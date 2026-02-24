@@ -2,6 +2,8 @@
 
 **系統脈絡：** 本資料集代表百家樂賭場管理系統（CMS），層級架構為：`t_shoe` (牌靴) → `t_game` (牌局) → `t_session` (玩家時段) → `t_bet` (單筆下注)。
 
+**資料實況（本次 Parquet 匯出）**：時間欄位在 Parquet 中以 `timestamp[ms, tz=UTC]` 儲存；如需對齊原系統/ClickHouse 的 `Asia/Shanghai`，請於使用端做時區轉換。`gaming_day` 範圍約為 2024-07-02 至 2026-02-13。
+
 ---
 
 ## 1. t_shoe (牌靴維度表)
@@ -127,9 +129,9 @@
 | `table_ip` | String | 賭桌設備 IP。 | |
 | `shoe_id` | String | 關聯的牌靴 (字串格式，可能橫跨多靴)。 | |
 | `player_id` | Int64 | 系統內部玩家 ID。 | |
-| `casino_player_id` | String | 賭場業務用的玩家 ID (如會員號)。 | |
+| `casino_player_id` | String | 賭場業務用的玩家 ID (如會員號)；可能為 NULL（未插卡/無會員）。另觀察到字串值 `null`，建議視為缺失值一併清理。 | |
 | `player_name` | String | 玩家姓名。 | |
-| `is_known_player` | Int32 | 旗標：是否為具名會員 (非散客)。 | |
+| `is_known_player` | Int32 | 旗標：是否為具名會員 (非散客)。取值通常為 0/1。 | |
 | `irc_number` | String | IRC (Internal Rating Card) 號碼。 | |
 | `group_code` | String | 玩家所屬旅行團/洗碼團代碼。 | |
 | `rep_code` | String | 負責公關/代理的代碼。 | |
@@ -138,12 +140,12 @@
 | `position_label` | String | 玩家座位標籤 (如 Seat 1)。 | |
 | `updated_position_label` | String | 更新後的座位標籤 (若有換位)。 | |
 | `seat_label` | String | 座位實體標籤。 | |
-| `session_start_dtm` | DateTime64 | 時段開始時間。 | |
-| `session_end_dtm` | DateTime64 | 時段結束時間。 | |
-| `clockin_event_dtm` | DateTime64 | 打卡上班/入座時間。 | |
-| `first_wager_game_start_dtm`| DateTime64 | 首次下注的牌局開始時間。 | |
-| `last_wager_game_end_dtm` | DateTime64 | 最後一次下注的牌局結束時間。 | |
-| `completion_dtm` | DateTime64 | 評級結算完成時間。 | |
+| `session_start_dtm` | DateTime64 | 時段開始時間（Parquet 以 UTC 儲存）。 | |
+| `session_end_dtm` | DateTime64 | 時段結束時間（Parquet 以 UTC 儲存）；少量為 NULL。 | |
+| `clockin_event_dtm` | DateTime64 | 打卡上班/入座時間（Parquet 以 UTC 儲存）。 | |
+| `first_wager_game_start_dtm`| DateTime64 | 首次下注的牌局開始時間（Parquet 以 UTC 儲存）。 | |
+| `last_wager_game_end_dtm` | DateTime64 | 最後一次下注的牌局結束時間（Parquet 以 UTC 儲存）。 | |
+| `completion_dtm` | DateTime64 | 評級結算完成時間（Parquet 以 UTC 儲存）；在本次匯出中多數為 NULL（分層抽樣觀察空值率約 99.99%）。 | |
 | `clockin_event_id` | String | 入座事件 ID。 | |
 | `clockout_event_id` | String | 離座事件 ID。 | |
 | `clockin_event_username` | String | 協助入座打卡的操作員帳號。 | |
@@ -179,16 +181,16 @@
 | `color_hsl_code` | String | 系統中代表該玩家的顏色代碼。 | |
 | `game_type` | String | 遊戲類型 (如 Baccarat)。 | |
 | `game_variant` | String | 遊戲變體。 | |
-| `status` | String | 時段狀態 (如 ACTIVE, CLOSED)。 | |
-| `rating_status` | String | 評級狀態。 | |
-| `verified_status` | String | 驗證狀態。 | |
+| `status` | String | 時段寫入/處理狀態；本次匯出常見：`SUCCESS`、`PROVISIONAL_SUCCESS`、`PROVISIONAL_REJECT`、`PROVISIONAL_PENDING`、空字串（未填）。 | |
+| `rating_status` | String | 評級狀態；多為 NULL，常見值：`CLOSED`、`PENDING`、`CANCELED`（分層抽樣觀察空值率約 97.8%）。 | |
+| `verified_status` | String | 驗證狀態；本次匯出常見：`VERIFIED` 或 NULL（分層抽樣觀察空值率約 74.7%）。 | |
 | `verification_info` | String | 驗證相關備註。 | |
 | `casino_open_rating_id` | String | 賭場系統的開台評級 ID。 | |
 | `casino_close_rating_id` | String | 賭場系統的關台評級 ID。 | |
-| `is_manual` | Int32 | 旗標：是否為人工建立的評級。 | |
-| `is_canceled` | Int32 | 旗標：評級是否被取消。 | |
-| `is_deleted` | Int32 | 旗標：評級是否被刪除。 | |
-| `isnotified` | Int32 | 旗標：是否已發送通知。 | |
+| `is_manual` | Int32 | 旗標：是否為人工建立的評級。取值通常為 0/1。 | |
+| `is_canceled` | Int32 | 旗標：評級是否被取消。取值通常為 0/1。 | |
+| `is_deleted` | Int32 | 旗標：評級是否被刪除。取值通常為 0/1。 | |
+| `isnotified` | Int32 | 旗標：是否已發送通知。取值通常為 0/1；分層抽樣觀察皆為 0（可能仍存在其他值）。 | |
 | `created_user_id` | Int32 | 建立此紀錄的員工 ID。 | |
 | `created_by_first_name` | String | 建立者名。 | |
 | `created_by_last_name` | String | 建立者姓。 | |
@@ -219,16 +221,16 @@
 | `session_id` | Int64 | 關聯的玩家時段 ID。 | |
 | `player_id` | Int64 | 下注玩家 ID。 | |
 | `table_id` | Int32 | 關聯的賭桌 ID。 | |
-| `position_code` | String | 下注位置代碼 (如 P1, B1)。 | |
+| `position_code` | String | 下注位置代碼；本次匯出常見形態為 `PLAYER_01` ~ `PLAYER_06`，少量為 NULL。 | |
 | `position_idx` | Int32 | 下注位置索引。 | |
-| `position_label` | String | 下注位置標籤 (如 Seat 1)。 | |
-| `is_back_bet` | Int32 | 旗標：是否為飛牌/背後下注 (非坐下玩家)。 | |
-| `bet_type` | String | 下注類型系統代碼 (如 BANKER, TIE)。 | |
-| `type_of_bet` | String | 下注的大分類。 | |
+| `position_label` | String | 下注位置標籤；本次匯出常見為數字字串（如 `1`~`6`），少量為 NULL。 | |
+| `is_back_bet` | Int32 | 旗標：是否為飛牌/背後下注 (非坐下玩家)。取值通常為 0/1。 | |
+| `bet_type` | String | 下注類型系統代碼；本次匯出常見：`BANKER`、`PLAYER`、`TIE`、`BANKER_PAIR`、`PLAYER_PAIR`、`LUCKY_SIX`、`BIG_TIGER`、`SMALL_TIGER`。 | |
+| `type_of_bet` | String | 下注的大分類；本次匯出常見：`MAIN_BET`、`SIDE_BET`。 | |
 | `short_bet_name_en` | String | 下注類型英文簡寫。 | |
 | `short_bet_name_zh` | String | 下注類型中文簡寫。 | |
 | `wager` | Decimal(19,4) | 下注金額 (現金碼)。 | |
-| `wager_nn` | Decimal(19,4) | 下注金額 (泥碼/洗碼)。 | |
+| `wager_nn` | Decimal(19,4) | 下注金額 (泥碼/洗碼)。在本次匯出中觀察到全為 0。 | |
 | `max_wager` | Decimal(19,4) | 該位置的最大允許下注額。 | |
 | `increment_wager` | Decimal(19,4) | 增量/追加的下注額。 | |
 | `payout_value` | Decimal(19,4) | 派彩給玩家的總金額 (本金+贏利)。 | |
@@ -258,10 +260,10 @@
 | `is_lump_sum_payout` | Int32 | 旗標：是否為一次性打包派彩。 | |
 | `bonus_game_offered` | Int32 | 旗標：是否觸發 Bonus 遊戲。 | |
 | `is_jackpot` | Int32 | 旗標：是否贏得 Jackpot。 | |
-| `status` | String | 下注狀態 (如 OPEN, RESOLVED)。 | |
-| `is_settled` | Int32 | 旗標：是否已結算完成。 | |
-| `payout_complete_dtm` | DateTime64 | 派彩完成時間。 | |
-| `bet_reconciled_at` | DateTime64 | 下注帳務對帳完成時間。 | |
+| `status` | String | 下注結果狀態；本次匯出常見：`WIN`、`LOSE`、`PUSH`。 | |
+| `is_settled` | Int32 | 旗標：是否已結算完成。取值通常為 0/1（抽樣中以 0 為主）。 | |
+| `payout_complete_dtm` | DateTime64 | 派彩完成時間（Parquet 以 UTC 儲存）。 | |
+| `bet_reconciled_at` | DateTime64 | 下注帳務對帳完成時間（Parquet 以 UTC 儲存）；在本次匯出中大量為 NULL，且非 NULL 值疑似出現 `1970-01-01` 預設時間，使用時請特別留意。 | |
 | `__ts_ms` | Int64 | CDC 時間戳 (毫秒)。 | |
 | `__op` | String | CDC 操作類型。 | |
 | `__deleted` | String | 軟刪除標記。 | |
