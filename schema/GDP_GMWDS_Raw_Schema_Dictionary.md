@@ -111,7 +111,7 @@
 | `__ts_ms` | Int64 | CDC 時間戳 (毫秒)。 | |
 | `__op` | String | CDC 操作類型。 | |
 | `__deleted` | String | 軟刪除標記。 | |
-| `__etl_insert_Dtm` | DateTime | 匯入資料倉儲時間。 | |
+| `__etl_insert_Dtm` | DateTime64 | 匯入資料倉儲時間。 | |
 
 ---
 
@@ -143,7 +143,7 @@
 | `session_start_dtm` | DateTime64 | 時段開始時間（Parquet 以 UTC 儲存）。 | |
 | `session_end_dtm` | DateTime64 | 時段結束時間（Parquet 以 UTC 儲存）；少量為 NULL。 | |
 | `clockin_event_dtm` | DateTime64 | 打卡上班/入座時間（Parquet 以 UTC 儲存）。 | |
-| `first_wager_game_start_dtm`| DateTime64 | 首次下注的牌局開始時間（Parquet 以 UTC 儲存）。 | |
+| `first_wager_game_start_dtm` | DateTime64 | 首次下注的牌局開始時間（Parquet 以 UTC 儲存）。 | |
 | `last_wager_game_end_dtm` | DateTime64 | 最後一次下注的牌局結束時間（Parquet 以 UTC 儲存）。 | |
 | `completion_dtm` | DateTime64 | 評級結算完成時間（Parquet 以 UTC 儲存）；在本次匯出中多數為 NULL（分層抽樣觀察空值率約 99.99%）。 | |
 | `clockin_event_id` | String | 入座事件 ID。 | |
@@ -163,7 +163,7 @@
 | `turnover_nn` | Decimal(19,4) | 使用泥碼 (Non-Negotiable) 的總投注額。 | |
 | `turnover_pushed_wagers` | Decimal(19,4) | 因和局退回的投注額。 | |
 | `turnover_contra_wagers` | Decimal(19,4) | 對沖下注總額。 | |
-| `turnover_pushed_contra_wagers`| Decimal(19,4) | 退回的對沖下注總額。 | |
+| `turnover_pushed_contra_wagers` | Decimal(19,4) | 退回的對沖下注總額。 | |
 | `player_win` | Decimal(19,4) | 玩家總淨贏損 (正為贏，負為輸)。 | |
 | `player_win_updated` | Decimal(19,4) | 更新/修正後的玩家淨贏損。 | |
 | `theo_win` | Decimal(19,4) | 賭場在此時段賺取的總理論贏。 | |
@@ -205,7 +205,7 @@
 | `__ts_ms` | Int64 | CDC 時間戳 (毫秒)。 | |
 | `__op` | String | CDC 操作類型。 | |
 | `__deleted` | String | 軟刪除標記。 | |
-| `__etl_insert_Dtm` | DateTime | 匯入資料倉儲時間。 | |
+| `__etl_insert_Dtm` | DateTime64 | 匯入資料倉儲時間。 | |
 
 ---
 
@@ -267,4 +267,4 @@
 | `__ts_ms` | Int64 | CDC 時間戳 (毫秒)。 | |
 | `__op` | String | CDC 操作類型。 | |
 | `__deleted` | String | 軟刪除標記。 | |
-| `__etl_insert_Dtm` | DateTime | 匯入資料倉儲時間。 | |
+| `__etl_insert_Dtm` | DateTime64 | 匯入資料倉儲時間。 | |
