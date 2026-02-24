@@ -1,0 +1,611 @@
+-- GDP_GMWDS_Raw.t_bet definition
+
+CREATE TABLE GDP_GMWDS_Raw.t_bet
+(
+
+    `bet_id` Int64,
+
+    `is_back_bet` Nullable(Int32),
+
+    `base_ha` Nullable(Decimal(19,
+ 4)),
+
+    `bet_type` Nullable(String),
+
+    `bet_uuid` String,
+
+    `bonus` Nullable(Decimal(19,
+ 4)),
+
+    `casino_loss_from_nn` Nullable(Decimal(19,
+ 4)),
+
+    `casino_win` Nullable(Decimal(19,
+ 4)),
+
+    `commission` Nullable(Decimal(19,
+ 4)),
+
+    `game_id` Nullable(Int64),
+
+    `is_lump_sum_payout` Nullable(Int32),
+
+    `max_wager` Nullable(Decimal(19,
+ 4)),
+
+    `payout_complete_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `gaming_day` Date32,
+
+    `payout_ha` Nullable(Decimal(19,
+ 4)),
+
+    `payout_odds` Nullable(Decimal(19,
+ 4)),
+
+    `player_id` Nullable(Int64),
+
+    `position_code` Nullable(String),
+
+    `position_idx` Nullable(Int32),
+
+    `position_label` Nullable(String),
+
+    `session_id` Nullable(Int64),
+
+    `is_settled` Nullable(Int32),
+
+    `status` Nullable(String),
+
+    `std_dev` Nullable(Decimal(19,
+ 4)),
+
+    `table_id` Int32,
+
+    `theo_win` Nullable(Decimal(19,
+ 4)),
+
+    `theo_win_cash` Nullable(Decimal(19,
+ 4)),
+
+    `true_odds` Nullable(Decimal(19,
+ 4)),
+
+    `wager` Nullable(Decimal(19,
+ 4)),
+
+    `wager_nn` Nullable(Decimal(19,
+ 4)),
+
+    `chips_paid` Nullable(String),
+
+    `chips_wagered` Nullable(String),
+
+    `chipsvalue_by_chipset` Nullable(String),
+
+    `chipset_label` Nullable(String),
+
+    `tip_amount` Nullable(Decimal(19,
+ 4)),
+
+    `chips_tip` Nullable(String),
+
+    `bet_cards` Nullable(String),
+
+    `increment_wager` Nullable(Decimal(19,
+ 4)),
+
+    `bet_cards_sum` Nullable(Decimal(19,
+ 4)),
+
+    `adjusted_theo_win` Nullable(Decimal(19,
+ 4)),
+
+    `short_bet_name_en` Nullable(String),
+
+    `short_bet_name_zh` Nullable(String),
+
+    `mixed_stack` Nullable(Int32),
+
+    `auto_resolve_stack` Nullable(Int32),
+
+    `type_of_bet` Nullable(String),
+
+    `bet_payout_type` Nullable(String),
+
+    `payout_value` Nullable(Decimal(19,
+ 4)),
+
+    `bonus_game_offered` Nullable(Int32),
+
+    `is_jackpot` Nullable(Int32),
+
+    `bet_reconciled_at` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `__ts_ms` Nullable(Int64) DEFAULT now(),
+
+    `__op` Nullable(String),
+
+    `__deleted` Nullable(String),
+
+    `__etl_insert_Dtm` DateTime DEFAULT now(),
+
+    INDEX payout_complete_dtm_minMax_index payout_complete_dtm TYPE minmax GRANULARITY 4
+)
+ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}',
+ '{replica}')
+PARTITION BY toYYYYMM(gaming_day)
+PRIMARY KEY (bet_id,
+ gaming_day)
+ORDER BY (bet_id,
+ gaming_day)
+SETTINGS index_granularity = 8192;
+
+
+-- GDP_GMWDS_Raw.t_game definition
+
+CREATE TABLE GDP_GMWDS_Raw.t_game
+(
+
+    `game_id` Int64,
+
+    `game_uuid` String,
+
+    `table_id` Int32,
+
+    `table_type` Nullable(String),
+
+    `shoe_id` Int32,
+
+    `dealer_id` Nullable(Int32),
+
+    `supervisor_id` Nullable(Int32),
+
+    `gaming_day` Date32,
+
+    `num_positions` Nullable(Int32),
+
+    `num_players` Nullable(Int32),
+
+    `total_turnover` Nullable(Decimal(19,
+ 4)),
+
+    `total_pushed_wagers` Nullable(Decimal(19,
+ 4)),
+
+    `total_contra_wagers` Nullable(Decimal(19,
+ 4)),
+
+    `total_pushed_contra_wagers` Nullable(Decimal(19,
+ 4)),
+
+    `casino_win` Nullable(Decimal(19,
+ 4)),
+
+    `theo_win` Nullable(Decimal(19,
+ 4)),
+
+    `table_exposure` Nullable(Decimal(19,
+ 4)),
+
+    `player_score` Nullable(Int32),
+
+    `banker_score` Nullable(Int32),
+
+    `outcome` Nullable(String),
+
+    `is_player_pair` Nullable(Int32),
+
+    `is_banker_pair` Nullable(Int32),
+
+    `num_cards_drawn` Nullable(Int32),
+
+    `card_p1` Nullable(String),
+
+    `card_p2` Nullable(String),
+
+    `card_p3` Nullable(String),
+
+    `card_b1` Nullable(String),
+
+    `card_b2` Nullable(String),
+
+    `card_b3` Nullable(String),
+
+    `prev_game_end_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `card_p1_draw_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `card_p2_draw_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `card_p3_draw_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `card_b1_draw_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `card_b2_draw_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `card_b3_draw_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `card_p1_turn_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `card_p2_turn_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `card_p3_turn_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `card_b1_turn_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `card_b2_turn_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `card_b3_turn_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `t4_take_begin_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `t4_take_end_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `rb_take_begin_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `game_start_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `payout_complete_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `table_limits` Nullable(String),
+
+    `table_template` Nullable(String),
+
+    `table_name` Nullable(String),
+
+    `game_status` Nullable(String),
+
+    `adjusted_turnover` Nullable(Decimal(19,
+ 4)),
+
+    `supervisor_first_name` Nullable(String),
+
+    `supervisor_last_name` Nullable(String),
+
+    `dealer_first_name` Nullable(String),
+
+    `dealer_last_name` Nullable(String),
+
+    `bonus` Nullable(Decimal(19,
+ 4)),
+
+    `is_lucky_six` Nullable(Int32),
+
+    `is_commissioned` Nullable(UInt8),
+
+    `pit_name` Nullable(String),
+
+    `gaming_area` Nullable(String),
+
+    `dealer_employee_number` Nullable(String),
+
+    `supervisor_employee_number` Nullable(String),
+
+    `gaming_day_first_game` Nullable(UInt8),
+
+    `include_in_aggregation` Nullable(UInt8),
+
+    `game_errors` Nullable(String),
+
+    `game_variance` Nullable(Decimal(19,
+ 4)),
+
+    `is_lucky8_player` Nullable(Int32),
+
+    `is_lucky8_banker` Nullable(Int32),
+
+    `dealer_cards` Nullable(String),
+
+    `game_type` Nullable(String),
+
+    `dealer_cards_sum` Nullable(Decimal(19,
+ 4)),
+
+    `game_result` Nullable(String),
+
+    `shoe_game_count` Nullable(Int64),
+
+    `game_variant` Nullable(String),
+
+    `dealer_cards_metadata` Nullable(String),
+
+    `lucky_card` Nullable(String),
+
+    `prg_template_id` Nullable(Int64),
+
+    `__ts_ms` Nullable(Int64) DEFAULT now(),
+
+    `__op` Nullable(String),
+
+    `__deleted` Nullable(String),
+
+    `__etl_insert_Dtm` DateTime DEFAULT now()
+)
+ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}',
+ '{replica}')
+PARTITION BY toYYYYMM(gaming_day)
+PRIMARY KEY (game_id,
+ gaming_day)
+ORDER BY (game_id,
+ gaming_day)
+SETTINGS index_granularity = 8192;
+
+
+-- GDP_GMWDS_Raw.t_session definition
+
+CREATE TABLE GDP_GMWDS_Raw.t_session
+(
+
+    `session_id` Int64,
+
+    `table_id` Nullable(Int32),
+
+    `player_id` Nullable(Int64),
+
+    `is_known_player` Nullable(Int32),
+
+    `session_start_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `first_wager_game_start_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `clockin_event_id` Nullable(String),
+
+    `clockin_event_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `gaming_day` Date32,
+
+    `num_games_elapsed` Nullable(Int32),
+
+    `num_games_with_wager` Nullable(Int32),
+
+    `last_wager_game_end_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `chips_in` Nullable(Decimal(19,
+ 4)),
+
+    `player_win` Nullable(Decimal(19,
+ 4)),
+
+    `turnover` Nullable(Decimal(19,
+ 4)),
+
+    `num_bets` Nullable(Int32),
+
+    `avg_bet` Nullable(Decimal(19,
+ 4)),
+
+    `turnover_pushed_wagers` Nullable(Decimal(19,
+ 4)),
+
+    `turnover_contra_wagers` Nullable(Decimal(19,
+ 4)),
+
+    `turnover_pushed_contra_wagers` Nullable(Decimal(19,
+ 4)),
+
+    `adjusted_turnover` Nullable(Decimal(19,
+ 4)),
+
+    `casino_open_rating_id` Nullable(String),
+
+    `casino_close_rating_id` Nullable(String),
+
+    `position_label` Nullable(String),
+
+    `clockin_event_username` Nullable(String),
+
+    `theo_win` Nullable(Decimal(19,
+ 4)),
+
+    `irc_number` Nullable(String),
+
+    `player_name` Nullable(String),
+
+    `casino_player_id` Nullable(String),
+
+    `table_name` Nullable(String),
+
+    `buyin` Nullable(Decimal(19,
+ 4)),
+
+    `bonus` Nullable(Decimal(19,
+ 4)),
+
+    `turnover_nn` Nullable(Decimal(19,
+ 4)),
+
+    `casino_loss_from_nn` Nullable(Decimal(19,
+ 4)),
+
+    `num_games_cash` Nullable(Int32),
+
+    `theo_win_cash` Nullable(Decimal(19,
+ 4)),
+
+    `nn_taken` Nullable(Decimal(19,
+ 4)),
+
+    `isnotified` Nullable(Int32),
+
+    `is_deleted` Nullable(Int32),
+
+    `session_end_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `clockout_event_id` Nullable(String),
+
+    `completion_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `is_canceled` Nullable(Int32),
+
+    `status` Nullable(String),
+
+    `table_ip` Nullable(String),
+
+    `created_user_id` Nullable(Int32),
+
+    `edited_user_id` Nullable(Int32),
+
+    `submitted_user_id` Nullable(Int32),
+
+    `approved_user_id` Nullable(Int32),
+
+    `created_by_first_name` Nullable(String),
+
+    `created_by_last_name` Nullable(String),
+
+    `crtd_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `lud_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `submitted_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `approved_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `approved_user_username` Nullable(String),
+
+    `rating_status` Nullable(String),
+
+    `is_manual` Nullable(Int32),
+
+    `seat_label` Nullable(String),
+
+    `chipset_labels` Nullable(String),
+
+    `adjusted_hands_played` Nullable(Int32),
+
+    `cash_buyins` Nullable(Decimal(19,
+ 4)),
+
+    `ranking` Nullable(String),
+
+    `hands_played_adjustment` Nullable(Decimal(19,
+ 4)),
+
+    `shoe_id` Nullable(String),
+
+    `pit_name` Nullable(String),
+
+    `gaming_area` Nullable(String),
+
+    `walk_in` Nullable(String),
+
+    `walk_with` Nullable(String),
+
+    `player_win_updated` Nullable(Decimal(19,
+ 4)),
+
+    `verified_status` Nullable(String),
+
+    `game_type` Nullable(String),
+
+    `group_code` Nullable(String),
+
+    `rep_code` Nullable(String),
+
+    `avg_cash_bet` Nullable(Decimal(19,
+ 4)),
+
+    `adjusted_theo_win` Nullable(Decimal(19,
+ 4)),
+
+    `color_hsl_code` Nullable(String),
+
+    `program_id` Nullable(Int32),
+
+    `verification_info` Nullable(String),
+
+    `updated_position_label` Nullable(String),
+
+    `game_variant` Nullable(String),
+
+    `issued_token` Decimal(19,
+ 4),
+
+    `__ts_ms` Nullable(Int64) DEFAULT now(),
+
+    `__op` Nullable(String),
+
+    `__deleted` Nullable(String),
+
+    `__etl_insert_Dtm` DateTime DEFAULT now()
+)
+ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}',
+ '{replica}')
+PARTITION BY toYYYYMM(gaming_day)
+PRIMARY KEY (session_id,
+ gaming_day)
+ORDER BY (session_id,
+ gaming_day)
+SETTINGS index_granularity = 8192;
+
+
+-- GDP_GMWDS_Raw.t_shoe definition
+
+CREATE TABLE GDP_GMWDS_Raw.t_shoe
+(
+
+    `shoe_id` Int64,
+
+    `casino_win` Nullable(Decimal(19,
+ 4)),
+
+    `current_card_count` Nullable(String),
+
+    `initial_card_count` Nullable(Int32),
+
+    `shoe_end_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `shoe_start_dtm` DateTime64(3,
+ 'Asia/Shanghai'),
+
+    `table_id` Int32,
+
+    `__ts_ms` Nullable(Int64) DEFAULT now(),
+
+    `__op` Nullable(String),
+
+    `__deleted` Nullable(String),
+
+    `__etl_insert_Dtm` DateTime DEFAULT now()
+)
+ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}',
+ '{replica}')
+PARTITION BY toYYYYMM(shoe_start_dtm)
+PRIMARY KEY (shoe_id,
+ shoe_start_dtm)
+ORDER BY (shoe_id,
+ shoe_start_dtm)
+SETTINGS index_granularity = 8192;
+
