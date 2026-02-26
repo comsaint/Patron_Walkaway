@@ -1,0 +1,155 @@
+"C:\Users\long.pun.GCR\PycharmProjects\walkaway trainer\.venv\Scripts\python.exe" "C:\Users\long.pun.GCR\PycharmProjects\walkaway trainer\walkaway trainer\trainer.py" 
+[trainer] window: 2026-02-18T18:18:08.386009+08:00 to 2026-02-25T17:48:08.386009+08:00
+[trainer] Pulling data from ClickHouse for 2026-02-18 18:18:08.386009+08:00 to 2026-02-25 17:48:08.386009+08:00
+[trainer] fetching bets and sessions from ClickHouse...
+[diagnostic] Bets per day in window:
+    bet_date  bet_count
+0 2026-02-18     254200
+1 2026-02-19     908259
+2 2026-02-20    1039740
+3 2026-02-21    1127387
+4 2026-02-22    1082428
+5 2026-02-23     998730
+6 2026-02-24     911311
+7 2026-02-25     572713
+[trainer] loaded bets: 6,894,768, sessions: 899,562
+[trainer] Saving bets to C:\Users\long.pun.GCR\PycharmProjects\walkaway trainer\walkaway trainer\out_trainer\bets_buffer.csv
+[trainer] Saving sessions to C:\Users\long.pun.GCR\PycharmProjects\walkaway trainer\walkaway trainer\out_trainer\sessions_buffer.csv
+[trainer] starting feature engineering...
+[trainer] computing rolling aggregates (5/15m)...
+[trainer]   ...rolling bet/wager/loss for 5m window...
+[trainer]   ...rolling bet/wager/loss for 15m window...
+[trainer] Saving rolling feature frame to C:\Users\long.pun.GCR\PycharmProjects\walkaway trainer\walkaway trainer\out_trainer\rolling_bets.csv
+[trainer] merging session info and computing session-based features...
+[trainer] feature engineering complete.
+[diagnostic] Columns after merge: ['bet_id', 'is_back_bet', 'base_ha', 'bet_type', 'payout_complete_dtm', 'session_id', 'casino_player_id_bet', 'table_id_bet', 'position_idx', 'wager', 'payout_odds', 'status', 'is_loss', 'loss_wager', 'bet_5m', 'wager_5m', 'wager_std_5m', 'wager_cv_5m', 'loss_count_5m', 'loss_amount_5m', 'bet_15m', 'wager_15m', 'wager_std_15m', 'wager_cv_15m', 'loss_count_15m', 'loss_amount_15m', 'casino_player_id_session', 'table_id_session', 'session_start_dtm', 'session_end_dtm', 'gap_to_next_min']
+[diagnostic] Sorted merged head for merge_asof:    table_id       payout_complete_dtm
+0  48301001 2026-02-18 18:18:08+08:00
+1  68751001 2026-02-18 18:18:09+08:00
+2      1087 2026-02-18 18:18:10+08:00
+3     51166 2026-02-18 18:18:10+08:00
+4  28801001 2026-02-18 18:18:10+08:00
+[diagnostic] Sorted timeline head for merge_asof:     table_id                        ts
+0   27501001 2026-02-17 18:18:11+08:00
+1   33651001 2026-02-17 18:18:13+08:00
+2   34551001 2026-02-17 18:18:14+08:00
+3   70751001 2026-02-17 18:18:14+08:00
+4  126501001 2026-02-17 18:18:15+08:00
+[trainer] rows after merge: 2,250,845, positives: 167,679
+[trainer] Saving engineered features to C:\Users\long.pun.GCR\PycharmProjects\walkaway trainer\walkaway trainer\out_trainer\features_buffer.csv
+[trainer] training and comparing multiple models...
+[trainer] Model configs: ['LightGBM_grid1', 'LightGBM_grid2', 'LightGBM_grid3', 'LightGBM_grid4', 'LightGBM_grid5']
+
+=== LightGBM_grid1 (1/5) ===
+Training LightGBM_grid1...
+[LightGBM] [Info] Number of positive: 134826, number of negative: 1665850
+[LightGBM] [Info] Auto-choosing col-wise multi-threading, the overhead of testing was 0.221626 seconds.
+You can set `force_col_wise=true` to remove the overhead.
+[LightGBM] [Info] Total Bins 5871
+[LightGBM] [Info] Number of data points in the train set: 1800676, number of used features: 33
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.500000 -> initscore=0.000000
+[LightGBM] [Info] Start training from score 0.000000
+LightGBM_grid1 validation precision: 0.3333
+
+=== LightGBM_grid2 (2/5) ===
+Training LightGBM_grid2...
+[LightGBM] [Info] Number of positive: 134826, number of negative: 1665850
+[LightGBM] [Info] Auto-choosing col-wise multi-threading, the overhead of testing was 0.208151 seconds.
+You can set `force_col_wise=true` to remove the overhead.
+[LightGBM] [Info] Total Bins 5871
+[LightGBM] [Info] Number of data points in the train set: 1800676, number of used features: 33
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.500000 -> initscore=0.000000
+[LightGBM] [Info] Start training from score 0.000000
+LightGBM_grid2 validation precision: 0.1930
+
+=== LightGBM_grid3 (3/5) ===
+Training LightGBM_grid3...
+[LightGBM] [Info] Number of positive: 134826, number of negative: 1665850
+[LightGBM] [Info] Auto-choosing col-wise multi-threading, the overhead of testing was 0.187793 seconds.
+You can set `force_col_wise=true` to remove the overhead.
+[LightGBM] [Info] Total Bins 5871
+[LightGBM] [Info] Number of data points in the train set: 1800676, number of used features: 33
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.500000 -> initscore=0.000000
+[LightGBM] [Info] Start training from score 0.000000
+LightGBM_grid3 validation precision: 0.6667
+
+=== LightGBM_grid4 (4/5) ===
+Training LightGBM_grid4...
+[LightGBM] [Info] Number of positive: 134826, number of negative: 1665850
+[LightGBM] [Info] Auto-choosing col-wise multi-threading, the overhead of testing was 0.188141 seconds.
+You can set `force_col_wise=true` to remove the overhead.
+[LightGBM] [Info] Total Bins 5871
+[LightGBM] [Info] Number of data points in the train set: 1800676, number of used features: 33
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.500000 -> initscore=0.000000
+[LightGBM] [Info] Start training from score 0.000000
+LightGBM_grid4 validation precision: 0.7500
+
+=== LightGBM_grid5 (5/5) ===
+Training LightGBM_grid5...
+[LightGBM] [Info] Number of positive: 134826, number of negative: 1665850
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.056851 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 5871
+[LightGBM] [Info] Number of data points in the train set: 1800676, number of used features: 33
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.500000 -> initscore=0.000000
+[LightGBM] [Info] Start training from score 0.000000
+LightGBM_grid5 validation precision: 1.0000
+Selected model: LightGBM_grid5 (precision=1.0000)
+[trainer] training complete; artifacts saved
+{
+  "metrics": {
+    "validation_precision": 1.0,
+    "validation_recall": 9.131586156515387e-05,
+    "threshold": 0.6398903103521424,
+    "positive_rate": 0.07449602260484396,
+    "val_samples": 450169,
+    "val_alerts": 3,
+    "val_true_alerts": 3,
+    "model_type": "LightGBM_grid5",
+    "selection_mode": "threshold",
+    "selection_k": 0
+  },
+  "features": [
+    "wager",
+    "payout_odds",
+    "base_ha",
+    "is_back_bet",
+    "position_idx",
+    "minutes_since_session_start",
+    "cum_bets",
+    "cum_wager",
+    "avg_wager_sofar",
+    "bet_5m",
+    "bet_15m",
+    "wager_5m",
+    "wager_15m",
+    "loss_count_5m",
+    "loss_count_15m",
+    "loss_amount_5m",
+    "loss_amount_15m",
+    "wager_std_5m",
+    "wager_std_15m",
+    "wager_cv_5m",
+    "wager_cv_15m",
+    "bets_per_minute",
+    "time_of_day_sin",
+    "time_of_day_cos",
+    "table_hc",
+    "bet_acceleration",
+    "wager_acceleration",
+    "loss_count_acceleration",
+    "loss_amount_acceleration",
+    "pace_delta_5_vs_prev10",
+    "loss_rate_5m",
+    "loss_rate_15m",
+    "loss_share_session"
+  ],
+  "model_path": "C:\\Users\\long.pun.GCR\\PycharmProjects\\walkaway trainer\\walkaway trainer\\models\\walkaway_model.pkl",
+  "metrics_path": "C:\\Users\\long.pun.GCR\\PycharmProjects\\walkaway trainer\\walkaway trainer\\out_trainer\\training_metrics.json",
+  "samples": 2250845,
+  "window_start": "2026-02-18T18:18:08.386009+08:00",
+  "window_end": "2026-02-25T17:48:08.386009+08:00"
+}
+
+Process finished with exit code 0
