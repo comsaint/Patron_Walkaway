@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Realtime Walkaway Predictor</title>
+    <link rel="stylesheet" href="./style.css">
+    <!-- Local JS Libraries to bypass firewall/tracking blocks (now under frontend/static) -->
+    <script src="./static/chart.js"></script>
+    <script src="./static/chartjs-adapter-date-fns.js"></script>
+</head>
+<body>
+    <div class="main-layout">
+        <div id="side_bar">
+            <div class="sidebar-title">Realtime Walkaway Predictor</div>
+            
+            <div class="metric-card" title="Current operational gaming date (HK/Macau)">
+                <span class="metric-label">Game Day</span>
+                <span id="stat_game_day" class="metric-value">--</span>
+            </div>
+            
+            <div class="metric-card" title="Synchronized live time for monitoring and audit">
+                <span class="metric-label">Casino Time</span>
+                <span id="stat_casino_time" class="metric-value">--:--:--</span>
+            </div>
+
+            <div class="metric-card" title="Total tables with at least 1 active session">
+                <span class="metric-label">Occupied Tables</span>
+                <span id="stat_occ_tables" class="metric-value">0</span>
+            </div>
+
+            <div class="metric-card" title="Total number of active player sessions across the floor">
+                <span class="metric-label">Occupied Seats</span>
+                <span id="stat_occ_seats" class="metric-value">0</span>
+            </div>
+
+            <div class="metric-card" title="Percentage change in player count over the last 10 minutes">
+                <span class="metric-label">Momentum</span>
+                <span id="stat_momentum" class="metric-value">N/A</span>
+            </div>
+
+            <div class="metric-card" title="Occupancy level per table over the floor">
+                <span class="metric-label">Occupancy</span>
+                <span id="stat_utilization" class="metric-value">0.0</span>
+            </div>
+
+            <div class="sidebar-footer">
+                <div>Created By EIM BI</div>
+                <div>2026 (C) GEG</div>
+            </div>
+        </div>
+        <div id="container">
+            <div id="map_panel">
+                <canvas id="map_canvas"></canvas>
+                <div id="canvas_tooltip"></div>
+                <div id="context_menu">
+                    <div class="ctx-close" onclick="document.getElementById('context_menu').style.display='none'">×</div>
+                    <div class="menu-header-ctx" id="ctx_table_name">Table --</div>
+                    
+                    <div class="menu-item" id="item_status">
+                        <span>Table Status</span>
+                        <div class="toggle-status active">ON</div>
+                    </div>
+
+                    <div class="menu-item">
+                        <span>Min Bet</span>
+                        <select class="ctx-select" id="sel_min_bet">
+                            <option value="500">500</option>
+                            <option value="1000">1000</option>
+                            <option value="1500">1500</option>
+                            <option value="2000">2000</option>
+                            <option value="3000">3000</option>
+                        </select>
+                    </div>
+
+                    <div class="menu-item">
+                        <span>Max Bet</span>
+                        <select class="ctx-select" id="sel_max_bet">
+                            <option value="1m">1m</option>
+                            <option value="2m">2m</option>
+                            <option value="3m">3m</option>
+                        </select>
+                    </div>
+
+                    <div class="menu-sep"></div>
+
+                    <div class="comp-panel">
+                        <div class="menu-header-ctx comp-panel-header">Distribute Comp</div>
+                        
+                        <div class="comp-panel-body">
+                            <div class="comp-panel-row">
+                                <span class="comp-panel-label">Seat #</span>
+                                <select class="ctx-select" id="sel_comp_seat">
+                                    <option value="">-</option>
+                                </select>
+                            </div>
+                            <div class="comp-panel-row">
+                                <span class="comp-panel-label">Benefit Type</span>
+                                <select class="ctx-select" id="sel_comp_type">
+                                    <option value="Beverage">Beverage</option>
+                                    <option value="Meal Voucher">Meal Voucher</option>
+                                    <option value="Match Play 500">Match Play $500</option>
+                                    <option value="Match Play 1000">Match Play $1000</option>
+                                    <option value="Hotel Stay">Hotel 1N</option>
+                                    <option value="Limousine">Limousine</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="menu-item comp-primary-action" id="item_comp">
+                            <span>Send Comp</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div id="splitter"></div>
+            <div id="list_panel">
+                <div class="tabs-header">
+                    <button class="tab-button active" onclick="openTab(event, 'tab_alerts')">Live Alerts</button>
+                    <button class="tab-button" onclick="openTab(event, 'tab_trends')">Validation</button>
+                    <button class="tab-button" onclick="openTab(event, 'tab_hc')">Floor Trends</button>
+                    <button class="tab-button" onclick="openTab(event, 'tab_settings')">Settings</button>
+                </div>
+
+                <div id="tab_alerts" class="tab-content">
+                    <div class="alerts-toolbar">
+                        <div class="alerts-filter-group">
+                            <span class="toolbar-label">Status</span>
+                            <label class="filter-item-horizontal"><input type="checkbox" id="tab_filter_pending" checked onchange="syncFilters('filter_pending', this.checked)"> Pending</label>
+                            <label class="filter-item-horizontal"><input type="checkbox" id="tab_filter_positive" onchange="syncFilters('filter_positive', this.checked)"> Match</label>
+                            <label class="filter-item-horizontal"><input type="checkbox" id="tab_filter_negative" onchange="syncFilters('filter_negative', this.checked)"> Miss</label>
+                        </div>
+                        <div class="alerts-filter-group">
+                            <span class="toolbar-label">Bet Size</span>
+                            <label class="filter-item-horizontal"><input type="checkbox" id="tab_filter_bet_0" checked onchange="syncFilters('filter_bet_0', this.checked)"> &lt; 1k</label>
+                            <label class="filter-item-horizontal"><input type="checkbox" id="tab_filter_bet_1" checked onchange="syncFilters('filter_bet_1', this.checked)"> 1-3k</label>
+                            <label class="filter-item-horizontal"><input type="checkbox" id="tab_filter_bet_2" checked onchange="syncFilters('filter_bet_2', this.checked)"> 3-10k</label>
+                            <label class="filter-item-horizontal"><input type="checkbox" id="tab_filter_bet_3" checked onchange="syncFilters('filter_bet_3', this.checked)"> &gt; 10k</label>
+                        </div>
+                        <div class="alerts-filter-group counts-group" title="Live alert counts by status">
+                            <span class="toolbar-label">Counts</span>
+                            <span class="status-pill status-pending">Pending <span id="count_pending">0</span></span>
+                            <span class="status-pill status-positive">Match <span id="count_positive">0</span></span>
+                            <span class="status-pill status-negative">Miss <span id="count_negative">0</span></span>
+                        </div>
+                    </div>
+                    <table id="alerts_table">
+                        <thead>
+                            <tr>
+                                <th>Type</th>
+                                <th>Alert Time (HKT) <button class="order-btn" data-col="1" title="Sort"><span class="visually-hidden">Sort</span></button></th>
+                                <th>Event (Bet) Time <button class="order-btn" data-col="2" title="Sort"><span class="visually-hidden">Sort</span></button></th>
+                                <th>Bet ID <button class="order-btn" data-col="3" title="Sort"><span class="visually-hidden">Sort</span></button></th>
+                                <th>Session ID <button class="order-btn" data-col="4" title="Sort"><span class="visually-hidden">Sort</span></button></th>
+                                <th>Player ID <button class="order-btn" data-col="5" title="Sort"><span class="visually-hidden">Sort</span></button></th>
+                                <th>Table <button class="order-btn" data-col="6" title="Sort"><span class="visually-hidden">Sort</span></button></th>
+                                <th>Seat <button class="order-btn" data-col="7" title="Sort"><span class="visually-hidden">Sort</span></button></th>
+                                <th>Avg Bet <button class="order-btn" data-col="8" title="Sort"><span class="visually-hidden">Sort</span></button></th>
+                                <th>Status</th>
+                                <th>Stats</th>
+                            </tr>
+                        </thead>
+                        <tbody id="alerts_body">
+                        </tbody>
+                    </table>
+                </div>
+
+                <div id="tab_trends" class="tab-content hidden">
+                    <div class="trend-top">
+                        <div style="display:flex; align-items:center; gap:12px;">
+                        <div class="trend-title">Validation Overview</div>
+                    </div>
+                    <div class="trend-summary">
+                            <div class="metric-card trend-card" title="Total alerts in current session">
+                                <div class="metric-label">Total</div>
+                                <div id="trend_count_total" class="metric-value">0</div>
+                            </div>
+                            <div class="metric-card trend-card validated" title="Alerts that have been finalized (Match + Miss)">
+                                <div class="metric-label">Validated</div>
+                                <div id="trend_count_validated" class="metric-value">0</div>
+                            </div>
+                            <div class="metric-card trend-card pending" title="Active alerts awaiting validation results">
+                                <div class="metric-label">Pending</div>
+                                <div id="trend_count_pending" class="metric-value status-pending">0</div>
+                            </div>
+                            <div class="metric-card trend-card match" title="Player left within 15 minutes of alert (Match)">
+                                <div class="metric-label">Match</div>
+                                <div id="trend_count_positive" class="metric-value status-positive">0</div>
+                            </div>
+                            <div class="metric-card trend-card miss" title="Player stayed or left after 15 minutes (Miss)">
+                                <div class="metric-label">Miss</div>
+                                <div id="trend_count_negative" class="metric-value status-negative">0</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="trend-chart">
+                        <div class="metric-card trend-panel">
+                            <div class="trend-panel-header">
+                                <div class="metric-label no-margin">Cumulative Accuracy Plot</div>
+                                <div id="trend_accuracy_value" title="Cumulative precision: (Match) / (Match + Miss). This is the percentage of alerts that were correct (player left within 15 minutes).">--%</div>
+                            </div>
+                            <div class="chart-area">
+                                <canvas id="accuracyChart"></canvas>
+                            </div>
+                            <div class="chart-note">
+                                * Precision = (Match) / (Match + Miss).
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="tab_hc" class="tab-content hidden">
+                    <div class="trend-split">
+                        <div class="metric-card trend-panel">
+                            <div class="chart-area-tall">
+                                <canvas id="hcChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div id="tab_settings" class="tab-content hidden">
+                    <div class="settings-panel">
+                        <div class="settings-grid">
+                            <label class="settings-item">Trends time range (hours)
+                                <select id="trend_range" class="ctx-select">
+                                    <option value="1">1</option>
+                                    <option value="6">6</option>
+                                    <option value="12">12</option>
+                                    <option value="24" selected>24</option>
+                                </select>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="./script.js"></script>
+</body>
+</html>

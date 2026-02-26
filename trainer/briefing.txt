@@ -1,0 +1,54 @@
+Copyright (2026) Eddy Dong
+ver 0.0.12
+
+Project: casino baccarat table game real-time walkaway (churn) risl predicton.
+
+Context:
+The casino gaming floor contains ~800 tables, each has 5 seats (id = 1,2,3,5,6). It opens 7x24. 
+
+Global Overriding Rules:
+All params for any py much be centralized into config.py as the sole contro panel.
+All time must always by HK time.
+
+Defintions:
+Session: a series of bets a patron made on a same table from he sit down to walk away from that table.
+Visit: a series of sessions of the same patron without any gap greater than 30 mins.
+Walkaway: the end of a visit, aka the starting of a 30-min gap of the patron's sessions.
+
+Goal:
+By every bet (and/or tick) we calculate (score) each patron's likelihood to end current session & visit in 15 mins, aka in 15mins since the firing of the alert, a gap of 30 mins will occur which is defined as the end of the visit. The score stream will be output in a csv in /out folder, the ones meet alert threshold will be pushed to an alert stream csv in the same folder. Important: 1 alert max for each visit.
+
+Data:
+Near realtime data (updated every 30-90 seconds) in Clickhouse (conn info in config.py) from the live gaming floor which contains ~800 tables, each has 5 seats (id = 1,2,3,5,6). 3 tables available: t_bet, t_session, t_game. You can find sample data for each in the "sample data" folder. Don't use the sample data for training. Those just FYI to get sense of the data. Use live Clickhouse data for training / backtesting. Conn info inccluded in config. Important: in t_bet the bet_id is NOT strictly incremental. So use the Payout Complete Dtm for sorting instead.
+
+Now build me a trainer.py, design and train a model for the problem. Need to ensure the best precision. Be sure to avoid simple random splitting of training and testing data since the data are time series, doing so may cause future leaked. Tried multiple models and pick the best performer. Then for the best performaing, use grid sweeping to optimize params.
+
+Then build a backtester.py, using the model trained with the trainer.py to run over historical data (by default from t-3h to t-1h) to see the real precision, which equals to "alert count that turned true (aka the start of a 30 min gap occured within 15 mins after the alert was fired)
+
+Then we do the scorer.py, periodically poll live data and do the inferrence and score each event. For those above threshold it emit alert to a local csv file. An alert should include ts (timestamp), player ID, table ID, seat ID, visit_start_ts, visit_end_ts, session_count (in current visit), bet_count (in current visit), visit average bet size (since current visit began), historical average bet size (since scoring began). Important: max 1 alert for 1 visit.
+
+Then we need a second server: validator.py which also run periodically checking all items in the alerts.scv that are older than 45 mins (15 forecast horizon + 30 visit-end gap) against live clickhouse historical data to see if the alert was true (if a 30min gap started within 15 mins of the alert). user a new folder /out_validator for output / buffer.
+
+Let's do a status_server.py to update the table status and update into the table_status.json every 45s (as a param in config), and the api just read from that json so we avoid each frontend trigger a request.
+
+Then we need an API server, which contains:
+    get_floor_status - get all open sessions from table_status.json and output a list of table-seat pair so the frontend can update the gaming floor status (which seat of which table is now occupied / empty etc.)
+    get_alerts - publishing alerts to frontend (which we will build soon). It has an optional param: ts. If not assigned, the API spit all alerts. If assigned, it spits only those after the ts. This is for the frontend to periotically pull data from the API without duplication. 
+    get_validation - publishing validator results with the same ts param, and in the output it should contain at least ts (alert's), player_id, walkaway_ts (the starting point of the 30min gap) and TP (test positive - true/false) so the frontend can easily update alert status / show accuracy rate etc.
+
+Now do a webpage called main.html in the /frontend folder, left side bar "side_bar"  150px wide, height=client window height. right side container "container" stretched to full size of the client window, in it we have 2 vertical panels, "map_panel" on the top and "list_panel" down below, splitter line adjustable. whole page responsive to window.resize(). do a quick demo using color fills and boarders to highlight the 3 parts for me to verify first.
+
+ok now in the list_panel, call get_alerts api (at http://127.0.0.1:8000) every 30s and display the alerts (order by alert ts desc). first call no param, it will spit all history. from the second call on, feed the last API calling ts so it spit only the incremental. pls refer to the api_server.py for ts param format.
+
+add get_validation but instead of showing them on a new table, merge them in the existing list view by adding a status column: alerted (amber) / walked away (green) / stayed longer (red)
+
+Jan 29:
+1. Inspect future leaking features used in trainer. Add "table_HC" at bet time as a new feature. Retrain and test.
+2. Inspect high accuracy rate.
+3. Table status should from Status_server, not attached to validator which is not complete and well synced.
+4. Make config.py config.json; adjust all py's; expose it to the Settings tab (ready only for now; masking password)
+
+
+To confirm current logic is aligned with the following: the reason we have the 6 hour thing is we want to ensure late data won't affect the validation, correct?  The key is: if we have at least 1 new bet / session start event after 15mins of the alert' bet_ts, we can certainly conclude that this alert is a Miss. But it's not the case the other way around: we can't guarantee it's a Match yet since new bet/session start data may come later than the 45mins window ends. We should wait for a while (15mins enough) for any potential late arriving data (but 6hours seems unnecessarily too long). If no new data came within the extended 15mins on top of the 45mins windows then we confirm this is a Match, other with we revise it as Miss.
+
+let me make it clearer: the extra period for late arrivals (that should have arrived within the 45mins) is only for validaton of the Match, since the Miss we have declared at the end of the 45mins window is verdict already and no way there is any new info that can change it.
