@@ -1,14 +1,20 @@
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 NUMEXPR_MAX_THREADS = 12
 
 # ------------------ ClickHouse (READ ONLY for now) ------------------
-CH_HOST    = "gdpedw"
-CH_TEAMDB_HOST = "GAD10DMTDBSP21"
-CH_PORT    = 8123
-CH_USER    = "eddy.dong"
-CH_PASS    = "Mars0723!2601"
+CH_HOST    = os.getenv("CH_HOST", "gdpedw")
+CH_TEAMDB_HOST = os.getenv("CH_TEAMDB_HOST", "GAD10DMTDBSP21")
+CH_PORT    = int(os.getenv("CH_PORT", 8123))
+CH_USER    = os.getenv("CH_USER", "")
+CH_PASS    = os.getenv("CH_PASS", "")
 CH_PASSWORD = CH_PASS
-CH_SECURE  = False
-SOURCE_DB  = "GDP_GMWDS_Raw"
+CH_SECURE  = os.getenv("CH_SECURE", "False").lower() in ("true", "1", "t")
+SOURCE_DB  = os.getenv("SOURCE_DB", "GDP_GMWDS_Raw")
 
 # ------------------ Source tables ---------------------------------
 TBET     = "t_bet"
