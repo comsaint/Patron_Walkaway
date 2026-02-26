@@ -39,92 +39,92 @@
 **表級資訊（簡版）**
 - **粒度（Grain）**：一筆 = 一局（hand / game）。
 - **唯一鍵（參考）**：`game_id`（原始 ClickHouse 設計亦包含 `gaming_day` 作為排序/分區關聯欄位）。
-- **資料可用性**：此專案未提供 `t_game` 的 Parquet 檔；以下僅列出欄位名稱（其餘資訊留空，待後續補齊）。
+- **資料可用性**：此專案已提供 `t_game` 的 Parquet 檔 (`data/gmwds_t_game.parquet`，約 18GB，約 2.11 億列)。以下欄位資訊由全表掃描與 metadata 統計產生。
 
 | 欄位名稱 | 型別 | 可空 | 業務定義 | 值域/格式/枚舉 | 範例值 | 注意事項/已知問題 |
 |---|---|---|---|---|---|---|
-| `game_id` |  |  |  |  |  |  |
-| `game_uuid` |  |  |  |  |  |  |
-| `table_id` |  |  |  |  |  |  |
-| `table_type` |  |  |  |  |  |  |
-| `shoe_id` |  |  |  |  |  |  |
-| `dealer_id` |  |  |  |  |  |  |
-| `supervisor_id` |  |  |  |  |  |  |
-| `gaming_day` |  |  |  |  |  |  |
-| `num_positions` |  |  |  |  |  |  |
-| `num_players` |  |  |  |  |  |  |
-| `total_turnover` |  |  |  |  |  |  |
-| `total_pushed_wagers` |  |  |  |  |  |  |
-| `total_contra_wagers` |  |  |  |  |  |  |
-| `total_pushed_contra_wagers` |  |  |  |  |  |  |
-| `casino_win` |  |  |  |  |  |  |
-| `theo_win` |  |  |  |  |  |  |
-| `table_exposure` |  |  |  |  |  |  |
-| `player_score` |  |  |  |  |  |  |
-| `banker_score` |  |  |  |  |  |  |
-| `outcome` |  |  |  |  |  |  |
-| `is_player_pair` |  |  |  |  |  |  |
-| `is_banker_pair` |  |  |  |  |  |  |
-| `num_cards_drawn` |  |  |  |  |  |  |
-| `card_p1` |  |  |  |  |  |  |
-| `card_p2` |  |  |  |  |  |  |
-| `card_p3` |  |  |  |  |  |  |
-| `card_b1` |  |  |  |  |  |  |
-| `card_b2` |  |  |  |  |  |  |
-| `card_b3` |  |  |  |  |  |  |
-| `prev_game_end_dtm` |  |  |  |  |  |  |
-| `card_p1_draw_dtm` |  |  |  |  |  |  |
-| `card_p2_draw_dtm` |  |  |  |  |  |  |
-| `card_p3_draw_dtm` |  |  |  |  |  |  |
-| `card_b1_draw_dtm` |  |  |  |  |  |  |
-| `card_b2_draw_dtm` |  |  |  |  |  |  |
-| `card_b3_draw_dtm` |  |  |  |  |  |  |
-| `card_p1_turn_dtm` |  |  |  |  |  |  |
-| `card_p2_turn_dtm` |  |  |  |  |  |  |
-| `card_p3_turn_dtm` |  |  |  |  |  |  |
-| `card_b1_turn_dtm` |  |  |  |  |  |  |
-| `card_b2_turn_dtm` |  |  |  |  |  |  |
-| `card_b3_turn_dtm` |  |  |  |  |  |  |
-| `t4_take_begin_dtm` |  |  |  |  |  |  |
-| `t4_take_end_dtm` |  |  |  |  |  |  |
-| `rb_take_begin_dtm` |  |  |  |  |  |  |
-| `game_start_dtm` |  |  |  |  |  |  |
-| `payout_complete_dtm` |  |  |  |  |  |  |
-| `table_limits` |  |  |  |  |  |  |
-| `table_template` |  |  |  |  |  |  |
-| `table_name` |  |  |  |  |  |  |
-| `game_status` |  |  |  |  |  |  |
-| `adjusted_turnover` |  |  |  |  |  |  |
-| `supervisor_first_name` |  |  |  |  |  |  |
-| `supervisor_last_name` |  |  |  |  |  |  |
-| `dealer_first_name` |  |  |  |  |  |  |
-| `dealer_last_name` |  |  |  |  |  |  |
-| `bonus` |  |  |  |  |  |  |
-| `is_lucky_six` |  |  |  |  |  |  |
-| `is_commissioned` |  |  |  |  |  |  |
-| `pit_name` |  |  |  |  |  |  |
-| `gaming_area` |  |  |  |  |  |  |
-| `dealer_employee_number` |  |  |  |  |  |  |
-| `supervisor_employee_number` |  |  |  |  |  |  |
-| `gaming_day_first_game` |  |  |  |  |  |  |
-| `include_in_aggregation` |  |  |  |  |  |  |
-| `game_errors` |  |  |  |  |  |  |
-| `game_variance` |  |  |  |  |  |  |
-| `is_lucky8_player` |  |  |  |  |  |  |
-| `is_lucky8_banker` |  |  |  |  |  |  |
-| `dealer_cards` |  |  |  |  |  |  |
-| `game_type` |  |  |  |  |  |  |
-| `dealer_cards_sum` |  |  |  |  |  |  |
-| `game_result` |  |  |  |  |  |  |
-| `shoe_game_count` |  |  |  |  |  |  |
-| `game_variant` |  |  |  |  |  |  |
-| `dealer_cards_metadata` |  |  |  |  |  |  |
-| `lucky_card` |  |  |  |  |  |  |
-| `prg_template_id` |  |  |  |  |  |  |
-| `__ts_ms` |  |  |  |  |  |  |
-| `__op` |  |  |  |  |  |  |
-| `__deleted` |  |  |  |  |  |  |
-| `__etl_insert_Dtm` |  |  |  |  |  |  |
+| `game_id` | BIGINT | 0.0% | 牌局唯一識別碼 | Min: 101001, Max: 362301010 | 315892327 | [DQ Rule] **Uniqueness (去重)**：全表有約 3.4 萬筆重複 `game_id`，使用時需依賴 `__ts_ms` 或 `__etl_insert_Dtm` 取最新一筆。 |
+| `game_uuid` | VARCHAR | 0.0% |  | Many distinct values | 33651001_GAME_1768377485705 |  |
+| `table_id` | INTEGER | 0.0% |  | Min: 1005, Max: 83151001 | 33651001 |  |
+| `table_type` | VARCHAR | 0.0% |  |  | CL05-2904-2B-45-153 |  |
+| `shoe_id` | INTEGER | 0.0% |  | Min: 1001, Max: 155001001 | 105057633 |  |
+| `dealer_id` | INTEGER | 0.08% |  | Min: 1, Max: 36051207 | 55038 |  |
+| `supervisor_id` | INTEGER | 0.75% |  | Min: 1, Max: 36051215 | 53505 |  |
+| `gaming_day` | DATE | 0.0% |  | Min: 2024-07-02, Max: 2026-02-13 | 2026-01-14 |  |
+| `num_positions` | INTEGER | 0.0% |  | Min: 0, Max: 5 | 5 |  |
+| `num_players` | INTEGER | 0.0% |  | Min: 0, Max: 38 | 0 |  |
+| `total_turnover` | DECIMAL(19,4) | 0.0% | 總投注額 | 0.0000 ~ 10620000.0000 | 0.0000 | 全表總計約 2.29 兆 |
+| `total_pushed_wagers` | DECIMAL(19,4) | 0.0% | 退回投注額 | 0.0000 ~ 7058000.0000 | 0.0000 |  |
+| `total_contra_wagers` | DECIMAL(19,4) | 0.0% | 對沖投注額 |  | 0.0000 |  |
+| `total_pushed_contra_wagers` | DECIMAL(19,4) | 0.0% | 退回對沖投注額 |  | 0.0000 |  |
+| `casino_win` | DECIMAL(19,4) | 0.0% | 賭場淨贏損 | -110000000.0000 ~ 10000000.0000 | 0.0000 |  |
+| `theo_win` | DECIMAL(19,4) | 0.0% | 理論贏 | 0.0000 ~ 716500.0000 | 0.0000 |  |
+| `table_exposure` | DECIMAL(19,4) | 0.0% | 賭桌曝險 | -1000000.0000 ~ 25000000.0000 | 0.0000 |  |
+| `player_score` | INTEGER | 0.0% | 閒家點數 | Min: 0, Max: 9 | 8 |  |
+| `banker_score` | INTEGER | 0.0% | 莊家點數 | Min: 0, Max: 9 | 1 |  |
+| `outcome` | VARCHAR | 0.0% | 牌局結果 | Enum: BANKER, PLAYER, TIE, VOID, UNRESOLVED | PLAYER |  |
+| `is_player_pair` | INTEGER | 0.0% |  | Min: 0, Max: 1 | 0 |  |
+| `is_banker_pair` | INTEGER | 0.0% |  | Min: 0, Max: 1 | 0 |  |
+| `num_cards_drawn` | INTEGER | 0.0% |  | Min: 1, Max: 6 | 4 |  |
+| `card_p1` | VARCHAR | 0.0% |  | Many distinct values | 4c |  |
+| `card_p2` | VARCHAR | 0.0% |  | Many distinct values | 4s |  |
+| `card_p3` | VARCHAR | 49.66% |  | Many distinct values | Kc |  |
+| `card_b1` | VARCHAR | 0.0% |  | Many distinct values | 4h |  |
+| `card_b2` | VARCHAR | 0.0% |  | Many distinct values | 7d |  |
+| `card_b3` | VARCHAR | 56.46% |  | Many distinct values | Jc |  |
+| `prev_game_end_dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 15:58:05+08:00 |  |
+| `card_p1_draw_dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 16:13:38+08:00 |  |
+| `card_p2_draw_dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 16:13:42+08:00 |  |
+| `card_p3_draw_dtm` | TIMESTAMP WITH TIME ZONE | 49.66% |  |  | 2026-01-14 16:15:27+08:00 |  |
+| `card_b1_draw_dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 16:13:40+08:00 |  |
+| `card_b2_draw_dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 16:13:43+08:00 |  |
+| `card_b3_draw_dtm` | TIMESTAMP WITH TIME ZONE | 56.46% |  |  | 2026-01-14 16:14:10+08:00 |  |
+| `card_p1_turn_dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 16:13:46+08:00 |  |
+| `card_p2_turn_dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 16:13:46+08:00 |  |
+| `card_p3_turn_dtm` | TIMESTAMP WITH TIME ZONE | 49.66% |  |  | 2026-01-14 16:15:32+08:00 |  |
+| `card_b1_turn_dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 16:13:46+08:00 |  |
+| `card_b2_turn_dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 16:13:46+08:00 |  |
+| `card_b3_turn_dtm` | TIMESTAMP WITH TIME ZONE | 56.46% |  |  | 2026-01-14 16:14:14+08:00 |  |
+| `t4_take_begin_dtm` | TIMESTAMP WITH TIME ZONE | 100.0% |  |  |  |  |
+| `t4_take_end_dtm` | TIMESTAMP WITH TIME ZONE | 100.0% |  |  |  |  |
+| `rb_take_begin_dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 16:13:46+08:00 |  |
+| `game_start_dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 16:13:38+08:00 |  |
+| `payout_complete_dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 16:13:51+08:00 |  |
+| `table_limits` | VARCHAR | 0.0% |  | Many distinct values | Mass NB TP 3K-2M_6S_126N |  |
+| `table_template` | VARCHAR | 0.0% |  | Many distinct values | Mass NB_TP CBH4_6S_126N |  |
+| `table_name` | VARCHAR | 0.0% |  | Many distinct values | GMCNB0916 |  |
+| `game_status` | VARCHAR | 0.0% | 牌局狀態 | Enum: RESOLVED, UNRESOLVED, VOID | RESOLVED |  |
+| `adjusted_turnover` | DECIMAL(19,4) | 0.0% |  | 0.0000 ~ 10620000.0000 | 0.0000 |  |
+| `supervisor_first_name` | VARCHAR | 0.75% |  | Many distinct values | Wenli |  |
+| `supervisor_last_name` | VARCHAR | 0.77% |  | Many distinct values | Liu |  |
+| `dealer_first_name` | VARCHAR | 0.08% |  | Many distinct values | Shuming |  |
+| `dealer_last_name` | VARCHAR | 0.2% |  | Many distinct values | Mao |  |
+| `bonus` | DECIMAL(19,4) | 100.0% |  |  |  |  |
+| `is_lucky_six` | INTEGER | 0.0% |  | Min: 0, Max: 1 | 0 |  |
+| `is_commissioned` | UTINYINT | 0.0% |  |  | 0 |  |
+| `pit_name` | VARCHAR | 0.0% |  | Many distinct values | GMCPIT09 |  |
+| `gaming_area` | VARCHAR | 0.0% |  | Enum: Premium Mass, Horizon Plus, NIC, Mass, Horizon | Mass |  |
+| `dealer_employee_number` | VARCHAR | 0.08% |  | Many distinct values | 8045429 |  |
+| `supervisor_employee_number` | VARCHAR | 0.75% |  | Many distinct values | 8001256 |  |
+| `gaming_day_first_game` | UTINYINT | 0.0% |  |  | 0 |  |
+| `include_in_aggregation` | UTINYINT | 0.0% |  |  | 0 |  |
+| `game_errors` | VARCHAR | 21.04% | 遊戲錯誤訊息 | 74.4萬筆有錯誤訊息，其餘為空字串或 NULL |  |  |
+| `game_variance` | DECIMAL(19,4) | 0.0% |  |  | 0.0000 |  |
+| `is_lucky8_player` | INTEGER | 0.0% |  | Min: 0, Max: 0 | 0 |  |
+| `is_lucky8_banker` | INTEGER | 0.0% |  | Min: 0, Max: 0 | 0 |  |
+| `dealer_cards` | VARCHAR | 100.0% |  |  |  |  |
+| `game_type` | VARCHAR | 0.0% |  | Enum: BACCARAT | BACCARAT |  |
+| `dealer_cards_sum` | DECIMAL(19,4) | 100.0% |  |  |  |  |
+| `game_result` | VARCHAR | 0.0% |  | Many distinct values | P |  |
+| `shoe_game_count` | BIGINT | 0.0% |  | Min: 0, Max: 90 | 36 |  |
+| `game_variant` | VARCHAR | 0.0% |  | Enum: baccarat | baccarat |  |
+| `dealer_cards_metadata` | VARCHAR | 43.92% |  | Enum: null | null |  |
+| `lucky_card` | VARCHAR | 100.0% |  |  |  |  |
+| `prg_template_id` | BIGINT | 100.0% |  |  |  |  |
+| `__ts_ms` | BIGINT | 0.0% |  | Min: 1754385937, Max: 1770955627 | 1768378925 |  |
+| `__op` | VARCHAR | 0.0% |  | Enum: c | c |  |
+| `__deleted` | VARCHAR | 0.0% |  | Enum: False | False |  |
+| `__etl_insert_Dtm` | TIMESTAMP WITH TIME ZONE | 0.0% |  |  | 2026-01-14 16:14:31+08:00 |  |
 
 ---
 

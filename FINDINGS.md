@@ -20,7 +20,7 @@
 | **FND-01** | `t_session`<br>`session_id` | 🔴 P0 | **存在重複版本**：同一 ID 最多出現 3 筆，包含純 ETL 重複與事後帳務/狀態更正（`lud_dtm` 不同）。 | 若不去重，玩家/桌台的 turnover、win 會被重複計算。 | 任何建模或分析前，必須先做去重：首選 `MAX(lud_dtm)`，再取 `MAX(__etl_insert_Dtm)`。 |
 | **FND-02** | `t_session`<br>`is_manual` | 🔴 P0 | **人工帳務調整（非打牌）**：`is_manual=1` 皆為 0 局數、0 Turnover，但包含極端 `player_win`（回佣/補償）。 | 若混入真實 session，會嚴重破壞行為特徵（如 avg bet）。 | **行為建模**必須排除；**價值建模**需保留但分離為 `manual_*` 特徵；並設立防呆排除極端金額（防 typo）。 |
 | **FND-03** | `t_session`<br>`casino_player_id` | 🔴 P0 | **存在字串 `'null'`**：缺失值不僅為 NULL (27.4%)，還混雜了字串 `'null'` (0.77%)。 | 導致 ID Mapping 錯誤，並產生嚴重的假性「多對多」映射問題。 | 下游關聯或聚合前，一律將字串 `'null'` 或空字串清洗轉換為真實 `NULL`。 |
-| **FND-04** | `t_session`<br>`status` | 🟡 P1 | **大量空字串**：高達 4200 萬筆狀態為空字串，超過 `SUCCESS`。 | 報表可能混入未完成、作廢或異常流程資料。 | 在釐清業務邏輯前，關鍵指標保守建議只篩選 `status='SUCCESS'`。 |
+| **FND-04** | `t_session`<br>`status` | 🔴 P0 | **大量空字串包含真實注單**：高達 4200 萬筆狀態為空字串，且這其中有 96.6% 都能在 `t_bet` 找到對應注單，佔總體正常流水的 17%。同一 session_id 幾乎不會從空狀態轉為 SUCCESS (交集僅135筆)。 | 若盲目過濾 `status='SUCCESS'`，將會直接蒸發掉約 17% 的真實玩家下注資料。 | **不要過濾 `status='SUCCESS'`**！只要 `is_manual=0` 且能產生真實流水 (`turnover > 0` 或 `num_games_with_wager > 0`)，不論狀態為空字串或 SUCCESS 皆應保留作為特徵。 |
 | **FND-05** | `t_session`<br>`num_games...` | 🟡 P1 | **出現負值局數**：`num_games_with_wager` 存在負值（全表僅少數幾筆，皆發生在 manual 紀錄）。 | 做活躍或投注量計算時會出現邏輯錯誤。 | 對 `is_manual=0` 強制約束 `num_games >= 0`；對 `is_manual=1` 則不應依賴此欄位。 |
 | **FND-06** | `t_bet`<br>`bet_reconciled_at` | 🔴 P0 | **100% 無效值**：全表僅含 NULL (42%) 或 UNIX 預設值 `1970-01-01` (58%)，有效值為 0。 | 無法用於判斷「對帳是否完成」或計算對帳延遲。 | 下游一律將此欄位視為不可用，全部清洗成 NULL，需尋找其他來源判斷對帳狀態。 |
 | **FND-07** | `t_bet`<br>`casino_win` | 🟡 P1 | **極端值符合賠率邏輯**：存在單注破億的虧損，但派彩與 wager 比例（`payout_ratio`）完全符合玩法賠率（上限 100 倍）。 | 視覺檢查易被誤判為資料錯誤或灌水。 | 屬真實下注行為，不需如同 `t_session` 般排除，但可加 `payout_ratio <= 100` 作為防禦性 DQ 監控。 |
@@ -29,7 +29,9 @@
 | **FND-10** | `t_session`<br>`rating_status` & `verified_status` | 🟡 P1 | **狀態欄位為平行宇宙**：`rating_status` 100% 專屬於人工調整(`is_manual=1`)；`verified_status` 100% 專屬於實際遊玩(`is_manual=0`)。其餘 6600 萬筆皆為 NULL。 | 將兩者混用或視為連續流程會導致邏輯嚴重錯誤。 | 了解這兩個狀態分屬不同的業務流程（帳務審批 vs 桌台驗證），不要混為一談，多數正常遊玩紀錄其實兩者皆無。 |
 | **FND-11** | `t_session`<br>`player_id` & `casino_player_id` | 🔴 P0 | **雙向 M:N 多對多映射**：雖然佔比極低（約 **0.03%**），但有 97 個 `player_id` 對應多張卡（玩家換卡）；同時有 97 張卡對應多個 `player_id`（生物辨識系統斷鏈重發 ID）。 | 單純 JOIN 或聚合會產生嚴重重複計算（Cartesian Explosion）與玩家輪廓破碎。 | **行為歸戶唯一真理**：有卡客唯一依賴 `casino_player_id`（並向上溯源彙整所有 `player_id` 紀錄）；無卡客才退而求其次使用 `player_id`。 |
 | **FND-12** | `t_session`<br>`casino_player_id` | 🔴 P0 | **大量一次性/零局數的假帳號 (Dummy IDs)**：高達 **4.0%** 的活躍會員卡號（約 1.3 萬個 8 位純數字 ID）終其一生只有 1 個 session 且打牌局數 ≤ 1 局。這些 ID 廣泛分佈在 700 多張桌台上。 | 佔比高達 4%，直接把這些 ID 當作真實活躍會員會嚴重稀釋玩家指標（客單價、留存率）。 | 這些極可能是 CRM 生成的過客/伴遊 Dummy ID，建模時須透過 `session_cnt > 1 OR total_games > 1` 的特徵來排除這批「單次且無下注」的幽靈人口。注意：這批 Dummy ID 與正常會員卡號的長度/前綴完全重疊，**無法**單純用正規表達式過濾。 |
-| **FND-13** | `t_session`, `t_bet`<br>時間欄位綜合評估 | 🔴 P0 | **系統時間受回填污染，且 Session 紀錄為「結束後」入湖**：`__etl_insert_Dtm` 與 `__ts_ms` 遇回填會嚴重失真。正常情況下，`t_session` 是在牌局結束後才完整入湖；`session_end_dtm` 缺值極低 (0.06%) 且精準反映業務結束時間（duration 中位數約 3 分鐘）。 | 若依賴系統時間模擬即時串流 (Streaming) 會導致未來資料外洩 (Data Leakage)；若誤用 `session_start_dtm` 當作資料可見時間，會嚴重低估延遲。 | **串流模擬最佳實踐 (Event Time + Delay)**：完全棄用系統時間。<br>1. **`t_bet`**: `event_time = payout_complete_dtm`，可用延遲設為 **+1 分鐘**。<br>2. **`t_session`**: `event_time = COALESCE(session_end_dtm, lud_dtm)`，可用延遲設為 **+7 分鐘** (保守可設 15 分)。<br>*(註：增量抽取仍以 `MAX(lud_dtm)` 為 watermark)* |
+| **FND-13** | `t_session`, `t_bet`, `t_game`<br>時間欄位綜合評估 | 🔴 P0 | **系統時間受回填污染，且 Session 紀錄為「結束後」入湖**：`__etl_insert_Dtm` 與 `__ts_ms` 遇回填會嚴重失真（`t_game` 甚至觀察到長達 200 天的延遲）。正常情況下，`t_session` 是在牌局結束後才完整入湖；`session_end_dtm` 缺值極低 (0.06%) 且精準反映業務結束時間。 | 若依賴系統時間模擬即時串流 (Streaming) 會導致未來資料外洩 (Data Leakage)；若誤用 `session_start_dtm` 當作資料可見時間，會嚴重低估延遲。 | **串流模擬最佳實踐 (Event Time + Delay)**：完全棄用系統時間。<br>1. **`t_bet` / `t_game`**: `event_time = payout_complete_dtm`，可用延遲設為 **+1 分鐘**。<br>2. **`t_session`**: `event_time = COALESCE(session_end_dtm, lud_dtm)`，可用延遲設為 **+7 分鐘** (保守可設 15 分)。<br>*(註：增量抽取仍以 `MAX(lud_dtm)` 或 `MAX(__ts_ms)` 為 watermark)* |
+| **FND-14** | `t_game`<br>`game_id` | 🔴 P0 | **存在重複版本**：全表約 2.11 億列中，有約 3.4 萬個 `game_id` 發生重複（總列數大於 unique IDs）。 | 若不去重，牌局的財務結算與狀態會被重複計算。 | 任何建模或分析前，必須先做去重：依賴 `MAX(__ts_ms)` 或 `MAX(__etl_insert_Dtm)` 取得最新狀態。 |
+| **FND-15** | `t_game`<br>財務欄位 | 🟡 P1 | **財務欄位非零且包含極端值**：`total_turnover`, `casino_win` 等並非全為 0。`casino_win` 包含極端值（如單局虧損 1.1 億），與 `t_bet` 的極端派彩現象一致。 | 若誤以為 `t_game` 財務欄位全為 0 而忽略，會遺失局級別的財務特徵。 | 這是真實的業務數據彙總，可作為特徵使用，但需注意極端值對模型的影響。 |
 
 ---
 
@@ -93,12 +95,54 @@ SELECT
 FROM read_parquet('data/gmwds_t_session.parquet');
 ```
 
-### [FND-04] `status` 大量空字串
+### [FND-04] `status` 大量空字串包含真實注單
 ```sql
-SELECT status AS v, COUNT(*) AS cnt
+-- 1. 驗證空字串與 SUCCESS 在 turnover 上的貢獻差異
+SELECT 
+    CASE WHEN status = '' THEN '[Empty String]' ELSE status END as session_status,
+    COUNT(*) as total_rows,
+    SUM(CASE WHEN turnover > 0 THEN 1 ELSE 0 END) as rows_with_turnover,
+    SUM(CASE WHEN num_games_with_wager > 0 THEN 1 ELSE 0 END) as rows_with_games,
+    SUM(turnover) as sum_turnover,
+    SUM(num_games_with_wager) as sum_games
 FROM read_parquet('data/gmwds_t_session.parquet')
-GROUP BY 1
-ORDER BY cnt DESC NULLS LAST;
+WHERE is_manual = 0
+GROUP BY status
+ORDER BY total_rows DESC;
+
+-- 2. 抽樣驗證空字串 session 是否真有對應的 t_bet 注單
+WITH empty_sessions AS (
+    SELECT session_id, turnover, num_games_with_wager
+    FROM read_parquet('data/gmwds_t_session.parquet')
+    WHERE is_manual = 0 AND status = ''
+    LIMIT 1000000
+)
+SELECT 
+    COUNT(s.session_id) as total_empty_sessions,
+    SUM(CASE WHEN b.session_id IS NOT NULL THEN 1 ELSE 0 END) as sessions_with_bets_in_t_bet,
+    SUM(s.num_games_with_wager) as sum_games_in_session_table,
+    SUM(b.bet_cnt) as sum_bets_found_in_bet_table
+FROM empty_sessions s
+LEFT JOIN (
+    SELECT session_id, COUNT(*) as bet_cnt 
+    FROM read_parquet('data/gmwds_t_bet.parquet') 
+    GROUP BY session_id
+) b ON s.session_id = b.session_id;
+
+-- 3. 驗證同一個 session_id 是否會從空字串轉為 SUCCESS (交集極少)
+WITH empty_status_sessions AS (
+    SELECT DISTINCT session_id
+    FROM read_parquet('data/gmwds_t_session.parquet')
+    WHERE is_manual = 0 AND status = ''
+),
+success_status_sessions AS (
+    SELECT DISTINCT session_id
+    FROM read_parquet('data/gmwds_t_session.parquet')
+    WHERE is_manual = 0 AND status = 'SUCCESS'
+)
+SELECT COUNT(*) as total_overlap
+FROM empty_status_sessions e
+INNER JOIN success_status_sessions s ON e.session_id = s.session_id;
 ```
 
 ### [FND-05] `num_games_with_wager` 負值
@@ -310,4 +354,30 @@ SELECT
     approx_quantile(date_diff('second', payout_complete_dtm, __etl_insert_Dtm), 0.5) as med_etl_delay_sec
 FROM read_parquet('data/gmwds_t_bet.parquet')
 WHERE date_diff('day', payout_complete_dtm, __etl_insert_Dtm) BETWEEN 0 AND 1;
+
+-- 6) 評估 t_game 系統時間污染與延遲
+SELECT 
+  APPROX_QUANTILE(date_diff('second', payout_complete_dtm, __etl_insert_Dtm), 0.5) as p50_delay_sec,
+  APPROX_QUANTILE(date_diff('second', payout_complete_dtm, __etl_insert_Dtm), 0.95) as p95_delay_sec,
+  APPROX_QUANTILE(date_diff('second', payout_complete_dtm, __etl_insert_Dtm), 0.99) as p99_delay_sec
+FROM read_parquet('data/gmwds_t_game.parquet')
+WHERE payout_complete_dtm IS NOT NULL AND __etl_insert_Dtm IS NOT NULL;
+```
+
+### [FND-14] `t_game` 存在重複版本
+```sql
+SELECT 
+  COUNT(game_id) as total_rows, 
+  COUNT(DISTINCT game_id) as unique_game_ids,
+  COUNT(game_id) - COUNT(DISTINCT game_id) as duplicated_ids
+FROM read_parquet('data/gmwds_t_game.parquet');
+```
+
+### [FND-15] `t_game` 財務欄位非零且包含極端值
+```sql
+SELECT 
+  MIN(total_turnover) as min_turnover, MAX(total_turnover) as max_turnover,
+  MIN(casino_win) as min_casino_win, MAX(casino_win) as max_casino_win,
+  MIN(theo_win) as min_theo_win, MAX(theo_win) as max_theo_win
+FROM read_parquet('data/gmwds_t_game.parquet');
 ```
