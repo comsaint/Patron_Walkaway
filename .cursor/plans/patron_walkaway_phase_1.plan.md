@@ -1,6 +1,6 @@
 ---
 name: Patron Walkaway Phase 1
-overview: 依據 SSOT 文件（v8 改寫，整合七輪 Spec Compliance Review 及 SSOT 大幅改寫），全面重構 trainer/scorer pipeline，採雙軌特徵工程架構（Featuretools DFS 軌道 A + 向量化手寫軌道 B），封閉 leakage、train-serve parity 破口、Schema 層級錯誤與 edge cases（含 E1–E8、F1–F4、G1–G5、H1–H4、I1–I6），並建立完整的 Testing & Validation 規格，達成 Phase 1 MVP 上線條件。
+overview: 依據 SSOT 文件（v9 對齊，整合七輪 Spec Compliance Review、SSOT 大幅改寫及 §9.3 樣本加權 / §10.3 評估口徑 / §12.1 展示邊界釐清），全面重構 trainer/scorer pipeline，採雙軌特徵工程架構（Featuretools DFS 軌道 A + 向量化手寫軌道 B），visit-level 樣本加權校正 Length Bias，Micro + Macro-by-visit 雙口徑評估，封閉 leakage、train-serve parity 破口、Schema 層級錯誤與 edge cases（含 E1–E8、F1–F4、G1–G5、H1–H4、I1–I6），並建立完整的 Testing & Validation 規格，達成 Phase 1 MVP 上線條件。
 todos:
   - id: config-definitions
     content: Step 0：在 config.py 集中定義所有常數（含 v3 新增 TABLE_HC_WINDOW_MIN / PLACEHOLDER_PLAYER_ID / LOSS_STREAK_PUSH_RESETS / HIST_AVG_BET_CAP；v6 新增 OPTUNA_N_TRIALS）
@@ -18,10 +18,10 @@ todos:
     content: Step 4：新建 features.py（導入雙軌特徵工程；軌道 A EntitySet 兩階段 DFS；軌道 B 向量化手寫 loss_streak 等；嚴格套用 cutoff_time 防漏）
     status: pending
   - id: trainer-refactor
-    content: Step 5：重構 trainer.py（整合新模組；特徵篩選 Feature screening；雙模型；class_weight='balanced'；TRN-07 快取驗證）
+    content: Step 5：重構 trainer.py（整合新模組；特徵篩選 Feature screening；雙模型；class_weight='balanced' + visit-level sample_weight；Optuna 超參調優；TRN-07 快取驗證）
     status: pending
   - id: backtester-g1
-    content: Step 6：更新 backtester.py（G1 閾值搜尋改用 Optuna TPE，OPTUNA_N_TRIALS；D4 alert volume = 雙模型合計；gaming day 去重）
+    content: Step 6：更新 backtester.py（G1 閾值搜尋改用 Optuna TPE，OPTUNA_N_TRIALS；D4 alert volume = 雙模型合計；回測評估口徑每 visit 至多計 1 次 TP；Micro + Macro-by-visit 雙口徑報告）
     status: pending
   - id: scorer-refactor
     content: Step 7：重構 scorer.py（匯入 features.py；t_bet FINAL；t_session 禁用 FINAL + FND-01 去重；E3/E4/G2 基礎過濾與回補；G3 穩定排序；D2 三步身份判定；reason codes）
@@ -38,7 +38,14 @@ todos:
 isProject: false
 ---
 
-# Patron Walkaway Phase 1 實作計畫（v8）
+# Patron Walkaway Phase 1 實作計畫（v9）
+
+> v9 依據 SSOT 最新修訂（§9.3 樣本加權、§10.3 評估口徑、§12.1 展示邊界、§14 前端/產品 scope 釐清），在 v8 基礎上新增：
+>
+> - **Visit-level 樣本加權（SSOT §9.3 — 強制）**：訓練時計算 `1/N_visit` 反比權重並以 `sample_weight` 傳入 LightGBM，校正高頻玩家主導 training loss 的 Length Bias。與 `class_weight='balanced'` 並用（兩者層面不同）。
+> - **雙口徑評估報告（SSOT §9.3 + §10.3）**：Micro（以 bet 為單位）+ Macro-by-visit（以 visit 為單位取平均），若兩者差距顯著則重新審視加權策略。
+> - **回測去重口徑澄清（SSOT §10.3）**：「每 visit 至多計 1 次 TP」為**離線評估口徑**，不等同線上只發一次 alert。線上通知節流屬產品/前端決策。
+> - **Reason code 展示邊界（SSOT §12.1）**：模型服務每次推論必須輸出 `reason_codes`/`score`/`margin`；「連續兩輪一致才展示」等 UX 過濾策略屬前端（`trainer/frontend/`）責任，不在模型層實作。
 
 > v8 依據 SSOT 大幅改寫，對齊 §8.2 雙軌特徵工程架構。最重大變更：
 >
@@ -75,6 +82,8 @@ isProject: false
 - Session 特徵策略：**S1**（保守；`table_hc` 改用 `t_bet` 即時計算，禁用 `session_end`）
 - 上線閾值策略：**G1**（Precision ≥ Pmin AND 警報量 ≥ Vmin；雙模型合計）
 - 模型：Phase 1 = **LightGBM 雙模型**（Rated / Non-rated）
+- 樣本加權：**visit-level 反比權重**（`1/N_visit`，SSOT §9.3；與 `class_weight='balanced'` 並用）
+- 評估口徑：**Micro + Macro-by-visit 雙口徑**（SSOT §9.3 / §10.3）
 
 ---
 
@@ -336,6 +345,12 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 - 依序呼叫 `identity.py`（`cutoff_dtm = training_window_end`）→ 對**各時間窗口**：`labels.py`（C1）→ `features.py`（兩階段 DFS 軌道 A + 軌道 B 向量化手寫，傳入該窗之 cutoff 時間點）→ 特徵篩選（DFS 探索後執行一次，見 Step 4 §D）。
 - **雙模型分離**（SSOT §9.1）：Rated / Non-rated 各自訓練
 - **演算法與超參調優**（SSOT §9.2）：使用 LightGBM（`class_weight='balanced'`）。必須使用 **Optuna (TPE Sampler)** 在 validation set 上進行超參搜尋（如 `n_estimators`, `learning_rate`, `max_depth` 等），目標為最佳化 F-beta 或 PR-AUC。Phase 1 不使用 AutoML 框架。
+- **Visit-level 樣本加權（SSOT §9.3 — 強制）**：
+  - 對每個觀測點計算 `sample_weight = 1 / N_visit`，其中 `N_visit` 為同一 visit（`canonical_id` × `gaming_day`）在**訓練集**內的觀測點數（取樣後計算）。
+  - 以 `model.fit(..., sample_weight=weights)` 傳入 LightGBM。
+  - **與 `class_weight='balanced'` 並用**：`class_weight` 處理正/負例標籤不平衡；`sample_weight` 處理跨玩家個體頻率不平衡（Length Bias）。兩者層面不同，可同時套用。
+  - **防洩漏**：`sample_weight` 僅使用 training window 內觀測點數，不可混入 valid/test。
+  - **取樣一致性**：若 §4.3 下採樣已執行，`N_visit` 以取樣**後**的實際觀測點數為準。
 - **時間切割**：Train 70% / Valid 15% / Test 15%，嚴格按 `payout_complete_dtm` 排序
 - **TRN-07 快取驗證**：快取 key = `(window_start, window_end, data_hash)`；不符時強制重算
 - **輸出（原子單位，版本化交付）**：`rated_model.pkl`、`nonrated_model.pkl`、`**saved_feature_defs`（軌道 A 計算圖）**、`features.py`（軌道 B）、`feature_list.json`、reason code 映射表、`model_version`（格式：`YYYYMMDD-HHMMSS-{git_short_hash}`）。任何組件版本不匹配時，服務端必須拒絕載入並回報錯誤。
@@ -392,9 +407,15 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 - **G4（低，v4 新增）**：Visit 去重以表內 `gaming_day` 欄位為準。
   - 去重 key：`(canonical_id, gaming_day)`
   - `GAMING_DAY_START_HOUR` 僅作備援，不作主流程口徑
+- **回測評估口徑（SSOT §10.3）**：回測指標計算時，對同一 visit 至多計入 **1 次 True Positive**，以避免高頻玩家因大量觀測點膨脹精準度指標。
+  > **重要區分**：此去重僅是**離線評估口徑**，**不**意味著線上推論只對每位玩家每次造訪輸出一個 alert。線上通知節流屬產品/前端設計決策，不在模型規格範圍內。
 - 嚴格時序處理，不 look-ahead
 
-**輸出**（valid + test 各一份）：Precision / Recall / PR-AUC / F-beta / 每小時警報量（P5–P95）/ `rated_threshold` / `nonrated_threshold`
+**輸出**（valid + test 各一份）：
+
+- **Micro（以觀測點為單位）**：Precision / Recall / PR-AUC / F-beta / 每小時警報量（P5–P95）
+- **Macro-by-visit（以 visit 為單位取平均）**：Precision / Recall / PR-AUC / F-beta — 用以驗證模型對不同停留時長的玩家是否公平泛化。若 Micro 與 Macro 差距顯著，應重新審視 §9.3 加權策略。
+- `rated_threshold` / `nonrated_threshold`
 
 ---
 
@@ -415,7 +436,9 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
   - `is_rated_obs = (resolved_card_id IS NOT NULL)`。
   - `is_rated_obs = True` → 使用 Rated model（開放存取包含歷史關聯的 EntitySet 特徵）；否則 → 使用 Non-rated model（限制 EntitySet 僅能使用 `t_bet` 內部特徵）。
   - 所有輸出需記錄 `is_rated_obs` 與 `resolved_card_id`（若有）以便稽核。
-- **Reason code 輸出**（§12.1）：SHAP top-k → 4 個固定 reason codes；版本化映射表；穩定性護欄（連續兩個輪詢週期一致才展示）
+- **Reason code 輸出**（§12.1）：SHAP top-k → 4 個固定 reason codes；版本化映射表（隨 `model_version` 管理）。
+  - 模型服務（`/score` 端點）**每次推論必須輸出** `reason_codes`、`score`、`margin`、`model_version`、`scored_at`，不在模型層做「連續輪詢一致才輸出」的過濾。
+  - **展示穩定性屬前端/產品責任**：是否連續兩輪一致才對 Host 展示、或設通知冷卻期，由 `trainer/frontend/` 及 UX 邏輯決定，不在本模型工程規格範圍內。
 
 ---
 
@@ -434,7 +457,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 - `POST /score`：接收 bet-level 特徵列（上限 10,000）→ 3 秒內回傳；stateless & idempotent
 - `GET /health`：`{"status": "ok", "model_version": str}`
 - `GET /model_info`：從 `feature_list.json` 動態讀取（非硬編碼）
-- 缺欄位或多餘欄位一律 422，不默默補齊（SSOT §9.3）
+- 缺欄位或多餘欄位一律 422，不默默補齊（SSOT §9.4）
 
 ---
 
@@ -470,6 +493,15 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
   - **H4（raw data 證據）**：對 `data/gmwds_t_bet.parquet` 讀取 parquet 統計或抽樣，驗證 `wager_null_pct == 0`；並在訓練/推論各自記錄 `wager_null_pct` 作為漂移監控（若 >0 觸發告警與 feature contract 更新）
 - **Model Routing 測試**
   - **H3**：驗證 `is_rated_obs` 的路由條件不依賴 `is_known_player`，且 Rated/Non-rated 的 EntitySet 使用正確（Non-rated 限制存取歷史關聯路徑）。
+- **Sample Weight 測試（SSOT §9.3）**
+  - 驗證每個 visit（`canonical_id` × `gaming_day`）內所有觀測點的 `sample_weight` 值一致，且等於 `1 / N_visit`。
+  - 驗證 `sample_weight` 僅使用 training window 內觀測點數計算，不混入 valid/test 資料。
+  - 若 §4.3 下採樣已執行，驗證 `N_visit` 以取樣後實際觀測點數為準。
+  - 驗證 `sample_weight` 全為正值且無 NaN/Inf。
+- **雙口徑評估測試（SSOT §9.3 + §10.3）**
+  - 驗證評估報告同時包含 Micro（以觀測點為單位）與 Macro-by-visit（以 visit 為單位取平均）兩套指標。
+  - 驗證回測中同一 visit 至多計入 1 次 True Positive（離線評估口徑去重）。
+  - 驗證 Macro-by-visit 的計算邏輯：先對每個 visit 算 precision/recall，再取平均。
 
 ---
 
@@ -588,6 +620,24 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 
 ---
 
+## 第九輪 SSOT 對齊（v9）— 論證/理由（供後續 review 引用）
+
+- **Visit-level 樣本加權（SSOT §9.3）**：
+  - **問題根源**：以「每筆下注為觀測點」時，高頻玩家貢獻遠多於短暫停留玩家的觀測點，導致 LightGBM 的 loss 被高頻玩家行為主導（Length Bias / Frequency Selection Bias）。現有 `trainer.py` 僅使用 `class_weight='balanced'` 處理標籤不平衡，未處理跨玩家頻率不平衡。
+  - **風險機制**：模型對偶爾造訪或短暫停留的玩家泛化不足；precision/recall 指標被少數高頻玩家表現主導，不反映真實全場效果。
+  - **修正原則**：訓練時計算 `1/N_visit`（visit = `canonical_id` × `gaming_day`）反比權重，以 `sample_weight` 傳入 `model.fit()`。與 `class_weight='balanced'` 並用（作用層面不同）。取樣後計算 `N_visit` 以確保語義一致。
+- **雙口徑評估報告（SSOT §9.3 + §10.3）**：
+  - **問題根源**：若僅報告 Micro 指標（以 bet 為單位），高頻玩家的大量觀測點會主導指標數值，掩蓋模型對低頻/短暫玩家的真實表現。
+  - **修正原則**：同時報告 Micro（以 bet 為單位）與 Macro-by-visit（以 visit 為單位取平均）兩套指標。差距顯著時提示 Length Bias 未充分校正。
+- **回測去重口徑澄清（SSOT §10.3）**：
+  - **問題根源**：原計畫「套用每次造訪最多 1 個警報的去重邏輯」的用語模糊，可能被誤讀為線上推論也只對每個賭客每次造訪發一個 alert。
+  - **修正原則**：明確標註此去重僅為**離線評估口徑**（避免指標膨脹），不代表線上推論需節流。線上通知頻率屬產品/前端決策。
+- **Reason code 展示邊界（SSOT §12.1）**：
+  - **問題根源**：原計畫 Step 7 寫「穩定性護欄（連續兩個輪詢週期一致才展示）」，把 UX 展示過濾放在模型層，違反 SSOT §12.1 的最新定位。
+  - **修正原則**：模型服務每次推論必須完整輸出 `reason_codes`/`score`/`margin`/`model_version`/`scored_at`，不在模型層做展示過濾。「連續兩輪一致才展示」等策略屬 `trainer/frontend/` 的 UX 邏輯。
+
+---
+
 ## 第六輪 Spec Compliance Review（v6）— 論證/理由（供後續 review 引用）
 
 - **I1（FND-12 欄位名稱錯誤）**：
@@ -617,7 +667,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 
 Phase 1 上線後，以下閉環必須升格為產品生命週期的一部分：
 
-- **監控**：資料分佈與特徵漂移、警報量、precision/recall proxy、reason code 分佈、線上 validator 結果、`wager_null_pct` 等 feature contract 指標。
+- **監控**：資料分佈與特徵漂移、警報量、precision/recall proxy（含 Micro 與 Macro-by-visit 雙口徑）、reason code 分佈、線上 validator 結果、`wager_null_pct` 等 feature contract 指標。若 Micro 與 Macro-by-visit 差距持續擴大，應觸發 Length Bias 校正策略再審。
 - **校準**：依業務容量與季節性調整閾值 / gate（仍遵守 SSOT §10.2 的策略框架）。
 - **重訓**：在 drift 或策略變更時更新模型與特徵集合，並以 `model_version` + `/model_info` 管理演進（含 `saved_feature_defs` 同步版本化）。
 
