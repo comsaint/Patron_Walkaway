@@ -257,7 +257,7 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 - **實體定義**：
   - `t_bet` (target entity)：以 `bet_id` 為 index，`payout_complete_dtm` 為 time_index。
   - `t_session` (歷史輪廓)：以 `session_id` 為 index，`session_end_dtm`（或 `COALESCE(session_end_dtm, lud_dtm)`）為 time_index。
-  - **關係（Schema 事實）**：**`t_bet.session_id` → `t_session.session_id`**（每筆 bet 所屬的 session；many-to-one）。兩表唯一的直接外鍵是 `session_id`，不是 `table_id`；`canonical_id` 為 D2 衍生的玩家鍵，用於標籤/分組，不用於 EntitySet 表間關聯。
+  - **關係（Schema 事實）**：`**t_bet.session_id` → `t_session.session_id`**（每筆 bet 所屬的 session；many-to-one）。兩表唯一的直接外鍵是 `session_id`，不是 `table_id`；`canonical_id` 為 D2 衍生的玩家鍵，用於標籤/分組，不用於 EntitySet 表間關聯。
 - **特徵基元 (Primitives)**：
   - 轉化基元：`time_since`, `cum_sum`, `cum_mean`, 時間週期（時/分轉換）等。
   - 聚合基元：過去行為的 `count`, `sum`, `mean`, `max`, `min`, `trend`。
@@ -266,6 +266,7 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 #### B. 領域特有邏輯 (Custom Primitives)
 
 必須將賭客特有狀態邏輯註冊為自動化工具的 Custom Primitives：
+
 - **Run 邊界**（B2 修正）：自訂 `detect_run_boundary`，由工具統一計算距離 run start 時間。
 - **lossstreak（TRN-09 / E2 修正 — 高）**：自訂狀態機 Primitive：
   - `status = 'LOSE'` → 連敗 +1
@@ -299,7 +300,8 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 ### Step 5 — 訓練器重構（`[trainer/trainer.py](trainer/trainer.py)`）
 
 - 從 `config.py` 讀取所有參數
-- 依序呼叫 `identity.py`（`cutoff_dtm = training_window_end`）→ `labels.py`（C1）→ `features.py`（呼叫 Featuretools DFS，傳入標籤時間點作為 `cutoff_time` 嚴格防漏）
+- **時間窗口化抽取與資料量（SSOT §4.3）**：不得一次性載入全時段 4.38 億筆。須依時間分窗（如月/週）自 ClickHouse 逐窗拉取 `t_bet`/`t_session`，查詢對齊 partition（如 `gaming_day`）；每窗內跑 labels + features（DFS 依窗口分批呼叫），產出可寫磁碟或串接後再訓練。若需取樣，須保持時間順序並記錄取樣率。
+- 依序呼叫 `identity.py`（`cutoff_dtm = training_window_end`）→ 對**各時間窗口**：`labels.py`（C1）→ `features.py`（Featuretools DFS，傳入該窗之 cutoff 時間點）→ 特徵篩選（可選在合併後做一次）。
 - **特徵篩選 (Feature screening)**：在送入主模型前，增加單變量與共線性過濾，並可選用輕量 LightGBM 在 Train set 計算 feature importance 取 top-K，篩選後寫入 `feature_list.json`。
 - **雙模型分離**（§9.1）：Rated / Non-rated 各自訓練
 - **類別不平衡**：LightGBM 使用 `class_weight='balanced'`
@@ -460,10 +462,10 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 
 | 編號        | 嚴重性   | 類型                 | SSOT/Schema 位置                                     | v6 修正位置                                                            |
 | --------- | ----- | ------------------ | -------------------------------------------------- | ------------------------------------------------------------------ |
-| A1        | 高     | Leakage            | §4.2, §8.1                                         | Step 4 歷史特徵：`session_avail_dtm <= cutoff_time`                    |
+| A1        | 高     | Leakage            | §4.2, §8.1                                         | Step 4 歷史特徵：`session_avail_dtm <= cutoff_time`                     |
 | A2        | 低     | Leakage            | §4.2, S1                                           | Step 4 S1：扣除 `BET_AVAIL_DELAY_MIN`                                 |
 | B1        | 中     | Parity             | §6.2, D2                                           | Step 2：`cutoff_dtm` 截止 + 快取版本控制                                    |
-| B2        | 中     | Parity             | §8.2.B                                             | Step 0/4：`RUN_BREAK_MIN` + Custom Primitive                         |
+| B2        | 中     | Parity             | §8.2.B                                             | Step 0/4：`RUN_BREAK_MIN` + Custom Primitive                        |
 | B3        | 低     | 特徵遺漏               | §9.1                                               | Step 4：Non-rated 亦包含時間週期等轉換特徵                                      |
 | C1        | 低     | SSOT 含糊            | §7.2                                               | Step 3：明確「至少 X+Y，建議 1 天」                                           |
 | C2        | 資訊性   | SSOT 不一致           | §2.1 vs §4.2                                       | Step 0：`SESSION_AVAIL_DELAY_MIN = 15` + rationale                  |
