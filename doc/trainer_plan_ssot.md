@@ -180,13 +180,22 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 - **禁止未來洩漏 (No future leakage)**：線上推論可得的特徵，訓練才可以用。
 - **訓練-服務一致性 (Train-Serve Parity)**：特徵計算與 rolling window 邊界在訓練與服務端必須完全一致（TRN-08）。
 
-### 8.2 特徵類別
-* **A. 當前投注特徵 (`t_bet`)**：`wager`, `payout_odds`, `base_ha`, `bet_type`, `is_back_bet`, `position_idx`。
-* **B. 當前連續投注段（當前「run」）內累積特徵（`t_bet`）**：`cum_bets`, `cum_wager`, `avg_wager_sofar`, `minutes_since_run_start`, `bets_per_minute`, `loss_streak`（需修復 TRN-09 bug）。其中 `minutes_since_run_start` **不得依賴** `t_session.session_start_dtm`（該欄位在 `t_session`，且 `t_session` 可能延遲入湖），而應以線上可得的 `t_bet.payout_complete_dtm` 為基礎，使用狀態/快取記錄「本 run 的第一筆下注時間」來計算。
-* **C. 滾動窗口特徵 (`t_bet` 跨 Session)**：過去 5/15/30 分鐘投注次數、10/30 分鐘投注金額。
-* **D. 時間上下文**：`time_of_day_sin/cos`。
-* **E. 歷史賭客特徵（有卡客，來自已完成的 `t_session`）**：`hist_session_count`, `hist_avg_bet`, `hist_win_rate` 等。
-* **F. 牌局/氛圍特徵（來自 `t_game`；後期階段）**：例如同一局/同一桌的玩家數（「氣氛/擁擠度」）、同局總下注量、桌台近期走勢等。此類特徵在本專案**後期**才整合（見 §8.3 決策與 §14 未來方向）。
+### 8.2 自動化特徵工程 (Automated Feature Engineering)
+
+本專案**不再依賴人工編寫與維護的靜態特徵清單**（例如人工手寫的 A–E 類特徵），而是全面導入 **自動化特徵工程框架（首選 Featuretools）** 作為核心特徵生成引擎。這能大幅提升特徵產出效率，並系統性地探索多維度的時間序列聚合模式。
+
+**核心架構與實作要求：**
+1. **EntitySet 建構**：將 `t_bet`（觀測點與行為序列）及 `t_session`（歷史屬性）建構為關聯實體圖 (EntitySet)。兩表的**唯一直接關聯鍵**為 **`session_id`**（`t_bet.session_id` → `t_session.session_id`，多筆 bet 對應一筆 session）；`table_id` 僅為兩表共有欄位，不適合作為 EntitySet 的父子關係鍵。
+2. **特徵基元 (Primitives) 運用**：
+   - **轉換基元 (Transform Primitives)**：`time_since`、`cum_sum`、`cum_mean`、週期性特徵（如 `time_of_day_sin/cos` 註冊為自訂基元）等。
+   - **聚合基元 (Aggregation Primitives)**：自動生成對過去行為的 `count`, `sum`, `mean`, `max`, `min`, `trend` 等。
+3. **滾動窗口 (Rolling Windows) 與近期行為**：利用框架內建的窗口機制（如 Featuretools 的 `window_size` 參數），自動生成過去 5、15、30 分鐘的下注統計（次數、金額），取代手寫 SQL/Pandas 滾動邏輯。
+4. **絕對防洩漏 (Cutoff Time 護欄)**：必須嚴格使用自動化工具的 `cutoff_time` 機制。每個觀測點 $t$ 會被傳入作為 cutoff，工具在生成聚合特徵時會自動切斷 $t$ 之後的資料。此機制是取代人工防漏檢查的核心護欄。
+5. **領域特有邏輯 (Custom Primitives)**：對於賭場特有的狀態特徵（例如基於 `t_bet.status` 遇到 'LOSE' 加 1、'WIN' 重置的 `loss_streak`），必須封裝為 **Custom Primitive** 並註冊進框架，統一由自動化引擎驅動，禁止在框架外「手工外掛」。
+6. **特徵篩選 (Feature screening)**：DFS 產出的候選特徵數量可能過大，**必須**在送入正式訓練前增加一層篩選，產出「高潛力特徵清單」再訓練。
+   - **第一階段**：可依單變量與目標關聯（如 mutual information、變異數門檻）及冗餘剔除（如高相關、VIF）縮減候選集。
+   - **第二階段（可選）**：在訓練集上以輕量模型（如 LightGBM）計算 feature importance 或 SHAP，取 top-K 作為最終特徵集；此步驟須僅使用訓練時間區間內的資料，不得使用 valid/test，以符合 §8.1 防洩漏。
+   - 最終通過篩選的特徵清單即為 `feature_list.json` 的內容，訓練與推論端僅計算此清單內特徵，以維持 train–serve parity。
 
 ### 8.3 ★ 決策點：Session 與桌台特徵線上可用性 (S1/S2)
 `table_hc`（同桌人數）目前以 `session_end_dtm` 重建，存在未來資料洩漏（TRN-05）。
@@ -208,48 +217,44 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 
 ### 8.4 特徵工程路線比較與分期策略
 
-除了 §8.2 的「手工聚合特徵 + 表格模型」路線外，另一條成熟的路線是**事件序列嵌入 (Event Sequence Embedding)**：將每筆下注視為一個帶有多維上下文的事件，用序列模型（GRU / Transformer）學習多層級嵌入向量（bet → run/session → player），再用嵌入做下游分類。近年在金融交易、電信 churn、反詐等領域已有成熟落地案例（PyTorch-Lifestream [IJCAI 2025]、CASPR [Microsoft]、TransactionGPT 等）。
+除了 §8.2 的「自動化特徵工程 + GBDT」路線外，另一條成熟的路線是**事件序列嵌入 (Event Sequence Embedding)**：將每筆下注視為一個帶有多維上下文的事件，用序列模型（GRU / Transformer）學習多層級嵌入向量（bet → run/session → player），再用嵌入做下游分類。近年在金融交易、電信 churn、反詐等領域已有成熟落地案例（PyTorch-Lifestream [IJCAI 2025]、CASPR [Microsoft]、TransactionGPT 等）。
 
 **為何序列嵌入值得考慮——直觀範例：**
 - **玩家 A**：連贏 5 把小注 → 輸 1 把大注。
 - **玩家 B**：輸 1 把大注 → 連贏 5 把小注。
 
-在傳統聚合特徵（「過去 6 把平均下注與勝率」）中，兩者看起來一模一樣。但玩家 A 可能正處於挫敗即將離場，而玩家 B 正在回本、情緒完全不同。序列嵌入能捕捉這種節奏與順序的微妙差異。
+在傳統聚合特徵（即使是 Featuretools 生成的「過去 6 把平均下注與勝率」）中，兩者看起來一模一樣。但玩家 A 可能正處於挫敗即將離場，而玩家 B 正在回本、情緒完全不同。序列嵌入能捕捉這種節奏與順序的微妙差異。
 
 #### 兩條路線的全面比較
 
-| 面向 | 路線 A：手工聚合特徵 + GBDT | 路線 B：事件序列嵌入 + 深度學習 |
+| 面向 | 路線 A：自動化特徵工程 (Featuretools) + GBDT | 路線 B：事件序列嵌入 + 深度學習 |
 |---|---|---|
 | **訊號表達力** | 較弱。聚合統計丟失事件順序與節奏變化。 | 強。天然捕捉序列模式、時間間隔動態、行為節奏漸變。 |
-| **特徵工程成本** | 高。需領域專家手動設計、逐一驗證 train-serve parity。 | 低（理論上）。但需設計 tokenization schema 與事件編碼。 |
+| **特徵工程成本** | 中低。透過 Primitives 與 EntitySet 自動展開空間，但仍需定義 Custom Primitives。 | 低（理論上）。但需設計 tokenization schema 與事件編碼。 |
 | **可解釋性** | 高。Feature importance / SHAP 直觀，Host 和管理層容易理解「為何警報響了」。 | 低。黑箱；需額外解釋工具，業務推廣有阻力。 |
-| **即時部署難度** | 低。LightGBM < 1ms，特徵可增量更新/快取。 | 中。Forward pass ~幾 ms 可接受（45 秒輪詢週期內綽綽有餘），但序列狀態管理、模型版本控制、回滾策略更複雜。 |
-| **洩漏風險** | 已知且可控（已有 TRN-\* 護欄）。 | **更高**。序列切窗、padding、mask/label 定義引入新的洩漏陷阱，工程護欄需更嚴格。 |
+| **即時部署難度** | 低。線上維護相同的 EntitySet 狀態更新並計算，LightGBM < 1ms。 | 中。Forward pass ~幾 ms 可接受，但序列狀態管理、模型版本控制、回滾策略更複雜。 |
+| **洩漏風險** | **極低**。自動化工具內建嚴格的 Cutoff Time 機制。 | **更高**。序列切窗、padding、mask/label 定義引入新的洩漏陷阱，工程護欄需更嚴格。 |
 | **監控複雜度** | 成熟。特徵分佈、重要性、閾值等標準做法。 | **新維度**。需監控 embedding drift、序列長度漂移、表徵崩壞 (representation collapse) 等。 |
-| **冷啟動 / 無卡客** | 可用（靠近期窗口），但跨日人格化弱。 | 短序列仍可產出嵌入但品質較差；無卡客跨日身份不穩限制 player embedding 長期價值。 |
+| **冷啟動 / 無卡客** | 可用（依賴近期窗口與即時狀態）。 | 短序列仍可產出嵌入但品質較差；無卡客跨日身份不穩限制 player embedding 長期價值。 |
 | **與現有系統契合** | 高。現有 scorer 輪詢 + 狀態快取天然支持。 | 中。需新增嵌入生成/快取/版本管理機制。 |
-| **迭代速度** | 快。加特徵 → 重訓 → 看結果，循環短。 | 慢。架構調整、預訓練 + 微調流程更長。 |
+| **迭代速度** | 快。增減 Primitives → 自動生成 → 重訓，循環短。 | 慢。架構調整、預訓練 + 微調流程更長。 |
 | **學術成熟度** | 非常成熟。GBDT 在表格資料 benchmark 仍持平或優於 DL（NeurIPS 2022、ICLR 2025）。 | 快速成熟中（CASPR、PyTorch-Lifestream，2024–2025），但 casino 行業落地案例極少。 |
 
 #### 本專案決策：分期混合策略 (Phased Hybrid)
 
 | Phase | 做什麼 | 目標 | 備註 |
 |---|---|---|---|
-| **Phase 1（本期）** | 手工特徵 A–E + LightGBM | 上線 MVP，打通 pipeline，用高可解釋性建立業務信任。 | 對應 §8.2 與 §9。 |
-| **Phase 2（基礎模型驗證後）** | 離線 SSL 預訓練序列嵌入（**僅用 `t_bet`**，避開 `t_session` 延遲問題），產出 Player/Run Embedding（如 64 維向量），**每日批次更新**，推論時當作靜態特徵餵進 GBDT。 | 量化嵌入對 PR-AUC / F-beta 的增益；若有效則長期作為正式方案。 | 此做法避開「即時跑 NN forward pass」的工程風險，把序列模型的增益以最低成本注入現有架構。 |
-| **Phase 3（僅在 Phase 2 增益不足時）** | 端到端即時序列模型線上化。 | 完全捕捉即時序列動態。 | 需更嚴的延遲/可靠性/監控與回滾策略；不是必然的演進方向。 |
-
-### 8.5 自動特徵工程探索
-
-計畫使用 `tsfresh` 或 `Featuretools` 探索時間序列候選特徵（滾動、延遲、聚合運算），但產出的候選特徵仍必須通過 §8.1 的護欄（無洩漏、線上可重現），最終以 §8.2 的特徵架構/命名/計算模組落地。不符合者不納入。
+| **Phase 1（本期）** | 自動化特徵工程 + LightGBM | 上線 MVP，打通 pipeline，用高可解釋性與自動化高產出建立業務信任。 | 對應 §8.2 與 §9。完全取代手工特徵清單。 |
+| **Phase 2（基礎模型驗證後）** | 離線 SSL 預訓練序列嵌入（**僅用 `t_bet`**），產出 Player/Run Embedding，**每日批次更新**，推論時當作靜態特徵餵進 GBDT。 | 量化嵌入對 PR-AUC / F-beta 的增益；若有效則長期作為正式方案。 | 避開「即時跑 NN forward pass」的工程風險，把序列模型的增益以最低成本注入。 |
+| **Phase 3（僅在 Phase 2 增益不足時）** | 端到端即時序列模型線上化。 | 完全捕捉即時序列動態。 | 需更嚴的延遲/可靠性/監控與回滾策略。 |
 
 ---
 
 ## 9. 建模方法 (Modeling Approach)
 
 ### 9.1 雙模型架構
-- **有卡客模型**：使用特徵 A–E。包含歷史賭客輪廓，能利用過去行為模式。
-- **無卡客模型**：純粹依靠**當前與近期投注行為**（特徵 A–C），不使用任何來自 `t_session` 的歷史輪廓或 Session 級欄位。
+- **有卡客模型**：開放 EntitySet 完整存取權限。包含 `t_session` 的歷史賭客輪廓，能利用過去行為模式與跨日特徵。
+- **無卡客模型**：限制 EntitySet 僅能探索 `t_bet` 內部路徑（當前與近期投注行為及轉換特徵），不使用任何來自 `t_session` 的歷史輪廓或 Session 級聚合。
 分開模型可避免歷史特徵被大量 NaN 掩蓋，並允許對不同群體分別校準閾值。
 
 ### 9.2 演算法與切割
@@ -274,9 +279,9 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
   - 缺少或多出特徵欄位時回傳 422（**不**在服務端默默補齊）。
 
 - **特徵清單的角色**
-  - `doc/model_api_protocol.md` 中列出的特徵（例如 `minutes_since_session_start`, `minutes_to_session_end` 等）代表的是**當前實作狀態的快照**，**不是永久固定的合約**。
-  - 新版模型的 **實際特徵集合** 由訓練時的 `FEATURES` 決定，並透過 `/model_info.features` 對外公開；App 端以此為準同步更新 `scorer.py` 的特徵計算邏輯。
-  - 在設計新特徵時仍須遵守 §8.1 的護欄（無洩漏、線上可重現）。若現有 API 中某些欄位（如 session-based 欄位）與這些原則衝突，可以在後續 API 版本中調整定義或移除，搭配 `model_version` 與 `/model_info` 一併演進。
+  - `doc/model_api_protocol.md` 中列出的特徵代表的是**當前實作狀態的快照**，**不是永久固定的合約**。
+  - 新版模型的 **實際特徵集合** 將由自動化特徵工程（如 Featuretools DFS）動態生成，並透過 `feature_list.json` 及 `/model_info.features` 對外公開；App 端（`scorer.py`）必須依賴相同的 EntitySet 定義與 Featuretools 計算圖來同步產生線上特徵。
+  - 產出的特徵依然嚴格受制於 §8.1 的護欄（無洩漏、線上可重現），自動化工具的 Cutoff Time 機制正是確保此一合約的核心。
 
 ---
 
