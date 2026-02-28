@@ -224,6 +224,7 @@ def get_train_valid_test_split(chunks: list, train_frac=0.7, valid_frac=0.15) ->
 
 1. Call `time_fold.get_monthly_chunks()` for all boundaries
 2. For each chunk: fetch `t_bet` + `t_session` with DQ guardrails, build labels (C1), build features (Phase 1 DFS on sampled, Phase 2 full), write parquet
+   - Training/dev may optionally read the **already-exported full tables** from local Parquet (e.g. `.data/` folder, via Pandas or DuckDB) instead of querying ClickHouse to speed up iteration. This is an I/O swap only: apply the same DQ filters/dedup rules and enforce the same available-time/cutoff semantics. Production scoring/validation still uses ClickHouse as the source of truth.
 3. After all chunks: load parquets, split train/valid/test
 4. Compute `sample_weight = 1 / N_visit` per observation (training set only)
 5. Optuna hyperparameter search on valid set

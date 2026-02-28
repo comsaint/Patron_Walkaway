@@ -341,7 +341,8 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 - 從 `config.py` 讀取所有參數
 - **集中式時間窗口定義器（SSOT §4.3 — 強制）**：**必須**呼叫 `time_fold.py` 模組取得所有時間窗口邊界（月度 chunk 的 `window_start`/`window_end`、C1 延伸拉取緩衝 `extended_end`、Train/Valid/Test cutoff 點）。禁止在 trainer 內部自行計算邊界。
   - **邊界語義合約**：核心窗口為 `[window_start, window_end)`；延伸拉取區間 `[window_end, extended_end)` **僅供**觀測未來事件以計算標籤，其樣本**絕對不可**納入訓練集。
-- **時間窗口化抽取（SSOT §4.3）**：不得一次性載入全時段 4.38 億筆。依 `time_fold.py` 發放的邊界逐窗查詢 `t_bet`/`t_session`，對齊 partition（如 `gaming_day`）；每窗內跑 labels + features（DFS 依窗口分批呼叫），產出可寫磁碟或串接後再訓練。若需取樣，須保持時間順序並記錄取樣率。
+- **時間窗口化抽取（SSOT §4.3）**：不得一次性載入全時段 4.38 億筆。依 `time_fold.py` 發放的邊界逐窗抽取 `t_bet`/`t_session`，對齊 partition（如 `gaming_day`）；每窗內跑 labels + features（DFS 依窗口分批呼叫），產出可寫磁碟或串接後再訓練。若需取樣，須保持時間順序並記錄取樣率。
+  - **訓練/開發允許離線 Parquet 作為資料源**：若已將 ClickHouse 的完整表匯出到本機（例如 `.data/` 目錄中的 Parquet），trainer 可改為「讀取 Parquet（或經 DuckDB 掃描）」取代逐窗查 ClickHouse，以加速迭代；但仍必須套用完全相同的 DQ/去重/available_time 規則（Step 1 / SSOT §4.2 / §5）以及相同的時間窗口邊界語義。Production（線上 scorer/validator）資料來源仍以 ClickHouse 為準。
 - 依序呼叫 `identity.py`（`cutoff_dtm = training_window_end`）→ 對**各時間窗口**：`labels.py`（C1）→ `features.py`（兩階段 DFS 軌道 A + 軌道 B 向量化手寫，傳入該窗之 cutoff 時間點）→ 特徵篩選（DFS 探索後執行一次，見 Step 4 §D）。
 - **雙模型分離**（SSOT §9.1）：Rated / Non-rated 各自訓練
 - **演算法與超參調優**（SSOT §9.2）：使用 LightGBM（`class_weight='balanced'`）。必須使用 **Optuna (TPE Sampler)** 在 validation set 上進行超參搜尋（如 `n_estimators`, `learning_rate`, `max_depth` 等），目標為最佳化 F-beta 或 PR-AUC。Phase 1 不使用 AutoML 框架。
@@ -490,7 +491,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
   - 驗證 `loss_streak` 僅依賴 `status` 欄位（E2）
   - 驗證 `hist_avg_bet` 最大值 ≤ `HIST_AVG_BET_CAP`（F2）
   - **G5**：驗證 winsorization 是先做 row-level cap（單列 `t_session.avg_bet`）再聚合，而不是聚合後才截斷
-  - **H4（raw data 證據）**：對 `data/gmwds_t_bet.parquet` 讀取 parquet 統計或抽樣，驗證 `wager_null_pct == 0`；並在訓練/推論各自記錄 `wager_null_pct` 作為漂移監控（若 >0 觸發告警與 feature contract 更新）
+  - **H4（raw data 證據）**：對「本機匯出的 `t_bet` Parquet」（例如 `.data/` 內對應檔）讀取 parquet 統計或抽樣，驗證 `wager_null_pct == 0`；並在訓練/推論各自記錄 `wager_null_pct` 作為漂移監控（若 >0 觸發告警與 feature contract 更新）
 - **Model Routing 測試**
   - **H3**：驗證 `is_rated_obs` 的路由條件不依賴 `is_known_player`，且 Rated/Non-rated 的 EntitySet 使用正確（Non-rated 限制存取歷史關聯路徑）。
 - **Sample Weight 測試（SSOT §9.3）**
@@ -605,7 +606,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
   - **風險機制**：未定義路由會導致工程端用錯欄位（尤其是 `is_known_player`），或讓 non-rated 誤用 E 類特徵造成 parity / 服務錯誤。
   - **修正原則**：以 `resolved_card_id`（session-card 或 mapping 命中）定義 `is_rated_obs`，並記錄於輸出供稽核。
 - **H4（wager NULL 與 NA propagation）**：
-  - **事實依據（raw data）**：對 `data/gmwds_t_bet.parquet`（438,005,955 rows）使用 Parquet row-group statistics 讀取，`wager null_count = 0`；抽樣前 5 個 row groups 亦 `wager NULL = 0`。
+  - **事實依據（raw data）**：對「本機匯出的 `t_bet` Parquet」（例如 `.data/` 內對應檔；約 4.38e8 rows）使用 Parquet row-group statistics 讀取，`wager null_count = 0`；抽樣前 5 個 row groups 亦 `wager NULL = 0`。
   - **結論**：本批資料不會因 `wager` NULL 造成 cumsum NA 汙染；但仍保留 `fillna(0)` 作防呆，以應對未來資料版本變更。不要把 `wager_is_null` 納入 feature list（避免常數欄），改用 `wager_null_pct` 監控觸發合約演進。
 
 ## 第八輪 SSOT 對齊（v8）— 論證/理由（供後續 review 引用）
