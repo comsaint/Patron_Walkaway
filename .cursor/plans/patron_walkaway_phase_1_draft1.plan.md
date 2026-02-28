@@ -1,30 +1,30 @@
 ---
 name: Patron Walkaway Phase 1
-overview: 依據 SSOT 文件（v3，整合三輪 Spec Compliance Review 共 20 項修正），全面重構 trainer/scorer pipeline，封閉所有 leakage、train-serve parity 破口、Schema 層級錯誤（E1–E8、F1–F4），並建立完整的 Testing & Validation 規格，達成 Phase 1 MVP 上線條件。
+overview: 依據 SSOT 文件（v5，整合五輪 Spec Compliance Review），全面重構 trainer/scorer pipeline，封閉 leakage、train-serve parity 破口、Schema 層級錯誤與 edge cases（含 E1–E8、F1–F4、G1–G5、H1–H4），並建立完整的 Testing & Validation 規格，達成 Phase 1 MVP 上線條件。
 todos:
   - id: config-definitions
-    content: Step 0：在 config.py 集中定義所有常數（含 v3 新增 TABLE_HC_WINDOW_MIN / PLACEHOLDER_PLAYER_ID / LOSS_STREAK_PUSH_RESETS / HIST_AVG_BET_CAP）
+    content: Step 0：在 config.py 集中定義所有常數（含 v3 新增 TABLE_HC_WINDOW_MIN / PLACEHOLDER_PLAYER_ID / LOSS_STREAK_PUSH_RESETS / HIST_AVG_BET_CAP；v6 新增 OPTUNA_N_TRIALS）
     status: pending
   - id: dq-guardrails
-    content: Step 1：P0 資料品質護欄（E1 移除 t_bet.is_manual；E3 payout_complete_dtm IS NOT NULL；E4/F1 player_id != -1；E5 所有查詢加 FINAL；E7 FND-04 COALESCE；F3 is_deleted/is_canceled）
+    content: Step 1：P0 資料品質護欄（E1 移除 t_bet.is_manual；E3 payout_complete_dtm IS NOT NULL；E4/F1 player_id != -1；G1 t_session 禁用 FINAL、用 FND-01 去重；E7 FND-04 COALESCE；F3 is_deleted/is_canceled）
     status: pending
   - id: identity-module
     content: Step 2：新建 identity.py（E6 FND-12 正確聚合 SQL；E4 player_id != -1；D2 M:N 衝突規則；B1 cutoff_dtm）
     status: pending
   - id: labels-module
-    content: Step 3：新建 labels.py（C1 防洩漏；延伸拉取至少 X+Y；t_bet FINAL + E3 IS NOT NULL）
+    content: Step 3：新建 labels.py（C1 防洩漏；延伸拉取至少 X+Y；t_bet FINAL + E3 IS NOT NULL；G3 穩定排序 payout_complete_dtm, bet_id）
     status: pending
   - id: features-module
-    content: Step 4：新建 features.py（E2 loss_streak 改用 status='LOSE'；F4 PUSH 語義；F2 hist_avg_bet winsorize；D1 TABLE_HC_WINDOW_MIN；E5 FINAL；TRN-05/08/09）
+    content: Step 4：新建 features.py（全面導入 Featuretools 等自動化特徵工程；定義 EntitySet 與 Custom Primitives；嚴格套用 cutoff_time 防漏；實作 loss_streak 等特有邏輯）
     status: pending
   - id: trainer-refactor
-    content: Step 5：重構 trainer.py（整合新模組；雙模型；class_weight='balanced'；TRN-07 快取驗證）
+    content: Step 5：重構 trainer.py（整合新模組；特徵篩選 Feature screening；雙模型；class_weight='balanced'；TRN-07 快取驗證）
     status: pending
   - id: backtester-g1
-    content: Step 6：更新 backtester.py（G1 閾值搜尋；D4 alert volume = 雙模型合計；gaming day 去重）
+    content: Step 6：更新 backtester.py（G1 閾值搜尋改用 Optuna TPE，OPTUNA_N_TRIALS；D4 alert volume = 雙模型合計；gaming day 去重）
     status: pending
   - id: scorer-refactor
-    content: Step 7：重構 scorer.py（匯入 features.py；E5 FINAL；E3/E4 基礎過濾；D2 三步身份判定；reason codes）
+    content: Step 7：重構 scorer.py（匯入 features.py；t_bet FINAL；t_session 禁用 FINAL + FND-01 去重；E3/E4/G2 基礎過濾與回補；G3 穩定排序；D2 三步身份判定；reason codes）
     status: pending
   - id: validator-update
     content: Step 8：更新 validator.py（canonical_id；45min horizon；gaming day 去重）
@@ -38,9 +38,31 @@ todos:
 isProject: false
 ---
 
-# Patron Walkaway Phase 1 實作計畫（v3）
+# Patron Walkaway Phase 1 實作計畫（v7）
 
-> v3 在 v2 基礎上整合了 Round 3 Spec Compliance Review 的 12 項新修正（E1–E8、F1–F4），以及 Round 2 遺留的 3 項補完（D1/D3/D4）。最重大變更：E1 移除 `t_bet.is_manual`（欄位不存在）、E2 修正 `loss_streak` 使用 `status='LOSE'`（`payout_value` 100% NULL）、E5 所有 ClickHouse 查詢加 `FINAL`。
+> v7 在 v6 基礎上新增整合 **第七輪業務需求對齊（Automated Feature Engineering）**。最重大變更：
+>
+> - **全面替換手工特徵工程**：捨棄原有的靜態 A–E 特徵清單，全面導入 **Featuretools** 作為核心特徵生成引擎。這將特徵產出的範式從「逐一手寫滾動/聚合 SQL 與 Pandas 邏輯」轉變為「定義 EntitySet、註冊 Custom Primitives（如 `loss_streak` 狀態機），並透過 DFS (Deep Feature Synthesis) 自動展開多維特徵空間」。
+> - **Cutoff Time 防漏機制**：不再依賴人工編寫 `session_avail_dtm <= obs_time` 等過濾條件，而是統一利用自動化工具內建的 `cutoff_time` 參數，從底層確保任何特徵計算都不會接觸到該觀測點之後的資料。
+
+> v6 在 v5 基礎上新增整合 **第六輪 Spec Compliance Review（I1–I4, I6）**。最重大變更：
+>
+> - **I1（中）**：Step 2 FND-12 假帳號排除 SQL 的 `HAVING` 子句使用了不存在的 `num_games` 欄位。修正為 `SUM(COALESCE(num_games_with_wager, 0)) <= 1`（`num_games_with_wager` 為 DDL 實際存在欄位，且為 Nullable）。
+> - **I2（中）**：Step 2 的兩段 SQL 範例皆直接 `FROM t_session WHERE ...`，未套用 FND-01 去重 CTE，若照抄會在原始未去重 rows 上建 mapping。修正為先包裹 `WITH deduped AS (ROW_NUMBER ...)` 再查詢。
+> - **I3（低）**：TRN-* Checklist 的 TRN-01「v3 更新」欄仍寫「加 FINAL（E5）」，與 v4 G1 決策矛盾。修正為「禁用 FINAL（G1），純依 FND-01 去重」。
+> - **I4（低）**：Step 6 閾值搜尋只描述單維掃描，未說明如何同時決定 `rated_threshold` 與 `nonrated_threshold`。首次明確二維搜尋需求（後由 I6 取代）。
+> - **I6（低）**：二維網格搜尋（99×99 = 9,801 組合）效率不足。改用 **Optuna TPE**（`TPESampler`，`n_trials=OPTUNA_N_TRIALS=300`），以貝葉斯採樣取代窮舉，大幅降低評估次數並智慧收斂至最優閾值組合。
+
+> v5 在 v4 基礎上新增整合 **第五輪 Spec Compliance Review（H1–H4）**。最重大變更：
+>
+> - **G1（高）**：`t_session` 禁用 `FINAL`，避免 ReplacingMergeTree（無 version 欄位）在 merge 時非決定性丟列，破壞 FND-01 的業務去重（MAX(lud_dtm)）。
+> - **G3（中）**：全系統穩定排序 `ORDER BY payout_complete_dtm ASC, bet_id ASC`，封住同毫秒多注造成的 Train-Serve Parity 破口。
+> - **G4（低）**：Visit / 去重以表內 `gaming_day` 欄位為準，不再以 `GAMING_DAY_START_HOUR` 自算作為主流程。
+> - **G2（中）**：`t_bet.player_id` 缺失但 `session_id` 存在時，先 join `t_session` 回補 `player_id` 再做 D2。
+> - **G5（低）**：`hist_avg_bet` winsorize 必須先做 row-level cap，再做跨 session 聚合。
+> - **H1（中）**：標籤建構對 `next_bet` 缺失（終端下注）需明確處理：若資料覆蓋足夠則視為 gap start；不足則視為 censored 排除（避免右截尾 TRN-06 反覆出現）。
+> - **H3（低）**：雙模型推論路由規則明文化（避免用錯欄位或用 `is_known_player`）。
+> - **H4（低）**：針對 `wager` 空值傳播加入防呆，但以 raw parquet 證據確認本批資料 `wager NULL=0`，因此不把 `wager_is_null` 納入 feature list（避免常數特徵）。
 
 ---
 
@@ -76,7 +98,7 @@ trainer/
 
 ### Step 0 — 集中常數定義（`[trainer/config.py](trainer/config.py)`）
 
-**目標**：全系統唯一事實來源；v3 新增 4 個常數。
+**目標**：全系統唯一事實來源；v3 新增 4 個常數；v6（I6）新增 `OPTUNA_N_TRIALS`。
 
 **業務參數**
 
@@ -93,15 +115,17 @@ trainer/
 
 - `RUN_BREAK_MIN = WALKAWAY_GAP_MIN`（= 30 分鐘）
 
-**Gaming Day**
+**Gaming Day / Visit 去重（v4：G4 修正）**
 
-- `GAMING_DAY_START_HOUR = 6`（本地時間 06:00；需業務確認）
+- **主流程以資料表 `gaming_day` 欄位為準**：回測/去重的 visit key 使用 `(canonical_id, gaming_day)`。
+- `GAMING_DAY_START_HOUR = 6` 僅保留為**備援參數**（敏感性分析或缺少 `gaming_day` 欄位的資料源才啟用），Phase 1 不依賴自算 gaming day。
 
 **G1 閾值策略**
 
 - `G1_PRECISION_MIN = 0.70`（暫定）
 - `G1_ALERT_VOLUME_MIN_PER_HOUR = 5`（暫定）
 - `G1_FBETA = 0.5`（β < 1，精準度優先）
+- `OPTUNA_N_TRIALS = 300`（I6：Optuna TPE 搜尋次數；300 次在 2D 空間通常足以收斂）
 
 **v3 新增常數（D1/E2/F2/F4 修正）**
 
@@ -122,11 +146,19 @@ trainer/
 
 **必須實作的過濾模式（對齊 SSOT §5）**
 
-- **E5（高，v3 新增 — ClickHouse FINAL）**：所有 `t_bet` 和 `t_session` 查詢**必須加 `FINAL`**，例如 `SELECT ... FROM t_bet FINAL WHERE ...`。`ReplacingMergeTree` 在無 `FINAL` 時不保證去重，直接影響標籤、特徵正確性。
-- **FND-01（TRN-01）**：`t_session FINAL` 去重：`ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC) = 1`
+- **G1（高，v4 新增 — `t_session` 禁用 `FINAL`）**：`t_session` 使用 `ReplacingMergeTree` 且未指定 version 欄位。
+  - 使用 `FINAL` 時，ClickHouse merge 可能對重複 key 任意保留一列（非決定性），使得後續 FND-01 的 `ROW_NUMBER()` 沒機會選到真正最新的 `lud_dtm`。
+  - 因此 `**t_session` 查詢不得使用 `FINAL`**，必須依賴 FND-01 的 SQL window 去重。
+- **E5（中，v3 新增 — ClickHouse 去重策略）**：
+  - `t_bet`：可使用 `FINAL` 以降低重複列風險（若後續確認 `bet_id` 幾乎無重複，可移除以提升效能）。
+  - `t_session`：一律不用 `FINAL`（見 G1）。
+- **FND-01（TRN-01）**：`t_session` 去重：`ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC) = 1`
 - **FND-02（TRN-02）— E1 修正（高）**：`is_manual = 0` 過濾**僅適用 `t_session`**。`t_bet` 表**無 `is_manual` 欄位**（Schema 確認），v2 計畫錯誤對 `t_bet` 套用此過濾，v3 必須移除。TRN-02 對應關係更新為：「`t_session` 加 `WHERE is_manual = 0`；`t_bet` 無對應過濾。」
 - **E3（中，v3 新增 — Nullable 時間）**：所有 `t_bet` 查詢的基礎 WHERE 子句必須包含 `payout_complete_dtm IS NOT NULL`，因該欄位為 Nullable，NULL 值無法用於時間排序或滾動窗口計算。
-- **E4/F1（中，v3 新增 — 佔位符 player_id）**：所有 `t_bet` 查詢加入 `player_id IS NOT NULL AND player_id != PLACEHOLDER_PLAYER_ID`（from config = -1）；`session_id IS NULL` 的行可保留（用 `player_id` 兜底），但在 D2 歸戶前需記錄比例。
+- **E4/F1（中，v3 新增 — 佔位符 player_id）**：`player_id = -1` 或 NULL 視為無效。
+  - **G2（中，v4 新增）**：若 `player_id` 無效但 `session_id` 有效，需先 join `t_session`（用 FND-01 去重後版本）回補 `player_id`：
+    - `effective_player_id = COALESCE(t_bet.player_id, t_session.player_id)`
+    - 最終只保留 `effective_player_id IS NOT NULL AND effective_player_id != PLACEHOLDER_PLAYER_ID`
 - **F3（低，v3 新增 — 軟刪除欄位）**：`t_session` 查詢加入 `is_deleted = 0 AND is_canceled = 0`；這兩個欄位存在於 schema 但 v2 計畫未使用。
 - **FND-03**：`casino_player_id` 清洗使用 `CASINO_PLAYER_ID_CLEAN_SQL`（from config）
 - **FND-04（E7 修正 — NULL-safe）**：條件改為 `COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0`；原版 NULL-unsafe，當欄位為 NULL 時過濾不生效。
@@ -142,30 +174,48 @@ trainer/
 
 **目標**：建立 `player_id → canonical_id` 映射，修正 FND-11/TRN-03；v3 補完 E6（FND-12 聚合 SQL）與 E4（`player_id != -1`）。
 
-**Mapping 建置查詢**（必須含 `FINAL` — E5 修正）
+**Mapping 建置查詢**（v4：G1 修正 — `t_session` 不用 `FINAL`；v6：I2 修正 — 先以 FND-01 CTE 去重再查詢）
 
 ```sql
--- 第一步：抽取連結邊
+-- 第一步：抽取連結邊（先 FND-01 去重）
+WITH deduped AS (
+  SELECT *,
+    ROW_NUMBER() OVER (
+      PARTITION BY session_id
+      ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC
+    ) AS rn
+  FROM t_session
+)
 SELECT player_id, casino_player_id
-FROM t_session FINAL
-WHERE is_manual = 0
+FROM deduped
+WHERE rn = 1
+  AND is_manual = 0
   AND is_deleted = 0 AND is_canceled = 0
   AND player_id IS NOT NULL AND player_id != {PLACEHOLDER_PLAYER_ID}
   AND COALESCE(session_end_dtm, lud_dtm) <= :cutoff_dtm
   AND {CASINO_PLAYER_ID_CLEAN_SQL} IS NOT NULL
 ```
 
-**FND-12 假帳號排除（E6 修正）**：`session_cnt` / `total_games` 是聚合欄位，需先聚合再過濾：
+**FND-12 假帳號排除（E6 修正；v6：I1 修正欄位名稱、I2 修正加入 FND-01 去重 CTE）**：`session_cnt` / `total_games` 是聚合欄位，需先聚合再過濾；`num_games_with_wager`（有實際下注的局數）為 Schema 內實際欄位，需 COALESCE 因其為 Nullable：
 
 ```sql
--- 第二步：識別假帳號（先聚合）
+-- 第二步：識別假帳號（先 FND-01 去重，再聚合）
+WITH deduped AS (
+  SELECT *,
+    ROW_NUMBER() OVER (
+      PARTITION BY session_id
+      ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC
+    ) AS rn
+  FROM t_session
+)
 SELECT player_id
-FROM t_session FINAL
-WHERE is_manual = 0
+FROM deduped
+WHERE rn = 1
+  AND is_manual = 0
   AND is_deleted = 0 AND is_canceled = 0
   AND player_id IS NOT NULL AND player_id != {PLACEHOLDER_PLAYER_ID}
 GROUP BY player_id
-HAVING COUNT(session_id) = 1 AND SUM(num_games) <= 1
+HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 ```
 
 **M:N 衝突規則**（兩種情境明文固定）：
@@ -186,65 +236,71 @@ HAVING COUNT(session_id) = 1 AND SUM(num_games) <= 1
 **目標**：防洩漏 walkaway label，處理右截尾（TRN-06）。
 
 - 時間軸依 `t_bet FINAL` 的 `payout_complete_dtm`（需 IS NOT NULL — E3）
+- **G3（中，v4 新增 — 穩定排序）**：同毫秒多注（主注/旁注）會共享相同 `payout_complete_dtm`，標籤建構必須使用穩定排序：`ORDER BY payout_complete_dtm ASC, bet_id ASC`（訓練與服務端一致）。
 - Gap start：`b_{i+1} - b_i ≥ WALKAWAY_GAP_MIN`
 - Label：觀測點 `t = b_j`，若 `[t, t + ALERT_HORIZON_MIN]` 內存在 gap start → `label = 1`
 - **C1 延伸拉取**：`window_end` 往後**至少** `LABEL_LOOKAHEAD_MIN`，實務建議 **1 天**（SSOT §7.2）；延伸區間僅用於標籤計算，不納入訓練集
 - 嚴禁進入特徵的衍生量：`minutes_to_next_bet`、`next_bet_dtm` 等
+- **H1（中，v5 新增 — 終端下注 / next_bet 缺失）**：對同一 `canonical_id` 的 bet 序列，若某筆 `b_i` 在延伸拉取後仍無 `b_{i+1}`（next_bet 缺失），必須明確區分：
+  - **可判定（非右截尾）**：若延伸資料覆蓋足夠使得 `b_i + WALKAWAY_GAP_MIN <= window_end_extended`，則可視 `b_i` 為 gap start（表示在可觀測的未來至少 X 分鐘內皆無下注）。
+  - **不可判定（右截尾）**：若 `b_i` 靠近 `window_end_extended`，使得未來 X 分鐘覆蓋不足，則將該觀測點標記為 **censored** 並排除訓練/評估（避免 TRN-06 重新發生）。
+  - 註：這個規則只影響「next_bet 缺失」的邊界樣本；一般樣本仍由 `b_{i+1} - b_i >= X` 判定 gap start。
 
 ---
 
 ### Step 4 — 共用特徵模組（`[trainer/features.py](trainer/features.py)`，Train-Serve Parity 核心）
 
-**目標**：Trainer 與 Scorer 共同匯入的唯一特徵計算來源；v3 修正 TRN-09（lossstreak 方法）、F2（winsorization）、F4（PUSH 語義）、D1（TABLEHCWINDOWMIN）。
+**目標**：導入自動化特徵工程（如 Featuretools），完全取代人工寫死的靜態特徵清單；確保 EntitySet 與 Cutoff Time 的使用在 Trainer 與 Scorer 間保持絕對一致（Train-Serve Parity）。
 
-#### A. 當前投注特徵（直接來自 `t_bet FINAL`）
+#### A. 構建 EntitySet 與基元 (Primitives)
 
-- `wager`, `payout_odds`, `base_ha`, `bet_type`, `is_back_bet`, `position_idx`
+- **實體定義**：
+  - `t_bet` (target entity)：以 `bet_id` 為 index，`payout_complete_dtm` 為 time_index。
+  - `t_session` (歷史輪廓)：以 `session_id` 為 index，`session_end_dtm`（或 `COALESCE(session_end_dtm, lud_dtm)`）為 time_index。
+  - **關係（Schema 事實）**：**`t_bet.session_id` → `t_session.session_id`**（每筆 bet 所屬的 session；many-to-one）。兩表唯一的直接外鍵是 `session_id`，不是 `table_id`；`canonical_id` 為 D2 衍生的玩家鍵，用於標籤/分組，不用於 EntitySet 表間關聯。
+- **特徵基元 (Primitives)**：
+  - 轉化基元：`time_since`, `cum_sum`, `cum_mean`, 時間週期（時/分轉換）等。
+  - 聚合基元：過去行為的 `count`, `sum`, `mean`, `max`, `min`, `trend`。
+  - **H4（低，v5 補充 — 數值防呆）**：在餵入 EntitySet 前，對數值欄位（如 `wager`）做 `fillna(0)` 防呆。
 
-#### B. 當前 Run 內累積特徵
+#### B. 領域特有邏輯 (Custom Primitives)
 
-- `cum_bets`, `cum_wager`, `avg_wager_sofar`, `minutes_since_run_start`, `bets_per_minute`
-- **Run 邊界**（B2 修正）：`detect_run_boundary(prev_dtm, curr_dtm)` 由 `features.py` 實作，`scorer.py` 直接匯入同一函數
-- **lossstreak（TRN-09 / E2 修正 — 高）**：`payout_value` 100% NULL（FND-08），不可用 `payout - wager`。改用 `t_bet.status` 直接判定：
+必須將賭客特有狀態邏輯註冊為自動化工具的 Custom Primitives：
+- **Run 邊界**（B2 修正）：自訂 `detect_run_boundary`，由工具統一計算距離 run start 時間。
+- **lossstreak（TRN-09 / E2 修正 — 高）**：自訂狀態機 Primitive：
   - `status = 'LOSE'` → 連敗 +1
   - `status = 'WIN'` → 連敗重置為 0
-  - `status = 'PUSH'` → 依 `LOSS_STREAK_PUSH_RESETS`（from config）決定是否重置（F4 修正）
-  - 其他 status 值 → 視同 PUSH 處理並記錄警告
+  - `status = 'PUSH'` → 依 `LOSS_STREAK_PUSH_RESETS` 決定是否重置（F4 修正）。
+- **G3（中，v4 新增 — 穩定排序）**：在 Custom Primitives 處理內部，若遇到同毫秒多注，必須以 `payout_complete_dtm ASC, bet_id ASC` 穩定排序。
+- **G2（中，v4 新增 — player_id 回補）**：餵入 EntitySet 前，若 `t_bet.player_id` 無效但 `session_id` 有效，先以 `t_session` 回補 `effective_player_id`。
 
-#### C. 滾動窗口特徵
+#### C. 滾動窗口與自動探索
 
-- 過去 5/15/30 分鐘投注次數；10/30 分鐘投注金額
-- **邊界語義**（TRN-08 修正）：統一 `[t - window_min, t)`（不含當前 bet）
-- 所有查詢必須用 `t_bet FINAL`（E5 修正）
+- 捨棄人工手寫滾動 SQL/Pandas；改用語法糖（如 Featuretools `window_size`：5m, 15m, 30m）自動展開窗口統計。
+- 自動生成特徵候選集，並透過共線過濾與特徵重要性篩選，產出最終的 `feature_list.json`。
 
-#### D. 時間上下文
+#### D. 防洩漏與 Cutoff Time
 
-- `time_of_day_sin = sin(2π × hour_of_day / 24)`
-- `time_of_day_cos = cos(2π × hour_of_day / 24)`
+- 訓練與推論計算特徵時，必須統一依賴自動化工具的 `cutoff_time` 參數，嚴格切斷該觀測點時間之後的所有資料。
+- **E 類特徵修正（A1/F2/G5）**：當使用 `t_session` 資料作為聚合基礎時，必須確保 `session_avail_dtm <= cutoff_time`，並對 `avg_bet` 等 outlier 進行事前 winsorization（row-level cap）再餵給工具聚合。
 
-#### E. 歷史賭客特徵（僅有卡客）
+#### S1 — `table_hc` 即時計算 (Custom Primitive)
 
-- `hist_session_count`、`hist_avg_bet`、`hist_win_rate`
-- **A1 修正**：只使用 `COALESCE(session_end_dtm, lud_dtm) + SESSION_AVAIL_DELAY_MIN <= obs_time` 的 `t_session FINAL` 資料
-- **F2 修正（v3 新增）**：`hist_avg_bet` 計算後必須套用 winsorization：`min(raw_hist_avg_bet, HIST_AVG_BET_CAP)`（`t_session.avg_bet` 極端值可達 5 兆，直接影響模型穩定性）
+- **D1/A2 修正**：將「過去 `TABLE_HC_WINDOW_MIN` 分鐘內同桌不重複玩家數」寫成 Custom Primitive，由工具動態計算（扣除 `BET_AVAIL_DELAY_MIN` 以防漏）。
+- 查詢必須用 `t_bet FINAL`（E5 修正）。
 
-#### S1 — `table_hc` 即時計算
+#### 特徵組對應 (Rated vs Non-rated)
 
-- **D1 修正（v3 補完）**：窗口大小使用 `TABLE_HC_WINDOW_MIN`（from config），不在 features.py 內硬編碼
-- **A2 修正**：`payout_complete_dtm <= obs_time - BET_AVAIL_DELAY_MIN`（from config）
-- 查詢必須用 `t_bet FINAL`（E5 修正）
-
-#### 特徵組對應
-
-- **Rated**：A + B + C + D + E + tablehc
-- **Non-rated**：A + B + C + D + tablehc（D 類無 session 依賴，應包含；B3 修正）
+- **Rated**：開放使用包含 `t_session` 歷史關聯的 EntitySet 特徵。
+- **Non-rated**：限制 EntitySet 僅能探索 `t_bet` 及當前 run/近期窗口之特徵（關閉 `t_session` 歷史路徑）。
 
 ---
 
 ### Step 5 — 訓練器重構（`[trainer/trainer.py](trainer/trainer.py)`）
 
 - 從 `config.py` 讀取所有參數
-- 依序呼叫 `identity.py`（`cutoff_dtm = training_window_end`）→ `labels.py`（C1）→ `features.py`（E 類嚴格過濾）
+- 依序呼叫 `identity.py`（`cutoff_dtm = training_window_end`）→ `labels.py`（C1）→ `features.py`（呼叫 Featuretools DFS，傳入標籤時間點作為 `cutoff_time` 嚴格防漏）
+- **特徵篩選 (Feature screening)**：在送入主模型前，增加單變量與共線性過濾，並可選用輕量 LightGBM 在 Train set 計算 feature importance 取 top-K，篩選後寫入 `feature_list.json`。
 - **雙模型分離**（§9.1）：Rated / Non-rated 各自訓練
 - **類別不平衡**：LightGBM 使用 `class_weight='balanced'`
 - **時間切割**：Train 70% / Valid 15% / Test 15%，嚴格按 `payout_complete_dtm` 排序
@@ -255,19 +311,54 @@ HAVING COUNT(session_id) = 1 AND SUM(num_games) <= 1
 
 ### Step 6 — 閾值選擇與回測（`[trainer/backtester.py](trainer/backtester.py)`，G1）
 
-**G1 閾值搜尋**（TRN-11 修正）：
+**G1 閾值搜尋**（TRN-11 修正；v6：I4/I6 改用 Optuna TPE 取代網格搜尋）：
 
-1. 在 validation set 掃描 0.01–0.99（步長 0.01）
-2. 過濾：Precision ≥ `G1_PRECISION_MIN`
-3. 過濾：每小時警報量 ≥ `G1_ALERT_VOLUME_MIN_PER_HOUR`
-4. **D4 修正（v3 補完）**：警報量計算 = **Rated + Non-rated 兩個模型的警報合計**，不得只計算其中一個模型
-5. 滿足兩者約束 → 最大化 `F_{G1_FBETA}`
-6. 無可行解 → 記錄並回報，降低 `G1_PRECISION_MIN` 後重試
-7. 閾值只在 validation set 選定；test set 僅用於最終報告
+**雙模型閾值搜尋策略（I6 — Optuna TPE）**：Rated 與 Non-rated 各有獨立閾值（`rated_threshold`、`nonrated_threshold`），以 Optuna `TPESampler` 在二維連續空間高效搜尋（取代 99×99 窮舉網格）：
+
+```python
+import optuna
+from config import (G1_PRECISION_MIN, G1_ALERT_VOLUME_MIN_PER_HOUR,
+                    G1_FBETA, OPTUNA_N_TRIALS)
+
+def objective(trial):
+    rt = trial.suggest_float("rated_threshold", 0.01, 0.99)
+    nt = trial.suggest_float("nonrated_threshold", 0.01, 0.99)
+
+    rated_alerts   = (rated_scores_val >= rt).sum()
+    nonrated_alerts = (nonrated_scores_val >= nt).sum()
+    total_alerts_per_hour = (rated_alerts + nonrated_alerts) / val_hours  # D4
+
+    rated_prec   = precision_score(y_rated_val,   rated_scores_val   >= rt)
+    nonrated_prec = precision_score(y_nonrated_val, nonrated_scores_val >= nt)
+
+    # 不符合約束 → 回傳 -inf 讓 Optuna 自動跳過
+    if rated_prec < G1_PRECISION_MIN or nonrated_prec < G1_PRECISION_MIN:
+        return float("-inf")
+    if total_alerts_per_hour < G1_ALERT_VOLUME_MIN_PER_HOUR:
+        return float("-inf")
+
+    # 目標：最大化整體 F-beta（合計 TP / 合計 alerts）
+    return fbeta_score_combined(y_rated_val, y_nonrated_val,
+                                rated_scores_val >= rt,
+                                nonrated_scores_val >= nt,
+                                beta=G1_FBETA)
+
+study = optuna.create_study(direction="maximize",
+                            sampler=optuna.samplers.TPESampler(seed=42))
+study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
+               callbacks=[optuna.study.MaxTrialsCallback(OPTUNA_N_TRIALS)])
+```
+
+- `OPTUNA_N_TRIALS = 300`（預設；可從 config 調整，300 次 TPE 在 2D 空間通常已足夠收斂）
+- 無可行解（所有 trial 皆回傳 `-inf`）→ 記錄並回報，降低 `G1_PRECISION_MIN` 後重試
+- 閾值只在 validation set 選定；test set 僅用於最終報告
+- Optuna study 結果（`study.trials_dataframe()`）與最佳組合一同輸出，供後續分析
 
 **回測規則**：
 
-- Visit 去重依 `GAMING_DAY_START_HOUR`（from config）定義 gaming day 邊界
+- **G4（低，v4 新增）**：Visit 去重以表內 `gaming_day` 欄位為準。
+  - 去重 key：`(canonical_id, gaming_day)`
+  - `GAMING_DAY_START_HOUR` 僅作備援，不作主流程口徑
 - 嚴格時序處理，不 look-ahead
 
 **輸出**（valid + test 各一份）：Precision / Recall / PR-AUC / F-beta / 每小時警報量（P5–P95）/ `rated_threshold` / `nonrated_threshold`
@@ -276,11 +367,18 @@ HAVING COUNT(session_id) = 1 AND SUM(num_games) <= 1
 
 ### Step 7 — Scorer 更新（`[trainer/scorer.py](trainer/scorer.py)`）
 
-- **移除**所有獨立特徵計算，改為匯入 `features.py`（TRN-05/07/08 修正）
-- 所有 ClickHouse 查詢加 `FINAL`（E5 修正）
-- `t_bet` 查詢基礎過濾：`payout_complete_dtm IS NOT NULL AND player_id IS NOT NULL AND player_id != PLACEHOLDER_PLAYER_ID`（E3/E4 修正）
-- E 類特徵：只讀取 `session_avail_dtm <= now() - SESSION_AVAIL_DELAY_MIN` 的快取統計（A1 修正）
+- **移除**所有獨立特徵計算，改為匯入 `features.py`（TRN-05/07/08 修正）。推論端必須透過同一套自動化特徵工程管線（EntitySet + DFS），傳入當前輪詢時間作為 `cutoff_time` 來即時計算特徵。
+- **G3（中，v4 新增）**：推論端處理 bet 流必須使用穩定排序 `ORDER BY payout_complete_dtm ASC, bet_id ASC`。
+- `t_bet` 查詢可使用 `FINAL`（E5）；`t_session` 禁用 `FINAL`（G1），並必須套用 FND-01 去重後再 join。
+- `t_bet` 查詢基礎條件（v4）：`payout_complete_dtm IS NOT NULL AND (player_id 有效 OR session_id 有效)`。
+  - **G2**：若 `player_id` 無效但 `session_id` 有效，先 join 去重後的 `t_session` 回補 `effective_player_id = COALESCE(t_bet.player_id, t_session.player_id)`，最終只保留有效的 `effective_player_id` 再進入狀態機。
+- **歷史特徵（原 E 類）處理**：只允許將 `session_avail_dtm <= now() - SESSION_AVAIL_DELAY_MIN` 的已完成 `t_session` 加入 EntitySet（A1 修正）。
 - **D2 三步身份判定**（§6.4）：依 `identity.py` 定義，三步兜底至無卡客
+- **H3（低，v5 新增 — 雙模型路由規則）**：推論時必須明確決定此觀測點用哪個模型，禁止使用 `is_known_player`。
+  - 定義 `resolved_card_id`：依 D2 三步身份判定流程，若能取得有效 `casino_player_id`（來自「可用時間已到的 t_session」或 mapping cache 命中），則 `resolved_card_id = casino_player_id`；否則為 NULL。
+  - `is_rated_obs = (resolved_card_id IS NOT NULL)`。
+  - `is_rated_obs = True` → 使用 Rated model（開放存取包含歷史關聯的 EntitySet 特徵）；否則 → 使用 Non-rated model（限制 EntitySet 僅能使用 `t_bet` 內部特徵）。
+  - 所有輸出需記錄 `is_rated_obs` 與 `resolved_card_id`（若有）以便稽核。
 - **Reason code 輸出**（§12.1）：SHAP top-k → 4 個固定 reason codes；版本化映射表；穩定性護欄（連續兩個輪詢週期一致才展示）
 
 ---
@@ -309,16 +407,20 @@ HAVING COUNT(session_id) = 1 AND SUM(num_games) <= 1
 **必須實作的測試，對應各合規議題**
 
 - **Leakage 偵測測試**
-  - 驗證 E 類特徵（`hist_*`）在所有觀測點均無未來資料（`session_avail_dtm <= obs_time`）
-  - 驗證 S1 `table_hc` 的最晚資料點 ≤ `obs_time - BET_AVAIL_DELAY_MIN`
-  - 驗證標籤建構用的延伸資料未混入訓練 feature matrix
+  - 驗證歷史特徵（原 E 類）在所有觀測點均無未來資料（`session_avail_dtm <= obs_time`）。
+  - 驗證 S1 `table_hc` 的最晚資料點 ≤ `obs_time - BET_AVAIL_DELAY_MIN`。
+  - **Cutoff Time 驗證**：驗證 Featuretools 產出的 feature matrix 中，所有的聚合運算都沒有使用到大於等於 `cutoff_time` 的資料列。
+  - 驗證標籤建構用的延伸資料未混入 EntitySet 供特徵合成使用。
 - **Train-Serve Parity 測試**
-  - 對同一批觀測點，分別從 `trainer.py`（批次）和 `scorer.py`（增量）計算特徵，斷言特徵值差異 < 容忍閾值（例如浮點誤差 1e-6）
+  - 對同一批觀測點，分別從 `trainer.py`（批次 DFS）和 `scorer.py`（增量 EntitySet 更新）計算特徵，斷言特徵值差異 < 容忍閾值（例如浮點誤差 1e-6）。
   - 驗證 `run_boundary`、rolling window 邊界語義的輸出一致性
-  - 驗證訓練與推論均使用 `FINAL` 關鍵字（E5）：對測試 ClickHouse 實例注入重複行，確認查詢結果去重
+  - **G1**：驗證 `t_session` 查詢不使用 `FINAL`，且去重結果與 FND-01（MAX(lud_dtm)）一致
+  - **G3**：在包含同毫秒多注的樣本集上，驗證 trainer/scorer 的處理順序與 B/C 類特徵逐筆一致（排序 key：`payout_complete_dtm`, `bet_id`）
+  - **G2**：驗證 player_id 回補路徑：當 `t_bet.player_id` 無效但 `session_id` 有效時，`effective_player_id` 能被正確回補且不破壞分組/狀態機
 - **Label Sanity 測試**
   - `label = 1` 的比例在預期範圍（例如 5%–25%）
   - 確認延伸區間的 bet 無 `label = 1` 進入 feature matrix
+  - **H1**：對 `next_bet` 缺失樣本，驗證「覆蓋足夠 → gap start」與「覆蓋不足 → censored 排除」的分流正確，且不會在 window end 附近膨脹正例（防 TRN-06）
 - **D2 覆蓋率測試**
   - 驗證 `canonical_id` 空值率 < 容忍閾值（例如 < 1%）
   - 驗證 FND-12 假帳號排除後的影響行數與預期相符
@@ -328,55 +430,147 @@ HAVING COUNT(session_id) = 1 AND SUM(num_games) <= 1
   - 驗證 `payout_value` / `bonus` 等 100% NULL 欄位未出現在 feature 計算中（FND-08）
   - 驗證 `loss_streak` 僅依賴 `status` 欄位（E2）
   - 驗證 `hist_avg_bet` 最大值 ≤ `HIST_AVG_BET_CAP`（F2）
+  - **G5**：驗證 winsorization 是先做 row-level cap（單列 `t_session.avg_bet`）再聚合，而不是聚合後才截斷
+  - **H4（raw data 證據）**：對 `data/gmwds_t_bet.parquet` 讀取 parquet 統計或抽樣，驗證 `wager_null_pct == 0`；並在訓練/推論各自記錄 `wager_null_pct` 作為漂移監控（若 >0 觸發告警與 feature contract 更新）
+- **Model Routing 測試**
+  - **H3**：驗證 `is_rated_obs` 的路由條件不依賴 `is_known_player`，且 Rated/Non-rated 的 EntitySet 使用正確（Non-rated 限制存取歷史關聯路徑）。
 
 ---
 
 ## TRN-* Remediation Checklist（SSOT §12 + v3 更新）
 
 
-| TRN        | 問題描述                        | 計畫落地                | v3 更新                                      |
-| ---------- | --------------------------- | ------------------- | ------------------------------------------ |
-| **TRN-01** | Session 去重未使用 `lud_dtm`     | Step 1（FND-01）      | 加 `FINAL`（E5）                              |
-| **TRN-02** | 未排除 `is_manual = 1`         | Step 1（FND-02）      | **僅 `t_session`**；`t_bet` 無此欄（E1 修正）       |
-| **TRN-03** | `player_id` 歸戶斷鏈            | Step 2（identity.py） | E6 FND-12 聚合 SQL；E4 `player_id != -1`      |
-| **TRN-05** | `table_hc` 依賴 `session_end` | Step 4（S1）、Step 7   | D1 `TABLE_HC_WINDOW_MIN` from config       |
-| **TRN-06** | 右截尾標籤膨脹                     | Step 3（labels.py）   | 無新增                                        |
-| **TRN-07** | 快取無窗口一致性                    | Step 5、Step 7       | 無新增                                        |
-| **TRN-08** | Rolling window 邊界不一致        | Step 4、Step 7       | 無新增                                        |
-| **TRN-09** | `loss_streak` 字串比較永為 0      | Step 4 B 類          | **E2 修正**：改用 `status='LOSE'`；E2/F4 PUSH 語義 |
-| **TRN-11** | 閾值過度保守，幾乎無警報                | Step 6（G1）          | **D4 修正**：alert volume = 雙模型合計             |
+| TRN        | 問題描述                        | 計畫落地                | v3 更新                                                    |
+| ---------- | --------------------------- | ------------------- | -------------------------------------------------------- |
+| **TRN-01** | Session 去重未使用 `lud_dtm`     | Step 1（FND-01）      | v4 修正：`t_session` 禁用 `FINAL`（G1），純依 FND-01 ROW_NUMBER 去重 |
+| **TRN-02** | 未排除 `is_manual = 1`         | Step 1（FND-02）      | **僅 `t_session`**；`t_bet` 無此欄（E1 修正）                     |
+| **TRN-03** | `player_id` 歸戶斷鏈            | Step 2（identity.py） | E6 FND-12 聚合 SQL；E4 `player_id != -1`                    |
+| **TRN-05** | `table_hc` 依賴 `session_end` | Step 4（S1）、Step 7   | D1 `TABLE_HC_WINDOW_MIN` from config                     |
+| **TRN-06** | 右截尾標籤膨脹                     | Step 3（labels.py）   | 無新增                                                      |
+| **TRN-07** | 快取無窗口一致性                    | Step 5、Step 7       | 無新增                                                      |
+| **TRN-08** | Rolling window 邊界不一致        | Step 4、Step 7       | 無新增                                                      |
+| **TRN-09** | `loss_streak` 字串比較永為 0      | Step 4 B 類          | **E2 修正**：改用 `status='LOSE'`；E2/F4 PUSH 語義               |
+| **TRN-11** | 閾值過度保守，幾乎無警報                | Step 6（G1）          | **D4 修正**：alert volume = 雙模型合計                           |
 
 
 ---
 
-## Spec Compliance Review 完整修正摘要（三輪）
+## Spec Compliance Review 完整修正摘要（六輪）
 
 
-| 編號        | 嚴重性   | 類型            | SSOT/Schema 位置                     | v3 修正位置                                           |
-| --------- | ----- | ------------- | ---------------------------------- | ------------------------------------------------- |
-| A1        | 高     | Leakage       | §4.2, §8.1                         | Step 4 E 類：`session_avail_dtm <= obs_time`        |
-| A2        | 低     | Leakage       | §4.2, S1                           | Step 4 S1：扣除 `BET_AVAIL_DELAY_MIN`                |
-| B1        | 中     | Parity        | §6.2, D2                           | Step 2：`cutoff_dtm` 截止 + 快取版本控制                   |
-| B2        | 中     | Parity        | §8.2.B                             | Step 0/4：`RUN_BREAK_MIN` + 共用函數                   |
-| B3        | 低     | 特徵遺漏          | §9.1                               | Step 4：Non-rated 含 D 類                            |
-| C1        | 低     | SSOT 含糊       | §7.2                               | Step 3：明確「至少 X+Y，建議 1 天」                          |
-| C2        | 資訊性   | SSOT 不一致      | §2.1 vs §4.2                       | Step 0：`SESSION_AVAIL_DELAY_MIN = 15` + rationale |
-| C3        | 中     | 定義缺口          | §2.2, §10.3                        | Step 0：`GAMING_DAY_START_HOUR`；Step 6/8           |
-| D1        | 低     | 常數遺漏          | S1                                 | Step 0：`TABLE_HC_WINDOW_MIN`                      |
-| D3        | 低     | 已知限制          | D2                                 | Step 2：備忘；Phase 2 再實作 PIT-correct mapping         |
-| D4        | 中     | 定義缺口          | §10.2, G1                          | Step 6：alert volume = 雙模型合計                       |
-| **E1**    | **高** | **Schema 錯誤** | `t_bet` DDL                        | Step 1：移除 `t_bet.is_manual` 過濾                    |
-| **E2**    | **高** | **邏輯錯誤**      | FND-08, `t_bet.status`             | Step 4 B 類：`loss_streak` 改用 `status='LOSE'`       |
-| **E3**    | 中     | Nullable 欄位   | `t_bet.payout_complete_dtm`        | Step 1/4：基礎過濾加 `IS NOT NULL`                      |
-| **E4/F1** | 中     | 佔位符 ID        | `t_bet.player_id = -1`             | Step 0/1/2：`PLACEHOLDER_PLAYER_ID` 常數 + 過濾        |
-| **E5**    | 中     | ClickHouse 引擎 | `ReplacingMergeTree`               | Step 1/4/7：所有查詢加 `FINAL`                          |
-| **E6**    | 低     | 聚合 SQL 錯誤     | FND-12                             | Step 2：正確聚合 SQL 範例                                |
-| **E7**    | 低     | NULL-unsafe   | FND-04                             | Step 1：`COALESCE(field, 0) > 0`                   |
-| **E8**    | 低     | 測試缺失          | 整體                                 | Step 10：Testing & Validation 規格                   |
-| **F2**    | 低     | 極端值           | `t_session.avg_bet`                | Step 0/4：`HIST_AVG_BET_CAP` + winsorization       |
-| **F3**    | 低     | DQ 護欄缺口       | `t_session.is_deleted/is_canceled` | Step 1：加入基礎過濾                                     |
-| **F4**    | 低     | 語義未定          | `t_bet.status = 'PUSH'`            | Step 0/4：`LOSS_STREAK_PUSH_RESETS` 常數             |
+| 編號        | 嚴重性   | 類型                 | SSOT/Schema 位置                                     | v6 修正位置                                                            |
+| --------- | ----- | ------------------ | -------------------------------------------------- | ------------------------------------------------------------------ |
+| A1        | 高     | Leakage            | §4.2, §8.1                                         | Step 4 歷史特徵：`session_avail_dtm <= cutoff_time`                    |
+| A2        | 低     | Leakage            | §4.2, S1                                           | Step 4 S1：扣除 `BET_AVAIL_DELAY_MIN`                                 |
+| B1        | 中     | Parity             | §6.2, D2                                           | Step 2：`cutoff_dtm` 截止 + 快取版本控制                                    |
+| B2        | 中     | Parity             | §8.2.B                                             | Step 0/4：`RUN_BREAK_MIN` + Custom Primitive                         |
+| B3        | 低     | 特徵遺漏               | §9.1                                               | Step 4：Non-rated 亦包含時間週期等轉換特徵                                      |
+| C1        | 低     | SSOT 含糊            | §7.2                                               | Step 3：明確「至少 X+Y，建議 1 天」                                           |
+| C2        | 資訊性   | SSOT 不一致           | §2.1 vs §4.2                                       | Step 0：`SESSION_AVAIL_DELAY_MIN = 15` + rationale                  |
+| C3        | 中     | 定義缺口               | §2.2, §10.3                                        | Step 0/6/8：Visit 去重改用 `gaming_day` 欄位（G4）                          |
+| D1        | 低     | 常數遺漏               | S1                                                 | Step 0：`TABLE_HC_WINDOW_MIN`                                       |
+| D3        | 低     | 已知限制               | D2                                                 | Step 2：備忘；Phase 2 再實作 PIT-correct mapping                          |
+| D4        | 中     | 定義缺口               | §10.2, G1                                          | Step 6：alert volume = 雙模型合計                                        |
+| **E1**    | **高** | **Schema 錯誤**      | `t_bet` DDL                                        | Step 1：移除 `t_bet.is_manual` 過濾                                     |
+| **E2**    | **高** | **邏輯錯誤**           | FND-08, `t_bet.status`                             | Step 4 B 類：`loss_streak` 改用 `status='LOSE'`                        |
+| **E3**    | 中     | Nullable 欄位        | `t_bet.payout_complete_dtm`                        | Step 1/4：基礎過濾加 `IS NOT NULL`                                       |
+| **E4/F1** | 中     | 佔位符 ID             | `t_bet.player_id = -1`                             | Step 0/1/2：`PLACEHOLDER_PLAYER_ID` 常數 + 過濾                         |
+| **E5**    | 中     | ClickHouse 引擎      | `ReplacingMergeTree`                               | Step 1：區分策略（t_bet 可用 FINAL；t_session 禁用 FINAL，見 G1）                |
+| **E6**    | 低     | 聚合 SQL 錯誤          | FND-12                                             | Step 2：正確聚合 SQL 範例                                                 |
+| **E7**    | 低     | NULL-unsafe        | FND-04                                             | Step 1：`COALESCE(field, 0) > 0`                                    |
+| **E8**    | 低     | 測試缺失               | 整體                                                 | Step 10：Testing & Validation 規格                                    |
+| **F2**    | 低     | 極端值                | `t_session.avg_bet`                                | Step 0/4：`HIST_AVG_BET_CAP` + winsorization                        |
+| **F3**    | 低     | DQ 護欄缺口            | `t_session.is_deleted/is_canceled`                 | Step 1：加入基礎過濾                                                      |
+| **F4**    | 低     | 語義未定               | `t_bet.status = 'PUSH'`                            | Step 0/4：`LOSS_STREAK_PUSH_RESETS` 常數                              |
+| **G1**    | **高** | 引擎/去重衝突            | `t_session` ReplacingMergeTree（無 version） + FND-01 | Step 1/2/4/7：`t_session` 禁用 FINAL；以 FND-01 去重                      |
+| **G2**    | 中     | Identity fallback  | `t_bet.player_id` Nullable/-1                      | Step 1/4/7：回補 `effective_player_id` 後再做 D2                         |
+| **G3**    | 中     | Parity（同毫秒多注）      | `t_bet.payout_complete_dtm` tie                    | Step 3/4/7：穩定排序 `payout_complete_dtm, bet_id`                      |
+| **G4**    | 低     | 口徑衝突               | `gaming_day` 定義                                    | Step 0/6/8：Visit 去重以 `gaming_day` 欄位為準                             |
+| **G5**    | 低     | 聚合順序               | `t_session.avg_bet` outlier                        | Step 4/10：row-level cap → 聚合                                       |
+| **H1**    | 中     | 標籤邊界（終端下注）         | C1 / TRN-06（右截尾）                                   | Step 3/10：next_bet 缺失分流（可判定 vs censored）                           |
+| **H2**    | 中     | 身份兜底鏈完整性           | D2 / t_session 可用性（available_time）                 | Step 7：僅在 session 可得時用 session card 兜底；否則不使用                       |
+| **H3**    | 低     | 模型路由規則             | 雙模型（§9.1）                                          | Step 7/10：`is_rated_obs` 明文化 + routing 測試                          |
+| **H4**    | 低     | 空值傳播（累積特徵）         | `t_bet.wager` Nullable（DDL） / raw parquet 證據       | Step 4/10：fillna 防呆 + wager_null_pct 監控                            |
+| **I1**    | 中     | SQL 欄位名稱錯誤         | `t_session.num_games_with_wager`（DDL）              | Step 2：FND-12 SQL 改用 `SUM(COALESCE(num_games_with_wager, 0)) <= 1` |
+| **I2**    | 中     | SQL 範例缺 FND-01 CTE | Step 2 identity.py 說明                              | Step 2：兩段 SQL 改為先建 deduped CTE（ROW_NUMBER 去重）再查詢                   |
+| **I3**    | 低     | Checklist 文字過時     | TRN-* Remediation Checklist TRN-01                 | Checklist：TRN-01 v3 更新欄改為「禁用 FINAL（G1）」描述                          |
+| **I4**    | 低     | 閾值搜尋策略缺失           | Step 6 G1，雙模型（§9.1）                                | Step 6：首次明確二維搜尋需求（後由 I6 升級為 Optuna）                                |
+| **I6**    | 低     | 網格搜尋效率不足           | Step 6 G1，雙模型閾值搜尋                                  | Step 0/6：改用 Optuna TPE；新增 `OPTUNA_N_TRIALS` 常數                     |
 
+
+---
+
+## 第四輪 Spec Compliance Review（v4）— 論證/理由（供後續 review 引用）
+
+- **G1（t_session 禁用 FINAL）**：
+  - **事實依據**：`schema/schema.txt` 顯示 `t_session` 為 `ReplicatedReplacingMergeTree`，且 DDL 未提供 version 欄位。
+  - **風險機制**：在無 version 欄位下使用 `FINAL`，merge 階段對同 key 的多列保留哪一列是非決定性的；這可能讓「最新 `lud_dtm` 的正確列」在我們套用 FND-01 `ROW_NUMBER()...ORDER BY lud_dtm DESC` 前就被丟棄。
+  - **為何違反 SSOT**：SSOT §5/FND-01 要求以 `MAX(lud_dtm)` 進行業務去重；`FINAL` 會把這個「選最新」的決策權交給引擎 merge 行為，破壞 P0 護欄。
+- **G2（player_id 回補）**：
+  - **事實依據**：Dictionary 與 DDL 指出 `t_bet.player_id` / `t_bet.session_id` 皆為 Nullable，且 `player_id` 觀察到 `-1` placeholder。
+  - **風險機制**：若直接丟棄或兜底成散客，會把同一玩家的 bet 序列切斷，造成 run/rolling 斷裂、假 gap，並影響 D2 歸戶。
+  - **修正原則**：只要 `session_id` 存在，就優先用去重後的 `t_session.player_id` 回補，再進行 D2。
+- **G3（同毫秒多注穩定排序）**：
+  - **事實依據**：同一局可有多筆下注（主注/旁注），可共享相同 `payout_complete_dtm`。
+  - **風險機制**：若 trainer/scorer 在同 timestamp 的多筆 bet 上處理順序不同，B 類累積狀態與 C 類窗口統計會出現逐筆偏差，形成 Train-Serve Parity 破口。
+  - **修正原則**：全系統固定 tie-break：`ORDER BY payout_complete_dtm ASC, bet_id ASC`。
+- **G4（gaming_day 欄位為準）**：
+  - **事實依據**：`t_bet`/`t_session` 都含 `gaming_day`，且 ClickHouse 以其做 partition。
+  - **風險機制**：自算 gaming day（例如固定 06:00 偏移）可能與上游 ETL/財務口徑不一致，導致回測/validator/監控報表口徑漂移。
+  - **修正原則**：Visit 去重以表內 `gaming_day` 欄位為 canonical；自算只作備援/敏感性分析。
+- **G5（winsorization 聚合順序）**：
+  - **事實依據**：Dictionary 指出 `t_session.avg_bet` 可能出現極端 outlier（至 5e12）。
+  - **風險機制**：若先跨 session 聚合再截斷，單一 outlier 仍可在聚合前把統計量拉爆，影響特徵與模型穩定性。
+  - **修正原則**：先對每列 `avg_bet` 做 row-level cap（`min(avg_bet, cap)`），再做跨 session 聚合。
+
+---
+
+## 第五輪 Spec Compliance Review（v5）— 論證/理由（供後續 review 引用）
+
+- **H1（終端下注 / next_bet 缺失）**：
+  - **風險機制**：若標籤建構直接依賴 `b_{i+1} - b_i`，則最後一筆下注 `b_{i+1}` 缺失會導致差值為 NaN，可能被默認判為非 gap；或被「一律視為 gap」而踩回右截尾（TRN-06）。
+  - **修正原則**：只在「延伸拉取後仍覆蓋到 `b_i + X`」的條件下，才能把 next_bet 缺失視為 gap start；否則視為 censored 排除。
+- **H2（身份兜底與 available_time）**：
+  - **風險機制**：用 `t_session.casino_player_id` 兜底可提高 identity 覆蓋，但若 session 尚未達 available_time 就被使用，會引入未來資訊（leakage），違反 SSOT §2.1/§4.2。
+  - **修正原則**：session-card 兜底僅在 `session_avail_time <= obs_time` 時可用；否則只能用 mapping cache 或 fallback 到有效的 `player_id`。
+- **H3（雙模型路由明文化）**：
+  - **風險機制**：未定義路由會導致工程端用錯欄位（尤其是 `is_known_player`），或讓 non-rated 誤用 E 類特徵造成 parity / 服務錯誤。
+  - **修正原則**：以 `resolved_card_id`（session-card 或 mapping 命中）定義 `is_rated_obs`，並記錄於輸出供稽核。
+- **H4（wager NULL 與 NA propagation）**：
+  - **事實依據（raw data）**：對 `data/gmwds_t_bet.parquet`（438,005,955 rows）使用 Parquet row-group statistics 讀取，`wager null_count = 0`；抽樣前 5 個 row groups 亦 `wager NULL = 0`。
+  - **結論**：本批資料不會因 `wager` NULL 造成 cumsum NA 汙染；但仍保留 `fillna(0)` 作防呆，以應對未來資料版本變更。不要把 `wager_is_null` 納入 feature list（避免常數欄），改用 `wager_null_pct` 監控觸發合約演進。
+
+## 第七輪業務需求對齊（v7）— 論證/理由（供後續 review 引用）
+
+- **全面導入自動化特徵工程（Featuretools）**：
+  - **事實依據**：手動維護 A–E 類數十個特徵的滾動/聚合 SQL 與 Pandas 邏輯，容易在推論端重構時引入 parity 破口，且擴展速度極慢。
+  - **風險機制**：若繼續依賴手工靜態清單，未來加入 `t_game`（Phase 2）或探索不同時間窗時，將面臨巨大的工程與測試負擔。人工防漏（如 `session_avail_dtm <= obs_time`）也容易出現人為失誤。
+  - **修正原則**：在 Phase 1 徹底重構特徵工程基礎設施，將 `t_bet` 與 `t_session` 抽象為 EntitySet。將領域邏輯（如 `loss_streak` 狀態機）封裝為 Custom Primitives。依賴 DFS (Deep Feature Synthesis) 自動展開多維特徵空間，並由工具內建的 `cutoff_time` 機制從根本上消除洩漏風險。這讓特徵清單從「靜態人工合約」變為「每次實驗動態輸出的產物」。
+
+---
+
+## 第六輪 Spec Compliance Review（v6）— 論證/理由（供後續 review 引用）
+
+- **I1（FND-12 欄位名稱錯誤）**：
+  - **事實依據**：`schema/schema.txt` 的 `t_session` DDL 中不存在 `num_games` 欄位；實際存在的是 `num_games_elapsed`（含未下注局）與 `num_games_with_wager`（有實際下注的局數，Nullable）。
+  - **風險機制**：若 SQL 執行 `SUM(num_games)`，ClickHouse 會直接報錯，identity.py 初始化失敗，整個訓練流程中斷。
+  - **修正原則**：FND-12 的「total_games」語意對應的是「有下注的局數」，故改用 `SUM(COALESCE(num_games_with_wager, 0))`；COALESCE 因 Nullable 必要。
+- **I2（FND-01 去重 CTE 缺失）**：
+  - **事實依據**：`t_session` 為 `ReplicatedReplacingMergeTree` 且不使用 `FINAL`（G1 決定）；在 merge 尚未完成前，同一 `session_id` 可能存在多列。
+  - **風險機制**：若直接 `FROM t_session WHERE ...`，一個 `session_id` 的多版本列會各自產生一條 `(player_id, casino_player_id)` 連結邊。重複邊會讓 M:N 衝突計算膨脹（情境 2），也可能讓假帳號排除的 `COUNT(session_id)` 不準確。
+  - **修正原則**：先用 FND-01 `ROW_NUMBER()` CTE 取每個 `session_id` 的最新列，再從 CTE 查詢，確保 mapping 建置與假帳號排除都在去重後的乾淨資料上進行。
+- **I3（TRN-01 Checklist 文字矛盾）**：
+  - **事實依據**：v4 G1 決定 `t_session` 禁用 `FINAL`；但 Checklist TRN-01 的 v3 更新欄仍寫「加 FINAL（E5）」。
+  - **風險機制**：Checklist 是工程師對照實作的文件；矛盾文字會讓人誤以為 `t_session` 要加 `FINAL`，與 G1 決策衝突。
+  - **修正原則**：統一更正為 G1 決策的描述，避免文件內部矛盾。
+- **I4（雙模型二維閾值搜尋，初版）**：
+  - **事實依據**：Phase 1 使用 Rated / Non-rated 雙模型，各自輸出獨立分數；D4 約束以兩模型合計警報量為準。
+  - **風險機制**：若兩個閾值分別獨立選定（例如各自掃描 99 個值），可能出現 rated 模型過濾太嚴或太鬆，使合計警報量不符合 `G1_ALERT_VOLUME_MIN_PER_HOUR` 約束；或 Precision 均達標但合計量仍不足。
+  - **修正原則（已由 I6 取代）**：首次確立需在二維空間聯合搜尋；具體方法見 I6。
+- **I6（Optuna TPE 取代網格搜尋）**：
+  - **事實依據**：二維網格（99×99 = 9,801 次）在每次 trial 都需計算整個 validation set 的 precision / recall 時，計算量隨模型複雜度線性成長；且網格搜尋對連續空間的覆蓋率不如隨機或貝葉斯採樣。
+  - **風險機制**：網格搜尋步長固定（0.01），可能在最優解附近解析度不足；且若未來引入更多閾值參數（例如 per-table 閾值），網格複雜度會指數爆炸。
+  - **修正原則**：採用 Optuna `TPESampler`，以歷史 trial 結果建立代理模型，智慧地引導後續採樣方向。不可行組合（違反約束）回傳 `-inf`，讓 Optuna 自動降低對此區域的採樣機率。`OPTUNA_N_TRIALS=300` 在 2D 空間通常已足夠收斂，且未來擴充參數時只需增加 `n_trials` 而非重新設計搜尋架構。
 
 ---
 
@@ -384,7 +578,6 @@ HAVING COUNT(session_id) = 1 AND SUM(num_games) <= 1
 
 - `G1_PRECISION_MIN`（暫定 0.70）
 - `G1_ALERT_VOLUME_MIN_PER_HOUR`（暫定 5）
-- `GAMING_DAY_START_HOUR`（暫定 06:00；需營運部門確認）
 - `TABLE_HC_WINDOW_MIN`（暫定 30 分鐘）
 - `HIST_AVG_BET_CAP`（暫定 500,000；需 EDA 驗證分位數）
 - `LOSS_STREAK_PUSH_RESETS`（暫定 False；需業務規則確認）
