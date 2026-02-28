@@ -209,3 +209,5 @@ __marimo__/
 # Others
 data/
 .env
+walkaway/
+trainer_backup/
