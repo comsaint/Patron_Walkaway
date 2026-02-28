@@ -109,7 +109,7 @@
 
 以下問題（詳載於 `doc/FINDINGS.md`）**必須**在建模前處理，否則將污染標籤與特徵：
 
-1. **Session 去重 (FND-01)**：` ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC) = 1`。必須 SELECT 此二欄位才能執行。
+1. **Session 去重 (FND-01)**：`ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC) = 1`。必須 SELECT 此二欄位才能執行。
 2. **人工帳務調整排除 (FND-02)**：加入 `is_manual = 0` 過濾條件。
 3. **casino_player_id 空值清洗 (FND-03)**：`CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END`。
 4. **Session 狀態處理 (FND-04)**：**不要**過濾 `status = 'SUCCESS'`。保留所有非人工且 `turnover > 0` 或 `num_games_with_wager > 0` 的 Session。
@@ -285,7 +285,7 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 
 | Phase | 做什麼 | 目標 | 備註 |
 |---|---|---|---|
-| **Phase 1（本期）** | 雙軌特徵工程（Featuretools DFS 探索/生產 + 手寫狀態特徵）+ LightGBM + Optuna 調參 | 上線 MVP，打通 pipeline，用高可解釋性與系統化探索建立業務信任。 | 對應 §8.2（雙軌架構、兩階段 DFS、`save_features`）與 §9.2（Optuna）。 |
+| **Phase 1（本期）** | 雙軌特徵工程（Featuretools DFS 探索/生產 + 手寫狀態特徵）+ LightGBM + Optuna 調參 + visit-level 樣本加權 | 上線 MVP，打通 pipeline，用高可解釋性與系統化探索建立業務信任。 | 對應 §8.2（雙軌架構、兩階段 DFS、`save_features`）、§9.2（Optuna）、§9.3（樣本加權）。 |
 | **Phase 2（基礎模型驗證後）** | 離線 SSL 預訓練序列嵌入（**僅用 `t_bet`**），產出 Player/Run Embedding，**每日批次更新**，推論時當作靜態特徵餵進 GBDT。 | 量化嵌入對 PR-AUC / F-beta 的增益；若有效則長期作為正式方案。 | 避開「即時跑 NN forward pass」的工程風險，把序列模型的增益以最低成本注入。 |
 | **Phase 3（僅在 Phase 2 增益不足時）** | 端到端即時序列模型線上化。 | 完全捕捉即時序列動態。 | 需更嚴的延遲/可靠性/監控與回滾策略。 |
 
@@ -311,7 +311,26 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 
 **切割方式**：**嚴格按時間切割**（Train 60-70% | Valid 15-20% | Test 15-20%）。不可隨機切分。
 
-### 9.3 Model API Contract（與 `scorer.py` 的介面）
+### 9.3 樣本加權策略：長度偏誤校正 (Sample Weighting / Length Bias Correction)
+
+**問題根源**：以「每筆下注為觀測點」時，下注次數多（長 session / 高頻玩家）的賭客在訓練集中貢獻遠多於短暫停留玩家的觀測點，導致模型的 loss 被高頻玩家行為主導（Length Bias）。這使模型對偶爾造訪或短暫停留的玩家泛化能力不足，且指標（precision/recall）容易被少數高頻玩家的表現所左右。
+
+**Phase 1 強制要求**：訓練時必須對每個觀測點計算 **visit-level 反比樣本權重（Inverse Visit-level Sample Weight）**，並傳入模型訓練：
+
+$$w_i = \frac{1}{N_{\text{visit}}(canonical\_id_i,\ gaming\_day_i)}$$
+
+其中 $N_{\text{visit}}$ 為同一 visit（`canonical_id` × `gaming_day`）內的**訓練集**總觀測點數（取樣後計算）。
+
+實作細節：
+- **與 `class_weight` 並用**：`class_weight='balanced'` 處理正/負例標籤不平衡；`sample_weight` 處理跨玩家個體頻率不平衡。兩者作用層面不同，可同時套用。LightGBM 透過 `model.fit(..., sample_weight=weights)` 傳入。
+- **防洩漏**：`sample_weight` 計算時**僅使用 training window 內的觀測點數**，不可混入 valid/test 資料。
+- **取樣一致性**：若 §4.3 的下採樣已執行，$N_{\text{visit}}$ 以取樣**後**的實際觀測點數為準（確保取樣與加權語義一致）。
+
+**評估報告雙口徑（必須同時報告）**：
+- **Micro（以觀測點為單位）**：直接計算整體 precision/recall/PR-AUC，反映全量 bet 的模型品質。
+- **Macro-by-visit**：對每個 visit 先計算各自指標，再取平均，用以驗證模型對不同停留時長的玩家是否公平泛化。若 Micro 與 Macro 差距顯著，說明 Length Bias 仍未充分校正，應重新審視加權策略。
+
+### 9.4 Model API Contract（與 `scorer.py` 的介面）
 
 模型在服務端以 HTTP 服務形式暴露，與現有 `scorer.py` 透過 API 對接。高層約束如下（細節以 `doc/model_api_protocol.md` 為準）：
 
@@ -349,7 +368,7 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 **核心執行機制**：
 - **僅限 Validation Set**：閾值只能在 valid set 決定，test set 僅供最終報告。
 - **Optuna 2D 搜索**：使用 Optuna TPE Sampler 搜索 `(rated_threshold, nonrated_threshold)`，取代窮舉 grid search（見 §9.2）。
-- 必須報告 Precision / Recall / PR-AUC / 總警報量，並在回測框架下（§10.3）模擬線上去重以確認營運可接受度。
+- 必須報告 Precision / Recall / PR-AUC / 總警報量，並依 §10.3 回測評估口徑（每 visit 至多計 1 次 TP）以確認營運可接受度。
 
 **Phase 1 首選策略：【G1】Precision 下限 + 最小警報量**
 為建立 Host 信任並確保可行動量，優先採用此 Gate：
@@ -361,7 +380,8 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 
 ### 10.3 線上 ground truth 與回測
 - 線上驗證：以 `trainer/validator.py` 的 45 分鐘 horizon 驗證語義為準（覆蓋 Y+X 並允許延遲）。
-- 回測時須按時間順序處理，套用每次造訪最多 1 個警報的去重邏輯。
+- **回測評估口徑**：回測指標計算時，對同一 visit（`canonical_id` × `gaming_day`）至多計入 1 次 True Positive，以避免高頻玩家因大量觀測點而膨脹精準度指標。回測須嚴格按時間順序處理，不得 look-ahead。
+  > **重要區分**：此「每 visit 至多計 1 次 TP」的去重僅是**離線評估口徑**（為正確計算 precision / alert volume），**不**意味著線上推論只對每位玩家每次造訪輸出一個 alert。線上是否節流、多久對同一賭客通知一次 Host，屬於產品／前端設計決策，不在本模型規格範圍內。
 
 ---
 
@@ -410,7 +430,8 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 
 **穩定性護欄（避免 reason 亂跳）**：
 - reason code 必須由**固定的「特徵 → reason」映射表**產生，且映射表需版本化（隨 `model_version` 管理）。
-- 可選：僅在同一賭客連續兩個輪詢週期輸出一致 reason 時才展示（降低抖動）。
+- 模型服務（`/score` 端點）在每次推論時都**必須輸出**當下的 `reason_codes`、`score` 與 `margin`，不在模型層做「連續輪詢一致才輸出」的過濾。
+  > **展示穩定性（產品／前端責任）**：是否只在連續兩輪 reason 一致時才對 Host 展示、或設定通知冷卻期，屬於前端／產品設計決策（`trainer/frontend/` 及相關 UX 邏輯），不在本模型工程規格範圍內。模型輸出需提供充足的 metadata（每次的 `reason_codes`、`score`、`margin`、`model_version`、`scored_at`），讓前端依產品需求決定呈現策略。
 
 ### 12.2 持續運營（Scope）：監控 → 校準 → 重訓
 
@@ -436,7 +457,7 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 3. **Game 表整合**：納入牌局層級（開牌結果、桌台走勢、同局玩家數等氣氛特徵）上下文。
 4. **跨桌造訪建模**：建模玩家在桌台間移動的旅程。
 5. **模型重訓機制**：監控 concept drift 並確立重訓頻率。
-6. **警報疲勞管理**：實作冷卻期與公關工作負荷平衡。
+6. **警報疲勞管理（產品／前端 scope）**：冷卻期設計、公關工作負荷平衡與通知節流策略，屬於產品與前端（`trainer/frontend/`）的決策範疇，不在本模型訓練計畫規格內。模型層僅保證每次推論誠實輸出分數與 reason codes，頻率與呈現方式由產品端定義。
 
 ---
 

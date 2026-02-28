@@ -1,6 +1,6 @@
 ---
 name: Patron Walkaway Phase 1
-overview: 依據 SSOT 文件（v5，整合五輪 Spec Compliance Review），全面重構 trainer/scorer pipeline，封閉 leakage、train-serve parity 破口、Schema 層級錯誤與 edge cases（含 E1–E8、F1–F4、G1–G5、H1–H4），並建立完整的 Testing & Validation 規格，達成 Phase 1 MVP 上線條件。
+overview: 依據 SSOT 文件（v8 改寫，整合七輪 Spec Compliance Review 及 SSOT 大幅改寫），全面重構 trainer/scorer pipeline，採雙軌特徵工程架構（Featuretools DFS 軌道 A + 向量化手寫軌道 B），封閉 leakage、train-serve parity 破口、Schema 層級錯誤與 edge cases（含 E1–E8、F1–F4、G1–G5、H1–H4、I1–I6），並建立完整的 Testing & Validation 規格，達成 Phase 1 MVP 上線條件。
 todos:
   - id: config-definitions
     content: Step 0：在 config.py 集中定義所有常數（含 v3 新增 TABLE_HC_WINDOW_MIN / PLACEHOLDER_PLAYER_ID / LOSS_STREAK_PUSH_RESETS / HIST_AVG_BET_CAP；v6 新增 OPTUNA_N_TRIALS）
@@ -15,7 +15,7 @@ todos:
     content: Step 3：新建 labels.py（C1 防洩漏；延伸拉取至少 X+Y；t_bet FINAL + E3 IS NOT NULL；G3 穩定排序 payout_complete_dtm, bet_id）
     status: pending
   - id: features-module
-    content: Step 4：新建 features.py（全面導入 Featuretools 等自動化特徵工程；定義 EntitySet 與 Custom Primitives；嚴格套用 cutoff_time 防漏；實作 loss_streak 等特有邏輯）
+    content: Step 4：新建 features.py（導入雙軌特徵工程；軌道 A EntitySet 兩階段 DFS；軌道 B 向量化手寫 loss_streak 等；嚴格套用 cutoff_time 防漏）
     status: pending
   - id: trainer-refactor
     content: Step 5：重構 trainer.py（整合新模組；特徵篩選 Feature screening；雙模型；class_weight='balanced'；TRN-07 快取驗證）
@@ -38,12 +38,14 @@ todos:
 isProject: false
 ---
 
-# Patron Walkaway Phase 1 實作計畫（v7）
+# Patron Walkaway Phase 1 實作計畫（v8）
 
-> v7 在 v6 基礎上新增整合 **第七輪業務需求對齊（Automated Feature Engineering）**。最重大變更：
+> v8 依據 SSOT 大幅改寫，對齊 §8.2 雙軌特徵工程架構。最重大變更：
 >
-> - **全面替換手工特徵工程**：捨棄原有的靜態 A–E 特徵清單，全面導入 **Featuretools** 作為核心特徵生成引擎。這將特徵產出的範式從「逐一手寫滾動/聚合 SQL 與 Pandas 邏輯」轉變為「定義 EntitySet、註冊 Custom Primitives（如 `loss_streak` 狀態機），並透過 DFS (Deep Feature Synthesis) 自動展開多維特徵空間」。
-> - **Cutoff Time 防漏機制**：不再依賴人工編寫 `session_avail_dtm <= obs_time` 等過濾條件，而是統一利用自動化工具內建的 `cutoff_time` 參數，從底層確保任何特徵計算都不會接觸到該觀測點之後的資料。
+> - **雙軌特徵工程**：軌道 A（Featuretools DFS）負責自動展開聚合/窗口/組合特徵空間；軌道 B（向量化 Pandas/Polars 手寫）負責 Featuretools 天然無法或效能極差的狀態機/跨玩家邏輯（`loss_streak`、`run_boundary`、`table_hc`）。兩軌共用同一 `cutoff_time` / 時間窗口框架，產出後 join 成統一 feature matrix。
+> - **兩階段 DFS 流程**：第一階段在抽樣集上探索並以 `save_features` 持久化計算圖；第二階段以 `calculate_feature_matrix(saved_feature_defs)` 對全量資料計算，從根本消除 train-serve parity 風險。
+> - `**player` 實體新增**：EntitySet 擴展至三實體（`t_bet` → `t_session` → `player`），以 `canonical_id` 為軸心支援跨 session 聚合。
+> - **集中式時間窗口定義器**：強制建立 Time Fold Splitter / Window Definer 模組（`time_fold.py`），統一管理所有時間切分邊界（SSOT §4.3）。
 
 > v6 在 v5 基礎上新增整合 **第六輪 Spec Compliance Review（I1–I4, I6）**。最重大變更：
 >
@@ -81,13 +83,17 @@ isProject: false
 ```
 trainer/
 ├── config.py        ← 更新：新增 TABLE_HC_WINDOW_MIN / PLACEHOLDER_PLAYER_ID
-│                              / LOSS_STREAK_PUSH_RESETS / HIST_AVG_BET_CAP
+│                              / LOSS_STREAK_PUSH_RESETS / HIST_AVG_BET_CAP / OPTUNA_N_TRIALS
+├── time_fold.py     ← 新建：集中式時間窗口定義器（SSOT §4.3）
+│                              所有 ETL / 特徵計算 / CV 必須呼叫此模組
 ├── identity.py      ← 新建：D2 歸戶（FND-12 正確聚合 + player_id != -1）
 ├── labels.py        ← 新建：C1 防洩漏標籤
-├── features.py      ← 新建：共用特徵（loss_streak 用 status; winsorize hist_avg_bet）
-├── trainer.py       ← 重構：整合新模組，雙模型訓練
-├── scorer.py        ← 重構：匯入 features.py，D2 三步身份判定
-├── backtester.py    ← 更新：G1 閾值搜尋，alert volume = 雙模型合計
+├── features.py      ← 新建：雙軌特徵工程
+│                              軌道 A：Featuretools EntitySet + DFS + save_features
+│                              軌道 B：loss_streak / run_boundary / table_hc 向量化手寫
+├── trainer.py       ← 重構：整合新模組，兩階段 DFS，雙模型訓練
+├── scorer.py        ← 重構：saved_feature_defs（軌道 A）+ features.py（軌道 B），D2 三步身份判定
+├── backtester.py    ← 更新：G1 閾值搜尋（Optuna TPE），alert volume = 雙模型合計
 ├── validator.py     ← 更新：canonical_id + 45min horizon
 └── api_server.py    ← 更新：Model API Contract
 ```
@@ -250,64 +256,89 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 
 ### Step 4 — 共用特徵模組（`[trainer/features.py](trainer/features.py)`，Train-Serve Parity 核心）
 
-**目標**：導入自動化特徵工程（如 Featuretools），完全取代人工寫死的靜態特徵清單；確保 EntitySet 與 Cutoff Time 的使用在 Trainer 與 Scorer 間保持絕對一致（Train-Serve Parity）。
+**目標**：導入雙軌特徵工程（Featuretools DFS + 向量化手寫），取代舊有靜態特徵清單；確保 EntitySet、Cutoff Time 與手寫邏輯在 Trainer 與 Scorer 間保持絕對一致（Train-Serve Parity）。
 
 #### A. 構建 EntitySet 與基元 (Primitives)
 
 - **實體定義**：
-  - `t_bet` (target entity)：以 `bet_id` 為 index，`payout_complete_dtm` 為 time_index。
-  - `t_session` (歷史輪廓)：以 `session_id` 為 index，`session_end_dtm`（或 `COALESCE(session_end_dtm, lud_dtm)`）為 time_index。
-  - **關係（Schema 事實）**：`**t_bet.session_id` → `t_session.session_id`**（每筆 bet 所屬的 session；many-to-one）。兩表唯一的直接外鍵是 `session_id`，不是 `table_id`；`canonical_id` 為 D2 衍生的玩家鍵，用於標籤/分組，不用於 EntitySet 表間關聯。
+  - `t_bet`（target entity）：以 `bet_id` 為 index，`payout_complete_dtm` 為 time_index。
+  - `t_session`（歷史輪廓）：以 `session_id` 為 index，`COALESCE(session_end_dtm, lud_dtm)` 為 time_index。
+  - `player`（跨日/跨桌輪廓）：以歸戶後的 `canonical_id` 為 index。提供跨 session 聚合的軸心（見 Step 2 / SSOT §6.2）。
+  - **關係**：
+    - `t_bet.session_id` → `t_session.session_id`（many-to-one）。`table_id` 僅為共有欄位，不作為 EntitySet 父子關係鍵。
+    - `t_session.canonical_id` → `player.canonical_id`（many-to-one）。
 - **特徵基元 (Primitives)**：
   - 轉化基元：`time_since`, `cum_sum`, `cum_mean`, 時間週期（時/分轉換）等。
   - 聚合基元：過去行為的 `count`, `sum`, `mean`, `max`, `min`, `trend`。
+  - **滾動窗口**：利用 `window_size` 參數（例如 5m, 15m, 30m 等）自動展開近期行為統計。
   - **H4（低，v5 補充 — 數值防呆）**：在餵入 EntitySet 前，對數值欄位（如 `wager`）做 `fillna(0)` 防呆。
 
-#### B. 領域特有邏輯 (Custom Primitives)
+#### B. 軌道 B：手工向量化特徵（Featuretools 無法或不宜處理的邏輯）
 
-必須將賭客特有狀態邏輯註冊為自動化工具的 Custom Primitives：
+以下特徵因涉及**條件重置狀態機**或**跨玩家/跨桌聚合**，Featuretools 天然無法支援或效能極差，**必須**以高效的向量化程式碼（Pandas/Polars）手寫實作，禁止逐列遍歷（Python for-loop / `apply`）：
 
-- **Run 邊界**（B2 修正）：自訂 `detect_run_boundary`，由工具統一計算距離 run start 時間。
-- **lossstreak（TRN-09 / E2 修正 — 高）**：自訂狀態機 Primitive：
-  - `status = 'LOSE'` → 連敗 +1
-  - `status = 'WIN'` → 連敗重置為 0
-  - `status = 'PUSH'` → 依 `LOSS_STREAK_PUSH_RESETS` 決定是否重置（F4 修正）。
-- **G3（中，v4 新增 — 穩定排序）**：在 Custom Primitives 處理內部，若遇到同毫秒多注，必須以 `payout_complete_dtm ASC, bet_id ASC` 穩定排序。
-- **G2（中，v4 新增 — player_id 回補）**：餵入 EntitySet 前，若 `t_bet.player_id` 無效但 `session_id` 有效，先以 `t_session` 回補 `effective_player_id`。
 
-#### C. 滾動窗口與自動探索
+| 特徵                                         | 為何不適合 Featuretools                                                        | 實作方式                                                                                                                          |
+| ------------------------------------------ | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `loss_streak`                              | 需要「遇 WIN 重置、遇 PUSH 條件不重置」的序列狀態機，無對應內建 Primitive                           | 向量化 Pandas/Polars；`status='LOSE'`→+1，`status='WIN'`→重置，`PUSH` 依 `LOSS_STREAK_PUSH_RESETS`（F4）；嚴格遵守同一 cutoff_time（TRN-09 / E2） |
+| `run_boundary` / `minutes_since_run_start` | 需要「相鄰 bet 間距 ≥ `RUN_BREAK_MIN` → 新 run 開始」的序列依賴切割                         | 同上（B2 修正）                                                                                                                     |
+| `table_hc`（S1）                             | 需跨玩家、以 `table_id` 為軸心的滾動聚合；若在 EntitySet 中建 table 實體，每個 cutoff 觸發全桌掃描，效能極差 | 同上；過去 `TABLE_HC_WINDOW_MIN` 分鐘內同桌不重複玩家數（from config）；扣除 `BET_AVAIL_DELAY_MIN` 防漏（D1/A2）                                       |
 
-- 捨棄人工手寫滾動 SQL/Pandas；改用語法糖（如 Featuretools `window_size`：5m, 15m, 30m）自動展開窗口統計。
-- 自動生成特徵候選集，並透過共線過濾與特徵重要性篩選，產出最終的 `feature_list.json`。
 
-#### D. 防洩漏與 Cutoff Time
+**手寫特徵防漏與 Parity 要求**：
 
-- 訓練與推論計算特徵時，必須統一依賴自動化工具的 `cutoff_time` 參數，嚴格切斷該觀測點時間之後的所有資料。
-- **E 類特徵修正（A1/F2/G5）**：當使用 `t_session` 資料作為聚合基礎時，必須確保 `session_avail_dtm <= cutoff_time`，並對 `avg_bet` 等 outlier 進行事前 winsorization（row-level cap）再餵給工具聚合。
+- 必須與軌道 A 共用同一個 `cutoff_time` / 時間窗口框架。
+- 計算函數必須抽取至 `features.py`，由 trainer 與 scorer 共同匯入（TRN-05/07/08）。
+- **G3（v4）**：同毫秒多注必須以 `payout_complete_dtm ASC, bet_id ASC` 穩定排序後再計算狀態。
+- **G2（v4）**：餵入前，若 `t_bet.player_id` 無效但 `session_id` 有效，先以去重後 `t_session` 回補 `effective_player_id`。
 
-#### S1 — `table_hc` 即時計算 (Custom Primitive)
+#### C. 兩階段 DFS 流程（解決單機資源限制）
 
-- **D1/A2 修正**：將「過去 `TABLE_HC_WINDOW_MIN` 分鐘內同桌不重複玩家數」寫成 Custom Primitive，由工具動態計算（扣除 `BET_AVAIL_DELAY_MIN` 以防漏）。
-- 查詢必須用 `t_bet FINAL`（E5 修正）。
+訓練環境為**單機**，無法對全量 4.38 億筆一次性做 DFS。採用以下兩階段流程：
 
-#### 特徵組對應 (Rated vs Non-rated)
+- **第一階段 — 探索（在抽樣資料上）**：
+  - 對各月度窗口內的多數類（label=0）做**時間分層下採樣（保留 10–20%）**，正例全保留，使每月觀測點從 ~2,300 萬降到幾百萬。
+  - 在此抽樣集上跑完整 DFS（建議 `max_depth<=2`，primitives 白名單），產出大量候選特徵。
+  - 做 Feature Screening（見下方 §D），選出高潛力候選。
+  - 以 `featuretools.save_features(feature_defs)` **將選中特徵的計算圖持久化**。
+- **第二階段 — 生產（全量）**：
+  - 以 `featuretools.calculate_feature_matrix(saved_feature_defs, entityset)` **直接套用已存的特徵定義**，逐月計算全量資料。
+  - **不重新實作**：訓練與推論都使用同一份 saved feature definitions，從根本上消除 train-serve parity 風險。
+  - 每月產出 parquet 落盤，合併後送入模型。
 
-- **Rated**：開放使用包含 `t_session` 歷史關聯的 EntitySet 特徵。
-- **Non-rated**：限制 EntitySet 僅能探索 `t_bet` 及當前 run/近期窗口之特徵（關閉 `t_session` 歷史路徑）。
+#### D. 特徵篩選（Feature Screening）
+
+軌道 A（DFS）產出的候選特徵數量可能很大，**必須**在送入正式訓練前篩選：
+
+1. **第一階段**：依單變量與目標關聯（如 mutual information、變異數門檻）及冗餘剔除（如高相關、VIF）縮減候選集。
+2. **第二階段（可選）**：在**訓練集**上以輕量 LightGBM 計算 feature importance 或 SHAP，取 top-K。**嚴格限制在 Train 集，不得使用 valid/test**，以符合防洩漏原則（SSOT §8.2.C）。
+3. 最終通過篩選的特徵清單（軌道 A 篩選後 + 軌道 B 全部）即為 `feature_list.json`，訓練與推論端僅計算此清單內特徵。
+
+#### E. 防洩漏與 Cutoff Time
+
+- 訓練與推論計算特徵時，必須統一依賴 Featuretools 的 `cutoff_time` 參數，嚴格切斷該觀測點時間之後的所有資料。
+- **E 類特徵修正（A1/F2/G5）**：使用 `t_session` 資料作為聚合基礎時，必須確保 `session_avail_dtm <= cutoff_time`，並對 `avg_bet` 等 outlier 進行事前 winsorization（row-level cap）再餵給工具聚合。
+- **H4（v5 補充 — 數值防呆）**：在餵入 EntitySet 前，對數值欄位（如 `wager`）做 `fillna(0)` 防呆。
+
+#### 特徵組對應（Rated vs Non-rated）
+
+- **Rated**：軌道 A 開放完整 EntitySet 存取（`t_bet` + `t_session` + `player`），含歷史賭客輪廓與跨日聚合；軌道 B 亦全部可用。
+- **Non-rated**：軌道 A 限制 EntitySet 僅探索 `t_bet` 內部路徑（不使用 `t_session` 歷史輪廓或 `player` 實體）；軌道 B 中 `loss_streak`、`run_boundary` 可用，但 `t_session` 相關聚合不可用。
 
 ---
 
 ### Step 5 — 訓練器重構（`[trainer/trainer.py](trainer/trainer.py)`）
 
 - 從 `config.py` 讀取所有參數
-- **時間窗口化抽取與資料量（SSOT §4.3）**：不得一次性載入全時段 4.38 億筆。須依時間分窗（如月/週）自 ClickHouse 逐窗拉取 `t_bet`/`t_session`，查詢對齊 partition（如 `gaming_day`）；每窗內跑 labels + features（DFS 依窗口分批呼叫），產出可寫磁碟或串接後再訓練。若需取樣，須保持時間順序並記錄取樣率。
-- 依序呼叫 `identity.py`（`cutoff_dtm = training_window_end`）→ 對**各時間窗口**：`labels.py`（C1）→ `features.py`（Featuretools DFS，傳入該窗之 cutoff 時間點）→ 特徵篩選（可選在合併後做一次）。
-- **特徵篩選 (Feature screening)**：在送入主模型前，增加單變量與共線性過濾，並可選用輕量 LightGBM 在 Train set 計算 feature importance 取 top-K，篩選後寫入 `feature_list.json`。
-- **雙模型分離**（§9.1）：Rated / Non-rated 各自訓練
-- **類別不平衡**：LightGBM 使用 `class_weight='balanced'`
+- **集中式時間窗口定義器（SSOT §4.3 — 強制）**：**必須**呼叫 `time_fold.py` 模組取得所有時間窗口邊界（月度 chunk 的 `window_start`/`window_end`、C1 延伸拉取緩衝 `extended_end`、Train/Valid/Test cutoff 點）。禁止在 trainer 內部自行計算邊界。
+  - **邊界語義合約**：核心窗口為 `[window_start, window_end)`；延伸拉取區間 `[window_end, extended_end)` **僅供**觀測未來事件以計算標籤，其樣本**絕對不可**納入訓練集。
+- **時間窗口化抽取（SSOT §4.3）**：不得一次性載入全時段 4.38 億筆。依 `time_fold.py` 發放的邊界逐窗查詢 `t_bet`/`t_session`，對齊 partition（如 `gaming_day`）；每窗內跑 labels + features（DFS 依窗口分批呼叫），產出可寫磁碟或串接後再訓練。若需取樣，須保持時間順序並記錄取樣率。
+- 依序呼叫 `identity.py`（`cutoff_dtm = training_window_end`）→ 對**各時間窗口**：`labels.py`（C1）→ `features.py`（兩階段 DFS 軌道 A + 軌道 B 向量化手寫，傳入該窗之 cutoff 時間點）→ 特徵篩選（DFS 探索後執行一次，見 Step 4 §D）。
+- **雙模型分離**（SSOT §9.1）：Rated / Non-rated 各自訓練
+- **演算法與超參調優**（SSOT §9.2）：使用 LightGBM（`class_weight='balanced'`）。必須使用 **Optuna (TPE Sampler)** 在 validation set 上進行超參搜尋（如 `n_estimators`, `learning_rate`, `max_depth` 等），目標為最佳化 F-beta 或 PR-AUC。Phase 1 不使用 AutoML 框架。
 - **時間切割**：Train 70% / Valid 15% / Test 15%，嚴格按 `payout_complete_dtm` 排序
 - **TRN-07 快取驗證**：快取 key = `(window_start, window_end, data_hash)`；不符時強制重算
-- **輸出**：`rated_model.pkl`、`nonrated_model.pkl`、`feature_list.json`、`model_version`（格式：`YYYYMMDD-HHMMSS-{git_short_hash}`）
+- **輸出（原子單位，版本化交付）**：`rated_model.pkl`、`nonrated_model.pkl`、`**saved_feature_defs`（軌道 A 計算圖）**、`features.py`（軌道 B）、`feature_list.json`、reason code 映射表、`model_version`（格式：`YYYYMMDD-HHMMSS-{git_short_hash}`）。任何組件版本不匹配時，服務端必須拒絕載入並回報錯誤。
 
 ---
 
@@ -369,7 +400,10 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 
 ### Step 7 — Scorer 更新（`[trainer/scorer.py](trainer/scorer.py)`）
 
-- **移除**所有獨立特徵計算，改為匯入 `features.py`（TRN-05/07/08 修正）。推論端必須透過同一套自動化特徵工程管線（EntitySet + DFS），傳入當前輪詢時間作為 `cutoff_time` 來即時計算特徵。
+- **移除**所有獨立特徵計算，改為：
+  - **軌道 A**：以 `featuretools.calculate_feature_matrix(saved_feature_defs, entityset)` 傳入當前輪詢時間為 `cutoff_time`，使用與訓練期**相同的** saved feature definitions 計算特徵。
+  - **軌道 B**：匯入 `features.py` 中的向量化手寫函數（`loss_streak`、`run_boundary`、`table_hc`）。
+  - 確保 train-serve parity（TRN-05/07/08 修正）。
 - **G3（中，v4 新增）**：推論端處理 bet 流必須使用穩定排序 `ORDER BY payout_complete_dtm ASC, bet_id ASC`。
 - `t_bet` 查詢可使用 `FINAL`（E5）；`t_session` 禁用 `FINAL`（G1），並必須套用 FND-01 去重後再 join。
 - `t_bet` 查詢基礎條件（v4）：`payout_complete_dtm IS NOT NULL AND (player_id 有效 OR session_id 有效)`。
@@ -417,7 +451,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
   - 對同一批觀測點，分別從 `trainer.py`（批次 DFS）和 `scorer.py`（增量 EntitySet 更新）計算特徵，斷言特徵值差異 < 容忍閾值（例如浮點誤差 1e-6）。
   - 驗證 `run_boundary`、rolling window 邊界語義的輸出一致性
   - **G1**：驗證 `t_session` 查詢不使用 `FINAL`，且去重結果與 FND-01（MAX(lud_dtm)）一致
-  - **G3**：在包含同毫秒多注的樣本集上，驗證 trainer/scorer 的處理順序與 B/C 類特徵逐筆一致（排序 key：`payout_complete_dtm`, `bet_id`）
+  - **G3**：在包含同毫秒多注的樣本集上，驗證 trainer/scorer 的處理順序與軌道 B 手寫狀態特徵及窗口統計逐筆一致（排序 key：`payout_complete_dtm`, `bet_id`）
   - **G2**：驗證 player_id 回補路徑：當 `t_bet.player_id` 無效但 `session_id` 有效時，`effective_player_id` 能被正確回補且不破壞分組/狀態機
 - **Label Sanity 測試**
   - `label = 1` 的比例在預期範圍（例如 5%–25%）
@@ -465,7 +499,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 | A1        | 高     | Leakage            | §4.2, §8.1                                         | Step 4 歷史特徵：`session_avail_dtm <= cutoff_time`                     |
 | A2        | 低     | Leakage            | §4.2, S1                                           | Step 4 S1：扣除 `BET_AVAIL_DELAY_MIN`                                 |
 | B1        | 中     | Parity             | §6.2, D2                                           | Step 2：`cutoff_dtm` 截止 + 快取版本控制                                    |
-| B2        | 中     | Parity             | §8.2.B                                             | Step 0/4：`RUN_BREAK_MIN` + Custom Primitive                        |
+| B2        | 中     | Parity             | §8.2.B                                             | Step 0/4：`RUN_BREAK_MIN` + 軌道 B 向量化手寫                              |
 | B3        | 低     | 特徵遺漏               | §9.1                                               | Step 4：Non-rated 亦包含時間週期等轉換特徵                                      |
 | C1        | 低     | SSOT 含糊            | §7.2                                               | Step 3：明確「至少 X+Y，建議 1 天」                                           |
 | C2        | 資訊性   | SSOT 不一致           | §2.1 vs §4.2                                       | Step 0：`SESSION_AVAIL_DELAY_MIN = 15` + rationale                  |
@@ -542,12 +576,15 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
   - **事實依據（raw data）**：對 `data/gmwds_t_bet.parquet`（438,005,955 rows）使用 Parquet row-group statistics 讀取，`wager null_count = 0`；抽樣前 5 個 row groups 亦 `wager NULL = 0`。
   - **結論**：本批資料不會因 `wager` NULL 造成 cumsum NA 汙染；但仍保留 `fillna(0)` 作防呆，以應對未來資料版本變更。不要把 `wager_is_null` 納入 feature list（避免常數欄），改用 `wager_null_pct` 監控觸發合約演進。
 
-## 第七輪業務需求對齊（v7）— 論證/理由（供後續 review 引用）
+## 第八輪 SSOT 對齊（v8）— 論證/理由（供後續 review 引用）
 
-- **全面導入自動化特徵工程（Featuretools）**：
-  - **事實依據**：手動維護 A–E 類數十個特徵的滾動/聚合 SQL 與 Pandas 邏輯，容易在推論端重構時引入 parity 破口，且擴展速度極慢。
-  - **風險機制**：若繼續依賴手工靜態清單，未來加入 `t_game`（Phase 2）或探索不同時間窗時，將面臨巨大的工程與測試負擔。人工防漏（如 `session_avail_dtm <= obs_time`）也容易出現人為失誤。
-  - **修正原則**：在 Phase 1 徹底重構特徵工程基礎設施，將 `t_bet` 與 `t_session` 抽象為 EntitySet。將領域邏輯（如 `loss_streak` 狀態機）封裝為 Custom Primitives。依賴 DFS (Deep Feature Synthesis) 自動展開多維特徵空間，並由工具內建的 `cutoff_time` 機制從根本上消除洩漏風險。這讓特徵清單從「靜態人工合約」變為「每次實驗動態輸出的產物」。
+- **雙軌特徵工程架構（Track A + Track B）**：
+  - **事實依據**：Featuretools DFS 能系統性搜索聚合/窗口/組合特徵空間，但對「條件重置狀態機」（`loss_streak`）或「跨玩家滾動聚合」（`table_hc`）等邏輯天然無法或效能極差。Custom Primitive 雖可部分橋接，但複雜狀態機的正確性難以驗證，且推論端難以複用。
+  - **風險機制**：若把 `loss_streak`、`run_boundary`、`table_hc` 強塞進 Featuretools Custom Primitives，會導致：(1) 狀態機邏輯分散在 Primitive 定義與外部程式碼間，難以測試；(2) Scorer 端難以高效重現；(3) 違反 SSOT §8.2.B 的明確設計意圖。
+  - **修正原則**：採雙軌並行——軌道 A（Featuretools DFS）專注自動化特徵探索，捨棄 Custom Primitive 包裝複雜狀態機；軌道 B（向量化 Pandas/Polars 手寫）專責狀態機與跨玩家特徵。兩軌共用同一 `cutoff_time` 框架，`features.py` 為唯一共用進入點，確保 train-serve parity。
+- `**player` 實體與兩階段 DFS**：
+  - **事實依據**：缺少 `player` 實體時，Featuretools 無法自動展開跨 session 的歷史聚合，必須手動串接；兩階段 DFS（探索在抽樣上 → 生產在全量上）是解決單機記憶體限制的標準模式（`save_features` / `calculate_feature_matrix`）。
+  - **修正原則**：EntitySet 新增 `player` 實體（以 `canonical_id` 為 index），建立 `t_session.canonical_id → player.canonical_id` 關係；採兩階段 DFS，第一階段 10–20% 下採樣探索，`save_features` 後第二階段全量套用，從根本封住 train-serve parity 風險。
 
 ---
 
@@ -576,7 +613,24 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 
 ---
 
-## 開放問題（需業務確認後才可落地 Step 6）
+## 持續運營範疇（SSOT §12.2）
+
+Phase 1 上線後，以下閉環必須升格為產品生命週期的一部分：
+
+- **監控**：資料分佈與特徵漂移、警報量、precision/recall proxy、reason code 分佈、線上 validator 結果、`wager_null_pct` 等 feature contract 指標。
+- **校準**：依業務容量與季節性調整閾值 / gate（仍遵守 SSOT §10.2 的策略框架）。
+- **重訓**：在 drift 或策略變更時更新模型與特徵集合，並以 `model_version` + `/model_info` 管理演進（含 `saved_feature_defs` 同步版本化）。
+
+---
+
+## 開放問題
+
+### 業務端協商未決（SSOT §13）
+
+1. **目標函數協商（未決）**：具體的 Precision/Recall 權衡底線為何？每班公關可處理多少警報（目標警報量範圍）？
+2. **Phase 1 Gate 選擇（未決）**：在 SSOT §10.2 的策略選項中，選定哪一個 gate 作為 Phase 1 的上線標準（建議預設採 **G1**，除非業務端明確要求其他 gate）。
+
+### 實作待確認參數（需 EDA 或業務確認後才可落地 Step 6）
 
 - `G1_PRECISION_MIN`（暫定 0.70）
 - `G1_ALERT_VOLUME_MIN_PER_HOUR`（暫定 5）
@@ -590,7 +644,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 
 - PIT-correct D2 mapping（D3 備忘）
 - `t_game` 牌局氛圍特徵（FND-14）
-- 序列嵌入 / SSL 預訓練（§8.4）
-- `tsfresh` / `Featuretools` 自動特徵探索（§8.5）
+- 序列嵌入 / SSL 預訓練（SSOT §8.4 Phase 2–3 策略）
+- AutoML / FLAML 集成探索（SSOT §9.2 Phase 2+）
 - 跨桌造訪建模
 
