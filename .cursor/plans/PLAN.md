@@ -16,25 +16,25 @@ todos:
     status: completed
   - id: step3-labels
     content: "Create trainer/labels.py: compute_labels() with C1 extended pull, H1 terminal bet censoring, stable sort guard"
-    status: in_progress
+    status: completed
   - id: step4-features
     content: "Create trainer/features.py: Track A Featuretools EntitySet/DFS/save_features, Track B vectorized loss_streak/run_boundary/table_hc, feature screening"
-    status: pending
+    status: completed
   - id: step5-trainer
     content: "Refactor trainer/trainer.py: chunked extraction via time_fold, identity+labels+features integration, dual model, visit-level sample_weight, Optuna hyperparams, atomic artifact output"
-    status: pending
+    status: completed
   - id: step6-backtester
     content: "Update trainer/backtester.py: Optuna TPE 2D threshold search, Micro+Macro-by-visit dual metrics, per-visit TP dedup evaluation"
-    status: pending
+    status: completed
   - id: step7-scorer
     content: "Refactor trainer/scorer.py: Track A saved_feature_defs, Track B features.py, D2 identity, H3 model routing, reason code output every poll"
-    status: pending
+    status: completed
   - id: step8-validator
     content: "Update trainer/validator.py: replace player_id with canonical_id, gaming_day visit dedup, write model_version to results"
     status: pending
   - id: step9-api
     content: "Update trainer/api_server.py: add /score, /health, /model_info endpoints with 422 schema validation; keep all existing routes intact"
-    status: pending
+    status: completed
   - id: step10-tests
     content: Create tests/ directory with test_labels.py, test_features.py, test_identity.py, test_trainer.py, test_backtester.py, test_scorer.py, test_dq_guardrails.py
     status: pending
