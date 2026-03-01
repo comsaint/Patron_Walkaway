@@ -18,7 +18,7 @@ Coverage
 import sys
 import pathlib
 import unittest
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 
 import pandas as pd
 
@@ -393,7 +393,10 @@ class TestResolveCanonicalId(unittest.TestCase):
     def test_step1_session_lookup_returns_card(self):
         avail = datetime(2025, 1, 1, 0, 0)
         obs = datetime(2025, 1, 1, 1, 0)  # after avail
-        lookup = lambda sid: {"casino_player_id": "CARD_X", "session_avail_dtm": avail}
+
+        def lookup(sid):
+            return {"casino_player_id": "CARD_X", "session_avail_dtm": avail}
+
         mapping = self._mapping([])
         result = resolve(1, "S1", mapping, lookup, obs_time=obs)
         self.assertEqual(result, "CARD_X")
@@ -401,7 +404,10 @@ class TestResolveCanonicalId(unittest.TestCase):
     def test_step1_skipped_when_session_not_yet_available(self):
         avail = datetime(2025, 1, 1, 2, 0)  # future
         obs = datetime(2025, 1, 1, 0, 0)
-        lookup = lambda sid: {"casino_player_id": "CARD_X", "session_avail_dtm": avail}
+
+        def lookup(sid):
+            return {"casino_player_id": "CARD_X", "session_avail_dtm": avail}
+
         mapping = self._mapping([(1, "CACHE_CARD")])
         result = resolve(1, "S1", mapping, lookup, obs_time=obs)
         # Step 1 fails (not available yet) → falls to step 2
@@ -430,7 +436,11 @@ class TestResolveCanonicalId(unittest.TestCase):
 
     def test_step1_skipped_when_no_session_id(self):
         called = []
-        lookup = lambda sid: (called.append(sid), None)[1]
+
+        def lookup(sid):
+            called.append(sid)
+            return None
+
         mapping = self._mapping([(1, "CACHE")])
         result = resolve(1, None, mapping, lookup)
         self.assertFalse(called)

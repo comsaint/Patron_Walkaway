@@ -269,6 +269,16 @@ def fetch_recent_data(
     if len(bets) != before:
         logger.debug("[scorer] filtered zero-wager bets: %d→%d", before, len(bets))
 
+    # Normalize payout_complete_dtm to tz-aware HK time so that Track-A
+    # cutoff_time (now_hk, tz-aware) is consistent with the EntitySet
+    # time_index when Featuretools computes features (R62).
+    if not bets.empty and "payout_complete_dtm" in bets.columns:
+        pcd = pd.to_datetime(bets["payout_complete_dtm"])
+        if pcd.dt.tz is None:
+            bets["payout_complete_dtm"] = pcd.dt.tz_localize(HK_TZ)
+        else:
+            bets["payout_complete_dtm"] = pcd.dt.tz_convert(HK_TZ)
+
     sessions = client.query_df(session_query, parameters=params)
     logger.info("[scorer] Fetched %d bets, %d sessions", len(bets), len(sessions))
     return bets, sessions

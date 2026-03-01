@@ -31,13 +31,13 @@ todos:
     status: completed
   - id: step8-validator
     content: "Update trainer/validator.py: replace player_id with canonical_id, gaming_day visit dedup, write model_version to results"
-    status: pending
+    status: completed
   - id: step9-api
     content: "Update trainer/api_server.py: add /score, /health, /model_info endpoints with 422 schema validation; keep all existing routes intact"
     status: completed
   - id: step10-tests
     content: Create tests/ directory with test_labels.py, test_features.py, test_identity.py, test_trainer.py, test_backtester.py, test_scorer.py, test_dq_guardrails.py
-    status: pending
+    status: completed
 isProject: false
 ---
 

@@ -4,7 +4,7 @@ import random
 import sqlite3
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 from zoneinfo import ZoneInfo
@@ -404,7 +404,7 @@ def fetch_table_ids_for_layout() -> List[str]:
 def write_status(conn: sqlite3.Connection, occupied: List[dict]) -> None:
     alert_stats = load_recent_alert_stats(conn)
     # Build occupancy map: table_id -> seat_id -> rich seat info
-    occ_map = {}
+    occ_map: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for row in occupied:
         tid = str(row.get("table_id")) if row.get("table_id") is not None else None
         seat = str(row.get("seat_id")) if row.get("seat_id") is not None else None
@@ -473,36 +473,55 @@ def write_status(conn: sqlite3.Connection, occupied: List[dict]) -> None:
         entry.setdefault("table_status", "Open")
         entry.setdefault("min_bet", 2000)
         entry.setdefault("max_bet", 2_000_000)
-        status = {k: 0 for k in SEAT_KEYS}
-        seat_info = {}
+        status: Dict[str, int] = {k: 0 for k in SEAT_KEYS}
+        table_seat_info: Dict[str, Dict[str, Any]] = {}
         for seat, info in occ_map.get(tid, {}).items():
             if seat in status:
                 status[seat] = 1
             else:
                 status["0"] = 1  # unexpected seat id
-            seat_info[seat] = info
+            table_seat_info[seat] = info
         entry["status"] = status
-        if seat_info:
-            entry["seat_info"] = seat_info
+        if table_seat_info:
+            entry["seat_info"] = table_seat_info
 
         # Roll up simple table metrics for tooltip consumption (independent of alerts/validation)
         try:
-            avg_bets = [float(v.get("avg_bet")) for v in seat_info.values() if v.get("avg_bet") is not None]
-            turnover_sum = sum(float(v.get("turnover")) for v in seat_info.values() if v.get("turnover") is not None)
-            win_sum = sum(float(v.get("win")) for v in seat_info.values() if v.get("win") is not None)
-            push_sum = sum(float(v.get("push")) for v in seat_info.values() if v.get("push") is not None)
+            avg_bets = [
+                float(v.get("avg_bet"))  # type: ignore[arg-type, union-attr]
+                for v in table_seat_info.values()
+                if v.get("avg_bet") is not None
+            ]
+            turnover_sum = sum(
+                float(v.get("turnover"))  # type: ignore[arg-type, misc, union-attr]
+                for v in table_seat_info.values()
+                if v.get("turnover") is not None
+            )
+            win_sum = sum(
+                float(v.get("win"))  # type: ignore[arg-type, misc, union-attr]
+                for v in table_seat_info.values()
+                if v.get("win") is not None
+            )
+            push_sum = sum(
+                float(v.get("push"))  # type: ignore[arg-type, misc, union-attr]
+                for v in table_seat_info.values()
+                if v.get("push") is not None
+            )
             entry["table_metrics"] = {
                 "avg_bet": (sum(avg_bets) / len(avg_bets)) if avg_bets else None,
                 "turnover": turnover_sum if turnover_sum != 0 else None,
                 "win": win_sum if win_sum != 0 else None,
                 "push": push_sum if push_sum != 0 else None,
                 "active_seats": sum(1 for v in status.values() if v == 1),
-                "session_count": len(seat_info),
+                "session_count": len(table_seat_info),
             }
             # Propagate commonly used metadata (first non-empty)
             meta_fields = ["table_name", "game_type", "pit_name", "gaming_area"]
             for field in meta_fields:
-                val = next((v.get(field) for v in seat_info.values() if v.get(field) not in (None, "")), None)
+                val = next(
+                    (v.get(field) for v in table_seat_info.values() if v.get(field) not in (None, "")),
+                    None,
+                )
                 if val is not None:
                     entry[field] = val
         except Exception:

@@ -335,6 +335,40 @@ class TestNullPayoutGuard(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# C1 — no leakage from extended zone
+# ---------------------------------------------------------------------------
+
+class TestC1NoLeakageFromExtendedZone(unittest.TestCase):
+    """Labels must not use information beyond extended_end (C1 extended pull boundary)."""
+
+    def test_terminal_censored_when_extended_end_before_determinability(self):
+        """When extended_end is strictly before payout + WALKAWAY_GAP_MIN, terminal is censored.
+
+        Ensures we do not use future data beyond extended_end to assign labels.
+        """
+        base = datetime(2025, 1, 1)
+        # Single bet at t=0; determinability at t=0 + WALKAWAY_GAP_MIN
+        window_end = base  # must be <= extended_end
+        extended_end = base + timedelta(minutes=WALKAWAY_GAP_MIN - 1)  # 1 min before we could know
+        df = pd.DataFrame([
+            {"canonical_id": "P1", "bet_id": 1, "payout_complete_dtm": base},
+        ])
+        result = compute_labels(df, window_end, extended_end)
+        self.assertTrue(result.iloc[0]["censored"], "terminal must be censored when extended_end < payout + X")
+
+    def test_terminal_not_censored_when_extended_end_at_determinability(self):
+        """When extended_end equals payout + WALKAWAY_GAP_MIN, gap is determinable (no leakage)."""
+        base = datetime(2025, 1, 1)
+        window_end = base  # must be <= extended_end
+        extended_end = base + timedelta(minutes=WALKAWAY_GAP_MIN)  # exactly at boundary
+        df = pd.DataFrame([
+            {"canonical_id": "P1", "bet_id": 1, "payout_complete_dtm": base},
+        ])
+        result = compute_labels(df, window_end, extended_end)
+        self.assertFalse(result.iloc[0]["censored"], "terminal determinable when extended_end >= payout + X")
+
+
+# ---------------------------------------------------------------------------
 # Exact alert-horizon boundary
 # ---------------------------------------------------------------------------
 

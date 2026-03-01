@@ -37,6 +37,10 @@ except ImportError:
     get_clickhouse_client = None  # type: ignore[assignment]
 
 HK_TZ = ZoneInfo(config.HK_TZ)
+# Sentinel for ongoing sessions (NULL session_end_dtm in DB); must not trigger
+# walkaway logic in validate_alert_row (R59 fix).
+_SENTINEL_SESSION_END = pd.Timestamp("2099-12-31 00:00:00", tz="UTC").tz_convert(HK_TZ)
+
 BASE_DIR = Path(__file__).parent
 STATE_DB_PATH = BASE_DIR / "local_state" / "state.db"
 OUT_DIR = BASE_DIR / "out_validator"
@@ -161,6 +165,7 @@ def fetch_bets_by_canonical_id(
               AND player_id != {config.PLACEHOLDER_PLAYER_ID}
               AND payout_complete_dtm >= %(start)s
               AND payout_complete_dtm <= %(end)s
+              AND payout_complete_dtm IS NOT NULL
               AND wager > 0
             ORDER BY player_id, payout_complete_dtm
         """
@@ -257,6 +262,10 @@ def fetch_sessions_by_canonical_id(
             else:
                 df[col] = df[col].dt.tz_convert(HK_TZ)
 
+        # session_end_dtm is NULL for ongoing sessions; replace NaT with a
+        # far-future sentinel so sort-key and gap arithmetic remain valid (R59).
+        df["session_end_dtm"] = df["session_end_dtm"].fillna(_SENTINEL_SESSION_END)
+
         for _, row in df.iterrows():
             pid = int(row["player_id"])
             resolved_cid = pid_to_cid.get(pid)
@@ -292,36 +301,6 @@ def fetch_sessions_by_canonical_id(
             )
         cache[cid] = sessions
 
-    return cache
-
-
-def fetch_bets_for_players(player_ids: List[int], start: datetime, end: datetime) -> Dict[int, List[datetime]]:
-    if not player_ids:
-        return {}
-    client = get_clickhouse_client()
-    params = {"players": tuple(player_ids), "start": start, "end": end}
-    query = f"""
-        SELECT player_id, payout_complete_dtm
-        FROM {config.SOURCE_DB}.{config.TBET}
-        WHERE player_id IN %(players)s
-          AND payout_complete_dtm >= %(start)s
-          AND payout_complete_dtm <= %(end)s
-                    AND wager > 0
-        ORDER BY player_id, payout_complete_dtm
-    """
-    df = client.query_df(query, parameters=params)
-    if df.empty:
-        return {}
-    # Ensure tz-aware in HK
-    df["payout_complete_dtm"] = pd.to_datetime(df["payout_complete_dtm"])
-    if df["payout_complete_dtm"].dt.tz is None:
-        df["payout_complete_dtm"] = df["payout_complete_dtm"].dt.tz_localize(HK_TZ)
-    else:
-        df["payout_complete_dtm"] = df["payout_complete_dtm"].dt.tz_convert(HK_TZ)
-
-    cache: Dict[int, List[datetime]] = {}
-    for pid, grp in df.groupby("player_id"):
-        cache[int(pid)] = list(grp["payout_complete_dtm"].sort_values())
     return cache
 
 
@@ -674,35 +653,42 @@ def validate_alert_row(
 
     if matched_session:
         session_end = matched_session["end"]
+        if pd.isna(session_end):
+            # defensive guard: ongoing session has no recorded end (R59)
+            session_end = bet_ts + timedelta(hours=24)
         next_start = matched_session.get("next_start")
-        gap_to_next = (next_start - session_end).total_seconds() / 60.0 if next_start is not None else 1e9
-        minutes_to_end = (session_end - bet_ts).total_seconds() / 60.0
-        
-        # Exact match within 15 min window -> candidate MATCH
-        # Per policy, we treat this as a candidate and defer finalization
-        # until the extended wait window passes (to allow late arrivals to show up).
-        if gap_to_next >= 30 and 0 <= minutes_to_end <= 15:
-            res_base.update(
-                {
-                    "result": None,  # signal to re-check later
-                    "gap_start": session_end.isoformat(),
-                    "gap_minutes": gap_to_next,
-                    "reason": "PENDING",
-                }
-            )
-            # do not return yet; let the later logic decide after the extended wait
-        
-        # Eventual walkaway (merged as MISS per requirement)
-        elif gap_to_next >= 30 and minutes_to_end > 15:
-            res_base.update(
-                {
-                    "result": False,
-                    "gap_start": session_end.isoformat(),
-                    "gap_minutes": gap_to_next,
-                    "reason": "MISS",
-                }
-            )
-            return res_base
+        # Skip walkaway logic for ongoing sessions (sentinel = far-future end);
+        # otherwise we would wrongly return MISS when there is no next session.
+        is_ongoing = getattr(session_end, "year", 0) >= 2090
+        if not is_ongoing:
+            gap_to_next = (next_start - session_end).total_seconds() / 60.0 if next_start is not None else 1e9
+            minutes_to_end = (session_end - bet_ts).total_seconds() / 60.0
+
+            # Exact match within 15 min window -> candidate MATCH
+            # Per policy, we treat this as a candidate and defer finalization
+            # until the extended wait window passes (to allow late arrivals to show up).
+            if gap_to_next >= 30 and 0 <= minutes_to_end <= 15:
+                res_base.update(
+                    {
+                        "result": None,  # signal to re-check later
+                        "gap_start": session_end.isoformat(),
+                        "gap_minutes": gap_to_next,
+                        "reason": "PENDING",
+                    }
+                )
+                # do not return yet; let the later logic decide after the extended wait
+
+            # Eventual walkaway (merged as MISS per requirement)
+            elif gap_to_next >= 30 and minutes_to_end > 15:
+                res_base.update(
+                    {
+                        "result": False,
+                        "gap_start": session_end.isoformat(),
+                        "gap_minutes": gap_to_next,
+                        "reason": "MISS",
+                    }
+                )
+                return res_base
 
     # Fallback to bet-gap check
     is_true, gap_start, gap_minutes = find_gap_within_window(bet_ts, bet_times, base_start=base_start)

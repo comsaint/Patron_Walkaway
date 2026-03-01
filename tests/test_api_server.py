@@ -18,7 +18,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 # ---------------------------------------------------------------------------
 # Import api_server safely — without adding trainer/ to sys.path.

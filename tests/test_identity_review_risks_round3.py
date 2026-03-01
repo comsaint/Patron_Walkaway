@@ -62,7 +62,10 @@ class TestIdentityReviewRisksRound3(unittest.TestCase):
         # not yet available (SESSION_AVAIL_DELAY_MIN is 15).
         obs = datetime(2025, 1, 1, 1, 0, 0)
         session_end = obs - timedelta(minutes=5)
-        lookup = lambda sid: {"casino_player_id": "CARD_X", "session_avail_dtm": session_end}
+
+        def lookup(sid):
+            return {"casino_player_id": "CARD_X", "session_avail_dtm": session_end}
+
         mapping = pd.DataFrame([(1, "CACHE_CARD")], columns=["player_id", "canonical_id"])
         got = IDENTITY.resolve_canonical_id(1, "S1", mapping, lookup, obs_time=obs)
         self.assertEqual(got, "CACHE_CARD")

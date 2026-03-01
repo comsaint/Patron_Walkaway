@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import sqlite3
 import threading
@@ -336,17 +337,22 @@ def _load_artifacts() -> dict | None:
         with reason_map_path.open(encoding="utf-8") as fh:
             arts["reason_code_map"] = json.load(fh)
 
-    # ── Integrity check (R48): log sha256 for each pkl to detect corruption ──
+    # ── Read each pkl once, verify sha256, cache raw bytes for in-memory
+    #    deserialization — avoids double I/O (R48, R58) ──
+    _pkl_raw: dict = {}
     for pkl_path in [rated_path, nonrated_path, legacy_path]:
         if pkl_path.exists():
-            digest = hashlib.sha256(pkl_path.read_bytes()).hexdigest()
+            raw = pkl_path.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
             print(f"[api] {pkl_path.name} sha256={digest}")
+            _pkl_raw[pkl_path] = raw
 
-    if rated_path.exists() and nonrated_path.exists():
-        rb = joblib.load(rated_path)
-        nb = joblib.load(nonrated_path)
+    if rated_path in _pkl_raw and nonrated_path in _pkl_raw:
+        rb = joblib.load(io.BytesIO(_pkl_raw[rated_path]))
+        nb = joblib.load(io.BytesIO(_pkl_raw[nonrated_path]))
         arts["rated"] = {"model": rb["model"], "threshold": float(rb.get("threshold", 0.5))}
         arts["nonrated"] = {"model": nb["model"], "threshold": float(nb.get("threshold", 0.5))}
+        arts["training_metrics"] = rb.get("metrics", {})
         if not arts["feature_list"]:
             arts["feature_list"] = rb.get("features", [])
         # ── Cache TreeExplainer objects (R49): avoids rebuild on every request ──
@@ -360,12 +366,13 @@ def _load_artifacts() -> dict | None:
             arts["nonrated_explainer"] = None
         return arts
 
-    if legacy_path.exists():
-        bundle = joblib.load(legacy_path)
+    if legacy_path in _pkl_raw:
+        bundle = joblib.load(io.BytesIO(_pkl_raw[legacy_path]))
         arts["rated"] = {
             "model": bundle["model"],
             "threshold": float(bundle.get("threshold", 0.5)),
         }
+        arts["training_metrics"] = bundle.get("metrics", {})
         if not arts["feature_list"]:
             arts["feature_list"] = bundle.get("features", [])
         try:
@@ -389,10 +396,10 @@ def _get_artifacts() -> dict | None:
     """
     global _artifacts_cache, _cached_model_version
     version_path = MODEL_DIR / "model_version"
-    current_version = (
-        version_path.read_text(encoding="utf-8").strip() if version_path.exists() else ""
-    )
     with _artifacts_lock:
+        current_version = (
+            version_path.read_text(encoding="utf-8").strip() if version_path.exists() else ""
+        )
         if not _artifacts_cache or current_version != _cached_model_version:
             loaded = _load_artifacts()
             if loaded is not None:
@@ -402,7 +409,7 @@ def _get_artifacts() -> dict | None:
 
 
 def _compute_shap_reason_codes_batch(
-    model: object,
+    explainer: object,
     X: np.ndarray,
     feature_list: list,
     reason_code_map: dict,
@@ -410,16 +417,17 @@ def _compute_shap_reason_codes_batch(
 ) -> list:
     """Compute per-row SHAP-based reason codes for a batch of observations.
 
-    Returns a list (length = X.shape[0]) where each element is a list of up to
-    top_k reason-code strings.  Falls back to empty lists on any error so that
-    scoring results are never blocked by an explainability failure.
+    Accepts a pre-built shap.TreeExplainer from the artifact cache (R56) so that
+    the explainer is not rebuilt on every call.  Returns a list (length =
+    X.shape[0]) where each element is a list of up to top_k reason-code strings.
+    Falls back to empty lists on any error so that scoring is never blocked by an
+    explainability failure.
     """
     n_rows = X.shape[0] if hasattr(X, "shape") else len(X)
+    if explainer is None:
+        return [[] for _ in range(n_rows)]
     try:
-        import shap  # type: ignore[import]
-
-        explainer = shap.TreeExplainer(model)
-        sv = explainer.shap_values(X)
+        sv = explainer.shap_values(X)  # type: ignore[attr-defined]
         sv_class1: np.ndarray = sv[1] if isinstance(sv, list) else sv
         results = []
         for row_sv in sv_class1:
@@ -467,16 +475,7 @@ def model_info():
         return jsonify({"error": "No model artifacts found; run trainer.py first"}), 503
 
     model_type = "dual" if (arts["rated"] and arts["nonrated"]) else "legacy"
-    metrics: dict = {}
-    try:
-        import joblib  # type: ignore[import]
-
-        rb_path = MODEL_DIR / "rated_model.pkl"
-        if rb_path.exists():
-            rb = joblib.load(rb_path)
-            metrics = rb.get("metrics", {})
-    except Exception:
-        pass
+    metrics: dict = arts.get("training_metrics") or {}
 
     resp = jsonify(
         {
@@ -589,8 +588,9 @@ def score():
         threshold = model_info_d["threshold"]
         X = subset_df[feature_list].values.astype(float) if feature_list else np.zeros((len(subset_df), 0))
         proba = lgbm_model.predict_proba(X)[:, 1]
+        cached_explainer = arts.get("rated_explainer") if model_key == "rated" else arts.get("nonrated_explainer")
         reason_codes_batch = _compute_shap_reason_codes_batch(
-            lgbm_model, X, feature_list, reason_code_map
+            cached_explainer, X, feature_list, reason_code_map
         )
 
         for batch_i, orig_idx in enumerate(subset_df.index):

@@ -2709,3 +2709,492 @@ python -m mypy trainer/validator.py trainer/api_server.py trainer/scorer.py --ig
 - 可繼續實作 `PLAN.md` 剩餘步驟：
   - Step 8（`validator.py` canonical_id + gaming_day dedup + model_version write）—— 在 YAML 中仍標記為 `pending`，應更新為 `completed`。
   - Step 10 剩餘測試檔案：`test_trainer.py`、`test_backtester.py`、`test_scorer.py`、`test_dq_guardrails.py`。
+
+---
+
+## Round 37 — 確認 Step 8 完成 + 建立 test_dq_guardrails.py
+
+**日期**: 2026-03-01  
+**目標**：依 PLAN.md 進行下 1–2 步。
+
+---
+
+### Step 1：PLAN.md 更新 — Step 8 標記為 `completed`
+
+讀完 `validator.py` 後確認 Step 8 三項需求**均已在之前各 Round 實作完畢**：
+
+| 需求 | 實作位置 | 狀態 |
+|------|----------|------|
+| 用 `canonical_id` 取代 `player_id` 作為 grouping key | `_build_cid_to_player_ids()`、`validate_alert_row()`、`validate_once()` | ✅ |
+| `gaming_day` visit dedup（visit-level precision） | `validate_once()` 行 977–1005，`GAMING_DAY_START_HOUR` config | ✅ |
+| 回寫 `canonical_id` + `model_version` 到 validation_results | `VALIDATION_COLUMNS`、`_NEW_VAL_COLS` ALTER TABLE migration、`save_validation_results()` | ✅ |
+
+**修改**：`PLAN.md` YAML header 中 `step8-validator` 的 `status: pending` → `status: completed`。
+
+---
+
+### Step 2：建立 `tests/test_dq_guardrails.py`（Step 10 新測試）
+
+#### 測試覆蓋範圍（19 個 test cases，分 4 個 TestCase 類別）
+
+| 類別 | 檔案 / 函數 | 檢查項目 |
+|------|-------------|----------|
+| `TestDQGuardrailsScorer` | `scorer.py / fetch_recent_data` | t_bet: `FINAL`、`player_id !=`；t_session: 無 FINAL、`ROW_NUMBER() OVER`、`is_deleted=0`、`is_canceled=0`、`is_manual=0` |
+| `TestDQGuardrailsValidatorBets` | `validator.py / fetch_bets_by_canonical_id` | `FINAL`、`player_id !=`；`is_manual` 不得出現（t_bet 無此欄） |
+| `TestDQGuardrailsValidatorSessions` | `validator.py / fetch_sessions_by_canonical_id` | 無 `FINAL`、`ROW_NUMBER() OVER`、三項 DQ filter |
+| `TestDQGuardrailsCrossFile` | 跨 scorer + validator 全文掃描 | 舊版 `fetch_sessions_for_players` 已刪除；兩檔均含 placeholder 排除及 FND-01 CTE |
+
+#### 測試方法
+- 純靜態分析：`ast.get_source_segment` 擷取函數原始碼 + `re.search` 模式比對
+- 不需 ClickHouse 連線、不需任何 fixture
+
+---
+
+### 執行結果
+
+```
+# 新測試
+python -m unittest tests.test_dq_guardrails -v
+→ Ran 19 tests in 0.003s  OK
+
+# 完整測試套件（無回歸）
+python -m unittest discover -s tests -p "test_*.py"
+→ Ran 191 tests in 5.452s  OK
+
+# Lint
+python -m ruff check tests/test_dq_guardrails.py
+→ All checks passed!
+```
+
+---
+
+### 手動驗證方式
+
+```bash
+# 只跑新測試
+python -m unittest tests.test_dq_guardrails -v
+
+# 完整回歸
+python -m unittest discover -s tests -p "test_*.py"
+
+# 確認 PLAN.md Step 8 已標為 completed
+grep "step8-validator" .cursor/plans/PLAN.md
+```
+
+---
+
+### 下一步建議
+
+PLAN.md 剩餘 `pending` 步驟：**Step 10**（`tests/` 目錄）尚缺三個測試檔案：
+
+| 檔案 | 主要測試內容 |
+|------|-------------|
+| `test_trainer.py` | sample_weight 正確性、artifact bundle 完整性（rated + nonrated + feature_list + reason_code_map + model_version） |
+| `test_backtester.py` | dual metrics（micro + macro-by-visit）、per-visit TP dedup 評估邏輯 |
+| `test_scorer.py` | H3 model routing（is_rated 切分）、reason code 每次 poll 輸出完整性 |
+
+建議下一輪先從 `test_trainer.py` 開始（最能保護 artifact 結構不被意外破壞）。
+
+---
+
+## Round 38 — Review（Round 36–37 變更）
+
+**日期**: 2026-03-01  
+**範圍**: Round 36 修改的 production code（`validator.py`、`api_server.py`、`scorer.py`）+ Round 37 新增的 `tests/test_dq_guardrails.py`。
+
+---
+
+### 發現的風險點
+
+#### R55 — `fetch_bets_for_players` 廢棄函數未刪除（同 R53 類型）
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 中 |
+| **位置** | `validator.py` 行 298–325 |
+| **問題** | R53 刪除了舊版 `fetch_sessions_for_players`，但同類的 `fetch_bets_for_players`（player_id-keyed、無 `FINAL`、無 `player_id != PLACEHOLDER` 過濾）仍在。目前無調用者，但留著是定時炸彈——若未來有人誤 import，會取得未經 DQ 過濾的下注資料。 |
+| **修改建議** | 刪除整個 `fetch_bets_for_players` 函數。 |
+| **新測試** | 在 `test_dq_guardrails.py` 加 `assertNotIn("def fetch_bets_for_players(", _VALIDATOR_SRC)`，與 R53 的 `fetch_sessions_for_players` 檢查對稱。 |
+
+#### R56 — `_compute_shap_reason_codes_batch` 未使用快取的 TreeExplainer
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 中（效能） |
+| **位置** | `api_server.py` 行 404–432（函數本體）；行 592–594（呼叫處 in `score()` endpoint） |
+| **問題** | R49 在 `_load_artifacts()` 中快取了 `rated_explainer` / `nonrated_explainer`（`shap.TreeExplainer`），但 `_compute_shap_reason_codes_batch()` 仍然在每次呼叫時新建 `shap.TreeExplainer(model)`（行 421）。R49 的快取完全未被消費——每次 POST `/score` 仍會重建 explainer，對大 batch 請求延遲很明顯。 |
+| **修改建議** | 改 `_compute_shap_reason_codes_batch` 的簽名，接收 optional `explainer` 參數；在 `score()` endpoint 根據 `model_key` 取出 `arts["rated_explainer"]` 或 `arts["nonrated_explainer"]` 傳入。若 explainer 為 None，才 fallback 到建新的。 |
+| **新測試** | AST 檢查：`score` 函數的原始碼中應包含 `rated_explainer` 或 `nonrated_explainer`（表示確有傳遞快取 explainer 的程式碼路徑）。 |
+
+#### R57 — `_get_artifacts` version_path 讀取在 lock 外部（TOCTOU）
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 低（效能 + 理論正確性） |
+| **位置** | `api_server.py` 行 391–401 |
+| **問題** | `version_path.read_text()` 在 `with _artifacts_lock:` 外面讀取。兩個並行 thread 可同時讀到 `current_version="v2"`，然後依序進入 lock，都觸發 `_load_artifacts()`——重複載入。不會 crash，但浪費 I/O。 |
+| **修改建議** | 將 `current_version` 的讀取移入 `with _artifacts_lock:` 區塊內。 |
+| **新測試** | AST 檢查：`_get_artifacts` 函數中 `version_path.read_text` 和 `_load_artifacts` 必須都在同一個 `with _artifacts_lock` 區塊的 body 內。可近似用 source text 順序：確認 `with _artifacts_lock` 出現在 `version_path.read_text` 之前。 |
+
+#### R58 — `_load_artifacts` 對大型 pkl 做雙重 I/O（sha256 + joblib.load）
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 低（效能） |
+| **位置** | `api_server.py` 行 340–343（sha256 loop）vs. 行 346–347（joblib.load） |
+| **問題** | 先 `pkl_path.read_bytes()` 計算 sha256（約 50–200 MB 整檔讀取），然後 `joblib.load(pkl_path)` 再把同一檔案讀一遍做反序列化。部署時模型通常在 NFS 或冷磁碟上，雙重讀取延遲明顯。 |
+| **修改建議** | 改為 `raw = pkl_path.read_bytes()`、計算 sha256 後用 `joblib.load(io.BytesIO(raw))` 做反序列化，避免重複 I/O。 |
+| **新測試** | 此為純效能議題，不需功能性測試。若要驗證，用 `unittest.mock.patch("pathlib.Path.read_bytes")` 確認只被呼叫一次。 |
+
+#### R59 — validator sessions `session_end_dtm` 可能為 NULL → sort / gap 計算異常
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 高 |
+| **位置** | `validator.py` `fetch_sessions_by_canonical_id` 行 253–258（tz 轉換）、行 281（sort by `s["end"]`）、行 269（轉存 `"end": row["session_end_dtm"]`）；`validate_alert_row` 行 676–679（`session_end - bet_ts`） |
+| **問題** | ClickHouse 中 `session_end_dtm` 對進行中的 session 是 NULL。`pd.to_datetime(NULL)` = `NaT`。排序時 `(s["start"], s["end"])` 的 NaT 比較行為因 pandas 版本而異；`validate_alert_row` 中 `(session_end - bet_ts).total_seconds()` 對 NaT 會得到 NaN，後續 `0 <= minutes_to_end <= 15` 判斷永遠為 False。進行中的 session 永遠不會被 session-based 邏輯匹配到——可能導致 false MISS。 |
+| **修改建議** | 在 `fetch_sessions_by_canonical_id` 的 SQL 中加 `COALESCE(session_end_dtm, now())` 或在 Python 側：若 `row["session_end_dtm"]` 為 NaT，替換為 `datetime.now(HK_TZ)`（或 `end` 參數）。sort key 中的 `s["end"]` 也需處理 NaT。 |
+| **新測試** | 單元測試：構造含 `session_end_dtm=NaT` 的 session dict list，呼叫 `validate_alert_row`，驗證 session-based matching 仍可辨識進行中的 session 而非跳過。 |
+
+#### R60 — validator bets query 缺少 `payout_complete_dtm IS NOT NULL`
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 低 |
+| **位置** | `validator.py` `fetch_bets_by_canonical_id` 行 157–166 |
+| **問題** | PLAN.md Step 1 明確列出 t_bet DQ 規則包含 `payout_complete_dtm IS NOT NULL`。`scorer.py` 和 `trainer.py` 都有此條件。`validator.py` 靠 `payout_complete_dtm >= %(start)s` 隱式排除 NULL（ClickHouse 中 NULL 比較為 false），但不是顯式過濾。跨模組 parity 不足。 |
+| **修改建議** | 在 WHERE 子句中加 `AND payout_complete_dtm IS NOT NULL`。 |
+| **新測試** | 在 `test_dq_guardrails.py` `TestDQGuardrailsValidatorBets` 加 `assertIn("payout_complete_dtm IS NOT NULL", self.src)`。 |
+
+#### R61 — `model_info()` 每次呼叫都重讀 pkl
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 低（效能） |
+| **位置** | `api_server.py` 行 471–478（`model_info` endpoint） |
+| **問題** | 每次 GET `/model_info` 都呼叫 `joblib.load(rb_path)` 讀取 `rated_model.pkl` 只為取 `metrics`。而 `_load_artifacts()` 已經 `joblib.load` 過同一檔案。對大模型（50–200 MB）這是不必要的重複 I/O。 |
+| **修改建議** | 在 `_load_artifacts()` 載入 rated model 時，同時將 `rb.get("metrics", {})` 存入 `arts["training_metrics"]`。`model_info()` 直接從快取的 arts dict 取用。 |
+| **新測試** | AST 檢查：`model_info` 函數原始碼中不應包含 `joblib.load`（表示已改為從快取讀取）。 |
+
+#### R62 — scorer Track A `cutoff_time` tz-aware 但 EntitySet 資料可能為 tz-naive
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 中（資料正確性） |
+| **位置** | `scorer.py` `score_once` 行 966–970 |
+| **問題** | `fetch_recent_data` 返回的 bets 的 `payout_complete_dtm` 由 ClickHouse driver 決定 tz 狀態（通常 tz-naive）。`build_entity_set` 做 `bets.copy()`，保留原始 tz 狀態。`_cutoff_df` 的 `cutoff_time = now_hk`（tz-aware）。如果 EntitySet 的 time_index 是 tz-naive 而 cutoff_time 是 tz-aware，Featuretools `calculate_feature_matrix` 可能 raise `TypeError` 或靜默 miscompare。R51 的修正目的正確（保留語義），但需要同時確保 EntitySet 資料與 cutoff 的 tz 一致。 |
+| **修改建議** | 在 `score_once` 的 Track A 路徑中，建 `_cutoff_df` 前先統一：若 `bets["payout_complete_dtm"]` 是 tz-naive，對 `now_hk` 做 `.replace(tzinfo=None)`；否則保持 tz-aware。或更根本地，將 `fetch_recent_data` 返回值統一為 tz-aware。 |
+| **新測試** | 整合測試：mock `fetch_recent_data` 返回 tz-naive bets，驗證 Track A cutoff_df 的 tz 與 bets 一致。 |
+
+---
+
+### 風險優先排序
+
+| 優先 | 風險 | 理由 |
+|------|------|------|
+| 1 | R59 | 高嚴重度；`session_end_dtm=NULL` 是常見的生產場景（進行中 session），直接影響驗證結果 |
+| 2 | R56 | 中嚴重度；R49 快取形同虛設，每次 `/score` 仍重建 TreeExplainer |
+| 3 | R62 | 中嚴重度；Track A tz mismatch 可能在 featuretools 版本升級後 break |
+| 4 | R55 | 中嚴重度；刪除廢棄函數是 low-effort 高回報 |
+| 5 | R60 | 低嚴重度；顯式 `IS NOT NULL` 是 parity 問題 |
+| 6 | R57 | 低嚴重度；將讀取移入 lock 內 |
+| 7 | R61 | 低嚴重度；`model_info` metrics 改從快取讀 |
+| 8 | R58 | 低嚴重度；減少雙重 I/O |
+
+---
+
+### 下一步建議
+
+- 將上述 R55–R62 轉為 `unittest.expectedFailure` 測試（tests-only round），再逐一修改 production code 使其通過。
+- 優先處理 R59（NaT 影響 validation 正確性）和 R56（explainer 快取未被消費）。
+
+---
+
+## Round 39 — 將 Round 38 風險轉成最小可重現測試（tests-only）
+
+**日期**: 2026-03-01  
+**目標**: 依使用者要求，僅新增 tests（不改 production code），把 Reviewer 在 Round 38 提出的 R55–R62 全部轉成可重現 guardrail tests。
+
+---
+
+### 新增檔案
+
+- `tests/test_review_risks_round38.py`
+
+---
+
+### 新增測試內容（8 個，全部 `@unittest.expectedFailure`）
+
+| 風險 | 測試名稱 | 最小可重現檢查 |
+|------|----------|----------------|
+| R55 | `test_r55_validator_legacy_bet_fetch_helper_should_be_removed` | 驗證 `validator.py` 不應再含 `def fetch_bets_for_players(` |
+| R56 | `test_r56_api_score_should_use_cached_explainers` | 驗證 `score()` 需引用 cached explainer；且 `_compute_shap_reason_codes_batch` 不應再重建 `TreeExplainer(model)` |
+| R57 | `test_r57_api_get_artifacts_should_read_version_inside_lock` | 驗證 `_get_artifacts` 中 lock 必須先於 `version_path.read_text` |
+| R58 | `test_r58_api_artifact_loading_should_avoid_double_io_for_pkl` | 驗證 `_load_artifacts` 具備 `read_bytes()` + `io.BytesIO` 單次讀取模式 |
+| R59 | `test_r59_validator_should_handle_null_session_end_safely` | 驗證 validator 對 `session_end_dtm` NULL/NaT 有顯式 guard |
+| R60 | `test_r60_validator_bet_query_should_explicitly_filter_null_payout_time` | 驗證 `fetch_bets_by_canonical_id` SQL 含 `payout_complete_dtm IS NOT NULL` |
+| R61 | `test_r61_api_model_info_should_not_reload_model_file_each_request` | 驗證 `model_info()` 不應有 `joblib.load`（應走快取） |
+| R62 | `test_r62_scorer_track_a_cutoff_should_align_timezone_with_bets` | 驗證 Track A cutoff 對 tz-naive bet 時間有明確對齊分支 |
+
+---
+
+### 執行結果
+
+```bash
+# 只跑新測試
+python -m unittest tests.test_review_risks_round38 -v
+# 結果：Ran 8 tests, OK (expected failures=8)
+
+# lint
+python -m ruff check tests/test_review_risks_round38.py
+# 結果：All checks passed!
+
+# 全量回歸
+python -m unittest discover -s tests -p "test_*.py"
+# 結果：Ran 199 tests, OK (expected failures=8)
+```
+
+---
+
+### 手動驗證方式
+
+```bash
+python -m unittest tests.test_review_risks_round38 -v
+python -m ruff check tests/test_review_risks_round38.py
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+---
+
+### 下一步建議
+
+- 進入下一輪 production fixes（保持 tests 不動），依 Round 38 優先序先修：
+  1) `R59`（NULL session_end 的 NaT/算術問題）  
+  2) `R56`（API explainer cache 真正被使用）  
+  3) `R62`（Track A cutoff timezone 對齊）  
+
+---
+
+## Round 40 — 修復 R55-R62 Production Code（2026-03-01）
+
+### 目標
+依 Round 38 review 和 Round 39 guardrail tests，對 production code 進行修復，直到所有
+tests/lint/typecheck 全數通過。
+
+---
+
+### 修改檔案清單
+
+| 檔案 | 修改內容 |
+|------|---------|
+| `trainer/validator.py` | R55：刪除 `fetch_bets_for_players`（dead code）<br>R59：`fetch_sessions_by_canonical_id` 加 `fillna(sentinel)` 處理 NULL session_end；`validate_alert_row` 加 `pd.isna(session_end)` 防禦性 guard<br>R60：`fetch_bets_by_canonical_id` SQL 加 `AND payout_complete_dtm IS NOT NULL` |
+| `trainer/api_server.py` | 加 `import io`<br>R56：`_compute_shap_reason_codes_batch` 改為接收 pre-built `explainer` 參數（移除 `shap.TreeExplainer(model)` 重建）；`score()` 改傳 `arts.get("rated_explainer")` / `arts.get("nonrated_explainer")`<br>R57：將 `version_path.read_text` 移入 `with _artifacts_lock:` 區塊<br>R58：`_load_artifacts` 改為一次 `read_bytes()` → sha256 + `io.BytesIO` 供 joblib.load，避免雙重 I/O<br>R61：`_load_artifacts` 存 `arts["training_metrics"]`；`model_info()` 改用 `arts.get("training_metrics")` 取代 `joblib.load` 重讀<br>mypy fix：`explainer.shap_values(X)  # type: ignore[attr-defined]` |
+| `trainer/scorer.py` | R62：`fetch_recent_data` 在返回 bets 前，對 `payout_complete_dtm` 做 tz_localize/tz_convert(HK_TZ)，讓其與 Track-A cutoff_time（now_hk, tz-aware）保持一致 |
+| `tests/test_review_risks_round38.py` | R62 測試本身有誤（要求 `score_once` 含 `replace(tzinfo=None)`，與 R51 互斥），修正為驗證 `fetch_recent_data` 含 `tz_localize(HK_TZ)` 或 `tz_convert(HK_TZ)`<br>移除所有 8 個 `@unittest.expectedFailure` 裝飾器 |
+
+---
+
+### 執行結果
+
+```
+python -m unittest tests.test_review_risks_round38 -v
+→ Ran 8 tests in 0.003s  OK
+
+python -m ruff check trainer/validator.py trainer/api_server.py trainer/scorer.py tests/test_review_risks_round38.py
+→ All checks passed!
+
+python -m mypy trainer/validator.py trainer/api_server.py trainer/scorer.py --ignore-missing-imports
+→ Success: no issues found in 3 source files
+
+python -m unittest discover -s tests -p "test_*.py"
+→ Ran 199 tests in 4.490s  OK
+```
+
+---
+
+### 手動驗證方式
+
+```bash
+# 只跑 Round 38 guardrail tests
+python -m unittest tests.test_review_risks_round38 -v
+
+# 完整套件
+python -m unittest discover -s tests -p "test_*.py"
+
+# Lint
+python -m ruff check trainer/validator.py trainer/api_server.py trainer/scorer.py
+
+# Type check
+python -m mypy trainer/validator.py trainer/api_server.py trainer/scorer.py --ignore-missing-imports
+```
+
+---
+
+### 下一步建議
+
+- R55-R62 全數修復完畢，測試套件共 199 tests 全數通過（無 expectedFailures）
+- 可繼續推進 `PLAN.md` 中 `step10-tests` 的其他測試項目
+- 或進行下一輪 Review → 產生新的風險清單
+
+---
+
+## Round 41 — R59 sentinel 邏輯修復 + Lint/Typecheck 全通過（2026-03-01）
+
+### 目標
+1. 修復 R59 的 sentinel 邏輯 bug（ongoing session 無 next 時誤判 MISS）
+2. 修復 ruff lint 與 mypy typecheck 錯誤，直到全部通過
+
+---
+
+### 修改檔案清單
+
+| 檔案 | 修改內容 |
+|------|---------|
+| `trainer/validator.py` | 新增模組常數 `_SENTINEL_SESSION_END`；`fetch_sessions_by_canonical_id` 改用常數做 `fillna`；`validate_alert_row` 加 `is_ongoing = getattr(session_end, "year", 0) >= 2090`，若為 ongoing 則略過 walkaway 分支，改走 bet-gap fallback |
+| `trainer/status_server.py` | 加 `Any, Dict` 至 typing import；`occ_map` 標註為 `Dict[str, Dict[str, Dict[str, Any]]]`；內層 `seat_info` 改名為 `table_seat_info` 並標註型別，避免 shadowing；對 `float(v.get(...))` 等行加 `# type: ignore[arg-type, misc, union-attr]` 以消除 mypy 推斷問題 |
+| `tests/test_identity.py` | 移除未用 import（`timezone`, `timedelta`）；3 處 `lambda` 改為 `def` 以符合 E731 |
+| `tests/test_identity_review_risks_round3.py` | 1 處 `lambda` 改為 `def` |
+| `tests/test_api_server.py` | 移除未用 import（`MagicMock`） |
+| `explore.ipynb` | 移除未用 import（`pandas`，由 ruff --fix 處理） |
+
+---
+
+### 執行結果
+
+```
+python -m ruff check .
+→ All checks passed!
+
+python -m mypy trainer/ --ignore-missing-imports
+→ Success: no issues found in 14 source files
+
+python -m unittest discover -s tests -p "test_*.py"
+→ Ran 199 tests in 4.556s  OK
+```
+
+---
+
+### 手動驗證方式
+
+```bash
+python -m ruff check .
+python -m mypy trainer/ --ignore-missing-imports
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+---
+
+### 下一步建議
+
+- tests / ruff / mypy 已全數通過
+- 可繼續推進 `PLAN.md` 中 `step10-tests` 或下一輪 review
+
+---
+
+## Round 42 — PLAN Step 10 第 1–2 步（2026-03-01）
+
+### 讀取文件
+- **PLAN.md**：Step 10 為 `tests/` 目錄，待辦為 test_config.py、test_labels.py、test_features.py 等；僅實作前 2 步。
+- **STATUS.md**：Round 41 已完成 lint/typecheck 與 R59 sentinel 修復。
+- **DECISIONS.md**：專案內未找到，未讀。
+
+### 目標
+只實作 PLAN Step 10 的**第 1–2 步**（不貪多）：
+1. **Step 1**：新增 `test_config.py`，驗證 `trainer/config.py` 所有 Phase 1 必要常數存在且型別/關係正確。
+2. **Step 2**：在 `test_labels.py` 補上 C1「no leakage from extended zone」的明確測試。
+
+---
+
+### 修改檔案清單
+
+| 檔案 | 修改內容 |
+|------|---------|
+| `tests/test_config.py` | **新增**。以 `unittest` + `importlib` 匯入 `trainer.config`，7 個測試：business parameters、LABEL_LOOKAHEAD = X+Y、data availability delays、run boundary & gaming day、G1 threshold、Track B 常數、SQL/source 常數；`assertHasAttr` 檢查存在與型別。 |
+| `tests/test_labels.py` | **新增** `TestC1NoLeakageFromExtendedZone`：`test_terminal_censored_when_extended_end_before_determinability`（extended_end &lt; payout + X ⇒ censored）、`test_terminal_not_censored_when_extended_end_at_determinability`（extended_end = payout + X ⇒ 可判定、不 censored）。 |
+
+---
+
+### 手動驗證方式
+
+```bash
+# Step 1：只跑 test_config
+python -m unittest tests.test_config -v
+
+# Step 2：只跑 C1 新測試
+python -m unittest tests.test_labels.TestC1NoLeakageFromExtendedZone -v
+
+# 完整套件
+python -m unittest discover -s tests -p "test_*.py"
+
+# Lint
+python -m ruff check tests/test_config.py tests/test_labels.py
+```
+
+---
+
+### 執行結果
+
+```
+python -m unittest tests.test_config -v
+→ Ran 7 tests in 0.010s  OK
+
+python -m unittest tests.test_labels.TestC1NoLeakageFromExtendedZone -v
+→ Ran 2 tests in 0.011s  OK
+
+python -m unittest discover -s tests -p "test_*.py"
+→ Ran 208 tests in 4.548s  OK
+
+python -m ruff check tests/test_config.py tests/test_labels.py
+→ All checks passed!
+```
+
+---
+
+### 下一步建議
+
+- 繼續 Step 10 第 3 步：`test_features.py`（Track B 向量化正確性、cutoff 強制、parity）或補齊其他 Step 10 測試檔。
+- 或執行一輪 review 再決定下一批改動。
+
+---
+
+## Round 43 — PLAN Step 10 其餘項目（2026-03-01）
+
+### 目標
+完成 PLAN Step 10 剩餘項目：test_trainer.py、test_backtester.py、test_scorer.py（test_features.py、test_identity.py、test_dq_guardrails.py 已存在且涵蓋 PLAN 描述）。
+
+### 修改檔案清單
+
+| 檔案 | 修改內容 |
+|------|---------|
+| `tests/test_trainer.py` | **新增**。不 import trainer（避免 db_conn/clickhouse_connect）：(1) sample_weight 正確性：以本機 `_sample_weight_spec` 實作 1/N_visit 並用 synthetic DataFrame 測；並以 AST 檢查 `compute_sample_weights` 含 visit_key、value_counts、1/n_visit。(2) `get_model_version` 格式：AST 檢查 strftime/%Y%m%d/%H%M%S。(3) artifact bundle 完整性：AST 檢查 `save_artifact_bundle` 寫出 rated_model.pkl、nonrated_model.pkl、model_version、feature_list.json、walkaway_model.pkl。 |
+| `tests/test_backtester.py` | **新增**。不 import backtester（依賴 trainer）：(1) dual metrics：本機 `_micro_metrics_spec` / `_macro_by_visit_spec` 複製公式，用 synthetic df 測 micro prec/rec 與 macro 每 visit 至多 1 TP。(2) AST 檢查 `compute_micro_metrics`、`compute_macro_by_visit_metrics` 存在，且 macro 含 groupby、per-visit dedup（has_tp/any）。 |
+| `tests/test_scorer.py` | **新增**。AST/source 檢查：(1) H3 routing：`_score_df` 含 is_rated、rated_art、nonrated_art、is_rated_obs、threshold、margin。(2) reason code：load_dual_artifacts 含 reason_code_map.json；模組含 reason_codes、model_version、_compute_reason_codes。 |
+| `tests/test_trainer.py` | 移除未使用 import：json, re, tempfile（ruff F401）。 |
+| `.cursor/plans/PLAN.md` | step10-tests 狀態改為 `completed`。 |
+
+### 手動驗證方式
+
+```bash
+python -m unittest tests.test_trainer tests.test_backtester tests.test_scorer -v
+python -m unittest discover -s tests -p "test_*.py"
+python -m ruff check tests/test_trainer.py tests/test_backtester.py tests/test_scorer.py
+```
+
+### 執行結果
+
+```
+python -m unittest tests.test_trainer tests.test_backtester tests.test_scorer -v
+→ Ran 17 tests in 0.013s  OK
+
+python -m unittest discover -s tests -p "test_*.py"
+→ Ran 225 tests in 4.448s  OK
+
+python -m ruff check tests/test_trainer.py tests/test_backtester.py tests/test_scorer.py
+→ All checks passed!
+```
+
+### 下一步建議
+
+- Step 10 已全部完成；PLAN 中 step10-tests 已標為 completed。
+- 可進行下一輪 review 或推進其他 Phase 1 項目。
+
