@@ -359,6 +359,43 @@ def build_canonical_mapping_from_df(
 # Public API — ClickHouse path
 # ---------------------------------------------------------------------------
 
+def get_dummy_player_ids(client, cutoff_dtm: datetime) -> Set:
+    """Return the set of player_ids that are FND-12 dummy/fake accounts (ClickHouse).
+
+    Use this in the trainer to drop dummy rows from training data (TRN-04).
+    """
+    dummy_sql = _build_dummy_sql(cutoff_dtm)
+    dummy_df = client.query_df(dummy_sql)
+    out: Set = set()
+    for x in dummy_df["player_id"].dropna():
+        try:
+            out.add(int(x))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def get_dummy_player_ids_from_df(sessions_df: pd.DataFrame, cutoff_dtm: datetime) -> Set:
+    """Return the set of player_ids that are FND-12 dummy/fake accounts (pandas).
+
+    Use this in the trainer when using --use-local-parquet to drop dummy rows (TRN-04).
+    """
+    deduped = _fnd01_dedup_pandas(sessions_df)
+    session_time = deduped["session_end_dtm"].fillna(deduped["lud_dtm"])
+    session_time = pd.to_datetime(session_time, errors="coerce")
+    cutoff_ts = pd.Timestamp(cutoff_dtm)
+    mask = (
+        (deduped["is_manual"] == 0)
+        & (deduped["is_deleted"] == 0)
+        & (deduped["is_canceled"] == 0)
+        & deduped["player_id"].notna()
+        & (deduped["player_id"] != PLACEHOLDER_PLAYER_ID)
+        & (session_time <= cutoff_ts)
+    )
+    filtered = deduped[mask].copy()
+    return _identify_dummy_player_ids(filtered)
+
+
 def build_canonical_mapping(client, cutoff_dtm: datetime) -> pd.DataFrame:
     """Build player_id → canonical_id mapping using ClickHouse.
 

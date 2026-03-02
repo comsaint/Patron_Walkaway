@@ -139,4 +139,51 @@
 
 ---
 
+## DEC-009：Trainer 閾值與主指標改為 PR-AUC + F1（簡化，可回退）
+
+**日期**：2026-03-02  
+**SSOT 章節**：§10.2（閾值策略）  
+
+**決策**：Trainer 內單模型閾值選擇改為以 **PR-AUC 為主要報告指標**，閾值則以 **F1** 最大化選出；**不再使用 G1 約束**（F-beta、G1_PRECISION_MIN、fallback 邏輯）。
+
+**背景**：  
+- 原為 G1 對齊：在滿足 precision ≥ G1_PRECISION_MIN 下最大化 F-beta (β=0.5)，邏輯與 fallback 較複雜。  
+- 需求為簡化指標，以 PR-ROC / PR-AUC 為主。
+
+**實作要點**：  
+- **主指標**：`val_prauc`（PR-AUC）為首要報告與日誌指標。  
+- **閾值選擇**：在 validation 上掃描閾值，取 **F1** 最大者（無 G1 約束）；若 F1 平手則取 recall 較高者。  
+- **日誌**：`PR-AUC=...  F1=...  prec=...  rec=...  thr=...`  
+- **Backtester**：仍保留 G1 閾值搜尋（Optuna 2D + F-beta + 約束），未在此次變更範圍；若日後希望一致可再改。
+
+**回退說明**：  
+若未來需恢復 G1 策略，可還原 `trainer/trainer.py` 中 `_train_one_model` 的閾值區塊為：  
+- 目標：最大化 F-beta (G1_FBETA)，約束：precision ≥ G1_PRECISION_MIN；  
+- Fallback：無可行解時改取最佳 F-beta 並打 warning。  
+- 並將 `f1_score` 改回 `fbeta_score`，metrics 與 log 恢復 `val_fbeta_{G1_FBETA}` 與對應格式。
+
+---
+
+## DEC-010：Backtester Optuna 閾值搜尋改為 F1（與 Trainer 對齊，保留 G1 約束）
+
+**日期**：2026-03-02  
+**SSOT 章節**：§10.2  
+**關聯**：DEC-009  
+
+**決策**：Backtester 的 Optuna 2D 閾值搜尋 **objective** 從 F-beta (G1_FBETA) 改為 **F1**，與 Trainer 的閾值選擇準則一致。**保留 G1 約束**：per-model precision ≥ G1_PRECISION_MIN、combined alerts/hour ≥ G1_ALERT_VOLUME_MIN_PER_HOUR。
+
+**理由**：  
+- DEC-009 將 Trainer 閾值改為 F1；Backtester 若仍用 F-beta 選閾值，兩端不一致。  
+- 改為 F1 後，Trainer 與 Backtester 的「閾值選擇邏輯」一致。  
+- G1 約束保留，作為業務門檻（避免 precision 過低、警報量不足）。
+
+**實作**：  
+- `run_optuna_threshold_search` 的 objective：`fbeta_score(..., beta=G1_FBETA)` → `f1_score(...)`  
+- 日誌：`F-beta=...` → `F1=...`  
+- `compute_micro_metrics` / `compute_macro_by_visit_metrics` 仍報告 `fbeta_{G1_FBETA}` 供參考，未改動。
+
+**回退**：將 objective 改回 `fbeta_score(y, all_preds, beta=G1_FBETA, zero_division=0)`，log 改回 `F-beta=%.4f`。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

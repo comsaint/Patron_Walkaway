@@ -54,7 +54,7 @@ import lightgbm as lgb
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import average_precision_score, precision_score
+from sklearn.metrics import average_precision_score, f1_score, precision_score
 from zoneinfo import ZoneInfo
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -598,6 +598,7 @@ def run_track_a_dfs(
 def process_chunk(
     chunk: dict,
     canonical_map: pd.DataFrame,
+    dummy_player_ids: Optional[set] = None,
     use_local_parquet: bool = False,
     force_recompute: bool = False,
 ) -> Optional[Path]:
@@ -605,6 +606,7 @@ def process_chunk(
 
     The canonical_map is built once at the global level (cutoff = training end)
     and passed in here.  Phase 2 should use per-chunk PIT mapping.
+    dummy_player_ids: FND-12 dummy/fake-account player_ids to drop from training (TRN-04).
     """
     window_start = chunk["window_start"]
     window_end = chunk["window_end"]
@@ -642,6 +644,16 @@ def process_chunk(
     if bets.empty:
         logger.warning("Chunk %s–%s: empty after DQ", window_start.date(), window_end.date())
         return None
+
+    # --- TRN-04: drop FND-12 dummy/fake-account rows before feature engineering ---
+    if dummy_player_ids and "player_id" in bets.columns:
+        before = len(bets)
+        bets = bets[~bets["player_id"].isin(dummy_player_ids)].copy()
+        if len(bets) < before:
+            logger.info("Chunk %s–%s: dropped %d dummy player_id rows (FND-12)", window_start.date(), window_end.date(), before - len(bets))
+        if bets.empty:
+            logger.warning("Chunk %s–%s: empty after FND-12 filter", window_start.date(), window_end.date())
+            return None
 
     # --- Identity: attach canonical_id ---
     if not canonical_map.empty and "player_id" in canonical_map.columns:
@@ -848,33 +860,33 @@ def _train_one_model(
     val_scores = model.predict_proba(X_val)[:, 1]
     prauc = float(average_precision_score(y_val, val_scores)) if y_val.sum() > 0 else 0.0
 
-    # Simple best-precision threshold search on validation set
+    # Threshold selection: maximise F1 (DEC-009 — primary metric is PR-AUC; F1 used to pick threshold)
     thresholds = np.unique(val_scores)
-    best_t, best_prec, best_rec = 0.5, 0.0, 0.0
+    best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
     for t in thresholds:
         preds = (val_scores >= t)
         if preds.sum() < 5:
             continue
+        f1 = float(f1_score(y_val, preds, zero_division=0))
         prec = float(precision_score(y_val, preds, zero_division=0))
         rec_val = float((preds & (y_val == 1)).sum()) / max(1, int(y_val.sum()))
-        if rec_val < 0.02:
-            continue
-        if prec > best_prec or (prec == best_prec and rec_val > best_rec):
-            best_prec, best_rec, best_t = prec, rec_val, float(t)
+        if f1 > best_f1 or (f1 == best_f1 and rec_val > best_rec):
+            best_f1, best_prec, best_rec, best_t = f1, prec, rec_val, float(t)
 
     metrics = {
         "label": label,
         "val_prauc": prauc,
         "val_precision": best_prec,
         "val_recall": best_rec,
+        "val_f1": best_f1,
         "threshold": best_t,
         "val_samples": int(len(y_val)),
         "val_positives": int(y_val.sum()),
         "best_hyperparams": hyperparams,
     }
     logger.info(
-        "%s: PR-AUC=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
-        label, prauc, best_prec, best_rec, best_t,
+        "%s: PR-AUC=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
+        label, prauc, best_f1, best_prec, best_rec, best_t,
     )
     return model, metrics
 
@@ -1039,32 +1051,38 @@ def run_pipeline(args) -> None:
 
     # 3. Build canonical mapping with TRAINING window cutoff (B1 — prevents
     #    identity links that arose after training from leaking into training data).
+    #    Also get FND-12 dummy player_ids so we drop them from training (TRN-04).
     logger.info("Building canonical identity mapping (cutoff=%s)…", train_end)
+    dummy_player_ids: set = set()
     if use_local:
         _, sessions_all = load_local_parquet(start, end + timedelta(days=1))
         _, sessions_all = apply_dq(
             pd.DataFrame(columns=["bet_id"]),  # dummy bets
             sessions_all, start, end + timedelta(days=1),
         )
+        canonical_map = build_canonical_mapping_from_df(sessions_all, cutoff_dtm=train_end)
+        try:
+            from identity import get_dummy_player_ids_from_df  # type: ignore[import]
+            dummy_player_ids = get_dummy_player_ids_from_df(sessions_all, cutoff_dtm=train_end)
+        except Exception as exc:
+            logger.warning("get_dummy_player_ids_from_df failed (%s); not filtering dummies", exc)
     else:
         try:
             client = get_clickhouse_client()
-            from identity import build_canonical_mapping  # type: ignore[import]
+            from identity import build_canonical_mapping, get_dummy_player_ids  # type: ignore[import]
             canonical_map = build_canonical_mapping(client, cutoff_dtm=train_end)
+            dummy_player_ids = get_dummy_player_ids(client, cutoff_dtm=train_end)
         except Exception as exc:
             logger.warning("ClickHouse canonical mapping failed (%s); using empty map", exc)
             canonical_map = pd.DataFrame(columns=["player_id", "canonical_id"])
         sessions_all = None
 
-    if sessions_all is not None:
-        canonical_map = build_canonical_mapping_from_df(sessions_all, cutoff_dtm=train_end)
-
-    logger.info("Canonical mapping: %d rows", len(canonical_map))
+    logger.info("Canonical mapping: %d rows; FND-12 dummy player_ids to exclude: %d", len(canonical_map), len(dummy_player_ids))
 
     # 4. Process chunks → write parquet
     chunk_paths = []
     for chunk in chunks:
-        path = process_chunk(chunk, canonical_map, use_local_parquet=use_local, force_recompute=force)
+        path = process_chunk(chunk, canonical_map, dummy_player_ids=dummy_player_ids, use_local_parquet=use_local, force_recompute=force)
         if path is not None:
             chunk_paths.append(path)
 

@@ -39,7 +39,7 @@ import joblib
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import average_precision_score, fbeta_score, precision_score
+from sklearn.metrics import average_precision_score, f1_score, fbeta_score, precision_score
 from zoneinfo import ZoneInfo
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -292,7 +292,7 @@ def run_optuna_threshold_search(
 ) -> Tuple[float, float]:
     """Optuna TPE search over (rated_threshold, nonrated_threshold).
 
-    Objective: maximise combined F-beta.
+    Objective: maximise combined F1 (DEC-010; aligned with trainer threshold criterion).
     Constraints (returned as -inf if violated):
       * per-model precision ≥ G1_PRECISION_MIN
       * combined alerts/hour ≥ G1_ALERT_VOLUME_MIN_PER_HOUR  (only if window_hours given)
@@ -326,14 +326,14 @@ def run_optuna_threshold_search(
             if n_alerts / window_hours < G1_ALERT_VOLUME_MIN_PER_HOUR:
                 return float("-inf")
 
-        # Combined preds for fbeta
+        # Combined preds for F1 (DEC-010)
         all_preds = np.zeros(len(df), dtype=bool)
         if rated_mask.any():
             all_preds[rated_mask] = preds_rated
         if nonrated_mask.any():
             all_preds[nonrated_mask] = preds_nonrated
 
-        return float(fbeta_score(y, all_preds, beta=G1_FBETA, zero_division=0))
+        return float(f1_score(y, all_preds, zero_division=0))
 
     study = optuna.create_study(
         direction="maximize",
@@ -352,7 +352,7 @@ def run_optuna_threshold_search(
         rated_t = study.best_params["rated_threshold"]
         nonrated_t = study.best_params["nonrated_threshold"]
         logger.info(
-            "Optuna best — rated_thr=%.4f  nonrated_thr=%.4f  F-beta=%.4f",
+            "Optuna best — rated_thr=%.4f  nonrated_thr=%.4f  F1=%.4f",
             rated_t, nonrated_t, study.best_value,
         )
 

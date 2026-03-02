@@ -30,6 +30,31 @@
 
 ---
 
+## 修復狀態（Phase 1 重構後，截至 2026-03-02）
+
+以下對照**目前程式碼**（`trainer/` + `identity/` + `labels/` + `features/`）與總表建議，逐項標註是否已修復。
+
+| ID | 狀態 | 說明 |
+|:---:|:---:|---|
+| **TRN-01** | ✅ 已修復 | Session SQL 已撈 `lud_dtm`（`_SESSION_SELECT_COLS`）；`apply_dq` 以 `lud_dtm DESC` + `__etl_insert_Dtm` 排序後 `drop_duplicates(session_id, keep="first")`，等同取最新版本。 |
+| **TRN-02** | ✅ 已修復 | Session query 已加 `AND is_manual = 0`（L296）；`apply_dq` 亦過濾 `is_manual`（L462）。 |
+| **TRN-03** | ✅ 已修復 | 標籤與歸戶改由 `labels.compute_labels` + `identity.build_canonical_mapping` 處理，以 **canonical_id**（D2 M:N 解析後）為鍵，不再用 `player_id` 算 gap。 |
+| **TRN-04** | ✅ 已修復 | `identity.get_dummy_player_ids` / `get_dummy_player_ids_from_df` 回傳 FND-12 假帳號 set；`trainer.process_chunk` 在 DQ 後、特徵工程前依 `player_id in dummy_player_ids` 過濾掉訓練列。 |
+| **TRN-05** | ✅ 已修復 | `features.compute_table_hc` 僅用 **bets**（`table_id`, `payout_complete_dtm`, `player_id`）與 cutoff，不依賴 `t_session.session_end_dtm`；訓練與推論語義一致。 |
+| **TRN-06** | ✅ 已修復 | `labels.compute_labels` 實作 H1：末端 bet 若 `payout + WALKAWAY_GAP_MIN > extended_end` 則標為 **censored**，不參與訓練/評估，避免窗口末端標籤膨脹。 |
+| **TRN-07** | ✅ 已修復 | Phase 1 已移除 `rolling_cache.csv` / `features_buffer.csv`。Chunk 快取改為 `.data/chunks/chunk_{window_start}_{window_end}.parquet`，檔名即含窗口，不會誤用他次窗口資料。 |
+| **TRN-08** | ✅ 已修復 | 訓練端 Track B 改為共用 `features.compute_loss_streak` / `compute_run_boundary` / `compute_table_hc`；scorer 亦從 `features` 匯入，train–serve 語義一致。舊 rolling 路徑已移除。 |
+| **TRN-09** | ✅ 已修復 | `features.compute_loss_streak` 以 `(df["status"] == "LOSE")` 判斷，無 `isinstance(st, str)`；並有 cutoff 與 G3 排序。若 DB 使用其他值域需在 ETL 層對應。 |
+| **TRN-10** | ✅ 已修復 | `add_legacy_features` merge 時僅帶入 sessions 側 `["session_id", "session_start_dtm", "session_end_dtm"]`，避免 `player_id`/`table_id` 碰撞。 |
+| **TRN-11** | ⚠️ 部分緩解 | 單模型閾值仍由 `_train_one_model` 內「best precision (min_recall≥2%)」選出；**backtester** 則以 Optuna 2D 搜尋並以 **G1_FBETA** 最大化 F-beta。實務上可依 backtester 產出閾值覆寫 artifact 或改 trainer 內改為 F-beta 目標。 |
+| **TRN-12** | ✅ 已修復（N/A） | Phase 1 已移除 `train_and_select_model` / grid；改為 `train_dual_model` + `run_optuna_search`（Optuna TPE 超參搜尋）。 |
+| **TRN-13** | ✅ 已修復 | 模組 docstring 已置於檔案第一行（`"""trainer/trainer.py — Phase 1 Refactor..."""`）。 |
+| **TRN-14** | ✅ 已修復 | 僅剩 `parse_window(args)` → `run_pipeline(args)`；無本機 CSV 路徑改寫 `start`/`end`，時區由 `parse_window` 統一。 |
+
+**結論**：總表 14 項中，13 項已修復、1 項（TRN-11）為部分緩解（backtester 已用 F-beta；trainer 內閾值仍以 precision 為主，可選改為 F-beta 或沿用 backtester 閾值）。
+
+---
+
 ## 附錄：問題驗證程式碼（Evidence）
 
 ### [TRN-01] Session 去重：確認目前邏輯與 SSOT 的差異
