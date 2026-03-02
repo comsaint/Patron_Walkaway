@@ -8,6 +8,7 @@
 > - **資料事實與 DQ 決策**：`doc/FINDINGS.md`（FND-*）
 > - **欄位/表級語義與可用性**：`schema/GDP_GMWDS_Raw_Schema_Dictionary.md`
 > - **既有系統現況與偏差風險**：`doc/TRAINER_ISSUES.md`（TRN-*）、`doc/TRAINER_SUMMARY.md`、`trainer/`
+> - **關鍵架構/策略決策**：`.cursor/plans/DECISION_LOG.md`（DEC-*；含 DEC-011 player-level table）
 
 ---
 
@@ -40,11 +41,11 @@
 | **預測視窗 (Prediction horizon)** | 離場事件發生前的 **$Y$**（預設 = 15 分鐘）時間窗口。警報發得太早（如離場前 60 分鐘）不具可行動性；發得太晚（如已離開後）則無意義。 |
 | **預警 (Alert)** | 在每筆下注時間點 $t$，判斷是否存在一個 gap 起點 $s$，使得 $s \in [t, t+Y]$ 且從 $s$ 起連續 $X$ 分鐘無下注。 |
 | **觀測點 (Observation point)** | 每一筆投注即為一個觀測點。在每筆投注的時間點，我們計算特徵並（在訓練時）賦予標籤。 |
-| **Session** | 單一賭客在單一賭桌上一段連續打牌的時段。紀錄在賭客**離桌後**才完成寫入。 |
+| **Session** | 單一賭客在**單一賭桌**（`table_id`）上一段連續打牌的時段。紀錄在賭客**離桌後**才完成寫入。粒度為「一位玩家在同一張桌的一段連續時段」，因此玩家**換桌（table_id 改變）會進入另一筆 session**。 |
 | **有卡客 (Rated player)** | 已刷會員卡的賭客（具有效的 `casino_player_id`），可連結歷史行為。 |
 | **無卡客 (Non-rated player)** | 未使用會員卡的賭客，僅有 Smart Table 指派的 `player_id`，無歷史檔案。 |
 | **營業日 (Gaming day)** | 賭場使用的帳務日；與日曆午夜不對齊。 |
-| **造訪 (Visit)** | 賭客在一個營業日內於娛樂場的整段停留時間，可能橫跨多張桌台的多個 Session。 |
+| **造訪 (Visit)** | 預留概念，供未來 Visit-level 指標使用。**Bet-derived 定義**：對同一玩家（`canonical_id`）的下注序列，將「相鄰兩筆 bet 的時間差 \(\\le X\\) 分鐘」視為同一段連續行為；一旦出現時間差 \(> X\\)（`WALKAWAY_GAP_MIN`），即切分為下一個 Visit。<br>**注意**：Visit **不受 `table_id` 限制**，因此可橫跨多張桌台；這與 `t_session`（單桌台）不同。<br>**Phase 1**：評估與閾值選擇採用 bet-level，不使用 Visit-level 聚合。 |
 
 ---
 
@@ -77,13 +78,15 @@
 |---|---|---|---|---|
 | `t_bet` | 每筆投注一列 | 4.38 億 | **主表**：當前投注行為、標籤計算及所有投注層級特徵。 | 派彩後約 1 分鐘內可用。 |
 | `t_session` | 每 Session 一列 | 7,400 萬 | **輔助表**：歷史賭客輪廓及 `player_id` ↔ `casino_player_id` 橋接關係。 | **Session 結束後**延遲約 7 分鐘可用。不可用於即時當前 Session 計算。 |
-| `t_game` | 每一局一列 | 2.11 億 | **未來用途**：牌局層級上下文。 | 派彩後約 1 分鐘內可用。 |
+| `player_profile_daily`（衍生/快取表） | 每玩家×每日快照一列（rated only） | N/A | **Rated 模型的歷史輪廓**：跨日/跨桌 patron profile（由 `t_session` 為主預彙總；PIT 安全；DEC-011）。 | **離線批次**產生；訓練/推論以 as-of 快照讀取（不得用未來快照）。 |
+| `t_game` | 每一局一列 | 2.11 億 | **Phase 1 不使用**（保留為未來可能的上下文來源）。 | 派彩後約 1 分鐘內可用。 |
 | `t_shoe` | 每副牌靴一列 | N/A | **不相關**：與離場預測無關。 | N/A |
 
 ### 4.2 事件時間與資料可用性策略 (FND-13)
 系統時間戳（`__etl_insert_Dtm`、`__ts_ms`）**受回填作業污染**，絕對不可用於串流模擬。任何特徵工程或標籤建構都必須透過「僅允許在該觀測點的 `event_time + delay` 時間之前已可見的資料」來模擬即時場景。
-- **`t_bet` / `t_game`**：`event_time = payout_complete_dtm`，延遲 **+1 分鐘**。
+- **`t_bet`**：`event_time = payout_complete_dtm`，延遲 **+1 分鐘**。
 - **`t_session`**：`event_time = COALESCE(session_end_dtm, lud_dtm)`，延遲 **+7 分鐘**（保守值：+15 分鐘）。
+- **`player_profile_daily`**：離線批次快照，不具即時語義；訓練/推論必須以 **as-of**（PIT）方式取用（只能 join 到觀測點之前的最新快照）。
 
 ### 4.3 時間窗口化抽取與資料量處理 (Time-windowed extraction & data volume)
 
@@ -94,6 +97,12 @@
 - 每個時間窗口的查詢應盡量對齊資料表 partition（例如 `t_bet` / `t_session` 依 `gaming_day` partition），以利 predicate pushdown（如 `payout_complete_dtm` 或 `gaming_day` 範圍條件），降低掃描量與記憶體峰值。
 - 標籤與特徵的計算須在**各窗口內**依 §7、§8 的語義執行（含 C1 延伸拉取：該窗口若鄰接下一窗口，延伸區間可落入下一窗口的已拉取資料，由實作計畫定義邊界與重疊規則）。
 - **離線訓練資料源（允許本機 Parquet 匯出）**：為加速迭代，允許在訓練/開發環境以「已從 ClickHouse 匯出的完整表 Parquet」（例如放在本機 `.data/` 目錄、或以 DuckDB 掃描）取代即時查詢 ClickHouse；但這僅是 I/O 替代，**不得**改變任何語義與護欄：仍需用同一套時間窗口邊界（§4.3 的集中式定義器）、仍需套用 §5 的 DQ 規則（含 FND-01 去重等）、仍需遵守 §4.2 的 available time / cutoff_time 防漏要求。Production（線上推論/驗證）資料來源一律以 ClickHouse 為準，本機 Parquet 僅用於離線重放與訓練加速。
+
+**Player-level table（DEC-011）建置與 PIT 使用（新增）**  
+- `player_profile_daily` 為 **rated-only** 的快取衍生表，用於提供長期歷史輪廓（patron profile），以解決 `doc/FINDINGS.md` 所揭示的 rated 歷史深度問題。  
+- 建置前必須先套用 §5 的 DQ（至少 FND-01/02/03/04/09/12），否則 dummy/人工調整/重複版本會污染 profile。  
+- 訓練/回測/推論時必須以 **as-of snapshot** 使用：對任一觀測點（bet time）\(t\)，只能 join 到 `snapshot_dtm <= t` 的最新快照；不可取用晚於 \(t\) 的快照以免洩漏。  
+- **Non-rated 模型不使用** player-level table（見 `doc/FINDINGS.md` unrated history span sanity check）。  
 
 **資料量處理策略 (Data volume strategy)**  
 - **統一的時間折疊與窗口定義器 (Time Fold Splitter / Window Definer)**：**必須**建立一個集中式的模組，負責計算與發放所有時間窗口的邊界（月度 chunk 的 start/end、C1 延伸拉取緩衝、Train/Valid/Test 的 cutoff 點）。所有 ETL、特徵計算與模型交叉驗證都必須嚴格呼叫這個定義器，避免各階段時間切分出現 off-by-one 錯誤或不一致。
@@ -116,7 +125,7 @@
 4. **Session 狀態處理 (FND-04)**：**不要**過濾 `status = 'SUCCESS'`。保留所有非人工且 `turnover > 0` 或 `num_games_with_wager > 0` 的 Session。
 5. **is_known_player 不可靠 (FND-09)**：絕對不要使用此旗標。一律檢查 `casino_player_id IS NOT NULL`。
 6. **bet_reconciled_at 不可用 (FND-06)**：100% 無效值。視為不存在。
-7. **Game 表去重 (FND-14)**：使用 `MAX(__ts_ms)` 或 `MAX(__etl_insert_Dtm)` 去重。
+7. **（若未來使用 `t_game`）Game 表去重 (FND-14)**：使用 `MAX(__ts_ms)` 或 `MAX(__etl_insert_Dtm)` 去重。
 8. **全空欄位 (FND-08)**：`bonus`, `tip_amount`, `increment_wager`, `payout_value` 100% 為 NULL，勿使用。
 9. **軟刪除旗標 (DQ Rule)**：schema 存在 `is_deleted` 與 `is_canceled`，應驗證其語義並預設過濾（如 `is_deleted = 0 AND is_canceled = 0`）。
 
@@ -193,12 +202,15 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 #### 軌道 A：自動化特徵探索與生產（Featuretools）
 
 **1. EntitySet 建構**
-- `t_bet`（target entity）：以 `bet_id` 為 index，`payout_complete_dtm` 為 time_index。
-- `t_session`（歷史輪廓）：以 `session_id` 為 index，`COALESCE(session_end_dtm, lud_dtm)` 為 time_index。
-- `player`（跨日/跨桌輪廓）：以歸戶後的 `canonical_id` 為 index。此實體提供跨 session 聚合的軸心（見 §6.2）。
-- **關係**：
-  - **`t_bet.session_id` → `t_session.session_id`**（many-to-one）。`table_id` 僅為共有欄位，不作為 EntitySet 的父子關係鍵。
-  - **`t_session.canonical_id` → `player.canonical_id`**（many-to-one）。
+- **Rated（有卡客）模型 EntitySet**：
+  - `t_bet`（target entity）：以 `bet_id` 為 index，`payout_complete_dtm` 為 time_index。
+  - `t_session`（session-level）：以 `session_id` 為 index，`COALESCE(session_end_dtm, lud_dtm)` 為 time_index（僅納入 `available_time <= cutoff_time` 的已可得 sessions）。
+  - `player_profile_daily`（player-level 快照）：作為 rated 的長期歷史輪廓來源（DEC-011；必須 PIT-safe）。實作上可先對每筆 bet 做 **as-of join**（取 `snapshot_dtm <= bet_time` 的最新快照）把 profile 欄位貼到觀測點，再交給軌道 A/B 計算其餘特徵。
+  - **關係**：
+    - **`t_bet.session_id` → `t_session.session_id`**（many-to-one）。`table_id` 僅為共有欄位，不作為 EntitySet 的父子關係鍵。
+    - **`t_session.canonical_id` → `player_profile_daily.canonical_id`**（many-to-one；以 as-of snapshot join）。
+- **Non-rated（無卡客）模型 EntitySet**：
+  - 僅包含 `t_bet`（不包含 `t_session`、`player_profile_daily` 或任何 game/table-level 實體）。
 
 **2. Primitives 運用**
 - **轉換基元**：`time_since`、`cum_sum`、`cum_mean`、週期性特徵（如 `time_of_day_sin/cos` 註冊為自訂基元）等。
@@ -232,7 +244,8 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 |---|---|---|
 | `loss_streak` | 需要「遇 WIN 重置、遇 PUSH 條件不重置」的序列狀態機，無對應內建 Primitive | 向量化 Pandas/Polars，嚴格遵守同一 cutoff_time |
 | `run_boundary` / `minutes_since_run_start` | 需要「相鄰 bet 間距 ≥ X → 新 run 開始」的序列依賴切割 | 同上 |
-| `table_hc`（同桌人數，S1） | 需跨玩家、以 `table_id` 為軸心的滾動聚合；若在 EntitySet 中建 table 實體，每個 cutoff 觸發全桌掃描，效能極差 | 同上 |
+
+> **桌台/牌局層級特徵（Phase 1 不採用）**：任何 table/game 層級特徵均延後至後期（必要時另立 SSOT/DEC 定義），本期不納入軌道 B。
 
 **手寫特徵的防漏與 parity 要求**：
 - 必須與軌道 A 共用同一個 `cutoff_time` / 時間窗口框架。
@@ -247,15 +260,14 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 2. **第二階段（可選）**：在訓練集上以輕量模型（如 LightGBM）計算 feature importance 或 SHAP，取 top-K 作為最終特徵集。此步驟須僅使用訓練時間區間內的資料，不得使用 valid/test，以符合 §8.1 防洩漏。
 3. 最終通過篩選的特徵清單（含軌道 A 篩選後 + 軌道 B 全部）即為 `feature_list.json` 的內容，訓練與推論端僅計算此清單內特徵，以維持 train-serve parity。
 
-### 8.3 Session 與桌台特徵可用性 (S1)
+### 8.3 Session 特徵可用性 (S1)
 
-為避免依賴 `session_end_dtm` 導致未來資料洩漏（TRN-05），**採用【S1】保守路線**：
+為避免依賴 `session_end_dtm` 導致未來資料洩漏，**採用【S1】保守路線**：
 - **禁止使用**：線上完全不使用任何與 `session_end` 相關的特徵。
-- **即時替代方案**：`table_hc`（同桌人數）改以 `t_bet` 即時計算（如「過去 N 分鐘內，同 `table_id` 下注的不重複 `player_id` 數」），確保訓練與服務端一致。
 
-**關於 `t_game`（分期實作）**：
-- **Phase 1（本期）**：不使用 `t_game` 牌局特徵，專注於 `t_bet` 與 `t_session`。
-- **Phase 2（後期）**：再整合 `t_game` 以打造「桌台氣氛」特徵（如同局玩家數、同局總下注）。
+**關於 `t_game` 與桌台/牌局層級特徵（分期實作）**：
+- **Phase 1（本期）**：不使用 `t_game`，且**不納入任何 game-level 或 table-level 特徵**。  
+- **後期（可能）**：如需引入桌台/牌局上下文，將另立 SSOT/DEC 記錄其特徵語義、可用性與防洩漏護欄（本文件不預先定義）。  
 
 ### 8.4 特徵工程路線比較與分期策略
 
@@ -295,15 +307,15 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 ## 9. 建模方法 (Modeling Approach)
 
 ### 9.1 雙模型架構
-- **有卡客模型**：軌道 A（Featuretools DFS）開放完整 EntitySet 存取權限（`t_bet` + `t_session`），含歷史賭客輪廓與跨日聚合；軌道 B 手寫特徵亦全部可用。
-- **無卡客模型**：軌道 A 限制 EntitySet 僅探索 `t_bet` 內部路徑（當前與近期投注行為及轉換特徵），不使用 `t_session` 的歷史輪廓或 Session 級聚合；軌道 B 中 `loss_streak`、`run_boundary` 可用，但 `t_session` 相關手寫特徵不可用。
+- **有卡客模型（Rated）**：允許使用 **bet/session/player 三層資料**：`t_bet`（即時投注行為）、`t_session`（已完成且可得的 session 訊號）、以及 `player_profile_daily`（DEC-011：PIT-safe 歷史輪廓快照）。軌道 B 的 bet 序列狀態特徵亦可用。
+- **無卡客模型（Non-rated）**：**僅使用 bet-level**（`t_bet`）資料。軌道 A 僅探索 `t_bet` 內部路徑；軌道 B 中 `loss_streak`、`run_boundary` 可用。**不使用**任何 `t_session`、`player_profile_daily` 或 game/table-level 特徵。
 - 分開模型可避免歷史特徵被大量 NaN 掩蓋，並允許對不同群體分別校準閾值（閾值搜索由 Optuna 統一管理，見 §10.2）。
 
 ### 9.2 演算法、調參與切割
 
 **Phase 1 演算法（本期）**：
 - **模型**：LightGBM（支援 `class_weight='balanced'` 處理類別不平衡）。
-- **超參調優**：使用 **Optuna（TPE Sampler）** 進行超參搜索（`n_estimators`, `learning_rate`, `max_depth`, `num_leaves`, `min_child_samples`, `subsample`, `colsample_bytree`, `reg_alpha`, `reg_lambda` 等），objective 以 validation set 上的 F-beta 或 PR-AUC 為目標。Optuna 同時用於 §10.2 的雙模型閾值搜索。
+- **超參調優**：使用 **Optuna（TPE Sampler）** 進行超參搜索（`n_estimators`, `learning_rate`, `max_depth`, `num_leaves`, `min_child_samples`, `subsample`, `colsample_bytree`, `reg_alpha`, `reg_lambda` 等），objective 以 validation set 上的 **PR-AUC** 為目標。Optuna 同時用於 §10.2 的雙模型閾值搜索。
 - **不使用 AutoML（Phase 1）**：為維持「可解釋性」與「最快出結果」，Phase 1 鎖定 LightGBM + Optuna，不引入 AutoML 框架。
 
 **Phase 2+ 演算法（未來）**：
@@ -327,9 +339,9 @@ $$w_i = \frac{1}{N_{\text{visit}}(canonical\_id_i,\ gaming\_day_i)}$$
 - **防洩漏**：`sample_weight` 計算時**僅使用 training window 內的觀測點數**，不可混入 valid/test 資料。
 - **取樣一致性**：若 §4.3 的下採樣已執行，$N_{\text{visit}}$ 以取樣**後**的實際觀測點數為準（確保取樣與加權語義一致）。
 
-**評估報告雙口徑（必須同時報告）**：
-- **Micro（以觀測點為單位）**：直接計算整體 precision/recall/PR-AUC，反映全量 bet 的模型品質。
-- **Macro-by-visit**：對每個 visit 先計算各自指標，再取平均，用以驗證模型對不同停留時長的玩家是否公平泛化。若 Micro 與 Macro 差距顯著，說明 Length Bias 仍未充分校正，應重新審視加權策略。
+**Phase 1 評估報告**：以 **Bet-level**（Micro，以觀測點為單位）為主：直接計算整體 precision/recall/PR-AUC/F-beta，反映全量 bet 的模型品質。
+
+> **Future TODO**：Macro-by-visit、Visit-level 聚合指標等，待業務校準後引入。見 §10.1、DEC-012。
 
 ### 9.4 Model API Contract（與 `scorer.py` 的介面）
 
@@ -357,32 +369,33 @@ $$w_i = \frac{1}{N_{\text{visit}}(canonical\_id_i,\ gaming\_day_i)}$$
 
 ## 10. 評估與閾值選擇 (Evaluation & Validation)
 
-### 10.1 指標
-- **精準度 (Precision)**：核心 KPI。
-- **Alert Volume / Coverage**：必要約束，每天需要有足夠的警報量。
-- 輔助：PR-AUC, F-beta。
+### 10.1 指標：Bet-level（Phase 1 現行）
+
+本專案 Phase 1 **統一採用 Bet-level 指標**，與訓練時的觀測粒度一致：每筆投注為一觀測點，每筆警報為一評估單位。
+
+1. **模型優化指標（Training Objective）**
+   - **PR-AUC（主）與 Log-loss**：用於 LightGBM 訓練與超參調優，客觀衡量模型將正例（即將離場的投注）排在前面的能力。
+
+2. **營運決策指標（Phase 1：Bet-level Precision / Recall / F-beta）**
+   - **Precision**：在所有超過閾值而觸發警報的投注中，有多少筆的標籤為正例（真正發生 walkaway）？
+   - **Recall**：在所有標籤為正例的投注中，我們成功在多少筆觸發了警報？
+   - **F-beta（或 alerts/hour）**：依業務需求輔助閾值選擇（例如 beta < 1 權重重在 precision）。
+
+> **Future TODO（待業務校準後決定）**：未來若需反映公關真實體驗（如「成功挽留多少獨立玩家」、同一 visit 內多次假警報的懲罰），可考慮引入 **Visit-level 聚合指標**（V-Precision, V-Recall, V-Volume）、**Per-player 通知冷卻期（Cooldown）** 等；具體定義與閾值策略需與業務端協商後補入本文件。見 DEC-012 與 §14。
 
 ### 10.2 閾值選擇策略 (Thresholding)
 
-現況閾值過度偏向精準度導致幾乎無警報（TRN-11）。為對齊「業務可用性」，需加入約束條件。
-
 **核心執行機制**：
 - **僅限 Validation Set**：閾值只能在 valid set 決定，test set 僅供最終報告。
-- **Optuna 2D 搜索**：使用 Optuna TPE Sampler 搜索 `(rated_threshold, nonrated_threshold)`，取代窮舉 grid search（見 §9.2）。
-- 必須報告 Precision / Recall / PR-AUC / 總警報量，並依 §10.3 回測評估口徑（每 visit 至多計 1 次 TP）以確認營運可接受度。
+- **Optuna 2D 搜索**：使用 Optuna TPE Sampler 在閾值空間中搜索 `(rated_threshold, nonrated_threshold)`，找出滿足約束的最佳組合。
 
-**Phase 1 首選策略：【G1】Precision 下限 + 最小警報量**
-為建立 Host 信任並確保可行動量，優先採用此 Gate：
-- **約束 1**：各模型 Precision 均需 ≥ \(P_{\min}\)（例：0.70–0.85）
-- **約束 2**：雙模型總警報量 ≥ \(V_{\min}\)（例：全場每小時 5–20 個）
-- **目標**：在滿足約束下，最大化 Recall 或 F\(_\beta\)（\(\beta<1\)）。
+**Phase 1 預設**：依既有 backtester/trainer 實作，以 **bet-level precision ≥ G1_PRECISION_MIN** 為約束，在此前提下**最大化 F1**（或 F-beta）。具體權衡底線（precision 門檻、最低警報量）尚待業務端確認。
 
-*(備援策略：若業務端優先要求覆蓋率，則改採【G2】設定 Recall 下限 ≥ 5-10% 以最大化 Precision；或採【G3】滿足 Precision 下限後單純最大化觸達量。)*
+> **Future TODO**：Visit-level 約束型策略（如 V-Precision ≥ 80%  maximize V-Recall）、Cooldown 設計等，需業務輸入後另訂。
 
 ### 10.3 線上 ground truth 與回測
-- 線上驗證：以 `trainer/validator.py` 的 45 分鐘 horizon 驗證語義為準（覆蓋 Y+X 並允許延遲）。
-- **回測評估口徑**：回測指標計算時，對同一 visit（`canonical_id` × `gaming_day`）至多計入 1 次 True Positive，以避免高頻玩家因大量觀測點而膨脹精準度指標。回測須嚴格按時間順序處理，不得 look-ahead。
-  > **重要區分**：此「每 visit 至多計 1 次 TP」的去重僅是**離線評估口徑**（為正確計算 precision / alert volume），**不**意味著線上推論只對每位玩家每次造訪輸出一個 alert。線上是否節流、多久對同一賭客通知一次 Host，屬於產品／前端設計決策，不在本模型規格範圍內。
+- **線上驗證**：以 `trainer/validator.py` 的 45 分鐘 horizon 驗證語義為準（覆蓋 Y+X 並允許延遲）。
+- **回測評估**：嚴格按時間順序處理，不得 look-ahead。報表以 **Bet-level** 指標（Precision, Recall, PR-AUC, F-beta, alerts/hour）為主。
 
 ---
 
@@ -403,7 +416,7 @@ $$w_i = \frac{1}{N_{\text{visit}}(canonical\_id_i,\ gaming\_day_i)}$$
 - **TRN-01**：Session 去重未使用 `lud_dtm`（違反 FND-01）。
 - **TRN-02**：未排除 `is_manual = 1`（違反 FND-02）。
 - **TRN-03**：`player_id` 歸戶造成換卡玩家斷鏈（對齊 FND-11 與 D1/D2）。
-- **TRN-05**：不可得的 `session_end` 導致 `table_hc` leakage（對齊 S1/S2）。
+- **TRN-05**：不可得的 `session_end` 導致資料洩漏（對齊 S1）。
 - **TRN-06**：窗口末端標籤膨脹（右截尾未處理，對齊 C1/C2）。
 - **TRN-07**：快取無窗口一致性檢查，靜默使用舊資料。
 - **TRN-08**：Rolling window 邊界語義不一致。
@@ -416,7 +429,7 @@ $$w_i = \frac{1}{N_{\text{visit}}(canonical\_id_i,\ gaming\_day_i)}$$
 
 **核心原則（必須遵守）**：
 - 解釋只能是**行為描述**，必須能由輸入特徵與模型決策支持。
-- 禁止輸出「意圖揣測」型理由（例如「去吃午餐/去洗手間」），因為目前資料（`t_bet`/`t_session`/`t_game`）無法可靠觀測此類意圖，會傷害信任。
+- 禁止輸出「意圖揣測」型理由（例如「去吃午餐/去洗手間」），因為目前資料（`t_bet`/`t_session`）無法可靠觀測此類意圖，會傷害信任。
 
 **輸出形態（建議最小集合）**：
 - **Confidence**：`score`、`threshold`、以及 margin（`score - threshold`）。
@@ -446,8 +459,7 @@ $$w_i = \frac{1}{N_{\text{visit}}(canonical\_id_i,\ gaming\_day_i)}$$
 ## 13. 開放問題與決策點 (Open Questions)
 
 目前尚未定案、需要與業務端協商並在 planning 中落地的問題：
-1. **目標函數協商（未決）**：具體的 Precision/Recall 權衡底線為何？每班公關可處理多少警報（目標警報量範圍）？
-2. **Phase 1 Gate 選擇（未決）**：在 §10.2 的策略選項中，選定哪一個 gate 作為 Phase 1 的上線標準（建議預設採 **G1**，除非業務端明確要求其他 gate）。
+1. **目標函數協商（進行中）**：具體的 Precision/Recall 權衡底線為何？每班公關可處理多少警報（目標警報量範圍）？Phase 1 採 bet-level 指標；未來若引入 Visit-level 或 Cooldown，需業務輸入後定義（見 DEC-012）。
 
 ---
 
@@ -455,10 +467,10 @@ $$w_i = \frac{1}{N_{\text{visit}}(canonical\_id_i,\ gaming\_day_i)}$$
 
 1. **AutoML 集成探索（Phase 2）**：引入 **FLAML** 或其他 AutoML 框架，在 Phase 1 的 LightGBM 基礎上探索 stacking/blending 集成，並支援時間序列感知的 CV 與自訂指標。僅在 Phase 1 模型穩定上線且具備基準指標後啟動。
 2. **序列嵌入整合（Phase 2–3）**：依 §8.4 分期策略，在基礎模型驗證後進行離線 SSL 預訓練，產出 Player/Run Embedding 並評估增益。
-3. **Game 表整合**：納入牌局層級（開牌結果、桌台走勢、同局玩家數等氣氛特徵）上下文。
+3. **Game 表整合（可能）**：如需引入牌局層級上下文，將另立 SSOT/DEC 記錄其特徵語義、可用性與防洩漏護欄（本文件不預先定義）。
 4. **跨桌造訪建模**：建模玩家在桌台間移動的旅程。
 5. **模型重訓機制**：監控 concept drift 並確立重訓頻率。
-6. **警報疲勞管理（產品／前端 scope）**：冷卻期設計、公關工作負荷平衡與通知節流策略，屬於產品與前端（`trainer/frontend/`）的決策範疇，不在本模型訓練計畫規格內。模型層僅保證每次推論誠實輸出分數與 reason codes，頻率與呈現方式由產品端定義。
+6. **營運層級評估與 Cooldown（Future TODO）**：待業務校準後，考慮引入 **Visit-level 聚合指標**（V-Precision, V-Recall, V-Volume，bet-derived visit 定義見 §2.2）、**Per-player 警報冷卻期**（避免同一 visit 內多次假警報打擾公關）。具體 metric 定義與閾值策略需與業務端協商。見 DEC-012。
 
 ---
 
@@ -470,5 +482,5 @@ $$w_i = \frac{1}{N_{\text{visit}}(canonical\_id_i,\ gaming\_day_i)}$$
 | `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` | 表格的完整綱要字典。 |
 | `doc/TRAINER_SUMMARY.md` | 現有 trainer 系統架構與模組摘要。 |
 | `doc/TRAINER_ISSUES.md` | 過去 trainer 實作的問題日誌（TRN-*）。 |
-| `doc/DECISION_LOG.md` | 關鍵架構/策略決策的記錄與理由（DEC-*）。 |
+| `.cursor/plans/DECISION_LOG.md` | 關鍵架構/策略決策的記錄與理由（DEC-*）。 |
 | `trainer/` | 現有（第一代）程式碼。 |

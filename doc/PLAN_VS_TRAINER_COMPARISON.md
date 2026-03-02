@@ -105,7 +105,7 @@ This document summarizes how the approach in `ssot/patron_walkaway_phase_1.plan.
 | **Constraints**        | Ad-hoc min recall / min alerts                                             | G1: `Precision ≥ G1_PRECISION_MIN`; total alert volume `≥ G1_ALERT_VOLUME_MIN_PER_HOUR` |
 | **Objective**          | Maximize precision (then recall)                                           | Maximize F-beta (β<1) subject to G1 constraints                                         |
 | **Per-visit TP dedup** | Not applied                                                                | Evaluation only: at most 1 TP per visit; does not affect online alerting                |
-| **Dual metrics**       | Single precision/recall                                                    | **Micro** (bet-level) + **Macro-by-visit**                                              |
+| **評估指標**           | Single precision/recall                                                    | **Bet-level**（Phase 1；Visit-level 延後見 DEC-012）                                      |
 
 
 ---
@@ -265,8 +265,7 @@ The Phase 1 plan represents a comprehensive refactor that:
 | **閾值搜尋** | 窮舉 `np.unique(val_scores)`；`min_recall=0.02`、`min_alerts=5` | **Optuna TPE** 對 `(rated_threshold, nonrated_threshold)` 做 2D 搜尋 |
 | **約束** | 臨時 min_recall / min_alerts | G1：`Precision ≥ G1_PRECISION_MIN`；總警報量 `≥ G1_ALERT_VOLUME_MIN_PER_HOUR` |
 | **目標** | 最大化 precision（其次 recall） | 在 G1 約束下最大化 F-beta（β<1） |
-| **每 visit TP 去重** | 未做 | 僅評估口徑：每 visit 至多 1 TP；不影響線上警報 |
-| **雙口徑指標** | 僅 precision/recall | **Micro**（bet 層級）+ **Macro-by-visit** |
+| **評估口徑** | 僅 precision/recall | **Bet-level**（Phase 1；Visit-level 延後 DEC-012） |
 
 ---
 

@@ -36,6 +36,96 @@
 
 ---
 
+## Session History Distribution — Patron 歷史分佈與 Player-Level Table 決策依據
+
+**日期**：2026-03-02  
+**資料來源**：`data/gmwds_t_session.parquet`（DuckDB 全掃描，約 6.5GB）  
+**目的**：評估 rated patrons 的 session 歷史深度，以決定是否值得建立 cached player-level 彙總表。
+
+### 資料清洗與 DQ 設定
+- **Canonical ID**：`casino_player_id` 若為有效（non-null、非空、非 `'null'` 字串）則用 `casino_player_id`，否則用 `player_id`。
+- **Rated 判定**：`casino_player_id` 有效即為 rated。
+- **排除**：`is_manual=1`、`is_deleted=1`、`is_canceled=1`。
+- **Session 時間**：`COALESCE(session_end_dtm, lud_dtm, session_start_dtm)` 作為排序與 span 計算基準。
+
+### 全量統計
+
+| 指標 | 數值 |
+|------|------|
+| 總 Patrons | 9,126,540 |
+| 其中 Rated | 332,813 |
+| 其中 Non-rated | 8,793,727 |
+| 總 Sessions | 71,214,034 |
+
+### Sessions per patron（全體）
+
+| 分位 | 值 |
+|------|-----|
+| p50 | 1 session |
+| p75 | 2 |
+| p90 | 6 |
+| p95 | 11 |
+| p99 | 96 |
+| max | 156,119 |
+
+### History span（天）per patron（全體）
+
+| 分位 | 值 |
+|------|-----|
+| p50 | 0 天 |
+| p75 | 0 |
+| p90 | 0.1 |
+| p95 | 0.6 |
+| p99 | 170.8 |
+| max | 586.2 |
+
+### Rated patrons 專屬（Player-Level Table 目標族群）
+
+| 指標 | 數值 |
+|------|------|
+| 人數 | 332,813 |
+| Sessions/patron 中位數 | 25 |
+| Sessions/patron 平均 | 151.7 |
+| History span 中位數 | 6.8 天 |
+| History span 平均 | 105.8 天 |
+
+| 門檻 | 佔比 |
+|------|------|
+| ≥5 sessions | 79.3% |
+| ≥10 sessions | 67.7% |
+| ≥20 sessions | 54.9% |
+| ≥30 天 history | 44.3% |
+| ≥90 天 history | 35.7% |
+| ≥180 天 history | 26.3% |
+
+### Unrated patrons 專屬（Sanity check）
+
+| 指標 | 數值 |
+|------|------|
+| 人數 | 8,793,727 |
+| Sessions/patron 中位數 | 1 |
+| Sessions/patron 平均 | 2.4 |
+| History span 中位數 | 0 天 |
+| History span 平均 | 0.4 天 |
+
+| 門檻 | 佔比 |
+|------|------|
+| ≥2 sessions | 32.1% |
+| ≥5 sessions | 10.1% |
+| ≥10 sessions | 3.5% |
+| ≥1 天 history | 2.1% |
+| ≥7 天 history | 0.9% |
+| ≥30 天 history | 0.3% |
+| **僅 1 session** | **67.9%** |
+| **0-day span（同日）** | **68.3%** |
+
+**Sanity check 結論**：Unrated 歷史極短（中位數 1 session、0 天 span），約 68% 單次到訪或同日多次，符合無卡 walk-in 預期。Player-level table 僅需針對 rated 設計，unrated 彙總效益低。
+
+### 決策結論
+Rated patrons 的 session 歷史深度明顯高於非 rated：多數具備多次 sessions 與多日歷史；unrated 則以單 session／同日為主。建立 **cached player-level 彙總表**可避免每次訓練/chunk 對同一批 patron 從 7,100 萬筆 sessions 反覆彙總，具顯著效益；**僅針對 rated** 設計即可。**決策**：進行 player-level table 設計與實作（見 DEC-011）。
+
+---
+
 ## 附錄：可重現驗證 SQL (Evidence)
 
 以下為本批次發現所使用的 DuckDB 驗證腳本，未來取得新資料可直接執行比對。
@@ -488,4 +578,42 @@ FROM read_parquet('data/gmwds_t_bet.parquet') b
 JOIN cand c ON b.session_id = c.session_id
 GROUP BY 1
 ORDER BY bet_rows DESC;
+```
+
+### [Session History Distribution] Patron 歷史分佈全掃描（DuckDB）
+```sql
+-- 完整腳本見 trainer/scripts/analyze_session_history_duckdb.py
+-- 以下為核心聚合邏輯（可直接於 DuckDB 執行驗證）
+WITH base AS (
+    SELECT
+        session_id,
+        player_id,
+        COALESCE(
+            CASE WHEN casino_player_id IS NOT NULL
+                 AND TRIM(CAST(casino_player_id AS VARCHAR)) NOT IN ('', 'null', 'NULL', 'nan', 'None')
+            THEN TRIM(CAST(casino_player_id AS VARCHAR))
+            ELSE NULL END,
+            CAST(player_id AS VARCHAR)
+        ) AS canonical_id,
+        CASE WHEN casino_player_id IS NOT NULL
+             AND TRIM(CAST(casino_player_id AS VARCHAR)) NOT IN ('', 'null', 'NULL')
+        THEN 1 ELSE 0 END AS is_rated,
+        COALESCE(session_end_dtm, lud_dtm, session_start_dtm) AS sess_time
+    FROM read_parquet('data/gmwds_t_session.parquet')
+    WHERE COALESCE(is_manual, 0) = 0
+      AND COALESCE(is_deleted, 0) = 0
+      AND COALESCE(is_canceled, 0) = 0
+),
+per_patron AS (
+    SELECT
+        canonical_id,
+        MAX(is_rated) AS is_rated,
+        COUNT(*) AS session_count,
+        MIN(sess_time) AS first_session,
+        MAX(sess_time) AS last_session,
+        EXTRACT(EPOCH FROM (MAX(sess_time) - MIN(sess_time))) / 86400.0 AS history_span_days
+    FROM base
+    GROUP BY canonical_id
+)
+SELECT * FROM per_patron;
 ```

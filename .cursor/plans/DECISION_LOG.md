@@ -186,4 +186,46 @@
 
 ---
 
+## DEC-011：建立 Cached Player-Level 彙總表
+
+**日期**：2026-03-02  
+**SSOT 章節**：待補充（Phase 1 後延伸）  
+**關聯**：`doc/FINDINGS.md` — Session History Distribution
+
+**決策**：進行 **cached player-level 彙總表** 的設計與實作，以支援 rated model 的 patron profile 特徵，避免每次 chunk 從 session 表反覆彙總。
+
+**背景**：  
+- Rated model 的 patron profile 目前僅依賴 chunk ±1 天內的 sessions，歷史範圍過短。  
+- 全量 session 表（`gmwds_t_session.parquet`）DuckDB 全掃描分析顯示：
+  - Rated patrons 共 332,813 人，平均每人 151.7 sessions、105.8 天歷史。  
+  - 79.3% rated 有 ≥5 sessions；44.3% 有 ≥30 天 history；26.3% 有 ≥180 天 history。
+
+**理由**：  
+- 多數 rated patrons 具備足夠的歷史深度，建立 player-level 彙總可避免從 7,100 萬筆 sessions 反覆計算。  
+- 預期設計：每日 snapshot + PIT，訓練/推論時按時間點取對應 snapshot，再與 chunk 內增量 sessions 合併。
+
+**待辦**：  
+- 具體 schema、更新頻率、PIT 策略於後續計畫補充。
+
+---
+
+## DEC-012：Phase 1 簡化為 Bet-level 評估指標，Visit-level / Cooldown 延後
+
+**日期**：2026-03-02  
+**SSOT 章節**：§10.1, §10.2, §10.3, §14  
+
+**決策**：Phase 1 **統一採用 Bet-level 指標**（Precision, Recall, F-beta, PR-AUC）進行閾值選擇與回測報告；不引入 Visit-level 聚合（V-Precision, V-Recall, V-Volume）或 Per-player 警報冷卻期（Cooldown）。
+
+**背景**：  
+- Visit-level 指標與 Cooldown 設計需反映公關真實體驗（如成功挽留多少獨立玩家、同一 visit 內多次假警報的懲罰），涉及業務語義與 KPI 協商。  
+- 目前尚無明確業務輸入可定義具體 metric 與門檻，為保持簡單與可落地，先以 bet-level 為主。
+
+**Future TODO**：  
+- 待業務校準後，考慮引入：  
+  - Visit-level 聚合指標（bet-derived visit 定義見 SSOT §2.2）  
+  - Per-player 警報冷卻期（避免同一 visit 內多次假警報打擾公關）  
+- 具體 metric 定義、Visit 語義（如同一 visit 內多 FP 如何計數）、閾值策略需與業務端協商後補入 SSOT。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

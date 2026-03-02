@@ -7,8 +7,8 @@ Key changes from pre-Phase-1 version
 * Dual-model artifacts: rated_model.pkl + nonrated_model.pkl (falls back to
   legacy walkaway_model.pkl when new artifacts are absent).
 * D2 identity resolution via identity.py build_canonical_mapping_from_df.
-* Track B features via features.py (compute_loss_streak / compute_run_boundary
-  / compute_table_hc) — guarantees train-serve parity with trainer.py.
+* Track B features via features.py (compute_loss_streak / compute_run_boundary)
+  — guarantees train-serve parity with trainer.py. (table_hc deferred to Phase 2.)
 * H3 model routing: is_rated_obs ← casino_player_id IS NOT NULL.
 * FND-01 CTE dedup + session_avail_dtm gate on session query (H2).
 * SHAP reason codes → reason_code_map.json lookup, emitted with every alert.
@@ -45,7 +45,6 @@ try:
     from features import (  # type: ignore[import]
         compute_loss_streak,
         compute_run_boundary,
-        compute_table_hc,
         build_entity_set,
         load_feature_defs,
     )
@@ -53,7 +52,6 @@ except ImportError:
     from trainer.features import (  # type: ignore[import, attr-defined]
         compute_loss_streak,
         compute_run_boundary,
-        compute_table_hc,
         build_entity_set,
         load_feature_defs,
     )
@@ -545,8 +543,8 @@ def build_features_for_scoring(
     Steps
     -----
     1. D2 identity: attach canonical_id from canonical_map.
-    2. Track B (features.py): loss_streak, run_id, minutes_since_run_start,
-       table_hc — same functions as trainer.py.
+    2. Track B (features.py): loss_streak, run_id, minutes_since_run_start
+       — same functions as trainer.py. (table_hc deferred to Phase 2.)
     3. Session rolling stats: bets_last_5/15/30m, wager_last_10/30m,
        cum_bets, cum_wager, avg_wager_sofar, session_duration_min,
        bets_per_minute (legacy parity with trainer.add_legacy_features).
@@ -601,10 +599,6 @@ def build_features_for_scoring(
     bets_df["minutes_since_run_start"] = (
         rb["minutes_since_run_start"] if "minutes_since_run_start" in rb.columns else 0.0
     )
-
-    bets_df["table_hc"] = compute_table_hc(
-        bets_df, cutoff_time=cutoff_naive
-    ).fillna(0)
 
     # ── Session rolling stats (legacy parity) ─────────────────────────────
     sess_df = sessions.copy() if not sessions.empty else pd.DataFrame()

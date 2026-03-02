@@ -113,7 +113,6 @@ try:
     from features import (  # type: ignore[import]
         compute_loss_streak,
         compute_run_boundary,
-        compute_table_hc,
         build_entity_set,
         run_dfs_exploration,
         save_feature_defs,
@@ -128,7 +127,6 @@ except ModuleNotFoundError:
     from trainer.features import (  # type: ignore[import]
         compute_loss_streak,
         compute_run_boundary,
-        compute_table_hc,
         build_entity_set,
         run_dfs_exploration,
         save_feature_defs,
@@ -157,7 +155,6 @@ TRACK_B_FEATURE_COLS: List[str] = [
     "loss_streak",
     "run_id",
     "minutes_since_run_start",
-    "table_hc",
 ]
 
 # Legacy feature columns (kept for backward compat until scorer is refactored)
@@ -481,7 +478,6 @@ def add_track_b_features(
         bets["loss_streak"] = 0
         bets["run_id"] = 0
         bets["minutes_since_run_start"] = 0.0
-        bets["table_hc"] = 0
         return bets
 
     df = bets.copy()
@@ -497,11 +493,6 @@ def add_track_b_features(
     df["minutes_since_run_start"] = run_df.get(
         "minutes_since_run_start", pd.Series(0.0, index=df.index)
     )
-
-    # table_hc (each row's own payout time is the per-row cutoff; pass None
-    # so the function uses per-row times; the global cutoff is enforced via
-    # the bets having already been filtered to <= extended_end upstream)
-    df["table_hc"] = compute_table_hc(df, cutoff_time=window_end)
 
     return df
 
