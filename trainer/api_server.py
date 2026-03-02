@@ -1,4 +1,8 @@
+import hashlib
+import io
+import json
 import sqlite3
+import threading
 import numpy as np
 import pandas as pd
 from flask import Flask, request, jsonify, send_from_directory, abort
@@ -6,10 +10,10 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import config
 from pathlib import Path
-import json
 
 BASE_DIR = Path(__file__).parent
 FRONTEND_DIR = BASE_DIR / "frontend"
+MODEL_DIR = BASE_DIR / "models"
 
 # Point Flask's static handler to the actual frontend/static folder for Chart.js, etc.
 app = Flask(
@@ -282,6 +286,326 @@ def get_alerts():
     resp = jsonify({"alerts": alerts})
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
+
+# ── Model artifact cache (Step 9) ─────────────────────────────────────────────
+# Artifacts are loaded lazily on the first request and reloaded automatically
+# whenever model_version changes (i.e. after trainer.py produces a new bundle).
+_artifacts_cache: dict = {}
+_cached_model_version: str = ""
+_artifacts_lock = threading.Lock()
+_MAX_SCORE_ROWS = 10_000
+
+
+def _load_artifacts() -> dict | None:
+    """Load dual-model artifacts from MODEL_DIR.
+
+    Returns a dict with keys: rated, nonrated, feature_list, reason_code_map,
+    model_version.  Returns None when no model file is found.
+    """
+    try:
+        import joblib  # type: ignore[import]
+    except ImportError:
+        print("[api] joblib not installed — /score endpoint unavailable")
+        return None
+
+    rated_path = MODEL_DIR / "rated_model.pkl"
+    nonrated_path = MODEL_DIR / "nonrated_model.pkl"
+    legacy_path = MODEL_DIR / "walkaway_model.pkl"
+    feature_list_path = MODEL_DIR / "feature_list.json"
+    reason_map_path = MODEL_DIR / "reason_code_map.json"
+    version_path = MODEL_DIR / "model_version"
+
+    arts: dict = {
+        "rated": None,
+        "nonrated": None,
+        "feature_list": [],
+        "reason_code_map": {},
+        "model_version": "unknown",
+    }
+
+    if version_path.exists():
+        arts["model_version"] = version_path.read_text(encoding="utf-8").strip()
+
+    if feature_list_path.exists():
+        with feature_list_path.open(encoding="utf-8") as fh:
+            raw = json.load(fh)
+            arts["feature_list"] = [
+                (entry["name"] if isinstance(entry, dict) else str(entry)) for entry in raw
+            ]
+
+    if reason_map_path.exists():
+        with reason_map_path.open(encoding="utf-8") as fh:
+            arts["reason_code_map"] = json.load(fh)
+
+    # ── Read each pkl once, verify sha256, cache raw bytes for in-memory
+    #    deserialization — avoids double I/O (R48, R58) ──
+    _pkl_raw: dict = {}
+    for pkl_path in [rated_path, nonrated_path, legacy_path]:
+        if pkl_path.exists():
+            raw = pkl_path.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            print(f"[api] {pkl_path.name} sha256={digest}")
+            _pkl_raw[pkl_path] = raw
+
+    if rated_path in _pkl_raw and nonrated_path in _pkl_raw:
+        rb = joblib.load(io.BytesIO(_pkl_raw[rated_path]))
+        nb = joblib.load(io.BytesIO(_pkl_raw[nonrated_path]))
+        arts["rated"] = {"model": rb["model"], "threshold": float(rb.get("threshold", 0.5))}
+        arts["nonrated"] = {"model": nb["model"], "threshold": float(nb.get("threshold", 0.5))}
+        arts["training_metrics"] = rb.get("metrics", {})
+        if not arts["feature_list"]:
+            arts["feature_list"] = rb.get("features", [])
+        # ── Cache TreeExplainer objects (R49): avoids rebuild on every request ──
+        try:
+            import shap  # type: ignore[import]
+            arts["rated_explainer"] = shap.TreeExplainer(rb["model"])
+            arts["nonrated_explainer"] = shap.TreeExplainer(nb["model"])
+        except Exception as exc:
+            print(f"[api] SHAP explainer pre-build failed: {exc}")
+            arts["rated_explainer"] = None
+            arts["nonrated_explainer"] = None
+        return arts
+
+    if legacy_path in _pkl_raw:
+        bundle = joblib.load(io.BytesIO(_pkl_raw[legacy_path]))
+        arts["rated"] = {
+            "model": bundle["model"],
+            "threshold": float(bundle.get("threshold", 0.5)),
+        }
+        arts["training_metrics"] = bundle.get("metrics", {})
+        if not arts["feature_list"]:
+            arts["feature_list"] = bundle.get("features", [])
+        try:
+            import shap  # type: ignore[import]
+            arts["rated_explainer"] = shap.TreeExplainer(bundle["model"])
+            arts["nonrated_explainer"] = None
+        except Exception as exc:
+            print(f"[api] SHAP explainer pre-build failed: {exc}")
+            arts["rated_explainer"] = None
+            arts["nonrated_explainer"] = None
+        return arts
+
+    return None
+
+
+def _get_artifacts() -> dict | None:
+    """Return cached artifacts, reloading when model_version file changes.
+
+    Cache reads and writes are protected by _artifacts_lock (R52) so that
+    concurrent Flask worker threads cannot observe a partially-loaded bundle.
+    """
+    global _artifacts_cache, _cached_model_version
+    version_path = MODEL_DIR / "model_version"
+    with _artifacts_lock:
+        current_version = (
+            version_path.read_text(encoding="utf-8").strip() if version_path.exists() else ""
+        )
+        if not _artifacts_cache or current_version != _cached_model_version:
+            loaded = _load_artifacts()
+            if loaded is not None:
+                _artifacts_cache = loaded
+                _cached_model_version = current_version
+        return _artifacts_cache or None
+
+
+def _compute_shap_reason_codes_batch(
+    explainer: object,
+    X: np.ndarray,
+    feature_list: list,
+    reason_code_map: dict,
+    top_k: int = 3,
+) -> list:
+    """Compute per-row SHAP-based reason codes for a batch of observations.
+
+    Accepts a pre-built shap.TreeExplainer from the artifact cache (R56) so that
+    the explainer is not rebuilt on every call.  Returns a list (length =
+    X.shape[0]) where each element is a list of up to top_k reason-code strings.
+    Falls back to empty lists on any error so that scoring is never blocked by an
+    explainability failure.
+    """
+    n_rows = X.shape[0] if hasattr(X, "shape") else len(X)
+    if explainer is None:
+        return [[] for _ in range(n_rows)]
+    try:
+        sv = explainer.shap_values(X)  # type: ignore[attr-defined]
+        sv_class1: np.ndarray = sv[1] if isinstance(sv, list) else sv
+        results = []
+        for row_sv in sv_class1:
+            top_idx = np.argsort(np.abs(row_sv))[::-1][:top_k]
+            codes = [reason_code_map.get(feature_list[i], feature_list[i]) for i in top_idx]
+            results.append(codes)
+        return results
+    except Exception as exc:
+        print(f"[api] SHAP reason codes failed: {exc}")
+        return [[] for _ in range(n_rows)]
+
+
+# ── New model-API endpoints ────────────────────────────────────────────────────
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Returns {"status": "ok", "model_version": <current_version>}.
+
+    Always returns 200.  Use model_version == "no_model" to detect that
+    trainer.py has not yet produced any artifacts.
+    """
+    arts = _get_artifacts()
+    version = arts["model_version"] if arts else "no_model"
+    resp = jsonify({"status": "ok", "model_version": version})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/model_info", methods=["GET"])
+def model_info():
+    """Returns model metadata.
+
+    Response schema:
+      {
+        "model_type":        "dual" | "legacy",
+        "model_version":     str,
+        "features":          [str, ...],
+        "training_metrics":  {}  (populated from pkl when available)
+      }
+
+    503 when no model artifacts are present.
+    """
+    arts = _get_artifacts()
+    if arts is None:
+        return jsonify({"error": "No model artifacts found; run trainer.py first"}), 503
+
+    model_type = "dual" if (arts["rated"] and arts["nonrated"]) else "legacy"
+    metrics: dict = arts.get("training_metrics") or {}
+
+    resp = jsonify(
+        {
+            "model_type": model_type,
+            "model_version": arts["model_version"],
+            "features": arts["feature_list"],
+            "training_metrics": metrics,
+        }
+    )
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/score", methods=["POST"])
+def score():
+    """Stateless batch scoring endpoint.
+
+    Input (JSON array, max 10 000 rows):
+      [
+        {"feature_a": 1.0, "feature_b": 0.5, ..., "is_rated": true},
+        ...
+      ]
+
+    Each dict must contain every feature listed in feature_list.json.
+    ``is_rated`` (bool, optional, default false) controls H3 model routing:
+    true → rated model, false → non-rated model.
+
+    Output (JSON array, same order as input):
+      [
+        {"score": 0.82, "alert": true, "reason_codes": ["RC1", ...], "model_version": "..."},
+        ...
+      ]
+
+    Error responses:
+      422  — payload is not a JSON array, exceeds the row limit, or is missing
+              required features.
+      503  — no model artifacts are available (trainer.py has not run yet).
+    """
+    body = request.get_json(silent=True)
+    if not isinstance(body, list):
+        return jsonify({"error": "Expected a JSON array of feature dicts"}), 422
+    if len(body) > _MAX_SCORE_ROWS:
+        return (
+            jsonify({"error": f"Batch size {len(body)} exceeds limit {_MAX_SCORE_ROWS}"}),
+            422,
+        )
+    if len(body) == 0:
+        return jsonify([])
+
+    arts = _get_artifacts()
+    if arts is None:
+        return jsonify({"error": "No model artifacts available; run trainer.py first"}), 503
+
+    feature_list = arts["feature_list"]
+    reason_code_map = arts["reason_code_map"]
+    version = arts["model_version"]
+
+    # ── Guard: reject corrupt/incomplete bundles where feature_list is empty ──
+    if not feature_list:
+        return (
+            jsonify({"error": "Model artifacts incomplete: feature_list is empty"}),
+            503,
+        )
+
+    # ── Schema validation (422 on first missing feature) ──────────────────────
+    if feature_list:
+        schema_errors: list = []
+        for i, row in enumerate(body):
+            missing = [f for f in feature_list if f not in row]
+            if missing:
+                schema_errors.append(
+                    f"row[{i}]: missing {len(missing)} feature(s): {missing[:5]}"
+                )
+                if len(schema_errors) >= 5:
+                    break
+        if schema_errors:
+            return jsonify({"error": "Schema mismatch (422)", "details": schema_errors}), 422
+
+    # ── Build DataFrame and fill missing values ────────────────────────────────
+    df = pd.DataFrame(body)
+    if feature_list:
+        df[feature_list] = df[feature_list].fillna(0)
+    if "is_rated" not in df.columns:
+        df["is_rated"] = False
+    df["is_rated"] = df["is_rated"].fillna(False).astype(bool)
+
+    # ── Score each model segment (H3 routing) ─────────────────────────────────
+    output: list = [None] * len(df)
+
+    for model_key, mask in [
+        ("rated", df["is_rated"]),
+        ("nonrated", ~df["is_rated"]),
+    ]:
+        subset_df = df[mask]
+        if subset_df.empty:
+            continue
+
+        model_info_d = arts.get(model_key) or arts.get("rated")
+        if model_info_d is None:
+            for orig_idx in subset_df.index:
+                output[int(orig_idx)] = {
+                    "score": None,
+                    "alert": False,
+                    "reason_codes": [],
+                    "model_version": version,
+                }
+            continue
+
+        lgbm_model = model_info_d["model"]
+        threshold = model_info_d["threshold"]
+        X = subset_df[feature_list].values.astype(float) if feature_list else np.zeros((len(subset_df), 0))
+        proba = lgbm_model.predict_proba(X)[:, 1]
+        cached_explainer = arts.get("rated_explainer") if model_key == "rated" else arts.get("nonrated_explainer")
+        reason_codes_batch = _compute_shap_reason_codes_batch(
+            cached_explainer, X, feature_list, reason_code_map
+        )
+
+        for batch_i, orig_idx in enumerate(subset_df.index):
+            score_val = float(proba[batch_i])
+            output[int(orig_idx)] = {
+                "score": round(score_val, 4),
+                "alert": bool(score_val >= threshold),
+                "reason_codes": reason_codes_batch[batch_i],
+                "model_version": version,
+            }
+
+    resp = jsonify(output)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
 
 if __name__ == "__main__":
     print(f" * SQLite Path: {STATE_DB_PATH}")

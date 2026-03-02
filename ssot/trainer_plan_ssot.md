@@ -93,6 +93,7 @@
 - 從 ClickHouse 抽取訓練用資料時，**必須**依時間範圍分窗（例如以月或週為單位），逐窗查詢 `t_bet` / `t_session`，不得假設「全時段一次 SELECT」。
 - 每個時間窗口的查詢應盡量對齊資料表 partition（例如 `t_bet` / `t_session` 依 `gaming_day` partition），以利 predicate pushdown（如 `payout_complete_dtm` 或 `gaming_day` 範圍條件），降低掃描量與記憶體峰值。
 - 標籤與特徵的計算須在**各窗口內**依 §7、§8 的語義執行（含 C1 延伸拉取：該窗口若鄰接下一窗口，延伸區間可落入下一窗口的已拉取資料，由實作計畫定義邊界與重疊規則）。
+- **離線訓練資料源（允許本機 Parquet 匯出）**：為加速迭代，允許在訓練/開發環境以「已從 ClickHouse 匯出的完整表 Parquet」（例如放在本機 `.data/` 目錄、或以 DuckDB 掃描）取代即時查詢 ClickHouse；但這僅是 I/O 替代，**不得**改變任何語義與護欄：仍需用同一套時間窗口邊界（§4.3 的集中式定義器）、仍需套用 §5 的 DQ 規則（含 FND-01 去重等）、仍需遵守 §4.2 的 available time / cutoff_time 防漏要求。Production（線上推論/驗證）資料來源一律以 ClickHouse 為準，本機 Parquet 僅用於離線重放與訓練加速。
 
 **資料量處理策略 (Data volume strategy)**  
 - **統一的時間折疊與窗口定義器 (Time Fold Splitter / Window Definer)**：**必須**建立一個集中式的模組，負責計算與發放所有時間窗口的邊界（月度 chunk 的 start/end、C1 延伸拉取緩衝、Train/Valid/Test 的 cutoff 點）。所有 ETL、特徵計算與模型交叉驗證都必須嚴格呼叫這個定義器，避免各階段時間切分出現 off-by-one 錯誤或不一致。

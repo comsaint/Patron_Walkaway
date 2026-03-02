@@ -32,6 +32,7 @@
 | **FND-13** | `t_session`, `t_bet`, `t_game`<br>時間欄位綜合評估 | 🔴 P0 | **系統時間受回填污染，且 Session 紀錄為「結束後」入湖**：`__etl_insert_Dtm` 與 `__ts_ms` 遇回填會嚴重失真（`t_game` 甚至觀察到長達 200 天的延遲）。正常情況下，`t_session` 是在牌局結束後才完整入湖；`session_end_dtm` 缺值極低 (0.06%) 且精準反映業務結束時間。 | 若依賴系統時間模擬即時串流 (Streaming) 會導致未來資料外洩 (Data Leakage)；若誤用 `session_start_dtm` 當作資料可見時間，會嚴重低估延遲。 | **串流模擬最佳實踐 (Event Time + Delay)**：完全棄用系統時間。<br>1. **`t_bet` / `t_game`**: `event_time = payout_complete_dtm`，可用延遲設為 **+1 分鐘**。<br>2. **`t_session`**: `event_time = COALESCE(session_end_dtm, lud_dtm)`，可用延遲設為 **+7 分鐘** (保守可設 15 分)。<br>*(註：增量抽取仍以 `MAX(lud_dtm)` 或 `MAX(__ts_ms)` 為 watermark)* |
 | **FND-14** | `t_game`<br>`game_id` | 🔴 P0 | **存在重複版本**：全表約 2.11 億列中，有約 3.4 萬個 `game_id` 發生重複（總列數大於 unique IDs）。 | 若不去重，牌局的財務結算與狀態會被重複計算。 | 任何建模或分析前，必須先做去重：依賴 `MAX(__ts_ms)` 或 `MAX(__etl_insert_Dtm)` 取得最新狀態。 |
 | **FND-15** | `t_game`<br>財務欄位 | 🟡 P1 | **財務欄位非零且包含極端值**：`total_turnover`, `casino_win` 等並非全為 0。`casino_win` 包含極端值（如單局虧損 1.1 億），與 `t_bet` 的極端派彩現象一致。 | 若誤以為 `t_game` 財務欄位全為 0 而忽略，會遺失局級別的財務特徵。 | 這是真實的業務數據彙總，可作為特徵使用，但需注意極端值對模型的影響。 |
+| **FND-16** | `t_session`<br>`session_id`, `casino_player_id`, `player_id` | 🟡 P1 | **同一 `session_id` 的多版本中，`casino_player_id` 可能「晚到補齊」(NULL → 非 NULL)，少數情況連 `player_id` 也會被更正**。同時 `t_bet` 本身不含 `casino_player_id` 欄位。 | 線上推論若只看「當下可得的 t_session」可能把實際有卡客暫時當作無卡；若未做 FND-01 去重與 available_time gate，會導致 D2 身份判定與 rated/non-rated 路由不穩定（且可能引入未來資訊）。 | 線上：有卡判定必須加 available_time gate（見 FND-13），並允許身份隨 `t_session` 更新而「升級」。離線/訓練：D2 mapping 必須先做 FND-01 去重再建表；同時保留 mapping cache（`player_id`→`casino_player_id`）作為兜底。 |
 
 ---
 
@@ -380,4 +381,111 @@ SELECT
   MIN(casino_win) as min_casino_win, MAX(casino_win) as max_casino_win,
   MIN(theo_win) as min_theo_win, MAX(theo_win) as max_theo_win
 FROM read_parquet('data/gmwds_t_game.parquet');
+```
+
+### [FND-16] 同一 `session_id` 的多版本可能「晚到補齊」`casino_player_id`（以及少數 `player_id` 更正）
+
+> 目的：驗證「玩家中途插卡/事後補登」這類情境，在資料上是否會反映為 `t_session` 的多版本更新（同 session_id 先無卡、後有卡），並確認 `t_bet` 不會被回寫出 `casino_player_id`。
+
+```sql
+-- 0) 確認 t_bet 沒有 casino_player_id 欄位（DuckDB 可用 DESCRIBE 檢查）
+DESCRIBE SELECT * FROM read_parquet('data/gmwds_t_bet.parquet') LIMIT 1;
+
+-- 1) 建立乾淨視圖（清洗 casino_player_id；保留版本時間欄位）
+CREATE OR REPLACE VIEW session_versions AS
+SELECT
+  session_id,
+  player_id,
+  CASE
+    WHEN casino_player_id IS NULL THEN NULL
+    WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL
+    ELSE trim(casino_player_id)
+  END AS clean_casino_player_id,
+  lud_dtm,
+  __etl_insert_Dtm,
+  session_start_dtm,
+  session_end_dtm,
+  num_bets,
+  is_manual,
+  is_deleted,
+  is_canceled
+FROM read_parquet('data/gmwds_t_session.parquet')
+WHERE is_manual = 0
+  AND COALESCE(is_deleted, 0) = 0
+  AND COALESCE(is_canceled, 0) = 0;
+
+-- 2) 找出「同 session_id 多版本，且同時出現 (NULL card) 與 (non-NULL card)」的 session
+WITH agg AS (
+  SELECT
+    session_id,
+    COUNT(*) AS version_cnt,
+    MAX(CASE WHEN clean_casino_player_id IS NULL THEN 1 ELSE 0 END) AS has_null_card,
+    MAX(CASE WHEN clean_casino_player_id IS NOT NULL THEN 1 ELSE 0 END) AS has_card,
+    COUNT(DISTINCT player_id) AS player_id_nunique,
+    COUNT(DISTINCT clean_casino_player_id) AS card_id_nunique
+  FROM session_versions
+  GROUP BY 1
+)
+SELECT
+  COUNT(*) AS sessions_with_late_card_update
+FROM agg
+WHERE version_cnt > 1 AND has_null_card = 1 AND has_card = 1;
+
+-- 3) 抽樣查看幾個例子（按版本數、以及版本時間排序）
+WITH agg AS (
+  SELECT
+    session_id,
+    COUNT(*) AS version_cnt,
+    MAX(CASE WHEN clean_casino_player_id IS NULL THEN 1 ELSE 0 END) AS has_null_card,
+    MAX(CASE WHEN clean_casino_player_id IS NOT NULL THEN 1 ELSE 0 END) AS has_card
+  FROM session_versions
+  GROUP BY 1
+),
+cand AS (
+  SELECT session_id
+  FROM agg
+  WHERE version_cnt > 1 AND has_null_card = 1 AND has_card = 1
+  ORDER BY version_cnt DESC, session_id
+  LIMIT 20
+)
+SELECT
+  v.session_id,
+  v.player_id,
+  v.clean_casino_player_id,
+  v.session_start_dtm,
+  v.session_end_dtm,
+  v.lud_dtm,
+  v.__etl_insert_Dtm,
+  v.num_bets
+FROM session_versions v
+JOIN cand c USING (session_id)
+ORDER BY v.session_id, v.lud_dtm NULLS LAST, v.__etl_insert_Dtm NULLS LAST;
+
+-- 4) 對同一批 cand session_id，檢查其在 t_bet 的 bet rows（只有 player_id，沒有 casino_player_id）
+WITH agg AS (
+  SELECT
+    session_id,
+    COUNT(*) AS version_cnt,
+    MAX(CASE WHEN clean_casino_player_id IS NULL THEN 1 ELSE 0 END) AS has_null_card,
+    MAX(CASE WHEN clean_casino_player_id IS NOT NULL THEN 1 ELSE 0 END) AS has_card
+  FROM session_versions
+  GROUP BY 1
+),
+cand AS (
+  SELECT session_id
+  FROM agg
+  WHERE version_cnt > 1 AND has_null_card = 1 AND has_card = 1
+  ORDER BY version_cnt DESC, session_id
+  LIMIT 20
+)
+SELECT
+  b.session_id,
+  COUNT(*) AS bet_rows,
+  COUNT(DISTINCT b.player_id) AS bet_player_id_nunique,
+  MIN(b.payout_complete_dtm) AS first_bet_time,
+  MAX(b.payout_complete_dtm) AS last_bet_time
+FROM read_parquet('data/gmwds_t_bet.parquet') b
+JOIN cand c ON b.session_id = c.session_id
+GROUP BY 1
+ORDER BY bet_rows DESC;
 ```

@@ -5,7 +5,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from bisect import bisect_left, bisect_right
 
 import pandas as pd
@@ -26,10 +26,21 @@ except Exception:
                 "or ensure python-dateutil is installed"
             )
 
-import config
-from db_conn import get_clickhouse_client
+try:
+    import config  # type: ignore[import]
+except ModuleNotFoundError:
+    import trainer.config as config  # type: ignore[import, no-redef]
+
+try:
+    from db_conn import get_clickhouse_client  # type: ignore[import]
+except ImportError:
+    get_clickhouse_client = None  # type: ignore[assignment]
 
 HK_TZ = ZoneInfo(config.HK_TZ)
+# Sentinel for ongoing sessions (NULL session_end_dtm in DB); must not trigger
+# walkaway logic in validate_alert_row (R59 fix).
+_SENTINEL_SESSION_END = pd.Timestamp("2099-12-31 00:00:00", tz="UTC").tz_convert(HK_TZ)
+
 BASE_DIR = Path(__file__).parent
 STATE_DB_PATH = BASE_DIR / "local_state" / "state.db"
 OUT_DIR = BASE_DIR / "out_validator"
@@ -42,6 +53,7 @@ VALIDATION_COLUMNS = [
     "alert_ts",
     "validated_at",
     "player_id",
+    "canonical_id",
     "table_id",
     "position_idx",
     "session_id",
@@ -52,80 +64,243 @@ VALIDATION_COLUMNS = [
     "gap_minutes",
     "reason",
     "bet_ts",
+    "model_version",
+]
+
+# Columns added to validation_results in Phase 1 (step 8) — migrated via ALTER TABLE
+_NEW_VAL_COLS: List[Tuple[str, str]] = [
+    ("canonical_id", "TEXT"),
+    ("model_version", "TEXT"),
+]
+
+# Columns present since Phase 1 in the alerts table
+_ALERTS_PHASE1_COLS: List[Tuple[str, str]] = [
+    ("canonical_id", "TEXT"),
+    ("model_version", "TEXT"),
 ]
 
 
-def fetch_bets_for_players(player_ids: List[int], start: datetime, end: datetime) -> Dict[int, List[datetime]]:
-    if not player_ids:
-        return {}
-    client = get_clickhouse_client()
-    params = {"players": tuple(player_ids), "start": start, "end": end}
-    query = f"""
-        SELECT player_id, payout_complete_dtm
-        FROM {config.SOURCE_DB}.{config.TBET}
-        WHERE player_id IN %(players)s
-          AND payout_complete_dtm >= %(start)s
-          AND payout_complete_dtm <= %(end)s
-                    AND wager > 0
-        ORDER BY player_id, payout_complete_dtm
-    """
-    df = client.query_df(query, parameters=params)
-    if df.empty:
-        return {}
-    # Ensure tz-aware in HK
-    df["payout_complete_dtm"] = pd.to_datetime(df["payout_complete_dtm"])
-    if df["payout_complete_dtm"].dt.tz is None:
-        df["payout_complete_dtm"] = df["payout_complete_dtm"].dt.tz_localize(HK_TZ)
-    else:
-        df["payout_complete_dtm"] = df["payout_complete_dtm"].dt.tz_convert(HK_TZ)
+def _build_cid_to_player_ids(alerts_df: pd.DataFrame) -> Dict[str, List[int]]:
+    """Build {canonical_id: [player_ids]} reverse mapping from the alerts DataFrame.
 
-    cache: Dict[int, List[datetime]] = {}
-    for pid, grp in df.groupby("player_id"):
-        cache[int(pid)] = list(grp["payout_complete_dtm"].sort_values())
+    The alerts table has both ``canonical_id`` (Phase-1 column) and ``player_id``.
+    For rated players the canonical_id is their casino card ID; for non-rated it is
+    str(player_id).  Grouping by canonical_id lets us fetch all bets that belong
+    to the same person even if they used different player_ids (换卡 / 断链重发).
+    """
+    if alerts_df.empty:
+        return {}
+
+    cid_col = "canonical_id" if "canonical_id" in alerts_df.columns else None
+    pid_col = "player_id" if "player_id" in alerts_df.columns else None
+
+    mapping: Dict[str, List[int]] = {}
+    for row in alerts_df.itertuples(index=False):
+        cid_raw = getattr(row, cid_col, None) if cid_col else None
+        pid_raw = getattr(row, pid_col, None) if pid_col else None
+
+        pid = None if (pid_raw is None or pd.isna(pid_raw)) else int(pid_raw)
+        if cid_raw is None or pd.isna(cid_raw) or str(cid_raw).strip() == "":
+            # fall back: use str(player_id) as canonical_id
+            cid = str(pid) if pid is not None else None
+        else:
+            cid = str(cid_raw)
+
+        if cid is None or pid is None:
+            continue
+        mapping.setdefault(cid, [])
+        if pid not in mapping[cid]:
+            mapping[cid].append(pid)
+
+    return mapping
+
+
+# Maximum player_ids per ClickHouse IN clause; avoids "Query is too large" errors (R44).
+_PLAYER_ID_CHUNK_SIZE = 5_000
+
+
+def fetch_bets_by_canonical_id(
+    cid_to_pids: Dict[str, List[int]],
+    start: datetime,
+    end: datetime,
+) -> Dict[str, List[datetime]]:
+    """Fetch bets for all player_ids, returning a {canonical_id: [bet_times]} dict.
+
+    Bets from multiple player_ids that share a canonical_id are merged and sorted
+    so that the validation logic treats all sub-identities of a rated player as one.
+
+    Large player_id lists are sent in chunks to avoid ClickHouse IN-clause limits
+    (R44 — _PLAYER_ID_CHUNK_SIZE per batch).
+
+    DB errors are not silenced — they propagate to the caller so that the
+    validation cycle can abort gracefully rather than producing false MISS verdicts
+    from an empty cache (R41).
+    """
+    if not cid_to_pids or get_clickhouse_client is None:
+        return {}
+
+    all_pids: List[int] = []
+    pid_to_cid: Dict[int, str] = {}
+    for cid, pids in cid_to_pids.items():
+        for pid in pids:
+            if pid not in pid_to_cid:
+                pid_to_cid[pid] = cid
+                all_pids.append(pid)
+
+    if not all_pids:
+        return {}
+
+    client = get_clickhouse_client()  # errors propagate to caller (R41)
+
+    cache: Dict[str, List[datetime]] = {}
+
+    # Batch queries to avoid oversized IN clauses (R44)
+    for i in range(0, len(all_pids), _PLAYER_ID_CHUNK_SIZE):
+        chunk_pids = all_pids[i : i + _PLAYER_ID_CHUNK_SIZE]
+        params = {"players": tuple(chunk_pids), "start": start, "end": end}
+        query = f"""
+            SELECT player_id, payout_complete_dtm
+            FROM {config.SOURCE_DB}.{config.TBET} FINAL
+            WHERE player_id IN %(players)s
+              AND player_id != {config.PLACEHOLDER_PLAYER_ID}
+              AND payout_complete_dtm >= %(start)s
+              AND payout_complete_dtm <= %(end)s
+              AND payout_complete_dtm IS NOT NULL
+              AND wager > 0
+            ORDER BY player_id, payout_complete_dtm
+        """
+        df = client.query_df(query, parameters=params)  # errors propagate (R41)
+        if df.empty:
+            continue
+
+        df["payout_complete_dtm"] = pd.to_datetime(df["payout_complete_dtm"])
+        if df["payout_complete_dtm"].dt.tz is None:
+            df["payout_complete_dtm"] = df["payout_complete_dtm"].dt.tz_localize(HK_TZ)
+        else:
+            df["payout_complete_dtm"] = df["payout_complete_dtm"].dt.tz_convert(HK_TZ)
+
+        for _, row in df.iterrows():
+            pid = int(row["player_id"])
+            resolved_cid = pid_to_cid.get(pid)
+            if resolved_cid is None:
+                continue
+            cache.setdefault(resolved_cid, [])
+            cache[resolved_cid].append(row["payout_complete_dtm"])
+
+    # Sort each canonical_id's bet list by time
+    for cid in cache:
+        cache[cid].sort()
+
     return cache
 
 
-def fetch_sessions_for_players(player_ids: List[int], start: datetime, end: datetime) -> Dict[int, List[Dict]]:
-    if not player_ids:
-        return {}
-    client = get_clickhouse_client()
-    params = {"players": tuple(player_ids), "start": start, "end": end}
-    query = f"""
-        SELECT player_id, session_id, session_start_dtm, session_end_dtm
-        FROM {config.SOURCE_DB}.{config.TSESSION}
-        WHERE player_id IN %(players)s
-          AND session_start_dtm >= %(start)s - INTERVAL 1 DAY
-          AND session_start_dtm <= %(end)s + INTERVAL 1 DAY
-        ORDER BY player_id, session_start_dtm, session_end_dtm
-    """
-    df = client.query_df(query, parameters=params)
-    if df.empty:
-        return {}
-    for col in ["session_start_dtm", "session_end_dtm"]:
-        df[col] = pd.to_datetime(df[col])
-        if df[col].dt.tz is None:
-            df[col] = df[col].dt.tz_localize(HK_TZ)
-        else:
-            df[col] = df[col].dt.tz_convert(HK_TZ)
+def fetch_sessions_by_canonical_id(
+    cid_to_pids: Dict[str, List[int]],
+    start: datetime,
+    end: datetime,
+) -> Dict[str, List[Dict]]:
+    """Fetch sessions for all player_ids, grouped by canonical_id (R42).
 
-    cache: Dict[int, List[Dict]] = {}
-    for pid, grp in df.groupby("player_id"):
-        grp_sorted = grp.sort_values(["session_start_dtm", "session_end_dtm"])
+    Sessions from multiple player_ids that share a canonical_id are merged and
+    time-sorted, so that rated players who swap casino-club cards within a visit
+    are treated as a single identity by validate_alert_row.
+
+    DB errors propagate to the caller — they are not silenced.
+    """
+    if not cid_to_pids or get_clickhouse_client is None:
+        return {}
+
+    all_pids: List[int] = []
+    pid_to_cid: Dict[int, str] = {}
+    for cid, pids in cid_to_pids.items():
+        for pid in pids:
+            if pid not in pid_to_cid:
+                pid_to_cid[pid] = cid
+                all_pids.append(pid)
+
+    if not all_pids:
+        return {}
+
+    client = get_clickhouse_client()  # errors propagate to caller
+
+    raw: List[Dict] = []
+    for i in range(0, len(all_pids), _PLAYER_ID_CHUNK_SIZE):
+        chunk_pids = all_pids[i : i + _PLAYER_ID_CHUNK_SIZE]
+        params = {"players": tuple(chunk_pids), "start": start, "end": end}
+        query = f"""
+            WITH deduped AS (
+                SELECT
+                    player_id,
+                    session_id,
+                    session_avail_dtm,
+                    session_end_dtm,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY session_id
+                        ORDER BY lud_dtm DESC, __etl_insert_Dtm DESC
+                    ) AS rn
+                FROM {config.SOURCE_DB}.{config.TSESSION}
+                WHERE player_id IN %(players)s
+                  AND session_avail_dtm >= %(start)s - INTERVAL 1 DAY
+                  AND session_avail_dtm <= %(end)s + INTERVAL 1 DAY
+                  AND is_deleted = 0
+                  AND is_canceled = 0
+                  AND is_manual = 0
+            )
+            SELECT player_id, session_id, session_avail_dtm, session_end_dtm
+            FROM deduped
+            WHERE rn = 1
+            ORDER BY player_id, session_avail_dtm, session_end_dtm
+        """
+        df = client.query_df(query, parameters=params)
+        if df.empty:
+            continue
+
+        for col in ["session_avail_dtm", "session_end_dtm"]:
+            df[col] = pd.to_datetime(df[col])
+            if df[col].dt.tz is None:
+                df[col] = df[col].dt.tz_localize(HK_TZ)
+            else:
+                df[col] = df[col].dt.tz_convert(HK_TZ)
+
+        # session_end_dtm is NULL for ongoing sessions; replace NaT with a
+        # far-future sentinel so sort-key and gap arithmetic remain valid (R59).
+        df["session_end_dtm"] = df["session_end_dtm"].fillna(_SENTINEL_SESSION_END)
+
+        for _, row in df.iterrows():
+            pid = int(row["player_id"])
+            resolved_cid = pid_to_cid.get(pid)
+            if resolved_cid is None:
+                continue
+            raw.append(
+                {
+                    "canonical_id": resolved_cid,
+                    "session_id": int(row["session_id"]) if pd.notna(row["session_id"]) else None,
+                    "start": row["session_avail_dtm"],
+                    "end": row["session_end_dtm"],
+                }
+            )
+
+    # Group by canonical_id, sort by start time, compute next_start
+    by_cid: Dict[str, List[Dict]] = {}
+    for item in raw:
+        by_cid.setdefault(item["canonical_id"], []).append(item)
+
+    cache: Dict[str, List[Dict]] = {}
+    for cid, items in by_cid.items():
+        sorted_items = sorted(items, key=lambda s: (s["start"], s["end"]))
         sessions = []
-        starts = grp_sorted["session_start_dtm"].to_list()
-        ends = grp_sorted["session_end_dtm"].to_list()
-        ids = grp_sorted["session_id"].to_list()
-        for i, (sid, st, en) in enumerate(zip(ids, starts, ends)):
-            next_start = starts[i + 1] if i + 1 < len(starts) else None
+        for idx, item in enumerate(sorted_items):
+            next_start = sorted_items[idx + 1]["start"] if idx + 1 < len(sorted_items) else None
             sessions.append(
                 {
-                    "session_id": int(sid) if pd.notna(sid) else None,
-                    "start": st,
-                    "end": en,
+                    "session_id": item["session_id"],
+                    "start": item["start"],
+                    "end": item["end"],
                     "next_start": next_start,
                 }
             )
-        cache[int(pid)] = sessions
+        cache[cid] = sessions
+
     return cache
 
 
@@ -195,6 +370,18 @@ def get_db_conn() -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_val_alert_ts ON validation_results(alert_ts)")
+
+    # Schema migration: add Phase-1 columns if they don't exist yet (step 8)
+    existing_val_cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(validation_results)").fetchall()
+    }
+    for col_name, col_type in _NEW_VAL_COLS:
+        if col_name not in existing_val_cols:
+            conn.execute(
+                f"ALTER TABLE validation_results ADD COLUMN {col_name} {col_type}"
+            )
+
     return conn
 
 
@@ -258,34 +445,45 @@ def load_existing_results(conn: sqlite3.Connection) -> Dict:
 def save_validation_results(conn: sqlite3.Connection, final_df: pd.DataFrame) -> None:
     if final_df.empty:
         return
+
+    def _s(v: object) -> Optional[str]:
+        try:
+            return None if pd.isna(v) else str(v)
+        except (TypeError, ValueError):
+            return str(v) if v is not None else None
+
     rows = [
         (
-            None if pd.isna(r.bet_id) else str(r.bet_id),
-            r.alert_ts,
-            r.validated_at,
+            _s(r.bet_id),
+            getattr(r, "alert_ts", None),
+            getattr(r, "validated_at", None),
             None if pd.isna(r.player_id) else int(r.player_id),
-            r.table_id,
-            r.position_idx,
+            _s(getattr(r, "canonical_id", None)),
+            _s(r.table_id),
+            getattr(r, "position_idx", None),
             None if pd.isna(r.session_id) else str(int(r.session_id)),
-            r.score,
+            getattr(r, "score", None),
             None if pd.isna(r.result) else int(bool(r.result)),
-            r.gap_start,
-            r.gap_minutes,
-            r.reason,
-            r.bet_ts,
+            getattr(r, "gap_start", None),
+            getattr(r, "gap_minutes", None),
+            getattr(r, "reason", None),
+            getattr(r, "bet_ts", None),
+            _s(getattr(r, "model_version", None)),
         )
         for r in final_df.itertuples(index=False)
     ]
     conn.executemany(
         """
         INSERT INTO validation_results(
-            bet_id, alert_ts, validated_at, player_id, table_id, position_idx, session_id,
-            score, result, gap_start, gap_minutes, reason, bet_ts
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            bet_id, alert_ts, validated_at, player_id, canonical_id, table_id,
+            position_idx, session_id, score, result, gap_start, gap_minutes,
+            reason, bet_ts, model_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(bet_id) DO UPDATE SET
             alert_ts=excluded.alert_ts,
             validated_at=excluded.validated_at,
             player_id=excluded.player_id,
+            canonical_id=excluded.canonical_id,
             table_id=excluded.table_id,
             position_idx=excluded.position_idx,
             session_id=excluded.session_id,
@@ -294,7 +492,8 @@ def save_validation_results(conn: sqlite3.Connection, final_df: pd.DataFrame) ->
             gap_start=excluded.gap_start,
             gap_minutes=excluded.gap_minutes,
             reason=excluded.reason,
-            bet_ts=excluded.bet_ts
+            bet_ts=excluded.bet_ts,
+            model_version=excluded.model_version
         """,
         rows,
     )
@@ -341,8 +540,19 @@ def find_gap_within_window(alert_ts: datetime, bet_times: List[datetime], base_s
     return False, None, 0.0
 
 
-def validate_alert_row(row: pd.Series, bet_cache: Dict[int, List[datetime]], session_cache: Dict[int, List[Dict]], force_finalize: bool = False) -> Dict:
-    score_ts = pd.to_datetime(row["ts"]) 
+def validate_alert_row(
+    row: pd.Series,
+    bet_cache: Dict[str, List[datetime]],
+    session_cache: Dict[str, List[Dict]],
+    force_finalize: bool = False,
+) -> Dict:
+    """Validate a single alert row.
+
+    ``bet_cache`` is now keyed by ``canonical_id`` (str) to support rated players
+    whose bets may span multiple ``player_id``s.  A player_id-based fallback is
+    still used when canonical_id is absent (e.g., legacy alerts).
+    """
+    score_ts = pd.to_datetime(row["ts"])
     if score_ts.tzinfo is None:
         score_ts = score_ts.tz_localize(HK_TZ)
     else:
@@ -359,10 +569,19 @@ def validate_alert_row(row: pd.Series, bet_cache: Dict[int, List[datetime]], ses
     player_id = row.get("player_id")
     bet_id = row.get("bet_id")
 
+    # Resolve canonical_id for bet_cache lookup (step 8)
+    cid_raw = row.get("canonical_id")
+    if cid_raw is None or pd.isna(cid_raw) or str(cid_raw).strip() == "":
+        canonical_id = str(int(player_id)) if pd.notna(player_id) else None
+    else:
+        canonical_id = str(cid_raw)
+
+    model_version = row.get("model_version")
+
     now_hk = datetime.now(HK_TZ)
 
     # Template for result with all columns
-    res_base = {col: None for col in VALIDATION_COLUMNS}
+    res_base: Dict[str, Any] = {col: None for col in VALIDATION_COLUMNS}
     res_base.update(
         {
             "alert_ts": score_ts.isoformat(),
@@ -371,9 +590,11 @@ def validate_alert_row(row: pd.Series, bet_cache: Dict[int, List[datetime]], ses
             "bet_id": bet_id,
             "score": row.get("score"),
             "player_id": int(player_id) if pd.notna(player_id) else None,
+            "canonical_id": canonical_id,
             "table_id": row.get("table_id"),
             "position_idx": row.get("position_idx"),
             "session_id": row.get("session_id"),
+            "model_version": model_version if pd.notna(model_version) else None,
         }
     )
 
@@ -387,8 +608,12 @@ def validate_alert_row(row: pd.Series, bet_cache: Dict[int, List[datetime]], ses
     if bet_ts > now_hk - timedelta(minutes=wait_minutes):
         return {"result": None}  # too recent; special key to signal skip
 
-    # Use cached bets for this player
-    bet_list = bet_cache.get(int(player_id), [])
+    # Use canonical_id to look up the merged bet list for this player (step 8).
+    # Falls back to player_id lookup for legacy bet_cache entries.
+    if canonical_id is not None and canonical_id in bet_cache:
+        bet_list = bet_cache[canonical_id]
+    else:
+        bet_list = bet_cache.get(str(int(player_id)) if pd.notna(player_id) else "", [])
     # Find last bet before bet_ts
     idx = bisect_left(bet_list, bet_ts)
     last_bet_before = bet_list[idx - 1] if idx > 0 else None
@@ -410,8 +635,8 @@ def validate_alert_row(row: pd.Series, bet_cache: Dict[int, List[datetime]], ses
     right_idx = bisect_right(bet_list, horizon_end)
     bet_times = bet_list[idx:right_idx]
 
-    # Session-based check (aligned with trainer/scorer)
-    sessions = session_cache.get(int(player_id), [])
+    # Session-based check keyed by canonical_id (R42 — supports multi-player_id rated players)
+    sessions = session_cache.get(canonical_id, []) if canonical_id is not None else []
     session_id = row.get("session_id")
     matched_session = None
     if pd.notna(session_id):
@@ -428,48 +653,54 @@ def validate_alert_row(row: pd.Series, bet_cache: Dict[int, List[datetime]], ses
 
     if matched_session:
         session_end = matched_session["end"]
+        if pd.isna(session_end):
+            # defensive guard: ongoing session has no recorded end (R59)
+            session_end = bet_ts + timedelta(hours=24)
         next_start = matched_session.get("next_start")
-        gap_to_next = (next_start - session_end).total_seconds() / 60.0 if next_start is not None else 1e9
-        minutes_to_end = (session_end - bet_ts).total_seconds() / 60.0
-        
-        # Exact match within 15 min window -> candidate MATCH
-        # Per policy, we treat this as a candidate and defer finalization
-        # until the extended wait window passes (to allow late arrivals to show up).
-        if gap_to_next >= 30 and 0 <= minutes_to_end <= 15:
-            res_base.update(
-                {
-                    "result": None,  # signal to re-check later
-                    "gap_start": session_end.isoformat(),
-                    "gap_minutes": gap_to_next,
-                    "reason": "PENDING",
-                }
-            )
-            # do not return yet; let the later logic decide after the extended wait
-        
-        # Eventual walkaway (merged as MISS per requirement)
-        elif gap_to_next >= 30 and minutes_to_end > 15:
-            res_base.update(
-                {
-                    "result": False,
-                    "gap_start": session_end.isoformat(),
-                    "gap_minutes": gap_to_next,
-                    "reason": "MISS",
-                }
-            )
-            return res_base
+        # Skip walkaway logic for ongoing sessions (sentinel = far-future end);
+        # otherwise we would wrongly return MISS when there is no next session.
+        is_ongoing = getattr(session_end, "year", 0) >= 2090
+        if not is_ongoing:
+            gap_to_next = (next_start - session_end).total_seconds() / 60.0 if next_start is not None else 1e9
+            minutes_to_end = (session_end - bet_ts).total_seconds() / 60.0
+
+            # Exact match within 15 min window -> candidate MATCH
+            # Per policy, we treat this as a candidate and defer finalization
+            # until the extended wait window passes (to allow late arrivals to show up).
+            if gap_to_next >= 30 and 0 <= minutes_to_end <= 15:
+                res_base.update(
+                    {
+                        "result": None,  # signal to re-check later
+                        "gap_start": session_end.isoformat(),
+                        "gap_minutes": gap_to_next,
+                        "reason": "PENDING",
+                    }
+                )
+                # do not return yet; let the later logic decide after the extended wait
+
+            # Eventual walkaway (merged as MISS per requirement)
+            elif gap_to_next >= 30 and minutes_to_end > 15:
+                res_base.update(
+                    {
+                        "result": False,
+                        "gap_start": session_end.isoformat(),
+                        "gap_minutes": gap_to_next,
+                        "reason": "MISS",
+                    }
+                )
+                return res_base
 
     # Fallback to bet-gap check
     is_true, gap_start, gap_minutes = find_gap_within_window(bet_ts, bet_times, base_start=base_start)
     
     # If a gap was found via bets, we verify if it was within 15m or late (merged to MISS)
     if is_true:
-        minutes_to_gap = (gap_start - bet_ts).total_seconds() / 60.0
         # A detected gap is a candidate MATCH, but per policy we allow a short
         # extended wait window for late-arriving data (arrivals with timestamps
         # in the (15m,45m] interval) before finalizing MATCH.
         res_base.update({
             "result": None,
-            "gap_start": gap_start.isoformat(),
+            "gap_start": gap_start.isoformat() if gap_start is not None else None,
             "gap_minutes": gap_minutes,
             "reason": "PENDING"
         })
@@ -486,10 +717,11 @@ def validate_alert_row(row: pd.Series, bet_cache: Dict[int, List[datetime]], ses
                 (sess.get("start") is not None and sess["start"] > late_threshold and sess["start"] <= horizon_end)
                 for sess in sessions
             )
+            _gs_iso = gap_start.isoformat() if gap_start is not None else None
             if any_late_bet_in_window or any_late_session_in_window:
                 res_base.update({
                     "result": False,
-                    "gap_start": gap_start.isoformat(),
+                    "gap_start": _gs_iso,
                     "gap_minutes": gap_minutes,
                     "reason": "MISS"
                 })
@@ -497,7 +729,7 @@ def validate_alert_row(row: pd.Series, bet_cache: Dict[int, List[datetime]], ses
             else:
                 res_base.update({
                     "result": True,
-                    "gap_start": gap_start.isoformat(),
+                    "gap_start": _gs_iso,
                     "gap_minutes": gap_minutes,
                     "reason": "MATCH"
                 })
@@ -612,6 +844,9 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
 
     existing_results = load_existing_results(conn)
 
+    # Build canonical_id → [player_ids] mapping from all relevant alerts (step 8)
+    cid_to_pids = _build_cid_to_player_ids(alerts)
+
     player_ids = (
         pending.loc[pending["player_id"].notna(), "player_id"]
         .astype(int)
@@ -632,13 +867,19 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
     except Exception:
         pass
 
-    bet_cache = {}
-    session_cache = {}
-    if player_ids:
+    bet_cache: Dict[str, List[datetime]] = {}
+    session_cache: Dict[str, List[Dict]] = {}
+    if player_ids or cid_to_pids:
         fetch_start = effective_ts[pending.index].min() - timedelta(hours=1)
         fetch_end = now_hk
-        bet_cache = fetch_bets_for_players(player_ids, fetch_start, fetch_end)
-        session_cache = fetch_sessions_for_players(player_ids, fetch_start, fetch_end)
+        try:
+            # R41: errors propagate so the cycle aborts rather than producing false MISSes
+            bet_cache = fetch_bets_by_canonical_id(cid_to_pids, fetch_start, fetch_end)
+            # R42: sessions grouped by canonical_id — supports multi-player_id rated players
+            session_cache = fetch_sessions_by_canonical_id(cid_to_pids, fetch_start, fetch_end)
+        except Exception as exc:
+            print(f"[validator] DB fetch error — skipping this validation cycle: {exc}")
+            return
 
     new_processed_ids: List = []
     updated_count = 0
@@ -696,8 +937,8 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
         if alert_dt.tzinfo is None:
             alert_dt = alert_dt.replace(tzinfo=HK_TZ)
 
-        if res["result"] == True or alert_dt <= finality_cutoff:
-            if res["result"] == False:
+        if res["result"] or alert_dt <= finality_cutoff:
+            if not res["result"]:
                 res["reason"] = "MISS"
                 existing_results[key] = res
 
@@ -705,14 +946,49 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
             new_processed_ids.append(row["bet_id"])
 
     if existing_results:
-        final_df = pd.DataFrame(list(existing_results.values()))[VALIDATION_COLUMNS]
+        final_df = pd.DataFrame(list(existing_results.values()))
+        # Ensure all expected columns are present (fill missing with None)
+        for col in VALIDATION_COLUMNS:
+            if col not in final_df.columns:
+                final_df[col] = None
+        final_df = final_df[VALIDATION_COLUMNS]
 
         kpi_df = final_df[~final_df["reason"].isin(IGNORED_REASONS)]
-        finalized_or_old = kpi_df[kpi_df["reason"] != "PENDING"]
+        finalized_or_old = kpi_df[kpi_df["reason"] != "PENDING"].copy()
         total = len(finalized_or_old)
         matches = finalized_or_old["reason"].eq("MATCH").sum()
         precision = (matches / total) if total > 0 else 0
-        print(f"[validator] Cumulative Precision (15m window): {precision:.2%} ({matches}/{total})")
+        print(f"[validator] Cumulative Precision (15m window, alert-level): {precision:.2%} ({matches}/{total})")
+
+        # Visit-level dedup: each (canonical_id, gaming_day) visit counts at most once as TP (step 8)
+        # gaming_day = (bet_ts - GAMING_DAY_START_HOUR hours).date()
+        _gd_start_h = getattr(config, "GAMING_DAY_START_HOUR", 6)
+        try:
+            finalized_or_old["_bet_ts_dt"] = pd.to_datetime(
+                finalized_or_old["bet_ts"], errors="coerce"
+            )
+            finalized_or_old["_gaming_day"] = (
+                finalized_or_old["_bet_ts_dt"] - pd.Timedelta(hours=_gd_start_h)
+            ).dt.date
+            _cid = finalized_or_old["canonical_id"].fillna(
+                finalized_or_old["player_id"].astype(str)
+            )
+            finalized_or_old["_visit_key"] = _cid + "_" + finalized_or_old["_gaming_day"].astype(str)
+
+            # Per visit, take the first MATCH if any (sorted by alert_ts ascending)
+            finalized_or_old_sorted = finalized_or_old.sort_values("alert_ts")
+            visit_matches = (
+                finalized_or_old_sorted[finalized_or_old_sorted["reason"] == "MATCH"]
+                ["_visit_key"].nunique()
+            )
+            visit_total = finalized_or_old_sorted["_visit_key"].nunique()
+            visit_precision = (visit_matches / visit_total) if visit_total > 0 else 0
+            print(
+                f"[validator] Visit-level Precision (canonical_id × gaming_day): "
+                f"{visit_precision:.2%} ({visit_matches}/{visit_total} visits)"
+            )
+        except Exception as exc:
+            print(f"[validator] Visit-level metrics skipped: {exc}")
 
         final_df["alert_ts_dt"] = pd.to_datetime(final_df["alert_ts"])
         final_df = final_df.sort_values("alert_ts_dt").drop(columns=["alert_ts_dt"])
