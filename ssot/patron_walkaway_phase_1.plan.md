@@ -1,6 +1,6 @@
 ---
 name: Patron Walkaway Phase 1
-overview: 依據 SSOT 文件（v9 對齊，整合七輪 Spec Compliance Review、SSOT 大幅改寫及 §9.3 樣本加權 / §10 評估口徑 / §12.1 展示邊界釐清），全面重構 trainer/scorer pipeline，採雙軌特徵工程架構（Featuretools DFS 軌道 A + 向量化手寫軌道 B），visit-level 樣本加權校正 Length Bias，**Bet-level 評估**（Phase 1 簡化，DEC-012；Visit-level / Cooldown 延後待業務校準），封閉 leakage、train-serve parity 破口、Schema 層級錯誤與 edge cases（含 E1–E8、F1–F4、G1–G5、H1–H4、I1–I6），並建立完整的 Testing & Validation 規格，達成 Phase 1 MVP 上線條件。
+overview: 依據 SSOT 文件（v10 對齊，整合七輪 Spec Compliance Review、SSOT 大幅改寫及 §10 評估口徑 / §12.1 展示邊界釐清、DEC-009/010 閾值策略），全面重構 trainer/scorer pipeline，採雙軌特徵工程架構（Featuretools DFS 軌道 A + 向量化手寫軌道 B），**Bet-level 評估**（Phase 1 簡化，DEC-012；Run-level / Cooldown 延後待業務校準），封閉 leakage、train-serve parity 破口、Schema 層級錯誤與 edge cases（含 E1–E8、F1–F4、G1–G5、H1–H4、I1–I6），並建立完整的 Testing & Validation 規格，達成 Phase 1 MVP 上線條件。
 todos:
   - id: config-definitions
     content: Step 0：在 config.py 集中定義所有常數（含 v3 新增 TABLE_HC_WINDOW_MIN / PLACEHOLDER_PLAYER_ID / LOSS_STREAK_PUSH_RESETS / HIST_AVG_BET_CAP；v6 新增 OPTUNA_N_TRIALS）
@@ -18,10 +18,10 @@ todos:
     content: Step 4：新建 features.py（導入雙軌特徵工程；軌道 A EntitySet 兩階段 DFS；軌道 B 向量化手寫 loss_streak 等；嚴格套用 cutoff_time 防漏）
     status: pending
   - id: trainer-refactor
-    content: Step 5：重構 trainer.py（整合新模組；特徵篩選 Feature screening；雙模型；class_weight='balanced' + visit-level sample_weight；Optuna 超參調優；TRN-07 快取驗證）
+    content: Step 5：重構 trainer.py（整合新模組；特徵篩選 Feature screening；雙模型；class_weight='balanced'；Optuna 超參調優；TRN-07 快取驗證）
     status: pending
-  - id: backtester-g1
-    content: Step 6：更新 backtester.py（G1 閾值搜尋改用 Optuna TPE，OPTUNA_N_TRIALS；D4 alert volume = 雙模型合計；Bet-level 評估報告，DEC-012）
+  - id: backtester-threshold
+    content: Step 6：更新 backtester.py（F1 閾值搜尋 Optuna TPE，OPTUNA_N_TRIALS；無 G1 約束；雙模型合計 alert volume；Bet-level 評估報告，DEC-012）
     status: pending
   - id: scorer-refactor
     content: Step 7：重構 scorer.py（匯入 features.py；t_bet FINAL；t_session 禁用 FINAL + FND-01 去重；E3/E4/G2 基礎過濾與回補；G3 穩定排序；D2 三步身份判定；reason codes）
@@ -38,13 +38,18 @@ todos:
 isProject: false
 ---
 
-# Patron Walkaway Phase 1 實作計畫（v9）
+# Patron Walkaway Phase 1 實作計畫（v10）
 
-> v9 依據 SSOT 最新修訂（§9.3 樣本加權、§10.3 評估口徑、§12.1 展示邊界、§14 前端/產品 scope 釐清），在 v8 基礎上新增：
+> **v10** 依據 DEC-009/010 與 SSOT 閾值策略，在 v9 基礎上：
+> - **閾值策略**：移除 G1 約束，改為 **F1 最大化**；backtester 僅搜尋閾值，無 precision/alert volume 門檻。
+> - **軌道 B Phase 1**：`table_hc` 延至 Phase 2；本期啟用 `loss_streak`、`run_boundary`。
+> - **player_profile_daily**：若建置，採 PIT/as-of join 貼到 bet，不納入 EntitySet relationship。
+> - **SESSION_AVAIL_DELAY_MIN**：預設 7 分鐘；FND-12 亦須在建置 player_profile_daily 時套用。
+
+> v9 依據 SSOT 最新修訂（§10.3 評估口徑、§12.1 展示邊界、§14 前端/產品 scope 釐清），在 v8 基礎上：
 >
-> - **Visit-level 樣本加權（SSOT §9.3 — 強制）**：訓練時計算 `1/N_visit` 反比權重並以 `sample_weight` 傳入 LightGBM，校正高頻玩家主導 training loss 的 Length Bias。與 `class_weight='balanced'` 並用（兩者層面不同）。
-> - **評估報告（SSOT §9.3 + §10）**：Phase 1 採 Bet-level（Micro）為主；Visit-level / Macro-by-visit 延後待業務校準（DEC-012）。
-> - **回測去重口徑澄清（SSOT §10.3）**：「每 visit 至多計 1 次 TP」為**離線評估口徑**，不等同線上只發一次 alert。線上通知節流屬產品/前端決策。
+> - **評估報告（SSOT §10）**：Phase 1 採 Bet-level（Micro）為主；Run-level / Macro-by-run 延後待業務校準（DEC-012）。術語統一為 **Run**（bet-derived 連續下注段，gap ≥ RUN_BREAK_MIN 切分；不再使用 Visit，見 DEC-013）。
+> - **回測去重口徑澄清（SSOT §10.3）**：「每 run 至多計 1 次 TP」為**離線評估口徑**，不等同線上只發一次 alert。線上通知節流屬產品/前端決策。
 > - **Reason code 展示邊界（SSOT §12.1）**：模型服務每次推論必須輸出 `reason_codes`/`score`/`margin`；「連續兩輪一致才展示」等 UX 過濾策略屬前端（`trainer/frontend/`）責任，不在模型層實作。
 
 > v8 依據 SSOT 大幅改寫，對齊 §8.2 雙軌特徵工程架構。最重大變更：
@@ -79,11 +84,31 @@ isProject: false
 
 - 身份歸戶：**D2**（Canonical ID；`casino_player_id` 優先）
 - 右截尾：**C1**（Extended pull；至少 X+Y，建議 1 天）
-- Session 特徵策略：**S1**（保守；`table_hc` 改用 `t_bet` 即時計算，禁用 `session_end`）
-- 上線閾值策略：**G1**（Precision ≥ Pmin AND 警報量 ≥ Vmin；雙模型合計）
+- Session 特徵策略：**S1**（保守；**Phase 1 不啟用 `table_hc`**；若啟用則 `table_hc` 改用 `t_bet` 即時計算，禁用 `session_end`）
+- 上線閾值策略：**F1 最大化**（DEC-009, DEC-010）；不設 precision/alert volume 下限約束
 - 模型：Phase 1 = **LightGBM 雙模型**（Rated / Non-rated）
-- 樣本加權：**visit-level 反比權重**（`1/N_visit`，SSOT §9.3；與 `class_weight='balanced'` 並用）
-- 評估口徑：**Bet-level**（SSOT §10；Visit-level 延後見 DEC-012）
+- 評估口徑：**Bet-level**（SSOT §10；Run-level 延後見 DEC-012）。術語統一為 **Run**（DEC-013）
+
+---
+
+## SSOT 章節對應與相關文件
+
+| SSOT 章節 | 對應 Phase 1 步驟 | 備註 |
+|-----------|------------------|------|
+| §2 名詞定義 | Step 0 | WALKAWAY_GAP_MIN, ALERT_HORIZON_MIN, Run 定義 |
+| §4 資料來源與即時可用性 | Step 0, Step 5, Step 7 | BET_AVAIL_DELAY_MIN, SESSION_AVAIL_DELAY_MIN, time_fold |
+| §4.3 Player-level table | Step 4 EntitySet | 完整規格見 `doc/player_profile_daily_spec.md` |
+| §5 關鍵資料品質護欄 | Step 1, Step 2 | FND-01～FND-14, F3, FND-04 不要過濾 status |
+| §6 玩家身份歸戶 D2 | Step 2 identity.py | FND-12 建置時套用；FND-12 亦用於 player_profile_daily |
+| §7 標籤設計 | Step 3 labels.py | C1 延伸拉取，G3 穩定排序 |
+| §8.2 雙軌特徵工程 | Step 4 features.py | 軌道 A DFS + 軌道 B loss_streak/run_boundary；table_hc Phase 2 |
+| §8.3 Session 特徵 S1 | Step 4, Step 7 | 進行中 session 不可見；table_hc Phase 1 不啟用 |
+| §9 建模方法 | Step 5, Step 6 | 雙模型、Optuna、PR-AUC 超參、F1 閾值 |
+| §9.4 Model API Contract | Step 9 | 完整合約見 `doc/model_api_protocol.md` |
+| §10 評估與閾值 | Step 6 | Bet-level；F1 最大化；DEC-009/010 |
+| §12 Remediation / Reason codes | Step 7, Step 10 | TRN-* 對應；reason codes 見 §12.1 |
+
+**相關文件**：`doc/FINDINGS.md`（FND-*）、`doc/player_profile_daily_spec.md`（player-level 欄位規格）、`doc/model_api_protocol.md`（API 合約）、`.cursor/plans/DECISION_LOG.md`（DEC-*）、`schema/GDP_GMWDS_Raw_Schema_Dictionary.md`（欄位字典）
 
 ---
 
@@ -99,10 +124,10 @@ trainer/
 ├── labels.py        ← 新建：C1 防洩漏標籤
 ├── features.py      ← 新建：雙軌特徵工程
 │                              軌道 A：Featuretools EntitySet + DFS + save_features
-│                              軌道 B：loss_streak / run_boundary / table_hc 向量化手寫
+│                              軌道 B Phase 1：loss_streak / run_boundary 向量化手寫；table_hc 延至 Phase 2
 ├── trainer.py       ← 重構：整合新模組，兩階段 DFS，雙模型訓練
 ├── scorer.py        ← 重構：saved_feature_defs（軌道 A）+ features.py（軌道 B），D2 三步身份判定
-├── backtester.py    ← 更新：G1 閾值搜尋（Optuna TPE），alert volume = 雙模型合計
+├── backtester.py    ← 更新：F1 閾值搜尋（Optuna TPE），無 G1 約束；alert volume = 雙模型合計
 ├── validator.py     ← 更新：canonical_id + 45min horizon
 └── api_server.py    ← 更新：Model API Contract
 ```
@@ -124,23 +149,21 @@ trainer/
 **資料可用性延遲**
 
 - `BET_AVAIL_DELAY_MIN = 1`（`t_bet`；SSOT §4.2）
-- `SESSION_AVAIL_DELAY_MIN = 15`（`t_session`；採保守值 +15min，SSOT §4.2 vs §2.1 衝突的解法）
+- `SESSION_AVAIL_DELAY_MIN = 7`（`t_session`；SSOT §2.1/§4.2；若需更保守可設為 15）
 
 **Run 邊界**
 
 - `RUN_BREAK_MIN = WALKAWAY_GAP_MIN`（= 30 分鐘）
 
-**Gaming Day / Visit 去重（v4：G4 修正）**
+**Gaming Day 與 Run 邊界（v4：G4 修正）**
 
-- **主流程以資料表 `gaming_day` 欄位為準**：回測/去重的 visit key 使用 `(canonical_id, gaming_day)`。
+- **主流程以資料表 `gaming_day` 欄位為準**：回測 dedup 可依實作階段使用 `(canonical_id, gaming_day)` 或 `(canonical_id, run_id)`。術語統一見 DEC-013。
 - `GAMING_DAY_START_HOUR = 6` 僅保留為**備援參數**（敏感性分析或缺少 `gaming_day` 欄位的資料源才啟用），Phase 1 不依賴自算 gaming day。
 
-**G1 閾值策略**
+**閾值搜尋（DEC-009, DEC-010：F1 最大化，無 G1 約束）**
 
-- `G1_PRECISION_MIN = 0.70`（暫定）
-- `G1_ALERT_VOLUME_MIN_PER_HOUR = 5`（暫定）
-- `G1_FBETA = 0.5`（β < 1，精準度優先）
 - `OPTUNA_N_TRIALS = 300`（I6：Optuna TPE 搜尋次數；300 次在 2D 空間通常足以收斂）
+- **廢棄（回退備註）**：若未來需恢復約束式 gate，可還原 `G1_PRECISION_MIN`、`G1_ALERT_VOLUME_MIN_PER_HOUR`、`G1_FBETA`；見 DEC-009/010 回退說明
 
 **v3 新增常數（D1/E2/F2/F4 修正）**
 
@@ -176,7 +199,7 @@ trainer/
     - 最終只保留 `effective_player_id IS NOT NULL AND effective_player_id != PLACEHOLDER_PLAYER_ID`
 - **F3（低，v3 新增 — 軟刪除欄位）**：`t_session` 查詢加入 `is_deleted = 0 AND is_canceled = 0`；這兩個欄位存在於 schema 但 v2 計畫未使用。
 - **FND-03**：`casino_player_id` 清洗使用 `CASINO_PLAYER_ID_CLEAN_SQL`（from config）
-- **FND-04（E7 修正 — NULL-safe）**：條件改為 `COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0`；原版 NULL-unsafe，當欄位為 NULL 時過濾不生效。
+- **FND-04（E7 修正 — NULL-safe；對齊 SSOT §5）**：**不要**過濾 `status = 'SUCCESS'`。保留所有非人工且 `COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0` 的 Session；原版 NULL-unsafe，且盲目過濾 status 會蒸發約 17% 真實流水（見 `doc/FINDINGS.md`）。
 - **FND-06**：全面移除 `bet_reconciled_at`（100% 無效值）
 - **FND-08**：移除 `bonus`, `tip_amount`, `increment_wager`, `payout_value`（100% NULL；這也是 TRN-09/E2 修正的根本原因）
 - **FND-09**：禁用 `is_known_player`；改為 `casino_player_id IS NOT NULL`
@@ -211,7 +234,7 @@ WHERE rn = 1
   AND {CASINO_PLAYER_ID_CLEAN_SQL} IS NOT NULL
 ```
 
-**FND-12 假帳號排除（E6 修正；v6：I1 修正欄位名稱、I2 修正加入 FND-01 去重 CTE）**：`session_cnt` / `total_games` 是聚合欄位，需先聚合再過濾；`num_games_with_wager`（有實際下注的局數）為 Schema 內實際欄位，需 COALESCE 因其為 Nullable：
+**FND-12 假帳號排除（E6 修正；v6：I1 修正欄位名稱、I2 修正加入 FND-01 去重 CTE；v10：應用時機）**：此排除須在建置 Canonical mapping（identity.py）與 **player_profile_daily**（若啟用）時一併套用。`session_cnt` / `total_games` 是聚合欄位，需先聚合再過濾；`num_games_with_wager`（有實際下注的局數）為 Schema 內實際欄位，需 COALESCE 因其為 Nullable：
 
 ```sql
 -- 第二步：識別假帳號（先 FND-01 去重，再聚合）
@@ -269,10 +292,11 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 
 #### A. 構建 EntitySet 與基元 (Primitives)
 
-- **實體定義**：
+- **實體定義**（對齊 SSOT §8.2）：
   - `t_bet`（target entity）：以 `bet_id` 為 index，`payout_complete_dtm` 為 time_index。
-  - `t_session`（歷史輪廓）：以 `session_id` 為 index，`COALESCE(session_end_dtm, lud_dtm)` 為 time_index。
-  - `player`（跨日/跨桌輪廓）：以歸戶後的 `canonical_id` 為 index。提供跨 session 聚合的軸心（見 Step 2 / SSOT §6.2）。
+  - `t_session`（歷史輪廓）：以 `session_id` 為 index，`COALESCE(session_end_dtm, lud_dtm)` 為 time_index；僅納入 `available_time <= cutoff_time` 的已可得 sessions。
+  - `player`（跨日/跨桌輪廓，Phase 1）：以 `canonical_id` 為 index；由 `t_session` 依 `canonical_id` 聚合作為跨 session 聚合軸心。
+  - **player_profile_daily**（Phase 1 後延伸）：行為輪廓快照（RFM 等），以 **PIT/as-of join**（`snapshot_dtm <= bet_time` 最新快照）將欄位貼到 bet，**不**在 EntitySet 內宣告 relationship；見 SSOT §4.3、§8.2；**完整欄位規格與特徵取捨理由**見 `doc/player_profile_daily_spec.md`。
   - **關係**：
     - `t_bet.session_id` → `t_session.session_id`（many-to-one）。`table_id` 僅為共有欄位，不作為 EntitySet 父子關係鍵。
     - `t_session.canonical_id` → `player.canonical_id`（many-to-one）。
@@ -291,7 +315,7 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 | ------------------------------------------ | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `loss_streak`                              | 需要「遇 WIN 重置、遇 PUSH 條件不重置」的序列狀態機，無對應內建 Primitive                           | 向量化 Pandas/Polars；`status='LOSE'`→+1，`status='WIN'`→重置，`PUSH` 依 `LOSS_STREAK_PUSH_RESETS`（F4）；嚴格遵守同一 cutoff_time（TRN-09 / E2） |
 | `run_boundary` / `minutes_since_run_start` | 需要「相鄰 bet 間距 ≥ `RUN_BREAK_MIN` → 新 run 開始」的序列依賴切割                         | 同上（B2 修正）                                                                                                                     |
-| `table_hc`（S1）                             | 需跨玩家、以 `table_id` 為軸心的滾動聚合；若在 EntitySet 中建 table 實體，每個 cutoff 觸發全桌掃描，效能極差 | 同上；過去 `TABLE_HC_WINDOW_MIN` 分鐘內同桌不重複玩家數（from config）；扣除 `BET_AVAIL_DELAY_MIN` 防漏（D1/A2）                                       |
+| `table_hc`（S1）                             | 需跨玩家、以 `table_id` 為軸心的滾動聚合；若在 EntitySet 中建 table 實體，每個 cutoff 觸發全桌掃描，效能極差 | 同上；**Phase 1 不啟用**，延至 Phase 2；可實作於 `features.py` 但 scorer/trainer 不呼叫 |
 
 
 **手寫特徵防漏與 Parity 要求**：
@@ -321,12 +345,13 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 
 1. **第一階段**：依單變量與目標關聯（如 mutual information、變異數門檻）及冗餘剔除（如高相關、VIF）縮減候選集。
 2. **第二階段（可選）**：在**訓練集**上以輕量 LightGBM 計算 feature importance 或 SHAP，取 top-K。**嚴格限制在 Train 集，不得使用 valid/test**，以符合防洩漏原則（SSOT §8.2.C）。
-3. 最終通過篩選的特徵清單（軌道 A 篩選後 + 軌道 B 全部）即為 `feature_list.json`，訓練與推論端僅計算此清單內特徵。
+3. 最終通過篩選的特徵清單（軌道 A 篩選後 + 軌道 B 本期啟用：`loss_streak`、`run_boundary`；不含 `table_hc`）即為 `feature_list.json`，訓練與推論端僅計算此清單內特徵。
 
 #### E. 防洩漏與 Cutoff Time
 
 - 訓練與推論計算特徵時，必須統一依賴 Featuretools 的 `cutoff_time` 參數，嚴格切斷該觀測點時間之後的所有資料。
 - **E 類特徵修正（A1/F2/G5）**：使用 `t_session` 資料作為聚合基礎時，必須確保 `session_avail_dtm <= cutoff_time`，並對 `avg_bet` 等 outlier 進行事前 winsorization（row-level cap）再餵給工具聚合。
+- **進行中 Session 不可見**（SSOT §8.3）：因 `t_session` 須滿足 `available_time <= cutoff_time`，當前仍在進行中的 session 對該 session 內當下的 bet 而言其 session-level 特徵**不可見**；此為設計護欄，非缺陷。
 - **H4（v5 補充 — 數值防呆）**：在餵入 EntitySet 前，對數值欄位（如 `wager`）做 `fillna(0)` 防呆。
 
 #### 特徵組對應（Rated vs Non-rated）
@@ -345,52 +370,36 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
   - **訓練/開發允許離線 Parquet 作為資料源**：若已將 ClickHouse 的完整表匯出到本機（例如 `.data/` 目錄中的 Parquet），trainer 可改為「讀取 Parquet（或經 DuckDB 掃描）」取代逐窗查 ClickHouse，以加速迭代；但仍必須套用完全相同的 DQ/去重/available_time 規則（Step 1 / SSOT §4.2 / §5）以及相同的時間窗口邊界語義。Production（線上 scorer/validator）資料來源仍以 ClickHouse 為準。
 - 依序呼叫 `identity.py`（`cutoff_dtm = training_window_end`）→ 對**各時間窗口**：`labels.py`（C1）→ `features.py`（兩階段 DFS 軌道 A + 軌道 B 向量化手寫，傳入該窗之 cutoff 時間點）→ 特徵篩選（DFS 探索後執行一次，見 Step 4 §D）。
 - **雙模型分離**（SSOT §9.1）：Rated / Non-rated 各自訓練
-- **演算法與超參調優**（SSOT §9.2）：使用 LightGBM（`class_weight='balanced'`）。必須使用 **Optuna (TPE Sampler)** 在 validation set 上進行超參搜尋（如 `n_estimators`, `learning_rate`, `max_depth` 等），目標為最佳化 F-beta 或 PR-AUC。Phase 1 不使用 AutoML 框架。
-- **Visit-level 樣本加權（SSOT §9.3 — 強制）**：
-  - 對每個觀測點計算 `sample_weight = 1 / N_visit`，其中 `N_visit` 為同一 visit（`canonical_id` × `gaming_day`）在**訓練集**內的觀測點數（取樣後計算）。
-  - 以 `model.fit(..., sample_weight=weights)` 傳入 LightGBM。
-  - **與 `class_weight='balanced'` 並用**：`class_weight` 處理正/負例標籤不平衡；`sample_weight` 處理跨玩家個體頻率不平衡（Length Bias）。兩者層面不同，可同時套用。
-  - **防洩漏**：`sample_weight` 僅使用 training window 內觀測點數，不可混入 valid/test。
-  - **取樣一致性**：若 §4.3 下採樣已執行，`N_visit` 以取樣**後**的實際觀測點數為準。
+- **演算法與超參調優**（SSOT §9.2）：使用 LightGBM（`class_weight='balanced'`）。必須使用 **Optuna (TPE Sampler)** 在 validation set 上進行超參搜尋（如 `n_estimators`, `learning_rate`, `max_depth` 等），目標為最佳化 **PR-AUC**。閾值則以 **F1 最大化**（Step 6 backtester）選出。
 - **時間切割**：Train 70% / Valid 15% / Test 15%，嚴格按 `payout_complete_dtm` 排序
 - **TRN-07 快取驗證**：快取 key = `(window_start, window_end, data_hash)`；不符時強制重算
 - **輸出（原子單位，版本化交付）**：`rated_model.pkl`、`nonrated_model.pkl`、`**saved_feature_defs`（軌道 A 計算圖）**、`features.py`（軌道 B）、`feature_list.json`、reason code 映射表、`model_version`（格式：`YYYYMMDD-HHMMSS-{git_short_hash}`）。任何組件版本不匹配時，服務端必須拒絕載入並回報錯誤。
 
 ---
 
-### Step 6 — 閾值選擇與回測（`[trainer/backtester.py](trainer/backtester.py)`，G1）
+### Step 6 — 閾值選擇與回測（`[trainer/backtester.py](trainer/backtester.py)`）
 
-**G1 閾值搜尋**（TRN-11 修正；v6：I4/I6 改用 Optuna TPE 取代網格搜尋）：
+**F1 閾值搜尋**（TRN-11 修正；v6：I4/I6 Optuna TPE；v10：移除 G1 約束，DEC-009/010）：
 
-**雙模型閾值搜尋策略（I6 — Optuna TPE）**：Rated 與 Non-rated 各有獨立閾值（`rated_threshold`、`nonrated_threshold`），以 Optuna `TPESampler` 在二維連續空間高效搜尋（取代 99×99 窮舉網格）：
+**雙模型閾值搜尋策略（I6 — Optuna TPE）**：Rated 與 Non-rated 各有獨立閾值（`rated_threshold`、`nonrated_threshold`），以 Optuna `TPESampler` 在二維連續空間高效搜尋，**objective = F1 最大化**（無 precision/alert volume 下限約束）：
 
 ```python
+import numpy as np
 import optuna
-from config import (G1_PRECISION_MIN, G1_ALERT_VOLUME_MIN_PER_HOUR,
-                    G1_FBETA, OPTUNA_N_TRIALS)
+from sklearn.metrics import f1_score
+from config import OPTUNA_N_TRIALS
 
 def objective(trial):
     rt = trial.suggest_float("rated_threshold", 0.01, 0.99)
     nt = trial.suggest_float("nonrated_threshold", 0.01, 0.99)
 
-    rated_alerts   = (rated_scores_val >= rt).sum()
-    nonrated_alerts = (nonrated_scores_val >= nt).sum()
-    total_alerts_per_hour = (rated_alerts + nonrated_alerts) / val_hours  # D4
+    rated_pred   = (rated_scores_val   >= rt).astype(int)
+    nonrated_pred = (nonrated_scores_val >= nt).astype(int)
 
-    rated_prec   = precision_score(y_rated_val,   rated_scores_val   >= rt)
-    nonrated_prec = precision_score(y_nonrated_val, nonrated_scores_val >= nt)
-
-    # 不符合約束 → 回傳 -inf 讓 Optuna 自動跳過
-    if rated_prec < G1_PRECISION_MIN or nonrated_prec < G1_PRECISION_MIN:
-        return float("-inf")
-    if total_alerts_per_hour < G1_ALERT_VOLUME_MIN_PER_HOUR:
-        return float("-inf")
-
-    # 目標：最大化整體 F-beta（合計 TP / 合計 alerts）
-    return fbeta_score_combined(y_rated_val, y_nonrated_val,
-                                rated_scores_val >= rt,
-                                nonrated_scores_val >= nt,
-                                beta=G1_FBETA)
+    # 目標：最大化 F1（合併 rated + nonrated 的預測與標籤）
+    y_all = np.concatenate([y_rated_val, y_nonrated_val])
+    pred_all = np.concatenate([rated_pred, nonrated_pred])
+    return f1_score(y_all, pred_all, zero_division=0)
 
 study = optuna.create_study(direction="maximize",
                             sampler=optuna.samplers.TPESampler(seed=42))
@@ -398,24 +407,21 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
                callbacks=[optuna.study.MaxTrialsCallback(OPTUNA_N_TRIALS)])
 ```
 
-- `OPTUNA_N_TRIALS = 300`（預設；可從 config 調整，300 次 TPE 在 2D 空間通常已足夠收斂）
-- 無可行解（所有 trial 皆回傳 `-inf`）→ 記錄並回報，降低 `G1_PRECISION_MIN` 後重試
+- `OPTUNA_N_TRIALS = 300`（預設；可從 config 調整）
 - 閾值只在 validation set 選定；test set 僅用於最終報告
 - Optuna study 結果（`study.trials_dataframe()`）與最佳組合一同輸出，供後續分析
 
 **回測規則**：
 
-- **G4（低，v4 新增）**：Visit 去重以表內 `gaming_day` 欄位為準。
-  - 去重 key：`(canonical_id, gaming_day)`
-  - `GAMING_DAY_START_HOUR` 僅作備援，不作主流程口徑
-- **回測評估口徑（SSOT §10.3）**：回測指標計算時，對同一 visit 至多計入 **1 次 True Positive**，以避免高頻玩家因大量觀測點膨脹精準度指標。
-  > **重要區分**：此去重僅是**離線評估口徑**，**不**意味著線上推論只對每位玩家每次造訪輸出一個 alert。線上通知節流屬產品/前端設計決策，不在模型規格範圍內。
+- **G4（低，v4 新增）**：回測 dedup 可依實作使用 `(canonical_id, gaming_day)` 或 `(canonical_id, run_id)`。`gaming_day` 以表內欄位為準；`GAMING_DAY_START_HOUR` 僅作備援。
+- **回測評估口徑（SSOT §10.3）**：回測指標計算時，對同一 run 至多計入 **1 次 True Positive**，以避免高頻玩家因大量觀測點膨脹精準度指標。
+  > **重要區分**：此去重僅是**離線評估口徑**，**不**意味著線上推論只對每位玩家每個 run 輸出一個 alert。線上通知節流屬產品/前端設計決策，不在模型規格範圍內。
 - 嚴格時序處理，不 look-ahead
 
 **輸出**（valid + test 各一份）：
 
 - **Micro（以觀測點為單位）**：Precision / Recall / PR-AUC / F-beta / 每小時警報量（P5–P95）
-- **Macro-by-visit（Future TODO）**：以 visit 為單位取平均；Phase 1 不採用，延後待業務校準（DEC-012）。
+- **Macro-by-run（Future TODO）**：以 run 為單位取平均；Phase 1 不採用，延後待業務校準（DEC-012）。
 - `rated_threshold` / `nonrated_threshold`
 
 ---
@@ -424,7 +430,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 
 - **移除**所有獨立特徵計算，改為：
   - **軌道 A**：以 `featuretools.calculate_feature_matrix(saved_feature_defs, entityset)` 傳入當前輪詢時間為 `cutoff_time`，使用與訓練期**相同的** saved feature definitions 計算特徵。
-  - **軌道 B**：匯入 `features.py` 中的向量化手寫函數（`loss_streak`、`run_boundary`、`table_hc`）。
+  - **軌道 B**：匯入 `features.py` 中的向量化手寫函數（`loss_streak`、`run_boundary`；`table_hc` Phase 1 不啟用）。
   - 確保 train-serve parity（TRN-05/07/08 修正）。
 - **G3（中，v4 新增）**：推論端處理 bet 流必須使用穩定排序 `ORDER BY payout_complete_dtm ASC, bet_id ASC`。
 - `t_bet` 查詢可使用 `FINAL`（E5）；`t_session` 禁用 `FINAL`（G1），並必須套用 FND-01 去重後再 join。
@@ -437,7 +443,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
   - `is_rated_obs = (resolved_card_id IS NOT NULL)`。
   - `is_rated_obs = True` → 使用 Rated model（開放存取包含歷史關聯的 EntitySet 特徵）；否則 → 使用 Non-rated model（限制 EntitySet 僅能使用 `t_bet` 內部特徵）。
   - 所有輸出需記錄 `is_rated_obs` 與 `resolved_card_id`（若有）以便稽核。
-- **Reason code 輸出**（§12.1）：SHAP top-k → 4 個固定 reason codes；版本化映射表（隨 `model_version` 管理）。
+- **Reason code 輸出**（SSOT §12.1）：SHAP top-k → 4 個固定 reason codes（`BETTING_PACE_DROPPING`、`GAP_INCREASING`、`LOSS_STREAK`、`LOW_ACTIVITY_RECENTLY`）；版本化映射表（隨 `model_version` 管理）。
   - 模型服務（`/score` 端點）**每次推論必須輸出** `reason_codes`、`score`、`margin`、`model_version`、`scored_at`，不在模型層做「連續輪詢一致才輸出」的過濾。
   - **展示穩定性屬前端/產品責任**：是否連續兩輪一致才對 Host 展示、或設通知冷卻期，由 `trainer/frontend/` 及 UX 邏輯決定，不在本模型工程規格範圍內。
 
@@ -455,10 +461,11 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 
 ### Step 9 — Model Service API（`[trainer/api_server.py](trainer/api_server.py)`）
 
+- 對齊 SSOT §9.4；**完整 API 合約與 schema 詳見** `doc/model_api_protocol.md`
 - `POST /score`：接收 bet-level 特徵列（上限 10,000）→ 3 秒內回傳；stateless & idempotent
 - `GET /health`：`{"status": "ok", "model_version": str}`
-- `GET /model_info`：從 `feature_list.json` 動態讀取（非硬編碼）
-- 缺欄位或多餘欄位一律 422，不默默補齊（SSOT §9.4）
+- `GET /model_info`：從 `feature_list.json` 動態讀取（非硬編碼）；特徵清單隨雙軌架構動態產生，非永久固定合約
+- 缺欄位或多餘欄位一律 422，不默默補齊
 
 ---
 
@@ -494,15 +501,10 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
   - **H4（raw data 證據）**：對「本機匯出的 `t_bet` Parquet」（例如 `.data/` 內對應檔）讀取 parquet 統計或抽樣，驗證 `wager_null_pct == 0`；並在訓練/推論各自記錄 `wager_null_pct` 作為漂移監控（若 >0 觸發告警與 feature contract 更新）
 - **Model Routing 測試**
   - **H3**：驗證 `is_rated_obs` 的路由條件不依賴 `is_known_player`，且 Rated/Non-rated 的 EntitySet 使用正確（Non-rated 限制存取歷史關聯路徑）。
-- **Sample Weight 測試（SSOT §9.3）**
-  - 驗證每個 visit（`canonical_id` × `gaming_day`）內所有觀測點的 `sample_weight` 值一致，且等於 `1 / N_visit`。
-  - 驗證 `sample_weight` 僅使用 training window 內觀測點數計算，不混入 valid/test 資料。
-  - 若 §4.3 下採樣已執行，驗證 `N_visit` 以取樣後實際觀測點數為準。
-  - 驗證 `sample_weight` 全為正值且無 NaN/Inf。
-- **雙口徑評估測試（SSOT §9.3 + §10.3）**
-  - 驗證評估報告以 Bet-level（Micro）為主；Macro-by-visit 延後（DEC-012）。
-  - 驗證回測中同一 visit 至多計入 1 次 True Positive（離線評估口徑去重）。
-  - （Future TODO）驗證 Macro-by-visit 的計算邏輯：先對每個 visit 算 precision/recall，再取平均。
+- **雙口徑評估測試（SSOT §10.3）**
+  - 驗證評估報告以 Bet-level（Micro）為主；Macro-by-run 延後（DEC-012）。
+  - 驗證回測中同一 run 至多計入 1 次 True Positive（離線評估口徑去重）。
+  - （Future TODO）驗證 Macro-by-run 的計算邏輯：先對每個 run 算 precision/recall，再取平均。
 
 ---
 
@@ -519,7 +521,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 | **TRN-07** | 快取無窗口一致性                    | Step 5、Step 7       | 無新增                                                      |
 | **TRN-08** | Rolling window 邊界不一致        | Step 4、Step 7       | 無新增                                                      |
 | **TRN-09** | `loss_streak` 字串比較永為 0      | Step 4 B 類          | **E2 修正**：改用 `status='LOSE'`；E2/F4 PUSH 語義               |
-| **TRN-11** | 閾值過度保守，幾乎無警報                | Step 6（G1）          | **D4 修正**：alert volume = 雙模型合計                           |
+| **TRN-11** | 閾值過度保守，幾乎無警報                | Step 6（F1 閾值搜尋）   | **D4**：alert volume 雙模型合計；**v10**：移除 G1 約束，改 F1 最大化           |
 
 
 ---
@@ -535,11 +537,11 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 | B2        | 中     | Parity             | §8.2.B                                             | Step 0/4：`RUN_BREAK_MIN` + 軌道 B 向量化手寫                              |
 | B3        | 低     | 特徵遺漏               | §9.1                                               | Step 4：Non-rated 亦包含時間週期等轉換特徵                                      |
 | C1        | 低     | SSOT 含糊            | §7.2                                               | Step 3：明確「至少 X+Y，建議 1 天」                                           |
-| C2        | 資訊性   | SSOT 不一致           | §2.1 vs §4.2                                       | Step 0：`SESSION_AVAIL_DELAY_MIN = 15` + rationale                  |
-| C3        | 中     | 定義缺口               | §2.2, §10.3                                        | Step 0/6/8：Visit 去重改用 `gaming_day` 欄位（G4）                          |
+| C2        | 資訊性   | SSOT 不一致           | §2.1 vs §4.2                                       | Step 0：`SESSION_AVAIL_DELAY_MIN = 7`（可選 15）；與 §2.1/§4.2 對齊     |
+| C3        | 中     | 定義缺口               | §2.2, §10.3                                        | Step 0/6/8：回測 dedup 可用 `gaming_day` 或 `run_id`（G4）；術語統一為 Run（DEC-013） |
 | D1        | 低     | 常數遺漏               | S1                                                 | Step 0：`TABLE_HC_WINDOW_MIN`                                       |
 | D3        | 低     | 已知限制               | D2                                                 | Step 2：備忘；Phase 2 再實作 PIT-correct mapping                          |
-| D4        | 中     | 定義缺口               | §10.2, G1                                          | Step 6：alert volume = 雙模型合計                                        |
+| D4        | 中     | 定義缺口               | §10.2                                              | Step 6：F1 閾值搜尋；alert volume = 雙模型合計（報告用）                        |
 | **E1**    | **高** | **Schema 錯誤**      | `t_bet` DDL                                        | Step 1：移除 `t_bet.is_manual` 過濾                                     |
 | **E2**    | **高** | **邏輯錯誤**           | FND-08, `t_bet.status`                             | Step 4 B 類：`loss_streak` 改用 `status='LOSE'`                        |
 | **E3**    | 中     | Nullable 欄位        | `t_bet.payout_complete_dtm`                        | Step 1/4：基礎過濾加 `IS NOT NULL`                                       |
@@ -563,8 +565,8 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 | **I1**    | 中     | SQL 欄位名稱錯誤         | `t_session.num_games_with_wager`（DDL）              | Step 2：FND-12 SQL 改用 `SUM(COALESCE(num_games_with_wager, 0)) <= 1` |
 | **I2**    | 中     | SQL 範例缺 FND-01 CTE | Step 2 identity.py 說明                              | Step 2：兩段 SQL 改為先建 deduped CTE（ROW_NUMBER 去重）再查詢                   |
 | **I3**    | 低     | Checklist 文字過時     | TRN-* Remediation Checklist TRN-01                 | Checklist：TRN-01 v3 更新欄改為「禁用 FINAL（G1）」描述                          |
-| **I4**    | 低     | 閾值搜尋策略缺失           | Step 6 G1，雙模型（§9.1）                                | Step 6：首次明確二維搜尋需求（後由 I6 升級為 Optuna）                                |
-| **I6**    | 低     | 網格搜尋效率不足           | Step 6 G1，雙模型閾值搜尋                                  | Step 0/6：改用 Optuna TPE；新增 `OPTUNA_N_TRIALS` 常數                     |
+| **I4**    | 低     | 閾值搜尋策略缺失           | Step 6，雙模型（§9.1）                                    | Step 6：二維搜尋（I6 Optuna TPE）；v10 改 F1 最大化                           |
+| **I6**    | 低     | 網格搜尋效率不足           | Step 6，雙模型閾值搜尋                                      | Step 0/6：改用 Optuna TPE；`OPTUNA_N_TRIALS`；v10 改 F1 objective             |
 
 
 ---
@@ -623,13 +625,10 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 
 ## 第九輪 SSOT 對齊（v9）— 論證/理由（供後續 review 引用）
 
-- **Visit-level 樣本加權（SSOT §9.3）**：
-  - **問題根源**：以「每筆下注為觀測點」時，高頻玩家貢獻遠多於短暫停留玩家的觀測點，導致 LightGBM 的 loss 被高頻玩家行為主導（Length Bias / Frequency Selection Bias）。現有 `trainer.py` 僅使用 `class_weight='balanced'` 處理標籤不平衡，未處理跨玩家頻率不平衡。
-  - **風險機制**：模型對偶爾造訪或短暫停留的玩家泛化不足；precision/recall 指標被少數高頻玩家表現主導，不反映真實全場效果。
-  - **修正原則**：訓練時計算 `1/N_visit`（visit = `canonical_id` × `gaming_day`）反比權重，以 `sample_weight` 傳入 `model.fit()`。與 `class_weight='balanced'` 並用（作用層面不同）。取樣後計算 `N_visit` 以確保語義一致。
-- **雙口徑評估報告（SSOT §9.3 + §10.3）**：
-  - **問題根源**：若僅報告 Micro 指標（以 bet 為單位），高頻玩家的大量觀測點會主導指標數值，掩蓋模型對低頻/短暫玩家的真實表現。
-  - **修正原則**：Phase 1 以 Bet-level（Micro）報告為主；Macro-by-visit 延後（DEC-012）。
+- **術語與樣本加權（DEC-013）**：
+  - **決策**：統一使用 **Run**（bet-derived 連續下注段；gap ≥ RUN_BREAK_MIN 切分），不再使用 Visit。 Phase 1 不採用 visit-level 樣本加權（`1/N_visit`），僅使用 `class_weight='balanced'`。
+- **雙口徑評估報告（SSOT §10.3）**：
+  - **修正原則**：Phase 1 以 Bet-level（Micro）報告為主；Macro-by-run 延後（DEC-012）。
 - **回測去重口徑澄清（SSOT §10.3）**：
   - **問題根源**：原計畫「套用每次造訪最多 1 個警報的去重邏輯」的用語模糊，可能被誤讀為線上推論也只對每個賭客每次造訪發一個 alert。
   - **修正原則**：明確標註此去重僅為**離線評估口徑**（避免指標膨脹），不代表線上推論需節流。線上通知頻率屬產品/前端決策。
@@ -654,13 +653,13 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
   - **風險機制**：Checklist 是工程師對照實作的文件；矛盾文字會讓人誤以為 `t_session` 要加 `FINAL`，與 G1 決策衝突。
   - **修正原則**：統一更正為 G1 決策的描述，避免文件內部矛盾。
 - **I4（雙模型二維閾值搜尋，初版）**：
-  - **事實依據**：Phase 1 使用 Rated / Non-rated 雙模型，各自輸出獨立分數；D4 約束以兩模型合計警報量為準。
-  - **風險機制**：若兩個閾值分別獨立選定（例如各自掃描 99 個值），可能出現 rated 模型過濾太嚴或太鬆，使合計警報量不符合 `G1_ALERT_VOLUME_MIN_PER_HOUR` 約束；或 Precision 均達標但合計量仍不足。
+  - **事實依據**：Phase 1 使用 Rated / Non-rated 雙模型，各自輸出獨立分數；D4 的 **alert volume 口徑**以兩模型合計為準（報告/監控用）。
+  - **風險機制**：若兩個閾值分別獨立選定（例如各自掃描 99 個值），可能出現 rated 模型過濾太嚴或太鬆，導致合計警報量與 precision/recall 指標出現不必要的偏移；且最佳組合需要在 2D 空間聯合搜尋才穩定。
   - **修正原則（已由 I6 取代）**：首次確立需在二維空間聯合搜尋；具體方法見 I6。
 - **I6（Optuna TPE 取代網格搜尋）**：
   - **事實依據**：二維網格（99×99 = 9,801 次）在每次 trial 都需計算整個 validation set 的 precision / recall 時，計算量隨模型複雜度線性成長；且網格搜尋對連續空間的覆蓋率不如隨機或貝葉斯採樣。
   - **風險機制**：網格搜尋步長固定（0.01），可能在最優解附近解析度不足；且若未來引入更多閾值參數（例如 per-table 閾值），網格複雜度會指數爆炸。
-  - **修正原則**：採用 Optuna `TPESampler`，以歷史 trial 結果建立代理模型，智慧地引導後續採樣方向。不可行組合（違反約束）回傳 `-inf`，讓 Optuna 自動降低對此區域的採樣機率。`OPTUNA_N_TRIALS=300` 在 2D 空間通常已足夠收斂，且未來擴充參數時只需增加 `n_trials` 而非重新設計搜尋架構。
+  - **修正原則**：採用 Optuna `TPESampler`，以歷史 trial 結果建立代理模型，智慧地引導後續採樣方向；**v10 以 F1 最大化為 objective，無 gate 約束**。`OPTUNA_N_TRIALS=300` 在 2D 空間通常已足夠收斂，且未來擴充參數時只需增加 `n_trials` 而非重新設計搜尋架構。（若未來恢復約束式 gate，才需要將不可行 trial 回傳 `-inf`。）
 
 ---
 
@@ -678,13 +677,12 @@ Phase 1 上線後，以下閉環必須升格為產品生命週期的一部分：
 
 ### 業務端協商未決（SSOT §13）
 
-1. **目標函數協商（未決）**：具體的 Precision/Recall 權衡底線為何？每班公關可處理多少警報（目標警報量範圍）？
-2. **Phase 1 Gate 選擇（未決）**：在 SSOT §10.2 的策略選項中，選定哪一個 gate 作為 Phase 1 的上線標準（建議預設採 **G1**，除非業務端明確要求其他 gate）。
+1. **營運校準（未決；供 Phase 2 / 回退 gate 使用）**：具體的 Precision/Recall 權衡底線為何？每班公關可處理多少警報（目標警報量範圍）？
+2. **Phase 1 閾值策略（v10 已決）**：採 **F1 最大化**、無 gate 約束（DEC-009/010）；`G1_PRECISION_MIN`、`G1_ALERT_VOLUME_MIN_PER_HOUR` 已廢棄。
 
 ### 實作待確認參數（需 EDA 或業務確認後才可落地 Step 6）
 
-- `G1_PRECISION_MIN`（暫定 0.70）
-- `G1_ALERT_VOLUME_MIN_PER_HOUR`（暫定 5）
+- ~~`G1_PRECISION_MIN`~~、~~`G1_ALERT_VOLUME_MIN_PER_HOUR`~~（v10 廢棄；見 DEC-009/010 回退備註）
 - `TABLE_HC_WINDOW_MIN`（暫定 30 分鐘）
 - `HIST_AVG_BET_CAP`（暫定 500,000；需 EDA 驗證分位數）
 - `LOSS_STREAK_PUSH_RESETS`（暫定 False；需業務規則確認）
@@ -693,8 +691,10 @@ Phase 1 上線後，以下閉環必須升格為產品生命週期的一部分：
 
 ## 本計畫不涵蓋（Phase 2+ 事項）
 
+- **player_profile_daily 建置**：Phase 1 後延伸；若建置需依 `doc/player_profile_daily_spec.md` 與 SSOT §4.3
 - PIT-correct D2 mapping（D3 備忘）
 - `t_game` 牌局氛圍特徵（FND-14）
+- `table_hc` 啟用（軌道 B 可實作但 Phase 1 不呼叫）
 - 序列嵌入 / SSL 預訓練（SSOT §8.4 Phase 2–3 策略）
 - AutoML / FLAML 集成探索（SSOT §9.2 Phase 2+）
 - 跨桌造訪建模

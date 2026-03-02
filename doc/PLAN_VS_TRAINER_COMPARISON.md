@@ -87,8 +87,8 @@ This document summarizes how the approach in `ssot/patron_walkaway_phase_1.plan.
 | ------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------------- |
 | **Number of models**      | Single LightGBM                                           | **Two models**: Rated (card-holders) + Non-rated                              |
 | **Model routing**         | N/A                                                       | `is_rated_obs = (resolved_card_id IS NOT NULL)`                               |
-| **Class weighting**       | `class_weight='balanced'`                                 | Same + **visit-level sample_weight** `1/N_visit` (Length Bias correction)     |
-| **Sample weighting**      | None                                                      | `sample_weight = 1 / N_visit` per observation; N_visit from training set only |
+| **Class weighting**       | `class_weight='balanced'`                                 | Same                                 |
+| **Sample weighting**      | None                                                      | None（DEC-013：已移除 visit-level 樣本加權） |
 | **Hyperparameter tuning** | Small grid (`num_leaves`, `min_child_samples`); no Optuna | **Optuna TPE** on validation set; `OPTUNA_N_TRIALS=300`                       |
 | **Time split**            | 80/20 (train/val)                                         | 70/15/15 (train/valid/test)                                                   |
 | **Early stopping**        | `stopping_rounds=50`                                      | Plan does not specify; Optuna optimizes F-beta / PR-AUC                       |
@@ -104,8 +104,8 @@ This document summarizes how the approach in `ssot/patron_walkaway_phase_1.plan.
 | **Threshold search**   | Exhaustive over `np.unique(val_scores)`; `min_recall=0.02`, `min_alerts=5` | **Optuna TPE** 2D search over `(rated_threshold, nonrated_threshold)`                   |
 | **Constraints**        | Ad-hoc min recall / min alerts                                             | G1: `Precision ≥ G1_PRECISION_MIN`; total alert volume `≥ G1_ALERT_VOLUME_MIN_PER_HOUR` |
 | **Objective**          | Maximize precision (then recall)                                           | Maximize F-beta (β<1) subject to G1 constraints                                         |
-| **Per-visit TP dedup** | Not applied                                                                | Evaluation only: at most 1 TP per visit; does not affect online alerting                |
-| **評估指標**           | Single precision/recall                                                    | **Bet-level**（Phase 1；Visit-level 延後見 DEC-012）                                      |
+| **Per-run TP dedup** | Not applied                                                                | Evaluation only: at most 1 TP per run; does not affect online alerting                |
+| **評估指標**           | Single precision/recall                                                    | **Bet-level**（Phase 1；Run-level 延後見 DEC-012）                                      |
 
 
 ---
@@ -166,7 +166,7 @@ The Phase 1 plan represents a comprehensive refactor that:
 2. **Closes leakage and parity gaps** via cutoff_time, C1 extended pull, S1 table_hc, and shared feature code.
 3. **Introduces dual-track feature engineering** (Featuretools DFS + vectorized hand-written) with persistent `saved_feature_defs` for train-serve parity.
 4. **Adds D2 canonical identity** and FND-compliant DQ guardrails.
-5. **Splits models** (Rated vs. Non-rated) and applies visit-level sample weighting for Length Bias correction.
+5. **Splits models** (Rated vs. Non-rated). Phase 1 無樣本加權（DEC-013）。
 6. **Uses Optuna** for both hyperparameter and 2D threshold search.
 7. **Produces an atomic artifact bundle** with versioning and reason codes for deployment.
 
@@ -250,8 +250,8 @@ The Phase 1 plan represents a comprehensive refactor that:
 |------|-------------------|--------------|
 | **模型數量** | 單一 LightGBM | **雙模型**：Rated（有卡客）+ Non-rated |
 | **模型路由** | 不適用 | `is_rated_obs = (resolved_card_id IS NOT NULL)` |
-| **類別權重** | `class_weight='balanced'` | 同上，並加上 **visit-level sample_weight** `1/N_visit`（長度偏誤校正） |
-| **樣本加權** | 無 | 每觀測點 `sample_weight = 1 / N_visit`；N_visit 僅取自訓練集 |
+| **類別權重** | `class_weight='balanced'` | 同上 |
+| **樣本加權** | 無 | 無（DEC-013：已移除 visit-level 樣本加權） |
 | **超參調優** | 小網格（`num_leaves`、`min_child_samples`）；無 Optuna | **Optuna TPE** 在 validation set；`OPTUNA_N_TRIALS=300` |
 | **時間切分** | 80/20 (train/val) | 70/15/15 (train/valid/test) |
 | **Early stopping** | `stopping_rounds=50` | 計畫未明訂；Optuna 以 F-beta / PR-AUC 為目標 |
@@ -265,7 +265,7 @@ The Phase 1 plan represents a comprehensive refactor that:
 | **閾值搜尋** | 窮舉 `np.unique(val_scores)`；`min_recall=0.02`、`min_alerts=5` | **Optuna TPE** 對 `(rated_threshold, nonrated_threshold)` 做 2D 搜尋 |
 | **約束** | 臨時 min_recall / min_alerts | G1：`Precision ≥ G1_PRECISION_MIN`；總警報量 `≥ G1_ALERT_VOLUME_MIN_PER_HOUR` |
 | **目標** | 最大化 precision（其次 recall） | 在 G1 約束下最大化 F-beta（β<1） |
-| **評估口徑** | 僅 precision/recall | **Bet-level**（Phase 1；Visit-level 延後 DEC-012） |
+| **評估口徑** | 僅 precision/recall | **Bet-level**（Phase 1；Run-level 延後 DEC-012） |
 
 ---
 
@@ -319,7 +319,7 @@ Phase 1 計畫為一次完整重構，涵蓋：
 2. **封閉洩漏與 parity 破口**：透過 cutoff_time、C1 延伸拉取、S1 table_hc、共用特徵程式碼。
 3. **導入雙軌特徵工程**（Featuretools DFS + 向量化手寫），以持久化 `saved_feature_defs` 維持 train-serve parity。
 4. **納入 D2 canonical 身份**與符合 FND 的 DQ 護欄。
-5. **模型拆為 Rated / Non-rated**，並以 visit-level sample weighting 校正長度偏誤。
+5. **模型拆為 Rated / Non-rated**。Phase 1 無樣本加權（DEC-013）。
 6. **以 Optuna** 同時做超參與 2D 閾值搜尋。
 7. **產出原子化 artifact 套件**，含版本與 reason codes，供部署使用。
 

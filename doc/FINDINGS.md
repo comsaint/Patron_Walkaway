@@ -117,12 +117,24 @@
 | ≥7 天 history | 0.9% |
 | ≥30 天 history | 0.3% |
 | **僅 1 session** | **67.9%** |
-| **0-day span（同日）** | **68.3%** |
+| **span = 0（精確零）** | **68.3%** |
+| **0 < span < 1 天** | **29.6%** |
 
-**Sanity check 結論**：Unrated 歷史極短（中位數 1 session、0 天 span），約 68% 單次到訪或同日多次，符合無卡 walk-in 預期。Player-level table 僅需針對 rated 設計，unrated 彙總效益低。
+**History span 定義與區間說明**  
+`history_span_days = (MAX(sess_time) - MIN(sess_time)) / 86400`（秒差轉天數，可為小數）。以下三類為**互斥且窮舉**：
+
+| 區間 | 佔比 | 說明 |
+|------|------|------|
+| **span = 0** | 68.3% | 僅 1 個 session（first = last），或極罕見的多 session 同時間戳。與「僅 1 session」67.9% 高度重合。 |
+| **0 < span < 1 天** | 29.6% | 多個 session 且時間不同，但首末 session 時間差小於 24 小時（同日多場或跨午夜數小時）。 |
+| **span ≥ 1 天** | 2.1% | 首末 session 間隔至少 1 天。 |
+
+> **重要澄清**：「0-day span」意即 **span 精確為 0**，並非「同日」或「小於 1 天」。若將 span = 0 與 0 < span < 1 合併，則 **97.9%** 的 Unrated 歷史跨度小於 1 天。
+
+**Sanity check 結論**：Unrated 歷史極短（中位數 1 session、0 天 span），約 97.9% 歷史跨度 < 1 天，符合無卡 walk-in 預期。Player-level table 僅需針對 rated 設計，unrated 彙總效益低。
 
 ### 決策結論
-Rated patrons 的 session 歷史深度明顯高於非 rated：多數具備多次 sessions 與多日歷史；unrated 則以單 session／同日為主。建立 **cached player-level 彙總表**可避免每次訓練/chunk 對同一批 patron 從 7,100 萬筆 sessions 反覆彙總，具顯著效益；**僅針對 rated** 設計即可。**決策**：進行 player-level table 設計與實作（見 DEC-011）。
+Rated patrons 的 session 歷史深度明顯高於非 rated：多數具備多次 sessions 與多日歷史；unrated 則以單 session／同日為主。建立 **cached player-level 彙總表**可避免每次訓練/chunk 對同一批 patron 從 7,100 萬筆 sessions 反覆彙總，具顯著效益；**僅針對 rated** 設計即可。**決策**：進行 player-level table 設計與實作（見 DEC-011；完整欄位規格見 `doc/player_profile_daily_spec.md`）。
 
 ---
 
