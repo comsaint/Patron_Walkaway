@@ -164,25 +164,26 @@
 
 ---
 
-## DEC-010：Backtester Optuna 閾值搜尋改為 F1（與 Trainer 對齊，保留 G1 約束）
+## DEC-010：Backtester Optuna 閾值搜尋改為 F1（與 Trainer 對齊，移除 G1 約束）
 
 **日期**：2026-03-02  
 **SSOT 章節**：§10.2  
 **關聯**：DEC-009  
 
-**決策**：Backtester 的 Optuna 2D 閾值搜尋 **objective** 從 F-beta (G1_FBETA) 改為 **F1**，與 Trainer 的閾值選擇準則一致。**保留 G1 約束**：per-model precision ≥ G1_PRECISION_MIN、combined alerts/hour ≥ G1_ALERT_VOLUME_MIN_PER_HOUR。
+**決策**：Backtester 的 Optuna 2D 閾值搜尋 **objective** 從 F-beta (G1_FBETA) 改為 **F1**，與 Trainer 的閾值選擇準則一致。**不再使用 G1 約束**（per-model precision、combined alerts/hour 下限均移除），與 SSOT §10.2 對齊。
 
 **理由**：  
-- DEC-009 將 Trainer 閾值改為 F1；Backtester 若仍用 F-beta 選閾值，兩端不一致。  
-- 改為 F1 後，Trainer 與 Backtester 的「閾值選擇邏輯」一致。  
-- G1 約束保留，作為業務門檻（避免 precision 過低、警報量不足）。
+- DEC-009 將 Trainer 閾值改為 F1，且移除 G1 約束。  
+- Backtester 與 Trainer 閾值選擇邏輯應完全一致。  
+- 具體權衡底線尚待業務端確認，暫不預設 precision/alert volume 門檻。
 
 **實作**：  
 - `run_optuna_threshold_search` 的 objective：`fbeta_score(..., beta=G1_FBETA)` → `f1_score(...)`  
+- 移除 G1 約束檢查（`rated_prec >= G1_PRECISION_MIN`、`nonrated_prec >= G1_PRECISION_MIN`、`total_alerts_per_hour >= G1_ALERT_VOLUME_MIN_PER_HOUR`）。  
 - 日誌：`F-beta=...` → `F1=...`  
 - `compute_micro_metrics` / `compute_macro_by_visit_metrics` 仍報告 `fbeta_{G1_FBETA}` 供參考，未改動。
 
-**回退**：將 objective 改回 `fbeta_score(y, all_preds, beta=G1_FBETA, zero_division=0)`，log 改回 `F-beta=%.4f`。
+**回退**：恢復 G1 約束檢查與 `fbeta_score` objective；見 DEC-009 回退說明。
 
 ---
 
@@ -205,26 +206,41 @@
 - 預期設計：每日 snapshot + PIT，訓練/推論時按時間點取對應 snapshot，再與 chunk 內增量 sessions 合併。
 
 **待辦**：  
-- 具體 schema、更新頻率、PIT 策略於後續計畫補充。
+- 具體 schema、更新頻率、PIT 策略：已補入 **`doc/player_profile_daily_spec.md`**（含欄位清單、計算公式、來源表、Phase 1/2 範圍、特徵取捨理由）。
 
 ---
 
-## DEC-012：Phase 1 簡化為 Bet-level 評估指標，Visit-level / Cooldown 延後
+## DEC-012：Phase 1 簡化為 Bet-level 評估指標，Run-level / Cooldown 延後
 
 **日期**：2026-03-02  
 **SSOT 章節**：§10.1, §10.2, §10.3, §14  
 
-**決策**：Phase 1 **統一採用 Bet-level 指標**（Precision, Recall, F-beta, PR-AUC）進行閾值選擇與回測報告；不引入 Visit-level 聚合（V-Precision, V-Recall, V-Volume）或 Per-player 警報冷卻期（Cooldown）。
+**決策**：Phase 1 **統一採用 Bet-level 指標**（Precision, Recall, F-beta, PR-AUC）進行閾值選擇與回測報告；不引入 Run-level 聚合（R-Precision, R-Recall, R-Volume）或 Per-player 警報冷卻期（Cooldown）。
 
 **背景**：  
-- Visit-level 指標與 Cooldown 設計需反映公關真實體驗（如成功挽留多少獨立玩家、同一 visit 內多次假警報的懲罰），涉及業務語義與 KPI 協商。  
+- Run-level 指標與 Cooldown 設計需反映公關真實體驗（如成功挽留多少獨立玩家、同一 run 內多次假警報的懲罰），涉及業務語義與 KPI 協商。  
 - 目前尚無明確業務輸入可定義具體 metric 與門檻，為保持簡單與可落地，先以 bet-level 為主。
 
 **Future TODO**：  
 - 待業務校準後，考慮引入：  
-  - Visit-level 聚合指標（bet-derived visit 定義見 SSOT §2.2）  
-  - Per-player 警報冷卻期（避免同一 visit 內多次假警報打擾公關）  
-- 具體 metric 定義、Visit 語義（如同一 visit 內多 FP 如何計數）、閾值策略需與業務端協商後補入 SSOT。
+  - Run-level 聚合指標（Run 定義見 SSOT §2.2）  
+  - Per-player 警報冷卻期（避免同一 run 內多次假警報打擾公關）  
+- 具體 metric 定義、Run 語義（如同一 run 內多 FP 如何計數）、閾值策略需與業務端協商後補入 SSOT。
+
+---
+
+## DEC-013：術語統一為 Run，移除 Visit 樣本加權
+
+**日期**：2026-03-02  
+**SSOT 章節**：§2.2, §9  
+
+**決策**：
+1. **術語統一**：全專案統一使用 **Run**（bet-derived 連續下注段：相鄰 bet 間距 ≥ `RUN_BREAK_MIN` 即切分為新 run）。不再使用「Visit」一詞以避免與其他語境的 visit 混淆。
+2. **移除 Visit 樣本加權**：Phase 1 不再採用 `1/N_visit`（`canonical_id` × `gaming_day`）反比權重作為 `sample_weight`。訓練僅使用 `class_weight='balanced'` 處理類別不平衡。
+
+**理由**：
+- Run 與原「Visit（bet-derived）」定義相同（皆以 30 分鐘 gap 切割），統一術語減少困惑。
+- Visit 樣本加權將自程式碼與規格中移除。
 
 ---
 
