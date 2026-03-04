@@ -38,6 +38,9 @@ Dependencies
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect
+import json
 import logging
 import os
 import tempfile
@@ -73,6 +76,7 @@ BASE_DIR = Path(__file__).parent
 PROJECT_ROOT = BASE_DIR.parent
 LOCAL_PARQUET_DIR = PROJECT_ROOT / "data"
 LOCAL_PROFILE_PARQUET = LOCAL_PARQUET_DIR / "player_profile_daily.parquet"
+LOCAL_PROFILE_SCHEMA_HASH = LOCAL_PARQUET_DIR / "player_profile_daily.schema_hash"
 
 HK_TZ = ZoneInfo(config.HK_TZ)
 SOURCE_DB: str = getattr(config, "SOURCE_DB", "GDP_GMWDS_Raw")
@@ -107,6 +111,136 @@ _SESSION_COLS = [
     "is_deleted",
     "is_canceled",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Helpers for reading raw-data metadata (used inside schema fingerprint)
+# ---------------------------------------------------------------------------
+
+def _read_session_min_date(session_path: Path) -> Optional[str]:
+    """Return the ISO-format minimum session date from *session_path* Parquet metadata.
+
+    Uses pyarrow row-group statistics — zero data scan.  Returns ``None``
+    when the file is absent, the stats are unavailable, or any error occurs.
+
+    We try several candidate columns in priority order so the function is
+    robust against schema variants (e.g. files written without ``gaming_day``).
+
+    Note: date coercion is inlined here so this module has no private helper
+    duplicating ``trainer.py:_parse_obj_to_date`` (R100).
+    """
+    if not session_path.exists():
+        return None
+    # Pre-flight: verify Parquet magic bytes before handing the path to pyarrow.
+    # pyarrow can leave file handles open on Windows when it fails to open an
+    # invalid file, which causes PermissionError during TemporaryDirectory cleanup.
+    try:
+        with session_path.open("rb") as _fh:
+            if _fh.read(4) != b"PAR1":
+                return None
+    except OSError:
+        return None
+    try:
+        import pyarrow.parquet as pq  # optional runtime dep
+
+        pf = pq.ParquetFile(session_path)
+        col_names = pf.schema_arrow.names
+        for col in ("session_start_dtm", "gaming_day", "lud_dtm", "session_end_dtm"):
+            if col not in col_names:
+                continue
+            col_idx = col_names.index(col)
+            mins: list = []
+            for rg in range(pf.metadata.num_row_groups):
+                stats = pf.metadata.row_group(rg).column(col_idx).statistics
+                if stats is None or not getattr(stats, "has_min_max", False):
+                    continue
+                # Inline coercion — shared logic lives in trainer._parse_obj_to_date (R100)
+                v = stats.min
+                d: Optional[date] = None
+                if isinstance(v, datetime):
+                    d = v.date()
+                elif isinstance(v, date):
+                    d = v
+                else:
+                    s = str(v).strip()
+                    try:
+                        d = datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+                    except (ValueError, AttributeError):
+                        try:
+                            d = date.fromisoformat(s[:10])
+                        except ValueError:
+                            pass
+                if d is not None:
+                    mins.append(d)
+            if mins:
+                return min(mins).isoformat()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read session parquet min date from %s: %s", session_path, exc)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Profile schema fingerprint
+# ---------------------------------------------------------------------------
+
+def compute_profile_schema_hash(session_parquet: Optional[Path] = None) -> str:
+    """Return an MD5 fingerprint of everything that determines profile correctness.
+
+    The fingerprint captures four independent drift signals:
+
+    1. **PROFILE_VERSION** — manually bumped string for intentional full-rebuilds.
+    2. **PROFILE_FEATURE_COLS + _SESSION_COLS** — column-list drift (features.py).
+    3. **compute_source_hash** — MD5 of ``_compute_profile`` source; catches
+       aggregation-logic changes that don't touch column names.
+    4. **session_min_date** — earliest date found in the raw session parquet
+       metadata (zero data scan).  When a developer replaces a 3-month local
+       session file with a 1-year file, ``session_min_date`` shifts earlier,
+       the hash changes, and the cached profile is automatically invalidated so
+       that previously-truncated 365-day windows are recomputed correctly.
+
+    Parameters
+    ----------
+    session_parquet:
+        Path to ``gmwds_t_session.parquet``.  Defaults to
+        ``LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"``.
+
+    The sidecar file ``player_profile_daily.schema_hash`` stores the
+    fingerprint written when the parquet was last built.
+    ``ensure_player_profile_daily_ready`` in trainer.py compares current vs
+    stored fingerprint to decide whether to invalidate the cache.
+    """
+    # Import PROFILE_FEATURE_COLS lazily to avoid circular imports.
+    try:
+        from features import PROFILE_FEATURE_COLS as _pfc  # type: ignore[import]
+    except ModuleNotFoundError:
+        from trainer.features import PROFILE_FEATURE_COLS as _pfc  # type: ignore[import, no-redef]
+
+    # Hash the source of _compute_profile so that changes to aggregation logic
+    # (not just column names or version string) also invalidate the cache.
+    # R98: normalize CRLF → LF before hashing so the fingerprint is identical
+    # regardless of whether the file was checked out on Windows or Linux.
+    _src = inspect.getsource(_compute_profile).replace("\r\n", "\n").replace("\r", "\n")
+    compute_source_hash = hashlib.md5(_src.encode("utf-8")).hexdigest()[:8]
+
+    # Read raw-data provenance: earliest session date in the source file.
+    # When the local session parquet is replaced with a more complete historical
+    # dataset, session_min_date shifts earlier → hash changes → full rebuild.
+    _sess_path = session_parquet if session_parquet is not None else (
+        LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+    )
+    session_min_date = _read_session_min_date(_sess_path)
+
+    payload = json.dumps(
+        {
+            "profile_version": PROFILE_VERSION,
+            "feature_cols": sorted(_pfc),
+            "session_cols": sorted(_SESSION_COLS),
+            "compute_source_hash": compute_source_hash,
+            "session_min_date": session_min_date,
+        },
+        sort_keys=True,
+    )
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -153,14 +287,98 @@ def _load_sessions(snapshot_dtm: datetime, client) -> pd.DataFrame:
     return df
 
 
+def _filter_ts_etl(dt: datetime, parquet_path: Path, col: str) -> "pd.Timestamp":
+    """Return a Timestamp compatible with the Parquet column's tz schema.
+
+    Reads the column schema once (cheap: no data rows) to determine whether
+    the column is tz-aware or tz-naive, then returns a matching Timestamp.
+    Mirrors the ``_filter_ts`` helper in trainer.py (R28 fix) so that
+    PyArrow pushdown filters never raise ArrowNotImplementedError due to
+    mismatched timezone awareness.
+    """
+    import pyarrow.parquet as pq  # local import: optional runtime dependency
+
+    ts = pd.Timestamp(dt)
+    try:
+        schema = pq.read_schema(parquet_path)
+        field = schema.field(col)
+        col_tz = getattr(field.type, "tz", None)
+    except Exception:
+        col_tz = None
+    if col_tz:
+        return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    else:
+        return ts.tz_localize(None) if ts.tzinfo is None else ts.replace(tzinfo=None)
+
+
 def _load_sessions_local(snapshot_dtm: datetime) -> Optional[pd.DataFrame]:
-    """Dev fallback: load t_session from a local Parquet export and apply DQ filters."""
+    """Dev fallback: load t_session from a local Parquet export and apply DQ filters.
+
+    Uses PyArrow pushdown filters on ``session_start_dtm`` to restrict the
+    rows read from disk to the relevant time window, avoiding a full-table
+    load (OOM fix for 8 GB machines).  Falls back to full-table read if the
+    target column is absent from the schema.
+    """
     t_session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
     if not t_session_path.exists():
         return None
     try:
         lo_dtm = snapshot_dtm - timedelta(days=MAX_LOOKBACK_DAYS + 30)
-        df = pd.read_parquet(t_session_path)
+
+        # Build pushdown filter on session_start_dtm to avoid full-table read.
+        # We use session_start_dtm as the filter column because it is always
+        # present and indexed in the Parquet row-group statistics.  The actual
+        # availability gate (session_end_dtm / lud_dtm + SESSION_AVAIL_DELAY_MIN)
+        # is applied below in pandas after the read; using session_start_dtm as
+        # a coarse lower bound is safe: a session that started before lo_dtm
+        # could not have ended (and therefore become "available") later than
+        # snapshot_dtm + MAX_LOOKBACK_DAYS, so no valid rows are excluded.
+        import pyarrow.parquet as pq  # local import: optional runtime dependency
+
+        _filter_col = "session_start_dtm"
+        try:
+            _schema_cols = pq.read_schema(t_session_path).names
+            _has_filter_col = _filter_col in _schema_cols
+        except Exception:
+            _has_filter_col = False
+
+        if _has_filter_col:
+            _lo_ts = _filter_ts_etl(lo_dtm, t_session_path, _filter_col)
+            # Upper bound: snapshot_dtm + SESSION_AVAIL_DELAY_MIN to capture
+            # sessions whose end time (used for avail_time) falls at or before
+            # snapshot_dtm after the delay is applied.
+            _hi_ts = _filter_ts_etl(
+                snapshot_dtm + timedelta(minutes=SESSION_AVAIL_DELAY_MIN),
+                t_session_path,
+                _filter_col,
+            )
+            parquet_filters = [
+                (_filter_col, ">=", _lo_ts),
+                (_filter_col, "<=", _hi_ts),
+            ]
+        else:
+            logger.warning(
+                "_load_sessions_local: %s not found in schema; "
+                "falling back to full-table read (potential OOM on large files)",
+                _filter_col,
+            )
+            parquet_filters = None
+
+        # R99: explicit column projection avoids loading unused columns.
+        df = pd.read_parquet(
+            t_session_path,
+            columns=_SESSION_COLS,
+            filters=parquet_filters,
+        )
+
+        # R103: guard against parquet files that are missing required DQ columns.
+        for _dq_col in ("is_manual", "is_deleted", "is_canceled"):
+            if _dq_col not in df.columns:
+                logger.warning(
+                    "Missing DQ column %s in local session parquet; "
+                    "rows will NOT be filtered on this column",
+                    _dq_col,
+                )
 
         def _naive(dt: datetime) -> pd.Timestamp:
             ts = pd.Timestamp(dt)
@@ -192,6 +410,77 @@ def _load_sessions_local(snapshot_dtm: datetime) -> Optional[pd.DataFrame]:
     except Exception as exc:
         logger.warning("Local session Parquet load failed: %s", exc)
         return None
+
+
+def _preload_sessions_local() -> Optional[pd.DataFrame]:
+    """Load the full local session Parquet once, apply DQ filters and dedup.
+
+    Adds a ``__avail_time`` column (tz-naive Timestamp) so callers can do
+    fast in-memory time-window filtering without re-reading the file.
+    Used by ``backfill`` fast-mode to avoid N × Parquet I/O.
+    """
+    t_session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+    if not t_session_path.exists():
+        return None
+    try:
+        df = pd.read_parquet(t_session_path, columns=_SESSION_COLS)
+        for _dq_col in ("is_manual", "is_deleted", "is_canceled"):
+            if _dq_col not in df.columns:
+                logger.warning(
+                    "Missing DQ column %s in local session parquet; "
+                    "rows will NOT be filtered on this column",
+                    _dq_col,
+                )
+
+        sess_end = pd.to_datetime(df.get("session_end_dtm", pd.NaT))
+        lud = pd.to_datetime(df.get("lud_dtm", pd.NaT))
+        avail_time = sess_end.fillna(lud) + pd.Timedelta(minutes=SESSION_AVAIL_DELAY_MIN)
+        if avail_time.dt.tz is not None:
+            avail_time = avail_time.dt.tz_localize(None)
+
+        dq_mask = (
+            (df.get("is_manual", pd.Series(0, index=df.index)) == 0)
+            & (df.get("is_deleted", pd.Series(0, index=df.index)) == 0)
+            & (df.get("is_canceled", pd.Series(0, index=df.index)) == 0)
+            & (
+                (df.get("turnover", pd.Series(0.0, index=df.index)).fillna(0) > 0)
+                | (df.get("num_games_with_wager", pd.Series(0, index=df.index)).fillna(0) > 0)
+            )
+        )
+        df = df[dq_mask].drop_duplicates(subset=["session_id"]).copy()
+        df["__avail_time"] = avail_time[df.index].values
+        logger.info(
+            "_preload_sessions_local: %d rows loaded (DQ applied, avail_time cached)", len(df)
+        )
+        return df
+    except Exception as exc:
+        logger.warning("_preload_sessions_local failed: %s", exc)
+        return None
+
+
+def _filter_preloaded_sessions(
+    preloaded: "pd.DataFrame", snapshot_dtm: datetime
+) -> Optional["pd.DataFrame"]:
+    """Filter a preloaded sessions cache for a given snapshot_dtm time window.
+
+    Expects ``preloaded`` to have a ``__avail_time`` column (tz-naive) as
+    produced by ``_preload_sessions_local``.
+    """
+    def _naive(dt: datetime) -> "pd.Timestamp":
+        ts = pd.Timestamp(dt)
+        return ts.tz_localize(None) if ts.tzinfo is None else ts.replace(tzinfo=None)
+
+    snap_ts = _naive(snapshot_dtm)
+    lo_ts = _naive(snapshot_dtm - timedelta(days=MAX_LOOKBACK_DAYS + 30))
+    avail = pd.to_datetime(preloaded["__avail_time"])
+    mask = (avail >= lo_ts) & (avail <= snap_ts)
+    result = preloaded[mask].drop(columns=["__avail_time"], errors="ignore")
+    if result.empty:
+        return None
+    logger.info(
+        "_filter_preloaded_sessions: %d rows for snapshot_dtm=%s", len(result), snapshot_dtm
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +524,10 @@ def _compute_profile(sessions: pd.DataFrame, snapshot_dtm: datetime) -> pd.DataF
     -------
     DataFrame with one row per canonical_id plus all Phase 1 feature columns.
     """
+    snapshot_date = (  # type: date
+        snapshot_dtm.date() if isinstance(snapshot_dtm, datetime) else snapshot_dtm
+    )
+
     snap_ts = pd.Timestamp(snapshot_dtm)
     if snap_ts.tzinfo is not None:
         snap_ts = snap_ts.replace(tzinfo=None)
@@ -444,7 +737,10 @@ def _write_to_clickhouse(df: pd.DataFrame, client) -> None:
     logger.info("Written %d rows to ClickHouse %s.%s", len(df), SOURCE_DB, TPROFILE)
 
 
-def _write_to_local_parquet(df: pd.DataFrame) -> None:
+def _write_to_local_parquet(
+    df: pd.DataFrame,
+    canonical_id_whitelist: Optional[set] = None,
+) -> None:
     """Append (or create) local Parquet file with atomic write (R88).
 
     Uses a temp file + os.replace to avoid leaving a corrupt file if the
@@ -452,14 +748,16 @@ def _write_to_local_parquet(df: pd.DataFrame) -> None:
     """
     LOCAL_PARQUET_DIR.mkdir(parents=True, exist_ok=True)
     if LOCAL_PROFILE_PARQUET.exists():
-        existing = pd.read_parquet(LOCAL_PROFILE_PARQUET)
-        combined = pd.concat([existing, df], ignore_index=True)
-        # Dedup by (canonical_id, snapshot_date) — keep latest
-        combined = (
-            combined.sort_values("snapshot_dtm")
-            .drop_duplicates(subset=["canonical_id", "snapshot_date"], keep="last")
-            .reset_index(drop=True)
+        # R104: only read rows for snapshot_dates NOT covered by the incoming
+        # batch.  Pyarrow applies the filter at row-group level, so for a large
+        # profile (365 days × tens-of-thousands of players) we skip re-reading
+        # rows we are about to replace, substantially reducing peak memory.
+        _incoming_dates = list(df["snapshot_date"].unique())
+        _retained = pd.read_parquet(
+            LOCAL_PROFILE_PARQUET,
+            filters=[("snapshot_date", "not in", _incoming_dates)],
         )
+        combined = pd.concat([_retained, df], ignore_index=True).reset_index(drop=True)
     else:
         combined = df
     # R88: atomic write — write to temp then os.replace to final path
@@ -469,6 +767,33 @@ def _write_to_local_parquet(df: pd.DataFrame) -> None:
     try:
         os.close(tmp_fd)
         combined.to_parquet(tmp_path, index=False)
+
+        # R95: Write schema fingerprint sidecar BEFORE replacing the parquet so
+        # that a crash between the two os.replace calls leaves a *mismatched*
+        # hash → next run sees schema drift → safe full rebuild.
+        hash_tmp_fd, hash_tmp_path = tempfile.mkstemp(
+            dir=LOCAL_PARQUET_DIR, suffix=".schema_hash.tmp"
+        )
+        try:
+            os.close(hash_tmp_fd)
+            # R106: sidecar must store full hash (with population tag) so
+            # ensure_player_profile_daily_ready can compare correctly
+            base_hash = compute_profile_schema_hash()
+            _pop_tag = (
+                f"_whitelist={len(canonical_id_whitelist)}"
+                if canonical_id_whitelist
+                else "_full"
+            )
+            full_hash = hashlib.md5((base_hash + _pop_tag).encode()).hexdigest()
+            Path(hash_tmp_path).write_text(full_hash, encoding="utf-8")
+            os.replace(hash_tmp_path, LOCAL_PROFILE_SCHEMA_HASH)
+        except Exception:
+            try:
+                os.unlink(hash_tmp_path)
+            except OSError:
+                pass
+            raise
+
         os.replace(tmp_path, LOCAL_PROFILE_PARQUET)
     except Exception:
         try:
@@ -476,6 +801,7 @@ def _write_to_local_parquet(df: pd.DataFrame) -> None:
         except OSError:
             pass
         raise
+
     logger.info(
         "Local Parquet updated (atomic): %d rows total at %s",
         len(combined),
@@ -491,6 +817,8 @@ def build_player_profile_daily(
     snapshot_date: date,
     use_local_parquet: bool = False,
     canonical_map: Optional[pd.DataFrame] = None,  # R90: accept pre-built mapping (backfill reuse)
+    preloaded_sessions: Optional[pd.DataFrame] = None,  # fast-mode: skip Parquet I/O per day
+    canonical_id_whitelist: Optional[set] = None,  # R106: for sidecar hash population tag
 ) -> Optional[pd.DataFrame]:
     """Compute player_profile_daily for one `snapshot_date` and persist the result.
 
@@ -506,23 +834,33 @@ def build_player_profile_daily(
     canonical_map:
         Pre-built D2 mapping DataFrame.  When provided (e.g. passed from
         ``backfill``), the mapping query is skipped (R90 reuse).
+    preloaded_sessions:
+        Pre-loaded and DQ-filtered sessions DataFrame (from
+        ``_preload_sessions_local``).  When provided, the Parquet file is
+        not re-read; only the snapshot_dtm time-window filter is applied
+        in-memory (fast-mode, avoids N × I/O in backfill).
 
     Returns
     -------
     DataFrame of profile rows, or None on failure.
     """
-    # snapshot_dtm = end of day in HK (all day's sessions flagged available by then)
+    # R102: snapshot_dtm = next midnight + SESSION_AVAIL_DELAY_MIN so that
+    # sessions ending at 23:54 on snapshot_date (available at 00:01 next day)
+    # are correctly included rather than silently dropped.
     snapshot_dtm = datetime(
         snapshot_date.year,
         snapshot_date.month,
         snapshot_date.day,
-        23, 59, 59,
-    )
+    ) + timedelta(days=1, minutes=SESSION_AVAIL_DELAY_MIN)
     logger.info("Building player_profile_daily for %s (snapshot_dtm=%s)", snapshot_date, snapshot_dtm)
 
     # 1. Load sessions
     sessions_raw: Optional[pd.DataFrame] = None
-    if use_local_parquet:
+    if preloaded_sessions is not None:
+        # Fast-mode: filter the in-memory cache for this snapshot's time window,
+        # avoiding a full Parquet read on every iteration.
+        sessions_raw = _filter_preloaded_sessions(preloaded_sessions, snapshot_dtm)
+    elif use_local_parquet:
         sessions_raw = _load_sessions_local(snapshot_dtm)
     if sessions_raw is None:
         if get_clickhouse_client is None:
@@ -584,14 +922,14 @@ def build_player_profile_daily(
 
     # 6. Persist
     if use_local_parquet:
-        _write_to_local_parquet(profile_df)
+        _write_to_local_parquet(profile_df, canonical_id_whitelist=canonical_id_whitelist)
     else:
         try:
             client = get_clickhouse_client()
             _write_to_clickhouse(profile_df, client)
         except Exception as exc:
             logger.error("ClickHouse write failed: %s; falling back to local Parquet", exc)
-            _write_to_local_parquet(profile_df)
+            _write_to_local_parquet(profile_df, canonical_id_whitelist=canonical_id_whitelist)
 
     return profile_df
 
@@ -600,11 +938,31 @@ def backfill(
     start_date: date,
     end_date: date,
     use_local_parquet: bool = False,
+    canonical_id_whitelist: Optional[set] = None,
+    snapshot_interval_days: int = 1,
+    preload_sessions: bool = True,
 ) -> None:
     """Backfill player_profile_daily for a range of dates.
 
     R90: canonical_map is built once and reused across all snapshot dates to
     avoid N redundant mapping queries during a long backfill run.
+
+    Parameters
+    ----------
+    canonical_id_whitelist:
+        When provided (fast-mode), only canonical_ids in this set are
+        profiled.  Rated players not in the whitelist are silently skipped,
+        dramatically reducing per-day aggregation cost.
+    snapshot_interval_days:
+        Compute a snapshot only every N days (fast-mode: 7).  Intermediate
+        dates are skipped; the PIT join in trainer.py will still find the
+        most recent available snapshot for each bet.
+    preload_sessions:
+        When True (default) and conditions are met (fast-mode or whitelist),
+        the entire session Parquet is loaded into memory once for efficient
+        per-day filtering.  Set to False on low-RAM machines (e.g. 8 GB) to
+        instead use per-day PyArrow pushdown reads via ``_load_sessions_local``,
+        avoiding the OOM risk at the cost of more frequent disk I/O.
     """
     # R90: pre-build canonical_map once for the whole backfill range
     canonical_map: Optional[pd.DataFrame] = None
@@ -624,25 +982,73 @@ def backfill(
                 "backfill: canonical_map pre-build failed (%s); will build per-day", exc
             )
 
+    # Apply whitelist: keep only the sampled rated players (fast-mode).
+    if canonical_id_whitelist is not None and canonical_map is not None and not canonical_map.empty:
+        before_n = len(canonical_map)
+        canonical_map = canonical_map[
+            canonical_map["canonical_id"].astype(str).isin(canonical_id_whitelist)
+        ].copy()
+        logger.info(
+            "backfill: canonical_id_whitelist applied — %d → %d rated players",
+            before_n, len(canonical_map),
+        )
+
+    # Fast-mode: pre-load sessions parquet once so each snapshot day only
+    # needs an in-memory time-window filter instead of a full file read.
+    # R112: also trigger when whitelist is set (whitelist-only fast-mode).
+    # When preload_sessions=False (--fast-mode-no-preload), skip full-table
+    # load entirely; _load_sessions_local uses PyArrow pushdown instead.
+    preloaded_sessions: Optional[pd.DataFrame] = None
+    if preload_sessions and use_local_parquet and (
+        snapshot_interval_days > 1 or canonical_id_whitelist is not None
+    ):
+        preloaded_sessions = _preload_sessions_local()
+        if preloaded_sessions is not None:
+            logger.info(
+                "backfill: session parquet preloaded once (%d rows) "
+                "for fast-mode (interval=%d days)",
+                len(preloaded_sessions), snapshot_interval_days,
+            )
+    elif not preload_sessions and use_local_parquet:
+        logger.info(
+            "backfill: session preload disabled (--fast-mode-no-preload); "
+            "each snapshot day will use per-day PyArrow pushdown read."
+        )
+
     current = start_date
     success = 0
     failed = 0
+    skipped = 0
+    _day_idx = 0
     while current <= end_date:
-        try:
-            result = build_player_profile_daily(
-                current,
-                use_local_parquet=use_local_parquet,
-                canonical_map=canonical_map,
-            )
-            if result is not None:
-                success += 1
-            else:
+        if _day_idx % snapshot_interval_days == 0:
+            try:
+                result = build_player_profile_daily(
+                    current,
+                    use_local_parquet=use_local_parquet,
+                    canonical_map=canonical_map,
+                    preloaded_sessions=preloaded_sessions,
+                    canonical_id_whitelist=canonical_id_whitelist,
+                )
+                if result is not None:
+                    success += 1
+                else:
+                    failed += 1
+            except Exception as exc:
+                logger.error("Failed for %s: %s", current, exc)
                 failed += 1
-        except Exception as exc:
-            logger.error("Failed for %s: %s", current, exc)
-            failed += 1
+        else:
+            skipped += 1
+            logger.debug(
+                "backfill: skipping %s (snapshot_interval_days=%d, day_idx=%d)",
+                current, snapshot_interval_days, _day_idx,
+            )
         current += timedelta(days=1)
-    logger.info("Backfill complete: %d succeeded, %d failed", success, failed)
+        _day_idx += 1
+    logger.info(
+        "Backfill complete: %d succeeded, %d failed, %d skipped",
+        success, failed, skipped,
+    )
 
 
 # ---------------------------------------------------------------------------

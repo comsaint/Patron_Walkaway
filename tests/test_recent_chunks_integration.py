@@ -98,10 +98,15 @@ class TestRecentChunksIntegration(unittest.TestCase):
         self.assertEqual(call_args[1], expected_effective_end + timedelta(days=1))
 
         # 2. Assert ensure_player_profile_daily_ready was called with effective window
+        # (canonical_id_whitelist=None, snapshot_interval_days=1, preload_sessions=True
+        # are the normal-mode defaults; preload_sessions added with --fast-mode-no-preload)
         mock_ensure_profile.assert_called_once_with(
             expected_effective_start,
             expected_effective_end,
-            use_local_parquet=True
+            use_local_parquet=True,
+            canonical_id_whitelist=None,
+            snapshot_interval_days=1,
+            preload_sessions=True,
         )
 
         # 3. Assert load_player_profile_daily was called with effective window

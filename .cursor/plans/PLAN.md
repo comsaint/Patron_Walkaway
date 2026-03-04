@@ -327,6 +327,116 @@ Uses `pytest` with small synthetic DataFrames — no ClickHouse connection requi
 10. `api_server.py` (depends on model artifacts structure)
 11. `tests/` (validates all of the above)
 
+## Fast Mode（DEC-015）
+
+### 目的
+
+讓整條 pipeline（ETL + Training + Evaluation）在筆電上以 `--fast-mode` 跑完 3 個月資料，目標 <10 分鐘，用於：
+- 開發迭代：驗證 code change 無 regression
+- CI smoke test：quick sanity check
+- Demo/展示：快速重現端到端流程
+
+### 選定方案：Option B — Rated Sampling + Full Nonrated
+
+| 面向 | Normal Mode | Fast Mode |
+|------|-------------|-----------|
+| Rated 玩家 | 全量 | canonical_map 中 deterministic 抽樣 N 人（預設 1,000） |
+| Nonrated 玩家 | 全量 | 全量（不受影響） |
+| Profile snapshot 頻率 | 每天 | 每 7 天 |
+| Session I/O | 每日各讀一次 parquet | 一次性讀入 memory，per-day in-memory filter |
+| Optuna 超參搜索 | 300 trials | 跳過，使用 default HP |
+| 模型 artifact | 正常輸出 | 結構不變，但 metadata 標記 `fast_mode=True` |
+
+### 影響模組與改動項目
+
+1. **`trainer.py`**
+   - 新增 `--fast-mode` CLI flag
+   - `run_pipeline()` 根據 flag：
+     - 從 canonical_map deterministic 抽樣 rated canonical_id（fixed seed）
+     - 傳 `canonical_id_whitelist` 給 ETL 與 profile loading
+     - 跳過 Optuna，使用 default hyperparameters
+   - Artifact metadata 加 `fast_mode` flag
+
+2. **`etl_player_profile.py`**
+   - `backfill()` 新增 `canonical_id_whitelist` 參數
+   - `backfill()` 新增 `snapshot_interval_days` 參數（fast-mode = 7）
+   - 一次性讀取 session parquet（取代每日各讀一次）
+
+3. **`doc/player_profile_daily_spec.md`**
+   - §2.3 Population 約束：profile 只為 rated（canonical_map 中的 ID）計算
+   - §2.4 Consumer 約束：只有 rated model 消費此表；nonrated model 不依賴
+
+### 不改動的部分
+
+- 快取 schema hash 機制照常運作
+- 時間折疊（`time_fold.py`）不受影響
+- `--recent-chunks` 與 `--fast-mode` 可疊加使用
+- Nonrated model 路徑完全不受影響
+
+### 安全護欄
+
+- Fast-mode 產出的模型 **不得用於生產推論**；artifact metadata 會標記 `fast_mode=True`
+- Scorer 載入模型時應檢查此 flag 並在 production 環境拒絕載入
+- Fast-mode 的 profile cache 與 normal-mode 不混用（schema hash 會自動處理）
+
+---
+
+## --recent-chunks 與 Local Parquet 視窗對齊
+
+### 目的
+
+使用 `--use-local-parquet` 且未指定 `--start`/`--end` 時，預設視窗為「現在往前 N 天」，導致本機 Parquet 資料若早於今日，會產生無資料的 chunk；`--recent-chunks N` 取的是「相對今天」的最後 N 個 chunk，在離線資料上無效。
+
+改為以**資料實際結束日**為基準：從 bet / session Parquet 的 metadata 讀取 max date，用其作為視窗 end，再回推 start，使 `--recent-chunks` 表示「資料內最近 N 個月度 chunk」。
+
+### 行為
+
+| 情境 | 行為 |
+|------|------|
+| 未用 `--use-local-parquet` | 不變：視窗仍為 now - days ~ now - 30min |
+| 使用 `--use-local-parquet` 且未給 `--start`/`--end` | 從 `gmwds_t_bet.parquet` 與 `gmwds_t_session.parquet` 的 row-group statistics 讀取 (min, max) date；end = min(bet_max, session_max) 的當日 00:00（exclusive 語義取次日 00:00），start = end - days；若 metadata 讀取失敗則 fallback 原邏輯並 log warning |
+| 顯式提供 `--start` 與 `--end` | 不受影響，不偵測資料範圍 |
+
+### 實作要點
+
+- `trainer.py` 新增 `_detect_local_data_end()`：呼叫既有 `_parquet_date_range(bet_path, ...)` 與 `_parquet_date_range(session_path, ...)`，取兩者 max date 的 **min**（保守：兩表都有資料到該日）。
+- 在 `run_pipeline()` 中，`parse_window(args)` 之後、`get_monthly_chunks()` 之前：若 `use_local_parquet and not (args.start or args.end)`，則以偵測到的 data_end 調整 start/end，並 log 調整後的視窗。
+- 僅讀 metadata（row-group statistics），不掃描資料列，零額外 I/O 成本。
+
+### 安全與相容性
+
+- ClickHouse 路徑與顯式 `--start`/`--end` 完全不變。
+- 同一份 Parquet 重跑 → 相同視窗 → 可重現。
+- Bet / session 結束日若差 1–2 天，取 min 確保兩表在 end 前皆有資料。
+
+---
+
+## 解決 Fast Mode 在 8GB 記憶體上的 OOM 問題
+
+### 目的
+
+Fast Mode 目前會呼叫 `_preload_sessions_local()`，一次將整個 `gmwds_t_session.parquet`（約 7400 萬列，大小 2-4GB+）載入記憶體。在 8GB 記憶體的機器上，這會直接導致 OOM。我們需要提供關閉 Preload 的選項，並透過 Pandas/PyArrow 的 `filters` 下推（Predicate Pushdown）技術，讓逐日讀取時記憶體也能保持在安全範圍。
+
+### 實作要點（方案一：Pandas + filters）
+
+1. **新增 CLI 開關關閉 Preload**
+   - 在 `trainer.py` 新增 `--fast-mode-no-preload` 參數。
+   - 將此參數一路傳遞：`run_pipeline` -> `ensure_player_profile_daily_ready` -> `backfill`。
+   - 在 `backfill` 中，若此開關開啟，則 **不呼叫** `_preload_sessions_local()`，讓 `preloaded_sessions` 維持 `None`，從而觸發原本的「逐日讀取」邏輯 (`_load_sessions_local`)。
+
+2. **優化 `_load_sessions_local` (加入 Parquet Filters)**
+   - 在 `etl_player_profile.py` 的 `_load_sessions_local` 中，目前的寫法是整檔讀取 (`pd.read_parquet(..., columns=...)`)。
+   - 改為使用 `filters=[...]`，限制 `session_end_dtm` (或 `session_start_dtm` 等) 必須在 `[lo_dtm, snapshot_dtm]` 之間。
+   - 需要引入與 `trainer.load_local_parquet` 相同的 `_filter_ts` 邏輯，以正確處理 Parquet 欄位是否帶有 timezone (`timestamp[ms, tz=UTC]`) 的問題，避免 PyArrow `ArrowNotImplementedError`。
+
+### 影響評估
+
+- **記憶體**：顯著降低峰值，允許 8GB 機器順利跑完 Fast Mode。
+- **速度**：Backfill 階段會因為 N 次 Parquet 讀取而稍微變慢，但透過 filters 下推，每次只讀取相關的 row-groups，能將 I/O 成本降到最低。
+- **正確性**：無影響，依賴現有的邏輯產出完全相同的 Profile DataFrame。
+
+---
+
 ## Key Risks / Notes
 
 - **featuretools + optuna must be installed** before running the refactored trainer

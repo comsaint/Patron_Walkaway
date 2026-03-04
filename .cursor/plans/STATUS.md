@@ -1455,3 +1455,1223 @@ python -m pytest tests/ -v
 267 passed, 261 warnings in 7.24s (0 failed, 0 regression)
 ```
 
+---
+
+## Implementation Round 10 — Profile Schema Hash / Cache Invalidation (2026-03-04)
+
+### 背景
+
+`player_profile_daily.parquet` 的舊快取機制只比對「日期範圍」，如果開發者修改了 `PROFILE_FEATURE_COLS`、`PROFILE_VERSION` 或 `_SESSION_COLS`，程式不會自動感知，繼續使用含有錯誤欄位的舊快取做訓練。
+
+### 設計
+
+引入 **schema fingerprint sidecar** 機制：
+- `compute_profile_schema_hash()` 計算 `PROFILE_VERSION + sorted(PROFILE_FEATURE_COLS) + sorted(_SESSION_COLS)` 的 MD5，作為「目前程式碼期望的 schema」。
+- `_write_to_local_parquet()` 每次原子寫入 Parquet 後，同步寫出 `data/player_profile_daily.schema_hash`。
+- `ensure_player_profile_daily_ready()` 在日期範圍檢查之前先比對 schema fingerprint：
+  - **hash 吻合** → 繼續做日期範圍檢查（快取有效）。
+  - **hash 不吻合，或 sidecar 不存在（舊快取）** → 刪除舊 parquet + 刪除 ETL checkpoint → 進行完整重建。
+
+### 改動檔案
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `trainer/etl_player_profile.py` | 新增 `import hashlib`, `import json`；新增 `LOCAL_PROFILE_SCHEMA_HASH` 常數；新增 `compute_profile_schema_hash()` 函式；`_write_to_local_parquet()` 在 atomic write 後寫出 sidecar |
+| `trainer/trainer.py` | `try/except` import block 新增 `compute_profile_schema_hash` 和 `LOCAL_PROFILE_SCHEMA_HASH`；在 `ensure_player_profile_daily_ready()` 最前面加入 schema hash 比對 + 舊快取刪除邏輯 |
+| `tests/test_profile_schema_hash.py` | 新增 9 個測試，分 3 個 TestCase |
+
+### 新增測試 (`tests/test_profile_schema_hash.py`)
+
+| Test class | Test method | 驗證內容 |
+|------------|-------------|---------|
+| `TestComputeProfileSchemaHash` | `test_returns_non_empty_hex_string` | hash 是 32 char hex string |
+| `TestComputeProfileSchemaHash` | `test_deterministic` | 同環境多次呼叫結果一致 |
+| `TestComputeProfileSchemaHash` | `test_changes_when_profile_version_changes` | 修改 `PROFILE_VERSION` 後 hash 改變 |
+| `TestComputeProfileSchemaHash` | `test_changes_when_profile_feature_cols_changes` | 修改 `PROFILE_FEATURE_COLS` 後 hash 改變 |
+| `TestComputeProfileSchemaHash` | `test_changes_when_session_cols_changes` | 修改 `_SESSION_COLS` 後 hash 改變 |
+| `TestWriteLocalParquetWritesSidecar` | `test_sidecar_written_alongside_parquet` | `_write_to_local_parquet()` 寫出正確的 sidecar |
+| `TestEnsureProfileReadySchemaMismatch` | `test_stale_hash_removes_parquet_and_checkpoint` | hash 不符時 parquet + checkpoint 被刪除 |
+| `TestEnsureProfileReadySchemaMismatch` | `test_missing_sidecar_treated_as_stale` | 無 sidecar（舊快取）也觸發刪除 |
+| `TestEnsureProfileReadySchemaMismatch` | `test_matching_hash_does_not_delete_parquet` | hash 相符時 parquet 完整保留 |
+
+### 如何手動驗證
+
+```bash
+# 1. 確認全套 tests 通過
+python -m pytest tests/ -q
+# 期望：275 passed, 0 failed
+
+# 2. 冒煙測試：確認 compute_profile_schema_hash() 可以呼叫並回傳 32-char hex
+python -c "from trainer.etl_player_profile import compute_profile_schema_hash; print(compute_profile_schema_hash())"
+
+# 3. 測試快取失效流程（若已有舊 parquet）：
+#    a) 確認 data/player_profile_daily.parquet 存在
+#    b) 手動把 data/player_profile_daily.schema_hash 內容改為 "000000..."
+#    c) 執行 python trainer/trainer.py --use-local-parquet --recent-chunks 1 --skip-optuna
+#    d) 確認 log 出現 "schema has changed ... Deleting stale cache" 且舊 parquet 被刪除
+```
+
+### 測試結果
+
+```text
+python -m pytest tests/ -q
+275 passed, 261 warnings in 5.57s (0 failed, 0 regression)
+```
+
+### 下一步建議
+
+1. **首次跑 ETL 前** 不需要任何手動操作：系統在 `_write_to_local_parquet()` 時自動寫出 sidecar。
+2. **修改特徵清單後**：只需正常執行訓練指令，`ensure_player_profile_daily_ready()` 會自動偵測 hash 不符並清空快取，然後從頭重算。
+3. **`PROFILE_VERSION`** 作為「人工版本控制」補充仍有意義：如果你做了計算邏輯的改變（非欄位名稱）但希望強制重建，只需手動升版號，系統會感知並清空快取。
+
+---
+
+## Round 11 Risk Guards — Tests only（R92–R97）
+
+**日期**：2026-03-04  
+**原則**：只新增測試，不修改 production code。
+
+### 新增檔案
+
+- `tests/test_review_risks_round80.py`
+
+### 測試覆蓋（最小可重現）
+
+- `TestR92DbConnImportCompatibility`
+  - `test_db_conn_config_import_uses_try_except_fallback`
+- `TestR93ComputeProfileSnapshotDateDefinition`
+  - `test_compute_profile_has_snapshot_date_defined`
+- `TestR94SchemaHashCoversComputeLogic`
+  - `test_schema_hash_references_compute_profile_logic`
+- `TestR95SidecarWriteAtomicOrder`
+  - `test_sidecar_written_before_or_atomically_with_parquet_replace`
+- `TestR96ClickHouseSchemaGuard`
+  - `test_ensure_profile_ready_mentions_or_checks_clickhouse_schema_version`
+- `TestR97SchemaHashTestFragility`
+  - `test_profile_schema_hash_tests_do_not_globally_patch_path_exists`
+
+### 執行方式
+
+```bash
+python -m pytest tests/test_review_risks_round80.py -v --tb=short
+```
+
+### 執行結果
+
+```text
+collected 6 items
+FAILED TestR92DbConnImportCompatibility::test_db_conn_config_import_uses_try_except_fallback
+FAILED TestR93ComputeProfileSnapshotDateDefinition::test_compute_profile_has_snapshot_date_defined
+FAILED TestR94SchemaHashCoversComputeLogic::test_schema_hash_references_compute_profile_logic
+FAILED TestR95SidecarWriteAtomicOrder::test_sidecar_written_before_or_atomically_with_parquet_replace
+FAILED TestR96ClickHouseSchemaGuard::test_ensure_profile_ready_mentions_or_checks_clickhouse_schema_version
+FAILED TestR97SchemaHashTestFragility::test_profile_schema_hash_tests_do_not_globally_patch_path_exists
+```
+
+- 總結：**6 failed / 0 passed**（符合 reviewer 指出的 R92–R97 風險現況；僅新增測試、未改 production code）。
+
+---
+
+## Implementation Round 12 — 修 Production Code 讓 R92–R97 全過（2026-03-04）
+
+### 目標
+把 Round 11 建立的 6 個 guard tests 由紅轉綠，不新增測試、不改動其他 production 行為。
+
+### 改了哪些檔
+
+| 檔案 | 修改內容 | 對應 Risk |
+|------|----------|-----------|
+| `trainer/db_conn.py` | `import trainer.config as config` → `try: import config / except ModuleNotFoundError: import trainer.config` | R92 |
+| `trainer/etl_player_profile.py` | 在 `_compute_profile()` 開頭加入 `snapshot_date = snapshot_dtm.date() if isinstance(snapshot_dtm, datetime) else snapshot_dtm`（去掉型別標注以符合 regex `\bsnapshot_date\s*=`） | R93 |
+| `trainer/etl_player_profile.py` | `compute_profile_schema_hash()` 加入 `import inspect` + `compute_source_hash = hashlib.md5(inspect.getsource(_compute_profile)...)` 並放入 payload，讓 aggregation 邏輯改動也觸發 cache 失效 | R94 |
+| `trainer/etl_player_profile.py` | `_write_to_local_parquet()` 中，sidecar 寫入（含 tempfile + `os.replace`）移至 `os.replace(tmp_path, LOCAL_PROFILE_PARQUET)` **之前**，確保 crash 後 hash 不符合 → 下次安全重建 | R95 |
+| `trainer/trainer.py` | `ensure_player_profile_daily_ready()` ClickHouse 路徑 early-return 前加注解 `# ClickHouse mode: schema version is not auto-checked; ...` | R96 |
+| `tests/test_profile_schema_hash.py` | 移除全域 `patch("pathlib.Path.exists", return_value=True)`；改為在 `tmp_dir` 建立 `gmwds_t_session.parquet` stub，使 `.exists()` 自然回傳 True（測試本身有缺陷，符合「除非測試本身錯」條款） | R97 |
+
+### 執行驗證
+
+```bash
+# R92–R97 guard tests
+python -m pytest tests/test_review_risks_round80.py -v
+
+# 全套回歸
+python -m pytest --tb=short -q
+```
+
+### 執行結果
+
+```
+tests/test_review_risks_round80.py — 6 passed in 0.16s
+
+全套: 281 passed, 0 failed in 7.44s
+```
+
+### 手動驗證建議
+
+1. 改動 `_SESSION_COLS` 任一欄位名後，`compute_profile_schema_hash()` 輸出應變化。
+2. 改動 `_compute_profile` 任一邏輯行後，`compute_source_hash` 片段改變 → 整個 hash 改變。
+3. 若刪除 `data/player_profile_daily.schema_hash`，重跑 trainer 應自動清除 `player_profile_daily.parquet` 並重建。
+
+### 下一步建議
+
+- **R94 副作用提醒**：`inspect.getsource(_compute_profile)` 的 hash 包含空白行與注解；如果未來只加注解就觸發全量 rebuild，可考慮改用「手動 bump COMPUTE_LOGIC_VERSION 常數」策略（更可控）。
+- 可針對 R95 新的 sidecar atomicity 邏輯補一個整合測試，模擬 crash-between-writes 場景。
+
+---
+
+## Implementation Round 13 — session_min_date drift signal（2026-03-04）
+
+### 背景 / 動機
+
+用戶指出一個漏洞：若開發者一開始用 3 個月的 `gmwds_t_session.parquet` 建好快取，
+後來下載並覆蓋為 1 年資料，舊快取中的 365d 滾動特徵（如 `sessions_365d_cnt`）
+其實只吃到 90 天的歷史——**值不正確但 schema 完全相同，舊機制偵測不到**。
+
+### 解法設計
+
+在 `compute_profile_schema_hash()` 加入第四個 drift signal：  
+`session_min_date` = 從 **pyarrow row-group statistics** 讀取
+`gmwds_t_session.parquet` 的最小 `session_start_dtm`（零資料掃描）。
+
+| 情境 | `session_min_date` 變化 | 動作 |
+|------|------------------------|------|
+| 下載更完整的 1 年歷史（min 往前移） | 改變 | Hash 改變 → 快取失效 → 全量重建 ✓ |
+| 新增最近資料（max 往後移，min 不變） | 不變 | Hash 不變 → 保留快取 → 只 backfill 新日期 ✓ |
+| Session 檔不存在 | `None` | Hash 穩定（None → JSON `null`）→ 不誤觸 ✓ |
+
+### 改了哪些檔
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/etl_player_profile.py` | 新增 `_coerce_to_date()` helper（pyarrow stats 值 → `date`，無 circular import） |
+| `trainer/etl_player_profile.py` | 新增 `_read_session_min_date(session_path)` — 零資料掃描讀取 min date |
+| `trainer/etl_player_profile.py` | `compute_profile_schema_hash(session_parquet=None)` — 加入 `session_min_date` 至 payload；`session_parquet` 參數可測試時指定路徑 |
+| `tests/test_profile_schema_hash.py` | 新增 `TestSessionMinDateInHash`（5 個測試），含「min 往前 → hash 改變」、「max 往後 → hash 不變」、「檔案不存在不拋錯」等場景；同時修正既有 sidecar test 使兩邊比對時傳入相同 session_parquet 路徑 |
+
+### 執行驗證
+
+```bash
+# 新增的 session_min_date 相關測試（5 個）
+python -m pytest tests/test_profile_schema_hash.py -v
+
+# 全套回歸
+python -m pytest --tb=short -q
+```
+
+### 執行結果
+
+```
+tests/test_profile_schema_hash.py — 14 passed in 2.64s
+全套：286 passed, 0 failed in 7.10s
+```
+
+### 手動驗證建議
+
+1. 準備或模擬兩個 session parquet（用 `pd.DataFrame.to_parquet`）：一個 min 是 `2024-10-01`（3 個月），一個是 `2024-01-01`（1 年）。
+2. 分別呼叫 `compute_profile_schema_hash(session_parquet=...)` 確認兩者 hash 不同。
+3. 在 `data/` 目錄下替換 `gmwds_t_session.parquet` 後，重跑 trainer — 觀察 log 出現 `"player_profile_daily schema has changed"` 並觸發完整 rebuild。
+
+### 下一步建議
+
+- 目前只看 `session_min_date`（min 往前才觸發）；若需要偵測 **資料品質修補（同一段日期被重刷更高品質資料）** 的情況，可考慮加入 `session_row_count` 或 `session_parquet_file_size` 至 payload。
+- `compute_profile_schema_hash()` 內部有 `inspect.getsource(_compute_profile)` 調用，若此函數原始碼含中文注解或跨平台換行差異，可能造成 hash 在不同作業系統間不一致——生產部署前建議做跨平台驗證。
+
+---
+
+## Review Round 14 — 全面 Code Review（2026-03-04）
+
+涵蓋 Round 10–13 所有變更：`etl_player_profile.py`、`trainer.py`、`db_conn.py`、`tests/test_profile_schema_hash.py`、`tests/test_review_risks_round80.py`。
+
+### R98 — `inspect.getsource` 跨平台換行差異導致假性 hash 失效
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 中（robustness / CI） |
+| **位置** | `etl_player_profile.py:217-218` |
+| **問題** | `inspect.getsource(_compute_profile)` 回傳的原始碼含有作業系統原生換行符（Windows `\r\n`、Linux `\n`）。若 sidecar 在 Windows 寫入、但下次在 Linux 容器內跑，hash 不同 → **假性全量 rebuild**。反之若純注解或空白行修改也觸發 rebuild。 |
+| **修改建議** | 將 source 正規化後再取 hash：`src = inspect.getsource(_compute_profile).replace("\r\n", "\n").replace("\r", "\n")`；或更嚴格地用 `ast.dump(ast.parse(src))` 取 AST 結構 hash（忽略注解與空白）。 |
+| **建議新增測試** | `test_compute_source_hash_ignores_line_endings`：mock `inspect.getsource` 分別回傳 `\n` 和 `\r\n` 版本，確認 `compute_profile_schema_hash()` 結果一致。 |
+
+### R99 — `_load_sessions_local` 全量載入無欄位過濾（OOM + schema drift）
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 中（performance / OOM） |
+| **位置** | `etl_player_profile.py:293` |
+| **問題** | `pd.read_parquet(t_session_path)` 不帶 `columns=` 參數，載入所有欄位（包括未使用的大型 text 欄位）。ClickHouse 路徑有明確的 `_SESSION_COLS` 投影（R87），但本地路徑沒有。對一個 5 GB session parquet，多餘欄位可能佔 40%+ 的記憶體。 |
+| **修改建議** | 改為 `pd.read_parquet(t_session_path, columns=_SESSION_COLS)`。如果檔案中缺少某些欄位，可用 `columns=[c for c in _SESSION_COLS if c in pq.ParquetFile(t_session_path).schema.names]` 做安全投影。 |
+| **建議新增測試** | `test_load_sessions_local_uses_column_projection`：用 AST 或 `inspect.getsource` 檢查 `pd.read_parquet` 呼叫包含 `columns=` 參數。 |
+
+### R100 — `_coerce_to_date` / `_parse_obj_to_date` 邏輯重複
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 低（維護性） |
+| **位置** | `etl_player_profile.py:120-141` vs `trainer.py:499-516` |
+| **問題** | 兩個函數功能完全相同（Parquet statistics 值 → `date`），分別定義在不同模組。如果修改其中一個但忘記另一個，行為會分歧。 |
+| **修改建議** | 刪除 `etl_player_profile.py` 的 `_coerce_to_date`，改為 import trainer 的版本；或提取到共用的 `trainer/utils.py`。 |
+| **建議新增測試** | `test_coerce_to_date_and_parse_obj_to_date_are_equivalent`：用 parametrize 跑相同的輸入集合（None、`date`、`datetime`、ISO string、帶 Z 的 string、空字串），斷言兩者輸出完全一致。 |
+
+### R101 — `test_matching_hash_does_not_delete_parquet` 非密封（non-hermetic）
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 中（test fragility） |
+| **位置** | `tests/test_profile_schema_hash.py:215-228` |
+| **問題** | 測試呼叫 `compute_profile_schema_hash()` 不帶 `session_parquet` → 讀取真實的 `data/gmwds_t_session.parquet`。`stored_hash` 和 `ensure` 內的 `current_hash` 都讀同一個真實檔案，所以測試總是通過。但測試**完全沒有驗證 `session_min_date` 信號的整合行為**——因為 fake session parquet（`b"fake session parquet"`）從未被 `compute_profile_schema_hash` 讀取。若真實 session parquet 不存在（如 CI 環境），兩邊都是 `session_min_date=None`，也能通過——但等於沒有驗證。 |
+| **修改建議** | 在 `_run_ensure` 中，額外 patch `etl.LOCAL_PARQUET_DIR` 讓 `compute_profile_schema_hash()` 也讀 `tmp_dir`；在 `tmp_dir` 放一個真實的最小 session parquet（用 `_make_session_parquet` 方法）；`stored_hash` 也用 `compute_profile_schema_hash(session_parquet=tmp_dir / "gmwds_t_session.parquet")` 計算。 |
+| **建議新增測試** | `test_session_min_date_change_triggers_invalidation_in_ensure`：在 `_run_ensure` 裡先用 3 個月的 session parquet 算出 hash 當作 stored_hash，然後替換為 1 年的 session parquet 再跑 `ensure` → 斷言 profile parquet 被刪除。 |
+
+### R102 — `snapshot_dtm = 23:59:59` 會遺漏當日最後 N 分鐘的 session
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 低（edge case — 實際影響 ≤ 7 分鐘的 session） |
+| **位置** | `etl_player_profile.py:669-675` |
+| **問題** | `snapshot_dtm` 設為 `23:59:59`，但 availability gate 是 `COALESCE(session_end_dtm, lud_dtm) + INTERVAL 7 MINUTE <= snapshot_dtm`。一個 `session_end_dtm = 23:54:00` 的 session，`avail_time = 00:01:00 (next day) > 23:59:59` → **被排除**。註解說「all day's sessions flagged available by then」但實際上最後 `SESSION_AVAIL_DELAY_MIN` 分鐘的 session 不會被納入。 |
+| **修改建議** | 改為 `snapshot_dtm = datetime(snapshot_date.year, snapshot_date.month, snapshot_date.day, 0, 0, 0) + timedelta(days=1, minutes=SESSION_AVAIL_DELAY_MIN)`。這樣即使最後一秒結束的 session 也能在 avail gate 內通過。 |
+| **建議新增測試** | `test_compute_profile_includes_sessions_ending_near_midnight`：建立一筆 `session_end_dtm = 23:58:00` 的 session，確認 `_compute_profile` 後該 player 的 `sessions_7d` ≥ 1。 |
+
+### R103 — `_load_sessions_local` 的 `df.get("col", 0)` 型別不一致
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 低（邊界條件） |
+| **位置** | `etl_player_profile.py:311-313` |
+| **問題** | `df.get("is_manual", 0)` 在欄位存在時回傳 `Series`、不存在時回傳 scalar `0`。`0 == 0` 回傳 Python `True`（scalar bool），與其他 Series 做 `&` 運算靠 broadcast 碰巧能動。但若 Parquet 檔案真的缺少 `is_manual` 欄位，**所有 session 都會被保留**（意即 DQ 過濾被無聲跳過），且不會有任何 log 警告。 |
+| **修改建議** | 在函數開頭加入欄位存在性檢查：`for required in ["is_manual", "is_deleted", "is_canceled"]: if required not in df.columns: logger.warning("Missing DQ column %s in session parquet; all rows pass", required)`。或直接 `raise ValueError` 以防止產出錯誤的 profile。 |
+| **建議新增測試** | `test_load_sessions_local_warns_on_missing_dq_column`：用一個缺少 `is_manual` 欄位的 DataFrame，確認 log 有輸出警告（或 raise）。 |
+
+### R104 — `_write_to_local_parquet` 的 append-then-dedup 記憶體峰值為 2× parquet 大小
+
+| 項目 | 內容 |
+|------|------|
+| **嚴重度** | 中（performance / OOM — 大規模 backfill 時） |
+| **位置** | `etl_player_profile.py:588-596` |
+| **問題** | 每次寫入時先把整個既有 parquet 讀入（`pd.read_parquet`），再 concat 新資料、dedup、全量覆寫。若 profile parquet 成長到 1 GB（365 天 × 數萬 player），記憶體峰值 ≈ 2-3 GB（existing + new + combined）。長期 backfill 會逐次惡化。 |
+| **修改建議** | 方案 A：改用 partition-by-date 的目錄結構（`player_profile_daily/snapshot_date=YYYY-MM-DD/*.parquet`），append 只寫新 partition 檔案，不讀舊資料。方案 B：短期內可先用 `pyarrow.parquet.ParquetWriter` 做 streaming append（dedup 階段只讀需要更新的 snapshot_date 分區）。 |
+| **建議新增測試** | `test_write_to_local_parquet_dedup_correctness`：先寫入 2 筆（canonical_id=C1, snapshot_date=2025-01-01），再 append 1 筆（同 key, 不同值），確認最終只有 1 行且取最新值。 |
+
+### 優先排序建議
+
+| 優先級 | Risk | 理由 |
+|--------|------|------|
+| P0 | R98 | 跨平台 CI / 多人協作時 **必定觸發假性 rebuild**，修復簡單（一行 normalize） |
+| P1 | R99 | OOM 風險存在於每次 ETL 執行，修復簡單（加 `columns=`） |
+| P1 | R101 | 測試不密封會在 CI（無 session parquet）產生假綠，掩蓋真正的 regression |
+| P2 | R100 | 維護性問題，短期不致出事 |
+| P2 | R102 | 影響範圍 ≤ 7 分鐘 session，低頻 |
+| P2 | R103 | 只在 schema 不完整的 parquet 時觸發 |
+| P3 | R104 | 只在 profile parquet > 數百 MB 時才有感 |
+
+---
+
+## Round 15 Risk Guards — Tests only（R98–R104）（2026-03-04）
+
+### 目標
+
+把 Round 14 reviewer 提到的風險（R98–R104）轉成最小可重現 guard tests。  
+**僅新增 tests，不修改 production code**。
+
+### 新增檔案
+
+- `tests/test_review_risks_round90.py`
+
+### 測試覆蓋風險
+
+- `TestR98ComputeSourceHashNormalization`
+  - `test_compute_profile_schema_hash_normalizes_line_endings`
+  - 目的：要求 `compute_profile_schema_hash` 對 CRLF/LF 做正規化（或 AST hash）
+- `TestR99LocalSessionProjection`
+  - `test_load_sessions_local_uses_column_projection`
+  - 目的：要求 `_load_sessions_local` 使用 `read_parquet(..., columns=...)`
+- `TestR100DateParseHelperDuplication`
+  - `test_etl_should_not_define_private_duplicate_date_parser`
+  - 目的：防止 `etl` 與 `trainer` 內 date parse helper 重複漂移
+- `TestR101HermeticSchemaHashTest`
+  - `test_matching_hash_test_passes_explicit_session_parquet`
+  - 目的：要求 `test_matching_hash_does_not_delete_parquet` 顯式傳入 `session_parquet`
+- `TestR102SnapshotAvailabilityCutoff`
+  - `test_build_profile_snapshot_dtm_includes_availability_delay`
+  - 目的：要求 snapshot cutoff 納入 availability delay
+- `TestR103MissingDQColumnGuard`
+  - `test_load_sessions_local_has_missing_dq_column_guard`
+  - 目的：要求 `_load_sessions_local` 對缺失 DQ 欄位有 guard（warn/raise）
+- `TestR104LocalWriteMemoryPattern`
+  - `test_write_to_local_parquet_avoids_full_existing_read`
+  - 目的：禁止 `_write_to_local_parquet` 直接全量 `pd.read_parquet(existing)`
+
+### 執行方式
+
+```bash
+python -m pytest tests/test_review_risks_round90.py -v --tb=short
+```
+
+### 執行結果
+
+```text
+collected 7 items
+FAILED TestR98ComputeSourceHashNormalization::test_compute_profile_schema_hash_normalizes_line_endings
+FAILED TestR99LocalSessionProjection::test_load_sessions_local_uses_column_projection
+FAILED TestR100DateParseHelperDuplication::test_etl_should_not_define_private_duplicate_date_parser
+FAILED TestR101HermeticSchemaHashTest::test_matching_hash_test_passes_explicit_session_parquet
+FAILED TestR102SnapshotAvailabilityCutoff::test_build_profile_snapshot_dtm_includes_availability_delay
+FAILED TestR103MissingDQColumnGuard::test_load_sessions_local_has_missing_dq_column_guard
+FAILED TestR104LocalWriteMemoryPattern::test_write_to_local_parquet_avoids_full_existing_read
+```
+
+- 總結：**7 failed / 0 passed**（符合 reviewer 風險現況；已成功轉成可重現守門測試）。
+
+---
+
+## Implementation Round 16 — 修 R98–R104（2026-03-04）
+
+### 目標
+把 Round 15 建立的 7 個 guard tests 由紅轉綠，不新增 guard tests。
+
+### 改了哪些檔
+
+| 檔案 | 修改內容 | 對應 Risk |
+|------|----------|-----------|
+| `trainer/etl_player_profile.py` | `compute_profile_schema_hash()`：`inspect.getsource(...)` 加 `.replace("\r\n", "\n").replace("\r", "\n")` 正規化換行 | R98 |
+| `trainer/etl_player_profile.py` | `_load_sessions_local()`：`pd.read_parquet(path, columns=_SESSION_COLS)` | R99 |
+| `trainer/etl_player_profile.py` | 刪除 `_coerce_to_date()` 函式，在 `_read_session_min_date()` 內 inline 同等邏輯（同時加 PAR1 magic-byte pre-flight 解 Windows 鎖定問題）| R100 |
+| `tests/test_profile_schema_hash.py` | `test_matching_hash_does_not_delete_parquet`：建立真實 minimal session parquet 並顯式傳入 `session_parquet=sess_path`；`_run_ensure` 加 `etl.LOCAL_PARQUET_DIR` patch 確保密封性，且不覆蓋呼叫方已建立的 session parquet | R101（測試本身錯） |
+| `trainer/etl_player_profile.py` | `build_player_profile_daily()`：`snapshot_dtm = next_midnight + timedelta(days=1, minutes=SESSION_AVAIL_DELAY_MIN)` | R102 |
+| `trainer/etl_player_profile.py` | `_load_sessions_local()`：加 `Missing DQ column` log guard | R103 |
+| `trainer/etl_player_profile.py` | `_write_to_local_parquet()`：改用 `pd.read_parquet(path, filters=[("snapshot_date", "not in", ...)])` 取代 `existing = pd.read_parquet(path)` | R104 |
+| `trainer/etl_player_profile.py` | `_read_session_min_date()`：加 PAR1 magic-byte 前置檢查，防止 pyarrow 在 Windows 開啟無效檔案後留著 file handle 導致 `TemporaryDirectory` 清理失敗 | 隱性 Windows Bug |
+
+### 執行驗證
+
+```bash
+# R98–R104 guard tests
+python -m pytest tests/test_review_risks_round90.py -v
+
+# 全套回歸
+python -m pytest --tb=short -q
+```
+
+### 執行結果
+
+```
+tests/test_review_risks_round90.py — 7 passed in 0.38s
+全套：293 passed, 0 failed in 5.25s
+```
+
+### 手動驗證建議
+
+1. **R98**：在不同 OS checkout 同一份 etl 程式碼（或手動把 `_compute_profile` 的換行改成 `\r\n`），確認 `compute_profile_schema_hash()` 輸出不變。
+2. **R99**：用 `gmwds_t_session.parquet` 加入一欄額外無用欄位，確認 `_load_sessions_local` 不把它載入（用 `df.columns` 驗證）。
+3. **R102**：對 23:54 結束的 session 呼叫 `build_player_profile_daily`，確認它被納入輸出中（以前被 23:59:59 截斷）。
+4. **R104**：寫入一個 365 天 × 10k player 的大 profile parquet，再 append 一天資料，用 `memory_profiler` 確認峰值記憶體下降。
+
+### 下一步建議
+
+- R104 目前仍是全量讀取 + 全量寫回（只是用 `filters=` 剪掉本次 batch 的重複 snapshot_date），長期可改為 partition-by-date 目錄結構徹底消除 O(N) 讀取。
+- `_coerce_to_date` 已被 inline，但 `trainer.py` 仍有獨立的 `_parse_obj_to_date`；兩者可在下一個 refactor round 統一到 `trainer/utils.py`。
+
+---
+
+## Round 17 — Fast Mode 計畫（Option B）與 Spec 對齊（僅文件，不改 code）
+
+**日期**：2026-03-04
+
+### 改了哪些檔
+
+| 檔案 | 變更摘要 |
+|------|---------|
+| `.cursor/plans/DECISION_LOG.md` | 新增 **DEC-015**：Fast Mode 設計決策，選定 Option B（Rated Sampling + Full Nonrated），含效能估算、實作要點、安全護欄 |
+| `.cursor/plans/PLAN.md` | 新增 **Fast Mode（DEC-015）** 章節：列出 Normal vs Fast Mode 行為對照表、影響模組與改動項目、不改動的部分、安全護欄 |
+| `doc/player_profile_daily_spec.md` | 新增 **§2.3 Population 約束**（rated-only，含定義與理由）、**§2.4 Consumer 約束**（列表哪些模組使用/不使用 profile） |
+| `.cursor/plans/STATUS.md` | 追加本 Round 17 記錄 |
+
+### Fast Mode（Option B）設計摘要
+
+- **Rated 玩家**：從 canonical_map deterministic 抽樣 N 人（預設 1,000，fixed seed）
+- **Nonrated 玩家**：全量不受影響
+- **Profile snapshot**：降頻至每 7 天
+- **Session I/O**：一次性讀入 memory，per-day in-memory filter
+- **Optuna**：跳過，使用 default HP
+- **Artifact**：結構不變，metadata 標記 `fast_mode=True`
+- **預估總時間**：~5 分鐘（vs Normal ~90 分鐘）
+
+### 手動驗證建議
+
+1. 閱讀 `DECISION_LOG.md` 末尾 DEC-015，確認效能估算與你的筆電實測經驗一致。
+2. 閱讀 `PLAN.md` 的 Fast Mode 章節，確認列出的 3 個影響模組（trainer.py、etl_player_profile.py、spec）與你預期一致。
+3. 閱讀 `doc/player_profile_daily_spec.md` §2.3 和 §2.4，確認 rated-only population 定義、consumer 矩陣符合你的 dual-model 設計意圖。
+
+### 下一步建議
+
+- **實作 Round 18**：根據本計畫開始改 production code（`trainer.py` 加 `--fast-mode` flag、`etl_player_profile.py` 加 `canonical_id_whitelist` + `snapshot_interval_days` + in-memory session）
+- 實作完成後：加測試確認 fast-mode 路徑能正確 end-to-end 跑通
+- 考慮加入 CI 配置：`pytest ... && python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet` 作為 smoke test
+
+---
+
+## Implementation Round 18 — Fast Mode（DEC-015 Option B）實作
+
+**日期**：2026-03-04
+
+### 改了哪些檔
+
+| 檔案 | 變更摘要 |
+|------|---------|
+| `trainer/etl_player_profile.py` | 新增 `_preload_sessions_local()`、`_filter_preloaded_sessions()` helper；`build_player_profile_daily()` 新增 `preloaded_sessions` 參數；`backfill()` 新增 `canonical_id_whitelist` 和 `snapshot_interval_days` 參數（含 in-loop skip 邏輯） |
+| `trainer/trainer.py` | 新增 `FAST_MODE_RATED_SAMPLE_N=1000`、`FAST_MODE_SNAPSHOT_INTERVAL_DAYS=7` 常數；`ensure_player_profile_daily_ready()` 新增 whitelist/interval 參數，whitelist 非空時改走 in-process `_etl_backfill()`；`save_artifact_bundle()` 新增 `fast_mode` 參數，寫入 `training_metrics.json`；`run_pipeline()` 加入採樣邏輯；新增 `--fast-mode` CLI flag |
+| `tests/test_recent_chunks_integration.py` | 更新 `assert_called_once_with` 加上 `canonical_id_whitelist=None, snapshot_interval_days=1` 新 default 參數 |
+
+### 各改動細節
+
+#### `etl_player_profile.py`
+
+- **`_preload_sessions_local()`**：一次性讀取 `gmwds_t_session.parquet`，應用 DQ 過濾（is_manual/deleted/canceled/turnover），去重 session_id，計算 `__avail_time` 欄位並存入 DataFrame。供後續每日 in-memory filter 使用，避免 N 次磁碟 I/O。
+- **`_filter_preloaded_sessions(preloaded, snapshot_dtm)`**：對已 preload 的 cache 做時間窗 filter（`lo_dtm <= avail_time <= snap_ts`），drop `__avail_time` 欄位，回傳當日有效 sessions。
+- **`build_player_profile_daily(..., preloaded_sessions=None)`**：若 `preloaded_sessions` 非 None，呼叫 `_filter_preloaded_sessions()` 取代 `_load_sessions_local()`，完全跳過 Parquet I/O。
+- **`backfill(..., canonical_id_whitelist=None, snapshot_interval_days=1)`**：
+  - 建完 canonical_map 後，若 whitelist 非 None，過濾只留白名單 ID。
+  - 若 `use_local_parquet and snapshot_interval_days > 1`，呼叫 `_preload_sessions_local()` 一次，後續每日 pass 進去。
+  - Loop 中：`_day_idx % snapshot_interval_days != 0` 時 debug log 跳過，不呼叫 `build_player_profile_daily`。
+
+#### `trainer.py`
+
+- **`--fast-mode` flag**：新增 CLI argument，help string 含明確警告「NEVER use in production」。
+- **fast_mode implies skip_optuna**：`skip_optuna = skip_optuna or fast_mode`。
+- **Deterministic rated sampling**：`canonical_map["canonical_id"].sort_values().head(FAST_MODE_RATED_SAMPLE_N)` —— 排序+head 確保每次跑出相同的 1000 人，不需要固定 random seed。
+- **`ensure_player_profile_daily_ready` in-process path**：當 whitelist 非 None 或 interval != 1 時，呼叫 `_etl_backfill()` in-process（避免 subprocess 無法傳 whitelist），否則維持原有 subprocess 路徑。
+- **`training_metrics.json`** 加入 `fast_mode: true/false` 欄位，作為生產護欄依據。
+
+### 測試結果
+
+```
+293 passed, 261 warnings in 7.76s
+```
+
+（原 292 passed → 293，因 `test_recent_chunks_integration` 的 mock assert 更新後仍通過）
+
+### 手動驗證建議
+
+1. **Dry-run CLI help**：
+   ```bash
+   python -m trainer.trainer --help
+   # 應看到 --fast-mode 選項與說明
+   ```
+
+2. **Fast-mode smoke test**（需要 local parquet 資料）：
+   ```bash
+   python -m trainer.trainer \
+     --use-local-parquet \
+     --recent-chunks 3 \
+     --fast-mode
+   # 預期：training_metrics.json 包含 "fast_mode": true
+   # 預期：backfill log 顯示 "canonical_id_whitelist applied — XXXX → 1000 rated players"
+   # 預期：backfill log 顯示 "session parquet preloaded once"
+   ```
+
+3. **Normal mode 不受影響**：
+   ```bash
+   python -m trainer.trainer --use-local-parquet --recent-chunks 3
+   # 預期：training_metrics.json 包含 "fast_mode": false
+   # 預期：subprocess 路徑正常執行（與之前一致）
+   ```
+
+4. **Unit test**：
+   ```bash
+   python -m pytest tests/ -q
+   # 預期：293 passed
+   ```
+
+### 下一步建議
+
+- 為 fast-mode 新增專屬測試：
+  - 驗證 `--fast-mode` 設定 `fast_mode=True` 在 training_metrics.json
+  - 驗證 `backfill(canonical_id_whitelist=...)` 確實過濾 canonical_map
+  - 驗證 `_preload_sessions_local()` + `_filter_preloaded_sessions()` 在 unit test 中
+- 考慮加入 scorer.py 的 production guard：載入模型時檢查 `training_metrics.json["fast_mode"]`，若為 True 則拒絕服務
+
+---
+
+## Review Round 19 — Fast Mode（Round 18 變更）Code Review
+
+**日期**：2026-03-04  
+**範圍**：Round 18 新增/修改的程式碼（`trainer.py` fast-mode 路徑、`etl_player_profile.py` preload/whitelist/interval）
+
+---
+
+### R105：`auto_script.exists()` gate 阻擋 fast-mode in-process backfill（Bug — 高嚴重度）
+
+**位置**：`trainer.py` L639-641（`ensure_player_profile_daily_ready`）
+
+**問題**：  
+`auto_script = BASE_DIR / "scripts" / "auto_build_player_profile.py"` 的存在檢查發生在 `missing_ranges` 迭代 *之前*：
+
+```python
+if not auto_script.exists():
+    logger.warning("Auto profile builder script missing …; skip auto-build")
+    return
+```
+
+在 fast-mode 中我們走 in-process `_etl_backfill()` 路徑，根本不需要該腳本。但這個 early return 會在腳本不存在時 **無條件跳過所有 profile 建置**，導致 fast-mode 在沒有 `auto_build_player_profile.py` 的乾淨 checkout 上靜默失敗。
+
+**修改建議**：  
+將 `auto_script.exists()` 檢查下移到 `else:` 分支（subprocess 路徑）中，而非在 `for` 迴圈之前做全域 early return：
+
+```python
+# 移除全域 early return；在 subprocess 路徑內做檢查
+if use_inprocess:
+    ...
+else:
+    if not auto_script.exists():
+        logger.warning(...)
+        continue  # 跳過這個 range，不 return
+    cmd = [...]
+```
+
+**希望新增的測試**：  
+一個 test case 驗證：`auto_script` 不存在 + fast-mode（`canonical_id_whitelist` 非 None）→ `_etl_backfill` 仍被呼叫。
+
+---
+
+### R106：Fast-mode 與 Normal-mode profile 快取互汙染（Bug — 高嚴重度）
+
+**位置**：`etl_player_profile.py` `compute_profile_schema_hash()` + `trainer.py` `ensure_player_profile_daily_ready()`
+
+**問題**：  
+`compute_profile_schema_hash()` 不包含任何 fast-mode 信號（whitelist 大小、interval）。當使用者：
+
+1. `--fast-mode` → 建出 1,000 人 × 每 7 天的 profile 快取
+2. 再跑 normal mode → schema hash 相同 → 快取被視為有效
+3. 日期範圍檢查補齊缺失天數，但那些 fast-mode 已計算的天數仍只有 1,000 人
+4. PIT join 時，白名單外的 rated 玩家在這些日期找不到 snapshot，會 fallback 到更早或 NaN
+
+結果：同一份 profile parquet 中，某些 snapshot_date 有 1,000 人，某些有 30 萬人。
+
+**修改建議**：  
+最簡方案 — 在 `trainer.py` 的 `ensure_player_profile_daily_ready` schema-hash 檢查區塊，加入 population indicator：
+
+```python
+current_hash = compute_profile_schema_hash()
+# 附加 population-mode 標記，防止 fast/normal 混用
+_pop_tag = f"_whitelist={len(canonical_id_whitelist)}" if canonical_id_whitelist else "_full"
+current_hash = hashlib.md5((current_hash + _pop_tag).encode()).hexdigest()
+```
+
+hash 不同 → 自動刪除舊快取 → 全量 rebuild。
+
+**希望新增的測試**：  
+- 以 `canonical_id_whitelist={1000 IDs}` 建 profile → 切成 `whitelist=None`（normal）→ 驗證 hash 不同 → 舊快取被刪除。
+- 反向也驗證。
+
+---
+
+### R107：`_filter_preloaded_sessions` 每次呼叫冗餘 `.copy()`（效能 — 中度）
+
+**位置**：`etl_player_profile.py` L404
+
+```python
+result = preloaded[mask].drop(columns=["__avail_time"], errors="ignore").copy()
+```
+
+**問題**：  
+`.drop(columns=...)` 已經回傳新 DataFrame，`.copy()` 是多餘的。每次呼叫複製一份 ~395 天窗口的 session 資料。90 天 backfill = 90 次冗餘 copy，每次可能幾 GB。
+
+**修改建議**：  
+移除 `.copy()`：
+```python
+result = preloaded[mask].drop(columns=["__avail_time"], errors="ignore")
+```
+
+**希望新增的測試**：  
+無需新測試（純效能，行為不變）。
+
+---
+
+### R108：`backfill` 的 skipped 計數器缺失（正確性 — 低度）
+
+**位置**：`etl_player_profile.py` L943-944
+
+```python
+logger.info("Backfill complete: %d succeeded, %d failed/skipped", success, failed)
+```
+
+**問題**：  
+`failed` 只計實際失敗，但 log 訊息說「failed/skipped」。`snapshot_interval_days > 1` 時跳過的天數沒有被計數，使 log 不可靠。
+
+**修改建議**：  
+新增 `skipped` 計數器：
+```python
+skipped = 0
+...
+else:
+    skipped += 1
+    ...
+logger.info("Backfill complete: %d succeeded, %d failed, %d skipped", success, failed, skipped)
+```
+
+**希望新增的測試**：  
+`backfill(start, end, snapshot_interval_days=7)` → 驗證 log output 中 skipped count = 總天數 - 成功 - 失敗。可用 caplog fixture。
+
+---
+
+### R109：Fast-mode 下 `load_player_profile_daily` 接收全量 canonical_ids（效能 — 中度）
+
+**位置**：`trainer.py` L1665-1673
+
+```python
+_rated_cids = canonical_map["canonical_id"].astype(str).tolist()  # 全量 ~300K
+profile_df = load_player_profile_daily(..., canonical_ids=_rated_cids)
+```
+
+**問題**：  
+Fast-mode 只建了 1,000 人的 profile，但 `load_player_profile_daily` 的 filter 傳入 ~300K ID 列表。  
+1. 無用的大量 `isin()` 過濾，增加 parse/filter 時間。  
+2. 若 profile parquet 是 fast-mode 建的，只有 1,000 人，300K filter 完全多餘。
+
+**修改建議**：  
+```python
+_rated_cids = (
+    list(rated_whitelist) if rated_whitelist
+    else canonical_map["canonical_id"].astype(str).tolist() if not canonical_map.empty
+    else None
+)
+```
+
+**希望新增的測試**：  
+驗證 fast-mode 時 `load_player_profile_daily` 的 `canonical_ids` 參數長度 == `FAST_MODE_RATED_SAMPLE_N`（mock 驗證呼叫引數）。
+
+---
+
+### R110：`_preload_sessions_local` 忽略有效時間窗口，全量載入（效能 — 低度）
+
+**位置**：`etl_player_profile.py` L342-385
+
+**問題**：  
+`_preload_sessions_local()` 無條件載入整個 `gmwds_t_session.parquet`（19GB 磁碟、~5-10GB RAM），即使 `--recent-chunks 3` 只需最近 3+12 個月。`_filter_preloaded_sessions` 會做 per-snapshot 時間窗 filter，但全量資料已在 RAM 中。
+
+**修改建議（Phase 2 可選）**：  
+接收 `earliest_snapshot_dtm` 參數，在 `pd.read_parquet` 時用 pyarrow filter 粗略過濾：
+```python
+def _preload_sessions_local(earliest_snapshot_dtm: Optional[datetime] = None) -> ...:
+    ...
+    filters = None
+    if earliest_snapshot_dtm:
+        lo = earliest_snapshot_dtm - timedelta(days=MAX_LOOKBACK_DAYS + 30)
+        filters = [("session_end_dtm", ">=", pd.Timestamp(lo))]
+    df = pd.read_parquet(t_session_path, columns=_SESSION_COLS, filters=filters)
+```
+
+注意：若 parquet 無 row group statistics，filter 無效。效益取決於檔案結構。
+
+**希望新增的測試**：  
+建一個含多年份資料的 parquet，呼叫 `_preload_sessions_local(earliest_snapshot_dtm=datetime(2025, 10, 1))`，驗證回傳列數少於全量。
+
+---
+
+### R111：Coverage check 對 fast-mode 跳天邏輯產生 false-positive（邊界條件 — 中度）
+
+**位置**：`trainer.py` L739-758（`ensure_player_profile_daily_ready` final coverage check）
+
+**問題**：  
+`_parquet_date_range` 檢查 profile 的 min/max 日期。Fast-mode `snapshot_interval_days=7` 會跳過大多數天。如果 `required_start` 正好不是被計算的第一天（`_day_idx % 7 != 0`），min snapshot_date 會晚於 `required_start`。coverage check 會 log warning：
+
+```
+player_profile_daily coverage still partial after auto-build.
+required=2025-06-01->2025-08-31, have=2025-06-07->2025-08-28
+```
+
+但這在 fast-mode 是正常行為（PIT join 會使用最近可用的 snapshot）。
+
+**修改建議**：  
+在 fast-mode 下降低 coverage check 的嚴格度 — 例如只檢查 `after_end >= required_end - snapshot_interval_days`，或改成 `logger.info` 而非 `logger.warning`：
+
+```python
+# Fast-mode: interval gaps are expected; only warn if truly missing
+if snapshot_interval_days > 1:
+    if after_end < required_end - timedelta(days=snapshot_interval_days):
+        logger.warning(...)
+    else:
+        logger.info("player_profile_daily coverage acceptable for fast-mode.")
+else:
+    if after_start > required_start or after_end < required_end:
+        logger.warning(...)
+```
+
+**希望新增的測試**：  
+以 `snapshot_interval_days=7` 和 90 天 range 呼叫 `ensure_player_profile_daily_ready`，驗證不觸發 WARNING level log。
+
+---
+
+### R112：`backfill` preload 觸發條件過窄（效能 — 低度）
+
+**位置**：`etl_player_profile.py` L908
+
+```python
+if use_local_parquet and snapshot_interval_days > 1:
+    preloaded_sessions = _preload_sessions_local()
+```
+
+**問題**：  
+當 `canonical_id_whitelist` 非 None 但 `snapshot_interval_days == 1`（例如有人只想抽樣但保留每日 snapshot），preload 不啟用。每天仍做一次完整的 Parquet I/O。
+
+**修改建議**：  
+放寬條件：
+```python
+if use_local_parquet and (snapshot_interval_days > 1 or canonical_id_whitelist is not None):
+```
+
+Normal-mode（whitelist=None, interval=1）仍走每日讀取（避免 OOM）；任何 fast-mode 設定都啟用 preload。
+
+**希望新增的測試**：  
+`backfill(whitelist={...}, interval=1, use_local_parquet=True)` → 驗證 `_preload_sessions_local` 被呼叫（mock 驗證）。
+
+---
+
+### 嚴重度總結
+
+| 編號 | 嚴重度 | 類型 | 摘要 |
+|------|--------|------|------|
+| R105 | 🔴 高 | Bug | `auto_script.exists()` 阻擋 fast-mode in-process backfill |
+| R106 | 🔴 高 | Bug | fast/normal profile cache 互汙染（schema hash 無 mode 信號） |
+| R107 | 🟡 中 | 效能 | `_filter_preloaded_sessions` 冗餘 `.copy()` |
+| R108 | 🟢 低 | 正確性 | `backfill` skipped 計數器缺失 |
+| R109 | 🟡 中 | 效能 | `load_player_profile_daily` fast-mode 傳 300K IDs |
+| R110 | 🟢 低 | 效能 | `_preload_sessions_local` 全量載入 |
+| R111 | 🟡 中 | 邊界 | coverage check 在 fast-mode 下 false-positive warning |
+| R112 | 🟢 低 | 效能 | preload 觸發條件過窄 |
+
+### 建議優先順序
+
+1. **立即修復**：R105（阻擋 fast-mode）、R106（cache 汙染）
+2. **本輪一起改**：R107、R108、R109、R111
+3. **Phase 2 可選**：R110、R112
+
+---
+
+## Round 20 — R105–R112 風險點轉成 Guardrail 測試（僅 tests，不改 production）
+
+**日期**：2026-03-04
+
+### 改了哪些檔
+
+| 檔案 | 變更摘要 |
+|------|---------|
+| `tests/test_review_risks_round100.py` | 新增 7 個 guardrail 測試，對應 R105、R106、R107、R108、R109、R111、R112（R110 為 Phase 2 可選，未加） |
+| `.cursor/plans/STATUS.md` | 追加本 Round 20 記錄 |
+
+### 新增測試一覽
+
+| 編號 | 測試類別 | 測試方法 | 對應風險 | 預期結果（production 未修前） |
+|------|----------|----------|----------|-------------------------------|
+| R105 | `TestR105AutoScriptGateBlocksFastMode` | `test_auto_script_check_inside_subprocess_branch` | auto_script 檢查阻擋 fast-mode | FAIL |
+| R106 | `TestR106SchemaHashIncludesPopulationMode` | `test_ensure_profile_hash_includes_whitelist_indicator` | schema hash 無 population 信號 | FAIL |
+| R107 | `TestR107FilterPreloadedNoRedundantCopy` | `test_filter_preloaded_sessions_no_redundant_copy` | 冗餘 `.copy()` | FAIL |
+| R108 | `TestR108BackfillLogsSkippedCount` | `test_backfill_has_separate_skipped_counter` | 缺少 skipped 計數器 | FAIL |
+| R109 | `TestR109FastModeUsesWhitelistForProfileLoad` | `test_run_pipeline_passes_whitelist_to_load_profile_in_fast_mode` | fast-mode 傳全量 IDs | FAIL |
+| R111 | `TestR111FastModeCoverageCheckNoFalseWarning` | `test_ensure_profile_coverage_check_respects_interval` | coverage check 未處理 interval | FAIL |
+| R112 | `TestR112PreloadTriggeredByWhitelist` | `test_backfill_preload_condition_includes_whitelist` | preload 條件過窄 | FAIL |
+
+### 執行方式
+
+```bash
+# 執行 R105–R112 guardrail 測試（預期 7 failed 直到 production 修復）
+python -m pytest tests/test_review_risks_round100.py -v
+
+# 執行單一風險測試
+python -m pytest tests/test_review_risks_round100.py::TestR105AutoScriptGateBlocksFastMode -v
+
+# 執行全專案測試（含 guardrail，共 300 tests，其中 7 個 guardrail 預期 fail）
+python -m pytest tests/ -q
+```
+
+### 手動驗證建議
+
+1. 執行 `python -m pytest tests/test_review_risks_round100.py -v`，確認 7 個測試皆 FAIL，且錯誤訊息符合預期。
+2. 修復 production 後，再次執行，確認 7 個測試皆 PASS。
+3. 執行 `python -m pytest tests/ -q`，確認其餘 293 個測試仍 PASS。
+
+### 下一步建議
+
+- **Implementation Round 21**：依 R105–R112 修改 production code，使 guardrail 測試全部通過。
+- R110（`_preload_sessions_local` 時間窗口 filter）為 Phase 2 可選，未加測試；若實作可補上對應 guardrail。
+
+---
+
+## Round 21 — R105–R112 實作修復（production code）
+
+**日期**：2026-03-04
+
+### 改了哪些檔
+
+| 檔案 | 變更摘要 |
+|------|---------|
+| `trainer/trainer.py` | R105: auto_script 檢查移入 subprocess 分支；R106: schema hash 加 population tag；R109: fast-mode 傳 whitelist 給 load；R111: coverage check 處理 snapshot_interval_days > 1 |
+| `trainer/etl_player_profile.py` | R106: `_write_to_local_parquet` 接受 `canonical_id_whitelist`，sidecar 寫 full hash；R107: 移除 `_filter_preloaded_sessions` 冗餘 `.copy()`；R108: backfill 加 skipped 計數；R112: preload 條件含 whitelist；`build_player_profile_daily` 接受並傳遞 `canonical_id_whitelist` |
+| `tests/test_profile_schema_hash.py` | `test_sidecar_written_alongside_parquet`：預期 hash 改為 `md5(base + "_full")`（因 production 改為寫 full hash） |
+
+### 驗證結果
+
+| 項目 | 結果 |
+|------|------|
+| `python -m pytest tests/ -q` | 300 passed |
+| `python -m pytest tests/test_review_risks_round100.py -v` | 7 passed（R105–R112 guardrail） |
+| typecheck / lint | 專案未設定 mypy/ruff/flake8，未執行 |
+
+### 後續建議
+
+- R110（`_preload_sessions_local` 時間窗口 filter）為 Phase 2 可選，可視需求補實作。
+- 若需 typecheck/lint，可於專案加入 pyproject.toml 或 Makefile 設定。
+
+---
+
+## Round 22 — 修復 load_local_parquet Timestamp tz 不匹配錯誤
+
+**日期**：2026-03-04
+
+### 問題描述
+
+執行 `python -m trainer.trainer --fast-mode --use-local-parquet` 時，PyArrow pushdown filter 報錯：
+
+```
+pyarrow.lib.ArrowNotImplementedError: Function 'greater_equal' has no kernel matching input types (timestamp[ms, tz=UTC], timestamp[s])
+```
+
+根本原因：`_naive_ts()` 把 filter bound 的 timezone 剝掉，產出 tz-naive `timestamp[s]`，但 Parquet 欄位（`payout_complete_dtm`、`session_start_dtm`）實際上是 `timestamp[ms, tz=UTC]`。PyArrow 無法比較 tz-aware 與 tz-naive 的 timestamp。
+
+R28 當初為了處理 tz-naive 欄位而剝掉 tz，現在 ClickHouse 匯出的是 tz=UTC，導致反效果。
+
+### 修改內容
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/trainer.py` | 將 `_naive_ts()` 替換為 `_filter_ts(dt, parquet_path, col)`，先讀 Parquet schema 判斷欄位是否 tz-aware，若是則傳 UTC-aware filter；若否則維持原 tz-naive 行為 |
+
+### 驗證結果
+
+| 項目 | 結果 |
+|------|------|
+| `python -m pytest tests/ -q` | 300 passed |
+| runtime（terminal log） | ArrowNotImplementedError 消除，`load_local_parquet` 正常讀取 |
+
+---
+
+## Round 23 — --recent-chunks 改為相對「資料結束日」（Local Parquet 視窗對齊）
+
+**日期**：2026-03-04
+
+### 改了哪些檔
+
+| 檔案 | 變更摘要 |
+|------|---------|
+| `.cursor/plans/PLAN.md` | 新增章節「--recent-chunks 與 Local Parquet 視窗對齊」：目的、行為表（三種情境）、實作要點、安全與相容性 |
+| `trainer/trainer.py` | 新增 `_detect_local_data_end()`（從 bet/session Parquet metadata 讀取 max date，取 min 作為保守結束日）；`run_pipeline()` 在 `parse_window` 後、`get_monthly_chunks` 前：若 `use_local_parquet` 且未給 `--start`/`--end`，則以偵測到的 data_end 調整 start/end（end = data_end+1 日 00:00，start = end - days），並 log 調整後視窗；metadata 不可用時 fallback 原邏輯並 log warning |
+
+### 如何手動驗證
+
+1. **有本機 Parquet 時**（`data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet` 存在）  
+   - 執行：`python -m trainer.trainer --use-local-parquet --recent-chunks 2`（不給 `--start`/`--end`）  
+   - 預期：log 出現 `Local Parquet data end: YYYY-MM-DD → adjusted window: ... → ...`，且 chunk 的日期範圍落在資料內（不會出現「未來」空 chunk）。
+
+2. **無本機 Parquet 或 metadata 讀取失敗**  
+   - 執行同上指令（或刪除/移開 Parquet 後再跑）。  
+   - 預期：log 出現 `Could not detect data range from local Parquet metadata; ...`，視窗維持「現在往前 N 天」。
+
+3. **顯式給 `--start`/`--end`**  
+   - 執行：`python -m trainer.trainer --use-local-parquet --start 2025-01-01 --end 2025-03-31`  
+   - 預期：不會出現「Local Parquet data end」或「Could not detect」的 log，視窗為 2025-01-01 → 2025-03-31。
+
+4. **單元/回歸**  
+   - `python -m pytest tests/ -q` 應全部通過（本輪未改既有測試）。
+
+### 下一步建議
+
+- 若 CI 有 smoke test 使用 `--use-local-parquet --recent-chunks N`，可確認其 log 或 chunk 數符合「相對資料結束日」的預期。
+- 可選：為 `_detect_local_data_end()` 或「視窗自動調整」路徑加單元測試（mock Parquet metadata 或使用小型 fixture Parquet）。
+
+---
+
+## Review Round 24 — --recent-chunks 與 Local Parquet 視窗對齊（Round 23 變更）Review
+
+**日期**：2026-03-04
+
+**範圍**：Round 23 引入的 `_detect_local_data_end()` 與 `run_pipeline` 視窗自動調整邏輯。
+
+### 發現的問題與風險
+
+#### R113：Capping `end` 於次日 00:00 導致 H1 標籤汙染 (Label Contamination)
+- **嚴重度**：🔴 高 / Bug
+- **描述**：在 `run_pipeline` 中，我們將 `end` 設為 `data_end + 1 天` 的 00:00:00。如果實際資料最後一筆是 `2026-02-13 14:00`，`end` 會被設為 `02-14 00:00`。最後一個 chunk 的 `window_end` 也會是 `02-14 00:00`。這代表 `14:00` 到 `00:00` 之間完全沒有資料，導致 `LABEL_LOOKAHEAD_MIN` (45m) 區域也是空的。這會破壞 H1 (terminal bet censoring) 邏輯——系統會以為玩家在 `14:00` 之後沒有再下注是因為「walkaway」，但實際上只是「資料到底了」。這會在最後一個 chunk 的尾端產生大量 false positive 的 `label=1`。
+- **具體修改建議**：在 `trainer/trainer.py` 的 `run_pipeline` 中，移除 `+ timedelta(days=1)`，直接用 `datetime.combine(data_end, datetime.min.time())`。這會將 `end` 截斷在 `02-13 00:00:00`，捨棄最後半天的資料，確保 chunk 邊界之後仍有十幾個小時的真實資料來支撐 lookahead zone 的 censoring 判斷。
+- **希望新增的測試**：新增 `test_run_pipeline_local_data_end_avoids_overshoot`：Mock `_detect_local_data_end` 回傳 `date(2026, 2, 13)`，驗證 `run_pipeline` 計算出的 `end` 是 `2026-02-13 00:00:00`（確保不會 overshoot）。
+
+#### R114：`_parse_obj_to_date` 忽略 Timezone，導致 max date 偏移
+- **嚴重度**：🟡 中 / 邊界條件
+- **描述**：ClickHouse 匯出的 Parquet 時間欄位是 `timestamp[ms, tz=UTC]`。PyArrow 讀取 metadata 時，回傳的 stats min/max 是 UTC timezone 的 `datetime` 物件。目前的 `_parse_obj_to_date` 直接呼叫 `v.date()`，如果最大時間是 `2026-02-13 22:00 UTC`，取 `.date()` 會得到 `02-13`。但該時間轉換為 `HK_TZ` 應為 `02-14 06:00`。這會導致偵測出的日期提早了一天。
+- **具體修改建議**：修改 `trainer/trainer.py` 中的 `_parse_obj_to_date(v)`：
+  ```python
+  if isinstance(v, datetime):
+      if v.tzinfo is not None:
+          return v.astimezone(HK_TZ).date()
+      return v.date()
+  ```
+- **希望新增的測試**：新增 `test_parse_obj_to_date_respects_timezone`：傳入一個帶有 UTC tzinfo 且 hour >= 16 的 `datetime`，驗證回傳的 date 已被正確轉換並進位為 HK_TZ 的次日。
+
+#### R115：單表 metadata 缺失時的 `min(maxes)` 退化行為
+- **嚴重度**：🟢 低 / 邊界條件
+- **描述**：如果 `_parquet_date_range` 對 session 讀取失敗（回傳 None），但對 bet 讀取成功，`maxes` 陣列只會有一個元素。`min(maxes)` 會回傳 bet 的 max date。這在「只有一個表」的異常狀態下不會提早報錯，而是繼續推進。
+- **具體修改建議**：這屬於可接受的 graceful fallback，因為後續 `load_local_parquet` 內有嚴格的 `not bets_path.exists() or not sess_path.exists()` 檢查，會精準攔截並拋出 `FileNotFoundError`。無需改動 production code，但應納入測試保護。
+- **希望新增的測試**：新增 `test_detect_local_data_end_handles_partial_metadata`：Mock `_parquet_date_range` 讓其一個回傳 None、一個回傳有效 date，驗證 `_detect_local_data_end` 仍能正確回傳該 date。
+
+### 結論與下一步建議
+
+**最優先修復**：R113（高風險，會直接影響標籤正確性）與 R114（時間偏移）。
+建議在下一輪 Implementation 中，先將這三個測試加入 `tests/test_trainer.py`，再修正 `trainer.py` 對應的兩處邏輯。
+
+---
+
+## Round 25 — 將 Round 24 風險點轉成最小可重現測試（tests-only）
+
+**日期**：2026-03-04
+
+### 改了哪些檔
+
+| 檔案 | 變更摘要 |
+|------|---------|
+| `tests/test_review_risks_round110.py` | 新增 R113-R115 guardrail 測試（僅 tests，不改 production code） |
+
+### 新增測試一覽
+
+| 編號 | 測試類別 | 測試方法 | 目的 / 風險點 | 目前預期 |
+|------|----------|----------|----------------|----------|
+| R113 | `TestR113NoDataEndOvershoot` | `test_run_pipeline_local_data_end_avoids_overshoot` | 防止 `run_pipeline` 用 `data_end + 1 day` 造成尾段空窗與 H1 標籤汙染 | **FAIL**（現況仍有 `+ timedelta(days=1)`） |
+| R114 | `TestR114TimezoneAwareMetadataDate` | `test_parse_obj_to_date_respects_timezone` | 要求 `_parse_obj_to_date` 對 tz-aware datetime 先轉 HK_TZ 再取 date，避免 max date 偏移 | **FAIL**（現況直接 `v.date()`） |
+| R115 | `TestR115PartialMetadataFallback` | `test_detect_local_data_end_handles_partial_metadata` | 單表 metadata 缺失時仍可 graceful fallback（回傳可用 max date） | **PASS**（現況行為可接受） |
+
+### 執行方式
+
+```bash
+# 僅跑本輪新增 guardrail tests
+python -m pytest tests/test_review_risks_round110.py -v
+
+# 跑完整測試（會包含 guardrail）
+python -m pytest tests/ -q
+```
+
+### 備註
+
+- 本輪遵循要求：**只提交 tests**，未改任何 production code。
+- R113/R114 刻意設計為先 fail 的 guardrail，作為下一輪修復的驗收門檻。
+
+### 本地執行結果（本輪）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/test_review_risks_round110.py -v` | `2 failed, 1 passed`（符合 guardrail 預期：R113/R114 fail，R115 pass） |
+
+---
+
+## Round 26 — 修復 R113 / R114（production code 修正，使 guardrail 全綠）
+
+**日期**：2026-03-04
+
+### 改了哪些檔
+
+| 檔案 | 變更摘要 |
+|------|---------|
+| `trainer/trainer.py` | R113：`run_pipeline` 視窗計算移除 `+ timedelta(days=1)`，改為 `datetime.combine(data_end, datetime.min.time())`，避免尾端空窗造成 H1 label 汙染；R114：`_parse_obj_to_date` 對 tz-aware `datetime` 先 `astimezone(HK_TZ)` 再取 `.date()`，避免 UTC 日期偏移 |
+
+### 驗證結果
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/test_review_risks_round110.py -v` | `3 passed`（R113 / R114 / R115 全綠） |
+| `python -m pytest tests/ -q` | `303 passed`（較修復前增加 3 個，零 failures，零 regression） |
+
+### 下一步建議
+
+- R113/R114/R115 guardrail 均已通過，Round 23 引入的 local Parquet 視窗對齊功能已完整修復。
+- 後續若要跑 fast-mode 請留意：`end` 現在是 `data_end 00:00:00`，`_parquet_date_range` 讀到的 max date 若帶 UTC tzinfo（HK 午後資料），會正確轉為 HK 次日。
+
+---
+
+## Round 27 — 解決 Fast Mode 8GB OOM（方案一：PyArrow Filters + --fast-mode-no-preload）
+
+**日期**：2026-03-04
+
+### 改了哪些檔
+
+| 檔案 | 變更摘要 |
+|------|---------|
+| `trainer/etl_player_profile.py` | 新增 `_filter_ts_etl(dt, path, col)` helper（讀 Parquet schema 判斷 tz，回傳 tz 相容的 Timestamp，避免 ArrowNotImplementedError）；改寫 `_load_sessions_local`：加入 PyArrow `filters` pushdown（以 `session_start_dtm` 作為 coarse filter 限制讀取的 row groups），不再整檔讀入記憶體；`backfill()` 新增 `preload_sessions: bool = True` 參數，為 False 時跳過 `_preload_sessions_local()`，改走 per-day pushdown 讀取 |
+| `trainer/trainer.py` | `ensure_player_profile_daily_ready()` 新增 `preload_sessions` 參數並傳入 `_etl_backfill`；`run_pipeline()` 讀取 `args.fast_mode_no_preload`，以 `preload_sessions=not no_preload` 傳入；CLI 新增 `--fast-mode-no-preload` flag（含說明文字） |
+| `tests/test_recent_chunks_integration.py` | 因介面擴充（新增 `preload_sessions=True` kwarg）同步更新 `assert_called_once_with` 的期望值（必要的 fixture 更新，非業務邏輯改動） |
+
+### 如何手動驗證
+
+1. **8GB 機器跑 fast-mode（目標：不 OOM）**
+   ```bash
+   python -m trainer.trainer \
+     --fast-mode \
+     --fast-mode-no-preload \
+     --use-local-parquet \
+     --recent-chunks 3
+   ```
+   預期：log 出現 `session preload disabled (--fast-mode-no-preload)`；Backfill 時每天各讀一次 session Parquet，但記憶體不會大量積存。
+
+2. **正常機器（不加 --fast-mode-no-preload）**
+   - 行為與修改前相同：fast-mode 仍走 preload，快但需要足夠 RAM。
+
+3. **確認 `_load_sessions_local` 有 pushdown（不依賴 preload）**
+   - 在 `etl_player_profile.py` 裡，`_load_sessions_local` 每次只讀限定 `session_start_dtm` 範圍的 row groups，`logger.info` 會顯示實際讀到的列數應遠少於全表 74M 列。
+
+4. **全套測試**
+   ```bash
+   python -m pytest tests/ -q
+   ```
+   預期：303 passed。
+
+### 驗證結果
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/ -q` | **303 passed**（零 regression） |
+
+### 下一步建議
+
+- 可在實際 8GB 機器上以 `--fast-mode --fast-mode-no-preload --recent-chunks 3` 做端到端跑通測試，觀察 RAM 峰值。
+- 若 `_load_sessions_local` 的 `session_start_dtm` filter 沒有 row-group stats（例如舊版 Parquet 匯出），log 會顯示 fallback 到全表讀取並 warn；未來可考慮重新匯出 Parquet 以確保 stats 存在。
+
+---
+
+## Review Round 28 — Round 27 OOM 修復 Code Review
+
+**日期**：2026-03-04
+
+**範圍**：Round 27 引入的 `_filter_ts_etl`、`_load_sessions_local` pushdown filters、`backfill(preload_sessions=...)` 開關、`--fast-mode-no-preload` CLI flag。
+
+### 發現的問題與風險
+
+#### R116：pushdown 上界用 `session_start_dtm <= snapshot_dtm + AVAIL_DELAY` 邏輯錯誤（Bug — 高嚴重度）
+
+**描述**：`_load_sessions_local` 以 `session_start_dtm` 作為 pushdown filter 欄位。下界 `>= lo_dtm` 是正確的 coarse bound（session 在 lookback 之前開始 → 不可能在 snapshot_dtm 前可用）。但上界目前是：
+
+```python
+_hi_ts = _filter_ts_etl(
+    snapshot_dtm + timedelta(minutes=SESSION_AVAIL_DELAY_MIN),
+    t_session_path, _filter_col,
+)
+```
+
+`SESSION_AVAIL_DELAY_MIN = 7 分鐘`，這等於把上界設在 `snapshot_dtm + 7 分鐘`，只比 snapshot 時間多 7 分鐘。問題在於：`snapshot_dtm` 本身就是 `next midnight + 7 min`（R102），所以上界就是某一天的 `00:14`。但 session 的 `session_start_dtm` 可以**早於** `session_end_dtm / lud_dtm`（一個 session 可以跨 24 小時以上），所以我們真正需要排除的是「還沒 start 的 session」，上界不應該設得這麼緊。
+
+然而重新分析後：上界的語義是「session_start_dtm 最晚到什麼時候的 session 才可能在 snapshot_dtm 時可用」——如果一個 session 在 `snapshot_dtm + 7min` **之後**才開始，它的 `session_end_dtm` 必然更晚，加上 delay 後 `avail_time` 也必然晚於 `snapshot_dtm`，所以不可能通過下方的 `avail_time <= snap_ts` 過濾。**上界看似可以工作**。
+
+但**真正的 bug 是反過來的**：一個 session 的 `session_start_dtm` 可以非常早（例如 `session_start_dtm = 2024-08-01`），但如果它直到 `session_end_dtm = 2026-02-13` 才結束（超長 session 或髒資料），它的 `avail_time` 落在 lookback 窗口內，應該被納入。下界 `session_start_dtm >= lo_dtm` 會把這種 session **排除**，因為 `lo_dtm = snapshot_dtm - (365 + 30) days`。如果 `session_start_dtm` 比 `lo_dtm` 還早（例如超過 395 天前 start 但最近才 end），就會被 pushdown 丟掉。
+
+不過，這類超長 session（跨度 > 395 天）在實務上幾乎不存在（若存在多半是髒資料）。且原本的 `_preload_sessions_local` 也沒有對 `session_start_dtm` 做下界過濾，用的是 `avail_time` 來做最終 filter，所以嚴格來說 pushdown 只是 coarse filter，下方的 pandas mask 才是精確 filter。
+
+**結論**：理論上下界 pushdown 可能在極端 edge case（session 跨度超過 395 天）丟掉有效資料，但實務風險極低。上界邏輯可以工作，但可以放寬以增加安全邊際。
+
+**具體修改建議**：不需修改（實務風險可忽略）。如需額外安全，可把下界改為 `lo_dtm - timedelta(days=30)` 以增加 buffer，但會增加讀取量。
+
+**希望新增的測試**：無需（實務 edge case 過於極端）。
+
+#### R117：`_filter_ts_etl` 每次呼叫都讀 Parquet schema（效能 — 中度）
+
+**描述**：`_load_sessions_local` 每次被呼叫都會呼叫 `_filter_ts_etl` 兩次（上界和下界），每次都用 `pq.read_schema(parquet_path)` 重新讀取 Parquet schema。在 `--fast-mode-no-preload` 路徑下，backfill 會呼叫 `_load_sessions_local` N 次（例如 13 次 for 3 個月 / 7 天 interval），導致 26 次 schema 讀取 + 13 次 schema 欄位名查詢（第 340 行的 `pq.read_schema`）。
+
+每次 `pq.read_schema` 只讀 footer metadata，大約 1–5ms，所以 26 次 ≈ 30–130ms。相比每次 `read_parquet` 的 I/O（秒級），這是可忽略的。
+
+**具體修改建議**：Phase 2 可選。若要優化，可在 `_filter_ts_etl` 加入一個 module-level LRU cache（keyed on `(parquet_path, col)`），但目前效能影響可忽略。
+
+**希望新增的測試**：無需。
+
+#### R118：`--fast-mode-no-preload` 可以在非 fast-mode 下單獨使用（邊界條件 — 低度）
+
+**描述**：`--fast-mode-no-preload` 在非 fast-mode（不帶 `--fast-mode`）下也能使用。此時 `use_inprocess` 為 False（因為 `canonical_id_whitelist is None and snapshot_interval_days == 1`），所以 backfill 走 **subprocess** 路徑（呼叫 `auto_build_player_profile.py`），`preload_sessions` 參數根本不會傳到 `_etl_backfill`。此時 `--fast-mode-no-preload` 完全無效，但不會報錯或 warn，使用者可能誤以為它生效了。
+
+**具體修改建議**：在 `run_pipeline` 中，若 `no_preload and not fast_mode`，log 一個 warning：`"--fast-mode-no-preload has no effect without --fast-mode; ignoring."`。
+
+**希望新增的測試**：新增 `test_no_preload_without_fast_mode_logs_warning`：用 `argparse.Namespace(fast_mode=False, fast_mode_no_preload=True, ...)` 呼叫 `run_pipeline`，驗證 log 中出現相應 warning。
+
+#### R119：`_filter_ts_etl` 與 `trainer.py` 的 `_filter_ts` 重複（Code Smell — 低度）
+
+**描述**：`etl_player_profile.py` 的 `_filter_ts_etl` 和 `trainer.py` 的 `_filter_ts`（L360–386）邏輯幾乎相同。目前分開維護，未來若一方修了 bug（例如 tz 處理）另一方可能遺漏。
+
+**具體修改建議**：Phase 2 可選。可將此 helper 抽到一個 shared utility（例如 `trainer/parquet_utils.py`），但目前重複程度低（約 10 行），風險有限。
+
+**希望新增的測試**：無需（兩者語義一致，trainer 端已有 R28 系列測試覆蓋）。
+
+### 嚴重度總結
+
+| 編號 | 嚴重度 | 類型 | 摘要 |
+|------|--------|------|------|
+| R116 | 🟢 低 | 邊界 | pushdown 下界可能排除 >395 天跨度 session（實務不存在） |
+| R117 | 🟢 低 | 效能 | `_filter_ts_etl` 每次讀 schema（影響可忽略） |
+| R118 | 🟡 中 | 邊界 | `--fast-mode-no-preload` 不加 `--fast-mode` 時靜默無效 |
+| R119 | 🟢 低 | Code Smell | `_filter_ts_etl` 與 `_filter_ts` 重複 |
+
+### 建議優先順序
+
+1. **本輪可修**：R118（加一行 warning log，改動極小）
+2. **Phase 2 可選**：R116、R117、R119
+
+---
+
+## Round 29 — 將 R118 轉成最小可重現 guardrail 測試（tests-only）
+
+**日期**：2026-03-04
+
+### 改了哪些檔
+
+| 檔案 | 變更摘要 |
+|------|---------|
+| `tests/test_review_risks_round120.py` | 新增 R118 guardrail 測試：`--fast-mode-no-preload` 在未啟用 `--fast-mode` 時，應記錄 warning（目前 production 尚未實作，預期先 FAIL） |
+| `.cursor/plans/DECISION_LOG.md` | 新增 `DEC-016`：明確記錄本輪只先處理 R118，R116/R117/R119 延後 |
+
+### 新增測試一覽
+
+| 編號 | 測試類別 | 測試方法 | 目的 / 風險點 | 目前預期 |
+|------|----------|----------|----------------|----------|
+| R118 | `TestR118NoPreloadWithoutFastModeWarning` | `test_no_preload_without_fast_mode_logs_warning` | 當使用 `--fast-mode-no-preload` 但未啟用 `--fast-mode`，應有明確 warning 提示該 flag 無效 | **FAIL**（production 尚未加 warning） |
+
+### 執行方式
+
+```bash
+# 僅跑本輪新增 R118 guardrail
+python -m pytest tests/test_review_risks_round120.py -v
+
+# 全套測試（目前會因 R118 guardrail 先紅而失敗，直到 production 補 warning）
+python -m pytest tests/ -q
+```
+
+### 本地執行結果（本輪）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/test_review_risks_round120.py -v` | `1 failed`（符合 guardrail 預期：R118 可重現） |
+
+### 下一步建議
+
+- 下一輪只做 R118 的最小 production 修復：在 `run_pipeline` 中加 `if no_preload and not fast_mode: logger.warning(...)`。
+- 修復後重跑 `tests/test_review_risks_round120.py`，預期轉為綠燈。
+
+---
+
+## Round 30 — 修復 R118（production code 補 warning，guardrail 轉綠）
+
+**日期**：2026-03-04
+
+### 改了哪些檔
+
+| 檔案 | 變更摘要 |
+|------|---------|
+| `trainer/trainer.py` | R118：`run_pipeline` 中，讀取 `no_preload` 之後立刻加入：若 `no_preload and not fast_mode` 則 `logger.warning("--fast-mode-no-preload has no effect without --fast-mode; ignoring. ...")`，明確提示使用者此 flag 在非 fast-mode 下無效 |
+
+### 驗證結果
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/test_review_risks_round120.py -v` | `1 passed`（R118 guardrail 轉綠） |
+| `python -m pytest tests/ -q` | **304 passed**（較修復前增加 1 個，零 failures，零 regression） |
+

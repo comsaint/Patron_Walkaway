@@ -257,4 +257,87 @@
 
 ---
 
+## DEC-015：Training Pipeline Fast Mode（Option B — Rated Sampling + Full Nonrated）
+
+**日期**：2026-03-04  
+**SSOT 章節**：§4.3, §8.2  
+**關聯**：DEC-011（player_profile_daily）、DEC-014（Local Parquet）
+
+**決策**：新增 `--fast-mode` CLI flag 至 `trainer.py` 與 `etl_player_profile.py`，使整條 pipeline（含 ETL + 訓練 + 評估）可在筆電上 <10 分鐘跑完 3 個月資料。
+
+**Fast Mode 行為定義**：
+
+| 面向 | Normal Mode | Fast Mode |
+|------|-------------|-----------|
+| **Rated 玩家範圍** | 所有 rated（mapping 全量） | 從 canonical_map 中 deterministic 抽樣 N 人（預設 N=1000，seed 固定） |
+| **Nonrated 玩家** | 全量 | 全量（不受影響） |
+| **Profile ETL snapshot 頻率** | 每天 1 snapshot | 每 7 天 1 snapshot（可由參數覆蓋） |
+| **Session Parquet 讀取** | backfill 每天各讀一次 | backfill 一次性讀入 Memory，每天 in-memory filter（解決 90× I/O 瓶頸） |
+| **Optuna 超參搜索** | OPTUNA_N_TRIALS 次 | 跳過 Optuna，使用 default hyperparameters |
+| **模型輸出** | `rated_model.pkl` + `nonrated_model.pkl` | 同上（artifact 結構不變，但標記 `fast_mode=True`） |
+| **Profile 快取** | Schema hash 機制照常運作 | 照常（但 snapshot 頻率降低會自然減少需要計算的日期數） |
+
+**考慮過的替代方案**：
+
+1. **Option A — Nonrated-only**：只跑 nonrated 模型，完全跳過 player_profile_daily。最快但無法驗證 rated 路徑。
+2. **Option B — Rated Sampling + Full Nonrated**（✓ 選定）：rated 模型仍有代表性樣本，nonrated 全量保留；兩條路徑都能驗證。
+3. **Option C — 只算當期 bets 出現的 rated IDs**：節省最多計算，但需要先掃全量 bets 找出 ID 集合，增加 orchestration 複雜度。
+
+**最終理由**：
+- Option B 在「能驗證完整 pipeline（含 rated + nonrated 雙路徑）」與「執行時間」之間取得最佳平衡。
+- 1,000 名 rated 玩家通常佔全量的 0.3%，但足以驗證 identity mapping、D2 join、profile PIT join、rated model training 全流程。
+- Deterministic sampling（hash-based 或 fixed seed）確保每次 fast-mode 跑出相同結果，不影響 CI regression。
+- Nonrated 全量保留，因為 nonrated 不需要 player_profile_daily，本身就很快。
+
+**效能估算（3 個月 Local Parquet）**：
+
+| 瓶頸 | Normal | Fast Mode | 加速因素 |
+|------|--------|-----------|---------|
+| Profile ETL（90 天 × 全量 rated） | ~60 min | ~2 min | 抽樣 + 降頻 + 一次讀取 |
+| Session I/O（90 次 read_parquet） | ~15 min | ~1 min | 一次讀取 |
+| Optuna（300 trials × 2 models） | ~10 min | ~0 min | 跳過 |
+| Training（LightGBM） | ~3 min | ~1 min | 資料量少 |
+| **總計** | ~90 min | **~5 min** | ~18× |
+
+**實作要點**：
+
+1. `trainer.py`：新增 `--fast-mode` CLI flag；在 `run_pipeline` 中：
+   - 若 `fast_mode`：從 canonical_map 抽 N 個 canonical_id（deterministic seed）
+   - 傳抽樣結果給 `ensure_player_profile_daily_ready` 與 `load_player_profile_daily`
+   - 跳過 Optuna，使用 default HP
+2. `etl_player_profile.py`：
+   - `backfill()` 新增 `canonical_id_whitelist` 參數：inner join 後立刻做 `isin(whitelist)` 過濾
+   - `backfill()` 新增 `snapshot_interval_days` 參數（fast-mode 傳 7）
+   - `backfill()` 一次性讀取 session parquet（而非每天各讀一次），per-day 只做 in-memory filter
+3. `doc/player_profile_daily_spec.md`：
+   - 新增 §2.3「Population 約束」：canonical_id 只能來自 rated mapping
+   - 新增 §2.4「Consumer 約束」：只有 rated model 使用；nonrated model 不依賴此表
+4. Artifact metadata：`model_version` 檔案加入 `fast_mode: true/false` 欄位，防止 fast-mode 產出被誤用於生產
+
+**警告 / 限制**：
+- Fast-mode 產出的模型**不得用於生產推論**（rated 模型只用 0.3% 玩家訓練）
+- Fast-mode 的 profile 快取（7 天一次 snapshot）不可與 normal-mode 快取混用；schema hash 機制會自然處理此問題（不同 snapshot 頻率 → 不同 date coverage → backfill 會自動補齊）
+
+---
+
+## DEC-016：Round 28 風險處理範圍收斂（僅先處理 R118）
+
+**日期**：2026-03-04  
+**關聯**：Review Round 28（R116–R119）
+
+**決策**：本輪只優先處理 `R118`（`--fast-mode-no-preload` 在非 `--fast-mode` 下靜默無效），其餘 `R116/R117/R119` 先不改 production code。
+
+**理由**：
+- `R118` 為使用者體驗與操作語義問題，修復成本最低（一條 warning 路徑）。
+- `R116` 屬極端邊界（超長 session > 395 天），實務風險低。
+- `R117` 為微小效能優化（schema 讀取開銷毫秒級），非當前瓶頸。
+- `R119` 屬程式碼重複（Code Smell），可於後續整理階段處理。
+
+**執行策略**：
+1. 先將 `R118` 轉成最小可重現 guardrail 測試（tests-only）。  
+2. 測試先紅（證明問題存在）後，再安排小幅 production 修復。  
+3. 修復完成後以該 guardrail 測試轉綠作為驗收標準。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

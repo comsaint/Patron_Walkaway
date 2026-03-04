@@ -8,7 +8,10 @@ try:
 except ImportError:
     clickhouse_connect = None
 
-import trainer.config as config
+try:
+    import config  # type: ignore[import]
+except ModuleNotFoundError:
+    import trainer.config as config  # type: ignore[import, no-redef]
 
 
 @lru_cache(maxsize=1)

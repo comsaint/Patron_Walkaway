@@ -46,6 +46,7 @@ import json
 import logging
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -127,6 +128,11 @@ try:
         PROFILE_FEATURE_COLS,
     )
     from db_conn import get_clickhouse_client  # type: ignore[import]
+    from etl_player_profile import (  # type: ignore[import]
+        compute_profile_schema_hash,
+        LOCAL_PROFILE_SCHEMA_HASH,
+        backfill as _etl_backfill,
+    )
 except ModuleNotFoundError:
     from trainer.time_fold import get_monthly_chunks, get_train_valid_test_split  # type: ignore[import]
     from trainer.identity import build_canonical_mapping_from_df  # type: ignore[import]
@@ -143,8 +149,18 @@ except ModuleNotFoundError:
         PROFILE_FEATURE_COLS,
     )
     from trainer.db_conn import get_clickhouse_client  # type: ignore[import]
+    from trainer.etl_player_profile import (  # type: ignore[import]
+        compute_profile_schema_hash,
+        LOCAL_PROFILE_SCHEMA_HASH,
+        backfill as _etl_backfill,
+    )
 
 HK_TZ = ZoneInfo(HK_TZ_STR)
+
+# Fast-mode: deterministic sampling of rated canonical_ids (DEC-015 Option B).
+# Set via --fast-mode; not configurable via config.py (intentionally a code constant).
+FAST_MODE_RATED_SAMPLE_N: int = 1_000
+FAST_MODE_SNAPSHOT_INTERVAL_DAYS: int = 7
 
 BASE_DIR = Path(__file__).parent
 PROJECT_ROOT = BASE_DIR.parent
@@ -342,32 +358,47 @@ def load_local_parquet(
 
     logger.info("Reading local Parquet: %s", LOCAL_PARQUET_DIR)
 
-    def _naive_ts(dt) -> pd.Timestamp:
-        """Strip timezone for pyarrow filter compatibility (R28).
+    def _filter_ts(dt, parquet_path: Path, col: str) -> pd.Timestamp:
+        """Return a Timestamp compatible with the Parquet column's tz schema.
 
-        pyarrow raises ArrowNotImplementedError when filter bounds are tz-aware
-        but the Parquet column schema is tz-naive (the common ClickHouse export
-        format).  For a tz-naive Timestamp tz_localize(None) is a no-op; for a
-        tz-aware Timestamp we use replace(tzinfo=None) to preserve local-time
-        representation without unit conversion.
+        Reads the schema of the target file once (cheap: no data rows) to
+        determine whether the column is tz-aware or tz-naive, then returns
+        either a UTC-aware or tz-naive Timestamp accordingly.
+
+        Background: R28 originally stripped tz for tz-naive columns, but
+        ClickHouse exports can produce tz=UTC columns (timestamp[ms, tz=UTC]),
+        which requires a tz-aware filter bound.  Mismatched tz triggers
+        ArrowNotImplementedError at pushdown time.
         """
+        import pyarrow.parquet as pq
         ts = pd.Timestamp(dt)
-        return ts.tz_localize(None) if ts.tzinfo is None else ts.replace(tzinfo=None)
+        try:
+            schema = pq.read_schema(parquet_path)
+            field = schema.field(col)
+            col_tz = getattr(field.type, "tz", None)
+        except Exception:
+            col_tz = None
+        if col_tz:
+            # Column is tz-aware — filter must also be tz-aware (UTC)
+            return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        else:
+            # Column is tz-naive — strip tz from filter (original R28 behaviour)
+            return ts.tz_localize(None) if ts.tzinfo is None else ts.replace(tzinfo=None)
 
     # Use pyarrow pushdown filters to avoid loading the full table per chunk (R26).
     bets_lo = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
     bets = pd.read_parquet(
         bets_path,
         filters=[
-            ("payout_complete_dtm", ">=", _naive_ts(bets_lo)),
-            ("payout_complete_dtm", "<",  _naive_ts(extended_end)),
+            ("payout_complete_dtm", ">=", _filter_ts(bets_lo, bets_path, "payout_complete_dtm")),
+            ("payout_complete_dtm", "<",  _filter_ts(extended_end, bets_path, "payout_complete_dtm")),
         ],
     )
     sessions = pd.read_parquet(
         sess_path,
         filters=[
-            ("session_start_dtm", ">=", _naive_ts(window_start - timedelta(days=1))),
-            ("session_start_dtm", "<",  _naive_ts(extended_end + timedelta(days=1))),
+            ("session_start_dtm", ">=", _filter_ts(window_start - timedelta(days=1), sess_path, "session_start_dtm")),
+            ("session_start_dtm", "<",  _filter_ts(extended_end + timedelta(days=1), sess_path, "session_start_dtm")),
         ],
     )
 
@@ -495,6 +526,8 @@ def _parse_obj_to_date(v: Any) -> Optional[date]:
     if isinstance(v, date) and not isinstance(v, datetime):
         return v
     if isinstance(v, datetime):
+        if v.tzinfo is not None:
+            return v.astimezone(HK_TZ).date()
         return v.date()
     s = str(v).strip()
     if not s:
@@ -540,10 +573,39 @@ def _parquet_date_range(path: Path, candidate_cols: List[str]) -> Optional[Tuple
     return None
 
 
+def _detect_local_data_end() -> Optional[date]:
+    """Detect the latest available date from local bet & session Parquet metadata.
+
+    Uses row-group statistics only (no data scan). Returns the conservative
+    (min) of the two max dates so both tables have data up to the returned
+    date. Returns None if metadata is unavailable for both.
+    """
+    bet_path = LOCAL_PARQUET_DIR / "gmwds_t_bet.parquet"
+    sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+
+    bet_rng = _parquet_date_range(bet_path, ["payout_complete_dtm", "gaming_day"])
+    sess_rng = _parquet_date_range(
+        sess_path, ["gaming_day", "session_end_dtm", "lud_dtm", "session_start_dtm"]
+    )
+
+    maxes: List[date] = []
+    if bet_rng is not None:
+        maxes.append(bet_rng[1])
+    if sess_rng is not None:
+        maxes.append(sess_rng[1])
+
+    if not maxes:
+        return None
+    return min(maxes)
+
+
 def ensure_player_profile_daily_ready(
     window_start: datetime,
     window_end: datetime,
     use_local_parquet: bool = False,
+    canonical_id_whitelist: Optional[set] = None,
+    snapshot_interval_days: int = 1,
+    preload_sessions: bool = True,
 ) -> None:
     """Auto-check profile table freshness and rebuild missing local ranges if needed.
 
@@ -551,8 +613,25 @@ def ensure_player_profile_daily_ready(
       1) determine required snapshot window for PIT join,
       2) compare against existing player_profile_daily coverage,
       3) auto-run helper script to backfill missing range(s).
+
+    Parameters
+    ----------
+    canonical_id_whitelist:
+        When provided (fast-mode), passed to ``backfill`` to restrict
+        profiling to the sampled rated player set.  Also triggers
+        in-process backfill (avoids subprocess overhead and allows
+        the whitelist to be passed directly).
+    snapshot_interval_days:
+        When > 1 (fast-mode: 7), passed to ``backfill`` so only every
+        N-th day is computed.  Also triggers in-process backfill.
+    preload_sessions:
+        Forwarded to ``backfill``.  Set False (--fast-mode-no-preload) to
+        disable full-table session preload, using per-day PyArrow pushdown
+        reads instead.  Reduces peak RAM at the cost of more disk I/O.
     """
     if not use_local_parquet:
+        # ClickHouse mode: schema version is not auto-checked; if PROFILE_FEATURE_COLS
+        # or _SESSION_COLS change, a manual TRUNCATE / re-population is required.
         logger.info("Profile auto-build skipped (ClickHouse mode).")
         return
 
@@ -560,11 +639,58 @@ def ensure_player_profile_daily_ready(
     session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
     auto_script = BASE_DIR / "scripts" / "auto_build_player_profile.py"
 
+    # --- Schema-hash check ---------------------------------------------------
+    # Compare the current profile schema fingerprint (PROFILE_VERSION +
+    # PROFILE_FEATURE_COLS + _SESSION_COLS) against the sidecar written when
+    # the parquet was last built.  A mismatch means features changed and the
+    # entire cached parquet must be discarded before the date-range check runs.
+    if profile_path.exists():
+        current_hash = compute_profile_schema_hash()
+        # R106: add population-mode indicator so fast/normal caches do not mix
+        _pop_tag = (
+            f"_whitelist={len(canonical_id_whitelist)}"
+            if canonical_id_whitelist
+            else "_full"
+        )
+        current_hash = hashlib.md5((current_hash + _pop_tag).encode()).hexdigest()
+        stored_hash: Optional[str] = None
+        if LOCAL_PROFILE_SCHEMA_HASH.exists():
+            try:
+                stored_hash = LOCAL_PROFILE_SCHEMA_HASH.read_text(encoding="utf-8").strip()
+            except OSError:
+                stored_hash = None
+
+        if stored_hash != current_hash:
+            logger.warning(
+                "player_profile_daily schema has changed "
+                "(stored=%s, current=%s). "
+                "Deleting stale cache and checkpoint — full rebuild required.",
+                stored_hash or "<missing>",
+                current_hash,
+            )
+            try:
+                profile_path.unlink()
+                logger.info("Deleted stale player_profile_daily.parquet")
+            except OSError as exc:
+                logger.error("Could not delete stale profile parquet: %s", exc)
+            try:
+                LOCAL_PROFILE_SCHEMA_HASH.unlink(missing_ok=True)
+            except OSError:
+                pass
+            # Also remove the ETL checkpoint so auto_build restarts from scratch.
+            checkpoint_path = LOCAL_PARQUET_DIR / "player_profile_etl_checkpoint.json"
+            if checkpoint_path.exists():
+                try:
+                    checkpoint_path.unlink()
+                    logger.info("Deleted stale ETL checkpoint")
+                except OSError as exc:
+                    logger.warning("Could not delete stale ETL checkpoint: %s", exc)
+        else:
+            logger.debug("player_profile_daily schema fingerprint matches (%s).", current_hash)
+    # -------------------------------------------------------------------------
+
     if not session_path.exists():
         logger.warning("Session parquet missing at %s; skip profile auto-build", session_path)
-        return
-    if not auto_script.exists():
-        logger.warning("Auto profile builder script missing at %s; skip auto-build", auto_script)
         return
 
     required_start = (window_start - timedelta(days=365)).date()
@@ -613,28 +739,68 @@ def ensure_player_profile_daily_ready(
             miss_start,
             miss_end,
         )
-        cmd = [
-            sys.executable,
-            str(auto_script),
-            "--local-parquet",
-            "--start-date",
-            miss_start.isoformat(),
-            "--end-date",
-            miss_end.isoformat(),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            logger.warning(
-                "Auto profile build failed for %s -> %s (rc=%s). stderr tail:\n%s",
-                miss_start,
-                miss_end,
-                proc.returncode,
-                "\n".join([ln for ln in proc.stderr.splitlines() if ln.strip()][-40:]),
-            )
+        # Fast-mode (whitelist or interval != 1): call backfill() in-process so
+        # the canonical_id_whitelist and snapshot_interval_days can be forwarded
+        # directly without CLI serialisation.  Normal mode uses subprocess to
+        # isolate memory (large backfills can OOM the trainer process).
+        use_inprocess = (
+            canonical_id_whitelist is not None or snapshot_interval_days != 1
+        )
+        if use_inprocess:
+            try:
+                _etl_backfill(
+                    miss_start,
+                    miss_end,
+                    use_local_parquet=True,
+                    canonical_id_whitelist=canonical_id_whitelist,
+                    snapshot_interval_days=snapshot_interval_days,
+                    preload_sessions=preload_sessions,
+                )
+                logger.info(
+                    "In-process profile build completed for %s -> %s "
+                    "(whitelist=%s, interval=%d)",
+                    miss_start, miss_end,
+                    f"{len(canonical_id_whitelist)} IDs" if canonical_id_whitelist else "none",
+                    snapshot_interval_days,
+                )
+            except Exception as _exc:
+                logger.warning(
+                    "In-process profile build failed for %s -> %s: %s",
+                    miss_start, miss_end, _exc,
+                )
         else:
-            logger.info("Auto profile build completed for %s -> %s", miss_start, miss_end)
+            # R105: auto_script check only for subprocess path; fast-mode uses
+            # in-process backfill and does not need the script.
+            if not auto_script.exists():
+                logger.warning(
+                    "Auto profile builder script missing at %s; skip this range",
+                    auto_script,
+                )
+                continue
+            cmd = [
+                sys.executable,
+                str(auto_script),
+                "--local-parquet",
+                "--start-date",
+                miss_start.isoformat(),
+                "--end-date",
+                miss_end.isoformat(),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                logger.warning(
+                    "Auto profile build failed for %s -> %s (rc=%s). stderr tail:\n%s",
+                    miss_start,
+                    miss_end,
+                    proc.returncode,
+                    "\n".join([ln for ln in proc.stderr.splitlines() if ln.strip()][-40:]),
+                )
+            else:
+                logger.info("Auto profile build completed for %s -> %s", miss_start, miss_end)
 
     # Final coverage check after auto-build attempt.
+    # R111: when snapshot_interval_days > 1, date gaps are expected; only warn
+    # if coverage is truly insufficient (after_end too far behind required_end).
     profile_rng_after = _parquet_date_range(profile_path, ["snapshot_date", "snapshot_dtm"])
     if profile_rng_after is None:
         logger.warning(
@@ -643,7 +809,23 @@ def ensure_player_profile_daily_ready(
         )
         return
     after_start, after_end = profile_rng_after
-    if after_start > required_start or after_end < required_end:
+    if snapshot_interval_days > 1:
+        if after_end < required_end - timedelta(days=snapshot_interval_days):
+            logger.warning(
+                "player_profile_daily coverage still partial after auto-build. "
+                "required=%s->%s, have=%s->%s. Training continues with partial profile coverage.",
+                required_start,
+                required_end,
+                after_start,
+                after_end,
+            )
+        else:
+            logger.info(
+                "player_profile_daily coverage acceptable for fast-mode "
+                "(interval=%d days).",
+                snapshot_interval_days,
+            )
+    elif after_start > required_start or after_end < required_end:
         logger.warning(
             "player_profile_daily coverage still partial after auto-build. "
             "required=%s->%s, have=%s->%s. Training continues with partial profile coverage.",
@@ -1339,6 +1521,7 @@ def save_artifact_bundle(
     feature_cols: List[str],
     combined_metrics: dict,
     model_version: str,
+    fast_mode: bool = False,
 ) -> None:
     """Write all model artifacts atomically.
 
@@ -1414,7 +1597,11 @@ def save_artifact_bundle(
 
     (MODEL_DIR / "model_version").write_text(model_version, encoding="utf-8")
     (MODEL_DIR / "training_metrics.json").write_text(
-        json.dumps({**combined_metrics, "model_version": model_version}, indent=2, default=str),
+        json.dumps(
+            {**combined_metrics, "model_version": model_version, "fast_mode": fast_mode},
+            indent=2,
+            default=str,
+        ),
         encoding="utf-8",
     )
 
@@ -1439,16 +1626,55 @@ def save_artifact_bundle(
 
 def run_pipeline(args) -> None:
     """Phase-1 training pipeline entry point."""
+    pipeline_start = time.perf_counter()
     start, end = parse_window(args)
     use_local = getattr(args, "use_local_parquet", False)
     force = getattr(args, "force_recompute", False)
-    skip_optuna = getattr(args, "skip_optuna", False)
+    fast_mode = getattr(args, "fast_mode", False)
+    # --fast-mode implies --skip-optuna; allow either flag independently.
+    skip_optuna = getattr(args, "skip_optuna", False) or fast_mode
+    # --fast-mode-no-preload: disable session full-table preload; use per-day
+    # PyArrow pushdown reads instead.  Reduces peak RAM for 8 GB machines.
+    no_preload = getattr(args, "fast_mode_no_preload", False)
+    # R118: warn if --fast-mode-no-preload is given without --fast-mode.
+    # Without fast_mode the backfill runs via subprocess (not in-process), so
+    # the preload_sessions flag is never forwarded; the option silently has no
+    # effect and can mislead the user.
+    if no_preload and not fast_mode:
+        logger.warning(
+            "--fast-mode-no-preload has no effect without --fast-mode; ignoring. "
+            "Combine both flags to use memory-safe backfill on low-RAM machines."
+        )
+
+    # Auto-adjust window to actual data end when using local Parquet without
+    # explicit --start/--end, so --recent-chunks is relative to data, not today.
+    if use_local and not (getattr(args, "start", None) or getattr(args, "end", None)):
+        data_end = _detect_local_data_end()
+        if data_end is not None:
+            days = getattr(args, "days", TRAINER_DAYS)
+            end = _to_hk(
+                datetime.combine(
+                    data_end, datetime.min.time()
+                )
+            )
+            start = end - timedelta(days=days)
+            logger.info(
+                "Local Parquet data end: %s → adjusted window: %s → %s",
+                data_end, start.date(), end.date(),
+            )
+        else:
+            logger.warning(
+                "Could not detect data range from local Parquet metadata; "
+                "using default window relative to now. "
+                "Consider --start/--end explicitly."
+            )
 
     logger.info("Training window: %s → %s  (local=%s)", start.date(), end.date(), use_local)
 
     # 1. Monthly chunks (DEC-008 / SSOT §4.3)
+    t0 = time.perf_counter()
     chunks = get_monthly_chunks(start, end)
-    logger.info("Chunks: %d", len(chunks))
+    logger.info("Chunks: %d  (%.1fs)", len(chunks), time.perf_counter() - t0)
 
     # Debug/test mode: limit to most recent N chunks so data loading from both
     # ClickHouse and local Parquet is proportionally restricted.
@@ -1477,7 +1703,9 @@ def run_pipeline(args) -> None:
 
     # 2. Determine train / valid / test split at chunk level FIRST (needed to
     #    derive train_end for canonical mapping cutoff — R25 / B1 leakage guard).
+    t0 = time.perf_counter()
     split = get_train_valid_test_split(chunks)
+    logger.info("Train/valid/test split: %.1fs", time.perf_counter() - t0)
     train_end = (
         max(c["window_end"] for c in split["train_chunks"])
         if split["train_chunks"] else end
@@ -1489,6 +1717,7 @@ def run_pipeline(args) -> None:
     # 3. Build canonical mapping with TRAINING window cutoff (B1 — prevents
     #    identity links that arose after training from leaking into training data).
     #    Also get FND-12 dummy player_ids so we drop them from training (TRN-04).
+    t0 = time.perf_counter()
     logger.info("Building canonical identity mapping (cutoff=%s)…", train_end)
     dummy_player_ids: set = set()
     if use_local:
@@ -1519,24 +1748,57 @@ def run_pipeline(args) -> None:
             canonical_map = pd.DataFrame(columns=["player_id", "canonical_id"])
         sessions_all = None
 
-    logger.info("Canonical mapping: %d rows; FND-12 dummy player_ids to exclude: %d", len(canonical_map), len(dummy_player_ids))
+    logger.info(
+        "Canonical mapping: %d rows; FND-12 dummy player_ids to exclude: %d  (%.1fs)",
+        len(canonical_map), len(dummy_player_ids), time.perf_counter() - t0,
+    )
+
+    # Fast-mode: deterministically sample N rated canonical_ids (DEC-015 Option B).
+    # Sort → head(N) gives a stable, reproducible sample without a random seed.
+    # Nonrated players are not affected (they don't use the profile table).
+    rated_whitelist: Optional[set] = None
+    if fast_mode and not canonical_map.empty:
+        _sample = (
+            canonical_map["canonical_id"]
+            .astype(str)
+            .drop_duplicates()
+            .sort_values()
+            .head(FAST_MODE_RATED_SAMPLE_N)
+        )
+        rated_whitelist = set(_sample.tolist())
+        logger.info(
+            "FAST MODE: sampled %d / %d rated canonical_ids (deterministic sort+head)",
+            len(rated_whitelist), canonical_map["canonical_id"].nunique(),
+        )
 
     # 3b. Auto-check local player_profile_daily freshness and backfill missing
     #     ranges before training starts (one-command flow, OOM-safe helper).
+    t0 = time.perf_counter()
     ensure_player_profile_daily_ready(
         effective_start,
         effective_end,
         use_local_parquet=use_local,
+        canonical_id_whitelist=rated_whitelist,
+        snapshot_interval_days=FAST_MODE_SNAPSHOT_INTERVAL_DAYS if fast_mode else 1,
+        preload_sessions=not no_preload,
     )
+    logger.info("ensure_player_profile_daily_ready: %.1fs", time.perf_counter() - t0)
 
     # 3c. Load player_profile_daily once for the entire training window (PLAN Step 4).
     #     Pass the resulting DataFrame to every process_chunk call so each chunk
     #     can do the PIT/as-of join without re-querying.  If load fails, profile
     #     features are 0 for all rows (graceful degradation).
+    # R109: in fast-mode, pass whitelist only (profile has 1k players, not full map)
     _rated_cids: Optional[List[str]] = (
-        canonical_map["canonical_id"].astype(str).tolist()
-        if not canonical_map.empty else None
+        list(rated_whitelist)
+        if rated_whitelist
+        else (
+            canonical_map["canonical_id"].astype(str).tolist()
+            if not canonical_map.empty
+            else None
+        )
     )
+    t0 = time.perf_counter()
     profile_df = load_player_profile_daily(
         effective_start,
         effective_end,
@@ -1544,11 +1806,12 @@ def run_pipeline(args) -> None:
         canonical_ids=_rated_cids,
     )
     if profile_df is not None:
-        logger.info("player_profile_daily: loaded %d snapshot rows for PIT join", len(profile_df))
+        logger.info("player_profile_daily: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), time.perf_counter() - t0)
     else:
-        logger.info("player_profile_daily: not available — profile features will be NaN")
+        logger.info("player_profile_daily: not available — profile features will be NaN (%.1fs)", time.perf_counter() - t0)
 
     # 4. Process chunks → write parquet
+    t0 = time.perf_counter()
     chunk_paths = []
     for chunk in chunks:
         path = process_chunk(
@@ -1562,10 +1825,12 @@ def run_pipeline(args) -> None:
         if path is not None:
             chunk_paths.append(path)
 
+    logger.info("Process chunks: %d produced  (%.1fs)", len(chunk_paths), time.perf_counter() - t0)
     if not chunk_paths:
         raise SystemExit("No chunks produced any usable data — check data source / time window")
 
     # 5. Load all chunks, concatenate (OOM guard: warn if chunk data is large)
+    t0 = time.perf_counter()
     _chunk_total_bytes = sum(Path(p).stat().st_size for p in chunk_paths)
     _est_ram_gb = (_chunk_total_bytes * CHUNK_CONCAT_RAM_FACTOR) / (1024**3)
     if _chunk_total_bytes >= CHUNK_CONCAT_MEMORY_WARN_BYTES:
@@ -1601,11 +1866,12 @@ def run_pipeline(args) -> None:
     valid_df  = full_df[full_df["_split"] == "valid"].copy()
     test_df   = full_df[full_df["_split"] == "test"].copy()
     logger.info(
-        "Split — train: %d  valid: %d  test: %d",
-        len(train_df), len(valid_df), len(test_df),
+        "Split — train: %d  valid: %d  test: %d  (concat+split: %.1fs)",
+        len(train_df), len(valid_df), len(test_df), time.perf_counter() - t0,
     )
 
     # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
+    t0 = time.perf_counter()
     model_version = get_model_version()
     rated_art, nonrated_art, combined_metrics = train_dual_model(
         train_df,
@@ -1613,9 +1879,18 @@ def run_pipeline(args) -> None:
         ALL_FEATURE_COLS,
         run_optuna=not skip_optuna,
     )
+    logger.info("train_dual_model: %.1fs", time.perf_counter() - t0)
 
     # 7. Save artifacts
-    save_artifact_bundle(rated_art, nonrated_art, ALL_FEATURE_COLS, combined_metrics, model_version)
+    t0 = time.perf_counter()
+    save_artifact_bundle(
+        rated_art, nonrated_art, ALL_FEATURE_COLS, combined_metrics, model_version,
+        fast_mode=fast_mode,
+    )
+    logger.info("save_artifact_bundle: %.1fs", time.perf_counter() - t0)
+
+    total_sec = time.perf_counter() - pipeline_start
+    logger.info("Pipeline total: %.1fs (%.1f min)", total_sec, total_sec / 60.0)
 
     summary = {
         "model_version": model_version,
@@ -1658,6 +1933,28 @@ def main() -> None:
             "window. Limits data loaded from both ClickHouse and local Parquet. "
             "Recommended N>=3 to keep train/valid/test all non-empty. "
             "E.g. --recent-chunks 3 uses roughly the last 3 months of data."
+        ),
+    )
+    parser.add_argument(
+        "--fast-mode", action="store_true",
+        help=(
+            "Fast mode (DEC-015 Option B): deterministically sample "
+            f"{FAST_MODE_RATED_SAMPLE_N} rated canonical_ids, compute profile "
+            f"snapshots every {FAST_MODE_SNAPSHOT_INTERVAL_DAYS} days, and skip "
+            "Optuna hyperparameter search. Reduces full pipeline to ~5 minutes for "
+            "3 months of local Parquet data. NEVER use artifacts from this mode in "
+            "production — training_metrics.json will be flagged with fast_mode=true."
+        ),
+    )
+    parser.add_argument(
+        "--fast-mode-no-preload", action="store_true",
+        help=(
+            "Disable full-table session Parquet preload during profile backfill. "
+            "Instead, each snapshot day reads only the relevant time window via "
+            "PyArrow pushdown filters. Recommended for machines with ≤8 GB RAM "
+            "where the full session Parquet (~74M rows) would cause OOM. "
+            "Trade-off: backfill is slower but memory-safe. "
+            "Combine with --fast-mode for best effect on low-RAM machines."
         ),
     )
     args = parser.parse_args()
