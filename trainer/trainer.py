@@ -654,6 +654,42 @@ def _detect_local_data_end() -> Optional[date]:
     return min(maxes)
 
 
+def _month_end_dates(start_date: date, end_date: date) -> List[date]:
+    """Return the last calendar day of each month in [start_date, end_date].
+
+    Used by DEC-019 to build a month-end profile snapshot schedule.
+    At most one snapshot per month is produced; the PIT join in
+    join_player_profile_daily uses the most-recent snapshot <= bet_time,
+    so bets mid-month will fall back to the previous month-end snapshot.
+
+    Parameters
+    ----------
+    start_date, end_date:
+        Inclusive date range.  Both must use HK-calendar dates.
+
+    Returns
+    -------
+    Sorted list of date objects, each being the last day of its month,
+    filtered to [start_date, end_date].
+    """
+    import calendar as _cal
+    result: List[date] = []
+    year, month = start_date.year, start_date.month
+    while True:
+        last_day = _cal.monthrange(year, month)[1]
+        month_end = date(year, month, last_day)
+        if month_end > end_date:
+            break
+        if month_end >= start_date:
+            result.append(month_end)
+        if month == 12:
+            year += 1
+            month = 1
+        else:
+            month += 1
+    return result
+
+
 def ensure_player_profile_daily_ready(
     window_start: datetime,
     window_end: datetime,
@@ -664,6 +700,7 @@ def ensure_player_profile_daily_ready(
     canonical_map: Optional[pd.DataFrame] = None,
     fast_mode: bool = False,
     max_lookback_days: int = 365,
+    use_month_end_snapshots: bool = True,
 ) -> None:
     """Auto-check profile table freshness and rebuild missing local ranges if needed.
 
@@ -682,6 +719,7 @@ def ensure_player_profile_daily_ready(
     snapshot_interval_days:
         When > 1 (fast-mode: 7), passed to ``backfill`` so only every
         N-th day is computed.  Also triggers in-process backfill.
+        Ignored when ``use_month_end_snapshots=True`` (DEC-019).
     preload_sessions:
         Forwarded to ``backfill``.  Set False (--fast-mode-no-preload) to
         disable full-table session preload, using per-day PyArrow pushdown
@@ -692,6 +730,14 @@ def ensure_player_profile_daily_ready(
         redundantly search for ``canonical_mapping.parquet`` on disk
         (DEC-017 bug fix — eliminates the
         ``No local canonical_mapping.parquet`` warning).
+    use_month_end_snapshots:
+        DEC-019: when True (default), build only the last-day-of-each-month
+        snapshot instead of daily snapshots.  Reduces profile ETL from
+        ~4-6 h (365 days) to ~12 min (12 snapshots/year).  PIT join
+        semantics are unchanged (most-recent snapshot <= bet_time).
+        Set to False to revert to daily / snapshot_interval_days behaviour.
+        Automatically disabled when fast_mode=True (fast-mode controls its
+        own frequency via snapshot_interval_days).
     """
     if not use_local_parquet:
         # ClickHouse mode: schema version is not auto-checked; if PROFILE_FEATURE_COLS
@@ -719,7 +765,11 @@ def ensure_player_profile_daily_ready(
             else "_full"
         )
         _horizon_tag = f"_mlb={max_lookback_days}"
-        current_hash = hashlib.md5((current_hash + _pop_tag + _horizon_tag).encode()).hexdigest()
+        # DEC-019 R601: include schedule mode so month-end and daily caches never collide
+        _sched_tag = "_month_end" if (use_month_end_snapshots and not fast_mode) else "_daily"
+        current_hash = hashlib.md5(
+            (current_hash + _pop_tag + _horizon_tag + _sched_tag).encode()
+        ).hexdigest()
         stored_hash: Optional[str] = None
         if LOCAL_PROFILE_SCHEMA_HASH.exists():
             try:
@@ -812,6 +862,26 @@ def ensure_player_profile_daily_ready(
             miss_start,
             miss_end,
         )
+        # DEC-019: compute month-end snapshot dates for this missing range when
+        # use_month_end_snapshots=True and not fast_mode (fast-mode has its own
+        # interval control via snapshot_interval_days=7).
+        _snap_dates = (
+            _month_end_dates(miss_start, miss_end)
+            if (use_month_end_snapshots and not fast_mode)
+            else None
+        )
+        # DEC-019 R600: if the range falls entirely within one month, month-end
+        # schedule yields an empty list — silently skipping the entire range would
+        # leave a gap in the profile.  Fall back to the interval-based path so
+        # data integrity is preserved.
+        if _snap_dates is not None and len(_snap_dates) == 0:
+            logger.warning(
+                "DEC-019: no month-end dates found in missing range %s -> %s "
+                "(intra-month gap); falling back to interval-based backfill.",
+                miss_start, miss_end,
+            )
+            _snap_dates = None
+
         # Use in-process backfill when any of:
         # (a) fast-mode: whitelist or interval != 1 — avoids subprocess overhead
         #     and allows whitelist / snapshot_interval_days to be forwarded
@@ -821,10 +891,13 @@ def ensure_player_profile_daily_ready(
         #     only path that can forward the pre-built map.  Without this,
         #     normal-mode local-parquet backfill would still trigger the
         #     "No local canonical_mapping.parquet" warning.
+        # (c) DEC-019: snapshot_dates is provided (in-process required to pass
+        #     the date list directly without CLI serialisation).
         use_inprocess = (
             canonical_map is not None
             or canonical_id_whitelist is not None
             or snapshot_interval_days != 1
+            or _snap_dates is not None
         )
         if use_inprocess:
             try:
@@ -837,13 +910,18 @@ def ensure_player_profile_daily_ready(
                     preload_sessions=preload_sessions,
                     canonical_map=canonical_map,
                     max_lookback_days=max_lookback_days,
+                    snapshot_dates=_snap_dates,
+                )
+                _sched_desc = (
+                    f"month-end ({len(_snap_dates)} dates)" if _snap_dates is not None
+                    else f"interval={snapshot_interval_days}"
                 )
                 logger.info(
                     "In-process profile build completed for %s -> %s "
-                    "(whitelist=%s, interval=%d)",
+                    "(whitelist=%s, schedule=%s)",
                     miss_start, miss_end,
                     f"{len(canonical_id_whitelist)} IDs" if canonical_id_whitelist else "none",
-                    snapshot_interval_days,
+                    _sched_desc,
                 )
             except Exception as _exc:
                 logger.warning(
@@ -881,8 +959,13 @@ def ensure_player_profile_daily_ready(
                 logger.info("Auto profile build completed for %s -> %s", miss_start, miss_end)
 
     # Final coverage check after auto-build attempt.
-    # R111: when snapshot_interval_days > 1, date gaps are expected; only warn
-    # if coverage is truly insufficient (after_end too far behind required_end).
+    # R111: when snapshot_interval_days > 1 or use_month_end_snapshots, date gaps
+    # are expected; only warn if coverage is truly insufficient.
+    # DEC-019: month-end snapshots allow gaps up to ~31 days.
+    _effective_interval = (
+        31 if (use_month_end_snapshots and not fast_mode)
+        else snapshot_interval_days
+    )
     profile_rng_after = _parquet_date_range(profile_path, ["snapshot_date", "snapshot_dtm"])
     if profile_rng_after is None:
         logger.warning(
@@ -891,8 +974,8 @@ def ensure_player_profile_daily_ready(
         )
         return
     after_start, after_end = profile_rng_after
-    if snapshot_interval_days > 1:
-        if after_end < required_end - timedelta(days=snapshot_interval_days):
+    if _effective_interval > 1:
+        if after_end < required_end - timedelta(days=_effective_interval):
             logger.warning(
                 "player_profile_daily coverage still partial after auto-build. "
                 "required=%s->%s, have=%s->%s. Training continues with partial profile coverage.",
@@ -902,10 +985,9 @@ def ensure_player_profile_daily_ready(
                 after_end,
             )
         else:
+            _sched_label = "month-end" if (use_month_end_snapshots and not fast_mode) else f"interval={snapshot_interval_days}"
             logger.info(
-                "player_profile_daily coverage acceptable for fast-mode "
-                "(interval=%d days).",
-                snapshot_interval_days,
+                "player_profile_daily coverage acceptable (%s).", _sched_label,
             )
     elif after_start > required_start or after_end < required_end:
         logger.warning(
@@ -1007,8 +1089,13 @@ def apply_dq(
         bets["payout_complete_dtm"] = bets["payout_complete_dtm"].dt.tz_convert(HK_TZ)
     # Strip tz after normalization — downstream (compute_labels, features) is tz-naive.
     bets["payout_complete_dtm"] = bets["payout_complete_dtm"].dt.tz_localize(None)
+    # DEC-018: unify datetime resolution to ns so merge_asof / comparisons always see
+    # the same dtype regardless of Parquet file's stored precision ([ms] vs [us]).
+    bets["payout_complete_dtm"] = bets["payout_complete_dtm"].astype("datetime64[ns]")
 
-    # Boundary comparison (tz-naive on both sides after normalization above)
+    # Boundary comparison — both sides are tz-naive after DEC-018 process_chunk strip.
+    # The explicit .replace(tzinfo=None) guards here are kept as a defensive fallback
+    # for callers that bypass process_chunk (e.g. backtester, tests).
     _lo = bets_history_start if bets_history_start is not None else window_start
     _lo = _lo.replace(tzinfo=None) if getattr(_lo, "tzinfo", None) else _lo
     _hi = extended_end.replace(tzinfo=None) if getattr(extended_end, "tzinfo", None) else extended_end
@@ -1039,6 +1126,11 @@ def apply_dq(
     for col in ("wager", "payout_odds", "base_ha", "is_back_bet", "position_idx"):
         if col in bets.columns:
             bets[col] = pd.to_numeric(bets[col], errors="coerce").fillna(0)
+
+    # DEC-018 / R23 contract assertion: payout_complete_dtm must leave apply_dq tz-naive.
+    if not bets.empty and "payout_complete_dtm" in bets.columns:
+        assert bets["payout_complete_dtm"].dt.tz is None, \
+            "R23 violation: payout_complete_dtm must be tz-naive after DQ"
 
     return bets, sessions
 
@@ -1199,6 +1291,19 @@ def process_chunk(
     window_start = chunk["window_start"]
     window_end = chunk["window_end"]
     extended_end = chunk["extended_end"]
+
+    # DEC-018: pipeline interior is uniformly tz-naive HK local time.
+    # time_fold produces tz-aware bounds; strip here so all downstream callers
+    # (apply_dq, compute_labels, add_track_b_features, label filter) receive
+    # tz-naive datetimes matching the tz-naive data columns from apply_dq R23.
+    window_start = window_start.replace(tzinfo=None) if window_start.tzinfo else window_start
+    window_end   = window_end.replace(tzinfo=None)   if window_end.tzinfo   else window_end
+    extended_end = extended_end.replace(tzinfo=None)  if extended_end.tzinfo  else extended_end
+    # Guard: all three boundaries must be tz-naive inside process_chunk.
+    for _bname, _bval in (("window_start", window_start), ("window_end", window_end), ("extended_end", extended_end)):
+        assert getattr(_bval, "tzinfo", None) is None, \
+            f"DEC-018: {_bname} must be tz-naive inside process_chunk (got {_bval!r})"
+
     chunk_path = _chunk_parquet_path(chunk)
 
     # --- Load data ---
@@ -1295,7 +1400,8 @@ def process_chunk(
     # H1: drop censored terminal bets — they cannot be reliably labelled
     labeled = labeled[~labeled["censored"]].copy()
 
-    # Filter to training window — exclude historical context rows AND extended zone
+    # Filter to training window — exclude historical context rows AND extended zone.
+    # Both sides are tz-naive after DEC-018 strip at process_chunk() entry.
     labeled = labeled[
         (labeled["payout_complete_dtm"] >= window_start)
         & (labeled["payout_complete_dtm"] < window_end)
@@ -1799,6 +1905,11 @@ def run_pipeline(args) -> None:
     # use this window so --recent-chunks applies consistently to all tables.
     effective_start = chunks[0]["window_start"] if chunks else start
     effective_end = chunks[-1]["window_end"] if chunks else end
+    # DEC-018: normalize effective window to tz-naive so all downstream helpers
+    # (ensure_player_profile_daily_ready, load_player_profile_daily, apply_dq
+    # called from the canonical-map path) receive tz-naive datetime arguments.
+    effective_start = effective_start.replace(tzinfo=None) if effective_start.tzinfo else effective_start
+    effective_end   = effective_end.replace(tzinfo=None)   if effective_end.tzinfo   else effective_end
 
     # DEC-017: derive the data horizon (days of available history in this run).
     # Used to (a) cap profile snapshot range in fast-mode, and (b) select only
@@ -1902,6 +2013,7 @@ def run_pipeline(args) -> None:
         canonical_map=canonical_map,
         fast_mode=fast_mode,
         max_lookback_days=data_horizon_days if fast_mode else 365,
+        use_month_end_snapshots=getattr(args, "month_end_snapshots", True),
     )
     logger.info("ensure_player_profile_daily_ready: %.1fs", time.perf_counter() - t0)
 
@@ -2106,6 +2218,17 @@ def main() -> None:
             "Example: --sample-rated 1000 to train on a 1k patron subset."
         ),
     )
+    parser.add_argument(
+        "--no-month-end-snapshots", action="store_false", dest="month_end_snapshots",
+        help=(
+            "DEC-019: disable month-end profile snapshot scheduling and revert to "
+            "daily snapshots (snapshot_interval_days=1) for full runs. "
+            "Use when you need daily profile resolution. "
+            "Has no effect in --fast-mode (fast-mode uses its own interval=7 schedule). "
+            "Default: month-end snapshots are ENABLED for full runs."
+        ),
+    )
+    parser.set_defaults(month_end_snapshots=True)
     args = parser.parse_args()
     run_pipeline(args)
 

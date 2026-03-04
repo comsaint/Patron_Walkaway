@@ -389,4 +389,86 @@ DEC-015 的設計在實際使用中暴露了兩個根本問題：
 
 ---
 
+## DEC-018：Pipeline 內部統一為 tz-naive HK 當地時間（消除 datetime tz 混用）
+
+**日期**：2026-03-04  
+**SSOT 章節**：§4.3（時間語義）  
+**關聯**：DEC-008（Time Fold Splitter）、R23（apply_dq tz 正規化）
+
+**決策**：在 `process_chunk()` 入口處，將 `window_start`、`window_end`、`extended_end` 等邊界時間 strip tz（`replace(tzinfo=None)`），使 **pipeline 內部統一只有 tz-naive 的 HK 當地時間**。同時在 `apply_dq()` 末尾統一 datetime resolution 為 `datetime64[ns]`。完成後移除所有逐點 tz-alignment 補丁。
+
+**背景與問題**：  
+Pipeline 中存在兩個 datetime「世界」混用：
+1. **邊界時間**（`window_start`、`window_end`、`extended_end`）：由 `parse_window()` → `_to_hk()` → `time_fold.generate_chunks()` 產生，帶 tz-aware（`Asia/Hong_Kong`，`+08:00`）。
+2. **資料欄位**（`payout_complete_dtm`、`snapshot_dtm` 等）：由 `apply_dq()` R23 正規化後為 tz-naive（localize/convert HK → strip tz）。
+
+下游在 `features.py`、`labels.py`、`trainer.py` 中拿邊界與資料欄位比較時，反覆觸發 `TypeError: Cannot compare tz-naive and tz-aware datetime-like objects`。此外，不同 Parquet 來源的 datetime resolution 不一致（`[ms]` vs `[us]`）也導致 `pd.merge_asof` 的 `MergeError`。
+
+在本次 training pipeline 除錯過程中，先後在 **6 處**逐點加入 tz-alignment 補丁（`features.py` 3 處、`labels.py` 1 處、`trainer.py` 2 處），每處都是「比較前先檢查雙方 tz 狀態再 localize/strip」。但此方法無法根治——每新增一個比較都可能再次觸發同類錯誤。
+
+**考慮過的替代方案**：
+
+1. **方案 A — 邊界 strip tz（pipeline 內部全 naive）** ✓ 選定  
+   在 `process_chunk()` 入口 strip 邊界 tz。`apply_dq()` 已保證資料是 HK 當地時間，邊界本身也是 HK 產生的，strip 不會丟失語義。改動量最小（一處入口 + 移除 6 處補丁），且未來新增比較不需再考慮 tz 對齊。
+
+2. **方案 B — 資料保持 tz-aware（pipeline 內部全 aware）**  
+   不在 `apply_dq()` strip tz，讓 `payout_complete_dtm` 保持 `Asia/Hong_Kong` tz-aware。但影響面極大——`features.py`、`labels.py`、`scorer.py`、`backtester.py`、`validator.py` 等到處假設資料為 tz-naive；且 tz-aware 的 pandas 運算較慢。**不推薦**。
+
+3. **繼續逐點補丁（維持現狀）**  
+   每個比較處判斷 tz 再對齊。可以 work，但永遠追不完，且程式碼充斥重複的 tz 判斷邏輯。**不推薦**。
+
+**最終理由**：
+- 方案 A 修改量最小（核心只改一處入口），且能一次性消除所有 tz-naive vs tz-aware 比較問題。
+- 語義正確：`apply_dq()` 的 R23 把資料轉成「HK 當地時間、無時區」，邊界（由 `_to_hk()` 產生）本來就是 HK 時間，strip tz 後語義完全一致。
+- `time_fold.py`、`parse_window()` 等外層介面不需要改動——它們仍然產出 tz-aware 供 DB query 等外部用途；只有進入 `process_chunk()` 後才 strip。
+- 附帶修復 datetime resolution mismatch：在 `apply_dq()` 統一轉為 `datetime64[ns]`，消除 `[ms]` vs `[us]` 的 `MergeError`。
+
+**實作要點**：
+1. `trainer.py` — `process_chunk()` 入口：strip `window_start`、`window_end`、`extended_end` 的 tz
+2. `trainer.py` — `apply_dq()`：R23 末尾加 `.astype("datetime64[ns]")`
+3. 移除 `features.py`（3 處）、`labels.py`（1 處）、`trainer.py`（2 處）的逐點 tz-alignment 補丁
+4. 加入防呆 assertion：`apply_dq()` 出口檢查 tz-naive、`process_chunk()` 入口檢查邊界 tz-naive
+
+**回退說明**：  
+若未來需要 pipeline 內部使用 tz-aware（例如跨時區部署），可在 `process_chunk()` 入口改為 `tz_convert(HK_TZ)` 而非 strip，並在 `apply_dq()` 中不 strip tz。但目前無此需求。
+
+---
+
+## DEC-019：player_profile_daily 改為「每月最後一天」更新以縮短 Full Run 時間
+
+**日期**：2026-03-04  
+**SSOT 章節**：§4.3（時間語義）、DEC-011（player_profile_daily）  
+**關聯**：`trainer/etl_player_profile.py` backfill、`trainer.py` ensure_player_profile_daily_ready
+
+**決策**：將 player_profile_daily 的 snapshot 更新頻率從「每日」改為「每月最後一天」一次（例如每月只計算該月最後一天當日的 snapshot）。PIT join 語意不變（每個 bet 仍使用 `snapshot_dtm <= bet_time` 的最近一筆 snapshot），僅時間解析度由「日」變「月」，以大幅縮短 full run 時 profile ETL 階段耗時。
+
+**背景與問題**：  
+Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_profile_daily_ready + backfill）需對 365 天逐日建 snapshot，每 day 約 30–60 秒（session filter + compute_profile），加上一次 session 全表 preload（約 3 分鐘），總計約 **4–6 小時**，成為整體 pipeline 最大瓶頸之一。使用者希望在不改程式邏輯的前提下，以「降低更新頻率」換取時間。
+
+**考慮過的替代方案**：
+
+1. **每月最後一天更新（月結）** ✓ 選定  
+   只對「區間內每個月的最後一天」建 snapshot（一年 12 次）。PIT 仍有效：例如 2 月中旬的注單用 1/31 snapshot，3 月初用 2/28 snapshot。Profile 特徵（30d/90d/365d 聚合）最多落後約一個月，對 walkaway 預測多數情境可接受。實作上需在 backfill 改為迭代「月結日期列表」而非逐日 + `snapshot_interval_days`。
+
+2. **維持 snapshot_interval_days=30（每 30 天一次）**  
+   可減少迭代次數（365 → 約 12），但 snapshot 日期不會對齊日曆月結（例如 1/1、1/31、3/2…），語意上為「每 30 天一個點」而非「每月最後一天」。若產品希望報表或語意對齊「月」，仍以方案 1 較清晰。
+
+3. **維持每日更新**  
+   不變更，profile ETL 仍約 4–6 小時。**不採納**——使用者明確希望縮短時間。
+
+**最終理由**：  
+- 時間縮短：profile ETL 從約 4.5 h 降至約 12 min（12 次 × 約 45 s + 同一次 preload），約 **20–25× 加速**；整體 full run 可少約 4–5 小時。  
+- 語意正確：PIT join 不需改動，僅 snapshot 的「產生日」變少；每個 bet 仍取「最近一筆 ≤ bet 時間」的 snapshot。  
+- 特徵可接受：profile 多為長期窗口（30d/90d/365d），最多落後約一個月需由產品/ML 確認，但多數情境可接受。
+
+**實作要點（僅記錄於計畫，不在此次改 code）**：  
+1. `etl_player_profile.py` — backfill：新增排程模式（例如 `snapshot_schedule='month_end'`）或接受 `snapshot_dates: List[date]`；迭代「區間內每月最後一天」並對這些日期呼叫 `build_player_profile_daily`。  
+2. `trainer.py` — ensure_player_profile_daily_ready：呼叫 backfill 時傳入上述月結排程或日期列表；coverage 檢查需接受「每月一個 snapshot」的間隔（例如沿用或擴充 `snapshot_interval_days` 的邏輯）。  
+3. 月結日期計算：以 HK 時間為準，用 calendar 或 date 運算產生「每月最後一天」列表，避免 `snapshot_interval_days=30` 造成不對齊。
+
+**回退說明**：  
+若產品要求每日解析度，可改回 `snapshot_interval_days=1` 或移除 month_end 排程，恢復逐日 backfill。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

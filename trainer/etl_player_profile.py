@@ -793,10 +793,11 @@ def _write_to_clickhouse(df: pd.DataFrame, client) -> None:
     logger.info("Written %d rows to ClickHouse %s.%s", len(df), SOURCE_DB, TPROFILE)
 
 
-def _write_to_local_parquet(
+def _persist_local_parquet(
     df: pd.DataFrame,
     canonical_id_whitelist: Optional[set] = None,
     max_lookback_days: int = 365,
+    sched_tag: str = "_daily",  # DEC-019 R601: "_month_end" | "_daily" for cache isolation
 ) -> None:
     """Append (or create) local Parquet file with atomic write (R88).
 
@@ -845,7 +846,10 @@ def _write_to_local_parquet(
                 else "_full"
             )
             _horizon_tag = f"_mlb={max_lookback_days}"
-            full_hash = hashlib.md5((base_hash + _pop_tag + _horizon_tag).encode()).hexdigest()
+            _sched_tag = sched_tag  # DEC-019 R601: isolate month-end vs daily caches
+            full_hash = hashlib.md5(
+                (base_hash + _pop_tag + _horizon_tag + _sched_tag).encode()
+            ).hexdigest()
             Path(hash_tmp_path).write_text(full_hash, encoding="utf-8")
             os.replace(hash_tmp_path, LOCAL_PROFILE_SCHEMA_HASH)
         except Exception:
@@ -881,6 +885,7 @@ def build_player_profile_daily(
     preloaded_sessions: Optional[pd.DataFrame] = None,  # fast-mode: skip Parquet I/O per day
     canonical_id_whitelist: Optional[set] = None,  # R106: for sidecar hash population tag
     max_lookback_days: int = 365,  # DEC-017: horizon restriction for profile feature computation
+    sched_tag: str = "_daily",  # DEC-019 R601: forwarded to _persist_local_parquet for cache key
 ) -> Optional[pd.DataFrame]:
     """Compute player_profile_daily for one `snapshot_date` and persist the result.
 
@@ -985,10 +990,11 @@ def build_player_profile_daily(
 
     # 6. Persist
     if use_local_parquet:
-        _write_to_local_parquet(
+        _persist_local_parquet(
             profile_df,
             canonical_id_whitelist=canonical_id_whitelist,
             max_lookback_days=max_lookback_days,
+            sched_tag=sched_tag,
         )
     else:
         try:
@@ -996,10 +1002,11 @@ def build_player_profile_daily(
             _write_to_clickhouse(profile_df, client)
         except Exception as exc:
             logger.error("ClickHouse write failed: %s; falling back to local Parquet", exc)
-            _write_to_local_parquet(
+            _persist_local_parquet(
                 profile_df,
                 canonical_id_whitelist=canonical_id_whitelist,
                 max_lookback_days=max_lookback_days,
+                sched_tag=sched_tag,
             )
 
     return profile_df
@@ -1014,6 +1021,7 @@ def backfill(
     preload_sessions: bool = True,
     canonical_map: Optional[pd.DataFrame] = None,
     max_lookback_days: int = 365,  # DEC-017: forwarded to _compute_profile via build_player_profile_daily
+    snapshot_dates: Optional[List[date]] = None,  # DEC-019: explicit date list overrides interval loop
 ) -> None:
     """Backfill player_profile_daily for a range of dates.
 
@@ -1030,6 +1038,7 @@ def backfill(
         Compute a snapshot only every N days (fast-mode: 7).  Intermediate
         dates are skipped; the PIT join in trainer.py will still find the
         most recent available snapshot for each bet.
+        Ignored when ``snapshot_dates`` is provided.
     preload_sessions:
         When True (default) and conditions are met (fast-mode or whitelist),
         the entire session Parquet is loaded into memory once for efficient
@@ -1042,6 +1051,11 @@ def backfill(
         internal map-building step is skipped entirely, eliminating the
         ``No local canonical_mapping.parquet`` warning that fires when the
         sidecar file is absent (DEC-017 bug fix).
+    snapshot_dates:
+        DEC-019: explicit list of dates to snapshot (e.g. month-end dates).
+        When provided, overrides the ``snapshot_interval_days`` loop — only the
+        dates in this list that fall within [start_date, end_date] are computed.
+        This is the primary mechanism for month-end snapshot scheduling.
     """
     # R90: pre-build canonical_map once for the whole backfill range.
     # DEC-017: skip if caller already supplied canonical_map (avoids the
@@ -1080,9 +1094,16 @@ def backfill(
             before_n, len(canonical_map),
         )
 
-    # Fast-mode: pre-load sessions parquet once so each snapshot day only
-    # needs an in-memory time-window filter instead of a full file read.
+    # DEC-019 R601: sched_tag distinguishes month-end vs daily cache keys so that
+    # profiles built under different schedules never silently reuse each other.
+    _sched_tag = "_month_end" if snapshot_dates is not None else "_daily"
+
+    # Fast-mode or whitelist: pre-load sessions parquet once so each snapshot day
+    # only needs an in-memory time-window filter instead of a full file read.
     # R112: also trigger when whitelist is set (whitelist-only fast-mode).
+    # DEC-019 R602: month-end schedule (snapshot_dates is not None) is NOT a
+    # preload trigger — ~12 dates/year means per-date PyArrow pushdown reads are
+    # cheap enough and avoids preloading 69M rows on an 8 GB machine.
     # When preload_sessions=False (--fast-mode-no-preload), skip full-table
     # load entirely; _load_sessions_local uses PyArrow pushdown instead.
     preloaded_sessions: Optional[pd.DataFrame] = None
@@ -1091,10 +1112,15 @@ def backfill(
     ):
         preloaded_sessions = _preload_sessions_local()
         if preloaded_sessions is not None:
+            # DEC-019 R603: log is schedule-aware (month-end vs fast-mode)
+            _mode_desc = (
+                f"DEC-019 month-end ({len(snapshot_dates)} dates)"
+                if snapshot_dates is not None
+                else f"fast-mode (interval={snapshot_interval_days} days)"
+            )
             logger.info(
-                "backfill: session parquet preloaded once (%d rows) "
-                "for fast-mode (interval=%d days)",
-                len(preloaded_sessions), snapshot_interval_days,
+                "backfill: session parquet preloaded once (%d rows) for %s",
+                len(preloaded_sessions), _mode_desc,
             )
     elif not preload_sessions and use_local_parquet:
         logger.info(
@@ -1102,37 +1128,68 @@ def backfill(
             "each snapshot day will use per-day PyArrow pushdown read."
         )
 
-    current = start_date
     success = 0
     failed = 0
     skipped = 0
-    _day_idx = 0
-    while current <= end_date:
-        if _day_idx % snapshot_interval_days == 0:
+
+    if snapshot_dates is not None:
+        # DEC-019: iterate over an explicit date list (e.g. month-end dates),
+        # filtered to [start_date, end_date].  Ignores snapshot_interval_days.
+        dates_to_process = sorted(d for d in snapshot_dates if start_date <= d <= end_date)
+        logger.info(
+            "backfill (DEC-019 snapshot_dates): %d dates in [%s, %s]",
+            len(dates_to_process), start_date, end_date,
+        )
+        for snap_date in dates_to_process:
             try:
                 result = build_player_profile_daily(
-                    current,
+                    snap_date,
                     use_local_parquet=use_local_parquet,
                     canonical_map=canonical_map,
                     preloaded_sessions=preloaded_sessions,
                     canonical_id_whitelist=canonical_id_whitelist,
                     max_lookback_days=max_lookback_days,
+                    sched_tag=_sched_tag,
                 )
                 if result is not None:
                     success += 1
                 else:
                     failed += 1
             except Exception as exc:
-                logger.error("Failed for %s: %s", current, exc)
+                logger.error("Failed for %s: %s", snap_date, exc)
                 failed += 1
-        else:
-            skipped += 1
-            logger.debug(
-                "backfill: skipping %s (snapshot_interval_days=%d, day_idx=%d)",
-                current, snapshot_interval_days, _day_idx,
-            )
-        current += timedelta(days=1)
-        _day_idx += 1
+    else:
+        # Original day-by-day loop with snapshot_interval_days.
+        current = start_date
+        _day_idx = 0
+        while current <= end_date:
+            if _day_idx % snapshot_interval_days == 0:
+                try:
+                    result = build_player_profile_daily(
+                        current,
+                        use_local_parquet=use_local_parquet,
+                        canonical_map=canonical_map,
+                        preloaded_sessions=preloaded_sessions,
+                        canonical_id_whitelist=canonical_id_whitelist,
+                        max_lookback_days=max_lookback_days,
+                        sched_tag=_sched_tag,
+                    )
+                    if result is not None:
+                        success += 1
+                    else:
+                        failed += 1
+                except Exception as exc:
+                    logger.error("Failed for %s: %s", current, exc)
+                    failed += 1
+            else:
+                skipped += 1
+                logger.debug(
+                    "backfill: skipping %s (snapshot_interval_days=%d, day_idx=%d)",
+                    current, snapshot_interval_days, _day_idx,
+                )
+            current += timedelta(days=1)
+            _day_idx += 1
+
     logger.info(
         "Backfill complete: %d succeeded, %d failed, %d skipped",
         success, failed, skipped,

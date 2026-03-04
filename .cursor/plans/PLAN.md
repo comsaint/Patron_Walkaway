@@ -509,6 +509,125 @@ Fast Mode 目前會呼叫 `_preload_sessions_local()`，一次將整個 `gmwds_t
 
 ---
 
+## Datetime 時區統一正規化（DEC-018）
+
+### 問題
+
+Pipeline 內存在兩個 datetime「世界」交錯使用，導致反覆出現 `TypeError: Cannot compare tz-naive and tz-aware datetime-like objects` 與 `MergeError: incompatible merge keys` 等錯誤：
+
+| 來源 | 時區狀態 | 範例 |
+|------|---------|------|
+| **邊界時間**（`window_start`、`window_end`、`extended_end`） | tz-aware（`+08:00`），由 `parse_window()` → `_to_hk()` → `time_fold.generate_chunks()` 產生 | `2026-02-13 00:00:00+08:00` |
+| **資料欄位**（`payout_complete_dtm`、`snapshot_dtm` 等） | tz-naive（HK 當地時間），由 `apply_dq()` 的 R23 正規化產出 | `datetime64[ms]` 無 tz |
+
+只要有任何地方將兩者混合比較（`<=`、`>=`、`merge_asof`），都會引發 TypeError 或 MergeError。目前已在 `features.py`（3 處）、`labels.py`（1 處）、`trainer.py`（2 處）逐點補丁，但每次新增比較都可能再出錯。
+
+### 設計原則
+
+**方案 A（推薦）：讓邊界也變 tz-naive，pipeline 內部統一為 tz-naive HK 當地時間。**
+
+既然 `apply_dq()` 已經把資料 strip 成 tz-naive HK（R23），且邊界本身就是 HK 產生的，strip 掉 tz 不會丟失語義資訊。
+
+### 改動清單
+
+#### 1. 核心：`process_chunk()` 入口 strip 邊界 tz
+
+```python
+# trainer.py — process_chunk() 開頭
+window_start = window_start.replace(tzinfo=None) if window_start.tzinfo else window_start
+window_end   = window_end.replace(tzinfo=None)   if window_end.tzinfo   else window_end
+extended_end = extended_end.replace(tzinfo=None)  if extended_end.tzinfo  else extended_end
+```
+
+這是唯一必要的核心改動——下游 `compute_labels()`、`add_track_b_features()`、label filter、profile join 收到的邊界都會是 tz-naive，與資料欄位一致。
+
+#### 2. 統一 datetime resolution
+
+在 `apply_dq()` 的 R23 正規化末尾，把 `payout_complete_dtm` 轉成 `datetime64[ns]`：
+
+```python
+bets["payout_complete_dtm"] = bets["payout_complete_dtm"].astype("datetime64[ns]")
+```
+
+避免 Parquet 讀出的 `[ms]` / `[us]` 與其他來源（profile 的 `[us]`）不一致，在 `merge_asof` 時觸發 `MergeError`。
+
+#### 3. 移除逐點補丁
+
+以下逐點 tz-alignment 補丁在步驟 1 完成後可全部移除，回到原始乾淨邏輯：
+
+- `features.py` — `compute_loss_streak()` 中的 `if col.dt.tz is None and cutoff_ts.tz is not None` 區塊
+- `features.py` — `compute_run_boundary()` 中的同款區塊
+- `features.py` — `compute_table_hc()` 中的同款區塊
+- `features.py` — `join_player_profile_daily()` 中的 `.astype("datetime64[ns]")` 強制轉型（已內含在步驟 2）
+- `labels.py` — `compute_labels()` 中的 `left_ts` tz 對齊區塊
+- `trainer.py` — `process_chunk()` 中 label filter 的 `col.dt.tz_localize` 區塊
+
+#### 4. 防呆 assertion（推薦）
+
+在 `apply_dq()` 回傳前加上：
+
+```python
+assert bets["payout_complete_dtm"].dt.tz is None, \
+    "R23 violation: payout_complete_dtm must be tz-naive after DQ"
+```
+
+在 `process_chunk()` 入口加上：
+
+```python
+for _name, _val in [("window_start", window_start), ("window_end", window_end), ("extended_end", extended_end)]:
+    assert getattr(_val, "tzinfo", None) is None, \
+        f"{_name} must be tz-naive inside process_chunk (got {_val})"
+```
+
+#### 5. 其他資料入口統一（可選，後續整理）
+
+以下非立即必要，但長期應統一，避免未來類似問題：
+
+| 入口 | 目前狀態 | 建議 |
+|------|---------|------|
+| `apply_dq()` session datetime 欄位 | 只做 `pd.to_datetime(..., utc=False)`，不統一 tz | 應同 R23 流程：localize/convert HK → strip |
+| `load_player_profile_daily()` 的 `snapshot_dtm` | 讀出即用 | 應轉為 `datetime64[ns]` tz-naive |
+| Cache 讀回（`pd.read_parquet(chunk_path)`） | 不經過 `apply_dq()` | 應在讀回後對 datetime 欄位做同樣正規化 |
+| `etl_player_profile.py` 的 session datetime | 各自 `_naive()` 處理 | 應統一成相同的 helper |
+
+### 不改動的部分
+
+- `time_fold.py` 仍然產出 tz-aware 的邊界（對外介面不變）
+- `parse_window()` / `_to_hk()` 仍然回傳 tz-aware（這是正確的——外層需要 tz 來做 DB query 等）
+- `scorer.py` 的 tz 處理獨立（它有自己的 R23-equivalent 流程）
+- ClickHouse query 的參數仍為 tz-aware（DB driver 需要 tz）
+
+### 預期效果
+
+- 消除所有 tz-naive vs tz-aware 的 `TypeError`
+- 消除 datetime resolution mismatch 的 `MergeError`
+- 未來新增比較邏輯時不需要再考慮 tz 對齊
+- 移除 6 處逐點補丁，程式碼更乾淨
+
+---
+
+## player_profile_daily 改為每月最後一天更新（DEC-019）
+
+### 目標
+
+縮短 full run 時間：將 player_profile_daily 的 snapshot 更新頻率從「每日」改為「每月最後一天」一次，使 profile ETL 階段由約 4–6 小時降至約 12 分鐘（約 20–25× 加速），整體 full run 可少約 4–5 小時。
+
+### 設計要點
+
+- **PIT 語意不變**：每個 bet 仍使用 `snapshot_dtm <= payout_complete_dtm` 的最近一筆 snapshot；僅 snapshot 的「產生日」改為每月最後一天（例如 1/31、2/28、3/31…）。
+- **特徵影響**：Profile 為 30d/90d/365d 等長期聚合；snapshot 從每日改為月結後，特徵最多落後約一個月，需由產品/ML 確認可接受。
+- **實作方向**（僅記錄於計畫，不在此次改 code）：
+  1. **etl_player_profile.py** — backfill 改為支援「月結排程」或「指定 snapshot 日期列表」：迭代區間內每月最後一天，對這些日期呼叫 `build_player_profile_daily`；不再依賴「逐日 + snapshot_interval_days % N」。
+  2. **trainer.py** — ensure_player_profile_daily_ready 呼叫 backfill 時傳入月結排程或預先算好的月結日期列表；coverage 檢查需接受「每月一個 snapshot」的間隔。
+  3. **月結日期**：以 HK 時間為準，用 calendar 或 date 運算產生「每月最後一天」，確保對齊日曆月而非每 30 天一點。
+
+### 預期效果
+
+- Profile ETL：由約 4.5 h → 約 12 min（12 次 snapshot/年 + 同一次 session preload）。
+- 整體 full run：少約 4–5 小時（其餘 Optuna、chunk 處理不變）。
+
+---
+
 ## Key Risks / Notes
 
 - **featuretools + optuna must be installed** before running the refactored trainer

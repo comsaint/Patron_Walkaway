@@ -471,6 +471,8 @@ def compute_loss_streak(
         Required columns: canonical_id, bet_id, payout_complete_dtm, status.
     cutoff_time : datetime | None
         If set, bets after this time are excluded from streak computation.
+        Must be **tz-naive** (DEC-018 contract); ``payout_complete_dtm`` is
+        expected to be tz-naive after ``apply_dq`` normalisation.
         The returned Series preserves the original index — rows beyond the
         cutoff receive NaN (use them for context if needed, but not for
         training labels).
@@ -487,15 +489,10 @@ def compute_loss_streak(
 
     df = bets_df.copy()
 
-    # TRN-09 / E2: respect cutoff (align tz so naive vs aware comparison is valid)
+    # TRN-09 / E2: respect cutoff
     if cutoff_time is not None:
         cutoff_ts = pd.Timestamp(cutoff_time)
-        col = df["payout_complete_dtm"]
-        if col.dt.tz is None and cutoff_ts.tz is not None:
-            col = col.dt.tz_localize(cutoff_ts.tz)
-        elif col.dt.tz is not None and cutoff_ts.tz is None:
-            cutoff_ts = cutoff_ts.tz_localize(col.dt.tz)
-        df = df[col <= cutoff_ts].copy()
+        df = df[df["payout_complete_dtm"] <= cutoff_ts].copy()
 
     if df.empty:
         return pd.Series(dtype="int32")
@@ -558,6 +555,8 @@ def compute_run_boundary(
         TRN-09 / E2 parity).  History bets before the cutoff are still used
         to compute the correct run start so that ``minutes_since_run_start``
         is accurate even for the first observation in a time window.
+        Must be **tz-naive** (DEC-018 contract); ``payout_complete_dtm`` is
+        expected to be tz-naive after ``apply_dq`` normalisation.
 
     Returns
     -------
@@ -621,12 +620,7 @@ def compute_run_boundary(
     # Apply cutoff_time filter after computing run_id / minutes_since_run_start
     # so that run start times are always anchored to their true first bet.
     if cutoff_ts is not None:
-        col = df["payout_complete_dtm"]
-        if col.dt.tz is None and cutoff_ts.tz is not None:
-            col = col.dt.tz_localize(cutoff_ts.tz)
-        elif col.dt.tz is not None and cutoff_ts.tz is None:
-            cutoff_ts = cutoff_ts.tz_localize(col.dt.tz)
-        df = df[col <= cutoff_ts].copy()
+        df = df[df["payout_complete_dtm"] <= cutoff_ts].copy()
 
     return df
 
@@ -661,6 +655,8 @@ def compute_table_hc(
     cutoff_time : datetime | None
         Global data availability cutoff.  Pass None for offline training
         where each row's own payout_complete_dtm acts as the cutoff.
+        Must be **tz-naive** (DEC-018 contract); ``payout_complete_dtm`` is
+        expected to be tz-naive after ``apply_dq`` normalisation.
 
     Returns
     -------
@@ -683,12 +679,7 @@ def compute_table_hc(
     ].copy()
     if cutoff_time is not None:
         avail_limit = pd.Timestamp(cutoff_time) - delay_td
-        col = pool["payout_complete_dtm"]
-        if col.dt.tz is None and avail_limit.tz is not None:
-            col = col.dt.tz_localize(avail_limit.tz)
-        elif col.dt.tz is not None and avail_limit.tz is None:
-            avail_limit = avail_limit.tz_localize(col.dt.tz)
-        pool = pool[col <= avail_limit]
+        pool = pool[pool["payout_complete_dtm"] <= avail_limit]
 
     result = pd.Series(0, index=bets_df.index, dtype="int32")
 
@@ -949,6 +940,10 @@ def join_player_profile_daily(
     profile_work = profile_df[["canonical_id", "snapshot_dtm"] + available_cols].copy()
     profile_work["canonical_id"] = profile_work["canonical_id"].astype(str)
     profile_work = profile_work.assign(snapshot_dtm=snap_time)
+
+    # merge_asof requires the same dtype on both time keys (e.g. [ms] vs [us] raises MergeError).
+    bets_work["_bet_time"] = pd.to_datetime(bets_work["_bet_time"], utc=False).astype("datetime64[ns]")
+    profile_work["snapshot_dtm"] = pd.to_datetime(profile_work["snapshot_dtm"], utc=False).astype("datetime64[ns]")
 
     # merge_asof requires ascending sort by the time key (and the by= grouping
     # key must also be sorted, but merge_asof does NOT sort — we must do it).

@@ -371,11 +371,14 @@ def backtest(
     extended_end = window_end + timedelta(minutes=max(LABEL_LOOKAHEAD_MIN, 24 * 60))
     history_start = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
 
-    # R29: apply_dq normalises payout_complete_dtm to tz-naive HK local time.
-    # Ensure window boundaries used for label-row filtering are also tz-naive so
-    # that the comparison never raises TypeError on mixed-tz DataFrames.
-    ws_naive = window_start.replace(tzinfo=None)
-    we_naive = window_end.replace(tzinfo=None)
+    # DEC-018: strip tz from all boundaries so pipeline interior is uniformly
+    # tz-naive HK local time, matching apply_dq R23 output contract.
+    window_start = window_start.replace(tzinfo=None) if window_start.tzinfo else window_start
+    window_end   = window_end.replace(tzinfo=None)   if window_end.tzinfo   else window_end
+    extended_end = extended_end.replace(tzinfo=None)  if extended_end.tzinfo  else extended_end
+    # Aliases kept for label-filter clarity below.
+    ws_naive = window_start
+    we_naive = window_end
 
     # --- DQ ---
     bets, sessions = apply_dq(
