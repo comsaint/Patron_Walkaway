@@ -116,13 +116,13 @@ class TestDualMetrics(unittest.TestCase):
         self.assertAlmostEqual(out["macro_recall"], 1.0)
 
     def test_backtester_defines_compute_micro_and_macro(self):
-        """backtester.py defines compute_micro_metrics and compute_macro_by_visit_metrics."""
+        """backtester.py defines compute_micro_metrics and compute_macro_by_gaming_day_metrics."""
         self.assertIn("def compute_micro_metrics", _SRC)
-        self.assertIn("def compute_macro_by_visit_metrics", _SRC)
+        self.assertIn("def compute_macro_by_gaming_day_metrics", _SRC)
 
     def test_macro_source_uses_per_visit_dedup(self):
-        """compute_macro_by_visit_metrics uses per-visit at-most-1-TP (has_tp = any())."""
-        src = _get_func_src("compute_macro_by_visit_metrics")
+        """compute_macro_by_gaming_day_metrics uses per-gaming-day at-most-1-TP (has_tp = any())."""
+        src = _get_func_src("compute_macro_by_gaming_day_metrics")
         self.assertIn("groupby", src)
         self.assertIn("gaming_day", src)
         self.assertTrue(

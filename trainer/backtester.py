@@ -1,6 +1,6 @@
 """trainer/backtester.py — Phase 1 Update
 ==========================================
-Patron Walkaway — Dual-Model Backtester + G1 Threshold Selector
+Patron Walkaway — Dual-Model Backtester (F1 Threshold, DEC-010)
 
 Pipeline
 --------
@@ -56,9 +56,9 @@ logger = logging.getLogger("backtester")
 try:
     import config as _cfg  # type: ignore[import]
 
-    G1_PRECISION_MIN = _cfg.G1_PRECISION_MIN
-    G1_ALERT_VOLUME_MIN_PER_HOUR = _cfg.G1_ALERT_VOLUME_MIN_PER_HOUR
-    G1_FBETA = _cfg.G1_FBETA
+    # G1_PRECISION_MIN / G1_ALERT_VOLUME_MIN_PER_HOUR intentionally not imported
+    # — deprecated per DEC-009/010. Backtester threshold objective is F1 only.
+    _G1_FBETA: float = getattr(_cfg, "G1_FBETA", 0.5)  # kept for fbeta reference metric only
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
     LABEL_LOOKAHEAD_MIN = _cfg.LABEL_LOOKAHEAD_MIN
     HK_TZ_STR: str = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
@@ -67,9 +67,7 @@ try:
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
-    G1_PRECISION_MIN = _cfg.G1_PRECISION_MIN
-    G1_ALERT_VOLUME_MIN_PER_HOUR = _cfg.G1_ALERT_VOLUME_MIN_PER_HOUR
-    G1_FBETA = _cfg.G1_FBETA
+    _G1_FBETA = getattr(_cfg, "G1_FBETA", 0.5)
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
     LABEL_LOOKAHEAD_MIN = _cfg.LABEL_LOOKAHEAD_MIN
     HK_TZ_STR = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
@@ -207,9 +205,9 @@ def compute_micro_metrics(
         if n_pos > 0
         else 0.0
     )
-    # F-beta: beta < 1 → precision-weighted
+    # F-beta reference metric (beta=0.5, precision-weighted); not used for threshold selection
     fb = float(
-        fbeta_score(df["label"], df["is_alert"], beta=G1_FBETA, zero_division=0)
+        fbeta_score(df["label"], df["is_alert"], beta=_G1_FBETA, zero_division=0)
     )
 
     alerts_per_hour: Optional[float] = None
@@ -220,7 +218,7 @@ def compute_micro_metrics(
         "precision": prec,
         "recall": rec,
         "prauc": prauc,
-        f"fbeta_{G1_FBETA}": fb,
+        f"fbeta_{_G1_FBETA}": fb,
         "alerts": n_alerts,
         "true_alerts": n_tp,
         "positives": n_pos,
@@ -229,17 +227,21 @@ def compute_micro_metrics(
     }
 
 
-def compute_macro_by_visit_metrics(
+def compute_macro_by_gaming_day_metrics(
     df: pd.DataFrame,
     rated_threshold: float,
     nonrated_threshold: float,
 ) -> dict:
-    """Macro-by-visit (per-visit-average) metrics.
+    """Macro-by-gaming-day (per-gaming-day-average) metrics.
 
-    Each visit = (canonical_id, gaming_day).  Per-visit at-most-1-TP dedup
-    is applied (G4/SSOT §10.3): a visit is a True Positive if ≥ 1 observation
-    in that visit is both alerted AND labelled 1; but each visit contributes
-    at most 1 TP to the count.
+    Grouping key = (canonical_id, gaming_day).  Per-gaming-day at-most-1-TP
+    dedup is applied (G4/SSOT §10.3): a gaming day is a True Positive if
+    >= 1 observation in that day is both alerted AND labelled 1; but each
+    gaming day contributes at most 1 TP to the count.
+
+    Note: run-level Macro metrics (per-run dedup using run_id) are deferred
+    to Phase 2 (DEC-012).  This function uses gaming_day as a pragmatic
+    Phase 1 approximation.
     """
     if "gaming_day" not in df.columns or "canonical_id" not in df.columns:
         logger.warning("Missing canonical_id or gaming_day; macro metrics unavailable")
@@ -281,7 +283,7 @@ def compute_macro_by_visit_metrics(
 
 
 # ---------------------------------------------------------------------------
-# Optuna TPE 2D threshold search (G1 / I6)
+# Optuna TPE 2D threshold search (DEC-010: F1 objective, no G1 constraints)
 # ---------------------------------------------------------------------------
 
 def run_optuna_threshold_search(
@@ -292,10 +294,10 @@ def run_optuna_threshold_search(
 ) -> Tuple[float, float]:
     """Optuna TPE search over (rated_threshold, nonrated_threshold).
 
-    Objective: maximise combined F1 (DEC-010; aligned with trainer threshold criterion).
-    Constraints (returned as -inf if violated):
-      * per-model precision ≥ G1_PRECISION_MIN
-      * combined alerts/hour ≥ G1_ALERT_VOLUME_MIN_PER_HOUR  (only if window_hours given)
+    Objective: maximise combined F1 (DEC-010; aligned with trainer threshold
+    criterion).  No G1 precision/alert-volume constraints — see DEC-009/010.
+    ``window_hours`` is accepted for API compatibility but not used in the
+    objective.
     """
     logger.info("Optuna 2D threshold search: %d trials", n_trials)
 
@@ -315,18 +317,7 @@ def run_optuna_threshold_search(
         preds_rated = rated_scores[rated_mask] >= rt if rated_mask.any() else np.array([], dtype=bool)
         preds_nonrated = nonrated_scores[nonrated_mask] >= nt if nonrated_mask.any() else np.array([], dtype=bool)
 
-        prec_rated = float(precision_score(y_rated, preds_rated, zero_division=0)) if len(y_rated) > 0 else 1.0
-        prec_nonrated = float(precision_score(y_nonrated, preds_nonrated, zero_division=0)) if len(y_nonrated) > 0 else 1.0
-
-        if prec_rated < G1_PRECISION_MIN or prec_nonrated < G1_PRECISION_MIN:
-            return float("-inf")
-
-        n_alerts = int(preds_rated.sum() if len(preds_rated) else 0) + int(preds_nonrated.sum() if len(preds_nonrated) else 0)
-        if window_hours and window_hours > 0:
-            if n_alerts / window_hours < G1_ALERT_VOLUME_MIN_PER_HOUR:
-                return float("-inf")
-
-        # Combined preds for F1 (DEC-010)
+        # Combined preds for F1 (DEC-010 — pure F1 maximisation, no G1 constraints)
         all_preds = np.zeros(len(df), dtype=bool)
         if rated_mask.any():
             all_preds[rated_mask] = preds_rated
@@ -341,10 +332,10 @@ def run_optuna_threshold_search(
     )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
-    if study.best_value == float("-inf"):
+    if study.best_value <= 0.0:
         logger.warning(
-            "No feasible threshold found (all trials violated G1 constraints). "
-            "Returning model-default thresholds."
+            "No improvement found (best F1=%.4f); returning model-default thresholds.",
+            study.best_value,
         )
         rated_t = float((artifacts.get("rated") or {}).get("threshold", 0.5))
         nonrated_t = float((artifacts.get("nonrated") or {}).get("threshold", 0.5))
@@ -445,7 +436,7 @@ def backtest(
     nonrated_t_default = float((artifacts.get("nonrated") or {}).get("threshold", 0.5))
 
     micro_default = compute_micro_metrics(labeled, rated_t_default, nonrated_t_default, window_hours)
-    macro_default = compute_macro_by_visit_metrics(labeled, rated_t_default, nonrated_t_default)
+    macro_default = compute_macro_by_gaming_day_metrics(labeled, rated_t_default, nonrated_t_default)
 
     results: dict = {
         "window_start": window_start.isoformat(),
@@ -468,7 +459,7 @@ def backtest(
             labeled, artifacts, n_trials=n_optuna_trials, window_hours=window_hours,
         )
         micro_opt = compute_micro_metrics(labeled, rated_t_opt, nonrated_t_opt, window_hours)
-        macro_opt = compute_macro_by_visit_metrics(labeled, rated_t_opt, nonrated_t_opt)
+        macro_opt = compute_macro_by_gaming_day_metrics(labeled, rated_t_opt, nonrated_t_opt)
         results["optuna"] = {
             "rated_threshold": rated_t_opt,
             "nonrated_threshold": nonrated_t_opt,
@@ -528,7 +519,7 @@ def main() -> None:
     parser.add_argument("--end",   default=None, help="Window end")
     parser.add_argument(
         "--use-local-parquet", action="store_true",
-        help="Load bets/sessions from .data/local/*.parquet instead of ClickHouse",
+        help="Load bets/sessions from data/*.parquet instead of ClickHouse",
     )
     parser.add_argument(
         "--skip-optuna", action="store_true",

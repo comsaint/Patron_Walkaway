@@ -29,27 +29,37 @@ def _get_func_src(name: str) -> str:
     return ""
 
 
+def _get_assign_src(name: str) -> str:
+    """Return source for a module-level assignment (e.g. _SESSION_SELECT_COLS)."""
+    for node in _TRAINER_TREE.body:
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == name:
+                    return ast.get_source_segment(_TRAINER_SRC, node) or ""
+    return ""
+
+
 # ---------------------------------------------------------------------------
-# sample_weight correctness (spec: 1/N_visit per row)
+# sample_weight correctness (spec: 1/N_run per row)
 # ---------------------------------------------------------------------------
 
 def _sample_weight_spec(df: pd.DataFrame) -> pd.Series:
-    """Replicate trainer.compute_sample_weights spec: weight = 1 / N_visit per (canonical_id, gaming_day)."""
-    if "gaming_day" not in df.columns or "canonical_id" not in df.columns:
+    """Replicate trainer.compute_sample_weights spec: weight = 1 / N_run per (canonical_id, run_id)."""
+    if "run_id" not in df.columns or "canonical_id" not in df.columns:
         return pd.Series(1.0, index=df.index)
-    visit_key = df["canonical_id"].astype(str) + "_" + df["gaming_day"].astype(str)
-    n_visit = visit_key.map(visit_key.value_counts())
-    return (1.0 / n_visit).fillna(1.0)
+    run_key = df["canonical_id"].astype(str) + "_" + df["run_id"].astype(str)
+    n_run = run_key.map(run_key.value_counts())
+    return (1.0 / n_run).fillna(1.0)
 
 
 class TestSampleWeightCorrectness(unittest.TestCase):
-    """Test that the documented sample_weight formula (1/N_visit) is correct."""
+    """Test that the documented sample_weight formula (1/N_run) is correct."""
 
     def test_single_visit_all_rows_same_weight(self):
-        """One (canonical_id, gaming_day) → each row gets weight 1/N."""
+        """One (canonical_id, run_id) → each row gets weight 1/N."""
         df = pd.DataFrame({
             "canonical_id": ["P1", "P1", "P1"],
-            "gaming_day": ["2025-01-01", "2025-01-01", "2025-01-01"],
+            "run_id": [7, 7, 7],
         })
         sw = _sample_weight_spec(df)
         self.assertEqual(len(sw), 3)
@@ -58,24 +68,30 @@ class TestSampleWeightCorrectness(unittest.TestCase):
         self.assertAlmostEqual(sw.iloc[2], 1.0 / 3.0)
 
     def test_two_visits_weights_sum_to_one_per_visit(self):
-        """Weights per visit sum to 1.0 (each visit contributes equally to loss)."""
+        """Weights per run sum to 1.0 (each run contributes equally to loss)."""
         df = pd.DataFrame({
-            "canonical_id": ["P1", "P1", "P2"],
-            "gaming_day": ["2025-01-01", "2025-01-01", "2025-01-01"],
+            "canonical_id": ["P1", "P1", "P2", "P2", "P2"],
+            "run_id": [1, 1, 1, 2, 2],
         })
         sw = _sample_weight_spec(df)
+        # (P1, run=1): 2 rows → 0.5 each
         self.assertAlmostEqual(sw.iloc[0], 0.5)
         self.assertAlmostEqual(sw.iloc[1], 0.5)
+        # (P2, run=1): 1 row → 1.0
         self.assertAlmostEqual(sw.iloc[2], 1.0)
+        # (P2, run=2): 2 rows → 0.5 each
+        self.assertAlmostEqual(sw.iloc[3], 0.5)
+        self.assertAlmostEqual(sw.iloc[4], 0.5)
 
     def test_trainer_compute_sample_weights_implements_spec(self):
-        """trainer.compute_sample_weights source implements visit_key and 1/n_visit."""
+        """trainer.compute_sample_weights source implements run_key and 1/n_run."""
         src = _get_func_src("compute_sample_weights")
-        self.assertIn("visit_key", src)
+        self.assertIn("run_id", src)
+        self.assertIn("run_key", src)
         self.assertIn("value_counts", src)
         self.assertTrue(
-            "1.0" in src and ("/ n_visit" in src or "/n_visit" in src),
-            "compute_sample_weights should use 1/N_visit",
+            "1.0" in src and ("/ n_run" in src or "/n_run" in src),
+            "compute_sample_weights should use 1/N_run",
         )
 
 
@@ -113,6 +129,50 @@ class TestArtifactBundleCompleteness(unittest.TestCase):
         """save_artifact_bundle must write walkaway_model.pkl for backward compat."""
         src = _get_func_src("save_artifact_bundle")
         self.assertIn("walkaway_model.pkl", src)
+
+
+# ---------------------------------------------------------------------------
+# Review risks: required DQ filter + reason_code_map.json presence
+# ---------------------------------------------------------------------------
+
+class TestReviewRiskGuards(unittest.TestCase):
+    def test_load_clickhouse_data_session_query_has_fnd04_turnover_guard(self):
+        """PLAN Step 1 / SSOT §5: sessions must satisfy turnover>0 OR num_games_with_wager>0."""
+        # 1) Column availability: selection must include the fields we filter on.
+        sess_cols_src = _get_assign_src("_SESSION_SELECT_COLS")
+        self.assertIn("num_games_with_wager", sess_cols_src)
+        self.assertIn("turnover", sess_cols_src)
+
+        # 2) DQ filter: query must explicitly filter sessions with no activity.
+        src = _get_func_src("load_clickhouse_data")
+        self.assertRegex(src, r"COALESCE\(\s*turnover\s*,\s*0\s*\)\s*>\s*0")
+        self.assertRegex(src, r"COALESCE\(\s*num_games_with_wager\s*,\s*0\s*\)\s*>\s*0")
+
+    def test_save_artifact_bundle_writes_reason_code_map_json(self):
+        """PLAN Artifacts: reason_code_map.json (feature -> reason_code mapping) must be written."""
+        src = _get_func_src("save_artifact_bundle")
+        self.assertIn("reason_code_map.json", src)
+
+    def test_apply_dq_filters_sessions_by_is_manual_fnd02(self):
+        """FND-02: apply_dq must actively filter is_manual=1 sessions (not just ensure column exists)."""
+        src = _get_func_src("apply_dq")
+        # Must have an actual boolean comparison, not just column initialisation.
+        self.assertRegex(
+            src,
+            r'sessions\["is_manual"\]\s*==\s*0',
+            "apply_dq must filter sessions where is_manual == 0 (FND-02)",
+        )
+
+    def test_apply_dq_filters_sessions_by_fnd04_turnover(self):
+        """FND-04: apply_dq must filter sessions with no real activity (turnover/num_games)."""
+        src = _get_func_src("apply_dq")
+        self.assertIn("_turnover", src)
+        self.assertIn("_games", src)
+        self.assertRegex(
+            src,
+            r"\(_turnover\s*>\s*0\)\s*\|\s*\(_games\s*>\s*0\)",
+            "apply_dq must keep sessions where turnover>0 OR num_games_with_wager>0 (FND-04)",
+        )
 
 
 if __name__ == "__main__":

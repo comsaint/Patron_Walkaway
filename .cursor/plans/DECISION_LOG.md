@@ -229,18 +229,31 @@
 
 ---
 
-## DEC-013：術語統一為 Run，移除 Visit 樣本加權
+## DEC-013：術語統一為 Run，採用 Run-level 樣本加權
 
 **日期**：2026-03-02  
 **SSOT 章節**：§2.2, §9  
 
 **決策**：
 1. **術語統一**：全專案統一使用 **Run**（bet-derived 連續下注段：相鄰 bet 間距 ≥ `RUN_BREAK_MIN` 即切分為新 run）。不再使用「Visit」一詞以避免與其他語境的 visit 混淆。
-2. **移除 Visit 樣本加權**：Phase 1 不再採用 `1/N_visit`（`canonical_id` × `gaming_day`）反比權重作為 `sample_weight`。訓練僅使用 `class_weight='balanced'` 處理類別不平衡。
+2. **Run-level 樣本加權**：Phase 1 採用 **run-level 反比權重** 作為 `sample_weight`：對每個觀測點計算 `sample_weight = 1 / N_run`，其中 `N_run` 為同一 run（由 `compute_run_boundary` 產生的 `run_id`）在訓練集內的觀測點數。與 `class_weight='balanced'` 並用：`class_weight` 處理正/負例標籤不平衡，`sample_weight` 處理跨 run 的長度偏誤（Length Bias），使每個 run 對 loss 的貢獻較為均等。
 
 **理由**：
 - Run 與原「Visit（bet-derived）」定義相同（皆以 30 分鐘 gap 切割），統一術語減少困惑。
-- Visit 樣本加權將自程式碼與規格中移除。
+- Run-level 加權可校正高頻/長 run 主導訓練的偏誤，同時與 Run 術語一致；僅使用 `class_weight` 無法處理此偏誤。
+
+---
+
+## DEC-014：採用根目錄 `./data` 作為 Local Parquet 預設路徑
+
+**日期**：2026-03-03  
+**SSOT 章節**：§4.3  
+
+**決策**：將 `trainer.py`、`etl_player_profile.py` 與 `scorer.py` 等模組中 `--use-local-parquet` 的預設讀取路徑，從 `trainer/.data/local/` 變更為專案根目錄下的 `./data/`。同時將預期檔名對齊實際匯出檔名（`gmwds_t_bet.parquet` 與 `gmwds_t_session.parquet`）。
+
+**理由**：
+- 實際的 raw data 檔案龐大（19GB+），通常會放在專案根目錄的 `data/` 資料夾中（並加入 `.gitignore`），而非深埋在 `trainer/.data/local/` 中。
+- 檔名直接對應 ClickHouse 匯出的原始表名，減少重新命名的手動步驟，降低開發者 onboarding 阻力。
 
 ---
 

@@ -11,7 +11,7 @@ Pipeline (SSOT §4.3 / §9)
      used only for label computation, NOT added to training rows.
 3. Write each processed chunk to .data/chunks/ as Parquet.
 4. Concatenate all chunks; split train / valid / test at chunk granularity.
-5. sample_weight = 1 / N_visit  (canonical_id × gaming_day), train set only.
+5. sample_weight = 1 / N_run  (canonical_id × run_id from compute_run_boundary), train set only.
 6. Optuna TPE hyperparameter search on validation set (per model type).
 7. Train Rated + Non-rated LightGBM with class_weight='balanced' + sample_weight.
 8. Atomic artifact bundle → trainer/models/.
@@ -33,7 +33,7 @@ keep running until they are refactored in Steps 7–8.
 
 Data source switching
 ---------------------
-  --use-local-parquet   Read from .data/local/ Parquet files instead of
+  --use-local-parquet   Read from data/ Parquet files instead of
                         ClickHouse.  Same DQ filters + time semantics apply.
   Default: ClickHouse for production.
 """
@@ -54,7 +54,7 @@ import lightgbm as lgb
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import average_precision_score, f1_score, precision_score
+from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve, precision_score
 from zoneinfo import ZoneInfo
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -77,15 +77,17 @@ try:
     BET_AVAIL_DELAY_MIN = _cfg.BET_AVAIL_DELAY_MIN
     SESSION_AVAIL_DELAY_MIN = _cfg.SESSION_AVAIL_DELAY_MIN
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
-    G1_PRECISION_MIN = _cfg.G1_PRECISION_MIN
-    G1_ALERT_VOLUME_MIN_PER_HOUR = _cfg.G1_ALERT_VOLUME_MIN_PER_HOUR
-    G1_FBETA = _cfg.G1_FBETA
+    # G1_PRECISION_MIN / G1_ALERT_VOLUME_MIN_PER_HOUR / G1_FBETA intentionally
+    # not imported — deprecated per DEC-009/010; rollback path only.
     PLACEHOLDER_PLAYER_ID = _cfg.PLACEHOLDER_PLAYER_ID
     SOURCE_DB = _cfg.SOURCE_DB
     TBET = _cfg.TBET
     TSESSION = _cfg.TSESSION
+    TPROFILE: str = getattr(_cfg, "TPROFILE", "player_profile_daily")
     HK_TZ_STR: str = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     TRAINER_DAYS: int = getattr(_cfg, "TRAINER_DAYS", 30)
+    CHUNK_CONCAT_MEMORY_WARN_BYTES: int = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 2 * (1024**3))
+    CHUNK_CONCAT_RAM_FACTOR: float = getattr(_cfg, "CHUNK_CONCAT_RAM_FACTOR", 3)
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
@@ -95,15 +97,17 @@ except ModuleNotFoundError:
     BET_AVAIL_DELAY_MIN = _cfg.BET_AVAIL_DELAY_MIN
     SESSION_AVAIL_DELAY_MIN = _cfg.SESSION_AVAIL_DELAY_MIN
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
-    G1_PRECISION_MIN = _cfg.G1_PRECISION_MIN
-    G1_ALERT_VOLUME_MIN_PER_HOUR = _cfg.G1_ALERT_VOLUME_MIN_PER_HOUR
-    G1_FBETA = _cfg.G1_FBETA
+    # G1_PRECISION_MIN / G1_ALERT_VOLUME_MIN_PER_HOUR / G1_FBETA intentionally
+    # not imported — deprecated per DEC-009/010; rollback path only.
     PLACEHOLDER_PLAYER_ID = _cfg.PLACEHOLDER_PLAYER_ID
     SOURCE_DB = _cfg.SOURCE_DB
     TBET = _cfg.TBET
     TSESSION = _cfg.TSESSION
+    TPROFILE = getattr(_cfg, "TPROFILE", "player_profile_daily")
     HK_TZ_STR = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     TRAINER_DAYS = getattr(_cfg, "TRAINER_DAYS", 30)
+    CHUNK_CONCAT_MEMORY_WARN_BYTES = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 2 * (1024**3))
+    CHUNK_CONCAT_RAM_FACTOR = getattr(_cfg, "CHUNK_CONCAT_RAM_FACTOR", 3)
 
 # Module-level pipeline imports (same try/except pattern)
 try:
@@ -118,6 +122,8 @@ try:
         save_feature_defs,
         load_feature_defs,
         compute_feature_matrix,
+        join_player_profile_daily,
+        PROFILE_FEATURE_COLS,
     )
     from db_conn import get_clickhouse_client  # type: ignore[import]
 except ModuleNotFoundError:
@@ -132,15 +138,18 @@ except ModuleNotFoundError:
         save_feature_defs,
         load_feature_defs,
         compute_feature_matrix,
+        join_player_profile_daily,
+        PROFILE_FEATURE_COLS,
     )
     from trainer.db_conn import get_clickhouse_client  # type: ignore[import]
 
 HK_TZ = ZoneInfo(HK_TZ_STR)
 
 BASE_DIR = Path(__file__).parent
+PROJECT_ROOT = BASE_DIR.parent
 DATA_DIR = BASE_DIR / ".data"
 CHUNK_DIR = DATA_DIR / "chunks"
-LOCAL_PARQUET_DIR = DATA_DIR / "local"
+LOCAL_PARQUET_DIR = PROJECT_ROOT / "data"
 MODEL_DIR = BASE_DIR / "models"
 FEATURE_DEFS_DIR = MODEL_DIR / "saved_feature_defs"  # Track A feature definitions (DEC-002)
 OUT_DIR = BASE_DIR / "out_trainer"
@@ -153,7 +162,9 @@ for _d in (DATA_DIR, CHUNK_DIR, LOCAL_PARQUET_DIR, MODEL_DIR, OUT_DIR):
 # ---------------------------------------------------------------------------
 TRACK_B_FEATURE_COLS: List[str] = [
     "loss_streak",
-    "run_id",
+    # "run_id" removed intentionally (R67): it is an ordinal per-player sequence
+    # without cross-player comparability. LightGBM might learn spurious patterns.
+    # It remains in the DataFrame for sample weighting but is not a model feature.
     "minutes_since_run_start",
 ]
 
@@ -171,7 +182,7 @@ LEGACY_FEATURE_COLS: List[str] = [
     "time_of_day_cos",
 ]
 
-ALL_FEATURE_COLS: List[str] = TRACK_B_FEATURE_COLS + LEGACY_FEATURE_COLS
+ALL_FEATURE_COLS: List[str] = TRACK_B_FEATURE_COLS + LEGACY_FEATURE_COLS + PROFILE_FEATURE_COLS
 
 # Extra days of bet history pulled before each chunk window_start to give
 # Track-B state machines (loss_streak, run_boundary) cross-chunk context.
@@ -255,6 +266,7 @@ _SESSION_SELECT_COLS = """
     is_manual,
     is_deleted,
     is_canceled,
+    COALESCE(turnover, 0) AS turnover,
     COALESCE(num_games_with_wager, 0) AS num_games_with_wager
 """.strip()
 
@@ -283,6 +295,7 @@ def load_clickhouse_data(
     # No FINAL on t_session (G1). FND-01 dedup handled downstream by identity.py.
     # Pull sessions overlapping the window with a ±1-day buffer.
     # FND-02: is_manual=1 rows are accounting adjustments, not real play (R38 parity fix)
+    # FND-04: exclude sessions with no real activity (SSOT §5)
     session_query = f"""
         SELECT {_SESSION_SELECT_COLS}
         FROM {SOURCE_DB}.{TSESSION}
@@ -291,6 +304,7 @@ def load_clickhouse_data(
           AND is_deleted = 0
           AND is_canceled = 0
           AND is_manual = 0
+          AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0)
     """
 
     bets = client.query_df(bets_query, parameters=params)
@@ -310,14 +324,14 @@ def load_local_parquet(
     """Load bets + sessions from local Parquet files, filtered to the window.
 
     Expects:
-      .data/local/bets.parquet     — full t_bet export with the same columns
-      .data/local/sessions.parquet — full t_session export with the same columns
+      data/gmwds_t_bet.parquet     — full t_bet export with the same columns
+      data/gmwds_t_session.parquet — full t_session export with the same columns
 
     Applies the same DQ filters (wager > 0, payout_complete_dtm IS NOT NULL)
     and time window restriction as the ClickHouse path.
     """
-    bets_path = LOCAL_PARQUET_DIR / "bets.parquet"
-    sess_path = LOCAL_PARQUET_DIR / "sessions.parquet"
+    bets_path = LOCAL_PARQUET_DIR / "gmwds_t_bet.parquet"
+    sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
 
     if not bets_path.exists() or not sess_path.exists():
         raise FileNotFoundError(
@@ -369,6 +383,111 @@ def load_local_parquet(
 
 
 # ---------------------------------------------------------------------------
+# player_profile_daily loading (PLAN Step 4 / DEC-011)
+# ---------------------------------------------------------------------------
+
+def load_player_profile_daily(
+    window_start: datetime,
+    window_end: datetime,
+    use_local_parquet: bool = False,
+    canonical_ids: Optional[List[str]] = None,
+) -> Optional[pd.DataFrame]:
+    """Load player_profile_daily snapshots covering the training window.
+
+    Returns a DataFrame with ``canonical_id``, ``snapshot_dtm``, and all
+    Phase 1 profile feature columns, or ``None`` if data is unavailable.
+
+    The caller should pass the returned DataFrame to ``process_chunk`` via its
+    ``profile_df`` parameter.  ``join_player_profile_daily`` handles the
+    PIT/as-of alignment per bet.
+
+    Parameters
+    ----------
+    window_start:
+        Earliest chunk window_start in the run.  Snapshots from
+        window_start - 365 days are included so that longer lookback windows
+        (e.g. sessions_365d) have data at the start of the training range.
+    window_end:
+        Latest chunk window_end in the run.  Snapshots up to window_end are
+        included.
+    use_local_parquet:
+        If True, reads from ``data/player_profile_daily.parquet``
+        instead of ClickHouse.
+    canonical_ids:
+        R82: optional list of canonical_id values to filter the profile table.
+        Pass the full set of rated player IDs from canonical_map to cap memory
+        usage; None loads all players in the time window.
+    """
+    profile_path = LOCAL_PARQUET_DIR / "player_profile_daily.parquet"
+
+    if use_local_parquet:
+        if profile_path.exists():
+            logger.info("Loading player_profile_daily from local Parquet: %s", profile_path)
+            try:
+                from datetime import timedelta as _td
+                snap_lo = window_start - _td(days=365)
+                snap_hi = window_end
+
+                def _naive(dt: datetime) -> pd.Timestamp:
+                    ts = pd.Timestamp(dt)
+                    return ts.tz_localize(None) if ts.tzinfo is None else ts.replace(tzinfo=None)
+
+                df = pd.read_parquet(
+                    profile_path,
+                    filters=[
+                        ("snapshot_dtm", ">=", _naive(snap_lo)),
+                        ("snapshot_dtm", "<=", _naive(snap_hi)),
+                    ],
+                )
+                # R82: filter to known canonical_ids to limit memory footprint
+                if canonical_ids is not None and not df.empty:
+                    df = df[df["canonical_id"].astype(str).isin(set(str(c) for c in canonical_ids))]
+                logger.info("player_profile_daily: %d rows loaded from local Parquet", len(df))
+                return df
+            except Exception as exc:
+                logger.warning("player_profile_daily local Parquet load failed: %s", exc)
+                return None
+        logger.info(
+            "player_profile_daily: %s not found; profile features will be 0", profile_path
+        )
+        return None
+
+    # ClickHouse path
+    try:
+        client = get_clickhouse_client()
+        from datetime import timedelta as _td
+
+        snap_lo = window_start - _td(days=365)
+        profile_cols_sql = ", ".join(PROFILE_FEATURE_COLS)
+        # R82: push canonical_id IN filter to ClickHouse when provided so only
+        # rated-player rows are fetched, capping memory to ~O(rated_players).
+        _cid_clause = ""
+        _params: dict = {"snap_lo": snap_lo, "snap_hi": window_end}
+        if canonical_ids:
+            _cid_clause = "AND canonical_id IN %(canonical_ids)s"
+            _params["canonical_ids"] = list(canonical_ids)
+        query = f"""
+            SELECT
+                canonical_id,
+                snapshot_dtm,
+                {profile_cols_sql}
+            FROM {SOURCE_DB}.{TPROFILE}
+            WHERE snapshot_dtm >= %(snap_lo)s
+              AND snapshot_dtm <= %(snap_hi)s
+              {_cid_clause}
+            ORDER BY canonical_id, snapshot_dtm
+        """
+        df = client.query_df(query, parameters=_params)
+        logger.info("player_profile_daily: %d rows loaded from ClickHouse", len(df))
+        return df if not df.empty else None
+    except Exception as exc:
+        logger.warning(
+            "player_profile_daily ClickHouse load failed (%s); profile features will be 0", exc
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # DQ & preprocessing
 # ---------------------------------------------------------------------------
 
@@ -386,9 +505,62 @@ def apply_dq(
     bets_history_start:
         If provided, bets are kept from this point (< window_start) to give
         Track-B state machines cross-chunk context.  Defaults to window_start.
+
+    Notes
+    -----
+    When ``bets`` is empty (e.g. sessions-only DQ path used when building the
+    canonical mapping), the bets processing block is skipped entirely and only
+    session DQ filters are applied.  This avoids a ``KeyError`` on
+    ``payout_complete_dtm`` when a caller passes a stub DataFrame.
     """
-    # --- bets ---
+    # --- sessions (FND-01 / FND-02 / FND-04) — applied first so that the
+    # bets.empty early-return path still yields clean session data.
+    sessions = sessions.copy()
+    for dt_col in ("session_start_dtm", "session_end_dtm", "lud_dtm"):
+        if dt_col in sessions.columns:
+            sessions[dt_col] = pd.to_datetime(sessions[dt_col], utc=False, errors="coerce")
+
+    for col in ("session_id", "player_id"):
+        sessions[col] = pd.to_numeric(sessions.get(col), errors="coerce")
+    sessions = sessions.dropna(subset=["session_id"]).copy()
+
+    # FND-01 dedup: keep latest record per session_id (lud_dtm DESC, then
+    # __etl_insert_Dtm DESC as tiebreaker — mirrors identity._fnd01_dedup_pandas) (R39)
+    sort_keys = [k for k in ("lud_dtm", "__etl_insert_Dtm") if k in sessions.columns]
+    if sort_keys:
+        sessions = sessions.sort_values(sort_keys, ascending=False)
+    sessions = sessions.drop_duplicates(subset=["session_id"], keep="first")
+
+    # Ensure sentinel columns exist before filtering
+    if "num_games_with_wager" not in sessions.columns:
+        sessions["num_games_with_wager"] = 0
+    for flag in ("is_manual", "is_deleted", "is_canceled"):
+        if flag not in sessions.columns:
+            sessions[flag] = 0
+
+    # FND-02: exclude manual adjustment sessions and soft-deleted rows
+    sessions = sessions[
+        (sessions["is_manual"] == 0)
+        & (sessions["is_deleted"] == 0)
+        & (sessions["is_canceled"] == 0)
+    ].copy()
+
+    # FND-04: exclude ghost sessions with no real wager activity (SSOT §5).
+    # Guard: only apply when at least one activity column is present.
+    if "turnover" in sessions.columns or "num_games_with_wager" in sessions.columns:
+        _turnover = sessions.get(
+            "turnover", pd.Series(0.0, index=sessions.index)
+        ).fillna(0)
+        _games = sessions["num_games_with_wager"].fillna(0)
+        sessions = sessions[(_turnover > 0) | (_games > 0)].copy()
+
     bets = bets.copy()
+    if bets.empty:
+        # Sessions-only path — return clean sessions, skip bets processing entirely.
+        # This avoids a KeyError on payout_complete_dtm when called with a stub DataFrame.
+        return bets, sessions
+
+    # --- bets ---
     bets["payout_complete_dtm"] = pd.to_datetime(bets["payout_complete_dtm"], utc=False)
 
     # R23: Timezone normalisation — tz_localize naive, tz_convert aware to HK,
@@ -434,31 +606,6 @@ def apply_dq(
     for col in ("wager", "payout_odds", "base_ha", "is_back_bet", "position_idx"):
         if col in bets.columns:
             bets[col] = pd.to_numeric(bets[col], errors="coerce").fillna(0)
-
-    # --- sessions ---
-    sessions = sessions.copy()
-    for dt_col in ("session_start_dtm", "session_end_dtm", "lud_dtm"):
-        if dt_col in sessions.columns:
-            sessions[dt_col] = pd.to_datetime(sessions[dt_col], utc=False, errors="coerce")
-
-    for col in ("session_id", "player_id"):
-        sessions[col] = pd.to_numeric(sessions.get(col), errors="coerce")
-    sessions = sessions.dropna(subset=["session_id"]).copy()
-
-    # FND-01 dedup: keep latest record per session_id (lud_dtm DESC, then
-    # __etl_insert_Dtm DESC as tiebreaker — mirrors identity._fnd01_dedup_pandas) (R39)
-    sort_keys = [k for k in ("lud_dtm", "__etl_insert_Dtm") if k in sessions.columns]
-    if sort_keys:
-        sessions = sessions.sort_values(sort_keys, ascending=False)
-    sessions = sessions.drop_duplicates(subset=["session_id"], keep="first")
-
-    # Ensure num_games_with_wager exists
-    if "num_games_with_wager" not in sessions.columns:
-        sessions["num_games_with_wager"] = 0
-    # Sentinel boolean flags
-    for flag in ("is_manual", "is_deleted", "is_canceled"):
-        if flag not in sessions.columns:
-            sessions[flag] = 0
 
     return bets, sessions
 
@@ -548,14 +695,28 @@ def _chunk_parquet_path(chunk: dict) -> Path:
     return CHUNK_DIR / f"chunk_{ws}_{we}.parquet"
 
 
-def _chunk_cache_key(chunk: dict, bets: pd.DataFrame) -> str:
-    """Hash to detect stale parquet cache (TRN-07)."""
+def _chunk_cache_key(chunk: dict, bets: pd.DataFrame, profile_hash: str = "none") -> str:
+    """Hash to detect stale parquet cache (TRN-07).
+
+    Includes a config-constants hash (R71) so that changes to
+    WALKAWAY_GAP_MIN, SESSION_AVAIL_DELAY_MIN, or HISTORY_BUFFER_DAYS
+    automatically invalidate all cached chunk Parquets.
+
+    R77: profile_hash encodes the shape/content of player_profile_daily so that
+    changes to the snapshot table also invalidate the chunk cache.
+    """
     ws = chunk["window_start"].isoformat()
     we = chunk["window_end"].isoformat()
     data_hash = hashlib.md5(
         pd.util.hash_pandas_object(bets, index=False).values.tobytes()
     ).hexdigest()[:8]
-    return f"{ws}|{we}|{data_hash}"
+    cfg_str = json.dumps({
+        "WALKAWAY_GAP_MIN": WALKAWAY_GAP_MIN,
+        "SESSION_AVAIL_DELAY_MIN": SESSION_AVAIL_DELAY_MIN,
+        "HISTORY_BUFFER_DAYS": HISTORY_BUFFER_DAYS,
+    }, sort_keys=True)
+    cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:6]
+    return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}"
 
 
 def run_track_a_dfs(
@@ -592,12 +753,15 @@ def process_chunk(
     dummy_player_ids: Optional[set] = None,
     use_local_parquet: bool = False,
     force_recompute: bool = False,
+    profile_df: Optional[pd.DataFrame] = None,
 ) -> Optional[Path]:
     """Process one monthly chunk; return path to written Parquet or None if empty.
 
     The canonical_map is built once at the global level (cutoff = training end)
     and passed in here.  Phase 2 should use per-chunk PIT mapping.
     dummy_player_ids: FND-12 dummy/fake-account player_ids to drop from training (TRN-04).
+    profile_df: player_profile_daily snapshot table for PIT join (PLAN Step 4/DEC-011).
+        Pass None to skip; profile feature columns will be 0 for all rows.
     """
     window_start = chunk["window_start"]
     window_end = chunk["window_end"]
@@ -614,17 +778,40 @@ def process_chunk(
         logger.warning("Chunk %s–%s: no bets, skipping", window_start.date(), window_end.date())
         return None
 
-    # --- TRN-07: cache validity ---
+    # --- TRN-07: cache validity via content hash ---
+    # Compute the cache key from chunk metadata + raw bets hash so that DQ rule
+    # or config changes (which alter bets_raw content) automatically invalidate
+    # the cached Parquet even when force_recompute=False.
+    # R77: include profile snapshot shape/col list so profile table changes also
+    # bust the cache.
+    _profile_hash: str
+    if profile_df is not None and not profile_df.empty:
+        _profile_cols_key = "|".join(sorted(profile_df.columns.tolist()))
+        _profile_hash = hashlib.md5(
+            f"{len(profile_df)}:{_profile_cols_key}".encode()
+        ).hexdigest()[:6]
+    else:
+        _profile_hash = "none"
+    current_key = _chunk_cache_key(chunk, bets_raw, profile_hash=_profile_hash)
+    key_path = chunk_path.with_suffix(".cache_key")
     if not force_recompute and chunk_path.exists():
-        try:
-            cached = pd.read_parquet(chunk_path)
+        stored_key = key_path.read_text(encoding="utf-8").strip() if key_path.exists() else ""
+        if stored_key == current_key:
+            try:
+                cached = pd.read_parquet(chunk_path)
+                logger.info(
+                    "Chunk %s–%s: cache hit (%d rows, key=%s)",
+                    window_start.date(), window_end.date(), len(cached), current_key,
+                )
+                return chunk_path
+            except Exception:
+                logger.warning(
+                    "Chunk %s–%s: cache corrupt, recomputing", window_start.date(), window_end.date()
+                )
+        else:
             logger.info(
-                "Chunk %s–%s: cache hit (%d rows)",
-                window_start.date(), window_end.date(), len(cached),
+                "Chunk %s–%s: cache stale (key mismatch), recomputing", window_start.date(), window_end.date()
             )
-            return chunk_path
-        except Exception:
-            logger.warning("Chunk %s–%s: cache corrupt, recomputing", window_start.date(), window_end.date())
 
     # --- DQ --- (bets_history_start pulls HISTORY_BUFFER_DAYS of extra context for Track-B)
     history_start = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
@@ -684,6 +871,11 @@ def process_chunk(
         logger.warning("Chunk %s–%s: empty after label filtering", window_start.date(), window_end.date())
         return None
 
+    # --- player_profile_daily PIT join (PLAN Step 4 / DEC-011) ---
+    # Attaches Rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
+    # Non-rated bets and bets without a prior snapshot receive 0 for all profile columns.
+    labeled = join_player_profile_daily(labeled, profile_df)
+
     # --- Legacy (Track B) features ---
     labeled = add_legacy_features(labeled, sessions)
 
@@ -715,11 +907,15 @@ def process_chunk(
                 exc,
             )
 
-    # Ensure all feature columns exist with numeric defaults
-    for col in ALL_FEATURE_COLS:
+    # Ensure all non-profile feature columns exist with numeric defaults.
+    # R74: profile columns are intentionally left as NaN when a player has no
+    # prior snapshot — LightGBM routes them to the trained default-child.
+    # Blanket fillna(0) across ALL_FEATURE_COLS would erase that signal.
+    _non_profile_cols = [c for c in ALL_FEATURE_COLS if c not in PROFILE_FEATURE_COLS]
+    for col in _non_profile_cols:
         if col not in labeled.columns:
             labeled[col] = 0
-    labeled[ALL_FEATURE_COLS] = labeled[ALL_FEATURE_COLS].fillna(0)
+    labeled[_non_profile_cols] = labeled[_non_profile_cols].fillna(0)
 
     # Mark rated/non-rated (H3: identity.build_canonical_mapping* only builds entries
     # for players who have a valid casino_player_id, so every canonical_id in the
@@ -740,26 +936,30 @@ def process_chunk(
     )
 
     labeled.to_parquet(chunk_path, index=False)
+    # Persist the cache key so future runs can detect stale data (TRN-07)
+    key_path.write_text(current_key, encoding="utf-8")
     return chunk_path
 
 
 # ---------------------------------------------------------------------------
-# Visit-level sample weights (SSOT §9.3)
+# Run-level sample weights (SSOT §9.3, DEC-013)
 # ---------------------------------------------------------------------------
 
 def compute_sample_weights(df: pd.DataFrame) -> pd.Series:
-    """Return sample_weight = 1 / N_visit for each row.
+    """Return sample_weight = 1 / N_run for each row.
 
-    N_visit = number of observations per (canonical_id, gaming_day) in ``df``.
+    N_run = number of bets in the same run (same canonical_id, same run_id from
+    compute_run_boundary) in ``df``.  Corrects length bias: long runs would
+    otherwise dominate the loss compared to short runs.
     Only call this on the TRAINING set; never on valid/test (leakage guard).
     """
-    if "gaming_day" not in df.columns or "canonical_id" not in df.columns:
-        logger.warning("Cannot compute visit weights — missing canonical_id or gaming_day; using 1.0")
+    if "run_id" not in df.columns or "canonical_id" not in df.columns:
+        logger.warning("Cannot compute run weights — missing canonical_id or run_id; using 1.0")
         return pd.Series(1.0, index=df.index)
 
-    visit_key = df["canonical_id"].astype(str) + "_" + df["gaming_day"].astype(str)
-    n_visit = visit_key.map(visit_key.value_counts())
-    weights = (1.0 / n_visit).fillna(1.0)
+    run_key = df["canonical_id"].astype(str) + "_" + df["run_id"].astype(str)
+    n_run = run_key.map(run_key.value_counts())
+    weights = (1.0 / n_run).fillna(1.0)
     return weights
 
 
@@ -851,18 +1051,29 @@ def _train_one_model(
     val_scores = model.predict_proba(X_val)[:, 1]
     prauc = float(average_precision_score(y_val, val_scores)) if y_val.sum() > 0 else 0.0
 
-    # Threshold selection: maximise F1 (DEC-009 — primary metric is PR-AUC; F1 used to pick threshold)
-    thresholds = np.unique(val_scores)
-    best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
-    for t in thresholds:
-        preds = (val_scores >= t)
-        if preds.sum() < 5:
-            continue
-        f1 = float(f1_score(y_val, preds, zero_division=0))
-        prec = float(precision_score(y_val, preds, zero_division=0))
-        rec_val = float((preds & (y_val == 1)).sum()) / max(1, int(y_val.sum()))
-        if f1 > best_f1 or (f1 == best_f1 and rec_val > best_rec):
-            best_f1, best_prec, best_rec, best_t = f1, prec, rec_val, float(t)
+    # Threshold selection: vectorised PR-curve scan (R65 — avoids O(N²) loop).
+    # precision_recall_curve returns arrays aligned so that for each threshold
+    # index i: preds = val_scores >= thresholds[i].  We compute F1 over the
+    # full threshold grid in one vectorised pass and pick the best.
+    pr_prec, pr_rec, pr_thresholds = precision_recall_curve(y_val, val_scores)
+    # pr_prec / pr_rec have one extra element (last = 1/0); align with thresholds
+    pr_prec = pr_prec[:-1]
+    pr_rec = pr_rec[:-1]
+    # Minimum-alert guard: vectorised via searchsorted (R68 — O(N log N) total)
+    _sorted_scores = np.sort(val_scores)
+    alert_counts = len(val_scores) - np.searchsorted(_sorted_scores, pr_thresholds, side="left")
+    valid_mask = alert_counts >= 5
+    if valid_mask.any():
+        denom = pr_prec + pr_rec
+        f1_arr = np.where(denom > 0, 2 * pr_prec * pr_rec / denom, 0.0)
+        f1_arr = np.where(valid_mask, f1_arr, -1.0)
+        best_idx = int(np.argmax(f1_arr))
+        best_t = float(pr_thresholds[best_idx])
+        best_f1 = float(f1_arr[best_idx])
+        best_prec = float(pr_prec[best_idx])
+        best_rec = float(pr_rec[best_idx])
+    else:
+        best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
 
     metrics = {
         "label": label,
@@ -917,6 +1128,8 @@ def train_dual_model(
             continue
 
         avail_cols = [c for c in feature_cols if c in tr_df.columns]
+        if name == "nonrated":  # exclude PROFILE_FEATURE_COLS — profile features are rated-only (R80)
+            avail_cols = [c for c in avail_cols if c not in PROFILE_FEATURE_COLS]
         X_tr, y_tr = tr_df[avail_cols], tr_df["label"]
         X_vl = vl_df[avail_cols] if not vl_df.empty else X_tr.head(0)
         y_vl = vl_df["label"] if not vl_df.empty else y_tr.head(0)
@@ -965,6 +1178,7 @@ def save_artifact_bundle(
     models/rated_model.pkl        {"model", "threshold", "features"}
     models/nonrated_model.pkl     {"model", "threshold", "features"}
     models/feature_list.json      [{name, track}]
+    models/reason_code_map.json   {feature_name: reason_code} for scorer SHAP lookup
     models/model_version          <version string>
     models/training_metrics.json  per-model metrics
 
@@ -985,12 +1199,50 @@ def save_artifact_bundle(
         )
 
     feature_list = [
-        {"name": c, "track": "B" if c in TRACK_B_FEATURE_COLS else "legacy"}
+        {
+            "name": c,
+            "track": (
+                "profile" if c in PROFILE_FEATURE_COLS
+                else "B" if c in TRACK_B_FEATURE_COLS
+                else "legacy"
+            ),
+        }
         for c in feature_cols
     ]
     (MODEL_DIR / "feature_list.json").write_text(
         json.dumps(feature_list, indent=2), encoding="utf-8"
     )
+
+    # reason_code_map.json: feature name → short reason code for SHAP output.
+    # Static entries for Track B + legacy features; Track A features fall back
+    # to a generated code so the scorer never hits a missing-key error.
+    _STATIC_REASON_CODES: dict[str, str] = {
+        "loss_streak": "LOSS_STREAK",
+        "minutes_since_run_start": "RUN_DURATION",
+        "wager": "BET_SIZE",
+        "payout_odds": "PAYOUT_ODDS",
+        "base_ha": "HOUSE_EDGE",
+        "is_back_bet": "BACK_BET",
+        "position_idx": "TABLE_POSITION",
+        "cum_bets": "CUM_BETS",
+        "cum_wager": "CUM_WAGER",
+        "avg_wager_sofar": "AVG_WAGER",
+        "time_of_day_sin": "TIME_OF_DAY",
+        "time_of_day_cos": "TIME_OF_DAY",
+    }
+    reason_code_map: dict[str, str] = {}
+    for feat in feature_cols:
+        if feat in _STATIC_REASON_CODES:
+            reason_code_map[feat] = _STATIC_REASON_CODES[feat]
+        elif feat in PROFILE_FEATURE_COLS:
+            # R76: profile features use PROFILE_ prefix for scorer readability
+            reason_code_map[feat] = f"PROFILE_{feat[:28].upper()}"
+        else:
+            reason_code_map[feat] = f"TRACK_A_{feat[:30].upper()}"
+    (MODEL_DIR / "reason_code_map.json").write_text(
+        json.dumps(reason_code_map, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
     (MODEL_DIR / "model_version").write_text(model_version, encoding="utf-8")
     (MODEL_DIR / "training_metrics.json").write_text(
         json.dumps({**combined_metrics, "model_version": model_version}, indent=2, default=str),
@@ -1070,17 +1322,49 @@ def run_pipeline(args) -> None:
 
     logger.info("Canonical mapping: %d rows; FND-12 dummy player_ids to exclude: %d", len(canonical_map), len(dummy_player_ids))
 
+    # 3b. Load player_profile_daily once for the entire training window (PLAN Step 4).
+    #     Pass the resulting DataFrame to every process_chunk call so each chunk
+    #     can do the PIT/as-of join without re-querying.  If load fails, profile
+    #     features are 0 for all rows (graceful degradation).
+    _rated_cids: Optional[List[str]] = (
+        canonical_map["canonical_id"].astype(str).tolist()
+        if not canonical_map.empty else None
+    )
+    profile_df = load_player_profile_daily(
+        start, end, use_local_parquet=use_local, canonical_ids=_rated_cids
+    )
+    if profile_df is not None:
+        logger.info("player_profile_daily: loaded %d snapshot rows for PIT join", len(profile_df))
+    else:
+        logger.info("player_profile_daily: not available — profile features will be NaN")
+
     # 4. Process chunks → write parquet
     chunk_paths = []
     for chunk in chunks:
-        path = process_chunk(chunk, canonical_map, dummy_player_ids=dummy_player_ids, use_local_parquet=use_local, force_recompute=force)
+        path = process_chunk(
+            chunk,
+            canonical_map,
+            dummy_player_ids=dummy_player_ids,
+            use_local_parquet=use_local,
+            force_recompute=force,
+            profile_df=profile_df,
+        )
         if path is not None:
             chunk_paths.append(path)
 
     if not chunk_paths:
         raise SystemExit("No chunks produced any usable data — check data source / time window")
 
-    # 5. Load all chunks, concatenate
+    # 5. Load all chunks, concatenate (OOM guard: warn if chunk data is large)
+    _chunk_total_bytes = sum(Path(p).stat().st_size for p in chunk_paths)
+    _est_ram_gb = (_chunk_total_bytes * CHUNK_CONCAT_RAM_FACTOR) / (1024**3)
+    if _chunk_total_bytes >= CHUNK_CONCAT_MEMORY_WARN_BYTES:
+        logger.warning(
+            "Chunk Parquets total %.2f GB on disk → estimated %.1f GB RAM for concat + train/valid split. "
+            "Reduce training window (--days / --start --end) or ensure sufficient RAM to avoid OOM.",
+            _chunk_total_bytes / (1024**3),
+            _est_ram_gb,
+        )
     all_dfs = [pd.read_parquet(p) for p in chunk_paths]
     full_df = pd.concat(all_dfs, ignore_index=True)
     logger.info("Total rows: %d  (label=1: %d)", len(full_df), int(full_df["label"].sum()))
@@ -1094,19 +1378,14 @@ def run_pipeline(args) -> None:
     _chunk_year = _payout_ts.dt.year
     _chunk_month = _payout_ts.dt.month
 
-    def _assign_split(year_s: pd.Series, month_s: pd.Series) -> pd.Series:
-        def _label(ym: tuple) -> str:
-            y, m = ym
-            for s, tag in [(train_ws, "train"), (valid_ws, "valid"), (test_ws, "test")]:
-                if any(y == x.year and m == x.month for x in s):
-                    return tag
-            return "train"  # fallback — should not happen with correct chunk coverage
-        return pd.Series(
-            [_label((y, m)) for y, m in zip(year_s, month_s)],
-            index=year_s.index,
-        )
+    # R70: vectorised split assignment via dict lookup — O(N) map, no row-level loop.
+    _ym_to_split: dict[tuple, str] = {}
+    for _cs, _tag in [(split["train_chunks"], "train"), (split["valid_chunks"], "valid"), (split["test_chunks"], "test")]:
+        for _c in _cs:
+            _ym_to_split[(_c["window_start"].year, _c["window_start"].month)] = _tag
 
-    full_df["_split"] = _assign_split(_chunk_year, _chunk_month)
+    _ym_keys = list(zip(_chunk_year, _chunk_month))
+    full_df["_split"] = pd.Series(_ym_keys, index=full_df.index).map(_ym_to_split).fillna("train")
 
     train_df = full_df[full_df["_split"] == "train"].copy()
     valid_df  = full_df[full_df["_split"] == "valid"].copy()
@@ -1116,7 +1395,7 @@ def run_pipeline(args) -> None:
         len(train_df), len(valid_df), len(test_df),
     )
 
-    # 6. Train dual model (Optuna + visit-level sample_weight)
+    # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
     model_version = get_model_version()
     rated_art, nonrated_art, combined_metrics = train_dual_model(
         train_df,
@@ -1152,7 +1431,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--use-local-parquet", action="store_true",
-        help="Read from .data/local/ Parquet instead of ClickHouse",
+        help="Read from data/ Parquet instead of ClickHouse",
     )
     parser.add_argument(
         "--force-recompute", action="store_true",

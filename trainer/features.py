@@ -71,6 +71,71 @@ except ModuleNotFoundError:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# player_profile_daily — Phase 1 feature column list (PLAN Step 4 / DEC-011)
+# ---------------------------------------------------------------------------
+
+#: Phase 1 profile feature columns sourced from player_profile_daily via
+#: t_session aggregations.  These are attached to **rated** bets only via a
+#: PIT/as-of join (snapshot_dtm <= bet_time).  Non-rated observations receive
+#: 0 for all columns (handled by join_player_profile_daily).
+#:
+#: Phase 2 additions (wager_mean_180d, wager_p50_180d from t_bet) are not
+#: included here.  See doc/player_profile_daily_spec.md §14.
+PROFILE_FEATURE_COLS: List[str] = [
+    # Recency
+    "days_since_last_session",
+    "days_since_first_session",
+    # Frequency
+    "sessions_7d",
+    "sessions_30d",
+    "sessions_90d",
+    "sessions_180d",
+    "sessions_365d",
+    "active_days_30d",
+    "active_days_90d",
+    "active_days_365d",
+    # Monetary
+    "turnover_sum_7d",
+    "turnover_sum_30d",
+    "turnover_sum_90d",
+    "turnover_sum_180d",
+    "turnover_sum_365d",
+    "player_win_sum_30d",
+    "player_win_sum_90d",
+    "player_win_sum_180d",
+    "player_win_sum_365d",
+    "theo_win_sum_30d",
+    "theo_win_sum_180d",
+    "num_bets_sum_30d",
+    "num_bets_sum_180d",
+    "num_games_with_wager_sum_30d",
+    "num_games_with_wager_sum_180d",
+    # Bet intensity
+    "turnover_per_bet_mean_30d",
+    "turnover_per_bet_mean_180d",
+    # Win / Loss & RTP
+    "win_session_rate_30d",
+    "win_session_rate_180d",
+    "actual_rtp_30d",
+    "actual_rtp_180d",
+    "actual_vs_theo_ratio_30d",
+    # Short / Long Ratios
+    "turnover_per_bet_30d_over_180d",
+    "turnover_30d_over_180d",
+    "sessions_30d_over_180d",
+    # Session Duration
+    "avg_session_duration_min_30d",
+    "avg_session_duration_min_180d",
+    # Venue Stickiness (30d/90d; 180d excluded per spec §3.1 — venue refits pollute 180d data)
+    "distinct_table_cnt_30d",
+    "distinct_table_cnt_90d",
+    "distinct_pit_cnt_30d",
+    "distinct_gaming_area_cnt_30d",
+    "top_table_share_30d",
+    "top_table_share_90d",
+]
+
+# ---------------------------------------------------------------------------
 # Track A — Featuretools EntitySet helpers
 # ---------------------------------------------------------------------------
 
@@ -681,3 +746,123 @@ def screen_features(
     logger.info("screen_features: %d features after LightGBM screening", len(candidates))
 
     return candidates
+
+
+# ---------------------------------------------------------------------------
+# player_profile_daily PIT / as-of join (PLAN Step 4 / SSOT §8.2, DEC-011)
+# ---------------------------------------------------------------------------
+
+def join_player_profile_daily(
+    bets_df: pd.DataFrame,
+    profile_df: Optional[pd.DataFrame],
+    feature_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Attach player_profile_daily features to bets via a PIT / as-of join.
+
+    For each bet the most recent profile snapshot satisfying
+    ``snapshot_dtm <= payout_complete_dtm`` (by ``canonical_id``) is joined.
+    Only **rated** players appear in ``profile_df``; non-rated observations
+    receive 0.0 for all profile columns.
+
+    Parameters
+    ----------
+    bets_df:
+        Bet-level DataFrame.  Must contain ``canonical_id`` and
+        ``payout_complete_dtm`` (tz-naive HK local time).
+    profile_df:
+        player_profile_daily snapshot table.  Must contain ``canonical_id``,
+        ``snapshot_dtm`` (tz-naive), and any subset of ``feature_cols``.
+        Pass ``None`` or an empty DataFrame to skip (all profile columns → 0).
+    feature_cols:
+        Profile columns to attach.  Defaults to ``PROFILE_FEATURE_COLS``.
+
+    Returns
+    -------
+    pd.DataFrame
+        ``bets_df`` (copy) with profile columns added.  Columns absent from
+        ``profile_df`` are zero-filled.  The original row order and index are
+        preserved.
+
+    Notes
+    -----
+    Uses ``pd.merge_asof`` which requires both sides to be sorted by the
+    merge key.  A temporary ``_orig_idx`` column restores original order
+    afterwards.
+    """
+    if feature_cols is None:
+        feature_cols = PROFILE_FEATURE_COLS
+
+    result = bets_df.copy()
+
+    # R74: initialise profile columns as NaN (not 0.0) so that LightGBM can use its
+    # native NaN routing (default-child) to distinguish "no data" from "zero activity".
+    for col in feature_cols:
+        if col not in result.columns:
+            result[col] = np.nan
+
+    if profile_df is None or (isinstance(profile_df, pd.DataFrame) and profile_df.empty):
+        logger.info("join_player_profile_daily: profile_df absent/empty — profile features are NaN")
+        return result
+
+    available_cols = [c for c in feature_cols if c in profile_df.columns]
+    if not available_cols:
+        logger.warning(
+            "join_player_profile_daily: none of the requested profile columns found in profile_df; "
+            "expected: %s",
+            feature_cols[:5],
+        )
+        return result
+
+    # Ensure tz-naive timestamps on both sides (apply_dq strips tz from bets;
+    # profile_df may arrive tz-naive or tz-aware depending on data source).
+    bet_time = pd.to_datetime(result["payout_complete_dtm"])
+    if bet_time.dt.tz is not None:
+        bet_time = bet_time.dt.tz_localize(None)
+
+    snap_time = pd.to_datetime(profile_df["snapshot_dtm"])
+    if snap_time.dt.tz is not None:
+        snap_time = snap_time.dt.tz_localize(None)
+
+    # Build working copies with a stable integer position tracker.
+    # R75: cast canonical_id to str on both sides — ClickHouse may return Int64
+    # while identity mapping uses str, causing merge_asof to silently produce all NaN.
+    bets_work = result[["canonical_id", "payout_complete_dtm"]].copy()
+    bets_work["canonical_id"] = bets_work["canonical_id"].astype(str)
+    bets_work["_bet_time"] = bet_time
+    bets_work["_orig_idx"] = np.arange(len(bets_work))
+
+    profile_work = profile_df[["canonical_id", "snapshot_dtm"] + available_cols].copy()
+    profile_work["canonical_id"] = profile_work["canonical_id"].astype(str)
+    profile_work = profile_work.assign(snapshot_dtm=snap_time)
+
+    # merge_asof requires ascending sort by the time key (and the by= grouping
+    # key must also be sorted, but merge_asof does NOT sort — we must do it).
+    bets_sorted = bets_work.sort_values(["canonical_id", "_bet_time"]).reset_index(drop=True)
+    profile_sorted = profile_work.sort_values(["canonical_id", "snapshot_dtm"]).reset_index(drop=True)
+
+    merged = pd.merge_asof(
+        bets_sorted,
+        profile_sorted,
+        left_on="_bet_time",
+        right_on="snapshot_dtm",
+        by="canonical_id",
+        direction="backward",
+    )
+
+    # Restore original row order.
+    # R74: keep NaN for unmatched bets (non-rated or before first snapshot) —
+    # LightGBM routes NaN to the trained default-child, which is semantically
+    # correct; zero-fill would conflate "no data" with "zero activity".
+    merged = merged.sort_values("_orig_idx").reset_index(drop=True)
+
+    for col in available_cols:
+        result[col] = merged[col].values
+
+    n_rated_with_profile = int(pd.notna(result[available_cols[0]]).sum())
+    logger.info(
+        "join_player_profile_daily: attached %d profile cols; %d/%d bets have profile snapshot",
+        len(available_cols),
+        n_rated_with_profile,
+        len(result),
+    )
+    return result

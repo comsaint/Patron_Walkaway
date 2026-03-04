@@ -20,6 +20,7 @@ SOURCE_DB  = os.getenv("SOURCE_DB", "GDP_GMWDS_Raw")
 TBET     = "t_bet"
 TSESSION = "t_session"
 TGAME    = "t_game"
+TPROFILE = "player_profile_daily"  # PIT/as-of profile snapshot table (DEC-011)
 
 # ------------------ Time / locality -------------------------------
 HK_TZ = "Asia/Hong_Kong"
@@ -51,7 +52,7 @@ VALIDATOR_FINALIZE_ON_HORIZON = True
 VALIDATOR_FINALIZE_MINUTES = 45  # Horizon minutes to finalize as MISS when enabled
 
 # ============================================================
-# Phase 1 — Walkaway Model Constants (SSOT v9)
+# Phase 1 — Walkaway Model Constants (SSOT v10)
 # ============================================================
 
 # --- Business parameters ---
@@ -61,20 +62,23 @@ LABEL_LOOKAHEAD_MIN = WALKAWAY_GAP_MIN + ALERT_HORIZON_MIN  # X + Y; C1 extended
 
 # --- Data availability delays (SSOT §4.2) ---
 BET_AVAIL_DELAY_MIN = 1          # t_bet available ~1 min after payout_complete_dtm
-SESSION_AVAIL_DELAY_MIN = 15     # t_session: conservative +15 min after session_end
+SESSION_AVAIL_DELAY_MIN = 7      # t_session: ~7 min after session_end (SSOT §4.2; use 15 for conservative)
 
 # --- Run boundary ---
 RUN_BREAK_MIN = WALKAWAY_GAP_MIN  # Gap >= this value starts a new betting run
 
-# --- Gaming day / visit dedup (G4) ---
+# --- Gaming day / run dedup (G4) ---
 # Primary: use the gaming_day column from t_bet/t_session.
 # This constant is a fallback only (sensitivity analysis or missing gaming_day).
 GAMING_DAY_START_HOUR = 6
 
-# --- G1 threshold gate ---
-G1_PRECISION_MIN = 0.70          # Minimum per-model precision (provisional; needs biz sign-off)
-G1_ALERT_VOLUME_MIN_PER_HOUR = 5 # Minimum combined alert volume/hour (provisional)
-G1_FBETA = 0.5                   # F-beta weight (beta < 1 → precision-weighted)
+# --- G1 threshold gate (DEPRECATED — rollback path only; DEC-009/010) ---
+# Threshold selection now uses F1 maximization; G1 constraints removed.
+# Do NOT import these in trainer.py or backtester.py.
+# Restore only if explicitly rolling back to G1 strategy (see DEC-009 rollback note).
+G1_PRECISION_MIN = 0.70          # [DEPRECATED] Minimum per-model precision
+G1_ALERT_VOLUME_MIN_PER_HOUR = 5 # [DEPRECATED] Minimum combined alert volume/hour
+G1_FBETA = 0.5                   # [DEPRECATED] F-beta weight (beta < 1 → precision-weighted)
 OPTUNA_N_TRIALS = 300            # Optuna TPE trials for 2-D threshold search (I6)
 
 # --- Track B constants ---
@@ -82,6 +86,12 @@ TABLE_HC_WINDOW_MIN = 30         # Lookback window for table headcount feature (
 PLACEHOLDER_PLAYER_ID = -1       # Invalid player_id sentinel in t_bet (E4/F1)
 LOSS_STREAK_PUSH_RESETS = False  # Whether PUSH resets the loss-streak counter (F4)
 HIST_AVG_BET_CAP = 500_000       # Winsorization cap for avg_bet (F2; validate with EDA)
+
+# --- Chunk concat memory guard (OOM risk when loading all chunk Parquets) ---
+# If total size of chunk Parquet files exceeds this, pipeline logs a RAM warning.
+# Pandas typically uses ~2–3x on-disk size in RAM when loading Parquet.
+CHUNK_CONCAT_MEMORY_WARN_BYTES = int(2 * (1024**3))  # 2 GB on-disk total
+CHUNK_CONCAT_RAM_FACTOR = 3  # rough factor: on-disk size × this ≈ peak RAM for full_df
 
 # --- SQL fragment shared across all modules (FND-03) ---
 CASINO_PLAYER_ID_CLEAN_SQL = (

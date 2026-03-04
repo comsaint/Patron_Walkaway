@@ -365,7 +365,8 @@ Walkaway ground truth 以 `t_bet` 的下注時間序列定義（不依賴 `t_ses
 
 **Phase 1 演算法（本期）**：
 
-- **模型**：LightGBM（支援 `class_weight='balanced'` 處理類別不平衡）。
+- **模型**：LightGBM。
+- **加權策略**：訓練時使用 `class_weight='balanced'` 處理正負例標籤不平衡，並搭配 **Run-level 樣本加權**（`sample_weight = 1 / N_run`，其中 `N_run` 為同一 run 內的觀測點數），以校正高頻/長 run 主導訓練的偏誤（DEC-013）。
 - **超參調優**：使用 **Optuna（TPE Sampler）** 進行超參搜索（`n_estimators`, `learning_rate`, `max_depth`, `num_leaves`, `min_child_samples`, `subsample`, `colsample_bytree`, `reg_alpha`, `reg_lambda` 等），objective 以 validation set 上的 **PR-AUC** 為目標。Optuna 同時用於 §10.2 的雙模型閾值搜索。
 - **不使用 AutoML（Phase 1）**：為維持「可解釋性」與「最快出結果」，Phase 1 鎖定 LightGBM + Optuna，不引入 AutoML 框架。
 

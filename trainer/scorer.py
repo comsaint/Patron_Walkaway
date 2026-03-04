@@ -9,6 +9,9 @@ Key changes from pre-Phase-1 version
 * D2 identity resolution via identity.py build_canonical_mapping_from_df.
 * Track B features via features.py (compute_loss_streak / compute_run_boundary)
   — guarantees train-serve parity with trainer.py. (table_hc deferred to Phase 2.)
+* player_profile_daily PIT join (R79): rated bets enriched with player profile
+  features via as-of merge (snapshot_dtm <= bet_time); profile features stay NaN
+  for non-rated bets and bets with no prior snapshot.
 * H3 model routing: is_rated_obs ← casino_player_id IS NOT NULL.
 * FND-01 CTE dedup + session_avail_dtm gate on session query (H2).
 * SHAP reason codes → reason_code_map.json lookup, emitted with every alert.
@@ -30,6 +33,21 @@ import joblib
 import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
+
+try:
+    from features import (  # type: ignore[import]
+        PROFILE_FEATURE_COLS,
+        join_player_profile_daily as _join_profile,
+    )
+except ImportError:
+    try:
+        from trainer.features import (  # type: ignore[import, attr-defined]
+            PROFILE_FEATURE_COLS,
+            join_player_profile_daily as _join_profile,
+        )
+    except ImportError:
+        PROFILE_FEATURE_COLS = []  # type: ignore[assignment]
+        _join_profile = None  # type: ignore[assignment]
 
 try:
     from db_conn import get_clickhouse_client  # type: ignore[import]
@@ -148,10 +166,12 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         artifacts["rated"] = {
             "model": rb["model"],
             "threshold": float(rb.get("threshold", 0.5)),
+            "features": rb.get("features", []),  # R83: model-specific feature subset
         }
         artifacts["nonrated"] = {
             "model": nb["model"],
             "threshold": float(nb.get("threshold", 0.5)),
+            "features": nb.get("features", []),  # R83: nonrated trained without profile cols
         }
         if not artifacts["feature_list"]:
             artifacts["feature_list"] = rb.get("features", [])
@@ -730,6 +750,105 @@ def _compute_reason_codes(
         return ["[]" for _ in range(len(X))]
 
 
+# ── player_profile_daily loading for real-time scoring (R79) ─────────────────
+
+PROJECT_ROOT = BASE_DIR.parent
+_LOCAL_PARQUET_PROFILE = PROJECT_ROOT / "data" / "player_profile_daily.parquet"
+
+# R85: module-level TTL cache — avoids re-querying the profile table on every
+# scoring call within the same process (e.g. repeated score_once calls in a loop).
+_profile_cache: dict = {"df": None, "loaded_at": None, "loaded_for": None}
+_PROFILE_CACHE_TTL_HOURS: float = 1.0
+
+
+def _load_profile_for_scoring(
+    rated_canonical_ids: set,
+    as_of_dtm: datetime,
+    lookback_days: int = 365,
+) -> "Optional[pd.DataFrame]":
+    """Load the *latest* player_profile_daily snapshot per rated player for PIT join.
+
+    Only the most-recent snapshot at or before ``as_of_dtm`` is returned for each
+    canonical_id (R84 — avoids sending stale/redundant rows to merge_asof).
+
+    Returns None when the table is unavailable (graceful degradation — profile
+    features stay NaN and LightGBM handles them via its trained default-child).
+    """
+    if not rated_canonical_ids:
+        return None
+
+    # R85: check TTL cache first
+    global _profile_cache
+    if (
+        _profile_cache["df"] is not None
+        and _profile_cache["loaded_at"] is not None
+    ):
+        age_hours = (datetime.now() - _profile_cache["loaded_at"]).total_seconds() / 3600
+        if age_hours < _PROFILE_CACHE_TTL_HOURS:
+            cached_df: "pd.DataFrame" = _profile_cache["df"]
+            cids_str_cache = {str(c) for c in rated_canonical_ids}
+            result = cached_df[cached_df["canonical_id"].astype(str).isin(cids_str_cache)]
+            logger.debug("[scorer] profile: served from cache (age=%.1fh)", age_hours)
+            return result if not result.empty else None
+
+    def _naive(dt: datetime) -> "pd.Timestamp":
+        ts = pd.Timestamp(dt)
+        return ts.tz_localize(None) if ts.tzinfo is None else ts.replace(tzinfo=None)
+
+    df_loaded: "Optional[pd.DataFrame]" = None
+
+    # Local Parquet dev path (mirrors trainer's LOCAL_PARQUET_DIR fallback)
+    if _LOCAL_PARQUET_PROFILE.exists():
+        try:
+            df = pd.read_parquet(
+                _LOCAL_PARQUET_PROFILE,
+                filters=[("snapshot_dtm", "<=", _naive(as_of_dtm))],
+            )
+            cids_str = {str(c) for c in rated_canonical_ids}
+            df = df[df["canonical_id"].astype(str).isin(cids_str)]
+            # R84: keep only the latest snapshot per player
+            df = df.sort_values("snapshot_dtm")
+            df = df.drop_duplicates(subset=["canonical_id"], keep="last")
+            logger.info("[scorer] player_profile_daily: %d rows from local Parquet", len(df))
+            df_loaded = df if not df.empty else None
+        except Exception as exc:
+            logger.debug("[scorer] profile local Parquet skipped: %s", exc)
+
+    # ClickHouse path
+    if df_loaded is None and get_clickhouse_client is not None:
+        try:
+            client = get_clickhouse_client()
+            _source_db = getattr(config, "SOURCE_DB", "GDP_GMWDS_Raw")
+            _tprofile = getattr(config, "TPROFILE", "player_profile_daily")
+            _profile_cols_sql = ", ".join(PROFILE_FEATURE_COLS) if PROFILE_FEATURE_COLS else "*"
+            _cids = list({str(c) for c in rated_canonical_ids})
+            # R84: ORDER BY snapshot_dtm DESC + LIMIT 1 BY canonical_id — latest snapshot per player
+            query = f"""
+                SELECT canonical_id, snapshot_dtm, {_profile_cols_sql}
+                FROM {_source_db}.{_tprofile}
+                WHERE snapshot_dtm <= %(as_of)s
+                  AND canonical_id IN %(cids)s
+                ORDER BY canonical_id, snapshot_dtm DESC
+                LIMIT 1 BY canonical_id
+            """
+            df = client.query_df(
+                query,
+                parameters={"as_of": as_of_dtm, "cids": _cids},
+            )
+            logger.info("[scorer] player_profile_daily: %d rows from ClickHouse", len(df))
+            df_loaded = df if not df.empty else None
+        except Exception as exc:
+            logger.warning(
+                "[scorer] player_profile_daily unavailable (%s); profile features will be NaN", exc
+            )
+
+    # R85: populate cache on successful load
+    if df_loaded is not None:
+        _profile_cache = {"df": df_loaded, "loaded_at": datetime.now(), "loaded_for": as_of_dtm}
+
+    return df_loaded
+
+
 # ── Scoring / H3 routing ──────────────────────────────────────────────────────
 
 def _score_df(
@@ -746,10 +865,18 @@ def _score_df(
     nonrated_art = artifacts.get("nonrated")
 
     df = df.copy()
-    for col in feature_list:
+    # R74/R79: profile features stay NaN when no prior snapshot exists —
+    # LightGBM routes them via its trained default-child (NaN-aware split).
+    # Non-profile features are always computable; default to 0.0 when absent.
+    _profile_in_list = set(PROFILE_FEATURE_COLS) & set(feature_list)
+    _non_profile_in_list = [c for c in feature_list if c not in _profile_in_list]
+    for col in _non_profile_in_list:
         if col not in df.columns:
             df[col] = 0.0
-    df[feature_list] = df[feature_list].fillna(0.0)
+    for col in _profile_in_list:
+        if col not in df.columns:
+            df[col] = np.nan
+    df[_non_profile_in_list] = df[_non_profile_in_list].fillna(0.0)
 
     is_rated = (
         df["is_rated"].to_numpy(dtype=bool)
@@ -765,15 +892,18 @@ def _score_df(
 
     if rated_mask.any():
         _model_r = (rated_art or _fallback)  # type: ignore[operator]
+        rated_features = (_model_r or {}).get("features") or feature_list  # type: ignore[union-attr]
         scores[rated_mask] = _model_r["model"].predict_proba(  # type: ignore[index]
-            df.loc[rated_mask, feature_list]
+            df.loc[rated_mask, rated_features]
         )[:, 1]
 
     if nonrated_mask.any():
         _model_nr = (nonrated_art or rated_art)  # type: ignore[operator]
         model = _model_nr["model"]  # type: ignore[index]
+        # R83: use nonrated model's own feature subset — it was trained without PROFILE_FEATURE_COLS
+        nonrated_features = _model_nr.get("features") or feature_list  # type: ignore[union-attr]
         scores[nonrated_mask] = model.predict_proba(
-            df.loc[nonrated_mask, feature_list]
+            df.loc[nonrated_mask, nonrated_features]
         )[:, 1]
 
     df["score"] = scores
@@ -984,6 +1114,20 @@ def score_once(
         except Exception as exc:
             logger.warning("[scorer] Track A features skipped: %s", exc)
 
+    # ── player_profile_daily PIT join (R79) ─────────────────────────────────
+    # Attach rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
+    # Non-rated bets and bets without a prior snapshot keep NaN — LightGBM handles
+    # this natively via the default-child path trained in trainer.py (R74/R79).
+    if _join_profile is not None and PROFILE_FEATURE_COLS and rated_canonical_ids:
+        _profile_df = _load_profile_for_scoring(rated_canonical_ids, now_hk)
+        if _profile_df is not None:
+            features_all = _join_profile(features_all, _profile_df)
+            logger.info("[scorer] player_profile_daily PIT join applied")
+        else:
+            logger.info(
+                "[scorer] player_profile_daily unavailable — profile features will be NaN"
+            )
+
     features_all["is_rated"] = features_all["canonical_id"].isin(rated_canonical_ids)
     logger.info("[scorer] Feature rows (full window): %d", len(features_all))
 
@@ -1014,13 +1158,15 @@ def score_once(
 
     rated_idx = alert_candidates.index[rated_mask_ac].tolist()
     if rated_idx and rated_art is not None and feature_list:
-        X_r = alert_candidates.loc[rated_idx, feature_list]
+        _rated_feats = rated_art.get("features") or feature_list
+        X_r = alert_candidates.loc[rated_idx, _rated_feats]
         rc_r = _compute_reason_codes(rated_art["model"], X_r, artifacts["reason_code_map"])
         alert_candidates.loc[rated_idx, "reason_codes"] = rc_r
 
     nonrated_idx = alert_candidates.index[~rated_mask_ac].tolist()
     if nonrated_idx and nonrated_art is not None and feature_list:
-        X_nr = alert_candidates.loc[nonrated_idx, feature_list]
+        _nonrated_feats = nonrated_art.get("features") or feature_list
+        X_nr = alert_candidates.loc[nonrated_idx, _nonrated_feats]
         rc_nr = _compute_reason_codes(nonrated_art["model"], X_nr, artifacts["reason_code_map"])
         alert_candidates.loc[nonrated_idx, "reason_codes"] = rc_nr
 
