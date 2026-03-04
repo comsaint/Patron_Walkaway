@@ -211,3 +211,8 @@ data/
 .env
 walkaway/
 trainer_backup/
+trainer/models/
+trainer/out_trainer/
+trainer/local_state/
+trainer/.data/
+trainer/out_backtest/
