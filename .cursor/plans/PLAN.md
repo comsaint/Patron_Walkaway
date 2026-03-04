@@ -327,44 +327,111 @@ Uses `pytest` with small synthetic DataFrames — no ClickHouse connection requi
 10. `api_server.py` (depends on model artifacts structure)
 11. `tests/` (validates all of the above)
 
-## Fast Mode（DEC-015）
+## Fast Mode（DEC-017 — Data-Horizon 限制模式）
 
-### 目的
+> **取代先前的 DEC-015（Rated Sampling + Full Nonrated）。** DEC-015 的 Rated Sampling 功能保留為獨立的 `--sample-rated N` flag。
 
-讓整條 pipeline（ETL + Training + Evaluation）在筆電上以 `--fast-mode` 跑完 3 個月資料，目標 <10 分鐘，用於：
-- 開發迭代：驗證 code change 無 regression
-- CI smoke test：quick sanity check
-- Demo/展示：快速重現端到端流程
+### 設計原則
 
-### 選定方案：Option B — Rated Sampling + Full Nonrated
+**Fast mode = 「假設你只有最近 N 天的原始資料」。**
 
-| 面向 | Normal Mode | Fast Mode |
-|------|-------------|-----------|
-| Rated 玩家 | 全量 | canonical_map 中 deterministic 抽樣 N 人（預設 1,000） |
-| Nonrated 玩家 | 全量 | 全量（不受影響） |
-| Profile snapshot 頻率 | 每天 | 每 7 天 |
-| Session I/O | 每日各讀一次 parquet | 一次性讀入 memory，per-day in-memory filter |
-| Optuna 超參搜索 | 300 trials | 跳過，使用 default HP |
-| 模型 artifact | 正常輸出 | 結構不變，但 metadata 標記 `fast_mode=True` |
+這是 data-source 層級的限制，所有子模組（identity、labels、features、profile ETL）必須遵守同一個時間邊界，不得存取或計算超出此邊界的任何資料。速度提升是「資料量減少」的自然結果，而非抽樣或跳步。
 
-### 影響模組與改動項目
+### 核心概念：Data Horizon
 
-1. **`trainer.py`**
-   - 新增 `--fast-mode` CLI flag
-   - `run_pipeline()` 根據 flag：
-     - 從 canonical_map deterministic 抽樣 rated canonical_id（fixed seed）
-     - 傳 `canonical_id_whitelist` 給 ETL 與 profile loading
-     - 跳過 Optuna，使用 default hyperparameters
-   - Artifact metadata 加 `fast_mode` flag
+```
+                    data_horizon_days
+          |<─────────────────────────────>|
+  data_start                         data_end
+  (= effective_start)                (= effective_end)
+          │                               │
+          │   canonical mapping: 只用此範圍內的 sessions
+          │   profile snapshots: 只建此範圍內的日期
+          │   profile features:  只計算 ≤ data_horizon_days 的窗口
+          │   training chunks:   只處理此範圍內的 chunks
+```
+
+- `data_horizon_days = (effective_end - effective_start).days`
+- `effective_start` / `effective_end` 由 `--recent-chunks` 或 `--start`/`--end` 決定
+- Normal mode 不影響（profile 仍可 lookback 365 天）
+
+### 行為對照表
+
+| 面向 | Normal Mode | Fast Mode (`--fast-mode`) |
+|------|-------------|---------------------------|
+| **資料時間範圍** | 全量（含 profile 365 天 lookback） | 僅 effective window 內（不往前推 365 天） |
+| **Canonical mapping** | effective window 內的 sessions | 同左（不變） |
+| **Profile snapshot 日期範圍** | `effective_start - 365d` → `effective_end` | `effective_start` → `effective_end`（不往前推） |
+| **Profile 特徵窗口** | 7d / 30d / 90d / 180d / 365d 全部計算 | **動態**：只計算 ≤ `data_horizon_days` 的窗口（見下表） |
+| **Profile snapshot 頻率** | 每天 | 每 7 天（`snapshot_interval_days=7`） |
+| **Optuna 超參搜索** | OPTUNA_N_TRIALS 次 | 跳過，使用 default HP（`--skip-optuna` 隱含） |
+| **Rated 玩家範圍** | 全量 | **全量**（預設不抽樣；可搭配 `--sample-rated N`） |
+| **模型 artifact** | 正常輸出 | 結構不變，metadata 標記 `fast_mode=True` |
+
+### Profile 特徵動態分層
+
+`_compute_profile` 根據 `max_lookback_days` 決定計算哪些時間窗口。超出可用天數的窗口直接跳過，對應欄位為 NaN。
+
+| 可用資料天數 (`data_horizon_days`) | 計算的窗口 | 跳過的窗口 |
+|---|---|---|
+| < 7 天 | 無（跳過 profile） | 全部 |
+| 7–29 天 | 7d | 30d, 90d, 180d, 365d |
+| 30–89 天 | 7d, 30d | 90d, 180d, 365d |
+| 90–179 天 | 7d, 30d, 90d | 180d, 365d |
+| 180–364 天 | 7d, 30d, 90d, 180d | 365d |
+| ≥ 365 天 | 全部 | 無 |
+
+**Ratio 特徵**（如 `turnover_30d_over_180d`）：需要分子和分母兩個窗口都有效才計算，否則為 NaN。
+
+**Recency 特徵**（`days_since_last_session`、`days_since_first_session`）：語義仍正確，但 `days_since_first_session` 的上限會被截斷至可用資料範圍，可接受。
+
+### 獨立 Flag：`--sample-rated N`
+
+與 `--fast-mode` 完全正交。控制「rated 玩家數量」而非「資料時間範圍」。
+
+- **預設**：不啟用（全量 rated patrons）
+- **行為**：從 canonical_map 中 deterministic sort + head(N) 抽樣，傳 `canonical_id_whitelist` 給 profile ETL 與 training
+- **適用情境**：在全量日期範圍上以少量 patron 快速測試完整 pipeline
+
+| 指令範例 | 行為 |
+|---|---|
+| `--fast-mode --recent-chunks 1` | 只用最後 1 個月資料，全量 rated patrons，profile 特徵窗口 ≤ ~30d |
+| `--fast-mode --recent-chunks 3 --sample-rated 1000` | 最後 3 個月資料，只取 1000 rated patrons |
+| `--sample-rated 500`（無 fast-mode） | 全量日期範圍（含 365d lookback），但只取 500 rated patrons |
+| 什麼都不加 | 全量日期 + 全量 rated（production 正常模式） |
+
+### Bug 修復：`canonical_map` 傳遞鏈（兩種模式都需要）
+
+**現有問題**：`trainer.py:run_pipeline` 在記憶體中建好 `canonical_map`，但呼叫 `ensure_player_profile_daily_ready` → `backfill` 時，`backfill()` 沒有 `canonical_map` 參數，自行去讀 `data/canonical_mapping.parquet`（不存在）→ 每天噴 `No local canonical_mapping.parquet; cannot join canonical_id` → profile 全部建失敗。
+
+**修正**：
+- `backfill()` 新增 `canonical_map: Optional[pd.DataFrame] = None` 參數
+- `ensure_player_profile_daily_ready()` 新增 `canonical_map` 參數
+- `trainer.py:run_pipeline` 把已建好的 `canonical_map` 一路傳到底
+- 此修正同時適用 normal mode 和 fast mode
+
+### 各模組改動清單
+
+1. **`features.py`**
+   - 新增 `get_profile_feature_cols(max_lookback_days: int = 365) -> List[str]`
+   - 根據 `max_lookback_days` 過濾出可計算的特徵子集
+   - 靜態 `PROFILE_FEATURE_COLS` 保留（= `get_profile_feature_cols(365)`，用於 scorer / normal mode 參考）
 
 2. **`etl_player_profile.py`**
-   - `backfill()` 新增 `canonical_id_whitelist` 參數
-   - `backfill()` 新增 `snapshot_interval_days` 參數（fast-mode = 7）
-   - 一次性讀取 session parquet（取代每日各讀一次）
+   - `backfill()` 新增 `canonical_map` 參數，傳入時跳過自行建 map 邏輯
+   - `backfill()` 新增 `max_lookback_days` 參數
+   - `build_player_profile_daily()` 新增 `max_lookback_days` 參數，傳遞至 `_compute_profile`
+   - `_compute_profile()` 新增 `max_lookback_days` 參數，只計算有效窗口的特徵
+   - `canonical_id_whitelist` 參數保留（給 `--sample-rated` 用）
 
-3. **`doc/player_profile_daily_spec.md`**
-   - §2.3 Population 約束：profile 只為 rated（canonical_map 中的 ID）計算
-   - §2.4 Consumer 約束：只有 rated model 消費此表；nonrated model 不依賴
+3. **`trainer.py`**
+   - `--fast-mode`：推導 `data_horizon_days = (effective_end - effective_start).days`
+   - `--sample-rated N`（新 flag，取代原 fast-mode 隱含的抽樣，預設不啟用）
+   - `ensure_player_profile_daily_ready()` 新增 `canonical_map` 和 `max_lookback_days` 參數
+   - Fast mode：`required_start = effective_start.date()`（不往前推 365 天）
+   - 用 `get_profile_feature_cols(data_horizon_days)` 決定動態 feature list
+   - `ALL_FEATURE_COLS` 在 `run_pipeline` 中動態組合（Track B + Legacy + Profile 子集）
+   - 把 `canonical_map` 一路傳入 profile 建表流程
 
 ### 不改動的部分
 
@@ -372,12 +439,15 @@ Uses `pytest` with small synthetic DataFrames — no ClickHouse connection requi
 - 時間折疊（`time_fold.py`）不受影響
 - `--recent-chunks` 與 `--fast-mode` 可疊加使用
 - Nonrated model 路徑完全不受影響
+- `--fast-mode-no-preload` 保留（低 RAM 保護，正交）
+- `--skip-optuna` 保留（可不搭配 fast-mode 獨立使用）
 
 ### 安全護欄
 
-- Fast-mode 產出的模型 **不得用於生產推論**；artifact metadata 會標記 `fast_mode=True`
+- Fast-mode 產出的模型 **不得用於生產推論**；artifact metadata 標記 `fast_mode=True`
 - Scorer 載入模型時應檢查此 flag 並在 production 環境拒絕載入
-- Fast-mode 的 profile cache 與 normal-mode 不混用（schema hash 會自動處理）
+- Fast-mode 的 profile cache 與 normal-mode 不混用（schema hash 機制自動處理）
+- `--sample-rated` 產出的模型同樣標記（rated 模型只用部分玩家訓練）
 
 ---
 
@@ -416,6 +486,8 @@ Uses `pytest` with small synthetic DataFrames — no ClickHouse connection requi
 ### 目的
 
 Fast Mode 目前會呼叫 `_preload_sessions_local()`，一次將整個 `gmwds_t_session.parquet`（約 7400 萬列，大小 2-4GB+）載入記憶體。在 8GB 記憶體的機器上，這會直接導致 OOM。我們需要提供關閉 Preload 的選項，並透過 Pandas/PyArrow 的 `filters` 下推（Predicate Pushdown）技術，讓逐日讀取時記憶體也能保持在安全範圍。
+
+> **DEC-017 備註**：新的 Data-Horizon 設計下，`--fast-mode --recent-chunks N` 會將 profile 日期範圍限制在 effective window 內（不往前推 365 天），session 讀取範圍也相應縮小，本身即大幅降低記憶體需求。`--fast-mode-no-preload` 仍作為額外保險，適用於即使限縮後 session 量仍然很大的情境。
 
 ### 實作要點（方案一：Pandas + filters）
 

@@ -120,13 +120,18 @@ class TestR108BackfillLogsSkippedCount(unittest.TestCase):
 
 
 class TestR109FastModeUsesWhitelistForProfileLoad(unittest.TestCase):
-    """R109: In fast-mode, load_player_profile_daily must receive whitelist not full canonical_map."""
+    """R109 (updated for DEC-017/R205): In fast-mode WITHOUT --sample-rated,
+    load_player_profile_daily must receive ALL canonical_ids from canonical_map
+    (no implicit sampling).  Implicit sampling was removed in R205; the old
+    DEC-015 FAST_MODE_RATED_SAMPLE_N auto-sampling no longer applies."""
 
     def test_run_pipeline_passes_whitelist_to_load_profile_in_fast_mode(self):
-        """When fast_mode=True, load_player_profile_daily canonical_ids length should be
-        FAST_MODE_RATED_SAMPLE_N, not full canonical_map size."""
+        """When fast_mode=True (no --sample-rated), load_player_profile_daily
+        canonical_ids must equal ALL canonical_ids in canonical_map (DEC-017/R205).
+        Previously (DEC-015) this was capped at FAST_MODE_RATED_SAMPLE_N; that
+        implicit behaviour was intentionally removed."""
         import argparse
-        from trainer.trainer import run_pipeline, FAST_MODE_RATED_SAMPLE_N
+        from trainer.trainer import run_pipeline, FAST_MODE_RATED_SAMPLE_N  # noqa: F401 (kept for reference)
 
         with patch("trainer.trainer.get_monthly_chunks") as mock_chunks, \
              patch("trainer.trainer.get_train_valid_test_split") as mock_split, \
@@ -179,18 +184,21 @@ class TestR109FastModeUsesWhitelistForProfileLoad(unittest.TestCase):
                     start="2025-01-01", end="2025-06-01", days=None,
                     use_local_parquet=True, force_recompute=False, skip_optuna=False,
                     recent_chunks=None, fast_mode=True,
+                    # sample_rated intentionally omitted (no --sample-rated flag)
                 )
                 run_pipeline(args)
 
                 self.assertTrue(mock_load_profile.called)
                 kwargs = mock_load_profile.call_args[1]
                 cids_arg = kwargs.get("canonical_ids")
-                self.assertIsNotNone(cids_arg)
+                # DEC-017/R205: without --sample-rated, fast-mode passes ALL canonical_ids.
+                # Implicit sampling (DEC-015) was removed; rated_whitelist stays None.
+                self.assertIsNotNone(cids_arg, "canonical_ids should not be None when canonical_map is non-empty")
                 self.assertEqual(
                     len(cids_arg),
-                    FAST_MODE_RATED_SAMPLE_N,
-                    "R109: fast-mode must pass whitelist (len=FAST_MODE_RATED_SAMPLE_N) to "
-                    "load_player_profile_daily, not full canonical_map",
+                    5000,
+                    "R109 (DEC-017): fast-mode WITHOUT --sample-rated must pass ALL "
+                    "canonical_ids (5000) to load_player_profile_daily, not a sampled subset.",
                 )
             finally:
                 pathlib.Path(_tmp_chunk).unlink(missing_ok=True)

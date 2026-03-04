@@ -29,7 +29,7 @@ ClickHouse ──► trainer.py ──► models/ (rated_model.pkl, nonrated_mod
 
 - **`trainer/`** — `config.py`、`db_conn.py`、`trainer.py`、`identity.py`、`labels.py`、`features.py`、`time_fold.py`、`backtester.py`、`scorer.py`、`validator.py`、`api_server.py`、`status_server.py`，以及 ETL 與腳本。
 - **`trainer/frontend/`** — 儀表板 SPA（地圖、告警、驗證趨勢、人流）。
-- **`tests/`** — 單元與整合測試（unittest）。
+- **`tests/`** — 單元與整合測試（pytest）。
 - **`doc/`** — 規格、發現、API 協定。**`schema/`** — 資料表/欄位字典與 DQ 提示。
 
 ### 環境設定
@@ -50,7 +50,7 @@ python -m trainer.trainer --use-local-parquet --recent-chunks 3
 python -m trainer.trainer --skip-optuna --use-local-parquet
 ```
 
-**Fast mode（僅供測試，筆電約 &lt;10 分鐘）**：使用少量確定性抽樣評級客與 7 天 snapshot 間隔。**請勿將產物用於生產。**
+**Fast mode（僅供測試，筆電約 &lt;10 分鐘）**：限制可用資料時間範圍（Data Horizon），所有子模組（identity / labels / features / profile ETL）共用同一個時間邊界，以較少資料量加速訓練；可選擇性搭配 `--sample-rated N` 只抽樣部分評級客。**請勿將產物用於生產。**
 
 ```bash
 python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
@@ -60,6 +60,12 @@ python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
 
 ```bash
 python -m trainer.trainer --fast-mode --fast-mode-no-preload --recent-chunks 3 --use-local-parquet
+```
+
+如需在 Fast mode 下只使用部分評級客，可加入（與 `--fast-mode` 正交）：
+
+```bash
+python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sample-rated 1000
 ```
 
 **Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`
@@ -76,8 +82,8 @@ python -m trainer.trainer --fast-mode --fast-mode-no-preload --recent-chunks 3 -
 
 ### 測試
 
-全部單元測試：`python -m unittest discover -s tests -v`  
-僅 trainer 相關：`python -m unittest tests.test_trainer -v`  
+全部測試：`pytest`  
+僅 trainer 相關：`pytest tests/test_trainer.py -v`  
 Fast-mode 煙測：`python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet`
 
 ### 文件
@@ -130,7 +136,7 @@ ClickHouse ──► trainer.py ──► models/ (rated_model.pkl, nonrated_mod
 
 - **`trainer/`** — `config.py`、`db_conn.py`、`trainer.py`、`identity.py`、`labels.py`、`features.py`、`time_fold.py`、`backtester.py`、`scorer.py`、`validator.py`、`api_server.py`、`status_server.py`，以及 ETL 与脚本。
 - **`trainer/frontend/`** — 仪表盘 SPA（地图、告警、验证趋势、人流）。
-- **`tests/`** — 单元与集成测试（unittest）。
+- **`tests/`** — 单元与集成测试（pytest）。
 - **`doc/`** — 规格、发现、API 协议。**`schema/`** — 表/字段字典与 DQ 提示。
 
 ### 环境设置
@@ -151,7 +157,7 @@ python -m trainer.trainer --use-local-parquet --recent-chunks 3
 python -m trainer.trainer --skip-optuna --use-local-parquet
 ```
 
-**Fast mode（仅供测试，笔记本约 &lt;10 分钟）**：使用少量确定性抽样评级客与 7 天 snapshot 间隔。**请勿将产物用于生产。**
+**Fast mode（仅供测试，笔记本约 &lt;10 分钟）**：限制可用数据时间范围（Data Horizon），所有子模块（identity / labels / features / profile ETL）共用同一个时间边界，以较少数据量加速训练；可选择性搭配 `--sample-rated N` 只抽样部分评级客。**请勿将产物用于生产。**
 
 ```bash
 python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
@@ -161,6 +167,12 @@ python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
 
 ```bash
 python -m trainer.trainer --fast-mode --fast-mode-no-preload --recent-chunks 3 --use-local-parquet
+```
+
+如需在 Fast mode 下只使用部分评级客，可加入（与 `--fast-mode` 正交）：
+
+```bash
+python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sample-rated 1000
 ```
 
 **Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`
@@ -177,8 +189,8 @@ python -m trainer.trainer --fast-mode --fast-mode-no-preload --recent-chunks 3 -
 
 ### 测试
 
-全部单元测试：`python -m unittest discover -s tests -v`  
-仅 trainer 相关：`python -m unittest tests.test_trainer -v`  
+全部测试：`pytest`  
+仅 trainer 相关：`pytest tests/test_trainer.py -v`  
 Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet`
 
 ### 文档
@@ -231,7 +243,7 @@ ClickHouse ──► trainer.py ──► models/ (rated_model.pkl, nonrated_mod
 
 - **`trainer/`** — `config.py`, `db_conn.py`, `trainer.py`, `identity.py`, `labels.py`, `features.py`, `time_fold.py`, `backtester.py`, `scorer.py`, `validator.py`, `api_server.py`, `status_server.py`, ETL and scripts.
 - **`trainer/frontend/`** — Dashboard SPA (map, alerts, validation trends, headcount).
-- **`tests/`** — Unit and integration tests (unittest).
+- **`tests/`** — Unit and integration tests (pytest).
 - **`doc/`** — Specs, findings, API protocol. **`schema/`** — Table/column dictionary and DQ hints.
 
 ---
@@ -283,7 +295,7 @@ python -m trainer.trainer --skip-optuna --use-local-parquet
 
 ### Fast mode (testing only, &lt;10 min on laptop)
 
-Uses a small deterministic sample of rated players and 7-day snapshot interval. **Do not use artifacts in production.**
+Constrains the available data time range (Data Horizon); all submodules (identity / labels / features / profile ETL) share the same time boundary so that a smaller slice of data is processed for faster iteration. You can optionally combine with `--sample-rated N` to train on a subset of rated patrons. **Do not use artifacts in production.**
 
 ```bash
 python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
@@ -293,6 +305,12 @@ Low-RAM (e.g. 8 GB): add `--fast-mode-no-preload` to avoid loading the full sess
 
 ```bash
 python -m trainer.trainer --fast-mode --fast-mode-no-preload --recent-chunks 3 --use-local-parquet
+```
+
+To use only a subset of rated patrons under Fast mode (orthogonal to `--fast-mode`):
+
+```bash
+python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sample-rated 1000
 ```
 
 ### Backtester
@@ -341,16 +359,16 @@ python -m trainer.status_server
 
 ## Testing
 
-Run all unit tests:
+Run all tests:
 
 ```bash
-python -m unittest discover -s tests -v
+pytest
 ```
 
 Run only trainer-related tests:
 
 ```bash
-python -m unittest tests.test_trainer -v
+pytest tests/test_trainer.py -v
 ```
 
 Fast-mode smoke test (requires local Parquet data):

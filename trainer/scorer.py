@@ -14,7 +14,7 @@ Key changes from pre-Phase-1 version
   for non-rated bets and bets with no prior snapshot.
 * H3 model routing: is_rated_obs ← casino_player_id IS NOT NULL.
 * FND-01 CTE dedup + session_avail_dtm gate on session query (H2).
-* SHAP reason codes → reason_code_map.json lookup, emitted with every alert.
+* SHAP reason codes -> reason_code_map.json lookup, emitted with every alert.
 * New alert DB columns: canonical_id, is_rated_obs, reason_codes,
   model_version, margin, scored_at.
 """
@@ -285,7 +285,7 @@ def fetch_recent_data(
     before = len(bets)
     bets = bets[bets["wager"].fillna(0) > 0].copy()
     if len(bets) != before:
-        logger.debug("[scorer] filtered zero-wager bets: %d→%d", before, len(bets))
+        logger.debug("[scorer] filtered zero-wager bets: %d->%d", before, len(bets))
 
     # Normalize payout_complete_dtm to tz-aware HK time so that Track-A
     # cutoff_time (now_hk, tz-aware) is consistent with the EntitySet
@@ -1065,7 +1065,7 @@ def score_once(
 
     refresh_alert_history(alert_history, now_hk, conn)
     start = now_hk - timedelta(hours=lookback_hours)
-    logger.info("[scorer] Window: %s → %s", start.isoformat(), now_hk.isoformat())
+    logger.info("[scorer] Window: %s -> %s", start.isoformat(), now_hk.isoformat())
 
     bets, sessions = fetch_recent_data(start, now_hk)
     if bets.empty:

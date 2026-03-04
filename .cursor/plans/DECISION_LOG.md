@@ -340,4 +340,53 @@
 
 ---
 
+## DEC-017：重新設計 Fast Mode 為 Data-Horizon 限制模式
+
+**日期**：2026-03-04  
+**SSOT 章節**：§4.3, §8.2  
+**關聯**：DEC-015（被取代）、DEC-011（player_profile_daily）、DEC-014（Local Parquet）
+
+**決策**：將 `--fast-mode` 的核心語義從「Rated Sampling + Snapshot 降頻」改為「**Data-Horizon 限制**」——假設只有最近 N 天的原始資料，所有子模組（identity、profile ETL、特徵計算、training）遵守同一個時間邊界，不得存取邊界外的資料。原 DEC-015 的 Rated Sampling 功能抽離為獨立的 `--sample-rated N` flag，與 `--fast-mode` 正交。
+
+**背景與問題**：  
+DEC-015 的設計在實際使用中暴露了兩個根本問題：
+
+1. **Profile 日期範圍不受 training window 限制**：即使用 `--fast-mode --recent-chunks 1`（只要最後一個月的 chunk），`ensure_player_profile_daily_ready` 仍然從 `effective_start - 365 days` 開始建 profile snapshot，導致 pipeline 花大量時間在建歷史 profile。
+2. **`canonical_map` 傳遞鏈斷裂**：`trainer.py` 在記憶體中建好 `canonical_map`，但呼叫 `backfill()` 時，`backfill()` 無法接收此 map——它自行嘗試讀取 `data/canonical_mapping.parquet`（本地不存在），導致每天的 profile 全部建失敗，產生大量 `No local canonical_mapping.parquet; cannot join canonical_id` 警告。
+
+使用者對 fast-mode 的期望是「假設只有最近幾天/月的資料，一切據此運行」，本質上是 data-source 層級的過濾，而非 DEC-015 的抽樣策略。
+
+**考慮過的替代方案**：
+
+1. **修補 DEC-015（加傳 canonical_map + 限制 profile 日期）**：可解決 bug，但核心設計仍是「全量日期 + 抽樣玩家」，與使用者心智模型不符——使用者想要的是「有限資料 → 一切自動對齊」。
+2. **DEC-017（Data-Horizon 模式）** ✓ 選定：fast-mode = data-horizon 限制，速度來自資料量減少，概念最簡潔。profile 特徵根據可用天數動態裁剪（< 90 天不算 180d/365d 窗口），避免產生無意義的等值特徵。
+
+**新設計要點**：
+
+1. **Data Horizon**：`data_horizon_days = (effective_end - effective_start).days`。Fast mode 下，profile `required_start = effective_start.date()`（不往前推 365 天）。Normal mode 不影響。
+2. **Profile 特徵動態分層**：`_compute_profile` 接受 `max_lookback_days` 參數，只計算 ≤ 該值的時間窗口。`features.py` 新增 `get_profile_feature_cols(max_lookback_days)` 函數動態產生特徵清單。
+3. **`canonical_map` 傳遞修復**（bug fix，兩種模式皆適用）：`backfill()` 和 `ensure_player_profile_daily_ready()` 新增 `canonical_map` 參數，`trainer.py` 把已建好的 map 傳到底。
+4. **`--sample-rated N`**（獨立 flag，取代 DEC-015 的隱含抽樣）：預設不啟用；可與 `--fast-mode` 搭配或單獨使用。適用於「全量日期但少量 patron」的測試情境。
+
+**與 DEC-015 的差異**：
+
+| 面向 | DEC-015 | DEC-017 |
+|------|---------|---------|
+| 核心機制 | Rated Sampling（1000 人） | Data-Horizon 限制（effective window 內） |
+| Profile 日期範圍 | 不限（仍回推 365 天） | 限制在 effective window 內 |
+| Profile 特徵窗口 | 全部計算（7d–365d） | 動態裁剪（只算 ≤ data_horizon_days） |
+| Rated Sampling | fast-mode 隱含 | 獨立 `--sample-rated N` flag，預設不啟用 |
+| canonical_map 傳遞 | 有 bug（斷裂） | 修復 |
+
+**保留自 DEC-015 的部分**：
+- `--skip-optuna`（fast-mode 隱含或獨立使用）
+- `snapshot_interval_days=7`（fast-mode 隱含）
+- `--fast-mode-no-preload`（低 RAM 保護）
+- schema hash 快取機制
+- artifact metadata `fast_mode=True` 標記
+
+**DEC-015 的狀態**：被 DEC-017 取代。DEC-015 中的 Rated Sampling 概念保留為 `--sample-rated N`，其餘行為由 DEC-017 重新定義。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

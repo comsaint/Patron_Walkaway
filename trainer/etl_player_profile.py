@@ -217,14 +217,14 @@ def compute_profile_schema_hash(session_parquet: Optional[Path] = None) -> str:
 
     # Hash the source of _compute_profile so that changes to aggregation logic
     # (not just column names or version string) also invalidate the cache.
-    # R98: normalize CRLF → LF before hashing so the fingerprint is identical
+    # R98: normalize CRLF -> LF before hashing so the fingerprint is identical
     # regardless of whether the file was checked out on Windows or Linux.
     _src = inspect.getsource(_compute_profile).replace("\r\n", "\n").replace("\r", "\n")
     compute_source_hash = hashlib.md5(_src.encode("utf-8")).hexdigest()[:8]
 
     # Read raw-data provenance: earliest session date in the source file.
     # When the local session parquet is replaced with a more complete historical
-    # dataset, session_min_date shifts earlier → hash changes → full rebuild.
+    # dataset, session_min_date shifts earlier -> hash changes -> full rebuild.
     _sess_path = session_parquet if session_parquet is not None else (
         LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
     )
@@ -501,7 +501,7 @@ def _exclude_fnd12_dummies(sessions: pd.DataFrame) -> pd.DataFrame:
     before = len(sessions["canonical_id"].unique())
     sessions = sessions[sessions["canonical_id"].isin(valid_ids)]
     after = len(sessions["canonical_id"].unique())
-    logger.info("FND-12 exclusion: %d → %d canonical_ids", before, after)
+    logger.info("FND-12 exclusion: %d -> %d canonical_ids", before, after)
     return sessions
 
 
@@ -509,8 +509,12 @@ def _exclude_fnd12_dummies(sessions: pd.DataFrame) -> pd.DataFrame:
 # Core aggregation
 # ---------------------------------------------------------------------------
 
-def _compute_profile(sessions: pd.DataFrame, snapshot_dtm: datetime) -> pd.DataFrame:
-    """Compute all Phase 1 player_profile_daily columns for one snapshot_dtm.
+def _compute_profile(
+    sessions: pd.DataFrame,
+    snapshot_dtm: datetime,
+    max_lookback_days: int = 365,
+) -> pd.DataFrame:
+    """Compute player_profile_daily columns for one snapshot_dtm.
 
     Parameters
     ----------
@@ -519,6 +523,12 @@ def _compute_profile(sessions: pd.DataFrame, snapshot_dtm: datetime) -> pd.DataF
         MAX_LOOKBACK_DAYS before snapshot_dtm.
     snapshot_dtm:
         The as-of cutoff time for all aggregations.
+    max_lookback_days:
+        DEC-017 Data-Horizon: only compute features whose minimum required
+        lookback window (per ``_PROFILE_FEATURE_MIN_DAYS`` in features.py) is
+        ≤ this value.  Columns for longer windows are emitted as NaN so that
+        the output schema stays constant regardless of the horizon.  Default
+        365 = full feature set (normal mode).
 
     Returns
     -------
@@ -569,7 +579,8 @@ def _compute_profile(sessions: pd.DataFrame, snapshot_dtm: datetime) -> pd.DataF
     sessions["_win_flag"] = (sessions["player_win"] > 0).astype(float)
 
     # Pre-compute window membership flags using _session_ts (R86: timestamp boundary
-    # avoids same-day boundary ambiguity introduced by date-level comparisons)
+    # avoids same-day boundary ambiguity introduced by date-level comparisons).
+    # All flags are computed regardless of max_lookback_days (trivially cheap).
     for days in (7, 30, 90, 180, 365):
         lo_ts = snap_ts - pd.Timedelta(days=days)
         sessions[f"_in_{days}d"] = sessions["_session_ts"] >= lo_ts
@@ -594,9 +605,14 @@ def _compute_profile(sessions: pd.DataFrame, snapshot_dtm: datetime) -> pd.DataF
             return sub.groupby("canonical_id")[col].mean()
         raise ValueError(f"Unknown agg: {agg}")
 
+    # DEC-017: shorthand for an empty (NaN) placeholder when a window exceeds
+    # the available data horizon.  Schema stays constant; values are NaN.
+    _null = pd.Series(dtype="float64")
+
     result_parts: dict = {}
 
     # ── Recency ─────────────────────────────────────────────────────────────
+    # Always computable: min_days = 1 per _PROFILE_FEATURE_MIN_DAYS.
     last_sess = grp["_session_date"].max()
     first_sess = grp["_session_date"].min()
     result_parts["days_since_last_session"] = (
@@ -608,97 +624,137 @@ def _compute_profile(sessions: pd.DataFrame, snapshot_dtm: datetime) -> pd.DataF
 
     # ── Frequency ────────────────────────────────────────────────────────────
     for days in (7, 30, 90, 180, 365):
-        result_parts[f"sessions_{days}d"] = _agg_window("session_id", "count", days)
-    result_parts["active_days_30d"] = _agg_window("_session_date", "nunique", 30)
-    result_parts["active_days_90d"] = _agg_window("_session_date", "nunique", 90)
-    result_parts["active_days_365d"] = _agg_window("_session_date", "nunique", 365)
+        if days > max_lookback_days:
+            result_parts[f"sessions_{days}d"] = _null
+        else:
+            result_parts[f"sessions_{days}d"] = _agg_window("session_id", "count", days)
+    for days in (30, 90, 365):
+        if days > max_lookback_days:
+            result_parts[f"active_days_{days}d"] = _null
+        else:
+            result_parts[f"active_days_{days}d"] = _agg_window("_session_date", "nunique", days)
 
     # ── Monetary ─────────────────────────────────────────────────────────────
     for days in (7, 30, 90, 180, 365):
-        result_parts[f"turnover_sum_{days}d"] = _agg_window("turnover", "sum", days)
+        if days > max_lookback_days:
+            result_parts[f"turnover_sum_{days}d"] = _null
+        else:
+            result_parts[f"turnover_sum_{days}d"] = _agg_window("turnover", "sum", days)
     for days in (30, 90, 180, 365):
-        result_parts[f"player_win_sum_{days}d"] = _agg_window("player_win", "sum", days)
+        if days > max_lookback_days:
+            result_parts[f"player_win_sum_{days}d"] = _null
+        else:
+            result_parts[f"player_win_sum_{days}d"] = _agg_window("player_win", "sum", days)
     for days in (30, 180):
-        result_parts[f"theo_win_sum_{days}d"] = _agg_window("theo_win", "sum", days)
-        result_parts[f"num_bets_sum_{days}d"] = _agg_window("num_bets", "sum", days)
-        result_parts[f"num_games_with_wager_sum_{days}d"] = _agg_window(
-            "num_games_with_wager", "sum", days
-        )
+        if days > max_lookback_days:
+            result_parts[f"theo_win_sum_{days}d"] = _null
+            result_parts[f"num_bets_sum_{days}d"] = _null
+            result_parts[f"num_games_with_wager_sum_{days}d"] = _null
+        else:
+            result_parts[f"theo_win_sum_{days}d"] = _agg_window("theo_win", "sum", days)
+            result_parts[f"num_bets_sum_{days}d"] = _agg_window("num_bets", "sum", days)
+            result_parts[f"num_games_with_wager_sum_{days}d"] = _agg_window(
+                "num_games_with_wager", "sum", days
+            )
 
     # ── Bet intensity ────────────────────────────────────────────────────────
-    # turnover_per_bet_mean = turnover_sum / num_bets_sum (per window)
+    # Derived from turnover_sum / num_bets_sum; empty inputs -> empty -> NaN in output.
     for days in (30, 180):
         t_sum = result_parts[f"turnover_sum_{days}d"]
         n_sum = result_parts[f"num_bets_sum_{days}d"]
-        result_parts[f"turnover_per_bet_mean_{days}d"] = t_sum / n_sum.replace(0, np.nan)
+        result_parts[f"turnover_per_bet_mean_{days}d"] = (
+            _null if days > max_lookback_days else t_sum / n_sum.replace(0, np.nan)
+        )
 
     # ── Win / Loss & RTP ─────────────────────────────────────────────────────
     for days in (30, 180):
-        sub = sessions[_w(days)]
-        if not sub.empty:
-            result_parts[f"win_session_rate_{days}d"] = (
-                sub.groupby("canonical_id")["_win_flag"].mean()
-            )
+        if days > max_lookback_days:
+            result_parts[f"win_session_rate_{days}d"] = _null
+            result_parts[f"actual_rtp_{days}d"] = _null
         else:
-            result_parts[f"win_session_rate_{days}d"] = pd.Series(dtype="float64")
+            sub = sessions[_w(days)]
+            if not sub.empty:
+                result_parts[f"win_session_rate_{days}d"] = (
+                    sub.groupby("canonical_id")["_win_flag"].mean()
+                )
+            else:
+                result_parts[f"win_session_rate_{days}d"] = _null
+            t_sum = result_parts[f"turnover_sum_{days}d"]
+            p_sum = result_parts[f"player_win_sum_{days}d"]
+            result_parts[f"actual_rtp_{days}d"] = 1.0 + p_sum / t_sum.replace(0, np.nan)
 
-        t_sum = result_parts[f"turnover_sum_{days}d"]
-        p_sum = result_parts[f"player_win_sum_{days}d"]
-        result_parts[f"actual_rtp_{days}d"] = 1.0 + p_sum / t_sum.replace(0, np.nan)
-
+    # actual_vs_theo_ratio_30d: min_days=30; empty inputs -> NaN automatically
     t30 = result_parts["theo_win_sum_30d"]
     p30 = result_parts["player_win_sum_30d"]
-    result_parts["actual_vs_theo_ratio_30d"] = p30 / t30.replace(0, np.nan)
+    result_parts["actual_vs_theo_ratio_30d"] = (
+        _null if 30 > max_lookback_days else p30 / t30.replace(0, np.nan)
+    )
 
-    # ── Short / Long Ratios ──────────────────────────────────────────────────
-    result_parts["turnover_per_bet_30d_over_180d"] = (
-        result_parts["turnover_per_bet_mean_30d"]
-        / result_parts["turnover_per_bet_mean_180d"].replace(0, np.nan)
-    )
-    result_parts["turnover_30d_over_180d"] = (
-        result_parts["turnover_sum_30d"]
-        / result_parts["turnover_sum_180d"].replace(0, np.nan)
-    )
-    result_parts["sessions_30d_over_180d"] = (
-        result_parts["sessions_30d"]
-        / result_parts["sessions_180d"].replace(0, np.nan)
-    )
+    # ── Short / Long Ratios (min_days=180) ───────────────────────────────────
+    # All three require the 180d window; produce NaN if horizon < 180.
+    if 180 > max_lookback_days:
+        result_parts["turnover_per_bet_30d_over_180d"] = _null
+        result_parts["turnover_30d_over_180d"] = _null
+        result_parts["sessions_30d_over_180d"] = _null
+    else:
+        result_parts["turnover_per_bet_30d_over_180d"] = (
+            result_parts["turnover_per_bet_mean_30d"]
+            / result_parts["turnover_per_bet_mean_180d"].replace(0, np.nan)
+        )
+        result_parts["turnover_30d_over_180d"] = (
+            result_parts["turnover_sum_30d"]
+            / result_parts["turnover_sum_180d"].replace(0, np.nan)
+        )
+        result_parts["sessions_30d_over_180d"] = (
+            result_parts["sessions_30d"]
+            / result_parts["sessions_180d"].replace(0, np.nan)
+        )
 
     # ── Session Duration ─────────────────────────────────────────────────────
     for days in (30, 180):
-        sub = sessions[_w(days) & sessions["_session_ts"].notna()]
-        if not sub.empty:
-            # Only sessions with both start and end (session_end_dtm IS NOT NULL)
-            sub_with_end = sub[sess_end[sub.index].notna()]
-            if not sub_with_end.empty:
-                result_parts[f"avg_session_duration_min_{days}d"] = (
-                    sub_with_end.groupby("canonical_id")["_duration_min"].mean()
-                )
-            else:
-                result_parts[f"avg_session_duration_min_{days}d"] = pd.Series(dtype="float64")
+        if days > max_lookback_days:
+            result_parts[f"avg_session_duration_min_{days}d"] = _null
         else:
-            result_parts[f"avg_session_duration_min_{days}d"] = pd.Series(dtype="float64")
+            sub = sessions[_w(days) & sessions["_session_ts"].notna()]
+            if not sub.empty:
+                sub_with_end = sub[sess_end[sub.index].notna()]
+                if not sub_with_end.empty:
+                    result_parts[f"avg_session_duration_min_{days}d"] = (
+                        sub_with_end.groupby("canonical_id")["_duration_min"].mean()
+                    )
+                else:
+                    result_parts[f"avg_session_duration_min_{days}d"] = _null
+            else:
+                result_parts[f"avg_session_duration_min_{days}d"] = _null
 
     # ── Venue Stickiness ─────────────────────────────────────────────────────
     for days in (30, 90):
-        result_parts[f"distinct_table_cnt_{days}d"] = _agg_window("table_id", "nunique", days)
-    result_parts["distinct_pit_cnt_30d"] = _agg_window("pit_name", "nunique", 30)
-    result_parts["distinct_gaming_area_cnt_30d"] = _agg_window("gaming_area", "nunique", 30)
+        if days > max_lookback_days:
+            result_parts[f"distinct_table_cnt_{days}d"] = _null
+        else:
+            result_parts[f"distinct_table_cnt_{days}d"] = _agg_window("table_id", "nunique", days)
+    result_parts["distinct_pit_cnt_30d"] = (
+        _null if 30 > max_lookback_days else _agg_window("pit_name", "nunique", 30)
+    )
+    result_parts["distinct_gaming_area_cnt_30d"] = (
+        _null if 30 > max_lookback_days else _agg_window("gaming_area", "nunique", 30)
+    )
 
     # top_table_share: two-level aggregation (spec §12)
     for days in (30, 90):
-        sub = sessions[_w(days)]
-        if not sub.empty and "table_id" in sub.columns:
-            # Level 1: turnover per (canonical_id, table_id)
-            per_table = (
-                sub.groupby(["canonical_id", "table_id"])["turnover"].sum()
-            ).reset_index()
-            # Level 2: max table turnover per canonical_id
-            max_tbl = per_table.groupby("canonical_id")["turnover"].max()
-            total_tbl = result_parts[f"turnover_sum_{days}d"]
-            result_parts[f"top_table_share_{days}d"] = max_tbl / total_tbl.replace(0, np.nan)
+        if days > max_lookback_days:
+            result_parts[f"top_table_share_{days}d"] = _null
         else:
-            result_parts[f"top_table_share_{days}d"] = pd.Series(dtype="float64")
+            sub = sessions[_w(days)]
+            if not sub.empty and "table_id" in sub.columns:
+                per_table = (
+                    sub.groupby(["canonical_id", "table_id"])["turnover"].sum()
+                ).reset_index()
+                max_tbl = per_table.groupby("canonical_id")["turnover"].max()
+                total_tbl = result_parts[f"turnover_sum_{days}d"]
+                result_parts[f"top_table_share_{days}d"] = max_tbl / total_tbl.replace(0, np.nan)
+            else:
+                result_parts[f"top_table_share_{days}d"] = _null
 
     # ── Assemble output DataFrame ────────────────────────────────────────────
     # All canonical_ids from the full (not windowed) session set
@@ -740,6 +796,7 @@ def _write_to_clickhouse(df: pd.DataFrame, client) -> None:
 def _write_to_local_parquet(
     df: pd.DataFrame,
     canonical_id_whitelist: Optional[set] = None,
+    max_lookback_days: int = 365,
 ) -> None:
     """Append (or create) local Parquet file with atomic write (R88).
 
@@ -770,21 +827,25 @@ def _write_to_local_parquet(
 
         # R95: Write schema fingerprint sidecar BEFORE replacing the parquet so
         # that a crash between the two os.replace calls leaves a *mismatched*
-        # hash → next run sees schema drift → safe full rebuild.
+        # hash -> next run sees schema drift -> safe full rebuild.
         hash_tmp_fd, hash_tmp_path = tempfile.mkstemp(
             dir=LOCAL_PARQUET_DIR, suffix=".schema_hash.tmp"
         )
         try:
             os.close(hash_tmp_fd)
             # R106: sidecar must store full hash (with population tag) so
-            # ensure_player_profile_daily_ready can compare correctly
+            # ensure_player_profile_daily_ready can compare correctly.
+            # R300: also encode max_lookback_days (horizon tag) so that a
+            # cache written with horizon=30 is not reused when horizon=365
+            # is requested — writer and reader must use identical formula.
             base_hash = compute_profile_schema_hash()
             _pop_tag = (
                 f"_whitelist={len(canonical_id_whitelist)}"
                 if canonical_id_whitelist
                 else "_full"
             )
-            full_hash = hashlib.md5((base_hash + _pop_tag).encode()).hexdigest()
+            _horizon_tag = f"_mlb={max_lookback_days}"
+            full_hash = hashlib.md5((base_hash + _pop_tag + _horizon_tag).encode()).hexdigest()
             Path(hash_tmp_path).write_text(full_hash, encoding="utf-8")
             os.replace(hash_tmp_path, LOCAL_PROFILE_SCHEMA_HASH)
         except Exception:
@@ -819,6 +880,7 @@ def build_player_profile_daily(
     canonical_map: Optional[pd.DataFrame] = None,  # R90: accept pre-built mapping (backfill reuse)
     preloaded_sessions: Optional[pd.DataFrame] = None,  # fast-mode: skip Parquet I/O per day
     canonical_id_whitelist: Optional[set] = None,  # R106: for sidecar hash population tag
+    max_lookback_days: int = 365,  # DEC-017: horizon restriction for profile feature computation
 ) -> Optional[pd.DataFrame]:
     """Compute player_profile_daily for one `snapshot_date` and persist the result.
 
@@ -917,19 +979,28 @@ def build_player_profile_daily(
         logger.warning("All sessions excluded by FND-12; nothing to write")
         return None
 
-    # 5. Compute profile aggregations
-    profile_df = _compute_profile(sessions_clean, snapshot_dtm)
+    # 5. Compute profile aggregations (DEC-017: pass horizon so only feasible
+    #    windows are computed; out-of-horizon columns are emitted as NaN).
+    profile_df = _compute_profile(sessions_clean, snapshot_dtm, max_lookback_days=max_lookback_days)
 
     # 6. Persist
     if use_local_parquet:
-        _write_to_local_parquet(profile_df, canonical_id_whitelist=canonical_id_whitelist)
+        _write_to_local_parquet(
+            profile_df,
+            canonical_id_whitelist=canonical_id_whitelist,
+            max_lookback_days=max_lookback_days,
+        )
     else:
         try:
             client = get_clickhouse_client()
             _write_to_clickhouse(profile_df, client)
         except Exception as exc:
             logger.error("ClickHouse write failed: %s; falling back to local Parquet", exc)
-            _write_to_local_parquet(profile_df, canonical_id_whitelist=canonical_id_whitelist)
+            _write_to_local_parquet(
+                profile_df,
+                canonical_id_whitelist=canonical_id_whitelist,
+                max_lookback_days=max_lookback_days,
+            )
 
     return profile_df
 
@@ -941,6 +1012,8 @@ def backfill(
     canonical_id_whitelist: Optional[set] = None,
     snapshot_interval_days: int = 1,
     preload_sessions: bool = True,
+    canonical_map: Optional[pd.DataFrame] = None,
+    max_lookback_days: int = 365,  # DEC-017: forwarded to _compute_profile via build_player_profile_daily
 ) -> None:
     """Backfill player_profile_daily for a range of dates.
 
@@ -963,24 +1036,38 @@ def backfill(
         per-day filtering.  Set to False on low-RAM machines (e.g. 8 GB) to
         instead use per-day PyArrow pushdown reads via ``_load_sessions_local``,
         avoiding the OOM risk at the cost of more frequent disk I/O.
+    canonical_map:
+        Pre-built player_id -> canonical_id mapping DataFrame.  When provided
+        by the caller (e.g. trainer.py already holds the map in memory), the
+        internal map-building step is skipped entirely, eliminating the
+        ``No local canonical_mapping.parquet`` warning that fires when the
+        sidecar file is absent (DEC-017 bug fix).
     """
-    # R90: pre-build canonical_map once for the whole backfill range
-    canonical_map: Optional[pd.DataFrame] = None
-    if use_local_parquet:
-        d2_path = LOCAL_PARQUET_DIR / "canonical_mapping.parquet"
-        if d2_path.exists():
-            canonical_map = pd.read_parquet(d2_path)
-            logger.info("backfill: reusing local canonical_map (%d rows)", len(canonical_map))
-    elif get_clickhouse_client is not None:
-        try:
-            client = get_clickhouse_client()
-            end_cutoff = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59)
-            canonical_map = build_canonical_mapping(client, cutoff_dtm=end_cutoff)
-            logger.info("backfill: pre-built canonical_map (%d rows) for reuse", len(canonical_map))
-        except Exception as exc:
-            logger.warning(
-                "backfill: canonical_map pre-build failed (%s); will build per-day", exc
-            )
+    # R90: pre-build canonical_map once for the whole backfill range.
+    # DEC-017: skip if caller already supplied canonical_map (avoids the
+    # "No local canonical_mapping.parquet" warning when the sidecar file is
+    # absent — trainer.py holds the map in memory and passes it directly).
+    if canonical_map is not None:
+        logger.info(
+            "backfill: using pre-built canonical_map (%d rows) supplied by caller",
+            len(canonical_map),
+        )
+    else:
+        if use_local_parquet:
+            d2_path = LOCAL_PARQUET_DIR / "canonical_mapping.parquet"
+            if d2_path.exists():
+                canonical_map = pd.read_parquet(d2_path)
+                logger.info("backfill: reusing local canonical_map (%d rows)", len(canonical_map))
+        elif get_clickhouse_client is not None:
+            try:
+                client = get_clickhouse_client()
+                end_cutoff = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59)
+                canonical_map = build_canonical_mapping(client, cutoff_dtm=end_cutoff)
+                logger.info("backfill: pre-built canonical_map (%d rows) for reuse", len(canonical_map))
+            except Exception as exc:
+                logger.warning(
+                    "backfill: canonical_map pre-build failed (%s); will build per-day", exc
+                )
 
     # Apply whitelist: keep only the sampled rated players (fast-mode).
     if canonical_id_whitelist is not None and canonical_map is not None and not canonical_map.empty:
@@ -989,7 +1076,7 @@ def backfill(
             canonical_map["canonical_id"].astype(str).isin(canonical_id_whitelist)
         ].copy()
         logger.info(
-            "backfill: canonical_id_whitelist applied — %d → %d rated players",
+            "backfill: canonical_id_whitelist applied — %d -> %d rated players",
             before_n, len(canonical_map),
         )
 
@@ -1029,6 +1116,7 @@ def backfill(
                     canonical_map=canonical_map,
                     preloaded_sessions=preloaded_sessions,
                     canonical_id_whitelist=canonical_id_whitelist,
+                    max_lookback_days=max_lookback_days,
                 )
                 if result is not None:
                     success += 1

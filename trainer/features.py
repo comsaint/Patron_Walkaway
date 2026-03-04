@@ -135,6 +135,106 @@ PROFILE_FEATURE_COLS: List[str] = [
     "top_table_share_90d",
 ]
 
+# Minimum lookback (days) required to compute each profile feature.
+# Recency features (days_since_*) are always computable given ≥1 day of data.
+# Ratio features (e.g. 30d_over_180d) require the longer of the two windows.
+_PROFILE_FEATURE_MIN_DAYS: dict = {
+    # Recency — computable from any non-empty session history
+    "days_since_last_session": 1,
+    "days_since_first_session": 1,
+    # Frequency
+    "sessions_7d": 7,
+    "sessions_30d": 30,
+    "sessions_90d": 90,
+    "sessions_180d": 180,
+    "sessions_365d": 365,
+    "active_days_30d": 30,
+    "active_days_90d": 90,
+    "active_days_365d": 365,
+    # Monetary
+    "turnover_sum_7d": 7,
+    "turnover_sum_30d": 30,
+    "turnover_sum_90d": 90,
+    "turnover_sum_180d": 180,
+    "turnover_sum_365d": 365,
+    "player_win_sum_30d": 30,
+    "player_win_sum_90d": 90,
+    "player_win_sum_180d": 180,
+    "player_win_sum_365d": 365,
+    "theo_win_sum_30d": 30,
+    "theo_win_sum_180d": 180,
+    "num_bets_sum_30d": 30,
+    "num_bets_sum_180d": 180,
+    "num_games_with_wager_sum_30d": 30,
+    "num_games_with_wager_sum_180d": 180,
+    # Bet intensity
+    "turnover_per_bet_mean_30d": 30,
+    "turnover_per_bet_mean_180d": 180,
+    # Win / Loss & RTP
+    "win_session_rate_30d": 30,
+    "win_session_rate_180d": 180,
+    "actual_rtp_30d": 30,
+    "actual_rtp_180d": 180,
+    "actual_vs_theo_ratio_30d": 30,
+    # Short / Long Ratios — require the longer window (180d) for both numerator and denominator
+    "turnover_per_bet_30d_over_180d": 180,
+    "turnover_30d_over_180d": 180,
+    "sessions_30d_over_180d": 180,
+    # Session Duration
+    "avg_session_duration_min_30d": 30,
+    "avg_session_duration_min_180d": 180,
+    # Venue Stickiness
+    "distinct_table_cnt_30d": 30,
+    "distinct_table_cnt_90d": 90,
+    "distinct_pit_cnt_30d": 30,
+    "distinct_gaming_area_cnt_30d": 30,
+    "top_table_share_30d": 30,
+    "top_table_share_90d": 90,
+}
+
+# R122: enforce at import time that _PROFILE_FEATURE_MIN_DAYS stays in sync with
+# PROFILE_FEATURE_COLS.  Any missing or extra key means the dynamic-feature-layer
+# logic (get_profile_feature_cols) will silently mis-classify features.
+assert set(_PROFILE_FEATURE_MIN_DAYS) == set(PROFILE_FEATURE_COLS), (
+    "_PROFILE_FEATURE_MIN_DAYS keys do not match PROFILE_FEATURE_COLS — "
+    f"missing: {set(PROFILE_FEATURE_COLS) - set(_PROFILE_FEATURE_MIN_DAYS)}, "
+    f"extra: {set(_PROFILE_FEATURE_MIN_DAYS) - set(PROFILE_FEATURE_COLS)}"
+)
+
+
+def get_profile_feature_cols(max_lookback_days: int = 365) -> List[str]:
+    """Return the subset of PROFILE_FEATURE_COLS computable for *max_lookback_days* of data.
+
+    Used by the DEC-017 Data-Horizon fast-mode: when only N days of session
+    history are available, features whose lookback window exceeds N would be
+    either identical to shorter-window features (wasteful) or entirely zero
+    (misleading).  This function returns only the features whose minimum
+    required lookback is ≤ ``max_lookback_days``.
+
+    Parameters
+    ----------
+    max_lookback_days:
+        Number of days of session history available.  Defaults to 365
+        (full feature set, equivalent to ``PROFILE_FEATURE_COLS``).
+
+    Returns
+    -------
+    List of column names, preserving the order of ``PROFILE_FEATURE_COLS``.
+
+    Examples
+    --------
+    >>> get_profile_feature_cols(30)   # ~30 days of data
+    ['days_since_last_session', 'days_since_first_session', 'sessions_7d',
+     'sessions_30d', 'active_days_30d', 'turnover_sum_7d', 'turnover_sum_30d', ...]
+    >>> get_profile_feature_cols(365)  # full history
+    PROFILE_FEATURE_COLS  # all columns
+    """
+    return [
+        col for col in PROFILE_FEATURE_COLS
+        if _PROFILE_FEATURE_MIN_DAYS.get(col, 365) <= max_lookback_days
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Track A — Featuretools EntitySet helpers
 # ---------------------------------------------------------------------------

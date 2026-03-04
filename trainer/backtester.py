@@ -534,7 +534,7 @@ def main() -> None:
     artifacts = load_dual_artifacts()
     start, end = _parse_window(args)
 
-    logger.info("Backtest window: %s → %s", start, end)
+    logger.info("Backtest window: %s -> %s", start, end)
 
     if args.use_local_parquet:
         bets_raw, sessions_raw = load_local_parquet(start, end + timedelta(days=1))

@@ -1,7 +1,7 @@
 import argparse
 from datetime import datetime, timedelta
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, ANY
 
 import pandas as pd
 from zoneinfo import ZoneInfo
@@ -99,7 +99,8 @@ class TestRecentChunksIntegration(unittest.TestCase):
 
         # 2. Assert ensure_player_profile_daily_ready was called with effective window
         # (canonical_id_whitelist=None, snapshot_interval_days=1, preload_sessions=True
-        # are the normal-mode defaults; preload_sessions added with --fast-mode-no-preload)
+        # are the normal-mode defaults; canonical_map matched via ANY since its content
+        # depends on build_canonical_mapping_from_df mock output — DEC-017 bug fix)
         mock_ensure_profile.assert_called_once_with(
             expected_effective_start,
             expected_effective_end,
@@ -107,7 +108,14 @@ class TestRecentChunksIntegration(unittest.TestCase):
             canonical_id_whitelist=None,
             snapshot_interval_days=1,
             preload_sessions=True,
+            canonical_map=ANY,
+            fast_mode=False,       # DEC-017: non-fast-mode default
+            max_lookback_days=365, # DEC-017: full horizon in normal mode
         )
+        ensure_kwargs = mock_ensure_profile.call_args.kwargs
+        passed_cmap = ensure_kwargs.get("canonical_map")
+        self.assertIsInstance(passed_cmap, pd.DataFrame)
+        self.assertListEqual(list(passed_cmap.columns), ["player_id", "canonical_id"])
 
         # 3. Assert load_player_profile_daily was called with effective window
         mock_load_profile.assert_called_once()
