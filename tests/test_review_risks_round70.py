@@ -105,8 +105,8 @@ class TestR88EtlAtomicParquetWrite(unittest.TestCase):
     """R88: local parquet write should be atomic/safe under concurrency."""
 
     def test_write_local_parquet_uses_atomic_replace_or_lock(self):
-        src = _get_func_src(_ETL_TREE, _ETL_SRC, "_write_to_local_parquet")
-        self.assertGreater(len(src), 0, "_write_to_local_parquet not found")
+        src = _get_func_src(_ETL_TREE, _ETL_SRC, "_persist_local_parquet")
+        self.assertGreater(len(src), 0, "_persist_local_parquet not found")
         self.assertRegex(
             src,
             r"os\.replace\(|tempfile|flock|portalocker|msvcrt\.locking",

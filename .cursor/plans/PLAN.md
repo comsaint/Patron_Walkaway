@@ -41,6 +41,15 @@ todos:
   - id: step11-start-training
     content: "Start the training process using the local parquet data in `./data`."
     status: in_progress
+  - id: bug-empty-valid-test-when-few-chunks
+    content: "Trainer: current get_train_valid_test_split() operates at chunk-level, so when the number of chunks is very small (e.g. 1 or 2) the validation/test splits can be empty or extremely small (valid=0, test=0 or test very short). LightGBM still receives an eval_set built from (possibly) empty X_vl/y_vl, causing `ValueError: Input data must be 2 dimensional and non empty.` Fix later by (a) moving the Train/Valid/Test split to row-level, strictly time-ordered 70/15/15 as per SSOT §9.2 (chunks only control ETL/data volume, not the split semantics), and (b) skipping eval_set / early_stopping when the derived validation set is empty or below a minimum sample threshold."
+    status: completed
+  - id: todo-row-level-time-split
+    content: "Refine trainer split semantics to align with SSOT §9.2: chunks are for ETL/cache only, Train/Valid/Test must be split at row-level by time (strictly ordered) with target ratios ≈ 70/15/15, regardless of how many monthly chunks exist. After concatenating all processed chunks, sort by payout_complete_dtm (and canonical_id/bet_id for stability), then derive time-based cutoffs for train/valid/test on the combined DataFrame. Ensure small-data guardrails (e.g. min N rows in valid/test) and keep get_monthly_chunks() + --recent-chunks solely as data-volume controls, not as the primary split mechanism."
+    status: completed
+  - id: todo-track-a-screening-no-afg
+    content: "DEC-020 Track A: DONE — run_track_a_dfs runs inside first chunk's process_chunk (run_afg), --no-afg CLI added, screen_features runs on ALL candidate features (Track A + Track B + profile) on training set only after concat+split, feature_list.json written from screened list with correct track labels (A/B/legacy/profile)."
+    status: completed
 isProject: false
 ---
 
@@ -177,9 +186,11 @@ def compute_labels(
 
 ### Step 4 — `trainer/features.py` (new, ~350 lines)
 
-**Track A — EntitySet and player_profile_daily (SSOT §8.2, DEC-011)**  
+**Track A — EntitySet and player_profile_daily (SSOT §8.2, DEC-011, DEC-020)**  
+- Track A is **fixed** in the pipeline: two-phase DFS (explore on sample → save screened feature defs → apply to full data).  
 - Rated: `t_bet` → `t_session` (many-to-one by `session_id`). **player_profile_daily** is not added as an EntitySet relationship; use **PIT/as-of join**: for each bet, join the latest `player_profile_daily` row with `snapshot_dtm <= bet_time` by `canonical_id`, then attach profile columns to the bet. Full spec: `doc/player_profile_daily_spec.md`.  
-- Non-rated: EntitySet contains only `t_bet`.
+- Non-rated: EntitySet contains only `t_bet`.  
+- **Feature screening** runs over **all** candidate features (player-level/profile, Track A, Track B). The caller builds the full feature matrix and passes all feature names to `screen_features()`; the returned list is the final set written to `feature_list.json`. Train and scorer use only this list (DEC-020).
 
 Key interfaces:
 
@@ -205,9 +216,10 @@ def compute_run_boundary(bets_df: pd.DataFrame) -> pd.DataFrame:
 
 # compute_table_hc: Phase 2 only (not in Phase 1 feature_list.json)
 
-# Feature screening
-def screen_features(feature_matrix, labels, feature_names) -> list:
-    """Two-stage: (1) mutual info + VIF, (2) optional LightGBM importance on train only."""
+# Feature screening (applies to ALL candidate features: Track A + Track B + profile)
+def screen_features(feature_matrix, labels, feature_names, ...) -> list:
+    """Two-stage: (1) mutual info + correlation pruning, (2) optional LightGBM importance on train only.
+    Caller passes the full set of feature names to screen; output is the screened list for feature_list.json."""
 ```
 
 ### Step 5 — `trainer/time_fold.py` (new, ~120 lines) + `trainer/trainer.py` (refactor, ~500 lines)
@@ -227,13 +239,15 @@ def get_train_valid_test_split(chunks: list, train_frac=0.7, valid_frac=0.15) ->
 **trainer.py** refactored flow:
 
 1. Call `time_fold.get_monthly_chunks()` for all boundaries
-2. For each chunk: fetch `t_bet` + `t_session` with DQ guardrails, build labels (C1), build features (Phase 1 DFS on sampled, Phase 2 full), write parquet
+2. **Track A (unless `--no-afg`)**：DFS exploration runs **inside the first chunk's process_chunk** (via `run_afg`), using that chunk's already-loaded data (no separate load). This produces `saved_feature_defs/feature_defs.json`; subsequent chunks apply it via `compute_feature_matrix`. **Remaining (not yet implemented)**：After concatenating all chunks, run **feature screening on ALL features** (Track A + Track B + player-level/profile): pass the combined feature matrix and all feature names to `screen_features()`; the returned list is the final feature set. Save only the **screened** Track A definitions (if desired) and write the full screened list (all tracks) to `feature_list.json`.
+3. For each chunk: fetch `t_bet` + `t_session` with DQ guardrails, build labels (C1), build features (Track B + profile +, if not `--no-afg`, Track A via `calculate_feature_matrix` with saved defs), write parquet
+   - **`--no-afg` (No Automatic Feature Generation)**：When set, skip Track A entirely (no DFS exploration, no `saved_feature_defs`). Screening still runs on Track B + player-level/profile (and any other non–Track A features present); `feature_list.json` contains only the screened subset of those. Scorer then computes only Track B + profile (no Featuretools).
    - Training/dev may optionally read the **already-exported full tables** from local Parquet (e.g. `.data/` folder, via Pandas or DuckDB) instead of querying ClickHouse to speed up iteration. This is an I/O swap only: apply the same DQ filters/dedup rules and enforce the same available-time/cutoff semantics. Production scoring/validation still uses ClickHouse as the source of truth.
-3. After all chunks: load parquets, split train/valid/test
-4. **Run-level sample weight**: Compute `sample_weight = 1 / N_run` per observation (training set only), where `N_run` = number of bets in the same run (same `canonical_id`, same run from `compute_run_boundary`). This corrects length bias so each run contributes more equally; use with `class_weight='balanced'`.
-5. Optuna hyperparameter search on valid set
-6. Train Rated + Non-rated LightGBM models with `class_weight='balanced'` + `sample_weight`
-7. Save atomic artifact bundle
+4. After all chunks: load parquets, split train/valid/test
+5. **Run-level sample weight**: Compute `sample_weight = 1 / N_run` per observation (training set only), where `N_run` = number of bets in the same run (same `canonical_id`, same run from `compute_run_boundary`). This corrects length bias so each run contributes more equally; use with `class_weight='balanced'`.
+6. Optuna hyperparameter search on valid set
+7. Train Rated + Non-rated LightGBM models with `class_weight='balanced'` + `sample_weight`
+8. Save atomic artifact bundle
 
 ### Step 6 — `trainer/backtester.py` (update, ~250 lines)
 
@@ -384,6 +398,29 @@ Uses `pytest` with small synthetic DataFrames — no ClickHouse connection requi
 **Ratio 特徵**（如 `turnover_30d_over_180d`）：需要分子和分母兩個窗口都有效才計算，否則為 NaN。
 
 **Recency 特徵**（`days_since_last_session`、`days_since_first_session`）：語義仍正確，但 `days_since_first_session` 的上限會被截斷至可用資料範圍，可接受。
+
+### 特徵篩選預設保留數量與單一 top_k (Screening default feature count, unified top_k)
+
+**參數簡化**：不再使用兩個獨立的 cap 參數（`mi_top_k` 與 `lgbm_top_k`），改為**單一 `top_k`**，語意為「最終回傳的特徵數上限（可為 `None` 表示不設上限）」：
+- `top_k` 由呼叫端傳入，或由 **config 提供**（見下）。若為整數 N，不論有無 Stage 2，最終最多保留 N 個特徵；若為 `None`，不設上限。
+- 若 `use_lgbm=False`：Stage 1 結束後依 MI 排序取前 `top_k`（`top_k` 為 `None` 則全保留）。
+- 若 `use_lgbm=True`：先做 Stage 1，再做 Stage 2（LightGBM importance），最後依 LGBM 排序取前 `top_k`。亦即 **`use_lgbm=True` 時會做兩段篩選**：Stage 1（zero-var + MI + 相關性修剪）→ Stage 2（LGBM importance），再套用 `top_k`。
+
+**預設行為**：**由 config 控制上限**。`config.py` 定義參數（例如 `SCREEN_FEATURES_TOP_K`）；呼叫端未傳入 `top_k` 時以該 config 值為準。**`SCREEN_FEATURES_TOP_K` 可為整數 N**（篩選後最多保留 N 個）**或 `None`**（不設上限，Stage 1 通過者全部保留）。
+
+**N 的來源**：`config.py` 中新增參數（如 `SCREEN_FEATURES_TOP_K`，型別為 `Optional[int]`）；pipeline 呼叫 `screen_features()` 時若未顯式傳入 `top_k`，則使用此 config 值。設為整數即為上限，設為 `None` 即不設上限。
+
+---
+
+### CLI：`--no-afg`（No Automatic Feature Generation）
+
+與 Track A 開關正交（可與 `--fast-mode`、`--sample-rated` 等併用）。
+
+- **預設**：不啟用；執行完整 Track A（DFS 探索 → 篩選 → 存 defs → 全量計算）。
+- **`--no-afg`**：跳過 Track A（不跑 DFS、不產出 `saved_feature_defs/feature_defs.json`）。篩選仍會執行，但僅針對 Track B + player-level/profile 等非–Track A 特徵；`feature_list.json` 僅含篩選後的這些特徵。Scorer 僅計算 Track B + profile，不載入 Featuretools defs。
+- **用途**：加快迭代、低資源環境、或僅想驗證 Track B + profile 時使用。
+
+---
 
 ### 獨立 Flag：`--sample-rated N`
 

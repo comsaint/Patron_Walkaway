@@ -62,7 +62,7 @@ class TestFeaturesReviewRisksRound9(unittest.TestCase):
             labels=labels,
             feature_names=["A", "B", "C"],
             corr_threshold=0.95,
-            mi_top_k=None,
+            top_k=None,
             use_lgbm=False,
         )
 

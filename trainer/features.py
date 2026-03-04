@@ -56,6 +56,7 @@ try:
         LOSS_STREAK_PUSH_RESETS,
         PLACEHOLDER_PLAYER_ID,
         RUN_BREAK_MIN,
+        SCREEN_FEATURES_TOP_K,
         TABLE_HC_WINDOW_MIN,
     )
 except ModuleNotFoundError:
@@ -65,6 +66,7 @@ except ModuleNotFoundError:
         LOSS_STREAK_PUSH_RESETS,
         PLACEHOLDER_PLAYER_ID,
         RUN_BREAK_MIN,
+        SCREEN_FEATURES_TOP_K,
         TABLE_HC_WINDOW_MIN,
     )
 
@@ -729,27 +731,33 @@ def compute_table_hc(
 # Feature screening
 # ---------------------------------------------------------------------------
 
+# Sentinel used to distinguish "caller did not pass top_k" from "caller passed None".
+# When top_k is _SCREEN_TOP_K_UNSET, screen_features() falls back to
+# SCREEN_FEATURES_TOP_K from config.py (DEC-020).
+_SCREEN_TOP_K_UNSET = object()
+
+
 def screen_features(
     feature_matrix: pd.DataFrame,
     labels: pd.Series,
     feature_names: List[str],
     corr_threshold: float = 0.95,
-    mi_top_k: Optional[int] = None,
+    top_k: object = _SCREEN_TOP_K_UNSET,
     use_lgbm: bool = False,
-    lgbm_top_k: Optional[int] = None,
     random_state: int = 42,
 ) -> List[str]:
-    """Two-stage feature screening (SSOT §8.2-D).
+    """Two-stage feature screening (SSOT §8.2-D, DEC-020).
 
     Stage 1 — univariate + redundancy:
         a) Drop near-zero-variance features (std == 0).
         b) Rank by mutual information with ``labels`` (sklearn).
         c) Prune highly correlated pairs (Pearson |r| > corr_threshold),
            keeping the higher-MI feature in each pair.
+        d) If ``use_lgbm=False``: apply ``top_k`` cap on MI-sorted survivors.
 
     Stage 2 — optional LightGBM importance (training-set only):
-        If ``use_lgbm=True``, fit a lightweight LightGBM on ``feature_matrix``
-        and keep the top ``lgbm_top_k`` features by split importance.
+        If ``use_lgbm=True``, fit a lightweight LightGBM on the Stage-1
+        survivors and re-rank by split importance.  Then apply ``top_k`` cap.
         CRITICAL: this stage must only be called on training data, never on
         valid/test, to comply with anti-leakage rules (SSOT §8.2-D / TRN-09).
 
@@ -764,21 +772,34 @@ def screen_features(
         Subset of ``feature_matrix.columns`` to consider.
     corr_threshold : float
         Pearson |r| above which a feature is considered redundant.
-    mi_top_k : int | None
-        Keep only the top-k features by mutual information.  None → keep all.
+    top_k : int | None | (unset)
+        Maximum number of features to return.  When not passed by the caller,
+        falls back to ``SCREEN_FEATURES_TOP_K`` from config.py (DEC-020).
+        ``None`` (either explicitly passed or from config) means no cap —
+        all Stage-1 (or Stage-2) survivors are returned.
     use_lgbm : bool
         Enable Stage-2 LightGBM importance screening.
-    lgbm_top_k : int | None
-        Number of features to retain after LightGBM screening.  None → half.
     random_state : int
         Random seed for reproducibility.
 
     Returns
     -------
     list[str]
-        Screened feature names (ordered by mutual information descending).
+        Screened feature names.  Ordered by mutual information descending
+        (Stage-1 only) or by LightGBM split importance descending (Stage-2).
     """
     from sklearn.feature_selection import mutual_info_classif  # type: ignore[import]
+
+    # DEC-020: resolve top_k from config when caller did not supply it.
+    if top_k is _SCREEN_TOP_K_UNSET:
+        top_k = SCREEN_FEATURES_TOP_K  # type: Optional[int]  # None = no cap
+
+    # R905: top_k=0 would silently return an empty feature list, causing a hard-to-debug
+    # downstream failure.  Fail early with a clear error instead.
+    if top_k is not None and top_k < 1:
+        raise ValueError(
+            f"screen_features: top_k must be a positive integer or None, got {top_k!r}"
+        )
 
     X = feature_matrix[feature_names].copy()
 
@@ -798,10 +819,8 @@ def screen_features(
         X_filled, labels, discrete_features=False, random_state=random_state
     )
     mi_df = pd.Series(mi, index=nonzero).sort_values(ascending=False)
-    if mi_top_k is not None:
-        mi_df = mi_df.head(mi_top_k)
     candidates = mi_df.index.tolist()
-    logger.info("screen_features: %d candidates after MI filter", len(candidates))
+    logger.info("screen_features: %d candidates after MI ranking", len(candidates))
 
     # Correlation pruning (Stage 1c)
     if len(candidates) > 1:
@@ -824,6 +843,10 @@ def screen_features(
         )
 
     if not use_lgbm:
+        # Stage 1 final: apply top_k cap on MI-sorted list (DEC-020).
+        if top_k is not None:
+            candidates = candidates[:top_k]
+            logger.info("screen_features: capped to top_k=%d (Stage 1)", top_k)
         return candidates
 
     # Stage 2 — LightGBM importance (TRAINING DATA ONLY — caller responsibility)
@@ -835,7 +858,6 @@ def screen_features(
             "Install it with: pip install lightgbm"
         ) from exc
 
-    _k = lgbm_top_k or max(1, len(candidates) // 2)
     dtrain = lgb.Dataset(X_filled[candidates], label=labels)
     params = {
         "objective": "binary",
@@ -848,8 +870,14 @@ def screen_features(
     importance = pd.Series(
         model.feature_importance(importance_type="split"), index=candidates
     ).sort_values(ascending=False)
-    candidates = importance.head(_k).index.tolist()
-    logger.info("screen_features: %d features after LightGBM screening", len(candidates))
+
+    # Stage 2 final: apply top_k cap on LGBM-ranked list (DEC-020).
+    if top_k is not None:
+        candidates = importance.head(top_k).index.tolist()
+        logger.info("screen_features: %d features after LightGBM screening (top_k=%d)", len(candidates), top_k)
+    else:
+        candidates = importance.index.tolist()
+        logger.info("screen_features: %d features after LightGBM screening (no cap)", len(candidates))
 
     return candidates
 
@@ -945,10 +973,23 @@ def join_player_profile_daily(
     bets_work["_bet_time"] = pd.to_datetime(bets_work["_bet_time"], utc=False).astype("datetime64[ns]")
     profile_work["snapshot_dtm"] = pd.to_datetime(profile_work["snapshot_dtm"], utc=False).astype("datetime64[ns]")
 
-    # merge_asof requires ascending sort by the time key (and the by= grouping
-    # key must also be sorted, but merge_asof does NOT sort — we must do it).
-    bets_sorted = bets_work.sort_values(["canonical_id", "_bet_time"]).reset_index(drop=True)
-    profile_sorted = profile_work.sort_values(["canonical_id", "snapshot_dtm"]).reset_index(drop=True)
+    # merge_asof requires the left key to be monotonically increasing and NaT-free.
+    # apply_dq already filters payout_complete_dtm.notna(), so NaT should not appear;
+    # the dropna here is a defensive guard that keeps NaT rows in `result` with their
+    # NaN-initialised profile features rather than breaking the entire merge.
+    _n_nat = int(bets_work["_bet_time"].isna().sum())
+    if _n_nat:
+        logger.warning(
+            "join_player_profile_daily: %d bet(s) with null payout_complete_dtm skipped; "
+            "profile features will be NaN for those rows.",
+            _n_nat,
+        )
+    bets_valid = bets_work.dropna(subset=["_bet_time"])
+
+    # merge_asof requires the left_on / right_on keys to be globally sorted;
+    # sorting by [canonical_id, time] only guarantees intra-group order.
+    bets_sorted = bets_valid.sort_values("_bet_time").reset_index(drop=True)
+    profile_sorted = profile_work.sort_values("snapshot_dtm").reset_index(drop=True)
 
     merged = pd.merge_asof(
         bets_sorted,
@@ -965,8 +1006,12 @@ def join_player_profile_daily(
     # correct; zero-fill would conflate "no data" with "zero activity".
     merged = merged.sort_values("_orig_idx").reset_index(drop=True)
 
+    # R800: when NaT rows were dropped before merge_asof, merged has fewer rows
+    # than result.  Use _orig_idx to scatter values back into the correct positions;
+    # dropped rows retain their NaN-initialised values (set above).
     for col in available_cols:
-        result[col] = merged[col].values
+        _vals = pd.Series(merged[col].values, index=merged["_orig_idx"].values)
+        result[col] = _vals.reindex(np.arange(len(result))).values
 
     n_rated_with_profile = int(pd.notna(result[available_cols[0]]).sum())
     logger.info(

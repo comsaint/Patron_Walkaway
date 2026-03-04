@@ -86,8 +86,8 @@ class TestR95SidecarWriteAtomicOrder(unittest.TestCase):
     """R95: sidecar write should be atomic and ordered safely around parquet replace."""
 
     def test_sidecar_written_before_or_atomically_with_parquet_replace(self):
-        src = _get_func_src(_ETL_TREE, _ETL_SRC, "_write_to_local_parquet")
-        self.assertGreater(len(src), 0, "_write_to_local_parquet not found")
+        src = _get_func_src(_ETL_TREE, _ETL_SRC, "_persist_local_parquet")
+        self.assertGreater(len(src), 0, "_persist_local_parquet not found")
 
         idx_replace_parquet = src.find("os.replace(tmp_path, LOCAL_PROFILE_PARQUET)")
         idx_sidecar_write = src.find("LOCAL_PROFILE_SCHEMA_HASH")

@@ -191,15 +191,24 @@ class TestFastModeHorizonPropagation(_PipelineMixin, unittest.TestCase):
         )
 
     def test_effective_window_uses_trimmed_chunk(self):
-        """ensure_player_profile_daily_ready should receive the trimmed window (1 chunk)."""
+        """ensure_player_profile_daily_ready should receive the trimmed window (1 chunk).
+
+        DEC-018 strips tz from effective_start/effective_end before passing them
+        to downstream helpers.  Compare as tz-naive to stay robust to that normalization
+        while still verifying the correct chunk window is used.
+        """
         result = self._run_pipeline_with_mocks()
         chunks = result["chunks"]
         ensure_args = result["ensure_args"]
         # positional args: window_start, window_end
         eff_start, eff_end = ensure_args[0], ensure_args[1]
-        self.assertEqual(eff_start, chunks[-1]["window_start"],
+        # DEC-018: effective_start/end are tz-normalised to naive inside run_pipeline;
+        # strip tz from the reference chunk datetimes to compare values only.
+        exp_start = chunks[-1]["window_start"].replace(tzinfo=None)
+        exp_end   = chunks[-1]["window_end"].replace(tzinfo=None)
+        self.assertEqual(eff_start, exp_start,
                          "effective_start should match last chunk start (recent_chunks=1)")
-        self.assertEqual(eff_end, chunks[-1]["window_end"],
+        self.assertEqual(eff_end, exp_end,
                          "effective_end should match last chunk end")
 
     def test_process_chunk_called_once_for_one_chunk(self):

@@ -12,7 +12,7 @@ class TestR300SchemaSidecarHorizonGuardrail(unittest.TestCase):
     def test_write_local_parquet_sidecar_hash_formula_includes_horizon_tag(self):
         import trainer.etl_player_profile as etl_mod
 
-        src = inspect.getsource(etl_mod._write_to_local_parquet)
+        src = inspect.getsource(etl_mod._persist_local_parquet)
         self.assertIn(
             "max_lookback_days",
             src,

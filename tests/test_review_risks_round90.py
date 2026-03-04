@@ -132,13 +132,13 @@ class TestR103MissingDQColumnGuard(unittest.TestCase):
 class TestR104LocalWriteMemoryPattern(unittest.TestCase):
     """R104: avoid full read-then-concat rewrite pattern for large parquet."""
 
-    def test_write_to_local_parquet_avoids_full_existing_read(self):
-        src = _get_func_src(_ETL_TREE, _ETL_SRC, "_write_to_local_parquet")
-        self.assertGreater(len(src), 0, "_write_to_local_parquet not found")
+    def test_persist_local_parquet_avoids_full_existing_read(self):
+        src = _get_func_src(_ETL_TREE, _ETL_SRC, "_persist_local_parquet")
+        self.assertGreater(len(src), 0, "_persist_local_parquet not found")
         self.assertNotRegex(
             src,
             r"existing\s*=\s*pd\.read_parquet\(",
-            "_write_to_local_parquet still does full existing parquet read (R104)",
+            "_persist_local_parquet still does full existing parquet read (R104)",
         )
 
 

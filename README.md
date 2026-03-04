@@ -50,10 +50,16 @@ python -m trainer.trainer --use-local-parquet --recent-chunks 3
 python -m trainer.trainer --skip-optuna --use-local-parquet
 ```
 
-**Fast mode（僅供測試，筆電約 &lt;10 分鐘）**：限制可用資料時間範圍（Data Horizon），所有子模組（identity / labels / features / profile ETL）共用同一個時間邊界，以較少資料量加速訓練；可選擇性搭配 `--sample-rated N` 只抽樣部分評級客。**請勿將產物用於生產。**
+**Fast mode（僅供測試，筆電約 &lt;10 分鐘）**：限制可用資料時間範圍（Data Horizon），所有子模組（identity / labels / features / profile ETL）共用同一個時間邊界，以較少資料量加速訓練；並隱含 `--skip-optuna` 與 `--no-afg`（跳過 Track A DFS）。可選擇性搭配 `--sample-rated N` 只抽樣部分評級客。**請勿將產物用於生產。**
 
 ```bash
 python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
+```
+
+**--no-afg（No Automatic Feature Generation）**：僅使用 Track B + profile 特徵，跳過 Track A（Featuretools DFS）；與 `--fast-mode` 正交（fast-mode 會自動帶入 --no-afg）。適用於無 Featuretools 環境或快速迭代 Track B。
+
+```bash
+python -m trainer.trainer --no-afg --recent-chunks 2 --use-local-parquet
 ```
 
 低記憶體（如 8 GB）：加上 `--fast-mode-no-preload`：
@@ -90,12 +96,16 @@ Fast-mode 煙測：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 | 文件 | 說明 |
 |------|------|
+| `ssot/trainer_plan_ssot.md` | 訓練/標籤/特徵設計規格（單一事實來源 SSOT） |
 | `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` | 資料表/欄位字典與 DQ 備註 |
 | `doc/FINDINGS.md` | 資料品質與行為發現（可重現 SQL） |
 | `doc/player_profile_daily_spec.md` | 玩家每日 profile ETL 與 PIT/as-of 語意 |
 | `doc/model_api_protocol.md` | 模型與應用 API 協定（如 POST /score） |
 | `doc/TRAINER_SUMMARY.md` | 系統摘要（架構、模組、前端） |
-| 其餘見 `doc/` 與 `.cursor/plans/` | 計畫與決策紀錄 |
+| `doc/TRAINER_TEAM_PRESENTATION.md` | 團隊向系統概覽 |
+| `doc/PLAN_VS_TRAINER_COMPARISON.md` | 計畫與實作對照 |
+| `doc/TRAINER_ISSUES.md` | 已知問題與備註 |
+| `.cursor/plans/` | 實作計畫（PLAN.md）、狀態（STATUS.md）、決策紀錄（DECISION_LOG.md） |
 
 ### 產物（trainer 輸出）
 
@@ -106,6 +116,7 @@ Fast-mode 煙測：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 - **Fast-mode** 產物在 metadata 中標記 `fast_mode=true`，不得用於生產推論。
 - **憑證**：請安全存放 ClickHouse 憑證，勿提交 `.env`。
 - **時區**：業務邏輯使用 `Asia/Hong_Kong`（`config.HK_TZ`）。
+- **閾值選擇**：Phase 1 以驗證集 **F1 最大化** 選定雙模型閾值（DEC-009），無精準度/警報量下限約束。
 
 ---
 
@@ -157,10 +168,16 @@ python -m trainer.trainer --use-local-parquet --recent-chunks 3
 python -m trainer.trainer --skip-optuna --use-local-parquet
 ```
 
-**Fast mode（仅供测试，笔记本约 &lt;10 分钟）**：限制可用数据时间范围（Data Horizon），所有子模块（identity / labels / features / profile ETL）共用同一个时间边界，以较少数据量加速训练；可选择性搭配 `--sample-rated N` 只抽样部分评级客。**请勿将产物用于生产。**
+**Fast mode（仅供测试，笔记本约 &lt;10 分钟）**：限制可用数据时间范围（Data Horizon），所有子模块（identity / labels / features / profile ETL）共用同一个时间边界，以较少数据量加速训练；并隐含 `--skip-optuna` 与 `--no-afg`（跳过 Track A DFS）。可选择性搭配 `--sample-rated N` 只抽样部分评级客。**请勿将产物用于生产。**
 
 ```bash
 python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
+```
+
+**--no-afg（No Automatic Feature Generation）**：仅使用 Track B + profile 特征，跳过 Track A（Featuretools DFS）；与 `--fast-mode` 正交（fast-mode 会自动带入 --no-afg）。适用于无 Featuretools 环境或快速迭代 Track B。
+
+```bash
+python -m trainer.trainer --no-afg --recent-chunks 2 --use-local-parquet
 ```
 
 低内存（如 8 GB）：加上 `--fast-mode-no-preload`：
@@ -197,12 +214,16 @@ Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 | 文档 | 说明 |
 |------|------|
+| `ssot/trainer_plan_ssot.md` | 训练/标签/特征设计规格（单一事实来源 SSOT） |
 | `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` | 表/字段字典与 DQ 备注 |
 | `doc/FINDINGS.md` | 数据质量与行为发现（可重现 SQL） |
 | `doc/player_profile_daily_spec.md` | 玩家每日 profile ETL 与 PIT/as-of 语义 |
 | `doc/model_api_protocol.md` | 模型与应用 API 协议（如 POST /score） |
 | `doc/TRAINER_SUMMARY.md` | 系统摘要（架构、模块、前端） |
-| 其余见 `doc/` 与 `.cursor/plans/` | 计划与决策记录 |
+| `doc/TRAINER_TEAM_PRESENTATION.md` | 团队向系统概览 |
+| `doc/PLAN_VS_TRAINER_COMPARISON.md` | 计划与实现对照 |
+| `doc/TRAINER_ISSUES.md` | 已知问题与备注 |
+| `.cursor/plans/` | 实现计划（PLAN.md）、状态（STATUS.md）、决策记录（DECISION_LOG.md） |
 
 ### 产物（trainer 输出）
 
@@ -213,6 +234,7 @@ Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 - **Fast-mode** 产物在 metadata 中标记 `fast_mode=true`，不得用于生产推理。
 - **凭证**：请安全存放 ClickHouse 凭证，勿提交 `.env`。
 - **时区**：业务逻辑使用 `Asia/Hong_Kong`（`config.HK_TZ`）。
+- **阈值选择**：Phase 1 以验证集 **F1 最大化** 选定双模型阈值（DEC-009），无精准度/警报量下限约束。
 
 ---
 
@@ -295,10 +317,18 @@ python -m trainer.trainer --skip-optuna --use-local-parquet
 
 ### Fast mode (testing only, &lt;10 min on laptop)
 
-Constrains the available data time range (Data Horizon); all submodules (identity / labels / features / profile ETL) share the same time boundary so that a smaller slice of data is processed for faster iteration. You can optionally combine with `--sample-rated N` to train on a subset of rated patrons. **Do not use artifacts in production.**
+Constrains the available data time range (Data Horizon); all submodules (identity / labels / features / profile ETL) share the same time boundary so that a smaller slice of data is processed for faster iteration. Implies `--skip-optuna` and `--no-afg` (skips Track A DFS). You can optionally combine with `--sample-rated N` to train on a subset of rated patrons. **Do not use artifacts in production.**
 
 ```bash
 python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
+```
+
+### --no-afg (No Automatic Feature Generation)
+
+Use only Track B + profile features and skip Track A (Featuretools DFS). Orthogonal to `--fast-mode` (fast-mode implies `--no-afg`). Useful when Featuretools is unavailable or for quick Track B iteration.
+
+```bash
+python -m trainer.trainer --no-afg --recent-chunks 2 --use-local-parquet
 ```
 
 Low-RAM (e.g. 8 GB): add `--fast-mode-no-preload` to avoid loading the full session Parquet into memory:
@@ -384,6 +414,7 @@ python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
 
 | Document | Description |
 |----------|-------------|
+| `ssot/trainer_plan_ssot.md` | Training/labels/features design spec (single source of truth) |
 | `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` | Table/column dictionary and short DQ notes |
 | `doc/FINDINGS.md` | Data quality and behavior findings (reproducible SQL) |
 | `doc/player_profile_daily_spec.md` | Player profile daily ETL and PIT/as-of semantics |
@@ -392,8 +423,7 @@ python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
 | `doc/TRAINER_TEAM_PRESENTATION.md` | Team-facing overview |
 | `doc/PLAN_VS_TRAINER_COMPARISON.md` | Plan vs implementation comparison |
 | `doc/TRAINER_ISSUES.md` | Known issues / notes |
-
-Internal planning (optional): `.cursor/plans/PLAN.md`, `STATUS.md`, `DECISION_LOG.md`.
+| `.cursor/plans/` | Implementation plan (PLAN.md), status (STATUS.md), decision log (DECISION_LOG.md) |
 
 ---
 
@@ -416,3 +446,4 @@ Legacy single `walkaway_model.pkl` is still written for backward compatibility.
 - **Fast-mode** outputs are marked `fast_mode=true` in metadata and must not be used for production inference.
 - **Credentials**: Store ClickHouse credentials securely; avoid committing `.env`.
 - **Time zone**: Business logic uses `Asia/Hong_Kong` (see `config.HK_TZ`).
+- **Threshold selection**: Phase 1 uses validation-set **F1 maximization** for dual-model thresholds (DEC-009); no precision/alert-volume lower bound.

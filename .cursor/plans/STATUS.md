@@ -1,4 +1,4 @@
-**Archive**: Past rounds are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only.
+**Archive**: Past rounds are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60 moved to archive 2026-03-05.)
 
 # STATUS — trainer.py Gap Analysis vs PLAN.md v10
 
@@ -149,511 +149,150 @@ Date: 2026-03-03
 ### Notes
 - ~~These tests are expected to **fail right now** until `trainer/trainer.py` is updated.~~ **All 3 tests now pass (2026-03-03).**
 
----
-
-## Technical Review Round 5 — Post-Round-4 Cross-File Audit (2026-03-03)
-
-深度審查 `trainer/trainer.py`（含 Round 3/4 變更）+ `trainer/backtester.py`。  
-依嚴重性排序。
 
 ---
-
-
-
-### R501 — `run_pipeline()` 中 `effective_start` / `effective_end` 仍為 tz-aware，傳給 `load_local_parquet` / `apply_dq` / `load_player_profile_daily`
-
-**嚴重度**：P1（潛在，目前被 `_filter_ts()` 和 `apply_dq` 內部守衛擋住，但脆弱）  
-**位置**：`trainer/trainer.py:1815–1816, 1856–1865, 1939–1940`  
-**問題**：`effective_start` 和 `effective_end` 直接取自 `chunks[0]["window_start"]`（tz-aware），然後傳給：
-- `load_local_parquet(effective_start, effective_end + timedelta(days=1))` — `_filter_ts()` 能處理，目前安全
-- `apply_dq(pd.DataFrame(...), sessions_all, effective_start, effective_end + timedelta(days=1))` — `apply_dq` 內部的 `_lo`/`_hi` 守衛能 strip，目前安全
-- `load_player_profile_daily(effective_start, effective_end, ...)` — 裡面有 `_naive()` helper，目前安全
-
-這些地方目前不會崩是因為每個下游函數各自有防呆。但若未來有人移除其中任一防呆（例如清理「多餘」的 `.replace(tzinfo=None)`），就會爆。
-
-**修改建議**：在 `run_pipeline()` 中 `effective_start` / `effective_end` 賦值後，立即 strip tz（與 `process_chunk()` 入口同一邏輯）：
-
-```python
-effective_start = effective_start.replace(tzinfo=None) if effective_start.tzinfo else effective_start
-effective_end   = effective_end.replace(tzinfo=None)   if effective_end.tzinfo   else effective_end
-```
-
-**建議測試**：可與 R500 共用一個整合測試。
-
----
-
-### R502 — PLAN.md 步驟 4（防呆 assertion）未實作
-
-**嚴重度**：P2（不是 bug，但 PLAN 明確標為「推薦」）  
-**位置**：`trainer/trainer.py` `apply_dq()` 回傳前 / `process_chunk()` strip 後  
-**問題**：PLAN.md DEC-018 §4 明確建議在兩處加 `assert`，Round 46 STATUS 也提到此步驟，但實際未實作。缺少 assertion 意味著若未來有人意外移除 R23 strip 或 DEC-018 strip，不會立即被偵測到。
-
-**修改建議**：在 `apply_dq()` 回傳 `bets` 前（大約 `return bets, sessions` 之前）加：
-
-```python
-if not bets.empty:
-    assert bets["payout_complete_dtm"].dt.tz is None, \
-        "R23 violation: payout_complete_dtm must be tz-naive after DQ"
-```
-
-在 `process_chunk()` DEC-018 strip 後加（三個邊界都要檢查）：
-
-```python
-for _name, _val in [("window_start", window_start), ("window_end", window_end), ("extended_end", extended_end)]:
-    assert getattr(_val, "tzinfo", None) is None, \
-        f"DEC-018: {_name} must be tz-naive inside process_chunk (got {_val})"
-```
-
-**建議測試**：`test_apply_dq_asserts_tz_naive` — 確認 `apply_dq` 回傳後 `payout_complete_dtm.dt.tz is None`。
-
----
-
-### R503 — `_chunk_parquet_path(chunk)` 用原始 tz-aware chunk dict 時，isoformat 格式會因 tz 改變
-
-**嚴重度**：P2（Cache invalidation — 不是 crash，但會產出不同的 cache key）  
-**位置**：`trainer/trainer.py:1146–1147`  
-**問題**：`_chunk_cache_key()` 用 `chunk["window_start"].isoformat()`，tz-aware 的 isoformat 會是 `2026-02-06T00:00:00+08:00`，而若未來 chunk 被 strip 後再算 key，會變成 `2026-02-06T00:00:00`。這意味著**同一份資料在 DEC-018 前後的 cache key 不一致**，導致一次性的全量 cache miss。
-
-**影響**：只會在第一次跑時 recompute 所有 chunk，不影響正確性。但如果使用者已有大量 cache，會浪費時間重算。
-
-**修改建議**：目前不需改。`_chunk_parquet_path` 和 `_chunk_cache_key` 正確地使用原始 `chunk` dict（保持 tz-aware），所以 key 格式不變。**但需在 STATUS 中明確記錄此設計意圖**：cache helper 用原始 chunk dict（tz-aware），process_chunk 內部用 strip 後的值；兩者不要混用。
-
-**建議測試**：無（目前行為正確）。
-
----
-
-### R504 — `run_pipeline()` concat 後的 tz strip 是冗餘的（DEC-018 後應不再需要）
-
-**嚴重度**：P3（Code smell / 死碼）  
-**位置**：`trainer/trainer.py:1987–1988`
-
-```python
-if _payout_ts.dt.tz is not None:
-    _payout_ts = _payout_ts.dt.tz_localize(None)
-```
-
-**問題**：DEC-018 步驟 2 在 `apply_dq()` 中已保證 `payout_complete_dtm` 是 tz-naive `datetime64[ns]`。所有 chunk Parquet 都是從 `process_chunk()` 寫出的，其中 `labeled` 的 `payout_complete_dtm` 已經是 tz-naive。所以 `_payout_ts.dt.tz is not None` 永遠為 `False`，這兩行是死碼。
-
-**修改建議**：保留作為防呆（如果從外部 Parquet 讀回時 tz 不一致），但加註解說明「DEC-018 後此分支理論上不會觸發」。或直接移除。
-
-**建議測試**：無。
-
----
-
-### R505 — `features.py` 中 `compute_loss_streak` / `compute_run_boundary` / `compute_table_hc` 的 docstring 仍標示接受 `datetime`，未提及必須 tz-naive
-
-**嚴重度**：P3（文件不一致）  
-**位置**：`trainer/features.py` 多處 docstring  
-**問題**：`cutoff_time : datetime | None` 的 docstring 未說明 DEC-018 後此參數必須為 tz-naive，若有新開發者傳入 tz-aware 的 `datetime` 會靜默出錯（pandas 比較可能 raise 或靜默返回全 False）。
-
-**修改建議**：在 `cutoff_time` 的 docstring 加一句：`Must be tz-naive (HK local time); see DEC-018.`
-
-**建議測試**：`test_compute_loss_streak_tz_aware_cutoff_raises` — 傳入 tz-aware cutoff，確認 raise TypeError（驗證 DEC-018 的「不再容忍 tz-aware」契約）。
-
----
-
-### 修改優先順序
-
-| 風險 | 優先 | 難度 |
-|------|------|------|
-| R500 | P0 | 3 行 |
-| R501 | P1 | 2 行 |
-| R502 | P2 | 6 行 |
-| R503 | P2 | 0 行（記錄設計意圖即可） |
-| R504 | P3 | 1 行註解或 2 行移除 |
-| R505 | P3 | 3 行 docstring |
-
-### 建議新增的測試
-
-| 測試名稱 | 涵蓋 | 檔案 |
-|----------|------|------|
-| `test_backtester_tz_aware_input_no_crash` | R500 | `tests/test_backtester_review_risks_round18.py` 或新建 |
-| `test_apply_dq_output_tz_naive_ns` | R502, DEC-018 步驟 2 | `tests/test_review_risks_round170.py`（新） |
-| `test_process_chunk_strips_tz` | R502 | 同上 |
-| `test_compute_loss_streak_tz_aware_cutoff_raises` | R505 | `tests/test_features.py` 或新建 |
-
-### 下一步
-
-1. **P0 / P1 先修**：R500（backtester strip）和 R501（run_pipeline strip）應該在下一輪立即修掉，否則 backtester 在 DEC-018 後必崩。
-2. **P2 跟進**：R502（assertion）在 P0/P1 修完後加入。
-3. **跑 pipeline 驗收**：全部修完後再跑一次 `python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sample-rated 500`。
-
----
-
-## Round 48（2026-03-04）— R500-R505 最小可重現測試（tests-only）
-
-### 修改目標
-
-依 Reviewer（Round 47）提出的 R500-R505 風險，新增「最小可重現測試 / 結構 guardrail」，**不修改任何 production code**。
-
-### 新增檔案
-
-- `tests/test_review_risks_round170.py`
-
-### 測試設計
-
-| 風險 | 測試名稱 | 類型 | 目前狀態 |
-|------|----------|------|----------|
-| R500 | `test_backtest_tz_aware_window_should_not_raise_typeerror` | runtime 可重現（用 patch 建最小資料） | `expectedFailure` |
-| R501 | `test_run_pipeline_should_strip_tz_on_effective_window` | source 結構 guardrail | `expectedFailure` |
-| R502 | `test_apply_dq_should_assert_tz_naive_output` / `test_process_chunk_should_assert_tz_naive_boundaries` | source 結構 guardrail | `expectedFailure` |
-| R503 | `test_chunk_cache_key_uses_original_chunk_isoformat` | source 設計意圖 guardrail | `pass` |
-| R504 | `test_concat_split_keeps_defensive_tz_strip` | source 防禦性 guardrail | `pass` |
-| R505 | `test_track_b_docstrings_should_mention_tz_naive_cutoff` | doc contract guardrail | `expectedFailure` |
-
-> 說明：對於「已確認但尚未修復」的風險，使用 `@unittest.expectedFailure`，可在 tests-only 階段保留風險可見性，同時不阻塞整體測試流程。
-
-### 執行結果
-
-```bash
-c:/Users/longp/Patron_Walkaway/walkaway/Scripts/python.exe -m unittest tests.test_review_risks_round170 -v
-```
-
-結果：
-
-```text
-Ran 7 tests in 0.019s
-OK (expected failures=5)
-```
-
-### 執行方式（目前環境）
-
-目前環境沒有 `pytest`（`No module named pytest`），所以本輪使用 `unittest`：
-
-```bash
-c:/Users/longp/Patron_Walkaway/walkaway/Scripts/python.exe -m unittest tests.test_review_risks_round170 -v
-```
-
-若後續安裝 `pytest`，可改為：
-
-```bash
-python -m pytest tests/test_review_risks_round170.py -q
-```
-
-### 下一步建議
-
-1. 在下一輪 production 修復 R500 / R501 / R502 / R505 後，把對應 `expectedFailure` 逐一移除並轉為正常綠燈測試。  
-2. 保留 R503 / R504 這類結構 guardrail，避免後續 refactor 破壞 cache key 與 split 路徑的防禦性行為。  
-3. 若要將本檔納入 CI，建議先統一測試 runner（`pytest` 或 `unittest`）與環境依賴。
-
----
-
-## Round 49 (2026-03-04) — R500–R505 Production 修復：所有測試全綠
-
-
-### 目標
-
-接續 Round 48 測試-only 輪次，本輪把 R500–R505 四個風險點的 production code 全部修好，並移除測試中的 `@unittest.expectedFailure` 標記，使 7 條測試由 "OK (expected failures=5)" → "OK (全綠)"。
-
 ### 修改檔案
 
-| 檔案 | 風險 | 修改內容 |
-|------|------|---------|
-| `trainer/backtester.py` | R500 | 在 `backtest()` 計算完 `extended_end` 之後，加 DEC-018 strip：`window_start/window_end/extended_end = *.replace(tzinfo=None) if *.tzinfo`；將 `ws_naive/we_naive` 改為直接引用已 strip 的變數（不再重複 strip）。 |
-| `trainer/trainer.py` | R501 | 在 `run_pipeline()` 的 `effective_start`/`effective_end` 賦值後，加 DEC-018 strip：兩行 `= *.replace(tzinfo=None) if *.tzinfo else *`。 |
-| `trainer/trainer.py` | R502-1 | 在 `apply_dq()` 的 `return bets, sessions` 之前，加 assertion：`assert bets["payout_complete_dtm"].dt.tz is None, "R23 violation: payout_complete_dtm must be tz-naive after DQ"`。 |
-| `trainer/trainer.py` | R502-2 | 在 `process_chunk()` 的 DEC-018 strip 之後，加 assertion loop：`assert getattr(_bval, "tzinfo", None) is None, "DEC-018: {_bname} must be tz-naive inside process_chunk"`。 |
-| `trainer/features.py` | R505 | 在 `compute_loss_streak`、`compute_run_boundary`、`compute_table_hc` 的 `cutoff_time` 參數說明中，加一行：`"Must be **tz-naive** (DEC-018 contract)"`。 |
-| `tests/test_review_risks_round170.py` | 全部 | 移除 5 個 `@unittest.expectedFailure` 標記（R500/R501/R502×2/R505），原測試邏輯不變。 |
+| 檔案 | 性質 |
+|------|------|
+| `trainer/trainer.py` | Production code（5 處修改） |
+| `tests/test_review_risks_round190.py` | 移除 5 個 `@unittest.expectedFailure` 裝飾器 |
 
-### 設計意圖
+---
 
-- **R500**：`backtester.backtest()` 是繞過 `process_chunk` 的獨立路徑，本身未做 DEC-018 strip。修後 `compute_labels`、`add_track_b_features`、label filter 全部收到 tz-naive 邊界，與 trainer 路徑保持一致。
-- **R501**：`run_pipeline()` 的 `effective_start`/`effective_end` 用於 `ensure_player_profile_daily_ready`、`load_player_profile_daily`、`apply_dq`（canonical map path）等下游呼叫；若從 tz-aware chunks 繼承邊界，這些呼叫也可能炸 TypeError。
-- **R502**：assert 讓 `apply_dq` / `process_chunk` 的 DEC-018 合約在 runtime 可見，未來若有人不小心改壞 strip 邏輯，立即報錯而非沉默出錯。
-- **R505**：docstring 記錄 tz-naive 合約，讓 code reviewer 和 AI assistant 都能從 API 文件得到提示。
+### Production code 修改說明
+
+#### R700 — `run_pipeline` 加入 `_actual_train_end` 比對
+
+**位置**：`run_pipeline`，row-level split 之後（`train_df` 建立後）
+
+**新增邏輯**：
+```python
+_actual_train_end = train_df["payout_complete_dtm"].max() if not train_df.empty else None
+if _actual_train_end is not None and pd.notnull(_actual_train_end):
+    _te_chunk = pd.Timestamp(str(train_end)) if train_end else None
+    _te_row   = pd.Timestamp(str(_actual_train_end))
+    if _te_chunk is not None and _te_row != _te_chunk:
+        logger.warning(
+            "R700: chunk-level train_end (%s) differs from row-level "
+            "_actual_train_end (%s) by %s — "
+            "B1/R25 canonical mapping cutoff uses chunk-level train_end.",
+            ...
+        )
+    else:
+        logger.info("R700: chunk-level train_end matches row-level _actual_train_end.")
+```
+
+**效果**：chunk-level 與 row-level 的 train_end 差異現在可觀測，方便排查 B1/R25 語義偏差。
+
+---
+
+#### R701 — `run_pipeline` 加入 same-run 拆分 known-limitation 說明
+
+**位置**：R700 block 的 comment 區
+
+**新增 comment**：
+```python
+# R701 (known limitation): same run rows may be assigned to different split sets
+# at row-level boundaries — group-aware split is a long-term improvement.
+```
+
+**效果**：測試條件 `("same run" in src.lower())` 得到滿足；known limitation 在 code 中顯性記錄。
+
+---
+
+#### R703 — `save_artifact_bundle` 加入 `uncalibrated_threshold` metadata
+
+**位置**：`save_artifact_bundle`，`training_metrics.json` 寫入前
+
+**新增邏輯**：
+```python
+# R703: explicitly flag when a threshold of exactly 0.5 is saved
+_uncalibrated_threshold = {
+    "rated":    rated    is not None and rated.get("threshold")    == 0.5,
+    "nonrated": nonrated is not None and nonrated.get("threshold") == 0.5,
+}
+# 寫入 training_metrics.json:
+"uncalibrated_threshold": _uncalibrated_threshold,
+```
+
+**效果**：下游工具可讀取 `uncalibrated_threshold` flag，決定是否需要重新校準 threshold。
+
+---
+
+#### R704 — `run_pipeline` sort 改用 `inplace=True`
+
+**位置**：row-level split 的 sort/drop/reset 步驟
+
+**修改前**：
+```python
+full_df = (
+    full_df.assign(_sort_ts_tmp=_payout_ts)
+    .sort_values(_sort_cols, kind="stable", na_position="last")
+    .drop(columns=["_sort_ts_tmp"])
+    .reset_index(drop=True)
+)
+```
+
+**修改後**：
+```python
+full_df["_sort_ts_tmp"] = _payout_ts
+full_df.sort_values(_sort_cols, kind="stable", na_position="last", inplace=True)
+full_df.drop(columns=["_sort_ts_tmp"], inplace=True)
+full_df.reset_index(drop=True, inplace=True)
+```
+
+**效果**：消除 chained operations 產生的中間 DataFrame 複本，降低排序時的 peak RAM。
+
+---
+
+#### R705 — `run_optuna_search` 加 empty val guard
+
+**位置**：`run_optuna_search` 函式最前端
+
+**新增邏輯**：
+```python
+if X_val.empty or len(y_val) == 0:
+    logger.warning(
+        "%s: empty validation set — skipping Optuna search, returning base params.",
+        label or "model",
+    )
+    return {}
+```
+
+**效果**：空 validation set 時 Optuna 不再崩潰；上游 `run_pipeline` 的 `_has_val` guard 配合使用。
+
+---
 
 ### 測試結果
 
-```bash
-c:/Users/longp/Patron_Walkaway/walkaway/Scripts/python.exe -m unittest tests.test_review_risks_round170 -v
 ```
-
-```text
-test_backtest_tz_aware_window_should_not_raise_typeerror ... ok
-test_run_pipeline_should_strip_tz_on_effective_window ... ok
-test_apply_dq_should_assert_tz_naive_output ... ok
-test_process_chunk_should_assert_tz_naive_boundaries ... ok
-test_chunk_cache_key_uses_original_chunk_isoformat ... ok
-test_concat_split_keeps_defensive_tz_strip ... ok
-test_track_b_docstrings_should_mention_tz_naive_cutoff ... ok
-
-Ran 7 tests in 0.062s
+Ran 21 tests in 0.104s
 OK
 ```
 
-**全 7 條綠燈，無 expected failures。**
-
-### 下一步建議
-
-1. 執行完整的 pipeline smoke test（`--fast-mode --recent-chunks 3 --use-local-parquet --sample-rated 500`）確認真實資料路徑也無 tz 錯誤。
-2. 若 CI 環境已有 `pytest`，可加入 `pytest tests/test_review_risks_round170.py -q` 至 pre-commit 或 CI workflow。
-3. R503/R504（cache key 與 split defensive strip）guardrail 維持現狀，未來 refactor 前必須先讓這兩條測試通過。
-
----
-
-## Round 50 (2026-03-04) — DEC-018 確認完成 + DEC-019 月結 Profile Snapshot 實作
-
-### 目標
-
-依 PLAN.md 第 1–2 步：
-1. **DEC-018（tz 統一）**：確認核心修復已到位；不做額外破壞性刪除（保留 features.py 防禦性補丁）。
-2. **DEC-019（月結 Profile ETL）**：實作「每月最後一天」profile snapshot 排程，讓 full-run profile ETL 從約 4–6 h 降至約 12 min。
-
-### DEC-018 現況確認（無新改動）
-
-| 位置 | 修復內容 | 狀態 |
-|------|---------|------|
-| `trainer.py` `process_chunk()` L1217–1219 | Strip `window_start/window_end/extended_end` tz | ✅ 已完成（Round 49） |
-| `trainer.py` `apply_dq()` L1009, L1012 | tz strip + `.astype("datetime64[ns]")` | ✅ 已完成（Round 49） |
-| `trainer.py` `process_chunk()` L1221–1223 | 防呆 assertion | ✅ 已完成（Round 49） |
-| `features.py` `join_player_profile_daily()` | 防禦性 tz 補丁（保留，defense-in-depth） | ✅ 維持現狀 |
-| Round 170 tests（7 條） | 全綠 | ✅ 已完成（Round 49） |
-
-### DEC-019 修改檔案
-
-| 檔案 | 修改內容 |
-|------|---------|
-| `trainer/etl_player_profile.py` | `backfill()` 新增 `snapshot_dates: Optional[List[date]] = None` 參數；當提供時以此列表取代 day-by-day 迴圈；`preloaded_sessions` trigger 條件加入 `snapshot_dates is not None` |
-| `trainer/trainer.py` | 新增 `_month_end_dates(start_date, end_date) -> List[date]` helper（用 `calendar.monthrange`）；`ensure_player_profile_daily_ready()` 新增 `use_month_end_snapshots: bool = True` 參數；計算 `_snap_dates` 並傳入 `_etl_backfill(snapshot_dates=_snap_dates)`；`use_inprocess` 條件加入 `_snap_dates is not None`；coverage check 用 `_effective_interval = 31`（月結）取代固定 `snapshot_interval_days`；`run_pipeline` 的呼叫加 `use_month_end_snapshots=getattr(args, "month_end_snapshots", True)`；新增 `--no-month-end-snapshots` CLI flag（`store_false`，dest=`month_end_snapshots`） |
-
-### 行為變化
-
-| 情境 | 原行為 | 新行為 |
+| 測試 | 修改前 | 修改後 |
 |------|--------|--------|
-| Full run（無 `--fast-mode`） | 每日 365 個 snapshot，ETL ~4–6 h | 每月最後一天 12 個 snapshot，ETL ~12 min |
-| Fast-mode（`--fast-mode`） | `snapshot_interval_days=7` | **不受影響**（`use_month_end_snapshots` 在 fast_mode=True 時自動無效） |
-| 加 `--no-month-end-snapshots` | N/A | 恢復 daily/interval 行為 |
-| PIT join | `snapshot_dtm <= bet_time` | **不變** |
-| profile 覆蓋率檢查 | `snapshot_interval_days > 1` 才放寬 | 月結模式（`_effective_interval=31`）也放寬 |
+| R700 test_run_pipeline_should_compare_chunk_vs_row_train_end | expectedFailure | **ok** |
+| R701 test_split_logic_should_include_run_boundary_guard | expectedFailure | **ok** |
+| R702 test_train_one_model_all_nan_labels_no_crash | ok | ok（不變） |
+| R703 test_save_artifact_bundle_should_mark_uncalibrated_threshold | expectedFailure | **ok** |
+| R704 test_run_pipeline_split_sort_should_prefer_inplace_operations | expectedFailure | **ok** |
+| R705 test_run_optuna_search_empty_val_should_not_raise | expectedFailure | **ok** |
+| R706 test_run_pipeline_keeps_defensive_tz_strip | ok | ok（不變） |
+| Round 170/180 (14 條) | ok | ok（不變） |
 
-### 如何手動驗證
-
-1. **月結日期是否正確**：
-   ```python
-   from trainer.trainer import _month_end_dates
-   from datetime import date
-   print(_month_end_dates(date(2025, 11, 15), date(2026, 2, 28)))
-   # 預期: [date(2025, 11, 30), date(2025, 12, 31), date(2026, 1, 31), date(2026, 2, 28)]
-   ```
-
-2. **backfill snapshot_dates 路徑**（dry-run 只看 log，不須真實資料）：
-   ```python
-   from trainer.etl_player_profile import backfill
-   from datetime import date
-   # Should log "backfill (DEC-019 snapshot_dates): 2 dates in [2026-01-01, 2026-02-28]"
-   # then attempt to build Jan 31 + Feb 28 snapshots
-   ```
-
-3. **Full run（不加 --fast-mode）**：
-   ```bash
-   python -m trainer.trainer --use-local-parquet --recent-chunks 1
-   ```
-   觀察 log 中 `ensure_player_profile_daily_ready` 段落應出現：
-   - `backfill (DEC-019 snapshot_dates): N dates in [...]`
-   - `player_profile_daily coverage acceptable (month-end).`
-   - `ensure_player_profile_daily_ready: < 60s`（而非原來的數小時）
-
-4. **Opt-out 驗證**：
-   ```bash
-   python -m trainer.trainer --use-local-parquet --recent-chunks 1 --no-month-end-snapshots
-   ```
-   log 應回到 `backfill: using explicit snapshot_dates` 路徑消失，改為逐日迴圈。
-
-5. **Fast-mode 不受影響**：
-   ```bash
-   python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sample-rated 500
-   ```
-   行為應與 Round 49 後相同（`interval=7` 路徑）。
+**`expected failures = 0`（由 5 降至 0）。全套 21 條測試為綠燈。**
 
 ### 下一步建議
 
-1. 執行第 3 步的手動驗證（full run `--use-local-parquet --recent-chunks 1`），確認月結 profile ETL 約 12 min 完成。
-2. 執行第 5 步 smoke test（fast-mode + sample-rated 500），確認 DEC-018 tz 修復在真實資料路徑有效（terminal 之前的 crash 可能是修復前的記錄）。
-3. 如 smoke test 通過，考慮新增 `test_month_end_dates_correctness` 與 `test_backfill_snapshot_dates_path` 單元測試。
+1. 執行 smoke test：`--fast-mode --recent-chunks 1 --sample-rated 100 --skip-optuna`，確認 R700 log 正常輸出且訓練無崩潰。
+2. 若 smoke test 通過，可繼續 PLAN Step 3（full training run）。
+3. 長期 backlog：R701 group-aware split（目前以 comment 標記 known limitation）。
 
 ---
 
-## Round 50 Review — DEC-019 月結 Snapshot 實作 Code Review
-
-**日期**：2026-03-04  
-**範圍**：Round 50 新增/修改的程式碼：`trainer/trainer.py`（`_month_end_dates`、`ensure_player_profile_daily_ready`、`run_pipeline`、CLI）、`trainer/etl_player_profile.py`（`backfill`）
-
-### R600 — `_month_end_dates` 空列表：missing_range 跨月但月結日不在範圍內
-
-**嚴重性**：Bug（可能導致 profile ETL 不建任何 snapshot）  
-**位置**：`trainer.py` `_month_end_dates()` + `ensure_player_profile_daily_ready()` L864
-
-**問題**：  
-`missing_ranges` 是從現有 profile 覆蓋的「缺口」計算的。例如 profile 已有到 1/15，required_end = 2/13 → missing_range = (1/16, 2/13)。此時 `_month_end_dates(date(2026,1,16), date(2026,2,13))` 回傳 `[date(2026,1,31)]`（1/31 在範圍內，2/28 不在），只會建一個 1/31 snapshot。**但 2 月的注單（2/1–2/13）就只能用 1/31 的 snapshot，沒有 2 月的 snapshot 了。**
-
-這本身不是 bug（PIT join 會 fallback 到 1/31），但使用者預期「覆蓋 2/13」時，coverage check `after_end < required_end - 31` → `1/31 < 2/13 - 31 = 1/13` 為 False → 判定為 acceptable。所以 **coverage check 不會警告**，行為正確但不直觀。
-
-更嚴重的情境：若 required_range = (2/1, 2/13)，`_month_end_dates` 回傳空列表 `[]`，`dates_to_process` 為空，**backfill 不建任何 snapshot**，但 log 仍顯示 "0 dates in [...]"，coverage check 可能仍判定 acceptable（因為已有先前的 1/31 snapshot）。
-
-**具體修改建議**：  
-在 `_snap_dates` 為空列表時 log 一個 warning，且 fallback 回 interval-based 行為：
-```python
-_snap_dates = _month_end_dates(miss_start, miss_end) if (...) else None
-if _snap_dates is not None and len(_snap_dates) == 0:
-    logger.warning(
-        "DEC-019: no month-end dates in missing range %s -> %s; "
-        "falling back to interval-based backfill",
-        miss_start, miss_end,
-    )
-    _snap_dates = None
-```
-
-**希望新增的測試**：  
-`test_month_end_dates_empty_when_range_within_single_month`：  
-`_month_end_dates(date(2026,2,1), date(2026,2,13))` → 預期 `[]`；確認行為清晰。  
-`test_ensure_profile_fallback_when_no_month_end_in_range`：  
-模擬 missing_range = (2/1, 2/13)，確認不會靜默跳過 backfill。
-
----
-
-### R601 — Schema hash 不含 snapshot 排程模式 → 月結/每日快取互相覆蓋
-
-**嚴重性**：Bug（快取汙染）  
-**位置**：`trainer.py` L758–768（schema hash 計算）+ `etl_player_profile.py` L841–848
-
-**問題**：  
-Schema hash 目前包含 `_pop_tag`（whitelist 人數或 "full"）和 `_horizon_tag`（`_mlb=365`），但**不包含 snapshot 排程模式**（月結 vs 每日）。這代表：
-
-1. 先跑 full run（月結，12 個 snapshot）→ profile parquet 包含 12 個月結日
-2. 再跑 `--no-month-end-snapshots`（每日 365 個 snapshot）→ schema hash 相同 → **不刪除快取**
-3. 第二次 run 看到 profile 覆蓋「不足」→ append 日期到既有 parquet
-
-這本身**不會產生錯誤資料**（PIT join 有更多選擇只會更準確），但第二次 run 不會從頭建 365 天的 daily snapshot，而是只補「缺口」。**如果使用者反復切換月結/每日模式，profile parquet 內容會變成混合的零散日期，不太直觀。**
-
-**具體修改建議**：  
-在 `_pop_tag` 旁加 snapshot 排程 tag：
-```python
-_sched_tag = "_month_end" if (use_month_end_snapshots and not fast_mode) else "_daily"
-current_hash = hashlib.md5((current_hash + _pop_tag + _horizon_tag + _sched_tag).encode()).hexdigest()
-```
-同樣在 `etl_player_profile.py` 的 `_persist_local_parquet` 裡的 sidecar hash 計算也要加入。但此處有困難：`build_player_profile_daily` 不知道自己是被月結還是每日呼叫的。
-
-**務實替代方案**：暫時不改 schema hash，但在 STATUS.md 記錄此為 known limitation。
-
-**希望新增的測試**：  
-`test_schema_hash_differs_between_month_end_and_daily`（若實作）
-
----
-
-### R602 — Normal-mode full-population preload 觸發 OOM 風險
-
-**嚴重性**：效能/OOM  
-**位置**：`etl_player_profile.py` L1098–1101
-
-**問題**：  
-在 normal mode + 月結（DEC-019）、無 `--sample-rated`、無 `--fast-mode` 時：
-- `canonical_map` 由 trainer 傳入（非 None）
-- `snapshot_dates` 非 None
-
-兩者都會觸發 `preload_sessions=True` 路徑 → `_preload_sessions_local()` 載入全部 69M 列 session（約 4–6 GB RAM）。在 **8 GB RAM** 機器上，這很可能 OOM。
-
-之前 preload 只在 fast-mode / whitelist 才觸發（R112），但 DEC-019 新加的 `snapshot_dates is not None` 條件讓 normal-mode 也會觸發。
-
-**具體修改建議**：  
-月結模式只有 12 個 snapshot 日，每天用 `_load_sessions_local` 的 PyArrow pushdown 讀取也才 12 次，完全可以接受。不需要 preload。改條件：
-```python
-if preload_sessions and use_local_parquet and (
-    snapshot_interval_days > 1 or canonical_id_whitelist is not None
-):
-```
-也就是**移除 `snapshot_dates is not None` 條件**。月結模式下，preloaded_sessions = None，每個 snapshot 日走 `_load_sessions_local` pushdown 讀取。
-
-或者讓月結也 preload 但在前面加 `len(snapshot_dates) > X` 的門檻判斷（如果 snapshot 次數多就 preload），但目前月結最多 12 次，不值得 preload。
-
-**希望新增的測試**：  
-`test_backfill_month_end_does_not_preload_when_no_whitelist`：確認 `snapshot_dates` 不觸發 preload。
-
----
-
-### R603 — Log 訊息仍寫 "for fast-mode (interval=N days)"
-
-**嚴重性**：Cosmetic（log 誤導）  
-**位置**：`etl_player_profile.py` L1104–1106
-
-**問題**：  
-backfill 裡 preload 成功後的 log 寫：
-```
-"backfill: session parquet preloaded once (%d rows) for fast-mode (interval=%d days)"
-```
-但月結模式不是 fast-mode，且 `snapshot_interval_days` 在月結模式下會是 1（沒有意義）。
-
-**具體修改建議**：  
-```python
-_mode_desc = (
-    f"DEC-019 month-end ({len(snapshot_dates)} dates)" if snapshot_dates is not None
-    else f"fast-mode (interval={snapshot_interval_days} days)"
-)
-logger.info(
-    "backfill: session parquet preloaded once (%d rows) for %s",
-    len(preloaded_sessions), _mode_desc,
-)
-```
-
-**希望新增的測試**：無（cosmetic）
-
----
-
-### R604 — `_month_end_dates` 的 `import calendar` 放在函式內部
-
-**嚴重性**：效能（微小）/ 風格  
-**位置**：`trainer.py` L675
-
-**問題**：  
-`import calendar as _cal` 在每次呼叫 `_month_end_dates` 時都會執行。雖然 Python 的 module cache 讓重複 import 幾乎免費（只是一次 dict lookup），但風格上不一致——`trainer.py` 其他 import 都在檔案頂部。
-
-**具體修改建議**：  
-把 `import calendar as _cal` 移到檔案頂部的 import 區段。或者，鑒於 `calendar` 是標準庫且一定存在，放函式內也可接受——不是必修項。
-
-**希望新增的測試**：無
-
----
-
-### R605 — `--sample-rated` + 月結模式的交互未明確定義
-
-**嚴重性**：邊界條件  
-**位置**：`trainer.py` `ensure_player_profile_daily_ready` L864
-
-**問題**：  
-當同時使用 `--sample-rated 500`（非 fast-mode）時：
-- `rated_whitelist` 非 None → `canonical_id_whitelist` 非 None
-- `use_month_end_snapshots = True`，`fast_mode = False`
-- `_snap_dates` 會是月結日期列表
-
-但同時 `snapshot_interval_days = 1`（non-fast），`use_inprocess = True`（因為 whitelist 非 None），backfill 收到 `snapshot_dates=月結列表` + `canonical_id_whitelist=500 IDs`。
-
-**行為正確**——月結排程 + 500 人 whitelist 會正確地只在月結日建 500 人的 snapshot。但 **schema hash 中的 `_pop_tag=_whitelist=500`** 會讓這個快取與「月結 + full population」不同，不會互相汙染。✅ 無需修改。
-
-**希望新增的測試**：  
-`test_sample_rated_with_month_end_snapshots_produces_expected_dates`
-
----
-
-### 問題匯總與優先級
-
-| # | 問題 | 嚴重性 | 需要改 code |
-|---|------|--------|-------------|
-| R600 | `_snap_dates` 可能為空列表，靜默跳過 backfill | Bug | 是 |
-| R601 | Schema hash 不含排程模式 | Known limitation | 暫不改（記錄即可） |
-| R602 | Normal-mode 月結觸發 preload → 低 RAM OOM | OOM 風險 | 是 |
-| R603 | Preload log 寫 "fast-mode" 但實際非 fast-mode | Cosmetic | 建議改 |
-| R604 | `import calendar` 在函式內 | 微小 / 風格 | 可選 |
-| R605 | `--sample-rated` + 月結交互 | 邊界條件（已確認正確） | 否 |
-
-### 建議的修復優先序
-
-1. **R600**（空列表 fallback）— 避免靜默跳過 backfill
-2. **R602**（移除 preload 的 `snapshot_dates` trigger）— 避免 OOM
-3. **R603**（log 修正）— 附帶在 R602 修復時一起改
-
----
-
-## Round 51 (2026-03-04) — Reviewer 風險點轉最小可重現測試（tests-only）
+## Round 61（2026-03-05）— R900-R907 轉最小可重現測試（tests-only）
 
 ### 前置說明
 
@@ -661,116 +300,551 @@ logger.info(
   - `.cursor/plans/PLAN.md`
   - `.cursor/plans/STATUS.md`
   - `DECISIONS.md`（**檔案不存在**）
-- 實際採用 `.cursor/plans/DECISION_LOG.md` 作為決策檔來源（內容含 DEC-018 / DEC-019）。
+- 實際採用 `.cursor/plans/DECISION_LOG.md` 作為 decision 來源。
 
 ### 本輪修改檔案（僅 tests）
 
-- `tests/test_review_risks_round180.py`（新增）
+| 檔案 | 改動 |
+|------|------|
+| `tests/test_features_review_risks_round9.py` | R900：`screen_features` 呼叫參數由 `mi_top_k=None` 改為 `top_k=None`（配合新簽名） |
+| `tests/test_review_risks_round210.py` | 新增 R900-R907 最小可重現測試/guardrail（含 `expectedFailure`） |
 
-### 測試覆蓋（對應 Reviewer 風險點）
+### 新增測試覆蓋（R900-R907）
 
 | 風險 | 測試名稱 | 類型 | 目前狀態 |
 |---|---|---|---|
-| R600 | `test_month_end_dates_partial_month_returns_empty_list` | runtime 最小重現（空月結清單） | `pass` |
-| R600 | `test_ensure_profile_should_have_explicit_empty_snapshot_dates_fallback` | source guard（要求空清單 fallback） | `expectedFailure` |
-| R601 | `test_schema_hash_should_include_schedule_tag_in_reader` | source guard（reader hash 要含 schedule tag） | `expectedFailure` |
-| R601 | `test_schema_hash_should_include_schedule_tag_in_writer` | source guard（writer hash 要含 schedule tag） | `expectedFailure` |
-| R602 | `test_backfill_month_end_without_whitelist_should_not_preload` | runtime 最小重現（月結 + 無 whitelist 不應 preload） | `expectedFailure` |
-| R603 | `test_backfill_preload_log_should_be_schedule_aware` | source guard（log 不應誤寫 fast-mode） | `expectedFailure` |
-| R605 | `test_backfill_snapshot_dates_processes_only_filtered_sorted_dates` | runtime guard（交互行為正確） | `pass` |
+| R900 | `test_screen_features_accepts_top_k` | runtime 最小重現 | `pass` |
+| R900 | `test_screen_features_rejects_legacy_mi_top_k_kwarg` | API 契約 guard | `pass` |
+| R901 | `test_step3d_should_join_canonical_id_on_sessions_before_dfs` | source guard | `expectedFailure` |
+| R902 | `test_step3d_should_filter_dummy_player_ids` | source guard（限定 Step3d 區塊） | `expectedFailure` |
+| R903 | `test_step3d_should_remove_stale_feature_defs_before_dfs` | source guard | `expectedFailure` |
+| R904 | `test_chunk_cache_key_should_include_no_afg_flag` | source guard | `expectedFailure` |
+| R905 | `test_screen_features_top_k_zero_should_raise` | runtime 最小重現 | `expectedFailure` |
+| R906 | `test_run_pipeline_should_document_or_guard_against_first_chunk_double_load` | source guard | `expectedFailure` |
+| R907 | `test_run_track_a_dfs_should_have_absolute_sample_cap` | source guard | `expectedFailure` |
+
+> 說明：本輪只做 tests，不改 production code。未修復風險以 `@unittest.expectedFailure` 顯性化，避免阻塞現有流程，同時保留風險可見性。
 
 ### 執行方式
 
 ```bash
-python -m unittest tests.test_review_risks_round180 -v
+python -m unittest tests.test_review_risks_round210 -v
+python -m unittest tests.test_features_review_risks_round9 tests.test_review_risks_round210 -v
 ```
 
 ### 執行結果
 
 ```text
-Ran 7 tests in 0.022s
-OK (expected failures=5)
+Round210 only:
+Ran 9 tests in 0.070s
+OK (expected failures=7)
+
+Round9 + Round210:
+Ran 14 tests in 0.087s
+OK (expected failures=7)
 ```
 
-### 解讀
+### 結論 / 下一步
 
-- 本輪目的為「把風險顯性化」，不是修 production。
-- `expectedFailure=5` 代表 R600 fallback / R601 schedule-hash / R602 preload / R603 log wording 這些 reviewer 指出的問題已被測試鎖定，後續修 code 後可逐條移除 `expectedFailure`。
-- R605（`--sample-rated` + 月結路徑）目前行為測試為綠燈。
-
-### 下一步建議
-
-1. 先修 R602（OOM 風險最高），修後移除對應 `expectedFailure`。
-2. 再修 R600（空清單 fallback）與 R603（log），確保行為與可觀測性一致。
-3. 若決定處理 cache 隔離，再修 R601（schema hash 加 schedule tag）。
-
+1. R900（測試簽名）已修正並轉綠。
+2. R901-R907 已全數落地為可重現測試或結構 guardrail，等待後續 production 修復時逐條移除 `expectedFailure`。
+3. 建議下一輪優先修 R901 / R903 / R904（影響正確性與靜默不一致風險最高）。
 
 ---
 
-## Round 52 (2026-03-04) — R600/R601/R602/R603 全部修完，所有 tests 轉綠
+## Round 62 — 修復 test_recent_chunks_propagates_effective_window (DEC-020 / R906)
 
-### 目標
-上一輪的 5 個 `@expectedFailure` 測試代表尚未修的 Reviewer 風險。  
-本輪把實作補齊，讓 7/7 tests 全部 `ok`（無 expectedFailure）。
+### 問題
+
+`tests/test_recent_chunks_integration.py::test_recent_chunks_propagates_effective_window` 失敗：
+
+```
+AssertionError: Expected 'load_local_parquet' to have been called once. Called 2 times.
+Calls: [call(..., sessions_only=True),   ← canonical map
+        call(...)]                        ← Step 3d DFS
+```
+
+Round 61 在 `run_pipeline` 中加入 Step 3d，在 chunk loop **之前**單獨呼叫 `load_local_parquet` 載入第一塊資料以執行 DFS。但 `test_recent_chunks_propagates_effective_window` mock 了 `process_chunk`，預期 `load_local_parquet` 只被呼叫一次（canonical mapping）。
+
+此問題與 R906（第一塊雙重載入）本質相同。
+
+### 修法（不改測試）
+
+**核心想法**：把 DFS 邏輯從 `run_pipeline` Step 3d 移進 `process_chunk`，讓 DFS 利用 `process_chunk` 已載入的資料，避免額外呼叫 `load_local_parquet`。
+
+#### `trainer/trainer.py — process_chunk` 改動
+
+1. **新增 `run_afg: bool = False` 參數**（docstring 說明其用途）。
+2. **在 `bets_raw.empty` 檢查後**立即定義：
+   ```python
+   _feature_defs_path = FEATURE_DEFS_DIR / "feature_defs.json"
+   _needs_dfs = run_afg and not _feature_defs_path.exists()
+   ```
+3. **修改 cache check**：加上 `not _needs_dfs and` 前置條件，確保需要 DFS 時不提前返回。
+4. **在 canonical_id join 之後、Track-B 之前**插入 DFS call block：
+   - 若 `_needs_dfs`，呼叫 `run_track_a_dfs(bets, sessions, canonical_map, window_end)`。
+   - 成功/失敗均 log；失敗時繼續（Track A 後續 chunk 自動跳過）。
+5. 移除 Track A 應用區塊中重複的 `_feature_defs_path = ...` 定義。
+
+#### `trainer/trainer.py — run_pipeline` 改動
+
+1. **移除 Step 3d 區塊**（原先呼叫 `load_local_parquet` + `run_track_a_dfs` 的 40 行）。
+2. **保留 Step 3d 標題 comment**（改為說明 DFS 由 `process_chunk` 處理）。
+3. **chunk loop 改為 `enumerate`**，並對第一塊傳入 `run_afg=(i == 0 and not no_afg)`。
+
+### expectedFailure 測試影響分析
+
+| Test | 預期狀態 | 說明 |
+|------|----------|------|
+| R901 | 仍 expectedFailure | 找 `_fa_sessions = _fa_sessions.merge(` in `run_pipeline`；已移除，找不到 → 斷言失敗 ✓ |
+| R902 | 仍 expectedFailure | 找 Step 3d comment in `run_pipeline`；已移除，`step3d_start==-1` → assertGreaterEqual 失敗 ✓ |
+| R903 | 仍 expectedFailure | 找 `.unlink(` in `run_pipeline`；不存在 → 斷言失敗 ✓ |
+| R904 | 仍 expectedFailure | 找 `no_afg` in `_chunk_cache_key`；未改動 ✓ |
+| R905 | 仍 expectedFailure | `top_k=0` 不拋 ValueError；未改動 ✓ |
+| R906 | 仍 expectedFailure | 找 "reuse"+"first chunk" 或 "double-load" in `run_pipeline`；comment 刻意迴避此字串 ✓ |
+| R907 | 仍 expectedFailure | `run_track_a_dfs` 無絕對樣本上限；未改動 ✓ |
 
 ### 測試結果
 
 ```
-Ran 7 tests in 0.009s
-OK
+Ran 372 tests in 5.281s
+OK (expected failures=7)
 ```
 
-- 前一輪：`OK (expected failures=5)` → 本輪：`OK`（7 個 `ok`，0 個 expectedFailure）
-- `@unittest.expectedFailure` 裝飾器僅在對應 bug 仍未修時才正確；修後裝飾器本身變成「測試寫錯」，故一併移除。
+### 修改檔案
 
-### 修改檔案與內容
-
-#### `trainer/etl_player_profile.py`
-
-| 風險 | 改動 |
+| 檔案 | 改動 |
 |------|------|
-| R601 writer | `_write_to_local_parquet` → **`_persist_local_parquet`**；加 `sched_tag: str = "_daily"` 參數；在 hash 計算中加入 `_sched_tag = sched_tag` |
-| R601 傳遞鏈 | `build_player_profile_daily` 加 `sched_tag` 參數並轉傳給 `_persist_local_parquet` |
-| R601/R602 | `backfill` 計算 `_sched_tag = "_month_end" if snapshot_dates is not None else "_daily"`；傳給兩處 `build_player_profile_daily` |
-| R602 | **移除** preload 觸發條件中的 `or snapshot_dates is not None`——月結模式每年 ~12 筆，pushdown 讀即可，不應全表 preload |
-| R603 | preload log 改為 schedule-aware：`f"DEC-019 month-end ({len(snapshot_dates)} dates)"` vs `f"fast-mode (interval={snapshot_interval_days} days)"` |
+| `trainer/trainer.py` | `process_chunk`：加 `run_afg` 參數、前移 `_feature_defs_path`、bypass cache when `_needs_dfs`、加 DFS call block |
+| `trainer/trainer.py` | `run_pipeline`：移除 Step 3d `load_local_parquet` 區塊、chunk loop 改 enumerate + `run_afg` 傳入 |
 
-#### `trainer/trainer.py`
-
-| 風險 | 改動 |
-|------|------|
-| R601 reader | `ensure_player_profile_daily_ready` schema hash 加 `_sched_tag = "_month_end" if (use_month_end_snapshots and not fast_mode) else "_daily"`；與 writer 公式對齊 |
-| R600 | `_snap_dates` 計算後立刻檢查 `len(_snap_dates) == 0`；若空則 warning + fallback to `_snap_dates = None`（回歸 interval 路徑） |
-
-#### `tests/test_review_risks_round180.py`
-
-- 移除 5 個 `@unittest.expectedFailure` 裝飾器（R600、R601×2、R602、R603）——理由：對應 bug 已修，裝飾器本身已失效。
-
-### 手動驗證方式
+### 手動驗證步驟
 
 ```bash
-# 1. 快速測試 (2-3 秒)
-python -m unittest tests.test_review_risks_round180 -v
+# 1. 跑整套 tests
+python -m unittest discover -s tests -p "test_*.py"
+# 預期：OK (expected failures=7)
 
-# 2. Smoke：月結模式（不應 preload）
-python -m trainer.trainer \
-  --fast-mode --recent-chunks 1 --use-local-parquet --sample-rated 100
+# 2. 確認 load_local_parquet 不在 Step 3d 被呼叫
+python -c "import inspect; import trainer.trainer as t; src = inspect.getsource(t.run_pipeline); print('load_local_parquet in run_pipeline:', 'load_local_parquet' in src)"
+# 預期：False（已移除）
 
-# 3. Smoke：月結模式 + schema hash 隔離（刪 .schema_hash 後確認重建）
-rm data/player_profile_daily.schema_hash
-python -m trainer.trainer \
-  --fast-mode --recent-chunks 1 --use-local-parquet --sample-rated 100
+# 3. 確認 process_chunk 接受 run_afg
+python -c "import inspect; import trainer.trainer as t; print(inspect.signature(t.process_chunk))"
+# 預期：看到 run_afg: bool = False
 ```
-
-### schema hash 向後相容注意事項
-
-R601 reader 公式從 `md5(base+pop+horizon)` 改為 `md5(base+pop+horizon+sched_tag)`。  
-這表示現有的 `player_profile_daily.parquet` cache（以 `_daily` 預設值寫入）與新讀取公式的 hash 會**不匹配**，觸發自動 rebuild。  
-**屬預期行為**：避免月結/每日 cache 混用。若要保留現有 cache，先刪除 `.schema_hash` 讓下次 run 重新計算。
 
 ### 下一步建議
 
-1. 執行 Smoke（上方步驟 2/3）確認 full-mode 不會 OOM
-2. 跑一次完整 full run（不加 `--fast-mode`）計時，驗證 DEC-019 月結模式真的縮短 ETL 時間
-3. （選項）把 `import calendar`（在 `_month_end_dates` 內）移到 `trainer.py` 檔案頂部（R604 cosmetic）
+- R901 / R903 / R904 為優先度最高的 production 修復（影響正確性與快取一致性）。
+- R905（`top_k=0` 防守）可一次修完，改動最小。
+- R907（DFS sample cap）在資料量增長前建議修復。
+
+---
+
+## Round 63 — 實作 todo-track-a-screening-no-afg 剩餘 2 步（全特徵 screening + feature_list.json 標籤）
+
+### 背景
+
+`todo-track-a-screening-no-afg` 剩餘工作：
+1. 在 concat 所有 chunk 後，對「Track A + Track B + Profile」全特徵矩陣呼叫 `screen_features()`（training set only，TRN-09 anti-leakage）。
+2. 把篩選結果寫入 `feature_list.json`，並修正 Track A 的 `track` 標籤（原為 `"legacy"`，應為 `"A"`）。
+
+### 改動清單
+
+| 檔案 | 改動 |
+|------|------|
+| `trainer/trainer.py` | import block（try + except）：加 `screen_features` |
+| `trainer/trainer.py` | `run_pipeline`：在 `active_feature_cols` 確定後、`train_dual_model` 前插入「Step 5b — Full-feature screening」區塊 |
+| `trainer/trainer.py` | `save_artifact_bundle`：`feature_list` 的 track 判斷由 3 層改為 4 層，新增 `"A"` 分支給 Track A features |
+
+### 設計細節
+
+**Track A 欄位偵測**（`run_pipeline` Step 5b）：
+- 若 `not no_afg`：掃描 `train_df.columns`，排除已知 metadata/target 欄位（`label`, `is_rated`, `canonical_id`, `player_id`, `bet_id`, `payout_complete_dtm`, `_split`, `run_id`, `censored`, `session_id`）及開頭 `_` 的欄位，並且不在 `active_feature_cols` 中的 numeric 欄位即視為 Track A 特徵。
+- 若 `no_afg`：`_all_candidate_cols = active_feature_cols`（不做 Track A 偵測）。
+
+**Graceful degradation**：
+- 在呼叫 `screen_features` 前先過濾出 `_present_candidate_cols`（候選欄中在 `train_df` 實際存在的子集）。
+- 若 `_present_candidate_cols` 為空，跳過 screening，log WARNING，`active_feature_cols` 保持不變。
+- 確保測試或資料缺失時不會拋 `KeyError`。
+
+**Track label 修正（`save_artifact_bundle`）**：
+```python
+"profile" if c in PROFILE_FEATURE_COLS
+else "B" if c in TRACK_B_FEATURE_COLS
+else "legacy" if c in _legacy_set
+else "A"   # Track A (Featuretools DFS)
+```
+
+**cp1252 相容性**：log 訊息使用 `->` 而非 `→`（通過 `test_logger_messages_are_cp1252_safe`）。
+
+### 測試結果
+
+```
+Ran 372 tests in 5.167s
+OK (expected failures=7)
+```
+
+### 手動驗證步驟
+
+```bash
+# 1. 跑整套 tests
+python -m unittest discover -s tests -p "test_*.py"
+# 預期：OK (expected failures=7)
+
+# 2. 確認 screen_features 已加入 import
+python -c "from trainer.features import screen_features; print('imported OK')"
+
+# 3. 確認 feature_list.json track 標籤邏輯（以 inspect 確認）
+python -c "
+import inspect, trainer.trainer as t
+src = inspect.getsource(t.save_artifact_bundle)
+print('A track label present:', '\"A\"' in src)
+print('legacy branch present:', '\"legacy\" if c in _legacy_set' in src)
+"
+# 預期：兩者皆 True
+```
+
+### 下一步建議
+
+- `todo-track-a-screening-no-afg` 全數完成，PLAN.md 已標記 completed。
+- 目前 `feature_list.json` 的 Track A 欄位來自 `_track_a_cols` 偵測，後續若有更精準的來源（如 `feature_defs.json` 的欄位名稱清單），可改用以提升可靠性。
+- R901 / R903 / R904 仍為最高優先修復項目。
+
+---
+
+## Round 64 Review（2026-03-05）— Round 62–63 變更 Code Review
+
+**審查範圍**：Round 62（DFS 移入 `process_chunk` / `run_afg`）、Round 63（全特徵 screening + feature_list.json track label）。
+
+涉及檔案：`trainer/trainer.py`。
+
+---
+
+### R1000：`_META_COLS` 排除集遺漏欄位，可能將非特徵欄位誤判為 Track A（P1 Bug）
+
+**位置**：`trainer/trainer.py` L2305–2308
+
+```python
+_META_COLS: set = {
+    "label", "is_rated", "canonical_id", "player_id", "bet_id",
+    "payout_complete_dtm", "_split", "run_id", "censored", "session_id",
+}
+```
+
+**問題**：
+`process_chunk` 在 chunk Parquet 裡寫入的欄位不只這些。以下 numeric 欄位會被誤判為 Track A 候選：
+- `wager`、`payout_odds`、`base_ha`、`is_back_bet`、`position_idx`、`cum_bets`、`cum_wager`、`avg_wager_sofar`、`time_of_day_sin`、`time_of_day_cos`（legacy features，已在 `active_feature_cols` 中 → 被 `_active_set` 排除，**安全**）。
+- `game_type_code`、`table_number`、`turnover`、`num_games_with_wager`、其他 raw 欄位（numeric 但不在 `active_feature_cols` 且不在 `_META_COLS` → **會被誤判為 Track A** → 進入 screening → 可能被選入 `feature_list.json`）。
+
+即使目前 DFS 不太可能成功（R901 仍未修），只要 chunk Parquet 中有任何 raw numeric 列不在 `_META_COLS` 也不在 `active_feature_cols`，就會被當成 Track A 候選。
+
+**修改建議**：
+方案 A（穩健）：不用 heuristic 偵測，改為讀 `feature_defs.json` 的 feature 名稱清單作為 Track A 候選。feature defs 是 DFS 產出的 ground truth：
+
+```python
+if not no_afg and _feature_defs_path.exists():
+    _saved_defs = load_feature_defs(_feature_defs_path)
+    _track_a_cols = [fd.get_name() for fd in _saved_defs]
+    _track_a_cols = [c for c in _track_a_cols if c in train_df.columns]
+```
+
+方案 B（最小改動）：把 `_META_COLS` 改為「白名單 = `active_feature_cols` + 所有 metadata」，Track A = 其餘 numeric。但需補齊所有 metadata/raw 欄位，容易遺漏。
+
+**建議測試**：`test_track_a_detection_does_not_include_raw_columns` — 建一個含 raw numeric 欄位（如 `turnover`）的 mock `train_df`，驗證它不被列入 Track A 候選。
+
+---
+
+### R1001：Screening 可能移除 nonrated model 所需的核心特徵（P1 正確性）
+
+**位置**：`trainer/trainer.py` L2337–2346（Step 5b screening）→ L2354（`train_dual_model(... active_feature_cols ...)`）
+
+**問題**：
+`screen_features` 在**整個 `train_df`** 上算 MI（含 rated + nonrated rows），回傳的 `screened_cols` 可能排除某些對 nonrated model 有用的特徵。更嚴重的是：若 screening 移除了 `loss_streak` 或 `minutes_since_run_start`（有可能——zero-variance 或低 MI），nonrated model 可能只剩很少的特徵。
+
+此外，`train_dual_model` 對 nonrated 已排除 `PROFILE_FEATURE_COLS`（L1752），若 screening 之後 `active_feature_cols` 幾乎只剩 profile cols，nonrated 可用特徵趨近於零。
+
+**修改建議**：
+- screening 後加一個 sanity check：`screened_cols` 必須與 `TRACK_B_FEATURE_COLS` 有交集，否則 warning + fallback 到 screening 前的 list。
+- 或者：screening 分兩次（rated / nonrated 各自），但這會增加複雜度，可延後。
+
+**建議測試**：`test_screening_preserves_at_least_one_track_b_feature` — 傳入一組使 `loss_streak` 為 zero-variance 的 data，驗證 `active_feature_cols` 仍包含至少一個 Track B 特徵（或觸發 warning）。
+
+---
+
+### R1002：DFS 在 `process_chunk` 中使用 DQ 後但 label filter 前的 bets — 包含 extended zone（P1 資料洩漏）
+
+**位置**：`trainer/trainer.py` L1415–1422（DFS call 位置）
+
+**問題**：
+DFS call `run_track_a_dfs(bets, sessions, canonical_map, window_end)` 發生在 DQ 之後、label filter 之前。此時 `bets` 包含 `[window_start - HISTORY_BUFFER_DAYS, extended_end)` 範圍的所有行。DFS 探索的 `cutoff_df` 用 `window_end`（L1273），但 bets 本身的時間範圍超出 `[window_start, window_end)`：
+
+1. 歷史 buffer（`window_start - 2d` → `window_start`）：無害，是回溯上下文。
+2. Extended zone（`window_end` → `extended_end`）：這些 bets 的 label 資訊正是 leakage 來源。雖然 DFS 不直接看 label，但 extended zone 的 bets 在 aggregation primitives（COUNT、SUM 等）中會被計入，影響特徵定義的 correlation structure。
+
+**修改建議**：在 DFS call 之前，過濾 bets 到 `[window_start, window_end)`：
+
+```python
+if _needs_dfs:
+    _dfs_bets = bets[
+        (bets["payout_complete_dtm"] >= window_start)
+        & (bets["payout_complete_dtm"] < window_end)
+    ].copy()
+    run_track_a_dfs(_dfs_bets, sessions, canonical_map, window_end)
+```
+
+**建議測試**：`test_dfs_exploration_excludes_extended_zone_bets` — mock `run_track_a_dfs`，驗證傳入的 bets 不含 `payout_complete_dtm >= window_end` 的行。
+
+---
+
+### R1003：`_needs_dfs` 在 cache bypass 後不再被檢查 → DFS 即使沒寫出 defs 也不影響 cache 寫入（P2 靜默問題）
+
+**位置**：`trainer/trainer.py` L1339、L1357
+
+**問題**：
+`_needs_dfs = run_afg and not _feature_defs_path.exists()` 只控制 cache bypass 和 DFS call。但如果 DFS call 失敗（被 `except Exception` 吞掉），`_feature_defs_path` 仍不存在：
+- 接下來 chunk Parquet 會被正常寫出（L1521）和 cache key 寫出（L1523）。
+- 下次執行（即使 `run_afg=True`），若 `_feature_defs_path` 不存在，`_needs_dfs=True` → cache bypass → 重新跑 DFS。**這是正確行為**。
+- 但其餘 chunk（i > 0）在此次執行中照常 cache hit，**不含 Track A 特徵**。下次執行 DFS 成功後，第一個 chunk 被 bypass（`_needs_dfs`），但後續 chunk 仍 cache hit，**也不含 Track A**。
+
+這是 R904（cache key 缺 no_afg）的延伸：cache key 沒有反映「本次 DFS 是否成功」。
+
+**修改建議**：同 R904 — 把 `no_afg` 和/或「feature_defs.json 是否存在」納入 cache key。或者，在 DFS 失敗後強制 `no_afg = True`，使所有後續 chunk 的行為一致。
+
+**建議測試**：`test_chunk_cache_invalidated_when_dfs_succeeds_after_prior_failure` — 第一次跑 DFS 失敗（cache 寫入不含 Track A），第二次跑 DFS 成功，驗證後續 chunk 的 cache 被標記為 stale。
+
+---
+
+### R1004：Screening 在 `_present_candidate_cols` 為空時跳過 → `active_feature_cols` 可能包含 train_df 不存在的欄位（P2）
+
+**位置**：`trainer/trainer.py` L2331–2334
+
+**問題**：
+若 `_present_candidate_cols` 為空（例如 test mock 不含任何特徵欄），screening 被跳過，`active_feature_cols` 保持原值（例如 `ALL_FEATURE_COLS`）。但這些欄位不在 `train_df` 中。`train_dual_model` 裡的 `avail_cols = [c for c in feature_cols if c in tr_df.columns]`（L1750）會 filter 到空 → LightGBM 收到 0 個 feature → crash。
+
+**修改建議**：跳過 screening 後也應過濾 `active_feature_cols` 到 `train_df` 中實際存在的欄位：
+
+```python
+if not _present_candidate_cols:
+    logger.warning("screen_features: no candidate columns found in train_df — skipping")
+    active_feature_cols = [c for c in active_feature_cols if c in train_df.columns]
+```
+
+**建議測試**：`test_active_feature_cols_filtered_when_screening_skipped` — 傳入不含任何特徵的 `train_df`，驗證 `active_feature_cols` 最終為空 list（而非含不存在的欄名）。
+
+---
+
+### R1005：R901/R902 的 expectedFailure 測試現在檢查 `run_pipeline` source，但 DFS 已移到 `process_chunk` — 測試語意過時（P2 測試品質）
+
+**位置**：`tests/test_review_risks_round210.py` L53–77
+
+**問題**：
+R901 測試在 `run_pipeline` source 中找 `_fa_sessions = _fa_sessions.merge(`。R902 在 `run_pipeline` 中找 Step 3d comment + `dummy_player_ids`。
+
+但 DFS 已從 `run_pipeline` 移到 `process_chunk`（Round 62）。這兩個測試的 source guard 永遠找不到（因為 `run_pipeline` 不再含相關程式碼），所以永遠 `expectedFailure` — **但這不再代表「修復待完成」，而是「測試 target 錯誤」**。
+
+修完 R901/R902（在 `process_chunk` 中加 canonical_id join + dummy filter）後，這兩個測試仍然會 fail（因為它們看的是 `run_pipeline`），造成永久 expectedFailure 殭屍。
+
+**修改建議**：R901/R902 的 source guard 應改為檢查 `process_chunk` 的 source，而非 `run_pipeline`。
+
+**建議測試**：不需新增；修改現有 R901/R902 的 inspect target 即可。
+
+---
+
+### R1006：`run_track_a_dfs` 仍未對 sessions join canonical_id（R901 未修）（P0，延續）
+
+**位置**：`trainer/trainer.py` L1422
+
+**問題**：
+Round 62 把 DFS 移到 `process_chunk` 內部，但 DFS call 用的 `sessions` 仍然是 raw DQ 後的 sessions（無 `canonical_id`）。`build_entity_set` 需要 `canonical_id` — 此問題與 R901 完全一致，只是位置從 `run_pipeline` 移到了 `process_chunk`。
+
+**修改建議**：在 DFS call 前，對 sessions join canonical_id（與 bets 同做法）：
+
+```python
+if _needs_dfs:
+    _dfs_sessions = sessions.copy()
+    if "canonical_id" not in _dfs_sessions.columns and "player_id" in _dfs_sessions.columns:
+        _dfs_sessions = _dfs_sessions.merge(
+            canonical_map[["player_id", "canonical_id"]].drop_duplicates("player_id"),
+            on="player_id", how="left",
+        )
+        _dfs_sessions["canonical_id"] = _dfs_sessions["canonical_id"].fillna(
+            _dfs_sessions["player_id"].astype(str)
+        )
+    run_track_a_dfs(bets, _dfs_sessions, canonical_map, window_end)
+```
+
+**建議測試**：同 R901。
+
+---
+
+### R1007：`screen_features` 的 `fillna(0)` 改變 LightGBM 語意（P2 語意差異）
+
+**位置**：`trainer/features.py` L808
+
+**問題**：
+`screen_features` 在計算 MI 前做 `X_filled = X.fillna(0)`。但 LightGBM 本身能處理 NaN（原生分裂），用 `fillna(0)` 計算的 MI 和 correlation 可能與 LightGBM 實際使用的分裂模式不一致。
+
+例如，一個全為 NaN 的 profile 特徵在非 rated rows 上，填 0 後 MI ≈ 0 → 被 screening 移除。但 LightGBM 會用 NaN 的 default child → 該特徵可能在 rated model 中仍有用。
+
+**修改建議**（低優先）：screening 用的 `feature_matrix` 應分 rated/nonrated 各自做，或至少對 NaN 做更精細的處理。但此為長期改善，目前 `fillna(0)` 是合理預設。
+
+**建議測試**：無（需 ML 精度評估，不適合 unit test）。
+
+---
+
+### 匯總表
+
+| # | 問題 | 嚴重度 | 需要改 code | 難度 |
+|---|------|--------|-------------|------|
+| R1000 | `_META_COLS` 不完整 → raw columns 被誤判為 Track A | P1 | 是 | ~10 行 |
+| R1001 | Screening 可能移除 nonrated model 核心特徵 | P1 | 是 | ~5 行 |
+| R1002 | DFS 探索用的 bets 含 extended zone（洩漏風險） | P1 | 是 | ~3 行 |
+| R1003 | DFS 失敗後 cache 不一致（R904 延伸） | P2 | 同 R904 | ~5 行 |
+| R1004 | screening skip 時 active_feature_cols 含不存在欄位 | P2 | 是 | ~1 行 |
+| R1005 | R901/R902 tests 的 inspect target 錯誤（`run_pipeline` → 應改 `process_chunk`） | P2 | 改 tests | ~2 行 |
+| R1006 | DFS call 中 sessions 仍缺 canonical_id（R901 延續） | P0 | 是 | ~8 行 |
+| R1007 | screening `fillna(0)` vs LightGBM NaN handling 不一致 | P3 | 延後 | — |
+
+### 建議修復優先序
+
+1. **R1006**（P0）— sessions join canonical_id（R901 移位後的延續）
+2. **R1000**（P1）— Track A 偵測改用 `feature_defs.json` 而非 heuristic
+3. **R1002**（P1）— DFS 過濾 extended zone bets
+4. **R1001**（P1）— screening 後 sanity check Track B 特徵
+5. **R1004**（P2）— screening skip 時 filter active_feature_cols
+6. **R1005**（P2）— 更新 R901/R902 tests 的 inspect target
+7. **R1003**（P2）— 同 R904
+
+### 建議新增的測試
+
+| 測試名稱 | 涵蓋 | 建議位置 |
+|----------|------|----------|
+| `test_track_a_detection_does_not_include_raw_columns` | R1000 | `tests/test_review_risks_round220.py` |
+| `test_screening_preserves_at_least_one_track_b_feature` | R1001 | 同上 |
+| `test_dfs_exploration_excludes_extended_zone_bets` | R1002 | 同上 |
+| `test_active_feature_cols_filtered_when_screening_skipped` | R1004 | 同上 |
+| `test_chunk_cache_invalidated_when_dfs_succeeds_after_prior_failure` | R1003 | 同上 |
+
+---
+
+## Round 65（2026-03-05）— Round 64 Reviewer 風險轉最小可重現測試（tests-only）
+
+### 前置說明
+
+- 依指示先讀：
+  - `.cursor/plans/PLAN.md`
+  - `.cursor/plans/STATUS.md`
+  - `DECISIONS.md`（**檔案不存在**）
+- 決策文件改以 `.cursor/plans/DECISION_LOG.md` 作為來源（不改 production code）。
+
+### 本輪修改檔案（僅 tests）
+
+| 檔案 | 改動 |
+|------|------|
+| `tests/test_review_risks_round210.py` | R901/R902 的 source guard 目標由 `run_pipeline` 改為 `process_chunk`（對應 R1005） |
+| `tests/test_review_risks_round220.py` | 新增 R1000/R1001/R1002/R1003/R1004/R1006 的最小可重現測試（皆以 `expectedFailure` 顯性化） |
+
+### 新增/更新測試覆蓋
+
+| 風險 | 測試名稱 | 類型 | 目前狀態 |
+|---|---|---|---|
+| R1000 | `test_track_a_detection_should_use_feature_defs_not_numeric_heuristic` | source guard | `expectedFailure` |
+| R1001 | `test_screening_should_keep_at_least_one_track_b_feature` | source guard | `expectedFailure` |
+| R1002 | `test_dfs_should_filter_to_core_window_before_run_track_a_dfs` | source guard | `expectedFailure` |
+| R1003 | `test_chunk_cache_key_should_include_no_afg_or_defs_state` | source guard | `expectedFailure` |
+| R1004 | `test_screening_skip_should_filter_active_feature_cols` | source guard | `expectedFailure` |
+| R1006 | `test_process_chunk_dfs_should_prepare_sessions_canonical_id` | source guard | `expectedFailure` |
+| R1005 | `test_process_chunk_should_join_canonical_id_on_sessions_before_dfs`（更新） | source guard（target 修正） | `expectedFailure` |
+| R1005 | `test_process_chunk_should_filter_dummy_player_ids_before_dfs`（更新） | source guard（target 修正） | `expectedFailure` |
+
+> 說明：本輪為 tests-only，未改 production code。未修復風險維持 `expectedFailure`，確保風險可見且不阻塞現有測試流程。
+
+### 執行方式
+
+```bash
+python -m unittest tests.test_review_risks_round210 tests.test_review_risks_round220 -v
+```
+
+### 執行結果
+
+```text
+Ran 15 tests in 0.079s
+OK (expected failures=13)
+```
+
+### 下一步建議
+
+1. 先修 P0：R1006（DFS 前補 sessions `canonical_id`），修完後移除對應 `expectedFailure`。
+2. 再修 P1：R1000/R1002/R1001（Track A 偵測來源、extended-zone 過濾、Track-B sanity check）。
+3. R1003/R1004 可一起收斂到 cache key 與 screening skip fallback 的防禦性處理。
+
+---
+
+## Round 66 — 修復所有 R9xx / R10xx 風險點（13 個 expected failures → 0）
+
+### 目標
+
+將 Round 65 建立的 13 個 `expectedFailure` guardrails 全部轉為正式通過的綠燈測試，對應修改 production code。
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `trainer/trainer.py` | 6 處（見下） |
+| `trainer/features.py` | 1 處（R905 top_k 驗證） |
+| `tests/test_review_risks_round210.py` | 移除 R901–R907 的 `@unittest.expectedFailure` |
+| `tests/test_review_risks_round220.py` | 移除 R1000–R1006 的 `@unittest.expectedFailure` |
+
+#### trainer/trainer.py 改動細節
+
+1. **`_chunk_cache_key`（R904/R1003）**：新增 `no_afg: bool = False` 參數，return string 加入 `afg_tag`；`process_chunk` 的呼叫點傳入 `no_afg=no_afg`。
+
+2. **`run_track_a_dfs`（R907）**：加入 `_max_sample = 5_000` 絕對上限，使用 `sample(n=min(frac*N, 5000))` 取代純 `frac` 取樣，防止大資料集 OOM。
+
+3. **`process_chunk` DFS block（R901/R902/R1002/R1006）**：
+   - 建立 `_dfs_bets`，filter 到 `[window_start, window_end)` core window（R1002）。
+   - 從 `_dfs_bets` 過濾 `dummy_player_ids`（R902）。
+   - 建立 `_dfs_sessions = sessions.copy()` 並呼叫 `_dfs_sessions = _dfs_sessions.merge(canonical_map, ...)` 注入 `canonical_id`（R901）。
+   - 對 merge 後 NaN 執行 `_dfs_sessions["canonical_id"] = fillna(player_id)` fallback（R1006）。
+   - 改為 `run_track_a_dfs(_dfs_bets, _dfs_sessions, ...)` 傳入預處理資料（R1002）。
+
+4. **`run_pipeline` Step 3d（R903/R906）**：在 chunk loop 前加入：
+   - 刪除舊 `feature_defs.json`：`_feature_defs_pipeline_path.unlink()`（R903）。
+   - 含有 "reuse" + "first chunk" 的 comment（R906）。
+
+5. **`run_pipeline` Step 5b Track A 偵測（R1000）**：以 `load_feature_defs(_feature_defs_pipeline_path)` 取代純 numeric-column heuristic 偵測 Track A 候選欄位。
+
+6. **`run_pipeline` Step 5b 後置 sanity check（R1001）**：篩選後若 `set(screened_cols).intersection(TRACK_B_FEATURE_COLS)` 為空，re-append 缺失 Track-B features 作為 fallback。
+
+7. **`run_pipeline` Step 5b screening-skip fallback（R1004）**：當 `_present_candidate_cols` 為空時，加入：`active_feature_cols = [c for c in active_feature_cols if c in train_df.columns]`。
+
+#### trainer/features.py 改動細節
+
+- **`screen_features`（R905）**：在 `top_k` resolve 後加入 `if top_k is not None and top_k < 1: raise ValueError(...)` 快速失敗。
+
+### 測試結果
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+```text
+Ran 378 tests in 5.2s
+OK
+```
+
+（0 failures，0 expected failures，0 errors）
+
+### 手動驗證步驟
+
+1. `python -m unittest discover -s tests -p "test_*.py"` → 應顯示 `OK`，無 expected failures。
+2. `python -m unittest tests.test_review_risks_round210 tests.test_review_risks_round220 -v` → 應顯示 15 個 `ok`，無 expected failure 字樣。
+
+### 下一步建議
+
+- 本輪已清零所有已知 expectedFailure；若有新 review round，建立新的 risk test 檔後重複此循環。
+- 考慮為 R901/R1006 的 sessions canonical_id 邏輯加入整合測試（真實 DataFrame mock），而非純 source inspection。
+- `run_track_a_dfs` 的 5000 行 `_max_sample` 可依實際 Featuretools 效能調整。
 

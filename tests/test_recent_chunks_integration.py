@@ -52,8 +52,10 @@ class TestRecentChunksIntegration(unittest.TestCase):
         # We will request only the recent 2 chunks.
         # So effective_start should be chunk index -2 start
         # effective_end should be chunk index -1 end
-        expected_effective_start = fake_chunks[-2]["window_start"]
-        expected_effective_end = fake_chunks[-1]["window_end"]
+        # DEC-018: run_pipeline strips tz from effective_start/end before passing
+        # them to downstream helpers.  Use tz-naive expected values for comparisons.
+        expected_effective_start = fake_chunks[-2]["window_start"].replace(tzinfo=None)
+        expected_effective_end   = fake_chunks[-1]["window_end"].replace(tzinfo=None)
 
         # Setup mock returns to let pipeline flow through
         mock_load_local.return_value = (pd.DataFrame(), pd.DataFrame())
@@ -109,8 +111,9 @@ class TestRecentChunksIntegration(unittest.TestCase):
             snapshot_interval_days=1,
             preload_sessions=True,
             canonical_map=ANY,
-            fast_mode=False,       # DEC-017: non-fast-mode default
-            max_lookback_days=365, # DEC-017: full horizon in normal mode
+            fast_mode=False,               # DEC-017: non-fast-mode default
+            max_lookback_days=365,         # DEC-017: full horizon in normal mode
+            use_month_end_snapshots=True,  # DEC-019: default when flag not passed
         )
         ensure_kwargs = mock_ensure_profile.call_args.kwargs
         passed_cmap = ensure_kwargs.get("canonical_map")

@@ -10,7 +10,8 @@ Pipeline (SSOT §4.3 / §9)
    - Labels use C1 extended pull; bets in (window_end, extended_end] are
      used only for label computation, NOT added to training rows.
 3. Write each processed chunk to .data/chunks/ as Parquet.
-4. Concatenate all chunks; split train / valid / test at chunk granularity.
+4. Concatenate all chunks; split train / valid / test at ROW level (time-ordered
+   70/15/15 — SSOT §9.2).  Chunks control ETL/cache volume only, not split semantics.
 5. sample_weight = 1 / N_run  (canonical_id × run_id from compute_run_boundary), train set only.
 6. Optuna TPE hyperparameter search on validation set (per model type).
 7. Train Rated + Non-rated LightGBM with class_weight='balanced' + sample_weight.
@@ -90,6 +91,9 @@ try:
     TRAINER_DAYS: int = getattr(_cfg, "TRAINER_DAYS", 30)
     CHUNK_CONCAT_MEMORY_WARN_BYTES: int = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 2 * (1024**3))
     CHUNK_CONCAT_RAM_FACTOR: float = getattr(_cfg, "CHUNK_CONCAT_RAM_FACTOR", 3)
+    TRAIN_SPLIT_FRAC: float = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
+    VALID_SPLIT_FRAC: float = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
+    MIN_VALID_TEST_ROWS: int = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
@@ -110,6 +114,9 @@ except ModuleNotFoundError:
     TRAINER_DAYS = getattr(_cfg, "TRAINER_DAYS", 30)
     CHUNK_CONCAT_MEMORY_WARN_BYTES = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 2 * (1024**3))
     CHUNK_CONCAT_RAM_FACTOR = getattr(_cfg, "CHUNK_CONCAT_RAM_FACTOR", 3)
+    TRAIN_SPLIT_FRAC = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
+    VALID_SPLIT_FRAC = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
+    MIN_VALID_TEST_ROWS = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
 
 # Module-level pipeline imports (same try/except pattern)
 try:
@@ -130,6 +137,7 @@ try:
         load_feature_defs,
         compute_feature_matrix,
         join_player_profile_daily,
+        screen_features,
         PROFILE_FEATURE_COLS,
         get_profile_feature_cols,
     )
@@ -157,6 +165,7 @@ except ModuleNotFoundError:
         load_feature_defs,
         compute_feature_matrix,
         join_player_profile_daily,
+        screen_features,
         PROFILE_FEATURE_COLS,
         get_profile_feature_cols,
     )
@@ -1220,7 +1229,12 @@ def _chunk_parquet_path(chunk: dict) -> Path:
     return CHUNK_DIR / f"chunk_{ws}_{we}.parquet"
 
 
-def _chunk_cache_key(chunk: dict, bets: pd.DataFrame, profile_hash: str = "none") -> str:
+def _chunk_cache_key(
+    chunk: dict,
+    bets: pd.DataFrame,
+    profile_hash: str = "none",
+    no_afg: bool = False,
+) -> str:
     """Hash to detect stale parquet cache (TRN-07).
 
     Includes a config-constants hash (R71) so that changes to
@@ -1229,6 +1243,10 @@ def _chunk_cache_key(chunk: dict, bets: pd.DataFrame, profile_hash: str = "none"
 
     R77: profile_hash encodes the shape/content of player_profile_daily so that
     changes to the snapshot table also invalidate the chunk cache.
+
+    R904/R1003: no_afg is included so that toggling --no-afg produces a distinct
+    cache key, preventing stale Track-A-enabled chunks from being reused when AFG
+    is turned off (or vice versa).
     """
     ws = chunk["window_start"].isoformat()
     we = chunk["window_end"].isoformat()
@@ -1241,7 +1259,8 @@ def _chunk_cache_key(chunk: dict, bets: pd.DataFrame, profile_hash: str = "none"
         "HISTORY_BUFFER_DAYS": HISTORY_BUFFER_DAYS,
     }, sort_keys=True)
     cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:6]
-    return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}"
+    afg_tag = "no_afg" if no_afg else "afg"
+    return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}|{afg_tag}"
 
 
 def run_track_a_dfs(
@@ -1259,7 +1278,10 @@ def run_track_a_dfs(
     compute_feature_matrix and merge Track A features into the labeled DataFrame.
     """
     FEATURE_DEFS_DIR.mkdir(parents=True, exist_ok=True)
-    sample = bets.sample(frac=min(sample_frac, 1.0), random_state=42) if len(bets) > 1 else bets
+    # R907: absolute cap prevents OOM on large datasets regardless of sample_frac.
+    _max_sample = 5_000
+    _n_sample = min(int(len(bets) * sample_frac), _max_sample)
+    sample = bets.sample(n=max(1, _n_sample), random_state=42) if len(bets) > 1 else bets
     cutoff_df = sample[["bet_id"]].copy()
     cutoff_df["cutoff_time"] = window_end
     es = build_entity_set(sample, sessions, canonical_map)
@@ -1279,6 +1301,8 @@ def process_chunk(
     use_local_parquet: bool = False,
     force_recompute: bool = False,
     profile_df: Optional[pd.DataFrame] = None,
+    no_afg: bool = False,
+    run_afg: bool = False,
 ) -> Optional[Path]:
     """Process one monthly chunk; return path to written Parquet or None if empty.
 
@@ -1287,6 +1311,11 @@ def process_chunk(
     dummy_player_ids: FND-12 dummy/fake-account player_ids to drop from training (TRN-04).
     profile_df: player_profile_daily snapshot table for PIT join (PLAN Step 4/DEC-011).
         Pass None to skip; profile feature columns will be 0 for all rows.
+    no_afg: when True, skip Track A feature computation even if feature_defs.json
+        exists on disk (DEC-020 --no-afg / --fast-mode).
+    run_afg: when True (first chunk only), run run_track_a_dfs on this chunk's data
+        if feature_defs.json does not yet exist.  This avoids a separate load in
+        run_pipeline (fixes R906 first-chunk double-load).
     """
     window_start = chunk["window_start"]
     window_end = chunk["window_end"]
@@ -1316,6 +1345,12 @@ def process_chunk(
         logger.warning("Chunk %s–%s: no bets, skipping", window_start.date(), window_end.date())
         return None
 
+    # DFS need check: evaluated once here so both cache bypass and post-DQ DFS use
+    # the same result.  _needs_dfs is True only for the first chunk (run_afg=True)
+    # when feature_defs.json has not yet been produced.
+    _feature_defs_path = FEATURE_DEFS_DIR / "feature_defs.json"
+    _needs_dfs = run_afg and not _feature_defs_path.exists()
+
     # --- TRN-07: cache validity via content hash ---
     # Compute the cache key from chunk metadata + raw bets hash so that DQ rule
     # or config changes (which alter bets_raw content) automatically invalidate
@@ -1330,9 +1365,9 @@ def process_chunk(
         ).hexdigest()[:6]
     else:
         _profile_hash = "none"
-    current_key = _chunk_cache_key(chunk, bets_raw, profile_hash=_profile_hash)
+    current_key = _chunk_cache_key(chunk, bets_raw, profile_hash=_profile_hash, no_afg=no_afg)
     key_path = chunk_path.with_suffix(".cache_key")
-    if not force_recompute and chunk_path.exists():
+    if not _needs_dfs and not force_recompute and chunk_path.exists():
         stored_key = key_path.read_text(encoding="utf-8").strip() if key_path.exists() else ""
         if stored_key == current_key:
             try:
@@ -1386,6 +1421,49 @@ def process_chunk(
     # all anonymous (non-rated) players from training data.
     bets["canonical_id"] = bets["canonical_id"].fillna(bets["player_id"].astype(str))
 
+    # --- Track A: DFS exploration (DEC-020, first-chunk only via run_afg) ---
+    # Runs here so we reuse already-loaded data (avoids R906 first-chunk double-load).
+    # feature_defs.json is written by run_track_a_dfs; subsequent chunks pick it up
+    # in the Track A application block below.
+    if _needs_dfs:
+        _t0_dfs = time.perf_counter()
+        logger.info(
+            "Track A (DEC-020): DFS exploration on first chunk %s–%s ...",
+            window_start.date(), window_end.date(),
+        )
+        try:
+            # R1002: filter to core window only (exclude extended zone) to avoid leakage.
+            _dfs_bets = bets[
+                (bets["bet_dtm"] >= window_start) & (bets["bet_dtm"] < window_end)
+            ].copy() if "bet_dtm" in bets.columns else bets.copy()
+            # R902: exclude FND-12 dummy player_ids from DFS exploration data.
+            if dummy_player_ids and "player_id" in _dfs_bets.columns:
+                _dfs_bets = _dfs_bets[~_dfs_bets["player_id"].isin(dummy_player_ids)].copy()
+            # R901/R1006: build a sessions frame that carries canonical_id for Featuretools.
+            _dfs_sessions = sessions.copy()
+            if not canonical_map.empty and "player_id" in canonical_map.columns:
+                _dfs_sessions = _dfs_sessions.merge(
+                    canonical_map[["player_id", "canonical_id"]].drop_duplicates("player_id"),
+                    on="player_id",
+                    how="left",
+                )
+            else:
+                _dfs_sessions["canonical_id"] = _dfs_sessions["player_id"].astype(str)
+            if "canonical_id" in _dfs_sessions.columns:
+                _dfs_sessions["canonical_id"] = (
+                    _dfs_sessions["canonical_id"].fillna(_dfs_sessions["player_id"].astype(str))
+                )
+            run_track_a_dfs(_dfs_bets, _dfs_sessions, canonical_map, window_end)
+            logger.info(
+                "Track A: feature defs saved to %s  (%.1fs)",
+                FEATURE_DEFS_DIR, time.perf_counter() - _t0_dfs,
+            )
+        except Exception as _dfs_exc:
+            logger.warning(
+                "Track A: DFS failed (%s) — proceeding without Track A features",
+                _dfs_exc,
+            )
+
     # --- Track-B features (on FULL bets incl. history, cutoff=window_end) ---
     # Computing before label filtering ensures cross-chunk state (loss_streak,
     # run_boundary) uses historical context from HISTORY_BUFFER_DAYS before window_start.
@@ -1418,11 +1496,11 @@ def process_chunk(
     # --- Legacy (Track B) features ---
     labeled = add_legacy_features(labeled, sessions)
 
-    # --- Track A: Featuretools DFS features (DEC-002/R45) ---
-    # Applied only when saved_feature_defs are present (produced by run_track_a_dfs).
-    # Missing defs are silently skipped so Track B can run independently.
-    _feature_defs_path = FEATURE_DEFS_DIR / "feature_defs.json"
-    if FEATURE_DEFS_DIR.exists() and _feature_defs_path.exists():
+    # --- Track A: Featuretools DFS features (DEC-002/R45, DEC-020) ---
+    # Applied only when saved_feature_defs are present (produced by run_track_a_dfs
+    # on the first chunk via run_afg) AND --no-afg / --fast-mode was not set.
+    # _feature_defs_path is defined earlier (before cache check).
+    if not no_afg and FEATURE_DEFS_DIR.exists() and _feature_defs_path.exists():
         try:
             _saved_defs = load_feature_defs(_feature_defs_path)
             _cutoff_df = labeled[["bet_id"]].copy()
@@ -1527,6 +1605,14 @@ def run_optuna_search(
     label: str = "",
 ) -> dict:
     """TPE hyperparameter search.  Optimises PR-AUC on validation set."""
+    # R705: guard against empty validation input — return empty dict (base params)
+    # rather than crashing inside LightGBM or average_precision_score.
+    if X_val.empty or len(y_val) == 0:
+        logger.warning(
+            "%s: empty validation set — skipping Optuna search, returning base params.",
+            label or "model",
+        )
+        return {}
     logger.info("Optuna search (%s): %d trials", label or "model", n_trials)
 
     def objective(trial: optuna.Trial) -> float:
@@ -1580,38 +1666,66 @@ def _train_one_model(
     """Train a single LightGBM model and compute validation metrics."""
     params = {**_base_lgb_params(), **hyperparams}
     model = lgb.LGBMClassifier(**params)
-    model.fit(
-        X_train,
-        y_train,
-        sample_weight=sw_train,
-        eval_set=[(X_val, y_val)],
-        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
-    )
-    val_scores = model.predict_proba(X_val)[:, 1]
-    prauc = float(average_precision_score(y_val, val_scores)) if y_val.sum() > 0 else 0.0
 
-    # Threshold selection: vectorised PR-curve scan (R65 — avoids O(N²) loop).
-    # precision_recall_curve returns arrays aligned so that for each threshold
-    # index i: preds = val_scores >= thresholds[i].  We compute F1 over the
-    # full threshold grid in one vectorised pass and pick the best.
-    pr_prec, pr_rec, pr_thresholds = precision_recall_curve(y_val, val_scores)
-    # pr_prec / pr_rec have one extra element (last = 1/0); align with thresholds
-    pr_prec = pr_prec[:-1]
-    pr_rec = pr_rec[:-1]
-    # Minimum-alert guard: vectorised via searchsorted (R68 — O(N log N) total)
-    _sorted_scores = np.sort(val_scores)
-    alert_counts = len(val_scores) - np.searchsorted(_sorted_scores, pr_thresholds, side="left")
-    valid_mask = alert_counts >= 5
-    if valid_mask.any():
-        denom = pr_prec + pr_rec
-        f1_arr = np.where(denom > 0, 2 * pr_prec * pr_rec / denom, 0.0)
-        f1_arr = np.where(valid_mask, f1_arr, -1.0)
-        best_idx = int(np.argmax(f1_arr))
-        best_t = float(pr_thresholds[best_idx])
-        best_f1 = float(f1_arr[best_idx])
-        best_prec = float(pr_prec[best_idx])
-        best_rec = float(pr_rec[best_idx])
+    # bug-empty-valid-test-when-few-chunks: LightGBM raises ValueError when
+    # eval_set contains an empty DataFrame.  Skip eval_set + early_stopping
+    # when the validation set is too small or has no positive labels.
+    # R801: also guard against NaN labels — pandas sum() silently skips NaN,
+    # so a y_val with mixed NaN/valid labels passes the sum() check but causes
+    # sklearn precision_recall_curve to raise ValueError: Input contains NaN.
+    _has_val = (
+        not X_val.empty
+        and len(y_val) >= MIN_VALID_TEST_ROWS
+        and int(y_val.isna().sum()) == 0
+        and int(y_val.sum()) >= 1
+    )
+    if _has_val:
+        model.fit(
+            X_train,
+            y_train,
+            sample_weight=sw_train,
+            eval_set=[(X_val, y_val)],
+            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+        )
     else:
+        logger.warning(
+            "%s: validation set too small (%d rows, %d positives) — "
+            "training without eval_set / early stopping.",
+            label or "model",
+            len(y_val),
+            int(y_val.sum()) if not y_val.empty else 0,
+        )
+        model.fit(X_train, y_train, sample_weight=sw_train)
+
+    if _has_val:
+        val_scores = model.predict_proba(X_val)[:, 1]
+        prauc = float(average_precision_score(y_val, val_scores)) if y_val.sum() > 0 else 0.0
+
+        # Threshold selection: vectorised PR-curve scan (R65 — avoids O(N²) loop).
+        # precision_recall_curve returns arrays aligned so that for each threshold
+        # index i: preds = val_scores >= thresholds[i].  We compute F1 over the
+        # full threshold grid in one vectorised pass and pick the best.
+        pr_prec, pr_rec, pr_thresholds = precision_recall_curve(y_val, val_scores)
+        # pr_prec / pr_rec have one extra element (last = 1/0); align with thresholds
+        pr_prec = pr_prec[:-1]
+        pr_rec = pr_rec[:-1]
+        # Minimum-alert guard: vectorised via searchsorted (R68 — O(N log N) total)
+        _sorted_scores = np.sort(val_scores)
+        alert_counts = len(val_scores) - np.searchsorted(_sorted_scores, pr_thresholds, side="left")
+        valid_mask = alert_counts >= 5
+        if valid_mask.any():
+            denom = pr_prec + pr_rec
+            f1_arr = np.where(denom > 0, 2 * pr_prec * pr_rec / denom, 0.0)
+            f1_arr = np.where(valid_mask, f1_arr, -1.0)
+            best_idx = int(np.argmax(f1_arr))
+            best_t = float(pr_thresholds[best_idx])
+            best_f1 = float(f1_arr[best_idx])
+            best_prec = float(pr_prec[best_idx])
+            best_rec = float(pr_rec[best_idx])
+        else:
+            best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
+    else:
+        prauc = 0.0
         best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
 
     metrics = {
@@ -1624,6 +1738,9 @@ def _train_one_model(
         "val_samples": int(len(y_val)),
         "val_positives": int(y_val.sum()),
         "best_hyperparams": hyperparams,
+        # R804: track via code-path (not value == 0.5) so a legitimately-optimised
+        # threshold of 0.5 is never falsely flagged as uncalibrated.
+        "_uncalibrated": not _has_val,
     }
     logger.info(
         "%s: PR-AUC=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
@@ -1739,13 +1856,15 @@ def save_artifact_bundle(
             MODEL_DIR / "nonrated_model.pkl",
         )
 
+    _legacy_set = set(LEGACY_FEATURE_COLS)
     feature_list = [
         {
             "name": c,
             "track": (
                 "profile" if c in PROFILE_FEATURE_COLS
                 else "B" if c in TRACK_B_FEATURE_COLS
-                else "legacy"
+                else "legacy" if c in _legacy_set
+                else "A"   # Track A (Featuretools DFS — DEC-020)
             ),
         }
         for c in feature_cols
@@ -1785,6 +1904,14 @@ def save_artifact_bundle(
     )
 
     (MODEL_DIR / "model_version").write_text(model_version, encoding="utf-8")
+    # R703: flag when the fallback (uncalibrated) 0.5 threshold was used.
+    # R804: read from the _uncalibrated code-path flag set by _train_one_model,
+    # not from `threshold == 0.5` — a legitimately-optimised threshold of 0.5
+    # must not be falsely flagged as uncalibrated.
+    _uncalibrated_threshold = {
+        "rated":    rated    is not None and bool(rated.get("_uncalibrated", False)),
+        "nonrated": nonrated is not None and bool(nonrated.get("_uncalibrated", False)),
+    }
     (MODEL_DIR / "training_metrics.json").write_text(
         json.dumps(
             {
@@ -1794,6 +1921,8 @@ def save_artifact_bundle(
                 # R301: record sampling metadata so artifacts can be audited
                 # even when loaded later.  None = full rated population was used.
                 "sample_rated_n": sample_rated_n,
+                # R703: uncalibrated_threshold=True means the 0.5 fallback was used.
+                "uncalibrated_threshold": _uncalibrated_threshold,
             },
             indent=2,
             default=str,
@@ -1829,6 +1958,10 @@ def run_pipeline(args) -> None:
     fast_mode = getattr(args, "fast_mode", False)
     # --fast-mode implies --skip-optuna; allow either flag independently.
     skip_optuna = getattr(args, "skip_optuna", False) or fast_mode
+    # --no-afg (No Automatic Feature Generation, DEC-020): skip Track A DFS.
+    # --fast-mode implies --no-afg to avoid the heavy Featuretools dependency
+    # when iterating quickly on a short data horizon.
+    no_afg = getattr(args, "no_afg", False) or fast_mode
     # --fast-mode-no-preload: disable session full-table preload; use per-day
     # PyArrow pushdown reads instead.  Reduces peak RAM for 8 GB machines.
     no_preload = getattr(args, "fast_mode_no_preload", False)
@@ -1927,18 +2060,16 @@ def run_pipeline(args) -> None:
             data_horizon_days,
         )
 
-    # 2. Determine train / valid / test split at chunk level FIRST (needed to
-    #    derive train_end for canonical mapping cutoff — R25 / B1 leakage guard).
+    # 2. Chunk-level split — used ONLY to derive train_end for the canonical
+    #    mapping cutoff (B1 / R25 identity-leakage guard).  The actual row
+    #    assignment to train/valid/test happens later at row level (SSOT §9.2).
     t0 = time.perf_counter()
     split = get_train_valid_test_split(chunks)
-    logger.info("Train/valid/test split: %.1fs", time.perf_counter() - t0)
+    logger.info("Chunk-level split (train_end derivation): %.1fs", time.perf_counter() - t0)
     train_end = (
         max(c["window_end"] for c in split["train_chunks"])
         if split["train_chunks"] else end
     )
-    train_ws = {c["window_start"] for c in split["train_chunks"]}
-    valid_ws = {c["window_start"] for c in split["valid_chunks"]}
-    test_ws  = {c["window_start"] for c in split["test_chunks"]}
 
     # 3. Build canonical mapping with TRAINING window cutoff (B1 — prevents
     #    identity links that arose after training from leaking into training data).
@@ -2043,10 +2174,20 @@ def run_pipeline(args) -> None:
     else:
         logger.info("player_profile_daily: not available — profile features will be NaN (%.1fs)", time.perf_counter() - t0)
 
+    # 3d. Track A: DFS exploration (DEC-020).
+    # R906: process_chunk (run_afg=True on the first chunk) handles DFS internally
+    # to allow reuse of the first chunk's already-loaded data without double-loading.
+    # R903: delete stale feature_defs.json before the chunk loop so that the first
+    # chunk (run_afg=True) always produces a fresh DFS exploration result.
+    _feature_defs_pipeline_path = FEATURE_DEFS_DIR / "feature_defs.json"
+    if not no_afg and _feature_defs_pipeline_path.exists():
+        _feature_defs_pipeline_path.unlink()
+        logger.info("Track A: removed stale feature_defs.json before DFS (R903)")
+
     # 4. Process chunks -> write parquet
     t0 = time.perf_counter()
     chunk_paths = []
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         path = process_chunk(
             chunk,
             canonical_map,
@@ -2054,6 +2195,8 @@ def run_pipeline(args) -> None:
             use_local_parquet=use_local,
             force_recompute=force,
             profile_df=profile_df,
+            no_afg=no_afg,
+            run_afg=(i == 0 and not no_afg),
         )
         if path is not None:
             chunk_paths.append(path)
@@ -2077,31 +2220,103 @@ def run_pipeline(args) -> None:
     full_df = pd.concat(all_dfs, ignore_index=True)
     logger.info("Total rows: %d  (label=1: %d)", len(full_df), int(full_df["label"].sum()))
 
-    # 6. Assign train / valid / test split label to each row.
-    #    R24: use year + month integer matching rather than Period conversion,
-    #    which raises ValueError when payout_complete_dtm is tz-aware.
+    # 6. Row-level time-ordered split (SSOT §9.2, todo-row-level-time-split).
+    #    Sort the concatenated dataset strictly by time, then assign the first
+    #    TRAIN_SPLIT_FRAC rows to "train", the next VALID_SPLIT_FRAC to "valid",
+    #    and the remainder to "test".  This guarantees non-empty valid/test sets
+    #    regardless of how many monthly chunks are available.
+    #
+    #    DEC-018: payout_complete_dtm is tz-naive datetime64[ns] after apply_dq().
+    #    The defensive tz-strip below handles externally-sourced Parquet that may
+    #    not have gone through apply_dq().
+    # R803: validate fractions at runtime so misconfiguration is caught early.
+    assert TRAIN_SPLIT_FRAC + VALID_SPLIT_FRAC < 1.0, (
+        f"TRAIN_SPLIT_FRAC ({TRAIN_SPLIT_FRAC}) + VALID_SPLIT_FRAC ({VALID_SPLIT_FRAC}) "
+        f"must be < 1.0 to leave room for the test set"
+    )
     _payout_ts = pd.to_datetime(full_df["payout_complete_dtm"])
     if _payout_ts.dt.tz is not None:
         _payout_ts = _payout_ts.dt.tz_localize(None)
-    _chunk_year = _payout_ts.dt.year
-    _chunk_month = _payout_ts.dt.month
 
-    # R70: vectorised split assignment via dict lookup — O(N) map, no row-level loop.
-    _ym_to_split: dict[tuple, str] = {}
-    for _cs, _tag in [(split["train_chunks"], "train"), (split["valid_chunks"], "valid"), (split["test_chunks"], "test")]:
-        for _c in _cs:
-            _ym_to_split[(_c["window_start"].year, _c["window_start"].month)] = _tag
+    # Stable sort: primary = payout time, tiebreakers = canonical_id, bet_id.
+    # R704: use inplace operations to avoid intermediate DataFrame copies and reduce
+    # peak RAM during the sort step.
+    _sort_cols = ["_sort_ts_tmp"] + [
+        c for c in ("canonical_id", "bet_id") if c in full_df.columns
+    ]
+    full_df["_sort_ts_tmp"] = _payout_ts
+    full_df.sort_values(_sort_cols, kind="stable", na_position="last", inplace=True)
+    full_df.drop(columns=["_sort_ts_tmp"], inplace=True)
+    full_df.reset_index(drop=True, inplace=True)
 
-    _ym_keys = list(zip(_chunk_year, _chunk_month))
-    full_df["_split"] = pd.Series(_ym_keys, index=full_df.index).map(_ym_to_split).fillna("train")
+    n_rows = len(full_df)
+    _train_end_idx = int(n_rows * TRAIN_SPLIT_FRAC)
+    _valid_end_idx = int(n_rows * (TRAIN_SPLIT_FRAC + VALID_SPLIT_FRAC))
+    _row_pos = np.arange(n_rows)
+    full_df["_split"] = np.select(
+        [_row_pos < _train_end_idx, _row_pos < _valid_end_idx],
+        ["train", "valid"],
+        default="test",
+    )
 
     train_df = full_df[full_df["_split"] == "train"].copy()
     valid_df  = full_df[full_df["_split"] == "valid"].copy()
     test_df   = full_df[full_df["_split"] == "test"].copy()
+    del full_df  # R802: release concat buffer; ~halves peak RAM after split
+
+    # R700: compare row-level _actual_train_end against chunk-level train_end.
+    # The canonical mapping cutoff (B1/R25 guard) always uses chunk-level train_end;
+    # this log makes any semantic drift between the two boundaries observable.
+    # R701 (known limitation): same run rows may be assigned to different split sets
+    # at row-level boundaries — group-aware split is a long-term improvement.
+    _actual_train_end = train_df["payout_complete_dtm"].max() if not train_df.empty else None
+    if _actual_train_end is not None and pd.notnull(_actual_train_end):
+        _te_chunk = pd.Timestamp(train_end) if train_end else None
+        # DEC-018: strip tz from _te_chunk so both sides are tz-naive for comparison
+        # (train_end comes from chunk["window_end"] which is tz-aware; _actual_train_end
+        # comes from payout_complete_dtm which is tz-naive after apply_dq).
+        if _te_chunk is not None and _te_chunk.tzinfo is not None:
+            _te_chunk = _te_chunk.replace(tzinfo=None)
+        _te_row = pd.Timestamp(str(_actual_train_end))
+        # DEC-018: strip tz from _te_row for the same reason as _te_chunk —
+        # payout_complete_dtm may be tz-aware when sourced from test mocks or
+        # external Parquet that skipped apply_dq().
+        if _te_row.tzinfo is not None:
+            _te_row = _te_row.replace(tzinfo=None)
+        if _te_chunk is not None and _te_row != _te_chunk:
+            logger.warning(
+                "R700: chunk-level train_end (%s) differs from row-level "
+                "_actual_train_end (%s) by %s — "
+                "B1/R25 canonical mapping cutoff uses chunk-level train_end.",
+                _te_chunk.date(), _te_row.date(),
+                abs(_te_row - _te_chunk),
+            )
+        else:
+            logger.info(
+                "R700: chunk-level train_end (%s) matches row-level _actual_train_end (%s).",
+                _te_chunk, _te_row,
+            )
     logger.info(
-        "Split — train: %d  valid: %d  test: %d  (concat+split: %.1fs)",
-        len(train_df), len(valid_df), len(test_df), time.perf_counter() - t0,
+        "Row-level split (%.0f/%.0f/%.0f) — train: %d  valid: %d  test: %d  (load+sort+split: %.1fs)",
+        TRAIN_SPLIT_FRAC * 100,
+        VALID_SPLIT_FRAC * 100,
+        (1.0 - TRAIN_SPLIT_FRAC - VALID_SPLIT_FRAC) * 100,
+        len(train_df), len(valid_df), len(test_df),
+        time.perf_counter() - t0,
     )
+    if len(valid_df) < MIN_VALID_TEST_ROWS:
+        logger.warning(
+            "Validation set has only %d rows (MIN_VALID_TEST_ROWS=%d); "
+            "PR-AUC and Optuna results will be unreliable. "
+            "Consider adding more --recent-chunks.",
+            len(valid_df), MIN_VALID_TEST_ROWS,
+        )
+    if len(test_df) < MIN_VALID_TEST_ROWS:
+        logger.warning(
+            "Test set has only %d rows (MIN_VALID_TEST_ROWS=%d); "
+            "backtester metrics will be unreliable.",
+            len(test_df), MIN_VALID_TEST_ROWS,
+        )
 
     # DEC-017: in fast-mode, restrict profile features to those computable within
     # the available data horizon; non-profile features (Track B + legacy) are
@@ -2118,6 +2333,68 @@ def run_pipeline(args) -> None:
         )
     else:
         active_feature_cols = ALL_FEATURE_COLS
+
+    # 5b. Full-feature screening (DEC-020, todo-track-a-screening-no-afg step 1-2).
+    # Runs on the TRAINING SET ONLY to comply with TRN-09 anti-leakage rules.
+    #
+    # Candidate set = active_feature_cols (Track B + Legacy + Profile) PLUS any
+    # Track A columns loaded from feature_defs.json (R1000: use saved defs, not
+    # raw numeric heuristic, to avoid mistaking metadata columns as Track A).
+    if not no_afg and _feature_defs_pipeline_path.exists():
+        # R1000: derive Track A candidate columns from the saved feature definitions
+        # rather than a raw numeric-column heuristic.
+        _saved_defs = load_feature_defs(_feature_defs_pipeline_path)
+        _track_a_cols = [
+            fd.get_name() for fd in _saved_defs
+            if fd.get_name() in train_df.columns
+        ]
+        if _track_a_cols:
+            logger.info(
+                "screen_features: loaded %d Track A candidate columns from feature_defs.json",
+                len(_track_a_cols),
+            )
+        _all_candidate_cols: List[str] = active_feature_cols + _track_a_cols
+    else:
+        _all_candidate_cols = active_feature_cols
+
+    # Only screen columns that actually exist in train_df (graceful degradation
+    # when tests or data sources don't produce all expected feature columns).
+    _present_candidate_cols = [c for c in _all_candidate_cols if c in train_df.columns]
+    if not _present_candidate_cols:
+        logger.warning(
+            "screen_features: no candidate columns found in train_df — skipping screening"
+        )
+        # R1004: restrict active_feature_cols to columns actually present in train_df
+        # so downstream training does not attempt to select absent columns.
+        active_feature_cols = [c for c in active_feature_cols if c in train_df.columns]
+    else:
+        t0 = time.perf_counter()
+        screened_cols = screen_features(
+            feature_matrix=train_df,
+            labels=train_df["label"],
+            feature_names=_present_candidate_cols,
+        )
+        logger.info(
+            "screen_features: %d -> %d features retained  (%.1fs)",
+            len(_present_candidate_cols), len(screened_cols), time.perf_counter() - t0,
+        )
+        # R1001: post-screening sanity — ensure at least one Track-B feature survives.
+        # If screening removes all Track-B features the nonrated model loses its core
+        # engineered signals.  Re-add any missing Track-B features from train_df as a
+        # fallback rather than failing silently.
+        _screened_set = set(screened_cols)
+        if not _screened_set.intersection(TRACK_B_FEATURE_COLS):
+            _missing_track_b = [c for c in TRACK_B_FEATURE_COLS if c in train_df.columns]
+            if _missing_track_b:
+                logger.warning(
+                    "screen_features: no TRACK_B_FEATURE_COLS survived screening — "
+                    "re-appending %d Track-B features as fallback (R1001)",
+                    len(_missing_track_b),
+                )
+                screened_cols = screened_cols + [
+                    c for c in _missing_track_b if c not in _screened_set
+                ]
+        active_feature_cols = screened_cols
 
     # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
     t0 = time.perf_counter()
@@ -2146,7 +2423,7 @@ def run_pipeline(args) -> None:
         "model_version": model_version,
         "window_start": start.isoformat(),
         "window_end": end.isoformat(),
-        "total_rows": len(full_df),
+        "total_rows": n_rows,
         "metrics": combined_metrics,
     }
     print(json.dumps(summary, indent=2, default=str))
@@ -2192,10 +2469,23 @@ def main() -> None:
             "effective training window — no 365-day lookback pushed back for profiles. "
             "Profile features are dynamically layered based on the available data horizon. "
             f"Profile snapshots computed every {FAST_MODE_SNAPSHOT_INTERVAL_DAYS} days. "
-            "Implies --skip-optuna. "
+            "Implies --skip-optuna and --no-afg (skips Track A DFS). "
             "Use --sample-rated N (separate flag) to also sample rated patrons. "
             "NEVER use artifacts from this mode in production — "
             "training_metrics.json will be flagged with fast_mode=true."
+        ),
+    )
+    parser.add_argument(
+        "--no-afg", action="store_true",
+        help=(
+            "No Automatic Feature Generation (DEC-020): skip Track A Featuretools DFS "
+            "exploration entirely. Feature screening still runs on Track B + "
+            "player-level/profile features; feature_list.json will not contain Track A "
+            "features and no saved_feature_defs are produced. "
+            "Scorer then computes only Track B + profile (no Featuretools). "
+            "Orthogonal to --fast-mode (--fast-mode implies --no-afg). "
+            "Use when Featuretools is unavailable, for faster iteration, or "
+            "to validate the Track B + profile path independently."
         ),
     )
     parser.add_argument(

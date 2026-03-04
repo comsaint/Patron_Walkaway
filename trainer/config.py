@@ -81,6 +81,12 @@ G1_ALERT_VOLUME_MIN_PER_HOUR = 5 # [DEPRECATED] Minimum combined alert volume/ho
 G1_FBETA = 0.5                   # [DEPRECATED] F-beta weight (beta < 1 → precision-weighted)
 OPTUNA_N_TRIALS = 300            # Optuna TPE trials for 2-D threshold search (I6)
 
+# --- Feature screening (DEC-020) ---
+# Maximum number of features to keep after screen_features().
+# None = no cap (all Stage-1 survivors kept); integer N = hard upper limit applied
+# after Stage-1 (MI ranking) and, if use_lgbm=True, after Stage-2 (LGBM ranking).
+SCREEN_FEATURES_TOP_K = None  # type: Optional[int]
+
 # --- Track B constants ---
 TABLE_HC_WINDOW_MIN = 30         # Lookback window for table headcount feature (D1)
 PLACEHOLDER_PLAYER_ID = -1       # Invalid player_id sentinel in t_bet (E4/F1)
@@ -92,6 +98,13 @@ HIST_AVG_BET_CAP = 500_000       # Winsorization cap for avg_bet (F2; validate w
 # Pandas typically uses ~2–3x on-disk size in RAM when loading Parquet.
 CHUNK_CONCAT_MEMORY_WARN_BYTES = int(2 * (1024**3))  # 2 GB on-disk total
 CHUNK_CONCAT_RAM_FACTOR = 3  # rough factor: on-disk size × this ≈ peak RAM for full_df
+
+# --- Row-level train/valid/test split ratios (SSOT §9.2, todo-row-level-time-split) ---
+# Chunks control ETL/cache volume only; the actual split is applied at row level
+# after concatenating all chunk Parquets, sorted by payout_complete_dtm.
+TRAIN_SPLIT_FRAC = 0.70   # fraction of rows allocated to training
+VALID_SPLIT_FRAC = 0.15   # fraction of rows allocated to validation; test = remainder
+MIN_VALID_TEST_ROWS = 50  # warn if valid or test set falls below this count
 
 # --- SQL fragment shared across all modules (FND-03) ---
 CASINO_PLAYER_ID_CLEAN_SQL = (

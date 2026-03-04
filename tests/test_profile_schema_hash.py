@@ -12,7 +12,7 @@ These tests verify that:
   b) ensure_player_profile_daily_ready() detects a hash mismatch and clears
      the stale parquet + checkpoint before triggering a rebuild.
   c) The schema hash sidecar is written alongside the parquet after each
-     successful _write_to_local_parquet call.
+     successful _persist_local_parquet call.
 """
 from __future__ import annotations
 
@@ -93,7 +93,7 @@ class TestComputeProfileSchemaHash(unittest.TestCase):
 
 
 class TestWriteLocalParquetWritesSidecar(unittest.TestCase):
-    """Verify that _write_to_local_parquet writes the .schema_hash sidecar."""
+    """Verify that _persist_local_parquet writes the .schema_hash sidecar."""
 
     def test_sidecar_written_alongside_parquet(self):
         """After a successful write, the sidecar file should exist and match current hash."""
@@ -117,7 +117,7 @@ class TestWriteLocalParquetWritesSidecar(unittest.TestCase):
                 patch.object(etl, "LOCAL_PROFILE_PARQUET", tmp_path / "player_profile_daily.parquet"),
                 patch.object(etl, "LOCAL_PROFILE_SCHEMA_HASH", tmp_path / "player_profile_daily.schema_hash"),
             ):
-                etl._write_to_local_parquet(df)
+                etl._persist_local_parquet(df)
 
             parquet_path = tmp_path / "player_profile_daily.parquet"
             hash_path = tmp_path / "player_profile_daily.schema_hash"
@@ -128,13 +128,15 @@ class TestWriteLocalParquetWritesSidecar(unittest.TestCase):
             written_hash = hash_path.read_text(encoding="utf-8").strip()
             # R106: sidecar stores full hash (base + _pop_tag). No whitelist → _full.
             # R300: sidecar also encodes max_lookback_days; default is 365 → _mlb=365.
+            # DEC-019 R601: sidecar also encodes sched_tag; default for
+            # _persist_local_parquet is "_daily".
             base_hash = etl.compute_profile_schema_hash(
                 session_parquet=tmp_path / "gmwds_t_session.parquet"
             )
-            expected_hash = hashlib.md5((base_hash + "_full" + "_mlb=365").encode()).hexdigest()
+            expected_hash = hashlib.md5((base_hash + "_full" + "_mlb=365" + "_daily").encode()).hexdigest()
             self.assertEqual(
                 written_hash, expected_hash,
-                "Sidecar should contain the current schema hash (with population tag + horizon tag)",
+                "Sidecar should contain the current schema hash (with population tag + horizon tag + sched_tag)",
             )
 
 
@@ -241,7 +243,10 @@ class TestEnsureProfileReadySchemaMismatch(unittest.TestCase):
             # _run_ensure calls ensure_player_profile_daily_ready() without
             # max_lookback_days, so the default 365 is used → _mlb=365.
             base_hash = compute_profile_schema_hash(session_parquet=sess_path)
-            stored_hash = hashlib.md5((base_hash + "_full" + "_mlb=365").encode()).hexdigest()
+            # DEC-019 R601: _run_ensure calls ensure_player_profile_daily_ready with
+            # default use_month_end_snapshots=True, fast_mode=False → _sched_tag="_month_end".
+            # stored_hash must match this formula exactly.
+            stored_hash = hashlib.md5((base_hash + "_full" + "_mlb=365" + "_month_end").encode()).hexdigest()
             profile_parquet, _, _ = self._run_ensure(
                 tmp_path,
                 stored_hash=stored_hash,
