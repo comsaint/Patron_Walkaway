@@ -3,9 +3,12 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
-import clickhouse_connect
+try:
+    import clickhouse_connect
+except ImportError:
+    clickhouse_connect = None
 
-import config
+import trainer.config as config
 
 
 @lru_cache(maxsize=1)

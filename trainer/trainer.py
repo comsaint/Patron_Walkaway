@@ -45,7 +45,8 @@ import hashlib
 import json
 import logging
 import subprocess
-from datetime import datetime, timedelta
+import sys
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -485,6 +486,174 @@ def load_player_profile_daily(
             "player_profile_daily ClickHouse load failed (%s); profile features will be 0", exc
         )
         return None
+
+
+def _parse_obj_to_date(v: Any) -> Optional[date]:
+    """Best-effort parse for Parquet stats values (date/datetime/str)."""
+    if v is None:
+        return None
+    if isinstance(v, date) and not isinstance(v, datetime):
+        return v
+    if isinstance(v, datetime):
+        return v.date()
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+    except ValueError:
+        try:
+            return date.fromisoformat(s[:10])
+        except ValueError:
+            return None
+
+
+def _parquet_date_range(path: Path, candidate_cols: List[str]) -> Optional[Tuple[date, date]]:
+    """Read min/max date from Parquet metadata stats without full table scan."""
+    if not path.exists():
+        return None
+    try:
+        import pyarrow.parquet as pq  # local import: optional runtime dependency
+
+        pf = pq.ParquetFile(path)
+        cols = pf.schema_arrow.names
+        for col in candidate_cols:
+            if col not in cols:
+                continue
+            col_idx = cols.index(col)
+            mins: List[date] = []
+            maxs: List[date] = []
+            for i in range(pf.metadata.num_row_groups):
+                stats = pf.metadata.row_group(i).column(col_idx).statistics
+                if stats is None or not getattr(stats, "has_min_max", False):
+                    continue
+                dmin = _parse_obj_to_date(stats.min)
+                dmax = _parse_obj_to_date(stats.max)
+                if dmin is not None:
+                    mins.append(dmin)
+                if dmax is not None:
+                    maxs.append(dmax)
+            if mins and maxs:
+                return min(mins), max(maxs)
+    except Exception as exc:
+        logger.warning("Failed to read parquet metadata date range (%s): %s", path, exc)
+    return None
+
+
+def ensure_player_profile_daily_ready(
+    window_start: datetime,
+    window_end: datetime,
+    use_local_parquet: bool = False,
+) -> None:
+    """Auto-check profile table freshness and rebuild missing local ranges if needed.
+
+    Local-parquet training mode only:
+      1) determine required snapshot window for PIT join,
+      2) compare against existing player_profile_daily coverage,
+      3) auto-run helper script to backfill missing range(s).
+    """
+    if not use_local_parquet:
+        logger.info("Profile auto-build skipped (ClickHouse mode).")
+        return
+
+    profile_path = LOCAL_PARQUET_DIR / "player_profile_daily.parquet"
+    session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+    auto_script = BASE_DIR / "scripts" / "auto_build_player_profile.py"
+
+    if not session_path.exists():
+        logger.warning("Session parquet missing at %s; skip profile auto-build", session_path)
+        return
+    if not auto_script.exists():
+        logger.warning("Auto profile builder script missing at %s; skip auto-build", auto_script)
+        return
+
+    required_start = (window_start - timedelta(days=365)).date()
+    required_end = window_end.date()
+
+    session_rng = _parquet_date_range(
+        session_path,
+        ["gaming_day", "session_end_dtm", "lud_dtm", "session_start_dtm"],
+    )
+    if session_rng:
+        required_start = max(required_start, session_rng[0])
+        required_end = min(required_end, session_rng[1])
+
+    if required_start > required_end:
+        logger.warning(
+            "Profile auto-build skipped: effective required range is empty (%s > %s)",
+            required_start,
+            required_end,
+        )
+        return
+
+    profile_rng = _parquet_date_range(profile_path, ["snapshot_date", "snapshot_dtm"])
+    missing_ranges: List[Tuple[date, date]] = []
+    if profile_rng is None:
+        missing_ranges.append((required_start, required_end))
+    else:
+        prof_start, prof_end = profile_rng
+        if prof_start > required_start:
+            missing_ranges.append((required_start, prof_start - timedelta(days=1)))
+        if prof_end < required_end:
+            missing_ranges.append((prof_end + timedelta(days=1), required_end))
+
+    if not missing_ranges:
+        logger.info(
+            "player_profile_daily is up-to-date for training window (%s -> %s).",
+            required_start,
+            required_end,
+        )
+        return
+
+    for miss_start, miss_end in missing_ranges:
+        if miss_start > miss_end:
+            continue
+        logger.info(
+            "player_profile_daily missing range %s -> %s; auto-building before training.",
+            miss_start,
+            miss_end,
+        )
+        cmd = [
+            sys.executable,
+            str(auto_script),
+            "--local-parquet",
+            "--start-date",
+            miss_start.isoformat(),
+            "--end-date",
+            miss_end.isoformat(),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            logger.warning(
+                "Auto profile build failed for %s -> %s (rc=%s). stderr tail:\n%s",
+                miss_start,
+                miss_end,
+                proc.returncode,
+                "\n".join([ln for ln in proc.stderr.splitlines() if ln.strip()][-40:]),
+            )
+        else:
+            logger.info("Auto profile build completed for %s -> %s", miss_start, miss_end)
+
+    # Final coverage check after auto-build attempt.
+    profile_rng_after = _parquet_date_range(profile_path, ["snapshot_date", "snapshot_dtm"])
+    if profile_rng_after is None:
+        logger.warning(
+            "player_profile_daily still unavailable after auto-build. "
+            "Training will continue with profile features as NaN."
+        )
+        return
+    after_start, after_end = profile_rng_after
+    if after_start > required_start or after_end < required_end:
+        logger.warning(
+            "player_profile_daily coverage still partial after auto-build. "
+            "required=%s->%s, have=%s->%s. Training continues with partial profile coverage.",
+            required_start,
+            required_end,
+            after_start,
+            after_end,
+        )
+    else:
+        logger.info("player_profile_daily coverage validated after auto-build.")
 
 
 # ---------------------------------------------------------------------------
@@ -1281,6 +1450,31 @@ def run_pipeline(args) -> None:
     chunks = get_monthly_chunks(start, end)
     logger.info("Chunks: %d", len(chunks))
 
+    # Debug/test mode: limit to most recent N chunks so data loading from both
+    # ClickHouse and local Parquet is proportionally restricted.
+    recent_chunks = getattr(args, "recent_chunks", None)
+    if recent_chunks is not None and recent_chunks > 0:
+        if recent_chunks < len(chunks):
+            chunks = chunks[-recent_chunks:]
+            logger.info(
+                "DEBUG MODE (--recent-chunks %d): trimmed to %s → %s",
+                recent_chunks,
+                chunks[0]["window_start"].date(),
+                chunks[-1]["window_end"].date(),
+            )
+        else:
+            logger.info(
+                "DEBUG MODE (--recent-chunks %d): requested >= total chunks (%d), using all",
+                recent_chunks,
+                len(chunks),
+            )
+
+    # Effective window is derived from the chunk list after optional trimming.
+    # All subsequent data loading (identity/profile checks/profile load) must
+    # use this window so --recent-chunks applies consistently to all tables.
+    effective_start = chunks[0]["window_start"] if chunks else start
+    effective_end = chunks[-1]["window_end"] if chunks else end
+
     # 2. Determine train / valid / test split at chunk level FIRST (needed to
     #    derive train_end for canonical mapping cutoff — R25 / B1 leakage guard).
     split = get_train_valid_test_split(chunks)
@@ -1298,10 +1492,15 @@ def run_pipeline(args) -> None:
     logger.info("Building canonical identity mapping (cutoff=%s)…", train_end)
     dummy_player_ids: set = set()
     if use_local:
-        _, sessions_all = load_local_parquet(start, end + timedelta(days=1))
+        _, sessions_all = load_local_parquet(
+            effective_start,
+            effective_end + timedelta(days=1),
+        )
         _, sessions_all = apply_dq(
             pd.DataFrame(columns=["bet_id"]),  # dummy bets
-            sessions_all, start, end + timedelta(days=1),
+            sessions_all,
+            effective_start,
+            effective_end + timedelta(days=1),
         )
         canonical_map = build_canonical_mapping_from_df(sessions_all, cutoff_dtm=train_end)
         try:
@@ -1322,7 +1521,15 @@ def run_pipeline(args) -> None:
 
     logger.info("Canonical mapping: %d rows; FND-12 dummy player_ids to exclude: %d", len(canonical_map), len(dummy_player_ids))
 
-    # 3b. Load player_profile_daily once for the entire training window (PLAN Step 4).
+    # 3b. Auto-check local player_profile_daily freshness and backfill missing
+    #     ranges before training starts (one-command flow, OOM-safe helper).
+    ensure_player_profile_daily_ready(
+        effective_start,
+        effective_end,
+        use_local_parquet=use_local,
+    )
+
+    # 3c. Load player_profile_daily once for the entire training window (PLAN Step 4).
     #     Pass the resulting DataFrame to every process_chunk call so each chunk
     #     can do the PIT/as-of join without re-querying.  If load fails, profile
     #     features are 0 for all rows (graceful degradation).
@@ -1331,7 +1538,10 @@ def run_pipeline(args) -> None:
         if not canonical_map.empty else None
     )
     profile_df = load_player_profile_daily(
-        start, end, use_local_parquet=use_local, canonical_ids=_rated_cids
+        effective_start,
+        effective_end,
+        use_local_parquet=use_local,
+        canonical_ids=_rated_cids,
     )
     if profile_df is not None:
         logger.info("player_profile_daily: loaded %d snapshot rows for PIT join", len(profile_df))
@@ -1440,6 +1650,15 @@ def main() -> None:
     parser.add_argument(
         "--skip-optuna", action="store_true",
         help="Skip Optuna search and use default LightGBM hyperparameters",
+    )
+    parser.add_argument(
+        "--recent-chunks", type=int, default=None, metavar="N",
+        help=(
+            "Debug/test mode: use only the last N monthly chunks from the training "
+            "window. Limits data loaded from both ClickHouse and local Parquet. "
+            "Recommended N>=3 to keep train/valid/test all non-empty. "
+            "E.g. --recent-chunks 3 uses roughly the last 3 months of data."
+        ),
     )
     args = parser.parse_args()
     run_pipeline(args)

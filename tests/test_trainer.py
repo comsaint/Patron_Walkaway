@@ -174,6 +174,35 @@ class TestReviewRiskGuards(unittest.TestCase):
             "apply_dq must keep sessions where turnover>0 OR num_games_with_wager>0 (FND-04)",
         )
 
+    def test_recent_chunks_effective_window_is_used_for_profile_flows(self):
+        """--recent-chunks must drive profile freshness-check and profile table load window."""
+        src = _get_func_src("run_pipeline")
+        self.assertIn("effective_start", src)
+        self.assertIn("effective_end", src)
+        self.assertRegex(
+            src,
+            r"ensure_player_profile_daily_ready\(\s*effective_start,\s*effective_end",
+            "Profile freshness check must use effective window after chunk trim",
+        )
+        self.assertRegex(
+            src,
+            r"load_player_profile_daily\(\s*effective_start,\s*effective_end",
+            "Profile table load must use effective window after chunk trim",
+        )
+
+    def test_recent_chunks_effective_window_is_used_for_local_identity_sessions(self):
+        """--recent-chunks must also constrain local sessions pull for identity mapping."""
+        src = _get_func_src("run_pipeline")
+        self.assertRegex(
+            src,
+            r"load_local_parquet\(\s*effective_start,\s*effective_end\s*\+\s*timedelta",
+            "Local canonical mapping bootstrap must use effective window",
+        )
+        self.assertIn("apply_dq(", src)
+        self.assertIn("sessions_all", src)
+        self.assertIn("effective_start", src)
+        self.assertIn("effective_end + timedelta(days=1)", src)
+
 
 if __name__ == "__main__":
     unittest.main()

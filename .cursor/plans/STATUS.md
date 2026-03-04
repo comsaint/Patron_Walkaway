@@ -1385,3 +1385,73 @@ python -m pytest tests/ -q
 - ClickHouse DDL：建立 `player_profile_daily` schema，對應所有 Phase 1 欄位（含 `snapshot_dtm DATETIME, profile_version VARCHAR`）。
 - ETL 排程：設定每日 01:00 HK cron，執行 `etl_player_profile.py --snapshot-date $(date -d '-1 day' +%F)`。
 - Profile Feature Importance 驗證：以一週資料跑 rated model，觀察 `sessions_30d / actual_rtp_30d` 等欄位的重要性，驗證 DEC-011 假設。
+
+---
+
+## Implementation Round 8 — `--recent-chunks` Debug/Test Mode（2026-03-04）
+
+### 背景
+
+正式訓練前需要能快速以少量資料驗證 pipeline 的完整流程（end-to-end），無論資料來源是 local Parquet 或 ClickHouse，都應只拉取對應時間範圍的資料。
+
+### 設計決策
+
+採用「截取 `chunks` 清單尾部」策略：
+
+- `get_monthly_chunks(start, end)` 之後，直接取 `chunks[-N:]`。
+- 因為 `load_local_parquet` 與 `load_clickhouse_data` 都以 `chunk["window_start"]` / `chunk["extended_end"]` 做 pushdown 過濾，截取後兩條資料路徑自動只拉最後 N 個月的資料，無需修改 loader。
+- `get_train_valid_test_split` 有 graceful fallback（n=1 → train only；n=2 → train+valid；n≥3 → train+valid+test），所以 N=1/2 不會 crash。
+- **預設 N=3**：確保 train/valid/test 各得 1 個 chunk，是 debug 時最完整且最小的合理預設。
+
+### 改動（`trainer/trainer.py`）
+
+| 位置 | 改動 |
+|------|------|
+| `run_pipeline()` — `get_monthly_chunks()` 後 | 加入 `recent_chunks = getattr(args, "recent_chunks", None)` + `chunks = chunks[-recent_chunks:]`（當 N < 總 chunks 時），並 log debug banner |
+| `main()` — `argparse` | 新增 `--recent-chunks N`（`type=int, default=None`），help 說明含 default=3 建議 |
+
+### 使用範例
+
+```bash
+# 最常見的 debug 場景：最近 3 個月，跑完整 train/valid/test
+python trainer/trainer.py --use-local-parquet --recent-chunks 3 --skip-optuna
+
+# 最小冒煙測試：只 1 個月（train only）
+python trainer/trainer.py --use-local-parquet --recent-chunks 1 --skip-optuna
+
+# ClickHouse 也同樣適用
+python trainer/trainer.py --recent-chunks 3 --skip-optuna
+```
+
+### 測試相容性
+
+- 無新增測試檔（功能純屬 argparse + list slice，無狀態/副作用）。
+- `getattr(args, "recent_chunks", None)` 防禦性讀取確保測試環境以 mock args 傳入時不會 AttributeError。
+- 全套測試維持 263 passed（未破壞任何現有測試）。
+
+---
+
+## Implementation Round 9 — Integration Test for `--recent-chunks` (2026-03-04)
+
+### 目標
+確保 `--recent-chunks` 在 `run_pipeline` 內被設定後，可以正確將 `effective_start` 與 `effective_end` 一路傳遞到與 profile/identity 相關的資料載入與檢查函式中，避免未來發生回歸（Regression）。
+
+### 新增測試
+
+- `tests/test_recent_chunks_integration.py::TestRecentChunksIntegration::test_recent_chunks_propagates_effective_window`
+  - 使用 `unittest.mock.patch` 對 `run_pipeline` 中的依賴進行 mock。
+  - 設定 `args.recent_chunks = 2`。
+  - 驗證 `load_local_parquet` 被呼叫時傳入的是倒數 2 個 chunk 的時間範圍。
+  - 驗證 `ensure_player_profile_daily_ready` 被呼叫時傳入的是倒數 2 個 chunk 的時間範圍。
+  - 驗證 `load_player_profile_daily` 被呼叫時傳入的是倒數 2 個 chunk 的時間範圍。
+  - 驗證 `process_chunk` 只被呼叫 2 次，針對最後 2 個 chunk。
+
+### 相關修正
+- 修復了 `trainer/db_conn.py` 在執行 pytest 收集時產生的 `ModuleNotFoundError: No module named 'config'` 問題（改為 `import trainer.config as config` 或使用相對/絕對路徑引入），使得測試套件可以在根目錄正確解析。
+
+### 測試結果
+```text
+python -m pytest tests/ -v
+267 passed, 261 warnings in 7.24s (0 failed, 0 regression)
+```
+
