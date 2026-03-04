@@ -42,6 +42,7 @@ Data source switching
 from __future__ import annotations
 
 import argparse
+import calendar
 import hashlib
 import json
 import logging
@@ -193,6 +194,9 @@ _CANONICAL_MAP_SESSION_COLS: list = [
 # now controlled by the independent --sample-rated N CLI flag.  This constant
 # is kept only as a reference; do not use it in new code.
 FAST_MODE_RATED_SAMPLE_N: int = 1_000
+# DEPRECATED(DEC-019 follow-up): profile snapshots are now forced to month-end
+# across all modes, including fast-mode.  Keep this constant only for backward
+# compatibility in logs/tests that may still import it.
 FAST_MODE_SNAPSHOT_INTERVAL_DAYS: int = 7
 
 BASE_DIR = Path(__file__).parent
@@ -681,11 +685,10 @@ def _month_end_dates(start_date: date, end_date: date) -> List[date]:
     Sorted list of date objects, each being the last day of its month,
     filtered to [start_date, end_date].
     """
-    import calendar as _cal
     result: List[date] = []
     year, month = start_date.year, start_date.month
     while True:
-        last_day = _cal.monthrange(year, month)[1]
+        last_day = calendar.monthrange(year, month)[1]
         month_end = date(year, month, last_day)
         if month_end > end_date:
             break
@@ -697,6 +700,23 @@ def _month_end_dates(start_date: date, end_date: date) -> List[date]:
         else:
             month += 1
     return result
+
+
+def _latest_month_end_on_or_before(ref_date: date) -> date:
+    """Return the nearest month-end date that is <= ref_date."""
+    year, month = ref_date.year, ref_date.month
+    month_last = calendar.monthrange(year, month)[1]
+    cand = date(year, month, month_last)
+    if cand <= ref_date:
+        return cand
+    # Previous month-end.
+    if month == 1:
+        year -= 1
+        month = 12
+    else:
+        month -= 1
+    prev_last = calendar.monthrange(year, month)[1]
+    return date(year, month, prev_last)
 
 
 def ensure_player_profile_daily_ready(
@@ -726,9 +746,9 @@ def ensure_player_profile_daily_ready(
         in-process backfill (avoids subprocess overhead and allows
         the whitelist to be passed directly).
     snapshot_interval_days:
-        When > 1 (fast-mode: 7), passed to ``backfill`` so only every
-        N-th day is computed.  Also triggers in-process backfill.
-        Ignored when ``use_month_end_snapshots=True`` (DEC-019).
+        Deprecated for scheduling.  Month-end scheduling is now enforced in all
+        modes.  This value is still forwarded for backward compatibility, but
+        it does not control snapshot date selection.
     preload_sessions:
         Forwarded to ``backfill``.  Set False (--fast-mode-no-preload) to
         disable full-table session preload, using per-day PyArrow pushdown
@@ -740,13 +760,8 @@ def ensure_player_profile_daily_ready(
         (DEC-017 bug fix — eliminates the
         ``No local canonical_mapping.parquet`` warning).
     use_month_end_snapshots:
-        DEC-019: when True (default), build only the last-day-of-each-month
-        snapshot instead of daily snapshots.  Reduces profile ETL from
-        ~4-6 h (365 days) to ~12 min (12 snapshots/year).  PIT join
-        semantics are unchanged (most-recent snapshot <= bet_time).
-        Set to False to revert to daily / snapshot_interval_days behaviour.
-        Automatically disabled when fast_mode=True (fast-mode controls its
-        own frequency via snapshot_interval_days).
+        Deprecated override flag.  Month-end scheduling is now always enabled
+        (including fast-mode) to keep profile update cadence stable.
     """
     if not use_local_parquet:
         # ClickHouse mode: schema version is not auto-checked; if PROFILE_FEATURE_COLS
@@ -757,6 +772,9 @@ def ensure_player_profile_daily_ready(
     profile_path = LOCAL_PARQUET_DIR / "player_profile_daily.parquet"
     session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
     auto_script = BASE_DIR / "scripts" / "auto_build_player_profile.py"
+    # Force a single scheduling policy across all execution modes/options:
+    # player_profile_daily snapshots are always month-end.
+    effective_month_end = True
 
     # --- Schema-hash check ---------------------------------------------------
     # Compare the current profile schema fingerprint (PROFILE_VERSION +
@@ -774,8 +792,8 @@ def ensure_player_profile_daily_ready(
             else "_full"
         )
         _horizon_tag = f"_mlb={max_lookback_days}"
-        # DEC-019 R601: include schedule mode so month-end and daily caches never collide
-        _sched_tag = "_month_end" if (use_month_end_snapshots and not fast_mode) else "_daily"
+        # DEC-019 R601: include schedule mode so month-end and daily caches never collide.
+        _sched_tag = "_month_end" if effective_month_end else "_daily"
         current_hash = hashlib.md5(
             (current_hash + _pop_tag + _horizon_tag + _sched_tag).encode()
         ).hexdigest()
@@ -871,25 +889,20 @@ def ensure_player_profile_daily_ready(
             miss_start,
             miss_end,
         )
-        # DEC-019: compute month-end snapshot dates for this missing range when
-        # use_month_end_snapshots=True and not fast_mode (fast-mode has its own
-        # interval control via snapshot_interval_days=7).
-        _snap_dates = (
-            _month_end_dates(miss_start, miss_end)
-            if (use_month_end_snapshots and not fast_mode)
-            else None
-        )
-        # DEC-019 R600: if the range falls entirely within one month, month-end
-        # schedule yields an empty list — silently skipping the entire range would
-        # leave a gap in the profile.  Fall back to the interval-based path so
-        # data integrity is preserved.
+        _backfill_start, _backfill_end = miss_start, miss_end
+        # Enforced month-end schedule (all modes): build only month-end snapshots.
+        _snap_dates = _month_end_dates(miss_start, miss_end) if effective_month_end else None
+        # If the missing range is intra-month (no month-end within range), anchor
+        # PIT with the most recent month-end on/before miss_end.
         if _snap_dates is not None and len(_snap_dates) == 0:
-            logger.warning(
-                "DEC-019: no month-end dates found in missing range %s -> %s "
-                "(intra-month gap); falling back to interval-based backfill.",
-                miss_start, miss_end,
+            _anchor = _latest_month_end_on_or_before(miss_end)
+            _snap_dates = [_anchor]
+            _backfill_start = min(_backfill_start, _anchor)
+            logger.info(
+                "Month-end-only schedule: intra-month missing range %s -> %s; "
+                "building anchor snapshot at %s.",
+                miss_start, miss_end, _anchor,
             )
-            _snap_dates = None
 
         # Use in-process backfill when any of:
         # (a) fast-mode: whitelist or interval != 1 — avoids subprocess overhead
@@ -911,8 +924,8 @@ def ensure_player_profile_daily_ready(
         if use_inprocess:
             try:
                 _etl_backfill(
-                    miss_start,
-                    miss_end,
+                    _backfill_start,
+                    _backfill_end,
                     use_local_parquet=True,
                     canonical_id_whitelist=canonical_id_whitelist,
                     snapshot_interval_days=snapshot_interval_days,
@@ -928,14 +941,14 @@ def ensure_player_profile_daily_ready(
                 logger.info(
                     "In-process profile build completed for %s -> %s "
                     "(whitelist=%s, schedule=%s)",
-                    miss_start, miss_end,
+                    _backfill_start, _backfill_end,
                     f"{len(canonical_id_whitelist)} IDs" if canonical_id_whitelist else "none",
                     _sched_desc,
                 )
             except Exception as _exc:
                 logger.warning(
                     "In-process profile build failed for %s -> %s: %s",
-                    miss_start, miss_end, _exc,
+                    _backfill_start, _backfill_end, _exc,
                 )
         else:
             # R105: auto_script check only for subprocess path; fast-mode uses
@@ -971,10 +984,7 @@ def ensure_player_profile_daily_ready(
     # R111: when snapshot_interval_days > 1 or use_month_end_snapshots, date gaps
     # are expected; only warn if coverage is truly insufficient.
     # DEC-019: month-end snapshots allow gaps up to ~31 days.
-    _effective_interval = (
-        31 if (use_month_end_snapshots and not fast_mode)
-        else snapshot_interval_days
-    )
+    _effective_interval = 31 if effective_month_end else snapshot_interval_days
     profile_rng_after = _parquet_date_range(profile_path, ["snapshot_date", "snapshot_dtm"])
     if profile_rng_after is None:
         logger.warning(
@@ -994,7 +1004,7 @@ def ensure_player_profile_daily_ready(
                 after_end,
             )
         else:
-            _sched_label = "month-end" if (use_month_end_snapshots and not fast_mode) else f"interval={snapshot_interval_days}"
+            _sched_label = "month-end" if effective_month_end else f"interval={snapshot_interval_days}"
             logger.info(
                 "player_profile_daily coverage acceptable (%s).", _sched_label,
             )
@@ -2010,9 +2020,12 @@ def run_pipeline(args) -> None:
     logger.info("Training window: %s -> %s  (local=%s)", start.date(), end.date(), use_local)
 
     # 1. Monthly chunks (DEC-008 / SSOT §4.3)
+    print("[Step 1/10] Training window and monthly chunks…", flush=True)
     t0 = time.perf_counter()
     chunks = get_monthly_chunks(start, end)
-    logger.info("Chunks: %d  (%.1fs)", len(chunks), time.perf_counter() - t0)
+    _el = time.perf_counter() - t0
+    print("[Step 1/10] Training window and monthly chunks done in %.1fs" % _el, flush=True)
+    logger.info("Chunks: %d  (%.1fs)", len(chunks), _el)
 
     # Debug/test mode: limit to most recent N chunks so data loading from both
     # ClickHouse and local Parquet is proportionally restricted.
@@ -2063,9 +2076,12 @@ def run_pipeline(args) -> None:
     # 2. Chunk-level split — used ONLY to derive train_end for the canonical
     #    mapping cutoff (B1 / R25 identity-leakage guard).  The actual row
     #    assignment to train/valid/test happens later at row level (SSOT §9.2).
+    print("[Step 2/10] Chunk-level split (train_end derivation)…", flush=True)
     t0 = time.perf_counter()
     split = get_train_valid_test_split(chunks)
-    logger.info("Chunk-level split (train_end derivation): %.1fs", time.perf_counter() - t0)
+    _el = time.perf_counter() - t0
+    print("[Step 2/10] Chunk-level split done in %.1fs" % _el, flush=True)
+    logger.info("Chunk-level split (train_end derivation): %.1fs", _el)
     train_end = (
         max(c["window_end"] for c in split["train_chunks"])
         if split["train_chunks"] else end
@@ -2074,6 +2090,7 @@ def run_pipeline(args) -> None:
     # 3. Build canonical mapping with TRAINING window cutoff (B1 — prevents
     #    identity links that arose after training from leaking into training data).
     #    Also get FND-12 dummy player_ids so we drop them from training (TRN-04).
+    print("[Step 3/10] Build canonical identity mapping…", flush=True)
     t0 = time.perf_counter()
     logger.info("Building canonical identity mapping (cutoff=%s)…", train_end)
     dummy_player_ids: set = set()
@@ -2107,9 +2124,11 @@ def run_pipeline(args) -> None:
             canonical_map = pd.DataFrame(columns=["player_id", "canonical_id"])
         sessions_all = None
 
+    _el = time.perf_counter() - t0
+    print("[Step 3/10] Build canonical identity mapping done in %.1fs" % _el, flush=True)
     logger.info(
         "Canonical mapping: %d rows; FND-12 dummy player_ids to exclude: %d  (%.1fs)",
-        len(canonical_map), len(dummy_player_ids), time.perf_counter() - t0,
+        len(canonical_map), len(dummy_player_ids), _el,
     )
 
     # DEC-017 / R205: rated-patron sampling is now an independent, orthogonal option
@@ -2133,20 +2152,23 @@ def run_pipeline(args) -> None:
 
     # 3b. Auto-check local player_profile_daily freshness and backfill missing
     #     ranges before training starts (one-command flow, OOM-safe helper).
+    print("[Step 4/10] Ensure player_profile_daily ready (backfill if needed)…", flush=True)
     t0 = time.perf_counter()
     ensure_player_profile_daily_ready(
         effective_start,
         effective_end,
         use_local_parquet=use_local,
         canonical_id_whitelist=rated_whitelist,
-        snapshot_interval_days=FAST_MODE_SNAPSHOT_INTERVAL_DAYS if fast_mode else 1,
+        snapshot_interval_days=1,
         preload_sessions=not no_preload,
         canonical_map=canonical_map,
         fast_mode=fast_mode,
         max_lookback_days=data_horizon_days if fast_mode else 365,
-        use_month_end_snapshots=getattr(args, "month_end_snapshots", True),
+        use_month_end_snapshots=True,
     )
-    logger.info("ensure_player_profile_daily_ready: %.1fs", time.perf_counter() - t0)
+    _el = time.perf_counter() - t0
+    print("[Step 4/10] Ensure player_profile_daily ready done in %.1fs" % _el, flush=True)
+    logger.info("ensure_player_profile_daily_ready: %.1fs", _el)
 
     # 3c. Load player_profile_daily once for the entire training window (PLAN Step 4).
     #     Pass the resulting DataFrame to every process_chunk call so each chunk
@@ -2162,6 +2184,7 @@ def run_pipeline(args) -> None:
             else None
         )
     )
+    print("[Step 5/10] Load player_profile_daily for PIT join…", flush=True)
     t0 = time.perf_counter()
     profile_df = load_player_profile_daily(
         effective_start,
@@ -2169,10 +2192,13 @@ def run_pipeline(args) -> None:
         use_local_parquet=use_local,
         canonical_ids=_rated_cids,
     )
+    _el = time.perf_counter() - t0
     if profile_df is not None:
-        logger.info("player_profile_daily: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), time.perf_counter() - t0)
+        print("[Step 5/10] Load player_profile_daily done in %.1fs (%d rows)" % (_el, len(profile_df)), flush=True)
+        logger.info("player_profile_daily: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), _el)
     else:
-        logger.info("player_profile_daily: not available — profile features will be NaN (%.1fs)", time.perf_counter() - t0)
+        print("[Step 5/10] Load player_profile_daily done in %.1fs (not available)" % _el, flush=True)
+        logger.info("player_profile_daily: not available — profile features will be NaN (%.1fs)", _el)
 
     # 3d. Track A: DFS exploration (DEC-020).
     # R906: process_chunk (run_afg=True on the first chunk) handles DFS internally
@@ -2185,6 +2211,7 @@ def run_pipeline(args) -> None:
         logger.info("Track A: removed stale feature_defs.json before DFS (R903)")
 
     # 4. Process chunks -> write parquet
+    print("[Step 6/10] Process chunks (DQ, labels, Track B, Track A)…", flush=True)
     t0 = time.perf_counter()
     chunk_paths = []
     for i, chunk in enumerate(chunks):
@@ -2201,11 +2228,14 @@ def run_pipeline(args) -> None:
         if path is not None:
             chunk_paths.append(path)
 
-    logger.info("Process chunks: %d produced  (%.1fs)", len(chunk_paths), time.perf_counter() - t0)
+    _el = time.perf_counter() - t0
+    print("[Step 6/10] Process chunks done in %.1fs (%d chunks)" % (_el, len(chunk_paths)), flush=True)
+    logger.info("Process chunks: %d produced  (%.1fs)", len(chunk_paths), _el)
     if not chunk_paths:
         raise SystemExit("No chunks produced any usable data — check data source / time window")
 
     # 5. Load all chunks, concatenate (OOM guard: warn if chunk data is large)
+    print("[Step 7/10] Load all chunks, concat, row-level train/valid/test split…", flush=True)
     t0 = time.perf_counter()
     _chunk_total_bytes = sum(Path(p).stat().st_size for p in chunk_paths)
     _est_ram_gb = (_chunk_total_bytes * CHUNK_CONCAT_RAM_FACTOR) / (1024**3)
@@ -2296,13 +2326,15 @@ def run_pipeline(args) -> None:
                 "R700: chunk-level train_end (%s) matches row-level _actual_train_end (%s).",
                 _te_chunk, _te_row,
             )
+    _el = time.perf_counter() - t0
+    print("[Step 7/10] Load all chunks, concat, row-level split done in %.1fs (train=%d valid=%d test=%d)" % (_el, len(train_df), len(valid_df), len(test_df)), flush=True)
     logger.info(
         "Row-level split (%.0f/%.0f/%.0f) — train: %d  valid: %d  test: %d  (load+sort+split: %.1fs)",
         TRAIN_SPLIT_FRAC * 100,
         VALID_SPLIT_FRAC * 100,
         (1.0 - TRAIN_SPLIT_FRAC - VALID_SPLIT_FRAC) * 100,
         len(train_df), len(valid_df), len(test_df),
-        time.perf_counter() - t0,
+        _el,
     )
     if len(valid_df) < MIN_VALID_TEST_ROWS:
         logger.warning(
@@ -2367,16 +2399,20 @@ def run_pipeline(args) -> None:
         # R1004: restrict active_feature_cols to columns actually present in train_df
         # so downstream training does not attempt to select absent columns.
         active_feature_cols = [c for c in active_feature_cols if c in train_df.columns]
+        print("[Step 8/10] Feature screening skipped (no candidates)", flush=True)
     else:
+        print("[Step 8/10] Feature screening…", flush=True)
         t0 = time.perf_counter()
         screened_cols = screen_features(
             feature_matrix=train_df,
             labels=train_df["label"],
             feature_names=_present_candidate_cols,
         )
+        _el = time.perf_counter() - t0
+        print("[Step 8/10] Feature screening done in %.1fs (%d -> %d features)" % (_el, len(_present_candidate_cols), len(screened_cols)), flush=True)
         logger.info(
             "screen_features: %d -> %d features retained  (%.1fs)",
-            len(_present_candidate_cols), len(screened_cols), time.perf_counter() - t0,
+            len(_present_candidate_cols), len(screened_cols), _el,
         )
         # R1001: post-screening sanity — ensure at least one Track-B feature survives.
         # If screening removes all Track-B features the nonrated model loses its core
@@ -2397,6 +2433,7 @@ def run_pipeline(args) -> None:
         active_feature_cols = screened_cols
 
     # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
+    print("[Step 9/10] Train dual model (Optuna + LightGBM)…", flush=True)
     t0 = time.perf_counter()
     model_version = get_model_version()
     rated_art, nonrated_art, combined_metrics = train_dual_model(
@@ -2405,18 +2442,24 @@ def run_pipeline(args) -> None:
         active_feature_cols,
         run_optuna=not skip_optuna,
     )
-    logger.info("train_dual_model: %.1fs", time.perf_counter() - t0)
+    _el = time.perf_counter() - t0
+    print("[Step 9/10] Train dual model done in %.1fs" % _el, flush=True)
+    logger.info("train_dual_model: %.1fs", _el)
 
     # 7. Save artifacts
+    print("[Step 10/10] Save artifact bundle…", flush=True)
     t0 = time.perf_counter()
     save_artifact_bundle(
         rated_art, nonrated_art, active_feature_cols, combined_metrics, model_version,
         fast_mode=fast_mode,
         sample_rated_n=sample_rated_n,
     )
-    logger.info("save_artifact_bundle: %.1fs", time.perf_counter() - t0)
+    _el = time.perf_counter() - t0
+    print("[Step 10/10] Save artifact bundle done in %.1fs" % _el, flush=True)
+    logger.info("save_artifact_bundle: %.1fs", _el)
 
     total_sec = time.perf_counter() - pipeline_start
+    print("All steps completed. Pipeline total: %.1fs (%.1f min)" % (total_sec, total_sec / 60.0), flush=True)
     logger.info("Pipeline total: %.1fs (%.1f min)", total_sec, total_sec / 60.0)
 
     summary = {
@@ -2468,7 +2511,7 @@ def main() -> None:
             "Fast mode (DEC-017 Data-Horizon): restrict all data access to the "
             "effective training window — no 365-day lookback pushed back for profiles. "
             "Profile features are dynamically layered based on the available data horizon. "
-            f"Profile snapshots computed every {FAST_MODE_SNAPSHOT_INTERVAL_DAYS} days. "
+            "Profile snapshots follow month-end schedule (same as full mode). "
             "Implies --skip-optuna and --no-afg (skips Track A DFS). "
             "Use --sample-rated N (separate flag) to also sample rated patrons. "
             "NEVER use artifacts from this mode in production — "
@@ -2511,11 +2554,9 @@ def main() -> None:
     parser.add_argument(
         "--no-month-end-snapshots", action="store_false", dest="month_end_snapshots",
         help=(
-            "DEC-019: disable month-end profile snapshot scheduling and revert to "
-            "daily snapshots (snapshot_interval_days=1) for full runs. "
-            "Use when you need daily profile resolution. "
-            "Has no effect in --fast-mode (fast-mode uses its own interval=7 schedule). "
-            "Default: month-end snapshots are ENABLED for full runs."
+            "Deprecated compatibility flag. Month-end profile snapshot scheduling "
+            "is now always enforced in all modes (including --fast-mode), so this "
+            "option has no effect."
         ),
     )
     parser.set_defaults(month_end_snapshots=True)

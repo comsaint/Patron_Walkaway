@@ -9,7 +9,7 @@ inside those helpers.
 Covered scenarios
 -----------------
 1. FastModeHorizonPropagation  — fast_mode=True with recent_chunks=1:
-   - snapshot_interval_days == FAST_MODE_SNAPSHOT_INTERVAL_DAYS (7)
+   - snapshot_interval_days == 1 (month-end scheduling enforced globally)
    - max_lookback_days == data_horizon_days (not 365)
    - fast_mode=True forwarded to ensure_player_profile_daily_ready
    - ensure called with the trimmed effective window, not the original window
@@ -33,7 +33,7 @@ from unittest.mock import patch, MagicMock, call, ANY
 import pandas as pd
 from zoneinfo import ZoneInfo
 
-from trainer.trainer import run_pipeline, FAST_MODE_SNAPSHOT_INTERVAL_DAYS
+from trainer.trainer import run_pipeline
 
 HK_TZ = ZoneInfo("Asia/Hong_Kong")
 
@@ -164,13 +164,13 @@ class TestFastModeHorizonPropagation(_PipelineMixin, unittest.TestCase):
         self._fast_mode = True
         self._recent_chunks = 1
 
-    def test_snapshot_interval_days_is_fast_mode_constant(self):
+    def test_snapshot_interval_days_is_one_even_in_fast_mode(self):
         result = self._run_pipeline_with_mocks()
         kwargs = result["ensure_kwargs"]
         self.assertEqual(
             kwargs.get("snapshot_interval_days"),
-            FAST_MODE_SNAPSHOT_INTERVAL_DAYS,
-            "fast_mode should set snapshot_interval_days to FAST_MODE_SNAPSHOT_INTERVAL_DAYS",
+            1,
+            "snapshot_interval_days should remain 1 because scheduling is month-end only",
         )
 
     def test_fast_mode_forwarded_to_ensure_profile(self):
@@ -308,7 +308,7 @@ class TestFastModePlusSampleRated(_PipelineMixin, unittest.TestCase):
         kwargs = result["ensure_kwargs"]
         # fast_mode semantics
         self.assertTrue(kwargs.get("fast_mode"))
-        self.assertEqual(kwargs.get("snapshot_interval_days"), FAST_MODE_SNAPSHOT_INTERVAL_DAYS)
+        self.assertEqual(kwargs.get("snapshot_interval_days"), 1)
         self.assertLess(kwargs.get("max_lookback_days", 365), 365)
         # sample_rated semantics
         wl = kwargs.get("canonical_id_whitelist")

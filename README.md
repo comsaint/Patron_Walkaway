@@ -45,9 +45,7 @@ ClickHouse ──► trainer.py ──► models/ (rated_model.pkl, nonrated_mod
 **訓練（完整流程）**（在專案根目錄）：
 
 ```bash
-python -m trainer.trainer
-python -m trainer.trainer --use-local-parquet --recent-chunks 3
-python -m trainer.trainer --skip-optuna --use-local-parquet
+python -m trainer.trainer --use-local-parquet --days 365
 ```
 
 **Fast mode（僅供測試，筆電約 &lt;10 分鐘）**：限制可用資料時間範圍（Data Horizon），所有子模組（identity / labels / features / profile ETL）共用同一個時間邊界，以較少資料量加速訓練；並隱含 `--skip-optuna` 與 `--no-afg`（跳過 Track A DFS）。可選擇性搭配 `--sample-rated N` 只抽樣部分評級客。**請勿將產物用於生產。**
@@ -85,6 +83,23 @@ python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sa
 **Status server**：`python -m trainer.status_server`
 
 **ETL / profile**：`trainer/etl_player_profile.py` 用於 profile 回填；`python -m trainer.scripts.auto_build_player_profile --start-date ... --end-date ...` 用於排程建置，詳見腳本說明。
+
+### Trainer 指令參數（cmd flags）
+
+| 參數 | 說明 |
+|------|------|
+| `--start` | 訓練視窗起日（YYYY-MM-DD 或 ISO）。須與 `--end` 同時指定，否則視窗由 `--days` 決定。 |
+| `--end` | 訓練視窗迄日。須與 `--start` 同時指定。 |
+| `--days` | 未給 `--start`/`--end` 時使用：取「迄日為現在減 30 分鐘」往前 N 天為視窗。預設由 `config.TRAINER_DAYS` 決定（通常 7）。 |
+| `--use-local-parquet` | 從專案根目錄 `data/` 讀取 Parquet（`gmwds_t_bet.parquet`、`gmwds_t_session.parquet` 等），不連 ClickHouse。 |
+| `--force-recompute` | 忽略已快取的 chunk Parquet（`trainer/.data/chunks/`），強制重新計算每個 chunk。 |
+| `--skip-optuna` | 不跑 Optuna 超參搜尋，使用預設 LightGBM 超參。 |
+| `--recent-chunks N` | 僅使用訓練視窗內「最後 N 個」月 chunk（每 chunk 約一個月）。限制從 ClickHouse 或本地 Parquet 載入的資料量；建議 N≥3 以保持 train/valid/test 皆有資料。例如 `--recent-chunks 3` 約為最近 3 個月。 |
+| `--fast-mode` | 快速模式（DEC-017）：profile 不往前做 365 天 lookback，僅用有效訓練視窗；profile 特徵依資料天數動態選用。隱含 `--skip-optuna` 與 `--no-afg`。產物標記 `fast_mode=true`，**不得用於生產**。 |
+| `--no-afg` | 不做 Track A（Featuretools DFS），僅用 Track B + profile 特徵；不產出 `saved_feature_defs/`。與 `--fast-mode` 正交（fast-mode 會自動帶入）。 |
+| `--fast-mode-no-preload` | 關閉 profile backfill 時對 session Parquet 的「全表一次載入」，改為每 snapshot 日用 PyArrow pushdown 讀取。適合 low RAM 機器，避免 OOM；建議與 `--fast-mode` 一併使用。 |
+| `--sample-rated N` | 僅使用 N 個評級客（canonical_id 字典序取前 N 個）。與 `--fast-mode` 正交，可單獨或搭配使用。預設不抽樣（使用全部評級客）。 |
+| `--no-month-end-snapshots` | 相容用旗標；目前月結 snapshot 排程一律啟用，此選項**無效**。 |
 
 ### 測試
 
@@ -203,6 +218,23 @@ python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sa
 **Status server**：`python -m trainer.status_server`
 
 **ETL / profile**：`trainer/etl_player_profile.py` 用于 profile 回填；`python -m trainer.scripts.auto_build_player_profile --start-date ... --end-date ...` 用于定时构建，详见脚本说明。
+
+### Trainer 指令参数（cmd flags）
+
+| 参数 | 说明 |
+|------|------|
+| `--start` | 训练窗口起日（YYYY-MM-DD 或 ISO）。须与 `--end` 同时指定，否则窗口由 `--days` 决定。 |
+| `--end` | 训练窗口迄日。须与 `--start` 同时指定。 |
+| `--days` | 未给 `--start`/`--end` 时使用：取「迄日为现在减 30 分钟」往前 N 天为窗口。默认由 `config.TRAINER_DAYS` 决定（通常 7）。 |
+| `--use-local-parquet` | 从项目根目录 `data/` 读取 Parquet（`gmwds_t_bet.parquet`、`gmwds_t_session.parquet` 等），不连 ClickHouse。 |
+| `--force-recompute` | 忽略已缓存的 chunk Parquet（`trainer/.data/chunks/`），强制重新计算每个 chunk。 |
+| `--skip-optuna` | 不跑 Optuna 超参搜索，使用默认 LightGBM 超参，可省约 10 分钟。 |
+| `--recent-chunks N` | 仅使用训练窗口内「最后 N 个」月 chunk（每 chunk 约一个月）。限制从 ClickHouse 或本地 Parquet 载入的数据量；建议 N≥3 以保持 train/valid/test 皆有数据。例如 `--recent-chunks 3` 约最近 3 个月。 |
+| `--fast-mode` | 快速模式（DEC-017）：profile 不往前做 365 天 lookback，仅用有效训练窗口；profile 特征依数据天数动态选用。隐含 `--skip-optuna` 与 `--no-afg`。产物标记 `fast_mode=true`，**不得用于生产**。 |
+| `--no-afg` | 不做 Track A（Featuretools DFS），仅用 Track B + profile 特征；不产出 `saved_feature_defs/`。与 `--fast-mode` 正交（fast-mode 会自动带入）。 |
+| `--fast-mode-no-preload` | 关闭 profile backfill 时对 session Parquet 的「全表一次载入」，改为每 snapshot 日用 PyArrow pushdown 读取。适合约 8 GB RAM 机器，避免 OOM；建议与 `--fast-mode` 一并使用。 |
+| `--sample-rated N` | 仅使用 N 个评级客（canonical_id 字典序取前 N 个）。与 `--fast-mode` 正交，可单独或搭配使用。默认不抽样（使用全部评级客）。 |
+| `--no-month-end-snapshots` | 兼容用旗标；当前月结 snapshot 调度一律启用，此选项**无效**。 |
 
 ### 测试
 
@@ -384,6 +416,25 @@ python -m trainer.status_server
 - **Auto-build profile (scheduled)**  
   `python -m trainer.scripts.auto_build_player_profile --start-date ... --end-date ...`  
   See script help for ClickHouse vs local Parquet.
+
+---
+
+## Trainer command-line flags
+
+| Flag | Description |
+|------|-------------|
+| `--start` | Training window start (YYYY-MM-DD or ISO). Must be used with `--end`; otherwise the window is determined by `--days`. |
+| `--end` | Training window end. Must be used with `--start`. |
+| `--days` | When `--start`/`--end` are not set: window is the last N days ending 30 minutes ago. Default from `config.TRAINER_DAYS` (often 7). |
+| `--use-local-parquet` | Read from project root `data/` Parquet files (`gmwds_t_bet.parquet`, `gmwds_t_session.parquet`, etc.) instead of ClickHouse. |
+| `--force-recompute` | Ignore cached chunk Parquets in `trainer/.data/chunks/` and recompute every chunk. |
+| `--skip-optuna` | Skip Optuna hyperparameter search and use default LightGBM hyperparameters (saves ~10 min). |
+| `--recent-chunks N` | Use only the last N monthly chunks in the training window (one chunk ≈ one month). Limits data loaded from ClickHouse or local Parquet; recommend N≥3 so train/valid/test are all non-empty. E.g. `--recent-chunks 3` ≈ last 3 months. |
+| `--fast-mode` | Fast mode (DEC-017): no 365-day profile lookback; profile features use only the effective training window and are layered by data horizon. Implies `--skip-optuna` and `--no-afg`. Artifacts are tagged `fast_mode=true` and **must not be used in production**. |
+| `--no-afg` | Skip Track A (Featuretools DFS); use only Track B + profile features. No `saved_feature_defs/` produced. Orthogonal to `--fast-mode` (fast-mode implies it). |
+| `--fast-mode-no-preload` | Disable full-table session Parquet preload during profile backfill; use per-snapshot PyArrow pushdown reads instead. Recommended for ~8 GB RAM to avoid OOM; combine with `--fast-mode`. |
+| `--sample-rated N` | Use only N rated canonical_ids (first N by lexicographic order). Orthogonal to `--fast-mode`. Default: no sampling (all rated). |
+| `--no-month-end-snapshots` | Deprecated compatibility flag; month-end snapshot schedule is always on; **no effect**. |
 
 ---
 
