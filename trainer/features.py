@@ -487,10 +487,15 @@ def compute_loss_streak(
 
     df = bets_df.copy()
 
-    # TRN-09 / E2: respect cutoff
+    # TRN-09 / E2: respect cutoff (align tz so naive vs aware comparison is valid)
     if cutoff_time is not None:
         cutoff_ts = pd.Timestamp(cutoff_time)
-        df = df[df["payout_complete_dtm"] <= cutoff_ts].copy()
+        col = df["payout_complete_dtm"]
+        if col.dt.tz is None and cutoff_ts.tz is not None:
+            col = col.dt.tz_localize(cutoff_ts.tz)
+        elif col.dt.tz is not None and cutoff_ts.tz is None:
+            cutoff_ts = cutoff_ts.tz_localize(col.dt.tz)
+        df = df[col <= cutoff_ts].copy()
 
     if df.empty:
         return pd.Series(dtype="int32")
@@ -616,7 +621,12 @@ def compute_run_boundary(
     # Apply cutoff_time filter after computing run_id / minutes_since_run_start
     # so that run start times are always anchored to their true first bet.
     if cutoff_ts is not None:
-        df = df[df["payout_complete_dtm"] <= cutoff_ts].copy()
+        col = df["payout_complete_dtm"]
+        if col.dt.tz is None and cutoff_ts.tz is not None:
+            col = col.dt.tz_localize(cutoff_ts.tz)
+        elif col.dt.tz is not None and cutoff_ts.tz is None:
+            cutoff_ts = cutoff_ts.tz_localize(col.dt.tz)
+        df = df[col <= cutoff_ts].copy()
 
     return df
 
@@ -673,7 +683,12 @@ def compute_table_hc(
     ].copy()
     if cutoff_time is not None:
         avail_limit = pd.Timestamp(cutoff_time) - delay_td
-        pool = pool[pool["payout_complete_dtm"] <= avail_limit]
+        col = pool["payout_complete_dtm"]
+        if col.dt.tz is None and avail_limit.tz is not None:
+            col = col.dt.tz_localize(avail_limit.tz)
+        elif col.dt.tz is not None and avail_limit.tz is None:
+            avail_limit = avail_limit.tz_localize(col.dt.tz)
+        pool = pool[col <= avail_limit]
 
     result = pd.Series(0, index=bets_df.index, dtype="int32")
 

@@ -186,9 +186,12 @@ def compute_labels(
     # A terminal bet IS a gap start if coverage beyond it is sufficient:
     # payout_complete_dtm + WALKAWAY_GAP_MIN <= extended_end  →  we can
     # observe that at least WALKAWAY_GAP_MIN minutes passed with no bet.
-    terminal_determinable = is_terminal & (
-        df["payout_complete_dtm"] + walkaway_gap_delta <= extended_end_ts
-    )
+    left_ts = df["payout_complete_dtm"] + walkaway_gap_delta
+    if left_ts.dt.tz is None and extended_end_ts.tz is not None:
+        left_ts = left_ts.dt.tz_localize(extended_end_ts.tz)
+    elif left_ts.dt.tz is not None and extended_end_ts.tz is None:
+        extended_end_ts = extended_end_ts.tz_localize(left_ts.dt.tz)
+    terminal_determinable = is_terminal & (left_ts <= extended_end_ts)
 
     # gap_start: either explicit (b_{i+1} - b_i >= X) or H1-determinable
     df["_gap_start"] = (
