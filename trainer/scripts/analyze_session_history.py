@@ -59,7 +59,7 @@ def main() -> None:
         print("(Note: sample may be small/demo; use --parquet for full export)")
         df = load_sessions(csv_path)
     else:
-        print(f"ERROR: No sessions file found.")
+        print("ERROR: No sessions file found.")
         print(f"  Parquet: {parquet_path}")
         print(f"  CSV:     {csv_path}")
         print("  Export from ClickHouse to .data/local/sessions.parquet first.")

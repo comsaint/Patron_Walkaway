@@ -95,6 +95,7 @@ MODEL_DIR = BASE_DIR / "models"
 RETENTION_HOURS: int = getattr(config, "SCORER_STATE_RETENTION_HOURS", 48)
 SESSION_AVAIL_DELAY_MIN: int = getattr(config, "SESSION_AVAIL_DELAY_MIN", 15)
 BET_AVAIL_DELAY_MIN: int = getattr(config, "BET_AVAIL_DELAY_MIN", 1)
+UNRATED_VOLUME_LOG: bool = bool(getattr(config, "UNRATED_VOLUME_LOG", True))
 SHAP_TOP_K = 3
 
 # New alert columns added in Phase 1
@@ -211,12 +212,13 @@ def fetch_recent_data(
 
     Bets:
     - FINAL, payout_complete_dtm IS NOT NULL, wager > 0
-    - player_id != PLACEHOLDER_PLAYER_ID
+    - player_id IS NOT NULL and player_id != PLACEHOLDER_PLAYER_ID
     - payout_complete_dtm <= end - BET_AVAIL_DELAY_MIN
 
     Sessions:
     - NO FINAL; FND-01 ROW_NUMBER CTE dedup on session_id
     - is_deleted=0, is_canceled=0, is_manual=0
+    - FND-04: COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0
     - H2 gate: COALESCE(session_end_dtm, lud_dtm) <= end - SESSION_AVAIL_DELAY_MIN
     - Fetches casino_player_id for H3 rated routing
     """
@@ -253,6 +255,7 @@ def fetch_recent_data(
           AND payout_complete_dtm <= %(bet_avail)s
           AND payout_complete_dtm IS NOT NULL
           AND wager > 0
+          AND player_id IS NOT NULL
           AND player_id != {placeholder}
     """
 
@@ -261,7 +264,7 @@ def fetch_recent_data(
             SELECT *,
                    ROW_NUMBER() OVER (
                        PARTITION BY session_id
-                       ORDER BY lud_dtm DESC, __etl_insert_Dtm DESC
+                       ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC
                    ) AS rn
             FROM {config.SOURCE_DB}.{config.TSESSION}
             WHERE session_start_dtm >= %(start)s - INTERVAL 2 DAY
@@ -282,10 +285,12 @@ def fetch_recent_data(
             is_manual,
             is_deleted,
             is_canceled,
+            COALESCE(turnover, 0) AS turnover,
             COALESCE(num_games_with_wager, 0) AS num_games_with_wager
         FROM deduped
         WHERE rn = 1
           AND COALESCE(session_end_dtm, lud_dtm) <= %(sess_avail)s
+          AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0)
     """
 
     bets = client.query_df(bets_query, parameters=params)
@@ -1164,6 +1169,30 @@ def score_once(
     if features_df.empty:
         logger.info("[scorer] No usable rows after feature engineering; sleeping")
         return
+    if UNRATED_VOLUME_LOG:
+        rated_bets = int(features_df["is_rated"].fillna(False).astype(bool).sum())
+        unrated_bets = int(len(features_df) - rated_bets)
+        rated_players = int(
+            features_df.loc[features_df["is_rated"].astype(bool), "player_id"]
+            .dropna()
+            .astype(str)
+            .nunique()
+        )
+        unrated_players = int(
+            features_df.loc[~features_df["is_rated"].astype(bool), "player_id"]
+            .dropna()
+            .astype(str)
+            .nunique()
+        )
+        logger.info(
+            "[scorer][volume] poll_cycle_ts=%s rated_player_count=%d rated_bet_count=%d "
+            "unrated_player_count=%d unrated_bet_count=%d",
+            scored_at,
+            rated_players,
+            rated_bets,
+            unrated_players,
+            unrated_bets,
+        )
 
     # ── Score with H3 routing ─────────────────────────────────────────────
     features_df = _score_df(features_df, artifacts, feature_list)

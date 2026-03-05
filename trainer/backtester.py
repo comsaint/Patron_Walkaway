@@ -39,7 +39,7 @@ import joblib
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import average_precision_score, f1_score, fbeta_score, precision_score
+from sklearn.metrics import average_precision_score, f1_score, fbeta_score
 from zoneinfo import ZoneInfo
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -330,39 +330,25 @@ def run_optuna_threshold_search(
     n_trials: int = OPTUNA_N_TRIALS,
     window_hours: Optional[float] = None,
 ) -> Tuple[float, float]:
-    """Optuna TPE search over (rated_threshold, nonrated_threshold).
+    """Optuna TPE search over rated_threshold only (v10 single Rated model, DEC-009/010).
 
-    Objective: maximise combined F1 (DEC-010; aligned with trainer threshold
-    criterion).  No G1 precision/alert-volume constraints — see DEC-009/010.
-    ``window_hours`` is accepted for API compatibility but not used in the
-    objective.
+    Objective: maximise F1 on rated observations. No G1 constraint.
+    Returns (rated_t, rated_t) for API compatibility with dual-metric callers.
     """
-    logger.info("Optuna 2D threshold search: %d trials", n_trials)
+    logger.info("Optuna single-threshold search: %d trials", n_trials)
 
-    y = df["label"].values
-    rated_scores = np.where(df["is_rated"], df["score"], np.nan)
-    nonrated_scores = np.where(~df["is_rated"], df["score"], np.nan)
+    rated_sub = df[df["is_rated"]]
+    if rated_sub.empty:
+        default_t = float((artifacts.get("rated") or {}).get("threshold", 0.5))
+        return default_t, default_t
 
-    rated_mask = df["is_rated"].values
-    nonrated_mask = ~df["is_rated"].values
-    y_rated = y[rated_mask]
-    y_nonrated = y[nonrated_mask]
+    y = rated_sub["label"].values
+    scores = rated_sub["score"].values
 
     def objective(trial: optuna.Trial) -> float:
         rt = trial.suggest_float("rated_threshold", 0.01, 0.99)
-        nt = trial.suggest_float("nonrated_threshold", 0.01, 0.99)
-
-        preds_rated = rated_scores[rated_mask] >= rt if rated_mask.any() else np.array([], dtype=bool)
-        preds_nonrated = nonrated_scores[nonrated_mask] >= nt if nonrated_mask.any() else np.array([], dtype=bool)
-
-        # Combined preds for F1 (DEC-010 — pure F1 maximisation, no G1 constraints)
-        all_preds = np.zeros(len(df), dtype=bool)
-        if rated_mask.any():
-            all_preds[rated_mask] = preds_rated
-        if nonrated_mask.any():
-            all_preds[nonrated_mask] = preds_nonrated
-
-        return float(f1_score(y, all_preds, zero_division=0))
+        preds = scores >= rt
+        return float(f1_score(y, preds, zero_division=0))
 
     study = optuna.create_study(
         direction="maximize",
@@ -372,20 +358,15 @@ def run_optuna_threshold_search(
 
     if study.best_value <= 0.0:
         logger.warning(
-            "No improvement found (best F1=%.4f); returning model-default thresholds.",
+            "No improvement found (best F1=%.4f); returning model-default threshold.",
             study.best_value,
         )
         rated_t = float((artifacts.get("rated") or {}).get("threshold", 0.5))
-        nonrated_t = float((artifacts.get("nonrated") or {}).get("threshold", 0.5))
     else:
         rated_t = study.best_params["rated_threshold"]
-        nonrated_t = study.best_params["nonrated_threshold"]
-        logger.info(
-            "Optuna best — rated_thr=%.4f  nonrated_thr=%.4f  F1=%.4f",
-            rated_t, nonrated_t, study.best_value,
-        )
+        logger.info("Optuna best — rated_thr=%.4f  F1=%.4f", rated_t, study.best_value)
 
-    return rated_t, nonrated_t
+    return rated_t, rated_t
 
 
 # ---------------------------------------------------------------------------

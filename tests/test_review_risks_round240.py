@@ -78,7 +78,7 @@ class TestR1203IdentityBidirectionalTzGuard(unittest.TestCase):
     """R1203: identity cutoff/session timezone alignment should be bidirectional."""
 
     def test_identity_aware_cutoff_naive_sessions_should_not_raise(self):
-        # Minimal required columns for build_canonical_mapping_from_df
+        # Minimal required columns for build_canonical_mapping_from_df (incl. turnover for FND-04)
         sessions_df = pd.DataFrame(
             {
                 "session_id": [1],
@@ -91,6 +91,7 @@ class TestR1203IdentityBidirectionalTzGuard(unittest.TestCase):
                 "is_deleted": [0],
                 "is_canceled": [0],
                 "num_games_with_wager": [2],
+                "turnover": [50.0],
             }
         )
         cutoff_aware = pd.Timestamp("2026-03-05 12:00:00", tz="Asia/Hong_Kong").to_pydatetime()

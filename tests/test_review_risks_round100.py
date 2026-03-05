@@ -55,6 +55,7 @@ class TestR105AutoScriptGateBlocksFastMode(unittest.TestCase):
         idx_use_inprocess = src.find("use_inprocess")
         idx_for_loop = src.find("for miss_start")
         self.assertGreater(idx_auto, 0, "auto_script.exists() not found")
+        self.assertGreater(idx_use_inprocess, 0, "use_inprocess not found")
         self.assertGreater(idx_for_loop, 0, "for miss_start loop not found")
         # The fix: auto_script check should be inside the else block of the for
         # loop body (the else that pairs with "if use_inprocess").

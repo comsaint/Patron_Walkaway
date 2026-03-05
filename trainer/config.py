@@ -1,4 +1,6 @@
 import os
+from typing import Optional
+
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -54,6 +56,8 @@ VALIDATOR_FINALIZE_MINUTES = 45  # Horizon minutes to finalize as MISS when enab
 # ============================================================
 # Phase 1 — Walkaway Model Constants (SSOT v10)
 # ============================================================
+# v10: Single Rated model only. No nonrated_threshold constant
+# (nonrated observations are volume-logged only; DEC-009/010).
 
 # --- Business parameters ---
 WALKAWAY_GAP_MIN = 30            # X: gap duration that qualifies as a walkaway (min)
@@ -79,17 +83,18 @@ GAMING_DAY_START_HOUR = 6
 G1_PRECISION_MIN = 0.70          # [DEPRECATED] Minimum per-model precision
 G1_ALERT_VOLUME_MIN_PER_HOUR = 5 # [DEPRECATED] Minimum combined alert volume/hour
 G1_FBETA = 0.5                   # [DEPRECATED] F-beta weight (beta < 1 → precision-weighted)
-OPTUNA_N_TRIALS = 300            # Optuna TPE trials for 2-D threshold search (I6)
+OPTUNA_N_TRIALS = 300            # Optuna TPE trials for F1 threshold search (DEC-009/010)
 
 # --- Feature screening (DEC-020) ---
 # Maximum number of features to keep after screen_features().
 # None = no cap (all Stage-1 survivors kept); integer N = hard upper limit applied
 # after Stage-1 (MI ranking) and, if use_lgbm=True, after Stage-2 (LGBM ranking).
-SCREEN_FEATURES_TOP_K = None  # type: Optional[int]
+SCREEN_FEATURES_TOP_K: Optional[int] = None
 
 # --- Track B constants ---
 TABLE_HC_WINDOW_MIN = 30         # Lookback window for table headcount feature (D1)
 PLACEHOLDER_PLAYER_ID = -1       # Invalid player_id sentinel in t_bet (E4/F1)
+UNRATED_VOLUME_LOG = True        # DEC-021: log unrated player/bet counts per poll cycle
 LOSS_STREAK_PUSH_RESETS = False  # Whether PUSH resets the loss-streak counter (F4)
 HIST_AVG_BET_CAP = 500_000       # Winsorization cap for avg_bet (F2; validate with EDA)
 

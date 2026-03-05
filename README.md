@@ -12,14 +12,14 @@ Patron Walkaway 離場偵測專案。
 
 ### 概述
 
-- **Phase 1** 實作：雙模型（評級 / 非評級）LightGBM 流程，含 Optuna 超參數搜尋、run-level 樣本權重、Track A（Featuretools DFS）與 Track B（如 `loss_streak`、`run_boundary`）特徵、身分對應與告警驗證。
+- **Phase 1** 實作：單一模型（僅評級客 Rated only）LightGBM 流程，含 Optuna 超參數搜尋、run-level 樣本權重、Track A（Featuretools DFS）與 Track B（如 `loss_streak`、`run_boundary`）特徵、身分對應與告警驗證。
 - **資料**：ClickHouse（`GDP_GMWDS_Raw`）或開發用本地 Parquet（置於 `data/`）。
-- **產出**：訓練產物在 `trainer/models/`（rated/nonrated `.pkl`、特徵清單、原因碼、模型版本）；即時 scorer 將告警寫入 SQLite；API 與前端儀表板供營運使用。
+- **產出**：訓練產物在 `trainer/models/`（`.pkl`、特徵清單、原因碼、模型版本）；即時 scorer 將告警寫入 SQLite；API 與前端儀表板供營運使用。
 
 ### 架構（高層）
 
 ```
-ClickHouse ──► trainer.py ──► models/ (rated_model.pkl, nonrated_model.pkl, …)
+ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
      │
      ├──► scorer.py ──► SQLite (alerts) ──► api_server.py ──► Frontend (main.html + JS)
      │
@@ -124,14 +124,14 @@ Fast-mode 煙測：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 ### 產物（trainer 輸出）
 
-`trainer/models/` 下：`rated_model.pkl`、`nonrated_model.pkl`、`saved_feature_defs/`、`feature_list.json`、`reason_code_map.json`、`model_version`、`training_metrics.json`。另保留 legacy `walkaway_model.pkl`。
+`trainer/models/` 下：`model.pkl`、`saved_feature_defs/`、`feature_list.json`、`reason_code_map.json`、`model_version`、`training_metrics.json`。另保留 legacy `walkaway_model.pkl`。
 
 ### 注意事項
 
 - **Fast-mode** 產物在 metadata 中標記 `fast_mode=true`，不得用於生產推論。
 - **憑證**：請安全存放 ClickHouse 憑證，勿提交 `.env`。
 - **時區**：業務邏輯使用 `Asia/Hong_Kong`（`config.HK_TZ`）。
-- **閾值選擇**：Phase 1 以驗證集 **F1 最大化** 選定雙模型閾值（DEC-009），無精準度/警報量下限約束。
+- **閾值選擇**：Phase 1 以驗證集 **F1 最大化** 選定單一模型閾值（DEC-009, DEC-021），無精準度/警報量下限約束。
 
 ---
 
@@ -147,12 +147,12 @@ Patron Walkaway 离场检测项目。
 
 - **Phase 1** 实现：双模型（评级 / 非评级）LightGBM 流程，含 Optuna 超参搜索、run-level 样本权重、Track A（Featuretools DFS）与 Track B（如 `loss_streak`、`run_boundary`）特征、身份映射与告警验证。
 - **数据**：ClickHouse（`GDP_GMWDS_Raw`）或开发用本地 Parquet（置于 `data/`）。
-- **产出**：训练产物在 `trainer/models/`（rated/nonrated `.pkl`、特征列表、原因码、模型版本）；实时 scorer 将告警写入 SQLite；API 与前端仪表盘供运营使用。
+- **产出**：训练产物在 `trainer/models/`（`.pkl`、特征列表、原因码、模型版本）；实时 scorer 将告警写入 SQLite；API 与前端仪表盘供运营使用。
 
 ### 架构（高层）
 
 ```
-ClickHouse ──► trainer.py ──► models/ (rated_model.pkl, nonrated_model.pkl, …)
+ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
      │
      ├──► scorer.py ──► SQLite (alerts) ──► api_server.py ──► Frontend (main.html + JS)
      │
@@ -259,7 +259,7 @@ Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 ### 产物（trainer 输出）
 
-`trainer/models/` 下：`rated_model.pkl`、`nonrated_model.pkl`、`saved_feature_defs/`、`feature_list.json`、`reason_code_map.json`、`model_version`、`training_metrics.json`。另保留 legacy `walkaway_model.pkl`。
+`trainer/models/` 下：`model.pkl`、`saved_feature_defs/`、`feature_list.json`、`reason_code_map.json`、`model_version`、`training_metrics.json`。另保留 legacy `walkaway_model.pkl`。
 
 ### 注意事项
 
@@ -274,20 +274,20 @@ Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 Patron Walkaway Detection project.
 
-Our mass gaming floor has deployed Smart Table technology through which we are able to capture the betting behavior of every patron (rated or not) in real-time. The goal is to detect in real-time whether a gaming patron will stop gaming and leave in the upcoming 15 minutes, so that our hosts can approach and retain them.
+Our mass gaming floor has deployed Smart Table technology through which we are able to capture the betting behavior of every patron (rated or not) in real-time. The goal is to detect in real-time whether a rated gaming patron will stop gaming and leave in the upcoming 15 minutes, so that our hosts can approach and retain them.
 
 ## Overview
 
-- **Phase 1** implementation: dual-model (rated / non-rated) LightGBM pipeline with Optuna hyperparameter search, run-level sample weighting, Track A (Featuretools DFS) + Track B (e.g. `loss_streak`, `run_boundary`) features, identity mapping, and alert validation.
+- **Phase 1** implementation: single-model (rated only) LightGBM pipeline with Optuna hyperparameter search, run-level sample weighting, Track A (Featuretools DFS) + Track B (e.g. `loss_streak`, `run_boundary`) features, identity mapping, and alert validation.
 - **Data**: ClickHouse (`GDP_GMWDS_Raw`) or local Parquet under `data/` for development.
-- **Output**: Trained artifacts in `trainer/models/` (rated/non-rated `.pkl`, feature list, reason codes, model version); live scorer writes alerts to SQLite; API + frontend dashboard for operators.
+- **Output**: Trained artifacts in `trainer/models/` (`.pkl`, feature list, reason codes, model version); live scorer writes alerts to SQLite; API + frontend dashboard for operators.
 
 ---
 
 ## Architecture (high level)
 
 ```
-ClickHouse ──► trainer.py ──► models/ (rated_model.pkl, nonrated_model.pkl, …)
+ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
      │
      ├──► scorer.py ──► SQLite (alerts) ──► api_server.py ──► Frontend (main.html + JS)
      │
@@ -349,7 +349,7 @@ python -m trainer.trainer --skip-optuna --use-local-parquet
 
 ### Fast mode (testing only, &lt;10 min on laptop)
 
-Constrains the available data time range (Data Horizon); all submodules (identity / labels / features / profile ETL) share the same time boundary so that a smaller slice of data is processed for faster iteration. Implies `--skip-optuna` and `--no-afg` (skips Track A DFS). You can optionally combine with `--sample-rated N` to train on a subset of rated patrons. **Do not use artifacts in production.**
+Constrains the available data time range (Data Horizon); all submodules (identity / labels / features / profile ETL) share the same time boundary so that a smaller slice of data is processed for faster iteration. Implies `--skip-optuna` and `--no-afg` (skips Track A DFS). You can optionally combine with `--sample-rated N` to train on a subset of patrons. **Do not use artifacts in production.**
 
 ```bash
 python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
@@ -369,7 +369,7 @@ Low-RAM (e.g. 8 GB): add `--fast-mode-no-preload` to avoid loading the full sess
 python -m trainer.trainer --fast-mode --fast-mode-no-preload --recent-chunks 3 --use-local-parquet
 ```
 
-To use only a subset of rated patrons under Fast mode (orthogonal to `--fast-mode`):
+To use only a subset of patrons under Fast mode (orthogonal to `--fast-mode`):
 
 ```bash
 python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sample-rated 1000
@@ -433,7 +433,7 @@ python -m trainer.status_server
 | `--fast-mode` | Fast mode (DEC-017): no 365-day profile lookback; profile features use only the effective training window and are layered by data horizon. Implies `--skip-optuna` and `--no-afg`. Artifacts are tagged `fast_mode=true` and **must not be used in production**. |
 | `--no-afg` | Skip Track A (Featuretools DFS); use only Track B + profile features. No `saved_feature_defs/` produced. Orthogonal to `--fast-mode` (fast-mode implies it). |
 | `--fast-mode-no-preload` | Disable full-table session Parquet preload during profile backfill; use per-snapshot PyArrow pushdown reads instead. Recommended for ~8 GB RAM to avoid OOM; combine with `--fast-mode`. |
-| `--sample-rated N` | Use only N rated canonical_ids (first N by lexicographic order). Orthogonal to `--fast-mode`. Default: no sampling (all rated). |
+| `--sample-rated N` | Use only N canonical_ids (first N by lexicographic order). Orthogonal to `--fast-mode`. Default: no sampling (all rated). |
 | `--no-month-end-snapshots` | Deprecated compatibility flag; month-end snapshot schedule is always on; **no effect**. |
 
 ---
@@ -482,7 +482,7 @@ python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
 
 Under `trainer/models/`:
 
-- `rated_model.pkl`, `nonrated_model.pkl` — LightGBM models
+- `model.pkl` — LightGBM models
 - `saved_feature_defs/` — Featuretools save_features output (Track A)
 - `feature_list.json`, `reason_code_map.json` — Feature names and reason codes
 - `model_version` — Version string (e.g. `20260228-153000-abc1234`)

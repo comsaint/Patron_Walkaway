@@ -1,9 +1,9 @@
 ---
 name: Patron Walkaway Phase 1
-overview: 依據 SSOT 文件（v10 對齊，整合七輪 Spec Compliance Review、SSOT 大幅改寫及 §10 評估口徑 / §12.1 展示邊界釐清、DEC-009/010 閾值策略），全面重構 trainer/scorer pipeline，採雙軌特徵工程架構（Featuretools DFS 軌道 A + 向量化手寫軌道 B），**Bet-level 評估**（Phase 1 簡化，DEC-012；Run-level / Cooldown 延後待業務校準），封閉 leakage、train-serve parity 破口、Schema 層級錯誤與 edge cases（含 E1–E8、F1–F4、G1–G5、H1–H4、I1–I6），並建立完整的 Testing & Validation 規格，達成 Phase 1 MVP 上線條件。
+overview: 依據 SSOT 文件（v10 對齊，整合七輪 Spec Compliance Review、SSOT 大幅改寫及 §8 特徵工程更新 / §10 評估口徑 / §12.1 展示邊界釐清、DEC-009/010/021/022/023/024 決策），全面重構 trainer/scorer pipeline，採三軌特徵工程架構（Track Profile / Track LLM / Track Human），**僅對有卡客建模與推論**，**Bet-level 評估**（Phase 1 簡化，DEC-012；Run-level / Cooldown 延後待業務校準），封閉 leakage、train-serve parity 破口、Schema 層級錯誤與 edge cases（含 E1–E8、F1–F4、G1–G5、H1–H4、I1–I6），並建立完整的 Testing & Validation 規格，達成 Phase 1 MVP 上線條件。
 todos:
   - id: config-definitions
-    content: Step 0：在 config.py 集中定義所有常數（含 v3 新增 TABLE_HC_WINDOW_MIN / PLACEHOLDER_PLAYER_ID / LOSS_STREAK_PUSH_RESETS / HIST_AVG_BET_CAP；v6 新增 OPTUNA_N_TRIALS）
+    content: Step 0：在 config.py 集中定義所有常數（含 v3 新增 TABLE_HC_WINDOW_MIN / PLACEHOLDER_PLAYER_ID / LOSS_STREAK_PUSH_RESETS / HIST_AVG_BET_CAP；v6 新增 OPTUNA_N_TRIALS；移除 nonrated_threshold，新增 UNRATED_VOLUME_LOG）
     status: pending
   - id: dq-guardrails
     content: Step 1：P0 資料品質護欄（E1 移除 t_bet.is_manual；E3 payout_complete_dtm IS NOT NULL；E4/F1 player_id != -1；G1 t_session 禁用 FINAL、用 FND-01 去重；E7 FND-04 COALESCE；F3 is_deleted/is_canceled）
@@ -15,16 +15,16 @@ todos:
     content: Step 3：新建 labels.py（C1 防洩漏；延伸拉取至少 X+Y；t_bet FINAL + E3 IS NOT NULL；G3 穩定排序 payout_complete_dtm, bet_id）
     status: pending
   - id: features-module
-    content: Step 4：新建 features.py（導入雙軌特徵工程；軌道 A EntitySet 兩階段 DFS；軌道 B 向量化手寫 loss_streak 等；嚴格套用 cutoff_time 防漏）
+    content: Step 4：新建 features.py（導入三軌特徵工程：Track Profile / Track LLM / Track Human；Track LLM 以 DuckDB + Feature Spec YAML 計算 bet-level 視窗特徵；Track Human 向量化手寫 loss_streak/run_boundary 等；嚴格套用 cutoff_time 防漏）
     status: pending
   - id: trainer-refactor
-    content: Step 5：重構 trainer.py（整合新模組；特徵篩選 Feature screening；雙模型；class_weight='balanced'；Optuna 超參調優；TRN-07 快取驗證）
+    content: Step 5：重構 trainer.py（整合新模組；特徵篩選 Feature screening；單一模型；class_weight='balanced'；Optuna 超參調優；TRN-07 快取驗證）
     status: pending
   - id: backtester-threshold
-    content: Step 6：更新 backtester.py（F1 閾值搜尋 Optuna TPE，OPTUNA_N_TRIALS；無 G1 約束；雙模型合計 alert volume；Bet-level 評估報告，DEC-012）
+    content: Step 6：更新 backtester.py（單一閾值搜尋 Optuna TPE，OPTUNA_N_TRIALS；無 G1 約束；alert volume 僅 rated 模型；Bet-level 評估報告，DEC-012）
     status: pending
   - id: scorer-refactor
-    content: Step 7：重構 scorer.py（匯入 features.py；t_bet FINAL；t_session 禁用 FINAL + FND-01 去重；E3/E4/G2 基礎過濾與回補；G3 穩定排序；D2 三步身份判定；reason codes）
+    content: Step 7：重構 scorer.py（匯入 features.py；t_bet FINAL；t_session 禁用 FINAL + FND-01 去重；E3/E4/G2 基礎過濾與回補；G3 穩定排序；D2 四步身份判定與無卡客跳過打分；reason codes）
     status: pending
   - id: validator-update
     content: Step 8：更新 validator.py（canonical_id；45min horizon；gaming day 去重）
@@ -52,11 +52,10 @@ isProject: false
 > - **回測去重口徑澄清（SSOT §10.3）**：「每 run 至多計 1 次 TP」為**離線評估口徑**，不等同線上只發一次 alert。線上通知節流屬產品/前端決策。
 > - **Reason code 展示邊界（SSOT §12.1）**：模型服務每次推論必須輸出 `reason_codes`/`score`/`margin`；「連續兩輪一致才展示」等 UX 過濾策略屬前端（`trainer/frontend/`）責任，不在模型層實作。
 
-> v8 依據 SSOT 大幅改寫，對齊 §8.2 雙軌特徵工程架構。最重大變更：
->
-> - **雙軌特徵工程**：軌道 A（Featuretools DFS）負責自動展開聚合/窗口/組合特徵空間；軌道 B（向量化 Pandas/Polars 手寫）負責 Featuretools 天然無法或效能極差的狀態機/跨玩家邏輯（`loss_streak`、`run_boundary`、`table_hc`）。兩軌共用同一 `cutoff_time` / 時間窗口框架，產出後 join 成統一 feature matrix。
-> - **兩階段 DFS 流程**：第一階段在抽樣集上探索並以 `save_features` 持久化計算圖；第二階段以 `calculate_feature_matrix(saved_feature_defs)` 對全量資料計算，從根本消除 train-serve parity 風險。
-> - `**player` 實體新增**：EntitySet 擴展至三實體（`t_bet` → `t_session` → `player`），以 `canonical_id` 為軸心支援跨 session 聚合。
+> v8 依據 SSOT 大幅改寫，對齊 §8.2 特徵工程架構。最重大變更（後續於 DEC-022/023/024 進一步演進為三軌架構）：  
+> - 將特徵工程正式拆分為玩家輪廓（後更名為 Track Profile）、投注行為（後更名為 Track LLM）與手寫狀態機（Track Human）三個層級，三者共用同一 `cutoff_time` / 時間窗口框架，產出後 join 成統一 feature matrix。  
+> - 引入集中式時間窗口定義器（`time_fold.py`），確保訓練/回測/特徵計算使用一致的時間切分邊界與 C1 延伸區間。  
+> - player-level 彙總表（`player_profile_daily`）確立為玩家輪廓特徵的唯一來源，僅供 Rated 模型使用。
 > - **集中式時間窗口定義器**：強制建立 Time Fold Splitter / Window Definer 模組（`time_fold.py`），統一管理所有時間切分邊界（SSOT §4.3）。
 
 > v6 在 v5 基礎上新增整合 **第六輪 Spec Compliance Review（I1–I4, I6）**。最重大變更：
@@ -86,7 +85,7 @@ isProject: false
 - 右截尾：**C1**（Extended pull；至少 X+Y，建議 1 天）
 - Session 特徵策略：**S1**（保守；**Phase 1 不啟用 `table_hc`**；若啟用則 `table_hc` 改用 `t_bet` 即時計算，禁用 `session_end`）
 - 上線閾值策略：**F1 最大化**（DEC-009, DEC-010）；不設 precision/alert volume 下限約束
-- 模型：Phase 1 = **LightGBM 雙模型**（Rated / Non-rated）
+- 模型：Phase 1 = **LightGBM 單一模型（Rated only）**
 - 評估口徑：**Bet-level**（SSOT §10；Run-level 延後見 DEC-012）。術語統一為 **Run**（DEC-013）
 
 ---
@@ -101,9 +100,9 @@ isProject: false
 | §5 關鍵資料品質護欄 | Step 1, Step 2 | FND-01～FND-14, F3, FND-04 不要過濾 status |
 | §6 玩家身份歸戶 D2 | Step 2 identity.py | FND-12 建置時套用；FND-12 亦用於 player_profile_daily |
 | §7 標籤設計 | Step 3 labels.py | C1 延伸拉取，G3 穩定排序 |
-| §8.2 雙軌特徵工程 | Step 4 features.py | 軌道 A DFS + 軌道 B loss_streak/run_boundary；table_hc Phase 2 |
+| §8.2 特徵工程（三軌） | Step 4 features.py | Track Profile / Track LLM / Track Human；loss_streak/run_boundary；table_hc Phase 2 |
 | §8.3 Session 特徵 S1 | Step 4, Step 7 | 進行中 session 不可見；table_hc Phase 1 不啟用 |
-| §9 建模方法 | Step 5, Step 6 | 雙模型、Optuna、PR-AUC 超參、F1 閾值 |
+| §9 建模方法 | Step 5, Step 6 | 單一模型、Optuna、PR-AUC 超參、F1 閾值 |
 | §9.4 Model API Contract | Step 9 | 完整合約見 `doc/model_api_protocol.md` |
 | §10 評估與閾值 | Step 6 | Bet-level；F1 最大化；DEC-009/010 |
 | §12 Remediation / Reason codes | Step 7, Step 10 | TRN-* 對應；reason codes 見 §12.1 |
@@ -122,12 +121,11 @@ trainer/
 │                              所有 ETL / 特徵計算 / CV 必須呼叫此模組
 ├── identity.py      ← 新建：D2 歸戶（FND-12 正確聚合 + player_id != -1）
 ├── labels.py        ← 新建：C1 防洩漏標籤
-├── features.py      ← 新建：雙軌特徵工程
-│                              軌道 A：Featuretools EntitySet + DFS + save_features
-│                              軌道 B Phase 1：loss_streak / run_boundary 向量化手寫；table_hc 延至 Phase 2
-├── trainer.py       ← 重構：整合新模組，兩階段 DFS，雙模型訓練
-├── scorer.py        ← 重構：saved_feature_defs（軌道 A）+ features.py（軌道 B），D2 三步身份判定
-├── backtester.py    ← 更新：F1 閾值搜尋（Optuna TPE），無 G1 約束；alert volume = 雙模型合計
+├── features.py      ← 新建：三軌特徵工程（Track Profile / Track LLM / Track Human）
+│                              Track LLM：DuckDB + Feature Spec YAML；Track Human Phase 1：loss_streak / run_boundary 向量化手寫；table_hc 延至 Phase 2
+├── trainer.py       ← 重構：整合新模組，DuckDB 特徵計算 + Feature Screening，僅訓練 Rated 模型
+├── scorer.py        ← 重構：內嵌 DuckDB 計算 Track LLM 特徵 + 匯入 features.py（Track Human / Track Profile），D2 四步身份判定，無卡客僅 volume log
+├── backtester.py    ← 更新：單一閾值搜尋（Optuna TPE），無 G1 約束；僅 rated 觀測
 ├── validator.py     ← 更新：canonical_id + 45min horizon
 └── api_server.py    ← 更新：Model API Contract
 ```
@@ -160,17 +158,18 @@ trainer/
 - **主流程以資料表 `gaming_day` 欄位為準**：回測 dedup 可依實作階段使用 `(canonical_id, gaming_day)` 或 `(canonical_id, run_id)`。術語統一見 DEC-013。
 - `GAMING_DAY_START_HOUR = 6` 僅保留為**備援參數**（敏感性分析或缺少 `gaming_day` 欄位的資料源才啟用），Phase 1 不依賴自算 gaming day。
 
-**閾值搜尋（DEC-009, DEC-010：F1 最大化，無 G1 約束）**
+**閾值搜尋（DEC-009, DEC-010, DEC-021：F1 最大化，單一閾值，無 G1 約束）**
 
-- `OPTUNA_N_TRIALS = 300`（I6：Optuna TPE 搜尋次數；300 次在 2D 空間通常足以收斂）
+- `OPTUNA_N_TRIALS = 300`（I6：Optuna TPE 搜尋次數；300 次在 1D 空間通常足以收斂）
 - **廢棄（回退備註）**：若未來需恢復約束式 gate，可還原 `G1_PRECISION_MIN`、`G1_ALERT_VOLUME_MIN_PER_HOUR`、`G1_FBETA`；見 DEC-009/010 回退說明
 
-**v3 新增常數（D1/E2/F2/F4 修正）**
+**v3/v6 新增常數**
 
 - `TABLE_HC_WINDOW_MIN = 30`（D1：S1 `table_hc` 回溯窗口分鐘數；從 config 讀取，禁止硬編碼）
 - `PLACEHOLDER_PLAYER_ID = -1`（E4/F1：`t_bet.player_id = -1` 為無效佔位符，需排除）
 - `LOSS_STREAK_PUSH_RESETS = False`（F4：PUSH 是否重置連敗計數；預設不重置）
 - `HIST_AVG_BET_CAP = 500_000`（F2：`hist_avg_bet` winsorization 上限；初始值需 EDA 驗證）
+- `UNRATED_VOLUME_LOG = True`（DEC-021：線上推論時是否記錄無卡客 volume 統計）
 
 **SQL fragment 常數**（供所有模組複用）
 
@@ -263,7 +262,7 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 
 **訓練期語義**：`identity.py` 接受 `cutoff_dtm`，只用 `training_window_end` 前的 session 建置 mapping，防止 mapping leakage（B1 修正）。
 
-**推論期語義**：定期更新快取（每小時增量），`built_at` 時間戳與 `model_version` 一起記錄。
+**推論期語義**：定期更新快取（每小時增量），`built_at` 時間戳與 `model_version` 一起記錄。Mapping 產出後，**訓練與推論僅保留 `canonical_id` 來自 `casino_player_id`（IS NOT NULL）的條目**。兜底到 player_id 的映射仍可保留在 mapping 表中作為身份辨識參考（判斷此人是否為 rated），但不用於特徵計算或模型推論。
 
 **D3（已知風險備忘）**：訓練窗口內的 D2 mapping 存在時序漏洞（早期觀測點理論上不應看到晚期才建立的歸戶關係）。Phase 1 接受此風險，因 `cutoff_dtm` 已從外部截斷，影響範圍有限；Phase 2 可考慮 Point-in-time Correct (PIT-correct) mapping。
 
@@ -274,6 +273,7 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 **目標**：防洩漏 walkaway label，處理右截尾（TRN-06）。
 
 - 時間軸依 `t_bet FINAL` 的 `payout_complete_dtm`（需 IS NOT NULL — E3）
+- 標籤建構前，**先過濾只保留 `canonical_id IN Canonical ID 名單（= casino_player_id 集合）` 的 bet 序列**，再對每位 rated 玩家建構 gap/label。
 - **G3（中，v4 新增 — 穩定排序）**：同毫秒多注（主注/旁注）會共享相同 `payout_complete_dtm`，標籤建構必須使用穩定排序：`ORDER BY payout_complete_dtm ASC, bet_id ASC`（訓練與服務端一致）。
 - Gap start：`b_{i+1} - b_i ≥ WALKAWAY_GAP_MIN`
 - Label：觀測點 `t = b_j`，若 `[t, t + ALERT_HORIZON_MIN]` 內存在 gap start → `label = 1`
@@ -288,76 +288,61 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 
 ### Step 4 — 共用特徵模組（`[trainer/features.py](trainer/features.py)`，Train-Serve Parity 核心）
 
-**目標**：導入雙軌特徵工程（Featuretools DFS + 向量化手寫），取代舊有靜態特徵清單；確保 EntitySet、Cutoff Time 與手寫邏輯在 Trainer 與 Scorer 間保持絕對一致（Train-Serve Parity）。
+**目標**：導入三軌特徵工程（Track Profile / Track LLM / Track Human），取代舊有靜態特徵清單與 Featuretools DFS；確保 DuckDB 特徵計算與手寫邏輯在 Trainer 與 Scorer 間保持絕對一致（Train-Serve Parity）。
 
-#### A. 構建 EntitySet 與基元 (Primitives)
+#### A. Track Profile：玩家輪廓特徵（`player_profile_daily`）
 
-- **實體定義**（對齊 SSOT §8.2）：
-  - `t_bet`（target entity）：以 `bet_id` 為 index，`payout_complete_dtm` 為 time_index。
-  - `t_session`（歷史輪廓）：以 `session_id` 為 index，`COALESCE(session_end_dtm, lud_dtm)` 為 time_index；僅納入 `available_time <= cutoff_time` 的已可得 sessions。
-  - `player`（跨日/跨桌輪廓，Phase 1）：以 `canonical_id` 為 index；由 `t_session` 依 `canonical_id` 聚合作為跨 session 聚合軸心。
-  - **player_profile_daily**（Phase 1 後延伸）：行為輪廓快照（RFM 等），以 **PIT/as-of join**（`snapshot_dtm <= bet_time` 最新快照）將欄位貼到 bet，**不**在 EntitySet 內宣告 relationship；見 SSOT §4.3、§8.2；**完整欄位規格與特徵取捨理由**見 `doc/player_profile_daily_spec.md`。
-  - **關係**：
-    - `t_bet.session_id` → `t_session.session_id`（many-to-one）。`table_id` 僅為共有欄位，不作為 EntitySet 父子關係鍵。
-    - `t_session.canonical_id` → `player.canonical_id`（many-to-one）。
-- **特徵基元 (Primitives)**：
-  - 轉化基元：`time_since`, `cum_sum`, `cum_mean`, 時間週期（時/分轉換）等。
-  - 聚合基元：過去行為的 `count`, `sum`, `mean`, `max`, `min`, `trend`。
-  - **滾動窗口**：利用 `window_size` 參數（例如 5m, 15m, 30m 等）自動展開近期行為統計。
-  - **H4（低，v5 補充 — 數值防呆）**：在餵入 EntitySet 前，對數值欄位（如 `wager`）做 `fillna(0)` 防呆。
+- 使用 `player_profile_daily` 為 Rated 玩家計算長期輪廓（RFM 等），按 DEC-011 與 SSOT §4.3 的 PIT 規則對每筆 bet 進行 as-of join：`snapshot_dtm <= bet_time` 的最近一筆 snapshot。  
+- `features.py` 需實作專門的 join 函數，並根據 Feature Spec 中的欄位定義（`source_column` → `feature_id`）選取/重命名欄位。  
+- 非 Rated 玩家不計算 Track Profile 特徵。
 
-#### B. 軌道 B：手工向量化特徵（Featuretools 無法或不宜處理的邏輯）
+#### B. Track LLM：DuckDB + Feature Spec YAML 的 Bet-level 特徵
 
-以下特徵因涉及**條件重置狀態機**或**跨玩家/跨桌聚合**，Featuretools 天然無法支援或效能極差，**必須**以高效的向量化程式碼（Pandas/Polars）手寫實作，禁止逐列遍歷（Python for-loop / `apply`）：
+- 以 DuckDB 為引擎，對 `t_bet` 進行 partition-by `canonical_id`、order-by `payout_complete_dtm, bet_id` 的時間窗口與 lag/transform/derived 計算。  
+- Feature 定義由 YAML 提供（見 DEC-024 / SSOT §8.2）：  
+  - `type`：`window` / `lag` / `transform` / `derived`。  
+  - `expression`：不含 `SELECT`/`FROM`/`JOIN` 的純運算片段。  
+  - `window_frame`：僅允許過去+當前 row（禁止 `FOLLOWING`）；Parser 靜態檢查。  
+  - `max_window_minutes` 控制視窗長度上限，並驅動 scorer 的 `HISTORY_WINDOW_MIN`。  
+- 訓練端透過 DuckDB 掃描 Parquet 或 ClickHouse 匯出檔，以月度 chunk + C1 延伸區間計算全量 Track LLM 候選特徵；推論端則在 `scorer.py` 內嵌 DuckDB，對最近 `HISTORY_WINDOW_MIN` 的 bets 執行相同 SQL。
 
+#### C. Track Human：手工向量化特徵（狀態機與 Run-level）
 
-| 特徵                                         | 為何不適合 Featuretools                                                        | 實作方式                                                                                                                          |
+以下特徵因涉及**條件重置狀態機**或**跨下注段聚合**，無法以單一 window function 安全表達，必須以高效的向量化程式碼（Pandas/Polars 或等效 DuckDB 程式邏輯）手寫實作，禁止逐列遍歷（Python for-loop / `apply`）：
+
+| 特徵                                         | 為何不適合作為單純 Track LLM window 特徵                                 | 實作方式                                                                                                                          |
 | ------------------------------------------ | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `loss_streak`                              | 需要「遇 WIN 重置、遇 PUSH 條件不重置」的序列狀態機，無對應內建 Primitive                           | 向量化 Pandas/Polars；`status='LOSE'`→+1，`status='WIN'`→重置，`PUSH` 依 `LOSS_STREAK_PUSH_RESETS`（F4）；嚴格遵守同一 cutoff_time（TRN-09 / E2） |
-| `run_boundary` / `minutes_since_run_start` | 需要「相鄰 bet 間距 ≥ `RUN_BREAK_MIN` → 新 run 開始」的序列依賴切割                         | 同上（B2 修正）                                                                                                                     |
-| `table_hc`（S1）                             | 需跨玩家、以 `table_id` 為軸心的滾動聚合；若在 EntitySet 中建 table 實體，每個 cutoff 觸發全桌掃描，效能極差 | 同上；**Phase 1 不啟用**，延至 Phase 2；可實作於 `features.py` 但 scorer/trainer 不呼叫 |
+| `loss_streak`                              | 需要「遇 WIN 重置、遇 PUSH 條件不重置」的序列狀態機，無法用單一聚合函數覆蓋                           | 向量化 Pandas/Polars；`status='LOSE'`→+1，`status='WIN'`→重置，`PUSH` 依 `LOSS_STREAK_PUSH_RESETS`（F4）；嚴格遵守同一 cutoff_time（TRN-09 / E2） |
+| `run_boundary` / `minutes_since_run_start` | 需要「相鄰 bet 間距 ≥ `RUN_BREAK_MIN` → 新 run 開始」的序列依賴切割與 run id 管理                         | 同上（B2 修正）                                                                                                                     |
+| `table_hc`（S1）                             | 需跨玩家、以 `table_id` 為軸心的滾動聚合；若用單純 per-player window 難以實現，且全桌掃描成本高 | 同上；**Phase 1 不啟用**，延至 Phase 2；可實作於 `features.py` 但 scorer/trainer 不呼叫 |
 
+**Track Human 防漏與 Parity 要求**：
 
-**手寫特徵防漏與 Parity 要求**：
-
-- 必須與軌道 A 共用同一個 `cutoff_time` / 時間窗口框架。
-- 計算函數必須抽取至 `features.py`，由 trainer 與 scorer 共同匯入（TRN-05/07/08）。
-- **G3（v4）**：同毫秒多注必須以 `payout_complete_dtm ASC, bet_id ASC` 穩定排序後再計算狀態。
+- 必須與 Track Profile / Track LLM 共用同一個 `cutoff_time` / 時間窗口框架。  
+- 計算函數必須抽取至 `features.py`，由 trainer 與 scorer 共同匯入（TRN-05/07/08），或在 DuckDB 內以等效邏輯實作。  
+- **G3（v4）**：同毫秒多注必須以 `payout_complete_dtm ASC, bet_id ASC` 穩定排序後再計算狀態。  
 - **G2（v4）**：餵入前，若 `t_bet.player_id` 無效但 `session_id` 有效，先以去重後 `t_session` 回補 `effective_player_id`。
-
-#### C. 兩階段 DFS 流程（解決單機資源限制）
-
-訓練環境為**單機**，無法對全量 4.38 億筆一次性做 DFS。採用以下兩階段流程：
-
-- **第一階段 — 探索（在抽樣資料上）**：
-  - 對各月度窗口內的多數類（label=0）做**時間分層下採樣（保留 10–20%）**，正例全保留，使每月觀測點從 ~2,300 萬降到幾百萬。
-  - 在此抽樣集上跑完整 DFS（建議 `max_depth<=2`，primitives 白名單），產出大量候選特徵。
-  - 做 Feature Screening（見下方 §D），選出高潛力候選。
-  - 以 `featuretools.save_features(feature_defs)` **將選中特徵的計算圖持久化**。
-- **第二階段 — 生產（全量）**：
-  - 以 `featuretools.calculate_feature_matrix(saved_feature_defs, entityset)` **直接套用已存的特徵定義**，逐月計算全量資料。
-  - **不重新實作**：訓練與推論都使用同一份 saved feature definitions，從根本上消除 train-serve parity 風險。
-  - 每月產出 parquet 落盤，合併後送入模型。
 
 #### D. 特徵篩選（Feature Screening）
 
-軌道 A（DFS）產出的候選特徵數量可能很大，**必須**在送入正式訓練前篩選：
-
-1. **第一階段**：依單變量與目標關聯（如 mutual information、變異數門檻）及冗餘剔除（如高相關、VIF）縮減候選集。
-2. **第二階段（可選）**：在**訓練集**上以輕量 LightGBM 計算 feature importance 或 SHAP，取 top-K。**嚴格限制在 Train 集，不得使用 valid/test**，以符合防洩漏原則（SSOT §8.2.C）。
-3. 最終通過篩選的特徵清單（軌道 A 篩選後 + 軌道 B 本期啟用：`loss_streak`、`run_boundary`；不含 `table_hc`）即為 `feature_list.json`，訓練與推論端僅計算此清單內特徵。
+- Feature Spec YAML 定義三軌的**候選特徵全集**（含 track/type/depends_on/postprocess 等）；Trainer 在抽樣後的訓練集上執行兩階段 Feature Screening：  
+  1. 第一階段：依單變量與目標關聯（如 mutual information、變異數門檻）及冗餘剔除（如高相關、VIF）縮減候選集。  
+  2. 第二階段（可選）：在**訓練集**上以輕量 LightGBM 計算 feature importance 或 SHAP，取 top-K。**嚴格限制在 Train 集，不得使用 valid/test**，以符合防洩漏原則（SSOT §8.2.C）。  
+- 最終通過篩選的特徵清單（Track Profile + Track LLM + Track Human 綜合後）即為 `feature_list.json` 或 `features_active.yaml`，訓練與推論端僅計算此清單內特徵。
 
 #### E. 防洩漏與 Cutoff Time
 
-- 訓練與推論計算特徵時，必須統一依賴 Featuretools 的 `cutoff_time` 參數，嚴格切斷該觀測點時間之後的所有資料。
-- **E 類特徵修正（A1/F2/G5）**：使用 `t_session` 資料作為聚合基礎時，必須確保 `session_avail_dtm <= cutoff_time`，並對 `avg_bet` 等 outlier 進行事前 winsorization（row-level cap）再餵給工具聚合。
-- **進行中 Session 不可見**（SSOT §8.3）：因 `t_session` 須滿足 `available_time <= cutoff_time`，當前仍在進行中的 session 對該 session 內當下的 bet 而言其 session-level 特徵**不可見**；此為設計護欄，非缺陷。
-- **H4（v5 補充 — 數值防呆）**：在餵入 EntitySet 前，對數值欄位（如 `wager`）做 `fillna(0)` 防呆。
+- 訓練與推論計算特徵時，必須統一依賴時間窗口與排序護欄（G3）切斷未來資料：  
+  - Track LLM 的 window/lag/derived 特徵僅能看到當前 row 及之前的資料（禁止 `FOLLOWING`）；  
+  - Track Profile 的 snapshot join 必須遵守 `snapshot_dtm <= bet_time`；  
+  - Track Human 的狀態機必須基於相同排序與 cutoff 語義。  
+- 使用 `t_session` 資料作為聚合基礎時，必須確保 `session_avail_dtm <= cutoff_time`，並對 `avg_bet` 等 outlier 進行事前 winsorization（row-level cap）再餵給工具聚合。  
+- **進行中 Session 不可見**（SSOT §8.3）：因 `t_session` 須滿足 `available_time <= cutoff_time`，當前仍在進行中的 session 對該 session 內當下的 bet 而言其 session-level 特徵**不可見**；此為設計護欄，非缺陷。  
+- 在餵入 DuckDB 或向量化程式之前，對數值欄位（如 `wager`）做 `fillna(0)` 防呆，並在 Feature Spec 中統一定義 `fill` / `clip` 策略。
 
-#### 特徵組對應（Rated vs Non-rated）
+#### 特徵組對應
 
-- **Rated**：軌道 A 開放完整 EntitySet 存取（`t_bet` + `t_session` + `player`），含歷史賭客輪廓與跨日聚合；軌道 B 亦全部可用。
-- **Non-rated**：軌道 A 限制 EntitySet 僅探索 `t_bet` 內部路徑（不使用 `t_session` 歷史輪廓或 `player` 實體）；軌道 B 中 `loss_streak`、`run_boundary` 可用，但 `t_session` 相關聚合不可用。
+- **模型（Rated only）**：Track Profile 提供玩家輪廓（player-level）、Track LLM 提供 bet-level 窗口與節奏特徵、Track Human 提供 Run/狀態機特徵。三軌混合後經 Feature Screening 產出統一的最終特徵集合，供 LightGBM 模型訓練與 `/score` 推論使用。
 
 ---
 
@@ -369,11 +354,11 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 - **時間窗口化抽取（SSOT §4.3）**：不得一次性載入全時段 4.38 億筆。依 `time_fold.py` 發放的邊界逐窗抽取 `t_bet`/`t_session`，對齊 partition（如 `gaming_day`）；每窗內跑 labels + features（DFS 依窗口分批呼叫），產出可寫磁碟或串接後再訓練。若需取樣，須保持時間順序並記錄取樣率。
   - **訓練/開發允許離線 Parquet 作為資料源**：若已將 ClickHouse 的完整表匯出到本機（例如 `.data/` 目錄中的 Parquet），trainer 可改為「讀取 Parquet（或經 DuckDB 掃描）」取代逐窗查 ClickHouse，以加速迭代；但仍必須套用完全相同的 DQ/去重/available_time 規則（Step 1 / SSOT §4.2 / §5）以及相同的時間窗口邊界語義。Production（線上 scorer/validator）資料來源仍以 ClickHouse 為準。
 - 依序呼叫 `identity.py`（`cutoff_dtm = training_window_end`）→ 對**各時間窗口**：`labels.py`（C1）→ `features.py`（兩階段 DFS 軌道 A + 軌道 B 向量化手寫，傳入該窗之 cutoff 時間點）→ 特徵篩選（DFS 探索後執行一次，見 Step 4 §D）。
-- **雙模型分離**（SSOT §9.1）：Rated / Non-rated 各自訓練
+- **僅訓練 Rated 模型**：只保留 canonical_id 來自 casino_player_id 的觀測。
 - **演算法與超參調優**（SSOT §9.2）：使用 LightGBM（`class_weight='balanced'`）。必須使用 **Optuna (TPE Sampler)** 在 validation set 上進行超參搜尋（如 `n_estimators`, `learning_rate`, `max_depth` 等），目標為最佳化 **PR-AUC**。閾值則以 **F1 最大化**（Step 6 backtester）選出。
 - **時間切割**：Train 70% / Valid 15% / Test 15%，嚴格按 `payout_complete_dtm` 排序
 - **TRN-07 快取驗證**：快取 key = `(window_start, window_end, data_hash)`；不符時強制重算
-- **輸出（原子單位，版本化交付）**：`rated_model.pkl`、`nonrated_model.pkl`、`**saved_feature_defs`（軌道 A 計算圖）**、`features.py`（軌道 B）、`feature_list.json`、reason code 映射表、`model_version`（格式：`YYYYMMDD-HHMMSS-{git_short_hash}`）。任何組件版本不匹配時，服務端必須拒絕載入並回報錯誤。
+- **輸出（原子單位，版本化交付）**：`model.pkl`、`**saved_feature_defs`（軌道 A 計算圖）**、`features.py`（軌道 B）、`feature_list.json`、reason code 映射表、`model_version`（格式：`YYYYMMDD-HHMMSS-{git_short_hash}`）。任何組件版本不匹配時，服務端必須拒絕載入並回報錯誤。不再產出 `nonrated_model.pkl`。
 
 ---
 
@@ -381,7 +366,7 @@ HAVING COUNT(session_id) = 1 AND SUM(COALESCE(num_games_with_wager, 0)) <= 1
 
 **F1 閾值搜尋**（TRN-11 修正；v6：I4/I6 Optuna TPE；v10：移除 G1 約束，DEC-009/010）：
 
-**雙模型閾值搜尋策略（I6 — Optuna TPE）**：Rated 與 Non-rated 各有獨立閾值（`rated_threshold`、`nonrated_threshold`），以 Optuna `TPESampler` 在二維連續空間高效搜尋，**objective = F1 最大化**（無 precision/alert volume 下限約束）：
+**單一閾值搜尋策略（I6 — Optuna TPE）**：僅針對 Rated 模型（單一閾值 `threshold`），以 Optuna `TPESampler` 在一維連續空間高效搜尋，**objective = F1 最大化**（無 precision/alert volume 下限約束）：
 
 ```python
 import numpy as np
@@ -390,16 +375,9 @@ from sklearn.metrics import f1_score
 from config import OPTUNA_N_TRIALS
 
 def objective(trial):
-    rt = trial.suggest_float("rated_threshold", 0.01, 0.99)
-    nt = trial.suggest_float("nonrated_threshold", 0.01, 0.99)
-
-    rated_pred   = (rated_scores_val   >= rt).astype(int)
-    nonrated_pred = (nonrated_scores_val >= nt).astype(int)
-
-    # 目標：最大化 F1（合併 rated + nonrated 的預測與標籤）
-    y_all = np.concatenate([y_rated_val, y_nonrated_val])
-    pred_all = np.concatenate([rated_pred, nonrated_pred])
-    return f1_score(y_all, pred_all, zero_division=0)
+    t = trial.suggest_float("threshold", 0.01, 0.99)
+    pred = (scores_val >= t).astype(int)
+    return f1_score(y_val, pred, zero_division=0)
 
 study = optuna.create_study(direction="maximize",
                             sampler=optuna.samplers.TPESampler(seed=42))
@@ -409,12 +387,12 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 
 - `OPTUNA_N_TRIALS = 300`（預設；可從 config 調整）
 - 閾值只在 validation set 選定；test set 僅用於最終報告
-- Optuna study 結果（`study.trials_dataframe()`）與最佳組合一同輸出，供後續分析
+- Optuna study 結果（`study.trials_dataframe()`）與最佳閾值一同輸出，供後續分析
 
 **回測規則**：
 
 - **G4（低，v4 新增）**：回測 dedup 可依實作使用 `(canonical_id, gaming_day)` 或 `(canonical_id, run_id)`。`gaming_day` 以表內欄位為準；`GAMING_DAY_START_HOUR` 僅作備援。
-- **回測評估口徑（SSOT §10.3）**：回測指標計算時，對同一 run 至多計入 **1 次 True Positive**，以避免高頻玩家因大量觀測點膨脹精準度指標。
+- **回測評估口徑（SSOT §10.3）**：回測指標計算時，對同一 run 至多計入 **1 次 True Positive**，以避免高頻玩家因大量觀測點膨脹精準度指標。**僅含 rated 觀測**（canonical_id 來自 casino_player_id）；無卡客 bet 不計入任何 Precision/Recall/F1/alerts-per-hour 指標。
   > **重要區分**：此去重僅是**離線評估口徑**，**不**意味著線上推論只對每位玩家每個 run 輸出一個 alert。線上通知節流屬產品/前端設計決策，不在模型規格範圍內。
 - 嚴格時序處理，不 look-ahead
 
@@ -422,7 +400,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 
 - **Micro（以觀測點為單位）**：Precision / Recall / PR-AUC / F-beta / 每小時警報量（P5–P95）
 - **Macro-by-run（Future TODO）**：以 run 為單位取平均；Phase 1 不採用，延後待業務校準（DEC-012）。
-- `rated_threshold` / `nonrated_threshold`
+- `threshold`
 
 ---
 
@@ -437,12 +415,14 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 - `t_bet` 查詢基礎條件（v4）：`payout_complete_dtm IS NOT NULL AND (player_id 有效 OR session_id 有效)`。
   - **G2**：若 `player_id` 無效但 `session_id` 有效，先 join 去重後的 `t_session` 回補 `effective_player_id = COALESCE(t_bet.player_id, t_session.player_id)`，最終只保留有效的 `effective_player_id` 再進入狀態機。
 - **歷史特徵（原 E 類）處理**：只允許將 `session_avail_dtm <= now() - SESSION_AVAIL_DELAY_MIN` 的已完成 `t_session` 加入 EntitySet（A1 修正）。
-- **D2 三步身份判定**（§6.4）：依 `identity.py` 定義，三步兜底至無卡客
-- **H3（低，v5 新增 — 雙模型路由規則）**：推論時必須明確決定此觀測點用哪個模型，禁止使用 `is_known_player`。
-  - 定義 `resolved_card_id`：依 D2 三步身份判定流程，若能取得有效 `casino_player_id`（來自「可用時間已到的 t_session」或 mapping cache 命中），則 `resolved_card_id = casino_player_id`；否則為 NULL。
+- **D2 四步身份判定**（§6.4）：依 `identity.py` 定義，三步兜底至無卡客。若最終判定為無卡客（兜底），**不呼叫模型**、不寫入警報，僅在 volume log 計入該觀測（記錄 player_id、bet 數）。
+- **H3（低，v5 新增 — 路由與跳過）**：推論時必須明確決定此觀測點是否打分，禁止使用 `is_known_player`。
+  - 定義 `resolved_card_id`：依 D2 身份判定流程，若能取得有效 `casino_player_id`（來自「可用時間已到的 t_session」或 mapping cache 命中），則 `resolved_card_id = casino_player_id`；否則為 NULL。
   - `is_rated_obs = (resolved_card_id IS NOT NULL)`。
-  - `is_rated_obs = True` → 使用 Rated model（開放存取包含歷史關聯的 EntitySet 特徵）；否則 → 使用 Non-rated model（限制 EntitySet 僅能使用 `t_bet` 內部特徵）。
-  - 所有輸出需記錄 `is_rated_obs` 與 `resolved_card_id`（若有）以便稽核。
+  - `is_rated_obs = True` → 呼叫 Rated model 打分並發佈警報。
+  - `is_rated_obs = False` → **跳過打分**，記錄 unrated volume。
+- **Volume Logging 規格（DEC-021）**：
+  若 `UNRATED_VOLUME_LOG=True`，每輪推論記錄：`poll_cycle_ts`、`unrated_player_count`、`unrated_bet_count`、`rated_player_count`、`rated_bet_count`。
 - **Reason code 輸出**（SSOT §12.1）：SHAP top-k → 4 個固定 reason codes（`BETTING_PACE_DROPPING`、`GAP_INCREASING`、`LOSS_STREAK`、`LOW_ACTIVITY_RECENTLY`）；版本化映射表（隨 `model_version` 管理）。
   - 模型服務（`/score` 端點）**每次推論必須輸出** `reason_codes`、`score`、`margin`、`model_version`、`scored_at`，不在模型層做「連續輪詢一致才輸出」的過濾。
   - **展示穩定性屬前端/產品責任**：是否連續兩輪一致才對 Host 展示、或設通知冷卻期，由 `trainer/frontend/` 及 UX 邏輯決定，不在本模型工程規格範圍內。
@@ -456,15 +436,16 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 - Ground truth：`t_bet FINAL` 時間序列，警報後 45 分鐘內出現 ≥ `WALKAWAY_GAP_MIN` 間隔
 - Visit 去重：同 Step 6（gaming day 邊界）
 - 回寫欄位新增 `model_version`, `canonical_id`, `threshold_used`, `margin`
+- **Validator 僅驗證 rated 觀測的 ground truth；無卡客警報不存在，故不需驗證。**
 
 ---
 
 ### Step 9 — Model Service API（`[trainer/api_server.py](trainer/api_server.py)`）
 
 - 對齊 SSOT §9.4；**完整 API 合約與 schema 詳見** `doc/model_api_protocol.md`
-- `POST /score`：接收 bet-level 特徵列（上限 10,000）→ 3 秒內回傳；stateless & idempotent
+- `POST /score`：接收一批 rated-only 特徵列（上限 10,000）→ 3 秒內回傳；stateless & idempotent
 - `GET /health`：`{"status": "ok", "model_version": str}`
-- `GET /model_info`：從 `feature_list.json` 動態讀取（非硬編碼）；特徵清單隨雙軌架構動態產生，非永久固定合約
+- `GET /model_info`：從 `feature_list.json` 動態讀取（非硬編碼）；單一模型，不再列 rated/nonrated
 - 缺欄位或多餘欄位一律 422，不默默補齊
 
 ---
@@ -476,13 +457,13 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 - **Leakage 偵測測試**
   - 驗證歷史特徵（原 E 類）在所有觀測點均無未來資料（`session_avail_dtm <= obs_time`）。
   - 驗證 S1 `table_hc` 的最晚資料點 ≤ `obs_time - BET_AVAIL_DELAY_MIN`。
-  - **Cutoff Time 驗證**：驗證 Featuretools 產出的 feature matrix 中，所有的聚合運算都沒有使用到大於等於 `cutoff_time` 的資料列。
-  - 驗證標籤建構用的延伸資料未混入 EntitySet 供特徵合成使用。
+  - **Cutoff Time 驗證**：驗證 DuckDB 產出的 feature matrix 中，所有 Track LLM 視窗特徵都只使用到當前 row 及之前的資料（window frame 無 `FOLLOWING`），且沒有引用 `obs_time` 之後的列。
+  - 驗證標籤建構用的延伸資料未混入特徵計算（延伸區間僅用於 label，對應 C1）。
 - **Train-Serve Parity 測試**
-  - 對同一批觀測點，分別從 `trainer.py`（批次 DFS）和 `scorer.py`（增量 EntitySet 更新）計算特徵，斷言特徵值差異 < 容忍閾值（例如浮點誤差 1e-6）。
-  - 驗證 `run_boundary`、rolling window 邊界語義的輸出一致性
+  - 對同一批觀測點，分別從 `trainer.py`（批次 DuckDB / 向量化計算）和 `scorer.py`（增量 DuckDB 狀態）計算 Track Profile / Track LLM / Track Human 特徵，斷言特徵值差異 < 容忍閾值（例如浮點誤差 1e-6）。
+  - 驗證 `run_boundary`、rolling window 邊界語義的輸出一致性。
   - **G1**：驗證 `t_session` 查詢不使用 `FINAL`，且去重結果與 FND-01（MAX(lud_dtm)）一致
-  - **G3**：在包含同毫秒多注的樣本集上，驗證 trainer/scorer 的處理順序與軌道 B 手寫狀態特徵及窗口統計逐筆一致（排序 key：`payout_complete_dtm`, `bet_id`）
+  - **G3**：在包含同毫秒多注的樣本集上，驗證 trainer/scorer 的處理順序與 Track Human 手寫狀態特徵及窗口統計逐筆一致（排序 key：`payout_complete_dtm`, `bet_id`）
   - **G2**：驗證 player_id 回補路徑：當 `t_bet.player_id` 無效但 `session_id` 有效時，`effective_player_id` 能被正確回補且不破壞分組/狀態機
 - **Label Sanity 測試**
   - `label = 1` 的比例在預期範圍（例如 5%–25%）
@@ -495,16 +476,24 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 - **Schema 合規測試**
   - 驗證 `t_bet` 查詢不包含 `is_manual` 欄位（E1）
   - 驗證 `payout_value` / `bonus` 等 100% NULL 欄位未出現在 feature 計算中（FND-08）
-  - 驗證 `loss_streak` 僅依賴 `status` 欄位（E2）
+  - 驗證 `loss_streak` 僅依賴 `status` 等預期欄位（E2），且其輸入欄位集合與 Feature Spec YAML 中 Track Human 的 `input_columns` 一致
   - 驗證 `hist_avg_bet` 最大值 ≤ `HIST_AVG_BET_CAP`（F2）
   - **G5**：驗證 winsorization 是先做 row-level cap（單列 `t_session.avg_bet`）再聚合，而不是聚合後才截斷
   - **H4（raw data 證據）**：對「本機匯出的 `t_bet` Parquet」（例如 `.data/` 內對應檔）讀取 parquet 統計或抽樣，驗證 `wager_null_pct == 0`；並在訓練/推論各自記錄 `wager_null_pct` 作為漂移監控（若 >0 觸發告警與 feature contract 更新）
 - **Model Routing 測試**
-  - **H3**：驗證 `is_rated_obs` 的路由條件不依賴 `is_known_player`，且 Rated/Non-rated 的 EntitySet 使用正確（Non-rated 限制存取歷史關聯路徑）。
+  - **H3**：驗證 `is_rated_obs = False` 的觀測**不呼叫模型**、不產出 alert；僅記錄 volume log。驗證 `is_rated_obs = True` 的觀測走完整打分流程。
 - **雙口徑評估測試（SSOT §10.3）**
   - 驗證評估報告以 Bet-level（Micro）為主；Macro-by-run 延後（DEC-012）。
+  - 驗證評估僅包含 rated 觀測。
   - 驗證回測中同一 run 至多計入 1 次 True Positive（離線評估口徑去重）。
   - （Future TODO）驗證 Macro-by-run 的計算邏輯：先對每個 run 算 precision/recall，再取平均。
+
+- **Feature Spec YAML 靜態驗證**
+  - 驗證 Feature Spec YAML 能夠成功被 Parser 載入，且所有 `feature_id` 在各 Track 中唯一。
+  - 驗證 Track LLM 中所有 `window` 類型特徵的 `window_frame` 僅包含過去 + 當前 row（禁止 `FOLLOWING`），且視窗長度不超過 `max_window_minutes`。
+  - 驗證 Track LLM 的 `expression` 僅使用白名單函數與欄位（不得出現 `SELECT` / `FROM` / `JOIN` / `UNION` / `WITH` 等關鍵字）。
+  - 驗證 `derived` 類型特徵的 `depends_on` 不形成循環依賴，並且被依賴的 feature 皆存在於同一 Track 中。
+  - 驗證 Track Human 與 Track Profile 特徵在 YAML 中宣告的 `input_columns` / `source_column` 與實際資料表 schema 一致。
 
 ---
 
@@ -535,7 +524,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 | A2        | 低     | Leakage            | §4.2, S1                                           | Step 4 S1：扣除 `BET_AVAIL_DELAY_MIN`                                 |
 | B1        | 中     | Parity             | §6.2, D2                                           | Step 2：`cutoff_dtm` 截止 + 快取版本控制                                    |
 | B2        | 中     | Parity             | §8.2.B                                             | Step 0/4：`RUN_BREAK_MIN` + 軌道 B 向量化手寫                              |
-| B3        | 低     | 特徵遺漏               | §9.1                                               | Step 4：Non-rated 亦包含時間週期等轉換特徵                                      |
+| B3        | 低     | 特徵遺漏               | §9.1                                               | Step 4：無卡客亦包含時間週期等轉換特徵（已隨架構移除）                                      |
 | C1        | 低     | SSOT 含糊            | §7.2                                               | Step 3：明確「至少 X+Y，建議 1 天」                                           |
 | C2        | 資訊性   | SSOT 不一致           | §2.1 vs §4.2                                       | Step 0：`SESSION_AVAIL_DELAY_MIN = 7`（可選 15）；與 §2.1/§4.2 對齊     |
 | C3        | 中     | 定義缺口               | §2.2, §10.3                                        | Step 0/6/8：回測 dedup 可用 `gaming_day` 或 `run_id`（G4）；術語統一為 Run（DEC-013） |
@@ -560,12 +549,12 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 | **G5**    | 低     | 聚合順序               | `t_session.avg_bet` outlier                        | Step 4/10：row-level cap → 聚合                                       |
 | **H1**    | 中     | 標籤邊界（終端下注）         | C1 / TRN-06（右截尾）                                   | Step 3/10：next_bet 缺失分流（可判定 vs censored）                           |
 | **H2**    | 中     | 身份兜底鏈完整性           | D2 / t_session 可用性（available_time）                 | Step 7：僅在 session 可得時用 session card 兜底；否則不使用                       |
-| **H3**    | 低     | 模型路由規則             | 雙模型（§9.1）                                          | Step 7/10：`is_rated_obs` 明文化 + routing 測試                          |
+| **H3**    | 低     | 模型路由規則             | 雙模型（§9.1）                                          | Step 7/10：Rated 打分 / Non-rated 跳過並記錄 volume                          |
 | **H4**    | 低     | 空值傳播（累積特徵）         | `t_bet.wager` Nullable（DDL） / raw parquet 證據       | Step 4/10：fillna 防呆 + wager_null_pct 監控                            |
 | **I1**    | 中     | SQL 欄位名稱錯誤         | `t_session.num_games_with_wager`（DDL）              | Step 2：FND-12 SQL 改用 `SUM(COALESCE(num_games_with_wager, 0)) <= 1` |
 | **I2**    | 中     | SQL 範例缺 FND-01 CTE | Step 2 identity.py 說明                              | Step 2：兩段 SQL 改為先建 deduped CTE（ROW_NUMBER 去重）再查詢                   |
 | **I3**    | 低     | Checklist 文字過時     | TRN-* Remediation Checklist TRN-01                 | Checklist：TRN-01 v3 更新欄改為「禁用 FINAL（G1）」描述                          |
-| **I4**    | 低     | 閾值搜尋策略缺失           | Step 6，雙模型（§9.1）                                    | Step 6：二維搜尋（I6 Optuna TPE）；v10 改 F1 最大化                           |
+| **I4**    | 低     | 閾值搜尋策略缺失           | Step 6，雙模型（§9.1）                                    | Step 6：**單一閾值搜尋** `threshold`；v10 改 F1 最大化                           |
 | **I6**    | 低     | 網格搜尋效率不足           | Step 6，雙模型閾值搜尋                                      | Step 0/6：改用 Optuna TPE；`OPTUNA_N_TRIALS`；v10 改 F1 objective             |
 
 
@@ -605,7 +594,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
   - **風險機制**：用 `t_session.casino_player_id` 兜底可提高 identity 覆蓋，但若 session 尚未達 available_time 就被使用，會引入未來資訊（leakage），違反 SSOT §2.1/§4.2。
   - **修正原則**：session-card 兜底僅在 `session_avail_time <= obs_time` 時可用；否則只能用 mapping cache 或 fallback 到有效的 `player_id`。
 - **H3（雙模型路由明文化）**：
-  - **風險機制**：未定義路由會導致工程端用錯欄位（尤其是 `is_known_player`），或讓 non-rated 誤用 E 類特徵造成 parity / 服務錯誤。
+  - **風險機制**：未定義路由會導致工程端用錯欄位（尤其是 `is_known_player`），或讓無卡客誤用 E 類特徵造成 parity / 服務錯誤。
   - **修正原則**：以 `resolved_card_id`（session-card 或 mapping 命中）定義 `is_rated_obs`，並記錄於輸出供稽核。
 - **H4（wager NULL 與 NA propagation）**：
   - **事實依據（raw data）**：對「本機匯出的 `t_bet` Parquet」（例如 `.data/` 內對應檔；約 4.38e8 rows）使用 Parquet row-group statistics 讀取，`wager null_count = 0`；抽樣前 5 個 row groups 亦 `wager NULL = 0`。
@@ -652,14 +641,14 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
   - **事實依據**：v4 G1 決定 `t_session` 禁用 `FINAL`；但 Checklist TRN-01 的 v3 更新欄仍寫「加 FINAL（E5）」。
   - **風險機制**：Checklist 是工程師對照實作的文件；矛盾文字會讓人誤以為 `t_session` 要加 `FINAL`，與 G1 決策衝突。
   - **修正原則**：統一更正為 G1 決策的描述，避免文件內部矛盾。
-- **I4（雙模型二維閾值搜尋，初版）**：
-  - **事實依據**：Phase 1 使用 Rated / Non-rated 雙模型，各自輸出獨立分數；D4 的 **alert volume 口徑**以兩模型合計為準（報告/監控用）。
-  - **風險機制**：若兩個閾值分別獨立選定（例如各自掃描 99 個值），可能出現 rated 模型過濾太嚴或太鬆，導致合計警報量與 precision/recall 指標出現不必要的偏移；且最佳組合需要在 2D 空間聯合搜尋才穩定。
-  - **修正原則（已由 I6 取代）**：首次確立需在二維空間聯合搜尋；具體方法見 I6。
+- **I4（單一閾值搜尋）**：
+  - **事實依據**：Phase 1 僅訓練 Rated 單一模型。
+  - **風險機制**：原計畫的二維搜尋不適用於單一模型架構。
+  - **修正原則**：改為 Optuna 一維 `threshold` 搜尋。
 - **I6（Optuna TPE 取代網格搜尋）**：
   - **事實依據**：二維網格（99×99 = 9,801 次）在每次 trial 都需計算整個 validation set 的 precision / recall 時，計算量隨模型複雜度線性成長；且網格搜尋對連續空間的覆蓋率不如隨機或貝葉斯採樣。
   - **風險機制**：網格搜尋步長固定（0.01），可能在最優解附近解析度不足；且若未來引入更多閾值參數（例如 per-table 閾值），網格複雜度會指數爆炸。
-  - **修正原則**：採用 Optuna `TPESampler`，以歷史 trial 結果建立代理模型，智慧地引導後續採樣方向；**v10 以 F1 最大化為 objective，無 gate 約束**。`OPTUNA_N_TRIALS=300` 在 2D 空間通常已足夠收斂，且未來擴充參數時只需增加 `n_trials` 而非重新設計搜尋架構。（若未來恢復約束式 gate，才需要將不可行 trial 回傳 `-inf`。）
+  - **修正原則**：採用 Optuna `TPESampler`，以歷史 trial 結果建立代理模型，智慧地引導後續採樣方向；**v10 以 F1 最大化為 objective，無 gate 約束**。`OPTUNA_N_TRIALS=300` 在 1D 空間通常已足夠收斂，且未來擴充參數時只需增加 `n_trials` 而非重新設計搜尋架構。（若未來恢復約束式 gate，才需要將不可行 trial 回傳 `-inf`。）
 
 ---
 

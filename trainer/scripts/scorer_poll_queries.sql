@@ -31,6 +31,7 @@ WHERE payout_complete_dtm >= toDateTime('2026-03-05 02:00:00', 'Asia/Hong_Kong')
   AND payout_complete_dtm <= toDateTime('2026-03-05 09:59:00', 'Asia/Hong_Kong')   -- bet_avail (end - 1 min)
   AND payout_complete_dtm IS NOT NULL
   AND wager > 0
+  AND player_id IS NOT NULL
   AND player_id != -1;
 
 
@@ -42,7 +43,7 @@ WITH deduped AS (
     SELECT *,
            ROW_NUMBER() OVER (
                PARTITION BY session_id
-               ORDER BY lud_dtm DESC, __etl_insert_Dtm DESC
+               ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC
            ) AS rn
     FROM GDP_GMWDS_Raw.t_session
     WHERE session_start_dtm >= toDateTime('2026-03-05 02:00:00', 'Asia/Hong_Kong') - INTERVAL 2 DAY   -- start - 2d
@@ -59,7 +60,10 @@ SELECT
     session_start_dtm,
     session_end_dtm,
     lud_dtm,
-    COALESCE(session_end_dtm, lud_dtm) AS session_avail_dtm
+    COALESCE(session_end_dtm, lud_dtm) AS session_avail_dtm,
+    COALESCE(turnover, 0) AS turnover,
+    COALESCE(num_games_with_wager, 0) AS num_games_with_wager
 FROM deduped
 WHERE rn = 1
-  AND COALESCE(session_end_dtm, lud_dtm) <= toDateTime('2026-03-05 09:53:00', 'Asia/Hong_Kong');   -- sess_avail (end - 7 min)
+  AND COALESCE(session_end_dtm, lud_dtm) <= toDateTime('2026-03-05 09:53:00', 'Asia/Hong_Kong')   -- sess_avail (end - 7 min)
+  AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0);

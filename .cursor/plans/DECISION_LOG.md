@@ -499,4 +499,116 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-021：改為單一模型架構（僅 Rated），不訓練無卡客模型
+
+**日期**：2026-03-05
+**SSOT 章節**：§3.1, §6.2, §8.2, §9.1, §10.2
+**關聯**：Phase 1 Plan
+
+**決策**：
+基於業務決策，本專案將資源聚焦於核心價值較高的 Rated players（有 casino_player_id 者）。
+- **取消雙模型架構**：僅對有卡客（Rated）訓練單一模型並進行推論。不再為無卡客（Non-rated）建置模型。
+- **無卡客處理策略**：線上推論時，若判定為無卡客（兜底至 player_id），將 **不呼叫模型**、**不寫入警報**，僅記錄基礎統計量（volume log，如 ID 數、bet 數）供後續監控與容量評估。
+- **打分與警報條件**：僅有「當前觀測能解析出 casino_player_id（直接存在，或經 mapping 得到 canonical_id 來自 casino_player_id）」的觀測點才進行模型打分與警報發布。
+- **閾值策略**：從 2D 雙閾值搜尋改為針對 Rated 模型的 **單一閾值搜尋**。
+- **模型命名與工件**：統一移除 `rated_`、`nonrated_` 前綴，產出單一 `model.pkl`、`threshold`。
+
+**背景與問題**：
+- 原設計包含 Rated 與 Non-rated 兩套模型。
+- 業務評估認為：無卡客流動性高且對營收貢獻影響不明確，加上其特徵深度與訊號品質皆不如 Rated 玩家。強行開發與維運 Non-rated 模型會分散注意力，且可能引發較多品質不佳的警報，消耗 Host 團隊精力。
+
+**最終理由**：
+- **業務對齊**：最大化挽留具有明確價值的目標客群（有建檔、有長期歷史行為的 Rated patrons）。
+- **系統簡化**：移除 Non-rated entity set、雙模型路由邏輯、雙維度閾值搜尋，降低線上推論與回測複雜度。
+- **減少雜訊**：不再產生缺乏強證據支持的無卡客警報，有助於初期建立公關對警報系統的信任。
+
+---
+
+## DEC-022：廢棄 Featuretools 軌道 A，改為「Track Profile / Track LLM / Track Human」三軌架構
+
+**日期**：2026-03-05  
+**SSOT 章節**：§4.3, §8.2, §9.4  
+**關聯**：DEC-001, DEC-002, DEC-011, DEC-021
+
+**決策**：
+
+1. **停止使用 Featuretools DFS 軌道 A** 作為自動特徵工程工具（不再建 EntitySet、不再使用 `save_features` / `calculate_feature_matrix`；僅保留歷史文檔作為參考）。  
+2. **正式定名並採用三軌特徵工程架構**：
+   - **Track Profile**：player-level 歷史輪廓特徵，來源為 `player_profile_daily`，以 PIT/as-of join（`snapshot_dtm <= bet_time` 最近一筆）貼到 bet 列。  
+   - **Track LLM**：LLM 建議的 bet-level 特徵，**只依賴 `t_bet` + `canonical_id`**，以時間序列 window / lag / transform 為主，由 DuckDB window function 計算。  
+   - **Track Human**：工程師手寫的狀態機/Run-level 特徵（例如 `loss_streak`, `run_id`, `minutes_since_run_start`），以向量化 Python（Pandas/Polars）實作。  
+3. 三軌皆受相同的 leakage 防護與 Train–Serve Parity 護欄約束（事件時間、available_time、穩定排序等），並可在設定中獨立 opt-in/out（例如僅啟用 Track LLM + Track Human 進行實驗）。
+
+**理由**：
+
+- Featuretools 在 20GB+ 單表、4.38 億筆 bet 的場景下，DFS + EntitySet 的記憶體成本與工程複雜度過高，即使採用兩階段 DFS 仍然不易在單機穩定落地。  
+- LLM 已可根據欄位語義快速發想大量窗口/聚合特徵，以 DuckDB SQL 表達更直覺、可讀且易於手工審核。  
+- Track Profile / Track LLM / Track Human 三軌能自然對應「長期輪廓 / 當期投注節奏 / 複雜狀態機」三種訊號來源，比原本的「Featuretools 軌道 A + 手寫軌道 B」更清晰且可測試。  
+- 移除 Featuretools 依賴可簡化部署與除錯，同時保留原本 SSOT 中最重要的護欄（PIT join、防洩漏與時間窗口一致性）。
+
+---
+
+## DEC-023：採用 DuckDB 作為訓練與推論的特徵計算引擎
+
+**日期**：2026-03-05  
+**SSOT 章節**：§4.3, §8.2, §11  
+**關聯**：DEC-014, DEC-017, DEC-022
+
+**決策**：
+
+1. **訓練端**：從 Local Parquet 或 ClickHouse 匯出的 `t_bet` / `t_session` 資料，透過 DuckDB（單機 in-process）執行所有 Track LLM 的 window / lag / transform 特徵計算。  
+2. **推論端（`scorer.py`）**：改為在 process 內嵌入 DuckDB；每個 polling cycle 從 ClickHouse 抓 raw bets 進入 DuckDB 的 in-memory 表（例如 `recent_bets`），再以與訓練端完全相同的 SQL（由 Feature Spec 產生）計算特徵。  
+3. **歷史窗口保留策略**：`scorer.py` 僅保留最近 `HISTORY_WINDOW_MIN` 分鐘的 bets（例如 75 分鐘），並在每輪 polling 時 prune 過舊資料；`HISTORY_WINDOW_MIN` 必須 ≥ Track LLM 中宣告的 `max_window_minutes` + buffer。  
+4. **Cold Start 回補**：當 `scorer.py` 啟動或重啟時，自動從 ClickHouse 回補過去 `HISTORY_WINDOW_MIN` 的 raw bets 到 DuckDB。在回補完成前暫停發警報（warmed_up = false）。
+
+**理由**：
+
+- DuckDB 對 Parquet 與 Window Function 的支援完整，能在數萬筆級別的 in-memory 表上於毫秒至百毫秒等級計算所有窗口特徵，完全滿足 45 秒 polling + 3 秒 scoring SLA。  
+- Train–Serve Parity 得以徹底簡化：同一份 Feature Spec YAML 產生相同 DuckDB SQL，訓練與推論端皆在 DuckDB 執行，避免 ClickHouse 與 Featuretools/Polars 之間的語義差異。  
+- ClickHouse 角色退化為「高效儲存與 raw 資料來源」，減少對其 window function 語義的依賴與運算負載。  
+- Cold Start 回補 + 暫停警報策略避免「重啟後前幾輪沒有完整歷史卻開始打分」的隱性風險。
+
+---
+
+## DEC-024：定義 Feature Spec YAML Protocol（候選 vs 生產特徵）
+
+**日期**：2026-03-05  
+**SSOT 章節**：§8.2, §9.4, §10.2  
+**關聯**：DEC-022, DEC-023
+
+**決策**：
+
+1. **Feature Spec 分層**：  
+   - `features_candidates.yaml`：記錄 Track Profile / Track LLM / Track Human 三軌的**候選特徵全集**（含 `feature_id`, `type`, `dtype`, `expression`, `window_frame`, `depends_on`, `postprocess` 等）。  
+   - `feature_list.json`（或 `features_active.yaml`）：由 Feature Screening 模組產生的**生產特徵清單**，僅列出最終要計算並送入模型的 feature_id。  
+2. **Track LLM YAML Schema 要點**：  
+   - 僅允許 LLM 填寫「原子算子」：`expression`（不含 SELECT/FROM/JOIN）與 `window_frame`，並明確標記 `type`（`window`/`lag`/`transform`/`derived`）。  
+   - Parser 會自動將這些片段組裝為合法的 DuckDB Window Function，並強制施加護欄：  
+     - 禁止 `FOLLOWING` 視窗（僅允許過去＋當前 row），避免未來洩漏。  
+     - 嚴格限制可用欄位（白名單 `t_bet` 欄位）與可用函數（COUNT/SUM/AVG/…）。  
+   - `max_window_minutes` 由 YAML 中集中定義；scorer 的 `HISTORY_WINDOW_MIN` 必須與之對齊。  
+3. **Track Human / Track Profile YAML Schema 要點**：  
+   - Track Human：記錄 `function_name`, `input_columns`, `output_columns`, `dtype`, `postprocess` 等，實作於 `features.py` 中的向量化函數。  
+   - Track Profile：記錄 `source_table`, `join_key`, `snapshot_time_column`, `pit_rule`（如 `snapshot_dtm <= bet_time` as-of join）、`source_column` 與 `feature_id` 映射，以及缺失 profile 時的處理策略（zero-fill 或 reject）。  
+4. **Reason Code 與 Spec Hash**：  
+   - 每個特徵可選擇性標註 `reason_code_category`（例如 `BETTING_PACE_DROPPING`, `LOSS_STREAK`），用於從 SHAP top-k 對應到穩定的 reason codes。  
+   - Pipeline 對 `features_candidates.yaml` 與 `feature_list.json` 計算 hash，將 `spec_hash`（候選）與 `active_hash`（生產）寫入 model artifact metadata，並透過 `/model_info` 暴露。
+
+**理由**：
+
+- YAML Protocol 提供一個對 LLM 友善、又對工程師透明的特徵定義格式，使「自動發想特徵」與「嚴格防洩漏/可測試性」可以共存。  
+- 候選集合與生產集合分離，能保留 LLM 的探索成果，同時保持線上模型的特徵數量可控且經過 screening。  
+- 類型化（window/lag/transform/derived/profile_column/python_vectorized）與欄位/函數白名單，有助於在載入 YAML 時做靜態檢查，降低 runtime 驚喜。  
+- Spec hash 讓模型版本與特徵定義緊密綁定，方便追蹤與回溯。
+
+---
+
+## FND-04 與 FND-12 語義對齊（2026-03-05）
+
+**背景**：FND-04 排除 ghost sessions（turnover=0 且 num_games_with_wager=0）；FND-12 偵測假帳號（1 session 且 ≤1 game）。
+
+**決策**：FND-04 應用於 FND-12 dummy 偵測後，**ghost sessions 不再計入 session_cnt**。部分 player 可能從非 dummy 變為 dummy。此為刻意行為（SSOT §5），首次上線時應比對 mapping 變化量。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

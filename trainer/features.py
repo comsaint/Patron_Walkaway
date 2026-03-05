@@ -791,14 +791,15 @@ def screen_features(
     from sklearn.feature_selection import mutual_info_classif  # type: ignore[import]
 
     # DEC-020: resolve top_k from config when caller did not supply it.
-    if top_k is _SCREEN_TOP_K_UNSET:
-        top_k = SCREEN_FEATURES_TOP_K  # type: Optional[int]  # None = no cap
+    effective_top_k: Optional[int] = (
+        SCREEN_FEATURES_TOP_K if top_k is _SCREEN_TOP_K_UNSET else top_k  # type: ignore[assignment]
+    )
 
     # R905: top_k=0 would silently return an empty feature list, causing a hard-to-debug
     # downstream failure.  Fail early with a clear error instead.
-    if top_k is not None and top_k < 1:
+    if effective_top_k is not None and effective_top_k < 1:
         raise ValueError(
-            f"screen_features: top_k must be a positive integer or None, got {top_k!r}"
+            f"screen_features: top_k must be a positive integer or None, got {effective_top_k!r}"
         )
 
     X = feature_matrix[feature_names].copy()
@@ -844,9 +845,9 @@ def screen_features(
 
     if not use_lgbm:
         # Stage 1 final: apply top_k cap on MI-sorted list (DEC-020).
-        if top_k is not None:
-            candidates = candidates[:top_k]
-            logger.info("screen_features: capped to top_k=%d (Stage 1)", top_k)
+        if effective_top_k is not None:
+            candidates = candidates[: effective_top_k]
+            logger.info("screen_features: capped to top_k=%d (Stage 1)", effective_top_k)
         return candidates
 
     # Stage 2 — LightGBM importance (TRAINING DATA ONLY — caller responsibility)
@@ -872,9 +873,9 @@ def screen_features(
     ).sort_values(ascending=False)
 
     # Stage 2 final: apply top_k cap on LGBM-ranked list (DEC-020).
-    if top_k is not None:
-        candidates = importance.head(top_k).index.tolist()
-        logger.info("screen_features: %d features after LightGBM screening (top_k=%d)", len(candidates), top_k)
+    if effective_top_k is not None:
+        candidates = importance.head(effective_top_k).index.tolist()
+        logger.info("screen_features: %d features after LightGBM screening (top_k=%d)", len(candidates), effective_top_k)
     else:
         candidates = importance.index.tolist()
         logger.info("screen_features: %d features after LightGBM screening (no cap)", len(candidates))

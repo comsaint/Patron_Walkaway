@@ -67,6 +67,7 @@ _SESSION_DEFAULTS = dict(
     is_deleted=0,
     is_canceled=0,
     num_games_with_wager=5,
+    turnover=100.0,  # FND-04: required for ghost-session filter
     lud_dtm=T0,
     __etl_insert_Dtm=T0,
     session_end_dtm=None,

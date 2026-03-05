@@ -58,7 +58,7 @@ import lightgbm as lgb
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve, precision_score
+from sklearn.metrics import average_precision_score, precision_recall_curve
 from zoneinfo import ZoneInfo
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -337,27 +337,40 @@ def load_clickhouse_data(
     # Pull extra history so Track-B state machines (loss_streak, run_boundary)
     # have cross-chunk context.  process_chunk filters training rows to
     # [window_start, window_end) after Track-B features are computed.
+    # E4/F1: exclude invalid player_id (PLAN Step 1)
+    # E5: t_bet may use FINAL for read-after-write consistency (G1: t_session must NOT)
     bets_query = f"""
         SELECT {_BET_SELECT_COLS}
-        FROM {SOURCE_DB}.{TBET}
+        FROM {SOURCE_DB}.{TBET} FINAL
         WHERE payout_complete_dtm >= %(start)s - INTERVAL {HISTORY_BUFFER_DAYS} DAY
           AND payout_complete_dtm < %(end)s
           AND wager > 0
           AND payout_complete_dtm IS NOT NULL
+          AND player_id IS NOT NULL
+          AND player_id != {PLACEHOLDER_PLAYER_ID}
     """
 
-    # No FINAL on t_session (G1). FND-01 dedup handled downstream by identity.py.
+    # No FINAL on t_session (G1). FND-01 CTE dedup for train-serve parity with scorer/validator.
     # Pull sessions overlapping the window with a ±1-day buffer.
     # FND-02: is_manual=1 rows are accounting adjustments, not real play (R38 parity fix)
     # FND-04: exclude sessions with no real activity (SSOT §5)
     session_query = f"""
+        WITH deduped AS (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY session_id
+                       ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC
+                   ) AS rn
+            FROM {SOURCE_DB}.{TSESSION}
+            WHERE session_start_dtm >= %(start)s - INTERVAL 1 DAY
+              AND session_start_dtm < %(end)s + INTERVAL 1 DAY
+              AND is_deleted = 0
+              AND is_canceled = 0
+              AND is_manual = 0
+        )
         SELECT {_SESSION_SELECT_COLS}
-        FROM {SOURCE_DB}.{TSESSION}
-        WHERE session_start_dtm >= %(start)s - INTERVAL 1 DAY
-          AND session_start_dtm < %(end)s + INTERVAL 1 DAY
-          AND is_deleted = 0
-          AND is_canceled = 0
-          AND is_manual = 0
+        FROM deduped
+        WHERE rn = 1
           AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0)
     """
 
@@ -460,8 +473,14 @@ def load_local_parquet(
                 ("payout_complete_dtm", "<",  _filter_ts(extended_end, bets_path, "payout_complete_dtm")),
             ],
         )
-        # DQ filters are applied fully in apply_dq; do a quick wager guard here
-        bets = bets[bets.get("wager", pd.Series(dtype=float)).fillna(0) > 0].copy() if "wager" in bets.columns else bets
+        # DQ filters are applied fully in apply_dq; quick guards here (E4/F1 parity with ClickHouse).
+        # Use one combined mask to avoid double-copy RAM overhead on large Parquet chunks.
+        _mask = pd.Series(True, index=bets.index)
+        if "wager" in bets.columns:
+            _mask &= bets.get("wager", pd.Series(dtype=float)).fillna(0) > 0
+        if "player_id" in bets.columns:
+            _mask &= bets["player_id"].notna() & (bets["player_id"] != PLACEHOLDER_PLAYER_ID)
+        bets = bets[_mask].copy()
         _sess_cols = None  # read all columns for normal chunk processing
 
     sessions = pd.read_parquet(
@@ -1129,9 +1148,12 @@ def apply_dq(
         bets[col] = pd.to_numeric(bets.get(col), errors="coerce")
     bets = bets.dropna(subset=["bet_id", "session_id"]).copy()
 
-    # E4/F1: drop sentinel placeholder player_id rows (R37)
+    # E4/F1: drop invalid player_id rows as final defense-in-depth guard (R37/R1100)
     if "player_id" in bets.columns:
-        bets = bets[bets["player_id"] != PLACEHOLDER_PLAYER_ID].copy()
+        bets = bets[
+            bets["player_id"].notna()
+            & (bets["player_id"] != PLACEHOLDER_PLAYER_ID)
+        ].copy()
 
     # Ensure gaming_day exists (fallback: date of payout)
     if "gaming_day" not in bets.columns:

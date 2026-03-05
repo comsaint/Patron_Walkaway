@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import datetime as dt
 import inspect
-import re
 import unittest
 from unittest.mock import patch
 

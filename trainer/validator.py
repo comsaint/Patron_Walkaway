@@ -162,6 +162,7 @@ def fetch_bets_by_canonical_id(
             SELECT player_id, payout_complete_dtm
             FROM {config.SOURCE_DB}.{config.TBET} FINAL
             WHERE player_id IN %(players)s
+              AND player_id IS NOT NULL
               AND player_id != {config.PLACEHOLDER_PLAYER_ID}
               AND payout_complete_dtm >= %(start)s
               AND payout_complete_dtm <= %(end)s
@@ -232,16 +233,18 @@ def fetch_sessions_by_canonical_id(
                 SELECT
                     player_id,
                     session_id,
-                    session_avail_dtm,
+                    COALESCE(session_end_dtm, lud_dtm) AS session_avail_dtm,
                     session_end_dtm,
+                    COALESCE(turnover, 0) AS turnover,
+                    COALESCE(num_games_with_wager, 0) AS num_games_with_wager,
                     ROW_NUMBER() OVER (
                         PARTITION BY session_id
-                        ORDER BY lud_dtm DESC, __etl_insert_Dtm DESC
+                        ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC
                     ) AS rn
                 FROM {config.SOURCE_DB}.{config.TSESSION}
                 WHERE player_id IN %(players)s
-                  AND session_avail_dtm >= %(start)s - INTERVAL 1 DAY
-                  AND session_avail_dtm <= %(end)s + INTERVAL 1 DAY
+                  AND COALESCE(session_end_dtm, lud_dtm) >= %(start)s - INTERVAL 1 DAY
+                  AND COALESCE(session_end_dtm, lud_dtm) <= %(end)s + INTERVAL 1 DAY
                   AND is_deleted = 0
                   AND is_canceled = 0
                   AND is_manual = 0
@@ -249,6 +252,7 @@ def fetch_sessions_by_canonical_id(
             SELECT player_id, session_id, session_avail_dtm, session_end_dtm
             FROM deduped
             WHERE rn = 1
+              AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0)
             ORDER BY player_id, session_avail_dtm, session_end_dtm
         """
         df = client.query_df(query, parameters=params)

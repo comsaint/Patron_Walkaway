@@ -62,7 +62,8 @@ class TestR93ComputeProfileSnapshotDateDefinition(unittest.TestCase):
         # 1) snapshot_date is passed as function parameter, or
         # 2) snapshot_date is derived inside the function from snapshot_dtm.
         has_param = re.search(r"def _compute_profile\([^)]*snapshot_date", src)
-        has_local_assign = re.search(r"\bsnapshot_date\s*=", src)
+        # Match "snapshot_date =" or "snapshot_date: date =" (type-annotated assign)
+        has_local_assign = re.search(r"\bsnapshot_date\s*(?::\s*\w+\s*)?=", src)
         self.assertTrue(
             bool(has_param) or bool(has_local_assign),
             "_compute_profile references snapshot_date but does not define it (R93)",

@@ -13,7 +13,7 @@ import inspect
 import unittest
 from datetime import datetime
 from tempfile import TemporaryDirectory
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pandas as pd
 from zoneinfo import ZoneInfo

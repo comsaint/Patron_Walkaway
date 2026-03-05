@@ -30,12 +30,15 @@ import unittest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCORER_PATH = _REPO_ROOT / "trainer" / "scorer.py"
 _VALIDATOR_PATH = _REPO_ROOT / "trainer" / "validator.py"
+_TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
 
 _SCORER_SRC = _SCORER_PATH.read_text(encoding="utf-8")
 _VALIDATOR_SRC = _VALIDATOR_PATH.read_text(encoding="utf-8")
+_TRAINER_SRC = _TRAINER_PATH.read_text(encoding="utf-8")
 
 _SCORER_TREE = ast.parse(_SCORER_SRC)
 _VALIDATOR_TREE = ast.parse(_VALIDATOR_SRC)
+_TRAINER_TREE = ast.parse(_TRAINER_SRC)
 
 
 def _func_src(tree: ast.Module, src: str, name: str) -> str:
@@ -152,6 +155,58 @@ class TestDQGuardrailsValidatorSessions(unittest.TestCase):
 
     def test_session_query_uses_fnd01_row_number_cte(self) -> None:
         """t_session fetch in validator must deduplicate via ROW_NUMBER() OVER (FND-01)."""
+        self.assertIn("ROW_NUMBER() OVER", self.src)
+
+    def test_session_query_filters_is_deleted(self) -> None:
+        self.assertIn("is_deleted = 0", self.src)
+
+    def test_session_query_filters_is_canceled(self) -> None:
+        self.assertIn("is_canceled = 0", self.src)
+
+    def test_session_query_filters_is_manual(self) -> None:
+        self.assertIn("is_manual = 0", self.src)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestDQGuardrailsTrainer(unittest.TestCase):
+    """SQL guardrails for trainer.py load_clickhouse_data (PLAN Step 1)."""
+
+    def setUp(self) -> None:
+        self.src = _func_src(_TRAINER_TREE, _TRAINER_SRC, "load_clickhouse_data")
+        self.assertNotEqual(self.src, "", "load_clickhouse_data not found in trainer.py")
+
+    def test_bet_query_uses_final(self) -> None:
+        """t_bet queries in trainer must use FINAL (E5, consistency with scorer/validator)."""
+        self.assertIn("FINAL", self.src)
+
+    def test_bet_query_excludes_placeholder_player_id(self) -> None:
+        """t_bet queries in trainer must exclude PLACEHOLDER_PLAYER_ID (E4/F1)."""
+        self.assertIn("player_id !=", self.src)
+
+    def test_bet_query_has_payout_complete_dtm_is_not_null(self) -> None:
+        """t_bet queries in trainer must use payout_complete_dtm IS NOT NULL (E3)."""
+        self.assertIn("payout_complete_dtm IS NOT NULL", self.src)
+
+    def test_bet_query_no_is_manual_column(self) -> None:
+        """is_manual is not a column on t_bet; must not appear in bet fetch SQL (E1)."""
+        # Extract only the bets_query SQL string using regex for robustness.
+        m = re.search(r'bets_query\s*=\s*f?"""(.*?)"""', self.src, re.DOTALL)
+        self.assertIsNotNone(m, "bets_query triple-quoted string not found")
+        bets_sql = m.group(1)
+        self.assertNotIn("is_manual", bets_sql)
+
+    # --- session guardrails ---
+
+    def test_session_query_no_final_on_tsession_ref(self) -> None:
+        """t_session table reference must NOT be immediately followed by FINAL."""
+        # Check that TSESSION is not followed by FINAL in the same line
+        lines = self.src.split('\n')
+        for line in lines:
+            if 'TSESSION' in line and 'FINAL' in line:
+                self.fail(f"t_session query must not use FINAL: {line.strip()}")
+
+    def test_session_query_uses_fnd01_row_number_cte(self) -> None:
+        """t_session query must deduplicate via ROW_NUMBER() OVER (FND-01)."""
         self.assertIn("ROW_NUMBER() OVER", self.src)
 
     def test_session_query_filters_is_deleted(self) -> None:

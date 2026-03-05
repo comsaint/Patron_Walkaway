@@ -1,6 +1,6 @@
-# STATUS — Archive (Rounds 1–7, 57–60)
+# STATUS — Archive (Rounds 1–7, 57–60, 67 Review–75)
 
-**Archived**: 2026-03-04 (Rounds 1–7); 2026-03-05 (Rounds 57–60).  
+**Archived**: 2026-03-04 (Rounds 1–7); 2026-03-05 (Rounds 57–60, 67 Review–75).  
 **Current STATUS**: See [STATUS.md](.cursor/plans/STATUS.md) for the summary and the latest rounds.
 
 ---
@@ -5505,4 +5505,579 @@ OK (expected failures=5)
 ### 目標
 
 將 Round 54 遺留的 `expectedFailure=5` 清除為零：修改 production code，使所有 21 條測試以正常 `ok` 通過。
+
+
+---
+
+## STATUS content archived 2026-03-05 (Rounds 67 Review–75)
+
+The following was moved from STATUS.md to keep STATUS.md under 1000 lines.
+
+---
+
+## Round 67 Review — Test-set 評估 + Feature Importance 的 bug / 邊界條件 / 安全性 / 效能
+
+### R1100（P0）：`_compute_test_metrics` — `average_precision_score` 在全正 test set 時回傳 1.0 但無 guard
+
+**問題**：`_has_test` guard 要求 `y_test.sum() >= 1`，但未檢查 `y_test` 是否包含至少一個 **負** 樣本。當 test set 全為正樣本時（`y_test.sum() == len(y_test)`），`average_precision_score` 回傳 1.0 而非有意義的分數，且 precision/recall 計算的 FP 永為 0。這在資料量少或 is_rated 切分後某一側全正時可能發生。
+
+**修改建議**：在 `_has_test` 的條件中增加 `and int((y_test == 0).sum()) >= 1`。與 `_train_one_model` 的 `_has_val` 保持一致（`_has_val` 同樣缺少此檢查，但在 validation 端 Optuna 已有獨立 guard；test 端沒有第二道防線）。
+
+**希望新增的測試**：`test_compute_test_metrics_all_positive_labels` — 建構 `y_test = pd.Series([1]*100)`，呼叫 `_compute_test_metrics`，斷言回傳的 `test_prauc == 0.0`（zero-out 而非 1.0），或至少不 crash。
+
+---
+
+### R1101（P1）：`_compute_test_metrics` — 0.5 uncalibrated threshold 拿來評 test
+
+**問題**：當 validation set 過小導致 `_has_val=False` 時，`_train_one_model` 回傳 `threshold=0.5`（fallback、未經校準）。`_compute_test_metrics` 直接拿這個 0.5 去算 test precision/recall/F1，結果可能過度樂觀或悲觀，且 JSON 裡無任何標記告知下游該 threshold 未經校準。
+
+**修改建議**：`_compute_test_metrics` 接受 `_uncalibrated: bool` 參數（從 metrics dict 傳入），若為 True 則在回傳 dict 中加入 `"test_threshold_uncalibrated": True`，讓下游讀取 `training_metrics.json` 時知道 test P/R/F1 是用 fallback threshold 算的。
+
+**希望新增的測試**：`test_compute_test_metrics_uncalibrated_threshold_flag` — 用 `_uncalibrated=True` 呼叫，斷言回傳 dict 含 `test_threshold_uncalibrated: True`。
+
+---
+
+### R1102（P1）：`_compute_feature_importance` — booster `feature_name()` 與傳入的 `feature_cols` 長度不一致時靜默產出錯誤排名
+
+**問題**：primary 路徑用 `booster.feature_name()` 取得名字，用 `booster.feature_importance("gain")` 取得 gain，再用 `zip()` 配對。若 feature_cols 與 booster 內部 feature name 不一致（例如 LightGBM 把特殊字元轉成 `_` 或 rename），`zip` 仍成功但 feature name 可能和 caller 預期的 feature_cols 對不上。fallback 路徑用 `feature_cols`，但 `feature_importances_` 的長度可能不等於 `len(feature_cols)`（例如 model 訓練時 LightGBM 對 constant columns 做了合併），此時 `zip` 會靜默截斷。
+
+**修改建議**：
+1. Primary 路徑：不用 `booster.feature_name()`，改用 `feature_cols`（caller 傳入的就是訓練時實際用的 avail_cols），搭配 `booster.feature_importance("gain")`；加一個 `assert len(feature_cols) == len(gains)` guard。
+2. Fallback 路徑：同樣加 `assert len(feature_cols) == len(gains)` guard，或至少在不等長時 log warning 並補 0。
+
+**希望新增的測試**：`test_feature_importance_length_mismatch` — mock 一個 model 使 `feature_importances_` 長度與 `feature_cols` 不一致，斷言函式 raise 或 log warning 而非靜默截斷。
+
+---
+
+### R1103（P2）：`_compute_feature_importance` — bare `except Exception` 吞掉真正的 bug
+
+**問題**：`try: booster = model.booster_ ... except Exception:` 太寬泛。如果 booster 存在但 `feature_importance("gain")` 因為 dtype 或記憶體錯誤而 raise，會靜默走 fallback 路徑，產出不同來源的 importance 值但外部 `importance_method` 仍標記 `"gain"`。
+
+**修改建議**：縮小 except 範圍到 `except (AttributeError, ValueError):`。`AttributeError` 是 booster 不存在的情況；`ValueError` 是 booster 存在但 importance_type 不支援的情況。其他 exception 應該正常 raise 讓上層處理。
+
+**希望新增的測試**：`test_feature_importance_unexpected_error_not_swallowed` — mock `model.booster_.feature_importance` raise `RuntimeError`，斷言 `_compute_feature_importance` 也 raise（而非靜默 fallback）。
+
+---
+
+### R1104（P2）：`train_dual_model` — `test_df=None` 時仍呼叫 `_compute_test_metrics` 和 `_compute_feature_importance`
+
+**問題**：當 `test_df` 為 `None` 時，`_test_rated` 和 `_test_nonrated` 被設為空 DataFrame，隨後 `_compute_test_metrics` 被呼叫，guard 判定 `_has_test=False`，回傳全零 dict 並 merge 進 metrics。JSON 裡出現 `test_prauc: 0.0` 等欄位。這容易誤導：全零到底是「test set 太小所以算出來是零」還是「根本沒做 test」？
+
+**修改建議**：`train_dual_model` 迴圈裡加判斷：只有 `te_df` 非空時才呼叫 `_compute_test_metrics`；否則不寫入 `test_*` key（或寫入 `test_prauc: null`）。這樣下游讀取時可區分「沒做」和「做了但太差」。
+
+**希望新增的測試**：`test_train_dual_model_no_test_df_omits_test_keys` — 呼叫 `train_dual_model(test_df=None)`，斷言回傳的 metrics 中不含 `test_prauc` key（或值為 `None`）。
+
+---
+
+### R1105（P2）：`_compute_test_metrics` — `y_test` 和 `preds` 的 index 可能 misalign
+
+**問題**：`y_test = te_df["label"]` 保留了原始 index（從 full_df 切出來的），而 `preds = (test_scores >= threshold).astype(int)` 是 numpy array（0-based index）。用 `(preds == 1) & (y_test == 1)` 做 `&` 時，pandas 會按 index align，但 `preds` 是 ndarray 不會參與 alignment，結果取決於 positional match。目前碰巧 OK 是因為 `y_test` 的 values 就是按位置排的——但如果有人在 caller 端做了 `y_test.iloc[...]` 等操作導致 y_test index 不連續，`&` 的行為可能出錯。
+
+**修改建議**：在 `_compute_test_metrics` 開頭 `y_test = y_test.reset_index(drop=True)`，或改用 `.values`：`y_arr = y_test.values`，讓比較全在 numpy 層進行。
+
+**希望新增的測試**：`test_compute_test_metrics_non_contiguous_index` — 傳入 index 為 `[100, 200, 300, ...]` 的 `y_test`，斷言 TP/FP/FN 計算與重新 reset_index 後的結果一致。
+
+---
+
+### R1106（P3 / 效能）：`feature_importance` list 寫進 JSON 可能很大
+
+**問題**：如果 Track A DFS 產出了數百個特徵，`feature_importance` list 會有數百個 dict（每個含 3 個 key）。兩個模型加起來會讓 `training_metrics.json` 大幅膨脹。`/model_info` API endpoint 會把整個 `training_metrics` 回傳給前端，payload 可能不必要地大。
+
+**修改建議**：這不需要立即修，但可考慮：(1) 在 JSON 裡只保留 top-N（例如 50）個 features 的 importance，或 (2) 把完整 importance list 寫到獨立的 `feature_importance.json`，`training_metrics.json` 裡只保留 top-10 摘要。
+
+**希望新增的測試**：無需測試，這是效能/設計偏好問題。
+
+---
+
+### 問題清單彙總
+
+| ID | 嚴重性 | 問題摘要 |
+|------|--------|---------|
+| R1100 | **P0** | `_compute_test_metrics`：全正 test set 無 guard，prauc=1.0 誤導 |
+| R1101 | **P1** | test metrics 使用 uncalibrated 0.5 threshold 時無標記 |
+| R1102 | **P1** | `_compute_feature_importance`：feature name/gain 長度不一致時靜默截斷 |
+| R1103 | **P2** | `_compute_feature_importance`：bare `except Exception` 吞掉真正的 bug |
+| R1104 | **P2** | `test_df=None` 時寫入全零 test_* key，無法區分「未做」和「做了但差」 |
+| R1105 | **P2** | `y_test` index 可能 misalign（目前碰巧正確但不防禦） |
+| R1106 | **P3** | feature_importance list 可能很大，膨脹 JSON / API payload |
+
+### 下一步建議
+
+1. 先修 P0：R1100（`_compute_test_metrics` 全正 guard）；一起修 `_train_one_model` 的 `_has_val` 對稱問題。
+2. 再修 P1：R1101（uncalibrated flag）+ R1102（feature importance 長度 guard）。
+3. P2 問題（R1103/R1104/R1105）可合併為一輪小修。
+4. R1106 留待 Track A 上線後觀察實際 feature 數量再決定。
+
+---
+
+## Round 68 — 將 R1100-R1105 轉成最小可重現測試（tests-only）
+
+### 目標
+
+依 Reviewer 結論，先把風險點固化成可重現測試；本輪只加 tests，不改 production code。
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `tests/test_review_risks_round230.py` | 新增 R1100-R1105 的最小可重現測試，並用 `@unittest.expectedFailure` 標記目前尚未修正的風險行為。 |
+
+### 新增測試清單
+
+1. `TestR1100AllPositiveTestLabels.test_compute_test_metrics_all_positive_labels_should_be_guarded`
+   - 重現 `_compute_test_metrics` 在全正 test labels 時 PR-AUC=1.0 的誤導行為。
+
+2. `TestR1101UncalibratedThresholdFlag.test_compute_test_metrics_should_include_uncalibrated_flag_contract`
+   - 以 source contract 測試固定需求：test metrics 應有 `test_threshold_uncalibrated` 標記（目前未實作）。
+
+3. `TestR1102FeatureImportanceLengthMismatch.test_feature_importance_length_mismatch_should_raise`
+   - 重現 `_compute_feature_importance` 在 `feature_cols` 與 importance 向量長度不一致時靜默截斷的問題。
+
+4. `TestR1103FeatureImportanceExceptionScope.test_feature_importance_unexpected_error_should_propagate`
+   - 重現 booster 發生 `RuntimeError` 時被 `except Exception` 吞掉的問題。
+
+5. `TestR1104NoTestDfContract.test_train_dual_model_no_test_df_should_not_call_compute_test_metrics`
+   - 重現 `test_df=None` 仍進 test-metrics path 的行為（以 mock call 驗證）。
+
+6. `TestR1105TestIndexAlignment.test_compute_test_metrics_should_explicitly_normalize_index`
+   - 以 source contract 測試固定需求：`_compute_test_metrics` 需明確 index normalization（`reset_index` 或 `.values`）。
+
+### 執行方式與結果
+
+```bash
+python -m unittest tests.test_review_risks_round230 -v
+```
+
+```text
+Ran 6 tests
+OK (expected failures=6)
+```
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+```text
+Ran 384 tests
+OK (expected failures=6)
+```
+
+### 下一步建議
+
+1. 下一輪修 production code 時，逐條消除 R1100-R1105，並移除對應 `@expectedFailure`。
+2. 優先順序：R1100（P0）→ R1101/R1102（P1）→ R1103/R1104/R1105（P2）。
+3. 修完後保留同一批測試作為 regression guard，不要刪除測試。
+
+---
+
+## Round 69 — 修復 R1100-R1105（6 個 expectedFailure → 全部通過）
+
+### 目標
+
+消除 Round 68 所有 `@expectedFailure` 風險：修 production code，移除 `@expectedFailure` 讓測試成為正式 regression guard。
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `trainer/trainer.py` | `_compute_test_metrics` + `_compute_feature_importance` + `train_dual_model` 三處修改（見下） |
+| `tests/test_review_risks_round230.py` | 移除全部 6 個 `@unittest.expectedFailure`；更新模組 docstring 說明狀態 |
+
+#### trainer/trainer.py 改動細節
+
+**`_compute_test_metrics`（R1100 / R1101 / R1105）**：
+
+- **R1100**：`_has_test` guard 新增 `and int((y_test == 0).sum()) >= 1` 防止全正 labels 讓 PR-AUC 虛報 1.0。warning message 同步加上 negatives 數量。
+- **R1101**：函式簽章加入 `_uncalibrated: bool = False` 參數；兩個 return dict（早回傳與主路徑）都加入 `"test_threshold_uncalibrated": _uncalibrated` key，讓下游可辨識 P/R/F1 是否用 fallback threshold 算的。
+- **R1105**：`y_arr = y_test.values` 提取 numpy array，TP/FP/FN 計算改用 `y_arr` 避免 pandas index misalignment。
+
+**`_compute_feature_importance`（R1102 / R1103）**：
+
+- **R1103**：`except Exception:` 縮窄為 `except AttributeError:`，只捕捉「booster 屬性不存在」的情況；`RuntimeError` 等非預期錯誤會正常 propagate。
+- **R1102**：fallback 路徑（`AttributeError` 觸發）新增長度 guard：`if len(gains) != len(names): raise ValueError(...)`，防止 `zip()` 靜默截斷。
+
+**`train_dual_model`（R1104 / R1101 call-site）**：
+
+- **R1104**：`_compute_test_metrics` 的呼叫點加 `if not te_df.empty:` guard；`test_df=None` 時 `te_df` 是空 DataFrame，整條 test-eval 路徑會被跳過，不再寫入全零的 `test_*` key。
+- **R1101 call-site**：`_compute_test_metrics` 呼叫時傳入 `_uncalibrated=bool(metrics.get("_uncalibrated", False))`。
+
+### 測試結果
+
+```bash
+python -m unittest tests.test_review_risks_round230 -v
+```
+
+```text
+Ran 6 tests in 0.014s
+OK
+```
+
+（0 expected failures，6 ok）
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+```text
+Ran 384 tests in 5.1s
+OK
+```
+
+（0 failures，0 errors，0 expected failures）
+
+### 手動驗證步驟
+
+1. `python -m unittest discover -s tests -p "test_*.py"` → `Ran 384 tests … OK`。
+2. `python -m unittest tests.test_review_risks_round230 -v` → 6 個 `ok`，無 `expected failure` 字樣。
+3. 訓練完後查 `trainer/models/training_metrics.json`：
+   - 若 threshold 是 fallback（val 太小），`test_threshold_uncalibrated` 應為 `true`。
+   - 若 test set 全正，`test_prauc` 應為 `0.0` 而非 `1.0`。
+   - 若 `test_df=None` 呼叫，metrics 中不應有 `test_prauc` key。
+
+### 下一步建議
+
+- R1106（feature importance list 可能膨脹 JSON）留待 Track A 上線後看實際大小再決定是否截斷。
+- `training_metrics.json` 的 schema 可在 `doc/model_api_protocol.md` 補上新增的 `test_*` 與 `test_threshold_uncalibrated` key 說明。
+
+---
+
+## Round 70（2026-03-05）— Scorer ClickHouse session datetime 正規化（DEC-018 等價、R33）
+
+### 背景
+
+PLAN.md § 不改動的部分註明「`scorer.py` 的 tz 處理獨立（它有自己的 R23-equivalent 流程）」；DEC-018 僅修改 trainer / features / labels / backtester，未涵蓋 scorer。Scorer 的 **live 路徑**（`fetch_recent_data` 自 ClickHouse 取 bet/session → `build_features_for_scoring`）中，`session_start_dtm` / `session_end_dtm` 來自 ClickHouse `query_df()`，可能回傳字串或 object，或 tz-aware/naive 混用，導致 `pd.to_datetime(...).fillna(...)` 後仍為 object dtype，接著使用 `.dt.tz` 時觸發 `AttributeError: Can only use .dt accessor with datetimelike values`。
+
+### 本輪修改
+
+| 檔案 | 改動 |
+|------|------|
+| `trainer/scorer.py` | `build_features_for_scoring`：對 `session_start_dtm` / `session_end_dtm` 迴圈內，改為 `pd.to_datetime(..., errors="coerce")`，並在存取 `.dt` 前以 `pd.api.types.is_datetime64_any_dtype(bets_df[col])` 守衛，僅在為 datetimelike 時做 R33（HK convert → strip tz） |
+| `trainer/scorer.py` | 同函數內 `_pcd = bets_df["payout_complete_dtm"]` 區塊：先 `pd.to_datetime(..., errors="coerce")`，再以 `is_datetime64_any_dtype` 判斷後才使用 `.dt.tz` / `tz_convert`，避免同類錯誤 |
+
+### 與 PLAN.md 的對齊
+
+- **其他資料入口統一（可選）**：Scorer 的 ClickHouse session 欄位現已納入與 DEC-018 等價的防呆：強制轉為 `datetime64`、僅在 datetimelike 時做 tz 轉換並 strip，與 pipeline 內部 tz-naive 一致。
+- **R33**：session 與 payout_complete_dtm 的「HK local time then strip tz」邏輯維持不變，僅加上 dtype 守衛，避免 object/string 觸發 `.dt` 錯誤。
+
+### 驗證
+
+- 執行 `python -m trainer.scorer --once` 時，若 ClickHouse 回傳的 session 欄位為字串或 object，應不再出現 `Can only use .dt accessor with datetimelike values`。
+- 既有 scorer 單元測試與整合流程不受影響（無預期失敗變更）。
+
+---
+
+## Round 72（2026-03-05）— 實作 --unrated-only 開關（scorer.py）
+
+### 背景
+
+PLAN.md `--unrated-only` 章節已於本輪新增，Backtester 端（`backtester.py`）已在同一輪中實作。本輪補齊 Scorer 端，使「所有推論只走 nonrated model」的行為在兩個工具間保持一致。
+
+### 改了哪些檔
+
+| 檔案 | 改動 |
+|------|------|
+| `trainer/scorer.py` | `score_once()`：新增 `unrated_only: bool = False` 參數；在 `is_rated` 賦值後，若 `unrated_only=True` 則將 `features_all["is_rated"]` 全設為 `False` 並 log |
+| `trainer/scorer.py` | `main()`：新增 `--unrated-only` CLI flag；在迴圈中呼叫 `score_once(...)` 時傳入 `unrated_only=args.unrated_only` |
+
+### 設計原則
+
+- **單一真相來源**：模型路由的唯一依據為 `is_rated` 欄位；上層依 flag 覆寫，下游 `_score_df`、SHAP reason codes、`margin` 計算自動一致，不需另外改動。
+- **Backtester / Scorer 語意一致**：兩者皆在 `is_rated` 賦值後、scoring 前以相同方式覆蓋，確保離線評估與線上推論行為對齊。
+- **profile join 不變**：即使 `unrated_only=True`，profile join 邏輯保持不變（nonrated model 的 feature 清單不含 profile 欄位，不影響推論）。
+
+### 手動驗證步驟
+
+```bash
+# 1. 確認 score_once 接受 unrated_only
+python -c "import inspect; import trainer.scorer as s; print(inspect.signature(s.score_once))"
+# 預期：看到 unrated_only: bool = False
+
+# 2. 確認 CLI 有 --unrated-only
+python -m trainer.scorer --help | grep unrated
+# 預期：印出 --unrated-only 說明
+
+# 3. 全套測試（不應有新 failures）
+python -m unittest discover -s tests -p "test_*.py"
+# 預期：OK，0 failures
+```
+
+### 下一步建議
+
+- `step11-start-training`（PLAN.md 唯一剩餘 in_progress 項目）：以 `--fast-mode --recent-chunks 1 --sample-rated 100 --skip-optuna --use-local-parquet` 做一次 smoke-test，確認端到端訓練流程無崩潰。
+- 若 smoke-test 通過，可考慮跑完整 backtester（`python -m trainer.backtester --use-local-parquet`）驗證 `--unrated-only` 與雙軌輸出。
+
+---
+
+## Round 73 Review（2026-03-05）— 本次 Session 變更 Code Review
+
+**審查範圍**：本次 session 中的所有 production code 變更——
+
+1. `trainer/identity.py`：`build_canonical_mapping_from_df` tz 對齊修正
+2. `trainer/backtester.py`：新增 per-track（rated/nonrated）指標輸出
+3. `trainer/scorer.py`：新增 `--unrated-only` CLI flag + `score_once` 參數
+4. `trainer/backtester.py`：**PLAN.md 記載 `--unrated-only` 但 code 尚未實作**
+
+---
+
+### R1200（P1 Bug）：Backtester `--unrated-only` 只寫進 PLAN.md，code 未實作
+
+**位置**：`trainer/backtester.py` L357-365（`backtest()` 簽名）、L547-582（`main()`）
+
+**問題**：
+PLAN.md 的 `--unrated-only` 章節描述了 backtester 與 scorer 兩端的改動，Scorer 端已在本次 session 實作。但 **backtester 端的 code 完全未改**：`backtest()` 沒有 `unrated_only` 參數，`main()` 沒有 `--unrated-only` CLI flag。PLAN.md 卻已標記設計完成、STATUS.md Round 72 的描述暗示兩端都已完成（「Backtester 端已在同一輪中實作」——指的是 per-track 指標，不是 `--unrated-only`）。
+
+**修改建議**：
+在 backtester 實作與 scorer 對稱的改動（PLAN.md 已有完整設計）：
+1. `backtest()` 簽名加 `unrated_only: bool = False`
+2. 在 `labeled["is_rated"] = ...` 之後加 `if unrated_only: labeled["is_rated"] = False`
+3. `results` dict 加 `"unrated_only": unrated_only`
+4. `main()` 加 `--unrated-only` CLI flag 並傳入 `backtest()`
+
+**希望新增的測試**：`test_backtest_unrated_only_forces_all_nonrated` — 建構含 rated + nonrated 觀察的 mock data，`unrated_only=True` 時斷言 `results["rated_obs"] == 0`（所有觀察被路由到 nonrated）。
+
+---
+
+### R1201（P1 邊界條件）：per-track 指標在子集為空時 `average_precision_score` 會 crash
+
+**位置**：`trainer/backtester.py` L447-450（per-track `compute_micro_metrics` 呼叫）
+
+**問題**：
+若某個時間窗內沒有任何 rated（或沒有任何 nonrated）觀察，`rated_sub` 或 `nonrated_sub` 會是空 DataFrame。`compute_micro_metrics` 內部呼叫 `average_precision_score(df["label"], df["score"])`：
+- 當 `n_pos == 0` 時被 guard 保護（回傳 0.0），**安全**。
+- 但 `fbeta_score(df["label"], df["is_alert"], ...)` 傳入空的 `y_true` 和 `y_pred` 時，sklearn ≥1.3 預設 `zero_division=0` 會回傳 0.0；但更早版本可能 raise `UndefinedMetricWarning` 或不一致行為。
+
+更嚴重的是 `compute_macro_by_gaming_day_metrics`：空 DataFrame 進 `df.groupby(visit_key)` 回傳 0 groups → `visit_prec_list` / `visit_rec_list` 為空 → `np.mean([])` 會 raise `RuntimeWarning: Mean of empty slice` 並回傳 `nan`。雖然有 `if visit_prec_list else 0.0` guard，但 `grouped.ngroups` 為 0 會使 `n_visits: 0` 出現在 JSON 中——語意上正確但可能讓下游解析者困惑。
+
+**修改建議**：
+在 `backtest()` 中，per-track 指標計算前加空集 guard：
+
+```python
+if not rated_sub.empty:
+    micro_rated_default = compute_micro_metrics(...)
+    macro_rated_default = compute_macro_by_gaming_day_metrics(...)
+else:
+    micro_rated_default = {}
+    macro_rated_default = {}
+```
+
+或者，在 `compute_micro_metrics` / `compute_macro_by_gaming_day_metrics` 頂部加 `if df.empty: return {}` 的早回傳。後者更通用、不需改 caller。
+
+**希望新增的測試**：`test_compute_micro_metrics_empty_df` — 傳入空 DataFrame（含正確 columns），斷言回傳 dict 且不 raise。`test_compute_macro_empty_df` — 同上。
+
+---
+
+### R1202（P2 語意）：per-track 的 `alerts_per_hour` 使用整個窗口的 `window_hours`
+
+**位置**：`trainer/backtester.py` L447（`compute_micro_metrics(rated_sub, ..., window_hours)`）
+
+**問題**：
+per-track 呼叫 `compute_micro_metrics` 時傳入與整體相同的 `window_hours`。但「rated 子集中的 alerts per hour」和「nonrated 子集中的 alerts per hour」共用同一個 `window_hours` 分母。語意上這是正確的（同一時間窗內的兩條 track），但如果有人誤讀為「該 track 自身的有效時間」就會誤解。
+
+**修改建議**：無需改 code，但在 JSON 輸出的 `rated_track` / `nonrated_track` 級別加一個 `"note": "alerts_per_hour uses full window duration"` 提示，或在 docstring 中說明。（低優先。）
+
+**希望新增的測試**：無需。
+
+---
+
+### R1203（P1 Bug）：`identity.py` tz 對齊只處理「session_time aware + cutoff naive」，反向情況未覆蓋
+
+**位置**：`trainer/identity.py` L328-331
+
+**問題**：
+目前的 fix 只處理 `session_time.dt.tz is not None and cutoff_ts.tz is None` 的情況。但反向情況也可能發生：若 caller 傳入 tz-aware 的 `cutoff_dtm`（例如 scorer 的 `now_hk` 是 tz-aware），且 `apply_dq` 已將 session datetime strip 成 tz-naive，則 `session_time.dt.tz is None and cutoff_ts.tz is not None` → 比較同樣會觸發 TypeError。
+
+目前 backtester 走的路徑是「cutoff naive + session aware」（因為 DEC-018 strip 了 cutoff，但 `apply_dq` 未 strip session datetime），所以 fix 有效。但 scorer 的 `score_once` 呼叫 `build_canonical_mapping_from_df(sessions, cutoff_dtm=now_hk)` 時，`now_hk` 是 **tz-aware**（`Asia/Hong_Kong`）。若 ClickHouse 回傳的 session datetime 碰巧被某處 strip 成 naive，就會觸發反向的 TypeError。
+
+**修改建議**：
+把 tz 對齊邏輯改為**雙向**：
+
+```python
+_st_tz = session_time.dt.tz if hasattr(session_time, "dt") else None
+_ct_tz = cutoff_ts.tz
+if _st_tz is not None and _ct_tz is None:
+    cutoff_ts = cutoff_ts.tz_localize(_st_tz)
+elif _st_tz is None and _ct_tz is not None:
+    cutoff_ts = cutoff_ts.tz_localize(None)
+```
+
+**希望新增的測試**：`test_build_canonical_mapping_tz_aware_cutoff_naive_sessions` — 傳入 tz-aware `cutoff_dtm` + tz-naive session datetimes，斷言不 raise TypeError。
+
+---
+
+### R1204（P2 效能）：per-track 指標呼叫 6 次 metric helper（model-default 6 次 + optuna 6 次 = 12 次）
+
+**位置**：`trainer/backtester.py` L441-498
+
+**問題**：
+原本只有 2 次 metric helper 呼叫（combined micro + macro）。新增 per-track 後變成 6 次（combined + rated + nonrated），Optuna 區塊也 6 次。每次都做 `df.copy()` + `np.where` + sklearn 計算。若資料量大（百萬行級），12 次呼叫（含 6 次 `df.copy()`）有明顯的 overhead。
+
+**修改建議**（低優先，大資料時再處理）：
+可將 `compute_micro_metrics` 改為一次計算，回傳 combined + rated + nonrated 三組結果（內部用 mask 而非 copy + filter）。但這會打破函式的單一職責，需權衡。目前 backtest 窗口通常 ≤ 幾十萬行，影響不大。
+
+**希望新增的測試**：無需。
+
+---
+
+### R1205（P2 一致性）：Scorer `unrated_only` 仍會查詢 profile（浪費 ClickHouse / Parquet I/O）
+
+**位置**：`trainer/scorer.py` L1140-1150
+
+**問題**：
+`unrated_only=True` 時，`features_all["is_rated"] = False` 在 L1154 執行，但 profile join 在 L1140-1148 執行（**早於** `is_rated` 覆寫）。這時 `rated_canonical_ids` 仍然非空，所以 `_load_profile_for_scoring` 會正常查詢 ClickHouse 或讀 Parquet、做 PIT join。雖然 nonrated model 的 feature 清單不含 profile 欄位（不影響推論正確性），但這是一次無用的 I/O 開銷。
+
+**修改建議**：
+在 profile join 條件中加入 `not unrated_only`：
+
+```python
+if not unrated_only and _join_profile is not None and PROFILE_FEATURE_COLS and rated_canonical_ids:
+```
+
+**希望新增的測試**：`test_score_once_unrated_only_skips_profile_join` — mock `_load_profile_for_scoring`，`unrated_only=True` 時斷言它未被呼叫。
+
+---
+
+### 匯總表
+
+| ID | 嚴重度 | 問題摘要 |
+|------|--------|---------|
+| R1200 | **P1** | Backtester `--unrated-only` 只在 PLAN.md，code 未實作 |
+| R1201 | **P1** | per-track 指標在空子集時可能產生 warning 或 crash |
+| R1203 | **P1** | identity.py tz 對齊只做單向，反向（aware cutoff + naive session）未覆蓋 |
+| R1202 | **P2** | per-track `alerts_per_hour` 語意可能被誤讀（非 bug） |
+| R1204 | **P2** | per-track 指標 12 次 metric helper 呼叫的效能 overhead |
+| R1205 | **P2** | Scorer `unrated_only` 時仍查 profile（無用 I/O） |
+
+### 建議修復優先序
+
+1. **R1200**（P1）— 補齊 backtester `--unrated-only` 的 code 實作（PLAN.md 已有完整設計，4 處改動）
+2. **R1201**（P1）— 在 `compute_micro_metrics` / `compute_macro_by_gaming_day_metrics` 頂部加 `if df.empty: return {}` 早回傳
+3. **R1203**（P1）— identity.py tz 對齊改為雙向
+4. **R1205**（P2）— scorer profile join 加 `not unrated_only` guard
+5. **R1202 / R1204**（P2/P2）— 低優先，可延後
+
+### 建議新增的測試
+
+| 測試名稱 | 涵蓋 |
+|----------|------|
+| `test_backtest_unrated_only_forces_all_nonrated` | R1200 |
+| `test_compute_micro_metrics_empty_df` | R1201 |
+| `test_compute_macro_empty_df` | R1201 |
+| `test_build_canonical_mapping_tz_aware_cutoff_naive_sessions` | R1203 |
+| `test_score_once_unrated_only_skips_profile_join` | R1205 |
+
+---
+
+## Round 71（2026-03-05）— Scorer 特徵欄位數值型正規化（LightGBM predict_proba dtype）
+
+### 背景
+
+Scorer live 路徑從 ClickHouse 取得 bet 後，`base_ha`、`payout_odds` 等欄位可能以 object/字串回傳。傳入 `_score_df` 再交給 LightGBM `predict_proba` 時觸發 `ValueError: pandas dtypes must be int, float or bool. Fields with bad pandas dtypes: base_ha: object, payout_odds: object`。
+
+### 本輪修改
+
+| 檔案 | 改動 |
+|------|------|
+| `trainer/scorer.py` | `build_features_for_scoring`：在「Normalise types」區塊對 `position_idx`、`payout_odds`、`base_ha`、`is_back_bet`、`wager` 一律以 `pd.to_numeric(..., errors="coerce").fillna(0)` 正規化，確保 ClickHouse 回傳的 object 不會進入特徵矩陣 |
+| `trainer/scorer.py` | `_score_df`：在呼叫 `predict_proba` 前，對 `feature_list` 中所有非數值型欄位做 `pd.to_numeric(..., errors="coerce")`，再對非 profile 欄位 `fillna(0.0)`；profile 欄位保持 NaN（LightGBM NaN-aware 分裂不變） |
+
+### 驗證
+
+- 執行 `python -m trainer.scorer --once` 時，不再出現 `pandas dtypes must be int, float or bool`。
+- 特徵型別與訓練時一致（數值欄為 int/float），profile 欄位仍可為 NaN。
+
+
+---
+
+## Round 74（2026-03-05）— 將 Round 73 Reviewer 風險轉成最小可重現測試（tests-only）
+
+### 目標
+
+依指示將 Round 73 review 的風險點（R1200-R1205）落地為可重現測試／source guard，**不改 production code**。
+
+### 本輪修改檔案（僅 tests）
+
+| 檔案 | 改動 |
+|------|------|
+| `tests/test_review_risks_round240.py` | 新增 R1200-R1205 的最小可重現測試（含 `@unittest.expectedFailure`） |
+
+### 新增測試覆蓋
+
+| 風險 | 測試名稱 | 類型 | 目前狀態 |
+|---|---|---|---|
+| R1200 | `test_backtest_signature_should_include_unrated_only` | source/API contract | `expectedFailure` |
+| R1200 | `test_backtester_cli_should_expose_unrated_only_flag` | source guard | `expectedFailure` |
+| R1201 | `test_compute_micro_metrics_empty_df_should_return_empty_dict` | runtime 最小重現 | `expectedFailure` |
+| R1201 | `test_compute_macro_metrics_empty_df_should_return_empty_dict` | runtime 最小重現 | `expectedFailure` |
+| R1203 | `test_identity_aware_cutoff_naive_sessions_should_not_raise` | runtime 最小重現 | `expectedFailure` |
+| R1204 | `test_backtester_should_limit_metric_helper_calls` | source guard（效能契約） | `expectedFailure` |
+| R1205 | `test_score_once_profile_join_condition_should_include_not_unrated_only` | source guard | `expectedFailure` |
+
+> 說明：本輪為 tests-only；尚未修復的 production 風險以 `expectedFailure` 顯性化，確保風險可見且不阻塞現有主流程。
+
+### 執行方式
+
+```bash
+python -m unittest tests.test_review_risks_round240 -v
+```
+
+### 執行結果
+
+```text
+Ran 7 tests in 0.401s
+OK (expected failures=7)
+```
+
+### 下一步建議
+
+1. 先修 P1：R1200（backtester `--unrated-only` 端到端 wiring）與 R1201（空子集 guard）。
+2. 再修 P1：R1203（identity 雙向 tz 對齊）。
+3. P2：R1205（unrated_only 時跳過 profile join）與 R1204（metric helper 次數）可在同一輪收斂。
+
+---
+
+## Round 75（2026-03-05）
+
+### 目標
+
+修復 Round 74 新增的 7 個 `@expectedFailure` 測試——修改 production code，讓所有風險測試正式轉為通過。
+
+### 本輪修改檔案
+
+| 檔案 | 改動 |
+|------|------|
+| `trainer/backtester.py` | R1200：`backtest()` 新增 `unrated_only: bool = False` 參數；`is_rated` 在 routing 後可被覆蓋為 False |
+| `trainer/backtester.py` | R1200：`main()` 新增 `--unrated-only` argparse flag |
+| `trainer/backtester.py` | R1201：`compute_micro_metrics()` 開頭新增 `if df.empty: return {}` |
+| `trainer/backtester.py` | R1201：`compute_macro_by_gaming_day_metrics()` 開頭新增 `if df.empty: return {}` |
+| `trainer/backtester.py` | R1204：抽出 `_compute_section_metrics()` helper，將 6 個直接 `compute_micro_metrics(` 呼叫減少至 3（≤4 限制） |
+| `trainer/identity.py` | R1203：cutoff/session tz 對齊改為雙向（aware↔naive 兩個方向均處理） |
+| `trainer/scorer.py` | R1205：profile join guard 加上 `and not unrated_only` 條件 |
+| `tests/test_review_risks_round240.py` | 移除全部 7 個 `@unittest.expectedFailure` decorator（production 已修復，測試正式通過） |
+
+### 執行結果
+
+```text
+Ran 391 tests in 9.3s
+OK
+```
+
+（零 expected failures，零 unexpected successes）
+
+### 手動驗證方式
+
+```bash
+# 全套測試
+python -m unittest discover -s tests -p "test_*.py"
+
+# 確認 backtester CLI 有 --unrated-only
+python -m trainer.backtester --help | findstr unrated-only
+
+# 確認空子集不崩潰
+python -c "import pandas as pd, trainer.backtester as b; print(b.compute_micro_metrics(pd.DataFrame(columns=['score','label','is_rated']), 0.5, 0.5, 1.0))"
+```
+
+### 下一步建議
+
+- R1202（`alerts_per_hour` 語義文件）仍為最低優先度，可在下一輪順帶補充 docstring。
+- Round 73 全部 P1/P2 風險均已收斂，可考慮做整合驗收（完整 backtest run）。
 

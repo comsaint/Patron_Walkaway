@@ -266,7 +266,7 @@ def _load_sessions(snapshot_dtm: datetime, client) -> pd.DataFrame:
         WITH deduped AS (
             SELECT
                 {_inner_cols},
-                ROW_NUMBER() OVER (PARTITION BY s.session_id ORDER BY s.lud_dtm DESC) AS rn
+                ROW_NUMBER() OVER (PARTITION BY s.session_id ORDER BY s.lud_dtm DESC NULLS LAST, s.__etl_insert_Dtm DESC) AS rn
             FROM {SOURCE_DB}.{TSESSION} AS s
             WHERE COALESCE(s.session_end_dtm, s.lud_dtm) >= %(lo_dtm)s
               AND COALESCE(s.session_end_dtm, s.lud_dtm)
@@ -534,7 +534,7 @@ def _compute_profile(
     -------
     DataFrame with one row per canonical_id plus all Phase 1 feature columns.
     """
-    snapshot_date = (  # type: date
+    snapshot_date: date = (
         snapshot_dtm.date() if isinstance(snapshot_dtm, datetime) else snapshot_dtm
     )
 

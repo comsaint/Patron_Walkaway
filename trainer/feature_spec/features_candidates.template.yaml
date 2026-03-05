@@ -1,0 +1,164 @@
+version: "2.0"
+spec_id: "walkaway_features_v2_template"
+description: "Template feature spec for Patron Walkaway Predictor (Track Profile / Track LLM / Track Human)."
+
+tracks_enabled:
+  track_profile: true
+  track_llm: true
+  track_human: true
+
+execution:
+  engine: "duckdb"
+  time_column: "payout_complete_dtm"
+  partition_key: "canonical_id"
+  order_by: "payout_complete_dtm ASC, bet_id ASC"
+  timezone_policy: "hk_local_tz_naive"
+
+inference_state:
+  history_window_min: 75          # 必須 >= track_llm.guardrails.max_window_minutes + buffer
+  history_buffer_min: 15
+  cold_start_backfill: true
+  cold_start_suspend_alerts: true
+
+guardrails:
+  disallow_sql_keywords_in_expressions: ["SELECT", "FROM", "JOIN", "UNION", "WITH"]
+  allowed_aggregate_functions: ["COUNT", "SUM", "AVG", "MIN", "MAX", "STDDEV_SAMP"]
+  allowed_window_functions: ["LAG"]
+  track_llm_allowed_columns:
+    - bet_id
+    - canonical_id
+    - payout_complete_dtm
+    - wager
+    - payout_odds
+    - status
+    - is_back_bet
+    - position_idx
+    - table_id
+
+track_llm:
+  name: "Track LLM"
+  source_table: "t_bet"
+  data_scope: "bet_only"
+  enabled: true
+
+  guardrails:
+    max_window_minutes: 60
+    disallow_following: true
+
+  candidates:
+    # ==== 以下為示例特徵，實際專案可刪除並由 LLM/工程師重新產生 ====
+    - feature_id: "bets_cnt_w15m"
+      type: "window"
+      dtype: "int"
+      description: "過去 15 分鐘下注次數"
+      rationale: "下注頻率下降通常先於離場。"
+      expression: "COUNT(bet_id)"
+      window_frame: "RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill:
+          strategy: "zero"
+        clip: { min: 0, max: 1000000 }
+      reason_code_category: "BETTING_PACE_DROPPING"
+
+    - feature_id: "wager_sum_w30m"
+      type: "window"
+      dtype: "float"
+      description: "過去 30 分鐘下注總額"
+      expression: "SUM(wager)"
+      window_frame: "RANGE BETWEEN INTERVAL 30 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 500000000.0 }
+      reason_code_category: "LOW_ACTIVITY_RECENTLY"
+
+    - feature_id: "prev_wager"
+      type: "lag"
+      dtype: "float"
+      description: "上一筆下注注碼"
+      expression: "LAG(wager, 1)"
+      postprocess:
+        fill: { strategy: "zero" }
+
+    - feature_id: "hour_of_day"
+      type: "transform"
+      dtype: "int"
+      description: "下注發生的小時（0–23）"
+      expression: "EXTRACT(HOUR FROM payout_complete_dtm)"
+      postprocess:
+        fill: { strategy: "zero" }
+
+  active:
+    feature_ids: []   # 由訓練流程產生的生產特徵清單寫入
+
+track_human:
+  name: "Track Human"
+  enabled: true
+
+  candidates:
+    - feature_id: "loss_streak"
+      type: "python_vectorized"
+      dtype: "int"
+      description: "連輸計數（WIN 重置；PUSH 是否重置由 config 決定）"
+      function_name: "compute_loss_streak"
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "status"]
+      output_columns: ["loss_streak"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 999 }
+      reason_code_category: "LOSS_STREAK"
+
+    - feature_id: "minutes_since_run_start"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "距離 run 起點的分鐘數（run 以 gap>=RUN_BREAK_MIN 切分）"
+      function_name: "compute_run_boundary_features"
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id"]
+      output_columns: ["run_id", "minutes_since_run_start"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1000000.0 }
+
+  active:
+    feature_ids: []
+
+track_profile:
+  name: "Track Profile"
+  enabled: true
+
+  source_table: "player_profile_daily"
+  join:
+    join_key: "canonical_id"
+    snapshot_time_column: "snapshot_dtm"
+    pit_rule: "asof_latest_snapshot_leq_event_time"
+    on_missing_profile:
+      strategy: "zero_fill"
+      emit_metric: "profile_missing_rate"
+
+  candidates:
+    - feature_id: "profile_days_since_last_visit"
+      type: "profile_column"
+      dtype: "float"
+      source_column: "days_since_last_visit"
+      description: "距離上次造訪天數"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 10000.0 }
+
+    - feature_id: "profile_avg_daily_turnover_30d"
+      type: "profile_column"
+      dtype: "float"
+      source_column: "avg_daily_turnover_30d"
+      description: "過去 30 天日均流水"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0e12 }
+
+  active:
+    feature_ids: []
+
+scoring_contract:
+  pass_through_columns: ["bet_id", "session_id"]
+  required_feature_ids: []   # 由訓練流程產生，通常為三軌 active feature_ids 的 union
+  all_numeric_required: true
+  reject_on_missing_or_extra: true
+

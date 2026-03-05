@@ -9,7 +9,6 @@ Uses data/gmwds_t_bet.parquet and data/gmwds_t_session.parquet if present.
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 

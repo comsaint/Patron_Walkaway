@@ -23,7 +23,7 @@ def _import_config():
 
 
 class TestConfigRequiredConstants(unittest.TestCase):
-    """Assert all Phase 1 (SSOT v9) required constants exist and have sane types."""
+    """Assert all Phase 1 (SSOT v10) required constants exist and have sane types."""
 
     @classmethod
     def setUpClass(cls):
@@ -50,11 +50,15 @@ class TestConfigRequiredConstants(unittest.TestCase):
         self.assertHasAttr("RUN_BREAK_MIN", (int, float))
         self.assertHasAttr("GAMING_DAY_START_HOUR", (int, float))
 
-    def test_g1_threshold_gate_exist(self):
-        self.assertHasAttr("G1_PRECISION_MIN", (int, float))
-        self.assertHasAttr("G1_ALERT_VOLUME_MIN_PER_HOUR", (int, float))
-        self.assertHasAttr("G1_FBETA", (int, float))
+    def test_optuna_n_trials_exist(self):
         self.assertHasAttr("OPTUNA_N_TRIALS", int)
+
+    def test_g1_deprecated_constants_are_numeric_if_present(self):
+        """DEC-009/010: G1 constants are deprecated rollback knobs."""
+        for name in ("G1_PRECISION_MIN", "G1_ALERT_VOLUME_MIN_PER_HOUR", "G1_FBETA"):
+            if hasattr(self.config, name):
+                val = getattr(self.config, name)
+                self.assertIsInstance(val, (int, float), f"{name} should be numeric if present")
 
     def test_track_b_constants_exist(self):
         self.assertHasAttr("TABLE_HC_WINDOW_MIN", (int, float))
@@ -69,6 +73,18 @@ class TestConfigRequiredConstants(unittest.TestCase):
         self.assertHasAttr("SOURCE_DB", str)
         self.assertHasAttr("TBET", str)
         self.assertHasAttr("TSESSION", str)
+
+    def test_unrated_volume_log_exists(self):
+        """PLAN Step 0: UNRATED_VOLUME_LOG (DEC-021) must exist."""
+        self.assertHasAttr("UNRATED_VOLUME_LOG", bool)
+
+    def test_no_nonrated_threshold(self):
+        """PLAN Step 0 / DEC-009: v10 single Rated model; no nonrated_threshold constant."""
+        for name in dir(self.config):
+            self.assertFalse(
+                "nonrated_threshold" in name.lower(),
+                f"config must NOT define {name} (v10 single Rated model)",
+            )
 
     def assertHasAttr(self, name: str, expected_type: type | tuple):
         self.assertTrue(hasattr(self.config, name), f"config must define {name}")

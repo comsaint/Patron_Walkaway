@@ -79,15 +79,15 @@ def main() -> None:
     print(f"Total sessions: {int(n_sessions):,}")
 
     print("\n--- Sessions per patron (all) ---")
-    for q in [0.5, 0.75, 0.9, 0.95, 0.99]:
-        v = agg["session_count"].quantile(q)
-        print(f"  p{q*100:.0f}: {v:.1f} sessions")
+    for pct in [0.5, 0.75, 0.9, 0.95, 0.99]:
+        val: float = float(agg["session_count"].quantile(pct))
+        print(f"  p{pct*100:.0f}: {val:.1f} sessions")
     print(f"  max: {agg['session_count'].max():.0f}")
 
     print("\n--- History span (days) per patron ---")
-    for q in [0.5, 0.75, 0.9, 0.95, 0.99]:
-        v = agg["history_span_days"].quantile(q)
-        print(f"  p{q*100:.0f}: {v:.1f} days")
+    for pct in [0.5, 0.75, 0.9, 0.95, 0.99]:
+        val = float(agg["history_span_days"].quantile(pct))
+        print(f"  p{pct*100:.0f}: {val:.1f} days")
     print(f"  max: {agg['history_span_days'].max():.1f} days")
 
     if n_rated > 0:

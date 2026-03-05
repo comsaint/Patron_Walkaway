@@ -28,7 +28,7 @@ Covered scenarios
 import argparse
 from datetime import datetime, timedelta
 import unittest
-from unittest.mock import patch, MagicMock, call, ANY
+from unittest.mock import patch
 
 import pandas as pd
 from zoneinfo import ZoneInfo

@@ -73,6 +73,7 @@ _REQUIRED_SESSION_COLS: frozenset[str] = frozenset({
     "is_deleted",
     "is_canceled",
     "num_games_with_wager",
+    "turnover",  # FND-04: required for ghost-session filter
 })
 
 # ---------------------------------------------------------------------------
@@ -94,6 +95,7 @@ WITH deduped AS (
 # Step 1 — extract player_id ↔ casino_player_id edges for rated players.
 # casino_player_id is cleaned inline (FND-03).  Cutoff applied via
 # COALESCE(session_end_dtm, lud_dtm) to use the business event time (FND-13).
+# FND-04: exclude ghost sessions with no real wager activity (SSOT §5).
 _LINKS_SQL_TMPL = """\
 {cte}
 SELECT player_id,
@@ -105,12 +107,14 @@ WHERE rn = 1
   AND is_deleted = 0 AND is_canceled = 0
   AND player_id IS NOT NULL AND player_id != {placeholder}
   AND COALESCE(session_end_dtm, lud_dtm) <= '{cutoff_dtm}'
+  AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0)
   AND ({clean_sql}) IS NOT NULL"""
 
 # Step 2 — identify dummy / fake-account player_ids (FND-12 / E6 / I1 / I2).
 # Groups by player_id after FND-01 dedup; COALESCE on Nullable num_games_with_wager.
 # cutoff_dtm applied here too (R8 fix) so pandas and SQL paths agree on which
 # sessions count toward the dummy criterion.
+# FND-04: exclude ghost sessions (SSOT §5).
 _DUMMY_SQL_TMPL = """\
 {cte}
 SELECT player_id
@@ -120,6 +124,7 @@ WHERE rn = 1
   AND is_deleted = 0 AND is_canceled = 0
   AND player_id IS NOT NULL AND player_id != {placeholder}
   AND COALESCE(session_end_dtm, lud_dtm) <= '{cutoff_dtm}'
+  AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0)
 GROUP BY player_id
 HAVING COUNT(session_id) = 1
    AND SUM(COALESCE(num_games_with_wager, 0)) <= 1"""
@@ -302,7 +307,7 @@ def build_canonical_mapping_from_df(
         Raw (or pre-fetched) t_session rows.  Must include columns:
         session_id, lud_dtm, __etl_insert_Dtm (optional), player_id,
         casino_player_id, session_end_dtm, is_manual, is_deleted,
-        is_canceled, num_games_with_wager.
+        is_canceled, num_games_with_wager, turnover.
     cutoff_dtm : datetime
         Training window end.  Only sessions with
         COALESCE(session_end_dtm, lud_dtm) <= cutoff_dtm are used (B1).
@@ -335,6 +340,13 @@ def build_canonical_mapping_from_df(
             # tz-naive column, tz-aware cutoff → strip cutoff tz
             cutoff_ts = cutoff_ts.replace(tzinfo=None)
 
+    # FND-04: exclude ghost sessions with no real wager activity (SSOT §5)
+    # R1301: coerce turnover to numeric to avoid TypeError on object dtype (e.g. string)
+    _turnover = pd.to_numeric(
+        deduped.get("turnover", pd.Series(0.0, index=deduped.index)),
+        errors="coerce",
+    ).fillna(0)
+    _games = deduped["num_games_with_wager"].fillna(0)
     mask = (
         (deduped["is_manual"] == 0)
         & (deduped["is_deleted"] == 0)
@@ -342,6 +354,7 @@ def build_canonical_mapping_from_df(
         & deduped["player_id"].notna()
         & (deduped["player_id"] != PLACEHOLDER_PLAYER_ID)
         & (session_time <= cutoff_ts)
+        & ((_turnover > 0) | (_games > 0))
     )
     filtered = deduped[mask].copy()
 
@@ -393,6 +406,20 @@ def get_dummy_player_ids_from_df(sessions_df: pd.DataFrame, cutoff_dtm: datetime
     session_time = deduped["session_end_dtm"].fillna(deduped["lud_dtm"])
     session_time = pd.to_datetime(session_time, errors="coerce")
     cutoff_ts = pd.Timestamp(cutoff_dtm)
+    # R1302: bidirectional tz alignment (parity with build_canonical_mapping_from_df)
+    if hasattr(session_time, "dt"):
+        col_tz = session_time.dt.tz
+        if col_tz is not None and cutoff_ts.tz is None:
+            cutoff_ts = cutoff_ts.tz_localize(col_tz)
+        elif col_tz is None and cutoff_ts.tz is not None:
+            cutoff_ts = cutoff_ts.replace(tzinfo=None)
+    # FND-04: exclude ghost sessions (SSOT §5)
+    # R1301: coerce turnover to numeric to avoid TypeError on object dtype
+    _turnover = pd.to_numeric(
+        deduped.get("turnover", pd.Series(0.0, index=deduped.index)),
+        errors="coerce",
+    ).fillna(0)
+    _games = deduped["num_games_with_wager"].fillna(0)
     mask = (
         (deduped["is_manual"] == 0)
         & (deduped["is_deleted"] == 0)
@@ -400,6 +427,7 @@ def get_dummy_player_ids_from_df(sessions_df: pd.DataFrame, cutoff_dtm: datetime
         & deduped["player_id"].notna()
         & (deduped["player_id"] != PLACEHOLDER_PLAYER_ID)
         & (session_time <= cutoff_ts)
+        & ((_turnover > 0) | (_games > 0))
     )
     filtered = deduped[mask].copy()
     return _identify_dummy_player_ids(filtered)
