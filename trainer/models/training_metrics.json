@@ -1,0 +1,45 @@
+{
+  "rated": {
+    "label": "rated",
+    "val_prauc": 0.18095818538323427,
+    "val_precision": 0.16040077256227667,
+    "val_recall": 0.6695241461929732,
+    "val_f1": 0.2587997730192801,
+    "threshold": 0.6472445883077323,
+    "val_samples": 743989,
+    "val_positives": 101838,
+    "best_hyperparams": {
+      "n_estimators": 400,
+      "learning_rate": 0.05,
+      "num_leaves": 31,
+      "max_depth": 8,
+      "min_child_samples": 20
+    },
+    "_uncalibrated": false
+  },
+  "nonrated": {
+    "label": "nonrated",
+    "val_prauc": 0.5363503849105029,
+    "val_precision": 0.4556964861957691,
+    "val_recall": 0.7657259051456329,
+    "val_f1": 0.5713643483819305,
+    "threshold": 0.612601862456999,
+    "val_samples": 151063,
+    "val_positives": 53113,
+    "best_hyperparams": {
+      "n_estimators": 400,
+      "learning_rate": 0.05,
+      "num_leaves": 31,
+      "max_depth": 8,
+      "min_child_samples": 20
+    },
+    "_uncalibrated": false
+  },
+  "model_version": "20260305-030022-994add6",
+  "fast_mode": true,
+  "sample_rated_n": 1000,
+  "uncalibrated_threshold": {
+    "rated": false,
+    "nonrated": false
+  }
+}
