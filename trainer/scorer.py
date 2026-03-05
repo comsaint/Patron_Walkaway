@@ -582,11 +582,13 @@ def build_features_for_scoring(
 
     bets_df = bets.copy()
 
-    # ── Normalise types ───────────────────────────────────────────────────
+    # ── Normalise types (ClickHouse may return object/string; LightGBM needs int/float/bool) ──
     for col in ["position_idx", "payout_odds", "base_ha", "is_back_bet", "wager"]:
         if col not in bets_df.columns:
             bets_df[col] = 0.0
-    bets_df["wager"] = pd.to_numeric(bets_df["wager"], errors="coerce").fillna(0)
+    for col in ["position_idx", "payout_odds", "base_ha", "wager"]:
+        bets_df[col] = pd.to_numeric(bets_df[col], errors="coerce").fillna(0)
+    bets_df["is_back_bet"] = pd.to_numeric(bets_df["is_back_bet"], errors="coerce").fillna(0)
     bets_df["status"] = bets_df.get("status", pd.Series("", index=bets_df.index)).astype(str).str.upper()
 
     # Normalise payout_complete_dtm to tz-naive HK local time (R23-style fix)
@@ -888,6 +890,11 @@ def _score_df(
     for col in _profile_in_list:
         if col not in df.columns:
             df[col] = np.nan
+    df[_non_profile_in_list] = df[_non_profile_in_list].fillna(0.0)
+    # Coerce feature columns to numeric (ClickHouse/joins can yield object); LightGBM requires int/float/bool
+    for col in feature_list:
+        if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     df[_non_profile_in_list] = df[_non_profile_in_list].fillna(0.0)
 
     is_rated = (
