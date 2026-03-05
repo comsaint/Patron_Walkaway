@@ -186,6 +186,8 @@ def compute_micro_metrics(
     window_hours:
         Duration of the evaluation window (used to compute alerts/hour).
     """
+    if df.empty:
+        return {}
     df = df.copy()
     df["is_alert"] = np.where(
         df["is_rated"],
@@ -243,6 +245,8 @@ def compute_macro_by_gaming_day_metrics(
     to Phase 2 (DEC-012).  This function uses gaming_day as a pragmatic
     Phase 1 approximation.
     """
+    if df.empty:
+        return {}
     if "gaming_day" not in df.columns or "canonical_id" not in df.columns:
         logger.warning("Missing canonical_id or gaming_day; macro metrics unavailable")
         return {}
@@ -279,6 +283,40 @@ def compute_macro_by_gaming_day_metrics(
         "n_visits": grouped.ngroups,
         "n_visits_with_alert": len(visit_prec_list),
         "n_visits_with_positive": len(visit_rec_list),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Combined + per-track metrics helper (reduces duplicate metric calls — R1204)
+# ---------------------------------------------------------------------------
+
+def _compute_section_metrics(
+    labeled: pd.DataFrame,
+    rated_sub: pd.DataFrame,
+    nonrated_sub: pd.DataFrame,
+    rated_threshold: float,
+    nonrated_threshold: float,
+    window_hours: Optional[float],
+) -> dict:
+    """Compute combined + rated-track + nonrated-track micro/macro metrics.
+
+    Centralises all compute_micro_metrics / compute_macro_by_gaming_day_metrics
+    calls for one threshold pair, preventing duplicated call-sites in backtest().
+    alerts_per_hour uses the full window_hours for all tracks (same evaluation window).
+    """
+    return {
+        "rated_threshold": rated_threshold,
+        "nonrated_threshold": nonrated_threshold,
+        "micro": compute_micro_metrics(labeled, rated_threshold, nonrated_threshold, window_hours),
+        "macro_by_visit": compute_macro_by_gaming_day_metrics(labeled, rated_threshold, nonrated_threshold),
+        "rated_track": {
+            "micro": compute_micro_metrics(rated_sub, rated_threshold, rated_threshold, window_hours),
+            "macro_by_visit": compute_macro_by_gaming_day_metrics(rated_sub, rated_threshold, rated_threshold),
+        },
+        "nonrated_track": {
+            "micro": compute_micro_metrics(nonrated_sub, nonrated_threshold, nonrated_threshold, window_hours),
+            "macro_by_visit": compute_macro_by_gaming_day_metrics(nonrated_sub, nonrated_threshold, nonrated_threshold),
+        },
     }
 
 
@@ -362,11 +400,18 @@ def backtest(
     window_end: datetime,
     run_optuna: bool = True,
     n_optuna_trials: int = OPTUNA_N_TRIALS,
+    unrated_only: bool = False,
 ) -> dict:
     """Full backtest pipeline for one time window.
 
     Returns a results dict with micro + macro metrics for both model-default
     thresholds and (optionally) Optuna-selected thresholds.
+
+    Parameters
+    ----------
+    unrated_only:
+        When True, force all observations through the nonrated model regardless
+        of patron status (sets is_rated=False for all rows before scoring).
     """
     extended_end = window_end + timedelta(minutes=max(LABEL_LOOKAHEAD_MIN, 24 * 60))
     history_start = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
@@ -427,6 +472,10 @@ def backtest(
         set(canonical_map["canonical_id"].unique()) if not canonical_map.empty else set()
     )
     labeled["is_rated"] = labeled["canonical_id"].isin(rated_ids)
+    # --unrated-only: force all observations through the nonrated model
+    if unrated_only:
+        labeled["is_rated"] = False
+        logger.info("unrated_only=True: all observations routed to nonrated model")
 
     # --- Score ---
     labeled = _score_df(labeled, artifacts)
@@ -434,26 +483,26 @@ def backtest(
     # --- Window duration (for alerts/hour) ---
     window_hours = (window_end - window_start).total_seconds() / 3600.0
 
+    # --- Per-track subsets (computed once, reused for default + optuna sections) ---
+    rated_sub = labeled[labeled["is_rated"]]
+    nonrated_sub = labeled[~labeled["is_rated"]]
+
     # --- Metrics with model-default thresholds ---
     rated_t_default = float((artifacts.get("rated") or {}).get("threshold", 0.5))
     nonrated_t_default = float((artifacts.get("nonrated") or {}).get("threshold", 0.5))
-
-    micro_default = compute_micro_metrics(labeled, rated_t_default, nonrated_t_default, window_hours)
-    macro_default = compute_macro_by_gaming_day_metrics(labeled, rated_t_default, nonrated_t_default)
 
     results: dict = {
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
         "window_hours": window_hours,
+        "unrated_only": unrated_only,
         "observations": len(labeled),
         "rated_obs": int(labeled["is_rated"].sum()),
         "nonrated_obs": int((~labeled["is_rated"]).sum()),
-        "model_default": {
-            "rated_threshold": rated_t_default,
-            "nonrated_threshold": nonrated_t_default,
-            "micro": micro_default,
-            "macro_by_visit": macro_default,
-        },
+        "model_default": _compute_section_metrics(
+            labeled, rated_sub, nonrated_sub,
+            rated_t_default, nonrated_t_default, window_hours,
+        ),
     }
 
     # --- Optional: Optuna 2D threshold search ---
@@ -461,14 +510,10 @@ def backtest(
         rated_t_opt, nonrated_t_opt = run_optuna_threshold_search(
             labeled, artifacts, n_trials=n_optuna_trials, window_hours=window_hours,
         )
-        micro_opt = compute_micro_metrics(labeled, rated_t_opt, nonrated_t_opt, window_hours)
-        macro_opt = compute_macro_by_gaming_day_metrics(labeled, rated_t_opt, nonrated_t_opt)
-        results["optuna"] = {
-            "rated_threshold": rated_t_opt,
-            "nonrated_threshold": nonrated_t_opt,
-            "micro": micro_opt,
-            "macro_by_visit": macro_opt,
-        }
+        results["optuna"] = _compute_section_metrics(
+            labeled, rated_sub, nonrated_sub,
+            rated_t_opt, nonrated_t_opt, window_hours,
+        )
 
     # --- Save predictions (R30: parquet for large windows; alerts stay CSV) ---
     pred_path = BACKTEST_OUT / "backtest_predictions.parquet"
@@ -532,6 +577,10 @@ def main() -> None:
         "--n-trials", type=int, default=OPTUNA_N_TRIALS,
         help=f"Optuna trials for threshold search (default: {OPTUNA_N_TRIALS})",
     )
+    parser.add_argument(
+        "--unrated-only", action="store_true",
+        help="Route all observations through the nonrated model (ignore patron rated status)",
+    )
     args = parser.parse_args()
 
     artifacts = load_dual_artifacts()
@@ -551,6 +600,7 @@ def main() -> None:
         bets_raw, sessions_raw, artifacts, start, end,
         run_optuna=not args.skip_optuna,
         n_optuna_trials=args.n_trials,
+        unrated_only=args.unrated_only,
     )
     print(json.dumps(result, indent=2, default=str))
 

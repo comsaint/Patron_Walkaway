@@ -325,10 +325,15 @@ def build_canonical_mapping_from_df(
     session_time = deduped["session_end_dtm"].fillna(deduped["lud_dtm"])
     session_time = pd.to_datetime(session_time, errors="coerce")
     cutoff_ts = pd.Timestamp(cutoff_dtm)
-    # Align tz for comparison: if session_time is tz-aware and cutoff is naive,
-    # treat cutoff as local time in session_time's timezone (DEC-018 / R23 compatibility).
-    if hasattr(session_time, "dt") and session_time.dt.tz is not None and cutoff_ts.tz is None:
-        cutoff_ts = cutoff_ts.tz_localize(session_time.dt.tz)
+    # Bidirectional tz alignment (R1203): align cutoff_ts to match session_time tz.
+    if hasattr(session_time, "dt"):
+        col_tz = session_time.dt.tz
+        if col_tz is not None and cutoff_ts.tz is None:
+            # tz-aware column, tz-naive cutoff → localize cutoff to column tz
+            cutoff_ts = cutoff_ts.tz_localize(col_tz)
+        elif col_tz is None and cutoff_ts.tz is not None:
+            # tz-naive column, tz-aware cutoff → strip cutoff tz
+            cutoff_ts = cutoff_ts.replace(tzinfo=None)
 
     mask = (
         (deduped["is_manual"] == 0)

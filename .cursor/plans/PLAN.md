@@ -676,6 +676,45 @@ for _name, _val in [("window_start", window_start), ("window_end", window_end), 
 
 ---
 
+## --unrated-only 開關（Backtester + Scorer）
+
+### 目標
+
+提供一個 CLI 開關，使**不論 patron 是否為 rated**，推論與回測都**只使用 unrated（non-rated）模型**，方便對比雙軌與單軌（unrated-only）行為，並與 backtester / scorer 行為一致。
+
+### Backtester（`trainer/backtester.py`）
+
+| 位置 | 改動 |
+|------|------|
+| **CLI** | 新增 `--unrated-only` flag；在 `main()` 呼叫 `backtest(...)` 時傳入 `unrated_only=args.unrated_only`。 |
+| **`backtest()` 簽名** | 新增參數 `unrated_only: bool = False`。 |
+| **`backtest()` 內部** | 在 `labeled["is_rated"] = labeled["canonical_id"].isin(rated_ids)` 之後、呼叫 `_score_df` 之前，若 `unrated_only` 為 True，則 `labeled["is_rated"] = False`。 |
+| **`results` dict** | 可選：在頂層加入 `"unrated_only": unrated_only`，方便 JSON 輸出記錄模式。 |
+
+下游 `_score_df`、`compute_micro_metrics`、`compute_macro_by_gaming_day_metrics`、`run_optuna_threshold_search` 皆依 `is_rated` 做模型路由與門檻選擇，無需改動。
+
+**用法**：`python -m trainer.backtester --unrated-only [--start ... --end ...]`
+
+### Scorer（`trainer/scorer.py`）
+
+| 位置 | 改動 |
+|------|------|
+| **CLI** | 新增 `--unrated-only` flag；在 `main()` 迴圈中呼叫 `score_once(...)` 時傳入 `unrated_only=args.unrated_only`。 |
+| **`score_once()` 簽名** | 新增參數 `unrated_only: bool = False`。 |
+| **`score_once()` 內部** | 在 `features_all["is_rated"] = features_all["canonical_id"].isin(rated_canonical_ids)` 之後（約第 1150 行），若 `unrated_only` 為 True，則 `features_all["is_rated"] = False`。 |
+| **（可選）profile join** | 若 `unrated_only` 為 True，可跳過 `_load_profile_for_scoring` / `_join_profile` 以省一次查詢；不跳過亦可，因 nonrated model 的 feature 清單不包含 profile 欄位，不影響推論。 |
+
+下游 `_score_df` 依 `df["is_rated"]` 設定 `is_rated_obs`、`margin` 與模型路由；SHAP reason codes 區塊依 `is_rated_obs` 分流。上游將 `is_rated` 全設為 False 後，行為自動一致。
+
+**用法**：`python -m trainer.scorer --unrated-only [--once] [--lookback-hours 8]`
+
+### 設計原則
+
+- **單一真相來源**：模型路由的唯一依據為 `is_rated` 欄位；backtester 與 scorer 皆在上層依 flag 覆寫該欄位，其餘程式碼不變。
+- **一致性**：同一 flag 在 backtester 與 scorer 語意相同，便於離線評估與線上推論對齊。
+
+---
+
 ## Key Risks / Notes
 
 - **featuretools + optuna must be installed** before running the refactored trainer

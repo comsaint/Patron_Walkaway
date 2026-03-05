@@ -1064,6 +1064,7 @@ def score_once(
     alert_history: set,
     conn: sqlite3.Connection,
     retention_hours: int = RETENTION_HOURS,
+    unrated_only: bool = False,
 ) -> None:
     """Run one scoring cycle.
 
@@ -1073,6 +1074,7 @@ def score_once(
     2. D2 identity via build_canonical_mapping_from_df.
     3. Build Track B + session rolling features (train-serve parity).
     4. H3 routing flag: is_rated ← canonical_id has casino_player_id.
+       If unrated_only=True, is_rated is forced to False for all observations.
     5. Dual model scoring via _score_df.
     6. SHAP reason codes for alert candidates.
     7. Session stats, duplicate suppression, DB write.
@@ -1137,7 +1139,7 @@ def score_once(
     # Attach rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
     # Non-rated bets and bets without a prior snapshot keep NaN — LightGBM handles
     # this natively via the default-child path trained in trainer.py (R74/R79).
-    if _join_profile is not None and PROFILE_FEATURE_COLS and rated_canonical_ids:
+    if _join_profile is not None and PROFILE_FEATURE_COLS and rated_canonical_ids and not unrated_only:
         _profile_df = _load_profile_for_scoring(rated_canonical_ids, now_hk)
         if _profile_df is not None:
             features_all = _join_profile(features_all, _profile_df)
@@ -1148,6 +1150,10 @@ def score_once(
             )
 
     features_all["is_rated"] = features_all["canonical_id"].isin(rated_canonical_ids)
+    # --unrated-only: force all observations through the nonrated model
+    if unrated_only:
+        features_all["is_rated"] = False
+        logger.info("[scorer] unrated_only=True: all observations routed to nonrated model")
     logger.info("[scorer] Feature rows (full window): %d", len(features_all))
 
     new_ids = set(new_bets["bet_id"].astype(str))
@@ -1285,6 +1291,10 @@ def main() -> None:
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING"],
     )
+    parser.add_argument(
+        "--unrated-only", action="store_true",
+        help="Use only the non-rated model for all patrons (ignore rated/unrated routing)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1311,7 +1321,8 @@ def main() -> None:
     while True:
         t_start = time.time()
         try:
-            score_once(artifacts, args.lookback_hours, alert_history, conn, RETENTION_HOURS)
+            score_once(artifacts, args.lookback_hours, alert_history, conn, RETENTION_HOURS,
+                       unrated_only=args.unrated_only)
         except Exception as exc:
             logger.error("[scorer] ERROR: %s", exc, exc_info=True)
         elapsed = time.time() - t_start
