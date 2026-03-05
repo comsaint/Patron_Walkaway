@@ -22,7 +22,7 @@ SOURCE_DB  = os.getenv("SOURCE_DB", "GDP_GMWDS_Raw")
 TBET     = "t_bet"
 TSESSION = "t_session"
 TGAME    = "t_game"
-TPROFILE = "player_profile_daily"  # PIT/as-of profile snapshot table (DEC-011)
+TPROFILE = "player_profile"  # PIT/as-of profile snapshot table (DEC-011)
 
 # ------------------ Time / locality -------------------------------
 HK_TZ = "Asia/Hong_Kong"
@@ -90,6 +90,12 @@ OPTUNA_N_TRIALS = 300            # Optuna TPE trials for F1 threshold search (DE
 # None = no cap (all Stage-1 survivors kept); integer N = hard upper limit applied
 # after Stage-1 (MI ranking) and, if use_lgbm=True, after Stage-2 (LGBM ranking).
 SCREEN_FEATURES_TOP_K: Optional[int] = None
+
+# --- Threshold selection guardrails ---
+# Minimum number of validation alerts required for a candidate threshold to be
+# considered during F1 maximisation.  Small validation sets (e.g. --sample-rated)
+# may require a lower value; large sets may warrant a higher one.
+MIN_THRESHOLD_ALERT_COUNT = 5
 
 # --- Track B constants ---
 TABLE_HC_WINDOW_MIN = 30         # Lookback window for table headcount feature (D1)

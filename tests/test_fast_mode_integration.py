@@ -2,8 +2,8 @@
 
 These tests exercise run_pipeline() with mocked heavy I/O so they run in
 milliseconds without real Parquet files.  They verify the *wiring* between
-CLI flags and the downstream helpers (ensure_player_profile_daily_ready,
-load_player_profile_daily, process_chunk) rather than the computations
+CLI flags and the downstream helpers (ensure_player_profile_ready,
+load_player_profile, process_chunk) rather than the computations
 inside those helpers.
 
 Covered scenarios
@@ -11,11 +11,11 @@ Covered scenarios
 1. FastModeHorizonPropagation  — fast_mode=True with recent_chunks=1:
    - snapshot_interval_days == 1 (month-end scheduling enforced globally)
    - max_lookback_days == data_horizon_days (not 365)
-   - fast_mode=True forwarded to ensure_player_profile_daily_ready
+   - fast_mode=True forwarded to ensure_player_profile_ready
    - ensure called with the trimmed effective window, not the original window
 
 2. FastModeNoPreload  — fast_mode=True + fast_mode_no_preload=True:
-   - preload_sessions=False forwarded to ensure_player_profile_daily_ready
+   - preload_sessions=False forwarded to ensure_player_profile_ready
 
 3. SampleRatedWhitelist  — sample_rated=N with canonical_map containing M IDs:
    - canonical_id_whitelist has min(N, M) entries
@@ -99,8 +99,8 @@ class _PipelineMixin:
             "apply_dq": patch("trainer.trainer.apply_dq", return_value=(pd.DataFrame(), pd.DataFrame())),
             "build_canonical_mapping_from_df": patch("trainer.trainer.build_canonical_mapping_from_df", return_value=cmap),
             "get_dummy_player_ids_from_df": patch("trainer.trainer.get_dummy_player_ids_from_df", return_value=set()),
-            "ensure_profile": patch("trainer.trainer.ensure_player_profile_daily_ready"),
-            "load_profile": patch("trainer.trainer.load_player_profile_daily", return_value=None),
+            "ensure_profile": patch("trainer.trainer.ensure_player_profile_ready"),
+            "load_profile": patch("trainer.trainer.load_player_profile", return_value=None),
             "process_chunk": patch("trainer.trainer.process_chunk", return_value="fake.parquet"),
             "read_parquet": patch("trainer.trainer.pd.read_parquet", return_value=fake_df),
             "train_dual_model": patch("trainer.trainer.train_dual_model",
@@ -177,7 +177,7 @@ class TestFastModeHorizonPropagation(_PipelineMixin, unittest.TestCase):
         result = self._run_pipeline_with_mocks()
         self.assertTrue(
             result["ensure_kwargs"].get("fast_mode"),
-            "fast_mode=True must be forwarded to ensure_player_profile_daily_ready",
+            "fast_mode=True must be forwarded to ensure_player_profile_ready",
         )
 
     def test_max_lookback_days_equals_data_horizon_not_365(self):
@@ -191,7 +191,7 @@ class TestFastModeHorizonPropagation(_PipelineMixin, unittest.TestCase):
         )
 
     def test_effective_window_uses_trimmed_chunk(self):
-        """ensure_player_profile_daily_ready should receive the trimmed window (1 chunk).
+        """ensure_player_profile_ready should receive the trimmed window (1 chunk).
 
         DEC-018 strips tz from effective_start/effective_end before passing them
         to downstream helpers.  Compare as tz-naive to stay robust to that normalization

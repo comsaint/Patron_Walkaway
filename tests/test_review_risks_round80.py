@@ -106,12 +106,12 @@ class TestR96ClickHouseSchemaGuard(unittest.TestCase):
     """R96: ClickHouse path should have explicit schema/version guard policy."""
 
     def test_ensure_profile_ready_mentions_or_checks_clickhouse_schema_version(self):
-        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "ensure_player_profile_daily_ready")
-        self.assertGreater(len(src), 0, "ensure_player_profile_daily_ready not found")
+        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "ensure_player_profile_ready")
+        self.assertGreater(len(src), 0, "ensure_player_profile_ready not found")
         self.assertRegex(
             src,
             r"profile_version|schema_version|ClickHouse mode.*schema|check.*clickhouse",
-            "ensure_player_profile_daily_ready should include explicit ClickHouse schema/version guard (R96)",
+            "ensure_player_profile_ready should include explicit ClickHouse schema/version guard (R96)",
         )
 
 

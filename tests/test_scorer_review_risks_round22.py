@@ -76,7 +76,10 @@ class TestScorerReviewRisksRound22(unittest.TestCase):
         )
 
     def test_r32_online_features_do_not_use_session_delayed_duration_features(self):
-        """R32: remove session-delayed duration/rate features from online production path."""
+        """R32 (updated by R2300): session_duration_min and bets_per_minute are computed
+        dynamically by the scorer for train-serve parity; they must NOT appear in the
+        static LEGACY_FEATURE_COLS training constant (to avoid double-counting), but MUST
+        be computed inside build_features_for_scoring (R2300 parity fix)."""
         legacy_features = _get_list_constant(_TRAINER_TREE, "LEGACY_FEATURE_COLS")
         self.assertNotIn(
             "minutes_since_session_start",
@@ -86,20 +89,21 @@ class TestScorerReviewRisksRound22(unittest.TestCase):
         self.assertNotIn(
             "bets_per_minute",
             legacy_features,
-            msg="trainer LEGACY_FEATURE_COLS should not include session-delayed rate features.",
+            msg="trainer LEGACY_FEATURE_COLS should not include bets_per_minute as a static constant.",
         )
 
         scorer_func = _get_func_node(_SCORER_TREE, "build_features_for_scoring")
         scorer_src = ast.get_source_segment(_SCORER_SRC, scorer_func) or ""
-        self.assertNotIn(
+        # R2300: scorer must compute these for train-serve parity (docstring step 3).
+        self.assertIn(
             'bets_df["session_duration_min"] =',
             scorer_src,
-            msg="scorer online feature builder should not compute session_duration_min.",
+            msg="scorer online feature builder must compute session_duration_min (R2300 parity).",
         )
-        self.assertNotIn(
+        self.assertIn(
             'bets_df["bets_per_minute"] =',
             scorer_src,
-            msg="scorer online feature builder should not compute bets_per_minute.",
+            msg="scorer online feature builder must compute bets_per_minute (R2300 parity).",
         )
 
     def test_r33_session_timestamps_convert_to_hk_before_tz_strip(self):

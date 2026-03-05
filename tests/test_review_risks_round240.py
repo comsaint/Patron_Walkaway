@@ -50,8 +50,7 @@ class TestR1201BacktesterEmptySubsetGuard(unittest.TestCase):
         df = pd.DataFrame(columns=["score", "label", "is_rated"])
         out = backtester_mod.compute_micro_metrics(
             df,
-            rated_threshold=0.5,
-            nonrated_threshold=0.5,
+            threshold=0.5,
             window_hours=1.0,
         )
         self.assertEqual(
@@ -64,8 +63,7 @@ class TestR1201BacktesterEmptySubsetGuard(unittest.TestCase):
         df = pd.DataFrame(columns=["canonical_id", "gaming_day", "score", "label", "is_rated"])
         out = backtester_mod.compute_macro_by_gaming_day_metrics(
             df,
-            rated_threshold=0.5,
-            nonrated_threshold=0.5,
+            threshold=0.5,
         )
         self.assertEqual(
             out,

@@ -1,4 +1,4 @@
-"""One-command OOM-safe runner for player_profile_daily ETL.
+"""One-command OOM-safe runner for player_profile ETL.
 
 This helper wraps `trainer/etl_player_profile.py` with:
 1) automatic date-range detection from local session parquet metadata,
@@ -205,13 +205,13 @@ def auto_run(
             "Please inspect logs above; this is likely not just memory pressure."
         )
 
-    print("[done] player_profile_daily backfill completed.")
+    print("[done] player_profile backfill completed.")
     print(f"[checkpoint] {checkpoint_file}")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Automatically run OOM-safe player_profile_daily backfill."
+        description="Automatically run OOM-safe player_profile backfill."
     )
     p.add_argument("--start-date", type=date.fromisoformat, default=None)
     p.add_argument("--end-date", type=date.fromisoformat, default=None)

@@ -109,6 +109,44 @@ class TestReviewRisksRound38(unittest.TestCase):
             msg="fetch_recent_data must normalize payout_complete_dtm to tz-aware HK time",
         )
 
+    def test_r48_api_artifact_loading_should_include_integrity_check_signal(self):
+        """R48: artifact loading should include integrity verification guardrails."""
+        src = _get_func_src(_API_TREE, _API_SRC, "_load_artifacts")
+        # Minimal signal: at least one common integrity-check keyword should exist.
+        self.assertTrue(
+            any(k in src for k in ("sha256", "hashlib", "signature", "hmac")),
+            msg="artifact loading lacks visible integrity-check signal",
+        )
+
+    def test_r49_api_should_cache_tree_explainer_objects(self):
+        """R49: /score should not rebuild TreeExplainer on every request."""
+        self.assertIn("rated_explainer", _API_SRC)
+        self.assertIn("nonrated_explainer", _API_SRC)
+
+    def test_r50_api_and_scorer_shap_mode_should_be_consistent(self):
+        """R50: API and scorer should use consistent SHAP perturbation behavior."""
+        api_func_src = _get_func_src(_API_TREE, _API_SRC, "_compute_shap_reason_codes_batch")
+        scorer_func_src = _get_func_src(_SCORER_TREE, _SCORER_SRC, "_compute_reason_codes")
+        # Guardrail: avoid explicit perturbation mode divergence between endpoints.
+        self.assertNotIn("feature_perturbation=", api_func_src)
+        self.assertNotIn("feature_perturbation=", scorer_func_src)
+
+    def test_r51_scorer_track_a_cutoff_time_must_not_strip_timezone(self):
+        """R51: scorer Track-A cutoff_time should keep timezone semantics."""
+        src = _get_func_src(_SCORER_TREE, _SCORER_SRC, "score_once")
+        self.assertNotIn("replace(tzinfo=None)", src)
+
+    def test_r52_api_get_artifacts_should_be_lock_protected(self):
+        """R52: artifact cache reads/writes should be protected by a lock."""
+        self.assertIn("threading.Lock()", _API_SRC)
+        get_artifacts_src = _get_func_src(_API_TREE, _API_SRC, "_get_artifacts")
+        self.assertIn("with _artifacts_lock", get_artifacts_src)
+
+    def test_r54_api_score_should_guard_empty_feature_list_before_predict(self):
+        """R54: /score should reject empty feature_list artifact before predict_proba."""
+        score_src = _get_func_src(_API_TREE, _API_SRC, "score")
+        self.assertIn("feature_list is empty", score_src)
+
 
 if __name__ == "__main__":
     unittest.main()

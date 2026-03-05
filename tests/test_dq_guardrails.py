@@ -26,11 +26,19 @@ import ast
 import pathlib
 import re
 import unittest
+import inspect
+import trainer.config as config_mod
+import trainer.etl_player_profile as profile_mod
+import trainer.validator as validator_mod
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCORER_PATH = _REPO_ROOT / "trainer" / "scorer.py"
 _VALIDATOR_PATH = _REPO_ROOT / "trainer" / "validator.py"
 _TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
+_SCORER_POLL_SQL = (
+    _REPO_ROOT / "trainer" / "scripts" / "scorer_poll_queries.sql"
+).read_text(encoding="utf-8")
+
 
 _SCORER_SRC = _SCORER_PATH.read_text(encoding="utf-8")
 _VALIDATOR_SRC = _VALIDATOR_PATH.read_text(encoding="utf-8")
@@ -236,6 +244,76 @@ class TestDQGuardrailsCrossFile(unittest.TestCase):
         """Both scorer and validator session queries must include ROW_NUMBER() OVER."""
         self.assertIn("ROW_NUMBER() OVER", _SCORER_SRC)
         self.assertIn("ROW_NUMBER() OVER", _VALIDATOR_SRC)
+
+
+class TestR1200ProfileFnd01Parity(unittest.TestCase):
+    """R1200: profile ETL should use full FND-01 ORDER BY."""
+
+    def test_etl_profile_session_query_has_fnd01_full_order_by(self):
+        src = inspect.getsource(profile_mod._load_sessions)
+        self.assertTrue(
+            "NULLS LAST" in src and "__etl_insert_Dtm" in src,
+            "_load_sessions FND-01 should include NULLS LAST + __etl_insert_Dtm tiebreaker.",
+        )
+
+
+class TestR1201ScorerPollBetsGuard(unittest.TestCase):
+    """R1201: scorer_poll SQL bets query should explicitly guard NULL player_id."""
+
+    def test_scorer_poll_sql_bets_has_player_id_is_not_null(self):
+        self.assertIn(
+            "AND player_id IS NOT NULL",
+            _SCORER_POLL_SQL,
+            "scorer_poll_queries.sql bets query should include explicit player_id IS NOT NULL.",
+        )
+
+
+class TestR1202ScorerPollSessionFnd04(unittest.TestCase):
+    """R1202: scorer_poll SQL session query should include FND-04 activity filter."""
+
+    def test_scorer_poll_sql_sessions_has_fnd04_filter(self):
+        self.assertIn(
+            "COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0",
+            _SCORER_POLL_SQL,
+            "scorer_poll_queries.sql sessions query should include FND-04 activity filter.",
+        )
+
+
+class TestR1203ValidatorSessionFnd04(unittest.TestCase):
+    """R1203: validator session query should include FND-04 activity filter."""
+
+    def test_validator_session_query_has_fnd04_filter(self):
+        src = inspect.getsource(validator_mod.fetch_sessions_by_canonical_id)
+        self.assertTrue(
+            "COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0" in src
+            and "turnover" in src
+            and "num_games_with_wager" in src,
+            "validator session query should include turnover columns + FND-04 filter.",
+        )
+
+
+class TestR1204ValidatorBetsGuard(unittest.TestCase):
+    """R1204: validator bets query should explicitly guard NULL player_id."""
+
+    def test_validator_bets_query_has_player_id_is_not_null(self):
+        src = inspect.getsource(validator_mod.fetch_bets_by_canonical_id)
+        self.assertIn(
+            "player_id IS NOT NULL",
+            src,
+            "validator bets query should include explicit player_id IS NOT NULL.",
+        )
+
+
+class TestR1205ConfigCommentFreshness(unittest.TestCase):
+    """R1205: config comment should reflect 1-D F1 threshold search."""
+
+    def test_config_should_not_keep_2d_threshold_comment(self):
+        src = inspect.getsource(config_mod)
+        self.assertNotIn(
+            "2-D threshold search",
+            src,
+            "config comment is stale: threshold search should be described as F1-based (single threshold).",
+        )
 
 
 if __name__ == "__main__":

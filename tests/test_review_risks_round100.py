@@ -41,8 +41,8 @@ class TestR105AutoScriptGateBlocksFastMode(unittest.TestCase):
         """The auto_script.exists() check must be inside the else (subprocess) branch,
         not as a global early return. Otherwise fast-mode in-process backfill is
         blocked when the script is missing."""
-        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "ensure_player_profile_daily_ready")
-        self.assertGreater(len(src), 0, "ensure_player_profile_daily_ready not found")
+        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "ensure_player_profile_ready")
+        self.assertGreater(len(src), 0, "ensure_player_profile_ready not found")
         # R105: "if not auto_script.exists(): return" must appear AFTER "else:" of
         # "if use_inprocess" — i.e. the script check must be inside the subprocess
         # branch. Check: the line with auto_script.exists() should be at greater
@@ -78,8 +78,8 @@ class TestR106SchemaHashIncludesPopulationMode(unittest.TestCase):
         """The hash used for cache invalidation must differ when canonical_id_whitelist
         changes (fast vs normal mode). The schema-hash block must modify current_hash
         using whitelist/_pop_tag, not just have whitelist as a parameter."""
-        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "ensure_player_profile_daily_ready")
-        self.assertGreater(len(src), 0, "ensure_player_profile_daily_ready not found")
+        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "ensure_player_profile_ready")
+        self.assertGreater(len(src), 0, "ensure_player_profile_ready not found")
         # R106: the block that sets current_hash for cache comparison must incorporate
         # canonical_id_whitelist (e.g. _pop_tag = f"_whitelist={len(...)}" and use in hash)
         idx = src.find("current_hash = compute_profile_schema_hash")
@@ -122,12 +122,12 @@ class TestR108BackfillLogsSkippedCount(unittest.TestCase):
 
 class TestR109FastModeUsesWhitelistForProfileLoad(unittest.TestCase):
     """R109 (updated for DEC-017/R205): In fast-mode WITHOUT --sample-rated,
-    load_player_profile_daily must receive ALL canonical_ids from canonical_map
+    load_player_profile must receive ALL canonical_ids from canonical_map
     (no implicit sampling).  Implicit sampling was removed in R205; the old
     DEC-015 FAST_MODE_RATED_SAMPLE_N auto-sampling no longer applies."""
 
     def test_run_pipeline_passes_whitelist_to_load_profile_in_fast_mode(self):
-        """When fast_mode=True (no --sample-rated), load_player_profile_daily
+        """When fast_mode=True (no --sample-rated), load_player_profile
         canonical_ids must equal ALL canonical_ids in canonical_map (DEC-017/R205).
         Previously (DEC-015) this was capped at FAST_MODE_RATED_SAMPLE_N; that
         implicit behaviour was intentionally removed."""
@@ -139,8 +139,8 @@ class TestR109FastModeUsesWhitelistForProfileLoad(unittest.TestCase):
              patch("trainer.trainer.load_local_parquet") as mock_load, \
              patch("trainer.trainer.apply_dq") as mock_dq, \
              patch("trainer.trainer.build_canonical_mapping_from_df") as mock_build, \
-             patch("trainer.trainer.ensure_player_profile_daily_ready"), \
-             patch("trainer.trainer.load_player_profile_daily") as mock_load_profile, \
+             patch("trainer.trainer.ensure_player_profile_ready"), \
+             patch("trainer.trainer.load_player_profile") as mock_load_profile, \
              patch("trainer.trainer.process_chunk") as mock_process, \
              patch("trainer.trainer.train_dual_model") as mock_train, \
              patch("trainer.trainer.save_artifact_bundle"):
@@ -199,7 +199,7 @@ class TestR109FastModeUsesWhitelistForProfileLoad(unittest.TestCase):
                     len(cids_arg),
                     5000,
                     "R109 (DEC-017): fast-mode WITHOUT --sample-rated must pass ALL "
-                    "canonical_ids (5000) to load_player_profile_daily, not a sampled subset.",
+                    "canonical_ids (5000) to load_player_profile, not a sampled subset.",
                 )
             finally:
                 pathlib.Path(_tmp_chunk).unlink(missing_ok=True)
@@ -211,8 +211,8 @@ class TestR111FastModeCoverageCheckNoFalseWarning(unittest.TestCase):
     def test_ensure_profile_coverage_check_respects_interval(self):
         """When snapshot_interval_days > 1, the final coverage check should not
         emit WARNING for expected date gaps."""
-        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "ensure_player_profile_daily_ready")
-        self.assertGreater(len(src), 0, "ensure_player_profile_daily_ready not found")
+        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "ensure_player_profile_ready")
+        self.assertGreater(len(src), 0, "ensure_player_profile_ready not found")
         # R111: coverage check block must have a branch for snapshot_interval_days > 1
         self.assertRegex(
             src,

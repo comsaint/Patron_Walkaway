@@ -27,9 +27,17 @@ from typing import Dict, List
 # R2: support both `import time_fold` (run from trainer/) and
 # `import trainer.time_fold` (run from project root / tests/).
 try:
-    from config import LABEL_LOOKAHEAD_MIN  # type: ignore[import]
+    from config import (  # type: ignore[import]
+        LABEL_LOOKAHEAD_MIN,
+        TRAIN_SPLIT_FRAC,
+        VALID_SPLIT_FRAC,
+    )
 except ModuleNotFoundError:
-    from trainer.config import LABEL_LOOKAHEAD_MIN  # type: ignore[import]
+    from trainer.config import (  # type: ignore[import]
+        LABEL_LOOKAHEAD_MIN,
+        TRAIN_SPLIT_FRAC,
+        VALID_SPLIT_FRAC,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +141,8 @@ def get_monthly_chunks(start: datetime, end: datetime) -> List[Dict]:
 
 def get_train_valid_test_split(
     chunks: List[Dict],
-    train_frac: float = 0.70,
-    valid_frac: float = 0.15,
+    train_frac: float = TRAIN_SPLIT_FRAC,
+    valid_frac: float = VALID_SPLIT_FRAC,
 ) -> Dict[str, List[Dict]]:
     """Split an ordered chunk list into train / valid / test by time order.
 
@@ -152,8 +160,10 @@ def get_train_valid_test_split(
     Parameters
     ----------
     chunks     : list returned by :func:`get_monthly_chunks`
-    train_frac : fraction of chunks allocated to training (default 0.70)
-    valid_frac : fraction of chunks allocated to validation (default 0.15)
+    train_frac : fraction of chunks allocated to training.  If ``None``,
+                 defaults to :data:`config.TRAIN_SPLIT_FRAC`.
+    valid_frac : fraction of chunks allocated to validation.  If ``None``,
+                 defaults to :data:`config.VALID_SPLIT_FRAC`.
 
     Returns
     -------

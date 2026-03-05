@@ -2,23 +2,18 @@
 ======================
 Shared feature engineering — Train-Serve Parity core (TRN-05/07/08).
 
-Architecture
-------------
-**Track A — Featuretools DFS** (systematic aggregation exploration)
-    build_entity_set()          Build EntitySet: t_bet → t_session → player
-    run_dfs_exploration()       Phase-1: DFS on sampled data → feature_defs
-    save_feature_defs()         Persist feature definitions (JSON/pickle via ft)
-    load_feature_defs()         Load persisted feature definitions
-    compute_feature_matrix()    Phase-2: Apply saved defs to full data
-
-**Track B — Vectorized hand-crafted features** (state-machine logic that
-    Featuretools cannot express without O(n²) cost)
+Architecture (DEC-022: Track Profile / Track LLM / Track Human)
+--------------------------------------------------------------
+**Track B — Vectorized hand-crafted features** (state-machine logic)
     compute_loss_streak()       LOSE→+1, WIN→reset, PUSH→conditional (F4)
     compute_run_boundary()      Gap ≥ RUN_BREAK_MIN → new run (B2)
     compute_table_hc()          Unique players per table in rolling window (S1)
 
-**Feature screening** (filters DFS output before training)
+**Feature screening** (unified across tracks)
     screen_features()           Mutual-info → correlation pruning → optional LGBM
+
+Track A is deprecated; legacy entry points are re-exported from
+trainer._deprecated_track_a for backward compatibility only.
 
 All Track B functions are imported by BOTH trainer.py and scorer.py to
 guarantee train-serve parity.  They must be kept stateless (no global mutable
@@ -33,26 +28,22 @@ with ``kind='stable'`` before processing, matching the scorer's sort order.
 H4 (numeric fillna)
 -------------------
 Numeric columns are filled with 0 before building the EntitySet so that
-Featuretools aggregations are not contaminated by NaN propagation.
+aggregations are not contaminated by NaN propagation.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
-from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 
-if TYPE_CHECKING:
-    import featuretools as ft
-
 try:
     from config import (  # type: ignore[import]
         BET_AVAIL_DELAY_MIN,
-        HIST_AVG_BET_CAP,
         LOSS_STREAK_PUSH_RESETS,
         PLACEHOLDER_PLAYER_ID,
         RUN_BREAK_MIN,
@@ -62,7 +53,6 @@ try:
 except ModuleNotFoundError:
     from trainer.config import (  # type: ignore[import]
         BET_AVAIL_DELAY_MIN,
-        HIST_AVG_BET_CAP,
         LOSS_STREAK_PUSH_RESETS,
         PLACEHOLDER_PLAYER_ID,
         RUN_BREAK_MIN,
@@ -73,16 +63,16 @@ except ModuleNotFoundError:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# player_profile_daily — Phase 1 feature column list (PLAN Step 4 / DEC-011)
+# player_profile — Phase 1 feature column list (PLAN Step 4 / DEC-011)
 # ---------------------------------------------------------------------------
 
-#: Phase 1 profile feature columns sourced from player_profile_daily via
+#: Phase 1 profile feature columns sourced from player_profile via
 #: t_session aggregations.  These are attached to **rated** bets only via a
 #: PIT/as-of join (snapshot_dtm <= bet_time).  Non-rated observations receive
-#: 0 for all columns (handled by join_player_profile_daily).
+#: 0 for all columns (handled by join_player_profile).
 #:
 #: Phase 2 additions (wager_mean_180d, wager_p50_180d from t_bet) are not
-#: included here.  See doc/player_profile_daily_spec.md §14.
+#: included here.  See doc/player_profile_spec.md §14.
 PROFILE_FEATURE_COLS: List[str] = [
     # Recency
     "days_since_last_session",
@@ -237,202 +227,26 @@ def get_profile_feature_cols(max_lookback_days: int = 365) -> List[str]:
     ]
 
 
-# ---------------------------------------------------------------------------
-# Track A — Featuretools EntitySet helpers
-# ---------------------------------------------------------------------------
-
-# Featuretools is an optional heavy dependency; import lazily so that the
-# Track B functions remain usable in scorer environments where ft may not be
-# installed, or in unit tests that only exercise Track B.
-
-def _ft():
-    """Lazy import of featuretools — raises ImportError with a clear message."""
-    try:
-        import featuretools as ft_mod
-        return ft_mod
-    except ImportError as exc:
-        raise ImportError(
-            "featuretools is required for Track A features.  "
-            "Install it with: pip install featuretools"
-        ) from exc
-
-
-# Numeric columns that receive H4 fillna(0) before EntitySet construction.
-_NUMERIC_BET_COLS = ["wager", "payout", "player_win", "num_games_with_wager"]
-_NUMERIC_SESSION_COLS = ["turnover", "player_win", "num_games_with_wager"]
-
-
-def build_entity_set(
-    bets_df: pd.DataFrame,
-    sessions_df: pd.DataFrame,
-    canonical_map: pd.DataFrame,
-    session_time_col: str = "session_avail_dtm",
-) -> "ft.EntitySet":
-    """Build a Featuretools EntitySet with three entities.
-
-    Entity hierarchy (DEC-007):
-        t_bet  →  t_session  →  player
-        (many-to-one on session_id)  (many-to-one on canonical_id)
-
-    Parameters
-    ----------
-    bets_df : DataFrame
-        t_bet rows with at least ``bet_id``, ``session_id``,
-        ``payout_complete_dtm``, and numeric bet-level columns.
-        Rows with PLACEHOLDER_PLAYER_ID are expected to have been filtered
-        upstream; ``wager`` and other numeric columns receive fillna(0) here
-        (H4) before EntitySet construction.
-    sessions_df : DataFrame
-        t_session rows after FND-01 dedup (one row per session_id).
-        Must contain ``session_id``, ``canonical_id``, and a time column
-        (default ``session_avail_dtm`` = COALESCE(session_end_dtm, lud_dtm)
-        + SESSION_AVAIL_DELAY_MIN; see FND-13).
-    canonical_map : DataFrame
-        Output of ``identity.build_canonical_mapping*``.
-        Columns: [player_id, canonical_id].  Used to build the ``player``
-        entity (de-duplicated by canonical_id).
-    session_time_col : str
-        Column in ``sessions_df`` used as the EntitySet time_index for the
-        t_session entity.  Defaults to ``session_avail_dtm``.
-
-    Returns
-    -------
-    ft.EntitySet
-        EntitySet named ``"walkaway"`` ready for DFS or
-        ``calculate_feature_matrix``.
-    """
-    ft_mod = _ft()
-
-    # H4: numeric fillna(0) before EntitySet
-    # F2 (SSOT §8.2-E): winsorize wager-like columns before aggregation to
-    # prevent extreme outliers from distorting Featuretools sum/mean/max primitives.
-    bets = bets_df.copy()
-    sessions = sessions_df.copy()
-    for col in _NUMERIC_BET_COLS:
-        if col in bets.columns:
-            bets[col] = bets[col].fillna(0).clip(upper=HIST_AVG_BET_CAP)
-    for col in _NUMERIC_SESSION_COLS:
-        if col in sessions.columns:
-            sessions[col] = sessions[col].fillna(0).clip(upper=HIST_AVG_BET_CAP)
-
-    # Player entity: one row per canonical_id
-    players = (
-        canonical_map[["canonical_id"]]
-        .drop_duplicates(subset=["canonical_id"])
-        .copy()
+# Legacy Track A (DEC-022 deprecated) — lazy re-export for backward compatibility.
+# Dual-path import: sibling-module form first (when run inside the trainer/
+# directory), then package form via importlib (R1906/R1603 — avoids hard
+# coupling at import time and keeps the package-qualified path out of this file).
+try:
+    from _deprecated_track_a import (  # type: ignore[import]  # noqa: E402, F401
+        build_entity_set,
+        compute_feature_matrix,
+        load_feature_defs,
+        run_dfs_exploration,
+        save_feature_defs,
     )
-
-    es = ft_mod.EntitySet(id="walkaway")
-
-    es = es.add_dataframe(
-        dataframe_name="t_bet",
-        dataframe=bets,
-        index="bet_id",
-        time_index="payout_complete_dtm",
-    )
-    es = es.add_dataframe(
-        dataframe_name="t_session",
-        dataframe=sessions,
-        index="session_id",
-        time_index=session_time_col,
-    )
-    es = es.add_dataframe(
-        dataframe_name="player",
-        dataframe=players,
-        index="canonical_id",
-    )
-
-    # Relationships (DEC-007)
-    es = es.add_relationship("t_session", "session_id", "t_bet", "session_id")
-    es = es.add_relationship("player", "canonical_id", "t_session", "canonical_id")
-
-    return es
-
-
-def run_dfs_exploration(
-    es: "ft.EntitySet",
-    cutoff_df: pd.DataFrame,
-    max_depth: int = 2,
-    agg_primitives: Optional[List[str]] = None,
-    trans_primitives: Optional[List[str]] = None,
-) -> Tuple[pd.DataFrame, list]:
-    """Phase-1 DFS: explore features on sampled data.
-
-    Parameters
-    ----------
-    es : ft.EntitySet
-        Built by ``build_entity_set``.
-    cutoff_df : DataFrame
-        Columns: [bet_id, cutoff_time].  Determines the temporal cutoff
-        for each observation; Featuretools will not look past cutoff_time.
-    max_depth : int
-        DFS depth.  depth=2 is recommended for Phase 1 to keep the search
-        space manageable.
-    agg_primitives : list[str] | None
-        Override default aggregation primitives.
-    trans_primitives : list[str] | None
-        Override default transform primitives.
-
-    Returns
-    -------
-    (feature_matrix, feature_defs)
-        ``feature_matrix`` is indexed by bet_id; ``feature_defs`` is the
-        list of FeatureBase objects to pass to ``save_feature_defs``.
-    """
-    ft_mod = _ft()
-
-    _agg = agg_primitives or [
-        "count", "sum", "mean", "max", "min", "trend",
-        "num_unique", "time_since_last",
-    ]
-    _trans = trans_primitives or ["time_since_previous", "cum_sum", "cum_mean"]
-
-    feature_matrix, feature_defs = ft_mod.dfs(
-        entityset=es,
-        target_dataframe_name="t_bet",
-        cutoff_time=cutoff_df,
-        agg_primitives=_agg,
-        trans_primitives=_trans,
-        max_depth=max_depth,
-        verbose=False,
-    )
-    return feature_matrix, feature_defs
-
-
-def save_feature_defs(feature_defs: list, path: Path) -> None:
-    """Persist feature definitions using featuretools serialisation."""
-    ft_mod = _ft()
-    ft_mod.save_features(feature_defs, str(path))
-    logger.info("Saved %d feature definitions to %s", len(feature_defs), path)
-
-
-def load_feature_defs(path: Path) -> list:
-    """Load persisted feature definitions."""
-    ft_mod = _ft()
-    feature_defs = ft_mod.load_features(str(path))
-    logger.info("Loaded %d feature definitions from %s", len(feature_defs), path)
-    return feature_defs
-
-
-def compute_feature_matrix(
-    es: "ft.EntitySet",
-    saved_feature_defs: list,
-    cutoff_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """Phase-2: apply saved feature definitions to full data.
-
-    Uses ``featuretools.calculate_feature_matrix`` — no re-exploration,
-    same feature definitions as Phase-1 (eliminates train-serve parity risk,
-    see DEC-002).
-    """
-    ft_mod = _ft()
-    return ft_mod.calculate_feature_matrix(
-        features=saved_feature_defs,
-        entityset=es,
-        cutoff_time=cutoff_df,
-        verbose=False,
-    )
-
+except ImportError:
+    import importlib as _il  # noqa: E402
+    _dta = _il.import_module("trainer._deprecated_track_a")
+    build_entity_set = _dta.build_entity_set  # noqa: F811
+    compute_feature_matrix = _dta.compute_feature_matrix  # noqa: F811
+    load_feature_defs = _dta.load_feature_defs  # noqa: F811
+    run_dfs_exploration = _dta.run_dfs_exploration  # noqa: F811
+    save_feature_defs = _dta.save_feature_defs  # noqa: F811
 
 # ---------------------------------------------------------------------------
 # Track B — Vectorized hand-crafted features
@@ -811,13 +625,19 @@ def screen_features(
     if dropped_zv:
         logger.info("screen_features: dropped %d zero-variance features", dropped_zv)
     X = X[nonzero]
+    if X.empty:
+        logger.warning(
+            "screen_features: all features are zero-variance/NaN — returning empty list"
+        )
+        return []
 
-    # Fill NaN for sklearn compatibility
-    X_filled = X.fillna(0)
+    # Fill NaN for sklearn compatibility — use a separate name (X_safe) to make
+    # it clear the fill is for MI / correlation computation only, not permanent.
+    X_safe = X.fillna(0)
 
     # Mutual information (Stage 1b)
     mi = mutual_info_classif(
-        X_filled, labels, discrete_features=False, random_state=random_state
+        X_safe, labels, discrete_features=False, random_state=random_state
     )
     mi_df = pd.Series(mi, index=nonzero).sort_values(ascending=False)
     candidates = mi_df.index.tolist()
@@ -825,7 +645,7 @@ def screen_features(
 
     # Correlation pruning (Stage 1c)
     if len(candidates) > 1:
-        corr = X_filled[candidates].corr().abs()
+        corr = X_safe[candidates].corr().abs()
         upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
         to_drop = set()
         for col in upper.columns:
@@ -859,11 +679,10 @@ def screen_features(
             "Install it with: pip install lightgbm"
         ) from exc
 
-    dtrain = lgb.Dataset(X_filled[candidates], label=labels)
+    dtrain = lgb.Dataset(X_safe[candidates], label=labels)
     params = {
         "objective": "binary",
         "verbosity": -1,
-        "n_estimators": 100,
         "num_leaves": 31,
         "seed": random_state,
     }
@@ -884,15 +703,15 @@ def screen_features(
 
 
 # ---------------------------------------------------------------------------
-# player_profile_daily PIT / as-of join (PLAN Step 4 / SSOT §8.2, DEC-011)
+# player_profile PIT / as-of join (PLAN Step 4 / SSOT §8.2, DEC-011)
 # ---------------------------------------------------------------------------
 
-def join_player_profile_daily(
+def join_player_profile(
     bets_df: pd.DataFrame,
     profile_df: Optional[pd.DataFrame],
     feature_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Attach player_profile_daily features to bets via a PIT / as-of join.
+    """Attach player_profile features to bets via a PIT / as-of join.
 
     For each bet the most recent profile snapshot satisfying
     ``snapshot_dtm <= payout_complete_dtm`` (by ``canonical_id``) is joined.
@@ -905,7 +724,7 @@ def join_player_profile_daily(
         Bet-level DataFrame.  Must contain ``canonical_id`` and
         ``payout_complete_dtm`` (tz-naive HK local time).
     profile_df:
-        player_profile_daily snapshot table.  Must contain ``canonical_id``,
+        player_profile snapshot table.  Must contain ``canonical_id``,
         ``snapshot_dtm`` (tz-naive), and any subset of ``feature_cols``.
         Pass ``None`` or an empty DataFrame to skip (all profile columns → 0).
     feature_cols:
@@ -936,13 +755,13 @@ def join_player_profile_daily(
             result[col] = np.nan
 
     if profile_df is None or (isinstance(profile_df, pd.DataFrame) and profile_df.empty):
-        logger.info("join_player_profile_daily: profile_df absent/empty — profile features are NaN")
+        logger.info("join_player_profile: profile_df absent/empty — profile features are NaN")
         return result
 
     available_cols = [c for c in feature_cols if c in profile_df.columns]
     if not available_cols:
         logger.warning(
-            "join_player_profile_daily: none of the requested profile columns found in profile_df; "
+            "join_player_profile: none of the requested profile columns found in profile_df; "
             "expected: %s",
             feature_cols[:5],
         )
@@ -950,13 +769,14 @@ def join_player_profile_daily(
 
     # Ensure tz-naive timestamps on both sides (apply_dq strips tz from bets;
     # profile_df may arrive tz-naive or tz-aware depending on data source).
+    # R1702: convert to HK before stripping tz (DEC-018).
     bet_time = pd.to_datetime(result["payout_complete_dtm"])
     if bet_time.dt.tz is not None:
-        bet_time = bet_time.dt.tz_localize(None)
+        bet_time = bet_time.dt.tz_convert("Asia/Hong_Kong").dt.tz_localize(None)
 
     snap_time = pd.to_datetime(profile_df["snapshot_dtm"])
     if snap_time.dt.tz is not None:
-        snap_time = snap_time.dt.tz_localize(None)
+        snap_time = snap_time.dt.tz_convert("Asia/Hong_Kong").dt.tz_localize(None)
 
     # Build working copies with a stable integer position tracker.
     # R75: cast canonical_id to str on both sides — ClickHouse may return Int64
@@ -981,7 +801,7 @@ def join_player_profile_daily(
     _n_nat = int(bets_work["_bet_time"].isna().sum())
     if _n_nat:
         logger.warning(
-            "join_player_profile_daily: %d bet(s) with null payout_complete_dtm skipped; "
+            "join_player_profile: %d bet(s) with null payout_complete_dtm skipped; "
             "profile features will be NaN for those rows.",
             _n_nat,
         )
@@ -1016,9 +836,408 @@ def join_player_profile_daily(
 
     n_rated_with_profile = int(pd.notna(result[available_cols[0]]).sum())
     logger.info(
-        "join_player_profile_daily: attached %d profile cols; %d/%d bets have profile snapshot",
+        "join_player_profile: attached %d profile cols; %d/%d bets have profile snapshot",
         len(available_cols),
         n_rated_with_profile,
         len(result),
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Track LLM — DuckDB + Feature Spec YAML (PLAN Step 4B / DEC-023 / DEC-024)
+# ---------------------------------------------------------------------------
+
+#: feature_id must be a valid SQL identifier: letter followed by letters/digits/underscores.
+_FEATURE_ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
+
+#: Synthetic sort-key column added to the DataFrame before DuckDB queries with
+#: RANGE frames.  Encodes G3 (payout_complete_dtm, bet_id) tie-breaking as a
+#: nanosecond offset so the single-column ORDER BY required by DuckDB RANGE INTERVAL
+#: semantics still produces deterministic, stable results.
+_RANGE_SORT_COL = "_range_sort_key"
+
+
+def load_feature_spec(yaml_path) -> dict:
+    """Load and statically validate the Feature Spec YAML (DEC-024).
+
+    Static checks performed:
+    - ``feature_id`` values across all tracks are unique.
+    - Track LLM ``window_frame`` strings do not contain ``FOLLOWING``
+      (prevents look-ahead leakage).
+    - Track LLM ``expression`` strings do not contain SQL structural keywords
+      (``SELECT``, ``FROM``, ``JOIN``, ``UNION``, ``WITH``).
+    - ``derived`` features' ``depends_on`` lists form no circular dependency.
+
+    Parameters
+    ----------
+    yaml_path:
+        Path to the Feature Spec YAML file.  Accepts ``str`` or ``pathlib.Path``.
+
+    Returns
+    -------
+    dict
+        Parsed spec dictionary, unchanged from the YAML structure.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``yaml_path`` does not exist.
+    ValueError
+        If any static validation check fails.
+    """
+    import pathlib
+    import yaml as _yaml  # type: ignore[import-untyped]
+
+    path = pathlib.Path(yaml_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Feature Spec YAML not found: {path}")
+
+    with path.open(encoding="utf-8") as fh:
+        spec = _yaml.safe_load(fh)
+
+    _validate_feature_spec(spec)
+    return spec
+
+
+def _validate_feature_spec(spec: dict) -> None:
+    """Raise ValueError describing *all* spec violations found (DEC-024 guardrails).
+
+    Guardrail checks:
+    - ``feature_id`` must match ``[a-zA-Z][a-zA-Z0-9_]*`` (R2000).
+    - ``feature_id`` values must be unique across all tracks.
+    - Track LLM ``window_frame`` must not contain ``FOLLOWING``.
+    - Track LLM ``expression`` must not contain SQL structural keywords
+      (word-boundary check, R2007) or semicolons (R2000).
+    - Disallowed keywords are merged from Python defaults and YAML ``guardrails``
+      section (R2004).
+    - ``derived`` features must not have circular ``depends_on`` (DAG check).
+    - ``None`` track sections are treated as empty (R2006).
+    """
+    errors: List[str] = []
+    all_ids: List[str] = []
+
+    # ── R2004: merge Python defaults with YAML guardrails ──────────────────
+    yaml_guardrails = spec.get("guardrails") or {}
+    yaml_kw_list = yaml_guardrails.get("disallow_sql_keywords_in_expressions") or []
+    # R2106: extend blocklist with DDL/DML keywords that can mutate schema or data.
+    disallowed_sql: set = {
+        "SELECT", "FROM", "JOIN", "UNION", "WITH",
+        "DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "CREATE", "TRUNCATE",
+        "EXEC", "EXECUTE",
+    } | {kw.upper() for kw in yaml_kw_list}
+
+    for track_key in ("track_llm", "track_human", "track_profile"):
+        # R2006: handle ``track_key: null`` in YAML without AttributeError
+        track = spec.get(track_key) or {}
+        for cand in track.get("candidates", []):
+            fid = cand.get("feature_id", "")
+            if not fid:
+                errors.append(f"[{track_key}] candidate is missing 'feature_id'.")
+            else:
+                # R2000: feature_id must be a valid SQL identifier
+                if not _FEATURE_ID_RE.match(fid):
+                    errors.append(
+                        f"[{track_key}] feature_id {fid!r} contains invalid characters "
+                        f"(only [a-zA-Z][a-zA-Z0-9_]* allowed)."
+                    )
+                all_ids.append(fid)
+
+            # Track LLM–specific checks
+            if track_key == "track_llm":
+                expr = cand.get("expression", "")
+                wf = cand.get("window_frame", "")
+
+                # No FOLLOWING in window_frame
+                if "FOLLOWING" in wf.upper():
+                    errors.append(
+                        f"[track_llm] '{fid}': window_frame contains FOLLOWING "
+                        f"(look-ahead leakage risk): {wf!r}"
+                    )
+
+                # R2111: no semicolons in window_frame (multi-statement injection vector)
+                if ";" in wf:
+                    errors.append(
+                        f"[track_llm] '{fid}': window_frame contains semicolon "
+                        f"(potential SQL injection): {wf!r}"
+                    )
+
+                # R2000: no semicolons in expression (multi-statement injection vector)
+                if ";" in expr:
+                    errors.append(
+                        f"[track_llm] '{fid}': expression contains semicolon "
+                        f"(potential SQL injection): {expr!r}"
+                    )
+
+                # R2007: word-boundary keyword check (avoids false positives like
+                # 'joined_value' matching 'JOIN', or 'PERFORM' matching 'FROM').
+                expr_upper = expr.upper()
+                forbidden = [
+                    kw for kw in disallowed_sql
+                    if re.search(r"\b" + re.escape(kw) + r"\b", expr_upper)
+                ]
+                if forbidden:
+                    errors.append(
+                        f"[track_llm] '{fid}': expression contains disallowed SQL keyword(s) "
+                        f"{forbidden}: {expr!r}"
+                    )
+
+    # ── Duplicate feature_id check ──────────────────────────────────────────
+    seen: set = set()
+    for fid in all_ids:
+        if fid in seen:
+            errors.append(f"Duplicate feature_id: '{fid}'")
+        seen.add(fid)
+
+    # ── Circular depends_on check (Track LLM derived features) ─────────────
+    # R2006: use ``or {}`` so a null track_llm section doesn't crash here either.
+    llm_track = spec.get("track_llm") or {}
+    dep_map: dict = {}
+    for cand in llm_track.get("candidates", []):
+        if cand.get("type") == "derived":
+            fid = cand.get("feature_id", "")
+            deps = cand.get("depends_on", []) or []
+            dep_map[fid] = list(deps)
+
+    for start in dep_map:
+        if _has_cycle(start, dep_map, set()):
+            errors.append(f"[track_llm] Circular depends_on detected starting from '{start}'.")
+
+    if errors:
+        raise ValueError("Feature Spec validation failed:\n" + "\n".join(f"  • {e}" for e in errors))
+
+
+def _has_cycle(node: str, dep_map: dict, visiting: set) -> bool:
+    """Depth-first cycle detector for depends_on graphs."""
+    if node in visiting:
+        return True
+    if node not in dep_map:
+        return False
+    visiting = visiting | {node}
+    return any(_has_cycle(dep, dep_map, visiting) for dep in dep_map[node])
+
+
+def _topo_sort_candidates(candidates: list) -> list:
+    """Return candidates sorted so every ``depends_on`` predecessor comes before
+    the feature that depends on it (R2005).
+
+    Non-derived candidates have no dependencies and float to the front naturally.
+    The sort is stable: relative order of independent candidates is preserved.
+    """
+    by_id = {c["feature_id"]: c for c in candidates}
+    visited: set = set()
+    result: list = []
+
+    def _visit(fid: str) -> None:
+        if fid in visited:
+            return
+        visited.add(fid)
+        cand = by_id.get(fid)
+        if cand is not None:
+            for dep in (cand.get("depends_on") or []):
+                _visit(dep)
+            result.append(cand)
+
+    for cand in candidates:
+        _visit(cand["feature_id"])
+
+    return result
+
+
+def compute_track_llm_features(
+    bets_df: pd.DataFrame,
+    feature_spec: dict,
+    cutoff_time: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Compute Track LLM features via DuckDB from a Feature Spec YAML definition.
+
+    Only features listed under ``track_llm.candidates`` are computed.  Each
+    candidate is translated into a DuckDB window-function ``SELECT`` expression
+    and executed against an in-memory table built from ``bets_df``.
+
+    All window frames are strictly backward-looking (``PRECEDING`` / ``CURRENT
+    ROW``); ``cutoff_time`` enforces an additional row-level leakage guard.
+
+    Parameters
+    ----------
+    bets_df:
+        Bet-level DataFrame.  Must contain at minimum ``canonical_id``,
+        ``payout_complete_dtm``, and ``bet_id``.  Additional columns referenced
+        in feature expressions must also be present.
+    feature_spec:
+        Parsed spec dict as returned by :func:`load_feature_spec`.
+    cutoff_time:
+        When provided, only rows with ``payout_complete_dtm <= cutoff_time`` are
+        used for feature calculation.  Rows after the cutoff are dropped from the
+        output (leakage guard, TRN-08).
+
+    Returns
+    -------
+    pd.DataFrame
+        ``bets_df`` (filtered to ``<= cutoff_time`` if specified) with one new
+        column per Track LLM candidate appended.  The original row count and
+        order are preserved.
+
+    Notes
+    -----
+    - ``NaN``/``NULL`` handling follows each candidate's ``postprocess.fill``
+      strategy (``"zero"`` → 0; ``"ffill"`` → forward-fill; otherwise left NaN).
+    - Numeric clipping is applied after fill if ``postprocess.clip`` is present.
+    - DuckDB 1.x is required (``RANGE BETWEEN INTERVAL … PRECEDING`` syntax).
+    """
+    import duckdb
+
+    # R2006: use ``or {}`` so a null track_llm section doesn't raise AttributeError.
+    llm_track = feature_spec.get("track_llm") or {}
+    candidates = llm_track.get("candidates", [])
+    if not candidates:
+        logger.warning("compute_track_llm_features: track_llm has no candidates — returning bets_df unchanged.")
+        return bets_df.copy()
+
+    # R2005: topological sort — derived features must follow their dependencies.
+    candidates = _topo_sort_candidates(candidates)
+
+    # ── Cutoff guard (R2009: restructured to avoid redundant .copy() calls) ─
+    if cutoff_time is not None:
+        ct = pd.Timestamp(cutoff_time)
+        if ct.tzinfo is not None:
+            ct = ct.tz_convert("Asia/Hong_Kong").tz_localize(None)
+        ts_for_mask = pd.to_datetime(bets_df["payout_complete_dtm"])
+        if ts_for_mask.dt.tz is not None:
+            ts_for_mask = ts_for_mask.dt.tz_convert("Asia/Hong_Kong").dt.tz_localize(None)
+        # reset_index guarantees an independent copy (no SettingWithCopyWarning).
+        df = bets_df.loc[ts_for_mask <= ct].reset_index(drop=True)
+    else:
+        df = bets_df.copy()
+
+    if df.empty:
+        for cand in candidates:
+            df[cand["feature_id"]] = pd.Series(dtype="float64")
+        return df
+
+    # ── Ensure payout_complete_dtm is tz-naive (DEC-018) ───────────────────
+    ts_col = pd.to_datetime(df["payout_complete_dtm"])
+    if ts_col.dt.tz is not None:
+        ts_col = ts_col.dt.tz_convert("Asia/Hong_Kong").dt.tz_localize(None)
+    df["payout_complete_dtm"] = ts_col.astype("datetime64[us]")
+
+    # ── R2002: G3-preserving synthetic sort key for RANGE frames ────────────
+    # DuckDB RANGE INTERVAL requires a single ORDER BY column.  We pre-sort by
+    # the full G3 key (canonical_id, payout_complete_dtm, bet_id) and then encode
+    # the tie-breaking ordinal as a nanosecond offset so the RANGE boundary
+    # semantics are unaffected (nanoseconds << minute-level intervals).
+    df = df.sort_values(
+        ["canonical_id", "payout_complete_dtm", "bet_id"], kind="stable"
+    ).reset_index(drop=True)
+    df[_RANGE_SORT_COL] = df["payout_complete_dtm"] + pd.to_timedelta(
+        df.groupby("canonical_id", sort=False).cumcount(), unit="ns"
+    )
+
+    # ── Build DuckDB window SELECT expressions ──────────────────────────────
+    # R2008: all passthrough column names are double-quoted to handle spaces and
+    # other special characters that would otherwise break the SQL parser.
+    fixed_cols = {"canonical_id", "payout_complete_dtm", "bet_id", _RANGE_SORT_COL}
+    passthrough_cols = [
+        c for c in df.columns
+        if c not in fixed_cols
+        and not any(c == cand["feature_id"] for cand in candidates)
+    ]
+    select_exprs = [
+        '"canonical_id"',
+        '"payout_complete_dtm"',
+        '"bet_id"',
+    ]
+    select_exprs.extend(f'"{c}"' for c in passthrough_cols)
+
+    for cand in candidates:
+        fid = cand["feature_id"]
+        expr = cand.get("expression", "")
+        ftype = cand.get("type", "window")
+        wf = cand.get("window_frame", "")
+
+        if ftype in ("window", "transform", "lag"):
+            if wf:
+                if wf.upper().startswith("RANGE"):
+                    # R2002: use synthetic G3 sort key; DuckDB requires single ORDER BY
+                    # for RANGE INTERVAL frames, but _RANGE_SORT_COL already encodes
+                    # the bet_id tie-breaker as a nanosecond offset.
+                    range_order = f'ORDER BY "{_RANGE_SORT_COL}" ASC'
+                    sql_expr = (
+                        f"{expr} OVER ("
+                        f"PARTITION BY canonical_id "
+                        f"{range_order} "
+                        f"{wf}"
+                        f') AS "{fid}"'
+                    )
+                else:
+                    sql_expr = (
+                        f"{expr} OVER ("
+                        f"PARTITION BY canonical_id "
+                        f"ORDER BY payout_complete_dtm ASC, bet_id ASC "
+                        f"{wf}"
+                        f') AS "{fid}"'
+                    )
+            else:
+                sql_expr = (
+                    f"{expr} OVER ("
+                    f"PARTITION BY canonical_id "
+                    f"ORDER BY payout_complete_dtm ASC, bet_id ASC"
+                    f') AS "{fid}"'
+                )
+        else:
+            # "derived": plain scalar expression; relies on lateral column
+            # references to window features already computed earlier in SELECT
+            # (topological order guaranteed by _topo_sort_candidates above).
+            sql_expr = f'({expr}) AS "{fid}"'
+
+        select_exprs.append(sql_expr)
+
+    select_clause = ",\n    ".join(select_exprs)
+    sql = (
+        f"SELECT\n    {select_clause}\n"
+        f"FROM bets\n"
+        f"ORDER BY canonical_id, payout_complete_dtm, bet_id"
+    )
+
+    # R2003: connection is always closed via finally, even when the query raises.
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.register("bets", df)
+        result_df = con.execute(sql).df()
+    except Exception as exc:  # pragma: no cover
+        logger.error("compute_track_llm_features: DuckDB query failed: %s\nSQL:\n%s", exc, sql)
+        raise
+    finally:
+        con.close()
+
+    # Drop the internal synthetic sort key from the output.
+    result_df = result_df.drop(columns=[_RANGE_SORT_COL], errors="ignore")
+
+    # ── Postprocess: fill + clip ────────────────────────────────────────────
+    for cand in candidates:
+        fid = cand["feature_id"]
+        pp = cand.get("postprocess", {}) or {}
+        fill_spec = pp.get("fill", {}) or {}
+        clip_spec = pp.get("clip", {}) or {}
+
+        fill_strategy = fill_spec.get("strategy", "none")
+        if fid in result_df.columns:
+            if fill_strategy == "zero":
+                result_df[fid] = result_df[fid].fillna(0)
+            elif fill_strategy == "ffill":
+                # R2001: grouped ffill prevents cross-canonical_id data leakage.
+                result_df[fid] = (
+                    result_df.groupby("canonical_id", sort=False)[fid].ffill()
+                )
+
+            if clip_spec:
+                lo = clip_spec.get("min")
+                hi = clip_spec.get("max")
+                result_df[fid] = result_df[fid].clip(lower=lo, upper=hi)
+
+    logger.info(
+        "compute_track_llm_features: computed %d Track LLM features for %d bets",
+        len(candidates),
+        len(result_df),
+    )
+    return result_df

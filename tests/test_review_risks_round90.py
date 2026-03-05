@@ -106,12 +106,12 @@ class TestR102SnapshotAvailabilityCutoff(unittest.TestCase):
     """R102: snapshot cutoff should include availability delay after day end."""
 
     def test_build_profile_snapshot_dtm_includes_availability_delay(self):
-        src = _get_func_src(_ETL_TREE, _ETL_SRC, "build_player_profile_daily")
-        self.assertGreater(len(src), 0, "build_player_profile_daily not found")
+        src = _get_func_src(_ETL_TREE, _ETL_SRC, "build_player_profile")
+        self.assertGreater(len(src), 0, "build_player_profile not found")
         self.assertRegex(
             src,
             r"SESSION_AVAIL_DELAY_MIN|timedelta\(\s*minutes\s*=",
-            "build_player_profile_daily should incorporate availability delay in snapshot cutoff (R102)",
+            "build_player_profile should incorporate availability delay in snapshot cutoff (R102)",
         )
 
 

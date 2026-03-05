@@ -30,11 +30,11 @@ class TestR600MonthEndEmptyRangeFallback(unittest.TestCase):
     def test_ensure_profile_should_have_explicit_empty_snapshot_dates_fallback(self):
         # Desired guardrail from review:
         # if _snap_dates == [], do not silently skip; fallback to interval path.
-        src = inspect.getsource(trainer_mod.ensure_player_profile_daily_ready)
+        src = inspect.getsource(trainer_mod.ensure_player_profile_ready)
         self.assertIn(
             "len(_snap_dates) == 0",
             src,
-            "ensure_player_profile_daily_ready should explicitly guard empty month-end schedule.",
+            "ensure_player_profile_ready should explicitly guard empty month-end schedule.",
         )
 
 
@@ -42,7 +42,7 @@ class TestR601SchemaHashScheduleIsolation(unittest.TestCase):
     """R601: schema hash should isolate month-end vs daily cache modes."""
 
     def test_schema_hash_should_include_schedule_tag_in_reader(self):
-        src = inspect.getsource(trainer_mod.ensure_player_profile_daily_ready)
+        src = inspect.getsource(trainer_mod.ensure_player_profile_ready)
         self.assertIn(
             "_sched_tag",
             src,
@@ -65,7 +65,7 @@ class TestR602MonthEndPreloadMemoryRisk(unittest.TestCase):
         # Desired behavior (from review): month-end has ~12 dates/year, so
         # per-date pushdown reads are acceptable; avoid preloading 69M rows.
         with patch.object(etl_mod, "_preload_sessions_local", return_value=pd.DataFrame()) as preload_mock, patch.object(
-            etl_mod, "build_player_profile_daily", return_value=pd.DataFrame({"x": [1]})
+            etl_mod, "build_player_profile", return_value=pd.DataFrame({"x": [1]})
         ):
             etl_mod.backfill(
                 start_date=dt.date(2026, 1, 1),
@@ -106,7 +106,7 @@ class TestR605SampleRatedMonthEndInteraction(unittest.TestCase):
             calls.append(snapshot_date)
             return pd.DataFrame({"snapshot_date": [snapshot_date]})
 
-        with patch.object(etl_mod, "build_player_profile_daily", side_effect=_record_call), patch.object(
+        with patch.object(etl_mod, "build_player_profile", side_effect=_record_call), patch.object(
             etl_mod, "_preload_sessions_local", return_value=None
         ):
             etl_mod.backfill(

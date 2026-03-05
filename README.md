@@ -12,7 +12,7 @@ Patron Walkaway 離場偵測專案。
 
 ### 概述
 
-- **Phase 1** 實作：單一模型（僅評級客 Rated only）LightGBM 流程，含 Optuna 超參數搜尋、run-level 樣本權重、Track A（Featuretools DFS）與 Track B（如 `loss_streak`、`run_boundary`）特徵、身分對應與告警驗證。
+- **Phase 1** 實作：單一模型（僅評級客 Rated only）LightGBM 流程，含 Optuna 超參數搜尋、run-level 樣本權重、**三軌特徵工程**（Track Profile PIT/as-of join、Track LLM DuckDB + Feature Spec YAML、Track Human 向量化 `loss_streak`/`run_boundary`）、身分對應與告警驗證。
 - **資料**：ClickHouse（`GDP_GMWDS_Raw`）或開發用本地 Parquet（置於 `data/`）。
 - **產出**：訓練產物在 `trainer/models/`（`.pkl`、特徵清單、原因碼、模型版本）；即時 scorer 將告警寫入 SQLite；API 與前端儀表板供營運使用。
 
@@ -38,7 +38,7 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 
 **環境變數**：將 `trainer/.env.example` 複製為 `trainer/.env`（或設定對應環境變數），用於 ClickHouse：`CH_HOST`、`CH_TEAMDB_HOST`、`CH_PORT`、`CH_USER`、`CH_PASS`、`CH_SECURE`、`SOURCE_DB`。
 
-**資料（訓練/回測）**：預設為 ClickHouse，請確認 `SOURCE_DB` 與憑證正確。本地 Parquet（開發/測試）：在專案根目錄放置 `data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet`（可選 `data/player_profile_daily.parquet`），執行 trainer 或 backtester 時加上 `--use-local-parquet`。
+**資料（訓練/回測）**：預設為 ClickHouse，請確認 `SOURCE_DB` 與憑證正確。本地 Parquet（開發/測試）：在專案根目錄放置 `data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet`（可選 `data/player_profile.parquet`），執行 trainer 或 backtester 時加上 `--use-local-parquet`。
 
 ### 使用方式
 
@@ -105,7 +105,8 @@ python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sa
 
 全部測試：`pytest`  
 僅 trainer 相關：`pytest tests/test_trainer.py -v`  
-Fast-mode 煙測：`python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet`
+Fast-mode 煙測：`python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet`  
+程式碼品質：`ruff check .`、`mypy trainer/ --ignore-missing-imports`
 
 ### 文件
 
@@ -124,7 +125,7 @@ Fast-mode 煙測：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 ### 產物（trainer 輸出）
 
-`trainer/models/` 下：`model.pkl`、`saved_feature_defs/`、`feature_list.json`、`reason_code_map.json`、`model_version`、`training_metrics.json`。另保留 legacy `walkaway_model.pkl`。
+`trainer/models/` 下：`model.pkl`、`feature_list.json`、`features_active.yaml`、`reason_code_map.json`、`model_version`、`training_metrics.json`。使用 Track A（Featuretools DFS）時會產出 `saved_feature_defs/`。另保留 legacy `walkaway_model.pkl`。
 
 ### 注意事項
 
@@ -145,7 +146,7 @@ Patron Walkaway 离场检测项目。
 
 ### 概述
 
-- **Phase 1** 实现：双模型（评级 / 非评级）LightGBM 流程，含 Optuna 超参搜索、run-level 样本权重、Track A（Featuretools DFS）与 Track B（如 `loss_streak`、`run_boundary`）特征、身份映射与告警验证。
+- **Phase 1** 实现：单模型（仅评级客 Rated only）LightGBM 流程，含 Optuna 超参搜索、run-level 样本权重、**三轨特征工程**（Track Profile PIT/as-of join、Track LLM DuckDB + Feature Spec YAML、Track Human 向量化 `loss_streak`/`run_boundary`）、身份映射与告警验证。
 - **数据**：ClickHouse（`GDP_GMWDS_Raw`）或开发用本地 Parquet（置于 `data/`）。
 - **产出**：训练产物在 `trainer/models/`（`.pkl`、特征列表、原因码、模型版本）；实时 scorer 将告警写入 SQLite；API 与前端仪表盘供运营使用。
 
@@ -171,7 +172,7 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 
 **环境变量**：将 `trainer/.env.example` 复制为 `trainer/.env`（或设置对应环境变量），用于 ClickHouse：`CH_HOST`、`CH_TEAMDB_HOST`、`CH_PORT`、`CH_USER`、`CH_PASS`、`CH_SECURE`、`SOURCE_DB`。
 
-**数据（训练/回测）**：默认为 ClickHouse，请确认 `SOURCE_DB` 与凭证正确。本地 Parquet（开发/测试）：在项目根目录放置 `data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet`（可选 `data/player_profile_daily.parquet`），运行 trainer 或 backtester 时加上 `--use-local-parquet`。
+**数据（训练/回测）**：默认为 ClickHouse，请确认 `SOURCE_DB` 与凭证正确。本地 Parquet（开发/测试）：在项目根目录放置 `data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet`（可选 `data/player_profile.parquet`），运行 trainer 或 backtester 时加上 `--use-local-parquet`。
 
 ### 使用方式
 
@@ -240,7 +241,8 @@ python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sa
 
 全部测试：`pytest`  
 仅 trainer 相关：`pytest tests/test_trainer.py -v`  
-Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet`
+Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet`  
+代码质量：`ruff check .`、`mypy trainer/ --ignore-missing-imports`
 
 ### 文档
 
@@ -259,14 +261,14 @@ Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 ### 产物（trainer 输出）
 
-`trainer/models/` 下：`model.pkl`、`saved_feature_defs/`、`feature_list.json`、`reason_code_map.json`、`model_version`、`training_metrics.json`。另保留 legacy `walkaway_model.pkl`。
+`trainer/models/` 下：`model.pkl`、`feature_list.json`、`features_active.yaml`、`reason_code_map.json`、`model_version`、`training_metrics.json`。使用 Track A（Featuretools DFS）时会产出 `saved_feature_defs/`。另保留 legacy `walkaway_model.pkl`。
 
 ### 注意事项
 
 - **Fast-mode** 产物在 metadata 中标记 `fast_mode=true`，不得用于生产推理。
 - **凭证**：请安全存放 ClickHouse 凭证，勿提交 `.env`。
 - **时区**：业务逻辑使用 `Asia/Hong_Kong`（`config.HK_TZ`）。
-- **阈值选择**：Phase 1 以验证集 **F1 最大化** 选定双模型阈值（DEC-009），无精准度/警报量下限约束。
+- **阈值选择**：Phase 1 以验证集 **F1 最大化** 选定单模型阈值（DEC-009, DEC-021），无精准度/警报量下限约束。
 
 ---
 
@@ -278,7 +280,7 @@ Our mass gaming floor has deployed Smart Table technology through which we are a
 
 ## Overview
 
-- **Phase 1** implementation: single-model (rated only) LightGBM pipeline with Optuna hyperparameter search, run-level sample weighting, Track A (Featuretools DFS) + Track B (e.g. `loss_streak`, `run_boundary`) features, identity mapping, and alert validation.
+- **Phase 1** implementation: single-model (rated only) LightGBM pipeline with Optuna hyperparameter search, run-level sample weighting, **three-track feature engineering** (Track Profile PIT/as-of join, Track LLM DuckDB + Feature Spec YAML, Track Human vectorized `loss_streak`/`run_boundary`), identity mapping, and alert validation.
 - **Data**: ClickHouse (`GDP_GMWDS_Raw`) or local Parquet under `data/` for development.
 - **Output**: Trained artifacts in `trainer/models/` (`.pkl`, feature list, reason codes, model version); live scorer writes alerts to SQLite; API + frontend dashboard for operators.
 
@@ -325,7 +327,7 @@ Copy `trainer/.env.example` to `trainer/.env` (or set env vars) for ClickHouse:
 
 - **ClickHouse**: Default. Ensure `SOURCE_DB` and credentials are correct.
 - **Local Parquet (dev/test)**:
-  - Place exports in project root: `data/gmwds_t_bet.parquet`, `data/gmwds_t_session.parquet` (and optionally `data/player_profile_daily.parquet`).
+  - Place exports in project root: `data/gmwds_t_bet.parquet`, `data/gmwds_t_session.parquet` (and optionally `data/player_profile.parquet`).
   - Use `--use-local-parquet` when running the trainer or backtester.
 
 ---
@@ -459,6 +461,13 @@ python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
 # Check trainer/models/ or training output for fast_mode=true in metadata
 ```
 
+Lint and type-check:
+
+```bash
+ruff check .
+mypy trainer/ --ignore-missing-imports
+```
+
 ---
 
 ## Documentation
@@ -482,13 +491,14 @@ python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
 
 Under `trainer/models/`:
 
-- `model.pkl` — LightGBM models
-- `saved_feature_defs/` — Featuretools save_features output (Track A)
-- `feature_list.json`, `reason_code_map.json` — Feature names and reason codes
+- `model.pkl` — Single rated LightGBM model (v10)
+- `feature_list.json`, `features_active.yaml` — Feature names and active Feature Spec metadata
+- `reason_code_map.json` — Feature-to-reason-code mapping
 - `model_version` — Version string (e.g. `20260228-153000-abc1234`)
-- `training_metrics.json` — Metrics and flags (e.g. `fast_mode`)
+- `training_metrics.json` — Validation/test metrics and flags (e.g. `fast_mode`, `uncalibrated_threshold`)
+- `saved_feature_defs/` — Optional; produced only when Track A (Featuretools DFS) is used (i.e. without `--no-afg`)
 
-Legacy single `walkaway_model.pkl` is still written for backward compatibility.
+Legacy `walkaway_model.pkl` is still written for backward compatibility.
 
 ---
 
@@ -497,4 +507,4 @@ Legacy single `walkaway_model.pkl` is still written for backward compatibility.
 - **Fast-mode** outputs are marked `fast_mode=true` in metadata and must not be used for production inference.
 - **Credentials**: Store ClickHouse credentials securely; avoid committing `.env`.
 - **Time zone**: Business logic uses `Asia/Hong_Kong` (see `config.HK_TZ`).
-- **Threshold selection**: Phase 1 uses validation-set **F1 maximization** for dual-model thresholds (DEC-009); no precision/alert-volume lower bound.
+- **Threshold selection**: Phase 1 uses validation-set **F1 maximization** for the single-model threshold (DEC-009, DEC-021); no precision/alert-volume lower bound.

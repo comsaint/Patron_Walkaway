@@ -19,7 +19,7 @@ import trainer.trainer as trainer_mod
 class TestR800JoinProfileNaTRowAlignment(unittest.TestCase):
     """R800: dropna in join path must not break row-aligned assignment."""
 
-    def test_join_player_profile_daily_nat_bet_time_should_not_crash(self):
+    def test_join_player_profile_nat_bet_time_should_not_crash(self):
         bets = pd.DataFrame(
             {
                 "canonical_id": ["c1", "c1"],
@@ -34,7 +34,7 @@ class TestR800JoinProfileNaTRowAlignment(unittest.TestCase):
             }
         )
 
-        out = features_mod.join_player_profile_daily(
+        out = features_mod.join_player_profile(
             bets_df=bets,
             profile_df=profile,
             feature_cols=["turnover_7d"],

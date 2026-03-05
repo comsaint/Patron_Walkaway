@@ -63,12 +63,12 @@ class TestR74ProfileMissingShouldRemainNull(unittest.TestCase):
     """R74: Missing profile should not be forced to 0."""
 
     def test_join_function_does_not_fill_profile_nan_with_zero(self):
-        src = _get_func_src(_FEATURES_TREE, _FEATURES_SRC, "join_player_profile_daily")
-        self.assertGreater(len(src), 0, "join_player_profile_daily not found")
+        src = _get_func_src(_FEATURES_TREE, _FEATURES_SRC, "join_player_profile")
+        self.assertGreater(len(src), 0, "join_player_profile not found")
         self.assertNotIn(
             ".fillna(0.0)",
             src,
-            "join_player_profile_daily should keep NaN for unmatched profile rows (R74)",
+            "join_player_profile should keep NaN for unmatched profile rows (R74)",
         )
 
     def test_process_chunk_does_not_fillna_zero_all_features(self):
@@ -85,7 +85,7 @@ class TestR75CanonicalIdTypeAlignment(unittest.TestCase):
     """R75: canonical_id dtype should be aligned before merge_asof."""
 
     def test_join_casts_both_sides_canonical_id_to_str(self):
-        src = _get_func_src(_FEATURES_TREE, _FEATURES_SRC, "join_player_profile_daily")
+        src = _get_func_src(_FEATURES_TREE, _FEATURES_SRC, "join_player_profile")
         self.assertRegex(
             src,
             r'bets_work\["canonical_id"\]\s*=\s*bets_work\["canonical_id"\]\.astype\(\s*str\s*\)',
@@ -164,12 +164,12 @@ class TestR79ScorerProfileParity(unittest.TestCase):
     """R79: scorer should implement/declare profile PIT parity."""
 
     def test_scorer_has_profile_join_or_profile_feature_import(self):
-        has_join = "join_player_profile_daily" in _SCORER_SRC
+        has_join = "join_player_profile" in _SCORER_SRC
         has_cols = "PROFILE_FEATURE_COLS" in _SCORER_SRC
-        has_profile_table = "player_profile_daily" in _SCORER_SRC
+        has_profile_table = "player_profile" in _SCORER_SRC
         self.assertTrue(
             has_join or has_cols or has_profile_table,
-            "scorer.py lacks player_profile_daily PIT parity signals (R79)",
+            "scorer.py lacks player_profile PIT parity signals (R79)",
         )
 
 
@@ -189,12 +189,12 @@ class TestR81LocalParquetBranchDeadCode(unittest.TestCase):
     """R81: remove always-false parent.parent.parent.exists condition."""
 
     def test_no_parent_parent_parent_exists_condition(self):
-        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "load_player_profile_daily")
-        self.assertGreater(len(src), 0, "load_player_profile_daily not found")
+        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "load_player_profile")
+        self.assertGreater(len(src), 0, "load_player_profile not found")
         self.assertNotIn(
             "parent.parent.parent.exists()",
             src,
-            "load_player_profile_daily contains dead-code branch condition (R81)",
+            "load_player_profile contains dead-code branch condition (R81)",
         )
 
 
@@ -202,12 +202,12 @@ class TestR82LoadProfileMemoryGuard(unittest.TestCase):
     """R82: profile loading should be filterable by canonical_id."""
 
     def test_load_profile_filters_by_canonical_id(self):
-        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "load_player_profile_daily")
+        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "load_player_profile")
         has_cid_filter = re.search(r"canonical_id\s+IN|canonical_id.*filters", src)
         has_param = "canonical_ids" in src
         self.assertTrue(
             bool(has_cid_filter) or has_param,
-            "load_player_profile_daily should include canonical_id filtering/memory guard (R82)",
+            "load_player_profile should include canonical_id filtering/memory guard (R82)",
         )
 
 

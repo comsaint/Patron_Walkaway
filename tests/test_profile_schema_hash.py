@@ -2,14 +2,14 @@
 ====================================
 Guardrail tests for the profile schema fingerprint mechanism.
 
-The player_profile_daily cache (local Parquet) can become stale if:
+The player_profile cache (local Parquet) can become stale if:
   1. PROFILE_FEATURE_COLS changes in features.py
   2. PROFILE_VERSION is bumped in etl_player_profile.py
   3. _SESSION_COLS changes in etl_player_profile.py
 
 These tests verify that:
   a) compute_profile_schema_hash() actually changes when those inputs change.
-  b) ensure_player_profile_daily_ready() detects a hash mismatch and clears
+  b) ensure_player_profile_ready() detects a hash mismatch and clears
      the stale parquet + checkpoint before triggering a rebuild.
   c) The schema hash sidecar is written alongside the parquet after each
      successful _persist_local_parquet call.
@@ -112,13 +112,13 @@ class TestWriteLocalParquetWritesSidecar(unittest.TestCase):
             # Patch module-level paths to point to our temp dir
             with (
                 patch.object(etl, "LOCAL_PARQUET_DIR", tmp_path),
-                patch.object(etl, "LOCAL_PROFILE_PARQUET", tmp_path / "player_profile_daily.parquet"),
-                patch.object(etl, "LOCAL_PROFILE_SCHEMA_HASH", tmp_path / "player_profile_daily.schema_hash"),
+                patch.object(etl, "LOCAL_PROFILE_PARQUET", tmp_path / "player_profile.parquet"),
+                patch.object(etl, "LOCAL_PROFILE_SCHEMA_HASH", tmp_path / "player_profile.schema_hash"),
             ):
                 etl._persist_local_parquet(df)
 
-            parquet_path = tmp_path / "player_profile_daily.parquet"
-            hash_path = tmp_path / "player_profile_daily.schema_hash"
+            parquet_path = tmp_path / "player_profile.parquet"
+            hash_path = tmp_path / "player_profile.schema_hash"
 
             self.assertTrue(parquet_path.exists(), "Parquet file should be written")
             self.assertTrue(hash_path.exists(), "Schema hash sidecar should be written")
@@ -139,15 +139,15 @@ class TestWriteLocalParquetWritesSidecar(unittest.TestCase):
 
 
 class TestEnsureProfileReadySchemaMismatch(unittest.TestCase):
-    """Verify ensure_player_profile_daily_ready() invalidates cache on hash mismatch."""
+    """Verify ensure_player_profile_ready() invalidates cache on hash mismatch."""
 
     def _run_ensure(self, tmp_dir: Path, stored_hash: str | None, parquet_exists: bool = True):
-        """Helper: run ensure_player_profile_daily_ready with controlled sidecar state."""
+        """Helper: run ensure_player_profile_ready with controlled sidecar state."""
         from datetime import datetime, timezone
-        from trainer.trainer import ensure_player_profile_daily_ready
+        from trainer.trainer import ensure_player_profile_ready
 
-        profile_parquet = tmp_dir / "player_profile_daily.parquet"
-        schema_hash_file = tmp_dir / "player_profile_daily.schema_hash"
+        profile_parquet = tmp_dir / "player_profile.parquet"
+        schema_hash_file = tmp_dir / "player_profile.schema_hash"
         checkpoint_file = tmp_dir / "player_profile_etl_checkpoint.json"
 
         if parquet_exists:
@@ -182,7 +182,7 @@ class TestEnsureProfileReadySchemaMismatch(unittest.TestCase):
             patch("subprocess.run") as mock_subproc,
         ):
             mock_subproc.return_value = MagicMock(returncode=0, stderr="", stdout="")
-            ensure_player_profile_daily_ready(start, end, use_local_parquet=True)
+            ensure_player_profile_ready(start, end, use_local_parquet=True)
 
         return profile_parquet, schema_hash_file, checkpoint_file
 
@@ -235,13 +235,13 @@ class TestEnsureProfileReadySchemaMismatch(unittest.TestCase):
             })
             sess_path = tmp_path / "gmwds_t_session.parquet"
             sess_df.to_parquet(sess_path, index=False)
-            # R106: ensure_player_profile_daily_ready adds _pop_tag to hash;
+            # R106: ensure_player_profile_ready adds _pop_tag to hash;
             # when canonical_id_whitelist=None, _pop_tag="_full".
             # R200: also adds _horizon_tag = f"_mlb={max_lookback_days}";
-            # _run_ensure calls ensure_player_profile_daily_ready() without
+            # _run_ensure calls ensure_player_profile_ready() without
             # max_lookback_days, so the default 365 is used → _mlb=365.
             base_hash = compute_profile_schema_hash(session_parquet=sess_path)
-            # DEC-019 R601: _run_ensure calls ensure_player_profile_daily_ready with
+            # DEC-019 R601: _run_ensure calls ensure_player_profile_ready with
             # default use_month_end_snapshots=True, fast_mode=False → _sched_tag="_month_end".
             # stored_hash must match this formula exactly.
             stored_hash = hashlib.md5((base_hash + "_full" + "_mlb=365" + "_month_end").encode()).hexdigest()

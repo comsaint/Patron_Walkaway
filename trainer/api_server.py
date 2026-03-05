@@ -8,6 +8,7 @@ import pandas as pd
 from flask import Flask, request, jsonify, send_from_directory, abort
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from werkzeug.security import safe_join
 import config
 from pathlib import Path
 
@@ -57,10 +58,14 @@ def script_js():
 
 @app.route("/<path:filename>")
 def frontend_module(filename):
-    target = FRONTEND_DIR / filename
-    if filename.endswith('.js') and target.exists():
-        return send_from_directory(FRONTEND_DIR, filename)
-    abort(404)
+    # R2323: safe_join prevents path traversal (e.g. "../../etc/passwd").
+    safe = safe_join(str(FRONTEND_DIR), filename)
+    if safe is None or not filename.endswith(".js"):
+        abort(404)
+    target = Path(safe)
+    if not target.exists():
+        abort(404)
+    return send_from_directory(FRONTEND_DIR, target.name)
 
 #   GET /get_floor_status     → returns all open table-seat pairs (occupied seats)
 
@@ -308,6 +313,7 @@ def _load_artifacts() -> dict | None:
         print("[api] joblib not installed — /score endpoint unavailable")
         return None
 
+    model_path = MODEL_DIR / "model.pkl"        # v10 single rated model
     rated_path = MODEL_DIR / "rated_model.pkl"
     nonrated_path = MODEL_DIR / "nonrated_model.pkl"
     legacy_path = MODEL_DIR / "walkaway_model.pkl"
@@ -339,15 +345,32 @@ def _load_artifacts() -> dict | None:
 
     # ── Read each pkl once, verify sha256, cache raw bytes for in-memory
     #    deserialization — avoids double I/O (R48, R58) ──
+    # Priority: model.pkl (v10) > rated+nonrated pair > legacy walkaway_model.pkl
     _pkl_raw: dict = {}
-    for pkl_path in [rated_path, nonrated_path, legacy_path]:
+    for pkl_path in [model_path, rated_path, nonrated_path, legacy_path]:
         if pkl_path.exists():
             raw = pkl_path.read_bytes()
             digest = hashlib.sha256(raw).hexdigest()
             print(f"[api] {pkl_path.name} sha256={digest}")
             _pkl_raw[pkl_path] = raw
 
-    if rated_path in _pkl_raw and nonrated_path in _pkl_raw:
+    # v10: prefer model.pkl (single rated model)
+    if model_path in _pkl_raw:
+        rb = joblib.load(io.BytesIO(_pkl_raw[model_path]))
+        arts["rated"] = {"model": rb["model"], "threshold": float(rb.get("threshold", 0.5))}
+        arts["training_metrics"] = rb.get("metrics", {})
+        if not arts["feature_list"]:
+            arts["feature_list"] = rb.get("features", [])
+        try:
+            import shap  # type: ignore[import]
+            arts["rated_explainer"] = shap.TreeExplainer(rb["model"])
+            arts["nonrated_explainer"] = None
+        except Exception as exc:
+            print(f"[api] SHAP explainer pre-build failed: {exc}")
+            arts["rated_explainer"] = None
+            arts["nonrated_explainer"] = None
+        return arts
+    elif rated_path in _pkl_raw and nonrated_path in _pkl_raw:
         rb = joblib.load(io.BytesIO(_pkl_raw[rated_path]))
         nb = joblib.load(io.BytesIO(_pkl_raw[nonrated_path]))
         arts["rated"] = {"model": rb["model"], "threshold": float(rb.get("threshold", 0.5))}
@@ -553,6 +576,23 @@ def score():
                     break
         if schema_errors:
             return jsonify({"error": "Schema mismatch (422)", "details": schema_errors}), 422
+
+    # ── R2320: Numeric type validation (reject non-numeric feature values) ─────
+    if feature_list:
+        type_errors: list = []
+        for i, row in enumerate(body):
+            bad = [
+                k for k, v in row.items()
+                if k in feature_list and not isinstance(v, (int, float, bool))
+            ]
+            if bad:
+                type_errors.append(
+                    f"row[{i}]: non-numeric feature value(s): {bad[:5]}"
+                )
+                if len(type_errors) >= 5:
+                    break
+        if type_errors:
+            return jsonify({"error": "Type mismatch (422)", "details": type_errors}), 422
 
     # ── Build DataFrame and fill missing values ────────────────────────────────
     df = pd.DataFrame(body)

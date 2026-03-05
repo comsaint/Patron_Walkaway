@@ -4,37 +4,37 @@ overview: "Patron Walkaway Phase 1（v10 SSOT 對齊）：單一 Rated 模型、
 todos:
   - id: step0-config
     content: "Step 0：在 config.py 集中定義所有常數（含 TABLE_HC_WINDOW_MIN / PLACEHOLDER_PLAYER_ID / LOSS_STREAK_PUSH_RESETS / HIST_AVG_BET_CAP / OPTUNA_N_TRIALS / UNRATED_VOLUME_LOG；移除 nonrated_threshold）"
-    status: pending
+    status: completed
   - id: step1-dq-guardrails
     content: "Step 1：P0 DQ 護欄（E1 移除 t_bet.is_manual；E3 IS NOT NULL；E4/F1 player_id != -1；G1 t_session 禁用 FINAL + FND-01 去重；FND-04 COALESCE；F3 is_deleted/is_canceled）"
-    status: pending
+    status: completed
   - id: step2-identity
     content: "Step 2：新建 identity.py（FND-12 正確聚合 SQL；E4 player_id != -1；D2 M:N 衝突規則；B1 cutoff_dtm）"
-    status: pending
+    status: completed
   - id: step3-labels
     content: "Step 3：新建 labels.py（C1 防洩漏；延伸拉取至少 X+Y；t_bet FINAL + E3 IS NOT NULL；G3 穩定排序 payout_complete_dtm, bet_id；H1 終端下注 censoring）"
-    status: pending
+    status: completed
   - id: step4-features
     content: "Step 4：新建 features.py（三軌特徵工程：Track Profile PIT/as-of join、Track LLM DuckDB + Feature Spec YAML、Track Human 向量化 loss_streak/run_boundary；嚴格 cutoff_time 防漏；Feature Screening 統一三軌）"
-    status: pending
+    status: completed
   - id: step5-trainer
     content: "Step 5：重構 trainer.py + time_fold.py（整合三軌；Feature Screening；單一 Rated 模型；class_weight='balanced' + run-level sample_weight；Optuna PR-AUC 超參；F1 閾值；test-set 評估；feature importance）"
-    status: pending
+    status: completed
   - id: step6-backtester
     content: "Step 6：更新 backtester.py（單一閾值 Optuna TPE F1 最大化；無 G1 約束；僅 rated 觀測；Bet-level 評估報告 DEC-012）"
-    status: pending
+    status: completed
   - id: step7-scorer
     content: "Step 7：重構 scorer.py（匯入 features.py 三軌計算；DuckDB 內嵌 Track LLM；D2 四步身份判定；無卡客跳過打分僅 volume log；reason codes 每次輸出）"
-    status: pending
+    status: completed
   - id: step8-validator
     content: "Step 8：更新 validator.py（canonical_id；45min horizon；gaming day 去重；僅驗證 rated 觀測）"
-    status: pending
+    status: completed
   - id: step9-api
     content: "Step 9：更新 api_server.py（/score /health /model_info；422 schema 驗證；單一模型）"
-    status: pending
+    status: completed
   - id: step10-tests
     content: "Step 10：定義 Testing & Validation 規格（leakage 偵測、parity 測試、label sanity、D2 覆蓋率、schema 合規、Feature Spec YAML 靜態驗證）"
-    status: pending
+    status: completed
 isProject: false
 ---
 
@@ -257,9 +257,12 @@ def build_canonical_mapping(client, cutoff_dtm: datetime) -> pd.DataFrame:
     Uses FND-01 CTE dedup, FND-12 fake account exclusion, D2 M:N resolution.
     cutoff_dtm prevents mapping leakage (B1)."""
 
-def resolve_canonical_id(player_id, session_id, mapping_df, session_lookup) -> str:
-    """D2 identity resolution for online scoring. Returns canonical_id string.
-    Returns None if unrated (fallback to player_id only)."""
+def resolve_canonical_id(player_id, session_id, mapping_df, session_lookup) -> Optional[str]:
+    """D2 identity resolution for online scoring.
+    Returns canonical_id string. Step 3 fallback: if not in mapping (unrated),
+    returns str(player_id) so downstream can identify the observation; only
+    returns None when player_id is None or PLACEHOLDER_PLAYER_ID (no usable identity).
+    Rated vs unrated is determined by canonical_id in mapping (casino_player_id), not by this return."""
 ```
 
 **Mapping 建置查詢**（G1：不用 FINAL；I2：先 FND-01 CTE 去重）

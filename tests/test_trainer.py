@@ -113,11 +113,10 @@ class TestGetModelVersion(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestArtifactBundleCompleteness(unittest.TestCase):
-    def test_save_artifact_bundle_writes_rated_and_nonrated_pkl(self):
-        """save_artifact_bundle must write rated_model.pkl and nonrated_model.pkl."""
+    def test_save_artifact_bundle_writes_single_model_pkl(self):
+        """save_artifact_bundle must write model.pkl (v10 single-model, DEC-021)."""
         src = _get_func_src("save_artifact_bundle")
-        self.assertIn("rated_model.pkl", src)
-        self.assertIn("nonrated_model.pkl", src)
+        self.assertIn("model.pkl", src)
 
     def test_save_artifact_bundle_writes_model_version_and_feature_list(self):
         """save_artifact_bundle must write model_version and feature_list.json."""
@@ -181,12 +180,12 @@ class TestReviewRiskGuards(unittest.TestCase):
         self.assertIn("effective_end", src)
         self.assertRegex(
             src,
-            r"ensure_player_profile_daily_ready\(\s*effective_start,\s*effective_end",
+            r"ensure_player_profile_ready\(\s*effective_start,\s*effective_end",
             "Profile freshness check must use effective window after chunk trim",
         )
         self.assertRegex(
             src,
-            r"load_player_profile_daily\(\s*effective_start,\s*effective_end",
+            r"load_player_profile\(\s*effective_start,\s*effective_end",
             "Profile table load must use effective window after chunk trim",
         )
 

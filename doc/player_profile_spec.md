@@ -1,4 +1,4 @@
-# player_profile_daily 規格說明書
+# player_profile 規格說明書
 
 > **關聯文件**：SSOT §4.3（`ssot/trainer_plan_ssot.md`）、Phase 1 計畫 Step 4（`ssot/patron_walkaway_phase_1.plan.md`）、DEC-011（`.cursor/plans/DECISION_LOG.md`）
 
@@ -6,7 +6,7 @@
 
 ## 1. 概述
 
-`player_profile_daily` 為 **rated-only**、**player-level** 的每日快照表，提供每位 `canonical_id` 的歷史行為輪廓，供 Rated 模型使用。訓練與推論時以 **PIT / as-of join** 使用（`snapshot_dtm <= bet_time` 的最新快照），不作為 EntitySet relationship。
+`player_profile` 為 **rated-only**、**player-level** 的快照表，提供每位 `canonical_id` 的歷史行為輪廓，供 Rated 模型使用。訓練與推論時以 **PIT / as-of join** 使用（`snapshot_dtm <= bet_time` 的最新快照），不作為 EntitySet relationship。
 
 ---
 
@@ -29,10 +29,10 @@
 
 ### 2.3 Population 約束（Rated-Only）
 
-`player_profile_daily` 僅為 **rated** 玩家建表。具體定義：
+`player_profile` 僅為 **rated** 玩家建表。具體定義：
 
 - **Rated**：在 D2 mapping 中擁有 `casino_player_id`（即有會員卡/Player Card）的玩家。這些玩家透過 `identity.build_canonical_mapping()` 產出 `canonical_id`。
-- **Unrated**：沒有 `casino_player_id` 的匿名下注紀錄。這些玩家的 `canonical_id` 為 `str(player_id)` 的 fallback 值，但 **不納入** player_profile_daily。
+- **Unrated**：沒有 `casino_player_id` 的匿名下注紀錄。這些玩家的 `canonical_id` 為 `str(player_id)` 的 fallback 值，但 **不納入** player_profile。
 
 **理由**：
 1. Unrated 玩家無法跨 session 追蹤身份，歷史行為輪廓不可靠。
@@ -45,7 +45,7 @@
 
 ### 2.4 Consumer 約束
 
-| Consumer | 是否使用 `player_profile_daily` | 說明 |
+| Consumer | 是否使用 `player_profile` | 說明 |
 |----------|-------------------------------|------|
 | **Rated model** | ✅ 使用 | PIT/as-of join，profile 欄位作為 feature |
 | **Nonrated model** | ❌ 不使用 | 僅使用 bet-level / session-level 即時特徵 |
@@ -196,9 +196,9 @@
 
 | 欄位                               | 型別      | 來源表                      | 計算方式                                                                |
 | -------------------------------- | ------- | ------------------------ | ------------------------------------------------------------------- |
-| `turnover_per_bet_30d_over_180d` | DECIMAL | **player_profile_daily** | `turnover_per_bet_mean_30d / NULLIF(turnover_per_bet_mean_180d, 0)` |
-| `turnover_30d_over_180d`         | DECIMAL | **player_profile_daily** | `turnover_sum_30d / NULLIF(turnover_sum_180d, 0)`                   |
-| `sessions_30d_over_180d`         | DECIMAL | **player_profile_daily** | `sessions_30d / NULLIF(sessions_180d, 0)`                           |
+| `turnover_per_bet_30d_over_180d` | DECIMAL | **player_profile** | `turnover_per_bet_mean_30d / NULLIF(turnover_per_bet_mean_180d, 0)` |
+| `turnover_30d_over_180d`         | DECIMAL | **player_profile** | `turnover_sum_30d / NULLIF(turnover_sum_180d, 0)`                   |
+| `sessions_30d_over_180d`         | DECIMAL | **player_profile** | `sessions_30d / NULLIF(sessions_180d, 0)`                           |
 
 
 ---
@@ -255,7 +255,7 @@
 | ------------------------ | --- | ------------------------------------------------------------------------------------- |
 | **t_session**            | ~38 | 主力：turnover、player_win、theo_win、num_bets、buyin、session 時間、table/pit/area              |
 | **t_bet**                | 2   | Phase 2：wager_mean_180d、wager_p50_180d（經 session→canonical_id join）                   |
-| **player_profile_daily** | 3   | 衍生 ratio：turnover_per_bet_30d_over_180d、turnover_30d_over_180d、sessions_30d_over_180d |
+| **player_profile** | 3   | 衍生 ratio：turnover_per_bet_30d_over_180d、turnover_30d_over_180d、sessions_30d_over_180d |
 | **D2 mapping**           | 1   | canonical_id                                                                          |
 | **參數**                   | 3   | snapshot_date、snapshot_dtm、profile_version                                            |
 
@@ -267,4 +267,3 @@
 - 快照 `snapshot_dtm` 為當日批次結束時間。
 - 對每筆 bet（`bet_time = payout_complete_dtm`），以 `canonical_id` 為 key，選 `snapshot_dtm <= bet_time` 的**最新一筆**快照，將其 profile 欄位貼到該 bet。
 - 訓練與推論皆僅使用該 as-of 快照，不得使用 `snapshot_dtm > bet_time` 的未來快照。
-

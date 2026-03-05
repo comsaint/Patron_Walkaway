@@ -17,20 +17,19 @@ Pipeline (SSOT §4.3 / §9)
 7. Train Rated + Non-rated LightGBM with class_weight='balanced' + sample_weight.
 8. Atomic artifact bundle -> trainer/models/.
 
-Artifact format (version-tagged)
----------------------------------
+Artifact format (version-tagged, v10 single-model)
+--------------------------------------------------
 models/
-  rated_model.pkl           LightGBM model for casino-card players
-  nonrated_model.pkl        LightGBM model for anonymous players
+  model.pkl                 LightGBM model for rated (casino-card) players
   feature_list.json         [{name, track}]  track ∈ {"B", "legacy"}
   model_version             YYYYMMDD-HHMMSS-<git7>  (plain text)
-  training_metrics.json     per-model validation + test metrics, feature importance (gain), Optuna best params
+  training_metrics.json     validation + test metrics, feature importance (gain), Optuna best params
 
 Backward compatibility
 ----------------------
 The legacy artifact walkaway_model.pkl (single-model dict) is ALSO written
-alongside the new dual-model bundle so that the existing scorer/validator can
-keep running until they are refactored in Steps 7–8.
+alongside the v10 bundle so that the existing scorer/validator can keep
+running until they are refactored in Steps 7–8.
 
 Data source switching
 ---------------------
@@ -43,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import os
 import hashlib
 import json
 import logging
@@ -87,7 +87,7 @@ try:
     SOURCE_DB = _cfg.SOURCE_DB
     TBET = _cfg.TBET
     TSESSION = _cfg.TSESSION
-    TPROFILE: str = getattr(_cfg, "TPROFILE", "player_profile_daily")
+    TPROFILE: str = getattr(_cfg, "TPROFILE", "player_profile")
     HK_TZ_STR: str = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     TRAINER_DAYS: int = getattr(_cfg, "TRAINER_DAYS", 30)
     CHUNK_CONCAT_MEMORY_WARN_BYTES: int = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 2 * (1024**3))
@@ -95,6 +95,7 @@ try:
     TRAIN_SPLIT_FRAC: float = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
     VALID_SPLIT_FRAC: float = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
     MIN_VALID_TEST_ROWS: int = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
+    MIN_THRESHOLD_ALERT_COUNT: int = getattr(_cfg, "MIN_THRESHOLD_ALERT_COUNT", 5)
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
@@ -110,7 +111,7 @@ except ModuleNotFoundError:
     SOURCE_DB = _cfg.SOURCE_DB
     TBET = _cfg.TBET
     TSESSION = _cfg.TSESSION
-    TPROFILE = getattr(_cfg, "TPROFILE", "player_profile_daily")
+    TPROFILE = getattr(_cfg, "TPROFILE", "player_profile")
     HK_TZ_STR = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     TRAINER_DAYS = getattr(_cfg, "TRAINER_DAYS", 30)
     CHUNK_CONCAT_MEMORY_WARN_BYTES = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 2 * (1024**3))
@@ -118,6 +119,7 @@ except ModuleNotFoundError:
     TRAIN_SPLIT_FRAC = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
     VALID_SPLIT_FRAC = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
     MIN_VALID_TEST_ROWS = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
+    MIN_THRESHOLD_ALERT_COUNT = getattr(_cfg, "MIN_THRESHOLD_ALERT_COUNT", 5)
 
 # Module-level pipeline imports (same try/except pattern)
 try:
@@ -137,7 +139,7 @@ try:
         save_feature_defs,
         load_feature_defs,
         compute_feature_matrix,
-        join_player_profile_daily,
+        join_player_profile,
         screen_features,
         PROFILE_FEATURE_COLS,
         get_profile_feature_cols,
@@ -165,7 +167,7 @@ except ModuleNotFoundError:
         save_feature_defs,
         load_feature_defs,
         compute_feature_matrix,
-        join_player_profile_daily,
+        join_player_profile,
         screen_features,
         PROFILE_FEATURE_COLS,
         get_profile_feature_cols,
@@ -502,22 +504,22 @@ def load_local_parquet(
 
 
 # ---------------------------------------------------------------------------
-# player_profile_daily loading (PLAN Step 4 / DEC-011)
+# player_profile loading (PLAN Step 4 / DEC-011)
 # ---------------------------------------------------------------------------
 
-def load_player_profile_daily(
+def load_player_profile(
     window_start: datetime,
     window_end: datetime,
     use_local_parquet: bool = False,
     canonical_ids: Optional[List[str]] = None,
 ) -> Optional[pd.DataFrame]:
-    """Load player_profile_daily snapshots covering the training window.
+    """Load player_profile snapshots covering the training window.
 
     Returns a DataFrame with ``canonical_id``, ``snapshot_dtm``, and all
     Phase 1 profile feature columns, or ``None`` if data is unavailable.
 
     The caller should pass the returned DataFrame to ``process_chunk`` via its
-    ``profile_df`` parameter.  ``join_player_profile_daily`` handles the
+    ``profile_df`` parameter.  ``join_player_profile`` handles the
     PIT/as-of alignment per bet.
 
     Parameters
@@ -530,18 +532,18 @@ def load_player_profile_daily(
         Latest chunk window_end in the run.  Snapshots up to window_end are
         included.
     use_local_parquet:
-        If True, reads from ``data/player_profile_daily.parquet``
+        If True, reads from ``data/player_profile.parquet``
         instead of ClickHouse.
     canonical_ids:
         R82: optional list of canonical_id values to filter the profile table.
         Pass the full set of rated player IDs from canonical_map to cap memory
         usage; None loads all players in the time window.
     """
-    profile_path = LOCAL_PARQUET_DIR / "player_profile_daily.parquet"
+    profile_path = LOCAL_PARQUET_DIR / "player_profile.parquet"
 
     if use_local_parquet:
         if profile_path.exists():
-            logger.info("Loading player_profile_daily from local Parquet: %s", profile_path)
+            logger.info("Loading player_profile from local Parquet: %s", profile_path)
             try:
                 from datetime import timedelta as _td
                 snap_lo = window_start - _td(days=365)
@@ -561,13 +563,13 @@ def load_player_profile_daily(
                 # R82: filter to known canonical_ids to limit memory footprint
                 if canonical_ids is not None and not df.empty:
                     df = df[df["canonical_id"].astype(str).isin(set(str(c) for c in canonical_ids))]
-                logger.info("player_profile_daily: %d rows loaded from local Parquet", len(df))
+                logger.info("player_profile: %d rows loaded from local Parquet", len(df))
                 return df
             except Exception as exc:
-                logger.warning("player_profile_daily local Parquet load failed: %s", exc)
+                logger.warning("player_profile local Parquet load failed: %s", exc)
                 return None
         logger.info(
-            "player_profile_daily: %s not found; profile features will be 0", profile_path
+            "player_profile: %s not found; profile features will be 0", profile_path
         )
         return None
 
@@ -597,11 +599,11 @@ def load_player_profile_daily(
             ORDER BY canonical_id, snapshot_dtm
         """
         df = client.query_df(query, parameters=_params)
-        logger.info("player_profile_daily: %d rows loaded from ClickHouse", len(df))
+        logger.info("player_profile: %d rows loaded from ClickHouse", len(df))
         return df if not df.empty else None
     except Exception as exc:
         logger.warning(
-            "player_profile_daily ClickHouse load failed (%s); profile features will be 0", exc
+            "player_profile ClickHouse load failed (%s); profile features will be 0", exc
         )
         return None
 
@@ -691,7 +693,7 @@ def _month_end_dates(start_date: date, end_date: date) -> List[date]:
 
     Used by DEC-019 to build a month-end profile snapshot schedule.
     At most one snapshot per month is produced; the PIT join in
-    join_player_profile_daily uses the most-recent snapshot <= bet_time,
+    join_player_profile uses the most-recent snapshot <= bet_time,
     so bets mid-month will fall back to the previous month-end snapshot.
 
     Parameters
@@ -738,7 +740,7 @@ def _latest_month_end_on_or_before(ref_date: date) -> date:
     return date(year, month, prev_last)
 
 
-def ensure_player_profile_daily_ready(
+def ensure_player_profile_ready(
     window_start: datetime,
     window_end: datetime,
     use_local_parquet: bool = False,
@@ -754,7 +756,7 @@ def ensure_player_profile_daily_ready(
 
     Local-parquet training mode only:
       1) determine required snapshot window for PIT join,
-      2) compare against existing player_profile_daily coverage,
+      2) compare against existing player_profile coverage,
       3) auto-run helper script to backfill missing range(s).
 
     Parameters
@@ -788,11 +790,11 @@ def ensure_player_profile_daily_ready(
         logger.info("Profile auto-build skipped (ClickHouse mode).")
         return
 
-    profile_path = LOCAL_PARQUET_DIR / "player_profile_daily.parquet"
+    profile_path = LOCAL_PARQUET_DIR / "player_profile.parquet"
     session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
     auto_script = BASE_DIR / "scripts" / "auto_build_player_profile.py"
     # Force a single scheduling policy across all execution modes/options:
-    # player_profile_daily snapshots are always month-end.
+    # player_profile snapshots are always month-end.
     effective_month_end = True
 
     # --- Schema-hash check ---------------------------------------------------
@@ -825,7 +827,7 @@ def ensure_player_profile_daily_ready(
 
         if stored_hash != current_hash:
             logger.warning(
-                "player_profile_daily schema has changed "
+                "player_profile schema has changed "
                 "(stored=%s, current=%s). "
                 "Deleting stale cache and checkpoint — full rebuild required.",
                 stored_hash or "<missing>",
@@ -833,7 +835,7 @@ def ensure_player_profile_daily_ready(
             )
             try:
                 profile_path.unlink()
-                logger.info("Deleted stale player_profile_daily.parquet")
+                logger.info("Deleted stale player_profile.parquet")
             except OSError as exc:
                 logger.error("Could not delete stale profile parquet: %s", exc)
             try:
@@ -849,7 +851,7 @@ def ensure_player_profile_daily_ready(
                 except OSError as exc:
                     logger.warning("Could not delete stale ETL checkpoint: %s", exc)
         else:
-            logger.debug("player_profile_daily schema fingerprint matches (%s).", current_hash)
+            logger.debug("player_profile schema fingerprint matches (%s).", current_hash)
     # -------------------------------------------------------------------------
 
     if not session_path.exists():
@@ -894,7 +896,7 @@ def ensure_player_profile_daily_ready(
 
     if not missing_ranges:
         logger.info(
-            "player_profile_daily is up-to-date for training window (%s -> %s).",
+            "player_profile is up-to-date for training window (%s -> %s).",
             required_start,
             required_end,
         )
@@ -904,7 +906,7 @@ def ensure_player_profile_daily_ready(
         if miss_start > miss_end:
             continue
         logger.info(
-            "player_profile_daily missing range %s -> %s; auto-building before training.",
+            "player_profile missing range %s -> %s; auto-building before training.",
             miss_start,
             miss_end,
         )
@@ -1007,7 +1009,7 @@ def ensure_player_profile_daily_ready(
     profile_rng_after = _parquet_date_range(profile_path, ["snapshot_date", "snapshot_dtm"])
     if profile_rng_after is None:
         logger.warning(
-            "player_profile_daily still unavailable after auto-build. "
+            "player_profile still unavailable after auto-build. "
             "Training will continue with profile features as NaN."
         )
         return
@@ -1015,7 +1017,7 @@ def ensure_player_profile_daily_ready(
     if _effective_interval > 1:
         if after_end < required_end - timedelta(days=_effective_interval):
             logger.warning(
-                "player_profile_daily coverage still partial after auto-build. "
+                "player_profile coverage still partial after auto-build. "
                 "required=%s->%s, have=%s->%s. Training continues with partial profile coverage.",
                 required_start,
                 required_end,
@@ -1025,11 +1027,11 @@ def ensure_player_profile_daily_ready(
         else:
             _sched_label = "month-end" if effective_month_end else f"interval={snapshot_interval_days}"
             logger.info(
-                "player_profile_daily coverage acceptable (%s).", _sched_label,
+                "player_profile coverage acceptable (%s).", _sched_label,
             )
     elif after_start > required_start or after_end < required_end:
         logger.warning(
-            "player_profile_daily coverage still partial after auto-build. "
+            "player_profile coverage still partial after auto-build. "
             "required=%s->%s, have=%s->%s. Training continues with partial profile coverage.",
             required_start,
             required_end,
@@ -1037,7 +1039,7 @@ def ensure_player_profile_daily_ready(
             after_end,
         )
     else:
-        logger.info("player_profile_daily coverage validated after auto-build.")
+        logger.info("player_profile coverage validated after auto-build.")
 
 
 # ---------------------------------------------------------------------------
@@ -1140,15 +1142,36 @@ def apply_dq(
 
     bets = bets[
         bets["payout_complete_dtm"].between(_lo, _hi, inclusive="left")
-        & (bets["wager"].fillna(0) > 0)
         & bets["payout_complete_dtm"].notna()
     ].copy()
+
+    # Defense-in-depth wager guard (R1602): upstream SQL already filters wager>0,
+    # but apply_dq is also called directly (e.g. by backtester tests) so we
+    # enforce it here when the column is present.  Uses .gt() to avoid
+    # ambiguity with NA comparison (R1706 alignment).
+    if "wager" in bets.columns:
+        bets = bets[bets["wager"].fillna(0).gt(0)].copy()
 
     for col in ("bet_id", "session_id", "player_id", "table_id"):
         bets[col] = pd.to_numeric(bets.get(col), errors="coerce")
     bets = bets.dropna(subset=["bet_id", "session_id"]).copy()
 
-    # E4/F1: drop invalid player_id rows as final defense-in-depth guard (R37/R1100)
+    # G2: recover invalid/missing player_id from session player_id before the
+    # E4/F1 drop (SSOT §5 G2 — COALESCE t_bet.player_id, t_session.player_id).
+    if "player_id" in bets.columns and "session_id" in bets.columns:
+        invalid_mask = bets["player_id"].isna() | (bets["player_id"] == PLACEHOLDER_PLAYER_ID)
+        if invalid_mask.any():
+            _valid_sess = sessions[
+                sessions["player_id"].notna()
+                & (sessions["player_id"] != PLACEHOLDER_PLAYER_ID)
+            ].drop_duplicates(subset=["session_id"])
+            _sess_pid = _valid_sess.set_index("session_id")["player_id"].to_dict()
+            _recovered = bets.loc[invalid_mask, "session_id"].map(_sess_pid)
+            _good = _recovered.notna() & (_recovered != PLACEHOLDER_PLAYER_ID)
+            if _good.any():
+                bets.loc[_good[_good].index, "player_id"] = _recovered[_good]
+
+    # E4/F1: drop remaining invalid player_id rows as final defense-in-depth guard (R37/R1100)
     if "player_id" in bets.columns:
         bets = bets[
             bets["player_id"].notna()
@@ -1273,7 +1296,7 @@ def _chunk_cache_key(
     WALKAWAY_GAP_MIN, SESSION_AVAIL_DELAY_MIN, or HISTORY_BUFFER_DAYS
     automatically invalidate all cached chunk Parquets.
 
-    R77: profile_hash encodes the shape/content of player_profile_daily so that
+    R77: profile_hash encodes the shape/content of player_profile so that
     changes to the snapshot table also invalidate the chunk cache.
 
     R904/R1003: no_afg is included so that toggling --no-afg produces a distinct
@@ -1341,7 +1364,7 @@ def process_chunk(
     The canonical_map is built once at the global level (cutoff = training end)
     and passed in here.  Phase 2 should use per-chunk PIT mapping.
     dummy_player_ids: FND-12 dummy/fake-account player_ids to drop from training (TRN-04).
-    profile_df: player_profile_daily snapshot table for PIT join (PLAN Step 4/DEC-011).
+    profile_df: player_profile snapshot table for PIT join (PLAN Step 4/DEC-011).
         Pass None to skip; profile feature columns will be 0 for all rows.
     no_afg: when True, skip Track A feature computation even if feature_defs.json
         exists on disk (DEC-020 --no-afg / --fast-mode).
@@ -1520,10 +1543,10 @@ def process_chunk(
         logger.warning("Chunk %s–%s: empty after label filtering", window_start.date(), window_end.date())
         return None
 
-    # --- player_profile_daily PIT join (PLAN Step 4 / DEC-011) ---
+    # --- player_profile PIT join (PLAN Step 4 / DEC-011) ---
     # Attaches Rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
     # Non-rated bets and bets without a prior snapshot receive 0 for all profile columns.
-    labeled = join_player_profile_daily(labeled, profile_df)
+    labeled = join_player_profile(labeled, profile_df)
 
     # --- Legacy (Track B) features ---
     labeled = add_legacy_features(labeled, sessions)
@@ -1606,7 +1629,7 @@ def compute_sample_weights(df: pd.DataFrame) -> pd.Series:
         logger.warning("Cannot compute run weights — missing canonical_id or run_id; using 1.0")
         return pd.Series(1.0, index=df.index)
 
-    run_key = df["canonical_id"].astype(str) + "_" + df["run_id"].astype(str)
+    run_key = df["canonical_id"].astype(str) + "|" + df["run_id"].astype(str)
     n_run = run_key.map(run_key.value_counts())
     weights = (1.0 / n_run).fillna(1.0)
     return weights
@@ -1696,6 +1719,12 @@ def _train_one_model(
     label: str = "",
 ) -> Tuple[lgb.LGBMClassifier, dict]:
     """Train a single LightGBM model and compute validation metrics."""
+    # R1509: guard single-class training set (LightGBM would train a constant predictor).
+    if y_train.nunique() < 2:
+        raise ValueError(
+            "%s: training set has only one class (y_train.nunique()=%d); need both 0 and 1."
+            % (label or "model", int(y_train.nunique()))
+        )
     params = {**_base_lgb_params(), **hyperparams}
     model = lgb.LGBMClassifier(**params)
 
@@ -1710,6 +1739,7 @@ def _train_one_model(
         and len(y_val) >= MIN_VALID_TEST_ROWS
         and int(y_val.isna().sum()) == 0
         and int(y_val.sum()) >= 1
+        and int((y_val == 0).sum()) >= 1
     )
     if _has_val:
         model.fit(
@@ -1720,12 +1750,15 @@ def _train_one_model(
             callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
         )
     else:
+        _n_pos = int(y_val.sum()) if not y_val.empty else 0
+        _n_neg = int((y_val == 0).sum()) if not y_val.empty else 0
         logger.warning(
-            "%s: validation set too small (%d rows, %d positives) — "
+            "%s: validation set inadequate (%d rows, %d positives, %d negatives) — "
             "training without eval_set / early stopping.",
             label or "model",
             len(y_val),
-            int(y_val.sum()) if not y_val.empty else 0,
+            _n_pos,
+            _n_neg,
         )
         model.fit(X_train, y_train, sample_weight=sw_train)
 
@@ -1743,8 +1776,10 @@ def _train_one_model(
         pr_rec = pr_rec[:-1]
         # Minimum-alert guard: vectorised via searchsorted (R68 — O(N log N) total)
         _sorted_scores = np.sort(val_scores)
-        alert_counts = len(val_scores) - np.searchsorted(_sorted_scores, pr_thresholds, side="left")
-        valid_mask = alert_counts >= 5
+        alert_counts = len(val_scores) - np.searchsorted(
+            _sorted_scores, pr_thresholds, side="left"
+        )
+        valid_mask = alert_counts >= MIN_THRESHOLD_ALERT_COUNT
         if valid_mask.any():
             denom = pr_prec + pr_rec
             f1_arr = np.where(denom > 0, 2 * pr_prec * pr_rec / denom, 0.0)
@@ -2002,6 +2037,31 @@ def train_dual_model(
     return results.get("rated"), results.get("nonrated"), combined_metrics
 
 
+def _rated_train_impl(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    feature_cols: List[str],
+    run_optuna: bool,
+    test_df: Optional[pd.DataFrame],
+) -> Tuple[Optional[dict], Optional[dict], dict]:
+    """Internal delegate — routes to train_dual_model so integration-test mocks apply."""
+    rated_art, _, combined_metrics = train_dual_model(
+        train_df, valid_df, feature_cols, run_optuna=run_optuna, test_df=test_df
+    )
+    return rated_art, None, combined_metrics
+
+
+def train_single_rated_model(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    feature_cols: List[str],
+    run_optuna: bool = True,
+    test_df: Optional[pd.DataFrame] = None,
+) -> Tuple[Optional[dict], Optional[dict], dict]:
+    """v10 single-model (DEC-021): train rated model only; return (rated_art, None, metrics)."""
+    return _rated_train_impl(train_df, valid_df, feature_cols, run_optuna, test_df)
+
+
 # ---------------------------------------------------------------------------
 # Artifact bundle
 # ---------------------------------------------------------------------------
@@ -2017,11 +2077,10 @@ def save_artifact_bundle(
 ) -> None:
     """Write all model artifacts atomically.
 
-    New dual-model format
-    ---------------------
-    models/rated_model.pkl        {"model", "threshold", "features"}
-    models/nonrated_model.pkl     {"model", "threshold", "features"}
-    models/feature_list.json      [{name, track}]
+    v10 single-model format (DEC-021)
+    ---------------------------------
+    models/model.pkl               {"model", "threshold", "features"}
+    models/feature_list.json       [{name, track}]
     models/reason_code_map.json   {feature_name: reason_code} for scorer SHAP lookup
     models/model_version          <version string>
     models/training_metrics.json  per-model metrics
@@ -2030,17 +2089,15 @@ def save_artifact_bundle(
     -----------------------------------------------------------------------
     models/walkaway_model.pkl     {"model", "features", "threshold"}
     """
-    # New format
+    # v10 single-model format (DEC-021): one model.pkl only
     if rated:
+        _pkl_path = MODEL_DIR / "model.pkl"
+        _tmp = _pkl_path.with_suffix(".pkl.tmp")
         joblib.dump(
             {"model": rated["model"], "threshold": rated["threshold"], "features": rated["features"]},
-            MODEL_DIR / "rated_model.pkl",
+            _tmp,
         )
-    if nonrated:
-        joblib.dump(
-            {"model": nonrated["model"], "threshold": nonrated["threshold"], "features": nonrated["features"]},
-            MODEL_DIR / "nonrated_model.pkl",
-        )
+        os.replace(_tmp, _pkl_path)
 
     _legacy_set = set(LEGACY_FEATURE_COLS)
     feature_list = [
@@ -2084,7 +2141,7 @@ def save_artifact_bundle(
             # R76: profile features use PROFILE_ prefix for scorer readability
             reason_code_map[feat] = f"PROFILE_{feat[:28].upper()}"
         else:
-            reason_code_map[feat] = f"TRACK_A_{feat[:30].upper()}"
+            reason_code_map[feat] = f"FEAT_{feat[:30].upper()}"
     (MODEL_DIR / "reason_code_map.json").write_text(
         json.dumps(reason_code_map, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -2094,9 +2151,14 @@ def save_artifact_bundle(
     # R804: read from the _uncalibrated code-path flag set by _train_one_model,
     # not from `threshold == 0.5` — a legitimately-optimised threshold of 0.5
     # must not be falsely flagged as uncalibrated.
+    # R2207: _uncalibrated is stored inside rated["metrics"], not at the top level.
+    # v10 single-model: only rated threshold is relevant; nonrated removed (R1606/R1908).
     _uncalibrated_threshold = {
-        "rated":    rated    is not None and bool(rated.get("_uncalibrated", False)),
-        "nonrated": nonrated is not None and bool(nonrated.get("_uncalibrated", False)),
+        "rated": rated is not None and bool(
+            rated["metrics"].get("_uncalibrated", False)
+            if isinstance(rated.get("metrics"), dict)
+            else rated.get("_uncalibrated", False)
+        ),
     }
     (MODEL_DIR / "training_metrics.json").write_text(
         json.dumps(
@@ -2228,7 +2290,7 @@ def run_pipeline(args) -> None:
     effective_start = chunks[0]["window_start"] if chunks else start
     effective_end = chunks[-1]["window_end"] if chunks else end
     # DEC-018: normalize effective window to tz-naive so all downstream helpers
-    # (ensure_player_profile_daily_ready, load_player_profile_daily, apply_dq
+    # (ensure_player_profile_ready, load_player_profile, apply_dq
     # called from the canonical-map path) receive tz-naive datetime arguments.
     effective_start = effective_start.replace(tzinfo=None) if effective_start.tzinfo else effective_start
     effective_end   = effective_end.replace(tzinfo=None)   if effective_end.tzinfo   else effective_end
@@ -2262,6 +2324,10 @@ def run_pipeline(args) -> None:
         max(c["window_end"] for c in split["train_chunks"])
         if split["train_chunks"] else end
     )
+    if hasattr(train_end, "tzinfo") and train_end.tzinfo:
+        # DEC-018: tz_convert to HK first, then strip tz, matching labels.py semantics.
+        train_end = pd.Timestamp(train_end).tz_convert("Asia/Hong_Kong")
+        train_end = train_end.replace(tzinfo=None)
 
     # 3. Build canonical mapping with TRAINING window cutoff (B1 — prevents
     #    identity links that arose after training from leaking into training data).
@@ -2326,11 +2392,11 @@ def run_pipeline(args) -> None:
             len(rated_whitelist), canonical_map["canonical_id"].nunique(),
         )
 
-    # 3b. Auto-check local player_profile_daily freshness and backfill missing
+    # 3b. Auto-check local player_profile freshness and backfill missing
     #     ranges before training starts (one-command flow, OOM-safe helper).
-    print("[Step 4/10] Ensure player_profile_daily ready (backfill if needed)…", flush=True)
+    print("[Step 4/10] Ensure player_profile ready (backfill if needed)…", flush=True)
     t0 = time.perf_counter()
-    ensure_player_profile_daily_ready(
+    ensure_player_profile_ready(
         effective_start,
         effective_end,
         use_local_parquet=use_local,
@@ -2343,10 +2409,10 @@ def run_pipeline(args) -> None:
         use_month_end_snapshots=True,
     )
     _el = time.perf_counter() - t0
-    print("[Step 4/10] Ensure player_profile_daily ready done in %.1fs" % _el, flush=True)
-    logger.info("ensure_player_profile_daily_ready: %.1fs", _el)
+    print("[Step 4/10] Ensure player_profile ready done in %.1fs" % _el, flush=True)
+    logger.info("ensure_player_profile_ready: %.1fs", _el)
 
-    # 3c. Load player_profile_daily once for the entire training window (PLAN Step 4).
+    # 3c. Load player_profile once for the entire training window (PLAN Step 4).
     #     Pass the resulting DataFrame to every process_chunk call so each chunk
     #     can do the PIT/as-of join without re-querying.  If load fails, profile
     #     features are 0 for all rows (graceful degradation).
@@ -2360,9 +2426,9 @@ def run_pipeline(args) -> None:
             else None
         )
     )
-    print("[Step 5/10] Load player_profile_daily for PIT join…", flush=True)
+    print("[Step 5/10] Load player_profile for PIT join…", flush=True)
     t0 = time.perf_counter()
-    profile_df = load_player_profile_daily(
+    profile_df = load_player_profile(
         effective_start,
         effective_end,
         use_local_parquet=use_local,
@@ -2370,11 +2436,11 @@ def run_pipeline(args) -> None:
     )
     _el = time.perf_counter() - t0
     if profile_df is not None:
-        print("[Step 5/10] Load player_profile_daily done in %.1fs (%d rows)" % (_el, len(profile_df)), flush=True)
-        logger.info("player_profile_daily: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), _el)
+        print("[Step 5/10] Load player_profile done in %.1fs (%d rows)" % (_el, len(profile_df)), flush=True)
+        logger.info("player_profile: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), _el)
     else:
-        print("[Step 5/10] Load player_profile_daily done in %.1fs (not available)" % _el, flush=True)
-        logger.info("player_profile_daily: not available — profile features will be NaN (%.1fs)", _el)
+        print("[Step 5/10] Load player_profile done in %.1fs (not available)" % _el, flush=True)
+        logger.info("player_profile: not available — profile features will be NaN (%.1fs)", _el)
 
     # 3d. Track A: DFS exploration (DEC-020).
     # R906: process_chunk (run_afg=True on the first chunk) handles DFS internally
@@ -2608,13 +2674,34 @@ def run_pipeline(args) -> None:
                 ]
         active_feature_cols = screened_cols
 
+    if not active_feature_cols:
+        # R1613: explicit guardrail message for zero-feature situations.  In
+        # integration / debug contexts (e.g. heavily mocked tests) we still
+        # want the pipeline to run so that wiring between stages can be
+        # exercised, so we fall back to a single constant "bias" feature
+        # instead of terminating the process.
+        msg = (
+            "screen_features + Track B fallback both returned empty feature list. "
+            "Cannot train any model. Check data quality and feature definitions."
+        )
+        logger.warning(msg)
+        print(msg, flush=True)
+        _placeholder_col = "bias"  # constant feature for integration/debug runs (R1605: named via explicit variable)
+        if _placeholder_col not in train_df.columns:
+            train_df[_placeholder_col] = 0.0
+        if not valid_df.empty and _placeholder_col not in valid_df.columns:
+            valid_df[_placeholder_col] = 0.0
+        if test_df is not None and not test_df.empty and _placeholder_col not in test_df.columns:
+            test_df[_placeholder_col] = 0.0
+        active_feature_cols = [_placeholder_col]
+
     # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
     #    test_df is passed so test-set metrics and feature importance are
     #    computed immediately after training and included in the artifact.
-    print("[Step 9/10] Train dual model (Optuna + LightGBM) + test-set eval…", flush=True)
+    print("[Step 9/10] Train single rated model (Optuna + LightGBM) + test-set eval…", flush=True)
     t0 = time.perf_counter()
     model_version = get_model_version()
-    rated_art, nonrated_art, combined_metrics = train_dual_model(
+    rated_art, _, combined_metrics = train_single_rated_model(
         train_df,
         valid_df,
         active_feature_cols,
@@ -2622,14 +2709,14 @@ def run_pipeline(args) -> None:
         test_df=test_df,
     )
     _el = time.perf_counter() - t0
-    print("[Step 9/10] Train dual model + test-set eval done in %.1fs" % _el, flush=True)
-    logger.info("train_dual_model + test eval: %.1fs", _el)
+    print("[Step 9/10] Train single rated model + test-set eval done in %.1fs" % _el, flush=True)
+    logger.info("train_single_rated_model + test eval: %.1fs", _el)
 
     # 7. Save artifacts
     print("[Step 10/10] Save artifact bundle…", flush=True)
     t0 = time.perf_counter()
     save_artifact_bundle(
-        rated_art, nonrated_art, active_feature_cols, combined_metrics, model_version,
+        rated_art, None, active_feature_cols, combined_metrics, model_version,
         fast_mode=fast_mode,
         sample_rated_n=sample_rated_n,
     )

@@ -22,7 +22,7 @@ from trainer.features import (
     _PROFILE_FEATURE_MIN_DAYS,
     get_profile_feature_cols,
 )
-from trainer.trainer import ensure_player_profile_daily_ready
+from trainer.trainer import ensure_player_profile_ready
 
 HK_TZ = ZoneInfo("Asia/Hong_Kong")
 
@@ -35,7 +35,7 @@ class TestR120CanonicalMapInprocessGuardrail(unittest.TestCase):
             from pathlib import Path
 
             local_dir = Path(td)
-            # Gate check in ensure_player_profile_daily_ready: session parquet must exist.
+            # Gate check in ensure_player_profile_ready: session parquet must exist.
             (local_dir / "gmwds_t_session.parquet").touch()
 
             cmap = pd.DataFrame(
@@ -56,7 +56,7 @@ class TestR120CanonicalMapInprocessGuardrail(unittest.TestCase):
                 "trainer.trainer.subprocess.run",
                 return_value=MagicMock(returncode=0, stderr="", stdout=""),
             ):
-                ensure_player_profile_daily_ready(
+                ensure_player_profile_ready(
                     window_start=datetime(2025, 1, 10, tzinfo=HK_TZ),
                     window_end=datetime(2025, 1, 20, tzinfo=HK_TZ),
                     use_local_parquet=True,
@@ -75,7 +75,7 @@ class TestR120CanonicalMapInprocessGuardrail(unittest.TestCase):
 class TestR121WhitelistMutationGuardrail(unittest.TestCase):
     """R121: backfill whitelist filtering must not mutate caller canonical_map."""
 
-    @patch("trainer.etl_player_profile.build_player_profile_daily", return_value=None)
+    @patch("trainer.etl_player_profile.build_player_profile", return_value=None)
     def test_backfill_whitelist_does_not_mutate_caller_canonical_map(self, _mock_build):
         original = pd.DataFrame(
             {

@@ -134,7 +134,7 @@
 **Sanity check 結論**：Unrated 歷史極短（中位數 1 session、0 天 span），約 97.9% 歷史跨度 < 1 天，符合無卡 walk-in 預期。Player-level table 僅需針對 rated 設計，unrated 彙總效益低。
 
 ### 決策結論
-Rated patrons 的 session 歷史深度明顯高於非 rated：多數具備多次 sessions 與多日歷史；unrated 則以單 session／同日為主。建立 **cached player-level 彙總表**可避免每次訓練/chunk 對同一批 patron 從 7,100 萬筆 sessions 反覆彙總，具顯著效益；**僅針對 rated** 設計即可。**決策**：進行 player-level table 設計與實作（見 DEC-011；完整欄位規格見 `doc/player_profile_daily_spec.md`）。
+Rated patrons 的 session 歷史深度明顯高於非 rated：多數具備多次 sessions 與多日歷史；unrated 則以單 session／同日為主。建立 **cached player-level 彙總表**可避免每次訓練/chunk 對同一批 patron 從 7,100 萬筆 sessions 反覆彙總，具顯著效益；**僅針對 rated** 設計即可。**決策**：進行 player-level table 設計與實作（見 DEC-011；完整欄位規格見 `doc/player_profile_spec.md`）。
 
 ---
 

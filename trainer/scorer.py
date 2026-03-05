@@ -9,7 +9,7 @@ Key changes from pre-Phase-1 version
 * D2 identity resolution via identity.py build_canonical_mapping_from_df.
 * Track B features via features.py (compute_loss_streak / compute_run_boundary)
   — guarantees train-serve parity with trainer.py. (table_hc deferred to Phase 2.)
-* player_profile_daily PIT join (R79): rated bets enriched with player profile
+* player_profile PIT join (R79): rated bets enriched with player profile
   features via as-of merge (snapshot_dtm <= bet_time); profile features stay NaN
   for non-rated bets and bets with no prior snapshot.
 * H3 model routing: is_rated_obs ← casino_player_id IS NOT NULL.
@@ -37,13 +37,13 @@ from zoneinfo import ZoneInfo
 try:
     from features import (  # type: ignore[import]
         PROFILE_FEATURE_COLS,
-        join_player_profile_daily as _join_profile,
+        join_player_profile as _join_profile,
     )
 except ImportError:
     try:
         from trainer.features import (  # type: ignore[import, attr-defined]
             PROFILE_FEATURE_COLS,
-            join_player_profile_daily as _join_profile,
+            join_player_profile as _join_profile,
         )
     except ImportError:
         PROFILE_FEATURE_COLS = []  # type: ignore[assignment]
@@ -111,9 +111,9 @@ _NEW_ALERT_COLS: List[Tuple[str, str]] = [
 
 # ── Artifact loading ──────────────────────────────────────────────────────────
 def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
-    """Load rated + nonrated models, feature list, reason code map, model version.
+    """Load model(s), feature list, reason code map, model version.
 
-    Falls back to legacy walkaway_model.pkl when new dual artifacts are absent.
+    Priority (v10): model.pkl → rated_model.pkl → walkaway_model.pkl.
 
     Returns dict:
         rated        : {"model": lgb.Booster, "threshold": float} or None
@@ -123,6 +123,7 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         model_version   : str
     """
     d = model_dir or MODEL_DIR
+    model_path = d / "model.pkl"      # v10 single-model artifact
     rated_path = d / "rated_model.pkl"
     nonrated_path = d / "nonrated_model.pkl"
     feature_list_path = d / "feature_list.json"
@@ -163,6 +164,38 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
     if reason_map_path.exists():
         with reason_map_path.open(encoding="utf-8") as fh:
             artifacts["reason_code_map"] = json.load(fh)
+
+    # R2206: check training_metrics.json for fast_mode flag; refuse to load
+    # a fast_mode artifact in production to prevent data-horizon violations.
+    metrics_path = d / "training_metrics.json"
+    if metrics_path.exists():
+        try:
+            _tm = json.loads(metrics_path.read_text(encoding="utf-8"))
+            fast_mode = bool(_tm.get("fast_mode", False))
+        except Exception:
+            fast_mode = False
+        if fast_mode:
+            raise RuntimeError(
+                "[scorer] Refusing to load fast_mode artifact in production. "
+                "Retrain without --fast-mode before deploying."
+            )
+
+    # v10 single-model: prefer model.pkl
+    if model_path.exists():
+        rb = joblib.load(model_path)
+        artifacts["rated"] = {
+            "model": rb["model"],
+            "threshold": float(rb.get("threshold", 0.5)),
+            "features": rb.get("features", []),
+        }
+        if not artifacts["feature_list"]:
+            artifacts["feature_list"] = rb.get("features", [])
+        logger.info(
+            "[scorer] Single rated model loaded from model.pkl (v=%s, %d features)",
+            artifacts["model_version"],
+            len(artifacts["feature_list"]),
+        )
+        return artifacts
 
     if rated_path.exists() and nonrated_path.exists():
         rb = joblib.load(rated_path)
@@ -672,6 +705,18 @@ def build_features_for_scoring(
     bets_df["cum_wager"] = bets_df.groupby("session_id")["wager"].cumsum()
     bets_df["avg_wager_sofar"] = bets_df["cum_wager"] / bets_df["cum_bets"]
 
+    # R2300: session_duration_min and bets_per_minute — train-serve parity with
+    # trainer.add_legacy_features (R2300 scorer parity gap).
+    bets_df["session_duration_min"] = (
+        (bets_df["session_end_dtm"] - bets_df["session_start_dtm"])
+        .dt.total_seconds()
+        .clip(lower=0)
+        / 60
+    )
+    bets_df["bets_per_minute"] = (
+        bets_df["cum_bets"] / bets_df["session_duration_min"].replace(0, np.nan)
+    ).fillna(0.0)
+
     # Vectorised rolling window counts / sums per session
     _pcd = pd.to_datetime(bets_df["payout_complete_dtm"], errors="coerce")
     if pd.api.types.is_datetime64_any_dtype(_pcd) and _pcd.dt.tz is not None:
@@ -769,10 +814,10 @@ def _compute_reason_codes(
         return ["[]" for _ in range(len(X))]
 
 
-# ── player_profile_daily loading for real-time scoring (R79) ─────────────────
+# ── player_profile loading for real-time scoring (R79) ─────────────────
 
 PROJECT_ROOT = BASE_DIR.parent
-_LOCAL_PARQUET_PROFILE = PROJECT_ROOT / "data" / "player_profile_daily.parquet"
+_LOCAL_PARQUET_PROFILE = PROJECT_ROOT / "data" / "player_profile.parquet"
 
 # R85: module-level TTL cache — avoids re-querying the profile table on every
 # scoring call within the same process (e.g. repeated score_once calls in a loop).
@@ -785,7 +830,7 @@ def _load_profile_for_scoring(
     as_of_dtm: datetime,
     lookback_days: int = 365,
 ) -> "Optional[pd.DataFrame]":
-    """Load the *latest* player_profile_daily snapshot per rated player for PIT join.
+    """Load the *latest* player_profile snapshot per rated player for PIT join.
 
     Only the most-recent snapshot at or before ``as_of_dtm`` is returned for each
     canonical_id (R84 — avoids sending stale/redundant rows to merge_asof).
@@ -828,7 +873,7 @@ def _load_profile_for_scoring(
             # R84: keep only the latest snapshot per player
             df = df.sort_values("snapshot_dtm")
             df = df.drop_duplicates(subset=["canonical_id"], keep="last")
-            logger.info("[scorer] player_profile_daily: %d rows from local Parquet", len(df))
+            logger.info("[scorer] player_profile: %d rows from local Parquet", len(df))
             df_loaded = df if not df.empty else None
         except Exception as exc:
             logger.debug("[scorer] profile local Parquet skipped: %s", exc)
@@ -838,7 +883,7 @@ def _load_profile_for_scoring(
         try:
             client = get_clickhouse_client()
             _source_db = getattr(config, "SOURCE_DB", "GDP_GMWDS_Raw")
-            _tprofile = getattr(config, "TPROFILE", "player_profile_daily")
+            _tprofile = getattr(config, "TPROFILE", "player_profile")
             _profile_cols_sql = ", ".join(PROFILE_FEATURE_COLS) if PROFILE_FEATURE_COLS else "*"
             _cids = list({str(c) for c in rated_canonical_ids})
             # R84: ORDER BY snapshot_dtm DESC + LIMIT 1 BY canonical_id — latest snapshot per player
@@ -854,11 +899,11 @@ def _load_profile_for_scoring(
                 query,
                 parameters={"as_of": as_of_dtm, "cids": _cids},
             )
-            logger.info("[scorer] player_profile_daily: %d rows from ClickHouse", len(df))
+            logger.info("[scorer] player_profile: %d rows from ClickHouse", len(df))
             df_loaded = df if not df.empty else None
         except Exception as exc:
             logger.warning(
-                "[scorer] player_profile_daily unavailable (%s); profile features will be NaN", exc
+                "[scorer] player_profile unavailable (%s); profile features will be NaN", exc
             )
 
     # R85: populate cache on successful load
@@ -1140,7 +1185,7 @@ def score_once(
         except Exception as exc:
             logger.warning("[scorer] Track A features skipped: %s", exc)
 
-    # ── player_profile_daily PIT join (R79) ─────────────────────────────────
+    # ── player_profile PIT join (R79) ─────────────────────────────────
     # Attach rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
     # Non-rated bets and bets without a prior snapshot keep NaN — LightGBM handles
     # this natively via the default-child path trained in trainer.py (R74/R79).
@@ -1148,10 +1193,10 @@ def score_once(
         _profile_df = _load_profile_for_scoring(rated_canonical_ids, now_hk)
         if _profile_df is not None:
             features_all = _join_profile(features_all, _profile_df)
-            logger.info("[scorer] player_profile_daily PIT join applied")
+            logger.info("[scorer] player_profile PIT join applied")
         else:
             logger.info(
-                "[scorer] player_profile_daily unavailable — profile features will be NaN"
+                "[scorer] player_profile unavailable — profile features will be NaN"
             )
 
     features_all["is_rated"] = features_all["canonical_id"].isin(rated_canonical_ids)

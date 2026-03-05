@@ -1,6 +1,6 @@
 """trainer/backtester.py — Phase 1 Update
 ==========================================
-Patron Walkaway — Dual-Model Backtester (F1 Threshold, DEC-010)
+Patron Walkaway — Single Rated Model Backtester (F1 Threshold, DEC-010 / v10)
 
 Pipeline
 --------
@@ -8,10 +8,10 @@ Pipeline
 2. Resolve canonical_id via identity.py (cutoff = window end).
 3. Compute labels via labels.py (C1 extended pull).
 4. Compute Track-B features via features.py.
-5. Route observations to Rated / Non-rated (H3).
-6. Score with dual models.
-7. Optuna TPE 2D threshold search (rated_threshold × nonrated_threshold).
-8. Report Micro and Macro-by-visit dual metrics.
+5. Route observations: rated only (H3).
+6. Score with single rated model.
+7. Optuna TPE 1D threshold search (rated_threshold).
+8. Report Micro and Macro-by-gaming-day metrics.
 
 Evaluation rules (SSOT §10.3)
 -------------------------------
@@ -115,16 +115,22 @@ BACKTEST_OUT.mkdir(exist_ok=True)
 # ---------------------------------------------------------------------------
 
 def load_dual_artifacts() -> Dict[str, Optional[dict]]:
-    """Load rated + non-rated model bundles.
+    """Load model bundle(s) for backtesting.
 
-    Falls back to legacy single-model ``walkaway_model.pkl`` for both slots
-    so that the backtester can still run before the dual-model trainer has
-    been executed.
+    Priority (v10 single-model):
+    1. ``model.pkl``         — v10 single rated model
+    2. ``rated_model.pkl``   — legacy dual-model rated slot
+    3. ``walkaway_model.pkl``— legacy single-model fallback
     """
     def _try(path: Path) -> Optional[dict]:
         if path.exists():
             return joblib.load(path)
         return None
+
+    # v10: prefer model.pkl (single rated model)
+    single = _try(MODEL_DIR / "model.pkl")
+    if single is not None:
+        return {"rated": single, "nonrated": None}
 
     rated = _try(MODEL_DIR / "rated_model.pkl")
     nonrated = _try(MODEL_DIR / "nonrated_model.pkl")
@@ -140,7 +146,7 @@ def load_dual_artifacts() -> Dict[str, Optional[dict]]:
     if rated is None and nonrated is None:
         raise FileNotFoundError(
             f"No model artifacts found in {MODEL_DIR}. "
-            "Run trainer.py first to produce rated_model.pkl / nonrated_model.pkl."
+            "Run trainer.py first to produce model.pkl / rated_model.pkl."
         )
     return {"rated": rated, "nonrated": nonrated}
 
@@ -171,29 +177,25 @@ def _score_df(df: pd.DataFrame, artifacts: Dict[str, Optional[dict]]) -> pd.Data
 
 def compute_micro_metrics(
     df: pd.DataFrame,
-    rated_threshold: float,
-    nonrated_threshold: float,
+    threshold: float,
     window_hours: Optional[float] = None,
 ) -> dict:
-    """Micro (observation-level) metrics for the combined rated+nonrated population.
+    """Micro (observation-level) metrics (v10 single model: one threshold only).
 
     Parameters
     ----------
     df:
         Must contain ``score``, ``label``, ``is_rated`` columns.
-    rated_threshold / nonrated_threshold:
-        Alert threshold per model track.
+    threshold:
+        Alert threshold (rated observations only; nonrated are not alerted).
     window_hours:
         Duration of the evaluation window (used to compute alerts/hour).
     """
     if df.empty:
         return {}
     df = df.copy()
-    df["is_alert"] = np.where(
-        df["is_rated"],
-        df["score"] >= rated_threshold,
-        df["score"] >= nonrated_threshold,
-    )
+    # v10: single model — only rated observations get alerts (DEC-021).
+    df["is_alert"] = np.where(df["is_rated"], df["score"] >= threshold, False)
 
     n_alerts = int(df["is_alert"].sum())
     n_tp = int((df["is_alert"] & (df["label"] == 1)).sum())
@@ -231,8 +233,7 @@ def compute_micro_metrics(
 
 def compute_macro_by_gaming_day_metrics(
     df: pd.DataFrame,
-    rated_threshold: float,
-    nonrated_threshold: float,
+    threshold: float,
 ) -> dict:
     """Macro-by-gaming-day (per-gaming-day-average) metrics.
 
@@ -252,37 +253,32 @@ def compute_macro_by_gaming_day_metrics(
         return {}
 
     df = df.copy()
-    df["is_alert"] = np.where(
-        df["is_rated"],
-        df["score"] >= rated_threshold,
-        df["score"] >= nonrated_threshold,
-    )
+    df["is_alert"] = np.where(df["is_rated"], df["score"] >= threshold, False)
 
-    visit_key = ["canonical_id", "gaming_day"]
-    grouped = df.groupby(visit_key)
+    group_key = ["canonical_id", "gaming_day"]
+    grouped = df.groupby(group_key)
 
-    visit_prec_list = []
-    visit_rec_list = []
+    day_prec_list: list = []
+    day_rec_list: list = []
     for _, grp in grouped:
         has_pos = int((grp["label"] == 1).sum()) > 0
         n_alerted = int(grp["is_alert"].sum())
-        # Per-visit TP: at most 1 even if multiple alerted+positive rows
         has_tp = int((grp["is_alert"] & (grp["label"] == 1)).any())
 
         if n_alerted > 0:
-            visit_prec_list.append(has_tp / n_alerted)
+            day_prec_list.append(has_tp / n_alerted)
         if has_pos:
-            visit_rec_list.append(float(has_tp))
+            day_rec_list.append(float(has_tp))
 
-    macro_prec = float(np.mean(visit_prec_list)) if visit_prec_list else 0.0
-    macro_rec = float(np.mean(visit_rec_list)) if visit_rec_list else 0.0
+    macro_prec = float(np.mean(day_prec_list)) if day_prec_list else 0.0
+    macro_rec = float(np.mean(day_rec_list)) if day_rec_list else 0.0
 
     return {
         "macro_precision": macro_prec,
         "macro_recall": macro_rec,
-        "n_visits": grouped.ngroups,
-        "n_visits_with_alert": len(visit_prec_list),
-        "n_visits_with_positive": len(visit_rec_list),
+        "n_gaming_days": grouped.ngroups,
+        "n_gaming_days_with_alert": len(day_prec_list),
+        "n_gaming_days_with_positive": len(day_rec_list),
     }
 
 
@@ -294,28 +290,21 @@ def _compute_section_metrics(
     labeled: pd.DataFrame,
     rated_sub: pd.DataFrame,
     nonrated_sub: pd.DataFrame,
-    rated_threshold: float,
-    nonrated_threshold: float,
+    threshold: float,
     window_hours: Optional[float],
 ) -> dict:
-    """Compute combined + rated-track + nonrated-track micro/macro metrics.
-
-    Centralises all compute_micro_metrics / compute_macro_by_gaming_day_metrics
-    calls for one threshold pair, preventing duplicated call-sites in backtest().
-    alerts_per_hour uses the full window_hours for all tracks (same evaluation window).
-    """
+    """Compute combined + rated micro/macro metrics (v10 single threshold)."""
     return {
-        "rated_threshold": rated_threshold,
-        "nonrated_threshold": nonrated_threshold,
-        "micro": compute_micro_metrics(labeled, rated_threshold, nonrated_threshold, window_hours),
-        "macro_by_visit": compute_macro_by_gaming_day_metrics(labeled, rated_threshold, nonrated_threshold),
+        "rated_threshold": threshold,
+        "micro": compute_micro_metrics(labeled, threshold, window_hours),
+        "macro_by_visit": compute_macro_by_gaming_day_metrics(labeled, threshold),
         "rated_track": {
-            "micro": compute_micro_metrics(rated_sub, rated_threshold, rated_threshold, window_hours),
-            "macro_by_visit": compute_macro_by_gaming_day_metrics(rated_sub, rated_threshold, rated_threshold),
+            "micro": compute_micro_metrics(rated_sub, threshold, window_hours),
+            "macro_by_visit": compute_macro_by_gaming_day_metrics(rated_sub, threshold),
         },
         "nonrated_track": {
-            "micro": compute_micro_metrics(nonrated_sub, nonrated_threshold, nonrated_threshold, window_hours),
-            "macro_by_visit": compute_macro_by_gaming_day_metrics(nonrated_sub, nonrated_threshold, nonrated_threshold),
+            "micro": compute_micro_metrics(nonrated_sub, threshold, window_hours),
+            "macro_by_visit": compute_macro_by_gaming_day_metrics(nonrated_sub, threshold),
         },
     }
 
@@ -468,9 +457,8 @@ def backtest(
     rated_sub = labeled[labeled["is_rated"]]
     nonrated_sub = labeled[~labeled["is_rated"]]
 
-    # --- Metrics with model-default thresholds ---
+    # --- Metrics with model-default threshold (v10 single model) ---
     rated_t_default = float((artifacts.get("rated") or {}).get("threshold", 0.5))
-    nonrated_t_default = float((artifacts.get("nonrated") or {}).get("threshold", 0.5))
 
     results: dict = {
         "window_start": window_start.isoformat(),
@@ -482,18 +470,18 @@ def backtest(
         "nonrated_obs": int((~labeled["is_rated"]).sum()),
         "model_default": _compute_section_metrics(
             labeled, rated_sub, nonrated_sub,
-            rated_t_default, nonrated_t_default, window_hours,
+            rated_t_default, window_hours,
         ),
     }
 
-    # --- Optional: Optuna 2D threshold search ---
+    # --- Optional: Optuna single-threshold search ---
     if run_optuna:
-        rated_t_opt, nonrated_t_opt = run_optuna_threshold_search(
+        rated_t_opt, _ = run_optuna_threshold_search(
             labeled, artifacts, n_trials=n_optuna_trials, window_hours=window_hours,
         )
         results["optuna"] = _compute_section_metrics(
             labeled, rated_sub, nonrated_sub,
-            rated_t_opt, nonrated_t_opt, window_hours,
+            rated_t_opt, window_hours,
         )
 
     # --- Save predictions (R30: parquet for large windows; alerts stay CSV) ---
@@ -503,7 +491,7 @@ def backtest(
     labeled["is_alert"] = np.where(
         labeled["is_rated"],
         labeled["score"] >= rated_t_default,
-        labeled["score"] >= nonrated_t_default,
+        False,
     )
     alerts_df = labeled[labeled["is_alert"]].copy()
     alerts_path = BACKTEST_OUT / "backtest_alerts.csv"

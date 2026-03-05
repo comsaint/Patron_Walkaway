@@ -34,18 +34,10 @@ def _get_func_src(name: str) -> str:
 # Dual metrics (micro + macro) — spec replication
 # ---------------------------------------------------------------------------
 
-def _micro_metrics_spec(
-    df: pd.DataFrame,
-    rated_threshold: float,
-    nonrated_threshold: float,
-) -> dict:
-    """Replicate backtester compute_micro_metrics: observation-level precision/recall."""
+def _micro_metrics_spec(df: pd.DataFrame, threshold: float) -> dict:
+    """Replicate backtester compute_micro_metrics (v10 single threshold)."""
     df = df.copy()
-    df["is_alert"] = np.where(
-        df["is_rated"],
-        df["score"] >= rated_threshold,
-        df["score"] >= nonrated_threshold,
-    )
+    df["is_alert"] = np.where(df["is_rated"], df["score"] >= threshold, False)
     n_alerts = int(df["is_alert"].sum())
     n_tp = int((df["is_alert"] & (df["label"] == 1)).sum())
     n_pos = int((df["label"] == 1).sum())
@@ -54,20 +46,12 @@ def _micro_metrics_spec(
     return {"precision": prec, "recall": rec, "alerts": n_alerts, "true_alerts": n_tp, "positives": n_pos}
 
 
-def _macro_by_visit_spec(
-    df: pd.DataFrame,
-    rated_threshold: float,
-    nonrated_threshold: float,
-) -> dict:
-    """Replicate backtester compute_macro_by_visit_metrics with per-visit at-most-1-TP dedup."""
+def _macro_by_visit_spec(df: pd.DataFrame, threshold: float) -> dict:
+    """Replicate backtester compute_macro_by_gaming_day_metrics (v10 single threshold)."""
     if "gaming_day" not in df.columns or "canonical_id" not in df.columns:
         return {}
     df = df.copy()
-    df["is_alert"] = np.where(
-        df["is_rated"],
-        df["score"] >= rated_threshold,
-        df["score"] >= nonrated_threshold,
-    )
+    df["is_alert"] = np.where(df["is_rated"], df["score"] >= threshold, False)
     visit_prec_list = []
     visit_rec_list = []
     for _, grp in df.groupby(["canonical_id", "gaming_day"]):
@@ -94,12 +78,13 @@ class TestDualMetrics(unittest.TestCase):
             "label": [1, 0, 1],
             "is_rated": [True, True, False],
         })
-        out = _micro_metrics_spec(df, rated_threshold=0.5, nonrated_threshold=0.5)
-        self.assertEqual(out["alerts"], 2)
-        self.assertEqual(out["true_alerts"], 2)
+        out = _micro_metrics_spec(df, threshold=0.5)
+        # v10: only rated rows get alerts; nonrated 0.8 is not alerted
+        self.assertEqual(out["alerts"], 1)
+        self.assertEqual(out["true_alerts"], 1)
         self.assertEqual(out["positives"], 2)
         self.assertAlmostEqual(out["precision"], 1.0)
-        self.assertAlmostEqual(out["recall"], 1.0)
+        self.assertAlmostEqual(out["recall"], 0.5)
 
     def test_macro_per_visit_at_most_one_tp(self):
         """Macro: one visit with 3 alerted TP rows counts as 1 TP for that visit."""
@@ -110,7 +95,7 @@ class TestDualMetrics(unittest.TestCase):
             "label": [1, 1, 1],
             "is_rated": [True, True, True],
         })
-        out = _macro_by_visit_spec(df, rated_threshold=0.5, nonrated_threshold=0.5)
+        out = _macro_by_visit_spec(df, threshold=0.5)
         # One visit, 3 alerts, 3 positives, but at most 1 TP per visit → prec = 1/3? No: has_tp = 1 (any), so per-visit prec = 1/1 = 1 (one visit, 3 alerts, has_tp=1 → prec for that visit = 1/3? No - the code does visit_prec_list.append(has_tp / n_alerted) so 1/3. And visit_rec_list.append(has_tp) so 1. So macro_recall = mean([1]) = 1.0. Macro_prec = mean([1/3]) = 1/3.
         self.assertAlmostEqual(out["macro_precision"], 1.0 / 3.0)
         self.assertAlmostEqual(out["macro_recall"], 1.0)

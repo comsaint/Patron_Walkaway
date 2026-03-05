@@ -68,9 +68,9 @@ trainer/feature_spec/features_candidates.template.yaml
 - `output_columns`: 函數會產出的欄位（可超過 1 個，例如 `run_id`, `minutes_since_run_start`）。  
 - `dtype`, `postprocess`, `reason_code_category` 同 Track LLM。
 
-### 2.4 Track Profile 區塊（player_profile_daily）
+### 2.4 Track Profile 區塊（player_profile）
 
-- `source_table`: `player_profile_daily`  
+- `source_table`: `player_profile`  
 - `join.join_key`: `canonical_id`  
 - `join.snapshot_time_column`: `snapshot_dtm`  
 - `join.pit_rule`: `asof_latest_snapshot_leq_event_time`（`snapshot_dtm <= bet_time` 最近一筆）  

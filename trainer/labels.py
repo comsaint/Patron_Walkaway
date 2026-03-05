@@ -45,9 +45,9 @@ import numpy as np
 import pandas as pd
 
 try:
-    from config import ALERT_HORIZON_MIN, LABEL_LOOKAHEAD_MIN, WALKAWAY_GAP_MIN  # type: ignore[import]
+    from config import ALERT_HORIZON_MIN, LABEL_LOOKAHEAD_MIN, WALKAWAY_GAP_MIN, HK_TZ  # type: ignore[import]
 except ModuleNotFoundError:
-    from trainer.config import ALERT_HORIZON_MIN, LABEL_LOOKAHEAD_MIN, WALKAWAY_GAP_MIN  # type: ignore[import]
+    from trainer.config import ALERT_HORIZON_MIN, LABEL_LOOKAHEAD_MIN, WALKAWAY_GAP_MIN, HK_TZ  # type: ignore[import]
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +108,13 @@ def compute_labels(
 
     window_end_ts = pd.Timestamp(window_end)
     extended_end_ts = pd.Timestamp(extended_end)
+    # Defensive tz alignment (DEC-018 parity): callers may pass tz-aware
+    # boundaries (e.g. from time_fold) while payout_complete_dtm is tz-naive.
+    # Normalise both to tz-naive HK local time before any comparisons.
+    if window_end_ts.tz is not None:
+        window_end_ts = window_end_ts.tz_convert(HK_TZ).tz_localize(None)
+    if extended_end_ts.tz is not None:
+        extended_end_ts = extended_end_ts.tz_convert(HK_TZ).tz_localize(None)
     if extended_end_ts < window_end_ts:
         raise ValueError(
             f"extended_end ({extended_end}) must be >= window_end ({window_end})"

@@ -1,4 +1,4 @@
-"""trainer/etl_player_profile.py — player_profile_daily daily snapshot ETL
+"""trainer/etl_player_profile.py — player_profile snapshot ETL
 ===========================================================================
 Builds one row per (canonical_id, snapshot_date) by aggregating cleaned
 t_session records over 7 / 30 / 90 / 180 / 365-day lookback windows.
@@ -25,9 +25,9 @@ Pipeline
 4. Apply session availability gate: COALESCE(session_end_dtm, lud_dtm) +
    SESSION_AVAIL_DELAY_MIN minutes <= snapshot_dtm.
 5. For each canonical_id compute all Phase 1 profile columns
-   (see doc/player_profile_daily_spec.md).
+   (see doc/player_profile_spec.md).
 6. Derive ratio columns from pre-computed window aggregates.
-7. Write result to player_profile_daily (ClickHouse INSERT or local Parquet).
+7. Write result to player_profile (ClickHouse INSERT or local Parquet).
 
 Dependencies
 ------------
@@ -75,13 +75,13 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).parent
 PROJECT_ROOT = BASE_DIR.parent
 LOCAL_PARQUET_DIR = PROJECT_ROOT / "data"
-LOCAL_PROFILE_PARQUET = LOCAL_PARQUET_DIR / "player_profile_daily.parquet"
-LOCAL_PROFILE_SCHEMA_HASH = LOCAL_PARQUET_DIR / "player_profile_daily.schema_hash"
+LOCAL_PROFILE_PARQUET = LOCAL_PARQUET_DIR / "player_profile.parquet"
+LOCAL_PROFILE_SCHEMA_HASH = LOCAL_PARQUET_DIR / "player_profile.schema_hash"
 
 HK_TZ = ZoneInfo(config.HK_TZ)
 SOURCE_DB: str = getattr(config, "SOURCE_DB", "GDP_GMWDS_Raw")
 TSESSION: str = getattr(config, "TSESSION", "t_session")
-TPROFILE: str = getattr(config, "TPROFILE", "player_profile_daily")
+TPROFILE: str = getattr(config, "TPROFILE", "player_profile")
 SESSION_AVAIL_DELAY_MIN: int = getattr(config, "SESSION_AVAIL_DELAY_MIN", 7)
 PROFILE_VERSION = "v1.0"
 
@@ -204,9 +204,9 @@ def compute_profile_schema_hash(session_parquet: Optional[Path] = None) -> str:
         Path to ``gmwds_t_session.parquet``.  Defaults to
         ``LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"``.
 
-    The sidecar file ``player_profile_daily.schema_hash`` stores the
+    The sidecar file ``player_profile.schema_hash`` stores the
     fingerprint written when the parquet was last built.
-    ``ensure_player_profile_daily_ready`` in trainer.py compares current vs
+    ``ensure_player_profile_ready`` in trainer.py compares current vs
     stored fingerprint to decide whether to invalidate the cache.
     """
     # Import PROFILE_FEATURE_COLS lazily to avoid circular imports.
@@ -514,7 +514,7 @@ def _compute_profile(
     snapshot_dtm: datetime,
     max_lookback_days: int = 365,
 ) -> pd.DataFrame:
-    """Compute player_profile_daily columns for one snapshot_dtm.
+    """Compute player_profile columns for one snapshot_dtm.
 
     Parameters
     ----------
@@ -787,7 +787,7 @@ def _compute_profile(
 # ---------------------------------------------------------------------------
 
 def _write_to_clickhouse(df: pd.DataFrame, client) -> None:
-    """Write profile snapshot to player_profile_daily in ClickHouse."""
+    """Write profile snapshot to player_profile in ClickHouse."""
     # Attempt INSERT … VALUES via clickhouse-driver / clickhouse-connect
     client.insert_df(f"{SOURCE_DB}.{TPROFILE}", df)
     logger.info("Written %d rows to ClickHouse %s.%s", len(df), SOURCE_DB, TPROFILE)
@@ -835,7 +835,7 @@ def _persist_local_parquet(
         try:
             os.close(hash_tmp_fd)
             # R106: sidecar must store full hash (with population tag) so
-            # ensure_player_profile_daily_ready can compare correctly.
+            # ensure_player_profile_ready can compare correctly.
             # R300: also encode max_lookback_days (horizon tag) so that a
             # cache written with horizon=30 is not reused when horizon=365
             # is requested — writer and reader must use identical formula.
@@ -878,7 +878,7 @@ def _persist_local_parquet(
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def build_player_profile_daily(
+def build_player_profile(
     snapshot_date: date,
     use_local_parquet: bool = False,
     canonical_map: Optional[pd.DataFrame] = None,  # R90: accept pre-built mapping (backfill reuse)
@@ -887,7 +887,7 @@ def build_player_profile_daily(
     max_lookback_days: int = 365,  # DEC-017: horizon restriction for profile feature computation
     sched_tag: str = "_daily",  # DEC-019 R601: forwarded to _persist_local_parquet for cache key
 ) -> Optional[pd.DataFrame]:
-    """Compute player_profile_daily for one `snapshot_date` and persist the result.
+    """Compute player_profile for one `snapshot_date` and persist the result.
 
     Parameters
     ----------
@@ -919,7 +919,7 @@ def build_player_profile_daily(
         snapshot_date.month,
         snapshot_date.day,
     ) + timedelta(days=1, minutes=SESSION_AVAIL_DELAY_MIN)
-    logger.info("Building player_profile_daily for %s (snapshot_dtm=%s)", snapshot_date, snapshot_dtm)
+    logger.info("Building player_profile for %s (snapshot_dtm=%s)", snapshot_date, snapshot_dtm)
 
     # 1. Load sessions
     sessions_raw: Optional[pd.DataFrame] = None
@@ -1020,10 +1020,10 @@ def backfill(
     snapshot_interval_days: int = 1,
     preload_sessions: bool = True,
     canonical_map: Optional[pd.DataFrame] = None,
-    max_lookback_days: int = 365,  # DEC-017: forwarded to _compute_profile via build_player_profile_daily
+    max_lookback_days: int = 365,  # DEC-017: forwarded to _compute_profile via build_player_profile
     snapshot_dates: Optional[List[date]] = None,  # DEC-019: explicit date list overrides interval loop
 ) -> None:
-    """Backfill player_profile_daily for a range of dates.
+    """Backfill player_profile for a range of dates.
 
     R90: canonical_map is built once and reused across all snapshot dates to
     avoid N redundant mapping queries during a long backfill run.
@@ -1142,7 +1142,7 @@ def backfill(
         )
         for snap_date in dates_to_process:
             try:
-                result = build_player_profile_daily(
+                result = build_player_profile(
                     snap_date,
                     use_local_parquet=use_local_parquet,
                     canonical_map=canonical_map,
@@ -1165,7 +1165,7 @@ def backfill(
         while current <= end_date:
             if _day_idx % snapshot_interval_days == 0:
                 try:
-                    result = build_player_profile_daily(
+                    result = build_player_profile(
                         current,
                         use_local_parquet=use_local_parquet,
                         canonical_map=canonical_map,
@@ -1202,7 +1202,7 @@ def backfill(
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Build player_profile_daily snapshot for one date or a date range."
+        description="Build player_profile snapshot for one date or a date range."
     )
     p.add_argument(
         "--snapshot-date",
@@ -1246,7 +1246,7 @@ def main() -> None:
         backfill(args.start_date, args.end_date, use_local_parquet=args.local_parquet)
     else:
         snap_date = args.snapshot_date or datetime.now(HK_TZ).date()
-        build_player_profile_daily(snap_date, use_local_parquet=args.local_parquet)
+        build_player_profile(snap_date, use_local_parquet=args.local_parquet)
 
 
 if __name__ == "__main__":

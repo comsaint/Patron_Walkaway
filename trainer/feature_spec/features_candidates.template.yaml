@@ -46,7 +46,19 @@ track_llm:
     disallow_following: true
 
   candidates:
-    # ==== 以下為示例特徵，實際專案可刪除並由 LLM/工程師重新產生 ====
+    # ==== 節奏 / 頻率 (Pace) ====
+    - feature_id: "bets_cnt_w5m"
+      type: "window"
+      dtype: "int"
+      description: "過去 5 分鐘下注次數"
+      rationale: "近期下注急遽下降為離場前兆；文獻 inter-bet interval 拉長為關鍵信號。"
+      expression: "COUNT(bet_id)"
+      window_frame: "RANGE BETWEEN INTERVAL 5 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 1000000 }
+      reason_code_category: "BETTING_PACE_DROPPING"
+
     - feature_id: "bets_cnt_w15m"
       type: "window"
       dtype: "int"
@@ -55,17 +67,77 @@ track_llm:
       expression: "COUNT(bet_id)"
       window_frame: "RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW"
       postprocess:
-        fill:
-          strategy: "zero"
+        fill: { strategy: "zero" }
         clip: { min: 0, max: 1000000 }
       reason_code_category: "BETTING_PACE_DROPPING"
 
+    - feature_id: "bets_cnt_w30m"
+      type: "window"
+      dtype: "int"
+      description: "過去 30 分鐘下注次數"
+      rationale: "較長窗口基線，供 pace_drop_ratio 計算衰減率。"
+      expression: "COUNT(bet_id)"
+      window_frame: "RANGE BETWEEN INTERVAL 30 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 1000000 }
+      reason_code_category: "BETTING_PACE_DROPPING"
+
+    - feature_id: "pace_drop_ratio"
+      type: "derived"
+      dtype: "float"
+      description: "近期下注節奏衰減率 (w5m/w30m)"
+      rationale: "若遠低於 0.167 代表最近 5 分鐘頻率急遽下降，即將離場。"
+      depends_on: ["bets_cnt_w5m", "bets_cnt_w30m"]
+      expression: "CAST(bets_cnt_w5m AS DOUBLE) / NULLIF(bets_cnt_w30m, 0)"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+      reason_code_category: "BETTING_PACE_DROPPING"
+
+    # ==== 金額動態 (Wager) ====
     - feature_id: "wager_sum_w30m"
       type: "window"
       dtype: "float"
       description: "過去 30 分鐘下注總額"
       expression: "SUM(wager)"
       window_frame: "RANGE BETWEEN INTERVAL 30 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 500000000.0 }
+      reason_code_category: "LOW_ACTIVITY_RECENTLY"
+
+    - feature_id: "wager_avg_w15m"
+      type: "window"
+      dtype: "float"
+      description: "過去 15 分鐘平均注碼"
+      rationale: "平均注碼下降代表保守化、即將離場。"
+      expression: "AVG(wager)"
+      window_frame: "RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 500000000.0 }
+      reason_code_category: "LOW_ACTIVITY_RECENTLY"
+
+    - feature_id: "wager_std_w15m"
+      type: "window"
+      dtype: "float"
+      description: "過去 15 分鐘注碼標準差"
+      rationale: "文獻：注碼波動性為最強單一預測因子；波動收斂可能代表放棄。"
+      expression: "STDDEV_SAMP(wager)"
+      window_frame: "RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1000000000.0 }
+      reason_code_category: "LOW_ACTIVITY_RECENTLY"
+
+    - feature_id: "wager_max_w15m"
+      type: "window"
+      dtype: "float"
+      description: "過去 15 分鐘最大單筆注碼"
+      rationale: "與平均比較可看出追趕損失行為。"
+      expression: "MAX(wager)"
+      window_frame: "RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW"
       postprocess:
         fill: { strategy: "zero" }
         clip: { min: 0.0, max: 500000000.0 }
@@ -79,13 +151,155 @@ track_llm:
       postprocess:
         fill: { strategy: "zero" }
 
-    - feature_id: "hour_of_day"
-      type: "transform"
+    # ==== 勝負結果 (Outcome) ====
+    - feature_id: "lose_cnt_w15m"
+      type: "window"
       dtype: "int"
-      description: "下注發生的小時（0–23）"
-      expression: "EXTRACT(HOUR FROM payout_complete_dtm)"
+      description: "過去 15 分鐘輸局次數"
+      rationale: "累積損失驅動離場；文獻累積損失導致減注與離場。"
+      expression: "SUM(CASE WHEN status = 'LOSE' THEN 1 ELSE 0 END)"
+      window_frame: "RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW"
       postprocess:
         fill: { strategy: "zero" }
+        clip: { min: 0, max: 10000 }
+      reason_code_category: "LOSS_STREAK"
+
+    - feature_id: "win_cnt_w15m"
+      type: "window"
+      dtype: "int"
+      description: "過去 15 分鐘贏局次數"
+      rationale: "勝負結果的近期統計，供勝率與行為轉折特徵使用。"
+      expression: "SUM(CASE WHEN status = 'WIN' THEN 1 ELSE 0 END)"
+      window_frame: "RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 10000 }
+      reason_code_category: "WIN_COUNT"
+
+    - feature_id: "win_rate_w15m"
+      type: "derived"
+      dtype: "float"
+      description: "過去 15 分鐘勝率"
+      rationale: "文獻：贏錢後 session 反而較短（趁贏走人）；勝率可捕捉此差異。"
+      depends_on: ["win_cnt_w15m", "bets_cnt_w15m"]
+      expression: "CAST(win_cnt_w15m AS DOUBLE) / NULLIF(bets_cnt_w15m, 0)"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+      reason_code_category: "WIN_RATE"
+
+    - feature_id: "prev_status"
+      type: "lag"
+      dtype: "str"
+      description: "上一把結果狀態（WIN/LOSE/PUSH/…）"
+      rationale: "上一把輸贏常是行為轉折與離場觸發事件。"
+      expression: "LAG(status, 1)"
+
+    - feature_id: "prev_bet_was_loss"
+      type: "derived"
+      dtype: "int"
+      description: "上一把是否輸錢 (1=是 0=否)"
+      rationale: "即時損失為離場觸發事件。"
+      depends_on: ["prev_status"]
+      expression: "CASE WHEN prev_status = 'LOSE' THEN 1 ELSE 0 END"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 1 }
+      reason_code_category: "LOSS_STREAK"
+
+    # ==== 風險偏好 (Risk) ====
+    - feature_id: "avg_payout_odds_w15m"
+      type: "window"
+      dtype: "float"
+      description: "過去 15 分鐘平均賠率"
+      rationale: "百家樂研究：連贏轉向 longshot、連輸變保守。"
+      expression: "AVG(payout_odds)"
+      window_frame: "RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1000000.0 }
+      reason_code_category: "RISK_APPETITE"
+
+    - feature_id: "back_bet_cnt_w20"
+      type: "window"
+      dtype: "int"
+      description: "近 20 把中 back bet 次數"
+      rationale: "投注類型轉變反映心態變化；供 back_bet_pct_w20 計算比例。"
+      expression: "SUM(is_back_bet)"
+      window_frame: "ROWS BETWEEN 20 PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 1000000 }
+      reason_code_category: "RISK_APPETITE"
+
+    - feature_id: "bets_cnt_w20"
+      type: "window"
+      dtype: "int"
+      description: "近 20 把下注次數"
+      rationale: "供 back_bet_pct_w20 計算比例。"
+      expression: "COUNT(*)"
+      window_frame: "ROWS BETWEEN 20 PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 1000000 }
+      reason_code_category: "BETTING_PACE_DROPPING"
+
+    - feature_id: "back_bet_pct_w20"
+      type: "derived"
+      dtype: "float"
+      description: "近 20 把中 back bet 佔比 (%)"
+      rationale: "投注類型轉變反映心態變化。"
+      depends_on: ["back_bet_cnt_w20", "bets_cnt_w20"]
+      expression: "100.0 * CAST(back_bet_cnt_w20 AS DOUBLE) / NULLIF(bets_cnt_w20, 0)"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 100.0 }
+      reason_code_category: "RISK_APPETITE"
+
+    # ==== 時段 / 位置 (Context) ====
+    - feature_id: "hour_of_day"
+      type: "derived"
+      dtype: "int"
+      description: "下注發生的小時（0–23）"
+      expression: "date_part('hour', payout_complete_dtm)"
+      postprocess:
+        fill: { strategy: "zero" }
+
+    - feature_id: "position_min_w30m"
+      type: "window"
+      dtype: "int"
+      description: "過去 30 分鐘最小 position_idx"
+      rationale: "用於判斷是否在近 30 分鐘內換位（避免 window-on-window nesting）。"
+      expression: "MIN(position_idx)"
+      window_frame: "RANGE BETWEEN INTERVAL 30 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 1000 }
+      reason_code_category: "ENGAGEMENT"
+
+    - feature_id: "position_max_w30m"
+      type: "window"
+      dtype: "int"
+      description: "過去 30 分鐘最大 position_idx"
+      rationale: "用於判斷是否在近 30 分鐘內換位（避免 window-on-window nesting）。"
+      expression: "MAX(position_idx)"
+      window_frame: "RANGE BETWEEN INTERVAL 30 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 1000 }
+      reason_code_category: "ENGAGEMENT"
+
+    - feature_id: "position_moved_w30m"
+      type: "derived"
+      dtype: "int"
+      description: "過去 30 分鐘是否換位 (1=是 0=否)"
+      rationale: "若 position_min != position_max 代表近 30 分鐘內至少發生過一次換位。"
+      depends_on: ["position_min_w30m", "position_max_w30m"]
+      expression: "CASE WHEN position_min_w30m = position_max_w30m THEN 0 ELSE 1 END"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 1 }
+      reason_code_category: "ENGAGEMENT"
 
   active:
     feature_ids: []   # 由訓練流程產生的生產特徵清單寫入
@@ -125,7 +339,7 @@ track_profile:
   name: "Track Profile"
   enabled: true
 
-  source_table: "player_profile_daily"
+  source_table: "player_profile"
   join:
     join_key: "canonical_id"
     snapshot_time_column: "snapshot_dtm"
@@ -135,23 +349,68 @@ track_profile:
       emit_metric: "profile_missing_rate"
 
   candidates:
-    - feature_id: "profile_days_since_last_visit"
+    - feature_id: "days_since_last_session"
       type: "profile_column"
       dtype: "float"
-      source_column: "days_since_last_visit"
-      description: "距離上次造訪天數"
+      source_column: "days_since_last_session"
+      description: "距離上次造訪天數（Recency）"
       postprocess:
         fill: { strategy: "zero" }
         clip: { min: 0.0, max: 10000.0 }
 
-    - feature_id: "profile_avg_daily_turnover_30d"
+    - feature_id: "sessions_30d_over_180d"
       type: "profile_column"
       dtype: "float"
-      source_column: "avg_daily_turnover_30d"
-      description: "過去 30 天日均流水"
+      source_column: "sessions_30d_over_180d"
+      description: "近期造訪頻率佔長期比例（30d/180d）"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1.0e12 }
+        clip: { min: 0.0, max: 100.0 }
+
+    - feature_id: "actual_vs_theo_ratio_30d"
+      type: "profile_column"
+      dtype: "float"
+      source_column: "actual_vs_theo_ratio_30d"
+      description: "過去 30 天實際贏錢與理論贏錢比率"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: -100.0, max: 100.0 }
+
+    - feature_id: "win_session_rate_30d"
+      type: "profile_column"
+      dtype: "float"
+      source_column: "win_session_rate_30d"
+      description: "過去 30 天贏錢 session 佔比"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+
+    - feature_id: "turnover_per_bet_30d_over_180d"
+      type: "profile_column"
+      dtype: "float"
+      source_column: "turnover_per_bet_30d_over_180d"
+      description: "近期平均注額 vs 長期平均注額比（30d/180d）"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 100.0 }
+
+    - feature_id: "avg_session_duration_min_30d"
+      type: "profile_column"
+      dtype: "float"
+      source_column: "avg_session_duration_min_30d"
+      description: "過去 30 天平均 Session 長度（分鐘）"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 10000.0 }
+
+    - feature_id: "distinct_table_cnt_30d"
+      type: "profile_column"
+      dtype: "float"
+      source_column: "distinct_table_cnt_30d"
+      description: "過去 30 天造訪過的不同桌台數"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1000.0 }
 
   active:
     feature_ids: []

@@ -428,12 +428,12 @@ class TestResolveCanonicalId(unittest.TestCase):
         placeholder = IDENTITY.PLACEHOLDER_PLAYER_ID
         mapping = self._mapping([])
         result = resolve(placeholder, "S1", mapping, session_lookup=None)
-        self.assertEqual(result, "")
+        self.assertIsNone(result)
 
     def test_none_player_id_returns_empty(self):
         mapping = self._mapping([])
         result = resolve(None, "S1", mapping, session_lookup=None)
-        self.assertEqual(result, "")
+        self.assertIsNone(result)
 
     def test_step1_skipped_when_no_session_id(self):
         called = []

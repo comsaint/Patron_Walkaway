@@ -36,10 +36,13 @@ Design notes
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Callable, Optional, Set
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+_HK_TZ = ZoneInfo("Asia/Hong_Kong")
 
 try:
     from config import (  # type: ignore[import]
@@ -171,7 +174,8 @@ def _clean_casino_player_id(series: pd.Series) -> pd.Series:
     canonical_ids identical for IDs that contain surrounding whitespace.
     """
     stripped = series.astype(str).str.strip()
-    mask_invalid = stripped.str.lower().isin(["", "null", "nan", "none"])
+    # Parity with CASINO_PLAYER_ID_CLEAN_SQL: only '' and 'null' are invalid (R1701).
+    mask_invalid = stripped.str.lower().isin(["", "null"])
     valid_mask = series.notna() & ~mask_invalid
     # Return the trimmed value for valid entries (parity with SQL trim()).
     # stripped for null/invalid rows contains artefacts like "nan"/"<NA>";
@@ -218,6 +222,11 @@ def _identify_dummy_player_ids(deduped_df: pd.DataFrame) -> Set:
         & (deduped_df["player_id"] != PLACEHOLDER_PLAYER_ID)
     ].copy()
     valid["_games"] = valid["num_games_with_wager"].fillna(0)
+    # FND-04: exclude ghost sessions (R1707).
+    valid = valid[
+        (pd.to_numeric(valid.get("turnover", 0), errors="coerce").fillna(0) > 0)
+        | (valid["_games"] > 0)
+    ]
     agg = valid.groupby("player_id").agg(
         session_cnt=("session_id", "count"),
         total_games=("_games", "sum"),
@@ -472,7 +481,7 @@ def resolve_canonical_id(
     mapping_df: pd.DataFrame,
     session_lookup: Optional[Callable[[str], Optional[dict]]],
     obs_time: Optional[datetime] = None,
-) -> str:
+) -> Optional[str]:
     """Three-step D2 identity resolution for online scoring (SSOT §6.4).
 
     Parameters
@@ -509,7 +518,7 @@ def resolve_canonical_id(
        indexed by ``player_id`` (O(1) ``.at[]`` lookup — R10 fix).
     3. Fallback: ``str(player_id)`` (non-rated).
     """
-    now = obs_time or datetime.now(timezone.utc).replace(tzinfo=None)
+    now = obs_time or datetime.now(_HK_TZ).replace(tzinfo=None)
 
     # Step 1 — current session card (with available-time gate, H2)
     if session_id and session_lookup is not None:
@@ -544,4 +553,4 @@ def resolve_canonical_id(
     # Step 3 — fallback: treat as non-rated using raw player_id
     if player_id is not None and player_id != PLACEHOLDER_PLAYER_ID:
         return str(player_id)
-    return ""  # no usable identity (player_id is null or placeholder)
+    return None  # no usable identity (player_id is null or placeholder)

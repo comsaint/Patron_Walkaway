@@ -16,8 +16,8 @@ class TestRecentChunksIntegration(unittest.TestCase):
     @patch("trainer.trainer.load_local_parquet")
     @patch("trainer.trainer.apply_dq")
     @patch("trainer.trainer.build_canonical_mapping_from_df")
-    @patch("trainer.trainer.ensure_player_profile_daily_ready")
-    @patch("trainer.trainer.load_player_profile_daily")
+    @patch("trainer.trainer.ensure_player_profile_ready")
+    @patch("trainer.trainer.load_player_profile")
     @patch("trainer.trainer.process_chunk")
     @patch("trainer.trainer.train_dual_model")
     @patch("trainer.trainer.save_artifact_bundle")
@@ -99,7 +99,7 @@ class TestRecentChunksIntegration(unittest.TestCase):
         self.assertEqual(call_args[0], expected_effective_start)
         self.assertEqual(call_args[1], expected_effective_end + timedelta(days=1))
 
-        # 2. Assert ensure_player_profile_daily_ready was called with effective window
+        # 2. Assert ensure_player_profile_ready was called with effective window
         # (canonical_id_whitelist=None, snapshot_interval_days=1, preload_sessions=True
         # are the normal-mode defaults; canonical_map matched via ANY since its content
         # depends on build_canonical_mapping_from_df mock output — DEC-017 bug fix)
@@ -120,7 +120,7 @@ class TestRecentChunksIntegration(unittest.TestCase):
         self.assertIsInstance(passed_cmap, pd.DataFrame)
         self.assertListEqual(list(passed_cmap.columns), ["player_id", "canonical_id"])
 
-        # 3. Assert load_player_profile_daily was called with effective window
+        # 3. Assert load_player_profile was called with effective window
         mock_load_profile.assert_called_once()
         kwargs = mock_load_profile.call_args[1]
         call_args = mock_load_profile.call_args[0]

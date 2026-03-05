@@ -51,6 +51,7 @@ FEATURES = _import_features()
 compute_loss_streak = FEATURES.compute_loss_streak
 compute_run_boundary = FEATURES.compute_run_boundary
 compute_table_hc = FEATURES.compute_table_hc
+compute_track_llm_features = FEATURES.compute_track_llm_features
 
 try:
     from trainer.config import (
@@ -365,6 +366,186 @@ class TestComputeTableHc(unittest.TestCase):
         df = pd.DataFrame({"table_id": ["T1"], "bet_id": [1]})
         with self.assertRaises(ValueError):
             compute_table_hc(df, cutoff_time=None)
+
+
+class TestComputeTrackLlmFeatures(unittest.TestCase):
+    """compute_track_llm_features — DuckDB-based Track LLM feature computation."""
+
+    _BASE = datetime(2026, 3, 1)
+
+    def _make_bets(self, minutes_offsets, wagers=None, statuses=None):
+        n = len(minutes_offsets)
+        if wagers is None:
+            wagers = [100.0] * n
+        if statuses is None:
+            statuses = ["WIN"] * n
+        ts = [self._BASE + timedelta(minutes=m) for m in minutes_offsets]
+        return pd.DataFrame({
+            "canonical_id": ["c1"] * n,
+            "bet_id": list(range(1, n + 1)),
+            "payout_complete_dtm": pd.to_datetime(ts),
+            "wager": wagers,
+            "status": statuses,
+        })
+
+    def _minimal_spec(self, candidates):
+        return {
+            "version": "2.0",
+            "spec_id": "test",
+            "track_llm": {"candidates": candidates},
+        }
+
+    def test_count_window_basic(self):
+        """bets_cnt should count bets within the window frame."""
+        bets = self._make_bets([0, 5, 10, 20])
+        spec = self._minimal_spec([{
+            "feature_id": "bets_cnt_w15m",
+            "type": "window",
+            "expression": "COUNT(bet_id)",
+            "window_frame": "RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW",
+            "postprocess": {"fill": {"strategy": "zero"}},
+        }])
+        result = compute_track_llm_features(bets, spec)
+        self.assertIn("bets_cnt_w15m", result.columns)
+        # All four bets at minutes 0,5,10,20 — bet at t=20 window covers [5,20] → 3 bets
+        self.assertEqual(int(result.iloc[3]["bets_cnt_w15m"]), 3)
+
+    def test_lag_feature(self):
+        """LAG window should return the previous bet's value."""
+        bets = self._make_bets([0, 10], wagers=[100.0, 200.0])
+        spec = self._minimal_spec([{
+            "feature_id": "prev_wager",
+            "type": "lag",
+            "expression": "LAG(wager, 1)",
+            "postprocess": {"fill": {"strategy": "zero"}},
+        }])
+        result = compute_track_llm_features(bets, spec)
+        self.assertIn("prev_wager", result.columns)
+        # First bet: LAG = NULL → filled to 0
+        self.assertEqual(float(result.iloc[0]["prev_wager"]), 0.0)
+        # Second bet: LAG = 100.0
+        self.assertAlmostEqual(float(result.iloc[1]["prev_wager"]), 100.0)
+
+    def test_cutoff_time_drops_later_bets(self):
+        """Rows after cutoff_time must be excluded from output."""
+        bets = self._make_bets([0, 10, 20])
+        cutoff = self._BASE + timedelta(minutes=10)
+        spec = self._minimal_spec([{
+            "feature_id": "bets_cnt",
+            "type": "window",
+            "expression": "COUNT(bet_id)",
+            "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+            "postprocess": {"fill": {"strategy": "zero"}},
+        }])
+        result = compute_track_llm_features(bets, spec, cutoff_time=cutoff)
+        # Only bets at t=0 and t=10 should appear (t=20 dropped)
+        self.assertEqual(len(result), 2)
+
+    def test_empty_candidates_returns_copy(self):
+        bets = self._make_bets([0, 5])
+        spec = self._minimal_spec([])
+        result = compute_track_llm_features(bets, spec)
+        # Should return a copy of the original bets unchanged
+        self.assertEqual(len(result), len(bets))
+
+    def test_postprocess_clip_applied(self):
+        """Clip min/max should be applied after fill."""
+        bets = self._make_bets([0], wagers=[999999.0])
+        spec = self._minimal_spec([{
+            "feature_id": "wager_clipped",
+            "type": "window",
+            "expression": "SUM(wager)",
+            "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+            "postprocess": {
+                "fill": {"strategy": "zero"},
+                "clip": {"min": 0.0, "max": 500.0},
+            },
+        }])
+        result = compute_track_llm_features(bets, spec)
+        self.assertLessEqual(float(result.iloc[0]["wager_clipped"]), 500.0)
+
+    def test_original_columns_preserved(self):
+        """Existing columns in bets_df should survive in the output."""
+        bets = self._make_bets([0, 5])
+        spec = self._minimal_spec([{
+            "feature_id": "cnt",
+            "type": "window",
+            "expression": "COUNT(bet_id)",
+            "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+            "postprocess": {"fill": {"strategy": "zero"}},
+        }])
+        result = compute_track_llm_features(bets, spec)
+        for col in ["canonical_id", "bet_id", "payout_complete_dtm", "wager", "status"]:
+            self.assertIn(col, result.columns, f"Missing original column: {col}")
+
+    # ── R2011 coverage tests ────────────────────────────────────────────────
+
+    def test_multi_canonical_id_partition_isolated(self):
+        """PARTITION BY canonical_id must keep each player's window count isolated."""
+        bets = pd.DataFrame({
+            "canonical_id": ["c1", "c1", "c2"],
+            "bet_id": [1, 2, 1],
+            "payout_complete_dtm": pd.to_datetime([
+                "2026-03-01 10:00:00",
+                "2026-03-01 10:05:00",
+                "2026-03-01 10:00:00",
+            ]),
+            "wager": [100.0, 200.0, 300.0],
+        })
+        spec = self._minimal_spec([{
+            "feature_id": "cum_cnt",
+            "type": "window",
+            "expression": "COUNT(bet_id)",
+            "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+            "postprocess": {"fill": {"strategy": "zero"}},
+        }])
+        result = compute_track_llm_features(bets, spec)
+        c1_counts = [int(x) for x in result.loc[result["canonical_id"] == "c1", "cum_cnt"]]
+        c2_counts = [int(x) for x in result.loc[result["canonical_id"] == "c2", "cum_cnt"]]
+        self.assertEqual(c1_counts, [1, 2], "c1 cumulative counts should be [1, 2]")
+        self.assertEqual(c2_counts, [1], "c2 cumulative count should be [1] (isolated partition)")
+
+    def test_derived_feature_basic(self):
+        """A derived feature referencing a window feature should compute correctly."""
+        bets = self._make_bets([0, 10])
+        spec = self._minimal_spec([
+            {
+                "feature_id": "base_cnt",
+                "type": "window",
+                "expression": "COUNT(bet_id)",
+                "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                "postprocess": {"fill": {"strategy": "zero"}},
+            },
+            {
+                "feature_id": "derived_a",
+                "type": "derived",
+                "expression": "base_cnt / 10.0",
+                "depends_on": ["base_cnt"],
+            },
+        ])
+        result = compute_track_llm_features(bets, spec)
+        self.assertIn("derived_a", result.columns)
+        # Second bet: base_cnt=2, derived_a=0.2
+        self.assertAlmostEqual(float(result.iloc[1]["derived_a"]), 0.2)
+
+    def test_empty_bets_with_candidates_returns_expected_columns(self):
+        """Empty bets_df with non-empty candidates should return empty frame with feature cols."""
+        bets = pd.DataFrame({
+            "canonical_id": pd.Series([], dtype="object"),
+            "bet_id": pd.Series([], dtype="int64"),
+            "payout_complete_dtm": pd.to_datetime([]),
+            "wager": pd.Series([], dtype="float64"),
+        })
+        spec = self._minimal_spec([{
+            "feature_id": "cnt",
+            "type": "window",
+            "expression": "COUNT(bet_id)",
+            "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+            "postprocess": {"fill": {"strategy": "zero"}},
+        }])
+        result = compute_track_llm_features(bets, spec)
+        self.assertEqual(len(result), 0)
+        self.assertIn("cnt", result.columns)
 
 
 if __name__ == "__main__":
