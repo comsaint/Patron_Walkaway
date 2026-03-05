@@ -278,7 +278,11 @@ def fetch_recent_data(
             session_start_dtm,
             session_end_dtm,
             lud_dtm,
-            COALESCE(session_end_dtm, lud_dtm) AS session_avail_dtm
+            COALESCE(session_end_dtm, lud_dtm) AS session_avail_dtm,
+            is_manual,
+            is_deleted,
+            is_canceled,
+            COALESCE(num_games_with_wager, 0) AS num_games_with_wager
         FROM deduped
         WHERE rn = 1
           AND COALESCE(session_end_dtm, lud_dtm) <= %(sess_avail)s
