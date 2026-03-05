@@ -74,7 +74,7 @@ python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sa
 
 **Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`
 
-**即時 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（單次執行加 `--once`）
+**即時 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（單次執行加 `--once`）。所有觀測用同一 rated 模型評分；**僅評級客（is_rated）會產生告警**，非評級客分數僅供 volume 統計（UNRATED_VOLUME_LOG）。
 
 **Validator**：`python -m trainer.validator --interval 60`（單次加 `--once`）
 
@@ -125,7 +125,7 @@ Fast-mode 煙測：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 ### 產物（trainer 輸出）
 
-`trainer/models/` 下：`model.pkl`、`feature_list.json`、`features_active.yaml`、`reason_code_map.json`、`model_version`、`training_metrics.json`。使用 Track A（Featuretools DFS）時會產出 `saved_feature_defs/`。另保留 legacy `walkaway_model.pkl`。
+`trainer/models/` 下：`model.pkl`（v10 單一評級客模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 凍結特徵規格）、`reason_code_map.json`、`model_version`、`training_metrics.json`（僅 rated 指標）。使用 Track A（Featuretools DFS）時會產出 `saved_feature_defs/`。另保留 legacy `walkaway_model.pkl`。訓練結束後若存在舊版 `nonrated_model.pkl` / `rated_model.pkl` 會自動刪除，避免 scorer/backtester 誤用。
 
 ### 注意事項
 
@@ -133,6 +133,7 @@ Fast-mode 煙測：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 - **憑證**：請安全存放 ClickHouse 憑證，勿提交 `.env`。
 - **時區**：業務邏輯使用 `Asia/Hong_Kong`（`config.HK_TZ`）。
 - **閾值選擇**：Phase 1 以驗證集 **F1 最大化** 選定單一模型閾值（DEC-009, DEC-021），無精準度/警報量下限約束。
+- **告警範圍**：Scorer 與 API `POST /score` 僅對評級客（`is_rated=true`）回傳告警；非評級客仍會得到分數，但 `alert` 恆為 `false`。
 
 ---
 
@@ -210,7 +211,7 @@ python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sa
 
 **Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`
 
-**实时 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（单次执行加 `--once`）
+**实时 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（单次执行加 `--once`）。所有观测用同一 rated 模型评分；**仅评级客（is_rated）会产生告警**，非评级客分数仅供 volume 统计（UNRATED_VOLUME_LOG）。
 
 **Validator**：`python -m trainer.validator --interval 60`（单次加 `--once`）
 
@@ -261,7 +262,7 @@ Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 ### 产物（trainer 输出）
 
-`trainer/models/` 下：`model.pkl`、`feature_list.json`、`features_active.yaml`、`reason_code_map.json`、`model_version`、`training_metrics.json`。使用 Track A（Featuretools DFS）时会产出 `saved_feature_defs/`。另保留 legacy `walkaway_model.pkl`。
+`trainer/models/` 下：`model.pkl`（v10 单一评级客模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 冻结特征规格）、`reason_code_map.json`、`model_version`、`training_metrics.json`（仅 rated 指标）。使用 Track A（Featuretools DFS）时会产出 `saved_feature_defs/`。另保留 legacy `walkaway_model.pkl`。训练结束后若存在旧版 `nonrated_model.pkl` / `rated_model.pkl` 会自动删除，避免 scorer/backtester 误用。
 
 ### 注意事项
 
@@ -269,6 +270,7 @@ Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 - **凭证**：请安全存放 ClickHouse 凭证，勿提交 `.env`。
 - **时区**：业务逻辑使用 `Asia/Hong_Kong`（`config.HK_TZ`）。
 - **阈值选择**：Phase 1 以验证集 **F1 最大化** 选定单模型阈值（DEC-009, DEC-021），无精准度/警报量下限约束。
+- **告警范围**：Scorer 与 API `POST /score` 仅对评级客（`is_rated=true`）返回告警；非评级客仍会得到分数，但 `alert` 恒为 `false`。
 
 ---
 
@@ -390,6 +392,8 @@ python -m trainer.scorer --interval 45 --lookback-hours 8
 # Single run: --once
 ```
 
+All observations are scored with the single rated model (v10). **Alerts are emitted only for rated patrons** (`is_rated`); unrated scores are used for volume telemetry only (UNRATED_VOLUME_LOG).
+
 ### Validator (match/miss vs realized walkaways)
 
 ```bash
@@ -491,14 +495,15 @@ mypy trainer/ --ignore-missing-imports
 
 Under `trainer/models/`:
 
-- `model.pkl` — Single rated LightGBM model (v10)
-- `feature_list.json`, `features_active.yaml` — Feature names and active Feature Spec metadata
-- `reason_code_map.json` — Feature-to-reason-code mapping
+- `model.pkl` — Single rated LightGBM model (v10 DEC-021)
+- `feature_list.json` — Feature names and track classification
+- `feature_spec.yaml` — Frozen feature spec snapshot (DEC-024) for train–serve consistency
+- `reason_code_map.json` — Feature-to-reason-code mapping for SHAP
 - `model_version` — Version string (e.g. `20260228-153000-abc1234`)
-- `training_metrics.json` — Validation/test metrics and flags (e.g. `fast_mode`, `uncalibrated_threshold`)
+- `training_metrics.json` — Rated metrics only; flags such as `fast_mode`, `uncalibrated_threshold`
 - `saved_feature_defs/` — Optional; produced only when Track A (Featuretools DFS) is used (i.e. without `--no-afg`)
 
-Legacy `walkaway_model.pkl` is still written for backward compatibility.
+Legacy `walkaway_model.pkl` is still written for backward compatibility. After each run, any stale `nonrated_model.pkl` or `rated_model.pkl` from older dual-model runs is removed so the scorer and backtester do not load them.
 
 ---
 
@@ -508,3 +513,4 @@ Legacy `walkaway_model.pkl` is still written for backward compatibility.
 - **Credentials**: Store ClickHouse credentials securely; avoid committing `.env`.
 - **Time zone**: Business logic uses `Asia/Hong_Kong` (see `config.HK_TZ`).
 - **Threshold selection**: Phase 1 uses validation-set **F1 maximization** for the single-model threshold (DEC-009, DEC-021); no precision/alert-volume lower bound.
+- **Alert scope**: The scorer and API `POST /score` return `alert=true` only for rated patrons (`is_rated=true`); unrated rows still receive a score but `alert` is always `false`.
