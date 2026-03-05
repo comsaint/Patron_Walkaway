@@ -17,6 +17,10 @@ except ModuleNotFoundError:
 @lru_cache(maxsize=1)
 def get_clickhouse_client():
     """Return a cached ClickHouse client configured from config.py."""
+    if clickhouse_connect is None:
+        raise RuntimeError(
+            "clickhouse_connect not available; install clickhouse-connect and ensure .env is loaded"
+        )
     return clickhouse_connect.get_client(
         host=config.CH_HOST,
         port=config.CH_PORT,
