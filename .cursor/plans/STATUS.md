@@ -848,3 +848,358 @@ OK
 - 考慮為 R901/R1006 的 sessions canonical_id 邏輯加入整合測試（真實 DataFrame mock），而非純 source inspection。
 - `run_track_a_dfs` 的 5000 行 `_max_sample` 可依實際 Featuretools 效能調整。
 
+---
+
+## Round 67 — Test-set 評估 + Feature Importance 寫入 training_metrics.json
+
+### 目標
+
+實作 PLAN.md 的兩個 pending 項目：
+- `todo-test-set-metrics`：訓練後在 held-out test set 上評估，並將 test 指標與 val 指標一同寫入 `training_metrics.json`。
+- `todo-feature-importance-in-metrics`：每個模型的特徵清單依 LightGBM gain importance 排序，同樣寫入 `training_metrics.json`。
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `trainer/trainer.py` | 新增兩個 helper 函式 + 修改 `train_dual_model` + 修改 `run_pipeline` 呼叫點 |
+
+#### trainer/trainer.py 改動細節
+
+1. **新增 `_compute_test_metrics(model, threshold, X_test, y_test, label)`**（插入於 `_train_one_model` 與 `train_dual_model` 之間）：
+   - 以 validation 階段決定的 threshold 在 test set 上做推論。
+   - 計算 `test_prauc`、`test_precision`、`test_recall`、`test_f1`、`test_samples`、`test_positives`。
+   - 使用與 `_train_one_model` 相同的 `_has_test` guard（`MIN_VALID_TEST_ROWS` + 無 NaN + 至少 1 個正樣本），不足時回傳全零而非 crash。
+
+2. **新增 `_compute_feature_importance(model, feature_cols)`**（緊接在 `_compute_test_metrics` 之後）：
+   - 呼叫 `model.booster_.feature_importance(importance_type="gain")` 取得 LightGBM gain importance。
+   - 回傳依 importance 降冪排序的 `[{"rank": i+1, "feature": name, "importance_gain": float}]` list。
+   - 若 booster 不可用（mock 測試情境）則 fallback 到 `model.feature_importances_`。
+
+3. **修改 `train_dual_model`**：
+   - 新增 `test_df: Optional[pd.DataFrame] = None` 參數（backward compatible）。
+   - 在迴圈內，訓練完每個模型後立即：(a) 呼叫 `_compute_test_metrics` 並 `.update(metrics)`；(b) 呼叫 `_compute_feature_importance` 並存入 `metrics["feature_importance"]`；(c) 記錄 `metrics["importance_method"] = "gain"`。
+   - 更新 docstring 說明新參數與 metrics dict 的新 key。
+
+4. **修改 `run_pipeline` 呼叫點**：`train_dual_model(...)` 加入 `test_df=test_df`，step label 更新為「Train dual model + test-set eval」。
+
+5. **模組 docstring**：`training_metrics.json` 說明更新為包含 validation + test metrics 及 feature importance。
+
+### training_metrics.json 新增欄位（每個 model key 下）
+
+```json
+{
+  "rated": {
+    "val_prauc": ...,  "val_f1": ...,  ...        ← 既有
+    "test_prauc": 0.87, "test_f1": 0.63,
+    "test_precision": 0.71, "test_recall": 0.57,
+    "test_samples": 4200, "test_positives": 380,
+    "importance_method": "gain",
+    "feature_importance": [
+      {"rank": 1, "feature": "loss_streak",  "importance_gain": 482.1},
+      {"rank": 2, "feature": "cum_wager",    "importance_gain": 310.5},
+      ...
+    ]
+  },
+  "nonrated": { ... }
+}
+```
+
+### 測試結果
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+```text
+Ran 378 tests in 6.8s
+OK
+```
+
+（0 failures，0 errors，0 expected failures）
+
+### 手動驗證步驟
+
+1. 跑完整 test suite：`python -m unittest discover -s tests -p "test_*.py"` → 應顯示 `OK`，378 tests。
+2. 訓練完成後查看 `trainer/models/training_metrics.json`：
+   - 應在 `rated` / `nonrated` key 下看到 `test_prauc`、`test_f1`、`test_precision`、`test_recall`、`test_samples`、`test_positives`。
+   - 應看到 `importance_method: "gain"` 與 `feature_importance` 陣列（按 gain 降冪排序）。
+3. 快速 smoke-test（不需要完整訓練）：
+   ```bash
+   python - << 'EOF'
+   import sys; sys.path.insert(0, "trainer")
+   import trainer as T, pandas as pd, numpy as np
+   rng = np.random.default_rng(0)
+   N = 200
+   df = pd.DataFrame({"is_rated": [True]*100+[False]*100, "label": rng.integers(0,2,N),
+       "loss_streak": rng.uniform(0,10,N), "cum_bets": rng.uniform(1,50,N),
+       "cum_wager": rng.uniform(10,500,N),
+       "payout_complete_dtm": pd.date_range("2025-01-01", periods=N, freq="5min"),
+       "canonical_id": [f"p{i%20}" for i in range(N)], "run_id": [f"r{i%10}" for i in range(N)]})
+   df["_split"] = ["train"]*140+["valid"]*30+["test"]*30
+   train_df=df[df["_split"]=="train"].copy(); valid_df=df[df["_split"]=="valid"].copy(); test_df=df[df["_split"]=="test"].copy()
+   _, _, m = T.train_dual_model(train_df, valid_df, ["loss_streak","cum_bets","cum_wager"], run_optuna=False, test_df=test_df)
+   for k,v in m.items():
+       if v: print(k, "test_f1=", v.get("test_f1"), "top_feat=", v.get("feature_importance",[{}])[0].get("feature"))
+   EOF
+   ```
+   應印出每個 model 的 `test_f1` 和排名第 1 的 feature。
+
+### 下一步建議
+
+- 為 `_compute_test_metrics` 與 `_compute_feature_importance` 加入正式 unit test（目前已由 smoke-test 驗證，但最好加進 `tests/test_trainer.py`）。
+- `training_metrics.json` 現在欄位較多，可考慮同步更新 `doc/model_api_protocol.md` 中的 schema 說明。
+- 若後續要改用 SHAP importance，只需替換 `_compute_feature_importance` 的計算方式，並把 `importance_method` 改為 `"shap"`。
+
+---
+
+## Round 67 Review — Test-set 評估 + Feature Importance 的 bug / 邊界條件 / 安全性 / 效能
+
+### R1100（P0）：`_compute_test_metrics` — `average_precision_score` 在全正 test set 時回傳 1.0 但無 guard
+
+**問題**：`_has_test` guard 要求 `y_test.sum() >= 1`，但未檢查 `y_test` 是否包含至少一個 **負** 樣本。當 test set 全為正樣本時（`y_test.sum() == len(y_test)`），`average_precision_score` 回傳 1.0 而非有意義的分數，且 precision/recall 計算的 FP 永為 0。這在資料量少或 is_rated 切分後某一側全正時可能發生。
+
+**修改建議**：在 `_has_test` 的條件中增加 `and int((y_test == 0).sum()) >= 1`。與 `_train_one_model` 的 `_has_val` 保持一致（`_has_val` 同樣缺少此檢查，但在 validation 端 Optuna 已有獨立 guard；test 端沒有第二道防線）。
+
+**希望新增的測試**：`test_compute_test_metrics_all_positive_labels` — 建構 `y_test = pd.Series([1]*100)`，呼叫 `_compute_test_metrics`，斷言回傳的 `test_prauc == 0.0`（zero-out 而非 1.0），或至少不 crash。
+
+---
+
+### R1101（P1）：`_compute_test_metrics` — 0.5 uncalibrated threshold 拿來評 test
+
+**問題**：當 validation set 過小導致 `_has_val=False` 時，`_train_one_model` 回傳 `threshold=0.5`（fallback、未經校準）。`_compute_test_metrics` 直接拿這個 0.5 去算 test precision/recall/F1，結果可能過度樂觀或悲觀，且 JSON 裡無任何標記告知下游該 threshold 未經校準。
+
+**修改建議**：`_compute_test_metrics` 接受 `_uncalibrated: bool` 參數（從 metrics dict 傳入），若為 True 則在回傳 dict 中加入 `"test_threshold_uncalibrated": True`，讓下游讀取 `training_metrics.json` 時知道 test P/R/F1 是用 fallback threshold 算的。
+
+**希望新增的測試**：`test_compute_test_metrics_uncalibrated_threshold_flag` — 用 `_uncalibrated=True` 呼叫，斷言回傳 dict 含 `test_threshold_uncalibrated: True`。
+
+---
+
+### R1102（P1）：`_compute_feature_importance` — booster `feature_name()` 與傳入的 `feature_cols` 長度不一致時靜默產出錯誤排名
+
+**問題**：primary 路徑用 `booster.feature_name()` 取得名字，用 `booster.feature_importance("gain")` 取得 gain，再用 `zip()` 配對。若 feature_cols 與 booster 內部 feature name 不一致（例如 LightGBM 把特殊字元轉成 `_` 或 rename），`zip` 仍成功但 feature name 可能和 caller 預期的 feature_cols 對不上。fallback 路徑用 `feature_cols`，但 `feature_importances_` 的長度可能不等於 `len(feature_cols)`（例如 model 訓練時 LightGBM 對 constant columns 做了合併），此時 `zip` 會靜默截斷。
+
+**修改建議**：
+1. Primary 路徑：不用 `booster.feature_name()`，改用 `feature_cols`（caller 傳入的就是訓練時實際用的 avail_cols），搭配 `booster.feature_importance("gain")`；加一個 `assert len(feature_cols) == len(gains)` guard。
+2. Fallback 路徑：同樣加 `assert len(feature_cols) == len(gains)` guard，或至少在不等長時 log warning 並補 0。
+
+**希望新增的測試**：`test_feature_importance_length_mismatch` — mock 一個 model 使 `feature_importances_` 長度與 `feature_cols` 不一致，斷言函式 raise 或 log warning 而非靜默截斷。
+
+---
+
+### R1103（P2）：`_compute_feature_importance` — bare `except Exception` 吞掉真正的 bug
+
+**問題**：`try: booster = model.booster_ ... except Exception:` 太寬泛。如果 booster 存在但 `feature_importance("gain")` 因為 dtype 或記憶體錯誤而 raise，會靜默走 fallback 路徑，產出不同來源的 importance 值但外部 `importance_method` 仍標記 `"gain"`。
+
+**修改建議**：縮小 except 範圍到 `except (AttributeError, ValueError):`。`AttributeError` 是 booster 不存在的情況；`ValueError` 是 booster 存在但 importance_type 不支援的情況。其他 exception 應該正常 raise 讓上層處理。
+
+**希望新增的測試**：`test_feature_importance_unexpected_error_not_swallowed` — mock `model.booster_.feature_importance` raise `RuntimeError`，斷言 `_compute_feature_importance` 也 raise（而非靜默 fallback）。
+
+---
+
+### R1104（P2）：`train_dual_model` — `test_df=None` 時仍呼叫 `_compute_test_metrics` 和 `_compute_feature_importance`
+
+**問題**：當 `test_df` 為 `None` 時，`_test_rated` 和 `_test_nonrated` 被設為空 DataFrame，隨後 `_compute_test_metrics` 被呼叫，guard 判定 `_has_test=False`，回傳全零 dict 並 merge 進 metrics。JSON 裡出現 `test_prauc: 0.0` 等欄位。這容易誤導：全零到底是「test set 太小所以算出來是零」還是「根本沒做 test」？
+
+**修改建議**：`train_dual_model` 迴圈裡加判斷：只有 `te_df` 非空時才呼叫 `_compute_test_metrics`；否則不寫入 `test_*` key（或寫入 `test_prauc: null`）。這樣下游讀取時可區分「沒做」和「做了但太差」。
+
+**希望新增的測試**：`test_train_dual_model_no_test_df_omits_test_keys` — 呼叫 `train_dual_model(test_df=None)`，斷言回傳的 metrics 中不含 `test_prauc` key（或值為 `None`）。
+
+---
+
+### R1105（P2）：`_compute_test_metrics` — `y_test` 和 `preds` 的 index 可能 misalign
+
+**問題**：`y_test = te_df["label"]` 保留了原始 index（從 full_df 切出來的），而 `preds = (test_scores >= threshold).astype(int)` 是 numpy array（0-based index）。用 `(preds == 1) & (y_test == 1)` 做 `&` 時，pandas 會按 index align，但 `preds` 是 ndarray 不會參與 alignment，結果取決於 positional match。目前碰巧 OK 是因為 `y_test` 的 values 就是按位置排的——但如果有人在 caller 端做了 `y_test.iloc[...]` 等操作導致 y_test index 不連續，`&` 的行為可能出錯。
+
+**修改建議**：在 `_compute_test_metrics` 開頭 `y_test = y_test.reset_index(drop=True)`，或改用 `.values`：`y_arr = y_test.values`，讓比較全在 numpy 層進行。
+
+**希望新增的測試**：`test_compute_test_metrics_non_contiguous_index` — 傳入 index 為 `[100, 200, 300, ...]` 的 `y_test`，斷言 TP/FP/FN 計算與重新 reset_index 後的結果一致。
+
+---
+
+### R1106（P3 / 效能）：`feature_importance` list 寫進 JSON 可能很大
+
+**問題**：如果 Track A DFS 產出了數百個特徵，`feature_importance` list 會有數百個 dict（每個含 3 個 key）。兩個模型加起來會讓 `training_metrics.json` 大幅膨脹。`/model_info` API endpoint 會把整個 `training_metrics` 回傳給前端，payload 可能不必要地大。
+
+**修改建議**：這不需要立即修，但可考慮：(1) 在 JSON 裡只保留 top-N（例如 50）個 features 的 importance，或 (2) 把完整 importance list 寫到獨立的 `feature_importance.json`，`training_metrics.json` 裡只保留 top-10 摘要。
+
+**希望新增的測試**：無需測試，這是效能/設計偏好問題。
+
+---
+
+### 問題清單彙總
+
+| ID | 嚴重性 | 問題摘要 |
+|------|--------|---------|
+| R1100 | **P0** | `_compute_test_metrics`：全正 test set 無 guard，prauc=1.0 誤導 |
+| R1101 | **P1** | test metrics 使用 uncalibrated 0.5 threshold 時無標記 |
+| R1102 | **P1** | `_compute_feature_importance`：feature name/gain 長度不一致時靜默截斷 |
+| R1103 | **P2** | `_compute_feature_importance`：bare `except Exception` 吞掉真正的 bug |
+| R1104 | **P2** | `test_df=None` 時寫入全零 test_* key，無法區分「未做」和「做了但差」 |
+| R1105 | **P2** | `y_test` index 可能 misalign（目前碰巧正確但不防禦） |
+| R1106 | **P3** | feature_importance list 可能很大，膨脹 JSON / API payload |
+
+### 下一步建議
+
+1. 先修 P0：R1100（`_compute_test_metrics` 全正 guard）；一起修 `_train_one_model` 的 `_has_val` 對稱問題。
+2. 再修 P1：R1101（uncalibrated flag）+ R1102（feature importance 長度 guard）。
+3. P2 問題（R1103/R1104/R1105）可合併為一輪小修。
+4. R1106 留待 Track A 上線後觀察實際 feature 數量再決定。
+
+---
+
+## Round 68 — 將 R1100-R1105 轉成最小可重現測試（tests-only）
+
+### 目標
+
+依 Reviewer 結論，先把風險點固化成可重現測試；本輪只加 tests，不改 production code。
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `tests/test_review_risks_round230.py` | 新增 R1100-R1105 的最小可重現測試，並用 `@unittest.expectedFailure` 標記目前尚未修正的風險行為。 |
+
+### 新增測試清單
+
+1. `TestR1100AllPositiveTestLabels.test_compute_test_metrics_all_positive_labels_should_be_guarded`
+   - 重現 `_compute_test_metrics` 在全正 test labels 時 PR-AUC=1.0 的誤導行為。
+
+2. `TestR1101UncalibratedThresholdFlag.test_compute_test_metrics_should_include_uncalibrated_flag_contract`
+   - 以 source contract 測試固定需求：test metrics 應有 `test_threshold_uncalibrated` 標記（目前未實作）。
+
+3. `TestR1102FeatureImportanceLengthMismatch.test_feature_importance_length_mismatch_should_raise`
+   - 重現 `_compute_feature_importance` 在 `feature_cols` 與 importance 向量長度不一致時靜默截斷的問題。
+
+4. `TestR1103FeatureImportanceExceptionScope.test_feature_importance_unexpected_error_should_propagate`
+   - 重現 booster 發生 `RuntimeError` 時被 `except Exception` 吞掉的問題。
+
+5. `TestR1104NoTestDfContract.test_train_dual_model_no_test_df_should_not_call_compute_test_metrics`
+   - 重現 `test_df=None` 仍進 test-metrics path 的行為（以 mock call 驗證）。
+
+6. `TestR1105TestIndexAlignment.test_compute_test_metrics_should_explicitly_normalize_index`
+   - 以 source contract 測試固定需求：`_compute_test_metrics` 需明確 index normalization（`reset_index` 或 `.values`）。
+
+### 執行方式與結果
+
+```bash
+python -m unittest tests.test_review_risks_round230 -v
+```
+
+```text
+Ran 6 tests
+OK (expected failures=6)
+```
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+```text
+Ran 384 tests
+OK (expected failures=6)
+```
+
+### 下一步建議
+
+1. 下一輪修 production code 時，逐條消除 R1100-R1105，並移除對應 `@expectedFailure`。
+2. 優先順序：R1100（P0）→ R1101/R1102（P1）→ R1103/R1104/R1105（P2）。
+3. 修完後保留同一批測試作為 regression guard，不要刪除測試。
+
+---
+
+## Round 69 — 修復 R1100-R1105（6 個 expectedFailure → 全部通過）
+
+### 目標
+
+消除 Round 68 所有 `@expectedFailure` 風險：修 production code，移除 `@expectedFailure` 讓測試成為正式 regression guard。
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `trainer/trainer.py` | `_compute_test_metrics` + `_compute_feature_importance` + `train_dual_model` 三處修改（見下） |
+| `tests/test_review_risks_round230.py` | 移除全部 6 個 `@unittest.expectedFailure`；更新模組 docstring 說明狀態 |
+
+#### trainer/trainer.py 改動細節
+
+**`_compute_test_metrics`（R1100 / R1101 / R1105）**：
+
+- **R1100**：`_has_test` guard 新增 `and int((y_test == 0).sum()) >= 1` 防止全正 labels 讓 PR-AUC 虛報 1.0。warning message 同步加上 negatives 數量。
+- **R1101**：函式簽章加入 `_uncalibrated: bool = False` 參數；兩個 return dict（早回傳與主路徑）都加入 `"test_threshold_uncalibrated": _uncalibrated` key，讓下游可辨識 P/R/F1 是否用 fallback threshold 算的。
+- **R1105**：`y_arr = y_test.values` 提取 numpy array，TP/FP/FN 計算改用 `y_arr` 避免 pandas index misalignment。
+
+**`_compute_feature_importance`（R1102 / R1103）**：
+
+- **R1103**：`except Exception:` 縮窄為 `except AttributeError:`，只捕捉「booster 屬性不存在」的情況；`RuntimeError` 等非預期錯誤會正常 propagate。
+- **R1102**：fallback 路徑（`AttributeError` 觸發）新增長度 guard：`if len(gains) != len(names): raise ValueError(...)`，防止 `zip()` 靜默截斷。
+
+**`train_dual_model`（R1104 / R1101 call-site）**：
+
+- **R1104**：`_compute_test_metrics` 的呼叫點加 `if not te_df.empty:` guard；`test_df=None` 時 `te_df` 是空 DataFrame，整條 test-eval 路徑會被跳過，不再寫入全零的 `test_*` key。
+- **R1101 call-site**：`_compute_test_metrics` 呼叫時傳入 `_uncalibrated=bool(metrics.get("_uncalibrated", False))`。
+
+### 測試結果
+
+```bash
+python -m unittest tests.test_review_risks_round230 -v
+```
+
+```text
+Ran 6 tests in 0.014s
+OK
+```
+
+（0 expected failures，6 ok）
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+```text
+Ran 384 tests in 5.1s
+OK
+```
+
+（0 failures，0 errors，0 expected failures）
+
+### 手動驗證步驟
+
+1. `python -m unittest discover -s tests -p "test_*.py"` → `Ran 384 tests … OK`。
+2. `python -m unittest tests.test_review_risks_round230 -v` → 6 個 `ok`，無 `expected failure` 字樣。
+3. 訓練完後查 `trainer/models/training_metrics.json`：
+   - 若 threshold 是 fallback（val 太小），`test_threshold_uncalibrated` 應為 `true`。
+   - 若 test set 全正，`test_prauc` 應為 `0.0` 而非 `1.0`。
+   - 若 `test_df=None` 呼叫，metrics 中不應有 `test_prauc` key。
+
+### 下一步建議
+
+- R1106（feature importance list 可能膨脹 JSON）留待 Track A 上線後看實際大小再決定是否截斷。
+- `training_metrics.json` 的 schema 可在 `doc/model_api_protocol.md` 補上新增的 `test_*` 與 `test_threshold_uncalibrated` key 說明。
+
+---
+
+## Round 70（2026-03-05）— Scorer ClickHouse session datetime 正規化（DEC-018 等價、R33）
+
+### 背景
+
+PLAN.md § 不改動的部分註明「`scorer.py` 的 tz 處理獨立（它有自己的 R23-equivalent 流程）」；DEC-018 僅修改 trainer / features / labels / backtester，未涵蓋 scorer。Scorer 的 **live 路徑**（`fetch_recent_data` 自 ClickHouse 取 bet/session → `build_features_for_scoring`）中，`session_start_dtm` / `session_end_dtm` 來自 ClickHouse `query_df()`，可能回傳字串或 object，或 tz-aware/naive 混用，導致 `pd.to_datetime(...).fillna(...)` 後仍為 object dtype，接著使用 `.dt.tz` 時觸發 `AttributeError: Can only use .dt accessor with datetimelike values`。
+
+### 本輪修改
+
+| 檔案 | 改動 |
+|------|------|
+| `trainer/scorer.py` | `build_features_for_scoring`：對 `session_start_dtm` / `session_end_dtm` 迴圈內，改為 `pd.to_datetime(..., errors="coerce")`，並在存取 `.dt` 前以 `pd.api.types.is_datetime64_any_dtype(bets_df[col])` 守衛，僅在為 datetimelike 時做 R33（HK convert → strip tz） |
+| `trainer/scorer.py` | 同函數內 `_pcd = bets_df["payout_complete_dtm"]` 區塊：先 `pd.to_datetime(..., errors="coerce")`，再以 `is_datetime64_any_dtype` 判斷後才使用 `.dt.tz` / `tz_convert`，避免同類錯誤 |
+
+### 與 PLAN.md 的對齊
+
+- **其他資料入口統一（可選）**：Scorer 的 ClickHouse session 欄位現已納入與 DEC-018 等價的防呆：強制轉為 `datetime64`、僅在 datetimelike 時做 tz 轉換並 strip，與 pipeline 內部 tz-naive 一致。
+- **R33**：session 與 payout_complete_dtm 的「HK local time then strip tz」邏輯維持不變，僅加上 dtype 守衛，避免 object/string 觸發 `.dt` 錯誤。
+
+### 驗證
+
+- 執行 `python -m trainer.scorer --once` 時，若 ClickHouse 回傳的 session 欄位為字串或 object，應不再出現 `Can only use .dt accessor with datetimelike values`。
+- 既有 scorer 單元測試與整合流程不受影響（無預期失敗變更）。
+
+

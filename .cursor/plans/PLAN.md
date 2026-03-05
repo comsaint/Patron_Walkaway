@@ -50,6 +50,12 @@ todos:
   - id: todo-track-a-screening-no-afg
     content: "DEC-020 Track A: DONE — run_track_a_dfs runs inside first chunk's process_chunk (run_afg), --no-afg CLI added, screen_features runs on ALL candidate features (Track A + Track B + profile) on training set only after concat+split, feature_list.json written from screened list with correct track labels (A/B/legacy/profile)."
     status: completed
+  - id: todo-test-set-metrics
+    content: "After training: evaluate trained models (rated + nonrated) on the held-out test set and write test metrics (e.g. test_prauc, test_f1, test_precision, test_recall per model) alongside existing validation metrics into training_metrics.json / artifact bundle."
+    status: completed
+  - id: todo-feature-importance-in-metrics
+    content: "In training_metrics.json, for each model (rated / nonrated), list the features used and rank them by importance. Use the same method as screening or model interpretability (e.g. mutual information, SHAP, LightGBM gain — document which method is used in the artifact)."
+    status: completed
 isProject: false
 ---
 
@@ -110,8 +116,11 @@ trainer/models/
 ├── saved_feature_defs/          ← featuretools save_features output
 ├── feature_list.json            ← final screened feature names
 ├── reason_code_map.json         ← feature → reason_code mapping
+├── training_metrics.json        ← per-model validation + test set metrics; per-model feature list ranked by importance (see Step 5.8–5.9)
 └── model_version                ← e.g. "20260228-153000-abc1234"
 ```
+
+`training_metrics.json` must include: (1) validation-set metrics (used for threshold selection / Optuna) and test-set metrics (evaluated after training for held-out reporting); (2) for each model (rated / nonrated), the list of features used, ranked by importance from the method in use (e.g. mutual information, SHAP, LightGBM gain — the artifact should record which method was used).
 
 ---
 
@@ -247,7 +256,9 @@ def get_train_valid_test_split(chunks: list, train_frac=0.7, valid_frac=0.15) ->
 5. **Run-level sample weight**: Compute `sample_weight = 1 / N_run` per observation (training set only), where `N_run` = number of bets in the same run (same `canonical_id`, same run from `compute_run_boundary`). This corrects length bias so each run contributes more equally; use with `class_weight='balanced'`.
 6. Optuna hyperparameter search on valid set
 7. Train Rated + Non-rated LightGBM models with `class_weight='balanced'` + `sample_weight`
-8. Save atomic artifact bundle
+8. **Evaluate on test set**: Run the trained models on the held-out test set (same feature columns as valid); compute test metrics (e.g. test_prauc, test_f1, test_precision, test_recall, test_samples, test_positives) per model (rated / nonrated). Write these alongside the existing validation metrics into the artifact (e.g. `training_metrics.json` or the same bundle) so both validation and test results are available for audit and reporting.
+9. **Feature importance per model**: For each trained model (rated / nonrated), compute feature importance using the same method as screening or interpretability (e.g. mutual information, SHAP, LightGBM gain). In `training_metrics.json`, for each model include: (a) the list of features used by that model, and (b) their ranking (and optionally raw importance values) by that method. Record which importance method was used (e.g. `importance_method: "gain"` or `"shap"`) in the artifact so consumers can interpret the ranking.
+10. Save atomic artifact bundle
 
 ### Step 6 — `trainer/backtester.py` (update, ~250 lines)
 

@@ -24,7 +24,7 @@ models/
   nonrated_model.pkl        LightGBM model for anonymous players
   feature_list.json         [{name, track}]  track ∈ {"B", "legacy"}
   model_version             YYYYMMDD-HHMMSS-<git7>  (plain text)
-  training_metrics.json     per-model validation metrics + Optuna best params
+  training_metrics.json     per-model validation + test metrics, feature importance (gain), Optuna best params
 
 Backward compatibility
 ----------------------
@@ -1759,18 +1759,141 @@ def _train_one_model(
     return model, metrics
 
 
+def _compute_test_metrics(
+    model: lgb.LGBMClassifier,
+    threshold: float,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    label: str = "",
+    _uncalibrated: bool = False,
+) -> dict:
+    """Evaluate a trained model on the held-out test set at the val-derived threshold.
+
+    Uses the same MIN_VALID_TEST_ROWS guard as _train_one_model so an under-sized
+    test split returns zeroed metrics rather than crashing.  test_prauc is computed
+    without any threshold so it is comparable to val_prauc.
+
+    R1100: requires at least one negative label so PR-AUC is meaningful.
+    R1101: _uncalibrated=True is propagated into test_threshold_uncalibrated key.
+    R1105: y_test.values is used for positional comparisons to avoid index misalign.
+    """
+    # R1100: guard against all-positive labels (average_precision_score = 1.0 trivially)
+    _has_test = (
+        not X_test.empty
+        and len(y_test) >= MIN_VALID_TEST_ROWS
+        and int(y_test.isna().sum()) == 0
+        and int(y_test.sum()) >= 1
+        and int((y_test == 0).sum()) >= 1
+    )
+    if not _has_test:
+        logger.warning(
+            "%s: test set too small or unbalanced (%d rows, %d positives, %d negatives)"
+            " — test metrics will be zero.",
+            label or "model",
+            len(y_test),
+            int(y_test.sum()) if not y_test.empty else 0,
+            int((y_test == 0).sum()) if not y_test.empty else 0,
+        )
+        return {
+            "test_prauc": 0.0,
+            "test_precision": 0.0,
+            "test_recall": 0.0,
+            "test_f1": 0.0,
+            "test_samples": int(len(y_test)),
+            "test_positives": int(y_test.sum()) if not y_test.empty else 0,
+            # R1101: propagate uncalibrated flag
+            "test_threshold_uncalibrated": _uncalibrated,
+        }
+
+    test_scores = model.predict_proba(X_test)[:, 1]
+    prauc = float(average_precision_score(y_test, test_scores))
+    preds = (test_scores >= threshold).astype(int)
+    # R1105: use .values to prevent pandas index misalignment with numpy preds array
+    y_arr = y_test.values
+    tp = int(((preds == 1) & (y_arr == 1)).sum())
+    fp = int(((preds == 1) & (y_arr == 0)).sum())
+    fn = int(((preds == 0) & (y_arr == 1)).sum())
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    logger.info(
+        "%s test: PR-AUC=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
+        label, prauc, f1, prec, rec, threshold,
+    )
+    return {
+        "test_prauc": prauc,
+        "test_precision": prec,
+        "test_recall": rec,
+        "test_f1": f1,
+        "test_samples": int(len(y_test)),
+        "test_positives": int(y_test.sum()),
+        # R1101: propagate uncalibrated flag so downstream can distrust P/R/F1
+        "test_threshold_uncalibrated": _uncalibrated,
+    }
+
+
+def _compute_feature_importance(
+    model: lgb.LGBMClassifier,
+    feature_cols: List[str],
+) -> list:
+    """Return features ranked by LightGBM 'gain' importance (descending).
+
+    Uses the booster's native feature_importance(importance_type='gain') which
+    reflects cumulative information gain rather than raw split counts.  Falls back
+    to sklearn-style .feature_importances_ only when the booster attribute is
+    absent (AttributeError), e.g. in unit tests with mock estimators.
+
+    R1102: raises ValueError if importance vector length != feature_cols length.
+    R1103: only AttributeError triggers fallback; other exceptions propagate.
+    """
+    try:
+        booster = model.booster_
+        names: List[str] = booster.feature_name()
+        gains = booster.feature_importance(importance_type="gain").tolist()
+    except AttributeError:
+        # Fallback for mock / non-LightGBM models (no booster_ attribute).
+        names = list(feature_cols)
+        gains = model.feature_importances_.tolist()
+        # R1102: guard against silent truncation by zip when lengths differ
+        if len(gains) != len(names):
+            raise ValueError(
+                f"_compute_feature_importance: feature_importances_ length ({len(gains)}) "
+                f"!= feature_cols length ({len(names)}). "
+                "Ensure the model was trained with the same feature list."
+            )
+
+    ranked = sorted(zip(names, gains), key=lambda x: x[1], reverse=True)
+    return [
+        {"rank": i + 1, "feature": name, "importance_gain": round(float(gain), 6)}
+        for i, (name, gain) in enumerate(ranked)
+    ]
+
+
 def train_dual_model(
     train_df: pd.DataFrame,
     valid_df: pd.DataFrame,
     feature_cols: List[str],
     run_optuna: bool = True,
+    test_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[Optional[dict], Optional[dict], dict]:
     """Train Rated + Non-rated LightGBM models.
+
+    Parameters
+    ----------
+    train_df, valid_df : labelled DataFrames with is_rated column
+    feature_cols       : screened feature list (all tracks)
+    run_optuna         : whether to run Optuna HPO (skipped in fast-mode)
+    test_df            : held-out test split; when provided, test metrics and
+                         LightGBM gain feature importance are appended to each
+                         model's metrics dict and written into training_metrics.json.
 
     Returns
     -------
     (rated_artifacts, nonrated_artifacts, combined_metrics)
-        Each artifacts dict: {"model": LGBMClassifier, "threshold": float, "metrics": dict}
+        Each artifacts dict: {"model": LGBMClassifier, "threshold": float,
+                              "features": list, "metrics": dict}
+        metrics dict contains val_* keys (always), test_* keys (when test_df
+        provided), feature_importance list, and importance_method string.
     """
     def _split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         rated = df[df["is_rated"]].copy()
@@ -1780,13 +1903,21 @@ def train_dual_model(
     train_rated, train_nonrated = _split(train_df)
     val_rated, val_nonrated = _split(valid_df)
 
+    _test_rated: pd.DataFrame
+    _test_nonrated: pd.DataFrame
+    if test_df is not None and not test_df.empty:
+        _test_rated, _test_nonrated = _split(test_df)
+    else:
+        _test_rated = pd.DataFrame()
+        _test_nonrated = pd.DataFrame()
+
     sw_rated = compute_sample_weights(train_rated)
     sw_nonrated = compute_sample_weights(train_nonrated)
 
     results: dict[str, Any] = {}
-    for name, tr_df, vl_df, sw in [
-        ("rated", train_rated, val_rated, sw_rated),
-        ("nonrated", train_nonrated, val_nonrated, sw_nonrated),
+    for name, tr_df, vl_df, te_df, sw in [
+        ("rated",    train_rated,    val_rated,    _test_rated,    sw_rated),
+        ("nonrated", train_nonrated, val_nonrated, _test_nonrated, sw_nonrated),
     ]:
         if tr_df.empty:
             logger.warning("%s model: no training rows, skipping", name)
@@ -1813,6 +1944,29 @@ def train_dual_model(
             }
 
         model, metrics = _train_one_model(X_tr, y_tr, X_vl, y_vl, sw, hp, label=name)
+
+        # R1104: only evaluate on test set when a real test split was provided.
+        # Skipping when te_df is empty avoids polluting the artifact with
+        # all-zero test_* keys that are indistinguishable from "evaluated but poor".
+        if not te_df.empty:
+            X_te = te_df[avail_cols]
+            y_te = te_df["label"]
+            metrics.update(
+                _compute_test_metrics(
+                    model,
+                    metrics["threshold"],
+                    X_te,
+                    y_te,
+                    label=name,
+                    # R1101: propagate whether the threshold was a fallback
+                    _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+                )
+            )
+
+        # Feature importance ranked by LightGBM gain.
+        metrics["feature_importance"] = _compute_feature_importance(model, avail_cols)
+        metrics["importance_method"] = "gain"
+
         results[name] = {
             "model": model,
             "threshold": metrics["threshold"],
@@ -2433,7 +2587,9 @@ def run_pipeline(args) -> None:
         active_feature_cols = screened_cols
 
     # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
-    print("[Step 9/10] Train dual model (Optuna + LightGBM)…", flush=True)
+    #    test_df is passed so test-set metrics and feature importance are
+    #    computed immediately after training and included in the artifact.
+    print("[Step 9/10] Train dual model (Optuna + LightGBM) + test-set eval…", flush=True)
     t0 = time.perf_counter()
     model_version = get_model_version()
     rated_art, nonrated_art, combined_metrics = train_dual_model(
@@ -2441,10 +2597,11 @@ def run_pipeline(args) -> None:
         valid_df,
         active_feature_cols,
         run_optuna=not skip_optuna,
+        test_df=test_df,
     )
     _el = time.perf_counter() - t0
-    print("[Step 9/10] Train dual model done in %.1fs" % _el, flush=True)
-    logger.info("train_dual_model: %.1fs", _el)
+    print("[Step 9/10] Train dual model + test-set eval done in %.1fs" % _el, flush=True)
+    logger.info("train_dual_model + test eval: %.1fs", _el)
 
     # 7. Save artifacts
     print("[Step 10/10] Save artifact bundle…", flush=True)

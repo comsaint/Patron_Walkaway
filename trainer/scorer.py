@@ -652,20 +652,25 @@ def build_features_for_scoring(
         if col not in bets_df.columns:
             bets_df[col] = bets_df["payout_complete_dtm"]
         else:
-            bets_df[col] = pd.to_datetime(bets_df[col]).fillna(
+            bets_df[col] = pd.to_datetime(bets_df[col], errors="coerce").fillna(
                 bets_df["payout_complete_dtm"]
             )
-            # convert to HK local time first, then strip tz to avoid wall-clock skew (R33)
-            if bets_df[col].dt.tz is not None:
-                bets_df[col] = bets_df[col].dt.tz_convert(HK_TZ).dt.tz_localize(None)
+        # Ensure datetime64 before .dt access (ClickHouse can return object/string)
+        bets_df[col] = pd.to_datetime(bets_df[col], errors="coerce")
+        # R33: convert to HK local time then strip tz to avoid wall-clock skew
+        if pd.api.types.is_datetime64_any_dtype(bets_df[col]) and bets_df[col].dt.tz is not None:
+            bets_df[col] = bets_df[col].dt.tz_convert(HK_TZ).dt.tz_localize(None)
 
     bets_df["cum_bets"] = bets_df.groupby("session_id").cumcount() + 1
     bets_df["cum_wager"] = bets_df.groupby("session_id")["wager"].cumsum()
     bets_df["avg_wager_sofar"] = bets_df["cum_wager"] / bets_df["cum_bets"]
 
     # Vectorised rolling window counts / sums per session
-    _pcd = bets_df["payout_complete_dtm"]
-    _pcd_utc = _pcd.dt.tz_convert("UTC").dt.tz_localize(None) if _pcd.dt.tz is not None else _pcd
+    _pcd = pd.to_datetime(bets_df["payout_complete_dtm"], errors="coerce")
+    if pd.api.types.is_datetime64_any_dtype(_pcd) and _pcd.dt.tz is not None:
+        _pcd_utc = _pcd.dt.tz_convert("UTC").dt.tz_localize(None)
+    else:
+        _pcd_utc = _pcd
     bets_df["_ts_ns"] = _pcd_utc.astype("datetime64[ns]").astype("int64")
 
     def _session_windows(group: pd.DataFrame) -> pd.DataFrame:
