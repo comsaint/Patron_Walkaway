@@ -52,7 +52,10 @@ except ImportError:
 try:
     from db_conn import get_clickhouse_client  # type: ignore[import]
 except ImportError:
-    get_clickhouse_client = None  # type: ignore[assignment]
+    try:
+        from trainer.db_conn import get_clickhouse_client  # type: ignore[import]
+    except ImportError:
+        get_clickhouse_client = None  # type: ignore[assignment]
 
 try:
     import config  # type: ignore[import]
