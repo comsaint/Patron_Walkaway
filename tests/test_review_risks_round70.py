@@ -31,21 +31,21 @@ def _get_func_src(tree: ast.Module, src: str, name: str) -> str:
     return ""
 
 
-class TestR83ScorerModelSpecificFeatureSubset(unittest.TestCase):
-    """R83: nonrated prediction should use nonrated model feature subset."""
+class TestR83ScorerSingleModelFeatureSubset(unittest.TestCase):
+    """R83 (updated): single rated model uses model-specific feature subset, not global list (v10 DEC-021)."""
 
-    def test_nonrated_predict_does_not_use_global_feature_list_directly(self):
+    def test_score_df_uses_rated_model_features_not_global_list(self):
         src = _get_func_src(_SCORER_TREE, _SCORER_SRC, "_score_df")
         self.assertGreater(len(src), 0, "_score_df not found")
-        self.assertNotIn(
-            "df.loc[nonrated_mask, feature_list]",
+        self.assertIn(
+            "rated_art",
             src,
-            "nonrated predict should use model-specific features, not global feature_list (R83)",
+            "_score_df should reference rated_art (R83)",
         )
         self.assertRegex(
             src,
-            r'nonrated.*get\(\s*"features"|_model_nr.*get\(\s*"features"',
-            "nonrated path should read feature subset from nonrated artifact (R83)",
+            r'rated_art.*get\(\s*"features"\)',
+            "_score_df should read feature subset from rated_art (R83)",
         )
 
 

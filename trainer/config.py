@@ -77,13 +77,15 @@ RUN_BREAK_MIN = WALKAWAY_GAP_MIN  # Gap >= this value starts a new betting run
 GAMING_DAY_START_HOUR = 6
 
 # --- G1 threshold gate (DEPRECATED — rollback path only; DEC-009/010) ---
-# Threshold selection now uses F1 maximization; G1 constraints removed.
+# Threshold selection now uses F-beta maximization (precision-weighted); G1 constraints removed.
 # Do NOT import these in trainer.py or backtester.py.
 # Restore only if explicitly rolling back to G1 strategy (see DEC-009 rollback note).
 G1_PRECISION_MIN = 0.70          # [DEPRECATED] Minimum per-model precision
 G1_ALERT_VOLUME_MIN_PER_HOUR = 5 # [DEPRECATED] Minimum combined alert volume/hour
 G1_FBETA = 0.5                   # [DEPRECATED] F-beta weight (beta < 1 → precision-weighted)
-OPTUNA_N_TRIALS = 300            # Optuna TPE trials for F1 threshold search (DEC-009/010)
+OPTUNA_N_TRIALS = 300            # Optuna TPE trials for threshold search (DEC-009/010)
+# Threshold selection objective: F-beta with beta < 1 favours precision over recall.
+THRESHOLD_FBETA: float = 0.5
 
 # --- Feature screening (DEC-020) ---
 # Maximum number of features to keep after screen_features().
@@ -93,9 +95,14 @@ SCREEN_FEATURES_TOP_K: Optional[int] = None
 
 # --- Threshold selection guardrails ---
 # Minimum number of validation alerts required for a candidate threshold to be
-# considered during F1 maximisation.  Small validation sets (e.g. --sample-rated)
+# considered during F-beta maximisation.  Small validation sets (e.g. --sample-rated)
 # may require a lower value; large sets may warrant a higher one.
 MIN_THRESHOLD_ALERT_COUNT = 5
+# Optional threshold constraints (None disables each constraint).
+# MIN_RECALL applies to both trainer threshold scan and backtester Optuna search.
+# MIN_ALERTS_PER_HOUR is only meaningful in backtester where window_hours exists.
+THRESHOLD_MIN_RECALL: Optional[float] = 0.01
+THRESHOLD_MIN_ALERTS_PER_HOUR: Optional[float] = 1.0
 
 # --- Track B constants ---
 TABLE_HC_WINDOW_MIN = 30         # Lookback window for table headcount feature (D1)

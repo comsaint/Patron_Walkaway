@@ -12,9 +12,6 @@ Architecture (DEC-022: Track Profile / Track LLM / Track Human)
 **Feature screening** (unified across tracks)
     screen_features()           Mutual-info → correlation pruning → optional LGBM
 
-Track A is deprecated; legacy entry points are re-exported from
-trainer._deprecated_track_a for backward compatibility only.
-
 All Track B functions are imported by BOTH trainer.py and scorer.py to
 guarantee train-serve parity.  They must be kept stateless (no global mutable
 state) and must only look backward in time from each observation's cutoff.
@@ -226,27 +223,6 @@ def get_profile_feature_cols(max_lookback_days: int = 365) -> List[str]:
         if _PROFILE_FEATURE_MIN_DAYS.get(col, 365) <= max_lookback_days
     ]
 
-
-# Legacy Track A (DEC-022 deprecated) — lazy re-export for backward compatibility.
-# Dual-path import: sibling-module form first (when run inside the trainer/
-# directory), then package form via importlib (R1906/R1603 — avoids hard
-# coupling at import time and keeps the package-qualified path out of this file).
-try:
-    from _deprecated_track_a import (  # type: ignore[import]  # noqa: E402, F401
-        build_entity_set,
-        compute_feature_matrix,
-        load_feature_defs,
-        run_dfs_exploration,
-        save_feature_defs,
-    )
-except ImportError:
-    import importlib as _il  # noqa: E402
-    _dta = _il.import_module("trainer._deprecated_track_a")
-    build_entity_set = _dta.build_entity_set  # noqa: F811
-    compute_feature_matrix = _dta.compute_feature_matrix  # noqa: F811
-    load_feature_defs = _dta.load_feature_defs  # noqa: F811
-    run_dfs_exploration = _dta.run_dfs_exploration  # noqa: F811
-    save_feature_defs = _dta.save_feature_defs  # noqa: F811
 
 # ---------------------------------------------------------------------------
 # Track B — Vectorized hand-crafted features
@@ -921,10 +897,15 @@ def _validate_feature_spec(spec: dict) -> None:
     yaml_guardrails = spec.get("guardrails") or {}
     yaml_kw_list = yaml_guardrails.get("disallow_sql_keywords_in_expressions") or []
     # R2106: extend blocklist with DDL/DML keywords that can mutate schema or data.
+    # R3506: extend blocklist with DuckDB file-access and extension functions to
+    # prevent YAML expressions from reading local files or loading untrusted extensions.
     disallowed_sql: set = {
         "SELECT", "FROM", "JOIN", "UNION", "WITH",
         "DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "CREATE", "TRUNCATE",
         "EXEC", "EXECUTE",
+        "READ_PARQUET", "READ_CSV", "READ_CSV_AUTO", "READ_JSON",
+        "READ_JSON_AUTO", "GLOB", "INSTALL_EXTENSION", "LOAD_EXTENSION",
+        "COPY", "EXPORT", "IMPORT",
     } | {kw.upper() for kw in yaml_kw_list}
 
     for track_key in ("track_llm", "track_human", "track_profile"):
@@ -1105,8 +1086,11 @@ def compute_track_llm_features(
         ts_for_mask = pd.to_datetime(bets_df["payout_complete_dtm"])
         if ts_for_mask.dt.tz is not None:
             ts_for_mask = ts_for_mask.dt.tz_convert("Asia/Hong_Kong").dt.tz_localize(None)
-        # reset_index guarantees an independent copy (no SettingWithCopyWarning).
-        df = bets_df.loc[ts_for_mask <= ct].reset_index(drop=True)
+        # R3508: 30-second tolerance prevents clock-skew from silently dropping
+        # recently-arrived bets whose payout_complete_dtm is fractionally after
+        # the scorer's now_hk.  Window frames are strictly backward-looking so
+        # this tolerance does not introduce leakage.
+        df = bets_df.loc[ts_for_mask <= ct + pd.Timedelta(seconds=30)].reset_index(drop=True)
     else:
         df = bets_df.copy()
 

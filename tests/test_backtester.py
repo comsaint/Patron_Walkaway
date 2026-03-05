@@ -79,7 +79,7 @@ class TestDualMetrics(unittest.TestCase):
             "is_rated": [True, True, False],
         })
         out = _micro_metrics_spec(df, threshold=0.5)
-        # v10: only rated rows get alerts; nonrated 0.8 is not alerted
+        # v10: single rated model scores all rows; is_rated is tracked but all rows are scored
         self.assertEqual(out["alerts"], 1)
         self.assertEqual(out["true_alerts"], 1)
         self.assertEqual(out["positives"], 2)

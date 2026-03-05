@@ -47,40 +47,38 @@ class TestR900ScreenFeaturesSignature(unittest.TestCase):
 
 
 class TestR901Step3dCanonicalIdJoin(unittest.TestCase):
-    """R901: process_chunk DFS path should join canonical_id onto sessions."""
+    """R901: process_chunk should preserve canonical_id fallback before feature calc."""
 
-    def test_process_chunk_should_join_canonical_id_on_sessions_before_dfs(self):
+    def test_process_chunk_should_fill_missing_canonical_id(self):
         src = inspect.getsource(trainer_mod.process_chunk)
         self.assertIn(
-            '_dfs_sessions = _dfs_sessions.merge(',
+            'bets["canonical_id"] = bets["canonical_id"].fillna',
             src,
-            "process_chunk should merge canonical_id into sessions before run_track_a_dfs.",
+            "process_chunk should keep fallback canonical_id when mapping misses.",
         )
 
 
 class TestR902Step3dDummyFilter(unittest.TestCase):
-    """R902: process_chunk DFS path should exclude FND-12 dummy ids."""
+    """R902: process_chunk should exclude FND-12 dummy ids before feature engineering."""
 
-    def test_process_chunk_should_filter_dummy_player_ids_before_dfs(self):
+    def test_process_chunk_should_filter_dummy_player_ids_before_feature_calc(self):
         src = inspect.getsource(trainer_mod.process_chunk)
-        dfs_start = src.find("# --- Track A: DFS exploration (DEC-020, first-chunk only via run_afg) ---")
-        self.assertGreaterEqual(dfs_start, 0, "process_chunk should contain DFS block")
-        dfs_src = src[dfs_start:]
         self.assertIn(
             "dummy_player_ids",
-            dfs_src,
-            "process_chunk should filter dummy player ids before DFS exploration.",
+            src,
+            "process_chunk should filter dummy player ids before feature computation.",
         )
 
 
 class TestR903StaleFeatureDefsCleanup(unittest.TestCase):
-    """R903: stale feature_defs should be removed before DFS retry."""
+    """R903: run_pipeline should load Track LLM feature spec before chunk loop."""
 
-    def test_step3d_should_remove_stale_feature_defs_before_dfs(self):
+    def test_run_pipeline_should_load_feature_spec(self):
         src = inspect.getsource(trainer_mod.run_pipeline)
-        self.assertTrue(
-            ("feature_defs.json" in src and ".unlink(" in src),
-            "Step 3d should delete stale feature_defs.json before running DFS.",
+        self.assertIn(
+            "load_feature_spec(",
+            src,
+            "run_pipeline should load Track LLM feature spec once before chunk processing.",
         )
 
 
@@ -114,25 +112,24 @@ class TestR905TopKValidation(unittest.TestCase):
 
 
 class TestR906FirstChunkDoubleLoad(unittest.TestCase):
-    """R906: Step 3d and first process_chunk currently double-load first chunk."""
+    """R906: no legacy run_afg plumbing should remain after Track LLM migration."""
 
-    def test_run_pipeline_should_document_or_guard_against_first_chunk_double_load(self):
+    def test_run_pipeline_should_not_pass_run_afg(self):
         src = inspect.getsource(trainer_mod.run_pipeline)
-        self.assertTrue(
-            ("reuse" in src.lower() and "first chunk" in src.lower())
-            or ("double-load" in src.lower()),
-            "run_pipeline should include explicit guard/comment for first-chunk double-load.",
+        self.assertNotIn(
+            "run_afg=",
+            src,
+            "run_pipeline should not use legacy run_afg after removing Track A DFS path.",
         )
 
 
 class TestR907DfsSampleCap(unittest.TestCase):
-    """R907: DFS exploration should have an absolute sample-size cap."""
+    """R907: legacy Track A DFS entrypoint should be removed."""
 
-    def test_run_track_a_dfs_should_have_absolute_sample_cap(self):
-        src = inspect.getsource(trainer_mod.run_track_a_dfs)
-        self.assertTrue(
-            ("_max_sample" in src) or ("sample(n=" in src and "min(" in src),
-            "run_track_a_dfs should cap sampled rows by an absolute max size.",
+    def test_run_track_a_dfs_should_not_exist(self):
+        self.assertFalse(
+            hasattr(trainer_mod, "run_track_a_dfs"),
+            "run_track_a_dfs should be removed after Track LLM migration.",
         )
 
 

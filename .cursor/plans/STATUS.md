@@ -2,7 +2,578 @@
 
 # STATUS — trainer.py Gap Analysis vs PLAN.md v10
 
-**Date**: 2026-03-05
+**Date**: 2026-03-06
+
+---
+
+## Round 105 — Reviewer 風險點最小可重現測試（tests-only）
+
+### 目標與約束
+- 僅新增測試，不修改任何 production code。
+- 將 Round 104 Review 識別的高風險點轉成最小可重現測試。
+- 由於風險尚未修復，測試以 `unittest.expectedFailure` 標記，確保風險可視化且不破壞既有綠燈流程。
+
+### 新增檔案
+- `tests/test_review_risks_round360.py`
+
+### 新增測試清單（7 項，皆為 xfail）
+- `TestR3600ScorerUnratedAlertLeak.test_score_once_should_emit_only_rated_alerts`
+  - 重現 Scorer 對 unrated 觀測仍可能發 alert 的風險。
+- `TestR3601ApiUnratedAlertLeak.test_score_endpoint_unrated_row_should_not_alert`
+  - 重現 API `/score` 對 unrated row 回傳 `alert=True` 的風險。
+- `TestR3602BacktesterCombinedPraucScope.test_combined_micro_prauc_should_match_rated_track_when_unrated_is_noise`
+  - 重現 combined PRAUC 被 unrated 分布影響的語義偏差。
+- `TestR3603ArtifactCleanupGuard.test_save_artifact_bundle_should_cleanup_legacy_nonrated_model_file`
+  - 檢查 artifact save path 是否有 stale nonrated artifact cleanup guard。
+- `TestR3604DocConsistencyGuards.test_api_score_doc_should_not_describe_dual_model_routing`
+  - 重現 API docstring 與 v10 單模型行為不一致。
+- `TestR3604DocConsistencyGuards.test_scorer_module_doc_should_not_mention_dual_model_artifacts`
+  - 重現 scorer 模組說明仍提 dual-model。
+- `TestR3604DocConsistencyGuards.test_backtester_micro_doc_should_not_reference_nonrated_alerting_rule`
+  - 重現 backtester 指標函式 docstring 仍保留 nonrated 舊語義。
+
+### 執行方式
+```bash
+python -m pytest "c:\Users\longp\Patron_Walkaway\tests\test_review_risks_round360.py" -q
+```
+
+### 實際執行結果
+```text
+7 xfailed in 1.56s
+```
+
+### 備註
+- 這批測試是「風險可重現化」而非「修復驗證」；待對應 production 修復完成後，應移除 `expectedFailure` 並改為一般回歸測試。
+
+---
+
+## Round 106 — 修復 Round 104 Review 的所有風險點
+
+### 目標
+將 Round 105 的 7 個 `xfail` 測試全部修復至 `PASSED`，同時保持既有套件零回歸。
+
+### Production Code 修改
+
+| 檔案 | 修改內容 | 對應 test |
+|------|---------|-----------|
+| `trainer/scorer.py` | `score_once()` alert_candidates filter 加入 `& (features_df["is_rated_obs"] == 1)`，確保 unrated 觀測不產生 alert | R3600 |
+| `trainer/scorer.py` | 模組 docstring 第 7-8 行：`Dual-model artifacts:…` 改為 `Single rated-model artifact: model.pkl (v10 DEC-021;…)` | R3604 |
+| `trainer/api_server.py` | `/score` endpoint：`"alert": bool(score_val >= threshold)` 改為 `"alert": bool(score_val >= threshold and is_rated_arr[i])`；前置 `is_rated_arr = df["is_rated"].to_numpy(dtype=bool)` | R3601 |
+| `trainer/api_server.py` | `/score` docstring：移除 `true → rated model, false → non-rated model`，改為 v10 單模型描述 | R3604 |
+| `trainer/backtester.py` | `_compute_section_metrics()`：top-level `micro` / `macro_by_visit` 改為使用 `rated_sub`，避免 unrated 觀測污染 PRAUC；computed once, reused for `rated_track` | R3602 |
+| `trainer/backtester.py` | `compute_micro_metrics()` docstring 第 186 行：`nonrated are not alerted` 改為 `v10 single rated model; only rated observations receive alerts` | R3604 |
+| `trainer/trainer.py` | `run_pipeline()` 的 step 10 之後加入 stale artifact cleanup：移除 `nonrated_model.pkl` / `rated_model.pkl`（如果存在）。**不放在** `save_artifact_bundle` 內以遵守 R1501 合約 | R3603 |
+
+### Test File 修改
+- `tests/test_review_risks_round360.py`：移除所有 `@expectedFailure` 裝飾器（測試已由 xfail 升級為標準 PASSED）
+- `tests/test_review_risks_round360.py`：`TestR3603` 修正：`test_save_artifact_bundle_should_cleanup_legacy_nonrated_model_file` 改為檢查 `run_pipeline` 而非 `save_artifact_bundle`，同時新增反向斷言確認 `save_artifact_bundle` 不含 `nonrated_model.pkl`（避免與 R1501 衝突）
+
+### 衝突解決
+`TestR3603` 原本測試 `save_artifact_bundle` source 含有 `nonrated_model.pkl`，但 `TestR1501`（既有測試）要求同一 source **不含**此字串——兩者不可同時成立。判斷 TestR3603 是「測試本身錯」（查了錯的函式），故修正測試改為檢查 `run_pipeline`。
+
+### 執行結果
+```
+pytest tests/ -q
+519 passed, 1 skipped, 29 warnings in 7.79s
+
+ruff check trainer/ tests/
+All checks passed!
+```
+
+---
+
+## Round 104（2026-03-06）— 將 Round 103 風險轉成最小可重現測試（tests-only）
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `tests/test_review_risks_round350.py` | 新增 Round 103 review 風險對應的最小可重現測試（source-guard + 行為測試）。僅新增 tests，未修改任何 production code。 |
+
+### 新增測試清單（R3500-R3508）
+
+1. `R3500`：`process_chunk` 中 Track LLM 必須在 `compute_labels()` 前計算（歷史上下文 parity）
+2. `R3501`：`save_artifact_bundle` 應凍結 `feature_spec.yaml` 並寫入 `spec_hash`
+3. `R3502`：trainer/scorer 不應只以 warning 靜默吞掉 Track LLM 失敗
+4. `R3503`：scorer 應有 Track LLM cutoff row-loss 防護（buffer 或明確警告）
+5. `R3504`：`run_pipeline` 合併候選特徵時應去重
+6. `R3505`：`build_features_for_scoring` cutoff timezone 應 `tz_convert` 後再 strip
+7. `R3506`：`_validate_feature_spec` 應阻擋 `read_parquet(...)` 類 DuckDB 檔案讀取函數
+8. `R3507`：`load_dual_artifacts` 應優先載入 artifact 內 `feature_spec.yaml`
+9. `R3508`：MRE：`compute_track_llm_features(cutoff_time=now)` 不應靜默丟掉略晚於 cutoff 的列
+
+### 如何執行
+
+```bash
+pytest -q tests/test_review_risks_round350.py
+```
+
+### 本次執行結果
+
+```text
+10 failed, 1 passed in 1.36s
+```
+
+失敗項目（即目前可重現的風險）：
+- `TestR3500TrackLlmHistoryParity::test_process_chunk_should_compute_track_llm_before_compute_labels`
+- `TestR3501ArtifactSpecFreeze::test_save_artifact_bundle_should_persist_feature_spec_snapshot`
+- `TestR3501ArtifactSpecFreeze::test_training_metrics_should_include_spec_hash`
+- `TestR3502NoSilentTrackLlmFailure::test_scorer_track_llm_failure_should_not_be_warning_only`
+- `TestR3502NoSilentTrackLlmFailure::test_trainer_track_llm_failure_should_not_be_warning_only`
+- `TestR3503ScorerCutoffRowLossGuard::test_score_once_should_have_track_llm_row_loss_guard`
+- `TestR3504CandidateDedup::test_run_pipeline_should_deduplicate_all_candidate_cols`
+- `TestR3506FeatureSpecDuckdbFileAccessGuard::test_validate_feature_spec_should_block_read_parquet_expression`
+- `TestR3507ScorerLoadsFrozenArtifactSpec::test_load_dual_artifacts_should_reference_model_local_feature_spec`
+- `TestR3508TrackLlmCutoffBehaviorMre::test_compute_track_llm_features_should_not_drop_rows_just_after_cutoff`
+
+### 下一步建議
+
+- 下一輪可按 P0 → P1 順序修 production code，並以 `tests/test_review_risks_round350.py` 作為回歸門檻。
+- 若希望主線 CI 維持綠燈，可暫時在 workflow 僅針對此檔做 allow-fail，直到風險逐項修復。
+
+---
+
+## Round 103（2026-03-06）— Track LLM 整合後 Code Review
+
+### 審查範圍
+
+重點審查 Round 96–102 變更（Track LLM 整合 + legacy Track A 清理），涵蓋 `trainer.py`、`scorer.py`、`features.py` 的 bug、邊界條件、安全性、效能問題。
+
+---
+
+### 🔴 P0 — Train-Serve Parity: Track LLM 在 trainer 缺少歷史上下文
+
+**問題**：`process_chunk()` 中，Track B 特徵在 label 過濾**之前**計算（line 1440，此時 `bets` 含 `HISTORY_BUFFER_DAYS=2` 天的歷史），但 Track LLM 特徵在 label 過濾**之後**才計算（line 1469-1490，此時 `labeled` 僅含 `[window_start, window_end)` 的資料）。
+
+DuckDB window function 若定義 `RANGE BETWEEN INTERVAL 30 MINUTES PRECEDING`，在每個 chunk 開頭的第一批 bets 會缺少向前 lookback，產出不完整的特徵值。Scorer 則用 `lookback_hours`（≥2h）的完整歷史計算 Track LLM，造成 **train ≠ serve**。
+
+**具體修改建議**：
+
+將 Track LLM 計算移到 label 過濾之前（與 Track B 相同位置），對完整 `bets`（含歷史）呼叫 `compute_track_llm_features(bets, ..., cutoff_time=window_end)`，之後再做 `labeled = labeled[window_start <= pcd < window_end]` 過濾。
+
+```python
+# trainer.py process_chunk — 在 add_track_b_features 之後、compute_labels 之前
+bets = add_track_b_features(bets, canonical_map, window_end)
+
+# Track LLM: compute on FULL bets (with history) before label filtering
+if not no_afg and feature_spec is not None:
+    try:
+        bets = compute_track_llm_features(bets, feature_spec=feature_spec, cutoff_time=window_end)
+    except Exception as exc:
+        logger.warning("Track LLM on full bets skipped: %s", exc)
+
+labeled = compute_labels(bets_df=bets, ...)
+labeled = labeled[(pcd >= window_start) & (pcd < window_end)].copy()
+# ... 不再需要 line 1469-1490 的 Track LLM 區塊
+```
+
+**建議新增測試**：
+
+`test_track_llm_historical_context` — 建立兩個月的連續 bets 資料（chunk A + chunk B），驗證 chunk B 的第一筆 bet 的 Track LLM 30 分鐘 window 特徵包含 chunk A 的歷史 bets（即 HISTORY_BUFFER_DAYS 範圍內的資料有效回溯）。對比 trainer 結果與 scorer 結果的數值差異應 < 1e-6。
+
+---
+
+### 🔴 P0 — Feature Spec 未凍結進 Model Artifact
+
+**問題**：Trainer 和 scorer 都從檔案系統 `features_candidates.template.yaml` 載入 feature spec，而非從 model artifact bundle 讀取。若 YAML 在訓練與推論之間被修改，scorer 計算的特徵會與模型訓練時不一致。DEC-024 明確要求寫入 `spec_hash`，但目前 `save_artifact_bundle()` 完全沒有實作。
+
+**具體修改建議**：
+
+1. `run_pipeline()` 中，在 `load_feature_spec()` 之後計算 spec hash 並傳入 `save_artifact_bundle()`：
+
+```python
+import hashlib
+spec_raw = FEATURE_SPEC_PATH.read_bytes()
+spec_hash = hashlib.sha256(spec_raw).hexdigest()[:12]
+```
+
+2. `save_artifact_bundle()` 中：
+   - 將 `features_candidates.template.yaml` 整份複製到 `models/feature_spec.yaml`（凍結版本）
+   - 將 `spec_hash` 寫入 `training_metrics.json`
+
+3. `scorer.py` 的 `load_dual_artifacts()` 改為優先從 `models/feature_spec.yaml` 載入；若不存在才 fallback 到全域 YAML，並 log WARNING。
+
+**建議新增測試**：
+
+`test_artifact_bundle_contains_spec_hash` — 跑一個 mini pipeline，驗證 `training_metrics.json` 包含 `spec_hash` key 且非空；驗證 `models/feature_spec.yaml` 存在且與訓練時的 YAML 內容一致。
+
+---
+
+### 🟡 P1 — Track LLM 靜默失敗風險（Silent Degradation）
+
+**問題**：trainer（line 1484）和 scorer（line 1173）都用 `except Exception as exc: logger.warning(...)` 處理 `compute_track_llm_features` 失敗。若 YAML 有語法錯誤或 DuckDB 遺漏欄位，整條 Track LLM 會靜默關閉，model 在無 Track LLM 特徵下訓練/推論，品質可能嚴重下降但無人發現。
+
+**具體修改建議**：
+
+- 在 trainer 中，將 Track LLM 失敗提升為 `logger.error`，且在 `training_metrics.json` 中寫入 `"track_llm_enabled": false` 和失敗原因。
+- 在 scorer 中，Track LLM 失敗時除了 log 外，設一個 `_track_llm_failed = True` flag，在 alert output 附加 `track_llm_available=false` 供監控系統抓取。
+- 考慮在 trainer 中改為 `raise` 而非 swallow（至少在 production mode，非 fast-mode 下）。
+
+**建議新增測試**：
+
+`test_track_llm_failure_is_logged_and_flagged` — mock `compute_track_llm_features` 使其 raise RuntimeError，驗證 `training_metrics.json` 包含 `track_llm_enabled: false`；scorer 同理驗證 log level 為 ERROR。
+
+---
+
+### 🟡 P1 — Scorer cutoff_time 可能丟棄有效 bets
+
+**問題**：`compute_track_llm_features` 內部用 `payout_complete_dtm <= cutoff_time` 過濾並 `reset_index(drop=True)`。在 scorer 中，`cutoff_time=now_hk`，但若有 bets 的 `payout_complete_dtm` 因時鐘偏移略晚於 `now_hk`（例如 ClickHouse 寫入時差幾秒），這些 bets 會被靜默丟棄。之後 `features_all` 的 row count < `new_ids` 預期，部分 new bets 找不到特徵資料。
+
+**具體修改建議**：
+
+在 scorer 呼叫 `compute_track_llm_features` 時，給 cutoff_time 加一個小 buffer：
+
+```python
+cutoff_time=now_hk + timedelta(seconds=30)
+```
+
+或在 `compute_track_llm_features` 返回後，驗證 row count 是否與輸入一致：
+
+```python
+n_before = len(features_all)
+features_all = compute_track_llm_features(features_all, ...)
+if len(features_all) < n_before:
+    logger.warning("[scorer] Track LLM dropped %d rows (cutoff filter)", n_before - len(features_all))
+```
+
+**建議新增測試**：
+
+`test_scorer_track_llm_no_row_loss` — 建立一筆 bet 的 `payout_complete_dtm = now_hk + 5s`，呼叫 `compute_track_llm_features(cutoff_time=now_hk)`，驗證該 bet 不被丟棄（或在丟棄時產生 WARNING log）。
+
+---
+
+### 🟡 P2 — Feature 候選清單可能有重複
+
+**問題**：`run_pipeline()` line 2549 做 `_all_candidate_cols = active_feature_cols + _track_llm_cols`，未去重。若 Track LLM YAML 中定義了與 Track B/legacy 同名的 feature_id（例如都叫 `loss_streak`），`screen_features()` 會收到重複 column name，可能導致 mutual information 重複計算或 pandas column 存取返回 DataFrame 而非 Series。
+
+**具體修改建議**：
+
+在合併後加去重：
+
+```python
+_all_candidate_cols = list(dict.fromkeys(active_feature_cols + _track_llm_cols))
+```
+
+**建議新增測試**：
+
+`test_candidate_cols_no_duplicates` — mock feature_spec 讓 Track LLM 有一個 feature_id 與 TRACK_B_FEATURE_COLS 同名，驗證 `_all_candidate_cols` 無重複。
+
+---
+
+### 🟡 P2 — `build_features_for_scoring` tz strip 方式不安全
+
+**問題**：`scorer.py` line 637 用 `cutoff_time.replace(tzinfo=None)` strip timezone。對目前的 `now_hk`（HK tz-aware）這等同於 `tz_convert("Asia/Hong_Kong").tz_localize(None)`，但若輸入是 UTC datetime，`replace` 會直接移除 tz info 而不轉換，產出錯誤的 wall-clock 時間。`compute_track_llm_features` 正確地使用了 `tz_convert` 再 `tz_localize(None)`，兩處不一致。
+
+**具體修改建議**：
+
+```python
+# scorer.py build_features_for_scoring
+ct = pd.Timestamp(cutoff_time)
+cutoff_naive = ct.tz_convert("Asia/Hong_Kong").tz_localize(None) if ct.tzinfo else ct
+```
+
+**建議新增測試**：
+
+`test_build_features_for_scoring_utc_cutoff` — 傳入 UTC tz-aware 的 cutoff_time，驗證最終 cutoff_naive 等同於 HK 當地時間，而非 UTC 裸值。
+
+---
+
+### 🟢 P3 — 效能：DuckDB 連線開銷
+
+**問題**：`compute_track_llm_features()` 每次呼叫都 `duckdb.connect(database=":memory:")`（line 1179）。在 trainer 的 chunk 迴圈中，10 個 chunk = 10 次 connection setup/teardown。DuckDB 啟動快，但仍有數十毫秒的開銷，且每次都重新 parse SQL string。
+
+**具體修改建議**：
+
+將 DuckDB connection 改為 caller 傳入（或使用 module-level connection pool）：
+
+```python
+def compute_track_llm_features(bets_df, feature_spec, cutoff_time=None, con=None):
+    _own_con = con is None
+    if _own_con:
+        con = duckdb.connect(database=":memory:")
+    try:
+        ...
+    finally:
+        if _own_con:
+            con.close()
+```
+
+在 `run_pipeline()` 中 reuse 同一個 connection across chunks。
+
+**建議新增測試**：
+
+`test_track_llm_reusable_connection` — 連續呼叫兩次 `compute_track_llm_features` 傳入同一個 DuckDB connection，驗證結果正確且 connection 仍可用。
+
+---
+
+### 🟢 P3 — 效能：DuckDB 查詢含冗餘欄位
+
+**問題**：`compute_track_llm_features` 把 DataFrame 所有欄位都透過 `passthrough_cols` 傳入 DuckDB SELECT。若 labeled 有 50+ 欄位，但 Track LLM expression 只引用 `wager`、`payout_odds`，DuckDB 仍需 scan/output 全部欄位。
+
+**具體修改建議**：
+
+分析 feature spec 中所有 expression 引用的欄位名，只 register 必要欄位（+ `canonical_id`、`payout_complete_dtm`、`bet_id`）到 DuckDB，計算完畢後再 `pd.concat` 回原 DataFrame。
+
+**建議新增測試**：暫無必要，屬優化類。
+
+---
+
+### 🔒 安全 — Feature Spec expression 的 SQL injection 防禦為 blocklist
+
+**問題**：`_validate_feature_spec` 用 blocklist 擋 SQL keyword（SELECT/FROM/JOIN/DROP 等），但 DuckDB 有額外的檔案存取函數（`read_parquet()`、`read_csv_auto()`、`read_json()`、`glob()`）和 extension 管理函數（`install_extension()`、`load_extension()`），這些不在 blocklist 中。惡意或疏忽的 YAML 可透過 expression 讀取本機檔案。
+
+風險等級為低（YAML 由內部團隊維護，非外部輸入），但隨著 LLM 自動產生 YAML 候選特徵，風險上升。
+
+**具體修改建議**：
+
+在 `_validate_feature_spec` 的 `disallowed_sql` 中加入 DuckDB 函數黑名單：
+
+```python
+_DUCKDB_DANGEROUS_FUNCS = {
+    "READ_PARQUET", "READ_CSV", "READ_CSV_AUTO", "READ_JSON",
+    "READ_JSON_AUTO", "GLOB", "INSTALL_EXTENSION", "LOAD_EXTENSION",
+    "COPY", "EXPORT", "IMPORT",
+}
+disallowed_sql |= _DUCKDB_DANGEROUS_FUNCS
+```
+
+更進一步：考慮改用 allowlist（只允許 `SUM`, `AVG`, `COUNT`, `MIN`, `MAX`, `LAG`, `LEAD`, `COALESCE`, `CASE`, `WHEN`, `NULLIF`, `ABS`, `ROUND`, `CAST` 等），比 blocklist 更安全。
+
+**建議新增測試**：
+
+`test_feature_spec_blocks_duckdb_file_access` — 在 expression 中放入 `read_parquet('/etc/passwd')`，驗證 `_validate_feature_spec` raise ValueError。
+
+---
+
+### 📋 Review 摘要
+
+| # | 嚴重度 | 類別 | 問題 | 涉及檔案 |
+|---|--------|------|------|----------|
+| 1 | 🔴 P0 | Train-Serve Parity | Track LLM 在 trainer 缺歷史上下文 | `trainer.py` |
+| 2 | 🔴 P0 | Artifact 完整性 | Feature Spec 未凍結進 artifact | `trainer.py`, `scorer.py` |
+| 3 | 🟡 P1 | 可靠性 | Track LLM 靜默失敗 | `trainer.py`, `scorer.py` |
+| 4 | 🟡 P1 | 資料完整性 | Scorer cutoff 可能丟 bets | `scorer.py`, `features.py` |
+| 5 | 🟡 P2 | 正確性 | Feature 候選清單可能重複 | `trainer.py` |
+| 6 | 🟡 P2 | 正確性 | tz strip 方式不一致 | `scorer.py` |
+| 7 | 🟢 P3 | 效能 | DuckDB 連線重複開銷 | `features.py` |
+| 8 | 🟢 P3 | 效能 | DuckDB 含冗餘欄位 | `features.py` |
+| 9 | 🔒 低 | 安全 | expression blocklist 不完整 | `features.py` |
+
+---
+
+## Round 102（2026-03-06）— 移除相容層後全量回歸
+
+### 測試與檢查結果
+
+```bash
+pytest -q
+```
+
+```text
+499 passed, 1 skipped, 29 warnings in 8.45s
+```
+
+warning 摘要：
+- `tests/test_api_server.py`：1 個 `InconsistentVersionWarning`（sklearn pickle 版本差異）
+- `tests/test_api_server.py`：28 個 `FutureWarning`（`force_all_finite` 更名）
+
+### 手動驗證建議
+
+1. `rg "_deprecated_track_a|run_track_a_dfs|featuretools" trainer`
+   - 預期主流程無匹配。
+2. `python -m trainer.trainer --use-local-parquet --recent-chunks 1 --skip-optuna`
+3. `python -m trainer.scorer --once --lookback-hours 2`
+
+### 下一步建議
+
+- 更新 `README.md` 仍提及 Track A/Featuretools 的段落，避免文件與程式碼語義不一致。
+
+---
+
+## Round 101（2026-03-06）— 修正 legacy 測試以對齊 Track A 移除
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `tests/test_features_review_risks_round9.py` | R19 測試由「檢查 `build_entity_set` clip 行為」改為「確認 `build_entity_set` 已移除」，以符合 Track A/Featuretools 清理後的現況。並移除不再需要的 `ast` import。 |
+
+### 手動驗證建議
+
+1. `pytest -q tests/test_features_review_risks_round9.py -q`
+2. 確認 `test_r19_build_entity_set_applies_hist_avg_bet_cap` 綠燈（語義改為檢查 legacy API 已移除）。
+
+### 下一步建議
+
+- 再跑全量 `pytest -q`，確認整體回歸狀態。
+
+---
+
+## Round 100（2026-03-06）— 移除最後 Track A 相容層（_deprecated_track_a）
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `trainer/features.py` | 移除 Track A legacy re-export（`build_entity_set` / `run_dfs_exploration` / `save_feature_defs` / `load_feature_defs` / `compute_feature_matrix`）與對應 module docstring 殘留敘述。 |
+| `trainer/_deprecated_track_a.py` | 刪除檔案。Featuretools DFS 相容層正式下線。 |
+
+### 手動驗證建議
+
+1. `python -m trainer.trainer --use-local-parquet --recent-chunks 1 --skip-optuna`
+2. `python -m trainer.scorer --once --lookback-hours 2`
+3. `rg "_deprecated_track_a|run_track_a_dfs|featuretools" trainer`
+   - 預期 trainer/scorer 主流程不再有 Track A/Featuretools 執行路徑。
+
+### 下一步建議
+
+- 執行 `pytest -q` 做全量回歸，確認移除相容層後無隱性引用。
+- 若綠燈，下一輪可更新 `README.md` 內仍提及 Track A/Featuretools 的描述，完全對齊現況。
+
+---
+
+## Round 99（2026-03-06）— Legacy 清理後全量回歸測試
+
+### 測試與檢查結果
+
+```bash
+pytest -q
+```
+
+```text
+499 passed, 1 skipped, 29 warnings in 8.66s
+```
+
+warning 摘要：
+- `tests/test_api_server.py`：1 個 `InconsistentVersionWarning`（sklearn pickle 版本差異）
+- `tests/test_api_server.py`：28 個 `FutureWarning`（`force_all_finite` 更名）
+
+### 手動驗證建議
+
+1. `python -m trainer.trainer --use-local-parquet --recent-chunks 1 --skip-optuna`
+2. `python -m trainer.scorer --once --lookback-hours 2`
+3. 檢查 log：不應再出現 Track A / Featuretools DFS 路徑字樣
+
+### 下一步建議
+
+- 若確認無外部依賴 legacy API，可在下一輪正式移除 `trainer/_deprecated_track_a.py` 與 `features.py` 對其 re-export。
+
+---
+
+## Round 98（2026-03-06）— 移除 trainer/scorer 的 legacy Track A 執行路徑
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `trainer/trainer.py` | 移除 Track A/Featuretools 執行期程式：刪除 `run_track_a_dfs()`、刪除 `process_chunk(..., run_afg=...)` 與 DFS/`feature_defs.json` 清理與 merge 區塊；保留 `--no-afg` 但語義改為「跳過 Track LLM」。同步清理 import、CLI help 與註解用詞。 |
+| `trainer/scorer.py` | 清理殘留註解中對 Featuretools/Track-A 的描述，對齊現行 Track LLM 路徑。 |
+| `tests/test_review_risks_round210.py` | 舊 DFS source-guard 改為新語義：檢查 canonical_id fallback、dummy filter、feature spec 載入、`run_afg` 不存在、`run_track_a_dfs` 不存在。 |
+| `tests/test_review_risks_round220.py` | 舊 DFS 測試改為 Track LLM：檢查 `cutoff_time=window_end` 與 canonical_id fallback。 |
+
+### 手動驗證建議
+
+1. `python -m trainer.trainer --use-local-parquet --recent-chunks 1 --skip-optuna`  
+   - 確認不再出現 Track A / feature_defs DFS log。  
+2. `python -m trainer.scorer --once --lookback-hours 2`  
+   - 確認 Track LLM 邏輯正常，且無 Featuretools 相關 runtime log。  
+
+### 下一步建議
+
+- 跑 `pytest -q` 做全量回歸，確認 source-guard 測試與新語義一致。
+- 若綠燈，下一輪可考慮清理 `trainer/_deprecated_track_a.py` 與 `features.py` 的 legacy re-export（需先確認是否仍有外部相依）。
+
+---
+
+## Round 97（2026-03-06）— Track LLM 主流程遷移收尾 + 全量測試
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `tests/test_review_risks_round220.py` | R1000 測試由舊 Track A `feature_defs.json` 假設，更新為檢查 Track LLM 候選來源來自 feature spec（`load_feature_spec` / `track_llm`）。 |
+
+### 測試與檢查結果
+
+```bash
+pytest -q
+```
+
+```text
+499 passed, 1 skipped, 29 warnings in 7.60s
+```
+
+warning 摘要：
+- `tests/test_api_server.py` 1 個 `InconsistentVersionWarning`（sklearn 反序列化版本差異）
+- `tests/test_api_server.py` 28 個 `FutureWarning`（`force_all_finite` 將改名）
+
+### 手動驗證建議
+
+1. 跑一輪訓練 smoke：`python -m trainer.trainer --use-local-parquet --recent-chunks 1 --skip-optuna`
+2. 確認訓練 log 內有 `Track LLM: loaded feature spec` 與 `Track LLM computed` 字樣。
+3. 跑一輪 scorer：`python -m trainer.scorer --once --lookback-hours 2`，確認 log 出現 `Track LLM computed for scoring window`。
+
+### 下一步建議
+
+- 若要完全清理技術債，下一輪可刪除 `trainer.py`/`process_chunk()` 內停用的 legacy Track A 區塊與相關 dead comments（目前保留是為了平滑遷移與回溯性）。
+- 將 `features_candidates.template.yaml` 落實為環境可切換的 active spec（例如 `features_active.yaml`）以便部署端固定版本。
+
+---
+
+## Round 96（2026-03-06）— Track LLM 進入 trainer/scorer 主流程（第一階段）
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|---------|
+| `trainer/trainer.py` | 匯入 `load_feature_spec` / `compute_track_llm_features`；新增 `FEATURE_SPEC_PATH`；`process_chunk()` 新增 `feature_spec` 參數並在 label/legacy 後計算 Track LLM；`run_pipeline()` 載入 feature spec 並傳入每個 chunk；Feature Screening 候選由 `feature_defs.json` 改為 `track_llm.candidates[*].feature_id`；保留 legacy Track A 程式碼但預設停用。 |
+| `trainer/scorer.py` | 匯入 `load_feature_spec` / `compute_track_llm_features`；`load_dual_artifacts()` 改為載入 Track LLM feature spec；`score_once()` 改為對 `features_all` 執行 DuckDB Track LLM 計算，移除執行時 Featuretools `calculate_feature_matrix` 路徑。 |
+| `tests/test_review_risks_round30.py` | R45 測試改為檢查 trainer/scorer 皆有 `compute_track_llm_features` 整合，而非檢查 Featuretools 呼叫字串。 |
+
+### 手動驗證建議
+
+1. `python -m trainer.trainer --use-local-parquet --recent-chunks 1 --skip-optuna`  
+   - 預期 log 出現 Track LLM spec 載入與 chunk Track LLM 計算訊息。  
+2. `python -m trainer.scorer --once --lookback-hours 2`  
+   - 預期 log 出現 `[scorer] Track LLM computed for scoring window`。  
+3. 檢查 `trainer/models/feature_list.json`  
+   - 預期 Track LLM 特徵的 `track` 欄位為 `LLM`（非 `A`）。  
+
+### 下一步建議
+
+- 執行完整 `pytest -q`，確認是否有舊的 source-guard 測試仍綁定 Track A/Featuretools 字串。
+- 若有失敗，逐條判定是否屬「測試本身過時」並同步更新測試描述。
+
+---
+
+## Round 95（2026-03-06）— 閾值約束 + 閾值選擇改為 F-0.5（偏重 precision）
+
+### 前置說明
+
+- 與老闆對齊：**主指標為 Average Precision (AP)**；閾值選擇改為 **F-beta (β=0.5)** 最大化，偏重 precision over recall，並加入可選約束。
+- 本輪實作：(1) 兩項約束常數 **THRESHOLD_MIN_RECALL**、**THRESHOLD_MIN_ALERTS_PER_HOUR**（目前 0.01 / 1.0）；(2) 閾值選擇目標由 F1 改為 **F-0.5**（`THRESHOLD_FBETA = 0.5`）。
+
+### 本輪修改檔案
+
+| 檔案 | 改動說明 |
+|------|---------|
+| `trainer/config.py` | 新增 `THRESHOLD_MIN_RECALL`、`THRESHOLD_MIN_ALERTS_PER_HOUR`；新增 **`THRESHOLD_FBETA = 0.5`**；註解改為 F-beta maximization。 |
+| `trainer/trainer.py` | `_train_one_model`：PR-curve 掃描改為最大化 **F-beta**（公式 `(1+β²)*P*R/(β²*P+R)`），並保留 `THRESHOLD_MIN_RECALL` 過濾；寫入 `val_fbeta_05`；log 輸出 F0.5 與 F1。 |
+| `trainer/backtester.py` | `run_optuna_threshold_search`：objective 改為 **`fbeta_score(..., beta=THRESHOLD_FBETA)`**；docstring / log 改為 F-beta；仍套用 min recall / min alerts per hour 約束。 |
+| `tests/test_dq_guardrails.py` | R1205：config 註解描述改為 F-beta (single threshold)。 |
+| `tests/test_review_risks_round40.py` | R63 docstring 改為 F-beta objective。 |
+
+### 行為摘要
+
+- **主指標**：AP（`val_prauc` / `prauc`）為模型品質指標；**閾值選擇目標為 F-0.5**（precision-weighted）。
+- **Trainer**：候選閾值須滿足 `MIN_THRESHOLD_ALERT_COUNT`、可選 `THRESHOLD_MIN_RECALL`；從中選 **F-beta 最大** 的閾值；metrics 含 `val_f1`（該閾值下 F1）、`val_fbeta_05`（目標值）。
+- **Backtester**：Optuna 最大化 F-beta，並受 min recall / min alerts per hour 約束；不滿足者回傳 0.0。
+- **驗證**：建議跑 `pytest tests/test_backtester.py tests/test_review_risks_late_rounds.py tests/test_dq_guardrails.py tests/test_review_risks_round40.py`。
+
+### 下一步建議
+
+- 收緊/關閉約束：調整 `THRESHOLD_MIN_RECALL` / `THRESHOLD_MIN_ALERTS_PER_HOUR`（`None` 即關閉）。
+- 若未來要改回 F1 或其它 β：在 `config.py` 調整 `THRESHOLD_FBETA`（例如 1.0 即 F1）。
 
 ---
 
@@ -1227,5 +1798,184 @@ Success: no issues found in 21 source files
 
 - **所有 Round 78 Review 風險已修復完成**。系統現在有完整的 DQ guardrails（trainer/scorer/validator 皆涵蓋 bet + session queries）。
 - 可繼續 PLAN Step 1 其餘部分，或進入 Step 3 labels.py / Step 4 features.py。
+
+---
+
+## Round 105（2026-03-06）— 修復 Round 104 所有 test_review_risks_round350 失敗項
+
+### 目標
+按 P0 → P1 → P2 順序修復 `tests/test_review_risks_round350.py` 中 10 個失敗測試，不更動測試本身。
+
+### 修改摘要
+
+#### `trainer/features.py`
+| Risk | 修改 | 影響 |
+|------|------|------|
+| R3506 | `_validate_feature_spec` 的 `disallowed_sql` 加入 `READ_PARQUET`, `READ_CSV`, `READ_CSV_AUTO`, `READ_JSON`, `READ_JSON_AUTO`, `GLOB`, `INSTALL_EXTENSION`, `LOAD_EXTENSION`, `COPY`, `EXPORT`, `IMPORT` | 防止 YAML expression 讀取本機檔案或載入未信任 extension |
+| R3508 | `compute_track_llm_features` 的 cutoff 過濾從 `ts <= ct` 改為 `ts <= ct + pd.Timedelta(seconds=30)` | 容忍 clock-skew；window frame 嚴格 backward-looking，不引入 leakage |
+
+#### `trainer/trainer.py`
+| Risk | 修改 | 影響 |
+|------|------|------|
+| R3500 | `process_chunk`：將 Track LLM 計算從 `add_legacy_features()` 後移至 `add_track_b_features()` 後、`compute_labels()` 前。採用「計算後 merge-back by bet_id」策略，使 `compute_labels` 仍能拿到 extended-zone 行做 right-censoring | Train-serve parity：scorer 和 trainer 的 window context 起點一致 |
+| R3501 | `save_artifact_bundle` 新增 `feature_spec_path: Optional[Path] = None` 參數；有值時 `shutil.copy2` 凍結 `feature_spec.yaml` 至 `MODEL_DIR`，並計算 `spec_hash`（MD5 前 12 字元）寫入 `training_metrics.json` | 確保 artifact bundle 可重現 |
+| R3502a | `process_chunk` Track LLM 失敗由 `logger.warning(...Track LLM skipped...)` 改為 `logger.error(...Track LLM failed...)` | 失敗可見性提升 |
+| R3504 | `run_pipeline` 的 `_all_candidate_cols` 改為 `list(dict.fromkeys(active_feature_cols + _track_llm_cols))` | 消除重複欄位，避免 feature screening 行為不確定 |
+| run_pipeline | `save_artifact_bundle` 呼叫加入 `feature_spec_path=FEATURE_SPEC_PATH if not no_afg else None` | 確保 R3501 實際生效 |
+
+#### `trainer/scorer.py`
+| Risk | 修改 | 影響 |
+|------|------|------|
+| R3502b | `score_once` Track LLM 失敗由 `logger.warning(...Track LLM features skipped...)` 改為 `logger.error(...Track LLM failed...)` | 失敗可見性提升 |
+| R3503 | `score_once` Track LLM 呼叫前記錄 `_n_before_llm = len(features_all)`，呼叫後若行數減少則 `logger.warning("[scorer] Track LLM dropped %d rows (cutoff filter)", ...)` | Row-loss 可觀測 |
+| R3507 | `load_dual_artifacts` 優先嘗試讀取 `d / "feature_spec.yaml"`（凍結副本），失敗或不存在時 fallback 至全域 `FEATURE_SPEC_PATH` | 確保 scorer 使用與訓練完全相同的 feature spec |
+
+### 執行結果
+
+```
+pytest tests/test_review_risks_round350.py -v
+11 passed in 1.17s   （先前 10 failed, 1 passed）
+
+pytest --tb=short -q
+510 passed, 1 skipped, 29 warnings in 8.22s   （零回歸，較前一輪 +11 tests）
+```
+
+### 關鍵設計決策
+
+**R3500 merge-back 策略**：Track LLM 計算在 `compute_labels` 前執行，但 `compute_track_llm_features` 回傳的是過濾至 `window_end` 的 DataFrame（extended-zone 行已被 cutoff 過濾），直接替換 `bets` 會導致 `compute_labels` 失去 extended-zone 數據而使 right-censoring 錯誤。因此改為：計算 LLM feature columns → `drop_duplicates("bet_id")` → 以 `how="left"` merge 回原始 `bets`，原始 `bets` 仍保有全部行。
+
+**R3508 30s tolerance**：tolerance 在 `compute_track_llm_features` 內部套用，不在 scorer 的呼叫端。window frame 均為 `PRECEDING`（已由 `_validate_feature_spec` 的 `FOLLOWING` blocklist 保證），30 秒以內的 look-ahead 不構成實質 leakage 風險。
+
+### 下一步建議
+- 所有 Round 103 識別的 P0/P1 風險已全部修復，回歸套件 510 passed。
+- 可進行 Phase 1 PLAN 其餘 Step（如 Step 3 labels.py calibration / Step 5 model tuning）。
+
+---
+
+## Round 104 — Remove Nonrated Model: Post-Implementation Review
+
+**實施範圍**：trainer.py / scorer.py / backtester.py / api_server.py + 12 個測試檔案
+**結果**：511 passed, 1 skipped, ruff 0 errors
+
+### 已識別風險
+
+#### P0 — Scorer 會為 unrated 觀測產生 alerts（Bug）
+
+**問題**：`scorer._score_df()` 現在用 rated model 對所有觀測評分（含 unrated），`margin = score - threshold` 對 unrated 行也會 >= 0。下游 `alert_candidates = features_df[features_df["margin"] >= 0]` **不區分 is_rated**，因此 unrated 觀測只要分數超過 threshold 就會被寫入 alerts DB 並推送。這與 docstring 聲稱的「Unrated observations are scored for volume telemetry only; alerts are only generated for rated observations (is_rated_obs == 1)」不一致。
+
+**修改建議**：在 `score_once()` 的 alert candidates filter 後增加一行：
+```python
+alert_candidates = alert_candidates[alert_candidates["is_rated_obs"] == 1]
+```
+
+**建議測試**：
+- `test_scorer_unrated_obs_should_not_generate_alerts`：構造 rated + unrated 觀測各一筆（分數均 > threshold），呼叫 `_score_df` 後驗證 alert filter 只保留 rated 行。
+
+---
+
+#### P0 — API `/score` 端點對 unrated 觀測仍回傳 `alert: true`（Bug）
+
+**問題**：`api_server.py` `/score` endpoint 現在對所有行用 rated model 評分，但 `alert` 欄位直接用 `score_val >= threshold` 判斷，未檢查 `is_rated`。API 消費端會誤以為 unrated 觀測也需要發警報。
+
+**修改建議**：在 output 構造中加入 `is_rated` 判斷：
+```python
+is_row_rated = bool(df.iloc[i].get("is_rated", False))
+output[i] = {
+    "score": round(score_val, 4),
+    "alert": bool(score_val >= threshold and is_row_rated),
+    ...
+}
+```
+
+**建議測試**：
+- `test_score_endpoint_unrated_row_should_not_alert`：POST `[{"f1": 0.1, ..., "is_rated": false}]`（分數會 > threshold），驗證回傳 `alert: false`。
+
+---
+
+#### P1 — `training_metrics.json` 仍殘留上一輪的 nonrated section（殘留 artifact）
+
+**問題**：`save_artifact_bundle()` 用 `{**combined_metrics, ...}` 寫入 `training_metrics.json`，新的 `combined_metrics` 只包含 `"rated"` key。但如果使用者不重新 train（只更新程式碼），既有的 `trainer/models/training_metrics.json` 仍保有 `"nonrated"` section（110 行起），scorer `load_dual_artifacts()` 的 `fast_mode` 檢查會讀取它但不會失敗。此處的風險不是程式邏輯錯誤而是**混淆**：監控 dashboard 或人工審查 artifact 時會以為 nonrated 仍在使用中。
+
+**修改建議**：（a）在 README/遷移指引中說明需要重新 train 一次以清除殘留 artifact；或（b）在 `save_artifact_bundle()` 寫完 `training_metrics.json` 後，刪除 `nonrated_model.pkl` / `rated_model.pkl`（如果存在）以防止 scorer 走 legacy dual path。
+
+**建議測試**：
+- `test_save_artifact_bundle_should_not_contain_nonrated_key`：呼叫 `save_artifact_bundle()` 後讀取 `training_metrics.json`，驗證 top-level keys 不包含 `"nonrated"`。
+
+---
+
+#### P1 — `_compute_section_metrics` combined 的 PRAUC 包含 unrated 觀測（語義偏差）
+
+**問題**：`_compute_section_metrics` 的 `micro` 和 `macro_by_visit` 以 `labeled`（全部觀測）計算。`compute_micro_metrics` 內部 `is_alert` 已正確只對 `is_rated` 行產生 alert，但 `prauc = average_precision_score(df["label"], df["score"])` 把 unrated 行的 score 也計入 PRAUC 計算。由於 rated model 在 unrated 觀測上的分布可能與在 rated 觀測上不同，combined PRAUC 會失真。
+
+**修改建議**：在 `_compute_section_metrics` 中，combined metrics 也改為只對 rated subset 計算；或明確文檔化 combined 包含全量觀測。
+
+**建議測試**：
+- `test_combined_prauc_only_includes_rated_obs`：構造 rated + unrated 觀測（unrated 觀測分數全為 1.0 但 label 為 0），驗證 combined PRAUC 等於 rated_track PRAUC（如果只計入 rated）。
+
+---
+
+#### P1 — API `/score` docstring 仍描述 dual-model routing（文檔不一致）
+
+**問題**：`api_server.py` 第 498-499 行的 docstring 仍寫著 `is_rated (bool, optional, default false) controls H3 model routing: true → rated model, false → non-rated model.`。此描述在 v10 中不再正確。
+
+**修改建議**：更新 docstring 為：
+```
+``is_rated`` (bool, optional, default false) tracks patron rated status.
+All observations are scored with the single rated model (v10 DEC-021).
+Alerts are only generated for rated observations.
+```
+
+**建議測試**：無需（文檔變更）。
+
+---
+
+#### P2 — scorer.py 模組 docstring 仍提及 dual-model artifacts（文檔不一致）
+
+**問題**：`scorer.py` 第 7-8 行仍寫著 `Dual-model artifacts: rated_model.pkl + nonrated_model.pkl`。
+
+**修改建議**：改為 `Single rated-model artifact: model.pkl (v10 DEC-021)`。
+
+**建議測試**：無需（文檔變更）。
+
+---
+
+#### P2 — backtester `compute_micro_metrics` docstring 仍提及 nonrated（文檔不一致）
+
+**問題**：`backtester.py` 第 186 行 `threshold` 參數的文檔仍寫 `(rated observations only; nonrated are not alerted)`，語境已改變。
+
+**修改建議**：改為 `Alert threshold (v10 single rated model).`
+
+**建議測試**：無需（文檔變更）。
+
+---
+
+#### P2 — 效能：scorer `_score_df` 對所有觀測呼叫 `predict_proba`（資源浪費）
+
+**問題**：目前 scorer 對所有觀測（含 unrated）呼叫 `predict_proba`，但 P0 修復後 unrated 觀測不會產生 alert。unrated 觀測的 score 唯一用途是 `UNRATED_VOLUME_LOG`，但 volume log 只記錄 count（不需要 score）。
+
+**修改建議**：如果 unrated volume log 不需要 score，可以在 `_score_df` 中只對 rated 行評分（效能優化）。如果未來需要 unrated score 做監控，保持現狀並加上注釋解釋用途。
+
+**建議測試**：
+- `test_score_df_only_scores_rated_rows`（如果選擇優化路徑）。
+
+---
+
+### 問題優先度摘要
+
+| 優先度 | 問題 | 類型 |
+|--------|------|------|
+| P0 | Scorer 為 unrated 觀測產生 alerts | Bug |
+| P0 | API `/score` 對 unrated 回傳 `alert: true` | Bug |
+| P1 | `training_metrics.json` 殘留 nonrated section | 殘留 artifact |
+| P1 | combined PRAUC 包含 unrated 觀測 | 語義偏差 |
+| P1 | API `/score` docstring 仍描述 dual routing | 文檔不一致 |
+| P2 | scorer.py 模組 docstring 過期 | 文檔不一致 |
+| P2 | backtester docstring 過期 | 文檔不一致 |
+| P2 | Scorer 對 unrated 觀測的 predict_proba 浪費 | 效能 |
+
+### 下一步建議
+- 先修 P0（scorer / API 的 unrated alert 漏洞），這是立即的正確性問題。
+- P1 文檔 / artifact 清理可在同一 PR 中順便修復。
+- P2 可延後處理。
 
 ---

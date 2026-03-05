@@ -1,6 +1,6 @@
 """trainer/backtester.py — Phase 1 Update
 ==========================================
-Patron Walkaway — Single Rated Model Backtester (F1 Threshold, DEC-010 / v10)
+Patron Walkaway — Single Rated Model Backtester (F-beta threshold, DEC-010 / v10)
 
 Pipeline
 --------
@@ -39,7 +39,7 @@ import joblib
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import average_precision_score, f1_score, fbeta_score
+from sklearn.metrics import average_precision_score, fbeta_score
 from zoneinfo import ZoneInfo
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -57,22 +57,30 @@ try:
     import config as _cfg  # type: ignore[import]
 
     # G1_PRECISION_MIN / G1_ALERT_VOLUME_MIN_PER_HOUR intentionally not imported
-    # — deprecated per DEC-009/010. Backtester threshold objective is F1 only.
+    # — deprecated per DEC-009/010. Backtester threshold objective is F-beta.
     _G1_FBETA: float = getattr(_cfg, "G1_FBETA", 0.5)  # kept for fbeta reference metric only
+    THRESHOLD_FBETA: float = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
     LABEL_LOOKAHEAD_MIN = _cfg.LABEL_LOOKAHEAD_MIN
     HK_TZ_STR: str = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     BACKTEST_HOURS: int = getattr(_cfg, "BACKTEST_HOURS", 6)
     BACKTEST_OFFSET_HOURS: int = getattr(_cfg, "BACKTEST_OFFSET_HOURS", 1)
+    THRESHOLD_MIN_RECALL: Optional[float] = getattr(_cfg, "THRESHOLD_MIN_RECALL", None)
+    THRESHOLD_MIN_ALERTS_PER_HOUR: Optional[float] = getattr(
+        _cfg, "THRESHOLD_MIN_ALERTS_PER_HOUR", None
+    )
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
     _G1_FBETA = getattr(_cfg, "G1_FBETA", 0.5)
+    THRESHOLD_FBETA = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
     LABEL_LOOKAHEAD_MIN = _cfg.LABEL_LOOKAHEAD_MIN
     HK_TZ_STR = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     BACKTEST_HOURS = getattr(_cfg, "BACKTEST_HOURS", 6)
     BACKTEST_OFFSET_HOURS = getattr(_cfg, "BACKTEST_OFFSET_HOURS", 1)
+    THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", None)
+    THRESHOLD_MIN_ALERTS_PER_HOUR = getattr(_cfg, "THRESHOLD_MIN_ALERTS_PER_HOUR", None)
 
 try:
     from labels import compute_labels  # type: ignore[import]
@@ -115,11 +123,11 @@ BACKTEST_OUT.mkdir(exist_ok=True)
 # ---------------------------------------------------------------------------
 
 def load_dual_artifacts() -> Dict[str, Optional[dict]]:
-    """Load model bundle(s) for backtesting.
+    """Load model bundle for backtesting (v10 single rated model, DEC-021).
 
-    Priority (v10 single-model):
+    Priority:
     1. ``model.pkl``         — v10 single rated model
-    2. ``rated_model.pkl``   — legacy dual-model rated slot
+    2. ``rated_model.pkl``   — legacy rated slot
     3. ``walkaway_model.pkl``— legacy single-model fallback
     """
     def _try(path: Path) -> Optional[dict]:
@@ -127,28 +135,23 @@ def load_dual_artifacts() -> Dict[str, Optional[dict]]:
             return joblib.load(path)
         return None
 
-    # v10: prefer model.pkl (single rated model)
     single = _try(MODEL_DIR / "model.pkl")
     if single is not None:
-        return {"rated": single, "nonrated": None}
+        return {"rated": single}
 
     rated = _try(MODEL_DIR / "rated_model.pkl")
-    nonrated = _try(MODEL_DIR / "nonrated_model.pkl")
     legacy = _try(MODEL_DIR / "walkaway_model.pkl")
 
     if rated is None and legacy is not None:
         logger.warning("rated_model.pkl not found; using walkaway_model.pkl as fallback")
         rated = legacy
-    if nonrated is None and legacy is not None:
-        logger.warning("nonrated_model.pkl not found; using walkaway_model.pkl as fallback")
-        nonrated = legacy
 
-    if rated is None and nonrated is None:
+    if rated is None:
         raise FileNotFoundError(
             f"No model artifacts found in {MODEL_DIR}. "
             "Run trainer.py first to produce model.pkl / rated_model.pkl."
         )
-    return {"rated": rated, "nonrated": nonrated}
+    return {"rated": rated}
 
 
 # ---------------------------------------------------------------------------
@@ -156,22 +159,15 @@ def load_dual_artifacts() -> Dict[str, Optional[dict]]:
 # ---------------------------------------------------------------------------
 
 def _score_df(df: pd.DataFrame, artifacts: Dict[str, Optional[dict]]) -> pd.DataFrame:
-    """Add ``score`` and ``is_alert`` columns to *df* using per-observation model routing."""
+    """Add ``score`` column to *df* using the single rated model (v10 DEC-021)."""
     df = df.copy()
-    df["score"] = np.nan
+    df["score"] = 0.0
 
-    for track, bundle in artifacts.items():
-        if bundle is None:
-            continue
-        is_track = df["is_rated"] if track == "rated" else ~df["is_rated"]
-        sub = df[is_track]
-        if sub.empty:
-            continue
-        avail = [c for c in bundle["features"] if c in sub.columns]
-        df.loc[is_track, "score"] = bundle["model"].predict_proba(sub[avail])[:, 1]
+    bundle = artifacts.get("rated")
+    if bundle is not None and not df.empty:
+        avail = [c for c in bundle["features"] if c in df.columns]
+        df["score"] = bundle["model"].predict_proba(df[avail])[:, 1]
 
-    # Fill any remaining NaN scores with 0 (observations not covered by either model)
-    df["score"] = df["score"].fillna(0.0)
     return df
 
 
@@ -187,7 +183,7 @@ def compute_micro_metrics(
     df:
         Must contain ``score``, ``label``, ``is_rated`` columns.
     threshold:
-        Alert threshold (rated observations only; nonrated are not alerted).
+        Alert threshold (v10 single rated model; only rated observations receive alerts).
     window_hours:
         Duration of the evaluation window (used to compute alerts/hour).
     """
@@ -289,28 +285,32 @@ def compute_macro_by_gaming_day_metrics(
 def _compute_section_metrics(
     labeled: pd.DataFrame,
     rated_sub: pd.DataFrame,
-    nonrated_sub: pd.DataFrame,
     threshold: float,
     window_hours: Optional[float],
 ) -> dict:
-    """Compute combined + rated micro/macro metrics (v10 single threshold)."""
+    """Compute rated micro/macro metrics (v10 single threshold, DEC-021).
+
+    Both the top-level ``micro``/``macro_by_visit`` and the nested
+    ``rated_track`` section are computed on rated observations only, so that
+    PRAUC and alert metrics are not skewed by unrated population scores.
+    The ``labeled`` parameter is accepted for API compatibility but only
+    ``rated_sub`` is used for metric computation.
+    """
+    rated_micro = compute_micro_metrics(rated_sub, threshold, window_hours)
+    rated_macro = compute_macro_by_gaming_day_metrics(rated_sub, threshold)
     return {
         "rated_threshold": threshold,
-        "micro": compute_micro_metrics(labeled, threshold, window_hours),
-        "macro_by_visit": compute_macro_by_gaming_day_metrics(labeled, threshold),
+        "micro": rated_micro,
+        "macro_by_visit": rated_macro,
         "rated_track": {
-            "micro": compute_micro_metrics(rated_sub, threshold, window_hours),
-            "macro_by_visit": compute_macro_by_gaming_day_metrics(rated_sub, threshold),
-        },
-        "nonrated_track": {
-            "micro": compute_micro_metrics(nonrated_sub, threshold, window_hours),
-            "macro_by_visit": compute_macro_by_gaming_day_metrics(nonrated_sub, threshold),
+            "micro": rated_micro,
+            "macro_by_visit": rated_macro,
         },
     }
 
 
 # ---------------------------------------------------------------------------
-# Optuna TPE 2D threshold search (DEC-010: F1 objective, no G1 constraints)
+# Optuna TPE threshold search (DEC-010: F-beta objective, optional constraints)
 # ---------------------------------------------------------------------------
 
 def run_optuna_threshold_search(
@@ -321,7 +321,8 @@ def run_optuna_threshold_search(
 ) -> Tuple[float, float]:
     """Optuna TPE search over rated_threshold only (v10 single Rated model, DEC-009/010).
 
-    Objective: maximise F1 on rated observations. No G1 constraint.
+    Objective: maximise F-beta (beta=THRESHOLD_FBETA, precision-weighted) on rated
+    observations, subject to optional min recall and min alerts/hour constraints.
     Returns (rated_t, rated_t) for API compatibility with dual-metric callers.
     """
     logger.info("Optuna single-threshold search: %d trials", n_trials)
@@ -337,7 +338,21 @@ def run_optuna_threshold_search(
     def objective(trial: optuna.Trial) -> float:
         rt = trial.suggest_float("rated_threshold", 0.01, 0.99)
         preds = scores >= rt
-        return float(f1_score(y, preds, zero_division=0))
+        if THRESHOLD_MIN_RECALL is not None:
+            n_pos = int((y == 1).sum())
+            tp = int((preds & (y == 1)).sum())
+            rec = tp / n_pos if n_pos > 0 else 0.0
+            if rec < THRESHOLD_MIN_RECALL:
+                return 0.0
+        if (
+            THRESHOLD_MIN_ALERTS_PER_HOUR is not None
+            and window_hours is not None
+            and window_hours > 0
+        ):
+            alerts_per_hour = float(preds.sum()) / float(window_hours)
+            if alerts_per_hour < THRESHOLD_MIN_ALERTS_PER_HOUR:
+                return 0.0
+        return float(fbeta_score(y, preds, beta=THRESHOLD_FBETA, zero_division=0))
 
     study = optuna.create_study(
         direction="maximize",
@@ -347,13 +362,16 @@ def run_optuna_threshold_search(
 
     if study.best_value <= 0.0:
         logger.warning(
-            "No improvement found (best F1=%.4f); returning model-default threshold.",
-            study.best_value,
+            "No improvement found (best F%.2f=%.4f); returning model-default threshold.",
+            THRESHOLD_FBETA, study.best_value,
         )
         rated_t = float((artifacts.get("rated") or {}).get("threshold", 0.5))
     else:
         rated_t = study.best_params["rated_threshold"]
-        logger.info("Optuna best — rated_thr=%.4f  F1=%.4f", rated_t, study.best_value)
+        logger.info(
+            "Optuna best — rated_thr=%.4f  F%.2f=%.4f",
+            rated_t, THRESHOLD_FBETA, study.best_value,
+        )
 
     return rated_t, rated_t
 
@@ -370,18 +388,11 @@ def backtest(
     window_end: datetime,
     run_optuna: bool = True,
     n_optuna_trials: int = OPTUNA_N_TRIALS,
-    unrated_only: bool = False,
 ) -> dict:
-    """Full backtest pipeline for one time window.
+    """Full backtest pipeline for one time window (v10 single rated model, DEC-021).
 
     Returns a results dict with micro + macro metrics for both model-default
     thresholds and (optionally) Optuna-selected thresholds.
-
-    Parameters
-    ----------
-    unrated_only:
-        When True, force all observations through the nonrated model regardless
-        of patron status (sets is_rated=False for all rows before scoring).
     """
     extended_end = window_end + timedelta(minutes=max(LABEL_LOOKAHEAD_MIN, 24 * 60))
     history_start = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
@@ -435,17 +446,13 @@ def backtest(
             labeled[col] = 0
     labeled[ALL_FEATURE_COLS] = labeled[ALL_FEATURE_COLS].fillna(0)
 
-    # --- Rated / Non-rated routing (H3) ---
+    # --- H3: mark rated observations ---
     # canonical_map only contains entries for players with a valid casino_player_id,
     # so every canonical_id in the mapping is a rated player (R36 fix).
     rated_ids: set = (
         set(canonical_map["canonical_id"].unique()) if not canonical_map.empty else set()
     )
     labeled["is_rated"] = labeled["canonical_id"].isin(rated_ids)
-    # --unrated-only: force all observations through the nonrated model
-    if unrated_only:
-        labeled["is_rated"] = False
-        logger.info("unrated_only=True: all observations routed to nonrated model")
 
     # --- Score ---
     labeled = _score_df(labeled, artifacts)
@@ -453,9 +460,8 @@ def backtest(
     # --- Window duration (for alerts/hour) ---
     window_hours = (window_end - window_start).total_seconds() / 3600.0
 
-    # --- Per-track subsets (computed once, reused for default + optuna sections) ---
+    # --- Rated subset (for per-track metrics) ---
     rated_sub = labeled[labeled["is_rated"]]
-    nonrated_sub = labeled[~labeled["is_rated"]]
 
     # --- Metrics with model-default threshold (v10 single model) ---
     rated_t_default = float((artifacts.get("rated") or {}).get("threshold", 0.5))
@@ -464,12 +470,11 @@ def backtest(
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
         "window_hours": window_hours,
-        "unrated_only": unrated_only,
         "observations": len(labeled),
         "rated_obs": int(labeled["is_rated"].sum()),
-        "nonrated_obs": int((~labeled["is_rated"]).sum()),
+        "unrated_obs": int((~labeled["is_rated"]).sum()),
         "model_default": _compute_section_metrics(
-            labeled, rated_sub, nonrated_sub,
+            labeled, rated_sub,
             rated_t_default, window_hours,
         ),
     }
@@ -480,7 +485,7 @@ def backtest(
             labeled, artifacts, n_trials=n_optuna_trials, window_hours=window_hours,
         )
         results["optuna"] = _compute_section_metrics(
-            labeled, rated_sub, nonrated_sub,
+            labeled, rated_sub,
             rated_t_opt, window_hours,
         )
 
@@ -546,10 +551,6 @@ def main() -> None:
         "--n-trials", type=int, default=OPTUNA_N_TRIALS,
         help=f"Optuna trials for threshold search (default: {OPTUNA_N_TRIALS})",
     )
-    parser.add_argument(
-        "--unrated-only", action="store_true",
-        help="Route all observations through the nonrated model (ignore patron rated status)",
-    )
     args = parser.parse_args()
 
     artifacts = load_dual_artifacts()
@@ -569,7 +570,6 @@ def main() -> None:
         bets_raw, sessions_raw, artifacts, start, end,
         run_optuna=not args.skip_optuna,
         n_optuna_trials=args.n_trials,
-        unrated_only=args.unrated_only,
     )
     print(json.dumps(result, indent=2, default=str))
 

@@ -173,16 +173,20 @@ class TestR79ScorerProfileParity(unittest.TestCase):
         )
 
 
-class TestR80NonratedProfileFeatureExclusion(unittest.TestCase):
-    """R80: nonrated model should exclude profile-only features."""
+class TestR80ProfileFeaturesRatedOnly(unittest.TestCase):
+    """R80 (updated): profile features are used for rated observations only (v10 DEC-021).
 
-    def test_train_dual_model_nonrated_excludes_profile_features(self):
-        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "train_dual_model")
-        self.assertRegex(
-            src,
-            r'name\s*==\s*"nonrated".*PROFILE_FEATURE_COLS',
-            "train_dual_model should exclude PROFILE_FEATURE_COLS for nonrated model (R80)",
-        )
+    train_single_rated_model trains on rated rows only; profile features are
+    naturally restricted to that subset.  No explicit nonrated exclusion needed.
+    """
+
+    def test_train_single_rated_model_exists(self):
+        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "train_single_rated_model")
+        self.assertGreater(len(src), 0, "train_single_rated_model not found in trainer.py")
+
+    def test_train_single_rated_filters_to_rated_rows(self):
+        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "train_single_rated_model")
+        self.assertIn("is_rated", src, "train_single_rated_model should filter by is_rated")
 
 
 class TestR81LocalParquetBranchDeadCode(unittest.TestCase):

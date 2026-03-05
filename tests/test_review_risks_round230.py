@@ -92,12 +92,12 @@ class TestR1103FeatureImportanceExceptionScope(unittest.TestCase):
 
 
 class TestR1104NoTestDfContract(unittest.TestCase):
-    """R1104: train_dual_model(test_df=None) should not run test-metrics evaluation path."""
+    """R1104: train_single_rated_model(test_df=None) should not run test-metrics evaluation path."""
 
-    def test_train_dual_model_no_test_df_should_not_call_compute_test_metrics(self):
+    def test_train_single_rated_model_no_test_df_should_not_call_compute_test_metrics(self):
         train_df = pd.DataFrame(
             {
-                "is_rated": [True, False, True, False],
+                "is_rated": [True, True, True, True],
                 "label": [1, 0, 0, 1],
                 "f0": [0.1, 0.2, 0.3, 0.4],
             }
@@ -111,14 +111,18 @@ class TestR1104NoTestDfContract(unittest.TestCase):
             return_value=(object(), {"threshold": 0.5, "val_f1": 0.0, "_uncalibrated": True}),
         ), patch.object(
             trainer_mod,
+            "_compute_train_metrics",
+            return_value={"train_prauc": 0.0, "train_random_ap": 0.0},
+        ), patch.object(
+            trainer_mod,
             "_compute_feature_importance",
-            return_value=[{"rank": 1, "feature": "f0", "importance_gain": 1.0}],
+            return_value=[{"rank": 1, "feature": "f0", "importance_gain_pct": 100.0}],
         ), patch.object(
             trainer_mod,
             "_compute_test_metrics",
             return_value={"test_prauc": 0.0},
         ) as mock_test_eval:
-            trainer_mod.train_dual_model(
+            trainer_mod.train_single_rated_model(
                 train_df=train_df,
                 valid_df=valid_df,
                 feature_cols=feature_cols,

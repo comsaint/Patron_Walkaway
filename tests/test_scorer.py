@@ -32,22 +32,20 @@ def _get_func_src(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 class TestH3ModelRouting(unittest.TestCase):
-    """H3: route each observation to rated vs nonrated model by is_rated."""
+    """H3 (v10 DEC-021): single rated model scores all observations, is_rated_obs tracks patron status."""
 
-    def test_score_df_uses_is_rated_for_routing(self):
-        """_score_df (or equivalent) must use is_rated to split rated vs nonrated."""
+    def test_score_df_uses_rated_art(self):
+        """_score_df must use rated_art for scoring."""
         src = _get_func_src("_score_df")
-        self.assertIn("is_rated", src)
         self.assertIn("rated_art", src)
-        self.assertIn("nonrated_art", src)
 
     def test_score_df_sets_is_rated_obs_column(self):
         """Scoring must set is_rated_obs (int 0/1) for downstream."""
         src = _get_func_src("_score_df")
         self.assertIn("is_rated_obs", src)
 
-    def test_score_df_uses_rated_and_nonrated_thresholds(self):
-        """Margin/alert must use per-model threshold (rated vs nonrated)."""
+    def test_score_df_uses_threshold_and_margin(self):
+        """Margin/alert must use rated model threshold."""
         src = _get_func_src("_score_df")
         self.assertIn("threshold", src)
         self.assertIn("margin", src)

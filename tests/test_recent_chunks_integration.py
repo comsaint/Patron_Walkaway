@@ -19,7 +19,7 @@ class TestRecentChunksIntegration(unittest.TestCase):
     @patch("trainer.trainer.ensure_player_profile_ready")
     @patch("trainer.trainer.load_player_profile")
     @patch("trainer.trainer.process_chunk")
-    @patch("trainer.trainer.train_dual_model")
+    @patch("trainer.trainer.train_single_rated_model")
     @patch("trainer.trainer.save_artifact_bundle")
     @patch("trainer.trainer.get_monthly_chunks")
     def test_recent_chunks_propagates_effective_window(

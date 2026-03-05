@@ -95,17 +95,17 @@ class TestReviewRisksRound30(unittest.TestCase):
             ),
         )
 
-    def test_r45_pipeline_must_integrate_track_a_featuretools_calls(self):
-        """R45: trainer/scorer pipelines should include Track-A featuretools execution."""
+    def test_r45_pipeline_must_integrate_track_llm_duckdb_calls(self):
+        """R45: trainer/scorer pipelines should include Track LLM DuckDB execution."""
         self.assertIn(
-            "compute_feature_matrix",
+            "compute_track_llm_features",
             _TRAINER_SRC,
-            msg="trainer.py should invoke Track-A compute_feature_matrix for production pipeline.",
+            msg="trainer.py should invoke compute_track_llm_features for production pipeline.",
         )
         self.assertIn(
-            "calculate_feature_matrix",
+            "compute_track_llm_features",
             _SCORER_SRC,
-            msg="scorer.py should invoke featuretools.calculate_feature_matrix for online parity.",
+            msg="scorer.py should invoke compute_track_llm_features for online parity.",
         )
 
 

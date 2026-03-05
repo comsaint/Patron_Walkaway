@@ -77,7 +77,6 @@ def _make_stub_artifacts(feature_list: list | None = None) -> dict:
     )
     return {
         "rated": model_entry,
-        "nonrated": model_entry,
         "feature_list": features,
         "reason_code_map": {"f1": "RC_F1", "f2": "RC_F2"},
         "model_version": "test-v0",
@@ -144,12 +143,12 @@ class TestModelInfoEndpoint(unittest.TestCase):
             for key in ("model_type", "model_version", "features", "training_metrics"):
                 self.assertIn(key, data, msg=f"Missing key: {key}")
 
-    def test_model_type_dual_when_both_models_present(self):
+    def test_model_type_rated_when_model_present(self):
         arts = _make_stub_artifacts()
         with patch.object(api_server, "_get_artifacts", return_value=arts):
             resp = self.client.get("/model_info")
             data = json.loads(resp.data)
-            self.assertEqual(data["model_type"], "dual")
+            self.assertEqual(data["model_type"], "rated")
 
     def test_features_list_matches_artifacts(self):
         arts = _make_stub_artifacts(feature_list=["alpha", "beta"])

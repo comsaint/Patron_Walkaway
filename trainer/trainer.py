@@ -14,7 +14,7 @@ Pipeline (SSOT §4.3 / §9)
    70/15/15 — SSOT §9.2).  Chunks control ETL/cache volume only, not split semantics.
 5. sample_weight = 1 / N_run  (canonical_id × run_id from compute_run_boundary), train set only.
 6. Optuna TPE hyperparameter search on validation set (per model type).
-7. Train Rated + Non-rated LightGBM with class_weight='balanced' + sample_weight.
+7. Train Rated LightGBM with class_weight='balanced' + sample_weight (v10 single-model, DEC-021).
 8. Atomic artifact bundle -> trainer/models/.
 
 Artifact format (version-tagged, v10 single-model)
@@ -96,6 +96,8 @@ try:
     VALID_SPLIT_FRAC: float = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
     MIN_VALID_TEST_ROWS: int = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
     MIN_THRESHOLD_ALERT_COUNT: int = getattr(_cfg, "MIN_THRESHOLD_ALERT_COUNT", 5)
+    THRESHOLD_MIN_RECALL: Optional[float] = getattr(_cfg, "THRESHOLD_MIN_RECALL", None)
+    THRESHOLD_FBETA: float = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
@@ -120,6 +122,8 @@ except ModuleNotFoundError:
     VALID_SPLIT_FRAC = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
     MIN_VALID_TEST_ROWS = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
     MIN_THRESHOLD_ALERT_COUNT = getattr(_cfg, "MIN_THRESHOLD_ALERT_COUNT", 5)
+    THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", None)
+    THRESHOLD_FBETA = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
 
 # Module-level pipeline imports (same try/except pattern)
 try:
@@ -134,11 +138,8 @@ try:
     from features import (  # type: ignore[import]
         compute_loss_streak,
         compute_run_boundary,
-        build_entity_set,
-        run_dfs_exploration,
-        save_feature_defs,
-        load_feature_defs,
-        compute_feature_matrix,
+        compute_track_llm_features,
+        load_feature_spec,
         join_player_profile,
         screen_features,
         PROFILE_FEATURE_COLS,
@@ -162,11 +163,8 @@ except ModuleNotFoundError:
     from trainer.features import (  # type: ignore[import]
         compute_loss_streak,
         compute_run_boundary,
-        build_entity_set,
-        run_dfs_exploration,
-        save_feature_defs,
-        load_feature_defs,
-        compute_feature_matrix,
+        compute_track_llm_features,
+        load_feature_spec,
         join_player_profile,
         screen_features,
         PROFILE_FEATURE_COLS,
@@ -206,8 +204,8 @@ PROJECT_ROOT = BASE_DIR.parent
 DATA_DIR = BASE_DIR / ".data"
 CHUNK_DIR = DATA_DIR / "chunks"
 LOCAL_PARQUET_DIR = PROJECT_ROOT / "data"
+FEATURE_SPEC_PATH = BASE_DIR / "feature_spec" / "features_candidates.template.yaml"
 MODEL_DIR = BASE_DIR / "models"
-FEATURE_DEFS_DIR = MODEL_DIR / "saved_feature_defs"  # Track A feature definitions (DEC-002)
 OUT_DIR = BASE_DIR / "out_trainer"
 
 for _d in (DATA_DIR, CHUNK_DIR, LOCAL_PARQUET_DIR, MODEL_DIR, OUT_DIR):
@@ -1300,7 +1298,7 @@ def _chunk_cache_key(
     changes to the snapshot table also invalidate the chunk cache.
 
     R904/R1003: no_afg is included so that toggling --no-afg produces a distinct
-    cache key, preventing stale Track-A-enabled chunks from being reused when AFG
+    cache key, preventing stale Track-LLM-enabled chunks from being reused when AFG
     is turned off (or vice versa).
     """
     ws = chunk["window_start"].isoformat()
@@ -1318,37 +1316,6 @@ def _chunk_cache_key(
     return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}|{afg_tag}"
 
 
-def run_track_a_dfs(
-    bets: pd.DataFrame,
-    sessions: pd.DataFrame,
-    canonical_map: pd.DataFrame,
-    window_end: datetime,
-    sample_frac: float = 0.1,
-    max_depth: int = 2,
-) -> None:
-    """Run Featuretools DFS on sampled bets and persist feature definitions (DEC-002 Phase 1).
-
-    Call once before the main process_chunk loops to produce saved_feature_defs.
-    Subsequent process_chunk calls automatically pick up the saved definitions via
-    compute_feature_matrix and merge Track A features into the labeled DataFrame.
-    """
-    FEATURE_DEFS_DIR.mkdir(parents=True, exist_ok=True)
-    # R907: absolute cap prevents OOM on large datasets regardless of sample_frac.
-    _max_sample = 5_000
-    _n_sample = min(int(len(bets) * sample_frac), _max_sample)
-    sample = bets.sample(n=max(1, _n_sample), random_state=42) if len(bets) > 1 else bets
-    cutoff_df = sample[["bet_id"]].copy()
-    cutoff_df["cutoff_time"] = window_end
-    es = build_entity_set(sample, sessions, canonical_map)
-    _, feature_defs = run_dfs_exploration(es, cutoff_df, max_depth=max_depth)
-    save_feature_defs(feature_defs, FEATURE_DEFS_DIR / "feature_defs.json")
-    logger.info(
-        "Track A: saved %d feature definitions to %s",
-        len(feature_defs),
-        FEATURE_DEFS_DIR,
-    )
-
-
 def process_chunk(
     chunk: dict,
     canonical_map: pd.DataFrame,
@@ -1356,8 +1323,8 @@ def process_chunk(
     use_local_parquet: bool = False,
     force_recompute: bool = False,
     profile_df: Optional[pd.DataFrame] = None,
+    feature_spec: Optional[dict] = None,
     no_afg: bool = False,
-    run_afg: bool = False,
 ) -> Optional[Path]:
     """Process one monthly chunk; return path to written Parquet or None if empty.
 
@@ -1366,11 +1333,8 @@ def process_chunk(
     dummy_player_ids: FND-12 dummy/fake-account player_ids to drop from training (TRN-04).
     profile_df: player_profile snapshot table for PIT join (PLAN Step 4/DEC-011).
         Pass None to skip; profile feature columns will be 0 for all rows.
-    no_afg: when True, skip Track A feature computation even if feature_defs.json
-        exists on disk (DEC-020 --no-afg / --fast-mode).
-    run_afg: when True (first chunk only), run run_track_a_dfs on this chunk's data
-        if feature_defs.json does not yet exist.  This avoids a separate load in
-        run_pipeline (fixes R906 first-chunk double-load).
+    feature_spec: parsed Track LLM feature spec loaded by run_pipeline.
+    no_afg: when True, skip Track LLM feature computation (DEC-020 --no-afg / --fast-mode).
     """
     window_start = chunk["window_start"]
     window_end = chunk["window_end"]
@@ -1400,12 +1364,6 @@ def process_chunk(
         logger.warning("Chunk %s–%s: no bets, skipping", window_start.date(), window_end.date())
         return None
 
-    # DFS need check: evaluated once here so both cache bypass and post-DQ DFS use
-    # the same result.  _needs_dfs is True only for the first chunk (run_afg=True)
-    # when feature_defs.json has not yet been produced.
-    _feature_defs_path = FEATURE_DEFS_DIR / "feature_defs.json"
-    _needs_dfs = run_afg and not _feature_defs_path.exists()
-
     # --- TRN-07: cache validity via content hash ---
     # Compute the cache key from chunk metadata + raw bets hash so that DQ rule
     # or config changes (which alter bets_raw content) automatically invalidate
@@ -1422,7 +1380,7 @@ def process_chunk(
         _profile_hash = "none"
     current_key = _chunk_cache_key(chunk, bets_raw, profile_hash=_profile_hash, no_afg=no_afg)
     key_path = chunk_path.with_suffix(".cache_key")
-    if not _needs_dfs and not force_recompute and chunk_path.exists():
+    if not force_recompute and chunk_path.exists():
         stored_key = key_path.read_text(encoding="utf-8").strip() if key_path.exists() else ""
         if stored_key == current_key:
             try:
@@ -1476,53 +1434,52 @@ def process_chunk(
     # all anonymous (non-rated) players from training data.
     bets["canonical_id"] = bets["canonical_id"].fillna(bets["player_id"].astype(str))
 
-    # --- Track A: DFS exploration (DEC-020, first-chunk only via run_afg) ---
-    # Runs here so we reuse already-loaded data (avoids R906 first-chunk double-load).
-    # feature_defs.json is written by run_track_a_dfs; subsequent chunks pick it up
-    # in the Track A application block below.
-    if _needs_dfs:
-        _t0_dfs = time.perf_counter()
-        logger.info(
-            "Track A (DEC-020): DFS exploration on first chunk %s–%s ...",
-            window_start.date(), window_end.date(),
-        )
-        try:
-            # R1002: filter to core window only (exclude extended zone) to avoid leakage.
-            _dfs_bets = bets[
-                (bets["bet_dtm"] >= window_start) & (bets["bet_dtm"] < window_end)
-            ].copy() if "bet_dtm" in bets.columns else bets.copy()
-            # R902: exclude FND-12 dummy player_ids from DFS exploration data.
-            if dummy_player_ids and "player_id" in _dfs_bets.columns:
-                _dfs_bets = _dfs_bets[~_dfs_bets["player_id"].isin(dummy_player_ids)].copy()
-            # R901/R1006: build a sessions frame that carries canonical_id for Featuretools.
-            _dfs_sessions = sessions.copy()
-            if not canonical_map.empty and "player_id" in canonical_map.columns:
-                _dfs_sessions = _dfs_sessions.merge(
-                    canonical_map[["player_id", "canonical_id"]].drop_duplicates("player_id"),
-                    on="player_id",
-                    how="left",
-                )
-            else:
-                _dfs_sessions["canonical_id"] = _dfs_sessions["player_id"].astype(str)
-            if "canonical_id" in _dfs_sessions.columns:
-                _dfs_sessions["canonical_id"] = (
-                    _dfs_sessions["canonical_id"].fillna(_dfs_sessions["player_id"].astype(str))
-                )
-            run_track_a_dfs(_dfs_bets, _dfs_sessions, canonical_map, window_end)
-            logger.info(
-                "Track A: feature defs saved to %s  (%.1fs)",
-                FEATURE_DEFS_DIR, time.perf_counter() - _t0_dfs,
-            )
-        except Exception as _dfs_exc:
-            logger.warning(
-                "Track A: DFS failed (%s) — proceeding without Track A features",
-                _dfs_exc,
-            )
-
     # --- Track-B features (on FULL bets incl. history, cutoff=window_end) ---
     # Computing before label filtering ensures cross-chunk state (loss_streak,
     # run_boundary) uses historical context from HISTORY_BUFFER_DAYS before window_start.
     bets = add_track_b_features(bets, canonical_map, window_end)
+
+    # --- Track LLM: DuckDB + Feature Spec YAML (DEC-022/023/024) ---
+    # R3500: compute on the FULL bets DataFrame (with HISTORY_BUFFER_DAYS context)
+    # BEFORE label filtering so window features see the same history as the scorer
+    # (train-serve parity).  The result is merged back onto bets by bet_id so that
+    # compute_labels still receives the extended-zone rows it needs for right-censoring.
+    _bets_llm_feature_cols: list = []
+    if not no_afg and feature_spec is not None:
+        try:
+            _t0_llm = time.perf_counter()
+            _bets_llm_result = compute_track_llm_features(
+                bets,
+                feature_spec=feature_spec,
+                cutoff_time=window_end,
+            )
+            _llm_cand_ids = [
+                c.get("feature_id")
+                for c in (feature_spec.get("track_llm") or {}).get("candidates", [])
+            ]
+            _bets_llm_feature_cols = [
+                fid for fid in _llm_cand_ids
+                if fid and fid in _bets_llm_result.columns
+            ]
+            if _bets_llm_feature_cols and "bet_id" in _bets_llm_result.columns:
+                bets = bets.merge(
+                    _bets_llm_result[["bet_id"] + _bets_llm_feature_cols].drop_duplicates("bet_id"),
+                    on="bet_id",
+                    how="left",
+                )
+            logger.info(
+                "Chunk %s–%s: Track LLM computed (%.1fs)",
+                window_start.date(),
+                window_end.date(),
+                time.perf_counter() - _t0_llm,
+            )
+        except Exception as exc:
+            logger.error(
+                "Chunk %s–%s: Track LLM failed — %s",
+                window_start.date(),
+                window_end.date(),
+                exc,
+            )
 
     # --- Labels (C1 extended pull) ---
     labeled = compute_labels(
@@ -1550,34 +1507,6 @@ def process_chunk(
 
     # --- Legacy (Track B) features ---
     labeled = add_legacy_features(labeled, sessions)
-
-    # --- Track A: Featuretools DFS features (DEC-002/R45, DEC-020) ---
-    # Applied only when saved_feature_defs are present (produced by run_track_a_dfs
-    # on the first chunk via run_afg) AND --no-afg / --fast-mode was not set.
-    # _feature_defs_path is defined earlier (before cache check).
-    if not no_afg and FEATURE_DEFS_DIR.exists() and _feature_defs_path.exists():
-        try:
-            _saved_defs = load_feature_defs(_feature_defs_path)
-            _cutoff_df = labeled[["bet_id"]].copy()
-            _cutoff_df["cutoff_time"] = window_end
-            _es = build_entity_set(labeled, sessions, canonical_map)
-            _fm = compute_feature_matrix(_es, _saved_defs, _cutoff_df)
-            labeled = labeled.merge(
-                _fm.reset_index(), on="bet_id", how="left", suffixes=("", "_track_a")
-            )
-            logger.info(
-                "Chunk %s–%s: Track A merged (%d extra features)",
-                window_start.date(),
-                window_end.date(),
-                len(_fm.columns),
-            )
-        except Exception as exc:
-            logger.warning(
-                "Chunk %s–%s: Track A skipped — %s",
-                window_start.date(),
-                window_end.date(),
-                exc,
-            )
 
     # Ensure all non-profile feature columns exist with numeric defaults.
     # R74: profile columns are intentionally left as NaN when a player has no
@@ -1768,8 +1697,8 @@ def _train_one_model(
 
         # Threshold selection: vectorised PR-curve scan (R65 — avoids O(N²) loop).
         # precision_recall_curve returns arrays aligned so that for each threshold
-        # index i: preds = val_scores >= thresholds[i].  We compute F1 over the
-        # full threshold grid in one vectorised pass and pick the best.
+        # index i: preds = val_scores >= thresholds[i].  We maximise F-beta (beta=THRESHOLD_FBETA)
+        # over the full threshold grid; beta < 1 favours precision over recall.
         pr_prec, pr_rec, pr_thresholds = precision_recall_curve(y_val, val_scores)
         # pr_prec / pr_rec have one extra element (last = 1/0); align with thresholds
         pr_prec = pr_prec[:-1]
@@ -1780,20 +1709,40 @@ def _train_one_model(
             _sorted_scores, pr_thresholds, side="left"
         )
         valid_mask = alert_counts >= MIN_THRESHOLD_ALERT_COUNT
+        if THRESHOLD_MIN_RECALL is not None:
+            valid_mask = valid_mask & (pr_rec >= THRESHOLD_MIN_RECALL)
         if valid_mask.any():
-            denom = pr_prec + pr_rec
-            f1_arr = np.where(denom > 0, 2 * pr_prec * pr_rec / denom, 0.0)
-            f1_arr = np.where(valid_mask, f1_arr, -1.0)
-            best_idx = int(np.argmax(f1_arr))
+            # F_beta = (1 + beta^2) * P * R / (beta^2 * P + R)
+            b = THRESHOLD_FBETA
+            denom = b * b * pr_prec + pr_rec
+            fbeta_arr = np.where(
+                denom > 0,
+                (1.0 + b * b) * pr_prec * pr_rec / denom,
+                0.0,
+            )
+            fbeta_arr = np.where(valid_mask, fbeta_arr, -1.0)
+            best_idx = int(np.argmax(fbeta_arr))
             best_t = float(pr_thresholds[best_idx])
-            best_f1 = float(f1_arr[best_idx])
             best_prec = float(pr_prec[best_idx])
             best_rec = float(pr_rec[best_idx])
+            best_fbeta = float(fbeta_arr[best_idx])
+            # F1 at chosen threshold (for reporting / backward compat)
+            best_f1 = (
+                2.0 * best_prec * best_rec / (best_prec + best_rec)
+                if (best_prec + best_rec) > 0
+                else 0.0
+            )
         else:
             best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
+            best_fbeta = 0.0
     else:
         prauc = 0.0
         best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
+        best_fbeta = 0.0
+
+    n_val = int(len(y_val))
+    n_val_pos = int(y_val.sum())
+    val_random_ap = (n_val_pos / n_val) if n_val > 0 else 0.0
 
     metrics = {
         "label": label,
@@ -1801,17 +1750,19 @@ def _train_one_model(
         "val_precision": best_prec,
         "val_recall": best_rec,
         "val_f1": best_f1,
+        "val_fbeta_05": best_fbeta,
         "threshold": best_t,
-        "val_samples": int(len(y_val)),
-        "val_positives": int(y_val.sum()),
+        "val_samples": n_val,
+        "val_positives": n_val_pos,
+        "val_random_ap": val_random_ap,
         "best_hyperparams": hyperparams,
         # R804: track via code-path (not value == 0.5) so a legitimately-optimised
         # threshold of 0.5 is never falsely flagged as uncalibrated.
         "_uncalibrated": not _has_val,
     }
     logger.info(
-        "%s: PR-AUC=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
-        label, prauc, best_f1, best_prec, best_rec, best_t,
+        "%s: PR-AUC=%.4f  F0.5=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
+        label, prauc, best_fbeta, best_f1, best_prec, best_rec, best_t,
     )
     return model, metrics
 
@@ -1851,13 +1802,16 @@ def _compute_test_metrics(
             int(y_test.sum()) if not y_test.empty else 0,
             int((y_test == 0).sum()) if not y_test.empty else 0,
         )
+        n_te = int(len(y_test))
+        n_te_pos = int(y_test.sum()) if not y_test.empty else 0
         return {
             "test_prauc": 0.0,
             "test_precision": 0.0,
             "test_recall": 0.0,
             "test_f1": 0.0,
-            "test_samples": int(len(y_test)),
-            "test_positives": int(y_test.sum()) if not y_test.empty else 0,
+            "test_samples": n_te,
+            "test_positives": n_te_pos,
+            "test_random_ap": (n_te_pos / n_te) if n_te > 0 else 0.0,
             # R1101: propagate uncalibrated flag
             "test_threshold_uncalibrated": _uncalibrated,
         }
@@ -1873,6 +1827,9 @@ def _compute_test_metrics(
     prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    n_te = int(len(y_test))
+    n_te_pos = int(y_test.sum())
+    test_random_ap = (n_te_pos / n_te) if n_te > 0 else 0.0
     logger.info(
         "%s test: PR-AUC=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
         label, prauc, f1, prec, rec, threshold,
@@ -1882,10 +1839,62 @@ def _compute_test_metrics(
         "test_precision": prec,
         "test_recall": rec,
         "test_f1": f1,
-        "test_samples": int(len(y_test)),
-        "test_positives": int(y_test.sum()),
+        "test_samples": n_te,
+        "test_positives": n_te_pos,
+        "test_random_ap": test_random_ap,
         # R1101: propagate uncalibrated flag so downstream can distrust P/R/F1
         "test_threshold_uncalibrated": _uncalibrated,
+    }
+
+
+def _compute_train_metrics(
+    model: lgb.LGBMClassifier,
+    threshold: float,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    label: str = "",
+) -> dict:
+    """Evaluate a trained model on the training set (for reporting overfit / fit quality).
+
+    Reports train_prauc, P/R/F1 at the validation-derived threshold, train_samples,
+    train_positives, and train_random_ap (positives/samples = theoretical AP for random guess).
+    """
+    if X_train.empty or y_train.empty:
+        return {
+            "train_prauc": 0.0,
+            "train_precision": 0.0,
+            "train_recall": 0.0,
+            "train_f1": 0.0,
+            "train_samples": 0,
+            "train_positives": 0,
+            "train_random_ap": 0.0,
+        }
+    n_tr = int(len(y_train))
+    n_tr_pos = int(y_train.sum())
+    train_random_ap = (n_tr_pos / n_tr) if n_tr > 0 else 0.0
+    train_scores = model.predict_proba(X_train)[:, 1]
+    has_both = n_tr_pos >= 1 and (n_tr - n_tr_pos) >= 1
+    train_prauc = float(average_precision_score(y_train, train_scores)) if has_both else 0.0
+    preds = (train_scores >= threshold).astype(int)
+    y_arr = y_train.values
+    tp = int(((preds == 1) & (y_arr == 1)).sum())
+    fp = int(((preds == 1) & (y_arr == 0)).sum())
+    fn = int(((preds == 0) & (y_arr == 1)).sum())
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    logger.info(
+        "%s train: PR-AUC=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  random_ap=%.4f",
+        label, train_prauc, f1, prec, rec, train_random_ap,
+    )
+    return {
+        "train_prauc": train_prauc,
+        "train_precision": prec,
+        "train_recall": rec,
+        "train_f1": f1,
+        "train_samples": n_tr,
+        "train_positives": n_tr_pos,
+        "train_random_ap": train_random_ap,
     }
 
 
@@ -1895,10 +1904,10 @@ def _compute_feature_importance(
 ) -> list:
     """Return features ranked by LightGBM 'gain' importance (descending).
 
-    Uses the booster's native feature_importance(importance_type='gain') which
-    reflects cumulative information gain rather than raw split counts.  Falls back
-    to sklearn-style .feature_importances_ only when the booster attribute is
-    absent (AttributeError), e.g. in unit tests with mock estimators.
+    Each entry has importance_gain_pct: share of total gain as a percentage (0–100).
+    Uses the booster's native feature_importance(importance_type='gain'); falls back
+    to sklearn-style .feature_importances_ when the booster attribute is absent
+    (AttributeError), e.g. in unit tests with mock estimators.
 
     R1102: raises ValueError if importance vector length != feature_cols length.
     R1103: only AttributeError triggers fallback; other exceptions propagate.
@@ -1919,9 +1928,14 @@ def _compute_feature_importance(
                 "Ensure the model was trained with the same feature list."
             )
 
+    total_gain = sum(gains)
     ranked = sorted(zip(names, gains), key=lambda x: x[1], reverse=True)
     return [
-        {"rank": i + 1, "feature": name, "importance_gain": round(float(gain), 6)}
+        {
+            "rank": i + 1,
+            "feature": name,
+            "importance_gain_pct": round(100.0 * float(gain) / total_gain, 2) if total_gain > 0 else 0.0,
+        }
         for i, (name, gain) in enumerate(ranked)
     ]
 
@@ -1934,6 +1948,12 @@ def train_dual_model(
     test_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[Optional[dict], Optional[dict], dict]:
     """Train Rated + Non-rated LightGBM models.
+
+    .. deprecated::
+        v10 (DEC-021) uses only the rated model.  The pipeline calls
+        ``train_single_rated_model`` instead.  This function is retained for
+        backward compatibility with integration-test mocks; do not call it
+        from production code.
 
     Parameters
     ----------
@@ -1949,8 +1969,10 @@ def train_dual_model(
     (rated_artifacts, nonrated_artifacts, combined_metrics)
         Each artifacts dict: {"model": LGBMClassifier, "threshold": float,
                               "features": list, "metrics": dict}
-        metrics dict contains val_* keys (always), test_* keys (when test_df
-        provided), feature_importance list, and importance_method string.
+        metrics dict contains val_* and train_* keys (always), test_* keys (when
+        test_df provided), val_random_ap/train_random_ap/test_random_ap (random-guess
+        AP = positives/samples), feature_importance list (importance_gain_pct), and
+        importance_method string.
     """
     def _split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         rated = df[df["is_rated"]].copy()
@@ -2002,6 +2024,17 @@ def train_dual_model(
 
         model, metrics = _train_one_model(X_tr, y_tr, X_vl, y_vl, sw, hp, label=name)
 
+        # Training set performance (for overfit / fit quality reporting).
+        metrics.update(
+            _compute_train_metrics(
+                model,
+                metrics["threshold"],
+                X_tr,
+                y_tr,
+                label=name,
+            )
+        )
+
         # R1104: only evaluate on test set when a real test split was provided.
         # Skipping when te_df is empty avoids polluting the artifact with
         # all-zero test_* keys that are indistinguishable from "evaluated but poor".
@@ -2037,20 +2070,6 @@ def train_dual_model(
     return results.get("rated"), results.get("nonrated"), combined_metrics
 
 
-def _rated_train_impl(
-    train_df: pd.DataFrame,
-    valid_df: pd.DataFrame,
-    feature_cols: List[str],
-    run_optuna: bool,
-    test_df: Optional[pd.DataFrame],
-) -> Tuple[Optional[dict], Optional[dict], dict]:
-    """Internal delegate — routes to train_dual_model so integration-test mocks apply."""
-    rated_art, _, combined_metrics = train_dual_model(
-        train_df, valid_df, feature_cols, run_optuna=run_optuna, test_df=test_df
-    )
-    return rated_art, None, combined_metrics
-
-
 def train_single_rated_model(
     train_df: pd.DataFrame,
     valid_df: pd.DataFrame,
@@ -2058,8 +2077,70 @@ def train_single_rated_model(
     run_optuna: bool = True,
     test_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[Optional[dict], Optional[dict], dict]:
-    """v10 single-model (DEC-021): train rated model only; return (rated_art, None, metrics)."""
-    return _rated_train_impl(train_df, valid_df, feature_cols, run_optuna, test_df)
+    """v10 single-model (DEC-021): train rated model only; return (rated_art, None, metrics).
+
+    Only rows where is_rated==True are used for training, validation, and test
+    evaluation.  Non-rated observations are intentionally excluded (DEC-009/010).
+    """
+    train_rated = train_df[train_df["is_rated"]].copy() if not train_df.empty else train_df
+    val_rated = valid_df[valid_df["is_rated"]].copy() if not valid_df.empty else valid_df
+    test_rated: Optional[pd.DataFrame]
+    if test_df is not None and not test_df.empty:
+        test_rated = test_df[test_df["is_rated"]].copy()
+    else:
+        test_rated = test_df
+
+    if train_rated.empty:
+        logger.warning("rated model: no training rows, skipping")
+        return None, None, {"rated": None}
+
+    sw_rated = compute_sample_weights(train_rated)
+    avail_cols = [c for c in feature_cols if c in train_rated.columns]
+    X_tr, y_tr = train_rated[avail_cols], train_rated["label"]
+    X_vl = val_rated[avail_cols] if not val_rated.empty else X_tr.head(0)
+    y_vl = val_rated["label"] if not val_rated.empty else y_tr.head(0)
+
+    if run_optuna and not val_rated.empty and y_vl.sum() > 0:
+        hp = run_optuna_search(X_tr, y_tr, X_vl, y_vl, sw_rated, label="rated")
+    else:
+        hp = {
+            "n_estimators": 400,
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "max_depth": 8,
+            "min_child_samples": 20,
+        }
+
+    model, metrics = _train_one_model(X_tr, y_tr, X_vl, y_vl, sw_rated, hp, label="rated")
+
+    metrics.update(
+        _compute_train_metrics(model, metrics["threshold"], X_tr, y_tr, label="rated")
+    )
+
+    if test_rated is not None and not test_rated.empty:
+        X_te = test_rated[avail_cols]
+        y_te = test_rated["label"]
+        metrics.update(
+            _compute_test_metrics(
+                model,
+                metrics["threshold"],
+                X_te,
+                y_te,
+                label="rated",
+                _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+            )
+        )
+
+    metrics["feature_importance"] = _compute_feature_importance(model, avail_cols)
+    metrics["importance_method"] = "gain"
+
+    rated_art = {
+        "model": model,
+        "threshold": metrics["threshold"],
+        "features": avail_cols,
+        "metrics": metrics,
+    }
+    return rated_art, None, {"rated": metrics}
 
 
 # ---------------------------------------------------------------------------
@@ -2068,27 +2149,37 @@ def train_single_rated_model(
 
 def save_artifact_bundle(
     rated: Optional[dict],
-    nonrated: Optional[dict],
     feature_cols: List[str],
     combined_metrics: dict,
     model_version: str,
     fast_mode: bool = False,
     sample_rated_n: Optional[int] = None,
+    feature_spec_path: Optional[Path] = None,
 ) -> None:
-    """Write all model artifacts atomically.
+    """Write all model artifacts atomically (v10 single rated model, DEC-021).
 
-    v10 single-model format (DEC-021)
-    ---------------------------------
+    v10 single-model format
+    -----------------------
     models/model.pkl               {"model", "threshold", "features"}
     models/feature_list.json       [{name, track}]
     models/reason_code_map.json   {feature_name: reason_code} for scorer SHAP lookup
     models/model_version          <version string>
-    models/training_metrics.json  per-model metrics
+    models/training_metrics.json  per-model metrics (rated only)
+    models/feature_spec.yaml      frozen feature spec snapshot (DEC-024, R3501)
 
     Legacy single-model format (for backward compat with existing scorer)
     -----------------------------------------------------------------------
     models/walkaway_model.pkl     {"model", "features", "threshold"}
     """
+    # DEC-024 / R3501: freeze a copy of the feature spec into the artifact bundle so
+    # the scorer can load an exact match to training-time spec_hash for reproducibility.
+    spec_hash: Optional[str] = None
+    if feature_spec_path is not None:
+        _fsp = Path(feature_spec_path)
+        if _fsp.exists():
+            import shutil as _shutil
+            _shutil.copy2(_fsp, MODEL_DIR / "feature_spec.yaml")
+            spec_hash = hashlib.md5(_fsp.read_bytes()).hexdigest()[:12]
     # v10 single-model format (DEC-021): one model.pkl only
     if rated:
         _pkl_path = MODEL_DIR / "model.pkl"
@@ -2107,7 +2198,7 @@ def save_artifact_bundle(
                 "profile" if c in PROFILE_FEATURE_COLS
                 else "B" if c in TRACK_B_FEATURE_COLS
                 else "legacy" if c in _legacy_set
-                else "A"   # Track A (Featuretools DFS — DEC-020)
+                else "LLM"   # Track LLM (DuckDB + feature spec)
             ),
         }
         for c in feature_cols
@@ -2117,7 +2208,7 @@ def save_artifact_bundle(
     )
 
     # reason_code_map.json: feature name -> short reason code for SHAP output.
-    # Static entries for Track B + legacy features; Track A features fall back
+    # Static entries for Track B + legacy features; Track LLM features fall back
     # to a generated code so the scorer never hits a missing-key error.
     _STATIC_REASON_CODES: dict[str, str] = {
         "loss_streak": "LOSS_STREAK",
@@ -2171,6 +2262,8 @@ def save_artifact_bundle(
                 "sample_rated_n": sample_rated_n,
                 # R703: uncalibrated_threshold=True means the 0.5 fallback was used.
                 "uncalibrated_threshold": _uncalibrated_threshold,
+                # DEC-024 / R3501: SHA-256 prefix of the frozen feature spec for audit.
+                "spec_hash": spec_hash,
             },
             indent=2,
             default=str,
@@ -2178,14 +2271,13 @@ def save_artifact_bundle(
         encoding="utf-8",
     )
 
-    # Legacy backward-compat: pick the better model (rated if available)
-    legacy_source = rated or nonrated
-    if legacy_source:
+    # Legacy backward-compat: write rated model as walkaway_model.pkl
+    if rated:
         joblib.dump(
             {
-                "model": legacy_source["model"],
-                "features": legacy_source["features"],
-                "threshold": legacy_source["threshold"],
+                "model": rated["model"],
+                "features": rated["features"],
+                "threshold": rated["threshold"],
             },
             MODEL_DIR / "walkaway_model.pkl",
         )
@@ -2206,8 +2298,8 @@ def run_pipeline(args) -> None:
     fast_mode = getattr(args, "fast_mode", False)
     # --fast-mode implies --skip-optuna; allow either flag independently.
     skip_optuna = getattr(args, "skip_optuna", False) or fast_mode
-    # --no-afg (No Automatic Feature Generation, DEC-020): skip Track A DFS.
-    # --fast-mode implies --no-afg to avoid the heavy Featuretools dependency
+    # --no-afg (No Automatic Feature Generation, DEC-020): skip Track LLM generation.
+    # --fast-mode implies --no-afg to reduce compute when iterating quickly.
     # when iterating quickly on a short data horizon.
     no_afg = getattr(args, "no_afg", False) or fast_mode
     # --fast-mode-no-preload: disable session full-table preload; use per-day
@@ -2442,18 +2534,13 @@ def run_pipeline(args) -> None:
         print("[Step 5/10] Load player_profile done in %.1fs (not available)" % _el, flush=True)
         logger.info("player_profile: not available — profile features will be NaN (%.1fs)", _el)
 
-    # 3d. Track A: DFS exploration (DEC-020).
-    # R906: process_chunk (run_afg=True on the first chunk) handles DFS internally
-    # to allow reuse of the first chunk's already-loaded data without double-loading.
-    # R903: delete stale feature_defs.json before the chunk loop so that the first
-    # chunk (run_afg=True) always produces a fresh DFS exploration result.
-    _feature_defs_pipeline_path = FEATURE_DEFS_DIR / "feature_defs.json"
-    if not no_afg and _feature_defs_pipeline_path.exists():
-        _feature_defs_pipeline_path.unlink()
-        logger.info("Track A: removed stale feature_defs.json before DFS (R903)")
+    feature_spec: Optional[dict] = None
+    if not no_afg:
+        feature_spec = load_feature_spec(FEATURE_SPEC_PATH)
+        logger.info("Track LLM: loaded feature spec from %s", FEATURE_SPEC_PATH)
 
     # 4. Process chunks -> write parquet
-    print("[Step 6/10] Process chunks (DQ, labels, Track B, Track A)…", flush=True)
+    print("[Step 6/10] Process chunks (DQ, labels, Track Human, Track LLM)…", flush=True)
     t0 = time.perf_counter()
     chunk_paths = []
     for i, chunk in enumerate(chunks):
@@ -2464,8 +2551,8 @@ def run_pipeline(args) -> None:
             use_local_parquet=use_local,
             force_recompute=force,
             profile_df=profile_df,
+            feature_spec=feature_spec,
             no_afg=no_afg,
-            run_afg=(i == 0 and not no_afg),
         )
         if path is not None:
             chunk_paths.append(path)
@@ -2608,26 +2695,23 @@ def run_pipeline(args) -> None:
     else:
         active_feature_cols = ALL_FEATURE_COLS
 
-    # 5b. Full-feature screening (DEC-020, todo-track-a-screening-no-afg step 1-2).
+    # 5b. Full-feature screening (DEC-020).
     # Runs on the TRAINING SET ONLY to comply with TRN-09 anti-leakage rules.
     #
-    # Candidate set = active_feature_cols (Track B + Legacy + Profile) PLUS any
-    # Track A columns loaded from feature_defs.json (R1000: use saved defs, not
-    # raw numeric heuristic, to avoid mistaking metadata columns as Track A).
-    if not no_afg and _feature_defs_pipeline_path.exists():
-        # R1000: derive Track A candidate columns from the saved feature definitions
-        # rather than a raw numeric-column heuristic.
-        _saved_defs = load_feature_defs(_feature_defs_pipeline_path)
-        _track_a_cols = [
-            fd.get_name() for fd in _saved_defs
-            if fd.get_name() in train_df.columns
+    # Candidate set = active_feature_cols (Track Human + Legacy + Profile) PLUS
+    # Track LLM candidate columns declared in feature spec and present in train_df.
+    if not no_afg and feature_spec is not None:
+        _track_llm_cols = [
+            cand.get("feature_id")
+            for cand in (feature_spec.get("track_llm", {}) or {}).get("candidates", [])
+            if cand.get("feature_id") in train_df.columns
         ]
-        if _track_a_cols:
+        if _track_llm_cols:
             logger.info(
-                "screen_features: loaded %d Track A candidate columns from feature_defs.json",
-                len(_track_a_cols),
+                "screen_features: loaded %d Track LLM candidate columns from feature spec",
+                len(_track_llm_cols),
             )
-        _all_candidate_cols: List[str] = active_feature_cols + _track_a_cols
+        _all_candidate_cols: List[str] = list(dict.fromkeys(active_feature_cols + _track_llm_cols))
     else:
         _all_candidate_cols = active_feature_cols
 
@@ -2657,9 +2741,8 @@ def run_pipeline(args) -> None:
             len(_present_candidate_cols), len(screened_cols), _el,
         )
         # R1001: post-screening sanity — ensure at least one Track-B feature survives.
-        # If screening removes all Track-B features the nonrated model loses its core
-        # engineered signals.  Re-add any missing Track-B features from train_df as a
-        # fallback rather than failing silently.
+        # Re-add any missing Track-B features from train_df as a fallback rather than
+        # failing silently.
         _screened_set = set(screened_cols)
         if not _screened_set.intersection(TRACK_B_FEATURE_COLS):
             _missing_track_b = [c for c in TRACK_B_FEATURE_COLS if c in train_df.columns]
@@ -2716,13 +2799,23 @@ def run_pipeline(args) -> None:
     print("[Step 10/10] Save artifact bundle…", flush=True)
     t0 = time.perf_counter()
     save_artifact_bundle(
-        rated_art, None, active_feature_cols, combined_metrics, model_version,
+        rated_art, active_feature_cols, combined_metrics, model_version,
         fast_mode=fast_mode,
         sample_rated_n=sample_rated_n,
+        feature_spec_path=FEATURE_SPEC_PATH if not no_afg else None,
     )
     _el = time.perf_counter() - t0
     print("[Step 10/10] Save artifact bundle done in %.1fs" % _el, flush=True)
     logger.info("save_artifact_bundle: %.1fs", _el)
+
+    # Remove stale nonrated_model.pkl / rated_model.pkl left over from previous
+    # dual-model runs so scorer/backtester cannot accidentally fall back to a
+    # v9 artifact (v10 uses model.pkl only).
+    for _stale in ["nonrated_model.pkl", "rated_model.pkl"]:
+        _stale_path = MODEL_DIR / _stale
+        if _stale_path.exists():
+            _stale_path.unlink()
+            logger.info("Removed stale artifact: %s", _stale)
 
     total_sec = time.perf_counter() - pipeline_start
     print("All steps completed. Pipeline total: %.1fs (%.1f min)" % (total_sec, total_sec / 60.0), flush=True)
@@ -2778,7 +2871,7 @@ def main() -> None:
             "effective training window — no 365-day lookback pushed back for profiles. "
             "Profile features are dynamically layered based on the available data horizon. "
             "Profile snapshots follow month-end schedule (same as full mode). "
-            "Implies --skip-optuna and --no-afg (skips Track A DFS). "
+            "Implies --skip-optuna and --no-afg (skips Track LLM generation). "
             "Use --sample-rated N (separate flag) to also sample rated patrons. "
             "NEVER use artifacts from this mode in production — "
             "training_metrics.json will be flagged with fast_mode=true."
@@ -2787,14 +2880,12 @@ def main() -> None:
     parser.add_argument(
         "--no-afg", action="store_true",
         help=(
-            "No Automatic Feature Generation (DEC-020): skip Track A Featuretools DFS "
-            "exploration entirely. Feature screening still runs on Track B + "
-            "player-level/profile features; feature_list.json will not contain Track A "
-            "features and no saved_feature_defs are produced. "
-            "Scorer then computes only Track B + profile (no Featuretools). "
+            "No Automatic Feature Generation (DEC-020): skip Track LLM (DuckDB) "
+            "feature generation. Feature screening still runs on Track Human + "
+            "player-level/profile + legacy features. "
+            "Scorer then computes only Track Human + profile (+ legacy). "
             "Orthogonal to --fast-mode (--fast-mode implies --no-afg). "
-            "Use when Featuretools is unavailable, for faster iteration, or "
-            "to validate the Track B + profile path independently."
+            "Use for faster iteration or to validate the non-LLM path independently."
         ),
     )
     parser.add_argument(

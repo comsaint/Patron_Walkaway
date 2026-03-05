@@ -9,7 +9,6 @@ to be removed once the corresponding production fixes are implemented.
 
 from __future__ import annotations
 
-import ast
 import importlib
 import inspect
 import pathlib
@@ -120,31 +119,11 @@ class TestFeaturesReviewRisksRound9(unittest.TestCase):
         self.assertEqual(int(hc.loc[1]), 0)
 
     def test_r19_build_entity_set_applies_hist_avg_bet_cap(self):
-        """R19: build_entity_set should clip wager/payout/turnover by HIST_AVG_BET_CAP (F2)."""
-        # This is enforced as a lint-like structural rule:
-        # `build_entity_set` should contain a `.clip(...HIST_AVG_BET_CAP...)` call.
-        src = inspect.getsource(FEATURES.build_entity_set)
-        tree = ast.parse(src)
-
-        def _call_uses_cap(node: ast.Call) -> bool:
-            # Match: <expr>.clip(upper=HIST_AVG_BET_CAP) or .clip(HIST_AVG_BET_CAP)
-            # We accept any of: keyword upper=Name('HIST_AVG_BET_CAP') or positional.
-            for kw in node.keywords:
-                if kw.arg == "upper" and isinstance(kw.value, ast.Name) and kw.value.id == "HIST_AVG_BET_CAP":
-                    return True
-            for arg in node.args:
-                if isinstance(arg, ast.Name) and arg.id == "HIST_AVG_BET_CAP":
-                    return True
-            return False
-
-        found = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "clip":
-                if _call_uses_cap(node):
-                    found = True
-                    break
-
-        self.assertTrue(found, "build_entity_set is expected to clip numeric columns using HIST_AVG_BET_CAP")
+        """R19: legacy Track-A build_entity_set should not exist after cleanup."""
+        self.assertFalse(
+            hasattr(FEATURES, "build_entity_set"),
+            "build_entity_set should be removed after Track-A/Featuretools cleanup.",
+        )
 
     def test_r21_compute_run_boundary_accepts_cutoff_time_param(self):
         """R21: compute_run_boundary should accept cutoff_time to match other Track B APIs."""

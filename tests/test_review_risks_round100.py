@@ -142,7 +142,7 @@ class TestR109FastModeUsesWhitelistForProfileLoad(unittest.TestCase):
              patch("trainer.trainer.ensure_player_profile_ready"), \
              patch("trainer.trainer.load_player_profile") as mock_load_profile, \
              patch("trainer.trainer.process_chunk") as mock_process, \
-             patch("trainer.trainer.train_dual_model") as mock_train, \
+             patch("trainer.trainer.train_single_rated_model") as mock_train, \
              patch("trainer.trainer.save_artifact_bundle"):
             from zoneinfo import ZoneInfo
             HK = ZoneInfo("Asia/Hong_Kong")

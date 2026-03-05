@@ -12,15 +12,14 @@ import unittest
 import trainer.trainer as trainer_mod
 
 
-class TestR1000TrackADetection(unittest.TestCase):
-    """R1000: Track A detection should not rely on raw numeric column heuristics."""
+class TestR1000TrackLlmDetection(unittest.TestCase):
+    """R1000: Track LLM detection should come from feature spec, not heuristics."""
 
-    def test_track_a_detection_should_use_feature_defs_not_numeric_heuristic(self):
+    def test_track_llm_detection_should_use_feature_spec_not_numeric_heuristic(self):
         src = inspect.getsource(trainer_mod.run_pipeline)
-        self.assertIn(
-            "load_feature_defs(",
-            src,
-            "Track A candidate columns should come from feature_defs.json, not numeric heuristics.",
+        self.assertTrue(
+            ("load_feature_spec(" in src) or ("feature_spec.get(\"track_llm\"" in src),
+            "Track LLM candidate columns should come from feature spec, not numeric heuristics.",
         )
 
 
@@ -35,14 +34,15 @@ class TestR1001ScreeningSanity(unittest.TestCase):
         )
 
 
-class TestR1002DfsLeakageGuard(unittest.TestCase):
-    """R1002: DFS exploration should exclude extended-zone bets."""
+class TestR1002TrackLlmLeakageGuard(unittest.TestCase):
+    """R1002: Track LLM computation should pass cutoff_time guard."""
 
-    def test_dfs_should_filter_to_core_window_before_run_track_a_dfs(self):
+    def test_track_llm_should_pass_cutoff_time_window_end(self):
         src = inspect.getsource(trainer_mod.process_chunk)
-        self.assertTrue(
-            'run_track_a_dfs(_dfs_bets' in src or 'run_track_a_dfs(dfs_bets' in src,
-            "process_chunk should pass window-filtered bets to run_track_a_dfs.",
+        self.assertIn(
+            "cutoff_time=window_end",
+            src,
+            "process_chunk should pass cutoff_time=window_end to Track LLM compute.",
         )
 
 
@@ -69,15 +69,15 @@ class TestR1004ScreeningSkipFallback(unittest.TestCase):
         )
 
 
-class TestR1006SessionsCanonicalId(unittest.TestCase):
-    """R1006: DFS call path should construct canonical_id for sessions."""
+class TestR1006CanonicalIdFallback(unittest.TestCase):
+    """R1006: process_chunk should keep canonical_id fallback for missing mappings."""
 
-    def test_process_chunk_dfs_should_prepare_sessions_canonical_id(self):
+    def test_process_chunk_should_prepare_canonical_id(self):
         src = inspect.getsource(trainer_mod.process_chunk)
         self.assertIn(
-            '_dfs_sessions["canonical_id"] =',
+            'bets["canonical_id"] = bets["canonical_id"].fillna',
             src,
-            "process_chunk DFS path should ensure sessions has canonical_id before run_track_a_dfs.",
+            "process_chunk should ensure canonical_id fallback before feature computation.",
         )
 
 

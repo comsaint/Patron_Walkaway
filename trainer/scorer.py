@@ -4,8 +4,8 @@ Near real-time scoring daemon.
 
 Key changes from pre-Phase-1 version
 --------------------------------------
-* Dual-model artifacts: rated_model.pkl + nonrated_model.pkl (falls back to
-  legacy walkaway_model.pkl when new artifacts are absent).
+* Single rated-model artifact: model.pkl (v10 DEC-021; falls back to
+  rated_model.pkl or legacy walkaway_model.pkl when model.pkl is absent).
 * D2 identity resolution via identity.py build_canonical_mapping_from_df.
 * Track B features via features.py (compute_loss_streak / compute_run_boundary)
   — guarantees train-serve parity with trainer.py. (table_hc deferred to Phase 2.)
@@ -66,15 +66,15 @@ try:
     from features import (  # type: ignore[import]
         compute_loss_streak,
         compute_run_boundary,
-        build_entity_set,
-        load_feature_defs,
+        compute_track_llm_features,
+        load_feature_spec,
     )
 except ImportError:
     from trainer.features import (  # type: ignore[import, attr-defined]
         compute_loss_streak,
         compute_run_boundary,
-        build_entity_set,
-        load_feature_defs,
+        compute_track_llm_features,
+        load_feature_spec,
     )
 
 try:
@@ -91,6 +91,7 @@ STATE_DIR = BASE_DIR / "local_state"
 STATE_DIR.mkdir(exist_ok=True)
 STATE_DB_PATH = STATE_DIR / "state.db"
 MODEL_DIR = BASE_DIR / "models"
+FEATURE_SPEC_PATH = BASE_DIR / "feature_spec" / "features_candidates.template.yaml"
 
 RETENTION_HOURS: int = getattr(config, "SCORER_STATE_RETENTION_HOURS", 48)
 SESSION_AVAIL_DELAY_MIN: int = getattr(config, "SESSION_AVAIL_DELAY_MIN", 15)
@@ -111,21 +112,20 @@ _NEW_ALERT_COLS: List[Tuple[str, str]] = [
 
 # ── Artifact loading ──────────────────────────────────────────────────────────
 def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
-    """Load model(s), feature list, reason code map, model version.
+    """Load model artifacts, feature list, reason code map, model version.
 
     Priority (v10): model.pkl → rated_model.pkl → walkaway_model.pkl.
 
     Returns dict:
         rated        : {"model": lgb.Booster, "threshold": float} or None
-        nonrated     : {"model": lgb.Booster, "threshold": float} or None
         feature_list : List[str]
         reason_code_map : Dict[str, str]
         model_version   : str
+        feature_spec    : parsed YAML dict or None
     """
     d = model_dir or MODEL_DIR
     model_path = d / "model.pkl"      # v10 single-model artifact
     rated_path = d / "rated_model.pkl"
-    nonrated_path = d / "nonrated_model.pkl"
     feature_list_path = d / "feature_list.json"
     reason_map_path = d / "reason_code_map.json"
     version_path = d / "model_version"
@@ -133,24 +133,29 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
 
     artifacts: dict = {
         "rated": None,
-        "nonrated": None,
         "feature_list": [],
         "reason_code_map": {},
         "model_version": "unknown",
-        "saved_feature_defs": None,  # Track A Featuretools definitions (DEC-002/R45)
+        "feature_spec": None,
     }
 
     if version_path.exists():
         artifacts["model_version"] = version_path.read_text(encoding="utf-8").strip()
 
-    # Track A: load saved Featuretools feature definitions when available (DEC-002/R45)
-    _feature_defs_dir = d / "saved_feature_defs"
-    _feature_defs_path = _feature_defs_dir / "feature_defs.json"
-    if _feature_defs_dir.exists() and _feature_defs_path.exists():
+    # Track LLM: prefer the frozen feature_spec.yaml inside the model artifact
+    # directory (DEC-024 / R3507) for exact train-serve reproducibility.
+    # Fall back to the global template when no frozen copy exists.
+    _frozen_spec = d / "feature_spec.yaml"
+    if _frozen_spec.exists():
         try:
-            artifacts["saved_feature_defs"] = load_feature_defs(_feature_defs_path)
+            artifacts["feature_spec"] = load_feature_spec(_frozen_spec)
         except Exception as exc:
-            logger.warning("[scorer] saved_feature_defs not loaded: %s", exc)
+            logger.warning("[scorer] frozen feature spec not loaded: %s; falling back to global", exc)
+    if artifacts["feature_spec"] is None and FEATURE_SPEC_PATH.exists():
+        try:
+            artifacts["feature_spec"] = load_feature_spec(FEATURE_SPEC_PATH)
+        except Exception as exc:
+            logger.warning("[scorer] feature spec not loaded: %s", exc)
 
     if feature_list_path.exists():
         with feature_list_path.open(encoding="utf-8") as fh:
@@ -197,23 +202,17 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         )
         return artifacts
 
-    if rated_path.exists() and nonrated_path.exists():
+    if rated_path.exists():
         rb = joblib.load(rated_path)
-        nb = joblib.load(nonrated_path)
         artifacts["rated"] = {
             "model": rb["model"],
             "threshold": float(rb.get("threshold", 0.5)),
-            "features": rb.get("features", []),  # R83: model-specific feature subset
-        }
-        artifacts["nonrated"] = {
-            "model": nb["model"],
-            "threshold": float(nb.get("threshold", 0.5)),
-            "features": nb.get("features", []),  # R83: nonrated trained without profile cols
+            "features": rb.get("features", []),
         }
         if not artifacts["feature_list"]:
             artifacts["feature_list"] = rb.get("features", [])
         logger.info(
-            "[scorer] Dual models loaded (v=%s, %d features)",
+            "[scorer] Rated model loaded from rated_model.pkl (v=%s, %d features)",
             artifacts["model_version"],
             len(artifacts["feature_list"]),
         )
@@ -227,7 +226,7 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         }
         if not artifacts["feature_list"]:
             artifacts["feature_list"] = bundle.get("features", [])
-        logger.warning("[scorer] Dual models absent; using legacy walkaway_model.pkl")
+        logger.warning("[scorer] rated_model.pkl absent; using legacy walkaway_model.pkl")
         return artifacts
 
     raise FileNotFoundError(
@@ -332,9 +331,8 @@ def fetch_recent_data(
     if len(bets) != before:
         logger.debug("[scorer] filtered zero-wager bets: %d->%d", before, len(bets))
 
-    # Normalize payout_complete_dtm to tz-aware HK time so that Track-A
-    # cutoff_time (now_hk, tz-aware) is consistent with the EntitySet
-    # time_index when Featuretools computes features (R62).
+    # Normalize payout_complete_dtm to tz-aware HK time so Track LLM cutoff_time
+    # (now_hk, tz-aware) stays consistent with scoring window timestamps.
     if not bets.empty and "payout_complete_dtm" in bets.columns:
         pcd = pd.to_datetime(bets["payout_complete_dtm"])
         if pcd.dt.tz is None:
@@ -920,13 +918,14 @@ def _score_df(
     artifacts: dict,
     feature_list: List[str],
 ) -> pd.DataFrame:
-    """Route each observation to rated/nonrated model (H3) and compute scores.
+    """Score all observations with the rated model and compute margin.
 
     Sets columns: score, is_rated_obs (int 0/1), margin.
-    Requires df["is_rated"] (bool) to already be set by caller.
+    All observations (rated and unrated) are scored with the single rated model
+    (v10 DEC-021).  Unrated observations are scored for volume telemetry only;
+    alerts are only generated for rated observations (is_rated_obs == 1).
     """
     rated_art = artifacts.get("rated")
-    nonrated_art = artifacts.get("nonrated")
 
     df = df.copy()
     # R74/R79: profile features stay NaN when no prior snapshot exists —
@@ -954,33 +953,15 @@ def _score_df(
     )
     scores = np.zeros(len(df), dtype=float)
 
-    rated_mask = is_rated
-    nonrated_mask = ~is_rated
-
-    _fallback = rated_art if nonrated_art is None else nonrated_art
-
-    if rated_mask.any():
-        _model_r = (rated_art or _fallback)  # type: ignore[operator]
-        rated_features = (_model_r or {}).get("features") or feature_list  # type: ignore[union-attr]
-        scores[rated_mask] = _model_r["model"].predict_proba(  # type: ignore[index]
-            df.loc[rated_mask, rated_features]
-        )[:, 1]
-
-    if nonrated_mask.any():
-        _model_nr = (nonrated_art or rated_art)  # type: ignore[operator]
-        model = _model_nr["model"]  # type: ignore[index]
-        # R83: use nonrated model's own feature subset — it was trained without PROFILE_FEATURE_COLS
-        nonrated_features = _model_nr.get("features") or feature_list  # type: ignore[union-attr]
-        scores[nonrated_mask] = model.predict_proba(
-            df.loc[nonrated_mask, nonrated_features]
-        )[:, 1]
+    if rated_art is not None and len(df) > 0:
+        model_features = rated_art.get("features") or feature_list
+        scores = rated_art["model"].predict_proba(df[model_features])[:, 1]
 
     df["score"] = scores
     df["is_rated_obs"] = is_rated.astype(int)
 
     rated_t = float((rated_art or {}).get("threshold", 0.5))
-    nonrated_t = float((nonrated_art or {}).get("threshold", 0.5))
-    df["margin"] = df["score"] - np.where(is_rated, rated_t, nonrated_t)
+    df["margin"] = df["score"] - rated_t
 
     return df
 
@@ -1114,7 +1095,6 @@ def score_once(
     alert_history: set,
     conn: sqlite3.Connection,
     retention_hours: int = RETENTION_HOURS,
-    unrated_only: bool = False,
 ) -> None:
     """Run one scoring cycle.
 
@@ -1123,10 +1103,9 @@ def score_once(
     1. Fetch bets + sessions (FND-01 CTE, H2 session_avail_dtm gate).
     2. D2 identity via build_canonical_mapping_from_df.
     3. Build Track B + session rolling features (train-serve parity).
-    4. H3 routing flag: is_rated ← canonical_id has casino_player_id.
-       If unrated_only=True, is_rated is forced to False for all observations.
-    5. Dual model scoring via _score_df.
-    6. SHAP reason codes for alert candidates.
+    4. Set is_rated flag: canonical_id in rated mapping.
+    5. Single rated model scoring via _score_df (v10 DEC-021).
+    6. SHAP reason codes for rated alert candidates.
     7. Session stats, duplicate suppression, DB write.
     """
     now_hk = datetime.now(HK_TZ)
@@ -1162,34 +1141,31 @@ def score_once(
     # ── Features on full window (for rolling context) ─────────────────────
     features_all = build_features_for_scoring(bets, sessions, canonical_map, now_hk)
 
-    # Track A: apply saved Featuretools feature definitions when available (DEC-002/R45)
-    _saved_feature_defs = artifacts.get("saved_feature_defs")
-    if _saved_feature_defs is not None:
+    # Track LLM: compute DuckDB features from feature spec when available.
+    _feature_spec = artifacts.get("feature_spec")
+    if _feature_spec is not None:
+        _n_before_llm = len(features_all)
         try:
-            import featuretools as ft  # type: ignore[import]
-
-            _cutoff_df = pd.DataFrame(
-                {
-                    "bet_id": bets["bet_id"].values,
-                    "cutoff_time": now_hk,
-                }
+            features_all = compute_track_llm_features(
+                features_all,
+                feature_spec=_feature_spec,
+                cutoff_time=now_hk,
             )
-            _es = build_entity_set(bets, sessions, canonical_map)
-            _fm = ft.calculate_feature_matrix(
-                _saved_feature_defs, _es, _cutoff_df, verbose=False
-            )
-            features_all = features_all.merge(
-                _fm.reset_index(), on="bet_id", how="left", suffixes=("", "_track_a")
-            )
-            logger.info("[scorer] Track A merged (%d extra features)", len(_fm.columns))
+            # R3503: log if cutoff filtering silently reduced the scoring window.
+            if len(features_all) < _n_before_llm:
+                logger.warning(
+                    "[scorer] Track LLM dropped %d rows (cutoff filter)",
+                    _n_before_llm - len(features_all),
+                )
+            logger.info("[scorer] Track LLM computed for scoring window")
         except Exception as exc:
-            logger.warning("[scorer] Track A features skipped: %s", exc)
+            logger.error("[scorer] Track LLM failed: %s", exc)
 
     # ── player_profile PIT join (R79) ─────────────────────────────────
     # Attach rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
     # Non-rated bets and bets without a prior snapshot keep NaN — LightGBM handles
     # this natively via the default-child path trained in trainer.py (R74/R79).
-    if _join_profile is not None and PROFILE_FEATURE_COLS and rated_canonical_ids and not unrated_only:
+    if _join_profile is not None and PROFILE_FEATURE_COLS and rated_canonical_ids:
         _profile_df = _load_profile_for_scoring(rated_canonical_ids, now_hk)
         if _profile_df is not None:
             features_all = _join_profile(features_all, _profile_df)
@@ -1200,10 +1176,6 @@ def score_once(
             )
 
     features_all["is_rated"] = features_all["canonical_id"].isin(rated_canonical_ids)
-    # --unrated-only: force all observations through the nonrated model
-    if unrated_only:
-        features_all["is_rated"] = False
-        logger.info("[scorer] unrated_only=True: all observations routed to nonrated model")
     logger.info("[scorer] Feature rows (full window): %d", len(features_all))
 
     new_ids = set(new_bets["bet_id"].astype(str))
@@ -1242,17 +1214,20 @@ def score_once(
     # ── Score with H3 routing ─────────────────────────────────────────────
     features_df = _score_df(features_df, artifacts, feature_list)
 
-    # ── Alert candidates (margin >= 0 means score >= threshold) ───────────
-    alert_candidates = features_df[features_df["margin"] >= 0].copy()
+    # ── Alert candidates: score >= threshold AND rated observations only ──
+    # Unrated observations are scored for volume telemetry (UNRATED_VOLUME_LOG)
+    # but must not be emitted as alerts (v10 DEC-021).
+    alert_candidates = features_df[
+        (features_df["margin"] >= 0) & (features_df["is_rated_obs"] == 1)
+    ].copy()
     if alert_candidates.empty:
         logger.info("[scorer] No above-threshold alerts this cycle")
         return
     logger.info("[scorer] Above-threshold rows: %d", len(alert_candidates))
 
-    # ── SHAP reason codes for alert candidates ────────────────────────────
+    # ── SHAP reason codes for rated alert candidates ──────────────────────
     alert_candidates["reason_codes"] = "[]"
     rated_art = artifacts.get("rated")
-    nonrated_art = artifacts.get("nonrated")
     rated_mask_ac = alert_candidates["is_rated_obs"].astype(bool)
 
     rated_idx = alert_candidates.index[rated_mask_ac].tolist()
@@ -1261,13 +1236,6 @@ def score_once(
         X_r = alert_candidates.loc[rated_idx, _rated_feats]
         rc_r = _compute_reason_codes(rated_art["model"], X_r, artifacts["reason_code_map"])
         alert_candidates.loc[rated_idx, "reason_codes"] = rc_r
-
-    nonrated_idx = alert_candidates.index[~rated_mask_ac].tolist()
-    if nonrated_idx and nonrated_art is not None and feature_list:
-        _nonrated_feats = nonrated_art.get("features") or feature_list
-        X_nr = alert_candidates.loc[nonrated_idx, _nonrated_feats]
-        rc_nr = _compute_reason_codes(nonrated_art["model"], X_nr, artifacts["reason_code_map"])
-        alert_candidates.loc[nonrated_idx, "reason_codes"] = rc_nr
 
     # ── Session stats ─────────────────────────────────────────────────────
     session_agg = (
@@ -1365,10 +1333,6 @@ def main() -> None:
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING"],
     )
-    parser.add_argument(
-        "--unrated-only", action="store_true",
-        help="Use only the non-rated model for all patrons (ignore rated/unrated routing)",
-    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1378,10 +1342,9 @@ def main() -> None:
 
     artifacts = load_dual_artifacts(args.model_dir)
     logger.info(
-        "[scorer] Loaded model v=%s, rated=%s, nonrated=%s, %d features",
+        "[scorer] Loaded model v=%s, rated=%s, %d features",
         artifacts["model_version"],
         "yes" if artifacts["rated"] else "no",
-        "yes" if artifacts["nonrated"] else "no",
         len(artifacts["feature_list"]),
     )
 
@@ -1395,8 +1358,7 @@ def main() -> None:
     while True:
         t_start = time.time()
         try:
-            score_once(artifacts, args.lookback_hours, alert_history, conn, RETENTION_HOURS,
-                       unrated_only=args.unrated_only)
+            score_once(artifacts, args.lookback_hours, alert_history, conn, RETENTION_HOURS)
         except Exception as exc:
             logger.error("[scorer] ERROR: %s", exc, exc_info=True)
         elapsed = time.time() - t_start

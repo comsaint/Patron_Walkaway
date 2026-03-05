@@ -302,10 +302,11 @@ _MAX_SCORE_ROWS = 10_000
 
 
 def _load_artifacts() -> dict | None:
-    """Load dual-model artifacts from MODEL_DIR.
+    """Load model artifacts from MODEL_DIR (v10 single rated model, DEC-021).
 
-    Returns a dict with keys: rated, nonrated, feature_list, reason_code_map,
-    model_version.  Returns None when no model file is found.
+    Returns a dict with keys: rated, feature_list, reason_code_map,
+    model_version, training_metrics, rated_explainer.
+    Returns None when no model file is found.
     """
     try:
         import joblib  # type: ignore[import]
@@ -315,7 +316,6 @@ def _load_artifacts() -> dict | None:
 
     model_path = MODEL_DIR / "model.pkl"        # v10 single rated model
     rated_path = MODEL_DIR / "rated_model.pkl"
-    nonrated_path = MODEL_DIR / "nonrated_model.pkl"
     legacy_path = MODEL_DIR / "walkaway_model.pkl"
     feature_list_path = MODEL_DIR / "feature_list.json"
     reason_map_path = MODEL_DIR / "reason_code_map.json"
@@ -323,7 +323,6 @@ def _load_artifacts() -> dict | None:
 
     arts: dict = {
         "rated": None,
-        "nonrated": None,
         "feature_list": [],
         "reason_code_map": {},
         "model_version": "unknown",
@@ -345,67 +344,40 @@ def _load_artifacts() -> dict | None:
 
     # ── Read each pkl once, verify sha256, cache raw bytes for in-memory
     #    deserialization — avoids double I/O (R48, R58) ──
-    # Priority: model.pkl (v10) > rated+nonrated pair > legacy walkaway_model.pkl
+    # Priority: model.pkl (v10) > rated_model.pkl > legacy walkaway_model.pkl
     _pkl_raw: dict = {}
-    for pkl_path in [model_path, rated_path, nonrated_path, legacy_path]:
+    for pkl_path in [model_path, rated_path, legacy_path]:
         if pkl_path.exists():
             raw = pkl_path.read_bytes()
             digest = hashlib.sha256(raw).hexdigest()
             print(f"[api] {pkl_path.name} sha256={digest}")
             _pkl_raw[pkl_path] = raw
 
-    # v10: prefer model.pkl (single rated model)
+    def _load_model_pkl(rb: dict, src_name: str) -> None:
+        arts["rated"] = {"model": rb["model"], "threshold": float(rb.get("threshold", 0.5))}
+        arts["training_metrics"] = rb.get("metrics", {})
+        if not arts["feature_list"]:
+            arts["feature_list"] = rb.get("features", [])
+        try:
+            import shap  # type: ignore[import]
+            arts["rated_explainer"] = shap.TreeExplainer(rb["model"])
+        except Exception as exc:
+            print(f"[api] SHAP explainer pre-build failed ({src_name}): {exc}")
+            arts["rated_explainer"] = None
+
     if model_path in _pkl_raw:
         rb = joblib.load(io.BytesIO(_pkl_raw[model_path]))
-        arts["rated"] = {"model": rb["model"], "threshold": float(rb.get("threshold", 0.5))}
-        arts["training_metrics"] = rb.get("metrics", {})
-        if not arts["feature_list"]:
-            arts["feature_list"] = rb.get("features", [])
-        try:
-            import shap  # type: ignore[import]
-            arts["rated_explainer"] = shap.TreeExplainer(rb["model"])
-            arts["nonrated_explainer"] = None
-        except Exception as exc:
-            print(f"[api] SHAP explainer pre-build failed: {exc}")
-            arts["rated_explainer"] = None
-            arts["nonrated_explainer"] = None
+        _load_model_pkl(rb, "model.pkl")
         return arts
-    elif rated_path in _pkl_raw and nonrated_path in _pkl_raw:
+
+    if rated_path in _pkl_raw:
         rb = joblib.load(io.BytesIO(_pkl_raw[rated_path]))
-        nb = joblib.load(io.BytesIO(_pkl_raw[nonrated_path]))
-        arts["rated"] = {"model": rb["model"], "threshold": float(rb.get("threshold", 0.5))}
-        arts["nonrated"] = {"model": nb["model"], "threshold": float(nb.get("threshold", 0.5))}
-        arts["training_metrics"] = rb.get("metrics", {})
-        if not arts["feature_list"]:
-            arts["feature_list"] = rb.get("features", [])
-        # ── Cache TreeExplainer objects (R49): avoids rebuild on every request ──
-        try:
-            import shap  # type: ignore[import]
-            arts["rated_explainer"] = shap.TreeExplainer(rb["model"])
-            arts["nonrated_explainer"] = shap.TreeExplainer(nb["model"])
-        except Exception as exc:
-            print(f"[api] SHAP explainer pre-build failed: {exc}")
-            arts["rated_explainer"] = None
-            arts["nonrated_explainer"] = None
+        _load_model_pkl(rb, "rated_model.pkl")
         return arts
 
     if legacy_path in _pkl_raw:
         bundle = joblib.load(io.BytesIO(_pkl_raw[legacy_path]))
-        arts["rated"] = {
-            "model": bundle["model"],
-            "threshold": float(bundle.get("threshold", 0.5)),
-        }
-        arts["training_metrics"] = bundle.get("metrics", {})
-        if not arts["feature_list"]:
-            arts["feature_list"] = bundle.get("features", [])
-        try:
-            import shap  # type: ignore[import]
-            arts["rated_explainer"] = shap.TreeExplainer(bundle["model"])
-            arts["nonrated_explainer"] = None
-        except Exception as exc:
-            print(f"[api] SHAP explainer pre-build failed: {exc}")
-            arts["rated_explainer"] = None
-            arts["nonrated_explainer"] = None
+        _load_model_pkl(bundle, "walkaway_model.pkl")
         return arts
 
     return None
@@ -497,7 +469,7 @@ def model_info():
     if arts is None:
         return jsonify({"error": "No model artifacts found; run trainer.py first"}), 503
 
-    model_type = "dual" if (arts["rated"] and arts["nonrated"]) else "legacy"
+    model_type = "rated" if arts["rated"] else "unavailable"
     metrics: dict = arts.get("training_metrics") or {}
 
     resp = jsonify(
@@ -523,8 +495,9 @@ def score():
       ]
 
     Each dict must contain every feature listed in feature_list.json.
-    ``is_rated`` (bool, optional, default false) controls H3 model routing:
-    true → rated model, false → non-rated model.
+    ``is_rated`` (bool, optional, default false) tracks patron rated status.
+    All observations are scored with the single rated model (v10 DEC-021).
+    Alerts are only generated for rated observations (is_rated=true).
 
     Output (JSON array, same order as input):
       [
@@ -602,43 +575,30 @@ def score():
         df["is_rated"] = False
     df["is_rated"] = df["is_rated"].fillna(False).astype(bool)
 
-    # ── Score each model segment (H3 routing) ─────────────────────────────────
+    # ── Score all observations with rated model (v10 DEC-021) ─────────────────
+    # Alerts are only generated for rated observations (is_rated=True).
     output: list = [None] * len(df)
+    is_rated_arr = df["is_rated"].to_numpy(dtype=bool)
 
-    for model_key, mask in [
-        ("rated", df["is_rated"]),
-        ("nonrated", ~df["is_rated"]),
-    ]:
-        subset_df = df[mask]
-        if subset_df.empty:
-            continue
-
-        model_info_d = arts.get(model_key) or arts.get("rated")
-        if model_info_d is None:
-            for orig_idx in subset_df.index:
-                output[int(orig_idx)] = {
-                    "score": None,
-                    "alert": False,
-                    "reason_codes": [],
-                    "model_version": version,
-                }
-            continue
-
+    model_info_d = arts.get("rated")
+    if model_info_d is None:
+        for i in range(len(df)):
+            output[i] = {"score": None, "alert": False, "reason_codes": [], "model_version": version}
+    else:
         lgbm_model = model_info_d["model"]
         threshold = model_info_d["threshold"]
-        X = subset_df[feature_list].values.astype(float) if feature_list else np.zeros((len(subset_df), 0))
+        X = df[feature_list].values.astype(float) if feature_list else np.zeros((len(df), 0))
         proba = lgbm_model.predict_proba(X)[:, 1]
-        cached_explainer = arts.get("rated_explainer") if model_key == "rated" else arts.get("nonrated_explainer")
+        cached_explainer = arts.get("rated_explainer")
         reason_codes_batch = _compute_shap_reason_codes_batch(
             cached_explainer, X, feature_list, reason_code_map
         )
-
-        for batch_i, orig_idx in enumerate(subset_df.index):
-            score_val = float(proba[batch_i])
-            output[int(orig_idx)] = {
+        for i in range(len(df)):
+            score_val = float(proba[i])
+            output[i] = {
                 "score": round(score_val, 4),
-                "alert": bool(score_val >= threshold),
-                "reason_codes": reason_codes_batch[batch_i],
+                "alert": bool(score_val >= threshold and is_rated_arr[i]),
+                "reason_codes": reason_codes_batch[i],
                 "model_version": version,
             }
 

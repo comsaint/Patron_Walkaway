@@ -24,22 +24,22 @@ _BACKTESTER_SRC = _BACKTESTER_PATH.read_text(encoding="utf-8")
 _SCORER_SRC = _SCORER_PATH.read_text(encoding="utf-8")
 
 
-class TestR1200BacktesterUnratedOnlyWiring(unittest.TestCase):
-    """R1200: backtester should implement --unrated-only end-to-end."""
+class TestR1200BacktesterUnratedOnlyRemoved(unittest.TestCase):
+    """R1200 (updated): backtester --unrated-only was removed in v10 DEC-021 (single rated model)."""
 
-    def test_backtest_signature_should_include_unrated_only(self):
+    def test_backtest_signature_should_not_include_unrated_only(self):
         sig = inspect.signature(backtester_mod.backtest)
-        self.assertIn(
+        self.assertNotIn(
             "unrated_only",
             sig.parameters,
-            "backtest() should accept unrated_only: bool = False",
+            "v10 backtest() should not accept unrated_only; single rated model only.",
         )
 
-    def test_backtester_cli_should_expose_unrated_only_flag(self):
-        self.assertIn(
+    def test_backtester_cli_should_not_expose_unrated_only_flag(self):
+        self.assertNotIn(
             "--unrated-only",
             _BACKTESTER_SRC,
-            "backtester CLI should expose --unrated-only",
+            "v10 backtester CLI should not expose --unrated-only",
         )
 
 
@@ -112,15 +112,18 @@ class TestR1204BacktesterMetricCallOverhead(unittest.TestCase):
         )
 
 
-class TestR1205ScorerUnratedOnlySkipsProfileJoin(unittest.TestCase):
-    """R1205: scorer should skip profile join path when unrated_only=True."""
+class TestR1205ScorerUnratedOnlyRemoved(unittest.TestCase):
+    """R1205 (updated): scorer --unrated-only was removed in v10 DEC-021 (single rated model).
 
-    def test_score_once_profile_join_condition_should_include_not_unrated_only(self):
-        src = inspect.getsource(scorer_mod.score_once)
-        self.assertIn(
-            "not unrated_only",
-            src,
-            "score_once should guard profile join with 'not unrated_only'.",
+    Profile join is now always performed for rated patrons; no conditional bypass needed.
+    """
+
+    def test_score_once_signature_should_not_include_unrated_only(self):
+        sig = inspect.signature(scorer_mod.score_once)
+        self.assertNotIn(
+            "unrated_only",
+            sig.parameters,
+            "v10 score_once() should not accept unrated_only parameter.",
         )
 
 

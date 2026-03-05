@@ -119,9 +119,8 @@ class TestReviewRisksRound38(unittest.TestCase):
         )
 
     def test_r49_api_should_cache_tree_explainer_objects(self):
-        """R49: /score should not rebuild TreeExplainer on every request."""
+        """R49: /score should not rebuild TreeExplainer on every request (rated model cache)."""
         self.assertIn("rated_explainer", _API_SRC)
-        self.assertIn("nonrated_explainer", _API_SRC)
 
     def test_r50_api_and_scorer_shap_mode_should_be_consistent(self):
         """R50: API and scorer should use consistent SHAP perturbation behavior."""

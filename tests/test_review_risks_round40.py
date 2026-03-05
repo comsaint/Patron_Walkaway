@@ -43,7 +43,7 @@ def _get_assign_src(tree: ast.Module, src: str, name: str) -> str:
 
 class TestReviewRisksRound40(unittest.TestCase):
     def test_r63_backtester_optuna_objective_does_not_use_g1_constraints(self):
-        """R63: DEC-010 requires F1 objective without G1 precision/alert gates."""
+        """R63: DEC-010 requires F-beta objective without G1 precision/alert gates."""
         src = _get_func_src(_BACKTESTER_TREE, _BACKTESTER_SRC, "run_optuna_threshold_search")
         self.assertNotIn("G1_PRECISION_MIN", src)
         self.assertNotIn("G1_ALERT_VOLUME_MIN_PER_HOUR", src)

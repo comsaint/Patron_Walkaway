@@ -103,7 +103,7 @@ class _PipelineMixin:
             "load_profile": patch("trainer.trainer.load_player_profile", return_value=None),
             "process_chunk": patch("trainer.trainer.process_chunk", return_value="fake.parquet"),
             "read_parquet": patch("trainer.trainer.pd.read_parquet", return_value=fake_df),
-            "train_dual_model": patch("trainer.trainer.train_dual_model",
+            "train_dual_model": patch("trainer.trainer.train_single_rated_model",
                                      return_value=({"model": None, "threshold": 0.5, "features": []}, None, {})),
             "save_bundle": patch("trainer.trainer.save_artifact_bundle"),
             "path_stat": patch("trainer.trainer.Path",

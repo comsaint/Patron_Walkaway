@@ -305,14 +305,14 @@ class TestR1204ValidatorBetsGuard(unittest.TestCase):
 
 
 class TestR1205ConfigCommentFreshness(unittest.TestCase):
-    """R1205: config comment should reflect 1-D F1 threshold search."""
+    """R1205: config comment should reflect single-threshold F-beta search."""
 
     def test_config_should_not_keep_2d_threshold_comment(self):
         src = inspect.getsource(config_mod)
         self.assertNotIn(
             "2-D threshold search",
             src,
-            "config comment is stale: threshold search should be described as F1-based (single threshold).",
+            "config comment is stale: threshold search should be described as F-beta (single threshold).",
         )
 
 

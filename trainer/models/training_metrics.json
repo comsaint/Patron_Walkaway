@@ -1,13 +1,13 @@
 {
   "rated": {
     "label": "rated",
-    "val_prauc": 0.18095818538323427,
-    "val_precision": 0.16040077256227667,
-    "val_recall": 0.6695241461929732,
-    "val_f1": 0.2587997730192801,
-    "threshold": 0.6472445883077323,
-    "val_samples": 743989,
-    "val_positives": 101838,
+    "val_prauc": 0.1853215731476512,
+    "val_precision": 0.16732669660652674,
+    "val_recall": 0.6315045221097286,
+    "val_f1": 0.2645554232257348,
+    "threshold": 0.6609846265401698,
+    "val_samples": 744001,
+    "val_positives": 101833,
     "best_hyperparams": {
       "n_estimators": 400,
       "learning_rate": 0.05,
@@ -15,17 +15,107 @@
       "max_depth": 8,
       "min_child_samples": 20
     },
-    "_uncalibrated": false
+    "_uncalibrated": false,
+    "test_prauc": 0.1864453300558444,
+    "test_precision": 0.16703580998138884,
+    "test_recall": 0.636002693819293,
+    "test_f1": 0.2645831416791416,
+    "test_samples": 736321,
+    "test_positives": 99487,
+    "test_threshold_uncalibrated": false,
+    "feature_importance": [
+      {
+        "rank": 1,
+        "feature": "minutes_since_run_start",
+        "importance_gain": 86322.682387
+      },
+      {
+        "rank": 2,
+        "feature": "cum_bets",
+        "importance_gain": 6167.456498
+      },
+      {
+        "rank": 3,
+        "feature": "cum_wager",
+        "importance_gain": 4731.292192
+      },
+      {
+        "rank": 4,
+        "feature": "loss_streak",
+        "importance_gain": 4576.655879
+      },
+      {
+        "rank": 5,
+        "feature": "time_of_day_cos",
+        "importance_gain": 3009.0982
+      },
+      {
+        "rank": 6,
+        "feature": "days_since_last_session",
+        "importance_gain": 2944.078439
+      },
+      {
+        "rank": 7,
+        "feature": "time_of_day_sin",
+        "importance_gain": 2865.337515
+      },
+      {
+        "rank": 8,
+        "feature": "days_since_first_session",
+        "importance_gain": 2855.322206
+      },
+      {
+        "rank": 9,
+        "feature": "sessions_7d",
+        "importance_gain": 2264.831444
+      },
+      {
+        "rank": 10,
+        "feature": "turnover_sum_7d",
+        "importance_gain": 1967.640532
+      },
+      {
+        "rank": 11,
+        "feature": "avg_wager_sofar",
+        "importance_gain": 1590.645963
+      },
+      {
+        "rank": 12,
+        "feature": "base_ha",
+        "importance_gain": 688.681718
+      },
+      {
+        "rank": 13,
+        "feature": "wager",
+        "importance_gain": 623.00403
+      },
+      {
+        "rank": 14,
+        "feature": "position_idx",
+        "importance_gain": 608.1199
+      },
+      {
+        "rank": 15,
+        "feature": "is_back_bet",
+        "importance_gain": 401.726089
+      },
+      {
+        "rank": 16,
+        "feature": "payout_odds",
+        "importance_gain": 290.652448
+      }
+    ],
+    "importance_method": "gain"
   },
   "nonrated": {
     "label": "nonrated",
-    "val_prauc": 0.5363503849105029,
-    "val_precision": 0.4556964861957691,
-    "val_recall": 0.7657259051456329,
-    "val_f1": 0.5713643483819305,
-    "threshold": 0.612601862456999,
-    "val_samples": 151063,
-    "val_positives": 53113,
+    "val_prauc": 0.5359336127920872,
+    "val_precision": 0.45452521181487215,
+    "val_recall": 0.7686297398049479,
+    "val_f1": 0.5712466680192818,
+    "threshold": 0.6099427212257291,
+    "val_samples": 151061,
+    "val_positives": 53114,
     "best_hyperparams": {
       "n_estimators": 400,
       "learning_rate": 0.05,
@@ -33,13 +123,82 @@
       "max_depth": 8,
       "min_child_samples": 20
     },
-    "_uncalibrated": false
+    "_uncalibrated": false,
+    "test_prauc": 0.5973278386838743,
+    "test_precision": 0.49865860863333045,
+    "test_recall": 0.8058568499475669,
+    "test_f1": 0.6160869201038638,
+    "test_samples": 158741,
+    "test_positives": 63891,
+    "test_threshold_uncalibrated": false,
+    "feature_importance": [
+      {
+        "rank": 1,
+        "feature": "minutes_since_run_start",
+        "importance_gain": 38268.375781
+      },
+      {
+        "rank": 2,
+        "feature": "loss_streak",
+        "importance_gain": 6735.59808
+      },
+      {
+        "rank": 3,
+        "feature": "cum_bets",
+        "importance_gain": 3723.44851
+      },
+      {
+        "rank": 4,
+        "feature": "wager",
+        "importance_gain": 1751.719145
+      },
+      {
+        "rank": 5,
+        "feature": "time_of_day_sin",
+        "importance_gain": 1728.044138
+      },
+      {
+        "rank": 6,
+        "feature": "cum_wager",
+        "importance_gain": 1619.939424
+      },
+      {
+        "rank": 7,
+        "feature": "time_of_day_cos",
+        "importance_gain": 1611.703212
+      },
+      {
+        "rank": 8,
+        "feature": "avg_wager_sofar",
+        "importance_gain": 1172.458255
+      },
+      {
+        "rank": 9,
+        "feature": "position_idx",
+        "importance_gain": 684.906849
+      },
+      {
+        "rank": 10,
+        "feature": "base_ha",
+        "importance_gain": 372.892567
+      },
+      {
+        "rank": 11,
+        "feature": "is_back_bet",
+        "importance_gain": 201.453764
+      },
+      {
+        "rank": 12,
+        "feature": "payout_odds",
+        "importance_gain": 108.061074
+      }
+    ],
+    "importance_method": "gain"
   },
-  "model_version": "20260305-030022-994add6",
+  "model_version": "20260306-011838-0fc0f87",
   "fast_mode": true,
-  "sample_rated_n": 1000,
+  "sample_rated_n": null,
   "uncalibrated_threshold": {
-    "rated": false,
-    "nonrated": false
+    "rated": false
   }
 }

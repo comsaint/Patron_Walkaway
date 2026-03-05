@@ -95,7 +95,7 @@ class TestR203HorizonZeroWarningGuardrail(unittest.TestCase):
     @patch("trainer.trainer.ensure_player_profile_ready")
     @patch("trainer.trainer.load_player_profile")
     @patch("trainer.trainer.process_chunk")
-    @patch("trainer.trainer.train_dual_model")
+    @patch("trainer.trainer.train_single_rated_model")
     @patch("trainer.trainer.save_artifact_bundle")
     @patch("trainer.trainer.logger.warning")
     def test_fast_mode_zero_horizon_should_warn(
@@ -168,7 +168,7 @@ class TestR205SampleRatedOrthogonalityGuardrail(unittest.TestCase):
     @patch("trainer.trainer.ensure_player_profile_ready")
     @patch("trainer.trainer.load_player_profile")
     @patch("trainer.trainer.process_chunk")
-    @patch("trainer.trainer.train_dual_model")
+    @patch("trainer.trainer.train_single_rated_model")
     @patch("trainer.trainer.save_artifact_bundle")
     def test_fast_mode_without_sample_flag_should_keep_whitelist_none(
         self,
@@ -246,7 +246,6 @@ class TestR207FeatureTrackClassificationGuardrail(unittest.TestCase):
             with patch.object(trainer_mod, "MODEL_DIR", model_dir):
                 trainer_mod.save_artifact_bundle(
                     rated=None,
-                    nonrated=None,
                     feature_cols=feature_cols,
                     combined_metrics={},
                     model_version="test-v1",
@@ -269,7 +268,7 @@ class TestR118NoPreloadWithoutFastModeWarning(unittest.TestCase):
     @patch("trainer.trainer.ensure_player_profile_ready")
     @patch("trainer.trainer.load_player_profile")
     @patch("trainer.trainer.process_chunk")
-    @patch("trainer.trainer.train_dual_model")
+    @patch("trainer.trainer.train_single_rated_model")
     @patch("trainer.trainer.save_artifact_bundle")
     @patch("trainer.trainer.get_monthly_chunks")
     @patch("trainer.trainer.logger.warning")

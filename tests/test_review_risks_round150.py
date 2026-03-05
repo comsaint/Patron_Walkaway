@@ -40,7 +40,6 @@ class TestR301SampleRatedMetadataGuardrail(unittest.TestCase):
             with patch.object(trainer_mod, "MODEL_DIR", trainer_mod.Path(td)):
                 trainer_mod.save_artifact_bundle(
                     rated=None,
-                    nonrated=None,
                     feature_cols=[],
                     combined_metrics={},
                     model_version="test-v1",

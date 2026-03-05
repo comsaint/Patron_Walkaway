@@ -2,17 +2,17 @@
   "position_idx": "TABLE_POSITION",
   "base_ha": "HOUSE_EDGE",
   "payout_odds": "PAYOUT_ODDS",
+  "days_since_first_session": "PROFILE_DAYS_SINCE_FIRST_SESSION",
   "minutes_since_run_start": "RUN_DURATION",
   "loss_streak": "LOSS_STREAK",
+  "days_since_last_session": "PROFILE_DAYS_SINCE_LAST_SESSION",
   "is_back_bet": "BACK_BET",
   "cum_bets": "CUM_BETS",
+  "turnover_sum_7d": "PROFILE_TURNOVER_SUM_7D",
   "avg_wager_sofar": "AVG_WAGER",
   "cum_wager": "CUM_WAGER",
   "wager": "BET_SIZE",
+  "sessions_7d": "PROFILE_SESSIONS_7D",
   "time_of_day_cos": "TIME_OF_DAY",
-  "days_since_first_session": "PROFILE_DAYS_SINCE_FIRST_SESSION",
-  "turnover_sum_7d": "PROFILE_TURNOVER_SUM_7D",
-  "time_of_day_sin": "TIME_OF_DAY",
-  "days_since_last_session": "PROFILE_DAYS_SINCE_LAST_SESSION",
-  "sessions_7d": "PROFILE_SESSIONS_7D"
+  "time_of_day_sin": "TIME_OF_DAY"
 }
