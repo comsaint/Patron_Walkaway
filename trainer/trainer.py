@@ -611,30 +611,100 @@ def load_player_profile(
 
     # ClickHouse path
     try:
-        client = get_clickhouse_client()
         from datetime import timedelta as _td
 
         snap_lo = window_start - _td(days=365)
         profile_cols_sql = ", ".join(PROFILE_FEATURE_COLS)
+        _params: dict = {"snap_lo": snap_lo, "snap_hi": window_end}
+
         # R82: push canonical_id IN filter to ClickHouse when provided so only
         # rated-player rows are fetched, capping memory to ~O(rated_players).
-        _cid_clause = ""
-        _params: dict = {"snap_lo": snap_lo, "snap_hi": window_end}
-        if canonical_ids:
-            _cid_clause = "AND canonical_id IN %(canonical_ids)s"
-            _params["canonical_ids"] = list(canonical_ids)
-        query = f"""
-            SELECT
-                canonical_id,
-                snapshot_dtm,
-                {profile_cols_sql}
-            FROM {SOURCE_DB}.{TPROFILE}
-            WHERE snapshot_dtm >= %(snap_lo)s
-              AND snapshot_dtm <= %(snap_hi)s
-              {_cid_clause}
-            ORDER BY canonical_id, snapshot_dtm
-        """
-        df = client.query_df(query, parameters=_params)
+        # R-FIX: when the list is large (>5k), client-side IN expansion exceeds
+        # ClickHouse's default max_query_size (256 KB).  Use a temporary table +
+        # JOIN via a session-scoped client instead.
+        _LARGE_CID_THRESHOLD = 5_000
+        _cid_list = list(canonical_ids) if canonical_ids else []
+
+        if _cid_list and len(_cid_list) > _LARGE_CID_THRESHOLD:
+            logger.info(
+                "player_profile: %d canonical_ids — using temp-table JOIN to avoid max_query_size",
+                len(_cid_list),
+            )
+            import uuid as _uuid
+            import clickhouse_connect as _cc
+
+            try:
+                import config as _cfg  # type: ignore[import]
+            except ModuleNotFoundError:
+                import trainer.config as _cfg  # type: ignore[import, no-redef]
+
+            session_id = str(_uuid.uuid4())
+            session_client = _cc.get_client(
+                host=_cfg.CH_HOST,
+                port=_cfg.CH_PORT,
+                username=_cfg.CH_USER,
+                password=_cfg.CH_PASS,
+                secure=_cfg.CH_SECURE,
+                database=_cfg.SOURCE_DB,
+                session_id=session_id,
+            )
+            # Risk-1 fix: guarantee close() regardless of success/failure.
+            try:
+                session_client.command(
+                    "CREATE TEMPORARY TABLE _tmp_profile_cids (canonical_id String)"
+                )
+
+                # Risk-4 fix: 200_000 rows per request → ≤2 round-trips for 323k IDs.
+                _INSERT_BATCH = 200_000
+                for _i in range(0, len(_cid_list), _INSERT_BATCH):
+                    # Risk-3 fix: stage-specific error log before re-raising.
+                    try:
+                        session_client.insert(
+                            "_tmp_profile_cids",
+                            [[cid] for cid in _cid_list[_i: _i + _INSERT_BATCH]],
+                            column_names=["canonical_id"],
+                        )
+                    except Exception as _ins_exc:
+                        logger.error("temp-table insert batch %d failed: %s", _i, _ins_exc)
+                        raise
+
+                # Risk-2 fix: CAST ensures type-safe JOIN even if profile table
+                # stores canonical_id as a numeric type, and prevents index skip.
+                query = f"""
+                    SELECT
+                        p.canonical_id,
+                        p.snapshot_dtm,
+                        {profile_cols_sql}
+                    FROM {SOURCE_DB}.{TPROFILE} p
+                    INNER JOIN _tmp_profile_cids t
+                        ON CAST(p.canonical_id AS String) = t.canonical_id
+                    WHERE p.snapshot_dtm >= %(snap_lo)s
+                      AND p.snapshot_dtm <= %(snap_hi)s
+                    ORDER BY p.canonical_id, p.snapshot_dtm
+                """
+                df = session_client.query_df(query, parameters=_params)
+            finally:
+                session_client.close()
+
+        else:
+            client = get_clickhouse_client()
+            _cid_clause = ""
+            if _cid_list:
+                _cid_clause = "AND canonical_id IN %(canonical_ids)s"
+                _params["canonical_ids"] = _cid_list
+            query = f"""
+                SELECT
+                    canonical_id,
+                    snapshot_dtm,
+                    {profile_cols_sql}
+                FROM {SOURCE_DB}.{TPROFILE}
+                WHERE snapshot_dtm >= %(snap_lo)s
+                  AND snapshot_dtm <= %(snap_hi)s
+                  {_cid_clause}
+                ORDER BY canonical_id, snapshot_dtm
+            """
+            df = client.query_df(query, parameters=_params)
+
         logger.info("player_profile: %d rows loaded from ClickHouse", len(df))
         return df if not df.empty else None
     except Exception as exc:

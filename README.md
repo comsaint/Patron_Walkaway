@@ -32,9 +32,16 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 - **`tests/`** — 單元與整合測試（pytest）。
 - **`doc/`** — 規格、發現、API 協定。**`schema/`** — 資料表/欄位字典與 DQ 提示。
 
+### 開發狀態（對應 `.cursor/plans/`）
+
+- **Phase 1**：PLAN.md Step 0–10 均已實作完成（單一 Rated 模型、三軌特徵、DuckDB Track LLM、Feature Spec YAML 凍結進 artifact、閾值 F-beta 最大化）。
+- **Track A（Featuretools DFS）已移除**：特徵工程僅保留三軌——Track Profile（PIT/as-of join）、Track LLM（DuckDB + YAML）、Track Human（向量化 `loss_streak`/`run_boundary`）。`--no-afg` 表示跳過 Track LLM。
+- **Scorer / API**：僅對評級客（`is_rated`）產生告警；訓練結束後會清理舊版 `nonrated_model.pkl` / `rated_model.pkl`。
+- **測試**：全量 `pytest` 約 519 passed；實作計畫與狀態詳見 `.cursor/plans/PLAN.md`、`.cursor/plans/STATUS.md`、`.cursor/plans/DECISION_LOG.md`。
+
 ### 環境設定
 
-**需求**：Python 3.10+，執行 `pip install -r requirements.txt`。主要套件：`lightgbm`、`featuretools`、`optuna`、`shap`、`pandas`、`pyarrow`、`python-dotenv` 等。
+**需求**：Python 3.10+，執行 `pip install -r requirements.txt`。主要套件：`lightgbm`、`duckdb`、`optuna`、`shap`、`pandas`、`pyarrow`、`python-dotenv` 等。
 
 **環境變數**：將 `trainer/.env.example` 複製為 `trainer/.env`（或設定對應環境變數），用於 ClickHouse：`CH_HOST`、`CH_TEAMDB_HOST`、`CH_PORT`、`CH_USER`、`CH_PASS`、`CH_SECURE`、`SOURCE_DB`。
 
@@ -48,13 +55,13 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 python -m trainer.trainer --use-local-parquet --days 365
 ```
 
-**Fast mode（僅供測試，筆電約 &lt;10 分鐘）**：限制可用資料時間範圍（Data Horizon），所有子模組（identity / labels / features / profile ETL）共用同一個時間邊界，以較少資料量加速訓練；並隱含 `--skip-optuna` 與 `--no-afg`（跳過 Track A DFS）。可選擇性搭配 `--sample-rated N` 只抽樣部分評級客。**請勿將產物用於生產。**
+**Fast mode（僅供測試，筆電約 &lt;10 分鐘）**：限制可用資料時間範圍（Data Horizon），所有子模組（identity / labels / features / profile ETL）共用同一個時間邊界，以較少資料量加速訓練；並隱含 `--skip-optuna` 與 `--no-afg`（跳過 Track LLM）。可選擇性搭配 `--sample-rated N` 只抽樣部分評級客。**請勿將產物用於生產。**
 
 ```bash
 python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
 ```
 
-**--no-afg（No Automatic Feature Generation）**：僅使用 Track B + profile 特徵，跳過 Track A（Featuretools DFS）；與 `--fast-mode` 正交（fast-mode 會自動帶入 --no-afg）。適用於無 Featuretools 環境或快速迭代 Track B。
+**--no-afg（No Automatic Feature Generation）**：僅使用 Track Profile + Track Human 特徵，跳過 Track LLM（DuckDB + Feature Spec YAML）；與 `--fast-mode` 正交（fast-mode 會自動帶入 --no-afg）。適用於快速迭代或無 DuckDB/Track LLM 需求時。
 
 ```bash
 python -m trainer.trainer --no-afg --recent-chunks 2 --use-local-parquet
@@ -96,7 +103,7 @@ python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sa
 | `--skip-optuna` | 不跑 Optuna 超參搜尋，使用預設 LightGBM 超參。 |
 | `--recent-chunks N` | 僅使用訓練視窗內「最後 N 個」月 chunk（每 chunk 約一個月）。限制從 ClickHouse 或本地 Parquet 載入的資料量；建議 N≥3 以保持 train/valid/test 皆有資料。例如 `--recent-chunks 3` 約為最近 3 個月。 |
 | `--fast-mode` | 快速模式（DEC-017）：profile 不往前做 365 天 lookback，僅用有效訓練視窗；profile 特徵依資料天數動態選用。隱含 `--skip-optuna` 與 `--no-afg`。產物標記 `fast_mode=true`，**不得用於生產**。 |
-| `--no-afg` | 不做 Track A（Featuretools DFS），僅用 Track B + profile 特徵；不產出 `saved_feature_defs/`。與 `--fast-mode` 正交（fast-mode 會自動帶入）。 |
+| `--no-afg` | 不做 Track LLM（DuckDB + Feature Spec），僅用 Track Profile + Track Human 特徵。與 `--fast-mode` 正交（fast-mode 會自動帶入）。 |
 | `--fast-mode-no-preload` | 關閉 profile backfill 時對 session Parquet 的「全表一次載入」，改為每 snapshot 日用 PyArrow pushdown 讀取。適合 low RAM 機器，避免 OOM；建議與 `--fast-mode` 一併使用。 |
 | `--sample-rated N` | 僅使用 N 個評級客（canonical_id 字典序取前 N 個）。與 `--fast-mode` 正交，可單獨或搭配使用。預設不抽樣（使用全部評級客）。 |
 | `--no-month-end-snapshots` | 相容用旗標；目前月結 snapshot 排程一律啟用，此選項**無效**。 |
@@ -125,14 +132,14 @@ Fast-mode 煙測：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 ### 產物（trainer 輸出）
 
-`trainer/models/` 下：`model.pkl`（v10 單一評級客模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 凍結特徵規格）、`reason_code_map.json`、`model_version`、`training_metrics.json`（僅 rated 指標）。使用 Track A（Featuretools DFS）時會產出 `saved_feature_defs/`。另保留 legacy `walkaway_model.pkl`。訓練結束後若存在舊版 `nonrated_model.pkl` / `rated_model.pkl` 會自動刪除，避免 scorer/backtester 誤用。
+`trainer/models/` 下：`model.pkl`（v10 單一評級客模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 凍結特徵規格，訓練時寫入 bundle，scorer 優先從此載入）、`reason_code_map.json`、`model_version`、`training_metrics.json`（僅 rated 指標）。另保留 legacy `walkaway_model.pkl`。訓練結束後若存在舊版 `nonrated_model.pkl` / `rated_model.pkl` 會自動刪除，避免 scorer/backtester 誤用。
 
 ### 注意事項
 
 - **Fast-mode** 產物在 metadata 中標記 `fast_mode=true`，不得用於生產推論。
 - **憑證**：請安全存放 ClickHouse 憑證，勿提交 `.env`。
 - **時區**：業務邏輯使用 `Asia/Hong_Kong`（`config.HK_TZ`）。
-- **閾值選擇**：Phase 1 以驗證集 **F1 最大化** 選定單一模型閾值（DEC-009, DEC-021），無精準度/警報量下限約束。
+- **閾值選擇**：Phase 1 以驗證集 **F-beta 最大化**（預設 β=0.5，偏重 precision）選定單一模型閾值（DEC-009, DEC-021）；可選最小 recall / 每小時警報量約束，詳見 `config.THRESHOLD_FBETA`。
 - **告警範圍**：Scorer 與 API `POST /score` 僅對評級客（`is_rated=true`）回傳告警；非評級客仍會得到分數，但 `alert` 恆為 `false`。
 
 ---
@@ -167,9 +174,16 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 - **`tests/`** — 单元与集成测试（pytest）。
 - **`doc/`** — 规格、发现、API 协议。**`schema/`** — 表/字段字典与 DQ 提示。
 
+### 开发状态（对应 `.cursor/plans/`）
+
+- **Phase 1**：PLAN.md Step 0–10 均已实现完成（单一 Rated 模型、三轨特征、DuckDB Track LLM、Feature Spec YAML 冻结进 artifact、阈值 F-beta 最大化）。
+- **Track A（Featuretools DFS）已移除**：特征工程仅保留三轨——Track Profile（PIT/as-of join）、Track LLM（DuckDB + YAML）、Track Human（向量化 `loss_streak`/`run_boundary`）。`--no-afg` 表示跳过 Track LLM。
+- **Scorer / API**：仅对评级客（`is_rated`）产生告警；训练结束后会清理旧版 `nonrated_model.pkl` / `rated_model.pkl`。
+- **测试**：全量 `pytest` 约 519 passed；实现计划与状态详见 `.cursor/plans/PLAN.md`、`.cursor/plans/STATUS.md`、`.cursor/plans/DECISION_LOG.md`。
+
 ### 环境设置
 
-**需求**：Python 3.10+，执行 `pip install -r requirements.txt`。主要包：`lightgbm`、`featuretools`、`optuna`、`shap`、`pandas`、`pyarrow`、`python-dotenv` 等。
+**需求**：Python 3.10+，执行 `pip install -r requirements.txt`。主要包：`lightgbm`、`duckdb`、`optuna`、`shap`、`pandas`、`pyarrow`、`python-dotenv` 等。
 
 **环境变量**：将 `trainer/.env.example` 复制为 `trainer/.env`（或设置对应环境变量），用于 ClickHouse：`CH_HOST`、`CH_TEAMDB_HOST`、`CH_PORT`、`CH_USER`、`CH_PASS`、`CH_SECURE`、`SOURCE_DB`。
 
@@ -185,13 +199,13 @@ python -m trainer.trainer --use-local-parquet --recent-chunks 3
 python -m trainer.trainer --skip-optuna --use-local-parquet
 ```
 
-**Fast mode（仅供测试，笔记本约 &lt;10 分钟）**：限制可用数据时间范围（Data Horizon），所有子模块（identity / labels / features / profile ETL）共用同一个时间边界，以较少数据量加速训练；并隐含 `--skip-optuna` 与 `--no-afg`（跳过 Track A DFS）。可选择性搭配 `--sample-rated N` 只抽样部分评级客。**请勿将产物用于生产。**
+**Fast mode（仅供测试，笔记本约 &lt;10 分钟）**：限制可用数据时间范围（Data Horizon），所有子模块（identity / labels / features / profile ETL）共用同一个时间边界，以较少数据量加速训练；并隐含 `--skip-optuna` 与 `--no-afg`（跳过 Track LLM）。可选择性搭配 `--sample-rated N` 只抽样部分评级客。**请勿将产物用于生产。**
 
 ```bash
 python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
 ```
 
-**--no-afg（No Automatic Feature Generation）**：仅使用 Track B + profile 特征，跳过 Track A（Featuretools DFS）；与 `--fast-mode` 正交（fast-mode 会自动带入 --no-afg）。适用于无 Featuretools 环境或快速迭代 Track B。
+**--no-afg（No Automatic Feature Generation）**：仅使用 Track Profile + Track Human 特征，跳过 Track LLM（DuckDB + Feature Spec YAML）；与 `--fast-mode` 正交（fast-mode 会自动带入 --no-afg）。适用于快速迭代或无 DuckDB/Track LLM 需求时。
 
 ```bash
 python -m trainer.trainer --no-afg --recent-chunks 2 --use-local-parquet
@@ -233,7 +247,7 @@ python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sa
 | `--skip-optuna` | 不跑 Optuna 超参搜索，使用默认 LightGBM 超参，可省约 10 分钟。 |
 | `--recent-chunks N` | 仅使用训练窗口内「最后 N 个」月 chunk（每 chunk 约一个月）。限制从 ClickHouse 或本地 Parquet 载入的数据量；建议 N≥3 以保持 train/valid/test 皆有数据。例如 `--recent-chunks 3` 约最近 3 个月。 |
 | `--fast-mode` | 快速模式（DEC-017）：profile 不往前做 365 天 lookback，仅用有效训练窗口；profile 特征依数据天数动态选用。隐含 `--skip-optuna` 与 `--no-afg`。产物标记 `fast_mode=true`，**不得用于生产**。 |
-| `--no-afg` | 不做 Track A（Featuretools DFS），仅用 Track B + profile 特征；不产出 `saved_feature_defs/`。与 `--fast-mode` 正交（fast-mode 会自动带入）。 |
+| `--no-afg` | 不做 Track LLM（DuckDB + Feature Spec），仅用 Track Profile + Track Human 特征。与 `--fast-mode` 正交（fast-mode 会自动带入）。 |
 | `--fast-mode-no-preload` | 关闭 profile backfill 时对 session Parquet 的「全表一次载入」，改为每 snapshot 日用 PyArrow pushdown 读取。适合约 8 GB RAM 机器，避免 OOM；建议与 `--fast-mode` 一并使用。 |
 | `--sample-rated N` | 仅使用 N 个评级客（canonical_id 字典序取前 N 个）。与 `--fast-mode` 正交，可单独或搭配使用。默认不抽样（使用全部评级客）。 |
 | `--no-month-end-snapshots` | 兼容用旗标；当前月结 snapshot 调度一律启用，此选项**无效**。 |
@@ -262,14 +276,14 @@ Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 ### 产物（trainer 输出）
 
-`trainer/models/` 下：`model.pkl`（v10 单一评级客模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 冻结特征规格）、`reason_code_map.json`、`model_version`、`training_metrics.json`（仅 rated 指标）。使用 Track A（Featuretools DFS）时会产出 `saved_feature_defs/`。另保留 legacy `walkaway_model.pkl`。训练结束后若存在旧版 `nonrated_model.pkl` / `rated_model.pkl` 会自动删除，避免 scorer/backtester 误用。
+`trainer/models/` 下：`model.pkl`（v10 单一评级客模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 冻结特征规格，训练时写入 bundle，scorer 优先从此载入）、`reason_code_map.json`、`model_version`、`training_metrics.json`（仅 rated 指标）。另保留 legacy `walkaway_model.pkl`。训练结束后若存在旧版 `nonrated_model.pkl` / `rated_model.pkl` 会自动删除，避免 scorer/backtester 误用。
 
 ### 注意事项
 
 - **Fast-mode** 产物在 metadata 中标记 `fast_mode=true`，不得用于生产推理。
 - **凭证**：请安全存放 ClickHouse 凭证，勿提交 `.env`。
 - **时区**：业务逻辑使用 `Asia/Hong_Kong`（`config.HK_TZ`）。
-- **阈值选择**：Phase 1 以验证集 **F1 最大化** 选定单模型阈值（DEC-009, DEC-021），无精准度/警报量下限约束。
+- **阈值选择**：Phase 1 以验证集 **F-beta 最大化**（默认 β=0.5，偏重 precision）选定单模型阈值（DEC-009, DEC-021）；可选最小 recall / 每小时警报量约束，详见 `config.THRESHOLD_FBETA`。
 - **告警范围**：Scorer 与 API `POST /score` 仅对评级客（`is_rated=true`）返回告警；非评级客仍会得到分数，但 `alert` 恒为 `false`。
 
 ---
@@ -304,6 +318,13 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 - **`tests/`** — Unit and integration tests (pytest).
 - **`doc/`** — Specs, findings, API protocol. **`schema/`** — Table/column dictionary and DQ hints.
 
+### Development status (see `.cursor/plans/`)
+
+- **Phase 1**: PLAN.md Steps 0–10 are implemented (single Rated model, three-track features, DuckDB Track LLM, Feature Spec YAML frozen into artifact, F-beta threshold maximization).
+- **Track A (Featuretools DFS) removed**: Feature engineering is three-track only — Track Profile (PIT/as-of join), Track LLM (DuckDB + YAML), Track Human (vectorized `loss_streak`/`run_boundary`). `--no-afg` skips Track LLM.
+- **Scorer / API**: Alerts are emitted only for rated patrons (`is_rated`); stale `nonrated_model.pkl` / `rated_model.pkl` are cleaned up after training.
+- **Tests**: Full `pytest` ~519 passed; see `.cursor/plans/PLAN.md`, `.cursor/plans/STATUS.md`, `.cursor/plans/DECISION_LOG.md` for plan and status.
+
 ---
 
 ## Setup
@@ -317,7 +338,7 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
   pip install -r requirements.txt
   ```
 
-  Key packages: `lightgbm`, `featuretools`, `optuna`, `shap`, `pandas`, `pyarrow`, `python-dotenv`, etc.
+  Key packages: `lightgbm`, `duckdb`, `optuna`, `shap`, `pandas`, `pyarrow`, `python-dotenv`, etc.
 
 ### Environment
 
@@ -353,7 +374,7 @@ python -m trainer.trainer --skip-optuna --use-local-parquet
 
 ### Fast mode (testing only, &lt;10 min on laptop)
 
-Constrains the available data time range (Data Horizon); all submodules (identity / labels / features / profile ETL) share the same time boundary so that a smaller slice of data is processed for faster iteration. Implies `--skip-optuna` and `--no-afg` (skips Track A DFS). You can optionally combine with `--sample-rated N` to train on a subset of patrons. **Do not use artifacts in production.**
+Constrains the available data time range (Data Horizon); all submodules (identity / labels / features / profile ETL) share the same time boundary so that a smaller slice of data is processed for faster iteration. Implies `--skip-optuna` and `--no-afg` (skips Track LLM). You can optionally combine with `--sample-rated N` to train on a subset of patrons. **Do not use artifacts in production.**
 
 ```bash
 python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
@@ -361,7 +382,7 @@ python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
 
 ### --no-afg (No Automatic Feature Generation)
 
-Use only Track B + profile features and skip Track A (Featuretools DFS). Orthogonal to `--fast-mode` (fast-mode implies `--no-afg`). Useful when Featuretools is unavailable or for quick Track B iteration.
+Use only Track Profile + Track Human features and skip Track LLM (DuckDB + Feature Spec YAML). Orthogonal to `--fast-mode` (fast-mode implies `--no-afg`). Useful for quick iteration or when DuckDB/Track LLM is not needed.
 
 ```bash
 python -m trainer.trainer --no-afg --recent-chunks 2 --use-local-parquet
@@ -437,7 +458,7 @@ python -m trainer.status_server
 | `--skip-optuna` | Skip Optuna hyperparameter search and use default LightGBM hyperparameters (saves ~10 min). |
 | `--recent-chunks N` | Use only the last N monthly chunks in the training window (one chunk ≈ one month). Limits data loaded from ClickHouse or local Parquet; recommend N≥3 so train/valid/test are all non-empty. E.g. `--recent-chunks 3` ≈ last 3 months. |
 | `--fast-mode` | Fast mode (DEC-017): no 365-day profile lookback; profile features use only the effective training window and are layered by data horizon. Implies `--skip-optuna` and `--no-afg`. Artifacts are tagged `fast_mode=true` and **must not be used in production**. |
-| `--no-afg` | Skip Track A (Featuretools DFS); use only Track B + profile features. No `saved_feature_defs/` produced. Orthogonal to `--fast-mode` (fast-mode implies it). |
+| `--no-afg` | Skip Track LLM (DuckDB + Feature Spec); use only Track Profile + Track Human features. Orthogonal to `--fast-mode` (fast-mode implies it). |
 | `--fast-mode-no-preload` | Disable full-table session Parquet preload during profile backfill; use per-snapshot PyArrow pushdown reads instead. Recommended for ~8 GB RAM to avoid OOM; combine with `--fast-mode`. |
 | `--sample-rated N` | Use only N canonical_ids (first N by lexicographic order). Orthogonal to `--fast-mode`. Default: no sampling (all rated). |
 | `--no-month-end-snapshots` | Deprecated compatibility flag; month-end snapshot schedule is always on; **no effect**. |
@@ -497,11 +518,10 @@ Under `trainer/models/`:
 
 - `model.pkl` — Single rated LightGBM model (v10 DEC-021)
 - `feature_list.json` — Feature names and track classification
-- `feature_spec.yaml` — Frozen feature spec snapshot (DEC-024) for train–serve consistency
+- `feature_spec.yaml` — Frozen feature spec snapshot (DEC-024) written at training time; scorer loads this first for train–serve consistency
 - `reason_code_map.json` — Feature-to-reason-code mapping for SHAP
 - `model_version` — Version string (e.g. `20260228-153000-abc1234`)
 - `training_metrics.json` — Rated metrics only; flags such as `fast_mode`, `uncalibrated_threshold`
-- `saved_feature_defs/` — Optional; produced only when Track A (Featuretools DFS) is used (i.e. without `--no-afg`)
 
 Legacy `walkaway_model.pkl` is still written for backward compatibility. After each run, any stale `nonrated_model.pkl` or `rated_model.pkl` from older dual-model runs is removed so the scorer and backtester do not load them.
 
@@ -512,5 +532,5 @@ Legacy `walkaway_model.pkl` is still written for backward compatibility. After e
 - **Fast-mode** outputs are marked `fast_mode=true` in metadata and must not be used for production inference.
 - **Credentials**: Store ClickHouse credentials securely; avoid committing `.env`.
 - **Time zone**: Business logic uses `Asia/Hong_Kong` (see `config.HK_TZ`).
-- **Threshold selection**: Phase 1 uses validation-set **F1 maximization** for the single-model threshold (DEC-009, DEC-021); no precision/alert-volume lower bound.
+- **Threshold selection**: Phase 1 uses validation-set **F-beta maximization** (default β=0.5, precision-weighted) for the single-model threshold (DEC-009, DEC-021); optional min recall / alerts-per-hour constraints; see `config.THRESHOLD_FBETA`.
 - **Alert scope**: The scorer and API `POST /score` return `alert=true` only for rated patrons (`is_rated=true`); unrated rows still receive a score but `alert` is always `false`.
