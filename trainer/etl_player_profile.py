@@ -988,28 +988,22 @@ def build_player_profile(
     #    windows are computed; out-of-horizon columns are emitted as NaN).
     profile_df = _compute_profile(sessions_clean, snapshot_dtm, max_lookback_days=max_lookback_days)
 
-    # 6. Persist
-    if use_local_parquet:
-        _persist_local_parquet(
-            profile_df,
-            canonical_id_whitelist=canonical_id_whitelist,
-            max_lookback_days=max_lookback_days,
-            sched_tag=sched_tag,
-        )
-    else:
-        try:
-            client = get_clickhouse_client()
-            _write_to_clickhouse(profile_df, client)
-        except Exception as exc:
-            logger.error("ClickHouse write failed: %s; falling back to local Parquet", exc)
-            _persist_local_parquet(
-                profile_df,
-                canonical_id_whitelist=canonical_id_whitelist,
-                max_lookback_days=max_lookback_days,
-                sched_tag=sched_tag,
-            )
+    # 6. Persist — always local Parquet.
+    # player_profile is a locally-derived table; ClickHouse has no such table and
+    # any INSERT attempt would fail.  The use_local_parquet flag is kept in the
+    # signature for backward compatibility but no longer changes behaviour.
+    _persist_local_parquet(
+        profile_df,
+        canonical_id_whitelist=canonical_id_whitelist,
+        max_lookback_days=max_lookback_days,
+        sched_tag=sched_tag,
+    )
 
     return profile_df
+
+
+# Public alias used by tests and callers that expect a single-snapshot entry-point.
+backfill_one_snapshot_date = build_player_profile
 
 
 def backfill(

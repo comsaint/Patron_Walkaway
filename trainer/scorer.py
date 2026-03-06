@@ -876,33 +876,15 @@ def _load_profile_for_scoring(
         except Exception as exc:
             logger.debug("[scorer] profile local Parquet skipped: %s", exc)
 
-    # ClickHouse path
-    if df_loaded is None and get_clickhouse_client is not None:
-        try:
-            client = get_clickhouse_client()
-            _source_db = getattr(config, "SOURCE_DB", "GDP_GMWDS_Raw")
-            _tprofile = getattr(config, "TPROFILE", "player_profile")
-            _profile_cols_sql = ", ".join(PROFILE_FEATURE_COLS) if PROFILE_FEATURE_COLS else "*"
-            _cids = list({str(c) for c in rated_canonical_ids})
-            # R84: ORDER BY snapshot_dtm DESC + LIMIT 1 BY canonical_id — latest snapshot per player
-            query = f"""
-                SELECT canonical_id, snapshot_dtm, {_profile_cols_sql}
-                FROM {_source_db}.{_tprofile}
-                WHERE snapshot_dtm <= %(as_of)s
-                  AND canonical_id IN %(cids)s
-                ORDER BY canonical_id, snapshot_dtm DESC
-                LIMIT 1 BY canonical_id
-            """
-            df = client.query_df(
-                query,
-                parameters={"as_of": as_of_dtm, "cids": _cids},
-            )
-            logger.info("[scorer] player_profile: %d rows from ClickHouse", len(df))
-            df_loaded = df if not df.empty else None
-        except Exception as exc:
-            logger.warning(
-                "[scorer] player_profile unavailable (%s); profile features will be NaN", exc
-            )
+    # player_profile is a locally-derived table (built by etl_player_profile.py from
+    # t_session); it is never stored in ClickHouse.  The ClickHouse path is removed
+    # to prevent spurious Code-60 errors on every scoring call.
+    if df_loaded is None:
+        logger.info(
+            "[scorer] player_profile not found at %s — "
+            "run etl_player_profile.py first; profile features will be NaN",
+            _LOCAL_PARQUET_PROFILE,
+        )
 
     # R85: populate cache on successful load
     if df_loaded is not None:

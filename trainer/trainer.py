@@ -558,7 +558,7 @@ def load_local_parquet(
 def load_player_profile(
     window_start: datetime,
     window_end: datetime,
-    use_local_parquet: bool = False,
+    use_local_parquet: bool = False,  # kept for backward-compat; always reads local Parquet
     canonical_ids: Optional[List[str]] = None,
 ) -> Optional[pd.DataFrame]:
     """Load player_profile snapshots covering the training window.
@@ -570,6 +570,12 @@ def load_player_profile(
     ``profile_df`` parameter.  ``join_player_profile`` handles the
     PIT/as-of alignment per bet.
 
+    **Always reads from local Parquet** (``data/player_profile.parquet``),
+    regardless of ``use_local_parquet``.  player_profile is computed by
+    ``etl_player_profile.py`` from the t_session table and is never stored in
+    ClickHouse — the ClickHouse read path was therefore unreachable in practice
+    and has been removed to prevent spurious Code-60 errors on every run.
+
     Parameters
     ----------
     window_start:
@@ -580,8 +586,8 @@ def load_player_profile(
         Latest chunk window_end in the run.  Snapshots up to window_end are
         included.
     use_local_parquet:
-        If True, reads from ``data/player_profile.parquet``
-        instead of ClickHouse.
+        Deprecated.  Retained for call-site backward compatibility; the value
+        is ignored because player_profile is always a local artifact.
     canonical_ids:
         R82: optional list of canonical_id values to filter the profile table.
         Pass the full set of rated player IDs from canonical_map to cap memory
@@ -589,130 +595,45 @@ def load_player_profile(
     """
     profile_path = LOCAL_PARQUET_DIR / "player_profile.parquet"
 
-    if use_local_parquet:
-        if profile_path.exists():
-            logger.info("Loading player_profile from local Parquet: %s", profile_path)
-            try:
-                from datetime import timedelta as _td
-                snap_lo = window_start - _td(days=365)
-                snap_hi = window_end
-
-                def _naive(dt: datetime) -> pd.Timestamp:
-                    ts = pd.Timestamp(dt)
-                    return ts.tz_localize(None) if ts.tzinfo is None else ts.replace(tzinfo=None)
-
-                df = pd.read_parquet(
-                    profile_path,
-                    filters=[
-                        ("snapshot_dtm", ">=", _naive(snap_lo)),
-                        ("snapshot_dtm", "<=", _naive(snap_hi)),
-                    ],
-                )
-                # R82: filter to known canonical_ids to limit memory footprint
-                if canonical_ids is not None and not df.empty:
-                    df = df[df["canonical_id"].astype(str).isin(set(str(c) for c in canonical_ids))]
-                logger.info("player_profile: %d rows loaded from local Parquet", len(df))
-                return df
-            except Exception as exc:
-                logger.warning("player_profile local Parquet load failed: %s", exc)
-                return None
+    if not profile_path.exists():
         logger.info(
-            "player_profile: %s not found; profile features will be 0", profile_path
+            "player_profile: %s not found — run etl_player_profile.py first. "
+            "Profile features will be NaN for this run.",
+            profile_path,
         )
         return None
 
-    # ClickHouse path
+    logger.info("Loading player_profile from local Parquet: %s", profile_path)
     try:
         from datetime import timedelta as _td
-
         snap_lo = window_start - _td(days=365)
-        profile_cols_sql = ", ".join(PROFILE_FEATURE_COLS)
-        _params: dict = {"snap_lo": snap_lo, "snap_hi": window_end}
+        snap_hi = window_end
 
-        # R82: push canonical_id IN filter to ClickHouse when provided so only
-        # rated-player rows are fetched, capping memory to ~O(rated_players).
-        # R-FIX: large lists would exceed ClickHouse's default max_query_size
-        # (256 KB) when expanded client-side.  Solution: chunked IN queries —
-        # split the ID list into batches small enough to stay under the limit,
-        # run one SELECT per batch, then concat in Python.  No CREATE TABLE
-        # permission required; uses the same shared read-only client throughout.
-        _cid_list = list(canonical_ids) if canonical_ids else []
-        # Each quoted ID is ~10–20 chars; 4 000 IDs ≈ 60–80 KB — well under 256 KB.
-        _IN_BATCH = 4_000
-        client = get_clickhouse_client()
+        def _naive(dt: datetime) -> pd.Timestamp:
+            ts = pd.Timestamp(dt)
+            return ts.tz_localize(None) if ts.tzinfo is None else ts.replace(tzinfo=None)
 
-        # R-CIN-5: two explicit query strings instead of string-template substitution,
-        # eliminating the double-escape risk and making SQL injection surface clear.
-        _query_no_filter = f"""
-            SELECT
-                canonical_id,
-                snapshot_dtm,
-                {profile_cols_sql}
-            FROM {SOURCE_DB}.{TPROFILE}
-            WHERE snapshot_dtm >= %(snap_lo)s
-              AND snapshot_dtm <= %(snap_hi)s
-            ORDER BY canonical_id, snapshot_dtm
-        """
-        _query_with_filter = f"""
-            SELECT
-                canonical_id,
-                snapshot_dtm,
-                {profile_cols_sql}
-            FROM {SOURCE_DB}.{TPROFILE}
-            WHERE snapshot_dtm >= %(snap_lo)s
-              AND snapshot_dtm <= %(snap_hi)s
-              AND canonical_id IN %(canonical_ids)s
-            ORDER BY canonical_id, snapshot_dtm
-        """
-
-        if not _cid_list:
-            # No ID filter — fetch all players in the time window.
-            df = client.query_df(_query_no_filter, parameters=_params)
-        elif len(_cid_list) <= _IN_BATCH:
-            # Small list: single query, no chunking needed.
-            _params["canonical_ids"] = _cid_list
-            df = client.query_df(_query_with_filter, parameters=_params)
-        else:
-            # Large list: split into chunks to stay within max_query_size.
-            _n_batches = (len(_cid_list) + _IN_BATCH - 1) // _IN_BATCH
-            logger.info(
-                "player_profile: %d canonical_ids — chunked IN queries (batch=%d)",
-                len(_cid_list), _IN_BATCH,
-            )
-            _parts: list = []
-            for _i in range(0, len(_cid_list), _IN_BATCH):
-                _batch_num = _i // _IN_BATCH + 1
-                # R-CIN-3: batch-level progress logging.
-                if _batch_num % 10 == 1:
-                    logger.info(
-                        "player_profile: batch %d/%d", _batch_num, _n_batches,
-                    )
-                _batch = _cid_list[_i: _i + _IN_BATCH]
-                # R-CIN-4: per-batch error logging before re-raise.
-                try:
-                    _part = client.query_df(
-                        _query_with_filter,
-                        parameters={**_params, "canonical_ids": _batch},
-                    )
-                    _parts.append(_part)
-                except Exception as _batch_exc:
-                    logger.error(
-                        "player_profile: batch %d/%d failed: %s",
-                        _batch_num, _n_batches, _batch_exc,
-                    )
-                    raise
-            # R-CIN-2: guard against empty _parts before concat.
-            # R-CIN-1: sort globally so downstream merge_asof works correctly.
-            df = pd.concat(_parts, ignore_index=True) if _parts else pd.DataFrame()
-            if not df.empty:
-                df.sort_values(["canonical_id", "snapshot_dtm"], inplace=True, ignore_index=True)
-
-        logger.info("player_profile: %d rows loaded from ClickHouse", len(df))
-        return df if not df.empty else None
-    except Exception as exc:
-        logger.warning(
-            "player_profile ClickHouse load failed (%s); profile features will be 0", exc
+        df = pd.read_parquet(
+            profile_path,
+            filters=[
+                ("snapshot_dtm", ">=", _naive(snap_lo)),
+                ("snapshot_dtm", "<=", _naive(snap_hi)),
+            ],
         )
+        # R82: filter to known canonical_ids to limit memory footprint
+        if canonical_ids is not None and not df.empty:
+            df = df[df["canonical_id"].astype(str).isin(set(str(c) for c in canonical_ids))]
+        if df.empty:
+            logger.info(
+                "player_profile: no snapshot rows found in window %s – %s; "
+                "profile features will be NaN.",
+                window_start.date(), window_end.date(),
+            )
+            return None
+        logger.info("player_profile: %d rows loaded from local Parquet", len(df))
+        return df
+    except Exception as exc:
+        logger.warning("player_profile local Parquet load failed: %s", exc)
         return None
 
 
@@ -1453,21 +1374,28 @@ def _oom_check_and_adjust_neg_sample_frac(
         p = NEG_SAMPLE_FRAC_ASSUMED_POS_RATE
 
     # --- Estimate per-chunk on-disk size ---
+    # R-371-3: only include chunks whose .cache_key sidecar exists so that chunks
+    # whose cache key will mismatch (and therefore be recomputed at full size) do
+    # not silently deflate the estimate with their old downsampled Parquet size.
     existing_sizes = [
         _chunk_parquet_path(c).stat().st_size
         for c in chunks
         if _chunk_parquet_path(c).exists()
+        and _chunk_parquet_path(c).with_suffix(".cache_key").exists()
     ]
     if existing_sizes:
         per_chunk_bytes = sum(existing_sizes) / len(existing_sizes)
-        size_source = f"avg of {len(existing_sizes)}/{len(chunks)} cached chunk Parquets"
+        size_source = f"avg of {len(existing_sizes)}/{len(chunks)} cached chunk Parquets (with .cache_key sidecar)"
     else:
         per_chunk_bytes = NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT
-        size_source = f"default estimate ({NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT // (1024**2)} MB/chunk; no cached chunks)"
+        size_source = f"default estimate ({NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT // (1024**2)} MB/chunk; no cached chunks with valid .cache_key)"
 
     n_chunks = len(chunks)
     estimated_on_disk = per_chunk_bytes * n_chunks
-    estimated_peak_ram = estimated_on_disk * CHUNK_CONCAT_RAM_FACTOR
+    # R-371-7: account for Step 7 row-split overhead.  At peak, full_df AND the
+    # largest split subset (train, TRAIN_SPLIT_FRAC of total rows) coexist in memory
+    # simultaneously.  Multiply by (1 + TRAIN_SPLIT_FRAC) to model this.
+    estimated_peak_ram = estimated_on_disk * CHUNK_CONCAT_RAM_FACTOR * (1.0 + TRAIN_SPLIT_FRAC)
     ram_budget = available_ram * NEG_SAMPLE_RAM_SAFETY
 
     # R-NEG-3/5: include total RAM alongside available so operators can judge
@@ -1804,7 +1732,14 @@ def process_chunk(
         _pos_mask = labeled["label"] == 1
         _n_neg_before = int((~_pos_mask).sum())
         # R-NEG-6: chunk-specific seed avoids systematic same-index bias across chunks.
-        _chunk_seed = hash((window_start.isoformat(), window_end.isoformat())) % (2**31)
+        # R-371-5: use hashlib instead of built-in hash() which is randomised per
+        # process by PYTHONHASHSEED (Python 3.3+), making seeds non-reproducible.
+        _chunk_seed = int(
+            hashlib.md5(
+                f"{window_start.isoformat()}|{window_end.isoformat()}".encode()
+            ).hexdigest()[:8],
+            16,
+        ) % (2**31)
         _neg_keep = labeled[~_pos_mask].sample(frac=neg_sample_frac, random_state=_chunk_seed)
         labeled = pd.concat([labeled[_pos_mask], _neg_keep], ignore_index=True)
         logger.info(
@@ -2993,10 +2928,15 @@ def run_pipeline(args) -> None:
         default="test",
     )
 
-    train_df = full_df[full_df["_split"] == "train"].copy()
-    valid_df  = full_df[full_df["_split"] == "valid"].copy()
-    test_df   = full_df[full_df["_split"] == "test"].copy()
-    del full_df  # R802: release concat buffer; ~halves peak RAM after split
+    # R-371-4: use reset_index(drop=True) instead of .copy() to avoid the peak where
+    # full_df + three simultaneous copies all occupy RAM.  reset_index creates a
+    # new contiguous DataFrame (safe for downstream inplace operations) without the
+    # .copy() pattern that triples the instantaneous allocation.
+    _split_col = full_df["_split"]
+    train_df = full_df[_split_col == "train"].reset_index(drop=True)
+    valid_df  = full_df[_split_col == "valid"].reset_index(drop=True)
+    test_df   = full_df[~(_split_col.isin(("train", "valid")))].reset_index(drop=True)
+    del full_df, _split_col  # R802: release concat buffer after split
 
     # R700: compare row-level _actual_train_end against chunk-level train_end.
     # The canonical mapping cutoff (B1/R25 guard) always uses chunk-level train_end;
