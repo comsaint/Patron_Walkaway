@@ -35,7 +35,7 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 ### 開發狀態（對應 `.cursor/plans/`）
 
 - **Phase 1**：PLAN.md Step 0–10 均已實作完成（單一 Rated 模型、三軌特徵、DuckDB Track LLM、Feature Spec YAML 凍結進 artifact、閾值 F-beta 最大化）。
-- **Track A（Featuretools DFS）已移除**：特徵工程僅保留三軌——Track Profile（PIT/as-of join）、Track LLM（DuckDB + YAML）、Track Human（向量化 `loss_streak`/`run_boundary`）。`--no-afg` 表示跳過 Track LLM。
+- **Track A（Featuretools DFS）已移除**：特徵工程僅保留三軌——Track Profile（PIT/as-of join）、Track LLM（DuckDB + YAML）、Track Human（向量化 `loss_streak`/`run_boundary`）。
 - **Scorer / API**：僅對評級客（`is_rated`）產生告警；訓練結束後會清理舊版 `nonrated_model.pkl` / `rated_model.pkl`。
 - **測試**：全量 `pytest` 約 519 passed；實作計畫與狀態詳見 `.cursor/plans/PLAN.md`、`.cursor/plans/STATUS.md`、`.cursor/plans/DECISION_LOG.md`。
 
@@ -55,28 +55,16 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 python -m trainer.trainer --use-local-parquet --days 365
 ```
 
-**Fast mode（僅供測試，筆電約 &lt;10 分鐘）**：限制可用資料時間範圍（Data Horizon），所有子模組（identity / labels / features / profile ETL）共用同一個時間邊界，以較少資料量加速訓練；並隱含 `--skip-optuna` 與 `--no-afg`（跳過 Track LLM）。可選擇性搭配 `--sample-rated N` 只抽樣部分評級客。**請勿將產物用於生產。**
+低記憶體（如 8 GB）：加上 `--no-preload` 可避免 profile backfill 時將整張 session Parquet 一次載入記憶體：
 
 ```bash
-python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
+python -m trainer.trainer --recent-chunks 3 --use-local-parquet --no-preload
 ```
 
-**--no-afg（No Automatic Feature Generation）**：僅使用 Track Profile + Track Human 特徵，跳過 Track LLM（DuckDB + Feature Spec YAML）；與 `--fast-mode` 正交（fast-mode 會自動帶入 --no-afg）。適用於快速迭代或無 DuckDB/Track LLM 需求時。
+如需只使用部分評級客（節省訓練時間），可加入 `--sample-rated N`：
 
 ```bash
-python -m trainer.trainer --no-afg --recent-chunks 2 --use-local-parquet
-```
-
-低記憶體（如 8 GB）：加上 `--fast-mode-no-preload`：
-
-```bash
-python -m trainer.trainer --fast-mode --fast-mode-no-preload --recent-chunks 3 --use-local-parquet
-```
-
-如需在 Fast mode 下只使用部分評級客，可加入（與 `--fast-mode` 正交）：
-
-```bash
-python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sample-rated 1000
+python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1000
 ```
 
 **Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`
@@ -102,17 +90,14 @@ python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sa
 | `--force-recompute` | 忽略已快取的 chunk Parquet（`trainer/.data/chunks/`），強制重新計算每個 chunk。 |
 | `--skip-optuna` | 不跑 Optuna 超參搜尋，使用預設 LightGBM 超參。 |
 | `--recent-chunks N` | 僅使用訓練視窗內「最後 N 個」月 chunk（每 chunk 約一個月）。限制從 ClickHouse 或本地 Parquet 載入的資料量；建議 N≥3 以保持 train/valid/test 皆有資料。例如 `--recent-chunks 3` 約為最近 3 個月。 |
-| `--fast-mode` | 快速模式（DEC-017）：profile 不往前做 365 天 lookback，僅用有效訓練視窗；profile 特徵依資料天數動態選用。隱含 `--skip-optuna` 與 `--no-afg`。產物標記 `fast_mode=true`，**不得用於生產**。 |
-| `--no-afg` | 不做 Track LLM（DuckDB + Feature Spec），僅用 Track Profile + Track Human 特徵。與 `--fast-mode` 正交（fast-mode 會自動帶入）。 |
-| `--fast-mode-no-preload` | 關閉 profile backfill 時對 session Parquet 的「全表一次載入」，改為每 snapshot 日用 PyArrow pushdown 讀取。適合 low RAM 機器，避免 OOM；建議與 `--fast-mode` 一併使用。 |
-| `--sample-rated N` | 僅使用 N 個評級客（canonical_id 字典序取前 N 個）。與 `--fast-mode` 正交，可單獨或搭配使用。預設不抽樣（使用全部評級客）。 |
-| `--no-month-end-snapshots` | 相容用旗標；目前月結 snapshot 排程一律啟用，此選項**無效**。 |
+| `--no-preload` | 關閉 profile backfill 時對 session Parquet 的「全表一次載入」，改為每 snapshot 日用 PyArrow pushdown 讀取。預設（不加此旗標）會完整載入整張 session 表格。適合 ≤8 GB RAM 機器，避免 OOM，代價是 backfill 速度較慢。 |
+| `--sample-rated N` | 僅使用 N 個評級客（canonical_id 字典序取前 N 個）。預設不抽樣（使用全部評級客）。 |
 
 ### 測試
 
 全部測試：`pytest`  
 僅 trainer 相關：`pytest tests/test_trainer.py -v`  
-Fast-mode 煙測：`python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet`  
+快速煙測：`python -m trainer.trainer --recent-chunks 1 --use-local-parquet --skip-optuna`  
 程式碼品質：`ruff check .`、`mypy trainer/ --ignore-missing-imports`
 
 ### 文件
@@ -136,7 +121,6 @@ Fast-mode 煙測：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 ### 注意事項
 
-- **Fast-mode** 產物在 metadata 中標記 `fast_mode=true`，不得用於生產推論。
 - **憑證**：請安全存放 ClickHouse 憑證，勿提交 `.env`。
 - **時區**：業務邏輯使用 `Asia/Hong_Kong`（`config.HK_TZ`）。
 - **閾值選擇**：Phase 1 以驗證集 **F-beta 最大化**（預設 β=0.5，偏重 precision）選定單一模型閾值（DEC-009, DEC-021）；可選最小 recall / 每小時警報量約束，詳見 `config.THRESHOLD_FBETA`。
@@ -177,7 +161,7 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 ### 开发状态（对应 `.cursor/plans/`）
 
 - **Phase 1**：PLAN.md Step 0–10 均已实现完成（单一 Rated 模型、三轨特征、DuckDB Track LLM、Feature Spec YAML 冻结进 artifact、阈值 F-beta 最大化）。
-- **Track A（Featuretools DFS）已移除**：特征工程仅保留三轨——Track Profile（PIT/as-of join）、Track LLM（DuckDB + YAML）、Track Human（向量化 `loss_streak`/`run_boundary`）。`--no-afg` 表示跳过 Track LLM。
+- **Track A（Featuretools DFS）已移除**：特征工程仅保留三轨——Track Profile（PIT/as-of join）、Track LLM（DuckDB + YAML）、Track Human（向量化 `loss_streak`/`run_boundary`）。
 - **Scorer / API**：仅对评级客（`is_rated`）产生告警；训练结束后会清理旧版 `nonrated_model.pkl` / `rated_model.pkl`。
 - **测试**：全量 `pytest` 约 519 passed；实现计划与状态详见 `.cursor/plans/PLAN.md`、`.cursor/plans/STATUS.md`、`.cursor/plans/DECISION_LOG.md`。
 
@@ -199,28 +183,16 @@ python -m trainer.trainer --use-local-parquet --recent-chunks 3
 python -m trainer.trainer --skip-optuna --use-local-parquet
 ```
 
-**Fast mode（仅供测试，笔记本约 &lt;10 分钟）**：限制可用数据时间范围（Data Horizon），所有子模块（identity / labels / features / profile ETL）共用同一个时间边界，以较少数据量加速训练；并隐含 `--skip-optuna` 与 `--no-afg`（跳过 Track LLM）。可选择性搭配 `--sample-rated N` 只抽样部分评级客。**请勿将产物用于生产。**
+低内存（如 8 GB）：加上 `--no-preload` 可避免 profile backfill 时将整张 session Parquet 一次载入内存：
 
 ```bash
-python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
+python -m trainer.trainer --recent-chunks 3 --use-local-parquet --no-preload
 ```
 
-**--no-afg（No Automatic Feature Generation）**：仅使用 Track Profile + Track Human 特征，跳过 Track LLM（DuckDB + Feature Spec YAML）；与 `--fast-mode` 正交（fast-mode 会自动带入 --no-afg）。适用于快速迭代或无 DuckDB/Track LLM 需求时。
+如需只使用部分评级客（节省训练时间），可加入 `--sample-rated N`：
 
 ```bash
-python -m trainer.trainer --no-afg --recent-chunks 2 --use-local-parquet
-```
-
-低内存（如 8 GB）：加上 `--fast-mode-no-preload`：
-
-```bash
-python -m trainer.trainer --fast-mode --fast-mode-no-preload --recent-chunks 3 --use-local-parquet
-```
-
-如需在 Fast mode 下只使用部分评级客，可加入（与 `--fast-mode` 正交）：
-
-```bash
-python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sample-rated 1000
+python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1000
 ```
 
 **Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`
@@ -246,17 +218,14 @@ python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sa
 | `--force-recompute` | 忽略已缓存的 chunk Parquet（`trainer/.data/chunks/`），强制重新计算每个 chunk。 |
 | `--skip-optuna` | 不跑 Optuna 超参搜索，使用默认 LightGBM 超参，可省约 10 分钟。 |
 | `--recent-chunks N` | 仅使用训练窗口内「最后 N 个」月 chunk（每 chunk 约一个月）。限制从 ClickHouse 或本地 Parquet 载入的数据量；建议 N≥3 以保持 train/valid/test 皆有数据。例如 `--recent-chunks 3` 约最近 3 个月。 |
-| `--fast-mode` | 快速模式（DEC-017）：profile 不往前做 365 天 lookback，仅用有效训练窗口；profile 特征依数据天数动态选用。隐含 `--skip-optuna` 与 `--no-afg`。产物标记 `fast_mode=true`，**不得用于生产**。 |
-| `--no-afg` | 不做 Track LLM（DuckDB + Feature Spec），仅用 Track Profile + Track Human 特征。与 `--fast-mode` 正交（fast-mode 会自动带入）。 |
-| `--fast-mode-no-preload` | 关闭 profile backfill 时对 session Parquet 的「全表一次载入」，改为每 snapshot 日用 PyArrow pushdown 读取。适合约 8 GB RAM 机器，避免 OOM；建议与 `--fast-mode` 一并使用。 |
-| `--sample-rated N` | 仅使用 N 个评级客（canonical_id 字典序取前 N 个）。与 `--fast-mode` 正交，可单独或搭配使用。默认不抽样（使用全部评级客）。 |
-| `--no-month-end-snapshots` | 兼容用旗标；当前月结 snapshot 调度一律启用，此选项**无效**。 |
+| `--no-preload` | 关闭 profile backfill 时对 session Parquet 的「全表一次载入」，改为每 snapshot 日用 PyArrow pushdown 读取。默认（不加此旗标）会完整载入整张 session 表格。适合 ≤8 GB RAM 机器，避免 OOM，代价是 backfill 速度较慢。 |
+| `--sample-rated N` | 仅使用 N 个评级客（canonical_id 字典序取前 N 个）。默认不抽样（使用全部评级客）。 |
 
 ### 测试
 
 全部测试：`pytest`  
 仅 trainer 相关：`pytest tests/test_trainer.py -v`  
-Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet`  
+快速烟测：`python -m trainer.trainer --recent-chunks 1 --use-local-parquet --skip-optuna`  
 代码质量：`ruff check .`、`mypy trainer/ --ignore-missing-imports`
 
 ### 文档
@@ -280,7 +249,6 @@ Fast-mode 烟测：`python -m trainer.trainer --fast-mode --recent-chunks 1 --us
 
 ### 注意事项
 
-- **Fast-mode** 产物在 metadata 中标记 `fast_mode=true`，不得用于生产推理。
 - **凭证**：请安全存放 ClickHouse 凭证，勿提交 `.env`。
 - **时区**：业务逻辑使用 `Asia/Hong_Kong`（`config.HK_TZ`）。
 - **阈值选择**：Phase 1 以验证集 **F-beta 最大化**（默认 β=0.5，偏重 precision）选定单模型阈值（DEC-009, DEC-021）；可选最小 recall / 每小时警报量约束，详见 `config.THRESHOLD_FBETA`。
@@ -321,7 +289,7 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 ### Development status (see `.cursor/plans/`)
 
 - **Phase 1**: PLAN.md Steps 0–10 are implemented (single Rated model, three-track features, DuckDB Track LLM, Feature Spec YAML frozen into artifact, F-beta threshold maximization).
-- **Track A (Featuretools DFS) removed**: Feature engineering is three-track only — Track Profile (PIT/as-of join), Track LLM (DuckDB + YAML), Track Human (vectorized `loss_streak`/`run_boundary`). `--no-afg` skips Track LLM.
+- **Track A (Featuretools DFS) removed**: Feature engineering is three-track only — Track Profile (PIT/as-of join), Track LLM (DuckDB + YAML), Track Human (vectorized `loss_streak`/`run_boundary`).
 - **Scorer / API**: Alerts are emitted only for rated patrons (`is_rated`); stale `nonrated_model.pkl` / `rated_model.pkl` are cleaned up after training.
 - **Tests**: Full `pytest` ~519 passed; see `.cursor/plans/PLAN.md`, `.cursor/plans/STATUS.md`, `.cursor/plans/DECISION_LOG.md` for plan and status.
 
@@ -372,32 +340,18 @@ python -m trainer.trainer --use-local-parquet --recent-chunks 3
 python -m trainer.trainer --skip-optuna --use-local-parquet
 ```
 
-### Fast mode (testing only, &lt;10 min on laptop)
+### Low-RAM / subset training
 
-Constrains the available data time range (Data Horizon); all submodules (identity / labels / features / profile ETL) share the same time boundary so that a smaller slice of data is processed for faster iteration. Implies `--skip-optuna` and `--no-afg` (skips Track LLM). You can optionally combine with `--sample-rated N` to train on a subset of patrons. **Do not use artifacts in production.**
+Low-RAM (e.g. 8 GB): add `--no-preload` to avoid loading the full session Parquet into memory during profile backfill. By default (flag absent) the entire session table is preloaded once for efficiency.
 
 ```bash
-python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
+python -m trainer.trainer --recent-chunks 3 --use-local-parquet --no-preload
 ```
 
-### --no-afg (No Automatic Feature Generation)
-
-Use only Track Profile + Track Human features and skip Track LLM (DuckDB + Feature Spec YAML). Orthogonal to `--fast-mode` (fast-mode implies `--no-afg`). Useful for quick iteration or when DuckDB/Track LLM is not needed.
+To train on a deterministic subset of rated patrons:
 
 ```bash
-python -m trainer.trainer --no-afg --recent-chunks 2 --use-local-parquet
-```
-
-Low-RAM (e.g. 8 GB): add `--fast-mode-no-preload` to avoid loading the full session Parquet into memory:
-
-```bash
-python -m trainer.trainer --fast-mode --fast-mode-no-preload --recent-chunks 3 --use-local-parquet
-```
-
-To use only a subset of patrons under Fast mode (orthogonal to `--fast-mode`):
-
-```bash
-python -m trainer.trainer --fast-mode --recent-chunks 3 --use-local-parquet --sample-rated 1000
+python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1000
 ```
 
 ### Backtester
@@ -457,11 +411,8 @@ python -m trainer.status_server
 | `--force-recompute` | Ignore cached chunk Parquets in `trainer/.data/chunks/` and recompute every chunk. |
 | `--skip-optuna` | Skip Optuna hyperparameter search and use default LightGBM hyperparameters (saves ~10 min). |
 | `--recent-chunks N` | Use only the last N monthly chunks in the training window (one chunk ≈ one month). Limits data loaded from ClickHouse or local Parquet; recommend N≥3 so train/valid/test are all non-empty. E.g. `--recent-chunks 3` ≈ last 3 months. |
-| `--fast-mode` | Fast mode (DEC-017): no 365-day profile lookback; profile features use only the effective training window and are layered by data horizon. Implies `--skip-optuna` and `--no-afg`. Artifacts are tagged `fast_mode=true` and **must not be used in production**. |
-| `--no-afg` | Skip Track LLM (DuckDB + Feature Spec); use only Track Profile + Track Human features. Orthogonal to `--fast-mode` (fast-mode implies it). |
-| `--fast-mode-no-preload` | Disable full-table session Parquet preload during profile backfill; use per-snapshot PyArrow pushdown reads instead. Recommended for ~8 GB RAM to avoid OOM; combine with `--fast-mode`. |
-| `--sample-rated N` | Use only N canonical_ids (first N by lexicographic order). Orthogonal to `--fast-mode`. Default: no sampling (all rated). |
-| `--no-month-end-snapshots` | Deprecated compatibility flag; month-end snapshot schedule is always on; **no effect**. |
+| `--no-preload` | Disable full-table session Parquet preload during profile backfill; use per-snapshot PyArrow pushdown reads instead. Default (flag absent) is to preload the full session table once. Recommended for ≤8 GB RAM to avoid OOM at the cost of slower backfill. |
+| `--sample-rated N` | Use only N canonical_ids (first N by lexicographic order). Default: no sampling (all rated). |
 
 ---
 
@@ -479,11 +430,10 @@ Run only trainer-related tests:
 pytest tests/test_trainer.py -v
 ```
 
-Fast-mode smoke test (requires local Parquet data):
+Quick smoke test (requires local Parquet data):
 
 ```bash
-python -m trainer.trainer --fast-mode --recent-chunks 1 --use-local-parquet
-# Check trainer/models/ or training output for fast_mode=true in metadata
+python -m trainer.trainer --recent-chunks 1 --use-local-parquet --skip-optuna
 ```
 
 Lint and type-check:
@@ -521,7 +471,7 @@ Under `trainer/models/`:
 - `feature_spec.yaml` — Frozen feature spec snapshot (DEC-024) written at training time; scorer loads this first for train–serve consistency
 - `reason_code_map.json` — Feature-to-reason-code mapping for SHAP
 - `model_version` — Version string (e.g. `20260228-153000-abc1234`)
-- `training_metrics.json` — Rated metrics only; flags such as `fast_mode`, `uncalibrated_threshold`
+- `training_metrics.json` — Rated metrics only; flags such as `uncalibrated_threshold`, `sample_rated_n`
 
 Legacy `walkaway_model.pkl` is still written for backward compatibility. After each run, any stale `nonrated_model.pkl` or `rated_model.pkl` from older dual-model runs is removed so the scorer and backtester do not load them.
 
@@ -529,7 +479,6 @@ Legacy `walkaway_model.pkl` is still written for backward compatibility. After e
 
 ## Notes
 
-- **Fast-mode** outputs are marked `fast_mode=true` in metadata and must not be used for production inference.
 - **Credentials**: Store ClickHouse credentials securely; avoid committing `.env`.
 - **Time zone**: Business logic uses `Asia/Hong_Kong` (see `config.HK_TZ`).
 - **Threshold selection**: Phase 1 uses validation-set **F-beta maximization** (default β=0.5, precision-weighted) for the single-model threshold (DEC-009, DEC-021); optional min recall / alerts-per-hour constraints; see `config.THRESHOLD_FBETA`.

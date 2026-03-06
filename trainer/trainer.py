@@ -82,6 +82,7 @@ try:
     BET_AVAIL_DELAY_MIN = _cfg.BET_AVAIL_DELAY_MIN
     SESSION_AVAIL_DELAY_MIN = _cfg.SESSION_AVAIL_DELAY_MIN
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
+    OPTUNA_TIMEOUT_SECONDS: Optional[int] = getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", 10 * 60)
     # G1_PRECISION_MIN / G1_ALERT_VOLUME_MIN_PER_HOUR / G1_FBETA intentionally
     # not imported — deprecated per DEC-009/010; rollback path only.
     PLACEHOLDER_PLAYER_ID = _cfg.PLACEHOLDER_PLAYER_ID
@@ -115,6 +116,7 @@ except ModuleNotFoundError:
     BET_AVAIL_DELAY_MIN = _cfg.BET_AVAIL_DELAY_MIN
     SESSION_AVAIL_DELAY_MIN = _cfg.SESSION_AVAIL_DELAY_MIN
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
+    OPTUNA_TIMEOUT_SECONDS: Optional[int] = getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", 10 * 60)
     # G1_PRECISION_MIN / G1_ALERT_VOLUME_MIN_PER_HOUR / G1_FBETA intentionally
     # not imported — deprecated per DEC-009/010; rollback path only.
     PLACEHOLDER_PLAYER_ID = _cfg.PLACEHOLDER_PLAYER_ID
@@ -235,15 +237,6 @@ _REQUIRED_BET_PARQUET_COLS: list = [
     "position_idx",
 ]
 
-# DEPRECATED(DEC-017): FAST_MODE_RATED_SAMPLE_N is no longer used by any
-# runtime logic.  Rated sampling was decoupled from fast-mode (R205) and is
-# now controlled by the independent --sample-rated N CLI flag.  This constant
-# is kept only as a reference; do not use it in new code.
-FAST_MODE_RATED_SAMPLE_N: int = 1_000
-# DEPRECATED(DEC-019 follow-up): profile snapshots are now forced to month-end
-# across all modes, including fast-mode.  Keep this constant only for backward
-# compatibility in logs/tests that may still import it.
-FAST_MODE_SNAPSHOT_INTERVAL_DAYS: int = 7
 
 BASE_DIR = Path(__file__).parent
 PROJECT_ROOT = BASE_DIR.parent
@@ -847,9 +840,7 @@ def ensure_player_profile_ready(
     snapshot_interval_days: int = 1,
     preload_sessions: bool = True,
     canonical_map: Optional[pd.DataFrame] = None,
-    fast_mode: bool = False,
     max_lookback_days: int = 365,
-    use_month_end_snapshots: bool = True,
 ) -> None:
     """Auto-check profile table freshness and rebuild missing local ranges if needed.
 
@@ -861,27 +852,21 @@ def ensure_player_profile_ready(
     Parameters
     ----------
     canonical_id_whitelist:
-        When provided (fast-mode), passed to ``backfill`` to restrict
-        profiling to the sampled rated player set.  Also triggers
-        in-process backfill (avoids subprocess overhead and allows
-        the whitelist to be passed directly).
+        When provided, passed to ``backfill`` to restrict profiling to the
+        sampled rated player set.  Also triggers in-process backfill (avoids
+        subprocess overhead and allows the whitelist to be passed directly).
     snapshot_interval_days:
         Deprecated for scheduling.  Month-end scheduling is now enforced in all
         modes.  This value is still forwarded for backward compatibility, but
         it does not control snapshot date selection.
     preload_sessions:
-        Forwarded to ``backfill``.  Set False (--fast-mode-no-preload) to
-        disable full-table session preload, using per-day PyArrow pushdown
-        reads instead.  Reduces peak RAM at the cost of more disk I/O.
+        Forwarded to ``backfill``.  Set False (--no-preload) to disable
+        full-table session preload, using per-day PyArrow pushdown reads
+        instead.  Reduces peak RAM at the cost of more disk I/O.
     canonical_map:
         Pre-built player_id -> canonical_id mapping DataFrame from
         trainer.py.  Forwarded to ``backfill`` so the ETL does not
-        redundantly search for ``canonical_mapping.parquet`` on disk
-        (DEC-017 bug fix — eliminates the
-        ``No local canonical_mapping.parquet`` warning).
-    use_month_end_snapshots:
-        Deprecated override flag.  Month-end scheduling is now always enabled
-        (including fast-mode) to keep profile update cadence stable.
+        redundantly search for ``canonical_mapping.parquet`` on disk.
     """
     if not use_local_parquet:
         # ClickHouse mode: schema version is not auto-checked; if PROFILE_FEATURE_COLS
@@ -903,9 +888,8 @@ def ensure_player_profile_ready(
     # entire cached parquet must be discarded before the date-range check runs.
     if profile_path.exists():
         current_hash = compute_profile_schema_hash()
-        # R106: add population-mode indicator so fast/normal caches do not mix.
-        # R200: also include max_lookback_days so that a profile cache built with
-        # horizon=30 (fast-mode) is not reused by normal-mode (horizon=365).
+        # R106/R200: add population-mode and horizon indicators so caches with
+        # different lookback settings do not mix.
         _pop_tag = (
             f"_whitelist={len(canonical_id_whitelist)}"
             if canonical_id_whitelist
@@ -963,10 +947,7 @@ def ensure_player_profile_ready(
     # full year of stale snapshots that are never actually used.
     #
     # Rationale: join_player_profile uses merge_asof(direction="backward"), so a bet
-    # on Feb 15 needs the Jan 31 snapshot.  Previously, normal mode pushed required_start
-    # back a full 365 days (wasteful), and fast-mode used window_start.date() directly
-    # (which would miss the Jan 31 anchor for cross-month windows, producing NaN for
-    # bets in the first partial month).  Both issues are fixed by this single approach.
+    # on Feb 15 needs the Jan 31 snapshot.
     required_start = _latest_month_end_on_or_before(window_start.date())
     required_end = window_end.date()
 
@@ -1029,14 +1010,13 @@ def ensure_player_profile_ready(
             )
 
         # Use in-process backfill when any of:
-        # (a) fast-mode: whitelist or interval != 1 — avoids subprocess overhead
-        #     and allows whitelist / snapshot_interval_days to be forwarded
-        #     directly without CLI serialisation.
-        # (b) canonical_map already in memory (DEC-017 R120 fix) — a subprocess
-        #     cannot receive a Python DataFrame object, so in-process is the
-        #     only path that can forward the pre-built map.  Without this,
-        #     normal-mode local-parquet backfill would still trigger the
-        #     "No local canonical_mapping.parquet" warning.
+        # (a) canonical_map already in memory — a subprocess cannot receive a
+        #     Python DataFrame object, so in-process is the only path that can
+        #     forward the pre-built map (eliminates "No local
+        #     canonical_mapping.parquet" warning).
+        # (b) canonical_id_whitelist provided — avoids subprocess overhead and
+        #     allows the whitelist to be forwarded directly without CLI
+        #     serialisation.
         # (c) DEC-019: snapshot_dates is provided (in-process required to pass
         #     the date list directly without CLI serialisation).
         use_inprocess = (
@@ -1075,8 +1055,8 @@ def ensure_player_profile_ready(
                     _backfill_start, _backfill_end, _exc,
                 )
         else:
-            # R105: auto_script check only for subprocess path; fast-mode uses
-            # in-process backfill and does not need the script.
+            # R105: auto_script check only for subprocess path; in-process
+            # backfill does not need the script.
             if not auto_script.exists():
                 logger.warning(
                     "Auto profile builder script missing at %s; skip this range",
@@ -1105,7 +1085,7 @@ def ensure_player_profile_ready(
                 logger.info("Auto profile build completed for %s -> %s", miss_start, miss_end)
 
     # Final coverage check after auto-build attempt.
-    # R111: when snapshot_interval_days > 1 or use_month_end_snapshots, date gaps
+    # R111: when snapshot_interval_days > 1 or month-end scheduling, date gaps
     # are expected; only warn if coverage is truly insufficient.
     # DEC-019: month-end snapshots allow gaps up to ~31 days.
     _effective_interval = 31 if effective_month_end else snapshot_interval_days
@@ -1543,7 +1523,6 @@ def _chunk_cache_key(
     chunk: dict,
     bets: pd.DataFrame,
     profile_hash: str = "none",
-    no_afg: bool = False,
     neg_sample_frac: float = 1.0,
 ) -> str:
     """Hash to detect stale parquet cache (TRN-07).
@@ -1554,10 +1533,6 @@ def _chunk_cache_key(
 
     R77: profile_hash encodes the shape/content of player_profile so that
     changes to the snapshot table also invalidate the chunk cache.
-
-    R904/R1003: no_afg is included so that toggling --no-afg produces a distinct
-    cache key, preventing stale Track-LLM-enabled chunks from being reused when AFG
-    is turned off (or vice versa).
 
     R-NEG-1: neg_sample_frac is included so that changing the downsampling ratio
     forces a cache miss and prevents stale full/partial chunks being served.
@@ -1573,8 +1548,7 @@ def _chunk_cache_key(
         "HISTORY_BUFFER_DAYS": HISTORY_BUFFER_DAYS,
     }, sort_keys=True)
     cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:6]
-    afg_tag = "no_afg" if no_afg else "afg"
-    return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}|{afg_tag}|ns{neg_sample_frac:.4f}"
+    return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}|ns{neg_sample_frac:.4f}"
 
 
 def process_chunk(
@@ -1585,7 +1559,6 @@ def process_chunk(
     force_recompute: bool = False,
     profile_df: Optional[pd.DataFrame] = None,
     feature_spec: Optional[dict] = None,
-    no_afg: bool = False,
     neg_sample_frac: float = NEG_SAMPLE_FRAC,
 ) -> Optional[Path]:
     """Process one monthly chunk; return path to written Parquet or None if empty.
@@ -1596,7 +1569,6 @@ def process_chunk(
     profile_df: player_profile snapshot table for PIT join (PLAN Step 4/DEC-011).
         Pass None to skip; profile feature columns will be 0 for all rows.
     feature_spec: parsed Track LLM feature spec loaded by run_pipeline.
-    no_afg: when True, skip Track LLM feature computation (DEC-020 --no-afg / --fast-mode).
     neg_sample_frac: fraction of label=0 rows to keep (1.0 = keep all).  Overrides
         the module-level NEG_SAMPLE_FRAC; normally supplied by run_pipeline after the
         OOM pre-check (_oom_check_and_adjust_neg_sample_frac).
@@ -1644,7 +1616,7 @@ def process_chunk(
     else:
         _profile_hash = "none"
     current_key = _chunk_cache_key(
-        chunk, bets_raw, profile_hash=_profile_hash, no_afg=no_afg,
+        chunk, bets_raw, profile_hash=_profile_hash,
         neg_sample_frac=neg_sample_frac)
     key_path = chunk_path.with_suffix(".cache_key")
     if not force_recompute and chunk_path.exists():
@@ -1712,7 +1684,7 @@ def process_chunk(
     # (train-serve parity).  The result is merged back onto bets by bet_id so that
     # compute_labels still receives the extended-zone rows it needs for right-censoring.
     _bets_llm_feature_cols: list = []
-    if not no_afg and feature_spec is not None:
+    if feature_spec is not None:
         try:
             _t0_llm = time.perf_counter()
             _bets_llm_result = compute_track_llm_features(
@@ -1908,7 +1880,6 @@ def run_optuna_search(
             label or "model",
         )
         return {}
-    logger.info("Optuna search (%s): %d trials", label or "model", n_trials)
 
     def objective(trial: optuna.Trial) -> float:
         params = {
@@ -1939,7 +1910,27 @@ def run_optuna_search(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=42),
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    _timeout = (
+        float(OPTUNA_TIMEOUT_SECONDS)
+        if OPTUNA_TIMEOUT_SECONDS is not None and OPTUNA_TIMEOUT_SECONDS > 0
+        else None
+    )
+    if _timeout is None:
+        logger.info(
+            "Optuna search (%s): n_trials=%d, timeout=disabled (OPTUNA_TIMEOUT_SECONDS=%s)",
+            label or "model",
+            n_trials,
+            OPTUNA_TIMEOUT_SECONDS,
+        )
+    else:
+        logger.info(
+            "Optuna search (%s): n_trials=%d, timeout=%.0fs (~%.1f min)",
+            label or "model",
+            n_trials,
+            _timeout,
+            _timeout / 60.0,
+        )
+    study.optimize(objective, n_trials=n_trials, timeout=_timeout, show_progress_bar=False)
     best = study.best_params
     logger.info("Optuna (%s) best AP=%.4f, params=%s", label or "model", study.best_value, best)
     return best
@@ -2346,7 +2337,7 @@ def train_dual_model(
     ----------
     train_df, valid_df : labelled DataFrames with is_rated column
     feature_cols       : screened feature list (all tracks)
-    run_optuna         : whether to run Optuna HPO (skipped in fast-mode)
+    run_optuna         : whether to run Optuna HPO (skipped when --skip-optuna)
     test_df            : held-out test split; when provided, test metrics and
                          LightGBM gain feature importance are appended to each
                          model's metrics dict and written into training_metrics.json.
@@ -2584,7 +2575,6 @@ def save_artifact_bundle(
     feature_cols: List[str],
     combined_metrics: dict,
     model_version: str,
-    fast_mode: bool = False,
     sample_rated_n: Optional[int] = None,
     feature_spec_path: Optional[Path] = None,
     neg_sample_frac: float = 1.0,
@@ -2689,7 +2679,6 @@ def save_artifact_bundle(
             {
                 **combined_metrics,
                 "model_version": model_version,
-                "fast_mode": fast_mode,
                 # R301: record sampling metadata so artifacts can be audited
                 # even when loaded later.  None = full rated population was used.
                 "sample_rated_n": sample_rated_n,
@@ -2734,17 +2723,11 @@ def run_pipeline(args) -> None:
     start, end = parse_window(args)
     use_local = getattr(args, "use_local_parquet", False)
     force = getattr(args, "force_recompute", False)
-    fast_mode = getattr(args, "fast_mode", False)
-    # --fast-mode implies --skip-optuna; allow either flag independently.
-    skip_optuna = getattr(args, "skip_optuna", False) or fast_mode
-    # --no-afg (No Automatic Feature Generation, DEC-020): skip Track LLM generation.
-    # --fast-mode implies --no-afg to reduce compute when iterating quickly.
-    # when iterating quickly on a short data horizon.
-    no_afg = getattr(args, "no_afg", False) or fast_mode
-    # --fast-mode-no-preload: disable session full-table preload; use per-day
-    # PyArrow pushdown reads instead.  Reduces peak RAM for 8 GB machines.
-    no_preload = getattr(args, "fast_mode_no_preload", False)
-    # --sample-rated N (DEC-017 / R205): orthogonal to --fast-mode.
+    skip_optuna = getattr(args, "skip_optuna", False)
+    # --no-preload: disable session full-table preload; use per-day PyArrow
+    # pushdown reads instead.  Reduces peak RAM for low-RAM machines.
+    no_preload = getattr(args, "no_preload", False)
+    # --sample-rated N: restrict training to a deterministic subset of rated patrons.
     # None means "use all rated canonical_ids" (default).
     sample_rated_n: Optional[int] = getattr(args, "sample_rated", None)
     # R302: reject invalid sampling sizes early with an actionable error.
@@ -2752,15 +2735,6 @@ def run_pipeline(args) -> None:
         raise SystemExit(
             f"--sample-rated N must be >= 1, got {sample_rated_n}. "
             "Pass a positive integer or omit the flag to use all rated patrons."
-        )
-    # R118 / R303: warn if --fast-mode-no-preload is given without --fast-mode
-    # AND without --sample-rated.  When --sample-rated is used, the in-process
-    # backfill path is taken (canonical_map is not None), so the preload_sessions
-    # flag IS forwarded — the warning would be incorrect in that case.
-    if no_preload and not fast_mode and sample_rated_n is None:
-        logger.warning(
-            "--fast-mode-no-preload has no effect without --fast-mode or --sample-rated; ignoring. "
-            "Combine with --fast-mode or --sample-rated for memory-safe backfill."
         )
 
     # Log the config-file NEG_SAMPLE_FRAC at startup.  The OOM pre-check (run
@@ -2849,22 +2823,6 @@ def run_pipeline(args) -> None:
         chunks, NEG_SAMPLE_FRAC
     )
 
-    # DEC-017: derive the data horizon (days of available history in this run).
-    # Used to (a) cap profile snapshot range in fast-mode, and (b) select only
-    # the profile feature subset that can actually be computed from available data.
-    data_horizon_days = max(0, (effective_end - effective_start).days)
-    # R203: warn early when the horizon is so small that all profile features will
-    # be excluded.  Sessions span 7d before the smallest computable window; any
-    # horizon below 7 days means get_profile_feature_cols() returns an empty list
-    # and the rated model trains with no profile signal at all.
-    if fast_mode and data_horizon_days < 7:
-        logger.warning(
-            "FAST MODE: data_horizon_days=%d is very small (< 7 days); "
-            "all profile features will be excluded from active_feature_cols. "
-            "Consider using --recent-chunks >= 2 for meaningful profile coverage.",
-            data_horizon_days,
-        )
-
     # 2. Chunk-level split — used ONLY to derive train_end for the canonical
     #    mapping cutoff (B1 / R25 identity-leakage guard).  The actual row
     #    assignment to train/valid/test happens later at row level (SSOT §9.2).
@@ -2927,10 +2885,7 @@ def run_pipeline(args) -> None:
         len(canonical_map), len(dummy_player_ids), _el,
     )
 
-    # DEC-017 / R205: rated-patron sampling is now an independent, orthogonal option
-    # controlled by --sample-rated N.  fast-mode alone does NOT imply sampling —
-    # it restricts the *data horizon* only.  This decouples fast iteration (horizon)
-    # from dataset-size reduction (patron count).
+    # Rated-patron sampling is an independent option controlled by --sample-rated N.
     rated_whitelist: Optional[set] = None
     if sample_rated_n is not None and not canonical_map.empty:
         _sample = (
@@ -2958,9 +2913,7 @@ def run_pipeline(args) -> None:
         snapshot_interval_days=1,
         preload_sessions=not no_preload,
         canonical_map=canonical_map,
-        fast_mode=fast_mode,
-        max_lookback_days=data_horizon_days if fast_mode else 365,
-        use_month_end_snapshots=True,
+        max_lookback_days=365,
     )
     _el = time.perf_counter() - t0
     print("[Step 4/10] Ensure player_profile ready done in %.1fs" % _el, flush=True)
@@ -2970,7 +2923,6 @@ def run_pipeline(args) -> None:
     #     Pass the resulting DataFrame to every process_chunk call so each chunk
     #     can do the PIT/as-of join without re-querying.  If load fails, profile
     #     features are 0 for all rows (graceful degradation).
-    # R109: in fast-mode, pass whitelist only (profile has 1k players, not full map)
     _rated_cids: Optional[List[str]] = (
         list(rated_whitelist)
         if rated_whitelist
@@ -2996,10 +2948,8 @@ def run_pipeline(args) -> None:
         print("[Step 5/10] Load player_profile done in %.1fs (not available)" % _el, flush=True)
         logger.info("player_profile: not available — profile features will be NaN (%.1fs)", _el)
 
-    feature_spec: Optional[dict] = None
-    if not no_afg:
-        feature_spec = load_feature_spec(FEATURE_SPEC_PATH)
-        logger.info("Track LLM: loaded feature spec from %s", FEATURE_SPEC_PATH)
+    feature_spec = load_feature_spec(FEATURE_SPEC_PATH)
+    logger.info("Track LLM: loaded feature spec from %s", FEATURE_SPEC_PATH)
 
     # 4. Process chunks -> write parquet
     _neg_sample_note = (
@@ -3020,7 +2970,6 @@ def run_pipeline(args) -> None:
             force_recompute=force,
             profile_df=profile_df,
             feature_spec=feature_spec,
-            no_afg=no_afg,
             neg_sample_frac=_effective_neg_sample_frac,
         )
         if path is not None:
@@ -3154,28 +3103,14 @@ def run_pipeline(args) -> None:
             len(test_df), MIN_VALID_TEST_ROWS,
         )
 
-    # DEC-017: in fast-mode, restrict profile features to those computable within
-    # the available data horizon; non-profile features (Track B + legacy) are
-    # always included.  In normal mode, use the full ALL_FEATURE_COLS list.
-    if fast_mode:
-        _active_profile_cols = get_profile_feature_cols(data_horizon_days)
-        active_feature_cols: List[str] = (
-            TRACK_B_FEATURE_COLS + LEGACY_FEATURE_COLS + _active_profile_cols
-        )
-        logger.info(
-            "FAST MODE: active profile features = %d / %d "
-            "(data_horizon_days=%d)",
-            len(_active_profile_cols), len(PROFILE_FEATURE_COLS), data_horizon_days,
-        )
-    else:
-        active_feature_cols = ALL_FEATURE_COLS
+    active_feature_cols = ALL_FEATURE_COLS
 
     # 5b. Full-feature screening (DEC-020).
     # Runs on the TRAINING SET ONLY to comply with TRN-09 anti-leakage rules.
     #
     # Candidate set = active_feature_cols (Track Human + Legacy + Profile) PLUS
     # Track LLM candidate columns declared in feature spec and present in train_df.
-    if not no_afg and feature_spec is not None:
+    if feature_spec is not None:
         _track_llm_cols = [
             cand.get("feature_id")
             for cand in (feature_spec.get("track_llm", {}) or {}).get("candidates", [])
@@ -3275,9 +3210,8 @@ def run_pipeline(args) -> None:
     t0 = time.perf_counter()
     save_artifact_bundle(
         rated_art, active_feature_cols, combined_metrics, model_version,
-        fast_mode=fast_mode,
         sample_rated_n=sample_rated_n,
-        feature_spec_path=FEATURE_SPEC_PATH if not no_afg else None,
+        feature_spec_path=FEATURE_SPEC_PATH,
         neg_sample_frac=_effective_neg_sample_frac,
     )
     _el = time.perf_counter() - t0
@@ -3341,58 +3275,24 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--fast-mode", action="store_true",
-        help=(
-            "Fast mode (DEC-017 Data-Horizon): restrict all data access to the "
-            "effective training window — no 365-day lookback pushed back for profiles. "
-            "Profile features are dynamically layered based on the available data horizon. "
-            "Profile snapshots follow month-end schedule (same as full mode). "
-            "Implies --skip-optuna and --no-afg (skips Track LLM generation). "
-            "Use --sample-rated N (separate flag) to also sample rated patrons. "
-            "NEVER use artifacts from this mode in production — "
-            "training_metrics.json will be flagged with fast_mode=true."
-        ),
-    )
-    parser.add_argument(
-        "--no-afg", action="store_true",
-        help=(
-            "No Automatic Feature Generation (DEC-020): skip Track LLM (DuckDB) "
-            "feature generation. Feature screening still runs on Track Human + "
-            "player-level/profile + legacy features. "
-            "Scorer then computes only Track Human + profile (+ legacy). "
-            "Orthogonal to --fast-mode (--fast-mode implies --no-afg). "
-            "Use for faster iteration or to validate the non-LLM path independently."
-        ),
-    )
-    parser.add_argument(
-        "--fast-mode-no-preload", action="store_true",
+        "--no-preload", action="store_true",
         help=(
             "Disable full-table session Parquet preload during profile backfill. "
             "Instead, each snapshot day reads only the relevant time window via "
             "PyArrow pushdown filters. Recommended for machines with <=8 GB RAM "
             "where the full session Parquet (~74M rows) would cause OOM. "
             "Trade-off: backfill is slower but memory-safe. "
-            "Combine with --fast-mode for best effect on low-RAM machines."
+            "By default (flag absent) the entire session table is loaded once."
         ),
     )
     parser.add_argument(
         "--sample-rated", type=int, default=None, metavar="N",
         help=(
             "Deterministically sample N rated canonical_ids (sorted lexicographically, "
-            "head N). Orthogonal to --fast-mode: can be combined or used independently. "
-            "Default: no sampling (all rated canonical_ids are used). "
+            "head N). Default: no sampling (all rated canonical_ids are used). "
             "Example: --sample-rated 1000 to train on a 1k patron subset."
         ),
     )
-    parser.add_argument(
-        "--no-month-end-snapshots", action="store_false", dest="month_end_snapshots",
-        help=(
-            "Deprecated compatibility flag. Month-end profile snapshot scheduling "
-            "is now always enforced in all modes (including --fast-mode), so this "
-            "option has no effect."
-        ),
-    )
-    parser.set_defaults(month_end_snapshots=True)
     args = parser.parse_args()
     run_pipeline(args)
 

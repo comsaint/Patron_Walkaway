@@ -61,6 +61,7 @@ try:
     _G1_FBETA: float = getattr(_cfg, "G1_FBETA", 0.5)  # kept for fbeta reference metric only
     THRESHOLD_FBETA: float = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
+    OPTUNA_TIMEOUT_SECONDS: Optional[int] = getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", 10 * 60)
     LABEL_LOOKAHEAD_MIN = _cfg.LABEL_LOOKAHEAD_MIN
     HK_TZ_STR: str = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     BACKTEST_HOURS: int = getattr(_cfg, "BACKTEST_HOURS", 6)
@@ -75,6 +76,7 @@ except ModuleNotFoundError:
     _G1_FBETA = getattr(_cfg, "G1_FBETA", 0.5)
     THRESHOLD_FBETA = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
+    OPTUNA_TIMEOUT_SECONDS: Optional[int] = getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", 10 * 60)
     LABEL_LOOKAHEAD_MIN = _cfg.LABEL_LOOKAHEAD_MIN
     HK_TZ_STR = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     BACKTEST_HOURS = getattr(_cfg, "BACKTEST_HOURS", 6)
@@ -325,7 +327,20 @@ def run_optuna_threshold_search(
     observations, subject to optional min recall and min alerts/hour constraints.
     Returns (rated_t, rated_t) for API compatibility with dual-metric callers.
     """
-    logger.info("Optuna single-threshold search: %d trials", n_trials)
+    # Log Optuna time-budget status before optimization begins.
+    if OPTUNA_TIMEOUT_SECONDS is None or OPTUNA_TIMEOUT_SECONDS <= 0:
+        logger.info(
+            "Optuna single-threshold search: n_trials=%d, timeout=disabled (OPTUNA_TIMEOUT_SECONDS=%s)",
+            n_trials,
+            OPTUNA_TIMEOUT_SECONDS,
+        )
+    else:
+        logger.info(
+            "Optuna single-threshold search: n_trials=%d, timeout=%ds (~%.1f min)",
+            n_trials,
+            int(OPTUNA_TIMEOUT_SECONDS),
+            float(OPTUNA_TIMEOUT_SECONDS) / 60.0,
+        )
 
     rated_sub = df[df["is_rated"]]
     if rated_sub.empty:
@@ -358,7 +373,12 @@ def run_optuna_threshold_search(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=42),
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    _timeout = (
+        float(OPTUNA_TIMEOUT_SECONDS)
+        if OPTUNA_TIMEOUT_SECONDS is not None and OPTUNA_TIMEOUT_SECONDS > 0
+        else None
+    )
+    study.optimize(objective, n_trials=n_trials, timeout=_timeout, show_progress_bar=False)
 
     if study.best_value <= 0.0:
         logger.warning(

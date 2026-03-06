@@ -170,21 +170,6 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         with reason_map_path.open(encoding="utf-8") as fh:
             artifacts["reason_code_map"] = json.load(fh)
 
-    # R2206: check training_metrics.json for fast_mode flag; refuse to load
-    # a fast_mode artifact in production to prevent data-horizon violations.
-    metrics_path = d / "training_metrics.json"
-    if metrics_path.exists():
-        try:
-            _tm = json.loads(metrics_path.read_text(encoding="utf-8"))
-            fast_mode = bool(_tm.get("fast_mode", False))
-        except Exception:
-            fast_mode = False
-        if fast_mode:
-            raise RuntimeError(
-                "[scorer] Refusing to load fast_mode artifact in production. "
-                "Retrain without --fast-mode before deploying."
-            )
-
     # v10 single-model: prefer model.pkl
     if model_path.exists():
         rb = joblib.load(model_path)

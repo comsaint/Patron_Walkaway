@@ -84,6 +84,9 @@ G1_PRECISION_MIN = 0.70          # [DEPRECATED] Minimum per-model precision
 G1_ALERT_VOLUME_MIN_PER_HOUR = 5 # [DEPRECATED] Minimum combined alert volume/hour
 G1_FBETA = 0.5                   # [DEPRECATED] F-beta weight (beta < 1 → precision-weighted)
 OPTUNA_N_TRIALS = 300            # Optuna TPE trials for threshold search (DEC-009/010)
+# Optional Optuna time budget (seconds) for study.optimize.
+# Disable timeout by setting to None or a non-positive value (e.g. -1).
+OPTUNA_TIMEOUT_SECONDS: Optional[int] = 10 * 60
 # Threshold selection objective: F-beta with beta < 1 favours precision over recall.
 THRESHOLD_FBETA: float = 0.5
 

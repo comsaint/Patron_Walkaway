@@ -417,7 +417,7 @@ def _preload_sessions_local() -> Optional[pd.DataFrame]:
 
     Adds a ``__avail_time`` column (tz-naive Timestamp) so callers can do
     fast in-memory time-window filtering without re-reading the file.
-    Used by ``backfill`` fast-mode to avoid N × Parquet I/O.
+    Used by ``backfill`` to avoid N × Parquet I/O when preloading is enabled.
     """
     t_session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
     if not t_session_path.exists():
@@ -882,7 +882,7 @@ def build_player_profile(
     snapshot_date: date,
     use_local_parquet: bool = False,
     canonical_map: Optional[pd.DataFrame] = None,  # R90: accept pre-built mapping (backfill reuse)
-    preloaded_sessions: Optional[pd.DataFrame] = None,  # fast-mode: skip Parquet I/O per day
+    preloaded_sessions: Optional[pd.DataFrame] = None,  # skip Parquet I/O per day when pre-loaded
     canonical_id_whitelist: Optional[set] = None,  # R106: for sidecar hash population tag
     max_lookback_days: int = 365,  # DEC-017: horizon restriction for profile feature computation
     sched_tag: str = "_daily",  # DEC-019 R601: forwarded to _persist_local_parquet for cache key
@@ -905,7 +905,7 @@ def build_player_profile(
         Pre-loaded and DQ-filtered sessions DataFrame (from
         ``_preload_sessions_local``).  When provided, the Parquet file is
         not re-read; only the snapshot_dtm time-window filter is applied
-        in-memory (fast-mode, avoids N × I/O in backfill).
+        in-memory (avoids N × I/O in backfill).
 
     Returns
     -------
@@ -924,7 +924,7 @@ def build_player_profile(
     # 1. Load sessions
     sessions_raw: Optional[pd.DataFrame] = None
     if preloaded_sessions is not None:
-        # Fast-mode: filter the in-memory cache for this snapshot's time window,
+        # Filter the in-memory cache for this snapshot's time window,
         # avoiding a full Parquet read on every iteration.
         sessions_raw = _filter_preloaded_sessions(preloaded_sessions, snapshot_dtm)
     elif use_local_parquet:
@@ -1025,20 +1025,19 @@ def backfill(
     Parameters
     ----------
     canonical_id_whitelist:
-        When provided (fast-mode), only canonical_ids in this set are
-        profiled.  Rated players not in the whitelist are silently skipped,
-        dramatically reducing per-day aggregation cost.
+        When provided, only canonical_ids in this set are profiled.  Rated
+        players not in the whitelist are silently skipped, dramatically
+        reducing per-day aggregation cost.
     snapshot_interval_days:
-        Compute a snapshot only every N days (fast-mode: 7).  Intermediate
-        dates are skipped; the PIT join in trainer.py will still find the
-        most recent available snapshot for each bet.
-        Ignored when ``snapshot_dates`` is provided.
+        Compute a snapshot only every N days.  Intermediate dates are skipped;
+        the PIT join in trainer.py will still find the most recent available
+        snapshot for each bet.  Ignored when ``snapshot_dates`` is provided.
     preload_sessions:
-        When True (default) and conditions are met (fast-mode or whitelist),
-        the entire session Parquet is loaded into memory once for efficient
-        per-day filtering.  Set to False on low-RAM machines (e.g. 8 GB) to
-        instead use per-day PyArrow pushdown reads via ``_load_sessions_local``,
-        avoiding the OOM risk at the cost of more frequent disk I/O.
+        When True (default) and conditions are met (whitelist or snapshot
+        schedule), the entire session Parquet is loaded into memory once for
+        efficient per-day filtering.  Set to False (--no-preload) on low-RAM
+        machines (e.g. 8 GB) to use per-day PyArrow pushdown reads via
+        ``_load_sessions_local``, avoiding OOM at the cost of more disk I/O.
     canonical_map:
         Pre-built player_id -> canonical_id mapping DataFrame.  When provided
         by the caller (e.g. trainer.py already holds the map in memory), the
@@ -1077,7 +1076,7 @@ def backfill(
                     "backfill: canonical_map pre-build failed (%s); will build per-day", exc
                 )
 
-    # Apply whitelist: keep only the sampled rated players (fast-mode).
+    # Apply whitelist: keep only the sampled rated players.
     if canonical_id_whitelist is not None and canonical_map is not None and not canonical_map.empty:
         before_n = len(canonical_map)
         canonical_map = canonical_map[
@@ -1106,8 +1105,8 @@ def backfill(
     # machines (e.g. 8 GB) are never put at risk, while high-RAM machines (32 GB+)
     # benefit from the single-read optimisation.
     #
-    # R112: whitelist also triggers preload (fast-mode with --sample-rated).
-    # When preload_sessions=False (--fast-mode-no-preload), skip regardless.
+    # R112: whitelist or snapshot schedule triggers preload.
+    # When preload_sessions=False (--no-preload), skip regardless.
     _MAX_PRELOAD_BYTES: int = int(1.5 * 1024**3)  # 1.5 GB on disk
     _t_session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
 
@@ -1147,7 +1146,7 @@ def backfill(
                         else (
                             f"whitelist ({len(canonical_id_whitelist)} IDs)"
                             if canonical_id_whitelist is not None
-                            else f"fast-mode (interval={snapshot_interval_days} days)"
+                            else f"interval={snapshot_interval_days} days"
                         )
                     )
                     logger.info(
@@ -1158,7 +1157,7 @@ def backfill(
                     )
     elif not preload_sessions and use_local_parquet:
         logger.info(
-            "backfill: session preload disabled (--fast-mode-no-preload); "
+            "backfill: session preload disabled (--no-preload); "
             "each snapshot day will use per-day PyArrow pushdown read."
         )
 
