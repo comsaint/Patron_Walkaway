@@ -82,15 +82,15 @@ class TestR903StaleFeatureDefsCleanup(unittest.TestCase):
         )
 
 
-class TestR904ChunkCacheKeyNoAfg(unittest.TestCase):
-    """R904: chunk cache key should include no_afg dimension."""
+class TestR904ChunkCacheKeyIncludesFeatureSpecHash(unittest.TestCase):
+    """R904: chunk cache key should include feature spec hash dimension."""
 
     def test_chunk_cache_key_should_include_no_afg_flag(self):
         src = inspect.getsource(trainer_mod._chunk_cache_key)
         self.assertIn(
-            "no_afg",
+            "feature_spec_hash",
             src,
-            "_chunk_cache_key should include no_afg in key material.",
+            "_chunk_cache_key should include feature_spec_hash in key material.",
         )
 
 

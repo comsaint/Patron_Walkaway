@@ -52,8 +52,8 @@ class TestR1003CacheKeyConsistency(unittest.TestCase):
     def test_chunk_cache_key_should_include_no_afg_or_defs_state(self):
         src = inspect.getsource(trainer_mod._chunk_cache_key)
         self.assertTrue(
-            ("no_afg" in src) or ("feature_defs" in src),
-            "_chunk_cache_key should include no_afg or feature_defs state to avoid stale reuse.",
+            ("feature_spec_hash" in src) or ("spec" in src),
+            "_chunk_cache_key should include feature spec state to avoid stale reuse.",
         )
 
 

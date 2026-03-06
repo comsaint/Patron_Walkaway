@@ -30,9 +30,8 @@ class TestR373Opt001RiskGuards(unittest.TestCase):
             "When session_rng[0] pushes required_start forward, code should emit a clear warning.",
         )
 
-    @unittest.expectedFailure
     def test_r373_2_ensure_profile_signature_should_drop_fast_mode(self):
-        """Risk #2: ensure_player_profile_ready still accepts dead-parameter fast_mode."""
+        """Regression guard: ensure_player_profile_ready must not accept dead-parameter fast_mode."""
         sig = inspect.signature(trainer_mod.ensure_player_profile_ready)
         self.assertNotIn(
             "fast_mode",

@@ -111,9 +111,7 @@ class TestRecentChunksIntegration(unittest.TestCase):
             snapshot_interval_days=1,
             preload_sessions=True,
             canonical_map=ANY,
-            fast_mode=False,               # DEC-017: non-fast-mode default
             max_lookback_days=365,         # DEC-017: full horizon in normal mode
-            use_month_end_snapshots=True,  # DEC-019: default when flag not passed
         )
         ensure_kwargs = mock_ensure_profile.call_args.kwargs
         passed_cmap = ensure_kwargs.get("canonical_map")

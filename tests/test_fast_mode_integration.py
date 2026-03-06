@@ -1,4 +1,4 @@
-"""Integration tests for DEC-017 fast-mode and --sample-rated flag.
+"""Integration tests for trainer CLI wiring.
 
 These tests exercise run_pipeline() with mocked heavy I/O so they run in
 milliseconds without real Parquet files.  They verify the *wiring* between
@@ -8,21 +8,16 @@ inside those helpers.
 
 Covered scenarios
 -----------------
-1. FastModeHorizonPropagation  — fast_mode=True with recent_chunks=1:
-   - snapshot_interval_days == 1 (month-end scheduling enforced globally)
-   - max_lookback_days == data_horizon_days (not 365)
-   - fast_mode=True forwarded to ensure_player_profile_ready
+1. RecentChunksPropagation — recent_chunks=N:
    - ensure called with the trimmed effective window, not the original window
+   - process_chunk called only for the recent chunks
 
-2. FastModeNoPreload  — fast_mode=True + fast_mode_no_preload=True:
+2. NoPreloadWiring — no_preload=True:
    - preload_sessions=False forwarded to ensure_player_profile_ready
+   - default (flag absent) keeps preload_sessions=True
 
-3. SampleRatedWhitelist  — sample_rated=N with canonical_map containing M IDs:
+3. SampleRatedWhitelist — sample_rated=N with canonical_map containing M IDs:
    - canonical_id_whitelist has min(N, M) entries
-   - fast_mode=False  (sample_rated is orthogonal to fast_mode)
-
-4. FastModePlusSampleRated  — both flags together:
-   - fast_mode semantics (horizon) AND whitelist both forwarded
 """
 
 import argparse
@@ -82,7 +77,6 @@ class _PipelineMixin:
     _fake_chunks: list | None = None
     _canonical_map_df: pd.DataFrame | None = None
     _sample_rated: int | None = None
-    _fast_mode: bool = False
     _no_preload: bool = False
     _recent_chunks: int | None = None
     _extra_args: dict | None = None
@@ -134,8 +128,7 @@ class _PipelineMixin:
                 "force_recompute": False,
                 "skip_optuna": True,
                 "recent_chunks": self._recent_chunks,
-                "fast_mode": self._fast_mode,
-                "fast_mode_no_preload": self._no_preload,
+                "no_preload": self._no_preload,
                 "sample_rated": self._sample_rated,
             }
             if self._extra_args:
@@ -153,42 +146,15 @@ class _PipelineMixin:
 
 
 # ---------------------------------------------------------------------------
-# Test 1: fast_mode=True forwards correct horizon params
+# Test 1: recent_chunks uses trimmed effective window
 # ---------------------------------------------------------------------------
 
-class TestFastModeHorizonPropagation(_PipelineMixin, unittest.TestCase):
+class TestRecentChunksPropagation(_PipelineMixin, unittest.TestCase):
 
     def setUp(self):
-        # 3 chunks — ask for most recent 1 only so horizon ~ 30 days
+        # 3 chunks — ask for most recent 1 only
         self._fake_chunks = _make_chunks(3)
-        self._fast_mode = True
         self._recent_chunks = 1
-
-    def test_snapshot_interval_days_is_one_even_in_fast_mode(self):
-        result = self._run_pipeline_with_mocks()
-        kwargs = result["ensure_kwargs"]
-        self.assertEqual(
-            kwargs.get("snapshot_interval_days"),
-            1,
-            "snapshot_interval_days should remain 1 because scheduling is month-end only",
-        )
-
-    def test_fast_mode_forwarded_to_ensure_profile(self):
-        result = self._run_pipeline_with_mocks()
-        self.assertTrue(
-            result["ensure_kwargs"].get("fast_mode"),
-            "fast_mode=True must be forwarded to ensure_player_profile_ready",
-        )
-
-    def test_max_lookback_days_equals_data_horizon_not_365(self):
-        result = self._run_pipeline_with_mocks()
-        kwargs = result["ensure_kwargs"]
-        mlb = kwargs.get("max_lookback_days")
-        self.assertIsNotNone(mlb, "max_lookback_days must be passed")
-        self.assertLess(
-            mlb, 365,
-            "fast_mode max_lookback_days should be data_horizon_days (~30), not 365",
-        )
 
     def test_effective_window_uses_trimmed_chunk(self):
         """ensure_player_profile_ready should receive the trimmed window (1 chunk).
@@ -218,14 +184,13 @@ class TestFastModeHorizonPropagation(_PipelineMixin, unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Test 2: fast_mode_no_preload=True -> preload_sessions=False
+# Test 2: no_preload=True -> preload_sessions=False
 # ---------------------------------------------------------------------------
 
-class TestFastModeNoPreload(_PipelineMixin, unittest.TestCase):
+class TestNoPreloadWiring(_PipelineMixin, unittest.TestCase):
 
     def setUp(self):
         self._fake_chunks = _make_chunks(2)
-        self._fast_mode = True
         self._no_preload = True
         self._recent_chunks = None
 
@@ -233,7 +198,7 @@ class TestFastModeNoPreload(_PipelineMixin, unittest.TestCase):
         result = self._run_pipeline_with_mocks()
         self.assertFalse(
             result["ensure_kwargs"].get("preload_sessions"),
-            "fast_mode_no_preload=True must forward preload_sessions=False",
+            "no_preload=True must forward preload_sessions=False",
         )
 
     def test_preload_default_is_true_without_flag(self):
@@ -246,7 +211,7 @@ class TestFastModeNoPreload(_PipelineMixin, unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Test 3: --sample-rated creates canonical_id_whitelist (orthogonal to fast_mode)
+# Test 3: --sample-rated creates canonical_id_whitelist
 # ---------------------------------------------------------------------------
 
 class TestSampleRatedWhitelist(_PipelineMixin, unittest.TestCase):
@@ -256,7 +221,6 @@ class TestSampleRatedWhitelist(_PipelineMixin, unittest.TestCase):
         # canonical_map has 10 IDs; sample 3
         self._canonical_map_df = _canonical_map(10)
         self._sample_rated = 3
-        self._fast_mode = False
         self._recent_chunks = None
 
     def test_whitelist_size_is_n(self):
@@ -273,47 +237,21 @@ class TestSampleRatedWhitelist(_PipelineMixin, unittest.TestCase):
         self.assertIsNotNone(wl)
         self.assertLessEqual(len(wl), 10, "whitelist capped by available canonical IDs")
 
-    def test_normal_mode_no_snapshot_interval_change(self):
-        """sample_rated alone should NOT change snapshot_interval_days (not fast_mode)."""
+    def test_sample_rated_does_not_change_snapshot_interval_days(self):
+        """sample_rated alone should NOT change snapshot_interval_days."""
         result = self._run_pipeline_with_mocks()
         kwargs = result["ensure_kwargs"]
         self.assertEqual(
             kwargs.get("snapshot_interval_days"), 1,
-            "--sample-rated without --fast-mode should keep snapshot_interval_days=1",
+            "--sample-rated should keep snapshot_interval_days=1",
         )
 
-    def test_max_lookback_is_365_without_fast_mode(self):
+    def test_max_lookback_is_365_with_sample_rated(self):
         result = self._run_pipeline_with_mocks()
         self.assertEqual(
             result["ensure_kwargs"].get("max_lookback_days"), 365,
-            "Without --fast-mode, max_lookback_days must be 365 even with --sample-rated",
+            "max_lookback_days must remain 365 even with --sample-rated",
         )
-
-
-# ---------------------------------------------------------------------------
-# Test 4: fast_mode + sample_rated combined
-# ---------------------------------------------------------------------------
-
-class TestFastModePlusSampleRated(_PipelineMixin, unittest.TestCase):
-
-    def setUp(self):
-        self._fake_chunks = _make_chunks(3)
-        self._canonical_map_df = _canonical_map(10)
-        self._fast_mode = True
-        self._sample_rated = 5
-        self._recent_chunks = 1
-
-    def test_both_flags_forwarded_simultaneously(self):
-        result = self._run_pipeline_with_mocks()
-        kwargs = result["ensure_kwargs"]
-        # fast_mode semantics
-        self.assertTrue(kwargs.get("fast_mode"))
-        self.assertEqual(kwargs.get("snapshot_interval_days"), 1)
-        self.assertLess(kwargs.get("max_lookback_days", 365), 365)
-        # sample_rated semantics
-        wl = kwargs.get("canonical_id_whitelist")
-        self.assertIsNotNone(wl)
-        self.assertEqual(len(wl), 5)
 
 
 if __name__ == "__main__":

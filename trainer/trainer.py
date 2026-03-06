@@ -1523,6 +1523,7 @@ def _chunk_cache_key(
     chunk: dict,
     bets: pd.DataFrame,
     profile_hash: str = "none",
+    feature_spec_hash: str = "none",
     neg_sample_frac: float = 1.0,
 ) -> str:
     """Hash to detect stale parquet cache (TRN-07).
@@ -1548,7 +1549,7 @@ def _chunk_cache_key(
         "HISTORY_BUFFER_DAYS": HISTORY_BUFFER_DAYS,
     }, sort_keys=True)
     cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:6]
-    return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}|ns{neg_sample_frac:.4f}"
+    return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}|spec{feature_spec_hash}|ns{neg_sample_frac:.4f}"
 
 
 def process_chunk(
@@ -1559,6 +1560,7 @@ def process_chunk(
     force_recompute: bool = False,
     profile_df: Optional[pd.DataFrame] = None,
     feature_spec: Optional[dict] = None,
+    feature_spec_hash: str = "none",
     neg_sample_frac: float = NEG_SAMPLE_FRAC,
 ) -> Optional[Path]:
     """Process one monthly chunk; return path to written Parquet or None if empty.
@@ -1569,6 +1571,8 @@ def process_chunk(
     profile_df: player_profile snapshot table for PIT join (PLAN Step 4/DEC-011).
         Pass None to skip; profile feature columns will be 0 for all rows.
     feature_spec: parsed Track LLM feature spec loaded by run_pipeline.
+    feature_spec_hash: short hash of the feature spec used to compute Track LLM
+        columns; included in the chunk cache key so spec changes bust cache.
     neg_sample_frac: fraction of label=0 rows to keep (1.0 = keep all).  Overrides
         the module-level NEG_SAMPLE_FRAC; normally supplied by run_pipeline after the
         OOM pre-check (_oom_check_and_adjust_neg_sample_frac).
@@ -1617,6 +1621,7 @@ def process_chunk(
         _profile_hash = "none"
     current_key = _chunk_cache_key(
         chunk, bets_raw, profile_hash=_profile_hash,
+        feature_spec_hash=feature_spec_hash,
         neg_sample_frac=neg_sample_frac)
     key_path = chunk_path.with_suffix(".cache_key")
     if not force_recompute and chunk_path.exists():
@@ -2949,7 +2954,15 @@ def run_pipeline(args) -> None:
         logger.info("player_profile: not available — profile features will be NaN (%.1fs)", _el)
 
     feature_spec = load_feature_spec(FEATURE_SPEC_PATH)
-    logger.info("Track LLM: loaded feature spec from %s", FEATURE_SPEC_PATH)
+    try:
+        feature_spec_hash = hashlib.md5(Path(FEATURE_SPEC_PATH).read_bytes()).hexdigest()[:12]
+    except Exception:
+        feature_spec_hash = "unknown"
+    logger.info(
+        "Track LLM: loaded feature spec from %s (spec_hash=%s)",
+        FEATURE_SPEC_PATH,
+        feature_spec_hash,
+    )
 
     # 4. Process chunks -> write parquet
     _neg_sample_note = (
@@ -2970,6 +2983,7 @@ def run_pipeline(args) -> None:
             force_recompute=force,
             profile_df=profile_df,
             feature_spec=feature_spec,
+            feature_spec_hash=feature_spec_hash,
             neg_sample_frac=_effective_neg_sample_frac,
         )
         if path is not None:

@@ -43,7 +43,6 @@ class TestR301SampleRatedMetadataGuardrail(unittest.TestCase):
                     feature_cols=[],
                     combined_metrics={},
                     model_version="test-v1",
-                    fast_mode=False,
                 )
             payload = json.loads(
                 (trainer_mod.Path(td) / "training_metrics.json").read_text(encoding="utf-8")
@@ -78,17 +77,14 @@ class TestR302SampleRatedValidationGuardrail(unittest.TestCase):
 
 
 class TestR303NoPreloadOrthogonalityGuardrail(unittest.TestCase):
-    """R303: no-preload warning should consider --sample-rated path as effective."""
+    """R303: no-preload flag should be wired without fast-mode dependency."""
 
     def test_r118_warning_condition_accounts_for_sample_rated(self):
         import trainer.trainer as trainer_mod
 
         src = inspect.getsource(trainer_mod.run_pipeline)
-        self.assertIn(
-            "if no_preload and not fast_mode and sample_rated_n is None:",
-            src,
-            "R118 warning condition should avoid warning when --sample-rated is present.",
-        )
+        self.assertIn('no_preload = getattr(args, "no_preload", False)', src)
+        self.assertNotIn("fast_mode", src, "run_pipeline should not reference removed fast_mode")
 
 
 class TestR304DeadConstantGuardrail(unittest.TestCase):

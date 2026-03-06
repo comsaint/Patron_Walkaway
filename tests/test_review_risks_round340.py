@@ -76,14 +76,14 @@ class TestR2300ScorerLegacyParityFields(unittest.TestCase):
 
 
 class TestR2206FastModeArtifactSafety(unittest.TestCase):
-    """R2206: scorer should reject fast_mode artifacts in production loading."""
+    """R2206: legacy fast_mode artifact guard should be removed."""
 
     def test_load_dual_artifacts_should_check_fast_mode_flag(self):
         src = inspect.getsource(scorer_mod.load_dual_artifacts)
-        self.assertIn(
+        self.assertNotIn(
             "fast_mode",
             src,
-            "load_dual_artifacts should enforce fast_mode safety check.",
+            "load_dual_artifacts should not contain legacy fast_mode guard.",
         )
 
 
