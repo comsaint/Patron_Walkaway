@@ -140,7 +140,7 @@ NEG_SAMPLE_FRAC: float = 1.0
 # have been downsampled during training.
 # Set to None to disable adjusted-precision reporting.
 # Example: 15.0 means production has ~15 negative observations per 1 positive.
-PRODUCTION_NEG_POS_RATIO: Optional[float] = None
+PRODUCTION_NEG_POS_RATIO: Optional[float] = 87.0/13.0
 
 # --- OOM pre-check: auto-adjust NEG_SAMPLE_FRAC after Step 1 if RAM looks tight ---
 # After the chunk list is built, the pipeline estimates Step 7 peak RAM as
