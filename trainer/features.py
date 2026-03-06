@@ -1068,6 +1068,11 @@ def compute_track_llm_features(
     """
     import duckdb
 
+    try:
+        from trainer.duckdb_schema import prepare_bets_for_duckdb
+    except ModuleNotFoundError:
+        from duckdb_schema import prepare_bets_for_duckdb  # type: ignore[import-not-found]
+
     # R2006: use ``or {}`` so a null track_llm section doesn't raise AttributeError.
     llm_track = feature_spec.get("track_llm") or {}
     candidates = llm_track.get("candidates", [])
@@ -1184,9 +1189,13 @@ def compute_track_llm_features(
     )
 
     # R2003: connection is always closed via finally, even when the query raises.
+    # Cast monetary columns to float64 so DuckDB sees DOUBLE and does not infer
+    # narrow DECIMAL(9,4)/(10,4), which fails for values like wager 100000 or
+    # casino_win -1900000 (schema/schema.txt uses Decimal(19,4)).
+    df_for_duckdb = prepare_bets_for_duckdb(df)
     con = duckdb.connect(database=":memory:")
     try:
-        con.register("bets", df)
+        con.register("bets", df_for_duckdb)
         result_df = con.execute(sql).df()
     except Exception as exc:  # pragma: no cover
         logger.error("compute_track_llm_features: DuckDB query failed: %s\nSQL:\n%s", exc, sql)
