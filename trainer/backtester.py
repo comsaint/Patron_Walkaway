@@ -65,7 +65,7 @@ try:
     HK_TZ_STR: str = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     BACKTEST_HOURS: int = getattr(_cfg, "BACKTEST_HOURS", 6)
     BACKTEST_OFFSET_HOURS: int = getattr(_cfg, "BACKTEST_OFFSET_HOURS", 1)
-    THRESHOLD_MIN_RECALL: Optional[float] = getattr(_cfg, "THRESHOLD_MIN_RECALL", None)
+    THRESHOLD_MIN_RECALL: Optional[float] = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_MIN_ALERTS_PER_HOUR: Optional[float] = getattr(
         _cfg, "THRESHOLD_MIN_ALERTS_PER_HOUR", None
     )
@@ -79,7 +79,7 @@ except ModuleNotFoundError:
     HK_TZ_STR = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     BACKTEST_HOURS = getattr(_cfg, "BACKTEST_HOURS", 6)
     BACKTEST_OFFSET_HOURS = getattr(_cfg, "BACKTEST_OFFSET_HOURS", 1)
-    THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", None)
+    THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_MIN_ALERTS_PER_HOUR = getattr(_cfg, "THRESHOLD_MIN_ALERTS_PER_HOUR", None)
 
 try:

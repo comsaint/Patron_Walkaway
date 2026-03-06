@@ -100,6 +100,7 @@ SCREEN_FEATURES_TOP_K: Optional[int] = None
 MIN_THRESHOLD_ALERT_COUNT = 5
 # Optional threshold constraints (None disables each constraint).
 # MIN_RECALL applies to both trainer threshold scan and backtester Optuna search.
+# Safeguard: default 0.01 enforces minimum 1% recall when choosing threshold.
 # MIN_ALERTS_PER_HOUR is only meaningful in backtester where window_hours exists.
 THRESHOLD_MIN_RECALL: Optional[float] = 0.01
 THRESHOLD_MIN_ALERTS_PER_HOUR: Optional[float] = 1.0

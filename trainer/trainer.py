@@ -96,7 +96,7 @@ try:
     VALID_SPLIT_FRAC: float = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
     MIN_VALID_TEST_ROWS: int = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
     MIN_THRESHOLD_ALERT_COUNT: int = getattr(_cfg, "MIN_THRESHOLD_ALERT_COUNT", 5)
-    THRESHOLD_MIN_RECALL: Optional[float] = getattr(_cfg, "THRESHOLD_MIN_RECALL", None)
+    THRESHOLD_MIN_RECALL: Optional[float] = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_FBETA: float = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
@@ -122,7 +122,7 @@ except ModuleNotFoundError:
     VALID_SPLIT_FRAC = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
     MIN_VALID_TEST_ROWS = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
     MIN_THRESHOLD_ALERT_COUNT = getattr(_cfg, "MIN_THRESHOLD_ALERT_COUNT", 5)
-    THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", None)
+    THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_FBETA = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
 
 # Module-level pipeline imports (same try/except pattern)
@@ -1588,7 +1588,8 @@ def run_optuna_search(
     n_trials: int = OPTUNA_N_TRIALS,
     label: str = "",
 ) -> dict:
-    """TPE hyperparameter search.  Optimises PR-AUC on validation set."""
+    """TPE hyperparameter search.  Optimises average precision (PR-AUC) on validation set.
+    Threshold selection uses F-0.5 separately."""
     # R705: guard against empty validation input — return empty dict (base params)
     # rather than crashing inside LightGBM or average_precision_score.
     if X_val.empty or len(y_val) == 0:
