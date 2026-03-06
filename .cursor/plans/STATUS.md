@@ -6,6 +6,25 @@
 
 ---
 
+## Round 107 — Trainer Step 9 日誌格式：train → valid → test
+
+### 變更摘要
+- **檔案**：`trainer/trainer.py`
+- **目的**：Step 9（Train single rated model）的效能輸出改為依序顯示 **train → valid → test**，並明確標示「valid」（原先第一行僅顯示 `rated: AP=...`，無 valid 字樣）。
+
+### 實作要點
+- `_train_one_model`：新增參數 `log_results=True`；日誌由 `rated: AP=...` 改為 `rated valid: AP=...`。
+- `_compute_train_metrics` / `_compute_test_metrics`：新增參數 `log_results=True`，可關閉單次 log。
+- `train_single_rated_model`：呼叫上述三者時傳 `log_results=False`，改為在函式內依序輸出三行：
+  - `rated train:  AP=... F1=... prec=... rec=... random_ap=...`
+  - `rated valid:  AP=... F0.5=... F1=... prec=... rec=... thr=...`
+  - `rated test:   AP=... F1=... prec=... rec=... thr=...`
+
+### 備註
+- 其他呼叫 `_train_one_model` 的路徑（如 dual-model 流程）維持預設 `log_results=True`，行為不變。
+
+---
+
 ## Round 105 — Reviewer 風險點最小可重現測試（tests-only）
 
 ### 目標與約束
@@ -2229,3 +2248,399 @@ Run command:
 
 Observed result:
 `2 passed, 5 xfailed in 3.17s`
+
+---
+
+## Per-Chunk Negative Downsampling（2026-03-06）
+
+### 背景
+Step 7 concat 所有 chunk Parquet 時出現 RAM 警告。30 天資料已有 ~27M 行，未來若延長至 90 天或 12 個月訓練視窗，Step 7 預估 RAM 將達 18–60 GB，極易 OOM。解法：在每個 chunk 寫出 Parquet 前，保留全部正樣本（label=1），對負樣本（label=0）做 random downsample，再配合已有的 `class_weight='balanced'` 和 per-run `sample_weight` 讓 LightGBM 自動補償。
+
+### 改動檔案
+
+| 檔案 | 改動內容 |
+|------|---------|
+| `trainer/config.py` | 新增 `NEG_SAMPLE_FRAC: float = 1.0`（預設 1.0 = 停用，不影響現有行為）；附詳細說明文字 |
+| `trainer/trainer.py` | (1) 兩個 config import 區塊（try/except）皆加入 `NEG_SAMPLE_FRAC = getattr(_cfg, "NEG_SAMPLE_FRAC", 1.0)`；(2) `process_chunk()` 在 `labeled.to_parquet()` 前加入 neg sampling 邏輯，含 `logger.info` 和 console print；(3) `run_pipeline()` 在 `--fast-mode-no-preload` 警告後加入 startup log（`NEG_SAMPLE_FRAC < 1.0` 時 print 到 console + logger）；(4) Step 6 print 行在啟用時附加 `neg-sample=X.XX` 提示 |
+
+### 行為說明
+- **預設（`NEG_SAMPLE_FRAC = 1.0`）**：與改動前完全一致，不取樣，不影響任何現有 run。
+- **啟用（例如 `NEG_SAMPLE_FRAC = 0.3`）**：
+  - Pipeline 啟動後立即 print `[Config] NEG_SAMPLE_FRAC=0.30: negatives will be downsampled to 30% per chunk`。
+  - Step 6 的每個 chunk 處理後 print `[neg-sample] chunk YYYY-MM-DD–YYYY-MM-DD: N -> M rows (neg 30%, pos all kept)`。
+  - 每個 chunk 的 logger.info 記錄 before/after row counts、pos 保留數、neg before/after。
+
+### 手動驗證方式
+1. **不取樣（預設）**：直接跑 trainer，確認無任何 `neg-sample` 輸出，行為與之前一致。
+2. **啟用取樣**：在 `trainer/config.py` 將 `NEG_SAMPLE_FRAC = 1.0` 改為 `NEG_SAMPLE_FRAC = 0.3`，再跑 trainer（可加 `--recent-chunks 1` 只跑一個 chunk），確認：
+   - Pipeline 啟動時看到 `[Config] NEG_SAMPLE_FRAC=0.30: negatives will be downsampled to 30%…`
+   - Step 6 print 有 `neg-sample=0.30`
+   - chunk 處理後看到 `[neg-sample] chunk ...: N -> M rows (neg 30%, pos all kept)`
+   - log 有 `neg downsample frac=0.30  rows X->Y  (pos kept: P, neg: A->B)`
+3. **記憶體效果**：以相同資料比較 Step 7 `[Config] Chunk Parquets total` 的 GB 數，預期下降至約 `NEG_SAMPLE_FRAC + pos_ratio` 倍的原始大小。
+
+### 下一步建議
+1. 根據實際資料的 positive rate（目前約 13% from `random_ap≈0.13`），選擇合適的 `NEG_SAMPLE_FRAC`：
+   - `0.3`：負樣本保留 30%，資料集縮至約 ~37%（100% pos + 30% neg）
+   - `0.5`：較保守，縮至約 ~57%
+2. 若未來訓練視窗延長至 90 天以上，建議設 `NEG_SAMPLE_FRAC = 0.3`（預估 Step 7 RAM 從 ~15 GB 降至 ~5–6 GB）。
+3. 可考慮追加 `temporal stratified sampling`（近期資料保留較多、遠期壓縮更多），進一步提升長歷史資料的訓練效益。
+4. 現有的未修 OOM 風險（R-OOM-1 / R-OOM-4）仍待處理，可考慮下一輪一起修。
+
+---
+
+## OOM Pre-check with Auto-adjustment（2026-03-06）
+
+### 背景
+在 per-chunk negative sampling 的基礎上，進一步新增「Step 1 完成後即時估算 Step 7 RAM」功能。若估算顯示 OOM 風險，自動降低 `NEG_SAMPLE_FRAC` 至適合的值，讓用戶在 Step 6 開始前就能看到警告和調整結果。
+
+### 改動檔案
+
+| 檔案 | 改動內容 |
+|------|---------|
+| `trainer/config.py` | 新增 5 個常數：`NEG_SAMPLE_FRAC_AUTO`（預設 `True`）、`NEG_SAMPLE_FRAC_MIN`（預設 `0.05`）、`NEG_SAMPLE_FRAC_ASSUMED_POS_RATE`（預設 `0.15`）、`NEG_SAMPLE_RAM_SAFETY`（預設 `0.75`）、`NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT`（預設 200 MB） |
+| `trainer/trainer.py` | (1) 兩個 config import 區塊加入上述 5 個常數；(2) 新增 `_oom_check_and_adjust_neg_sample_frac(chunks, current_frac)` helper function；(3) `process_chunk()` 新增 `neg_sample_frac: float = NEG_SAMPLE_FRAC` 參數，取代內部的 module-level constant；(4) `run_pipeline()` 在 effective_start/end 計算後（Step 1 完成、Step 2 開始前）呼叫 OOM check，結果傳入每個 `process_chunk()` call |
+
+### OOM Check 邏輯
+
+```
+Step 1 完成（chunks list 確定）
+    ↓
+_oom_check_and_adjust_neg_sample_frac(chunks, NEG_SAMPLE_FRAC)
+    1. NEG_SAMPLE_FRAC_AUTO=False → 直接返回 current_frac
+    2. psutil 不可用 → 跳過，返回 current_frac
+    3. 從 cached chunk Parquets 估計 per-chunk 大小
+       （無 cached chunks → 用 NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT = 200 MB）
+    4. est_peak_ram = N_chunks × per_chunk_size × CHUNK_CONCAT_RAM_FACTOR
+    5. budget = available_ram × NEG_SAMPLE_RAM_SAFETY (75%)
+    6. Print 一行摘要（不論是否 OOM）
+    7. est_peak ≤ budget → "RAM OK"，返回 current_frac
+    8. current_frac < 1.0 → 用戶已設定，warn only，不覆蓋
+    9. 否則：frac = (budget/peak - pos_rate) / (1 - pos_rate)
+             clamp to [NEG_SAMPLE_FRAC_MIN, 1.0]
+             print *** OOM RISK *** 警告 + 調整後的 frac
+    → 返回 _effective_neg_sample_frac（傳入每個 process_chunk）
+```
+
+### Console 輸出範例
+
+**RAM 充足時（無 cached chunks）：**
+```
+[OOM-check] 3 chunk(s) × 200 MB × 3x factor → est. Step 7 peak RAM 1.8 GB | available 12.0 GB | budget (75%) 9.0 GB  [default estimate (200 MB/chunk; no cached chunks)]
+[OOM-check] RAM looks OK — no adjustment to NEG_SAMPLE_FRAC.
+```
+
+**RAM 不足、自動調整時：**
+```
+[OOM-check] 12 chunk(s) × 450 MB × 3x factor → est. Step 7 peak RAM 16.2 GB | available 8.0 GB | budget (75%) 6.0 GB  [avg of 12/12 cached chunk Parquets]
+[OOM-check] *** OOM RISK: est. peak 16.2 GB > budget 6.0 GB ***
+  Auto-adjusting NEG_SAMPLE_FRAC: 1.0 → 0.21  (assumed pos_rate=15%, floor=0.05)
+  To disable: set NEG_SAMPLE_FRAC_AUTO=False in config.py
+```
+
+**RAM 不足、用戶已設定 frac 時：**
+```
+[OOM-check] WARNING: estimated peak 16.2 GB > budget 6.0 GB, but NEG_SAMPLE_FRAC=0.30 is already user-configured — not overriding. Consider lowering it further.
+```
+
+### 手動驗證方式
+1. **正常路徑（有充足 RAM）**：跑 trainer，應看到 `[OOM-check] RAM looks OK`。
+2. **模擬 OOM**：暫時在 config.py 把 `NEG_SAMPLE_RAM_SAFETY = 1.5`（強制讓 budget 縮小），應看到自動調整警告和新 frac。
+3. **psutil 不可用**：`pip uninstall psutil` 後跑，應看到 `psutil not installed; skipping RAM pre-check.`，其餘流程正常。
+4. **cached chunks 存在**：先跑一次完整 pipeline，再跑第二次，第二次的 `[OOM-check]` 應顯示 `avg of N/N cached chunk Parquets`，估算更準確。
+5. **NEG_SAMPLE_FRAC_AUTO=False**：設為 `False`，應完全跳過 OOM check。
+
+### 下一步建議
+1. 若生產環境有穩定的 `psutil` 可用，`NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT` 可在第一次跑完後自動從 cached chunk Parquets 取得，不再需要預設值。
+2. `NEG_SAMPLE_FRAC_ASSUMED_POS_RATE = 0.15` 可在第一個 chunk 跑完後更新為實測值，第二個 chunk 起使用更精準的估算。
+3. 現有的未修 OOM 風險（R-OOM-1 / R-OOM-4）仍待處理。
+
+---
+
+## Self-review：Negative Downsampling + OOM Pre-check（2026-03-06）
+
+### R-NEG-1（P1 正確性）— Cache hit 跳過 neg sampling，導致不同 `neg_sample_frac` 下取得不同資料
+
+**嚴重度**：P1（靜默正確性問題）
+
+**問題**：`process_chunk()` 在 cache hit 時直接 `return chunk_path`（L1634），完全跳過 neg sampling 邏輯。這意味著：
+1. **第一次跑**（`NEG_SAMPLE_FRAC=1.0`，無取樣）→ cache 寫入**全量**行。
+2. **第二次跑**（OOM check 自動降到 `NEG_SAMPLE_FRAC=0.3`）→ cache key 沒有包含 `neg_sample_frac`，key match → cache hit → 返回**全量** Parquet。
+3. Step 7 依然嘗試 concat 全量行 → OOM 依舊。
+
+反之亦然：先跑 `frac=0.3` 寫入縮小後的 cache，之後改回 `1.0` 跑，會拿到縮小過的資料訓練，靜默損失負樣本。
+
+**根本原因**：`_chunk_cache_key()` 不包含 `neg_sample_frac`。
+
+**修改建議**：
+1. 在 `_chunk_cache_key()` 加入 `neg_sample_frac` 參數並寫入 key 字串。
+2. `process_chunk()` 把 `neg_sample_frac` 傳給 `_chunk_cache_key()`。
+
+**希望新增的測試**：
+```python
+def test_chunk_cache_key_includes_neg_sample_frac():
+    """Changing neg_sample_frac must produce a different cache key."""
+    import ast, inspect
+    src = inspect.getsource(_chunk_cache_key)
+    assert "neg_sample_frac" in src, (
+        "_chunk_cache_key must include neg_sample_frac to prevent stale cache hits"
+    )
+```
+
+---
+
+### R-NEG-2（P2 可審計性）— `training_metrics.json` 未記錄 effective `neg_sample_frac`
+
+**嚴重度**：P2（可審計性缺陷）
+
+**問題**：`save_artifact_bundle()` 記錄了 `fast_mode` 和 `sample_rated_n`，但未記錄 `neg_sample_frac`（尤其是 OOM auto-adjusted 後的 effective 值）。訓練完成後無法從 artifact 判斷資料是否做過 negative downsampling、比率為何。
+
+**修改建議**：
+1. `save_artifact_bundle()` 加入 `neg_sample_frac: float = 1.0` 參數。
+2. 在 `training_metrics.json` 寫入 `"neg_sample_frac": <value>`。
+3. `run_pipeline()` 呼叫時傳入 `_effective_neg_sample_frac`。
+
+**希望新增的測試**：
+```python
+def test_training_metrics_records_neg_sample_frac():
+    """training_metrics.json must include neg_sample_frac for auditability."""
+    import ast, inspect
+    src = inspect.getsource(save_artifact_bundle)
+    assert "neg_sample_frac" in src
+```
+
+---
+
+### R-NEG-3（P2 bug）— `total_ram` 變數賦值後未使用
+
+**嚴重度**：P2（dead code / lint noise）
+
+**問題**：`_oom_check_and_adjust_neg_sample_frac()` L1436 賦值 `total_ram = _psutil.virtual_memory().total`，但整個函數中從未使用此變數。此外 `_psutil.virtual_memory()` 被呼叫了兩次（L1435 和 L1436），浪費一次系統呼叫。
+
+**修改建議**：
+```python
+_vmem = _psutil.virtual_memory()
+available_ram = _vmem.available
+# total_ram = _vmem.total  ← 移除，或留著供 log 使用
+```
+
+**希望新增的測試**：
+```python
+def test_oom_check_no_unused_variables():
+    """_oom_check_and_adjust_neg_sample_frac should not have unused assignments."""
+    import ast, inspect
+    src = inspect.getsource(_oom_check_and_adjust_neg_sample_frac)
+    tree = ast.parse(src)
+    assigns = {
+        node.targets[0].id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    }
+    # All assigned names should appear at least once more (as Load) besides the assignment
+    for name in assigns:
+        uses = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)
+        )
+        assert uses > 0, f"Variable '{name}' is assigned but never read"
+```
+
+---
+
+### R-NEG-4（P2 邊界條件）— `NEG_SAMPLE_FRAC_ASSUMED_POS_RATE ≥ 1.0` 或 `= 0.0` 造成除零或無效 frac
+
+**嚴重度**：P2（config 誤設邊界條件）
+
+**問題**：auto-frac 公式 `(needed_factor - p) / (1.0 - p)` 在 `p = 1.0` 時除零，`p = 0.0` 時 `raw_frac = needed_factor`（退化但不 crash），`p > 1.0` 時除以負數→ frac 反向。config 沒有任何校驗。
+
+**修改建議**：在 `_oom_check_and_adjust_neg_sample_frac()` 開頭加校驗：
+```python
+if not (0.0 < NEG_SAMPLE_FRAC_ASSUMED_POS_RATE < 1.0):
+    logger.warning(
+        "OOM-check: NEG_SAMPLE_FRAC_ASSUMED_POS_RATE=%.2f out of valid range (0, 1); "
+        "falling back to 0.15",
+        NEG_SAMPLE_FRAC_ASSUMED_POS_RATE,
+    )
+    p = 0.15
+```
+
+**希望新增的測試**：
+```python
+def test_oom_check_handles_extreme_pos_rate():
+    """Auto-adjust must not crash or produce invalid frac when pos_rate is 0 or 1."""
+    # Mock psutil, set pos_rate=1.0 → should not ZeroDivisionError
+    ...
+```
+
+---
+
+### R-NEG-5（P2 效能）— OOM pre-check 用 `available` RAM 而非 `total` RAM，在高記憶體壓力下過度保守
+
+**嚴重度**：P2（效能 / UX）
+
+**問題**：`psutil.virtual_memory().available` 是**當下瞬間**的可用 RAM，受其他 process、OS cache 影響。如果跑 trainer 前碰巧有 Chrome 或其他應用佔用大量 RAM，available 可能只有 3 GB（但 total 有 16 GB）。OOM check 會誤判為高風險，過度壓縮 `neg_sample_frac`。但 Step 6/7 開始前 trainer 自己已透過 `gc.collect()` 和 `del sessions_all` 釋放了大量記憶體。
+
+**修改建議**：考慮用 `max(available_ram, total_ram * 0.5)` 作為基準（假設 pipeline 跑到 Step 7 時至少能拿回 50% total RAM），或 log 中同時顯示 total RAM 讓用戶自行判斷，並提供 `NEG_SAMPLE_FRAC_AUTO=False` 的 escape hatch（已有）。至少在 log 中加入 total RAM 資訊：
+
+```python
+print(f"... | total {total_ram / (1024**3):.1f} GB | available {available_ram / (1024**3):.1f} GB | ...")
+```
+
+**希望新增的測試**：此為 UX 議題，不需要自動化測試，但 log 應包含 total RAM 以便手動判斷。
+
+---
+
+### R-NEG-6（P3 一致性）— `random_state=42` 固定種子：跨 chunk 的 neg sampling 每個 chunk 都使用相同的隨機序列
+
+**嚴重度**：P3（微小偏差風險，不影響正確性但不理想）
+
+**問題**：每個 chunk 的 `labeled[~_pos_mask].sample(frac=..., random_state=42)` 都用相同的 `random_state=42`。由於每個 chunk 的 DataFrame index 都在 `reset_index(drop=True)` 後從 0 開始，固定種子意味著相同 index 位置的行會被一致地保留或丟棄。若不同 chunk 的負樣本碰巧有系統性的 index 排列（例如按 player_id 排序），可能導致某些 player 的負樣本被過度或不足取樣。
+
+**修改建議**：使用 chunk-specific seed：
+```python
+_chunk_seed = hash((window_start.isoformat(), window_end.isoformat())) % (2**31)
+_neg_keep = labeled[~_pos_mask].sample(frac=neg_sample_frac, random_state=_chunk_seed)
+```
+
+**希望新增的測試**：
+```python
+def test_neg_sampling_seed_varies_by_chunk():
+    """Different chunks should use different random seeds for neg downsampling."""
+    import inspect
+    src = inspect.getsource(process_chunk)
+    # Should NOT hardcode random_state=42 for neg sampling
+    assert "random_state=42" not in src or "chunk" in src.split("random_state=42")[0][-100:]
+```
+
+---
+
+### R-NEG-7（P3 邊界條件）— `NEG_SAMPLE_FRAC` 設為 0.0 時 `pd.DataFrame.sample(frac=0.0)` 回傳空 DataFrame → 只剩正樣本
+
+**嚴重度**：P3（邊界條件）
+
+**問題**：若 `NEG_SAMPLE_FRAC = 0.0`（或 `NEG_SAMPLE_FRAC_MIN = 0.0` 且 auto-adjust 降到 0），`sample(frac=0.0)` 回傳空 DataFrame，只剩 label=1 的行。LightGBM 的 `class_weight='balanced'` 無法補償完全沒有負樣本的情況（`y_train.nunique() < 2` → 已有 guard 會 `raise ValueError`）。流程不會 crash（被 `_train_one_model` 的 guard 攔截），但會產生一個不可用的 pipeline run 且沒有提前的 clear error。
+
+**修改建議**：在 `process_chunk()` 的 neg sampling 後加 sanity check：
+```python
+if neg_sample_frac < 1.0 and int((labeled["label"] == 0).sum()) == 0:
+    logger.error(
+        "Chunk %s–%s: NEG_SAMPLE_FRAC=%.2f removed ALL negatives — "
+        "model training will fail. Increase NEG_SAMPLE_FRAC or NEG_SAMPLE_FRAC_MIN.",
+        window_start.date(), window_end.date(), neg_sample_frac,
+    )
+```
+
+**希望新增的測試**：
+```python
+def test_neg_sampling_frac_zero_warns():
+    """frac=0.0 should produce a clear error/warning, not a silent empty neg set."""
+    ...
+```
+
+---
+
+### 問題優先度摘要
+
+| 優先度 | 問題 ID | 描述 | 類型 |
+|--------|---------|------|------|
+| **P1** | R-NEG-1 | cache key 不含 `neg_sample_frac`，cache hit 跳過取樣 | 正確性 |
+| P2 | R-NEG-2 | `training_metrics.json` 未記錄 effective `neg_sample_frac` | 可審計性 |
+| P2 | R-NEG-3 | `total_ram` 未使用 + 雙重 `virtual_memory()` 呼叫 | Dead code |
+| P2 | R-NEG-4 | `ASSUMED_POS_RATE ≥ 1.0` 除零 / 反向 | 邊界條件 |
+| P2 | R-NEG-5 | 用 `available` RAM 而非 `total` → 可能過度保守 | 效能 / UX |
+| P3 | R-NEG-6 | 所有 chunk 共用 `random_state=42` | 一致性 |
+| P3 | R-NEG-7 | `frac=0.0` 產生純正樣本集 → 無提前警告 | 邊界條件 |
+
+### 下一步建議
+1. **必修**（P1）：R-NEG-1 — cache key 加入 `neg_sample_frac`。這是唯一會導致靜默錯誤的問題。
+2. **應修**（P2）：R-NEG-2 + R-NEG-3 + R-NEG-4 — 可在同一輪修復。
+3. R-NEG-5（加入 total RAM log）改動量極小，建議順手修。
+4. R-NEG-6 / R-NEG-7 屬低風險，可延後。
+
+---
+
+## Round 370 Tests Added（R-NEG 風險可重現）
+
+新增測試檔：`tests/test_review_risks_round370.py`
+
+目標：把 Reviewer 提到的 R-NEG-1..R-NEG-7 轉成「可執行的最小可重現測試 / lint-like source guard」。
+
+設計原則：
+- **不改 production code**（tests-only）
+- 未修風險先用 `@unittest.expectedFailure` 掛住，避免被遺忘但不阻斷 CI
+- 以 source/AST 檢查為主，降低測試環境依賴與跑測成本
+
+### 測試清單
+
+| Risk ID | Test | 類型 | 目前結果 |
+|---|---|---|---|
+| R-NEG-1 | `test_chunk_cache_key_includes_neg_sample_frac` | source guard | xfailed |
+| R-NEG-1 | `test_process_chunk_passes_neg_sample_frac_into_cache_key` | source guard | xfailed |
+| R-NEG-2 | `test_training_metrics_records_neg_sample_frac` | source guard | xfailed |
+| R-NEG-3 | `test_oom_check_no_unused_total_ram_assignment` | AST lint-like guard | xfailed |
+| R-NEG-4 | `test_oom_check_validates_assumed_pos_rate_range` | source guard | xfailed |
+| R-NEG-5 | `test_oom_check_logs_total_ram_alongside_available` | source guard | xfailed |
+| R-NEG-6 | `test_neg_sampling_seed_not_hardcoded_constant` | source guard | xfailed |
+| R-NEG-7 | `test_neg_sampling_frac_zero_has_explicit_guard` | source guard | xfailed |
+
+### 執行方式
+
+```bash
+python -m pytest "c:/Users/longp/Patron_Walkaway/tests/test_review_risks_round370.py" -q
+```
+
+Observed result:
+`8 xfailed in 4.81s`
+
+---
+
+## Round 370-B：修復實作，所有 Tests 轉 PASSED（2026-03-06）
+
+### 背景
+
+上一輪把 R-NEG-1..R-NEG-7 轉成測試但標為 `@unittest.expectedFailure`。
+本輪目標：修改 production code 使所有測試真正通過，再移除 `expectedFailure`。
+
+### 修改清單
+
+| File | 修改內容 | 解決 Risk |
+|---|---|---|
+| `trainer/trainer.py` | `_chunk_cache_key` 加入 `neg_sample_frac: float = 1.0` 參數，回傳字串加 `\|ns{:.4f}` | R-NEG-1 |
+| `trainer/trainer.py` | `process_chunk` 中對 `_chunk_cache_key` 的呼叫改成 `neg_sample_frac=neg_sample_frac` | R-NEG-1 |
+| `trainer/trainer.py` | `save_artifact_bundle` 加入 `neg_sample_frac: float = 1.0` 參數，寫入 `training_metrics.json` | R-NEG-2 |
+| `trainer/trainer.py` | `run_pipeline` 的 `save_artifact_bundle(...)` 呼叫傳入 `neg_sample_frac=_effective_neg_sample_frac` | R-NEG-2 |
+| `trainer/trainer.py` | `_oom_check_and_adjust_neg_sample_frac`：合併兩次 `virtual_memory()` 呼叫；`total_ram` 加入 print/log | R-NEG-3, R-NEG-5 |
+| `trainer/trainer.py` | `_oom_check_and_adjust_neg_sample_frac`：加入 `0.0 < NEG_SAMPLE_FRAC_ASSUMED_POS_RATE < 1.0` 校驗，不合格時 fallback 0.15 | R-NEG-4 |
+| `trainer/trainer.py` | `process_chunk` 中 neg sampling 改用 chunk-specific seed（`hash(window_start, window_end) % 2**31`），移除 `random_state=42` | R-NEG-6 |
+| `trainer/trainer.py` | `process_chunk` neg sampling 之後加入全負樣本被移除的 `logger.error(... "removed ALL negatives" ...)` | R-NEG-7 |
+| `tests/test_review_risks_round370.py` | 移除所有 8 個 `@unittest.expectedFailure`（risks 已修，測試改為正式 pass guard） | 全部 |
+
+### 測試結果
+
+```bash
+python -m pytest "c:/Users/longp/Patron_Walkaway/tests/test_review_risks_round370.py" -v
+```
+
+```
+8 passed in 2.20s
+```
+
+| Test | 結果 |
+|---|---|
+| `test_chunk_cache_key_includes_neg_sample_frac` | **PASSED** |
+| `test_process_chunk_passes_neg_sample_frac_into_cache_key` | **PASSED** |
+| `test_training_metrics_records_neg_sample_frac` | **PASSED** |
+| `test_oom_check_no_unused_total_ram_assignment` | **PASSED** |
+| `test_oom_check_validates_assumed_pos_rate_range` | **PASSED** |
+| `test_oom_check_logs_total_ram_alongside_available` | **PASSED** |
+| `test_neg_sampling_seed_not_hardcoded_constant` | **PASSED** |
+| `test_neg_sampling_frac_zero_has_explicit_guard` | **PASSED** |
+
+Lint：`No linter errors found.`
+
+### 下一步建議
+
+- 跑完整 pipeline 做一次 smoke test（特別確認 cache-key 格式變化不會誤 invalidate 大量舊 chunks）
+- 考慮在 CI 加入 `python -m pytest tests/test_review_risks_round370.py` 步驟，防止回歸
+

@@ -119,6 +119,32 @@ HIST_AVG_BET_CAP = 500_000       # Winsorization cap for avg_bet (F2; validate w
 CHUNK_CONCAT_MEMORY_WARN_BYTES = int(1 * (1024**3))  # 1 GB on-disk total
 CHUNK_CONCAT_RAM_FACTOR = 3  # rough factor: on-disk size × this ≈ peak RAM for full_df
 
+# --- Per-chunk negative downsampling (OOM mitigation for long training windows) ---
+# When < 1.0: ALL label=1 rows are kept; label=0 rows are randomly downsampled
+# to this fraction before writing each chunk Parquet.  Combined with
+# class_weight='balanced' and per-run sample_weight, LightGBM compensates for
+# the reduced negative count automatically.
+# 1.0 = disabled (keep all negatives, original behaviour).
+# Recommended: 0.3 when training on 90+ days of data to avoid Step 7 OOM.
+# Example: 30 days × 27M rows → ~10M rows with NEG_SAMPLE_FRAC=0.3.
+NEG_SAMPLE_FRAC: float = 1.0
+
+# --- OOM pre-check: auto-adjust NEG_SAMPLE_FRAC after Step 1 if RAM looks tight ---
+# After the chunk list is built, the pipeline estimates Step 7 peak RAM and
+# auto-reduces NEG_SAMPLE_FRAC when a likely OOM is detected.
+# Only triggers when NEG_SAMPLE_FRAC == 1.0 (user-configured values are respected).
+NEG_SAMPLE_FRAC_AUTO: bool = True   # set False to disable auto-adjustment entirely
+NEG_SAMPLE_FRAC_MIN: float = 0.05  # hard floor: auto-reduce will never go below this
+# Assumed positive rate used in the auto-adjustment formula.
+# Default 0.15 (15%) is conservative; lower your actual positive rate for a tighter bound.
+NEG_SAMPLE_FRAC_ASSUMED_POS_RATE: float = 0.15
+# Target: keep Step 7 estimated peak RAM within this fraction of *available* RAM.
+# 0.75 = aim to use at most 75% of currently free RAM (leaves headroom for OS + other).
+NEG_SAMPLE_RAM_SAFETY: float = 0.75
+# Fallback per-chunk on-disk size estimate when no cached chunk Parquets exist (bytes).
+# 200 MB is a rough estimate for a ~2–3M-row monthly chunk.
+NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT: int = 200 * 1024 * 1024
+
 # --- Row-level train/valid/test split ratios (SSOT §9.2, todo-row-level-time-split) ---
 # Chunks control ETL/cache volume only; the actual split is applied at row level
 # after concatenating all chunk Parquets, sorted by payout_complete_dtm.

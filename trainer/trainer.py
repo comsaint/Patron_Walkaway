@@ -99,6 +99,12 @@ try:
     MIN_THRESHOLD_ALERT_COUNT: int = getattr(_cfg, "MIN_THRESHOLD_ALERT_COUNT", 5)
     THRESHOLD_MIN_RECALL: Optional[float] = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_FBETA: float = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
+    NEG_SAMPLE_FRAC: float = getattr(_cfg, "NEG_SAMPLE_FRAC", 1.0)
+    NEG_SAMPLE_FRAC_AUTO: bool = getattr(_cfg, "NEG_SAMPLE_FRAC_AUTO", True)
+    NEG_SAMPLE_FRAC_MIN: float = getattr(_cfg, "NEG_SAMPLE_FRAC_MIN", 0.05)
+    NEG_SAMPLE_FRAC_ASSUMED_POS_RATE: float = getattr(_cfg, "NEG_SAMPLE_FRAC_ASSUMED_POS_RATE", 0.15)
+    NEG_SAMPLE_RAM_SAFETY: float = getattr(_cfg, "NEG_SAMPLE_RAM_SAFETY", 0.75)
+    NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT: int = getattr(_cfg, "NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT", 200 * 1024 * 1024)
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
@@ -125,6 +131,12 @@ except ModuleNotFoundError:
     MIN_THRESHOLD_ALERT_COUNT = getattr(_cfg, "MIN_THRESHOLD_ALERT_COUNT", 5)
     THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_FBETA = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
+    NEG_SAMPLE_FRAC = getattr(_cfg, "NEG_SAMPLE_FRAC", 1.0)
+    NEG_SAMPLE_FRAC_AUTO = getattr(_cfg, "NEG_SAMPLE_FRAC_AUTO", True)
+    NEG_SAMPLE_FRAC_MIN = getattr(_cfg, "NEG_SAMPLE_FRAC_MIN", 0.05)
+    NEG_SAMPLE_FRAC_ASSUMED_POS_RATE = getattr(_cfg, "NEG_SAMPLE_FRAC_ASSUMED_POS_RATE", 0.15)
+    NEG_SAMPLE_RAM_SAFETY = getattr(_cfg, "NEG_SAMPLE_RAM_SAFETY", 0.75)
+    NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT = getattr(_cfg, "NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT", 200 * 1024 * 1024)
 
 # Module-level pipeline imports (same try/except pattern)
 try:
@@ -1387,11 +1399,149 @@ def _chunk_parquet_path(chunk: dict) -> Path:
     return CHUNK_DIR / f"chunk_{ws}_{we}.parquet"
 
 
+def _oom_check_and_adjust_neg_sample_frac(
+    chunks: list,
+    current_frac: float,
+) -> float:
+    """Estimate Step 7 peak RAM after Step 1; auto-reduce NEG_SAMPLE_FRAC if OOM is likely.
+
+    Called immediately after the chunk list is finalised so the user sees a
+    warning — and any auto-adjustment — before the slow Step 6 data loading
+    begins.
+
+    Logic:
+    1. Skip if NEG_SAMPLE_FRAC_AUTO is False.
+    2. Try psutil for available RAM; skip gracefully if not installed.
+    3. Estimate per-chunk on-disk size from cached chunk Parquets (if any),
+       otherwise fall back to NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT.
+    4. estimated_peak_ram = N_chunks × per_chunk_bytes × CHUNK_CONCAT_RAM_FACTOR
+    5. Print a one-line summary so user can see the estimate.
+    6. If peak ≤ budget: no change.
+    7. If current_frac < 1.0 (user-configured): warn only, do not override.
+    8. Otherwise compute the auto frac from the algebra:
+         rows_factor = pos_rate + frac × (1 - pos_rate)
+         need rows_factor ≤ budget / estimated_peak_ram
+         → frac = (budget/peak - pos_rate) / (1 - pos_rate)
+       Clamp to [NEG_SAMPLE_FRAC_MIN, 1.0].
+
+    Returns the effective frac to use for the pipeline run.
+    """
+    if not NEG_SAMPLE_FRAC_AUTO:
+        logger.info("OOM-check: NEG_SAMPLE_FRAC_AUTO=False — skipping")
+        return current_frac
+
+    try:
+        import psutil as _psutil
+        _vmem = _psutil.virtual_memory()
+        available_ram = _vmem.available
+        total_ram = _vmem.total
+    except ImportError:
+        logger.info("OOM-check: psutil not installed — skipping (pip install psutil to enable)")
+        print("[OOM-check] psutil not installed; skipping RAM pre-check.", flush=True)
+        return current_frac
+
+    # R-NEG-4: validate ASSUMED_POS_RATE is in (0, 1) before using in formula.
+    # p ≥ 1.0 causes division by zero; p ≤ 0.0 degenerates the formula.
+    if not (0.0 < NEG_SAMPLE_FRAC_ASSUMED_POS_RATE < 1.0):
+        logger.warning(
+            "OOM-check: NEG_SAMPLE_FRAC_ASSUMED_POS_RATE=%.2f out of valid range (0, 1); "
+            "falling back to 0.15",
+            NEG_SAMPLE_FRAC_ASSUMED_POS_RATE,
+        )
+        p = 0.15
+    else:
+        p = NEG_SAMPLE_FRAC_ASSUMED_POS_RATE
+
+    # --- Estimate per-chunk on-disk size ---
+    existing_sizes = [
+        _chunk_parquet_path(c).stat().st_size
+        for c in chunks
+        if _chunk_parquet_path(c).exists()
+    ]
+    if existing_sizes:
+        per_chunk_bytes = sum(existing_sizes) / len(existing_sizes)
+        size_source = f"avg of {len(existing_sizes)}/{len(chunks)} cached chunk Parquets"
+    else:
+        per_chunk_bytes = NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT
+        size_source = f"default estimate ({NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT // (1024**2)} MB/chunk; no cached chunks)"
+
+    n_chunks = len(chunks)
+    estimated_on_disk = per_chunk_bytes * n_chunks
+    estimated_peak_ram = estimated_on_disk * CHUNK_CONCAT_RAM_FACTOR
+    ram_budget = available_ram * NEG_SAMPLE_RAM_SAFETY
+
+    # R-NEG-3/5: include total RAM alongside available so operators can judge
+    # whether "available" is temporarily low (e.g. OS cache) vs genuinely tight.
+    print(
+        f"[OOM-check] {n_chunks} chunk(s) × {per_chunk_bytes / (1024**2):.0f} MB"
+        f" × {CHUNK_CONCAT_RAM_FACTOR}x factor"
+        f" → est. Step 7 peak RAM {estimated_peak_ram / (1024**3):.1f} GB"
+        f" | total {total_ram / (1024**3):.1f} GB | available {available_ram / (1024**3):.1f} GB"
+        f" | budget ({NEG_SAMPLE_RAM_SAFETY:.0%}) {ram_budget / (1024**3):.1f} GB"
+        f"  [{size_source}]",
+        flush=True,
+    )
+    logger.info(
+        "OOM-check: %d chunks est. peak %.1f GB  total %.1f GB  available %.1f GB  budget %.1f GB  (%s)",
+        n_chunks,
+        estimated_peak_ram / (1024**3),
+        total_ram / (1024**3),
+        available_ram / (1024**3),
+        ram_budget / (1024**3),
+        size_source,
+    )
+
+    if estimated_peak_ram <= ram_budget:
+        print("[OOM-check] RAM looks OK — no adjustment to NEG_SAMPLE_FRAC.", flush=True)
+        logger.info("OOM-check: peak %.1f GB ≤ budget %.1f GB — no adjustment", estimated_peak_ram / (1024**3), ram_budget / (1024**3))
+        return current_frac
+
+    # OOM is likely.
+    if current_frac < 1.0:
+        print(
+            f"[OOM-check] WARNING: estimated peak {estimated_peak_ram / (1024**3):.1f} GB"
+            f" > budget {ram_budget / (1024**3):.1f} GB, but NEG_SAMPLE_FRAC={current_frac:.2f}"
+            f" is already user-configured — not overriding. Consider lowering it further.",
+            flush=True,
+        )
+        logger.warning(
+            "OOM-check: est. peak %.1f GB > budget %.1f GB but NEG_SAMPLE_FRAC=%.2f is user-set — not overriding",
+            estimated_peak_ram / (1024**3), ram_budget / (1024**3), current_frac,
+        )
+        return current_frac
+
+    # Auto-compute frac:  rows_factor = p + frac*(1-p)  where p = assumed positive rate.
+    # Need: estimated_peak_ram * rows_factor ≤ ram_budget
+    # → frac ≤ (ram_budget/estimated_peak_ram - p) / (1-p)
+    # p is already validated/defaulted above.
+    needed_factor = ram_budget / estimated_peak_ram   # fraction of total rows needed
+    raw_frac = (needed_factor - p) / (1.0 - p)
+    auto_frac = max(NEG_SAMPLE_FRAC_MIN, min(1.0, raw_frac))
+
+    _warn_floor = raw_frac < NEG_SAMPLE_FRAC_MIN
+    print(
+        f"[OOM-check] *** OOM RISK: est. peak {estimated_peak_ram / (1024**3):.1f} GB"
+        f" > budget {ram_budget / (1024**3):.1f} GB ***\n"
+        f"  Auto-adjusting NEG_SAMPLE_FRAC: 1.0 → {auto_frac:.2f}"
+        f"  (assumed pos_rate={p:.0%}, floor={NEG_SAMPLE_FRAC_MIN})"
+        + (f"\n  *** Floor hit: even frac={NEG_SAMPLE_FRAC_MIN} may not be enough —"
+           f" consider reducing --days / --recent-chunks ***" if _warn_floor else "")
+        + "\n  To disable: set NEG_SAMPLE_FRAC_AUTO=False in config.py",
+        flush=True,
+    )
+    logger.warning(
+        "OOM-check: auto-adjusting NEG_SAMPLE_FRAC 1.0 -> %.2f  (peak %.1f GB > budget %.1f GB)",
+        auto_frac, estimated_peak_ram / (1024**3), ram_budget / (1024**3),
+    )
+    return auto_frac
+
+
 def _chunk_cache_key(
     chunk: dict,
     bets: pd.DataFrame,
     profile_hash: str = "none",
     no_afg: bool = False,
+    neg_sample_frac: float = 1.0,
 ) -> str:
     """Hash to detect stale parquet cache (TRN-07).
 
@@ -1405,6 +1555,9 @@ def _chunk_cache_key(
     R904/R1003: no_afg is included so that toggling --no-afg produces a distinct
     cache key, preventing stale Track-LLM-enabled chunks from being reused when AFG
     is turned off (or vice versa).
+
+    R-NEG-1: neg_sample_frac is included so that changing the downsampling ratio
+    forces a cache miss and prevents stale full/partial chunks being served.
     """
     ws = chunk["window_start"].isoformat()
     we = chunk["window_end"].isoformat()
@@ -1418,7 +1571,7 @@ def _chunk_cache_key(
     }, sort_keys=True)
     cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:6]
     afg_tag = "no_afg" if no_afg else "afg"
-    return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}|{afg_tag}"
+    return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}|{afg_tag}|ns{neg_sample_frac:.4f}"
 
 
 def process_chunk(
@@ -1430,6 +1583,7 @@ def process_chunk(
     profile_df: Optional[pd.DataFrame] = None,
     feature_spec: Optional[dict] = None,
     no_afg: bool = False,
+    neg_sample_frac: float = NEG_SAMPLE_FRAC,
 ) -> Optional[Path]:
     """Process one monthly chunk; return path to written Parquet or None if empty.
 
@@ -1440,6 +1594,9 @@ def process_chunk(
         Pass None to skip; profile feature columns will be 0 for all rows.
     feature_spec: parsed Track LLM feature spec loaded by run_pipeline.
     no_afg: when True, skip Track LLM feature computation (DEC-020 --no-afg / --fast-mode).
+    neg_sample_frac: fraction of label=0 rows to keep (1.0 = keep all).  Overrides
+        the module-level NEG_SAMPLE_FRAC; normally supplied by run_pipeline after the
+        OOM pre-check (_oom_check_and_adjust_neg_sample_frac).
     """
     window_start = chunk["window_start"]
     window_end = chunk["window_end"]
@@ -1483,7 +1640,9 @@ def process_chunk(
         ).hexdigest()[:6]
     else:
         _profile_hash = "none"
-    current_key = _chunk_cache_key(chunk, bets_raw, profile_hash=_profile_hash, no_afg=no_afg)
+    current_key = _chunk_cache_key(
+        chunk, bets_raw, profile_hash=_profile_hash, no_afg=no_afg,
+        neg_sample_frac=neg_sample_frac)
     key_path = chunk_path.with_suffix(".cache_key")
     if not force_recompute and chunk_path.exists():
         stored_key = key_path.read_text(encoding="utf-8").strip() if key_path.exists() else ""
@@ -1634,12 +1793,47 @@ def process_chunk(
     )
     labeled["is_rated"] = labeled["canonical_id"].isin(rated_ids)
 
+    _n_total_before_sample = len(labeled)
+    _n_pos_before_sample = int(labeled["label"].sum())
+    _n_rated_before_sample = int(labeled["is_rated"].sum())
+
+    # --- Per-chunk negative downsampling (OOM mitigation, config.NEG_SAMPLE_FRAC) ---
+    # Keep ALL positives; downsample negatives to neg_sample_frac fraction.
+    # class_weight='balanced' + per-run sample_weight compensate automatically.
+    if neg_sample_frac < 1.0 and "label" in labeled.columns:
+        _pos_mask = labeled["label"] == 1
+        _n_neg_before = int((~_pos_mask).sum())
+        # R-NEG-6: chunk-specific seed avoids systematic same-index bias across chunks.
+        _chunk_seed = hash((window_start.isoformat(), window_end.isoformat())) % (2**31)
+        _neg_keep = labeled[~_pos_mask].sample(frac=neg_sample_frac, random_state=_chunk_seed)
+        labeled = pd.concat([labeled[_pos_mask], _neg_keep], ignore_index=True)
+        logger.info(
+            "Chunk %s–%s: neg downsample frac=%.2f  rows %d->%d  "
+            "(pos kept: %d, neg: %d->%d)",
+            window_start.date(), window_end.date(),
+            neg_sample_frac, _n_total_before_sample, len(labeled),
+            _n_pos_before_sample, _n_neg_before, len(_neg_keep),
+        )
+        print(
+            "  [neg-sample] chunk %s–%s: %d -> %d rows (neg %.0f%%, pos all kept)"
+            % (window_start.date(), window_end.date(),
+               _n_total_before_sample, len(labeled), neg_sample_frac * 100),
+            flush=True,
+        )
+        # R-NEG-7: guard against extreme frac values that remove all negatives.
+        if int((labeled["label"] == 0).sum()) == 0:
+            logger.error(
+                "Chunk %s–%s: neg_sample_frac=%.4f removed ALL negatives — "
+                "model training will fail. Increase NEG_SAMPLE_FRAC or NEG_SAMPLE_FRAC_MIN.",
+                window_start.date(), window_end.date(), neg_sample_frac,
+            )
+
     logger.info(
         "Chunk %s–%s: %d rows (label=1: %d, rated: %d)",
         window_start.date(), window_end.date(),
         len(labeled),
         int(labeled["label"].sum()),
-        int(labeled["is_rated"].sum()),
+        _n_rated_before_sample,
     )
 
     labeled.to_parquet(chunk_path, index=False)
@@ -1753,6 +1947,7 @@ def _train_one_model(
     sw_train: pd.Series,
     hyperparams: dict,
     label: str = "",
+    log_results: bool = True,
 ) -> Tuple[lgb.LGBMClassifier, dict]:
     """Train a single LightGBM model and compute validation metrics."""
     # R1509: guard single-class training set (LightGBM would train a constant predictor).
@@ -1867,10 +2062,11 @@ def _train_one_model(
         # threshold of 0.5 is never falsely flagged as uncalibrated.
         "_uncalibrated": not _has_val,
     }
-    logger.info(
-        "%s: AP=%.4f  F0.5=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
-        label, prauc, best_fbeta, best_f1, best_prec, best_rec, best_t,
-    )
+    if log_results:
+        logger.info(
+            "%s valid: AP=%.4f  F0.5=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
+            label, prauc, best_fbeta, best_f1, best_prec, best_rec, best_t,
+        )
     return model, metrics
 
 
@@ -1881,6 +2077,7 @@ def _compute_test_metrics(
     y_test: pd.Series,
     label: str = "",
     _uncalibrated: bool = False,
+    log_results: bool = True,
 ) -> dict:
     """Evaluate a trained model on the held-out test set at the val-derived threshold.
 
@@ -1937,10 +2134,11 @@ def _compute_test_metrics(
     n_te = int(len(y_test))
     n_te_pos = int(y_test.sum())
     test_random_ap = (n_te_pos / n_te) if n_te > 0 else 0.0
-    logger.info(
-        "%s test: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
-        label, prauc, f1, prec, rec, threshold,
-    )
+    if log_results:
+        logger.info(
+            "%s test: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
+            label, prauc, f1, prec, rec, threshold,
+        )
     return {
         "test_ap": prauc,
         "test_precision": prec,
@@ -1960,6 +2158,7 @@ def _compute_train_metrics(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     label: str = "",
+    log_results: bool = True,
 ) -> dict:
     """Evaluate a trained model on the training set (for reporting overfit / fit quality).
 
@@ -1990,10 +2189,11 @@ def _compute_train_metrics(
     prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-    logger.info(
-        "%s train: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  random_ap=%.4f",
-        label, train_prauc, f1, prec, rec, train_random_ap,
-    )
+    if log_results:
+        logger.info(
+            "%s train: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  random_ap=%.4f",
+            label, train_prauc, f1, prec, rec, train_random_ap,
+        )
     return {
         "train_ap": train_prauc,
         "train_precision": prec,
@@ -2218,24 +2418,57 @@ def train_single_rated_model(
             "min_child_samples": 20,
         }
 
-    model, metrics = _train_one_model(X_tr, y_tr, X_vl, y_vl, sw_rated, hp, label="rated")
-
-    metrics.update(
-        _compute_train_metrics(model, metrics["threshold"], X_tr, y_tr, label="rated")
+    model, metrics = _train_one_model(
+        X_tr, y_tr, X_vl, y_vl, sw_rated, hp, label="rated", log_results=False
     )
+
+    train_m = _compute_train_metrics(
+        model, metrics["threshold"], X_tr, y_tr, label="rated", log_results=False
+    )
+    metrics.update(train_m)
 
     if test_rated is not None and not test_rated.empty:
         X_te = test_rated[avail_cols]
         y_te = test_rated["label"]
-        metrics.update(
-            _compute_test_metrics(
-                model,
-                metrics["threshold"],
-                X_te,
-                y_te,
-                label="rated",
-                _uncalibrated=bool(metrics.get("_uncalibrated", False)),
-            )
+        test_m = _compute_test_metrics(
+            model,
+            metrics["threshold"],
+            X_te,
+            y_te,
+            label="rated",
+            _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+            log_results=False,
+        )
+        metrics.update(test_m)
+    else:
+        test_m = {}
+
+    # Log in order: train → valid → test (clear labels; valid was previously unlabeled).
+    logger.info(
+        "rated train: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  random_ap=%.4f",
+        train_m.get("train_ap", 0.0),
+        train_m.get("train_f1", 0.0),
+        train_m.get("train_precision", 0.0),
+        train_m.get("train_recall", 0.0),
+        train_m.get("train_random_ap", 0.0),
+    )
+    logger.info(
+        "rated valid: AP=%.4f  F0.5=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
+        metrics.get("val_ap", 0.0),
+        metrics.get("val_fbeta_05", 0.0),
+        metrics.get("val_f1", 0.0),
+        metrics.get("val_precision", 0.0),
+        metrics.get("val_recall", 0.0),
+        metrics.get("threshold", 0.5),
+    )
+    if test_m:
+        logger.info(
+            "rated test:  AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
+            test_m.get("test_ap", 0.0),
+            test_m.get("test_f1", 0.0),
+            test_m.get("test_precision", 0.0),
+            test_m.get("test_recall", 0.0),
+            metrics.get("threshold", 0.5),
         )
 
     metrics["feature_importance"] = _compute_feature_importance(model, avail_cols)
@@ -2262,6 +2495,7 @@ def save_artifact_bundle(
     fast_mode: bool = False,
     sample_rated_n: Optional[int] = None,
     feature_spec_path: Optional[Path] = None,
+    neg_sample_frac: float = 1.0,
 ) -> None:
     """Write all model artifacts atomically (v10 single rated model, DEC-021).
 
@@ -2367,6 +2601,9 @@ def save_artifact_bundle(
                 # R301: record sampling metadata so artifacts can be audited
                 # even when loaded later.  None = full rated population was used.
                 "sample_rated_n": sample_rated_n,
+                # R-NEG-2: record effective neg_sample_frac for auditability.
+                # 1.0 = no downsampling; < 1.0 = negatives were downsampled.
+                "neg_sample_frac": neg_sample_frac,
                 # R703: uncalibrated_threshold=True means the 0.5 fallback was used.
                 "uncalibrated_threshold": _uncalibrated_threshold,
                 # DEC-024 / R3501: SHA-256 prefix of the frozen feature spec for audit.
@@ -2431,6 +2668,22 @@ def run_pipeline(args) -> None:
             "Combine with --fast-mode or --sample-rated for memory-safe backfill."
         )
 
+    # Log the config-file NEG_SAMPLE_FRAC at startup.  The OOM pre-check (run
+    # after Step 1) may further lower this to _effective_neg_sample_frac.
+    if NEG_SAMPLE_FRAC < 1.0:
+        print(
+            f"[Config] NEG_SAMPLE_FRAC={NEG_SAMPLE_FRAC:.2f}: "
+            f"negatives will be downsampled to {NEG_SAMPLE_FRAC * 100:.0f}% per chunk "
+            f"(OOM mitigation — positives always kept in full)",
+            flush=True,
+        )
+        logger.info(
+            "NEG_SAMPLE_FRAC=%.2f (config): negatives downsampled per chunk (OOM mitigation)",
+            NEG_SAMPLE_FRAC,
+        )
+    else:
+        logger.info("NEG_SAMPLE_FRAC=1.0 (config): negative downsampling disabled (all rows kept)")
+
     # Auto-adjust window to actual data end when using local Parquet without
     # explicit --start/--end, so --recent-chunks is relative to data, not today.
     if use_local and not (getattr(args, "start", None) or getattr(args, "end", None)):
@@ -2493,6 +2746,13 @@ def run_pipeline(args) -> None:
     # called from the canonical-map path) receive tz-naive datetime arguments.
     effective_start = effective_start.replace(tzinfo=None) if effective_start.tzinfo else effective_start
     effective_end   = effective_end.replace(tzinfo=None)   if effective_end.tzinfo   else effective_end
+
+    # --- OOM pre-check (earliest feasible point: chunk list is final) ---
+    # Estimate Step 7 peak RAM and auto-reduce NEG_SAMPLE_FRAC when OOM is likely.
+    # Result may equal NEG_SAMPLE_FRAC (no change) or be lower (auto-adjusted).
+    _effective_neg_sample_frac: float = _oom_check_and_adjust_neg_sample_frac(
+        chunks, NEG_SAMPLE_FRAC
+    )
 
     # DEC-017: derive the data horizon (days of available history in this run).
     # Used to (a) cap profile snapshot range in fast-mode, and (b) select only
@@ -2647,7 +2907,13 @@ def run_pipeline(args) -> None:
         logger.info("Track LLM: loaded feature spec from %s", FEATURE_SPEC_PATH)
 
     # 4. Process chunks -> write parquet
-    print("[Step 6/10] Process chunks (DQ, labels, Track Human, Track LLM)…", flush=True)
+    _neg_sample_note = (
+        f"  neg-sample={_effective_neg_sample_frac:.2f}" if _effective_neg_sample_frac < 1.0 else ""
+    )
+    print(
+        f"[Step 6/10] Process chunks (DQ, labels, Track Human, Track LLM){_neg_sample_note}…",
+        flush=True,
+    )
     t0 = time.perf_counter()
     chunk_paths = []
     for i, chunk in enumerate(chunks):
@@ -2660,6 +2926,7 @@ def run_pipeline(args) -> None:
             profile_df=profile_df,
             feature_spec=feature_spec,
             no_afg=no_afg,
+            neg_sample_frac=_effective_neg_sample_frac,
         )
         if path is not None:
             chunk_paths.append(path)
@@ -2911,6 +3178,7 @@ def run_pipeline(args) -> None:
         fast_mode=fast_mode,
         sample_rated_n=sample_rated_n,
         feature_spec_path=FEATURE_SPEC_PATH if not no_afg else None,
+        neg_sample_frac=_effective_neg_sample_frac,
     )
     _el = time.perf_counter() - t0
     print("[Step 10/10] Save artifact bundle done in %.1fs" % _el, flush=True)

@@ -1,12 +1,12 @@
 {
   "rated": {
     "label": "rated",
-    "val_prauc": 0.1853215731476512,
-    "val_precision": 0.19392890062529583,
-    "val_recall": 0.3057751416534915,
-    "val_f1": 0.23733503050720856,
-    "val_fbeta_05": 0.2092357231460215,
-    "threshold": 0.7769684696097663,
+    "val_ap": 0.1815846846897936,
+    "val_precision": 0.1912532011339204,
+    "val_recall": 0.2742824035430558,
+    "val_f1": 0.225363590519415,
+    "val_fbeta_05": 0.20357842043962035,
+    "threshold": 0.7884809636204453,
     "val_samples": 744001,
     "val_positives": 101833,
     "val_random_ap": 0.13687212786004319,
@@ -18,17 +18,17 @@
       "min_child_samples": 20
     },
     "_uncalibrated": false,
-    "train_prauc": 0.19831450157357156,
-    "train_precision": 0.20680606861956624,
-    "train_recall": 0.32212825679385615,
-    "train_f1": 0.2518954629262975,
+    "train_ap": 0.18764969836377324,
+    "train_precision": 0.19896807242739864,
+    "train_recall": 0.28534302099677905,
+    "train_f1": 0.2344532332180752,
     "train_samples": 3546124,
     "train_positives": 470977,
     "train_random_ap": 0.132814588547947,
-    "test_prauc": 0.1864453300558444,
-    "test_precision": 0.195681231997289,
-    "test_recall": 0.3134278850503081,
-    "test_f1": 0.24093834753784224,
+    "test_ap": 0.1826257200677873,
+    "test_precision": 0.19332183426219257,
+    "test_recall": 0.2827706132459517,
+    "test_f1": 0.2296433556729223,
     "test_samples": 736321,
     "test_positives": 99487,
     "test_random_ap": 0.13511362571487165,
@@ -37,87 +37,67 @@
       {
         "rank": 1,
         "feature": "minutes_since_run_start",
-        "importance_gain_pct": 70.81
+        "importance_gain_pct": 76.98
       },
       {
         "rank": 2,
         "feature": "cum_bets",
-        "importance_gain_pct": 5.06
+        "importance_gain_pct": 5.61
       },
       {
         "rank": 3,
         "feature": "cum_wager",
-        "importance_gain_pct": 3.88
+        "importance_gain_pct": 4.54
       },
       {
         "rank": 4,
         "feature": "loss_streak",
-        "importance_gain_pct": 3.75
+        "importance_gain_pct": 4.22
       },
       {
         "rank": 5,
         "feature": "time_of_day_cos",
-        "importance_gain_pct": 2.47
+        "importance_gain_pct": 2.22
       },
       {
         "rank": 6,
-        "feature": "days_since_last_session",
-        "importance_gain_pct": 2.42
+        "feature": "time_of_day_sin",
+        "importance_gain_pct": 2.19
       },
       {
         "rank": 7,
-        "feature": "time_of_day_sin",
-        "importance_gain_pct": 2.35
+        "feature": "avg_wager_sofar",
+        "importance_gain_pct": 1.46
       },
       {
         "rank": 8,
-        "feature": "days_since_first_session",
-        "importance_gain_pct": 2.34
+        "feature": "wager",
+        "importance_gain_pct": 0.77
       },
       {
         "rank": 9,
-        "feature": "sessions_7d",
-        "importance_gain_pct": 1.86
+        "feature": "base_ha",
+        "importance_gain_pct": 0.7
       },
       {
         "rank": 10,
-        "feature": "turnover_sum_7d",
-        "importance_gain_pct": 1.61
+        "feature": "position_idx",
+        "importance_gain_pct": 0.57
       },
       {
         "rank": 11,
-        "feature": "avg_wager_sofar",
-        "importance_gain_pct": 1.3
+        "feature": "is_back_bet",
+        "importance_gain_pct": 0.38
       },
       {
         "rank": 12,
-        "feature": "base_ha",
-        "importance_gain_pct": 0.56
-      },
-      {
-        "rank": 13,
-        "feature": "wager",
-        "importance_gain_pct": 0.51
-      },
-      {
-        "rank": 14,
-        "feature": "position_idx",
-        "importance_gain_pct": 0.5
-      },
-      {
-        "rank": 15,
-        "feature": "is_back_bet",
-        "importance_gain_pct": 0.33
-      },
-      {
-        "rank": 16,
         "feature": "payout_odds",
-        "importance_gain_pct": 0.24
+        "importance_gain_pct": 0.36
       }
     ],
     "importance_method": "gain"
   },
-  "model_version": "20260306-023906-0f7f25b",
+  "model_version": "20260306-120125-c967124",
   "fast_mode": true,
   "sample_rated_n": null,
   "uncalibrated_threshold": {
