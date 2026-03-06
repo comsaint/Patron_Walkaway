@@ -861,3 +861,141 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - **Feature Spec YAML 必須到位**：三軌候選特徵定義的唯一來源
 - 既有 `walkaway_model.pkl` 格式（單模型 `{"model", "features", "threshold"}`）與新 artifact 結構不相容；scorer 需新 artifacts 才能推論
 - `api_server.py` 既有 data-serving routes（`/get_alerts`, `/get_validation`, `/get_floor_status`）完全保留
+
+---
+
+## DuckDB 記憶體預算動態化計畫（2026-03-06）
+
+### 背景
+
+- 目前 `trainer/etl_player_profile.py` 的 `_compute_profile_duckdb()` 在建立 DuckDB 連線後，未設定 `memory_limit`、`threads` 或其他 runtime guard。
+- 在低 RAM 機器上，`player_profile` 的 local Parquet DuckDB ETL 可能在 Step 4 直接 OOM；而 `trainer.py` 既有的 OOM-check 只保護 Step 7，無法覆蓋這條路徑。
+- 若直接寫死 `SET memory_limit='2GB'`，雖可暫時避開部分 OOM，但在不同 RAM 的 PC 上會造成兩種問題：
+  - 高 RAM 機器過度保守，效能被白白限制。
+  - 低 RAM 機器仍可能與 Python / OS 爭搶剩餘記憶體。
+
+### 目標
+
+- 將 DuckDB 的記憶體限制改為依「當前可用 RAM」動態計算，而非固定值。
+- 保持 `build_player_profile()` 可獨立執行，不依賴只有 `trainer.py` 才有的前置流程。
+- 讓低 RAM 機器在 DuckDB 失敗時，仍能清楚地 fallback 到既有 pandas + PyArrow pushdown 路徑。
+- 提供可調參數，但預設值應對不同機器自動適配。
+
+### 變更範圍
+
+- `trainer/config.py`
+- `trainer/etl_player_profile.py`
+- `tests/`（新增記憶體預算與 fallback 行為的單元測試）
+- 可選：`trainer/trainer.py` 共用 RAM helper；若會導致耦合變高，則不強求
+
+### 設計決策
+
+1. **不採用靜態 `memory_limit='2GB'`**
+   - 這只能作為除錯或緊急 workaround，不應是 production / cross-machine 預設。
+
+2. **優先採用「ETL 內自算 RAM budget」**
+   - `player_profile` ETL 不只會從 `trainer.py` 進入，也可能被直接執行。
+   - 因此 `_compute_profile_duckdb()` 或其附近 helper 應能在沒有 trainer context 的情況下，自行讀取當前 available RAM 並計算 DuckDB limit。
+
+3. **保留與 trainer OOM-check 的語義一致性，但不強耦合**
+   - trainer 目前使用 `available_ram * NEG_SAMPLE_RAM_SAFETY` 作為 Step 7 預算。
+   - 新方案可借用相同思路，但不直接依賴 trainer 內部函式，以免 ETL 單獨執行時失效。
+
+### 具體實作步驟
+
+#### Step A — 在 `config.py` 新增 DuckDB runtime budget 參數
+
+新增以下設定，避免把 policy 寫死在 `etl_player_profile.py`：
+
+- `PROFILE_DUCKDB_RAM_FRACTION`
+  - 預設建議：`0.5`
+  - 語意：DuckDB 最多可使用目前 `available_ram` 的多少比例。
+- `PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB`
+  - 預設建議：`0.5`
+  - 語意：避免在極低 available RAM 時算出不合理的小值。
+- `PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB`
+  - 預設建議：`8.0`
+  - 語意：避免高 RAM 機器讓單一 DuckDB 查詢無上限膨脹。
+- `PROFILE_DUCKDB_THREADS`
+  - 預設建議：`2`
+  - 語意：低 RAM / 筆電環境先保守限制執行緒，降低峰值記憶體。
+- `PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER`
+  - 預設建議：`False`
+  - 語意：依 DuckDB OOM 訊息建議，關閉 insertion-order preservation 以減少記憶體壓力。
+
+#### Step B — 在 `etl_player_profile.py` 抽出 DuckDB runtime guard helper
+
+新增小型 helper，責任分離如下：
+
+- `_get_available_ram_bytes() -> Optional[int]`
+  - 優先使用 `psutil.virtual_memory().available`
+  - 若 `psutil` 不存在，回傳 `None`
+- `_compute_profile_duckdb_budget_bytes(available_ram_bytes: Optional[int]) -> Optional[int]`
+  - 若有 available RAM：
+    - `budget = available_ram_bytes * PROFILE_DUCKDB_RAM_FRACTION`
+    - 再 clamp 到 min/max GB 設定
+  - 若無 available RAM：
+    - 使用 `PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB` 與 `MIN_GB` 推導出保守 fallback
+    - 或回傳 `None`，代表不設定 `memory_limit`；二者需選一個，實作時以「保守預設」為優先
+- `_configure_duckdb_runtime(_con, *, budget_bytes, threads, preserve_insertion_order)`
+  - 統一執行：
+    - `SET memory_limit='...GB'`
+    - `SET threads=...`
+    - `SET preserve_insertion_order=false`
+  - 並記錄 log，讓使用者在 terminal 可看到本次實際套用的限制
+
+#### Step C — 在 `_compute_profile_duckdb()` 連線建立後套用 runtime guard
+
+修改流程：
+
+- 在 `_con = duckdb.connect(":memory:")` 後立即呼叫 runtime helper
+- 若已有外部傳入 `con`：
+  - 預設仍套用 guard，確保共享連線也遵守 budget
+  - 但需避免重複 log 太多次；可只在第一次或明確需要時 log
+- 若設定失敗：
+  - 記 warning，保留後續 fallback 路徑，不應讓設定失敗直接中斷整個 profile ETL
+
+#### Step D — 強化 OOM / fallback 日誌
+
+新增或調整 log，至少包含：
+
+- `available_ram`
+- 計算出的 `duckdb memory_limit`
+- `threads`
+- 是否關閉 `preserve_insertion_order`
+- 若 DuckDB query 失敗：
+  - 失敗類型是否為 OOM
+  - 是否將回退到 pandas ETL
+
+目標是讓 terminal 一眼看出：
+
+- 這台機器看到多少可用 RAM
+- DuckDB 實際被限制到多少
+- 失敗時是 budget 不夠、設定未生效，還是 SQL 本身問題
+
+#### Step E — 測試
+
+至少新增以下測試：
+
+- **budget 計算測試**
+  - 模擬不同 available RAM（例如 2 GB、8 GB、32 GB）
+  - 驗證輸出的 `memory_limit` 會按 fraction 計算，且受到 min/max clamp
+- **無 psutil 測試**
+  - 驗證沒有 `psutil` 時仍能得到保守 fallback 行為，而不是直接崩潰
+- **DuckDB runtime 設定測試**
+  - 驗證 helper 會對 connection 執行對應 `SET` 指令
+- **OOM fallback 測試**
+  - 模擬 `_con.execute(...).df()` 拋出 OOM 例外時，`build_player_profile()` 仍會走既有 pandas fallback 邏輯
+
+### 驗收標準
+
+- 在低 RAM 機器上，DuckDB 路徑不再無上限吃滿整機可用記憶體。
+- 在高 RAM 機器上，DuckDB 可自動拿到比 2 GB 更合理的記憶體上限。
+- `player_profile` ETL 單獨執行時，不需要依賴 `trainer.py` 也能動態決定 budget。
+- terminal log 可清楚顯示本次 DuckDB runtime guard 的實際值。
+- DuckDB 失敗時仍能維持既有 pandas fallback 行為。
+
+### 備註
+
+- 若後續發現 trainer 與 profile ETL 都需要相同的 RAM helper，可再抽到共用 utility；但第一步不應為了「共用」而把兩條路徑硬綁在一起。
+- 若實測顯示 `threads=2` 仍過高，可再把 `PROFILE_DUCKDB_THREADS` 納入按 RAM 動態調整，但這屬第二階段優化，先不在第一輪增加複雜度。

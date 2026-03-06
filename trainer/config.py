@@ -185,6 +185,30 @@ PROFILE_USE_DUCKDB: bool = True
 # fallback path; the DuckDB path (PROFILE_USE_DUCKDB=True) never preloads.
 PROFILE_PRELOAD_MAX_BYTES: int = int(1.5 * 1024**3)  # 1.5 GB on disk
 
+# --- DuckDB runtime memory budget (player_profile ETL DuckDB path) ---
+# _configure_duckdb_runtime() in etl_player_profile.py reads these constants
+# at execution time and applies them via SET statements immediately after the
+# DuckDB connection is opened.  The memory limit is computed dynamically:
+#   limit = clamp(available_ram * FRACTION, MIN_GB, MAX_GB)
+# This avoids a hard-coded value while still being portable across machines.
+#
+# FRACTION  – how much of currently available RAM DuckDB may use (0–1).
+#             0.5 leaves the other half for Python, OS, and the pandas fallback.
+# MIN_GB    – floor: prevents an absurdly small limit on very low-RAM machines
+#             (the query will OOM anyway, but at least it fails fast).
+# MAX_GB    – ceiling: prevents a single DuckDB query from monopolising RAM on
+#             high-memory servers where 50% could be many tens of GB.
+# THREADS   – DuckDB worker threads; lower = less peak RAM, slower sort/hash.
+#             2 is a safe default for laptops; raise on dedicated servers.
+# PRESERVE_INSERTION_ORDER – DuckDB default is True (sort output to match
+#             insertion order), which costs extra RAM.  Profile aggregation
+#             output order is non-deterministic anyway, so False is safe here.
+PROFILE_DUCKDB_RAM_FRACTION: float = 0.5
+PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB: float = 0.5
+PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB: float = 8.0
+PROFILE_DUCKDB_THREADS: int = 2
+PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER: bool = False
+
 # --- SQL fragment shared across all modules (FND-03) ---
 CASINO_PLAYER_ID_CLEAN_SQL = (
     "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "

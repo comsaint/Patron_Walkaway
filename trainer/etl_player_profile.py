@@ -215,15 +215,15 @@ def compute_profile_schema_hash(session_parquet: Optional[Path] = None) -> str:
     except ModuleNotFoundError:
         from trainer.features import PROFILE_FEATURE_COLS as _pfc  # type: ignore[import, no-redef]
 
-    # Hash both computation paths so a change to either invalidates the cache.
-    # R98: normalize CRLF -> LF before hashing so the fingerprint is identical
-    # regardless of whether the file was checked out on Windows or Linux.
-    # OPT-002: also include _compute_profile_duckdb + _DUCKDB_ETL_VERSION so
-    # that DuckDB SQL changes trigger an automatic full rebuild.
+    # Hash the pandas aggregation logic so a computation change invalidates cache.
+    # R98: normalize CRLF -> LF so the fingerprint is identical across OS.
+    # OPT-002: _DUCKDB_ETL_VERSION is a manually-bumped string that captures DuckDB
+    # SQL and runtime-guard changes.  We deliberately do NOT hash the full source of
+    # _compute_profile_duckdb to avoid spurious cache invalidation from runtime-only
+    # edits (log messages, connection setup) that don't affect aggregation results.
     _src_pandas = inspect.getsource(_compute_profile).replace("\r\n", "\n").replace("\r", "\n")
-    _src_duckdb = inspect.getsource(_compute_profile_duckdb).replace("\r\n", "\n").replace("\r", "\n")
     compute_source_hash = hashlib.md5(
-        (_src_pandas + _src_duckdb + _DUCKDB_ETL_VERSION).encode("utf-8")
+        (_src_pandas + _DUCKDB_ETL_VERSION).encode("utf-8")
     ).hexdigest()[:8]
 
     # Read raw-data provenance: earliest session date in the source file.
@@ -803,9 +803,102 @@ def _compute_profile(
 # DuckDB-accelerated profile computation (OPT-002)
 # ---------------------------------------------------------------------------
 
-# Bump this string whenever the DuckDB SQL changes so that compute_profile_schema_hash
-# picks up the change and invalidates any stale cached profiles.
-_DUCKDB_ETL_VERSION = "v1"
+# Bump this string whenever the DuckDB SQL or runtime-guard logic changes so that
+# compute_profile_schema_hash picks up the change and invalidates stale profiles.
+# v1   – initial DuckDB ETL implementation
+# v1.1 – Round 108: added dynamic memory-budget guard (_configure_duckdb_runtime)
+_DUCKDB_ETL_VERSION = "v1.1"
+
+
+# ---------------------------------------------------------------------------
+# DuckDB runtime memory-budget helpers (Step A/B/C of DuckDB OOM plan)
+# ---------------------------------------------------------------------------
+
+def _get_available_ram_bytes() -> Optional[int]:
+    """Return currently available system RAM in bytes, or None if unavailable.
+
+    Returns None on ImportError (psutil not installed) and on any runtime
+    error from psutil (e.g. OSError in restricted container environments).
+    """
+    try:
+        import psutil as _psutil  # optional dependency
+        return _psutil.virtual_memory().available
+    except Exception:
+        return None
+
+
+def _compute_duckdb_memory_limit_bytes(available_bytes: Optional[int]) -> int:
+    """Compute a DuckDB memory_limit (bytes) that is safe for the current machine.
+
+    Formula:
+        budget = clamp(available_bytes * PROFILE_DUCKDB_RAM_FRACTION,
+                       PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB * 1 GiB,
+                       PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB * 1 GiB)
+
+    When ``available_bytes`` is None (psutil not installed or failed), the
+    conservative floor (MIN_GB) is returned so the call never crashes.
+
+    Config values are validated and normalised:
+    - FRACTION must be in (0, 1]; invalid values fall back to 0.5 with a warning.
+    - If MIN_GB > MAX_GB the two values are swapped with a warning.
+    """
+    _min = int(getattr(config, "PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB", 0.5) * 1024 ** 3)
+    _max = int(getattr(config, "PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB", 8.0) * 1024 ** 3)
+    frac = getattr(config, "PROFILE_DUCKDB_RAM_FRACTION", 0.5)
+
+    if not (0.0 < frac <= 1.0):
+        logger.warning(
+            "PROFILE_DUCKDB_RAM_FRACTION=%.3f out of valid range (0, 1]; using 0.5",
+            frac,
+        )
+        frac = 0.5
+
+    if _min > _max:
+        logger.warning(
+            "PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB (%.2f GB) > MAX_GB (%.2f GB); swapping",
+            _min / 1024 ** 3,
+            _max / 1024 ** 3,
+        )
+        _min, _max = _max, _min
+
+    if available_bytes is None:
+        return _min
+    budget = int(available_bytes * frac)
+    return max(_min, min(_max, budget))
+
+
+def _configure_duckdb_runtime(con, *, budget_bytes: int) -> None:
+    """Apply memory_limit, threads, and preserve_insertion_order to *con*.
+
+    All policy values come from config (PROFILE_DUCKDB_*).
+    Each SET statement is executed independently so that a failure on one
+    (e.g. unsupported setting in an older DuckDB version) does not silently
+    skip the remaining settings.
+    """
+    threads = max(1, int(getattr(config, "PROFILE_DUCKDB_THREADS", 2)))
+    preserve = getattr(config, "PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER", False)
+    budget_gb = budget_bytes / 1024 ** 3
+
+    _stmts: list[tuple[str, str]] = [
+        (f"SET memory_limit='{budget_gb:.2f}GB'", "memory_limit"),
+        (f"SET threads={threads}", "threads"),
+    ]
+    if not preserve:
+        _stmts.append(("SET preserve_insertion_order=false", "preserve_insertion_order"))
+
+    for _stmt, _label in _stmts:
+        try:
+            con.execute(_stmt)
+        except Exception as exc:
+            logger.warning("DuckDB SET %s failed (non-fatal): %s", _label, exc)
+
+    logger.info(
+        "DuckDB runtime guard: memory_limit=%.2fGB  threads=%d"
+        "  preserve_insertion_order=%s",
+        budget_gb,
+        threads,
+        preserve,
+    )
 
 
 def _compute_profile_duckdb(
@@ -853,6 +946,15 @@ def _compute_profile_duckdb(
             logger.info("duckdb not installed; falling back to pandas ETL path")
             return None
         _con = duckdb.connect(":memory:")
+        # Apply dynamic memory budget so DuckDB does not monopolise all RAM.
+        _avail = _get_available_ram_bytes()
+        _budget = _compute_duckdb_memory_limit_bytes(_avail)
+        logger.info(
+            "DuckDB profile ETL: available_ram=%s  computed_budget=%.2fGB",
+            f"{_avail / 1024 ** 3:.1f}GB" if _avail is not None else "unknown (psutil unavailable)",
+            _budget / 1024 ** 3,
+        )
+        _configure_duckdb_runtime(_con, budget_bytes=_budget)
     else:
         _con = con
 
@@ -1102,12 +1204,28 @@ LEFT JOIN top_table t ON p.canonical_id = t.canonical_id
         _con.register("canonical_map", cmap)
         result_df = _con.execute(sql, [pq_path]).df()
     except Exception as exc:
-        logger.error(
-            "_compute_profile_duckdb SQL failed for snapshot %s: %s",
-            snap_date,
-            exc,
-            exc_info=True,
-        )
+        # Prefer type-based OOM detection; fall back to string matching for
+        # environments where duckdb is not importable at this point.
+        try:
+            import duckdb as _ddb
+            _is_oom = isinstance(exc, _ddb.OutOfMemoryException)
+        except ImportError:
+            _is_oom = "out of memory" in str(exc).lower()
+        if _is_oom:
+            logger.error(
+                "_compute_profile_duckdb OOM for snapshot %s "
+                "(DuckDB memory_limit exhausted — falling back to pandas ETL): %s",
+                snap_date,
+                exc,
+            )
+        else:
+            logger.error(
+                "_compute_profile_duckdb SQL failed for snapshot %s "
+                "(falling back to pandas ETL): %s",
+                snap_date,
+                exc,
+                exc_info=True,
+            )
         return None
     finally:
         if _own_con:

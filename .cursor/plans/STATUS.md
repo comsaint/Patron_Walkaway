@@ -6,6 +6,190 @@
 
 ---
 
+## Round 111 — 修復 Round 109 Review 風險點（使 Round 110 xfail 升 PASSED）
+
+### 目標
+修改 production code，使 Round 110 的 6 個 `expectedFailure` 測試全數升為 `PASSED`，同時保持全套 573 個測試零回歸、零新 lint。
+
+### 修改檔案
+
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/etl_player_profile.py` | 六處修改，詳見下表 |
+| `tests/test_review_risks_round109_duckdb_runtime.py` | 移除 6 個 `@unittest.expectedFailure` 裝飾器（測試斷言正確，裝飾器因修復而過時） |
+
+### Production Code 修改明細
+
+| 對應風險 | 函式 | 修改內容 |
+|---------|------|---------|
+| #1 FRACTION 驗證 | `_compute_duckdb_memory_limit_bytes` | 先提取 `frac` 變數；`if not (0.0 < frac <= 1.0):` 加 warning + fallback 0.5 |
+| #1 MIN/MAX 正規化 | `_compute_duckdb_memory_limit_bytes` | `if _min > _max:` 加 warning + swap |
+| #2 schema hash 副作用 | `compute_profile_schema_hash` | 移除 `inspect.getsource(_compute_profile_duckdb)` 不再 hash 整個函式 source；改依 `_DUCKDB_ETL_VERSION` 追蹤 DuckDB 邏輯變更 |
+| #2 (連帶) | `_DUCKDB_ETL_VERSION` | Bump `"v1"` → `"v1.1"` 明確標記 Round 108 runtime guard 加入 |
+| #3 psutil 健壯性 | `_get_available_ram_bytes` | `except ImportError:` → `except Exception:`（攔截 OSError 等 psutil 執行期失敗） |
+| #4 SET 獨立失敗 | `_configure_duckdb_runtime` | 改為 `list[tuple[stmt, label]]` + for 迴圈，每句 `SET` 各有獨立 try/except；加 `threads = max(1, int(threads))` guard |
+| #6 OOM 偵測 | `_compute_profile_duckdb` except 區塊 | 優先 `isinstance(exc, duckdb.OutOfMemoryException)`；`import duckdb` 失敗時 fallback 字串比對 |
+
+### 測試結果
+
+```
+# 目標測試：
+python -m pytest tests/test_review_risks_round109_duckdb_runtime.py -v
+7 passed in 0.20s   (原 1 passed + 6 xfailed)
+
+# 全套測試 + lint：
+python -m pytest tests/ -q
+573 passed, 1 skipped in 22.18s
+
+ruff check trainer/ tests/
+7 existing errors in unchanged files (test_review_risks_round140.py, test_review_risks_round371.py, trainer/trainer.py)
+Modified files (etl_player_profile.py, config.py, test_review_risks_round109_duckdb_runtime.py): no errors
+```
+
+### 備註
+- Lint 的 7 個 F401 均在本輪未改動的既存檔案，非本輪引入。
+- `_DUCKDB_ETL_VERSION = "v1.1"` 會使下次 run 觸發一次 profile cache 重建（預期行為）。
+
+---
+
+## Round 110 — 將 Round 109 風險轉成最小可重現測試（tests-only）
+
+### 目標與約束
+- 僅新增 tests，不修改任何 production code。
+- 將 Round 109 reviewer 指出的 DuckDB runtime 風險轉成可執行測試 guard。
+- 未修復的風險以 `expectedFailure` 標記，保持 CI 綠燈但持續可見。
+
+### 新增檔案
+- `tests/test_review_risks_round109_duckdb_runtime.py`
+
+### 新增測試清單
+- `test_r109_0_config_should_expose_duckdb_runtime_knobs`
+  - Sanity 檢查 `config.py` 已提供 `PROFILE_DUCKDB_*` 5 個參數。
+- `test_r109_1_fraction_should_be_range_validated` (`expectedFailure`)
+  - 風險 #1：要求 `PROFILE_DUCKDB_RAM_FRACTION` 有 `(0,1]` 範圍驗證與 warning fallback。
+- `test_r109_2_min_max_should_be_normalized` (`expectedFailure`)
+  - 風險 #1：要求 `MIN_GB > MAX_GB` 有 guard（swap 或等效處理）。
+- `test_r109_3_get_available_ram_should_handle_psutil_runtime_errors` (`expectedFailure`)
+  - 風險 #3：要求 `_get_available_ram_bytes` 捕捉 `psutil` 執行期錯誤（非僅 `ImportError`）。
+- `test_r109_4_runtime_set_failure_should_not_skip_later_settings` (`expectedFailure`)
+  - 風險 #4：要求 `SET threads` 失敗時，後續 `SET preserve_insertion_order=false` 仍會執行。
+- `test_r109_5_oom_detection_should_prefer_exception_type` (`expectedFailure`)
+  - 風險 #6：要求 OOM 分支優先使用 `duckdb.OutOfMemoryException` 型別判斷。
+- `test_r109_6_schema_hash_should_not_depend_on_runtime_guard_source` (`expectedFailure`)
+  - 風險 #2：要求 schema hash 不依賴整個 `_compute_profile_duckdb` 函式 source（避免 runtime-only 變更觸發全量 rebuild）。
+
+### 執行方式
+```bash
+python -m pytest "c:\Users\longp\Patron_Walkaway\tests\test_review_risks_round109_duckdb_runtime.py" -q
+```
+
+### 實際執行結果
+```text
+.xxxxxx
+1 passed, 6 xfailed in 0.73s
+```
+
+### 備註
+- 這批是「風險可重現測試」，不是修復；等後續修 production 後，再把對應 `expectedFailure` 移除。
+
+---
+
+## Round 109 Review — Round 108 DuckDB 記憶體預算動態化 Code Review
+
+### Review 範圍
+- `trainer/config.py`：新增 `PROFILE_DUCKDB_*` 參數（5 個）
+- `trainer/etl_player_profile.py`：新增 `_get_available_ram_bytes`、`_compute_duckdb_memory_limit_bytes`、`_configure_duckdb_runtime`；修改 `_compute_profile_duckdb` 的連線建立與 except 區塊
+
+### 發現問題
+
+| # | 嚴重度 | 類型 | 問題摘要 |
+|---|--------|------|---------|
+| 1 | 中 | 邊界條件 | Config 值無驗證：`FRACTION=0`/負/`>1`、`MIN_GB > MAX_GB`、`THREADS=0` 均可產出無效 DuckDB SET |
+| 2 | 中 | 副作用 | `inspect.getsource(_compute_profile_duckdb)` 已因新程式碼改變 → schema hash 變了 → 下次 run 會觸發全量 profile 重建 |
+| 3 | 低 | 健壯性 | `_get_available_ram_bytes` 只捕獲 `ImportError`；`psutil.virtual_memory()` 在受限環境可拋 `OSError` 未被攔截 |
+| 4 | 低 | 健壯性 | `_configure_duckdb_runtime` 三個 `SET` 共用一個 `try/except`；中間某句失敗會跳過後續 SET（例如 `threads` 失敗 → `preserve_insertion_order` 不設） |
+| 5 | 低 | 效能/噪音 | backfill 多 snapshot 時每個 snapshot 都重建連線 + 重複 log（30 次 INFO 級 runtime guard log） |
+| 6 | 極低 | 正確性 | OOM 偵測用字串比對 `"out of memory"` 而非 `duckdb.OutOfMemoryException` 型別 |
+
+### 具體修改建議
+
+**問題 1**：在 `_compute_duckdb_memory_limit_bytes` 開頭驗證 `FRACTION ∈ (0, 1]`（否則 warn + fallback 0.5）、`MIN ≤ MAX`（否則 warn + swap）。在 `_configure_duckdb_runtime` 將 `threads` clamp 至 `max(1, threads)`。
+
+**問題 2**：不改 hash 機制。Bump `_DUCKDB_ETL_VERSION` 到 `"v1.1"`，commit message 明確記錄「hash 變更因 runtime guard 程式碼加入，非聚合邏輯變更」。
+
+**問題 3**：`_get_available_ram_bytes` 的 `except ImportError` 改為 `except Exception`，讓 psutil 任何失敗都安全回傳 `None`。
+
+**問題 4**：將三個 `SET` 改為逐句 try/except，每句獨立 warning，確保一句失敗不影響其餘。
+
+**問題 5**：本輪不改；短期可將重複 log 降為 `DEBUG`（僅第一次 `INFO`），中期考慮 backfill 共享連線。
+
+**問題 6**：在 `except` 內嘗試 `isinstance(exc, duckdb.OutOfMemoryException)`（duckdb 已在上方 try import 過），字串比對留作 fallback。
+
+### 建議新增測試
+
+| 測試名 | 對應問題 | 測試內容 |
+|--------|---------|---------|
+| `test_fraction_zero_clamps_to_safe_default` | #1 | `FRACTION=0` 時應 warn 並使用 0.5 |
+| `test_min_greater_than_max_swaps` | #1 | `MIN_GB=10, MAX_GB=2` 時應 warn + swap |
+| `test_threads_zero_clamps_to_one` | #1 | `THREADS=0` 時 SET 應用 `threads=1` |
+| `test_get_available_ram_psutil_oserror_returns_none` | #3 | mock `psutil.virtual_memory` 拋 `OSError` → 回傳 `None` |
+| `test_partial_set_failure_continues` | #4 | mock `SET threads` 拋錯 → `memory_limit` 和 `preserve_insertion_order` 仍套用 |
+| `test_oom_detection_by_exception_type` | #6 | mock 拋 `duckdb.OutOfMemoryException` → 走 OOM log 分支 |
+
+### 建議修復優先順序
+
+1. 問題 1 + 3 + 4（邊界條件＋健壯性，改動量小，一起修）
+2. 問題 2（bump `_DUCKDB_ETL_VERSION`，一行改動）
+3. 問題 6（OOM 偵測改型別，可選）
+4. 問題 5（log 噪音，非急迫）
+
+---
+
+## Round 108 — DuckDB 記憶體預算動態化（PLAN Step A–D）
+
+### 目標
+解決 `_compute_profile_duckdb()` 無 `memory_limit` 導致 Step 4 OOM 的問題，同時不採用靜態寫死的 `2GB`，改為依當前機器可用 RAM 動態計算。
+
+### 改了哪些檔
+
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/config.py` | 在 `PROFILE_PRELOAD_MAX_BYTES` 後面新增 5 個 DuckDB runtime 參數：`PROFILE_DUCKDB_RAM_FRACTION`（`0.5`）、`PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB`（`0.5`）、`PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB`（`8.0`）、`PROFILE_DUCKDB_THREADS`（`2`）、`PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER`（`False`）。 |
+| `trainer/etl_player_profile.py` | 在 `_compute_profile_duckdb` 定義前新增三個 helper：`_get_available_ram_bytes()`、`_compute_duckdb_memory_limit_bytes()`、`_configure_duckdb_runtime()`；在 `duckdb.connect(":memory:")` 之後立即呼叫三者套用動態 limit；強化 except 區塊以區分 OOM 與其他 SQL 失敗，並在 log 中明確標示 fallback。 |
+
+### 實作要點
+
+- `_get_available_ram_bytes()`：呼叫 `psutil.virtual_memory().available`；若 psutil 未安裝回傳 `None`，不崩潰。
+- `_compute_duckdb_memory_limit_bytes(available_bytes)`：`budget = clamp(available * 0.5, 0.5 GB, 8 GB)`；`available` 為 None 時直接回傳 0.5 GB（保守下限）。
+- `_configure_duckdb_runtime(con, *, budget_bytes)`：依序執行 `SET memory_limit=...`、`SET threads=2`、`SET preserve_insertion_order=false`；任何 SET 失敗都只 warning 不中止。
+- OOM log 改為明確說明「DuckDB memory_limit exhausted — falling back to pandas ETL」，非 OOM 錯誤仍輸出完整 traceback。
+- **外部傳入 `con` 的路徑**（共享連線）本輪不套用 runtime guard，以免干擾 caller 的連線狀態；僅對 `_own_con=True` 時的新連線套用。
+
+### 手動驗證方法
+
+1. 跑 `python -m trainer.trainer --days 3 --use-local-parquet`，觀察 Step 4 log 應出現：
+   ```
+   INFO DuckDB profile ETL: available_ram=X.XGB  computed_budget=Y.YYGB
+   INFO DuckDB runtime guard: memory_limit=Y.YYGB  threads=2  preserve_insertion_order=False
+   ```
+2. 若仍 OOM（budget 不夠），log 應改為：
+   ```
+   ERROR _compute_profile_duckdb OOM for snapshot 2026-01-31 (DuckDB memory_limit exhausted — falling back to pandas ETL): ...
+   ```
+   而非原本的 `SQL failed` 訊息，可確認 fallback 判斷正確。
+3. 在低 RAM 機器（available ≈ 3 GB）驗證 computed_budget ≈ 1.5 GB（= 3 × 0.5）；在高 RAM 機器（available ≈ 30 GB）驗證 computed_budget = 8.0 GB（受 MAX_GB 截斷）。
+4. 移除 psutil（或在 Python 中 mock ImportError），重跑確認 log 顯示 `available_ram=unknown (psutil unavailable)` 且 `computed_budget=0.50GB`。
+
+### 尚未實作（下一輪建議）
+
+**Step E — 測試**（PLAN 優先度最高的遺漏項）：
+- `test_compute_duckdb_memory_limit_bytes`：模擬 2 GB / 8 GB / 32 GB available_ram，驗證 clamp 行為。
+- `test_get_available_ram_bytes_no_psutil`：mock `ImportError`，確認回傳 `None`。
+- `test_configure_duckdb_runtime_calls_set`：mock DuckDB connection，確認三個 `SET` 指令都被呼叫。
+- `test_compute_profile_duckdb_oom_fallback`：mock `_con.execute` 拋出 OOM，確認 `build_player_profile()` fallback 到 pandas 路徑且不崩潰。
+
+---
+
 ## Round 107 — Trainer Step 9 日誌格式：train → valid → test
 
 ### 變更摘要

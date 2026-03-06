@@ -454,13 +454,13 @@ def load_local_parquet(
 
     if not sess_path.exists():
         raise FileNotFoundError(
-            f"Local Parquet files not found in {LOCAL_PARQUET_DIR}. "
-            "Export ClickHouse tables first or run without --use-local-parquet."
+            f"Session Parquet missing: {sess_path}. "
+            "Export ClickHouse t_session to data/ (gmwds_t_session.parquet) or run without --use-local-parquet."
         )
     if not sessions_only and not bets_path.exists():
         raise FileNotFoundError(
-            f"Local Parquet files not found in {LOCAL_PARQUET_DIR}. "
-            "Export ClickHouse tables first or run without --use-local-parquet."
+            f"Bet Parquet missing: {bets_path}. "
+            "Export ClickHouse t_bet to data/ (gmwds_t_bet.parquet) or run without --use-local-parquet."
         )
 
     logger.info("Reading local Parquet: %s%s", LOCAL_PARQUET_DIR, " (sessions only)" if sessions_only else "")
