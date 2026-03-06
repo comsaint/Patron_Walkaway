@@ -173,6 +173,18 @@ TRAIN_SPLIT_FRAC = 0.70   # fraction of rows allocated to training
 VALID_SPLIT_FRAC = 0.15   # fraction of rows allocated to validation; test = remainder
 MIN_VALID_TEST_ROWS = 50  # warn if valid or test set falls below this count
 
+# ── player_profile ETL (OPT-002) ──────────────────────────────────────────────
+# When True, build_player_profile() reads the session Parquet directly in DuckDB
+# instead of loading the full table into pandas memory.  Set False to force the
+# pandas fallback path (useful for debugging or environments without DuckDB).
+PROFILE_USE_DUCKDB: bool = True
+
+# Threshold for the preload OOM guard in backfill().
+# If the session Parquet on-disk size exceeds this, the preload is skipped and
+# per-snapshot PyArrow pushdown is used instead.  Only applies to the pandas
+# fallback path; the DuckDB path (PROFILE_USE_DUCKDB=True) never preloads.
+PROFILE_PRELOAD_MAX_BYTES: int = int(1.5 * 1024**3)  # 1.5 GB on disk
+
 # --- SQL fragment shared across all modules (FND-03) ---
 CASINO_PLAYER_ID_CLEAN_SQL = (
     "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "

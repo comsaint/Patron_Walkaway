@@ -215,12 +215,16 @@ def compute_profile_schema_hash(session_parquet: Optional[Path] = None) -> str:
     except ModuleNotFoundError:
         from trainer.features import PROFILE_FEATURE_COLS as _pfc  # type: ignore[import, no-redef]
 
-    # Hash the source of _compute_profile so that changes to aggregation logic
-    # (not just column names or version string) also invalidate the cache.
+    # Hash both computation paths so a change to either invalidates the cache.
     # R98: normalize CRLF -> LF before hashing so the fingerprint is identical
     # regardless of whether the file was checked out on Windows or Linux.
-    _src = inspect.getsource(_compute_profile).replace("\r\n", "\n").replace("\r", "\n")
-    compute_source_hash = hashlib.md5(_src.encode("utf-8")).hexdigest()[:8]
+    # OPT-002: also include _compute_profile_duckdb + _DUCKDB_ETL_VERSION so
+    # that DuckDB SQL changes trigger an automatic full rebuild.
+    _src_pandas = inspect.getsource(_compute_profile).replace("\r\n", "\n").replace("\r", "\n")
+    _src_duckdb = inspect.getsource(_compute_profile_duckdb).replace("\r\n", "\n").replace("\r", "\n")
+    compute_source_hash = hashlib.md5(
+        (_src_pandas + _src_duckdb + _DUCKDB_ETL_VERSION).encode("utf-8")
+    ).hexdigest()[:8]
 
     # Read raw-data provenance: earliest session date in the source file.
     # When the local session parquet is replaced with a more complete historical
@@ -311,19 +315,28 @@ def _filter_ts_etl(dt: datetime, parquet_path: Path, col: str) -> "pd.Timestamp"
         return ts.tz_localize(None) if ts.tzinfo is None else ts.replace(tzinfo=None)
 
 
-def _load_sessions_local(snapshot_dtm: datetime) -> Optional[pd.DataFrame]:
+def _load_sessions_local(
+    snapshot_dtm: datetime,
+    max_lookback_days: int = MAX_LOOKBACK_DAYS,
+) -> Optional[pd.DataFrame]:
     """Dev fallback: load t_session from a local Parquet export and apply DQ filters.
 
     Uses PyArrow pushdown filters on ``session_start_dtm`` to restrict the
     rows read from disk to the relevant time window, avoiding a full-table
     load (OOM fix for 8 GB machines).  Falls back to full-table read if the
     target column is absent from the schema.
+
+    Parameters
+    ----------
+    max_lookback_days:
+        Horizon limit (R373-5).  Controls the lower bound of the pushdown
+        window.  Defaults to ``MAX_LOOKBACK_DAYS`` (365).
     """
     t_session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
     if not t_session_path.exists():
         return None
     try:
-        lo_dtm = snapshot_dtm - timedelta(days=MAX_LOOKBACK_DAYS + 30)
+        lo_dtm = snapshot_dtm - timedelta(days=max_lookback_days + 30)
 
         # Build pushdown filter on session_start_dtm to avoid full-table read.
         # We use session_start_dtm as the filter column because it is always
@@ -404,7 +417,9 @@ def _load_sessions_local(snapshot_dtm: datetime) -> Optional[pd.DataFrame]:
                 | (df.get("num_games_with_wager", 0).fillna(0) > 0)
             )
         )
-        df = df[mask].drop_duplicates(subset=["session_id"])
+        # FND-01: keep the most-recently-updated row per session_id (matches
+        # ClickHouse and DuckDB ROW_NUMBER ORDER BY lud_dtm DESC behaviour).
+        df = df[mask].sort_values("lud_dtm", ascending=False, na_position="last").drop_duplicates(subset=['session_id'], keep="first")
         logger.info("_load_sessions_local: %d rows from local Parquet", len(df))
         return df
     except Exception as exc:
@@ -447,7 +462,9 @@ def _preload_sessions_local() -> Optional[pd.DataFrame]:
                 | (df.get("num_games_with_wager", pd.Series(0, index=df.index)).fillna(0) > 0)
             )
         )
-        df = df[dq_mask].drop_duplicates(subset=["session_id"]).copy()
+        # FND-01: keep the most-recently-updated row per session_id (matches
+        # ClickHouse and DuckDB ROW_NUMBER ORDER BY lud_dtm DESC behaviour).
+        df = df[dq_mask].sort_values("lud_dtm", ascending=False, na_position="last").drop_duplicates(subset=['session_id'], keep="first").copy()
         df["__avail_time"] = avail_time[df.index].values
         logger.info(
             "_preload_sessions_local: %d rows loaded (DQ applied, avail_time cached)", len(df)
@@ -783,6 +800,348 @@ def _compute_profile(
 
 
 # ---------------------------------------------------------------------------
+# DuckDB-accelerated profile computation (OPT-002)
+# ---------------------------------------------------------------------------
+
+# Bump this string whenever the DuckDB SQL changes so that compute_profile_schema_hash
+# picks up the change and invalidates any stale cached profiles.
+_DUCKDB_ETL_VERSION = "v1"
+
+
+def _compute_profile_duckdb(
+    session_parquet_path: Path,
+    canonical_map: pd.DataFrame,
+    snapshot_dtm: datetime,
+    max_lookback_days: int = 365,
+    con: "Optional[object]" = None,
+) -> Optional[pd.DataFrame]:
+    """Compute player_profile for one snapshot_dtm using DuckDB on Parquet.
+
+    Replaces the pandas pipeline (_load_sessions_local → D2 join → FND-12
+    → _compute_profile) with a single DuckDB SQL execution.  Only the
+    aggregated result (one row per canonical_id) is returned to Python,
+    eliminating the full-table pandas DataFrame load (~GB RAM).
+
+    Parameters
+    ----------
+    con:
+        Optional pre-opened ``duckdb.DuckDBPyConnection`` for backfill reuse
+        (R-OPT002-4).  When ``None`` (default) this function opens and closes
+        its own in-memory connection.  Pass a persistent connection to amortise
+        connection-setup cost across many snapshots in ``backfill()``.
+
+    Assumptions
+    -----------
+    - Session timestamps in the Parquet are tz-naive HK local time, which is
+      what the existing pandas pipeline produces via ``tz_localize(None)``.
+      If they are stored as UTC the window boundaries are still consistent
+      (both sides shifted identically) but ``session_date`` may differ by
+      ±1 day relative to the pandas path at midnight boundaries.
+    - DuckDB >= 0.6 (SELECT * EXCLUDE, FILTER WHERE, read_parquet($1)).
+
+    Returns
+    -------
+    DataFrame with the same schema as ``_compute_profile()``, or ``None``
+    when DuckDB is unavailable, the parquet is missing, or the query fails.
+    Falls back gracefully; callers should re-try the pandas path on ``None``.
+    """
+    _own_con = con is None
+    if _own_con:
+        try:
+            import duckdb  # optional dependency; not in base requirements
+        except ImportError:
+            logger.info("duckdb not installed; falling back to pandas ETL path")
+            return None
+        _con = duckdb.connect(":memory:")
+    else:
+        _con = con
+
+    if not session_parquet_path.exists():
+        return None
+
+    if canonical_map is None or canonical_map.empty:
+        logger.warning("_compute_profile_duckdb: empty canonical_map; skipping")
+        return None
+
+    # ── Timestamp pre-computation (tz-naive, matching existing behaviour) ──
+    snap_ts = pd.Timestamp(snapshot_dtm)
+    if snap_ts.tzinfo is not None:
+        snap_ts = snap_ts.replace(tzinfo=None)
+    snap_date = snap_ts.date()
+
+    # Coarse load window: MAX_LOOKBACK_DAYS + 30-day buffer for availability lag
+    _load_lo = snap_ts - pd.Timedelta(days=MAX_LOOKBACK_DAYS + 30)
+    # Upper bound: sessions that start after snapshot_dtm + avail delay could
+    # not yet be available, so exclude them to avoid reading future rows.
+    _load_hi = snap_ts + pd.Timedelta(minutes=SESSION_AVAIL_DELAY_MIN)
+
+    def _ts(t: pd.Timestamp) -> str:
+        """ISO-8601 string safe for embedding in DuckDB TIMESTAMP literals."""
+        return t.strftime("%Y-%m-%d %H:%M:%S")
+
+    snap_m = {d: snap_ts - pd.Timedelta(days=d) for d in (7, 30, 90, 180, 365)}
+
+    # ── Prepare canonical_map (VARCHAR player_id for safe join) ─────────────
+    cmap = canonical_map[["player_id", "canonical_id"]].drop_duplicates().copy()
+    cmap["player_id"] = cmap["player_id"].astype(str)
+
+    # R-OPT002-2: path is bound as a positional parameter ($1) to prevent
+    # SQL-injection from file-system paths containing quote characters.
+    pq_path = str(session_parquet_path).replace("\\", "/")
+    avail_delay = SESSION_AVAIL_DELAY_MIN
+
+    sql = f"""
+WITH
+-- ── Step 1: Read & coarse-filter from Parquet ─────────────────────────────
+sessions_raw AS (
+    SELECT
+        session_id,
+        CAST(player_id AS VARCHAR)                               AS player_id,
+        session_start_dtm, session_end_dtm, lud_dtm, gaming_day,
+        table_id, pit_name, gaming_area,
+        COALESCE(TRY_CAST(turnover             AS DOUBLE), 0.0) AS turnover,
+        COALESCE(TRY_CAST(player_win           AS DOUBLE), 0.0) AS player_win,
+        COALESCE(TRY_CAST(theo_win             AS DOUBLE), 0.0) AS theo_win,
+        COALESCE(TRY_CAST(num_bets             AS DOUBLE), 0.0) AS num_bets,
+        COALESCE(TRY_CAST(num_games_with_wager AS DOUBLE), 0.0) AS num_games_with_wager,
+        is_manual, is_deleted, is_canceled
+    FROM read_parquet($1)
+    WHERE TRY_CAST(session_start_dtm AS TIMESTAMP)
+              >= TIMESTAMP '{_ts(_load_lo)}'
+      AND TRY_CAST(session_start_dtm AS TIMESTAMP)
+              <= TIMESTAMP '{_ts(_load_hi)}'
+),
+-- ── Step 2: DQ filters + dedup (FND-01/02/03/04) ─────────────────────────
+sessions_dq AS (
+    SELECT *,
+        -- Availability time: COALESCE(end, lud) + SESSION_AVAIL_DELAY_MIN minutes
+        COALESCE(
+            TRY_CAST(session_end_dtm AS TIMESTAMP),
+            TRY_CAST(lud_dtm        AS TIMESTAMP)
+        ) + INTERVAL '{avail_delay}' MINUTE                  AS avail_time,
+        -- session_ts for window membership (same COALESCE, no delay)
+        COALESCE(
+            TRY_CAST(session_end_dtm AS TIMESTAMP),
+            TRY_CAST(lud_dtm        AS TIMESTAMP)
+        )                                                    AS session_ts,
+        CAST(COALESCE(
+            TRY_CAST(session_end_dtm AS TIMESTAMP),
+            TRY_CAST(lud_dtm        AS TIMESTAMP)
+        ) AS DATE)                                           AS session_date,
+        TRY_CAST(session_start_dtm AS TIMESTAMP)             AS session_start_ts,
+        -- FND-01 dedup: keep only the most-recently-updated row per session_id
+        ROW_NUMBER() OVER (
+            PARTITION BY session_id
+            ORDER BY TRY_CAST(lud_dtm AS TIMESTAMP) DESC NULLS LAST
+        )                                                    AS _rn
+    FROM sessions_raw
+    WHERE COALESCE(CAST(is_manual   AS INTEGER), 0) = 0
+      AND COALESCE(CAST(is_deleted  AS INTEGER), 0) = 0
+      AND COALESCE(CAST(is_canceled AS INTEGER), 0) = 0
+      AND (turnover > 0 OR num_games_with_wager > 0)
+),
+sessions_deduped AS (
+    SELECT * EXCLUDE (_rn) FROM sessions_dq WHERE _rn = 1
+),
+-- ── Step 3: Availability gate ─────────────────────────────────────────────
+sessions_avail AS (
+    SELECT * FROM sessions_deduped
+    WHERE avail_time <= TIMESTAMP '{_ts(snap_ts)}'
+      AND avail_time >= TIMESTAMP '{_ts(_load_lo)}'
+),
+-- ── Step 4: D2 inner join (rated players only) ────────────────────────────
+sessions_with_cid AS (
+    SELECT s.*, c.canonical_id
+    FROM sessions_avail s
+    INNER JOIN canonical_map c ON s.player_id = c.player_id
+),
+-- ── Step 5: FND-12 — exclude dummy / test players ─────────────────────────
+valid_cids AS (
+    SELECT canonical_id
+    FROM sessions_with_cid
+    GROUP BY canonical_id
+    HAVING SUM(num_games_with_wager) > 1
+),
+sessions_final AS (
+    SELECT s.*
+    FROM sessions_with_cid s
+    INNER JOIN valid_cids v ON s.canonical_id = v.canonical_id
+),
+-- ── Step 6: Per-table turnover for top_table_share ────────────────────────
+tbl_stats AS (
+    SELECT canonical_id, table_id,
+        SUM(turnover) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[30])}') AS tbl_to_30d,
+        SUM(turnover) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[90])}') AS tbl_to_90d
+    FROM sessions_final
+    GROUP BY canonical_id, table_id
+),
+top_table AS (
+    SELECT canonical_id,
+        MAX(tbl_to_30d) AS max_tbl_30d,
+        MAX(tbl_to_90d) AS max_tbl_90d
+    FROM tbl_stats
+    GROUP BY canonical_id
+),
+-- ── Step 7: Main profile aggregation ──────────────────────────────────────
+profile_agg AS (
+    SELECT
+        canonical_id,
+        -- Recency
+        DATE_DIFF('day', MAX(session_date), DATE '{snap_date}') AS days_since_last_session,
+        DATE_DIFF('day', MIN(session_date), DATE '{snap_date}') AS days_since_first_session,
+        -- Frequency
+        COUNT(*) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[7])}')   AS sessions_7d,
+        COUNT(*) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[30])}')  AS sessions_30d,
+        COUNT(*) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[90])}')  AS sessions_90d,
+        COUNT(*) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[180])}') AS sessions_180d,
+        COUNT(*) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[365])}') AS sessions_365d,
+        COUNT(DISTINCT session_date) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[30])}')  AS active_days_30d,
+        COUNT(DISTINCT session_date) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[90])}')  AS active_days_90d,
+        COUNT(DISTINCT session_date) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[365])}') AS active_days_365d,
+        -- Monetary: turnover
+        SUM(turnover) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[7])}')   AS turnover_sum_7d,
+        SUM(turnover) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[30])}')  AS turnover_sum_30d,
+        SUM(turnover) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[90])}')  AS turnover_sum_90d,
+        SUM(turnover) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[180])}') AS turnover_sum_180d,
+        SUM(turnover) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[365])}') AS turnover_sum_365d,
+        -- Monetary: player_win
+        SUM(player_win) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[30])}')  AS player_win_sum_30d,
+        SUM(player_win) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[90])}')  AS player_win_sum_90d,
+        SUM(player_win) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[180])}') AS player_win_sum_180d,
+        SUM(player_win) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[365])}') AS player_win_sum_365d,
+        -- Monetary: theo_win, num_bets, num_games_with_wager (30d + 180d only)
+        SUM(theo_win)             FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[30])}')  AS theo_win_sum_30d,
+        SUM(theo_win)             FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[180])}') AS theo_win_sum_180d,
+        SUM(num_bets)             FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[30])}')  AS num_bets_sum_30d,
+        SUM(num_bets)             FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[180])}') AS num_bets_sum_180d,
+        SUM(num_games_with_wager) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[30])}')  AS num_games_with_wager_sum_30d,
+        SUM(num_games_with_wager) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[180])}') AS num_games_with_wager_sum_180d,
+        -- Win / loss flag
+        AVG(CASE WHEN player_win > 0 THEN 1.0 ELSE 0.0 END)
+            FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[30])}')  AS win_session_rate_30d,
+        AVG(CASE WHEN player_win > 0 THEN 1.0 ELSE 0.0 END)
+            FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[180])}') AS win_session_rate_180d,
+        -- Session duration: EPOCH(interval)/60.0 preserves sub-second precision
+        -- (DATE_DIFF truncates to integer seconds — R-OPT002-5 fix).
+        AVG(EPOCH(session_ts - session_start_ts) / 60.0)
+            FILTER (WHERE session_ts      >= TIMESTAMP '{_ts(snap_m[30])}'
+                      AND session_start_ts IS NOT NULL
+                      AND TRY_CAST(session_end_dtm AS TIMESTAMP) IS NOT NULL)
+            AS avg_session_duration_min_30d,
+        AVG(EPOCH(session_ts - session_start_ts) / 60.0)
+            FILTER (WHERE session_ts      >= TIMESTAMP '{_ts(snap_m[180])}'
+                      AND session_start_ts IS NOT NULL
+                      AND TRY_CAST(session_end_dtm AS TIMESTAMP) IS NOT NULL)
+            AS avg_session_duration_min_180d,
+        -- Venue stickiness
+        COUNT(DISTINCT table_id)    FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[30])}')  AS distinct_table_cnt_30d,
+        COUNT(DISTINCT table_id)    FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[90])}')  AS distinct_table_cnt_90d,
+        COUNT(DISTINCT pit_name)    FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[30])}')  AS distinct_pit_cnt_30d,
+        COUNT(DISTINCT gaming_area) FILTER (WHERE session_ts >= TIMESTAMP '{_ts(snap_m[30])}')  AS distinct_gaming_area_cnt_30d
+    FROM sessions_final
+    GROUP BY canonical_id
+)
+-- ── Step 8: Derived columns + top_table join ──────────────────────────────
+SELECT
+    p.canonical_id,
+    -- Recency (cast to DOUBLE for schema parity with pandas path)
+    CAST(p.days_since_last_session  AS DOUBLE) AS days_since_last_session,
+    CAST(p.days_since_first_session AS DOUBLE) AS days_since_first_session,
+    -- Frequency
+    CAST(p.sessions_7d   AS DOUBLE) AS sessions_7d,
+    CAST(p.sessions_30d  AS DOUBLE) AS sessions_30d,
+    CAST(p.sessions_90d  AS DOUBLE) AS sessions_90d,
+    CAST(p.sessions_180d AS DOUBLE) AS sessions_180d,
+    CAST(p.sessions_365d AS DOUBLE) AS sessions_365d,
+    CAST(p.active_days_30d  AS DOUBLE) AS active_days_30d,
+    CAST(p.active_days_90d  AS DOUBLE) AS active_days_90d,
+    CAST(p.active_days_365d AS DOUBLE) AS active_days_365d,
+    -- Monetary (already DOUBLE from SUM of DOUBLE)
+    p.turnover_sum_7d,   p.turnover_sum_30d,  p.turnover_sum_90d,
+    p.turnover_sum_180d, p.turnover_sum_365d,
+    p.player_win_sum_30d,  p.player_win_sum_90d,
+    p.player_win_sum_180d, p.player_win_sum_365d,
+    p.theo_win_sum_30d,  p.theo_win_sum_180d,
+    p.num_bets_sum_30d,  p.num_bets_sum_180d,
+    p.num_games_with_wager_sum_30d, p.num_games_with_wager_sum_180d,
+    -- Bet intensity (derived)
+    p.turnover_sum_30d  / NULLIF(p.num_bets_sum_30d,  0) AS turnover_per_bet_mean_30d,
+    p.turnover_sum_180d / NULLIF(p.num_bets_sum_180d, 0) AS turnover_per_bet_mean_180d,
+    -- Win / loss & RTP
+    p.win_session_rate_30d,
+    p.win_session_rate_180d,
+    1.0 + p.player_win_sum_30d  / NULLIF(p.turnover_sum_30d,  0) AS actual_rtp_30d,
+    1.0 + p.player_win_sum_180d / NULLIF(p.turnover_sum_180d, 0) AS actual_rtp_180d,
+    -- Actual vs theo ratio
+    p.player_win_sum_30d / NULLIF(p.theo_win_sum_30d, 0) AS actual_vs_theo_ratio_30d,
+    -- Short / long ratios (both windows must be present; NULLIF guards div-by-zero)
+    (p.turnover_sum_30d  / NULLIF(p.num_bets_sum_30d,  0))
+        / NULLIF(p.turnover_sum_180d / NULLIF(p.num_bets_sum_180d, 0), 0)
+                                                AS turnover_per_bet_30d_over_180d,
+    p.turnover_sum_30d  / NULLIF(p.turnover_sum_180d, 0) AS turnover_30d_over_180d,
+    CAST(p.sessions_30d AS DOUBLE)
+        / NULLIF(CAST(p.sessions_180d AS DOUBLE), 0)     AS sessions_30d_over_180d,
+    -- Session duration
+    p.avg_session_duration_min_30d,
+    p.avg_session_duration_min_180d,
+    -- Venue stickiness (cast to DOUBLE)
+    CAST(p.distinct_table_cnt_30d       AS DOUBLE) AS distinct_table_cnt_30d,
+    CAST(p.distinct_table_cnt_90d       AS DOUBLE) AS distinct_table_cnt_90d,
+    CAST(p.distinct_pit_cnt_30d         AS DOUBLE) AS distinct_pit_cnt_30d,
+    CAST(p.distinct_gaming_area_cnt_30d AS DOUBLE) AS distinct_gaming_area_cnt_30d,
+    -- Top table share
+    t.max_tbl_30d / NULLIF(p.turnover_sum_30d, 0) AS top_table_share_30d,
+    t.max_tbl_90d / NULLIF(p.turnover_sum_90d, 0) AS top_table_share_90d
+FROM profile_agg p
+LEFT JOIN top_table t ON p.canonical_id = t.canonical_id
+"""
+
+    try:
+        # canonical_map registered as a virtual table; pq_path bound as $1 to
+        # prevent SQL injection from paths that contain quote characters.
+        _con.register("canonical_map", cmap)
+        result_df = _con.execute(sql, [pq_path]).df()
+    except Exception as exc:
+        logger.error(
+            "_compute_profile_duckdb SQL failed for snapshot %s: %s",
+            snap_date,
+            exc,
+            exc_info=True,
+        )
+        return None
+    finally:
+        if _own_con:
+            _con.close()
+
+    if result_df.empty:
+        logger.warning("_compute_profile_duckdb: no results for snapshot %s", snap_date)
+        return None
+
+    # Apply max_lookback_days masking (same semantics as _compute_profile pandas path)
+    try:
+        from features import _PROFILE_FEATURE_MIN_DAYS as _pmin  # type: ignore[import]
+    except ModuleNotFoundError:
+        from trainer.features import _PROFILE_FEATURE_MIN_DAYS as _pmin  # type: ignore[import, no-redef]
+
+    for col, min_days in _pmin.items():
+        if min_days > max_lookback_days and col in result_df.columns:
+            result_df[col] = float("nan")
+
+    # Add metadata columns to match _compute_profile output schema
+    result_df["snapshot_date"] = snap_date
+    result_df["snapshot_dtm"] = snapshot_dtm
+    result_df["profile_version"] = PROFILE_VERSION
+
+    logger.info(
+        "_compute_profile_duckdb: %d canonical_ids, %d columns for snapshot %s",
+        len(result_df),
+        len(result_df.columns),
+        snap_date,
+    )
+    return result_df
+
+
+# ---------------------------------------------------------------------------
 # Write helpers
 # ---------------------------------------------------------------------------
 
@@ -921,6 +1280,68 @@ def build_player_profile(
     ) + timedelta(days=1, minutes=SESSION_AVAIL_DELAY_MIN)
     logger.info("Building player_profile for %s (snapshot_dtm=%s)", snapshot_date, snapshot_dtm)
 
+    # OPT-002: DuckDB path for local Parquet — reads the session parquet in-process
+    # via DuckDB SQL, skipping the full-table pandas load.  Only active when:
+    #   • use_local_parquet=True (no preloaded sessions available)
+    #   • config.PROFILE_USE_DUCKDB=True
+    #   • the session parquet file exists
+    _t_session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+    _use_duckdb = (
+        use_local_parquet
+        and preloaded_sessions is None
+        and getattr(config, "PROFILE_USE_DUCKDB", False)
+        and _t_session_path.exists()
+    )
+    if _use_duckdb:
+        # Ensure canonical_map is available; DuckDB path does the D2 join internally.
+        _cmap_for_ddb = canonical_map
+        if _cmap_for_ddb is None:
+            _d2_path = LOCAL_PARQUET_DIR / "canonical_mapping.parquet"
+            if _d2_path.exists():
+                try:
+                    _cmap_for_ddb = pd.read_parquet(_d2_path)
+                except Exception as _exc:
+                    logger.warning(
+                        "Failed to load canonical_mapping.parquet for DuckDB path: %s; "
+                        "falling back to pandas ETL",
+                        _exc,
+                    )
+                    _cmap_for_ddb = None
+            else:
+                logger.warning(
+                    "No canonical_mapping.parquet; DuckDB path requires it; "
+                    "falling back to pandas ETL"
+                )
+                _cmap_for_ddb = None
+
+        if _cmap_for_ddb is not None and not _cmap_for_ddb.empty:
+            # Restrict canonical_map to whitelist when provided (reduces DuckDB join size)
+            _cmap_ddb = _cmap_for_ddb
+            if canonical_id_whitelist is not None:
+                _cmap_ddb = _cmap_for_ddb[
+                    _cmap_for_ddb["canonical_id"].astype(str).isin(canonical_id_whitelist)
+                ].copy()
+            profile_df = _compute_profile_duckdb(
+                session_parquet_path=_t_session_path,
+                canonical_map=_cmap_ddb,
+                snapshot_dtm=snapshot_dtm,
+                max_lookback_days=max_lookback_days,
+            )
+            if profile_df is not None:
+                _persist_local_parquet(
+                    profile_df,
+                    canonical_id_whitelist=canonical_id_whitelist,
+                    max_lookback_days=max_lookback_days,
+                    sched_tag=sched_tag,
+                )
+                return profile_df
+            logger.warning(
+                "DuckDB profile build returned None for %s; falling back to pandas ETL",
+                snapshot_date,
+            )
+
+    # ── Original pandas path (ClickHouse, preloaded sessions, or DuckDB fallback) ──
+
     # 1. Load sessions
     sessions_raw: Optional[pd.DataFrame] = None
     if preloaded_sessions is not None:
@@ -928,7 +1349,9 @@ def build_player_profile(
         # avoiding a full Parquet read on every iteration.
         sessions_raw = _filter_preloaded_sessions(preloaded_sessions, snapshot_dtm)
     elif use_local_parquet:
-        sessions_raw = _load_sessions_local(snapshot_dtm)
+        sessions_raw = _load_sessions_local(
+            snapshot_dtm, max_lookback_days=max_lookback_days
+        )
     if sessions_raw is None:
         if get_clickhouse_client is None:
             logger.error("ClickHouse client unavailable and no local Parquet; aborting")
@@ -977,6 +1400,23 @@ def build_player_profile(
     if sessions_with_cid.empty:
         logger.warning("No sessions matched canonical_id mapping for %s", snapshot_date)
         return None
+
+    # 3b. Apply canonical_id whitelist in pandas path for parity with DuckDB path.
+    # R-OPT002-6: DuckDB path already filters canonical_map before the SQL join;
+    # this ensures the pandas fallback produces identical coverage.
+    if canonical_id_whitelist is not None:
+        sessions_with_cid = sessions_with_cid[
+            sessions_with_cid["canonical_id"].astype(str).isin(canonical_id_whitelist)
+        ]
+        logger.info(
+            "Pandas path: whitelist filter applied, %d canonical_ids remaining",
+            sessions_with_cid["canonical_id"].nunique(),
+        )
+        if sessions_with_cid.empty:
+            logger.warning(
+                "No sessions remain after whitelist filter for %s", snapshot_date
+            )
+            return None
 
     # 4. FND-12: exclude dummy players
     sessions_clean = _exclude_fnd12_dummies(sessions_with_cid)
@@ -1107,7 +1547,9 @@ def backfill(
     #
     # R112: whitelist or snapshot schedule triggers preload.
     # When preload_sessions=False (--no-preload), skip regardless.
-    _MAX_PRELOAD_BYTES: int = int(1.5 * 1024**3)  # 1.5 GB on disk
+    # R373-4: read threshold from config so it can be tuned without code changes.
+    # Falls back to 1.5 GB if the constant has not yet been added to config.
+    PROFILE_PRELOAD_MAX_BYTES: int = getattr(config, "PROFILE_PRELOAD_MAX_BYTES", int(1.5 * 1024**3))
     _t_session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
 
     _wants_preload = preload_sessions and use_local_parquet and (
@@ -1125,13 +1567,24 @@ def backfill(
             )
         else:
             _file_size = _t_session_path.stat().st_size
-            if _file_size > _MAX_PRELOAD_BYTES:
+            # R373-3: Dynamic RAM check — compare file size against available
+            # physical memory so the guard still fires on machines with plenty of
+            # disk but limited RAM (e.g. 8 GB laptops with a 2 GB Parquet file).
+            try:
+                import psutil
+                _avail_ram = psutil.virtual_memory().available
+                _ram_ok = _file_size * 3 <= _avail_ram
+            except ImportError:
+                _avail_ram = float("inf")
+                _ram_ok = True
+            if _file_size > PROFILE_PRELOAD_MAX_BYTES or not _ram_ok:
                 logger.warning(
-                    "backfill: session parquet size (%.1f GB) exceeds OOM-safe preload "
-                    "limit (%.1f GB on disk).  Disabling preload — each snapshot date "
-                    "will use per-day PyArrow pushdown read (safe for low-RAM machines).",
+                    "backfill: session parquet size (%.1f GB) or available RAM "
+                    "(%.1f GB) may be insufficient for safe preload.  "
+                    "Disabling preload — each snapshot will use per-day PyArrow "
+                    "pushdown read (safe for low-RAM machines).",
                     _file_size / (1024**3),
-                    _MAX_PRELOAD_BYTES / (1024**3),
+                    (_avail_ram / (1024**3)) if _avail_ram != float("inf") else float("nan"),
                 )
             # R112: one of these must be True (guaranteed by _wants_preload above);
             # written explicitly here so source readers and guards can confirm

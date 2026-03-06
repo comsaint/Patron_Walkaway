@@ -20,13 +20,18 @@ import trainer.trainer as trainer_mod
 class TestR373Opt001RiskGuards(unittest.TestCase):
     """Guardrails for OPT-001 follow-up risks (#1-#5 from review)."""
 
-    @unittest.expectedFailure
     def test_r373_1_anchor_clamp_should_emit_explicit_warning(self):
-        """Risk #1: session-range clamp should warn when it invalidates ideal anchor."""
+        """Risk #1: session-range clamp should warn when it invalidates ideal anchor.
+
+        Uses re.DOTALL so the pattern can span the assignment and the following
+        warning call, which are on separate lines in the source.
+        """
         src = inspect.getsource(trainer_mod.ensure_player_profile_ready)
-        self.assertRegex(
-            src,
-            r"required_start\s*=\s*max\(\s*required_start\s*,\s*session_rng\[0\]\s*\).*logger\.warning",
+        self.assertTrue(
+            re.search(
+                r"required_start\s*=\s*max\(\s*required_start\s*,\s*session_rng\[0\]\s*\)[\s\S]*?logger\.warning",
+                src,
+            ),
             "When session_rng[0] pushes required_start forward, code should emit a clear warning.",
         )
 
@@ -39,7 +44,6 @@ class TestR373Opt001RiskGuards(unittest.TestCase):
             "fast_mode is dead in ensure_player_profile_ready and should be removed from signature.",
         )
 
-    @unittest.expectedFailure
     def test_r373_3_preload_oom_guard_should_consider_available_ram(self):
         """Risk #3: preload OOM guard should use available RAM (psutil), not only on-disk bytes."""
         src = inspect.getsource(etl_mod.backfill)
@@ -48,7 +52,6 @@ class TestR373Opt001RiskGuards(unittest.TestCase):
             "Expected psutil.virtual_memory()-based guard in backfill preload decision.",
         )
 
-    @unittest.expectedFailure
     def test_r373_4_preload_limit_should_be_config_driven(self):
         """Risk #4: preload byte threshold should be configurable via config.py."""
         self.assertTrue(
@@ -62,7 +65,6 @@ class TestR373Opt001RiskGuards(unittest.TestCase):
             "backfill should read preload threshold from config instead of local hardcode.",
         )
 
-    @unittest.expectedFailure
     def test_r373_5_load_sessions_local_should_accept_max_lookback_days(self):
         """Risk #5: _load_sessions_local should respect caller's horizon, not fixed 365-day constant."""
         sig = inspect.signature(etl_mod._load_sessions_local)

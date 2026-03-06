@@ -47,7 +47,7 @@ isProject: false
 > - **三軌特徵工程**（DEC-022/023/024）：Track Profile（`player_profile_daily`）、Track LLM（DuckDB + Feature Spec YAML）、Track Human（向量化手寫狀態機）。
 > - **閾值策略**（DEC-009/010）：**F1 最大化**，無 precision/alert volume 門檻約束。
 > - **Track Human Phase 1**：`loss_streak`、`run_boundary` 啟用；`table_hc` 延至 Phase 2。
-> - **DuckDB 為核心計算引擎**（DEC-023）：取代 Featuretools DFS，用於 Track LLM 特徵計算。
+> - **DuckDB 為核心計算引擎**（DEC-023）：取代 Featuretools DFS，用於 Track LLM；並作為 `player_profile` **local Parquet ETL** 的目標加速引擎。**ClickHouse path 先維持現狀**（SQL → Python/pandas → 聚合）。
 > - **Feature Spec YAML**（DEC-024）：集中管理三軌候選特徵定義。
 > - **DEC-021**：無卡客 volume logging 規格。
 
@@ -62,7 +62,7 @@ isProject: false
 - 模型：Phase 1 = **LightGBM 單一模型（Rated only）**
 - 評估口徑：**Bet-level**（SSOT §10；Run-level 延後見 DEC-012）
 - 術語：**Run**（bet-derived 連續下注段；gap ≥ RUN_BREAK_MIN 切分；DEC-013）
-- 特徵計算引擎：**DuckDB**（DEC-023；Track LLM 核心）
+- 特徵計算引擎：**DuckDB**（DEC-023；Track LLM 核心，且規劃用於 `player_profile` 的 local Parquet ETL；ClickHouse ETL path 暫不改）
 
 ---
 
@@ -360,6 +360,9 @@ def compute_labels(
 - 建置前必須套用 §5 DQ（FND-01/02/03/04/09/12）
 - Non-rated 不計算 Track Profile
 - 完整欄位清單見 `doc/player_profile_daily_spec.md`
+- **實作策略（OPT-002）**：
+  - **Local Parquet path**：改為 DuckDB 直接掃描 `t_session` Parquet、套用 DQ / D2 / FND-12，並在 DuckDB 內完成 profile 聚合後才將結果拉回 Python。
+  - **ClickHouse path**：**維持現狀**，仍由 ClickHouse SQL 抽取 session 結果到 Python/pandas，再沿用既有聚合邏輯；本次不做 DuckDB 化。
 
 ```python
 def join_player_profile_daily(
@@ -490,7 +493,8 @@ def get_train_valid_test_split(chunks: list, train_frac=0.7, valid_frac=0.15) ->
 11. **Feature importance**：per-model feature ranking（gain/SHAP），記錄 importance_method
 12. **輸出原子 artifact bundle**：`model.pkl` + `feature_list.json` + `features_active.yaml` + `reason_code_map.json` + `training_metrics.json` + `model_version`
 
-**離線資料源**：允許以本機 Parquet（DuckDB 掃描）取代 ClickHouse，但必須套用完全相同的 DQ/去重/available_time 規則。Production 資料來源仍以 ClickHouse 為準。
+**離線資料源**：允許以本機 Parquet 取代 ClickHouse，但必須套用完全相同的 DQ/去重/available_time 規則。  
+**OPT-002 補充**：DuckDB 化的範圍先限定在 **local Parquet 的 `player_profile` ETL**；Production / ClickHouse path 仍以現有 SQL → Python/pandas 聚合為準，不在本輪變更。
 
 **TRN-07 快取驗證**：快取 key = `(window_start, window_end, data_hash)`
 
@@ -677,11 +681,11 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 | 面向 | Normal Mode | Fast Mode (`--fast-mode`) |
 |------|-------------|---------------------------|
-| **資料時間範圍** | 全量（含 profile 365 天 lookback） | 僅 effective window 內 |
+| **資料時間範圍** | 全量訓練視窗 | 僅 effective window 內 |
 | **Canonical mapping** | effective window 內的 sessions | 同左 |
-| **Profile snapshot 日期範圍** | `effective_start - 365d` → `effective_end` | `effective_start` → `effective_end` |
+| **Profile snapshot 日期範圍** | `latest_month_end_on_or_before(effective_start)` → `effective_end` | 同左 |
 | **Profile 特徵窗口** | 7d / 30d / 90d / 180d / 365d 全部計算 | **動態**：只計算 ≤ `data_horizon_days` 的窗口 |
-| **Profile snapshot 頻率** | 每天 | 每 7 天 |
+| **Profile snapshot 頻率** | 每月最後一天（month-end） | 同左 |
 | **Optuna 超參搜索** | OPTUNA_N_TRIALS 次 | 跳過，使用 default HP |
 | **模型 artifact** | 正常輸出 | metadata 標記 `fast_mode=True` |
 
@@ -758,13 +762,19 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 ---
 
-## player_profile_daily 改為每月最後一天更新（DEC-019）
+## player_profile_daily 月結更新 + DuckDB ETL 方向（DEC-019 / OPT-002）
 
-**目標**：將 snapshot 更新頻率從每日改為每月最後一天，Profile ETL 約 4.5h → 約 12min。
+**目標**：
+
+- 將 snapshot 更新頻率從每日改為每月最後一天（DEC-019）
+- 將 `player_profile` 的 **local Parquet ETL** 改為 DuckDB 掃描 / 聚合，消除 pandas 全表載入造成的 OOM 與長時間等待
+- **ClickHouse path 維持現狀**，本輪不調整
 
 - PIT 語意不變
 - Profile 為 30d/90d/365d 長期聚合，snapshot 月結後特徵最多落後約一個月
 - 月結日期以 HK 時間為準
+- `ensure_player_profile_ready` 的 snapshot 覆蓋範圍以 `latest_month_end_on_or_before(effective_start)` 為起點，避免為首個部分月份遺漏 anchor snapshot，也避免無效地回補整整 365 天的舊快照
+- DuckDB rollout scope：**只覆蓋 local Parquet path**；ClickHouse path 仍走現有 SQL → Python/pandas → 聚合流程
 
 ---
 

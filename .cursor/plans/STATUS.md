@@ -3110,3 +3110,241 @@ Exit code: **0**
 | 3 | `test_r373_3` | preload OOM 改用 `psutil.virtual_memory().available` |
 | 4 | `test_r373_4` | `_MAX_PRELOAD_BYTES` 移到 `config.py` |
 | 5 | `test_r373_5` | `_load_sessions_local` 接受 `max_lookback_days` |
+
+---
+
+## Round OPT-002 Phase A + R373 Clean-up（本輪）
+
+### 已改動的檔案
+
+| 檔案 | 變更內容 |
+|---|---|
+| `tests/test_review_risks_round373.py` | R373-1 test: 移除 `@expectedFailure`；修 regex 改用 `re.search(..., re.DOTALL)` 語意（`[\s\S]*?`）讓 pattern 跨行匹配 |
+| `tests/test_review_risks_round373.py` | R373-4 test: 移除 `@expectedFailure`（production fix 已完成） |
+| `trainer/trainer.py` | `ensure_player_profile_ready`：`required_start = max(...)` 後加 `logger.warning`，當 session range clamp 使 anchor 往後移時警告（R373-1 production fix） |
+| `trainer/config.py` | 新增 `PROFILE_USE_DUCKDB: bool = True`；新增 `PROFILE_PRELOAD_MAX_BYTES: int = 1.5 GB`（OPT-002 + R373-4） |
+| `trainer/etl_player_profile.py` | 新增 `_DUCKDB_ETL_VERSION = "v1"` 常數 |
+| `trainer/etl_player_profile.py` | 新增 `_compute_profile_duckdb(session_parquet_path, canonical_map, snapshot_dtm, max_lookback_days)` — 完整 DuckDB SQL ETL 函數（OPT-002 Phase A） |
+| `trainer/etl_player_profile.py` | `build_player_profile()`：DuckDB 路徑注入（條件：`use_local_parquet=True` + `PROFILE_USE_DUCKDB=True` + session parquet exists + `preloaded_sessions is None`） |
+| `trainer/etl_player_profile.py` | `compute_profile_schema_hash()`：加入 `_compute_profile_duckdb` 源碼雜湊，SQL 變動自動 invalidate cache |
+| `trainer/etl_player_profile.py` | `backfill()`：`_MAX_PRELOAD_BYTES` → `PROFILE_PRELOAD_MAX_BYTES = getattr(config, ...)` 讀自 config（R373-4） |
+
+### OPT-002 Phase A 設計摘要
+
+`_compute_profile_duckdb()` 的 8 個 CTE：
+
+1. **sessions_raw** — `read_parquet()` + `session_start_dtm` 時間範圍 pushdown（MAX_LOOKBACK_DAYS+30 天窗口）
+2. **sessions_dq** — DQ filter（FND-02/03/04：`is_manual/deleted/canceled=0` + `turnover>0 or ngw>0`） + 計算 `avail_time / session_ts / session_date / session_start_ts` + FND-01 `ROW_NUMBER()` dedup
+3. **sessions_deduped** — 保留 `_rn=1`
+4. **sessions_avail** — availability gate（`avail_time <= snap_ts`，`avail_time >= load_lo`）
+5. **sessions_with_cid** — INNER JOIN `canonical_map`（D2 join）
+6. **valid_cids / sessions_final** — FND-12 exclusion（`HAVING SUM(ngw) > 1`）
+7. **tbl_stats / top_table** — per-table turnover 30d/90d（for `top_table_share`）
+8. **profile_agg + final SELECT** — 全部 42 個 PROFILE_FEATURE_COLS 聚合 + 衍生欄位（比率、RTP、top_table_share）
+
+`build_player_profile()` 注入邏輯：DuckDB 成功 → 直接 persist + return；DuckDB 失敗（`None`）→ 自動 fallback 到原有 pandas 路徑（`_load_sessions_local` → D2 join → FND-12 → `_compute_profile`）。
+
+### 手動驗證
+
+```bash
+# 1. 完整測試套件
+python -m pytest tests/ -v
+# 預期結果：558 passed, 1 skipped, 2 xfailed（R373-3, R373-5）
+
+# 2. 快速驗證 R373
+python -m pytest tests/test_review_risks_round373.py -v
+# 預期：test_r373_1 PASSED, test_r373_2 PASSED, test_r373_3 XFAIL, test_r373_4 PASSED, test_r373_5 XFAIL
+
+# 3. 確認 DuckDB import 可用
+python -c "import duckdb; print(duckdb.__version__)"
+
+# 4. 確認 config 新增常數
+python -c "import trainer.config as c; print(c.PROFILE_USE_DUCKDB, c.PROFILE_PRELOAD_MAX_BYTES)"
+
+# 5. （有真實 parquet 時）實際跑 Step 4 計時
+python -m trainer.trainer --days 7 --use-local-parquet --skip-optuna 2>&1 | grep "Building player_profile"
+```
+
+### 測試結果
+
+| 測試 | 結果 |
+|---|---|
+| 全套 558 tests | **558 passed, 1 skipped, 2 xfailed** |
+| R373-1 anchor clamp warning | **PASSED**（由 xfail 升為 pass） |
+| R373-2 drop fast_mode | **PASSED**（原本已 pass） |
+| R373-3 psutil OOM guard | **xfailed**（Phase B 待做） |
+| R373-4 config-driven preload limit | **PASSED**（由 xfail 升為 pass） |
+| R373-5 _load_sessions_local max_lookback | **xfailed**（Phase B 待做） |
+
+### 剩餘 xfailed 風險點現況
+
+| # | 測試 | 狀態 | 說明 |
+|---|---|---|---|
+| 3 | `test_r373_3` | xfail — Phase B | DuckDB path 啟用後 preload 幾乎不再觸發；pandas fallback 路徑仍有舊 guard；可在 Phase B 加入 psutil 或移除 |
+| 5 | `test_r373_5` | xfail — Phase B | `_load_sessions_local` 仍為 DuckDB fallback；接受 `max_lookback_days` 可在 Phase B 加入 |
+
+### 下一步建議
+
+1. **OPT-002 Phase B**：`backfill()` 偵測 DuckDB 可用時跳過 preload 邏輯（preload 與 DuckDB 互斥）；移除或大幅簡化 `_load_sessions_local` 的冗長 preload 邏輯
+2. **實測比較**：在真實 parquet 上執行一次 snapshot（`backfill_one_snapshot_date`）分別用 DuckDB 路徑和 pandas 路徑，比較：行數 / 欄位數 / 各欄位相對差異 / 執行時間
+3. **R373-3/5 Phase B 修正**：若 Phase B cleanup 保留 pandas fallback，可加入 psutil guard（R373-3）和 `max_lookback_days` 參數（R373-5）
+
+---
+
+## OPT-002 Phase A Self-Review（Round R-OPT002）
+
+### 已發現問題
+
+| 編號 | 類型 | 嚴重度 | 摘要 |
+|---|---|---|---|
+| R-OPT002-1 | Bug | 中 | FND-01 dedup 語意不一致（pandas `drop_duplicates` 保留 Parquet 物理順序第一筆；DuckDB/ClickHouse 用 `ROW_NUMBER ORDER BY lud_dtm DESC` 保留最新） |
+| R-OPT002-2 | 安全性 | 中 | SQL f-string 路徑注入：`read_parquet('{pq_path}')` 若路徑含 `'` 會語法錯誤或注入 |
+| R-OPT002-3 | 安全性 | 高 | **缺少 DuckDB vs pandas 數值 parity 測試**：42 個 feature column 的聚合邏輯無自動驗證 |
+| R-OPT002-4 | 效能 | 中 | 每 snapshot 開新 DuckDB connection，backfill N 個 snapshot = N 次 Parquet 全掃（無 connection reuse） |
+| R-OPT002-5 | Bug | 低 | `avg_session_duration_min` 子秒截斷：DuckDB `DATE_DIFF('second',...)` 丟棄毫秒，pandas `total_seconds()` 保留 |
+| R-OPT002-6 | 邊界條件 | 中 | DuckDB path 的 whitelist 剪裁 canonical_map 只 profile N 人；pandas fallback 仍 profile 全部 rated players，同一 backfill 混合路徑時行數不一致 |
+
+### 每個問題的修改建議
+
+**R-OPT002-1**：`_load_sessions_local` 改為 `df.sort_values("lud_dtm", ascending=False, na_position="last").drop_duplicates(subset=["session_id"], keep="first")`，同步 `_preload_sessions_local`。三路徑統一保留最新 lud_dtm row。
+
+**R-OPT002-2**：改用 DuckDB 參數綁定 `con.execute("CREATE VIEW v AS SELECT * FROM read_parquet($1)", [pq_path])`，或至少 escape 單引號 `pq_path.replace("'", "''")`。
+
+**R-OPT002-3**：新增 `tests/test_opt002_duckdb_parity.py`，用 synthetic session Parquet（~100 rows、3 canonical_ids、含 edge case：NULL lud_dtm、重複 session_id、ngw=0/1 的 FND-12 邊界）分別跑 `_compute_profile` 和 `_compute_profile_duckdb`，`pd.testing.assert_frame_equal(rtol=1e-4)` 驗證所有 42 features + metadata columns。
+
+**R-OPT002-4**：`_compute_profile_duckdb` 加 `con: Optional[DuckDBPyConnection] = None` 參數；若 `con` 為 None 則 self-managed（現行為），否則使用呼叫端提供的 persistent connection。`backfill()` 在 DuckDB mode 時一次性建立 connection，所有 snapshot 共享。
+
+**R-OPT002-5**：DuckDB SQL 改用 `EPOCH(session_ts - session_start_ts) / 60.0`（保留子秒精度）替代 `DATE_DIFF('second', ...) / 60.0`。
+
+**R-OPT002-6**：在 pandas fallback path（`build_player_profile` 的 Step 2 D2 join 後）也加入 whitelist 篩選：若 `canonical_id_whitelist is not None`，只保留 whitelist 內的 canonical_ids。
+
+### 希望新增的測試
+
+| 測試 | 驗證 |
+|---|---|
+| `test_load_sessions_local_dedup_keeps_latest_lud_dtm` | R-OPT002-1：pandas dedup 保留最新 lud_dtm |
+| `test_compute_profile_duckdb_path_with_special_chars` | R-OPT002-2：路徑含空白/引號不破壞 SQL |
+| `test_duckdb_pandas_parity` (integration) | R-OPT002-3：42 features 數值對比 |
+| `test_backfill_duckdb_connection_reuse` | R-OPT002-4：backfill 只建一次 connection |
+| `test_avg_duration_preserves_sub_second` | R-OPT002-5：duration 子秒精度 |
+| `test_whitelist_consistent_across_paths` | R-OPT002-6：兩路徑 profile 相同 canonical_ids |
+
+### 建議修復順序
+
+1. **R-OPT002-3**（parity 測試）→ 先寫測試，發現其他 bug 才能 catch
+2. **R-OPT002-1**（dedup 修正）→ 修完後 parity test 應自動 pass
+3. **R-OPT002-5**（EPOCH 修正）→ 微調 SQL
+4. **R-OPT002-6**（whitelist 一致性）→ 小改動
+5. **R-OPT002-2**（路徑 escape）→ 防禦性改動
+6. **R-OPT002-4**（connection reuse）→ 效能優化，改動面最大
+
+---
+
+## Round R-OPT002 Risk Guards（tests-only）
+
+### 本輪改動（僅 tests）
+
+| 檔案 | 說明 |
+|---|---|
+| `tests/test_review_risks_opt002.py` | 新增 6 個最小可重現風險測試（R-OPT002-1 ~ R-OPT002-6），全部以 `@unittest.expectedFailure` 標記，避免阻斷 CI 並持續可見 |
+
+### 新增測試項目
+
+| 測試 | 對應風險 | 類型 |
+|---|---|---|
+| `test_r_opt002_1_local_pandas_dedup_should_keep_latest_lud` | R-OPT002-1 | source guard |
+| `test_r_opt002_2_duckdb_parquet_path_should_be_parameterized` | R-OPT002-2 | source guard |
+| `test_r_opt002_3_duckdb_vs_pandas_minimal_parity` | R-OPT002-3 | minimal integration repro |
+| `test_r_opt002_4_duckdb_compute_should_accept_reused_connection` | R-OPT002-4 | signature guard |
+| `test_r_opt002_5_duration_should_use_subsecond_expression` | R-OPT002-5 | source guard |
+| `test_r_opt002_6_pandas_fallback_should_filter_whitelist` | R-OPT002-6 | source guard |
+
+### 執行方式
+
+```bash
+# 只跑本輪新增測試
+python -m pytest tests/test_review_risks_opt002.py -v
+```
+
+### 執行結果（本機）
+
+| 測試檔 | 結果 |
+|---|---|
+| `tests/test_review_risks_opt002.py` | **6 xfailed**, 0 failed |
+
+### 備註
+
+- 本輪遵守「tests-only」要求，未修改任何 production code。
+- 這 6 個測試可作為後續修復 R-OPT002 風險的驗收門檻；修正完成後可逐項移除 `expectedFailure`。
+
+---
+
+## OPT-002 Phase B — 修復所有 xfail，全套 PASS（2026-03-06）
+
+### 背景
+指令：「不要改 tests（除非測試本身錯）。請修改實作直到所有 tests/typecheck/lint 通過。」
+基準：558 passed, 1 skipped, **8 xfailed**（R373-3/5 + R-OPT002-1~6）
+
+### Production code 修改彙整
+
+| 風險 | 修改位置 | 改動內容 |
+|---|---|---|
+| R-OPT002-1 | `_load_sessions_local` | `drop_duplicates` 前先 `sort_values("lud_dtm", ascending=False)`，保留最新 lud 行（FND-01 語意對齊 ClickHouse/DuckDB） |
+| R-OPT002-1 | `_preload_sessions_local` | 同上 |
+| R-OPT002-2 | `_compute_profile_duckdb` SQL | `FROM read_parquet('{pq_path}')` → `FROM read_parquet($1)`；路徑改由 `con.execute(sql, [pq_path])` 參數綁定，消除 SQL injection 風險 |
+| R-OPT002-4 | `_compute_profile_duckdb` 簽名 | 新增 `con: Optional[object] = None`；`None` 時自建連線並 close，非 None 時 reuse 外部連線（可供 `backfill` 跨 snapshot 共享） |
+| R-OPT002-5 | `_compute_profile_duckdb` SQL | `DATE_DIFF('second', ...)` → `EPOCH(session_ts - session_start_ts) / 60.0`（保留子秒精度，EPOCH 回傳 DOUBLE） |
+| R-OPT002-6 | `build_player_profile` | 在 pandas fallback 路徑 Step 3b 加入 `if canonical_id_whitelist is not None: sessions_with_cid = sessions_with_cid[...]`，與 DuckDB 路徑行為一致 |
+| R373-3 | `backfill` | 加入 `import psutil; _avail_ram = psutil.virtual_memory().available`；OOM 守衛改為同時檢查 file size 與可用 RAM（`_file_size * 3 > _avail_ram`） |
+| R373-5 | `_load_sessions_local` 簽名 | 新增 `max_lookback_days: int = MAX_LOOKBACK_DAYS` 參數，下推視窗長度改由呼叫方傳入 |
+| R373-5 | `build_player_profile` | 呼叫 `_load_sessions_local(snapshot_dtm, max_lookback_days=max_lookback_days)` 轉發 horizon |
+
+### 測試修改彙整（僅移除已修正的 `@expectedFailure` / 修正測試 bug）
+
+| 檔案 | 修改 | 原因 |
+|---|---|---|
+| `tests/test_review_risks_opt002.py` | 移除 R-OPT002-1 ~ -6 的 `@expectedFailure` | 對應 production 修復完成 |
+| `tests/test_review_risks_opt002.py` | R-OPT002-3 inline pandas：加入 `sort_values("lud_dtm")` before `drop_duplicates` | 測試本身有 bug：inline code 沿用舊的 first-row 語意，導致 parity 永遠不可能通過；這是測試 bug，符合「除非測試本身錯」條件 |
+| `tests/test_review_risks_round373.py` | 移除 R373-3、R373-5 的 `@expectedFailure` | 對應 production 修復完成 |
+
+### 最終執行結果
+
+```bash
+python -m pytest tests/ -v
+```
+
+| 指標 | 修復前 | 修復後 |
+|---|---|---|
+| passed | 558 | **566** |
+| skipped | 1 | 1 |
+| xfailed | 8 | **0** |
+| failed | 0 | 0 |
+
+**566 passed, 1 skipped, 0 xfailed — 全套綠燈。**
+
+### 手動驗證方式
+
+```bash
+# 完整套件
+python -m pytest tests/ -v
+
+# 僅跑本次修復相關測試
+python -m pytest tests/test_review_risks_opt002.py tests/test_review_risks_round373.py -v
+
+# 驗證 DuckDB $1 參數化與 EPOCH 精度
+python -c "
+import duckdb, tempfile, pandas as pd, pathlib
+td = tempfile.mkdtemp()
+pq = pathlib.Path(td) / 'test.parquet'
+pd.DataFrame({'x': [1,2,3]}).to_parquet(pq)
+con = duckdb.connect(':memory:')
+print(con.execute('SELECT count(*) FROM read_parquet(\$1)', [str(pq).replace(chr(92),'/')]).fetchone())
+print(con.execute(\"SELECT EPOCH(TIMESTAMP '2025-12-31 10:30:45.500' - TIMESTAMP '2025-12-31 10:00:00') AS secs\").fetchone())
+"
+```
+
+### 下一步建議
+
+1. **Performance（R-OPT002-4 進階）**：在 `backfill` 迴圈中建立一個共享 DuckDB connection，並傳入 `_compute_profile_duckdb(con=shared_con)`，可進一步節省跨 snapshot 的 connection 初始化成本。
+2. **Regression base**：現在 8 個新增 guard 全為 PASS，後續任何人修改 dedup、duration、whitelist 邏輯都會立即被偵測。
+3. **Parity 擴充**：R-OPT002-3 目前只驗證 `turnover_sum_30d`；可逐步擴充驗證更多 feature columns 以強化回歸保護。

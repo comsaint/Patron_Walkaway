@@ -956,7 +956,17 @@ def ensure_player_profile_ready(
         ["gaming_day", "session_end_dtm", "lud_dtm", "session_start_dtm"],
     )
     if session_rng:
+        _pre_clamp_start = required_start
         required_start = max(required_start, session_rng[0])
+        if required_start > _pre_clamp_start:
+            logger.warning(
+                "OPT-001 anchor clamp: session parquet starts at %s, which is after the "
+                "ideal anchor snapshot date %s.  Bets between %s and the first available "
+                "month-end snapshot may have NaN profile features.",
+                session_rng[0],
+                _pre_clamp_start,
+                window_start.date(),
+            )
         required_end = min(required_end, session_rng[1])
 
     if required_start > required_end:
