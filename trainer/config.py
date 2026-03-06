@@ -115,7 +115,8 @@ HIST_AVG_BET_CAP = 500_000       # Winsorization cap for avg_bet (F2; validate w
 # --- Chunk concat memory guard (OOM risk when loading all chunk Parquets) ---
 # If total size of chunk Parquet files exceeds this, pipeline logs a RAM warning.
 # Pandas typically uses ~2–3x on-disk size in RAM when loading Parquet.
-CHUNK_CONCAT_MEMORY_WARN_BYTES = int(2 * (1024**3))  # 2 GB on-disk total
+# 1 GB: fire warning earlier so desktop users can reduce --days before Step 7 OOM.
+CHUNK_CONCAT_MEMORY_WARN_BYTES = int(1 * (1024**3))  # 1 GB on-disk total
 CHUNK_CONCAT_RAM_FACTOR = 3  # rough factor: on-disk size × this ≈ peak RAM for full_df
 
 # --- Row-level train/valid/test split ratios (SSOT §9.2, todo-row-level-time-split) ---

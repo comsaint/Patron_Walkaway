@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import gc
 import os
 import hashlib
 import json
@@ -90,7 +91,7 @@ try:
     TPROFILE: str = getattr(_cfg, "TPROFILE", "player_profile")
     HK_TZ_STR: str = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     TRAINER_DAYS: int = getattr(_cfg, "TRAINER_DAYS", 30)
-    CHUNK_CONCAT_MEMORY_WARN_BYTES: int = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 2 * (1024**3))
+    CHUNK_CONCAT_MEMORY_WARN_BYTES: int = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 1 * (1024**3))
     CHUNK_CONCAT_RAM_FACTOR: float = getattr(_cfg, "CHUNK_CONCAT_RAM_FACTOR", 3)
     TRAIN_SPLIT_FRAC: float = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
     VALID_SPLIT_FRAC: float = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
@@ -116,7 +117,7 @@ except ModuleNotFoundError:
     TPROFILE = getattr(_cfg, "TPROFILE", "player_profile")
     HK_TZ_STR = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     TRAINER_DAYS = getattr(_cfg, "TRAINER_DAYS", 30)
-    CHUNK_CONCAT_MEMORY_WARN_BYTES = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 2 * (1024**3))
+    CHUNK_CONCAT_MEMORY_WARN_BYTES = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 1 * (1024**3))
     CHUNK_CONCAT_RAM_FACTOR = getattr(_cfg, "CHUNK_CONCAT_RAM_FACTOR", 3)
     TRAIN_SPLIT_FRAC = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
     VALID_SPLIT_FRAC = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
@@ -2602,6 +2603,7 @@ def run_pipeline(args) -> None:
         )
         if path is not None:
             chunk_paths.append(path)
+        gc.collect()  # Release chunk memory before loading next (OOM quick win)
 
     _el = time.perf_counter() - t0
     print("[Step 6/10] Process chunks done in %.1fs (%d chunks)" % (_el, len(chunk_paths)), flush=True)
