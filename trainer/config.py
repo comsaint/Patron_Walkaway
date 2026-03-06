@@ -127,14 +127,29 @@ CHUNK_CONCAT_RAM_FACTOR = 15  # on-disk size × this × (1 + TRAIN_SPLIT_FRAC) �
 # to this fraction before writing each chunk Parquet.  Combined with
 # class_weight='balanced' and per-run sample_weight, LightGBM compensates for
 # the reduced negative count automatically.
-# 1.0 = disabled (keep all negatives, original behaviour).
-# Recommended: 0.3 when training on 90+ days of data to avoid Step 7 OOM.
+# 1.0 = disabled (keep all negatives, original behaviour). When 1.0, the OOM
+# pre-check (see below) may still auto-reduce the effective fraction if RAM looks tight.
+# Recommended: 0.3 when training on 90+ days of data to avoid Step 7 OOM,
+# or just leave it at 1.0 and let the OOM pre-check auto-adjust.
 # Example: 30 days × 27M rows → ~10M rows with NEG_SAMPLE_FRAC=0.3.
 NEG_SAMPLE_FRAC: float = 1.0
 
+# --- Production class-ratio assumption (for adjusted test precision reporting) ---
+# Expected negative-to-positive ratio in production (serving), used to adjust
+# test set precision to a realistic estimate of serving precision when negatives
+# have been downsampled during training.
+# Set to None to disable adjusted-precision reporting.
+# Example: 15.0 means production has ~15 negative observations per 1 positive.
+PRODUCTION_NEG_POS_RATIO: Optional[float] = None
+
 # --- OOM pre-check: auto-adjust NEG_SAMPLE_FRAC after Step 1 if RAM looks tight ---
-# After the chunk list is built, the pipeline estimates Step 7 peak RAM and
-# auto-reduces NEG_SAMPLE_FRAC when a likely OOM is detected.
+# After the chunk list is built, the pipeline estimates Step 7 peak RAM as
+#   on_disk_total × CHUNK_CONCAT_RAM_FACTOR × (1 + TRAIN_SPLIT_FRAC)
+# (full_df and train split coexist at peak). If that exceeds
+#   ram_budget = available_ram × NEG_SAMPLE_RAM_SAFETY,
+# it auto-computes a negative fraction: frac = (ram_budget/peak - pos_rate)/(1 - pos_rate),
+# then clamps to [NEG_SAMPLE_FRAC_MIN, 1.0]. So "how much" is controlled by the
+# constants below (and by CHUNK_CONCAT_RAM_FACTOR / TRAIN_SPLIT_FRAC), not a fixed value.
 # Only triggers when NEG_SAMPLE_FRAC == 1.0 (user-configured values are respected).
 NEG_SAMPLE_FRAC_AUTO: bool = True   # set False to disable auto-adjustment entirely
 NEG_SAMPLE_FRAC_MIN: float = 0.05  # hard floor: auto-reduce will never go below this

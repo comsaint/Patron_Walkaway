@@ -105,6 +105,7 @@ try:
     NEG_SAMPLE_FRAC_ASSUMED_POS_RATE: float = getattr(_cfg, "NEG_SAMPLE_FRAC_ASSUMED_POS_RATE", 0.15)
     NEG_SAMPLE_RAM_SAFETY: float = getattr(_cfg, "NEG_SAMPLE_RAM_SAFETY", 0.75)
     NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT: int = getattr(_cfg, "NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT", 200 * 1024 * 1024)
+    PRODUCTION_NEG_POS_RATIO: Optional[float] = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
@@ -137,6 +138,7 @@ except ModuleNotFoundError:
     NEG_SAMPLE_FRAC_ASSUMED_POS_RATE = getattr(_cfg, "NEG_SAMPLE_FRAC_ASSUMED_POS_RATE", 0.15)
     NEG_SAMPLE_RAM_SAFETY = getattr(_cfg, "NEG_SAMPLE_RAM_SAFETY", 0.75)
     NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT = getattr(_cfg, "NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT", 200 * 1024 * 1024)
+    PRODUCTION_NEG_POS_RATIO: Optional[float] = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)
 
 # Module-level pipeline imports (same try/except pattern)
 try:
@@ -558,23 +560,18 @@ def load_local_parquet(
 def load_player_profile(
     window_start: datetime,
     window_end: datetime,
-    use_local_parquet: bool = False,  # kept for backward-compat; always reads local Parquet
+    use_local_parquet: bool = False,  # kept for backward-compat; prefers local Parquet when available
     canonical_ids: Optional[List[str]] = None,
 ) -> Optional[pd.DataFrame]:
     """Load player_profile snapshots covering the training window.
 
-    Returns a DataFrame with ``canonical_id``, ``snapshot_dtm``, and all
-    Phase 1 profile feature columns, or ``None`` if data is unavailable.
+    Primary path: local Parquet (data/player_profile.parquet), built by
+    etl_player_profile.py.  Falls back to ClickHouse with a chunked-IN
+    strategy when the local artifact is absent and use_local_parquet=False.
 
-    The caller should pass the returned DataFrame to ``process_chunk`` via its
-    ``profile_df`` parameter.  ``join_player_profile`` handles the
-    PIT/as-of alignment per bet.
-
-    **Always reads from local Parquet** (``data/player_profile.parquet``),
-    regardless of ``use_local_parquet``.  player_profile is computed by
-    ``etl_player_profile.py`` from the t_session table and is never stored in
-    ClickHouse — the ClickHouse read path was therefore unreachable in practice
-    and has been removed to prevent spurious Code-60 errors on every run.
+    The ClickHouse path splits large canonical_id lists into batches of
+    _IN_BATCH IDs per SQL IN (...) clause and merges results with pd.concat.
+    No DDL permissions (temp-table creation) are required.
 
     Parameters
     ----------
@@ -586,55 +583,128 @@ def load_player_profile(
         Latest chunk window_end in the run.  Snapshots up to window_end are
         included.
     use_local_parquet:
-        Deprecated.  Retained for call-site backward compatibility; the value
-        is ignored because player_profile is always a local artifact.
+        Prefer local Parquet artifact; skip ClickHouse fallback even when the
+        file is missing.
     canonical_ids:
         R82: optional list of canonical_id values to filter the profile table.
         Pass the full set of rated player IDs from canonical_map to cap memory
         usage; None loads all players in the time window.
     """
+    _IN_BATCH = 4_000  # keep each IN(...) list well under ClickHouse 256 KB max_query_size
+
+    # --- Primary path: local Parquet (ETL artifact from etl_player_profile.py) ---
     profile_path = LOCAL_PARQUET_DIR / "player_profile.parquet"
-
-    if not profile_path.exists():
-        logger.info(
-            "player_profile: %s not found — run etl_player_profile.py first. "
-            "Profile features will be NaN for this run.",
-            profile_path,
-        )
-        return None
-
-    logger.info("Loading player_profile from local Parquet: %s", profile_path)
-    try:
-        from datetime import timedelta as _td
-        snap_lo = window_start - _td(days=365)
-        snap_hi = window_end
-
-        def _naive(dt: datetime) -> pd.Timestamp:
-            ts = pd.Timestamp(dt)
-            return ts.tz_localize(None) if ts.tzinfo is None else ts.replace(tzinfo=None)
-
-        df = pd.read_parquet(
-            profile_path,
-            filters=[
-                ("snapshot_dtm", ">=", _naive(snap_lo)),
-                ("snapshot_dtm", "<=", _naive(snap_hi)),
-            ],
-        )
-        # R82: filter to known canonical_ids to limit memory footprint
-        if canonical_ids is not None and not df.empty:
-            df = df[df["canonical_id"].astype(str).isin(set(str(c) for c in canonical_ids))]
-        if df.empty:
+    if use_local_parquet or profile_path.exists():
+        if not profile_path.exists():
             logger.info(
-                "player_profile: no snapshot rows found in window %s – %s; "
-                "profile features will be NaN.",
-                window_start.date(), window_end.date(),
+                "player_profile: %s not found -- run etl_player_profile.py first. "
+                "Profile features will be NaN for this run.",
+                profile_path,
             )
             return None
-        logger.info("player_profile: %d rows loaded from local Parquet", len(df))
-        return df
-    except Exception as exc:
-        logger.warning("player_profile local Parquet load failed: %s", exc)
+        logger.info("Loading player_profile from local Parquet: %s", profile_path)
+        try:
+            from datetime import timedelta as _td
+            snap_lo = window_start - _td(days=365)
+            snap_hi = window_end
+
+            def _naive(dt: datetime) -> pd.Timestamp:
+                ts = pd.Timestamp(dt)
+                return ts.tz_localize(None) if ts.tzinfo is None else ts.replace(tzinfo=None)
+
+            df = pd.read_parquet(
+                profile_path,
+                filters=[
+                    ("snapshot_dtm", ">=", _naive(snap_lo)),
+                    ("snapshot_dtm", "<=", _naive(snap_hi)),
+                ],
+            )
+            # R82: filter to known canonical_ids to limit memory footprint
+            if canonical_ids is not None and not df.empty:
+                df = df[df["canonical_id"].astype(str).isin(set(str(c) for c in canonical_ids))]
+            if df.empty:
+                logger.info(
+                    "player_profile: no snapshot rows found in window %s - %s; "
+                    "profile features will be NaN.",
+                    window_start.date(), window_end.date(),
+                )
+                return None
+            logger.info("player_profile: %d rows loaded from local Parquet", len(df))
+            return df
+        except Exception as exc:
+            logger.warning("player_profile local Parquet load failed: %s", exc)
+            return None
+
+    # --- Fallback path: ClickHouse with chunked-IN strategy ---
+    # Used when local Parquet artifact is absent and use_local_parquet=False.
+    # Three branches based on canonical_ids size:
+    #   Branch 1 (_query_no_filter): canonical_ids is None -> load all IDs in window
+    #   Branch 2: small list          -> single IN clause
+    #   Branch 3: large list          -> chunked IN batches with pd.concat
+    from datetime import timedelta as _td_ch
+    _snap_lo_s = (window_start - _td_ch(days=365)).strftime("%Y-%m-%d %H:%M:%S")
+    _snap_hi_s = window_end.strftime("%Y-%m-%d %H:%M:%S")
+    _BASE_SQL = (
+        "SELECT * "
+        "FROM " + SOURCE_DB + "." + TPROFILE + " "
+        "WHERE snapshot_dtm >= '" + _snap_lo_s + "' "
+        "AND snapshot_dtm <= '" + _snap_hi_s + "'"
+    )
+    client = get_clickhouse_client()
+
+    if canonical_ids is None:
+        _query_no_filter = _BASE_SQL
+        try:
+            df = client.query_df(_query_no_filter)
+        except Exception as exc:
+            logger.warning("player_profile ClickHouse query failed: %s", exc)
+            return None
+        if df.empty:
+            return None
+        return df.sort_values(["canonical_id", "snapshot_dtm"]).reset_index(drop=True)
+
+    _cid_list = [str(c) for c in canonical_ids]
+    if len(_cid_list) <= _IN_BATCH:
+        # Small list: single IN clause avoids chunked overhead
+        _cids_str = ", ".join("'" + c + "'" for c in _cid_list)
+        _small_query = _BASE_SQL + " AND canonical_id IN (" + _cids_str + ")"
+        try:
+            df = client.query_df(_small_query)
+        except Exception as exc:
+            logger.warning("player_profile ClickHouse query failed: %s", exc)
+            return None
+        if df.empty:
+            return None
+        return df.sort_values(["canonical_id", "snapshot_dtm"]).reset_index(drop=True)
+
+    # Large list: chunked IN with pd.concat
+    logger.info(
+        "player_profile: %d canonical_ids -> chunked IN strategy (%d IDs per batch)",
+        len(_cid_list), _IN_BATCH,
+    )
+    _parts = []
+    _n_batches = (len(_cid_list) + _IN_BATCH - 1) // _IN_BATCH
+    for _i in range(0, len(_cid_list), _IN_BATCH):
+        _batch = _cid_list[_i: _i + _IN_BATCH]
+        _batch_num = _i // _IN_BATCH + 1
+        logger.info(
+            "player_profile: batch %d/%d (%d IDs)",
+            _batch_num, _n_batches, len(_batch),
+        )
+        _cids_str = ", ".join("'" + c + "'" for c in _batch)
+        _batch_query = _BASE_SQL + " AND canonical_id IN (" + _cids_str + ")"
+        try:
+            _parts.append(client.query_df(_batch_query))
+        except Exception as _exc:
+            logger.error(
+                "player_profile batch %d/%d failed: %s",
+                _batch_num, _n_batches, _exc,
+            )
+    df = pd.concat(_parts, ignore_index=True) if _parts else pd.DataFrame()
+    if df.empty:
         return None
+    df = df.sort_values(["canonical_id", "snapshot_dtm"]).reset_index(drop=True)
+    return df
 
 
 def _parse_obj_to_date(v: Any) -> Optional[date]:
@@ -1336,6 +1406,7 @@ def _oom_check_and_adjust_neg_sample_frac(
     3. Estimate per-chunk on-disk size from cached chunk Parquets (if any),
        otherwise fall back to NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT.
     4. estimated_peak_ram = N_chunks × per_chunk_bytes × CHUNK_CONCAT_RAM_FACTOR
+       × (1 + TRAIN_SPLIT_FRAC)  (full_df and train split coexist at Step 7 peak).
     5. Print a one-line summary so user can see the estimate.
     6. If peak ≤ budget: no change.
     7. If current_frac < 1.0 (user-configured): warn only, do not override.
@@ -1421,7 +1492,7 @@ def _oom_check_and_adjust_neg_sample_frac(
 
     if estimated_peak_ram <= ram_budget:
         print("[OOM-check] RAM looks OK — no adjustment to NEG_SAMPLE_FRAC.", flush=True)
-        logger.info("OOM-check: peak %.1f GB ≤ budget %.1f GB — no adjustment", estimated_peak_ram / (1024**3), ram_budget / (1024**3))
+        logger.info("OOM-check: peak %.1f GB <= budget %.1f GB -- no adjustment", estimated_peak_ram / (1024**3), ram_budget / (1024**3))
         return current_frac
 
     # OOM is likely.
@@ -2013,6 +2084,7 @@ def _compute_test_metrics(
     label: str = "",
     _uncalibrated: bool = False,
     log_results: bool = True,
+    production_neg_pos_ratio: Optional[float] = None,
 ) -> dict:
     """Evaluate a trained model on the held-out test set at the val-derived threshold.
 
@@ -2023,7 +2095,19 @@ def _compute_test_metrics(
     R1100: requires at least one negative label so average precision is meaningful.
     R1101: _uncalibrated=True is propagated into test_threshold_uncalibrated key.
     R1105: y_test.values is used for positional comparisons to avoid index misalign.
+
+    Additional reporting:
+    - test_precision_at_recall_{r}: highest precision achievable at recall >= r,
+      computed from the PR curve (threshold-free). Reported for r in (0.01, 0.1, 0.5).
+    - test_precision_prod_adjusted: test_precision rescaled to the assumed production
+      neg/pos ratio (production_neg_pos_ratio). Only computed when
+      production_neg_pos_ratio is not None and > 0.
     """
+    _TARGET_RECALLS = (0.01, 0.1, 0.5)
+    _zeroed_recall_keys = {
+        f"test_precision_at_recall_{r}": None for r in _TARGET_RECALLS
+    }
+
     # R1100: guard against all-positive labels (average_precision_score = 1.0 trivially)
     _has_test = (
         not X_test.empty
@@ -2053,6 +2137,10 @@ def _compute_test_metrics(
             "test_random_ap": (n_te_pos / n_te) if n_te > 0 else 0.0,
             # R1101: propagate uncalibrated flag
             "test_threshold_uncalibrated": _uncalibrated,
+            **_zeroed_recall_keys,
+            "test_precision_prod_adjusted": None,
+            "test_neg_pos_ratio": None,
+            "production_neg_pos_ratio_assumed": production_neg_pos_ratio,
         }
 
     test_scores = model.predict_proba(X_test)[:, 1]
@@ -2068,12 +2156,61 @@ def _compute_test_metrics(
     f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
     n_te = int(len(y_test))
     n_te_pos = int(y_test.sum())
+    n_te_neg = int((y_test == 0).sum())
     test_random_ap = (n_te_pos / n_te) if n_te > 0 else 0.0
-    if log_results:
-        logger.info(
-            "%s test: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
-            label, prauc, f1, prec, rec, threshold,
+
+    # --- Precision at fixed recall levels (threshold-free, from PR curve) ---
+    # For each target recall R, find the maximum precision among all PR-curve
+    # points where recall >= R.  Returns None when no point satisfies recall >= R.
+    pr_prec_arr, pr_rec_arr, _ = precision_recall_curve(y_test, test_scores)
+    precision_at_recall: dict = {}
+    for r in _TARGET_RECALLS:
+        mask = pr_rec_arr >= r
+        if mask.any():
+            precision_at_recall[f"test_precision_at_recall_{r}"] = float(pr_prec_arr[mask].max())
+        else:
+            precision_at_recall[f"test_precision_at_recall_{r}"] = None
+
+    # --- Production-prior adjusted precision ---
+    # Rescales test precision to the expected production neg/pos ratio using the
+    # Bayes-consistent approximation: 1/P - 1 scales linearly with neg/pos ratio.
+    # Only meaningful when negatives were downsampled (neg_sample_frac < 1.0) and
+    # production_neg_pos_ratio is provided.
+    test_neg_pos_ratio: Optional[float] = (n_te_neg / n_te_pos) if n_te_pos > 0 else None
+    test_precision_prod_adjusted: Optional[float] = None
+    if (
+        prec > 0.0
+        and production_neg_pos_ratio is not None
+        and production_neg_pos_ratio > 0.0
+        and test_neg_pos_ratio is not None
+        and test_neg_pos_ratio > 0.0
+    ):
+        scaling = production_neg_pos_ratio / test_neg_pos_ratio
+        test_precision_prod_adjusted = 1.0 / (1.0 + (1.0 / prec - 1.0) * scaling)
+    elif production_neg_pos_ratio is not None and production_neg_pos_ratio <= 0.0:
+        logger.warning(
+            "PRODUCTION_NEG_POS_RATIO=%.4f is invalid (must be > 0); "
+            "test_precision_prod_adjusted will be None.",
+            production_neg_pos_ratio,
         )
+
+    if log_results:
+        _adj_str = (
+            f"  prec_prod_adj={test_precision_prod_adjusted:.4f}"
+            if test_precision_prod_adjusted is not None
+            else ""
+        )
+        _par_str = "  ".join(
+            f"prec@rec{r}={precision_at_recall[f'test_precision_at_recall_{r}']:.4f}"
+            if precision_at_recall[f"test_precision_at_recall_{r}"] is not None
+            else f"prec@rec{r}=N/A"
+            for r in _TARGET_RECALLS
+        )
+        logger.info(
+            "%s test: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f%s",
+            label, prauc, f1, prec, rec, threshold, _adj_str,
+        )
+        logger.info("%s test PR-curve: %s", label, _par_str)
     return {
         "test_ap": prauc,
         "test_precision": prec,
@@ -2084,6 +2221,10 @@ def _compute_test_metrics(
         "test_random_ap": test_random_ap,
         # R1101: propagate uncalibrated flag so downstream can distrust P/R/F1
         "test_threshold_uncalibrated": _uncalibrated,
+        **precision_at_recall,
+        "test_precision_prod_adjusted": test_precision_prod_adjusted,
+        "test_neg_pos_ratio": test_neg_pos_ratio,
+        "production_neg_pos_ratio_assumed": production_neg_pos_ratio,
     }
 
 
@@ -2292,6 +2433,7 @@ def train_dual_model(
                     label=name,
                     # R1101: propagate whether the threshold was a fallback
                     _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+                    production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
                 )
             )
 
@@ -2373,6 +2515,7 @@ def train_single_rated_model(
             label="rated",
             _uncalibrated=bool(metrics.get("_uncalibrated", False)),
             log_results=False,
+            production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
         )
         metrics.update(test_m)
     else:
@@ -2397,14 +2540,24 @@ def train_single_rated_model(
         metrics.get("threshold", 0.5),
     )
     if test_m:
+        _adj = test_m.get("test_precision_prod_adjusted")
+        _adj_str = f"  prec_prod_adj={_adj:.4f}" if _adj is not None else ""
         logger.info(
-            "rated test:  AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
+            "rated test:  AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f%s",
             test_m.get("test_ap", 0.0),
             test_m.get("test_f1", 0.0),
             test_m.get("test_precision", 0.0),
             test_m.get("test_recall", 0.0),
             metrics.get("threshold", 0.5),
+            _adj_str,
         )
+        _par_parts = []
+        for _r in (0.01, 0.1, 0.5):
+            _v = test_m.get(f"test_precision_at_recall_{_r}")
+            _par_parts.append(
+                f"prec@rec{_r}={_v:.4f}" if _v is not None else f"prec@rec{_r}=N/A"
+            )
+        logger.info("rated test PR-curve: %s", "  ".join(_par_parts))
 
     metrics["feature_importance"] = _compute_feature_importance(model, avail_cols)
     metrics["importance_method"] = "gain"
@@ -2539,6 +2692,9 @@ def save_artifact_bundle(
                 # R-NEG-2: record effective neg_sample_frac for auditability.
                 # 1.0 = no downsampling; < 1.0 = negatives were downsampled.
                 "neg_sample_frac": neg_sample_frac,
+                # Production neg/pos ratio assumed for test_precision_prod_adjusted.
+                # None = feature disabled (PRODUCTION_NEG_POS_RATIO not set in config).
+                "production_neg_pos_ratio": PRODUCTION_NEG_POS_RATIO,
                 # R703: uncalibrated_threshold=True means the 0.5 fallback was used.
                 "uncalibrated_threshold": _uncalibrated_threshold,
                 # DEC-024 / R3501: SHA-256 prefix of the frozen feature spec for audit.

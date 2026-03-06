@@ -868,9 +868,10 @@ def _load_profile_for_scoring(
             )
             cids_str = {str(c) for c in rated_canonical_ids}
             df = df[df["canonical_id"].astype(str).isin(cids_str)]
-            # R84: keep only the latest snapshot per player
+            # R84: keep only the latest snapshot per player (groupby last preserves
+            # the most-recent row per canonical_id after sort by snapshot_dtm)
             df = df.sort_values("snapshot_dtm")
-            df = df.drop_duplicates(subset=["canonical_id"], keep="last")
+            df = df.groupby("canonical_id").last().reset_index()
             logger.info("[scorer] player_profile: %d rows from local Parquet", len(df))
             df_loaded = df if not df.empty else None
         except Exception as exc:
