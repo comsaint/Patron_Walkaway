@@ -151,9 +151,9 @@
 - 需求為簡化指標，以 PR-ROC / PR-AUC 為主。
 
 **實作要點**：  
-- **主指標**：`val_prauc`（PR-AUC）為首要報告與日誌指標。  
+- **主指標**：`val_ap`（average precision, AP）為首要報告與日誌指標。  
 - **閾值選擇**：在 validation 上掃描閾值，取 **F1** 最大者（無 G1 約束）；若 F1 平手則取 recall 較高者。  
-- **日誌**：`PR-AUC=...  F1=...  prec=...  rec=...  thr=...`  
+- **日誌**：`AP=...  F1=...  prec=...  rec=...  thr=...`  
 - **Backtester**：仍保留 G1 閾值搜尋（Optuna 2D + F-beta + 約束），未在此次變更範圍；若日後希望一致可再改。
 
 **回退說明**：  

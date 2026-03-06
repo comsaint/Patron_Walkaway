@@ -189,6 +189,37 @@ _CANONICAL_MAP_SESSION_COLS: list = [
     "turnover",
 ]
 
+# Minimal bet columns needed by the full process_chunk pipeline.
+# Column pushdown: load_local_parquet reads only these from the ~60-column t_bet Parquet,
+# cutting RAM by ~2/3 and avoiding the 17-object-column .copy() OOM.
+#
+# Includes:
+#   - DQ / identity:    bet_id, session_id, player_id, table_id, payout_complete_dtm,
+#                       gaming_day, wager, lud_dtm, __etl_insert_Dtm
+#   - Track B:          status  (loss_streak needs it; run_boundary uses payout_complete_dtm)
+#   - Track LLM YAML:   payout_odds, is_back_bet, position_idx  (allowed_columns whitelist)
+#   - Legacy features:  base_ha  (LEGACY_FEATURE_COLS)
+#   - Output chunk:     run_id, canonical_id, is_rated, label added downstream
+#
+# If a future feature spec references additional source columns, add them here.
+_REQUIRED_BET_PARQUET_COLS: list = [
+    # Keys & timestamps
+    "bet_id",
+    "session_id",
+    "player_id",
+    "table_id",
+    "payout_complete_dtm",
+    "gaming_day",
+    # DQ guard / Track-B state machines
+    "wager",
+    "status",
+    # Legacy / Track LLM features
+    "payout_odds",
+    "base_ha",
+    "is_back_bet",
+    "position_idx",
+]
+
 # DEPRECATED(DEC-017): FAST_MODE_RATED_SAMPLE_N is no longer used by any
 # runtime logic.  Rated sampling was decoupled from fast-mode (R205) and is
 # now controlled by the independent --sample-rated N CLI flag.  This constant
@@ -465,9 +496,15 @@ def load_local_parquet(
             _sess_cols.append("__etl_insert_Dtm")
     else:
         # Use pyarrow pushdown filters to avoid loading the full table per chunk (R26).
+        # Column pushdown: only load _REQUIRED_BET_PARQUET_COLS to cut RAM by ~2/3 vs
+        # loading all ~60 t_bet columns (OOM fix — 17 object columns were the final straw).
         bets_lo = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
+        import pyarrow.parquet as _pq_bets
+        _bet_schema_cols = set(_pq_bets.read_schema(bets_path).names)
+        _bet_cols = [c for c in _REQUIRED_BET_PARQUET_COLS if c in _bet_schema_cols]
         bets = pd.read_parquet(
             bets_path,
+            columns=_bet_cols,
             filters=[
                 ("payout_complete_dtm", ">=", _filter_ts(bets_lo, bets_path, "payout_complete_dtm")),
                 ("payout_complete_dtm", "<",  _filter_ts(extended_end, bets_path, "payout_complete_dtm")),
@@ -1107,6 +1144,11 @@ def apply_dq(
         _games = sessions["num_games_with_wager"].fillna(0)
         sessions = sessions[(_turnover > 0) | (_games > 0)].copy()
 
+    # Defensive copy so apply_dq never mutates the caller's DataFrame.
+    # In-place column assignments below (payout_complete_dtm tz normalisation, etc.)
+    # require ownership of the data.  Callers that pass a freshly-filtered slice
+    # (e.g. from load_local_parquet) still benefit: pandas may hold a view rather
+    # than a copy, so the explicit copy here ensures safe mutation.
     bets = bets.copy()
     if bets.empty:
         # Sessions-only path — return clean sessions, skip bets processing entirely.
@@ -1138,21 +1180,20 @@ def apply_dq(
     _lo = _lo.replace(tzinfo=None) if getattr(_lo, "tzinfo", None) else _lo
     _hi = extended_end.replace(tzinfo=None) if getattr(extended_end, "tzinfo", None) else extended_end
 
-    bets = bets[
-        bets["payout_complete_dtm"].between(_lo, _hi, inclusive="left")
-        & bets["payout_complete_dtm"].notna()
-    ].copy()
-
-    # Defense-in-depth wager guard (R1602): upstream SQL already filters wager>0,
-    # but apply_dq is also called directly (e.g. by backtester tests) so we
-    # enforce it here when the column is present.  Uses .gt() to avoid
-    # ambiguity with NA comparison (R1706 alignment).
-    if "wager" in bets.columns:
-        bets = bets[bets["wager"].fillna(0).gt(0)].copy()
-
     for col in ("bet_id", "session_id", "player_id", "table_id"):
         bets[col] = pd.to_numeric(bets.get(col), errors="coerce")
-    bets = bets.dropna(subset=["bet_id", "session_id"]).copy()
+
+    # Combine time-window filter, wager guard, and key-column dropna into one mask
+    # to avoid three consecutive .copy() calls on a large DataFrame (OOM risk).
+    _dq_mask = (
+        bets["payout_complete_dtm"].between(_lo, _hi, inclusive="left")
+        & bets["payout_complete_dtm"].notna()
+        & bets[["bet_id", "session_id"]].notna().all(axis=1)
+    )
+    if "wager" in bets.columns:
+        # Defense-in-depth wager guard (R1602): applied inside the combined mask.
+        _dq_mask &= bets["wager"].fillna(0).gt(0)
+    bets = bets.loc[_dq_mask].reset_index(drop=True)
 
     # G2: recover invalid/missing player_id from session player_id before the
     # E4/F1 drop (SSOT §5 G2 — COALESCE t_bet.player_id, t_session.player_id).
@@ -1174,7 +1215,7 @@ def apply_dq(
         bets = bets[
             bets["player_id"].notna()
             & (bets["player_id"] != PLACEHOLDER_PLAYER_ID)
-        ].copy()
+        ].reset_index(drop=True)
 
     # Ensure gaming_day exists (fallback: date of payout)
     if "gaming_day" not in bets.columns:
@@ -1206,15 +1247,19 @@ def add_track_b_features(
     canonical_map: pd.DataFrame,
     window_end: datetime,
 ) -> pd.DataFrame:
-    """Attach Track-B features to bets.  Requires canonical_id column."""
-    if "canonical_id" not in bets.columns:
-        logger.warning("canonical_id missing; Track-B features will be zeros")
-        bets["loss_streak"] = 0
-        bets["run_id"] = 0
-        bets["minutes_since_run_start"] = 0.0
-        return bets
+    """Return a copy of *bets* with Track-B feature columns attached.
 
+    A copy is taken so the caller's DataFrame is not mutated.  After column
+    pushdown, ``bets`` is already narrow (~20 cols), so the copy cost is low.
+    """
     df = bets.copy()
+
+    if "canonical_id" not in df.columns:
+        logger.warning("canonical_id missing; Track-B features will be zeros")
+        df["loss_streak"] = 0
+        df["run_id"] = 0
+        df["minutes_since_run_start"] = 0.0
+        return df
 
     # loss_streak (cutoff = window_end so future bets don't influence streak)
     streak = compute_loss_streak(df, cutoff_time=window_end)
@@ -1222,7 +1267,6 @@ def add_track_b_features(
 
     # run_boundary (cutoff = window_end)
     run_df = compute_run_boundary(df, cutoff_time=window_end)
-    run_df = run_df.set_index(run_df.index)  # keep original index
     df["run_id"] = run_df.get("run_id", pd.Series(0, index=df.index))
     df["minutes_since_run_start"] = run_df.get(
         "minutes_since_run_start", pd.Series(0.0, index=df.index)
@@ -1412,7 +1456,7 @@ def process_chunk(
     # --- TRN-04: drop FND-12 dummy/fake-account rows before feature engineering ---
     if dummy_player_ids and "player_id" in bets.columns:
         before = len(bets)
-        bets = bets[~bets["player_id"].isin(dummy_player_ids)].copy()
+        bets = bets[~bets["player_id"].isin(dummy_player_ids)].reset_index(drop=True)
         if len(bets) < before:
             logger.info("Chunk %s–%s: dropped %d dummy player_id rows (FND-12)", window_start.date(), window_end.date(), before - len(bets))
         if bets.empty:
@@ -1487,15 +1531,16 @@ def process_chunk(
         window_end=window_end,
         extended_end=extended_end,
     )
-    # H1: drop censored terminal bets — they cannot be reliably labelled
-    labeled = labeled[~labeled["censored"]].copy()
-
-    # Filter to training window — exclude historical context rows AND extended zone.
+    # H1: drop censored terminal bets + filter to training window in a single pass.
+    # Combining the two filters into one mask avoids an intermediate ~32M-row .copy()
+    # that was the direct OOM trigger (17 object cols × 32M rows ≈ 4 GiB allocation).
     # Both sides are tz-naive after DEC-018 strip at process_chunk() entry.
-    labeled = labeled[
-        (labeled["payout_complete_dtm"] >= window_start)
+    _keep_mask = (
+        ~labeled["censored"]
+        & (labeled["payout_complete_dtm"] >= window_start)
         & (labeled["payout_complete_dtm"] < window_end)
-    ].copy()
+    )
+    labeled = labeled.loc[_keep_mask].reset_index(drop=True)
     if labeled.empty:
         logger.warning("Chunk %s–%s: empty after label filtering", window_start.date(), window_end.date())
         return None
@@ -1588,7 +1633,7 @@ def run_optuna_search(
     n_trials: int = OPTUNA_N_TRIALS,
     label: str = "",
 ) -> dict:
-    """TPE hyperparameter search.  Optimises average precision (PR-AUC) on validation set.
+    """TPE hyperparameter search.  Optimises average precision (AP) on validation set.
     Threshold selection uses F-0.5 separately."""
     # R705: guard against empty validation input — return empty dict (base params)
     # rather than crashing inside LightGBM or average_precision_score.
@@ -1631,7 +1676,7 @@ def run_optuna_search(
     )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     best = study.best_params
-    logger.info("Optuna (%s) best PR-AUC=%.4f, params=%s", label or "model", study.best_value, best)
+    logger.info("Optuna (%s) best AP=%.4f, params=%s", label or "model", study.best_value, best)
     return best
 
 
@@ -1747,7 +1792,7 @@ def _train_one_model(
 
     metrics = {
         "label": label,
-        "val_prauc": prauc,
+        "val_ap": prauc,
         "val_precision": best_prec,
         "val_recall": best_rec,
         "val_f1": best_f1,
@@ -1762,7 +1807,7 @@ def _train_one_model(
         "_uncalibrated": not _has_val,
     }
     logger.info(
-        "%s: PR-AUC=%.4f  F0.5=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
+        "%s: AP=%.4f  F0.5=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
         label, prauc, best_fbeta, best_f1, best_prec, best_rec, best_t,
     )
     return model, metrics
@@ -1779,10 +1824,10 @@ def _compute_test_metrics(
     """Evaluate a trained model on the held-out test set at the val-derived threshold.
 
     Uses the same MIN_VALID_TEST_ROWS guard as _train_one_model so an under-sized
-    test split returns zeroed metrics rather than crashing.  test_prauc is computed
-    without any threshold so it is comparable to val_prauc.
+    test split returns zeroed metrics rather than crashing.  test_ap is computed
+    without any threshold so it is comparable to val_ap.
 
-    R1100: requires at least one negative label so PR-AUC is meaningful.
+    R1100: requires at least one negative label so average precision is meaningful.
     R1101: _uncalibrated=True is propagated into test_threshold_uncalibrated key.
     R1105: y_test.values is used for positional comparisons to avoid index misalign.
     """
@@ -1806,7 +1851,7 @@ def _compute_test_metrics(
         n_te = int(len(y_test))
         n_te_pos = int(y_test.sum()) if not y_test.empty else 0
         return {
-            "test_prauc": 0.0,
+            "test_ap": 0.0,
             "test_precision": 0.0,
             "test_recall": 0.0,
             "test_f1": 0.0,
@@ -1832,11 +1877,11 @@ def _compute_test_metrics(
     n_te_pos = int(y_test.sum())
     test_random_ap = (n_te_pos / n_te) if n_te > 0 else 0.0
     logger.info(
-        "%s test: PR-AUC=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
+        "%s test: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
         label, prauc, f1, prec, rec, threshold,
     )
     return {
-        "test_prauc": prauc,
+        "test_ap": prauc,
         "test_precision": prec,
         "test_recall": rec,
         "test_f1": f1,
@@ -1857,12 +1902,12 @@ def _compute_train_metrics(
 ) -> dict:
     """Evaluate a trained model on the training set (for reporting overfit / fit quality).
 
-    Reports train_prauc, P/R/F1 at the validation-derived threshold, train_samples,
+    Reports train_ap, P/R/F1 at the validation-derived threshold, train_samples,
     train_positives, and train_random_ap (positives/samples = theoretical AP for random guess).
     """
     if X_train.empty or y_train.empty:
         return {
-            "train_prauc": 0.0,
+            "train_ap": 0.0,
             "train_precision": 0.0,
             "train_recall": 0.0,
             "train_f1": 0.0,
@@ -1885,11 +1930,11 @@ def _compute_train_metrics(
     rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
     logger.info(
-        "%s train: PR-AUC=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  random_ap=%.4f",
+        "%s train: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  random_ap=%.4f",
         label, train_prauc, f1, prec, rec, train_random_ap,
     )
     return {
-        "train_prauc": train_prauc,
+        "train_ap": train_prauc,
         "train_precision": prec,
         "train_recall": rec,
         "train_f1": f1,
@@ -2669,7 +2714,7 @@ def run_pipeline(args) -> None:
     if len(valid_df) < MIN_VALID_TEST_ROWS:
         logger.warning(
             "Validation set has only %d rows (MIN_VALID_TEST_ROWS=%d); "
-            "PR-AUC and Optuna results will be unreliable. "
+            "AP and Optuna results will be unreliable. "
             "Consider adding more --recent-chunks.",
             len(valid_df), MIN_VALID_TEST_ROWS,
         )

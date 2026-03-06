@@ -21,8 +21,8 @@
   - 重現 Scorer 對 unrated 觀測仍可能發 alert 的風險。
 - `TestR3601ApiUnratedAlertLeak.test_score_endpoint_unrated_row_should_not_alert`
   - 重現 API `/score` 對 unrated row 回傳 `alert=True` 的風險。
-- `TestR3602BacktesterCombinedPraucScope.test_combined_micro_prauc_should_match_rated_track_when_unrated_is_noise`
-  - 重現 combined PRAUC 被 unrated 分布影響的語義偏差。
+- `TestR3602BacktesterCombinedApScope.test_combined_micro_ap_should_match_rated_track_when_unrated_is_noise`
+  - 重現 combined AP 被 unrated 分布影響的語義偏差。
 - `TestR3603ArtifactCleanupGuard.test_save_artifact_bundle_should_cleanup_legacy_nonrated_model_file`
   - 檢查 artifact save path 是否有 stale nonrated artifact cleanup guard。
 - `TestR3604DocConsistencyGuards.test_api_score_doc_should_not_describe_dual_model_routing`
@@ -565,7 +565,7 @@ warning 摘要：
 
 ### 行為摘要
 
-- **主指標**：AP（`val_prauc` / `prauc`）為模型品質指標；**閾值選擇目標為 F-0.5**（precision-weighted）。
+- **主指標**：AP（`val_ap`）為模型品質指標；**閾值選擇目標為 F-0.5**（precision-weighted）。
 - **Trainer**：候選閾值須滿足 `MIN_THRESHOLD_ALERT_COUNT`、可選 `THRESHOLD_MIN_RECALL`；從中選 **F-beta 最大** 的閾值；metrics 含 `val_f1`（該閾值下 F1）、`val_fbeta_05`（目標值）。
 - **Backtester**：Optuna 最大化 F-beta，並受 min recall / min alerts per hour 約束；不滿足者回傳 0.0。
 - **驗證**：建議跑 `pytest tests/test_backtester.py tests/test_review_risks_late_rounds.py tests/test_dq_guardrails.py tests/test_review_risks_round40.py`。
@@ -1979,3 +1979,253 @@ Alerts are only generated for rated observations.
 - P2 可延後處理。
 
 ---
+
+## OOM 修復（2026-03-06）
+
+### 問題
+`python -m trainer.trainer --use-local-parquet --days 365` 在第二個 chunk（2025-03-01~04-01，約 32M 筆 bet）執行 `labeled = labeled[~labeled["censored"]].copy()` 時觸發：
+```
+numpy._core._exceptions._ArrayMemoryError: Unable to allocate 4.04 GiB for an array with shape (17, 31901503) and data type object
+```
+根本原因：`bets` 帶著 t_bet 全部 ~60 個欄位（其中 17 個是 object/string），在 pipeline 裡被連續 `.copy()` 多次，peak RAM 超過可用記憶體。
+
+### 修改的檔案
+
+#### 1. `trainer/trainer.py`
+
+| 修改位置 | 說明 |
+|----------|------|
+| 模組常數區（`_CANONICAL_MAP_SESSION_COLS` 下方）新增 `_REQUIRED_BET_PARQUET_COLS` | 定義 pipeline 真正需要的 bet 欄位白名單（20 欄，含 keys、DQ 欄、Track B / LLM / Legacy features），作為 Parquet column pushdown 的依據 |
+| `load_local_parquet()`：`pd.read_parquet(bets_path, ...)` | 加上 `columns=_bet_cols`（pushdown），只從 Parquet 讀取 `_REQUIRED_BET_PARQUET_COLS` 中存在於 schema 的欄位，節省 ~2/3 載入記憶體 |
+| `apply_dq()`：原本 3 個連續 `.copy()`（時間窗口過濾、wager 過濾、dropna） | 合併為 1 個 `_dq_mask` 布林遮罩，最後用 `.loc[_dq_mask].reset_index(drop=True)` 一次完成，省去 2 次 deep copy |
+| `apply_dq()`：E4/F1 player_id 過濾 `.copy()` | 改為 `.reset_index(drop=True)`，不做 deep copy |
+| `add_track_b_features()`：`df = bets.copy()` | 移除，改為直接在 `bets` 上做 `bets["loss_streak"] = ...` 等 in-place 修改（呼叫端 `bets = add_track_b_features(bets, ...)` 立刻覆蓋，無需 defensive copy） |
+| `process_chunk()`：FND-12 過濾 `.copy()` | 改為 `.reset_index(drop=True)` |
+| `process_chunk()`：H1 censored 過濾 + 時間窗口過濾（原本 2 個連續 `.copy()`） | 合併為 1 個 `_keep_mask`，用 `.loc[_keep_mask].reset_index(drop=True)` 一次完成，**直接消除觸發 OOM 的那次 4.04 GiB 分配** |
+
+#### 2. `trainer/duckdb_schema.py`（新建，來自前一次修復）
+Track LLM 的 DECIMAL cast 修復：`prepare_bets_for_duckdb()` 把貨幣欄位轉成 float64，避免 DuckDB 推斷成 DECIMAL(9,4) / DECIMAL(10,4)。
+
+#### 3. `trainer/features.py`（來自前一次修復）
+`compute_track_llm_features()` 在 `con.register("bets", df)` 前呼叫 `prepare_bets_for_duckdb(df)`。
+
+#### 4. `schema/duckdb_t_bet.sql`（新建）
+DuckDB t_bet 建表 DDL 參考，所有金額欄使用 DECIMAL(19,4)，對齊 `schema/schema.txt`。
+
+### 預期效果
+- **Column pushdown**：`bets` 從 ~60 欄 → 20 欄，記憶體節省 ~65%
+- **減少 copy**：省去 3~4 次大型 DataFrame deep copy，peak RAM 可降低 3~4× 單份 DataFrame 大小（數 GB 等級）
+- **直接修復 OOM 觸發點**：`_keep_mask` 一步合併，不再有中間 4.04 GiB 分配
+
+### 如何手動驗證
+1. 重跑 pipeline：`python -m trainer.trainer --use-local-parquet --days 365`
+2. 確認不再出現 `_ArrayMemoryError`
+3. 確認 chunk Parquet 產生，且 `label=1` / `rated` 計數與修改前大致相同（DQ 語義未改變）
+4. 可跑 `python -m pytest tests/ -x -q` 確認既有測試通過（尤其是 `test_apply_dq*`、`test_track_b*`、`test_review_risks*`）
+
+### 已知限制與下一步建議
+- **Layer 3（縮小 chunk 大小）**：若資料量繼續增長，可改 `time_fold.py` 把月度 chunk 改為半月或週，作為第二道防線
+- **`_REQUIRED_BET_PARQUET_COLS` 維護**：若 feature spec 新增了需要 t_bet 原始欄位的特徵（如 `casino_win`、`theo_win`），需手動把該欄位加進去
+- **ClickHouse 路徑**：`load_clickhouse_data()` 的 SQL 已有 SELECT 特定欄的邏輯，不受本次改動影響
+- **`compute_labels()` 仍做一次 `bets_df.copy()`**：這是必要的（函式設計不允許 in-place 修改傳入 DataFrame），但現在傳入的 `bets` 已瘦身，copy 代價大幅降低
+
+---
+
+## Self-review：OOM / DECIMAL 修復（2026-03-06）
+
+### R-OOM-1｜`add_track_b_features` in-place 修改破壞 backtester 呼叫端安全
+
+**嚴重度**：Medium（backtester 也用 `bets = add_track_b_features(bets, ...)` 所以目前安全，但函式設計已從「純函數」變成「有副作用」）
+
+**問題**：`add_track_b_features` 原本做 `df = bets.copy()`，是純函數——不改動傳入的 `bets`。現在改為直接 mutate `bets`（in-place 加 `loss_streak`、`run_id`、`minutes_since_run_start` 欄位），破壞了函式契約。當前所有呼叫端（`trainer.py` 第 1486 行、`backtester.py` 第 430 行）都做 `bets = add_track_b_features(bets, ...)`，所以結果正確。但若未來有人在呼叫前後存了 `bets` 的引用（例如 `original = bets`），原始物件也會被改掉。
+
+**修改建議**：
+- 在 docstring 裡加上 `.. warning:: This function **mutates** the input DataFrame in-place.` 警告。
+- 或更安全的做法：恢復 `.copy()` 但只 copy 傳入 `bets` 中 **必要的欄位**（用 `bets[NEEDED_COLS].copy()` 替代 `bets.copy()`）。不過由於 column pushdown 已把 `bets` 瘦到 20 欄，整份 copy 代價已大幅下降，恢復 `.copy()` 可能更安全。
+
+**建議測試**：
+```python
+def test_add_track_b_does_not_corrupt_caller():
+    """Verify add_track_b_features return value is usable and original df gets
+    the columns added (in-place contract)."""
+    bets = _make_sample_bets(100)
+    original_cols = set(bets.columns)
+    result = add_track_b_features(bets, pd.DataFrame(), some_dt)
+    assert result is bets  # in-place contract
+    assert "loss_streak" in bets.columns
+    assert "run_id" in bets.columns
+```
+
+---
+
+### R-OOM-2｜`_REQUIRED_BET_PARQUET_COLS` 包含 `lud_dtm` 和 `__etl_insert_Dtm`，但 bets 處理不用它們
+
+**嚴重度**：Low（浪費少量 IO 和記憶體，不是 bug）
+
+**問題**：`lud_dtm` 和 `__etl_insert_Dtm` 在 `apply_dq` 裡只用於 **sessions** 的 FND-01 dedup，從未用於 bets 處理。包含在 `_REQUIRED_BET_PARQUET_COLS` 會多讀兩欄但不會出錯。
+
+**修改建議**：從 `_REQUIRED_BET_PARQUET_COLS` 中移除 `"lud_dtm"` 和 `"__etl_insert_Dtm"`，並更新註釋。
+
+**建議測試**：
+```python
+def test_required_bet_cols_no_session_only_columns():
+    """Ensure _REQUIRED_BET_PARQUET_COLS doesn't include session-only columns."""
+    assert "lud_dtm" not in _REQUIRED_BET_PARQUET_COLS
+    assert "__etl_insert_Dtm" not in _REQUIRED_BET_PARQUET_COLS
+```
+
+---
+
+### R-OOM-3｜`_REQUIRED_BET_PARQUET_COLS` 與 `_BET_SELECT_COLS`（ClickHouse）不同步
+
+**嚴重度**：Low（功能正確，但維護風險：兩份清單可能悄悄偏移）
+
+**問題**：ClickHouse 路徑的 `_BET_SELECT_COLS` 包含 `bet_type`，但 `_REQUIRED_BET_PARQUET_COLS` 不包含。目前 `bet_type` 在 pipeline 裡不被任何 feature / label / DQ 使用，所以不影響正確性。但兩份清單分開維護，將來新增欄位時容易遺漏其中一份。
+
+**修改建議**：
+- 把 `_REQUIRED_BET_PARQUET_COLS` 同時用在 ClickHouse 路徑的 SELECT（取代硬寫的 `_BET_SELECT_COLS`），或用一個 `_PIPELINE_BET_COLS` 常數做 single source of truth。
+- 若 ClickHouse 路徑有不同需求（例如需要 COALESCE 表達式），可在常數上游做 mapping。
+
+**建議測試**：
+```python
+def test_parquet_cols_subset_of_clickhouse_cols():
+    """Ensure all Parquet pushdown columns are also fetched by ClickHouse path."""
+    ch_cols = {c.strip().split()[-1].split('(')[-1] for c in _BET_SELECT_COLS.split(',')}
+    for col in _REQUIRED_BET_PARQUET_COLS:
+        assert col in ch_cols or col in ("lud_dtm", "__etl_insert_Dtm"), col
+```
+
+---
+
+### R-OOM-4｜`prepare_bets_for_duckdb` 在 `compute_track_llm_features` 裡造成額外一次完整 copy
+
+**嚴重度**：Medium（效能：32M 行 × 20 欄 copy ≈ 幾百 MB，但不致 OOM）
+
+**問題**：`compute_track_llm_features` 裡已經做了 `df = bets_df.copy()`（或 `bets_df.loc[mask].reset_index()`），然後再呼叫 `prepare_bets_for_duckdb(df)` 又做一次 `out = bets_df.copy()`。在大 chunk 上這是兩份完整副本。
+
+**修改建議**：
+- 在 `prepare_bets_for_duckdb` 內改為 in-place 模式（加一個 `inplace=True` 參數或直接改 `df` 後傳入），或在 `compute_track_llm_features` 裡不做前面那次 copy、直接用 `prepare_bets_for_duckdb` 回傳的 copy。
+- 最簡方案：`prepare_bets_for_duckdb` 不做 copy，而是在呼叫端傳入的 `df`（已經是 copy）上直接修改。
+
+**建議測試**：
+```python
+def test_prepare_bets_for_duckdb_no_mutation():
+    """Verify prepare_bets_for_duckdb does not mutate input."""
+    df = pd.DataFrame({"wager": pd.array([100], dtype="object")})
+    result = prepare_bets_for_duckdb(df)
+    assert df["wager"].dtype == object  # original unchanged
+    assert result["wager"].dtype == np.float64
+```
+
+---
+
+### R-OOM-5｜`apply_dq` 合併 mask 後 `to_numeric` 的執行順序改變
+
+**嚴重度**：Low（語義正確但需確認）
+
+**問題**：原本 `to_numeric` 在 `.copy()` 之前就已經在 `bets` 上做完（in-place）。現在 `to_numeric` 仍在 `bets = bets.copy()` 之後、`_dq_mask` 之前，順序一致。但原本的 `bets.dropna(subset=["bet_id", "session_id"]).copy()` 是在 `to_numeric` **之後**，確保被 coerce 成 NaN 的不合法 bet_id/session_id 被丟棄。新版用 `bets[["bet_id", "session_id"]].notna().all(axis=1)` 放在同一個 mask 裡，時序相同（`to_numeric` 在 mask 組裝之前），所以語義正確。
+
+**修改建議**：無需修改，但建議加上明確註釋：`# to_numeric(errors="coerce") must run BEFORE this mask so NaN coercion applies`。
+
+**建議測試**：
+```python
+def test_apply_dq_drops_non_numeric_bet_id():
+    """Verify bets with non-numeric bet_id are dropped after to_numeric coercion."""
+    bets = pd.DataFrame({
+        "bet_id": ["abc", 2],
+        "session_id": [1, 2],
+        "player_id": [100, 200],
+        "payout_complete_dtm": pd.to_datetime(["2025-01-01", "2025-01-01"]),
+        "wager": [100, 200],
+    })
+    result_bets, _ = apply_dq(bets, sessions_stub, window_start, extended_end)
+    assert len(result_bets) == 1
+    assert result_bets.iloc[0]["bet_id"] == 2
+```
+
+---
+
+### R-OOM-6｜`reset_index(drop=True)` vs `.copy()` — 下游 `.loc[]` 寫入安全性
+
+**嚴重度**：Low（pandas 1.5+ 的 CoW 行為在此情境下已安全，但值得注意）
+
+**問題**：多處把 `.copy()` 改成 `.reset_index(drop=True)`。`.reset_index(drop=True)` **不**做 deep copy——它回傳一個新 DataFrame，但底層 data 是舊的 view。如果後續做 `bets.loc[..., "col"] = value`，在 pandas 2.x+ CoW 模式下是安全的（自動觸發 copy-on-write），但在 pandas 1.x 可能產生 `SettingWithCopyWarning`。
+
+**修改建議**：確認 `requirements.txt` 或 project 鎖定的 pandas 版本 ≥ 2.0。若需支持 pandas 1.x，在 `bets.loc[...]` 寫入前加一句 `bets = bets.copy()` 只在第一次寫入時 copy（惰性策略）。
+
+**建議測試**：
+```python
+def test_apply_dq_no_setting_with_copy_warning():
+    """Verify no SettingWithCopyWarning during apply_dq."""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", pd.errors.SettingWithCopyWarning)
+        apply_dq(bets, sessions, window_start, extended_end)
+```
+
+---
+
+### R-DECIMAL-1｜`prepare_bets_for_duckdb` 檢測 `str(dtype).startswith("decimal")` 不可靠
+
+**嚴重度**：Low（pandas / pyarrow Decimal 型別的 repr 可能因版本不同而異）
+
+**問題**：`str(out[col].dtype).startswith("decimal")` 在標準 pandas 裡不會出現——pandas 沒有原生 decimal dtype。如果從 pyarrow-backed 的 Parquet 載入（`dtype_backend="pyarrow"`），dtype repr 可能是 `"decimal128(19, 4)"` 而非 `"decimal..."`。
+
+**修改建議**：改用更穩健的檢測：
+```python
+dtype_str = str(out[col].dtype).lower()
+if out[col].dtype == object or "decimal" in dtype_str:
+```
+
+**建議測試**：
+```python
+def test_prepare_bets_handles_pyarrow_decimal():
+    """Verify decimal128 columns are correctly cast to float64."""
+    import pyarrow as pa
+    arr = pa.array([100000.0], type=pa.decimal128(19, 4))
+    df = pd.DataFrame({"wager": pd.array(arr, dtype="decimal128(19, 4)[pyarrow]")})
+    result = prepare_bets_for_duckdb(df)
+    assert result["wager"].dtype == np.float64
+```
+
+---
+
+### 問題優先度摘要
+
+| 優先度 | 問題 ID | 描述 | 類型 |
+|--------|---------|------|------|
+| Medium | R-OOM-1 | `add_track_b_features` in-place 破壞純函數契約 | Safety |
+| Medium | R-OOM-4 | `prepare_bets_for_duckdb` 額外 copy（效能） | 效能 |
+| Low | R-OOM-2 | `_REQUIRED_BET_PARQUET_COLS` 含不必要欄位 | Cleanup |
+| Low | R-OOM-3 | Parquet pushdown 與 ClickHouse SELECT 不同步 | 維護風險 |
+| Low | R-OOM-5 | `apply_dq` 合併 mask 順序正確但缺註釋 | 可讀性 |
+| Low | R-OOM-6 | `reset_index` vs `.copy()` — pandas 版本相容性 | 相容性 |
+| Low | R-DECIMAL-1 | decimal dtype 檢測字串比對不夠穩健 | 邊界條件 |
+
+### 下一步建議
+1. 先修 R-OOM-1（加 docstring 警告或恢復 lightweight copy）和 R-OOM-4（避免雙重 copy）。
+2. R-OOM-2 / R-OOM-3 屬於 cleanup，可順便修。
+3. R-DECIMAL-1 只在使用 pyarrow dtype backend 時才觸發，優先度最低。
+4. 所有建議測試可集中在一個 `tests/test_oom_fixes.py` 裡。
+
+---
+
+## Round 280 Tests Added
+
+新增測試檔：`tests/test_review_risks_round280.py`
+
+| Risk ID | Test | Outcome |
+|---|---|---|
+| R-OOM-1 | `test_add_track_b_features_should_preserve_pure_function_contract` | xfailed |
+| R-OOM-2 | `test_required_bet_cols_should_not_include_session_only_fields` | xfailed |
+| R-OOM-3 | `test_required_bet_cols_should_stay_in_sync_with_clickhouse_select` | xfailed |
+| R-OOM-4 | `test_prepare_bets_for_duckdb_should_avoid_extra_full_copy` | xfailed |
+| R-OOM-5 | `test_apply_dq_to_numeric_happens_before_combined_mask` | passed |
+| R-OOM-6 | `test_apply_dq_no_settingwithcopywarning_on_minimal_input` | passed |
+| R-DECIMAL-1 | `test_prepare_bets_decimal_detection_should_be_backend_agnostic` | xfailed |
+
+Run command:
+`python -m pytest "c:/Users/longp/Patron_Walkaway/tests/test_review_risks_round280.py" -q`
+
+Observed result:
+`2 passed, 5 xfailed in 3.17s`

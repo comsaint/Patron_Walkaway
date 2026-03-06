@@ -133,10 +133,10 @@ class TestR3601ApiUnratedAlertLeak(unittest.TestCase):
             )
 
 
-class TestR3602BacktesterCombinedPraucScope(unittest.TestCase):
-    """R3602: combined PRAUC must not be skewed by unrated observations."""
+class TestR3602BacktesterCombinedApScope(unittest.TestCase):
+    """R3602: combined AP (average precision) must not be skewed by unrated observations."""
 
-    def test_combined_micro_prauc_should_match_rated_track_when_unrated_is_noise(self):
+    def test_combined_micro_ap_should_match_rated_track_when_unrated_is_noise(self):
         rated = pd.DataFrame(
             {
                 "canonical_id": ["r1", "r2"],
@@ -163,10 +163,10 @@ class TestR3602BacktesterCombinedPraucScope(unittest.TestCase):
             window_hours=1.0,
         )
         self.assertAlmostEqual(
-            out["micro"]["prauc"],
-            out["rated_track"]["micro"]["prauc"],
+            out["micro"]["ap"],
+            out["rated_track"]["micro"]["ap"],
             places=10,
-            msg="Combined PRAUC should not be skewed by unrated observations when policy is rated-only alerts.",
+            msg="Combined AP should not be skewed by unrated observations when policy is rated-only alerts.",
         )
 
 

@@ -41,24 +41,27 @@ T_BET_DECIMAL_19_4_COLUMNS: Set[str] = {
 
 
 def prepare_bets_for_duckdb(bets_df):
-    """Return a copy of bets_df with monetary columns as float64 for DuckDB.
+    """Cast monetary columns of *bets_df* to float64 in-place and return it.
 
-    Use this before duckdb.register("bets", df) or before passing the frame
-    to DuckDB so that window expressions (SUM(wager), AVG(payout_odds), etc.)
-    are computed as DOUBLE and never cast to DECIMAL(9,4) or DECIMAL(10,4),
-    which would fail for values like 100000 or -1900000.
+    Mutates the caller's DataFrame directly to avoid an extra full copy; the
+    caller in ``compute_track_llm_features`` already works on a local view so
+    mutation is safe.
 
-    Aligned to schema/schema.txt: all t_bet Decimal(19,4) columns are cast
-    to float64; columns missing from the DataFrame are skipped.
+    Use this before duckdb.register("bets", df) so that window expressions
+    (SUM(wager), AVG(payout_odds), etc.) are computed as DOUBLE and never
+    cast to DECIMAL(9,4) or DECIMAL(10,4), which would fail for values like
+    100000 or -1900000.
+
+    Decimal detection uses ``"decimal" in str(dtype).lower()`` to remain
+    backend-agnostic (covers pyarrow Decimal128, pandas ArrowDtype, etc.).
     """
     import pandas as pd
 
-    out = bets_df.copy()
     for col in T_BET_DECIMAL_19_4_COLUMNS:
-        if col not in out.columns:
+        if col not in bets_df.columns:
             continue
-        if out[col].dtype == object or str(out[col].dtype).startswith("decimal"):
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-        if out[col].dtype != "float64":
-            out[col] = out[col].astype("float64")
-    return out
+        if bets_df[col].dtype == object or "decimal" in str(bets_df[col].dtype).lower():
+            bets_df[col] = pd.to_numeric(bets_df[col], errors="coerce")
+        if bets_df[col].dtype != "float64":
+            bets_df[col] = bets_df[col].astype("float64")
+    return bets_df

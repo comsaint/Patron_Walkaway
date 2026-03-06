@@ -91,7 +91,7 @@ This document summarizes how the approach in `ssot/patron_walkaway_phase_1.plan.
 | **Sample weighting**      | None                                                      | None（DEC-013：已移除 visit-level 樣本加權） |
 | **Hyperparameter tuning** | Small grid (`num_leaves`, `min_child_samples`); no Optuna | **Optuna TPE** on validation set; `OPTUNA_N_TRIALS=300`                       |
 | **Time split**            | 80/20 (train/val)                                         | 70/15/15 (train/valid/test)                                                   |
-| **Early stopping**        | `stopping_rounds=50`                                      | Plan does not specify; Optuna optimizes F-beta / PR-AUC                       |
+| **Early stopping**        | `stopping_rounds=50`                                      | Plan does not specify; Optuna optimizes F-beta / AP (average precision)       |
 
 
 ---
@@ -254,7 +254,7 @@ The Phase 1 plan represents a comprehensive refactor that:
 | **樣本加權** | 無 | 無（DEC-013：已移除 visit-level 樣本加權） |
 | **超參調優** | 小網格（`num_leaves`、`min_child_samples`）；無 Optuna | **Optuna TPE** 在 validation set；`OPTUNA_N_TRIALS=300` |
 | **時間切分** | 80/20 (train/val) | 70/15/15 (train/valid/test) |
-| **Early stopping** | `stopping_rounds=50` | 計畫未明訂；Optuna 以 F-beta / PR-AUC 為目標 |
+| **Early stopping** | `stopping_rounds=50` | 計畫未明訂；Optuna 以 F-beta / AP (average precision) 為目標 |
 
 ---
 

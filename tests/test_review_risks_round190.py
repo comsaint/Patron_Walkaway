@@ -62,7 +62,7 @@ class TestR702NaNValidationLabels(unittest.TestCase):
             label="nan-val-guard",
         )
         self.assertIsNotNone(model)
-        self.assertEqual(metrics.get("val_prauc"), 0.0)
+        self.assertEqual(metrics.get("val_ap"), 0.0)
         self.assertEqual(metrics.get("threshold"), 0.5)
 
 

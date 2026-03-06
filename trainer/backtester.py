@@ -20,7 +20,7 @@ Evaluation rules (SSOT §10.3)
   contributes at most one True Positive, preventing high-frequency players
   from dominating the metric.  Online scoring is NOT limited to one alert
   per visit; this dedup applies ONLY to offline evaluation.
-* Micro metrics (observation-level): Precision / Recall / PR-AUC / F-beta /
+* Micro metrics (observation-level): Precision / Recall / AP (average precision) / F-beta /
   alerts-per-hour.
 * Macro-by-visit metrics: unweighted mean over visits of per-visit
   Precision and Recall.
@@ -200,7 +200,7 @@ def compute_micro_metrics(
     prec = n_tp / n_alerts if n_alerts > 0 else 0.0
     rec = n_tp / n_pos if n_pos > 0 else 0.0
 
-    prauc = (
+    ap = (
         float(average_precision_score(df["label"], df["score"]))
         if n_pos > 0
         else 0.0
@@ -217,7 +217,7 @@ def compute_micro_metrics(
     return {
         "precision": prec,
         "recall": rec,
-        "prauc": prauc,
+        "ap": ap,
         f"fbeta_{_G1_FBETA}": fb,
         "alerts": n_alerts,
         "true_alerts": n_tp,
