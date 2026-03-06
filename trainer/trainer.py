@@ -957,13 +957,17 @@ def ensure_player_profile_ready(
         logger.warning("Session parquet missing at %s; skip profile auto-build", session_path)
         return
 
-    # DEC-017: fast-mode restricts the profile snapshot range to the effective
-    # data window — no 365-day lookback push-back.  Normal mode still requests
-    # 365 days of snapshots so that 365d-window features have data available.
-    if fast_mode:
-        required_start = window_start.date()
-    else:
-        required_start = (window_start - timedelta(days=365)).date()
+    # OPT-001: Use the nearest month-end on or before window_start as required_start.
+    # This ensures the PIT join has a valid anchor snapshot for bets in the first
+    # (possibly partial) month of the training window, while avoiding building a
+    # full year of stale snapshots that are never actually used.
+    #
+    # Rationale: join_player_profile uses merge_asof(direction="backward"), so a bet
+    # on Feb 15 needs the Jan 31 snapshot.  Previously, normal mode pushed required_start
+    # back a full 365 days (wasteful), and fast-mode used window_start.date() directly
+    # (which would miss the Jan 31 anchor for cross-month windows, producing NaN for
+    # bets in the first partial month).  Both issues are fixed by this single approach.
+    required_start = _latest_month_end_on_or_before(window_start.date())
     required_end = window_end.date()
 
     session_rng = _parquet_date_range(

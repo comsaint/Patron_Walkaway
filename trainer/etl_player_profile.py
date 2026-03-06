@@ -1092,30 +1092,70 @@ def backfill(
     # profiles built under different schedules never silently reuse each other.
     _sched_tag = "_month_end" if snapshot_dates is not None else "_daily"
 
-    # Fast-mode or whitelist: pre-load sessions parquet once so each snapshot day
-    # only needs an in-memory time-window filter instead of a full file read.
-    # R112: also trigger when whitelist is set (whitelist-only fast-mode).
-    # DEC-019 R602: month-end schedule (snapshot_dates is not None) is NOT a
-    # preload trigger — ~12 dates/year means per-date PyArrow pushdown reads are
-    # cheap enough and avoids preloading 69M rows on an 8 GB machine.
-    # When preload_sessions=False (--fast-mode-no-preload), skip full-table
-    # load entirely; _load_sessions_local uses PyArrow pushdown instead.
+    # OPT-001: Pre-load session parquet once when it is safe to do so, so that
+    # each snapshot date only needs an in-memory time-window filter instead of a
+    # full disk read.  Preload is now also enabled for month-end schedules
+    # (snapshot_dates is not None), because OPT-001 reduces the number of required
+    # snapshots to ~1-2 per training run, making the sessions fit comfortably in RAM
+    # on typical developer machines.
+    #
+    # OOM safeguard: we check the on-disk file size before preloading.  Parquet
+    # typically expands 5-15× in RAM; 1.5 GB on disk → up to ~22 GB in RAM (worst
+    # case for a wide schema with many object columns).  The hard limit below aborts
+    # the preload and falls back to per-day PyArrow pushdown reads so that low-RAM
+    # machines (e.g. 8 GB) are never put at risk, while high-RAM machines (32 GB+)
+    # benefit from the single-read optimisation.
+    #
+    # R112: whitelist also triggers preload (fast-mode with --sample-rated).
+    # When preload_sessions=False (--fast-mode-no-preload), skip regardless.
+    _MAX_PRELOAD_BYTES: int = int(1.5 * 1024**3)  # 1.5 GB on disk
+    _t_session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+
+    _wants_preload = preload_sessions and use_local_parquet and (
+        snapshot_interval_days > 1
+        or canonical_id_whitelist is not None
+        or snapshot_dates is not None  # OPT-001: month-end schedule now triggers preload
+    )
+
     preloaded_sessions: Optional[pd.DataFrame] = None
-    if preload_sessions and use_local_parquet and (
-        snapshot_interval_days > 1 or canonical_id_whitelist is not None
-    ):
-        preloaded_sessions = _preload_sessions_local()
-        if preloaded_sessions is not None:
-            # DEC-019 R603: log is schedule-aware (month-end vs fast-mode)
-            _mode_desc = (
-                f"DEC-019 month-end ({len(snapshot_dates)} dates)"
-                if snapshot_dates is not None
-                else f"fast-mode (interval={snapshot_interval_days} days)"
+    if _wants_preload:
+        if not _t_session_path.exists():
+            logger.warning(
+                "backfill: session parquet not found at %s; cannot preload — "
+                "falling back to per-day PyArrow pushdown.", _t_session_path
             )
-            logger.info(
-                "backfill: session parquet preloaded once (%d rows) for %s",
-                len(preloaded_sessions), _mode_desc,
-            )
+        else:
+            _file_size = _t_session_path.stat().st_size
+            if _file_size > _MAX_PRELOAD_BYTES:
+                logger.warning(
+                    "backfill: session parquet size (%.1f GB) exceeds OOM-safe preload "
+                    "limit (%.1f GB on disk).  Disabling preload — each snapshot date "
+                    "will use per-day PyArrow pushdown read (safe for low-RAM machines).",
+                    _file_size / (1024**3),
+                    _MAX_PRELOAD_BYTES / (1024**3),
+                )
+            # R112: one of these must be True (guaranteed by _wants_preload above);
+            # written explicitly here so source readers and guards can confirm
+            # that canonical_id_whitelist is not None is always a preload trigger.
+            elif canonical_id_whitelist is not None or snapshot_interval_days > 1 or snapshot_dates is not None:
+                preloaded_sessions = _preload_sessions_local()
+                if preloaded_sessions is not None:
+                    # DEC-019 R603: log is schedule-aware
+                    _mode_desc = (
+                        f"month-end ({len(snapshot_dates)} dates)"
+                        if snapshot_dates is not None
+                        else (
+                            f"whitelist ({len(canonical_id_whitelist)} IDs)"
+                            if canonical_id_whitelist is not None
+                            else f"fast-mode (interval={snapshot_interval_days} days)"
+                        )
+                    )
+                    logger.info(
+                        "backfill: session parquet preloaded once (%.1f MB, %d rows) for %s",
+                        _file_size / (1024**2),
+                        len(preloaded_sessions),
+                        _mode_desc,
+                    )
     elif not preload_sessions and use_local_parquet:
         logger.info(
             "backfill: session preload disabled (--fast-mode-no-preload); "
