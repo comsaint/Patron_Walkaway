@@ -619,91 +619,81 @@ def load_player_profile(
 
         # R82: push canonical_id IN filter to ClickHouse when provided so only
         # rated-player rows are fetched, capping memory to ~O(rated_players).
-        # R-FIX: when the list is large (>5k), client-side IN expansion exceeds
-        # ClickHouse's default max_query_size (256 KB).  Use a temporary table +
-        # JOIN via a session-scoped client instead.
-        _LARGE_CID_THRESHOLD = 5_000
+        # R-FIX: large lists would exceed ClickHouse's default max_query_size
+        # (256 KB) when expanded client-side.  Solution: chunked IN queries —
+        # split the ID list into batches small enough to stay under the limit,
+        # run one SELECT per batch, then concat in Python.  No CREATE TABLE
+        # permission required; uses the same shared read-only client throughout.
         _cid_list = list(canonical_ids) if canonical_ids else []
+        # Each quoted ID is ~10–20 chars; 4 000 IDs ≈ 60–80 KB — well under 256 KB.
+        _IN_BATCH = 4_000
+        client = get_clickhouse_client()
 
-        if _cid_list and len(_cid_list) > _LARGE_CID_THRESHOLD:
-            logger.info(
-                "player_profile: %d canonical_ids — using temp-table JOIN to avoid max_query_size",
-                len(_cid_list),
-            )
-            import uuid as _uuid
-            import clickhouse_connect as _cc
+        # R-CIN-5: two explicit query strings instead of string-template substitution,
+        # eliminating the double-escape risk and making SQL injection surface clear.
+        _query_no_filter = f"""
+            SELECT
+                canonical_id,
+                snapshot_dtm,
+                {profile_cols_sql}
+            FROM {SOURCE_DB}.{TPROFILE}
+            WHERE snapshot_dtm >= %(snap_lo)s
+              AND snapshot_dtm <= %(snap_hi)s
+            ORDER BY canonical_id, snapshot_dtm
+        """
+        _query_with_filter = f"""
+            SELECT
+                canonical_id,
+                snapshot_dtm,
+                {profile_cols_sql}
+            FROM {SOURCE_DB}.{TPROFILE}
+            WHERE snapshot_dtm >= %(snap_lo)s
+              AND snapshot_dtm <= %(snap_hi)s
+              AND canonical_id IN %(canonical_ids)s
+            ORDER BY canonical_id, snapshot_dtm
+        """
 
-            try:
-                import config as _cfg  # type: ignore[import]
-            except ModuleNotFoundError:
-                import trainer.config as _cfg  # type: ignore[import, no-redef]
-
-            session_id = str(_uuid.uuid4())
-            session_client = _cc.get_client(
-                host=_cfg.CH_HOST,
-                port=_cfg.CH_PORT,
-                username=_cfg.CH_USER,
-                password=_cfg.CH_PASS,
-                secure=_cfg.CH_SECURE,
-                database=_cfg.SOURCE_DB,
-                session_id=session_id,
-            )
-            # Risk-1 fix: guarantee close() regardless of success/failure.
-            try:
-                session_client.command(
-                    "CREATE TEMPORARY TABLE _tmp_profile_cids (canonical_id String)"
-                )
-
-                # Risk-4 fix: 200_000 rows per request → ≤2 round-trips for 323k IDs.
-                _INSERT_BATCH = 200_000
-                for _i in range(0, len(_cid_list), _INSERT_BATCH):
-                    # Risk-3 fix: stage-specific error log before re-raising.
-                    try:
-                        session_client.insert(
-                            "_tmp_profile_cids",
-                            [[cid] for cid in _cid_list[_i: _i + _INSERT_BATCH]],
-                            column_names=["canonical_id"],
-                        )
-                    except Exception as _ins_exc:
-                        logger.error("temp-table insert batch %d failed: %s", _i, _ins_exc)
-                        raise
-
-                # Risk-2 fix: CAST ensures type-safe JOIN even if profile table
-                # stores canonical_id as a numeric type, and prevents index skip.
-                query = f"""
-                    SELECT
-                        p.canonical_id,
-                        p.snapshot_dtm,
-                        {profile_cols_sql}
-                    FROM {SOURCE_DB}.{TPROFILE} p
-                    INNER JOIN _tmp_profile_cids t
-                        ON CAST(p.canonical_id AS String) = t.canonical_id
-                    WHERE p.snapshot_dtm >= %(snap_lo)s
-                      AND p.snapshot_dtm <= %(snap_hi)s
-                    ORDER BY p.canonical_id, p.snapshot_dtm
-                """
-                df = session_client.query_df(query, parameters=_params)
-            finally:
-                session_client.close()
-
+        if not _cid_list:
+            # No ID filter — fetch all players in the time window.
+            df = client.query_df(_query_no_filter, parameters=_params)
+        elif len(_cid_list) <= _IN_BATCH:
+            # Small list: single query, no chunking needed.
+            _params["canonical_ids"] = _cid_list
+            df = client.query_df(_query_with_filter, parameters=_params)
         else:
-            client = get_clickhouse_client()
-            _cid_clause = ""
-            if _cid_list:
-                _cid_clause = "AND canonical_id IN %(canonical_ids)s"
-                _params["canonical_ids"] = _cid_list
-            query = f"""
-                SELECT
-                    canonical_id,
-                    snapshot_dtm,
-                    {profile_cols_sql}
-                FROM {SOURCE_DB}.{TPROFILE}
-                WHERE snapshot_dtm >= %(snap_lo)s
-                  AND snapshot_dtm <= %(snap_hi)s
-                  {_cid_clause}
-                ORDER BY canonical_id, snapshot_dtm
-            """
-            df = client.query_df(query, parameters=_params)
+            # Large list: split into chunks to stay within max_query_size.
+            _n_batches = (len(_cid_list) + _IN_BATCH - 1) // _IN_BATCH
+            logger.info(
+                "player_profile: %d canonical_ids — chunked IN queries (batch=%d)",
+                len(_cid_list), _IN_BATCH,
+            )
+            _parts: list = []
+            for _i in range(0, len(_cid_list), _IN_BATCH):
+                _batch_num = _i // _IN_BATCH + 1
+                # R-CIN-3: batch-level progress logging.
+                if _batch_num % 10 == 1:
+                    logger.info(
+                        "player_profile: batch %d/%d", _batch_num, _n_batches,
+                    )
+                _batch = _cid_list[_i: _i + _IN_BATCH]
+                # R-CIN-4: per-batch error logging before re-raise.
+                try:
+                    _part = client.query_df(
+                        _query_with_filter,
+                        parameters={**_params, "canonical_ids": _batch},
+                    )
+                    _parts.append(_part)
+                except Exception as _batch_exc:
+                    logger.error(
+                        "player_profile: batch %d/%d failed: %s",
+                        _batch_num, _n_batches, _batch_exc,
+                    )
+                    raise
+            # R-CIN-2: guard against empty _parts before concat.
+            # R-CIN-1: sort globally so downstream merge_asof works correctly.
+            df = pd.concat(_parts, ignore_index=True) if _parts else pd.DataFrame()
+            if not df.empty:
+                df.sort_values(["canonical_id", "snapshot_dtm"], inplace=True, ignore_index=True)
 
         logger.info("player_profile: %d rows loaded from ClickHouse", len(df))
         return df if not df.empty else None
