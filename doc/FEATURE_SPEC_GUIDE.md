@@ -14,14 +14,14 @@
 - 候選特徵定義（spec 原始檔）：  
   - `trainer/feature_spec/features_candidates.yaml`（實際使用時由 template 複製或改名自 `.template.yaml`）  
 - 生產特徵清單（active features）：  
-  - `trainer/feature_spec/feature_list.json` 或 `features_active.yaml`（由訓練流程產生）
+  - **`trainer/feature_spec/feature_list.json`**（由訓練流程產生，為 canonical 來源；template 內各 track 的 `active.feature_ids: []` 可視為同一定義的 YAML 表示）
 
 兩者關係：
 
 1. **features_candidates.yaml**：Track Profile / Track LLM / Track Human 的「特徵全集」，包含所有候選。  
 2. 訓練流程（`trainer.py`）讀取 candidates，計算特徵並做 Feature Screening。  
 3. Screening 結果寫入 **feature_list.json**（只留需要真的計算與送入模型的 feature_id）。  
-4. `scorer.py` 只依據 feature_list.json + candidates spec 來計算線上特徵。
+4. `scorer.py` 只依據 feature_list.json 與 **凍結在 model artifact 內的 feature_spec.yaml**（訓練時寫入）來計算線上特徵；若 artifact 內無 feature_spec.yaml 則 fallback 至全域 spec 路徑。
 
 ---
 
@@ -37,20 +37,23 @@ trainer/feature_spec/features_candidates.template.yaml
 
 - `version` / `spec_id` / `description`：人類可讀版本與識別碼。  
 - `tracks_enabled`：三軌開關（Track Profile / Track LLM / Track Human）。  
-- `execution`：時間欄位、分組鍵與排序欄位（`payout_complete_dtm ASC, bet_id ASC`）。  
-- `inference_state`：scorer 端的 DuckDB 歷史保留長度（`history_window_min`）與 cold start 策略。  
+- `execution`：  
+  - `engine`: `"duckdb"`；`time_column`、`partition_key`、`order_by`（例如 `payout_complete_dtm ASC, bet_id ASC`）；`timezone_policy`（例如 `hk_local_tz_naive`）。  
+- `inference_state`：scorer 端的 DuckDB 歷史保留長度（`history_window_min`，須 ≥ track_llm 最大視窗 + buffer）、`history_buffer_min`、cold start 策略（`cold_start_backfill`、`cold_start_suspend_alerts`）。  
 - `guardrails`：  
-  - 禁止在 `expression` 中出現 `SELECT`/`FROM`/`JOIN` 等關鍵字。  
-  - 限定允許的聚合函數與 window 函數。  
-  - 宣告 Track LLM 允許使用的欄位白名單。
+  - 禁止在 `expression`（及 `window_frame`）中出現 SQL 關鍵字：`SELECT`/`FROM`/`JOIN`/`UNION`/`WITH` 等。  
+  - 禁止 DuckDB 檔案存取與 extension 函數（如 `read_parquet`、`read_csv_auto`、`read_json`、`GLOB`、`INSTALL_EXTENSION`、`LOAD_EXTENSION`、`COPY`、`EXPORT`、`IMPORT`），由靜態驗證阻擋。  
+  - 限定允許的聚合函數與 window 函數（allowlist）。  
+  - 宣告 Track LLM 允許使用的欄位白名單（`track_llm_allowed_columns`）。
 
 ### 2.2 Track LLM 區塊（bet-level 特徵）
 
 重點欄位：
 
-- `source_table`: `t_bet`  
+- `name` / `enabled`：軌道顯示名稱與開關。  
+- `source_table`: `t_bet`；`data_scope`: `bet_only`（僅 bet 層級）。  
 - `guardrails.max_window_minutes`: 視窗長度上限（分）。  
-- `guardrails.disallow_following: true`: 禁止使用未來視窗。  
+- `guardrails.disallow_following: true`: 禁止使用未來視窗（FOLLOWING）。  
 - `candidates[]` 中每個特徵包含：
   - `feature_id`: 唯一識別（建議帶窗口與單位，如 `bets_cnt_w15m`）。  
   - `type`: `window` / `lag` / `transform` / `derived`。  
@@ -59,24 +62,37 @@ trainer/feature_spec/features_candidates.template.yaml
   - `window_frame`（僅 `type=window` 需要）：例如 `RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW`。  
   - `depends_on`（僅 `type=derived` 需要）：依賴的其他 feature_id。  
   - `postprocess`: `fill`/`clip`/`safe_div_epsilon` 等穩定化設定。  
-  - `reason_code_category`（可選）：對應 SSOT §12.1 中的 reason code 分類。
+  - `reason_code_category`（可選）：對應 SSOT §12.1 中的 reason code 分類。  
+- `active.feature_ids`: 由訓練流程寫入的生產特徵 ID 清單（初始為 `[]`）；與 `feature_list.json` 對齊。
 
 ### 2.3 Track Human 區塊（狀態機與 Run-level）
 
-- `function_name`: `features.py` 中對應的 Python 向量化函數名稱。  
+- `name` / `enabled`：軌道顯示名稱與開關。  
+- `candidates[]` 中每個特徵：`type`: `python_vectorized`；`function_name`: `features.py` 中對應的 Python 向量化函數名稱。  
 - `input_columns`: 函數需要的原始欄位。  
 - `output_columns`: 函數會產出的欄位（可超過 1 個，例如 `run_id`, `minutes_since_run_start`）。  
-- `dtype`, `postprocess`, `reason_code_category` 同 Track LLM。
+- `dtype`, `postprocess`, `reason_code_category` 同 Track LLM。  
+- `active.feature_ids`: 同上，由訓練流程寫入。
 
 ### 2.4 Track Profile 區塊（player_profile）
 
+- `name` / `enabled`：軌道顯示名稱與開關。  
 - `source_table`: `player_profile`  
 - `join.join_key`: `canonical_id`  
 - `join.snapshot_time_column`: `snapshot_dtm`  
 - `join.pit_rule`: `asof_latest_snapshot_leq_event_time`（`snapshot_dtm <= bet_time` 最近一筆）  
 - `join.on_missing_profile.strategy`: 缺 profile 時的策略（目前預設 `zero_fill`）。  
-- `candidates[].source_column`: profile 表中的實際欄位名稱。  
-- `feature_id`, `dtype`, `postprocess` 同上。
+- `join.on_missing_profile.emit_metric`: 缺 profile 時是否發出指標（例如 `profile_missing_rate`）。  
+- `candidates[].type`: `profile_column`；`candidates[].source_column`: profile 表中的實際欄位名稱。  
+- `feature_id`, `dtype`, `postprocess` 同上。  
+- `active.feature_ids`: 同上，由訓練流程寫入。
+
+### 2.5 scoring_contract（評分合約）
+
+- `pass_through_columns`: 評分時一併傳遞的欄位（如 `bet_id`, `session_id`）。  
+- `required_feature_ids`: 由訓練流程產生，通常為三軌 active feature_ids 的聯集。  
+- `all_numeric_required`: 是否要求所有特徵為數值。  
+- `reject_on_missing_or_extra`: 是否在缺少或多了特徵時拒絕評分。
 
 ---
 
@@ -86,15 +102,14 @@ trainer/feature_spec/features_candidates.template.yaml
 2. 執行兩階段 Feature Screening：  
    - 單變量 + 冗餘剔除（MI / variance / correlation / VIF 等）。  
    - 輕量 LightGBM importance/SHAP（只用 train set）。  
-3. 將最終保留的 feature_id 寫入 `feature_list.json` 或 `features_active.yaml`。  
+3. 將最終保留的 feature_id 寫入 **feature_list.json**（canonical 生產清單）。  
 4. `trainer.py` 只用 active features 訓練模型；`scorer.py` 只計算 active features。
 
-建議另在 model artifact metadata 中記錄：
+**Artifact 凍結與版本追蹤**（與 STATUS Round 105 / R3501 對齊）：
 
-- `candidates_spec_hash`: `features_candidates.yaml` 的 hash  
-- `active_feature_hash`: `feature_list.json` 的 hash  
-
-以便在 `/model_info` 或線上監控中追蹤模型與特徵定義版本。
+- 訓練時會將當時使用的 **features_candidates.yaml 整份複製**到 model 目錄下的 **feature_spec.yaml**（凍結版本），scorer 載入時優先使用此檔，確保 train–serve 一致。  
+- **spec_hash**（例如 MD5 前 12 字元）寫入 **training_metrics.json**。  
+- 建議另記錄 **active_feature_hash**（feature_list.json 的 hash）於 artifact metadata，以便在 `/model_info` 或線上監控中追蹤模型與特徵定義版本。
 
 ---
 
@@ -133,7 +148,7 @@ VERY IMPORTANT CONSTRAINTS:
   - `description`, `rationale`
   - optional `postprocess.fill` and `postprocess.clip`
 - For window features, window_frame MUST be "past and current row only" (PRECEDING + CURRENT ROW). Never use FOLLOWING.
-- Use only allowed functions: COUNT, SUM, AVG, MIN, MAX, STDDEV_SAMP, LAG, basic arithmetic, CASE WHEN.
+- Use only allowed functions: COUNT, SUM, AVG, MIN, MAX, STDDEV_SAMP, LAG, basic arithmetic, CASE WHEN. Do NOT use file-access or extension functions (e.g. read_parquet, GLOB, INSTALL_EXTENSION).
 - Use only the allowed columns from `t_bet` listed above.
 
 Output format:
@@ -175,10 +190,10 @@ Task:
 1. 從 `features_candidates.template.yaml` 複製為新檔案 `features_candidates.yaml`。  
 2. 依照當前資料理解，手動調整：  
    - `track_llm.guardrails.max_window_minutes`  
-   - `history_window_min` 與 buffer  
+   - `inference_state.history_window_min` 與 `history_buffer_min`  
    - Track Profile / Track Human 的實際欄位與函數名稱。  
 3. 把 Track LLM 的 schema 貼給 LLM，使用上面的 Prompt 請它產生一批候選特徵。  
 4. 人工 review 這批 YAML snippet，貼回 `track_llm.candidates`。  
 5. 跑一輪訓練 + Feature Screening，產生 `feature_list.json`。  
-6. 將 `spec_hash` 和 `active_hash` 寫入新模型 artifact，部署後於 `/model_info` 中曝光。
+6. 訓練流程會自動將 spec 凍結為 artifact 內的 **feature_spec.yaml**，並將 **spec_hash** 寫入 **training_metrics.json**；可另將 active list 的 hash 寫入 artifact metadata，部署後於 `/model_info` 中曝光。
 
