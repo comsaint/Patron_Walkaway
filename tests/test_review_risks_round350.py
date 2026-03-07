@@ -45,7 +45,11 @@ class TestR3500TrackLlmHistoryParity(unittest.TestCase):
 
 
 class TestR3501ArtifactSpecFreeze(unittest.TestCase):
-    """R3501: artifact bundle should freeze feature spec + spec hash."""
+    """R3501: artifact bundle should freeze feature spec + spec hash.
+
+    Covers PLAN 特徵整合計畫 Step 7 (Artifact 產出) and R3501/R3507: save_artifact_bundle
+    persists feature_spec.yaml and spec_hash in training_metrics; load_dual_artifacts
+    prefers model_dir/feature_spec.yaml. See STATUS Round 147 Review P2."""
 
     def test_save_artifact_bundle_should_persist_feature_spec_snapshot(self):
         src = inspect.getsource(trainer_mod.save_artifact_bundle)
@@ -139,7 +143,11 @@ class TestR3506FeatureSpecDuckdbFileAccessGuard(unittest.TestCase):
 
 
 class TestR3507ScorerLoadsFrozenArtifactSpec(unittest.TestCase):
-    """R3507: scorer should prefer model artifact feature_spec over global template."""
+    """R3507: scorer should prefer model artifact feature_spec over global template.
+
+    Covers PLAN 特徵整合計畫 Step 7 (Feature Spec 凍結) with R3501/R3507: scorer
+    load_dual_artifacts uses model_dir/feature_spec.yaml for train-serve consistency.
+    See STATUS Round 147 Review P2."""
 
     def test_load_dual_artifacts_should_reference_model_local_feature_spec(self):
         src = inspect.getsource(scorer_mod.load_dual_artifacts)

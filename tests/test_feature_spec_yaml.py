@@ -237,6 +237,26 @@ class TestNoCyclicDependsOn(unittest.TestCase):
         self.assertIsNotNone(spec)
 
 
+class TestTemplateDtypeIntegrity(unittest.TestCase):
+    """Step 8: Template candidates use allowed dtypes only (int, float, str)."""
+
+    ALLOWED_DTYPES = {"int", "float", "str"}
+
+    def test_template_candidates_have_allowed_dtype_or_none(self):
+        spec = features_mod.load_feature_spec(TEMPLATE_YAML)
+        for track_key in ("track_llm", "track_human", "track_profile"):
+            track = spec.get(track_key) or {}
+            for cand in track.get("candidates", []):
+                fid = cand.get("feature_id", "")
+                dtype = cand.get("dtype")
+                if dtype is not None:
+                    self.assertIn(
+                        dtype,
+                        self.ALLOWED_DTYPES,
+                        f"[{track_key}] feature_id {fid!r} has dtype {dtype!r}; allowed: {self.ALLOWED_DTYPES}",
+                    )
+
+
 class TestLoadFeatureSpecFileNotFound(unittest.TestCase):
     """load_feature_spec raises FileNotFoundError for missing paths."""
 

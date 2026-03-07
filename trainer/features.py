@@ -37,6 +37,8 @@ from typing import List, Optional
 
 import numpy as np
 import pandas as pd
+import pathlib
+import yaml as _yaml  # type: ignore[import-untyped]
 
 try:
     from config import (  # type: ignore[import]
@@ -70,115 +72,31 @@ logger = logging.getLogger(__name__)
 #:
 #: Phase 2 additions (wager_mean_180d, wager_p50_180d from t_bet) are not
 #: included here.  See doc/player_profile_spec.md §14.
+
+_yaml_path = pathlib.Path(__file__).parent / "feature_spec" / "features_candidates.template.yaml"
+try:
+    with open(_yaml_path, "r", encoding="utf-8") as _f:
+        _TEMPLATE_SPEC = _yaml.safe_load(_f) or {}
+except FileNotFoundError:
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "Feature Spec YAML not found at %s — PROFILE_FEATURE_COLS will be empty. "
+        "Ensure the template YAML exists before training.",
+        _yaml_path,
+    )
+    _TEMPLATE_SPEC = {}
+
 PROFILE_FEATURE_COLS: List[str] = [
-    # Recency
-    "days_since_last_session",
-    "days_since_first_session",
-    # Frequency
-    "sessions_7d",
-    "sessions_30d",
-    "sessions_90d",
-    "sessions_180d",
-    "sessions_365d",
-    "active_days_30d",
-    "active_days_90d",
-    "active_days_365d",
-    # Monetary
-    "turnover_sum_7d",
-    "turnover_sum_30d",
-    "turnover_sum_90d",
-    "turnover_sum_180d",
-    "turnover_sum_365d",
-    "player_win_sum_30d",
-    "player_win_sum_90d",
-    "player_win_sum_180d",
-    "player_win_sum_365d",
-    "theo_win_sum_30d",
-    "theo_win_sum_180d",
-    "num_bets_sum_30d",
-    "num_bets_sum_180d",
-    "num_games_with_wager_sum_30d",
-    "num_games_with_wager_sum_180d",
-    # Bet intensity
-    "turnover_per_bet_mean_30d",
-    "turnover_per_bet_mean_180d",
-    # Win / Loss & RTP
-    "win_session_rate_30d",
-    "win_session_rate_180d",
-    "actual_rtp_30d",
-    "actual_rtp_180d",
-    "actual_vs_theo_ratio_30d",
-    # Short / Long Ratios
-    "turnover_per_bet_30d_over_180d",
-    "turnover_30d_over_180d",
-    "sessions_30d_over_180d",
-    # Session Duration
-    "avg_session_duration_min_30d",
-    "avg_session_duration_min_180d",
-    # Venue Stickiness (30d/90d; 180d excluded per spec §3.1 — venue refits pollute 180d data)
-    "distinct_table_cnt_30d",
-    "distinct_table_cnt_90d",
-    "distinct_pit_cnt_30d",
-    "distinct_gaming_area_cnt_30d",
-    "top_table_share_30d",
-    "top_table_share_90d",
+    c["feature_id"]
+    for c in _TEMPLATE_SPEC.get("track_profile", {}).get("candidates", [])
+    if c.get("feature_id")
 ]
 
 # Minimum lookback (days) required to compute each profile feature.
-# Recency features (days_since_*) are always computable given ≥1 day of data.
-# Ratio features (e.g. 30d_over_180d) require the longer of the two windows.
 _PROFILE_FEATURE_MIN_DAYS: dict = {
-    # Recency — computable from any non-empty session history
-    "days_since_last_session": 1,
-    "days_since_first_session": 1,
-    # Frequency
-    "sessions_7d": 7,
-    "sessions_30d": 30,
-    "sessions_90d": 90,
-    "sessions_180d": 180,
-    "sessions_365d": 365,
-    "active_days_30d": 30,
-    "active_days_90d": 90,
-    "active_days_365d": 365,
-    # Monetary
-    "turnover_sum_7d": 7,
-    "turnover_sum_30d": 30,
-    "turnover_sum_90d": 90,
-    "turnover_sum_180d": 180,
-    "turnover_sum_365d": 365,
-    "player_win_sum_30d": 30,
-    "player_win_sum_90d": 90,
-    "player_win_sum_180d": 180,
-    "player_win_sum_365d": 365,
-    "theo_win_sum_30d": 30,
-    "theo_win_sum_180d": 180,
-    "num_bets_sum_30d": 30,
-    "num_bets_sum_180d": 180,
-    "num_games_with_wager_sum_30d": 30,
-    "num_games_with_wager_sum_180d": 180,
-    # Bet intensity
-    "turnover_per_bet_mean_30d": 30,
-    "turnover_per_bet_mean_180d": 180,
-    # Win / Loss & RTP
-    "win_session_rate_30d": 30,
-    "win_session_rate_180d": 180,
-    "actual_rtp_30d": 30,
-    "actual_rtp_180d": 180,
-    "actual_vs_theo_ratio_30d": 30,
-    # Short / Long Ratios — require the longer window (180d) for both numerator and denominator
-    "turnover_per_bet_30d_over_180d": 180,
-    "turnover_30d_over_180d": 180,
-    "sessions_30d_over_180d": 180,
-    # Session Duration
-    "avg_session_duration_min_30d": 30,
-    "avg_session_duration_min_180d": 180,
-    # Venue Stickiness
-    "distinct_table_cnt_30d": 30,
-    "distinct_table_cnt_90d": 90,
-    "distinct_pit_cnt_30d": 30,
-    "distinct_gaming_area_cnt_30d": 30,
-    "top_table_share_30d": 30,
-    "top_table_share_90d": 90,
+    c["feature_id"]: c.get("min_lookback_days", 365)
+    for c in _TEMPLATE_SPEC.get("track_profile", {}).get("candidates", [])
+    if c.get("feature_id")
 }
 
 # R122: enforce at import time that _PROFILE_FEATURE_MIN_DAYS stays in sync with
@@ -189,8 +107,6 @@ assert set(_PROFILE_FEATURE_MIN_DAYS) == set(PROFILE_FEATURE_COLS), (
     f"missing: {set(PROFILE_FEATURE_COLS) - set(_PROFILE_FEATURE_MIN_DAYS)}, "
     f"extra: {set(_PROFILE_FEATURE_MIN_DAYS) - set(PROFILE_FEATURE_COLS)}"
 )
-
-
 def get_profile_feature_cols(max_lookback_days: int = 365) -> List[str]:
     """Return the subset of PROFILE_FEATURE_COLS computable for *max_lookback_days* of data.
 
@@ -222,6 +138,92 @@ def get_profile_feature_cols(max_lookback_days: int = 365) -> List[str]:
         col for col in PROFILE_FEATURE_COLS
         if _PROFILE_FEATURE_MIN_DAYS.get(col, 365) <= max_lookback_days
     ]
+
+
+# ---------------------------------------------------------------------------
+# Feature Spec YAML helpers (PLAN: 特徵整合 Step 2)
+# ---------------------------------------------------------------------------
+
+def _is_screening_ineligible(val) -> bool:
+    """Return True if *val* explicitly marks a candidate as not screening-eligible.
+
+    Handles the following representations that all mean "not eligible":
+    - Python ``False`` (canonical YAML ``false``)
+    - Integer ``0``
+    - String ``"false"`` or ``"False"`` (defensive guard against YAML authored as string)
+
+    Anything else (``True``, ``1``, ``"true"``, ``None`` / missing) is treated as eligible.
+    """
+    if val is False:
+        return True
+    if val is True or val is None:
+        return False
+    if isinstance(val, int) and val == 0:
+        return True
+    if isinstance(val, str) and val.strip().lower() == "false":
+        return True
+    return False
+
+
+def get_candidate_feature_ids(
+    spec: dict,
+    track: str,
+    screening_only: bool = False,
+) -> List[str]:
+    """從 YAML spec 讀取某一軌的 candidate feature_id 列表。
+
+    track 為 "track_llm" | "track_human" | "track_profile"。
+    screening_only=True 時排除 dtype='str' 或 screening_eligible 為 false/0/"false"
+    的候選（中間變數不參與篩選）。
+    """
+    candidates = ((spec.get(track) or {}).get("candidates") or [])
+    out: List[str] = []
+    for c in candidates:
+        fid = c.get("feature_id")
+        if not fid:
+            continue
+        if screening_only:
+            if _is_screening_ineligible(c.get("screening_eligible")):
+                continue
+            if c.get("dtype") == "str":
+                continue
+        out.append(fid)
+    return out
+
+
+def get_all_candidate_feature_ids(
+    spec: dict,
+    screening_only: bool = False,
+) -> List[str]:
+    """三軌候選 feature_id 合併去重（order: track_llm, track_human, track_profile）。"""
+    ids_llm = get_candidate_feature_ids(spec, "track_llm", screening_only)
+    ids_human = get_candidate_feature_ids(spec, "track_human", screening_only)
+    ids_profile = get_candidate_feature_ids(spec, "track_profile", screening_only)
+    return list(dict.fromkeys(ids_llm + ids_human + ids_profile))
+
+
+def get_profile_min_lookback(spec: dict) -> dict:
+    """從 track_profile.candidates 讀取 { feature_id: min_lookback_days }。
+
+    若候選無 min_lookback_days 則預設 365。
+    """
+    candidates = ((spec.get("track_profile") or {}).get("candidates") or [])
+    return {
+        c["feature_id"]: c.get("min_lookback_days", 365)
+        for c in candidates
+        if c.get("feature_id")
+    }
+
+
+def coerce_feature_dtypes(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+) -> pd.DataFrame:
+    """將指定欄位強制為數值；非數值 → NaN（訓練與推論共用，train-serve parity）。"""
+    for col in feature_cols:
+        if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +595,9 @@ def screen_features(
         )
 
     X = feature_matrix[feature_names].copy()
+    # feat-consolidation Step 5: coerce non-numeric columns before std/MI/corr,
+    # avoiding X.std() failure on string columns (e.g. screening_eligible=false).
+    coerce_feature_dtypes(X, list(X.columns))
 
     # Drop zero-variance columns
     std = X.std()
@@ -908,6 +913,15 @@ def _validate_feature_spec(spec: dict) -> None:
         "COPY", "EXPORT", "IMPORT",
     } | {kw.upper() for kw in yaml_kw_list}
 
+    # R112-2: Build allowed function whitelist (aggregate + window).  Applied only to
+    # window/transform/lag type candidates; derived and passthrough are exempt.
+    _DEFAULT_ALLOWED_AGG: set = {"COUNT", "SUM", "AVG", "MIN", "MAX", "STDDEV_SAMP"}
+    _DEFAULT_ALLOWED_WIN: set = {"LAG"}
+    yaml_agg = {f.upper() for f in (yaml_guardrails.get("allowed_aggregate_functions") or [])}
+    yaml_win = {f.upper() for f in (yaml_guardrails.get("allowed_window_functions") or [])}
+    allowed_funcs: set = _DEFAULT_ALLOWED_AGG | _DEFAULT_ALLOWED_WIN | yaml_agg | yaml_win
+    _FUNC_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
     for track_key in ("track_llm", "track_human", "track_profile"):
         # R2006: handle ``track_key: null`` in YAML without AttributeError
         track = spec.get(track_key) or {}
@@ -928,6 +942,7 @@ def _validate_feature_spec(spec: dict) -> None:
             if track_key == "track_llm":
                 expr = cand.get("expression", "")
                 wf = cand.get("window_frame", "")
+                ftype = cand.get("type", "window")
 
                 # No FOLLOWING in window_frame
                 if "FOLLOWING" in wf.upper():
@@ -962,6 +977,23 @@ def _validate_feature_spec(spec: dict) -> None:
                         f"[track_llm] '{fid}': expression contains disallowed SQL keyword(s) "
                         f"{forbidden}: {expr!r}"
                     )
+
+                # R112-2: For window/transform/lag types with a non-empty expression,
+                # every function call must appear in the allowed-functions whitelist.
+                # Derived and passthrough types are exempt (derived references column
+                # names produced by preceding window expressions; passthrough has no
+                # expression).
+                if ftype in ("window", "transform", "lag") and expr:
+                    found_funcs = {
+                        m.upper() for m in _FUNC_CALL_RE.findall(expr)
+                    }
+                    unknown = found_funcs - allowed_funcs
+                    if unknown:
+                        errors.append(
+                            f"[track_llm] '{fid}': expression uses function(s) not in "
+                            f"allowed_aggregate_functions / allowed_window_functions: "
+                            f"{sorted(unknown)} in {expr!r}"
+                        )
 
     # ── Duplicate feature_id check ──────────────────────────────────────────
     seen: set = set()
@@ -1071,7 +1103,7 @@ def compute_track_llm_features(
     try:
         from trainer.duckdb_schema import prepare_bets_for_duckdb
     except ModuleNotFoundError:
-        from duckdb_schema import prepare_bets_for_duckdb  # type: ignore[import-not-found]
+        from duckdb_schema import prepare_bets_for_duckdb  # type: ignore[import-not-found,no-redef]
 
     # R2006: use ``or {}`` so a null track_llm section doesn't raise AttributeError.
     llm_track = feature_spec.get("track_llm") or {}
@@ -1173,6 +1205,11 @@ def compute_track_llm_features(
                     f"ORDER BY payout_complete_dtm ASC, bet_id ASC"
                     f') AS "{fid}"'
                 )
+        elif ftype == "passthrough":
+            # R112-1: raw column pass-through — select the column directly without
+            # any computation.  The column must already exist in bets_df so that
+            # DuckDB can resolve it from the registered "bets" table.
+            sql_expr = f'"{fid}" AS "{fid}"'
         else:
             # "derived": plain scalar expression; relies on lateral column
             # references to window features already computed earlier in SELECT

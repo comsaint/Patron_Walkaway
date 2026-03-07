@@ -38,16 +38,19 @@ try:
     from features import (  # type: ignore[import]
         PROFILE_FEATURE_COLS,
         join_player_profile as _join_profile,
+        coerce_feature_dtypes,
     )
 except ImportError:
     try:
         from trainer.features import (  # type: ignore[import, attr-defined]
             PROFILE_FEATURE_COLS,
             join_player_profile as _join_profile,
+            coerce_feature_dtypes,
         )
     except ImportError:
         PROFILE_FEATURE_COLS = []  # type: ignore[assignment]
         _join_profile = None  # type: ignore[assignment]
+        coerce_feature_dtypes = None  # type: ignore[assignment]
 
 try:
     from db_conn import get_clickhouse_client  # type: ignore[import]
@@ -134,6 +137,7 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
     artifacts: dict = {
         "rated": None,
         "feature_list": [],
+        "feature_list_meta": None,  # list of {name, track} when from feature_list.json (Step 6)
         "reason_code_map": {},
         "model_version": "unknown",
         "feature_spec": None,
@@ -165,6 +169,9 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
                 (entry["name"] if isinstance(entry, dict) else str(entry))
                 for entry in raw
             ]
+            # feat-consolidation Step 6: keep name+track so profile vs non-profile is YAML-driven
+            if raw and isinstance(raw[0], dict) and "track" in raw[0]:
+                artifacts["feature_list_meta"] = raw
 
     if reason_map_path.exists():
         with reason_map_path.open(encoding="utf-8") as fh:
@@ -898,8 +905,16 @@ def _score_df(
     df = df.copy()
     # R74/R79: profile features stay NaN when no prior snapshot exists —
     # LightGBM routes them via its trained default-child (NaN-aware split).
-    # Non-profile features are always computable; default to 0.0 when absent.
-    _profile_in_list = set(PROFILE_FEATURE_COLS) & set(feature_list)
+    # Step 6: profile vs non-profile from artifact track (YAML-driven); fallback to PROFILE_FEATURE_COLS.
+    # Step 8 backward compat: accept legacy "profile" as track_profile so old feature_list.json works.
+    _meta = artifacts.get("feature_list_meta")
+    if _meta and isinstance(_meta, list):
+        _profile_in_list = {
+            e["name"] for e in _meta
+            if isinstance(e, dict) and e.get("track") in ("track_profile", "profile")
+        }
+    else:
+        _profile_in_list = set(PROFILE_FEATURE_COLS) & set(feature_list)
     _non_profile_in_list = [c for c in feature_list if c not in _profile_in_list]
     for col in _non_profile_in_list:
         if col not in df.columns:
@@ -908,10 +923,13 @@ def _score_df(
         if col not in df.columns:
             df[col] = np.nan
     df[_non_profile_in_list] = df[_non_profile_in_list].fillna(0.0)
-    # Coerce feature columns to numeric (ClickHouse/joins can yield object); LightGBM requires int/float/bool
-    for col in feature_list:
-        if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Step 6: use shared coerce_feature_dtypes (train-serve parity); fallback to inline coerce if import failed.
+    if coerce_feature_dtypes is not None:
+        coerce_feature_dtypes(df, feature_list)
+    else:
+        for col in feature_list:
+            if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
     df[_non_profile_in_list] = df[_non_profile_in_list].fillna(0.0)
 
     is_rated = (

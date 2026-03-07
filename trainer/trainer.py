@@ -21,7 +21,7 @@ Artifact format (version-tagged, v10 single-model)
 --------------------------------------------------
 models/
   model.pkl                 LightGBM model for rated (casino-card) players
-  feature_list.json         [{name, track}]  track ∈ {"B", "legacy"}
+  feature_list.json         [{name, track}]  track ∈ {"track_llm", "track_human", "track_profile"} (PLAN Step 7)
   model_version             YYYYMMDD-HHMMSS-<git7>  (plain text)
   training_metrics.json     validation + test metrics, feature importance (gain), Optuna best params
 
@@ -116,7 +116,7 @@ except ModuleNotFoundError:
     BET_AVAIL_DELAY_MIN = _cfg.BET_AVAIL_DELAY_MIN
     SESSION_AVAIL_DELAY_MIN = _cfg.SESSION_AVAIL_DELAY_MIN
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
-    OPTUNA_TIMEOUT_SECONDS: Optional[int] = getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", 10 * 60)
+    OPTUNA_TIMEOUT_SECONDS: Optional[int] = getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", 10 * 60)  # type: ignore[no-redef]
     # G1_PRECISION_MIN / G1_ALERT_VOLUME_MIN_PER_HOUR / G1_FBETA intentionally
     # not imported — deprecated per DEC-009/010; rollback path only.
     PLACEHOLDER_PLAYER_ID = _cfg.PLACEHOLDER_PLAYER_ID
@@ -140,7 +140,7 @@ except ModuleNotFoundError:
     NEG_SAMPLE_FRAC_ASSUMED_POS_RATE = getattr(_cfg, "NEG_SAMPLE_FRAC_ASSUMED_POS_RATE", 0.15)
     NEG_SAMPLE_RAM_SAFETY = getattr(_cfg, "NEG_SAMPLE_RAM_SAFETY", 0.75)
     NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT = getattr(_cfg, "NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT", 200 * 1024 * 1024)
-    PRODUCTION_NEG_POS_RATIO: Optional[float] = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)
+    PRODUCTION_NEG_POS_RATIO: Optional[float] = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)  # type: ignore[no-redef]
 
 # Module-level pipeline imports (same try/except pattern)
 try:
@@ -159,8 +159,10 @@ try:
         load_feature_spec,
         join_player_profile,
         screen_features,
+        coerce_feature_dtypes,
         PROFILE_FEATURE_COLS,
-        get_profile_feature_cols,
+        get_all_candidate_feature_ids,
+        get_candidate_feature_ids,
     )
     from db_conn import get_clickhouse_client  # type: ignore[import]
     from etl_player_profile import (  # type: ignore[import]
@@ -184,8 +186,10 @@ except ModuleNotFoundError:
         load_feature_spec,
         join_player_profile,
         screen_features,
+        coerce_feature_dtypes,
         PROFILE_FEATURE_COLS,
-        get_profile_feature_cols,
+        get_all_candidate_feature_ids,
+        get_candidate_feature_ids,
     )
     from trainer.db_conn import get_clickhouse_client  # type: ignore[import]
     from trainer.etl_player_profile import (  # type: ignore[import]
@@ -215,7 +219,7 @@ _CANONICAL_MAP_SESSION_COLS: list = [
 #                       gaming_day, wager, lud_dtm, __etl_insert_Dtm
 #   - Track B:          status  (loss_streak needs it; run_boundary uses payout_complete_dtm)
 #   - Track LLM YAML:   payout_odds, is_back_bet, position_idx  (allowed_columns whitelist)
-#   - Legacy features:  base_ha  (LEGACY_FEATURE_COLS)
+#   - Legacy / Track LLM: base_ha, etc. (see feature_spec YAML)
 #   - Output chunk:     run_id, canonical_id, is_rated, label added downstream
 #
 # If a future feature spec references additional source columns, add them here.
@@ -250,32 +254,9 @@ OUT_DIR = BASE_DIR / "out_trainer"
 for _d in (DATA_DIR, CHUNK_DIR, LOCAL_PARQUET_DIR, MODEL_DIR, OUT_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Track-B feature column list (shared with scorer via feature_list.json)
-# ---------------------------------------------------------------------------
-TRACK_B_FEATURE_COLS: List[str] = [
-    "loss_streak",
-    # "run_id" removed intentionally (R67): it is an ordinal per-player sequence
-    # without cross-player comparability. LightGBM might learn spurious patterns.
-    # It remains in the DataFrame for sample weighting but is not a model feature.
-    "minutes_since_run_start",
-]
-
-# Legacy feature columns (kept for backward compat until scorer is refactored)
-LEGACY_FEATURE_COLS: List[str] = [
-    "wager",
-    "payout_odds",
-    "base_ha",
-    "is_back_bet",
-    "position_idx",
-    "cum_bets",
-    "cum_wager",
-    "avg_wager_sofar",
-    "time_of_day_sin",
-    "time_of_day_cos",
-]
-
-ALL_FEATURE_COLS: List[str] = TRACK_B_FEATURE_COLS + LEGACY_FEATURE_COLS + PROFILE_FEATURE_COLS
+# Feature column lists are now from Feature Spec YAML (get_all_candidate_feature_ids /
+# get_candidate_feature_ids). See feat-consolidation Step 3; no TRACK_B_FEATURE_COLS,
+# LEGACY_FEATURE_COLS, or ALL_FEATURE_COLS here.
 
 # Extra days of bet history pulled before each chunk window_start to give
 # Track-B state machines (loss_streak, run_boundary) cross-chunk context.
@@ -1334,47 +1315,6 @@ def add_track_b_features(
 
 
 # ---------------------------------------------------------------------------
-# Legacy features (session-based aggregates — kept for parity with old scorer)
-# ---------------------------------------------------------------------------
-
-def add_legacy_features(
-    bets: pd.DataFrame,
-    sessions: pd.DataFrame,
-) -> pd.DataFrame:
-    """Compute legacy session-level aggregates merged into bets.
-
-    These mirror the features used by the pre-Phase-1 scorer so that the
-    legacy scorer path can keep running until Step 7 refactors it.
-    """
-    sess = sessions[
-        [c for c in ("session_id", "session_start_dtm", "session_end_dtm") if c in sessions.columns]
-    ].drop_duplicates(subset=["session_id"], keep="last").copy()
-
-    df = bets.merge(sess, on="session_id", how="left", validate="many_to_one")
-
-    # session_start_dtm availability guard
-    if "session_start_dtm" not in df.columns:
-        df["session_start_dtm"] = pd.NaT
-
-    df["cum_bets"] = df.groupby("session_id").cumcount() + 1
-    df["cum_wager"] = df.groupby("session_id")["wager"].cumsum().fillna(0)
-    df["avg_wager_sofar"] = (df["cum_wager"] / df["cum_bets"]).fillna(0)
-
-    # Cyclic time-of-day encoding
-    min_into_day = (
-        df["payout_complete_dtm"].dt.hour * 60 + df["payout_complete_dtm"].dt.minute
-    )
-    df["time_of_day_sin"] = np.sin(2 * np.pi * min_into_day / 1440)
-    df["time_of_day_cos"] = np.cos(2 * np.pi * min_into_day / 1440)
-
-    for col in LEGACY_FEATURE_COLS:
-        if col in df.columns:
-            df[col] = df[col].fillna(0)
-
-    return df
-
-
-# ---------------------------------------------------------------------------
 # Chunk processing
 # ---------------------------------------------------------------------------
 
@@ -1760,14 +1700,20 @@ def process_chunk(
     # Non-rated bets and bets without a prior snapshot receive 0 for all profile columns.
     labeled = join_player_profile(labeled, profile_df)
 
-    # --- Legacy (Track B) features ---
-    labeled = add_legacy_features(labeled, sessions)
-
     # Ensure all non-profile feature columns exist with numeric defaults.
     # R74: profile columns are intentionally left as NaN when a player has no
     # prior snapshot — LightGBM routes them to the trained default-child.
-    # Blanket fillna(0) across ALL_FEATURE_COLS would erase that signal.
-    _non_profile_cols = [c for c in ALL_FEATURE_COLS if c not in PROFILE_FEATURE_COLS]
+    # Blanket fillna(0) across all candidate cols would erase that signal.
+    # R127-2: derive profile set from feature_spec/YAML (SSOT). When feature_spec is None
+    # (e.g. YAML path missing), fallback to PROFILE_FEATURE_COLS from features.py; long-term
+    # PLAN Step 3 may move this to load default YAML or reject run (Round 141 Review P1).
+    _all_candidate_cols = get_all_candidate_feature_ids(feature_spec, screening_only=True) if feature_spec else list(PROFILE_FEATURE_COLS)
+    _yaml_profile_set = (
+        set(get_candidate_feature_ids(feature_spec, "track_profile", screening_only=False))
+        if feature_spec
+        else set(PROFILE_FEATURE_COLS)
+    )
+    _non_profile_cols = [c for c in _all_candidate_cols if c not in _yaml_profile_set]
     for col in _non_profile_cols:
         if col not in labeled.columns:
             labeled[col] = 0
@@ -2490,6 +2436,11 @@ def train_single_rated_model(
 
     sw_rated = compute_sample_weights(train_rated)
     avail_cols = [c for c in feature_cols if c in train_rated.columns]
+    # R123-1: coerce object columns to numeric before building X_train so LightGBM
+    # never receives an object-dtype feature (which would crash fit()).
+    coerce_feature_dtypes(train_rated, avail_cols)
+    if not val_rated.empty:
+        coerce_feature_dtypes(val_rated, avail_cols)
     X_tr, y_tr = train_rated[avail_cols], train_rated["label"]
     X_vl = val_rated[avail_cols] if not val_rated.empty else X_tr.head(0)
     y_vl = val_rated["label"] if not val_rated.empty else y_tr.head(0)
@@ -2612,12 +2563,13 @@ def save_artifact_bundle(
     # DEC-024 / R3501: freeze a copy of the feature spec into the artifact bundle so
     # the scorer can load an exact match to training-time spec_hash for reproducibility.
     spec_hash: Optional[str] = None
-    if feature_spec_path is not None:
-        _fsp = Path(feature_spec_path)
-        if _fsp.exists():
-            import shutil as _shutil
-            _shutil.copy2(_fsp, MODEL_DIR / "feature_spec.yaml")
-            spec_hash = hashlib.md5(_fsp.read_bytes()).hexdigest()[:12]
+    feature_spec: Optional[dict] = None
+    _fsp = Path(feature_spec_path) if feature_spec_path is not None else FEATURE_SPEC_PATH
+    if _fsp.exists():
+        import shutil as _shutil
+        _shutil.copy2(_fsp, MODEL_DIR / "feature_spec.yaml")
+        spec_hash = hashlib.md5(_fsp.read_bytes()).hexdigest()[:12]
+        feature_spec = load_feature_spec(_fsp)
     # v10 single-model format (DEC-021): one model.pkl only
     if rated:
         _pkl_path = MODEL_DIR / "model.pkl"
@@ -2628,15 +2580,17 @@ def save_artifact_bundle(
         )
         os.replace(_tmp, _pkl_path)
 
-    _legacy_set = set(LEGACY_FEATURE_COLS)
+    _profile_set = set(get_candidate_feature_ids(feature_spec, "track_profile", screening_only=False)) if feature_spec else set(PROFILE_FEATURE_COLS)
+    _llm_set = set(get_candidate_feature_ids(feature_spec, "track_llm", screening_only=False)) if feature_spec else set()
+    _human_set = set(get_candidate_feature_ids(feature_spec, "track_human", screening_only=False)) if feature_spec else set()
+
     feature_list = [
         {
             "name": c,
             "track": (
-                "profile" if c in PROFILE_FEATURE_COLS
-                else "B" if c in TRACK_B_FEATURE_COLS
-                else "legacy" if c in _legacy_set
-                else "LLM"   # Track LLM (DuckDB + feature spec)
+                "track_profile" if c in _profile_set
+                else "track_human" if c in _human_set
+                else "track_llm"
             ),
         }
         for c in feature_cols
@@ -2646,31 +2600,24 @@ def save_artifact_bundle(
     )
 
     # reason_code_map.json: feature name -> short reason code for SHAP output.
-    # Static entries for Track B + legacy features; Track LLM features fall back
-    # to a generated code so the scorer never hits a missing-key error.
-    _STATIC_REASON_CODES: dict[str, str] = {
-        "loss_streak": "LOSS_STREAK",
-        "minutes_since_run_start": "RUN_DURATION",
-        "wager": "BET_SIZE",
-        "payout_odds": "PAYOUT_ODDS",
-        "base_ha": "HOUSE_EDGE",
-        "is_back_bet": "BACK_BET",
-        "position_idx": "TABLE_POSITION",
-        "cum_bets": "CUM_BETS",
-        "cum_wager": "CUM_WAGER",
-        "avg_wager_sofar": "AVG_WAGER",
-        "time_of_day_sin": "TIME_OF_DAY",
-        "time_of_day_cos": "TIME_OF_DAY",
-    }
+    # Generated from feature_spec (DEC-024 / TRN-XX).
     reason_code_map: dict[str, str] = {}
+    if feature_spec is not None:
+        for track in ["track_llm", "track_human", "track_profile"]:
+            for c in feature_spec.get(track, {}).get("candidates", []):
+                fid = c.get("feature_id")
+                rcode = c.get("reason_code_category")
+                if fid and rcode:
+                    reason_code_map[fid] = rcode
+
+    # Fallback for any missing code
     for feat in feature_cols:
-        if feat in _STATIC_REASON_CODES:
-            reason_code_map[feat] = _STATIC_REASON_CODES[feat]
-        elif feat in PROFILE_FEATURE_COLS:
-            # R76: profile features use PROFILE_ prefix for scorer readability
-            reason_code_map[feat] = f"PROFILE_{feat[:28].upper()}"
-        else:
-            reason_code_map[feat] = f"FEAT_{feat[:30].upper()}"
+        if feat not in reason_code_map:
+            if feat in PROFILE_FEATURE_COLS:
+                reason_code_map[feat] = f"PROFILE_{feat[:28].upper()}"
+            else:
+                reason_code_map[feat] = f"FEAT_{feat[:30].upper()}"
+
     (MODEL_DIR / "reason_code_map.json").write_text(
         json.dumps(reason_code_map, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -3127,7 +3074,7 @@ def run_pipeline(args) -> None:
             len(test_df), MIN_VALID_TEST_ROWS,
         )
 
-    active_feature_cols = ALL_FEATURE_COLS
+    active_feature_cols = get_all_candidate_feature_ids(feature_spec, screening_only=True)
 
     # 5b. Full-feature screening (DEC-020).
     # Runs on the TRAINING SET ONLY to comply with TRN-09 anti-leakage rules.
@@ -3174,16 +3121,20 @@ def run_pipeline(args) -> None:
             "screen_features: %d -> %d features retained  (%.1fs)",
             len(_present_candidate_cols), len(screened_cols), _el,
         )
-        # R1001: post-screening sanity — ensure at least one Track-B feature survives.
-        # Re-add any missing Track-B features from train_df as a fallback rather than
-        # failing silently.
+        # R1001: post-screening sanity — ensure at least one Track Human feature survives.
+        # Use YAML feature_spec (SSOT) instead of hardcoded list (feat-consolidation R123-2).
         _screened_set = set(screened_cols)
-        if not _screened_set.intersection(TRACK_B_FEATURE_COLS):
-            _missing_track_b = [c for c in TRACK_B_FEATURE_COLS if c in train_df.columns]
+        _yaml_track_human = (
+            set(get_candidate_feature_ids(feature_spec, "track_human", screening_only=True))
+            if feature_spec is not None
+            else set()
+        )
+        if _yaml_track_human and not _screened_set.intersection(_yaml_track_human):
+            _missing_track_b = [c for c in _yaml_track_human if c in train_df.columns]
             if _missing_track_b:
                 logger.warning(
-                    "screen_features: no TRACK_B_FEATURE_COLS survived screening — "
-                    "re-appending %d Track-B features as fallback (R1001)",
+                    "screen_features: no track_human features survived screening — "
+                    "re-appending %d track_human features as fallback (R1001)",
                     len(_missing_track_b),
                 )
                 screened_cols = screened_cols + [

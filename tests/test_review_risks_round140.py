@@ -7,17 +7,19 @@ Tests-only: no production code changes.
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import inspect
+import json
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import pandas as pd
 from zoneinfo import ZoneInfo
 
+import trainer.trainer as trainer_mod
 from trainer.trainer import ensure_player_profile_ready, run_pipeline
 
 HK_TZ = ZoneInfo("Asia/Hong_Kong")
@@ -95,9 +97,42 @@ class TestR207FeatureTrackClassificationGuardrail(unittest.TestCase):
 
             feature_list = json.loads((model_dir / "feature_list.json").read_text(encoding="utf-8"))
             track_by_name = {item["name"]: item["track"] for item in feature_list}
-            self.assertEqual(track_by_name["loss_streak"], "B")
-            self.assertEqual(track_by_name["days_since_last_session"], "profile")
-            self.assertEqual(track_by_name["sessions_30d"], "profile")
+            self.assertEqual(track_by_name["loss_streak"], "track_human")
+            self.assertEqual(track_by_name["days_since_last_session"], "track_profile")
+            self.assertEqual(track_by_name["sessions_30d"], "track_profile")
+
+
+class TestR144SaveArtifactBundleWhenFeatureSpecNone(unittest.TestCase):
+    """Round 144 Review P3: when feature_spec is None, save_artifact_bundle writes non-profile as track_llm."""
+
+    def test_feature_list_non_profile_track_llm_when_spec_path_missing(self):
+        """When feature_spec_path points to nonexistent file, feature_spec is None; non-profile cols get track 'track_llm'."""
+        feature_cols = ["loss_streak", "days_since_last_session"]
+        nonexistent_spec = Path("/nonexistent/features_candidates.yaml")
+
+        with TemporaryDirectory() as td:
+            model_dir = Path(td)
+            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+                trainer_mod.save_artifact_bundle(
+                    rated=None,
+                    feature_cols=feature_cols,
+                    combined_metrics={},
+                    model_version="r144-test",
+                    feature_spec_path=nonexistent_spec,
+                )
+            feature_list = json.loads((model_dir / "feature_list.json").read_text(encoding="utf-8"))
+            track_by_name = {item["name"]: item["track"] for item in feature_list}
+            self.assertEqual(
+                track_by_name["loss_streak"],
+                "track_llm",
+                "When feature_spec is None, non-profile (not in PROFILE_FEATURE_COLS) must get track_llm fallback.",
+            )
+            self.assertEqual(
+                track_by_name["days_since_last_session"],
+                "track_profile",
+                "Profile cols still from PROFILE_FEATURE_COLS when spec is None.",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

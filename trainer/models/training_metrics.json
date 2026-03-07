@@ -1,107 +1,293 @@
 {
   "rated": {
     "label": "rated",
-    "val_ap": 0.1815846846897936,
-    "val_precision": 0.1912532011339204,
-    "val_recall": 0.2742824035430558,
-    "val_f1": 0.225363590519415,
-    "val_fbeta_05": 0.20357842043962035,
-    "threshold": 0.7884809636204453,
-    "val_samples": 744001,
-    "val_positives": 101833,
-    "val_random_ap": 0.13687212786004319,
+    "val_ap": 0.2101043915278645,
+    "val_precision": 0.2335868740951812,
+    "val_recall": 0.2755937533890034,
+    "val_f1": 0.25285755152299105,
+    "val_fbeta_05": 0.24093158633243583,
+    "threshold": 0.7997237561046193,
+    "val_samples": 269202,
+    "val_positives": 36884,
+    "val_random_ap": 0.1370123550345094,
     "best_hyperparams": {
-      "n_estimators": 400,
-      "learning_rate": 0.05,
-      "num_leaves": 31,
-      "max_depth": 8,
-      "min_child_samples": 20
+      "n_estimators": 750,
+      "learning_rate": 0.0906859411595227,
+      "max_depth": 4,
+      "num_leaves": 39,
+      "min_child_samples": 94,
+      "colsample_bytree": 0.649203200766181,
+      "subsample": 0.8163151963811591,
+      "reg_alpha": 0.0009903029343708322,
+      "reg_lambda": 0.009940329995997628
     },
     "_uncalibrated": false,
-    "train_ap": 0.18764969836377324,
-    "train_precision": 0.19896807242739864,
-    "train_recall": 0.28534302099677905,
-    "train_f1": 0.2344532332180752,
-    "train_samples": 3546124,
-    "train_positives": 470977,
-    "train_random_ap": 0.132814588547947,
-    "test_ap": 0.1826257200677873,
-    "test_precision": 0.19332183426219257,
-    "test_recall": 0.2827706132459517,
-    "test_f1": 0.2296433556729223,
-    "test_samples": 736321,
-    "test_positives": 99487,
-    "test_random_ap": 0.13511362571487165,
+    "train_ap": 0.25472696978734866,
+    "train_precision": 0.2726700883374509,
+    "train_recall": 0.3352237066260199,
+    "train_f1": 0.3007284445271143,
+    "train_samples": 1333007,
+    "train_positives": 178448,
+    "train_random_ap": 0.13386876438008202,
+    "test_ap": 0.19335032674490646,
+    "test_precision": 0.20922013820335636,
+    "test_recall": 0.27417143152829165,
+    "test_f1": 0.23733216873271298,
+    "test_samples": 286894,
+    "test_positives": 38651,
+    "test_random_ap": 0.13472223190446647,
     "test_threshold_uncalibrated": false,
+    "test_precision_at_recall_0.01": 0.3499095840867993,
+    "test_precision_at_recall_0.1": 0.2455717097327154,
+    "test_precision_at_recall_0.5": 0.1844996611269676,
+    "test_precision_prod_adjusted": 0.20249774059267645,
+    "test_neg_pos_ratio": 6.422679878916457,
+    "production_neg_pos_ratio_assumed": 6.6923076923076925,
     "feature_importance": [
       {
         "rank": 1,
         "feature": "minutes_since_run_start",
-        "importance_gain_pct": 76.98
+        "importance_gain_pct": 55.31
       },
       {
         "rank": 2,
-        "feature": "cum_bets",
-        "importance_gain_pct": 5.61
+        "feature": "loss_streak",
+        "importance_gain_pct": 3.16
       },
       {
         "rank": 3,
-        "feature": "cum_wager",
-        "importance_gain_pct": 4.54
+        "feature": "avg_session_duration_min_180d",
+        "importance_gain_pct": 2.03
       },
       {
         "rank": 4,
-        "feature": "loss_streak",
-        "importance_gain_pct": 4.22
+        "feature": "turnover_per_bet_mean_180d",
+        "importance_gain_pct": 1.79
       },
       {
         "rank": 5,
-        "feature": "time_of_day_cos",
-        "importance_gain_pct": 2.22
+        "feature": "sessions_365d",
+        "importance_gain_pct": 1.78
       },
       {
         "rank": 6,
-        "feature": "time_of_day_sin",
-        "importance_gain_pct": 2.19
+        "feature": "turnover_sum_365d",
+        "importance_gain_pct": 1.53
       },
       {
         "rank": 7,
-        "feature": "avg_wager_sofar",
-        "importance_gain_pct": 1.46
+        "feature": "num_games_with_wager_sum_180d",
+        "importance_gain_pct": 1.51
       },
       {
         "rank": 8,
-        "feature": "wager",
-        "importance_gain_pct": 0.77
+        "feature": "base_ha",
+        "importance_gain_pct": 1.5
       },
       {
         "rank": 9,
-        "feature": "base_ha",
-        "importance_gain_pct": 0.7
+        "feature": "num_bets_sum_180d",
+        "importance_gain_pct": 1.5
       },
       {
         "rank": 10,
-        "feature": "position_idx",
-        "importance_gain_pct": 0.57
+        "feature": "win_session_rate_180d",
+        "importance_gain_pct": 1.43
       },
       {
         "rank": 11,
-        "feature": "is_back_bet",
-        "importance_gain_pct": 0.38
+        "feature": "top_table_share_90d",
+        "importance_gain_pct": 1.43
       },
       {
         "rank": 12,
+        "feature": "days_since_first_session",
+        "importance_gain_pct": 1.41
+      },
+      {
+        "rank": 13,
+        "feature": "active_days_365d",
+        "importance_gain_pct": 1.4
+      },
+      {
+        "rank": 14,
+        "feature": "wager",
+        "importance_gain_pct": 1.29
+      },
+      {
+        "rank": 15,
+        "feature": "days_since_last_session",
+        "importance_gain_pct": 1.27
+      },
+      {
+        "rank": 16,
+        "feature": "player_win_sum_365d",
+        "importance_gain_pct": 1.21
+      },
+      {
+        "rank": 17,
+        "feature": "sessions_90d",
+        "importance_gain_pct": 1.06
+      },
+      {
+        "rank": 18,
+        "feature": "is_back_bet",
+        "importance_gain_pct": 1.0
+      },
+      {
+        "rank": 19,
+        "feature": "player_win_sum_90d",
+        "importance_gain_pct": 0.97
+      },
+      {
+        "rank": 20,
+        "feature": "position_idx",
+        "importance_gain_pct": 0.96
+      },
+      {
+        "rank": 21,
+        "feature": "avg_session_duration_min_30d",
+        "importance_gain_pct": 0.94
+      },
+      {
+        "rank": 22,
+        "feature": "theo_win_sum_180d",
+        "importance_gain_pct": 0.93
+      },
+      {
+        "rank": 23,
+        "feature": "actual_rtp_180d",
+        "importance_gain_pct": 0.91
+      },
+      {
+        "rank": 24,
+        "feature": "player_win_sum_180d",
+        "importance_gain_pct": 0.9
+      },
+      {
+        "rank": 25,
+        "feature": "active_days_90d",
+        "importance_gain_pct": 0.84
+      },
+      {
+        "rank": 26,
+        "feature": "sessions_180d",
+        "importance_gain_pct": 0.74
+      },
+      {
+        "rank": 27,
+        "feature": "player_win_sum_30d",
+        "importance_gain_pct": 0.74
+      },
+      {
+        "rank": 28,
+        "feature": "turnover_sum_7d",
+        "importance_gain_pct": 0.73
+      },
+      {
+        "rank": 29,
+        "feature": "win_session_rate_30d",
+        "importance_gain_pct": 0.72
+      },
+      {
+        "rank": 30,
+        "feature": "num_games_with_wager_sum_30d",
+        "importance_gain_pct": 0.67
+      },
+      {
+        "rank": 31,
+        "feature": "actual_vs_theo_ratio_30d",
+        "importance_gain_pct": 0.66
+      },
+      {
+        "rank": 32,
+        "feature": "actual_rtp_30d",
+        "importance_gain_pct": 0.64
+      },
+      {
+        "rank": 33,
+        "feature": "turnover_per_bet_30d_over_180d",
+        "importance_gain_pct": 0.64
+      },
+      {
+        "rank": 34,
+        "feature": "top_table_share_30d",
+        "importance_gain_pct": 0.63
+      },
+      {
+        "rank": 35,
+        "feature": "turnover_30d_over_180d",
+        "importance_gain_pct": 0.61
+      },
+      {
+        "rank": 36,
+        "feature": "theo_win_sum_30d",
+        "importance_gain_pct": 0.61
+      },
+      {
+        "rank": 37,
         "feature": "payout_odds",
-        "importance_gain_pct": 0.36
+        "importance_gain_pct": 0.61
+      },
+      {
+        "rank": 38,
+        "feature": "turnover_sum_30d",
+        "importance_gain_pct": 0.6
+      },
+      {
+        "rank": 39,
+        "feature": "distinct_table_cnt_90d",
+        "importance_gain_pct": 0.58
+      },
+      {
+        "rank": 40,
+        "feature": "turnover_per_bet_mean_30d",
+        "importance_gain_pct": 0.54
+      },
+      {
+        "rank": 41,
+        "feature": "num_bets_sum_30d",
+        "importance_gain_pct": 0.48
+      },
+      {
+        "rank": 42,
+        "feature": "sessions_7d",
+        "importance_gain_pct": 0.44
+      },
+      {
+        "rank": 43,
+        "feature": "active_days_30d",
+        "importance_gain_pct": 0.34
+      },
+      {
+        "rank": 44,
+        "feature": "distinct_table_cnt_30d",
+        "importance_gain_pct": 0.28
+      },
+      {
+        "rank": 45,
+        "feature": "sessions_30d",
+        "importance_gain_pct": 0.28
+      },
+      {
+        "rank": 46,
+        "feature": "distinct_pit_cnt_30d",
+        "importance_gain_pct": 0.27
+      },
+      {
+        "rank": 47,
+        "feature": "distinct_gaming_area_cnt_30d",
+        "importance_gain_pct": 0.13
       }
     ],
     "importance_method": "gain"
   },
-  "model_version": "20260306-120125-c967124",
-  "fast_mode": true,
+  "model_version": "20260307-202047-18f3193",
   "sample_rated_n": null,
+  "neg_sample_frac": 1.0,
+  "production_neg_pos_ratio": 6.6923076923076925,
   "uncalibrated_threshold": {
     "rated": false
   },
-  "spec_hash": null
+  "spec_hash": "4b4c55e96732"
 }

@@ -184,6 +184,7 @@ class TestR73ReasonCodeCleanup(unittest.TestCase):
     """R73: run_id was removed from TRACK_B_FEATURE_COLS (R67).  Its entry
     in _STATIC_REASON_CODES is dead code that misleads readers."""
 
+    @unittest.skip("Removed in PLAN Step 3 (hardcoded _STATIC_REASON_CODES deleted)")
     def test_static_reason_codes_does_not_contain_run_id(self):
         src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "save_artifact_bundle")
         self.assertGreater(len(src), 0, "save_artifact_bundle not found")

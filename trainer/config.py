@@ -203,9 +203,13 @@ PROFILE_PRELOAD_MAX_BYTES: int = int(1.5 * 1024**3)  # 1.5 GB on disk
 # PRESERVE_INSERTION_ORDER – DuckDB default is True (sort output to match
 #             insertion order), which costs extra RAM.  Profile aggregation
 #             output order is non-deterministic anyway, so False is safe here.
+# RAM_MAX_FRACTION – When set (e.g. 0.45), effective ceiling = max(MAX_GB,
+#             available_ram * RAM_MAX_FRACTION).  High-RAM machines get a
+#             higher DuckDB limit, reducing OOM.  None = use only MAX_GB.
 PROFILE_DUCKDB_RAM_FRACTION: float = 0.5
 PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB: float = 0.5
 PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB: float = 8.0
+PROFILE_DUCKDB_RAM_MAX_FRACTION: Optional[float] = 0.45
 PROFILE_DUCKDB_THREADS: int = 2
 PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER: bool = False
 

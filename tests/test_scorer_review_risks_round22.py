@@ -10,11 +10,21 @@ converted to normal passing assertions once implementation fixes are applied.
 from __future__ import annotations
 
 import ast
+import importlib
 import pathlib
+import sys
 import unittest
 
 
+def _features_mod():
+    _root = pathlib.Path(__file__).resolve().parents[1]
+    if str(_root) not in sys.path:
+        sys.path.insert(0, str(_root))
+    return importlib.import_module("trainer.features")
+
+
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_FEATURE_SPEC_PATH = _REPO_ROOT / "trainer" / "feature_spec" / "features_candidates.template.yaml"
 _SCORER_PATH = _REPO_ROOT / "trainer" / "scorer.py"
 _TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
 
@@ -78,18 +88,25 @@ class TestScorerReviewRisksRound22(unittest.TestCase):
     def test_r32_online_features_do_not_use_session_delayed_duration_features(self):
         """R32 (updated by R2300): session_duration_min and bets_per_minute are computed
         dynamically by the scorer for train-serve parity; they must NOT appear in the
-        static LEGACY_FEATURE_COLS training constant (to avoid double-counting), but MUST
-        be computed inside build_features_for_scoring (R2300 parity fix)."""
-        legacy_features = _get_list_constant(_TRAINER_TREE, "LEGACY_FEATURE_COLS")
+        training feature candidate list (YAML SSOT, feat-consolidation) to avoid
+        double-counting, but MUST be computed inside build_features_for_scoring (R2300).
+        Depends on repo template features_candidates.template.yaml as SSOT (Round 141 Review P2)."""
+        self.assertTrue(
+            _FEATURE_SPEC_PATH.exists(),
+            "Template YAML required for R32: trainer/feature_spec/features_candidates.template.yaml",
+        )
+        features = _features_mod()
+        spec = features.load_feature_spec(_FEATURE_SPEC_PATH)
+        training_candidates = features.get_all_candidate_feature_ids(spec, screening_only=True)
         self.assertNotIn(
             "minutes_since_session_start",
-            legacy_features,
-            msg="trainer LEGACY_FEATURE_COLS should not include session-delayed duration features.",
+            training_candidates,
+            msg="Training candidate list (YAML) should not include session-delayed duration features.",
         )
         self.assertNotIn(
             "bets_per_minute",
-            legacy_features,
-            msg="trainer LEGACY_FEATURE_COLS should not include bets_per_minute as a static constant.",
+            training_candidates,
+            msg="Training candidate list (YAML) should not include bets_per_minute as a static constant.",
         )
 
         scorer_func = _get_func_node(_SCORER_TREE, "build_features_for_scoring")

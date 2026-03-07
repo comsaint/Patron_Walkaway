@@ -831,9 +831,17 @@ def _compute_duckdb_memory_limit_bytes(available_bytes: Optional[int]) -> int:
     """Compute a DuckDB memory_limit (bytes) that is safe for the current machine.
 
     Formula:
+        effective_ceiling = max(PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB * 1 GiB,
+                                available_bytes * PROFILE_DUCKDB_RAM_MAX_FRACTION)
+                            when PROFILE_DUCKDB_RAM_MAX_FRACTION is set and valid;
+                            otherwise effective_ceiling = MAX_GB * 1 GiB.
         budget = clamp(available_bytes * PROFILE_DUCKDB_RAM_FRACTION,
                        PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB * 1 GiB,
-                       PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB * 1 GiB)
+                       effective_ceiling)
+
+    On high-RAM machines PROFILE_DUCKDB_RAM_MAX_FRACTION raises the effective
+    ceiling above the fixed MAX_GB, reducing OOM risk.  Set it to None to keep
+    the fixed MAX_GB ceiling regardless of available RAM.
 
     When ``available_bytes`` is None (psutil not installed or failed), the
     conservative floor (MIN_GB) is returned so the call never crashes.
@@ -841,6 +849,8 @@ def _compute_duckdb_memory_limit_bytes(available_bytes: Optional[int]) -> int:
     Config values are validated and normalised:
     - FRACTION must be in (0, 1]; invalid values fall back to 0.5 with a warning.
     - If MIN_GB > MAX_GB the two values are swapped with a warning.
+    - If RAM_MAX_FRACTION < RAM_FRACTION, a warning is emitted because the budget
+      will always be capped by the ceiling before FRACTION is fully used.
     """
     _min = int(getattr(config, "PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB", 0.5) * 1024 ** 3)
     _max = int(getattr(config, "PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB", 8.0) * 1024 ** 3)
@@ -863,8 +873,30 @@ def _compute_duckdb_memory_limit_bytes(available_bytes: Optional[int]) -> int:
 
     if available_bytes is None:
         return _min
+    # Dynamic ceiling (PLAN duckdb-dynamic-ceiling): on high-RAM machines,
+    # raise the effective ceiling above the fixed MAX_GB so DuckDB can use more
+    # RAM and reduce OOM risk.  effective_ceiling = max(MAX_GB, available * frac).
+    ram_max_frac = getattr(config, "PROFILE_DUCKDB_RAM_MAX_FRACTION", None)
+    if ram_max_frac is not None and not (0.0 < ram_max_frac <= 1.0):
+        logger.warning(
+            "PROFILE_DUCKDB_RAM_MAX_FRACTION=%s out of (0, 1]; using fixed MAX_GB ceiling",
+            ram_max_frac,
+        )
+        ram_max_frac = None
+    if ram_max_frac is not None:
+        effective_max = max(_max, int(available_bytes * ram_max_frac))
+        if ram_max_frac < frac:
+            logger.warning(
+                "PROFILE_DUCKDB_RAM_MAX_FRACTION (%.2f) < PROFILE_DUCKDB_RAM_FRACTION (%.2f); "
+                "on high-RAM machines the effective ceiling will cap the budget before "
+                "PROFILE_DUCKDB_RAM_FRACTION is fully used",
+                ram_max_frac,
+                frac,
+            )
+    else:
+        effective_max = _max
     budget = int(available_bytes * frac)
-    return max(_min, min(_max, budget))
+    return max(_min, min(effective_max, budget))
 
 
 def _configure_duckdb_runtime(con, *, budget_bytes: int) -> None:
@@ -956,7 +988,7 @@ def _compute_profile_duckdb(
         )
         _configure_duckdb_runtime(_con, budget_bytes=_budget)
     else:
-        _con = con
+        _con = con  # type: ignore[assignment]
 
     if not session_parquet_path.exists():
         return None

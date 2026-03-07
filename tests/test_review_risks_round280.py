@@ -14,6 +14,14 @@ import unittest
 
 import pandas as pd
 
+# SettingWithCopyWarning: location varies by pandas version; absent in some (e.g. 3.0.1)
+_SettingWithCopyWarning = getattr(pd.errors, "SettingWithCopyWarning", None)
+if _SettingWithCopyWarning is None:
+    try:
+        from pandas.core.common import SettingWithCopyWarning as _SettingWithCopyWarning
+    except ImportError:
+        _SettingWithCopyWarning = None  # e.g. pandas 3.x without this warning class
+
 import trainer.duckdb_schema as duckdb_schema_mod
 import trainer.trainer as trainer_mod
 
@@ -66,8 +74,13 @@ class TestR280ApplyDqRegressionGuards(unittest.TestCase):
         ws = pd.Timestamp("2025-03-01 00:00:00").to_pydatetime()
         ee = pd.Timestamp("2025-03-02 00:00:00").to_pydatetime()
 
+        if _SettingWithCopyWarning is None:
+            self.skipTest(
+                "SettingWithCopyWarning not available in this pandas version; "
+                "skipping strict no-SettingWithCopyWarning check"
+            )
         with warnings.catch_warnings():
-            warnings.simplefilter("error", pd.errors.SettingWithCopyWarning)
+            warnings.simplefilter("error", _SettingWithCopyWarning)
             bets_out, sessions_out = trainer_mod.apply_dq(bets, sessions, ws, ee)
 
         self.assertIsInstance(bets_out, pd.DataFrame)

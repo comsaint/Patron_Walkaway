@@ -28,9 +28,12 @@ class TestR1001ScreeningSanity(unittest.TestCase):
 
     def test_screening_should_keep_at_least_one_track_b_feature(self):
         src = inspect.getsource(trainer_mod.run_pipeline)
+        # R123-2 (feat-consolidation): hardcoded TRACK_B_FEATURE_COLS was replaced with
+        # YAML-driven track_human lookup. Assert the new implementation still enforces
+        # a post-screening track_human sanity check.
         self.assertTrue(
-            "TRACK_B_FEATURE_COLS" in src and "intersection" in src,
-            "run_pipeline should enforce a post-screening Track-B sanity check.",
+            "_yaml_track_human" in src and "intersection" in src,
+            "run_pipeline should enforce a post-screening track_human sanity check (YAML-driven, R1001).",
         )
 
 

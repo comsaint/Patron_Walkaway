@@ -33,7 +33,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -76,7 +76,7 @@ except ModuleNotFoundError:
     _G1_FBETA = getattr(_cfg, "G1_FBETA", 0.5)
     THRESHOLD_FBETA = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
-    OPTUNA_TIMEOUT_SECONDS: Optional[int] = getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", 10 * 60)
+    OPTUNA_TIMEOUT_SECONDS: Optional[int] = getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", 10 * 60)  # type: ignore[no-redef]
     LABEL_LOOKAHEAD_MIN = _cfg.LABEL_LOOKAHEAD_MIN
     HK_TZ_STR = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     BACKTEST_HOURS = getattr(_cfg, "BACKTEST_HOURS", 6)
@@ -93,8 +93,8 @@ try:
         load_local_parquet,
         apply_dq,
         add_track_b_features,
-        add_legacy_features,
-        ALL_FEATURE_COLS,
+        compute_track_llm_features,
+        load_feature_spec,
         _to_hk,
         HISTORY_BUFFER_DAYS,
     )
@@ -107,8 +107,8 @@ except ModuleNotFoundError:
         load_local_parquet,
         apply_dq,
         add_track_b_features,
-        add_legacy_features,
-        ALL_FEATURE_COLS,
+        compute_track_llm_features,
+        load_feature_spec,
         _to_hk,
         HISTORY_BUFFER_DAYS,
     )
@@ -124,13 +124,17 @@ BACKTEST_OUT.mkdir(exist_ok=True)
 # Artifact loading
 # ---------------------------------------------------------------------------
 
-def load_dual_artifacts() -> Dict[str, Optional[dict]]:
+def load_dual_artifacts() -> Dict[str, Any]:
     """Load model bundle for backtesting (v10 single rated model, DEC-021).
 
     Priority:
     1. ``model.pkl``         — v10 single rated model
     2. ``rated_model.pkl``   — legacy rated slot
     3. ``walkaway_model.pkl``— legacy single-model fallback
+
+    Also loads ``feature_list.json`` (if present) into the returned dict under
+    the key ``"feature_list_meta"`` so that backtest() can distinguish profile
+    features from non-profile features for NaN-fill logic (R127-1).
     """
     def _try(path: Path) -> Optional[dict]:
         if path.exists():
@@ -139,28 +143,40 @@ def load_dual_artifacts() -> Dict[str, Optional[dict]]:
 
     single = _try(MODEL_DIR / "model.pkl")
     if single is not None:
-        return {"rated": single}
+        artifacts: Dict[str, Any] = {"rated": single}
+    else:
+        rated = _try(MODEL_DIR / "rated_model.pkl")
+        legacy = _try(MODEL_DIR / "walkaway_model.pkl")
 
-    rated = _try(MODEL_DIR / "rated_model.pkl")
-    legacy = _try(MODEL_DIR / "walkaway_model.pkl")
+        if rated is None and legacy is not None:
+            logger.warning("rated_model.pkl not found; using walkaway_model.pkl as fallback")
+            rated = legacy
 
-    if rated is None and legacy is not None:
-        logger.warning("rated_model.pkl not found; using walkaway_model.pkl as fallback")
-        rated = legacy
+        if rated is None:
+            raise FileNotFoundError(
+                f"No model artifacts found in {MODEL_DIR}. "
+                "Run trainer.py first to produce model.pkl / rated_model.pkl."
+            )
+        artifacts = {"rated": rated}
 
-    if rated is None:
-        raise FileNotFoundError(
-            f"No model artifacts found in {MODEL_DIR}. "
-            "Run trainer.py first to produce model.pkl / rated_model.pkl."
-        )
-    return {"rated": rated}
+    _fl_path = MODEL_DIR / "feature_list.json"
+    if _fl_path.exists():
+        try:
+            artifacts["feature_list_meta"] = json.loads(_fl_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to load feature_list.json: %s", exc)
+            artifacts["feature_list_meta"] = []
+    else:
+        artifacts["feature_list_meta"] = []
+
+    return artifacts
 
 
 # ---------------------------------------------------------------------------
 # Metric helpers
 # ---------------------------------------------------------------------------
 
-def _score_df(df: pd.DataFrame, artifacts: Dict[str, Optional[dict]]) -> pd.DataFrame:
+def _score_df(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.DataFrame:
     """Add ``score`` column to *df* using the single rated model (v10 DEC-021)."""
     df = df.copy()
     df["score"] = 0.0
@@ -317,7 +333,7 @@ def _compute_section_metrics(
 
 def run_optuna_threshold_search(
     df: pd.DataFrame,
-    artifacts: Dict[str, Optional[dict]],
+    artifacts: Dict[str, Any],
     n_trials: int = OPTUNA_N_TRIALS,
     window_hours: Optional[float] = None,
 ) -> Tuple[float, float]:
@@ -403,7 +419,7 @@ def run_optuna_threshold_search(
 def backtest(
     bets_raw: pd.DataFrame,
     sessions_raw: pd.DataFrame,
-    artifacts: Dict[str, Optional[dict]],
+    artifacts: Dict[str, Any],
     window_start: datetime,
     window_end: datetime,
     run_optuna: bool = True,
@@ -459,12 +475,58 @@ def backtest(
     if labeled.empty:
         return {"error": "No rows after label filtering"}
 
-    # --- Legacy features ---
-    labeled = add_legacy_features(labeled, sessions)
-    for col in ALL_FEATURE_COLS:
+    # --- Track LLM & default fills ---
+    _spec_path = MODEL_DIR / "feature_spec.yaml"
+    if _spec_path.exists():
+        feature_spec = load_feature_spec(_spec_path)
+    else:
+        feature_spec = load_feature_spec(Path(__file__).parent / "feature_spec" / "features_candidates.template.yaml")
+
+    try:
+        _bets_llm_result = compute_track_llm_features(
+            labeled,
+            feature_spec=feature_spec,
+            cutoff_time=window_end,
+        )
+        _llm_cand_ids = [
+            c.get("feature_id")
+            for c in (feature_spec.get("track_llm") or {}).get("candidates", [])
+        ]
+        _bets_llm_feature_cols = [
+            fid for fid in _llm_cand_ids
+            if fid and fid in _bets_llm_result.columns
+        ]
+        if _bets_llm_feature_cols and "bet_id" in _bets_llm_result.columns:
+            labeled = labeled.merge(
+                _bets_llm_result[["bet_id"] + _bets_llm_feature_cols].drop_duplicates("bet_id"),
+                on="bet_id",
+                how="left",
+            )
+    except Exception as exc:
+        logger.error(f"Track LLM failed in backtester: {exc}")
+
+    # Zero-fill non-profile artifact features (R127-1 / train-serve parity).
+    # Profile features keep NaN when no snapshot exists — LightGBM uses its
+    # trained NaN-aware default-child path, matching trainer.py / scorer.py.
+    _artifact_features: list = list((artifacts.get("rated") or {}).get("features") or [])
+    _artifact_meta: List[Any] = list(artifacts.get("feature_list_meta") or [])
+    _profile_in_artifact: set = {
+        e["name"] for e in _artifact_meta
+        if isinstance(e, dict) and e.get("track") in ("track_profile", "profile")
+    }
+    # R131-2: when meta empty (missing/old-format JSON), fallback so profile cols keep NaN.
+    if not _profile_in_artifact and _artifact_features:
+        try:
+            from trainer.features import PROFILE_FEATURE_COLS as _PF
+        except Exception:
+            _PF = []
+        _profile_in_artifact = set(_PF) & set(_artifact_features)
+    _non_profile_artifact = [c for c in _artifact_features if c not in _profile_in_artifact]
+    for col in _non_profile_artifact:
         if col not in labeled.columns:
             labeled[col] = 0
-    labeled[ALL_FEATURE_COLS] = labeled[ALL_FEATURE_COLS].fillna(0)
+    if _non_profile_artifact:
+        labeled[_non_profile_artifact] = labeled[_non_profile_artifact].fillna(0)
 
     # --- H3: mark rated observations ---
     # canonical_map only contains entries for players with a valid casino_player_id,

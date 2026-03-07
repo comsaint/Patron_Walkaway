@@ -35,6 +35,12 @@ todos:
   - id: step10-tests
     content: "Step 10：定義 Testing & Validation 規格（leakage 偵測、parity 測試、label sanity、D2 覆蓋率、schema 合規、Feature Spec YAML 靜態驗證）"
     status: completed
+  - id: duckdb-dynamic-ceiling
+    content: "DuckDB profile ETL：動態天花板（PROFILE_DUCKDB_RAM_MAX_FRACTION），依可用 RAM 放寬 memory_limit 上限以減少 OOM"
+    status: completed
+  - id: feat-consolidation
+    content: "特徵整合：Feature Spec YAML 單一 SSOT（三軌候選全入 YAML、Legacy 併入 Track LLM、canonical_id only、無 session 依賴、Scorer 跟隨 Trainer 產出）"
+    status: completed
 isProject: false
 ---
 
@@ -788,6 +794,74 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 ---
 
+## 特徵整合計畫：Feature Spec YAML 單一 SSOT（已實作）
+
+### 目標與原則
+
+1. **YAML = 三軌候選特徵的唯一真相來源**：所有 Track Profile / Track LLM / Track Human 的候選特徵均在 Feature Spec YAML 定義；Python 不再硬編碼 `PROFILE_FEATURE_COLS`、`TRACK_B_FEATURE_COLS`、`LEGACY_FEATURE_COLS`。
+2. **Scorer 由 Trainer 產出驅動**：Scorer 計算的特徵清單與計算方式完全由 trainer 產出的 `feature_list.json` + `feature_spec.yaml` 決定，與訓練使用同一套計算路徑（train-serve parity）。
+3. **Serving 不依賴 session**：所有進模型的候選特徵計算**不得**依賴 `session_id`、`session_start_dtm`、`session_end_dtm`，因即時 serving 時不能假設 session 資訊可用。
+4. **Track LLM 單一 partition**：所有 Track LLM 的 window/aggregate 一律 `PARTITION BY canonical_id`，ORDER BY 與現有 `partition_key`/`order_by` 一致；不支援 `partition_by: "session_id"`。
+
+### Step 1 — YAML 補完
+
+| 項目 | 內容 |
+|------|------|
+| **track_profile.candidates** | 將 `features.py` 的 47 個 profile 欄位全部補進 YAML；每項含 `min_lookback_days`（取代 `_PROFILE_FEATURE_MIN_DAYS`）。 |
+| **track_llm.candidates** | 吸收原 Legacy 10 個特徵：5 個 raw 欄位用 `type: "passthrough"`（wager, payout_odds, base_ha, is_back_bet, position_idx）；cum_bets、cum_wager 用 window（**PARTITION BY canonical_id**）；avg_wager_sofar 用 derived；time_of_day_sin/cos 用 derived（僅依 payout_complete_dtm）。 |
+| **track_human.candidates** | 已完整，不需改。 |
+| **中間變數** | `prev_status`（dtype: "str"）標記 `screening_eligible: false`，不參與 screening。 |
+| **Session 依賴** | 任何依賴 session 的特徵（如 session_duration_min、bets_per_minute）**不**列入 Feature Spec 的 model 候選。 |
+
+### Step 2 — Python helper（features.py）
+
+- `get_candidate_feature_ids(spec, track, screening_only=False)`：從 YAML 讀取某軌 feature_id 列表；`screening_only=True` 時排除 dtype=str / screening_eligible=false。
+- `get_all_candidate_feature_ids(spec, screening_only=False)`：三軌合併去重。
+- `get_profile_min_lookback(spec)`：從 track_profile.candidates 讀取 `min_lookback_days`，取代 `_PROFILE_FEATURE_MIN_DAYS`。
+- `coerce_feature_dtypes(df, feature_cols)`：非數值欄 `pd.to_numeric(..., errors="coerce")`，訓練與推論共用。
+
+### Step 3 — 移除硬編碼，改用 YAML
+
+- **trainer.py**：刪除 `TRACK_B_FEATURE_COLS`、`LEGACY_FEATURE_COLS`、`ALL_FEATURE_COLS`；刪除 `add_legacy_features()`（cum_bets 等改由 Track LLM DuckDB 計算）。候選清單改為 `get_all_candidate_feature_ids(spec, screening_only=True)`。
+- **features.py**：`PROFILE_FEATURE_COLS`、`_PROFILE_FEATURE_MIN_DAYS` 改為從 YAML 動態讀取；`get_profile_feature_cols(max_lookback_days)` 依 YAML 的 `min_lookback_days` 過濾。
+- **reason_code_map**：從 YAML 的 `reason_code_category` 產生，不再硬編碼 `_STATIC_REASON_CODES`。
+
+### Step 4 — compute_track_llm_features 擴充
+
+- 支援 `type: "passthrough"`（raw column 直接選出）。
+- 支援 cum_bets / cum_wager（window, PARTITION BY canonical_id）/ avg_wager_sofar（derived）/ time_of_day_sin|cos（derived）。
+- **不**實作 `partition_by` 覆蓋；所有特徵皆用既有 `partition_key: canonical_id`。
+
+### Step 5 — Screening 改造
+
+- 候選來源改為 `get_all_candidate_feature_ids(spec, screening_only=True)`。
+- 在 `screen_features()` 內加入 `coerce_feature_dtypes` + 僅對數值欄做 zero-variance / 後續步驟，修復字串欄位導致 `X.std()` 報錯。
+- 可選：簡化為僅 LightGBM importance 篩選 + top_k（移除 MI + 相關性修剪）。
+
+### Step 6 — Scorer 對齊
+
+- Scorer 僅依 `feature_list.json` + `feature_spec.yaml` 與 trainer 共用之計算函式（Track LLM / Track Human / Track Profile）產出特徵。
+- **不假設即時 session 可用**：移除依賴 session_start_dtm / session_end_dtm 的模型特徵計算；若有 session 僅供 alert DB 展示用且不進模型。
+- `_score_df()` 改用共用 `coerce_feature_dtypes`；profile 與否改由 YAML 判斷。
+
+### Step 7 — Artifact 產出
+
+- `feature_list.json` 的 track 標記改為 YAML 的 track key（track_llm / track_human / track_profile），不再使用 "B" / "legacy"。
+- `reason_code_map.json` 由 YAML 的 `reason_code_category` 產生。
+
+### Step 8 — 測試
+
+- YAML 完整性（feature_id 唯一、dtype 合法、無 session 依賴）。
+- 向後相容：載入舊版 feature_list（含 "B"/"legacy"）時 scorer 不報錯。
+- Train-serve parity：同一批資料、同一套函式，特徵值一致。
+- 無 session 時 scorer 仍可正確計算 feature_list 內所有特徵。
+
+### 實作順序
+
+1. Step 1（YAML 補完）→ 2（helpers）→ 4（compute_track_llm_features 擴充）→ 3（移除硬編碼）→ 5（Screening）→ 7（Artifact）→ 6（Scorer）→ 8（測試）。
+
+---
+
 ## TRN-* Remediation Checklist（SSOT §12）
 
 | TRN | 問題描述 | 計畫落地 | 備註 |
@@ -901,6 +975,10 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
    - trainer 目前使用 `available_ram * NEG_SAMPLE_RAM_SAFETY` 作為 Step 7 預算。
    - 新方案可借用相同思路，但不直接依賴 trainer 內部函式，以免 ETL 單獨執行時失效。
 
+4. **動態天花板（effective_max）**
+   - 上限不再僅用固定 `MAX_GB`，改為 effective_max = min(MAX_GB, available_ram × PROFILE_DUCKDB_RAM_MAX_FRACTION)（當 RAM_MAX_FRACTION 有值時）。
+   - 高 RAM 機器（例如 44 GB 可用）時，DuckDB 可取得約 20 GB（0.45 × 44）而非被 8 GB 卡死，降低 profile ETL OOM 機率。
+
 ### 具體實作步驟
 
 #### Step A — 在 `config.py` 新增 DuckDB runtime budget 參數
@@ -916,6 +994,9 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - `PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB`
   - 預設建議：`8.0`
   - 語意：避免高 RAM 機器讓單一 DuckDB 查詢無上限膨脹。
+- `PROFILE_DUCKDB_RAM_MAX_FRACTION`（`Optional[float]`）
+  - 預設建議：`0.45`；設為 `None` 表示僅用 `MAX_GB`，不依可用 RAM 再壓一層。
+  - 語意：effective 天花板 = min(MAX_GB, available_ram × 此比例)。高 RAM 時可放寬 DuckDB 上限，減少 OOM。
 - `PROFILE_DUCKDB_THREADS`
   - 預設建議：`2`
   - 語意：低 RAM / 筆電環境先保守限制執行緒，降低峰值記憶體。
@@ -930,10 +1011,10 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - `_get_available_ram_bytes() -> Optional[int]`
   - 優先使用 `psutil.virtual_memory().available`
   - 若 `psutil` 不存在，回傳 `None`
-- `_compute_profile_duckdb_budget_bytes(available_ram_bytes: Optional[int]) -> Optional[int]`
+- `_compute_duckdb_memory_limit_bytes(available_ram_bytes: Optional[int])`（或同義之 budget helper）
   - 若有 available RAM：
-    - `budget = available_ram_bytes * PROFILE_DUCKDB_RAM_FRACTION`
-    - 再 clamp 到 min/max GB 設定
+    - `cap = min(MAX_GB, available_ram × PROFILE_DUCKDB_RAM_MAX_FRACTION)`（當 RAM_MAX_FRACTION 有值時；否則 `cap = MAX_GB`）
+    - `budget = clamp(available_ram × PROFILE_DUCKDB_RAM_FRACTION, MIN_GB, cap)`
   - 若無 available RAM：
     - 使用 `PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB` 與 `MIN_GB` 推導出保守 fallback
     - 或回傳 `None`，代表不設定 `memory_limit`；二者需選一個，實作時以「保守預設」為優先
@@ -994,6 +1075,13 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - `player_profile` ETL 單獨執行時，不需要依賴 `trainer.py` 也能動態決定 budget。
 - terminal log 可清楚顯示本次 DuckDB runtime guard 的實際值。
 - DuckDB 失敗時仍能維持既有 pandas fallback 行為。
+
+### 動態天花板（2026-03 補充）
+
+- **問題**：固定 `MAX_GB=8` 在 session Parquet 較大、單一 snapshot 查詢較重時，DuckDB 易觸及 memory_limit 而 OOM，再 fallback 到 pandas ETL。
+- **對策**：天花板改為依「當前可用 RAM」動態計算：effective_max = min(MAX_GB, available_ram × PROFILE_DUCKDB_RAM_MAX_FRACTION)。高 RAM 機器可自動放寬 DuckDB 上限，減少 OOM。
+- **設定**：`config.PROFILE_DUCKDB_RAM_MAX_FRACTION`（預設 0.45；`None` 表示僅用 MAX_GB）。
+- **本階段不做**：OOM 後自動重試並提高預算（留待需要時再實作）。
 
 ### 備註
 
