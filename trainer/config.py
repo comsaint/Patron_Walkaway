@@ -86,7 +86,7 @@ G1_FBETA = 0.5                   # [DEPRECATED] F-beta weight (beta < 1 → prec
 OPTUNA_N_TRIALS = 300            # Optuna TPE trials for threshold search (DEC-009/010)
 # Optional Optuna time budget (seconds) for study.optimize.
 # Disable timeout by setting to None or a non-positive value (e.g. -1).
-OPTUNA_TIMEOUT_SECONDS: Optional[int] = 10 * 60
+OPTUNA_TIMEOUT_SECONDS: Optional[int] = -1  # -1 = no timeout, 10 * 60 = 10 minutes
 # Threshold selection objective: F-beta with beta < 1 favours precision over recall.
 THRESHOLD_FBETA: float = 0.5
 

@@ -81,11 +81,11 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --no-preload
 python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1000
 ```
 
-**Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`
+**Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`（可加 `--skip-optuna` 跳過閾值搜尋、`--n-trials N` 指定 Optuna 試驗次數）
 
-**即時 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（單次執行加 `--once`）。所有觀測用同一 rated 模型評分；**僅評級客（is_rated）會產生告警**，非評級客分數僅供 volume 統計（UNRATED_VOLUME_LOG）。
+**即時 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（單次執行加 `--once`；可加 `--model-dir` 指定模型目錄、`--log-level DEBUG|INFO|WARNING`）。所有觀測用同一 rated 模型評分；**僅評級客（is_rated）會產生告警**，非評級客分數僅供 volume 統計（UNRATED_VOLUME_LOG）。
 
-**Validator**：`python -m trainer.validator --interval 60`（單次加 `--once`）
+**Validator**：`python -m trainer.validator --interval 60`（單次加 `--once`；手動強制結案 PENDING 加 `--force-finalize`）
 
 **API 伺服器**：`python -m trainer.api_server`（預設 http://0.0.0.0:8000）
 
@@ -102,7 +102,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `--days` | 未給 `--start`/`--end` 時使用：取「迄日為現在減 30 分鐘」往前 N 天為視窗。預設由 `config.TRAINER_DAYS` 決定（通常 7）。 |
 | `--use-local-parquet` | 從專案根目錄 `data/` 讀取 Parquet（`gmwds_t_bet.parquet`、`gmwds_t_session.parquet` 等），不連 ClickHouse。 |
 | `--force-recompute` | 忽略已快取的 chunk Parquet（`trainer/.data/chunks/`），強制重新計算每個 chunk。 |
-| `--skip-optuna` | 不跑 Optuna 超參搜尋，使用預設 LightGBM 超參。 |
+| `--skip-optuna` | 不跑 Optuna 超參搜尋，使用預設 LightGBM 超參（可節省約 10 分鐘）。 |
 | `--recent-chunks N` | 僅使用訓練視窗內「最後 N 個」月 chunk（每 chunk 約一個月）。限制從 ClickHouse 或本地 Parquet 載入的資料量；建議 N≥3 以保持 train/valid/test 皆有資料。例如 `--recent-chunks 3` 約為最近 3 個月。 |
 | `--no-preload` | 關閉 profile backfill 時對 session Parquet 的「全表一次載入」，改為每 snapshot 日用 PyArrow pushdown 讀取。預設（不加此旗標）會完整載入整張 session 表格。適合 ≤8 GB RAM 機器，避免 OOM，代價是 backfill 速度較慢。 |
 | `--sample-rated N` | 僅使用 N 個評級客（canonical_id 字典序取前 N 個）。預設不抽樣（使用全部評級客）。 |
@@ -121,7 +121,8 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `ssot/trainer_plan_ssot.md` | 訓練/標籤/特徵設計規格（單一事實來源 SSOT） |
 | `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` | 資料表/欄位字典與 DQ 備註 |
 | `doc/FINDINGS.md` | 資料品質與行為發現（可重現 SQL） |
-| `doc/player_profile_daily_spec.md` | 玩家每日 profile ETL 與 PIT/as-of 語意 |
+| `doc/player_profile_spec.md` | 玩家 profile ETL 與 PIT/as-of 語意 |
+| `doc/FEATURE_SPEC_GUIDE.md` | 特徵規格 YAML 與 Feature Spec 使用說明 |
 | `doc/model_api_protocol.md` | 模型與應用 API 協定（如 POST /score） |
 | `doc/TRAINER_SUMMARY.md` | 系統摘要（架構、模組、前端） |
 | `doc/TRAINER_TEAM_PRESENTATION.md` | 團隊向系統概覽 |
@@ -209,11 +210,11 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --no-preload
 python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1000
 ```
 
-**Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`
+**Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`（可加 `--skip-optuna` 跳过阈值搜索、`--n-trials N` 指定 Optuna 试验次数）
 
-**实时 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（单次执行加 `--once`）。所有观测用同一 rated 模型评分；**仅评级客（is_rated）会产生告警**，非评级客分数仅供 volume 统计（UNRATED_VOLUME_LOG）。
+**实时 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（单次执行加 `--once`；可加 `--model-dir` 指定模型目录、`--log-level DEBUG|INFO|WARNING`）。所有观测用同一 rated 模型评分；**仅评级客（is_rated）会产生告警**，非评级客分数仅供 volume 统计（UNRATED_VOLUME_LOG）。
 
-**Validator**：`python -m trainer.validator --interval 60`（单次加 `--once`）
+**Validator**：`python -m trainer.validator --interval 60`（单次加 `--once`；手动强制结案 PENDING 加 `--force-finalize`）
 
 **API 服务**：`python -m trainer.api_server`（默认 http://0.0.0.0:8000）
 
@@ -249,7 +250,8 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `ssot/trainer_plan_ssot.md` | 训练/标签/特征设计规格（单一事实来源 SSOT） |
 | `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` | 表/字段字典与 DQ 备注 |
 | `doc/FINDINGS.md` | 数据质量与行为发现（可重现 SQL） |
-| `doc/player_profile_daily_spec.md` | 玩家每日 profile ETL 与 PIT/as-of 语义 |
+| `doc/player_profile_spec.md` | 玩家 profile ETL 与 PIT/as-of 语义 |
+| `doc/FEATURE_SPEC_GUIDE.md` | 特征规格 YAML 与 Feature Spec 使用说明 |
 | `doc/model_api_protocol.md` | 模型与应用 API 协议（如 POST /score） |
 | `doc/TRAINER_SUMMARY.md` | 系统摘要（架构、模块、前端） |
 | `doc/TRAINER_TEAM_PRESENTATION.md` | 团队向系统概览 |
@@ -372,13 +374,14 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 ```bash
 python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet
+# Optional: --skip-optuna (skip threshold search), --n-trials N (Optuna trials)
 ```
 
 ### Live scorer (polling + alerts)
 
 ```bash
 python -m trainer.scorer --interval 45 --lookback-hours 8
-# Single run: --once
+# Single run: --once. Override model dir: --model-dir PATH. Log level: --log-level DEBUG|INFO|WARNING
 ```
 
 All observations are scored with the single rated model (v10). **Alerts are emitted only for rated patrons** (`is_rated`); unrated scores are used for volume telemetry only (UNRATED_VOLUME_LOG).
@@ -387,7 +390,7 @@ All observations are scored with the single rated model (v10). **Alerts are emit
 
 ```bash
 python -m trainer.validator --interval 60
-# Single pass: --once
+# Single pass: --once. Force-finalize PENDING: --force-finalize
 ```
 
 ### API server (dashboard backend)
@@ -466,7 +469,8 @@ mypy trainer/ --ignore-missing-imports
 | `ssot/trainer_plan_ssot.md` | Training/labels/features design spec (single source of truth) |
 | `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` | Table/column dictionary and short DQ notes |
 | `doc/FINDINGS.md` | Data quality and behavior findings (reproducible SQL) |
-| `doc/player_profile_daily_spec.md` | Player profile daily ETL and PIT/as-of semantics |
+| `doc/player_profile_spec.md` | Player profile ETL and PIT/as-of semantics |
+| `doc/FEATURE_SPEC_GUIDE.md` | Feature spec YAML and Feature Spec usage guide |
 | `doc/model_api_protocol.md` | Model–app API contract (e.g. POST /score) for decoupled inference |
 | `doc/TRAINER_SUMMARY.md` | System summary (architecture, modules, frontend) |
 | `doc/TRAINER_TEAM_PRESENTATION.md` | Team-facing overview |
