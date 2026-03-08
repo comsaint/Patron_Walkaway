@@ -355,9 +355,11 @@ def compute_run_boundary(
     Returns
     -------
     DataFrame
-        Original columns (for bets ≤ cutoff_time) + two new columns:
-        ``run_id`` (int, 0-based within each canonical_id) and
-        ``minutes_since_run_start`` (float ≥ 0).
+        Original columns (for bets ≤ cutoff_time) + four new columns:
+        ``run_id`` (int, 0-based within each canonical_id),
+        ``minutes_since_run_start`` (float ≥ 0),
+        ``bets_in_run_so_far`` (int, 1-based count within run),
+        ``wager_sum_in_run_so_far`` (float, cumulative wager in run; 0 if wager missing).
         Sorted by (canonical_id, payout_complete_dtm, bet_id).
     """
     missing = _REQUIRED_RUN_COLS - set(bets_df.columns)
@@ -368,6 +370,8 @@ def compute_run_boundary(
         result = bets_df.copy()
         result["run_id"] = pd.array([], dtype="int32")
         result["minutes_since_run_start"] = pd.array([], dtype="float64")
+        result["bets_in_run_so_far"] = pd.array([], dtype="int32")
+        result["wager_sum_in_run_so_far"] = pd.array([], dtype="float64")
         return result
 
     # TRN-09 / E2: apply cutoff filter (compute run_id on full set first,
@@ -408,6 +412,17 @@ def compute_run_boundary(
     df["minutes_since_run_start"] = (
         (df["payout_complete_dtm"] - df["_run_start"]).dt.total_seconds().div(60)
     )
+
+    # Run-level cumulative features (bets in run so far, wager sum in run so far)
+    df["bets_in_run_so_far"] = (
+        df.groupby(["canonical_id", "run_id"], sort=False).cumcount() + 1
+    ).astype("int32")
+    if "wager" in df.columns:
+        df["wager_sum_in_run_so_far"] = (
+            df.groupby(["canonical_id", "run_id"], sort=False)["wager"].cumsum()
+        )
+    else:
+        df["wager_sum_in_run_so_far"] = 0.0
 
     df = df.drop(columns=["_is_new_run", "_run_start"])
 
@@ -906,7 +921,8 @@ def _validate_feature_spec(spec: dict) -> None:
     _DEFAULT_ALLOWED_WIN: set = {"LAG"}
     yaml_agg = {f.upper() for f in (yaml_guardrails.get("allowed_aggregate_functions") or [])}
     yaml_win = {f.upper() for f in (yaml_guardrails.get("allowed_window_functions") or [])}
-    allowed_funcs: set = _DEFAULT_ALLOWED_AGG | _DEFAULT_ALLOWED_WIN | yaml_agg | yaml_win
+    yaml_scalar = {f.upper() for f in (yaml_guardrails.get("allowed_scalar_functions") or [])}
+    allowed_funcs: set = _DEFAULT_ALLOWED_AGG | _DEFAULT_ALLOWED_WIN | yaml_agg | yaml_win | yaml_scalar
     _FUNC_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
     for track_key in ("track_llm", "track_human", "track_profile"):

@@ -671,6 +671,12 @@ def build_features_for_scoring(
     bets_df["minutes_since_run_start"] = (
         rb["minutes_since_run_start"] if "minutes_since_run_start" in rb.columns else 0.0
     )
+    bets_df["bets_in_run_so_far"] = (
+        rb["bets_in_run_so_far"] if "bets_in_run_so_far" in rb.columns else 0
+    )
+    bets_df["wager_sum_in_run_so_far"] = (
+        rb["wager_sum_in_run_so_far"] if "wager_sum_in_run_so_far" in rb.columns else 0.0
+    )
 
     # ── Session rolling stats (legacy parity) ─────────────────────────────
     sess_df = sessions.copy() if not sessions.empty else pd.DataFrame()

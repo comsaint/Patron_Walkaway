@@ -1334,6 +1334,8 @@ def add_track_b_features(
         df["loss_streak"] = 0
         df["run_id"] = 0
         df["minutes_since_run_start"] = 0.0
+        df["bets_in_run_so_far"] = 0
+        df["wager_sum_in_run_so_far"] = 0.0
         return df
 
     # loss_streak (cutoff = window_end so future bets don't influence streak)
@@ -1345,6 +1347,12 @@ def add_track_b_features(
     df["run_id"] = run_df.get("run_id", pd.Series(0, index=df.index))
     df["minutes_since_run_start"] = run_df.get(
         "minutes_since_run_start", pd.Series(0.0, index=df.index)
+    )
+    df["bets_in_run_so_far"] = run_df.get(
+        "bets_in_run_so_far", pd.Series(0, index=df.index)
+    )
+    df["wager_sum_in_run_so_far"] = run_df.get(
+        "wager_sum_in_run_so_far", pd.Series(0.0, index=df.index)
     )
 
     return df

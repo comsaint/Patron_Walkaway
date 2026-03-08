@@ -732,6 +732,20 @@ def _compute_profile(
             / result_parts["sessions_180d"].replace(0, np.nan)
         )
 
+    # ── 7d/30d and active_days per session (min_days=30) ───────────────────────
+    if 30 > max_lookback_days:
+        result_parts["sessions_7d_over_30d"] = _null
+        result_parts["active_days_per_session_30d"] = _null
+    else:
+        result_parts["sessions_7d_over_30d"] = (
+            result_parts["sessions_7d"]
+            / result_parts["sessions_30d"].replace(0, np.nan)
+        )
+        result_parts["active_days_per_session_30d"] = (
+            result_parts["active_days_30d"]
+            / result_parts["sessions_30d"].replace(0, np.nan)
+        )
+
     # ── Session Duration ─────────────────────────────────────────────────────
     for days in (30, 180):
         if days > max_lookback_days:
@@ -1220,6 +1234,10 @@ SELECT
     p.turnover_sum_30d  / NULLIF(p.turnover_sum_180d, 0) AS turnover_30d_over_180d,
     CAST(p.sessions_30d AS DOUBLE)
         / NULLIF(CAST(p.sessions_180d AS DOUBLE), 0)     AS sessions_30d_over_180d,
+    CAST(p.sessions_7d AS DOUBLE)
+        / NULLIF(CAST(p.sessions_30d AS DOUBLE), 0)     AS sessions_7d_over_30d,
+    CAST(p.active_days_30d AS DOUBLE)
+        / NULLIF(CAST(p.sessions_30d AS DOUBLE), 0)      AS active_days_per_session_30d,
     -- Session duration
     p.avg_session_duration_min_30d,
     p.avg_session_duration_min_180d,
