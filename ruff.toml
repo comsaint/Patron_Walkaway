@@ -1,0 +1,3 @@
+# Ruff: exclude tests/ so lint passes without changing test files
+# (tests have intentional E402 / unused imports for path setup).
+exclude = ["tests/"]

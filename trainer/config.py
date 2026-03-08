@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 
@@ -90,11 +90,13 @@ OPTUNA_TIMEOUT_SECONDS: Optional[int] = 10 * 60
 # Threshold selection objective: F-beta with beta < 1 favours precision over recall.
 THRESHOLD_FBETA: float = 0.5
 
-# --- Feature screening (DEC-020) ---
+# --- Feature screening (DEC-020, PLAN screen-lgbm-default) ---
 # Maximum number of features to keep after screen_features().
 # None = no cap (all Stage-1 survivors kept); integer N = hard upper limit applied
-# after Stage-1 (MI ranking) and, if use_lgbm=True, after Stage-2 (LGBM ranking).
+# after Stage-1 (MI or LGBM ranking) and, if screen_method=mi_then_lgbm, after Stage-2 (LGBM ranking).
 SCREEN_FEATURES_TOP_K: Optional[int] = None
+# Screening method: "lgbm" = LGBM-only (fast, no MI); "mi" = original MI path; "mi_then_lgbm" = MI then LGBM re-rank (original use_lgbm=True).
+SCREEN_FEATURES_METHOD: Literal["lgbm", "mi", "mi_then_lgbm"] = "lgbm"
 
 # --- Threshold selection guardrails ---
 # Minimum number of validation alerts required for a candidate threshold to be
@@ -212,6 +214,48 @@ PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB: float = 8.0
 PROFILE_DUCKDB_RAM_MAX_FRACTION: Optional[float] = 0.45
 PROFILE_DUCKDB_THREADS: int = 2
 PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER: bool = False
+
+# --- Step 7 DuckDB out-of-core sort (OOM-safe; PLAN Step 7 Out-of-Core) ---
+# When True, Step 7 uses DuckDB to sort and split chunk Parquets (spills to disk
+# when over memory_limit), avoiding pandas concat+sort peak RAM. When False or
+# on DuckDB error, fall back to pandas concat + sort + split.
+STEP7_USE_DUCKDB: bool = True
+STEP7_DUCKDB_RAM_FRACTION: float = 0.50
+STEP7_DUCKDB_RAM_MIN_GB: float = 2.0
+STEP7_DUCKDB_RAM_MAX_GB: float = 24.0
+STEP7_DUCKDB_THREADS: int = 4
+STEP7_DUCKDB_PRESERVE_INSERTION_ORDER: bool = False
+# Temp directory for DuckDB spill; None = caller uses DATA_DIR / "duckdb_tmp"
+STEP7_DUCKDB_TEMP_DIR: Optional[str] = None
+
+# --- Plan B+: Step 7 keep train on disk (PLAN 方案 B+ 階段 1–2) ---
+# When True and DuckDB succeeds, Step 7 does not load train into memory; only valid/test
+# are loaded. Step 8 then samples from train Parquet (first N rows) for screening; after
+# screening train is loaded once for export/Step 9. Reduces peak RAM between Step 7 and Step 8.
+# Requires STEP7_USE_DUCKDB=True; on DuckDB failure we raise (no pandas fallback) per PLAN.
+STEP7_KEEP_TRAIN_ON_DISK: bool = False
+
+# --- Plan B+: LibSVM export (PLAN 方案 B+ 階段 3) ---
+# When True and step7_train_path is set (B+ path), stream export from Parquet to
+# train_for_lgb.libsvm + train_for_lgb.libsvm.weight and valid_for_lgb.libsvm
+# before loading train into memory. Requires STEP7_KEEP_TRAIN_ON_DISK and split paths.
+STEP9_EXPORT_LIBSVM: bool = False
+
+# --- Plan B: train from file (PLAN 方案 B) ---
+# When True, Step 9 will train from on-disk CSV/TSV (or equivalent) instead of
+# loading full train_df into memory. Requires export + Booster path (not yet implemented).
+# Default False until the full path is implemented and validated.
+STEP9_TRAIN_FROM_FILE: bool = False
+
+# --- Plan B+ stage 5 (PLAN 方案 B+ 階段 5)：optional .bin for LibSVM path ---
+# When True and training from LibSVM (train_libsvm_paths), save dtrain to
+# train_for_lgb.bin after first build; on next run use .bin if present (faster I/O).
+STEP9_SAVE_LGB_BINARY: bool = False
+# When set (e.g. 2_000_000), Step 8 feature screening uses only this many rows from
+# train (strategy A: sample-based screening to avoid loading full train). None = use
+# full train for screening (current behaviour). If set to an integer, must be > 0;
+# 0 or negative is invalid (treat as None when implementing Step 8).
+STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = None
 
 # --- SQL fragment shared across all modules (FND-03) ---
 CASINO_PLAYER_ID_CLEAN_SQL = (

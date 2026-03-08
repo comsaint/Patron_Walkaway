@@ -65,10 +65,11 @@ class TestR1004ScreeningSkipFallback(unittest.TestCase):
 
     def test_screening_skip_should_filter_active_feature_cols(self):
         src = inspect.getsource(trainer_mod.run_pipeline)
+        # R1004: restrict to columns present in train (or _train_cols when B+ keep-on-disk).
         self.assertIn(
-            "active_feature_cols = [c for c in active_feature_cols if c in train_df.columns]",
+            "active_feature_cols = [c for c in active_feature_cols if c in _train_cols]",
             src,
-            "When screening is skipped, active_feature_cols should be restricted to train_df columns.",
+            "When screening is skipped, active_feature_cols should be restricted to train columns (_train_cols).",
         )
 
 

@@ -395,3 +395,345 @@ python -m trainer.trainer --days 30
 1. 跑全套 `python -m pytest tests/` 確認其他 tests 未受影響。
 2. 考慮對 `features.py:1074` 的 pre-existing mypy `no-redef` 錯誤開一個獨立 ticket 修復。
 3. 觀察生產環境日誌，確認批次進度 log 頻率（每 10 批一次）合適，視需要調整。
+
+---
+
+## Round 372 — Plan B+ 階段 3：串流匯出 LibSVM + .weight（2026-03-08）
+
+### 目標
+實作 PLAN §4.3 階段 3：從 `train_path` / `valid_path`（Parquet）串流寫出  
+`train_for_lgb.libsvm`、`train_for_lgb.libsvm.weight`、`valid_for_lgb.libsvm`；weight 語義與 `compute_sample_weights` 一致（run-level 1/N_run）。不載入完整 train 進記憶體。
+
+### 改動的檔案
+
+| 檔案 | 性質 | 說明 |
+|------|------|------|
+| `trainer/config.py` | 設定 | 新增 `STEP9_EXPORT_LIBSVM: bool = False`（Plan B+ 區塊） |
+| `trainer/trainer.py` | 實作 | 讀取 `STEP9_EXPORT_LIBSVM`；新增 `_export_parquet_to_libsvm(...)`；在 `step7_train_path is not None` 且載入 train 前，若 `STEP9_EXPORT_LIBSVM` 且 `active_feature_cols` 非空則呼叫匯出 |
+
+### 實作摘要
+
+- **`_export_parquet_to_libsvm(train_path, valid_path, feature_cols, export_dir)`**：以 DuckDB 自 Parquet 串流讀取（`fetchmany(50_000)`），僅 `is_rated` 列；train 權重為 `1.0 / COUNT(*) OVER (PARTITION BY canonical_id, run_id)`；寫出 LibSVM（1-based 特徵索引、省略 0 做 sparse）與 `.weight`（一行一權重）；valid 僅寫 `.libsvm`。
+- **接線**：在 `run_pipeline` 的「Step 7 B+ 載入 train」區塊內，在 `pd.read_parquet(step7_train_path)` 與 unlink 之前，若 `STEP9_EXPORT_LIBSVM` 且 `active_feature_cols` 非空則呼叫上述函式，輸出目錄為 `DATA_DIR / "export"`。
+
+### 手動驗證
+
+1. **單元/整合**：`python -m pytest tests/ -q`（見下方結果）。
+2. **手動觸發匯出**：設定 `STEP9_EXPORT_LIBSVM = True` 且啟用 B+ 路徑（`STEP7_KEEP_TRAIN_ON_DISK` 等），跑一次 pipeline；檢查 `trainer/.data/export/` 下是否產生 `train_for_lgb.libsvm`、`train_for_lgb.libsvm.weight`、`valid_for_lgb.libsvm`，且 train 行數與 weight 行數一致。
+
+### 下一步建議
+
+1. **階段 4（PLAN §4.4）**：Step 9 改為自 LibSVM 訓練（`lgb.Dataset(libsvm_path, weight_file=...)`），不再載入 `train_df`，以完成 B+ 記憶體優化。
+2. 可選：為 `_export_parquet_to_libsvm` 加小型單元測試（mock Parquet + DuckDB 或 fixture）以鎖定行為。
+
+### pytest -q 結果
+
+```
+732 passed, 4 skipped, 28 warnings, 5 subtests passed in 19.11s
+```
+
+---
+
+## Code Review：Plan B+ 階段 3 變更（Round 372，2026-03-08）
+
+以下針對 **Round 372** 引入的 `STEP9_EXPORT_LIBSVM`、`_export_parquet_to_libsvm` 及 run_pipeline 接線進行審查。僅列出最可能的 bug、邊界條件、安全性與效能問題；每項附**具體修改建議**與**希望新增的測試**。不重寫整套實作。
+
+---
+
+### 1. [Bug] 特徵值 NaN 寫成字串 `"nan"`，LightGBM LibSVM 可能無法解析
+
+- **問題描述**：`_export_parquet_to_libsvm` 中對特徵值做 `x = float(v)`，若 Parquet 內為 `NaN`，則 `float(v)` 為 `float('nan')`，`x != 0.0` 為 True，會寫出 `"idx:nan"`。LibSVM 格式通常要求數值，LightGBM 從檔案讀 LibSVM 時可能無法解析 `nan` 字串或行為未定義。
+- **具體修改建議**：在寫入 LibSVM 前將 NaN 視為 0（與 PLAN「0 可省略為 sparse」一致）。例如在 `x = float(v)` 之後加：`if math.isnan(x): x = 0.0`（或 `x = 0.0 if (isinstance(x, float) and math.isnan(x)) else x`），再依 `x != 0.0` 決定是否輸出。
+- **希望新增的測試**：單元測試：給定一筆 Parquet（或 mock DuckDB 回傳）其中某特徵為 `NaN`，匯出後該行 LibSVM 中該特徵索引要么省略（視為 0）、要么為 `idx:0`，且檔案可被 `lgb.Dataset(path)` 成功讀入（或至少斷言輸出行不包含字串 `"nan"`）。
+
+---
+
+### 2. [邊界條件] Train 或 Valid 無任何 is_rated 列時產出空檔，LightGBM 可能無法建 Dataset
+
+- **問題描述**：若 `train_path` 或 `valid_path` 經 `WHERE is_rated = true` 後為 0 列，函式仍會寫出 0 行的 `.libsvm`（及 train 的 `.weight`）。後續階段 4 若以 `lgb.Dataset(train_for_lgb.libsvm, weight_file=...)` 讀取，LightGBM 可能報錯或行為未定義。
+- **具體修改建議**：在寫入 train 後若 `n_train == 0`，記錄 `logger.warning` 並可選拋出 `ValueError("LibSVM export produced 0 train rows; cannot train from file.")`，或在 docstring 註明「caller 應在階段 4 檢查檔案非空再建 Dataset」。若選擇僅 warning，則在階段 4 實作時對空檔做明確處理（跳過或失敗）。
+- **希望新增的測試**：整合或單元測試：mock/ fixture 使 train Parquet 的 `is_rated` 全為 false，呼叫 `_export_parquet_to_libsvm`，斷言要麼拋出明確錯誤、要麼至少有一次 `warning` 且 train 行數為 0；並可選斷言 `valid` 為 0 行時行為一致（例如 valid 空檔僅 warning、不阻斷）。
+
+---
+
+### 3. [邊界條件] train_path / valid_path 不存在時錯誤訊息不友善
+
+- **問題描述**：未先檢查 `train_path.exists()` / `valid_path.exists()`，直接以 DuckDB `read_parquet(path)` 讀取。若檔案不存在或路徑錯誤，DuckDB 拋出的例外可能較難對應到「路徑錯誤」。
+- **具體修改建議**：在函式開頭（建立 export_dir 之後）加上：  
+  `if not train_path.exists(): raise FileNotFoundError(f"Train Parquet not found: {train_path}")`  
+  以及對 `valid_path` 的同樣檢查。若希望 valid 可選，則改為僅對 train_path 必存在、valid_path 可選並在不存在時跳過寫 valid 或明確說明行為。
+- **希望新增的測試**：傳入不存在的 `train_path`（或 `valid_path`），斷言拋出 `FileNotFoundError`（或明確的錯誤類型）且訊息中包含路徑或 "not found" 等關鍵字。
+
+---
+
+### 4. [邊界條件] label 未驗證為 0/1，非二分類值可能導致訓練或評估錯誤
+
+- **問題描述**：目前以 `label = int(row[0])` 寫入 LibSVM。若 Parquet 中 `label` 為 2、-1 或浮點 0.5，會變成 2、-1、0。LightGBM 二分類預期 0/1，非 0/1 可能導致訓練異常或評估解讀錯誤。
+- **具體修改建議**：寫入前驗證：若 `label not in (0, 1)` 則記錄 `logger.warning("LibSVM export: non-binary label %s at row, coercing to 0/1", label)` 並將 label 強制為 `1 if label else 0`，或在首筆異常時直接 `raise ValueError("LibSVM export expects binary label 0/1, got ...")`。依專案策略二擇一（寬鬆 coerce 或嚴格 fail）。
+- **希望新增的測試**：給定一筆 label=2（或 -1）的列，斷言匯出後該行 label 被改為 0/1 或函式拋出 ValueError；並可選斷言日誌中出現對應 warning。
+
+---
+
+### 5. [安全性/可維護性] 路徑來自呼叫端，僅跳脫單引號；惡意或異常路徑仍有風險
+
+- **問題描述**：`_esc_path` 僅對單引號做 `'` → `''`，避免 SQL 字串斷開。若 `train_path`/`valid_path` 來自不可信來源或含異常字元（如換行、多個單引號組合），理論上仍有注入或解析風險。目前呼叫端為 run_pipeline，路徑為 Step 7 產出，屬內部可控。
+- **具體修改建議**：在 docstring 或模組註解中明確寫明「train_path / valid_path 必須為受信任的內部路徑，由 Step 7 產出；勿傳入使用者可控路徑」。若未來接受外部路徑，應改為 DuckDB 參數化查詢或僅接受絕對路徑白名單。
+- **希望新增的測試**：靜態/規則測試：搜尋 `_export_parquet_to_libsvm` 的呼叫處，斷言傳入的 path 來自 `step7_train_path`/`step7_valid_path`（或常數 `DATA_DIR / "export"`），而非任意使用者輸入；或文件化「path 僅限內部」並由 code review 覆核。
+
+---
+
+### 6. [穩健性] 寫入中斷時可能產生 train 行數與 weight 行數不一致的殘留檔
+
+- **問題描述**：train 的 `.libsvm` 與 `.libsvm.weight` 以兩個檔案同時逐行寫入。若寫入中途發生例外（磁碟滿、OOM、中斷），可能出現 .libsvm 行數 ≠ .weight 行數，階段 4 用 LightGBM 載入時會得到錯誤對齊的權重。
+- **具體修改建議**：改為先寫入暫存檔（例如 `train_for_lgb.libsvm.tmp`、`train_for_lgb.libsvm.weight.tmp`），全部成功寫完後再 `os.replace(tmp, final)` 覆蓋正式檔；失敗時保留或刪除暫存檔並重新拋出例外，避免留下半成品為「正式」檔。
+- **希望新增的測試**：單元測試：mock 在寫入第 N 行時拋出例外，斷言最終正式路徑下 either 無新檔案、或僅存在未更名的 .tmp；且成功路徑下不會出現「.libsvm 與 .weight 行數不同」的檔案對。
+
+---
+
+### 7. [效能] batch_size 固定 50_000，極低記憶體環境可能需更小批次
+
+- **問題描述**：`fetchmany(50_000)` 與逐行處理的記憶體用量相對可控，但在極端低 RAM 環境下，50_000 行 × 特徵數 × 8 位元組可能仍偏高。
+- **具體修改建議**：可選：將 `batch_size` 改為函式參數（預設 50_000）或從 config 讀取（例如 `STEP9_LIBSVM_BATCH_SIZE`），便於調校。非必須，可列為後續優化。
+- **希望新增的測試**：可選：傳入較小 batch_size（如 100），斷言匯出結果與預設 batch 一致（相同行數、前幾行內容一致）；或僅在文件/註解中說明可調參數意圖。
+
+---
+
+### 8. [一致性] 與 Plan B CSV 匯出行為差異：未限制「僅 common 特徵」、未檢查路徑存在
+
+- **問題描述**：`_export_train_valid_to_csv` 會取 train/valid 的 **common** 特徵、缺欄時 warning 並只匯出 common_cols，且會檢查 DataFrame 有 `label`。`_export_parquet_to_libsvm` 直接使用傳入的 `feature_cols`，若 Parquet 缺某欄由 DuckDB 拋錯；且未先檢查檔案存在。
+- **具體修改建議**：若希望與 Plan B 行為對齊，可在匯出前用 DuckDB 查詢 Parquet 的 schema（或 `read_parquet 的 columns`），只保留 `feature_cols` 中實際存在的欄位，並對「僅存在於 train 或僅存在於 valid」的欄位打 warning；否則至少在 docstring 註明「caller 須保證 feature_cols 在兩份 Parquet 皆存在且順序一致」。路徑存在性見項目 3。
+- **希望新增的測試**：當某 `feature_cols` 在 train 存在、在 valid 不存在（或反）時，斷言要麼匯出時有 warning 且僅使用 common 特徵、要麼 DuckDB 報錯被明確處理；並可選比對與 CSV 匯出在「common 特徵子集」上的一致性（若兩者皆啟用）。
+
+---
+
+### 總結
+
+| # | 類型       | 嚴重度（主觀） | 建議優先處理 |
+|---|------------|----------------|--------------|
+| 1 | Bug        | 高             | 是（NaN → 0） |
+| 2 | 邊界條件   | 中             | 是（0 行 train） |
+| 3 | 邊界條件   | 中             | 是（路徑存在檢查） |
+| 4 | 邊界條件   | 中             | 可選（label 0/1） |
+| 5 | 安全性     | 低             | 文件化即可 |
+| 6 | 穩健性     | 中             | 建議（原子寫入） |
+| 7 | 效能       | 低             | 可選 |
+| 8 | 一致性     | 低             | 可選／文件化 |
+
+以上為 Round 372 Plan B+ 階段 3 變更之審查結果；實作修正與測試可依優先級分輪進行。
+
+---
+
+## Round 373 — Plan B+ 階段 3 Review 風險 → 最小可重現測試（僅 tests，未改 production）
+
+### 目標
+將 STATUS.md「Code Review：Plan B+ 階段 3 變更」中列出的 8 項風險轉成可執行的最小可重現測試或 lint/規則檢查；**僅新增測試，不修改 production code**。
+
+### 新增檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/test_review_risks_round372_plan_b_plus_libsvm.py` | Plan B+ LibSVM 匯出 8 項 review 風險對應的 guard 測試 |
+
+### 測試與 Review 項目對應
+
+| Review # | 風險要點 | 測試／規則 | 目前狀態 |
+|----------|----------|------------|----------|
+| 1 | 特徵 NaN 不得寫成字串 "nan" | `test_libsvm_output_contains_no_nan_literal_when_feature_is_nan`：Parquet 含 NaN 時匯出檔不得含 "nan" | ✅ PASS（DuckDB 回傳 None 時已省略） |
+| 2 | 0 行 train 時應 warning 或 raise | `test_zero_rated_train_rows_should_warn_or_raise`：全 is_rated=False 時須有 warning 且 train 行數=0 | ⚠️ XFAIL（production 尚未實作） |
+| 3 | 路徑不存在應拋 FileNotFoundError | `test_missing_train_path_raises_filenotfounderror`：傳入不存在的 train_path 須拋 FileNotFoundError 或訊息含 "not found" | ⚠️ XFAIL（production 依賴 DuckDB 錯誤） |
+| 4 | label 須為 0/1 | `test_non_binary_label_should_be_coerced_or_raise`：label=2 時匯出須為 0/1 或 raise | ⚠️ XFAIL（production 原樣寫入） |
+| 5 | 呼叫處僅用內部路徑 | `test_export_libsvm_is_called_with_step7_paths_and_export_dir`：靜態規則，call site 須為 step7_train_path、step7_valid_path、DATA_DIR/export | ✅ PASS |
+| 6 | 應先寫 .tmp 再 rename 做原子寫入 | `test_export_uses_temp_file_then_rename`：函式內須有 .tmp 或 os.replace/rename | ⚠️ XFAIL（production 直接寫最終路徑） |
+| 7 | batch_size 存在／可調 | `test_batch_size_present_in_export_function`：函式內須有 batch_size 與 fetchmany | ✅ PASS |
+| 8 | valid 缺欄時須明確處理或 common 特徵 | `test_valid_missing_feature_column_handled_gracefully`：valid 缺 feature_cols 時須成功用 common 或錯誤訊息含 column/f2/common 等 | ✅ PASS（DuckDB 錯誤訊息已含欄位資訊） |
+
+### 執行方式
+
+僅跑本輪新增的 Plan B+ LibSVM review 測試：
+
+```bash
+python -m pytest tests/test_review_risks_round372_plan_b_plus_libsvm.py -v
+```
+
+預期結果：**4 passed, 4 xfailed**（4 項為尚未實作的預期失敗，待 production 修正後移除 `@unittest.expectedFailure`）。
+
+全套測試（含本輪）：
+
+```bash
+python -m pytest -q
+```
+
+預期：**736 passed, 4 skipped, 4 xfailed**（新增 4 個通過、4 個 xfail）。
+
+### 下一步建議
+
+1. 依 Review 優先級修正 production（#1 NaN 已滿足；#2、#3、#4、#6 待實作），每修一項可移除對應測試的 `@expectedFailure` 並確認通過。
+2. 若未來變更 call site 或匯出邏輯，須確保上述 5 項通過的規則／行為不回歸。
+
+---
+
+## Round 374 — Plan B+ 階段 3 Review 修正（production 實作 + 全綠）
+
+### 目標
+依 Round 372 Code Review 與 Round 373 測試，修正 production 直至所有 tests / typecheck / lint 通過；僅在 decorator 過時時移除 `@expectedFailure`，不改測試邏輯。
+
+### 改動的檔案
+
+| 檔案 | 性質 | 說明 |
+|------|------|------|
+| `trainer/trainer.py` | 實作 | `_export_parquet_to_libsvm`：路徑存在檢查、0 行 train warning、label 0/1 強制、NaN→0、原子寫入 .tmp + os.replace；call site 加 assert step7_valid_path 以滿足 mypy |
+| `trainer/trainer.py` | 實作 | 頂層 `import math`（供 `math.isnan`） |
+| `tests/test_review_risks_round372_plan_b_plus_libsvm.py` | tests | 移除 4 個已過時的 `@unittest.expectedFailure`（#2、#3、#4、#6） |
+
+### 實作摘要（_export_parquet_to_libsvm）
+
+| Review # | 修正內容 |
+|----------|----------|
+| 2 | 寫完 train 後若 `n_train == 0` 則 `logger.warning("LibSVM export produced 0 train rows...")` |
+| 3 | 函式開頭 `train_path.exists()` / `valid_path.exists()` 若不存在則 `raise FileNotFoundError(...)` |
+| 4 | 寫入前將 label 強制為 0/1（`label = 1 if raw_label else 0`），非 0/1 時 `logger.warning` |
+| 6 | 先寫入 `train_for_lgb.libsvm.tmp`、`train_for_lgb.libsvm.weight.tmp`、`valid_for_lgb.libsvm.tmp`，成功後 `os.replace(tmp, final)` |
+| 1（加固） | 特徵值 `float(v)` 後若 `math.isnan(x)` 則 `x = 0.0`，避免寫出字串 "nan" |
+
+### 測試結果
+
+```bash
+python -m pytest tests/test_review_risks_round372_plan_b_plus_libsvm.py -v
+# 8 passed in ~1s
+
+python -m pytest -q
+# 740 passed, 4 skipped, 28 warnings, 5 subtests passed in ~19.5s
+```
+
+### Lint / Typecheck
+
+| 工具 | 範圍 | 結果 |
+|------|------|------|
+| ruff | `trainer/trainer.py`、`tests/test_review_risks_round372_plan_b_plus_libsvm.py` | All checks passed |
+| mypy | `trainer/trainer.py` | 本次修正消除 `_export_parquet_to_libsvm` 呼叫處之 arg-type（`step7_valid_path` 加 assert）；其餘為既有 import-untyped 等 |
+
+### 手動驗證
+
+```bash
+python -m pytest tests/test_review_risks_round372_plan_b_plus_libsvm.py -v
+python -m pytest -q
+python -m ruff check trainer/trainer.py tests/test_review_risks_round372_plan_b_plus_libsvm.py
+```
+
+### 下一步建議
+
+1. **PLAN 方案 B+ 階段 4**：Step 9 改為自 LibSVM 訓練（`lgb.Dataset(libsvm_path, weight_file=...)`），不再載入 `train_df`，完成 B+ 記憶體優化。
+2. 可選：第一次建 Dataset 後 `save_binary`、Valid/Test 從檔案或分塊 predict。
+
+---
+
+## Round 375 — Plan B+ 階段 4：Step 9 從 LibSVM 訓練（2026-03-08）
+
+### 目標
+實作 PLAN §4.4：當 `STEP9_EXPORT_LIBSVM` 且已匯出 LibSVM 時，Step 9 以 `lgb.Dataset(libsvm_path)` 從檔案訓練，並載入同名的 `.weight` 檔，不再依賴 in-memory train 建 Dataset。
+
+### 改動的檔案
+
+| 檔案 | 性質 | 說明 |
+|------|------|------|
+| `trainer/trainer.py` | 實作 | `train_single_rated_model` 新增參數 `train_libsvm_paths: Optional[Tuple[Path, Path]]`；當設且兩檔存在時以 `use_from_libsvm` 建 `dtrain`/`dvalid` 從路徑、讀 .weight 檔傳入、用預設 hp、`lgb.train`；`run_pipeline` 在 B+ 路徑下取得 `_export_parquet_to_libsvm` 回傳路徑並傳入 `train_libsvm_paths` |
+
+### 實作摘要
+
+- **train_libsvm_paths**：若為 `(train_path, valid_path)` 且兩檔存在，則 `use_from_libsvm = True`，不走 Plan B CSV 與 in-memory 訓練。
+- **LibSVM 訓練**：0 行 train 時 fallback in-memory；否則讀 `.weight` 檔（一行一權重）傳入 `lgb.Dataset(..., weight=...)`；`dtrain`/`dvalid` 以 `feature_name=avail_cols` 建；用預設 hp、early_stopping 於 dvalid（若 valid 足夠）；產出 `_BoosterWrapper(booster)` 與 metrics，與既有 path 一致。
+- **接線**：`run_pipeline` 在 `step7_train_path is not None` 且 `STEP9_EXPORT_LIBSVM` 時於 export 後取得 `_train_libsvm, _valid_libsvm`，呼叫 `train_single_rated_model(..., train_libsvm_paths=(_train_libsvm, _valid_libsvm))`。
+
+### 手動驗證
+
+1. **單元／整合**：`python -m pytest -q`（見下方結果）。
+2. **B+ 端對端**：設定 `STEP7_KEEP_TRAIN_ON_DISK=True`、`STEP9_EXPORT_LIBSVM=True`，跑 `python -m trainer.trainer --days 30`（或 `--recent-chunks 3`），確認 log 出現 LibSVM 匯出與訓練，且產出 `model.pkl`。
+
+### 下一步建議
+
+1. **可選**：B+ 路徑下不載入 `train_df`（僅保留 valid/test），改為在 Step 9 後用 LibSVM 路徑訓練，進一步降 peak RAM。
+2. **可選**：第一次建 Dataset 後 `save_binary`；Valid/Test 從檔案或分塊 predict（階段 5–6）。
+
+### pytest -q 結果
+
+```
+740 passed, 4 skipped, 28 warnings, 5 subtests passed in 21.14s
+```
+
+---
+
+## Code Review：Plan B+ 階段 4 變更（Round 375，2026-03-08）
+
+以下針對 **Round 375** 引入的 `train_libsvm_paths`、`use_from_libsvm` 分支及 run_pipeline 接線進行審查。僅列出最可能的 bug、邊界條件、安全性與效能問題；每項附**具體修改建議**與**希望新增的測試**。不重寫整套實作。
+
+---
+
+### 1. [Bug] .weight 檔行數與 LibSVM 行數不一致時，LightGBM 可能錯位或報錯
+
+- **問題描述**：目前讀取 `.weight` 檔為 `[float(line.strip()) for line in _wf]`，未驗證 `len(_train_weights)` 是否等於 LibSVM 行數 `_n_lines`。若 .weight 因寫入中斷、手動編輯或與舊版 export 混用而多/少幾行，LightGBM 會將權重對應到錯誤的樣本，或於內部檢查時拋錯。
+- **具體修改建議**：在讀完 `_train_weights` 後加上：`if _train_weights is not None and len(_train_weights) != _n_lines: logger.warning("Plan B+: weight file line count (%d) != train LibSVM lines (%d); ignoring weights.", len(_train_weights), _n_lines); _train_weights = None`，或改為拋出 `ValueError` 明確中止，由呼叫端決定策略。
+- **希望新增的測試**：單元測試：準備 train.libsvm（N 行）與 train.libsvm.weight（N-1 或 N+1 行），呼叫 `train_single_rated_model(..., train_libsvm_paths=(...))`，斷言要麼出現 warning 且權重被忽略、要麼拋出明確錯誤；並可選斷言 N 行對 N 行時訓練成功且無該 warning。
+
+---
+
+### 2. [邊界條件] 0 行 LibSVM fallback 後若 train_rated 為空，in-memory 路徑會失敗
+
+- **問題描述**：當 `_n_lines < 1` 時設 `use_from_libsvm = False`，後續走 `_train_one_model(X_tr, y_tr, ...)`。目前 run_pipeline 仍會載入 train_df，故 `train_rated` 通常非空。若未來 B+ 路徑改為不載入 train，`train_rated` 可能為空，此時 `X_tr`/`y_tr` 為空，`_train_one_model` 或 LightGBM 可能報錯或產出無意義模型。
+- **具體修改建議**：在設 `use_from_libsvm = False` 之後、進入 `if not use_from_file and not use_from_libsvm` 之前，若 `train_rated.empty`：記錄 `logger.warning("Plan B+: fallback to in-memory but no train rows; cannot train.")` 並 `return None, None, {"rated": None}`，與現有「no training rows」行為一致。
+- **希望新增的測試**：整合或 mock 測試：在 `use_from_libsvm` 為 True 且 LibSVM 為 0 行的情境下，mock 或提供空的 `train_df`，斷言函式回傳 `(None, None, {"rated": None})` 或等同行為，且不呼叫 `_train_one_model` 或 LightGBM。
+
+---
+
+### 3. [邊界條件] test_rated 缺欄時可能 KeyError
+
+- **問題描述**：LibSVM 路徑結束後 `avail_cols = list(booster.feature_name())`，後續 `test_rated[avail_cols]` 若 test_df 缺少任一 `avail_cols` 會 KeyError。Plan B CSV 路徑對 valid 有 `_missing_val_cols` 防呆，對 test 則未限制。
+- **具體修改建議**：在 `if test_rated is not None and not test_rated.empty` 區塊內，計算 `_missing_te_cols = [c for c in avail_cols if c not in test_rated.columns]`；若非空則 `logger.warning("Plan B+: test_df missing columns %s; skipping test metrics.", _missing_te_cols)` 且不呼叫 `_compute_test_metrics`（或僅傳入 test_rated 中存在的欄位子集並在 doc 註明可能維度不符），避免 KeyError。
+- **希望新增的測試**：給定 `train_libsvm_paths` 且訓練成功，傳入的 `test_df` 缺少部分 `avail_cols`，斷言不拋 KeyError，且日誌出現 missing columns 的 warning 或 test 指標被跳過。
+
+---
+
+### 4. [邊界條件] .weight 檔含非數值或空行時會拋 ValueError
+
+- **問題描述**：`_train_weights = [float(line.strip()) for line in _wf]` 遇空行會 `float('')` 拋 ValueError；遇非數值字串亦然。若 export 或檔案損壞產生異常行，整段訓練會中斷。
+- **具體修改建議**：逐行讀取時做 try/except 或驗證：例如 `_train_weights = []`，對每行 `s = line.strip(); _train_weights.append(float(s) if s else 0.0)` 或 `try: _train_weights.append(float(s)); except ValueError: logger.warning("Plan B+: invalid weight line %r, using 0.0", s); _train_weights.append(0.0)`。並在最後仍可選擇檢查 `len(_train_weights) == _n_lines`（見項目 1）。
+- **希望新增的測試**：準備含一空行或含 "nan"/"x" 的 .weight 檔，斷言要麼轉為 0.0 且出現 warning、要麼拋出明確錯誤，且行為在文件中註明。
+
+---
+
+### 5. [效能] 大資料時 .weight 整檔載入記憶體
+
+- **問題描述**：`.weight` 檔以 `[float(line.strip()) for line in _wf]` 一次載入。60M 行約 480MB+。PLAN 目標為避免 train 特徵/標籤進記憶體，權重仍進記憶體，對極大 window 仍可能推高 peak RAM。
+- **具體修改建議**：在 docstring 或註解中註明「B+ 路徑下 train 特徵/標籤不進記憶體，但 .weight 會整檔讀入；若需進一步降 RAM 可考慮 LightGBM 支援從檔案讀 weight 或分塊讀入」。可選：當 `_n_lines` 超過某閾值（如 10M）時 `logger.info("Plan B+: loading %d weights into memory (~%.0f MB)", _n_lines, _n_lines * 8 / 1e6)` 以利觀察。
+- **希望新增的測試**：可選：mock 或 fixture 產生大行數 .weight，斷言記憶體使用在合理範圍或僅文件化預期；或壓力測試在給定 RAM 下可完成訓練。
+
+---
+
+### 6. [一致性] LibSVM 路徑未做單一類別檢查（Plan B CSV 有）
+
+- **問題描述**：Plan B CSV 路徑會檢查 `_train_labels["label"].nunique() < 2`，若僅單一類別則 fallback in-memory 並 warning。LibSVM 路徑未做等同檢查，若 export 後 train 僅 0 或僅 1，LightGBM 可能仍訓練但模型/閾值可能退化。
+- **具體修改建議**：在 `use_from_libsvm` 且 `_n_lines >= 1` 時，快速掃過 LibSVM 第一欄（label）或讀取前若干行，若僅見 0 或僅見 1 則 `logger.warning("Plan B+: train LibSVM has only one class; falling back to in-memory training.")` 且 `use_from_libsvm = False`；或與 Plan B 一致改為 fallback。若掃描成本高可僅在文件註明「單一類別時行為未定義，建議由 caller 保證」。
+- **希望新增的測試**：給定僅 label=0（或僅 label=1）的 train LibSVM，斷言要麼 fallback 並 warning、要麼明確拒絕訓練；並可選與 Plan B 單一類別行為對齊。
+
+---
+
+### 7. [可維護性] train_libsvm_paths 來源與契約
+
+- **問題描述**：`train_libsvm_paths` 目前僅由 run_pipeline 在 B+ 路徑下傳入，路徑來自 `_export_parquet_to_libsvm` 回傳值，屬內部可控。若未來其他呼叫端傳入不可信路徑或錯誤順序（train/valid 對調），可能導致訓練/驗證資料錯置。
+- **具體修改建議**：在 `train_single_rated_model` docstring 註明「train_libsvm_paths 須為 (train_libsvm_path, valid_libsvm_path)，且兩者皆為受信任的內部路徑（例如由 _export_parquet_to_libsvm 產出）；勿傳入使用者可控路徑。」若需要可加 assertion：`assert train_libsvm_paths[0].name.startswith("train") and train_libsvm_paths[1].name.startswith("valid")` 作為簡易防呆（或僅文件化）。
+- **希望新增的測試**：靜態或規則測試：搜尋對 `train_single_rated_model` 的呼叫，斷言 `train_libsvm_paths` 僅在 run_pipeline 內傳入且來源為 `_export_parquet_to_libsvm` 回傳；或文件化契約並由 code review 覆核。
+
+---
+
+### 總結
+
+| # | 類型       | 嚴重度（主觀） | 建議優先處理 |
+|---|------------|----------------|--------------|
+| 1 | Bug        | 高             | 是（weight 行數一致檢查） |
+| 2 | 邊界條件   | 中             | 是（0 行 fallback + 空 train） |
+| 3 | 邊界條件   | 中             | 是（test 缺欄 KeyError） |
+| 4 | 邊界條件   | 中             | 是（.weight 非數值/空行） |
+| 5 | 效能       | 低             | 文件化即可 |
+| 6 | 一致性     | 中             | 可選（單一類別檢查） |
+| 7 | 可維護性   | 低             | 文件化即可 |
+
+以上為 Round 375 Plan B+ 階段 4 變更之審查結果；實作修正與測試可依優先級分輪進行。

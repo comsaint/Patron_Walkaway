@@ -85,6 +85,11 @@ try:
 except ImportError:
     from trainer.identity import build_canonical_mapping_from_df  # type: ignore[import, attr-defined]
 
+try:
+    from schema_io import normalize_bets_sessions  # type: ignore[import]
+except ImportError:
+    from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
+
 logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -611,12 +616,16 @@ def build_features_for_scoring(
     bets_df = bets.copy()
 
     # ── Normalise types (ClickHouse may return object/string; LightGBM needs int/float/bool) ──
+    # Skip categorical columns set by normalizer (PLAN Phase 4: do not overwrite).
     for col in ["position_idx", "payout_odds", "base_ha", "is_back_bet", "wager"]:
         if col not in bets_df.columns:
             bets_df[col] = 0.0
     for col in ["position_idx", "payout_odds", "base_ha", "wager"]:
+        if isinstance(bets_df[col].dtype, pd.CategoricalDtype):
+            continue
         bets_df[col] = pd.to_numeric(bets_df[col], errors="coerce").fillna(0)
-    bets_df["is_back_bet"] = pd.to_numeric(bets_df["is_back_bet"], errors="coerce").fillna(0)
+    if not isinstance(bets_df["is_back_bet"].dtype, pd.CategoricalDtype):
+        bets_df["is_back_bet"] = pd.to_numeric(bets_df["is_back_bet"], errors="coerce").fillna(0)
     bets_df["status"] = bets_df.get("status", pd.Series("", index=bets_df.index)).astype(str).str.upper()
 
     # Normalise payout_complete_dtm to tz-naive HK local time (R23-style fix)
@@ -1104,6 +1113,8 @@ def score_once(
     logger.info("[scorer] Window: %s -> %s", start.isoformat(), now_hk.isoformat())
 
     bets, sessions = fetch_recent_data(start, now_hk)
+    # Post-Load Normalizer (PLAN § Post-Load Normalizer Phase 4)
+    bets, sessions = normalize_bets_sessions(bets, sessions)
     if bets.empty:
         logger.info("[scorer] No bets in window; sleeping")
         return

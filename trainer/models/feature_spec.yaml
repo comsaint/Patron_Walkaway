@@ -341,7 +341,7 @@ track_llm:
       window_frame: "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e12 }
+        clip: { min: 0.0, max: 1000000000000.0 }
     - feature_id: "avg_wager_sofar"
       type: "derived"
       dtype: "float"
@@ -350,7 +350,7 @@ track_llm:
       expression: "CAST(cum_wager AS DOUBLE) / NULLIF(cum_bets, 0)"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e9 }
+        clip: { min: 0.0, max: 1000000000.0 }
     - feature_id: "time_of_day_sin"
       type: "derived"
       dtype: "float"
@@ -512,7 +512,7 @@ track_profile:
       description: "過去 7 天 turnover 合計"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e12 }
+        clip: { min: 0.0, max: 1000000000000.0 }
     - feature_id: "turnover_sum_30d"
       type: "profile_column"
       dtype: "float"
@@ -521,7 +521,7 @@ track_profile:
       description: "過去 30 天 turnover 合計"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e12 }
+        clip: { min: 0.0, max: 1000000000000.0 }
     - feature_id: "turnover_sum_90d"
       type: "profile_column"
       dtype: "float"
@@ -530,7 +530,7 @@ track_profile:
       description: "過去 90 天 turnover 合計"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e12 }
+        clip: { min: 0.0, max: 1000000000000.0 }
     - feature_id: "turnover_sum_180d"
       type: "profile_column"
       dtype: "float"
@@ -539,7 +539,7 @@ track_profile:
       description: "過去 180 天 turnover 合計"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e12 }
+        clip: { min: 0.0, max: 1000000000000.0 }
     - feature_id: "turnover_sum_365d"
       type: "profile_column"
       dtype: "float"
@@ -548,7 +548,7 @@ track_profile:
       description: "過去 365 天 turnover 合計"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e12 }
+        clip: { min: 0.0, max: 1000000000000.0 }
     - feature_id: "player_win_sum_30d"
       type: "profile_column"
       dtype: "float"
@@ -605,7 +605,7 @@ track_profile:
       description: "過去 30 天下注筆數合計"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e9 }
+        clip: { min: 0.0, max: 1000000000.0 }
     - feature_id: "num_bets_sum_180d"
       type: "profile_column"
       dtype: "float"
@@ -614,7 +614,7 @@ track_profile:
       description: "過去 180 天下注筆數合計"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e9 }
+        clip: { min: 0.0, max: 1000000000.0 }
     - feature_id: "num_games_with_wager_sum_30d"
       type: "profile_column"
       dtype: "float"
@@ -623,7 +623,7 @@ track_profile:
       description: "過去 30 天有下注局數合計"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e9 }
+        clip: { min: 0.0, max: 1000000000.0 }
     - feature_id: "num_games_with_wager_sum_180d"
       type: "profile_column"
       dtype: "float"
@@ -632,7 +632,7 @@ track_profile:
       description: "過去 180 天有下注局數合計"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e9 }
+        clip: { min: 0.0, max: 1000000000.0 }
     - feature_id: "turnover_per_bet_mean_30d"
       type: "profile_column"
       dtype: "float"
@@ -641,7 +641,7 @@ track_profile:
       description: "過去 30 天平均每注 turnover"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e9 }
+        clip: { min: 0.0, max: 1000000000.0 }
     - feature_id: "turnover_per_bet_mean_180d"
       type: "profile_column"
       dtype: "float"
@@ -650,7 +650,7 @@ track_profile:
       description: "過去 180 天平均每注 turnover"
       postprocess:
         fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1e9 }
+        clip: { min: 0.0, max: 1000000000.0 }
     - feature_id: "win_session_rate_30d"
       type: "profile_column"
       dtype: "float"

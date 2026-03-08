@@ -87,6 +87,7 @@ except ModuleNotFoundError:
 try:
     from labels import compute_labels  # type: ignore[import]
     from identity import build_canonical_mapping_from_df  # type: ignore[import]
+    from schema_io import normalize_bets_sessions  # type: ignore[import]
     from trainer import (  # type: ignore[import, attr-defined]
         MODEL_DIR,
         load_clickhouse_data,
@@ -101,6 +102,7 @@ try:
 except ModuleNotFoundError:
     from trainer.labels import compute_labels  # type: ignore[import]
     from trainer.identity import build_canonical_mapping_from_df  # type: ignore[import]
+    from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
     from trainer.trainer import (  # type: ignore[import]
         MODEL_DIR,
         load_clickhouse_data,
@@ -429,6 +431,12 @@ def backtest(
 
     Returns a results dict with micro + macro metrics for both model-default
     thresholds and (optionally) Optuna-selected thresholds.
+
+    Notes
+    -----
+    Caller (e.g. main) must pass already-normalized bets/sessions; parameter
+    names are historical.  Unnormalized data leads to apply_dq/downstream type
+    contract mismatch vs trainer/scorer (PLAN § Post-Load Normalizer).
     """
     extended_end = window_end + timedelta(minutes=max(LABEL_LOOKAHEAD_MIN, 24 * 60))
     history_start = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
@@ -648,8 +656,11 @@ def main() -> None:
     if bets_raw.empty:
         raise SystemExit("No bets for the requested window")
 
+    # Post-Load Normalizer (PLAN § Post-Load Normalizer Phase 3)
+    bets_norm, sessions_norm = normalize_bets_sessions(bets_raw, sessions_raw)
+
     result = backtest(
-        bets_raw, sessions_raw, artifacts, start, end,
+        bets_norm, sessions_norm, artifacts, start, end,
         run_optuna=not args.skip_optuna,
         n_optuna_trials=args.n_trials,
     )

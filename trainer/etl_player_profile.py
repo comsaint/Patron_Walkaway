@@ -67,6 +67,11 @@ try:
 except ImportError:
     from trainer.identity import build_canonical_mapping  # type: ignore[import, attr-defined]
 
+try:
+    from schema_io import normalize_bets_sessions  # type: ignore[import]
+except ImportError:
+    from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -1516,6 +1521,10 @@ def build_player_profile(
     if sessions_raw is None or sessions_raw.empty:
         logger.warning("No session data for %s; skipping", snapshot_date)
         return None
+
+    # Post-Load Normalizer (PLAN § Post-Load Normalizer Phase 5).
+    # Same type contract as trainer/scorer/backtester; use normalized sessions below.
+    _, sessions_raw = normalize_bets_sessions(pd.DataFrame(), sessions_raw)
 
     # 2. D2 canonical_id mapping — reuse pre-built mapping when available (R90)
     if canonical_map is None:

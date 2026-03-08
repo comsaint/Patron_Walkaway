@@ -536,28 +536,23 @@ def screen_features(
     corr_threshold: float = 0.95,
     top_k: object = _SCREEN_TOP_K_UNSET,
     use_lgbm: bool = False,
+    screen_method: str = "lgbm",
     random_state: int = 42,
 ) -> List[str]:
-    """Two-stage feature screening (SSOT §8.2-D, DEC-020).
+    """Feature screening (SSOT §8.2-D, DEC-020; PLAN screen-lgbm-default).
 
-    Stage 1 — univariate + redundancy:
-        a) Drop near-zero-variance features (std == 0).
-        b) Rank by mutual information with ``labels`` (sklearn).
-        c) Prune highly correlated pairs (Pearson |r| > corr_threshold),
-           keeping the higher-MI feature in each pair.
-        d) If ``use_lgbm=False``: apply ``top_k`` cap on MI-sorted survivors.
+    Three modes via ``screen_method``:
+        "lgbm"  — zv → correlation pruning → LGBM rank → top_k (default, no MI).
+        "mi"    — zv → MI rank → correlation pruning → top_k (original path).
+        "mi_then_lgbm" — zv → MI → correlation → LGBM re-rank → top_k (original use_lgbm=True).
 
-    Stage 2 — optional LightGBM importance (training-set only):
-        If ``use_lgbm=True``, fit a lightweight LightGBM on the Stage-1
-        survivors and re-rank by split importance.  Then apply ``top_k`` cap.
-        CRITICAL: this stage must only be called on training data, never on
-        valid/test, to comply with anti-leakage rules (SSOT §8.2-D / TRN-09).
+    MI is only run when ``screen_method`` is "mi" or "mi_then_lgbm". LGBM stage must
+    only be called on training data (anti-leakage, SSOT §8.2-D / TRN-09).
 
     Parameters
     ----------
     feature_matrix : DataFrame
         Feature values (rows = observations, columns = feature candidates).
-        Should be pre-filtered to ``feature_names`` columns.
     labels : Series
         Binary labels aligned with ``feature_matrix``.
     feature_names : list[str]
@@ -565,41 +560,38 @@ def screen_features(
     corr_threshold : float
         Pearson |r| above which a feature is considered redundant.
     top_k : int | None | (unset)
-        Maximum number of features to return.  When not passed by the caller,
-        falls back to ``SCREEN_FEATURES_TOP_K`` from config.py (DEC-020).
-        ``None`` (either explicitly passed or from config) means no cap —
-        all Stage-1 (or Stage-2) survivors are returned.
+        Max features to return; unset falls back to ``SCREEN_FEATURES_TOP_K``.
     use_lgbm : bool
-        Enable Stage-2 LightGBM importance screening.
+        [Backward compat] If True and screen_method=="lgbm", treated as "mi_then_lgbm".
+    screen_method : str
+        "lgbm" | "mi" | "mi_then_lgbm". Default from config ``SCREEN_FEATURES_METHOD``.
     random_state : int
         Random seed for reproducibility.
 
     Returns
     -------
     list[str]
-        Screened feature names.  Ordered by mutual information descending
-        (Stage-1 only) or by LightGBM split importance descending (Stage-2).
+        Screened feature names (MI- or LGBM-ordered depending on method).
     """
-    from sklearn.feature_selection import mutual_info_classif  # type: ignore[import]
+    # Backward compat: legacy use_lgbm=True with default method → mi_then_lgbm
+    if use_lgbm and screen_method == "lgbm":
+        screen_method = "mi_then_lgbm"
+    if screen_method not in ("lgbm", "mi", "mi_then_lgbm"):
+        raise ValueError(
+            f"screen_features: screen_method must be one of 'lgbm', 'mi', 'mi_then_lgbm', got {screen_method!r}"
+        )
 
     # DEC-020: resolve top_k from config when caller did not supply it.
     effective_top_k: Optional[int] = (
         SCREEN_FEATURES_TOP_K if top_k is _SCREEN_TOP_K_UNSET else top_k  # type: ignore[assignment]
     )
-
-    # R905: top_k=0 would silently return an empty feature list, causing a hard-to-debug
-    # downstream failure.  Fail early with a clear error instead.
     if effective_top_k is not None and effective_top_k < 1:
         raise ValueError(
             f"screen_features: top_k must be a positive integer or None, got {effective_top_k!r}"
         )
 
     X = feature_matrix[feature_names].copy()
-    # feat-consolidation Step 5: coerce non-numeric columns before std/MI/corr,
-    # avoiding X.std() failure on string columns (e.g. screening_eligible=false).
     coerce_feature_dtypes(X, list(X.columns))
-
-    # Drop zero-variance columns
     std = X.std()
     nonzero = std[std > 0].index.tolist()
     dropped_zv = len(feature_names) - len(nonzero)
@@ -611,76 +603,71 @@ def screen_features(
             "screen_features: all features are zero-variance/NaN — returning empty list"
         )
         return []
-
-    # Fill NaN for sklearn compatibility — use a separate name (X_safe) to make
-    # it clear the fill is for MI / correlation computation only, not permanent.
     X_safe = X.fillna(0)
 
-    # Mutual information (Stage 1b)
+    def _correlation_prune(ordered_names: List[str], x: pd.DataFrame) -> List[str]:
+        if len(ordered_names) <= 1:
+            return ordered_names
+        corr = x[ordered_names].corr().abs()
+        upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
+        to_drop = set()
+        for col in upper.columns:
+            if col in to_drop:
+                continue
+            highly_corr = upper.index[upper[col] > corr_threshold].tolist()
+            if any(c not in to_drop for c in highly_corr):
+                to_drop.add(col)
+        out = [c for c in ordered_names if c not in to_drop]
+        logger.info(
+            "screen_features: %d features after correlation pruning (threshold=%.2f)",
+            len(out), corr_threshold,
+        )
+        return out
+
+    def _lgbm_rank_and_cap(names: List[str]) -> List[str]:
+        try:
+            import lightgbm as lgb  # type: ignore[import]
+        except ImportError as exc:
+            raise ImportError(
+                "lightgbm is required for LGBM feature screening. pip install lightgbm"
+            ) from exc
+        dtrain = lgb.Dataset(X_safe[names], label=labels)
+        params = {"objective": "binary", "verbosity": -1, "num_leaves": 31, "seed": random_state}
+        model = lgb.train(params, dtrain, num_boost_round=100)
+        importance = pd.Series(
+            model.feature_importance(importance_type="split"), index=names
+        ).sort_values(ascending=False)
+        if effective_top_k is not None:
+            out = importance.head(effective_top_k).index.tolist()
+            logger.info("screen_features: %d features after LightGBM screening (top_k=%d)", len(out), effective_top_k)
+        else:
+            out = importance.index.tolist()
+            logger.info("screen_features: %d features after LightGBM screening (no cap)", len(out))
+        return out
+
+    if screen_method == "lgbm":
+        candidates = _correlation_prune(nonzero, X_safe)
+        return _lgbm_rank_and_cap(candidates)
+
+    # "mi" or "mi_then_lgbm": run mutual information
+    from sklearn.feature_selection import mutual_info_classif  # type: ignore[import]
+
     mi = mutual_info_classif(
         X_safe, labels, discrete_features=False, random_state=random_state
     )
     mi_df = pd.Series(mi, index=nonzero).sort_values(ascending=False)
     candidates = mi_df.index.tolist()
     logger.info("screen_features: %d candidates after MI ranking", len(candidates))
+    candidates = _correlation_prune(candidates, X_safe)
 
-    # Correlation pruning (Stage 1c)
-    if len(candidates) > 1:
-        corr = X_safe[candidates].corr().abs()
-        upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
-        to_drop = set()
-        for col in upper.columns:
-            if col in to_drop:
-                continue
-            # upper[col] gives correlation between EARLIER columns (higher MI, since
-            # candidates are MI-sorted descending) and this column.
-            # If col is highly correlated with any surviving higher-MI feature, drop col.
-            highly_corr = upper.index[upper[col] > corr_threshold].tolist()
-            if any(c not in to_drop for c in highly_corr):
-                to_drop.add(col)
-        candidates = [c for c in candidates if c not in to_drop]
-        logger.info(
-            "screen_features: %d features after correlation pruning (threshold=%.2f)",
-            len(candidates), corr_threshold,
-        )
-
-    if not use_lgbm:
-        # Stage 1 final: apply top_k cap on MI-sorted list (DEC-020).
+    if screen_method == "mi":
         if effective_top_k is not None:
-            candidates = candidates[: effective_top_k]
+            candidates = candidates[:effective_top_k]
             logger.info("screen_features: capped to top_k=%d (Stage 1)", effective_top_k)
         return candidates
 
-    # Stage 2 — LightGBM importance (TRAINING DATA ONLY — caller responsibility)
-    try:
-        import lightgbm as lgb  # type: ignore[import]
-    except ImportError as exc:
-        raise ImportError(
-            "lightgbm is required for Stage-2 feature screening.  "
-            "Install it with: pip install lightgbm"
-        ) from exc
-
-    dtrain = lgb.Dataset(X_safe[candidates], label=labels)
-    params = {
-        "objective": "binary",
-        "verbosity": -1,
-        "num_leaves": 31,
-        "seed": random_state,
-    }
-    model = lgb.train(params, dtrain, num_boost_round=100)
-    importance = pd.Series(
-        model.feature_importance(importance_type="split"), index=candidates
-    ).sort_values(ascending=False)
-
-    # Stage 2 final: apply top_k cap on LGBM-ranked list (DEC-020).
-    if effective_top_k is not None:
-        candidates = importance.head(effective_top_k).index.tolist()
-        logger.info("screen_features: %d features after LightGBM screening (top_k=%d)", len(candidates), effective_top_k)
-    else:
-        candidates = importance.index.tolist()
-        logger.info("screen_features: %d features after LightGBM screening (no cap)", len(candidates))
-
-    return candidates
+    # mi_then_lgbm
+    return _lgbm_rank_and_cap(candidates)
 
 
 # ---------------------------------------------------------------------------
@@ -995,6 +982,21 @@ def _validate_feature_spec(spec: dict) -> None:
                             f"{sorted(unknown)} in {expr!r}"
                         )
 
+                # postprocess.clip min/max must be int or float (avoids str vs float
+                # in pandas clip() which raises "'<' not supported between str and float").
+                clip_spec = (cand.get("postprocess") or {}).get("clip") or {}
+                for bound_key in ("min", "max"):
+                    if bound_key not in clip_spec:
+                        continue
+                    val = clip_spec[bound_key]
+                    if val is None:
+                        continue
+                    if not isinstance(val, (int, float)):
+                        errors.append(
+                            f"[track_llm] '{fid}': postprocess.clip.{bound_key} must be "
+                            f"int or float, got {type(val).__name__}: {val!r}"
+                        )
+
     # ── Duplicate feature_id check ──────────────────────────────────────────
     seen: set = set()
     for fid in all_ids:
@@ -1120,7 +1122,8 @@ def compute_track_llm_features(
         ct = pd.Timestamp(cutoff_time)
         if ct.tzinfo is not None:
             ct = ct.tz_convert("Asia/Hong_Kong").tz_localize(None)
-        ts_for_mask = pd.to_datetime(bets_df["payout_complete_dtm"])
+        # Coerce to datetime so we never compare str vs float (Parquet/object mixed types).
+        ts_for_mask = pd.to_datetime(bets_df["payout_complete_dtm"], errors="coerce")
         if ts_for_mask.dt.tz is not None:
             ts_for_mask = ts_for_mask.dt.tz_convert("Asia/Hong_Kong").dt.tz_localize(None)
         # R3508: 30-second tolerance prevents clock-skew from silently dropping
@@ -1147,9 +1150,14 @@ def compute_track_llm_features(
     # the full G3 key (canonical_id, payout_complete_dtm, bet_id) and then encode
     # the tie-breaking ordinal as a nanosecond offset so the RANGE boundary
     # semantics are unaffected (nanoseconds << minute-level intervals).
+    # Use uniform string keys for sort to avoid "'<' not supported between
+    # instances of 'str' and 'float'" when columns have mixed types from Parquet.
+    _cid = df["canonical_id"].astype(str)
+    _bid = df["bet_id"].astype(str)
+    df = df.assign(_sort_cid=_cid, _sort_bid=_bid)
     df = df.sort_values(
-        ["canonical_id", "payout_complete_dtm", "bet_id"], kind="stable"
-    ).reset_index(drop=True)
+        ["_sort_cid", "payout_complete_dtm", "_sort_bid"], kind="stable"
+    ).drop(columns=["_sort_cid", "_sort_bid"]).reset_index(drop=True)
     df[_RANGE_SORT_COL] = df["payout_complete_dtm"] + pd.to_timedelta(
         df.groupby("canonical_id", sort=False).cumcount(), unit="ns"
     )
@@ -1230,6 +1238,18 @@ def compute_track_llm_features(
     # narrow DECIMAL(9,4)/(10,4), which fails for values like wager 100000 or
     # casino_win -1900000 (schema/schema.txt uses Decimal(19,4)).
     df_for_duckdb = prepare_bets_for_duckdb(df)
+    # Diagnostic: log dtype and type distribution for ORDER BY columns (str vs float).
+    for col in ("canonical_id", "bet_id"):
+        if col in df_for_duckdb.columns:
+            dtype = df_for_duckdb[col].dtype
+            type_counts = df_for_duckdb[col].apply(type).value_counts().to_dict()
+            type_counts_str = {k.__name__: int(v) for k, v in type_counts.items()}
+            logger.info(
+                "compute_track_llm_features: %s dtype=%s type_dist=%s",
+                col,
+                dtype,
+                type_counts_str,
+            )
     con = duckdb.connect(database=":memory:")
     try:
         con.register("bets", df_for_duckdb)

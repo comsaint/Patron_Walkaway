@@ -41,6 +41,21 @@ todos:
   - id: feat-consolidation
     content: "特徵整合：Feature Spec YAML 單一 SSOT（三軌候選全入 YAML、Legacy 併入 Track LLM、canonical_id only、無 session 依賴、Scorer 跟隨 Trainer 產出）"
     status: completed
+  - id: post-load-normalizer
+    content: "Post-Load Normalizer：與來源無關的 schema/dtype 正規化（schema_io.py、categorical 保留 NaN、trainer/scorer/backtester/ETL 一律經同一 normalizer）"
+    status: completed
+  - id: screen-lgbm-default
+    content: "Feature Screening：LightGBM 取代 MI 並省時間（SCREEN_FEATURES_METHOD=lgbm/mi/mi_then_lgbm；保留 MI 程式碼）"
+    status: completed
+  - id: step7-out-of-core-sort
+    content: "Step 7 Out-of-Core 排序：DuckDB sort+split、pandas fallback、Layer 2 OOM failsafe（重跑 Step 6 + 重試、step6_completed 旗標、max 3 retries、except 清理暫存、current_neg_frac 驗證）已完成；見下方「Step 7 Out-of-Core 排序 + OOM Failsafe 計畫」"
+    status: completed
+  - id: step9-train-from-file
+    content: "方案 B：LightGBM 從檔案訓練（STEP9_TRAIN_FROM_FILE）、抽樣篩選、DuckDB 匯出 CSV/TSV、Booster 包裝 artifact；R191/193 hp 防呆、R197 early_stopping 對齊已完成；見「方案 B：LightGBM 從檔案訓練」"
+    status: completed
+  - id: plan-b-plus-libsvm-oom
+    content: "方案 B+：LibSVM 匯出 + 完整 OOM 避免（Step 7 不載入 train、Step 8 從檔案取樣、串流寫 LibSVM+.weight、Step 9 真正 lgb.Dataset(path)；可選 .bin）；見「方案 B+：LibSVM 匯出與完整 OOM 避免計畫」"
+    status: completed
 isProject: false
 ---
 
@@ -72,6 +87,24 @@ isProject: false
 
 ---
 
+## 接下來要做的事（Current focus）
+
+Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML SSOT、Post-Load Normalizer、Feature Screening LGBM 預設）均已完成。可選／後續：
+
+| 優先 | 項目 | 狀態 | 規格位置 |
+|------|------|------|----------|
+| 1 | **Post-Load Normalizer** | completed | 下方「Post-Load Normalizer」一節 |
+| 2 | **Feature Screening：LightGBM 預設** | completed | 下方「Feature Screening：LightGBM 取代 MI」一節 |
+| 3 | **Step 7 Out-of-Core 排序 + OOM Failsafe** | completed（含 Layer 2 failsafe） | 下方「Step 7 Out-of-Core 排序 + OOM Failsafe 計畫」一節 |
+| 4 | **方案 B：LightGBM 從檔案訓練** | completed（Round 198 狀態更新；R199 審查邊界條件已於 Round 201 修正：valid 缺欄不 KeyError、export common_cols 空時拋 ValueError；Config、Step 8、CSV 匯出、從檔案訓練、Booster 包裝、R191/193/197 已完成；手動 pipeline 比對可選） | 下方「方案 B：LightGBM 從檔案訓練」一節 |
+| 5 | **方案 B+：LibSVM + 完整 OOM 避免** | 階段 1–6 已完成（階段 6 第 3 步 Test 從檔案 predict 已於 Round 220 實作） | 下方「方案 B+：LibSVM 匯出與完整 OOM 避免計畫」一節 |
+
+**建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。
+
+**可選／後續**：OOM 預檢查（Step 6 以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC）已於 Round 210/211/212 實作並通過 Review 修復（chunk 1 探針、path1_rerun 為 None 時保留 path1、psutil 改攔 Exception 健壯性）；規格見「OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC」一節。
+
+---
+
 ## SSOT 章節對應與相關文件
 
 | SSOT 章節 | 對應 Phase 1 步驟 | 備註 |
@@ -100,6 +133,8 @@ trainer/
 ├── config.py        ← 更新：新增 TABLE_HC_WINDOW_MIN / PLACEHOLDER_PLAYER_ID
 │                              / LOSS_STREAK_PUSH_RESETS / HIST_AVG_BET_CAP
 │                              / OPTUNA_N_TRIALS / UNRATED_VOLUME_LOG
+├── schema_io.py     ← 新建：Post-Load Normalizer（與來源無關的 schema/dtype 正規化）
+│                              normalize_bets_sessions()；categorical 常數；原則見下方「Post-Load Normalizer」
 ├── time_fold.py     ← 新建：集中式時間窗口定義器（SSOT §4.3）
 ├── identity.py      ← 新建：D2 歸戶（FND-12 正確聚合 + player_id != -1）
 ├── labels.py        ← 新建：C1 防洩漏標籤
@@ -108,11 +143,12 @@ trainer/
 │                              Track Human Phase 1：loss_streak / run_boundary
 │                              table_hc 延至 Phase 2
 ├── trainer.py       ← 重構：整合三軌，DuckDB 特徵計算 + Feature Screening
-│                              僅訓練 Rated 模型
+│                              僅訓練 Rated 模型；load 後呼叫 normalize_bets_sessions；apply_dq 排除 categorical
 ├── scorer.py        ← 重構：內嵌 DuckDB 計算 Track LLM + 匯入 features.py
-│                              D2 四步身份判定，無卡客僅 volume log
-├── backtester.py    ← 更新：單一閾值搜尋（Optuna TPE），無 G1 約束；僅 rated 觀測
+│                              D2 四步身份判定，無卡客僅 volume log；fetch 後呼叫 normalize_bets_sessions
+├── backtester.py    ← 更新：單一閾值搜尋（Optuna TPE），無 G1 約束；僅 rated 觀測；load 後呼叫 normalize_bets_sessions
 ├── validator.py     ← 更新：canonical_id + 45min horizon
+├── etl_player_profile.py  ← 更新：取得 sessions_raw 後呼叫 normalize_bets_sessions（與 trainer/scorer 共用型別契約）
 └── api_server.py    ← 更新：Model API Contract（單一模型）
 
 trainer/feature_spec/
@@ -645,19 +681,21 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 ---
 
-## 實作順序
+## 實作順序（Phase 1 已完成）
 
-1. `config.py`（全系統常數）
-2. `time_fold.py`（時間窗口定義器）
-3. `identity.py`（D2 歸戶）
-4. `labels.py`（C1 防洩漏標籤）
-5. `features.py`（三軌特徵工程）+ Feature Spec YAML
-6. `trainer.py`（重構，依賴 1–5）
-7. `backtester.py`（依賴 features.py + labels.py）
-8. `scorer.py`（依賴 features.py + identity.py + model artifacts）
-9. `validator.py`（依賴 identity.py）
-10. `api_server.py`（依賴 model artifacts）
-11. `tests/`（驗證以上所有）
+以下為 Phase 1 的原始模組順序，**均已完成**。目前待辦見上方「接下來要做的事」。
+
+1. `config.py`（全系統常數） ✓  
+2. `time_fold.py`（時間窗口定義器） ✓  
+3. `identity.py`（D2 歸戶） ✓  
+4. `labels.py`（C1 防洩漏標籤） ✓  
+5. `features.py`（三軌特徵工程）+ Feature Spec YAML ✓  
+6. `trainer.py`（重構，依賴 1–5） ✓  
+7. `backtester.py`（依賴 features.py + labels.py） ✓  
+8. `scorer.py`（依賴 features.py + identity.py + model artifacts） ✓  
+9. `validator.py`（依賴 identity.py） ✓  
+10. `api_server.py`（依賴 model artifacts） ✓  
+11. `tests/`（驗證以上所有） ✓  
 
 ---
 
@@ -743,6 +781,69 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 ---
 
+## OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC（計畫）
+
+### 目標
+
+- 在 **Step 5 之後**，用 **第 1 個 chunk 的實際產物大小**（on-disk parquet）來估計 Step 7 的 peak RAM，再決定是否要對負樣本做 downsampling（NEG_SAMPLE_FRAC）。
+- 若 chunk 1 的 parquet **已存在且 cache key 吻合**（即先前以 frac=1.0 算過），則**不重算**，直接用該檔 `stat().st_size` 當 `size_chunk1`。
+- 若估計超過 budget 且要 downsampling，則 **chunk 1 整段重跑一次**（與 chunks 2..N 一致使用 `_effective_neg_sample_frac`）。
+
+### 現狀簡述
+
+- **Step 1 後**：`_oom_check_and_adjust_neg_sample_frac(chunks, NEG_SAMPLE_FRAC)` 用「快取 chunk 平均大小」或 **200 MB/chunk 預設** 估計 Step 7 peak，得到 `_early_frac`。
+- **Step 6**：所有 chunk 用 `_effective_neg_sample_frac`（目前即 `_early_frac`）一次 loop 跑完。
+- **問題**：沒有有效 cache 時 200 MB 低估，導致未觸發 downsampling，Step 7 仍 OOM。
+
+### 新流程（高層）
+
+1. **Step 1**：維持現有 OOM 檢查，得到 `_early_frac`（使用者已設 &lt; 1.0 時沿用；chunk-1 探針僅在需要時覆寫最終 frac）。
+2. **Step 2～5**：不變。
+3. **Step 6（改動點）**：僅在 `NEG_SAMPLE_FRAC_AUTO is True` 且 `len(chunks) > 0` 時做「chunk 1 探針」：
+   - 呼叫 `process_chunk(chunks[0], ..., neg_sample_frac=1.0)`。
+   - 若回傳 `path1 is not None`：`size_chunk1 = path1.stat().st_size` → `_effective_neg_sample_frac = _oom_check_after_chunk1(size_chunk1, len(chunks), _early_frac)`。若 `_effective_neg_sample_frac < 1.0`，再呼叫一次 `process_chunk(chunks[0], ..., neg_sample_frac=_effective_neg_sample_frac)`（chunk 1 重跑一整遍）；`chunk_paths = [path1]`（或重跑後的 path），然後對 `chunks[1:]` 依序 `process_chunk(..., neg_sample_frac=_effective_neg_sample_frac)` 並 append。
+   - 若 `path1 is None`（chunk 1 無資料）：不做探針決策，`_effective_neg_sample_frac = _early_frac`，所有 chunks 用 `_early_frac` 跑（單一 loop，與現有行為一致）。
+4. 若 `NEG_SAMPLE_FRAC_AUTO is False`（或 `len(chunks)==0`）：不做 chunk 1 探針，`_effective_neg_sample_frac = _early_frac`，所有 chunks 用 `_early_frac` 一次 loop（與現有完全相同）。
+5. **Step 7 及之後**：仍使用 `_effective_neg_sample_frac`（artifact、log 等），無需改介面。
+
+### 新增／使用的元件
+
+- **`_oom_check_after_chunk1(per_chunk_bytes, n_chunks, current_frac) -> float`**  
+  輸入：chunk 1 的 on-disk 大小（bytes）、chunk 總數、目前 frac（即 `_early_frac`）。公式與現有 OOM 檢查一致：`estimated_peak_ram = n_chunks * per_chunk_bytes * CHUNK_CONCAT_RAM_FACTOR * (1 + TRAIN_SPLIT_FRAC)`，`ram_budget = available_ram * NEG_SAMPLE_RAM_SAFETY`（需 psutil）。政策：若 `estimated_peak_ram <= ram_budget` 回傳 `current_frac`；若 `current_frac < 1.0`（使用者已設）僅 log 警告、回傳 `current_frac`；否則依現有公式計算 `auto_frac`，clamp 到 `[NEG_SAMPLE_FRAC_MIN, 1.0]`，log/print 後回傳。若無 psutil 則直接回傳 `current_frac`。
+- **Cache 行為**：第一次 `process_chunk(chunks[0], neg_sample_frac=1.0)` 時，若該 chunk 已有 parquet 且 `.cache_key` 與「此 run 的 config + profile_hash + feature_spec_hash + ns1.0000」一致，則 cache hit、直接回傳 path 不重算；否則重算並寫入、回傳 path。兩種情況都用回傳的 path 做 `stat().st_size`。
+
+### 需決策／共識的點
+
+| # | 項目 | 建議 |
+|---|------|------|
+| 5.1 | Step 1 的 OOM 檢查是否保留？ | **保留**。使用者若已設 `NEG_SAMPLE_FRAC<1` 就固定 `_early_frac`；chunk-1 探針僅在 frac=1.0 時用實測 size 再決定是否調低。 |
+| 5.2 | Chunk 1 時間範圍較短導致 size 偏小 | **先不做** scaling；實作簡單、行為可預期；若實務上仍低估再加「依日期長度」scaling。 |
+| 5.3 | Chunk 1 為空（`path1 is None`） | 回退：`_effective_neg_sample_frac = _early_frac`，所有 chunks 用 `_early_frac` 一次 loop。 |
+| 5.4 | 日誌 | 探針時加簡短說明（OOM probe）；`_oom_check_after_chunk1` 內 log/print 標註 "(chunk 1 size)" 以區分 Step 1 的檢查。 |
+
+### 邊界與不變性
+
+- **單一 chunk**：仍會跑一次 chunk 1（frac=1.0），量 size；若超過 budget 會得到 `_effective_neg_sample_frac < 1.0`，再重跑同一個 chunk 一次。
+- **Cache key**：已含 `neg_sample_frac`（例如 `ns1.0000`），「frac=1.0 的 cache」與「frac&lt;1 的 cache」不會混用。
+- **force_recompute**：若 `force_recompute=True`，chunk 1 會重算兩次（探針一次、若 downsampling 再一次）；可接受。
+- **Artifact / 後續步驟**：仍只使用一個 `_effective_neg_sample_frac`，寫入 training_metrics、log 等，與現有一致。
+
+### 實作順序建議
+
+1. 新增 `_oom_check_after_chunk1(per_chunk_bytes, n_chunks, current_frac)`，與現有 OOM 檢查相同常數與公式。
+2. 在 `run_pipeline` 的 Step 6：在「Process chunks」loop 前，加入「若 AUTO 且 len(chunks)&gt;0：先處理 chunk 1（frac=1.0）、量 size、呼叫 `_oom_check_after_chunk1`、必要時重跑 chunk 1、再處理 chunks[1:]」的分支；其餘情況維持現有單一 loop。
+3. 確認 `_effective_neg_sample_frac` 在 Step 6 後被正確設定並一路用到 Step 7 與 artifact。
+4. 補上簡短 log/print（OOM probe、chunk 1 size 估計結果）。
+
+### 驗證要點
+
+- 無 cache、chunk 較大（例如 1.37 GB/4 chunks）：探針應得到約 35 GB 估計、超過 budget，並觸發 auto downsampling。
+- 有 cache（frac=1.0）：chunk 1 不重算，僅 `stat()`，估計與上類似。
+- 使用者設 `NEG_SAMPLE_FRAC=0.3`：Step 1 的 `_early_frac=0.3`，chunk-1 探針不覆寫（僅可能 log 警告）。
+- `NEG_SAMPLE_FRAC_AUTO=False`：行為與改動前完全一致（不做探針）。
+
+---
+
 ## Datetime 時區統一正規化（DEC-018）
 
 ### 原則
@@ -765,6 +866,67 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - `time_fold.py` 仍產出 tz-aware 邊界
 - `parse_window()` / `_to_hk()` 仍回傳 tz-aware（DB query 需要 tz）
 - `scorer.py` 獨立處理
+
+---
+
+## Post-Load Normalizer（與來源無關的 Schema/Dtype 正規化）
+
+### 原則（須寫入文件）
+
+**Always preprocess data input the same way regardless of source.**
+
+不論資料來自 Parquet、ClickHouse、API 或 ETL 的讀取路徑，只要進入 pipeline（trainer / scorer / backtester / ETL），都必須先經同一個 normalizer，再進行後續 DQ、特徵或寫出。這樣可保證型別契約一致、避免來源不同導致靜默行為差異。
+
+### 目標與範圍
+
+- **單一職責**：對「剛載入的 raw bets / sessions DataFrame」做 **schema/dtype 正規化**（含標註 categorical），與資料來源無關。
+- **不負責**：過濾、時區、業務 DQ、identity、特徵計算、cache key。這些留在現有流程。
+
+### Categorical 與 NaN
+
+- **Categorical 的 fillna**：**保留 NaN 在 category 中**，不在 normalizer 裡對 categorical 欄位做 fillna 再 `astype("category")`。直接對該欄位 `astype("category")`；pandas 會保留 NaN。
+- **Key numeric 欄位**（如 bet_id, session_id, player_id）：維持 `pd.to_numeric(..., errors="coerce")`，不在此處 fillna，由 `apply_dq` 或下游負責。
+
+### 實作契約
+
+- **模組**：`trainer/schema_io.py`
+- **函數**：`normalize_bets_sessions(bets: pd.DataFrame, sessions: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]`
+- **常數**（單一真相來源）：`BET_CATEGORICAL_COLUMNS`（如 `table_id`, `position_idx`, `is_back_bet`）、`SESSION_CATEGORICAL_COLUMNS`（如 `table_id`）、`BET_KEY_NUMERIC_COLUMNS`、`SESSION_KEY_NUMERIC_COLUMNS`
+- **行為**：對存在的欄位做 categorical → `astype("category")`（保留 NaN）；key 欄位 → `to_numeric(..., errors="coerce")`；回傳 copy，不 mutate 呼叫端。
+
+### 必須經過 Normalizer 的入口
+
+| 入口 | 取得資料後 | 說明 |
+|------|------------|------|
+| **trainer** `process_chunk()` | 先 cache key(**raw**)，再 normalize，再 `apply_dq` | Parquet / ClickHouse 二選一 |
+| **trainer** sessions-only | normalize(sessions)，再 `apply_dq` | 建 canonical mapping 時 |
+| **backtester** `main()` | load 後 normalize，再 `backtest()` → `apply_dq` | 同上 |
+| **scorer** `score_once()` | `fetch_recent_data()` 後 normalize，再 `build_features_for_scoring` | ClickHouse |
+| **etl_player_profile** | 取得 `sessions_raw` 後、任何業務邏輯前 `normalize_bets_sessions(pd.DataFrame(), sessions_raw)` | 與 trainer/scorer 共用型別契約 |
+
+### apply_dq 配合修改
+
+- 對 `bet_id`, `session_id`, `player_id` 做 to_numeric；**不要**對 `table_id`（已為 categorical）。
+- 對 `wager`, `payout_odds`, `base_ha` 做 to_numeric + fillna(0)；**跳過** `is_back_bet`, `position_idx`（已為 categorical）。
+
+### ETL
+
+- 在取得 `sessions_raw` 之後、D2 join / `_compute_profile` 之前呼叫 `normalize_bets_sessions(pd.DataFrame(), sessions_raw)`，後續一律使用回傳的 sessions。
+- 在 ETL 註解/文件標註：與 trainer/scorer 共用型別契約，同一原則「不論來源、同一套前置」。
+
+### 文件
+
+- 在 `schema_io.py` 模組 docstring 寫明上述原則。
+- 建議在 `doc/` 或 README 新增「Data loading & preprocessing」小節，列出原則與所有須經 normalizer 的入口。
+
+### 實作順序建議
+
+1. Phase 1：新增 `schema_io.py`、常數、`normalize_bets_sessions`（categorical 保留 NaN）、單元測試。
+2. Phase 2：Trainer（process_chunk + sessions-only）+ `apply_dq` 排除 categorical。
+3. Phase 3：Backtester 接上 normalizer。
+4. Phase 4：Scorer 接上 normalizer，`build_features_for_scoring` 不再對 categorical 欄位 to_numeric。
+5. Phase 5：ETL 在取得 `sessions_raw` 後呼叫 normalizer，加註解/文件。
+6. Phase 6：專案文件新增/更新「Data loading & preprocessing」小節。
 
 ---
 
@@ -791,6 +953,75 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - 由 `config.SCREEN_FEATURES_TOP_K`（`Optional[int]`）控制
 - `use_lgbm=False`：Stage 1 結束後依 MI 排序取前 `top_k`
 - `use_lgbm=True`：Stage 1 → Stage 2（LGBM importance）→ 依 LGBM 排序取前 `top_k`
+
+---
+
+## Feature Screening：LightGBM 取代 MI 並省時間（計畫）
+
+### 目標
+
+- **預設**：screening 改為 **LightGBM-only**（zv → LGBM 排序 → correlation pruning → top_k），省下約 255s 的 `mutual_info_classif` 時間。
+- **保留**：MI 路徑完整保留，可透過設定切回「MI」或「MI + LGBM 重排」，不刪除任何 MI 相關程式碼。
+
+### 行為與介面
+
+以單一 **method 開關** 區分三種行為；MI 程式僅在 `"mi"` 與 `"mi_then_lgbm"` 路徑執行。
+
+| `screen_method` | 流程 | 用途 |
+|-----------------|------|------|
+| `"lgbm"` | zv → LGBM 排序 → correlation pruning → top_k | 預設，省時間 |
+| `"mi"` | zv → MI 排序 → correlation pruning → top_k | 保留，必要時可切回 |
+| `"mi_then_lgbm"` | zv → MI → correlation pruning → LGBM 重排 → top_k | 保留現有兩階段行為 |
+
+- **Config**：新增 `SCREEN_FEATURES_METHOD`，預設 `"lgbm"`。
+- **`screen_features()`**：新增參數 `screen_method`；依其值分支；MI 僅在 `"mi"` / `"mi_then_lgbm"` 時執行。
+
+### 檔案與修改清單
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/config.py` | 新增 `SCREEN_FEATURES_METHOD`（`"lgbm"` \| `"mi"` \| `"mi_then_lgbm"`），註解說明三種 mode。 |
+| `trainer/features.py` | 新增 `screen_method` 參數；實作 LGBM-only 分支；重構為三條分支，**保留全部 MI 與 correlation 程式碼**。 |
+| `trainer/trainer.py` | 呼叫 `screen_features(..., screen_method=SCREEN_FEATURES_METHOD)`。 |
+
+### Config（`trainer/config.py`）
+
+在 DEC-020 / `SCREEN_FEATURES_TOP_K` 附近新增：
+
+- `SCREEN_FEATURES_METHOD`：`Literal["lgbm", "mi", "mi_then_lgbm"]` 或 `str`，預設 `"lgbm"`。
+- 註解：`"lgbm"` = 快速 LGBM-only；`"mi"` = 原 MI 路徑；`"mi_then_lgbm"` = 原 use_lgbm=True 兩階段。
+
+### `screen_features()`（`trainer/features.py`）邏輯
+
+- **簽名**：新增參數 `screen_method: str = "lgbm"`（或由 caller 傳入 `SCREEN_FEATURES_METHOD`）。
+- **開頭**：若 `screen_method not in ("lgbm", "mi", "mi_then_lgbm")` 則 `raise ValueError`。其餘不變：`X`、`coerce_feature_dtypes`、zero-variance → `nonzero`、`X_safe`；若 `X.empty` 則 `return []`。
+- **分支一 `screen_method == "lgbm"`**：不做 `mutual_info_classif`；`candidates = nonzero`；fit LightGBM 於 `X_safe[candidates]`（與現有 Stage 2 相同 params，如 100 rounds）；依 `feature_importance(importance_type="split")` 排序；**沿用現有 correlation pruning**（對 LGBM 排序後的 list）；再依 `effective_top_k` 截斷；`return candidates`。
+- **分支二 `screen_method == "mi"`**：保留現有 MI 程式碼（`mutual_info_classif` → `candidates`）、現有 correlation pruning、`top_k`；`return candidates`。
+- **分支三 `screen_method == "mi_then_lgbm"`**：與分支二相同到 correlation pruning 後，再執行現有 Stage 2（LGBM 於 survivors、importance 重排、top_k）；`return candidates`。
+- **向後相容**（可選）：若保留 `use_lgbm` 參數，可於開頭做 `if use_lgbm and screen_method == "lgbm": screen_method = "mi_then_lgbm"`。
+- **Docstring**：更新為三種 `screen_method` 行為說明，並註明 MI 僅在 `"mi"` 與 `"mi_then_lgbm"` 時執行。
+
+### Trainer（`trainer/trainer.py`）
+
+- 呼叫 `screen_features(..., screen_method=SCREEN_FEATURES_METHOD)`（需自 config import `SCREEN_FEATURES_METHOD`）。
+
+### 實作順序建議
+
+1. **config**：新增 `SCREEN_FEATURES_METHOD = "lgbm"` 及註解。
+2. **features.py**：加 `screen_method` 與合法值檢查；實作 LGBM-only 分支並補 log；將現有程式包成 `"mi"` 與 `"mi_then_lgbm"` 兩條分支，不刪除任何 MI 或 correlation 程式碼；更新 docstring。
+3. **trainer.py**：import `SCREEN_FEATURES_METHOD`，傳入 `screen_method=SCREEN_FEATURES_METHOD`。
+
+### 測試與回歸
+
+- **預設**：跑一次 pipeline，確認 Step 8 時間明顯下降、screened 特徵數與後續訓練正常。
+- **切回 MI**：設 `SCREEN_FEATURES_METHOD="mi"` 再跑，確認 Step 8 時間約 255s、結果與原 MI 一致。
+- **兩階段**：設 `SCREEN_FEATURES_METHOD="mi_then_lgbm"`，確認與原 `use_lgbm=True` 行為一致（若有保留該相容邏輯）。
+
+### 小結
+
+- **改動點**：config 一個新常數；`screen_features()` 一個新參數與三條分支；trainer 傳入 `screen_method`。
+- **MI 程式**：全部保留在 `"mi"` 與 `"mi_then_lgbm"` 路徑，未來改回或 A/B 測試僅需改 config。
+- **預設**：`SCREEN_FEATURES_METHOD = "lgbm"`，即用 LightGBM screening 取代 MI 並省時間。
 
 ---
 
@@ -900,6 +1131,8 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 ---
 
 ## 開放問題
+
+**實作待辦**：無；可選／後續見「接下來要做的事」一節（OOM 預檢查等）。
 
 ### 業務端協商未決（SSOT §13）
 
@@ -1087,3 +1320,383 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 - 若後續發現 trainer 與 profile ETL 都需要相同的 RAM helper，可再抽到共用 utility；但第一步不應為了「共用」而把兩條路徑硬綁在一起。
 - 若實測顯示 `threads=2` 仍過高，可再把 `PROFILE_DUCKDB_THREADS` 納入按 RAM 動態調整，但這屬第二階段優化，先不在第一輪增加複雜度。
+
+---
+
+## Step 7 Out-of-Core 排序 + OOM Failsafe 計畫（部分實作）
+
+**實作現狀**：Config（Step 0）、輔助函式（Step 2）、`_duckdb_sort_and_split()`（Step 1）、`_step7_oom_failsafe_next_frac` 與 `_step7_pandas_fallback()`（Step 4/5）、orchestrator `_step7_sort_and_split` 與 run_pipeline Step 7 接線（Step 3）、讀回後暫存清理、R803、OOM pre-check（Step 6）均已實作。**Layer 2**（Round 180/181）：DuckDB OOM 時砍半 NEG_SAMPLE_FRAC、重跑 Step 6、再試 _duckdb_sort_and_split；step6_completed 旗標防無限迴圈、最多 3 次 retry、except 內清理 split parquets、current_neg_frac (0,1] 驗證，已完成。**DuckDB temp 目錄清理**已於 Round 213 實作（Step 7 成功後呼叫 `_step7_clean_duckdb_temp_dir()`，失敗僅 log warning）；**R213 Review #1 白名單**已於 Round 215 實作（僅在路徑為 DATA_DIR/duckdb_tmp 或位於 DATA_DIR 之下時才 rmtree，避免誤刪系統/使用者目錄）。
+
+### 一、問題根因回顧
+
+目前 Step 7 的 peak RAM 由三件事疊加造成：
+
+| 時間點 | 記憶體佔用 |
+|--------|-----------|
+| `pd.concat(all_dfs)` 建出 `full_df` | ~40 GB（86M 列 × ~70 欄） |
+| `full_df.sort_values(...)` 的**臨時 indexer 陣列** | +27.6 GiB（shape (43, 86M) float64） |
+| **Peak** | ~67 GB > 47 GB available → OOM |
+
+現有 OOM pre-check（`_oom_check_and_adjust_neg_sample_frac`）以 `CHUNK_CONCAT_RAM_FACTOR=15` 估算 peak，**但估算值 34.9 GB 低於實際**（沒有精確捕捉到 sort 的暫存配置）。而且，它判定 34.9 ≤ budget 35.3 → 不需調整 → 結果照樣 OOM。
+
+### 二、整體架構（三層防線）
+
+```
+Layer 1:  DuckDB out-of-core sort+split（正常路徑，消除 sort OOM）
+Layer 2:  DuckDB OOM → 自動降 NEG_SAMPLE_FRAC → 重跑 Step 6 + 7
+Layer 3:  pandas in-memory fallback（DuckDB 不可用時，搭配強制降採樣）
+```
+
+### 三、詳細步驟
+
+#### Step 0：新增 config 常數（`config.py`）
+
+```python
+# --- Step 7 DuckDB out-of-core sort (OOM-safe) ---
+STEP7_USE_DUCKDB: bool = True
+STEP7_DUCKDB_RAM_FRACTION: float = 0.50
+STEP7_DUCKDB_RAM_MIN_GB: float = 2.0
+STEP7_DUCKDB_RAM_MAX_GB: float = 24.0
+STEP7_DUCKDB_THREADS: int = 4
+STEP7_DUCKDB_PRESERVE_INSERTION_ORDER: bool = False
+# Temp directory for DuckDB spill; None = use DATA_DIR / "duckdb_tmp"
+STEP7_DUCKDB_TEMP_DIR: Optional[str] = None
+```
+
+#### Step 1：新函式 `_duckdb_sort_and_split()`
+
+位置：`trainer.py` 裡 Step 7 區塊附近。
+
+**輸入**：`chunk_paths: List[Path]`, `train_frac: float`, `valid_frac: float`  
+**輸出**：`(train_path, valid_path, test_path)` — 三個 Parquet 檔路徑
+
+邏輯概要：
+
+1. `con = duckdb.connect(":memory:")`
+2. 設定 `memory_limit`、`temp_directory`（`_compute_step7_duckdb_budget()`、`_configure_step7_duckdb_runtime()`）
+3. `SELECT count(*) FROM read_parquet([...])` 得到 `n_rows`，計算 `train_end_idx`、`valid_end_idx`
+4. `CREATE TEMP VIEW sorted_bets AS SELECT *, ROW_NUMBER() OVER (ORDER BY payout_complete_dtm, canonical_id, bet_id) - 1 AS _rn FROM read_parquet(?)`
+5. 三個 `COPY (SELECT * EXCLUDE (_rn) FROM sorted_bets WHERE _rn >= lo AND _rn < hi) TO 'path' (FORMAT PARQUET)`
+6. `con.close()`，回傳三個路徑
+
+DuckDB 的 `ORDER BY` 超過 `memory_limit` 時會自動 spill 到磁碟，不會一次配置 27.6 GiB。
+
+#### Step 2：輔助函式
+
+- `_compute_step7_duckdb_budget()` — 依 `STEP7_DUCKDB_*` 與 `psutil.virtual_memory().available` 計算 budget bytes
+- `_configure_step7_duckdb_runtime(con, budget_bytes)` — 設定 `memory_limit`、`threads`、`temp_directory`、`preserve_insertion_order`
+- `_is_duckdb_oom(exc)` — 偵測 `duckdb.OutOfMemoryException` 或 `MemoryError` 或 "unable to allocate" 字串
+
+#### Step 3：改寫 Step 7（`run_pipeline` 裡）
+
+替換現有的 `all_dfs = [pd.read_parquet(p) for p in chunk_paths]` … `del full_df` 整段，改為呼叫 orchestrator：
+
+- `_step7_sort_and_split(chunk_paths, train_frac, valid_frac, effective_neg_sample_frac, chunks, **retry_kwargs)`  
+  回傳 `(train_df, valid_df, test_df)`。
+
+#### Step 4：OOM Failsafe（Layer 2）— `_step7_oom_failsafe()`
+
+當 DuckDB 在 sort 時 OOM：
+
+1. 將 NEG_SAMPLE_FRAC 砍半（floor = `NEG_SAMPLE_FRAC_MIN`）
+2. 以 `force_recompute=True` 與新 frac 重跑 Step 6（`process_chunk` 對所有 chunks）
+3. 再呼叫 `_duckdb_sort_and_split()`；成功則讀回三個 Parquet 成 DataFrame 並回傳
+4. 若仍 OOM 且 frac 已到 floor → 明確 raise，提示縮短 `--days` 或加 RAM
+5. 最多 retry 數次（例如 3 次）
+
+#### Step 5：Pandas fallback（Layer 3）— `_step7_pandas_fallback()`
+
+當 `STEP7_USE_DUCKDB=False` 或 DuckDB 發生非 OOM 錯誤時，使用現有 pandas concat + sort + split 邏輯（可包在 try/except MemoryError 中，若 OOM 再 raise 或走 failsafe）。
+
+#### Step 6：更新 OOM Pre-check（`_oom_check_and_adjust_neg_sample_frac`）
+
+- 若 `STEP7_USE_DUCKDB=True`：估算「讀回最大 split（train）的 RAM」而非 concat+sort peak，例如 `on_disk_total × CHUNK_CONCAT_RAM_FACTOR × TRAIN_SPLIT_FRAC`
+- 若 `STEP7_USE_DUCKDB=False`：維持現有公式
+
+#### Step 7：保留 R700、清理暫存
+
+- 從 `train_df["payout_complete_dtm"].max()` 取 `_actual_train_end`，與 chunk-level `train_end` 比對（R700）— 邏輯不變
+- Step 7 完成後刪除 `split_train.parquet` / `split_valid.parquet` / `split_test.parquet` 及 DuckDB temp 目錄；清理 DuckDB temp 時僅允許刪除「等於 DATA_DIR/duckdb_tmp 或位於 DATA_DIR 之下」的路徑（R213 Review #1 白名單，Round 215）
+
+### 四、記憶體流向比較
+
+| 階段 | 現有 (pandas) | 新方案 (DuckDB) |
+|------|----------------|-----------------|
+| concat all chunks | ~40 GB | 0 — DuckDB 直讀 Parquet |
+| sort | +27.6 GB（temp） | 由 DuckDB 控制，超限 spill |
+| split → 3 個 DF | ~40 GB | 寫成 3 個 Parquet |
+| 讀回 train_df | — | ~28 GB（70%） |
+| 讀回 valid_df / test_df | — | 各約 ~6 GB |
+| **Step 7 Peak** | **~67 GB → OOM** | **~40 GB → 可接受** |
+
+### 五、Failsafe 流程圖
+
+```
+Step 7 開始
+  │
+  ├─ STEP7_USE_DUCKDB = True?
+  │    ├─ Yes → _duckdb_sort_and_split()
+  │    │         ├─ 成功 → 讀回 train/valid/test DF → 繼續 Step 8
+  │    │         ├─ DuckDB OOM →
+  │    │         │    ├─ 砍半 NEG_SAMPLE_FRAC
+  │    │         │    ├─ 重跑 Step 6 (process_chunk force_recompute)
+  │    │         │    ├─ 重試 _duckdb_sort_and_split()
+  │    │         │    ├─ 成功 → 繼續 Step 8
+  │    │         │    └─ 仍 OOM & 到 floor → 明確報錯 (縮 --days 或加 RAM)
+  │    │         └─ 非 OOM 錯誤 → 降級到 pandas fallback
+  │    └─ No  → _step7_pandas_fallback()
+  │              ├─ 成功 → 繼續 Step 8
+  │              └─ MemoryError → 報錯
+  │
+  └─ 繼續 Step 8 → Step 9 → Step 10
+```
+
+### 六、磁碟需求
+
+- DuckDB spill + 三個 split Parquet 暫存：額外約 10–15 GB（依資料量）
+- 確認 `trainer/.data/` 所在磁碟空間足夠；必要時 `STEP7_DUCKDB_TEMP_DIR` 指到另一磁碟
+
+### 七、實作順序建議
+
+1. 在 `config.py` 加 `STEP7_DUCKDB_*` 常數
+2. 實作 `_compute_step7_duckdb_budget`、`_configure_step7_duckdb_runtime`、`_is_duckdb_oom`
+3. 實作 `_duckdb_sort_and_split()`
+4. 實作 `_step7_oom_failsafe()`
+5. 實作 `_step7_pandas_fallback()`（從現有 Step 7 抽出）
+6. 實作 orchestrator `_step7_sort_and_split()`
+7. 在 `run_pipeline()` 的 Step 7 改為呼叫 orchestrator
+8. 更新 `_oom_check_and_adjust_neg_sample_frac()` 以區分 DuckDB / pandas 的 peak 估算
+9. 測試：先 `--days 7` 小資料，再 `--days 90` 驗證
+
+---
+
+## 方案 B：LightGBM 從檔案訓練（部分實作）
+
+**實作狀態**：Config、Step 8 抽樣篩選、匯出 CSV、從檔案 `lgb.train`、Booster 包裝 artifact 已實作。Round 191 Review #1/#3（hp 為空或缺鍵時合併預設、num_boost_round ≥ 1）已於 Round 193 修正並通過對應測試。Round 199 Review 邊界條件（valid 缺特徵欄不 KeyError、export 時 common_cols 空則 ValueError）已於 Round 201 修正並通過 `test_review_risks_round199_plan_b_from_file`。
+
+**目標**：在 Step 7 已產出 `train.parquet` / `valid.parquet` / `test.parquet` 的前提下，**不將完整 train 載入 Python 記憶體**，改由 LightGBM 從磁碟檔案讀取訓練資料（`lgb.Dataset(path)` + `lgb.train()`），以進一步避免「讀回 train_df」導致的 OOM。  
+**前提**：Step 7 Out-of-Core 排序計畫已實作（DuckDB 產出三個 split Parquet）；方案 B 為「若讀回 train 仍 OOM」或「希望訓練階段完全不握有 60M 列」時的進階選項。
+
+### 一、現狀與約束
+
+| 項目 | 現狀 |
+|------|------|
+| 訓練入口 | `train_single_rated_model(train_df, valid_df, feature_cols, ..., test_df)` |
+| 實際擬合 | `LGBMClassifier.fit(X_train, y_train, sample_weight=sw_train, eval_set=[(X_val, y_val)], ...)` |
+| sample_weight | `compute_sample_weights(train_df)`：依 `canonical_id` + `run_id` 算 `1/N_run`；chunk 產物含 `run_id`，split Parquet 會帶出 |
+| Step 8 篩選 | `screen_features(feature_matrix=train_df, labels=train_df["label"], ...)` — **目前必須有 train 資料在記憶體** |
+| Artifact | `model.pkl` 內為 `{"model": LGBMClassifier, "threshold", "features"}`；scorer 使用 `model.predict_proba(X)[:, 1]` |
+| 驗證/測試 | `_train_one_model` 內用 `eval_set`、threshold 選自 validation；`_compute_test_metrics(model, ..., X_test, y_test)` 需 X_test / y_test |
+
+LightGBM 支援從**檔案**建 `Dataset`：`data` 可為 **CSV / TSV / LibSVM 或 LightGBM 二進位檔**路徑；**不支援 Parquet**。從檔案建 `Dataset` 時，C++ 端會讀檔，Python 端不需先 `pd.read_parquet` 整份 train，可降低 Python 側 peak。
+
+### 二、整體流程（高層）
+
+1. **Step 7** 產出 `train.parquet`、`valid.parquet`、`test.parquet`（含 `label`、`run_id`、`canonical_id`、`is_rated` 與所有候選特徵）。
+2. **Step 8 特徵篩選**：在**不載入完整 train** 的前提下取得 `screened_cols`（見下方「特徵篩選策略」）。
+3. **匯出為 LightGBM 可讀格式**：僅 **rated** 列、僅 **screened_cols + label + weight**；weight 在 DuckDB 內以 `1 / COUNT(*) OVER (PARTITION BY canonical_id, run_id)` 計算，與現有 `compute_sample_weights` 語義一致。
+4. **Step 9 訓練**：`lgb.Dataset(train_path, ...)`、`lgb.Dataset(valid_path, reference=dtrain, ...)`，`lgb.train(params, dtrain, valid_sets=[dvalid], ...)`，取得 **Booster**。
+5. **閾值與測試**：validation 預測可改為「從 valid 檔案或 valid.parquet 分塊 predict」；test 同理，避免一次載入 13M 列。
+6. **Artifact 相容**：將 Booster 包成 scorer 可用的介面（具 `predict_proba(X)[:, 1]` 與 `booster_`），仍寫入 `model.pkl`，不改變現有 scorer/backtester 載入格式。
+
+### 三、特徵篩選策略（Step 8）
+
+目前 `screen_features(feature_matrix=train_df, labels=train_df["label"], ...)` 需要整份 train。方案 B 可擇一：
+
+- **策略 A（建議）— 抽樣篩選**  
+  - 自 `train.parquet` **只讀取前 N 列（或隨機抽樣）** 作為 `train_sample`（例如 1–2M 列），足夠做 MI / LGBM screening 即可。  
+  - 對 `train_sample` 執行現有 `screen_features(...)`，得到 `screened_cols`。  
+  - **注意**：篩選結果與「全量 train 篩選」可能略有差異，需在文件與 log 中註明「screening 使用 N 列抽樣」。
+
+- **策略 B — 仍載入全量 train 做篩選**  
+  - 若記憶體允許（例如已做負採樣、train 較小），可維持現狀：Step 7 讀回 `train_df`，Step 8 用完整 `train_df` 篩選，篩選完再寫出 train/valid 到檔案並釋放 `train_df`，Step 9 從檔案訓練。  
+  - 好處是篩選語義與現有完全一致；缺點是仍有一段時間握有完整 train_df。
+
+實作時建議預設採用**策略 A**，並以 config 或 flag 切換（例如 `STEP8_SCREEN_SAMPLE_ROWS`：`None` = 全量，整數 = 最多取 N 列做篩選）。
+
+### 四、匯出格式與 weight / label
+
+- **格式選擇**  
+  - **CSV/TSV**：DuckDB 可 `COPY (SELECT ...) TO 'train.csv'`，不需經 pandas。LightGBM Python API 從檔案建 `Dataset` 時，若 label/weight 在檔案內，需確認 API 是否支援「指定欄位為 label/weight」（文件需查證）；若僅支援傳入獨立 `label=`/`weight=`，則 60M 列會變成兩個 60M 長陣列，失去省記憶體意義。  
+  - **LightGBM 二進位**：`Dataset.save_binary()` 產生的檔案可含內部表示；但 **無法對單一檔案做 append**，且通常需先從一塊 in-memory 資料建 `Dataset` 再存檔，不適合「從未載入的 60M 列」直接寫出。  
+  - **實務建議**：優先以 **CSV 或 TSV** 由 DuckDB 串流寫出（欄位順序：`feat1, feat2, ..., label, weight`），並在實作前查證 LightGBM 對「從 CSV 讀取且 label/weight 為檔案欄位」的支援方式；若必須傳入獨立 `label`/`weight`，可評估「分塊讀 Parquet → 逐塊寫 CSV + 累積寫 label/weight 到側檔」或改用 CLI 版 LightGBM 的參數（若支援從多檔/欄位指定）。
+
+- **Weight 計算**  
+  - 在 DuckDB 匯出 train 時，於 SQL 中計算：  
+    `weight = 1.0 / COUNT(*) OVER (PARTITION BY canonical_id, run_id)`  
+  - 與現有 `compute_sample_weights`（同一 run 內每列 1/N_run）一致。  
+  - 僅匯出 `is_rated == true` 的列。
+
+- **Valid**  
+  - 同欄位集合（screened_cols + label），不需 weight。  
+  - 用於 `lgb.Dataset(valid_path, reference=dtrain)` 以對齊 binning。
+
+### 五、訓練 API 與參數
+
+- 改為使用 **原生 API**：`lgb.train(params, dtrain, num_boost_round=..., valid_sets=[dvalid], callbacks=[early_stopping, log_evaluation])`。  
+- `params` 與現有 `_base_lgb_params()` + Optuna 產出一致（objective、metric、num_class、class_weight 等）；若 Optuna 仍用 `train_df` 抽樣做 HPO，可維持「僅 HPO 時用抽樣 DataFrame」，正式訓練用檔案。  
+- **Optuna**：可 (1) 仍用抽樣 `train_df`/`valid_df` 跑 Optuna，定出超參後，再以「全量 train/valid 檔案」跑一次 `lgb.train`；或 (2) 第一輪就用檔案建 `Dataset` 跑 Optuna（需確認 Optuna 是否重複建 Dataset、對記憶體影響）。
+
+### 六、閾值選擇與 test 評估
+
+- **Validation 預測**  
+  - 訓練後得到 Booster；需在 validation 上算分以做 threshold 選擇。  
+  - 選項：(a) 自 `valid.parquet` 僅讀取 screened_cols + label，分塊讀（例如 1M 列/次）、每塊 `booster.predict(chunk)`，串接得到 `val_scores`；(b) 若 valid 列數可接受，可一次讀入 valid 再做 `booster.predict`。  
+  - 再用既有邏輯：`precision_recall_curve`、F-beta 最大化、`MIN_THRESHOLD_ALERT_COUNT` / `THRESHOLD_MIN_RECALL` 等，產出 `threshold`。
+
+- **Test 評估**  
+  - 同樣以分塊讀 `test.parquet`（僅 screened_cols + label）或一次讀入，`booster.predict` 得到 `test_scores`，再呼叫現有 `_compute_test_metrics` 的計算（AP、precision、recall、F1、prod-adjusted precision 等），不改變輸出欄位與 artifact 結構。
+
+### 七、Artifact 與 Scorer 相容
+
+- 目前 scorer 使用 `rated_art["model"].predict_proba(df[model_features])[:, 1]`；`model` 為 `LGBMClassifier`。  
+- `lgb.train()` 回傳為 **Booster**，無 `predict_proba`，但有 `.predict(data)` 回傳正類機率。  
+- **做法**：  
+  - 訓練結束後，建一個 **薄包裝**：實作 `predict_proba(X)[:, 1]` 委派給 `booster.predict(X)`，並暴露 `booster_` 供 `_compute_feature_importance` 等使用（與現有 `model.booster_` 一致）。  
+  - 將此包裝物件與 `threshold`、`features` 一併寫入 `model.pkl` / `walkaway_model.pkl`，**不更動** scorer 載入與呼叫方式。  
+- 或：若 LightGBM 提供「由 Booster 建回 LGBMClassifier」的官方方式，可採用並寫入既有 `LGBMClassifier` 格式，以最小化改動。
+
+### 八、依賴與觸發條件
+
+- **依賴**：Step 7 已產出 `train.parquet`、`valid.parquet`、`test.parquet`（含 `run_id`、`canonical_id`、`is_rated`、`label` 與所有候選特徵）。  
+- **觸發**：可透過 config 開關（例如 `STEP9_TRAIN_FROM_FILE`）或「當估計 train 列數 > 某閾值時自動啟用」，預設可為 `False`，待方案 B 穩定後再改為可選或預設開啟。
+
+### 九、實作順序建議
+
+1. **Config**：新增 `STEP9_TRAIN_FROM_FILE`、`STEP8_SCREEN_SAMPLE_ROWS`（可選）等常數。  
+2. **Step 8**：實作「自 train.parquet 抽樣再篩選」路徑（策略 A），並與現有全量篩選路徑並存（可切換）。  
+3. **匯出**：實作 DuckDB（或 PyArrow）自 `train.parquet` / `valid.parquet` 選取 rated 列、screened_cols + label + weight（train 含 weight），寫出 CSV/TSV；確認 LightGBM 能從該格式建 `Dataset` 且 label/weight 不需 60M 長陣列。  
+4. **Step 9**：實作「從檔案建 dtrain/dvalid → lgb.train → 得到 Booster」路徑；實作 validation/test 的分塊 predict（若需要）。  
+5. **Artifact**：實作 Booster → 具 `predict_proba` + `booster_` 的包裝，寫入 `model.pkl`；跑一輪 scorer 與 backtester 確認行為一致。  
+6. **Optuna**：決定 HPO 用抽樣或檔案，並在文件中註明。  
+7. **測試**：小資料（`--days 7`）與大資料（`--days 90`）各跑一輪，比對「全量 in-memory 訓練」與「從檔案訓練」的 threshold、test AP/F1 等是否在可接受誤差內。
+
+**實作狀態（截至 Round 197）**
+
+| 順序 | 項目 | 狀態 |
+|------|------|------|
+| 1 | Config | ✅ 已完成（STEP9_TRAIN_FROM_FILE、STEP8_SCREEN_SAMPLE_ROWS，Round 182） |
+| 2 | Step 8 抽樣篩選（策略 A） | ✅ 已完成（STEP8_SCREEN_SAMPLE_ROWS 可切換；log 含 cap、int 轉換；Round 184/185） |
+| 3 | 匯出 CSV/TSV | ✅ 已完成（common_cols + 去重，Round 186/187） |
+| 4 | Step 9 從檔案訓練 | ✅ 已完成（Round 188；Round 190：R188 #1/#2/#3；Round 193：R191 #1/#3 hp 防呆；Round 197：early_stopping 對齊 in-memory） |
+| 5 | Artifact Booster 包裝 | ✅ 已完成（Round 188：_BoosterWrapper 提供 predict_proba + booster_） |
+| 6 | Optuna | ✅ 已完成（Round 191：HPO 於 in-memory 執行，從檔案訓練時以最佳參數 lgb.train） |
+| 7 | 測試（小/大資料比對） | 單元 parity 已完成（Round 194、Round 196 R195 測試、Round 197 全通過）；手動 pipeline（--days 7/90）比對可選 |
+
+### 十、風險與注意
+
+- **篩選語義**：策略 A 用抽樣做 screening，與全量篩選可能略有差異，需在 log/metric 中標註。  
+- **LightGBM 版本**：不同版本對 CSV 欄位、label/weight 從檔讀取的支援可能不同，需以實際使用版本驗證。  
+- **磁碟 I/O**：大 CSV 寫入與讀取會增加 Step 8/9 時間與磁碟空間；可選保留 split Parquet，僅在「啟用從檔案訓練」時多寫一層 CSV/TSV。
+
+---
+
+## 方案 B+：LibSVM 匯出與完整 OOM 避免計畫（草案）
+
+**實作狀態**：階段 1–2 已於 Round 202/204 實作。階段 3 已於 Round 372/373/374 實作（含 Code Review 修正）。**階段 4**（Step 9 從 LibSVM 訓練）已於 Round 375 實作；Round 206 修復 R375 Code Review 四項邊界條件（.weight 行數 mismatch 警告與暫存 LibSVM、0 行 LibSVM＋空 train 提早 return、test_df 缺欄跳過評估、單一類別 LibSVM fallback），`train_single_rated_model(..., train_libsvm_paths=...)` 建 `lgb.Dataset(path)`、讀 .weight、預設 hp、early_stopping 於 dvalid。**階段 5**（可選 .bin）已於 Round 207/208/209 完成：使用 .bin 前以 `_bin_path.is_file()` 檢查、`save_binary` 失敗時 try/except OSError 僅 log warning 不中斷訓練。**階段 6**（Valid/Test 從檔案或分塊 predict）：第 1 步與 R216 Review 修復已完成（Round 216/217/218）：valid 可從 LibSVM 讀 labels、predict 從路徑、valid_df=None 支援、path 限 DATA_DIR 下、零列不呼叫 predict）。第 2 步已於 Round 219 完成：run_pipeline 在 B+ LibSVM 路徑不載入 valid_df/test_df，改傳 None，以 _n_valid/_n_test 做 log 與 MIN_VALID_TEST_ROWS。R219 Review 風險已轉為契約測試；第 3 步（test 從檔案 predict）已於 Round 220 實作：匯出 test LibSVM、train_single_rated_model 接受 test_libsvm_path、從檔案 predict 並以 _compute_test_metrics_from_scores 計算 test 指標。R220 Review 風險已轉為測試（test_review_risks_round220_plan_b_plus_stage6_step3.py）；tests/mypy/ruff 驗證全過。方案 B+ 階段 6 已全部完成。
+
+### 一、目標與背景
+
+**問題**：大 window（如 `--days 90`）時，Step 7 會 OOM：
+- **Pandas fallback**：`full_df.sort_values` 時約 86M 列 × 43 欄 → 單一陣列 ~27.6 GiB，整段 concat + sort 更高。
+- **即使 DuckDB 成功**：目前仍會 `pd.read_parquet(train_path)` 把約 60M 列 train 載入 → 同樣有 OOM 風險。
+- **方案 B 現況**：匯出 CSV 後，`train_single_rated_model` 仍用 `pd.read_csv(train_path)` 再建 `lgb.Dataset(DataFrame)`，等於 train 還是整份進記憶體，沒有真正「從檔案」訓練。
+
+**目標**：
+- 大 window 時不再在 Step 7 / Step 9 因 full/train 進記憶體而 OOM。
+- 訓練階段使用 **LightGBM 從檔案**（改用 **LibSVM** 取代 CSV，可選 **.bin** 加速重複訓練）。
+- **LightGBM 4.6.0** 支援：從 CSV 用 `params={"label_column","weight_column"}`；從 LibSVM 可用**同名 .weight 檔**（如 `train.libsvm.weight`）自動載入 sample weight，無需 CSV。
+
+### 二、格式選擇：LibSVM 取代 CSV
+
+| 項目 | CSV | LibSVM |
+|------|-----|--------|
+| 用途 | 目前方案 B 匯出格式 | **建議**：唯一用途為訓練 LightGBM 時 |
+| I/O | 較慢、檔大 | 較精簡、解析快，LightGBM C++ 優化 |
+| Sample weight | `weight_column` 在 params | 同檔名 `.weight` 檔，一行一權重，4.6.0 自動載入 |
+| 串流寫出 | 可 | 可（逐行 `label idx:val idx:val ...`） |
+
+**結論**：改為寫出 **LibSVM**（`train.libsvm`）+ **train.libsvm.weight**，不再寫 CSV；可兼顧效率與 sample weight。
+
+### 三、整體流程（高層）
+
+```
+Step 6 → chunk Parquets（不變）
+    ↓
+Step 7 → DuckDB OOC sort+split → 只寫出 train/valid/test 到「檔案」（Parquet）
+        → 不讀回 full/train 進記憶體（僅保留 path + 必要 metadata）
+    ↓
+Step 8 → 從「train 檔案」取樣（DuckDB LIMIT N 或 PyArrow 前 N 列）做 screening → active_feature_cols
+    ↓
+匯出（新增）→ 從 split 檔案串流寫出 LibSVM + .weight（不載入 full train）
+    ↓
+Step 9 → lgb.Dataset(train.libsvm)，LightGBM 自動載入 .weight
+        → 真正從檔案訓練；可選第一次建 Dataset 後 save_binary 供重訓使用
+```
+
+### 四、分步實作要點
+
+#### 4.1 Step 7：Sort + Split 後不把 train 載入記憶體
+
+- **現狀**：DuckDB 已 OOC 寫出 `split_train.parquet` 等；之後 `train_df = pd.read_parquet(train_path)` 會把約 60M 列載入 → OOM。
+- **調整**：
+  1. Step 7 成功後**不**對 train 做 `read_parquet`，只保留 `train_path`、`valid_path`、`test_path` 與必要 metadata（如用 DuckDB `SELECT count(*)` 得到 `n_rows`、`label=1` 數等）。
+  2. 必要時只對 valid/test 做有條件的輕量讀取（例如僅讀取列數或前 N 列用於檢查）；或 valid/test 也改為「需要時再從檔案讀」。
+  3. 若 DuckDB 本身 OOM：保留現有 Layer 2（降 NEG_SAMPLE_FRAC、重跑 Step 6 + Step 7）。若仍失敗，**不要** fallback 到 pandas 全量 concat+sort；改為明確失敗並建議縮小 `--days` 或加大 RAM。
+
+**產物**：`train_path`、`valid_path`、`test_path`（Parquet）；**不再有 `train_df`**（或僅在「小資料 / 除錯」模式可選載入）。
+
+#### 4.2 Step 8：Feature screening 不依賴整份 train_df
+
+- **現狀**：`screen_features(feature_matrix=train_df, ...)` 需要整份 train 在記憶體。
+- **做法**：
+  1. **Screening 只對樣本**：從 **train 檔案**只讀前 N 列（DuckDB `SELECT * FROM read_parquet(train_path) LIMIT N` 或 PyArrow 前 N 列）做 screening；與現有 `STEP8_SCREEN_SAMPLE_ROWS` 一致，記憶體為 O(N)。
+  2. 或大資料時關閉 screening（例如 flag），改用既有 feature_spec / 固定候選特徵。
+  3. 進階（可後做）：用 DuckDB 在 train Parquet 上算 variance、簡單相關等，產出篩選後欄位名。
+
+**產物**：`active_feature_cols`，不依賴 `train_df`。
+
+#### 4.3 匯出：從 split 檔案串流寫出 LibSVM + .weight（不 OOM）
+
+- **輸入**：Step 7 的 `train_path` / `valid_path`（Parquet）、Step 8 的 `active_feature_cols`、以及 `is_rated` 與 weight 的定義（與現有 `compute_sample_weights` 語義一致）。
+- **輸出**：
+  - `train_for_lgb.libsvm`：僅 `is_rated` 列；每行 `label idx1:val1 idx2:val2 ...`（特徵順序固定，對應 `active_feature_cols` 的 index；0 可省略為 sparse）。
+  - `train_for_lgb.libsvm.weight`：一行一權重，與 train 行對應；LightGBM 4.6.0 自動載入。
+  - `valid_for_lgb.libsvm`（無 weight 檔）。
+- **實作**：用 **DuckDB** 從 `train_path`/`valid_path` 依序讀取，篩選 `is_rated`、計算 weight（與現有 run-level `1/N_run` 一致），逐行寫出 LibSVM 與 .weight；或 PyArrow 以 batch/streaming 讀 Parquet，逐 batch 寫出。**不**將 full train 載入記憶體。
+- **LightGBM binary（可選）**：第一次從 LibSVM 建好 `lgb.Dataset(train_path, ...)` 後，立刻 `dtrain.save_binary(export_dir / "train_for_lgb.bin")`；之後同份資料重訓可優先使用 `.bin`。
+
+#### 4.4 Step 9：真正從檔案訓練 + 可選 .bin
+
+- **訓練**：`dtrain = lgb.Dataset(str(train_path))`（LightGBM 自動載入同名的 `.weight` 檔），**不再** `pd.read_csv` 或 `pd.read_parquet` 整份 train。
+- 若有 valid：`dvalid = lgb.Dataset(str(valid_path), reference=dtrain)`。
+- **可選**：第一次建 Dataset 後 `dtrain.save_binary(...)`；之後若存在 `.bin` 則直接用 `lgb.Dataset(bin_path)`。
+- **HPO**：大資料時 in-memory HPO 不可行；可改為用 Step 8 的 sample 做少量 trial 的 HPO，得到一組 hp 後對「從檔案」的 full train 單次訓練；或直接使用預設/保守 hp 做 from-file 單次訓練。
+
+#### 4.5 Valid / Test 的評估與記憶體
+
+- **Valid**：約 15% × 86M ≈ 13M 列；可改為從檔案用 `lgb.Booster.predict(dvalid)` 直接對 valid Dataset 預測，或只讀 valid 的 label + 預測結果（或分批讀）算 AP 等，避免一次載入全部欄位。
+- **Test**：同理，能從檔案 predict 就從檔案；若必須載入，可考慮只載入 subset 或僅必要欄位做 backtest。
+
+### 五、實作順序建議
+
+| 階段 | 內容 | 目的 |
+|------|------|------|
+| 1 | Step 7：DuckDB 成功後不讀回 train（只保留 path + metadata）；必要時只讀 valid/test 輕量資訊 | 消除 train 的 60M 列載入，避免 OOM |
+| 2 | Step 8：改為從 train **檔案**取樣（DuckDB LIMIT N 或 PyArrow 前 N 列）做 screening | 不依賴 `train_df`，記憶體有上限 |
+| 3 | 匯出：實作「從 train_path/valid_path 串流寫出 train_for_lgb.libsvm + .weight、valid_for_lgb.libsvm」 | 大資料也能產出 LibSVM，且保留 weight |
+| 4 | Step 9：改為 `lgb.Dataset(train_path)`（自動 .weight）、`lgb.Dataset(valid_path, reference=dtrain)`，移除任何 `pd.read_*` train | 真正 from-file 訓練，不再因 train OOM |
+| 5 | 可選：第一次建 Dataset 後 `save_binary`，之後優先使用 .bin | 重複訓練時省 I/O、省時間 |
+| 6 | Valid/Test 評估：從檔案或分塊 predict，避免一次載入 13M 列 | 進一步壓低 peak RAM |
+
+### 六、風險與取捨
+
+- **Screening 用樣本**：前 N 列與全量分佈可能略有差異，篩選結果可能與全量不同；可透過 `STEP8_SCREEN_SAMPLE_ROWS` 調大或簡單分層取樣降低偏差。
+- **HPO**：大資料時不做 full in-memory HPO，改用 sample-based HPO 或固定 hp，為記憶體與效果取捨。
+- **DuckDB 本身 OOM**：86M 列在 DuckDB 的 sort + COPY 仍可能吃滿；可調低 DuckDB memory_limit、或依賴 Layer 2 降 NEG_SAMPLE_FRAC 重跑；必要時在文件中註明建議的 `--days` 與機器 RAM。
+
+### 七、小結
+
+- **OOM** 須從兩頭解決：**Step 7 不要讓 full/train 進記憶體**；**Step 9 不要用 pandas 讀整份 train**。
+- **LibSVM**：取代 CSV 作為「僅供 LightGBM 訓練」的匯出格式；配合 `.weight` 檔，4.6.0 完整支援 sample weight。
+- **LightGBM binary**：由 LightGBM 在第一次建 Dataset 後 `save_binary` 產生，供後續重訓使用；pipeline 只負責產出 LibSVM + .weight，不直接寫 .bin。

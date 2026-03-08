@@ -43,16 +43,19 @@ from __future__ import annotations
 import argparse
 import calendar
 import gc
+import math
 import os
+import shutil
 import hashlib
 import json
 import logging
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
 import joblib
 import lightgbm as lgb
@@ -107,6 +110,18 @@ try:
     NEG_SAMPLE_RAM_SAFETY: float = getattr(_cfg, "NEG_SAMPLE_RAM_SAFETY", 0.75)
     NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT: int = getattr(_cfg, "NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT", 200 * 1024 * 1024)
     PRODUCTION_NEG_POS_RATIO: Optional[float] = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)
+    STEP7_USE_DUCKDB: bool = getattr(_cfg, "STEP7_USE_DUCKDB", True)
+    STEP7_DUCKDB_RAM_FRACTION: float = getattr(_cfg, "STEP7_DUCKDB_RAM_FRACTION", 0.50)
+    STEP7_DUCKDB_RAM_MIN_GB: float = getattr(_cfg, "STEP7_DUCKDB_RAM_MIN_GB", 2.0)
+    STEP7_DUCKDB_RAM_MAX_GB: float = getattr(_cfg, "STEP7_DUCKDB_RAM_MAX_GB", 24.0)
+    STEP7_DUCKDB_THREADS: int = getattr(_cfg, "STEP7_DUCKDB_THREADS", 4)
+    STEP7_DUCKDB_PRESERVE_INSERTION_ORDER: bool = getattr(_cfg, "STEP7_DUCKDB_PRESERVE_INSERTION_ORDER", False)
+    STEP7_DUCKDB_TEMP_DIR: Optional[str] = getattr(_cfg, "STEP7_DUCKDB_TEMP_DIR", None)
+    STEP7_KEEP_TRAIN_ON_DISK: bool = getattr(_cfg, "STEP7_KEEP_TRAIN_ON_DISK", False)
+    STEP9_EXPORT_LIBSVM: bool = getattr(_cfg, "STEP9_EXPORT_LIBSVM", False)
+    STEP9_TRAIN_FROM_FILE: bool = getattr(_cfg, "STEP9_TRAIN_FROM_FILE", False)
+    STEP9_SAVE_LGB_BINARY: bool = getattr(_cfg, "STEP9_SAVE_LGB_BINARY", False)
+    STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
@@ -140,7 +155,19 @@ except ModuleNotFoundError:
     NEG_SAMPLE_FRAC_ASSUMED_POS_RATE = getattr(_cfg, "NEG_SAMPLE_FRAC_ASSUMED_POS_RATE", 0.15)
     NEG_SAMPLE_RAM_SAFETY = getattr(_cfg, "NEG_SAMPLE_RAM_SAFETY", 0.75)
     NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT = getattr(_cfg, "NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT", 200 * 1024 * 1024)
-    PRODUCTION_NEG_POS_RATIO: Optional[float] = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)  # type: ignore[no-redef]
+    PRODUCTION_NEG_POS_RATIO = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)  # type: ignore[no-redef]
+    STEP7_USE_DUCKDB = getattr(_cfg, "STEP7_USE_DUCKDB", True)
+    STEP7_DUCKDB_RAM_FRACTION = getattr(_cfg, "STEP7_DUCKDB_RAM_FRACTION", 0.50)
+    STEP7_DUCKDB_RAM_MIN_GB = getattr(_cfg, "STEP7_DUCKDB_RAM_MIN_GB", 2.0)
+    STEP7_DUCKDB_RAM_MAX_GB = getattr(_cfg, "STEP7_DUCKDB_RAM_MAX_GB", 24.0)
+    STEP7_DUCKDB_THREADS = getattr(_cfg, "STEP7_DUCKDB_THREADS", 4)
+    STEP7_DUCKDB_PRESERVE_INSERTION_ORDER = getattr(_cfg, "STEP7_DUCKDB_PRESERVE_INSERTION_ORDER", False)
+    STEP7_DUCKDB_TEMP_DIR = getattr(_cfg, "STEP7_DUCKDB_TEMP_DIR", None)
+    STEP7_KEEP_TRAIN_ON_DISK = getattr(_cfg, "STEP7_KEEP_TRAIN_ON_DISK", False)
+    STEP9_EXPORT_LIBSVM = getattr(_cfg, "STEP9_EXPORT_LIBSVM", False)
+    STEP9_TRAIN_FROM_FILE = getattr(_cfg, "STEP9_TRAIN_FROM_FILE", False)
+    STEP9_SAVE_LGB_BINARY = getattr(_cfg, "STEP9_SAVE_LGB_BINARY", False)
+    STEP8_SCREEN_SAMPLE_ROWS = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
 
 # Module-level pipeline imports (same try/except pattern)
 try:
@@ -170,6 +197,8 @@ try:
         LOCAL_PROFILE_SCHEMA_HASH,
         backfill as _etl_backfill,
     )
+    from config import SCREEN_FEATURES_METHOD  # type: ignore[import]
+    from schema_io import normalize_bets_sessions  # type: ignore[import]
 except ModuleNotFoundError:
     from trainer.time_fold import get_monthly_chunks, get_train_valid_test_split  # type: ignore[import]
     from trainer.identity import (  # type: ignore[import]
@@ -197,6 +226,8 @@ except ModuleNotFoundError:
         LOCAL_PROFILE_SCHEMA_HASH,
         backfill as _etl_backfill,
     )
+    from trainer.config import SCREEN_FEATURES_METHOD  # type: ignore[import]
+    from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
 
 HK_TZ = ZoneInfo(HK_TZ_STR)
 
@@ -1219,8 +1250,10 @@ def apply_dq(
     _lo = _lo.replace(tzinfo=None) if getattr(_lo, "tzinfo", None) else _lo
     _hi = extended_end.replace(tzinfo=None) if getattr(extended_end, "tzinfo", None) else extended_end
 
-    for col in ("bet_id", "session_id", "player_id", "table_id"):
-        bets[col] = pd.to_numeric(bets.get(col), errors="coerce")
+    # Key numeric only; table_id is categorical after normalizer (PLAN § apply_dq 配合修改).
+    for col in ("bet_id", "session_id", "player_id"):
+        if col in bets.columns:
+            bets[col] = pd.to_numeric(bets.get(col), errors="coerce")
 
     # Combine time-window filter, wager guard, and key-column dropna into one mask
     # to avoid three consecutive .copy() calls on a large DataFrame (OOM risk).
@@ -1264,10 +1297,13 @@ def apply_dq(
     if "status" not in bets.columns:
         bets["status"] = None
 
-    # Numeric guard for legacy features
+    # Numeric guard for legacy features; skip columns already categorical (PLAN § apply_dq 配合修改).
     for col in ("wager", "payout_odds", "base_ha", "is_back_bet", "position_idx"):
-        if col in bets.columns:
-            bets[col] = pd.to_numeric(bets[col], errors="coerce").fillna(0)
+        if col not in bets.columns:
+            continue
+        if isinstance(bets[col].dtype, pd.CategoricalDtype):
+            continue
+        bets[col] = pd.to_numeric(bets[col], errors="coerce").fillna(0)
 
     # DEC-018 / R23 contract assertion: payout_complete_dtm must leave apply_dq tz-naive.
     if not bets.empty and "payout_complete_dtm" in bets.columns:
@@ -1361,9 +1397,9 @@ def _oom_check_and_adjust_neg_sample_frac(
         _vmem = _psutil.virtual_memory()
         available_ram = _vmem.available
         total_ram = _vmem.total
-    except ImportError:
-        logger.info("OOM-check: psutil not installed — skipping (pip install psutil to enable)")
-        print("[OOM-check] psutil not installed; skipping RAM pre-check.", flush=True)
+    except Exception as _e:
+        logger.warning("OOM-check: psutil unavailable (%s); skipping RAM pre-check.", _e)
+        print("[OOM-check] psutil unavailable; skipping RAM pre-check.", flush=True)
         return current_frac
 
     # R-NEG-4: validate ASSUMED_POS_RATE is in (0, 1) before using in formula.
@@ -1397,10 +1433,13 @@ def _oom_check_and_adjust_neg_sample_frac(
 
     n_chunks = len(chunks)
     estimated_on_disk = per_chunk_bytes * n_chunks
-    # R-371-7: account for Step 7 row-split overhead.  At peak, full_df AND the
-    # largest split subset (train, TRAIN_SPLIT_FRAC of total rows) coexist in memory
-    # simultaneously.  Multiply by (1 + TRAIN_SPLIT_FRAC) to model this.
-    estimated_peak_ram = estimated_on_disk * CHUNK_CONCAT_RAM_FACTOR * (1.0 + TRAIN_SPLIT_FRAC)
+    # Step 7 peak: when STEP7_USE_DUCKDB we only read back the largest split (train);
+    # when pandas path, full_df and train split coexist (PLAN Step 6).
+    if STEP7_USE_DUCKDB:
+        estimated_peak_ram = estimated_on_disk * CHUNK_CONCAT_RAM_FACTOR * TRAIN_SPLIT_FRAC
+    else:
+        # R-371-7: full_df AND train split coexist in memory.
+        estimated_peak_ram = estimated_on_disk * CHUNK_CONCAT_RAM_FACTOR * (1.0 + TRAIN_SPLIT_FRAC)
     ram_budget = available_ram * NEG_SAMPLE_RAM_SAFETY
 
     # R-NEG-3/5: include total RAM alongside available so operators can judge
@@ -1464,6 +1503,87 @@ def _oom_check_and_adjust_neg_sample_frac(
     )
     logger.warning(
         "OOM-check: auto-adjusting NEG_SAMPLE_FRAC 1.0 -> %.2f  (peak %.1f GB > budget %.1f GB)",
+        auto_frac, estimated_peak_ram / (1024**3), ram_budget / (1024**3),
+    )
+    return auto_frac
+
+
+def _oom_check_after_chunk1(
+    per_chunk_bytes: int,
+    n_chunks: int,
+    current_frac: float,
+) -> float:
+    """Re-estimate Step 7 peak RAM using chunk 1 actual on-disk size; optionally lower frac.
+
+    Called after processing chunk 1 with neg_sample_frac=1.0 (OOM probe). Uses the same
+    formula and constants as _oom_check_and_adjust_neg_sample_frac. Logs include
+    \"(chunk 1 size)\" to distinguish from the Step 1 pre-check.
+
+    Returns the effective NEG_SAMPLE_FRAC to use for the rest of the run.
+    """
+    if not NEG_SAMPLE_FRAC_AUTO:
+        return current_frac
+    try:
+        import psutil as _psutil
+        _vmem = _psutil.virtual_memory()
+        available_ram = _vmem.available
+    except Exception as _e:
+        logger.warning("OOM-check (chunk 1 size): psutil unavailable (%s); skipping", _e)
+        return current_frac
+
+    if not (0.0 < NEG_SAMPLE_FRAC_ASSUMED_POS_RATE < 1.0):
+        p = 0.15
+    else:
+        p = NEG_SAMPLE_FRAC_ASSUMED_POS_RATE
+
+    estimated_on_disk = per_chunk_bytes * n_chunks
+    if STEP7_USE_DUCKDB:
+        estimated_peak_ram = estimated_on_disk * CHUNK_CONCAT_RAM_FACTOR * TRAIN_SPLIT_FRAC
+    else:
+        estimated_peak_ram = estimated_on_disk * CHUNK_CONCAT_RAM_FACTOR * (1.0 + TRAIN_SPLIT_FRAC)
+    ram_budget = available_ram * NEG_SAMPLE_RAM_SAFETY
+
+    print(
+        f"[OOM-check (chunk 1 size)] {n_chunks} chunk(s) x {per_chunk_bytes / (1024**2):.0f} MB"
+        f" -> est. Step 7 peak RAM {estimated_peak_ram / (1024**3):.1f} GB"
+        f" | budget {ram_budget / (1024**3):.1f} GB",
+        flush=True,
+    )
+    logger.info(
+        "OOM-check (chunk 1 size): %d chunks x %.0f MB -> est. peak %.1f GB  budget %.1f GB",
+        n_chunks, per_chunk_bytes / (1024**2), estimated_peak_ram / (1024**3), ram_budget / (1024**3),
+    )
+
+    if estimated_peak_ram <= ram_budget:
+        print("[OOM-check (chunk 1 size)] RAM looks OK — no adjustment.", flush=True)
+        logger.info("OOM-check (chunk 1 size): peak <= budget — no adjustment")
+        return current_frac
+
+    if current_frac < 1.0:
+        print(
+            f"[OOM-check (chunk 1 size)] WARNING: est. peak {estimated_peak_ram / (1024**3):.1f} GB"
+            f" > budget {ram_budget / (1024**3):.1f} GB, but NEG_SAMPLE_FRAC={current_frac:.2f}"
+            " is user-configured — not overriding.",
+            flush=True,
+        )
+        logger.warning(
+            "OOM-check (chunk 1 size): est. peak > budget but NEG_SAMPLE_FRAC=%.2f is user-set — not overriding",
+            current_frac,
+        )
+        return current_frac
+
+    needed_factor = ram_budget / estimated_peak_ram
+    raw_frac = (needed_factor - p) / (1.0 - p)
+    auto_frac = max(NEG_SAMPLE_FRAC_MIN, min(1.0, raw_frac))
+    _warn_floor = raw_frac < NEG_SAMPLE_FRAC_MIN
+    print(
+        f"[OOM-check (chunk 1 size)] *** OOM RISK *** Auto-adjusting NEG_SAMPLE_FRAC: 1.0 -> {auto_frac:.2f}"
+        f"  (assumed pos_rate={p:.0%}, floor={NEG_SAMPLE_FRAC_MIN})"
+        + (f"\n  *** Floor hit: frac={NEG_SAMPLE_FRAC_MIN} may not be enough ***" if _warn_floor else ""),
+        flush=True,
+    )
+    logger.warning(
+        "OOM-check (chunk 1 size): auto-adjusting NEG_SAMPLE_FRAC 1.0 -> %.2f  (peak %.1f GB > budget %.1f GB)",
         auto_frac, estimated_peak_ram / (1024**3), ram_budget / (1024**3),
     )
     return auto_frac
@@ -1593,10 +1713,13 @@ def process_chunk(
                 "Chunk %s–%s: cache stale (key mismatch), recomputing", window_start.date(), window_end.date()
             )
 
+    # --- Post-Load Normalizer (PLAN § Post-Load Normalizer Phase 2) ---
+    bets_norm, sessions_norm = normalize_bets_sessions(bets_raw, sessions_raw)
+
     # --- DQ --- (bets_history_start pulls HISTORY_BUFFER_DAYS of extra context for Track-B)
     history_start = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
     bets, sessions = apply_dq(
-        bets_raw, sessions_raw, window_start, extended_end,
+        bets_norm, sessions_norm, window_start, extended_end,
         bets_history_start=history_start,
     )
     if bets.empty:
@@ -1674,6 +1797,7 @@ def process_chunk(
                 window_end.date(),
                 exc,
             )
+            logger.exception("Track LLM full traceback")
 
     # --- Labels (C1 extended pull) ---
     labeled = compute_labels(
@@ -1805,6 +1929,311 @@ def compute_sample_weights(df: pd.DataFrame) -> pd.Series:
     n_run = run_key.map(run_key.value_counts())
     weights = (1.0 / n_run).fillna(1.0)
     return weights
+
+
+# ---------------------------------------------------------------------------
+# Plan B: export train/valid to CSV for LightGBM from-file training (PLAN §3)
+# ---------------------------------------------------------------------------
+
+def _export_train_valid_to_csv(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    feature_cols: List[str],
+    export_dir: Path,
+) -> Tuple[Path, Path]:
+    """Export rated rows to CSV for LightGBM lgb.Dataset(path) (PLAN 方案 B 匯出).
+
+    Train: screened_cols + label + weight (weight = 1/N_run per canonical_id, run_id).
+    Valid: screened_cols + label (no weight).
+    Only rows with is_rated == True are exported.
+    Returns (train_csv_path, valid_csv_path).
+    """
+    export_dir = Path(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    if "label" not in train_df.columns or "label" not in valid_df.columns:
+        raise ValueError("train_df and valid_df must contain 'label' for export")
+    # Round 186 Review P3: dedupe feature_cols so CSV header has no duplicate column names.
+    feature_cols_unique = list(dict.fromkeys(feature_cols))
+    # Round 186 Review P1: use only columns present in BOTH train and valid (Step 9 alignment).
+    common_cols = [
+        c for c in feature_cols_unique
+        if c in train_df.columns and c in valid_df.columns
+    ]
+    # R199 Review #2: refuse to export when no common feature columns (would produce invalid CSV for lgb).
+    if len(common_cols) == 0:
+        raise ValueError(
+            "Plan B export: no common feature columns between train_df and valid_df; cannot export valid CSV for LightGBM."
+        )
+    only_in_train = [c for c in feature_cols_unique if c in train_df.columns and c not in valid_df.columns]
+    only_in_valid = [c for c in feature_cols_unique if c in valid_df.columns and c not in train_df.columns]
+    if only_in_train or only_in_valid:
+        logger.warning(
+            "Plan B export: using common features only (skipped: only in train=%s, only in valid=%s)",
+            only_in_train or None,
+            only_in_valid or None,
+        )
+    cols_train_plus_label = common_cols + ["label"]
+    # Rated only (PLAN: 僅匯出 is_rated == true 的列)
+    train_rated = (
+        train_df[train_df["is_rated"]]
+        if "is_rated" in train_df.columns
+        else train_df
+    )
+    valid_rated = (
+        valid_df[valid_df["is_rated"]]
+        if "is_rated" in valid_df.columns
+        else valid_df
+    )
+    # Weight for train (same semantics as compute_sample_weights)
+    weight_series = compute_sample_weights(train_rated)
+    train_export = train_rated[cols_train_plus_label].copy()
+    train_export.insert(len(cols_train_plus_label), "weight", weight_series.values)
+    train_path = export_dir / "train_for_lgb.csv"
+    train_export.to_csv(train_path, index=False)
+    logger.info(
+        "Exported train for Plan B: %s (%d rows, %d features + label + weight)",
+        train_path,
+        len(train_export),
+        len(common_cols),
+    )
+    valid_cols = common_cols + ["label"]
+    valid_export = valid_rated[valid_cols]
+    valid_path = export_dir / "valid_for_lgb.csv"
+    valid_export.to_csv(valid_path, index=False)
+    logger.info(
+        "Exported valid for Plan B: %s (%d rows, %d features + label)",
+        valid_path,
+        len(valid_export),
+        len(valid_cols) - 1,
+    )
+    return (train_path, valid_path)
+
+
+# ---------------------------------------------------------------------------
+# Plan B+: stream export Parquet → LibSVM + .weight (PLAN 方案 B+ 階段 3)
+# ---------------------------------------------------------------------------
+
+
+def _labels_from_libsvm(path: Path) -> np.ndarray:
+    """Read labels (first column) from a LibSVM file without loading features (PLAN B+ 階段 6).
+
+    One label per line; returns float array for compatibility with precision_recall_curve.
+    """
+    labels: List[float] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            first = line.split(None, 1)[0]
+            try:
+                labels.append(float(first))
+            except ValueError:
+                continue
+    return np.asarray(labels, dtype=np.float64)
+
+
+def _export_parquet_to_libsvm(
+    train_path: Path,
+    valid_path: Path,
+    feature_cols: List[str],
+    export_dir: Path,
+    test_path: Optional[Path] = None,
+) -> Tuple[Path, Path, Optional[Path]]:
+    """Stream export from split Parquets to LibSVM + .weight (PLAN B+ §4.3, 階段 6 第 3 步).
+
+    Train: rated rows only; weight = 1/N_run (same as compute_sample_weights).
+    Valid: rated rows only; no weight file.
+    Test (optional): rated rows only; no weight file. When test_path is provided, writes test_for_lgb.libsvm.
+    Does not load full train/valid/test into memory.
+    Returns (train_libsvm_path, valid_libsvm_path, test_libsvm_path or None).
+    """
+    import duckdb
+
+    export_dir = Path(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    if not feature_cols:
+        raise ValueError("feature_cols must be non-empty for LibSVM export")
+    if not train_path.exists():
+        raise FileNotFoundError(f"Train Parquet not found: {train_path}")
+    if not valid_path.exists():
+        raise FileNotFoundError(f"Valid Parquet not found: {valid_path}")
+
+    def _esc_path(s: str) -> str:
+        return s.replace("'", "''")
+
+    def _esc_col(c: str) -> str:
+        return '"' + c.replace('"', '""') + '"'
+
+    train_libsvm = export_dir / "train_for_lgb.libsvm"
+    train_weight = export_dir / "train_for_lgb.libsvm.weight"
+    valid_libsvm = export_dir / "valid_for_lgb.libsvm"
+    train_libsvm_tmp = export_dir / "train_for_lgb.libsvm.tmp"
+    train_weight_tmp = export_dir / "train_for_lgb.libsvm.weight.tmp"
+    valid_libsvm_tmp = export_dir / "valid_for_lgb.libsvm.tmp"
+    test_libsvm: Optional[Path] = None
+
+    con = duckdb.connect(":memory:")
+    try:
+        train_s = _esc_path(str(train_path))
+        valid_s = _esc_path(str(valid_path))
+        cols = ", ".join(_esc_col(c) for c in feature_cols)
+        # Rated only; weight = 1/N_run per (canonical_id, run_id)
+        train_sql = (
+            f"SELECT label, {cols}, "
+            "1.0 / COUNT(*) OVER (PARTITION BY canonical_id, run_id) AS _w "
+            f"FROM read_parquet('{train_s}') WHERE COALESCE(is_rated, false) = true"
+        )
+        valid_sql = (
+            f"SELECT label, {cols} "
+            f"FROM read_parquet('{valid_s}') WHERE COALESCE(is_rated, false) = true"
+        )
+        batch_size = 50_000
+        n_train = 0
+        with open(train_libsvm_tmp, "w", encoding="utf-8") as f_lib, open(
+            train_weight_tmp, "w", encoding="utf-8"
+        ) as f_w:
+            result = con.execute(train_sql)
+            while True:
+                rows = result.fetchmany(batch_size)
+                if not rows:
+                    break
+                for row in rows:
+                    raw_label = int(row[0])
+                    label = 1 if raw_label else 0
+                    if raw_label not in (0, 1):
+                        logger.warning(
+                            "LibSVM export: non-binary label %s at row, coercing to 0/1",
+                            raw_label,
+                        )
+                    vals = row[1 : 1 + len(feature_cols)]
+                    w = float(row[-1])
+                    parts = [str(label)]
+                    for i, v in enumerate(vals):
+                        if v is None or (isinstance(v, float) and v == 0.0):
+                            continue
+                        try:
+                            x = float(v)
+                        except (TypeError, ValueError):
+                            x = 0.0
+                        if isinstance(x, float) and math.isnan(x):
+                            x = 0.0
+                        if x != 0.0:
+                            parts.append(f"{i + 1}:{x}")
+                    f_lib.write(" ".join(parts) + "\n")
+                    f_w.write(f"{w}\n")
+                    n_train += 1
+        if n_train == 0:
+            logger.warning(
+                "LibSVM export produced 0 train rows (no is_rated rows); cannot train from file.",
+            )
+        os.replace(train_libsvm_tmp, train_libsvm)
+        os.replace(train_weight_tmp, train_weight)
+
+        n_valid = 0
+        with open(valid_libsvm_tmp, "w", encoding="utf-8") as f_lib:
+            result = con.execute(valid_sql)
+            while True:
+                rows = result.fetchmany(batch_size)
+                if not rows:
+                    break
+                for row in rows:
+                    raw_label = int(row[0])
+                    label = 1 if raw_label else 0
+                    if raw_label not in (0, 1):
+                        logger.warning(
+                            "LibSVM export: non-binary label %s at row, coercing to 0/1",
+                            raw_label,
+                        )
+                    vals = row[1 : 1 + len(feature_cols)]
+                    parts = [str(label)]
+                    for i, v in enumerate(vals):
+                        if v is None or (isinstance(v, float) and v == 0.0):
+                            continue
+                        try:
+                            x = float(v)
+                        except (TypeError, ValueError):
+                            x = 0.0
+                        if isinstance(x, float) and math.isnan(x):
+                            x = 0.0
+                        if x != 0.0:
+                            parts.append(f"{i + 1}:{x}")
+                    f_lib.write(" ".join(parts) + "\n")
+                    n_valid += 1
+        os.replace(valid_libsvm_tmp, valid_libsvm)
+
+        n_test = 0
+        if test_path is not None and test_path.exists():
+            test_libsvm = export_dir / "test_for_lgb.libsvm"
+            test_libsvm_tmp = export_dir / "test_for_lgb.libsvm.tmp"
+            test_s = _esc_path(str(test_path))
+            test_sql = (
+                f"SELECT label, {cols} "
+                f"FROM read_parquet('{test_s}') WHERE COALESCE(is_rated, false) = true"
+            )
+            with open(test_libsvm_tmp, "w", encoding="utf-8") as f_lib:
+                result = con.execute(test_sql)
+                while True:
+                    rows = result.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    for row in rows:
+                        raw_label = int(row[0])
+                        label = 1 if raw_label else 0
+                        if raw_label not in (0, 1):
+                            logger.warning(
+                                "LibSVM export (test): non-binary label %s, coercing to 0/1",
+                                raw_label,
+                            )
+                        vals = row[1 : 1 + len(feature_cols)]
+                        parts = [str(label)]
+                        for i, v in enumerate(vals):
+                            if v is None or (isinstance(v, float) and v == 0.0):
+                                continue
+                            try:
+                                x = float(v)
+                            except (TypeError, ValueError):
+                                x = 0.0
+                            if isinstance(x, float) and math.isnan(x):
+                                x = 0.0
+                            if x != 0.0:
+                                parts.append(f"{i + 1}:{x}")
+                        f_lib.write(" ".join(parts) + "\n")
+                        n_test += 1
+            os.replace(test_libsvm_tmp, test_libsvm)
+    finally:
+        con.close()
+
+    if test_libsvm is not None:
+        logger.info(
+            "Exported LibSVM for Plan B+: train %s (%d rows + weight), valid %s (%d rows), test %s (%d rows)",
+            train_libsvm, n_train, valid_libsvm, n_valid, test_libsvm, n_test,
+        )
+    else:
+        logger.info(
+            "Exported LibSVM for Plan B+: train %s (%d rows + weight), valid %s (%d rows)",
+            train_libsvm, n_train, valid_libsvm, n_valid,
+        )
+    return (train_libsvm, valid_libsvm, test_libsvm)
+
+
+# ---------------------------------------------------------------------------
+# Plan B: Booster wrapper for scorer/artifact compatibility (PLAN §5)
+# ---------------------------------------------------------------------------
+
+class _BoosterWrapper:
+    """Thin wrapper so lgb.Booster can be used where LGBMClassifier is expected (PLAN 方案 B §5).
+
+    Scorer and _compute_test_metrics use model.predict_proba(X)[:, 1] and model.booster_.
+    """
+
+    def __init__(self, booster: lgb.Booster):
+        self.booster_ = booster
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        p = self.booster_.predict(X)
+        p = np.asarray(p).reshape(-1, 1)
+        return np.hstack([1.0 - p, p])
 
 
 # ---------------------------------------------------------------------------
@@ -1979,11 +2408,13 @@ def _train_one_model(
             # F_beta = (1 + beta^2) * P * R / (beta^2 * P + R)
             b = THRESHOLD_FBETA
             denom = b * b * pr_prec + pr_rec
-            fbeta_arr = np.where(
-                denom > 0,
-                (1.0 + b * b) * pr_prec * pr_rec / denom,
-                0.0,
-            )
+            # Avoid RuntimeWarning: divide only where denom > 0 (np.where evaluates both branches).
+            with np.errstate(divide="ignore", invalid="ignore"):
+                fbeta_arr = np.where(
+                    denom > 0,
+                    (1.0 + b * b) * pr_prec * pr_rec / denom,
+                    0.0,
+                )
             fbeta_arr = np.where(valid_mask, fbeta_arr, -1.0)
             best_idx = int(np.argmax(fbeta_arr))
             best_t = float(pr_thresholds[best_idx])
@@ -2033,7 +2464,7 @@ def _train_one_model(
 
 
 def _compute_test_metrics(
-    model: lgb.LGBMClassifier,
+    model: Union[lgb.LGBMClassifier, "_BoosterWrapper"],
     threshold: float,
     X_test: pd.DataFrame,
     y_test: pd.Series,
@@ -2184,8 +2615,108 @@ def _compute_test_metrics(
     }
 
 
+def _compute_test_metrics_from_scores(
+    y_test: np.ndarray,
+    test_scores: np.ndarray,
+    threshold: float,
+    label: str = "",
+    _uncalibrated: bool = False,
+    log_results: bool = True,
+    production_neg_pos_ratio: Optional[float] = None,
+) -> dict:
+    """Compute test-set metrics from precomputed scores (PLAN B+ 階段 6 第 3 步: test from file).
+
+    Same keys as _compute_test_metrics; used when test labels and predictions come from
+    LibSVM file (no X_test in memory). y_test and test_scores must be 1d arrays of same length.
+    """
+    _TARGET_RECALLS = (0.01, 0.1, 0.5)
+    _zeroed_recall_keys = {f"test_precision_at_recall_{r}": None for r in _TARGET_RECALLS}
+    y_arr = np.asarray(y_test).reshape(-1)
+    scores_arr = np.asarray(test_scores).reshape(-1)
+    if len(y_arr) != len(scores_arr):
+        n = min(len(y_arr), len(scores_arr))
+        y_arr = y_arr[:n]
+        scores_arr = scores_arr[:n]
+    n_te = int(len(y_arr))
+    n_te_pos = int(np.nansum(y_arr))
+    n_te_neg = int(np.sum(np.asarray(y_arr == 0, dtype=float)))
+    _has_test = (
+        n_te >= MIN_VALID_TEST_ROWS
+        and int(np.isnan(y_arr).sum()) == 0
+        and n_te_pos >= 1
+        and n_te_neg >= 1
+    )
+    if not _has_test:
+        logger.warning(
+            "%s: test from file too small or unbalanced (%d rows, %d pos, %d neg) — test metrics zero.",
+            label or "model", n_te, n_te_pos, n_te_neg,
+        )
+        return {
+            "test_ap": 0.0,
+            "test_precision": 0.0,
+            "test_recall": 0.0,
+            "test_f1": 0.0,
+            "test_samples": n_te,
+            "test_positives": n_te_pos,
+            "test_random_ap": (n_te_pos / n_te) if n_te > 0 else 0.0,
+            "test_threshold_uncalibrated": _uncalibrated,
+            **_zeroed_recall_keys,
+            "test_precision_prod_adjusted": None,
+            "test_neg_pos_ratio": None,
+            "production_neg_pos_ratio_assumed": production_neg_pos_ratio,
+        }
+    prauc = float(average_precision_score(y_arr, scores_arr))
+    preds = (scores_arr >= threshold).astype(int)
+    tp = int(((preds == 1) & (y_arr == 1)).sum())
+    fp = int(((preds == 1) & (y_arr == 0)).sum())
+    fn = int(((preds == 0) & (y_arr == 1)).sum())
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    test_random_ap = (n_te_pos / n_te) if n_te > 0 else 0.0
+    pr_prec_arr, pr_rec_arr, _ = precision_recall_curve(y_arr, scores_arr)
+    precision_at_recall: dict[str, Optional[float]] = {}
+    for r in _TARGET_RECALLS:
+        mask = pr_rec_arr >= r
+        if mask.any():
+            precision_at_recall[f"test_precision_at_recall_{r}"] = float(pr_prec_arr[mask].max())
+        else:
+            precision_at_recall[f"test_precision_at_recall_{r}"] = None
+    test_neg_pos_ratio = (n_te_neg / n_te_pos) if n_te_pos > 0 else None
+    test_precision_prod_adjusted = None
+    if (
+        prec > 0.0
+        and production_neg_pos_ratio is not None
+        and production_neg_pos_ratio > 0.0
+        and test_neg_pos_ratio is not None
+        and test_neg_pos_ratio > 0.0
+    ):
+        scaling = production_neg_pos_ratio / test_neg_pos_ratio
+        test_precision_prod_adjusted = 1.0 / (1.0 + (1.0 / prec - 1.0) * scaling)
+    if log_results:
+        _adj_str = f"  prec_prod_adj={test_precision_prod_adjusted:.4f}" if test_precision_prod_adjusted is not None else ""
+        logger.info(
+            "%s test (from file): AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f%s",
+            label, prauc, f1, prec, rec, threshold, _adj_str,
+        )
+    return {
+        "test_ap": prauc,
+        "test_precision": prec,
+        "test_recall": rec,
+        "test_f1": f1,
+        "test_samples": n_te,
+        "test_positives": n_te_pos,
+        "test_random_ap": test_random_ap,
+        "test_threshold_uncalibrated": _uncalibrated,
+        **precision_at_recall,
+        "test_precision_prod_adjusted": test_precision_prod_adjusted,
+        "test_neg_pos_ratio": test_neg_pos_ratio,
+        "production_neg_pos_ratio_assumed": production_neg_pos_ratio,
+    }
+
+
 def _compute_train_metrics(
-    model: lgb.LGBMClassifier,
+    model: Union[lgb.LGBMClassifier, "_BoosterWrapper"],
     threshold: float,
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -2238,7 +2769,7 @@ def _compute_train_metrics(
 
 
 def _compute_feature_importance(
-    model: lgb.LGBMClassifier,
+    model: Union[lgb.LGBMClassifier, "_BoosterWrapper"],
     feature_cols: List[str],
 ) -> list:
     """Return features ranked by LightGBM 'gain' importance (descending).
@@ -2258,7 +2789,7 @@ def _compute_feature_importance(
     except AttributeError:
         # Fallback for mock / non-LightGBM models (no booster_ attribute).
         names = list(feature_cols)
-        gains = model.feature_importances_.tolist()
+        gains = model.feature_importances_.tolist()  # type: ignore[union-attr]
         # R1102: guard against silent truncation by zip when lengths differ
         if len(gains) != len(names):
             raise ValueError(
@@ -2412,16 +2943,59 @@ def train_dual_model(
 
 def train_single_rated_model(
     train_df: pd.DataFrame,
-    valid_df: pd.DataFrame,
+    valid_df: Optional[pd.DataFrame],
     feature_cols: List[str],
     run_optuna: bool = True,
     test_df: Optional[pd.DataFrame] = None,
+    train_from_file: bool = False,
+    train_libsvm_paths: Optional[Tuple[Path, Path]] = None,
+    test_libsvm_path: Optional[Path] = None,
 ) -> Tuple[Optional[dict], Optional[dict], dict]:
     """v10 single-model (DEC-021): train rated model only; return (rated_art, None, metrics).
 
     Only rows where is_rated==True are used for training, validation, and test
     evaluation.  Non-rated observations are intentionally excluded (DEC-009/010).
+
+    When train_from_file is True (PLAN 方案 B §4), training uses on-disk CSV from
+    DATA_DIR/export (train_for_lgb.csv, valid_for_lgb.csv). A thin Booster wrapper
+    (§5) is returned so scorer and artifact save work unchanged.
+
+    When train_libsvm_paths is (train_path, valid_path) and both files exist (PLAN B+ §4.4),
+    training uses lgb.Dataset(path) so train data is not loaded into memory; .weight
+    file alongside train path is auto-loaded by LightGBM 4.6.0.
+
+    When valid_df is None and train_libsvm_paths is set (PLAN B+ 階段 6), validation
+    labels and predictions are read from the valid LibSVM file; path must be under DATA_DIR.
+
+    When test_df is None and test_libsvm_path is set (PLAN B+ 階段 6 第 3 步), test
+    labels and predictions are read from the test LibSVM file; path must be under DATA_DIR.
     """
+    if valid_df is None:
+        valid_df = pd.DataFrame()
+    use_from_libsvm = False
+    if train_libsvm_paths is not None:
+        _t, _v = train_libsvm_paths
+        if _t.exists() and _v.exists():
+            use_from_libsvm = True
+        else:
+            logger.warning(
+                "train_libsvm_paths set but files missing (%s / %s); using in-memory training.",
+                _t,
+                _v,
+            )
+
+    use_from_file = False
+    if train_from_file and not use_from_libsvm:
+        train_path = DATA_DIR / "export" / "train_for_lgb.csv"
+        valid_path = DATA_DIR / "export" / "valid_for_lgb.csv"
+        if train_path.exists() and valid_path.exists():
+            use_from_file = True
+        else:
+            logger.warning(
+                "STEP9_TRAIN_FROM_FILE is True but export CSVs missing (%s / %s); using in-memory training.",
+                train_path,
+                valid_path,
+            )
     train_rated = train_df[train_df["is_rated"]].copy() if not train_df.empty else train_df
     val_rated = valid_df[valid_df["is_rated"]].copy() if not valid_df.empty else valid_df
     test_rated: Optional[pd.DataFrame]
@@ -2430,12 +3004,19 @@ def train_single_rated_model(
     else:
         test_rated = test_df
 
-    if train_rated.empty:
+    if train_rated.empty and not use_from_libsvm:
         logger.warning("rated model: no training rows, skipping")
         return None, None, {"rated": None}
 
-    sw_rated = compute_sample_weights(train_rated)
-    avail_cols = [c for c in feature_cols if c in train_rated.columns]
+    sw_rated = compute_sample_weights(train_rated) if not train_rated.empty else pd.Series(dtype=float)
+    if use_from_libsvm:
+        avail_cols = [c for c in feature_cols if c in val_rated.columns]
+        if not avail_cols:
+            avail_cols = list(feature_cols)
+    else:
+        avail_cols = [c for c in feature_cols if c in train_rated.columns]
+        if not val_rated.empty:
+            avail_cols = [c for c in avail_cols if c in val_rated.columns]
     # R123-1: coerce object columns to numeric before building X_train so LightGBM
     # never receives an object-dtype feature (which would crash fit()).
     coerce_feature_dtypes(train_rated, avail_cols)
@@ -2445,7 +3026,17 @@ def train_single_rated_model(
     X_vl = val_rated[avail_cols] if not val_rated.empty else X_tr.head(0)
     y_vl = val_rated["label"] if not val_rated.empty else y_tr.head(0)
 
-    if run_optuna and not val_rated.empty and y_vl.sum() > 0:
+    # PLAN 方案 B §6: HPO on in-memory (train/valid) for both paths; from-file then uses best params for lgb.train.
+    # B+ §4.4: from LibSVM we use default hp (no in-memory HPO).
+    if use_from_libsvm:
+        hp = {
+            "n_estimators": 400,
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "max_depth": 8,
+            "min_child_samples": 20,
+        }
+    elif run_optuna and not val_rated.empty and y_vl.sum() > 0:
         hp = run_optuna_search(X_tr, y_tr, X_vl, y_vl, sw_rated, label="rated")
     else:
         hp = {
@@ -2456,29 +3047,435 @@ def train_single_rated_model(
             "min_child_samples": 20,
         }
 
-    model, metrics = _train_one_model(
-        X_tr, y_tr, X_vl, y_vl, sw_rated, hp, label="rated", log_results=False
-    )
+    if use_from_libsvm:
+        # PLAN B+ §4.4: train from LibSVM file; LightGBM auto-loads .weight when beside .libsvm.
+        train_libsvm_p, valid_libsvm_p = train_libsvm_paths  # type: ignore[misc]
+        with open(train_libsvm_p, encoding="utf-8") as _f:
+            _n_lines = sum(1 for _ in _f)
+        if _n_lines < 1:
+            logger.warning(
+                "Plan B+: train LibSVM has 0 lines; falling back to in-memory training."
+            )
+            use_from_libsvm = False
+            if train_rated.empty:
+                return None, None, {"rated": None}
+        if use_from_libsvm:
+            # R375 #6: single-class check (align with Plan B R188 #3 / R1509).
+            with open(train_libsvm_p, encoding="utf-8") as _f:
+                _labels = [line.split(None, 1)[0] for line in _f if line.strip()]
+            if len(set(_labels)) < 2:
+                logger.warning(
+                    "Plan B+: train LibSVM has only one class; falling back to in-memory training."
+                )
+                use_from_libsvm = False
+        if use_from_libsvm:
+            # PLAN B+ 階段 6: validation labels from file when valid_df not in memory (R216 Review #6: path under DATA_DIR only)
+            _valid_path_under_data_dir = True
+            if valid_df is None or (valid_df is not None and valid_df.empty):
+                try:
+                    valid_libsvm_p.resolve().relative_to(DATA_DIR.resolve())
+                except ValueError:
+                    logger.warning(
+                        "Plan B+: valid LibSVM path %s is not under DATA_DIR; skipping validation from file.",
+                        valid_libsvm_p,
+                    )
+                    y_vl = np.array([], dtype=np.float64)
+                    _valid_path_under_data_dir = False
+                else:
+                    y_vl = _labels_from_libsvm(valid_libsvm_p)
+            _has_val_from_file = (
+                len(y_vl) >= MIN_VALID_TEST_ROWS
+                and (int(y_vl.isna().sum()) if hasattr(y_vl, "isna") else int(np.isnan(y_vl).sum())) == 0
+                and int(np.asarray(y_vl).sum()) >= 1
+                and int((np.asarray(y_vl) == 0).sum()) >= 1
+            )
+            _bin_path = train_libsvm_p.parent / (train_libsvm_p.stem + ".bin")
+            _libsvm_temp_to_remove: Optional[Path] = None
+            if _bin_path.is_file():
+                dtrain = lgb.Dataset(str(_bin_path))
+                dvalid = lgb.Dataset(
+                    str(valid_libsvm_p),
+                    reference=dtrain,
+                    feature_name=list(avail_cols),
+                )
+            else:
+                weight_path = Path(str(train_libsvm_p) + ".weight")
+                _train_path_for_lgb: Union[str, Path] = train_libsvm_p
+                if weight_path.exists():
+                    with open(weight_path, encoding="utf-8") as _wf:
+                        _train_weights = [float(line.strip()) for line in _wf]
+                    if len(_train_weights) != _n_lines:
+                        logger.warning(
+                            "Plan B+: .weight file line count (%s) does not match train LibSVM line count (%s); ignoring weights.",
+                            len(_train_weights),
+                            _n_lines,
+                        )
+                        _train_weights = [1.0] * _n_lines
+                        _fd, _tmp = tempfile.mkstemp(suffix=".libsvm")
+                        os.close(_fd)
+                        _libsvm_temp_to_remove = Path(_tmp)
+                        _libsvm_temp_to_remove.write_text(
+                            train_libsvm_p.read_text(encoding="utf-8"), encoding="utf-8"
+                        )
+                        _train_path_for_lgb = _tmp
+                else:
+                    _train_weights = None
+                dtrain = lgb.Dataset(
+                    str(_train_path_for_lgb),
+                    weight=_train_weights,
+                    feature_name=list(avail_cols),
+                )
+                dvalid = lgb.Dataset(
+                    str(valid_libsvm_p),
+                    reference=dtrain,
+                    feature_name=list(avail_cols),
+                )
+                if STEP9_SAVE_LGB_BINARY:
+                    try:
+                        dtrain.save_binary(str(_bin_path))
+                        logger.info("Plan B+: saved train Dataset to %s", _bin_path)
+                    except OSError as _e:
+                        logger.warning(
+                            "Plan B+: failed to save train Dataset to %s (%s); continuing without .bin.",
+                            _bin_path,
+                            _e,
+                        )
+            _default_hp = {
+                "n_estimators": 400,
+                "learning_rate": 0.05,
+                "num_leaves": 31,
+                "max_depth": 8,
+                "min_child_samples": 20,
+            }
+            hp_resolved = {**_default_hp, **hp}
+            hp_lgb = {
+                **_base_lgb_params(),
+                "learning_rate": hp_resolved["learning_rate"],
+                "num_leaves": hp_resolved["num_leaves"],
+                "max_depth": hp_resolved["max_depth"],
+                "min_child_samples": hp_resolved["min_child_samples"],
+            }
+            num_boost_round = max(1, int(hp_resolved.get("n_estimators", 400)))
+            if _has_val_from_file:
+                booster = lgb.train(
+                    hp_lgb,
+                    dtrain,
+                    num_boost_round=num_boost_round,
+                    valid_sets=[dvalid],
+                    callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+                )
+            else:
+                booster = lgb.train(
+                    hp_lgb,
+                    dtrain,
+                    num_boost_round=num_boost_round,
+                )
+            avail_cols = list(booster.feature_name())
+            # PLAN B+ 階段 6: when valid_df not in memory, predict from file path; else in-memory (backward compat).
+            _missing_val_cols = (
+                [c for c in avail_cols if c not in val_rated.columns]
+                if not val_rated.empty
+                else []
+            )
+            if _missing_val_cols:
+                val_scores = np.array([], dtype=np.float64)
+                _has_val = False
+            elif valid_df is None or (valid_df is not None and valid_df.empty):
+                # Validation from file: Booster.predict(path) only when path under DATA_DIR and len(y_vl) > 0 (R216 #4, #6)
+                if not _valid_path_under_data_dir or len(y_vl) == 0:
+                    val_scores = np.array([], dtype=np.float64)
+                    _has_val = False
+                else:
+                    _raw = booster.predict(str(valid_libsvm_p))
+                    val_scores = np.asarray(_raw).reshape(-1) if np.ndim(_raw) else np.asarray([_raw]).reshape(-1)
+                    if len(val_scores) != len(y_vl):
+                        logger.warning(
+                            "Plan B+: valid LibSVM label count (%d) != predict count (%d); trimming to min.",
+                            len(y_vl),
+                            len(val_scores),
+                        )
+                        _n = min(len(val_scores), len(y_vl))
+                        val_scores = val_scores[:_n]
+                        y_vl = y_vl[:_n] if hasattr(y_vl, "__getitem__") else np.asarray(y_vl)[:_n]
+                    _has_val = _has_val_from_file
+            else:
+                val_scores = np.asarray(booster.predict(val_rated[avail_cols])).reshape(-1)
+                _has_val = _has_val_from_file
+            if _has_val and np.asarray(y_vl).sum() > 0:
+                prauc = float(average_precision_score(y_vl, val_scores))
+                pr_prec, pr_rec, pr_thresholds = precision_recall_curve(y_vl, val_scores)
+                pr_prec = pr_prec[:-1]
+                pr_rec = pr_rec[:-1]
+                _sorted_scores = np.sort(val_scores)
+                alert_counts = len(val_scores) - np.searchsorted(_sorted_scores, pr_thresholds, side="left")
+                valid_mask = alert_counts >= MIN_THRESHOLD_ALERT_COUNT
+                if THRESHOLD_MIN_RECALL is not None:
+                    valid_mask = valid_mask & (pr_rec >= THRESHOLD_MIN_RECALL)
+                if valid_mask.any():
+                    b = THRESHOLD_FBETA
+                    denom = b * b * pr_prec + pr_rec
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        fbeta_arr = np.where(denom > 0, (1.0 + b * b) * pr_prec * pr_rec / denom, 0.0)
+                    fbeta_arr = np.where(valid_mask, fbeta_arr, -1.0)
+                    best_idx = int(np.argmax(fbeta_arr))
+                    best_t = float(pr_thresholds[best_idx])
+                    best_prec = float(pr_prec[best_idx])
+                    best_rec = float(pr_rec[best_idx])
+                    best_fbeta = float(fbeta_arr[best_idx])
+                    best_f1 = (
+                        2.0 * best_prec * best_rec / (best_prec + best_rec)
+                        if (best_prec + best_rec) > 0
+                        else 0.0
+                    )
+                else:
+                    best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
+                    best_fbeta = 0.0
+            else:
+                prauc = 0.0
+                best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
+                best_fbeta = 0.0
+            n_val = int(len(y_vl))
+            n_val_pos = int(y_vl.sum())
+            val_random_ap = (n_val_pos / n_val) if n_val > 0 else 0.0
+            metrics = {
+                "label": "rated",
+                "val_ap": prauc,
+                "val_precision": best_prec,
+                "val_recall": best_rec,
+                "val_f1": best_f1,
+                "val_fbeta_05": best_fbeta,
+                "threshold": best_t,
+                "val_samples": n_val,
+                "val_positives": n_val_pos,
+                "val_random_ap": val_random_ap,
+                "best_hyperparams": hp_resolved,
+                "_uncalibrated": not _has_val,
+            }
+            model = _BoosterWrapper(booster)
+            if _libsvm_temp_to_remove is not None and _libsvm_temp_to_remove.exists():
+                _libsvm_temp_to_remove.unlink()
+
+    if use_from_file:
+        # Plan B §4: train from CSV; §5: wrap Booster for scorer/artifact compatibility.
+        train_path = DATA_DIR / "export" / "train_for_lgb.csv"
+        valid_path = DATA_DIR / "export" / "valid_for_lgb.csv"
+        # R188 Review #2: 0-row train CSV => fallback to in-memory (avoid LightGBM "at least one line" error).
+        with open(train_path, encoding="utf-8") as _f:
+            _n_lines = sum(1 for _ in _f)
+        if _n_lines < 2:
+            use_from_file = False
+            logger.warning(
+                "Plan B: train CSV has < 2 lines (header-only or empty); using in-memory training."
+            )
+        if use_from_file:
+            # R188 Review #3: single-class train CSV => fallback (align with R1509 semantics).
+            _train_labels = pd.read_csv(train_path, usecols=["label"])
+            if _train_labels["label"].nunique() < 2:
+                use_from_file = False
+                logger.warning(
+                    "Plan B: train CSV has only one class; using in-memory training."
+                )
+        if use_from_file:
+            # Load train from CSV so feature set is explicit (avoid weight column as feature in some LightGBM builds).
+            _train_csv = pd.read_csv(train_path)
+            _train_feature_cols = [c for c in _train_csv.columns if c not in ("label", "weight")]
+            dtrain = lgb.Dataset(
+                _train_csv[_train_feature_cols],
+                label=_train_csv["label"],
+                weight=_train_csv["weight"] if "weight" in _train_csv.columns else None,
+            )
+            # R191 Review #1: run_optuna_search may return {} or partial keys; merge with defaults to avoid KeyError.
+            _default_rated_hp = {
+                "n_estimators": 400,
+                "learning_rate": 0.05,
+                "num_leaves": 31,
+                "max_depth": 8,
+                "min_child_samples": 20,
+            }
+            hp_resolved = {**_default_rated_hp, **hp}
+            hp_lgb = {
+                **_base_lgb_params(),
+                "learning_rate": hp_resolved["learning_rate"],
+                "num_leaves": hp_resolved["num_leaves"],
+                "max_depth": hp_resolved["max_depth"],
+                "min_child_samples": hp_resolved["min_child_samples"],
+            }
+            # R191 Review #3: ensure at least 1 round (guard 0/negative from Optuna).
+            num_boost_round = max(1, int(hp_resolved.get("n_estimators", 400)))
+            # R196: align with in-memory path — use in-memory val_rated for early_stopping so parity test passes.
+            _has_val_from_file = (
+                not val_rated.empty
+                and len(y_vl) >= MIN_VALID_TEST_ROWS
+                and int(y_vl.isna().sum()) == 0
+                and int(y_vl.sum()) >= 1
+                and int((y_vl == 0).sum()) >= 1
+            )
+            # R199 Review #1: val_rated must contain all _train_feature_cols (from CSV); else skip early_stopping to avoid KeyError.
+            _missing_val_cols = [c for c in _train_feature_cols if c not in val_rated.columns]
+            if _missing_val_cols:
+                logger.warning(
+                    "Plan B: valid_df missing columns %s present in train CSV; skipping early_stopping for from-file training.",
+                    _missing_val_cols,
+                )
+                _has_val_from_file = False
+            if _has_val_from_file:
+                dvalid = lgb.Dataset(
+                    val_rated[_train_feature_cols],
+                    label=val_rated["label"],
+                    reference=dtrain,
+                )
+                booster = lgb.train(
+                    hp_lgb,
+                    dtrain,
+                    num_boost_round=num_boost_round,
+                    valid_sets=[dvalid],
+                    callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+                )
+            else:
+                booster = lgb.train(
+                    hp_lgb,
+                    dtrain,
+                    num_boost_round=num_boost_round,
+                )
+            # R188 Review #1: artifact features must match Booster (common_cols from export).
+            avail_cols = list(booster.feature_name())
+            # R199 #1: if val_rated is missing any feature column, do not predict (would KeyError).
+            if _missing_val_cols:
+                val_scores = np.array([], dtype=np.float64)
+                _has_val = False
+            else:
+                val_scores = np.asarray(booster.predict(val_rated[avail_cols])).reshape(-1)
+                _has_val = (
+                    not val_rated.empty
+                    and len(y_vl) >= MIN_VALID_TEST_ROWS
+                    and int(y_vl.isna().sum()) == 0
+                    and int(y_vl.sum()) >= 1
+                    and int((y_vl == 0).sum()) >= 1
+                )
+            if _has_val and y_vl.sum() > 0:
+                prauc = float(average_precision_score(y_vl, val_scores))
+                pr_prec, pr_rec, pr_thresholds = precision_recall_curve(y_vl, val_scores)
+                pr_prec = pr_prec[:-1]
+                pr_rec = pr_rec[:-1]
+                _sorted_scores = np.sort(val_scores)
+                alert_counts = len(val_scores) - np.searchsorted(_sorted_scores, pr_thresholds, side="left")
+                valid_mask = alert_counts >= MIN_THRESHOLD_ALERT_COUNT
+                if THRESHOLD_MIN_RECALL is not None:
+                    valid_mask = valid_mask & (pr_rec >= THRESHOLD_MIN_RECALL)
+                if valid_mask.any():
+                    b = THRESHOLD_FBETA
+                    denom = b * b * pr_prec + pr_rec
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        fbeta_arr = np.where(denom > 0, (1.0 + b * b) * pr_prec * pr_rec / denom, 0.0)
+                    fbeta_arr = np.where(valid_mask, fbeta_arr, -1.0)
+                    best_idx = int(np.argmax(fbeta_arr))
+                    best_t = float(pr_thresholds[best_idx])
+                    best_prec = float(pr_prec[best_idx])
+                    best_rec = float(pr_rec[best_idx])
+                    best_fbeta = float(fbeta_arr[best_idx])
+                    best_f1 = (
+                        2.0 * best_prec * best_rec / (best_prec + best_rec)
+                        if (best_prec + best_rec) > 0
+                        else 0.0
+                    )
+                else:
+                    best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
+                    best_fbeta = 0.0
+            else:
+                prauc = 0.0
+                best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
+                best_fbeta = 0.0
+            n_val = int(len(y_vl))
+            n_val_pos = int(y_vl.sum())
+            val_random_ap = (n_val_pos / n_val) if n_val > 0 else 0.0
+            metrics = {
+                "label": "rated",
+                "val_ap": prauc,
+                "val_precision": best_prec,
+                "val_recall": best_rec,
+                "val_f1": best_f1,
+                "val_fbeta_05": best_fbeta,
+                "threshold": best_t,
+                "val_samples": n_val,
+                "val_positives": n_val_pos,
+                "val_random_ap": val_random_ap,
+                "best_hyperparams": hp_resolved,
+                "_uncalibrated": not _has_val,
+            }
+            model = _BoosterWrapper(booster)
+    if not use_from_file and not use_from_libsvm:
+        model, metrics = _train_one_model(
+            X_tr, y_tr, X_vl, y_vl, sw_rated, hp, label="rated", log_results=False
+        )
 
     train_m = _compute_train_metrics(
-        model, metrics["threshold"], X_tr, y_tr, label="rated", log_results=False
+        model, cast(float, metrics["threshold"]), train_rated[avail_cols], y_tr, label="rated", log_results=False
     )
     metrics.update(train_m)
 
     if test_rated is not None and not test_rated.empty:
-        X_te = test_rated[avail_cols]
-        y_te = test_rated["label"]
-        test_m = _compute_test_metrics(
-            model,
-            metrics["threshold"],
-            X_te,
-            y_te,
-            label="rated",
-            _uncalibrated=bool(metrics.get("_uncalibrated", False)),
-            log_results=False,
-            production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
-        )
-        metrics.update(test_m)
+        _missing_test_cols = [c for c in avail_cols if c not in test_rated.columns]
+        if _missing_test_cols:
+            logger.warning(
+                "rated: test_df missing columns %s; skipping test evaluation.",
+                _missing_test_cols,
+            )
+            test_m = {}
+        else:
+            X_te = test_rated[avail_cols]
+            y_te = test_rated["label"]
+            test_m = _compute_test_metrics(
+                model,
+                cast(float, metrics["threshold"]),
+                X_te,
+                y_te,
+                label="rated",
+                _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+                log_results=False,
+                production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+            )
+            metrics.update(test_m)
+    elif (
+        use_from_libsvm
+        and test_libsvm_path is not None
+        and test_libsvm_path.exists()
+    ):
+        # PLAN B+ 階段 6 第 3 步: test from file (path under DATA_DIR, same contract as valid)
+        _test_path_under_data_dir = True
+        try:
+            test_libsvm_path.resolve().relative_to(DATA_DIR.resolve())
+        except ValueError:
+            logger.warning(
+                "Plan B+: test LibSVM path %s not under DATA_DIR; skipping test from file.",
+                test_libsvm_path,
+            )
+            _test_path_under_data_dir = False
+            test_m = {}
+        else:
+            y_te = _labels_from_libsvm(test_libsvm_path)
+            if len(y_te) == 0:
+                test_m = {}
+            else:
+                _test_booster = getattr(model, "booster_", None)
+                if _test_booster is None:
+                    test_m = {}
+                else:
+                    _raw = _test_booster.predict(str(test_libsvm_path))
+                    test_scores = np.asarray(_raw).reshape(-1) if np.ndim(_raw) else np.asarray([_raw]).reshape(-1)
+                    if len(test_scores) != len(y_te):
+                        _n = min(len(test_scores), len(y_te))
+                        test_scores = test_scores[:_n]
+                        y_te = y_te[:_n]
+                    test_m = _compute_test_metrics_from_scores(
+                        y_te,
+                        test_scores,
+                        cast(float, metrics["threshold"]),
+                        label="rated",
+                        _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+                        log_results=False,
+                        production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+                    )
+                    metrics.update(test_m)
     else:
         test_m = {}
 
@@ -2514,9 +3511,9 @@ def train_single_rated_model(
         )
         _par_parts = []
         for _r in (0.01, 0.1, 0.5):
-            _v = test_m.get(f"test_precision_at_recall_{_r}")
+            _par_val = test_m.get(f"test_precision_at_recall_{_r}")
             _par_parts.append(
-                f"prec@rec{_r}={_v:.4f}" if _v is not None else f"prec@rec{_r}=N/A"
+                f"prec@rec{_r}={_par_val:.4f}" if _par_val is not None else f"prec@rec{_r}=N/A"
             )
         logger.info("rated test PR-curve: %s", "  ".join(_par_parts))
 
@@ -2818,6 +3815,7 @@ def run_pipeline(args) -> None:
             effective_end + timedelta(days=1),
             sessions_only=True,
         )
+        _, sessions_all = normalize_bets_sessions(pd.DataFrame(), sessions_all)
         _, sessions_all = apply_dq(
             pd.DataFrame(columns=["bet_id"]),  # dummy bets
             sessions_all,
@@ -2922,6 +3920,8 @@ def run_pipeline(args) -> None:
     )
 
     # 4. Process chunks -> write parquet
+    # When NEG_SAMPLE_FRAC_AUTO and there are chunks, run chunk 1 with frac=1.0 (OOM probe),
+    # measure size, possibly lower _effective_neg_sample_frac, then process remaining chunks.
     _neg_sample_note = (
         f"  neg-sample={_effective_neg_sample_frac:.2f}" if _effective_neg_sample_frac < 1.0 else ""
     )
@@ -2930,10 +3930,13 @@ def run_pipeline(args) -> None:
         flush=True,
     )
     t0 = time.perf_counter()
-    chunk_paths = []
-    for i, chunk in enumerate(chunks):
-        path = process_chunk(
-            chunk,
+    chunk_paths: List[Path] = []
+    if NEG_SAMPLE_FRAC_AUTO and len(chunks) > 0:
+        # OOM probe: process chunk 1 with frac=1.0, then decide effective frac.
+        print("[Step 6/10] OOM probe: chunk 1 with neg_sample_frac=1.0…", flush=True)
+        logger.info("OOM probe: processing chunk 1 with neg_sample_frac=1.0")
+        path1 = process_chunk(
+            chunks[0],
             canonical_map,
             dummy_player_ids=dummy_player_ids,
             use_local_parquet=use_local,
@@ -2941,11 +3944,85 @@ def run_pipeline(args) -> None:
             profile_df=profile_df,
             feature_spec=feature_spec,
             feature_spec_hash=feature_spec_hash,
-            neg_sample_frac=_effective_neg_sample_frac,
+            neg_sample_frac=1.0,
         )
-        if path is not None:
-            chunk_paths.append(path)
-        gc.collect()  # Release chunk memory before loading next (OOM quick win)
+        if path1 is not None:
+            _path1 = Path(path1) if isinstance(path1, str) else path1
+            if getattr(_path1, "exists", lambda: False)() and _path1.is_file():
+                size_chunk1 = _path1.stat().st_size
+                _effective_neg_sample_frac = _oom_check_after_chunk1(
+                    size_chunk1, len(chunks), _effective_neg_sample_frac
+                )
+                if _effective_neg_sample_frac < 1.0:
+                    path1_rerun = process_chunk(
+                        chunks[0],
+                        canonical_map,
+                        dummy_player_ids=dummy_player_ids,
+                        use_local_parquet=use_local,
+                        force_recompute=force,
+                        profile_df=profile_df,
+                        feature_spec=feature_spec,
+                        feature_spec_hash=feature_spec_hash,
+                        neg_sample_frac=_effective_neg_sample_frac,
+                    )
+                    if path1_rerun is not None:
+                        chunk_paths.append(path1_rerun)
+                    else:
+                        chunk_paths.append(path1)
+                else:
+                    chunk_paths.append(path1)
+            else:
+                # Path does not exist (e.g. test mock): skip size-based adjustment
+                chunk_paths.append(path1)
+            gc.collect()
+            for chunk in chunks[1:]:
+                path = process_chunk(
+                    chunk,
+                    canonical_map,
+                    dummy_player_ids=dummy_player_ids,
+                    use_local_parquet=use_local,
+                    force_recompute=force,
+                    profile_df=profile_df,
+                    feature_spec=feature_spec,
+                    feature_spec_hash=feature_spec_hash,
+                    neg_sample_frac=_effective_neg_sample_frac,
+                )
+                if path is not None:
+                    chunk_paths.append(path)
+                gc.collect()
+        else:
+            # Chunk 1 empty: no probe decision, use _effective_neg_sample_frac for all.
+            for chunk in chunks:
+                path = process_chunk(
+                    chunk,
+                    canonical_map,
+                    dummy_player_ids=dummy_player_ids,
+                    use_local_parquet=use_local,
+                    force_recompute=force,
+                    profile_df=profile_df,
+                    feature_spec=feature_spec,
+                    feature_spec_hash=feature_spec_hash,
+                    neg_sample_frac=_effective_neg_sample_frac,
+                )
+                if path is not None:
+                    chunk_paths.append(path)
+                gc.collect()
+    else:
+        for i, chunk in enumerate(chunks):
+            path = process_chunk(
+                chunk,
+                canonical_map,
+                dummy_player_ids=dummy_player_ids,
+                use_local_parquet=use_local,
+                force_recompute=force,
+                profile_df=profile_df,
+                feature_spec=feature_spec,
+                feature_spec_hash=feature_spec_hash,
+                neg_sample_frac=_effective_neg_sample_frac,
+            )
+            if path is not None:
+                chunk_paths.append(path)
+            gc.collect()
 
     _el = time.perf_counter() - t0
     print("[Step 6/10] Process chunks done in %.1fs (%d chunks)" % (_el, len(chunk_paths)), flush=True)
@@ -2953,7 +4030,458 @@ def run_pipeline(args) -> None:
     if not chunk_paths:
         raise SystemExit("No chunks produced any usable data — check data source / time window")
 
-    # 5. Load all chunks, concatenate (OOM guard: warn if chunk data is large)
+    # --- Step 7 helpers (PLAN Step 7 Out-of-Core: DuckDB sort+split) ---
+    def _get_step7_available_ram_bytes() -> Optional[int]:
+        try:
+            import psutil as _psutil
+            return _psutil.virtual_memory().available
+        except Exception:
+            return None
+
+    def _compute_step7_duckdb_budget(available_bytes: Optional[int]) -> int:
+        """Compute DuckDB memory_limit (bytes) for Step 7 sort+split.
+
+        budget = clamp(available_bytes * STEP7_DUCKDB_RAM_FRACTION,
+                      STEP7_DUCKDB_RAM_MIN_GB, STEP7_DUCKDB_RAM_MAX_GB).
+        FRACTION must be in (0, 1]; invalid values fall back to 0.5 with a warning.
+        If MIN_GB > MAX_GB, the two are swapped with a warning (align with ETL).
+        When available_bytes is None, returns MIN_GB so caller never crashes.
+        """
+        _min_gb = STEP7_DUCKDB_RAM_MIN_GB
+        _max_gb = STEP7_DUCKDB_RAM_MAX_GB
+        frac = STEP7_DUCKDB_RAM_FRACTION
+        if not (0.0 < frac <= 1.0):
+            logger.warning(
+                "STEP7_DUCKDB_RAM_FRACTION=%.3f out of valid range (0, 1]; using 0.5",
+                frac,
+            )
+            frac = 0.5
+        lo = int(_min_gb * 1024**3)
+        hi = int(_max_gb * 1024**3)
+        if lo > hi:
+            logger.warning(
+                "STEP7_DUCKDB_RAM_MIN_GB (%.2f GB) > RAM_MAX_GB (%.2f GB); swapping",
+                _min_gb,
+                _max_gb,
+            )
+            lo, hi = hi, lo
+        if available_bytes is None:
+            return lo
+        budget = int(available_bytes * frac)
+        return max(lo, min(hi, budget))
+
+    def _configure_step7_duckdb_runtime(con: Any, *, budget_bytes: int) -> None:
+        """Set memory_limit, threads, temp_directory, preserve_insertion_order on *con*.
+        Paths containing single quotes are escaped for SQL (''); if unescapable we fallback
+        to DATA_DIR/duckdb_tmp and log a warning.
+        """
+        budget_gb = budget_bytes / 1024**3
+        threads = max(1, int(STEP7_DUCKDB_THREADS))
+        temp_dir_raw = STEP7_DUCKDB_TEMP_DIR if STEP7_DUCKDB_TEMP_DIR else str(DATA_DIR / "duckdb_tmp")
+        if "'" in temp_dir_raw:
+            fallback = str(DATA_DIR / "duckdb_tmp")
+            logger.warning(
+                "STEP7_DUCKDB_TEMP_DIR contains single quote; using fallback %s",
+                fallback,
+            )
+            temp_dir = fallback
+        else:
+            temp_dir = temp_dir_raw
+        temp_dir_sql = temp_dir.replace("'", "''")
+        for _stmt, _label in [
+            (f"SET memory_limit='{budget_gb:.2f}GB'", "memory_limit"),
+            (f"SET threads={threads}", "threads"),
+            (f"SET temp_directory='{temp_dir_sql}'", "temp_directory"),
+        ]:
+            try:
+                con.execute(_stmt)
+            except Exception as exc:
+                logger.warning("Step 7 DuckDB SET %s failed (non-fatal): %s", _label, exc)
+        if not STEP7_DUCKDB_PRESERVE_INSERTION_ORDER:
+            try:
+                con.execute("SET preserve_insertion_order=false")
+            except Exception as exc:
+                logger.warning("Step 7 DuckDB SET preserve_insertion_order failed (non-fatal): %s", exc)
+        logger.info(
+            "Step 7 DuckDB runtime: memory_limit=%.2fGB  threads=%d  temp_directory=%s",
+            budget_gb, threads, temp_dir,
+        )
+
+    def _is_duckdb_oom(exc: BaseException) -> bool:
+        """Return True if *exc* is DuckDB OOM or MemoryError or 'unable to allocate' message."""
+        try:
+            import duckdb as _duckdb
+            oom_cls = getattr(_duckdb, "OutOfMemoryException", None)
+            if oom_cls is not None and isinstance(exc, oom_cls):
+                return True
+        except ImportError:
+            pass
+        if isinstance(exc, MemoryError):
+            return True
+        msg = str(exc.args[0]) if getattr(exc, "args", None) and exc.args else str(exc)
+        return "unable to allocate" in msg.lower() or "out of memory" in msg.lower()
+
+    def _step7_clean_duckdb_temp_dir() -> None:
+        """Remove Step 7 DuckDB temp directory if it exists (PLAN Step 7: 清理暫存).
+        Only deletes when path is DATA_DIR/duckdb_tmp or under DATA_DIR (R213 Review #1 whitelist).
+        """
+        temp_dir_raw = STEP7_DUCKDB_TEMP_DIR if STEP7_DUCKDB_TEMP_DIR else str(DATA_DIR / "duckdb_tmp")
+        if "'" in temp_dir_raw:
+            effective = DATA_DIR / "duckdb_tmp"
+        else:
+            effective = Path(temp_dir_raw)
+        data_dir_resolved = DATA_DIR.resolve()
+        effective_resolved = effective.resolve()
+        allowed_duckdb_tmp = (DATA_DIR / "duckdb_tmp").resolve()
+        if effective_resolved != allowed_duckdb_tmp:
+            try:
+                effective_resolved.relative_to(data_dir_resolved)
+            except ValueError:
+                logger.warning(
+                    "Step 7: refusing to remove DuckDB temp directory outside DATA_DIR: %s",
+                    effective,
+                )
+                return
+        if effective.exists() and effective.is_dir():
+            try:
+                shutil.rmtree(effective)
+                logger.info("Step 7: cleaned DuckDB temp directory %s", effective)
+            except OSError as _e:
+                logger.warning("Step 7: could not remove DuckDB temp directory %s: %s", effective, _e)
+
+    def _duckdb_sort_and_split(
+        chunk_paths: List[Path],
+        train_frac: float,
+        valid_frac: float,
+    ) -> Tuple[Path, Path, Path]:
+        """Sort chunk Parquets by payout_complete_dtm, canonical_id, bet_id and split into train/valid/test Parquet files.
+        Uses DuckDB out-of-core; returns (train_path, valid_path, test_path).
+        Creates step7_splits and DuckDB temp directory (or fallback DATA_DIR/duckdb_tmp when config path contains single quote).
+        DuckDB may remove its temp directory on close; caller should not assume it exists after return.
+        """
+        if not chunk_paths:
+            raise ValueError("chunk_paths must be non-empty")
+        if not (0 < train_frac and 0 < valid_frac and train_frac + valid_frac < 1.0):
+            raise ValueError(
+                "train_frac and valid_frac must be in (0, 1) and train_frac + valid_frac < 1"
+            )
+        import duckdb
+        path_list = [str(p) for p in chunk_paths]
+        step7_dir = DATA_DIR / "step7_splits" / str(os.getpid())
+        step7_dir.mkdir(parents=True, exist_ok=True)
+        train_path = step7_dir / "split_train.parquet"
+        valid_path = step7_dir / "split_valid.parquet"
+        test_path = step7_dir / "split_test.parquet"
+        temp_dir_raw = STEP7_DUCKDB_TEMP_DIR if STEP7_DUCKDB_TEMP_DIR else str(DATA_DIR / "duckdb_tmp")
+        if "'" in temp_dir_raw:
+            effective_temp_dir = str(DATA_DIR / "duckdb_tmp")
+        else:
+            effective_temp_dir = temp_dir_raw
+        Path(effective_temp_dir).mkdir(parents=True, exist_ok=True)
+        con = duckdb.connect(":memory:")
+        try:
+            budget = _compute_step7_duckdb_budget(_get_step7_available_ram_bytes())
+            _configure_step7_duckdb_runtime(con, budget_bytes=budget)
+            # Avoid prepared statement with list (Binder Error in some DuckDB builds).
+            paths_escaped = [p.replace("'", "''") for p in path_list]
+            paths_sql = ",".join(f"'{p}'" for p in paths_escaped)
+            con.execute(f"SELECT count(*) AS n FROM read_parquet([{paths_sql}])")
+            _row = con.fetchone()
+            if _row is None:
+                raise ValueError("No rows in chunk Parquets")
+            n_rows = _row[0]
+            if n_rows == 0:
+                raise ValueError("No rows in chunk Parquets")
+            train_end_idx = int(n_rows * train_frac)
+            valid_end_idx = int(n_rows * (train_frac + valid_frac))
+            con.execute(
+                f"CREATE TEMP VIEW sorted_bets AS SELECT *, ROW_NUMBER() OVER (ORDER BY payout_complete_dtm NULLS LAST, canonical_id NULLS LAST, bet_id NULLS LAST) - 1 AS _rn FROM read_parquet([{paths_sql}])"
+            )
+            _tp = str(train_path).replace("'", "''")
+            _vp = str(valid_path).replace("'", "''")
+            _sp = str(test_path).replace("'", "''")
+            try:
+                con.execute(
+                    f"COPY (SELECT * EXCLUDE (_rn) FROM sorted_bets WHERE _rn >= 0 AND _rn < {train_end_idx}) TO '{_tp}' (FORMAT PARQUET)"
+                )
+                con.execute(
+                    f"COPY (SELECT * EXCLUDE (_rn) FROM sorted_bets WHERE _rn >= {train_end_idx} AND _rn < {valid_end_idx}) TO '{_vp}' (FORMAT PARQUET)"
+                )
+                con.execute(
+                    f"COPY (SELECT * EXCLUDE (_rn) FROM sorted_bets WHERE _rn >= {valid_end_idx}) TO '{_sp}' (FORMAT PARQUET)"
+                )
+            except Exception:
+                for p in (train_path, valid_path, test_path):
+                    if p.exists():
+                        p.unlink()
+                raise
+        finally:
+            con.close()
+        return (train_path, valid_path, test_path)
+
+    def _step7_oom_failsafe_next_frac(current_frac: float) -> Tuple[float, bool]:
+        """Compute next NEG_SAMPLE_FRAC after DuckDB OOM (halve); signal whether to retry.
+        Returns (new_frac, should_retry). If already at NEG_SAMPLE_FRAC_MIN, raises
+        with a clear message to reduce --days or add RAM. Orchestrator is responsible
+        for re-running Step 6 with the returned new_frac and retrying _duckdb_sort_and_split.
+        """
+        if not (0.0 < current_frac <= 1.0):
+            raise ValueError(
+                "current_frac must be in (0, 1], got %s" % current_frac
+            )
+        new_frac = max(NEG_SAMPLE_FRAC_MIN, current_frac / 2.0)
+        if new_frac >= current_frac:
+            raise RuntimeError(
+                "Step 7 DuckDB OOM and NEG_SAMPLE_FRAC already at floor (%.2f). "
+                "Reduce training window (--days / --start --end) or add RAM."
+                % NEG_SAMPLE_FRAC_MIN
+            )
+        return (new_frac, True)
+
+    def _read_parquet_head(path: Path, n: int) -> pd.DataFrame:
+        """Read first n rows from a Parquet file without loading full file (PLAN B+ Step 8 sample)."""
+        if n <= 0:
+            return pd.DataFrame()
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        pf = pq.ParquetFile(path)
+        batches: List[Any] = []
+        total = 0
+        for batch in pf.iter_batches(batch_size=min(n, 100_000)):
+            batches.append(batch)
+            total += len(batch)
+            if total >= n:
+                break
+        if not batches:
+            return pd.DataFrame()
+        table = pa.Table.from_batches(batches)
+        return table.slice(0, n).to_pandas()
+
+    def _step7_metadata_from_paths(
+        _train_path: Path, _valid_path: Path, _test_path: Path
+    ) -> Tuple[int, int, int, int, Optional[Any]]:
+        """(n_train, n_valid, n_test, label1_total, train_end_max) via DuckDB (PLAN B+)."""
+        import duckdb
+        con = duckdb.connect(":memory:")
+        try:
+            def _q_count(p: Path) -> int:
+                s = str(p).replace("'", "''")
+                r = con.execute(f"SELECT count(*) FROM read_parquet('{s}')").fetchone()
+                return int(r[0]) if r else 0
+
+            def _q_label_sum(p: Path) -> int:
+                s = str(p).replace("'", "''")
+                r = con.execute(
+                    f"SELECT coalesce(sum(cast(label AS INTEGER)), 0) FROM read_parquet('{s}')"
+                ).fetchone()
+                return int(r[0]) if r else 0
+
+            def _q_max_dtm(p: Path) -> Optional[Any]:
+                s = str(p).replace("'", "''")
+                r = con.execute(
+                    f"SELECT max(payout_complete_dtm) FROM read_parquet('{s}')"
+                ).fetchone()
+                if r is None or r[0] is None:
+                    return None
+                return pd.Timestamp(r[0])
+
+            n_train = _q_count(_train_path)
+            n_valid = _q_count(_valid_path)
+            n_test = _q_count(_test_path)
+            label1_total = _q_label_sum(_train_path) + _q_label_sum(_valid_path) + _q_label_sum(_test_path)
+            train_end_max = _q_max_dtm(_train_path)
+            return (n_train, n_valid, n_test, label1_total, train_end_max)
+        finally:
+            con.close()
+
+    def _step7_pandas_fallback(
+        chunk_paths: List[Path],
+        train_frac: float,
+        valid_frac: float,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[Path], Optional[Path], Optional[Path]]:
+        """Pandas in-memory concat + sort + row-level split (Layer 3 fallback).
+        Returns (train_df, valid_df, test_df, None, None, None). Caller remains responsible for
+        R700 log and MIN_VALID_TEST_ROWS warnings.
+        Chunk Parquets must contain column payout_complete_dtm.
+        """
+        if not chunk_paths:
+            raise ValueError("chunk_paths must be non-empty")
+        if not (
+            0 < train_frac and 0 < valid_frac and train_frac + valid_frac < 1.0
+        ):
+            raise ValueError(
+                "train_frac and valid_frac must be in (0, 1) and "
+                "train_frac + valid_frac < 1.0"
+            )
+        all_dfs = [pd.read_parquet(p) for p in chunk_paths]
+        full_df = pd.concat(all_dfs, ignore_index=True)
+        if "payout_complete_dtm" not in full_df.columns:
+            raise ValueError(
+                "chunk Parquets must contain column payout_complete_dtm"
+            )
+        _payout_ts = pd.to_datetime(full_df["payout_complete_dtm"])
+        if _payout_ts.dt.tz is not None:
+            _payout_ts = _payout_ts.dt.tz_localize(None)
+        _sort_cols = ["_sort_ts_tmp"] + [
+            c for c in ("canonical_id", "bet_id") if c in full_df.columns
+        ]
+        full_df["_sort_ts_tmp"] = _payout_ts
+        full_df.sort_values(_sort_cols, kind="stable", na_position="last", inplace=True)
+        full_df.drop(columns=["_sort_ts_tmp"], inplace=True)
+        full_df.reset_index(drop=True, inplace=True)
+        n_rows = len(full_df)
+        if n_rows == 0:
+            raise ValueError("chunk_paths produced no rows")
+        _train_end_idx = int(n_rows * train_frac)
+        _valid_end_idx = int(n_rows * (train_frac + valid_frac))
+        _row_pos = np.arange(n_rows)
+        full_df["_split"] = np.select(
+            [_row_pos < _train_end_idx, _row_pos < _valid_end_idx],
+            ["train", "valid"],
+            default="test",
+        )
+        _split_col = full_df["_split"]
+        train_df = full_df[_split_col == "train"].reset_index(drop=True)
+        valid_df = full_df[_split_col == "valid"].reset_index(drop=True)
+        test_df = full_df[~(_split_col.isin(("train", "valid")))].reset_index(drop=True)
+        del full_df, _split_col
+        return (train_df, valid_df, test_df, None, None, None)
+
+    def _step7_sort_and_split(
+        chunk_paths: List[Path],
+        train_frac: float,
+        valid_frac: float,
+        *,
+        step6_runner: Optional[Callable[[float], List[Path]]] = None,
+        current_neg_frac: Optional[float] = None,
+    ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[Path], Optional[Path], Optional[Path]]:
+        """Orchestrator: DuckDB sort+split (Layer 1), OOM retry (Layer 2), or pandas fallback (Layer 3).
+        Returns (train_df, valid_df, test_df, train_path, valid_path, test_path). When STEP7_KEEP_TRAIN_ON_DISK
+        and DuckDB succeed, train_df is None and paths are set (train not loaded). When STEP9_EXPORT_LIBSVM too,
+        valid_df and test_df are not loaded (PLAN B+ 階段 6 第 2 步). Otherwise paths are None.
+        When STEP7_KEEP_TRAIN_ON_DISK and DuckDB fails, raises (no pandas fallback) per PLAN B+.
+        If DuckDB returns but read_parquet of the split files fails, falls back to pandas using chunk_paths.
+        """
+        if not STEP7_USE_DUCKDB:
+            return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
+        try:
+            train_path, valid_path, test_path = _duckdb_sort_and_split(
+                chunk_paths, train_frac, valid_frac
+            )
+            if STEP7_KEEP_TRAIN_ON_DISK:
+                if STEP9_EXPORT_LIBSVM:
+                    _step7_clean_duckdb_temp_dir()
+                    return (None, None, None, train_path, valid_path, test_path)
+                valid_df = pd.read_parquet(valid_path)
+                test_df = pd.read_parquet(test_path)
+                _step7_clean_duckdb_temp_dir()
+                return (None, valid_df, test_df, train_path, valid_path, test_path)
+            train_df = pd.read_parquet(train_path)
+            valid_df = pd.read_parquet(valid_path)
+            test_df = pd.read_parquet(test_path)
+            for p in (train_path, valid_path, test_path):
+                if p.exists():
+                    p.unlink(missing_ok=True)
+            _step7_clean_duckdb_temp_dir()
+            return (train_df, valid_df, test_df, None, None, None)
+        except Exception as exc:
+            if (
+                _is_duckdb_oom(exc)
+                and step6_runner is not None
+                and current_neg_frac is not None
+            ):
+                current = current_neg_frac
+                if not (0.0 < current_neg_frac <= 1.0):
+                    if STEP7_KEEP_TRAIN_ON_DISK:
+                        raise RuntimeError(
+                            "Step 7 STEP7_KEEP_TRAIN_ON_DISK is True and DuckDB failed; "
+                            "no pandas fallback. Reduce --days or add RAM."
+                        )
+                    logger.warning(
+                        "Step 7 Layer 2 skipped: current_neg_frac=%.2f not in (0, 1]; falling back to pandas.",
+                        current_neg_frac,
+                    )
+                    return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
+                new_frac = None
+                retries_left = 3
+                while True:
+                    step6_completed = False
+                    train_path: Optional[Path] = None  # type: ignore[no-redef]
+                    valid_path: Optional[Path] = None  # type: ignore[no-redef]
+                    test_path: Optional[Path] = None  # type: ignore[no-redef]
+                    try:
+                        new_frac, _ = _step7_oom_failsafe_next_frac(current)
+                        chunk_paths = step6_runner(new_frac)
+                        if not chunk_paths:
+                            raise ValueError("step6_runner returned no chunk paths")
+                        step6_completed = True
+                        train_path, valid_path, test_path = _duckdb_sort_and_split(
+                            chunk_paths, train_frac, valid_frac
+                        )
+                        if STEP7_KEEP_TRAIN_ON_DISK:
+                            if STEP9_EXPORT_LIBSVM:
+                                _step7_clean_duckdb_temp_dir()
+                                return (None, None, None, train_path, valid_path, test_path)
+                            valid_df = pd.read_parquet(valid_path)
+                            test_df = pd.read_parquet(test_path)
+                            _step7_clean_duckdb_temp_dir()
+                            return (None, valid_df, test_df, train_path, valid_path, test_path)
+                        train_df = pd.read_parquet(train_path)
+                        valid_df = pd.read_parquet(valid_path)
+                        test_df = pd.read_parquet(test_path)
+                        for p in (train_path, valid_path, test_path):
+                            if p is not None and p.exists():
+                                p.unlink(missing_ok=True)
+                        _step7_clean_duckdb_temp_dir()
+                        return (train_df, valid_df, test_df, None, None, None)
+                    except RuntimeError:
+                        raise
+                    except Exception as retry_exc:
+                        for p in (train_path, valid_path, test_path):
+                            if p is not None and p.exists():
+                                p.unlink(missing_ok=True)
+                        if (
+                            _is_duckdb_oom(retry_exc)
+                            and new_frac is not None
+                            and step6_completed
+                            and retries_left > 0
+                        ):
+                            logger.warning(
+                                "Step 7 DuckDB OOM retry with NEG_SAMPLE_FRAC=%.4f; re-ran Step 6.",
+                                new_frac,
+                            )
+                            current = new_frac
+                            retries_left -= 1
+                            continue
+                        if STEP7_KEEP_TRAIN_ON_DISK:
+                            raise RuntimeError(
+                                "Step 7 STEP7_KEEP_TRAIN_ON_DISK: DuckDB failed after retries; "
+                                "no pandas fallback. Reduce --days or add RAM."
+                            ) from retry_exc
+                        logger.warning(
+                            "Step 7 DuckDB failed (non-OOM) on retry; falling back to pandas: %s",
+                            retry_exc,
+                        )
+                        return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
+            if STEP7_KEEP_TRAIN_ON_DISK:
+                raise RuntimeError(
+                    "Step 7 STEP7_KEEP_TRAIN_ON_DISK is True and DuckDB failed; "
+                    "no pandas fallback. Reduce --days or add RAM."
+                ) from exc
+            if _is_duckdb_oom(exc):
+                logger.warning(
+                    "Step 7 DuckDB OOM; falling back to pandas in-memory sort+split: %s",
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "Step 7 DuckDB failed (non-OOM); falling back to pandas: %s",
+                    exc,
+                )
+            return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
+
+    # 5. Load all chunks, sort, row-level train/valid/test split (PLAN Step 7 Out-of-Core).
+    #    Orchestrator: DuckDB first (Layer 1), on failure pandas fallback (Layer 3).
     print("[Step 7/10] Load all chunks, concat, row-level train/valid/test split…", flush=True)
     t0 = time.perf_counter()
     _chunk_total_bytes = sum(Path(p).stat().st_size for p in chunk_paths)
@@ -2965,65 +4493,86 @@ def run_pipeline(args) -> None:
             _chunk_total_bytes / (1024**3),
             _est_ram_gb,
         )
-    all_dfs = [pd.read_parquet(p) for p in chunk_paths]
-    full_df = pd.concat(all_dfs, ignore_index=True)
-    logger.info("Total rows: %d  (label=1: %d)", len(full_df), int(full_df["label"].sum()))
+    # R803: validate fractions at runtime so misconfiguration is caught early (-O safe).
+    if not (TRAIN_SPLIT_FRAC + VALID_SPLIT_FRAC < 1.0):
+        raise ValueError(
+            f"TRAIN_SPLIT_FRAC ({TRAIN_SPLIT_FRAC}) + VALID_SPLIT_FRAC ({VALID_SPLIT_FRAC}) "
+            "must be < 1.0 to leave room for the test set"
+        )
 
-    # 6. Row-level time-ordered split (SSOT §9.2, todo-row-level-time-split).
-    #    Sort the concatenated dataset strictly by time, then assign the first
-    #    TRAIN_SPLIT_FRAC rows to "train", the next VALID_SPLIT_FRAC to "valid",
-    #    and the remainder to "test".  This guarantees non-empty valid/test sets
-    #    regardless of how many monthly chunks are available.
-    #
-    #    DEC-018: payout_complete_dtm is tz-naive datetime64[ns] after apply_dq().
-    #    The defensive tz-strip below handles externally-sourced Parquet that may
-    #    not have gone through apply_dq().
-    # R803: validate fractions at runtime so misconfiguration is caught early.
-    assert TRAIN_SPLIT_FRAC + VALID_SPLIT_FRAC < 1.0, (
-        f"TRAIN_SPLIT_FRAC ({TRAIN_SPLIT_FRAC}) + VALID_SPLIT_FRAC ({VALID_SPLIT_FRAC}) "
-        f"must be < 1.0 to leave room for the test set"
+    def _run_step6(neg_frac: float) -> List[Path]:
+        """Re-run Step 6 with given neg_sample_frac and force_recompute=True (Layer 2 OOM retry)."""
+        paths: List[Path] = []
+        for _i, _chunk in enumerate(chunks):
+            _path = process_chunk(
+                _chunk,
+                canonical_map,
+                dummy_player_ids=dummy_player_ids,
+                use_local_parquet=use_local,
+                force_recompute=True,
+                profile_df=profile_df,
+                feature_spec=feature_spec,
+                feature_spec_hash=feature_spec_hash,
+                neg_sample_frac=neg_frac,
+            )
+            if _path is not None:
+                paths.append(_path)
+            gc.collect()
+        return paths
+
+    _step7_result = _step7_sort_and_split(
+        chunk_paths,
+        TRAIN_SPLIT_FRAC,
+        VALID_SPLIT_FRAC,
+        step6_runner=_run_step6,
+        current_neg_frac=_effective_neg_sample_frac,
     )
-    _payout_ts = pd.to_datetime(full_df["payout_complete_dtm"])
-    if _payout_ts.dt.tz is not None:
-        _payout_ts = _payout_ts.dt.tz_localize(None)
-
-    # Stable sort: primary = payout time, tiebreakers = canonical_id, bet_id.
-    # R704: use inplace operations to avoid intermediate DataFrame copies and reduce
-    # peak RAM during the sort step.
-    _sort_cols = ["_sort_ts_tmp"] + [
-        c for c in ("canonical_id", "bet_id") if c in full_df.columns
-    ]
-    full_df["_sort_ts_tmp"] = _payout_ts
-    full_df.sort_values(_sort_cols, kind="stable", na_position="last", inplace=True)
-    full_df.drop(columns=["_sort_ts_tmp"], inplace=True)
-    full_df.reset_index(drop=True, inplace=True)
-
-    n_rows = len(full_df)
-    _train_end_idx = int(n_rows * TRAIN_SPLIT_FRAC)
-    _valid_end_idx = int(n_rows * (TRAIN_SPLIT_FRAC + VALID_SPLIT_FRAC))
-    _row_pos = np.arange(n_rows)
-    full_df["_split"] = np.select(
-        [_row_pos < _train_end_idx, _row_pos < _valid_end_idx],
-        ["train", "valid"],
-        default="test",
+    train_df, valid_df, test_df, step7_train_path, step7_valid_path, step7_test_path = _step7_result
+    _train_libsvm: Optional[Path] = None
+    _valid_libsvm: Optional[Path] = None
+    _test_libsvm: Optional[Path] = None
+    if step7_train_path is not None:
+        # R202 Review #3: guard so _step7_metadata_from_paths never receives None (B+ path contract).
+        if step7_valid_path is None or step7_test_path is None:
+            raise ValueError(
+                "step7_valid_path and step7_test_path must be set when step7_train_path is set (B+ path)."
+            )
+        # PLAN B+ Stage 1–2: train not loaded; get metadata and sample for Step 8 from file.
+        _n_train, _n_valid, _n_test, _label1_total, _train_end_max = _step7_metadata_from_paths(
+            step7_train_path, step7_valid_path, step7_test_path
+        )
+        _total_rows = _n_train + _n_valid + _n_test
+        _label1 = _label1_total
+        _actual_train_end = _train_end_max
+        _sample_n_disk = (
+            int(STEP8_SCREEN_SAMPLE_ROWS)
+            if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1)
+            else 2_000_000
+        )
+        _train_for_screen = _read_parquet_head(step7_train_path, _sample_n_disk)
+    else:
+        assert train_df is not None  # step7_train_path is None implies train was loaded in Step 7
+        assert valid_df is not None and test_df is not None  # pandas path always has both
+        _train_for_screen = None
+        _n_valid = len(valid_df)
+        _n_test = len(test_df)
+        _total_rows = len(train_df) + _n_valid + _n_test
+        _label1 = int(train_df["label"].sum()) + int(valid_df["label"].sum()) + int(test_df["label"].sum())
+        _actual_train_end = train_df["payout_complete_dtm"].max() if not train_df.empty else None
+    _train_cols = (
+        train_df.columns
+        if train_df is not None
+        else (_train_for_screen.columns if _train_for_screen is not None else pd.Index([]))
     )
-
-    # R-371-4: use reset_index(drop=True) instead of .copy() to avoid the peak where
-    # full_df + three simultaneous copies all occupy RAM.  reset_index creates a
-    # new contiguous DataFrame (safe for downstream inplace operations) without the
-    # .copy() pattern that triples the instantaneous allocation.
-    _split_col = full_df["_split"]
-    train_df = full_df[_split_col == "train"].reset_index(drop=True)
-    valid_df  = full_df[_split_col == "valid"].reset_index(drop=True)
-    test_df   = full_df[~(_split_col.isin(("train", "valid")))].reset_index(drop=True)
-    del full_df, _split_col  # R802: release concat buffer after split
+    n_rows = _total_rows  # for downstream summary (artifact, logs)
+    _n_train_print = _n_train if step7_train_path is not None else (len(train_df) if train_df is not None else 0)
+    logger.info("Total rows: %d  (label=1: %d)", _total_rows, _label1)
 
     # R700: compare row-level _actual_train_end against chunk-level train_end.
     # The canonical mapping cutoff (B1/R25 guard) always uses chunk-level train_end;
     # this log makes any semantic drift between the two boundaries observable.
     # R701 (known limitation): same run rows may be assigned to different split sets
     # at row-level boundaries — group-aware split is a long-term improvement.
-    _actual_train_end = train_df["payout_complete_dtm"].max() if not train_df.empty else None
     if _actual_train_end is not None and pd.notnull(_actual_train_end):
         _te_chunk = pd.Timestamp(train_end) if train_end else None
         # DEC-018: strip tz from _te_chunk so both sides are tz-naive for comparison
@@ -3050,28 +4599,30 @@ def run_pipeline(args) -> None:
                 "R700: chunk-level train_end (%s) matches row-level _actual_train_end (%s).",
                 _te_chunk, _te_row,
             )
+    _n_valid_print = _n_valid if valid_df is None else len(valid_df)
+    _n_test_print = _n_test if test_df is None else len(test_df)
     _el = time.perf_counter() - t0
-    print("[Step 7/10] Load all chunks, concat, row-level split done in %.1fs (train=%d valid=%d test=%d)" % (_el, len(train_df), len(valid_df), len(test_df)), flush=True)
+    print("[Step 7/10] Load all chunks, concat, row-level split done in %.1fs (train=%d valid=%d test=%d)" % (_el, _n_train_print, _n_valid_print, _n_test_print), flush=True)
     logger.info(
         "Row-level split (%.0f/%.0f/%.0f) — train: %d  valid: %d  test: %d  (load+sort+split: %.1fs)",
         TRAIN_SPLIT_FRAC * 100,
         VALID_SPLIT_FRAC * 100,
         (1.0 - TRAIN_SPLIT_FRAC - VALID_SPLIT_FRAC) * 100,
-        len(train_df), len(valid_df), len(test_df),
+        _n_train_print, _n_valid_print, _n_test_print,
         _el,
     )
-    if len(valid_df) < MIN_VALID_TEST_ROWS:
+    if _n_valid_print < MIN_VALID_TEST_ROWS:
         logger.warning(
             "Validation set has only %d rows (MIN_VALID_TEST_ROWS=%d); "
             "AP and Optuna results will be unreliable. "
             "Consider adding more --recent-chunks.",
-            len(valid_df), MIN_VALID_TEST_ROWS,
+            _n_valid_print, MIN_VALID_TEST_ROWS,
         )
-    if len(test_df) < MIN_VALID_TEST_ROWS:
+    if _n_test_print < MIN_VALID_TEST_ROWS:
         logger.warning(
             "Test set has only %d rows (MIN_VALID_TEST_ROWS=%d); "
             "backtester metrics will be unreliable.",
-            len(test_df), MIN_VALID_TEST_ROWS,
+            _n_test_print, MIN_VALID_TEST_ROWS,
         )
 
     active_feature_cols = get_all_candidate_feature_ids(feature_spec, screening_only=True)
@@ -3085,7 +4636,7 @@ def run_pipeline(args) -> None:
         _track_llm_cols = [
             cand.get("feature_id")
             for cand in (feature_spec.get("track_llm", {}) or {}).get("candidates", [])
-            if cand.get("feature_id") in train_df.columns
+            if cand.get("feature_id") in _train_cols
         ]
         if _track_llm_cols:
             logger.info(
@@ -3096,24 +4647,51 @@ def run_pipeline(args) -> None:
     else:
         _all_candidate_cols = active_feature_cols
 
-    # Only screen columns that actually exist in train_df (graceful degradation
-    # when tests or data sources don't produce all expected feature columns).
-    _present_candidate_cols = [c for c in _all_candidate_cols if c in train_df.columns]
+    # Only screen columns that actually exist in train (or train sample when B+ on disk).
+    _present_candidate_cols = [c for c in _all_candidate_cols if c in _train_cols]
     if not _present_candidate_cols:
         logger.warning(
             "screen_features: no candidate columns found in train_df — skipping screening"
         )
-        # R1004: restrict active_feature_cols to columns actually present in train_df
-        # so downstream training does not attempt to select absent columns.
-        active_feature_cols = [c for c in active_feature_cols if c in train_df.columns]
+        # R1004: restrict active_feature_cols to columns actually present in train.
+        active_feature_cols = [c for c in active_feature_cols if c in _train_cols]
         print("[Step 8/10] Feature screening skipped (no candidates)", flush=True)
     else:
+        # PLAN 方案 B 策略 A / B+ Stage 2: use sample from memory or from file (_train_for_screen from _read_parquet_head when on disk).
+        if train_df is not None:
+            _sample_n = STEP8_SCREEN_SAMPLE_ROWS if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1) else None
+            if _sample_n is not None:
+                _sample_n = int(_sample_n)  # Round 184 Review P2: coerce float to int before head()
+                _matrix_for_screen = train_df.head(_sample_n)
+                if len(_matrix_for_screen) < _sample_n:
+                    logger.info(
+                        "Step 8 screening: using first %d rows (train smaller than cap STEP8_SCREEN_SAMPLE_ROWS=%d); full train has %d rows",
+                        len(_matrix_for_screen),
+                        _sample_n,
+                        len(train_df),
+                    )
+                else:
+                    logger.info(
+                        "Step 8 screening: using first %d rows (cap STEP8_SCREEN_SAMPLE_ROWS); full train has %d rows",
+                        len(_matrix_for_screen),
+                        len(train_df),
+                    )
+            else:
+                _matrix_for_screen = train_df
+        else:
+            _matrix_for_screen = _train_for_screen
+            logger.info(
+                "Step 8 screening: using first %d rows from train file (STEP7_KEEP_TRAIN_ON_DISK); full train has %d rows",
+                len(_matrix_for_screen),
+                _n_train_print,
+            )
         print("[Step 8/10] Feature screening…", flush=True)
         t0 = time.perf_counter()
         screened_cols = screen_features(
-            feature_matrix=train_df,
-            labels=train_df["label"],
+            feature_matrix=_matrix_for_screen,
+            labels=_matrix_for_screen["label"],
             feature_names=_present_candidate_cols,
+            screen_method=SCREEN_FEATURES_METHOD,
         )
         _el = time.perf_counter() - t0
         print("[Step 8/10] Feature screening done in %.1fs (%d -> %d features)" % (_el, len(_present_candidate_cols), len(screened_cols)), flush=True)
@@ -3130,7 +4708,7 @@ def run_pipeline(args) -> None:
             else set()
         )
         if _yaml_track_human and not _screened_set.intersection(_yaml_track_human):
-            _missing_track_b = [c for c in _yaml_track_human if c in train_df.columns]
+            _missing_track_b = [c for c in _yaml_track_human if c in _train_cols]
             if _missing_track_b:
                 logger.warning(
                     "screen_features: no track_human features survived screening — "
@@ -3141,6 +4719,26 @@ def run_pipeline(args) -> None:
                     c for c in _missing_track_b if c not in _screened_set
                 ]
         active_feature_cols = screened_cols
+
+    # PLAN B+ Stage 2: load train from file after screening so export/Step 9 have train_df.
+    if step7_train_path is not None:
+        if STEP9_EXPORT_LIBSVM and active_feature_cols:
+            assert step7_valid_path is not None and step7_test_path is not None  # R202 guard
+            _train_libsvm, _valid_libsvm, _test_libsvm = _export_parquet_to_libsvm(
+                step7_train_path,
+                step7_valid_path,
+                active_feature_cols,
+                DATA_DIR / "export",
+                test_path=step7_test_path,
+            )
+        train_df = pd.read_parquet(step7_train_path)
+        if step7_train_path.exists():
+            step7_train_path.unlink(missing_ok=True)
+        logger.info(
+            "Step 7 B+: loaded train from file after screening (%d rows)%s",
+            len(train_df),
+            "; valid/test left on disk (B+ 階段 6 第 2 步)" if (valid_df is None and test_df is None) else "",
+        )
 
     if not active_feature_cols:
         # R1613: explicit guardrail message for zero-feature situations.  In
@@ -3155,13 +4753,26 @@ def run_pipeline(args) -> None:
         logger.warning(msg)
         print(msg, flush=True)
         _placeholder_col = "bias"  # constant feature for integration/debug runs (R1605: named via explicit variable)
-        if _placeholder_col not in train_df.columns:
+        if train_df is not None and _placeholder_col not in train_df.columns:
             train_df[_placeholder_col] = 0.0
-        if not valid_df.empty and _placeholder_col not in valid_df.columns:
+        if valid_df is not None and not valid_df.empty and _placeholder_col not in valid_df.columns:
             valid_df[_placeholder_col] = 0.0
         if test_df is not None and not test_df.empty and _placeholder_col not in test_df.columns:
             test_df[_placeholder_col] = 0.0
         active_feature_cols = [_placeholder_col]
+
+    # Plan B: export train/valid to CSV when training from file (PLAN 方案 B §3).
+    # Skip when B+ LibSVM path (valid_df not loaded) — validation uses LibSVM from file.
+    if STEP9_TRAIN_FROM_FILE and train_df is not None and valid_df is not None:
+        _export_dir = DATA_DIR / "export"
+        _train_csv, _valid_csv = _export_train_valid_to_csv(
+            train_df, valid_df, active_feature_cols, _export_dir
+        )
+        print(
+            "[Plan B] Exported train/valid to %s and %s"
+            % (_train_csv, _valid_csv),
+            flush=True,
+        )
 
     # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
     #    test_df is passed so test-set metrics and feature importance are
@@ -3169,12 +4780,16 @@ def run_pipeline(args) -> None:
     print("[Step 9/10] Train single rated model (Optuna + LightGBM) + test-set eval…", flush=True)
     t0 = time.perf_counter()
     model_version = get_model_version()
+    _libsvm_paths = (_train_libsvm, _valid_libsvm) if (_train_libsvm is not None and _valid_libsvm is not None) else None
     rated_art, _, combined_metrics = train_single_rated_model(
         train_df,
         valid_df,
         active_feature_cols,
         run_optuna=not skip_optuna,
         test_df=test_df,
+        train_from_file=STEP9_TRAIN_FROM_FILE,
+        train_libsvm_paths=_libsvm_paths,
+        test_libsvm_path=_test_libsvm,
     )
     _el = time.perf_counter() - t0
     print("[Step 9/10] Train single rated model + test-set eval done in %.1fs" % _el, flush=True)
