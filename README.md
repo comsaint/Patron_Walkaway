@@ -47,6 +47,20 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 
 **資料（訓練/回測）**：預設為 ClickHouse，請確認 `SOURCE_DB` 與憑證正確。本地 Parquet（開發/測試）：在專案根目錄放置 `data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet`（可選 `data/player_profile.parquet`），執行 trainer 或 backtester 時加上 `--use-local-parquet`。
 
+### Data loading & preprocessing
+
+不論資料來自 Parquet、ClickHouse 或 ETL，進入 pipeline 前一律先經 **Post-Load Normalizer**（`trainer/schema_io.py` 的 `normalize_bets_sessions`），再進行 DQ、特徵或寫出，以保證型別契約一致。須經 normalizer 的入口如下：
+
+| 入口 | 取得資料後 |
+|------|------------|
+| **trainer** `process_chunk()` | 先 cache key(raw)，再 normalize，再 `apply_dq` |
+| **trainer** sessions-only | normalize(sessions)，再 `apply_dq` |
+| **backtester** `main()` | load 後 normalize，再 `backtest()` → `apply_dq` |
+| **scorer** `score_once()` | `fetch_recent_data()` 後 normalize，再 `build_features_for_scoring` |
+| **etl_player_profile** | 取得 `sessions_raw` 後、D2 join / `_compute_profile` 前 `normalize_bets_sessions(pd.DataFrame(), sessions_raw)` |
+
+詳見 `.cursor/plans/PLAN.md` § Post-Load Normalizer 與 `trainer/schema_io.py` 模組說明。
+
 ### 使用方式
 
 **訓練（完整流程）**（在專案根目錄）：

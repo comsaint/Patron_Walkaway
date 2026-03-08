@@ -98,10 +98,13 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 3 | **Step 7 Out-of-Core 排序 + OOM Failsafe** | completed（含 Layer 2 failsafe） | 下方「Step 7 Out-of-Core 排序 + OOM Failsafe 計畫」一節 |
 | 4 | **方案 B：LightGBM 從檔案訓練** | completed（Round 198 狀態更新；R199 審查邊界條件已於 Round 201 修正：valid 缺欄不 KeyError、export common_cols 空時拋 ValueError；Config、Step 8、CSV 匯出、從檔案訓練、Booster 包裝、R191/193/197 已完成；手動 pipeline 比對可選） | 下方「方案 B：LightGBM 從檔案訓練」一節 |
 | 5 | **方案 B+：LibSVM + 完整 OOM 避免** | 階段 1–6 已完成（階段 6 第 3 步 Test 從檔案 predict 已於 Round 220 實作） | 下方「方案 B+：LibSVM 匯出與完整 OOM 避免計畫」一節 |
+| 6 | **Train–Serve Parity：Scorer / Backtester 與 trainer 對齊** | 完成（Round 221：Scorer + Backtester 打分前準備；Round 222：Backtester player_profile PIT join、Track LLM 在完整 bets 上計算後 merge 再 label） | 下方「Train–Serve Parity：Scorer / Backtester 與 trainer.py 對齊規格」一節；R221 審查風險已轉為 tests（test_review_risks_round221_train_serve_parity.py） |
+
+**Plan 狀態摘要（Round 223）**：上表 1～6 項均為 **completed**，無剩餘必要項目。tests/typecheck/lint 已全過（見 STATUS.md Round 223）。
 
 **建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。
 
-**可選／後續**：OOM 預檢查（Step 6 以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC）已於 Round 210/211/212 實作並通過 Review 修復（chunk 1 探針、path1_rerun 為 None 時保留 path1、psutil 改攔 Exception 健壯性）；規格見「OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC」一節。
+**可選／後續**（非阻斷）：(1) OOM 預檢查（Step 6 以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC）已於 Round 210/211/212 實作並通過 Review 修復；規格見「OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC」一節。(2) Round 222 Review 建議之 production 補強（Track LLM 失敗 warning、canonical_ids=[]、use_local_parquet 參數、candidates 型別防呆）可依優先度排入。
 
 ---
 
@@ -927,6 +930,47 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 4. Phase 4：Scorer 接上 normalizer，`build_features_for_scoring` 不再對 categorical 欄位 to_numeric。
 5. Phase 5：ETL 在取得 `sessions_raw` 後呼叫 normalizer，加註解/文件。
 6. Phase 6：專案文件新增/更新「Data loading & preprocessing」小節。
+
+---
+
+## Train–Serve Parity：Scorer / Backtester 與 trainer.py 對齊規格
+
+本節為 **scorer.py** 與 **backtester.py** 與 **trainer.py** 行為對齊的單一規格來源（專案關鍵）。實作與審查時須依此檢查，確保訓練、回測、即時推論三者特徵與評分契約一致。
+
+### 原則
+
+- **Trainer 為對齊基準**：Scorer 與 Backtester 的資料欄位、特徵計算順序、打分前準備（欄位補齊、dtype、profile vs 非 profile 填值）須與 `trainer.py`（含 `process_chunk`、`apply_dq`、`add_track_b_features`、Track LLM、player_profile PIT join、artifact 使用方式）一致。
+- **Post-Load Normalizer**：三者皆在載入 raw 資料後、業務邏輯前呼叫 `normalize_bets_sessions`（見上方「Post-Load Normalizer」一節）。
+
+### H2 session_avail_dtm（Backtester 不實作）
+
+- **SSOT §4.2**：Session 資料「可用」定義為 `session_avail_dtm = COALESCE(session_end_dtm, lud_dtm)` 且 `session_avail_dtm <= 當前時間 - SESSION_AVAIL_DELAY_MIN`（H2 gate）。
+- **Scorer**：即時拉取時**必須**套用 H2（只拉已可用 session），與 identity 的 available-time gate 一致。
+- **Trainer**：`load_clickhouse_data` 的 session 查詢**不**套用 H2；訓練使用視窗內所有 session。
+- **Backtester**：**不實作 H2**，與 trainer 行為一致。回測評估「視窗內所有已寫入的 session」，不模擬即時資料延遲。若未來需「模擬線上資料可用性」可選配 H2，但非預設規格。
+
+### Scorer 對齊項目（與 trainer 一致）
+
+| 項目 | 規格 | 說明 |
+|------|------|------|
+| **Bet 查詢含 gaming_day** | Scorer 的 `fetch_recent_data` bet SELECT 須包含與 trainer `_BET_SELECT_COLS` 一致的 `gaming_day` 來源（如 `COALESCE(gaming_day, toDate(payout_complete_dtm)) AS gaming_day`）。 | 避免日後依賴 gaming_day 的特徵或邏輯在 serve 端缺欄。 |
+| **Session casino_player_id 清洗** | 與 trainer / config 一致。Trainer 使用 `CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END`；scorer 使用 `config.CASINO_PLAYER_ID_CLEAN_SQL` 時須確保未設定時預設與上述語意一致，或文件明確要求必須設定該 config。 | D2 身份與 rated 判定與訓練一致。 |
+| **其餘** | 已對齊：normalize、identity、Track B、Track LLM、player_profile PIT join、`coerce_feature_dtypes`、artifact 與 feature_list_meta 使用方式。 | 維持現有實作即可。 |
+
+### Backtester 對齊項目（與 trainer 一致）
+
+| 項目 | 規格 | 說明 |
+|------|------|------|
+| **player_profile PIT join** | **必須**。Backtester 須與 trainer 相同方式載入 player_profile（如 `load_player_profile` 或 `data/player_profile.parquet`），並在 label 過濾後、打分前呼叫 `join_player_profile(labeled, profile_df)`。非 profile 補 0、profile 無 snapshot 留 NaN（R74/R79）。 | 模型 artifact 含 track_profile 特徵；缺 join 會導致輸入缺欄或與訓練不一致。 |
+| **Track LLM 計算順序與輸入** | **必須**。在 **完整 bets**（`add_track_b_features` 之後、`compute_labels` 之前）上呼叫 `compute_track_llm_features(bets, feature_spec=..., cutoff_time=window_end)`，再 merge 回 bets，然後才 `compute_labels` 與時間過濾得到 `labeled`。與 trainer `process_chunk` 順序一致。 | 若在已過濾的 `labeled` 上計算 Track LLM，rolling/歷史視窗會缺少上下文，與訓練特徵不一致。 |
+| **打分前欄位與 dtype** | **必須**。打分前須：(1) 依 artifact 的 feature_list / feature_list_meta 區分 profile 與非 profile；(2) 缺欄時非 profile 補 0、profile 補 NaN；(3) 呼叫 `coerce_feature_dtypes(labeled, feature_list)`；(4) 以 **完整** artifact feature 列表（與順序）傳入 `predict_proba`，不得以「僅存在於 df 的欄位」縮減。 | 與 trainer / scorer 的 `_score_df` 前準備一致；缺欄或 dtype 不一致會導致評分與訓練/線上不一致。 |
+| **H2 session_avail_dtm** | **不實作**（見上）。 | 與 trainer 一致。 |
+
+### 實作與審查檢查清單
+
+- [x] Scorer：bet 查詢含 `gaming_day`；session `casino_player_id` 與 config/trainer 一致。（Round 221 已完成）
+- [x] Backtester：player_profile PIT join；Track LLM 在完整 bets 上計算後 merge 再 label。（Round 222 完成；打分前補齊欄位 + `coerce_feature_dtypes` + 完整 feature 矩陣已於 Round 221 完成）
+- [x] 確認 Backtester 未套用 H2 session_avail_dtm 過濾（與 trainer 行為一致；規格明訂不實作）。
 
 ---
 

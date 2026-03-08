@@ -88,6 +88,7 @@ try:
     from labels import compute_labels  # type: ignore[import]
     from identity import build_canonical_mapping_from_df  # type: ignore[import]
     from schema_io import normalize_bets_sessions  # type: ignore[import]
+    from features import coerce_feature_dtypes  # type: ignore[import]
     from trainer import (  # type: ignore[import, attr-defined]
         MODEL_DIR,
         load_clickhouse_data,
@@ -96,6 +97,8 @@ try:
         add_track_b_features,
         compute_track_llm_features,
         load_feature_spec,
+        load_player_profile,
+        join_player_profile,
         _to_hk,
         HISTORY_BUFFER_DAYS,
     )
@@ -103,6 +106,7 @@ except ModuleNotFoundError:
     from trainer.labels import compute_labels  # type: ignore[import]
     from trainer.identity import build_canonical_mapping_from_df  # type: ignore[import]
     from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
+    from trainer.features import coerce_feature_dtypes  # type: ignore[import]
     from trainer.trainer import (  # type: ignore[import]
         MODEL_DIR,
         load_clickhouse_data,
@@ -111,6 +115,8 @@ except ModuleNotFoundError:
         add_track_b_features,
         compute_track_llm_features,
         load_feature_spec,
+        load_player_profile,
+        join_player_profile,
         _to_hk,
         HISTORY_BUFFER_DAYS,
     )
@@ -179,14 +185,20 @@ def load_dual_artifacts() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _score_df(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.DataFrame:
-    """Add ``score`` column to *df* using the single rated model (v10 DEC-021)."""
+    """Add ``score`` column to *df* using the single rated model (v10 DEC-021).
+
+    PLAN § Train–Serve Parity: uses full artifact feature list (order and set)
+    for predict_proba; caller must ensure all columns exist (non-profile 0, profile NaN).
+    """
     df = df.copy()
     df["score"] = 0.0
 
     bundle = artifacts.get("rated")
     if bundle is not None and not df.empty:
-        avail = [c for c in bundle["features"] if c in df.columns]
-        df["score"] = bundle["model"].predict_proba(df[avail])[:, 1]
+        model_features = list(bundle.get("features") or [])
+        if model_features:
+            # Full feature list for train-serve parity (PLAN § Train–Serve Parity).
+            df["score"] = bundle["model"].predict_proba(df[model_features])[:, 1]
 
     return df
 
@@ -473,26 +485,16 @@ def backtest(
     # --- Track-B features (full history for context) ---
     bets = add_track_b_features(bets, canonical_map, window_end)
 
-    # --- Labels ---
-    labeled = compute_labels(bets_df=bets, window_end=window_end, extended_end=extended_end)
-    labeled = labeled[~labeled["censored"]].copy()
-    labeled = labeled[
-        (labeled["payout_complete_dtm"] >= ws_naive)
-        & (labeled["payout_complete_dtm"] < we_naive)
-    ].copy()
-    if labeled.empty:
-        return {"error": "No rows after label filtering"}
-
-    # --- Track LLM & default fills ---
+    # --- Track LLM on FULL bets (PLAN § Train–Serve Parity) ---
+    # Compute before label filtering so window features see same history as trainer/scorer.
     _spec_path = MODEL_DIR / "feature_spec.yaml"
     if _spec_path.exists():
         feature_spec = load_feature_spec(_spec_path)
     else:
         feature_spec = load_feature_spec(Path(__file__).parent / "feature_spec" / "features_candidates.template.yaml")
-
     try:
         _bets_llm_result = compute_track_llm_features(
-            labeled,
+            bets,
             feature_spec=feature_spec,
             cutoff_time=window_end,
         )
@@ -505,13 +507,37 @@ def backtest(
             if fid and fid in _bets_llm_result.columns
         ]
         if _bets_llm_feature_cols and "bet_id" in _bets_llm_result.columns:
-            labeled = labeled.merge(
+            bets = bets.merge(
                 _bets_llm_result[["bet_id"] + _bets_llm_feature_cols].drop_duplicates("bet_id"),
                 on="bet_id",
                 how="left",
             )
     except Exception as exc:
-        logger.error(f"Track LLM failed in backtester: {exc}")
+        logger.error("Track LLM failed in backtester: %s", exc)
+
+    # --- Labels ---
+    labeled = compute_labels(bets_df=bets, window_end=window_end, extended_end=extended_end)
+    labeled = labeled[~labeled["censored"]].copy()
+    labeled = labeled[
+        (labeled["payout_complete_dtm"] >= ws_naive)
+        & (labeled["payout_complete_dtm"] < we_naive)
+    ].copy()
+    if labeled.empty:
+        return {"error": "No rows after label filtering"}
+
+    # --- player_profile PIT join (PLAN § Train–Serve Parity) ---
+    _rated_cids = (
+        list(canonical_map["canonical_id"].astype(str).unique())
+        if not canonical_map.empty
+        else None
+    )
+    profile_df = load_player_profile(
+        window_start,
+        window_end,
+        use_local_parquet=False,
+        canonical_ids=_rated_cids,
+    )
+    labeled = join_player_profile(labeled, profile_df)
 
     # Zero-fill non-profile artifact features (R127-1 / train-serve parity).
     # Profile features keep NaN when no snapshot exists — LightGBM uses its
@@ -534,6 +560,15 @@ def backtest(
         if col not in labeled.columns:
             labeled[col] = 0
     if _non_profile_artifact:
+        labeled[_non_profile_artifact] = labeled[_non_profile_artifact].fillna(0)
+    # PLAN § Train–Serve Parity: profile columns as NaN when missing (R74/R79).
+    for col in _profile_in_artifact:
+        if col not in labeled.columns:
+            labeled[col] = np.nan
+
+    # PLAN § Train–Serve Parity: coerce dtypes before score (train-serve parity with trainer/scorer).
+    if _artifact_features:
+        coerce_feature_dtypes(labeled, _artifact_features)
         labeled[_non_profile_artifact] = labeled[_non_profile_artifact].fillna(0)
 
     # --- H3: mark rated observations ---

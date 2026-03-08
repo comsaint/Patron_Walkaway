@@ -8,19 +8,17 @@ Tests-only: no production code changes.
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-import pandas as pd
 from zoneinfo import ZoneInfo
 
 import trainer.trainer as trainer_mod
-from trainer.trainer import ensure_player_profile_ready, run_pipeline
+from trainer.trainer import ensure_player_profile_ready
 
 HK_TZ = ZoneInfo("Asia/Hong_Kong")
 

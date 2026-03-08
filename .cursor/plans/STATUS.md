@@ -10371,3 +10371,408 @@ All checks passed!
 ### 下一步建議
 - 方案 B+ 階段 1–6 已完成；可依 PLAN 可選項或新需求進行。
 
+---
+
+## Round 221 — PLAN Train–Serve Parity（Scorer + Backtester 對齊，下 1–2 步）
+
+**目標**：依 PLAN「Train–Serve Parity：Scorer / Backtester 與 trainer.py 對齊規格」實作**下 1–2 步**（不貪多）：(1) Scorer 對齊；(2) Backtester 打分前 coerce + 完整 feature 矩陣。
+
+### 改了哪些檔
+
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/scorer.py` | **fetch_recent_data**：Bet 查詢新增 `COALESCE(gaming_day, toDate(payout_complete_dtm)) AS gaming_day`，與 trainer `_BET_SELECT_COLS` 一致。**casino_player_id**：預設改為與 config/trainer 相同之 SQL 片段（`CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END`），未設定 `CASINO_PLAYER_ID_CLEAN_SQL` 時仍與訓練端 D2 語意一致。 |
+| `trainer/backtester.py` | **import**：新增 `coerce_feature_dtypes`（from features / trainer.features）。**backtest()**：在 R127-1 零填後補齊 profile 欄位為 NaN（PLAN R74/R79）；呼叫 `coerce_feature_dtypes(labeled, _artifact_features)` 後再填非 profile 0；然後才 H3 與 **Score**。**_score_df**：改為以 **完整** artifact `features` 列表傳入 `predict_proba(df[model_features])`，不再以「僅存在於 df 的欄位」縮減（PLAN § 打分前欄位與 dtype）。 |
+
+### 手動驗證
+
+- **Scorer**：有 ClickHouse 時執行 `python -m trainer.scorer --once --lookback-hours 1`，確認 bet 查詢不報錯且回傳 DataFrame 含 `gaming_day` 欄位；無 config 覆寫時 session 的 `casino_player_id` 應為上述 CASE 語意（可查 log 或斷點）。
+- **Backtester**：執行 `python -m trainer.backtester --skip-optuna`（或 `--use-local-parquet` 若有資料），確認 backtest 完成、`out_backtest/backtest_metrics.json` 與 `backtest_predictions.parquet` 產出正常；若 artifact 含 track_profile 特徵，缺 profile 時應為 NaN 且 coerce 後再打分。
+
+### 下一步建議
+
+- PLAN 同節尚未實作：**Backtester** 的 (1) **player_profile PIT join**、(2) **Track LLM 在完整 bets 上計算後 merge 再 label**。建議下一輪實作其中一項或兩項，再更新檢查清單。
+
+### pytest 結果（本輪）
+
+```
+python -m pytest tests/ -q
+777 passed, 4 skipped, 29 warnings, 5 subtests passed in 19.50s
+```
+
+---
+
+## Round 221 Review — Train–Serve Parity 變更程式審查
+
+**審查範圍**：Round 221 變更（scorer: gaming_day + casino_player_id 預設；backtester: coerce_feature_dtypes、profile NaN 補齊、_score_df 完整 feature 矩陣）。
+
+**結論**：變更符合 PLAN § Train–Serve Parity 規格，邏輯正確。下列為潛在 bug／邊界條件／安全性／效能與建議測試，供後續修復或加測時使用。
+
+---
+
+### 1. 邊界條件：feature_list_meta 條目缺 `"name"` 時 KeyError
+
+**問題**：`backtester.py` 中 `_profile_in_artifact = { e["name"] for e in _artifact_meta if ... }` 假設每個 `e` 皆有 `"name"`。若 `feature_list.json` 出現 `{"track": "track_profile"}` 而無 `"name"`（或舊格式），會觸發 `KeyError`。
+
+**具體修改建議**：改為 `e.get("name") for e in _artifact_meta ...`，並過濾掉 None：  
+`_profile_in_artifact = { name for e in _artifact_meta if isinstance(e, dict) and e.get("track") in ("track_profile", "profile") and (name := e.get("name")) is not None }`  
+或先取 `name = e.get("name")`，再 `if name: _profile_in_artifact.add(name)`，避免將 None 加入 set。
+
+**建議新增測試**：  
+- 契約測試：`load_dual_artifacts` 或 backtest 使用一組 mock artifacts，其中 `feature_list_meta` 含 `{"track": "track_profile"}` 但無 `"name"`，斷言不拋 KeyError，且 `_profile_in_artifact` 不包含該條目或 backtest 仍完成。  
+- 可選：`feature_list_meta` 含 `{"name": "x", "track": "track_profile"}` 與 `{"track": "track_profile"}`（無 name），斷言僅 "x" 被識別為 profile。
+
+---
+
+### 2. 邊界條件：_score_df 缺欄時 KeyError 無明確契約說明
+
+**問題**：`_score_df` 以 `df[model_features]` 傳入 `predict_proba`；若 caller 未補齊某個 artifact feature 欄位，會直接得到 pandas `KeyError`，除錯時不易區分「缺欄」與「欄名拼錯」。
+
+**具體修改建議**：在 `_score_df` 內、呼叫 `predict_proba` 前，檢查 `missing = [c for c in model_features if c not in df.columns]`；若 `missing` 非空，記錄 `logger.warning("Backtester _score_df: missing feature columns (will KeyError): %s", missing)` 或改為 `raise ValueError("Missing feature columns for scoring: %s" % missing)`，以明確契約（caller 須補齊所有 artifact 特徵）。
+
+**建議新增測試**：  
+- 單元或契約：mock artifacts 的 `features = ["feat_a", "feat_b"]`，傳入的 df 僅含 `feat_a`，斷言 (1) 若實作為 raise：捕獲 ValueError 且訊息含 "feat_b"；(2) 若實作為 log：不拋錯但 score 仍 0 或後續 KeyError 可被辨識為缺欄。
+
+---
+
+### 3. 邊界條件：coerce 後 non_profile 再 fillna(0) 與 profile 欄位
+
+**問題**：`coerce_feature_dtypes` 會把非數值轉成 NaN；緊接的 `labeled[_non_profile_artifact] = labeled[_non_profile_artifact].fillna(0)` 只對「非 profile」填 0，語意正確。但若 `coerce_feature_dtypes` 對某欄產生全 NaN（例如整欄為字串且無法轉數值），該欄在非 profile 時會被填 0；若該欄同時被誤判為 profile（例如 meta 與 artifact 不一致），則會保留 NaN。目前 profile / 非 profile 由同一套 _artifact_meta 與 _artifact_features 推得，理論上一致；僅在 meta 與 bundle["features"] 不一致時可能有模糊地帶。
+
+**具體修改建議**：維持現狀即可；可於 backtest() 註解中註明「coerce 後僅對 _non_profile_artifact 填 0，profile 欄位保持 NaN（含 coerce 產生的 NaN），與 trainer/scorer 一致」。
+
+**建議新增測試**：  
+- 可選：fixture 提供 labeled 中某非 profile 欄為字串列，coerce 後該欄全 NaN，再 fillna(0) 後斷言該欄全為 0；另有一 profile 欄為 NaN，斷言 coerce 後仍為 NaN、未被填 0。
+
+---
+
+### 4. 安全性：config.CASINO_PLAYER_ID_CLEAN_SQL 直接嵌入 SQL
+
+**問題**：scorer 將 `cid_sql`（來自 `getattr(config, "CASINO_PLAYER_ID_CLEAN_SQL", _default_cid_sql)`）直接以 f-string 嵌入 `session_query`（`{cid_sql} AS casino_player_id`）。若 config 被篡改或誤設為含 `;`、多語句或惡意片段，可能造成 SQL 注入或查詢失敗。
+
+**具體修改建議**：目前 config 為專案受控檔，風險低。若需強化：可限制 `CASINO_PLAYER_ID_CLEAN_SQL` 僅允許單一表達式（例如白名單：僅含 `CASE`、`WHEN`、`trim`、`lower`、`casino_player_id`、`NULL`、數字與括號），或在 docstring / PLAN 註明「CASINO_PLAYER_ID_CLEAN_SQL 須為受信任、單一 SQL 表達式，不可含多語句或使用者輸入」。
+
+**建議新增測試**：  
+- 可選：契約測試，讀取 config 後 assert `";" not in getattr(config, "CASINO_PLAYER_ID_CLEAN_SQL", "")`，或 assert 該值等於預期之 CASE 表達式常數。
+
+---
+
+### 5. 效能：backtester 重複填 0
+
+**問題**：backtest() 中先對 _non_profile_artifact 做 `labeled[_non_profile_artifact] = labeled[_non_profile_artifact].fillna(0)`，呼叫 `coerce_feature_dtypes` 後再執行一次 `labeled[_non_profile_artifact] = labeled[_non_profile_artifact].fillna(0)`。coerce 可能把部分 cell 轉成 NaN，第二次 fillna(0) 確屬必要；第一次 fillna(0) 是補「原本就缺的欄位」的 0。兩次均合理，僅為輕微重複賦值。
+
+**具體修改建議**：維持現狀；若未來優化，可考慮在 coerce 後只做一次「對 _non_profile_artifact 的 fillna(0)」，並在 coerce 前僅做「缺欄補 0／NaN」不先 fillna，以減少一次大區塊賦值。非必須。
+
+**建議新增測試**：無需為此加測。
+
+---
+
+### 6. 正確性：Scorer gaming_day 與 ClickHouse 型別
+
+**問題**：Scorer 使用 `COALESCE(gaming_day, toDate(payout_complete_dtm)) AS gaming_day`。若 ClickHouse 中 `gaming_day` 為 Date、`payout_complete_dtm` 為 DateTime，`toDate(payout_complete_dtm)` 與 trainer 一致；若時區或型別在不同環境不一致，可能導致回傳型別為 Date 或 DateTime，影響下游 pandas 型別。目前僅為欄位存在性與語意對齊，風險低。
+
+**具體修改建議**：維持現狀；若有實務問題，可在 scorer 取得 bets 後對 `gaming_day` 做統一 `pd.to_datetime(...).dt.date` 或保留為 date 的明確轉換並在 docstring 註明。
+
+**建議新增測試**：  
+- 可選：scorer 單元或整合測試，mock 或真實查詢後 assert `"gaming_day" in bets.columns` 且非全空。
+
+---
+
+### 審查彙總表
+
+| 類別       | 項目                                       | 嚴重度 | 建議 |
+|------------|--------------------------------------------|--------|------|
+| 邊界條件   | feature_list_meta 條目缺 `"name"` KeyError | 中     | 用 `e.get("name")` 並過濾 None；加測 |
+| 邊界條件   | _score_df 缺欄時 KeyError 不明確            | 低     | 缺欄時 log 或 raise 明確錯誤；加測 |
+| 邊界條件   | coerce 後 non_profile/profile 填值語意     | 低     | 註解即可；可選加測 |
+| 安全性     | CASINO_PLAYER_ID_CLEAN_SQL 嵌入 SQL        | 低     | 文件化「受信任單一表達式」；可選契約測 |
+| 效能       | backtester 兩次 fillna(0)                  | 低     | 可維持現狀 |
+| 正確性     | Scorer gaming_day 型別                     | 低     | 若有問題再統一轉換；可選 assert 欄存在 |
+
+---
+
+## Round 221 審查風險 → 最小可重現測試（僅 tests，未改 production）
+
+**目標**：將 Round 221 Review 所列風險點轉成契約／行為測試，不改 production code。
+
+### 新增檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/test_review_risks_round221_train_serve_parity.py` | R221 Review #1、#2、#4、#6 的契約／行為測試（#3、#5 依 Review 建議未加測）。 |
+
+### 測試與對應風險
+
+| 風險 | 測試類／方法 | 斷言內容 |
+|------|----------------|----------|
+| #1 feature_list_meta 缺 `"name"` KeyError | `TestR221FeatureListMetaNameKeyError::test_backtest_source_uses_name_from_meta_for_profile_set` | backtest 原始碼中建 _profile_in_artifact 使用 `e["name"]`（目前風險契約）；日後改為 `e.get("name")` 時須同步更新此測為要求安全寫法。 |
+| #2 _score_df 缺欄 KeyError 不明確 | `TestR221ScoreDfMissingColumnsKeyError::test_score_df_raises_keyerror_when_feature_column_missing` | 傳入 df 缺 bundle["features"] 中一欄、mock model 有 predict_proba 時，_score_df 拋 KeyError 且訊息含缺欄名；日後改為先檢查缺欄並 raise ValueError 時可改斷言為 ValueError。 |
+| #4 CASINO_PLAYER_ID_CLEAN_SQL 單一表達式 | `TestR221CasinoPlayerIdCleanSqlSingleExpression::test_config_casino_player_id_clean_sql_contains_no_semicolon` | config.CASINO_PLAYER_ID_CLEAN_SQL 字串中不包含 `";"`（單一表達式契約）。 |
+| #6 Scorer bet 查詢含 gaming_day | `TestR221ScorerBetQueryContainsGamingDay::test_scorer_fetch_recent_data_source_includes_gaming_day_in_bet_query` | fetch_recent_data 原始碼中 bet 查詢含 `"gaming_day"` 與 `"COALESCE(gaming_day"`（與 trainer _BET_SELECT_COLS 對齊）。 |
+
+（#3 coerce 後 fillna 語意、#5 效能：依 Review 建議未加測。）
+
+### 執行方式
+
+```bash
+# 僅跑本輪新增的 R221 審查風險測試
+python -m pytest tests/test_review_risks_round221_train_serve_parity.py -v
+
+# 全量測試（含 R221 共 4 支新測）
+python -m pytest tests/ -q
+```
+
+### pytest 結果（本輪新增後）
+
+```
+python -m pytest tests/test_review_risks_round221_train_serve_parity.py -v
+4 passed in ~0.9s
+
+python -m pytest tests/ -q
+781 passed, 4 skipped, 29 warnings, 5 subtests passed in ~19.4s
+```
+
+---
+
+## 驗證回合 — tests / typecheck / lint 全過（無改 production／無改 tests）
+
+**目標**：確認所有 tests、mypy、ruff 通過；不修改 tests（除非測試錯誤或 decorator 過時），不修改 production（本回合僅驗證）。
+
+**結果**：無需修改；pytest、mypy、ruff 均已通過。
+
+### 執行結果
+
+**pytest**
+```
+python -m pytest tests/ -q
+781 passed, 4 skipped, 29 warnings, 5 subtests passed in 19.54s
+```
+
+**mypy**
+```
+python -m mypy trainer/ --ignore-missing-imports
+Success: no issues found in 23 source files
+```
+（另有 4 則 annotation-unchecked 為 api_server 未加型別之函式，非錯誤。）
+
+**ruff**
+```
+ruff check trainer/
+All checks passed!
+```
+
+### 變更摘要
+- **Production**：無變更。
+- **Tests**：無變更。
+
+### PLAN.md 更新（本回合）
+- 項目 6「Train–Serve Parity」狀態更新為 **部分完成**（Scorer 已對齊；Backtester 打分前準備已完成；尚缺 Backtester player_profile PIT join、Track LLM 順序）。
+- 實作與審查檢查清單：Scorer 與 H2 兩項勾選完成；Backtester 保留未勾（player_profile、Track LLM 順序待實作）。
+
+### 剩餘項目（PLAN）
+- **Train–Serve Parity** 尚未完成：Backtester 須實作 (1) **player_profile PIT join**、(2) **Track LLM 在完整 bets 上計算後 merge 再 label**。其餘 PLAN 表列項目（1～5）均為 completed。
+
+---
+
+## Round 222 — PLAN Train–Serve Parity：Backtester player_profile PIT join + Track LLM 順序
+
+### 目標
+實作 PLAN「Train–Serve Parity」的下一 1–2 步：(1) Backtester **player_profile PIT join**；(2) Backtester **Track LLM 在完整 bets 上計算後 merge 再 label**（與 trainer `process_chunk` 順序一致）。
+
+### 改了哪些檔
+
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/backtester.py` | (1) 新增 import：`load_player_profile`、`join_player_profile`（自 trainer / trainer.trainer）。(2) **Track LLM 順序**：將 feature_spec 載入與 `compute_track_llm_features` 移至 **add_track_b_features 之後、compute_labels 之前**；改為對 **bets**（完整）呼叫 `compute_track_llm_features(bets, ...)`，結果 merge 回 **bets**，再執行 `compute_labels(bets_df=bets, ...)` 與時間過濾得到 `labeled`。(3) **player_profile PIT join**：在 label 過濾後、打分前呼叫 `profile_df = load_player_profile(window_start, window_end, use_local_parquet=False, canonical_ids=_rated_cids)`，再 `labeled = join_player_profile(labeled, profile_df)`。 |
+
+### 手動驗證
+- 執行一次 backtest（有 local parquet 或 ClickHouse）：  
+  `python -m trainer.backtester --use-local-parquet --skip-optuna`（或指定 `--start`/`--end`）。  
+  確認無 KeyError/缺欄；若存在 `data/player_profile.parquet`，日誌應出現 profile 載入與 join 相關訊息；若不存在，`join_player_profile` 會將 profile 欄位留 NaN（與規格一致）。
+- 與 trainer 順序對齊：Track LLM 現於「完整 bets」上計算後 merge，再 compute_labels；profile 於 labeled 過濾後、打分前 join。
+
+### 下一步建議
+- 將 PLAN 項目 6「Train–Serve Parity」實作檢查清單中 Backtester 兩項勾選完成（player_profile PIT join、Track LLM 順序已實作）。
+- 可選：Backtester 支援 `--use-local-parquet` 時一併傳入 `use_local_parquet` 給 `load_player_profile`，與 trainer 完全一致（目前 `profile_path.exists()` 時仍會用 local parquet）。
+
+### pytest 結果（Round 222 執行）
+
+```
+python -m pytest tests/ -q
+781 passed, 4 skipped, 29 warnings, 5 subtests passed in 21.32s
+```
+
+---
+
+## Round 222 Review — Train–Serve Parity 變更（Backtester PIT join + Track LLM 順序）程式審查
+
+**審查範圍**：Round 222 對 `trainer/backtester.py` 的變更（player_profile PIT join、Track LLM 在完整 bets 上計算後 merge 再 label）。對齊 PLAN § Train–Serve Parity、DEC-011、DEC-022/023。
+
+**審查結論**：實作與規格一致，順序正確。下列為建議補強項目（非阻斷上線），每項附**具體修改建議**與**希望新增的測試**。
+
+---
+
+### 1. Track LLM 失敗時靜默降級（正確性／可觀測性）
+
+**問題**：當 `compute_track_llm_features(bets, ...)` 拋出例外時，僅 `logger.error(...)`，`bets` 不帶任何 Track LLM 欄位；後續 zero-fill 會將 artifact 要求的 LLM 特徵全填 0，模型在錯誤輸入下打分，回測結果可能不可信，且使用者不易察覺。
+
+**具體修改建議**：
+- 在 `except` 區塊除現有 `logger.error` 外，增加一句 **warning** 明確說明：「Track LLM failed; artifact LLM features will be zero-filled. Backtest scores may be unreliable.」
+- 可選：在 `_score_df` 前檢查 artifact 的 `features` 中屬於 Track LLM 的欄位，若在 `labeled` 中多數缺失或全為常數 0，打 warning 或於 results 中加 `"track_llm_degraded": true`，供呼叫端判斷。
+
+**希望新增的測試**：
+- **行為**：mock `compute_track_llm_features` 使其 raise，呼叫 `backtest(...)`，assert 日誌中出現上述 warning 字樣（或 results 含 `track_llm_degraded`）。
+- **契約**：assert 在 Track LLM 失敗路徑下，`backtest` 仍回傳 dict（不 crash），且 `labeled` 中對應 artifact LLM 特徵為 0 或缺失並被 zero-fill。
+
+---
+
+### 2. canonical_map 為空時載入全表 profile（效能／邊界）
+
+**問題**：`_rated_cids = list(canonical_map["canonical_id"].astype(str).unique()) if not canonical_map.empty else None`。當 `canonical_map.empty` 時傳 `canonical_ids=None`，`load_player_profile(..., canonical_ids=None)` 會載入時間窗口內**全部** profile 列（無篩選），可能 OOM 或耗時；且此時沒有 rated 玩家，join 後無人 match，語意上不需 profile。
+
+**具體修改建議**：
+- **Backtester**：當 `canonical_map.empty` 時改傳 `canonical_ids=[]`（空 list），避免「無 rated 仍載入全表」。
+- **trainer.load_player_profile**（若尚未有）：在函式開頭加 early return：`if canonical_ids is not None and len(canonical_ids) == 0: return None`，避免對空 ID 列表仍讀取 Parquet。
+
+**希望新增的測試**：
+- **Backtester**：在 `canonical_map` 為空（或 sessions 無 casino_player_id）的 fixture 下執行 `backtest`，assert 傳給 `load_player_profile` 的 `canonical_ids` 為 `[]`（或透過 mock 確認未以 `None` 呼叫導致全表讀取）。
+- **load_player_profile**（可放在 trainer 或 etl 測試）：`canonical_ids=[]` 時不讀 Parquet、直接 return None（或等價行為）。
+
+---
+
+### 3. use_local_parquet 與資料來源一致（Parity／可選）
+
+**問題**：Backtester 固定傳 `load_player_profile(..., use_local_parquet=False)`。當使用者以 `--use-local-parquet` 載入 bets/sessions 時，profile 仍會依「local 檔存在與否」決定用 local 或 ClickHouse；若 local 不存在則走 ClickHouse，造成「bets/sessions 來自 local、profile 來自 ClickHouse」的資料來源不一致。
+
+**具體修改建議**：在 `backtest()` 新增參數 `use_local_parquet: bool = False`，並在 `main()` 依 `args.use_local_parquet` 傳入；呼叫 `load_player_profile(..., use_local_parquet=use_local_parquet)`。與 trainer 一致，且語意明確。
+
+**希望新增的測試**：
+- 以 `--use-local-parquet` 執行 backtester main（或直接呼叫 `backtest(..., use_local_parquet=True)`），mock 或 assert 傳給 `load_player_profile` 的 `use_local_parquet` 為 `True`。
+
+---
+
+### 4. feature_spec 結構邊界（健壯性）
+
+**問題**：`feature_spec.get("track_llm") or {}` 與 `.get("candidates", [])` 已防呆；若 `candidates` 存在但為非 list（例如 dict），`_llm_cand_ids` 可能出錯。機率低，但 YAML 被手動改壞時會觸發。
+
+**具體修改建議**：取得 candidates 後加型別檢查，例如 `_raw = (feature_spec.get("track_llm") or {}).get("candidates"); _candidates = _raw if isinstance(_raw, list) else []`，再從 `_candidates` 取 `feature_id`。
+
+**希望新增的測試**：
+- `feature_spec["track_llm"]["candidates"] = {}`（或非 list）時，backtest 不拋錯，且 Track LLM 欄位為空／zero-fill（與「無 candidates」行為一致）。
+
+---
+
+### 5. join_player_profile 未傳 feature_cols（Parity／維持現狀可接受）
+
+**說明**：Trainer 呼叫 `join_player_profile(labeled, profile_df)` 未傳 `feature_cols`，使用 `features.py` 預設 `PROFILE_FEATURE_COLS`。Backtester 亦未傳，行為一致。若未來 trainer 改為依 YAML/artifact 傳入 profile 欄位清單，Backtester 須同步改為同一來源（例如 artifact 或 feature_spec），以維持 parity。目前無需改動，僅作審查紀錄。
+
+**希望新增的測試**：無（現狀已與 trainer 一致）。
+
+---
+
+### 6. 安全性
+
+**結論**：本輪變更未新增使用者可控的 SQL/路徑注入；`load_player_profile`、`join_player_profile` 均為既有介面，無新安全性疑慮。R221 既有項目（如 CASINO_PLAYER_ID_CLEAN_SQL 單一表達式）仍由既有測試覆蓋。
+
+---
+
+### 審查摘要表
+
+| # | 類型       | 嚴重度 | 摘要                                           | 建議 |
+|---|------------|--------|------------------------------------------------|------|
+| 1 | 正確性     | P1     | Track LLM 失敗時靜默 zero-fill，結果可能不可信 | 加 warning／可選 results 旗標；補測試 |
+| 2 | 效能/邊界  | P1     | canonical_map 空時 profile 全表載入           | 傳 `[]` + load_player_profile early return；補測試 |
+| 3 | Parity     | P2     | use_local_parquet 未從 CLI 傳入                | 可選：backtest 參數 + main 傳遞；補測試 |
+| 4 | 健壯性     | P2     | feature_spec track_llm.candidates 非 list     | 型別防呆；補測試 |
+| 5 | Parity     | 紀錄   | join_player_profile 未傳 feature_cols          | 維持現狀；未來若 trainer 改則 backtester 同步 |
+| 6 | 安全性     | —      | 無新風險                                       | 無 |
+
+---
+
+## Round 222 審查風險 → 最小可重現測試（僅 tests，未改 production）
+
+### 目標與約束
+- 將 Round 222 Review 列出的風險點轉成最小可重現測試（或契約／source 守衛）。
+- **僅新增 tests**，不修改 production code。
+
+### 新增檔案
+- `tests/test_review_risks_round222_train_serve_parity.py`
+
+### 新增測試清單
+
+| 對應審查項 | 測試類別 | 測試名稱 | 說明 |
+|------------|----------|----------|------|
+| **#1 Track LLM 失敗靜默降級** | 契約 | `test_backtest_except_block_contains_track_llm_failed_log` | backtest() 的 except 區塊須含 "Track LLM failed"；目前 assert "zero-filled" 不在 source（production 補 warning 後改為 assertIn）。 |
+| **#1** | 行為 | `test_backtest_returns_dict_when_track_llm_raises` | mock `compute_track_llm_features` 拋錯，backtest 仍回傳 dict、不 crash（LLM 欄位由既有 zero-fill 補齊）。 |
+| **#2 canonical_map 空時全表載入** | 契約 | `test_backtest_source_passes_canonical_ids_to_load_player_profile` | backtest 呼叫 `load_player_profile(..., canonical_ids=_rated_cids)`，且 source 含 "else None"（canonical_map 空時）；production 改為傳 `[]` 後改 assert "else []" 或等價。 |
+| **#3 use_local_parquet 未傳入** | 契約 | `test_backtest_source_calls_load_player_profile_with_use_local_parquet_false` | backtest 目前寫死 `use_local_parquet=False`；production 改為參數傳遞後改 assert 參數來源。 |
+| **#4 candidates 非 list** | 契約 | `test_backtest_source_gets_candidates_with_default_list` | backtest 以 `.get("candidates", [])` 取得 track_llm candidates；production 加 isinstance 防呆後可補 assert。 |
+| **#4** | 行為 | `test_backtest_does_not_crash_when_candidates_is_dict` | `load_feature_spec` 回傳 `track_llm.candidates = dict` 時，backtest 不拋錯（mock 全路徑）。 |
+
+### 執行方式
+
+**僅跑 R222 審查風險測試：**
+```bash
+python -m pytest tests/test_review_risks_round222_train_serve_parity.py -v
+```
+
+**全套測試（含 R222）：**
+```bash
+python -m pytest tests/ -q
+```
+
+### 實際執行結果（本輪）
+
+**R222 測試：**
+```
+6 passed in 0.97s
+```
+
+**全套：**
+```
+787 passed, 4 skipped, 29 warnings, 5 subtests passed in 19.48s
+```
+
+### 備註
+- 未新增 lint/typecheck 規則；審查項均以 pytest 契約／行為測試覆蓋。
+- Production 依審查建議修復後，請依各測試 docstring 更新 assert（例如 #1 改為 assertIn "zero-filled"、#2 改為 assert "else []"、#4 可加 isinstance 契約）。
+
+---
+
+## Round 223 — tests/typecheck/lint 全通過（僅改 tests 以通過 lint）
+
+### 目標
+修改實作直到所有 tests、typecheck、lint 通過；不改測試邏輯（僅允許測試本身錯或 decorator 過時時改 tests）。本輪僅需修 tests 的 lint。
+
+### 修改摘要
+- **Tests**：未改任何測試邏輯。為通過 `ruff check trainer/ tests/`：
+  - 執行 `ruff check tests/ --fix`，自動移除 6 處未使用 import（F401）：`test_review_risks_round140.py`（inspect, timedelta, pandas, run_pipeline）、`test_review_risks_round220_plan_b_plus_stage6_step3.py`（trainer_mod）、`test_review_risks_round371.py`（re）。
+  - 於 5 處 E402（import 在 sys.path 之後）加上 `# noqa: E402`：`test_review_risks_round112.py`、`test_review_risks_round153.py`、`test_review_risks_round280.py`（2 行）、`test_schema_io.py`。
+- **Production**：無變更（trainer/ 原本即通過 ruff）。
+
+### 執行結果（本輪）
+
+**pytest**
+```
+python -m pytest tests/ -q
+787 passed, 4 skipped, 29 warnings, 5 subtests passed in 19.22s
+```
+
+**mypy**
+```
+python -m mypy trainer/ --ignore-missing-imports
+Success: no issues found in 23 source files
+```
+（另有 4 則 annotation-unchecked 在 api_server，非錯誤。）
+
+**ruff**
+```
+ruff check trainer/ tests/
+All checks passed!
+```
+
+### 下一步建議
+- 無；tests/typecheck/lint 已全過。可選：依 Round 222 Review 修 production（Track LLM warning、canonical_ids=[]、use_local_parquet 參數、candidates isinstance），再依 R222 測試 docstring 更新 assert。
+
+---
+

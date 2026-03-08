@@ -19,7 +19,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-import trainer.trainer as trainer_mod
+import trainer.trainer as trainer_mod  # noqa: E402
 
 
 def _make_sessions(now: datetime):

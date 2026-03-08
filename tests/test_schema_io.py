@@ -14,7 +14,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from trainer.schema_io import (
+from trainer.schema_io import (  # noqa: E402
     BET_CATEGORICAL_COLUMNS,
     SESSION_CATEGORICAL_COLUMNS,
     BET_KEY_NUMERIC_COLUMNS,

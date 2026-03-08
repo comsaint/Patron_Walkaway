@@ -259,10 +259,15 @@ def fetch_recent_data(
     sess_avail = end - timedelta(minutes=SESSION_AVAIL_DELAY_MIN)
     params: dict = {"start": start, "end": end, "bet_avail": bet_avail, "sess_avail": sess_avail}
     placeholder = getattr(config, "PLACEHOLDER_PLAYER_ID", -1)
+    # Train–serve parity (PLAN § Train–Serve Parity): default to same expression as trainer/config.
+    _default_cid_sql = (
+        "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "
+        "THEN NULL ELSE trim(casino_player_id) END"
+    )
     cid_sql = getattr(
         config,
         "CASINO_PLAYER_ID_CLEAN_SQL",
-        "casino_player_id",
+        _default_cid_sql,
     )
 
     bets_query = f"""
@@ -272,6 +277,7 @@ def fetch_recent_data(
             base_ha,
             bet_type,
             payout_complete_dtm,
+            COALESCE(gaming_day, toDate(payout_complete_dtm)) AS gaming_day,
             session_id,
             player_id,
             table_id,

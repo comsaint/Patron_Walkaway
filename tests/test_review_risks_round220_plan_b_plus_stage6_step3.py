@@ -12,7 +12,6 @@ from pathlib import Path
 
 import numpy as np
 
-import trainer.trainer as trainer_mod
 
 # Expected keys from _compute_test_metrics / _compute_test_metrics_from_scores (R220 Review #6)
 _EXPECTED_TEST_METRICS_KEYS = frozenset({

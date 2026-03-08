@@ -22,8 +22,8 @@ if _SettingWithCopyWarning is None:
     except ImportError:
         _SettingWithCopyWarning = None  # e.g. pandas 3.x without this warning class
 
-import trainer.duckdb_schema as duckdb_schema_mod
-import trainer.trainer as trainer_mod
+import trainer.duckdb_schema as duckdb_schema_mod  # noqa: E402
+import trainer.trainer as trainer_mod  # noqa: E402
 
 
 class TestR280ApplyDqRegressionGuards(unittest.TestCase):

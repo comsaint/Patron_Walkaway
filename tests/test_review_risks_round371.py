@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import inspect
 import pathlib
-import re
 import unittest
 
 import trainer.config as config_mod
