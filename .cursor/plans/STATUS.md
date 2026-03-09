@@ -6,6 +6,22 @@
 
 ---
 
+## join_player_profile OOM fix（90 天訓練 ArrayMemoryError）
+
+### 問題
+使用 `--days 90` 訓練時，Step 6 process_chunk 在第二個 chunk（約 30M 列）呼叫 `join_player_profile` 後，於 `merged.sort_values("_orig_idx").reset_index(drop=True)` 觸發單次 ~10 GiB 分配，導致 `numpy._core._exceptions._ArrayMemoryError: Unable to allocate 10.0 GiB for an array with shape (45, 29825213) and data type float64`。
+
+### 修改
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/features.py` | `join_player_profile`: 移除 `merged.sort_values("_orig_idx").reset_index(drop=True)`。Scatter 迴圈僅依 `_orig_idx` 做 `pd.Series(..., index=merged["_orig_idx"]).reindex(np.arange(len(result)))` 寫回 `result`，列序由 `result`（= `bets_df.copy()`）保持，無需對 `merged` 排序。移除該行可避免大 chunk 時之單次 10 GiB 分配，且不影響回傳列序、docstring「original row order and index are preserved」及所有呼叫端（trainer、backtester、測試）。加註解說明為何跳過 sort。 |
+
+### 備註
+- 回傳值為 `result`，非 `merged`；caller 僅依賴 `result` 與輸入 `bets_df` 同序，行為不變。
+- 若需還原排序行為（僅為除錯或比對），可暫時加回該行；生產環境建議維持移除以降低 OOM 風險。
+
+---
+
 ## Round 111 — 修復 Round 109 Review 風險點（使 Round 110 xfail 升 PASSED）
 
 ### 目標

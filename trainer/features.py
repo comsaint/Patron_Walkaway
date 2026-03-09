@@ -804,11 +804,13 @@ def join_player_profile(
         direction="backward",
     )
 
-    # Restore original row order.
     # R74: keep NaN for unmatched bets (non-rated or before first snapshot) —
     # LightGBM routes NaN to the trained default-child, which is semantically
     # correct; zero-fill would conflate "no data" with "zero activity".
-    merged = merged.sort_values("_orig_idx").reset_index(drop=True)
+    # Do not sort merged by _orig_idx here: the scatter below uses _orig_idx as
+    # index and reindex(), so row order of merged is irrelevant. Skipping the
+    # sort avoids a ~10 GiB allocation on large chunks (e.g. 90-day training)
+    # and prevents ArrayMemoryError in join_player_profile.
 
     # R800: when NaT rows were dropped before merge_asof, merged has fewer rows
     # than result.  Use _orig_idx to scatter values back into the correct positions;
