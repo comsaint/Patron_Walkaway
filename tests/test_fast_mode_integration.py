@@ -87,10 +87,20 @@ class _PipelineMixin:
         cmap = self._canonical_map_df if self._canonical_map_df is not None else _canonical_map()
         fake_df = _fake_chunk_df(chunks[-1]["window_start"])
 
+        from unittest.mock import MagicMock
+        _mock_canonical_parquet = MagicMock()
+        _mock_canonical_parquet.exists.return_value = False
+        _mock_canonical_cutoff = MagicMock()
+        _mock_canonical_cutoff.exists.return_value = False
         patches = {
             "get_monthly_chunks": patch("trainer.trainer.get_monthly_chunks", return_value=chunks),
             "load_local_parquet": patch("trainer.trainer.load_local_parquet", return_value=(pd.DataFrame(), pd.DataFrame())),
             "apply_dq": patch("trainer.trainer.apply_dq", return_value=(pd.DataFrame(), pd.DataFrame())),
+            "canonical_parquet": patch("trainer.trainer.CANONICAL_MAPPING_PARQUET", new=_mock_canonical_parquet),
+            "canonical_cutoff_json": patch("trainer.trainer.CANONICAL_MAPPING_CUTOFF_JSON", new=_mock_canonical_cutoff),
+            "build_links_dummy": patch("trainer.trainer.build_canonical_links_and_dummy_from_duckdb",
+                                       return_value=(pd.DataFrame(columns=["player_id", "casino_player_id", "lud_dtm"]), set())),
+            "build_canonical_mapping_from_links": patch("trainer.trainer.build_canonical_mapping_from_links", return_value=cmap),
             "build_canonical_mapping_from_df": patch("trainer.trainer.build_canonical_mapping_from_df", return_value=cmap),
             "get_dummy_player_ids_from_df": patch("trainer.trainer.get_dummy_player_ids_from_df", return_value=set()),
             "ensure_profile": patch("trainer.trainer.ensure_player_profile_ready"),
@@ -108,6 +118,10 @@ class _PipelineMixin:
             patches["get_monthly_chunks"],
             patches["load_local_parquet"],
             patches["apply_dq"],
+            patches["canonical_parquet"],
+            patches["canonical_cutoff_json"],
+            patches["build_links_dummy"],
+            patches["build_canonical_mapping_from_links"],
             patches["build_canonical_mapping_from_df"],
             patches["get_dummy_player_ids_from_df"],
             patches["ensure_profile"] as mock_ensure,

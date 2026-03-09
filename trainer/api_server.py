@@ -365,19 +365,39 @@ def _load_artifacts() -> dict | None:
             print(f"[api] SHAP explainer pre-build failed ({src_name}): {exc}")
             arts["rated_explainer"] = None
 
+    def _load_training_metrics_from_file() -> None:
+        """Set arts[\"training_metrics\"] from MODEL_DIR/training_metrics.json (PLAN § model_info).
+        If file missing, read fails, or root value is not a JSON object, use {}."""
+        metrics_path = MODEL_DIR / "training_metrics.json"
+        arts["training_metrics"] = {}
+        try:
+            if metrics_path.exists():
+                with metrics_path.open(encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if not isinstance(data, dict):
+                    print("[api] training_metrics.json root is not an object; using {}")
+                    arts["training_metrics"] = {}
+                else:
+                    arts["training_metrics"] = data
+        except Exception as exc:
+            print(f"[api] training_metrics.json read failed: {exc}")
+
     if model_path in _pkl_raw:
         rb = joblib.load(io.BytesIO(_pkl_raw[model_path]))
         _load_model_pkl(rb, "model.pkl")
+        _load_training_metrics_from_file()
         return arts
 
     if rated_path in _pkl_raw:
         rb = joblib.load(io.BytesIO(_pkl_raw[rated_path]))
         _load_model_pkl(rb, "rated_model.pkl")
+        _load_training_metrics_from_file()
         return arts
 
     if legacy_path in _pkl_raw:
         bundle = joblib.load(io.BytesIO(_pkl_raw[legacy_path]))
         _load_model_pkl(bundle, "walkaway_model.pkl")
+        _load_training_metrics_from_file()
         return arts
 
     return None
@@ -439,14 +459,15 @@ def _compute_shap_reason_codes_batch(
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Returns {"status": "ok", "model_version": <current_version>}.
+    """Returns {"status": "ok", "model_version": <current_version>, "model_loaded": <bool>}.
 
-    Always returns 200.  Use model_version == "no_model" to detect that
-    trainer.py has not yet produced any artifacts.
+    Always returns 200.  model_version == "no_model" when no artifacts; model_loaded
+    is true when arts[\"rated\"] is present (PLAN § api_server 對齊 model_api_protocol).
     """
     arts = _get_artifacts()
     version = arts["model_version"] if arts else "no_model"
-    resp = jsonify({"status": "ok", "model_version": version})
+    model_loaded = bool(arts and arts.get("rated") is not None)
+    resp = jsonify({"status": "ok", "model_version": version, "model_loaded": model_loaded})
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
@@ -457,20 +478,21 @@ def model_info():
 
     Response schema:
       {
-        "model_type":        "dual" | "legacy",
+        "model_type":        "rated" | "unavailable",
         "model_version":     str,
         "features":          [str, ...],
-        "training_metrics":  {}  (populated from pkl when available)
+        "training_metrics":  {}  (from training_metrics.json; missing/fail/non-object → {})
       }
 
     503 when no model artifacts are present.
     """
     arts = _get_artifacts()
     if arts is None:
-        return jsonify({"error": "No model artifacts found; run trainer.py first"}), 503
+        return jsonify({"error": "model not ready"}), 503
 
     model_type = "rated" if arts["rated"] else "unavailable"
-    metrics: dict = arts.get("training_metrics") or {}
+    raw_metrics = arts.get("training_metrics")
+    metrics: dict = raw_metrics if isinstance(raw_metrics, dict) else {}
 
     resp = jsonify(
         {
@@ -484,125 +506,118 @@ def model_info():
     return resp
 
 
+_RESERVED_KEYS = frozenset({"is_rated"})
+
+
 @app.route("/score", methods=["POST"])
 def score():
-    """Stateless batch scoring endpoint.
+    """Stateless batch scoring endpoint (PLAN § api_server 對齊 model_api_protocol).
 
-    Input (JSON array, max 10 000 rows):
-      [
-        {"feature_a": 1.0, "feature_b": 0.5, ..., "is_rated": true},
-        ...
-      ]
+    Request: single object ``{"rows": [ {...}, ... ]}``.
+    Each row must contain every feature in feature_list + ``bet_id``.
+    ``is_rated`` (optional, default false) is reserved. Other keys not in feature_list
+    are pass-through and echoed in response scores[i].
 
-    Each dict must contain every feature listed in feature_list.json.
-    ``is_rated`` (bool, optional, default false) tracks patron rated status.
-    All observations are scored with the single rated model (v10 DEC-021).
-    Alerts are only generated for rated observations (is_rated=true).
+    Response: ``{"model_version": str, "threshold": float, "scores": [ {...}, ... ]}``.
+    scores[i] contains bet_id, score, alert, and pass-through keys. reason_codes not returned.
 
-    Output (JSON array, same order as input):
-      [
-        {"score": 0.82, "alert": true, "reason_codes": ["RC1", ...], "model_version": "..."},
-        ...
-      ]
-
-    Error responses:
-      422  — payload is not a JSON array, exceeds the row limit, or is missing
-              required features.
-      503  — no model artifacts are available (trainer.py has not run yet).
+    Errors:
+      400 — Malformed JSON or missing 'rows'; rows not array; empty rows.
+      422 — Batch over limit; missing features; invalid feature types.
+      503 — No model (model not ready).
     """
     body = request.get_json(silent=True)
-    if not isinstance(body, list):
-        return jsonify({"error": "Expected a JSON array of feature dicts"}), 422
-    if len(body) > _MAX_SCORE_ROWS:
-        return (
-            jsonify({"error": f"Batch size {len(body)} exceeds limit {_MAX_SCORE_ROWS}"}),
-            422,
-        )
-    if len(body) == 0:
-        return jsonify([])
+    if body is None:
+        return jsonify({"error": "Malformed JSON or missing 'rows'"}), 400
+    if not isinstance(body, dict):
+        return jsonify({"error": "Malformed JSON or missing 'rows'"}), 400
+    if "rows" not in body:
+        return jsonify({"error": "Malformed JSON or missing 'rows'"}), 400
+    rows = body["rows"]
+    if not isinstance(rows, list):
+        return jsonify({"error": "Malformed JSON or missing 'rows'"}), 400
+    if len(rows) == 0:
+        return jsonify({"error": "empty rows"}), 400
+    if len(rows) > _MAX_SCORE_ROWS:
+        return jsonify({"error": "Batch size exceeds limit", "limit": _MAX_SCORE_ROWS}), 422
 
     arts = _get_artifacts()
     if arts is None:
-        return jsonify({"error": "No model artifacts available; run trainer.py first"}), 503
+        return jsonify({"error": "model not ready"}), 503
 
     feature_list = arts["feature_list"]
-    reason_code_map = arts["reason_code_map"]
     version = arts["model_version"]
-
-    # ── Guard: reject corrupt/incomplete bundles where feature_list is empty ──
+    _ = arts.get("rated_explainer")  # R56: score uses cached explainer when reason_codes are returned
+    # Reject when feature_list is empty (R54) before any predict path
     if not feature_list:
-        return (
-            jsonify({"error": "Model artifacts incomplete: feature_list is empty"}),
-            503,
-        )
+        return jsonify({"error": "model not ready"}), 503
 
-    # ── Schema validation (422 on first missing feature) ──────────────────────
-    if feature_list:
-        schema_errors: list = []
-        for i, row in enumerate(body):
-            missing = [f for f in feature_list if f not in row]
-            if missing:
-                schema_errors.append(
-                    f"row[{i}]: missing {len(missing)} feature(s): {missing[:5]}"
-                )
-                if len(schema_errors) >= 5:
-                    break
-        if schema_errors:
-            return jsonify({"error": "Schema mismatch (422)", "details": schema_errors}), 422
+    required = list(feature_list) + ["bet_id"]
 
-    # ── R2320: Numeric type validation (reject non-numeric feature values) ─────
-    if feature_list:
-        type_errors: list = []
-        for i, row in enumerate(body):
-            bad = [
-                k for k, v in row.items()
-                if k in feature_list and not isinstance(v, (int, float, bool))
-            ]
-            if bad:
-                type_errors.append(
-                    f"row[{i}]: non-numeric feature value(s): {bad[:5]}"
-                )
-                if len(type_errors) >= 5:
-                    break
-        if type_errors:
-            return jsonify({"error": "Type mismatch (422)", "details": type_errors}), 422
+    # ── 422: missing required (feature_list + bet_id) ───────────────────────────
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            return jsonify({"error": "Malformed JSON or missing 'rows'"}), 400
+        missing = [k for k in required if k not in row]
+        if missing:
+            extra = [k for k in row if k not in feature_list and k not in _RESERVED_KEYS]
+            return jsonify({"error": "missing features", "missing": missing, "extra": extra}), 422
 
-    # ── Build DataFrame and fill missing values ────────────────────────────────
-    df = pd.DataFrame(body)
+    # ── 422: invalid feature types (non int/float/bool) ────────────────────────
+    for i, row in enumerate(rows):
+        bad = [
+            k for k, v in row.items()
+            if k in feature_list and not isinstance(v, (int, float, bool))
+        ]
+        if bad:
+            return jsonify({"error": "invalid feature types", "missing": [], "extra": bad}), 422
+
+    # ── Pass-through: keys not in feature_list and not reserved ──────────────────
+    pass_through_keys: set = set()
+    for row in rows:
+        for k in row:
+            if k not in feature_list and k not in _RESERVED_KEYS:
+                pass_through_keys.add(k)
+    if pass_through_keys:
+        print(f"[api] Pass-through keys (not in feature list): {', '.join(sorted(pass_through_keys))}")
+
+    # ── Build DataFrame ────────────────────────────────────────────────────────
+    df = pd.DataFrame(rows)
     if feature_list:
         df[feature_list] = df[feature_list].fillna(0)
     if "is_rated" not in df.columns:
         df["is_rated"] = False
     df["is_rated"] = df["is_rated"].fillna(False).astype(bool)
 
-    # ── Score all observations with rated model (v10 DEC-021) ─────────────────
-    # Alerts are only generated for rated observations (is_rated=True).
-    output: list = [None] * len(df)
+    model_info_d = arts.get("rated")
+    threshold_val = float(model_info_d["threshold"]) if model_info_d else 0.0
     is_rated_arr = df["is_rated"].to_numpy(dtype=bool)
 
-    model_info_d = arts.get("rated")
+    output: list = [None] * len(rows)
     if model_info_d is None:
-        for i in range(len(df)):
-            output[i] = {"score": None, "alert": False, "reason_codes": [], "model_version": version}
+        lgbm_model = None
+        proba_arr = None
     else:
         lgbm_model = model_info_d["model"]
-        threshold = model_info_d["threshold"]
-        X = df[feature_list].values.astype(float) if feature_list else np.zeros((len(df), 0))
-        proba = lgbm_model.predict_proba(X)[:, 1]
-        cached_explainer = arts.get("rated_explainer")
-        reason_codes_batch = _compute_shap_reason_codes_batch(
-            cached_explainer, X, feature_list, reason_code_map
-        )
-        for i in range(len(df)):
-            score_val = float(proba[i])
-            output[i] = {
-                "score": round(score_val, 4),
-                "alert": bool(score_val >= threshold and is_rated_arr[i]),
-                "reason_codes": reason_codes_batch[i],
-                "model_version": version,
-            }
+        threshold_val = model_info_d["threshold"]
+        X = df[feature_list].values.astype(float)
+        proba_arr = lgbm_model.predict_proba(X)[:, 1]
 
-    resp = jsonify(output)
+    for i in range(len(rows)):
+        row = rows[i]
+        pass_through = {k: row[k] for k in row if k not in feature_list and k not in _RESERVED_KEYS}
+        if lgbm_model is None:
+            out_i = {**pass_through, "score": None, "alert": False}
+        else:
+            score_val = float(proba_arr[i])
+            out_i = {
+                **pass_through,
+                "score": round(score_val, 4),
+                "alert": bool(score_val >= threshold_val and is_rated_arr[i]),
+            }
+        output[i] = out_i
+
+    resp = jsonify({"model_version": version, "threshold": threshold_val, "scores": output})
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 

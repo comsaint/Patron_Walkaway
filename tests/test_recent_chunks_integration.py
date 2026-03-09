@@ -13,9 +13,10 @@ HK_TZ = ZoneInfo("Asia/Hong_Kong")
 
 
 class TestRecentChunksIntegration(unittest.TestCase):
-    @patch("trainer.trainer.load_local_parquet")
-    @patch("trainer.trainer.apply_dq")
-    @patch("trainer.trainer.build_canonical_mapping_from_df")
+    @patch("trainer.trainer.CANONICAL_MAPPING_PARQUET")
+    @patch("trainer.trainer.CANONICAL_MAPPING_CUTOFF_JSON")
+    @patch("trainer.trainer.build_canonical_links_and_dummy_from_duckdb")
+    @patch("trainer.trainer.build_canonical_mapping_from_links")
     @patch("trainer.trainer.ensure_player_profile_ready")
     @patch("trainer.trainer.load_player_profile")
     @patch("trainer.trainer.process_chunk")
@@ -30,9 +31,10 @@ class TestRecentChunksIntegration(unittest.TestCase):
         mock_process_chunk,
         mock_load_profile,
         mock_ensure_profile,
-        mock_build_canonical,
-        mock_apply_dq,
-        mock_load_local
+        mock_build_from_links,
+        mock_links_and_dummy,
+        mock_cutoff_json,
+        mock_parquet_path,
     ):
         # Setup fake chunks. Let's say we have 5 months of data originally.
         base_time = datetime(2025, 1, 1, tzinfo=HK_TZ)
@@ -57,12 +59,14 @@ class TestRecentChunksIntegration(unittest.TestCase):
         expected_effective_start = fake_chunks[-2]["window_start"].replace(tzinfo=None)
         expected_effective_end   = fake_chunks[-1]["window_end"].replace(tzinfo=None)
 
-        # Setup mock returns to let pipeline flow through
-        mock_load_local.return_value = (pd.DataFrame(), pd.DataFrame())
-        mock_apply_dq.return_value = (pd.DataFrame(), pd.DataFrame())
-        mock_build_canonical.return_value = pd.DataFrame(columns=["player_id", "canonical_id"])
+        # Step 3: no artifact on disk; DuckDB path returns empty links/dummy and empty map.
+        mock_parquet_path.exists.return_value = False
+        mock_cutoff_json.exists.return_value = False
+        _empty_links = pd.DataFrame(columns=["player_id", "casino_player_id", "lud_dtm"])
+        mock_links_and_dummy.return_value = (_empty_links, set())
+        mock_build_from_links.return_value = pd.DataFrame(columns=["player_id", "canonical_id"])
         mock_load_profile.return_value = pd.DataFrame()
-        
+
         # process_chunk should return a fake path so concat doesn't fail immediately
         # Actually, let's mock pd.read_parquet and Path so we don't hit disk
         with patch("trainer.trainer.pd.read_parquet") as mock_read_parquet, \
@@ -93,11 +97,12 @@ class TestRecentChunksIntegration(unittest.TestCase):
             
             run_pipeline(args)
 
-        # 1. Assert load_local_parquet was called with effective window for mapping
-        mock_load_local.assert_called_once()
-        call_args = mock_load_local.call_args[0]
-        self.assertEqual(call_args[0], expected_effective_start)
-        self.assertEqual(call_args[1], expected_effective_end + timedelta(days=1))
+        # 1. Assert canonical mapping used train_end from chunk split (DuckDB path).
+        mock_links_and_dummy.assert_called_once()
+        _call_args = mock_links_and_dummy.call_args[0]
+        _train_end = pd.Timestamp(_call_args[1])
+        self.assertGreaterEqual(_train_end, expected_effective_start, "train_end must be >= effective_start")
+        self.assertLessEqual(_train_end, expected_effective_end, "train_end must be <= effective_end (max of train_chunks)")
 
         # 2. Assert ensure_player_profile_ready was called with effective window
         # (canonical_id_whitelist=None, snapshot_interval_days=1, preload_sessions=True

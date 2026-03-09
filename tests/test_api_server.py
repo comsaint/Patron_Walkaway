@@ -158,6 +158,11 @@ class TestModelInfoEndpoint(unittest.TestCase):
             self.assertEqual(data["features"], ["alpha", "beta"])
 
 
+def _score_payload(rows):
+    """Build request body for POST /score (PLAN § {rows})."""
+    return {"rows": rows}
+
+
 class TestScoreEndpoint(unittest.TestCase):
     def setUp(self):
         self.client = api_server.app.test_client()
@@ -171,39 +176,63 @@ class TestScoreEndpoint(unittest.TestCase):
             content_type=content_type,
         )
 
-    # ── 422 error cases ───────────────────────────────────────────────────────
+    def _one_row(self, **kw):
+        """One row with feature_list + bet_id (required by protocol)."""
+        row = {f: 0.5 for f in self.features}
+        row["bet_id"] = 1
+        row.update(kw)
+        return row
 
-    def test_422_when_body_is_not_list(self):
+    # ── 400 error cases ───────────────────────────────────────────────────────
+
+    def test_400_when_rows_missing(self):
         resp = self._post({"f1": 1})
-        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.status_code, 400)
+        data = json.loads(resp.data)
+        self.assertIn("error", data)
 
-    def test_422_when_body_is_string(self):
+    def test_400_when_body_not_object(self):
         resp = self._post("hello")
-        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_400_when_empty_rows(self):
+        with patch.object(api_server, "_get_artifacts", return_value=self.arts):
+            resp = self._post(_score_payload([]))
+            self.assertEqual(resp.status_code, 400)
+            data = json.loads(resp.data)
+            self.assertEqual(data.get("error"), "empty rows")
+
+    # ── 422 error cases ───────────────────────────────────────────────────────
 
     def test_422_when_features_missing(self):
         with patch.object(api_server, "_get_artifacts", return_value=self.arts):
-            resp = self._post([{"f1": 1.0}])  # f2, f3 missing
+            resp = self._post(_score_payload([{"f1": 1.0}]))  # f2, f3, bet_id missing
             self.assertEqual(resp.status_code, 422)
 
-    def test_422_error_body_contains_schema_mismatch(self):
+    def test_422_error_body_contains_missing_and_extra(self):
         with patch.object(api_server, "_get_artifacts", return_value=self.arts):
-            resp = self._post([{"f1": 1.0}])
+            resp = self._post(_score_payload([{"f1": 1.0}]))
             data = json.loads(resp.data)
             self.assertIn("error", data)
+            self.assertIn("missing", data)
 
     def test_422_when_batch_too_large(self):
         with patch.object(api_server, "_get_artifacts", return_value=self.arts):
-            big_batch = [{"f1": 0, "f2": 0, "f3": 0}] * (api_server._MAX_SCORE_ROWS + 1)
-            resp = self._post(big_batch)
+            big_batch = [
+                {f: 0 for f in self.features} | {"bet_id": i}
+                for i in range(api_server._MAX_SCORE_ROWS + 1)
+            ]
+            resp = self._post(_score_payload(big_batch))
             self.assertEqual(resp.status_code, 422)
 
     # ── 503 when no model ─────────────────────────────────────────────────────
 
     def test_503_when_no_artifacts(self):
         with patch.object(api_server, "_get_artifacts", return_value=None):
-            resp = self._post([{"f1": 1.0, "f2": 0.5, "f3": 0.2}])
+            resp = self._post(_score_payload([self._one_row()]))
             self.assertEqual(resp.status_code, 503)
+            data = json.loads(resp.data)
+            self.assertEqual(data.get("error"), "model not ready")
 
     # ── 200 happy-path ────────────────────────────────────────────────────────
 
@@ -211,34 +240,30 @@ class TestScoreEndpoint(unittest.TestCase):
         if self.arts["rated"] is None:
             self.skipTest("LightGBM not available")
         with patch.object(api_server, "_get_artifacts", return_value=self.arts):
-            resp = self._post([{"f1": 0.1, "f2": 0.9, "f3": 0.5}])
+            resp = self._post(_score_payload([self._one_row(f1=0.1, f2=0.9, f3=0.5)]))
             self.assertEqual(resp.status_code, 200)
 
-    def test_empty_batch_returns_empty_list(self):
-        with patch.object(api_server, "_get_artifacts", return_value=self.arts):
-            resp = self._post([])
-            self.assertEqual(resp.status_code, 200)
-            self.assertEqual(json.loads(resp.data), [])
-
-    def test_output_has_required_keys_per_row(self):
+    def test_response_shape_model_version_threshold_scores(self):
         if self.arts["rated"] is None:
             self.skipTest("LightGBM not available")
-        row = {f: 0.5 for f in self.features}
         with patch.object(api_server, "_get_artifacts", return_value=self.arts):
-            resp = self._post([row])
+            resp = self._post(_score_payload([self._one_row()]))
             data = json.loads(resp.data)
-            self.assertEqual(len(data), 1)
-            result = data[0]
-            for key in ("score", "alert", "reason_codes", "model_version"):
+            self.assertIn("model_version", data)
+            self.assertIn("threshold", data)
+            self.assertIn("scores", data)
+            self.assertEqual(len(data["scores"]), 1)
+            result = data["scores"][0]
+            for key in ("bet_id", "score", "alert"):
                 self.assertIn(key, result, msg=f"Missing key in /score output: {key}")
+            self.assertNotIn("reason_codes", result)
 
     def test_score_is_float_between_0_and_1(self):
         if self.arts["rated"] is None:
             self.skipTest("LightGBM not available")
-        row = {f: 0.5 for f in self.features}
         with patch.object(api_server, "_get_artifacts", return_value=self.arts):
-            resp = self._post([row])
-            score_val = json.loads(resp.data)[0]["score"]
+            resp = self._post(_score_payload([self._one_row()]))
+            score_val = json.loads(resp.data)["scores"][0]["score"]
             self.assertIsInstance(score_val, float)
             self.assertGreaterEqual(score_val, 0.0)
             self.assertLessEqual(score_val, 1.0)
@@ -246,28 +271,28 @@ class TestScoreEndpoint(unittest.TestCase):
     def test_alert_is_bool(self):
         if self.arts["rated"] is None:
             self.skipTest("LightGBM not available")
-        row = {f: 0.5 for f in self.features}
         with patch.object(api_server, "_get_artifacts", return_value=self.arts):
-            resp = self._post([row])
-            alert_val = json.loads(resp.data)[0]["alert"]
+            resp = self._post(_score_payload([self._one_row()]))
+            alert_val = json.loads(resp.data)["scores"][0]["alert"]
             self.assertIsInstance(alert_val, bool)
 
     def test_output_order_matches_input_order(self):
         """The i-th output row must correspond to the i-th input row."""
         if self.arts["rated"] is None:
             self.skipTest("LightGBM not available")
-        rows = [{f: float(i) / 10 for f in self.features} for i in range(5)]
+        rows = [self._one_row(**{f: float(i) / 10 for f in self.features}) for i in range(5)]
+        for i, r in enumerate(rows):
+            r["bet_id"] = i + 1
         with patch.object(api_server, "_get_artifacts", return_value=self.arts):
-            resp = self._post(rows)
+            resp = self._post(_score_payload(rows))
             data = json.loads(resp.data)
-            self.assertEqual(len(data), 5)
+            self.assertEqual(len(data["scores"]), 5)
 
     def test_is_rated_true_routes_to_rated_model(self):
         """is_rated=True in the payload should use the rated model branch."""
         if self.arts["rated"] is None:
             self.skipTest("LightGBM not available")
-        row = {f: 0.5 for f in self.features}
-        row["is_rated"] = True
+        row = self._one_row(is_rated=True)
         call_tracker = {"rated": 0, "nonrated": 0}
         original_predict = self.arts["rated"]["model"].predict_proba
 
@@ -277,26 +302,16 @@ class TestScoreEndpoint(unittest.TestCase):
 
         self.arts["rated"]["model"].predict_proba = tracking_predict
         with patch.object(api_server, "_get_artifacts", return_value=self.arts):
-            self.client.post("/score", data=json.dumps([row]), content_type="application/json")
+            self._post(_score_payload([row]))
         self.assertGreater(call_tracker["rated"], 0)
 
     def test_model_version_in_output_matches_artifacts(self):
         if self.arts["rated"] is None:
             self.skipTest("LightGBM not available")
-        row = {f: 0.5 for f in self.features}
         with patch.object(api_server, "_get_artifacts", return_value=self.arts):
-            resp = self._post([row])
+            resp = self._post(_score_payload([self._one_row()]))
             data = json.loads(resp.data)
-            self.assertEqual(data[0]["model_version"], "test-v0")
-
-    def test_reason_codes_is_list(self):
-        if self.arts["rated"] is None:
-            self.skipTest("LightGBM not available")
-        row = {f: 0.5 for f in self.features}
-        with patch.object(api_server, "_get_artifacts", return_value=self.arts):
-            resp = self._post([row])
-            codes = json.loads(resp.data)[0]["reason_codes"]
-            self.assertIsInstance(codes, list)
+            self.assertEqual(data["model_version"], "test-v0")
 
 
 class TestArtifactCacheReload(unittest.TestCase):

@@ -829,6 +829,9 @@ def _compute_reason_codes(
 
 PROJECT_ROOT = BASE_DIR.parent
 _LOCAL_PARQUET_PROFILE = PROJECT_ROOT / "data" / "player_profile.parquet"
+# PLAN Canonical mapping step 8: load mapping artifact (same paths as trainer).
+CANONICAL_MAPPING_PARQUET = PROJECT_ROOT / "data" / "canonical_mapping.parquet"
+CANONICAL_MAPPING_CUTOFF_JSON = PROJECT_ROOT / "data" / "canonical_mapping.cutoff.json"
 
 # R85: module-level TTL cache — avoids re-querying the profile table on every
 # scoring call within the same process (e.g. repeated score_once calls in a loop).
@@ -1102,13 +1105,15 @@ def score_once(
     alert_history: set,
     conn: sqlite3.Connection,
     retention_hours: int = RETENTION_HOURS,
+    rebuild_canonical_mapping: bool = False,
 ) -> None:
     """Run one scoring cycle.
 
     Steps
     -----
     1. Fetch bets + sessions (FND-01 CTE, H2 session_avail_dtm gate).
-    2. D2 identity via build_canonical_mapping_from_df.
+    2. D2 identity: load from data/canonical_mapping.parquet if cutoff >= now and not --rebuild;
+       else build_canonical_mapping_from_df(sessions, cutoff_dtm=now_hk).
     3. Build Track B + session rolling features (train-serve parity).
     4. Set is_rated flag: canonical_id in rated mapping.
     5. Single rated model scoring via _score_df (v10 DEC-021).
@@ -1139,7 +1144,28 @@ def score_once(
         return
 
     # ── D2 identity ───────────────────────────────────────────────────────
-    canonical_map = build_canonical_mapping_from_df(sessions, cutoff_dtm=now_hk)
+    canonical_map = None
+    if not rebuild_canonical_mapping and CANONICAL_MAPPING_PARQUET.exists() and CANONICAL_MAPPING_CUTOFF_JSON.exists():
+        try:
+            with open(CANONICAL_MAPPING_CUTOFF_JSON, encoding="utf-8") as _f:
+                _sidecar = json.load(_f)
+            _cutoff_str = _sidecar.get("cutoff_dtm")
+            _cutoff_ts = pd.Timestamp(_cutoff_str) if _cutoff_str else None
+            if _cutoff_ts is not None:
+                _cutoff_naive = _cutoff_ts.replace(tzinfo=None) if _cutoff_ts.tz else _cutoff_ts
+                now_naive = now_hk.replace(tzinfo=None) if now_hk.tzinfo else now_hk
+                if _cutoff_naive >= now_naive:
+                    _df = pd.read_parquet(CANONICAL_MAPPING_PARQUET)
+                    if set(_df.columns) >= {"player_id", "canonical_id"}:
+                        canonical_map = _df
+                        logger.info(
+                            "[scorer] Canonical mapping loaded from %s (cutoff %s >= now)",
+                            CANONICAL_MAPPING_PARQUET, _cutoff_str,
+                        )
+        except Exception as exc:
+            logger.warning("[scorer] Load canonical mapping artifact failed (%s); will build", exc)
+    if canonical_map is None:
+        canonical_map = build_canonical_mapping_from_df(sessions, cutoff_dtm=now_hk)
 
     # H3: every canonical_id in the mapping is a rated player — identity.py only
     # builds entries for players who have a valid casino_player_id (R36 fix).
@@ -1342,6 +1368,10 @@ def main() -> None:
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING"],
     )
+    parser.add_argument(
+        "--rebuild-canonical-mapping", action="store_true",
+        help="Do not load canonical mapping from data/canonical_mapping.parquet; build from current window.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1367,7 +1397,14 @@ def main() -> None:
     while True:
         t_start = time.time()
         try:
-            score_once(artifacts, args.lookback_hours, alert_history, conn, RETENTION_HOURS)
+            score_once(
+                artifacts,
+                args.lookback_hours,
+                alert_history,
+                conn,
+                RETENTION_HOURS,
+                rebuild_canonical_mapping=getattr(args, "rebuild_canonical_mapping", False),
+            )
         except Exception as exc:
             logger.error("[scorer] ERROR: %s", exc, exc_info=True)
         elapsed = time.time() - t_start

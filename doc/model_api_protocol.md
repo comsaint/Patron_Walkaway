@@ -193,7 +193,16 @@ Returns model metadata for monitoring and debugging.
 | 200 | Success | Scores response |
 | 400 | Malformed JSON or empty `rows` | `{"error": "description"}` |
 | 422 | Missing or extra features | `{"error": "missing features", "missing": ["col1"], "extra": ["col2"]}` |
+| 422 | Invalid feature types (non int/float/bool) | `{"error": "invalid feature types", "missing": [], "extra": ["field1", ...]}` |
 | 503 | Model not loaded / warming up | `{"error": "model not ready"}` |
+
+### 5.1  Implementation notes (api_server)
+
+- **Request shape**: Body must be a single object `{"rows": [...]}`. Non-object, missing `rows`, or `rows` not an array → 400 `{"error": "Malformed JSON or missing 'rows'"}`. Empty array `rows` → 400 `{"error": "empty rows"}`.
+- **Feature list**: The set of required feature keys is determined by the service (e.g. from `feature_list.json`). Each row must contain every feature in that list plus `bet_id`.
+- **Reserved key**: `is_rated` (optional, default false) is reserved and not treated as a feature or pass-through.
+- **Pass-through**: Any key in a row that is not in the feature list and not reserved is echoed as-is in the corresponding `scores[i]`. Server may log pass-through keys once per request.
+- **training_metrics** (`GET /model_info`): Sourced from `training_metrics.json` (e.g. under model dir). If the file is missing or read fails, or the root value is not a JSON object, the response uses `{}`.
 
 ---
 

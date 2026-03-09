@@ -123,12 +123,16 @@ class TestR3601ApiUnratedAlertLeak(unittest.TestCase):
             patch.object(api_server_mod, "_get_artifacts", return_value=arts),
             patch.object(api_server_mod, "_compute_shap_reason_codes_batch", return_value=[[]]),
         ):
-            resp = client.post("/score", json=[{"f1": 1.0, "is_rated": False}])
+            resp = client.post(
+                "/score",
+                json={"rows": [{"f1": 1.0, "bet_id": 1, "is_rated": False}]},
+            )
             self.assertEqual(resp.status_code, 200)
             payload = resp.get_json()
-            self.assertEqual(len(payload), 1)
+            self.assertIn("scores", payload)
+            self.assertEqual(len(payload["scores"]), 1)
             self.assertFalse(
-                payload[0]["alert"],
+                payload["scores"][0]["alert"],
                 "API should not return alert=True for unrated rows.",
             )
 

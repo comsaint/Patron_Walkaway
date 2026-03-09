@@ -34,7 +34,7 @@ import joblib
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import average_precision_score, fbeta_score
+from sklearn.metrics import average_precision_score, fbeta_score, precision_recall_curve
 from zoneinfo import ZoneInfo
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -176,15 +176,22 @@ def load_dual_artifacts() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Metric helpers
+# Metric helpers (trainer-aligned: precision-at-recall PLAN § Backtester precision-at-recall)
 # ---------------------------------------------------------------------------
 
+_TARGET_RECALLS = (0.01, 0.1, 0.5)
+
+
 def _zeroed_flat_metrics(threshold: float, window_hours: Optional[float]) -> dict:
-    """Return trainer-style flat metrics dict with zeros (empty/invalid subset)."""
+    """Return trainer-style flat metrics dict with zeros (empty/invalid subset).
+
+    Includes test_precision_at_recall_0.01/0.1/0.5 as None (PLAN § Backtester
+    precision-at-recall: boundary/empty/single-class).
+    """
     alerts_per_hour: Optional[float] = None
     if window_hours is not None and window_hours > 0:
         alerts_per_hour = 0.0 / window_hours
-    return {
+    out = {
         "test_ap": 0.0,
         "test_precision": 0.0,
         "test_recall": 0.0,
@@ -197,6 +204,9 @@ def _zeroed_flat_metrics(threshold: float, window_hours: Optional[float]) -> dic
         "alerts": 0,
         "alerts_per_hour": alerts_per_hour,
     }
+    for r in _TARGET_RECALLS:
+        out[f"test_precision_at_recall_{r}"] = None
+    return out
 
 
 def _score_df(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.DataFrame:
@@ -227,7 +237,8 @@ def compute_micro_metrics(
 
     Returns a flat dict with trainer-style keys: test_ap, test_precision, test_recall,
     test_f1, test_fbeta_05, threshold, test_samples, test_positives, test_random_ap,
-    alerts, alerts_per_hour (PLAN § Backtester 評估輸出格式對齊 trainer).
+    alerts, alerts_per_hour; and test_precision_at_recall_0.01/0.1/0.5 (PLAN § Backtester
+    precision-at-recall; None when empty/invalid/single-class).
     Empty or invalid (e.g. NaN labels, single-class) subset returns same keys with zeros.
 
     Parameters
@@ -241,9 +252,19 @@ def compute_micro_metrics(
     """
     if df.empty:
         return _zeroed_flat_metrics(threshold, window_hours)
+    missing = [c for c in ("score", "label", "is_rated") if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"compute_micro_metrics requires columns: score, label, is_rated; missing: {missing}"
+        )
     if "label" in df.columns and df["label"].isna().any():
         logger.warning(
             "compute_micro_metrics: label contains NaN — returning zeroed flat metrics (trainer-aligned)."
+        )
+        return _zeroed_flat_metrics(threshold, window_hours)
+    if df["score"].isna().any():
+        logger.warning(
+            "compute_micro_metrics: score contains NaN — returning zeroed flat metrics (precision_at_recall keys None)."
         )
         return _zeroed_flat_metrics(threshold, window_hours)
     df = df.copy()
@@ -274,6 +295,20 @@ def compute_micro_metrics(
     if window_hours is not None and window_hours > 0:
         alerts_per_hour = n_alerts / window_hours
 
+    # Precision at fixed recall levels (trainer-aligned; None when single-class)
+    precision_at_recall: Dict[str, Optional[float]] = {}
+    if n_pos == 0 or n_pos == n_samples:
+        for r in _TARGET_RECALLS:
+            precision_at_recall[f"test_precision_at_recall_{r}"] = None
+    else:
+        pr_prec, pr_rec, _ = precision_recall_curve(df["label"], df["score"])
+        for r in _TARGET_RECALLS:
+            mask = pr_rec >= r
+            if mask.any():
+                precision_at_recall[f"test_precision_at_recall_{r}"] = float(pr_prec[mask].max())
+            else:
+                precision_at_recall[f"test_precision_at_recall_{r}"] = None
+
     return {
         "test_ap": ap,
         "test_precision": prec,
@@ -286,6 +321,7 @@ def compute_micro_metrics(
         "test_random_ap": test_random_ap,
         "alerts": n_alerts,
         "alerts_per_hour": alerts_per_hour,
+        **precision_at_recall,
     }
 
 

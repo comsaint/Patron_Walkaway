@@ -297,6 +297,44 @@ def _apply_mn_resolution(
 
 
 # ---------------------------------------------------------------------------
+# Public API — links + dummy (DuckDB path; PLAN Canonical mapping Step 3)
+# ---------------------------------------------------------------------------
+
+def build_canonical_mapping_from_links(
+    links_df: pd.DataFrame,
+    dummy_pids: Set,
+) -> pd.DataFrame:
+    """Build player_id → canonical_id mapping from pre-computed links and FND-12 dummies.
+
+    Used by the DuckDB canonical-mapping path (PLAN Step 3): DuckDB produces
+    links (player_id, casino_player_id, lud_dtm) and dummy_pids; this function
+    applies FND-03 cleaning and M:N resolution.
+
+    Parameters
+    ----------
+    links_df : DataFrame
+        Must have columns [player_id, casino_player_id, lud_dtm]. May contain
+        rows with null/invalid casino_player_id; those are dropped before M:N.
+    dummy_pids : set
+        FND-12 dummy/fake-account player_ids to exclude from the result.
+
+    Returns
+    -------
+    DataFrame with columns [player_id, canonical_id] (str).
+    """
+    required = {"player_id", "casino_player_id", "lud_dtm"}
+    missing = required - set(links_df.columns)
+    if missing:
+        raise ValueError(f"links_df is missing required columns: {sorted(missing)}")
+    if links_df.empty:
+        return pd.DataFrame(columns=["player_id", "canonical_id"])
+    df = links_df.copy()
+    df["casino_player_id"] = _clean_casino_player_id(df["casino_player_id"])
+    rated = df.loc[df["casino_player_id"].notna(), ["player_id", "casino_player_id", "lud_dtm"]]
+    return _apply_mn_resolution(rated, dummy_pids)
+
+
+# ---------------------------------------------------------------------------
 # Public API — offline / Parquet path
 # ---------------------------------------------------------------------------
 

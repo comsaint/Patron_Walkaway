@@ -59,6 +59,15 @@ todos:
   - id: backtester-metrics-align
     content: "Backtester 輸出格式對齊 trainer：移除 macro_by_visit、改用 trainer 風格 test_* 鍵名與 flat 結構；見「Backtester 評估輸出格式對齊 trainer」"
     status: completed
+  - id: backtester-precision-at-recall
+    content: "Backtester 產出 precision at recall 指標（與 trainer 一致）：test_precision_at_recall_0.01/0.1/0.5；見「Backtester precision-at-recall 指標」"
+    status: completed
+  - id: step9-api-protocol-align
+    content: "api_server 對齊 doc/model_api_protocol.md：Request {rows}、Response {model_version,threshold,scores}、pass-through、/health model_loaded、/model_info training_metrics.json 原樣、422 invalid feature types、empty rows→400；步驟 1–6 已完成（R232/234/235/237/238/241），R242 Review + R243 測試鎖定現有行為"
+    status: completed
+  - id: canonical-mapping-full-history
+    content: "Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入；--rebuild-canonical-mapping（trainer + scorer）；步驟 1 已完成（R245/R246/R247）；步驟 2 已完成（R253/R254 Review/R255 實作修正）；步驟 3 已完成（R249/R250 Review/R251 測試）；步驟 4–9 與 CLI 待實作；見「Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入與生產增量更新」"
+    status: pending
 isProject: false
 ---
 
@@ -103,8 +112,11 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 5 | **方案 B+：LibSVM + 完整 OOM 避免** | 階段 1–6 已完成（階段 6 第 3 步 Test 從檔案 predict 已於 Round 220 實作） | 下方「方案 B+：LibSVM 匯出與完整 OOM 避免計畫」一節 |
 | 6 | **Train–Serve Parity：Scorer / Backtester 與 trainer 對齊** | 完成（Round 221：Scorer + Backtester 打分前準備；Round 222：Backtester player_profile PIT join、Track LLM 在完整 bets 上計算後 merge 再 label） | 下方「Train–Serve Parity：Scorer / Backtester 與 trainer.py 對齊規格」一節；R221 審查風險已轉為 tests（test_review_risks_round221_train_serve_parity.py） |
 | 7 | **Backtester 評估輸出格式對齊 trainer** | completed | 下方「Backtester 評估輸出格式對齊 trainer」一節；步驟 1–4、6 已完成（Round 225/226），步驟 3 於 Round 226 實作（section flat、無 micro 巢狀）。 |
+| 8 | **Backtester precision-at-recall 指標** | completed | 下方「Backtester precision-at-recall 指標」一節；Round 229/230/231 實作與 Review 修復。 |
+| 9 | **api_server 對齊 model_api_protocol** | in progress | 下方「api_server 對齊 model_api_protocol 實作計畫」一節；步驟 1–5 已完成（Round 232/234/235/237/238），僅步驟 6（可選 doc）未做。 |
+| 10 | **Canonical mapping 全歷史 + DuckDB + 寫出/載入 + 強制重建** | pending | 下方「Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入與生產增量更新」一節；含 `--rebuild-canonical-mapping`（trainer + scorer）。 |
 
-**Plan 狀態摘要（Round 228）**：上表 1～7 項均為 **completed**。tests / typecheck / lint 全過（見 STATUS.md Round 228）。
+**Plan 狀態摘要（Round 240）**：上表 1～8 項為 **completed**，第 9 項為 **in progress**（步驟 1–5 完成，僅步驟 6 可選未做），第 10 項為 **pending**。tests / typecheck / lint 全過（見 STATUS.md Round 240）。
 
 **建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。Backtester 輸出格式對齊（項目 7）可獨立排入。
 
@@ -641,6 +653,74 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - `GET /model_info`：從 `feature_list.json` 動態讀取；**單一模型**，不再列 rated/nonrated
 - 缺欄位或多餘欄位一律 422，不默默補齊
 - 保留所有既有 frontend serving + data API routes
+- **待實作**：與 protocol 的 request/response 形狀、錯誤格式、/health、/model_info 完全對齊，見下方「api_server 對齊 model_api_protocol 實作計畫」。
+
+---
+
+### api_server 對齊 model_api_protocol 實作計畫
+
+**目標**：`trainer/api_server.py` 與 `doc/model_api_protocol.md` 對齊；特徵仍由 `feature_list.json` 決定；本階段不回傳 `reason_codes`。
+
+#### 1. Request（POST /score）
+
+| 項目 | 規格 |
+|------|------|
+| Body 形狀 | 單一物件 `{"rows": [ ... ]}`。非物件或無 `rows` → **400** `{"error": "Malformed JSON or missing 'rows'"}`。 |
+| rows | 必須為陣列。非陣列 → 400。`rows == []` → **400** `{"error": "empty rows"}`。 |
+| 筆數上限 | `len(rows)` ≤ `_MAX_SCORE_ROWS`（如 10,000）。 |
+| 必填欄位 | 每筆 row：**所有 feature_list 特徵** + **bet_id**。缺任一 → **422** `{"error": "missing features", "missing": [...], "extra": [...]}`。 |
+| 型別錯誤 | 特徵值非 int/float/bool → **422** `{"error": "invalid feature types", "missing": [], "extra": ["<field>", ...]}`。 |
+| 額外欄位 | **is_rated**（可選，預設 false）為保留鍵。 |
+| Pass-through | 凡鍵名 **不在 feature_list 且非保留鍵** 者，一律視為 pass-through，在 response 的對應 `scores[i]` 原樣 echo。 |
+| Console | 每個 request 一次：列印所有 pass-through 鍵，例如 `[api] Pass-through keys (not in feature list): bet_id, session_id, ...`。 |
+
+#### 2. Response（POST /score 成功）
+
+- 單一物件：`{"model_version": "<string>", "threshold": <float>, "scores": [ ... ]}`。
+- `scores[i]`：至少 `bet_id`, `score`, `alert`；其餘為該 row 的 **pass-through 鍵**原樣帶入。
+- **不**回傳 `reason_codes`（下階段實作）。
+
+#### 3. GET /health
+
+- Body：`{"status": "ok", "model_version": "<string>", "model_loaded": <bool>}`。
+- 無 artifact：`model_version` 為 `"no_model"`，`model_loaded` 為 `false`。
+- 有 artifact 且 `arts["rated"]` 非 None：`model_loaded` 為 `true`。
+
+#### 4. GET /model_info
+
+- 無 artifact → **503** `{"error": "model not ready"}`。
+- 有 artifact：`model_version`（來自 `model_version` 檔）、`model_type`（如 `"LightGBM"`）、`threshold`（來自 pkl）、`feature_count`、`features`（來自 `feature_list.json`）、**training_metrics**（從 **`trainer/models/training_metrics.json` 讀取並照檔案原樣**放入回應；若檔案不存在或讀取失敗則 `{}`）。
+- 載入 artifact 時（如 `_load_artifacts`）一併讀取 `training_metrics.json` 存於 `arts`，供 `/model_info` 使用。
+
+#### 5. 錯誤回應（對齊 protocol §5）
+
+| HTTP | 情境 | Body |
+|------|------|------|
+| 400 | Body 非 JSON、非物件、缺 `rows`、`rows` 非陣列 | `{"error": "Malformed JSON or missing 'rows'"}`（或簡短描述）。 |
+| 400 | `rows` 為空 `[]` | `{"error": "empty rows"}`。 |
+| 422 | 缺少必填特徵（feature_list 或 bet_id） | `{"error": "missing features", "missing": ["col1", ...], "extra": ["col2", ...]}`。 |
+| 422 | 特徵型別錯誤 | `{"error": "invalid feature types", "missing": [], "extra": ["field1", ...]}`。 |
+| 503 | 無 artifact / model 未載入 | `{"error": "model not ready"}`。 |
+
+#### 6. 決定摘要
+
+| 項目 | 決定 |
+|------|------|
+| Pass-through | 依「非特徵」動態：不在 feature_list 且非保留鍵即 pass-through；console 列出所有此類鍵。 |
+| GET /model_info training_metrics | 照 `training_metrics.json` 原樣（選項 B）。 |
+| 特徵型別錯誤 | 422，`"error": "invalid feature types"`。 |
+| Empty rows | 400 + `{"error": "empty rows"}`。 |
+
+#### 7. 實作順序建議
+
+1. 在 `_load_artifacts()` 中讀取 `MODEL_DIR / "training_metrics.json"`，存成 `arts["training_metrics_from_file"]`（或 `arts["training_metrics"]`）。
+2. GET /health：加上 `model_loaded`。
+3. GET /model_info：從 artifact + `training_metrics.json` 組出；`training_metrics` 照檔案原樣。
+4. POST /score：改為接受 `{"rows": [...]}`；空 rows → 400；missing/extra → 422；型別錯誤 → 422 `"invalid feature types"`；計算 pass-through 並列印 console；組 response `{ model_version, threshold, scores }`，scores 含 bet_id、score、alert 及 pass-through 鍵，不含 reason_codes。
+5. 統一 400/422/503 body 與 protocol §5。
+6. 可選：更新 `doc/model_api_protocol.md` 註明 request 形狀、特徵由 feature_list 決定、is_rated、pass-through 規則、422 含 `invalid feature types`、empty rows → 400、training_metrics 照 artifact 原樣。
+
+**實作狀態（Round 244）**：步驟 1–6 已完成（Round 232/234：步驟 1–3；Round 235：步驟 4 POST /score；Round 237/238：步驟 5；Round 241：步驟 6 doc 更新；Round 242 Review、Round 243 風險測試鎖定行為）。可選後續：threshold/feature_count 於 GET /model_info、NumPy 純量接受、body 大小 413（見 STATUS Round 242 Review）。
 
 ---
 
@@ -1043,6 +1123,56 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 ---
 
+## Backtester precision-at-recall 指標（計畫）
+
+### 目標與背景
+
+- **對齊對象**：`trainer/backtester.py` 寫出的 `backtest_metrics.json`（以及 backtester 的 performance log）與 `trainer/trainer.py` 的 test 評估指標一致，包含 **precision at recall = X** 的閾值無關指標。
+- **參考**：trainer 在 `_compute_test_metrics` / `_compute_test_metrics_from_scores` 中已產出 `test_precision_at_recall_0.01`、`test_precision_at_recall_0.1`、`test_precision_at_recall_0.5`（見 `trainer.py` 約 2501、2560–2567、2597–2607、2619 行）；backtester 目前僅有單一閾值下的 test_precision / test_recall，未產出 PR 曲線上的 precision-at-recall。
+
+### 範圍
+
+- **改動**：`trainer/backtester.py`（`compute_micro_metrics`、`_zeroed_flat_metrics`，必要時 docstring / 模組頂部說明）；可選：backtester 的 logger 輸出（若需與 trainer 類似的「prec@rec…」log）。
+- **不改動**：`trainer/trainer.py`、scorer、artifact 結構；現有 backtester 其餘流程與鍵名語意不變。
+
+### 設計要點
+
+1. **Target recalls 與 trainer 一致**
+   - 使用與 trainer 相同的 recall 水準：`(0.01, 0.1, 0.5)`（即 `_TARGET_RECALLS`）。
+   - 鍵名：`test_precision_at_recall_0.01`、`test_precision_at_recall_0.1`、`test_precision_at_recall_0.5`。
+
+2. **計算方式（與 trainer 一致）**
+   - 使用 `sklearn.metrics.precision_recall_curve(df["label"], df["score"])` 取得 PR 曲線。
+   - 對每個 target recall `r`：在「recall ≥ r」的曲線點中取 **precision 最大值** 作為 `test_precision_at_recall_{r}`；若無滿足條件的點則為 `None`。
+
+3. **邊界與零值路徑**
+   - Empty df、label 含 NaN、單一類別（n_pos==0 或 n_pos==n_samples）：與現有零值 flat 一致，此三鍵設為 `None`（在 `_zeroed_flat_metrics` 及 `compute_micro_metrics` 的 early-return 路徑中補齊）。
+
+4. **輸出**
+   - 三鍵納入 `compute_micro_metrics` 回傳 dict → 經 `_compute_section_metrics` 進入 `model_default` / `optuna` → 寫入 `backtest_metrics.json`。
+   - 可選：在寫出 JSON 後或組裝 results 時，以 `logger.info` 輸出「prec@rec0.01=… prec@rec0.1=… prec@rec0.5=…」，格式可對齊 trainer 的 test PR-curve log。
+
+### 實作步驟建議
+
+| 步驟 | 內容 |
+|------|------|
+| 1 | 在 `backtester.py` 中自 `sklearn.metrics` 新增 `precision_recall_curve` import（若尚未引入）。 |
+| 2 | 定義與 trainer 一致的 target recalls 常數（如 `_TARGET_RECALLS = (0.01, 0.1, 0.5)`），並在 `_zeroed_flat_metrics` 中為 `test_precision_at_recall_{r}` 三鍵設為 `None`。 |
+| 3 | 在 `compute_micro_metrics` 的「有效 df」路徑中，於計算完 AP/F-beta 後呼叫 `precision_recall_curve(df["label"], df["score"])`，依上述邏輯計算三項 precision-at-recall，併入回傳 dict。 |
+| 4 | 更新 `compute_micro_metrics`（及模組）docstring，說明回傳包含 `test_precision_at_recall_0.01/0.1/0.5`（可為 `None`）。 |
+| 5 | 可選：在 `backtest()` 寫出 `backtest_metrics.json` 後，對 `model_default`（或 optuna）做一次 `logger.info`，輸出 prec@rec 行。 |
+| 6 | 更新 section 鍵集契約：若存在 `_EXPECTED_SECTION_KEYS` / `_EXPECTED_FLAT_KEYS` 等測試常數，將三鍵加入預期鍵集；新增或調整單元測試，驗證三鍵存在且在邊界時為 `None`、在有效資料時為 float 或 None。 |
+
+### 驗收
+
+- `backtest_metrics.json` 的 `model_default` 與 `optuna` 區塊含有 `test_precision_at_recall_0.01`、`test_precision_at_recall_0.1`、`test_precision_at_recall_0.5`，語意與 trainer 一致（PR 曲線上、recall ≥ r 時之最大 precision）。
+- Empty/NaN/single-class 時三鍵為 `None`，不影響既有欄位與下游。
+- 既有 backtester 流程與呼叫端可正常執行；可選驗證：與 trainer 同筆資料下，backtester 與 trainer 的 precision-at-recall 數值一致或極接近。
+
+**實作狀態**：待實作（pending）。
+
+---
+
 ## player_profile_daily 月結更新 + DuckDB ETL 方向（DEC-019 / OPT-002）
 
 **目標**：
@@ -1240,6 +1370,64 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 | I1 | 中 | Step 2：`num_games_with_wager` |
 | I2 | 中 | Step 2：FND-01 CTE |
 | I6 | 低 | Step 0/6：Optuna TPE |
+
+---
+
+## Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入與生產增量更新（計畫）
+
+### 目標與背景
+
+1. **全歷史建 mapping**：Canonical mapping 改為使用「到 `train_end` 為止的**全部歷史** session」，不再受 `--days` 限制；B1 不變：僅使用 `COALESCE(session_end_dtm, lud_dtm) <= train_end`。
+2. **ClickHouse**：已確認建 mapping 時**未**用 `effective_start` / `--days` 限縮；SQL 掃整表、只做 `<= cutoff_dtm`。**無需改動**。
+3. **Local Parquet**：目前以 `load_local_parquet(effective_start, effective_end, ...)` 只載訓練窗內 session，導致 mapping 不完整且易 OOM。改為以 **DuckDB** 掃整份 session Parquet、在 DB 內 dedup + DQ + 產出 links/dummy，再在 pandas 做 M:N，目標 peak RAM 約 4–6 GB。
+4. **寫出與共用**：目前**未**寫入 canonical mapping。納入「建完即寫出」與「若存在且有效則載入」，即可在強機算一次、將檔案放到 `data/`，在筆電或他機共用（假設 session 資料一致且更新至同一時點）。
+5. **生產增量更新**：Session 表頻繁更新時，需能依「mapping 已涵蓋到之時間」只拉新 session、**patch** 既有 mapping，且過程要快以支援即時。
+
+### 一、全歷史 + DuckDB（Local Parquet）
+
+| 步驟 | 內容 |
+|------|------|
+| 1 | **Config**：新增 `CANONICAL_MAP_DUCKDB_*`（memory_limit 上下限、threads）；可選 `CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS`（強制舊 pandas 全量，僅除錯）。 |
+| 2 | **DuckDB 建 mapping**：實作「讀 session Parquet（僅 _CANONICAL_MAP_SESSION_COLS）→ DuckDB 內 FND-01 dedup、FND-02/FND-04、FND-12 → 產出 links + dummy」；WHERE 用 `COALESCE(session_end_dtm, lud_dtm) <= :train_end`；不依賴 Parquet 時間 pushdown。 |
+| 3 | **Identity**：新增 `build_canonical_mapping_from_links(links_df, dummy_pids)`（FND-03 + M:N），回傳 `[player_id, canonical_id]`。 |
+| 4 | **Trainer Step 3（local Parquet）**：改為呼叫 DuckDB 路徑產出 links + dummy → `build_canonical_mapping_from_links`；不再用 `load_local_parquet(effective_start, effective_end, sessions_only=True)` 建 mapping。 |
+| 5 | **錯誤處理**：DuckDB 不可用或查詢失敗時 fail fast 並提示；可選實作 `CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS`。 |
+| 6 | **測試**：DuckDB 路徑與「全量 pandas 建 map」結果一致；無 DuckDB 時行為與錯誤訊息正確。 |
+
+### 二、寫出與載入（共用 artifact）
+
+| 步驟 | 內容 |
+|------|------|
+| 7 | **寫出**：Step 3 成功建出 `canonical_map` 後，寫入 `data/canonical_mapping.parquet`；可選寫 sidecar `data/canonical_mapping.cutoff.json`（`cutoff_dtm` = 本次使用的 train_end），標示此 mapping 有效截止時間。 |
+| 8 | **載入**：Step 3 開始時，若 `data/canonical_mapping.parquet` 存在且（若有 sidecar）`cutoff_dtm >= train_end`，且**未**指定強制重建（見下），則載入並跳過建表；否則照常建。若規定 sidecar 為必備，則 cutoff &lt; train_end 時一律重建。 |
+| 9 | **共用語意**：共用時假設兩邊 session 資料一致且更新至同一時點；mapping 的 cutoff 應 ≥ 該次 run 的 `train_end`。 |
+
+### 三、強制重建（command-line）
+
+| 項目 | 規格 |
+|------|------|
+| **Training** | 新增 CLI 參數（例如 `--rebuild-canonical-mapping`）。若指定，Step 3 **一律**從頭建 mapping（ClickHouse 或 DuckDB/全歷史），**不**讀取既有 `canonical_mapping.parquet`；建完後照常寫出。 |
+| **Serving** | Scorer（或對應 entrypoint）新增同等參數（例如 `--rebuild-canonical-mapping`）。若指定，該輪**不**載入既有 mapping 或增量 state，改為依當時資料源（ClickHouse 全量或 local session 全量）從頭建 mapping；建完後可寫出供後續輪次使用。 |
+| **語意** | 用於：mapping 損壞/過期、schema 或 DQ 變更後需重算、或除錯時確保與載入 artifact 無關。 |
+
+### 四、建表耗時估計（16 個月資料）
+
+假設 session 約 70M–95M 行（16 個月）、僅讀 11 欄、DuckDB 設 memory_limit。
+
+| 路徑 | 預估時間 | 備註 |
+|------|----------|------|
+| **ClickHouse** | **約 10–60 秒** | 掃整表、dedup + filter 在 DB 端；Python 只收 (player_id, canonical_id)。 |
+| **Local Parquet（DuckDB）** | **約 2–5 分鐘**（SSD）/ **約 4–8 分鐘**（HDD） | 讀 1–3 GB 壓縮 Parquet、DuckDB 內 dedup/filter、產出 links；pandas M:N 約 &lt;1 min。 |
+
+### 五、生產增量更新（可選／Phase 2）
+
+**目標**：Session 表頻繁更新時，不每輪全表重算；依「mapping 已涵蓋到之時間」只拉新 session，patch 既有 mapping，並滿足即時延遲。
+
+**持久化狀態**（除既有 mapping 外需新增）：**cutoff_dtm**、**last_lud**（player_id → lud_dtm）、**player_stats**（player_id → session_count, sum_games）；可選持久化 **links** 取代 last_lud 並每次全量 M:N。
+
+**增量流程**：載入狀態 → 查詢 `COALESCE(session_end_dtm, lud_dtm) > cutoff_dtm AND <= new_cutoff` → 新 session FND-01 + DQ → 更新 player_stats 與 dummy set → 增量 M:N 更新 mapping 與 last_lud → 寫回並更新 cutoff_dtm。
+
+**觸發**：Scorer 每輪若有持久化 mapping 且 cutoff 接近 now 則只拉增量並 patch；否則冷啟動全量建表後再恢復增量。
 
 ---
 
