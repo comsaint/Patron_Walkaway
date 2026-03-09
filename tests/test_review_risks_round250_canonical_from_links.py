@@ -9,7 +9,6 @@ Reference: PLAN § Canonical mapping 全歷史 Step 3, STATUS Round 250 Review.
 from __future__ import annotations
 
 import unittest
-from datetime import datetime
 
 import pandas as pd
 

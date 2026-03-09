@@ -118,7 +118,6 @@ class TestR256_1_ScorerAlwaysBuildsCanonicalMapping(unittest.TestCase):
         build_mock.assert_called_once()
 
 
-@unittest.expectedFailure
 class TestR256_1_ScorerLoadsArtifactWhenFilesExistAndCutoffFuture(unittest.TestCase):
     """Review #1 (desired): When parquet+sidecar exist and cutoff >= now and rebuild=False, scorer should NOT call build."""
 

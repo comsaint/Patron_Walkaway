@@ -202,7 +202,9 @@ Returns model metadata for monitoring and debugging.
 - **Feature list**: The set of required feature keys is determined by the service (e.g. from `feature_list.json`). Each row must contain every feature in that list plus `bet_id`.
 - **Reserved key**: `is_rated` (optional, default false) is reserved and not treated as a feature or pass-through.
 - **Pass-through**: Any key in a row that is not in the feature list and not reserved is echoed as-is in the corresponding `scores[i]`. Server may log pass-through keys once per request.
-- **training_metrics** (`GET /model_info`): Sourced from `training_metrics.json` (e.g. under model dir). If the file is missing or read fails, or the root value is not a JSON object, the response uses `{}`.
+- **training_metrics** (`GET /model_info`): Sourced from `training_metrics.json` (e.g. under model dir). If the file is missing or read fails, or the root value is not a JSON object, the response uses `{}`. The value is returned as-is from the file (no reshaping).
+
+*Phase 1 alignment: `trainer/api_server.py` implements the above. Features are taken from `feature_list.json` in the model artifact; request/response and error bodies match §3 and §5.*
 
 ---
 

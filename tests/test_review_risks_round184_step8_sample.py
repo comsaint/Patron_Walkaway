@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +20,7 @@ import pandas as pd
 import trainer.config as config_mod
 import trainer.features as features_mod
 import trainer.trainer as trainer_mod
+from trainer.trainer import _CANONICAL_MAP_SESSION_COLS
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +141,26 @@ def _make_chunks(n: int = 1):
     ]
 
 
+def _minimal_session_parquet_for_canonical(path: Path) -> None:
+    """Write a minimal session parquet with _CANONICAL_MAP_SESSION_COLS so DuckDB canonical path can read it."""
+    base = {
+        "session_id": "s1",
+        "player_id": 10,
+        "casino_player_id": "C1",
+        "lud_dtm": pd.Timestamp("2025-01-15 12:00:00"),
+        "session_start_dtm": pd.Timestamp("2025-01-15 11:00:00"),
+        "session_end_dtm": pd.Timestamp("2025-01-15 12:00:00"),
+        "is_manual": 0,
+        "is_deleted": 0,
+        "is_canceled": 0,
+        "num_games_with_wager": 1,
+        "turnover": 10.0,
+    }
+    df = pd.DataFrame([base])
+    cols = [c for c in _CANONICAL_MAP_SESSION_COLS if c in df.columns]
+    df[cols].to_parquet(path, index=False)
+
+
 class TestR184Step8SmallNPipelineCompletes(unittest.TestCase):
     """Round 184 Review §4 (optional): STEP8_SCREEN_SAMPLE_ROWS=1 with small train completes without crash."""
 
@@ -159,38 +181,60 @@ class TestR184Step8SmallNPipelineCompletes(unittest.TestCase):
         )
         cmap = pd.DataFrame({"player_id": [0], "canonical_id": ["C000"]})
 
-        with (
-            patch("trainer.trainer.get_monthly_chunks", return_value=chunks),
-            patch("trainer.trainer.STEP8_SCREEN_SAMPLE_ROWS", 1),
-            patch("trainer.trainer.load_local_parquet", return_value=(pd.DataFrame(), pd.DataFrame())),
-            patch("trainer.trainer.apply_dq", return_value=(pd.DataFrame(), pd.DataFrame())),
-            patch("trainer.trainer.build_canonical_mapping_from_df", return_value=cmap),
-            patch("trainer.trainer.get_dummy_player_ids_from_df", return_value=set()),
-            patch("trainer.trainer.ensure_player_profile_ready"),
-            patch("trainer.trainer.load_player_profile", return_value=None),
-            patch("trainer.trainer.process_chunk", return_value=Path("fake.parquet")),
-            patch("trainer.trainer.pd.read_parquet", return_value=fake_df),
-            patch("trainer.trainer.train_single_rated_model", return_value=(
-                {"model": None, "threshold": 0.5, "features": []},
-                None,
-                {},
-            )),
-            patch("trainer.trainer.save_artifact_bundle"),
-            patch("trainer.trainer.Path", **{"return_value.stat.return_value.st_size": 500}),
-            patch("duckdb.connect", side_effect=RuntimeError("test")),
-        ):
-            args = argparse.Namespace(
-                start="2025-01-01",
-                end="2025-02-01",
-                days=None,
-                use_local_parquet=True,
-                force_recompute=False,
-                skip_optuna=True,
-                recent_chunks=1,
-                no_preload=False,
-                sample_rated=None,
-            )
-            run_pipeline(args)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            session_parquet = tmp_path / "gmwds_t_session.parquet"
+            _minimal_session_parquet_for_canonical(session_parquet)
+            # Step 7 sums Path(p).stat().st_size for chunk_paths; process_chunk returns this path
+            fake_chunk_path = tmp_path / "fake.parquet"
+            fake_chunk_path.write_bytes(b"x")
+
+            _real_read_parquet = pd.read_parquet
+
+            def read_parquet_side_effect(path, *args, **kwargs):
+                # Step 3 reads session parquet; let it read the real file. Step 7+ read chunks → fake_df.
+                try:
+                    p = Path(path).resolve() if path else None
+                    sp = session_parquet.resolve()
+                except Exception:
+                    return fake_df
+                if p is not None and (p == sp or (hasattr(p, "name") and p.name == "gmwds_t_session.parquet")):
+                    return _real_read_parquet(path, *args, **kwargs)
+                return fake_df
+
+            with (
+                patch("trainer.trainer.LOCAL_PARQUET_DIR", tmp_path),
+                patch("trainer.trainer.CANONICAL_MAPPING_PARQUET", tmp_path / "canonical_mapping.parquet"),
+                patch("trainer.trainer.CANONICAL_MAPPING_CUTOFF_JSON", tmp_path / "canonical_mapping.cutoff.json"),
+                patch("trainer.trainer.get_monthly_chunks", return_value=chunks),
+                patch("trainer.trainer.STEP8_SCREEN_SAMPLE_ROWS", 1),
+                patch("trainer.trainer.load_local_parquet", return_value=(pd.DataFrame(), pd.DataFrame())),
+                patch("trainer.trainer.apply_dq", return_value=(pd.DataFrame(), pd.DataFrame())),
+                patch("trainer.trainer.build_canonical_mapping_from_df", return_value=cmap),
+                patch("trainer.trainer.get_dummy_player_ids_from_df", return_value=set()),
+                patch("trainer.trainer.ensure_player_profile_ready"),
+                patch("trainer.trainer.load_player_profile", return_value=None),
+                patch("trainer.trainer.process_chunk", return_value=fake_chunk_path),
+                patch("trainer.trainer.pd.read_parquet", side_effect=read_parquet_side_effect),
+                patch("trainer.trainer.train_single_rated_model", return_value=(
+                    {"model": None, "threshold": 0.5, "features": []},
+                    None,
+                    {},
+                )),
+                patch("trainer.trainer.save_artifact_bundle"),
+            ):
+                args = argparse.Namespace(
+                    start="2025-01-01",
+                    end="2025-02-01",
+                    days=None,
+                    use_local_parquet=True,
+                    force_recompute=False,
+                    skip_optuna=True,
+                    recent_chunks=1,
+                    no_preload=False,
+                    sample_rated=None,
+                )
+                run_pipeline(args)
 
 
 # ---------------------------------------------------------------------------

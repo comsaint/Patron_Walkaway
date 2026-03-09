@@ -122,8 +122,9 @@ try:
     STEP9_TRAIN_FROM_FILE: bool = getattr(_cfg, "STEP9_TRAIN_FROM_FILE", False)
     STEP9_SAVE_LGB_BINARY: bool = getattr(_cfg, "STEP9_SAVE_LGB_BINARY", False)
     STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
+    CANONICAL_MAP_DUCKDB_RAM_FRACTION: float = getattr(_cfg, "CANONICAL_MAP_DUCKDB_RAM_FRACTION", 0.45)
     CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB: float = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB", 1.0)
-    CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB: float = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB", 6.0)
+    CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB: float = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB", 24.0)
     CANONICAL_MAP_DUCKDB_THREADS: int = getattr(_cfg, "CANONICAL_MAP_DUCKDB_THREADS", 2)
     CASINO_PLAYER_ID_CLEAN_SQL: str = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END")
 except ModuleNotFoundError:
@@ -172,8 +173,9 @@ except ModuleNotFoundError:
     STEP9_TRAIN_FROM_FILE = getattr(_cfg, "STEP9_TRAIN_FROM_FILE", False)
     STEP9_SAVE_LGB_BINARY = getattr(_cfg, "STEP9_SAVE_LGB_BINARY", False)
     STEP8_SCREEN_SAMPLE_ROWS = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
+    CANONICAL_MAP_DUCKDB_RAM_FRACTION = getattr(_cfg, "CANONICAL_MAP_DUCKDB_RAM_FRACTION", 0.45)
     CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB", 1.0)
-    CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB", 6.0)
+    CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB", 24.0)
     CANONICAL_MAP_DUCKDB_THREADS = getattr(_cfg, "CANONICAL_MAP_DUCKDB_THREADS", 2)
     CASINO_PLAYER_ID_CLEAN_SQL = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END")
 
@@ -309,6 +311,41 @@ HISTORY_BUFFER_DAYS: int = 2
 # Canonical mapping: DuckDB path (PLAN Step 2)
 # ---------------------------------------------------------------------------
 
+def _compute_canonical_map_duckdb_budget(available_bytes: Optional[int]) -> int:
+    """Compute DuckDB memory_limit (bytes) for canonical mapping (PLAN Canonical mapping DuckDB 對齊 Step 7).
+
+    budget = clamp(available_bytes * RAM_FRACTION, MIN_GB, MAX_GB).
+    When available_bytes is None, returns MIN_GB (bytes). Invalid fraction or min>max handled with warnings.
+    MIN_GB and MAX_GB must be positive (Round 253 Review #4).
+    """
+    frac = getattr(_cfg, "CANONICAL_MAP_DUCKDB_RAM_FRACTION", 0.45)
+    _min_gb = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB", 1.0)
+    _max_gb = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB", 24.0)
+    if _min_gb <= 0 or _max_gb <= 0:
+        raise ValueError(
+            "CANONICAL_MAP_DUCKDB MEMORY_LIMIT MIN_GB and MAX_GB must be positive"
+        )
+    if not (0.0 < frac <= 1.0):
+        logger.warning(
+            "CANONICAL_MAP_DUCKDB_RAM_FRACTION=%.3f out of (0, 1]; using 0.45",
+            frac,
+        )
+        frac = 0.45
+    lo = int(_min_gb * 1024**3)
+    hi = int(_max_gb * 1024**3)
+    if lo > hi:
+        logger.warning(
+            "CANONICAL_MAP_DUCKDB MEMORY_LIMIT_MIN_GB (%.2f) > MAX_GB (%.2f); swapping",
+            _min_gb,
+            _max_gb,
+        )
+        lo, hi = hi, lo
+    if available_bytes is None:
+        return lo
+    budget = int(available_bytes * frac)
+    return max(lo, min(hi, budget))
+
+
 def build_canonical_links_and_dummy_from_duckdb(
     session_parquet_path: Path,
     train_end: datetime,
@@ -354,9 +391,6 @@ def build_canonical_links_and_dummy_from_duckdb(
         raise ValueError(f"Session Parquet missing required columns: {sorted(missing)}")
 
     # Config validation (Round 253 Review #4)
-    max_gb = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB", 6.0)
-    if not isinstance(max_gb, (int, float)) or max_gb <= 0:
-        raise ValueError("CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB must be a positive number")
     threads = getattr(_cfg, "CANONICAL_MAP_DUCKDB_THREADS", 2)
     if not isinstance(threads, int) or threads < 1:
         raise ValueError("CANONICAL_MAP_DUCKDB_THREADS must be >= 1")
@@ -409,14 +443,51 @@ GROUP BY player_id
 HAVING COUNT(session_id) = 1
    AND SUM(COALESCE(num_games_with_wager, 0)) <= 1"""
 
+    # Align with Step 7: temp_directory (spill to disk over memory_limit), preserve_insertion_order=false (PLAN Canonical mapping DuckDB 對齊 Step 7)
+    temp_dir_raw = str(DATA_DIR / "duckdb_tmp")
+    if "'" in temp_dir_raw:
+        temp_dir = str(DATA_DIR / "duckdb_tmp")
+    else:
+        temp_dir = temp_dir_raw
+    Path(temp_dir).mkdir(parents=True, exist_ok=True)
+    temp_dir_sql = temp_dir.replace("'", "''")
+
+    # Dynamic RAM budget (PLAN Canonical mapping DuckDB 對齊 Step 7)
+    try:
+        import psutil as _psutil
+        _avail = _psutil.virtual_memory().available
+    except Exception:
+        _avail = None
+    budget_bytes = _compute_canonical_map_duckdb_budget(_avail)
+    mem_gb = budget_bytes / 1024**3
+
     con = duckdb.connect(":memory:")
     try:
-        min_gb = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB", 1.0)
-        mem_gb = max(min_gb, min(float(max_gb), 999.0))
         con.execute(f"SET memory_limit = '{mem_gb}GB'")
         con.execute(f"SET threads = {int(threads)}")
-        links_df = con.execute(links_sql).df()
-        dummy_df = con.execute(dummy_sql).df()
+        try:
+            con.execute(f"SET temp_directory = '{temp_dir_sql}'")
+        except Exception as exc:
+            logger.warning("Canonical mapping DuckDB SET temp_directory failed (non-fatal): %s", exc)
+        try:
+            con.execute("SET preserve_insertion_order = false")
+        except Exception as exc:
+            logger.warning("Canonical mapping DuckDB SET preserve_insertion_order failed (non-fatal): %s", exc)
+        logger.info(
+            "Canonical mapping DuckDB runtime: memory_limit=%.2fGB  threads=%d  temp_directory=%s",
+            mem_gb, int(threads), temp_dir,
+        )
+        try:
+            links_df = con.execute(links_sql).df()
+            dummy_df = con.execute(dummy_sql).df()
+        except Exception as exc:
+            _hint = (
+                " If OOM: ensure temp_directory is writable, or reduce CANONICAL_MAP_DUCKDB_THREADS / "
+                "memory limit; see PLAN Canonical mapping DuckDB 對齊 Step 7."
+            )
+            raise RuntimeError(
+                f"Canonical mapping DuckDB query failed: {exc!s}.{_hint}"
+            ) from exc
         dummy_pids: Set[int] = set() if dummy_df.empty else set(dummy_df["player_id"].astype(int).tolist())
         return (links_df, dummy_pids)
     finally:
@@ -3948,60 +4019,64 @@ def run_pipeline(args) -> None:
     dummy_player_ids: set = set()
     rebuild_canonical = getattr(args, "rebuild_canonical_mapping", False)
     _canonical_built = False
-    if use_local:
-        loaded_from_file = False
-        if not rebuild_canonical and CANONICAL_MAPPING_PARQUET.exists() and CANONICAL_MAPPING_CUTOFF_JSON.exists():
-            try:
-                with open(CANONICAL_MAPPING_CUTOFF_JSON, encoding="utf-8") as _f:
-                    _sidecar = json.load(_f)
-                _cutoff_str = _sidecar.get("cutoff_dtm")
-                _cutoff_ts = pd.Timestamp(_cutoff_str) if _cutoff_str else None
-                if _cutoff_ts is not None:
-                    _cutoff_naive = _cutoff_ts.replace(tzinfo=None) if _cutoff_ts.tz else _cutoff_ts
-                    if _cutoff_naive >= train_end:
-                        canonical_map = pd.read_parquet(CANONICAL_MAPPING_PARQUET)
-                        if set(canonical_map.columns) >= {"player_id", "canonical_id"}:
-                            dummy_player_ids = set(_sidecar.get("dummy_player_ids", []))
-                            dummy_player_ids = set(int(x) for x in dummy_player_ids)
-                            loaded_from_file = True
-                            logger.info(
-                                "Canonical mapping loaded from %s (cutoff %s >= train_end)",
-                                CANONICAL_MAPPING_PARQUET, _cutoff_str,
-                            )
-                        else:
-                            logger.warning(
-                                "Canonical mapping artifact missing required columns; will rebuild"
-                            )
-            except Exception as exc:
-                logger.warning("Load canonical mapping artifact failed (%s); will rebuild", exc)
+    # PLAN step 8: try load existing artifact once (use_local and ClickHouse paths both skip build if ok)
+    loaded_from_artifact = False
+    if not rebuild_canonical and CANONICAL_MAPPING_PARQUET.exists() and CANONICAL_MAPPING_CUTOFF_JSON.exists():
+        try:
+            with open(CANONICAL_MAPPING_CUTOFF_JSON, encoding="utf-8") as _f:
+                _sidecar = json.load(_f)
+            _cutoff_str = _sidecar.get("cutoff_dtm")
+            _cutoff_ts = pd.Timestamp(_cutoff_str) if _cutoff_str else None
+            if _cutoff_ts is not None:
+                _cutoff_naive = _cutoff_ts.replace(tzinfo=None) if _cutoff_ts.tz else _cutoff_ts
+                if _cutoff_naive >= train_end:
+                    canonical_map = pd.read_parquet(CANONICAL_MAPPING_PARQUET)
+                    if set(canonical_map.columns) >= {"player_id", "canonical_id"}:
+                        dummy_player_ids = set(_sidecar.get("dummy_player_ids") or [])
+                        dummy_player_ids = set(int(x) for x in dummy_player_ids)
+                        loaded_from_artifact = True
+                        logger.info(
+                            "Canonical mapping loaded from %s (cutoff %s >= train_end)",
+                            CANONICAL_MAPPING_PARQUET, _cutoff_str,
+                        )
+                    else:
+                        logger.warning(
+                            "Canonical mapping artifact missing required columns; will rebuild"
+                        )
+        except Exception as exc:
+            logger.warning("Load canonical mapping artifact failed (%s); will rebuild", exc)
 
-        if not loaded_from_file:
-            use_full_sessions_pandas = getattr(_cfg, "CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS", False)
-            if use_full_sessions_pandas:
-                _, sessions_all = load_local_parquet(
-                    effective_start,
-                    effective_end + timedelta(days=1),
-                    sessions_only=True,
-                )
-                _, sessions_all = normalize_bets_sessions(pd.DataFrame(), sessions_all)
-                _, sessions_all = apply_dq(
-                    pd.DataFrame(columns=["bet_id"]),
-                    sessions_all,
-                    effective_start,
-                    effective_end + timedelta(days=1),
-                )
-                canonical_map = build_canonical_mapping_from_df(sessions_all, cutoff_dtm=train_end)
-                try:
-                    dummy_player_ids = get_dummy_player_ids_from_df(sessions_all, cutoff_dtm=train_end)
-                except Exception as exc:
-                    logger.warning("get_dummy_player_ids_from_df failed (%s); not filtering dummies", exc)
-                sessions_all = None
-            else:
-                sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
-                links_df, dummy_pids = build_canonical_links_and_dummy_from_duckdb(sess_path, train_end)
-                canonical_map = build_canonical_mapping_from_links(links_df, dummy_pids)
-                dummy_player_ids = dummy_pids
-            _canonical_built = True
+    if loaded_from_artifact:
+        pass  # canonical_map, dummy_player_ids already set; skip build for both use_local and ClickHouse
+    elif use_local:
+        sessions_all = None  # R403 guardrail: ensure release in every path; set again in pandas branch
+        use_full_sessions_pandas = getattr(_cfg, "CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS", False)
+        if use_full_sessions_pandas:
+            _, sessions_all = load_local_parquet(
+                effective_start,
+                effective_end + timedelta(days=1),
+                sessions_only=True,
+            )
+            _, sessions_all = normalize_bets_sessions(pd.DataFrame(), sessions_all)
+            _, sessions_all = apply_dq(
+                pd.DataFrame(columns=["bet_id"]),
+                sessions_all,
+                effective_start,
+                effective_end + timedelta(days=1),
+            )
+            canonical_map = build_canonical_mapping_from_df(sessions_all, cutoff_dtm=train_end)
+            try:
+                dummy_player_ids = get_dummy_player_ids_from_df(sessions_all, cutoff_dtm=train_end)
+            except Exception as exc:
+                logger.warning("get_dummy_player_ids_from_df failed (%s); not filtering dummies", exc)
+            sessions_all = None
+        else:
+            sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+            links_df, dummy_pids = build_canonical_links_and_dummy_from_duckdb(sess_path, train_end)
+            canonical_map = build_canonical_mapping_from_links(links_df, dummy_pids)
+            dummy_player_ids = dummy_pids
+            sessions_all = None  # not used in DuckDB path; clear for peak memory guardrail (R403)
+        _canonical_built = True
 
         if _canonical_built:
             try:
@@ -4025,7 +4100,22 @@ def run_pipeline(args) -> None:
         except Exception as exc:
             logger.warning("ClickHouse canonical mapping failed (%s); using empty map", exc)
             canonical_map = pd.DataFrame(columns=["player_id", "canonical_id"])
+            dummy_player_ids = set()
         sessions_all = None
+        # PLAN § Canonical mapping 步驟 7：ClickHouse 路徑建完後也寫出，供共用／下次載入
+        if set(canonical_map.columns) >= {"player_id", "canonical_id"} and not canonical_map.empty:
+            try:
+                canonical_map.to_parquet(CANONICAL_MAPPING_PARQUET, index=False)
+                _cutoff_iso = train_end.isoformat() if hasattr(train_end, "isoformat") else str(train_end)
+                with open(CANONICAL_MAPPING_CUTOFF_JSON, "w", encoding="utf-8") as _f:
+                    json.dump(
+                        {"cutoff_dtm": _cutoff_iso, "dummy_player_ids": list(dummy_player_ids)},
+                        _f,
+                        indent=0,
+                    )
+                logger.info("Canonical mapping written to %s (from ClickHouse)", CANONICAL_MAPPING_PARQUET)
+            except Exception as exc:
+                logger.warning("Write canonical mapping artifact failed (%s); next run will rebuild", exc)
 
     _el = time.perf_counter() - t0
     print("[Step 3/10] Build canonical identity mapping done in %.1fs" % _el, flush=True)

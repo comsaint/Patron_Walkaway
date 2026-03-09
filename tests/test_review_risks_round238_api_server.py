@@ -8,7 +8,6 @@ Reference: PLAN § api_server 對齊 model_api_protocol 步驟 5, STATUS Round 2
 
 from __future__ import annotations
 
-import json
 import sys
 import unittest
 from pathlib import Path

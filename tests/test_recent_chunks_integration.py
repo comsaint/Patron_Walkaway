@@ -78,13 +78,15 @@ class TestRecentChunksIntegration(unittest.TestCase):
                 "label": [1],
                 "is_rated": [True]
             })
-            # Setup fake path stat
+            # Setup fake path: exists + is_file so OOM probe branch runs; patch
+            # _oom_check_after_chunk1 so effective_frac < 1.0 and trainer reruns chunk 1.
             mock_path.return_value.stat.return_value.st_size = 1000
-            
+            mock_path.return_value.exists.return_value = True
+            mock_path.return_value.is_file.return_value = True
+
             mock_process_chunk.return_value = "fake_path.parquet"
             mock_train.return_value = ({"model": None, "threshold": 0.5, "features": []}, None, {})
 
-            # Run pipeline with args
             args = argparse.Namespace(
                 start="2025-01-01",
                 end="2025-06-01",
@@ -94,8 +96,8 @@ class TestRecentChunksIntegration(unittest.TestCase):
                 skip_optuna=True,
                 recent_chunks=2
             )
-            
-            run_pipeline(args)
+            with patch("trainer.trainer._oom_check_after_chunk1", return_value=0.5):
+                run_pipeline(args)
 
         # 1. Assert canonical mapping used train_end from chunk split (DuckDB path).
         mock_links_and_dummy.assert_called_once()

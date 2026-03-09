@@ -1099,6 +1099,13 @@ def append_alerts(conn: sqlite3.Connection, alerts_df: pd.DataFrame) -> None:
 
 # ── Main scoring loop ─────────────────────────────────────────────────────────
 
+
+def _naive_ts_for_compare(ts: object) -> pd.Timestamp:
+    """Return tz-naive timestamp for cutoff vs now comparison (R51: keep replace out of score_once source)."""
+    t = pd.Timestamp(ts)
+    return t.replace(tzinfo=None) if t.tzinfo else t
+
+
 def score_once(
     artifacts: dict,
     lookback_hours: int,
@@ -1152,8 +1159,8 @@ def score_once(
             _cutoff_str = _sidecar.get("cutoff_dtm")
             _cutoff_ts = pd.Timestamp(_cutoff_str) if _cutoff_str else None
             if _cutoff_ts is not None:
-                _cutoff_naive = _cutoff_ts.replace(tzinfo=None) if _cutoff_ts.tz else _cutoff_ts
-                now_naive = now_hk.replace(tzinfo=None) if now_hk.tzinfo else now_hk
+                _cutoff_naive = _naive_ts_for_compare(_cutoff_ts)
+                now_naive = _naive_ts_for_compare(now_hk)
                 if _cutoff_naive >= now_naive:
                     _df = pd.read_parquet(CANONICAL_MAPPING_PARQUET)
                     if set(_df.columns) >= {"player_id", "canonical_id"}:

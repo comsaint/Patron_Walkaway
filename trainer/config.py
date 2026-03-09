@@ -260,11 +260,12 @@ STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = None
 # --- Canonical mapping: DuckDB path (PLAN Canonical mapping 全歷史 Step 1) ---
 # When building canonical mapping from local Parquet, DuckDB is used to scan full
 # session history (COALESCE(session_end_dtm, lud_dtm) <= train_end) with limited RAM.
-# memory_limit is applied via DuckDB SET memory_limit; clamp to [MIN_GB, MAX_GB].
+# memory_limit = available_ram × RAM_FRACTION, clamped to [MIN_GB, MAX_GB] (PLAN Canonical mapping DuckDB 對齊 Step 7).
 # THREADS: worker threads; lower = less peak RAM, slower.
+CANONICAL_MAP_DUCKDB_RAM_FRACTION: float = 0.45
 CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB: float = 1.0
-CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB: float = 6.0
-CANONICAL_MAP_DUCKDB_THREADS: int = 2
+CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB: float = 24.0
+CANONICAL_MAP_DUCKDB_THREADS: int = 1
 # When True, skip DuckDB path and build mapping from full sessions in pandas (debug only;
 # may OOM on large history). PLAN: CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS.
 CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS: bool = False

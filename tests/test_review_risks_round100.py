@@ -126,13 +126,31 @@ class TestR109RunPipelinePassesCanonicalIdsToProfileLoad(unittest.TestCase):
     def test_run_pipeline_passes_all_canonical_ids_when_not_sampled(self):
         """Without --sample-rated, load_player_profile should receive all canonical_ids."""
         import argparse
+        from unittest.mock import MagicMock
         from trainer.trainer import run_pipeline
+
+        # R109: use_local_parquet=True and no artifact on disk → DuckDB path.
+        # Mock DuckDB path so we never call real build_canonical_links_and_dummy_from_duckdb (OOM).
+        cids = [f"cid_{i}" for i in range(5000)]
+        canonical_map_5000 = pd.DataFrame({
+            "player_id": list(range(5000)),
+            "canonical_id": cids,
+        })
+        mock_parquet_path = MagicMock()
+        mock_parquet_path.exists.return_value = False
+        mock_cutoff_path = MagicMock()
+        mock_cutoff_path.exists.return_value = False
 
         with patch("trainer.trainer.get_monthly_chunks") as mock_chunks, \
              patch("trainer.trainer.get_train_valid_test_split") as mock_split, \
              patch("trainer.trainer.load_local_parquet") as mock_load, \
              patch("trainer.trainer.apply_dq") as mock_dq, \
-             patch("trainer.trainer.build_canonical_mapping_from_df") as mock_build, \
+             patch("trainer.trainer.CANONICAL_MAPPING_PARQUET", new=mock_parquet_path), \
+             patch("trainer.trainer.CANONICAL_MAPPING_CUTOFF_JSON", new=mock_cutoff_path), \
+             patch("trainer.trainer.build_canonical_links_and_dummy_from_duckdb",
+                   return_value=(pd.DataFrame(columns=["player_id", "casino_player_id", "lud_dtm"]), set())), \
+             patch("trainer.trainer.build_canonical_mapping_from_links", return_value=canonical_map_5000), \
+             patch("trainer.trainer.build_canonical_mapping_from_df"), \
              patch("trainer.trainer.ensure_player_profile_ready"), \
              patch("trainer.trainer.load_player_profile") as mock_load_profile, \
              patch("trainer.trainer.process_chunk") as mock_process, \
@@ -152,12 +170,6 @@ class TestR109RunPipelinePassesCanonicalIdsToProfileLoad(unittest.TestCase):
             }
             mock_load.return_value = (pd.DataFrame(), pd.DataFrame())
             mock_dq.return_value = (pd.DataFrame(), pd.DataFrame())
-            # canonical_map with 5000 unique IDs
-            cids = [f"cid_{i}" for i in range(5000)]
-            mock_build.return_value = pd.DataFrame({
-                "player_id": list(range(5000)),
-                "canonical_id": cids,
-            })
             mock_load_profile.return_value = pd.DataFrame()
             with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tf:
                 pd.DataFrame({

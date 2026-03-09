@@ -47,6 +47,8 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 
 **資料（訓練/回測）**：預設為 ClickHouse，請確認 `SOURCE_DB` 與憑證正確。本地 Parquet（開發/測試）：在專案根目錄放置 `data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet`（可選 `data/player_profile.parquet`），執行 trainer 或 backtester 時加上 `--use-local-parquet`。
 
+**Canonical mapping 共用 artifact（Step 3）**：訓練 Step 3 會產出 `data/canonical_mapping.parquet` 與 `data/canonical_mapping.cutoff.json`（sidecar 記錄本次使用的 `train_end`）。若兩檔存在且 sidecar 的 `cutoff_dtm` ≥ 該次 run 的 `train_end`，且未指定 `--rebuild-canonical-mapping`，則 Step 3 會**載入既有 artifact 並跳過建表**。若 parquet 缺少必要欄位（`player_id`、`canonical_id`），Step 3 會記錄警告並改為從頭建表。共用 artifact 時（例如將 `data/` 複製至他機）：假設兩邊 session 資料一致且更新至同一時點，mapping 的 cutoff 應 ≥ 該次 run 的 `train_end`；請確保 `data/` 僅由受控程式寫入，勿讓未信任來源寫入該目錄。詳見 `.cursor/plans/PLAN.md` § Canonical mapping 寫出與載入。
+
 ### Data loading & preprocessing
 
 不論資料來自 Parquet、ClickHouse 或 ETL，進入 pipeline 前一律先經 **Post-Load Normalizer**（`trainer/schema_io.py` 的 `normalize_bets_sessions`），再進行 DQ、特徵或寫出，以保證型別契約一致。須經 normalizer 的入口如下：
@@ -83,7 +85,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 **Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`（可加 `--skip-optuna` 跳過閾值搜尋、`--n-trials N` 指定 Optuna 試驗次數）
 
-**即時 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（單次執行加 `--once`；可加 `--model-dir` 指定模型目錄、`--log-level DEBUG|INFO|WARNING`）。所有觀測用同一 rated 模型評分；**僅評級客（is_rated）會產生告警**，非評級客分數僅供 volume 統計（UNRATED_VOLUME_LOG）。
+**即時 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（單次執行加 `--once`；可加 `--model-dir` 指定模型目錄、`--log-level DEBUG|INFO|WARNING`）。Scorer 也會讀取 `data/canonical_mapping.parquet` 與 sidecar（條件同 trainer）；若需強制重建 mapping 可加 `--rebuild-canonical-mapping`。所有觀測用同一 rated 模型評分；**僅評級客（is_rated）會產生告警**，非評級客分數僅供 volume 統計（UNRATED_VOLUME_LOG）。
 
 **Validator**：`python -m trainer.validator --interval 60`（單次加 `--once`；手動強制結案 PENDING 加 `--force-finalize`）
 
@@ -106,6 +108,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `--recent-chunks N` | 僅使用訓練視窗內「最後 N 個」月 chunk（每 chunk 約一個月）。限制從 ClickHouse 或本地 Parquet 載入的資料量；建議 N≥3 以保持 train/valid/test 皆有資料。例如 `--recent-chunks 3` 約為最近 3 個月。 |
 | `--no-preload` | 關閉 profile backfill 時對 session Parquet 的「全表一次載入」，改為每 snapshot 日用 PyArrow pushdown 讀取。預設（不加此旗標）會完整載入整張 session 表格。適合 ≤8 GB RAM 機器，避免 OOM，代價是 backfill 速度較慢。 |
 | `--sample-rated N` | 僅使用 N 個評級客（canonical_id 字典序取前 N 個）。預設不抽樣（使用全部評級客）。 |
+| `--rebuild-canonical-mapping` | 強制從頭建 canonical mapping，不載入既有 `data/canonical_mapping.parquet`；建完後照常寫出。用於 mapping 損壞/過期或 schema 變更後重算。 |
 
 ### 測試
 
@@ -188,6 +191,8 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 
 **数据（训练/回测）**：默认为 ClickHouse，请确认 `SOURCE_DB` 与凭证正确。本地 Parquet（开发/测试）：在项目根目录放置 `data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet`（可选 `data/player_profile.parquet`），运行 trainer 或 backtester 时加上 `--use-local-parquet`。
 
+**Canonical mapping 共用 artifact（Step 3）**：训练 Step 3 会产出 `data/canonical_mapping.parquet` 与 `data/canonical_mapping.cutoff.json`（sidecar 记录本次使用的 `train_end`）。若两档存在且 sidecar 的 `cutoff_dtm` ≥ 该次 run 的 `train_end`，且未指定 `--rebuild-canonical-mapping`，则 Step 3 会**载入既有 artifact 并跳过建表**。若 parquet 缺少必要栏位（`player_id`、`canonical_id`），Step 3 会记录警告并改为从头建表。共用 artifact 时（例如将 `data/` 复制至他机）：假设两边 session 数据一致且更新至同一时点，mapping 的 cutoff 应 ≥ 该次 run 的 `train_end`；请确保 `data/` 仅由受控程式写入，勿让未信任来源写入该目录。详见 `.cursor/plans/PLAN.md` § Canonical mapping 写出与载入。
+
 ### 使用方式
 
 **训练（完整流程）**（在项目根目录）：
@@ -212,7 +217,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 **Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`（可加 `--skip-optuna` 跳过阈值搜索、`--n-trials N` 指定 Optuna 试验次数）
 
-**实时 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（单次执行加 `--once`；可加 `--model-dir` 指定模型目录、`--log-level DEBUG|INFO|WARNING`）。所有观测用同一 rated 模型评分；**仅评级客（is_rated）会产生告警**，非评级客分数仅供 volume 统计（UNRATED_VOLUME_LOG）。
+**实时 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（单次执行加 `--once`；可加 `--model-dir` 指定模型目录、`--log-level DEBUG|INFO|WARNING`）。Scorer 也会读取 `data/canonical_mapping.parquet` 与 sidecar（条件同 trainer）；若需强制重建 mapping 可加 `--rebuild-canonical-mapping`。所有观测用同一 rated 模型评分；**仅评级客（is_rated）会产生告警**，非评级客分数仅供 volume 统计（UNRATED_VOLUME_LOG）。
 
 **Validator**：`python -m trainer.validator --interval 60`（单次加 `--once`；手动强制结案 PENDING 加 `--force-finalize`）
 
@@ -235,6 +240,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `--recent-chunks N` | 仅使用训练窗口内「最后 N 个」月 chunk（每 chunk 约一个月）。限制从 ClickHouse 或本地 Parquet 载入的数据量；建议 N≥3 以保持 train/valid/test 皆有数据。例如 `--recent-chunks 3` 约最近 3 个月。 |
 | `--no-preload` | 关闭 profile backfill 时对 session Parquet 的「全表一次载入」，改为每 snapshot 日用 PyArrow pushdown 读取。默认（不加此旗标）会完整载入整张 session 表格。适合 ≤8 GB RAM 机器，避免 OOM，代价是 backfill 速度较慢。 |
 | `--sample-rated N` | 仅使用 N 个评级客（canonical_id 字典序取前 N 个）。默认不抽样（使用全部评级客）。 |
+| `--rebuild-canonical-mapping` | 强制从头建 canonical mapping，不载入既有 `data/canonical_mapping.parquet`；建完后照常写出。用于 mapping 损坏/过期或 schema 变更后重算。 |
 
 ### 测试
 
@@ -337,6 +343,9 @@ Copy `trainer/.env.example` to `trainer/.env` (or set env vars) for ClickHouse:
   - Place exports in project root: `data/gmwds_t_bet.parquet`, `data/gmwds_t_session.parquet` (and optionally `data/player_profile.parquet`).
   - Use `--use-local-parquet` when running the trainer or backtester.
 
+**Canonical mapping shared artifact (Step 3)**  
+Step 3 writes `data/canonical_mapping.parquet` and `data/canonical_mapping.cutoff.json` (sidecar records this run’s `train_end`). If both exist and the sidecar’s `cutoff_dtm` ≥ this run’s `train_end`, and `--rebuild-canonical-mapping` is not set, Step 3 **loads the existing artifact and skips building**. If the parquet is missing required columns (`player_id`, `canonical_id`), Step 3 logs a warning and rebuilds from scratch. When sharing the artifact (e.g. copying `data/` to another machine), assume session data is consistent and up to the same point; the mapping’s cutoff should be ≥ that run’s `train_end`. Ensure `data/` is written only by controlled processes; do not allow untrusted sources to write to that directory. See `.cursor/plans/PLAN.md` § Canonical mapping write/load.
+
 ---
 
 ## Usage
@@ -384,7 +393,7 @@ python -m trainer.scorer --interval 45 --lookback-hours 8
 # Single run: --once. Override model dir: --model-dir PATH. Log level: --log-level DEBUG|INFO|WARNING
 ```
 
-All observations are scored with the single rated model (v10). **Alerts are emitted only for rated patrons** (`is_rated`); unrated scores are used for volume telemetry only (UNRATED_VOLUME_LOG).
+The scorer also loads `data/canonical_mapping.parquet` and sidecar (same conditions as trainer); use `--rebuild-canonical-mapping` to force a full rebuild. All observations are scored with the single rated model (v10). **Alerts are emitted only for rated patrons** (`is_rated`); unrated scores are used for volume telemetry only (UNRATED_VOLUME_LOG).
 
 ### Validator (match/miss vs realized walkaways)
 
@@ -430,6 +439,7 @@ python -m trainer.status_server
 | `--recent-chunks N` | Use only the last N monthly chunks in the training window (one chunk ≈ one month). Limits data loaded from ClickHouse or local Parquet; recommend N≥3 so train/valid/test are all non-empty. E.g. `--recent-chunks 3` ≈ last 3 months. |
 | `--no-preload` | Disable full-table session Parquet preload during profile backfill; use per-snapshot PyArrow pushdown reads instead. Default (flag absent) is to preload the full session table once. Recommended for ≤8 GB RAM to avoid OOM at the cost of slower backfill. |
 | `--sample-rated N` | Use only N canonical_ids (first N by lexicographic order). Default: no sampling (all rated). |
+| `--rebuild-canonical-mapping` | Force rebuild canonical mapping from scratch; do not load existing `data/canonical_mapping.parquet`; write after build. Use when mapping is corrupted/expired or after schema changes. |
 
 ---
 

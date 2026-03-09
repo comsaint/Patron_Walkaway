@@ -66,8 +66,11 @@ todos:
     content: "api_server 對齊 doc/model_api_protocol.md：Request {rows}、Response {model_version,threshold,scores}、pass-through、/health model_loaded、/model_info training_metrics.json 原樣、422 invalid feature types、empty rows→400；步驟 1–6 已完成（R232/234/235/237/238/241），R242 Review + R243 測試鎖定現有行為"
     status: completed
   - id: canonical-mapping-full-history
-    content: "Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入；--rebuild-canonical-mapping（trainer + scorer）；步驟 1 已完成（R245/R246/R247）；步驟 2 已完成（R253/R254 Review/R255 實作修正）；步驟 3 已完成（R249/R250 Review/R251 測試）；步驟 4–9 與 CLI 待實作；見「Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入與生產增量更新」"
-    status: pending
+    content: "Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入；--rebuild-canonical-mapping（trainer + scorer）；步驟 1–9 已完成（步驟 9 Round 384 README 文件化）；見「Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入與生產增量更新」"
+    status: completed
+  - id: canonical-mapping-duckdb-align-step7
+    content: "Canonical mapping DuckDB 對齊 Step 7：temp_directory、preserve_insertion_order、動態 RAM 預算（available × fraction clamp MIN/MAX）、錯誤訊息不再建議 Pandas。Round 386 完成 temp_directory + preserve_insertion_order + 錯誤訊息；Round 388 完成動態 RAM 預算（CANONICAL_MAP_DUCKDB_RAM_FRACTION、MIN/MAX_GB）。見「Canonical mapping DuckDB 對齊 Step 7」一節。"
+    status: completed
 isProject: false
 ---
 
@@ -113,10 +116,10 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 6 | **Train–Serve Parity：Scorer / Backtester 與 trainer 對齊** | 完成（Round 221：Scorer + Backtester 打分前準備；Round 222：Backtester player_profile PIT join、Track LLM 在完整 bets 上計算後 merge 再 label） | 下方「Train–Serve Parity：Scorer / Backtester 與 trainer.py 對齊規格」一節；R221 審查風險已轉為 tests（test_review_risks_round221_train_serve_parity.py） |
 | 7 | **Backtester 評估輸出格式對齊 trainer** | completed | 下方「Backtester 評估輸出格式對齊 trainer」一節；步驟 1–4、6 已完成（Round 225/226），步驟 3 於 Round 226 實作（section flat、無 micro 巢狀）。 |
 | 8 | **Backtester precision-at-recall 指標** | completed | 下方「Backtester precision-at-recall 指標」一節；Round 229/230/231 實作與 Review 修復。 |
-| 9 | **api_server 對齊 model_api_protocol** | in progress | 下方「api_server 對齊 model_api_protocol 實作計畫」一節；步驟 1–5 已完成（Round 232/234/235/237/238），僅步驟 6（可選 doc）未做。 |
-| 10 | **Canonical mapping 全歷史 + DuckDB + 寫出/載入 + 強制重建** | pending | 下方「Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入與生產增量更新」一節；含 `--rebuild-canonical-mapping`（trainer + scorer）。 |
+| 9 | **api_server 對齊 model_api_protocol** | completed | 下方「api_server 對齊 model_api_protocol 實作計畫」一節；步驟 1–6 已完成（Round 232/234/235/237/238/241；本輪確認 doc 與實作一致並補 Phase 1 alignment 註記）。 |
+| 10 | **Canonical mapping 全歷史 + DuckDB + 寫出/載入 + 強制重建** | completed | 下方「Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入與生產增量更新」一節；步驟 1–9 已完成（Round 384 步驟 9 README 文件化）；CLI 已接線；五、生產增量更新為可選 Phase 2。 |
 
-**Plan 狀態摘要（Round 240）**：上表 1～8 項為 **completed**，第 9 項為 **in progress**（步驟 1–5 完成，僅步驟 6 可選未做），第 10 項為 **pending**。tests / typecheck / lint 全過（見 STATUS.md Round 240）。
+**Plan 狀態摘要**：上表 1～10 項均為 **completed**。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。
 
 **建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。Backtester 輸出格式對齊（項目 7）可獨立排入。
 
@@ -1398,11 +1401,11 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 ### 二、寫出與載入（共用 artifact）
 
-| 步驟 | 內容 |
-|------|------|
-| 7 | **寫出**：Step 3 成功建出 `canonical_map` 後，寫入 `data/canonical_mapping.parquet`；可選寫 sidecar `data/canonical_mapping.cutoff.json`（`cutoff_dtm` = 本次使用的 train_end），標示此 mapping 有效截止時間。 |
-| 8 | **載入**：Step 3 開始時，若 `data/canonical_mapping.parquet` 存在且（若有 sidecar）`cutoff_dtm >= train_end`，且**未**指定強制重建（見下），則載入並跳過建表；否則照常建。若規定 sidecar 為必備，則 cutoff &lt; train_end 時一律重建。 |
-| 9 | **共用語意**：共用時假設兩邊 session 資料一致且更新至同一時點；mapping 的 cutoff 應 ≥ 該次 run 的 `train_end`。 |
+| 步驟 | 內容 | 實作狀態 |
+|------|------|----------|
+| 7 | **寫出**：Step 3 成功建出 `canonical_map` 後，寫入 `data/canonical_mapping.parquet`；可選寫 sidecar `data/canonical_mapping.cutoff.json`（`cutoff_dtm` = 本次使用的 train_end），標示此 mapping 有效截止時間。 | 已完成（Round 376/379 use_local + ClickHouse 路徑寫出） |
+| 8 | **載入**：Step 3 開始時，若 `data/canonical_mapping.parquet` 存在且（若有 sidecar）`cutoff_dtm >= train_end`，且**未**指定強制重建（見下），則載入並跳過建表；否則照常建。若規定 sidecar 為必備，則 cutoff &lt; train_end 時一律重建。Sidecar 的 `dummy_player_ids` 為 null 或缺失時以空 list 處理（Round 382 Review #1）。 | 已完成（Round 382 兩路徑共用載入、Round 383 or [] 修復） |
+| 9 | **共用語意**：共用時假設兩邊 session 資料一致且更新至同一時點；mapping 的 cutoff 應 ≥ 該次 run 的 `train_end`。 | 已完成（Round 384 文件化於 README：Step 3 載入條件、共用假設、`--rebuild-canonical-mapping`） |
 
 ### 三、強制重建（command-line）
 
@@ -1433,9 +1436,28 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 ---
 
+## Canonical mapping DuckDB 對齊 Step 7（建議實作）
+
+**目標**：讓 Step 3 的 `build_canonical_links_and_dummy_from_duckdb` 在「全歷史、資料成長」下不 OOM，且在不同 RAM 機器（8–64 GB）上合理使用記憶體；**不**退回 Pandas 路徑。
+
+**現狀**：Canonical mapping 的 DuckDB 連線僅設定 `memory_limit`（固定 [MIN_GB, MAX_GB]，預設 1–6 GB）與 `threads`，**未**設定 `temp_directory`、**未**設定 `preserve_insertion_order=false`。Step 7 則已設定上述兩項並以 `_compute_step7_duckdb_budget(available_bytes)` 依可用 RAM 動態計算預算。後果：(1) 無 temp_directory → DuckDB 無法 spill，超過 memory_limit 即 OOM；(2) 固定 6 GB 上限 → 在 32–64 GB 機器上浪費 RAM、不必要 spill，在 8 GB 機器上仍可能與其他步驟搶記憶體。
+
+**建議變更**（僅計畫，不在此改 code）：
+
+| 項目 | 內容 |
+|------|------|
+| **temp_directory** | 在 `build_canonical_links_and_dummy_from_duckdb` 建立連線後設定 `SET temp_directory='...'`（可與 Step 7 共用 `DATA_DIR / "duckdb_tmp"` 或專用子目錄）；確保目錄存在。使 DuckDB 超過 memory_limit 時可 spill 到磁碟，避免 OOM。 |
+| **preserve_insertion_order** | 設定 `SET preserve_insertion_order=false`，與 Step 7 一致，降低 DuckDB 峰值記憶體。 |
+| **動態 RAM 預算** | 不再使用固定 MAX_GB（6）。改為與 Step 7 相同模式：以 `psutil.virtual_memory().available`（或同等）取得可用 RAM，計算 `budget = available_ram × CANONICAL_MAP_DUCKDB_RAM_FRACTION`，再 clamp 至 `[CANONICAL_MAP_DUCKDB_RAM_MIN_GB, CANONICAL_MAP_DUCKDB_RAM_MAX_GB]`。Config 新增或沿用：`CANONICAL_MAP_DUCKDB_RAM_FRACTION`（建議 0.4–0.5）、MIN_GB（如 1–2）、MAX_GB（如 24–32），使 8 GB 機器給 DuckDB 較小預算、64 GB 機器可給較大預算。 |
+| **錯誤訊息** | DuckDB 查詢失敗時的 RuntimeError hint 改為建議檢查 temp_directory 可寫、或調低 threads／memory；**不再**建議 `CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS=True`（Pandas 路徑為除錯用，非全歷史量產方案）。 |
+
+**預期**：Step 3 在 8–64 GB 機器上以 DuckDB 完成全歷史 canonical mapping 時不 OOM；大機器減少不必要 spill、小機器保留足夠 headroom 給後續 Step 7 等。
+
+---
+
 ## 開放問題
 
-**實作待辦**：無；可選／後續見「接下來要做的事」一節（OOM 預檢查等）。
+**實作待辦**：Canonical mapping DuckDB 對齊 Step 7（見上一節；temp_directory、preserve_insertion_order、動態 RAM 預算）。可選／後續見「接下來要做的事」一節（OOM 預檢查等）。
 
 ### 業務端協商未決（SSOT §13）
 

@@ -110,8 +110,15 @@ class _PipelineMixin:
             "train_dual_model": patch("trainer.trainer.train_single_rated_model",
                                      return_value=({"model": None, "threshold": 0.5, "features": []}, None, {})),
             "save_bundle": patch("trainer.trainer.save_artifact_bundle"),
-            "path_stat": patch("trainer.trainer.Path",
-                               **{"return_value.stat.return_value.st_size": 500}),
+            "path_stat": patch(
+                "trainer.trainer.Path",
+                **{
+                    "return_value.stat.return_value.st_size": 500,
+                    "return_value.exists.return_value": True,
+                    "return_value.is_file.return_value": True,
+                },
+            ),
+            "oom_check_after_chunk1": patch("trainer.trainer._oom_check_after_chunk1", return_value=0.5),
         }
 
         with (
@@ -131,6 +138,7 @@ class _PipelineMixin:
             patches["train_dual_model"],
             patches["save_bundle"],
             patches["path_stat"],
+            patches["oom_check_after_chunk1"],
         ):
             start_date = chunks[0]["window_start"].strftime("%Y-%m-%d")
             end_date = chunks[-1]["window_end"].strftime("%Y-%m-%d")
