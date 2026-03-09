@@ -179,8 +179,10 @@ class TestRecentChunksPropagation(_PipelineMixin, unittest.TestCase):
 
     def test_process_chunk_called_once_for_one_chunk(self):
         result = self._run_pipeline_with_mocks()
-        self.assertEqual(result["mock_proc_call_count"], 1,
-                         "With recent_chunks=1, only 1 chunk should be processed")
+        # With NEG_SAMPLE_FRAC_AUTO, pipeline runs OOM probe (chunk 1 with frac=1.0) then processes
+        # chunk 1 again with effective frac → 2 process_chunk calls for recent_chunks=1.
+        self.assertEqual(result["mock_proc_call_count"], 2,
+                         "With recent_chunks=1, expect 2 calls (OOM probe + actual chunk) when NEG_SAMPLE_FRAC_AUTO.")
 
 
 # ---------------------------------------------------------------------------

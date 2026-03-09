@@ -47,17 +47,25 @@ class TestR1201BacktesterEmptySubsetGuard(unittest.TestCase):
     """R1201: per-track metric helpers should handle empty subset robustly."""
 
     def test_compute_micro_metrics_empty_df_should_return_empty_dict(self):
+        # R224: empty df returns trainer-aligned flat keys with zeros (not {}) to avoid KeyError.
         df = pd.DataFrame(columns=["score", "label", "is_rated"])
         out = backtester_mod.compute_micro_metrics(
             df,
             threshold=0.5,
             window_hours=1.0,
         )
-        self.assertEqual(
-            out,
-            {},
-            "Expected explicit empty-df guard in compute_micro_metrics.",
-        )
+        self.assertIsInstance(out, dict)
+        self.assertEqual(out["test_ap"], 0.0)
+        self.assertEqual(out["threshold"], 0.5)
+        self.assertEqual(out["test_samples"], 0)
+        self.assertEqual(out["test_positives"], 0)
+        self.assertEqual(out["alerts"], 0)
+        self.assertEqual(out["alerts_per_hour"], 0.0)
+        self.assertIn("test_precision", out)
+        self.assertIn("test_recall", out)
+        self.assertIn("test_f1", out)
+        self.assertIn("test_fbeta_05", out)
+        self.assertIn("test_random_ap", out)
 
     def test_compute_macro_metrics_empty_df_should_return_empty_dict(self):
         df = pd.DataFrame(columns=["canonical_id", "gaming_day", "score", "label", "is_rated"])

@@ -56,6 +56,9 @@ todos:
   - id: plan-b-plus-libsvm-oom
     content: "方案 B+：LibSVM 匯出 + 完整 OOM 避免（Step 7 不載入 train、Step 8 從檔案取樣、串流寫 LibSVM+.weight、Step 9 真正 lgb.Dataset(path)；可選 .bin）；見「方案 B+：LibSVM 匯出與完整 OOM 避免計畫」"
     status: completed
+  - id: backtester-metrics-align
+    content: "Backtester 輸出格式對齊 trainer：移除 macro_by_visit、改用 trainer 風格 test_* 鍵名與 flat 結構；見「Backtester 評估輸出格式對齊 trainer」"
+    status: completed
 isProject: false
 ---
 
@@ -99,10 +102,11 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 4 | **方案 B：LightGBM 從檔案訓練** | completed（Round 198 狀態更新；R199 審查邊界條件已於 Round 201 修正：valid 缺欄不 KeyError、export common_cols 空時拋 ValueError；Config、Step 8、CSV 匯出、從檔案訓練、Booster 包裝、R191/193/197 已完成；手動 pipeline 比對可選） | 下方「方案 B：LightGBM 從檔案訓練」一節 |
 | 5 | **方案 B+：LibSVM + 完整 OOM 避免** | 階段 1–6 已完成（階段 6 第 3 步 Test 從檔案 predict 已於 Round 220 實作） | 下方「方案 B+：LibSVM 匯出與完整 OOM 避免計畫」一節 |
 | 6 | **Train–Serve Parity：Scorer / Backtester 與 trainer 對齊** | 完成（Round 221：Scorer + Backtester 打分前準備；Round 222：Backtester player_profile PIT join、Track LLM 在完整 bets 上計算後 merge 再 label） | 下方「Train–Serve Parity：Scorer / Backtester 與 trainer.py 對齊規格」一節；R221 審查風險已轉為 tests（test_review_risks_round221_train_serve_parity.py） |
+| 7 | **Backtester 評估輸出格式對齊 trainer** | completed | 下方「Backtester 評估輸出格式對齊 trainer」一節；步驟 1–4、6 已完成（Round 225/226），步驟 3 於 Round 226 實作（section flat、無 micro 巢狀）。 |
 
-**Plan 狀態摘要（Round 223）**：上表 1～6 項均為 **completed**，無剩餘必要項目。tests/typecheck/lint 已全過（見 STATUS.md Round 223）。
+**Plan 狀態摘要（Round 228）**：上表 1～7 項均為 **completed**。tests / typecheck / lint 全過（見 STATUS.md Round 228）。
 
-**建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。
+**建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。Backtester 輸出格式對齊（項目 7）可獨立排入。
 
 **可選／後續**（非阻斷）：(1) OOM 預檢查（Step 6 以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC）已於 Round 210/211/212 實作並通過 Review 修復；規格見「OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC」一節。(2) Round 222 Review 建議之 production 補強（Track LLM 失敗 warning、canonical_ids=[]、use_local_parquet 參數、candidates 型別防呆）可依優先度排入。
 
@@ -971,6 +975,71 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - [x] Scorer：bet 查詢含 `gaming_day`；session `casino_player_id` 與 config/trainer 一致。（Round 221 已完成）
 - [x] Backtester：player_profile PIT join；Track LLM 在完整 bets 上計算後 merge 再 label。（Round 222 完成；打分前補齊欄位 + `coerce_feature_dtypes` + 完整 feature 矩陣已於 Round 221 完成）
 - [x] 確認 Backtester 未套用 H2 session_avail_dtm 過濾（與 trainer 行為一致；規格明訂不實作）。
+
+---
+
+## Backtester 評估輸出格式對齊 trainer（計畫）
+
+### 目標與背景
+
+- **對齊對象**：`trainer/backtester.py` 寫出的 `backtest_metrics.json` 與 `trainer/trainer.py` 的 `training_metrics.json` 在「評估指標」的鍵名與結構上一致，方便比對與下游共用。
+- **移除 macro_by_visit**：專案已無「visit」概念，不再產出 per-gaming-day / per-visit 的 macro 指標；backtester 僅保留 observation-level（micro）指標，並改為與 trainer 的 test 評估格式一致。
+
+### 範圍
+
+- **僅改動**：`trainer/backtester.py`（及必要時其單元測試）。
+- **不改動**：`trainer/trainer.py`、scorer、artifact 結構（model.pkl / feature_list.json 等）。
+
+### 設計要點
+
+1. **廢除 macro_by_visit**
+   - 不再呼叫 `compute_macro_by_gaming_day_metrics`。
+   - 從 `_compute_section_metrics` 回傳中移除 `macro_by_visit` 與 `rated_track.macro_by_visit`。
+   - 模組頂部 docstring 中 G4 / Macro-by-visit / per-visit 相關描述一併刪除或改寫。
+   - 可選擇保留 `compute_macro_by_gaming_day_metrics` 函式本體但不再被呼叫，或整段移除（若確定未來不做 run-level macro 再實作）。
+
+2. **輸出格式對齊 trainer**
+   - Trainer 的評估輸出為 **flat**：`test_ap`, `test_precision`, `test_recall`, `test_f1`, `test_fbeta_05`, `threshold`, `test_samples`, `test_positives`, `test_random_ap` 等（見 `_compute_test_metrics`）。
+   - Backtester 目前為巢狀：`model_default.micro`, `model_default.macro_by_visit`, `optuna.*`。
+   - **對齊後**：每個 section（`model_default` / `optuna`）改為 **flat、trainer 風格** 的鍵名，且不再包含 `micro` / `macro_by_visit` 巢狀。
+
+3. **鍵名對應**
+
+   | 目前 backtester（micro 內） | 對齊後（trainer 風格） |
+   |---------------------------|-------------------------|
+   | `ap`                      | `test_ap`               |
+   | `precision`               | `test_precision`        |
+   | `recall`                  | `test_recall`          |
+   | （需新增）                 | `test_f1`（2×P×R/(P+R)）|
+   | `fbeta_0.5`               | `test_fbeta_05`         |
+   | `rated_threshold`         | `threshold`             |
+   | `observations`            | `test_samples`          |
+   | `positives`               | `test_positives`        |
+   | （可算）                  | `test_random_ap` = positives / test_samples |
+   | `alerts`                  | 保留 `alerts`（或註解說明等同 TP+FP） |
+   | `alerts_per_hour`         | 保留（trainer 無此欄，但 backtester 保留合理） |
+
+4. **結構**
+   - 保留 `model_default` 與 `optuna` 兩個區塊（若啟用 Optuna），各自為一組 flat 的 test_* + threshold + alerts 等。
+   - 不再有 `rated_track` 巢狀；若需「僅 rated 軌」語意，以註解或單一 flat 區塊表達即可。
+
+### 實作步驟建議
+
+| 步驟 | 內容 |
+|------|------|
+| 1 | 在 `_compute_section_metrics` 中停止呼叫 `compute_macro_by_gaming_day_metrics`，並從回傳移除 `macro_by_visit`、`rated_track.macro_by_visit`。 |
+| 2 | 在 `compute_micro_metrics`（或 `_compute_section_metrics` 內）補算 `test_f1`、`test_random_ap`，並將回傳鍵改為 `test_ap`, `test_precision`, `test_recall`, `test_f1`, `test_fbeta_05`, `threshold`, `test_samples`, `test_positives`, `test_random_ap`, `alerts`, `alerts_per_hour` 等，改為 flat 結構。 |
+| 3 | 在 `backtest()` 組裝結果時，`model_default` / `optuna` 底下改為直接展開上述 flat 鍵，不再包一層 `micro`。 |
+| 4 | 更新 backtester 模組與函式 docstring，移除或改寫 G4、Macro-by-visit、per-visit 相關說明。 |
+| 5 | 可選：以 `precision_recall_curve` 產出 `test_precision_at_recall_0.01/0.1/0.5`、若需再產出 `test_precision_prod_adjusted`，以與 trainer 完全一致。 |
+| 6 | 更新或新增單元測試，驗證輸出鍵名與結構、以及不再出現 `macro_by_visit`。 |
+
+### 驗收
+
+- `backtest_metrics.json` 中無 `macro_by_visit`、無 `micro` 巢狀；`model_default` 與 `optuna` 均為 trainer 風格的 flat test_* 鍵名。
+- 既有 backtester 流程與呼叫端（若有）仍可正常執行；數值語意不變（僅鍵名與結構變更）。
+
+**實作狀態（Round 226）**：步驟 1、2、4、6 於 Round 225 完成；步驟 3（`model_default`/`optuna` 改為 flat、無 `micro` 巢狀）於 Round 226 完成。
 
 ---
 

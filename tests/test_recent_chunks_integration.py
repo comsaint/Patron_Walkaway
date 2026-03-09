@@ -126,12 +126,15 @@ class TestRecentChunksIntegration(unittest.TestCase):
         self.assertEqual(call_args[1], expected_effective_end)
         self.assertEqual(kwargs.get("use_local_parquet"), True)
 
-        # 4. Assert process_chunk was only called for the 2 recent chunks
-        self.assertEqual(mock_process_chunk.call_count, 2)
+        # 4. Assert process_chunk was called: OOM probe (chunk 1) + rerun chunk 1 + chunk 2 when NEG_SAMPLE_FRAC_AUTO
+        self.assertEqual(mock_process_chunk.call_count, 3,
+                         "With recent_chunks=2 and OOM probe: probe(chunk[-2]) + rerun(chunk[-2]) + chunk[-1]")
         chunk_args_1 = mock_process_chunk.call_args_list[0][0][0]
         chunk_args_2 = mock_process_chunk.call_args_list[1][0][0]
+        chunk_args_3 = mock_process_chunk.call_args_list[2][0][0]
         self.assertEqual(chunk_args_1, fake_chunks[-2])
-        self.assertEqual(chunk_args_2, fake_chunks[-1])
+        self.assertEqual(chunk_args_2, fake_chunks[-2])
+        self.assertEqual(chunk_args_3, fake_chunks[-1])
 
 if __name__ == "__main__":
     unittest.main()

@@ -10792,3 +10792,370 @@ All checks passed!
 
 ---
 
+## Round 224 — Backtester 評估輸出格式對齊 trainer（PLAN 步驟 1–2）
+
+### 目標
+依 PLAN「Backtester 評估輸出格式對齊 trainer」實作步驟 1–2（僅此兩步，不貪多）：
+- **步驟 1**：在 `_compute_section_metrics` 中停止呼叫 `compute_macro_by_gaming_day_metrics`，並從回傳移除 `macro_by_visit`、`rated_track`。
+- **步驟 2**：在 `compute_micro_metrics` 中補算 `test_f1`、`test_random_ap`，並將回傳鍵改為 trainer 風格：`test_ap`, `test_precision`, `test_recall`, `test_f1`, `test_fbeta_05`, `threshold`, `test_samples`, `test_positives`, `test_random_ap`, `alerts`, `alerts_per_hour`。
+
+### 改了哪些檔
+
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/backtester.py` | **步驟 1**：`_compute_section_metrics` 不再呼叫 `compute_macro_by_gaming_day_metrics`；回傳僅保留 `rated_threshold` 與 `micro`（移除 `macro_by_visit`、`rated_track`）。Docstring 改為「observation-level metrics」，移除 macro/visit 描述。**步驟 2**：`compute_micro_metrics` 補算 `test_f1`、`test_random_ap`；回傳改為 flat 且鍵名對齊 trainer（`test_ap`, `test_precision`, `test_recall`, `test_f1`, `test_fbeta_05`, `threshold`, `test_samples`, `test_positives`, `test_random_ap`, `alerts`, `alerts_per_hour`）。Docstring 註明 PLAN § Backtester 評估輸出格式對齊。 |
+| `tests/test_review_risks_round360.py` | `test_combined_micro_ap_should_match_rated_track_when_unrated_is_noise`：因已移除 `rated_track`，改為斷言 `out["micro"]["test_ap"]` 與預期 rated-only AP（1.0）一致，並加註說明。 |
+
+### 手動驗證
+- 執行 backtester（需先有 model artifact 與資料）：`python -m trainer.backtester --use-local-parquet --skip-optuna --start … --end …`，檢查輸出 JSON 中 `model_default` 與 `optuna` 底下僅有 `rated_threshold` 與 `micro`，且 `micro` 內為 `test_ap`, `test_precision`, `test_recall`, `test_f1`, `test_fbeta_05`, `threshold`, `test_samples`, `test_positives`, `test_random_ap`, `alerts`, `alerts_per_hour`；不應出現 `macro_by_visit`、`rated_track`、舊鍵名（`precision`, `recall`, `ap`, `observations`, `positives`）。
+- `compute_macro_by_gaming_day_metrics` 仍保留於模組內（目前未被呼叫），供未來 run-level macro 或測試參考。
+
+### pytest 結果（本輪執行）
+
+**全套**
+```
+python -m pytest tests/ -q
+3 failed, 785 passed, 3 skipped, 260 warnings in 46.58s
+```
+上述 3 個失敗與本輪 backtester 修改無關：`test_fast_mode_integration`（OOM probe 導致 process_chunk 呼叫次數）、`test_recent_chunks_integration`（recent_chunks 傳遞）、`test_review_risks_round170`（backtest 路徑需 ClickHouse，測試環境未提供）。
+
+**與 backtester 相關**
+```
+python -m pytest tests/test_backtester.py tests/test_review_risks_round360.py tests/test_review_risks_round240.py tests/test_review_risks_round221_train_serve_parity.py tests/test_review_risks_round222_train_serve_parity.py -q -v
+29 passed in 3.41s
+```
+
+### 下一步建議
+- 依 PLAN 步驟 3：在 `backtest()` 組裝結果時，將 `model_default` / `optuna` 底下改為直接展開 flat 鍵（即 `model_default.test_ap`, `model_default.test_precision` 等），不再包一層 `micro`。
+- 步驟 4：更新 backtester 模組頂部 docstring，移除或改寫 G4、Macro-by-visit、per-visit 相關描述。
+
+---
+
+## Round 224 Review — Backtester 評估輸出格式對齊（步驟 1–2）Code Review
+
+**審查範圍**：Round 224 對 `trainer/backtester.py` 與 `tests/test_review_risks_round360.py` 的變更（步驟 1–2：移除 macro_by_visit、compute_micro_metrics 改為 trainer 風格 flat 鍵）。  
+**參考**：PLAN.md § Backtester 評估輸出格式對齊 trainer、STATUS Round 224、DECISION_LOG（DEC-009/010/021）。
+
+---
+
+### 1. 邊界條件：`rated_sub` 為空時 `micro` 為 `{}`，下游易 KeyError
+
+**問題**  
+當 `rated_sub` 為空（例如視窗內全為 unrated）時，`compute_micro_metrics(rated_sub, ...)` 回傳 `{}`，故 `model_default` / `optuna` 為 `{"rated_threshold": t, "micro": {}}`。任何依賴 `results["model_default"]["micro"]["test_ap"]` 或其它 `micro` 內鍵的程式（含未來步驟 3 展開後直接讀 `model_default.test_ap`）會得到 `KeyError`。Trainer 的 `_compute_test_metrics` 在「無有效 test」時仍回傳**完整結構**（test_ap/test_precision/… 皆 0.0、test_samples 等有值），不會回傳空 dict。
+
+**具體修改建議**  
+- 在 `compute_micro_metrics` 中，當 `df.empty` 時不要回傳 `{}`，改回傳與「有資料時」相同的鍵集合，數值為 0 或 None（例如：`test_ap`/`test_precision`/`test_recall`/`test_f1`/`test_fbeta_05` 為 0.0，`threshold` 為傳入的 `threshold`，`test_samples`/`test_positives`/`alerts` 為 0，`test_random_ap` 為 0.0，`alerts_per_hour` 為 None）。  
+- 或：在 `_compute_section_metrics` 中，若 `rated_micro` 為空則改為一組「零值 flat」dict（同上鍵集），再賦給 `"micro"`。  
+- 擇一實作即可，以與 trainer 的「無效時仍回傳完整結構」對齊，並避免下游 KeyError。
+
+**希望新增的測試**  
+- `test_compute_micro_metrics_empty_df_returns_flat_keys_with_zeros`：呼叫 `compute_micro_metrics(pd.DataFrame(), threshold=0.5, window_hours=1.0)`，斷言回傳 dict 包含所有 trainer 風格鍵（`test_ap`, `test_precision`, `test_recall`, `test_f1`, `test_fbeta_05`, `threshold`, `test_samples`, `test_positives`, `test_random_ap`, `alerts`, `alerts_per_hour`），且數值為 0 / None / 傳入的 threshold，且無額外鍵。  
+- `test_compute_section_metrics_empty_rated_sub_returns_micro_with_flat_keys`：以 `rated_sub=pd.DataFrame()` 呼叫 `_compute_section_metrics`，斷言 `out["micro"]` 非空且含 `test_ap`（及上述鍵集），避免下游取 `out["micro"]["test_ap"]` 時 KeyError。
+
+---
+
+### 2. 邊界條件／正確性：`label` 含 NaN 時行為未定義
+
+**問題**  
+`compute_micro_metrics` 使用 `df["label"]` 與 `(df["label"] == 1)` 計算 `n_pos`、TP 等，並呼叫 `average_precision_score(df["label"], df["score"])`。若 `label` 含 NaN，則：  
+- `(df["label"] == 1).sum()` 不計 NaN，可能低估 n_pos；  
+- `average_precision_score` 可能拋錯或產生未定義結果（視 sklearn 版本）。  
+Trainer 的 `_compute_test_metrics` 有明確 guard：`int(y_test.isna().sum()) == 0`，不合格時直接回傳零值結構並 log。
+
+**具體修改建議**  
+- 在 `compute_micro_metrics` 開頭（或至少在使用 `label` / 呼叫 `average_precision_score` 前）加入 NaN 檢查：若 `df["label"].isna().any()`，則 log warning 並依政策二擇一：(a) 回傳與 empty 相同的「零值 flat」結構（與建議 1 一致），或 (b) 先 `df = df.dropna(subset=["label"])` 再計算，並在 docstring 註明「NaN label 列會被排除」。  
+- 建議 (a) 以與 trainer「無效則零值、不靜默丟列」的語意一致。
+
+**希望新增的測試**  
+- `test_compute_micro_metrics_nan_labels_returns_safe_structure`：造一筆 `label=np.nan`、`score=0.5`、`is_rated=True` 的 df，呼叫 `compute_micro_metrics`，斷言不拋錯且回傳為零值 flat 結構（或 docstring 若改為 dropna，則斷言 n_pos/AP 未含該列）。
+
+---
+
+### 3. 語意／對齊 trainer：全正或全負時 AP 語意
+
+**問題**  
+Trainer R1100 要求 test 集至少 1 正、1 負，否則 `average_precision_score` 無意義（全正時 AP=1.0 無資訊）。Backtester 的 `compute_micro_metrics` 僅在 `n_pos > 0` 時才算 AP，否則 AP=0.0；但當「全為正」時仍會呼叫 `average_precision_score`，可能得到 1.0 或（依版本）-0.0，與 trainer 的「不合格則零值」不完全一致。
+
+**具體修改建議**  
+- 可選、低優先：在 `compute_micro_metrics` 中，若 `n_pos == 0` 或 `n_pos == n_samples`（全正），則不呼叫 `average_precision_score`，直接將 `test_ap` 設為 0.0（與 trainer 的「unbalanced 時零值」對齊），並在 docstring 註明「單類別時 test_ap 固定 0.0」。  
+- 若專案接受 backtester 在極小視窗下仍產出一個 AP 數值，可僅在 docstring 說明與 trainer 的差異，不強制改行為。
+
+**希望新增的測試**  
+- `test_compute_micro_metrics_all_positive_labels_ap_behavior`：造全為 label=1 的 rated df，呼叫 `compute_micro_metrics`，斷言 `test_ap` 為 0.0（若採「單類別→0」）或斷言回傳不拋錯且含所有鍵（若保留現行行為，僅契約測試）。
+
+---
+
+### 4. 文件漂移：模組頂部 docstring 仍描述 Macro-by-visit
+
+**問題**  
+PLAN 步驟 4 要求「更新 backtester 模組與函式 docstring，移除或改寫 G4、Macro-by-visit、per-visit 相關說明」。目前模組頂部仍寫「Report Micro and Macro-by-gaming-day metrics」「Per-visit at-most-1-TP dedup (G4)」「Macro-by-visit metrics: unweighted mean over visits…」，與實作（已不再產出 macro_by_visit）不一致，易誤導閱讀者與後續維護。
+
+**具體修改建議**  
+- 在 backtester 模組頂部 docstring 中：刪除或改寫「Macro-by-gaming-day」「Per-visit at-most-1-TP dedup (G4)」「Macro-by-visit metrics」等句，改為僅描述「observation-level (micro) metrics」「trainer-style test_* keys」「F-beta threshold (DEC-010)」。  
+- 保留 Pipeline 步驟 1–8 的簡述，將第 8 步改為「Report observation-level metrics (trainer-aligned keys)」之類。
+
+**希望新增的測試**  
+- `test_backtester_module_doc_should_not_reference_macro_by_visit`：`inspect.getdoc(backtester_mod)`（或讀 backtester.py 前 N 行），斷言 docstring 中不出現 "macro_by_visit" 或 "Macro-by-visit"（或依你們用語微調）。
+
+---
+
+### 5. 冗餘鍵：`rated_threshold` 與 `micro.threshold`
+
+**問題**  
+`_compute_section_metrics` 回傳 `{"rated_threshold": threshold, "micro": rated_micro}`，而 `rated_micro` 已含 `"threshold": threshold`。同一閾值出現兩次，若步驟 3 展開 flat 後仍保留 `rated_threshold` 與 `threshold`，會重複。非功能性錯誤，僅結構冗餘。
+
+**具體修改建議**  
+- 步驟 3 展開時只保留一個 `threshold` 鍵（與 trainer 一致），不再使用 `rated_threshold`；或保留 `rated_threshold` 作為向後相容，但在 docstring / PLAN 註明「與 micro.threshold 同值，擇一使用」。  
+- 本輪可不改，待步驟 3 一併整理。
+
+**希望新增的測試**  
+- 可選：步驟 3 完成後，加一測試斷言 `model_default` 與 `optuna` 內僅有一個閾值鍵（`threshold` 或 `rated_threshold`），且值與傳入一致。
+
+---
+
+### 6. 效能與安全性
+
+**結論**  
+- **效能**：未新增迴圈或額外 I/O；計算量與改動前相同，無效能疑慮。  
+- **安全性**：輸出為內部寫入 `backtest_metrics.json`，無使用者可控輸入直接寫入；未發現本輪變更引入之安全問題。
+
+---
+
+### 審查總結
+
+| # | 類型         | 嚴重度 | 摘要 |
+|---|--------------|--------|------|
+| 1 | 邊界條件     | 中     | rated_sub 空時 micro={}，下游易 KeyError；應回傳完整零值 flat 結構。 |
+| 2 | 正確性/邊界  | 中     | label 含 NaN 時未 guard；應檢查並回傳零值或 dropna 並註明。 |
+| 3 | 語意對齊     | 低     | 全正/全負時 AP 與 trainer 語意可選對齊（單類別→test_ap=0）。 |
+| 4 | 文件         | 低     | 模組 docstring 仍描述 Macro-by-visit，應依 PLAN 步驟 4 更新。 |
+| 5 | 結構冗餘     | 低     | rated_threshold 與 micro.threshold 重複，可於步驟 3 一併收斂。 |
+| 6 | 效能/安全    | —      | 無問題。 |
+
+建議優先處理 **#1**（空 rated_sub 回傳完整結構 + 測試）、**#2**（NaN label 處理 + 測試），再視需要做 **#4**（docstring）與 **#3**（可選）。
+
+---
+
+## Round 224 — Reviewer 風險轉為最小可重現測試（tests-only）
+
+### 目標與約束
+- 依使用者要求：先讀 PLAN.md、STATUS.md、DECISION_LOG.md；僅新增 tests，**不修改 production code**。
+- 將 Round 224 Review 所列風險點轉成可執行測試；尚未修復的項目以 `@unittest.expectedFailure` 標示，使 CI 可視但不阻斷。
+
+### 新增檔案
+- `tests/test_review_risks_round224_backtester_metrics_align.py`
+
+### 新增測試清單（與 Review 編號對應）
+
+| Review # | 測試名稱 | 斷言內容 | 狀態 |
+|----------|----------|----------|------|
+| **#1a** | `test_compute_micro_metrics_empty_df_returns_flat_keys_with_zeros` | 空 df 時回傳 dict 含全部 trainer 風格鍵（`test_ap`, `test_precision`, `test_recall`, `test_f1`, `test_fbeta_05`, `threshold`, `test_samples`, `test_positives`, `test_random_ap`, `alerts`, `alerts_per_hour`），數值為 0 / None / 傳入 threshold，且無額外鍵。 | xfail |
+| **#1b** | `test_compute_section_metrics_empty_rated_sub_returns_micro_with_flat_keys` | `rated_sub` 空時 `out["micro"]` 非空且含 `test_ap` 及上述鍵集，避免下游 `out["micro"]["test_ap"]` KeyError。 | xfail |
+| **#2** | `test_compute_micro_metrics_nan_labels_returns_safe_structure` | 一筆 `label=np.nan`、`score=0.5`、`is_rated=True` 的 df 呼叫 `compute_micro_metrics`，不拋錯且回傳為零值 flat 結構（含 `_EXPECTED_FLAT_KEYS`、`test_ap`=0、`test_positives`=0）。 | xfail |
+| **#3** | `test_compute_micro_metrics_all_positive_labels_ap_behavior` | 全為 label=1 的 rated df，回傳含全部鍵且 `test_ap` 為 0.0（與 trainer R1100 單類別→零值對齊）。 | xfail |
+| **#4** | `test_backtester_module_doc_should_not_reference_macro_by_visit` | `inspect.getdoc(backtester_mod)` 中不出現 "macro_by_visit" 或 "Macro-by-visit"。 | xfail |
+| **#5** | `test_compute_section_metrics_returns_rated_threshold_and_micro_with_threshold` | 目前契約：section 含 `rated_threshold` 與 `micro.threshold`（冗餘但現狀）。 | passed |
+
+### 執行方式
+
+**僅跑本輪新增測試**
+```bash
+python -m pytest tests/test_review_risks_round224_backtester_metrics_align.py -v
+```
+
+**預期結果（production 未修時）**
+```
+1 passed, 5 xfailed
+```
+- 1 passed：Review #5 契約測試（當前 section 結構）。
+- 5 xfailed：Review #1a/#1b/#2/#3/#4 為「期望修復後行為」，production 尚未改動故標記為 expectedFailure。
+
+### 全套回歸（本輪執行）
+```bash
+python -m pytest tests/ -q
+```
+結果：`3 failed, 786 passed, 3 skipped, 5 xfailed`。本輪僅新增上述一檔，不修改既有 production；3 個失敗為既有（fast_mode、recent_chunks、round170 ClickHouse），5 xfailed 即本輪 R224 的 5 個 expectedFailure。
+
+### 備註
+- 未新增 lint / typecheck 規則；審查項均以 pytest 契約／行為測試覆蓋。
+- Production 依 Round 224 Review 建議修復後，可依各測試 docstring 移除對應的 `@unittest.expectedFailure`，使 xfail 升為 PASSED。
+
+---
+
+## Round 225 — Backtester R224 Review 修復（empty/NaN/single-class/docstring）
+
+### 目標
+依 Round 224 Review 與 PLAN「Backtester 評估輸出格式對齊 trainer」完成步驟 1、2、4、6 之實作：空 subset 與無效輸入回傳 trainer 風格 flat 零值、單一類別 test_ap=0、模組 doc 移除 Macro-by-visit；測試預期更新並移除 expectedFailure。
+
+### 修改檔案
+
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/backtester.py` | 新增 `_zeroed_flat_metrics(threshold, window_hours)`；`compute_micro_metrics`：空 df → 回傳零值 flat（非 `{}`）、label 含 NaN → 回傳零值 flat 並 log warning、單一類別（n_pos==0 或 n_pos==n_samples）→ `test_ap=0.0` 不呼叫 `average_precision_score`；模組 docstring 移除 Macro-by-gaming-day / G4 / per-visit，改為 observation-level 與 trainer 鍵名說明。 |
+| `tests/test_review_risks_round240.py` | `test_compute_micro_metrics_empty_df_should_return_empty_dict`：預期改為「空 df 回傳 flat 零值」（R224 契約），斷言 11 鍵與零值。 |
+| `tests/test_review_risks_round224_backtester_metrics_align.py` | 移除 5 個 `@unittest.expectedFailure`；`test_compute_micro_metrics_empty_df_returns_flat_keys_with_zeros` 之 `alerts_per_hour` 改為 assert 0.0（window_hours=1.0 時）；NaN 測試預期 `test_samples==0`（與 empty 一致）。 |
+
+### 測試 / typecheck / lint 結果
+
+- **R224 + R240 相關**：`python -m pytest tests/test_review_risks_round224_backtester_metrics_align.py tests/test_review_risks_round240.py -v` → **13 passed**。
+- **全套**：`python -m pytest tests/ -q` → **3 failed, 791 passed, 3 skipped**。3 個失敗為既有：`test_fast_mode_integration`（process_chunk 呼叫次數）、`test_recent_chunks_integration`（effective_window）、`test_review_risks_round170`（clickhouse_connect not available）；與本輪 backtester 改動無關。
+- **typecheck**：`python -m mypy trainer/ --ignore-missing-imports` → **Success: no issues found in 23 source files**。
+- **lint**：`ruff check .` → **All checks passed!**
+
+### 備註
+- PLAN 項目 7「Backtester 評估輸出格式對齊 trainer」步驟 1、2、4、6 已完成；步驟 3（backtest 結果不再包一層 `micro`）為可選／待辦。
+- 若需「全 suite 綠燈」，需另輪處理上述 3 個既存失敗（mock ClickHouse、或調整 integration 對 process_chunk 次數之預期）。
+
+---
+
+## Round 226 — Backtester PLAN 步驟 3：section 改為 flat（無 micro 巢狀）
+
+### 目標
+實作 PLAN「Backtester 評估輸出格式對齊 trainer」**步驟 3**：在 `backtest()` 組裝結果時，`model_default` / `optuna` 底下改為直接展開 flat 鍵（trainer 風格），不再包一層 `micro`。
+
+### 修改檔案
+
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/backtester.py` | `_compute_section_metrics`：回傳改為 `{ **rated_micro, "rated_threshold": threshold }`，不再回傳 `{ "rated_threshold", "micro" }`；docstring 註明回傳 flat、無 `micro` 巢狀。 |
+| `tests/test_review_risks_round224_backtester_metrics_align.py` | `test_compute_section_metrics_empty_rated_sub_returns_micro_with_flat_keys`：改為斷言 section 為 flat（無 `micro` 鍵）、含 `rated_threshold` 與全部 flat 鍵。`test_compute_section_metrics_returns_rated_threshold_and_micro_with_threshold`：改為斷言 top-level `threshold` 與 `rated_threshold`，且無 `micro`。 |
+| `tests/test_review_risks_round360.py` | `test_combined_micro_ap_should_match_rated_track_when_unrated_is_noise`：`out["micro"]["test_ap"]` 改為 `out["test_ap"]`（section 改為 flat）。 |
+
+### 手動驗證
+
+- **Backtester section 為 flat**：執行 `python -m pytest tests/test_review_risks_round224_backtester_metrics_align.py tests/test_review_risks_round360.py -v` → 應全部通過。
+- **寫出之 backtest_metrics.json**：若執行過 `python -m trainer.backtester --use-local-parquet`（或實際 backtest），開啟 `trainer/backtest_out/backtest_metrics.json`，確認 `model_default` 與 `optuna` 區塊為 flat（直接含 `test_ap`, `test_precision`, `threshold` 等），無 `micro` 巢狀。
+
+### pytest -q 結果（本輪執行）
+
+```bash
+python -m pytest tests/ -q
+```
+
+結果：**3 failed, 791 passed, 3 skipped**。3 個失敗為既存（與 Round 225 相同）：`test_fast_mode_integration::test_process_chunk_called_once_for_one_chunk`、`test_recent_chunks_integration::test_recent_chunks_propagates_effective_window`、`test_review_risks_round170::test_backtest_tz_aware_window_should_not_raise_typeerror`；與本輪 backtester 步驟 3 改動無關。
+
+### 下一步建議
+
+1. **PLAN 項目 7**：步驟 3 已完成，可將「Backtester 評估輸出格式對齊 trainer」標為 **completed**（步驟 5 為可選）。
+2. 若需全 suite 綠燈：另輪處理上述 3 個既存失敗（integration 預期或 mock ClickHouse）。
+
+---
+
+## Round 226 Code Review — Backtester 步驟 3（section flat）變更
+
+**審查範圍**：Round 225/226 之 backtester 變更（`_zeroed_flat_metrics`、`compute_micro_metrics` 邊界、`_compute_section_metrics` 回傳 flat、backtest 組裝、相關測試）。  
+**依據**：PLAN.md § Backtester 評估輸出格式對齊 trainer、STATUS Round 224 Review、DECISION_LOG DEC-009/010/021。
+
+### 1. 最可能的 Bug / 回歸風險
+
+| # | 問題 | 具體修改建議 | 希望新增的測試 |
+|---|------|--------------|----------------|
+| 1 | **全路徑契約未驗證**：目前僅對 `_compute_section_metrics` 回傳值斷言「無 micro、flat 鍵」。若日後有人在 `backtest()` 內對 section 再包一層或改鍵名，現有測試不會失敗。 | 在 `backtest()` 組裝後、或寫出 JSON 後，增加一層契約檢查（例如 assert `"micro" not in results["model_default"]`），或由測試覆蓋該路徑。 | 新增測試：mock `load_*` / pipeline，呼叫 `backtest(..., run_optuna=False)` 取得 `results`，斷言 `"micro" not in results["model_default"]`、`results["model_default"]["test_ap"]` 存在且為數值；可選：讀取 `results["metrics_path"]` 的 JSON 做相同斷言，確保寫出格式與記憶體結構一致。 |
+| 2 | **鍵集漂移**：若未來 `compute_micro_metrics` 新增或刪除鍵，section 會一併變動，下游若假設固定鍵集可能 KeyError 或漏讀。 | 在 backtester 或測試中明確定義 section 的預期鍵集（例如 `_EXPECTED_FLAT_KEYS | {"rated_threshold"}`），並在單元測試中斷言 `set(section.keys()) == expected` 或至少 `expected.issubset(section.keys())`，避免無意中改動回傳鍵未同步更新契約。 | 新增測試：`test_compute_section_metrics_section_keys_exactly_expected`，以一筆最小 rated df 呼叫 `_compute_section_metrics`，斷言 `set(out.keys()) == _EXPECTED_FLAT_KEYS | {"rated_threshold"}`（或專案約定的 section 鍵集常數），且無多餘鍵。 |
+
+### 2. 邊界條件
+
+| # | 問題 | 具體修改建議 | 希望新增的測試 |
+|---|------|--------------|----------------|
+| 3 | **window_hours=None 或 0**：`_zeroed_flat_metrics` 與 `compute_micro_metrics` 在 `window_hours is None` 或 `<= 0` 時將 `alerts_per_hour` 設為 None，section 會帶有 `alerts_per_hour: null`。下游若未處理 null 可能出錯。 | 在 docstring 或契約說明中註明：section 的 `alerts_per_hour` 在無有效 window 時為 `None`（JSON null）。若下游一律期望數值，可考慮在 backtester 層統一轉為 `0.0`並在文件註明；目前設計與 trainer 無此欄位一致，保留 None 合理。 | 新增測試：`test_compute_section_metrics_window_hours_none_alerts_per_hour_is_none`，以 `window_hours=None` 呼叫 `_compute_section_metrics`，斷言 `out["alerts_per_hour"] is None`。 |
+| 4 | **labeled 與 rated_sub 列數不一致**：`_compute_section_metrics(labeled, rated_sub, ...)` 僅使用 `rated_sub` 計算指標，`labeled` 僅為 API 相容。若呼叫端誤傳錯位（例如 labeled 與 rated_sub 對應不同視窗），語義錯誤但不會拋錯。 | 維持現狀；docstring 已說明僅 `rated_sub` 用於計算。若需防呆，可選：在 debug 或測試環境中 assert `rated_sub.index.isin(labeled.index).all()` 或列數關係；不建議在 production 強制，以免合法用法被擋。 | 可選：在整合測試或 doc 範例中明確寫出「labeled 為全量、rated_sub 為其 is_rated 子集」，避免誤用。 |
+
+### 3. 安全性
+
+| # | 問題 | 具體修改建議 | 希望新增的測試 |
+|---|------|--------------|----------------|
+| 5 | **輸出寫入**：`backtest_metrics.json` 寫入 `BACKTEST_OUT`（專案可控路徑），內容來自 backtest 結果，無使用者可控輸入直接寫入鍵名或數值。 | 無需修改。若未來接受「輸出路徑可配置」，須確保路徑來自 config 或環境變數、且不可被外部注入為任意路徑（path traversal）。 | 無（本輪未變更寫入路徑或權限邏輯）。 |
+
+### 4. 效能
+
+| # | 問題 | 具體修改建議 | 希望新增的測試 |
+|---|------|--------------|----------------|
+| 6 | **Section 組裝**：`return { **rated_micro, "rated_threshold": threshold }` 僅為單次 dict 展開，無額外迴圈或大物件複製，對 backtest 整體耗時可忽略。 | 無需修改。 | 無。 |
+
+### 5. JSON 序列化與數值
+
+| # | 問題 | 具體修改建議 | 希望新增的測試 |
+|---|------|--------------|----------------|
+| 7 | **NaN 未序列化**：若未來任何 metric 為 `float('nan')` 或 `np.nan`，`json.dump(..., default=str)` 不會處理 nan，標準庫在部分環境下可能拋錯或產出非標準 JSON。目前 `compute_micro_metrics` / `_zeroed_flat_metrics` 皆回傳 0.0 或正常 float。 | 維持現狀即可。若希望防禦：在寫入前對 `results` 做一層 sanitize（例如遞迴將 nan 替換為 None 或 0.0），或在 docstring 註明「所有 metrics 須為 JSON-serializable，不得為 nan」。 | 可選：單元測試中建一個含 `float('nan')` 的 section-like dict，經 `json.dumps` 確認目前行為（會拋錯或產出 NaN 字串），並在文件註明契約。 |
+
+### 6. 向後相容與文件
+
+| # | 問題 | 具體修改建議 | 希望新增的測試 |
+|---|------|--------------|----------------|
+| 8 | **backtest_metrics.json 格式變更**：Round 226 起 `model_default` / `optuna` 改為 flat，不再包含 `micro`。任何曾依賴 `model_default.micro` 或 `optuna.micro` 的腳本、儀表板或文件會失效。 | 在 STATUS / CHANGELOG 或 Backtester 模組 docstring 註明：「自 Round 226 起，backtest_metrics.json 的 model_default 與 optuna 為 flat 結構（trainer 風格鍵名），不再包含 micro 巢狀；下游請改讀 model_default.test_ap 等。」若有已知外部消費者，需通知或提供遷移範例。 | 不適用（文件/溝通）；可選在測試或 doc 中加一則「遷移範例」：舊碼 `x = data["model_default"]["micro"]["test_ap"]` → 新碼 `x = data["model_default"]["test_ap"]`。 |
+
+### 7. 總結
+
+- **必做**：無；本輪實作符合 PLAN 步驟 3，邊界與安全性未發現必須立即修補之問題。
+- **建議**：優先考慮 #1（backtest 全路徑契約測試）、#2（section 鍵集穩定測試）、#3（window_hours=None 時 alerts_per_hour 行為測試）；#8 為文件/溝通。
+- **可選**：#4（labeled/rated_sub 語義文件）、#7（NaN 序列化契約）。
+
+---
+
+## Round 227 — Reviewer 風險點轉成最小可重現測試（僅 tests）
+
+### 目標
+將 Round 226 Code Review 所列風險點轉為最小可重現測試；**不修改 production code**。僅提交 tests，並將新增測試與執行方式寫入 STATUS.md。
+
+### 新增測試
+
+| Review # | 風險點 | 測試位置 | 測試名稱 | 斷言摘要 |
+|----------|--------|----------|----------|----------|
+| #1 | 全路徑契約未驗證 | `tests/test_review_risks_round226_backtester_review.py` | `test_backtest_return_model_default_is_flat_no_micro` | Mock pipeline 後呼叫 `backtest(..., run_optuna=False)`，斷言 `result["model_default"]` 無 `micro`、含 `test_ap` 且為數值。 |
+| #2 | 鍵集漂移 | `tests/test_review_risks_round224_backtester_metrics_align.py` | `test_compute_section_metrics_section_keys_exactly_expected` | 以最小 rated df 呼叫 `_compute_section_metrics`，斷言 `set(out.keys()) == _EXPECTED_SECTION_KEYS`（= _EXPECTED_FLAT_KEYS ∪ {"rated_threshold"}），無多餘鍵。 |
+| #3 | window_hours=None 時 alerts_per_hour | `tests/test_review_risks_round224_backtester_metrics_align.py` | `test_compute_section_metrics_window_hours_none_alerts_per_hour_is_none` | 以 `window_hours=None` 呼叫 `_compute_section_metrics`，斷言 `out["alerts_per_hour"] is None`。 |
+
+- **#4/#5/#6**：Review 標為可選或無需測試，本輪未新增。
+- **#7**（NaN 序列化）：可選；未新增。
+- **#8**（格式變更文件）：文件/溝通，未新增自動化測試。
+
+### 執行方式
+
+**僅跑本輪新增／相關測試**
+```bash
+python -m pytest tests/test_review_risks_round224_backtester_metrics_align.py tests/test_review_risks_round226_backtester_review.py -v
+```
+
+**預期結果**
+- `test_review_risks_round224_backtester_metrics_align.py`：共 8 則（含 2 則本輪新增 #2、#3）。
+- `test_review_risks_round226_backtester_review.py`：1 則（#1）。
+- 合計 9 則，全部應 **passed**。
+
+**全套回歸（可選）**
+```bash
+python -m pytest tests/ -q
+```
+
+### 本輪執行結果（Round 227）
+
+```bash
+python -m pytest tests/test_review_risks_round224_backtester_metrics_align.py tests/test_review_risks_round226_backtester_review.py -v --tb=short -q
+```
+結果：**9 passed**。
+
+---
+
+## Round 228 — 修正三則既存失敗測試（tests/typecheck/lint 全過）
+
+### 目標
+修改測試以符合目前實作（OOM probe、backtest 依賴），使 **所有 tests / typecheck / lint 通過**。不改 production code；僅在「測試本身錯或 decorator 過時」前提下改 tests。
+
+### 修改檔案（僅 tests）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `tests/test_fast_mode_integration.py` | `test_process_chunk_called_once_for_one_chunk`：預期由 1 改為 2（NEG_SAMPLE_FRAC_AUTO 下 OOM probe 會先跑 chunk 1，再跑實際 chunk 1）。 |
+| `tests/test_recent_chunks_integration.py` | `test_recent_chunks_propagates_effective_window`：`process_chunk` 呼叫次數由 2 改為 3（OOM probe + rerun chunk 1 + chunk 2）；斷言三筆 call 的 chunk 為 fake_chunks[-2]、fake_chunks[-2]、fake_chunks[-1]。 |
+| `tests/test_review_risks_round170.py` | `test_backtest_tz_aware_window_should_not_raise_typeerror`：新增 mock `load_player_profile`（return None）、`join_player_profile`（return labeled.copy()），使 backtest 在無 ClickHouse 環境下可跑完，仍驗證 tz-aware window 不拋 TypeError。 |
+
+### 執行結果（本輪）
+
+- **pytest**：`python -m pytest tests/ -q` → **797 passed, 3 skipped**（0 failed）。
+- **typecheck**：`python -m mypy trainer/ --ignore-missing-imports` → **Success: no issues found in 23 source files**。
+- **lint**：`ruff check .` → **All checks passed!**
+
+### 備註
+- 三則皆屬「測試預期與現行實作不符」：OOM probe 增加 process_chunk 次數；round170 未 mock 外部依賴導致無 ClickHouse 時失敗。依「除非測試本身錯」修正測試。
+
+---
+

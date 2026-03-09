@@ -11,19 +11,14 @@ Pipeline
 5. Route observations: rated only (H3).
 6. Score with single rated model.
 7. Optuna TPE 1D threshold search (rated_threshold).
-8. Report Micro and Macro-by-gaming-day metrics.
+8. Report observation-level (micro) metrics aligned with trainer keys.
 
-Evaluation rules (SSOT §10.3)
--------------------------------
-* **Per-visit at-most-1-TP dedup** (G4): for the purpose of computing
-  Macro-by-visit precision/recall, each (canonical_id, gaming_day) visit
-  contributes at most one True Positive, preventing high-frequency players
-  from dominating the metric.  Online scoring is NOT limited to one alert
-  per visit; this dedup applies ONLY to offline evaluation.
-* Micro metrics (observation-level): Precision / Recall / AP (average precision) / F-beta /
-  alerts-per-hour.
-* Macro-by-visit metrics: unweighted mean over visits of per-visit
-  Precision and Recall.
+Evaluation (observation-level, trainer-aligned)
+------------------------------------------------
+* Micro metrics: flat dict with trainer-style keys (test_ap, test_precision,
+  test_recall, test_f1, test_fbeta_05, threshold, test_samples, test_positives,
+  test_random_ap, alerts, alerts_per_hour). F-beta reference uses DEC-010 beta.
+* Empty or invalid subset returns same keys with zeros to avoid downstream KeyError.
 """
 
 from __future__ import annotations
@@ -184,6 +179,26 @@ def load_dual_artifacts() -> Dict[str, Any]:
 # Metric helpers
 # ---------------------------------------------------------------------------
 
+def _zeroed_flat_metrics(threshold: float, window_hours: Optional[float]) -> dict:
+    """Return trainer-style flat metrics dict with zeros (empty/invalid subset)."""
+    alerts_per_hour: Optional[float] = None
+    if window_hours is not None and window_hours > 0:
+        alerts_per_hour = 0.0 / window_hours
+    return {
+        "test_ap": 0.0,
+        "test_precision": 0.0,
+        "test_recall": 0.0,
+        "test_f1": 0.0,
+        "test_fbeta_05": 0.0,
+        "threshold": threshold,
+        "test_samples": 0,
+        "test_positives": 0,
+        "test_random_ap": 0.0,
+        "alerts": 0,
+        "alerts_per_hour": alerts_per_hour,
+    }
+
+
 def _score_df(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.DataFrame:
     """Add ``score`` column to *df* using the single rated model (v10 DEC-021).
 
@@ -208,7 +223,12 @@ def compute_micro_metrics(
     threshold: float,
     window_hours: Optional[float] = None,
 ) -> dict:
-    """Micro (observation-level) metrics (v10 single model: one threshold only).
+    """Observation-level metrics aligned with trainer test_* key names (v10 single model).
+
+    Returns a flat dict with trainer-style keys: test_ap, test_precision, test_recall,
+    test_f1, test_fbeta_05, threshold, test_samples, test_positives, test_random_ap,
+    alerts, alerts_per_hour (PLAN § Backtester 評估輸出格式對齊 trainer).
+    Empty or invalid (e.g. NaN labels, single-class) subset returns same keys with zeros.
 
     Parameters
     ----------
@@ -220,7 +240,12 @@ def compute_micro_metrics(
         Duration of the evaluation window (used to compute alerts/hour).
     """
     if df.empty:
-        return {}
+        return _zeroed_flat_metrics(threshold, window_hours)
+    if "label" in df.columns and df["label"].isna().any():
+        logger.warning(
+            "compute_micro_metrics: label contains NaN — returning zeroed flat metrics (trainer-aligned)."
+        )
+        return _zeroed_flat_metrics(threshold, window_hours)
     df = df.copy()
     # v10: single model — only rated observations get alerts (DEC-021).
     df["is_alert"] = np.where(df["is_rated"], df["score"] >= threshold, False)
@@ -228,15 +253,18 @@ def compute_micro_metrics(
     n_alerts = int(df["is_alert"].sum())
     n_tp = int((df["is_alert"] & (df["label"] == 1)).sum())
     n_pos = int((df["label"] == 1).sum())
+    n_samples = len(df)
 
     prec = n_tp / n_alerts if n_alerts > 0 else 0.0
     rec = n_tp / n_pos if n_pos > 0 else 0.0
+    f1 = 2.0 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    test_random_ap = (n_pos / n_samples) if n_samples > 0 else 0.0
 
-    ap = (
-        float(average_precision_score(df["label"], df["score"]))
-        if n_pos > 0
-        else 0.0
-    )
+    # Single-class (all positive or all negative): test_ap = 0.0 to align with trainer R1100.
+    if n_pos == 0 or n_pos == n_samples:
+        ap = 0.0
+    else:
+        ap = float(average_precision_score(df["label"], df["score"]))
     # F-beta reference metric (beta=0.5, precision-weighted); not used for threshold selection
     fb = float(
         fbeta_score(df["label"], df["is_alert"], beta=_G1_FBETA, zero_division=0)
@@ -247,14 +275,16 @@ def compute_micro_metrics(
         alerts_per_hour = n_alerts / window_hours
 
     return {
-        "precision": prec,
-        "recall": rec,
-        "ap": ap,
-        f"fbeta_{_G1_FBETA}": fb,
+        "test_ap": ap,
+        "test_precision": prec,
+        "test_recall": rec,
+        "test_f1": f1,
+        "test_fbeta_05": fb,
+        "threshold": threshold,
+        "test_samples": n_samples,
+        "test_positives": n_pos,
+        "test_random_ap": test_random_ap,
         "alerts": n_alerts,
-        "true_alerts": n_tp,
-        "positives": n_pos,
-        "observations": len(df),
         "alerts_per_hour": alerts_per_hour,
     }
 
@@ -320,24 +350,21 @@ def _compute_section_metrics(
     threshold: float,
     window_hours: Optional[float],
 ) -> dict:
-    """Compute rated micro/macro metrics (v10 single threshold, DEC-021).
+    """Compute rated observation-level metrics (v10 single threshold, DEC-021).
 
-    Both the top-level ``micro``/``macro_by_visit`` and the nested
-    ``rated_track`` section are computed on rated observations only, so that
+    Metrics are computed on rated observations only (``rated_sub``) so that
     PRAUC and alert metrics are not skewed by unrated population scores.
     The ``labeled`` parameter is accepted for API compatibility but only
     ``rated_sub`` is used for metric computation.
+
+    Returns a flat dict (trainer-style keys): test_ap, test_precision, ...,
+    threshold, rated_threshold, alerts, alerts_per_hour (PLAN step 3: no ``micro``
+    nest; backtest_metrics.json model_default/optuna are flat).
     """
     rated_micro = compute_micro_metrics(rated_sub, threshold, window_hours)
-    rated_macro = compute_macro_by_gaming_day_metrics(rated_sub, threshold)
     return {
+        **rated_micro,
         "rated_threshold": threshold,
-        "micro": rated_micro,
-        "macro_by_visit": rated_macro,
-        "rated_track": {
-            "micro": rated_micro,
-            "macro_by_visit": rated_macro,
-        },
     }
 
 

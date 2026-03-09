@@ -162,9 +162,11 @@ class TestR3602BacktesterCombinedApScope(unittest.TestCase):
             threshold=0.5,
             window_hours=1.0,
         )
+        # Section is flat (PLAN step 3); metrics on rated_sub only; trainer-style key test_ap.
+        # Rated-only AP: labels [1,0], scores [0.95, 0.10] → AP = 1.0 (no unrated skew).
         self.assertAlmostEqual(
-            out["micro"]["ap"],
-            out["rated_track"]["micro"]["ap"],
+            out["test_ap"],
+            1.0,
             places=10,
             msg="Combined AP should not be skewed by unrated observations when policy is rated-only alerts.",
         )

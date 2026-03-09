@@ -45,12 +45,16 @@ class TestR500BacktesterTzAwareBoundary(unittest.TestCase):
         # - apply_dq returns our tiny fixture
         # - canonical map empty -> fallback canonical_id path
         # - Track-B returns input unchanged (we only care about label-stage tz mismatch)
+        # - load_player_profile / join_player_profile mocked so backtest runs without ClickHouse
+        def _minimal_join_profile(labeled, profile_df):
+            return labeled.copy()
+
         with patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)), patch.object(
             backtester_mod, "build_canonical_mapping_from_df", return_value=pd.DataFrame()
-        ), patch.object(backtester_mod, "add_track_b_features", side_effect=lambda df, *_: df):
-            # Desired contract after fixing R500: this should not raise TypeError.
-            # Current behavior: compute_labels receives tz-aware window_end/extended_end
-            # and raises naive-vs-aware comparison TypeError.
+        ), patch.object(backtester_mod, "add_track_b_features", side_effect=lambda df, *_: df), patch.object(
+            backtester_mod, "load_player_profile", return_value=None
+        ), patch.object(backtester_mod, "join_player_profile", side_effect=_minimal_join_profile):
+            # R500: should not raise TypeError (tz-aware window); no ClickHouse required (mocked).
             _ = backtester_mod.backtest(
                 bets_raw=bets,
                 sessions_raw=sessions,
