@@ -12457,3 +12457,22 @@ pytest tests/test_review_risks_round256_canonical_artifact.py tests/test_review_
 - 指令：`pytest tests/test_review_risks_round256_canonical_artifact.py -q`
 - 結果：**12 passed, 1 xfailed**（xfail 為 Review #1 之「Scorer 載入後不呼叫 build」待實作通過）。
 
+---
+
+## Round 258 — Canonical mapping Step 6：DuckDB vs pandas parity 改為抽樣資料測試（文件更新）
+
+**目標**：將 PLAN 步驟 6「DuckDB 路徑與全量 pandas 建 map 結果一致」之測試策略改為**抽樣／小型資料 parity**，避免全量 pandas 建 map 導致 OOM。本輪僅更新文件，不變更程式碼。
+
+### 修改文件
+
+| 文件 | 修改摘要 |
+|------|----------|
+| **PLAN.md** | 步驟 6 表格改為「在小型或抽樣 session 資料上驗證兩路徑結果一致；全量資料不執行全量 pandas 建 map（避免 OOM）」；新增「步驟 6 實作說明」段落，註明以同一份小型或抽樣資料分別跑 DuckDB 路徑與 pandas 路徑並比對產出。 |
+| **STATUS.md** | 本輪紀錄（Round 258）。 |
+| **DECISION_LOG.md** | 新增 DEC-025：Canonical mapping Step 6  parity 測試改採抽樣資料，不執行全量 pandas 建 map。 |
+
+### 後續建議（實作時）
+
+- 新增測試檔（例如 `tests/test_canonical_duckdb_pandas_parity.py`）：同一份小型 session DataFrame 寫成暫存 parquet → DuckDB 路徑產出 `canonical_map`（及 dummy）→ 同一 DataFrame 呼叫 `build_canonical_mapping_from_df` 產出 map → 斷言兩者一致。
+- 執行：`pytest tests/test_canonical_duckdb_pandas_parity.py -v`（測試檔新增後）。
+

@@ -1392,7 +1392,9 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 | 3 | **Identity**：新增 `build_canonical_mapping_from_links(links_df, dummy_pids)`（FND-03 + M:N），回傳 `[player_id, canonical_id]`。 |
 | 4 | **Trainer Step 3（local Parquet）**：改為呼叫 DuckDB 路徑產出 links + dummy → `build_canonical_mapping_from_links`；不再用 `load_local_parquet(effective_start, effective_end, sessions_only=True)` 建 mapping。 |
 | 5 | **錯誤處理**：DuckDB 不可用或查詢失敗時 fail fast 並提示；可選實作 `CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS`。 |
-| 6 | **測試**：DuckDB 路徑與「全量 pandas 建 map」結果一致；無 DuckDB 時行為與錯誤訊息正確。 |
+| 6 | **測試**：在**小型或抽樣 session 資料**上驗證 DuckDB 路徑與 pandas 路徑（`build_canonical_mapping_from_df`）產出之 canonical map 一致；無 DuckDB 時行為與錯誤訊息正確。全量資料不執行全量 pandas 建 map（避免 OOM）。 |
+
+**步驟 6 實作說明**：全量 pandas 建 map 於大資料（如 70M+ session 行）易 OOM，故以同一份小型或抽樣 session 資料分別跑 DuckDB 路徑（`build_canonical_links_and_dummy_from_duckdb` → `build_canonical_mapping_from_links`）與 pandas 路徑，比對兩者產出之 canonical map（及可選 dummy 集合）一致即可。
 
 ### 二、寫出與載入（共用 artifact）
 

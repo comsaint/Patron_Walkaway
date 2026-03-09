@@ -611,4 +611,15 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-025：Canonical mapping Step 6 parity 測試改採抽樣資料（避免 OOM）
+
+**日期**：2026-03-09  
+**相關**：PLAN § Canonical mapping 全歷史 + DuckDB 步驟 6。
+
+**決策**：步驟 6 要求「DuckDB 路徑與全量 pandas 建 map 結果一致」。全量 pandas 建 map（`load_local_parquet` 全段 session + `build_canonical_mapping_from_df`）於大資料（如 70M+ session 行）易 OOM，故**不**在生產規模資料上執行全量 pandas 路徑。改為在**同一份小型或抽樣 session 資料**上分別執行 DuckDB 路徑與 pandas 路徑，比對兩者產出之 canonical map（及可選 dummy 集合）一致，以驗證邏輯 parity。
+
+**理由**：小資料 parity 足以保證兩路徑語義一致；全量比對既不可行（OOM）亦非必要。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*
