@@ -65,6 +65,9 @@ todos:
   - id: backtester-precision-at-recall
     content: "Backtester 產出 precision at recall 指標（與 trainer 一致）：test_precision_at_recall_0.01/0.1/0.5；見「Backtester precision-at-recall 指標」"
     status: completed
+  - id: threshold-precision-at-recall-001-and-metrics
+    content: "閾值與 Precision-at-Recall 報告更新（DEC-026）：優化目標改為 Precision at recall=0.01；target recalls 新增 0.001；每 recall 水準產出 threshold 與 alerts per minute；見「閾值策略與 Precision-at-Recall 報告更新（DEC-026）」"
+    status: completed
   - id: step9-api-protocol-align
     content: "api_server 對齊 doc/model_api_protocol.md：Request {rows}、Response {model_version,threshold,scores}、pass-through、/health model_loaded、/model_info training_metrics.json 原樣、422 invalid feature types、empty rows→400；步驟 1–6 已完成（R232/234/235/237/238/241），R242 Review + R243 測試鎖定現有行為"
     status: completed
@@ -83,6 +86,18 @@ todos:
   - id: scorer-defaults-in-config
     content: "Scorer 預設移至 config.py：SCORER_LOOKBACK_HOURS、SCORER_POLL_INTERVAL_SECONDS 為 --lookback-hours / --interval 的 SSOT；供 trainer 對齊 Track Human/LLM lookback 用"
     status: completed
+  - id: feature-spec-rename-template-to-yaml
+    content: "Feature Spec 檔名重構：features_candidates.template.yaml → features_candidates.yaml（事實文件 SSOT）；更新 trainer/scorer/features/backtester、tests、doc、plans 引用。見「Feature Spec 檔名重構」一節。"
+    status: completed
+  - id: exclude-unrated-before-model
+    content: "Scorer/Backtester：取得 bet 後依 canonical_id 判定 rated，排除 unrated 再送模型；console 註記用 Excluded、由 UNRATED_VOLUME_LOG 控制；Validator 不加 log。見「取得 bet 後排除 unrated 再送模型（計畫）」一節。"
+    status: completed
+  - id: oom-precheck
+    content: "OOM 預檢查：Step 6 以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC；已於 R210/211/212 實作。見「OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC」一節。"
+    status: completed
+  - id: r222-review-production
+    content: "Round 222 Review production 補強：Track LLM 失敗 warning、canonical_ids=[]、use_local_parquet 參數、candidates 型別防呆。見「Round 222 Review production 補強（實作計畫）」一節。四項均已實作（Round 406 完成項目 1、3）。"
+    status: completed
 isProject: false
 ---
 
@@ -93,7 +108,7 @@ isProject: false
 > v10 核心變更：
 > - **單一 Rated 模型**：不為無卡客建模或推論；Non-rated 觀測僅記錄 volume。
 > - **三軌特徵工程**（DEC-022/023/024）：Track Profile（`player_profile_daily`）、Track LLM（DuckDB + Feature Spec YAML）、Track Human（向量化手寫狀態機）。
-> - **閾值策略**（DEC-009/010）：**F1 最大化**，無 precision/alert volume 門檻約束。
+> - **閾值策略**（DEC-009/010/DEC-026）：**Precision at recall=0.01 最大化**，無 precision/alert volume 門檻約束。
 > - **Track Human Phase 1**：`loss_streak`、`run_boundary` 啟用；`table_hc` 延至 Phase 2。
 > - **DuckDB 為核心計算引擎**（DEC-023）：取代 Featuretools DFS，用於 Track LLM；並作為 `player_profile` **local Parquet ETL** 的目標加速引擎。**ClickHouse path 先維持現狀**（SQL → Python/pandas → 聚合）。
 > - **Feature Spec YAML**（DEC-024）：集中管理三軌候選特徵定義。
@@ -106,7 +121,7 @@ isProject: false
 - 身份歸戶：**D2**（Canonical ID；`casino_player_id` 優先）
 - 右截尾：**C1**（Extended pull；至少 X+Y，建議 1 天）
 - Session 特徵策略：**S1**（保守；Phase 1 不啟用 `table_hc`）
-- 上線閾值策略：**F1 最大化**（DEC-009/010）；不設 precision/alert volume 下限約束
+- 上線閾值策略：**Precision at recall=0.01 最大化**（DEC-009/010/DEC-026）；不設 precision/alert volume 下限約束
 - 模型：Phase 1 = **LightGBM 單一模型（Rated only）**
 - 評估口徑：**Bet-level**（SSOT §10；Run-level 延後見 DEC-012）
 - 術語：**Run**（bet-derived 連續下注段；gap ≥ RUN_BREAK_MIN 切分；DEC-013）
@@ -134,14 +149,188 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 12 | **api_server 還原為 DB-only** | completed | 下方「api_server 還原為 DB-only 計畫」一節；已實作並通過 tests/typecheck/lint。 |
 | 13 | **Scorer 預設移至 config** | completed | config.py：SCORER_LOOKBACK_HOURS、SCORER_POLL_INTERVAL_SECONDS；scorer 的 --lookback-hours / --interval 從 config 讀；供 trainer 對齊 Track Human/LLM lookback。 |
 | 14 | **Validator 對齊舊版（僅 alert-level）** | completed | 移除 Visit-level 精準度、精準度輸出與 validator_old 一致、註解 within a visit → within a run；保留 canonical_id 與資料清洗。見 Step 8 下方「Validator 對齊舊版（僅 alert-level）」一節。Round 393 實作。 |
+| 15 | **閾值與 Precision-at-Recall 報告更新（DEC-026）** | completed | 優化目標改為 Precision at recall=0.01；target recalls 新增 0.001；每 recall 水準產出 threshold 與 alerts per minute。Round 398（§2、§3）、Round 400（§1）完成。 |
+| 16 | **取得 bet 後排除 unrated 再送模型** | completed | 下方「取得 bet 後排除 unrated 再送模型（計畫）」一節。Round 402/403 實作並通過 R402 審查測試。 |
+| 17 | **OOM 預檢查** | completed | Step 6 以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC；已於 Round 210/211/212 實作並通過 Review 修復。規格見下方「OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC」一節。 |
+| 18 | **Round 222 Review production 補強** | completed | 四項均已實作：項目 1（Track LLM 失敗 warning + track_llm_degraded）、項目 2（canonical_ids=[]）、項目 3（use_local_parquet 從 CLI 傳入）、項目 4（candidates 型別防呆）。Round 406 完成項目 1、3 與 R222 測試契約更新。規格見下方「Round 222 Review production 補強（實作計畫）」一節。 |
 
-**Plan 狀態摘要**：上表 1～14 項均為 **completed**。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
+**Plan 狀態摘要**：上表 1～18 項均為 **completed**（第 18 項於 Round 406 完成項目 1、3；Round 409 完成 R407 Review #1 錯誤回傳含 track_llm_degraded，為 Review 跟進非新項目）。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
 
-**剩餘項目**：上表「接下來要做的事」**無未完成項**；以下為可選／後續，非阻斷。
+**剩餘項目**：上表 1～18 項均已完成。以下為可選／後續，非阻斷。
 
 **建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。Backtester 輸出格式對齊（項目 7）可獨立排入。Optuna 整份 study 的 early stop（項目 11）為可選省時機制，預設關閉，實作後可依需要設定 `OPTUNA_EARLY_STOP_PATIENCE`。
 
-**可選／後續**（非阻斷）：(1) OOM 預檢查（Step 6 以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC）已於 Round 210/211/212 實作並通過 Review 修復；規格見「OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC」一節。(2) Round 222 Review 建議之 production 補強（Track LLM 失敗 warning、canonical_ids=[]、use_local_parquet 參數、candidates 型別防呆）可依優先度排入。
+**可選／後續**（非阻斷）：(1) OOM 預檢查已於 Round 210/211/212 實作，視為 **completed**（見上表項目 17）。(2) Round 222 Review production 補強見上表項目 18 與下方「Round 222 Review production 補強（實作計畫）」一節，建議實作。
+
+---
+
+## Round 222 Review production 補強（實作計畫）
+
+**目標**：實作 Round 222 Review 建議之四項 production 補強（P1×2、P2×2），使 backtester 可觀測性、邊界與 parity 符合審查建議。  
+**參考**：STATUS.md Round 222 Review、`tests/test_review_risks_round222_train_serve_parity.py`。
+
+### 項目 1 — Track LLM 失敗時的可觀測性（P1）
+
+| 項目 | 內容 |
+|------|------|
+| **問題** | Track LLM 拋錯時僅 `logger.error`，LLM 特徵被 zero-fill，回測可能不可信且難察覺。 |
+| **修改** | 在 backtester 的 Track LLM `except` 區塊：除現有 `logger.error` 外，增加一句 **`logger.warning`**，內文含「Track LLM failed; artifact LLM features will be zero-filled. Backtest scores may be unreliable.」（或與現有 log 風格一致之等價文案）。可選：results 加 `track_llm_degraded: true`。 |
+| **檔案** | `trainer/backtester.py`（Track LLM try/except 區塊）。 |
+| **測試** | 既有 R222 行為測試保留；新增或調整：capture log 出現上述 warning，或 assert `result.get("track_llm_degraded") is True`。 |
+
+### 項目 2 — canonical_map 為空時不載入全表 profile（P1）
+
+| 項目 | 內容 |
+|------|------|
+| **問題** | `canonical_map.empty` 時傳 `canonical_ids=None`，`load_player_profile(..., canonical_ids=None)` 會載入全表。 |
+| **修改** | **Backtester**：`_rated_cids = ... else None` 改為 `... else []`。**trainer**：`load_player_profile` 開頭加 `if canonical_ids is not None and len(canonical_ids) == 0: return None`。 |
+| **檔案** | `trainer/backtester.py`（`_rated_cids`）、定義 `load_player_profile` 的模組。 |
+| **測試** | R222：canonical_map 為空時 assert 傳給 `load_player_profile` 的 `canonical_ids=[]`；`load_player_profile` 單元測試：`canonical_ids=[]` 時 return None。 |
+
+### 項目 3 — use_local_parquet 從 CLI 傳入 backtest（P2）
+
+| 項目 | 內容 |
+|------|------|
+| **問題** | Backtester 固定 `load_player_profile(..., use_local_parquet=False)`，與 `args.use_local_parquet` 不一致。 |
+| **修改** | **backtest()**：新增參數 `use_local_parquet: bool = False`；呼叫 `load_player_profile(..., use_local_parquet=use_local_parquet)`。**main()**：呼叫 `backtest(..., use_local_parquet=args.use_local_parquet)`。 |
+| **檔案** | `trainer/backtester.py`（`backtest()` 簽名與 `load_player_profile` 呼叫；`main()` 對 `backtest()` 的呼叫）。 |
+| **測試** | `backtest(..., use_local_parquet=True)` 或 main 使用 `--use-local-parquet` 時，assert 傳給 `load_player_profile` 的 `use_local_parquet is True`。 |
+
+### 項目 4 — feature_spec track_llm.candidates 型別防呆（P2）
+
+| 項目 | 內容 |
+|------|------|
+| **問題** | `candidates` 存在但非 list（如 dict）時，迭代或取 `feature_id` 可能出錯。 |
+| **修改** | `_raw = (feature_spec.get("track_llm") or {}).get("candidates"); _candidates = _raw if isinstance(_raw, list) else []`，後續僅用 `_candidates`。 |
+| **檔案** | `trainer/backtester.py`（使用 track_llm candidates 之處）。 |
+| **測試** | 既有 R222 行為測試（candidates 為 dict 不 crash）保留；可補 assert 與「無 candidates」行為一致。 |
+
+### 實作順序建議
+
+1. **項目 2**（canonical_ids=[] + load_player_profile early return）  
+2. **項目 4**（candidates 型別防呆）  
+3. **項目 1**（Track LLM warning／可選 results 旗標）  
+4. **項目 3**（use_local_parquet 參數與 main 傳遞）
+
+### 驗收
+
+- 既有 tests（含 `test_review_risks_round222_train_serve_parity.py`）通過。  
+- 四項各有測試覆蓋；typecheck／lint 通過。  
+- STATUS.md 記錄本輪修改與驗證；完成後將上表項目 18 標為 **completed**。
+
+---
+
+## 取得 bet 後排除 unrated 再送模型（計畫）
+
+### 目標與背景
+
+- **目標**：取得 bet 資料並完成 canonical_id 對應後，先區分 rated / unrated，**僅將 rated 觀察送進模型**；unrated 不參與推論，以節省頻寬並避免混淆。
+- **背景**：目前 scorer 與 backtester 會對所有 bet（含 unrated）呼叫模型打分，再於下游僅對 rated 發 alert／算指標；改為在打分前就排除 unrated，模型只處理 rated。
+
+### 適用範圍
+
+| 元件 | 是否改動 | 說明 |
+|------|----------|------|
+| **trainer/scorer.py** | 是 | 在 `_score_df` 前依 `is_rated` 過濾，只保留 rated；僅當 `UNRATED_VOLUME_LOG=True` 時打 console 註記。 |
+| **trainer/backtester.py** | 是 | 在 `_score_df` 前依 `is_rated` 過濾，只保留 rated；無 rated 時回傳與現有一致的 `{"error": "..."}`；僅當 `UNRATED_VOLUME_LOG=True` 時打 console 註記。 |
+| **trainer/validator.py** | 否 | 不跑模型，僅驗證既有 alert；不加「rated only」等 log。 |
+| **trainer/trainer.py** | 否 | 訓練／評估已僅用 rated，無需變更。 |
+
+### 決定摘要
+
+| 項目 | 決定 |
+|------|------|
+| Validator 是否加 log | **不加**「rated patrons only」等說明。 |
+| Console 註記開關 | **仍用 config 控制**：僅當 `UNRATED_VOLUME_LOG=True` 時打「Excluded unrated …; scoring K rated」那一行。 |
+| Backtester 無 rated 時回傳 | 與現有 error 一致：`{"error": "No rated observations in window"}`。 |
+| Log 用詞 | **Excluded**（例如：Excluded N unrated bets (M players); scoring K rated bets.）。 |
+
+### 實作要點
+
+**Rated 定義（不變）**：`canonical_id in canonical_map["canonical_id"]`（identity 僅為有 `casino_player_id` 的玩家建 mapping）。
+
+**scorer.py**
+
+1. 在已有 `features_df` 且已設 `features_all["is_rated"]` / `features_df["is_rated"]` 之後、呼叫 `_score_df` 之前：
+   - 計算 `n_unrated`、`n_rated`、`unrated_players`（必要時用 `player_id`）。
+   - `features_df = features_df[features_df["is_rated"].fillna(False).astype(bool)].copy()`。
+   - 若 `features_df.empty`：log 後 return（例如 "[scorer] No rated bets to score; sleeping"）。
+   - 僅當 `UNRATED_VOLUME_LOG` 為 True 時：`logger.info("[scorer] Excluded %d unrated bets (%d players); scoring %d rated bets.", n_unrated, unrated_players, n_rated)`。
+2. 現有 `UNRATED_VOLUME_LOG` 區塊改為上述單行註記（或保留簡要 volume 數字並由 config 控制）。
+3. `_score_df` 簽名與行為可不變；之後傳入的皆為 rated，`is_rated_obs` 恆為 1。
+
+**backtester.py**
+
+1. 在已設 `labeled["is_rated"]` 之後、呼叫 `_score_df(labeled, artifacts)` 之前：
+   - 先存 `n_rated`、`n_unrated`、`unrated_players`（供 results 與 log 使用）。
+   - 僅當 `UNRATED_VOLUME_LOG` 為 True 時：`logger.info("[backtester] Excluded %d unrated observations (%d players); scoring %d rated.", n_unrated, unrated_players, n_rated)`。
+   - `labeled = labeled[labeled["is_rated"]].copy()`。
+   - 若 `labeled.empty`：`return {"error": "No rated observations in window"}`。
+2. 再呼叫 `_score_df(labeled, artifacts)`；`rated_sub = labeled`；`results["rated_obs"]` / `results["unrated_obs"]` 使用前述儲存之計數。
+
+### 驗收要點
+
+- Scorer：僅 rated 注單進入 `_score_df`；`UNRATED_VOLUME_LOG=False` 時不打 Excluded 那行；為 True 時打一行且用詞為 Excluded。
+- Backtester：僅 rated 進入 `_score_df`；無 rated 時回傳 `{"error": "No rated observations in window"}`；volume log 同上。
+- Validator：無新增 log；行為不變。
+- 既有 alert／指標／寫出格式不變；僅減少送入模型的資料量與 log 混淆。
+
+---
+
+## Feature Spec 檔名重構：template → features_candidates.yaml
+
+### 目標
+
+將 repo 內唯一的 Feature Spec 定義檔由 `features_candidates.template.yaml` 更名為 `features_candidates.yaml`，以反映其角色為**事實文件／SSOT**，而非「需複製填寫的範本」。
+
+### 理由
+
+- 程式實際用法：trainer、scorer、features.py、backtester、測試皆**直接讀取此單一檔案**，沒有「從 template 複製成另一 yaml 再讀」的流程。
+- 語意：「template」易被理解為範例或需替換變數的範本，與「單一真相來源」不符；改名後與「候選特徵定義」的定位一致。
+- 與 DEC-024 的關係不變：訓練時仍將此檔**整份複製**到 artifact 的 `feature_spec.yaml`（凍結版）；「來源檔」不必再用檔名表達「template」。
+
+### 範圍
+
+- **重新命名**：`trainer/feature_spec/features_candidates.template.yaml` → `trainer/feature_spec/features_candidates.yaml`（內容不變）。
+- **更新所有引用**：路徑字串、註解、文件、計畫內提及的檔名，一律改為 `features_candidates.yaml`。
+
+### 需異動的檔案與位置
+
+| 檔案 | 異動內容 |
+|------|----------|
+| `trainer/trainer.py` | `FEATURE_SPEC_PATH` 指向 `feature_spec/features_candidates.yaml`；`save_artifact_bundle(..., feature_spec_path=...)` 註解若提到 template 則改為「來源 spec」或「features_candidates.yaml」。 |
+| `trainer/scorer.py` | `FEATURE_SPEC_PATH` 改為 `feature_spec/features_candidates.yaml`；fallback 註解中的「template」改為「repo spec」或檔名。 |
+| `trainer/features.py` | `_yaml_path` 改為 `feature_spec/features_candidates.yaml`。 |
+| `trainer/backtester.py` | fallback 的 `load_feature_spec(..., "features_candidates.template.yaml")` 改為 `"features_candidates.yaml"`。 |
+| `tests/test_feature_spec_yaml.py` | 註解／常數中的 `features_candidates.template.yaml` 改為 `features_candidates.yaml`（如 `TEMPLATE_YAML` 可考慮改名為 `SPEC_YAML` 或保留變數名、僅改路徑）。 |
+| `tests/test_review_risks_round40.py` | `_FEATURE_SPEC_PATH` 路徑改為 `features_candidates.yaml`。 |
+| `tests/test_review_risks_round112.py` | 路徑字串中的 `features_candidates.template.yaml` 改為 `features_candidates.yaml`。 |
+| `tests/test_scorer_review_risks_round22.py` | `_FEATURE_SPEC_PATH` 與 docstring/assert 訊息中的檔名改為 `features_candidates.yaml`。 |
+| `tests/test_review_risks_round119.py` | 若引用 template 路徑則改為 `features_candidates.yaml`。 |
+| `scripts/one_time/patch_backtester.py` | 路徑中的 `features_candidates.template.yaml` 改為 `features_candidates.yaml`。 |
+| `scripts/one_time/patch_features.py` | 同上。 |
+| `doc/FEATURE_SPEC_GUIDE.md` | 所有「template」檔名改為 `features_candidates.yaml`；若文件描述「複製為 features_candidates.yaml」已無實際流程，可改為說明「repo 內唯一 spec 為 features_candidates.yaml，訓練時複製到 artifact 的 feature_spec.yaml」。 |
+| `.cursor/plans/PLAN.md` | 本節「主要異動檔案」樹狀圖已改為 `features_candidates.yaml`；若他處有寫到 template 檔名一併更新。 |
+| `.cursor/plans/STATUS.md`、`.cursor/plans/DECISION_LOG.md` | 搜尋 `features_candidates.template`，將提及「template 檔」的敘述改為 `features_candidates.yaml` 或「repo feature spec」；歷史決策紀錄可保留「當時為 template 檔名」的說明。 |
+
+### 實作步驟建議
+
+1. **搜尋確認**：全 repo 搜尋 `features_candidates.template` 與 `feature_spec/features_candidates`，列出所有需改處。
+2. **重新命名檔案**：`trainer/feature_spec/features_candidates.template.yaml` → `trainer/feature_spec/features_candidates.yaml`（Git 用 `git mv` 以保留歷史）。
+3. **更新程式碼**：trainer、scorer、features、backtester 的路徑常數與 fallback 路徑。
+4. **更新測試**：上述測試檔中的路徑與註解／assert 訊息。
+5. **更新腳本與文件**：scripts/one_time、doc/FEATURE_SPEC_GUIDE.md、.cursor/plans/*.md。
+6. **驗收**：執行相關測試（含 test_feature_spec_yaml、test_review_risks_round40/112、test_scorer_review_risks_round22）；確認訓練與 scorer 仍可正確載入 spec；可選：跑一次短 pipeline 或 backtester 做 smoke test。
+
+### 驗收要點
+
+- 全專案不再出現 `features_candidates.template.yaml` 路徑（除歷史/註解中刻意保留的說明）。
+- 現有依賴此 spec 的測試與流程行為不變；artifact 內仍產出 `feature_spec.yaml`（凍結版），scorer/backtester 優先讀 artifact 內 spec 的邏輯不變。
+
+### 不變性
+
+- **Artifact 內檔名**：模型目錄內仍為 `feature_spec.yaml`（凍結版），不更名。
+- **載入優先順序**：scorer 先讀 `model_dir/feature_spec.yaml`，不存在再 fallback 至 repo 的 `features_candidates.yaml`；backtester 同理。
 
 ---
 
@@ -192,7 +381,7 @@ trainer/
 └── api_server.py    ← 更新：Model API Contract（單一模型）
 
 trainer/feature_spec/
-└── features_candidates.template.yaml  ← Feature Spec YAML 候選特徵定義（DEC-024）
+└── features_candidates.yaml  ← Feature Spec YAML 候選特徵定義（DEC-024）
 
 tests/
 ├── test_config.py
@@ -1265,8 +1454,8 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 ### 設計要點
 
 1. **Target recalls 與 trainer 一致**
-   - 使用與 trainer 相同的 recall 水準：`(0.01, 0.1, 0.5)`（即 `_TARGET_RECALLS`）。
-   - 鍵名：`test_precision_at_recall_0.01`、`test_precision_at_recall_0.1`、`test_precision_at_recall_0.5`。
+   - 使用與 trainer 相同的 recall 水準：`(0.01, 0.1, 0.5)`（即 `_TARGET_RECALLS`）；**DEC-026 擴充**為 `(0.001, 0.01, 0.1, 0.5)`，並新增每 recall 之 threshold 與 alerts_per_minute，見「閾值策略與 Precision-at-Recall 報告更新（DEC-026）」。
+   - 鍵名：`test_precision_at_recall_0.01`、`test_precision_at_recall_0.1`、`test_precision_at_recall_0.5`（DEC-026 後增 `test_precision_at_recall_0.001` 及 `threshold_at_recall_{r}`、`alerts_per_minute_at_recall_{r}`）。
 
 2. **計算方式（與 trainer 一致）**
    - 使用 `sklearn.metrics.precision_recall_curve(df["label"], df["score"])` 取得 PR 曲線。
@@ -1284,7 +1473,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 | 步驟 | 內容 |
 |------|------|
 | 1 | 在 `backtester.py` 中自 `sklearn.metrics` 新增 `precision_recall_curve` import（若尚未引入）。 |
-| 2 | 定義與 trainer 一致的 target recalls 常數（如 `_TARGET_RECALLS = (0.01, 0.1, 0.5)`），並在 `_zeroed_flat_metrics` 中為 `test_precision_at_recall_{r}` 三鍵設為 `None`。 |
+| 2 | 定義與 trainer 一致的 target recalls 常數（如 `_TARGET_RECALLS = (0.01, 0.1, 0.5)`），並在 `_zeroed_flat_metrics` 中為 `test_precision_at_recall_{r}` 三鍵設為 `None`。（DEC-026 擴充為四水準 0.001/0.01/0.1/0.5 及 threshold/apm 鍵。） |
 | 3 | 在 `compute_micro_metrics` 的「有效 df」路徑中，於計算完 AP/F-beta 後呼叫 `precision_recall_curve(df["label"], df["score"])`，依上述邏輯計算三項 precision-at-recall，併入回傳 dict。 |
 | 4 | 更新 `compute_micro_metrics`（及模組）docstring，說明回傳包含 `test_precision_at_recall_0.01/0.1/0.5`（可為 `None`）。 |
 | 5 | 可選：在 `backtest()` 寫出 `backtest_metrics.json` 後，對 `model_default`（或 optuna）做一次 `logger.info`，輸出 prec@rec 行。 |
@@ -1296,7 +1485,42 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - Empty/NaN/single-class 時三鍵為 `None`，不影響既有欄位與下游。
 - 既有 backtester 流程與呼叫端可正常執行；可選驗證：與 trainer 同筆資料下，backtester 與 trainer 的 precision-at-recall 數值一致或極接近。
 
-**實作狀態**：待實作（pending）。
+**實作狀態**：已完成（Round 229/230/231）。後續擴充見 DEC-026 與下方「閾值策略與 Precision-at-Recall 報告更新（DEC-026）」一節。
+
+---
+
+## 閾值策略與 Precision-at-Recall 報告更新（DEC-026）
+
+**決策**：見 DECISION_LOG.md DEC-026。本節為實作規格摘要。
+
+### 1. 閾值選擇目標改為 Precision at recall=0.01
+
+- **Trainer**（`_train_one_model` 及 Plan B / train from file 路徑之閾值掃描）：在 validation 上仍以 `precision_recall_curve` 掃描閾值；**選閾值準則**由「在滿足 min recall / min alerts 下最大化 F-beta」改為「在滿足 min recall（≥ 0.01）與 min alerts 下**最大化 Precision**」。即：在 `recall ≥ THRESHOLD_MIN_RECALL` 且 `alert_counts ≥ MIN_THRESHOLD_ALERT_COUNT` 的候選中，取 **argmax(pr_prec)** 作為最佳閾值。`val_fbeta_05`、`val_f1` 仍可計算並寫入 metrics/日誌，但不用於選閾值。
+- **Backtester**（`run_optuna_threshold_search`）：Optuna objective 由「最大化 F-beta」改為「**最大化 Precision**」；約束不變（recall ≥ THRESHOLD_MIN_RECALL、可選 min alerts/hour）。不滿足約束時回傳 0.0，滿足時回傳該閾值下的 precision。
+- **Config**：註解/文件標明閾值選擇目標為「Optimize Precision at recall=0.01」；可新增常數（如 `THRESHOLD_OPTIMIZE_PRECISION_AT_RECALL = 0.01`）或僅在註解中與現有 `THRESHOLD_MIN_RECALL` 對齊。
+
+### 2. Target recalls 新增 0.001
+
+- **常數**：Trainer 與 Backtester 之 `_TARGET_RECALLS` 由 `(0.01, 0.1, 0.5)` 改為 **`(0.001, 0.01, 0.1, 0.5)`**。
+- **影響**：所有產出「Precision@Recall」的程式與輸出（`_compute_test_metrics`、`_compute_test_metrics_from_scores`、`compute_micro_metrics`、`_zeroed_flat_metrics`、日誌、`training_metrics.json`、`backtest_metrics.json`）均需涵蓋四個 recall 水準；zeroed/邊界路徑對四鍵皆設為 `None`。測試與文件中的預期鍵集與 `_TARGET_RECALLS` 斷言一併更新。
+
+### 3. 每個 recall 水準產出 threshold 與 alerts per minute
+
+- **語意**：對每個 target recall `r`，除既有 `test_precision_at_recall_{r}` 外，新增：
+  - **threshold_at_recall_{r}**：在 PR 曲線上達成「recall ≥ r 時最大 precision」的該點所對應之閾值（與 `precision_recall_curve` 回傳之 `thresholds` 對齊：使用 `prec[:-1]`、`rec[:-1]` 與 `thresholds` 同索引）。
+  - **alerts_per_minute_at_recall_{r}**：在該閾值下之 alert 數 ÷ 評估窗長（分鐘）。Backtester 有 `window_hours`，故 `window_minutes = window_hours * 60`；Trainer 之 test set 若無「評估窗長」參數，可選填或僅產出 **n_alerts_at_recall_{r}**，`alerts_per_minute_at_recall_{r}` 為 `None` 或由呼叫端傳入 `test_window_minutes` 時才計算。
+- **輸出**：上述新鍵納入 `_compute_test_metrics` / `_compute_test_metrics_from_scores`（trainer）與 `compute_micro_metrics` / `_zeroed_flat_metrics`（backtester）之回傳 dict；所有 **performance log**（含「prec@rec…」行）對每個 recall 水準一併輸出 **thr=…** 與 **apm=…**（或 N/A）；`training_metrics.json`、`backtest_metrics.json` 含對應鍵。
+
+### 實作範圍摘要
+
+| 區域 | 改動要點 |
+|------|----------|
+| `trainer/config.py` | 註解/常數：閾值目標為 Precision at recall=0.01 |
+| `trainer/trainer.py` | 閾值選擇改為 valid_mask 下 argmax(pr_prec)；`_TARGET_RECALLS`=(0.001,0.01,0.1,0.5)；precision@recall 迴圈與 zeroed keys 擴充；每 r 產出 threshold_at_recall_{r}、n_alerts_at_recall_{r}、可選 alerts_per_minute_at_recall_{r}；日誌含 thr/apm |
+| `trainer/backtester.py` | `_TARGET_RECALLS` 與 _zeroed 四鍵；Optuna objective → precision；compute_micro_metrics 產出 threshold_at_recall_{r}、alerts_per_minute_at_recall_{r}；日誌/JSON 新鍵 |
+| 測試 | 更新 _TARGET_RECALLS 與 precision@recall 鍵集之斷言；可選契約測試 threshold/APM |
+
+**實作狀態**：§2、§3 已於 Round 398 完成；§1（閾值選擇目標改為 Precision at recall=0.01）已於 Round 400 完成（trainer argmax(pr_prec)、backtester Optuna precision objective、config 註解與 THRESHOLD_OPTIMIZE_PRECISION_AT_RECALL）。DEC-026 全項完成。
 
 ---
 

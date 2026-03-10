@@ -65,6 +65,7 @@ try:
     THRESHOLD_MIN_ALERTS_PER_HOUR: Optional[float] = getattr(
         _cfg, "THRESHOLD_MIN_ALERTS_PER_HOUR", None
     )
+    UNRATED_VOLUME_LOG: bool = bool(getattr(_cfg, "UNRATED_VOLUME_LOG", True))
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
@@ -78,6 +79,7 @@ except ModuleNotFoundError:
     BACKTEST_OFFSET_HOURS = getattr(_cfg, "BACKTEST_OFFSET_HOURS", 1)
     THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_MIN_ALERTS_PER_HOUR = getattr(_cfg, "THRESHOLD_MIN_ALERTS_PER_HOUR", None)
+    UNRATED_VOLUME_LOG = bool(getattr(_cfg, "UNRATED_VOLUME_LOG", True))  # type: ignore[no-redef]
 
 try:
     from labels import compute_labels  # type: ignore[import]
@@ -179,14 +181,14 @@ def load_dual_artifacts() -> Dict[str, Any]:
 # Metric helpers (trainer-aligned: precision-at-recall PLAN § Backtester precision-at-recall)
 # ---------------------------------------------------------------------------
 
-_TARGET_RECALLS = (0.01, 0.1, 0.5)
+_TARGET_RECALLS = (0.001, 0.01, 0.1, 0.5)  # DEC-026
 
 
 def _zeroed_flat_metrics(threshold: float, window_hours: Optional[float]) -> dict:
     """Return trainer-style flat metrics dict with zeros (empty/invalid subset).
 
-    Includes test_precision_at_recall_0.01/0.1/0.5 as None (PLAN § Backtester
-    precision-at-recall: boundary/empty/single-class).
+    Includes test_precision_at_recall_{r}, threshold_at_recall_{r},
+    alerts_per_minute_at_recall_{r} for r in (0.001, 0.01, 0.1, 0.5) (DEC-026).
     """
     alerts_per_hour: Optional[float] = None
     if window_hours is not None and window_hours > 0:
@@ -206,6 +208,8 @@ def _zeroed_flat_metrics(threshold: float, window_hours: Optional[float]) -> dic
     }
     for r in _TARGET_RECALLS:
         out[f"test_precision_at_recall_{r}"] = None
+        out[f"threshold_at_recall_{r}"] = None
+        out[f"alerts_per_minute_at_recall_{r}"] = None
     return out
 
 
@@ -295,19 +299,34 @@ def compute_micro_metrics(
     if window_hours is not None and window_hours > 0:
         alerts_per_hour = n_alerts / window_hours
 
-    # Precision at fixed recall levels (trainer-aligned; None when single-class)
+    # Precision at fixed recall levels + threshold and alerts_per_minute (DEC-026)
     precision_at_recall: Dict[str, Optional[float]] = {}
     if n_pos == 0 or n_pos == n_samples:
         for r in _TARGET_RECALLS:
             precision_at_recall[f"test_precision_at_recall_{r}"] = None
+            precision_at_recall[f"threshold_at_recall_{r}"] = None
+            precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
     else:
-        pr_prec, pr_rec, _ = precision_recall_curve(df["label"], df["score"])
+        pr_prec, pr_rec, pr_thresholds = precision_recall_curve(df["label"], df["score"])
+        pr_p = pr_prec[:-1]
+        pr_r = pr_rec[:-1]
+        window_minutes = (window_hours * 60.0) if (window_hours is not None and window_hours > 0) else None
         for r in _TARGET_RECALLS:
-            mask = pr_rec >= r
+            mask = pr_r >= r
             if mask.any():
-                precision_at_recall[f"test_precision_at_recall_{r}"] = float(pr_prec[mask].max())
+                valid_idx = np.where(mask)[0]
+                best_local = int(np.argmax(pr_p[valid_idx]))
+                best_idx = int(valid_idx[best_local])
+                thr_r = float(pr_thresholds[best_idx])
+                n_at_r = int((df["score"].values >= thr_r).sum())
+                apm_r = (n_at_r / window_minutes) if window_minutes else None
+                precision_at_recall[f"test_precision_at_recall_{r}"] = float(pr_p[best_idx])
+                precision_at_recall[f"threshold_at_recall_{r}"] = thr_r
+                precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = apm_r
             else:
                 precision_at_recall[f"test_precision_at_recall_{r}"] = None
+                precision_at_recall[f"threshold_at_recall_{r}"] = None
+                precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
 
     return {
         "test_ap": ap,
@@ -405,7 +424,7 @@ def _compute_section_metrics(
 
 
 # ---------------------------------------------------------------------------
-# Optuna TPE threshold search (DEC-010: F-beta objective, optional constraints)
+# Optuna TPE threshold search (DEC-010 / DEC-026: precision objective, optional constraints)
 # ---------------------------------------------------------------------------
 
 def run_optuna_threshold_search(
@@ -414,10 +433,10 @@ def run_optuna_threshold_search(
     n_trials: int = OPTUNA_N_TRIALS,
     window_hours: Optional[float] = None,
 ) -> Tuple[float, float]:
-    """Optuna TPE search over rated_threshold only (v10 single Rated model, DEC-009/010).
+    """Optuna TPE search over rated_threshold only (v10 single Rated model, DEC-009/010/026).
 
-    Objective: maximise F-beta (beta=THRESHOLD_FBETA, precision-weighted) on rated
-    observations, subject to optional min recall and min alerts/hour constraints.
+    Objective: maximise Precision (DEC-026) on rated observations, subject to
+    recall >= THRESHOLD_MIN_RECALL and optional min alerts/hour constraints.
     Returns (rated_t, rated_t) for API compatibility with dual-metric callers.
     """
     # Log Optuna time-budget status before optimization begins.
@@ -460,7 +479,11 @@ def run_optuna_threshold_search(
             alerts_per_hour = float(preds.sum()) / float(window_hours)
             if alerts_per_hour < THRESHOLD_MIN_ALERTS_PER_HOUR:
                 return 0.0
-        return float(fbeta_score(y, preds, beta=THRESHOLD_FBETA, zero_division=0))
+        # DEC-026: maximise Precision (at recall >= THRESHOLD_MIN_RECALL).
+        tp = int((preds & (y == 1)).sum())
+        fp = int((preds & (y == 0)).sum())
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        return float(prec)
 
     study = optuna.create_study(
         direction="maximize",
@@ -475,15 +498,15 @@ def run_optuna_threshold_search(
 
     if study.best_value <= 0.0:
         logger.warning(
-            "No improvement found (best F%.2f=%.4f); returning model-default threshold.",
-            THRESHOLD_FBETA, study.best_value,
+            "No improvement found (best precision=%.4f); returning model-default threshold.",
+            study.best_value,
         )
         rated_t = float((artifacts.get("rated") or {}).get("threshold", 0.5))
     else:
         rated_t = study.best_params["rated_threshold"]
         logger.info(
-            "Optuna best — rated_thr=%.4f  F%.2f=%.4f",
-            rated_t, THRESHOLD_FBETA, study.best_value,
+            "Optuna best — rated_thr=%.4f  precision=%.4f (DEC-026)",
+            rated_t, study.best_value,
         )
 
     return rated_t, rated_t
@@ -501,6 +524,7 @@ def backtest(
     window_end: datetime,
     run_optuna: bool = True,
     n_optuna_trials: int = OPTUNA_N_TRIALS,
+    use_local_parquet: bool = False,
 ) -> dict:
     """Full backtest pipeline for one time window (v10 single rated model, DEC-021).
 
@@ -550,21 +574,22 @@ def backtest(
 
     # --- Track LLM on FULL bets (PLAN § Train–Serve Parity) ---
     # Compute before label filtering so window features see same history as trainer/scorer.
+    _track_llm_degraded = False
     _spec_path = MODEL_DIR / "feature_spec.yaml"
     if _spec_path.exists():
         feature_spec = load_feature_spec(_spec_path)
     else:
-        feature_spec = load_feature_spec(Path(__file__).parent / "feature_spec" / "features_candidates.template.yaml")
+        feature_spec = load_feature_spec(Path(__file__).parent / "feature_spec" / "features_candidates.yaml")
     try:
         _bets_llm_result = compute_track_llm_features(
             bets,
             feature_spec=feature_spec,
             cutoff_time=window_end,
         )
-        _llm_cand_ids = [
-            c.get("feature_id")
-            for c in (feature_spec.get("track_llm") or {}).get("candidates", [])
-        ]
+        # R222 Review #4: candidates may be non-list (e.g. dict) in YAML; treat as no candidates.
+        _raw_candidates = (feature_spec.get("track_llm") or {}).get("candidates")
+        _candidates = _raw_candidates if isinstance(_raw_candidates, list) else []
+        _llm_cand_ids = [c.get("feature_id") for c in _candidates]
         _bets_llm_feature_cols = [
             fid for fid in _llm_cand_ids
             if fid and fid in _bets_llm_result.columns
@@ -577,6 +602,10 @@ def backtest(
             )
     except Exception as exc:
         logger.error("Track LLM failed in backtester: %s", exc)
+        logger.warning(
+            "Track LLM failed; artifact LLM features will be zero-filled. Backtest scores may be unreliable."
+        )
+        _track_llm_degraded = True
 
     # --- Labels ---
     labeled = compute_labels(bets_df=bets, window_end=window_end, extended_end=extended_end)
@@ -586,18 +615,19 @@ def backtest(
         & (labeled["payout_complete_dtm"] < we_naive)
     ].copy()
     if labeled.empty:
-        return {"error": "No rows after label filtering"}
+        return {"error": "No rows after label filtering", "track_llm_degraded": _track_llm_degraded}
 
     # --- player_profile PIT join (PLAN § Train–Serve Parity) ---
+    # R222 Review #2: pass [] when no rated players so load_player_profile does not load full table.
     _rated_cids = (
         list(canonical_map["canonical_id"].astype(str).unique())
         if not canonical_map.empty
-        else None
+        else []
     )
     profile_df = load_player_profile(
         window_start,
         window_end,
-        use_local_parquet=False,
+        use_local_parquet=use_local_parquet,
         canonical_ids=_rated_cids,
     )
     labeled = join_player_profile(labeled, profile_df)
@@ -642,14 +672,44 @@ def backtest(
     )
     labeled["is_rated"] = labeled["canonical_id"].isin(rated_ids)
 
-    # --- Score ---
+    # --- Exclude unrated before model (PLAN: 取得 bet 後排除 unrated 再送模型) ---
+    n_rated_orig = int(labeled["is_rated"].sum())
+    n_unrated_orig = int((~labeled["is_rated"]).sum())
+    unrated_players_orig = (
+        int(
+            labeled.loc[~labeled["is_rated"], "canonical_id"]
+            .dropna()
+            .astype(str)
+            .nunique()
+        )
+        if n_unrated_orig > 0
+        else 0
+    )
+    if UNRATED_VOLUME_LOG and n_unrated_orig > 0:
+        logger.info(
+            "[backtester] Excluded %d unrated observations (%d players); scoring %d rated.",
+            n_unrated_orig,
+            unrated_players_orig,
+            n_rated_orig,
+        )
+    labeled = labeled[labeled["is_rated"]].copy()
+    if labeled.empty:
+        return {
+            "error": "No rated observations in window",
+            "rated_obs": 0,
+            "unrated_obs": n_unrated_orig,
+            "observations": n_unrated_orig,
+            "track_llm_degraded": _track_llm_degraded,
+        }
+
+    # --- Score (rated only) ---
     labeled = _score_df(labeled, artifacts)
 
     # --- Window duration (for alerts/hour) ---
     window_hours = (window_end - window_start).total_seconds() / 3600.0
 
-    # --- Rated subset (for per-track metrics) ---
-    rated_sub = labeled[labeled["is_rated"]]
+    # --- Rated subset (labeled is already rated-only) ---
+    rated_sub = labeled
 
     # --- Metrics with model-default threshold (v10 single model) ---
     rated_t_default = float((artifacts.get("rated") or {}).get("threshold", 0.5))
@@ -658,9 +718,10 @@ def backtest(
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
         "window_hours": window_hours,
-        "observations": len(labeled),
-        "rated_obs": int(labeled["is_rated"].sum()),
-        "unrated_obs": int((~labeled["is_rated"]).sum()),
+        "observations": n_rated_orig + n_unrated_orig,
+        "rated_obs": n_rated_orig,
+        "unrated_obs": n_unrated_orig,
+        "track_llm_degraded": _track_llm_degraded,
         "model_default": _compute_section_metrics(
             labeled, rated_sub,
             rated_t_default, window_hours,
@@ -761,6 +822,7 @@ def main() -> None:
         bets_norm, sessions_norm, artifacts, start, end,
         run_optuna=not args.skip_optuna,
         n_optuna_trials=args.n_trials,
+        use_local_parquet=args.use_local_parquet,
     )
     print(json.dumps(result, indent=2, default=str))
 

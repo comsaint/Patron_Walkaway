@@ -103,7 +103,7 @@ STATE_DIR = BASE_DIR / "local_state"
 STATE_DIR.mkdir(exist_ok=True)
 STATE_DB_PATH = STATE_DIR / "state.db"
 MODEL_DIR = BASE_DIR / "models"
-FEATURE_SPEC_PATH = BASE_DIR / "feature_spec" / "features_candidates.template.yaml"
+FEATURE_SPEC_PATH = BASE_DIR / "feature_spec" / "features_candidates.yaml"
 
 RETENTION_HOURS: int = getattr(config, "SCORER_STATE_RETENTION_HOURS", 48)
 SESSION_AVAIL_DELAY_MIN: int = getattr(config, "SESSION_AVAIL_DELAY_MIN", 15)
@@ -159,7 +159,7 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
 
     # Track LLM: prefer the frozen feature_spec.yaml inside the model artifact
     # directory (DEC-024 / R3507) for exact train-serve reproducibility.
-    # Fall back to the global template when no frozen copy exists.
+    # Fall back to the repo feature spec (features_candidates.yaml) when no frozen copy exists.
     _frozen_spec = d / "feature_spec.yaml"
     if _frozen_spec.exists():
         try:
@@ -1234,32 +1234,34 @@ def score_once(
     if features_df.empty:
         logger.info("[scorer] No usable rows after feature engineering; sleeping")
         return
-    if UNRATED_VOLUME_LOG:
-        rated_bets = int(features_df["is_rated"].fillna(False).astype(bool).sum())
-        unrated_bets = int(len(features_df) - rated_bets)
-        rated_players = int(
-            features_df.loc[features_df["is_rated"].astype(bool), "player_id"]
+
+    # --- Exclude unrated before model (PLAN: 取得 bet 後排除 unrated 再送模型) ---
+    is_rated_mask = features_df["is_rated"].fillna(False).astype(bool)
+    n_rated = int(is_rated_mask.sum())
+    n_unrated = int(len(features_df) - n_rated)
+    unrated_players = (
+        int(
+            features_df.loc[~is_rated_mask, "player_id"]
             .dropna()
             .astype(str)
             .nunique()
         )
-        unrated_players = int(
-            features_df.loc[~features_df["is_rated"].astype(bool), "player_id"]
-            .dropna()
-            .astype(str)
-            .nunique()
-        )
+        if n_unrated > 0
+        else 0
+    )
+    features_df = features_df[is_rated_mask].copy()
+    if features_df.empty:
+        logger.info("[scorer] No rated bets to score; sleeping")
+        return
+    if UNRATED_VOLUME_LOG and n_unrated > 0:
         logger.info(
-            "[scorer][volume] poll_cycle_ts=%s rated_player_count=%d rated_bet_count=%d "
-            "unrated_player_count=%d unrated_bet_count=%d",
-            scored_at,
-            rated_players,
-            rated_bets,
+            "[scorer] Excluded %d unrated bets (%d players); scoring %d rated bets.",
+            n_unrated,
             unrated_players,
-            unrated_bets,
+            n_rated,
         )
 
-    # ── Score with H3 routing ─────────────────────────────────────────────
+    # ── Score with H3 routing (rated only) ─────────────────────────────────
     features_df = _score_df(features_df, artifacts, feature_list)
 
     # ── Alert candidates: score >= threshold AND rated observations only ──

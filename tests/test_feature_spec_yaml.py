@@ -7,8 +7,8 @@ Covers:
 - derived 的 depends_on 無循環依賴
 - load_feature_spec 對非法 YAML 拋出 ValueError
 
-All tests use the shipped features_candidates.template.yaml as the canonical
-reference so that any future edits to the template are automatically validated.
+All tests use the shipped features_candidates.yaml as the canonical
+reference so that any future edits to the spec are automatically validated.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def _import_features():
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-TEMPLATE_YAML = REPO_ROOT / "trainer" / "feature_spec" / "features_candidates.template.yaml"
+SPEC_YAML = REPO_ROOT / "trainer" / "feature_spec" / "features_candidates.yaml"
 
 features_mod = _import_features()
 
@@ -38,23 +38,23 @@ class TestLoadFeatureSpecTemplateLoads(unittest.TestCase):
     """Template YAML can be loaded without errors."""
 
     def test_template_loads_without_error(self):
-        spec = features_mod.load_feature_spec(TEMPLATE_YAML)
+        spec = features_mod.load_feature_spec(SPEC_YAML)
         self.assertIsInstance(spec, dict)
 
     def test_spec_has_required_top_level_keys(self):
-        spec = features_mod.load_feature_spec(TEMPLATE_YAML)
+        spec = features_mod.load_feature_spec(SPEC_YAML)
         for key in ("version", "spec_id", "track_llm", "track_human", "track_profile"):
             self.assertIn(key, spec, f"Missing top-level key: {key}")
 
     def test_template_yaml_file_exists(self):
-        self.assertTrue(TEMPLATE_YAML.exists(), f"Template YAML missing at {TEMPLATE_YAML}")
+        self.assertTrue(SPEC_YAML.exists(), f"Spec YAML missing at {SPEC_YAML}")
 
 
 class TestFeatureIdUniqueness(unittest.TestCase):
     """feature_id values are unique across all tracks."""
 
     def test_all_feature_ids_unique_in_template(self):
-        spec = features_mod.load_feature_spec(TEMPLATE_YAML)
+        spec = features_mod.load_feature_spec(SPEC_YAML)
         all_ids = []
         for track_key in ("track_llm", "track_human", "track_profile"):
             track = spec.get(track_key, {})
@@ -86,7 +86,7 @@ class TestNoFollowingInWindowFrame(unittest.TestCase):
     """Track LLM window_frame must not contain FOLLOWING."""
 
     def test_template_has_no_following_in_any_window_frame(self):
-        spec = features_mod.load_feature_spec(TEMPLATE_YAML)
+        spec = features_mod.load_feature_spec(SPEC_YAML)
         for cand in spec.get("track_llm", {}).get("candidates", []):
             wf = cand.get("window_frame", "") or ""
             self.assertNotIn(
@@ -120,7 +120,7 @@ class TestNoSQLKeywordsInExpressions(unittest.TestCase):
     FORBIDDEN_KEYWORDS = ["SELECT", "FROM", "JOIN", "UNION", "WITH"]
 
     def test_template_expressions_contain_no_sql_keywords(self):
-        spec = features_mod.load_feature_spec(TEMPLATE_YAML)
+        spec = features_mod.load_feature_spec(SPEC_YAML)
         for cand in spec.get("track_llm", {}).get("candidates", []):
             expr = cand.get("expression", "") or ""
             for kw in self.FORBIDDEN_KEYWORDS:
@@ -232,7 +232,7 @@ class TestNoCyclicDependsOn(unittest.TestCase):
 
     def test_template_has_no_circular_depends_on(self):
         """The template YAML must load without circular-dependency errors."""
-        spec = features_mod.load_feature_spec(TEMPLATE_YAML)
+        spec = features_mod.load_feature_spec(SPEC_YAML)
         # If no exception, the template is clean
         self.assertIsNotNone(spec)
 
@@ -243,7 +243,7 @@ class TestTemplateDtypeIntegrity(unittest.TestCase):
     ALLOWED_DTYPES = {"int", "float", "str"}
 
     def test_template_candidates_have_allowed_dtype_or_none(self):
-        spec = features_mod.load_feature_spec(TEMPLATE_YAML)
+        spec = features_mod.load_feature_spec(SPEC_YAML)
         for track_key in ("track_llm", "track_human", "track_profile"):
             track = spec.get(track_key) or {}
             for cand in track.get("candidates", []):

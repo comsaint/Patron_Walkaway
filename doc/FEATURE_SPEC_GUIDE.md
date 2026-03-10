@@ -12,7 +12,7 @@
 ## 1. 檔案位置與角色
 
 - 候選特徵定義（spec 原始檔）：  
-  - `trainer/feature_spec/features_candidates.yaml`（實際使用時由 template 複製或改名自 `.template.yaml`）  
+  - **`trainer/feature_spec/features_candidates.yaml`**（repo 內唯一 spec SSOT；訓練時會整份複製到 artifact 的 `feature_spec.yaml`）  
 - 生產特徵清單（active features）：  
   - **`trainer/feature_spec/feature_list.json`**（由訓練流程產生，為 canonical 來源；template 內各 track 的 `active.feature_ids: []` 可視為同一定義的 YAML 表示）
 
@@ -27,10 +27,10 @@
 
 ## 2. YAML 結構概要
 
-完整模板見：
+完整 spec 見：
 
 ```text
-trainer/feature_spec/features_candidates.template.yaml
+trainer/feature_spec/features_candidates.yaml
 ```
 
 ### 2.1 全域區塊
@@ -115,7 +115,7 @@ trainer/feature_spec/features_candidates.template.yaml
 
 ## 4. 給未來 LLM 看的 Prompt 範本
 
-> 下列 Prompt 範本假設你在對話中直接貼上 `features_candidates.template.yaml` 裡的 Track LLM 結構，並要求 LLM 產生多個新特徵。請務必保留「只寫 expression + window_frame，不寫 SELECT」這個約束。
+> 下列 Prompt 範本假設你在對話中直接貼上 `features_candidates.yaml` 裡的 Track LLM 結構，並要求 LLM 產生多個新特徵。請務必保留「只寫 expression + window_frame，不寫 SELECT」這個約束。
 
 **英文版本（推薦）**：
 
@@ -187,7 +187,7 @@ Task:
 
 ## 5. 推薦使用流程（給未來的自己）
 
-1. 從 `features_candidates.template.yaml` 複製為新檔案 `features_candidates.yaml`。  
+1. 在 repo 內直接編輯 **`features_candidates.yaml`**（唯一 spec 來源）。  
 2. 依照當前資料理解，手動調整：  
    - `track_llm.guardrails.max_window_minutes`  
    - `inference_state.history_window_min` 與 `history_buffer_min`  

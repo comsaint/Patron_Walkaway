@@ -17,7 +17,7 @@ text = re.sub(
     if _spec_path.exists():
         feature_spec = load_feature_spec(_spec_path)
     else:
-        feature_spec = load_feature_spec(Path(__file__).parent / "feature_spec" / "features_candidates.template.yaml")
+        feature_spec = load_feature_spec(Path(__file__).parent / "feature_spec" / "features_candidates.yaml")
 
     try:
         _bets_llm_result = compute_track_llm_features(

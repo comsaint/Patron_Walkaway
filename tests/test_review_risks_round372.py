@@ -68,7 +68,7 @@ class TestR372ReviewerRiskGuards(unittest.TestCase):
         )
 
         p_arr, r_arr, _ = precision_recall_curve(y_s, scores)
-        for r in (0.01, 0.1, 0.5):
+        for r in (0.001, 0.01, 0.1, 0.5):  # DEC-026
             mask = r_arr >= r
             expected = float(p_arr[mask].max()) if mask.any() else None
             self.assertAlmostEqual(out[f"test_precision_at_recall_{r}"], expected)
@@ -82,6 +82,7 @@ class TestR372ReviewerRiskGuards(unittest.TestCase):
         out = trainer_mod._compute_test_metrics(
             model, 0.5, x, y_s, log_results=False, production_neg_pos_ratio=15.0
         )
+        self.assertIsNone(out["test_precision_at_recall_0.001"])
         self.assertIsNone(out["test_precision_at_recall_0.01"])
         self.assertIsNone(out["test_precision_at_recall_0.1"])
         self.assertIsNone(out["test_precision_at_recall_0.5"])
@@ -96,6 +97,7 @@ class TestR372ReviewerRiskGuards(unittest.TestCase):
             model, 0.5, x, y_s, log_results=False, production_neg_pos_ratio=15.0
         )
         self.assertEqual(out["test_ap"], 0.0)
+        self.assertIsNone(out["test_precision_at_recall_0.001"])
         self.assertIsNone(out["test_precision_at_recall_0.01"])
         self.assertIsNone(out["test_precision_at_recall_0.1"])
         self.assertIsNone(out["test_precision_at_recall_0.5"])

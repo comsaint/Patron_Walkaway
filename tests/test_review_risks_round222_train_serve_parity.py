@@ -35,11 +35,11 @@ class TestR222TrackLlmFailureSilentDegradation(unittest.TestCase):
             source,
             "R222 #1: backtest() except block must log 'Track LLM failed'.",
         )
-        # Current state: no explicit warning that scores may be unreliable
-        self.assertNotIn(
+        # Production now logs warning that scores may be unreliable when Track LLM fails.
+        self.assertIn(
             "zero-filled",
             source,
-            "R222 #1: When production adds warning containing 'zero-filled', change this to assertIn.",
+            "R222 #1: backtest() except block must log warning containing 'zero-filled' (artifact LLM features zero-filled).",
         )
 
     def test_backtest_returns_dict_when_track_llm_raises(self):
@@ -65,9 +65,11 @@ class TestR222TrackLlmFailureSilentDegradation(unittest.TestCase):
             "feature_list_meta": [],
         }
 
+        # One-row canonical map so the single bet is rated (PLAN § exclude unrated → need rated obs).
+        _canonical_map_rated = pd.DataFrame({"player_id": [100], "canonical_id": [100]})
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
-            patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=pd.DataFrame()),
+            patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=_canonical_map_rated),
             patch.object(backtester_mod, "add_track_b_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
             patch.object(
@@ -89,6 +91,11 @@ class TestR222TrackLlmFailureSilentDegradation(unittest.TestCase):
             )
         self.assertIsInstance(result, dict, "R222 #1: backtest must return dict when Track LLM raises.")
         self.assertNotIn("error", result, "R222 #1: backtest should complete without error key when mocks provide valid path.")
+        self.assertIs(
+            result.get("track_llm_degraded"),
+            True,
+            "R222 #1 (PLAN): when Track LLM raises, result must include track_llm_degraded=True.",
+        )
 
 
 def _minimal_compute_labels(bets_df, window_end, extended_end):
@@ -128,12 +135,11 @@ class TestR222CanonicalMapEmptyLoadProfileFullTable(unittest.TestCase):
             source,
             "R222 #2: backtest must pass canonical_ids to load_player_profile.",
         )
-        # Current risky pattern: else None when canonical_map empty
+        # R222 #2 fixed: empty map → else [] so load_player_profile gets [] and does not load full table.
         self.assertIn(
-            "else None",
+            "else []",
             source,
-            "R222 #2: Current implementation uses else None when canonical_map empty (full table load). "
-            "When fixed to else [], update this to assert 'else []' or similar.",
+            "R222 #2: backtest must pass canonical_ids=[] when canonical_map empty (no full-table load).",
         )
 
 
@@ -145,13 +151,17 @@ class TestR222UseLocalParquetNotPassed(unittest.TestCase):
     """R222 #3: backtest() hardcodes use_local_parquet=False when calling load_player_profile."""
 
     def test_backtest_source_calls_load_player_profile_with_use_local_parquet_false(self):
-        """Contract: backtest() calls load_player_profile(..., use_local_parquet=False). When production adds param, assert it is passed from backtest(..., use_local_parquet=...)."""
+        """Contract: backtest() accepts use_local_parquet and passes it to load_player_profile(..., use_local_parquet=use_local_parquet)."""
         source = inspect.getsource(backtester_mod.backtest)
         self.assertIn(
-            "use_local_parquet=False",
+            "use_local_parquet=use_local_parquet",
             source,
-            "R222 #3: backtest currently hardcodes use_local_parquet=False. "
-            "When production adds use_local_parquet parameter, update test to assert parameter is passed.",
+            "R222 #3: backtest() must pass use_local_parquet parameter through to load_player_profile.",
+        )
+        self.assertIn(
+            "use_local_parquet: bool = False",
+            source,
+            "R222 #3: backtest() must accept use_local_parquet parameter (default False).",
         )
 
 
@@ -163,12 +173,17 @@ class TestR222FeatureSpecCandidatesNonList(unittest.TestCase):
     """R222 #4: If track_llm.candidates is not a list (e.g. dict), iteration may be wrong; no isinstance guard."""
 
     def test_backtest_source_gets_candidates_with_default_list(self):
-        """Contract: backtest uses .get('candidates', []) for track_llm. When production adds isinstance(_raw, list) guard, add assert for it here."""
+        """Contract: backtest gets track_llm candidates with type guard (isinstance) so non-list (e.g. dict) is treated as no candidates."""
         source = inspect.getsource(backtester_mod.backtest)
         self.assertIn(
-            '.get("candidates", [])',
+            "isinstance(_raw_candidates, list)",
             source,
-            "R222 #4: backtest gets candidates with .get('candidates', []).",
+            "R222 #4: backtest must guard candidates with isinstance(_raw_candidates, list) else [].",
+        )
+        self.assertIn(
+            '.get("candidates")',
+            source,
+            "R222 #4: backtest gets candidates from feature_spec track_llm.",
         )
 
     def test_backtest_does_not_crash_when_candidates_is_dict(self):
@@ -193,11 +208,12 @@ class TestR222FeatureSpecCandidatesNonList(unittest.TestCase):
             },
             "feature_list_meta": [],
         }
-        # candidates is a dict (non-list); iteration yields keys
+        # candidates is a dict (non-list); iteration yields keys. One-row canonical map so bet is rated.
         bad_spec = {"track_llm": {"candidates": {"key1": 1, "key2": 2}}}
+        _canonical_map_rated = pd.DataFrame({"player_id": [100], "canonical_id": [100]})
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
-            patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=pd.DataFrame()),
+            patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=_canonical_map_rated),
             patch.object(backtester_mod, "add_track_b_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value=bad_spec),
             patch.object(backtester_mod, "compute_track_llm_features", return_value=pd.DataFrame({"bet_id": [1]})),

@@ -98,8 +98,11 @@ OPTUNA_TIMEOUT_SECONDS: Optional[int] = -1  # -1 = no timeout, 10 * 60 = 10 minu
 # Positive int (e.g. 40–60) = stop early to save time; recommend 40–60 to avoid stopping
 # too soon when TPE has a dry spell (PLAN "Optuna 整份 study 的 early stop").
 OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = None
-# Threshold selection objective: F-beta with beta < 1 favours precision over recall.
+# Threshold selection objective (DEC-026): Optimize Precision at recall >= THRESHOLD_MIN_RECALL
+# (trainer: argmax(pr_prec) over valid_mask; backtester: Optuna maximises precision).
+# THRESHOLD_FBETA is still used for val_fbeta_05 / reporting only, not for choosing threshold.
 THRESHOLD_FBETA: float = 0.5
+THRESHOLD_OPTIMIZE_PRECISION_AT_RECALL: float = 0.01  # DEC-026: target recall for precision optimisation
 
 # --- Feature screening (DEC-020, PLAN screen-lgbm-default) ---
 # Maximum number of features to keep after screen_features().
@@ -111,12 +114,12 @@ SCREEN_FEATURES_METHOD: Literal["lgbm", "mi", "mi_then_lgbm"] = "lgbm"
 
 # --- Threshold selection guardrails ---
 # Minimum number of validation alerts required for a candidate threshold to be
-# considered during F-beta maximisation.  Small validation sets (e.g. --sample-rated)
-# may require a lower value; large sets may warrant a higher one.
+# considered (DEC-026: during precision maximisation at recall >= MIN_RECALL).
+# Small validation sets (e.g. --sample-rated) may require a lower value.
 MIN_THRESHOLD_ALERT_COUNT = 5
 # Optional threshold constraints (None disables each constraint).
-# MIN_RECALL applies to both trainer threshold scan and backtester Optuna search.
-# Safeguard: default 0.01 enforces minimum 1% recall when choosing threshold.
+# MIN_RECALL: both trainer and backtester require recall >= this when choosing threshold (DEC-026).
+# Default 0.01 aligns with THRESHOLD_OPTIMIZE_PRECISION_AT_RECALL (optimise Precision at recall=0.01).
 # MIN_ALERTS_PER_HOUR is only meaningful in backtester where window_hours exists.
 THRESHOLD_MIN_RECALL: Optional[float] = 0.01
 THRESHOLD_MIN_ALERTS_PER_HOUR: Optional[float] = 1.0

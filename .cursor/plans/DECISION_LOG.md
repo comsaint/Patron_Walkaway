@@ -622,4 +622,24 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-026：閾值優化目標改為 Precision at recall=0.01，並擴充 Precision-at-Recall 報告
+
+**日期**：2026-03-10  
+**相關**：PLAN § 閾值策略、§ Backtester precision-at-recall 指標、§ 閾值策略與 Precision-at-Recall 報告更新（DEC-026）。  
+**關聯**：DEC-009（Trainer 閾值）、DEC-010（Backtester Optuna）。
+
+**決策**：
+
+1. **閾值選擇目標**：Trainer 與 Backtester 之閾值選擇由「在 min recall / min alerts 約束下最大化 F-beta（或 F1）」改為 **「在 recall ≥ 0.01（及既有 min alerts 約束）下最大化 Precision」**。即：優化目標為 **Precision at recall=0.01**。
+2. **Target recalls 擴充**：所有 Precision@Recall 報告之 recall 水準由 `(0.01, 0.1, 0.5)` 擴充為 **`(0.001, 0.01, 0.1, 0.5)`**，即新增 **Recall=0.001**。
+3. **每 recall 水準之額外產出**：在所有 performance 日誌與評估輸出（含 `training_metrics.json`、`backtest_metrics.json`）中，對每個 recall 水準除既有 **Precision@Recall** 外，一併產出：
+   - **該 operating point 之 threshold**（`threshold_at_recall_{r}`）；
+   - **該閾值下之 alerts per minute**（`alerts_per_minute_at_recall_{r}`；Trainer 之 test set 若無評估窗長則可選填或僅產出 alert 數）。
+
+**理由**：業務端確認以「Precision at recall=0.01」為優化目標；報告需涵蓋更低 recall（0.001）以供監控，且每個 recall 水準需可見對應閾值與告警量（APM）以利營運判斷。
+
+**實作**：見 PLAN「閾值策略與 Precision-at-Recall 報告更新（DEC-026）」一節；程式變更待後續依 PLAN 實作。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

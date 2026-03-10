@@ -295,7 +295,7 @@ CHUNK_DIR = DATA_DIR / "chunks"
 LOCAL_PARQUET_DIR = PROJECT_ROOT / "data"
 CANONICAL_MAPPING_PARQUET = LOCAL_PARQUET_DIR / "canonical_mapping.parquet"
 CANONICAL_MAPPING_CUTOFF_JSON = LOCAL_PARQUET_DIR / "canonical_mapping.cutoff.json"
-FEATURE_SPEC_PATH = BASE_DIR / "feature_spec" / "features_candidates.template.yaml"
+FEATURE_SPEC_PATH = BASE_DIR / "feature_spec" / "features_candidates.yaml"
 MODEL_DIR = BASE_DIR / "models"
 OUT_DIR = BASE_DIR / "out_trainer"
 
@@ -800,6 +800,10 @@ def load_player_profile(
         usage; None loads all players in the time window.
     """
     _IN_BATCH = 4_000  # keep each IN(...) list well under ClickHouse 256 KB max_query_size
+
+    # R222 Review #2: empty canonical_ids → no profile load (avoid full-table read when no rated players).
+    if canonical_ids is not None and len(canonical_ids) == 0:
+        return None
 
     # --- Primary path: local Parquet (ETL artifact from etl_player_profile.py) ---
     profile_path = LOCAL_PARQUET_DIR / "player_profile.parquet"
@@ -2676,8 +2680,8 @@ def _train_one_model(
 
         # Threshold selection: vectorised PR-curve scan (R65 — avoids O(N²) loop).
         # precision_recall_curve returns arrays aligned so that for each threshold
-        # index i: preds = val_scores >= thresholds[i].  We maximise F-beta (beta=THRESHOLD_FBETA)
-        # over the full threshold grid; beta < 1 favours precision over recall.
+        # index i: preds = val_scores >= thresholds[i].  DEC-026: choose threshold by
+        # maximising Precision subject to recall >= THRESHOLD_MIN_RECALL and min alerts.
         pr_prec, pr_rec, pr_thresholds = precision_recall_curve(y_val, val_scores)
         # pr_prec / pr_rec have one extra element (last = 1/0); align with thresholds
         pr_prec = pr_prec[:-1]
@@ -2691,22 +2695,22 @@ def _train_one_model(
         if THRESHOLD_MIN_RECALL is not None:
             valid_mask = valid_mask & (pr_rec >= THRESHOLD_MIN_RECALL)
         if valid_mask.any():
-            # F_beta = (1 + beta^2) * P * R / (beta^2 * P + R)
+            # DEC-026: argmax(pr_prec) over valid_mask (optimise Precision at recall >= 0.01).
+            prec_arr = np.where(valid_mask, pr_prec, -1.0)
+            best_idx = int(np.argmax(prec_arr))
+            # F-beta at chosen threshold (for metrics/logging only; not used for selection).
             b = THRESHOLD_FBETA
             denom = b * b * pr_prec + pr_rec
-            # Avoid RuntimeWarning: divide only where denom > 0 (np.where evaluates both branches).
             with np.errstate(divide="ignore", invalid="ignore"):
                 fbeta_arr = np.where(
                     denom > 0,
                     (1.0 + b * b) * pr_prec * pr_rec / denom,
                     0.0,
                 )
-            fbeta_arr = np.where(valid_mask, fbeta_arr, -1.0)
-            best_idx = int(np.argmax(fbeta_arr))
+            best_fbeta = float(fbeta_arr[best_idx])
             best_t = float(pr_thresholds[best_idx])
             best_prec = float(pr_prec[best_idx])
             best_rec = float(pr_rec[best_idx])
-            best_fbeta = float(fbeta_arr[best_idx])
             # F1 at chosen threshold (for reporting / backward compat)
             best_f1 = (
                 2.0 * best_prec * best_rec / (best_prec + best_rec)
@@ -2771,15 +2775,20 @@ def _compute_test_metrics(
 
     Additional reporting:
     - test_precision_at_recall_{r}: highest precision achievable at recall >= r,
-      computed from the PR curve (threshold-free). Reported for r in (0.01, 0.1, 0.5).
+      computed from the PR curve (threshold-free). Reported for r in (0.001, 0.01, 0.1, 0.5) (DEC-026).
+    - threshold_at_recall_{r}, n_alerts_at_recall_{r}: operating point at that precision; alerts_per_minute_at_recall_{r} is None (trainer has no test window length).
     - test_precision_prod_adjusted: test_precision rescaled to the assumed production
       neg/pos ratio (production_neg_pos_ratio). Only computed when
       production_neg_pos_ratio is not None and > 0.
     """
-    _TARGET_RECALLS = (0.01, 0.1, 0.5)
-    _zeroed_recall_keys = {
+    _TARGET_RECALLS = (0.001, 0.01, 0.1, 0.5)  # DEC-026
+    _zeroed_recall_keys: dict = {
         f"test_precision_at_recall_{r}": None for r in _TARGET_RECALLS
     }
+    for r in _TARGET_RECALLS:
+        _zeroed_recall_keys[f"threshold_at_recall_{r}"] = None
+        _zeroed_recall_keys[f"n_alerts_at_recall_{r}"] = None
+        _zeroed_recall_keys[f"alerts_per_minute_at_recall_{r}"] = None
 
     # R1100: guard against all-positive labels (average_precision_score = 1.0 trivially)
     _has_test = (
@@ -2834,15 +2843,28 @@ def _compute_test_metrics(
 
     # --- Precision at fixed recall levels (threshold-free, from PR curve) ---
     # For each target recall R, find the maximum precision among all PR-curve
-    # points where recall >= R.  Returns None when no point satisfies recall >= R.
-    pr_prec_arr, pr_rec_arr, _ = precision_recall_curve(y_test, test_scores)
+    # points where recall >= R; also record threshold and n_alerts at that point (DEC-026).
+    pr_prec_arr, pr_rec_arr, pr_thresholds = precision_recall_curve(y_test, test_scores)
+    pr_prec = pr_prec_arr[:-1]
+    pr_rec = pr_rec_arr[:-1]
     precision_at_recall: dict = {}
     for r in _TARGET_RECALLS:
-        mask = pr_rec_arr >= r
+        mask = pr_rec >= r
         if mask.any():
-            precision_at_recall[f"test_precision_at_recall_{r}"] = float(pr_prec_arr[mask].max())
+            valid_idx = np.where(mask)[0]
+            best_local = int(np.argmax(pr_prec[valid_idx]))
+            best_idx = int(valid_idx[best_local])
+            thr_r = float(pr_thresholds[best_idx])
+            n_alerts_r = int((test_scores >= thr_r).sum())
+            precision_at_recall[f"test_precision_at_recall_{r}"] = float(pr_prec[best_idx])
+            precision_at_recall[f"threshold_at_recall_{r}"] = thr_r
+            precision_at_recall[f"n_alerts_at_recall_{r}"] = n_alerts_r
+            precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None  # trainer has no test window
         else:
             precision_at_recall[f"test_precision_at_recall_{r}"] = None
+            precision_at_recall[f"threshold_at_recall_{r}"] = None
+            precision_at_recall[f"n_alerts_at_recall_{r}"] = None
+            precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
 
     # --- Production-prior adjusted precision ---
     # Rescales test precision to the expected production neg/pos ratio using the
@@ -2879,11 +2901,18 @@ def _compute_test_metrics(
             else f"prec@rec{r}=N/A"
             for r in _TARGET_RECALLS
         )
+        _thr_apm_str = "  ".join(
+            f"thr@rec{r}={precision_at_recall[f'threshold_at_recall_{r}']:.4f} n={precision_at_recall[f'n_alerts_at_recall_{r}']}"
+            if precision_at_recall[f"threshold_at_recall_{r}"] is not None
+            else f"thr@rec{r}=N/A"
+            for r in _TARGET_RECALLS
+        )
         logger.info(
             "%s test: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f%s",
             label, prauc, f1, prec, rec, threshold, _adj_str,
         )
         logger.info("%s test PR-curve: %s", label, _par_str)
+        logger.info("%s test thr/n_alerts@rec: %s", label, _thr_apm_str)
     return {
         "test_ap": prauc,
         "test_precision": prec,
@@ -2915,8 +2944,12 @@ def _compute_test_metrics_from_scores(
     Same keys as _compute_test_metrics; used when test labels and predictions come from
     LibSVM file (no X_test in memory). y_test and test_scores must be 1d arrays of same length.
     """
-    _TARGET_RECALLS = (0.01, 0.1, 0.5)
+    _TARGET_RECALLS = (0.001, 0.01, 0.1, 0.5)  # DEC-026
     _zeroed_recall_keys = {f"test_precision_at_recall_{r}": None for r in _TARGET_RECALLS}
+    for r in _TARGET_RECALLS:
+        _zeroed_recall_keys[f"threshold_at_recall_{r}"] = None
+        _zeroed_recall_keys[f"n_alerts_at_recall_{r}"] = None
+        _zeroed_recall_keys[f"alerts_per_minute_at_recall_{r}"] = None
     y_arr = np.asarray(y_test).reshape(-1)
     scores_arr = np.asarray(test_scores).reshape(-1)
     if len(y_arr) != len(scores_arr):
@@ -2960,14 +2993,27 @@ def _compute_test_metrics_from_scores(
     rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
     test_random_ap = (n_te_pos / n_te) if n_te > 0 else 0.0
-    pr_prec_arr, pr_rec_arr, _ = precision_recall_curve(y_arr, scores_arr)
+    pr_prec_arr, pr_rec_arr, pr_thresholds = precision_recall_curve(y_arr, scores_arr)
+    pr_prec = pr_prec_arr[:-1]
+    pr_rec = pr_rec_arr[:-1]
     precision_at_recall: dict[str, Optional[float]] = {}
     for r in _TARGET_RECALLS:
-        mask = pr_rec_arr >= r
+        mask = pr_rec >= r
         if mask.any():
-            precision_at_recall[f"test_precision_at_recall_{r}"] = float(pr_prec_arr[mask].max())
+            valid_idx = np.where(mask)[0]
+            best_local = int(np.argmax(pr_prec[valid_idx]))
+            best_idx = int(valid_idx[best_local])
+            thr_r = float(pr_thresholds[best_idx])
+            n_alerts_r = int((scores_arr >= thr_r).sum())
+            precision_at_recall[f"test_precision_at_recall_{r}"] = float(pr_prec[best_idx])
+            precision_at_recall[f"threshold_at_recall_{r}"] = thr_r
+            precision_at_recall[f"n_alerts_at_recall_{r}"] = n_alerts_r
+            precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
         else:
             precision_at_recall[f"test_precision_at_recall_{r}"] = None
+            precision_at_recall[f"threshold_at_recall_{r}"] = None
+            precision_at_recall[f"n_alerts_at_recall_{r}"] = None
+            precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
     test_neg_pos_ratio = (n_te_neg / n_te_pos) if n_te_pos > 0 else None
     test_precision_prod_adjusted = None
     if (
@@ -3498,15 +3544,16 @@ def train_single_rated_model(
                 if THRESHOLD_MIN_RECALL is not None:
                     valid_mask = valid_mask & (pr_rec >= THRESHOLD_MIN_RECALL)
                 if valid_mask.any():
+                    # DEC-026: argmax(pr_prec) over valid_mask (optimise Precision at recall >= 0.01).
+                    prec_arr = np.where(valid_mask, pr_prec, -1.0)
+                    best_idx = int(np.argmax(prec_arr))
+                    best_t = float(pr_thresholds[best_idx])
+                    best_prec = float(pr_prec[best_idx])
+                    best_rec = float(pr_rec[best_idx])
                     b = THRESHOLD_FBETA
                     denom = b * b * pr_prec + pr_rec
                     with np.errstate(divide="ignore", invalid="ignore"):
                         fbeta_arr = np.where(denom > 0, (1.0 + b * b) * pr_prec * pr_rec / denom, 0.0)
-                    fbeta_arr = np.where(valid_mask, fbeta_arr, -1.0)
-                    best_idx = int(np.argmax(fbeta_arr))
-                    best_t = float(pr_thresholds[best_idx])
-                    best_prec = float(pr_prec[best_idx])
-                    best_rec = float(pr_rec[best_idx])
                     best_fbeta = float(fbeta_arr[best_idx])
                     best_f1 = (
                         2.0 * best_prec * best_rec / (best_prec + best_rec)
@@ -3649,15 +3696,16 @@ def train_single_rated_model(
                 if THRESHOLD_MIN_RECALL is not None:
                     valid_mask = valid_mask & (pr_rec >= THRESHOLD_MIN_RECALL)
                 if valid_mask.any():
+                    # DEC-026: argmax(pr_prec) over valid_mask (optimise Precision at recall >= 0.01).
+                    prec_arr = np.where(valid_mask, pr_prec, -1.0)
+                    best_idx = int(np.argmax(prec_arr))
+                    best_t = float(pr_thresholds[best_idx])
+                    best_prec = float(pr_prec[best_idx])
+                    best_rec = float(pr_rec[best_idx])
                     b = THRESHOLD_FBETA
                     denom = b * b * pr_prec + pr_rec
                     with np.errstate(divide="ignore", invalid="ignore"):
                         fbeta_arr = np.where(denom > 0, (1.0 + b * b) * pr_prec * pr_rec / denom, 0.0)
-                    fbeta_arr = np.where(valid_mask, fbeta_arr, -1.0)
-                    best_idx = int(np.argmax(fbeta_arr))
-                    best_t = float(pr_thresholds[best_idx])
-                    best_prec = float(pr_prec[best_idx])
-                    best_rec = float(pr_rec[best_idx])
                     best_fbeta = float(fbeta_arr[best_idx])
                     best_f1 = (
                         2.0 * best_prec * best_rec / (best_prec + best_rec)
@@ -4239,13 +4287,14 @@ def run_pipeline(args) -> None:
     #     Pass the resulting DataFrame to every process_chunk call so each chunk
     #     can do the PIT/as-of join without re-querying.  If load fails, profile
     #     features are 0 for all rows (graceful degradation).
+    # R404 Review #1: empty map → [] so load_player_profile does not load full table (train-serve parity with backtester).
     _rated_cids: Optional[List[str]] = (
         list(rated_whitelist)
         if rated_whitelist
         else (
             canonical_map["canonical_id"].astype(str).tolist()
             if not canonical_map.empty
-            else None
+            else []
         )
     )
     print("[Step 5/10] Load player_profile for PIT join…", flush=True)

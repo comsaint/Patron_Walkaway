@@ -16,5 +16,5 @@ python scripts/one_time/patch_backtester.py
 | `patch_trainer2.py` | `trainer/trainer.py` | Remove legacy feature logic; use feature_spec + get_all_candidate_feature_ids. |
 | `patch_backtester.py` | `trainer/backtester.py` | Switch from legacy features to Track LLM + feature_spec. |
 | `patch_reason_codes.py` | `trainer/trainer.py` | Generate reason_code_map from feature_spec YAML. |
-| `patch_features.py` | `trainer/features.py` | Load PROFILE_FEATURE_COLS from features_candidates.template.yaml. |
+| `patch_features.py` | `trainer/features.py` | Load PROFILE_FEATURE_COLS from features_candidates.yaml. |
 | `fix_trainer.py` | `trainer/trainer.py` | save_artifact_bundle: add feature_spec load; fallbacks for get_candidate_feature_ids. |

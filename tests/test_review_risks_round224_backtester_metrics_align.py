@@ -32,9 +32,18 @@ _EXPECTED_FLAT_KEYS = frozenset({
     "test_random_ap",
     "alerts",
     "alerts_per_hour",
+    "test_precision_at_recall_0.001",
     "test_precision_at_recall_0.01",
     "test_precision_at_recall_0.1",
     "test_precision_at_recall_0.5",
+    "threshold_at_recall_0.001",
+    "threshold_at_recall_0.01",
+    "threshold_at_recall_0.1",
+    "threshold_at_recall_0.5",
+    "alerts_per_minute_at_recall_0.001",
+    "alerts_per_minute_at_recall_0.01",
+    "alerts_per_minute_at_recall_0.1",
+    "alerts_per_minute_at_recall_0.5",
 })
 # Section = flat metrics + rated_threshold (Round 226 Review #2: no extra keys).
 _EXPECTED_SECTION_KEYS = _EXPECTED_FLAT_KEYS | {"rated_threshold"}
@@ -62,8 +71,8 @@ class TestR224_1_EmptyRatedSubFlatKeys(unittest.TestCase):
         self.assertEqual(out["test_random_ap"], 0.0)
         self.assertEqual(out["alerts"], 0)
         self.assertEqual(out["alerts_per_hour"], 0.0, "window_hours=1.0 → 0/1.0")
-        for r in (0.01, 0.1, 0.5):
-            self.assertIsNone(out[f"test_precision_at_recall_{r}"], "empty → None (PLAN)")
+        for r in (0.001, 0.01, 0.1, 0.5):
+            self.assertIsNone(out[f"test_precision_at_recall_{r}"], "empty → None (PLAN DEC-026)")
 
     def test_compute_section_metrics_empty_rated_sub_returns_micro_with_flat_keys(self):
         """Section is flat (no 'micro' nest); downstream reads out['test_ap'] (PLAN step 3)."""
@@ -101,8 +110,8 @@ class TestR224_2_NaNLabelsSafeStructure(unittest.TestCase):
         self.assertEqual(out["test_ap"], 0.0)
         self.assertEqual(out["test_samples"], 0, "NaN label → same zeroed structure as empty")
         self.assertEqual(out["test_positives"], 0)
-        for r in (0.01, 0.1, 0.5):
-            self.assertIsNone(out[f"test_precision_at_recall_{r}"], "NaN labels → None (PLAN)")
+        for r in (0.001, 0.01, 0.1, 0.5):
+            self.assertIsNone(out[f"test_precision_at_recall_{r}"], "NaN labels → None (PLAN DEC-026)")
 
 
 class TestR224_3_AllPositiveAPBehavior(unittest.TestCase):
@@ -118,8 +127,8 @@ class TestR224_3_AllPositiveAPBehavior(unittest.TestCase):
         out = backtester_mod.compute_micro_metrics(df, threshold=0.5, window_hours=1.0)
         self.assertEqual(set(out.keys()), _EXPECTED_FLAT_KEYS)
         self.assertEqual(out["test_ap"], 0.0, "Single-class AP should be 0 (trainer-aligned)")
-        for r in (0.01, 0.1, 0.5):
-            self.assertIsNone(out[f"test_precision_at_recall_{r}"], "single-class → None (PLAN)")
+        for r in (0.001, 0.01, 0.1, 0.5):
+            self.assertIsNone(out[f"test_precision_at_recall_{r}"], "single-class → None (PLAN DEC-026)")
 
 
 class TestR224_4_ModuleDocNoMacroByVisit(unittest.TestCase):

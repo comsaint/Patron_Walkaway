@@ -28,6 +28,7 @@ class TestR229_1_ScoreNaN(unittest.TestCase):
             "is_rated": [True, True, True, True],
         })
         out = backtester_mod.compute_micro_metrics(df, threshold=0.5, window_hours=1.0)
+        self.assertIsNone(out.get("test_precision_at_recall_0.001"))
         self.assertIsNone(out.get("test_precision_at_recall_0.01"))
         self.assertIsNone(out.get("test_precision_at_recall_0.1"))
         self.assertIsNone(out.get("test_precision_at_recall_0.5"))
@@ -40,6 +41,7 @@ class TestR229_1_ScoreNaN(unittest.TestCase):
             "is_rated": [True, True, True, True],
         })
         out = backtester_mod.compute_micro_metrics(df, threshold=0.5, window_hours=1.0)
+        self.assertIsNone(out.get("test_precision_at_recall_0.001"))
         self.assertIsNone(out.get("test_precision_at_recall_0.01"))
         self.assertIsNone(out.get("test_precision_at_recall_0.1"))
         self.assertIsNone(out.get("test_precision_at_recall_0.5"))
@@ -74,6 +76,7 @@ class TestR229_3_AllNegative(unittest.TestCase):
             "is_rated": [True, True, True],
         })
         out = backtester_mod.compute_micro_metrics(df, threshold=0.5, window_hours=1.0)
+        self.assertIsNone(out["test_precision_at_recall_0.001"])
         self.assertIsNone(out["test_precision_at_recall_0.01"])
         self.assertIsNone(out["test_precision_at_recall_0.1"])
         self.assertIsNone(out["test_precision_at_recall_0.5"])
@@ -85,11 +88,11 @@ class TestR229_4_TargetRecallsContract(unittest.TestCase):
     """Review #4: _TARGET_RECALLS 與 trainer 口徑一致（常數同步）."""
 
     def test_backtester_target_recalls_is_expected_tuple(self):
-        """Backtester 的 _TARGET_RECALLS 須為 (0.01, 0.1, 0.5)，與 PLAN / trainer 一致."""
+        """Backtester 的 _TARGET_RECALLS 須為 (0.001, 0.01, 0.1, 0.5)，與 PLAN DEC-026 / trainer 一致."""
         self.assertEqual(
             backtester_mod._TARGET_RECALLS,
-            (0.01, 0.1, 0.5),
-            "_TARGET_RECALLS must match trainer and PLAN § Backtester precision-at-recall.",
+            (0.001, 0.01, 0.1, 0.5),
+            "_TARGET_RECALLS must match trainer and PLAN § DEC-026.",
         )
 
 

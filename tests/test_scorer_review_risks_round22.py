@@ -24,7 +24,7 @@ def _features_mod():
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_FEATURE_SPEC_PATH = _REPO_ROOT / "trainer" / "feature_spec" / "features_candidates.template.yaml"
+_FEATURE_SPEC_PATH = _REPO_ROOT / "trainer" / "feature_spec" / "features_candidates.yaml"
 _SCORER_PATH = _REPO_ROOT / "trainer" / "scorer.py"
 _TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
 
@@ -90,10 +90,10 @@ class TestScorerReviewRisksRound22(unittest.TestCase):
         dynamically by the scorer for train-serve parity; they must NOT appear in the
         training feature candidate list (YAML SSOT, feat-consolidation) to avoid
         double-counting, but MUST be computed inside build_features_for_scoring (R2300).
-        Depends on repo template features_candidates.template.yaml as SSOT (Round 141 Review P2)."""
+        Depends on repo spec features_candidates.yaml as SSOT (Round 141 Review P2)."""
         self.assertTrue(
             _FEATURE_SPEC_PATH.exists(),
-            "Template YAML required for R32: trainer/feature_spec/features_candidates.template.yaml",
+            "Spec YAML required for R32: trainer/feature_spec/features_candidates.yaml",
         )
         features = _features_mod()
         spec = features.load_feature_spec(_FEATURE_SPEC_PATH)

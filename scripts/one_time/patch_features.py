@@ -12,7 +12,7 @@ if start_idx != -1 and end_idx != -1:
     replacement = """#: Phase 2 additions (wager_mean_180d, wager_p50_180d from t_bet) are not
 #: included here.  See doc/player_profile_spec.md §14.
 
-_yaml_path = pathlib.Path(__file__).parent / "feature_spec" / "features_candidates.template.yaml"
+_yaml_path = pathlib.Path(__file__).parent / "feature_spec" / "features_candidates.yaml"
 with open(_yaml_path, "r", encoding="utf-8") as _f:
     _TEMPLATE_SPEC = _yaml.safe_load(_f)
 

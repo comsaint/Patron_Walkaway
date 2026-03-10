@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 #: Phase 2 additions (wager_mean_180d, wager_p50_180d from t_bet) are not
 #: included here.  See doc/player_profile_spec.md §14.
 
-_yaml_path = pathlib.Path(__file__).parent / "feature_spec" / "features_candidates.template.yaml"
+_yaml_path = pathlib.Path(__file__).parent / "feature_spec" / "features_candidates.yaml"
 try:
     with open(_yaml_path, "r", encoding="utf-8") as _f:
         _TEMPLATE_SPEC = _yaml.safe_load(_f) or {}
@@ -81,7 +81,7 @@ except FileNotFoundError:
     import logging as _logging
     _logging.getLogger(__name__).warning(
         "Feature Spec YAML not found at %s — PROFILE_FEATURE_COLS will be empty. "
-        "Ensure the template YAML exists before training.",
+        "Ensure features_candidates.yaml (repo spec) exists before training.",
         _yaml_path,
     )
     _TEMPLATE_SPEC = {}
@@ -176,9 +176,13 @@ def get_candidate_feature_ids(
     screening_only=True 時排除 dtype='str' 或 screening_eligible 為 false/0/"false"
     的候選（中間變數不參與篩選）。
     """
-    candidates = ((spec.get(track) or {}).get("candidates") or [])
+    # R404 Review #4: candidates may be non-list (e.g. dict); treat as no candidates.
+    _raw = ((spec.get(track) or {}).get("candidates"))
+    candidates = _raw if isinstance(_raw, list) else []
     out: List[str] = []
     for c in candidates:
+        if not isinstance(c, dict):
+            continue
         fid = c.get("feature_id")
         if not fid:
             continue
