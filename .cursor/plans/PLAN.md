@@ -71,6 +71,9 @@ todos:
   - id: canonical-mapping-duckdb-align-step7
     content: "Canonical mapping DuckDB 對齊 Step 7：temp_directory、preserve_insertion_order、動態 RAM 預算（available × fraction clamp MIN/MAX）、錯誤訊息不再建議 Pandas。Round 386 完成 temp_directory + preserve_insertion_order + 錯誤訊息；Round 388 完成動態 RAM 預算（CANONICAL_MAP_DUCKDB_RAM_FRACTION、MIN/MAX_GB）。見「Canonical mapping DuckDB 對齊 Step 7」一節。"
     status: completed
+  - id: optuna-study-early-stop
+    content: "Optuna 整份 study 的 early stop：可選 callback + study.stop()，連續 N 個 trial 無改進即停；config OPTUNA_EARLY_STOP_PATIENCE（預設 None=關）；log 標註提早停。見「Optuna 整份 study 的 early stop（計畫）」"
+    status: pending
 isProject: false
 ---
 
@@ -118,10 +121,11 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 8 | **Backtester precision-at-recall 指標** | completed | 下方「Backtester precision-at-recall 指標」一節；Round 229/230/231 實作與 Review 修復。 |
 | 9 | **api_server 對齊 model_api_protocol** | completed | 下方「api_server 對齊 model_api_protocol 實作計畫」一節；步驟 1–6 已完成（Round 232/234/235/237/238/241；本輪確認 doc 與實作一致並補 Phase 1 alignment 註記）。 |
 | 10 | **Canonical mapping 全歷史 + DuckDB + 寫出/載入 + 強制重建** | completed | 下方「Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入與生產增量更新」一節；步驟 1–9 已完成（Round 384 步驟 9 README 文件化）；CLI 已接線；五、生產增量更新為可選 Phase 2。 |
+| 11 | **Optuna 整份 study 的 early stop** | pending | 下方「Optuna 整份 study 的 early stop（計畫）」一節。 |
 
-**Plan 狀態摘要**：上表 1～10 項均為 **completed**。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。
+**Plan 狀態摘要**：上表 1～10 項均為 **completed**；第 11 項 Optuna study early stop 為 **pending**。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。
 
-**建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。Backtester 輸出格式對齊（項目 7）可獨立排入。
+**建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。Backtester 輸出格式對齊（項目 7）可獨立排入。Optuna 整份 study 的 early stop（項目 11）為可選省時機制，預設關閉，實作後可依需要設定 `OPTUNA_EARLY_STOP_PATIENCE`。
 
 **可選／後續**（非阻斷）：(1) OOM 預檢查（Step 6 以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC）已於 Round 210/211/212 實作並通過 Review 修復；規格見「OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC」一節。(2) Round 222 Review 建議之 production 補強（Track LLM 失敗 warning、canonical_ids=[]、use_local_parquet 參數、candidates 型別防呆）可依優先度排入。
 
@@ -931,6 +935,50 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - 有 cache（frac=1.0）：chunk 1 不重算，僅 `stat()`，估計與上類似。
 - 使用者設 `NEG_SAMPLE_FRAC=0.3`：Step 1 的 `_early_frac=0.3`，chunk-1 探針不覆寫（僅可能 log 警告）。
 - `NEG_SAMPLE_FRAC_AUTO=False`：行為與改動前完全一致（不做探針）。
+
+---
+
+## Optuna 整份 study 的 early stop（計畫）
+
+### 目標與背景
+
+- **現狀**：Step 9 執行 Optuna 搜尋時固定跑滿 `OPTUNA_N_TRIALS`（例如 300）；每個 trial 內已有 LightGBM 的 early stopping（50 輪無改進即停），但 **整份 study** 不會提早結束。
+- **需求**：當 validation best AP 已明顯 plateau（連續 N 個 trial 無改進）時，可選擇提早結束 study，節省 1～數小時訓練時間，且對最終 best 結果影響通常很小。
+- **適用情境**：長時間、大資料量的訓練（如 90 天、22M+ 列）；若在意可重現性／審計「固定 300 trials」，則預設關閉此機制。
+
+### 範圍
+
+- **改動**：`trainer/config.py`（新增一項可選常數）、`trainer/trainer.py` 內 `run_optuna_search`（新增 callback，條件滿足時呼叫 `study.stop()`）。
+- **不改動**：Optuna 本身、LightGBM 單一 trial 內 early stopping、backtester 的 Optuna 閾值搜尋（若需可另立計畫比照實作）。
+
+### 設計要點
+
+1. **觸發條件**：連續 **N 個 trial** 的 best value（validation AP）皆未改進即呼叫 `study.stop()`。N 由 config 控制。
+2. **Config**：新增 `OPTUNA_EARLY_STOP_PATIENCE`（`Optional[int]`）：
+   - `None` 或未設定：**不啟用** early stop，維持現有「跑滿 n_trials」行為（建議預設，以利可重現性與審計）。
+   - 正整數（例如 40～60）：連續 N 個 trial 無改進即停；建議區間 40～60，避免 TPE 偶發乾旱後又改進時過早停。
+3. **Callback 邏輯**：在現有 `_progress_callback` 旁（或合併）加入 early-stop callback：
+   - 維護「當前 best value」與「自上次改進起連續未改進次數」；
+   - 每 trial 結束後：若 `study.best_value` 大於先前記錄的 best → 更新 best、重置計數；否則計數 +1；
+   - 若計數 ≥ `OPTUNA_EARLY_STOP_PATIENCE` → 呼叫 `study.stop()`。
+4. **日誌**：提早停時必須打一筆 log，例如：  
+   `[Step 9] Optuna early stop: no improvement for N trials (stopped at trial K/300)`  
+   方便事後區分「跑滿」與「提早停」。
+
+### 實作步驟建議
+
+| 步驟 | 內容 |
+|------|------|
+| 1 | 在 `config.py` 新增 `OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = None`，註解說明：None=關閉；正整數=連續 N 個 trial 無改進即停，建議 40～60。 |
+| 2 | 在 `run_optuna_search` 中實作 early-stop callback（或擴充現有 progress callback）：追蹤 best value 與連續未改進次數；當次數 ≥ patience 時呼叫 `study.stop()`。 |
+| 3 | 在 callback 內（或 `study.optimize` 結束後）若因 early stop 結束：log 上述 `[Step 9] Optuna early stop: ...` 訊息，含 N、實際結束之 trial 編號與 n_trials。 |
+| 4 | 確保 `study.optimize(..., callbacks=[_progress_callback, _early_stop_callback])` 傳入順序正確；early-stop 僅在 `OPTUNA_EARLY_STOP_PATIENCE` 為正整數時加入 callbacks。 |
+
+### 驗收
+
+- `OPTUNA_EARLY_STOP_PATIENCE=None`（預設）：行為與改動前完全一致，跑滿 n_trials。
+- 設為 50、且約 trial 80 起無改進：應在約 trial 130 結束，並出現 `[Step 9] Optuna early stop: no improvement for 50 trials (stopped at trial 130/300)` 之類 log。
+- 若需審計／可重現：預設保持 `None`；僅在 dev 或明確要省時間時設定 patience。
 
 ---
 
