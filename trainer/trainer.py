@@ -1525,11 +1525,15 @@ def add_track_b_features(
     bets: pd.DataFrame,
     canonical_map: pd.DataFrame,
     window_end: datetime,
+    lookback_hours: Optional[float] = None,
 ) -> pd.DataFrame:
     """Return a copy of *bets* with Track-B feature columns attached.
 
     A copy is taken so the caller's DataFrame is not mutated.  After column
     pushdown, ``bets`` is already narrow (~20 cols), so the copy cost is low.
+    When ``lookback_hours`` is set (e.g. SCORER_LOOKBACK_HOURS), Track Human
+    features use only bets in (row_time - lookback_hours, row_time] for
+    train–serve parity with scorer.
     """
     df = bets.copy()
 
@@ -1543,21 +1547,15 @@ def add_track_b_features(
         return df
 
     # loss_streak (cutoff = window_end so future bets don't influence streak)
-    streak = compute_loss_streak(df, cutoff_time=window_end)
+    streak = compute_loss_streak(df, cutoff_time=window_end, lookback_hours=lookback_hours)
     df["loss_streak"] = streak.reindex(df.index, fill_value=0)
 
-    # run_boundary (cutoff = window_end)
-    run_df = compute_run_boundary(df, cutoff_time=window_end)
-    df["run_id"] = run_df.get("run_id", pd.Series(0, index=df.index))
-    df["minutes_since_run_start"] = run_df.get(
-        "minutes_since_run_start", pd.Series(0.0, index=df.index)
-    )
-    df["bets_in_run_so_far"] = run_df.get(
-        "bets_in_run_so_far", pd.Series(0, index=df.index)
-    )
-    df["wager_sum_in_run_so_far"] = run_df.get(
-        "wager_sum_in_run_so_far", pd.Series(0.0, index=df.index)
-    )
+    # run_boundary (cutoff = window_end); reindex so rows beyond cutoff get 0 not NaN (Review #2)
+    run_df = compute_run_boundary(df, cutoff_time=window_end, lookback_hours=lookback_hours)
+    df["run_id"] = run_df["run_id"].reindex(df.index, fill_value=0).values
+    df["minutes_since_run_start"] = run_df["minutes_since_run_start"].reindex(df.index, fill_value=0.0).values
+    df["bets_in_run_so_far"] = run_df["bets_in_run_so_far"].reindex(df.index, fill_value=0).values
+    df["wager_sum_in_run_so_far"] = run_df["wager_sum_in_run_so_far"].reindex(df.index, fill_value=0.0).values
 
     return df
 
@@ -1825,10 +1823,12 @@ def _chunk_cache_key(
     data_hash = hashlib.md5(
         pd.util.hash_pandas_object(bets, index=False).values.tobytes()
     ).hexdigest()[:8]
+    _lookback = getattr(_cfg, "SCORER_LOOKBACK_HOURS", None)
     cfg_str = json.dumps({
         "WALKAWAY_GAP_MIN": WALKAWAY_GAP_MIN,
         "SESSION_AVAIL_DELAY_MIN": SESSION_AVAIL_DELAY_MIN,
         "HISTORY_BUFFER_DAYS": HISTORY_BUFFER_DAYS,
+        "SCORER_LOOKBACK_HOURS": _lookback,
     }, sort_keys=True)
     cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:6]
     return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}|spec{feature_spec_hash}|ns{neg_sample_frac:.4f}"
@@ -1966,7 +1966,10 @@ def process_chunk(
     # --- Track-B features (on FULL bets incl. history, cutoff=window_end) ---
     # Computing before label filtering ensures cross-chunk state (loss_streak,
     # run_boundary) uses historical context from HISTORY_BUFFER_DAYS before window_start.
-    bets = add_track_b_features(bets, canonical_map, window_end)
+    # When SCORER_LOOKBACK_HOURS is set, restrict context to that many hours per row
+    # for train–serve parity with scorer (STATUS.md: trainer 對齊 Track Human/LLM).
+    _lookback_hours = getattr(_cfg, "SCORER_LOOKBACK_HOURS", None)
+    bets = add_track_b_features(bets, canonical_map, window_end, lookback_hours=_lookback_hours)
 
     # --- Track LLM: DuckDB + Feature Spec YAML (DEC-022/023/024) ---
     # R3500: compute on the FULL bets DataFrame (with HISTORY_BUFFER_DAYS context)

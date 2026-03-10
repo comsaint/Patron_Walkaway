@@ -244,6 +244,7 @@ _REQUIRED_HC_COLS: frozenset[str] = frozenset(
 def compute_loss_streak(
     bets_df: pd.DataFrame,
     cutoff_time: Optional[datetime] = None,
+    lookback_hours: Optional[float] = None,
 ) -> pd.Series:
     """Return the running LOSE streak for each bet.
 
@@ -258,6 +259,8 @@ def compute_loss_streak(
     G3: sorted by (canonical_id, payout_complete_dtm, bet_id) before computing.
     TRN-09 / E2: only bets with ``payout_complete_dtm <= cutoff_time`` are
     considered; if ``cutoff_time`` is None all bets in ``bets_df`` are used.
+    When ``lookback_hours`` is set (e.g. SCORER_LOOKBACK_HOURS for train–serve
+    parity), streak at row i uses only bets in (t_i - lookback_hours, t_i].
 
     Parameters
     ----------
@@ -270,6 +273,10 @@ def compute_loss_streak(
         The returned Series preserves the original index — rows beyond the
         cutoff receive NaN (use them for context if needed, but not for
         training labels).
+    lookback_hours : float | None
+        If set, for each row only bets with payout_complete_dtm in
+        (row_time - lookback_hours, row_time] are used (train–serve parity
+        with scorer's fetch window). None = use all bets (current behavior).
 
     Returns
     -------
@@ -280,6 +287,8 @@ def compute_loss_streak(
     missing = _REQUIRED_STREAK_COLS - set(bets_df.columns)
     if missing:
         raise ValueError(f"compute_loss_streak: missing columns {sorted(missing)}")
+    if lookback_hours is not None and lookback_hours <= 0:
+        raise ValueError("lookback_hours must be positive when set")
 
     df = bets_df.copy()
 
@@ -298,7 +307,34 @@ def compute_loss_streak(
         kind="stable",
     )
 
-    # Vectorized streak using cumsum-of-resets approach:
+    if lookback_hours is not None and lookback_hours > 0:
+        # Per-row context: for each row only use bets in (t - lookback_hours, t].
+        delta = pd.Timedelta(hours=float(lookback_hours))
+        out_list = []
+        for cid, grp in df.groupby("canonical_id", sort=False):
+            times = pd.to_datetime(grp["payout_complete_dtm"], utc=False)
+            for idx, t in zip(grp.index, times):
+                lo = t - delta
+                sub = grp.loc[(times > lo) & (times <= t)]
+                if sub.empty:
+                    out_list.append((idx, 0))
+                    continue
+                sub = sub.sort_values(["payout_complete_dtm", "bet_id"], kind="stable")
+                _is_lose = (sub["status"] == "LOSE").astype("int8")
+                _is_reset = (
+                    (sub["status"] == "WIN")
+                    | ((sub["status"] == "PUSH") & LOSS_STREAK_PUSH_RESETS)
+                ).astype("int8")
+                _reset_grp = _is_reset.cumsum()
+                streak_sub = _is_lose.groupby(_reset_grp.values, sort=False).cumsum().astype("int32")
+                out_list.append((idx, int(streak_sub.iloc[-1])))
+        streak = pd.Series(
+            {idx: v for idx, v in out_list},
+            dtype="int32",
+        ).reindex(df.index, fill_value=0)
+        return streak
+
+    # Vectorized streak using cumsum-of-resets approach (no lookback):
     #   - A "reset" event starts a new group (WIN, or PUSH if LOSS_STREAK_PUSH_RESETS)
     #   - Within each (canonical_id × reset_group), cumsum of is_lose = streak
     #
@@ -330,6 +366,7 @@ def compute_loss_streak(
 def compute_run_boundary(
     bets_df: pd.DataFrame,
     cutoff_time: Optional[datetime] = None,
+    lookback_hours: Optional[float] = None,
 ) -> pd.DataFrame:
     """Assign run_id and minutes_since_run_start for each bet.
 
@@ -338,6 +375,8 @@ def compute_run_boundary(
     is >= ``RUN_BREAK_MIN`` minutes (B2 correction).
 
     G3: sorted by (canonical_id, payout_complete_dtm, bet_id) internally.
+    When ``lookback_hours`` is set (e.g. SCORER_LOOKBACK_HOURS for train–serve
+    parity), run at row i is computed only from bets in (t_i - lookback_hours, t_i].
 
     Parameters
     ----------
@@ -351,6 +390,10 @@ def compute_run_boundary(
         is accurate even for the first observation in a time window.
         Must be **tz-naive** (DEC-018 contract); ``payout_complete_dtm`` is
         expected to be tz-naive after ``apply_dq`` normalisation.
+    lookback_hours : float | None
+        If set, for each row only bets with payout_complete_dtm in
+        (row_time - lookback_hours, row_time] are used (train–serve parity).
+        None = use all bets (current behavior).
 
     Returns
     -------
@@ -365,6 +408,8 @@ def compute_run_boundary(
     missing = _REQUIRED_RUN_COLS - set(bets_df.columns)
     if missing:
         raise ValueError(f"compute_run_boundary: missing columns {sorted(missing)}")
+    if lookback_hours is not None and lookback_hours <= 0:
+        raise ValueError("lookback_hours must be positive when set")
 
     if bets_df.empty:
         result = bets_df.copy()
@@ -386,48 +431,86 @@ def compute_run_boundary(
         kind="stable",
     ).copy()
 
-    # Gap to previous bet within canonical_id (NaT for the first bet)
-    prev_payout = df.groupby("canonical_id", sort=False)["payout_complete_dtm"].shift(1)
-    gap_min = (df["payout_complete_dtm"] - prev_payout).dt.total_seconds().div(60)
-
-    # New run: first bet of cid (prev_payout is NaT) OR gap >= RUN_BREAK_MIN
-    is_new_run = prev_payout.isna() | (gap_min >= RUN_BREAK_MIN)
-
-    # run_id = cumsum of is_new_run, minus 1 so it starts at 0.
-    # Use groupby().cumsum() (transform-style) to avoid multi-index issues
-    # that arise with groupby().apply() when there is only one group.
-    df["_is_new_run"] = is_new_run.astype("int8")
-    df["run_id"] = (
-        df.groupby("canonical_id", sort=False)["_is_new_run"]
-        .cumsum()
-        .sub(1)
-        .astype("int32")
-    )
-
-    # Run start time: payout_complete_dtm at the first bet of each run,
-    # forward-filled within canonical_id so all bets in a run share the same start.
-    df["_run_start"] = df["payout_complete_dtm"].where(df["_is_new_run"].astype(bool))
-    df["_run_start"] = df.groupby("canonical_id", sort=False)["_run_start"].ffill()
-
-    df["minutes_since_run_start"] = (
-        (df["payout_complete_dtm"] - df["_run_start"]).dt.total_seconds().div(60)
-    )
-
-    # Run-level cumulative features (bets in run so far, wager sum in run so far)
-    df["bets_in_run_so_far"] = (
-        df.groupby(["canonical_id", "run_id"], sort=False).cumcount() + 1
-    ).astype("int32")
-    if "wager" in df.columns:
-        df["wager_sum_in_run_so_far"] = (
-            df.groupby(["canonical_id", "run_id"], sort=False)["wager"].cumsum()
-        )
+    if lookback_hours is not None and lookback_hours > 0:
+        # Per-row context: for each row only use bets in (t - lookback_hours, t].
+        delta = pd.Timedelta(hours=float(lookback_hours))
+        run_id_list = []
+        min_since_list = []
+        bets_in_run_list = []
+        wager_sum_list = []
+        for cid, grp in df.groupby("canonical_id", sort=False):
+            times = pd.to_datetime(grp["payout_complete_dtm"], utc=False)
+            for idx, t in zip(grp.index, times):
+                lo = t - delta
+                sub = grp.loc[(times > lo) & (times <= t)]
+                if sub.empty:
+                    run_id_list.append((idx, 0))
+                    min_since_list.append((idx, 0.0))
+                    bets_in_run_list.append((idx, 0))
+                    wager_sum_list.append((idx, 0.0))
+                    continue
+                sub = sub.sort_values(["payout_complete_dtm", "bet_id"], kind="stable")
+                prev = sub["payout_complete_dtm"].shift(1)
+                gap_min = (sub["payout_complete_dtm"] - prev).dt.total_seconds().div(60)
+                is_new = prev.isna() | (gap_min >= RUN_BREAK_MIN)
+                run_id_sub = is_new.astype("int8").cumsum().sub(1).astype("int32")
+                run_start = sub["payout_complete_dtm"].where(is_new).ffill()
+                min_since = (sub["payout_complete_dtm"] - run_start).dt.total_seconds().div(60)
+                bets_in_run = run_id_sub.groupby(run_id_sub).cumcount() + 1
+                wager_sub = (
+                    sub.groupby(run_id_sub)["wager"].cumsum()
+                    if "wager" in sub.columns
+                    else pd.Series(0.0, index=sub.index)
+                )
+                # Take last row (current bet) values
+                run_id_list.append((idx, int(run_id_sub.iloc[-1])))
+                min_since_list.append((idx, float(min_since.iloc[-1])))
+                bets_in_run_list.append((idx, int(bets_in_run.iloc[-1])))
+                wager_sum_list.append((idx, float(wager_sub.iloc[-1])))
+        df["run_id"] = pd.Series({i: v for i, v in run_id_list}, dtype="int32").reindex(df.index, fill_value=0).values
+        df["minutes_since_run_start"] = pd.Series({i: v for i, v in min_since_list}, dtype="float64").reindex(df.index, fill_value=0.0).values
+        df["bets_in_run_so_far"] = pd.Series({i: v for i, v in bets_in_run_list}, dtype="int32").reindex(df.index, fill_value=0).values
+        df["wager_sum_in_run_so_far"] = pd.Series({i: v for i, v in wager_sum_list}, dtype="float64").reindex(df.index, fill_value=0.0).values
     else:
-        df["wager_sum_in_run_so_far"] = 0.0
+        # Gap to previous bet within canonical_id (NaT for the first bet)
+        prev_payout = df.groupby("canonical_id", sort=False)["payout_complete_dtm"].shift(1)
+        gap_min = (df["payout_complete_dtm"] - prev_payout).dt.total_seconds().div(60)
 
-    df = df.drop(columns=["_is_new_run", "_run_start"])
+        # New run: first bet of cid (prev_payout is NaT) OR gap >= RUN_BREAK_MIN
+        is_new_run = prev_payout.isna() | (gap_min >= RUN_BREAK_MIN)
+
+        # run_id = cumsum of is_new_run, minus 1 so it starts at 0.
+        df["_is_new_run"] = is_new_run.astype("int8")
+        df["run_id"] = (
+            df.groupby("canonical_id", sort=False)["_is_new_run"]
+            .cumsum()
+            .sub(1)
+            .astype("int32")
+        )
+
+        # Run start time: payout_complete_dtm at the first bet of each run,
+        # forward-filled within canonical_id so all bets in a run share the same start.
+        df["_run_start"] = df["payout_complete_dtm"].where(df["_is_new_run"].astype(bool))
+        df["_run_start"] = df.groupby("canonical_id", sort=False)["_run_start"].ffill()
+
+        df["minutes_since_run_start"] = (
+            (df["payout_complete_dtm"] - df["_run_start"]).dt.total_seconds().div(60)
+        )
+
+        # Run-level cumulative features (bets in run so far, wager sum in run so far)
+        df["bets_in_run_so_far"] = (
+            df.groupby(["canonical_id", "run_id"], sort=False).cumcount() + 1
+        ).astype("int32")
+        if "wager" in df.columns:
+            df["wager_sum_in_run_so_far"] = (
+                df.groupby(["canonical_id", "run_id"], sort=False)["wager"].cumsum()
+            )
+        else:
+            df["wager_sum_in_run_so_far"] = 0.0
+
+        df = df.drop(columns=["_is_new_run", "_run_start"])
 
     # Apply cutoff_time filter after computing run_id / minutes_since_run_start
-    # so that run start times are always anchored to their true first bet.
     if cutoff_ts is not None:
         df = df[df["payout_complete_dtm"] <= cutoff_ts].copy()
 

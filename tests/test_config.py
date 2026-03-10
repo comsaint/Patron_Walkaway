@@ -86,6 +86,13 @@ class TestConfigRequiredConstants(unittest.TestCase):
                 f"config must NOT define {name} (v10 single Rated model)",
             )
 
+    def test_scorer_poll_defaults_exist_and_positive(self):
+        """Scorer defaults in config (PLAN scorer-defaults-in-config); Review: must be positive int."""
+        self.assertHasAttr("SCORER_LOOKBACK_HOURS", int)
+        self.assertHasAttr("SCORER_POLL_INTERVAL_SECONDS", int)
+        self.assertGreater(getattr(self.config, "SCORER_LOOKBACK_HOURS"), 0)
+        self.assertGreater(getattr(self.config, "SCORER_POLL_INTERVAL_SECONDS"), 0)
+
     def assertHasAttr(self, name: str, expected_type: type | tuple):
         self.assertTrue(hasattr(self.config, name), f"config must define {name}")
         val = getattr(self.config, name)

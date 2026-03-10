@@ -1362,11 +1362,15 @@ def main() -> None:
         description="Near real-time scorer for walkaway alerts"
     )
     parser.add_argument(
-        "--interval", type=int, default=45,
+        "--interval",
+        type=int,
+        default=getattr(config, "SCORER_POLL_INTERVAL_SECONDS", 45),
         help="Polling interval in seconds (includes run time)",
     )
     parser.add_argument(
-        "--lookback-hours", type=int, default=8,
+        "--lookback-hours",
+        type=int,
+        default=getattr(config, "SCORER_LOOKBACK_HOURS", 8),
         help="Hours of history to pull each cycle",
     )
     parser.add_argument(
@@ -1386,6 +1390,10 @@ def main() -> None:
         help="Do not load canonical mapping from data/canonical_mapping.parquet; build from current window.",
     )
     args = parser.parse_args()
+    if args.lookback_hours <= 0:
+        parser.error("--lookback-hours must be positive")
+    if args.interval <= 0:
+        parser.error("--interval must be positive")
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),

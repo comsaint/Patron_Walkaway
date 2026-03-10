@@ -40,6 +40,12 @@ SCORER_STATE_RETENTION_HOURS = 24     # Keep scorer SQLite state for this many h
 VALIDATOR_ALERT_RETENTION_DAYS = 30   # Keep alerts visible to validator for last N days
 VALIDATION_RESULTS_RETENTION_DAYS = 180  # Keep validation_results history for last N days
 
+# ------------------ Scorer poll defaults (SSOT for scorer CLI) -----------------
+# Used by scorer.py --lookback-hours / --interval. Trainer can align Track Human/LLM
+# to SCORER_LOOKBACK_HOURS for train–serve parity.
+SCORER_LOOKBACK_HOURS = 8       # Hours of bet history to pull each cycle
+SCORER_POLL_INTERVAL_SECONDS = 45  # Polling interval in seconds (includes run time)
+
 # ------------------ Status Server -----------------------------
 TABLE_STATUS_REFRESH_SECONDS = 45  # How often to refresh table occupancy snapshot
 TABLE_STATUS_LOOKBACK_HOURS = 12   # Only consider sessions started within this many hours for status

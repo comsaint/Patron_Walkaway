@@ -77,6 +77,9 @@ todos:
   - id: api-server-revert-db-only
     content: "api_server 還原為 DB-only：與 api_server_old 行為一致（無 /score、/health、/model_info）；測試方案 B（整檔/部分 skip）；scorer 文件對齊。見「api_server 還原為 DB-only 計畫」"
     status: completed
+  - id: scorer-defaults-in-config
+    content: "Scorer 預設移至 config.py：SCORER_LOOKBACK_HOURS、SCORER_POLL_INTERVAL_SECONDS 為 --lookback-hours / --interval 的 SSOT；供 trainer 對齊 Track Human/LLM lookback 用"
+    status: completed
 isProject: false
 ---
 
@@ -126,8 +129,11 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 10 | **Canonical mapping 全歷史 + DuckDB + 寫出/載入 + 強制重建** | completed | 下方「Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入與生產增量更新」一節；步驟 1–9 已完成（Round 384 步驟 9 README 文件化）；CLI 已接線；五、生產增量更新為可選 Phase 2。 |
 | 11 | **Optuna 整份 study 的 early stop** | completed | 下方「Optuna 整份 study 的 early stop（計畫）」一節。 |
 | 12 | **api_server 還原為 DB-only** | completed | 下方「api_server 還原為 DB-only 計畫」一節；已實作並通過 tests/typecheck/lint。 |
+| 13 | **Scorer 預設移至 config** | completed | config.py：SCORER_LOOKBACK_HOURS、SCORER_POLL_INTERVAL_SECONDS；scorer 的 --lookback-hours / --interval 從 config 讀；供 trainer 對齊 Track Human/LLM lookback。 |
 
-**Plan 狀態摘要**：上表 1～12 項均為 **completed**。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。
+**Plan 狀態摘要**：上表 1～13 項均為 **completed**。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。
+
+**剩餘項目**：上表「接下來要做的事」**無未完成項**；以下為可選／後續，非阻斷。
 
 **建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。Backtester 輸出格式對齊（項目 7）可獨立排入。Optuna 整份 study 的 early stop（項目 11）為可選省時機制，預設關閉，實作後可依需要設定 `OPTUNA_EARLY_STOP_PATIENCE`。
 

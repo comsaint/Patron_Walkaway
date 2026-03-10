@@ -12935,3 +12935,431 @@ All checks passed!
 ### 備註
 - Optuna early stop 項目 11 已依 Review #1/#3 修正並通過上述三項驗證；PLAN.md 第 11 項標為 **completed**。
 
+---
+
+## Scorer 預設移至 config（PLAN scorer-defaults-in-config）
+
+### 目標
+實作 PLAN 項目 13：將 scorer 的 `--lookback-hours`、`--interval` 預設值移至 `config.py` 為單一來源（SSOT），供日後 trainer 對齊 Track Human/LLM lookback 使用。
+
+### 修改檔案
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/config.py` | 新增區塊「Scorer poll defaults」：`SCORER_LOOKBACK_HOURS = 8`、`SCORER_POLL_INTERVAL_SECONDS = 45`；註解說明為 scorer CLI 的 SSOT 及 trainer 對齊用途。 |
+| `trainer/scorer.py` | `--interval` 的 default 改為 `getattr(config, "SCORER_POLL_INTERVAL_SECONDS", 45)`；`--lookback-hours` 的 default 改為 `getattr(config, "SCORER_LOOKBACK_HOURS", 8)`。保持無 config 時 fallback 行為不變。 |
+
+### 手動驗證
+- 不帶參數執行 scorer：`python -m trainer.scorer --once`（需有 model 與資料來源），日誌應出現 `Window: ...` 且時間範圍為 8 小時。
+- 覆寫驗證：`python -m trainer.scorer --once --lookback-hours 4 --interval 60`，行為應為 4 小時視窗、60 秒 interval（--once 下 interval 僅影響 sleep 前計算）。
+- 確認 config 常數存在：`python -c "import trainer.config as c; print(c.SCORER_LOOKBACK_HOURS, c.SCORER_POLL_INTERVAL_SECONDS)"` 應輸出 `8 45`。
+
+### pytest 結果
+
+```
+python -m pytest tests/ -q
+864 passed, 41 skipped, 192 warnings in 32.86s
+```
+
+### 下一步建議
+1. PLAN 項目 13 標為 **completed**；可選：trainer 對齊 Track Human/LLM 至 `SCORER_LOOKBACK_HOURS`（train–serve parity）排入後續。
+
+---
+
+## Scorer 預設移至 config — Code Review（目前變更）
+
+**審查範圍**：`trainer/config.py` 新增 `SCORER_LOOKBACK_HOURS`、`SCORER_POLL_INTERVAL_SECONDS`；`trainer/scorer.py` 的 `--interval` / `--lookback-hours` default 改為自 config 讀取。  
+**參考**：PLAN.md、STATUS.md、DECISION_LOG.md；不重寫整套，僅列風險與建議。
+
+---
+
+### 1. 邊界條件：config 值為 0 或負數時語義錯誤
+
+**問題**：`config.py` 目前為常數字面（8、45），若日後改為 `os.getenv(..., "8")` 未轉 `int`，或有人 monkey-patch 為 0/負數：  
+- `SCORER_LOOKBACK_HOURS = 0` → `timedelta(hours=0)`，視窗為 0，等於不拉資料。  
+- `SCORER_LOOKBACK_HOURS < 0` → `start = now_hk - timedelta(hours=-1)` 會變成 start 在 now 之後，`fetch_recent_data(start, now_hk)` 時間區間反序或空，行為未定義。  
+- `SCORER_POLL_INTERVAL_SECONDS <= 0` → `sleep_for = max(0, args.interval - elapsed)` 恆為 0，scorer 會 busy loop。
+
+**具體修改建議**：  
+- 在 `config.py` 註解中註明「必須為正整數；scorer 未做執行期檢查，請勿設為 0 或負數」。若希望執行期防呆，可在 `scorer.main()` 在 `args = parser.parse_args()` 之後加：  
+  `if args.lookback_hours <= 0: parser.error("--lookback-hours must be positive")`；  
+  `if args.interval <= 0: parser.error("--interval must be positive")`。  
+- 若未來從 env 讀取，請在 config 內以 `int(os.getenv(..., default))` 並處理 `ValueError`，確保型別為 `int`。
+
+**希望新增的測試**：  
+- `tests/test_config.py`（或同類）：`test_scorer_poll_defaults_exist_and_positive` — 斷言 `hasattr(config, "SCORER_LOOKBACK_HOURS")`、`hasattr(config, "SCORER_POLL_INTERVAL_SECONDS")`，且兩者皆為 `int` 且 `> 0`。  
+- 可選：`test_scorer_cli_uses_config_defaults`（在 tests 內 patch `config.SCORER_LOOKBACK_HOURS = 4`、`SCORER_POLL_INTERVAL_SECONDS = 60`，解析 `--once` 不帶其他參數，斷言 `args.lookback_hours == 4`、`args.interval == 60`），確保 CLI default 來自 config。
+
+---
+
+### 2. 邊界條件：CLI 傳入 0 或負數未驗證
+
+**問題**：argparse `type=int` 允許 0、負數。使用者下 `--lookback-hours 0` 或 `--interval -1` 時，行為同上（空視窗或 busy loop），目前無驗證也無明確錯誤訊息。
+
+**具體修改建議**：  
+- 在 `main()` 中 `args = parser.parse_args()` 之後，若 `args.lookback_hours <= 0` 或 `args.interval <= 0`，呼叫 `parser.error("...")` 並退出，避免靜默錯誤。
+
+**希望新增的測試**：  
+- `test_scorer_cli_rejects_non_positive_lookback_hours`：以 `parser.parse_args(["--once", "--lookback-hours", "0"])`（或 subprocess）預期 `SystemExit` / error。  
+- `test_scorer_cli_rejects_non_positive_interval`：同上，`--interval 0` 或 `-1` 預期被拒絕。
+
+---
+
+### 3. 可維護性／回歸：config 常數未被 test_config 要求
+
+**問題**：若有人更名或刪除 `SCORER_LOOKBACK_HOURS` / `SCORER_POLL_INTERVAL_SECONDS`，scorer 會以 getattr fallback 靜默使用 8/45，test_config 不會失敗，回歸風險無測試保護。
+
+**具體修改建議**：  
+- 在 `tests/test_config.py` 的 `TestConfigRequiredConstants`（或新 test）中新增一則：斷言 `SCORER_LOOKBACK_HOURS`、`SCORER_POLL_INTERVAL_SECONDS` 存在且為正整數（可與上述 #1 的測試合併為 `test_scorer_poll_defaults_exist_and_positive`）。
+
+**希望新增的測試**：  
+- 同上 #1：`test_scorer_poll_defaults_exist_and_positive`，並納入 test_config 的 required constants 清單或同等級測試。
+
+---
+
+### 4. 效能／可用性：極大 lookback 無上限
+
+**問題**：`--lookback-hours 999999` 或 config 被設為極大值時，`fetch_recent_data(start, now_hk)` 會拉取極長時間的資料，可能 OOM 或長時間阻塞，屬資源/可用性風險（非正確性 bug）。
+
+**具體修改建議**：  
+- 不在本輪強制加硬性上限；建議在 config 註解或 doc 註明「實務上建議不超過 N 小時（例如 24 或 168）」。若需防呆，可在 scorer 內若 `lookback_hours > 24`（或 168）時 `logger.warning(...)` 提醒，或列為後續改進。
+
+**希望新增的測試**：  
+- 可選：`test_scorer_lookback_hours_above_reasonable_warns`（若實作 warning）；或僅在文件/註解中記錄建議上限，不強制加測。
+
+---
+
+### 5. 小結（無 P0 正確性 bug）
+
+- 目前變更為「常數集中至 config + getattr fallback」，邏輯正確；未引入 P0 正確性錯誤。  
+- 主要風險為：**邊界（0/負數）**、**config 常數未被測試要求**、以及**極大 lookback 的資源風險**。建議至少實作 #1 與 #3 的測試，並在 config 註解標註「必須為正整數」；#2（CLI 驗證）可一併做以提升可操作性。  
+- Review 結果已追加至 STATUS.md；後續可依優先度修復並將對應測試改為 required。
+
+---
+
+## Scorer 預設移至 config — Reviewer 風險點轉為最小可重現測試（tests-only）
+
+**目標**：將「Scorer 預設移至 config — Code Review」所列風險點轉成可執行測試或規則；**僅新增 tests，不修改 production code**。
+
+### 新增／修改的測試
+
+| 檔案 | 新增／修改 | 對應 Review 項 |
+|------|------------|----------------|
+| `tests/test_config.py` | 新增 `test_scorer_poll_defaults_exist_and_positive` | #1、#3：config 必須定義 `SCORER_LOOKBACK_HOURS`、`SCORER_POLL_INTERVAL_SECONDS` 且皆為 `int` 且 `> 0` |
+| `tests/test_review_risks_scorer_defaults_in_config.py` | 新建 | #1、#2、#3 |
+
+**test_review_risks_scorer_defaults_in_config.py 內容摘要**：
+
+- **TestScorerDefaultsFromConfig**
+  - `test_cli_defaults_from_config`：patch config 為 4 / 60，以與 scorer 相同之 default=`getattr(config, ...)` 建 parser，解析 `["--once"]`，斷言 `args.lookback_hours == 4`、`args.interval == 60`（確保 CLI default 來自 config）。
+- **TestScorerCliNonPositiveReproduceRisk**
+  - `test_cli_accepts_zero_lookback_hours_current_behavior`：解析 `["--once", "--lookback-hours", "0"]`，斷言 `args.lookback_hours == 0`（重現風險：目前接受 0）。
+  - `test_cli_accepts_negative_interval_current_behavior`：解析 `["--once", "--interval", "-1"]`，斷言 `args.interval == -1`（重現風險：目前接受負數）。
+- **TestScorerCliShouldRejectNonPositive**（`@unittest.expectedFailure`）
+  - `test_cli_should_reject_non_positive_lookback_hours`：解析 `--lookback-hours 0` 後斷言 `args.lookback_hours > 0`（預期行為尚未實作，故 xfail）。
+  - `test_cli_should_reject_non_positive_interval`：解析 `--interval 0` 後斷言 `args.interval > 0`（同上）。
+
+### 執行方式
+
+**只跑本輪新增／修改的測試**：
+
+```bash
+# 僅 test_config 新增項 + 新檔
+python -m pytest tests/test_config.py tests/test_review_risks_scorer_defaults_in_config.py -v
+```
+
+**預期結果**：14 passed, 2 xfailed（2 個 expectedFailure 為「應拒絕非正數」之預期行為，production 尚未實作）。
+
+**全套回歸**：
+
+```bash
+python -m pytest tests/ -q
+```
+
+**預期**：868 passed, 41 skipped, 2 xfailed（與本輪前相比多 4 passed、2 xfailed）。
+
+### 備註
+
+- 未新增 lint / typecheck 規則；風險皆以 unittest 覆蓋。
+- 待 production 於 `scorer.main()` 內加入 `parser.error()` 拒絕 `lookback_hours <= 0` 與 `interval <= 0` 後，可移除上述兩則 `@unittest.expectedFailure`，並將測試改為預期 `SystemExit`（或改為直接呼叫該驗證邏輯再斷言）。
+
+---
+
+## Scorer 預設移至 config — 實作修復（Review #2 驗證 + tests/typecheck/lint 全過）
+
+**目標**：依 Review 建議加入 production 驗證，使「應拒絕非正數」的測試改為通過；不改 tests 除 decorator 過時與必要行為調整；達成 tests/typecheck/lint 通過並更新 PLAN。
+
+### 修改檔案（production）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/scorer.py` | 在 `args = parser.parse_args()` 之後新增：`if args.lookback_hours <= 0: parser.error("--lookback-hours must be positive")`；`if args.interval <= 0: parser.error("--interval must be positive")`。 |
+
+### 修改檔案（tests — decorator 過時與行為對齊）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `tests/test_review_risks_scorer_defaults_in_config.py` | 移除兩則 `@unittest.expectedFailure`。改為呼叫 `trainer.scorer.main()`，`sys.argv` patch 為 `["scorer", "--once", "--lookback-hours", "0"]` 或 `["scorer", "--once", "--interval", "0"]`，以 `assertRaises(SystemExit)` 斷言 main 退出。新增 `import sys`。 |
+
+### 驗證結果
+
+**1. pytest**
+
+```
+python -m pytest tests/ -q
+870 passed, 41 skipped, 192 warnings in 40.20s
+```
+
+**2. typecheck**
+
+```
+python -m mypy trainer/ --ignore-missing-imports
+Success: no issues found in 25 source files
+```
+
+**3. lint（本輪修改檔）**
+
+```
+python -m ruff check trainer/scorer.py tests/test_config.py tests/test_review_risks_scorer_defaults_in_config.py
+All checks passed!
+```
+
+**備註**：`ruff check trainer/ tests/` 仍會報約 30 個 E402（其他既有測試檔之 import 不在檔案頂端）；本輪未改動該些檔案，且 scorer/config 與本輪測試檔均通過。
+
+### 下一步
+
+- PLAN 項目 13（Scorer 預設移至 config）已含 Review 跟進（CLI 驗證）；見 PLAN.md 狀態更新。  
+- 可選後續：trainer 對齊 Track Human/LLM 至 `SCORER_LOOKBACK_HOURS`（train–serve parity）。
+
+---
+
+## Trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS
+
+**目標**：Trainer 的 Track Human（loss_streak、run_boundary）與 scorer 使用相同 lookback 視窗（`SCORER_LOOKBACK_HOURS`），達成 train–serve parity。Track LLM 維持既有 5/15/30/60 分鐘視窗，不套用 lookback_hours。
+
+### 改了哪些檔
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/features.py` | **compute_loss_streak**：新增可選參數 `lookback_hours: Optional[float] = None`。有值時對每個 row 只使用同 `canonical_id` 且 `payout_complete_dtm` 在 `(t_i - lookback_hours, t_i]` 的 bets，在 slice 上跑 streak 邏輯，回傳 reindex 後的 Series；`None` 時維持原本向量化路徑。**compute_run_boundary**：同上新增 `lookback_hours`；有值時對每個 row 只使用同 canonical_id 且時間在 `(t - lookback_hours, t]` 的 rows，在 slice 上算 run_id、minutes_since_run_start、bets_in_run_so_far、wager_sum_in_run_so_far（wager 依 run 累加），取 slice 最後一行寫回；`None` 時走原本向量化路徑。 |
+| `trainer/trainer.py` | **add_track_b_features**：新增參數 `lookback_hours: Optional[float] = None`，傳給 `compute_loss_streak` 與 `compute_run_boundary`。**process_chunk**：在呼叫 add_track_b_features 前設定 `_lookback_hours = getattr(_cfg, "SCORER_LOOKBACK_HOURS", None)`，以 `lookback_hours=_lookback_hours` 呼叫。**_chunk_cache_key**：在 `cfg_str` 中加入 `"SCORER_LOOKBACK_HOURS": getattr(_cfg, "SCORER_LOOKBACK_HOURS", None)`，使變更常數時 chunk cache 失效。 |
+
+### 如何手動驗證
+
+- 跑一小段訓練並確認有讀取 config 的 `SCORER_LOOKBACK_HOURS`（例如 `--days 1`），檢查 log 或中斷點確認 `add_track_b_features(..., lookback_hours=8)`（若 config 為 8）。
+- 或執行既有 feature 測試：`python -m pytest tests/test_features.py -v`，確認 `compute_loss_streak` / `compute_run_boundary` 在 `lookback_hours` 有值與 `None` 的案例皆通過。
+- 確認 config 已定義 `SCORER_LOOKBACK_HOURS`（如 8）：`tests/test_config.py` 與 `tests/test_review_risks_scorer_defaults_in_config.py` 已涵蓋常數存在且為正整數。
+
+### 下一步建議
+
+- 若 scorer/backtester 未來要與 trainer 完全一致，可考慮在 scorer 特徵計算處傳入相同 `lookback_hours`（目前 scorer 不傳，預設 None，行為與改動前一致）。
+- 可選：為 `compute_loss_streak` / `compute_run_boundary` 的 lookback 路徑加一則整合測試（小 DataFrame + 明確時間窗），驗證左開右閉區間與只計同 canonical_id。
+
+### pytest -q 結果
+
+```
+python -m pytest tests/ -q
+........................................................................ [  7%]
+........................................................................ [ 15%]
+...（略）
+...............................................                          [100%]
+870 passed, 41 skipped, 192 warnings in 32.91s
+```
+
+---
+
+## Trainer 對齊 SCORER_LOOKBACK_HOURS — Code Review（關鍵決策）
+
+**審查範圍**：`trainer/features.py` 的 `compute_loss_streak` / `compute_run_boundary` 的 `lookback_hours` 路徑，以及 `trainer/trainer.py` 的 `add_track_b_features`、`process_chunk`、`_chunk_cache_key` 對 `SCORER_LOOKBACK_HOURS` 的使用。  
+**參考**：PLAN.md、STATUS.md、DECISION_LOG.md。不重寫整套，僅列風險與建議。
+
+---
+
+### 1. lookback_hours ≤ 0 時靜默走向量化路徑（train–serve 不一致風險）
+
+**問題**：`features.py` 中條件為 `if lookback_hours is not None and lookback_hours > 0`；若 `lookback_hours` 為 0 或負數，會走「全歷史」向量化路徑。若 config 被誤設為 `SCORER_LOOKBACK_HOURS = 0`（或未來從 env 讀取時出錯），trainer 會用全歷史計算 Track Human，與 scorer 的 8 小時視窗不一致，且無錯誤或警告。
+
+**具體修改建議**：
+- 在 `compute_loss_streak` / `compute_run_boundary` 開頭：若 `lookback_hours is not None` 且 `lookback_hours <= 0`，則 `raise ValueError("lookback_hours must be positive when set")`；或
+- 在 `process_chunk` 取得 `_lookback_hours` 後：若 `_lookback_hours is not None` 且 `_lookback_hours <= 0`，則 `logger.warning("SCORER_LOOKBACK_HOURS <= 0 ignored; using full history")` 並將 `_lookback_hours = None`，使行為明確且可追蹤。
+
+**希望新增的測試**：
+- `tests/test_features.py`：`test_compute_loss_streak_lookback_hours_zero_raises_or_warns`（若採 raise）或 `test_compute_loss_streak_lookback_hours_negative_raises`；同様 `test_compute_run_boundary_lookback_hours_zero_raises`。
+- 若採 trainer 層 warning：在 `tests/test_trainer.py`（或專用 test）中 patch `SCORER_LOOKBACK_HOURS = 0`，呼叫 `add_track_b_features`，斷言得到全歷史結果且 log 出現預期 warning（或斷言 raise）。
+
+---
+
+### 2. add_track_b_features 中 run_* 與 loss_streak 對「超出 cutoff 列」處理不一致
+
+**問題**：`compute_loss_streak` 回傳的 Series 經 `streak.reindex(df.index, fill_value=0)` 寫入，故 `payout_complete_dtm > window_end` 的列會得到 `loss_streak = 0`。`compute_run_boundary` 在內部計算完後會做 `df = df[df["payout_complete_dtm"] <= cutoff_ts]` 再回傳，因此回傳的 `run_df` 的 index 為 cutoff 後的子集。在 `add_track_b_features` 中 `df["run_id"] = run_df.get("run_id", ...)` 等為「依 index 對齊賦值」，超出 cutoff 的列不在 `run_df` 的 index 中，會得到 **NaN**（而非 0）。與 `loss_streak` 的 fill_value=0 不一致，下游若假設「無歷史則為 0」可能出錯或觸發 NaN 傳播。
+
+**具體修改建議**：
+- 在 `add_track_b_features` 中，對 `run_df` 的四個欄位（`run_id`、`minutes_since_run_start`、`bets_in_run_so_far`、`wager_sum_in_run_so_far`）改為先 `reindex(df.index, fill_value=0)`（或對應型別的 0/0.0）再賦值給 `df`，使與 `loss_streak` 一致：超出 cutoff 的列皆為 0。
+
+**希望新增的測試**：
+- `tests/test_features.py` 或 `tests/test_trainer.py`：建立一組 `bets` 其中部分列 `payout_complete_dtm > window_end`，呼叫 `add_track_b_features(bets, ..., window_end, lookback_hours=8)`，斷言這些列上 `loss_streak` 與 `run_id` / `minutes_since_run_start` / `bets_in_run_so_far` / `wager_sum_in_run_so_far` 均為 0（或 0.0），且無 NaN。
+
+---
+
+### 3. 效能：lookback 路徑 per-row 切片，大 canonical_id 組為 O(K²)
+
+**問題**：在 `compute_loss_streak` / `compute_run_boundary` 的 lookback 路徑中，對每個 canonical_id 的每列做 `grp.loc[(times > lo) & (times <= t)]`，對該 group 而言為 O(列數) 的布林篩選；整組 K 列即 O(K²)。若單一 canonical_id 在 chunk 內有數萬筆，該組會明顯變慢。
+
+**具體修改建議**：
+- 短期：在 docstring 或 STATUS 註明「lookback 路徑在大組時較慢，若 chunk 內單一 canonical_id 極大可考慮預先依時間切子集或監控耗時」。
+- 中長期：可考慮對每個 canonical_id 的 `times` 做 `np.searchsorted` 或 `pd.Series.searchsorted` 取得每列對應的 slice 起迄 index，再對 slice 做 streak/run 計算，將每組複雜度降為 O(K log K) 或 O(K)。
+
+**希望新增的測試**：
+- 可選：`test_compute_loss_streak_lookback_large_group_smoke` — 單一 canonical_id、約 1000 列、lookback_hours=2，斷言結果形狀與數值合理且在 N 秒內完成（smoke test，不鎖定數值）。
+
+---
+
+### 4. 邊界：lookback_hours 極大或極小
+
+**問題**：`lookback_hours` 為 `float`，若誤設極大（如 1e6）則 `pd.Timedelta(hours=...)` 仍可成立，但實務上等於全歷史且可能加重 O(K²) 問題；若極小（如 1e-9）可能因浮點誤差導致時間窗為空或邊界不穩定。Config 目前為整數 8，scorer CLI 已驗證 > 0，但 trainer 從 config 讀取時未再驗證範圍。
+
+**具體修改建議**：
+- 在 `features.py` 的 lookback 路徑中，若 `lookback_hours > 24`（或 168）可 `logger.warning("lookback_hours very large (%s), consider SCORER_LOOKBACK_HOURS <= 24", lookback_hours)`（可選，與 STATUS 先前 scorer 建議一致）。
+- 在 config 註解中註明「建議 1–24（或 168）小時，過大可能影響效能與語義」。
+
+**希望新增的測試**：
+- 可選：`test_compute_loss_streak_lookback_hours_large_uses_window` — 例如 lookback_hours=1e3，小 DataFrame，斷言不會崩潰且結果為有限值（不鎖定具體數值）。
+
+---
+
+### 5. payout_complete_dtm 含 NaT 時 lookback 路徑靜默排除
+
+**問題**：lookback 路徑使用 `(times > lo) & (times <= t)` 篩選；若某列 `payout_complete_dtm` 為 NaT，與 `lo`/`t` 的比較結果為 False，該列會被靜默排除在 slice 外。向量化路徑則會保留該列並參與排序，可能產生 NaN 傳播或 reset 邊界不同。若上游 DQ 已保證無 NaT，則影響低；否則語義與向量化路徑不一致。
+
+**具體修改建議**：
+- 在 `compute_loss_streak` / `compute_run_boundary` 的 docstring 中註明「當使用 lookback_hours 時，僅考慮 `payout_complete_dtm` 非 NaT 的列；含 NaT 的列在該 row 的 lookback 窗內不參與計算」。
+- 可選：在 lookback 路徑開頭若 `bets_df["payout_complete_dtm"].isna().any()` 則 `logger.warning("NaT in payout_complete_dtm; those rows are excluded from lookback window")`。
+
+**希望新增的測試**：
+- 可選：小 DataFrame 中一列設 NaT，`lookback_hours=1`，斷言不崩潰且 NaT 列得到的 streak/run 值為 0 或與「該列被排除在窗外」一致（依產品語義決定預期值）。
+
+---
+
+### 6. 測試覆蓋：lookback 路徑目前無專用單元／整合測試
+
+**問題**：`tests/test_features.py` 中所有 `compute_loss_streak` / `compute_run_boundary` 呼叫皆未傳 `lookback_hours`，因此 lookback 路徑完全依賴回歸測試與手動驗證，回歸或重構時容易遺漏。
+
+**具體修改建議**：
+- 新增至少一則「lookback 路徑」單元測試：固定小 DataFrame（例如 2 個 canonical_id、每組 3–5 列、時間跨度約 2 小時），`lookback_hours=1`，斷言 `compute_loss_streak(..., lookback_hours=1)` 與 `compute_run_boundary(..., lookback_hours=1)` 的結果與「左開右閉 (t-1h, t]、只計同 canonical_id」語義一致（可手算預期值寫死）。
+- 可選：一則 `lookback_hours=1` 與 `lookback_hours=None` 的結果差異測試（例如某列在 1h 窗外有 LOSE，None 時 streak 含該筆、1h 時不含）。
+
+**希望新增的測試**：
+- `test_compute_loss_streak_with_lookback_hours_left_open_right_closed`：小資料、lookback_hours=1，斷言邊界 (t-1, t] 與 canonical_id 隔離。
+- `test_compute_run_boundary_with_lookback_hours_same_semantics`：同上，斷言 run_id / minutes_since_run_start / bets_in_run_so_far / wager_sum 在窗內一致。
+- `test_compute_loss_streak_lookback_vs_none_differ_at_boundary`：一筆在 (t-2h, t-1h] 的 LOSE，斷言 lookback_hours=1 時該列 streak 不含該筆、lookback_hours=None 時含。
+
+---
+
+### 7. 小結（無 P0 安全性問題；建議優先處理 #1、#2、#6）
+
+- **安全性**：`lookback_hours` 來自 config / 程式內參數，無使用者輸入注入風險。
+- **最可能影響正確性**：#1（0/負數靜默全歷史）、#2（run_* NaN 與 loss_streak 的 0 不一致）。
+- **效能**：#3 在大組時可能變慢，可先文件化再視需要優化。
+- **邊界與可維護性**：#4、#5 可選註解或 warning；#6 強烈建議補測試以鎖定 lookback 語義並防回歸。
+
+Review 結果已追加至 STATUS.md；後續可依優先度實作「具體修改建議」並補上「希望新增的測試」。
+
+---
+
+## Trainer 對齊 SCORER_LOOKBACK_HOURS — Reviewer 風險點轉為最小可重現測試（tests-only）
+
+**目標**：將「Trainer 對齊 SCORER_LOOKBACK_HOURS — Code Review」所列風險點轉成可執行測試；**僅新增 tests，不修改 production code**。
+
+### 新增的測試
+
+| 檔案 | 測試類別／方法 | 對應 Review 項 |
+|------|----------------|----------------|
+| `tests/test_review_risks_lookback_hours_trainer_align.py` | **TestLookbackHoursZeroOrNegativeReproduceRisk** | #1 |
+| | `test_loss_streak_lookback_hours_zero_same_as_none_current_behavior` | 重現：lookback_hours=0 與 None 結果相同（全歷史） |
+| | `test_run_boundary_lookback_hours_zero_same_as_none_current_behavior` | 同上 run_boundary |
+| | `test_loss_streak_should_reject_lookback_hours_zero` | @expectedFailure：預期應 reject 0 |
+| | `test_run_boundary_should_reject_lookback_hours_zero` | @expectedFailure：同上 |
+| | **TestAddTrackBRunBeyondCutoff** | #2 |
+| | `test_beyond_cutoff_rows_get_nan_for_run_cols_current_behavior` | 重現：超出 cutoff 列 run_* 為 NaN |
+| | `test_beyond_cutoff_rows_should_get_zero_for_run_cols` | @expectedFailure：預期應為 0 |
+| | **TestLookbackLargeGroupSmoke** | #3 可選 |
+| | `test_compute_loss_streak_lookback_large_group_smoke` | 500 列、lookback 2h 不崩潰、形狀正確 |
+| | **TestLookbackHoursLarge** | #4 可選 |
+| | `test_compute_loss_streak_lookback_hours_large_no_crash` | lookback_hours=1000 不崩潰 |
+| | **TestLookbackWithNaT** | #5 可選 |
+| | `test_lookback_with_nat_does_not_crash` | 一列 NaT、lookback 1h 不崩潰 |
+| | **TestLookbackPathSemantics** | #6 |
+| | `test_compute_loss_streak_with_lookback_left_open_right_closed` | 左開右閉 (t-1h,t] 與 canonical_id 隔離 |
+| | `test_compute_run_boundary_with_lookback_same_semantics` | run_id / minutes_since_run_start / bets_in_run 語義 |
+| | `test_compute_loss_streak_lookback_vs_none_differ_at_boundary` | lookback=1h 與 None 在邊界列 streak 差異 |
+
+### 執行方式
+
+**只跑本輪新增的測試**：
+
+```bash
+python -m pytest tests/test_review_risks_lookback_hours_trainer_align.py -v
+```
+
+**預期結果**：9 passed, 3 xfailed（3 個為 @expectedFailure：lookback_hours=0 應 reject、超出 cutoff 列 run_* 應為 0）。
+
+**全套回歸**：
+
+```bash
+python -m pytest tests/ -q
+```
+
+**預期**：879 passed, 41 skipped, 3 xfailed（與本輪前相比多 9 passed、3 xfailed）。
+
+### 備註
+
+- 未新增 lint / typecheck 規則；風險皆以 unittest 覆蓋。
+- 待 production 實作 Review #1（reject lookback_hours ≤ 0）與 #2（run_* 超出 cutoff 時 reindex fill_value=0）後，可移除對應的 @expectedFailure，並將測試改為斷言新行為。
+
+---
+
+## Trainer 對齊 SCORER_LOOKBACK_HOURS — 實作修復（Review #1/#2）+ tests/typecheck/lint 全過
+
+**目標**：依 Review 建議實作 #1（reject lookback_hours ≤ 0）與 #2（run_* 超出 cutoff 時 reindex fill_value=0）；僅在測試錯誤或 decorator 過時時改 tests；達成 tests/typecheck/lint 全過並更新 STATUS/PLAN。
+
+### 修改檔案（production）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/features.py` | **compute_loss_streak**：在 missing-columns 檢查後新增 `if lookback_hours is not None and lookback_hours <= 0: raise ValueError("lookback_hours must be positive when set")`。**compute_run_boundary**：同上。 |
+| `trainer/trainer.py` | **add_track_b_features**：run_boundary 回傳後，對 `run_id` / `minutes_since_run_start` / `bets_in_run_so_far` / `wager_sum_in_run_so_far` 改為 `run_df[col].reindex(df.index, fill_value=0)`（或 0.0）再賦值，使超出 cutoff 的列為 0 而非 NaN（與 loss_streak 一致）。 |
+
+### 修改檔案（tests — decorator 過時與行為對齊）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `tests/test_review_risks_lookback_hours_trainer_align.py` | #1：`test_loss_streak_lookback_hours_zero_same_as_none_current_behavior` → `test_loss_streak_lookback_hours_zero_raises`（assertRaises ValueError）；`test_run_boundary_...` → `test_run_boundary_lookback_hours_zero_raises`；移除兩則 @expectedFailure（行為已實作）。#2：`test_beyond_cutoff_rows_get_nan_for_run_cols_current_behavior` 與 @expectedFailure 合併為單一 `test_beyond_cutoff_rows_get_zero_for_run_cols`（斷言超出 cutoff 列 run_* 與 loss_streak 均為 0）。E402：import 行加 `# noqa: E402`。 |
+
+### 驗證結果
+
+**1. pytest**
+
+```
+python -m pytest tests/ -q
+879 passed, 41 skipped, 192 warnings in 52.32s
+```
+
+**2. typecheck**
+
+```
+python -m mypy trainer/ --ignore-missing-imports
+Success: no issues found in 25 source files
+```
+
+**3. lint**
+
+```
+python -m ruff check trainer/features.py trainer/trainer.py tests/test_review_risks_lookback_hours_trainer_align.py
+All checks passed!
+```
+
+### 備註
+
+- Review #3–#5（效能／極大 lookback／NaT）未改 production，僅保留既有測試與文件建議。
+- PLAN 項目 13（Scorer 預設移至 config）之可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已於前輪實作，本輪完成 Review #1/#2 修復並鎖定測試。
+
