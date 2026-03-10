@@ -89,15 +89,15 @@ GAMING_DAY_START_HOUR = 6
 G1_PRECISION_MIN = 0.70          # [DEPRECATED] Minimum per-model precision
 G1_ALERT_VOLUME_MIN_PER_HOUR = 5 # [DEPRECATED] Minimum combined alert volume/hour
 G1_FBETA = 0.5                   # [DEPRECATED] F-beta weight (beta < 1 → precision-weighted)
-OPTUNA_N_TRIALS = 300            # Optuna TPE trials for threshold search (DEC-009/010)
+OPTUNA_N_TRIALS = 150            # Optuna TPE trials for threshold search (DEC-009/010)
 # Optional Optuna time budget (seconds) for study.optimize.
 # Disable timeout by setting to None or a non-positive value (e.g. -1).
-OPTUNA_TIMEOUT_SECONDS: Optional[int] = -1  # -1 = no timeout, 10 * 60 = 10 minutes
+OPTUNA_TIMEOUT_SECONDS: Optional[int] = 4 * 60 * 60  # -1 = no timeout, 10 * 60 = 10 minutes
 # Optional study-level early stop: stop when best validation AP has not improved for
 # this many consecutive trials. None = disabled (run full n_trials; default for reproducibility).
 # Positive int (e.g. 40–60) = stop early to save time; recommend 40–60 to avoid stopping
 # too soon when TPE has a dry spell (PLAN "Optuna 整份 study 的 early stop").
-OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = None
+OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = 40
 # Threshold selection objective (DEC-026): Optimize Precision at recall >= THRESHOLD_MIN_RECALL
 # (trainer: argmax(pr_prec) over valid_mask; backtester: Optuna maximises precision).
 # THRESHOLD_FBETA is still used for val_fbeta_05 / reporting only, not for choosing threshold.
