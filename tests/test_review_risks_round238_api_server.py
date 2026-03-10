@@ -8,6 +8,10 @@ Reference: PLAN § api_server 對齊 model_api_protocol 步驟 5, STATUS Round 2
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")
+
 import sys
 import unittest
 from pathlib import Path

@@ -61,6 +61,7 @@ import joblib
 import lightgbm as lgb
 import numpy as np
 import optuna
+from optuna.trial import FrozenTrial
 import pandas as pd
 from sklearn.metrics import average_precision_score, precision_recall_curve
 from zoneinfo import ZoneInfo
@@ -86,6 +87,7 @@ try:
     SESSION_AVAIL_DELAY_MIN = _cfg.SESSION_AVAIL_DELAY_MIN
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
     OPTUNA_TIMEOUT_SECONDS: Optional[int] = getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", 10 * 60)
+    OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = getattr(_cfg, "OPTUNA_EARLY_STOP_PATIENCE", None)
     # G1_PRECISION_MIN / G1_ALERT_VOLUME_MIN_PER_HOUR / G1_FBETA intentionally
     # not imported — deprecated per DEC-009/010; rollback path only.
     PLACEHOLDER_PLAYER_ID = _cfg.PLACEHOLDER_PLAYER_ID
@@ -137,6 +139,7 @@ except ModuleNotFoundError:
     SESSION_AVAIL_DELAY_MIN = _cfg.SESSION_AVAIL_DELAY_MIN
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
     OPTUNA_TIMEOUT_SECONDS: Optional[int] = getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", 10 * 60)  # type: ignore[no-redef]
+    OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = getattr(_cfg, "OPTUNA_EARLY_STOP_PATIENCE", None)  # type: ignore[no-redef]
     # G1_PRECISION_MIN / G1_ALERT_VOLUME_MIN_PER_HOUR / G1_FBETA intentionally
     # not imported — deprecated per DEC-009/010; rollback path only.
     PLACEHOLDER_PLAYER_ID = _cfg.PLACEHOLDER_PLAYER_ID
@@ -2532,29 +2535,77 @@ def run_optuna_search(
 
     _start = time.perf_counter()
 
-    def _progress_callback(study: optuna.Study, trial: optuna.Trial) -> None:
+    def _progress_callback(study: optuna.Study, trial: FrozenTrial) -> None:
         n = len(study.trials)
         if n == 1 or n % 20 == 0 or n == n_trials:
             elapsed = time.perf_counter() - _start
+            try:
+                best_ap = study.best_value
+            except ValueError:
+                # No trials completed yet (e.g. all failed so far); Optuna raises.
+                best_ap = None
+            ap_str = "%.4f" % (best_ap if best_ap is not None else float("nan"))
             logger.info(
-                "[Step 9] Optuna (%s) trial %d/%d  best_AP=%.4f  elapsed %.0fs (%.1f min)",
+                "[Step 9] Optuna (%s) trial %d/%d  best_AP=%s  elapsed %.0fs (%.1f min)",
                 label or "rated",
                 n,
                 n_trials,
-                study.best_value,
+                ap_str,
                 elapsed,
                 elapsed / 60.0,
             )
+
+    # Study-level early stop: stop when best AP has not improved for N consecutive trials
+    # (PLAN "Optuna 整份 study 的 early stop"). Only active when OPTUNA_EARLY_STOP_PATIENCE is a positive int.
+    _early_stop_state: dict = {"best": None, "no_improve_count": 0}
+
+    def _early_stop_callback(study: optuna.Study, trial: FrozenTrial) -> None:
+        try:
+            current_best = study.best_value
+        except ValueError:
+            # No trials completed yet; skip state update (Review #2).
+            return
+        if current_best is None:
+            return
+        prev = _early_stop_state["best"]
+        if prev is None or current_best > prev:
+            _early_stop_state["best"] = current_best
+            _early_stop_state["no_improve_count"] = 0
+        else:
+            _early_stop_state["no_improve_count"] += 1
+        patience = OPTUNA_EARLY_STOP_PATIENCE if isinstance(OPTUNA_EARLY_STOP_PATIENCE, int) else 0
+        if patience > 0 and _early_stop_state["no_improve_count"] >= patience:
+            study.stop()
+            n = len(study.trials)
+            logger.info(
+                "[Step 9] Optuna early stop: no improvement for %d trials (stopped at trial %d/%d)",
+                patience,
+                n,
+                n_trials,
+            )
+
+    callbacks: List[Callable[[optuna.Study, FrozenTrial], None]] = [_progress_callback]
+    if isinstance(OPTUNA_EARLY_STOP_PATIENCE, int) and OPTUNA_EARLY_STOP_PATIENCE > 0:
+        callbacks.append(_early_stop_callback)
 
     study.optimize(
         objective,
         n_trials=n_trials,
         timeout=_timeout,
         show_progress_bar=False,
-        callbacks=[_progress_callback],
+        callbacks=callbacks,
     )
     best = study.best_params
-    logger.info("Optuna (%s) best AP=%.4f, params=%s", label or "model", study.best_value, best)
+    try:
+        final_best_ap = study.best_value
+    except ValueError:
+        final_best_ap = None
+    logger.info(
+        "Optuna (%s) best AP=%s, params=%s",
+        label or "model",
+        "%.4f" % final_best_ap if final_best_ap is not None else "N/A",
+        best,
+    )
     return best
 
 

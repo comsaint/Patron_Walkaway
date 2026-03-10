@@ -17,6 +17,10 @@ Key changes from pre-Phase-1 version
 * SHAP reason codes -> reason_code_map.json lookup, emitted with every alert.
 * New alert DB columns: canonical_id, is_rated_obs, reason_codes,
   model_version, margin, scored_at.
+
+Architecture: api_server reads only from shared SQLite (state.db) and does not
+expose a model API; this scorer is the only component that loads the model
+and writes alerts.
 """
 from __future__ import annotations
 
@@ -121,6 +125,8 @@ _NEW_ALERT_COLS: List[Tuple[str, str]] = [
 # ── Artifact loading ──────────────────────────────────────────────────────────
 def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
     """Load model artifacts, feature list, reason code map, model version.
+
+    Model is loaded locally only; api_server does not serve /score.
 
     Priority (v10): model.pkl → rated_model.pkl → walkaway_model.pkl.
 

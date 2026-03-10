@@ -87,6 +87,11 @@ OPTUNA_N_TRIALS = 300            # Optuna TPE trials for threshold search (DEC-0
 # Optional Optuna time budget (seconds) for study.optimize.
 # Disable timeout by setting to None or a non-positive value (e.g. -1).
 OPTUNA_TIMEOUT_SECONDS: Optional[int] = -1  # -1 = no timeout, 10 * 60 = 10 minutes
+# Optional study-level early stop: stop when best validation AP has not improved for
+# this many consecutive trials. None = disabled (run full n_trials; default for reproducibility).
+# Positive int (e.g. 40–60) = stop early to save time; recommend 40–60 to avoid stopping
+# too soon when TPE has a dry spell (PLAN "Optuna 整份 study 的 early stop").
+OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = None
 # Threshold selection objective: F-beta with beta < 1 favours precision over recall.
 THRESHOLD_FBETA: float = 0.5
 

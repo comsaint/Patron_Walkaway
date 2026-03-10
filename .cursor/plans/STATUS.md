@@ -12476,3 +12476,462 @@ pytest tests/test_review_risks_round256_canonical_artifact.py tests/test_review_
 - 新增測試檔（例如 `tests/test_canonical_duckdb_pandas_parity.py`）：同一份小型 session DataFrame 寫成暫存 parquet → DuckDB 路徑產出 `canonical_map`（及 dummy）→ 同一 DataFrame 呼叫 `build_canonical_mapping_from_df` 產出 map → 斷言兩者一致。
 - 執行：`pytest tests/test_canonical_duckdb_pandas_parity.py -v`（測試檔新增後）。
 
+---
+
+## Round — api_server 還原為 DB-only（PLAN 實作）
+
+### 目標
+依 PLAN「api_server 還原為 DB-only」完成：api_server 僅讀 shared SQLite、不提供 model API；scorer 為唯一載入模型並寫入 alerts 的元件。
+
+### 改了哪些檔
+
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/api_server.py` | 還原為與 api_server_old 一致：移除 MODEL_DIR、Model artifact cache、/health、/model_info、/score、_load_artifacts、_get_artifacts；frontend_module 改回僅 .js + send_from_directory；保留四支資料 API 與靜態路由。 |
+| `trainer/scorer.py` | 模組 docstring 與 load_dual_artifacts docstring 補上架構說明：api_server 僅讀 state.db、不暴露 model API；scorer 唯一載入模型並寫入 alerts。 |
+| `tests/test_api_server.py` | 改寫為只測靜態與四支資料 API；新增 TestModelApiRemoved（/health、/model_info、POST /score 預期 404 或 405）。 |
+| `tests/test_review_risks_round232_api_server.py` | 整檔 `pytestmark = pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")`。 |
+| `tests/round235_api_server_score.py` | 同上整檔 skip。 |
+| `tests/round238_api_server.py` | 同上整檔 skip。 |
+| `tests/round242_api_server.py` | 同上整檔 skip。 |
+| `tests/round360.py` | 同上整檔 skip。 |
+| `tests/test_review_risks_round38.py` | 9 個依賴 api_server model API 的 test（R48, R49, R50, R52, R54, R56, R57, R58, R61）加 @pytest.mark.skip(…)。 |
+| `tests/test_review_risks_round340.py` | TestR2320ApiScoreNumericValidation、TestR2323PathTraversalGuard 兩 class 加 skip。 |
+| `tests/test_review_risks_late_rounds.py` | 新增 `import pytest`；TestR1903ScorerApiArtifactPath.test_api_loader_should_reference_model_pkl 加 @pytest.mark.skip（api_server 已無 model.pkl）。 |
+
+### 手動驗證
+
+1. 啟動 api_server：`python -m trainer.api_server`（或依專案慣例）。
+2. 確認無 model API：`GET /health`、`GET /model_info`、`POST /score` 應回 404 或 405。
+3. 確認四支資料 API 與靜態：`GET /api/floor_status`、`GET /api/hc_history`、`GET /api/validation`、`GET /api/alerts` 以及前端靜態檔（如 `/js/…`）行為正常。
+
+### 下一步建議
+
+- 若需正式移除舊 model API 相關測試碼，可再整理被 skip 的檔案（刪除或改為僅文件說明）。
+- 持續以「api_server DB-only、scorer 唯一載模型」為準，新功能勿在 api_server 加回 /score 或 artifact 載入。
+
+### pytest -q 結果
+
+```
+cd "c:\Users\longp\Patron_Walkaway" && pytest -q 2>&1
+........................................................................ [  8%]
+........................................................................ [ 16%]
+........................................................................ [ 24%]
+.........................................................s.............. [ 32%]
+........................................................................ [ 40%]
+........................................................................ [ 48%]
+........................................................................ [ 56%]
+................................................ssssssssssss.......sssss [ 65%]
+s........s.............................................................. [ 73%]
+..ss...........ssssssss................................................. [ 81%]
+.............sss.ss.sss..s........................................s..... [ 89%]
+.s...................................................................... [ 97%]
+.....................                                                    [100%]
+============================== warnings summary ===============================
+(... werkzeug/ast deprecation, identity fillna FutureWarning ...)
+844 passed, 41 skipped, 192 warnings in 55.94s
+```
+
+---
+
+## Round — api_server 還原為 DB-only：Code Review（目前變更）
+
+**範圍**：依 PLAN/DECISION 還原後的 `trainer/api_server.py`（與 api_server_old 一致）、`trainer/scorer.py` 文件對齊、以及相關測試改動（test_api_server.py 改寫、多檔 skip）。以下僅列**最可能的 bug／邊界條件／安全性／效能問題**，每項附**具體修改建議**與**建議新增的測試**。不重寫整套邏輯。
+
+---
+
+### 1. 安全性：`frontend_module` 路徑遍歷
+
+**問題**：`target = FRONTEND_DIR / filename` 後僅檢查 `filename.endswith('.js') and target.exists()`。若 `filename` 為 `../../other/something.js`，`Path` 會解析到 `FRONTEND_DIR` 外的檔案；只要該路徑存在且為 `.js`，就會被 `send_from_directory(FRONTEND_DIR, filename)` 送出（Flask 會依 filename 解析），可能洩漏伺服器上其他 .js 或可被解析為 .js 的檔案。PLAN 雖註明「不保留 path traversal 防護」以對齊 api_server_old，仍屬已知風險。
+
+**具體修改建議**：在 `frontend_module` 內，解析真實路徑並限制在 `FRONTEND_DIR` 下再送出，例如：
+- `target = (FRONTEND_DIR / filename).resolve()`
+- 若 `not target.is_relative_to(FRONTEND_DIR.resolve())` 或 `not target.exists()` 或 `not filename.endswith('.js')` → `abort(404)`
+- 否則 `send_from_directory(FRONTEND_DIR, filename)`（或改為 `send_from_directory(FRONTEND_DIR, target.name)` 並確保 path 在 DIR 下，避免 symlink 等邊界）
+
+**建議新增測試**：
+- 請求 `GET /..%2f..%2ftrainer%2fconfig.py`（或等同 `../trainer/config.py`）預期 404。
+- 在測試中建立暫存目錄與 `FRONTEND_DIR` 外之 `.js` 檔，請求可解析到該檔的 path（例如 `../temp/out.js`），預期 404，不應回傳該檔內容。
+
+---
+
+### 2. 邊界條件：`get_validation` / `get_alerts` 缺欄位時 KeyError → 500
+
+**問題**：`get_validation` 假設 `validation_results` 必有 `alert_ts`, `player_id`, `bet_id`, `gap_start`, `result`, `validated_at`, `reason`, `bet_ts`；`get_alerts` 假設 `alerts` 必有 `ts`。若 DB schema 未遷移或為舊版（缺欄），`df[["alert_ts", ...]]` 或 `df["ts"]` 會 KeyError，整支 API 回 500。
+
+**具體修改建議**：
+- 在取欄位前檢查必要欄位是否存在（例如 `required = ["alert_ts", "player_id", ...]`；`if not all(c in df.columns for c in required): return jsonify({"results": [], "error": "schema mismatch"})`）。
+- `get_alerts` 同理：若 `"ts" not in df.columns` 則回傳 `{"alerts": [], "error": "schema mismatch"}` 或空列表，並 log，避免未處理例外。
+
+**建議新增測試**：
+- Mock `get_db_conn()` 回傳的 cursor/read_sql 產出缺欄的 DataFrame（例如只有 `bet_id`），呼叫 `GET /get_validation` 與 `GET /get_alerts`，斷言 200、`results`/`alerts` 為空或含 `error`，且非 500。
+
+---
+
+### 3. 邊界條件：`get_hc_history` 參數 `hours` 為負或零
+
+**問題**：`hours = float(hours_param)` 可接受負數或 0；負數會使 `cutoff` 在未來，`WHERE ts > ?` 語義變成「比未來還新」的資料，通常無資料；`hours=0` 則 `cutoff=now`，可能只傳回極少列。雖有 `limit_rows` 上限 10000，但語義不清且易造成前端或監控誤解。
+
+**具體修改建議**：在解析 `hours` 後，若 `hours <= 0` 則視為無效，不加入 `where_clause`（或強制 `hours = max(0.01, hours)`），並在 docstring 註明「僅接受正數」。
+
+**建議新增測試**：
+- `GET /get_hc_history?hours=-1` 與 `?hours=0`：斷言 200、不崩潰，且若實作改為忽略負/零則可斷言與未帶 `hours` 時行為一致或回傳空列表。
+
+---
+
+### 4. 效能：`get_validation` / `get_alerts` 全表載入
+
+**問題**：`SELECT * FROM validation_results` 與 `SELECT * FROM alerts` 無 LIMIT，表很大時會整表載入記憶體並做 pandas 過濾，延遲與記憶體皆高，可能影響其他請求或 OOM。
+
+**具體修改建議**：
+- 在 SQL 層加可配置上限，例如 `SELECT * FROM alerts ORDER BY ts DESC LIMIT ?` 搭配 `min(MAX_ALERTS_ROWS, 50000)`（或從 config 讀取），並在 docstring/README 說明預設上限。
+- 或提供 pagination 參數（如 `since_ts` + `limit`），由前端分批拉取。
+
+**建議新增測試**：
+- 使用 mock DB 回傳 100k 列，斷言回應時間在閾值內或回應列數不超過設定之 MAX 列數；或整合測試中建立 10k 列 alerts，斷言 `get_alerts` 回傳列數 ≤ 設定上限。
+
+---
+
+### 5. 可觀測性／一致性：`get_floor_status` 主路徑失敗時仍回 200
+
+**問題**：當 `status_snapshots` 查詢失敗（exception）時，僅 `print` 錯誤並 fallback 到 CSV/sample，回應仍 200 且含 `occupied` 或 sample 資料，呼叫端無法區分「來自 DB cache」或「DB 失敗改用 fallback」，不利監控與除錯。
+
+**具體修改建議**：
+- 在 JSON 中加選用欄位，例如 `"source": "cache"`（來自 status_snapshots）或 `"source": "fallback"`（來自 CSV/sample）；若希望明確標示錯誤，可加 `"db_error": "..."`（僅在 fallback 時），不影響既有前端對 `layout`/`occupied` 的解析。
+
+**建議新增測試**：
+- Mock DB 在 `get_floor_status` 內 raise，斷言 200、body 含 `occupied` 或 `layout`，且可選斷言含 `source` 或 `db_error`，以便後續監控邏輯依此撰寫。
+
+---
+
+### 6. 測試覆蓋：資料 API 的錯誤路徑與參數
+
+**問題**：目前 `test_api_server.py` 對四支資料 API 僅做「回 200 且結構正確」的基本測試，較少涵蓋：DB 連線失敗、空表、`ts`/`bet_id`/`bet_ids` 格式錯誤、以及上述邊界（缺欄、負數 hours）。
+
+**具體修改建議**：維持現有正向測試，另以 mock `get_db_conn` 或暫存 SQLite 加入：
+- 空表時 `get_validation`/`get_alerts` 回 `[]`；
+- 無效 `ts`（如 `ts=not-a-date`）時仍 200、結果為全表或依實作過濾；
+- `get_hc_history` 在無 `hc_history` 表或查詢錯誤時回 500 且 body 含 `error`（已有部分覆蓋，可補明確斷言）。
+
+**建議新增測試**：如上；可集中在一個 `TestDataApiEdgeCases` class，用 pytest fixture 提供暫存 DB 或 unittest.mock 補丁。
+
+---
+
+### 7. scorer 文件對齊
+
+**結論**：`scorer.py` 模組 docstring 與 `load_dual_artifacts` 註解已正確說明「api_server 僅讀 state.db、不提供 model API；scorer 為唯一載入模型並寫入 alerts 的元件」，與 PLAN Part 3 一致，無額外程式修改建議。若未來在 scorer 內新增與 api 互動的程式碼，建議再加一筆單元測試或註解，確保不依賴 api_server 的 /score。
+
+---
+
+### Review 總結
+
+| # | 類別       | 嚴重度（主觀） | 建議優先級 |
+|---|------------|----------------|------------|
+| 1 | 路徑遍歷   | 中（依部署環境） | 若對外或不可信請求則高 |
+| 2 | 缺欄 KeyError | 中           | 高（避免 500） |
+| 3 | hours ≤ 0  | 低           | 中 |
+| 4 | 全表載入   | 中～高（資料量大時） | 中 |
+| 5 | floor_status 可觀測性 | 低 | 低 |
+| 6 | 測試邊界   | —            | 隨 2、3、4、5 一併補 |
+
+以上為追加式建議，不要求本輪全部實作；可依優先級排入後續 Round 或併入「api_server 還原」的後續改進項。
+
+---
+
+## Round — Reviewer 風險點轉成最小可重現測試（tests-only）
+
+### 目標
+將「api_server 還原為 DB-only」Code Review 所列風險點轉成最小可重現測試（或 lint/typecheck 規則）。**僅新增 tests，未改 production code**。
+
+### 新增測試檔與對應風險
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/test_api_server_db_only_review_risks.py` | 對應 Review 風險 1～6 的最小可重現測試 |
+
+**風險對應表**
+
+| Review # | 風險類別 | 測試 class / 要點 |
+|----------|----------|--------------------|
+| 1 | 路徑遍歷 | `TestR1PathTraversal`：`..%2f..%2ftrainer%2fconfig.py` → 404；於 FRONTEND_DIR 外建立 `.js` 並以 `../review_risks_traversal.js` 請求 → 404，不洩漏內容 |
+| 2 | 缺欄 KeyError | `TestR2MissingColumnsValidation`：mock `validation_results` 缺欄 → 斷言 200 或 500（目前 production 為 500；修復後可改斷言 200）；`TestR2MissingColumnsAlerts`：mock `alerts` 無 `ts` → 同上 |
+| 3 | hours ≤ 0 | `TestR3HcHistoryHoursEdgeCase`：`?hours=-1`、`?hours=0` → 200 或 500，不崩潰；200 時 body 為 list |
+| 4 | 全表載入 | `TestR4LargeResultNoCrash`：mock 2000 列 alerts → 200 且回傳列數 2000（鎖定目前無 LIMIT 行為；若日後加 LIMIT 可改斷言 ≤ MAX） |
+| 5 | floor_status 可觀測性 | `TestR5FloorStatusFallbackWhenDbRaises`：mock `get_db_conn` raise → 200 且 body 含 `layout` 或 `occupied` |
+| 6 | 資料 API 邊界 | `TestR6DataApiEdgeCases`：空表 → `results`/`alerts` 空 list；`ts=not-a-date` → 200；`get_hc_history` DB 錯誤 → 500 且 body 含 `error` |
+
+### 執行方式
+
+```bash
+# 只跑本輪新增的 Review 風險測試
+pytest tests/test_api_server_db_only_review_risks.py -v
+
+# 或與 api_server 相關一併跑
+pytest tests/test_api_server.py tests/test_api_server_db_only_review_risks.py -v
+```
+
+### 測試結果（本輪）
+
+```
+pytest tests/test_api_server_db_only_review_risks.py -v
+14 passed in ~0.9s
+```
+
+**全套回歸**（含新檔）：
+
+```
+pytest -q
+858 passed, 41 skipped, 192 warnings in ~36s
+```
+
+### 備註
+
+- **Risk 2**：目前 production 在缺欄時會 500（KeyError）；測試接受 200 或 500。日後若在 api_server 加上 schema 檢查並回傳 200 + 空/error，請將該兩則測試改為斷言 `status_code == 200` 且 `results`/`alerts` 為空或含 `error`。
+- **Risk 7（scorer 文件）**：Review 結論為無需改程式，未新增測試；若未來 scorer 與 api 互動邏輯變更，可再補測試或註解。
+- 未新增 lint/typecheck 規則：本次風險多為 runtime 行為，以單元測試覆蓋為主。
+
+---
+
+## Round — 實作修正使 tests / typecheck / lint 全過（未改 tests）
+
+### 目標
+依指示：修改實作直到所有 tests/typecheck/lint 通過；不要改 tests（除非測試本身錯或 decorator 過時）。每輪結果追加至 STATUS；最後修訂 PLAN.md 並回報剩餘項目。
+
+### 修改檔案（production only）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/scorer_old.py` | 移除未使用 import：`typing.Dict`、`lightgbm as lgb`（F401）。`load_model_artifacts(model_path: Path = None)` 改為 `model_path: Optional[Path] = None` 並自 typing 匯入 Optional（mypy assignment）。 |
+| `trainer/trainer.py` | Optuna callback 型別：`_progress_callback(study, trial: optuna.Trial)` 改為 `trial: FrozenTrial`，並新增 `from optuna.trial import FrozenTrial`（mypy list-item 與 Study.optimize callbacks 簽名一致）。 |
+
+### 驗證結果
+
+**1. pytest**
+
+```
+pytest -q
+858 passed, 41 skipped, 192 warnings in ~46s
+```
+
+**2. typecheck**
+
+```
+python -m mypy trainer/ --ignore-missing-imports
+Success: no issues found in 25 source files
+```
+
+**3. lint**
+
+```
+ruff check .
+All checks passed!
+```
+
+（`ruff.toml` 排除 `tests/`，故僅檢查 trainer 等非 tests 路徑。）
+
+### 備註
+
+- 未改任何測試檔。
+- PLAN.md 已更新：api_server 還原為 DB-only 標為 **completed**；剩餘 pending 為「Optuna 整份 study 的 early stop」。
+
+---
+
+## Round — Optuna 整份 study 的 early stop（PLAN 項目 11）
+
+### 目標
+實作 PLAN「Optuna 整份 study 的 early stop」步驟 1–4：config 新增 `OPTUNA_EARLY_STOP_PATIENCE`、在 `run_optuna_search` 中加入 early-stop callback（連續 N 個 trial 無改進即 `study.stop()`）、提早停時打 log、僅在 patience 為正整數時啟用。
+
+### 改了哪些檔
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/config.py` | 新增 `OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = None`；註解說明 None=關閉、正整數=連續 N trial 無改進即停，建議 40～60。 |
+| `trainer/trainer.py` | Config 匯入：兩處 config 區塊皆新增 `OPTUNA_EARLY_STOP_PATIENCE`（getattr 預設 None）。`run_optuna_search`：新增 `_early_stop_state` 與 `_early_stop_callback`，追蹤 best value 與連續未改進次數，當次數 ≥ patience 時呼叫 `study.stop()` 並 log `[Step 9] Optuna early stop: no improvement for N trials (stopped at trial K/n_trials)`；callbacks 僅在 `OPTUNA_EARLY_STOP_PATIENCE` 為正整數時加入 early-stop。 |
+
+### 手動驗證建議
+- **預設關閉**：不設定或 `OPTUNA_EARLY_STOP_PATIENCE=None` 時，行為與改動前一致，跑滿 `n_trials`。
+- **提早停**：在 config 或環境變數設 `OPTUNA_EARLY_STOP_PATIENCE=50`，跑一次訓練（例如 `--fast-mode` 或小資料）；若約 trial 80 起無改進，應在約 trial 130 結束，並在 log 中出現 `[Step 9] Optuna early stop: no improvement for 50 trials (stopped at trial 130/300)`。
+- **可重現／審計**：預設保持 `None`；僅在 dev 或要省時間時設定 patience。
+
+### 下一步建議
+1. 將 PLAN.md 中項目 11「Optuna 整份 study 的 early stop」標為 **completed**。
+2. 可選：為 early stop 加一則單元測試（mock study 或小 n_trials + 固定 seed 驗證提早停與 log）。
+
+### pytest 結果（本輪執行）
+
+```
+pytest -q
+858 passed, 41 skipped, 192 warnings in 42.05s
+```
+
+---
+
+## Code Review — Optuna 整份 study 的 early stop 變更
+
+**審查範圍**：PLAN 項目 11 實作（`trainer/config.py` 新增 `OPTUNA_EARLY_STOP_PATIENCE`；`trainer/trainer.py` 內 `run_optuna_search` 之 early-stop callback、log、callbacks 串接）。  
+**對照**：PLAN.md「Optuna 整份 study 的 early stop（計畫）」、DECISION_LOG（DEC-003/006）。
+
+以下僅列出**最可能的 bug、邊界條件、安全性與效能**；每項附**具體修改建議**與**建議新增的測試**。不重寫整套實作。
+
+---
+
+### 1. Config 型別非 int 時可能 TypeError（邊界／健壯性）
+
+**問題**：目前 `config.py` 未從環境變數讀取 `OPTUNA_EARLY_STOP_PATIENCE`，但若日後改為 `os.getenv("OPTUNA_EARLY_STOP_PATIENCE", None)` 且未轉成 int，會得到 `str`。在 `trainer.py` 中 `OPTUNA_EARLY_STOP_PATIENCE > 0` 或 `no_improve_count >= patience` 會對 `str` 做比較，在 Python 3 會拋出 `TypeError`。
+
+**具體修改建議**：
+- 在 `run_optuna_search` 中，僅在「`OPTUNA_EARLY_STOP_PATIENCE` 為正整數」時啟用 early stop；其餘一律視為關閉。
+- 作法：將「是否加入 callback」改為  
+  `if isinstance(OPTUNA_EARLY_STOP_PATIENCE, int) and OPTUNA_EARLY_STOP_PATIENCE > 0:`  
+  並在 `_early_stop_callback` 內使用一區域變數  
+  `patience = OPTUNA_EARLY_STOP_PATIENCE if isinstance(OPTUNA_EARLY_STOP_PATIENCE, int) else 0`  
+  再判斷 `patience > 0 and _early_stop_state["no_improve_count"] >= patience`，避免在 callback 內對非 int 做 `>=`。
+
+**建議新增的測試**：
+- 以 monkeypatch 或 import 前替換，使 `trainer` 所見之 `OPTUNA_EARLY_STOP_PATIENCE` 為 `"50"`（str），呼叫 `run_optuna_search(..., n_trials=3)`，斷言不拋錯且實際執行 3 個 trial（行為等同關閉 early stop）。
+- 可選：`OPTUNA_EARLY_STOP_PATIENCE=0` 時，跑 3 trials 斷言不會提早停。
+
+---
+
+### 2. Trial 失敗時 `study.best_value` 為 None（已正確處理，建議補測試）
+
+**問題**：Optuna 在 trial 失敗（例外或未回傳有效值）時不更新 `study.best_value`，可能維持 `None`。目前實作在 `current_best is None` 時直接 `return`，不更新 state、不遞增計數，行為正確。
+
+**具體修改建議**：無需改邏輯；可加註解說明：`# Failed trials leave best_value unchanged/None; skip state update to avoid double-counting.`
+
+**建議新增的測試**：
+- 使用 mock 或自訂 objective：前 2 次 trial 故意 raise / 回傳 NaN，第 3 次回傳 0.5。設 `n_trials=5`、`patience=2`，斷言 study 未提早停（因前兩次失敗、best 從第 3 次才設定，之後才開始計「連續未改進」），或至少斷言 callback 在 `best_value is None` 時不拋錯、不呼叫 `study.stop()`。
+
+---
+
+### 3. 相鄰程式：_progress_callback 在 best_value 為 None 時可能 format 錯誤
+
+**問題**：與 early stop 無直接關係，但同一函式內。`_progress_callback` 在 `n == 1 or n % 20 == 0 or n == n_trials` 時以 `study.best_value` 用 `%.4f` 印 log。若第一個 trial 即失敗，`study.best_value` 仍為 `None`，`logger.info(..., study.best_value)` 會對 `None` 用 `%.4f`，可能觸發 `TypeError`。
+
+**具體修改建議**：
+- 在 _progress_callback 的 log 中，將 `study.best_value` 改為  
+  `(study.best_value if study.best_value is not None else float("nan"))`，或改用 `%s` 並 str(best_value)，避免 None。
+
+**建議新增的測試**：
+- 可選：mock 一個 study，僅有一個 failed trial，觸發 _progress_callback（例如 n=1），斷言不拋錯（或 log 內容含 "nan" / "None"）。
+
+---
+
+### 4. 邊界：patience 遠大於 n_trials
+
+**問題**：若 `OPTUNA_EARLY_STOP_PATIENCE=500`、`n_trials=300`，永遠不會達到「連續 500 次未改進」，study 會跑滿 300 次後正常結束。屬合理行為，無 bug。
+
+**具體修改建議**：無需修改；若希望對使用者提示，可在 log（例如「Optuna search (…) n_trials=…」那行）或 docstring 註明「若 patience > n_trials 則不會觸發 early stop」。非必要。
+
+**建議新增的測試**：
+- 可選：`patience=100`、`n_trials=5`，斷言跑滿 5 trials、無 early stop log。
+
+---
+
+### 5. 安全性與效能
+
+**安全性**：early stop 邏輯僅依賴 config 常數與 Optuna study 狀態，無使用者輸入或注入點，風險低。
+
+**效能**：每 trial 一次 callback，僅做 dict 讀寫與整數比較，開銷可忽略。
+
+**具體修改建議**：無。
+
+**建議新增的測試**：無額外安全/效能測試需求。
+
+---
+
+### 6. 小結與建議優先順序
+
+| # | 類型         | 嚴重度 | 建議 |
+|---|--------------|--------|------|
+| 1 | 型別防呆     | 中     | 建議做：`isinstance(..., int) and ... > 0`，避免日後 env 傳 str 崩潰。 |
+| 2 | 失敗 trial   | 低     | 邏輯正確；可補一則「失敗 trial + None best_value」測試。 |
+| 3 | 相鄰 log     | 低     | 建議做：_progress_callback 對 `best_value is None` 防呆。 |
+| 4 | patience>n_trials | 低 | 可選註解或測試。 |
+| 5 | 安全/效能    | -      | 無需變更。 |
+
+完成後可將本 Review 摘要保留於 STATUS.md，修復時在對應 Round 註明「依 Review #1/#3 修正」即可。
+
+---
+
+## Round — Reviewer 風險點轉成最小可重現測試（僅 tests，未改 production）
+
+### 目標
+將 STATUS.md「Code Review — Optuna 整份 study 的 early stop 變更」中列出的風險點轉成最小可重現測試（及一則 config 型別契約）；**僅新增 tests，未改 production code**。
+
+### 新增檔案與測試對應
+
+| 檔案 | 測試類別／方法 | 對應 Review | 說明 |
+|------|----------------|-------------|------|
+| `tests/test_review_risks_optuna_early_stop.py` | `TestOptunaEarlyStopReview1ConfigType` | #1 | **#1** `test_patience_str_does_not_raise_and_returns_dict`：OPTUNA_EARLY_STOP_PATIENCE 為 str `"50"` 時不應 TypeError，應回傳 dict（目前 xfail，待 production 型別防呆）。`test_patience_zero_does_not_add_early_stop_callback`：patience=0 時不加入 early-stop callback，`study.stop()` 未被呼叫。 |
+| 同上 | `TestOptunaEarlyStopReview2FailedTrials` | #2 | **#2** `test_objective_fails_twice_then_succeeds_completes_without_crash`：前 2 次 trial 失敗、之後成功時 run 應完成不拋錯（patch optimize 的 catch=(ValueError,)）；目前 xfail，因 _progress_callback 在尚無完成 trial 時讀 `study.best_value` 會觸發 Optuna 的 ValueError，與 #3 同根因。 |
+| 同上 | `TestOptunaEarlyStopReview3ProgressCallbackNoneBest` | #3 | **#3** `test_first_trial_fails_progress_callback_does_not_raise`：第一個 trial 失敗時 progress callback 觸發（n=1）、best 不可用，不應 TypeError（目前 xfail，待 production 防呆）。 |
+| 同上 | `TestOptunaEarlyStopReview4PatienceGtNTrials` | #4 | **#4** `test_patience_100_n_trials_5_stop_never_called`：patience=100、n_trials=5 時 `study.stop()` 不應被呼叫。 |
+| 同上 | `TestOptunaEarlyStopConfigTypeContract` | #1 型別契約 | **Config 型別** `test_config_early_stop_patience_is_int_or_none`：`config.OPTUNA_EARLY_STOP_PATIENCE` 應為 `int | None`，供日後 env 引入時防呆。 |
+
+### 執行方式
+
+**僅跑本輪新增的 Optuna early stop 審查測試：**
+```bash
+python -m pytest tests/test_review_risks_optuna_early_stop.py -v
+```
+
+**預期結果**：3 passed、3 xfailed（Review #1、#2、#3 為 xfail，待 production 依 Review 修正後移除 decorator）。
+
+**全套回歸（含新檔）：**
+```bash
+pytest -q
+```
+
+**預期**：861 passed, 41 skipped, 3 xfailed（3 個 xfailed 即上列三則）。
+
+### 備註
+- 未改任何 production code；lint/typecheck 未新增規則（config 型別以 runtime 測試 `test_config_early_stop_patience_is_int_or_none` 鎖定）。
+- 修復 Review #1（型別防呆）後：移除 `test_patience_str_does_not_raise_and_returns_dict` 的 `@unittest.expectedFailure`。
+- 修復 Review #3（_progress_callback 在 best 不可用時防呆）後：移除 `test_first_trial_fails_progress_callback_does_not_raise` 與 `test_objective_fails_twice_then_succeeds_completes_without_crash` 的 `@unittest.expectedFailure`。
+
+---
+
+## Round — 依 Code Review 修正實作，tests/typecheck/lint 全過
+
+### 目標
+依 STATUS.md「Code Review — Optuna 整份 study 的 early stop 變更」修正 production，使所有 tests / typecheck / lint 通過；不改 tests 除 decorator 過時與一則測試情境補齊。
+
+### 修改檔案（production）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/trainer.py` | **Review #1**：僅在 `isinstance(OPTUNA_EARLY_STOP_PATIENCE, int) and OPTUNA_EARLY_STOP_PATIENCE > 0` 時加入 early-stop callback；callback 內 `patience = OPTUNA_EARLY_STOP_PATIENCE if isinstance(..., int) else 0`，避免非 int（如日後 env 傳 str）造成 TypeError。**Review #3**：`_progress_callback` 以 try/except 取得 `study.best_value`，若 `ValueError`（尚無完成 trial）則 best_ap=None，log 改為 `best_AP=%s` 並以 `nan` 或數值輸出；`_early_stop_callback` 以 try/except 取得 `study.best_value`，若 `ValueError` 則 return；`study.optimize` 結束後最終 log 亦以 try/except 取得 `study.best_value`，不可用時輸出 "N/A"。 |
+
+### 修改檔案（tests，僅 decorator 過時與情境補齊）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `tests/test_review_risks_optuna_early_stop.py` | 移除三則 `@unittest.expectedFailure`（production 已修復，decorator 過時）。Review #3 測試補齊情境：加入 `optimize_with_catch(catch=(ValueError,))` patch，使首 trial 失敗後 callbacks 仍會被呼叫，以驗證 _progress_callback 在 best 不可用時不拋錯。 |
+
+### 驗證結果
+
+**1. pytest**
+
+```
+pytest -q
+864 passed, 41 skipped, 192 warnings in 62.85s
+```
+
+**2. typecheck**
+
+```
+python -m mypy trainer/ --ignore-missing-imports
+Success: no issues found in 25 source files
+```
+
+**3. lint**
+
+```
+ruff check trainer/
+All checks passed!
+```
+
+### 備註
+- Optuna early stop 項目 11 已依 Review #1/#3 修正並通過上述三項驗證；PLAN.md 第 11 項標為 **completed**。
+

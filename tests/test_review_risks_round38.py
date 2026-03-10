@@ -7,6 +7,8 @@ Round 40: production code fixes applied for all 8 risks; decorators removed.
 
 from __future__ import annotations
 
+import pytest
+
 import ast
 import pathlib
 import unittest
@@ -38,6 +40,7 @@ class TestReviewRisksRound38(unittest.TestCase):
         """R55: remove dead fetch_bets_for_players helper to avoid accidental reuse."""
         self.assertNotIn("def fetch_bets_for_players(", _VALIDATOR_SRC)
 
+    @pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")
     def test_r56_api_score_should_use_cached_explainers(self):
         """R56: /score should consume rated/nonrated explainer cache instead of rebuilding."""
         score_src = _get_func_src(_API_TREE, _API_SRC, "score")
@@ -52,6 +55,7 @@ class TestReviewRisksRound38(unittest.TestCase):
             msg="_compute_shap_reason_codes_batch still rebuilds TreeExplainer",
         )
 
+    @pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")
     def test_r57_api_get_artifacts_should_read_version_inside_lock(self):
         """R57: version read and cache reload should be in the same lock scope."""
         src = _get_func_src(_API_TREE, _API_SRC, "_get_artifacts")
@@ -65,6 +69,7 @@ class TestReviewRisksRound38(unittest.TestCase):
             msg="version_path.read_text occurs before lock acquisition",
         )
 
+    @pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")
     def test_r58_api_artifact_loading_should_avoid_double_io_for_pkl(self):
         """R58: _load_artifacts should reuse already-read bytes when loading pickles."""
         src = _get_func_src(_API_TREE, _API_SRC, "_load_artifacts")
@@ -92,6 +97,7 @@ class TestReviewRisksRound38(unittest.TestCase):
         src = _get_func_src(_VALIDATOR_TREE, _VALIDATOR_SRC, "fetch_bets_by_canonical_id")
         self.assertIn("payout_complete_dtm IS NOT NULL", src)
 
+    @pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")
     def test_r61_api_model_info_should_not_reload_model_file_each_request(self):
         """R61: model_info should consume cached metrics instead of joblib.load per request."""
         src = _get_func_src(_API_TREE, _API_SRC, "model_info")
@@ -109,6 +115,7 @@ class TestReviewRisksRound38(unittest.TestCase):
             msg="fetch_recent_data must normalize payout_complete_dtm to tz-aware HK time",
         )
 
+    @pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")
     def test_r48_api_artifact_loading_should_include_integrity_check_signal(self):
         """R48: artifact loading should include integrity verification guardrails."""
         src = _get_func_src(_API_TREE, _API_SRC, "_load_artifacts")
@@ -118,10 +125,12 @@ class TestReviewRisksRound38(unittest.TestCase):
             msg="artifact loading lacks visible integrity-check signal",
         )
 
+    @pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")
     def test_r49_api_should_cache_tree_explainer_objects(self):
         """R49: /score should not rebuild TreeExplainer on every request (rated model cache)."""
         self.assertIn("rated_explainer", _API_SRC)
 
+    @pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")
     def test_r50_api_and_scorer_shap_mode_should_be_consistent(self):
         """R50: API and scorer should use consistent SHAP perturbation behavior."""
         api_func_src = _get_func_src(_API_TREE, _API_SRC, "_compute_shap_reason_codes_batch")
@@ -135,12 +144,14 @@ class TestReviewRisksRound38(unittest.TestCase):
         src = _get_func_src(_SCORER_TREE, _SCORER_SRC, "score_once")
         self.assertNotIn("replace(tzinfo=None)", src)
 
+    @pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")
     def test_r52_api_get_artifacts_should_be_lock_protected(self):
         """R52: artifact cache reads/writes should be protected by a lock."""
         self.assertIn("threading.Lock()", _API_SRC)
         get_artifacts_src = _get_func_src(_API_TREE, _API_SRC, "_get_artifacts")
         self.assertIn("with _artifacts_lock", get_artifacts_src)
 
+    @pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")
     def test_r54_api_score_should_guard_empty_feature_list_before_predict(self):
         """R54: /score should reject empty feature_list artifact before predict_proba."""
         score_src = _get_func_src(_API_TREE, _API_SRC, "score")

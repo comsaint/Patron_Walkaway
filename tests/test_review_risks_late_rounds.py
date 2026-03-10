@@ -9,6 +9,8 @@ import sys
 import unittest
 from datetime import datetime
 
+import pytest
+
 import numpy as np
 import pandas as pd
 
@@ -477,6 +479,7 @@ class TestR1903ScorerApiArtifactPath(unittest.TestCase):
         src = _read_text("trainer/scorer.py")
         self.assertIn('"model.pkl"', src, "scorer loader should read model.pkl in v10.")
 
+    @pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")
     def test_api_loader_should_reference_model_pkl(self):
         src = _read_text("trainer/api_server.py")
         self.assertIn('"model.pkl"', src, "api loader should read model.pkl in v10.")

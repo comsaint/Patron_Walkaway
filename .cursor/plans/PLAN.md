@@ -73,7 +73,10 @@ todos:
     status: completed
   - id: optuna-study-early-stop
     content: "Optuna 整份 study 的 early stop：可選 callback + study.stop()，連續 N 個 trial 無改進即停；config OPTUNA_EARLY_STOP_PATIENCE（預設 None=關）；log 標註提早停。見「Optuna 整份 study 的 early stop（計畫）」"
-    status: pending
+    status: completed
+  - id: api-server-revert-db-only
+    content: "api_server 還原為 DB-only：與 api_server_old 行為一致（無 /score、/health、/model_info）；測試方案 B（整檔/部分 skip）；scorer 文件對齊。見「api_server 還原為 DB-only 計畫」"
+    status: completed
 isProject: false
 ---
 
@@ -121,9 +124,10 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 8 | **Backtester precision-at-recall 指標** | completed | 下方「Backtester precision-at-recall 指標」一節；Round 229/230/231 實作與 Review 修復。 |
 | 9 | **api_server 對齊 model_api_protocol** | completed | 下方「api_server 對齊 model_api_protocol 實作計畫」一節；步驟 1–6 已完成（Round 232/234/235/237/238/241；本輪確認 doc 與實作一致並補 Phase 1 alignment 註記）。 |
 | 10 | **Canonical mapping 全歷史 + DuckDB + 寫出/載入 + 強制重建** | completed | 下方「Canonical mapping 全歷史 + DuckDB 降 RAM + 寫出/載入與生產增量更新」一節；步驟 1–9 已完成（Round 384 步驟 9 README 文件化）；CLI 已接線；五、生產增量更新為可選 Phase 2。 |
-| 11 | **Optuna 整份 study 的 early stop** | pending | 下方「Optuna 整份 study 的 early stop（計畫）」一節。 |
+| 11 | **Optuna 整份 study 的 early stop** | completed | 下方「Optuna 整份 study 的 early stop（計畫）」一節。 |
+| 12 | **api_server 還原為 DB-only** | completed | 下方「api_server 還原為 DB-only 計畫」一節；已實作並通過 tests/typecheck/lint。 |
 
-**Plan 狀態摘要**：上表 1～10 項均為 **completed**；第 11 項 Optuna study early stop 為 **pending**。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。
+**Plan 狀態摘要**：上表 1～12 項均為 **completed**。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。
 
 **建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。Backtester 輸出格式對齊（項目 7）可獨立排入。Optuna 整份 study 的 early stop（項目 11）為可選省時機制，預設關閉，實作後可依需要設定 `OPTUNA_EARLY_STOP_PATIENCE`。
 
@@ -729,6 +733,51 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 **實作狀態（Round 244）**：步驟 1–6 已完成（Round 232/234：步驟 1–3；Round 235：步驟 4 POST /score；Round 237/238：步驟 5；Round 241：步驟 6 doc 更新；Round 242 Review、Round 243 風險測試鎖定行為）。可選後續：threshold/feature_count 於 GET /model_info、NumPy 純量接受、body 大小 413（見 STATUS Round 242 Review）。
 
+**後續決策**：已決定將 api_server **還原為 DB-only**（與 api_server_old 一致，移除 /score、/health、/model_info）。詳見下方「api_server 還原為 DB-only 計畫」。
+
+---
+
+### api_server 還原為 DB-only 計畫
+
+**目標**：api_server 不具備任何模型知識，僅提供前端與四支「自共用 SQLite 讀取」的 API，行為與 `trainer/api_server_old.py` 一致。scorer 維持本機載入模型並寫入 state.db；測試採方案 B（整檔/部分 skip）。
+
+#### 已鎖定決策
+
+- **api_server.py**：完全還原為 `api_server_old.py` 行為（含 `frontend_module`，不保留 path traversal 防護）。
+- **測試**：方案 B — model-API 專用測試**整檔或部分 skip**，不刪除。
+- **scorer 對齊**：僅文件/註解對齊；不改程式邏輯、DB schema、model 載入路徑。
+- **scorer model 載入**：維持現狀 — `model.pkl` → `rated_model.pkl` → `walkaway_model.pkl`。
+
+#### Part 1：修改 `trainer/api_server.py`
+
+1. **Imports**：移除 `hashlib`, `io`, `threading`, `from werkzeug.security import safe_join`；保留與 api_server_old 相同（含 `json`）。
+2. **全域**：移除 `MODEL_DIR`；其餘不變。
+3. **`frontend_module`**：改回與 api_server_old 完全相同（`target = FRONTEND_DIR / filename`；僅當 `filename.endswith('.js') and target.exists()` 時 `send_from_directory(FRONTEND_DIR, filename)`；否則 `abort(404)`）。
+4. **刪除整塊 Model API**：自 `# ── Model artifact cache (Step 9) ───` 起至 `if __name__ == "__main__":` 前全部刪除（含 `_artifacts_cache`, `_cached_model_version`, `_artifacts_lock`, `_MAX_SCORE_ROWS`, `_load_artifacts`, `_get_artifacts`, `_compute_shap_reason_codes_batch`, `/health`, `/model_info`, `/score`, `_RESERVED_KEYS`）。
+5. **四支 API**：若與 api_server_old 一致則不改；若有差異則改回一致。
+6. **結尾**：保留 `if __name__ == "__main__":` + `print(STATE_DB_PATH)` + `app.run(host="0.0.0.0", port=8000, debug=True)`。
+
+#### Part 2：測試處理（方案 B）
+
+- **test_api_server.py**：改寫 — 刪除所有對 `/health`、`/model_info`、`/score` 及 `_get_artifacts`、`_load_artifacts`、`_artifacts_cache`、`_cached_model_version`、`_MAX_SCORE_ROWS` 的測試；只保留對靜態檔 + get_floor_status / get_hc_history / get_validation / get_alerts 的測試。
+- **model-API 專用測試檔**：整檔或部分 skip（reason: `"api_server reverted to DB-only; model API removed"`）。
+  - 整檔 skip：test_review_risks_round232_api_server.py、round235、round238、round242、round360。
+  - 部分 skip：round38、round340（僅 skip 依賴 /score 或 api_server 原始碼的 test）。
+
+#### Part 3：對齊 `trainer/scorer.py`
+
+- **不變更**：scorer 不呼叫 api_server；寫入 alerts 與 init state.db 與 reverted api_server 讀取相容；validation_results 由 validator 寫入。無需改 scorer 程式邏輯或 DB。
+- **僅文件/註解**：模組 docstring 補一句「api_server 僅自共用 SQLite（state.db）讀取資料，不提供 model API；本 scorer 為唯一載入模型並寫入 alerts 的元件。」可選在 `load_dual_artifacts` 或 `main()` 附近加註解「Model is loaded locally only; api_server does not serve /score.」
+- **Model 載入路徑**：維持 `model.pkl` → `rated_model.pkl` → `walkaway_model.pkl`，不變更。
+
+#### Part 4：驗證與後續
+
+- 執行 pytest：無 import 錯誤、保留的測試通過、skip 標註正確。
+- 手動確認：靜態與四支 API 與 api_server_old 一致；`/health`、`/model_info`、`POST /score` 回 404。
+- 若 README 或文件有寫 api_server 提供 /health、/model_info、/score，改為「僅提供前端與四支資料 API」。
+
+**實作狀態**：已完成（api_server 還原、測試方案 B、scorer 文件對齊；tests/typecheck/lint 全過）。
+
 ---
 
 ### Step 10 — Testing & Validation 規格
@@ -979,6 +1028,8 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - `OPTUNA_EARLY_STOP_PATIENCE=None`（預設）：行為與改動前完全一致，跑滿 n_trials。
 - 設為 50、且約 trial 80 起無改進：應在約 trial 130 結束，並出現 `[Step 9] Optuna early stop: no improvement for 50 trials (stopped at trial 130/300)` 之類 log。
 - 若需審計／可重現：預設保持 `None`；僅在 dev 或明確要省時間時設定 patience。
+
+**實作狀態**：已完成（config + run_optuna_search callback、Review #1/#3 型別與 best_value 防呆；見 STATUS 對應 Round）。
 
 ---
 
