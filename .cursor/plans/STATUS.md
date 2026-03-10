@@ -14586,3 +14586,172 @@ python -m pytest tests/test_review_risks_round407_code_review.py -v
 
 R407 #1 兩支測試已由 XFAIL 轉為 PASSED。
 
+---
+
+## Round 410 — PLAN optuna-hpo-sample-rows：Optuna HPO 階段 train/valid 抽樣
+
+**日期**：2026-03-10  
+**對應**：PLAN.md「Optuna HPO 階段 train/valid 抽樣（計畫）」；todo `optuna-hpo-sample-rows`。
+
+### 實作變更
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/config.py` | 新增 `OPTUNA_HPO_SAMPLE_ROWS: Optional[int] = None`；註解說明僅影響 Optuna 階段、valid 與 train 同比例、最終訓練仍用全量。 |
+| `trainer/trainer.py` | 新增 `from sklearn.model_selection import train_test_split`；config 讀取 `OPTUNA_HPO_SAMPLE_ROWS`（getattr 預設 None）。在 `run_optuna_search` 內、empty val guard 之後：若 `OPTUNA_HPO_SAMPLE_ROWS` 為正整數且 `len(X_train) > OPTUNA_HPO_SAMPLE_ROWS`，對 train 做 stratified 抽樣（單一類別時改隨機抽樣），計算 ratio r，對 valid 依同比例 r 做 stratified 抽樣得 `n_valid`；賦值 `X_tr, y_tr, sw_tr, X_vl, y_vl`；有抽樣時 log「Optuna HPO: subsampled train … valid … (ratio=…)」。Objective 改為使用 `X_tr, y_tr, sw_tr, X_vl, y_vl`（閉包），簽名與回傳不變。 |
+
+### 手動驗證建議
+
+- **關閉抽樣**：`OPTUNA_HPO_SAMPLE_ROWS=None`（預設）時，執行 trainer 至 Step 9，log 不應出現「Optuna HPO: subsampled」；行為與改動前一致。
+- **開啟抽樣**：在 config 或環境中設 `OPTUNA_HPO_SAMPLE_ROWS=1_500_000`，以 `--days 90 --use-local-parquet`（或較小 window）跑至 Step 9，log 應出現「Optuna HPO: subsampled train N -> 1500000, valid M -> K (ratio=…)」；單 trial 時間應明顯縮短；最終仍產出 model artifact（全量訓練不變）。
+- **小資料**：當 `len(X_train) <= OPTUNA_HPO_SAMPLE_ROWS` 時不抽樣，無 subsample log。
+
+### 下一步建議
+
+- 將 PLAN.md 中 todo `optuna-hpo-sample-rows` 標為 completed（實作完成後）。
+- 可選：新增單元測試，驗證 `run_optuna_search` 在 mock 資料下、設 `OPTUNA_HPO_SAMPLE_ROWS` 時確實使用子集且回傳 best_params 結構不變。
+
+### pytest 結果（本輪執行）
+
+```text
+python -m pytest tests/ -q
+919 passed, 42 skipped, 5 subtests passed in 22.92s
+```
+
+---
+
+## Round 410 Code Review — Optuna HPO 抽樣（R410 Review）
+
+**日期**：2026-03-10  
+**範圍**：Round 410 實作（`run_optuna_search` 內 HPO 階段 train/valid 抽樣）。  
+**依據**：PLAN.md「Optuna HPO 階段 train/valid 抽樣（計畫）」、STATUS Round 410、DECISION_LOG（Optuna/HPO 相關決策）。  
+**原則**：不重寫整套；僅列出問題、具體修改建議與建議新增之測試，並追加至 STATUS。
+
+---
+
+### 1. 最可能的 Bug / 正確性
+
+| # | 問題 | 具體修改建議 | 建議新增的測試 |
+|---|------|--------------|----------------|
+| **1** | **Valid 僅 1 列時 AP 退化**：PLAN 規定 `n_valid` 至少 1，但 `average_precision_score(y_vl, scores)` 在 valid 僅 1 筆時（例如 `len(X_val)*r < 1` → `n_valid=1`）語意退化，且可能觸發 sklearn 警告或邊界行為。 | 在計算 `n_valid` 後加上下限：`n_valid = max(n_valid, 50)`（或使用既有常數如 `MIN_VALID_TEST_ROWS` 的較小值，例如 50），並以 `n_valid = min(len(X_val), n_valid)` 再 cap，避免 valid 子集過小導致 AP 不可靠。若 `len(X_val) < 50` 則不抽樣 valid（維持全量）。 | 單元測試：mock 資料 `len(X_val)=200`、`r=0.01` → `int(200*0.01)=2`；驗證 valid 子集筆數 ≥ 50（或 ≥ min(50, len(X_val))），且 `run_optuna_search` 回傳 dict 且至少含預期鍵（如 `n_estimators`）。 |
+| **2** | **sklearn 版本與 stratify + train_size=int**：部分 sklearn 版本中 `train_test_split(..., train_size=int, stratify=y)` 有已知議題（如 issue #20256），stratify 與整數 `train_size` 同時使用時可能不如預期。 | 若專案鎖定之 sklearn 版本在該情境下行為正確，則在註解中註明「需 sklearn >= X.Y 以確保 stratify + train_size=int 正確」。或改為兩段式：先用 `StratifiedShuffleSplit(n_splits=1, train_size=_sample_rows, random_state=42).split(X_train, y_train)` 取一組索引，再依索引取子集，以明確控制「stratified + 固定數量」。 | 測試：給定固定 `random_state=42`、已知 y 分佈（如 30% 正類），驗證抽樣後 `y_tr.value_counts(normalize=True)` 與原 `y_train` 比例誤差 < 0.05（或子集比例落在預期區間）。 |
+| **3** | **Index 對齊**：`X_tr = X_train.iloc[idx_tr]` 等保留原始 index，子集 index 可能不連續。LightGBM/sklearn 通常依位置不依 index，但若未來依賴「index 對齊」可能出錯。 | 抽樣後對 HPO 用子集做 `reset_index(drop=True)`（例如 `X_tr = X_train.iloc[idx_tr].reset_index(drop=True)`，同理 `y_tr`, `sw_tr`, `X_vl`, `y_vl`），確保 0..n-1 連續 index，避免隱性依賴 index 的程式出錯。 | 測試：在 mock 的 `X_train` 使用非 0 起始或非連續 index，啟用 `OPTUNA_HPO_SAMPLE_ROWS`，呼叫 `run_optuna_search` 並執行至少 1 個 trial（n_trials=1），驗證不拋錯且回傳 params；可選斷言 `X_tr.index[0] == 0`。 |
+
+---
+
+### 2. 邊界條件
+
+| # | 問題 | 具體修改建議 | 建議新增的測試 |
+|---|------|--------------|----------------|
+| **4** | **OPTUNA_HPO_SAMPLE_ROWS 為 float**：config 型別為 `Optional[int]`，若使用者設成 `1.5e6`（float），目前 `isinstance(..., int)` 為 False，整段抽樣被跳過，行為與 None 相同但無 log 說明。 | 在 `_sample_rows` 計算時允許數值型並安全轉 int：例如 `v = getattr(_cfg, "OPTUNA_HPO_SAMPLE_ROWS", None)`；`_sample_rows = int(v) if v is not None and (isinstance(v, (int, float)) and 0 < v <= 2**31) else None`，並對 float 打一次 debug 或 info log「OPTUNA_HPO_SAMPLE_ROWS coerced to int」。或維持僅 int，在 config 註解中註明「必須為 int，float 視為未設定」。 | 測試：以 monkeypatch 將 `OPTUNA_HPO_SAMPLE_ROWS` 設為 `1_500_000.0`，驗證不拋錯且 either 抽樣發生（若實作接受 float）或 不抽樣且無 crash（若維持僅 int）。 |
+| **5** | **單一類別 fallback 無 log**：PLAN §3 要求「改為簡單隨機抽樣……並在註解/log 說明」。目前僅有註解，無 run-time log，除錯時難以判斷是否走了 fallback。 | 在 `except ValueError:` 區塊（train 與 valid 兩處）內加一行：`logger.debug("Optuna HPO: single-class in train/valid, using random sample (stratify failed).")` 或 `logger.info(...)`，以便必要時追蹤。 | 測試：提供僅一類的 `y_train`（全 0 或全 1）、啟用抽樣，驗證 `run_optuna_search` 完成且回傳 dict；可選以 caplog 或 mock logger 斷言出現「single-class」或「random sample」相關 log。 |
+| **6** | **len(X_train) == OPTUNA_HPO_SAMPLE_ROWS**：條件為 `len(X_train) > _sample_rows`，故相等時不抽樣，符合「不抽樣」語意；但若未來有人改為 `>=` 會觸發 train_test_split 的 train_size 等於總數，可能導致 test 為空或邊界行為。 | 維持現有 `>` 條件，在註解中註明「刻意用 > 避免 len==_sample_rows 時無謂抽樣與潛在 stratify 邊界」。無需改碼。 | 測試：`len(X_train) == OPTUNA_HPO_SAMPLE_ROWS`（例如各 1000）、啟用抽樣，驗證不進入抽樣分支（例如無 subsample log 或 X_tr is X_train）。 |
+
+---
+
+### 3. 安全性
+
+| # | 問題 | 具體修改建議 | 建議新增的測試 |
+|---|------|--------------|----------------|
+| **7** | **Config 注入**：`OPTUNA_HPO_SAMPLE_ROWS` 來自 config/環境，若被設成極大（如 2**31）或極小正數，目前由「len(X_train) > _sample_rows」與「max(1, int(...))」等自然限制，不會越界；若從不可信來源讀取，理論上有 DoS 風險。 | 在 config 或 trainer 讀取處加上合理上下限：例如 `OPTUNA_HPO_SAMPLE_ROWS` 若為 int 則 clamp 至 [1, 50_000_000] 或與現有常數一致；超過時 log warning 並使用 clamp 值。專案若為內建 config 唯讀則可標註「trusted config」。 | 測試：設 `OPTUNA_HPO_SAMPLE_ROWS=2**31`，驗證不崩潰且實際使用之 sample 數 ≤ len(X_train) 且 ≤ 合理上限（若實作 clamp）。 |
+
+---
+
+### 4. 效能
+
+| # | 問題 | 具體修改建議 | 建議新增的測試 |
+|---|------|--------------|----------------|
+| **8** | **多餘複本**：`X_tr = X_train.iloc[idx_tr]` 會產生新 DataFrame 複本；若 `OPTUNA_HPO_SAMPLE_ROWS` 接近 `len(X_train)`，幾乎全量複製一次，記憶體峰值略增。 | 若實務上 HPO 抽樣比例通常較小（如 1.5M/22M），可接受。若需優化，可考慮僅在「抽樣後列數 < 原列數的某比例」時才做子集，否則直接使用原 DataFrame（即「抽樣比例過高則不抽樣」）；或維持現狀並在 doc/註解註明「HPO 子集會暫存一份，記憶體峰值略增」。 | 可選：大資料 mock（如 1e6 列）、啟用抽樣 100k，量測 `run_optuna_search` 前後記憶體或僅驗證完成不 OOM。 |
+
+---
+
+### 5. 小結與建議優先順序
+
+- **高優先（正確性/可觀測）**：#1（valid 最小筆數）、#3（index 重置）、#5（單一類別 log）。  
+- **中優先（相容/邊界）**：#2（sklearn 註解或 StratifiedShuffleSplit）、#4（float 處理或文件化）、#6（邊界註解）。  
+- **低優先（防禦/效能）**：#7（config clamp）、#8（文件化或優化）。
+
+建議先實作 #1、#3、#5，再跑一輪 pytest 並更新 STATUS；其餘可依優先級排入後續 Round。
+
+---
+
+## R410 Review 風險 → 最小可重現測試（僅 tests，未改 production）
+
+**日期**：2026-03-10  
+**原則**：將 R410 Review 所列風險點轉成最小可重現測試或 AST/型別契約；**僅新增 tests，不改 production code**。
+
+### 新增測試檔
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/test_review_risks_round410_optuna_hpo_sampling.py` | R410 抽樣相關之最小可重現測試與源碼/AST、config 型別契約 |
+
+### 風險編號與測試對應
+
+| R410 # | 測試類別 / 方法 | 內容摘要 |
+|--------|-----------------|----------|
+| **1** | `TestR410_1_ValidSmallSubset::test_small_valid_subset_completes_and_returns_params` | valid 子集很小（n_valid=2）：run_optuna_search 完成且回傳 dict 含 n_estimators 等鍵 |
+| **2** | `TestR410_2_StratifiedSubsamplingCompletes::test_stratified_like_data_subsampling_returns_params` | 5000 train / 30% 正類、sample_rows=1000、n_trials=1，完成且回傳 params |
+| **3** | `TestR410_3_NonContiguousIndex::test_non_contiguous_index_subsampling_completes` | 非連續 index（index_start=100）、抽樣啟用，完成且回傳 params |
+| **4** | `TestR410_4_FloatSampleRows::test_float_sample_rows_no_crash_returns_params` | OPTUNA_HPO_SAMPLE_ROWS=1_500_000.0（float），不崩潰且回傳 params（目前實作視為未設定） |
+| **5** | `TestR410_5_SingleClassFallback::test_single_class_train_subsampling_completes` | y_train 全 0、valid 兩類、啟用抽樣 → **xfail**：目前 production 會因 LightGBM LabelEncoder 在 valid 見到未見標籤而拋錯，待 production 修復後移除 xfail |
+| **6** | `TestR410_6_EqualLengthNoSubsample::test_equal_train_and_sample_rows_completes` | len(X_train)==1000、OPTUNA_HPO_SAMPLE_ROWS=1000 → 不抽樣、完成並回傳 dict |
+| **6** | `TestR410_6_EqualLengthNoSubsample::test_source_uses_strict_gt_for_subsample_condition` | AST 契約：源碼須為 `len(X_train) > _sample_rows`，不得為 `>=` |
+| **7** | `TestR410_7_HugeSampleRowsNoCrash::test_huge_sample_rows_completes` | OPTUNA_HPO_SAMPLE_ROWS=2**31、10000 train，不崩潰且回傳 dict |
+| **Config** | `TestR410_ConfigTypeContract::test_config_hpo_sample_rows_is_int_or_none` | `trainer.config.OPTUNA_HPO_SAMPLE_ROWS` 型別為 int 或 None |
+
+### 執行方式
+
+```bash
+# 專案根目錄
+python -m pytest tests/test_review_risks_round410_optuna_hpo_sampling.py -v
+```
+
+### 目前 pytest 結果（Round 411 後）
+
+```
+9 passed in ~1.4s
+```
+
+- **R410 #5**：Round 411 於 production 處理單一類 train + 兩類 valid（見下），`test_single_class_train_subsampling_completes` 改為通過；已移除過時之 `@pytest.mark.xfail`。
+
+### 備註
+
+- 測試中對 `OPTUNA_HPO_SAMPLE_ROWS` 的覆寫使用 `patch.object(trainer_mod, "OPTUNA_HPO_SAMPLE_ROWS", value, create=True)`，以相容 `trainer` 在部分環境下從 `trainer.config` 載入、模組本身無該屬性之情況。
+- Round 411 已實作 R410 Review #5 單一類別邊界處理；其餘 #1/#3 等建議可依優先級排入後續 Round。
+
+---
+
+## Round 411 — R410 Review #5 單一類別邊界 + tests/typecheck/lint 全過
+
+**日期**：2026-03-10  
+**目標**：修改實作直至所有 tests / typecheck / lint 通過；不改 tests（僅移除過時 xfail）；每輪結果追加 STATUS；最後更新 PLAN.md 與項目狀態。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/trainer.py` | **except 區塊**：新增 `OPTUNA_HPO_SAMPLE_ROWS = getattr(_cfg, "OPTUNA_HPO_SAMPLE_ROWS", None)`，使從 `trainer.config` 載入時該變數存在，避免 NameError。**`run_optuna_search` objective**：當 `y_tr.nunique() < 2`（單一類別 train）時，不傳 `eval_set` 與 early_stopping callbacks，僅 `model.fit(X_tr, y_tr, sample_weight=sw_tr)`，再以 `model.predict_proba(X_vl)[:, 1]` 與 `average_precision_score(y_vl, scores)` 回傳；避免 LightGBM LabelEncoder 在 valid 見到未見標籤而拋錯（R410 #5）。 |
+| `tests/test_review_risks_round410_optuna_hpo_sampling.py` | 移除 `test_single_class_train_subsampling_completes` 之 `@pytest.mark.xfail`（production 已處理，decorator 過時）。 |
+
+### pytest / typecheck / lint 結果
+
+```
+# 專案根目錄執行
+python -m pytest tests/ -q --tb=no
+# 928 passed, 42 skipped, 5 subtests passed
+
+python -m pytest tests/test_review_risks_round410_optuna_hpo_sampling.py -v
+# 9 passed
+
+ruff check .
+# All checks passed!
+
+python -m mypy trainer/ --ignore-missing-imports
+# Success: no issues found in 23 source files
+```
+
+### 備註
+
+- 未改其他 production 或測試邏輯；僅 R410 #5 邊界處理與 except 區塊補齊、以及過時 xfail 移除。
+

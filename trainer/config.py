@@ -98,6 +98,10 @@ OPTUNA_TIMEOUT_SECONDS: Optional[int] = 4 * 60 * 60  # -1 = no timeout, 10 * 60 
 # Positive int (e.g. 40–60) = stop early to save time; recommend 40–60 to avoid stopping
 # too soon when TPE has a dry spell (PLAN "Optuna 整份 study 的 early stop").
 OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = 40
+# HPO subsampling (PLAN "Optuna HPO 階段 train/valid 抽樣"): max rows used for Optuna search only.
+# None = no subsampling (use full train/valid). Positive int (e.g. 1_500_000) = cap train to this many rows;
+# valid is subsampled to the same proportion r = n_train / len(X_train). Final training still uses full data.
+OPTUNA_HPO_SAMPLE_ROWS: Optional[int] = None
 # Threshold selection objective (DEC-026): Optimize Precision at recall >= THRESHOLD_MIN_RECALL
 # (trainer: argmax(pr_prec) over valid_mask; backtester: Optuna maximises precision).
 # THRESHOLD_FBETA is still used for val_fbeta_05 / reporting only, not for choosing threshold.

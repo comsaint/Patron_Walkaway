@@ -64,6 +64,7 @@ import optuna
 from optuna.trial import FrozenTrial
 import pandas as pd
 from sklearn.metrics import average_precision_score, precision_recall_curve
+from sklearn.model_selection import train_test_split
 from zoneinfo import ZoneInfo
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -88,6 +89,7 @@ try:
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
     OPTUNA_TIMEOUT_SECONDS: Optional[int] = getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", 10 * 60)
     OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = getattr(_cfg, "OPTUNA_EARLY_STOP_PATIENCE", None)
+    OPTUNA_HPO_SAMPLE_ROWS: Optional[int] = getattr(_cfg, "OPTUNA_HPO_SAMPLE_ROWS", None)
     # G1_PRECISION_MIN / G1_ALERT_VOLUME_MIN_PER_HOUR / G1_FBETA intentionally
     # not imported — deprecated per DEC-009/010; rollback path only.
     PLACEHOLDER_PLAYER_ID = _cfg.PLACEHOLDER_PLAYER_ID
@@ -138,6 +140,7 @@ except ModuleNotFoundError:
     BET_AVAIL_DELAY_MIN = _cfg.BET_AVAIL_DELAY_MIN
     SESSION_AVAIL_DELAY_MIN = _cfg.SESSION_AVAIL_DELAY_MIN
     OPTUNA_N_TRIALS = _cfg.OPTUNA_N_TRIALS
+    OPTUNA_HPO_SAMPLE_ROWS: Optional[int] = getattr(_cfg, "OPTUNA_HPO_SAMPLE_ROWS", None)  # type: ignore[no-redef]
     OPTUNA_TIMEOUT_SECONDS: Optional[int] = getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", 10 * 60)  # type: ignore[no-redef]
     OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = getattr(_cfg, "OPTUNA_EARLY_STOP_PATIENCE", None)  # type: ignore[no-redef]
     # G1_PRECISION_MIN / G1_ALERT_VOLUME_MIN_PER_HOUR / G1_FBETA intentionally
@@ -2490,6 +2493,63 @@ def run_optuna_search(
         )
         return {}
 
+    # HPO subsampling (PLAN "Optuna HPO 階段 train/valid 抽樣"): use X_tr, y_tr, sw_tr, X_vl, y_vl in objective.
+    X_tr = X_train
+    y_tr = y_train
+    sw_tr = sw_train
+    X_vl = X_val
+    y_vl = y_val
+    _hpo_ratio: Optional[float] = None
+
+    _sample_rows = (
+        OPTUNA_HPO_SAMPLE_ROWS
+        if isinstance(OPTUNA_HPO_SAMPLE_ROWS, int) and OPTUNA_HPO_SAMPLE_ROWS > 0
+        else None
+    )
+    if _sample_rows is not None and len(X_train) > _sample_rows:
+        # Stratified sample train to _sample_rows; fallback to random if single class.
+        idx = np.arange(len(X_train))
+        try:
+            idx_tr, _ = train_test_split(
+                idx,
+                train_size=_sample_rows,
+                stratify=y_train,
+                random_state=42,
+            )
+        except ValueError:
+            # Single class in y_train; use random sample (PLAN §3).
+            idx_tr = np.random.RandomState(42).choice(
+                idx, size=min(_sample_rows, len(idx)), replace=False
+            )
+        X_tr = X_train.iloc[idx_tr]
+        y_tr = y_train.iloc[idx_tr]
+        sw_tr = sw_train.iloc[idx_tr]
+        _hpo_ratio = _sample_rows / len(X_train)
+        n_valid = min(len(X_val), max(1, int(len(X_val) * _hpo_ratio)))
+        if len(X_val) > n_valid:
+            idx_v = np.arange(len(X_val))
+            try:
+                idx_vl, _ = train_test_split(
+                    idx_v,
+                    train_size=n_valid,
+                    stratify=y_val,
+                    random_state=42,
+                )
+            except ValueError:
+                idx_vl = np.random.RandomState(42).choice(
+                    idx_v, size=min(n_valid, len(idx_v)), replace=False
+                )
+            X_vl = X_val.iloc[idx_vl]
+            y_vl = y_val.iloc[idx_vl]
+        logger.info(
+            "Optuna HPO: subsampled train %d -> %d, valid %d -> %d (ratio=%.4f)",
+            len(X_train),
+            len(X_tr),
+            len(X_val),
+            len(X_vl),
+            _hpo_ratio,
+        )
+
     def objective(trial: optuna.Trial) -> float:
         params = {
             **_base_lgb_params(),
@@ -2505,15 +2565,20 @@ def run_optuna_search(
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
         }
         model = lgb.LGBMClassifier(**params)
-        model.fit(
-            X_train,
-            y_train,
-            sample_weight=sw_train,
-            eval_set=[(X_val, y_val)],
-            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
-        )
-        scores = model.predict_proba(X_val)[:, 1]
-        return average_precision_score(y_val, scores)
+        # R410 #5: single-class y_tr + two-class y_vl would make LightGBM LabelEncoder
+        # raise on eval_set (unseen label). Fit without eval_set when train has one class.
+        if y_tr.nunique() < 2:
+            model.fit(X_tr, y_tr, sample_weight=sw_tr)
+        else:
+            model.fit(
+                X_tr,
+                y_tr,
+                sample_weight=sw_tr,
+                eval_set=[(X_vl, y_vl)],
+                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+            )
+        scores = model.predict_proba(X_vl)[:, 1]
+        return average_precision_score(y_vl, scores)
 
     study = optuna.create_study(
         direction="maximize",

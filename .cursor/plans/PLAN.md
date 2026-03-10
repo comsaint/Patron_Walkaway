@@ -98,6 +98,9 @@ todos:
   - id: r222-review-production
     content: "Round 222 Review production 補強：Track LLM 失敗 warning、canonical_ids=[]、use_local_parquet 參數、candidates 型別防呆。見「Round 222 Review production 補強（實作計畫）」一節。四項均已實作（Round 406 完成項目 1、3）。"
     status: completed
+  - id: optuna-hpo-sample-rows
+    content: "Optuna HPO 階段 train/valid 抽樣：僅設 OPTUNA_HPO_SAMPLE_ROWS；valid 與 train 同比例；stratified 抽樣、random_state=42；最終訓練仍用全量。見「Optuna HPO 階段 train/valid 抽樣（計畫）」一節。"
+    status: completed
 isProject: false
 ---
 
@@ -1244,6 +1247,73 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - 若需審計／可重現：預設保持 `None`；僅在 dev 或明確要省時間時設定 patience。
 
 **實作狀態**：已完成（config + run_optuna_search callback、Review #1/#3 型別與 best_value 防呆；見 STATUS 對應 Round）。
+
+---
+
+## Optuna HPO 階段 train/valid 抽樣（計畫）
+
+### 目標
+
+- **Optuna 搜尋**：只在「抽樣後的 train / valid」上跑 objective，以縮短每個 trial 的時間。
+- **最終訓練**：沿用現有流程，用 **全量** train/valid 與 Optuna 回傳的 best params 做一次訓練；行為與介面不變。
+- **可選**：透過 config 關閉抽樣（`None`）時，維持目前「全量 HPO」行為。
+
+### 1. Config 新增
+
+**檔案**：`trainer/config.py`（Optuna 相關區塊旁）
+
+| 常數 | 型別 | 建議預設 | 說明 |
+|------|------|----------|------|
+| `OPTUNA_HPO_SAMPLE_ROWS` | `Optional[int]` | `1_500_000` 或 `None` | HPO 時 train 最多使用的列數；`None` = 不抽樣，使用全量。Valid 抽樣數由「與 train 同比例」計算，不另設常數。 |
+
+註解寫明：僅影響 Optuna 階段；最終訓練仍用全量；valid 會依與 train 相同比例縮小。
+
+### 2. Valid「與 train 同比例」的定義
+
+- 設 \( n_{\text{train}} = \min(\text{len}(X_{\text{train}}),\; \text{OPTUNA\_HPO\_SAMPLE\_ROWS}) \)（若為 `None` 則不抽樣）。
+- 比例 \( r = n_{\text{train}} / \text{len}(X_{\text{train}}) \in (0, 1] \)。
+- Valid 抽樣數：\( n_{\text{valid}} = \min(\texttt{len}(X_{\text{val}}),\; \max(1,\; \lfloor \texttt{len}(X_{\text{val}}) \times r \rfloor)) \)。
+- 等同：**valid 保留與 train 相同的取樣比例 r**。
+
+實作時：若 train 有抽樣，則 \( r = \texttt{OPTUNA_HPO_SAMPLE_ROWS} / \texttt{len(X_train)} \)，valid 抽樣數 = `min(len(X_val), max(1, int(len(X_val) * r)))`。若 train 不抽樣，則 valid 也不抽樣。
+
+### 3. 抽樣策略
+
+- **Train**：`OPTUNA_HPO_SAMPLE_ROWS is None` 或 `len(X_train) <= OPTUNA_HPO_SAMPLE_ROWS` → 不抽樣。否則：stratified 抽 `OPTUNA_HPO_SAMPLE_ROWS` 筆（以 `y_train`），對 `X_train, y_train, sw_train` 用同一組索引取子集；`random_state=42`。
+- **Valid（同比例）**：僅在 train 有被抽樣時才對 valid 抽樣；\( n_{\text{valid}} = \min(\texttt{len(X_val)},\; \max(1,\; \texttt{int(len(X_val) * r)}) \)；對 `X_val, y_val` 做 stratified 抽樣取 `n_valid` 筆，`random_state=42`。
+- **單一類別**：若 `y_train` 或 `y_val` 只有一類，stratified 會報錯，改為簡單隨機抽樣（同 `random_state`），並在註解/log 說明。
+
+### 4. 程式改動位置與流程
+
+**檔案**：`trainer/trainer.py`
+
+- **Import**：需有 `sklearn.model_selection.train_test_split`（或等價的 stratified 抽樣方式）。
+- **Config**：僅讀取 `OPTUNA_HPO_SAMPLE_ROWS`（`getattr(..., None)`）。
+- **`run_optuna_search` 開頭**（在 `if X_val.empty or len(y_val) == 0: return {}` 之後）：
+  1. `X_tr, y_tr, sw_tr = X_train, y_train, sw_train`；`X_vl, y_vl = X_val, y_val`。
+  2. **Train 抽樣**：若 `OPTUNA_HPO_SAMPLE_ROWS` 為正整數且 `len(X_train) > OPTUNA_HPO_SAMPLE_ROWS`：以 stratified 取 `OPTUNA_HPO_SAMPLE_ROWS` 筆索引，得到 `X_tr, y_tr, sw_tr`；計算 \( r = \texttt{OPTUNA_HPO_SAMPLE_ROWS} / \texttt{len(X_train)} \)。
+  3. **Valid 抽樣（同比例）**：僅在上述 train 有抽樣時：\( n_{\text{valid}} = \min(\texttt{len(X_val)},\; \max(1,\; \texttt{int(len(X_val) * r)}) \)；若 `len(X_val) > n_valid`：對 valid 做 stratified 抽 `n_valid` 筆，得到 `X_vl, y_vl`；否則不抽樣。
+  4. Log：例如 `"Optuna HPO: subsampled train %d -> %d, valid %d -> %d (ratio=%.4f)"`（僅在有抽樣時打）。
+  5. 其後 objective 與 `model.fit` 一律使用 `X_tr, y_tr, sw_tr, X_vl, y_vl`；簽名與回傳不變，呼叫端仍用全量做最終訓練。
+
+### 5. 邊界與特殊情況
+
+- **Valid 筆數**：`n_valid` 至少 1（避免空 valid）；若 `len(X_val) * r < 1` 則取 1。
+- **Train 不抽樣**：不計算 r，valid 也不抽樣。
+- **Stratified 失敗**：僅在單一類別時改隨機抽樣。
+- **重現性**：抽樣一律 `random_state=42`。
+
+### 6. 測試與驗收
+
+- **關閉**：`OPTUNA_HPO_SAMPLE_ROWS=None` → 無 subsample log，行為與改動前一致。
+- **開啟**：設 `OPTUNA_HPO_SAMPLE_ROWS=1_500_000`，確認 log 出現 train 與 valid 的筆數及 ratio；valid 筆數應約為 `len(X_val) * (1_500_000 / len(X_train))`；單 trial 變快；最終訓練仍用全量並產出 artifact。
+- **小 valid**：若 `len(X_val)` 很小，`n_valid` 可能等於 `len(X_val)`（不抽樣），邏輯上為「同比例」的特例。
+
+### 7. 文件
+
+- 說明：僅新增 `OPTUNA_HPO_SAMPLE_ROWS`；valid 依與 train **相同比例** 抽樣，不另設 valid 常數；`None` 表示不抽樣。
+
+**實作狀態**：已完成（Round 410：config + run_optuna_search 抽樣與 objective 改用 X_tr/y_tr/sw_tr/X_vl/y_vl；Round 411：R410 Review #5 單一類別 train 邊界處理—objective 內 y_tr 僅一類時不傳 eval_set 避免 LabelEncoder 未見標籤；except 區塊補齊 OPTUNA_HPO_SAMPLE_ROWS。見 STATUS Round 410 / R410 風險→測試 / Round 411）。
 
 ---
 
