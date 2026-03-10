@@ -2529,7 +2529,30 @@ def run_optuna_search(
             _timeout,
             _timeout / 60.0,
         )
-    study.optimize(objective, n_trials=n_trials, timeout=_timeout, show_progress_bar=False)
+
+    _start = time.perf_counter()
+
+    def _progress_callback(study: optuna.Study, trial: optuna.Trial) -> None:
+        n = len(study.trials)
+        if n == 1 or n % 20 == 0 or n == n_trials:
+            elapsed = time.perf_counter() - _start
+            logger.info(
+                "[Step 9] Optuna (%s) trial %d/%d  best_AP=%.4f  elapsed %.0fs (%.1f min)",
+                label or "rated",
+                n,
+                n_trials,
+                study.best_value,
+                elapsed,
+                elapsed / 60.0,
+            )
+
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        timeout=_timeout,
+        show_progress_bar=False,
+        callbacks=[_progress_callback],
+    )
     best = study.best_params
     logger.info("Optuna (%s) best AP=%.4f, params=%s", label or "model", study.best_value, best)
     return best
