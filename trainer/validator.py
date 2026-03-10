@@ -203,7 +203,7 @@ def fetch_sessions_by_canonical_id(
     """Fetch sessions for all player_ids, grouped by canonical_id (R42).
 
     Sessions from multiple player_ids that share a canonical_id are merged and
-    time-sorted, so that rated players who swap casino-club cards within a visit
+    time-sorted, so that rated players who swap casino-club cards within a run
     are treated as a single identity by validate_alert_row.
 
     DB errors propagate to the caller — they are not silenced.
@@ -456,6 +456,17 @@ def save_validation_results(conn: sqlite3.Connection, final_df: pd.DataFrame) ->
         except (TypeError, ValueError):
             return str(v) if v is not None else None
 
+    def _session_id_safe(v: object) -> Optional[str]:
+        """Safe session_id for DB: None/NaN -> None; numeric -> str(int); else str(v) or None on error."""
+        if v is None or pd.isna(v):
+            return None
+        try:
+            if isinstance(v, (int, float)):
+                return str(int(v))
+            return str(v)
+        except (TypeError, ValueError):
+            return str(v) if v is not None else None
+
     rows = [
         (
             _s(r.bet_id),
@@ -465,7 +476,7 @@ def save_validation_results(conn: sqlite3.Connection, final_df: pd.DataFrame) ->
             _s(getattr(r, "canonical_id", None)),
             _s(r.table_id),
             getattr(r, "position_idx", None),
-            None if pd.isna(r.session_id) else str(int(r.session_id)),
+            _session_id_safe(getattr(r, "session_id", None)),
             getattr(r, "score", None),
             None if pd.isna(r.result) else int(bool(r.result)),
             getattr(r, "gap_start", None),
@@ -922,7 +933,14 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
         key = bid if bid != "nan" else f"{row['player_id']}_{row['ts']}"
 
         is_new = key not in existing_results
-        is_upgrade = not is_new and not existing_results[key]["result"] and res["result"]
+        # Treat stored result as MATCH only when explicitly True/1/1.0 (R393: NaN/0/None allow upgrade to MATCH)
+        stored = existing_results[key].get("result")
+        stored_is_match = (
+            stored is True
+            or stored == 1
+            or (isinstance(stored, float) and not pd.isna(stored) and stored == 1.0)
+        )
+        is_upgrade = not is_new and res["result"] and not stored_is_match
         was_pending = not is_new and existing_results[key].get("reason") == "PENDING"
         is_finalize = was_pending and res.get("reason") == "MISS"
 
@@ -962,37 +980,7 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
         total = len(finalized_or_old)
         matches = finalized_or_old["reason"].eq("MATCH").sum()
         precision = (matches / total) if total > 0 else 0
-        print(f"[validator] Cumulative Precision (15m window, alert-level): {precision:.2%} ({matches}/{total})")
-
-        # Visit-level dedup: each (canonical_id, gaming_day) visit counts at most once as TP (step 8)
-        # gaming_day = (bet_ts - GAMING_DAY_START_HOUR hours).date()
-        _gd_start_h = getattr(config, "GAMING_DAY_START_HOUR", 6)
-        try:
-            finalized_or_old["_bet_ts_dt"] = pd.to_datetime(
-                finalized_or_old["bet_ts"], errors="coerce"
-            )
-            finalized_or_old["_gaming_day"] = (
-                finalized_or_old["_bet_ts_dt"] - pd.Timedelta(hours=_gd_start_h)
-            ).dt.date
-            _cid = finalized_or_old["canonical_id"].fillna(
-                finalized_or_old["player_id"].astype(str)
-            )
-            finalized_or_old["_visit_key"] = _cid + "_" + finalized_or_old["_gaming_day"].astype(str)
-
-            # Per visit, take the first MATCH if any (sorted by alert_ts ascending)
-            finalized_or_old_sorted = finalized_or_old.sort_values("alert_ts")
-            visit_matches = (
-                finalized_or_old_sorted[finalized_or_old_sorted["reason"] == "MATCH"]
-                ["_visit_key"].nunique()
-            )
-            visit_total = finalized_or_old_sorted["_visit_key"].nunique()
-            visit_precision = (visit_matches / visit_total) if visit_total > 0 else 0
-            print(
-                f"[validator] Visit-level Precision (canonical_id × gaming_day): "
-                f"{visit_precision:.2%} ({visit_matches}/{visit_total} visits)"
-            )
-        except Exception as exc:
-            print(f"[validator] Visit-level metrics skipped: {exc}")
+        print(f"[validator] Cumulative Precision (15m window): {precision:.2%} ({matches}/{total})")
 
         final_df["alert_ts_dt"] = pd.to_datetime(final_df["alert_ts"])
         final_df = final_df.sort_values("alert_ts_dt").drop(columns=["alert_ts_dt"])

@@ -1891,3 +1891,171 @@ python -m pytest -q
 
 - 前緣 YAML 與「接下來要做的事」表 1～10 項 **全部 completed**。
 - **可選／後續**：Round 389 Review 建議、Round 386 #2/#3、生產增量更新（Phase 2）等，見 PLAN「可選／後續」。
+
+---
+
+## Round 393 — Validator 對齊舊版（僅 alert-level）（2026-03-10）
+
+### 目標
+實作 PLAN 第 14 項「Validator 對齊舊版（僅 alert-level）」：移除 Visit-level 精準度、精準度輸出與 validator_old 一致、註解 within a visit → within a run；保留 canonical_id 與資料清洗。依 PLAN「Validator 對齊舊版（僅 alert-level）」一節執行 1–2 步。
+
+### 改了哪些檔
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/validator.py` | (1) **註解**：`fetch_sessions_by_canonical_id` docstring 中 `within a visit` → `within a run`（約 206 行）。(2) **精準度輸出**：`validate_once()` 內 print 由 `"Cumulative Precision (15m window, alert-level):"` 改為 `"Cumulative Precision (15m window):"`（與 validator_old 一致）。(3) **移除 Visit-level**：刪除整段 Visit-level 邏輯（約原 967–994 行）：註解「Visit-level dedup…」、`_gd_start_h`、`_bet_ts_dt`、`_gaming_day`、`_visit_key`、`visit_matches`/`visit_total`/`visit_precision` 計算、兩處 print（Visit-level Precision / Visit-level metrics skipped）。保留其後 `final_df["alert_ts_dt"]` 及 sort/save/print。 |
+
+### 手動驗證方式
+
+- 僅一處 precision 的 print，內容為 `[validator] Cumulative Precision (15m window): ...`。
+- 程式中無 `_visit_key`、`visit_matches`、`visit_total`、`visit_precision` 或「Visit-level」相關註解。
+- `fetch_sessions_by_canonical_id` 的 docstring 為「within a run」。
+- 可選：`python -m trainer.validator --once`（需 state.db 與 alerts）僅印出 alert-level 精準度、無 Visit-level 行。
+
+### 下一步建議
+
+- PLAN 第 14 項已實作完成，可將 `.cursor/plans/PLAN.md` 前緣 todo `validator-align-old` 標為 **completed**，並將「接下來要做的事」表第 14 項狀態改為 completed。
+- 無後續必須步驟；可選：若未來要改為 run-level 精準度（per (canonical_id, run_id)），需 scorer 寫入 run_id、validator 存 run_id 並以 run_key 做 dedup。
+
+### pytest -q 結果（本輪後）
+
+```
+879 passed, 41 skipped, 192 warnings in 52.72s
+```
+（無失敗；warnings 來自 werkzeug/pandas 等依賴，非本輪修改。）
+
+---
+
+## Code Review — Round 393 變更（Validator 對齊舊版）（2026-03-10）
+
+**範圍**：Round 393 對 `trainer/validator.py` 的修改（移除 Visit-level 精準度、精準度輸出與舊版一致、註解 within a visit → within a run）。以下僅列與該變更相關或受影響路徑上最可能的問題；每項附**具體修改建議**與**希望新增的測試**。
+
+---
+
+### 1. [Bug] `is_upgrade` 在 DB 回傳 `result` 為 NaN/float 時可能為 False，導致 PENDING→MATCH 未寫回
+
+- **問題描述**：`existing_results[key]` 來自 `load_existing_results`（`r.to_dict()`，pandas 從 SQLite 讀出）。SQLite 的 `result` 欄位為 INTEGER；pandas 可能回傳 `0`、`1`、`1.0`、`0.0` 或 `np.nan`（NULL）。目前 `is_upgrade = not is_new and not existing_results[key]["result"] and res["result"]`。在 Python 中 `bool(np.nan)` 為 `True`，故 `not np.nan` 為 `False`；當已存 `result` 為 NaN（例如 PENDING 列尚未寫入 result）時，`not existing_results[key]["result"]` 為 False，導致 `is_upgrade` 為 False，PENDING→MATCH 的結果不會覆寫舊列，寫回 DB 時可能遺失 MATCH。
+- **具體修改建議**：將 `is_upgrade` 改為顯式判斷「已存非 MATCH、新為 MATCH」：
+  ```python
+  stored = existing_results[key].get("result")
+  stored_is_match = stored is True or stored == 1 or (isinstance(stored, float) and stored == 1.0)
+  is_upgrade = not is_new and res["result"] and not stored_is_match
+  ```
+  或使用 helper：`def _is_match_result(x): return x is True or x == 1 or (isinstance(x, float) and not np.isnan(x) and x == 1.0)`，再設 `is_upgrade = not is_new and res["result"] and not _is_match_result(existing_results[key].get("result"))`。
+- **希望新增的測試**：在 `tests/` 中新增或擴充 validator 相關測試：mock `load_existing_results` 回傳一筆 `result=np.nan`（或 `None`）、`reason="PENDING"` 的列，模擬該 key 經 `validate_alert_row` 得到 `res["result"]=True`；斷言該 key 在 `existing_results` 中被更新為 MATCH，且之後 `save_validation_results` 被呼叫時該列之 `result` 為 1（或 True）。可選：再測 `result=0`、`result=0.0` 同樣會觸發 is_upgrade 並寫回 MATCH。
+
+---
+
+### 2. [邊界條件] `save_validation_results` 中 `session_id` 以 `int(r.session_id)` 轉換可能拋出 ValueError
+
+- **問題描述**：`save_validation_results` 內對 `session_id` 使用 `None if pd.isna(r.session_id) else str(int(r.session_id))`。若 `r` 來自 `final_df.itertuples()` 且 `session_id` 為非數字字串（例如 legacy 或異常資料），`int(r.session_id)` 會拋出 `ValueError`，整次寫入失敗。
+- **具體修改建議**：對 `session_id` 做與 `_s()` 類似的安全轉換，例如：
+  ```python
+  def _session_id_safe(v):
+      if v is None or pd.isna(v):
+          return None
+      try:
+          return str(int(float(v))) if isinstance(v, (int, float)) else str(v)
+      except (TypeError, ValueError):
+          return str(v) if v is not None else None
+  ```
+  並在組 `rows` 時以 `_session_id_safe(r.session_id)` 取代目前的 `None if pd.isna(r.session_id) else str(int(r.session_id))`。或至少用 try/except 包住該行，失敗時寫入 `None` 並 log。
+- **希望新增的測試**：建一個 `final_df` 含一筆 `session_id="abc"`（或 `session_id=12345.0` 以確認 float 正常），呼叫 `save_validation_results(conn, final_df)`，斷言不拋錯且該筆寫入 DB 的 `session_id` 為預期（例如 None 或字串 "abc" 依產品決定）；另可加一筆 `session_id=np.nan` 斷言寫入 None。
+
+---
+
+### 3. [可維護性／除錯] `load_existing_results` 與 `parse_alerts` 的 `except Exception: pass` 會吞掉所有錯誤
+
+- **問題描述**：兩處在 `try` 內發生任何 Exception（含 DB schema 缺欄、型別錯誤、連線失敗）時皆靜默忽略，回傳空 dict 或空 DataFrame。若 `validation_results` 表新增欄位但 validator 未同步，或反之，會難以從行為發現問題（例如 `existing_results` 始終為空或列缺欄）。
+- **具體修改建議**：至少記錄日誌：`except Exception as e: logger.debug("load_existing_results failed: %s", e)`（或 `logger.warning`），必要時可加 `raise` 的選項（例如由 config 或環境變數控制「嚴格模式」）。不建議在未區分錯誤類型下直接 re-raise，以免正常環境因暫時性問題反覆崩潰。
+- **希望新增的測試**：Mock `conn.execute` / `pd.read_sql_query` 在 `load_existing_results` 或 `parse_alerts` 路徑上拋出 `sqlite3.OperationalError`（例如 table 不存在）；斷言函數不拋錯、回傳空結構，且（若已加 log）可選斷言 log 被呼叫。若實作「嚴格模式」，可再加一測試在該模式下斷言例外傳播。
+
+---
+
+### 4. [文件／死碼] Validator 不再使用 `GAMING_DAY_START_HOUR`
+
+- **問題描述**：Round 393 移除 Visit-level 精準度後，`trainer/validator.py` 內已無任何對 `config.GAMING_DAY_START_HOUR` 的引用。該常數仍在 `trainer/config.py` 定義並可能被 backtester 等使用，非 validator 的 bug，但 validator 的依賴文件或註解若仍提及「gaming day」可能造成誤解。
+- **具體修改建議**：在 `validator.py` 頂部或 `validate_once` 附近註解中註明「精準度僅為 alert-level，不再使用 gaming_day / GAMING_DAY_START_HOUR」。無須刪除 config 常數（他處可能使用）。
+- **希望新增的測試**：可選。以 grep 或靜態檢查確保 `validator.py` 內無 `GAMING_DAY_START_HOUR` 或 `_visit_key`、`visit_matches` 等字串，防止 Visit-level 邏輯回歸。
+
+---
+
+### 5. [效能] `parse_alerts` 使用 `SELECT * FROM alerts` 且無上限
+
+- **問題描述**：在 `VALIDATOR_ALERT_RETENTION_DAYS` 較大或未設時，會載入全部 alerts，若表很大可能導致記憶體與 I/O 上升、單次週期變慢。
+- **具體修改建議**：目前為已知取捨（需足夠歷史以做 re-check）。若未來要限流，可考慮：在 SQL 加 `ORDER BY ts DESC LIMIT N`（N 由 config 或常數決定），或保留現狀但在文件註明「大 retention 時注意記憶體」。非本輪必改。
+- **希望新增的測試**：可選。整合測試或 benchmark：在 alerts 表插入大量列，量測 `parse_alerts` 耗時或記憶體，或僅在文件中註明建議的 retention 上限。
+
+---
+
+**總結**：優先建議處理 **#1（is_upgrade + NaN/float）** 與 **#2（session_id 安全轉換）**；**#3** 建議至少加 log；**#4**、**#5** 為文件／可選優化。以上為審查結果，未改動任何程式碼，僅追加至 STATUS.md。
+
+---
+
+## Round 393 審查風險 → 最小可重現測試（2026-03-10）
+
+將上述 Code Review 的風險點轉為 tests-only 的守衛測試與規則，**未改動 production code**。
+
+### 新增檔案
+
+- **`tests/test_review_risks_validator_round393.py`**
+
+### 測試與規則對應
+
+| 審查項 | 測試類／方法 | 規則／斷言 | 狀態 |
+|--------|--------------|------------|------|
+| **#1 is_upgrade + NaN** | `TestValidatorRound393Risk1IsUpgrade::test_is_upgrade_logic_handles_nan_stored_result` | `validate_once` 內 is_upgrade 須以 `stored_is_match` 或對 `get("result")` 顯式判斷 1/1.0/True，不得僅用 `not existing_results[key]["result"]` | **通過**（Round 394 修補） |
+| **#2 session_id 非數字** | `TestValidatorRound393Risk2SessionId::test_save_validation_results_accepts_non_numeric_session_id` | `save_validation_results(conn, final_df)` 在某一列 `session_id="abc"` 時不拋錯且能寫入 | **通過**（Round 394 修補） |
+| **#2 session_id float/NaN** | `test_save_validation_results_accepts_float_session_id`, `test_save_validation_results_accepts_nan_session_id` | `session_id` 為 float 或 NaN 時不拋錯、寫入符合預期 | 通過 |
+| **#3 例外吞掉** | `TestValidatorRound393Risk3ExceptionSwallowing::test_load_existing_results_returns_empty_dict_when_sql_raises`, `test_parse_alerts_returns_empty_dataframe_when_sql_raises` | `read_sql_query` 拋 `sqlite3.OperationalError` 時，`load_existing_results` 回傳 `{}`、`parse_alerts` 回傳空 DataFrame，且不 re-raise | 通過 |
+| **#4 Visit-level 回歸** | `TestValidatorRound393Risk4VisitLevelRegression::test_validator_no_visit_level_regression` | `validator.py` 原始碼不得含 `GAMING_DAY_START_HOUR`、`_visit_key`、`visit_matches`、`visit_total`、`visit_precision` | 通過 |
+
+### 執行方式
+
+僅跑本批審查風險測試：
+
+```bash
+python -m pytest tests/test_review_risks_validator_round393.py -v --tb=short
+```
+
+預期結果（Round 394 修補後）：**7 passed**。此前為 5 passed, 2 xfailed（#1、#2 待 production 修正）；Round 394 已修補並移除 expectedFailure。
+
+全套測試含本檔：
+
+```bash
+python -m pytest tests/ -q --tb=line
+```
+
+本輪實跑結果：**884 passed, 41 skipped, 2 xfailed**（2 xfailed 即上表 #1、#2 之 expectedFailure）。下述 Round 394 已修補 #1、#2，改為 **7 passed**／**886 passed**。
+
+---
+
+## Round 394 — Validator 審查 Risk #1/#2 實作修補（2026-03-10）
+
+### 目標
+依 Code Review Round 393 建議，修正 production 使 tests/typecheck/lint 全過；不改 tests 邏輯，僅移除已過期之 `@unittest.expectedFailure` 並修測試內未使用變數（lint）。
+
+### 本輪修改（production）
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/validator.py` | **Risk 1**：`validate_once` 內 `is_upgrade` 改為依「已存 result 是否為 MATCH」判斷。新增 `stored = existing_results[key].get("result")`、`stored_is_match = stored is True or stored == 1 or (isinstance(stored, float) and not pd.isna(stored) and stored == 1.0)`，`is_upgrade = not is_new and res["result"] and not stored_is_match`，使 PENDING（result=NaN/None）→ MATCH 會正確覆寫並寫回 DB。 |
+| `trainer/validator.py` | **Risk 2**：`save_validation_results` 新增 `_session_id_safe(v)`：None/NaN → None；int/float → str(int(v))；其餘先 try 再 fallback str(v)，避免 `int(r.session_id)` 在 session_id=`"abc"` 時拋 ValueError。寫入時改用 `_session_id_safe(getattr(r, "session_id", None))`。 |
+
+### 本輪修改（tests — 僅過期 decorator 與 lint）
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `tests/test_review_risks_validator_round393.py` | 移除 `TestValidatorRound393Risk1IsUpgrade::test_is_upgrade_logic_handles_nan_stored_result` 與 `TestValidatorRound393Risk2SessionId::test_save_validation_results_accepts_non_numeric_session_id` 的 `@unittest.expectedFailure`（修補後預期通過）。移除未使用變數 `fragile` 以通過 ruff F841。 |
+
+### 驗證結果（本輪後）
+
+- **pytest**（僅 Round393 風險測試）：`7 passed in 0.34s`
+- **pytest**（全套）：`886 passed, 41 skipped`
+- **mypy**：`python -m mypy trainer/validator.py --ignore-missing-imports` → **Success: no issues found in 1 source file**
+- **ruff**：`ruff check trainer/validator.py tests/test_review_risks_validator_round393.py` → **All checks passed!**
+
+### PLAN 狀態（本輪後）
+
+- 無新增 PLAN todo；Round 393 審查修補為對「Validator 對齊舊版」之跟進，第 14 項維持 completed。
+- **剩餘項目**：見 PLAN「接下來要做的事」表 1～14 項均 **completed**；剩餘為可選／後續，無未完成項。

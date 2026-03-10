@@ -29,6 +29,9 @@ todos:
   - id: step8-validator
     content: "Step 8：更新 validator.py（canonical_id；45min horizon；gaming day 去重；僅驗證 rated 觀測）"
     status: completed
+  - id: validator-align-old
+    content: "Validator 對齊舊版：移除 Visit-level 精準度、精準度輸出與 validator_old 一致、註解 within a visit → within a run（保留 canonical_id 與資料清洗）"
+    status: completed
   - id: step9-api
     content: "Step 9：更新 api_server.py（/score /health /model_info；422 schema 驗證；單一模型）"
     status: completed
@@ -130,8 +133,9 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 11 | **Optuna 整份 study 的 early stop** | completed | 下方「Optuna 整份 study 的 early stop（計畫）」一節。 |
 | 12 | **api_server 還原為 DB-only** | completed | 下方「api_server 還原為 DB-only 計畫」一節；已實作並通過 tests/typecheck/lint。 |
 | 13 | **Scorer 預設移至 config** | completed | config.py：SCORER_LOOKBACK_HOURS、SCORER_POLL_INTERVAL_SECONDS；scorer 的 --lookback-hours / --interval 從 config 讀；供 trainer 對齊 Track Human/LLM lookback。 |
+| 14 | **Validator 對齊舊版（僅 alert-level）** | completed | 移除 Visit-level 精準度、精準度輸出與 validator_old 一致、註解 within a visit → within a run；保留 canonical_id 與資料清洗。見 Step 8 下方「Validator 對齊舊版（僅 alert-level）」一節。Round 393 實作。 |
 
-**Plan 狀態摘要**：上表 1～13 項均為 **completed**。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。
+**Plan 狀態摘要**：上表 1～14 項均為 **completed**。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
 
 **剩餘項目**：上表「接下來要做的事」**無未完成項**；以下為可選／後續，非阻斷。
 
@@ -656,9 +660,24 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 - Horizon = `LABEL_LOOKAHEAD_MIN = 45`（from config）
 - 分組鍵改用 `canonical_id`（D2）
 - Ground truth：`t_bet FINAL` 時間序列，警報後 45 分鐘內出現 ≥ `WALKAWAY_GAP_MIN` 間隔
-- 去重：同 Step 6（gaming day 邊界）
 - 回寫欄位新增 `model_version`, `canonical_id`, `threshold_used`, `margin`
 - **僅驗證 rated 觀測的 ground truth；無卡客不存在警報，故不需驗證。**
+
+#### Validator 對齊舊版（僅 alert-level）
+
+**目標**：精準度只做 alert-level、與 `validator_old.py` 一致；保留 canonical_id 與資料清洗（FINAL、chunk、R59、R41 等）。
+
+**修改項目**：
+
+| 項目 | 位置 | 動作 |
+|------|------|------|
+| 1. 移除 Visit-level 精準度 | `validate_once()` 約 967–994 行 | 刪除整段 Visit-level 邏輯：註解「Visit-level dedup…」、`_gd_start_h`、`_bet_ts_dt`、`_gaming_day`、`_visit_key`、`visit_matches`/`visit_total`/`visit_precision` 計算、兩處 print（Visit-level Precision / Visit-level metrics skipped）。保留其後的 `final_df["alert_ts_dt"]` 及 sort/save/print。 |
+| 2. 精準度輸出與舊版一致 | 同函式內 | 將 `print(f"[validator] Cumulative Precision (15m window, alert-level): ...")` 改為 `print(f"[validator] Cumulative Precision (15m window): {precision:.2%} ({matches}/{total})")`（移除字串中的 `", alert-level"`）。 |
+| 3. 註解用語修正 | `fetch_sessions_by_canonical_id` docstring 約 206 行 | 將 `within a visit` 改為 `within a run`。 |
+
+**不變更**：canonical_id、fetch 邏輯（FINAL、chunk、R59、R41）、schema、`model_version`。
+
+**驗收**：僅一處 precision 的 print，內容為「Cumulative Precision (15m window):」；無 Visit-level 相關程式與註解；docstring 為「within a run」。
 
 ---
 
