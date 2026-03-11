@@ -67,6 +67,16 @@ from sklearn.metrics import average_precision_score, precision_recall_curve
 from sklearn.model_selection import train_test_split
 from zoneinfo import ZoneInfo
 
+try:
+    from tqdm import tqdm as _tqdm_bar
+except ImportError:
+    def _tqdm_bar(**kwargs: Any) -> Any:
+        """No-op progress bar when tqdm is not installed (PLAN § Step 6 進度條)."""
+        class _NoopBar:
+            def update(self, n: int = 1) -> None: pass  # noqa: E701
+            def close(self) -> None: pass  # noqa: E701
+        return _NoopBar()
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logging.basicConfig(
     level=logging.INFO,
@@ -385,13 +395,15 @@ def build_canonical_links_and_dummy_from_duckdb(
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"Session Parquet not found: {path}")
 
-    # Required columns for view and filters (Round 253 Review #1)
+    # Required columns for view and filters (Round 253 Review #1).
+    # PLAN canonical-step3-schema-check-oom: read only Parquet metadata to get column names,
+    # do not load any rows (pd.read_parquet(columns=...) still loads all rows and can OOM on huge session files).
     required = set(_CANONICAL_MAP_SESSION_COLS)
     try:
-        sample = pd.read_parquet(path, columns=list(required))
-        schema_names = set(sample.columns)
-    except KeyError as e:
-        raise ValueError(f"Session Parquet missing required columns: {e}") from e
+        import pyarrow.parquet as _pq_sess
+        schema_names = set(_pq_sess.read_schema(path).names)
+    except Exception as e:
+        raise ValueError(f"Session Parquet schema read failed: {e}") from e
     missing = required - schema_names
     if missing:
         raise ValueError(f"Session Parquet missing required columns: {sorted(missing)}")
@@ -1830,12 +1842,14 @@ def _chunk_cache_key(
     data_hash = hashlib.md5(
         pd.util.hash_pandas_object(bets, index=False).values.tobytes()
     ).hexdigest()[:8]
-    _lookback = getattr(_cfg, "SCORER_LOOKBACK_HOURS", None)
+    # Effective lookback: same logic as process_chunk (TRAINER_USE_LOOKBACK → SCORER_LOOKBACK_HOURS or None)
+    _use_lookback = getattr(_cfg, "TRAINER_USE_LOOKBACK", False)
+    _effective_lookback = getattr(_cfg, "SCORER_LOOKBACK_HOURS", None) if _use_lookback else None
     cfg_str = json.dumps({
         "WALKAWAY_GAP_MIN": WALKAWAY_GAP_MIN,
         "SESSION_AVAIL_DELAY_MIN": SESSION_AVAIL_DELAY_MIN,
         "HISTORY_BUFFER_DAYS": HISTORY_BUFFER_DAYS,
-        "SCORER_LOOKBACK_HOURS": _lookback,
+        "TRACK_HUMAN_LOOKBACK_HOURS": _effective_lookback,
     }, sort_keys=True)
     cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:6]
     return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}|spec{feature_spec_hash}|ns{neg_sample_frac:.4f}"
@@ -1973,9 +1987,11 @@ def process_chunk(
     # --- Track Human features (on FULL bets incl. history, cutoff=window_end) ---
     # Computing before label filtering ensures cross-chunk state (loss_streak,
     # run_boundary) uses historical context from HISTORY_BUFFER_DAYS before window_start.
-    # When SCORER_LOOKBACK_HOURS is set, restrict context to that many hours per row
-    # for train–serve parity with scorer (STATUS.md: trainer 對齊 Track Human/LLM).
-    _lookback_hours = getattr(_cfg, "SCORER_LOOKBACK_HOURS", None)
+    # When TRAINER_USE_LOOKBACK is True, use SCORER_LOOKBACK_HOURS for train–serve parity.
+    # Phase 1 unblock (PLAN § Track Human Lookback): default False so Step 6 uses
+    # vectorized no-lookback path and finishes in reasonable time (doc/track_human_lookback_vectorization_plan.md).
+    _use_lookback = getattr(_cfg, "TRAINER_USE_LOOKBACK", False)
+    _lookback_hours = getattr(_cfg, "SCORER_LOOKBACK_HOURS", None) if _use_lookback else None
     bets = add_track_human_features(bets, canonical_map, window_end, lookback_hours=_lookback_hours)
 
     # --- Track LLM: DuckDB + Feature Spec YAML (DEC-022/023/024) ---
@@ -4401,31 +4417,59 @@ def run_pipeline(args) -> None:
     )
     t0 = time.perf_counter()
     chunk_paths: List[Path] = []
-    if NEG_SAMPLE_FRAC_AUTO and len(chunks) > 0:
-        # OOM probe: process chunk 1 with frac=1.0, then decide effective frac.
-        print("[Step 6/10] OOM probe: chunk 1 with neg_sample_frac=1.0…", flush=True)
-        logger.info("OOM probe: processing chunk 1 with neg_sample_frac=1.0")
-        path1 = process_chunk(
-            chunks[0],
-            canonical_map,
-            dummy_player_ids=dummy_player_ids,
-            use_local_parquet=use_local,
-            force_recompute=force,
-            profile_df=profile_df,
-            feature_spec=feature_spec,
-            feature_spec_hash=feature_spec_hash,
-            neg_sample_frac=1.0,
-        )
-        if path1 is not None:
-            _path1 = Path(path1) if isinstance(path1, str) else path1
-            if getattr(_path1, "exists", lambda: False)() and _path1.is_file():
-                size_chunk1 = _path1.stat().st_size
-                _effective_neg_sample_frac = _oom_check_after_chunk1(
-                    size_chunk1, len(chunks), _effective_neg_sample_frac
-                )
-                if _effective_neg_sample_frac < 1.0:
-                    path1_rerun = process_chunk(
-                        chunks[0],
+    pbar = _tqdm_bar(total=len(chunks), desc="Step 6 chunks", unit="chunk")
+    try:
+        if NEG_SAMPLE_FRAC_AUTO and len(chunks) > 0:
+            # OOM probe: process chunk 1 with frac=1.0, then decide effective frac.
+            print("[Step 6/10] OOM probe: chunk 1 with neg_sample_frac=1.0…", flush=True)
+            logger.info("OOM probe: processing chunk 1 with neg_sample_frac=1.0")
+            path1 = process_chunk(
+                chunks[0],
+                canonical_map,
+                dummy_player_ids=dummy_player_ids,
+                use_local_parquet=use_local,
+                force_recompute=force,
+                profile_df=profile_df,
+                feature_spec=feature_spec,
+                feature_spec_hash=feature_spec_hash,
+                neg_sample_frac=1.0,
+            )
+            if path1 is not None:
+                _path1 = Path(path1) if isinstance(path1, str) else path1
+                if getattr(_path1, "exists", lambda: False)() and _path1.is_file():
+                    size_chunk1 = _path1.stat().st_size
+                    _effective_neg_sample_frac = _oom_check_after_chunk1(
+                        size_chunk1, len(chunks), _effective_neg_sample_frac
+                    )
+                    if _effective_neg_sample_frac < 1.0:
+                        path1_rerun = process_chunk(
+                            chunks[0],
+                            canonical_map,
+                            dummy_player_ids=dummy_player_ids,
+                            use_local_parquet=use_local,
+                            force_recompute=force,
+                            profile_df=profile_df,
+                            feature_spec=feature_spec,
+                            feature_spec_hash=feature_spec_hash,
+                            neg_sample_frac=_effective_neg_sample_frac,
+                        )
+                        if path1_rerun is not None:
+                            chunk_paths.append(path1_rerun)
+                            pbar.update(1)
+                        else:
+                            chunk_paths.append(path1)
+                            pbar.update(1)
+                    else:
+                        chunk_paths.append(path1)
+                        pbar.update(1)
+                else:
+                    # Path does not exist (e.g. test mock): skip size-based adjustment
+                    chunk_paths.append(path1)
+                    pbar.update(1)
+                gc.collect()
+                for chunk in chunks[1:]:
+                    path = process_chunk(
+                        chunk,
                         canonical_map,
                         dummy_player_ids=dummy_player_ids,
                         use_local_parquet=use_local,
@@ -4435,34 +4479,30 @@ def run_pipeline(args) -> None:
                         feature_spec_hash=feature_spec_hash,
                         neg_sample_frac=_effective_neg_sample_frac,
                     )
-                    if path1_rerun is not None:
-                        chunk_paths.append(path1_rerun)
-                    else:
-                        chunk_paths.append(path1)
-                else:
-                    chunk_paths.append(path1)
+                    if path is not None:
+                        chunk_paths.append(path)
+                        pbar.update(1)
+                    gc.collect()
             else:
-                # Path does not exist (e.g. test mock): skip size-based adjustment
-                chunk_paths.append(path1)
-            gc.collect()
-            for chunk in chunks[1:]:
-                path = process_chunk(
-                    chunk,
-                    canonical_map,
-                    dummy_player_ids=dummy_player_ids,
-                    use_local_parquet=use_local,
-                    force_recompute=force,
-                    profile_df=profile_df,
-                    feature_spec=feature_spec,
-                    feature_spec_hash=feature_spec_hash,
-                    neg_sample_frac=_effective_neg_sample_frac,
-                )
-                if path is not None:
-                    chunk_paths.append(path)
-                gc.collect()
+                # Chunk 1 empty: no probe decision, use _effective_neg_sample_frac for all.
+                for chunk in chunks:
+                    path = process_chunk(
+                        chunk,
+                        canonical_map,
+                        dummy_player_ids=dummy_player_ids,
+                        use_local_parquet=use_local,
+                        force_recompute=force,
+                        profile_df=profile_df,
+                        feature_spec=feature_spec,
+                        feature_spec_hash=feature_spec_hash,
+                        neg_sample_frac=_effective_neg_sample_frac,
+                    )
+                    if path is not None:
+                        chunk_paths.append(path)
+                        pbar.update(1)
+                    gc.collect()
         else:
-            # Chunk 1 empty: no probe decision, use _effective_neg_sample_frac for all.
-            for chunk in chunks:
+            for i, chunk in enumerate(chunks):
                 path = process_chunk(
                     chunk,
                     canonical_map,
@@ -4476,23 +4516,10 @@ def run_pipeline(args) -> None:
                 )
                 if path is not None:
                     chunk_paths.append(path)
+                    pbar.update(1)
                 gc.collect()
-    else:
-        for i, chunk in enumerate(chunks):
-            path = process_chunk(
-                chunk,
-                canonical_map,
-                dummy_player_ids=dummy_player_ids,
-                use_local_parquet=use_local,
-                force_recompute=force,
-                profile_df=profile_df,
-                feature_spec=feature_spec,
-                feature_spec_hash=feature_spec_hash,
-                neg_sample_frac=_effective_neg_sample_frac,
-            )
-            if path is not None:
-                chunk_paths.append(path)
-            gc.collect()
+    finally:
+        pbar.close()
 
     _el = time.perf_counter() - t0
     print("[Step 6/10] Process chunks done in %.1fs (%d chunks)" % (_el, len(chunk_paths)), flush=True)

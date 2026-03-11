@@ -2059,3 +2059,732 @@ python -m pytest tests/ -q --tb=line
 
 - 無新增 PLAN todo；Round 393 審查修補為對「Validator 對齊舊版」之跟進，第 14 項維持 completed。
 - **剩餘項目**：見 PLAN「接下來要做的事」表 1～14 項均 **completed**；剩餘為可選／後續，無未完成項。
+
+---
+
+## Phase 1 — Track Human Lookback 解封（PLAN § 項目 19）
+
+**目標**：Trainer 呼叫 `add_track_human_features` 時傳 `lookback_hours=None`（預設），使 Step 6 走向量化無 lookback 路徑，避免 7h+ 凍結。規格見 `doc/track_human_lookback_vectorization_plan.md`。
+
+### 本輪修改
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/config.py` | 新增 `TRAINER_USE_LOOKBACK = False`；註解說明 Phase 1 解封、Phase 2 向量化後可設 True 以達 train–serve parity。 |
+| `trainer/trainer.py` | `process_chunk`：依 `TRAINER_USE_LOOKBACK` 決定 `_lookback_hours`（True→SCORER_LOOKBACK_HOURS，False→None），再傳入 `add_track_human_features`。`_chunk_cache_key`：改為使用 effective lookback（同上邏輯），cfg 鍵名改為 `TRACK_HUMAN_LOOKBACK_HOURS`，使 cache 與實際計算一致、切換 config 時正確 bust cache。 |
+
+### 手動驗證
+
+- 預設 `TRAINER_USE_LOOKBACK=False` 時，Step 6 應走無 lookback 路徑，chunk 處理時間與改動前「無 lookback」行為相當。
+- 設 `config.TRAINER_USE_LOOKBACK = True` 且 `SCORER_LOOKBACK_HOURS=8` 時，行為與改動前一致（8h lookback）；若資料量大仍可能 7h+，僅在 Phase 2 向量化後建議常開。
+- 切換 `TRAINER_USE_LOOKBACK` 後重跑 pipeline，cache key 不同，應強制重算對應 chunk（不沿用舊 Parquet）。
+
+### 下一步建議
+
+- 實作 **Step 6 進度條（tqdm）**（同 PLAN § 項目 19），以便長時間 Step 6 有進度與 ETA。
+- Phase 2：numba two-pointer 向量化 lookback，完成後可將 `TRAINER_USE_LOOKBACK` 設為 True 達成完整 train–serve parity。
+
+### pytest 結果（本輪後）
+
+```
+2 failed, 927 passed, 41 skipped, 192 warnings in 42.64s
+```
+
+失敗的兩個測試均為 integration 測試（`test_fast_mode_integration.py::TestRecentChunksPropagation::test_process_chunk_called_once_for_one_chunk`、`test_recent_chunks_integration.py::TestRecentChunksIntegration::test_recent_chunks_propagates_effective_window`），預期在 **NEG_SAMPLE_FRAC_AUTO=True** 時會多一次 OOM probe 的 `process_chunk` 呼叫。目前 `config.py` 中 **NEG_SAMPLE_FRAC_AUTO = False**，故不會進入 OOM probe 分支，call 次數少 1，與本輪 Phase 1 程式改動無關。若需通過上述兩項測試，可暫時將 config 設為 `NEG_SAMPLE_FRAC_AUTO = True` 或於測試中 patch 該值。
+
+---
+
+## Step 6 進度條（tqdm）（PLAN § 項目 19）
+
+**目標**：Process chunks 時顯示進度與 ETA，避免長時間無輸出被誤判為凍結。規格見 PLAN「Track Human Lookback 向量化與 Step 6 進度條」與 `doc/track_human_lookback_vectorization_plan.md` §6。
+
+### 本輪修改
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/trainer.py` | **tqdm 引入**：try/import `tqdm` 為 `_tqdm_bar`；若未安裝則 fallback 為 no-op（回傳具 `update(n)`、`close()` 的 dummy 物件），避免無 tqdm 環境報錯。**Step 6**：在 `t0` 與 `chunk_paths=[]` 之後建立 `pbar = _tqdm_bar(total=len(chunks), desc="Step 6 chunks", unit="chunk")`；在所有 `chunk_paths.append(...)` 之後呼叫 `pbar.update(1)`（涵蓋 OOM probe 後 path1_rerun/path1、chunks[1:]、path1 為 None 時整份 chunks、以及非 AUTO 的 enumerate(chunks) 分支）；以 `try/finally` 確保 `pbar.close()`。 |
+
+### 手動驗證
+
+- 執行 pipeline（例如 `--recent-chunks 3` 或完整 window）：Step 6 執行時終端應顯示 tqdm 進度條（如 `Step 6 chunks:  30%\|███       \| 3/10 [00:05<00:12, 1.2chunk/s]`），完成後 bar 關閉。
+- 若卸載 tqdm 後再跑：不應報錯，僅無進度條（no-op bar）。
+
+### 下一步建議
+
+- Phase 2：numba two-pointer 向量化 lookback（`compute_loss_streak` / `compute_run_boundary`），完成後可將 `TRAINER_USE_LOOKBACK` 設為 True 達成完整 train–serve parity。
+- 可選：將 PLAN 項目 19（Track Human Lookback 向量化 + Step 6 進度條）標為 completed（Phase 1 解封與 Step 6 進度條已完成）。
+
+### pytest 結果（本輪後）
+
+```
+929 passed, 41 skipped, 192 warnings in 46.34s
+```
+
+---
+
+## Phase 2 — compute_loss_streak lookback 向量化（PLAN § 項目 19，第 1 步）
+
+**目標**：以 numba two-pointer 單 pass 實作 `compute_loss_streak` 的 lookback 分支，替換 per-row Python 迴圈，使 `TRAINER_USE_LOOKBACK=True` 時 Step 6 不致 7h+ 凍結。規格見 `doc/track_human_lookback_vectorization_plan.md` §5。
+
+### 本輪修改
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/features.py` | **Numba 核心**：新增 `_streak_lookback_numba`（try/import numba，失敗則為 None）：two-pointer 單 pass，輸入 times(int64 ns)、status(int8 1=LOSE,2=WIN,3=PUSH)、push_resets、delta_ns、out(int32)；視窗 (t_i−δ, t_i]、F4 語意不變。**lookback 分支**：優先走 numba 路徑（按 canonical_id 分組，轉 times/status 陣列後呼叫 JIT，組裝 Series）；若 numba 不可用或執行期異常則 fallback 既有 Python 迴圈；fallback 且 len(df)>100_000 時 log 警告。 |
+| `tests/test_review_risks_lookback_hours_trainer_align.py` | 新增 `test_compute_loss_streak_lookback_numba_parity_with_python_fallback`：patch `_streak_lookback_numba` 為 None 得 Python 路徑結果，與 numba 路徑結果 assert Series 相等。 |
+
+### 手動驗證
+
+- 設 `TRAINER_USE_LOOKBACK=True`、`SCORER_LOOKBACK_HOURS=8`，以 1 個月 chunk 跑 Step 6：應在合理時間內完成（不再 7h+）；與 Phase 1 無 lookback 時同 chunk 的輸出欄位一致。
+- 卸載 numba 或 mock 失敗：應自動 fallback 至 Python 路徑，大資料時有 warning log。
+
+### 下一步建議
+
+- **Phase 2 第 2 步**：對 `compute_run_boundary` 實作相同策略（numba two-pointer lookback，fallback 既有迴圈），並加 parity 測試。
+- 兩者完成後可將 PLAN 項目 19 標為 completed，並視需要將 `TRAINER_USE_LOOKBACK` 預設改為 True（完整 train–serve parity）。
+
+### pytest 結果（本輪後）
+
+```
+930 passed, 41 skipped, 192 warnings in 32.08s
+```
+
+---
+
+## Code Review：Phase 2 compute_loss_streak lookback 向量化
+
+**範圍**：`trainer/features.py` 之 `_streak_lookback_numba` 與 lookback 分支（numba 路徑 + fallback）、`tests/test_review_risks_lookback_hours_trainer_align.py` 之 parity 測試。  
+**依據**：PLAN.md 項目 19、`doc/track_human_lookback_vectorization_plan.md` §3 語意契約、DECISION_LOG（Track Human train–serve parity）。
+
+以下列出**最可能的 bug / 邊界條件 / 安全性 / 效能問題**，每項附**具體修改建議**與**希望新增的測試**。
+
+---
+
+### 1. [Bug/邊界] NaT 在 numba 路徑下導致錯誤或未定義行為
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | numba 路徑中 `times_ns = pd.to_datetime(grp["payout_complete_dtm"], utc=False).astype("int64")`：若存在 `NaT`，pandas 會轉成 numpy 的 iNaT（例如 `-9223372036854775808`）。傳入 numba 後，`t_i - delta_ns`、`times[lo] <= lo_bound` 等比較與 two-pointer 的單調假設會被破壞，可能得到錯誤 streak 或未定義行為。現有 `test_lookback_with_nat_does_not_crash` 只要求不崩潰、不檢查數值正確性。 |
+| **具體修改建議** | **方案 A（建議）**：進入 numba 路徑前，在每個 group 內檢查 `grp["payout_complete_dtm"].isna().any()`；若該 group 有 NaT，則該 group 改走 Python 迴圈（或整段 fallback）。**方案 B**：在 sort 後、分組前，對全表做 `df = df[df["payout_complete_dtm"].notna()]`，並在 docstring 註明 lookback 路徑會排除 NaT 列（與無 lookback 路徑行為可能不一致，需評估）。 |
+| **希望新增的測試** | 建立小 fixture：同一 canonical_id 內一筆 NaT、一筆正常時間，`lookback_hours=1`。Assert：結果長度與輸入一致、無 exception；且 **numba 路徑**與 **fallback 路徑**（patch `_streak_lookback_numba` 為 None）輸出一致；或明確規定「含 NaT 時 fallback」並 assert 該 group 未用 numba。 |
+
+---
+
+### 2. [邊界] 極大 lookback_hours 導致 delta_ns 或整數溢出
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `delta_ns = int(float(lookback_hours) * 1e9 * 3600)` 後以 `np.int64(delta_ns)` 傳入 numba。若 `lookback_hours` 極大（例如 1e6），`delta_ns` 可能超過 `2^63-1`，轉成 int64 時溢出為負數，two-pointer 邏輯錯誤。 |
+| **具體修改建議** | 在計算 `delta_ns` 後、傳入 numba 前，檢查 `0 < delta_ns <= (2**63 - 1)`（或取合理上限，例如 1000 小時對應的 ns）。若超出則 raise `ValueError("lookback_hours too large for lookback computation")` 或在 docstring 註明上限，並在呼叫處避免傳入過大值。 |
+| **希望新增的測試** | `test_compute_loss_streak_lookback_hours_overflow`：`lookback_hours=1e10`（或會使 delta_ns 超過 int64 的值）時，assert 拋出 `ValueError` 或結果仍為合理（若改為 clamp 則 assert 不拋錯且輸出與小 lookback 一致或文件化行為）。 |
+
+---
+
+### 3. [邊界] streak 值理論上可能超過 int32 範圍
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 回傳型別為 `pd.Series` 的 int32。若視窗內連續 LOSE 次數超過 `2^31-1`，numba 內 `streak += 1` 與 `out[i] = streak` 會溢出。實務上 8h 內筆數有限，但規格未禁止極端輸入。 |
+| **具體修改建議** | 在 numba 內寫入前 clamp：`out[i] = min(streak, 2147483647)`，或在 docstring 註明「視窗內連續 LOSE 超過 2^31-1 時行為未定義／以 2^31-1 為上限」。若選擇 clamp，需與無 lookback 路徑一致（該路徑亦為 int32）。 |
+| **希望新增的測試** | 可選：人造資料，單一 canonical_id、同一秒內 2^31 筆 LOSE（或模擬），assert 不崩潰且回傳為 int32；若採 clamp 則 assert 最大值為 2147483647。 |
+
+---
+
+### 4. [邊界/相容性] status 非字串（例如 Categorical）時 .map 行為
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `grp["status"].map({"LOSE": 1, "WIN": 2, "PUSH": 3})` 假設 `status` 為字串。若上游傳入 Categorical 或數字編碼，`.map` 可能全部得到 NaN（fillna(0) 後全為 0），streak 恆為 0，與預期不符。 |
+| **具體修改建議** | 在 numba 路徑取 status 前，先做 `grp["status"] = grp["status"].astype(str).str.strip().str.upper()`（或至少 `astype(str)`），再 `.map({"LOSE": 1, "WIN": 2, "PUSH": 3})`，以與 Python 路徑的 `== "LOSE"` 等比較一致；或於 docstring 明確要求「status 須為 'LOSE'/'WIN'/'PUSH' 字串」。 |
+| **希望新增的測試** | `test_compute_loss_streak_lookback_status_categorical_or_numeric`：status 為 Categorical(["LOSE","WIN"]) 或整數編碼（0=LOSE, 1=WIN）時，assert 結果與字串版一致，或明確 assert 拋錯／文件化「僅支援字串」。 |
+
+---
+
+### 5. [效能] 部分 group 失敗時整段 fallback 的開銷
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 目前設計為：numba 任一群組拋錯即 catch、整段改走 Python。若僅少數 group（例如含 NaT）有問題，仍會對全表重算，大表時浪費 numba 已算完的群組。 |
+| **具體修改建議** | 短期可維持現狀（實作簡單、正確性優先）。若後續優化：可改為「 per-group try/except」：單一 group 失敗時僅該 group 用 Python 迴圈，其餘群組仍用 numba，並 log 該 group 的 canonical_id；需注意 out_list 與 index 對齊。 |
+| **希望新增的測試** | 可選：mock 讓第二個 group 呼叫 numba 時拋錯，assert 最終結果與「全部 fallback」結果一致（parity），且 log 中有 fallback 或 warning。 |
+
+---
+
+### 6. [正確性] 與 Python 路徑的 index 與 reindex 一致
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 回傳 Series 的 index 應為 `df.index`（cutoff 後、sort 後的 DataFrame）。numba 路徑以 `grp.index` 與 `out_arr` 對應後組裝 `out_list`，再 `Series(..., dtype="int32").reindex(df.index, fill_value=0)`。若 groupby 時出現重複 index 或順序與 `df.index` 不一致，理論上可能錯位。目前 groupby("canonical_id", sort=False) 會保持 df 的列順序，且每個 index 只會出現在一個 group，風險低，但仍屬契約一環。 |
+| **具體修改建議** | 在單元測試中明確 assert：對同一 `df`，numba 路徑回傳的 `result.index.equals(df.index)` 且 `len(result) == len(df)`；並與 fallback 路徑 `pd.testing.assert_series_equal(..., check_index=True)`。 |
+| **希望新增的測試** | 在既有 `test_compute_loss_streak_lookback_numba_parity_with_python_fallback` 中加上 `check_index=True`（若尚未）；另加一筆「多個 canonical_id、每組筆數不同」的 fixture，assert 兩路徑結果 index 完全一致且與 `df.index` 一致。 |
+
+---
+
+### 7. [可維護性] numba 載入失敗時靜默 fallback
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `try: from numba import ... except Exception: _streak_lookback_numba = None` 會吞掉所有異常（含 SyntaxError、版本不相容）。部署環境若缺 numba 或版本不合，會靜默走 Python 路徑，大資料時變慢且無明確 log。 |
+| **具體修改建議** | 區分「預期無 numba」與「未預期錯誤」：僅 catch `ImportError`（與可選的 `ModuleNotFoundError`），其餘讓其傳播；或在首次 fallback 時（例如在 `except Exception` 內）打一筆 `logger.warning("numba not available for compute_loss_streak lookback; using Python path")`，並在 doc 註明 numba 為可選依賴。 |
+| **希望新增的測試** | 在無 numba 環境（或 patch 讓 import 失敗）下執行 lookback 路徑，assert 不拋錯且結果與有 numba 時一致；並可選 assert 日誌中出現預期的 warning。 |
+
+---
+
+**總結**：優先建議處理 **#1（NaT）** 與 **#2（delta_ns 上限）**，並補上對應測試；**#3–#5** 可依風險與成本取捨；**#6–#7** 可納入既有測試與 log 策略。審查結果已追加至 STATUS.md，後續實作可依此逐項關閉。
+
+---
+
+### 審查風險 → 最小可重現測試（僅 tests，未改 production）
+
+已將上述 7 項風險轉成最小可重現測試或斷言，僅新增/調整 tests，**未修改 production code**。
+
+**檔案**：`tests/test_review_risks_lookback_hours_trainer_align.py`
+
+**新增／調整內容**：
+
+| Review # | 測試名稱 | 說明 |
+|----------|----------|------|
+| #1 | `TestPhase2LookbackReviewRisks::test_review1_nat_numba_parity_with_fallback` | 同一 canonical_id 內一筆 NaT、一筆正常時間，assert numba 路徑與 fallback 路徑輸出一致。目前 **@unittest.expectedFailure**（numba 未處理 NaT 導致不一致）。 |
+| #2 | `test_review2_lookback_hours_overflow_no_crash_or_overflow_raised` | `lookback_hours=1e10` 時要不不崩潰且結果長度正確，要不拋出 overflow 相關異常（ValueError / OutOfBoundsTimedelta / OverflowError）。 |
+| #2 | `test_review2_lookback_hours_overflow_raises_value_error_or_overflow` | 契約：過大 lookback 應 raise ValueError；目前 fallback 拋 OutOfBoundsTimedelta 時 **skip**，文件化「期望 upfront ValueError」。 |
+| #3 | `test_review3_return_dtype_int32_and_no_crash_large_window` | 500 筆 LOSE、lookback 2h：assert 回傳 dtype 為 int32、不崩潰、值 ≥0。 |
+| #4 | `test_review4_status_categorical_parity_with_string` | status 為 Categorical 時結果與字串版一致（assert_series_equal）。 |
+| #5 | `test_review5_partial_fallback_parity_with_full_fallback` | 多 group fixture：numba 路徑結果與全 fallback 結果一致。 |
+| #6 | 既有 `test_compute_loss_streak_lookback_numba_parity_with_python_fallback` | 補上 **check_index=True**、`result.index.equals(df.index)`、`len(result)==len(df)`。 |
+| #6 | `test_review6_index_equals_df_index_multi_cid` | 多個 canonical_id、每組筆數不同，assert 兩路徑 index 與 `df.index` 一致且兩路徑結果一致。 |
+| #7 | `test_review7_no_numba_result_equals_with_numba` | patch numba 為 None 時不拋錯，結果與有 numba 時一致。 |
+
+**執行方式**：
+
+```bash
+# 僅跑 Phase 2 審查風險測試
+python -m pytest tests/test_review_risks_lookback_hours_trainer_align.py::TestPhase2LookbackReviewRisks -v
+
+# 跑整份 lookback 相關測試（含既有 + Phase 2 審查）
+python -m pytest tests/test_review_risks_lookback_hours_trainer_align.py -v
+```
+
+**本輪執行結果**：`16 passed, 1 skipped, 1 xfailed`（xfail = #1 NaT parity，skip = #2 契約「upfront ValueError」未實作時之 skip）。
+
+---
+
+### 實作修正（Review #1 / #2）— 直至 tests / typecheck / lint 通過
+
+**修改內容**（僅 production + 移除過期 decorator）：
+
+1. **Review #2（delta_ns 溢出）**：在 `trainer/features.py` lookback 分支中，計算 `delta_ns` 後加入上限檢查：`delta_ns <= 0` 或 `delta_ns > 1000*3600*10**9` 時 `raise ValueError("lookback_hours must be positive and not exceed 1000 hours for lookback computation")`，避免 int64 / pd.Timedelta 溢出。
+2. **Review #1（NaT）**：numba 路徑中，對每個 `canonical_id` group 若 `grp["payout_complete_dtm"].isna().any()`，該 group 改走與 fallback 相同的 per-group Python 迴圈（不呼叫 numba），其餘 group 仍用 numba；並在 lookback 分支開頭建立 `delta = pd.Timedelta(hours=float(lookback_hours))` 供 NaT-group 與 fallback 共用。
+3. **測試**：移除 `test_review1_nat_numba_parity_with_fallback` 的 `@unittest.expectedFailure`（實作修正後測試通過，decorator 過時）。
+
+**驗證指令與結果**：
+
+```bash
+# 全量 pytest
+python -m pytest -q
+# 938 passed, 41 skipped, 192 warnings in 45.75s
+
+# typecheck
+mypy trainer/ --ignore-missing-imports
+# Success: no issues found in 23 source files
+
+# lint（僅 trainer/，本輪未改 tests）
+ruff check trainer/
+# All checks passed!
+```
+
+**說明**：`ruff check trainer/ tests/` 仍有 31 個既有錯誤（E402/F401 等於其他測試檔），非本輪修改引入；依「不改 tests 除非測試錯或 decorator 過時」未改動該等檔案。本輪修改之 `trainer/features.py` 與移除 decorator 之單一測試檔通過 pytest / mypy / ruff（trainer/）。
+
+---
+
+## PLAN 下一步 1–2 步：compute_run_boundary lookback 契約對齊（2026-03-11）
+
+**依據**：PLAN.md 項目 19（Phase 2 **compute_run_boundary** lookback 向量化尚待實作）、STATUS.md Phase 2 compute_loss_streak 已做 delta_ns 上限與 NaT 處理；`doc/track_human_lookback_vectorization_plan.md` §3 語意契約。
+
+**本輪僅實作 1–2 步**：不實作 numba two-pointer，先讓 run_boundary lookback 與 loss_streak 的「過大 lookback 契約」一致。
+
+### 改動檔案
+
+| 檔案 | 改動摘要 |
+|------|----------|
+| `trainer/features.py` | 在 `compute_run_boundary` 的 lookback 分支開頭（`if lookback_hours is not None and lookback_hours > 0` 內）加入與 `compute_loss_streak` 相同的 **delta_ns 上限檢查**：`delta_ns = int(float(lookback_hours) * 1e9 * 3600)`，若 `delta_ns <= 0` 或 `delta_ns > 1000*3600*10**9` 則 `raise ValueError("lookback_hours must be positive and not exceed 1000 hours for lookback computation")`，避免 int64 / pd.Timedelta 溢出。 |
+| `tests/test_review_risks_lookback_hours_trainer_align.py` | 在 `TestLookbackPathSemantics` 中新增 **`test_run_boundary_lookback_hours_overflow_raises_value_error`**：以 `compute_run_boundary(..., lookback_hours=1e10)` 呼叫，assert 拋出 `ValueError` 且訊息含 "lookback"。 |
+
+### 手動驗證
+
+```bash
+# 僅跑 lookback 相關測試（含新 run_boundary overflow 測試）
+python -m pytest tests/test_review_risks_lookback_hours_trainer_align.py -v
+
+# 全量測試
+python -m pytest -q
+```
+
+### 下一步建議
+
+- **Phase 2 compute_run_boundary 向量化（numba）**：對 `compute_run_boundary` 的 lookback 分支實作與 `compute_loss_streak` 同策略的 numba two-pointer 單 pass（或 per-group 狀態機），並提供無 numba 時的 Python fallback；必要時對 NaT 做 per-group fallback。規格見 `doc/track_human_lookback_vectorization_plan.md` §5.1。
+- 完成後可將 PLAN 項目 19 標為 completed（或僅將 run_boundary 子項標為完成），並可選將 `TRAINER_USE_LOOKBACK` 預設改為 True。
+
+### pytest 結果（本輪後）
+
+```
+939 passed, 41 skipped, 192 warnings in 46.07s
+```
+
+---
+
+## Code Review：compute_run_boundary lookback 契約對齊變更（2026-03-11）
+
+**範圍**：STATUS.md「PLAN 下一步 1–2 步」之變更——`trainer/features.py` 在 `compute_run_boundary` 的 lookback 分支開頭加入 delta_ns 上限檢查並 `raise ValueError`；`tests/test_review_risks_lookback_hours_trainer_align.py` 新增 `test_run_boundary_lookback_hours_overflow_raises_value_error`。  
+**依據**：PLAN.md 項目 19、DECISION_LOG（Track Human train–serve parity）、`doc/track_human_lookback_vectorization_plan.md` §3 語意契約。
+
+以下僅列與**本輪變更**或**受影響路徑**最相關的 bug／邊界／安全性／效能項目；每項附**具體修改建議**與**希望新增的測試**。不重寫整套實作。
+
+---
+
+### 1. [邊界] run_boundary lookback 路徑未處理 NaT，與 loss_streak 契約不一致
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `compute_loss_streak` 的 lookback 已依 Review #1 對「含 NaT 的 group」改走 per-group Python 迴圈，語意明確。`compute_run_boundary` 的 lookback 分支未做類似的 NaT 檢查：`times = pd.to_datetime(grp["payout_complete_dtm"], utc=False)` 後若存在 NaT，則 `t - delta` 為 NaT，`(times > lo) & (times <= t)` 的比較結果可能全為 False 或未定義，導致該列得到 (run_id=0, min_since=0, …) 或錯誤值，與「不崩潰且語意可預期」的契約不一致。 |
+| **具體修改建議** | **方案 A（建議）**：在 run_boundary lookback 的 `for cid, grp in df.groupby(...)` 迴圈內，若 `grp["payout_complete_dtm"].isna().any()`，則該 group 比照 loss_streak 的 NaT 處理：對該 group 逐列用 Python 迴圈計算（或明確將 NaT 列視為「空視窗」並寫入 0），避免 NaT 參與比較。**方案 B**：在 docstring 註明「lookback 路徑下 `payout_complete_dtm` 不得含 NaT；若有則行為未定義」，並在呼叫端（trainer/scorer）保證傳入前已過濾或填補。 |
+| **希望新增的測試** | 建立小 fixture：同一 canonical_id 內一筆 NaT、一筆正常時間，`lookback_hours=1`，呼叫 `compute_run_boundary`。Assert：不拋錯、回傳長度與輸入一致、含 NaT 的列有明確語意（例如 run_id / minutes_since_run_start / bets_in_run_so_far 為 0 或與文件一致）；若採方案 A，可再 assert 與「手動預期」一致。 |
+
+---
+
+### 2. [可維護性] 1000 小時上限與錯誤訊息在兩處重複
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `compute_loss_streak` 與 `compute_run_boundary` 的 lookback 分支各自定義 `_max_delta_ns = 1000 * 3600 * 10**9` 及相同字串 `"lookback_hours must be positive and not exceed 1000 hours for lookback computation"`。日後若調整上限或文案，需改兩處，易遺漏。 |
+| **具體修改建議** | 在 `features.py` 模組頂層（常數區）定義單一 SSOT，例如：`_LOOKBACK_MAX_HOURS = 1000`、`_LOOKBACK_MAX_DELTA_NS = _LOOKBACK_MAX_HOURS * 3600 * 10**9`，以及共用錯誤訊息字串或小 helper（如 `_raise_lookback_hours_bounds(delta_ns, max_ns)`）；兩函數的 lookback 分支改為使用該常數／helper。 |
+| **希望新增的測試** | 現有 overflow 測試已間接覆蓋「超過上限必拋錯」；可選：新增一則測試 assert 兩函數在 `lookback_hours=1e10` 時拋出的 `ValueError` 訊息相同（或至少均含 "1000"），以鎖定契約一致性。 |
+
+---
+
+### 3. [契約／回歸] 新測試僅斷言訊息含 "lookback"，未鎖定完整契約
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `test_run_boundary_lookback_hours_overflow_raises_value_error` 僅 `assertIn("lookback", str(ctx.exception).lower())`。若日後有人將錯誤改為 "invalid window" 等，仍會通過測試，但與 `compute_loss_streak` 的「1000 hours」契約不一致，呼叫端也無法依訊息區分「過大 lookback」與其他錯誤。 |
+| **具體修改建議** | 在該測試中至少再 assert 訊息含 **"1000"**（或 "exceed"），以鎖定「不得超過 1000 小時」的契約；若採用 §2 的共用訊息，可改為 assert 與 `compute_loss_streak(..., lookback_hours=1e10)` 拋出的 `ValueError` 訊息相同。 |
+| **希望新增的測試** | 在既有 `test_run_boundary_lookback_hours_overflow_raises_value_error` 內補上 `self.assertIn("1000", str(ctx.exception))`；或新增一則 `test_run_boundary_and_loss_streak_overflow_message_consistent`：兩者在 `lookback_hours=1e10` 時皆拋 ValueError 且訊息一致。 |
+
+---
+
+### 4. [邊界] float 轉 int 的截斷與極小正數
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `delta_ns = int(float(lookback_hours) * 1e9 * 3600)`：若 `lookback_hours` 為極小正數（如 1e-15），乘積可能小於 1，`int()` 截斷為 0，觸發 `delta_ns <= 0` 而 raise。此為預期（拒絕非正或無效視窗）；但若上游傳入「接近 0 但意圖有效」的數值（如 1e-9 小時），會被拒絕。 |
+| **具體修改建議** | 維持現狀即可；若需支援極小 lookback，可在 docstring 註明「lookback_hours 換算成 ns 後須為正整數，實務上建議 ≥ 對應 1 秒的小時數」。無需放寬檢查。 |
+| **希望新增的測試** | 可選：`lookback_hours=1e-15` 或 `1e-9` 時 assert 拋出 ValueError，以文件化「過小視窗會被拒絕」的邊界。 |
+
+---
+
+### 5. [效能] run_boundary lookback 仍為 O(N×B) Python 迴圈
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 本輪僅增加 delta_ns 檢查，未改動迴圈邏輯。`compute_run_boundary` 的 lookback 分支仍為 per-row 雙層迴圈，大表（如 25M 列）時與原問題相同：耗時 7h+、無進度輸出。此為已知待辦（PLAN 項目 19 Phase 2 numba 向量化），非本輪引入。 |
+| **具體修改建議** | 無需在本輪變更中修改；依 PLAN 後續實作 numba two-pointer（或等價單 pass）並保留 Python fallback。 |
+| **希望新增的測試** | 無（效能目標由 Phase 2 向量化與既有 smoke 測試涵蓋）。 |
+
+---
+
+### 6. [正確性] 空 DataFrame 與 lookback_hours > 0 路徑
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 目前 `bets_df.empty` 時在 L509–514 即 return，不會進入 lookback 分支，故不會執行 delta_ns 檢查。行為正確：無需對空表做上限檢查。 |
+| **具體修改建議** | 無需修改。 |
+| **希望新增的測試** | 無（既有 empty 路徑已有覆蓋或可依需求補空表 + lookback_hours 的 smoke）。 |
+
+---
+
+**總結**：建議優先處理 **#1（NaT）** 與 **#3（測試契約鎖定 "1000"）**；**#2（常數共用）** 可提升可維護性；**#4–#6** 可依風險取捨或僅文件化。審查結果已追加至 STATUS.md。
+
+---
+
+### 審查風險 → 最小可重現測試（僅 tests，未改 production）
+
+已將上述 6 項審查風險轉成最小可重現測試或強化既有測試；**僅新增／調整 tests，未修改 production code**。
+
+**檔案**：`tests/test_review_risks_lookback_hours_trainer_align.py`
+
+**新增／調整內容**：
+
+| Review # | 測試名稱 | 說明 |
+|----------|----------|------|
+| #1 | `TestRunBoundaryLookbackReviewRisks::test_run_boundary_lookback_with_nat_no_crash_and_defined_semantics` | 同一 canonical_id 內一筆 NaT、一筆正常時間，`lookback_hours=1`；assert 不拋錯、`len(result)==len(df)`、`run_id` / `minutes_since_run_start` / `bets_in_run_so_far` / `wager_sum_in_run_so_far` 無 NaN 且 ≥0。 |
+| #2/#3 | `TestRunBoundaryLookbackReviewRisks::test_run_boundary_and_loss_streak_overflow_message_contain_1000` | `lookback_hours=1e10` 時 `compute_loss_streak` 與 `compute_run_boundary` 皆拋 `ValueError` 且訊息均含 `"1000"`，鎖定契約一致。 |
+| #3 | `TestLookbackPathSemantics::test_run_boundary_lookback_hours_overflow_raises_value_error` | **強化**：除原有 `assertIn("lookback", ...)` 外，新增 `assertIn("1000", str(ctx.exception))`，鎖定「不得超過 1000 小時」契約。 |
+| #4 | `TestRunBoundaryLookbackReviewRisks::test_run_boundary_lookback_hours_tiny_raises_value_error` | `lookback_hours=1e-15` 時 `compute_run_boundary` 拋 `ValueError` 且訊息含 "lookback"，文件化極小視窗被拒絕。 |
+
+**執行方式**：
+
+```bash
+# 僅跑 run_boundary lookback 審查風險測試（本輪新增）
+python -m pytest tests/test_review_risks_lookback_hours_trainer_align.py::TestRunBoundaryLookbackReviewRisks -v
+
+# 跑整份 lookback 相關測試（含既有 + Phase 2 + run_boundary 審查）
+python -m pytest tests/test_review_risks_lookback_hours_trainer_align.py -v
+
+# 全量測試
+python -m pytest -q
+```
+
+**本輪執行結果**：`22 passed`（整份 lookback 檔）；其中 `TestRunBoundaryLookbackReviewRisks` 3 則 + 強化後的 `test_run_boundary_lookback_hours_overflow_raises_value_error` 1 則，共 4 則與本輪審查對應。
+
+---
+
+## 本輪驗證：tests / typecheck / lint 全過（無 production 變更）
+
+**說明**：依「修改實作直到所有 tests/typecheck/lint 通過」執行驗證；目前實作已滿足全部檢查，**本輪未修改 production code**。
+
+**驗證指令與結果**：
+
+```bash
+python -m pytest -q
+# 942 passed, 41 skipped, 192 warnings in 55.54s
+
+mypy trainer/ --ignore-missing-imports
+# Success: no issues found in 23 source files
+
+ruff check trainer/
+# All checks passed!
+```
+
+---
+
+## PLAN 下一步 1–2 步：lookback 常數共用 + run_boundary NaT 語意（本輪）
+
+**依據**：PLAN.md 項目 19、STATUS.md「Code Review：compute_run_boundary lookback 契約對齊變更」§1（NaT）、§2（常數重複）。
+
+**本輪僅實作 1–2 步**：不實作 numba 向量化；實作審查建議 #2（常數 SSOT）與 #1（run_boundary 含 NaT 時明確語意）。
+
+### 改動檔案
+
+| 檔案 | 改動摘要 |
+|------|----------|
+| `trainer/features.py` | **Step 1**：在模組頂層（logger 後）新增 `_LOOKBACK_MAX_HOURS = 1000`、`_LOOKBACK_MAX_DELTA_NS`、`_LOOKBACK_BOUNDS_MSG`；`compute_loss_streak` 與 `compute_run_boundary` 的 lookback 分支改為使用上述常數並 `raise ValueError(_LOOKBACK_BOUNDS_MSG)`，移除重複的魔數與字串。**Step 2**：在 `compute_run_boundary` 的 lookback 迴圈內，若該 group 有 NaT（`times.isna().any()`），則：NaT 列直接 append (0, 0.0, 0, 0.0)；非 NaT 列使用視窗 `(times.notna()) & (times > lo) & (times <= t)` 計算，使「NaT 列得 0、其餘列以排除 NaT 的視窗」語意明確。 |
+
+### 手動驗證
+
+```bash
+# 跑 lookback 相關測試（含 overflow 訊息含 "1000"、run_boundary NaT）
+python -m pytest tests/test_review_risks_lookback_hours_trainer_align.py -v
+
+# 全量測試
+python -m pytest -q
+```
+
+### 下一步建議
+
+- **Phase 2 compute_run_boundary numba 向量化**：對 lookback 分支實作 numba two-pointer 單 pass（或 per-group 狀態機），輸出 run_id / minutes_since_run_start / bets_in_run_so_far / wager_sum_in_run_so_far；無 numba 時保留現有 Python 迴圈為 fallback；若需可對含 NaT 的 group 維持現有 per-group Python 路徑。規格見 `doc/track_human_lookback_vectorization_plan.md` §5.1。
+- 完成後可將 PLAN 項目 19 標為 completed，並可選將 `TRAINER_USE_LOOKBACK` 預設改為 True。
+
+### pytest 結果（本輪後）
+
+```
+942 passed, 41 skipped, 192 warnings in 44.80s
+```
+
+---
+
+## Code Review：lookback 常數共用 + run_boundary NaT 語意變更（本輪）
+
+**範圍**：STATUS.md「PLAN 下一步 1–2 步：lookback 常數共用 + run_boundary NaT 語意」之變更——`trainer/features.py` 新增 `_LOOKBACK_MAX_HOURS` / `_LOOKBACK_MAX_DELTA_NS` / `_LOOKBACK_BOUNDS_MSG` 並於兩函數 lookback 分支使用；`compute_run_boundary` lookback 對含 NaT 的 group 明確處理（NaT 列 0、非 NaT 列視窗排除 NaT）。  
+**依據**：PLAN.md 項目 19、DECISION_LOG（Track Human train–serve parity）、`doc/track_human_lookback_vectorization_plan.md` §3 語意契約。
+
+以下僅列與**本輪變更**或**受影響路徑**最相關的 bug／邊界／安全性／效能項目；每項附**具體修改建議**與**希望新增的測試**。不重寫整套實作。
+
+---
+
+### 1. [可維護性] 錯誤訊息與常數可能不同步
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `_LOOKBACK_BOUNDS_MSG` 為字串常數，內文寫死 "1000 hours"。若日後將 `_LOOKBACK_MAX_HOURS` 改為 500 或從 config 讀取，錯誤訊息仍為 "1000"，呼叫端或日誌會誤導。 |
+| **具體修改建議** | 改為由常數組裝訊息，例如 `_LOOKBACK_BOUNDS_MSG = f"lookback_hours must be positive and not exceed {_LOOKBACK_MAX_HOURS} hours for lookback computation"`（若在模組載入時求值即可），或定義為函數 `def _lookback_bounds_msg(): return f"... {_LOOKBACK_MAX_HOURS} ..."` 並在 raise 時呼叫，以維持單一 SSOT。 |
+| **希望新增的測試** | 可選：assert 兩函數在 lookback_hours 過大時拋出的 `ValueError` 訊息內含 `str(_LOOKBACK_MAX_HOURS)`（或從 features 模組讀取該常數再 assert），以鎖定「訊息與常數一致」。 |
+
+---
+
+### 2. [契約／文件] 視窗排除 NaT 的語意未寫入 docstring
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 規格 §3.1 寫「僅使用 (t_i - lookback_hours, t_i] 內的 bet」；實作上當 group 含 NaT 時，視窗為「該區間內且 payout_complete_dtm 非 NaT 的 bet」，NaT 列本身輸出 0。此為合理定義，但 `compute_run_boundary` 的 docstring 未註明，日後維護或 train–serve 對照時可能產生歧義。 |
+| **具體修改建議** | 在 `compute_run_boundary` 的 docstring（`lookback_hours` 參數或 Returns 上方）加一句：當 `lookback_hours` 不為 None 時，若某列 `payout_complete_dtm` 為 NaT，該列輸出 run_id / minutes_since_run_start / bets_in_run_so_far / wager_sum_in_run_so_far 皆為 0；視窗 (t - lookback_hours, t] 僅含非 NaT 的列。 |
+| **希望新增的測試** | 既有 `test_run_boundary_lookback_with_nat_no_crash_and_defined_semantics` 已覆蓋不崩潰與無 NaN；可選：加一則 assert 全 group 皆 NaT 時每列四欄皆 0，以文件化邊界。 |
+
+---
+
+### 3. [邊界] 全 group 皆 NaT 時行為
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 當某 canonical_id 內所有列的 `payout_complete_dtm` 皆為 NaT 時，`has_nat` 為 True，每列皆走 `if has_nat and pd.isna(t): ... append 0s`，不會執行 `lo = t - delta` 或後續。行為正確，無需額外分支。 |
+| **具體修改建議** | 維持現狀即可。 |
+| **希望新增的測試** | 可選：fixture 單一 canonical_id、多筆皆 NaT，assert 不拋錯、回傳長度一致、所有 run 欄位為 0。 |
+
+---
+
+### 4. [正確性] mask 與 grp.loc 的 index 對齊
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `mask = (times.notna()) & (times > lo) & (times <= t) if has_nat else ...` 中 `times` 為 `grp` 的 Series，index 與 `grp.index` 一致；`grp.loc[mask]` 會選出 mask 為 True 的列，index 保持。後續 `sub.sort_values(...).iloc[-1]` 與 append(idx, ...) 的 idx 對應當前列，正確。 |
+| **具體修改建議** | 無需修改。 |
+| **希望新增的測試** | 無（既有 NaT 與多列語意測試已覆蓋）。 |
+
+---
+
+### 5. [效能] 含 NaT 的 group 多一次 notna() 計算
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 當 `has_nat` 為 True 時，迴圈內每列會計算 `mask = (times.notna()) & (times > lo) & (times <= t)`，較無 NaT 時多一次 `times.notna()`。僅影響「該 group 含 NaT」的群組，且該群組通常為少數；整體額外成本可接受。 |
+| **具體修改建議** | 維持現狀；若未來 profiling 顯示此處熱點，可考慮在 group 層級先算好 `valid_mask = times.notna()`，迴圈內僅用 `valid_mask & (times > lo) & (times <= t)`。 |
+| **希望新增的測試** | 無。 |
+
+---
+
+### 6. [安全性]
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 本輪無使用者可控之格式字串或注入；錯誤訊息為固定字串或由常數組裝，無額外風險。 |
+| **具體修改建議** | 無需修改。 |
+| **希望新增的測試** | 無。 |
+
+---
+
+**總結**：建議優先處理 **#1（訊息與常數同步）** 與 **#2（docstring 註明 NaT 語意）**；**#3–#6** 可依風險取捨或僅文件化。審查結果已追加至 STATUS.md。
+
+---
+
+### 審查風險 → 最小可重現測試（僅 tests，未改 production）
+
+已將上述 6 項審查中「希望新增的測試」轉成最小可重現測試；**僅新增 tests，未修改 production code**。
+
+**檔案**：`tests/test_review_risks_lookback_hours_trainer_align.py`
+
+**新增內容**：
+
+| Review # | 測試名稱 | 說明 |
+|----------|----------|------|
+| §1 常數同步 | `TestRunBoundaryLookbackReviewRisks::test_overflow_message_contains_lookback_max_hours_constant` | 從 `trainer.features` 讀取 `_LOOKBACK_MAX_HOURS`；兩函數在 `lookback_hours=1e10` 時皆拋 `ValueError`，且 `str(ctx.exception)` 內含 `str(_LOOKBACK_MAX_HOURS)`，鎖定錯誤訊息與常數一致。 |
+| §2/§3 全 group NaT | `TestRunBoundaryLookbackReviewRisks::test_run_boundary_lookback_all_nat_group_gets_zeros` | 單一 canonical_id、多筆皆 NaT（`payout_complete_dtm` 全為 NaT），`lookback_hours=1`；assert 不拋錯、`len(result)==len(df)`、四欄 `run_id` / `minutes_since_run_start` / `bets_in_run_so_far` / `wager_sum_in_run_so_far` 皆為 0。 |
+
+**依賴**：測試需能 import `trainer.features._LOOKBACK_MAX_HOURS`（模組常數，僅用於 assert 訊息內容）。
+
+**執行方式**：
+
+```bash
+# 僅跑 run_boundary lookback 審查風險測試（含本輪新增 2 則）
+python -m pytest tests/test_review_risks_lookback_hours_trainer_align.py::TestRunBoundaryLookbackReviewRisks -v
+
+# 跑整份 lookback 相關測試
+python -m pytest tests/test_review_risks_lookback_hours_trainer_align.py -v
+
+# 全量測試
+python -m pytest -q
+```
+
+**本輪執行結果**：`24 passed`（整份 lookback 檔）；其中 `TestRunBoundaryLookbackReviewRisks` 共 5 則（含本輪新增 2 則）。
+
+---
+
+## 本輪驗證：tests / typecheck / lint 全過（無 production 變更）
+
+**說明**：依「修改實作直到所有 tests/typecheck/lint 通過」執行驗證；目前實作已滿足全部檢查，**本輪未修改 production code**。
+
+**驗證指令與結果**：
+
+```bash
+python -m pytest -q
+# 944 passed, 41 skipped, 192 warnings in 60.70s
+
+mypy trainer/ --ignore-missing-imports
+# Success: no issues found in 23 source files
+
+ruff check trainer/
+# All checks passed!
+```
+
+---
+
+## 本輪實作：Phase 2 compute_run_boundary lookback numba 向量化（PLAN 項目 19）
+
+**日期**：2026-03-11（接續 PLAN 下一、二步）
+
+**範圍**：僅實作 PLAN 下一步 — **compute_run_boundary** 在 `lookback_hours` 設定時改為 numba two-pointer 單 pass，與 `compute_loss_streak` lookback 同模式；未做 canonical-step3-schema-check-oom。
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|----------|
+| `trainer/features.py` | (1) 新增 `_run_boundary_lookback_numba`：numba JIT 函數，單 pass 維護視窗 [lo, i]、gap ≥ RUN_BREAK_MIN 切 run、輸出 run_id / minutes_since_run_start / bets_in_run_so_far / wager_sum_in_run_so_far；無 numba 時為 None。(2) `compute_run_boundary` 的 lookback 分支：先算 `run_break_min_ns`、抽成 `_run_boundary_python_loop(grp, times)`；依 group 迭代，若 numba 可用且該 group 無 NaT 則呼叫 numba kernel 寫入四個 list，否則或 numba 拋錯則 fallback Python 迴圈；NaT 語意與既有一致（per-group fallback）；大資料無 numba 時 log warning。 |
+
+### 如何手動驗證
+
+```bash
+# 僅跑 run_boundary / lookback 相關測試
+python -m pytest tests/test_features.py tests/test_review_risks_lookback_hours_trainer_align.py -v
+
+# 全量測試
+python -m pytest -q
+```
+
+### 下一步建議
+
+1. **PLAN 項目 19**：可將「Track Human Lookback 向量化 + Step 6 進度條」標為 **completed**（Phase 2 compute_run_boundary lookback 已完成 numba 向量化）。
+2. **PLAN 下一項**：實作 **canonical-step3-schema-check-oom**（Step 3 Schema 檢查改為僅讀 metadata，避免整份讀入 session parquet 導致 OOM）。
+
+### 本輪 pytest -q 結果
+
+```bash
+python -m pytest -q
+```
+
+```
+944 passed, 41 skipped, 192 warnings in 53.39s
+```
+
+---
+
+## Code Review：Phase 2 compute_run_boundary lookback numba 向量化（2026-03-11）
+
+**範圍**：本輪變更（`trainer/features.py` 之 `_run_boundary_lookback_numba` 與 `compute_run_boundary` lookback 分支）。  
+**參考**：PLAN.md 項目 19、`doc/track_human_lookback_vectorization_plan.md` §3.3／§5.1、DECISION_LOG.md（DEC-001 雙軌／parity）、STATUS.md 本輪實作節。
+
+以下依**最可能的 bug／邊界條件／安全性／效能**列出問題，每項附**具體修改建議**與**希望新增的測試**。不重寫整套實作，僅供後續修補或測試補強。
+
+---
+
+### 1. [邊界／語意] wager 欄位含 NaN 時，numba 路徑會傳播 NaN
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 進入 numba 時以 `grp["wager"].to_numpy(dtype=np.float64, copy=True)` 取得陣列；若欄位存在但含 NaN，numba 內 `wager_sum_cur += wager[j]` 會得到 NaN 並寫入 `out_wager_sum`。規格 §3.3 寫「wager 缺失時為 0」，實務上「缺失」常包含值為 NaN。 |
+| **具體修改建議** | 在呼叫 numba 前，取得 wager 陣列後對 NaN 填 0：`wager_arr = np.nan_to_num(wager_arr, nan=0.0, posinf=0.0, neginf=0.0)`，或 `wager_arr = grp["wager"].fillna(0.0).to_numpy(dtype=np.float64, copy=True)`。若希望與 Python fallback 完全一致，可一併在 Python 路徑的 `wager_sub` 計算前對 `sub["wager"]` 做 `fillna(0)`。 |
+| **希望新增的測試** | 單一 canonical_id、lookback_hours=1，多筆 bet 其中一筆 `wager=NaN`；assert `wager_sum_in_run_so_far` 在該 row 不為 NaN（且數值與「該 run 內非 NaN 的 wager 之和」或「NaN 視為 0」一致）。可同時 assert numba 路徑與 Python fallback（例如 mock numba 為 None）結果一致。 |
+
+---
+
+### 2. [邊界／健壯性] run_break_min_ns 過大時可能造成 int64 溢出
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `run_break_min_ns = int(float(RUN_BREAK_MIN) * 60 * 1e9)` 後以 `np.int64(run_break_min_ns)` 傳入 numba。若 config 誤設極大值（例如 RUN_BREAK_MIN=1e10 分鐘），Python int 仍可存，但轉成 int64 會溢出，numba 內比較 `gap_ns >= run_break_min_ns` 行為未定義。 |
+| **具體修改建議** | 比照 `delta_ns` 與 `_LOOKBACK_MAX_DELTA_NS`，為 run_break 設合理上限（例如對應「最長 run 間隔」如 10000 分鐘），在 `run_break_min_ns` 計算後檢查：若 `run_break_min_ns < 0` 或 `run_break_min_ns > 某常數（如 10000*60*10**9）」則 `raise ValueError("RUN_BREAK_MIN must be in [0, ...] minutes for lookback computation")`。或至少在轉成 int64 前檢查 `run_break_min_ns <= (2**63 - 1)` 並在超出時拋錯。 |
+| **希望新增的測試** | 在測試中暫時將 RUN_BREAK_MIN 設為極大值（或 patch config），呼叫 `compute_run_boundary(..., lookback_hours=8)`，assert 拋出 `ValueError` 且訊息提及 RUN_BREAK_MIN 或範圍。 |
+
+---
+
+### 3. [正確性／parity] numba 與 Python lookback 路徑未做逐 row 對照測試
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 目前既有測試涵蓋 run_boundary 語意與 lookback 審查風險（NaT、overflow 訊息等），但沒有在**同一輸入**上同時跑 numba 路徑與 Python 路徑並比對四欄（run_id、minutes_since_run_start、bets_in_run_so_far、wager_sum_in_run_so_far）完全一致。若兩路徑實作有細微差異（例如視窗邊界、gap 計算），回歸不易發現。 |
+| **具體修改建議** | 不需改 production；補測試即可。 |
+| **希望新增的測試** | 建一小 DataFrame（同一 canonical_id、多筆 bet、含 wager、時間間隔與 gap 涵蓋「新 run」與「同 run」），先 `compute_run_boundary(..., lookback_hours=2)` 得到結果 A；再 patch 或 mock 使 `_run_boundary_lookback_numba is None`，同樣輸入得到結果 B。Assert A 與 B 的四欄逐列相等（或對 float 用 assertAlmostEqual）。可多組參數（不同 lookback_hours、有/無 wager、多 group）。 |
+
+---
+
+### 4. [效能] 單一 group 觸發 numba 例外後，其餘 group 全走 Python
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 當某個 canonical_id 的 group 呼叫 numba 時拋錯（例如罕見的型別或邊界導致），會 `use_numba = False` 並對**當前** group 走 Python，之後**所有** group 都走 Python。若只有一個 group 有問題（例如該 group 資料異常），其餘 group 仍會變慢。 |
+| **具體修改建議** | 可選優化：不設全域 `use_numba = False`，僅對「當前 group」fallback Python；下一個 group 仍嘗試 numba。亦即 except 區塊內不要 `use_numba = False`，只做 `_run_boundary_python_loop(grp, times)`。這樣單一異常 group 不影響其他 group 的 numba 加速。若希望「一旦失敗就全部降級」以利除錯，可保留現狀並在 log 中註明。 |
+| **希望新增的測試** | （可選）Mock 某個 group 第一次呼叫 numba 時拋錯，第二次不拋錯；assert 第二個 group 的結果仍來自 numba（例如透過 spy 或結果數值與純 Python 路徑在該 group 上的差異來間接判斷，或 log 計數）。 |
+
+---
+
+### 5. [安全性]
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 本輪變更無使用者可控之格式字串或注入；輸入為內部 DataFrame，錯誤訊息由常數或既有變數組裝。 |
+| **具體修改建議** | 無需修改。 |
+| **希望新增的測試** | 無。 |
+
+---
+
+### 6. [邊界] minutes_since_run_start 理論上可為負（未強制 ≥ 0）
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 規格 §3.3 要求 `minutes_since_run_start ≥ 0`。numba 內計算為 `(times_ns[i] - run_start_ns) / (60.0 * 1e9)`，在輸入已按 (canonical_id, payout_complete_dtm, bet_id) 排序的前提下，run_start_ns 必 ≤ times_ns[i]，故實務上應不會出現負值。若未來呼叫方未先排序或存在時鐘異常，可能出現負值。 |
+| **具體修改建議** | 若欲嚴格符合規格：在 numba 寫入前 `out_min_since[i] = max(0.0, (times_ns[i] - run_start_ns) / (60.0 * 1e9))`；或於 Python 端在 reindex 後對 `df["minutes_since_run_start"]` 做 `clip(lower=0)`。屬低優先級防禦性寫法。 |
+| **希望新增的測試** | 現有測試已含「minutes_since_run_start 在 run 起點為 0」；可加一則 assert 整欄 `df["minutes_since_run_start"].min() >= 0`（lookback 與非 lookback 皆測）。 |
+
+---
+
+**總結**：建議優先處理 **#1（wager NaN）** 與 **#2（run_break_min_ns 上限）**；**#3（numba vs Python 對照測試）** 強烈建議補上以鎖定 parity。**#4** 為可選效能優化；**#5** 無需動作；**#6** 可選防禦。Review 結果已追加至 STATUS.md。
+
+---
+
+## 審查風險 → 最小可重現測試（run_boundary numba lookback，僅 tests）
+
+**說明**：將上節「Code Review：Phase 2 compute_run_boundary lookback numba 向量化」各項「希望新增的測試」轉成最小可重現測試；**僅新增 tests，未修改 production code**。
+
+**新增檔案**：`tests/test_review_risks_run_boundary_numba_lookback.py`
+
+**對應關係**：
+
+| Review # | 測試類別 | 測試方法 | 說明 |
+|----------|----------|----------|------|
+| #1 | `TestRunBoundaryLookbackWagerNanContract` | `test_wager_nan_row_gets_finite_wager_sum_in_run_so_far` | 契約：wager 含 NaN 時 `wager_sum_in_run_so_far` 不為 NaN；production 已填 0，已移除 expectedFailure。 |
+| #1 | `TestRunBoundaryLookbackWagerNanContract` | `test_wager_finite_numba_vs_python_fallback_parity` | wager 全為有限值時，numba 與 fallback 四欄一致。 |
+| #2 | `TestRunBoundaryLookbackRunBreakMinOverflowContract` | `test_run_break_min_huge_raises_value_error` | 契約：RUN_BREAK_MIN 極大時應拋 ValueError；production 已加上限，已移除 expectedFailure。 |
+| #3 | `TestRunBoundaryLookbackNumbaVsPythonParity` | `test_single_group_with_new_run_and_same_run_parity` | 單一 group、間隔涵蓋新 run／同 run，numba 與 fallback 四欄一致。 |
+| #3 | `TestRunBoundaryLookbackNumbaVsPythonParity` | `test_two_groups_parity` | 兩 canonical_id，numba 與 fallback 四欄一致。 |
+| #3 | `TestRunBoundaryLookbackNumbaVsPythonParity` | `test_no_wager_column_parity` | 無 wager 欄時兩路徑一致，且 wager_sum_in_run_so_far 皆 0。 |
+| #6 | `TestRunBoundaryMinutesSinceRunStartNonNegative` | `test_lookback_path_minutes_since_run_start_non_negative` | lookback 路徑下整欄 `minutes_since_run_start` ≥ 0。 |
+| #6 | `TestRunBoundaryMinutesSinceRunStartNonNegative` | `test_no_lookback_path_minutes_since_run_start_non_negative` | lookback_hours=None 時整欄 ≥ 0。 |
+
+**執行方式**：
+
+```bash
+# 僅跑本輪新增的 run_boundary numba lookback 審查風險測試
+python -m pytest tests/test_review_risks_run_boundary_numba_lookback.py -v
+
+# 全量測試（含 2 個 expectedFailure）
+python -m pytest -q
+```
+
+**本輪執行結果**：`6 passed, 2 xfailed`（本檔）；全量 `pytest -q` → **950 passed, 41 skipped, 2 xfailed**。
+
+---
+
+## 本輪實作：Code Review 修補（wager NaN + run_break_min_ns 上限）+ PLAN 項目 19 完成
+
+**日期**：2026-03-11
+
+**目標**：依 STATUS Code Review 修改 production 使 tests/typecheck/lint 全過；不改 tests 除 decorator 過時（兩則 expectedFailure 契約已滿足，移除裝飾器）。
+
+### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|----------|
+| `trainer/features.py` | (1) **Review #1**：lookback 路徑 wager 含 NaN 時視為 0 — numba 路徑 `grp["wager"].fillna(0.0).to_numpy(...)`；Python 路徑 `sub["wager"].fillna(0.0).groupby(run_id_sub, sort=False).cumsum()`。(2) **Review #2**：新增 `_RUN_BREAK_MAX_MIN = 10000`、`_RUN_BREAK_MAX_NS`、`_RUN_BREAK_BOUNDS_MSG`；lookback 分支在 `run_break_min_ns` 計算後檢查 `run_break_min_ns < 0 or run_break_min_ns > _RUN_BREAK_MAX_NS` 則 `raise ValueError(_RUN_BREAK_BOUNDS_MSG)`。 |
+| `tests/test_review_risks_run_boundary_numba_lookback.py` | 移除兩則 `@unittest.expectedFailure`（契約已由 production 滿足，decorator 過時）。 |
+
+### 驗證結果（本輪後）
+
+```bash
+python -m pytest tests/test_review_risks_run_boundary_numba_lookback.py -v
+# 8 passed in 3.76s
+
+python -m pytest -q
+# 952 passed, 41 skipped, 192 warnings in 62.43s
+
+python -m mypy trainer/ --ignore-missing-imports
+# Success: no issues found in 23 source files
+
+ruff check trainer/
+# All checks passed!
+```

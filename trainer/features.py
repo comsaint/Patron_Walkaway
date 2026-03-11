@@ -61,6 +61,20 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger(__name__)
 
+# Lookback bounds (STATUS Code Review compute_run_boundary 2026-03-11 §2): single SSOT for both
+# compute_loss_streak and compute_run_boundary to avoid int64/pd.Timedelta overflow.
+_LOOKBACK_MAX_HOURS = 1000
+_LOOKBACK_MAX_DELTA_NS = _LOOKBACK_MAX_HOURS * 3600 * 10**9
+_LOOKBACK_BOUNDS_MSG = (
+    "lookback_hours must be positive and not exceed 1000 hours for lookback computation"
+)
+# Run break upper bound for lookback (STATUS Code Review run_boundary #2): avoid int64 overflow in numba.
+_RUN_BREAK_MAX_MIN = 10000
+_RUN_BREAK_MAX_NS = _RUN_BREAK_MAX_MIN * 60 * 10**9
+_RUN_BREAK_BOUNDS_MSG = (
+    "RUN_BREAK_MIN must be in [0, 10000] minutes for lookback computation"
+)
+
 # ---------------------------------------------------------------------------
 # player_profile — Phase 1 feature column list (PLAN Step 4 / DEC-011)
 # ---------------------------------------------------------------------------
@@ -240,6 +254,82 @@ _REQUIRED_STREAK_COLS: frozenset[str] = frozenset(
 _REQUIRED_RUN_COLS: frozenset[str] = frozenset(
     {"canonical_id", "bet_id", "payout_complete_dtm"}
 )
+
+# Optional numba kernel for lookback streak (PLAN § Phase 2 Track Human Lookback 向量化)
+try:
+    from numba import jit as numba_jit
+
+    @numba_jit(nopython=True, cache=True)
+    def _streak_lookback_numba(times, status, push_resets, delta_ns, out):
+        # times: int64 array (nanoseconds), status: int8 (1=LOSE,2=WIN,3=PUSH), out: int32
+        n = times.shape[0]
+        lo = 0
+        for i in range(n):
+            t_i = times[i]
+            lo_bound = t_i - delta_ns
+            while lo < i and times[lo] <= lo_bound:
+                lo += 1
+            streak = 0
+            for j in range(lo, i + 1):
+                s = status[j]
+                if s == 2:  # WIN
+                    streak = 0
+                elif s == 3:  # PUSH
+                    if push_resets:
+                        streak = 0
+                elif s == 1:  # LOSE
+                    streak += 1
+            out[i] = streak
+except Exception:
+    _streak_lookback_numba = None
+
+# Optional numba kernel for run_boundary lookback (PLAN § Phase 2 Track Human Lookback 向量化)
+try:
+    from numba import jit as _numba_jit_run
+
+    @_numba_jit_run(nopython=True, cache=True)
+    def _run_boundary_lookback_numba(
+        times_ns,
+        wager,
+        run_break_min_ns,
+        delta_ns,
+        out_run_id,
+        out_min_since,
+        out_bets_in_run,
+        out_wager_sum,
+    ):
+        # times_ns: int64 (nanoseconds), wager: float64, run_break_min_ns/delta_ns: int64
+        # outputs: int32, float64, int32, float64
+        n = times_ns.shape[0]
+        lo = 0
+        for i in range(n):
+            t_i = times_ns[i]
+            lo_bound = t_i - delta_ns
+            while lo < i and times_ns[lo] <= lo_bound:
+                lo += 1
+            run_id = 0
+            run_start_ns = times_ns[lo]
+            bets_in_run_cur = 0
+            wager_sum_cur = 0.0
+            for j in range(lo, i + 1):
+                gap_ns = times_ns[j] - times_ns[j - 1] if j > lo else 0
+                is_new_run = (j == lo) or (gap_ns >= run_break_min_ns)
+                if is_new_run:
+                    if j > lo:
+                        run_id += 1
+                    run_start_ns = times_ns[j]
+                    bets_in_run_cur = 1
+                    wager_sum_cur = wager[j]
+                else:
+                    bets_in_run_cur += 1
+                    wager_sum_cur += wager[j]
+            out_run_id[i] = run_id
+            out_min_since[i] = (times_ns[i] - run_start_ns) / (60.0 * 1e9)
+            out_bets_in_run[i] = bets_in_run_cur
+            out_wager_sum[i] = wager_sum_cur
+except Exception:
+    _run_boundary_lookback_numba = None
+
 _REQUIRED_HC_COLS: frozenset[str] = frozenset(
     {"table_id", "bet_id", "payout_complete_dtm", "player_id"}
 )
@@ -313,25 +403,83 @@ def compute_loss_streak(
 
     if lookback_hours is not None and lookback_hours > 0:
         # Per-row context: for each row only use bets in (t - lookback_hours, t].
+        # Phase 2 (PLAN § Track Human Lookback 向量化): numba two-pointer when available.
+        delta_ns = int(float(lookback_hours) * 1e9 * 3600)
+        if delta_ns <= 0 or delta_ns > _LOOKBACK_MAX_DELTA_NS:
+            raise ValueError(_LOOKBACK_BOUNDS_MSG)
         delta = pd.Timedelta(hours=float(lookback_hours))
-        out_list = []
-        for cid, grp in df.groupby("canonical_id", sort=False):
-            times = pd.to_datetime(grp["payout_complete_dtm"], utc=False)
-            for idx, t in zip(grp.index, times):
-                lo = t - delta
-                sub = grp.loc[(times > lo) & (times <= t)]
-                if sub.empty:
-                    out_list.append((idx, 0))
-                    continue
-                sub = sub.sort_values(["payout_complete_dtm", "bet_id"], kind="stable")
-                _is_lose = (sub["status"] == "LOSE").astype("int8")
-                _is_reset = (
-                    (sub["status"] == "WIN")
-                    | ((sub["status"] == "PUSH") & LOSS_STREAK_PUSH_RESETS)
-                ).astype("int8")
-                _reset_grp = _is_reset.cumsum()
-                streak_sub = _is_lose.groupby(_reset_grp.values, sort=False).cumsum().astype("int32")
-                out_list.append((idx, int(streak_sub.iloc[-1])))
+        push_resets_int = 1 if LOSS_STREAK_PUSH_RESETS else 0
+        out_list: List[tuple] = []
+        use_numba = _streak_lookback_numba is not None
+        if use_numba:
+            try:
+                for _cid, grp in df.groupby("canonical_id", sort=False):
+                    # Review #1: groups with NaT use Python path to match fallback semantics (STATUS.md).
+                    if grp["payout_complete_dtm"].isna().any():
+                        times = pd.to_datetime(grp["payout_complete_dtm"], utc=False)
+                        for idx, t in zip(grp.index, times):
+                            lo = t - delta
+                            sub = grp.loc[(times > lo) & (times <= t)]
+                            if sub.empty:
+                                out_list.append((idx, 0))
+                                continue
+                            sub = sub.sort_values(["payout_complete_dtm", "bet_id"], kind="stable")
+                            _is_lose = (sub["status"] == "LOSE").astype("int8")
+                            _is_reset = (
+                                (sub["status"] == "WIN")
+                                | ((sub["status"] == "PUSH") & LOSS_STREAK_PUSH_RESETS)
+                            ).astype("int8")
+                            _reset_grp = _is_reset.cumsum()
+                            streak_sub = _is_lose.groupby(_reset_grp.values, sort=False).cumsum().astype("int32")
+                            out_list.append((idx, int(streak_sub.iloc[-1])))
+                        continue
+                    times_ns = pd.to_datetime(grp["payout_complete_dtm"], utc=False).astype("int64")
+                    status_arr = (
+                        grp["status"]
+                        .map({"LOSE": 1, "WIN": 2, "PUSH": 3})
+                        .fillna(0)
+                        .astype(np.int8)
+                    )
+                    out_arr = np.zeros(len(grp), dtype=np.int32)
+                    _streak_lookback_numba(
+                        times_ns.values,
+                        status_arr.values,
+                        np.int8(push_resets_int),
+                        np.int64(delta_ns),
+                        out_arr,
+                    )
+                    for idx, val in zip(grp.index, out_arr):
+                        out_list.append((idx, int(val)))
+            except Exception as e:
+                logger.warning(
+                    "compute_loss_streak: numba lookback failed (%s), falling back to Python path",
+                    e,
+                )
+                use_numba = False
+        if not use_numba:
+            if len(df) > 100_000:
+                logger.warning(
+                    "compute_loss_streak: lookback without numba on %d rows may be slow (7h+ at 25M)",
+                    len(df),
+                )
+            out_list = []
+            for cid, grp in df.groupby("canonical_id", sort=False):
+                times = pd.to_datetime(grp["payout_complete_dtm"], utc=False)
+                for idx, t in zip(grp.index, times):
+                    lo = t - delta
+                    sub = grp.loc[(times > lo) & (times <= t)]
+                    if sub.empty:
+                        out_list.append((idx, 0))
+                        continue
+                    sub = sub.sort_values(["payout_complete_dtm", "bet_id"], kind="stable")
+                    _is_lose = (sub["status"] == "LOSE").astype("int8")
+                    _is_reset = (
+                        (sub["status"] == "WIN")
+                        | ((sub["status"] == "PUSH") & LOSS_STREAK_PUSH_RESETS)
+                    ).astype("int8")
+                    _reset_grp = _is_reset.cumsum()
+                    streak_sub = _is_lose.groupby(_reset_grp.values, sort=False).cumsum().astype("int32")
+                    out_list.append((idx, int(streak_sub.iloc[-1])))
         streak = pd.Series(
             {idx: v for idx, v in out_list},
             dtype="int32",
@@ -437,16 +585,33 @@ def compute_run_boundary(
 
     if lookback_hours is not None and lookback_hours > 0:
         # Per-row context: for each row only use bets in (t - lookback_hours, t].
+        # Phase 2 (PLAN § Track Human Lookback 向量化): numba two-pointer when available.
+        delta_ns = int(float(lookback_hours) * 1e9 * 3600)
+        if delta_ns <= 0 or delta_ns > _LOOKBACK_MAX_DELTA_NS:
+            raise ValueError(_LOOKBACK_BOUNDS_MSG)
+        run_break_min_ns = int(float(RUN_BREAK_MIN) * 60 * 1e9)
+        if run_break_min_ns < 0 or run_break_min_ns > _RUN_BREAK_MAX_NS:
+            raise ValueError(_RUN_BREAK_BOUNDS_MSG)
         delta = pd.Timedelta(hours=float(lookback_hours))
-        run_id_list = []
-        min_since_list = []
-        bets_in_run_list = []
-        wager_sum_list = []
-        for cid, grp in df.groupby("canonical_id", sort=False):
-            times = pd.to_datetime(grp["payout_complete_dtm"], utc=False)
+        run_id_list: List[tuple] = []
+        min_since_list: List[tuple] = []
+        bets_in_run_list: List[tuple] = []
+        wager_sum_list: List[tuple] = []
+        use_numba = _run_boundary_lookback_numba is not None
+
+        def _run_boundary_python_loop(grp: pd.DataFrame, times: pd.Series) -> None:
+            # Review #1 (STATUS Code Review 2026-03-11): when group has NaT, 0 for NaT rows.
+            has_nat = times.isna().any()
             for idx, t in zip(grp.index, times):
+                if has_nat and pd.isna(t):
+                    run_id_list.append((idx, 0))
+                    min_since_list.append((idx, 0.0))
+                    bets_in_run_list.append((idx, 0))
+                    wager_sum_list.append((idx, 0.0))
+                    continue
                 lo = t - delta
-                sub = grp.loc[(times > lo) & (times <= t)]
+                mask = (times.notna()) & (times > lo) & (times <= t) if has_nat else (times > lo) & (times <= t)
+                sub = grp.loc[mask]
                 if sub.empty:
                     run_id_list.append((idx, 0))
                     min_since_list.append((idx, 0.0))
@@ -462,15 +627,61 @@ def compute_run_boundary(
                 min_since = (sub["payout_complete_dtm"] - run_start).dt.total_seconds().div(60)
                 bets_in_run = run_id_sub.groupby(run_id_sub).cumcount() + 1
                 wager_sub = (
-                    sub.groupby(run_id_sub)["wager"].cumsum()
+                    sub["wager"].fillna(0.0).groupby(run_id_sub, sort=False).cumsum()
                     if "wager" in sub.columns
                     else pd.Series(0.0, index=sub.index)
                 )
-                # Take last row (current bet) values
                 run_id_list.append((idx, int(run_id_sub.iloc[-1])))
                 min_since_list.append((idx, float(min_since.iloc[-1])))
                 bets_in_run_list.append((idx, int(bets_in_run.iloc[-1])))
                 wager_sum_list.append((idx, float(wager_sub.iloc[-1])))
+
+        for cid, grp in df.groupby("canonical_id", sort=False):
+            times = pd.to_datetime(grp["payout_complete_dtm"], utc=False)
+            if use_numba:
+                try:
+                    if times.isna().any():
+                        _run_boundary_python_loop(grp, times)
+                        continue
+                    times_ns = times.astype("int64")
+                    wager_arr = (
+                        grp["wager"].fillna(0.0).to_numpy(dtype=np.float64, copy=True)
+                        if "wager" in grp.columns
+                        else np.zeros(len(grp), dtype=np.float64)
+                    )
+                    out_run_id = np.zeros(len(grp), dtype=np.int32)
+                    out_min_since = np.zeros(len(grp), dtype=np.float64)
+                    out_bets_in_run = np.zeros(len(grp), dtype=np.int32)
+                    out_wager_sum = np.zeros(len(grp), dtype=np.float64)
+                    _run_boundary_lookback_numba(
+                        times_ns.values,
+                        wager_arr,
+                        np.int64(run_break_min_ns),
+                        np.int64(delta_ns),
+                        out_run_id,
+                        out_min_since,
+                        out_bets_in_run,
+                        out_wager_sum,
+                    )
+                    for k, idx in enumerate(grp.index):
+                        run_id_list.append((idx, int(out_run_id[k])))
+                        min_since_list.append((idx, float(out_min_since[k])))
+                        bets_in_run_list.append((idx, int(out_bets_in_run[k])))
+                        wager_sum_list.append((idx, float(out_wager_sum[k])))
+                except Exception as e:
+                    logger.warning(
+                        "compute_run_boundary: numba lookback failed (%s), falling back to Python path",
+                        e,
+                    )
+                    use_numba = False
+                    _run_boundary_python_loop(grp, times)
+            else:
+                _run_boundary_python_loop(grp, times)
+        if not use_numba and len(df) > 100_000:
+            logger.warning(
+                "compute_run_boundary: lookback without numba on %d rows may be slow (7h+ at 25M)",
+                len(df),
+            )
         df["run_id"] = pd.Series({i: v for i, v in run_id_list}, dtype="int32").reindex(df.index, fill_value=0).values
         df["minutes_since_run_start"] = pd.Series({i: v for i, v in min_since_list}, dtype="float64").reindex(df.index, fill_value=0.0).values
         df["bets_in_run_so_far"] = pd.Series({i: v for i, v in bets_in_run_list}, dtype="int32").reindex(df.index, fill_value=0).values

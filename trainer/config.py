@@ -46,6 +46,12 @@ VALIDATION_RESULTS_RETENTION_DAYS = 180  # Keep validation_results history for l
 SCORER_LOOKBACK_HOURS = 8       # Hours of bet history to pull each cycle
 SCORER_POLL_INTERVAL_SECONDS = 45  # Polling interval in seconds (includes run time)
 
+# Phase 1 unblock (PLAN § Track Human Lookback 向量化): when False, trainer passes
+# lookback_hours=None to add_track_human_features so Step 6 uses vectorized no-lookback
+# path and finishes in reasonable time. Scorer still uses SCORER_LOOKBACK_HOURS.
+# Set True only when Phase 2 (numba lookback) is in place for full train–serve parity.
+TRAINER_USE_LOOKBACK = False
+
 # ------------------ Status Server -----------------------------
 TABLE_STATUS_REFRESH_SECONDS = 45  # How often to refresh table occupancy snapshot
 TABLE_STATUS_LOOKBACK_HOURS = 12   # Only consider sessions started within this many hours for status
@@ -174,7 +180,7 @@ PRODUCTION_NEG_POS_RATIO: Optional[float] = 87.0/13.0
 # then clamps to [NEG_SAMPLE_FRAC_MIN, 1.0]. So "how much" is controlled by the
 # constants below (and by CHUNK_CONCAT_RAM_FACTOR / TRAIN_SPLIT_FRAC), not a fixed value.
 # Only triggers when NEG_SAMPLE_FRAC == 1.0 (user-configured values are respected).
-NEG_SAMPLE_FRAC_AUTO: bool = False   # set False to disable auto-adjustment entirely
+NEG_SAMPLE_FRAC_AUTO: bool = True   # set False to disable auto-adjustment entirely
 NEG_SAMPLE_FRAC_MIN: float = 0.05  # hard floor: auto-reduce will never go below this
 # Assumed positive rate used in the auto-adjustment formula.
 # Default 0.15 (15%) is conservative; lower your actual positive rate for a tighter bound.

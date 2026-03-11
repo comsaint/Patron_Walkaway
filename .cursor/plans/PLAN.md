@@ -102,8 +102,11 @@ todos:
     content: "Optuna HPO 階段 train/valid 抽樣：僅設 OPTUNA_HPO_SAMPLE_ROWS；valid 與 train 同比例；stratified 抽樣、random_state=42；最終訓練仍用全量。見「Optuna HPO 階段 train/valid 抽樣（計畫）」一節。"
     status: completed
   - id: track-b-lookback-vectorization
-    content: "Track Human Lookback 向量化（critical）：SCORER_LOOKBACK_HOURS 時 compute_loss_streak/compute_run_boundary 改為 two-pointer 單 pass，避免 25M 列 per-row 迴圈導致 Step 6 凍結 7h+；Phase 1 可先 trainer 傳 lookback_hours=None 解封。Step 6 進度條：以 tqdm 顯示 Process chunks 進度與 ETA。見「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。"
-    status: pending
+    content: "Track Human Lookback 向量化（critical）：Phase 1 解封（trainer lookback_hours=None）與 Step 6 tqdm 進度條已完成。Phase 2：compute_loss_streak lookback 已以 numba two-pointer 實作並通過 Review #1/#2；compute_run_boundary lookback 已以 numba 單 pass 實作，並完成 Code Review 修補（wager NaN 填 0、run_break_min_ns 上限）。見「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。"
+    status: completed
+  - id: canonical-step3-schema-check-oom
+    content: "Canonical mapping Step 3：Schema 檢查改為僅讀 metadata，避免 build_canonical_links_and_dummy_from_duckdb 整份讀入 session parquet 導致 OOM。見「Canonical mapping Step 3 Schema 檢查改為僅讀 metadata（避免 OOM）」一節。"
+    status: completed
 isProject: false
 ---
 
@@ -159,15 +162,15 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 16 | **取得 bet 後排除 unrated 再送模型** | completed | 下方「取得 bet 後排除 unrated 再送模型（計畫）」一節。Round 402/403 實作並通過 R402 審查測試。 |
 | 17 | **OOM 預檢查** | completed | Step 6 以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC；已於 Round 210/211/212 實作並通過 Review 修復。規格見下方「OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC」一節。 |
 | 18 | **Round 222 Review production 補強** | completed | 四項均已實作：項目 1（Track LLM 失敗 warning + track_llm_degraded）、項目 2（canonical_ids=[]）、項目 3（use_local_parquet 從 CLI 傳入）、項目 4（candidates 型別防呆）。Round 406 完成項目 1、3 與 R222 測試契約更新。規格見下方「Round 222 Review production 補強（實作計畫）」一節。 |
-| 19 | **Track Human Lookback 向量化 + Step 6 進度條** | pending | **Critical**：SCORER_LOOKBACK_HOURS=8 時 Step 6 凍結 7h+（per-row Python 迴圈）；Phase 1 解封：trainer 傳 lookback_hours=None；Phase 2：numba two-pointer 向量化 lookback。Step 6 以 tqdm 顯示 chunk 進度與 ETA。見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。 |
+| 19 | **Track Human Lookback 向量化 + Step 6 進度條** | completed | Phase 1 解封與 Step 6 tqdm 已完成。Phase 2 **compute_loss_streak** 與 **compute_run_boundary** lookback 均已以 numba 單 pass 實作；Code Review 修補（wager NaN 填 0、run_break_min_ns 上限）已完成。見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。 |
 
-**Plan 狀態摘要**：上表 1～18 項均為 **completed**（第 18 項於 Round 406 完成項目 1、3；Round 409 完成 R407 Review #1 錯誤回傳含 track_llm_degraded，為 Review 跟進非新項目）。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
+**Plan 狀態摘要**：上表 1～19 項均為 **completed**（第 18 項於 Round 406 完成項目 1、3；第 19 項 Track Human Lookback 向量化於本輪完成 Phase 2 compute_run_boundary numba 與 Code Review 修補 wager NaN／run_break_min_ns 上限）。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
 
-**剩餘項目**：上表 1～18 項均已完成。**項目 19**（Track Human Lookback 向量化 + Step 6 進度條）為 **pending**、**critical**：Step 6 在 SCORER_LOOKBACK_HOURS 下會凍結 7h+，Phase 1 解封與 tqdm 進度條建議優先實作。
+**剩餘項目**：上表 1～19 項與 **canonical-step3-schema-check-oom** 均已完成；目前無 pending 項目。
 
-**建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；**項目 19**：先實作 Phase 1（trainer 傳 lookback_hours=None）+ Step 6 tqdm 進度條以解封並可觀測，再排 Phase 2（numba lookback 向量化）。Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。Backtester 輸出格式對齊（項目 7）可獨立排入。Optuna 整份 study 的 early stop（項目 11）為可選省時機制，預設關閉，實作後可依需要設定 `OPTUNA_EARLY_STOP_PATIENCE`。
+**建議實作順序**：可選／後續見下方各節（Step 7 out-of-core 排序、Optuna early stop 等）。
 
-**可選／後續**（非阻斷）：(1) OOM 預檢查已於 Round 210/211/212 實作，視為 **completed**（見上表項目 17）。(2) Round 222 Review production 補強見上表項目 18 與下方「Round 222 Review production 補強（實作計畫）」一節，建議實作。(3) **項目 19** 見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 `doc/track_human_lookback_vectorization_plan.md`。
+**可選／後續**（非阻斷）：(1) OOM 預檢查已於 Round 210/211/212 實作，視為 **completed**（見上表項目 17）。(2) Round 222 Review production 補強見上表項目 18 與下方「Round 222 Review production 補強（實作計畫）」一節。(3) **項目 19** Track Human Lookback 向量化已完成（見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 `doc/track_human_lookback_vectorization_plan.md`）。
 
 ---
 
@@ -1904,9 +1907,36 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 ---
 
+## Canonical mapping Step 3 Schema 檢查改為僅讀 metadata（避免 OOM）
+
+**目標**：消除 Step 3「Build canonical identity mapping」在 `build_canonical_links_and_dummy_from_duckdb` 中因「為檢查必要欄位而整份讀入 session parquet」所導致的 OOM（尤於 32GB 或更低 RAM 機器）。行為不變：仍於組 DuckDB SQL 前 fail-fast 檢查 `_CANONICAL_MAP_SESSION_COLS` 是否存在；僅改為**只讀 schema／metadata**，不載入任何列。
+
+**背景與問題**：Round 253 實作時，規格要求「在組 SQL 前檢查 session parquet 具備視圖與過濾所需欄位，缺欄則 raise ValueError」。實作以 `pd.read_parquet(path, columns=list(required))` 取得 `sample.columns` 做檢查。`read_parquet(..., columns=...)` 僅限制欄位、仍會讀取**全部列**，故大檔（如千萬列 session）會在一次 schema 檢查即耗盡記憶體，在 32GB 機器上易觸發 OOM。
+
+**建議變更**（僅計畫，實作時再改 code）：
+
+| 步驟 | 內容 |
+|------|------|
+| 1 | **取得 schema 不讀資料**：在 `build_canonical_links_and_dummy_from_duckdb` 內，改為以「僅讀 Parquet metadata／schema」的方式取得欄位名集合，例如 (a) `pyarrow.parquet.read_schema(path)` 或 (b) 以 `pd.read_parquet` 僅讀單一 row group（如 `row_groups=[0]` 若 API 支援）或 (c) 以 `pyarrow.parquet.ParquetFile(path).schema_arrow.names` 取得欄位名。選定方式需在 Windows／常用環境可用的前提下定案。 |
+| 2 | **保留既有錯誤語意**：若缺少 `_CANONICAL_MAP_SESSION_COLS` 任一等欄位，仍 `raise ValueError(f"Session Parquet missing required columns: {sorted(missing)}")`；錯誤訊息與現行一致，以便既有測試與呼叫端不變。 |
+| 3 | **移除整份讀入**：刪除現行 `sample = pd.read_parquet(path, columns=list(required))` 及僅用於 `schema_names = set(sample.columns)` 的完整讀取；改為自 metadata/schema 得到 `schema_names` 後即進行 `missing = required - schema_names` 檢查。 |
+| 4 | **相依與 fallback**：若選用 PyArrow，需確認專案已依賴 `pyarrow`（Parquet 讀取通常已有）；若希望零額外依賴，可評估 `pd.read_parquet(path, columns=required)` 搭配僅讀第一個 row group 的可行性（依 pandas/pyarrow 版本文件確認）。 |
+
+**測試與驗收**：
+
+| 項目 | 內容 |
+|------|------|
+| 行為不變 | 具備全部 required 欄位的 session parquet：Step 3 照常通過；缺欄時仍 raise ValueError，訊息含 "Session Parquet missing required columns"。 |
+| 記憶體 | 大檔（例如千萬列）session parquet 下，Step 3 開始時不再出現因「schema 檢查」導致之整檔載入峰值；可選：在 32GB 或限定 RAM 環境跑一次 Step 3，確認無 OOM。 |
+| 既有測試 | Round 253／376／384／386 等與 `build_canonical_links_and_dummy_from_duckdb` 或 `_CANONICAL_MAP_SESSION_COLS` 相關之測試仍通過；必要時僅調整 fixture（例如仍提供小 parquet），不改變「缺欄即 ValueError」的斷言。 |
+
+**不變性**：DuckDB 查詢邏輯、`_CANONICAL_MAP_SESSION_COLS` 定義、temp_directory／memory_limit／threads 等設定、以及 Step 3 其餘流程（載入 artifact、寫出 parquet/sidecar）均不變；僅「取得欄位名以做必要欄位檢查」的實作方式改變。
+
+---
+
 ## 開放問題
 
-**實作待辦**：Canonical mapping DuckDB 對齊 Step 7（見上一節；temp_directory、preserve_insertion_order、動態 RAM 預算）。可選／後續見「接下來要做的事」一節（OOM 預檢查等）。
+**實作待辦**：Canonical mapping DuckDB 對齊 Step 7 與 **Canonical mapping Step 3 Schema 檢查改為僅讀 metadata**（避免 OOM）均已完成。可選／後續見「接下來要做的事」一節。
 
 ### 業務端協商未決（SSOT §13）
 

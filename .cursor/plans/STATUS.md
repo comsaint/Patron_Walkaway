@@ -14755,3 +14755,38 @@ python -m mypy trainer/ --ignore-missing-imports
 
 - 未改其他 production 或測試邏輯；僅 R410 #5 邊界處理與 except 區塊補齊、以及過時 xfail 移除。
 
+---
+
+## canonical-step3-schema-check-oom — Step 3 Schema 檢查僅讀 metadata（避免 OOM）
+
+**日期**：2026-03-11  
+**目標**：實作 PLAN「Canonical mapping Step 3 Schema 檢查改為僅讀 metadata（避免 OOM）」；`build_canonical_links_and_dummy_from_duckdb` 不再以 `pd.read_parquet(path, columns=...)` 整份讀入 session parquet 做欄位檢查，改為僅讀 Parquet metadata 取得欄位名，避免大檔 OOM。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/trainer.py` | 在 `build_canonical_links_and_dummy_from_duckdb` 內：移除 `sample = pd.read_parquet(path, columns=list(required))` 與 `schema_names = set(sample.columns)`；改為 `import pyarrow.parquet as _pq_sess` 與 `schema_names = set(_pq_sess.read_schema(path).names)`。缺欄時仍 `raise ValueError(f"Session Parquet missing required columns: {sorted(missing)}")`，錯誤語意不變。 |
+
+### 驗證
+
+```bash
+python -m pytest tests/test_review_risks_round253_canonical_duckdb.py tests/test_review_risks_round376_canonical_duckdb.py tests/test_review_risks_round386_canonical_duckdb_review.py tests/test_review_risks_round389_canonical_duckdb_dynamic_ram.py tests/test_canonical_mapping_duckdb_pandas_parity.py -v
+# 27 passed
+
+python -m pytest -q
+# 952 passed, 41 skipped
+
+python -m mypy trainer/ --ignore-missing-imports
+# Success: no issues found in 23 source files
+
+ruff check trainer/
+# All checks passed!
+```
+
+### PLAN.md 更新
+
+- **canonical-step3-schema-check-oom**：`status: pending` → **completed**。
+- **剩餘項目**：目前無 pending 項目；建議實作順序改為可選／後續。
+- **開放問題／實作待辦**：Step 3 Schema 僅讀 metadata 已標為已完成。
+
