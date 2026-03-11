@@ -4,7 +4,7 @@ Shared feature engineering — Train-Serve Parity core (TRN-05/07/08).
 
 Architecture (DEC-022: Track Profile / Track LLM / Track Human)
 --------------------------------------------------------------
-**Track B — Vectorized hand-crafted features** (state-machine logic)
+**Track Human — Vectorized hand-crafted features** (state-machine logic)
     compute_loss_streak()       LOSE→+1, WIN→reset, PUSH→conditional (F4)
     compute_run_boundary()      Gap ≥ RUN_BREAK_MIN → new run (B2)
     compute_table_hc()          Unique players per table in rolling window (S1)
@@ -12,13 +12,13 @@ Architecture (DEC-022: Track Profile / Track LLM / Track Human)
 **Feature screening** (unified across tracks)
     screen_features()           Mutual-info → correlation pruning → optional LGBM
 
-All Track B functions are imported by BOTH trainer.py and scorer.py to
+All Track Human functions are imported by BOTH trainer.py and scorer.py to
 guarantee train-serve parity.  They must be kept stateless (no global mutable
 state) and must only look backward in time from each observation's cutoff.
 
 Sorting convention (G3)
 -----------------------
-Every Track B function sorts its input by
+Every Track Human function sorts its input by
     (canonical_id | table_id, payout_complete_dtm, bet_id)
 with ``kind='stable'`` before processing, matching the scorer's sort order.
 
@@ -231,7 +231,7 @@ def coerce_feature_dtypes(
 
 
 # ---------------------------------------------------------------------------
-# Track B — Vectorized hand-crafted features
+# Track Human — Vectorized hand-crafted features
 # ---------------------------------------------------------------------------
 
 _REQUIRED_STREAK_COLS: frozenset[str] = frozenset(

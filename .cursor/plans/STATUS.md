@@ -575,17 +575,17 @@ pytest -q tests/test_review_risks_round350.py
 
 ### 🔴 P0 — Train-Serve Parity: Track LLM 在 trainer 缺少歷史上下文
 
-**問題**：`process_chunk()` 中，Track B 特徵在 label 過濾**之前**計算（line 1440，此時 `bets` 含 `HISTORY_BUFFER_DAYS=2` 天的歷史），但 Track LLM 特徵在 label 過濾**之後**才計算（line 1469-1490，此時 `labeled` 僅含 `[window_start, window_end)` 的資料）。
+**問題**：`process_chunk()` 中，Track Human 特徵在 label 過濾**之前**計算（line 1440，此時 `bets` 含 `HISTORY_BUFFER_DAYS=2` 天的歷史），但 Track LLM 特徵在 label 過濾**之後**才計算（line 1469-1490，此時 `labeled` 僅含 `[window_start, window_end)` 的資料）。
 
 DuckDB window function 若定義 `RANGE BETWEEN INTERVAL 30 MINUTES PRECEDING`，在每個 chunk 開頭的第一批 bets 會缺少向前 lookback，產出不完整的特徵值。Scorer 則用 `lookback_hours`（≥2h）的完整歷史計算 Track LLM，造成 **train ≠ serve**。
 
 **具體修改建議**：
 
-將 Track LLM 計算移到 label 過濾之前（與 Track B 相同位置），對完整 `bets`（含歷史）呼叫 `compute_track_llm_features(bets, ..., cutoff_time=window_end)`，之後再做 `labeled = labeled[window_start <= pcd < window_end]` 過濾。
+將 Track LLM 計算移到 label 過濾之前（與 Track Human 相同位置），對完整 `bets`（含歷史）呼叫 `compute_track_llm_features(bets, ..., cutoff_time=window_end)`，之後再做 `labeled = labeled[window_start <= pcd < window_end]` 過濾。
 
 ```python
-# trainer.py process_chunk — 在 add_track_b_features 之後、compute_labels 之前
-bets = add_track_b_features(bets, canonical_map, window_end)
+# trainer.py process_chunk — 在 add_track_human_features 之後、compute_labels 之前
+bets = add_track_human_features(bets, canonical_map, window_end)
 
 # Track LLM: compute on FULL bets (with history) before label filtering
 if not no_afg and feature_spec is not None:
@@ -676,7 +676,7 @@ if len(features_all) < n_before:
 
 ### 🟡 P2 — Feature 候選清單可能有重複
 
-**問題**：`run_pipeline()` line 2549 做 `_all_candidate_cols = active_feature_cols + _track_llm_cols`，未去重。若 Track LLM YAML 中定義了與 Track B/legacy 同名的 feature_id（例如都叫 `loss_streak`），`screen_features()` 會收到重複 column name，可能導致 mutual information 重複計算或 pandas column 存取返回 DataFrame 而非 Series。
+**問題**：`run_pipeline()` line 2549 做 `_all_candidate_cols = active_feature_cols + _track_llm_cols`，未去重。若 Track LLM YAML 中定義了與 Track Human/legacy 同名的 feature_id（例如都叫 `loss_streak`），`screen_features()` 會收到重複 column name，可能導致 mutual information 重複計算或 pandas column 存取返回 DataFrame 而非 Series。
 
 **具體修改建議**：
 
@@ -2249,7 +2249,7 @@ Success: no issues found in 21 source files
 #### `trainer/trainer.py`
 | Risk | 修改 | 影響 |
 |------|------|------|
-| R3500 | `process_chunk`：將 Track LLM 計算從 `add_legacy_features()` 後移至 `add_track_b_features()` 後、`compute_labels()` 前。採用「計算後 merge-back by bet_id」策略，使 `compute_labels` 仍能拿到 extended-zone 行做 right-censoring | Train-serve parity：scorer 和 trainer 的 window context 起點一致 |
+| R3500 | `process_chunk`：將 Track LLM 計算從 `add_legacy_features()` 後移至 `add_track_human_features()` 後、`compute_labels()` 前。採用「計算後 merge-back by bet_id」策略，使 `compute_labels` 仍能拿到 extended-zone 行做 right-censoring | Train-serve parity：scorer 和 trainer 的 window context 起點一致 |
 | R3501 | `save_artifact_bundle` 新增 `feature_spec_path: Optional[Path] = None` 參數；有值時 `shutil.copy2` 凍結 `feature_spec.yaml` 至 `MODEL_DIR`，並計算 `spec_hash`（MD5 前 12 字元）寫入 `training_metrics.json` | 確保 artifact bundle 可重現 |
 | R3502a | `process_chunk` Track LLM 失敗由 `logger.warning(...Track LLM skipped...)` 改為 `logger.error(...Track LLM failed...)` | 失敗可見性提升 |
 | R3504 | `run_pipeline` 的 `_all_candidate_cols` 改為 `list(dict.fromkeys(active_feature_cols + _track_llm_cols))` | 消除重複欄位，避免 feature screening 行為不確定 |
@@ -2427,11 +2427,11 @@ numpy._core._exceptions._ArrayMemoryError: Unable to allocate 4.04 GiB for an ar
 
 | 修改位置 | 說明 |
 |----------|------|
-| 模組常數區（`_CANONICAL_MAP_SESSION_COLS` 下方）新增 `_REQUIRED_BET_PARQUET_COLS` | 定義 pipeline 真正需要的 bet 欄位白名單（20 欄，含 keys、DQ 欄、Track B / LLM / Legacy features），作為 Parquet column pushdown 的依據 |
+| 模組常數區（`_CANONICAL_MAP_SESSION_COLS` 下方）新增 `_REQUIRED_BET_PARQUET_COLS` | 定義 pipeline 真正需要的 bet 欄位白名單（20 欄，含 keys、DQ 欄、Track Human / LLM / Legacy features），作為 Parquet column pushdown 的依據 |
 | `load_local_parquet()`：`pd.read_parquet(bets_path, ...)` | 加上 `columns=_bet_cols`（pushdown），只從 Parquet 讀取 `_REQUIRED_BET_PARQUET_COLS` 中存在於 schema 的欄位，節省 ~2/3 載入記憶體 |
 | `apply_dq()`：原本 3 個連續 `.copy()`（時間窗口過濾、wager 過濾、dropna） | 合併為 1 個 `_dq_mask` 布林遮罩，最後用 `.loc[_dq_mask].reset_index(drop=True)` 一次完成，省去 2 次 deep copy |
 | `apply_dq()`：E4/F1 player_id 過濾 `.copy()` | 改為 `.reset_index(drop=True)`，不做 deep copy |
-| `add_track_b_features()`：`df = bets.copy()` | 移除，改為直接在 `bets` 上做 `bets["loss_streak"] = ...` 等 in-place 修改（呼叫端 `bets = add_track_b_features(bets, ...)` 立刻覆蓋，無需 defensive copy） |
+| `add_track_human_features()`：`df = bets.copy()` | 移除，改為直接在 `bets` 上做 `bets["loss_streak"] = ...` 等 in-place 修改（呼叫端 `bets = add_track_human_features(bets, ...)` 立刻覆蓋，無需 defensive copy） |
 | `process_chunk()`：FND-12 過濾 `.copy()` | 改為 `.reset_index(drop=True)` |
 | `process_chunk()`：H1 censored 過濾 + 時間窗口過濾（原本 2 個連續 `.copy()`） | 合併為 1 個 `_keep_mask`，用 `.loc[_keep_mask].reset_index(drop=True)` 一次完成，**直接消除觸發 OOM 的那次 4.04 GiB 分配** |
 
@@ -2453,7 +2453,7 @@ DuckDB t_bet 建表 DDL 參考，所有金額欄使用 DECIMAL(19,4)，對齊 `s
 1. 重跑 pipeline：`python -m trainer.trainer --use-local-parquet --days 365`
 2. 確認不再出現 `_ArrayMemoryError`
 3. 確認 chunk Parquet 產生，且 `label=1` / `rated` 計數與修改前大致相同（DQ 語義未改變）
-4. 可跑 `python -m pytest tests/ -x -q` 確認既有測試通過（尤其是 `test_apply_dq*`、`test_track_b*`、`test_review_risks*`）
+4. 可跑 `python -m pytest tests/ -x -q` 確認既有測試通過（尤其是 `test_apply_dq*`、`test_track_human*`、`test_review_risks*`）
 
 ### 已知限制與下一步建議
 - **Layer 3（縮小 chunk 大小）**：若資料量繼續增長，可改 `time_fold.py` 把月度 chunk 改為半月或週，作為第二道防線
@@ -2465,11 +2465,11 @@ DuckDB t_bet 建表 DDL 參考，所有金額欄使用 DECIMAL(19,4)，對齊 `s
 
 ## Self-review：OOM / DECIMAL 修復（2026-03-06）
 
-### R-OOM-1｜`add_track_b_features` in-place 修改破壞 backtester 呼叫端安全
+### R-OOM-1｜`add_track_human_features` in-place 修改破壞 backtester 呼叫端安全
 
-**嚴重度**：Medium（backtester 也用 `bets = add_track_b_features(bets, ...)` 所以目前安全，但函式設計已從「純函數」變成「有副作用」）
+**嚴重度**：Medium（backtester 也用 `bets = add_track_human_features(bets, ...)` 所以目前安全，但函式設計已從「純函數」變成「有副作用」）
 
-**問題**：`add_track_b_features` 原本做 `df = bets.copy()`，是純函數——不改動傳入的 `bets`。現在改為直接 mutate `bets`（in-place 加 `loss_streak`、`run_id`、`minutes_since_run_start` 欄位），破壞了函式契約。當前所有呼叫端（`trainer.py` 第 1486 行、`backtester.py` 第 430 行）都做 `bets = add_track_b_features(bets, ...)`，所以結果正確。但若未來有人在呼叫前後存了 `bets` 的引用（例如 `original = bets`），原始物件也會被改掉。
+**問題**：`add_track_human_features` 原本做 `df = bets.copy()`，是純函數——不改動傳入的 `bets`。現在改為直接 mutate `bets`（in-place 加 `loss_streak`、`run_id`、`minutes_since_run_start` 欄位），破壞了函式契約。當前所有呼叫端（`trainer.py` 第 1486 行、`backtester.py` 第 430 行）都做 `bets = add_track_human_features(bets, ...)`，所以結果正確。但若未來有人在呼叫前後存了 `bets` 的引用（例如 `original = bets`），原始物件也會被改掉。
 
 **修改建議**：
 - 在 docstring 裡加上 `.. warning:: This function **mutates** the input DataFrame in-place.` 警告。
@@ -2477,12 +2477,12 @@ DuckDB t_bet 建表 DDL 參考，所有金額欄使用 DECIMAL(19,4)，對齊 `s
 
 **建議測試**：
 ```python
-def test_add_track_b_does_not_corrupt_caller():
-    """Verify add_track_b_features return value is usable and original df gets
+def test_add_track_human_features_does_not_corrupt_caller():
+    """Verify add_track_human_features return value is usable and original df gets
     the columns added (in-place contract)."""
     bets = _make_sample_bets(100)
     original_cols = set(bets.columns)
-    result = add_track_b_features(bets, pd.DataFrame(), some_dt)
+    result = add_track_human_features(bets, pd.DataFrame(), some_dt)
     assert result is bets  # in-place contract
     assert "loss_streak" in bets.columns
     assert "run_id" in bets.columns
@@ -2626,7 +2626,7 @@ def test_prepare_bets_handles_pyarrow_decimal():
 
 | 優先度 | 問題 ID | 描述 | 類型 |
 |--------|---------|------|------|
-| Medium | R-OOM-1 | `add_track_b_features` in-place 破壞純函數契約 | Safety |
+| Medium | R-OOM-1 | `add_track_human_features` in-place 破壞純函數契約 | Safety |
 | Medium | R-OOM-4 | `prepare_bets_for_duckdb` 額外 copy（效能） | 效能 |
 | Low | R-OOM-2 | `_REQUIRED_BET_PARQUET_COLS` 含不必要欄位 | Cleanup |
 | Low | R-OOM-3 | Parquet pushdown 與 ClickHouse SELECT 不同步 | 維護風險 |
@@ -2648,7 +2648,7 @@ def test_prepare_bets_handles_pyarrow_decimal():
 
 | Risk ID | Test | Outcome |
 |---|---|---|
-| R-OOM-1 | `test_add_track_b_features_should_preserve_pure_function_contract` | xfailed |
+| R-OOM-1 | `test_add_track_human_features_should_preserve_pure_function_contract` | xfailed |
 | R-OOM-2 | `test_required_bet_cols_should_not_include_session_only_fields` | xfailed |
 | R-OOM-3 | `test_required_bet_cols_should_stay_in_sync_with_clickhouse_select` | xfailed |
 | R-OOM-4 | `test_prepare_bets_for_duckdb_should_avoid_extra_full_copy` | xfailed |
@@ -3777,7 +3777,7 @@ print(con.execute(\"SELECT EPOCH(TIMESTAMP '2025-12-31 10:30:45.500' - TIMESTAMP
 | 檔案 | 修改摘要 |
 |------|---------|
 | `trainer/feature_spec/features_candidates.template.yaml` | (1) `prev_status` 新增 `screening_eligible: false`；(2) `guardrails.track_llm_allowed_columns` 新增 `base_ha`；(3) Track LLM 新增 10 個 Legacy 候選：5 個 `type: passthrough`（wager, payout_odds, base_ha, is_back_bet, position_idx）、cum_bets/cum_wager（window, ROWS UNBOUNDED PRECEDING）、avg_wager_sofar（derived）、time_of_day_sin/cos（derived）；(4) Track Profile 補齊 47 個 candidates，每項含 `min_lookback_days`，與 `features.py` 的 PROFILE_FEATURE_COLS / _PROFILE_FEATURE_MIN_DAYS 對齊。 |
-| `trainer/features.py` | 新增四個 helper：`get_candidate_feature_ids(spec, track, screening_only)`、`get_all_candidate_feature_ids(spec, screening_only)`、`get_profile_min_lookback(spec)`、`coerce_feature_dtypes(df, feature_cols)`。置於 `get_profile_feature_cols` 之後、「Track B」區塊之前。 |
+| `trainer/features.py` | 新增四個 helper：`get_candidate_feature_ids(spec, track, screening_only)`、`get_all_candidate_feature_ids(spec, screening_only)`、`get_profile_min_lookback(spec)`、`coerce_feature_dtypes(df, feature_cols)`。置於 `get_profile_feature_cols` 之後、「Track Human」區塊之前。 |
 
 ### 手動驗證
 
@@ -4216,7 +4216,7 @@ ruff check trainer/features.py → All checks passed!
 | # | 嚴重度 | 類型 | 問題摘要 |
 |---|--------|------|---------|
 | 1 | **P1** | 崩潰邊界 | **訓練集未 coerce 引發 LightGBM 崩潰風險**：`screen_features` 內部對複製的 `X` 做了型別強制轉換，但 `trainer.py` 的原始 `train_df`, `valid_df` 並未被轉型。若某個特徵（如字串數字 `"123.5"`）撐過篩選，後續未轉型的 Object 欄位餵給 LightGBM 時會直接觸發例外崩潰。 |
-| 2 | **P2** | 邏輯殘留 | **`trainer.py` 仍有硬編碼列表（Step 3 未清乾淨）**：`trainer.py` 頂端依然殘留 `TRACK_B_FEATURE_COLS` 等硬編碼。且在篩選後的 Track-B 兜底邏輯（R1001）中，依然使用這個寫死的列表，而非從 `feature_spec.yaml` 取得，違反 SSOT 原則。 |
+| 2 | **P2** | 邏輯殘留 | **`trainer.py` 仍有硬編碼列表（Step 3 未清乾淨）**：`trainer.py` 頂端依然殘留 `TRACK_B_FEATURE_COLS` 等硬編碼。且在篩選後的 Track Human 兜底邏輯（R1001）中，依然使用這個寫死的列表，而非從 `feature_spec.yaml` 取得，違反 SSOT 原則。 |
 | 3 | **P3** | 效能 | **多餘的記憶體複製與迴圈**：`screen_features` 裡會 `copy()` 整個特徵矩陣並做型態強制轉換，當資料量與特徵量極大時會造成瞬間 OOM 或延遲；若在 `trainer.py` 給入前就確保型態正確，則可避免此問題。 |
 
 ### 具體修改建議
@@ -4691,16 +4691,16 @@ pytest -q
 ## Round 138 — feat-consolidation Step 8（train-serve parity 測試）
 
 ### 目標
-依 PLAN 特徵整合 Step 8 與 STATUS 下一步建議，只實作 **next 1 步**：**Train-serve parity** — 同一批資料、同一套函式，特徵值一致。本輪以「Track B」特徵（loss_streak、minutes_since_run_start）為範圍，新增一則最小可重現測試；不改 production code。
+依 PLAN 特徵整合 Step 8 與 STATUS 下一步建議，只實作 **next 1 步**：**Train-serve parity** — 同一批資料、同一套函式，特徵值一致。本輪以「Track Human」特徵（loss_streak、minutes_since_run_start）為範圍，新增一則最小可重現測試；不改 production code。
 
 ### 已修改／新增檔案
 
 | 檔案 | 變更 |
 |------|------|
-| `tests/test_feat_consolidation_step8.py` | ① 模組 docstring 補上「Train-serve parity：同一批資料、同一套函式，特徵值一致」。② **新增** `TestScorerTrainServeParityTrackB`：`test_track_b_loss_streak_minutes_since_run_match_shared_functions` — 以相同 bets/sessions/canonical_map/cutoff 呼叫 `build_features_for_scoring` 取得 scorer 輸出；在測試內依 scorer 相同邏輯做 merge+sort 後，直接呼叫 `features.compute_loss_streak`、`compute_run_boundary`；斷言 scorer 輸出的 `loss_streak`、`minutes_since_run_start` 與直接呼叫結果一致（`pd.testing.assert_series_equal`，`check_names=False`）。 |
+| `tests/test_feat_consolidation_step8.py` | ① 模組 docstring 補上「Train-serve parity：同一批資料、同一套函式，特徵值一致」。② **新增** `TestScorerTrainServeParityTrackHuman`：`test_track_human_loss_streak_minutes_since_run_match_shared_functions` — 以相同 bets/sessions/canonical_map/cutoff 呼叫 `build_features_for_scoring` 取得 scorer 輸出；在測試內依 scorer 相同邏輯做 merge+sort 後，直接呼叫 `features.compute_loss_streak`、`compute_run_boundary`；斷言 scorer 輸出的 `loss_streak`、`minutes_since_run_start` 與直接呼叫結果一致（`pd.testing.assert_series_equal`，`check_names=False`）。 |
 
 ### 手動驗證
-1. `python -m pytest tests/test_feat_consolidation_step8.py::TestScorerTrainServeParityTrackB -v` → 1 passed  
+1. `python -m pytest tests/test_feat_consolidation_step8.py::TestScorerTrainServeParityTrackHuman -v` → 1 passed  
 2. `python -m pytest tests/test_feat_consolidation_step8.py -v` → 9 passed（含本輪 1 則）  
 3. `pytest -q` → 603 passed, 4 skipped  
 
@@ -4716,27 +4716,27 @@ pytest -q
 
 ## Round 138 Review — 目前變更（Step 8 train-serve parity 測試）Code Review
 
-**審查範圍**：PLAN.md、STATUS.md、DECISION_LOG.md 已讀；針對 Round 138 新增的 `TestScorerTrainServeParityTrackB`（`tests/test_feat_consolidation_step8.py`）與其重複的 scorer 前置邏輯進行審查。不重寫整套，僅列問題與建議。
+**審查範圍**：PLAN.md、STATUS.md、DECISION_LOG.md 已讀；針對 Round 138 新增的 `TestScorerTrainServeParityTrackHuman`（`tests/test_feat_consolidation_step8.py`）與其重複的 scorer 前置邏輯進行審查。不重寫整套，僅列問題與建議。
 
 ---
 
 ### 1. 可維護性／漂移風險：測試內重複 scorer 前置邏輯
 
-**問題**：測試內手動複製了 `build_features_for_scoring` 的 pre–Track B 步驟（補欄、型別正規化、merge、fillna、sort）。若日後 scorer 調整該段（例如多一步正規化、或 merge 前後順序改變），測試內的「複製版」不會同步更新，可能出現：一、測試無故失敗（scorer 仍正確）；二、測試仍過但實際 parity 已破。亦即測試與實作存在重複，易產生 drift。
+**問題**：測試內手動複製了 `build_features_for_scoring` 的 pre–Track Human 步驟（補欄、型別正規化、merge、fillna、sort）。若日後 scorer 調整該段（例如多一步正規化、或 merge 前後順序改變），測試內的「複製版」不會同步更新，可能出現：一、測試無故失敗（scorer 仍正確）；二、測試仍過但實際 parity 已破。亦即測試與實作存在重複，易產生 drift。
 
-**具體修改建議**：在測試上方加註註解，明確列出「本測試複製之 scorer 步驟」與對應 `build_features_for_scoring` 的區段（例如：補欄 613–619、payout_complete_dtm 正規化 621–625、merge 631–641、sort 644–646），並註明：若 scorer 該段有變更，此測試之複製邏輯須一併更新。可選：在 scorer 或共用的 test helper 中抽出 `_prepare_bets_for_track_b(bets, sessions, canonical_map, cutoff)`（僅供測試或內部使用），測試改為呼叫該 helper，避免雙份實作；若暫不抽 helper，至少以註解鎖定契約。
+**具體修改建議**：在測試上方加註註解，明確列出「本測試複製之 scorer 步驟」與對應 `build_features_for_scoring` 的區段（例如：補欄 613–619、payout_complete_dtm 正規化 621–625、merge 631–641、sort 644–646），並註明：若 scorer 該段有變更，此測試之複製邏輯須一併更新。可選：在 scorer 或共用的 test helper 中抽出 `_prepare_bets_for_track_human(bets, sessions, canonical_map, cutoff)`（僅供測試或內部使用），測試改為呼叫該 helper，避免雙份實作；若暫不抽 helper，至少以註解鎖定契約。
 
-**希望新增的測試**：不需新增另一則測試；建議在既有 `test_track_b_loss_streak_minutes_since_run_match_shared_functions` 的 docstring 或類別 docstring 中註明「若 build_features_for_scoring 的 merge/sort/正規化步驟變更，此處複製邏輯須同步更新」，或新增一個 `test_build_features_for_scoring_prep_contract`：對固定輸入呼叫 `build_features_for_scoring`，斷言輸出具備 `canonical_id`、且依 `(canonical_id, payout_complete_dtm, bet_id)` 排序（例如檢查 `out.sort_values([...]).reset_index(drop=True).index.equals(out.index)`），以文件化 scorer 的 prep 契約，減少「改了 scorer 卻忘了改測試複製」的風險。
+**希望新增的測試**：不需新增另一則測試；建議在既有 `test_track_human_loss_streak_minutes_since_run_match_shared_functions` 的 docstring 或類別 docstring 中註明「若 build_features_for_scoring 的 merge/sort/正規化步驟變更，此處複製邏輯須同步更新」，或新增一個 `test_build_features_for_scoring_prep_contract`：對固定輸入呼叫 `build_features_for_scoring`，斷言輸出具備 `canonical_id`、且依 `(canonical_id, payout_complete_dtm, bet_id)` 排序（例如檢查 `out.sort_values([...]).reset_index(drop=True).index.equals(out.index)`），以文件化 scorer 的 prep 契約，減少「改了 scorer 卻忘了改測試複製」的風險。
 
 ---
 
 ### 2. 邊界條件：僅單一 player / 單一 canonical_id
 
-**問題**：目前測試僅使用單一 `player_id`（100）與單一 `canonical_id`（c100）。Track B 的 `compute_loss_streak`、`compute_run_boundary` 均依 `canonical_id` 分組；若有多個 canonical_id，排序與分組順序會影響結果。未覆蓋「多玩家」情境，日後 scorer 在 merge 或 sort 上若有細微差異（例如多玩家時 row 順序不同），parity 可能僅在多玩家時破功而未被發現。
+**問題**：目前測試僅使用單一 `player_id`（100）與單一 `canonical_id`（c100）。Track Human 的 `compute_loss_streak`、`compute_run_boundary` 均依 `canonical_id` 分組；若有多個 canonical_id，排序與分組順序會影響結果。未覆蓋「多玩家」情境，日後 scorer 在 merge 或 sort 上若有細微差異（例如多玩家時 row 順序不同），parity 可能僅在多玩家時破功而未被發現。
 
 **具體修改建議**：新增一則測試，使用兩名玩家（例如 `player_id` 100 與 200，`canonical_map` 對應 c100、c200），bets 交錯或分組皆可，其餘前置與 parity 斷言方式同既有測試；斷言 scorer 輸出的 `loss_streak`、`minutes_since_run_start` 與直接呼叫 `compute_loss_streak` / `compute_run_boundary` 在相同 prepared DataFrame 上之結果一致。
 
-**希望新增的測試**：`test_track_b_parity_two_players` — 輸入含兩筆 player_id（100, 200）、對應兩筆 canonical_id；`build_features_for_scoring` 與測試內複製的 merge+sort 後，對 prepared bets 呼叫 `compute_loss_streak`、`compute_run_boundary`；assert 兩路輸出的 `loss_streak`、`minutes_since_run_start` 一致（可 `reset_index(drop=True)` 後比較）。
+**希望新增的測試**：`test_track_human_parity_two_players` — 輸入含兩筆 player_id（100, 200）、對應兩筆 canonical_id；`build_features_for_scoring` 與測試內複製的 merge+sort 後，對 prepared bets 呼叫 `compute_loss_streak`、`compute_run_boundary`；assert 兩路輸出的 `loss_streak`、`minutes_since_run_start` 一致（可 `reset_index(drop=True)` 後比較）。
 
 ---
 
@@ -4744,9 +4744,9 @@ pytest -q
 
 **問題**：目前測試使用 tz-naive 的 `payout_complete_dtm` 與 tz-aware 的 `cutoff`；scorer 會將 cutoff 轉成 naive、並在必要時將 payout_complete_dtm 轉為 HK 再 strip。若未來有人改動 scorer 的時區正規化（例如改用 UTC 或不同預設），parity 在「tz-aware 輸入」路徑可能受影響。目前測試未顯式覆蓋「輸入為 tz-aware datetime」的情境，該行為未被鎖定。
 
-**具體修改建議**：新增一則測試，使用 tz-aware 的 `payout_complete_dtm`（例如 `pd.to_datetime(..., utc=True).dt.tz_convert(HK_TZ)`）或 tz-aware 的 `cutoff`，其餘同既有 parity 流程；斷言 scorer 輸出與直接呼叫 shared functions 的結果仍一致，以鎖定「時區正規化後 Track B 仍與 shared 函式一致」。
+**具體修改建議**：新增一則測試，使用 tz-aware 的 `payout_complete_dtm`（例如 `pd.to_datetime(..., utc=True).dt.tz_convert(HK_TZ)`）或 tz-aware 的 `cutoff`，其餘同既有 parity 流程；斷言 scorer 輸出與直接呼叫 shared functions 的結果仍一致，以鎖定「時區正規化後 Track Human 仍與 shared 函式一致」。
 
-**希望新增的測試**：`test_track_b_parity_tz_aware_inputs` — 同一批 bets 但 `payout_complete_dtm` 改為 tz-aware（e.g. Asia/Hong_Kong 或 UTC），cutoff 維持或改為 tz-aware；呼叫 `build_features_for_scoring` 與測試內 prepared bets（含相同 tz 轉換）後呼叫 `compute_loss_streak`、`compute_run_boundary`；assert `loss_streak`、`minutes_since_run_start` 一致。
+**希望新增的測試**：`test_track_human_parity_tz_aware_inputs` — 同一批 bets 但 `payout_complete_dtm` 改為 tz-aware（e.g. Asia/Hong_Kong 或 UTC），cutoff 維持或改為 tz-aware；呼叫 `build_features_for_scoring` 與測試內 prepared bets（含相同 tz 轉換）後呼叫 `compute_loss_streak`、`compute_run_boundary`；assert `loss_streak`、`minutes_since_run_start` 一致。
 
 ---
 
@@ -4778,22 +4778,22 @@ pytest -q
 
 | 檔案 | 新增內容 |
 |------|----------|
-| `tests/test_feat_consolidation_step8.py` | 在 **TestScorerTrainServeParityTrackB** 內新增 3 則測試（對應 Review #1–#3）： |
+| `tests/test_feat_consolidation_step8.py` | 在 **TestScorerTrainServeParityTrackHuman** 內新增 3 則測試（對應 Review #1–#3）： |
 
 | 測試名稱 | 對應 Review | 斷言摘要 |
 |----------|-------------|----------|
 | `test_build_features_for_scoring_prep_contract` | #1 prep 契約 | 固定輸入呼叫 `build_features_for_scoring`，斷言輸出具 `canonical_id`、且依 `(canonical_id, payout_complete_dtm, bet_id)` 排序（`out` 與 `out.sort_values(...)` 相等）。 |
-| `test_track_b_parity_two_players` | #2 多玩家 | 兩名 player_id（100, 200）、兩筆 canonical_id；scorer 輸出與測試內 prepared bets 直接呼叫 `compute_loss_streak` / `compute_run_boundary` 之結果一致。 |
-| `test_track_b_parity_tz_aware_inputs` | #3 tz-aware 輸入 | `payout_complete_dtm` 為 tz-aware（UTC→HK）；`build_features_for_scoring` 不崩潰、回傳 3 列且含 `loss_streak`、`minutes_since_run_start`。 |
+| `test_track_human_parity_two_players` | #2 多玩家 | 兩名 player_id（100, 200）、兩筆 canonical_id；scorer 輸出與測試內 prepared bets 直接呼叫 `compute_loss_streak` / `compute_run_boundary` 之結果一致。 |
+| `test_track_human_parity_tz_aware_inputs` | #3 tz-aware 輸入 | `payout_complete_dtm` 為 tz-aware（UTC→HK）；`build_features_for_scoring` 不崩潰、回傳 3 列且含 `loss_streak`、`minutes_since_run_start`。 |
 
 ### 執行方式
 
 ```bash
 # 僅跑 Round 138 Review 對應的 3 則新測試
-python -m pytest tests/test_feat_consolidation_step8.py::TestScorerTrainServeParityTrackB::test_build_features_for_scoring_prep_contract tests/test_feat_consolidation_step8.py::TestScorerTrainServeParityTrackB::test_track_b_parity_two_players tests/test_feat_consolidation_step8.py::TestScorerTrainServeParityTrackB::test_track_b_parity_tz_aware_inputs -v
+python -m pytest tests/test_feat_consolidation_step8.py::TestScorerTrainServeParityTrackHuman::test_build_features_for_scoring_prep_contract tests/test_feat_consolidation_step8.py::TestScorerTrainServeParityTrackHuman::test_track_human_parity_two_players tests/test_feat_consolidation_step8.py::TestScorerTrainServeParityTrackHuman::test_track_human_parity_tz_aware_inputs -v
 
-# 跑整個 TestScorerTrainServeParityTrackB（4 則，含既有 1 + 新 3）
-python -m pytest tests/test_feat_consolidation_step8.py::TestScorerTrainServeParityTrackB -v
+# 跑整個 TestScorerTrainServeParityTrackHuman（4 則，含既有 1 + 新 3）
+python -m pytest tests/test_feat_consolidation_step8.py::TestScorerTrainServeParityTrackHuman -v
 
 # 跑整個 feat_consolidation Step 8 測試檔
 python -m pytest tests/test_feat_consolidation_step8.py -v
@@ -7962,7 +7962,7 @@ pytest tests/ -q
 
 ### 7. 正確性（R1001 track_human fallback）
 
-**結論**：R1001 使用 `train_df.columns` 判斷 `_missing_track_b`，即「在完整 train 中存在的 track_human 欄位」，與「screening 用 sample」無衝突；fallback 語義正確。無需修改。
+**結論**：R1001 使用 `train_df.columns` 判斷 `_missing_track_human`，即「在完整 train 中存在的 track_human 欄位」，與「screening 用 sample」無衝突；fallback 語義正確。無需修改。
 
 ---
 
@@ -10599,7 +10599,7 @@ All checks passed!
 
 | 檔案 | 修改摘要 |
 |------|---------|
-| `trainer/backtester.py` | (1) 新增 import：`load_player_profile`、`join_player_profile`（自 trainer / trainer.trainer）。(2) **Track LLM 順序**：將 feature_spec 載入與 `compute_track_llm_features` 移至 **add_track_b_features 之後、compute_labels 之前**；改為對 **bets**（完整）呼叫 `compute_track_llm_features(bets, ...)`，結果 merge 回 **bets**，再執行 `compute_labels(bets_df=bets, ...)` 與時間過濾得到 `labeled`。(3) **player_profile PIT join**：在 label 過濾後、打分前呼叫 `profile_df = load_player_profile(window_start, window_end, use_local_parquet=False, canonical_ids=_rated_cids)`，再 `labeled = join_player_profile(labeled, profile_df)`。 |
+| `trainer/backtester.py` | (1) 新增 import：`load_player_profile`、`join_player_profile`（自 trainer / trainer.trainer）。(2) **Track LLM 順序**：將 feature_spec 載入與 `compute_track_llm_features` 移至 **add_track_human_features 之後、compute_labels 之前**；改為對 **bets**（完整）呼叫 `compute_track_llm_features(bets, ...)`，結果 merge 回 **bets**，再執行 `compute_labels(bets_df=bets, ...)` 與時間過濾得到 `labeled`。(3) **player_profile PIT join**：在 label 過濾後、打分前呼叫 `profile_df = load_player_profile(window_start, window_end, use_local_parquet=False, canonical_ids=_rated_cids)`，再 `labeled = join_player_profile(labeled, profile_df)`。 |
 
 ### 手動驗證
 - 執行一次 backtest（有 local parquet 或 ClickHouse）：  
@@ -13142,11 +13142,11 @@ All checks passed!
 | 檔案 | 修改摘要 |
 |------|----------|
 | `trainer/features.py` | **compute_loss_streak**：新增可選參數 `lookback_hours: Optional[float] = None`。有值時對每個 row 只使用同 `canonical_id` 且 `payout_complete_dtm` 在 `(t_i - lookback_hours, t_i]` 的 bets，在 slice 上跑 streak 邏輯，回傳 reindex 後的 Series；`None` 時維持原本向量化路徑。**compute_run_boundary**：同上新增 `lookback_hours`；有值時對每個 row 只使用同 canonical_id 且時間在 `(t - lookback_hours, t]` 的 rows，在 slice 上算 run_id、minutes_since_run_start、bets_in_run_so_far、wager_sum_in_run_so_far（wager 依 run 累加），取 slice 最後一行寫回；`None` 時走原本向量化路徑。 |
-| `trainer/trainer.py` | **add_track_b_features**：新增參數 `lookback_hours: Optional[float] = None`，傳給 `compute_loss_streak` 與 `compute_run_boundary`。**process_chunk**：在呼叫 add_track_b_features 前設定 `_lookback_hours = getattr(_cfg, "SCORER_LOOKBACK_HOURS", None)`，以 `lookback_hours=_lookback_hours` 呼叫。**_chunk_cache_key**：在 `cfg_str` 中加入 `"SCORER_LOOKBACK_HOURS": getattr(_cfg, "SCORER_LOOKBACK_HOURS", None)`，使變更常數時 chunk cache 失效。 |
+| `trainer/trainer.py` | **add_track_human_features**：新增參數 `lookback_hours: Optional[float] = None`，傳給 `compute_loss_streak` 與 `compute_run_boundary`。**process_chunk**：在呼叫 add_track_human_features 前設定 `_lookback_hours = getattr(_cfg, "SCORER_LOOKBACK_HOURS", None)`，以 `lookback_hours=_lookback_hours` 呼叫。**_chunk_cache_key**：在 `cfg_str` 中加入 `"SCORER_LOOKBACK_HOURS": getattr(_cfg, "SCORER_LOOKBACK_HOURS", None)`，使變更常數時 chunk cache 失效。 |
 
 ### 如何手動驗證
 
-- 跑一小段訓練並確認有讀取 config 的 `SCORER_LOOKBACK_HOURS`（例如 `--days 1`），檢查 log 或中斷點確認 `add_track_b_features(..., lookback_hours=8)`（若 config 為 8）。
+- 跑一小段訓練並確認有讀取 config 的 `SCORER_LOOKBACK_HOURS`（例如 `--days 1`），檢查 log 或中斷點確認 `add_track_human_features(..., lookback_hours=8)`（若 config 為 8）。
 - 或執行既有 feature 測試：`python -m pytest tests/test_features.py -v`，確認 `compute_loss_streak` / `compute_run_boundary` 在 `lookback_hours` 有值與 `None` 的案例皆通過。
 - 確認 config 已定義 `SCORER_LOOKBACK_HOURS`（如 8）：`tests/test_config.py` 與 `tests/test_review_risks_scorer_defaults_in_config.py` 已涵蓋常數存在且為正整數。
 
@@ -13170,7 +13170,7 @@ python -m pytest tests/ -q
 
 ## Trainer 對齊 SCORER_LOOKBACK_HOURS — Code Review（關鍵決策）
 
-**審查範圍**：`trainer/features.py` 的 `compute_loss_streak` / `compute_run_boundary` 的 `lookback_hours` 路徑，以及 `trainer/trainer.py` 的 `add_track_b_features`、`process_chunk`、`_chunk_cache_key` 對 `SCORER_LOOKBACK_HOURS` 的使用。  
+**審查範圍**：`trainer/features.py` 的 `compute_loss_streak` / `compute_run_boundary` 的 `lookback_hours` 路徑，以及 `trainer/trainer.py` 的 `add_track_human_features`、`process_chunk`、`_chunk_cache_key` 對 `SCORER_LOOKBACK_HOURS` 的使用。  
 **參考**：PLAN.md、STATUS.md、DECISION_LOG.md。不重寫整套，僅列風險與建議。
 
 ---
@@ -13185,19 +13185,19 @@ python -m pytest tests/ -q
 
 **希望新增的測試**：
 - `tests/test_features.py`：`test_compute_loss_streak_lookback_hours_zero_raises_or_warns`（若採 raise）或 `test_compute_loss_streak_lookback_hours_negative_raises`；同様 `test_compute_run_boundary_lookback_hours_zero_raises`。
-- 若採 trainer 層 warning：在 `tests/test_trainer.py`（或專用 test）中 patch `SCORER_LOOKBACK_HOURS = 0`，呼叫 `add_track_b_features`，斷言得到全歷史結果且 log 出現預期 warning（或斷言 raise）。
+- 若採 trainer 層 warning：在 `tests/test_trainer.py`（或專用 test）中 patch `SCORER_LOOKBACK_HOURS = 0`，呼叫 `add_track_human_features`，斷言得到全歷史結果且 log 出現預期 warning（或斷言 raise）。
 
 ---
 
-### 2. add_track_b_features 中 run_* 與 loss_streak 對「超出 cutoff 列」處理不一致
+### 2. add_track_human_features 中 run_* 與 loss_streak 對「超出 cutoff 列」處理不一致
 
-**問題**：`compute_loss_streak` 回傳的 Series 經 `streak.reindex(df.index, fill_value=0)` 寫入，故 `payout_complete_dtm > window_end` 的列會得到 `loss_streak = 0`。`compute_run_boundary` 在內部計算完後會做 `df = df[df["payout_complete_dtm"] <= cutoff_ts]` 再回傳，因此回傳的 `run_df` 的 index 為 cutoff 後的子集。在 `add_track_b_features` 中 `df["run_id"] = run_df.get("run_id", ...)` 等為「依 index 對齊賦值」，超出 cutoff 的列不在 `run_df` 的 index 中，會得到 **NaN**（而非 0）。與 `loss_streak` 的 fill_value=0 不一致，下游若假設「無歷史則為 0」可能出錯或觸發 NaN 傳播。
+**問題**：`compute_loss_streak` 回傳的 Series 經 `streak.reindex(df.index, fill_value=0)` 寫入，故 `payout_complete_dtm > window_end` 的列會得到 `loss_streak = 0`。`compute_run_boundary` 在內部計算完後會做 `df = df[df["payout_complete_dtm"] <= cutoff_ts]` 再回傳，因此回傳的 `run_df` 的 index 為 cutoff 後的子集。在 `add_track_human_features` 中 `df["run_id"] = run_df.get("run_id", ...)` 等為「依 index 對齊賦值」，超出 cutoff 的列不在 `run_df` 的 index 中，會得到 **NaN**（而非 0）。與 `loss_streak` 的 fill_value=0 不一致，下游若假設「無歷史則為 0」可能出錯或觸發 NaN 傳播。
 
 **具體修改建議**：
-- 在 `add_track_b_features` 中，對 `run_df` 的四個欄位（`run_id`、`minutes_since_run_start`、`bets_in_run_so_far`、`wager_sum_in_run_so_far`）改為先 `reindex(df.index, fill_value=0)`（或對應型別的 0/0.0）再賦值給 `df`，使與 `loss_streak` 一致：超出 cutoff 的列皆為 0。
+- 在 `add_track_human_features` 中，對 `run_df` 的四個欄位（`run_id`、`minutes_since_run_start`、`bets_in_run_so_far`、`wager_sum_in_run_so_far`）改為先 `reindex(df.index, fill_value=0)`（或對應型別的 0/0.0）再賦值給 `df`，使與 `loss_streak` 一致：超出 cutoff 的列皆為 0。
 
 **希望新增的測試**：
-- `tests/test_features.py` 或 `tests/test_trainer.py`：建立一組 `bets` 其中部分列 `payout_complete_dtm > window_end`，呼叫 `add_track_b_features(bets, ..., window_end, lookback_hours=8)`，斷言這些列上 `loss_streak` 與 `run_id` / `minutes_since_run_start` / `bets_in_run_so_far` / `wager_sum_in_run_so_far` 均為 0（或 0.0），且無 NaN。
+- `tests/test_features.py` 或 `tests/test_trainer.py`：建立一組 `bets` 其中部分列 `payout_complete_dtm > window_end`，呼叫 `add_track_human_features(bets, ..., window_end, lookback_hours=8)`，斷言這些列上 `loss_streak` 與 `run_id` / `minutes_since_run_start` / `bets_in_run_so_far` / `wager_sum_in_run_so_far` 均為 0（或 0.0），且無 NaN。
 
 ---
 
@@ -13327,7 +13327,7 @@ python -m pytest tests/ -q
 | 檔案 | 修改摘要 |
 |------|----------|
 | `trainer/features.py` | **compute_loss_streak**：在 missing-columns 檢查後新增 `if lookback_hours is not None and lookback_hours <= 0: raise ValueError("lookback_hours must be positive when set")`。**compute_run_boundary**：同上。 |
-| `trainer/trainer.py` | **add_track_b_features**：run_boundary 回傳後，對 `run_id` / `minutes_since_run_start` / `bets_in_run_so_far` / `wager_sum_in_run_so_far` 改為 `run_df[col].reindex(df.index, fill_value=0)`（或 0.0）再賦值，使超出 cutoff 的列為 0 而非 NaN（與 loss_streak 一致）。 |
+| `trainer/trainer.py` | **add_track_human_features**：run_boundary 回傳後，對 `run_id` / `minutes_since_run_start` / `bets_in_run_so_far` / `wager_sum_in_run_so_far` 改為 `run_df[col].reindex(df.index, fill_value=0)`（或 0.0）再賦值，使超出 cutoff 的列為 0 而非 NaN（與 loss_streak 一致）。 |
 
 ### 修改檔案（tests — decorator 過時與行為對齊）
 

@@ -44,14 +44,14 @@ class TestR500BacktesterTzAwareBoundary(unittest.TestCase):
         # Keep the execution path minimal and deterministic:
         # - apply_dq returns our tiny fixture
         # - canonical map empty -> fallback canonical_id path
-        # - Track-B returns input unchanged (we only care about label-stage tz mismatch)
+        # - Track Human returns input unchanged (we only care about label-stage tz mismatch)
         # - load_player_profile / join_player_profile mocked so backtest runs without ClickHouse
         def _minimal_join_profile(labeled, profile_df):
             return labeled.copy()
 
         with patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)), patch.object(
             backtester_mod, "build_canonical_mapping_from_df", return_value=pd.DataFrame()
-        ), patch.object(backtester_mod, "add_track_b_features", side_effect=lambda df, *_: df), patch.object(
+        ), patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_: df), patch.object(
             backtester_mod, "load_player_profile", return_value=None
         ), patch.object(backtester_mod, "join_player_profile", side_effect=_minimal_join_profile):
             # R500: should not raise TypeError (tz-aware window); no ClickHouse required (mocked).
@@ -128,9 +128,9 @@ class TestR503R504DesignGuardrails(unittest.TestCase):
 
 
 class TestR505TrackBCutoffDocContract(unittest.TestCase):
-    """R505: Track B docstrings should explicitly state tz-naive cutoff contract."""
+    """R505: Track Human docstrings should explicitly state tz-naive cutoff contract."""
 
-    def test_track_b_docstrings_should_mention_tz_naive_cutoff(self):
+    def test_track_human_docstrings_should_mention_tz_naive_cutoff(self):
         targets = [
             features_mod.compute_loss_streak,
             features_mod.compute_run_boundary,

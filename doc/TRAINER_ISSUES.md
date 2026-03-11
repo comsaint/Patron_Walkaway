@@ -43,7 +43,7 @@
 | **TRN-05** | ✅ 已修復 | `features.compute_table_hc` 僅用 **bets**（`table_id`, `payout_complete_dtm`, `player_id`）與 cutoff，不依賴 `t_session.session_end_dtm`；訓練與推論語義一致。 |
 | **TRN-06** | ✅ 已修復 | `labels.compute_labels` 實作 H1：末端 bet 若 `payout + WALKAWAY_GAP_MIN > extended_end` 則標為 **censored**，不參與訓練/評估，避免窗口末端標籤膨脹。 |
 | **TRN-07** | ✅ 已修復 | Phase 1 已移除 `rolling_cache.csv` / `features_buffer.csv`。Chunk 快取改為 `.data/chunks/chunk_{window_start}_{window_end}.parquet`，檔名即含窗口，不會誤用他次窗口資料。 |
-| **TRN-08** | ✅ 已修復 | 訓練端 Track B 改為共用 `features.compute_loss_streak` / `compute_run_boundary` / `compute_table_hc`；scorer 亦從 `features` 匯入，train–serve 語義一致。舊 rolling 路徑已移除。 |
+| **TRN-08** | ✅ 已修復 | 訓練端 Track Human 改為共用 `features.compute_loss_streak` / `compute_run_boundary` / `compute_table_hc`；scorer 亦從 `features` 匯入，train–serve 語義一致。舊 rolling 路徑已移除。 |
 | **TRN-09** | ✅ 已修復 | `features.compute_loss_streak` 以 `(df["status"] == "LOSE")` 判斷，無 `isinstance(st, str)`；並有 cutoff 與 G3 排序。若 DB 使用其他值域需在 ETL 層對應。 |
 | **TRN-10** | ✅ 已修復 | `add_legacy_features` merge 時僅帶入 sessions 側 `["session_id", "session_start_dtm", "session_end_dtm"]`，避免 `player_id`/`table_id` 碰撞。 |
 | **TRN-11** | ⚠️ 部分緩解 | 單模型閾值仍由 `_train_one_model` 內「best precision (min_recall≥2%)」選出；**backtester** 則以 Optuna 2D 搜尋並以 **G1_FBETA** 最大化 F-beta。實務上可依 backtester 產出閾值覆寫 artifact 或改 trainer 內改為 F-beta 目標。 |

@@ -91,7 +91,7 @@ try:
         load_clickhouse_data,
         load_local_parquet,
         apply_dq,
-        add_track_b_features,
+        add_track_human_features,
         compute_track_llm_features,
         load_feature_spec,
         load_player_profile,
@@ -109,7 +109,7 @@ except ModuleNotFoundError:
         load_clickhouse_data,
         load_local_parquet,
         apply_dq,
-        add_track_b_features,
+        add_track_human_features,
         compute_track_llm_features,
         load_feature_spec,
         load_player_profile,
@@ -570,7 +570,7 @@ def backtest(
     bets["canonical_id"] = bets["canonical_id"].fillna(bets["player_id"].astype(str))
 
     # --- Track-B features (full history for context) ---
-    bets = add_track_b_features(bets, canonical_map, window_end)
+    bets = add_track_human_features(bets, canonical_map, window_end)
 
     # --- Track LLM on FULL bets (PLAN § Train–Serve Parity) ---
     # Compute before label filtering so window features see same history as trainer/scorer.

@@ -26,7 +26,7 @@ class TestR1000TrackLlmDetection(unittest.TestCase):
 class TestR1001ScreeningSanity(unittest.TestCase):
     """R1001: screening should preserve minimum Track-B coverage."""
 
-    def test_screening_should_keep_at_least_one_track_b_feature(self):
+    def test_screening_should_keep_at_least_one_track_human_feature(self):
         src = inspect.getsource(trainer_mod.run_pipeline)
         # R123-2 (feat-consolidation): hardcoded TRACK_B_FEATURE_COLS was replaced with
         # YAML-driven track_human lookup. Assert the new implementation still enforces

@@ -7,7 +7,7 @@ Key changes from pre-Phase-1 version
 * Single rated-model artifact: model.pkl (v10 DEC-021; falls back to
   rated_model.pkl or legacy walkaway_model.pkl when model.pkl is absent).
 * D2 identity resolution via identity.py build_canonical_mapping_from_df.
-* Track B features via features.py (compute_loss_streak / compute_run_boundary)
+* Track Human features via features.py (compute_loss_streak / compute_run_boundary)
   — guarantees train-serve parity with trainer.py. (table_hc deferred to Phase 2.)
 * player_profile PIT join (R79): rated bets enriched with player profile
   features via as-of merge (snapshot_dtm <= bet_time); profile features stay NaN
@@ -615,7 +615,7 @@ def build_features_for_scoring(
     Steps
     -----
     1. D2 identity: attach canonical_id from canonical_map.
-    2. Track B (features.py): loss_streak, run_id, minutes_since_run_start
+    2. Track Human (features.py): loss_streak, run_id, minutes_since_run_start
        — same functions as trainer.py. (table_hc deferred to Phase 2.)
     3. Session rolling stats: bets_last_5/15/30m, wager_last_10/30m,
        cum_bets, cum_wager, avg_wager_sofar, session_duration_min,
@@ -662,12 +662,12 @@ def build_features_for_scoring(
         bets_df["player_id"].astype(str)
     )
 
-    # Stable sort (required by Track B functions and labels.py)
+    # Stable sort (required by Track Human functions and labels.py)
     bets_df = bets_df.sort_values(
         ["canonical_id", "payout_complete_dtm", "bet_id"], kind="stable"
     ).reset_index(drop=True)
 
-    # ── Track B ───────────────────────────────────────────────────────────
+    # ── Track Human ──────────────────────────────────────────────────────────
     bets_df["loss_streak"] = compute_loss_streak(
         bets_df, cutoff_time=cutoff_naive
     ).fillna(0)
@@ -1127,7 +1127,7 @@ def score_once(
     1. Fetch bets + sessions (FND-01 CTE, H2 session_avail_dtm gate).
     2. D2 identity: load from data/canonical_mapping.parquet if cutoff >= now and not --rebuild;
        else build_canonical_mapping_from_df(sessions, cutoff_dtm=now_hk).
-    3. Build Track B + session rolling features (train-serve parity).
+    3. Build Track Human + session rolling features (train-serve parity).
     4. Set is_rated flag: canonical_id in rated mapping.
     5. Single rated model scoring via _score_df (v10 DEC-021).
     6. SHAP reason codes for rated alert candidates.

@@ -10,11 +10,11 @@ from __future__ import annotations
 import unittest
 
 
-class TestScorerTrainServeParityTrackB(unittest.TestCase):
-    """Step 8: Same batch of data + same Track B functions (features.py) -> same feature values (scorer path)."""
+class TestScorerTrainServeParityTrackHuman(unittest.TestCase):
+    """Step 8: Same batch of data + same Track Human functions (features.py) -> same feature values (scorer path)."""
 
-    def test_track_b_loss_streak_minutes_since_run_match_shared_functions(self):
-        """Scorer build_features_for_scoring Track B columns match direct features.compute_* on same prepared bets."""
+    def test_track_human_loss_streak_minutes_since_run_match_shared_functions(self):
+        """Scorer build_features_for_scoring Track Human columns match direct features.compute_* on same prepared bets."""
         import pandas as pd
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -49,7 +49,7 @@ class TestScorerTrainServeParityTrackB(unittest.TestCase):
         self.assertIn("loss_streak", out.columns)
         self.assertIn("minutes_since_run_start", out.columns)
 
-        # Replicate scorer prep (merge + sort) and call shared Track B functions
+        # Replicate scorer prep (merge + sort) and call shared Track Human functions
         bets_df = bets.copy()
         for col in ["position_idx", "payout_odds", "base_ha", "is_back_bet", "wager"]:
             if col not in bets_df.columns:
@@ -115,8 +115,8 @@ class TestScorerTrainServeParityTrackB(unittest.TestCase):
             check_like=True,
         )
 
-    def test_track_b_parity_two_players(self):
-        """R138-2: Track B parity holds with two players / two canonical_ids."""
+    def test_track_human_parity_two_players(self):
+        """R138-2: Track Human parity holds with two players / two canonical_ids."""
         import pandas as pd
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -179,8 +179,8 @@ class TestScorerTrainServeParityTrackB(unittest.TestCase):
         pd.testing.assert_series_equal(out["loss_streak"].reset_index(drop=True), direct_streak.reset_index(drop=True), check_names=False)
         pd.testing.assert_series_equal(out["minutes_since_run_start"].reset_index(drop=True), direct_minutes.reset_index(drop=True), check_names=False)
 
-    def test_track_b_parity_tz_aware_inputs(self):
-        """R138-3: build_features_for_scoring with tz-aware payout_complete_dtm runs and produces sane Track B columns."""
+    def test_track_human_parity_tz_aware_inputs(self):
+        """R138-3: build_features_for_scoring with tz-aware payout_complete_dtm runs and produces sane Track Human columns."""
         import pandas as pd
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -243,7 +243,7 @@ class TestScorerBackwardCompatFeatureList(unittest.TestCase):
         # Profile column should still have NaN where it was NaN (not zero-filled)
         self.assertTrue(pd.isna(out["days_since_last_session"].iloc[0]))
 
-    def test_score_df_with_track_b_and_legacy_does_not_crash(self):
+    def test_score_df_with_track_human_and_legacy_does_not_crash(self):
         """feature_list_meta with only track 'B' and 'legacy' runs without error."""
         import pandas as pd
 
@@ -312,7 +312,7 @@ class TestScorerNoSessionComputesFeatureList(unittest.TestCase):
 
         HK_TZ = ZoneInfo("Asia/Hong_Kong")
         cutoff = datetime(2026, 3, 1, 12, 0, 0, tzinfo=HK_TZ)
-        # Minimal bets: no session data needed for Track B + legacy raw columns
+        # Minimal bets: no session data needed for Track Human + legacy raw columns
         bets = pd.DataFrame({
             "bet_id": [1, 2],
             "session_id": ["s1", "s1"],
@@ -331,7 +331,7 @@ class TestScorerNoSessionComputesFeatureList(unittest.TestCase):
 
         out = build_features_for_scoring(bets, sessions, canonical_map, cutoff)
         self.assertFalse(out.empty, "build_features_for_scoring should return non-empty DataFrame")
-        # feature_list that does not depend on session (Track B + legacy passthrough)
+        # feature_list that does not depend on session (Track Human + legacy passthrough)
         feature_list = ["wager", "loss_streak", "minutes_since_run_start"]
         for col in feature_list:
             self.assertIn(col, out.columns, f"feature_list column {col} should be present when session is empty")

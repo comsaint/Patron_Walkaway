@@ -13,7 +13,7 @@ text = re.sub(
 
 # Remove the call to add_legacy_features
 text = re.sub(
-    r'    # --- Legacy \(Track B\) features ---\n    labeled = add_legacy_features\(labeled, sessions\)\n\n',
+    r'    # --- Legacy (Track Human) features ---\n    labeled = add_legacy_features\(labeled, sessions\)\n\n',
     '',
     text,
     flags=re.DOTALL
@@ -64,7 +64,7 @@ text = re.sub(
 
 # Remove the warnings related to TRACK_B_FEATURE_COLS
 text = re.sub(
-    r'        if not _screened_set\.intersection\(TRACK_B_FEATURE_COLS\):.*?len\(_missing_track_b\),\n                \)\n                screened_cols\.extend\(_missing_track_b\)\n',
+    r'        if not _screened_set\.intersection\(TRACK_HUMAN_FEATURE_COLS\):.*?len\(_missing_track_human\),\n                \)\n                screened_cols\.extend\(_missing_track_human\)\n',
     '',
     text,
     flags=re.DOTALL

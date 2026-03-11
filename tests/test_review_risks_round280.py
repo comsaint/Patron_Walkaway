@@ -90,9 +90,9 @@ class TestR280ApplyDqRegressionGuards(unittest.TestCase):
 class TestR280ResolvedRisks(unittest.TestCase):
     """Risks from Round-280 review — now resolved in production code."""
 
-    def test_add_track_b_features_should_preserve_pure_function_contract(self):
+    def test_add_track_human_features_should_preserve_pure_function_contract(self):
         """Risk R-OOM-1 resolved: copy taken inside function, not mutating caller."""
-        src = inspect.getsource(trainer_mod.add_track_b_features)
+        src = inspect.getsource(trainer_mod.add_track_human_features)
         self.assertIn(
             "df = bets.copy()",
             src,

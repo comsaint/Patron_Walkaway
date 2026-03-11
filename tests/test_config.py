@@ -60,7 +60,7 @@ class TestConfigRequiredConstants(unittest.TestCase):
                 val = getattr(self.config, name)
                 self.assertIsInstance(val, (int, float), f"{name} should be numeric if present")
 
-    def test_track_b_constants_exist(self):
+    def test_track_human_constants_exist(self):
         self.assertHasAttr("TABLE_HC_WINDOW_MIN", (int, float))
         self.assertHasAttr("PLACEHOLDER_PLAYER_ID", int)
         self.assertHasAttr("LOSS_STREAK_PUSH_RESETS", bool)

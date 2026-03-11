@@ -67,20 +67,20 @@ class TestLookbackHoursZeroOrNegativeReproduceRisk(unittest.TestCase):
         self.assertIn("lookback_hours", str(ctx.exception))
 
 
-# --- Review #2: add_track_b_features 超出 cutoff 列 run_* 為 NaN ---------------------
+# --- Review #2: add_track_human_features 超出 cutoff 列 run_* 為 NaN ---------------------
 
 class TestAddTrackBRunBeyondCutoff(unittest.TestCase):
     """#2 超出 window_end 的列 loss_streak 與 run_* 均為 0（Review #2 已實作）."""
 
     def test_beyond_cutoff_rows_get_zero_for_run_cols(self):
         """超出 cutoff 的列 run_* 與 loss_streak 一致為 0，無 NaN（Review #2）."""
-        from trainer.trainer import add_track_b_features
+        from trainer.trainer import add_track_human_features
 
         df = _bets([(0, 1, "LOSE"), (10, 2, "LOSE"), (20, 3, "LOSE")])
         df["wager"] = 1.0
         window_end = _BASE + timedelta(minutes=10)
         canonical_map = pd.DataFrame({"player_id": [1], "canonical_id": ["P1"]})
-        out = add_track_b_features(df, canonical_map, window_end, lookback_hours=8.0)
+        out = add_track_human_features(df, canonical_map, window_end, lookback_hours=8.0)
         beyond = out[out["payout_complete_dtm"] > window_end]
         self.assertGreater(len(beyond), 0)
         self.assertEqual(out.loc[beyond.index, "loss_streak"].iloc[0], 0)

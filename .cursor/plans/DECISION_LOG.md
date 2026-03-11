@@ -480,22 +480,22 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 **決策**：
 
 1. **Track A 固定接入**：訓練 pipeline 必須在 process_chunk 迴圈**之前**執行 Track A 第一階段（在抽樣資料上跑 DFS 探索），並將篩選後的 feature definitions 存成 `saved_feature_defs/feature_defs.json`；後續每個 chunk 以 `calculate_feature_matrix` 套用該定義，不再出現「從未呼叫 run_track_a_dfs、Track A 永遠不跑」的設計斷裂。
-2. **篩選改為「全特徵」**：Feature screening 的輸入改為**所有**候選特徵（player-level/profile、Track A、Track B），而非僅軌道 A。呼叫端組好完整 feature matrix 與全部 feature 名稱後傳入 `screen_features()`，回傳的清單即為 `feature_list.json` 的內容；訓練與 scorer 僅計算此清單內特徵，維持 train–serve parity。
-3. **新增 CLI `--no-afg`（No Automatic Feature Generation）**：當設定時，**不**執行 Track A（不跑 DFS、不產出 `saved_feature_defs`）。篩選仍會執行，但僅針對 Track B + player-level/profile 等非–Track A 特徵；`feature_list.json` 僅含篩選後的這些特徵，scorer 僅計算 Track B + profile，不載入 Featuretools defs。與 `--fast-mode`、`--sample-rated` 等正交。
+2. **篩選改為「全特徵」**：Feature screening 的輸入改為**所有**候選特徵（player-level/profile、Track A、Track Human），而非僅軌道 A。呼叫端組好完整 feature matrix 與全部 feature 名稱後傳入 `screen_features()`，回傳的清單即為 `feature_list.json` 的內容；訓練與 scorer 僅計算此清單內特徵，維持 train–serve parity。
+3. **新增 CLI `--no-afg`（No Automatic Feature Generation）**：當設定時，**不**執行 Track A（不跑 DFS、不產出 `saved_feature_defs`）。篩選仍會執行，但僅針對 Track Human + player-level/profile 等非–Track A 特徵；`feature_list.json` 僅含篩選後的這些特徵，scorer 僅計算 Track Human + profile，不載入 Featuretools defs。與 `--fast-mode`、`--sample-rated` 等正交。
 
 **背景與問題**：  
 - 目前 `run_track_a_dfs` 從未被 `run_pipeline` 呼叫，導致 `feature_defs.json` 永遠不存在、Track A 在 process_chunk 中永遠被跳過。  
-- SSOT §8.2.C 原描述為「軌道 A 篩選後 + 軌道 B 固定納入」；需求改為「篩選對象為全特徵」，使 player-level 與 Track B 也參與 ranking/redundancy 剔除，產出單一一致的特徵清單。  
+- SSOT §8.2.C 原描述為「軌道 A 篩選後 + 軌道 B 固定納入」；需求改為「篩選對象為全特徵」，使 player-level 與 Track Human 也參與 ranking/redundancy 剔除，產出單一一致的特徵清單。  
 - 需要一個明確開關以便在不用自動特徵時仍可跑 pipeline（篩選照常、僅無 Track A）。
 
 **預設篩選保留數量**：  
 特徵數上限 **由 config 控制**：在 `config.py` 中定義一參數（如 `SCREEN_FEATURES_TOP_K`）。`screen_features()` 呼叫時若未傳入 `top_k`，則以該 config 值為準：**若為整數 N**，篩選後最多保留 N 個特徵（Stage 1 通過者依 MI 排序取前 N；若啟用 Stage 2 則依 LGBM importance 取前 N）；**若為 `None`**，不設上限，Stage 1 通過者全部保留。
 
 **實作要點（僅記錄於計畫，尚未改 code）**：  
-- `run_pipeline`：在 process_chunk 迴圈前，若未設定 `--no-afg`，則載入首 chunk 抽樣 → `run_track_a_dfs` → 與 Track B + profile 合併成完整 feature matrix → `screen_features(..., feature_names=all_candidates)` → 依 screened 清單過濾 Track A defs 並 `save_feature_defs`，`feature_list.json` 寫入 screened 全清單。  
-- `run_pipeline`：新增 `--no-afg` 參數；若設定，跳過 DFS 與 saved_feature_defs，僅對 Track B + profile 做 screening，寫入 `feature_list.json`。  
+- `run_pipeline`：在 process_chunk 迴圈前，若未設定 `--no-afg`，則載入首 chunk 抽樣 → `run_track_a_dfs` → 與 Track Human + profile 合併成完整 feature matrix → `screen_features(..., feature_names=all_candidates)` → 依 screened 清單過濾 Track A defs 並 `save_feature_defs`，`feature_list.json` 寫入 screened 全清單。  
+- `run_pipeline`：新增 `--no-afg` 參數；若設定，跳過 DFS 與 saved_feature_defs，僅對 Track Human + profile 做 screening，寫入 `feature_list.json`。  
 - By default, setting `--fast-mode` implies `--no-afg`.
-- Scorer：行為不變，依 `feature_list.json` 與（若存在）`saved_feature_defs` 計算；`--no-afg` 產出的 bundle 無 `saved_feature_defs`，scorer 僅算 Track B + profile。
+- Scorer：行為不變，依 `feature_list.json` 與（若存在）`saved_feature_defs` 計算；`--no-afg` 產出的 bundle 無 `saved_feature_defs`，scorer 僅算 Track Human + profile。
 
 ---
 

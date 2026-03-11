@@ -1,6 +1,6 @@
 """tests/test_features.py
 ========================
-Unit tests for trainer/features.py — Track B vectorized functions only.
+Unit tests for trainer/features.py — Track Human vectorized functions only.
 No ClickHouse, no Featuretools, no LightGBM required.
 
 Coverage

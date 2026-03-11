@@ -70,7 +70,7 @@ class TestR222TrackLlmFailureSilentDegradation(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=_canonical_map_rated),
-            patch.object(backtester_mod, "add_track_b_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
             patch.object(
                 backtester_mod,
@@ -214,7 +214,7 @@ class TestR222FeatureSpecCandidatesNonList(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=_canonical_map_rated),
-            patch.object(backtester_mod, "add_track_b_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value=bad_spec),
             patch.object(backtester_mod, "compute_track_llm_features", return_value=pd.DataFrame({"bet_id": [1]})),
             patch.object(backtester_mod, "compute_labels", side_effect=_minimal_compute_labels),

@@ -28,7 +28,7 @@ def _get_func_node(name: str) -> ast.FunctionDef:
 
 
 class TestTrainerReviewRisksRound14(unittest.TestCase):
-    def test_r22_clickhouse_pull_includes_history_buffer_for_track_b(self):
+    def test_r22_clickhouse_pull_includes_history_buffer_for_track_human(self):
         """R22: bets pull should include pre-window history buffer for Track-B states."""
         load_func = _get_func_node("load_clickhouse_data")
         load_src = ast.get_source_segment(_SRC, load_func) or ""

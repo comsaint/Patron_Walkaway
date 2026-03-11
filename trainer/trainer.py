@@ -5,7 +5,7 @@ Patron Walkaway Prediction — Training Pipeline
 Pipeline (SSOT §4.3 / §9)
 --------------------------
 1. time_fold.get_monthly_chunks(start, end)  -> month boundaries
-2. Per chunk: load bets + sessions -> DQ -> identity -> labels -> Track-B features
+2. Per chunk: load bets + sessions -> DQ -> identity -> labels -> Track Human features
    - Data source: ClickHouse (production) OR local Parquet (dev iteration)
    - Labels use C1 extended pull; bets in (window_end, extended_end] are
      used only for label computation, NOT added to training rows.
@@ -266,7 +266,7 @@ _CANONICAL_MAP_SESSION_COLS: list = [
 # Includes:
 #   - DQ / identity:    bet_id, session_id, player_id, table_id, payout_complete_dtm,
 #                       gaming_day, wager, lud_dtm, __etl_insert_Dtm
-#   - Track B:          status  (loss_streak needs it; run_boundary uses payout_complete_dtm)
+#   - Track Human:      status  (loss_streak needs it; run_boundary uses payout_complete_dtm)
 #   - Track LLM YAML:   payout_odds, is_back_bet, position_idx  (allowed_columns whitelist)
 #   - Legacy / Track LLM: base_ha, etc. (see feature_spec YAML)
 #   - Output chunk:     run_id, canonical_id, is_rated, label added downstream
@@ -280,7 +280,7 @@ _REQUIRED_BET_PARQUET_COLS: list = [
     "table_id",
     "payout_complete_dtm",
     "gaming_day",
-    # DQ guard / Track-B state machines
+    # DQ guard / Track Human state machines
     "wager",
     "status",
     # Legacy / Track LLM features
@@ -310,7 +310,7 @@ for _d in (DATA_DIR, CHUNK_DIR, LOCAL_PARQUET_DIR, MODEL_DIR, OUT_DIR):
 # LEGACY_FEATURE_COLS, or ALL_FEATURE_COLS here.
 
 # Extra days of bet history pulled before each chunk window_start to give
-# Track-B state machines (loss_streak, run_boundary) cross-chunk context.
+# Track Human state machines (loss_streak, run_boundary) cross-chunk context.
 HISTORY_BUFFER_DAYS: int = 2
 
 # ---------------------------------------------------------------------------
@@ -592,7 +592,7 @@ def load_clickhouse_data(
     client = get_clickhouse_client()
     params = {"start": window_start, "end": extended_end}
 
-    # Pull extra history so Track-B state machines (loss_streak, run_boundary)
+    # Pull extra history so Track Human state machines (loss_streak, run_boundary)
     # have cross-chunk context.  process_chunk filters training rows to
     # [window_start, window_end) after Track-B features are computed.
     # E4/F1: exclude invalid player_id (PLAN Step 1)
@@ -1375,7 +1375,7 @@ def apply_dq(
     ----------
     bets_history_start:
         If provided, bets are kept from this point (< window_start) to give
-        Track-B state machines cross-chunk context.  Defaults to window_start.
+        Track Human state machines cross-chunk context.  Defaults to window_start.
 
     Notes
     -----
@@ -1525,16 +1525,16 @@ def apply_dq(
 
 
 # ---------------------------------------------------------------------------
-# Track-B feature computation
+# Track Human feature computation
 # ---------------------------------------------------------------------------
 
-def add_track_b_features(
+def add_track_human_features(
     bets: pd.DataFrame,
     canonical_map: pd.DataFrame,
     window_end: datetime,
     lookback_hours: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Return a copy of *bets* with Track-B feature columns attached.
+    """Return a copy of *bets* with Track Human feature columns attached.
 
     A copy is taken so the caller's DataFrame is not mutated.  After column
     pushdown, ``bets`` is already narrow (~20 cols), so the copy cost is low.
@@ -1545,7 +1545,7 @@ def add_track_b_features(
     df = bets.copy()
 
     if "canonical_id" not in df.columns:
-        logger.warning("canonical_id missing; Track-B features will be zeros")
+        logger.warning("canonical_id missing; Track Human features will be zeros")
         df["loss_streak"] = 0
         df["run_id"] = 0
         df["minutes_since_run_start"] = 0.0
@@ -1872,7 +1872,7 @@ def process_chunk(
 
     # DEC-018: pipeline interior is uniformly tz-naive HK local time.
     # time_fold produces tz-aware bounds; strip here so all downstream callers
-    # (apply_dq, compute_labels, add_track_b_features, label filter) receive
+    # (apply_dq, compute_labels, add_track_human_features, label filter) receive
     # tz-naive datetimes matching the tz-naive data columns from apply_dq R23.
     window_start = window_start.replace(tzinfo=None) if window_start.tzinfo else window_start
     window_end   = window_end.replace(tzinfo=None)   if window_end.tzinfo   else window_end
@@ -1935,7 +1935,7 @@ def process_chunk(
     # --- Post-Load Normalizer (PLAN § Post-Load Normalizer Phase 2) ---
     bets_norm, sessions_norm = normalize_bets_sessions(bets_raw, sessions_raw)
 
-    # --- DQ --- (bets_history_start pulls HISTORY_BUFFER_DAYS of extra context for Track-B)
+    # --- DQ --- (bets_history_start pulls HISTORY_BUFFER_DAYS of extra context for Track Human)
     history_start = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
     bets, sessions = apply_dq(
         bets_norm, sessions_norm, window_start, extended_end,
@@ -1970,13 +1970,13 @@ def process_chunk(
     # all anonymous (non-rated) players from training data.
     bets["canonical_id"] = bets["canonical_id"].fillna(bets["player_id"].astype(str))
 
-    # --- Track-B features (on FULL bets incl. history, cutoff=window_end) ---
+    # --- Track Human features (on FULL bets incl. history, cutoff=window_end) ---
     # Computing before label filtering ensures cross-chunk state (loss_streak,
     # run_boundary) uses historical context from HISTORY_BUFFER_DAYS before window_start.
     # When SCORER_LOOKBACK_HOURS is set, restrict context to that many hours per row
     # for train–serve parity with scorer (STATUS.md: trainer 對齊 Track Human/LLM).
     _lookback_hours = getattr(_cfg, "SCORER_LOOKBACK_HOURS", None)
-    bets = add_track_b_features(bets, canonical_map, window_end, lookback_hours=_lookback_hours)
+    bets = add_track_human_features(bets, canonical_map, window_end, lookback_hours=_lookback_hours)
 
     # --- Track LLM: DuckDB + Feature Spec YAML (DEC-022/023/024) ---
     # R3500: compute on the FULL bets DataFrame (with HISTORY_BUFFER_DAYS context)
@@ -5178,15 +5178,15 @@ def run_pipeline(args) -> None:
             else set()
         )
         if _yaml_track_human and not _screened_set.intersection(_yaml_track_human):
-            _missing_track_b = [c for c in _yaml_track_human if c in _train_cols]
-            if _missing_track_b:
+            _missing_track_human = [c for c in _yaml_track_human if c in _train_cols]
+            if _missing_track_human:
                 logger.warning(
                     "screen_features: no track_human features survived screening — "
                     "re-appending %d track_human features as fallback (R1001)",
-                    len(_missing_track_b),
+                    len(_missing_track_human),
                 )
                 screened_cols = screened_cols + [
-                    c for c in _missing_track_b if c not in _screened_set
+                    c for c in _missing_track_human if c not in _screened_set
                 ]
         active_feature_cols = screened_cols
 
@@ -5217,7 +5217,7 @@ def run_pipeline(args) -> None:
         # exercised, so we fall back to a single constant "bias" feature
         # instead of terminating the process.
         msg = (
-            "screen_features + Track B fallback both returned empty feature list. "
+            "screen_features + Track Human fallback both returned empty feature list. "
             "Cannot train any model. Check data quality and feature definitions."
         )
         logger.warning(msg)

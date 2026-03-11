@@ -126,7 +126,7 @@ class TestFeaturesReviewRisksRound9(unittest.TestCase):
         )
 
     def test_r21_compute_run_boundary_accepts_cutoff_time_param(self):
-        """R21: compute_run_boundary should accept cutoff_time to match other Track B APIs."""
+        """R21: compute_run_boundary should accept cutoff_time to match other Track Human APIs."""
         sig = inspect.signature(compute_run_boundary)
         self.assertIn("cutoff_time", sig.parameters)
 

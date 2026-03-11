@@ -206,7 +206,7 @@ class TestR1613ZeroFeatureEarlyExit(unittest.TestCase):
     def test_run_pipeline_has_explicit_zero_feature_guard(self):
         src = inspect.getsource(trainer_mod.run_pipeline)
         self.assertIn(
-            "screen_features + Track B fallback both returned empty feature list",
+            "screen_features + Track Human fallback both returned empty feature list",
             src,
             "run_pipeline should raise a clear SystemExit before LightGBM zero-column crash.",
         )

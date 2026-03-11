@@ -25,11 +25,11 @@
 ### 1.2 術語與文件一致性
 
 - **程式實際行為**：`--no-afg` 跳過的是 **Track LLM**（DuckDB + Feature Spec YAML），不是 Featuretools DFS。
-- **README / 部分 help** 仍寫「Track A (Featuretools DFS)」「Track B」：
-  - 程式內已統一為 **Track Human**、**Track LLM**、**Track B (legacy)**；**Track A** 在程式裡已不再使用。
+- **README / 部分 help** 仍寫「Track A (Featuretools DFS)」「Track Human」：
+  - 程式內已統一為 **Track Human**、**Track LLM**；**Track A** 在程式裡已不再使用。
 - **建議**：
   - 在 **trainer.py** 的 `--no-afg` help 中維持現有正確描述（Track LLM），無需改為 Track A。
-  - 在 **README** 的「Trainer 指令參數」表中，將 `--no-afg` 說明改為：「跳過 **Track LLM**（DuckDB + feature spec），僅用 Track Human + profile + legacy」；並可註明「與舊文件中的 Track A 無關，現架構為 Track LLM / Track Human / Track B」。
+  - 在 **README** 的「Trainer 指令參數」表中，將 `--no-afg` 說明改為：「跳過 **Track LLM**（DuckDB + feature spec），僅用 Track Human + profile + legacy」；並可註明「與舊文件中的 Track A 無關，現架構為 Track LLM / Track Human」。
 
 ### 1.3 廢棄參數
 
@@ -116,7 +116,7 @@
 ## 7. README 修訂摘要
 
 1. **Trainer 指令參數表**（繁/簡體）：  
-   - 將 `--no-afg` 說明改為「跳過 **Track LLM**（DuckDB + feature spec）」，並可註明與 Track Human / Track B 的關係。  
+   - 將 `--no-afg` 說明改為「跳過 **Track LLM**（DuckDB + feature spec）」，並可註明與 Track Human 的關係。  
    - 若保留 `--no-month-end-snapshots`：在表內註明「已廢棄、無效」；若從程式移除，則從 README 刪除該列。
 
 2. **使用方式**：  

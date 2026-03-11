@@ -101,6 +101,9 @@ todos:
   - id: optuna-hpo-sample-rows
     content: "Optuna HPO 階段 train/valid 抽樣：僅設 OPTUNA_HPO_SAMPLE_ROWS；valid 與 train 同比例；stratified 抽樣、random_state=42；最終訓練仍用全量。見「Optuna HPO 階段 train/valid 抽樣（計畫）」一節。"
     status: completed
+  - id: track-b-lookback-vectorization
+    content: "Track Human Lookback 向量化（critical）：SCORER_LOOKBACK_HOURS 時 compute_loss_streak/compute_run_boundary 改為 two-pointer 單 pass，避免 25M 列 per-row 迴圈導致 Step 6 凍結 7h+；Phase 1 可先 trainer 傳 lookback_hours=None 解封。Step 6 進度條：以 tqdm 顯示 Process chunks 進度與 ETA。見「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。"
+    status: pending
 isProject: false
 ---
 
@@ -156,14 +159,15 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 16 | **取得 bet 後排除 unrated 再送模型** | completed | 下方「取得 bet 後排除 unrated 再送模型（計畫）」一節。Round 402/403 實作並通過 R402 審查測試。 |
 | 17 | **OOM 預檢查** | completed | Step 6 以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC；已於 Round 210/211/212 實作並通過 Review 修復。規格見下方「OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC」一節。 |
 | 18 | **Round 222 Review production 補強** | completed | 四項均已實作：項目 1（Track LLM 失敗 warning + track_llm_degraded）、項目 2（canonical_ids=[]）、項目 3（use_local_parquet 從 CLI 傳入）、項目 4（candidates 型別防呆）。Round 406 完成項目 1、3 與 R222 測試契約更新。規格見下方「Round 222 Review production 補強（實作計畫）」一節。 |
+| 19 | **Track Human Lookback 向量化 + Step 6 進度條** | pending | **Critical**：SCORER_LOOKBACK_HOURS=8 時 Step 6 凍結 7h+（per-row Python 迴圈）；Phase 1 解封：trainer 傳 lookback_hours=None；Phase 2：numba two-pointer 向量化 lookback。Step 6 以 tqdm 顯示 chunk 進度與 ETA。見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。 |
 
 **Plan 狀態摘要**：上表 1～18 項均為 **completed**（第 18 項於 Round 406 完成項目 1、3；Round 409 完成 R407 Review #1 錯誤回傳含 track_llm_degraded，為 Review 跟進非新項目）。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
 
-**剩餘項目**：上表 1～18 項均已完成。以下為可選／後續，非阻斷。
+**剩餘項目**：上表 1～18 項均已完成。**項目 19**（Track Human Lookback 向量化 + Step 6 進度條）為 **pending**、**critical**：Step 6 在 SCORER_LOOKBACK_HOURS 下會凍結 7h+，Phase 1 解封與 tqdm 進度條建議優先實作。
 
-**建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。Backtester 輸出格式對齊（項目 7）可獨立排入。Optuna 整份 study 的 early stop（項目 11）為可選省時機制，預設關閉，實作後可依需要設定 `OPTUNA_EARLY_STOP_PATIENCE`。
+**建議實作順序**：Post-Load Normalizer 與 Feature Screening 預設已完成；**項目 19**：先實作 Phase 1（trainer 傳 lookback_hours=None）+ Step 6 tqdm 進度條以解封並可觀測，再排 Phase 2（numba lookback 向量化）。Step 7 改用 DuckDB 做 out-of-core 排序並加入 OOM 時自動降 NEG_SAMPLE_FRAC 重跑之 failsafe，可依需要排入。Backtester 輸出格式對齊（項目 7）可獨立排入。Optuna 整份 study 的 early stop（項目 11）為可選省時機制，預設關閉，實作後可依需要設定 `OPTUNA_EARLY_STOP_PATIENCE`。
 
-**可選／後續**（非阻斷）：(1) OOM 預檢查已於 Round 210/211/212 實作，視為 **completed**（見上表項目 17）。(2) Round 222 Review production 補強見上表項目 18 與下方「Round 222 Review production 補強（實作計畫）」一節，建議實作。
+**可選／後續**（非阻斷）：(1) OOM 預檢查已於 Round 210/211/212 實作，視為 **completed**（見上表項目 17）。(2) Round 222 Review production 補強見上表項目 18 與下方「Round 222 Review production 補強（實作計畫）」一節，建議實作。(3) **項目 19** 見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 `doc/track_human_lookback_vectorization_plan.md`。
 
 ---
 
@@ -1204,6 +1208,33 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 ---
 
+## Track Human Lookback 向量化與 Step 6 進度條（計畫）
+
+**目標**：解決 `SCORER_LOOKBACK_HOURS=8` 時 Step 6（Process chunks）凍結 7h+ 的問題，並在 Step 6 顯示 chunk 進度與 ETA。
+
+**背景**：`trainer/features.py` 的 `compute_loss_streak` 與 `compute_run_boundary` 在 `lookback_hours` 有設定時，以 **per-row Python 迴圈**（對每筆 bet 切 8h 視窗再算）實作，導致 25M 列時複雜度 O(N×B)、常數極大，無 progress log 故畫面像凍結。Serving 需 8h lookback 以限制歷史載入，train–serve parity 要求 trainer 同語意；實作方式需改為單 pass 向量化或 numba two-pointer，而非逐列迴圈。
+
+**規格詳見**：`doc/track_human_lookback_vectorization_plan.md`（問題摘要、語意不變、Phase 1 解封 / Phase 2 numba、檔案清單、成功標準）。
+
+### Phase 1 — 解封（立即）
+
+- Trainer 呼叫 `add_track_human_features` 時傳 `lookback_hours=None`（或 config `TRAINER_USE_LOOKBACK=False`），使 Step 6 走現有向量化無 lookback 路徑，Step 6 可於合理時間內完成。
+- Scorer 仍使用 `SCORER_LOOKBACK_HOURS`；train–serve 對 8h 視窗的完全一致延至 Phase 2。
+
+### Phase 2 — Lookback 向量化（正確解）
+
+- 以 **numba（或 Cython）** 實作 two-pointer + 狀態機：每個 `canonical_id` 單 pass，對每個 row 的 8h 視窗算出 streak / run_boundary，替換目前 lookback 分支的 per-row 迴圈；輸出欄位與型別不變。
+- 若 numba 可選：無 numba 時 fallback 現有慢路徑並在資料量大時 log 警告。
+
+### Step 6 進度條（tqdm）
+
+- **目的**：Process chunks 時顯示進度與 ETA，避免長時間無輸出被誤判為凍結。
+- **作法**：使用 `tqdm`，`total=len(chunks)`、`desc="Step 6 chunks"`、`unit="chunk"`。在 Step 6 開始（`t0` 與 `chunk_paths=[]` 之後）建立一個 progress bar；每次將 chunk 結果 append 到 `chunk_paths` 時呼叫 `pbar.update(1)`（涵蓋 OOM probe、chunks[1:]、path1 為 None 時整份 chunks、以及非 AUTO 的 enumerate(chunks) 所有分支）；以 `try/finally` 確保 `pbar.close()`。
+- **依賴**：將 `tqdm` 加入專案依賴（requirements.txt 或 pyproject.toml）。`trainer/trainer.py` 內以 try/import 引入 tqdm；若未安裝則 fallback 為 no-op（例如 `def tqdm(iterable, **kwargs): return iterable`），避免無 tqdm 環境報錯。
+- **檔案**：`trainer/trainer.py`（Step 6 迴圈前建立 bar、各分支 append 後 update(1)、finally close）；依賴檔。
+
+---
+
 ## Optuna 整份 study 的 early stop（計畫）
 
 ### 目標與背景
@@ -1409,7 +1440,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 
 ### 原則
 
-- **Trainer 為對齊基準**：Scorer 與 Backtester 的資料欄位、特徵計算順序、打分前準備（欄位補齊、dtype、profile vs 非 profile 填值）須與 `trainer.py`（含 `process_chunk`、`apply_dq`、`add_track_b_features`、Track LLM、player_profile PIT join、artifact 使用方式）一致。
+- **Trainer 為對齊基準**：Scorer 與 Backtester 的資料欄位、特徵計算順序、打分前準備（欄位補齊、dtype、profile vs 非 profile 填值）須與 `trainer.py`（含 `process_chunk`、`apply_dq`、`add_track_human_features`、Track LLM、player_profile PIT join、artifact 使用方式）一致。
 - **Post-Load Normalizer**：三者皆在載入 raw 資料後、業務邏輯前呼叫 `normalize_bets_sessions`（見上方「Post-Load Normalizer」一節）。
 
 ### H2 session_avail_dtm（Backtester 不實作）
@@ -1425,14 +1456,14 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 |------|------|------|
 | **Bet 查詢含 gaming_day** | Scorer 的 `fetch_recent_data` bet SELECT 須包含與 trainer `_BET_SELECT_COLS` 一致的 `gaming_day` 來源（如 `COALESCE(gaming_day, toDate(payout_complete_dtm)) AS gaming_day`）。 | 避免日後依賴 gaming_day 的特徵或邏輯在 serve 端缺欄。 |
 | **Session casino_player_id 清洗** | 與 trainer / config 一致。Trainer 使用 `CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END`；scorer 使用 `config.CASINO_PLAYER_ID_CLEAN_SQL` 時須確保未設定時預設與上述語意一致，或文件明確要求必須設定該 config。 | D2 身份與 rated 判定與訓練一致。 |
-| **其餘** | 已對齊：normalize、identity、Track B、Track LLM、player_profile PIT join、`coerce_feature_dtypes`、artifact 與 feature_list_meta 使用方式。 | 維持現有實作即可。 |
+| **其餘** | 已對齊：normalize、identity、Track Human、Track LLM、player_profile PIT join、`coerce_feature_dtypes`、artifact 與 feature_list_meta 使用方式。 | 維持現有實作即可。 |
 
 ### Backtester 對齊項目（與 trainer 一致）
 
 | 項目 | 規格 | 說明 |
 |------|------|------|
 | **player_profile PIT join** | **必須**。Backtester 須與 trainer 相同方式載入 player_profile（如 `load_player_profile` 或 `data/player_profile.parquet`），並在 label 過濾後、打分前呼叫 `join_player_profile(labeled, profile_df)`。非 profile 補 0、profile 無 snapshot 留 NaN（R74/R79）。 | 模型 artifact 含 track_profile 特徵；缺 join 會導致輸入缺欄或與訓練不一致。 |
-| **Track LLM 計算順序與輸入** | **必須**。在 **完整 bets**（`add_track_b_features` 之後、`compute_labels` 之前）上呼叫 `compute_track_llm_features(bets, feature_spec=..., cutoff_time=window_end)`，再 merge 回 bets，然後才 `compute_labels` 與時間過濾得到 `labeled`。與 trainer `process_chunk` 順序一致。 | 若在已過濾的 `labeled` 上計算 Track LLM，rolling/歷史視窗會缺少上下文，與訓練特徵不一致。 |
+| **Track LLM 計算順序與輸入** | **必須**。在 **完整 bets**（`add_track_human_features` 之後、`compute_labels` 之前）上呼叫 `compute_track_llm_features(bets, feature_spec=..., cutoff_time=window_end)`，再 merge 回 bets，然後才 `compute_labels` 與時間過濾得到 `labeled`。與 trainer `process_chunk` 順序一致。 | 若在已過濾的 `labeled` 上計算 Track LLM，rolling/歷史視窗會缺少上下文，與訓練特徵不一致。 |
 | **打分前欄位與 dtype** | **必須**。打分前須：(1) 依 artifact 的 feature_list / feature_list_meta 區分 profile 與非 profile；(2) 缺欄時非 profile 補 0、profile 補 NaN；(3) 呼叫 `coerce_feature_dtypes(labeled, feature_list)`；(4) 以 **完整** artifact feature 列表（與順序）傳入 `predict_proba`，不得以「僅存在於 df 的欄位」縮減。 | 與 trainer / scorer 的 `_score_df` 前準備一致；缺欄或 dtype 不一致會導致評分與訓練/線上不一致。 |
 | **H2 session_avail_dtm** | **不實作**（見上）。 | 與 trainer 一致。 |
 

@@ -92,7 +92,7 @@ G1_FBETA = 0.5                   # [DEPRECATED] F-beta weight (beta < 1 → prec
 OPTUNA_N_TRIALS = 150            # Optuna TPE trials for threshold search (DEC-009/010)
 # Optional Optuna time budget (seconds) for study.optimize.
 # Disable timeout by setting to None or a non-positive value (e.g. -1).
-OPTUNA_TIMEOUT_SECONDS: Optional[int] = 4 * 60 * 60  # -1 = no timeout, 10 * 60 = 10 minutes
+OPTUNA_TIMEOUT_SECONDS: Optional[int] = 5 * 60  # -1 = no timeout, 10 * 60 = 10 minutes
 # Optional study-level early stop: stop when best validation AP has not improved for
 # this many consecutive trials. None = disabled (run full n_trials; default for reproducibility).
 # Positive int (e.g. 40–60) = stop early to save time; recommend 40–60 to avoid stopping
@@ -112,7 +112,7 @@ THRESHOLD_OPTIMIZE_PRECISION_AT_RECALL: float = 0.01  # DEC-026: target recall f
 # Maximum number of features to keep after screen_features().
 # None = no cap (all Stage-1 survivors kept); integer N = hard upper limit applied
 # after Stage-1 (MI or LGBM ranking) and, if screen_method=mi_then_lgbm, after Stage-2 (LGBM ranking).
-SCREEN_FEATURES_TOP_K: Optional[int] = None
+SCREEN_FEATURES_TOP_K: Optional[int] = 50
 # Screening method: "lgbm" = LGBM-only (fast, no MI); "mi" = original MI path; "mi_then_lgbm" = MI then LGBM re-rank (original use_lgbm=True).
 SCREEN_FEATURES_METHOD: Literal["lgbm", "mi", "mi_then_lgbm"] = "lgbm"
 
@@ -128,7 +128,7 @@ MIN_THRESHOLD_ALERT_COUNT = 5
 THRESHOLD_MIN_RECALL: Optional[float] = 0.01
 THRESHOLD_MIN_ALERTS_PER_HOUR: Optional[float] = 1.0
 
-# --- Track B constants ---
+# --- Track Human constants ---
 TABLE_HC_WINDOW_MIN = 30         # Lookback window for table headcount feature (D1)
 PLACEHOLDER_PLAYER_ID = -1       # Invalid player_id sentinel in t_bet (E4/F1)
 UNRATED_VOLUME_LOG = True        # DEC-021: log unrated player/bet counts per poll cycle
@@ -155,7 +155,7 @@ CHUNK_CONCAT_RAM_FACTOR = 15  # on-disk size × this × (1 + TRAIN_SPLIT_FRAC) �
 # Recommended: 0.3 when training on 90+ days of data to avoid Step 7 OOM,
 # or just leave it at 1.0 and let the OOM pre-check auto-adjust.
 # Example: 30 days × 27M rows → ~10M rows with NEG_SAMPLE_FRAC=0.3.
-NEG_SAMPLE_FRAC: float = 1.0
+NEG_SAMPLE_FRAC: float = 0.2
 
 # --- Production class-ratio assumption (for adjusted test precision reporting) ---
 # Expected negative-to-positive ratio in production (serving), used to adjust
@@ -174,7 +174,7 @@ PRODUCTION_NEG_POS_RATIO: Optional[float] = 87.0/13.0
 # then clamps to [NEG_SAMPLE_FRAC_MIN, 1.0]. So "how much" is controlled by the
 # constants below (and by CHUNK_CONCAT_RAM_FACTOR / TRAIN_SPLIT_FRAC), not a fixed value.
 # Only triggers when NEG_SAMPLE_FRAC == 1.0 (user-configured values are respected).
-NEG_SAMPLE_FRAC_AUTO: bool = True   # set False to disable auto-adjustment entirely
+NEG_SAMPLE_FRAC_AUTO: bool = False   # set False to disable auto-adjustment entirely
 NEG_SAMPLE_FRAC_MIN: float = 0.05  # hard floor: auto-reduce will never go below this
 # Assumed positive rate used in the auto-adjustment formula.
 # Default 0.15 (15%) is conservative; lower your actual positive rate for a tighter bound.

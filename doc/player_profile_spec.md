@@ -36,7 +36,7 @@
 
 **理由**：
 1. Unrated 玩家無法跨 session 追蹤身份，歷史行為輪廓不可靠。
-2. Unrated 模型僅使用 bet-level / session-level 即時特徵（Track A + Track B），不需要 player-level profile。
+2. Unrated 模型僅使用 bet-level / session-level 即時特徵（Track A + Track Human），不需要 player-level profile。
 3. 避免浪費計算資源在永遠不會被消費的 profile 上（unrated 在 3 個月資料中可達數十萬筆，但對 rated model 無用）。
 
 **ETL 實作要點**：

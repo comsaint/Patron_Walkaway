@@ -602,7 +602,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS,
 
 ## 第八輪 SSOT 對齊（v8）— 論證/理由（供後續 review 引用）
 
-- **雙軌特徵工程架構（Track A + Track B）**：
+- **雙軌特徵工程架構（Track A + Track Human）**：
   - **事實依據**：Featuretools DFS 能系統性搜索聚合/窗口/組合特徵空間，但對「條件重置狀態機」（`loss_streak`）或「跨玩家滾動聚合」（`table_hc`）等邏輯天然無法或效能極差。Custom Primitive 雖可部分橋接，但複雜狀態機的正確性難以驗證，且推論端難以複用。
   - **風險機制**：若把 `loss_streak`、`run_boundary`、`table_hc` 強塞進 Featuretools Custom Primitives，會導致：(1) 狀態機邏輯分散在 Primitive 定義與外部程式碼間，難以測試；(2) Scorer 端難以高效重現；(3) 違反 SSOT §8.2.B 的明確設計意圖。
   - **修正原則**：採雙軌並行——軌道 A（Featuretools DFS）專注自動化特徵探索，捨棄 Custom Primitive 包裝複雜狀態機；軌道 B（向量化 Pandas/Polars 手寫）專責狀態機與跨玩家特徵。兩軌共用同一 `cutoff_time` 框架，`features.py` 為唯一共用進入點，確保 train-serve parity。
