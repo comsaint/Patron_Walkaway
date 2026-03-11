@@ -1,7 +1,10 @@
+import logging
 import os
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 
 from dotenv import load_dotenv
+
+_log = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -53,6 +56,10 @@ SCORER_POLL_INTERVAL_SECONDS = 45  # Polling interval in seconds (includes run t
 # path and finishes in reasonable time. Scorer still uses SCORER_LOOKBACK_HOURS.
 # Set True only when Phase 2 (numba lookback) is in place for full train–serve parity.
 TRAINER_USE_LOOKBACK = False
+
+# ------------------ Progress / UI (PLAN § progress-bars-long-steps) -----
+# When True, disable tqdm progress bars (Step 6 chunks, Step 9 Optuna, etc.) for CI / non-TTY.
+DISABLE_PROGRESS_BAR = False
 
 # ------------------ Status Server -----------------------------
 TABLE_STATUS_REFRESH_SECONDS = 45  # How often to refresh table occupancy snapshot
@@ -168,7 +175,7 @@ CHUNK_CONCAT_RAM_FACTOR = 15  # on-disk size × this × (1 + TRAIN_SPLIT_FRAC) �
 # Recommended: 0.3 when training on 90+ days of data to avoid Step 7 OOM,
 # or just leave it at 1.0 and let the OOM pre-check auto-adjust.
 # Example: 30 days × 27M rows → ~10M rows with NEG_SAMPLE_FRAC=0.3.
-NEG_SAMPLE_FRAC: float = 0.2
+NEG_SAMPLE_FRAC: float = 0.30
 
 # --- Production class-ratio assumption (for adjusted test precision reporting) ---
 # Expected negative-to-positive ratio in production (serving), used to adjust
@@ -219,50 +226,43 @@ PROFILE_USE_DUCKDB: bool = True
 # On 8/32GB machines use --no-preload or lower this value to avoid OOM (A05).
 PROFILE_PRELOAD_MAX_BYTES: int = int(1.5 * 1024**3)  # 1.5 GB on disk
 
-# --- DuckDB runtime memory budget (player_profile ETL DuckDB path) ---
-# _configure_duckdb_runtime() in etl_player_profile.py reads these constants
-# at execution time and applies them via SET statements immediately after the
-# DuckDB connection is opened.  The memory limit is computed dynamically:
-#   limit = clamp(available_ram * FRACTION, MIN_GB, MAX_GB)
-# This avoids a hard-coded value while still being portable across machines.
-#
-# FRACTION  – how much of currently available RAM DuckDB may use (0–1).
-#             0.5 leaves the other half for Python, OS, and the pandas fallback.
-# MIN_GB    – floor: prevents an absurdly small limit on very low-RAM machines
-#             (the query will OOM anyway, but at least it fails fast).
-# MAX_GB    – ceiling: prevents a single DuckDB query from monopolising RAM on
-#             high-memory servers where 50% could be many tens of GB.
-# THREADS   – DuckDB worker threads; lower = less peak RAM, slower sort/hash.
-#             2 is a safe default for laptops; raise on dedicated servers.
-# PRESERVE_INSERTION_ORDER – DuckDB default is True (sort output to match
-#             insertion order), which costs extra RAM.  Profile aggregation
-#             output order is non-deterministic anyway, so False is safe here.
-# RAM_MAX_FRACTION – When set (e.g. 0.45), effective ceiling = max(MAX_GB,
-#             available_ram * RAM_MAX_FRACTION).  High-RAM machines get a
-#             higher DuckDB limit, reducing OOM.  None = use only MAX_GB.
-PROFILE_DUCKDB_RAM_FRACTION: float = 0.5
-PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB: float = 0.5
+# --- DuckDB 共用（SSOT, DEC-027）---
+# All DuckDB-using stages (profile ETL, Step 7, canonical mapping) share these
+# defaults. Stage overrides below. Formula: limit = clamp(available_ram * FRACTION,
+# MIN_GB, effective_MAX); effective_MAX = max(MAX_GB, available_ram * RAM_MAX_FRACTION)
+# when RAM_MAX_FRACTION is set. See doc/training_oom_and_runtime_audit.md.
+DUCKDB_RAM_FRACTION: float = 0.5
+DUCKDB_MEMORY_LIMIT_MIN_GB: float = 1.0
+DUCKDB_MEMORY_LIMIT_MAX_GB: float = 24.0
+DUCKDB_RAM_MAX_FRACTION: Optional[float] = 0.45
+DUCKDB_THREADS: int = 2
+DUCKDB_PRESERVE_INSERTION_ORDER: bool = False
+
+# Profile ETL override: heavier queries use a lower ceiling (others from DUCKDB_*).
 PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB: float = 8.0
-PROFILE_DUCKDB_RAM_MAX_FRACTION: Optional[float] = 0.45
-PROFILE_DUCKDB_THREADS: int = 2
-PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER: bool = False
+# Backward-compat aliases (DEC-027): tests/ETL may still read these; budget uses get_duckdb_memory_limit_bytes.
+PROFILE_DUCKDB_RAM_FRACTION: float = DUCKDB_RAM_FRACTION
+PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB: float = DUCKDB_MEMORY_LIMIT_MIN_GB
+PROFILE_DUCKDB_RAM_MAX_FRACTION: Optional[float] = DUCKDB_RAM_MAX_FRACTION
+PROFILE_DUCKDB_THREADS: int = DUCKDB_THREADS
+PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER: bool = DUCKDB_PRESERVE_INSERTION_ORDER
 
 # --- Pipeline Step 7/8/9 與方案 B/B+ 開關 (DEC-027) ---
-# DuckDB 記憶體預算由 PROFILE_* / STEP7_* / CANONICAL_MAP_* 各 stage 常數控制。
+# DuckDB 記憶體預算改由 DUCKDB_* 共用常數 + get_duckdb_memory_config("step7") 控制。
 # Step 7 DuckDB out-of-core sort (OOM-safe; PLAN Step 7 Out-of-Core, A19):
 # When True, Step 7 uses DuckDB to sort and split chunk Parquets (spills to disk
-# when over memory_limit), avoiding pandas concat+sort peak RAM. When False,
-# pandas fallback is used (high OOM risk; peak ~20× on-disk). To avoid OOM,
-# keep True or reduce --days / NEG_SAMPLE_FRAC. See doc/training_oom_and_runtime_audit.md A19.
+# when over memory_limit). When False, pandas fallback (high OOM risk). See A19.
 STEP7_USE_DUCKDB: bool = True
-STEP7_DUCKDB_RAM_FRACTION: float = 0.50
-STEP7_DUCKDB_RAM_MIN_GB: float = 2.0
-STEP7_DUCKDB_RAM_MAX_GB: float = 24.0
+# Step 7 overrides: only temp dir and threads (memory from shared DUCKDB_*).
 STEP7_DUCKDB_THREADS: int = 4
-STEP7_DUCKDB_PRESERVE_INSERTION_ORDER: bool = False
-# Temp directory for DuckDB spill; None = caller uses DATA_DIR / "duckdb_tmp".
-# A20: Ensure this (or default duckdb_tmp) is writable; memory_limit is set via STEP7_DUCKDB_RAM_*.
+# Temp directory for DuckDB spill; None = caller uses DATA_DIR / "duckdb_tmp". A20.
 STEP7_DUCKDB_TEMP_DIR: Optional[str] = None
+# Backward-compat aliases (DEC-027): tests may still expect these on config.
+STEP7_DUCKDB_RAM_FRACTION: float = DUCKDB_RAM_FRACTION
+STEP7_DUCKDB_RAM_MIN_GB: float = DUCKDB_MEMORY_LIMIT_MIN_GB
+STEP7_DUCKDB_RAM_MAX_GB: float = DUCKDB_MEMORY_LIMIT_MAX_GB
+STEP7_DUCKDB_PRESERVE_INSERTION_ORDER: bool = DUCKDB_PRESERVE_INSERTION_ORDER
+
 
 # --- Plan B+: Step 7 keep train on disk (PLAN 方案 B+ 階段 1–2) ---
 # When True and DuckDB succeeds, Step 7 does not load train into memory; only valid/test
@@ -294,17 +294,104 @@ STEP9_SAVE_LGB_BINARY: bool = False
 STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = None
 
 # --- Canonical mapping: DuckDB path (PLAN Canonical mapping 全歷史 Step 1) ---
-# When building canonical mapping from local Parquet, DuckDB is used to scan full
-# session history (COALESCE(session_end_dtm, lud_dtm) <= train_end) with limited RAM.
-# memory_limit = available_ram × RAM_FRACTION, clamped to [MIN_GB, MAX_GB] (PLAN Canonical mapping DuckDB 對齊 Step 7).
-# THREADS: worker threads; lower = less peak RAM, slower.
-CANONICAL_MAP_DUCKDB_RAM_FRACTION: float = 0.45
-CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB: float = 1.0
-CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB: float = 24.0
+# Memory from DUCKDB_* shared; override threads only (low RAM priority for full-history scan).
 CANONICAL_MAP_DUCKDB_THREADS: int = 1
-# When True, skip DuckDB path and build mapping from full sessions in pandas (debug only;
-# may OOM on large history, A03). Do not enable by default in production.
+# When True, skip DuckDB path and build mapping from full sessions in pandas (debug only; A03).
 CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS: bool = False
+# Backward-compat aliases (DEC-027): tests may still expect these on config.
+CANONICAL_MAP_DUCKDB_RAM_FRACTION: float = DUCKDB_RAM_FRACTION
+CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB: float = DUCKDB_MEMORY_LIMIT_MIN_GB
+CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB: float = DUCKDB_MEMORY_LIMIT_MAX_GB
+
+# --- DuckDB helper: single SSOT for all stages (DEC-027) ---
+def get_duckdb_memory_config(
+    stage: Literal["profile", "step7", "canonical_map"],
+) -> Tuple[float, float, float, Optional[float], int, bool, Optional[str]]:
+    """Return (frac, min_gb, max_gb, ram_max_frac, threads, preserve_order, temp_dir).
+
+    Callers use this + available_ram to compute memory_limit and SET runtime.
+    """
+    if stage not in ("profile", "step7", "canonical_map"):
+        raise ValueError(
+            "stage must be 'profile', 'step7', or 'canonical_map', got %r" % (stage,)
+        )
+    frac = DUCKDB_RAM_FRACTION
+    min_gb = DUCKDB_MEMORY_LIMIT_MIN_GB
+    max_gb = DUCKDB_MEMORY_LIMIT_MAX_GB
+    ram_max_frac = DUCKDB_RAM_MAX_FRACTION
+    threads = DUCKDB_THREADS
+    preserve_order = DUCKDB_PRESERVE_INSERTION_ORDER
+    temp_dir: Optional[str] = None
+    if stage == "profile":
+        max_gb = PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB
+    elif stage == "step7":
+        threads = STEP7_DUCKDB_THREADS
+        temp_dir = STEP7_DUCKDB_TEMP_DIR
+    elif stage == "canonical_map":
+        threads = CANONICAL_MAP_DUCKDB_THREADS
+    return (frac, min_gb, max_gb, ram_max_frac, threads, preserve_order, temp_dir)
+
+
+def get_duckdb_memory_limit_bytes(
+    stage: Literal["profile", "step7", "canonical_map"],
+    available_bytes: Optional[int],
+) -> int:
+    """Compute DuckDB memory_limit in bytes. Uses get_duckdb_memory_config(stage).
+
+    When available_bytes is None or negative, returns min in bytes (safe fallback).
+    Validates frac in (0, 1]; if min_gb > max_gb they are swapped.
+    DEC-027 Review: min/max forced positive; negative available_bytes treated as None; optional 1 TB cap.
+    """
+    frac, min_gb, max_gb, ram_max_frac, _t, _p, _d = get_duckdb_memory_config(stage)
+    if not (0.0 < frac <= 1.0):
+        _log.warning(
+            "DUCKDB_RAM_FRACTION=%.3f out of valid range (0, 1]; using 0.5",
+            frac,
+        )
+        frac = 0.5
+    _min = int(min_gb * 1024**3)
+    _max = int(max_gb * 1024**3)
+    if _min <= 0:
+        _log.warning(
+            "DUCKDB MEMORY_LIMIT MIN_GB (%.2f) <= 0; using 0.1 GB floor",
+            min_gb,
+        )
+        _min = max(1, int(0.1 * 1024**3))
+    if _max <= 0:
+        _log.warning(
+            "DUCKDB MEMORY_LIMIT MAX_GB (%.2f) <= 0; using _min",
+            max_gb,
+        )
+        _max = _min
+    if _min > _max:
+        _log.warning(
+            "DUCKDB MEMORY_LIMIT MIN_GB (%.2f) > MAX_GB (%.2f); swapping",
+            min_gb,
+            max_gb,
+        )
+        _min, _max = _max, _min
+    _max_cap = 1024 * 1024**3  # 1 TB (DEC-027 Review #8 optional cap)
+    if _max > _max_cap:
+        _log.warning(
+            "DUCKDB MEMORY_LIMIT MAX_GB capped at 1024 (1 TB); was %.2f",
+            _max / 1024**3,
+        )
+        _max = _max_cap
+        _min = min(_min, _max)
+    if available_bytes is None:
+        return _min
+    if available_bytes < 0:
+        _log.warning(
+            "get_duckdb_memory_limit_bytes: available_bytes < 0; treating as None (return _min)",
+        )
+        return _min
+    effective_max = _max
+    if ram_max_frac is not None and 0.0 < ram_max_frac <= 1.0:
+        effective_max = max(_max, int(available_bytes * ram_max_frac))
+    # DEC-027 Review #8: apply same 1 TB cap to effective_max (e.g. step7 ram_max_frac path)
+    effective_max = min(effective_max, _max_cap)
+    budget = int(available_bytes * frac)
+    return max(_min, min(effective_max, budget))
 
 # --- SQL fragment shared across all modules (FND-03) ---
 CASINO_PLAYER_ID_CLEAN_SQL = (

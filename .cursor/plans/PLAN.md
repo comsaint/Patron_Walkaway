@@ -112,10 +112,13 @@ todos:
     status: completed
   - id: config-consolidation
     content: "Config 集中化與合併（排除 Retention／Refresh・Poll）：DuckDB 一組共用參數＋stage 覆寫、Validator 補齊 SSOT、時間窗 HISTORY_BUFFER_DAYS 入 config、Threshold 命名統一（MIN_THRESHOLD_ALERT_COUNT → THRESHOLD_MIN_ALERT_COUNT）、OOM 區塊整理與分組；見「Config 集中化與合併變更草案（DEC-027）」一節。"
-    status: pending
+    status: completed
   - id: training-config-recommender
     content: "Training config recommender：偵測資源、依資料來源（Parquet／ClickHouse）估計每步資源與時間、建議參數；ClickHouse 路徑以實際連線查表大小估計 chunk；見「Training config recommender（Parquet／ClickHouse）」一節。"
-    status: pending
+    status: completed
+  - id: progress-bars-long-steps
+    content: "Training pipeline 長時間步驟進度條：依 doc/training_oom_and_runtime_audit.md 在 Step 3/4/7/8/9 加入進度條或強化 log，讓使用者能判斷是否仍在執行並估計剩餘時間；Step 6 已有 tqdm。見「Training pipeline 長時間步驟進度條（計畫）」一節。"
+    status: completed
 isProject: false
 ---
 
@@ -175,7 +178,7 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 
 **Plan 狀態摘要**：上表 1～19 項均為 **completed**（第 18 項於 Round 406 完成項目 1、3；第 19 項 Track Human Lookback 向量化於本輪完成 Phase 2 compute_run_boundary numba 與 Code Review 修補 wager NaN／run_break_min_ns 上限）。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
 
-**剩餘項目**：上表 1～19 項與 **canonical-step3-schema-check-oom** 均已完成。目前唯一 **pending** 為 **config-consolidation**（Config 集中化與合併，DEC-027；見上方 todos 與下方「Config 集中化與合併變更草案（DEC-027）」一節）。
+**剩餘項目**：上表 1～19 項與 **canonical-step3-schema-check-oom**、**config-consolidation**（DEC-027）、**progress-bars-long-steps**、**training-config-recommender** 均已完成。DEC-027 與 progress-bars Code Review 修補已通過對應測試；training-config-recommender 已實作並完成 Code Review 修補（負 training_days frac clamp、CLI --days≥1 驗證、Parquet discovery OSError 防護），`tests/test_review_risks_training_config_recommender.py` 全 9 則通過。目前 **pending**：無（見上方 todos）。
 
 **建議實作順序**：可選／後續見下方各節（Step 7 out-of-core 排序、Optuna early stop 等）。
 
@@ -534,6 +537,46 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 - 獨立執行 CLI 時，Parquet 路徑能依 chunk_dir/session 檔產出 profile 與建議；ClickHouse 路徑在可連線時能依 **實際查表結果** 產出 chunk/session 估計與建議。
 - 連線 CH 失敗時，行為明確（fallback 或錯誤訊息），不影響 Parquet 路徑。
 - 報告標註估計為近似、公式出處為稽核文件。
+
+---
+
+## Training pipeline 長時間步驟進度條（計畫）
+
+**目標**：在預期耗時較長的步驟中加入進度條，讓使用者能判斷程式是否仍在執行，並對剩餘時間有概念。
+
+**參考**：`doc/training_oom_and_runtime_audit.md` 中標註為 **Long** 或 **OOM, Long** 的項目；現有 Step 6 已使用 `_tqdm_bar`（見「Track Human Lookback 向量化與 Step 6 進度條」一節）。
+
+**候選步驟與建議**：
+
+| 步驟 | 稽核 ID | 說明 | 進度條類型 | 位置／備註 |
+|------|---------|------|------------|------------|
+| Step 3 | A02 | Canonical mapping DuckDB 查詢後 .df() materialize | 單一長時間操作、無迴圈 | 可選：indeterminate（spinner）或僅 log 開始/結束 + elapsed；或維持現狀 |
+| Step 4 | A06, A30 | Profile backfill 依 snapshot_dates 或 day-by-day 迴圈 | **Determinate**：`total=len(dates_to_process)` 或等效天數，`desc="Profile backfill"`，`unit="snapshot"` | etl_player_profile.py `backfill()`：`for snap_date in dates_to_process` 與 `while current <= end_date` 兩分支皆可包一層 tqdm；ETL 內需 try/import tqdm 或共用 trainer 的 no-op fallback |
+| Step 6 | A12–A18 | 已有 chunk 級 tqdm | **已完成**：`_tqdm_bar(total=len(chunks), desc="Step 6 chunks", unit="chunk")` | trainer.py 已實作；可選：chunk 內子階段僅 log 不另加 bar |
+| Step 7 | A20 | DuckDB sort + 寫出三個 split Parquet | 單一長時間操作 | 可選：indeterminate bar 或 print + elapsed 週期（例如每 10s log）；或僅開始/結束 log |
+| Step 8 | A24 | screen_features：corr、LGB、可選 MI | 單一呼叫、內部多階段 | 可選：indeterminate 或「Step 8: screening… (elapsed Xs)」；若 screen_features 內有階段可傳入 callback 則可子階段 bar |
+| Step 9 | A26, A27 | Optuna study.optimize + lgb.train 每 trial | 已有 _progress_callback 每 20 trial log | **改進**：在 callback 中更新 tqdm bar（total=n_trials, update(1)）以顯示 ETA；或啟用 Optuna `show_progress_bar=True`（若依賴支援） |
+
+**實作要點**：
+
+- **共用**：沿用 trainer 內 `_tqdm_bar` 模式（try/import tqdm，未安裝則 no-op），必要時將 no-op 抽出至共用模組供 etl_player_profile 使用。
+- **Determinate**：Step 4 backfill、Step 9 trials 有明確總數，可用 tqdm 顯示百分比與 ETA。
+- **Indeterminate**：Step 3、Step 7、Step 8 若不加子階段迴圈，可用 tqdm 不設 total（或 leave=True 的 spinner）僅顯示「進行中 + elapsed」。
+- **CLI**：可選 `--no-progress` 關閉所有進度條（僅保留 log），方便 CI／無 TTY 環境。
+- **依賴**：tqdm 已為 Step 6 使用，無新增依賴；etl_player_profile 若加 bar 需確保 tqdm 可用或使用 no-op。
+
+**檔案**：
+
+- trainer/trainer.py：Step 7/8/9 的 bar 或 log 改進。
+- trainer/etl_player_profile.py：Step 4 backfill 迴圈 tqdm（兩分支：snapshot_dates 與 day-by-day）。
+- 可選：共用 util 或 config 的 `DISABLE_PROGRESS_BAR` / `--no-progress`。
+
+**優先順序建議**：
+
+1. **Step 4 backfill**（determinate，使用者常單獨跑 backfill，效益高）。
+2. **Step 9 Optuna**（determinate，trial 數已知，補 ETA）。
+3. Step 7 / Step 8（indeterminate 或 log 強化）。
+4. Step 3（可選，單一查詢通常已有開始/結束 log）。
 
 ---
 

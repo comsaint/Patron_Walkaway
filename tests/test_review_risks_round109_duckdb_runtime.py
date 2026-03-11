@@ -45,26 +45,27 @@ class TestR109DuckDBRuntimeRiskGuards(unittest.TestCase):
             self.assertTrue(hasattr(cfg, name), f"Missing config knob: {name}")
 
     def test_r109_1_fraction_should_be_range_validated(self):
-        """Risk #1: RAM fraction should be validated to (0, 1] with warning fallback."""
-        src = inspect.getsource(etl_mod._compute_duckdb_memory_limit_bytes)
+        """Risk #1: RAM fraction should be validated to (0, 1] with warning fallback. DEC-027: in config.get_duckdb_memory_limit_bytes."""
+        # ETL delegates to config; validation lives in config.get_duckdb_memory_limit_bytes.
+        src_cfg = inspect.getsource(cfg.get_duckdb_memory_limit_bytes)
         self.assertTrue(
-            re.search(r"0\.0\s*<\s*.*PROFILE_DUCKDB_RAM_FRACTION.*<=\s*1\.0", src)
-            or re.search(r"if\s+not\s*\(\s*0\.0\s*<\s*frac\s*<=\s*1\.0\s*\)", src),
-            "Expected explicit range validation for PROFILE_DUCKDB_RAM_FRACTION.",
+            re.search(r"0\.0\s*<\s*frac\s*<=\s*1\.0", src_cfg)
+            or re.search(r"if\s+not\s*\(\s*0\.0\s*<\s*frac\s*<=\s*1\.0\s*\)", src_cfg),
+            "Expected explicit range validation for frac in config.get_duckdb_memory_limit_bytes.",
         )
         self.assertIn(
-            "logger.warning",
-            src,
-            "Expected warning log when PROFILE_DUCKDB_RAM_FRACTION is invalid.",
+            "warning",
+            src_cfg,
+            "Expected warning log when fraction is invalid.",
         )
 
     def test_r109_2_min_max_should_be_normalized(self):
-        """Risk #1: MIN_GB > MAX_GB should be detected and normalized."""
-        src = inspect.getsource(etl_mod._compute_duckdb_memory_limit_bytes)
+        """Risk #1: MIN_GB > MAX_GB should be detected and normalized. DEC-027: in config.get_duckdb_memory_limit_bytes."""
+        src_cfg = inspect.getsource(cfg.get_duckdb_memory_limit_bytes)
         self.assertRegex(
-            src,
+            src_cfg,
             r"if\s+_min\s*>\s*_max",
-            "Expected guard for PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB > MAX_GB.",
+            "Expected guard for MIN_GB > MAX_GB in config.get_duckdb_memory_limit_bytes.",
         )
 
     def test_r109_3_get_available_ram_should_handle_psutil_runtime_errors(self):

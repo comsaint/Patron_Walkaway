@@ -72,6 +72,24 @@ try:
 except ImportError:
     from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
 
+try:
+    from tqdm import tqdm as _tqdm_bar
+except ImportError:
+    def _tqdm_bar(iterable=None, **kwargs):  # noqa: D401 — no-op when tqdm not installed
+        if iterable is not None:
+            return iterable
+        class _NoopBar:
+            def update(self, n: int = 1) -> None: ...
+            def close(self) -> None: ...
+        return _NoopBar()
+
+
+class _ProgressNoop:
+    """No-op progress bar for --no-progress (PLAN § progress-bars-long-steps)."""
+    def update(self, n: int = 1) -> None: ...
+    def close(self) -> None: ...
+
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -847,87 +865,36 @@ def _get_available_ram_bytes() -> Optional[int]:
 
 
 def _compute_duckdb_memory_limit_bytes(available_bytes: Optional[int]) -> int:
-    """Compute a DuckDB memory_limit (bytes) that is safe for the current machine.
-
-    Formula:
-        effective_ceiling = max(PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB * 1 GiB,
-                                available_bytes * PROFILE_DUCKDB_RAM_MAX_FRACTION)
-                            when PROFILE_DUCKDB_RAM_MAX_FRACTION is set and valid;
-                            otherwise effective_ceiling = MAX_GB * 1 GiB.
-        budget = clamp(available_bytes * PROFILE_DUCKDB_RAM_FRACTION,
-                       PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB * 1 GiB,
-                       effective_ceiling)
-
-    On high-RAM machines PROFILE_DUCKDB_RAM_MAX_FRACTION raises the effective
-    ceiling above the fixed MAX_GB, reducing OOM risk.  Set it to None to keep
-    the fixed MAX_GB ceiling regardless of available RAM.
-
-    When ``available_bytes`` is None (psutil not installed or failed), the
-    conservative floor (MIN_GB) is returned so the call never crashes.
-
-    Config values are validated and normalised:
-    - FRACTION must be in (0, 1]; invalid values fall back to 0.5 with a warning.
-    - If MIN_GB > MAX_GB the two values are swapped with a warning.
-    - If RAM_MAX_FRACTION < RAM_FRACTION, a warning is emitted because the budget
-      will always be capped by the ceiling before FRACTION is fully used.
-    """
-    _min = int(getattr(config, "PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB", 0.5) * 1024 ** 3)
-    _max = int(getattr(config, "PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB", 8.0) * 1024 ** 3)
-    frac = getattr(config, "PROFILE_DUCKDB_RAM_FRACTION", 0.5)
-
-    if not (0.0 < frac <= 1.0):
-        logger.warning(
-            "PROFILE_DUCKDB_RAM_FRACTION=%.3f out of valid range (0, 1]; using 0.5",
-            frac,
-        )
-        frac = 0.5
-
-    if _min > _max:
-        logger.warning(
-            "PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB (%.2f GB) > MAX_GB (%.2f GB); swapping",
-            _min / 1024 ** 3,
-            _max / 1024 ** 3,
-        )
-        _min, _max = _max, _min
-
+    """Compute DuckDB memory_limit (bytes) for profile ETL. DEC-027: uses config.get_duckdb_memory_limit_bytes."""
+    get_limit = getattr(config, "get_duckdb_memory_limit_bytes", None)
+    if get_limit is not None:
+        return get_limit("profile", available_bytes)
+    # Fallback if config not yet updated (e.g. tests).
+    _min = int(getattr(config, "DUCKDB_MEMORY_LIMIT_MIN_GB", 1.0) * 1024**3)
     if available_bytes is None:
         return _min
-    # Dynamic ceiling (PLAN duckdb-dynamic-ceiling): on high-RAM machines,
-    # raise the effective ceiling above the fixed MAX_GB so DuckDB can use more
-    # RAM and reduce OOM risk.  effective_ceiling = max(MAX_GB, available * frac).
-    ram_max_frac = getattr(config, "PROFILE_DUCKDB_RAM_MAX_FRACTION", None)
-    if ram_max_frac is not None and not (0.0 < ram_max_frac <= 1.0):
-        logger.warning(
-            "PROFILE_DUCKDB_RAM_MAX_FRACTION=%s out of (0, 1]; using fixed MAX_GB ceiling",
-            ram_max_frac,
-        )
-        ram_max_frac = None
-    if ram_max_frac is not None:
-        effective_max = max(_max, int(available_bytes * ram_max_frac))
-        if ram_max_frac < frac:
-            logger.warning(
-                "PROFILE_DUCKDB_RAM_MAX_FRACTION (%.2f) < PROFILE_DUCKDB_RAM_FRACTION (%.2f); "
-                "on high-RAM machines the effective ceiling will cap the budget before "
-                "PROFILE_DUCKDB_RAM_FRACTION is fully used",
-                ram_max_frac,
-                frac,
-            )
-    else:
-        effective_max = _max
+    frac = getattr(config, "DUCKDB_RAM_FRACTION", 0.5)
+    _max = int(getattr(config, "PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB", 8.0) * 1024**3)
     budget = int(available_bytes * frac)
-    return max(_min, min(effective_max, budget))
+    return max(_min, min(_max, budget))
 
 
 def _configure_duckdb_runtime(con, *, budget_bytes: int) -> None:
     """Apply memory_limit, threads, and preserve_insertion_order to *con*.
 
-    All policy values come from config (PROFILE_DUCKDB_*).
+    DEC-027: policy from config.get_duckdb_memory_config("profile").
     Each SET statement is executed independently so that a failure on one
     (e.g. unsupported setting in an older DuckDB version) does not silently
     skip the remaining settings.
     """
-    threads = max(1, int(getattr(config, "PROFILE_DUCKDB_THREADS", 2)))
-    preserve = getattr(config, "PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER", False)
+    get_cfg = getattr(config, "get_duckdb_memory_config", None)
+    if get_cfg is not None:
+        _tup = get_cfg("profile")
+        threads = max(1, int(_tup[4]))
+        preserve = _tup[5]
+    else:
+        threads = max(1, int(getattr(config, "DUCKDB_THREADS", 2)))
+        preserve = getattr(config, "DUCKDB_PRESERVE_INSERTION_ORDER", False)
     budget_gb = budget_bytes / 1024 ** 3
 
     _stmts: list[tuple[str, str]] = [
@@ -1633,6 +1600,7 @@ def backfill(
     canonical_map: Optional[pd.DataFrame] = None,
     max_lookback_days: int = 365,  # DEC-017: forwarded to _compute_profile via build_player_profile
     snapshot_dates: Optional[List[date]] = None,  # DEC-019: explicit date list overrides interval loop
+    disable_progress: bool = False,  # PLAN § progress-bars-long-steps: --no-progress for CI/non-TTY
 ) -> None:
     """Backfill player_profile for a range of dates.
 
@@ -1803,7 +1771,12 @@ def backfill(
             "backfill (DEC-019 snapshot_dates): %d dates in [%s, %s]",
             len(dates_to_process), start_date, end_date,
         )
-        for snap_date in dates_to_process:
+        date_iter = (
+            dates_to_process
+            if disable_progress
+            else _tqdm_bar(dates_to_process, desc="Profile backfill", unit="snapshot")
+        )
+        for snap_date in date_iter:
             try:
                 result = build_player_profile(
                     snap_date,
@@ -1823,35 +1796,46 @@ def backfill(
                 failed += 1
     else:
         # Original day-by-day loop with snapshot_interval_days.
-        current = start_date
-        _day_idx = 0
-        while current <= end_date:
-            if _day_idx % snapshot_interval_days == 0:
-                try:
-                    result = build_player_profile(
-                        current,
-                        use_local_parquet=use_local_parquet,
-                        canonical_map=canonical_map,
-                        preloaded_sessions=preloaded_sessions,
-                        canonical_id_whitelist=canonical_id_whitelist,
-                        max_lookback_days=max_lookback_days,
-                        sched_tag=_sched_tag,
-                    )
-                    if result is not None:
-                        success += 1
-                    else:
+        # Review #1: clamp so tqdm(total=...) never receives negative when start_date > end_date.
+        total_days = max(0, (end_date - start_date).days + 1)
+        pbar = (
+            _ProgressNoop()
+            if disable_progress
+            else _tqdm_bar(total=total_days, desc="Profile backfill", unit="day")
+        )
+        try:
+            current = start_date
+            _day_idx = 0
+            while current <= end_date:
+                if _day_idx % snapshot_interval_days == 0:
+                    try:
+                        result = build_player_profile(
+                            current,
+                            use_local_parquet=use_local_parquet,
+                            canonical_map=canonical_map,
+                            preloaded_sessions=preloaded_sessions,
+                            canonical_id_whitelist=canonical_id_whitelist,
+                            max_lookback_days=max_lookback_days,
+                            sched_tag=_sched_tag,
+                        )
+                        if result is not None:
+                            success += 1
+                        else:
+                            failed += 1
+                    except Exception as exc:
+                        logger.error("Failed for %s: %s", current, exc)
                         failed += 1
-                except Exception as exc:
-                    logger.error("Failed for %s: %s", current, exc)
-                    failed += 1
-            else:
-                skipped += 1
-                logger.debug(
-                    "backfill: skipping %s (snapshot_interval_days=%d, day_idx=%d)",
-                    current, snapshot_interval_days, _day_idx,
-                )
-            current += timedelta(days=1)
-            _day_idx += 1
+                else:
+                    skipped += 1
+                    logger.debug(
+                        "backfill: skipping %s (snapshot_interval_days=%d, day_idx=%d)",
+                        current, snapshot_interval_days, _day_idx,
+                    )
+                current += timedelta(days=1)
+                _day_idx += 1
+                pbar.update(1)
+        finally:
+            pbar.close()
 
     logger.info(
         "Backfill complete: %d succeeded, %d failed, %d skipped",
@@ -1895,6 +1879,11 @@ def _parse_args() -> argparse.Namespace:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bar (e.g. for CI / non-TTY). PLAN § progress-bars-long-steps.",
+    )
     return p.parse_args()
 
 
@@ -1906,7 +1895,12 @@ def main() -> None:
     )
 
     if args.start_date and args.end_date:
-        backfill(args.start_date, args.end_date, use_local_parquet=args.local_parquet)
+        backfill(
+            args.start_date,
+            args.end_date,
+            use_local_parquet=args.local_parquet,
+            disable_progress=args.no_progress,
+        )
     else:
         snap_date = args.snapshot_date or datetime.now(HK_TZ).date()
         build_player_profile(snap_date, use_local_parquet=args.local_parquet)

@@ -2788,3 +2788,36 @@ python -m mypy trainer/ --ignore-missing-imports
 ruff check trainer/
 # All checks passed!
 ```
+
+---
+
+## Round — Code Review DEC-027 Config 集中化：實作修補至 tests/typecheck/lint 全過（2026-03-11）
+
+**目標**：依 STATUS「Code Review — Config 集中化（DEC-027）」風險表，修改 production 使 `tests/test_review_risks_dec027_config_consolidation.py` 全數通過；僅在 decorator 過時時移除 `@unittest.expectedFailure`；最後追加結果至 STATUS、更新 PLAN.md。
+
+### 本輪修改（production + tests）
+
+| 檔案 | 性質 | 說明 |
+|------|------|------|
+| `trainer/config.py` | 實作 | **Risk 1**：min_gb/max_gb ≤ 0 時 warn 並設 floor（0.1 GB）/ 用 _min；**Risk 2**：available_bytes &lt; 0 視同 None 回傳 _min；**Risk 4**：`get_duckdb_memory_config(stage)` 僅接受 `profile`/`step7`/`canonical_map`，否則 `ValueError`；**Risk 6**：頂層 `import logging`、`_log`，移除函式內重複 import；**Risk 8**：MAX_GB 與 effective_max 上限 1 TB，並對 step7 ram_max_frac 路徑套用同一 cap。 |
+| `trainer/trainer.py` | 實作 | **Risk 3**：`build_canonical_links_and_dummy_from_duckdb` 之 threads 改為 `max(1, int(threads))`，TypeError/ValueError 時 `ValueError("CANONICAL_MAP_DUCKDB_THREADS must be a positive integer")`；**Risk 7**：`_configure_step7_duckdb_runtime` 與 `_duckdb_sort_and_split` 之 temp_dir 僅允許 DATA_DIR 下或 `DATA_DIR/duckdb_tmp`，否則 fallback 並 log warning。 |
+| `trainer/trainer.py` | 實作 | **HISTORY_BUFFER_DAYS**：在 try 區塊（`import config as _cfg`）補上 `HISTORY_BUFFER_DAYS: int = getattr(_cfg, "HISTORY_BUFFER_DAYS", 2)`，使 backtester 自 trainer 匯入時不報錯。 |
+| `tests/test_review_risks_dec027_config_consolidation.py` | tests | 移除 8 處已過時之 `@unittest.expectedFailure`（R1 兩則、R3 兩則、R4 兩則、R7 一則、R8 一則）。 |
+
+### 驗證結果
+
+```text
+python -m pytest tests/test_review_risks_dec027_config_consolidation.py -v
+# 11 passed in ~2.5s
+
+python -m pytest tests/ -q
+# 970 passed, 41 skipped, 192 warnings in ~40s
+
+python -m mypy trainer/ --ignore-missing-imports
+# Success: no issues found in 23 source files
+
+ruff check trainer/config.py trainer/trainer.py tests/test_review_risks_dec027_config_consolidation.py
+# All checks passed!
+```
+
+**說明**：`ruff check trainer/ tests/` 仍有 31 個既有錯誤（E402/F401 等於其他測試檔），非本輪引入；依「不改 tests 除非測試錯或 decorator 過時」未改動該等檔案。本輪修改之 trainer 與 DEC-027 測試檔通過 ruff。

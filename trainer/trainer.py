@@ -77,6 +77,12 @@ except ImportError:
             def close(self) -> None: pass  # noqa: E701
         return _NoopBar()
 
+
+class _ProgressNoop:
+    """No-op bar when DISABLE_PROGRESS_BAR (PLAN § progress-bars-long-steps)."""
+    def update(self, n: int = 1) -> None: ...
+    def close(self) -> None: ...
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +115,7 @@ try:
     TPROFILE: str = getattr(_cfg, "TPROFILE", "player_profile")
     HK_TZ_STR: str = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     TRAINER_DAYS: int = getattr(_cfg, "TRAINER_DAYS", 30)
+    HISTORY_BUFFER_DAYS: int = getattr(_cfg, "HISTORY_BUFFER_DAYS", 2)
     CHUNK_CONCAT_MEMORY_WARN_BYTES: int = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 1 * (1024**3))
     CHUNK_CONCAT_RAM_FACTOR: float = getattr(_cfg, "CHUNK_CONCAT_RAM_FACTOR", 3)
     TRAIN_SPLIT_FRAC: float = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
@@ -125,6 +132,7 @@ try:
     NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT: int = getattr(_cfg, "NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT", 200 * 1024 * 1024)
     PRODUCTION_NEG_POS_RATIO: Optional[float] = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)
     STEP7_USE_DUCKDB: bool = getattr(_cfg, "STEP7_USE_DUCKDB", True)
+    # STEP7 DuckDB: runtime uses get_duckdb_memory_config("step7"); exposed for tests (DEC-027).
     STEP7_DUCKDB_RAM_FRACTION: float = getattr(_cfg, "STEP7_DUCKDB_RAM_FRACTION", 0.50)
     STEP7_DUCKDB_RAM_MIN_GB: float = getattr(_cfg, "STEP7_DUCKDB_RAM_MIN_GB", 2.0)
     STEP7_DUCKDB_RAM_MAX_GB: float = getattr(_cfg, "STEP7_DUCKDB_RAM_MAX_GB", 24.0)
@@ -136,10 +144,7 @@ try:
     STEP9_TRAIN_FROM_FILE: bool = getattr(_cfg, "STEP9_TRAIN_FROM_FILE", False)
     STEP9_SAVE_LGB_BINARY: bool = getattr(_cfg, "STEP9_SAVE_LGB_BINARY", False)
     STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
-    CANONICAL_MAP_DUCKDB_RAM_FRACTION: float = getattr(_cfg, "CANONICAL_MAP_DUCKDB_RAM_FRACTION", 0.45)
-    CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB: float = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB", 1.0)
-    CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB: float = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB", 24.0)
-    CANONICAL_MAP_DUCKDB_THREADS: int = getattr(_cfg, "CANONICAL_MAP_DUCKDB_THREADS", 2)
+    # Canonical mapping DuckDB from get_duckdb_memory_config("canonical_map") (DEC-027).
     CASINO_PLAYER_ID_CLEAN_SQL: str = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END")
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
@@ -190,10 +195,6 @@ except ModuleNotFoundError:
     STEP9_TRAIN_FROM_FILE = getattr(_cfg, "STEP9_TRAIN_FROM_FILE", False)
     STEP9_SAVE_LGB_BINARY = getattr(_cfg, "STEP9_SAVE_LGB_BINARY", False)
     STEP8_SCREEN_SAMPLE_ROWS = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
-    CANONICAL_MAP_DUCKDB_RAM_FRACTION = getattr(_cfg, "CANONICAL_MAP_DUCKDB_RAM_FRACTION", 0.45)
-    CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB", 1.0)
-    CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB", 24.0)
-    CANONICAL_MAP_DUCKDB_THREADS = getattr(_cfg, "CANONICAL_MAP_DUCKDB_THREADS", 2)
     CASINO_PLAYER_ID_CLEAN_SQL = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END")
 
 # Module-level pipeline imports (same try/except pattern)
@@ -326,38 +327,19 @@ for _d in (DATA_DIR, CHUNK_DIR, LOCAL_PARQUET_DIR, MODEL_DIR, OUT_DIR):
 # ---------------------------------------------------------------------------
 
 def _compute_canonical_map_duckdb_budget(available_bytes: Optional[int]) -> int:
-    """Compute DuckDB memory_limit (bytes) for canonical mapping (PLAN Canonical mapping DuckDB 對齊 Step 7).
-
-    budget = clamp(available_bytes * RAM_FRACTION, MIN_GB, MAX_GB).
-    When available_bytes is None, returns MIN_GB (bytes). Invalid fraction or min>max handled with warnings.
-    MIN_GB and MAX_GB must be positive (Round 253 Review #4).
-    """
-    frac = getattr(_cfg, "CANONICAL_MAP_DUCKDB_RAM_FRACTION", 0.45)
-    _min_gb = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB", 1.0)
-    _max_gb = getattr(_cfg, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB", 24.0)
-    if _min_gb <= 0 or _max_gb <= 0:
-        raise ValueError(
-            "CANONICAL_MAP_DUCKDB MEMORY_LIMIT MIN_GB and MAX_GB must be positive"
-        )
-    if not (0.0 < frac <= 1.0):
-        logger.warning(
-            "CANONICAL_MAP_DUCKDB_RAM_FRACTION=%.3f out of (0, 1]; using 0.45",
-            frac,
-        )
-        frac = 0.45
+    """Compute DuckDB memory_limit (bytes) for canonical mapping. DEC-027: uses config.get_duckdb_memory_limit_bytes."""
+    get_limit = getattr(_cfg, "get_duckdb_memory_limit_bytes", None)
+    if get_limit is not None:
+        return get_limit("canonical_map", available_bytes)
+    # Fallback if config not yet updated.
+    _min_gb = getattr(_cfg, "DUCKDB_MEMORY_LIMIT_MIN_GB", 1.0)
     lo = int(_min_gb * 1024**3)
-    hi = int(_max_gb * 1024**3)
-    if lo > hi:
-        logger.warning(
-            "CANONICAL_MAP_DUCKDB MEMORY_LIMIT_MIN_GB (%.2f) > MAX_GB (%.2f); swapping",
-            _min_gb,
-            _max_gb,
-        )
-        lo, hi = hi, lo
     if available_bytes is None:
         return lo
-    budget = int(available_bytes * frac)
-    return max(lo, min(hi, budget))
+    frac = getattr(_cfg, "DUCKDB_RAM_FRACTION", 0.45)
+    _max_gb = getattr(_cfg, "DUCKDB_MEMORY_LIMIT_MAX_GB", 24.0)
+    hi = int(_max_gb * 1024**3)
+    return max(lo, min(hi, int(available_bytes * frac)))
 
 
 def build_canonical_links_and_dummy_from_duckdb(
@@ -406,10 +388,16 @@ def build_canonical_links_and_dummy_from_duckdb(
     if missing:
         raise ValueError(f"Session Parquet missing required columns: {sorted(missing)}")
 
-    # Config validation (Round 253 Review #4)
-    threads = getattr(_cfg, "CANONICAL_MAP_DUCKDB_THREADS", 2)
-    if not isinstance(threads, int) or threads < 1:
-        raise ValueError("CANONICAL_MAP_DUCKDB_THREADS must be >= 1")
+    # Config validation (Round 253 Review #4). DEC-027: threads from get_duckdb_memory_config("canonical_map"); accept numeric like Step 7.
+    get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
+    if get_cfg is not None:
+        threads = get_cfg("canonical_map")[4]
+    else:
+        threads = getattr(_cfg, "CANONICAL_MAP_DUCKDB_THREADS", 1)
+    try:
+        threads = max(1, int(threads))
+    except (TypeError, ValueError):
+        raise ValueError("CANONICAL_MAP_DUCKDB_THREADS must be a positive integer")
 
     clean_sql = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", None) or CASINO_PLAYER_ID_CLEAN_SQL
     if ";" in (clean_sql or ""):
@@ -2620,8 +2608,16 @@ def run_optuna_search(
         )
 
     _start = time.perf_counter()
+    # PLAN § progress-bars-long-steps: Step 9 Optuna tqdm bar (ETA); respect DISABLE_PROGRESS_BAR.
+    _disable_bar = getattr(_cfg, "DISABLE_PROGRESS_BAR", False)
+    optuna_pbar = (
+        _ProgressNoop()
+        if _disable_bar
+        else _tqdm_bar(total=n_trials, desc="Step 9 Optuna", unit="trial")
+    )
 
     def _progress_callback(study: optuna.Study, trial: FrozenTrial) -> None:
+        optuna_pbar.update(1)
         n = len(study.trials)
         if n == 1 or n % 20 == 0 or n == n_trials:
             elapsed = time.perf_counter() - _start
@@ -2674,13 +2670,16 @@ def run_optuna_search(
     if isinstance(OPTUNA_EARLY_STOP_PATIENCE, int) and OPTUNA_EARLY_STOP_PATIENCE > 0:
         callbacks.append(_early_stop_callback)
 
-    study.optimize(
-        objective,
-        n_trials=n_trials,
-        timeout=_timeout,
-        show_progress_bar=False,
-        callbacks=callbacks,
-    )
+    try:
+        study.optimize(
+            objective,
+            n_trials=n_trials,
+            timeout=_timeout,
+            show_progress_bar=False,
+            callbacks=callbacks,
+        )
+    finally:
+        optuna_pbar.close()
     best = study.best_params
     try:
         final_best_ap = study.best_value
@@ -4418,7 +4417,12 @@ def run_pipeline(args) -> None:
     )
     t0 = time.perf_counter()
     chunk_paths: List[Path] = []
-    pbar = _tqdm_bar(total=len(chunks), desc="Step 6 chunks", unit="chunk")
+    _step6_disable_bar = getattr(_cfg, "DISABLE_PROGRESS_BAR", False)
+    pbar = (
+        _ProgressNoop()
+        if _step6_disable_bar
+        else _tqdm_bar(total=len(chunks), desc="Step 6 chunks", unit="chunk")
+    )
     try:
         if NEG_SAMPLE_FRAC_AUTO and len(chunks) > 0:
             # OOM probe: process chunk 1 with frac=1.0, then decide effective frac.
@@ -4537,54 +4541,49 @@ def run_pipeline(args) -> None:
             return None
 
     def _compute_step7_duckdb_budget(available_bytes: Optional[int]) -> int:
-        """Compute DuckDB memory_limit (bytes) for Step 7 sort+split.
-
-        budget = clamp(available_bytes * STEP7_DUCKDB_RAM_FRACTION,
-                      STEP7_DUCKDB_RAM_MIN_GB, STEP7_DUCKDB_RAM_MAX_GB).
-        FRACTION must be in (0, 1]; invalid values fall back to 0.5 with a warning.
-        If MIN_GB > MAX_GB, the two are swapped with a warning (align with ETL).
-        When available_bytes is None, returns MIN_GB so caller never crashes.
-        """
-        _min_gb = STEP7_DUCKDB_RAM_MIN_GB
-        _max_gb = STEP7_DUCKDB_RAM_MAX_GB
-        frac = STEP7_DUCKDB_RAM_FRACTION
-        if not (0.0 < frac <= 1.0):
-            logger.warning(
-                "STEP7_DUCKDB_RAM_FRACTION=%.3f out of valid range (0, 1]; using 0.5",
-                frac,
-            )
-            frac = 0.5
-        lo = int(_min_gb * 1024**3)
-        hi = int(_max_gb * 1024**3)
-        if lo > hi:
-            logger.warning(
-                "STEP7_DUCKDB_RAM_MIN_GB (%.2f GB) > RAM_MAX_GB (%.2f GB); swapping",
-                _min_gb,
-                _max_gb,
-            )
-            lo, hi = hi, lo
+        """Compute DuckDB memory_limit (bytes) for Step 7 sort+split. DEC-027: uses config helper."""
+        get_limit = getattr(_cfg, "get_duckdb_memory_limit_bytes", None)
+        if get_limit is not None:
+            return get_limit("step7", available_bytes)
+        lo = int(getattr(_cfg, "DUCKDB_MEMORY_LIMIT_MIN_GB", 1.0) * 1024**3)
         if available_bytes is None:
             return lo
-        budget = int(available_bytes * frac)
-        return max(lo, min(hi, budget))
+        frac = getattr(_cfg, "DUCKDB_RAM_FRACTION", 0.5)
+        hi = int(getattr(_cfg, "DUCKDB_MEMORY_LIMIT_MAX_GB", 24.0) * 1024**3)
+        return max(lo, min(hi, int(available_bytes * frac)))
 
     def _configure_step7_duckdb_runtime(con: Any, *, budget_bytes: int) -> None:
-        """Set memory_limit, threads, temp_directory, preserve_insertion_order on *con*.
-        Paths containing single quotes are escaped for SQL (''); if unescapable we fallback
-        to DATA_DIR/duckdb_tmp and log a warning.
-        """
-        budget_gb = budget_bytes / 1024**3
-        threads = max(1, int(STEP7_DUCKDB_THREADS))
-        temp_dir_raw = STEP7_DUCKDB_TEMP_DIR if STEP7_DUCKDB_TEMP_DIR else str(DATA_DIR / "duckdb_tmp")
-        if "'" in temp_dir_raw:
-            fallback = str(DATA_DIR / "duckdb_tmp")
-            logger.warning(
-                "STEP7_DUCKDB_TEMP_DIR contains single quote; using fallback %s",
-                fallback,
-            )
-            temp_dir = fallback
+        """Set memory_limit, threads, temp_directory, preserve_insertion_order on *con*. DEC-027: from get_duckdb_memory_config('step7')."""
+        get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
+        if get_cfg is not None:
+            _tup = get_cfg("step7")
+            threads = max(1, int(_tup[4]))
+            preserve_order = _tup[5]
+            temp_dir_raw = _tup[6] or str(DATA_DIR / "duckdb_tmp")
         else:
-            temp_dir = temp_dir_raw
+            threads = max(1, int(getattr(_cfg, "STEP7_DUCKDB_THREADS", 4)))
+            preserve_order = False
+            temp_dir_raw = getattr(_cfg, "STEP7_DUCKDB_TEMP_DIR", None) or str(DATA_DIR / "duckdb_tmp")
+        if "'" in temp_dir_raw:
+            temp_dir = str(DATA_DIR / "duckdb_tmp")
+            logger.warning("Step 7 DuckDB temp_directory contains single quote; using fallback %s", temp_dir)
+        else:
+            # DEC-027 Review #7: only allow path under DATA_DIR or exactly DATA_DIR/duckdb_tmp
+            try:
+                effective_resolved = Path(temp_dir_raw).resolve()
+                data_dir_resolved = DATA_DIR.resolve()
+                allowed_duckdb_tmp = (DATA_DIR / "duckdb_tmp").resolve()
+                if effective_resolved != allowed_duckdb_tmp:
+                    effective_resolved.relative_to(data_dir_resolved)
+            except (ValueError, OSError):
+                temp_dir = str(DATA_DIR / "duckdb_tmp")
+                logger.warning(
+                    "Step 7 DuckDB temp_directory outside DATA_DIR; using fallback %s",
+                    temp_dir,
+                )
+            else:
+                temp_dir = temp_dir_raw
+        budget_gb = budget_bytes / 1024**3
         temp_dir_sql = temp_dir.replace("'", "''")
         for _stmt, _label in [
             (f"SET memory_limit='{budget_gb:.2f}GB'", "memory_limit"),
@@ -4595,7 +4594,7 @@ def run_pipeline(args) -> None:
                 con.execute(_stmt)
             except Exception as exc:
                 logger.warning("Step 7 DuckDB SET %s failed (non-fatal): %s", _label, exc)
-        if not STEP7_DUCKDB_PRESERVE_INSERTION_ORDER:
+        if not preserve_order:
             try:
                 con.execute("SET preserve_insertion_order=false")
             except Exception as exc:
@@ -4622,8 +4621,13 @@ def run_pipeline(args) -> None:
     def _step7_clean_duckdb_temp_dir() -> None:
         """Remove Step 7 DuckDB temp directory if it exists (PLAN Step 7: 清理暫存).
         Only deletes when path is DATA_DIR/duckdb_tmp or under DATA_DIR (R213 Review #1 whitelist).
+        DEC-027: temp_dir from get_duckdb_memory_config('step7').
         """
-        temp_dir_raw = STEP7_DUCKDB_TEMP_DIR if STEP7_DUCKDB_TEMP_DIR else str(DATA_DIR / "duckdb_tmp")
+        get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
+        if get_cfg is not None:
+            temp_dir_raw = get_cfg("step7")[6] or str(DATA_DIR / "duckdb_tmp")
+        else:
+            temp_dir_raw = getattr(_cfg, "STEP7_DUCKDB_TEMP_DIR", None) or str(DATA_DIR / "duckdb_tmp")
         if "'" in temp_dir_raw:
             effective = DATA_DIR / "duckdb_tmp"
         else:
@@ -4670,11 +4674,26 @@ def run_pipeline(args) -> None:
         train_path = step7_dir / "split_train.parquet"
         valid_path = step7_dir / "split_valid.parquet"
         test_path = step7_dir / "split_test.parquet"
-        temp_dir_raw = STEP7_DUCKDB_TEMP_DIR if STEP7_DUCKDB_TEMP_DIR else str(DATA_DIR / "duckdb_tmp")
+        get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
+        temp_dir_raw = (get_cfg("step7")[6] if get_cfg else None) or str(DATA_DIR / "duckdb_tmp")
         if "'" in temp_dir_raw:
             effective_temp_dir = str(DATA_DIR / "duckdb_tmp")
         else:
-            effective_temp_dir = temp_dir_raw
+            # DEC-027 Review #7: only use path under DATA_DIR or exactly DATA_DIR/duckdb_tmp
+            try:
+                effective_resolved = Path(temp_dir_raw).resolve()
+                data_dir_resolved = DATA_DIR.resolve()
+                allowed_duckdb_tmp = (DATA_DIR / "duckdb_tmp").resolve()
+                if effective_resolved != allowed_duckdb_tmp:
+                    effective_resolved.relative_to(data_dir_resolved)
+            except (ValueError, OSError):
+                effective_temp_dir = str(DATA_DIR / "duckdb_tmp")
+                logger.warning(
+                    "Step 7 DuckDB temp_directory outside DATA_DIR; using fallback %s",
+                    effective_temp_dir,
+                )
+            else:
+                effective_temp_dir = temp_dir_raw
         Path(effective_temp_dir).mkdir(parents=True, exist_ok=True)
         con = duckdb.connect(":memory:")
         try:

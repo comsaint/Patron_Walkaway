@@ -934,14 +934,14 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
 
         is_new = key not in existing_results
         # Treat stored result as MATCH only when explicitly True/1/1.0 (R393: NaN/0/None allow upgrade to MATCH)
-        stored = existing_results[key].get("result")
+        stored = existing_results.get(key, {}).get("result")
         stored_is_match = (
             stored is True
             or stored == 1
             or (isinstance(stored, float) and not pd.isna(stored) and stored == 1.0)
         )
         is_upgrade = not is_new and res["result"] and not stored_is_match
-        was_pending = not is_new and existing_results[key].get("reason") == "PENDING"
+        was_pending = not is_new and existing_results.get(key, {}).get("reason") == "PENDING"
         is_finalize = was_pending and res.get("reason") == "MISS"
 
         if res.get("reason") in IGNORED_REASONS:

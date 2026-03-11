@@ -6,6 +6,24 @@
 
 ---
 
+## validator KeyError 修復（首次 finalize 為 MATCH 時崩潰）
+
+### 問題
+生產環境執行 `python -m trainer.validator` 時，當某筆 alert 首次被 finalize 為 MATCH（「Finalizing candidate as MATCH (no late arrivals in 15-45m window or forced)」）後，主迴圈隨即拋出 `KeyError: '594619219'`（bet_id），錯誤重複出現導致該週期無法完成。
+
+### 原因
+`validate_once` 內對 `pending` 迴圈處理時，假設「只要有 result 的 row 其 key 已存在於 `existing_results`」。但首次被 finalize 的 alert 尚未寫入 `existing_results`，第 937 行 `existing_results[key].get("result")` 與第 945 行 `existing_results[key].get("reason")` 在 key 不存在時會觸發 KeyError。
+
+### 修改
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/validator.py` | 第 937 行改為 `stored = existing_results.get(key, {}).get("result")`；第 945 行改為 `was_pending = not is_new and existing_results.get(key, {}).get("reason") == "PENDING"`。key 不存在時以空 dict 取值，不影響 is_new / is_upgrade / is_finalize 邏輯，後續仍會將 res 寫入 `existing_results[key]`。 |
+
+### 備註
+- 錯誤訊息僅顯示 `'594619219'` 為 KeyError 的 key（bet_id），main() 的 except 只 print(exc)，未列印 traceback。
+
+---
+
 ## join_player_profile OOM fix（90 天訓練 ArrayMemoryError）
 
 ### 問題
@@ -15194,4 +15212,551 @@ python -m mypy trainer/ --ignore-missing-imports
 **下一步建議**
 
 - 步驟 4：Config 內 OOM 區塊與 Step 7/8/9 註解整理。
+
+---
+
+## Config 集中化與合併（DEC-027）— 本輪實作（2026-03-11）
+
+### 目標
+
+依 PLAN.md「Config 集中化與合併變更草案（DEC-027）」實作：DuckDB 一組共用 SSOT ＋ stage 覆寫、get_duckdb_memory_config / get_duckdb_memory_limit_bytes、etl_player_profile 與 trainer 改用 helper；Validator／HISTORY_BUFFER_DAYS／Threshold 命名已於前輪完成，本輪完成「一、DuckDB 共用＋helper」與相關測試對齊。
+
+### 改了哪些檔
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/config.py` | 新增 DUCKDB_* 共用常數（RAM_FRACTION、MEMORY_LIMIT_MIN/MAX_GB、RAM_MAX_FRACTION、THREADS、PRESERVE_INSERTION_ORDER）；新增 `get_duckdb_memory_config(stage)`、`get_duckdb_memory_limit_bytes(stage, available_bytes)`；Profile 僅保留 PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB=8.0 覆寫；Step 7 僅保留 STEP7_DUCKDB_TEMP_DIR、STEP7_DUCKDB_THREADS；Canonical 僅保留 CANONICAL_MAP_DUCKDB_THREADS=1；向後相容別名（PROFILE_DUCKDB_*、STEP7_DUCKDB_RAM_*、CANONICAL_MAP_DUCKDB_*）供既有測試；get_duckdb_memory_limit_bytes 內含 frac/min_max 驗證與 warning。 |
+| `trainer/etl_player_profile.py` | `_compute_duckdb_memory_limit_bytes` 改為呼叫 `config.get_duckdb_memory_limit_bytes("profile", available_bytes)`；`_configure_duckdb_runtime` 改為自 `config.get_duckdb_memory_config("profile")` 取得 threads/preserve_order；保留 getattr fallback。 |
+| `trainer/trainer.py` | Config 區塊保留 STEP7_DUCKDB_*／CANONICAL_MAP 註解與從 _cfg 讀取之別名（供測試）；`_compute_canonical_map_duckdb_budget`、`_compute_step7_duckdb_budget` 改為呼叫 `_cfg.get_duckdb_memory_limit_bytes(..., available_bytes)`；`_configure_step7_duckdb_runtime`、`_step7_clean_duckdb_temp_dir`、Step 7 sort 內 temp_dir 改為自 `get_duckdb_memory_config("step7")` 取得；`build_canonical_links_and_dummy_from_duckdb` 之 threads 改為自 `get_duckdb_memory_config("canonical_map")` 取得。 |
+| `tests/test_review_risks_round109_duckdb_runtime.py` | test_r109_1／r109_2 改為檢查 `config.get_duckdb_memory_limit_bytes` 原始碼內之 frac 驗證與 _min > _max 處理。 |
+| `tests/test_review_risks_round115_dynamic_ceiling.py` | test_r115_5 改為接受 doc 提及 get_duckdb_memory_limit_bytes 或 DUCKDB_RAM_MAX_FRACTION；test_r115_6 改為僅斷言動態 ceiling 結果 > 8G，不再要求 ETL warning。 |
+| `tests/test_review_risks_round389_canonical_duckdb_dynamic_ram.py` | test_ram_fraction_string_raises 改為 patch config.DUCKDB_RAM_FRACTION="0.5" 並對 config.get_duckdb_memory_limit_bytes 期待 TypeError/ValueError；test_compute_budget_large_available 改為斷言結果等於 config.get_duckdb_memory_limit_bytes("canonical_map", 2**60) 且 ≥ 24G。 |
+
+### 手動驗證
+
+- `python -c "import trainer.config as c; t=c.get_duckdb_memory_config('profile'); print(t[0], t[1], t[2])"` → 預期 (0.5, 1.0, 8.0)（profile 覆寫 max_gb=8）。
+- `python -c "import trainer.config as c; print(c.get_duckdb_memory_limit_bytes('step7', None))"` → 預期 1073741824（1G bytes）。
+- `python -m pytest tests/test_review_risks_round109_duckdb_runtime.py tests/test_review_risks_round115_dynamic_ceiling.py tests/test_review_risks_round171_step7_helpers.py tests/test_review_risks_round246_canonical_map_config.py tests/test_review_risks_round389_canonical_duckdb_dynamic_ram.py -v --tb=short` → 全部通過。
+- 既有 pipeline 行為不變：DuckDB 預算仍由相同公式計算，僅來源改為共用常數＋helper。
+
+### 下一步建議
+
+- 將 PLAN.md 內 `config-consolidation` todo 標為 **completed**。
+- 可選：Training config recommender（PLAN 下一 pending 項）；或執行一次短窗訓練／backtest 確認 end-to-end 無行為差異。
+
+---
+
+## Code Review — Config 集中化（DEC-027）變更（2026-03-11）
+
+**範圍**：本輪 DEC-027 實作（config.py 共用 DuckDB + helper、etl_player_profile / trainer 改用 helper、相關測試）。  
+**標準**：關鍵決策、最高可靠性；僅列出問題與建議，不重寫整套。
+
+---
+
+### 1. Bug／邊界：`get_duckdb_memory_limit_bytes` 未驗證 `min_gb`／`max_gb` 為正數
+
+**問題**：`_min = int(min_gb * 1024**3)`、`_max = int(max_gb * 1024**3)` 未檢查 `min_gb`／`max_gb` > 0。若 config 被 patch 或誤設為 0 或負數，會得到 `_min`／`_max` ≤ 0，回傳值可能為 0 或負數，DuckDB 的 `SET memory_limit='0GB'` 或負值語義未定義，可能導致 OOM 或執行期錯誤。
+
+**具體修改建議**：在 `get_duckdb_memory_limit_bytes` 內，在計算 `_min`／`_max` 之後、使用前加入：若 `_min <= 0` 或 `_max <= 0`，記錄 warning 並將 `_min` 設為 `max(1, _min)`（或至少 `int(0.1 * 1024**3)` 作為 0.1 GB 底線）、`_max` 設為 `max(_min, _max)`；或改為在讀取後立即驗證 `min_gb > 0 and max_gb > 0`，否則 raise `ValueError`（與 Round 253 Review #4 風格一致）。
+
+**建議新增測試**：  
+- `test_get_duckdb_memory_limit_bytes_min_gb_zero_or_negative`：patch `DUCKDB_MEMORY_LIMIT_MIN_GB=0` 或 `-1`，呼叫 `get_duckdb_memory_limit_bytes("profile", None)`，斷言不回傳 0 或負數（且可選：出現 warning 或 ValueError）。  
+- `test_get_duckdb_memory_limit_bytes_max_gb_zero_or_negative`：同上針對 `MAX_GB`，且回傳值仍在合理範圍內。
+
+---
+
+### 2. 邊界：`available_bytes` 為負數時語義不明
+
+**問題**：`get_duckdb_memory_limit_bytes(stage, -1000)` 會計算 `budget = int(-1000 * frac) < 0`，最後 `max(_min, min(effective_max, budget))` 會回傳 `_min`。行為雖不至於回傳負數，但「負的可用記憶體」應視為無效輸入，與 `None`（fallback 到 _min）區分或一致處理較妥。
+
+**具體修改建議**：在 `if available_bytes is None: return _min` 之後加一分支：`if available_bytes is not None and available_bytes < 0:` 記錄 warning 並將 `available_bytes = None`，再走既有 `return _min` 邏輯；或直接 `return _min` 並 log 一次 warning。避免用負數參與 `effective_max`／`budget` 計算。
+
+**建議新增測試**：  
+- `test_get_duckdb_memory_limit_bytes_negative_available_treated_like_none_or_min`：`get_duckdb_memory_limit_bytes("step7", -1)` 回傳值等於 `get_duckdb_memory_limit_bytes("step7", None)`，且可選 assert 有 warning。
+
+---
+
+### 3. 邊界／一致性：`build_canonical_links_and_dummy_from_duckdb` 的 `threads` 僅接受 `int`，Step 7 用 `int(_tup[4])` 強制轉換
+
+**問題**：`build_canonical_links_and_dummy_from_duckdb` 內 `threads = get_cfg("canonical_map")[4]` 後以 `if not isinstance(threads, int) or threads < 1: raise ValueError` 檢查。若 config 或環境將 `CANONICAL_MAP_DUCKDB_THREADS` 設為 `1.0`（float）或字串 `"1"`，canonical 路徑會因 `isinstance(threads, int)` 為 False 而拋錯；而 Step 7 的 `threads = max(1, int(_tup[4]))` 會接受 float／可轉 int 的字串。兩處對「數字」的寬嚴不一致，易在 patch 或設定檔型別不同時只壞一邊。
+
+**具體修改建議**：canonical 路徑改為與 Step 7 一致：先 `threads = get_cfg("canonical_map")[4]`，再 `threads = max(1, int(threads))`（對無法轉 int 的型別自然拋錯）；若仍要嚴格型別，可改為 `try: threads = int(threads); except (TypeError, ValueError): raise ValueError("CANONICAL_MAP_DUCKDB_THREADS must be a positive integer")`，並再檢查 `threads >= 1`。
+
+**建議新增測試**：  
+- `test_canonical_map_duckdb_threads_accepts_numeric_like_step7`：patch `CANONICAL_MAP_DUCKDB_THREADS = 1.0` 或 `"1"`，在 mock DuckDB 下呼叫 `build_canonical_links_and_dummy_from_duckdb`，斷言不因型別而 raise，且 SET threads 值為 1。
+
+---
+
+### 4. 防禦性：`get_duckdb_memory_config(stage)` 未拒絕未知 `stage`
+
+**問題**：型別為 `Literal["profile", "step7", "canonical_map"]`，但執行期若傳入 `"step6"` 或 `"profile "` 等，函式會 fallthrough 並回傳共用預設值（且 step7 的 `temp_dir` 為 None）。行為雖可接受（caller 會用 `temp_dir or str(DATA_DIR / "duckdb_tmp")`），但易造成「用錯 stage 卻無錯誤」的除錯困難。
+
+**具體修改建議**：在 `get_duckdb_memory_config` 開頭加入：  
+`if stage not in ("profile", "step7", "canonical_map"): raise ValueError("stage must be 'profile', 'step7', or 'canonical_map', got %r" % (stage,))`。  
+保留 Literal 型別，執行期也拒絕非法值。
+
+**建議新增測試**：  
+- `test_get_duckdb_memory_config_invalid_stage_raises`：`get_duckdb_memory_config("step6")` 或 `get_duckdb_memory_config("")` 拋出 `ValueError` 且訊息含 `stage`。
+
+---
+
+### 5. Fallback 語義：ETL／trainer fallback 路徑未套用 `RAM_MAX_FRACTION` 動態天花板
+
+**問題**：`etl_player_profile._compute_duckdb_memory_limit_bytes` 與 trainer 的 `_compute_step7_duckdb_budget`／`_compute_canonical_map_duckdb_budget` 在 `get_limit is None` 時的 fallback 僅做 `clamp(available * frac, min_gb, max_gb)`，未考慮 `DUCKDB_RAM_MAX_FRACTION`。因此當 config 尚未更新（或測試 patch 掉 helper）時，高 RAM 機器會少掉動態天花板，行為與「有 helper」時不一致。
+
+**具體修改建議**：視 fallback 是否要長期保留而定。若保留：在 ETL 與 trainer 的 fallback 分支中，依 config 讀取 `ram_max_frac`，計算 `effective_max = max(_max, int(available_bytes * ram_max_frac))`（當 `ram_max_frac` 存在且合法時），再 `return max(_min, min(effective_max, budget))`。若 fallback 僅為過渡，可僅在註解中註明「fallback 不套用動態天花板」，並依需求補測試鎖定 fallback 行為。
+
+**建議新增測試**：  
+- 可選：`test_etl_fallback_budget_without_helper_uses_fixed_max_only`：在 patch 掉 `config.get_duckdb_memory_limit_bytes` 的情況下，呼叫 ETL 的 `_compute_duckdb_memory_limit_bytes(available_bytes=50*1024**3)`，斷言回傳為 8G（profile 固定 max）而非 0.45*50G；目的為鎖定 fallback 語義，避免日後改動時行為悄悄改變。
+
+---
+
+### 6. 效能／可維護性：`get_duckdb_memory_limit_bytes` 內重複 `import logging`
+
+**問題**：每次呼叫皆執行 `import logging` 與 `logging.getLogger(__name__)`，對熱路徑（如 Step 7 每 run 一次）有極輕微開銷，且與多數模組在頂層 import 的風格不一致。
+
+**具體修改建議**：在 `config.py` 頂部與其他 import 一併加入 `import logging`，並在模組層定義 `_log = logging.getLogger(__name__)`（或保留 `getLogger(__name__)` 在函式內但將 `import logging` 移到檔頂）。若擔心 config 被 import 時尚未需要 logging，可保留在函式內 get logger，但至少將 `import logging` 移到檔頂。
+
+**建議新增測試**：無需為此單獨加測；可納入既有「helper 回傳值正確」的測試即可。
+
+---
+
+### 7. 安全性：Step 7 `temp_directory` 路徑僅跳過單引號，未阻擋路徑穿越
+
+**問題**：`temp_dir_raw` 來自 config 或 `get_duckdb_memory_config("step7")[6]`，僅做 `"'" in temp_dir_raw` 時改用 `DATA_DIR / "duckdb_tmp"`。若設定為 `../other_dir` 或絕對路徑指向敏感目錄，DuckDB 會在該處寫入 spill 檔；與 R213「僅刪除 DATA_DIR 下」的 whitelist 精神一致，但「寫入」路徑目前未做相同限制。
+
+**具體修改建議**：在 `_configure_step7_duckdb_runtime` 與 `_duckdb_sort_and_split` 使用 `temp_dir` 前，若 `temp_dir` 不為 `DATA_DIR / "duckdb_tmp"` 且不在 `DATA_DIR` 下（例如 `Path(temp_dir).resolve().relative_to(DATA_DIR.resolve())` 會拋 `ValueError`），則記錄 warning 並改為使用 `str(DATA_DIR / "duckdb_tmp")`，避免寫入任意目錄。若產品需求為允許自訂 spill 目錄，則在文件與註解中明確說明「僅建議設在 DATA_DIR 下或受控目錄」。
+
+**建議新增測試**：  
+- `test_step7_temp_dir_outside_data_dir_falls_back_to_duckdb_tmp`：patch `STEP7_DUCKDB_TEMP_DIR` 為 `"/tmp"` 或 `str(Path.cwd() / ".." / "other")`，在 mock DuckDB 下執行 Step 7 設定，斷言最終 `SET temp_directory` 使用的路徑為 `DATA_DIR/duckdb_tmp` 或在其下，或 assert 有 warning 且未使用該外部路徑。
+
+---
+
+### 8. 可選硬化：`min_gb`／`max_gb` 合理範圍上限
+
+**問題**：若誤設 `DUCKDB_MEMORY_LIMIT_MAX_GB = 1e6`，會得到極大的 `_max`，DuckDB 可能接受過大的 `memory_limit` 導致 OOM。非必要，但可降低 misconfig 風險。
+
+**具體修改建議**：在 `get_duckdb_memory_limit_bytes` 中，在計算出 `_min`／`_max` 後，將兩者 clamp 至合理區間，例如 `_min = max(0, min(_min, 1024**4))`、`_max = max(_min, min(_max, 1024**4))`（以 1 TB 為上限），並在 clamp 時打一次 warning。或僅在文件／註解中建議 MIN/MAX_GB 勿超過 1024。
+
+**建議新增測試**：可選；例如 `test_get_duckdb_memory_limit_bytes_extreme_max_gb_capped_or_warned`：patch `DUCKDB_MEMORY_LIMIT_MAX_GB = 1e6`，呼叫 helper，斷言回傳值不超過 1 TB 或出現 warning。
+
+---
+
+### Review 摘要
+
+| # | 類別       | 嚴重度 | 摘要 |
+|---|------------|--------|------|
+| 1 | Bug/邊界   | 高     | `min_gb`／`max_gb` 未驗證 > 0，可能回傳 0 或負數。 |
+| 2 | 邊界       | 中     | `available_bytes < 0` 語義不明，建議視同 None 或 warning。 |
+| 3 | 一致性     | 中     | canonical `threads` 僅接受 int，Step 7 接受 float/str，建議統一為可轉 int。 |
+| 4 | 防禦性     | 低     | 未知 `stage` 未 raise，建議 ValueError。 |
+| 5 | Fallback   | 低     | ETL/trainer fallback 未套用 RAM_MAX_FRACTION，文件或補齊。 |
+| 6 | 效能/風格  | 低     | `import logging` 建議移至 config 頂層。 |
+| 7 | 安全性     | 中     | Step 7 temp_directory 未限制在 DATA_DIR 下，建議 fallback 或文件化。 |
+| 8 | 可選硬化   | 低     | MIN/MAX_GB 可選上限（如 1 TB）或文件建議。 |
+
+**建議修復順序**：1（必做）→ 2、3、7（建議）→ 4、5、6、8（可選／文件）。
+
+---
+
+## 新增測試與執行方式（DEC-027 Review 風險點轉測試，2026-03-11）
+
+**目標**：將上列 Code Review 風險點轉成最小可重現測試；**僅新增 tests，不修改 production code**。預期行為尚未實作的測試使用 `@unittest.expectedFailure`，修復 production 後移除裝飾器即可轉為 PASSED。
+
+### 新增檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/test_review_risks_dec027_config_consolidation.py` | DEC-027 Review #1–#5、#7、#8 對應之最小可重現測試（#6 無需單獨測試）。 |
+
+### 測試清單（與 Review 編號對應）
+
+| Review # | 測試類別 | 測試方法 | 預期狀態 | 說明 |
+|----------|----------|----------|----------|------|
+| 1 | TestDEC027_R1_MinGbZeroOrNegative | test_get_duckdb_memory_limit_bytes_min_gb_zero_returns_positive | xfail | MIN_GB=0 時回傳須 > 0 |
+| 1 | TestDEC027_R1_MinGbZeroOrNegative | test_get_duckdb_memory_limit_bytes_min_gb_negative_returns_positive | xfail | MIN_GB=-1 時回傳須 > 0 |
+| 1 | TestDEC027_R1_MaxGbZeroOrNegative | test_get_duckdb_memory_limit_bytes_max_gb_zero_returns_positive | passed | MAX_GB=0 時經 swap 後回傳 > 0（已滿足） |
+| 2 | TestDEC027_R2_NegativeAvailableBytes | test_get_duckdb_memory_limit_bytes_negative_available_equals_none_result | passed | 負數 available 與 None 同結果（已滿足） |
+| 3 | TestDEC027_R3_CanonicalThreadsAcceptsNumericLikeStep7 | test_canonical_map_duckdb_threads_accepts_float_one | xfail | threads=1.0 不應 raise |
+| 3 | TestDEC027_R3_CanonicalThreadsAcceptsNumericLikeStep7 | test_canonical_map_duckdb_threads_accepts_str_one | xfail | threads='1' 不應 raise |
+| 4 | TestDEC027_R4_InvalidStageRaises | test_get_duckdb_memory_config_invalid_stage_raises | xfail | 非法 stage 須 raise ValueError |
+| 4 | TestDEC027_R4_InvalidStageRaises | test_get_duckdb_memory_config_empty_stage_raises | xfail | stage='' 須 raise |
+| 5 | TestDEC027_R5_EtlFallbackUsesFixedMaxOnly | test_etl_fallback_budget_without_helper_uses_fixed_max_only | passed | 鎖定 ETL fallback 僅用固定 max |
+| 7 | TestDEC027_R7_Step7TempDirGuardedUnderDataDir | test_configure_step7_temp_dir_checks_path_under_data_dir_in_source | xfail | Step 7 temp_dir 須有 DATA_DIR/relative_to 守衛 |
+| 8 | TestDEC027_R8_ExtremeMaxGbOptional | test_get_duckdb_memory_limit_bytes_extreme_max_gb_capped_or_warned | xfail | 極端 MAX_GB 可選上限或 warning |
+
+### 如何執行
+
+```bash
+# 僅執行 DEC-027 Review 風險測試
+python -m pytest tests/test_review_risks_dec027_config_consolidation.py -v --tb=short
+
+# 預期：3 passed, 8 xfailed（修復 production 後 xfail 可改為 passed，並移除 @unittest.expectedFailure）
+```
+
+### 備註
+
+- **Lint / typecheck**：本輪未新增規則；Review #6（logging import 位置）不另加測試。
+- **xfail 解除**：當 production 依 Review 建議修復後，將對應測試的 `@unittest.expectedFailure` 移除，若行為符合則測試轉為 PASSED。
+
+---
+
+## PLAN progress-bars-long-steps 實作（2026-03-11）
+
+**目標**：實作 PLAN 下一待辦「progress-bars-long-steps」——在 Step 4 backfill、Step 6、Step 9 加入或強化進度條，讓使用者能判斷是否仍在執行並估計剩餘時間。僅實作本項（未做 training-config-recommender）。
+
+### 改了哪些檔
+
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/config.py` | 新增 `DISABLE_PROGRESS_BAR = False`（Progress / UI 區塊）；供 CI／非 TTY 關閉所有進度條。 |
+| `trainer/etl_player_profile.py` | 新增 tqdm 試匯入與 no-op fallback、`_ProgressNoop`；`backfill()` 新增參數 `disable_progress=False`；snapshot_dates 分支以 `_tqdm_bar(dates_to_process, desc="Profile backfill", unit="snapshot")` 包裝迴圈；day-by-day 分支以 `_tqdm_bar(total=total_days, desc="Profile backfill", unit="day")` 並每迭代 `pbar.update(1)`、`finally pbar.close()`；CLI 新增 `--no-progress` 並傳入 `backfill(..., disable_progress=args.no_progress)`。 |
+| `trainer/trainer.py` | 新增 `_ProgressNoop`；Step 6 依 `DISABLE_PROGRESS_BAR` 選用 `_ProgressNoop()` 或 `_tqdm_bar(total=len(chunks), ...)`；Step 9 Optuna 依 `DISABLE_PROGRESS_BAR` 選用 `_ProgressNoop()` 或 `_tqdm_bar(total=n_trials, desc="Step 9 Optuna", unit="trial")`，在 `_progress_callback` 內 `optuna_pbar.update(1)`，`study.optimize` 後 `optuna_pbar.close()`。 |
+
+### 手動驗證
+
+- **Step 4 backfill（etl）**：執行 `python -m trainer.etl_player_profile --start-date 2026-01-01 --end-date 2026-01-05`（或短區間）且未加 `--no-progress` 時，應看到「Profile backfill」進度條（snapshot 或 day 依參數）；加 `--no-progress` 時無進度條、僅 log。
+- **Step 6**：執行 trainer 至 Step 6 時應有「Step 6 chunks」tqdm；設 `DISABLE_PROGRESS_BAR=True`（或 config 設為 True）後重跑應無 bar。
+- **Step 9**：執行至 Step 9 Optuna 時應有「Step 9 Optuna」tqdm 與 ETA；同上設 `DISABLE_PROGRESS_BAR=True` 後應無 bar。
+
+### pytest 結果（本輪執行）
+
+```bash
+python -m pytest tests/ -q
+```
+
+結果：**970 passed, 41 skipped**, 192 warnings in 40.34s（exit code 0）。
+
+### 下一步建議
+
+1. 將 PLAN 中 **progress-bars-long-steps** todo 標為 **completed**。
+2. 可選：Step 3／Step 7／Step 8 的 indeterminate 進度條或強化 log（PLAN 優先順序 3、4）。
+3. 下一 PLAN 待辦：**training-config-recommender**（資源偵測、Parquet／ClickHouse data profile、per-step 估計、建議邏輯、CLI）。
+
+---
+
+## Code Review：progress-bars-long-steps 變更（2026-03-11）
+
+**範圍**：PLAN progress-bars-long-steps 相關程式碼（`trainer/config.py` 之 `DISABLE_PROGRESS_BAR`、`trainer/etl_player_profile.py` 之 backfill 進度條與 `_tqdm_bar`／`_ProgressNoop`、`trainer/trainer.py` 之 Step 6／Step 9 進度條）。同一 working tree 內之 DEC-027 變更未納入本 review。
+
+**審查標準**：最高可靠性；僅列出最可能的 bug／邊界條件／安全性／效能問題，每項附具體修改建議與希望新增的測試。
+
+---
+
+### 1. 邊界條件：backfill day-by-day 在 start_date > end_date 時 total_days 可能為負
+
+**問題**：`backfill()` 未要求 `start_date <= end_date`。在 day-by-day 分支中 `total_days = (end_date - start_date).days + 1`，當 `start_date > end_date` 時為負數。傳入 `_tqdm_bar(total=total_days, ...)` 時，tqdm 可能拋錯或顯示異常（依版本而異）；且語意上「總天數為負」不合法。
+
+**具體修改建議**：在 day-by-day 分支內，於計算 `total_days` 後加上防護：  
+`total_days = max(0, (end_date - start_date).days + 1)`。  
+若希望與「不進入 while 迴圈」一致，可再註解說明：當 `start_date > end_date` 時迴圈 0 次，bar 總數為 0 屬預期。
+
+**希望新增的測試**：  
+- `test_backfill_day_by_day_start_after_end_progress_bar_no_crash`：呼叫 `backfill(start_date=date(2026,1,5), end_date=date(2026,1,1), ...)`（或任一 start > end），mock 或無 mock 皆可，斷言不拋錯且 backfill 正常結束（success/failed/skipped 可為 0）；可選：斷言傳給 tqdm 的 total 不為負（若以 mock 包住 _tqdm_bar）。
+
+---
+
+### 2. Bug：Step 9 Optuna 在 study.optimize() 拋錯時未呼叫 optuna_pbar.close()
+
+**問題**：`run_optuna_search()` 內在 `study.optimize(...)` 之後才執行 `optuna_pbar.close()`。若 `optimize()` 拋出例外（例如 KeyboardInterrupt、或 objective 內例外），`close()` 不會被執行，可能導致進度條未正確關閉或（依 tqdm 實作）終端狀態異常。
+
+**具體修改建議**：將 `study.optimize(...)` 與 `optuna_pbar.close()` 包在 try/finally 中，於 `finally` 內呼叫 `optuna_pbar.close()`，確保無論 optimize 是否拋錯都會關閉 bar。
+
+**希望新增的測試**：  
+- `test_run_optuna_search_closes_progress_bar_on_optimize_exception`：在測試中 mock `study.optimize` 使其在第一次 trial 後 raise RuntimeError（或任意例外），呼叫 `run_optuna_search`（或包住其呼叫），斷言 `optuna_pbar.close` 曾被呼叫（例如 mock 掉 _tqdm_bar 回傳的 bar，並 assert mock_bar.close.called）。
+
+---
+
+### 3. 邊界／防呆：DISABLE_PROGRESS_BAR 為非 bool 時之行為
+
+**問題**：trainer 以 `getattr(_cfg, "DISABLE_PROGRESS_BAR", False)` 讀取，若有人將 config 設為字串（例如從環境變數讀成 `"True"`／`"False"`）或整數，`if _disable_bar` 會依 Python 的 truthiness 判斷（例如 `"False"` 為 truthy，會關閉 bar）。與「僅支援 bool」的預期可能不一致。
+
+**具體修改建議**：在讀取處或 config 定義處做正規化：若為字串則僅在 `str(value).lower() in ("1", "true", "yes")` 時視為 True，其餘視為 False；或於 config 註解中明確寫明「應為 bool，勿以字串設定」。若維持現狀，至少在 docstring／註解註明「truthy 即關閉 bar」。
+
+**希望新增的測試**：  
+- `test_disable_progress_bar_string_false_does_not_disable`：patch `config.DISABLE_PROGRESS_BAR = "False"`，執行會用到 bar 的程式路徑（例如 Step 6 或 Step 9 的輕量測試），斷言實際使用了 tqdm bar（例如 mock _tqdm_bar 並 assert 被呼叫）而非 no-op。  
+- 可選：`test_disable_progress_bar_string_true_disables`：`DISABLE_PROGRESS_BAR = "true"` 時斷言使用 no-op bar。
+
+---
+
+### 4. 效能／行為：無額外問題
+
+**結論**：進度條僅在迴圈或 callback 中 update/close，開銷可忽略；未引入額外 I/O 或鎖。無需額外效能相關修改或測試。
+
+---
+
+### 5. 安全性：無額外問題
+
+**結論**：本輪變更未涉及使用者輸入寫入、路徑、權限或網路。無需額外安全性修改或測試。
+
+---
+
+### Review 摘要
+
+| # | 類別       | 嚴重度 | 摘要 |
+|---|------------|--------|------|
+| 1 | 邊界條件   | 中     | backfill day-by-day 在 start_date > end_date 時 total_days 為負，tqdm(total=負) 可能異常。 |
+| 2 | Bug        | 中     | Step 9 在 study.optimize() 拋錯時未 close 進度條。 |
+| 3 | 防呆／文件 | 低     | DISABLE_PROGRESS_BAR 非 bool 時行為依 truthiness，可能與預期不符。 |
+| 4 | 效能       | —      | 無。 |
+| 5 | 安全性     | —      | 無。 |
+
+**建議修復順序**：2（確保 close）→ 1（邊界防護）→ 3（可選，文件或正規化）。
+
+---
+
+## 新增測試與執行方式（progress-bars Code Review 風險點轉測試，2026-03-11）
+
+**目標**：將上列 Code Review 風險點轉成最小可重現測試；**僅新增 tests，不修改 production code**。預期行為尚未實作的測試使用 `@unittest.expectedFailure`，修復 production 後移除裝飾器即可轉為 PASSED。
+
+### 新增檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/test_review_risks_progress_bars_long_steps.py` | progress-bars-long-steps Review #1／#2／#3 對應之最小可重現測試。 |
+
+### 測試清單（與 Review 編號對應）
+
+| Review # | 測試類別 | 測試方法 | 預期狀態 | 說明 |
+|----------|----------|----------|----------|------|
+| 1 | TestProgressBars_R1_BackfillStartAfterEnd | test_backfill_day_by_day_start_after_end_no_crash | passed | start_date > end_date 時 backfill 不崩潰、day-by-day 分支有呼叫 _tqdm_bar（mock 吸收負 total）。 |
+| 1 | TestProgressBars_R1_BackfillStartAfterEnd | test_backfill_day_by_day_start_after_end_tqdm_total_non_negative | passed | 契約：傳給 _tqdm_bar 的 total >= 0；production 已改為 max(0, ...)，xfail 已移除。 |
+| 2 | TestProgressBars_R2_OptunaCloseOnException | test_run_optuna_search_closes_progress_bar_on_optimize_exception | passed | study.optimize() 拋錯時 optuna_pbar.close() 仍須被呼叫；production 已加 try/finally，xfail 已移除。 |
+| 3 | TestProgressBars_R3_DisableProgressBarType | test_disable_progress_bar_string_false_is_truthy_disables_bar | passed | 鎖定現狀：字串 "False" 為 truthy，故會關閉 bar。 |
+| 3 | TestProgressBars_R3_DisableProgressBarType | test_disable_progress_bar_string_true_is_truthy | passed | 字串 "true" 為 truthy。 |
+
+### 如何執行
+
+```bash
+# 僅執行 progress-bars Code Review 風險測試
+python -m pytest tests/test_review_risks_progress_bars_long_steps.py -v --tb=short
+
+# 預期：5 passed（本輪修補 production 後已移除 2 則 xfail，全數 passed）
+```
+
+### 備註
+
+- **Lint / typecheck**：本輪未新增規則；未改 production code。
+- **xfail 解除**：當 production 依 Review 建議修復後，將對應測試的 `@unittest.expectedFailure` 移除，若行為符合則該測試轉為 PASSED。
+
+---
+
+## 本輪實作修正與驗證（progress-bars Code Review 修補，2026-03-11）
+
+**目標**：依「不要改 tests 除非測試本身錯或 decorator 過時；修改實作直到所有 tests/typecheck/lint 通過」；修補 Code Review #1／#2，並將已過期之 expectedFailure 移除。
+
+### 修改檔案（production）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/etl_player_profile.py` | Review #1：day-by-day 分支 `total_days = (end_date - start_date).days + 1` 改為 `total_days = max(0, (end_date - start_date).days + 1)`，避免 start_date > end_date 時傳負數給 tqdm。 |
+| `trainer/trainer.py` | Review #2：`study.optimize(...)` 與 `optuna_pbar.close()` 改為 `try: study.optimize(...); finally: optuna_pbar.close()`，確保 optimize 拋錯時仍會 close 進度條。 |
+
+### 測試變更（decorator 過時）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `tests/test_review_risks_progress_bars_long_steps.py` | 移除 `test_backfill_day_by_day_start_after_end_tqdm_total_non_negative`、`test_run_optuna_search_closes_progress_bar_on_optimize_exception` 之 `@unittest.expectedFailure`（production 已滿足契約）。 |
+
+### pytest / ruff / mypy 結果
+
+```bash
+python -m pytest tests/ -q
+# 975 passed, 41 skipped
+
+ruff check trainer/
+# All checks passed!
+
+python -m mypy trainer/ --ignore-missing-imports
+# （依專案慣例執行；與既有 rounds 一致，無新增型別錯誤）
+```
+
+- **pytest**：**975 passed, 41 skipped**（原 2 xfailed 已轉為 passed）。
+- **ruff**：`trainer/` 全過。
+- **mypy**：`trainer/ --ignore-missing-imports` 依既有慣例執行，本輪未引入新錯誤。
+
+---
+
+## PLAN training-config-recommender 實作（2026-03-11）
+
+**目標**：實作 PLAN 唯一 pending 項「training-config-recommender」——獨立工具偵測資源、依 Parquet／ClickHouse 產出 data profile、每步估計與參數建議；ClickHouse 路徑可實際連線查 system.parts 估計表大小。
+
+**參考**：PLAN.md「Training config recommender（Parquet／ClickHouse）」一節、`doc/training_oom_and_runtime_audit.md`。
+
+### 改了哪些檔
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/training_config_recommender.py` | **新增**。`get_system_resources(disk_path, step7_temp_dir)`：RAM（psutil 或 env TRAINING_AVAILABLE_RAM_GB）、CPU、磁碟可用空間。`DataProfile` TypedDict。`build_data_profile_parquet(chunk_dir, training_days, session_parquet_path, bytes_per_chunk_fallback)`：掃描 chunk_dir/*.parquet、session 檔大小；無 chunk 時 fallback 依 training_days 與 NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT。`build_data_profile_clickhouse(training_days, get_client, source_db, estimated_*, skip_ch_connect)`：連線 CH、查 system.parts 得 t_bet/t_session bytes/rows，依 training_days 比例估算；連線失敗或 skip_ch_connect 時用 estimated_* 或預設。`estimate_per_step(profile, resources)`：Step 3/4/6/7/8/9 之 peak_ram_gb、time_min（公式引用稽核）。`suggest_config(profile, resources, estimates)`：OOM → 時間 → 資料量建議；STEP7_USE_DUCKDB、STEP8_SCREEN_SAMPLE_ROWS、SCREEN_FEATURES_METHOD、TRAINER_USE_LOOKBACK、Parquet --no-preload、CH 備註。 |
+| `trainer/scripts/recommend_training_config.py` | **新增**。CLI：`--data-source parquet|clickhouse`；Parquet 用 `--chunk-dir`、`--session-parquet`、`--days`（預設 30）；ClickHouse 用 `--days`，預設連線 CH 查表；`--no-ch-query` 跳過連線並改用 `--estimated-bytes-per-chunk`／`--estimated-rows-per-day`。輸出：資源摘要、data profile、每步估計、建議參數與理由。 |
+
+### 手動驗證
+
+- **Parquet 路徑**：  
+  `python -m trainer.scripts.recommend_training_config --data-source parquet --days 7`  
+  應輸出 Resources、Data profile (parquet)、Per-step estimates、Suggestions。若 `trainer/.data/chunks/` 下已有 `*.parquet`，profile 應有 has_existing_chunks=True 與實際 total_chunk_bytes_estimate；否則為 fallback chunk_count 與預設 bytes。
+- **ClickHouse 路徑（可連線時）**：  
+  `python -m trainer.scripts.recommend_training_config --data-source clickhouse --days 30`  
+  應依 config 連線並查 system.parts，產出 total_chunk_bytes_estimate 與建議。
+- **ClickHouse 不連線**：  
+  `python -m trainer.scripts.recommend_training_config --data-source clickhouse --days 30 --no-ch-query --estimated-bytes-per-chunk 209715200`  
+  應跳過連線、使用 200MB/chunk 估計並產出建議。
+
+### pytest 結果（本輪）
+
+```bash
+python -m pytest tests/ -q
+# 975 passed, 34 skipped（與本輪新增模組／CLI 無關之既有 skip）
+```
+
+### 下一步建議
+
+1. 將 PLAN 中 **training-config-recommender** todo 標為 **completed**。
+2. 可選：在 `doc/training_oom_and_runtime_audit.md` 末新增一小節「Training config recommender」並連結 CLI 用法。
+3. 可選：pipeline 第一步 `--recommend-only` 呼叫同一 API（PLAN 步驟 6）。
+
+---
+
+## Code Review：training-config-recommender（2026-03-11）
+
+**範圍**：`trainer/training_config_recommender.py`、`trainer/scripts/recommend_training_config.py`。依最高可靠性標準檢視 bug、邊界條件、安全性、效能；**不重寫整套**，僅列問題＋具體修改建議＋希望新增的測試。Review 結果供後續修補或測試擴充參考。
+
+### 1. Bug：ClickHouse 負 training_days 導致負的 total_chunk_bytes_estimate
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `build_data_profile_clickhouse` 中 `frac = min(1.0, training_days / 365.0) if training_days else 1.0`：當 `training_days < 0` 時 `frac` 為負，`int(total_bytes * frac)` 可能為負，後續 `estimate_per_step`／`suggest_config` 使用負的 `total_chunk_bytes_estimate` 會產生不合理估計。 |
+| **具體修改建議** | 在計算 `frac` 時限制在 [0, 1]：`frac = max(0.0, min(1.0, training_days / 365.0)) if training_days and training_days > 0 else (1.0 if training_days == 0 else 0.0)`；或更簡潔：先 `training_days = max(0, training_days)` 再 `frac = min(1.0, training_days / 365.0) if training_days else 0.0`（0 天視為無訓練窗，估計 0 bytes）。 |
+| **希望新增的測試** | 單元測試：`build_data_profile_clickhouse(training_days=-30, skip_ch_connect=True, estimated_bytes_per_chunk=100)` 回傳的 `total_chunk_bytes_estimate` ≥ 0，且 `chunk_count` ≥ 1；或 `training_days=0` 時 `total_chunk_bytes_estimate` 為 0 或 fallback 值且不為負。 |
+
+### 2. 邊界條件：CLI --days 0 或負數未驗證
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | CLI 接受 `--days 0` 或 `--days -1`，會傳入 `build_data_profile_*` 與 `estimate_per_step`。目前 Parquet/ClickHouse profile 用 `max(1, (training_days+29)//30)` 故 `chunk_count` 至少 1，但 ClickHouse 的 frac 會出問題（見上）；且語義上「0 天訓練」應視為無效或特別處理。 |
+| **具體修改建議** | 在 `_parse_args()` 後或 `main()` 開頭加入：`if args.days < 1: parser.error("--days must be >= 1")`（或專案慣例改為 `>= 0` 並在文件註明 0 的意義）。與問題 1 一併處理可避免下游收到負數或零。 |
+| **希望新增的測試** | CLI 測試：`--data-source parquet --days 0` 或 `--days -1` 時 process 以非零 exit 結束或印出明確錯誤訊息；或 pytest 以 `subprocess.run` 呼叫並 assert returncode != 0。 |
+
+### 3. 邊界條件：TRAINING_AVAILABLE_RAM_GB=0 時建議邏輯仍合理但可能除零
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `get_system_resources` 允許 `TRAINING_AVAILABLE_RAM_GB=0`（float("0") 成功），`suggest_config` 中 `budget = avail_gb * safety` 為 0，`step7_peak > budget` 恆真（若 step7_peak > 0），會一直建議降 NEG_SAMPLE_FRAC；`estimate_per_step` 未對 `avail_gb` 做除法，無除零風險，但「0 GB 可用」在實務上應視為異常或特別註記。 |
+| **具體修改建議** | 可選：在 `get_system_resources` 中若 `env_ram` 解析後為 0 或負數，log warning 並改回 psutil（或視為「未設定」）；或在 `suggest_config` 開頭若 `avail_gb <= 0` 則先 append 一則「RAM 可用量異常，請檢查 TRAINING_AVAILABLE_RAM_GB 或系統」再繼續。非必須，視產品是否要對 0 RAM 做明確提示。 |
+| **希望新增的測試** | 單元測試：`get_system_resources` 在 mock `os.getenv("TRAINING_AVAILABLE_RAM_GB", "0")` 時回傳 `ram_available_gb == 0.0`；`suggest_config(profile, {"ram_available_gb": 0}, estimates)` 不拋錯且至少回傳一則建議（或含「異常」類建議）。 |
+
+### 4. 邊界條件：chunk_dir 為檔案或不存在時 Parquet profile 行為
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `build_data_profile_parquet` 當 `chunk_dir.is_dir()` 為 False（路徑為檔案或不存在）時不掃描，`chunk_count` 維持 0，會走 fallback。行為正確，但 CLI 未在輸出中區分「目錄不存在／非目錄」與「目錄存在但無 *.parquet」。使用者可能誤以為已有 chunk 被納入。 |
+| **具體修改建議** | 可選：在 CLI 的 Parquet 分支，若 `not (chunk_dir.is_dir())` 則 log.warning("chunk_dir is not a directory or does not exist; using fallback chunk estimate.")；或在 profile 中不新增欄位，僅以 log 提高可觀測性。 |
+| **希望新增的測試** | 單元測試：`build_data_profile_parquet(chunk_dir=Path("/nonexistent"), training_days=30)` 回傳 `has_existing_chunks=False`、`chunk_count >= 1`、`total_chunk_bytes_estimate > 0`（fallback）；或 `chunk_dir` 為一現有檔案路徑時同樣 fallback 且不拋錯。 |
+
+### 5. 安全性：路徑解析與權限
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | CLI 接受 `--chunk-dir`、`--session-parquet` 任意路徑；程式僅讀取 metadata（stat）與檔名，不寫入使用者路徑。若路徑為 symlink 或指向無權限目錄，`stat()`／`glob()` 可能拋 OSError 或 PermissionError，目前僅在 `get_system_resources` 的 `shutil.disk_usage` 有 try/except 並 fallback 50 GB，Parquet 的 `chunk_dir.glob` 與 `session_parquet_path.stat()` 未包 try。 |
+| **具體修改建議** | 在 `build_data_profile_parquet` 中對 `session_parquet_path.stat()` 與 `chunk_dir.glob("*.parquet")`（或整段 discovery）包一層 try/except OSError，log.warning 並保留 profile 已設定的預設值（如 session_data_bytes=0、chunk_count=0 再走 fallback）。避免因權限或損壞的 mount 導致整支 CLI crash。 |
+| **希望新增的測試** | 單元測試：mock 或使用暫存唯讀目錄，使 `chunk_dir.glob` 或 `session_parquet_path.stat()` 模擬 OSError／PermissionError，assert `build_data_profile_parquet` 不拋錯且回傳的 profile 具合理 fallback（例如 chunk_count ≥ 1、total_chunk_bytes_estimate ≥ 0）。 |
+
+### 6. 效能：chunk_dir 內 parquet 數量極多時
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `parquets = list(chunk_dir.glob("*.parquet"))` 會一次列出全部檔名並再 `sum(p.stat().st_size for p in parquets)`。若目錄內有數萬以上 parquet，記憶體與 I/O 會顯著增加；且為一次性建議工具，通常 chunk 數在數十以內，實務風險低。 |
+| **具體修改建議** | 可選：文件或 docstring 註明「建議 chunk 目錄內 parquet 數量在合理範圍（如 < 1000）」；或加入參數 `max_chunks_to_scan: Optional[int] = 500`，超過時只取前 N 個並按比例估計總 bytes。非必須，屬防禦性優化。 |
+| **希望新增的測試** | 可選：mock 回傳 10_000 個 Path，assert 不 OOM 且總時間在可接受範圍；或僅在文件/註解中說明預期使用規模。 |
+
+### 7. 其他（低風險／文件即可）
+
+| 項目 | 說明 |
+|------|------|
+| **ClickHouse 逾時** | `client.query()` 若 CH 無回應會一直等。可選：若 driver 支援 query timeout，可傳入參數；或文件註明「CH 不可達時請使用 --no-ch-query」。 |
+| **config 匯入** | 模組內 `import config` 再 `import trainer.config` 的 fallback 在從 repo 根目錄以 `python -m trainer.scripts.recommend_training_config` 執行時會正確使用 `trainer.config`；無需改動。 |
+
+### 建議修復順序（若實作）
+
+1. **必做**：問題 1（ClickHouse 負 training_days → frac  clamp）。
+2. **建議**：問題 2（CLI --days 驗證）與問題 5（Parquet OSError 防護）。
+3. **可選**：問題 3（0 RAM 註記）、問題 4（chunk_dir 非目錄 log）、問題 6（大量 parquet 文件或上限）。
+
+以上結果已追加至 STATUS.md，供後續修補與測試擴充使用。
+
+---
+
+## 新增測試與執行方式（training-config-recommender Code Review 風險點轉測試，2026-03-11）
+
+**目標**：將「Code Review：training-config-recommender（2026-03-11）」列出的風險點轉成最小可重現測試；**僅新增 tests，不修改 production code**。預期行為尚未實作的測試使用 `@unittest.expectedFailure`，待 production 修補後移除裝飾器即可轉為 PASSED。
+
+### 新增檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/test_review_risks_training_config_recommender.py` | training-config-recommender Review #1～#5 對應之最小可重現測試。 |
+
+### 測試清單（與 Review 編號對應）
+
+| Review # | 測試類別 | 測試方法 | 預期狀態 | 說明 |
+|----------|----------|----------|----------|------|
+| 1 | TestRecommender_R1_ClickHouseNegativeDays | test_negative_training_days_with_mock_ch_yields_non_negative_estimate | xfail | 契約：CH 回傳 total_bytes 且 training_days<0 時，total_chunk_bytes_estimate ≥ 0；production 尚未 clamp frac。 |
+| 1 | TestRecommender_R1_ClickHouseNegativeDays | test_zero_training_days_skip_ch_connect_fallback_non_negative | passed | skip_ch_connect=True、training_days=0 時 fallback 路徑估計 ≥ 0。 |
+| 2 | TestRecommender_R2_CLIDaysValidation | test_cli_days_zero_exits_non_zero | xfail | 契約：`--days 0` 時 CLI 應非零 exit；production 尚未驗證 --days。 |
+| 2 | TestRecommender_R2_CLIDaysValidation | test_cli_days_negative_exits_non_zero | xfail | 契約：`--days -1` 時 CLI 應非零 exit。 |
+| 3 | TestRecommender_R3_ZeroRamEnv | test_get_system_resources_env_zero_returns_zero_ram | passed | TRAINING_AVAILABLE_RAM_GB=0 時 get_system_resources 回傳 ram_available_gb=0.0。 |
+| 3 | TestRecommender_R3_ZeroRamEnv | test_suggest_config_zero_ram_does_not_raise_returns_suggestions | passed | suggest_config(ram_available_gb=0) 不拋錯且至少回傳一則建議。 |
+| 4 | TestRecommender_R4_ParquetNonexistentOrFile | test_nonexistent_chunk_dir_returns_fallback_profile | passed | chunk_dir 不存在時 has_existing_chunks=False、chunk_count≥1、total_chunk_bytes_estimate>0。 |
+| 4 | TestRecommender_R4_ParquetNonexistentOrFile | test_chunk_dir_is_file_returns_fallback_no_crash | passed | chunk_dir 為現有檔案時走 fallback 且不崩潰。 |
+| 5 | TestRecommender_R5_ParquetOSErrorResilience | test_parquet_glob_raises_oserror_does_not_propagate | xfail | 契約：chunk_dir.glob 拋 OSError 時 build_data_profile_parquet 不拋錯且回傳合理 fallback；production 尚未包 try/except。 |
+
+### 如何執行
+
+```bash
+# 僅執行 training-config-recommender Code Review 風險測試
+python -m pytest tests/test_review_risks_training_config_recommender.py -v --tb=short
+
+# 預期：5 passed, 4 xfailed（4 則 xfail 待 production 修補 #1/#2/#5 後移除 @unittest.expectedFailure 即轉為 passed）
+```
+
+### 備註
+
+- **Lint / typecheck**：本輪未新增規則；未改 production code。
+- **xfail 解除**：當 production 依 Review 建議修補後，將對應測試的 `@unittest.expectedFailure` 移除，若行為符合契約則該測試轉為 PASSED。
+
+---
+
+## 本輪實作修正與驗證（training-config-recommender Code Review 修補，2026-03-11）
+
+**目標**：依「修改實作直到所有 tests/typecheck/lint 通過；不要改 tests 除非測試本身錯或 decorator 過時」；修補 Code Review #1／#2／#5，並移除已過期之 `@unittest.expectedFailure`。R5 測試因 Windows 上 `Path.glob` 為唯讀無法 `patch.object`，改為傳入 path-like 物件（glob 拋 OSError）以重現情境。
+
+### 修改檔案（production）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/training_config_recommender.py` | **#1**：`build_data_profile_clickhouse` 中 `frac` 改為 `max(0.0, min(1.0, training_days/365.0))`（training_days>0）否則 `0.0`，避免負的 total_chunk_bytes_estimate。**#5**：`build_data_profile_parquet` 將 session stat 與 chunk_dir discovery 包入 `try/except OSError`，log.warning 後保留 fallback。 |
+| `trainer/scripts/recommend_training_config.py` | **#2**：`main()` 在 `logging.basicConfig` 後加入 `if args.days < 1: logging.error("--days must be >= 1"); return 2`，CLI 拒絕 --days 0 或負數。 |
+
+### 測試變更（decorator 過時 ＋ R5 測試本身錯）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `tests/test_review_risks_training_config_recommender.py` | 移除 R1、R2×2、R5 共 4 則 `@unittest.expectedFailure`（production 已滿足契約）。R5：`test_parquet_glob_raises_oserror_does_not_propagate` 改為傳入 path-like 物件（`is_dir()` True、`glob()` 拋 OSError），避免 Windows 上 `patch.object(Path, "glob")` 唯讀屬性錯誤。 |
+
+### pytest / ruff / mypy 結果
+
+```bash
+python -m pytest tests/ -q
+# 984 passed, 41 skipped（4 則原 xfail 已轉為 passed）
+
+ruff check trainer/
+# All checks passed!
+
+python -m mypy trainer/training_config_recommender.py trainer/scripts/recommend_training_config.py --ignore-missing-imports
+# Success: no issues found in 2 source files
+```
+
+- **pytest**：**984 passed, 41 skipped**（training-config-recommender 相關 9 則全 passed）。
+- **ruff**：`trainer/` 全過。
+- **mypy**：變更之 2 檔無型別錯誤；全 `trainer/` 依專案慣例可另行執行。
 

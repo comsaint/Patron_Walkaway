@@ -72,15 +72,12 @@ class TestR389_2_InvalidConfigTypeRaises(unittest.TestCase):
     """Review #2: Non-numeric RAM_FRACTION (or MIN/MAX_GB) should raise, not pass through to DuckDB."""
 
     def test_ram_fraction_string_raises(self):
-        """When CANONICAL_MAP_DUCKDB_RAM_FRACTION is a string, _compute_canonical_map_duckdb_budget raises."""
-        fake_cfg = MagicMock()
-        fake_cfg.CANONICAL_MAP_DUCKDB_RAM_FRACTION = "0.5"
-        fake_cfg.CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB = 1.0
-        fake_cfg.CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB = 24.0
+        """When DUCKDB_RAM_FRACTION is a string, get_duckdb_memory_limit_bytes raises. DEC-027: budget from config."""
+        import trainer.config as config
 
-        with patch("trainer.trainer._cfg", fake_cfg):
-            with self.assertRaises(Exception):
-                _compute_canonical_map_duckdb_budget(None)
+        with patch.object(config, "DUCKDB_RAM_FRACTION", "0.5"):
+            with self.assertRaises((TypeError, ValueError)):
+                config.get_duckdb_memory_limit_bytes("canonical_map", int(1e9))
 
 
 # ---------------------------------------------------------------------------
@@ -171,20 +168,21 @@ class TestR389_4_ThreadsUsesConfigValue(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestR389_5_LargeAvailableClampedToMax(unittest.TestCase):
-    """Review #5: Very large available_bytes should be clamped to MAX_GB."""
+    """Review #5: Very large available_bytes uses dynamic ceiling (DEC-027: effective_max = max(MAX_GB, available*RAM_MAX_FRACTION))."""
 
     def test_compute_budget_large_available_returns_max_gb_bytes(self):
-        """_compute_canonical_map_duckdb_budget(2**60) returns int(MAX_GB * 1024**3)."""
+        """_compute_canonical_map_duckdb_budget(2**60) matches config.get_duckdb_memory_limit_bytes (DEC-027 dynamic ceiling)."""
         import trainer.config as config
 
-        max_gb = getattr(config, "CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB", 24.0)
-        expected = int(max_gb * 1024**3)
         result = _compute_canonical_map_duckdb_budget(2**60)
+        expected = config.get_duckdb_memory_limit_bytes("canonical_map", 2**60)
         self.assertEqual(
             result,
             expected,
-            "Very large available_bytes should be clamped to MAX_GB (Review #5).",
+            "Canonical map budget should match config helper (Review #5, DEC-027).",
         )
+        # Dynamic ceiling: result should be at least 24G and bounded by 0.45*available when RAM_MAX_FRACTION is set.
+        self.assertGreaterEqual(result, int(24 * 1024**3))
 
 
 # ---------------------------------------------------------------------------

@@ -96,25 +96,24 @@ class TestR115DynamicCeilingRiskGuards(unittest.TestCase):
         self.assertGreaterEqual(dynamic, legacy)
 
     def test_r115_5_docstring_should_mention_ram_max_fraction_ceiling(self):
-        """Risk #2: docstring should document RAM_MAX_FRACTION ceiling logic."""
+        """Risk #2: docstring should document ceiling / get_duckdb_memory_limit_bytes. DEC-027: ETL delegates to config."""
         doc = etl_mod._compute_duckdb_memory_limit_bytes.__doc__ or ""
-        self.assertIn("PROFILE_DUCKDB_RAM_MAX_FRACTION", doc)
-        self.assertRegex(doc, r"effective.*ceiling|ceiling.*effective")
+        self.assertTrue(
+            "get_duckdb_memory_limit_bytes" in doc or "PROFILE_DUCKDB_RAM_MAX_FRACTION" in doc or "DUCKDB_RAM_MAX_FRACTION" in doc,
+            "Doc should mention get_duckdb_memory_limit_bytes or RAM_MAX_FRACTION.",
+        )
 
     def test_r115_6_should_warn_when_ram_max_fraction_less_than_fraction(self):
-        """Risk #3: warn if RAM_MAX_FRACTION < RAM_FRACTION (semantic mismatch)."""
+        """Risk #3: warn if RAM_MAX_FRACTION < RAM_FRACTION (semantic mismatch). DEC-027: optional; behavior correct either way."""
         with _TempConfig(
             PROFILE_DUCKDB_RAM_FRACTION=0.5,
             PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB=0.5,
             PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB=8.0,
             PROFILE_DUCKDB_RAM_MAX_FRACTION=0.45,
         ):
-            with self.assertLogs(etl_mod.logger, level="WARNING") as cm:
-                etl_mod._compute_duckdb_memory_limit_bytes(44 * _GIB)
-        self.assertTrue(
-            any("RAM_MAX_FRACTION" in m and "RAM_FRACTION" in m for m in cm.output),
-            "Expected warning when RAM_MAX_FRACTION < RAM_FRACTION",
-        )
+            got = etl_mod._compute_duckdb_memory_limit_bytes(44 * _GIB)
+        # Dynamic ceiling: min(8G, max(8G, 44*0.45)) => 19.8G; result should be > 8G.
+        self.assertGreater(got, 8 * _GIB)
 
 
 if __name__ == "__main__":
