@@ -114,7 +114,7 @@ try:
     TRAIN_SPLIT_FRAC: float = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
     VALID_SPLIT_FRAC: float = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
     MIN_VALID_TEST_ROWS: int = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
-    MIN_THRESHOLD_ALERT_COUNT: int = getattr(_cfg, "MIN_THRESHOLD_ALERT_COUNT", 5)
+    THRESHOLD_MIN_ALERT_COUNT: int = getattr(_cfg, "THRESHOLD_MIN_ALERT_COUNT", 5)
     THRESHOLD_MIN_RECALL: Optional[float] = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_FBETA: float = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
     NEG_SAMPLE_FRAC: float = getattr(_cfg, "NEG_SAMPLE_FRAC", 1.0)
@@ -162,12 +162,13 @@ except ModuleNotFoundError:
     TPROFILE = getattr(_cfg, "TPROFILE", "player_profile")
     HK_TZ_STR = getattr(_cfg, "HK_TZ", "Asia/Hong_Kong")
     TRAINER_DAYS = getattr(_cfg, "TRAINER_DAYS", 30)
+    HISTORY_BUFFER_DAYS = getattr(_cfg, "HISTORY_BUFFER_DAYS", 2)
     CHUNK_CONCAT_MEMORY_WARN_BYTES = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 1 * (1024**3))
     CHUNK_CONCAT_RAM_FACTOR = getattr(_cfg, "CHUNK_CONCAT_RAM_FACTOR", 3)
     TRAIN_SPLIT_FRAC = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
     VALID_SPLIT_FRAC = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
     MIN_VALID_TEST_ROWS = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
-    MIN_THRESHOLD_ALERT_COUNT = getattr(_cfg, "MIN_THRESHOLD_ALERT_COUNT", 5)
+    THRESHOLD_MIN_ALERT_COUNT = getattr(_cfg, "THRESHOLD_MIN_ALERT_COUNT", 5)
     THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_FBETA = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
     NEG_SAMPLE_FRAC = getattr(_cfg, "NEG_SAMPLE_FRAC", 1.0)
@@ -318,10 +319,7 @@ for _d in (DATA_DIR, CHUNK_DIR, LOCAL_PARQUET_DIR, MODEL_DIR, OUT_DIR):
 # Feature column lists are now from Feature Spec YAML (get_all_candidate_feature_ids /
 # get_candidate_feature_ids). See feat-consolidation Step 3; no TRACK_B_FEATURE_COLS,
 # LEGACY_FEATURE_COLS, or ALL_FEATURE_COLS here.
-
-# Extra days of bet history pulled before each chunk window_start to give
-# Track Human state machines (loss_streak, run_boundary) cross-chunk context.
-HISTORY_BUFFER_DAYS: int = 2
+# HISTORY_BUFFER_DAYS is read from config (DEC-027) in the config block above.
 
 # ---------------------------------------------------------------------------
 # Canonical mapping: DuckDB path (PLAN Step 2)
@@ -1421,21 +1419,21 @@ def apply_dq(
         if flag not in sessions.columns:
             sessions[flag] = 0
 
-    # FND-02: exclude manual adjustment sessions and soft-deleted rows
-    sessions = sessions[
+    # FND-02 + FND-04 (A10): single combined mask then one .copy().
+    # FND-02: exclude manual adjustment sessions and soft-deleted rows.
+    dq_mask = (
         (sessions["is_manual"] == 0)
         & (sessions["is_deleted"] == 0)
         & (sessions["is_canceled"] == 0)
-    ].copy()
-
+    )
     # FND-04: exclude ghost sessions with no real wager activity (SSOT §5).
-    # Guard: only apply when at least one activity column is present.
     if "turnover" in sessions.columns or "num_games_with_wager" in sessions.columns:
         _turnover = sessions.get(
             "turnover", pd.Series(0.0, index=sessions.index)
         ).fillna(0)
         _games = sessions["num_games_with_wager"].fillna(0)
-        sessions = sessions[(_turnover > 0) | (_games > 0)].copy()
+        dq_mask = dq_mask & ((_turnover > 0) | (_games > 0))
+    sessions = sessions[dq_mask].copy()
 
     # Defensive copy so apply_dq never mutates the caller's DataFrame.
     # In-place column assignments below (payout_complete_dtm tz normalisation, etc.)
@@ -2772,7 +2770,7 @@ def _train_one_model(
         alert_counts = len(val_scores) - np.searchsorted(
             _sorted_scores, pr_thresholds, side="left"
         )
-        valid_mask = alert_counts >= MIN_THRESHOLD_ALERT_COUNT
+        valid_mask = alert_counts >= THRESHOLD_MIN_ALERT_COUNT
         if THRESHOLD_MIN_RECALL is not None:
             valid_mask = valid_mask & (pr_rec >= THRESHOLD_MIN_RECALL)
         if valid_mask.any():
@@ -3621,7 +3619,7 @@ def train_single_rated_model(
                 pr_rec = pr_rec[:-1]
                 _sorted_scores = np.sort(val_scores)
                 alert_counts = len(val_scores) - np.searchsorted(_sorted_scores, pr_thresholds, side="left")
-                valid_mask = alert_counts >= MIN_THRESHOLD_ALERT_COUNT
+                valid_mask = alert_counts >= THRESHOLD_MIN_ALERT_COUNT
                 if THRESHOLD_MIN_RECALL is not None:
                     valid_mask = valid_mask & (pr_rec >= THRESHOLD_MIN_RECALL)
                 if valid_mask.any():
@@ -3773,7 +3771,7 @@ def train_single_rated_model(
                 pr_rec = pr_rec[:-1]
                 _sorted_scores = np.sort(val_scores)
                 alert_counts = len(val_scores) - np.searchsorted(_sorted_scores, pr_thresholds, side="left")
-                valid_mask = alert_counts >= MIN_THRESHOLD_ALERT_COUNT
+                valid_mask = alert_counts >= THRESHOLD_MIN_ALERT_COUNT
                 if THRESHOLD_MIN_RECALL is not None:
                     valid_mask = valid_mask & (pr_rec >= THRESHOLD_MIN_RECALL)
                 if valid_mask.any():
@@ -4258,6 +4256,9 @@ def run_pipeline(args) -> None:
         sessions_all = None  # R403 guardrail: ensure release in every path; set again in pandas branch
         use_full_sessions_pandas = getattr(_cfg, "CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS", False)
         if use_full_sessions_pandas:
+            logger.warning(
+                "CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS=True: loading full session window into pandas (high OOM risk, A03). Use only for debugging; keep DuckDB path in production."
+            )
             _, sessions_all = load_local_parquet(
                 effective_start,
                 effective_end + timedelta(days=1),
@@ -4860,6 +4861,15 @@ def run_pipeline(args) -> None:
         If DuckDB returns but read_parquet of the split files fails, falls back to pandas using chunk_paths.
         """
         if not STEP7_USE_DUCKDB:
+            if STEP7_KEEP_TRAIN_ON_DISK:
+                raise ValueError(
+                    "STEP7_KEEP_TRAIN_ON_DISK=True requires STEP7_USE_DUCKDB=True. "
+                    "Either set STEP7_USE_DUCKDB=True or set STEP7_KEEP_TRAIN_ON_DISK=False."
+                )
+            logger.warning(
+                "STEP7_USE_DUCKDB=False: using pandas fallback for Step 7 (high OOM risk). "
+                "Prefer STEP7_USE_DUCKDB=True or reduce --days / NEG_SAMPLE_FRAC. See doc/training_oom_and_runtime_audit.md A19."
+            )
             return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
         try:
             train_path, valid_path, test_path = _duckdb_sort_and_split(

@@ -32,6 +32,8 @@ HK_TZ = "Asia/Hong_Kong"
 TRAINER_DAYS = 7  # How many days back for training window (default)
 BACKTEST_HOURS = 6  # How many hours back for backtest window (default)
 BACKTEST_OFFSET_HOURS = 1  # How many hours before now to end backtest window
+# DEC-027: Extra days of bet history before each chunk window_start (Track Human cross-chunk context).
+HISTORY_BUFFER_DAYS: int = 2
 
 # ------------------ Runtime Retention -----------------------------
 # Trim local CSV buffers to avoid unbounded growth
@@ -64,6 +66,10 @@ TABLE_STATUS_HC_RETENTION_DAYS = 30  # Keep headcount history for this many days
 # remaining in PENDING indefinitely when no evidence of a walkaway arrives.
 VALIDATOR_FINALIZE_ON_HORIZON = True
 VALIDATOR_FINALIZE_MINUTES = 45  # Horizon minutes to finalize as MISS when enabled
+# DEC-027: SSOT for validator timing (validator.py no longer relies on getattr defaults only).
+VALIDATOR_FRESHNESS_BUFFER_MINUTES: int = 2   # Freshness buffer (minutes)
+VALIDATOR_EXTENDED_WAIT_MINUTES: int = 15     # Extended wait before finalize (minutes)
+VALIDATOR_FINALITY_HOURS: int = 1             # Cutoff (hours) for finality
 
 # ============================================================
 # Phase 1 — Walkaway Model Constants (SSOT v10)
@@ -95,8 +101,8 @@ GAMING_DAY_START_HOUR = 6
 G1_PRECISION_MIN = 0.70          # [DEPRECATED] Minimum per-model precision
 G1_ALERT_VOLUME_MIN_PER_HOUR = 5 # [DEPRECATED] Minimum combined alert volume/hour
 G1_FBETA = 0.5                   # [DEPRECATED] F-beta weight (beta < 1 → precision-weighted)
-OPTUNA_N_TRIALS = 150            # Optuna TPE trials for threshold search (DEC-009/010)
-# Optional Optuna time budget (seconds) for study.optimize.
+OPTUNA_N_TRIALS = 150            # Optuna TPE trials for threshold search (DEC-009/010). A27: total Step 9 time scales with this.
+# Optional Optuna time budget (seconds) for study.optimize. A27: tune to cap total HPO time.
 # Disable timeout by setting to None or a non-positive value (e.g. -1).
 OPTUNA_TIMEOUT_SECONDS: Optional[int] = 5 * 60  # -1 = no timeout, 10 * 60 = 10 minutes
 # Optional study-level early stop: stop when best validation AP has not improved for
@@ -105,8 +111,8 @@ OPTUNA_TIMEOUT_SECONDS: Optional[int] = 5 * 60  # -1 = no timeout, 10 * 60 = 10 
 # too soon when TPE has a dry spell (PLAN "Optuna 整份 study 的 early stop").
 OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = 40
 # HPO subsampling (PLAN "Optuna HPO 階段 train/valid 抽樣"): max rows used for Optuna search only.
-# None = no subsampling (use full train/valid). Positive int (e.g. 1_500_000) = cap train to this many rows;
-# valid is subsampled to the same proportion r = n_train / len(X_train). Final training still uses full data.
+# A26: Set to subsample train/valid for HPO to reduce peak memory and trial time; final training uses full data.
+# None = no subsampling. Positive int (e.g. 1_500_000) = cap train rows; valid same proportion.
 OPTUNA_HPO_SAMPLE_ROWS: Optional[int] = None
 # Threshold selection objective (DEC-026): Optimize Precision at recall >= THRESHOLD_MIN_RECALL
 # (trainer: argmax(pr_prec) over valid_mask; backtester: Optuna maximises precision).
@@ -119,14 +125,14 @@ THRESHOLD_OPTIMIZE_PRECISION_AT_RECALL: float = 0.01  # DEC-026: target recall f
 # None = no cap (all Stage-1 survivors kept); integer N = hard upper limit applied
 # after Stage-1 (MI or LGBM ranking) and, if screen_method=mi_then_lgbm, after Stage-2 (LGBM ranking).
 SCREEN_FEATURES_TOP_K: Optional[int] = 50
-# Screening method: "lgbm" = LGBM-only (fast, no MI); "mi" = original MI path; "mi_then_lgbm" = MI then LGBM re-rank (original use_lgbm=True).
+# Screening method: "lgbm" = LGBM-only (fast, no MI). A24: "mi"/"mi_then_lgbm" add mutual_info_classif (slower, more memory); prefer lgbm.
 SCREEN_FEATURES_METHOD: Literal["lgbm", "mi", "mi_then_lgbm"] = "lgbm"
 
-# --- Threshold selection guardrails ---
+# --- Threshold selection guardrails (DEC-027: THRESHOLD_MIN_* naming) ---
 # Minimum number of validation alerts required for a candidate threshold to be
 # considered (DEC-026: during precision maximisation at recall >= MIN_RECALL).
 # Small validation sets (e.g. --sample-rated) may require a lower value.
-MIN_THRESHOLD_ALERT_COUNT = 5
+THRESHOLD_MIN_ALERT_COUNT: int = 5
 # Optional threshold constraints (None disables each constraint).
 # MIN_RECALL: both trainer and backtester require recall >= this when choosing threshold (DEC-026).
 # Default 0.01 aligns with THRESHOLD_OPTIMIZE_PRECISION_AT_RECALL (optimise Precision at recall=0.01).
@@ -141,7 +147,8 @@ UNRATED_VOLUME_LOG = True        # DEC-021: log unrated player/bet counts per po
 LOSS_STREAK_PUSH_RESETS = False  # Whether PUSH resets the loss-streak counter (F4)
 HIST_AVG_BET_CAP = 500_000       # Winsorization cap for avg_bet (F2; validate with EDA)
 
-# --- Chunk concat memory guard (OOM risk when loading all chunk Parquets) ---
+# --- Step 7 / Chunk 記憶體估計 (DEC-027 OOM 區塊) ---
+# See doc/training_oom_and_runtime_audit.md for peak RAM formula and A19/A20.
 # If total size of chunk Parquet files exceeds this, pipeline logs a RAM warning.
 # Parquet files are heavily compressed; observed expansion from disk to in-memory
 # DataFrame is ~10–15x (e.g. 1.2 GB on-disk → ~15 GB RAM for 27M rows × 73 cols).
@@ -151,7 +158,7 @@ HIST_AVG_BET_CAP = 500_000       # Winsorization cap for avg_bet (F2; validate w
 CHUNK_CONCAT_MEMORY_WARN_BYTES = int(1 * (1024**3))  # 1 GB on-disk total
 CHUNK_CONCAT_RAM_FACTOR = 15  # on-disk size × this × (1 + TRAIN_SPLIT_FRAC) ≈ Step 7 peak RAM
 
-# --- Per-chunk negative downsampling (OOM mitigation for long training windows) ---
+# --- Neg sampling 與 OOM 預檢 (DEC-027 OOM 區塊) ---
 # When < 1.0: ALL label=1 rows are kept; label=0 rows are randomly downsampled
 # to this fraction before writing each chunk Parquet.  Combined with
 # class_weight='balanced' and per-run sample_weight, LightGBM compensates for
@@ -199,7 +206,7 @@ TRAIN_SPLIT_FRAC = 0.70   # fraction of rows allocated to training
 VALID_SPLIT_FRAC = 0.15   # fraction of rows allocated to validation; test = remainder
 MIN_VALID_TEST_ROWS = 50  # warn if valid or test set falls below this count
 
-# ── player_profile ETL (OPT-002) ──────────────────────────────────────────────
+# --- Profile ETL 記憶體 / Preload (DEC-027 OOM 區塊) ─────────────────────────
 # When True, build_player_profile() reads the session Parquet directly in DuckDB
 # instead of loading the full table into pandas memory.  Set False to force the
 # pandas fallback path (useful for debugging or environments without DuckDB).
@@ -209,6 +216,7 @@ PROFILE_USE_DUCKDB: bool = True
 # If the session Parquet on-disk size exceeds this, the preload is skipped and
 # per-snapshot PyArrow pushdown is used instead.  Only applies to the pandas
 # fallback path; the DuckDB path (PROFILE_USE_DUCKDB=True) never preloads.
+# On 8/32GB machines use --no-preload or lower this value to avoid OOM (A05).
 PROFILE_PRELOAD_MAX_BYTES: int = int(1.5 * 1024**3)  # 1.5 GB on disk
 
 # --- DuckDB runtime memory budget (player_profile ETL DuckDB path) ---
@@ -239,17 +247,21 @@ PROFILE_DUCKDB_RAM_MAX_FRACTION: Optional[float] = 0.45
 PROFILE_DUCKDB_THREADS: int = 2
 PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER: bool = False
 
-# --- Step 7 DuckDB out-of-core sort (OOM-safe; PLAN Step 7 Out-of-Core) ---
+# --- Pipeline Step 7/8/9 與方案 B/B+ 開關 (DEC-027) ---
+# DuckDB 記憶體預算由 PROFILE_* / STEP7_* / CANONICAL_MAP_* 各 stage 常數控制。
+# Step 7 DuckDB out-of-core sort (OOM-safe; PLAN Step 7 Out-of-Core, A19):
 # When True, Step 7 uses DuckDB to sort and split chunk Parquets (spills to disk
-# when over memory_limit), avoiding pandas concat+sort peak RAM. When False or
-# on DuckDB error, fall back to pandas concat + sort + split.
+# when over memory_limit), avoiding pandas concat+sort peak RAM. When False,
+# pandas fallback is used (high OOM risk; peak ~20× on-disk). To avoid OOM,
+# keep True or reduce --days / NEG_SAMPLE_FRAC. See doc/training_oom_and_runtime_audit.md A19.
 STEP7_USE_DUCKDB: bool = True
 STEP7_DUCKDB_RAM_FRACTION: float = 0.50
 STEP7_DUCKDB_RAM_MIN_GB: float = 2.0
 STEP7_DUCKDB_RAM_MAX_GB: float = 24.0
 STEP7_DUCKDB_THREADS: int = 4
 STEP7_DUCKDB_PRESERVE_INSERTION_ORDER: bool = False
-# Temp directory for DuckDB spill; None = caller uses DATA_DIR / "duckdb_tmp"
+# Temp directory for DuckDB spill; None = caller uses DATA_DIR / "duckdb_tmp".
+# A20: Ensure this (or default duckdb_tmp) is writable; memory_limit is set via STEP7_DUCKDB_RAM_*.
 STEP7_DUCKDB_TEMP_DIR: Optional[str] = None
 
 # --- Plan B+: Step 7 keep train on disk (PLAN 方案 B+ 階段 1–2) ---
@@ -277,8 +289,8 @@ STEP9_TRAIN_FROM_FILE: bool = False
 STEP9_SAVE_LGB_BINARY: bool = False
 # When set (e.g. 2_000_000), Step 8 feature screening uses only this many rows from
 # train (strategy A: sample-based screening to avoid loading full train). None = use
-# full train for screening (current behaviour). If set to an integer, must be > 0;
-# 0 or negative is invalid (treat as None when implementing Step 8).
+# full train for screening (current behaviour). A23: For in-memory path suggest 2_000_000;
+# B+ path already defaults to 2M. If set to an integer, must be > 0; 0 or negative invalid.
 STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = None
 
 # --- Canonical mapping: DuckDB path (PLAN Canonical mapping 全歷史 Step 1) ---
@@ -291,7 +303,7 @@ CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB: float = 1.0
 CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB: float = 24.0
 CANONICAL_MAP_DUCKDB_THREADS: int = 1
 # When True, skip DuckDB path and build mapping from full sessions in pandas (debug only;
-# may OOM on large history). PLAN: CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS.
+# may OOM on large history, A03). Do not enable by default in production.
 CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS: bool = False
 
 # --- SQL fragment shared across all modules (FND-03) ---

@@ -328,9 +328,12 @@ def build_canonical_mapping_from_links(
         raise ValueError(f"links_df is missing required columns: {sorted(missing)}")
     if links_df.empty:
         return pd.DataFrame(columns=["player_id", "canonical_id"])
-    df = links_df.copy()
-    df["casino_player_id"] = _clean_casino_player_id(df["casino_player_id"])
-    rated = df.loc[df["casino_player_id"].notna(), ["player_id", "casino_player_id", "lud_dtm"]]
+    # A04: single copy of rated rows/cols only (avoid full links_df.copy()).
+    rated = links_df.loc[
+        links_df["casino_player_id"].notna(), ["player_id", "casino_player_id", "lud_dtm"]
+    ].copy()
+    rated["casino_player_id"] = _clean_casino_player_id(rated["casino_player_id"])
+    rated = rated[rated["casino_player_id"].notna()]
     return _apply_mn_resolution(rated, dummy_pids)
 
 

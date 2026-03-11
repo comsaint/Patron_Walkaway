@@ -642,4 +642,35 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-027：Config 集中化與合併策略（排除 Retention／Refresh・Poll）
+
+**日期**：2026-03-11  
+**相關**：PLAN § Config 集中化與合併變更草案（DEC-027）。
+
+**決策**：對 `trainer/config.py` 中重複語意的常數群組進行集中化合併，以降低維護成本與 OOM 調校時的混淆；但以下兩類常數**明確排除，維持現狀**：
+
+1. **Retention 常數**（SCORER_ALERT_RETENTION_DAYS、VALIDATOR_ALERT_RETENTION_DAYS、SCORER_STATE_RETENTION_HOURS、TABLE_STATUS_RETENTION_HOURS、TABLE_STATUS_HC_RETENTION_DAYS）：各自服務不同介面（scorer、validator、status_server），雖數值巧合相同，但語意與調整時機不同，合併反而增加耦合。
+2. **Refresh／Poll 間隔**（SCORER_POLL_INTERVAL_SECONDS、TABLE_STATUS_REFRESH_SECONDS）：同為 45 秒但屬不同系統的週期，未來可能獨立調整。
+
+**納入合併的變更**：
+
+| 項目 | 策略 |
+|------|------|
+| **DuckDB 記憶體** | 新增一組共用 `DUCKDB_*` 常數（FRACTION、MIN/MAX_GB、RAM_MAX_FRACTION、THREADS、PRESERVE_INSERTION_ORDER）為 SSOT；各 stage（Profile ETL、Step 7、Canonical mapping）只保留與共用不同的覆寫；新增 helper `get_duckdb_memory_config(stage)` 統一取用。 |
+| **Validator SSOT** | 補入 config 缺少的三個常數：`VALIDATOR_FRESHNESS_BUFFER_MINUTES`、`VALIDATOR_EXTENDED_WAIT_MINUTES`、`VALIDATOR_FINALITY_HOURS`（目前只在 getattr 的 magic default 裡）。 |
+| **HISTORY_BUFFER_DAYS** | 從 `trainer.py` 模組常數移至 `config.py`，與 `TRAINER_DAYS`、`BACKTEST_*` 同區塊。 |
+| **Threshold 命名** | `MIN_THRESHOLD_ALERT_COUNT` 更名為 `THRESHOLD_MIN_ALERT_COUNT`，與同系列 `THRESHOLD_MIN_RECALL`、`THRESHOLD_MIN_ALERTS_PER_HOUR` 一致。 |
+| **OOM 區塊** | 不合併名稱，但在 config 內分成「Chunk 記憶體估計」「Neg sampling / OOM 預檢」「Profile ETL 記憶體」三個有明確標題的子區塊，並引用 `doc/training_oom_and_runtime_audit.md`。 |
+| **Data availability delay** | 可選：命名對齊 `AVAIL_DELAY_*` 風格或保留現名，僅確保同區塊。 |
+
+**理由**：  
+- DuckDB 三組參數（PROFILE_*、STEP7_*、CANONICAL_MAP_*）的計算邏輯與命名風格不一致，合併後統一 `MEMORY_LIMIT_*` 命名並封裝在 helper 中，各 call site 只需指定 stage，不再重複讀取邏輯。  
+- Validator 的三個常數目前只存在於 getattr 的 default 值中，屬隱性配置，補入 config 使其可見、可調。  
+- HISTORY_BUFFER_DAYS 應與其他時間視窗常數同屬 SSOT，不應分散在 trainer.py。  
+- Retention 與 Refresh/Poll 排除的原因：各自服務不同元件，合併會造成不必要的耦合，且未來調整某元件時需區分影響範圍。
+
+**回退說明**：各項變更均為「重命名＋搬移＋引入 helper」，無演算法改變；若需回退，可逐項還原（helper 內部仍讀相同數值）。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

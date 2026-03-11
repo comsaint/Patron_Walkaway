@@ -133,25 +133,19 @@ def compute_labels(
         )
 
     # ------------------------------------------------------------------ #
-    # E3: drop rows with null payout_complete_dtm (should be pre-filtered)
+    # E3 + R12: drop rows with null payout_complete_dtm or null canonical_id (A16: single mask + one copy).
     # ------------------------------------------------------------------ #
     df = bets_df.copy()
-    null_mask = df["payout_complete_dtm"].isna()
-    if null_mask.any():
-        logger.warning(
-            "compute_labels: dropped %d row(s) with null payout_complete_dtm (E3)",
-            null_mask.sum(),
-        )
-        df = df[~null_mask].copy()
-
-    # R12: drop rows with null canonical_id — identity unknown, cannot group.
+    null_payout = df["payout_complete_dtm"].isna()
     null_cid = df["canonical_id"].isna()
-    if null_cid.any():
+    combined_null = null_payout | null_cid
+    if combined_null.any():
         logger.warning(
-            "compute_labels: dropped %d row(s) with null canonical_id",
+            "compute_labels: dropped %d row(s) with null payout_complete_dtm (E3), %d with null canonical_id (R12)",
+            null_payout.sum(),
             null_cid.sum(),
         )
-        df = df[~null_cid].copy()
+        df = df[~combined_null].copy()
 
     if df.empty:
         df["label"] = pd.array([], dtype="int8")

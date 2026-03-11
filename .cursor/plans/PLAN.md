@@ -107,6 +107,12 @@ todos:
   - id: canonical-step3-schema-check-oom
     content: "Canonical mapping Step 3：Schema 檢查改為僅讀 metadata，避免 build_canonical_links_and_dummy_from_duckdb 整份讀入 session parquet 導致 OOM。見「Canonical mapping Step 3 Schema 檢查改為僅讀 metadata（避免 OOM）」一節。"
     status: completed
+  - id: oom-runtime-audit-remediation
+    content: "OOM/長時間執行稽核補救：依 doc/training_oom_and_runtime_audit.md 與其「優先處理計畫」分階段處理 A02–A30（A01 已修復、A12 由 Phase 2 lookback 處理）；見「OOM／長時間執行稽核項目處理計畫」一節。Phase 1（A19）、Phase 2a、2b、2c、Phase 3（A04/A10/A16）、Phase 4（文件）均已完成；Code Review 對應測試已實作並通過，見 STATUS.md「新增測試與執行方式（2026-03-11）」與「本輪實作修正與驗證」."
+    status: completed
+  - id: config-consolidation
+    content: "Config 集中化與合併（排除 Retention／Refresh・Poll）：DuckDB 一組共用參數＋stage 覆寫、Validator 補齊 SSOT、時間窗 HISTORY_BUFFER_DAYS 入 config、Threshold 命名統一（MIN_THRESHOLD_ALERT_COUNT → THRESHOLD_MIN_ALERT_COUNT）、OOM 區塊整理與分組；見「Config 集中化與合併變更草案（DEC-027）」一節。"
+    status: pending
 isProject: false
 ---
 
@@ -166,11 +172,56 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 
 **Plan 狀態摘要**：上表 1～19 項均為 **completed**（第 18 項於 Round 406 完成項目 1、3；第 19 項 Track Human Lookback 向量化於本輪完成 Phase 2 compute_run_boundary numba 與 Code Review 修補 wager NaN／run_break_min_ns 上限）。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
 
-**剩餘項目**：上表 1～19 項與 **canonical-step3-schema-check-oom** 均已完成；目前無 pending 項目。
+**剩餘項目**：上表 1～19 項與 **canonical-step3-schema-check-oom** 均已完成。目前唯一 **pending** 為 **config-consolidation**（Config 集中化與合併，DEC-027；見上方 todos 與下方「Config 集中化與合併變更草案（DEC-027）」一節）。
 
 **建議實作順序**：可選／後續見下方各節（Step 7 out-of-core 排序、Optuna early stop 等）。
 
 **可選／後續**（非阻斷）：(1) OOM 預檢查已於 Round 210/211/212 實作，視為 **completed**（見上表項目 17）。(2) Round 222 Review production 補強見上表項目 18 與下方「Round 222 Review production 補強（實作計畫）」一節。(3) **項目 19** Track Human Lookback 向量化已完成（見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 `doc/track_human_lookback_vectorization_plan.md`）。
+
+---
+
+## OOM／長時間執行稽核項目處理計畫
+
+**參考文件：** `doc/training_oom_and_runtime_audit.md`（含 Summary Table、Config、與文末「優先處理計畫」）。  
+**範圍：** 訓練路徑 OOM／Long-runtime 稽核項目 A01–A30。A01 已修復；A12 由 Phase 2 Track Human lookback 向量化處理，不重複列入本計畫。
+
+### 目標
+
+- 依嚴重度與依賴關係，分階段降低 Step 3／4／6／7／8／9 的 OOM 與長時間執行風險。
+- 每項以「可驗收的程式／設定／文件變更」為完成定義，必要時附記憶體／時間估算。
+
+### 已完成
+
+- **A01**：Step 3 schema 檢查改為僅讀 metadata（`pyarrow.parquet.read_schema(path).names`），見 `trainer.py:399–408`。已列入稽核文件並標為 Fixed。
+
+### 優先順序與階段（對應稽核 ID）
+
+| 階段 | 重點 | 項目 | 完成定義／產出 |
+|------|------|------|----------------|
+| **Phase 1（Critical）** | 避免致命 OOM | **A19** | 確保 Step 7 不進入 pandas fallback：維持 `STEP7_USE_DUCKDB=True`；必要時加 guard（`STEP7_USE_DUCKDB=False` 時 log warning 或 fail fast）；文件註明減 `--days`／NEG_SAMPLE_FRAC 以避開 fallback。 |
+| **Phase 2a（High — Step 3/4）** | Step 3 其餘、Step 4 | **A02, A03, A05, A06, A07** | A02：A01 後若 links 仍 OOM，再評估 streaming／LIMIT。A03：文件／config 註明勿預設啟用 full sessions pandas。A05：文件註明 8/32GB 用 `--no-preload` 或調低 PROFILE_PRELOAD_MAX_BYTES。A06：排程／文件建議月底 snapshot_dates。A07：確認呼叫端傳入 canonical_ids 限制 profile 讀取。 |
+| **Phase 2b（High — Step 6/7/8）** | Step 6/7/8 記憶體與時間 | **A08, A14, A20–A24** | A08：必要時文件註明長窗減 `--days`／`--recent-chunks`；可選 warning。A14：評估 Track LLM 只註冊必要欄位或 column pruning。A20：文件／檢查 temp_directory、memory_limit。A21：B+ 已延後載入 train；可選進一步「train 永不整份進記憶體」設計。A22：改善首次 run 估計（或文件註明樂觀估計）。A23：in-memory 路徑預設或建議 STEP8_SCREEN_SAMPLE_ROWS=2_000_000（B+ 已預設 2M）。A24：維持 screen_method=lgbm、文件註明 MI 路徑成本。 |
+| **Phase 2c（High — Step 9）** | Step 9 訓練與 HPO | **A25–A27** | A25：可選評估 LGB 是否接受 view 以少一份 copy。A26/A27：文件化 OPTUNA_HPO_SAMPLE_ROWS、N_TRIALS、TIMEOUT 對時間／記憶體影響。 |
+| **Phase 3（Medium）** | 少 copy、流程優化 | **A04, A07, A09–A11, A13, A15–A16, A18, A29–A30** | A04：identity 減少 links 多餘 copy。A10：apply_dq 合併 sessions 多次 filter 為單一 mask＋一次 copy。A16：compute_labels 合併 null mask 後一次 copy。A13：compute_table_hc 向量化或 groupby 後單次 np.unique。A15 維持現狀。A09/A11/A18/A29/A30：依稽核「建議作法」與效益決定是否實作。 |
+| **Phase 4（Low）** | 可選優化 | **A17, A28** | 可選：A17 `pd.concat(..., copy=False)`；A28 若 artifact 變大改 schema-only 讀取。 |
+
+### 依賴與建議執行順序
+
+1. **A19 優先**：避免 Step 7 pandas fallback（設定＋可選 guard＋文件）。
+2. **A23＋A24 一併**：Step 8 screening 取樣與方法（in-memory 預設 2M 或文件建議）。
+3. **A22**：可與 Step 7 相關項目同輪（預檢估計或文件）。
+4. **A04、A10、A16**：同屬「少 copy」可集中一輪重構，需驗證不可變性與下游。
+
+### 驗收與完成定義
+
+- **程式變更**：通過既有測試；必要時加單元／整合測試覆蓋新路徑。
+- **設定／文件**：config 註解或 `doc/training_oom_and_runtime_audit.md`／README 更新，註明建議值與風險。
+- **可選量測**：在 8GB／32GB 各跑一次 pipeline，用 memory_profiler 或類似工具確認 Step 3/6/7/8 peak 符合預期。
+
+### 不納入本計畫的項目
+
+- **A12**：由 Phase 2 lookback 向量化與 `doc/track_human_lookback_vectorization_plan.md` 處理。
+- **A01**：已完成，僅在稽核文件中標註與維護行號。
 
 ---
 
@@ -284,6 +335,122 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 - Backtester：僅 rated 進入 `_score_df`；無 rated 時回傳 `{"error": "No rated observations in window"}`；volume log 同上。
 - Validator：無新增 log；行為不變。
 - 既有 alert／指標／寫出格式不變；僅減少送入模型的資料量與 log 混淆。
+
+---
+
+## Config 集中化與合併變更草案（DEC-027）
+
+**目標**：減少 `trainer/config.py` 中重複語意與命名不一致的常數，改為「一組共用 SSOT ＋ 必要時 stage／元件覆寫」，便於維護並降低 OOM／運行時間調校時的混淆。  
+**不納入**：Retention（SCORER_*、VALIDATOR_*、TABLE_STATUS_* 保留天數/小時）與 Refresh／Poll 間隔（SCORER_POLL_INTERVAL_SECONDS、TABLE_STATUS_REFRESH_SECONDS）維持現有名稱與用途，供不同介面使用，不合併。  
+**參考**：`doc/training_oom_and_runtime_audit.md`；DEC-027。
+
+### 一、DuckDB 記憶體（一組共用 ＋ stage 覆寫）
+
+**現狀**：三組結構相同、命名不一的參數（PROFILE_*、STEP7_*、CANONICAL_MAP_*），計算式皆為 `clamp(available_ram × FRACTION, MIN_GB, MAX_GB)`。
+
+**變更**：
+
+| 項目 | 內容 |
+|------|------|
+| **新增共用常數（SSOT）** | `DUCKDB_RAM_FRACTION`、`DUCKDB_MEMORY_LIMIT_MIN_GB`、`DUCKDB_MEMORY_LIMIT_MAX_GB`、`DUCKDB_RAM_MAX_FRACTION`（Optional）、`DUCKDB_THREADS`、`DUCKDB_PRESERVE_INSERTION_ORDER`；命名統一為 `MEMORY_LIMIT_*`。 |
+| **預設** | RAM_FRACTION=0.5、MIN_GB=1.0、MAX_GB=24.0、RAM_MAX_FRACTION=0.45、THREADS=2、PRESERVE_INSERTION_ORDER=False。 |
+| **Stage 覆寫（僅保留與共用不同的）** | **Profile ETL**：`PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB = 8.0`（較重查詢保守上限）；**Step 7**：`STEP7_DUCKDB_TEMP_DIR`（唯一需要 spill 目錄的 stage）、可選 `STEP7_DUCKDB_THREADS = 4`；**Canonical mapping**：可選 `CANONICAL_MAP_DUCKDB_THREADS = 1`（全歷史掃描，低 RAM 優先）。 |
+| **Helper** | 新增 `get_duckdb_memory_config(stage: "profile" \| "step7" \| "canonical_map")` 回傳 `(frac, min_gb, max_gb, ram_max_frac, threads, preserve_order, temp_dir)`；先讀共用常數，再依 stage 套用覆寫。 |
+
+**需異動檔案**：`trainer/config.py`（新增共用常數，PROFILE/STEP7/CANONICAL_MAP DuckDB 常數改為 stage 覆寫或移除）；`trainer/etl_player_profile.py`（改呼叫共用 helper 或讀共用＋PROFILE 覆寫）；`trainer/trainer.py`（Step 7、canonical mapping 使用同一 helper）。
+
+---
+
+### 二、Validator 設定補齊 SSOT
+
+**現狀**：`validator.py` 以 `getattr(config, "...", default)` 讀取，但 `config.py` 未定義 `VALIDATOR_FRESHNESS_BUFFER_MINUTES`、`VALIDATOR_EXTENDED_WAIT_MINUTES`、`VALIDATOR_FINALITY_HOURS`。
+
+**變更**：在 `config.py` 的 Validator 區塊新增：
+
+| 常數 | 建議預設 | 說明 |
+|------|----------|------|
+| `VALIDATOR_FRESHNESS_BUFFER_MINUTES` | 2 | Freshness 緩衝（分鐘）。 |
+| `VALIDATOR_EXTENDED_WAIT_MINUTES` | 15 | 延長等待後再 finalize（分鐘）。 |
+| `VALIDATOR_FINALITY_HOURS` | 1 | 判定 finality 的 cutoff（小時）。 |
+
+**需異動檔案**：`trainer/config.py`（新增三常數）；`trainer/validator.py`（可維持 getattr 以相容未更新 config 的環境，行為不變）。
+
+---
+
+### 三、時間窗與 buffer（補齊 config）
+
+**現狀**：`HISTORY_BUFFER_DAYS = 2` 定義於 `trainer/trainer.py` 模組頂層，未在 config。
+
+**變更**：  
+- 於 `config.py` 新增 `HISTORY_BUFFER_DAYS = 2`，與 `TRAINER_DAYS`、`BACKTEST_HOURS`、`BACKTEST_OFFSET_HOURS` 放在同一「Time windows / buffers」區塊。  
+- `trainer.py`、`backtester.py` 改為自 config 讀取（`getattr(config, "HISTORY_BUFFER_DAYS", 2)` 或直接 import）。
+
+**需異動檔案**：`trainer/config.py`；`trainer/trainer.py`；`trainer/backtester.py`。
+
+---
+
+### 四、Threshold 命名統一
+
+**現狀**：`MIN_THRESHOLD_ALERT_COUNT` 與其他 `THRESHOLD_MIN_*` 系列命名風格不一致。
+
+**變更**：  
+- 將 `MIN_THRESHOLD_ALERT_COUNT` 更名為 `THRESHOLD_MIN_ALERT_COUNT`（與 `THRESHOLD_MIN_RECALL`、`THRESHOLD_MIN_ALERTS_PER_HOUR` 一致）。  
+- 在 config 註解中標明「Threshold 選擇」與「Optuna HPO」兩個子區塊。
+
+**需異動檔案**：`trainer/config.py`；所有引用 `MIN_THRESHOLD_ALERT_COUNT` 的檔案（`trainer/trainer.py`、`trainer/backtester.py`）。
+
+---
+
+### 五、OOM／記憶體區塊整理（分組與文件，不合併常數）
+
+**現狀**：CHUNK_CONCAT_MEMORY_WARN_BYTES、CHUNK_CONCAT_RAM_FACTOR、NEG_SAMPLE_*、PROFILE_PRELOAD_MAX_BYTES 等分散各處。
+
+**變更**：  
+- 在 config 內以明確區塊分隔：「Step 7 / Chunk 記憶體估計」、「Neg sampling 與 OOM 預檢」、「Profile ETL 記憶體 / Preload」。  
+- 各區塊頂端以 `# ---` 分隔並加入引用公式或連結 `doc/training_oom_and_runtime_audit.md`。  
+- 不強制合併為更少名稱；可選後續引入高階常數（如 `MEMORY_SAFETY_FRACTION`）供 NEG_SAMPLE_RAM_SAFETY 與 DuckDB 共用。
+
+**需異動檔案**：`trainer/config.py`（區塊註解與可選文件連結）。
+
+---
+
+### 六、Step 7/8/9 與 Plan B/B+ 說明（補充註解）
+
+**現狀**：STEP7_*／STEP8_*／STEP9_* 中混雜 DuckDB 記憶體與 pipeline 開關，易被誤解為又一組獨立記憶體參數。
+
+**變更**：  
+- DuckDB 記憶體相關常數（FRACTION、MIN/MAX_GB、THREADS 等）改為由「一、共用參數 ＋ stage 覆寫」管理；Step 7 只保留 `STEP7_DUCKDB_TEMP_DIR`（spill 目錄）等非記憶體參數。  
+- 在 config 該區塊加上說明：「本區為 Pipeline Step 7/8/9 與方案 B/B+ 開關；DuckDB 記憶體預算改由 DUCKDB_* 共用常數控制」。
+
+**需異動檔案**：`trainer/config.py`（註解；DuckDB 常數在完成一後移除或改為覆寫）。
+
+---
+
+### 七、Data availability delay（可選：命名一致性）
+
+**現狀**：`BET_AVAIL_DELAY_MIN`、`SESSION_AVAIL_DELAY_MIN`。  
+**變更**：可選改為 `AVAIL_DELAY_BET_MIN`／`AVAIL_DELAY_SESSION_MIN`，並在同區塊加 `# Data availability delays (SSOT §4.2)` 標題。若保留現名，僅確保與其他時間常數同區塊。  
+**需異動檔案**：`trainer/config.py`；若更名則需更新所有引用處。
+
+---
+
+### 實作順序建議
+
+| 順序 | 項目 | 說明 |
+|------|------|------|
+| 1 | 二、Validator 補齊 | 僅新增三個常數，無行為依賴，零風險。 |
+| 2 | 三、HISTORY_BUFFER_DAYS 入 config | 小範圍、易驗收。 |
+| 3 | 四、THRESHOLD_MIN_ALERT_COUNT 更名 | 搜尋替換＋既有測試驗收。 |
+| 4 | 一、DuckDB 共用＋helper | 新增共用常數與 `get_duckdb_memory_config`；etl_player_profile、trainer Step 7/canonical 改為使用；刪除或改為 stage 覆寫之舊常數。 |
+| 5 | 六、Step 7/8/9 區塊說明 | config 註解更新。 |
+| 6 | 五、OOM 區塊整理 | config 分區與文件連結。 |
+| 7 | 七、Availability delay | 可選，命名與區塊對齊。 |
+
+### 驗收要點
+
+- **行為不變**：既有 tests、typecheck、lint 通過；scorer / validator / status_server / trainer / backtester 行為與目前一致（僅設定來源改為共用或覆寫）。  
+- **Config SSOT**：DuckDB 記憶體、Validator 時間常數、HISTORY_BUFFER_DAYS 均有單一或明確的定義處；Validator 不再依賴 getattr 的 magic default。  
+- **不變**：SCORER_ALERT_RETENTION_DAYS、VALIDATOR_ALERT_RETENTION_DAYS、SCORER_STATE_RETENTION_HOURS、TABLE_STATUS_RETENTION_HOURS、TABLE_STATUS_HC_RETENTION_DAYS、SCORER_POLL_INTERVAL_SECONDS、TABLE_STATUS_REFRESH_SECONDS 維持現有名稱，不合併。
 
 ---
 

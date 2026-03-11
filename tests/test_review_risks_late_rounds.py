@@ -236,15 +236,16 @@ class TestR1615ThresholdMinAlertConfig(unittest.TestCase):
     """R1615: minimum alert count should be configurable, not magic number."""
 
     def test_min_alert_count_is_config_backed(self):
+        # DEC-027: renamed to THRESHOLD_MIN_ALERT_COUNT.
         self.assertTrue(
-            hasattr(config_mod, "MIN_THRESHOLD_ALERT_COUNT"),
-            "config.py should define MIN_THRESHOLD_ALERT_COUNT.",
+            hasattr(config_mod, "THRESHOLD_MIN_ALERT_COUNT"),
+            "config.py should define THRESHOLD_MIN_ALERT_COUNT.",
         )
         src = inspect.getsource(trainer_mod._train_one_model)
         self.assertNotIn(
             "alert_counts >= 5",
             src,
-            "_train_one_model should use config.MIN_THRESHOLD_ALERT_COUNT, not hard-coded 5.",
+            "_train_one_model should use config THRESHOLD_MIN_ALERT_COUNT, not hard-coded 5.",
         )
 
 

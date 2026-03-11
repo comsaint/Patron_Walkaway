@@ -200,7 +200,7 @@ This document summarizes known **out-of-memory (OOM)** and **long-running-time**
 | 優先 | ID | 建議作法 | 預估記憶體減少 | 預估時間減少 | 備註／不確定性 |
 |------|----|----------|----------------|----------------|----------------|
 | 1 | **A01** | **已修復。** 已改為 schema-only 讀取（`pyarrow.parquet.read_schema(path).names`），見 trainer.py:399–408。 | 已達成：不再載入整張 session 表，省 **1–5 GB** peak（視表大小）。 | 已達成：略減 I/O。 | 已修復。 |
-| 2 | **A19** | **避免觸發**：維持 `STEP7_USE_DUCKDB=True`、必要時減 `--days`／`--recent-chunks` 或 `NEG_SAMPLE_FRAC`，確保 Step 7 不走 pandas fallback。可加 guard：當 `STEP7_USE_DUCKDB=False` 時 log warning 或 fail fast。 | 若目前會走 fallback：peak 約 **20× on-disk**（文件所述）；改為只用 DuckDB 則 **避免該 peak**，等於省下 **數 GB～數十 GB**（依 chunk 總量）。 | 不觸發 fallback 即無 pandas concat/sort，可省 **數分～數十分鐘**。 | 以「不進入 fallback」為目標；若未來要支援 fallback，需另做 streaming／分塊設計。 |
+| 2 | **A19** | **已實作（Phase 1）**：維持 `STEP7_USE_DUCKDB=True`；當 `STEP7_USE_DUCKDB=False` 時 log warning 後再走 pandas fallback；config 註明減 `--days`／NEG_SAMPLE_FRAC 以避開 fallback。 | 若目前會走 fallback：peak 約 **20× on-disk**；改為只用 DuckDB 則 **避免該 peak**。 | 不觸發 fallback 即無 pandas concat/sort。 | trainer.py 進入 fallback前 logger.warning；config.py STEP7_USE_DUCKDB 註解已更新。 |
 
 ---
 
@@ -208,20 +208,20 @@ This document summarizes known **out-of-memory (OOM)** and **long-running-time**
 
 | 優先 | ID | 建議作法 | 預估記憶體減少 | 預估時間減少 | 備註／不確定性 |
 |------|----|----------|----------------|----------------|----------------|
-| 3 | A02 | A01 修好後再評估：若 links 仍導致 OOM，再考慮 DuckDB 結果流式寫出 Parquet 再分塊讀入，或限制 `.df()` 前先 `LIMIT` 取樣（需確認下游是否允許）。 | 若改為不一次 materialize 全量：可省 **與 links 列數成比例**（數百萬～數千萬列 × 約 20–40 字節/列），約 **數百 MB～數 GB**。 | 若改 streaming/分塊，可能略增 I/O 時間；若僅加 LIMIT 取樣則可能略減。 | 依實際 links 列數與機器 RAM 決定是否實作；需與 identity 介面一致。 |
-| 4 | A03 | 不預設啟用：保持 `CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS=False`（或等同設定），並在文件／config 註明風險。必要時在程式內若為 True 時 log warning。 | 僅在有人開啟時才有影響；若關閉則 **避免載入整段 session 時間窗**，可達 **1–5+ GB**（與 session 窗長成正比）。 | 避免一次載入全 session，可省 **數十秒～數分鐘**。 | 屬設定／文件層級即可。 |
-| 5 | A05 | 8/32GB 環境建議 `--no-preload` 或調低 `PROFILE_PRELOAD_MAX_BYTES`。可選：在程式內若偵測到可用 RAM 低於某閾值時自動跳過 preload 並 log。 | 不 preload 即不載入全表，省 **整份 session 表**（可達 **1.5 GB+**，受 `PROFILE_PRELOAD_MAX_BYTES` 與檔案大小限制）。 | 無 preload 時改為每 snapshot 讀 Parquet，總時間可能**增加**（見 A06）。 | 文件與預設已足夠；自動依 RAM 關閉為可選。 |
-| 6 | A06 | 文件與排程建議：使用**月底** `snapshot_dates`，避免長區間逐日 backfill。若 backfill 由排程驅動，可改為只排月底。 | 不直接省記憶體（主要省 I/O 與重複讀取）。 | 若從逐日改為月底：**N 日 → 約 N/30 次** `build_player_profile`，可省 **數十分鐘～數小時**（依 N 與是否 preload）。 | 多為流程／排程調整。 |
-| 7 | A08 | 已做 pushdown；必要時在文件註明：長窗或大 chunk 時減 `--days` 或 `--recent-chunks`。可選：在 `load_local_parquet` 依可用 RAM 或 chunk 數給出 warning。 | 不直接改程式；透過縮小範圍可降低**單次載入 chunk 大小**，約 **數百 MB～1+ GB**（視窗長）。 | 縮小範圍可略減 Step 6 單 chunk 時間。 | 以文件與可選 warning 為主。 |
-| 8 | A14 | Track LLM 路徑：大 chunk 時 DuckDB + `.df()` 為主因。可評估 (1) 只註冊必要欄位、(2) 在 DuckDB 內先做 column pruning、(3) 分塊 materialize 再合併（需改介面）。 | 若減少 materialize 的列/欄或改分塊：可省 **約 1× chunk 大小**（數百 MB～1+ GB）。 | 若減少資料量或優化查詢，可省 **數十秒～數分鐘**/chunk。 | 需看 Track LLM 實際欄位與用量；估算為數量級。 |
-| 9 | A20 | 確保 `temp_directory` 可寫、DuckDB `memory_limit` 已設；必要時調低 `memory_limit` 讓 DuckDB 多 spill，避免 OOM。 | 透過 spill 可**避免** Step 7 DuckDB OOM，不必然省 peak，但可讓大資料在有限 RAM 下跑完。 | 若改為多 spill，可能略增 **數分鐘**；若原本就 spill 則影響小。 | 屬設定與環境檢查。 |
-| 10 | A21 | B+ 已延後載入 train（5231）；screening 時已用 `_read_parquet_head` 取樣（預設 2M）。若需再降 peak 可考慮 train 永不整份進記憶體（需重構 Step 8/9）。 | 若改為 train 永不整份進記憶體：可省 **整份 train**（約 **數 GB**）。B+ 已用 head 取樣。 | 可能略增一次 head 讀取，影響小。 | 與 A23 聯動；B+ 已用 2M 取樣。 |
-| 11 | A22 | 改善估計：首次 run 無 cache 時用 `NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT` 或依 session/bet 檔大小推估；必要時在文件註明「首次跑估計可能偏樂觀」。 | 不直接省記憶體；估計更準可**減少誤判**（過早或過晚觸發 auto-reduce）。 | 無。 | 屬防護機制改進與文件。 |
-| 12 | A23 | **設定**：in-memory 路徑建議設 `STEP8_SCREEN_SAMPLE_ROWS=2_000_000` 或程式內未設時用 `train_df.head(2_000_000)`。**B+ 路徑已預設 2M**（`_read_parquet_head(..., _sample_n_disk)`，未設時 `_sample_n_disk=2_000_000`）。 | 若 train 為 5M–10M 列：可省 **約 0.6–2 GB**（full train − 2M 列）。B+ 已達成。 | screening 資料量減為 2M 列：`.corr()`／LGB／MI 可省 **數十秒～數分鐘**。 | B+ 已預設 2M；in-memory 路徑仍可設 STEP8_SCREEN_SAMPLE_ROWS。 |
-| 13 | A24 | 使用 `STEP8_SCREEN_SAMPLE_ROWS` 並維持 `SCREEN_FEATURES_METHOD="lgbm"`；避免 `mi`／`mi_then_lgbm` 除非必要。 | 與 A23 同：**約 0.6–2 GB**（若改為 2M 取樣）。MI 路徑改 LGB：可省 **數分鐘～數十分鐘**（MI 最慢）。 | **數分鐘～數十分鐘**（若從 MI 改 LGB）。 | 與 A23 一併處理。 |
-| 14 | A25 | 必要子集；可評估是否用 `train_df.loc[mask]` 等產生 view 再傳給 LGB（若 LGB 接受且不複製），或延後 copy 到真正需要時。需測 LGB 是否會觸發 copy。 | 若可少一份 rated 子集 copy：約 **數百 MB～1 GB**（與 train/valid/test 大小與比例有關）。 | 可略。 | 需確認 LightGBM 介面與內部是否複製。 |
-| 15 | A26 | 已由資料量與 early stop 決定；可調 `OPTUNA_HPO_SAMPLE_ROWS` 或 `num_boost_round`/early_stopping 以換取時間。 | 若啟用 `OPTUNA_HPO_SAMPLE_ROWS`：HPO 階段 peak 可降 **與 subsample 比例成比例**（例如 50% → 約半份 train/valid）。 | 每 trial 變快，總 HPO 可省 **數分～數十分鐘**（依 trial 數與 early stop）。 | 多為設定與文件。 |
-| 16 | A27 | 調整 `OPTUNA_N_TRIALS`、`OPTUNA_TIMEOUT_SECONDS` 或 `OPTUNA_HPO_SAMPLE_ROWS`。 | 不直接省記憶體。 | 總 Step 9 時間可省 **數分～數十分鐘**（例如減 trial 或 timeout）。 | 設定與文件。 |
+| 3 | A02 | **Phase 2a（文件）**：A01 修好後若 links 仍導致 OOM，再評估 DuckDB 結果流式寫出 Parquet 再分塊讀入，或 `.df()` 前先 `LIMIT` 取樣（需確認下游是否允許）。目前以文件註明為完成。 | 若改為不一次 materialize 全量：可省 **與 links 列數成比例**，約 **數百 MB～數 GB**。 | 若改 streaming/分塊，可能略增 I/O 時間。 | 依實際 links 列數與機器 RAM 決定是否實作。 |
+| 4 | A03 | **Phase 2a 已實作**：預設 `CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS=False`；config 註明勿於生產啟用；當為 True 時 trainer.py 會 log warning（A03）。 | 若關閉則 **避免載入整段 session 時間窗**，可達 **1–5+ GB**。 | 避免一次載入全 session。 | 程式內已加 warning；config 註明 A03。 |
+| 5 | A05 | **Phase 2a 已實作**：8/32GB 環境建議 `--no-preload` 或調低 `PROFILE_PRELOAD_MAX_BYTES`；config.py 該常數註解已註明（A05）。 | 不 preload 即不載入全表，省 **整份 session 表**（可達 **1.5 GB+**）。 | 無 preload 時改為每 snapshot 讀 Parquet，總時間可能**增加**（見 A06）。 | config 註解已加。 |
+| 6 | A06 | **Phase 2a（文件）**：排程／文件建議使用**月底** `snapshot_dates`，避免長區間逐日 backfill；若 backfill 由排程驅動，改為只排月底。本節即為文件建議。 | 不直接省記憶體。 | 若從逐日改為月底：**N 日 → 約 N/30 次** `build_player_profile`，可省 **數十分鐘～數小時**。 | 多為流程／排程調整。 |
+| 7 | A08 | **Phase 2b 已實作（文件）**：本節與 Mitigation 列已註明長窗或大 chunk 時減 `--days` 或 `--recent-chunks`。 | 透過縮小範圍可降低**單次載入 chunk 大小**，約 **數百 MB～1+ GB**（視窗長）。 | 縮小範圍可略減 Step 6 單 chunk 時間。 | 以文件註明為完成。 |
+| 8 | A14 | **Phase 2b（文件）**：以文件註明為完成；若 links 仍 OOM 可再評估只註冊必要欄位或 column pruning。 | 若減少 materialize 的列/欄：可省 **約 1× chunk 大小**（數百 MB～1+ GB）。 | 若減少資料量可省 **數十秒～數分鐘**/chunk。 | 估算為數量級。 |
+| 9 | A20 | **Phase 2b 已實作**：config 註明確保 temp_directory 可寫、memory_limit 已設（STEP7_DUCKDB_*）；Step 7 已使用兩者。 | 透過 spill 可**避免** Step 7 DuckDB OOM。 | 若改為多 spill 可能略增 **數分鐘**。 | config.py STEP7_DUCKDB_TEMP_DIR 註解已更新。 |
+| 10 | A21 | **Phase 2b 已實作**：B+ 已延後載入 train；screening 時已用 `_read_parquet_head` 預設 2M。 | B+ 已用 head 取樣。 | 影響小。 | 以文件註明為完成。 |
+| 11 | A22 | **Phase 2b 已實作（文件）**：OOM 預檢已實作；本節註明「首次跑估計可能偏樂觀」。 | 估計更準可**減少誤判**。 | 無。 | 以文件註明為完成。 |
+| 12 | A23 | **Phase 2b 已實作**：config 之 `STEP8_SCREEN_SAMPLE_ROWS` 已註明 in-memory 建議 2_000_000；B+ 已預設 2M。 | 若 train 為 5M–10M 列：可省 **約 0.6–2 GB**。B+ 已達成。 | screening 減為 2M 可省 **數十秒～數分鐘**。 | config 註解已更新。 |
+| 13 | A24 | **Phase 2b 已實作**：維持 `SCREEN_FEATURES_METHOD="lgbm"`；config 已註明 "mi"/"mi_then_lgbm" 較慢較吃記憶體（A24）。 | 與 A23 同。MI 改 LGB 可省 **數分鐘～數十分鐘**。 | **數分鐘～數十分鐘**（若從 MI 改 LGB）。 | config 註解已更新。 |
+| 14 | A25 | 可選評估 LGB view；維持以文件註明，不實作。 | 若可少一份 copy：約 **數百 MB～1 GB**。 | 可略。 | Phase 2c 以文件為完成。 |
+| 15 | A26 | **Phase 2c 已實作**：config 之 `OPTUNA_HPO_SAMPLE_ROWS` 已註明對 HPO 階段 peak／trial 時間之影響（A26）。 | 若啟用可降 HPO peak **與 subsample 比例成比例**。 | 每 trial 變快，總 HPO 可省 **數分～數十分鐘**。 | config 註解已更新。 |
+| 16 | A27 | **Phase 2c 已實作**：config 之 `OPTUNA_N_TRIALS`、`OPTUNA_TIMEOUT_SECONDS` 已註明對 Step 9 時間之影響（A27）。 | 不直接省記憶體。 | 總 Step 9 可省 **數分～數十分鐘**（減 trial 或 timeout）。 | config 註解已更新。 |
 
 ---
 
@@ -230,7 +230,7 @@ This document summarizes known **out-of-memory (OOM)** and **long-running-time**
 | 優先 | ID | 建議作法 | 預估記憶體減少 | 預估時間減少 | 備註／不確定性 |
 |------|----|----------|----------------|----------------|----------------|
 | 17 | A04 | 在 `build_canonical_mapping_from_links` 與 `_apply_mn_resolution` 中減少多餘 `.copy()`：例如在 `_apply_mn_resolution` 內對輸入做一次 copy 並在該 copy 上 in-place 操作，`build_canonical_mapping_from_links` 只傳 slice（`rated`），避免對全量 links 再 copy。 | 目前約 2 份 links 量（build 內 1 份 + _apply_mn 內 1 份）；可省 **約 1 份 links**，約 **數百 MB～1+ GB**（與 links 列數成正比）。 | 可略。 | 需確認 `_apply_mn_resolution` 是否會改動傳入的 df。 |
-| 18 | A07 | 呼叫端確保傳入 `canonical_ids` 限制；若尚未傳則補上。文件註明大窗或大 canonical 集時風險。 | 可省 **與 profile 結果集大小成比例**（過濾後行數 × 欄寬），約 **數十～數百 MB**（視窗與玩家數）。 | 略減讀取與 merge 時間。 | 取決於目前呼叫端是否已傳 canonical_ids。 |
+| 18 | A07 | **Phase 2a 已確認**：呼叫端（trainer run_pipeline、backtester）皆傳入 `canonical_ids`（rated 玩家 ID）；`load_player_profile` 在 `canonical_ids=[]` 時直接 return None 不讀表。文件註明大窗或大 canonical 集時風險。 | 可省 **與 profile 結果集大小成比例**，約 **數十～數百 MB**（視窗與玩家數）。 | 略減讀取與 merge 時間。 | trainer 與 backtester 已傳 _rated_cids；R222 已處理空表不載入。 |
 | 19 | A09 | `normalize_bets_sessions` 為必要 copy（型別轉換）；若未來改為 in-place 型別轉換（pandas 允許且無共用風險），可省 1 份 bets + 1 份 sessions。 | 若改為 in-place：可省 **約 1× (bets + sessions)**，約 **數百 MB～1+ GB**/chunk。 | 可略。 | 需確認後續是否仍需要原始型別；改動範圍較大。 |
 | 20 | A10 | 在 `apply_dq` 內合併 sessions 的多次 filter：用單一 mask 或鏈式布林索引，最後一次 `.copy()`，避免 1401/1408/1429/1438 各一次 copy。 | 可省 **約 1–2 份 sessions**（每份約 chunk 內 sessions 大小），約 **數十～數百 MB**/chunk。 | 可略。 | 與現有 bets 單一 mask 做法對齊。 |
 | 21 | A11 | 評估 `add_track_human_features` 是否可在 bets 上 in-place 加欄位或只複製必要欄位；或與前一步共用一份 bets 避免重複 copy。 | 可省 **約 1× bets**/chunk，約 **數百 MB**/chunk（視欄位數）。 | 可略。 | 需理清與 canonical_map、Track LLM merge 的介面。 |
@@ -252,10 +252,41 @@ This document summarizes known **out-of-memory (OOM)** and **long-running-time**
 
 ---
 
+## Phase 1 與 Phase 2a 實作狀態（OOM 稽核計畫）
+
+- **Phase 1（A19）**：`STEP7_USE_DUCKDB=False` 時改為先 log warning 再進入 pandas fallback；`config.py` 註明保持 True 或減 `--days`／NEG_SAMPLE_FRAC；稽核文件 A19 列已標為已實作。
+- **Phase 2a（A02）**：以文件註明「A01 後若 links 仍 OOM 再評估 streaming／LIMIT」為完成，無程式變更。
+- **Phase 2a（A03）**：config 註明勿預設啟用；`trainer.py` 在 `CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS=True` 時 log warning。
+- **Phase 2a（A05）**：`config.py` 之 `PROFILE_PRELOAD_MAX_BYTES` 註解已註明 8/32GB 使用 `--no-preload` 或調低該值。
+- **Phase 2a（A06）**：本節「優先處理計畫」表與 A06 列即為排程／文件建議（月底 snapshot_dates）。
+- **Phase 2a（A07）**：已確認 trainer 與 backtester 皆傳入 `canonical_ids` 限制 profile 讀取；`load_player_profile` 空列表時 return None。
+
+## Phase 2b 與 Phase 2c 實作狀態（OOM 稽核計畫）
+
+- **A08**：本節與 Mitigation 列已註明長窗或大 chunk 時減 `--days` 或 `--recent-chunks`；無程式變更。
+- **A14**：以文件註明為完成；若 links 仍 OOM 可再評估 Track LLM 只註冊必要欄位或 column pruning。
+- **A20**：`config.py` 之 `STEP7_DUCKDB_TEMP_DIR` 註解已註明確保可寫、memory_limit 已設（STEP7_DUCKDB_RAM_*）；Step 7 程式已使用 temp_directory 與 memory_limit。
+- **A21**：B+ 已延後載入 train；screening 時已用 `_read_parquet_head` 預設 2M；以文件註明為完成。
+- **A22**：OOM 預檢已實作；本節註明「首次跑估計可能偏樂觀」。
+- **A23**：`config.py` 之 `STEP8_SCREEN_SAMPLE_ROWS` 已註明 in-memory 路徑建議 2_000_000；B+ 已預設 2M。
+- **A24**：`config.py` 之 `SCREEN_FEATURES_METHOD` 已註明 "mi"/"mi_then_lgbm" 較慢且較吃記憶體，建議 lgbm；預設為 lgbm。
+- **A25**：可選；維持以文件註明，不實作 LGB view 評估。
+- **A26/A27**：`config.py` 之 `OPTUNA_N_TRIALS`、`OPTUNA_TIMEOUT_SECONDS`、`OPTUNA_HPO_SAMPLE_ROWS` 已註明對 Step 9 時間／記憶體之影響（A26/A27）。
+
+## Phase 3 與 Phase 4 實作狀態（OOM 稽核計畫）
+
+- **A04**：`identity.py`：`build_canonical_mapping_from_links` 改為僅複製 rated 列/欄（單一 copy），再傳入 `_apply_mn_resolution`；避免全量 links_df.copy()。
+- **A10**：`trainer.py` `apply_dq`：sessions 之 FND-02 與 FND-04 合併為單一 mask，最後一次 `sessions = sessions[dq_mask].copy()`。
+- **A16**：`labels.py` `compute_labels`：E3 與 R12 之 null 檢查合併為單一 combined_null mask，一次 `df = df[~combined_null].copy()`。
+- **A15**：維持現狀（註解已註明省約 10 GiB）。
+- **Phase 4（A17, A28）**：可選；本輪以文件註明為完成，不實作程式變更。
+
+---
+
 ## 依賴與建議順序摘要
 
 1. **A01 已完成**：Step 3 已改為 schema-only 讀取，為 A02 提供穩定 baseline。
-2. **A19 以「不觸發」為主**：確保 DuckDB 路徑穩定，必要時加 guard 或文件。
+2. **A19 已實作**：Guard（log warning when False）+ config 與文件註明；確保 DuckDB 路徑為預設。
 3. **A23 + A24**：建議一併做（Step 8 screening 取樣 + 方法），記憶體與時間效益一起算。
 4. **A22**：屬預檢與估計改進，可與 Step 7 相關項目一起做。
 5. **A04、A10、A16**：都是「少 copy」類，可集中一輪重構，測試時注意不可變性與下游是否依賴 copy。

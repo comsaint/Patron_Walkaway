@@ -14790,3 +14790,408 @@ ruff check trainer/
 - **剩餘項目**：目前無 pending 項目；建議實作順序改為可選／後續。
 - **開放問題／實作待辦**：Step 3 Schema 僅讀 metadata 已標為已完成。
 
+---
+
+## OOM／長時間執行稽核計畫 — Phase 1 + Phase 2a（2026-03-11）
+
+**目標**：實作 PLAN.md「OOM／長時間執行稽核項目處理計畫」之 **Phase 1（A19）** 與 **Phase 2a（A02, A03, A05, A06, A07）**。參考 `doc/training_oom_and_runtime_audit.md`。
+
+### 改了哪些檔
+
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/trainer.py` | **A19**：當 `STEP7_USE_DUCKDB=False` 時，在呼叫 `_step7_pandas_fallback` 前新增 `logger.warning`，內文含高 OOM 風險提示與稽核文件 A19 參照。**A03**：當 `CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS=True` 時，在載入 full session 前新增 `logger.warning`，註明僅供除錯、生產勿用。 |
+| `trainer/config.py` | **A19**：`STEP7_USE_DUCKDB` 註解擴充為註明 False 時為 pandas fallback、高 OOM 風險（peak ~20× on-disk），並建議保持 True 或減 `--days`／NEG_SAMPLE_FRAC，參照 A19。**A03**：`CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS` 註解補上 A03、勿於生產啟用。**A05**：`PROFILE_PRELOAD_MAX_BYTES` 註解補上「On 8/32GB machines use --no-preload or lower this value (A05)」。 |
+| `doc/training_oom_and_runtime_audit.md` | **Phase 1**：A19 列改為「已實作」並註明 trainer 與 config 變更。**Phase 2a**：A02/A03/A05/A06 表列更新為已實作或文件完成；A07 在 Phase 3 表改為「Phase 2a 已確認」並註明 trainer/backtester 已傳 canonical_ids。新增「Phase 1 與 Phase 2a 實作狀態」小節列舉各項完成定義；「依賴與建議順序摘要」中 A19 改為已實作。 |
+
+### 手動驗證
+
+- **A19**：將 `config.STEP7_USE_DUCKDB` 暫時改為 False（或環境變數覆寫），跑 pipeline 至 Step 7，日誌應出現 WARNING「STEP7_USE_DUCKDB=False: using pandas fallback for Step 7 (high OOM risk)...」。
+- **A03**：將 `config.CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS` 設為 True，以 local Parquet 跑 Step 3，日誌應出現 WARNING「CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS=True: loading full session window...」。
+- **A05/A06/A07**：為 config 與文件變更；A07 行為已由 R222 與既有程式確認（trainer/backtester 傳 `_rated_cids`，`load_player_profile` 空列表 return None）。
+
+### 下一步建議
+
+1. 將 PLAN.md 中 **oom-runtime-audit-remediation** todo 的 `status: pending` 改為 **in_progress** 或依階段更新（Phase 1 + 2a 完成後可標為部分 completed）。
+2. 續做 **Phase 2b**（A08, A14, A20–A24）時，可依同格式更新 STATUS 與稽核文件。
+
+### pytest 結果（本輪執行）
+
+```
+python -m pytest -q
+# 952 passed, 41 skipped, 192 warnings in 44.18s
+```
+
+---
+
+## Code Review — OOM Phase 1 + Phase 2a 變更（2026-03-11）
+
+**範圍**：本輪 Phase 1（A19）與 Phase 2a（A03, A05, A07 確認）之程式與文件變更。  
+**依據**：PLAN.md「OOM／長時間執行稽核項目處理計畫」、STATUS.md 本輪紀錄、DECISION_LOG.md 與既有測試契約。
+
+以下僅列出**最可能的 bug／邊界條件／安全性／效能**問題；每項附**具體修改建議**與**希望新增的測試**。不重寫整套實作。
+
+---
+
+### 1. 邊界條件／契約：STEP7_KEEP_TRAIN_ON_DISK=True 且 STEP7_USE_DUCKDB=False 時行為不一致
+
+**問題**：`config.py` 註明「STEP7_KEEP_TRAIN_ON_DISK requires STEP7_USE_DUCKDB=True」，但 `_step7_sort_and_split` 在 `STEP7_USE_DUCKDB=False` 時僅 log warning 後直接走 pandas fallback，回傳 `(train_df, valid_df, test_df, None, None, None)`。此時 `train_df` 為整份 in-memory，與 B+ 契約「train 不載入記憶體、僅回傳 path」矛盾；下游若依 STEP7_KEEP_TRAIN_ON_DISK 假定 `train_df is None` 且 path 存在，會拿到 `path is None` 而邏輯錯誤或後續 OOM。
+
+**具體修改建議**：在 `_step7_sort_and_split` 內，進入 `if not STEP7_USE_DUCKDB:` 區塊後、在 `logger.warning(...)` 之前，加入：
+
+```python
+if STEP7_KEEP_TRAIN_ON_DISK:
+    raise ValueError(
+        "STEP7_KEEP_TRAIN_ON_DISK=True requires STEP7_USE_DUCKDB=True. "
+        "Either set STEP7_USE_DUCKDB=True or set STEP7_KEEP_TRAIN_ON_DISK=False."
+    )
+```
+
+如此可保證 B+ 契約：KEEP_TRAIN_ON_DISK 僅在 DuckDB 路徑下生效，且與 config 註解一致。
+
+**希望新增的測試**：
+
+- **test_step7_keep_train_on_disk_requires_use_duckdb**：mock 或 patch 使 `STEP7_USE_DUCKDB=False`、`STEP7_KEEP_TRAIN_ON_DISK=True`，呼叫 `_step7_sort_and_split(chunk_paths, 0.7, 0.15)`（chunk_paths 可為最小可測 list，例如單一暫存 Parquet path），預期 `raise ValueError` 且訊息含 "STEP7_KEEP_TRAIN_ON_DISK" 與 "STEP7_USE_DUCKDB"。
+- 可選：在 `test_review_risks_round219_plan_b_plus_stage6_step2.py` 或 `test_review_risks_round177_step7_orchestrator.py` 中新增，以與既有 Step 7 契約測試同處維護。
+
+---
+
+### 2. 可觀測性／邊界：A19 warning 僅在 log 出現，無程式化契約
+
+**問題**：A19 僅在 `STEP7_USE_DUCKDB=False` 時打 `logger.warning`。若執行環境將 WARNING 過濾或未集中收集（例如部分 CI／batch），操作者可能無法察覺已進入高 OOM 風險路徑，且目前無單元測試鎖定「此路徑會打 warning」。
+
+**具體修改建議**：維持現有 warning 行為；可選強化為在既有測試中鎖定契約：當 Step 7 走 pandas fallback（不論是 config False 或 DuckDB 例外後 fallback），至少有一次 log 含 "pandas fallback" 或 "high OOM risk"，避免日後重構時誤刪 warning。
+
+**希望新增的測試**：
+
+- **test_step7_use_duckdb_false_logs_oom_warning**：在 `STEP7_USE_DUCKDB=False`、`STEP7_KEEP_TRAIN_ON_DISK=False` 下，呼叫 `_step7_sort_and_split`（需可測的 chunk_paths，例如 fixture 或 mock 回傳一筆小 Parquet），用 `caplog` 或 `logging` capture 斷言出現一筆 WARNING，訊息含 "STEP7_USE_DUCKDB=False" 與 "high OOM risk"（或 "doc/training_oom_and_runtime_audit.md A19"）。若目前 `_step7_pandas_fallback` 在空或無效 path 會提早失敗，可僅用 mock 的 path 或最小 Parquet 以通過 fallback。
+
+---
+
+### 3. 一致性：STEP7_USE_DUCKDB 為 import-time 讀取，A03 為 runtime 讀取
+
+**問題**：`trainer.py` 中 `STEP7_USE_DUCKDB` 在模組載入時由 `getattr(_cfg, "STEP7_USE_DUCKDB", True)` 設定（約 127／180 行），之後 `_step7_sort_and_split` 使用此模組級變數。相對地，A03 的 `CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS` 在 `run_pipeline` 內每次以 `getattr(_cfg, "CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS", False)` 讀取。若未來有人於執行期動態修改 config（例如測試或 feature flag），Step 7 可能仍用舊的 STEP7_USE_DUCKDB，而 Step 3 會看到新值。目前專案多數 flag 為 import-time，故屬一致性／文件問題，非必然 bug。
+
+**具體修改建議**：不在本輪改為 runtime 讀取（避免擴大改動）。建議在 `trainer.py` 或 `doc/training_oom_and_runtime_audit.md` 加一句註解：Step 7 相關 flag（含 STEP7_USE_DUCKDB）於 import 時自 config 讀取，執行期修改 config 不會影響已載入的 trainer 模組。
+
+**希望新增的測試**：無須為此新增測試；可選在既有「config 存在 STEP7_USE_DUCKDB」的 source 檢查（如 round171）旁加註「value is read at import time」。
+
+---
+
+### 4. A03 warning 僅在 local + 未從 artifact 載入時觸發
+
+**問題**：A03 的 warning 僅在 `use_local` 為 True、`loaded_from_artifact` 為 False、且 `use_full_sessions_pandas` 為 True 時執行。若測試或程式只跑 ClickHouse 路徑或從 artifact 載入 canonical map，不會覆蓋此分支，warning 邏輯未被測試鎖定。
+
+**具體修改建議**：邏輯正確，無需改行為。建議以測試鎖定「當進入 full sessions pandas 分支時會打 warning」。
+
+**希望新增的測試**：
+
+- **test_canonical_map_full_sessions_pandas_true_logs_warning**：在可觸發 Step 3 建 canonical mapping 且走 pandas 路徑的設定下（例如 local Parquet、未載入 artifact、`CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS=True`），以 mock 或最小資料呼叫對應區塊，用 caplog 斷言出現一筆 WARNING，訊息含 "CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS=True" 與 "high OOM risk" 或 "A03"。若現有 test 已用 mock 建 mapping，可擴充該 test 或新增一則專注於「pandas 分支 + warning」的契約測試。
+
+---
+
+### 5. 效能與安全性
+
+**效能**：本輪僅新增兩處 `logger.warning(...)` 呼叫，無額外 I/O 或重計算，效能影響可忽略。
+
+**安全性**：未新增使用者輸入或網路；warning 訊息僅含 flag 名稱與文件路徑，無敏感資料。唯一依賴為文件路徑 `doc/training_oom_and_runtime_audit.md` 若日後更名，需同步更新 log 訊息（低風險，可於重構時一併處理）。
+
+**結論**：無需針對效能或安全性做程式修改；可選在 A19／A03 的 log 文案註解中註明「若稽核文件路徑變更請同步更新」。
+
+---
+
+### Review 總結
+
+| # | 類型         | 嚴重度 | 建議動作 |
+|---|--------------|--------|----------|
+| 1 | 邊界／契約   | 高     | 在 STEP7_USE_DUCKDB=False 時若 STEP7_KEEP_TRAIN_ON_DISK=True 則 raise ValueError；並新增對應測試。 |
+| 2 | 可觀測性     | 中     | 新增測試鎖定 A19 warning 文案（STEP7_USE_DUCKDB=False 時）。 |
+| 3 | 一致性／文件 | 低     | 註解說明 Step 7 flag 為 import-time 讀取即可。 |
+| 4 | 測試覆蓋     | 中     | 新增測試鎖定 A03 pandas 分支之 warning。 |
+| 5 | 效能／安全   | —      | 無需變更。 |
+
+---
+
+## Reviewer 風險點 → 最小可重現測試（tests-only，2026-03-11）
+
+**目標**：將上列 Code Review 風險點轉成最小可重現測試（或 source/contract 檢查），**僅提交 tests，不改 production code**。
+
+### 新增測試檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/test_review_risks_oom_phase1_phase2a.py` | 對應 Review #1–#4 的 source/contract 測試；#1 契約已由 production 實作，expectedFailure 已移除。 |
+
+### 測試與風險對應
+
+| Review # | 風險摘要 | 測試類別／方法 | 預期結果（目前） |
+|----------|----------|----------------|------------------|
+| 1 | STEP7_KEEP_TRAIN_ON_DISK=True 且 STEP7_USE_DUCKDB=False 時應 raise ValueError | `TestOomReview1Step7KeepTrainRequiresUseDuckdb.test_step7_invalid_combo_should_raise_value_error_in_source` | **passed**（production 已加入檢查，見本輪 Production 修復） |
+| 2 | A19：STEP7_USE_DUCKDB=False 時須 log warning（含 high OOM risk） | `TestOomReview2Step7UseDuckdbFalseLogsOomWarning.test_step7_use_duckdb_false_block_logs_oom_warning` | passed |
+| 3 | STEP7_USE_DUCKDB 自 config 讀取（import-time） | `TestOomReview3Step7UseDuckdbReadFromConfig.test_step7_use_duckdb_read_from_config_in_source` | passed |
+| 4 | A03：full sessions pandas 分支須 log warning（含 A03／high OOM risk） | `TestOomReview4CanonicalFullSessionsPandasLogsWarning.test_canonical_map_full_sessions_pandas_branch_logs_warning` | passed |
+
+### 執行方式
+
+```bash
+# 僅跑本輪新增的 OOM review 風險測試
+python -m pytest tests/test_review_risks_oom_phase1_phase2a.py -v
+
+# 預期：4 passed（#1 已由 production 實作，expectedFailure 已移除）
+```
+
+### 備註
+
+- **#1**：production 在 `_step7_sort_and_split` 的 `if not STEP7_USE_DUCKDB:` 區塊加入「若 STEP7_KEEP_TRAIN_ON_DISK 則 raise ValueError」後，請移除該 test 的 `@unittest.expectedFailure`，使 test 以 passed 鎖定契約。
+- 未新增 lint／typecheck 規則；Review #3、#5 以 source 檢查與文件為主，無額外規則。
+
+### 全套 pytest 結果（本輪新增測試後）
+
+```
+python -m pytest -q
+# 956 passed, 41 skipped, 192 warnings（本輪 Production 修復後；見上方「本輪結果」）
+```
+
+---
+
+## Production 修復 Review #1 + 全綠（2026-03-11）
+
+**目標**：實作 Code Review #1（STEP7_KEEP_TRAIN_ON_DISK=True 且 STEP7_USE_DUCKDB=False 時應 raise ValueError），使 tests/typecheck/lint 全過；不改 tests 邏輯，僅移除已過時的 `@unittest.expectedFailure`。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/trainer.py` | 在 `_step7_sort_and_split` 的 `if not STEP7_USE_DUCKDB:` 區塊內，於 `logger.warning` 與 `_step7_pandas_fallback` 前新增：若 `STEP7_KEEP_TRAIN_ON_DISK` 則 `raise ValueError(...)`，訊息註明須設 STEP7_USE_DUCKDB=True 或 STEP7_KEEP_TRAIN_ON_DISK=False。 |
+| `tests/test_review_risks_oom_phase1_phase2a.py` | 移除 `TestOomReview1Step7KeepTrainRequiresUseDuckdb.test_step7_invalid_combo_should_raise_value_error_in_source` 的 `@unittest.expectedFailure`（decorator 過時，production 已滿足契約）。 |
+
+### 本輪結果（tests / typecheck / lint）
+
+```
+python -m pytest -q
+# 956 passed, 41 skipped, 192 warnings in 54.39s
+
+python -m mypy trainer/ --ignore-missing-imports
+# Success: no issues found in 23 source files
+
+ruff check trainer/ tests/test_review_risks_oom_phase1_phase2a.py
+# All checks passed!
+```
+
+### 備註
+
+- Review #1 契約已由 production 實作鎖定，四則 OOM review 風險測試均 passed。
+
+---
+
+## OOM 稽核補救 — Phase 2b / 2c / 3 / 4 完成（2026-03-11）
+
+**目標**：實作 PLAN「OOM／長時間執行稽核項目處理計畫」餘下階段（Phase 2b、2c、Phase 3、Phase 4）。參考 `doc/training_oom_and_runtime_audit.md`。
+
+### 改了哪些檔
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/config.py` | **Phase 2b/2c**：`STEP7_DUCKDB_TEMP_DIR` 註解補 A20（確保可寫、memory_limit 已設）。`STEP8_SCREEN_SAMPLE_ROWS` 註解補 A23（in-memory 建議 2_000_000；B+ 已預設 2M）。`OPTUNA_N_TRIALS`／`OPTUNA_TIMEOUT_SECONDS` 註解補 A27。`OPTUNA_HPO_SAMPLE_ROWS` 註解補 A26。`SCREEN_FEATURES_METHOD` 註解改為 A24（mi／mi_then_lgbm 較慢較吃記憶體，建議 lgbm）。 |
+| `doc/training_oom_and_runtime_audit.md` | **Phase 2b/2c**：新增「Phase 2b 與 Phase 2c 實作狀態」小節；Phase 2 表 A08–A27 列更新為已實作（文件／config）。**Phase 3/4**：新增「Phase 3 與 Phase 4 實作狀態」；A04/A10/A16 程式實作摘要；Phase 4 以文件註明為完成。 |
+| `trainer/identity.py` | **A04**：`build_canonical_mapping_from_links` 改為僅對 rated 列/欄做一次 copy（`links_df.loc[..., [...]].copy()`），清理後傳入 `_apply_mn_resolution`；移除全量 `links_df.copy()`。 |
+| `trainer/labels.py` | **A16**：`compute_labels` 將 E3（null payout_complete_dtm）與 R12（null canonical_id）合併為單一 `combined_null` mask，一次 `df = df[~combined_null].copy()`；保留同一則 warning 並同時輸出兩類 drop 數量。 |
+| `trainer/trainer.py` | **A10**：`apply_dq` 中 sessions 的 FND-02 與 FND-04 合併為單一 `dq_mask`，最後一次 `sessions = sessions[dq_mask].copy()`。 |
+
+### 手動驗證
+
+- **Phase 2b/2c**：為 config 與稽核文件更新；`python -c "import trainer.config as c; print(c.STEP8_SCREEN_SAMPLE_ROWS, c.SCREEN_FEATURES_METHOD)"` 確認常數存在；閱讀 `doc/training_oom_and_runtime_audit.md` 確認 Phase 2b/2c/3/4 狀態小節與表列一致。
+- **A04**：跑一次依賴 canonical mapping 的 pipeline（例如 `--days 7` 且 local Parquet），或執行 `tests/test_identity.py` 與 `tests/test_canonical_mapping_duckdb_pandas_parity.py`，確認 mapping 結果不變。
+- **A10**：跑 `tests/test_apply_dq*.py` 或含 apply_dq 的整合測試，確認 sessions 篩選結果與改動前一致。
+- **A16**：跑 `tests/test_labels*.py` 或含 compute_labels 的測試，確認 label 產出與 drop 數量日誌一致。
+
+### 下一步建議
+
+- OOM 稽核計畫 Phase 1–4 已全部完成；PLAN.md 之 `oom-runtime-audit-remediation` 可標為 **completed**。
+- 可選：在 8GB／32GB 環境以 memory_profiler 量測 Step 3/6/7/8 peak，對照稽核估算。
+
+### pytest / typecheck / lint 結果（本輪完成後）
+
+```
+python -m pytest -q
+# 956 passed, 41 skipped, 192 warnings in 46.54s
+
+python -m mypy trainer/ --ignore-missing-imports
+# Success: no issues found in 23 source files
+
+ruff check trainer/ trainer/labels.py
+# All checks passed!
+```
+
+---
+
+## Code Review — OOM Phase 2b/2c/3/4 變更（2026-03-11）
+
+**範圍**：本輪 Phase 2b/2c（config ＋稽核文件）、Phase 3（A04 identity、A10 apply_dq、A16 compute_labels）、Phase 4（文件）之程式與文件變更。  
+**依據**：PLAN.md「OOM／長時間執行稽核項目處理計畫」、STATUS.md 本輪紀錄、DECISION_LOG.md 與既有測試契約。
+
+以下僅列出**最可能的 bug／邊界條件／安全性／效能**問題；每項附**具體修改建議**與**希望新增的測試**。不重寫整套實作。
+
+---
+
+### 1. 可觀測性／語意：compute_labels 合併 drop 日誌的計數可能重疊（A16）
+
+**問題**：改為單一 `combined_null` 後，日誌為「dropped %d row(s) with null payout_complete_dtm (E3), %d with null canonical_id (R12)」，使用 `null_payout.sum()` 與 `null_cid.sum()`。同一列若同時為 null payout 與 null canonical_id，會兩邊都計入，故兩數相加可能大於實際刪除列數 `combined_null.sum()`，解讀時易誤以為「先後兩階段各刪 N 與 M 列」。
+
+**具體修改建議**：在現有 `logger.warning` 補上實際刪除列數，或於訊息中註明重疊可能。例如：
+
+```python
+logger.warning(
+    "compute_labels: dropped %d row(s) (null payout_complete_dtm: %d, null canonical_id: %d; counts may overlap) (E3/R12)",
+    combined_null.sum(),
+    null_payout.sum(),
+    null_cid.sum(),
+)
+```
+
+或保留原兩數，並加一句「Total rows dropped: %d」使用 `combined_null.sum()`。
+
+**希望新增的測試**：**test_compute_labels_combined_null_log_total_dropped**：給定 `bets_df` 中部分列僅 null payout、部分僅 null canonical_id、部分兩者皆 null，呼叫 `compute_labels` 並以 caplog 或 mock 擷取 log，斷言日誌中出現的「dropped」總列數等於 `combined_null.sum()`（或斷言訊息內含 `combined_null.sum()`）。
+
+---
+
+### 2. 邊界條件：build_canonical_mapping_from_links 在「清理後 rated 全空」時行為（A04）
+
+**問題**：改為先取 `casino_player_id.notna()` 再 `_clean_casino_player_id` 並過濾 `notna()` 後，若清理後無任何列（例如全部為無效字串），會傳入空 DataFrame 給 `_apply_mn_resolution`。`_apply_mn_resolution` 已處理空輸入（回傳空 mapping），行為正確，但此路徑目前無專屬測試，日後若改動 `_clean_casino_player_id` 或過濾邏輯，回歸風險較高。
+
+**具體修改建議**：無需改 production；以測試鎖定契約即可。
+
+**希望新增的測試**：**test_build_canonical_mapping_from_links_all_cleaned_to_nan_returns_empty**：給定 `links_df` 僅含一欄 `casino_player_id` 為空字串或 "null"（經 `_clean_casino_player_id` 會變 NaN），其餘欄位合法，呼叫 `build_canonical_mapping_from_links(links_df, dummy_pids)`，斷言回傳為空 DataFrame 且欄位為 `["player_id", "canonical_id"]`。
+
+---
+
+### 3. apply_dq sessions 合併 mask（A10）與原邏輯一致性
+
+**問題**：FND-04 條件為「僅當 `turnover` 或 `num_games_with_wager` 至少一欄存在時才套用」。改動後改為 `if "turnover" in sessions.columns or "num_games_with_wager" in sessions.columns` 才將 `(_turnover > 0) | (_games > 0)` 併入 `dq_mask`；且前述程式已保證在檢查前若缺 `num_games_with_wager` 會先設為 0，故條件恆為 True，與原行為一致。無明顯 bug，僅建議以測試鎖定「FND-02 ＋ FND-04 合併後篩選結果與改動前一致」。
+
+**具體修改建議**：無需改 production。
+
+**希望新增的測試**：既有 `test_apply_dq` 或 `test_review_risks_round280` 等若已涵蓋 sessions 篩選，可補一則：給定相同 sessions（含 is_manual/is_deleted/is_canceled 與 turnover/num_games_with_wager），分別以「兩次獨立 filter＋copy」的邏輯與目前「單一 dq_mask＋一次 copy」比對，斷言輸出 sessions 列數與內容一致（或僅斷言列數與關鍵欄位一致）。
+
+---
+
+### 4. 效能與安全性
+
+**效能**：A04 改為僅複製 rated 列/欄，減少全量 links 複製；A10、A16 各少一次 `.copy()`。無負面效能影響。
+
+**安全性**：未新增使用者輸入或網路；無敏感資料。無需變更。
+
+**結論**：無需針對效能或安全性修改程式。
+
+---
+
+### Review 總結
+
+| # | 類型         | 嚴重度 | 建議動作 |
+|---|--------------|--------|----------|
+| 1 | 可觀測性     | 低     | compute_labels 日誌補上實際 dropped 總數或註明「counts may overlap」；並新增測試鎖定總數與 log。 |
+| 2 | 邊界／測試   | 低     | 新增測試：build_canonical_mapping_from_links 在清理後 rated 全空時回傳空 mapping。 |
+| 3 | 契約／測試   | 低     | 可選：新增或擴充 apply_dq 測試，鎖定 FND-02＋FND-04 合併 mask 與原兩段 filter 結果一致。 |
+| 4 | 效能／安全   | —      | 無需變更。 |
+
+---
+
+### 新增測試與執行方式（2026-03-11）
+
+已依 Review #1–#3 將「希望新增的測試」實作為最小可重現測試，**僅新增測試、未改 production**。
+
+- **測試檔**：`tests/test_review_risks_oom_phase2b2c_phase3.py`
+- **測試項目**：
+  - **#1 (A16)**：`TestOomReviewA16ComputeLabelsCombinedNull::test_compute_labels_combined_null_dropped_count_and_warning` — 給定部分列僅 null payout、部分僅 null canonical_id、部分兩者皆 null 的 `bets_df`，呼叫 `compute_labels`，以 `assertLogs("trainer.labels")` 擷取 WARNING，斷言結果列數等於 `n - combined_null.sum()` 且至少一則 log 含 "dropped"。
+  - **#2 (A04)**：`TestOomReviewA04CanonicalFromLinksAllCleanedToNan::test_build_canonical_mapping_from_links_all_cleaned_to_nan_returns_empty` — `links_df` 的 `casino_player_id` 為 `""` 或 `"null"`，其餘欄位合法；斷言回傳空 DataFrame、欄位為 `["player_id", "canonical_id"]`。
+  - **#3 (A10)**：`TestOomReviewA10ApplyDqSessionsSingleMask::test_apply_dq_sessions_uses_single_dq_mask_and_one_copy` — 以 `inspect.getsource(apply_dq)` 斷言 source 含 `dq_mask`、`FND-02`、`FND-04`、`sessions[dq_mask].copy()`。
+- **執行方式**：
+  - 執行上述三則：`pytest tests/test_review_risks_oom_phase2b2c_phase3.py -v`
+  - 或指定單一測試：`pytest tests/test_review_risks_oom_phase2b2c_phase3.py::TestOomReviewA16ComputeLabelsCombinedNull::test_compute_labels_combined_null_dropped_count_and_warning -v`
+- **結果**：`pytest tests/test_review_risks_oom_phase2b2c_phase3.py -q` → **3 passed**。
+
+---
+
+## 本輪實作修正與驗證（2026-03-11）
+
+**指示**：以最高可靠性標準處理；不改 tests（除非測試本身錯或 decorator 過時）；修改實作直到所有 tests／typecheck／lint 通過；每輪結果追加 STATUS.md；最後修訂 PLAN.md 並回報剩餘項目。
+
+### 結果摘要
+
+- **實作變更**：無。現有 production 已通過全套測試、typecheck、lint，本輪未修改任何 production 或測試。
+- **tests**：`python -m pytest tests/ -q --tb=no` → **959 passed, 41 skipped**（含 `tests/test_review_risks_oom_phase2b2c_phase3.py` 3 則）。
+- **lint**：`python -m ruff check trainer/` → **All checks passed!**
+- **typecheck**：`python -m mypy trainer/ --ignore-missing-imports` → **Success: no issues found in 23 source files.**
+
+### 執行指令（可重現）
+
+```bash
+python -m pytest tests/ -q --tb=no
+python -m ruff check trainer/
+python -m mypy trainer/ --ignore-missing-imports
+```
+
+### PLAN.md 更新與剩餘項目
+
+- 已確認 PLAN.md 中 OOM 稽核補救（oom-runtime-audit-remediation）為 **completed**；Code Review 對應之測試已於本輪前新增並通過（見上節「新增測試與執行方式」）。
+- **剩餘項目**：todos 中僅 **config-consolidation**（Config 集中化與合併，DEC-027）為 **pending**；其餘均為 completed。見 PLAN.md 下方「Config 集中化與合併變更草案（DEC-027）」一節。
+
+---
+
+## Config 集中化與合併（DEC-027）實作 — 2026-03-11
+
+依 PLAN § Config 集中化與合併變更草案（DEC-027）順序實作；Retention 與 Refresh/Poll 間隔維持不變。
+
+### 步驟 1 — Validator 設定補齊 SSOT
+
+**改了哪些檔**
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/config.py` | 在 Validator 區塊新增 `VALIDATOR_FRESHNESS_BUFFER_MINUTES = 2`、`VALIDATOR_EXTENDED_WAIT_MINUTES = 15`、`VALIDATOR_FINALITY_HOURS = 1`（DEC-027）。 |
+
+**手動驗證**
+
+- `python -c "import trainer.config as c; print(c.VALIDATOR_FRESHNESS_BUFFER_MINUTES, c.VALIDATOR_EXTENDED_WAIT_MINUTES, c.VALIDATOR_FINALITY_HOURS)"` → 應輸出 `2 15 1`。
+- validator 行為不變（仍以 getattr 讀取，未改 validator.py）。
+
+**下一步建議**
+
+- 步驟 2：HISTORY_BUFFER_DAYS 入 config，trainer/backtester 改為自 config 讀取。
+
+### 步驟 2 — HISTORY_BUFFER_DAYS 入 config
+
+**改了哪些檔**
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/config.py` | 在「Model/Backtest Time Window」區塊新增 `HISTORY_BUFFER_DAYS = 2`（DEC-027）。 |
+| `trainer/trainer.py` | 在 config 讀取區塊新增 `HISTORY_BUFFER_DAYS = getattr(_cfg, "HISTORY_BUFFER_DAYS", 2)`；移除模組級 `HISTORY_BUFFER_DAYS: int = 2`，改註解說明來自 config。 |
+
+**手動驗證**
+
+- `python -c "from trainer import trainer as t; print(t.HISTORY_BUFFER_DAYS)"` → `2`。
+- backtester 仍自 trainer 匯入 `HISTORY_BUFFER_DAYS`，無需改動。
+
+**下一步建議**
+
+- 步驟 3：MIN_THRESHOLD_ALERT_COUNT 更名為 THRESHOLD_MIN_ALERT_COUNT。
+
+### 步驟 3 — Threshold 命名統一（THRESHOLD_MIN_ALERT_COUNT）
+
+**改了哪些檔**
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/config.py` | `MIN_THRESHOLD_ALERT_COUNT` 更名為 `THRESHOLD_MIN_ALERT_COUNT`；區塊註解標明「Threshold selection guardrails (DEC-027)」。 |
+| `trainer/trainer.py` | Config 讀取改為 `THRESHOLD_MIN_ALERT_COUNT`；三處 `valid_mask = alert_counts >= MIN_THRESHOLD_ALERT_COUNT` 改為 `>= THRESHOLD_MIN_ALERT_COUNT`。 |
+
+**手動驗證**
+
+- `python -c "import trainer.config as c; print(getattr(c, 'THRESHOLD_MIN_ALERT_COUNT', None))"` → `5`。
+- 閾值選擇邏輯不變，僅常數名與讀取 key 改變。
+
+**下一步建議**
+
+- 步驟 4：Config 內 OOM 區塊與 Step 7/8/9 註解整理。
+
