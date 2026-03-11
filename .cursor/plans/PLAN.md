@@ -113,6 +113,9 @@ todos:
   - id: config-consolidation
     content: "Config 集中化與合併（排除 Retention／Refresh・Poll）：DuckDB 一組共用參數＋stage 覆寫、Validator 補齊 SSOT、時間窗 HISTORY_BUFFER_DAYS 入 config、Threshold 命名統一（MIN_THRESHOLD_ALERT_COUNT → THRESHOLD_MIN_ALERT_COUNT）、OOM 區塊整理與分組；見「Config 集中化與合併變更草案（DEC-027）」一節。"
     status: pending
+  - id: training-config-recommender
+    content: "Training config recommender：偵測資源、依資料來源（Parquet／ClickHouse）估計每步資源與時間、建議參數；ClickHouse 路徑以實際連線查表大小估計 chunk；見「Training config recommender（Parquet／ClickHouse）」一節。"
+    status: pending
 isProject: false
 ---
 
@@ -451,6 +454,86 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 - **行為不變**：既有 tests、typecheck、lint 通過；scorer / validator / status_server / trainer / backtester 行為與目前一致（僅設定來源改為共用或覆寫）。  
 - **Config SSOT**：DuckDB 記憶體、Validator 時間常數、HISTORY_BUFFER_DAYS 均有單一或明確的定義處；Validator 不再依賴 getattr 的 magic default。  
 - **不變**：SCORER_ALERT_RETENTION_DAYS、VALIDATOR_ALERT_RETENTION_DAYS、SCORER_STATE_RETENTION_HOURS、TABLE_STATUS_RETENTION_HOURS、TABLE_STATUS_HC_RETENTION_DAYS、SCORER_POLL_INTERVAL_SECONDS、TABLE_STATUS_REFRESH_SECONDS 維持現有名稱，不合併。
+
+---
+
+## Training config recommender（Parquet／ClickHouse）
+
+**目標**：獨立工具，協助使用者在不同訓練環境下設定參數：**避免 OOM（必須）**、**可接受運行時間（重要）**、**盡量多用資料（最低優先）**。需 (1) 偵測可用資源，(2) 估計各步驟所需時間與資源，(3) 產出建議參數。支援 **local Parquet** 與 **ClickHouse** 兩種資料來源；兩者皆需產出估計與建議。  
+**參考**：`doc/training_oom_and_runtime_audit.md`（A01–A30、Config 表、優先處理計畫）。
+
+### 資源偵測
+
+- **RAM**：`psutil.virtual_memory()` → total / available（bytes 或 GB）。
+- **CPU**：`os.cpu_count()` 或 `psutil.cpu_count()`。
+- **磁碟**：`shutil.disk_usage(DATA_DIR)` 或 `STEP7_DUCKDB_TEMP_DIR` → available（Step 7 spill、chunk 寫出）。
+- 可選：容器內以環境變數覆寫可用 RAM（如 `TRAINING_AVAILABLE_RAM_GB`）。
+
+### 資料設定（Data profile）— 共用結構
+
+不論來源，產出統一 **data profile** 供後續估計與建議使用：
+
+- `data_source`: `"parquet"` | `"clickhouse"`
+- `training_days`: int（對應 `--days`）
+- `chunk_count`: int
+- `total_chunk_bytes_estimate`: int（Step 7 等用）
+- `session_data_bytes`: int（Step 3/4 用）
+- `has_existing_chunks`: bool（Parquet 時是否已有 chunk 檔）
+- 可選：`rows_per_chunk_estimate`, `bets_rows_per_day`, `sessions_rows_per_day`
+
+### Parquet 資料設定
+
+- **Discovery（優先）**：掃描 `CHUNK_DIR` 之 `*.parquet` → `chunk_count`、`total_chunk_bytes_estimate`（加總檔大小），`has_existing_chunks=True`。`session_parquet_path` → `Path.stat().st_size` 得 `session_data_bytes`。可選：`bet_parquet_path` 用於無 chunk 時估計單月 chunk 大小。
+- **Fallback（尚無 chunk）**：依 `training_days` 推 `chunk_count`；`total_chunk_bytes_estimate = chunk_count * NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT`（或由 bet/session 總大小按比例）；`session_data_bytes` 由 session 檔大小或保守預設。
+
+### ClickHouse 資料設定 — 實際連線查表大小
+
+**Chunk 大小／總量**：以 **實際連線 ClickHouse** 查詢表大小或列數來估計，而非僅依使用者手動輸入。
+
+- **連線**：使用既有 `db_conn.get_clickhouse_client()`（config：CH_HOST、CH_PORT、CH_USER、CH_PASS、SOURCE_DB）。若連線失敗（網路、權限、未安裝 clickhouse-connect），回退為「無法取得 CH 估計」並可選改用使用者提供的 `--estimated-*` 或保守預設。
+- **取得表大小或列數**：
+  - **方式 A（建議）**：查 `system.parts` 或 `system.tables` 取得 `t_bet`、`t_session` 在 SOURCE_DB 下的 **總 bytes 或總列數**（例如 `SELECT sum(bytes_on_disk), sum(rows) FROM system.parts WHERE database = %(db)s AND table IN ('t_bet','t_session')` 或等價）。再依訓練時間窗占全表比例（或依 `payout_complete_dtm` / `session_end_dtm` 範圍的 `COUNT(*)`）估算訓練窗內資料量。
+  - **方式 B**：對訓練時間窗直接執行輕量查詢，例如 `SELECT count(*) FROM t_bet WHERE payout_complete_dtm >= %(start)s AND payout_complete_dtm < %(end)s` 與 `t_session` 對應條件，得到訓練窗內列數；再以 schema 或取樣估計 bytes/row → `total_chunk_bytes_estimate`、`session_data_bytes`（session 窗內列數 × 列寬）。
+- **Chunk 數**：與 Parquet 相同邏輯（依 `training_days` 或 `--recent-chunks`）。每 chunk 對應約一個月時，`bytes_per_chunk = total_chunk_bytes_estimate / chunk_count`；Step 7 仍用 `total_chunk_bytes_estimate` 套用現有公式。
+- **Fallback**：若連線失敗或查詢不可用，則使用使用者提供的 `--estimated-bytes-per-chunk` / `--estimated-rows-per-day`（若提供），或保守預設並在報告中註明「未連線 ClickHouse，估計為預設值」。
+
+### Per-step 估計（兩來源共用公式，時間分叉）
+
+| Step | 輸入 | 輸出 | Parquet 專用 | ClickHouse 專用 |
+|------|------|------|--------------|------------------|
+| 3 | session_data_bytes, config | peak_ram_gb, time_min | 讀檔時間 ≈ session 大小／磁碟 throughput；DuckDB materialize 見 A02。 | 查詢時間 + 網路；RAM = 結果集大小（≈ session_data_bytes）。 |
+| 4 | session_data_bytes, preload, snapshot 數 | peak_ram_gb, time_min | Preload → peak = session 檔大小；無 preload → 每 snapshot 讀取 × 次數。 | 每 snapshot 一查詢；時間 = snapshot 數 × (查詢 + 傳輸)；RAM 每次約一 snapshot 結果集。 |
+| 6 | total_chunk_bytes / chunk_count, NEG_SAMPLE_FRAC | per_chunk_ram_gb, per_chunk_time_min | 單 chunk 讀取 + 處理；時間用 chunk 大小 × 常數。 | 單 chunk = 一次 CH 查詢結果；RAM 同；時間 = 查詢 + 傳輸 + 同 Parquet 處理。 |
+| 7 | total_chunk_bytes_estimate, CHUNK_CONCAT_RAM_FACTOR, TRAIN_SPLIT_FRAC | peak_ram_gb, time_min | 與現有 config 公式一致；時間用稽核數量級。 | 同一公式（chunk 總量來自 CH 查表）；時間同。 |
+| 8 / 9 | train 列數、OPTUNA_*、SCREEN_* | peak_ram_gb, time_min | 同稽核 A23/A24、A25–A27。 | 同。 |
+
+### 建議邏輯
+
+- **來源無關**：Step 7 peak 若 > available_ram × safety → 建議降 NEG_SAMPLE_FRAC 或 --days/--recent-chunks；建議 STEP7_USE_DUCKDB=True、STEP8_SCREEN_SAMPLE_ROWS=2000000（train 大時）、SCREEN_FEATURES_METHOD="lgbm"、TRAINER_USE_LOOKBACK=False；Step 9 依時間目標建議 OPTUNA_*；在安全與時間允許下建議可提高的 --days 或 NEG_SAMPLE_FRAC。
+- **Parquet 專用**：session_data_bytes 大且 available_ram 小 → 建議 --no-preload 或調低 PROFILE_PRELOAD_MAX_BYTES（A05）。
+- **ClickHouse 專用**：報告中註明總時間含「CH 查詢 + 網路」；若連線失敗則註明「CH 估計未取得，建議以 Parquet 匯出或手動提供 --estimated-*」。
+
+### 模組與 CLI
+
+- **模組**（如 `trainer/training_config_recommender.py`）：`get_system_resources()`、`build_data_profile_parquet(...)`、`build_data_profile_clickhouse(...)`（**內含實際連線與查 system.parts / COUNT(*) 取得表大小或列數**）、`estimate_per_step()`、`suggest_config()`。
+- **CLI**（如 `trainer/scripts/recommend_training_config.py`）：`--data-source parquet|clickhouse`；Parquet 用 `--chunk-dir`、`--session-parquet`、`--days`；ClickHouse 用 `--days` 並讀 config/.env 連線，**預設連線 CH 查表估計**，可選 `--no-ch-query` 改用手動 `--estimated-*`；輸出資源摘要、data profile、每步估計、建議參數與理由。
+
+### 實作順序建議
+
+| 順序 | 內容 |
+|------|------|
+| 1 | 資源偵測 + 共用 data profile 結構 + Parquet discovery（含 fallback）。 |
+| 2 | **ClickHouse data profile：實際連線 + 查 system.parts 或訓練窗 COUNT(*)，產出 total_chunk_bytes_estimate、session_data_bytes；連線失敗時 fallback 為 --estimated-* 或保守預設。** |
+| 3 | Per-step 估計（Step 3/4/6/7/8/9），公式引用稽核；依 data_source 分叉時間／備註。 |
+| 4 | 建議邏輯（OOM → 時間 → 資料量），含 Parquet/CH 專用建議。 |
+| 5 | CLI：--data-source、對應參數、報告輸出；CH 路徑預設執行查表估計。 |
+| 6 | 文件（稽核 doc 或新小節）；可選：pipeline 第一步 --recommend-only 呼叫同一 API。 |
+
+### 驗收要點
+
+- 獨立執行 CLI 時，Parquet 路徑能依 chunk_dir/session 檔產出 profile 與建議；ClickHouse 路徑在可連線時能依 **實際查表結果** 產出 chunk/session 估計與建議。
+- 連線 CH 失敗時，行為明確（fallback 或錯誤訊息），不影響 Parquet 路徑。
+- 報告標註估計為近似、公式出處為稽核文件。
 
 ---
 
