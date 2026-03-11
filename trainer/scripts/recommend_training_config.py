@@ -1,11 +1,12 @@
 """CLI for training config recommender (PLAN § training-config-recommender).
 
 Usage:
-  python -m trainer.scripts.recommend_training_config --data-source parquet --chunk-dir .data/chunks --session-parquet ../data/gmwds_t_session.parquet --days 30
+  python -m trainer.scripts.recommend_training_config --data-source parquet --days 30
   python -m trainer.scripts.recommend_training_config --data-source clickhouse --days 30
   python -m trainer.scripts.recommend_training_config --data-source clickhouse --days 30 --no-ch-query --estimated-bytes-per-chunk 209715200
 
-Output: Resources summary, data profile, per-step estimates, and suggested parameters.
+Parquet mode uses the same paths as the trainer (CHUNK_DIR, LOCAL_PARQUET_DIR) so no path args are needed.
+Optional --chunk-dir / --session-parquet override for testing. Output: resources, data profile, estimates, suggestions.
 """
 from __future__ import annotations
 
@@ -45,18 +46,18 @@ def _parse_args() -> argparse.Namespace:
         default=30,
         help="Training window in days (default 30).",
     )
-    # Parquet
+    # Parquet (defaults mirror trainer: CHUNK_DIR, LOCAL_PARQUET_DIR/gmwds_t_session.parquet)
     p.add_argument(
         "--chunk-dir",
         type=Path,
         default=None,
-        help="[Parquet] Directory containing chunk_*.parquet files (default trainer/.data/chunks).",
+        help="[Parquet] Override chunk directory (default: same as trainer CHUNK_DIR).",
     )
     p.add_argument(
         "--session-parquet",
         type=Path,
         default=None,
-        help="[Parquet] Path to session Parquet for session_data_bytes (optional).",
+        help="[Parquet] Override session Parquet path (default: same as trainer LOCAL_PARQUET_DIR/gmwds_t_session.parquet).",
     )
     # ClickHouse fallback when no query
     p.add_argument(
@@ -95,13 +96,27 @@ def main() -> int:
         logging.error("--days must be >= 1")
         return 2
 
+    # Parquet: use same paths as trainer (single source of truth) unless overridden
+    if args.data_source == "parquet":
+        from trainer.trainer import CHUNK_DIR, LOCAL_PARQUET_DIR  # noqa: E402
+
+        chunk_dir = args.chunk_dir
+        if chunk_dir is not None:
+            if not chunk_dir.is_absolute():
+                chunk_dir = (_REPO / "trainer" / chunk_dir).resolve()
+        else:
+            chunk_dir = CHUNK_DIR
+        session_path = args.session_parquet
+        if session_path is not None:
+            if not session_path.is_absolute():
+                session_path = (_REPO / session_path).resolve()
+        else:
+            session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+    else:
+        chunk_dir = None
+
     # Resource detection
-    chunk_dir = args.chunk_dir
-    if chunk_dir is not None and not chunk_dir.is_absolute():
-        chunk_dir = (_REPO / "trainer" / chunk_dir).resolve()
-    elif chunk_dir is None and args.data_source == "parquet":
-        chunk_dir = _REPO / "trainer" / ".data" / "chunks"
-    disk_path = chunk_dir if isinstance(chunk_dir, Path) else _REPO / "trainer" / ".data"
+    disk_path = chunk_dir if (chunk_dir is not None and isinstance(chunk_dir, Path)) else _REPO / "trainer" / ".data"
 
     try:
         import trainer.config as _config  # type: ignore[import]
@@ -117,11 +132,8 @@ def main() -> int:
     print("  Disk free:    %.1f GB" % resources.get("disk_available_gb", 0))
 
     if args.data_source == "parquet":
-        session_path = args.session_parquet
-        if session_path is not None and not session_path.is_absolute():
-            session_path = _REPO / session_path
         profile = build_data_profile_parquet(
-            chunk_dir or Path("."),
+            chunk_dir,
             args.days,
             session_parquet_path=session_path,
         )
@@ -147,6 +159,14 @@ def main() -> int:
             print("  %s: %.2f" % (k, v))
         else:
             print("  %s: %s" % (k, v))
+
+    # Total time (sum of step times) and peak RAM (max of step peaks)
+    time_keys = ["step3_time_min", "step4_time_min", "step6_total_time_min", "step7_time_min", "step8_time_min", "step9_time_min"]
+    ram_keys = ["step3_peak_ram_gb", "step4_peak_ram_gb", "step6_per_chunk_ram_gb", "step7_peak_ram_gb", "step8_peak_ram_gb", "step9_peak_ram_gb"]
+    total_time_min = sum(estimates.get(k, 0) for k in time_keys if isinstance(estimates.get(k), (int, float)))
+    peak_ram_gb = max((estimates.get(k, 0) for k in ram_keys if isinstance(estimates.get(k), (int, float))), default=0.0)
+    print("  total_time_min: %.2f" % total_time_min)
+    print("  peak_ram_gb: %.2f" % peak_ram_gb)
 
     suggestions = suggest_config(profile, resources, estimates)
     print("\n=== Suggestions ===")

@@ -176,40 +176,95 @@ def get_hc_history():
         return jsonify({"error": str(e)}), 500
 
 
-# --- get_validation endpoint ---
-@app.route("/get_validation", methods=["GET"])
-def get_validation():
-    ts = request.args.get("ts")
-    start = datetime.now()
-    try:
-        with get_db_conn() as conn:
-            df = pd.read_sql_query("SELECT * FROM validation_results", conn)
-    except Exception as e:
-        return jsonify({"results": [], "error": str(e)})
+# --- ML API Protocol (doc/ML_API_PROTOCOL.md): GET /alerts, GET /validation ---
+# Default: last 24h when no query params. Port 8001. Protocol fields only.
 
+def _alerts_24h_cutoff():
+    return datetime.now(HK_TZ) - timedelta(hours=24)
+
+
+def _validation_24h_cutoff():
+    return datetime.now(HK_TZ) - timedelta(hours=24)
+
+
+def _query_alerts_df(ts_param=None, limit_param=None, default_24h=False):
+    """Return alerts DataFrame with ts filter. If default_24h and no ts_param, restrict to last 24h. Optional limit when ts absent."""
+    with get_db_conn() as conn:
+        df = pd.read_sql_query("SELECT * FROM alerts", conn)
     if df.empty:
-        return jsonify({"results": []})
+        return df
+    df["ts_dt"] = pd.to_datetime(df["ts"], errors="coerce")
+    df = df.dropna(subset=["ts_dt"]).sort_values("ts_dt")
+    if ts_param:
+        try:
+            ts_dt = pd.to_datetime(ts_param)
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.tz_localize(HK_TZ)
+            else:
+                ts_dt = ts_dt.tz_convert(HK_TZ)
+            df = df[df["ts_dt"] > ts_dt]
+        except Exception:
+            pass
+    elif default_24h:
+        cutoff = _alerts_24h_cutoff()
+        df = df[df["ts_dt"] > cutoff]
+    if limit_param is not None:
+        try:
+            limit = int(limit_param)
+            if limit > 0:
+                df = df.tail(limit)
+        except (ValueError, TypeError):
+            pass
+    return df
 
+
+def _alerts_to_protocol_records(df):
+    """Shape alerts to ML_API_PROTOCOL.md: only protocol fields; casino_player_id null, is_known_player from is_rated_obs."""
+    if df.empty:
+        return []
+    df = df.copy()
+    df["ts"] = (
+        df["ts_dt"].dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        if df["ts_dt"].dt.tz is None
+        else df["ts_dt"].dt.tz_convert(HK_TZ)
+    )
+    df["ts"] = df["ts"].dt.floor("s").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+    protocol_keys = [
+        "bet_id", "ts", "bet_ts", "player_id", "casino_player_id", "table_id",
+        "position_idx", "session_id", "visit_avg_bet", "is_known_player",
+    ]
+    out = pd.DataFrame(index=df.index)
+    for k in ["bet_id", "ts", "bet_ts", "player_id", "table_id", "position_idx", "session_id", "visit_avg_bet"]:
+        out[k] = df[k] if k in df.columns else None
+    out["casino_player_id"] = None
+    out["is_known_player"] = df["is_rated_obs"].fillna(0).astype(int) if "is_rated_obs" in df.columns else 0
+    out = out[protocol_keys]
+    out = out.replace({np.nan: None, np.inf: None, -np.inf: None})
+    return out.to_dict(orient="records")
+
+
+def _query_validation_df(ts_param=None, bet_id_param=None, bet_ids_param=None, default_24h=False):
+    """Return validation_results DataFrame with filters. If default_24h and no ts/bet_id/bet_ids => last 24h."""
+    with get_db_conn() as conn:
+        df = pd.read_sql_query("SELECT * FROM validation_results", conn)
+    if df.empty:
+        return df
     df["validated_at"] = pd.to_datetime(df["validated_at"], errors="coerce")
     df = df.dropna(subset=["validated_at"]).sort_values("validated_at")
-
-    bet_id = request.args.get('bet_id')
-    bet_ids = request.args.get('bet_ids')
-    if bet_ids:
+    if bet_ids_param:
         try:
-            ids = [s.strip() for s in str(bet_ids).split(',') if s.strip()]
+            ids = [s.strip() for s in str(bet_ids_param).split(",") if s.strip()]
             df = df[df["bet_id"].astype(str).isin(ids)]
         except Exception:
             pass
-    elif bet_id:
+    elif bet_id_param:
         try:
-            df = df[df["bet_id"].astype(str) == str(bet_id)]
+            df = df[df["bet_id"].astype(str) == str(bet_id_param)]
         except Exception:
             pass
-
-    if ts:
+    if ts_param:
         try:
-            ts_dt = pd.to_datetime(ts)
+            ts_dt = pd.to_datetime(ts_param)
             if ts_dt.tzinfo is None:
                 ts_dt = ts_dt.tz_localize(HK_TZ)
             else:
@@ -217,17 +272,24 @@ def get_validation():
             df = df[df["validated_at"] > ts_dt]
         except Exception:
             pass
+    elif default_24h and not bet_id_param and not bet_ids_param:
+        cutoff = _validation_24h_cutoff()
+        df = df[df["validated_at"] > cutoff]
+    return df
 
+
+def _validation_to_protocol_records(df):
+    """Shape validation to ML_API_PROTOCOL.md: TP as string, casino_player_id null."""
     if df.empty:
-        return jsonify({"results": []})
-
+        return []
     out = df[["alert_ts", "player_id", "bet_id", "gap_start", "result", "validated_at", "reason", "bet_ts"]].rename(columns={
         "alert_ts": "ts",
         "gap_start": "walkaway_ts",
-        "result": "TP",
-        "validated_at": "sync_ts"
+        "validated_at": "sync_ts",
     }).copy()
-
+    out["TP"] = out["result"].apply(lambda x: "TP" if x in (1, True, 1.0) else "FP")
+    out = out.drop(columns=["result"], errors="ignore")
+    out["casino_player_id"] = None
     for col in ["ts", "walkaway_ts", "sync_ts", "bet_ts"]:
         dt_col = pd.to_datetime(out[col], errors="coerce")
         if getattr(dt_col.dt, "tz", None) is None:
@@ -235,7 +297,64 @@ def get_validation():
         else:
             dt_col = dt_col.dt.tz_convert(HK_TZ)
         out[col] = dt_col.dt.floor("s").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+    out = out[["ts", "player_id", "casino_player_id", "bet_id", "walkaway_ts", "TP", "sync_ts", "reason", "bet_ts"]]
+    out = out.replace({np.nan: None, np.inf: None, -np.inf: None})
+    return out.to_dict(orient="records")
 
+
+@app.route("/alerts", methods=["GET"])
+def ml_alerts():
+    """GET /alerts per doc/ML_API_PROTOCOL.md: ts (after), limit (when ts absent); default last 24h; protocol fields only."""
+    ts_param = request.args.get("ts")
+    limit_param = request.args.get("limit")
+    df = _query_alerts_df(ts_param=ts_param, limit_param=limit_param, default_24h=True)
+    records = _alerts_to_protocol_records(df)
+    resp = jsonify({"alerts": records})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/validation", methods=["GET"])
+def ml_validation():
+    """GET /validation per doc/ML_API_PROTOCOL.md: ts, bet_id, bet_ids; default last 24h; protocol fields only."""
+    ts_param = request.args.get("ts")
+    bet_id_param = request.args.get("bet_id")
+    bet_ids_param = request.args.get("bet_ids")
+    df = _query_validation_df(ts_param=ts_param, bet_id_param=bet_id_param, bet_ids_param=bet_ids_param, default_24h=True)
+    records = _validation_to_protocol_records(df)
+    resp = jsonify({"results": records})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+# --- get_validation endpoint (legacy: full result column, no 24h default) ---
+@app.route("/get_validation", methods=["GET"])
+def get_validation():
+    start = datetime.now()
+    try:
+        df = _query_validation_df(
+            ts_param=request.args.get("ts"),
+            bet_id_param=request.args.get("bet_id"),
+            bet_ids_param=request.args.get("bet_ids"),
+            default_24h=False,
+        )
+    except Exception as e:
+        return jsonify({"results": [], "error": str(e)})
+    if df.empty:
+        return jsonify({"results": []})
+    out = df[["alert_ts", "player_id", "bet_id", "gap_start", "result", "validated_at", "reason", "bet_ts"]].rename(columns={
+        "alert_ts": "ts",
+        "gap_start": "walkaway_ts",
+        "result": "TP",
+        "validated_at": "sync_ts"
+    }).copy()
+    for col in ["ts", "walkaway_ts", "sync_ts", "bet_ts"]:
+        dt_col = pd.to_datetime(out[col], errors="coerce")
+        if getattr(dt_col.dt, "tz", None) is None:
+            dt_col = dt_col.dt.tz_localize(HK_TZ)
+        else:
+            dt_col = dt_col.dt.tz_convert(HK_TZ)
+        out[col] = dt_col.dt.floor("s").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
     out = out.replace({np.nan: None, np.inf: None, -np.inf: None})
     results = out.to_dict(orient="records")
     print(f"[api] get_validation: {len(results)} rows in {(datetime.now()-start).total_seconds():.3f}s")
@@ -245,44 +364,32 @@ def get_validation():
 
 @app.route("/get_alerts", methods=["GET"])
 def get_alerts():
+    """Legacy: full alert rows. For protocol use GET /alerts."""
     ts = request.args.get("ts")
     start = datetime.now()
     try:
-        with get_db_conn() as conn:
-            df = pd.read_sql_query("SELECT * FROM alerts", conn)
+        # Legacy: no 24h default when ts absent; limit not applied
+        df = _query_alerts_df(ts_param=ts, limit_param=None, default_24h=False)
+        if df.empty:
+            return jsonify({"alerts": []})
+        df["ts"] = (
+            df["ts_dt"].dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+            if df["ts_dt"].dt.tz is None
+            else df["ts_dt"].dt.tz_convert(HK_TZ)
+        )
+        df["ts"] = df["ts"].dt.floor("s").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+        df_out = df.drop(columns=["ts_dt"], errors="ignore").replace({np.nan: None, np.inf: None, -np.inf: None})
+        alerts = df_out.to_dict(orient="records")
     except Exception as e:
         return jsonify({"alerts": [], "error": str(e)})
-
-    if df.empty:
-        return jsonify({"alerts": []})
-
-    df["ts_dt"] = pd.to_datetime(df["ts"], errors="coerce")
-    df = df.dropna(subset=["ts_dt"]).sort_values("ts_dt")
-
-    if ts:
-        try:
-            ts_dt = pd.to_datetime(ts)
-            if ts_dt.tzinfo is None:
-                ts_dt = ts_dt.tz_localize(HK_TZ)
-            else:
-                ts_dt = ts_dt.tz_convert(HK_TZ)
-            df = df[df["ts_dt"] > ts_dt]
-        except Exception:
-            pass
-
-    if df.empty:
-        return jsonify({"alerts": []})
-
-    df["ts"] = df["ts_dt"].dt.tz_localize(HK_TZ, ambiguous='NaT', nonexistent='shift_forward') if df["ts_dt"].dt.tz is None else df["ts_dt"].dt.tz_convert(HK_TZ)
-    df["ts"] = df["ts"].dt.floor("s").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
-
-    df_out = df.drop(columns=["ts_dt"]).replace({np.nan: None, np.inf: None, -np.inf: None})
-    alerts = df_out.to_dict(orient="records")
     print(f"[api] get_alerts: {len(alerts)} rows in {(datetime.now()-start).total_seconds():.3f}s")
     resp = jsonify({"alerts": alerts})
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
 if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("ML_API_PORT", "8001"))
     print(f" * SQLite Path: {STATE_DB_PATH}")
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    print(f" * ML API: http://localhost:{port}/alerts, http://localhost:{port}/validation")
+    app.run(host="0.0.0.0", port=port, debug=True)

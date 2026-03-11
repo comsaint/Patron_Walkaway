@@ -6,6 +6,24 @@
 
 ---
 
+## Recommender path alignment with trainer (parquet mode)
+
+**Date**: 2026-03-11
+
+### 問題
+`recommend_training_config` 在 parquet 模式下要求使用者傳 `--session-parquet` / `--chunk-dir`，且相對路徑是對 `_REPO` 解析，導致 `../data/...` 指到 repo 上一層目錄而非與 trainer 相同的 `data/`，造成 `session_data_bytes: 0`、Step 3 估計 0、與實際執行 OOM 在 Step 3 不一致。
+
+### 修改
+| 檔案 | 修改摘要 |
+|------|---------|
+| `trainer/scripts/recommend_training_config.py` | Parquet 模式改為與 trainer 同一套路徑：從 `trainer.trainer` 匯入 `CHUNK_DIR`、`LOCAL_PARQUET_DIR`，預設 `chunk_dir=CHUNK_DIR`、`session_path=LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"`，不再要求使用者傳路徑。`--chunk-dir` / `--session-parquet` 改為選填覆寫（測試用）。Docstring 範例改為 `--data-source parquet --days 30`，並說明路徑與 trainer 一致。 |
+
+### 備註
+- 目錄搬遷時只需改 trainer 的常數，recommender 會自動一致。
+- 執行 `python -m trainer.scripts.recommend_training_config --data-source parquet --days 30` 即可，無需傳路徑；若有 session 檔，`session_data_bytes` 與 Step 3 估計會正確。
+
+---
+
 ## validator KeyError 修復（首次 finalize 為 MATCH 時崩潰）
 
 ### 問題
