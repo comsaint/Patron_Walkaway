@@ -59,7 +59,7 @@ If neither is given, returns alerts from the **last 24 hours**.
 | `bet_ts` | Original bet timestamp |
 | `bet_id` | Bet identifier |
 | `player_id` | Player identifier |
-| `casino_player_id` | Casino-assigned player ID (reserved, currently `null`) |
+| `casino_player_id` | Casino-assigned player ID |
 | `table_id` | Table identifier |
 | `position_idx` | Seat position |
 | `session_id` | Session identifier |
@@ -108,7 +108,7 @@ If none given, returns results from the **last 24 hours**.
 |---------------|---------|
 | `ts`          | Original alert timestamp |
 | `player_id`   | Player identifier |
-| `casino_player_id` | Casino-assigned player ID (reserved, currently `null`) |
+| `casino_player_id` | Casino-assigned player ID |
 | `bet_id`      | Bet identifier |
 | `walkaway_ts` | When the player actually walked away (`null` if MISS) |
 | `TP`          | Validation result (`TP` = true positive, etc.) |
