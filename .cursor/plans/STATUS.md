@@ -1233,3 +1233,223 @@ warning 摘要：
 - 將 `features_candidates.template.yaml` 落實為環境可切換的 active spec（例如 `features_active.yaml`）以便部署端固定版本。
 
 ---
+
+## ML API：populate casino_player_id（PLAN § Populate casino_player_id in ML API）
+
+**Date**: 2026-03-12
+
+### 第一輪：Scorer（1.1–1.3）
+
+#### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|----------|
+| `trainer/scorer.py` | **1.1** `build_features_for_scoring`：與 sessions merge 時一併帶入 `casino_player_id`（`merge_cols` 含 `casino_player_id` 若 sess_df 有此欄）；merge 後若無該欄則補 `bets_df["casino_player_id"] = pd.NA`。**1.2** `_NEW_ALERT_COLS` 新增 `("casino_player_id", "TEXT")`，既有 DB 經 `init_state_db` 會 ALTER 新增該欄。**1.3** `append_alerts`：row tuple 與 INSERT 欄位新增 `casino_player_id`（在 player_id 後）；ON CONFLICT DO UPDATE SET 增加 `casino_player_id=excluded.casino_player_id`。 |
+
+#### 手動驗證
+
+1. 有 ClickHouse 時：`python -m trainer.scorer --once --lookback-hours 2`，確認無報錯；若有 rated 警報，可 `sqlite3 trainer/local_state/state.db "SELECT bet_id, player_id, casino_player_id FROM alerts LIMIT 5"` 檢查新寫入的 alert 是否帶 `casino_player_id`（rated 來自 session 應有值）。
+2. 無 DB 時：`python -c "from trainer.scorer import init_state_db; import sqlite3; from trainer.scorer import STATE_DB_PATH; init_state_db(); print([r[1] for r in sqlite3.connect(STATE_DB_PATH).execute('PRAGMA table_info(alerts)').fetchall()])"`，確認 `casino_player_id` 在 alerts 表欄位列表中。
+
+#### 下一步建議
+
+- 實作 Validator（2.1–2.4）：`_NEW_VAL_COLS`、`VALIDATION_COLUMNS`、`validate_alert_row` 的 `res_base["casino_player_id"]`、`save_validation_results` 的 row 與 INSERT。
+
+### 第二輪：Validator（2.1–2.4）
+
+#### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|----------|
+| `trainer/validator.py` | **2.1** `_NEW_VAL_COLS` 新增 `("casino_player_id", "TEXT")`。**2.2** `VALIDATION_COLUMNS` 在 `player_id` 後新增 `"casino_player_id"`。**2.3** `validate_alert_row` 的 `res_base.update` 新增 `"casino_player_id": row.get("casino_player_id")`（NaN 時 None）。**2.4** `save_validation_results`：row tuple 與 INSERT 欄位新增 `casino_player_id`（在 player_id 與 canonical_id 之間）；ON CONFLICT 增加 `casino_player_id=excluded.casino_player_id`。 |
+
+#### 手動驗證
+
+1. 先跑 scorer 寫入至少一筆帶 `casino_player_id` 的 alert，再跑 `python -m trainer.validator --once`，確認無報錯。
+2. `sqlite3 trainer/local_state/state.db "SELECT bet_id, player_id, casino_player_id FROM validation_results LIMIT 5"` 檢查新寫入的 validation 是否帶 `casino_player_id`。
+
+#### 下一步建議
+
+- 實作 API 層（§3）：`trainer/api_server.py` 與 `package/deploy/main.py` 的 protocol 轉換改為從 df 讀取 `casino_player_id`。
+
+### 第三輪：API 層（§3）
+
+#### 改了哪些檔
+
+| 檔案 | 改動摘要 |
+|------|----------|
+| `trainer/api_server.py` | `_alerts_to_protocol_records`：`out["casino_player_id"]` 改為 `df["casino_player_id"] if "casino_player_id" in df.columns else None`。`_validation_to_protocol_records`：同上，從 `df` 讀取 `casino_player_id`。 |
+| `package/deploy/main.py` | 同上：`_alerts_to_protocol_records`、`_validation_to_protocol_records` 改為從查詢結果 DataFrame 讀取 `casino_player_id`（有則用，無則 None）。 |
+
+#### 手動驗證
+
+1. 啟動 API：`STATE_DB_PATH=trainer/local_state/state.db python -m trainer.api_server`（或從專案根目錄跑，依專案設定）。
+2. 若有已寫入的 alerts：`curl -s "http://localhost:8001/alerts"`，檢查回應中每筆 alert 的 `casino_player_id` 是否為 DB 內值（或 null）。
+3. 若有 validation 結果：`curl -s "http://localhost:8001/validation"`，檢查每筆 result 的 `casino_player_id`。
+
+#### 下一步建議
+
+- 端到端：跑一輪 scorer → validator，再呼叫 `GET /alerts`、`GET /validation`，確認 rated 警報/結果的 `casino_player_id` 非 null、格式符合 `package/ML_API_PROTOCOL.md`。
+- 可選：更新 `package/README.md` 或 `package/PLAN.md` 註明 `casino_player_id` 已由後端填入；可選更新 `package/ML_API_PROTOCOL.md` 範例 JSON 為範例值並加註。
+
+---
+
+## Code Review：ML API populate casino_player_id 變更（2026-03-12）
+
+**範圍**：PLAN § Populate casino_player_id 實作（scorer / validator / api_server / package/deploy/main.py）。以下僅列最可能的 bug、邊界條件、安全性與效能問題，並附具體修改建議與建議新增測試；不重寫整套。
+
+---
+
+### 1. 邊界條件：空字串未正規化為 null
+
+**問題**：協定與 FND-03 語意將「空字串」視為無效 casino_player_id；目前 scorer 的 `_s()`、validator 的 `res_base["casino_player_id"]`、API 皆未將 `""` 正規化為 `null`。若來源（ClickHouse / 既有 DB）出現 `casino_player_id = ''`，會一路寫入並回傳空字串，與「無卡」語意不符。
+
+**具體修改建議**：
+- **scorer**：在 `append_alerts` 中對 `casino_player_id` 做與 config 一致的清洗，例如 `_s(getattr(r, "casino_player_id", None))` 後若為 `""` 改為 `None`；或抽成小函數 `_cid(v) -> Optional[str]`：`None`/`pd.NA`/空字串/僅空白 → `None`，否則 `str(v).strip()`。
+- **validator**：`validate_alert_row` 裡 `casino_player_id` 設值時，若 `row.get("casino_player_id")` 經 `str(...).strip()` 後為空，改為 `None`。
+- **API**：可選在 protocol 輸出前將 `casino_player_id == ""` 改為 `None`，或依賴上游已正規化。
+
+**希望新增的測試**：
+- 單元：`append_alerts` 或 `_s`/輔助函數：給定 `casino_player_id in ("", "  ")` 時，寫入 DB 的該欄為 `NULL`。
+- 單元：`validate_alert_row` 在 `row["casino_player_id"] == ""` 時，`res_base["casino_player_id"] is None`。
+- 可選：API `_alerts_to_protocol_records` / `_validation_to_protocol_records` 當 df 中 `casino_player_id` 為 `""` 時，輸出為 `null`（若由 API 層正規化）。
+
+---
+
+### 2. 邊界條件：API 層 casino_player_id 型別未強制為字串或 null
+
+**問題**：SQLite 無嚴格外型，`casino_player_id` 可能被讀成 `float`（例如舊資料或匯入異常）。`out["casino_player_id"] = df["casino_player_id"]` 後直接 to_dict，JSON 可能出現數字或非字串型別，偏離協定「字串或 null」。
+
+**具體修改建議**：
+- 在 `_alerts_to_protocol_records`、`_validation_to_protocol_records`（api_server 與 deploy main）中，對 `casino_player_id` 做輸出前正規化：若為 `pd.isna` 或 `None` 則 `None`；否則 `str(v).strip()`，若結果為 `""` 則 `None`。如此協定回應一律為 `string | null`。
+
+**希望新增的測試**：
+- 單元：`_alerts_to_protocol_records(df)` 當 `df["casino_player_id"]` 為 `1.0` 或 `np.nan` 時，輸出 records 中該欄為 `"1"` 或 `null`（依上述規則）。
+- 同上對 `_validation_to_protocol_records`。
+
+---
+
+### 3. 邊界條件：Validator 從 alert row 取 casino_player_id 的 key 缺失
+
+**問題**：既有 DB 若尚未執行 validator 的 ALTER（或 alerts 表為舊 schema），`parse_alerts` 回傳的 row 可能沒有 `casino_player_id` 鍵。目前使用 `row.get("casino_player_id")`，鍵缺失時為 `None`，行為正確；但若未來改為 `row["casino_player_id"]` 會 KeyError。
+
+**具體修改建議**：
+- 維持使用 `row.get("casino_player_id")`，並在註解或 docstring 註明「alert 可能來自舊 schema，需用 .get」。
+
+**希望新增的測試**：
+- 單元：`validate_alert_row` 傳入的 `row` 無 `casino_player_id` 鍵（或 `row` 為僅含必要鍵的 dict），不拋錯且 `res_base["casino_player_id"] is None`。
+
+---
+
+### 4. 正確性：final_df 來自舊 validation_results 時缺少 casino_player_id 欄
+
+**問題**：`existing_results` 若含遷移前寫入的舊 row（`to_dict()` 無 `casino_player_id`），`pd.DataFrame(list(existing_results.values()))` 可能無該欄。目前 `save_validation_results` 前有 `for col in VALIDATION_COLUMNS: if col not in final_df.columns: final_df[col] = None`，故不會 KeyError，且 `getattr(r, "casino_player_id", None)` 會寫入 `NULL`。
+
+**具體修改建議**：
+- 無需改邏輯；可在該迴圈旁加註「含 migration 後新增的 casino_player_id，舊 row 無此鍵時補 None」。
+
+**希望新增的測試**：
+- 單元：`save_validation_results(conn, final_df)` 當 `final_df` 無 `casino_player_id` 欄（僅有其它 VALIDATION_COLUMNS）時，INSERT 不報錯且該欄寫入為 `NULL`（可查 DB 或 mock executemany 檢查參數）。
+
+---
+
+### 5. 效能
+
+**問題**：新增一欄 merge、一欄 INSERT、API 多一次欄位賦值，資料量與現有管線同階，無額外迴圈或大物件複製。
+
+**具體修改建議**：無。
+
+**希望新增的測試**：無。
+
+---
+
+### 6. 安全性
+
+**問題**：`casino_player_id` 為 PII，但協定本就定義該欄，此次僅改為從 DB 填入而非固定 null，未擴大暴露範圍。寫入皆經參數化（INSERT ?）與 `_s()` 等轉字串，未見 SQL 拼接或使用者輸入直接寫入該欄。
+
+**具體修改建議**：無。若產品要求「僅在必要時回傳」，可於 API 層依 role 或 feature flag 將 `casino_player_id` 強制改為 `null`（本次不實作）。
+
+**希望新增的測試**：無（或可選：API 回傳欄位不包含未經允許的額外鍵）。
+
+---
+
+### 7. 小結與建議優先順序
+
+| 優先 | 項目 | 建議 |
+|------|------|------|
+| 1 | 空字串正規化（§1） | 上游 scorer/validator 將 `""` 視為 null，避免語意與 FND-03 不一致。 |
+| 2 | API 輸出型別（§2） | 協定輸出強制為 `string \| null`，避免 SQLite 型別滲漏到 JSON。 |
+| 3 | 邊界與舊 schema（§3、§4） | 以註解與單元測試鎖定 .get / 缺欄補 None 行為即可。 |
+
+以上結果已追加至 STATUS.md，後續可依優先順序補實作與測試。
+
+---
+
+## 新增測試：Code Review casino_player_id 風險點（2026-03-12）
+
+**對應**：STATUS.md「Code Review：ML API populate casino_player_id 變更」§1–§4。僅新增 tests，未改 production code。
+
+### 新增檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/test_review_risks_casino_player_id.py` | 將 Reviewer 風險點轉成最小可重現測試（或契約測試）。 |
+
+### 測試與 Review 對應
+
+| Review 項 | 測試類／方法 | 契約／預期 |
+|-----------|--------------|------------|
+| **§1 空字串未正規化** | `TestAppendAlertsCasinoPlayerIdEmptyString`：`test_append_alerts_casino_player_id_empty_string_writes_null`、`test_append_alerts_casino_player_id_whitespace_writes_null` | 當 `casino_player_id` 為 `""` 或 `"  "` 時，寫入 DB 應為 `NULL`。**目前無正規化，兩者會 FAIL**。 |
+| **§1 同上** | `TestValidateAlertRowCasinoPlayerIdEmptyString`：`test_validate_alert_row_casino_player_id_empty_string_yields_none` | `row["casino_player_id"] == ""` 時，`res_base["casino_player_id"]` 應為 `None`。**目前會 FAIL**。 |
+| **§2 API 型別** | `TestApiAlertsProtocolCasinoPlayerIdType`：`test_alerts_protocol_casino_player_id_float_becomes_str_or_none`、`test_alerts_protocol_casino_player_id_nan_becomes_none` | 輸出欄位 `casino_player_id` 應為 `str` 或 `None`；`np.nan` 應變 `None`。**float 目前會 FAIL**，nan 已 PASS。 |
+| **§2 同上** | `TestApiValidationProtocolCasinoPlayerIdType`：`test_validation_protocol_casino_player_id_float_becomes_str_or_none` | 同上，validation 協定。**目前會 FAIL**。 |
+| **§3 row 缺 key** | `TestValidateAlertRowMissingCasinoPlayerIdKey`：`test_validate_alert_row_missing_casino_player_id_key_no_raise` | `row` 無 `casino_player_id` 鍵時不 KeyError，且 `res_base["casino_player_id"] is None`。**已 PASS**。 |
+| **§4 final_df 缺欄** | `TestSaveValidationResultsMissingCasinoPlayerIdColumn`：`test_save_validation_results_missing_casino_player_id_column_no_raise` | `final_df` 無 `casino_player_id` 欄時 INSERT 不報錯，該欄寫入 `NULL`。**已 PASS**。 |
+
+### 執行方式
+
+```bash
+# 專案根目錄下執行
+python -m pytest tests/test_review_risks_casino_player_id.py -v
+
+# 僅跑本檔、簡短 traceback
+python -m pytest tests/test_review_risks_casino_player_id.py -v --tb=short
+```
+
+**預期結果**：目前 3 passed、5 failed。5 個失敗為契約測試（§1 空字串正規化、§2 API 輸出型別），待 production 依 Review 建議補正規化後應全過。
+
+---
+
+## 本輪：Code Review casino_player_id 修補完成（2026-03-12）
+
+### 目標
+依 STATUS「Code Review：ML API populate casino_player_id 變更」§1–§2，僅改 production 與必要 fixture，使 tests/typecheck/lint 通過；每輪結果追加 STATUS；最後修訂 PLAN 狀態並回報剩餘項目。
+
+### Production 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/validator.py` | 新增 `_norm_casino_player_id(v)`：None/pd.isna/空或僅空白 → None，否則 `str(v).strip()` 或 None；`validate_alert_row` 的 `res_base["casino_player_id"]` 改為 `_norm_casino_player_id(row.get("casino_player_id"))`。 |
+| `trainer/api_server.py` | `_alerts_to_protocol_records`、`_validation_to_protocol_records`：`casino_player_id` 改為依欄存在與否用 `df["casino_player_id"].apply(lambda v: None if (v is None or pd.isna(v)) else (str(v).strip() or None))` 正規化，輸出一律 `str` 或 `None`。 |
+| `package/deploy/main.py` | 同上，兩處 protocol 轉換對 `casino_player_id` 做相同正規化。 |
+
+### 測試／Fixture 修改（僅 schema 補齊）
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `tests/test_review_risks_validator_round393.py` | `_conn_with_validation_results()` 的 CREATE TABLE 補上 `casino_player_id TEXT`（在 player_id 與 canonical_id 之間），與現行 `VALIDATION_COLUMNS` 一致，否則 `save_validation_results` 會因缺欄報錯。 |
+
+### 驗證結果
+
+- **casino_player_id 專用測試**：`python -m pytest tests/test_review_risks_casino_player_id.py -v` → **8 passed**。
+- **validator round393 + casino_player_id**：`python -m pytest tests/test_review_risks_validator_round393.py tests/test_review_risks_casino_player_id.py -v` → **15 passed**。
+- **全量測試**：`python -m pytest tests/ -q` → **996 passed, 7 failed, 42 skipped**。7 個失敗皆為既存（lookback/run_boundary 之 numba 與 Python fallback 語意／parity），與本輪 casino_player_id 變更無關。
+- **Typecheck**：`python -m mypy trainer/ package/deploy/main.py --ignore-missing-imports` → **Success: no issues found in 26 source files**。
+- **Lint**：`ruff check trainer/validator.py trainer/api_server.py package/deploy/main.py` → **All checks passed**。
+
+### PLAN.md
+
+- `ml-api-casino-player-id` 已為 `status: completed`，本輪未改 PLAN 狀態。
+- 與「Populate casino_player_id in ML API」相關項目已全部完成；無剩餘待辦。
+
+---

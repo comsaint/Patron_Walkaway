@@ -122,6 +122,9 @@ todos:
   - id: deploy-dec028-fixes
     content: "Deploy DEC-028 修補：scorer DATA_DIR 空/空白→未設定、build profile 複製 try/except、deploy main E402 noqa、scorer _DATA_DIR 型別；tests/typecheck/lint 全過。"
     status: completed
+  - id: ml-api-casino-player-id
+    content: "ML API：populate casino_player_id（scorer/validator/API + deploy main）；見「Populate casino_player_id in ML API（Protocol Update）」一節。"
+    status: completed
 isProject: false
 ---
 
@@ -187,6 +190,69 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 **建議實作順序**：可選／後續見下方各節（Step 7 out-of-core 排序、Optuna early stop 等）。
 
 **可選／後續**（非阻斷）：(1) OOM 預檢查已於 Round 210/211/212 實作，視為 **completed**（見上表項目 17）。(2) Round 222 Review production 補強見上表項目 18 與下方「Round 222 Review production 補強（實作計畫）」一節。(3) **項目 19** Track Human Lookback 向量化已完成（見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 `doc/track_human_lookback_vectorization_plan.md`）。
+
+---
+
+## Populate casino_player_id in ML API（Protocol Update）
+
+**目標**：依 `package/ML_API_PROTOCOL.md` 更新，讓 `GET /alerts` 與 `GET /validation` 的 `casino_player_id` 欄位改為從資料庫實際填入，不再固定為 `null`。
+
+**參考**：協定中 `/alerts`、`/validation` 回應皆包含 `casino_player_id`（Casino-assigned player ID）；資料來源為 `t_session.casino_player_id`（scorer 已查詢，目前未往下游傳遞）。
+
+**資料流**：
+- **GET /alerts**：API 從 state.db 的 **alerts** 表讀出；值由 **scorer** 寫入（scorer 從 ClickHouse t_session 的 session 查詢取得 casino_player_id，經 session_id merge 到 bet，寫入 alerts）。
+- **GET /validation**：API 從 state.db 的 **validation_results** 表讀出；值由 **validator** 寫入（validator 從該筆 alert 的 row 複製 casino_player_id 到 validation 結果）。
+
+### 1. trainer/scorer.py
+
+| 項目 | 說明 |
+|------|------|
+| **1.1 特徵/alert 管線帶上 casino_player_id** | 在 `build_features_for_scoring` 中，與 sessions 的 merge 目前只帶入 `["session_id", "session_start_dtm", "session_end_dtm"]`。改為一併帶入 `casino_player_id`（即 `sess_df[["session_id", "session_start_dtm", "session_end_dtm", "casino_player_id"]]`），使 `features_all` / `alert_candidates` 每筆都有 `casino_player_id`。 |
+| **1.2 alerts 表 schema** | 在 `init_state_db` 的 Phase-1 遷移區塊中，將 `("casino_player_id", "TEXT")` 加入與 `_NEW_ALERT_COLS` 同類的遷移邏輯（或擴充 `_NEW_ALERT_COLS`），對既有 DB 執行 `ALTER TABLE alerts ADD COLUMN casino_player_id TEXT`（若尚不存在）。 |
+| **1.3 寫入 alert 時寫入 casino_player_id** | 在 `append_alerts` 中：從 `alerts_df` 的每列讀取 `casino_player_id`（例如 `getattr(r, "casino_player_id", None)`），納入 `rows` 的 tuple；在 `INSERT INTO alerts(...)` 與 `ON CONFLICT ... DO UPDATE SET` 中皆加入 `casino_player_id` 欄位，確保新寫入與更新時都會寫入該值。 |
+
+**注意**：Rated 觀測的 `casino_player_id` 來自 session（H3 路由已用）；未 rated 或 session 無卡號時可為 `NULL`，與協定「可為 null」一致。
+
+### 2. trainer/validator.py
+
+| 項目 | 說明 |
+|------|------|
+| **2.1 validation_results 表** | 在 `_NEW_VAL_COLS` 中新增 `("casino_player_id", "TEXT")`，與既有遷移一樣在 `get_db_conn` 的 `PRAGMA table_info(validation_results)` 遷移區塊中執行 `ALTER TABLE validation_results ADD COLUMN casino_player_id TEXT`（若不存在）。 |
+| **2.2 VALIDATION_COLUMNS** | 在 `VALIDATION_COLUMNS` 中加入 `"casino_player_id"`（建議放在 `player_id` 之後，與協定欄位順序一致）。 |
+| **2.3 驗證結果帶出 casino_player_id** | 在 `validate_alert_row` 組裝 `res_base` 時，從 alert 列讀取 `casino_player_id`（例如 `row.get("casino_player_id")`），寫入 `res_base["casino_player_id"]`。如此 validator 輸出的每筆結果都帶有與該 alert 對應的 casino_player_id（來源為 scorer 寫入的 alerts 表）。 |
+| **2.4 寫入 DB** | 在 `save_validation_results` 中：從 `final_df` 讀取 `casino_player_id`（若無則 None），加入每筆 row 的 tuple，並在 `INSERT INTO validation_results(...)` 與 `ON CONFLICT ... DO UPDATE SET` 中皆包含 `casino_player_id`。 |
+
+**注意**：Validator 從 `parse_alerts(conn)` 取得 alert 列；一旦 scorer 在 alerts 表寫入 `casino_player_id`，這裡即可從 `row` 取得並一路寫入 validation 結果與 API 查詢結果。
+
+### 3. API 層：讀出並回傳 casino_player_id
+
+| 檔案 | 修改 |
+|------|------|
+| **trainer/api_server.py** | **`_alerts_to_protocol_records`**：刪除 `out["casino_player_id"] = None`。改為：若 `df` 有 `casino_player_id` 欄位則 `out["casino_player_id"] = df["casino_player_id"]`（或對齊 index 後賦值），否則 `out["casino_player_id"]` 為 None。**`_validation_to_protocol_records`**：同上，改為從 `df["casino_player_id"]` 取值（若存在），否則 None。 |
+| **package/deploy/main.py** | 與 api_server 相同邏輯：在 `_alerts_to_protocol_records` 與 `_validation_to_protocol_records` 中改為從查詢結果 DataFrame 讀取 `casino_player_id`（有則用，無則 None），不再強制 `None`。 |
+
+### 4. package/ 打包與部署
+
+| 項目 | 說明 |
+|------|------|
+| **4.1 程式來源** | 部署包使用 `walkaway_ml` wheel（來自目前 `trainer/`），scorer / validator 的變更會隨下次 build 一併打包，無需在 `build_deploy_package.py` 或 `package_model_bundle.py` 加額外步驟。 |
+| **4.2 部署用 API** | `package/deploy/main.py` 內含獨立的 `_alerts_to_protocol_records` 與 `_validation_to_protocol_records`，必須依上述 §3 同步修改，否則部署環境仍會回傳 `casino_player_id: null`。 |
+| **4.3 文件** | 可於 `package/README.md` 或 `package/PLAN.md` 註明：ML API 依 `ML_API_PROTOCOL.md` 回傳之 `casino_player_id` 已由後端從 session 解析並填入（rated 有值，未 rated 可為 null）。 |
+| **4.4 既有部署升級** | 既有 state.db 升級時，scorer 的 `init_state_db` 會對 alerts 做 ALTER 新增 `casino_player_id`；validator 的 `get_db_conn` 會對 validation_results 做 ALTER。新寫入的 alert/validation 會帶 `casino_player_id`；舊資料該欄為 NULL，符合協定。 |
+
+### 5. 實作順序建議
+
+1. **scorer**：1.1 → 1.2 → 1.3（先讓 alert 管線與 DB 具備 casino_player_id）。
+2. **validator**：2.1 → 2.2 → 2.3 → 2.4（schema、結果結構、寫入 DB）。
+3. **API**：同時改 `trainer/api_server.py` 與 `package/deploy/main.py` 的兩處 protocol 轉換。
+4. **文件**：更新 `package/README.md` 或 `package/PLAN.md`（可選）。
+5. **驗證**：跑一輪 scorer + validator 後，對 `GET /alerts`、`GET /validation` 檢查回應中 `casino_player_id` 在 rated 警報/結果中為非 null、格式符合協定。
+
+### 6. 可選：協定文件範例更新
+
+若希望 `package/ML_API_PROTOCOL.md` 的範例 JSON 不再寫 `"casino_player_id": null`，可改為範例值（例如 `"C001"`）並加註：實際為 casino 指派之玩家 ID，無卡或未解析時為 `null`。此為文件與範例調整，不影響上述實作。
+
+**狀態（2026-03-12）**：§1–§4 與 Code Review §1–§2（空字串→null、API 輸出 str\|null）修補已完成；見 STATUS.md「本輪：Code Review casino_player_id 修補完成」。**無剩餘待辦。**
 
 ---
 

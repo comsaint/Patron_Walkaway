@@ -61,6 +61,7 @@ VALIDATION_COLUMNS = [
     "alert_ts",
     "validated_at",
     "player_id",
+    "casino_player_id",
     "canonical_id",
     "table_id",
     "position_idx",
@@ -75,10 +76,11 @@ VALIDATION_COLUMNS = [
     "model_version",
 ]
 
-# Columns added to validation_results in Phase 1 (step 8) — migrated via ALTER TABLE
+# Columns added to validation_results in Phase 1 (step 8) + casino_player_id (ML API protocol)
 _NEW_VAL_COLS: List[Tuple[str, str]] = [
     ("canonical_id", "TEXT"),
     ("model_version", "TEXT"),
+    ("casino_player_id", "TEXT"),
 ]
 
 # Columns present since Phase 1 in the alerts table
@@ -481,6 +483,7 @@ def save_validation_results(conn: sqlite3.Connection, final_df: pd.DataFrame) ->
             getattr(r, "alert_ts", None),
             getattr(r, "validated_at", None),
             None if pd.isna(r.player_id) else int(r.player_id),
+            _s(getattr(r, "casino_player_id", None)),
             _s(getattr(r, "canonical_id", None)),
             _s(r.table_id),
             getattr(r, "position_idx", None),
@@ -498,14 +501,15 @@ def save_validation_results(conn: sqlite3.Connection, final_df: pd.DataFrame) ->
     conn.executemany(
         """
         INSERT INTO validation_results(
-            bet_id, alert_ts, validated_at, player_id, canonical_id, table_id,
+            bet_id, alert_ts, validated_at, player_id, casino_player_id, canonical_id, table_id,
             position_idx, session_id, score, result, gap_start, gap_minutes,
             reason, bet_ts, model_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(bet_id) DO UPDATE SET
             alert_ts=excluded.alert_ts,
             validated_at=excluded.validated_at,
             player_id=excluded.player_id,
+            casino_player_id=excluded.casino_player_id,
             canonical_id=excluded.canonical_id,
             table_id=excluded.table_id,
             position_idx=excluded.position_idx,
@@ -564,6 +568,14 @@ def find_gap_within_window(alert_ts: datetime, bet_times: List[datetime], base_s
     return False, None, 0.0
 
 
+def _norm_casino_player_id(v: Any) -> Optional[str]:
+    """Normalize casino_player_id: None/pd.NA/empty or whitespace -> None (FND-03 / Review §1)."""
+    if v is None or pd.isna(v):
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
 def validate_alert_row(
     row: pd.Series,
     bet_cache: Dict[str, List[datetime]],
@@ -614,6 +626,7 @@ def validate_alert_row(
             "bet_id": bet_id,
             "score": row.get("score"),
             "player_id": int(player_id) if pd.notna(player_id) else None,
+            "casino_player_id": _norm_casino_player_id(row.get("casino_player_id")),
             "canonical_id": canonical_id,
             "table_id": row.get("table_id"),
             "position_idx": row.get("position_idx"),

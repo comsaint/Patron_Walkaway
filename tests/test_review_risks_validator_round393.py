@@ -63,6 +63,7 @@ class TestValidatorRound393Risk2SessionId(unittest.TestCase):
                 alert_ts TEXT,
                 validated_at TEXT,
                 player_id TEXT,
+                casino_player_id TEXT,
                 canonical_id TEXT,
                 table_id TEXT,
                 position_idx REAL,

@@ -227,7 +227,7 @@ def _query_alerts_df(ts_param=None, limit_param=None, default_24h=False):
 
 
 def _alerts_to_protocol_records(df):
-    """Shape alerts to ML_API_PROTOCOL.md: only protocol fields; casino_player_id null, is_known_player from is_rated_obs; timestamps +08:00; bet_id/session_id int when possible."""
+    """Shape alerts to ML_API_PROTOCOL.md: only protocol fields; casino_player_id from DB when present; is_known_player from is_rated_obs; timestamps +08:00; bet_id/session_id int when possible."""
     if df.empty:
         return []
     df = df.copy()
@@ -251,7 +251,12 @@ def _alerts_to_protocol_records(df):
             out["bet_ts"] = _format_ts_hk_iso(b).replace("NaT", None)
         else:
             out["bet_ts"] = out["bet_ts"]
-    out["casino_player_id"] = None
+    if "casino_player_id" in df.columns:
+        out["casino_player_id"] = df["casino_player_id"].apply(
+            lambda v: None if (v is None or pd.isna(v)) else (str(v).strip() or None)
+        )
+    else:
+        out["casino_player_id"] = None
     out["is_known_player"] = df["is_rated_obs"].fillna(0).astype(int) if "is_rated_obs" in df.columns else 0
     out = out[protocol_keys]
     out = out.replace({np.nan: None, np.inf: None, -np.inf: None})
@@ -302,7 +307,7 @@ def _query_validation_df(ts_param=None, bet_id_param=None, bet_ids_param=None, d
 
 
 def _validation_to_protocol_records(df):
-    """Shape validation to ML_API_PROTOCOL.md: TP as string, casino_player_id null, bet_id string, timestamps +08:00."""
+    """Shape validation to ML_API_PROTOCOL.md: TP as string; casino_player_id from DB when present; bet_id string; timestamps +08:00."""
     if df.empty:
         return []
     out = df[["alert_ts", "player_id", "bet_id", "gap_start", "result", "validated_at", "reason", "bet_ts"]].rename(columns={
@@ -312,7 +317,12 @@ def _validation_to_protocol_records(df):
     }).copy()
     out["TP"] = out["result"].apply(lambda x: "TP" if x in (1, True, 1.0) else "FP")
     out = out.drop(columns=["result"], errors="ignore")
-    out["casino_player_id"] = None
+    if "casino_player_id" in df.columns:
+        out["casino_player_id"] = df["casino_player_id"].apply(
+            lambda v: None if (v is None or pd.isna(v)) else (str(v).strip() or None)
+        )
+    else:
+        out["casino_player_id"] = None
     out["bet_id"] = out["bet_id"].astype(str)
     for col in ["ts", "walkaway_ts", "sync_ts", "bet_ts"]:
         dt_col = pd.to_datetime(out[col], errors="coerce")

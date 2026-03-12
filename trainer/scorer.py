@@ -140,7 +140,7 @@ BET_AVAIL_DELAY_MIN: int = getattr(config, "BET_AVAIL_DELAY_MIN", 1)
 UNRATED_VOLUME_LOG: bool = bool(getattr(config, "UNRATED_VOLUME_LOG", True))
 SHAP_TOP_K = 3
 
-# New alert columns added in Phase 1
+# New alert columns added in Phase 1 (+ casino_player_id for ML API protocol)
 _NEW_ALERT_COLS: List[Tuple[str, str]] = [
     ("canonical_id", "TEXT"),
     ("is_rated_obs", "INTEGER"),
@@ -148,6 +148,7 @@ _NEW_ALERT_COLS: List[Tuple[str, str]] = [
     ("model_version", "TEXT"),
     ("margin", "REAL"),
     ("scored_at", "TEXT"),
+    ("casino_player_id", "TEXT"),
 ]
 
 
@@ -735,11 +736,16 @@ def build_features_for_scoring(
             sess_df = sess_df.sort_values("session_id")
         sess_df = sess_df.drop_duplicates(subset=["session_id"], keep="last")
 
+        merge_cols = ["session_id", "session_start_dtm", "session_end_dtm"]
+        if "casino_player_id" in sess_df.columns:
+            merge_cols.append("casino_player_id")
         bets_df = bets_df.merge(
-            sess_df[["session_id", "session_start_dtm", "session_end_dtm"]],
+            sess_df[merge_cols],
             on="session_id",
             how="left",
         )
+    if "casino_player_id" not in bets_df.columns:
+        bets_df["casino_player_id"] = pd.NA
 
     for col in ["session_start_dtm", "session_end_dtm"]:
         if col not in bets_df.columns:
@@ -1082,12 +1088,20 @@ def append_alerts(conn: sqlite3.Connection, alerts_df: pd.DataFrame) -> None:
         except Exception:
             return None
 
+    def _cid(v: object) -> Optional[str]:
+        """Casino player ID: None/pd.NA/empty or whitespace-only -> None (FND-03 / Review §1)."""
+        if v is None or pd.isna(v):
+            return None
+        s = str(v).strip()
+        return s if s else None
+
     rows = [
         (
             _s(r.bet_id),
             _ts(r.ts),
             _ts(r.bet_ts),
             _s(r.player_id),
+            _cid(getattr(r, "casino_player_id", None)),
             _s(r.table_id),
             _f(r.position_idx),
             _ts(r.visit_start_ts),
@@ -1122,7 +1136,7 @@ def append_alerts(conn: sqlite3.Connection, alerts_df: pd.DataFrame) -> None:
     conn.executemany(
         """
         INSERT INTO alerts(
-            bet_id, ts, bet_ts, player_id, table_id, position_idx,
+            bet_id, ts, bet_ts, player_id, casino_player_id, table_id, position_idx,
             visit_start_ts, visit_end_ts, session_count, bet_count,
             visit_avg_bet, historical_avg_bet, score, session_id,
             loss_streak, bets_last_5m, bets_last_15m, bets_last_30m,
@@ -1131,7 +1145,7 @@ def append_alerts(conn: sqlite3.Connection, alerts_df: pd.DataFrame) -> None:
             canonical_id, is_rated_obs, reason_codes, model_version,
             margin, scored_at
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(bet_id) DO UPDATE SET
@@ -1143,7 +1157,8 @@ def append_alerts(conn: sqlite3.Connection, alerts_df: pd.DataFrame) -> None:
             reason_codes=excluded.reason_codes,
             model_version=excluded.model_version,
             margin=excluded.margin,
-            scored_at=excluded.scored_at
+            scored_at=excluded.scored_at,
+            casino_player_id=excluded.casino_player_id
         """,
         rows,
     )

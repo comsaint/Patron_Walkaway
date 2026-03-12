@@ -152,7 +152,12 @@ def _alerts_to_protocol_records(df):
         if hasattr(bet_ts_dt, "dt"):
             b = bet_ts_dt.dt.tz_localize(HK_TZ, ambiguous="NaT") if bet_ts_dt.dt.tz is None else bet_ts_dt.dt.tz_convert(HK_TZ)
             out["bet_ts"] = _format_ts_hk_iso(b).replace("NaT", None)
-    out["casino_player_id"] = None
+    if "casino_player_id" in df.columns:
+        out["casino_player_id"] = df["casino_player_id"].apply(
+            lambda v: None if (v is None or pd.isna(v)) else (str(v).strip() or None)
+        )
+    else:
+        out["casino_player_id"] = None
     out["is_known_player"] = df["is_rated_obs"].fillna(0).astype(int) if "is_rated_obs" in df.columns else 0
     out = out[protocol_keys]
     out = out.replace({np.nan: None, np.inf: None, -np.inf: None})
@@ -211,7 +216,12 @@ def _validation_to_protocol_records(df):
     }).copy()
     out["TP"] = out["result"].apply(lambda x: "TP" if x in (1, True, 1.0) else "FP")
     out = out.drop(columns=["result"], errors="ignore")
-    out["casino_player_id"] = None
+    if "casino_player_id" in df.columns:
+        out["casino_player_id"] = df["casino_player_id"].apply(
+            lambda v: None if (v is None or pd.isna(v)) else (str(v).strip() or None)
+        )
+    else:
+        out["casino_player_id"] = None
     out["bet_id"] = out["bet_id"].astype(str)
     for col in ["ts", "walkaway_ts", "sync_ts", "bet_ts"]:
         dt_col = pd.to_datetime(out[col], errors="coerce")
