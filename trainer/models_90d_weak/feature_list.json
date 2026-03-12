@@ -1,0 +1,202 @@
+[
+  {
+    "name": "sessions_365d",
+    "track": "track_profile"
+  },
+  {
+    "name": "active_days_365d",
+    "track": "track_profile"
+  },
+  {
+    "name": "win_cnt_w15m",
+    "track": "track_llm"
+  },
+  {
+    "name": "avg_session_duration_min_180d",
+    "track": "track_profile"
+  },
+  {
+    "name": "loss_streak",
+    "track": "track_human"
+  },
+  {
+    "name": "active_days_per_session_30d",
+    "track": "track_profile"
+  },
+  {
+    "name": "wager_recent_vs_session_avg",
+    "track": "track_llm"
+  },
+  {
+    "name": "cum_bets",
+    "track": "track_llm"
+  },
+  {
+    "name": "minutes_since_run_start",
+    "track": "track_human"
+  },
+  {
+    "name": "prev_bet_gap_min",
+    "track": "track_llm"
+  },
+  {
+    "name": "avg_session_duration_min_30d",
+    "track": "track_profile"
+  },
+  {
+    "name": "avg_payout_odds_w15m",
+    "track": "track_llm"
+  },
+  {
+    "name": "num_games_with_wager_sum_180d",
+    "track": "track_profile"
+  },
+  {
+    "name": "active_days_90d",
+    "track": "track_profile"
+  },
+  {
+    "name": "win_session_rate_180d",
+    "track": "track_profile"
+  },
+  {
+    "name": "prev_wager",
+    "track": "track_llm"
+  },
+  {
+    "name": "bets_in_run_so_far",
+    "track": "track_human"
+  },
+  {
+    "name": "theo_win_sum_180d",
+    "track": "track_profile"
+  },
+  {
+    "name": "win_rate_w15m",
+    "track": "track_llm"
+  },
+  {
+    "name": "back_bet_pct_w20",
+    "track": "track_llm"
+  },
+  {
+    "name": "days_since_first_session",
+    "track": "track_profile"
+  },
+  {
+    "name": "back_bet_cnt_w20",
+    "track": "track_llm"
+  },
+  {
+    "name": "time_of_day_sin",
+    "track": "track_llm"
+  },
+  {
+    "name": "time_of_day_cos",
+    "track": "track_llm"
+  },
+  {
+    "name": "sessions_90d",
+    "track": "track_profile"
+  },
+  {
+    "name": "turnover_per_bet_mean_180d",
+    "track": "track_profile"
+  },
+  {
+    "name": "wager_std_w15m",
+    "track": "track_llm"
+  },
+  {
+    "name": "wager_sum_w30m",
+    "track": "track_llm"
+  },
+  {
+    "name": "bets_cnt_w30m",
+    "track": "track_llm"
+  },
+  {
+    "name": "bets_cnt_w5m",
+    "track": "track_llm"
+  },
+  {
+    "name": "hour_of_day",
+    "track": "track_llm"
+  },
+  {
+    "name": "cum_wager",
+    "track": "track_llm"
+  },
+  {
+    "name": "turnover_sum_365d",
+    "track": "track_profile"
+  },
+  {
+    "name": "position_moved_w30m",
+    "track": "track_llm"
+  },
+  {
+    "name": "num_bets_sum_180d",
+    "track": "track_profile"
+  },
+  {
+    "name": "sessions_180d",
+    "track": "track_profile"
+  },
+  {
+    "name": "theo_win_sum_30d",
+    "track": "track_profile"
+  },
+  {
+    "name": "avg_wager_sofar",
+    "track": "track_llm"
+  },
+  {
+    "name": "bets_cnt_w15m",
+    "track": "track_llm"
+  },
+  {
+    "name": "wager_avg_w15m",
+    "track": "track_llm"
+  },
+  {
+    "name": "position_min_w30m",
+    "track": "track_llm"
+  },
+  {
+    "name": "prev_bet_was_loss",
+    "track": "track_llm"
+  },
+  {
+    "name": "top_table_share_30d",
+    "track": "track_profile"
+  },
+  {
+    "name": "wager_sum_in_run_so_far",
+    "track": "track_human"
+  },
+  {
+    "name": "pace_drop_ratio_w15m_w30m",
+    "track": "track_llm"
+  },
+  {
+    "name": "position_max_w30m",
+    "track": "track_llm"
+  },
+  {
+    "name": "distinct_table_cnt_90d",
+    "track": "track_profile"
+  },
+  {
+    "name": "top_table_share_90d",
+    "track": "track_profile"
+  },
+  {
+    "name": "active_days_30d",
+    "track": "track_profile"
+  },
+  {
+    "name": "actual_vs_theo_ratio_30d",
+    "track": "track_profile"
+  }
+]

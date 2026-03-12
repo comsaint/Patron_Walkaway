@@ -24,6 +24,7 @@ guardrails:
   disallow_sql_keywords_in_expressions: ["SELECT", "FROM", "JOIN", "UNION", "WITH"]
   allowed_aggregate_functions: ["COUNT", "SUM", "AVG", "MIN", "MAX", "STDDEV_SAMP"]
   allowed_window_functions: ["LAG"]
+  allowed_scalar_functions: ["EPOCH", "OVER"]
   track_llm_allowed_columns:
     - bet_id
     - canonical_id
@@ -96,6 +97,29 @@ track_llm:
         clip: { min: 0.0, max: 1.0 }
       reason_code_category: "BETTING_PACE_DROPPING"
 
+    - feature_id: "prev_bet_gap_min"
+      type: "derived"
+      dtype: "float"
+      description: "與上一筆下注間隔（分鐘）"
+      rationale: "文獻 inter-bet interval 拉長為離場前兆；可單獨或與節奏特徵搭配。"
+      expression: "(epoch(payout_complete_dtm) - epoch(LAG(payout_complete_dtm, 1) OVER (PARTITION BY canonical_id ORDER BY payout_complete_dtm ASC, bet_id ASC))) / 60.0"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 10080.0 }
+      reason_code_category: "BETTING_PACE_DROPPING"
+
+    - feature_id: "pace_drop_ratio_w15m_w30m"
+      type: "derived"
+      dtype: "float"
+      description: "近期下注節奏衰減率 (w15m/w30m)"
+      rationale: "多時間尺度衰減，與 pace_drop_ratio (w5m/w30m) 互補。"
+      depends_on: ["bets_cnt_w15m", "bets_cnt_w30m"]
+      expression: "CAST(bets_cnt_w15m AS DOUBLE) / NULLIF(bets_cnt_w30m, 0)"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 2.0 }
+      reason_code_category: "BETTING_PACE_DROPPING"
+
     # ==== 金額動態 (Wager) ====
     - feature_id: "wager_sum_w30m"
       type: "window"
@@ -130,6 +154,18 @@ track_llm:
       postprocess:
         fill: { strategy: "zero" }
         clip: { min: 0.0, max: 1000000000.0 }
+      reason_code_category: "LOW_ACTIVITY_RECENTLY"
+
+    - feature_id: "wager_recent_vs_session_avg"
+      type: "derived"
+      dtype: "float"
+      description: "近期平均注額 vs 當次 session 平均注額比"
+      rationale: "比值 <1 表示最近變保守，常伴隨即將離場。"
+      depends_on: ["wager_avg_w15m", "avg_wager_sofar"]
+      expression: "wager_avg_w15m / NULLIF(avg_wager_sofar, 0)"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 10.0 }
       reason_code_category: "LOW_ACTIVITY_RECENTLY"
 
     - feature_id: "wager_max_w15m"
@@ -200,6 +236,7 @@ track_llm:
     - feature_id: "prev_bet_was_loss"
       type: "derived"
       dtype: "int"
+      screening_eligible: false
       description: "上一把是否輸錢 (1=是 0=否)"
       rationale: "即時損失為離場觸發事件。"
       depends_on: ["prev_status"]
@@ -237,6 +274,7 @@ track_llm:
     - feature_id: "bets_cnt_w20"
       type: "window"
       dtype: "int"
+      screening_eligible: false
       description: "近 20 把下注次數"
       rationale: "供 back_bet_pct_w20 計算比例。"
       expression: "COUNT(*)"
@@ -270,6 +308,7 @@ track_llm:
     - feature_id: "position_min_w30m"
       type: "window"
       dtype: "int"
+      screening_eligible: false
       description: "過去 30 分鐘最小 position_idx"
       rationale: "用於判斷是否在近 30 分鐘內換位（避免 window-on-window nesting）。"
       expression: "MIN(position_idx)"
@@ -282,6 +321,7 @@ track_llm:
     - feature_id: "position_max_w30m"
       type: "window"
       dtype: "int"
+      screening_eligible: false
       description: "過去 30 分鐘最大 position_idx"
       rationale: "用於判斷是否在近 30 分鐘內換位（避免 window-on-window nesting）。"
       expression: "MAX(position_idx)"
@@ -392,10 +432,32 @@ track_human:
       description: "距離 run 起點的分鐘數（run 以 gap>=RUN_BREAK_MIN 切分）"
       function_name: "compute_run_boundary_features"
       input_columns: ["canonical_id", "payout_complete_dtm", "bet_id"]
-      output_columns: ["run_id", "minutes_since_run_start"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far"]
       postprocess:
         fill: { strategy: "zero" }
         clip: { min: 0.0, max: 1000000.0 }
+
+    - feature_id: "bets_in_run_so_far"
+      type: "python_vectorized"
+      dtype: "int"
+      description: "當筆為止同一 run 內下注筆數（1-based）"
+      function_name: "compute_run_boundary_features"
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 10000000 }
+
+    - feature_id: "wager_sum_in_run_so_far"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "當筆為止同一 run 內下注金額累計"
+      function_name: "compute_run_boundary_features"
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1000000000000.0 }
 
   active:
     feature_ids: []
@@ -417,6 +479,7 @@ track_profile:
     - feature_id: "days_since_last_session"
       type: "profile_column"
       dtype: "float"
+      screening_eligible: false
       source_column: "days_since_last_session"
       min_lookback_days: 1
       description: "距離上次造訪天數（Recency）"
@@ -435,6 +498,7 @@ track_profile:
     - feature_id: "sessions_7d"
       type: "profile_column"
       dtype: "float"
+      screening_eligible: false
       source_column: "sessions_7d"
       min_lookback_days: 7
       description: "過去 7 天 session 次數"
@@ -721,6 +785,24 @@ track_profile:
       postprocess:
         fill: { strategy: "zero" }
         clip: { min: 0.0, max: 100.0 }
+    - feature_id: "sessions_7d_over_30d"
+      type: "profile_column"
+      dtype: "float"
+      source_column: "sessions_7d_over_30d"
+      min_lookback_days: 30
+      description: "最近一週造訪佔 30 天比例（7d/30d）"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 2.0 }
+    - feature_id: "active_days_per_session_30d"
+      type: "profile_column"
+      dtype: "float"
+      source_column: "active_days_per_session_30d"
+      min_lookback_days: 30
+      description: "過去 30 天有活動天數／session 數"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 31.0 }
     - feature_id: "avg_session_duration_min_30d"
       type: "profile_column"
       dtype: "float"
@@ -742,6 +824,7 @@ track_profile:
     - feature_id: "distinct_table_cnt_30d"
       type: "profile_column"
       dtype: "float"
+      screening_eligible: false
       source_column: "distinct_table_cnt_30d"
       min_lookback_days: 30
       description: "過去 30 天造訪過的不同桌台數"
@@ -760,6 +843,7 @@ track_profile:
     - feature_id: "distinct_pit_cnt_30d"
       type: "profile_column"
       dtype: "float"
+      screening_eligible: false
       source_column: "distinct_pit_cnt_30d"
       min_lookback_days: 30
       description: "過去 30 天造訪 pit 數"
@@ -769,6 +853,7 @@ track_profile:
     - feature_id: "distinct_gaming_area_cnt_30d"
       type: "profile_column"
       dtype: "float"
+      screening_eligible: false
       source_column: "distinct_gaming_area_cnt_30d"
       min_lookback_days: 30
       description: "過去 30 天造訪 gaming area 數"
