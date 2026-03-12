@@ -1,0 +1,12 @@
+# Deploy: run pip install -r requirements.txt from repo root (so -e .. resolves)
+Flask>=2.0
+pandas
+numpy
+joblib
+lightgbm
+pyyaml
+python-dotenv
+clickhouse-driver
+
+# Application package (walkaway_ml). From repo root: -e . installs this repo as walkaway_ml
+-e .

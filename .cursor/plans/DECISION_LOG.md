@@ -673,4 +673,34 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-028：Deploy 套件帶出 player_profile.parquet、canonical mapping 僅在目標機持久化
+
+**日期**：2026-03-12  
+**相關**：DEPLOY_PLAN §8、package/deploy、scorer 路徑與重啟行為。
+
+**決策**：
+
+1. **player_profile 打包**  
+   - 建包時若 **repo 根目錄 `data/player_profile.parquet`** 存在（與 trainer / etl_player_profile 使用之 `LOCAL_PARQUET_DIR` 一致），則複製到 deploy 套件的 `data/player_profile.parquet`。  
+   - 若不存在則不複製，但在建包**全部完成後**於 console 印出一行錯誤級訊息，提醒未帶出 profile、scorer 將以 profile 特徵為 NaN 運行。
+
+2. **目標機 profile 讀取**  
+   - 部署端由 main.py 設定 `DATA_DIR = DEPLOY_ROOT / "data"` 並寫入環境變數，scorer 優先從 `DATA_DIR / "player_profile.parquet"` 讀取；若不存在則維持現有 warning、profile 特徵為 NaN。
+
+3. **canonical mapping**  
+   - **不**在套件內預先打包 canonical mapping。  
+   - Scorer 在部署端一律採「由當輪 sessions 建出」邏輯；建出後將結果**持久化**到 `DATA_DIR`（`canonical_mapping.parquet` + `canonical_mapping.cutoff.json`）。  
+   - 重啟後若該二檔存在且 cutoff 仍有效則從磁碟載入，避免重啟後重新計算；否則再從 sessions 重建並覆寫。
+
+**理由**：  
+- 單一來源路徑（repo `data/`）與現有 trainer/etl 一致，避免多處路徑設定。  
+- 有 profile 就帶出、沒有就明確錯誤提示，方便建包時發現遺漏。  
+- Canonical 不預建、僅在目標機持久化，可隨 sessions 更新且重啟不重算。
+
+**設計理由（為何帶 profile 不帶 canonical mapping）**：  
+- **player_profile**：計算成本高、變動慢（目前僅每月更新一次），適合隨套件一併帶出；且模型本身約每月也會用新資料重訓幾次，帶出 profile 與重訓節奏一致。  
+- **canonical_mapping**：變動快、具動態性，且計算量不大，故不在建包時預先打包，改由部署端依當下 sessions 建出並持久化，既能反映最新身份對應，又不會增加建包複雜度。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

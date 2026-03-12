@@ -6,8 +6,10 @@ from dotenv import load_dotenv
 
 _log = logging.getLogger(__name__)
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file.
+# In deploy, main.py already loads from deploy root; skip loading from cwd to avoid overwriting CH_*.
+if not os.getenv("STATE_DB_PATH") and not os.getenv("MODEL_DIR"):
+    load_dotenv()
 
 NUMEXPR_MAX_THREADS = 12
 

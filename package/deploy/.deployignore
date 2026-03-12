@@ -1,0 +1,11 @@
+# Platform-neutral deploy exclude list (e.g. when building tar/zip)
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.git/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/

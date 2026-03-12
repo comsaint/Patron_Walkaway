@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -29,7 +31,10 @@ except Exception:
 try:
     import config  # type: ignore[import]
 except ModuleNotFoundError:
-    import trainer.config as config  # type: ignore[import, no-redef]
+    try:
+        from . import config  # type: ignore[import, no-redef]
+    except ImportError:
+        import trainer.config as config  # type: ignore[import, no-redef]
 
 try:
     from db_conn import get_clickhouse_client  # type: ignore[import]
@@ -42,12 +47,15 @@ HK_TZ = ZoneInfo(config.HK_TZ)
 _SENTINEL_SESSION_END = pd.Timestamp("2099-12-31 00:00:00", tz="UTC").tz_convert(HK_TZ)
 
 BASE_DIR = Path(__file__).parent
-STATE_DB_PATH = BASE_DIR / "local_state" / "state.db"
+_state_db_env = os.environ.get("STATE_DB_PATH")
+STATE_DB_PATH = Path(_state_db_env) if _state_db_env else (BASE_DIR / "local_state" / "state.db")
 OUT_DIR = BASE_DIR / "out_validator"
 OUT_DIR.mkdir(exist_ok=True)
 RESULTS_PATH = OUT_DIR / "validation_results.csv"  # legacy only (read-backfill); DB is source of truth
 
 IGNORED_REASONS = {"gap_started_before_alert", "missing_player_id"}
+
+logger = logging.getLogger(__name__)
 
 VALIDATION_COLUMNS = [
     "alert_ts",
@@ -523,9 +531,10 @@ def parse_alerts(conn: sqlite3.Connection) -> pd.DataFrame:
         if not df.empty:
             df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
             df["bet_ts"] = pd.to_datetime(df.get("bet_ts"), errors="coerce")
-            df["ts"] = df["ts"].dt.tz_localize("UTC").dt.tz_convert(HK_TZ) if df["ts"].dt.tz is None else df["ts"].dt.tz_convert(HK_TZ)
+            # Stored naive datetimes are HK local (scorer writes tz-naive HK); do not treat as UTC.
+            df["ts"] = df["ts"].dt.tz_localize(HK_TZ) if df["ts"].dt.tz is None else df["ts"].dt.tz_convert(HK_TZ)
             if "bet_ts" in df.columns:
-                df["bet_ts"] = df["bet_ts"].dt.tz_localize("UTC").dt.tz_convert(HK_TZ) if df["bet_ts"].dt.tz is None else df["bet_ts"].dt.tz_convert(HK_TZ)
+                df["bet_ts"] = df["bet_ts"].dt.tz_localize(HK_TZ) if df["bet_ts"].dt.tz is None else df["bet_ts"].dt.tz_convert(HK_TZ)
             if retention_days is not None and retention_days > 0:
                 cutoff = datetime.now(HK_TZ) - timedelta(days=retention_days)
                 df = df[df["ts"] >= cutoff]
@@ -740,7 +749,7 @@ def validate_alert_row(
                     "gap_minutes": gap_minutes,
                     "reason": "MISS"
                 })
-                print(f"[validator] Finalizing candidate as MISS (late arrival in 15-45m window or forced) player={player_id} bet_id={bet_id}")
+                logger.info("[validator] Finalizing candidate as MISS (late arrival in 15-45m window or forced) player=%s bet_id=%s", player_id, bet_id)
             else:
                 res_base.update({
                     "result": True,
@@ -748,7 +757,7 @@ def validate_alert_row(
                     "gap_minutes": gap_minutes,
                     "reason": "MATCH"
                 })
-                print(f"[validator] Finalizing candidate as MATCH (no late arrivals in 15-45m window or forced) player={player_id} bet_id={bet_id}")
+                logger.info("[validator] Finalizing candidate as MATCH (no late arrivals in 15-45m window or forced) player=%s bet_id=%s", player_id, bet_id)
     else:
         # No gap found within the horizon.
         # Policy:
@@ -777,7 +786,7 @@ def validate_alert_row(
                 "gap_minutes": 0,
                 "reason": "MISS"
             })
-            print(f"[validator] Finalizing alert as MISS (evidence within 45m) player={player_id} bet_id={bet_id}")
+            logger.info("[validator] Finalizing alert as MISS (evidence within 45m) player=%s bet_id=%s", player_id, bet_id)
         else:
             if getattr(config, 'VALIDATOR_FINALIZE_ON_HORIZON', False):
                 # Still within extended wait window -> skip (to be re-checked later)
@@ -799,7 +808,7 @@ def validate_alert_row(
                         "gap_minutes": 0,
                         "reason": "MISS"
                     })
-                    print(f"[validator] Finalizing alert as MISS (late arrival in 15-45m window) player={player_id} bet_id={bet_id}")
+                    logger.info("[validator] Finalizing alert as MISS (late arrival in 15-45m window) player=%s bet_id=%s", player_id, bet_id)
                 else:
                     # No late arrivals in the 15-45m window -> confirm MATCH
                     res_base.update({
@@ -808,7 +817,7 @@ def validate_alert_row(
                         "gap_minutes": 0,
                         "reason": "MATCH"
                     })
-                    print(f"[validator] Finalizing alert as MATCH (no late arrivals in 15-45m window) player={player_id} bet_id={bet_id}")
+                    logger.info("[validator] Finalizing alert as MATCH (no late arrivals in 15-45m window) player=%s bet_id=%s", player_id, bet_id)
             else:
                 res_base.update({
                     "result": False,
@@ -826,14 +835,14 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
 
     alerts = parse_alerts(conn)
     if alerts.empty:
-        print("[validator] No alerts to validate")
+        logger.info("[validator] No alerts to validate")
         return
 
     processed = {str(bid) for bid in load_processed(conn)}
     alerts["bet_id_str"] = alerts["bet_id"].astype(str)
     pending_all = alerts[~alerts["bet_id_str"].isin(processed)].copy()
     if pending_all.empty:
-        print(f"[validator] Alerts: {len(alerts)}, Pending: 0 (all processed)")
+        logger.info("[validator] Alerts: %d, Pending: 0 (all processed)", len(alerts))
         return
 
     freshness_buffer_min = getattr(config, "VALIDATOR_FRESHNESS_BUFFER_MINUTES", 2)
@@ -847,15 +856,34 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
     else:
         effective_ts = effective_ts.dt.tz_convert(HK_TZ)
 
+    # Debug: bet_ts and effective_ts range for pending alerts (diagnose "all too recent")
+    bet_ts_ser = pending_all["bet_ts"]
+    if bet_ts_ser.notna().any():
+        bet_ts_valid = pd.to_datetime(bet_ts_ser.dropna())
+        if bet_ts_valid.dt.tz is None:
+            bet_ts_valid = bet_ts_valid.dt.tz_localize(HK_TZ)
+        else:
+            bet_ts_valid = bet_ts_valid.dt.tz_convert(HK_TZ)
+        logger.info(
+            "[validator] pending_all: n=%d, bet_ts min=%s, bet_ts max=%s, effective_ts min=%s, effective_ts max=%s, cutoff=%s (wait_min=%s)",
+            len(pending_all), bet_ts_valid.min(), bet_ts_valid.max(),
+            effective_ts.min(), effective_ts.max(), cutoff, wait_minutes,
+        )
+    else:
+        logger.info(
+            "[validator] pending_all: n=%d, bet_ts all NaT (using ts); effective_ts min=%s, max=%s, cutoff=%s (wait_min=%s)",
+            len(pending_all), effective_ts.min(), effective_ts.max(), cutoff, wait_minutes,
+        )
+
     pending = pending_all[effective_ts <= cutoff].copy()
     if pending.empty:
-        print(f"[validator] {len(pending_all)} pending, but all are too recent (<{wait_minutes}m)")
+        logger.info("[validator] %d pending, but all are too recent (<%sm)", len(pending_all), wait_minutes)
         return
 
     if force_finalize:
-        print("[validator] WARNING: running with --force-finalize; PENDING candidates will be finalized now")
+        logger.info("[validator] WARNING: running with --force-finalize; PENDING candidates will be finalized now")
 
-    print(f"[validator] Processing {len(pending)} alerts (including re-checks)...")
+    logger.info("[validator] Processing %d alerts (including re-checks)...", len(pending))
 
     existing_results = load_existing_results(conn)
 
@@ -893,7 +921,7 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
             # R42: sessions grouped by canonical_id — supports multi-player_id rated players
             session_cache = fetch_sessions_by_canonical_id(cid_to_pids, fetch_start, fetch_end)
         except Exception as exc:
-            print(f"[validator] DB fetch error — skipping this validation cycle: {exc}")
+            logger.warning("[validator] DB fetch error — skipping this validation cycle: %s", exc)
             return
 
     new_processed_ids: List = []
@@ -980,18 +1008,50 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
         total = len(finalized_or_old)
         matches = finalized_or_old["reason"].eq("MATCH").sum()
         precision = (matches / total) if total > 0 else 0
-        print(f"[validator] Cumulative Precision (15m window): {precision:.2%} ({matches}/{total})")
+        logger.info("[validator] Cumulative Precision (15m window): %.2f%% (%d/%d)", precision * 100, matches, total)
 
         final_df["alert_ts_dt"] = pd.to_datetime(final_df["alert_ts"])
         final_df = final_df.sort_values("alert_ts_dt").drop(columns=["alert_ts_dt"])
         save_validation_results(conn, final_df)
-        print(f"[validator] Saved {len(final_df)} total validations to SQLite (Updated {updated_count}, Finalized {len(new_processed_ids)})")
+        logger.info(
+            "[validator] Saved %d total validations to SQLite (Updated %d, Finalized %d)",
+            len(final_df), updated_count, len(new_processed_ids),
+        )
 
     mark_processed(conn, new_processed_ids)
     return
 
 
+def run_validator_loop(
+    interval_seconds: int = 60,
+    once: bool = False,
+    force_finalize: bool = False,
+) -> None:
+    """Run the validator loop (no argparse). Used by package/deploy/main.py.
+    Uses STATE_DB_PATH from env if set.
+    """
+    conn = get_db_conn()
+    while True:
+        start_time = time.time()
+        try:
+            validate_once(conn, force_finalize=force_finalize)
+        except Exception as exc:
+            logger.exception("[validator] ERROR: %s", exc)
+        if once:
+            break
+        elapsed = time.time() - start_time
+        sleep_time = max(0, interval_seconds - elapsed)
+        time.sleep(sleep_time)
+
+
 def main():
+    # Ensure console logs include timestamp (when not already set by deploy main)
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
     parser = argparse.ArgumentParser(description="Validate alerts against realized walkaways")
     parser.add_argument("--interval", type=int, default=60, help="Polling interval in seconds")
     parser.add_argument("--once", action="store_true", help="Run a single validation pass and exit")
@@ -1006,7 +1066,7 @@ def main():
         try:
             validate_once(conn, force_finalize=args.force_finalize)
         except Exception as exc:
-            print(f"[validator] ERROR: {exc}")
+            logger.exception("[validator] ERROR: %s", exc)
         if args.once:
             break
         # Sleep to next tick (preventing overlap)

@@ -8,6 +8,8 @@ optionally a .tar.gz archive). See package/PLAN.md.
 Usage (from repo root):
   python -m package.package_model_bundle --source-dir trainer/models --output-dir package/bundles
   python -m package.package_model_bundle --source-dir trainer/models --archive
+  python -m package.package_model_bundle --deploy
+  python -m package.package_model_bundle --source-dir /path/to/other_run/models --deploy
 """
 
 from __future__ import annotations
@@ -53,9 +55,11 @@ def build_bundle(
     output_dir: Path,
     version: str | None = None,
     create_archive: bool = False,
+    deploy_overwrite: bool = False,
 ) -> Path:
     """
-    Copy required and optional artifacts from source_dir into output_dir/<version>/.
+    Copy required and optional artifacts from source_dir into output_dir/<version>/
+    (or directly into output_dir if deploy_overwrite).
     Returns the path to the bundle directory.
     """
     source_dir = source_dir.resolve()
@@ -76,7 +80,10 @@ def build_bundle(
             f"Missing {source_dir / 'feature_list.json'}. Run trainer first."
         )
 
-    bundle_dir = output_dir / version
+    if deploy_overwrite:
+        bundle_dir = output_dir
+    else:
+        bundle_dir = output_dir / version
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
     copied: list[str] = []
@@ -103,7 +110,7 @@ def build_bundle(
 
     print(f"Bundle created: {bundle_dir} ({len(copied)} files)")
 
-    if create_archive:
+    if create_archive and not deploy_overwrite:
         archive_path = output_dir / f"model_bundle_{version}.tar.gz"
         with tarfile.open(archive_path, "w:gz") as tf:
             tf.add(bundle_dir, arcname=bundle_dir.name)
@@ -137,9 +144,18 @@ def main() -> int:
     parser.add_argument(
         "--archive",
         action="store_true",
-        help="Also create model_bundle_<version>.tar.gz in output-dir",
+        help="Also create model_bundle_<version>.tar.gz in output-dir (ignored if --deploy)",
+    )
+    parser.add_argument(
+        "--deploy",
+        action="store_true",
+        help="Write directly into package/deploy/models/ (overwrite); no version subdir, no archive. Use with --source-dir to switch models.",
     )
     args = parser.parse_args()
+
+    if args.deploy:
+        args.output_dir = REPO_ROOT / "package" / "deploy" / "models"
+        args.archive = False
 
     try:
         build_bundle(
@@ -147,6 +163,7 @@ def main() -> int:
             output_dir=args.output_dir,
             version=args.version,
             create_archive=args.archive,
+            deploy_overwrite=args.deploy,
         )
         return 0
     except FileNotFoundError as e:

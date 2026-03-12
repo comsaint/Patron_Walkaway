@@ -31,6 +31,7 @@ aggregations are not contaminated by NaN propagation.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import datetime
 from typing import List, Optional
@@ -87,18 +88,30 @@ _RUN_BREAK_BOUNDS_MSG = (
 #: Phase 2 additions (wager_mean_180d, wager_p50_180d from t_bet) are not
 #: included here.  See doc/player_profile_spec.md §14.
 
-_yaml_path = pathlib.Path(__file__).parent / "feature_spec" / "features_candidates.yaml"
-try:
+# Deploy: use MODEL_DIR/feature_spec.yaml and require it. Repo: use feature_spec/features_candidates.yaml.
+_model_dir_env = os.environ.get("MODEL_DIR")
+if _model_dir_env:
+    _yaml_path = pathlib.Path(_model_dir_env) / "feature_spec.yaml"
+    if not _yaml_path.exists():
+        raise FileNotFoundError(
+            "Feature spec required in deploy but not found at %s. "
+            "Ensure the deploy package includes models/feature_spec.yaml." % _yaml_path
+        )
     with open(_yaml_path, "r", encoding="utf-8") as _f:
         _TEMPLATE_SPEC = _yaml.safe_load(_f) or {}
-except FileNotFoundError:
-    import logging as _logging
-    _logging.getLogger(__name__).warning(
-        "Feature Spec YAML not found at %s — PROFILE_FEATURE_COLS will be empty. "
-        "Ensure features_candidates.yaml (repo spec) exists before training.",
-        _yaml_path,
-    )
-    _TEMPLATE_SPEC = {}
+else:
+    _yaml_path = pathlib.Path(__file__).parent / "feature_spec" / "features_candidates.yaml"
+    try:
+        with open(_yaml_path, "r", encoding="utf-8") as _f:
+            _TEMPLATE_SPEC = _yaml.safe_load(_f) or {}
+    except FileNotFoundError:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Feature Spec YAML not found at %s — PROFILE_FEATURE_COLS will be empty. "
+            "Ensure features_candidates.yaml (repo spec) exists before training.",
+            _yaml_path,
+        )
+        _TEMPLATE_SPEC = {}
 
 PROFILE_FEATURE_COLS: List[str] = [
     c["feature_id"]

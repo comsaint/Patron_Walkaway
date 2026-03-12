@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "walkaway_ml"
+version = "0.0.1"
+description = "Walkaway ML: scorer, validator, and ML API (no training)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pandas",
+    "numpy",
+    "joblib",
+    "lightgbm",
+    "pyyaml",
+    "python-dotenv",
+    "clickhouse-driver",
+]
+
+# Package mapping: install trainer/ as walkaway_ml (see setup.py)

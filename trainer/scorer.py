@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -46,6 +47,12 @@ try:
     )
 except ImportError:
     try:
+        from .features import (  # type: ignore[import, attr-defined]
+            PROFILE_FEATURE_COLS,
+            join_player_profile as _join_profile,
+            coerce_feature_dtypes,
+        )
+    except ImportError:
         from trainer.features import (  # type: ignore[import, attr-defined]
             PROFILE_FEATURE_COLS,
             join_player_profile as _join_profile,
@@ -60,14 +67,20 @@ try:
     from db_conn import get_clickhouse_client  # type: ignore[import]
 except ImportError:
     try:
-        from trainer.db_conn import get_clickhouse_client  # type: ignore[import]
+        from .db_conn import get_clickhouse_client  # type: ignore[import]
     except ImportError:
-        get_clickhouse_client = None  # type: ignore[assignment]
+        try:
+            from trainer.db_conn import get_clickhouse_client  # type: ignore[import]
+        except ImportError:
+            get_clickhouse_client = None  # type: ignore[assignment]
 
 try:
     import config  # type: ignore[import]
 except ModuleNotFoundError:
-    import trainer.config as config  # type: ignore[import, no-redef]
+    try:
+        from . import config  # type: ignore[import, no-redef]
+    except ImportError:
+        import trainer.config as config  # type: ignore[import, no-redef]
 
 try:
     from features import (  # type: ignore[import]
@@ -77,32 +90,48 @@ try:
         load_feature_spec,
     )
 except ImportError:
-    from trainer.features import (  # type: ignore[import, attr-defined]
-        compute_loss_streak,
-        compute_run_boundary,
-        compute_track_llm_features,
-        load_feature_spec,
-    )
+    try:
+        from .features import (  # type: ignore[import, attr-defined]
+            compute_loss_streak,
+            compute_run_boundary,
+            compute_track_llm_features,
+            load_feature_spec,
+        )
+    except ImportError:
+        from trainer.features import (  # type: ignore[import, attr-defined]
+            compute_loss_streak,
+            compute_run_boundary,
+            compute_track_llm_features,
+            load_feature_spec,
+        )
 
 try:
     from identity import build_canonical_mapping_from_df  # type: ignore[import]
 except ImportError:
-    from trainer.identity import build_canonical_mapping_from_df  # type: ignore[import, attr-defined]
+    try:
+        from .identity import build_canonical_mapping_from_df  # type: ignore[import, attr-defined]
+    except ImportError:
+        from trainer.identity import build_canonical_mapping_from_df  # type: ignore[import, attr-defined]
 
 try:
     from schema_io import normalize_bets_sessions  # type: ignore[import]
 except ImportError:
-    from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
+    try:
+        from .schema_io import normalize_bets_sessions  # type: ignore[import]
+    except ImportError:
+        from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
 
 logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 HK_TZ = ZoneInfo(config.HK_TZ)
 BASE_DIR = Path(__file__).parent
-STATE_DIR = BASE_DIR / "local_state"
-STATE_DIR.mkdir(exist_ok=True)
-STATE_DB_PATH = STATE_DIR / "state.db"
-MODEL_DIR = BASE_DIR / "models"
+_state_db_env = os.environ.get("STATE_DB_PATH")
+_model_dir_env = os.environ.get("MODEL_DIR")
+STATE_DIR = Path(_state_db_env).parent if _state_db_env else (BASE_DIR / "local_state")
+STATE_DB_PATH = Path(_state_db_env) if _state_db_env else (BASE_DIR / "local_state" / "state.db")
+MODEL_DIR = Path(_model_dir_env) if _model_dir_env else (BASE_DIR / "models")
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 FEATURE_SPEC_PATH = BASE_DIR / "feature_spec" / "features_candidates.yaml"
 
 RETENTION_HOURS: int = getattr(config, "SCORER_STATE_RETENTION_HOURS", 48)
@@ -159,18 +188,25 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
 
     # Track LLM: prefer the frozen feature_spec.yaml inside the model artifact
     # directory (DEC-024 / R3507) for exact train-serve reproducibility.
-    # Fall back to the repo feature spec (features_candidates.yaml) when no frozen copy exists.
+    # In deploy (d == MODEL_DIR from env), feature_spec.yaml is required; no fallback.
+    # Fall back to the repo feature spec (features_candidates.yaml) when frozen load fails.
     _frozen_spec = d / "feature_spec.yaml"
     if _frozen_spec.exists():
         try:
             artifacts["feature_spec"] = load_feature_spec(_frozen_spec)
         except Exception as exc:
-            logger.warning("[scorer] frozen feature spec not loaded: %s; falling back to global", exc)
-    if artifacts["feature_spec"] is None and FEATURE_SPEC_PATH.exists():
-        try:
-            artifacts["feature_spec"] = load_feature_spec(FEATURE_SPEC_PATH)
-        except Exception as exc:
-            logger.warning("[scorer] feature spec not loaded: %s", exc)
+            logger.warning("[scorer] frozen feature spec not loaded: %s; falling back to repo spec", exc)
+    if artifacts["feature_spec"] is None:
+        if d.resolve() == MODEL_DIR.resolve():
+            raise FileNotFoundError(
+                "feature_spec.yaml required in deploy but not found at %s. "
+                "Ensure the deploy package includes models/feature_spec.yaml." % _frozen_spec
+            )
+        if FEATURE_SPEC_PATH.exists():
+            try:
+                artifacts["feature_spec"] = load_feature_spec(FEATURE_SPEC_PATH)
+            except Exception as exc:
+                logger.warning("[scorer] feature spec not loaded: %s", exc)
 
     if feature_list_path.exists():
         with feature_list_path.open(encoding="utf-8") as fh:
@@ -834,10 +870,20 @@ def _compute_reason_codes(
 # ── player_profile loading for real-time scoring (R79) ─────────────────
 
 PROJECT_ROOT = BASE_DIR.parent
-_LOCAL_PARQUET_PROFILE = PROJECT_ROOT / "data" / "player_profile.parquet"
-# PLAN Canonical mapping step 8: load mapping artifact (same paths as trainer).
-CANONICAL_MAPPING_PARQUET = PROJECT_ROOT / "data" / "canonical_mapping.parquet"
-CANONICAL_MAPPING_CUTOFF_JSON = PROJECT_ROOT / "data" / "canonical_mapping.cutoff.json"
+# In deploy, main.py sets DATA_DIR (e.g. deploy root / "data"); use it for profile + canonical.
+# Only treat as deploy path when non-empty after strip (avoid Path("") or Path("  ") = cwd).
+_data_dir_env = os.environ.get("DATA_DIR")
+_DATA_DIR: Path | None
+if _data_dir_env and _data_dir_env.strip():
+    _DATA_DIR = Path(_data_dir_env.strip())
+    _LOCAL_PARQUET_PROFILE = _DATA_DIR / "player_profile.parquet"
+    CANONICAL_MAPPING_PARQUET = _DATA_DIR / "canonical_mapping.parquet"
+    CANONICAL_MAPPING_CUTOFF_JSON = _DATA_DIR / "canonical_mapping.cutoff.json"
+else:
+    _DATA_DIR = None
+    _LOCAL_PARQUET_PROFILE = PROJECT_ROOT / "data" / "player_profile.parquet"
+    CANONICAL_MAPPING_PARQUET = PROJECT_ROOT / "data" / "canonical_mapping.parquet"
+    CANONICAL_MAPPING_CUTOFF_JSON = PROJECT_ROOT / "data" / "canonical_mapping.cutoff.json"
 
 # R85: module-level TTL cache — avoids re-querying the profile table on every
 # scoring call within the same process (e.g. repeated score_once calls in a loop).
@@ -1167,18 +1213,32 @@ def score_once(
             if _cutoff_ts is not None:
                 _cutoff_naive = _naive_ts_for_compare(_cutoff_ts)
                 now_naive = _naive_ts_for_compare(now_hk)
-                if _cutoff_naive >= now_naive:
+                # In deploy (DATA_DIR set), use persisted file if present so restart does not recompute (DEC-028).
+                # In trainer/dev, require cutoff >= now to avoid stale artifact.
+                use_persisted = (_DATA_DIR is not None) or (_cutoff_naive >= now_naive)
+                if use_persisted:
                     _df = pd.read_parquet(CANONICAL_MAPPING_PARQUET)
                     if set(_df.columns) >= {"player_id", "canonical_id"}:
                         canonical_map = _df
                         logger.info(
-                            "[scorer] Canonical mapping loaded from %s (cutoff %s >= now)",
+                            "[scorer] Canonical mapping loaded from %s (cutoff %s)",
                             CANONICAL_MAPPING_PARQUET, _cutoff_str,
                         )
         except Exception as exc:
             logger.warning("[scorer] Load canonical mapping artifact failed (%s); will build", exc)
     if canonical_map is None:
         canonical_map = build_canonical_mapping_from_df(sessions, cutoff_dtm=now_hk)
+        # DEC-028: in deploy (DATA_DIR set), persist so restart does not recompute
+        if _DATA_DIR is not None and not canonical_map.empty:
+            try:
+                canonical_map.to_parquet(CANONICAL_MAPPING_PARQUET, index=False)
+                CANONICAL_MAPPING_CUTOFF_JSON.write_text(
+                    json.dumps({"cutoff_dtm": now_hk.isoformat()}, indent=0),
+                    encoding="utf-8",
+                )
+                logger.info("[scorer] Canonical mapping persisted to %s", CANONICAL_MAPPING_PARQUET)
+            except Exception as exc:
+                logger.warning("[scorer] Failed to persist canonical mapping: %s", exc)
 
     # H3: every canonical_id in the mapping is a rated player — identity.py only
     # builds entries for players who have a valid casino_player_id (R36 fix).
@@ -1355,6 +1415,53 @@ def score_once(
     alert_history.update(alert_candidates["bet_id"].astype(str).tolist())
     logger.info("[scorer] Emitted %d alerts", len(alert_candidates))
     conn.commit()
+
+
+# ── Programmatic entry (for deploy: one process runs scorer + validator + API) ──
+
+def run_scorer_loop(
+    interval_seconds: int | None = None,
+    lookback_hours: int | None = None,
+    model_dir: Optional[Path] = None,
+    once: bool = False,
+) -> None:
+    """Run the scorer loop (no argparse). Used by package/deploy/main.py.
+    Uses STATE_DB_PATH and MODEL_DIR from env if set.
+    """
+    interval = interval_seconds if interval_seconds is not None else getattr(config, "SCORER_POLL_INTERVAL_SECONDS", 45)
+    lookback = lookback_hours if lookback_hours is not None else getattr(config, "SCORER_LOOKBACK_HOURS", 8)
+    if interval <= 0 or lookback <= 0:
+        raise ValueError("interval_seconds and lookback_hours must be positive")
+    artifacts = load_dual_artifacts(model_dir)
+    logger.info(
+        "[scorer] Loaded model v=%s, rated=%s, %d features",
+        artifacts["model_version"],
+        "yes" if artifacts["rated"] else "no",
+        len(artifacts["feature_list"]),
+    )
+    conn = sqlite3.connect(STATE_DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    init_state_db()
+    alert_history = load_alert_history(conn)
+    while True:
+        t_start = time.time()
+        try:
+            score_once(
+                artifacts,
+                lookback,
+                alert_history,
+                conn,
+                RETENTION_HOURS,
+                rebuild_canonical_mapping=False,
+            )
+        except Exception as exc:
+            logger.error("[scorer] ERROR: %s", exc, exc_info=True)
+        elapsed = time.time() - t_start
+        sleep_for = max(0, interval - elapsed)
+        if once:
+            break
+        time.sleep(sleep_for)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

@@ -119,6 +119,9 @@ todos:
   - id: progress-bars-long-steps
     content: "Training pipeline 長時間步驟進度條：依 doc/training_oom_and_runtime_audit.md 在 Step 3/4/7/8/9 加入進度條或強化 log，讓使用者能判斷是否仍在執行並估計剩餘時間；Step 6 已有 tqdm。見「Training pipeline 長時間步驟進度條（計畫）」一節。"
     status: completed
+  - id: deploy-dec028-fixes
+    content: "Deploy DEC-028 修補：scorer DATA_DIR 空/空白→未設定、build profile 複製 try/except、deploy main E402 noqa、scorer _DATA_DIR 型別；tests/typecheck/lint 全過。"
+    status: completed
 isProject: false
 ---
 
@@ -175,10 +178,11 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 17 | **OOM 預檢查** | completed | Step 6 以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC；已於 Round 210/211/212 實作並通過 Review 修復。規格見下方「OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC」一節。 |
 | 18 | **Round 222 Review production 補強** | completed | 四項均已實作：項目 1（Track LLM 失敗 warning + track_llm_degraded）、項目 2（canonical_ids=[]）、項目 3（use_local_parquet 從 CLI 傳入）、項目 4（candidates 型別防呆）。Round 406 完成項目 1、3 與 R222 測試契約更新。規格見下方「Round 222 Review production 補強（實作計畫）」一節。 |
 | 19 | **Track Human Lookback 向量化 + Step 6 進度條** | completed | Phase 1 解封與 Step 6 tqdm 已完成。Phase 2 **compute_loss_streak** 與 **compute_run_boundary** lookback 均已以 numba 單 pass 實作；Code Review 修補（wager NaN 填 0、run_break_min_ns 上限）已完成。見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。 |
+| 20 | **Deploy DEC-028 修補（player_profile 打包／canonical 持久化）** | completed | DEPLOY_PLAN §8、DECISION_LOG DEC-028。Production 修補：scorer DATA_DIR 空/空白視為未設定；build 時 profile 複製失敗 try/except 建包仍完成；deploy main 遲 import 加 noqa: E402；scorer _DATA_DIR 型別註解。tests/test_review_risks_deploy_dec028.py 7/7 通過；tests/typecheck/lint 全過。見 STATUS.md「DEC-028 本輪實作修正與驗證」。 |
 
 **Plan 狀態摘要**：上表 1～19 項均為 **completed**（第 18 項於 Round 406 完成項目 1、3；第 19 項 Track Human Lookback 向量化於本輪完成 Phase 2 compute_run_boundary numba 與 Code Review 修補 wager NaN／run_break_min_ns 上限）。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
 
-**剩餘項目**：上表 1～19 項與 **canonical-step3-schema-check-oom**、**config-consolidation**（DEC-027）、**progress-bars-long-steps**、**training-config-recommender** 均已完成。DEC-027 與 progress-bars Code Review 修補已通過對應測試；training-config-recommender 已實作並完成 Code Review 修補（負 training_days frac clamp、CLI --days≥1 驗證、Parquet discovery OSError 防護），`tests/test_review_risks_training_config_recommender.py` 全 9 則通過。目前 **pending**：無（見上方 todos）。
+**剩餘項目**：上表 1～20 項與 **canonical-step3-schema-check-oom**、**config-consolidation**（DEC-027）、**progress-bars-long-steps**、**training-config-recommender** 均已完成。DEC-027 與 progress-bars Code Review 修補已通過對應測試；training-config-recommender 已實作並完成 Code Review 修補；**項目 20** Deploy DEC-028 修補已於本輪完成（scorer DATA_DIR 邊界、build profile 複製 try/except、E402 noqa、mypy _DATA_DIR 型別），`tests/test_review_risks_deploy_dec028.py` 7/7 通過，tests/typecheck/lint 全過。目前 **pending**：無（見上方 todos）。
 
 **建議實作順序**：可選／後續見下方各節（Step 7 out-of-core 排序、Optuna early stop 等）。
 

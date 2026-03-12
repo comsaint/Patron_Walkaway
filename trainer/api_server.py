@@ -176,8 +176,15 @@ def get_hc_history():
         return jsonify({"error": str(e)}), 500
 
 
-# --- ML API Protocol (doc/ML_API_PROTOCOL.md): GET /alerts, GET /validation ---
+# --- ML API Protocol (package/ML_API_PROTOCOL.md): GET /alerts, GET /validation ---
 # Default: last 24h when no query params. Port 8001. Protocol fields only.
+# Timestamps: HK time, format +08:00 per spec. limit only when ts absent.
+
+def _format_ts_hk_iso(series):
+    """Format datetime series as ISO with +08:00 offset (spec: HK timezone)."""
+    s = series.dt.floor("s").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+    return s.str.replace(r"(\+|-)(\d{2})(\d{2})$", r"\1\2:\3", regex=True)
+
 
 def _alerts_24h_cutoff():
     return datetime.now(HK_TZ) - timedelta(hours=24)
@@ -208,7 +215,8 @@ def _query_alerts_df(ts_param=None, limit_param=None, default_24h=False):
     elif default_24h:
         cutoff = _alerts_24h_cutoff()
         df = df[df["ts_dt"] > cutoff]
-    if limit_param is not None:
+    # Spec: limit only used when ts is absent
+    if limit_param is not None and not ts_param:
         try:
             limit = int(limit_param)
             if limit > 0:
@@ -219,28 +227,43 @@ def _query_alerts_df(ts_param=None, limit_param=None, default_24h=False):
 
 
 def _alerts_to_protocol_records(df):
-    """Shape alerts to ML_API_PROTOCOL.md: only protocol fields; casino_player_id null, is_known_player from is_rated_obs."""
+    """Shape alerts to ML_API_PROTOCOL.md: only protocol fields; casino_player_id null, is_known_player from is_rated_obs; timestamps +08:00; bet_id/session_id int when possible."""
     if df.empty:
         return []
     df = df.copy()
-    df["ts"] = (
+    ts_ser = (
         df["ts_dt"].dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
         if df["ts_dt"].dt.tz is None
         else df["ts_dt"].dt.tz_convert(HK_TZ)
     )
-    df["ts"] = df["ts"].dt.floor("s").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
     protocol_keys = [
         "bet_id", "ts", "bet_ts", "player_id", "casino_player_id", "table_id",
         "position_idx", "session_id", "visit_avg_bet", "is_known_player",
     ]
     out = pd.DataFrame(index=df.index)
-    for k in ["bet_id", "ts", "bet_ts", "player_id", "table_id", "position_idx", "session_id", "visit_avg_bet"]:
+    out["ts"] = _format_ts_hk_iso(ts_ser).replace("NaT", None)
+    for k in ["bet_id", "bet_ts", "player_id", "table_id", "position_idx", "session_id", "visit_avg_bet"]:
         out[k] = df[k] if k in df.columns else None
+    if "bet_ts" in df.columns:
+        bet_ts_dt = pd.to_datetime(out["bet_ts"], errors="coerce")
+        if hasattr(bet_ts_dt, "dt"):
+            b = bet_ts_dt.dt.tz_localize(HK_TZ, ambiguous="NaT") if bet_ts_dt.dt.tz is None else bet_ts_dt.dt.tz_convert(HK_TZ)
+            out["bet_ts"] = _format_ts_hk_iso(b).replace("NaT", None)
+        else:
+            out["bet_ts"] = out["bet_ts"]
     out["casino_player_id"] = None
     out["is_known_player"] = df["is_rated_obs"].fillna(0).astype(int) if "is_rated_obs" in df.columns else 0
     out = out[protocol_keys]
     out = out.replace({np.nan: None, np.inf: None, -np.inf: None})
-    return out.to_dict(orient="records")
+    records = out.to_dict(orient="records")
+    for r in records:
+        for key in ("bet_id", "session_id"):
+            if key in r and r[key] is not None:
+                try:
+                    r[key] = int(r[key])
+                except (TypeError, ValueError):
+                    pass
+    return records
 
 
 def _query_validation_df(ts_param=None, bet_id_param=None, bet_ids_param=None, default_24h=False):
@@ -279,7 +302,7 @@ def _query_validation_df(ts_param=None, bet_id_param=None, bet_ids_param=None, d
 
 
 def _validation_to_protocol_records(df):
-    """Shape validation to ML_API_PROTOCOL.md: TP as string, casino_player_id null."""
+    """Shape validation to ML_API_PROTOCOL.md: TP as string, casino_player_id null, bet_id string, timestamps +08:00."""
     if df.empty:
         return []
     out = df[["alert_ts", "player_id", "bet_id", "gap_start", "result", "validated_at", "reason", "bet_ts"]].rename(columns={
@@ -290,13 +313,14 @@ def _validation_to_protocol_records(df):
     out["TP"] = out["result"].apply(lambda x: "TP" if x in (1, True, 1.0) else "FP")
     out = out.drop(columns=["result"], errors="ignore")
     out["casino_player_id"] = None
+    out["bet_id"] = out["bet_id"].astype(str)
     for col in ["ts", "walkaway_ts", "sync_ts", "bet_ts"]:
         dt_col = pd.to_datetime(out[col], errors="coerce")
         if getattr(dt_col.dt, "tz", None) is None:
-            dt_col = dt_col.dt.tz_localize(HK_TZ)
+            dt_col = dt_col.dt.tz_localize(HK_TZ, ambiguous="NaT")
         else:
             dt_col = dt_col.dt.tz_convert(HK_TZ)
-        out[col] = dt_col.dt.floor("s").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+        out[col] = _format_ts_hk_iso(dt_col).replace("NaT", None)
     out = out[["ts", "player_id", "casino_player_id", "bet_id", "walkaway_ts", "TP", "sync_ts", "reason", "bet_ts"]]
     out = out.replace({np.nan: None, np.inf: None, -np.inf: None})
     return out.to_dict(orient="records")
