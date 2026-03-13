@@ -63,16 +63,7 @@ except ImportError:
         _join_profile = None  # type: ignore[assignment]
         coerce_feature_dtypes = None  # type: ignore[assignment]
 
-try:
-    from db_conn import get_clickhouse_client  # type: ignore[import]
-except ImportError:
-    try:
-        from .db_conn import get_clickhouse_client  # type: ignore[import]
-    except ImportError:
-        try:
-            from trainer.db_conn import get_clickhouse_client  # type: ignore[import]
-        except ImportError:
-            get_clickhouse_client = None  # type: ignore[assignment]
+from .db_conn import get_clickhouse_client  # Option A: package entrypoint only; no try/except package-name guessing
 
 try:
     import config  # type: ignore[import]

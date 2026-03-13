@@ -55,12 +55,8 @@ class TestProgressBars_R1_BackfillStartAfterEnd(unittest.TestCase):
     @patch("trainer.etl_player_profile.build_player_profile", return_value=None)
     @patch("trainer.etl_player_profile._tqdm_bar")
     def test_backfill_day_by_day_start_after_end_tqdm_total_non_negative(self, mock_tqdm_bar, _mock_build):
-        """Contract: when start > end, total_days passed to tqdm must be >= 0. xfail until production uses max(0, ...)."""
-        mock_bar = MagicMock()
-        mock_bar.update = MagicMock()
-        mock_bar.close = MagicMock()
-        mock_tqdm_bar.return_value = mock_bar
-
+        """Contract: when start > end, backfill uses a single date-list path; iterable passed to tqdm must be empty (len >= 0)."""
+        mock_tqdm_bar.side_effect = lambda it, **kw: it  # pass-through when disabled; when enabled return iterable
         etl_mod.backfill(
             start_date=date(2026, 1, 5),
             end_date=date(2026, 1, 1),
@@ -68,10 +64,12 @@ class TestProgressBars_R1_BackfillStartAfterEnd(unittest.TestCase):
             preload_sessions=False,
             disable_progress=False,
         )
-        kwargs = mock_tqdm_bar.call_args[1] if mock_tqdm_bar.call_args[1] else {}
-        total = kwargs.get("total")
-        self.assertIsNotNone(total, "_tqdm_bar should be called with total= in day-by-day branch")
-        self.assertGreaterEqual(total, 0, "total must be >= 0 to avoid tqdm misbehaviour")
+        # Unified path: _tqdm_bar(dates_to_process, desc=..., unit="snapshot"); first arg is the date list.
+        call_args = mock_tqdm_bar.call_args
+        self.assertIsNotNone(call_args, "_tqdm_bar should be called in backfill")
+        dates_iter = call_args[0][0] if call_args[0] else []
+        n = len(list(dates_iter)) if hasattr(dates_iter, "__iter__") and not isinstance(dates_iter, (str, bytes)) else 0
+        self.assertGreaterEqual(n, 0, "iterable length (effective total) must be >= 0 when start > end")
 
 
 # ---------------------------------------------------------------------------

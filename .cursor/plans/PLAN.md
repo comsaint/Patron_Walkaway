@@ -131,6 +131,9 @@ todos:
   - id: step8-duckdb-stats
     content: "Step 8 Feature Screening：DuckDB 算統計量（std/可選 corr）避免 X.std() 全量 OOM；並檢視其他類似全量統計是否可一併優化。見「Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）」一節。"
     status: pending
+  - id: package-entrypoint-db-conn-imports
+    content: "套件 entrypoint + 相對匯入（Option A）：統一以 package 方式執行、db_conn 等僅用相對匯入、無 try/except 包名猜測；需 ClickHouse 時若無法取得 client 即 raise。見「套件 entrypoint 與 db_conn 相對匯入（Option A）」一節。"
+    status: completed
 isProject: false
 ---
 
@@ -3048,3 +3051,53 @@ Step 9 → lgb.Dataset(train.libsvm)，LightGBM 自動載入 .weight
 | 3 | **`trainer/scripts/auto_build_player_profile.py`**：新增 **`--month-end`**，並在呼叫 ETL 時傳遞（subprocess 或單一範圍 + `--month-end`），使一鍵 backfill 可選 month-end-only。 |
 | 4 | 為 **profile_schedule** 與 **ETL CLI month-end**（含 intra-month）補上 **測試**。 |
 | 5 | 更新 **ETL 與 package/README** 文件。 |
+
+---
+
+## 套件 entrypoint 與 db_conn 相對匯入（Option A）
+
+### 目標
+
+- **不再依賴 try/except 猜測包名**（`db_conn` / `trainer.db_conn` / `walkaway_ml.db_conn`）：改包名即易壞且難維護。
+- **統一約定**：程式一律以 **package 方式執行**（例如 `python -m trainer.validator`、deploy 的 `walkaway_ml` entrypoint）；不支援「直接執行單一檔案」如 `python trainer/validator.py`。
+- **單一匯入方式**：凡需 `get_clickhouse_client` 的模組，一律使用 **同套件相對匯入** `from .db_conn import get_clickhouse_client`。套件名無論為 `trainer`、`walkaway_ml` 或未來更名，皆無需改程式。
+- **Fail-fast**：在「應連線 ClickHouse」的情境（validator 驗證、scorer 拉即時 bet、ETL 非 `--local-parquet` 等），若無法取得 client（匯入失敗或依賴缺失），**立即 raise**，不靜默設為 `None` 導致誤判（如 all MATCH）。
+
+### 背景與問題
+
+- **現狀**：validator / etl_player_profile 僅 `from db_conn import ...`，deploy 時包名為 `walkaway_ml` 導致 ImportError → `get_clickhouse_client = None`，validator 無 bet 資料卻靜默 MATCH。scorer 有多層 fallback（`db_conn` → `.db_conn` → `trainer.db_conn`）故 deploy 可動，但寫法脆弱，改包名需再加一層 except。
+- **取捨**：Option A 不支援「以腳本直接跑單檔」；若需支援，可再以 Option B（單一 fallback 用 `__package__`）補強，本計畫先採 A。
+
+### 實作要點
+
+| 項目 | 內容 |
+|------|------|
+| 1. 相對匯入 | **validator**、**scorer**、**etl_player_profile**、**trainer**（若目前非相對匯入）、**status_server** 等所有使用 `get_clickhouse_client` 的模組，改為 `from .db_conn import get_clickhouse_client`；**移除**多層 try/except 與 `trainer.db_conn` / `walkaway_ml.db_conn` 等硬編碼。 |
+| 2. 單一 fallback（可選） | 若仍要支援「非 package 執行」（如 `__name__ == "__main__"` 且無上層套件），僅保留**一層** fallback：以 `__package__` 或 `__name__.rsplit(".", 1)[0]` 推斷當前套件名，`import_module(f"{pkg}.db_conn")` 取 client；預設僅在無套件時用一固定名（如 `trainer`），**不**列舉多個包名。 |
+| 3. 需 ClickHouse 時 raise | **validator**：進入 `validate_once` 且有待驗證 alert 時，若 `get_clickhouse_client is None`，**raise RuntimeError**（例如「validator 需要 ClickHouse 以取得 bet/session 資料；無法取得 client」），不靜默跳過。**scorer**：已有「無法 fetch 即 raise」；維持。**etl_player_profile**：在非 `--local-parquet` 且需連線時，若 client 為 None 則 raise，不靜默 fallback。 |
+| 4. 文件與約定 | 在 **README** 或 **doc** 註明：執行方式請用 `python -m trainer.xxx` 或 deploy 指定之 entrypoint；不保證 `python path/to/file.py` 可正常取得 db_conn / config。CI 與本機指令一律以 `python -m` 或 package 入口執行。 |
+
+### 涉及檔案（建議）
+
+| 檔案 | 變更摘要 |
+|------|----------|
+| `trainer/validator.py` | `from .db_conn import get_clickhouse_client`；若為 None 且有待驗證 alert 則 raise。 |
+| `trainer/scorer.py` | 移除多層 try/except，改為 `from .db_conn import get_clickhouse_client`（或保留單一 fallback 如上）；維持「需 fetch 時 client 為 None 即 raise」。 |
+| `trainer/etl_player_profile.py` | `from .db_conn import get_clickhouse_client`；非 local-parquet 且需 ClickHouse 時若 None 則 raise。 |
+| `trainer/trainer.py` | 若目前為 `from db_conn` / `from trainer.db_conn`，改為相對匯入或與上述一致之單一 fallback。 |
+| `trainer/status_server.py` | 改為相對匯入 `from .db_conn import get_clickhouse_client`（或同套件匯入）。 |
+| `trainer/training_config_recommender.py` | 若依賴 `trainer.db_conn`，改為相對匯入或依執行情境統一。 |
+| 文件（README / doc） | 註明「以 package 執行」之約定與建議指令。 |
+
+### 實作檢查表
+
+| 步驟 | 動作 |
+|------|------|
+| 1 | 將 **validator**、**scorer**、**etl_player_profile**、**trainer**、**status_server** 中取得 `get_clickhouse_client` 的程式改為 **相對匯入** `from .db_conn import get_clickhouse_client`（必要時保留單一 fallback，不列舉包名）。 |
+| 2 | **validator**：在需要 fetch bet/session 時，若 `get_clickhouse_client is None` 則 **raise RuntimeError**，不靜默繼續。 |
+| 3 | **etl_player_profile**：在非 `--local-parquet` 且需 ClickHouse 時，若 client 為 None 則 **raise**。 |
+| 4 | 確認 **scorer** 已為「需 fetch 即 raise」且匯入方式符合上述約定。 |
+| 5 | 更新 **README** 或開發文件：執行方式以 `python -m trainer.xxx` 或 deploy entrypoint 為準，不支援直接執行單檔。 |
+| 6 | 執行 tests / typecheck / lint；deploy 情境下驗證 validator 可正確取得 ClickHouse client 並驗證 alert。 |
+
+**Code Review 修補（2026-03-13）**：status_server config try/except、training_config_recommender 縮窄 except 並 re-raise RuntimeError、trainer.py try/except 註解已實作；Option A 專用測試 7 passed / 1 skipped。見 STATUS.md「本輪：Code Review 套件 entrypoint 與 db_conn 修補完成」。

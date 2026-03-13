@@ -198,7 +198,8 @@ except ModuleNotFoundError:
     STEP8_SCREEN_SAMPLE_ROWS = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
     CASINO_PLAYER_ID_CLEAN_SQL = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END")
 
-# Module-level pipeline imports (same try/except pattern)
+# Module-level pipeline imports: try = run from trainer dir with modules on path (e.g. dev);
+# except = run as package (python -m trainer.trainer). Only the except path uses relative db_conn.
 try:
     from time_fold import get_monthly_chunks, get_train_valid_test_split  # type: ignore[import]
     from identity import (  # type: ignore[import]
@@ -221,6 +222,7 @@ try:
         get_all_candidate_feature_ids,
         get_candidate_feature_ids,
     )
+    # except path uses relative .db_conn (python -m trainer.trainer)
     from db_conn import get_clickhouse_client  # type: ignore[import]
     from etl_player_profile import (  # type: ignore[import]
         compute_profile_schema_hash,
@@ -251,7 +253,7 @@ except ModuleNotFoundError:
         get_all_candidate_feature_ids,
         get_candidate_feature_ids,
     )
-    from trainer.db_conn import get_clickhouse_client  # type: ignore[import]
+    from .db_conn import get_clickhouse_client  # type: ignore[import]
     from trainer.etl_player_profile import (  # type: ignore[import]
         compute_profile_schema_hash,
         LOCAL_PROFILE_SCHEMA_HASH,

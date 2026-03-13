@@ -9,8 +9,12 @@ from typing import Any, Dict, List, Tuple
 import pandas as pd
 from zoneinfo import ZoneInfo
 
-import config
-from db_conn import get_clickhouse_client
+try:
+    import config  # type: ignore[import]
+except ModuleNotFoundError:
+    import trainer.config as config  # type: ignore[import, no-redef]
+
+from .db_conn import get_clickhouse_client
 
 HK_TZ = ZoneInfo(config.HK_TZ)
 BASE_DIR = Path(__file__).parent

@@ -60,10 +60,7 @@ try:
 except ModuleNotFoundError:
     import trainer.config as config  # type: ignore[import, no-redef]
 
-try:
-    from db_conn import get_clickhouse_client  # type: ignore[import]
-except ImportError:
-    get_clickhouse_client = None  # type: ignore[assignment]
+from .db_conn import get_clickhouse_client  # Option A: package entrypoint only; no try/except package-name guessing
 
 try:
     from identity import build_canonical_mapping  # type: ignore[import]
@@ -1502,8 +1499,10 @@ def build_player_profile(
         )
     if sessions_raw is None:
         if get_clickhouse_client is None:
-            logger.error("ClickHouse client unavailable and no local Parquet; aborting")
-            return None
+            raise RuntimeError(
+                "ETL requires ClickHouse when sessions are not from local Parquet; "
+                "get_clickhouse_client is unavailable. Run as package (e.g. python -m trainer.etl_player_profile)."
+            )
         try:
             client = get_clickhouse_client()
             sessions_raw = _load_sessions(snapshot_dtm, client)
@@ -1530,6 +1529,11 @@ def build_player_profile(
                     logger.warning("No local canonical_mapping.parquet; cannot join canonical_id")
                     return None
             else:
+                if get_clickhouse_client is None:
+                    raise RuntimeError(
+                        "ETL requires ClickHouse for canonical mapping when not using local Parquet; "
+                        "get_clickhouse_client is unavailable. Run as package (e.g. python -m trainer.etl_player_profile)."
+                    )
                 client = get_clickhouse_client()
                 canonical_map = build_canonical_mapping(client, cutoff_dtm=snapshot_dtm)
         except Exception as exc:
@@ -1658,7 +1662,12 @@ def backfill(
             if d2_path.exists():
                 canonical_map = pd.read_parquet(d2_path)
                 logger.info("backfill: reusing local canonical_map (%d rows)", len(canonical_map))
-        elif get_clickhouse_client is not None:
+        else:
+            if get_clickhouse_client is None:
+                raise RuntimeError(
+                    "Backfill requires ClickHouse for canonical_map when not using local Parquet; "
+                    "get_clickhouse_client is unavailable. Run as package (e.g. python -m trainer.etl_player_profile)."
+                )
             try:
                 client = get_clickhouse_client()
                 end_cutoff = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59)
@@ -1771,79 +1780,56 @@ def backfill(
     failed = 0
     skipped = 0
 
+    # Build a single list of dates to process so log and progress bar are shared
+    # (month-end, by-date, or future by-week all use the same display path).
     if snapshot_dates is not None:
-        # DEC-019: iterate over an explicit date list (e.g. month-end dates),
-        # filtered to [start_date, end_date].  Ignores snapshot_interval_days.
+        # DEC-019: explicit date list (e.g. month-end), filtered to [start_date, end_date].
         dates_to_process = sorted(d for d in snapshot_dates if start_date <= d <= end_date)
         logger.info(
             "backfill (DEC-019 snapshot_dates): %d dates in [%s, %s]",
             len(dates_to_process), start_date, end_date,
         )
-        date_iter = (
-            dates_to_process
-            if disable_progress
-            else _tqdm_bar(dates_to_process, desc="Profile backfill", unit="snapshot")
-        )
-        for snap_date in date_iter:
-            try:
-                result = build_player_profile(
-                    snap_date,
-                    use_local_parquet=use_local_parquet,
-                    canonical_map=canonical_map,
-                    preloaded_sessions=preloaded_sessions,
-                    canonical_id_whitelist=canonical_id_whitelist,
-                    max_lookback_days=max_lookback_days,
-                    sched_tag=_sched_tag,
-                )
-                if result is not None:
-                    success += 1
-                else:
-                    failed += 1
-            except Exception as exc:
-                logger.error("Failed for %s: %s", snap_date, exc)
-                failed += 1
+        skipped = 0  # explicit date list: no "calendar skip" semantics
     else:
-        # Original day-by-day loop with snapshot_interval_days.
-        # Review #1: clamp so tqdm(total=...) never receives negative when start_date > end_date.
-        total_days = max(0, (end_date - start_date).days + 1)
-        pbar = (
-            _ProgressNoop()
-            if disable_progress
-            else _tqdm_bar(total=total_days, desc="Profile backfill", unit="day")
-        )
+        # By-date: every snapshot_interval_days-th day in [start_date, end_date].
+        dates_to_process = []
+        d = start_date
+        while d <= end_date:
+            dates_to_process.append(d)
+            d += timedelta(days=snapshot_interval_days)
+        total_days_in_range = max(0, (end_date - start_date).days + 1)
+        skipped = total_days_in_range - len(dates_to_process)
+        if dates_to_process:
+            logger.info(
+                "backfill (interval=%d days): %d dates in [%s, %s]",
+                snapshot_interval_days, len(dates_to_process), start_date, end_date,
+            )
+
+    n_dates = len(dates_to_process)
+    date_iter = (
+        dates_to_process
+        if disable_progress
+        else _tqdm_bar(dates_to_process, desc="Profile backfill", unit="snapshot")
+    )
+    for i, snap_date in enumerate(date_iter):
+        logger.info("Calculating snapshot for %s (%d/%d)", snap_date, i + 1, n_dates)
         try:
-            current = start_date
-            _day_idx = 0
-            while current <= end_date:
-                if _day_idx % snapshot_interval_days == 0:
-                    try:
-                        result = build_player_profile(
-                            current,
-                            use_local_parquet=use_local_parquet,
-                            canonical_map=canonical_map,
-                            preloaded_sessions=preloaded_sessions,
-                            canonical_id_whitelist=canonical_id_whitelist,
-                            max_lookback_days=max_lookback_days,
-                            sched_tag=_sched_tag,
-                        )
-                        if result is not None:
-                            success += 1
-                        else:
-                            failed += 1
-                    except Exception as exc:
-                        logger.error("Failed for %s: %s", current, exc)
-                        failed += 1
-                else:
-                    skipped += 1
-                    logger.debug(
-                        "backfill: skipping %s (snapshot_interval_days=%d, day_idx=%d)",
-                        current, snapshot_interval_days, _day_idx,
-                    )
-                current += timedelta(days=1)
-                _day_idx += 1
-                pbar.update(1)
-        finally:
-            pbar.close()
+            result = build_player_profile(
+                snap_date,
+                use_local_parquet=use_local_parquet,
+                canonical_map=canonical_map,
+                preloaded_sessions=preloaded_sessions,
+                canonical_id_whitelist=canonical_id_whitelist,
+                max_lookback_days=max_lookback_days,
+                sched_tag=_sched_tag,
+            )
+            if result is not None:
+                success += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            logger.error("Failed for %s: %s", snap_date, exc)
+            failed += 1
 
     logger.info(
         "Backfill complete: %d succeeded, %d failed, %d skipped",

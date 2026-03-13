@@ -52,6 +52,8 @@ From the **repository root** (for local testing with dashboard):
 python -m trainer.api_server
 ```
 
+**Note:** Trainer components (validator, scorer, etl_player_profile, trainer, status_server, etc.) must be run as a package (e.g. `python -m trainer.validator`). Direct script execution (e.g. `python trainer/validator.py`) is not supported; the deploy entrypoint uses the same package-style imports.
+
 - **Base URL:** `http://localhost:8001`
 - **Port override:** `ML_API_PORT=8002 python -m trainer.api_server`
 

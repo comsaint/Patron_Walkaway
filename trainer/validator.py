@@ -36,10 +36,7 @@ except ModuleNotFoundError:
     except ImportError:
         import trainer.config as config  # type: ignore[import, no-redef]
 
-try:
-    from db_conn import get_clickhouse_client  # type: ignore[import]
-except ImportError:
-    get_clickhouse_client = None  # type: ignore[assignment]
+from .db_conn import get_clickhouse_client  # Option A: package entrypoint only; no try/except package-name guessing
 
 HK_TZ = ZoneInfo(config.HK_TZ)
 # Sentinel for ongoing sessions (NULL session_end_dtm in DB); must not trigger
@@ -651,6 +648,17 @@ def validate_alert_row(
         bet_list = bet_cache[canonical_id]
     else:
         bet_list = bet_cache.get(str(int(player_id)) if pd.notna(player_id) else "", [])
+
+    # Do not conclude MATCH when we have no bet data (e.g. fetch failed, wrong range, or TZ mismatch).
+    # Otherwise find_gap_within_window(..., []) would treat "no bets in window" as a 45m gap and we'd falsely MATCH.
+    if not bet_list:
+        logger.warning(
+            "[validator] No bet data for canonical_id=%s player_id=%s bet_id=%s — leaving PENDING (cannot verify late arrivals)",
+            canonical_id, player_id, bet_id,
+        )
+        res_base.update({"result": None, "reason": "PENDING"})
+        return res_base
+
     # Find last bet before bet_ts
     idx = bisect_left(bet_list, bet_ts)
     last_bet_before = bet_list[idx - 1] if idx > 0 else None
@@ -926,6 +934,11 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
     bet_cache: Dict[str, List[datetime]] = {}
     session_cache: Dict[str, List[Dict]] = {}
     if player_ids or cid_to_pids:
+        if get_clickhouse_client is None:
+            raise RuntimeError(
+                "Validator requires ClickHouse to fetch bets/sessions for validation; "
+                "get_clickhouse_client is unavailable. Run as package (e.g. python -m trainer.validator)."
+            )
         fetch_start = effective_ts[pending.index].min() - timedelta(hours=1)
         fetch_end = now_hk
         try:

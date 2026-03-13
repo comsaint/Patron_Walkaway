@@ -6,6 +6,76 @@
 
 ---
 
+## Validator：all alerts MATCH — empty bet_list 導致誤判
+
+**Date**: 2026-03-13
+
+### 現象
+
+目標機重新部署後，所有 alert 仍被標為 MATCH；個案：玩家 bet 581874952 觸發 alert，但該玩家之後至少繼續玩一小時（應為 MISS 或 PENDING，不應為 MATCH）。
+
+### 根因（validator.py）
+
+當 **bet_list 為空**（從 ClickHouse 查不到該 canonical_id / player_id 在 [fetch_start, fetch_end] 內的任何一筆 bet）時：
+
+1. `find_gap_within_window(bet_ts, [], base_start=bet_ts)` 會把「窗口內沒有任何 bet」當成「bet_ts 到 horizon_end 的 45 分鐘空檔」，回傳 `(True, bet_ts, 45.0)`。
+2. 接著 `any_late_bet_in_window` 對空 list 為 False。
+3. 程式因此將該筆 **finalize 為 MATCH**，造成「沒有 bet 資料卻被當成已確認 walkaway」。
+
+可能導致 bet_list 為空的原因包括：  
+- ClickHouse 查詢時間範圍／時區與 DB 儲存不一致（fetch_start/fetch_end 為 HK，若 DB 存 UTC 且 driver 未轉換會查不到）；  
+- canonical_id 或 player_id 對應錯誤，查錯人；  
+- 連線或查詢失敗後 bet_cache 為空。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/validator.py` | 在 `validate_alert_row` 內，取得 `bet_list` 後若為空，**不再進入後續 gap / late-arrival 邏輯**：直接 `res_base.update({"result": None, "reason": "PENDING"})` 並 return，並打一筆 WARNING log：`No bet data for canonical_id=... player_id=... bet_id=... — leaving PENDING (cannot verify late arrivals)`。避免「無 bet 資料」被誤判為 MATCH。 |
+
+### 驗證
+
+- `python -m pytest tests/test_review_risks_validator_round393.py tests/test_validator_datetime_naive_hk.py -v` → 12 passed.
+
+### 若問題仍存在，可再提供之資料
+
+1. **Validator 當輪 log**  
+   - 是否有 `[validator] No bet data for canonical_id=... bet_id=581874952`？若有，代表目前 fix 已生效，問題在「為何 ClickHouse 查不到該玩家該時段 bet」。
+2. **SQLite alerts 表**  
+   - 該筆 alert 的 `bet_ts`、`ts`、`canonical_id`、`player_id`（可 `sqlite3 state.db "SELECT bet_id, bet_ts, ts, canonical_id, player_id FROM alerts WHERE bet_id=581874952"`）。
+3. **ClickHouse 時間與時區**  
+   - `payout_complete_dtm` 在 DB 的型別與時區（DateTime / DateTime64, 是否 UTC）；  
+   - 同一 player 在 bet_ts 前後 1 小時內的 bet 筆數與一兩筆範例時間（可對照 gmwds_data_bets_of_173812520.xls）。
+4. **比對用表格**  
+   - gmwds_data_bets_of_173812520.xls 中 bet_id 581874952 的 `payout_complete_dtm`（或等同欄位）與其後數筆 bet 的時間，用於確認 validator 的 15–45m 窗口應包含哪些「late arrival」。
+
+---
+
+## Backfill：統一 log 與 progress bar（month-end / by-date / 未來 by-week 共用）
+
+**Date**: 2026-03-13
+
+### 目標
+
+不論是 month-end（`snapshot_dates`）、by-date（`snapshot_interval_days`）或未來新增排程（如 by-week），都使用**同一段**程式顯示「正在計算的日期」日誌與 tqdm 進度條，方便維護與擴充。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/etl_player_profile.py` | **backfill()**：改為先依模式建出單一 **dates_to_process**（month-end 時為 filtered snapshot_dates；by-date 時為 start_date + k×interval 直至 end_date），再以**同一迴圈**迭代：`date_iter = tqdm(dates_to_process, ...)`（或無 bar 時用原 list），每筆前 `logger.info("Calculating snapshot for %s (%d/%d)", snap_date, i+1, n_dates)`，然後呼叫 `build_player_profile(snap_date, ...)`。移除原 day-by-day 的 while + 手動 pbar.update(1)。month-end 時 skipped=0；by-date 時 skipped = total_days_in_range - len(dates_to_process)。 |
+| `tests/test_review_risks_progress_bars_long_steps.py` | **test_backfill_day_by_day_start_after_end_tqdm_total_non_negative**：契約改為「unified path 下 _tqdm_bar 收到之 iterable 長度 ≥ 0」（start > end 時為空 list），不再要求 `total=` 關鍵字參數。 |
+
+### 驗證
+
+- `python -m pytest tests/test_etl_player_profile_month_end_cli.py tests/test_auto_build_player_profile_month_end.py tests/test_review_risks_progress_bars_long_steps.py tests/test_profile_schedule.py -v` → 21 passed.
+
+### 備註
+
+- 未來若新增 by-week，只需在 CLI 層組出對應的 **dates_to_process**（例如 `week_end_dates(start, end)`）並呼叫 `backfill(..., snapshot_dates=dates_to_process)`，即可自動沿用同一 log 與 progress bar，無需再改 backfill 迴圈。
+
+---
+
 ## Validator parse_alerts：naive datetime 當 HK 修復（+8 小時 bug）
 
 **Date**: 2026-03-12
@@ -1720,5 +1790,225 @@ python -m pytest -q
 
 - 「CLI for month-end-only player_profile」實作檢查表步驟 1～5 已於前輪完成；本輪僅修正 lint（E402），並在 PLAN 中將該項標為 **completed**。
 - **剩餘項目**：PLAN 中仍為 **pending** 者為 **Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）**；與 CLI month-end 無關。
+
+---
+
+## PLAN § 套件 entrypoint 與 db_conn 相對匯入（Option A）
+
+**Date**: 2026-03-13
+
+### 目標
+
+僅使用**相對匯入**取得 `get_clickhouse_client`（`from .db_conn import get_clickhouse_client`），不再以 try/except 猜測多種套件名；執行方式統一為**套件執行**（如 `python -m trainer.validator`），不支援直接執行腳本。需要 ClickHouse 的流程在 client 不可用時 **fail-fast**（raise），不靜默繼續。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/validator.py` | 改為 `from .db_conn import get_clickhouse_client`；在 `validate_once` 中若有 pending 且需 fetch bet/session，在呼叫 fetch 前若 `get_clickhouse_client is None` 則 **raise RuntimeError**（說明需 ClickHouse、建議以 package 執行）。 |
+| `trainer/scorer.py` | 將三層 try/except（db_conn → .db_conn → trainer.db_conn）改為單一 `from .db_conn import get_clickhouse_client`；原有 fetch 時 client 為 None 即 raise 保留。 |
+| `trainer/etl_player_profile.py` | 改為 `from .db_conn import get_clickhouse_client`。**build_player_profile**：sessions_raw 為 None 且非 local-parquet 時，若 client 不可用則 **raise**；canonical_map 為 None 且非 local-parquet 時，在呼叫 `get_clickhouse_client` 前若不可用則 **raise**。**backfill**：非 local-parquet 且要從 ClickHouse 建 canonical_map 時，若 client 不可用則 **raise**（不再靜默跳過）。 |
+| `trainer/trainer.py` | except 分支（package 模式）改為 `from .db_conn import get_clickhouse_client`（原 `from trainer.db_conn import ...`）。 |
+| `trainer/status_server.py` | `from db_conn import get_clickhouse_client` → `from .db_conn import get_clickhouse_client`。 |
+| `trainer/training_config_recommender.py` | 函式內 `from trainer.db_conn import get_clickhouse_client` → `from .db_conn import get_clickhouse_client`（相對匯入）。 |
+| `package/README.md` | 在「Run the ML API server」小節後加註：trainer 元件須以套件執行（`python -m trainer.xxx`），不支援直接執行腳本；deploy entrypoint 同為套件式匯入。 |
+
+### 手動驗證
+
+1. **套件執行**（自 repo 根目錄）：
+   - `python -m trainer.validator --help`、`python -m trainer.scorer --help`、`python -m trainer.etl_player_profile --help`、`python -m trainer.trainer --help` → 無 ImportError。
+   - 有 ClickHouse 時：`python -m trainer.scorer --once --lookback-hours 1`、`python -m trainer.validator --once`（若有 pending）→ 正常執行或依邏輯結束。
+2. **Fail-fast**：在無 ClickHouse 或故意讓 `get_clickhouse_client` 不可用的環境下，執行需 DB 的路徑（例如 validator 有 pending、etl 非 `--local-parquet`）→ 應出現 **RuntimeError** 且訊息提及「Run as package (e.g. python -m trainer.xxx)」。
+3. **Lint / typecheck**（可選）：`ruff check trainer/`、`python -m mypy trainer/ --ignore-missing-imports`。
+
+### 下一步建議
+
+1. 將 PLAN.md 中對應 todo（`package-entrypoint-db-conn-imports`）標記為 **completed**。
+2. 若有 CI，確認以 `python -m trainer.*` 執行之測試與指令皆通過。
+3. 其餘 PLAN 待辦（如 feat-consolidation、Step 8 Feature Screening）依原計畫進行。
+
+---
+
+## Code Review：PLAN § 套件 entrypoint 與 db_conn 相對匯入（Option A）變更
+
+**Date**: 2026-03-13
+
+針對「套件 entrypoint 與 db_conn 相對匯入（Option A）」實作之變更進行 review。僅列**最可能的 bug／邊界條件／安全性／效能**，每項附**具體修改建議**與**希望新增的測試**。不重寫整套。
+
+---
+
+### 1. 正確性／語意：`get_clickhouse_client is None` 在現行 db_conn 下恆為 False
+
+**問題**：`db_conn.get_clickhouse_client` 在 `clickhouse_connect` 不可用時是**在呼叫時 raise**，不會回傳 `None`。因此凡使用 `from .db_conn import get_clickhouse_client` 的模組，該符號一定是 callable，**不會是 None**。validator / etl_player_profile / scorer 中新增的 `if get_clickhouse_client is None: raise RuntimeError("... Run as package ...")` 在正常執行路徑下**永遠不會成立**；實際失敗會發生在後續呼叫 `get_clickhouse_client()` 時，由 db_conn 拋出「clickhouse_connect not available...」。使用者因此幾乎看不到「Run as package」的提示，只會看到 db_conn 的錯誤訊息，可能誤以為是「沒用 package 執行」而非「未安裝 clickhouse-connect 或 .env 未載入」。
+
+**具體修改建議**：
+- **選項 A（建議）**：在 `db_conn.py` 的 `RuntimeError` 文案中補一句提示，例如：「If running as package (e.g. python -m trainer.xxx), also ensure clickhouse-connect is installed and .env is loaded.」讓兩種失敗情境（未以 package 執行 vs 依賴未裝）都有線索。
+- **選項 B**：保留各模組的 `if get_clickhouse_client is None` 作為防呆／mock 情境，並在註解註明：「Defensive: only True if name is rebound (e.g. in tests); under normal import it is always callable.」
+
+**希望新增的測試**：
+- 單元：mock `trainer.db_conn.get_clickhouse_client` 為 `None`，呼叫 `validate_once`（或有 pending 的情境），預期 **raise RuntimeError** 且訊息含「Run as package」或「ClickHouse」。
+- 單元：不 mock，但 mock `clickhouse_connect = None`（或未安裝），在需 ClickHouse 的路徑呼叫 `get_clickhouse_client()`，預期 raise 來自 **db_conn** 且訊息含「clickhouse_connect not available」或「install clickhouse-connect」。
+
+---
+
+### 2. 邊界條件：status_server 仍使用頂層 `import config`
+
+**問題**：`status_server.py` 已改為 `from .db_conn import get_clickhouse_client`，但仍使用 `import config`（頂層絕對匯入）。以 `python -m trainer.status_server` 自 repo 根目錄執行時，若專案根目錄沒有 `config` 模組，會先因 `import config` 失敗而無法啟動；與「一律以 package 執行」的約定一致，但與其他 trainer 子模組的 config 匯入方式（try: config / except: trainer.config）不一致，易在未來搬移或複製 status_server 時踩雷。
+
+**具體修改建議**：
+- 與 validator / etl_player_profile 一致：改為 `try: import config except ModuleNotFoundError: import trainer.config as config`，或統一改為 `from . import config`（若確定永遠以 package 執行）。如此 status_server 在 `python -m trainer.status_server` 下無論 cwd 是否帶有頂層 config 都能正確解析為 trainer.config。
+
+**希望新增的測試**：
+- 單元或整合：在無頂層 `config` 模組的環境下（或 mock sys.modules 移除 config），執行 `python -m trainer.status_server` 或 `import trainer.status_server`，預期成功載入且 `status_server.config` 指向 `trainer.config`（或等價行為）。
+
+---
+
+### 3. 邊界條件：training_config_recommender 的 `except Exception` 過寬
+
+**問題**：`training_config_recommender.py` 內 `from .db_conn import get_clickhouse_client` 外層為 `except Exception: get_client = None`。會吞掉所有例外（含 ImportError、ModuleNotFoundError、以及 db_conn 在 import 時可能拋出的其他錯誤），導致「無法取得 client」時靜默設為 None。若日後 db_conn 在 import 階段因設定錯誤而 raise，除錯時不易區分「套件未裝」與「設定錯誤」。
+
+**具體修改建議**：
+- 改為只捕捉與匯入相關的例外，例如：`except (ImportError, ModuleNotFoundError, AttributeError): get_client = None`，並在註解註明「Lazy import may fail when not run as trainer package or when db_conn is missing」。若希望更保守，可保留 `except Exception` 但至少 log：`logger.debug("get_clickhouse_client not available: %s", exc)`。
+
+**希望新增的測試**：
+- 單元：mock `trainer.training_config_recommender` 的 `.db_conn` 在 import 時 raise `ImportError`，呼叫 recommend 相關函式且 `skip_ch_connect=False`、`get_client=None`，預期 `get_client` 仍為 None 且後續不崩潰（或依現有邏輯跳過 CH 估計）。
+- 可選：當 import 時 raise `RuntimeError`（模擬 db_conn 內部錯誤），預期 either 傳播例外或 log，不靜默設為 None 且無 log。
+
+---
+
+### 4. 一致性：trainer.py 仍保留雙重匯入路徑
+
+**問題**：`trainer.py` 的 try 分支使用 `from db_conn import get_clickhouse_client`（絕對），except 分支使用 `from .db_conn import get_clickhouse_client`（相對）。與 PLAN「單一匯入方式」不完全一致；且 try 分支依賴「db_conn 為頂層可解析」（例如 cwd 為 trainer 且 PYTHONPATH 含該目錄）。若未來移除 try 分支或統一改為僅 package 執行，僅改 except 即可；目前為刻意保留的雙路徑，需在文件或註解中說明，避免後人誤刪或改錯。
+
+**具體修改建議**：
+- 在 try/except 區塊上方加註解，註明：「Try: run from trainer dir with modules on path (e.g. dev). Except: run as package (python -m trainer.trainer). Only the except path uses relative db_conn.」若決策為「僅支援 package 執行」，可再考慮移除 try 分支，改為單一相對匯入（與 validator/scorer 一致）。
+
+**希望新增的測試**：
+- 契約：`python -m trainer.trainer --help` 可成功執行（表示 except 路徑至少可載入）。
+- 可選：在 CI 中明確以 `python -m trainer.trainer ...` 跑一輪 smoke，確保 package 路徑為預設／推薦路徑。
+
+---
+
+### 5. 效能
+
+**問題**：相對匯入與單一 `from .db_conn import get_clickhouse_client` 對啟動與執行期開銷無實質影響；training_config_recommender 的 lazy import 仍在函式內，僅在需要時執行。無額外效能疑慮。
+
+**具體修改建議**：無。
+
+**希望新增的測試**：無。
+
+---
+
+### 6. 安全性
+
+**問題**：變更僅涉及匯入方式與 fail-fast 條件，未新增外部輸入或網路呼叫；db_conn 的連線參數仍來自 config/.env，未擴大攻擊面。
+
+**具體修改建議**：無。
+
+**希望新增的測試**：無。
+
+---
+
+### 7. 部署／打包：walkaway_ml 套件結構
+
+**問題**：deploy 使用 `walkaway_ml` 套件時，若 bundle 內為 `walkaway_ml.validator`、`walkaway_ml.db_conn` 等，則 `from .db_conn import get_clickhouse_client` 會正確解析為 `walkaway_ml.db_conn`。若建包或目錄結構與 trainer 不一致（例如缺少 db_conn 或更名），會在 import 時直接失敗，屬預期 fail-fast；但需確認建包腳本與 deploy 目錄確實包含 db_conn 且套件結構一致。
+
+**具體修改建議**：
+- 在 DEPLOY_PLAN 或 package README 註明：deploy 入口必須以 package 執行（例如 `python -m walkaway_ml.main` 或等同方式），且套件內須包含 `db_conn` 模組（與 trainer 相對匯入相容）。建包後做一次「目標機上 import walkaway_ml.validator / walkaway_ml.db_conn」的 smoke 檢查。
+
+**希望新增的測試**：
+- 可選：在 CI 或手動檢查清單中，於 deploy 輸出目錄執行 `python -c "import walkaway_ml.db_conn; from walkaway_ml.validator import get_clickhouse_client"`（或實際 deploy 套件名），預期無 ImportError。
+
+---
+
+### Review 摘要表
+
+| # | 類別       | 嚴重度 | 問題摘要                                                                 | 建議優先度 |
+|---|------------|--------|--------------------------------------------------------------------------|------------|
+| 1 | 正確性     | 中     | None 檢查在現行 db_conn 下永不成立；使用者看不到「Run as package」提示   | 高（文件／訊息） |
+| 2 | 邊界條件   | 中     | status_server 仍用頂層 `import config`，與其他模組不一致                  | 中         |
+| 3 | 邊界條件   | 低     | training_config_recommender 的 `except Exception` 過寬，易吞掉非預期錯誤 | 中         |
+| 4 | 一致性     | 低     | trainer.py 雙重 db_conn 匯入路徑需文件化或收斂                           | 低         |
+| 5 | 效能       | 無     | 無額外疑慮                                                                | —          |
+| 6 | 安全性     | 無     | 未擴大攻擊面                                                              | —          |
+| 7 | 部署       | 低     | 需確認 deploy 套件結構含 db_conn 且以 package 執行                        | 文件／smoke |
+
+---
+
+## 新增測試：Code Review 套件 entrypoint 與 db_conn 風險點（tests-only）
+
+**Date**: 2026-03-13
+
+依 STATUS「Code Review：PLAN § 套件 entrypoint 與 db_conn 相對匯入（Option A）變更」所列風險點，**僅新增 tests**，不修改 production code。將 Reviewer 建議的「希望新增的測試」轉成最小可重現測試或契約；未修復項目以 `@unittest.expectedFailure` 或 skip 標示。
+
+### 新增檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/test_review_risks_package_entrypoint_db_conn.py` | Option A Review §1–§4、§7 對應之測試與契約。 |
+
+### 測試與 Review 對應
+
+| Review § | 測試類／方法 | 契約／預期 | 狀態 |
+|----------|--------------|------------|------|
+| **§1 正確性** | `TestValidatorGetClickhouseClientNoneRaises::test_validate_once_raises_when_get_clickhouse_client_is_none_and_pending` | Mock `validator.get_clickhouse_client = None`，有 pending alert 時 `validate_once` 應 raise **RuntimeError**，訊息含「ClickHouse」且含「Run as package」或「get_clickhouse_client」。 | PASSED |
+| **§1 db_conn** | `TestDbConnRaisesWhenClickhouseConnectUnavailable::test_get_clickhouse_client_raises_with_install_message` | Mock `clickhouse_connect = None` 時，`get_clickhouse_client()` 應 raise **RuntimeError**，訊息含「clickhouse_connect」或「install」。 | PASSED |
+| **§2 邊界** | `TestStatusServerConfigResolvesToTrainerConfig::test_status_server_config_is_trainer_config` | 成功 `import trainer.status_server` 後，`status_server.config` 應為 `trainer.config`。若無法 import（例如無頂層 config）則 **skip**。 | PASSED（本輪 status_server 改 try/except config 後） |
+| **§3 邊界** | `TestRecommenderImportErrorSetsClientNone::test_build_data_profile_clickhouse_import_error_sets_client_none_no_crash` | Patch `trainer.db_conn` 使取得 `get_clickhouse_client` 時 raise **ImportError**；呼叫 `build_data_profile_clickhouse(..., get_client=None, skip_ch_connect=False)` 應不崩潰並回傳 profile（`data_source=="clickhouse"`）。 | PASSED |
+| **§3 可選** | `TestRecommenderRuntimeErrorOnImportShouldPropagateOrLog::test_build_data_profile_clickhouse_runtime_error_should_not_be_silent` | 當 import 時 raise **RuntimeError**，應 re-raise 不靜默。 | PASSED（本輪 recommender 改 except RuntimeError: raise 後） |
+| **§4 契約** | `TestTrainerPackagePathLoads::test_trainer_help_succeeds` | `python -m trainer.trainer --help` 應 exit code 0（package 路徑可載入）。 | PASSED |
+| **§4 source guard** | `TestTrainerTryExceptBlockDocumented::test_trainer_try_except_has_comment_about_package_execution` | `trainer.py` 在 try/except 匯入區塊應有註解提及「package」或「python -m trainer」。 | PASSED（本輪 trainer 加註解後） |
+| **§7 部署** | `TestWalkawayMlPackageStructure::test_walkaway_ml_db_conn_and_validator_import` | 若已安裝 `walkaway_ml`，`import walkaway_ml.db_conn` 與 `from walkaway_ml.validator import get_clickhouse_client` 應無 ImportError。未安裝則 **skip**。 | SKIPPED（walkaway_ml 未安裝時） |
+
+### 執行方式
+
+```bash
+# 僅跑本批 Option A Review 風險測試
+python -m pytest tests/test_review_risks_package_entrypoint_db_conn.py -v
+
+# 簡短 traceback
+python -m pytest tests/test_review_risks_package_entrypoint_db_conn.py -v --tb=short
+```
+
+### 預期結果（本輪修補後）
+
+- **7 passed**（§1 兩則、§2、§3 兩則、§4 兩則）
+- **1 skipped**（§7 walkaway_ml 未安裝時 skip）
+- 原 2 個 xfail 已因 production 修補而通過，decorator 已移除。
+
+---
+
+## 本輪：Code Review 套件 entrypoint 與 db_conn 修補完成（tests/typecheck/lint）
+
+**Date**: 2026-03-13
+
+### 目標
+
+依「Code Review：PLAN § 套件 entrypoint 與 db_conn 相對匯入（Option A）變更」§2、§3、§4 之具體修改建議，僅改 production code，使 Option A 相關測試全過（含原 2 個 xfail 升為 PASSED）；並追加 STATUS、更新 PLAN。不修改 tests（僅移除已過時之 `@unittest.expectedFailure`）。
+
+### Production 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/status_server.py` | **§2**：`import config` 改為 `try: import config except ModuleNotFoundError: import trainer.config as config`，與 validator/etl 一致；以 package 執行時 `status_server.config` 為 `trainer.config`。 |
+| `trainer/training_config_recommender.py` | **§3**：lazy import 之 `except Exception` 改為先 `except RuntimeError: raise`（不靜默吞掉），再 `except (ImportError, ModuleNotFoundError, AttributeError): get_client = None`。 |
+| `trainer/trainer.py` | **§4**：在 try/except 匯入區塊上方與 `from db_conn import` 前行加註解，註明 try = 自 trainer 目錄、except = package 執行（python -m trainer.trainer）及相對 db_conn。 |
+
+### 測試變更
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `tests/test_review_risks_package_entrypoint_db_conn.py` | 移除兩處已過時之 `@unittest.expectedFailure`（§3 RuntimeError 應傳播、§4 try/except 註解），因 production 已修補。 |
+
+### 驗證結果
+
+- **Option A 專用測試**：`python -m pytest tests/test_review_risks_package_entrypoint_db_conn.py -v` → **7 passed, 1 skipped**（原 2 xfailed 已通過）。
+- **Lint**：`ruff check trainer/status_server.py trainer/training_config_recommender.py trainer/trainer.py` → **All checks passed!**
+- **全量 pytest**：`python -m pytest -q` → **992 passed, 35 failed, 42 skipped**。35 個失敗皆為既有情境：`ImportError: cannot import name 'trainer'/'config'/'features' from 'walkaway_ml'`（專案以 walkaway_ml 安裝時，部分 test 以 `import trainer.xxx` 觸發之環境問題），與本輪 Option A 修補無關。
+
+### 下一步建議
+
+1. 若需全量測試綠燈：可於未安裝 walkaway_ml 之環境（或 `pip uninstall walkaway_ml` 後自 repo 根目錄執行 pytest）驗證；或修正該 35 則測試之 import 方式以相容 walkaway_ml 安裝情境。
+2. PLAN 剩餘 **pending**：**Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）**；其餘與 Option A 相關項目已標為 completed。
 
 ---

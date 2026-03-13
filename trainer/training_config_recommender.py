@@ -189,10 +189,12 @@ def build_data_profile_clickhouse(
 
     if not skip_ch_connect and get_client is None:
         try:
-            from trainer.db_conn import get_clickhouse_client  # type: ignore[import]
+            from .db_conn import get_clickhouse_client  # type: ignore[import]
             get_client = get_clickhouse_client
-        except Exception:
-            get_client = None
+        except RuntimeError:
+            raise  # do not silently swallow config/dependency errors from db_conn
+        except (ImportError, ModuleNotFoundError, AttributeError):
+            get_client = None  # lazy import may fail when not run as trainer package
 
     if not skip_ch_connect and get_client is not None:
         try:
