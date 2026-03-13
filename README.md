@@ -89,11 +89,13 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 **Validator**：`python -m trainer.validator --interval 60`（單次加 `--once`；手動強制結案 PENDING 加 `--force-finalize`）
 
-**API 伺服器**：`python -m trainer.api_server`（預設 http://0.0.0.0:8000）
+**API 伺服器**：`python -m trainer.api_server`（預設 http://0.0.0.0:8001；見 `package/ML_API_PROTOCOL.md`）
 
 **Status server**：`python -m trainer.status_server`
 
 **ETL / profile**：`trainer/etl_player_profile.py` 用於 profile 回填；`python -m trainer.scripts.auto_build_player_profile --start-date ... --end-date ...` 用於排程建置，詳見腳本說明。
+
+**部署**：訓練完成後可建置可部署套件（scorer + validator + Flask GET /alerts、GET /validation），從專案根目錄執行 `python -m package.build_deploy_package` 產出 `deploy_dist/`（可加 `--archive` 產出 zip）。目標機複製後 `pip install -r requirements.txt`、設定 `.env`、執行 `python main.py`。詳見 `package/README.md` 與 `.cursor/plans/DEPLOY_PLAN.md`。
 
 ### Trainer 指令參數（cmd flags）
 
@@ -127,6 +129,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `doc/player_profile_spec.md` | 玩家 profile ETL 與 PIT/as-of 語意 |
 | `doc/FEATURE_SPEC_GUIDE.md` | 特徵規格 YAML 與 Feature Spec 使用說明 |
 | `doc/model_api_protocol.md` | 模型與應用 API 協定（如 POST /score） |
+| `package/ML_API_PROTOCOL.md` | 部署用 ML API 協定（GET /alerts、GET /validation，儀表板輪詢） |
 | `doc/TRAINER_SUMMARY.md` | 系統摘要（架構、模組、前端） |
 | `doc/TRAINER_TEAM_PRESENTATION.md` | 團隊向系統概覽 |
 | `doc/PLAN_VS_TRAINER_COMPARISON.md` | 計畫與實作對照 |
@@ -221,11 +224,13 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 **Validator**：`python -m trainer.validator --interval 60`（单次加 `--once`；手动强制结案 PENDING 加 `--force-finalize`）
 
-**API 服务**：`python -m trainer.api_server`（默认 http://0.0.0.0:8000）
+**API 服务**：`python -m trainer.api_server`（默认 http://0.0.0.0:8001；见 `package/ML_API_PROTOCOL.md`）
 
 **Status server**：`python -m trainer.status_server`
 
 **ETL / profile**：`trainer/etl_player_profile.py` 用于 profile 回填；`python -m trainer.scripts.auto_build_player_profile --start-date ... --end-date ...` 用于定时构建，详见脚本说明。
+
+**部署**：训练完成后可构建可部署包（scorer + validator + Flask GET /alerts、GET /validation），从项目根目录执行 `python -m package.build_deploy_package` 产出 `deploy_dist/`（可加 `--archive` 产出 zip）。目标机复制后 `pip install -r requirements.txt`、配置 `.env`、执行 `python main.py`。详见 `package/README.md` 与 `.cursor/plans/DEPLOY_PLAN.md`。
 
 ### Trainer 指令参数（cmd flags）
 
@@ -259,6 +264,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `doc/player_profile_spec.md` | 玩家 profile ETL 与 PIT/as-of 语义 |
 | `doc/FEATURE_SPEC_GUIDE.md` | 特征规格 YAML 与 Feature Spec 使用说明 |
 | `doc/model_api_protocol.md` | 模型与应用 API 协议（如 POST /score） |
+| `package/ML_API_PROTOCOL.md` | 部署用 ML API 协议（GET /alerts、GET /validation，仪表板轮询） |
 | `doc/TRAINER_SUMMARY.md` | 系统摘要（架构、模块、前端） |
 | `doc/TRAINER_TEAM_PRESENTATION.md` | 团队向系统概览 |
 | `doc/PLAN_VS_TRAINER_COMPARISON.md` | 计划与实现对照 |
@@ -406,7 +412,7 @@ python -m trainer.validator --interval 60
 
 ```bash
 python -m trainer.api_server
-# Serves on http://0.0.0.0:8000
+# Serves on http://0.0.0.0:8001 (see package/ML_API_PROTOCOL.md)
 ```
 
 ### Status server (floor occupancy)
@@ -423,6 +429,17 @@ python -m trainer.status_server
 - **Auto-build profile (scheduled)**  
   `python -m trainer.scripts.auto_build_player_profile --start-date ... --end-date ...`  
   See script help for ClickHouse vs local Parquet.
+
+### Deployment
+
+After training, build a deployable package (scorer + validator + Flask GET /alerts, GET /validation) from the repo root:
+
+```bash
+python -m package.build_deploy_package
+# Optional: --archive for deploy_dist.zip; --model-source DIR to override model dir
+```
+
+Copy `deploy_dist/` (or the zip) to the target machine, then `pip install -r requirements.txt`, configure `.env`, and run `python main.py`. See `package/README.md` and `.cursor/plans/DEPLOY_PLAN.md` for details.
 
 ---
 
@@ -482,6 +499,7 @@ mypy trainer/ --ignore-missing-imports
 | `doc/player_profile_spec.md` | Player profile ETL and PIT/as-of semantics |
 | `doc/FEATURE_SPEC_GUIDE.md` | Feature spec YAML and Feature Spec usage guide |
 | `doc/model_api_protocol.md` | Model–app API contract (e.g. POST /score) for decoupled inference |
+| `package/ML_API_PROTOCOL.md` | Deploy ML API contract (GET /alerts, GET /validation for dashboard polling) |
 | `doc/TRAINER_SUMMARY.md` | System summary (architecture, modules, frontend) |
 | `doc/TRAINER_TEAM_PRESENTATION.md` | Team-facing overview |
 | `doc/PLAN_VS_TRAINER_COMPARISON.md` | Plan vs implementation comparison |
