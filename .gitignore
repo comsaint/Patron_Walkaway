@@ -215,3 +215,5 @@ trainer/out_trainer/
 trainer/local_state/
 trainer/.data/
 trainer/out_backtest/
+deploy_dist/
+deploy_dist.zip
