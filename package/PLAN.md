@@ -1,4 +1,4 @@
-# Plan: Model Bundle Packaging & ML API Server (port 8001)
+.# Plan: Model Bundle Packaging & ML API Server (port 8001)
 
 **Goal**: After training, produce a deployable model bundle and expose GET `/alerts` and GET `/validation` at `http://localhost:8001` per `doc/ML_API_PROTOCOL.md`.
 

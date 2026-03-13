@@ -125,6 +125,9 @@ todos:
   - id: ml-api-casino-player-id
     content: "ML API：populate casino_player_id（scorer/validator/API + deploy main）；見「Populate casino_player_id in ML API（Protocol Update）」一節。"
     status: completed
+  - id: step8-duckdb-stats
+    content: "Step 8 Feature Screening：DuckDB 算統計量（std/可選 corr）避免 X.std() 全量 OOM；並檢視其他類似全量統計是否可一併優化。見「Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）」一節。"
+    status: pending
 isProject: false
 ---
 
@@ -182,10 +185,11 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 18 | **Round 222 Review production 補強** | completed | 四項均已實作：項目 1（Track LLM 失敗 warning + track_llm_degraded）、項目 2（canonical_ids=[]）、項目 3（use_local_parquet 從 CLI 傳入）、項目 4（candidates 型別防呆）。Round 406 完成項目 1、3 與 R222 測試契約更新。規格見下方「Round 222 Review production 補強（實作計畫）」一節。 |
 | 19 | **Track Human Lookback 向量化 + Step 6 進度條** | completed | Phase 1 解封與 Step 6 tqdm 已完成。Phase 2 **compute_loss_streak** 與 **compute_run_boundary** lookback 均已以 numba 單 pass 實作；Code Review 修補（wager NaN 填 0、run_break_min_ns 上限）已完成。見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。 |
 | 20 | **Deploy DEC-028 修補（player_profile 打包／canonical 持久化）** | completed | DEPLOY_PLAN §8、DECISION_LOG DEC-028。Production 修補：scorer DATA_DIR 空/空白視為未設定；build 時 profile 複製失敗 try/except 建包仍完成；deploy main 遲 import 加 noqa: E402；scorer _DATA_DIR 型別註解。tests/test_review_risks_deploy_dec028.py 7/7 通過；tests/typecheck/lint 全過。見 STATUS.md「DEC-028 本輪實作修正與驗證」。 |
+| 21 | **Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）** | pending | 以 DuckDB 對 train（Parquet 或註冊 DataFrame）算 stddev_pop 取得零變異篩選，避免 pandas X.std() 產生 ~17.6 GiB 暫存陣列；可選將相關矩陣改為 DuckDB CORR；其餘類似全量統計一併檢視。見「Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）」一節。 |
 
 **Plan 狀態摘要**：上表 1～19 項均為 **completed**（第 18 項於 Round 406 完成項目 1、3；第 19 項 Track Human Lookback 向量化於本輪完成 Phase 2 compute_run_boundary numba 與 Code Review 修補 wager NaN／run_break_min_ns 上限）。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
 
-**剩餘項目**：上表 1～20 項與 **canonical-step3-schema-check-oom**、**config-consolidation**（DEC-027）、**progress-bars-long-steps**、**training-config-recommender** 均已完成。DEC-027 與 progress-bars Code Review 修補已通過對應測試；training-config-recommender 已實作並完成 Code Review 修補；**項目 20** Deploy DEC-028 修補已於本輪完成（scorer DATA_DIR 邊界、build profile 複製 try/except、E402 noqa、mypy _DATA_DIR 型別），`tests/test_review_risks_deploy_dec028.py` 7/7 通過，tests/typecheck/lint 全過。目前 **pending**：無（見上方 todos）。
+**剩餘項目**：上表 1～20 項與 **canonical-step3-schema-check-oom**、**config-consolidation**（DEC-027）、**progress-bars-long-steps**、**training-config-recommender** 均已完成。DEC-027 與 progress-bars Code Review 修補已通過對應測試；training-config-recommender 已實作並完成 Code Review 修補；**項目 20** Deploy DEC-028 修補已於本輪完成（scorer DATA_DIR 邊界、build profile 複製 try/except、E402 noqa、mypy _DATA_DIR 型別），`tests/test_review_risks_deploy_dec028.py` 7/7 通過，tests/typecheck/lint 全過。目前 **pending**：**項目 21** Step 8 DuckDB 算統計量（見上方 todos 與下方對應一節）。
 
 **建議實作順序**：可選／後續見下方各節（Step 7 out-of-core 排序、Optuna early stop 等）。
 
@@ -298,6 +302,87 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 
 - **A12**：由 Phase 2 lookback 向量化與 `doc/track_human_lookback_vectorization_plan.md` 處理。
 - **A01**：已完成，僅在稽核文件中標註與維護行號。
+
+---
+
+## Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）
+
+**目標與現況**
+
+- **問題**：Step 8 `screen_features()` 對全量 train（例如 33M×71）做 `X.std()` 時，pandas/numpy 內部 `(values - mean)**2` 會產生約 17.6 GiB 暫存陣列，導致 `ArrayMemoryError`。
+- **方向**：將「全量一次算」的統計改為用 **DuckDB** 做單次掃描聚合，只把少量結果（每欄一個數字或小矩陣）拉回 Python，避免大陣列。
+- **範圍**：以 Step 8 的 screening 為主，並一併檢視其他類似「大 DataFrame 上做統計」的程式碼是否也可用 DuckDB 或同一模式優化。
+
+### Step 8 中可改為 DuckDB 的計算
+
+`screen_features()`（`trainer/features.py` 約 918–997 行）目前流程：
+
+| 步驟 | 現有做法 | 記憶體風險 | DuckDB 替代 |
+|------|----------|------------|-------------|
+| 1. 零變異篩選 | `X = feature_matrix[feature_names].copy()` 後 `std = X.std()` | 高：`std()` 內部產生 ~17.6 GiB | 用 DuckDB 對 train 資料做 `stddev_pop(col)` 每欄一次，只取 71 個數回 Python |
+| 2. fillna(0) | `X_safe = X.fillna(0)`，仍為全量 DataFrame | 中：若後續 MI/LGBM 用 sample 則可接受 | 若後續 MI/LGBM 用 sample，可保留在 sample 上 fillna；若需全量統計再考慮 DuckDB 的 COALESCE/IFNULL |
+| 3. 相關性修剪 | `corr = x[ordered_names].corr().abs()` | 中：理論上可產生大中間陣列；結果是 K×K | 用 DuckDB `CORR(a, b)` 對每對欄位查詢，或一次查詢產出上三角相關矩陣，只拉回 K×K |
+| 4. MI 排序 | `mutual_info_classif(X_safe, labels, ...)` | 中：需整份 X_safe + labels | 維持在「sample」上做（現有 B+ 已用 sample）；不強制改 DuckDB |
+| 5. LGBM 排序 | `lgb.Dataset(X_safe[names], label=labels)` | 中：需整份 feature + label | 同上，維持 sample；若未來要全量可再評估 DuckDB 匯出 batch 或外部表 |
+
+**結論**：最值得且最容易用 DuckDB 取代的是 **1. 標準差（零變異篩選）**；必要時可一併將 **3. 相關矩陣** 改為 DuckDB，其餘可沿用 sample 或現有邏輯。
+
+### 實作計畫（DuckDB 算統計量）
+
+#### 資料來源的兩種情況
+
+Step 8 時 train 的來源只有兩種（`trainer.py` 約 5056–5208、5187–5208）：
+
+- **A. 路徑模式**：`step7_train_path` 有值（STEP7_KEEP_TRAIN_ON_DISK 且 DuckDB 成功），train 在磁碟 Parquet，未載入。
+- **B. 記憶體模式**：`train_df` 有值（pandas 已載入整份 train，約 33M 列）。
+
+兩種都要支援：A 直接用 DuckDB `read_parquet(step7_train_path)`；B 用 DuckDB 的 `con.register('train', train_df)` 讓 DuckDB 從既有 DataFrame 串流讀取，**不必先寫成 Parquet**。
+
+#### 零變異篩選（std）— 優先實作
+
+- **介面**：新增 helper，例如 `compute_column_std_duckdb(source, columns, *, path=None, df=None) -> pd.Series`（`source` 為單一 DuckDB 連線或「path / df 二選一」）。回傳 `pd.Series`：index = 欄名，value = 該欄的 std（與 pandas 的 `ddof=0` 對齊可用 `stddev_pop`）。
+- **實作要點**：若 `path` 有值則 `SELECT stddev_pop("c1"), stddev_pop("c2"), ... FROM read_parquet(path)` 一次查詢回傳一列；若 `df` 有值則 `con.register('_t', df)` 後同上 `SELECT ... FROM _t`。只對數值欄算 std；若 feature 名單中混有非數值，可先 coerce 或跳過（與現有 `coerce_feature_dtypes` 行為對齊）。
+- **在 `screen_features` 中**：若 caller 能傳入 `train_path: Optional[Path] = None` 和/或已註冊的 DuckDB connection，則用上述 helper 得到 `std` Series，再 `nonzero = std[std > 0].index.tolist()`，**不再做** `X = feature_matrix[feature_names].copy()` 與 `X.std()`。若無法用 DuckDB（例如無 duckdb 套件），則 fallback 現有邏輯：對傳入的 `feature_matrix` 做 sample 或限制行數後再 `X.std()`，避免全量 33M 列。
+
+#### 相關矩陣（可選優化）
+
+- **現狀**：`_correlation_prune(ordered_names, x)` 內 `corr = x[ordered_names].corr().abs()`，`x` 可能是 33M×K 的 DataFrame。
+- **DuckDB**：用 `CORR(col_i, col_j)` 對每對查詢，或一次查詢產出 K×(K-1)/2 對的相關系數，在 Python 組回 K×K 上三角再對稱化。
+- **建議**：先做零變異篩選（std）解決 OOM；若日後仍遇 correlation 記憶體問題，再改為「由 DuckDB 算 CORR，只拉回 K×K 小矩陣」。
+
+#### 呼叫端改動（trainer.py）
+
+- Step 8 呼叫 `screen_features` 時（約 5216）：若為**路徑模式**則傳入 `train_path=step7_train_path`（以及 `feature_names`），讓 `screen_features` 內用 DuckDB 讀 Parquet 算 std（及可選的 corr）。若為**記憶體模式**則傳入 `train_df=train_df` 或透過暫時註冊到 DuckDB 的 view/table，讓 helper 用 `stddev_pop` 從 DuckDB 算 std，**不要**把 33M 列再傳給 `screen_features` 做全量 `X.std()`。
+- 不論哪種模式，**MI/LGBM 仍可只用「sample」**（例如 `_matrix_for_screen` 的 2M 列或 `STEP8_SCREEN_SAMPLE_ROWS`），以控制記憶體；篩選結果（nonzero、correlation pruned、top_k）再套回全量 train 用於後續 export/Step 9。
+
+#### 依賴與 fallback
+
+- 依賴：`duckdb`（專案已於 Step 7 使用）。
+- Fallback：若 `screen_features` 無法取得 path/connection 或 DuckDB 查詢失敗，則退回「僅在 sample 上做 pandas std/corr」（並記錄 log），避免大 DataFrame 全量進記憶體。
+
+### 其他可一併檢視的「類似計算」
+
+| 位置 | 計算 | 說明 |
+|------|------|------|
+| **features.py:921** | `X.std()` | 已納入本計畫（DuckDB 算 std）。 |
+| **features.py:937** | `x[ordered_names].corr().abs()` | 已納入本計畫（可選 DuckDB CORR）。 |
+| **trainer.py 約 4805–4809** | `_q_count`, `_q_label_sum`, `_q_max_dtm` | 已用 DuckDB 對 split Parquet 做聚合，無需改動。 |
+| **etl_player_profile.py** | `groupby(...).mean()` 等 | 在 DuckDB ETL 內做聚合，大表已在 DuckDB 中處理；若未來有「先載入大 DataFrame 再在 pandas 做 groupby 聚合」的程式碼，可考慮改為 DuckDB 聚合。 |
+| **analyze_session_history*.py** | `.mean()` / `.median()` | 腳本級、資料量應較小，優先級低；若日後資料變大可改為 DuckDB 查詢。 |
+
+目前 trainer 主流程裡，**會對「全量 train」做單次掃描統計且易 OOM 的**，就是 Step 8 的 `std`（以及潛在的 `corr`），其餘多為 sample 或已在 DuckDB 內完成。
+
+### 實作順序建議
+
+1. **Phase 1（解 OOM）**：在 `features.py` 新增 `compute_column_std_duckdb(...)`（或同等介面），支援 path 與 df 兩種輸入。在 `screen_features()` 中改為優先使用該 helper 得到 `std` 與 `nonzero`，不再對全量 `feature_matrix` 做 `X.std()`。在 `trainer.py` Step 8 傳入 `train_path` 或已註冊的 DuckDB 資料來源，並保留「無 path 時用 sample + pandas」的 fallback。
+2. **Phase 2（可選）**：若需進一步省記憶體或統一風格，將 `_correlation_prune` 改為從 DuckDB 用 `CORR` 算相關矩陣，只拉回 K×K。為 DuckDB 統計路徑加簡單單元測試（小 DataFrame / 小 Parquet），確保與 pandas 的 std（以及可選的 corr）數值一致。
+3. **Phase 3（其餘優化）**：若之後在別處發現「大 DataFrame + .mean()/.std()/.corr()」的程式碼，可套用同一模式：改為 DuckDB 聚合或先 sample 再算。
+
+### 注意事項
+
+- **數值一致**：DuckDB `stddev_pop` 對應 pandas `ddof=0`；若目前 pandas 預設是 `ddof=1`，要確認是否改為 `stddev_samp` 或統一在文件/註解中說明。
+- **型別**：只對數值欄呼叫 `stddev_pop`；字串/類別欄跳過或先 coerce，與現有 `coerce_feature_dtypes` 一致。
+- **連線生命週期**：若用 `con.register(df)`，在 step 結束後關閉 connection 或 unregister，避免長期持有大 DataFrame 引用。
 
 ---
 
