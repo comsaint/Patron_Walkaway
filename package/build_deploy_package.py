@@ -3,8 +3,8 @@ Build a single deploy package: one folder (or one .zip file) containing
 everything needed to run the ML API on the target machine.
 
 After you run this script, you get either:
-  - A folder: package/deploy_dist/   (copy this folder to the target), or
-  - A single file: package/deploy_dist.zip   (copy this file, then unzip on target; works well on Windows)
+  - A folder: deploy_dist/   (at repo root; copy this folder to the target), or
+  - A single file: deploy_dist.zip   (copy this file, then unzip on target; works well on Windows)
 
 Contents: walkaway_ml wheel (from current trainer/ code), main.py, .env.example,
 model artifacts (model.pkl, feature_list.json, feature_spec.yaml, etc.),
@@ -17,7 +17,7 @@ Then GET /alerts and GET /validation are available at http://0.0.0.0:8001.
 Usage (from repo root):
   python -m package.build_deploy_package
   python -m package.build_deploy_package --archive
-  python -m package.build_deploy_package --model-source trainer/models --output-dir package/deploy_dist
+  python -m package.build_deploy_package --model-source trainer/models --output-dir deploy_dist
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPLOY_DIR = REPO_ROOT / "package" / "deploy"
 
-# Model/bundle files (same set as package_model_bundle; includes feature_spec.yaml etc.)
+# Model/bundle files (pkl, feature_list.json, feature_spec.yaml, etc.)
 BUNDLE_FILES = [
     "model.pkl",
     "rated_model.pkl",
@@ -91,6 +91,9 @@ def copy_model_bundle(source_dir: Path, dest_models: Path) -> None:
     if not (source_dir / "feature_list.json").exists():
         raise FileNotFoundError(f"Missing {source_dir / 'feature_list.json'}. Found: {names!r}")
 
+    # Flush existing content so we don't leave stale files from a previous run
+    if dest_models.exists():
+        shutil.rmtree(dest_models)
     dest_models.mkdir(parents=True, exist_ok=True)
     for name in BUNDLE_FILES:
         src = source_dir / name
@@ -261,8 +264,8 @@ def main() -> int:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=REPO_ROOT / "package" / "deploy_dist",
-        help="Output folder (default: package/deploy_dist)",
+        default=REPO_ROOT / "deploy_dist",
+        help="Output folder (default: ./deploy_dist)",
     )
     parser.add_argument(
         "--model-source",

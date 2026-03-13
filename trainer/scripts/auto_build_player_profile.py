@@ -5,8 +5,13 @@ This helper wraps `trainer/etl_player_profile.py` with:
 2) checkpoint-based resume,
 3) adaptive chunk sizing on failure (reduce days per run).
 
+With --month-end, only month-end snapshots are built (same schedule as trainer);
+requires --start-date/--end-date or auto-detected range. One ETL invocation for
+the full range (no chunking).
+
 Typical usage:
     python trainer/scripts/auto_build_player_profile.py --local-parquet
+    python trainer/scripts/auto_build_player_profile.py --local-parquet --month-end
 """
 
 from __future__ import annotations
@@ -126,7 +131,12 @@ def infer_initial_chunk_days(user_chunk_days: int) -> int:
     return 1
 
 
-def run_etl_chunk(start_d: date, end_d: date, local_parquet: bool) -> CmdResult:
+def run_etl_chunk(
+    start_d: date,
+    end_d: date,
+    local_parquet: bool,
+    month_end: bool = False,
+) -> CmdResult:
     cmd = [
         sys.executable,
         str(ETL_SCRIPT),
@@ -137,6 +147,8 @@ def run_etl_chunk(start_d: date, end_d: date, local_parquet: bool) -> CmdResult:
     ]
     if local_parquet:
         cmd.append("--local-parquet")
+    if month_end:
+        cmd.append("--month-end")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     return CmdResult(proc.returncode, proc.stdout, proc.stderr)
 
@@ -153,9 +165,21 @@ def auto_run(
     local_parquet: bool,
     chunk_days: int,
     resume: bool,
+    month_end: bool = False,
 ) -> None:
     if start_date > end_date:
         raise ValueError("start_date cannot be later than end_date")
+
+    if month_end:
+        print(f"[run] month-end only: {start_date.isoformat()} -> {end_date.isoformat()}")
+        result = run_etl_chunk(start_date, end_date, local_parquet=local_parquet, month_end=True)
+        if result.returncode != 0:
+            print("[warn] month-end ETL failed")
+            if result.stderr:
+                print(_tail(result.stderr))
+            raise SystemExit(result.returncode)
+        print("[done] player_profile month-end backfill completed.")
+        return
 
     current = start_date
     if resume:
@@ -174,7 +198,7 @@ def auto_run(
     while current <= end_date:
         chunk_end = min(current + timedelta(days=active_chunk - 1), end_date)
         print(f"[run] {current.isoformat()} -> {chunk_end.isoformat()} (chunk_days={active_chunk})")
-        result = run_etl_chunk(current, chunk_end, local_parquet=local_parquet)
+        result = run_etl_chunk(current, chunk_end, local_parquet=local_parquet, month_end=False)
 
         if result.returncode == 0:
             save_checkpoint(checkpoint_file, chunk_end)
@@ -237,6 +261,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore checkpoint and start from --start-date.",
     )
+    p.add_argument(
+        "--month-end",
+        action="store_true",
+        help="Build only month-end snapshots (same as trainer). Single ETL run for full range; no chunking.",
+    )
     return p.parse_args()
 
 
@@ -258,7 +287,7 @@ def main() -> None:
         raise FileNotFoundError(f"Cannot find ETL script: {ETL_SCRIPT}")
 
     init_chunk = infer_initial_chunk_days(args.chunk_days)
-    print(f"[config] initial chunk_days={init_chunk}, local_parquet={args.local_parquet}")
+    print(f"[config] initial chunk_days={init_chunk}, local_parquet={args.local_parquet}, month_end={args.month_end}")
 
     auto_run(
         start_date=start_d,
@@ -267,6 +296,7 @@ def main() -> None:
         local_parquet=args.local_parquet,
         chunk_days=init_chunk,
         resume=not args.no_resume,
+        month_end=args.month_end,
     )
 
 

@@ -17,6 +17,9 @@ python etl_player_profile.py --start-date 2026-01-01 --end-date 2026-02-28
 # Dry-run: write to local Parquet instead of ClickHouse
 python etl_player_profile.py --local-parquet
 
+# Month-end schedule: build only last calendar day of each month in range (same as trainer.ensure_player_profile_ready)
+python etl_player_profile.py --start-date 2026-01-01 --end-date 2026-03-31 --local-parquet --month-end
+
 Pipeline
 --------
 1. Load clean t_session records via ClickHouse (or local Parquet dev path).
@@ -71,6 +74,11 @@ try:
     from schema_io import normalize_bets_sessions  # type: ignore[import]
 except ImportError:
     from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
+
+try:
+    from profile_schedule import latest_month_end_on_or_before, month_end_dates  # type: ignore[import]
+except ImportError:
+    from trainer.profile_schedule import latest_month_end_on_or_before, month_end_dates  # type: ignore[import]
 
 try:
     from tqdm import tqdm as _tqdm_bar
@@ -1884,6 +1892,18 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable progress bar (e.g. for CI / non-TTY). PLAN § progress-bars-long-steps.",
     )
+    p.add_argument(
+        "--month-end",
+        action="store_true",
+        help="Build only month-end snapshots (last calendar day of each month in range). Same schedule as trainer.ensure_player_profile_ready. If range has no month-end (intra-month), builds one anchor snapshot at latest month-end on or before end-date.",
+    )
+    p.add_argument(
+        "--snapshot-interval-days",
+        type=int,
+        default=1,
+        metavar="N",
+        help="When not using --month-end: compute a snapshot every N days (default 1 = daily). Trainer always uses month-end; this is for non-trainer backfills.",
+    )
     return p.parse_args()
 
 
@@ -1895,12 +1915,29 @@ def main() -> None:
     )
 
     if args.start_date and args.end_date:
-        backfill(
-            args.start_date,
-            args.end_date,
-            use_local_parquet=args.local_parquet,
-            disable_progress=args.no_progress,
-        )
+        if args.month_end:
+            snapshot_dates = month_end_dates(args.start_date, args.end_date)
+            if not snapshot_dates:
+                anchor = latest_month_end_on_or_before(args.end_date)
+                snapshot_dates = [anchor]
+                backfill_start = min(args.start_date, anchor)
+            else:
+                backfill_start = args.start_date
+            backfill(
+                backfill_start,
+                args.end_date,
+                use_local_parquet=args.local_parquet,
+                snapshot_dates=snapshot_dates,
+                disable_progress=args.no_progress,
+            )
+        else:
+            backfill(
+                args.start_date,
+                args.end_date,
+                use_local_parquet=args.local_parquet,
+                snapshot_interval_days=max(1, int(args.snapshot_interval_days or 1)),
+                disable_progress=args.no_progress,
+            )
     else:
         snap_date = args.snapshot_date or datetime.now(HK_TZ).date()
         build_player_profile(snap_date, use_local_parquet=args.local_parquet)

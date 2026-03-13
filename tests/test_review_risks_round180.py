@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pandas as pd
 
 import trainer.etl_player_profile as etl_mod
+import trainer.profile_schedule as profile_schedule_mod
 import trainer.trainer as trainer_mod
 
 
@@ -24,7 +25,7 @@ class TestR600MonthEndEmptyRangeFallback(unittest.TestCase):
     def test_month_end_dates_partial_month_returns_empty_list(self):
         # Minimal repro:
         # missing range 2026-02-01 -> 2026-02-13 has no month-end date inside.
-        got = trainer_mod._month_end_dates(dt.date(2026, 2, 1), dt.date(2026, 2, 13))
+        got = profile_schedule_mod.month_end_dates(dt.date(2026, 2, 1), dt.date(2026, 2, 13))
         self.assertEqual(got, [])
 
     def test_ensure_profile_should_have_explicit_empty_snapshot_dates_fallback(self):

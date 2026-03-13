@@ -41,7 +41,6 @@ Data source switching
 from __future__ import annotations
 
 import argparse
-import calendar
 import gc
 import math
 import os
@@ -66,6 +65,8 @@ import pandas as pd
 from sklearn.metrics import average_precision_score, precision_recall_curve
 from sklearn.model_selection import train_test_split
 from zoneinfo import ZoneInfo
+
+from trainer.profile_schedule import latest_month_end_on_or_before, month_end_dates
 
 try:
     from tqdm import tqdm as _tqdm_bar
@@ -1001,56 +1002,7 @@ def _detect_local_data_end() -> Optional[date]:
     return min(maxes)
 
 
-def _month_end_dates(start_date: date, end_date: date) -> List[date]:
-    """Return the last calendar day of each month in [start_date, end_date].
-
-    Used by DEC-019 to build a month-end profile snapshot schedule.
-    At most one snapshot per month is produced; the PIT join in
-    join_player_profile uses the most-recent snapshot <= bet_time,
-    so bets mid-month will fall back to the previous month-end snapshot.
-
-    Parameters
-    ----------
-    start_date, end_date:
-        Inclusive date range.  Both must use HK-calendar dates.
-
-    Returns
-    -------
-    Sorted list of date objects, each being the last day of its month,
-    filtered to [start_date, end_date].
-    """
-    result: List[date] = []
-    year, month = start_date.year, start_date.month
-    while True:
-        last_day = calendar.monthrange(year, month)[1]
-        month_end = date(year, month, last_day)
-        if month_end > end_date:
-            break
-        if month_end >= start_date:
-            result.append(month_end)
-        if month == 12:
-            year += 1
-            month = 1
-        else:
-            month += 1
-    return result
-
-
-def _latest_month_end_on_or_before(ref_date: date) -> date:
-    """Return the nearest month-end date that is <= ref_date."""
-    year, month = ref_date.year, ref_date.month
-    month_last = calendar.monthrange(year, month)[1]
-    cand = date(year, month, month_last)
-    if cand <= ref_date:
-        return cand
-    # Previous month-end.
-    if month == 1:
-        year -= 1
-        month = 12
-    else:
-        month -= 1
-    prev_last = calendar.monthrange(year, month)[1]
-    return date(year, month, prev_last)
+# Month-end schedule: shared with etl_player_profile CLI (--month-end). See PLAN § CLI for month-end-only player_profile.
 
 
 def ensure_player_profile_ready(
@@ -1169,7 +1121,7 @@ def ensure_player_profile_ready(
     #
     # Rationale: join_player_profile uses merge_asof(direction="backward"), so a bet
     # on Feb 15 needs the Jan 31 snapshot.
-    required_start = _latest_month_end_on_or_before(window_start.date())
+    required_start = latest_month_end_on_or_before(window_start.date())
     required_end = window_end.date()
 
     session_rng = _parquet_date_range(
@@ -1227,11 +1179,11 @@ def ensure_player_profile_ready(
         )
         _backfill_start, _backfill_end = miss_start, miss_end
         # Enforced month-end schedule (all modes): build only month-end snapshots.
-        _snap_dates = _month_end_dates(miss_start, miss_end) if effective_month_end else None
+        _snap_dates = month_end_dates(miss_start, miss_end) if effective_month_end else None
         # If the missing range is intra-month (no month-end within range), anchor
         # PIT with the most recent month-end on/before miss_end.
         if _snap_dates is not None and len(_snap_dates) == 0:
-            _anchor = _latest_month_end_on_or_before(miss_end)
+            _anchor = latest_month_end_on_or_before(miss_end)
             _snap_dates = [_anchor]
             _backfill_start = min(_backfill_start, _anchor)
             logger.info(

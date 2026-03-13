@@ -31,7 +31,7 @@
 | **.env.example** | CH_HOST, CH_PORT, CH_USER, CH_PASS, SOURCE_DB, PORT/ML_API_PORT, STATE_DB_PATH, MODEL_DIR; note that credentials are supplied by the deployer. |
 | **.deployignore** | Files/directories to exclude when packaging. |
 | **README.md** | How to deploy, configure .env, swap model, and the two APIs. |
-| **models/** | Model bundle (copy output of `package_model_bundle` here). |
+| **models/** | Model bundle (filled by `build_deploy_package.py` from `--model-source`). |
 | **local_state/** | Runtime state; `state.db` is created here. |
 | **wheels/** (optional) | Hold **walkaway_ml-*.whl** for self-contained install. |
 
@@ -66,12 +66,10 @@ Flask GET /validation ──────► read validation_results
 
 ## 6. Build and ship flow
 
-1. After training → run `package_model_bundle.py` → get `package/bundles/<version>/`.
-2. Copy bundle contents into `package/deploy/models/`.
-3. From repo root run **`pip wheel .`** (pyproject.toml has `name = "walkaway_ml"`); copy **walkaway_ml-*.whl** into `package/deploy/wheels/`.
-4. Package the **package/deploy/** directory (respecting .deployignore) as the deployable unit (e.g. tar/zip).
-5. On target: unpack → copy `.env.example` to `.env` and fill in ClickHouse credentials etc. → **`pip install -r requirements.txt`** (installs **walkaway_ml** and dependencies) → **`python main.py`**.
-6. To swap model: replace contents of `deploy/models/` and restart.
+1. After training → run **`python -m package.build_deploy_package`** [--model-source trainer/models] [--archive] → get **deploy_dist/** at repo root (and optionally deploy_dist.zip).
+2. Ship the **deploy_dist** folder (or .zip) to the target. It already contains wheels/, models/, main.py, requirements.txt, .env.example.
+3. On target: unpack if needed → copy `.env.example` to `.env` and fill in ClickHouse etc. → **`pip install -r requirements.txt`** → **`python main.py`**.
+4. To swap model: re-run build_deploy_package with a different --model-source, or replace contents of deploy_dist/models/ and re-ship.
 
 ---
 

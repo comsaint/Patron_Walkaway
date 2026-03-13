@@ -22,7 +22,7 @@ Single process: continuously fetches from ClickHouse, runs scorer and validator,
    If you use a wheel for self-contained deploy, add `-f wheels` and `walkaway_ml` (or the wheel file) to `requirements.txt` and run `pip install -r requirements.txt` from this directory.
 
 3. **Model bundle**  
-   Put the model bundle in `models/` (e.g. copy from `package/bundles/<version>/` after running `package_model_bundle.py`). Required files: at least one of `model.pkl`, `rated_model.pkl`, `walkaway_model.pkl`, and `feature_list.json`.
+   When building the deploy package, `build_deploy_package.py` copies the model from `--model-source` (e.g. `trainer/models`) into `models/`. Required in that source: at least one of `model.pkl`, `rated_model.pkl`, `walkaway_model.pkl`, and `feature_list.json`. If you run the deploy app from this folder only (no full deploy package), put those files in `models/` yourself.
 
 ## Run
 
@@ -43,8 +43,8 @@ python main.py
 
 ## Swapping the model
 
-1. Run `package_model_bundle.py` to produce a new bundle (e.g. in `package/bundles/<version>/`).
-2. Replace the contents of `package/deploy/models/` with the new bundle (or point `MODEL_DIR` in `.env` to another directory).
+1. Re-run `python -m package.build_deploy_package --model-source <path-to-new-model>` (and `--archive` if needed) to produce a new deploy package with the new model in `models/`.
+2. Or, if running from this folder only: replace the contents of `models/` with the new model files (or point `MODEL_DIR` in `.env` to another directory).
 3. Restart `main.py`.
 
 No code changes required; the app loads the model from `MODEL_DIR` at startup.

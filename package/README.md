@@ -16,7 +16,7 @@ Full design: **PLAN.md** in this folder.
 Deployment is **always** a single folder or archive that you copy to the target and run there. Build it from the **repository root**:
 
 ```bash
-# Default: model from trainer/models, output = package/deploy_dist/
+# Default: model from trainer/models, output = deploy_dist/ (at repo root)
 python -m package.build_deploy_package
 
 # Optional: single file for transfer (e.g. deploy_dist.zip)
@@ -29,10 +29,10 @@ python -m package.build_deploy_package --model-source trainer/models_90d_weak --
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--model-source` | `trainer/models` | Directory with model artifacts (`model.pkl` or `walkaway_model.pkl`, `feature_list.json`, etc.). |
-| `--output-dir` | `package/deploy_dist` | Output folder. |
+| `--output-dir` | `deploy_dist` | Output folder (default: ./deploy_dist at repo root). |
 | `--archive` | Off | Also create `deploy_dist.zip` in the parent of output-dir for a single-file transfer. |
 
-**Result:** A folder `package/deploy_dist/` (and optionally `package/deploy_dist.zip`) containing everything needed on the target: `main.py`, `requirements.txt`, `.env.example`, `wheels/`, `models/`, `README_DEPLOY.txt`, etc.
+**Result:** A folder `deploy_dist/` (and optionally `deploy_dist.zip`) at repo root, containing everything needed on the target: `main.py`, `requirements.txt`, `.env.example`, `wheels/`, `models/`, `README_DEPLOY.txt`, etc.
 
 **On the target machine:** Copy the folder (or unzip the .zip), then:
 
@@ -44,25 +44,7 @@ Endpoints: `http://0.0.0.0:8001/alerts`, `/validation`. See **README_DEPLOY.txt*
 
 ---
 
-### 2. Optional: versioned model bundle
-
-If you want a versioned model directory (e.g. for multiple variants) before building the deploy package, run:
-
-```bash
-python -m package.package_model_bundle --source-dir trainer/models_90d_weak --output-dir package/bundles --archive
-```
-
-This produces `package/bundles/<version>/` with only model files (no app, no requirements). **Do not ship this alone.** Use it as the model source for the deploy package:
-
-```bash
-python -m package.build_deploy_package --model-source package/bundles/<version> --archive
-```
-
-Then ship the resulting `deploy_dist/` or `deploy_dist.zip` to the target as in section 1.
-
----
-
-### 3. Run the ML API server (local dev)
+### 2. Run the ML API server (local dev)
 
 From the **repository root** (for local testing with dashboard):
 
@@ -84,13 +66,20 @@ Example: `curl "http://localhost:8001/alerts"`. Full format: **`doc/ML_API_PROTO
 
 ---
 
-### 4. End-to-end flow
+### 3. End-to-end flow
 
 1. **Train** — Run the training pipeline so that `trainer/models/` (or your chosen dir) has model artifacts.
-2. **Build deploy package** — `python -m package.build_deploy_package [--model-source ...] [--archive]` → `package/deploy_dist/` (and optionally `.zip`).
+2. **Build deploy package** — `python -m package.build_deploy_package [--model-source ...] [--archive]` → `deploy_dist/` (and optionally `.zip`) at repo root.
 3. **Ship** — Copy the folder or the `.zip` to the target machine.
 4. **On target** — Unzip if needed, `pip install -r requirements.txt`, configure `.env`, `python main.py`.
 5. **Dashboard** polls `http://<target>:8001/alerts` and `/validation`.
+
+**Build player_profile (month-end only, same schedule as trainer):**
+
+```bash
+python -m trainer.etl_player_profile --start-date YYYY-MM-DD --end-date YYYY-MM-DD --local-parquet --month-end
+python -m trainer.scripts.auto_build_player_profile --local-parquet --month-end
+```
 
 ---
 
@@ -101,9 +90,7 @@ Example: `curl "http://localhost:8001/alerts"`. Full format: **`doc/ML_API_PROTO
 | **README.md** | This file — deploy package and API usage. |
 | **PLAN.md** | Full plan: bundle contents, API behavior, implementation notes. |
 | **build_deploy_package.py** | Build the shippable deploy folder (or .zip): app + model + requirements. Use this to deploy to the target. |
-| **package_model_bundle.py** | Optional: build a versioned model-only bundle; use its output as `--model-source` for build_deploy_package. |
-| **deploy_dist/** | Output of build_deploy_package — copy this (or its .zip) to the target. |
-| **bundles/** | Optional output of package_model_bundle (model files only; not shippable by itself). |
+| **deploy_dist/** | Output of build_deploy_package (at repo root) — copy this folder or its .zip to the target. |
 | **deploy/** | Source for main.py and config used by build_deploy_package. See deploy/README.md. |
 
 ---
@@ -134,7 +121,7 @@ Example: `curl "http://localhost:8001/alerts"`. Full format: **`doc/ML_API_PROTO
 部署**一律**為單一資料夾或壓縮檔：複製到目標機後在該機執行。請在 **專案根目錄** 執行：
 
 ```bash
-# 預設：模型來自 trainer/models，輸出 = package/deploy_dist/
+# 預設：模型來自 trainer/models，輸出 = deploy_dist/（專案根目錄）
 python -m package.build_deploy_package
 
 # 可選：產生單一壓縮檔（例如 deploy_dist.zip）
@@ -147,10 +134,10 @@ python -m package.build_deploy_package --model-source trainer/models_90d_weak --
 | 選項 | 預設 | 說明 |
 |--------|---------|-------------|
 | `--model-source` | `trainer/models` | 模型產物目錄（`model.pkl` 或 `walkaway_model.pkl`、`feature_list.json` 等）。 |
-| `--output-dir` | `package/deploy_dist` | 輸出資料夾。 |
+| `--output-dir` | `deploy_dist` | 輸出資料夾（預設為專案根目錄 ./deploy_dist）。 |
 | `--archive` | 關閉 | 另在輸出目錄上一層產生 `deploy_dist.zip`，便於單檔傳輸。 |
 
-**結果：** 產生 `package/deploy_dist/`（及可選的 `package/deploy_dist.zip`），內含目標機所需一切：`main.py`、`requirements.txt`、`.env.example`、`wheels/`、`models/`、`README_DEPLOY.txt` 等。
+**結果：** 在專案根目錄產生 `deploy_dist/`（及可選的 `deploy_dist.zip`），內含目標機所需一切：`main.py`、`requirements.txt`、`.env.example`、`wheels/`、`models/`、`README_DEPLOY.txt` 等。
 
 **在目標機上：** 複製該資料夾（或解壓 .zip）後：
 
@@ -162,25 +149,7 @@ python -m package.build_deploy_package --model-source trainer/models_90d_weak --
 
 ---
 
-### 2. 可選：版本化模型 bundle
-
-若要先建出版本化模型目錄再建部署包，可執行：
-
-```bash
-python -m package.package_model_bundle --source-dir trainer/models_90d_weak --output-dir package/bundles --archive
-```
-
-會產生僅含模型檔的 `package/bundles/<version>/`。**請勿單獨搬此目錄部署。** 可將其作為部署包的模型來源：
-
-```bash
-python -m package.build_deploy_package --model-source package/bundles/<version> --archive
-```
-
-再將產生的 `deploy_dist/` 或 `deploy_dist.zip` 依第 1 節方式搬至目標機。
-
----
-
-### 3. 啟動 ML API 服務（本機開發）
+### 2. 啟動 ML API 服務（本機開發）
 
 在 **專案根目錄** 執行（供本機與儀表板測試）：
 
@@ -202,13 +171,20 @@ python -m trainer.api_server
 
 ---
 
-### 4. 端到端流程
+### 3. 端到端流程
 
 1. **訓練** — 執行訓練流程，產出 `trainer/models/`（或自訂目錄）之模型產物。
-2. **建置部署包** — `python -m package.build_deploy_package [--model-source ...] [--archive]` → `package/deploy_dist/`（及可選 `.zip`）。
+2. **建置部署包** — `python -m package.build_deploy_package [--model-source ...] [--archive]` → 專案根目錄的 `deploy_dist/`（及可選 `.zip`）。
 3. **搬運** — 將該資料夾或 `.zip` 複製到目標機。
 4. **目標機** — 若有 .zip 先解壓，執行 `pip install -r requirements.txt`、設定 `.env`、`python main.py`。
 5. **儀表板** 輪詢 `http://<目標機>:8001/alerts` 與 `/validation`。
+
+**僅建每月（month-end）player_profile snapshot（與 trainer 排程一致）：**
+
+```bash
+python -m trainer.etl_player_profile --start-date YYYY-MM-DD --end-date YYYY-MM-DD --local-parquet --month-end
+python -m trainer.scripts.auto_build_player_profile --local-parquet --month-end
+```
 
 ---
 
@@ -219,9 +195,7 @@ python -m trainer.api_server
 | **README.md** | 本說明 — 部署包與 API 使用方式。 |
 | **PLAN.md** | 完整計畫：bundle 內容、API 行為與實作說明。 |
 | **build_deploy_package.py** | 建置可搬運的部署資料夾（或 .zip）：應用 + 模型 + requirements。部署至目標機請用此腳本。 |
-| **package_model_bundle.py** | 可選：建置僅含模型的版本化 bundle；可作為 build_deploy_package 的 `--model-source`。 |
-| **deploy_dist/** | build_deploy_package 的輸出 — 將此資料夾或其 .zip 複製到目標機。 |
-| **bundles/** | package_model_bundle 的可選輸出（僅模型檔；不可單獨搬運部署）。 |
+| **deploy_dist/** | build_deploy_package 的輸出（專案根目錄）— 將此資料夾或其 .zip 複製到目標機。 |
 | **deploy/** | build_deploy_package 使用的 main.py 與設定來源。詳見 deploy/README.md。 |
 
 ---

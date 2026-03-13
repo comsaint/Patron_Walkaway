@@ -45,31 +45,28 @@
 - **Optional archive**: `model_bundle_<version>.tar.gz` (or `.zip`) for transfer/versioning.
 - **MANIFEST** (optional): `MANIFEST.txt` or `bundle_info.json` in the bundle dir listing files and `model_version`.
 
-### 3.3 Packaging script
+### 3.3 Packaging (single entry point)
 
-- **Location**: `package/package_model_bundle.py`.
+- **Entry point**: `package/build_deploy_package.py` (no separate model-bundle script).
 - **Arguments**:
-  - `--source-dir`: Default `trainer/models` (relative to repo root or absolute).
-  - `--output-dir`: Default `package/bundles` or `dist`.
-  - `--version`: Optional; if omitted, read from `source-dir/model_version` or use timestamp.
-  - `--archive`: Optional flag to also produce `.tar.gz`.
+  - `--model-source`: Default `trainer/models`; directory with model artifacts and `feature_list.json`.
+  - `--output-dir`: Default `deploy_dist` (repo root); output folder (or `.zip` with `--archive`).
+  - `--archive`: Optional; also create `deploy_dist.zip` for single-file transfer.
 - **Logic**:
-  1. Ensure at least one of `model.pkl`, `rated_model.pkl`, `walkaway_model.pkl` exists and `feature_list.json` exists.
-  2. Create `output-dir/<version>/` (or `output-dir/model_bundle_<version>/`).
-  3. Copy the files above when present (skip missing optional files).
-  4. Optionally write MANIFEST / bundle_info.
-  5. If `--archive`, create `model_bundle_<version>.tar.gz`.
-- **Errors**: Exit non-zero with clear message if required files are missing.
+  1. Build `walkaway_ml` wheel; copy `main.py`, `.env.example`, app config.
+  2. Copy model bundle from `--model-source` into `output-dir/models/` (flush existing first). Require at least one of `model.pkl`, `rated_model.pkl`, `walkaway_model.pkl` and `feature_list.json`.
+  3. Write `requirements.txt`, `README_DEPLOY.txt`; create `local_state/`.
+- **Errors**: Exit non-zero with clear message if required model files are missing.
 
 ### 3.4 Usage
 
 After training, run from repo root:
 
 ```bash
-python -m package.package_model_bundle --source-dir trainer/models --output-dir package/bundles --archive
+python -m package.build_deploy_package --model-source trainer/models --archive
 ```
 
-Deploy: unpack or point scorer `--model-dir` at the bundle directory.
+Deploy: copy the resulting folder (or `.zip`) to the target; on target: `pip install -r requirements.txt`, configure `.env`, `python main.py`.
 
 ---
 
@@ -111,9 +108,9 @@ Listens on `0.0.0.0:8001` (or from env). Document for dashboard: base URL `http:
 ## 5. End-to-end flow
 
 1. **Train**: Run existing pipeline → `trainer/models/`.
-2. **Package**: Run `package/package_model_bundle.py` → `package/bundles/<version>/` (and optional `.tar.gz`).
-3. **Deploy**: Copy bundle to target; point scorer at bundle dir; scorer writes to `local_state/state.db`; validator writes validation_results.
-4. **Start API**: Run API server on port 8001; it reads same `state.db`; expose GET `/alerts`, GET `/validation`.
+2. **Package**: Run `package/build_deploy_package.py` [--model-source ...] [--archive] → `deploy_dist/` at repo root (and optional `.zip`).
+3. **Deploy**: Copy deploy_dist folder (or `.zip`) to target; on target: `pip install -r requirements.txt`, configure `.env`, `python main.py`.
+4. **API**: Same process runs scorer, validator, and Flask; reads `local_state/state.db`; exposes GET `/alerts`, GET `/validation`.
 5. **Dashboard**: Poll `http://localhost:8001/alerts` and `http://localhost:8001/validation` per protocol.
 
 ---
@@ -123,7 +120,7 @@ Listens on `0.0.0.0:8001` (or from env). Document for dashboard: base URL `http:
 | Item | Type | Description |
 |------|------|-------------|
 | `package/PLAN.md` | Doc | This plan. |
-| `package/package_model_bundle.py` | New | Packaging script (source dir, output dir, optional version, optional archive). |
+| `package/build_deploy_package.py` | Modify | Single packaging entry: app + model bundle into deploy_dist (model copy from --model-source; flush models/ before copy). |
 | `trainer/api_server.py` | Modify | Port 8001; add GET `/alerts` and GET `/validation` with 24h default, `limit`, protocol fields, `casino_player_id`/`is_known_player`/`TP`. |
 
 ---

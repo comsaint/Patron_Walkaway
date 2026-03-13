@@ -125,6 +125,9 @@ todos:
   - id: ml-api-casino-player-id
     content: "ML API：populate casino_player_id（scorer/validator/API + deploy main）；見「Populate casino_player_id in ML API（Protocol Update）」一節。"
     status: completed
+  - id: cli-month-end-player-profile
+    content: "CLI for month-end-only player_profile：profile_schedule、ETL --month-end、auto_build --month-end、測試、文件；見「CLI for month-end-only player_profile」一節。"
+    status: completed
   - id: step8-duckdb-stats
     content: "Step 8 Feature Screening：DuckDB 算統計量（std/可選 corr）避免 X.std() 全量 OOM；並檢視其他類似全量統計是否可一併優化。見「Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）」一節。"
     status: pending
@@ -186,10 +189,11 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 19 | **Track Human Lookback 向量化 + Step 6 進度條** | completed | Phase 1 解封與 Step 6 tqdm 已完成。Phase 2 **compute_loss_streak** 與 **compute_run_boundary** lookback 均已以 numba 單 pass 實作；Code Review 修補（wager NaN 填 0、run_break_min_ns 上限）已完成。見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。 |
 | 20 | **Deploy DEC-028 修補（player_profile 打包／canonical 持久化）** | completed | DEPLOY_PLAN §8、DECISION_LOG DEC-028。Production 修補：scorer DATA_DIR 空/空白視為未設定；build 時 profile 複製失敗 try/except 建包仍完成；deploy main 遲 import 加 noqa: E402；scorer _DATA_DIR 型別註解。tests/test_review_risks_deploy_dec028.py 7/7 通過；tests/typecheck/lint 全過。見 STATUS.md「DEC-028 本輪實作修正與驗證」。 |
 | 21 | **Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）** | pending | 以 DuckDB 對 train（Parquet 或註冊 DataFrame）算 stddev_pop 取得零變異篩選，避免 pandas X.std() 產生 ~17.6 GiB 暫存陣列；可選將相關矩陣改為 DuckDB CORR；其餘類似全量統計一併檢視。見「Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）」一節。 |
+| 22 | **CLI for month-end-only player_profile** | completed | profile_schedule、ETL `--month-end`／`--snapshot-interval-days`、auto_build_player_profile `--month-end`、測試、文件；Lint E402 已修正（import 移至頂部）。見「CLI for month-end-only player_profile」一節與 STATUS.md 本輪。 |
 
 **Plan 狀態摘要**：上表 1～19 項均為 **completed**（第 18 項於 Round 406 完成項目 1、3；第 19 項 Track Human Lookback 向量化於本輪完成 Phase 2 compute_run_boundary numba 與 Code Review 修補 wager NaN／run_break_min_ns 上限）。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
 
-**剩餘項目**：上表 1～20 項與 **canonical-step3-schema-check-oom**、**config-consolidation**（DEC-027）、**progress-bars-long-steps**、**training-config-recommender** 均已完成。DEC-027 與 progress-bars Code Review 修補已通過對應測試；training-config-recommender 已實作並完成 Code Review 修補；**項目 20** Deploy DEC-028 修補已於本輪完成（scorer DATA_DIR 邊界、build profile 複製 try/except、E402 noqa、mypy _DATA_DIR 型別），`tests/test_review_risks_deploy_dec028.py` 7/7 通過，tests/typecheck/lint 全過。目前 **pending**：**項目 21** Step 8 DuckDB 算統計量（見上方 todos 與下方對應一節）。
+**剩餘項目**：上表 1～20 項與 **canonical-step3-schema-check-oom**、**config-consolidation**（DEC-027）、**progress-bars-long-steps**、**training-config-recommender** 均已完成。DEC-027 與 progress-bars Code Review 修補已通過對應測試；training-config-recommender 已實作並完成 Code Review 修補；**項目 20** Deploy DEC-028 修補已完成；**項目 22** CLI for month-end-only player_profile 已實作完成（含 Lint E402 修正），tests/typecheck/lint 全過。目前 **pending**：**項目 21** Step 8 DuckDB 算統計量（見上方 todos 與下方對應一節）。
 
 **建議實作順序**：可選／後續見下方各節（Step 7 out-of-core 排序、Optuna early stop 等）。
 
@@ -239,7 +243,7 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 
 | 項目 | 說明 |
 |------|------|
-| **4.1 程式來源** | 部署包使用 `walkaway_ml` wheel（來自目前 `trainer/`），scorer / validator 的變更會隨下次 build 一併打包，無需在 `build_deploy_package.py` 或 `package_model_bundle.py` 加額外步驟。 |
+| **4.1 程式來源** | 部署包使用 `walkaway_ml` wheel（來自目前 `trainer/`），scorer / validator 的變更會隨下次 build 一併打包，無需在 `build_deploy_package.py` 加額外步驟。 |
 | **4.2 部署用 API** | `package/deploy/main.py` 內含獨立的 `_alerts_to_protocol_records` 與 `_validation_to_protocol_records`，必須依上述 §3 同步修改，否則部署環境仍會回傳 `casino_player_id: null`。 |
 | **4.3 文件** | 可於 `package/README.md` 或 `package/PLAN.md` 註明：ML API 依 `ML_API_PROTOCOL.md` 回傳之 `casino_player_id` 已由後端從 session 解析並填入（rated 有值，未 rated 可為 null）。 |
 | **4.4 既有部署升級** | 既有 state.db 升級時，scorer 的 `init_state_db` 會對 alerts 做 ALTER 新增 `casino_player_id`；validator 的 `get_db_conn` 會對 validation_results 做 ALTER。新寫入的 alert/validation 會帶 `casino_player_id`；舊資料該欄為 NULL，符合協定。 |
@@ -2952,3 +2956,95 @@ Step 9 → lgb.Dataset(train.libsvm)，LightGBM 自動載入 .weight
 - **OOM** 須從兩頭解決：**Step 7 不要讓 full/train 進記憶體**；**Step 9 不要用 pandas 讀整份 train**。
 - **LibSVM**：取代 CSV 作為「僅供 LightGBM 訓練」的匯出格式；配合 `.weight` 檔，4.6.0 完整支援 sample weight。
 - **LightGBM binary**：由 LightGBM 在第一次建 Dataset 後 `save_binary` 產生，供後續重訓使用；pipeline 只負責產出 LibSVM + .weight，不直接寫 .bin。
+
+---
+
+## CLI for month-end-only player_profile（與 trainer 行為一致）
+
+### 目標
+
+- 提供 CLI 方式，只建 **month-end** 的 player_profile snapshot。
+- 與 **trainer.py 的 `ensure_player_profile_ready`** 使用相同排程邏輯（DEC-019、OPT-001 式 intra-month anchor）。
+
+### trainer.py 現有行為（需對齊）
+
+1. **Month-end only**：`effective_month_end = True` → 一律用 month-end 排程。
+2. **日期列表**：`_month_end_dates(start, end)` → 範圍內每月最後一個日曆日。
+3. **Intra-month 範圍**：若範圍內沒有任何 month-end（例如 2026-02-01～2026-02-15），則建 **一個 anchor snapshot**：`_latest_month_end_on_or_before(end_date)`（例如 2026-01-31），讓 PIT join 有可用的 snapshot。
+4. **backfill 呼叫**：`backfill(..., snapshot_dates=_snap_dates)`；使用 anchor 時會設定 `_backfill_start` 讓該單日被包含。
+
+---
+
+### 1. 共用日期邏輯 — Option A：共用模組
+
+- **新檔**：`trainer/profile_schedule.py`。
+- **內容**：
+  - `month_end_dates(start_date: date, end_date: date) -> List[date]` — 與現有 `trainer._month_end_dates` 相同：範圍內每月最後一個日曆日。
+  - `latest_month_end_on_or_before(ref_date: date) -> date` — 與現有 `trainer._latest_month_end_on_or_before` 相同。
+- **trainer**：`trainer/trainer.py` 改為自 `trainer.profile_schedule` 匯入上述兩函式（或保留薄包裝呼叫共用函式）。
+- **ETL**：`trainer/etl_player_profile.py` 自 `trainer.profile_schedule` 匯入上述兩函式，供 CLI 使用；不依賴 trainer 其餘部分。
+
+---
+
+### 2. ETL CLI 變更（`trainer/etl_player_profile.py`）
+
+- **新參數**：`--month-end`。與 `--start-date`、`--end-date` 一併使用時，改為 **僅建 month-end** 的 backfill。
+- **邏輯**（當 `--month-end` 且給定 `--start-date` / `--end-date`）：
+  1. `snapshot_dates = month_end_dates(start_date, end_date)`（使用 `trainer.profile_schedule`）。
+  2. 若 `snapshot_dates` 為空：`anchor = latest_month_end_on_or_before(end_date)`，`snapshot_dates = [anchor]`，`backfill_start = min(start_date, anchor)`；否則 `backfill_start = start_date`。
+  3. 呼叫 `backfill(backfill_start, end_date, ..., snapshot_dates=snapshot_dates, use_local_parquet=..., disable_progress=...)`。
+- **未使用 `--month-end`**：維持現狀（每日 backfill）。
+- **可選**：`--snapshot-interval-days N` 供非 month-end 使用（預設 1）；文件註明 trainer 一律使用 month-end。
+- **Help**：說明 `--month-end` 與 trainer 排程一致（僅每月最後一天；intra-month 時建單一 anchor）。
+
+---
+
+### 3. `main()` 流程（偽碼）
+
+- 若 `args.start_date` 且 `args.end_date`：
+  - 若 `args.month_end`：依上計算 `snapshot_dates`（及必要時 `backfill_start`），再 `backfill(..., snapshot_dates=snapshot_dates)`。
+  - 否則：`backfill(..., snapshot_interval_days=args.snapshot_interval_days or 1)`。
+- 否則：維持單日路徑 → `build_player_profile(snap_date, ...)`。
+
+---
+
+### 4. auto_build_player_profile.py — Option 1：支援 `--month-end`
+
+- 在 **`trainer/scripts/auto_build_player_profile.py`** 新增 **`--month-end`**。
+- 當 `--month-end` 時：
+  - 呼叫 ETL 時改為 **month-end 排程**（同一日期範圍）：
+    - **若為 subprocess**：在呼叫 `etl_player_profile` 時加上 `--month-end`，例如  
+      `python -m trainer.etl_player_profile --start-date ... --end-date ... --local-parquet --month-end`。
+    - **若腳本會拆成多個 chunk**：可對每個 chunk 的 ETL 呼叫都加上 `--month-end`，或對該次執行改為單一範圍、單次 ETL 呼叫並加上 `--month-end`（不拆 chunk）。
+- 未加 `--month-end`：維持現有 chunk 每日 backfill。
+- Docstring：註明「加 `--month-end` 時僅建 month-end snapshot（與 trainer 一致）；需搭配 `--start-date`/`--end-date` 或自動偵測範圍」。
+
+---
+
+### 5. 測試
+
+- **共用模組**（`trainer/profile_schedule.py`）：為 `month_end_dates`、`latest_month_end_on_or_before` 寫單元測試（跨月、單月、intra-month、邊界）。若有現成對 trainer 的 `_month_end_dates`/`_latest_month_end_on_or_before` 測試，可改為對共用模組測。
+- **ETL CLI**：測試在給定 `--start-date`/`--end-date`/`--local-parquet`/`--month-end` 時，`backfill` 被呼叫且 `snapshot_dates` 為預期之 month-end 列表（或 intra-month 單一 anchor）。
+- **Intra-month**：至少一則測試為「範圍內無 month-end」（例如 2026-02-01～2026-02-15），斷言只建一個 snapshot（2026-01-31）。
+
+---
+
+### 6. 文件
+
+- **etl_player_profile.py** 頂部 docstring：加一項「Month-end 排程」說明 — 使用 `--month-end` 且 `--start-date`/`--end-date` 時，僅建每月最後一天 snapshot；與 trainer 的 `ensure_player_profile_ready` 行為一致。
+- **package/README.md**（或 ETL 使用說明）：加「僅建每月（month-end）snapshot」說明與範例：  
+  `python -m trainer.etl_player_profile --start-date YYYY-MM-DD --end-date YYYY-MM-DD --local-parquet --month-end`；  
+  以及一鍵 backfill：  
+  `python -m trainer.scripts.auto_build_player_profile --local-parquet --month-end`（可選 `--start-date`/`--end-date`）。
+
+---
+
+### 7. 實作檢查表
+
+| 步驟 | 動作 |
+|------|------|
+| 1 | 新增 **`trainer/profile_schedule.py`**（`month_end_dates`、`latest_month_end_on_or_before`）；**`trainer/trainer.py`** 改為使用該模組。 |
+| 2 | **`trainer/etl_player_profile.py`**：新增 `--month-end`（與可選 `--snapshot-interval-days`），在 `main()` 實作 month-end + intra-month anchor，並在 `--month-end` 時呼叫 `backfill(..., snapshot_dates=...)`。 |
+| 3 | **`trainer/scripts/auto_build_player_profile.py`**：新增 **`--month-end`**，並在呼叫 ETL 時傳遞（subprocess 或單一範圍 + `--month-end`），使一鍵 backfill 可選 month-end-only。 |
+| 4 | 為 **profile_schedule** 與 **ETL CLI month-end**（含 intra-month）補上 **測試**。 |
+| 5 | 更新 **ETL 與 package/README** 文件。 |

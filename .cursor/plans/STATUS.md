@@ -1453,3 +1453,272 @@ python -m pytest tests/test_review_risks_casino_player_id.py -v --tb=short
 - 與「Populate casino_player_id in ML API」相關項目已全部完成；無剩餘待辦。
 
 ---
+
+## CLI for month-end-only player_profile（PLAN § 實作）
+
+**Date**: 2026-03-12
+
+### Step 1：共用模組 profile_schedule + trainer 改用
+
+**改動檔案**
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/profile_schedule.py` | 新增：`month_end_dates(start_date, end_date)`、`latest_month_end_on_or_before(ref_date)`（自 trainer 抽出，邏輯不變）。 |
+| `trainer/trainer.py` | 移除 `_month_end_dates` / `_latest_month_end_on_or_before` 定義及 `import calendar`；改為 `from trainer.profile_schedule import latest_month_end_on_or_before, month_end_dates`；三處呼叫改為使用 `month_end_dates`、`latest_month_end_on_or_before`。 |
+
+**手動驗證**
+
+- 自 repo 根目錄：`python -c "from trainer.profile_schedule import month_end_dates, latest_month_end_on_or_before; from datetime import date; print(month_end_dates(date(2026,1,1), date(2026,3,31))); print(latest_month_end_on_or_before(date(2026,2,15)))"` → 應印出 `[datetime.date(2026, 1, 31), datetime.date(2026, 2, 28), datetime.date(2026, 3, 31)]` 與 `2026-01-31`。
+- `python -c "from trainer.trainer import ensure_player_profile_ready"` → 無 ImportError（trainer 仍可載入）。
+
+**下一步建議**
+
+- 實作 Step 2：在 `etl_player_profile.py` 新增 `--month-end`、`--snapshot-interval-days` 並在 `main()` 中依 PLAN 呼叫 `backfill(..., snapshot_dates=...)`。
+
+### Step 2：ETL CLI `--month-end`、`--snapshot-interval-days`
+
+**改動檔案**
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/etl_player_profile.py` | 匯入 `trainer.profile_schedule` 的 `month_end_dates`、`latest_month_end_on_or_before`；新增參數 `--month-end`、`--snapshot-interval-days`（預設 1）；在 `main()` 中若 `--month-end` 且給定起訖日則計算 `snapshot_dates`（空則用 anchor），呼叫 `backfill(..., snapshot_dates=...)`，否則呼叫 `backfill(..., snapshot_interval_days=...)`。 |
+
+**手動驗證**
+
+- `python -m trainer.etl_player_profile --help` → 應出現 `--month-end`、`--snapshot-interval-days`。
+- 乾跑（無 session 資料）：`python -m trainer.etl_player_profile --start-date 2026-01-01 --end-date 2026-03-31 --local-parquet --month-end` → 應嘗試 backfill 並因無 session 或缺少資料而結束（不 crash）。
+
+**下一步建議**
+
+- 實作 Step 3：在 `auto_build_player_profile.py` 新增 `--month-end`，呼叫 ETL 時傳入該旗標。
+
+### Step 3：auto_build_player_profile.py `--month-end`
+
+**改動檔案**
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/scripts/auto_build_player_profile.py` | Docstring 註明 `--month-end` 僅建 month-end、單次 ETL 不拆 chunk；`run_etl_chunk` 新增參數 `month_end=False`，為 True 時在 cmd 加上 `--month-end`；`auto_run` 新增 `month_end=False`，為 True 時單次呼叫 `run_etl_chunk(start_date, end_date, ..., month_end=True)` 後 return；`parse_args` 新增 `--month-end`；`main` 將 `args.month_end` 傳入 `auto_run` 並在 config 印出。 |
+
+**手動驗證**
+
+- `python -m trainer.scripts.auto_build_player_profile --help` → 應出現 `--month-end`。
+- 無 session 時：`python -m trainer.scripts.auto_build_player_profile --start-date 2026-01-01 --end-date 2026-01-31 --local-parquet --month-end` → 應出現 `[run] month-end only: ...` 並因無資料或 ETL 錯誤結束（不 crash）。
+
+**下一步建議**
+
+- 實作 Step 4：為 `profile_schedule` 與 ETL CLI month-end（含 intra-month）撰寫測試；Step 5：更新 ETL docstring 與 package/README。
+
+### Step 4：測試 profile_schedule 與 ETL CLI month-end
+
+**改動檔案**
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `tests/test_profile_schedule.py` | 新增：`TestMonthEndDates`（跨月、單月、intra-month 空列表、邊界、閏年）、`TestLatestMonthEndOnOrBefore`（同日、月中、月初、1/1）。 |
+| `tests/test_etl_player_profile_month_end_cli.py` | 新增：mock `backfill` 與 `_parse_args`，驗證 `--month-end` 時 `main()` 呼叫 `backfill` 且 `snapshot_dates` 為預期 month-end 列表；intra-month 範圍驗證單一 anchor（2026-01-31）且 `backfill_start` 正確。 |
+| `tests/test_review_risks_round180.py` | `test_month_end_dates_partial_month_returns_empty_list` 改為使用 `profile_schedule_mod.month_end_dates`（因 trainer 已移除 `_month_end_dates`）。 |
+
+**手動驗證**
+
+- `python -m pytest tests/test_profile_schedule.py tests/test_etl_player_profile_month_end_cli.py tests/test_review_risks_round180.py -v` → 18 passed。
+
+**下一步建議**
+
+- 實作 Step 5：更新 ETL 頂部 docstring 與 package/README.md 的 month-end 說明與範例。
+
+### Step 5：文件更新
+
+**改動檔案**
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/etl_player_profile.py` | 頂部 Usage 區塊新增一則範例：`--month-end` 搭配 `--start-date`/`--end-date`/`--local-parquet`，說明與 trainer.ensure_player_profile_ready 一致。 |
+| `package/README.md` | 在「End-to-end flow」與「端到端流程」後新增「Build player_profile (month-end only)」／「僅建每月（month-end）player_profile snapshot」：兩行範例指令（etl_player_profile --month-end、auto_build_player_profile --month-end）。 |
+
+**手動驗證**
+
+- 檢視 `trainer/etl_player_profile.py` 前 25 行與 `package/README.md` 對應段落，確認說明與指令正確。
+
+**下一步建議**
+
+- 執行 `pytest -q` 並將結果寫入 STATUS.md。
+
+### pytest -q 結果（實作完成後）
+
+**Date**: 2026-03-12
+
+```
+1015 passed, 41 skipped, 232 warnings in 45.18s
+```
+
+（Exit code 0；warnings 為既有 deprecation / FutureWarning，與本次變更無關。）
+
+---
+
+## Code Review：CLI for month-end-only player_profile 變更
+
+**Date**: 2026-03-12
+
+針對 PLAN §「CLI for month-end-only player_profile」實作之變更進行 review，僅列**最可能的 bug／邊界條件／安全性／效能**，每項附具體修改建議與建議新增測試。不重寫整套。
+
+---
+
+### 1. 邊界條件：`start_date > end_date` 未驗證（ETL main）
+
+**問題**：`etl_player_profile.main()` 在 `args.start_date and args.end_date` 時未檢查 `start_date <= end_date`。若使用者傳入 `--start-date 2026-03-01 --end-date 2026-01-01 --month-end`，`month_end_dates(2026-03-01, 2026-01-01)` 會回傳 `[]`，接著以 anchor = 2025-12-31 呼叫 `backfill(2025-12-31, 2026-01-01, snapshot_dates=[2025-12-31])`。雖不當機，但語意為「起訖顛倒」卻靜默執行；且若未用 `--month-end` 會進入 `backfill(start, end, snapshot_interval_days=...)`，其內 `dates_to_process` 或 day loop 會因 `start > end` 而無效（0 筆），等於靜默 no-op。
+
+**具體修改建議**：在 `main()` 進入 backfill 分支後、計算 `snapshot_dates` 或呼叫 `backfill` 前，加上：
+
+```python
+if args.start_date > args.end_date:
+    raise SystemExit("Invalid range: start-date must be <= end-date.")
+```
+
+或改為 `logging.error` + `sys.exit(1)`，並在 help 或文件中註明起訖須滿足 start ≤ end。
+
+**建議新增測試**：在 `test_etl_player_profile_month_end_cli.py` 新增一則：mock `_parse_args` 回傳 `start_date=date(2026, 3, 1)`, `end_date=date(2026, 1, 1)`, `month_end=True`，呼叫 `main()`，預期 `SystemExit`（或 `sys.exit(1)`）且 `backfill` 未被呼叫；或改為驗證「當 start > end 時程式以非零 exit 結束且未執行 backfill」。
+
+---
+
+### 2. 邊界條件：`profile_schedule.month_end_dates` 在 `start_date > end_date` 時回傳空列表
+
+**問題**：`month_end_dates(start_date, end_date)` 當 `start_date > end_date` 時會回傳 `[]`（第一個月末即 > end_date 而 break），呼叫端（ETL main）會解讀為「intra-month」並改為單一 anchor，容易造成語意混淆；且與「起訖顛倒」的錯誤使用混在一起，不利除錯。
+
+**具體修改建議**：在 `month_end_dates` 開頭加上：
+
+```python
+if start_date > end_date:
+    return []
+```
+
+並在 docstring 註明「若 start_date > end_date 則回傳空列表」。或改為 `raise ValueError("start_date must be <= end_date")`，由呼叫端（ETL）在 CLI 層先檢查並以明確錯誤訊息結束，再呼叫 `month_end_dates`（見上則）。
+
+**建議新增測試**：在 `test_profile_schedule.py` 的 `TestMonthEndDates` 中新增：`test_start_after_end_returns_empty_list`，`month_end_dates(date(2026, 3, 1), date(2026, 1, 1))` 預期為 `[]`；若改為「必須 raise ValueError」則改為 assertRaises 測試。
+
+---
+
+### 3. 邊界條件：`--snapshot-interval-days 0` 或負數
+
+**問題**：目前以 `max(1, int(args.snapshot_interval_days or 1))` 傳入 backfill，故 0 或負數會被壓成 1，不會當機，但使用者若誤傳 `--snapshot-interval-days 0` 會得到「每日」而非錯誤提示。
+
+**具體修改建議**：在 `main()` 的非 month-end 分支中，在呼叫 `backfill` 前檢查：
+
+```python
+interval = int(args.snapshot_interval_days or 1)
+if interval < 1:
+    raise SystemExit("--snapshot-interval-days must be >= 1.")
+```
+
+再傳 `snapshot_interval_days=max(1, interval)` 或直接傳 `interval`（此時已 ≥ 1）。若希望與現有行為完全一致（0/負數當 1），可僅在 help 或文件中說明「N < 1 時視為 1」，不強制改為 exit。
+
+**建議新增測試**：在 ETL CLI 測試中新增：`_parse_args` 回傳 `month_end=False`, `snapshot_interval_days=0`（或 -1），預期傳給 `backfill` 的 `snapshot_interval_days` 為 1；若改為「必須 exit」，則改為驗證 SystemExit 且 backfill 未以 0 或負數被呼叫。
+
+---
+
+### 4. 效能／行為：auto_build_player_profile `--month-end` 不寫 checkpoint
+
+**問題**：`--month-end` 時為單次 ETL 全範圍，成功後直接 return，未呼叫 `save_checkpoint`。若 ETL 執行到一半 OOM 或中斷，下次再跑會從頭再來，無法 resume。對「單次全範圍」而言屬預期，但與「chunk 模式會寫 checkpoint」行為不一致，文件未說明。
+
+**具體修改建議**：在 `auto_build_player_profile.py` 的 docstring 或 `--month-end` 的 help 中註明：「month-end 為單次執行，不寫 checkpoint，失敗需整段重跑。」若未來要支援「month-end + resume」，可再設計 checkpoint 格式（例如只存「最後成功之 month-end 日期」）。
+
+**建議新增測試**：可選。例如：mock `run_etl_chunk` 回傳 returncode=0，呼叫 `auto_run(..., month_end=True)`，驗證 `save_checkpoint` 未被呼叫（若 script 內有注入點）；或僅在文件／註解中說明，不強制加測。
+
+---
+
+### 5. 正確性：intra-month 時 `backfill_start` 與既有 parquet 合併語意
+
+**問題**：intra-month 時我們傳 `backfill_start = min(args.start_date, anchor)`、`end_date = args.end_date`、`snapshot_dates = [anchor]`。`backfill` 內會做 `dates_to_process = [d for d in snapshot_dates if start_date <= d <= end_date]`，故只會處理 `anchor` 一天，正確。但 `_persist_local_parquet` 會與既有 `LOCAL_PROFILE_PARQUET` 合併，若既有 parquet 已有同一天 `snapshot_date` 的資料，會依現有 R104 邏輯覆寫／合併。此為既有行為，非本次引入；僅提醒若未來有「idempotent run」需求，需依 snapshot_date 去重或覆寫策略一致。
+
+**具體修改建議**：無需改程式；可在 ETL 或 backfill docstring 註明「同一 snapshot_date 重複執行會依 _persist_local_parquet 邏輯合併／覆寫」。
+
+**建議新增測試**：可選。現有 `test_month_end_cli_intra_month_calls_backfill_with_single_anchor` 已驗證 `backfill_start` 與 `snapshot_dates`；若需更嚴格，可加一則整合測試：寫入一筆假 parquet 後再跑一次 backfill 同一 anchor，檢查合併後 row 數或內容符合預期。
+
+---
+
+### 6. 安全性
+
+**結論**：未發現額外安全性問題。CLI 參數經 `argparse` 與 `date.fromisoformat` 解析，傳入 backfill 的為 `date` 與 bool/int，subprocess 組裝的 cmd 僅含 `sys.executable`、固定路徑與 `isoformat()` 字串，無使用者可控的 shell 或路徑注入。
+
+---
+
+### 7. 小結
+
+| # | 類別       | 嚴重度 | 建議 |
+|---|------------|--------|------|
+| 1 | 邊界條件   | 中     | ETL main 檢查 start ≤ end，否則 exit 並附錯誤訊息；加測 start > end 時 exit 且未呼叫 backfill。 |
+| 2 | 邊界條件   | 低     | `month_end_dates` 對 start > end 明確回傳 [] 或 raise，並在 test 中鎖定行為。 |
+| 3 | 邊界條件   | 低     | 可選：對 `--snapshot-interval-days < 1` 報錯或於文件說明視為 1。 |
+| 4 | 行為／文件 | 低     | 在 auto script 註明 month-end 不寫 checkpoint、失敗需重跑。 |
+| 5 | 正確性     | 提醒   | 文件註明同一 snapshot_date 重複執行之合併行為即可。 |
+| 6 | 安全性     | 無     | 無額外建議。 |
+
+---
+
+## Code Review 風險點 → 最小可重現測試（僅新增 tests）
+
+**Date**: 2026-03-12
+
+依 Reviewer 所列風險點轉成最小可重現測試，**未改 production code**。新增測試與執行方式如下。
+
+### 新增測試一覽
+
+| Review § | 風險點 | 測試檔 | 測試名稱 | 鎖定行為 |
+|----------|--------|--------|----------|----------|
+| §1 | ETL main 未驗證 start ≤ end | `test_etl_player_profile_month_end_cli.py` | `test_etl_main_start_after_end_month_end_still_calls_backfill` | 當 start_date > end_date 且 month_end=True 時，目前仍會呼叫 backfill(anchor, end_date, snapshot_dates=[anchor])；若日後 production 改為先檢查並 SystemExit，請改為預期 SystemExit 且 backfill 未被呼叫。 |
+| §2 | month_end_dates(start > end) 回傳 [] | `test_profile_schedule.py` | `test_start_after_end_returns_empty_list` | `month_end_dates(date(2026,3,1), date(2026,1,1))` 回傳 `[]`。 |
+| §3 | snapshot_interval_days 0／負數 | `test_etl_player_profile_month_end_cli.py` | `test_etl_main_snapshot_interval_days_zero_passed_as_one` | month_end=False、snapshot_interval_days=0 時，傳給 backfill 的 `snapshot_interval_days` 為 1。 |
+| §3 | 同上 | `test_etl_player_profile_month_end_cli.py` | `test_etl_main_snapshot_interval_days_negative_passed_as_one` | month_end=False、snapshot_interval_days=-1 時，傳給 backfill 的 `snapshot_interval_days` 為 1。 |
+| §4 | month-end 不寫 checkpoint | `test_auto_build_player_profile_month_end.py` | `test_month_end_success_does_not_save_checkpoint` | `auto_run(..., month_end=True)` 且 `run_etl_chunk` 回傳成功時，`save_checkpoint` 未被呼叫。 |
+
+### 新增／修改的測試檔
+
+- **`tests/test_profile_schedule.py`**：新增 `test_start_after_end_returns_empty_list`。
+- **`tests/test_etl_player_profile_month_end_cli.py`**：新增 `test_etl_main_start_after_end_month_end_still_calls_backfill`、`test_etl_main_snapshot_interval_days_zero_passed_as_one`、`test_etl_main_snapshot_interval_days_negative_passed_as_one`。
+- **`tests/test_auto_build_player_profile_month_end.py`**：新檔；內含 `TestAutoBuildMonthEndDoesNotSaveCheckpoint::test_month_end_success_does_not_save_checkpoint`。
+
+### 執行方式
+
+僅跑上述與 month-end／profile_schedule 相關測試：
+
+```bash
+python -m pytest tests/test_profile_schedule.py tests/test_etl_player_profile_month_end_cli.py tests/test_auto_build_player_profile_month_end.py -v
+```
+
+全量測試（含本次新增）：
+
+```bash
+python -m pytest -q
+```
+
+（§5 正確性／§6 安全性未新增測試；§5 已有 `test_month_end_cli_intra_month_calls_backfill_with_single_anchor` 涵蓋 backfill_start／snapshot_dates。）
+
+---
+
+## 本輪：tests / typecheck / lint 全過（CLI month-end 收尾）
+
+**Date**: 2026-03-13
+
+### 目標
+
+依最高可靠性標準，僅改 production code，使 **tests、typecheck、lint 全過**；每輪結果追加 STATUS.md；最後修訂 PLAN.md 並回報剩餘項目。
+
+### Production 修改
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/trainer.py` | **Lint E402**：將 `from trainer.profile_schedule import latest_month_end_on_or_before, month_end_dates` 自 line 1004 移至檔案頂部（與其他 import 同區塊）；保留原處註解「Month-end schedule: shared with etl_player_profile CLI…」。 |
+
+### 驗證結果
+
+- **pytest**：`python -m pytest -q` → **1020 passed, 41 skipped**（exit 0）。
+- **ruff**：`ruff check trainer/ package/` → **All checks passed!**（修正前：trainer.py line 1004 E402 module level import not at top of file）。
+- **mypy**：`python -m mypy trainer/profile_schedule.py trainer/etl_player_profile.py trainer/scripts/auto_build_player_profile.py --ignore-missing-imports` → **Success: no issues found in 3 source files**。
+
+### PLAN.md
+
+- 「CLI for month-end-only player_profile」實作檢查表步驟 1～5 已於前輪完成；本輪僅修正 lint（E402），並在 PLAN 中將該項標為 **completed**。
+- **剩餘項目**：PLAN 中仍為 **pending** 者為 **Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）**；與 CLI month-end 無關。
+
+---
