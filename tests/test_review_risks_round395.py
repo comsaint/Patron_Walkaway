@@ -15,8 +15,8 @@ import unittest
 from unittest.mock import patch
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_FEATURES_PY = _REPO_ROOT / "trainer" / "features.py"
-_SCORER_PY = _REPO_ROOT / "trainer" / "scorer.py"
+_FEATURES_PY = _REPO_ROOT / "trainer" / "features" / "features.py"  # 項目 2.2: 實作在 features 子包
+_SCORER_PY = _REPO_ROOT / "trainer" / "serving" / "scorer.py"
 
 
 def _scorer_mod():
@@ -98,18 +98,18 @@ class TestR395ScorerFallbackComment(unittest.TestCase):
         )
 
 
-# ── Risk #4: scripts/one_time 路徑以 __file__ 為基準會指向錯誤目錄 ──
+# ── Risk #4: doc/one_time_scripts 路徑以 __file__ 為基準會指向錯誤目錄 ──
 
 
 class TestR395ScriptsOneTimeSpecPath(unittest.TestCase):
-    """R395 Review #4: scripts/one_time 的 Path(__file__).parent 會解析到錯誤路徑，僅文件化現狀."""
+    """R395 Review #4: doc/one_time_scripts 的 Path(__file__).parent 會解析到錯誤路徑，僅文件化現狀."""
 
     def test_script_resolved_spec_path_does_not_exist(self):
-        """以 scripts/one_time 為基準解析的 feature_spec 路徑不存在（pre-existing 問題）."""
-        script_spec = _REPO_ROOT / "scripts" / "one_time" / "feature_spec" / "features_candidates.yaml"
+        """以 doc/one_time_scripts 為基準解析的 feature_spec 路徑不存在（pre-existing 問題）."""
+        script_spec = _REPO_ROOT / "doc" / "one_time_scripts" / "feature_spec" / "features_candidates.yaml"
         self.assertFalse(
             script_spec.exists(),
-            "Path as resolved from scripts/one_time (__file__.parent) does not exist; "
+            "Path as resolved from doc/one_time_scripts (__file__.parent) does not exist; "
             "spec lives under trainer/feature_spec/ (R395 Review #4).",
         )
 

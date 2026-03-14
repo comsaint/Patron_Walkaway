@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 def _get_trainer_source() -> str:
-    path = Path(__file__).resolve().parent.parent / "trainer" / "trainer.py"
+    path = Path(__file__).resolve().parent.parent / "trainer" / "training" / "trainer.py"
     return path.read_text(encoding="utf-8")
 
 

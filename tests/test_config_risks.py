@@ -14,13 +14,14 @@ class TestConfigRisks(unittest.TestCase):
         # Maintainability rule: LABEL_LOOKAHEAD_MIN must reference X + Y in source,
         # not be a numeric literal, so that changing X or Y keeps it consistent.
         repo_root = pathlib.Path(__file__).resolve().parents[1]
-        cfg_path = repo_root / "trainer" / "config.py"
+        # SSOT for config is trainer/core/config.py after PLAN 項目 2.2 move
+        cfg_path = repo_root / "trainer" / "core" / "config.py"
         text = cfg_path.read_text(encoding="utf-8")
 
         # Find the assignment line and assert it references the two source constants.
         # This is intentionally strict; it should fail while it's a numeric literal.
         m = re.search(r"^\s*LABEL_LOOKAHEAD_MIN\s*=\s*(.+?)\s*(#.*)?$", text, flags=re.M)
-        self.assertIsNotNone(m, "LABEL_LOOKAHEAD_MIN assignment not found in trainer/config.py")
+        self.assertIsNotNone(m, "LABEL_LOOKAHEAD_MIN assignment not found in trainer/core/config.py")
         rhs = m.group(1)
         self.assertIn("WALKAWAY_GAP_MIN", rhs)
         self.assertIn("ALERT_HORIZON_MIN", rhs)

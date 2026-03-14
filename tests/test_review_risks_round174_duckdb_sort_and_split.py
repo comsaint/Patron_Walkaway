@@ -33,7 +33,7 @@ def _split_indices_replica(n_rows: int, train_frac: float, valid_frac: float) ->
 
 
 def _get_trainer_source() -> str:
-    path = Path(__file__).resolve().parent.parent / "trainer" / "trainer.py"
+    path = Path(__file__).resolve().parent.parent / "trainer" / "training" / "trainer.py"
     return path.read_text(encoding="utf-8")
 
 

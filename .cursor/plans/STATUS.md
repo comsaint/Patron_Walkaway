@@ -6,6 +6,1194 @@
 
 ---
 
+## Phase 2 前結構整理 — 項目 4：產出目錄統一與 .gitignore
+
+**Date**: 2026-03-14
+
+### 目標
+依 PLAN.md § Phase 2 前結構整理 項目 4：預設產出改為 repo 根下 `out/models/`、`out/backtest/`；config 為 SSOT；建包預設 model 來源對齊；.gitignore 涵蓋新舊產出目錄。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/config.py` | 新增 `_REPO_ROOT`、`DEFAULT_MODEL_DIR`（out/models）、`DEFAULT_BACKTEST_OUT`（out/backtest）。 |
+| `trainer/trainer.py` | `MODEL_DIR` 改為使用 `getattr(_cfg, "DEFAULT_MODEL_DIR", BASE_DIR / "models")`。 |
+| `trainer/backtester.py` | `BACKTEST_OUT` 改為 `getattr(_cfg, "DEFAULT_BACKTEST_OUT", BASE_DIR / "out_backtest")`，並 `BACKTEST_OUT.mkdir(parents=True, exist_ok=True)`。 |
+| `trainer/scorer.py` | 未設 `MODEL_DIR` 時改為 `getattr(config, "DEFAULT_MODEL_DIR", None) or (BASE_DIR / "models")`。 |
+| `package/build_deploy_package.py` | 新增 `import os`；預設 `--model-source`：有 `MODEL_DIR` 用該值，否則 `REPO_ROOT / "out" / "models"`（原為 trainer/models）。 |
+| `.gitignore` | 新增 `out/`、`trainer/models/`、`trainer/models_90d_weak/`。 |
+
+### 手動驗證建議
+- 執行訓練／回測一次，確認產出寫入 `out/models/`、`out/backtest/`（或依環境變數覆寫）。
+- 執行 `python -m package.build_deploy_package` 不指定 `--model-source`，確認預設從 `out/models` 取模型（或 `MODEL_DIR` 環境變數）。
+- 本機若有既有 `trainer/out_backtest/`、`trainer/models/` 可手動遷移或符號連結；README 遷移說明可後補。
+
+### pytest 結果
+```
+1056 passed, 44 skipped, 9 subtests passed in 27.47s
+```
+（指令：`python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load`）
+
+### 下一步建議
+進行 **步驟 3（項目 5）**：check_span 移至 scripts、one_time 移至 doc/one_time_scripts、README 說明。
+
+---
+
+## Phase 2 前結構整理 — 項目 5：根目錄與零散腳本
+
+**Date**: 2026-03-14
+
+### 目標
+依 PLAN.md § 項目 5：`check_span.py` 自根目錄移至 `scripts/check_span.py`；`scripts/one_time/` 整目錄移至 `doc/one_time_scripts/`；PROJECT.md／README 註明可執行腳本在 `scripts/`、歷史／一次性腳本在 `doc/one_time_scripts/`。
+
+### 修改摘要
+
+| 檔案／變更 | 內容 |
+|------------|------|
+| `check_span.py`（刪） | 自專案根目錄移除。 |
+| `scripts/check_span.py`（新增） | 內容與原檔相同；執行時須自 repo 根目錄執行（相對路徑 `data/...`）。 |
+| `scripts/one_time/*`（刪） | README.md 與所有 .py 刪除；目錄改為空（原整目錄移至 doc）。 |
+| `doc/one_time_scripts/`（新增） | 自 `scripts/one_time/` 複製所有 .py 與 README；README 開頭加「僅供參考、勿直接執行」，範例指令改為 `python doc/one_time_scripts/patch_backtester.py`。 |
+| `PROJECT.md` | 目標目錄樹與各頂層目錄職責：`doc/one_time_scripts/`、`scripts/` 改為現狀描述（移除「項目 5 後」）；產出與可執行腳本約定同調。 |
+| `README.md` | 架構小節新增一行：可執行腳本在 `scripts/`，歷史／一次性在 `doc/one_time_scripts/`，詳見 PROJECT.md。 |
+| `tests/test_review_risks_round395.py` | Risk #4：路徑由 `scripts/one_time` 改為 `doc/one_time_scripts`（搬移後契約不變：spec 不在 one_time 目錄下）。 |
+
+### 手動驗證建議
+- 自 repo 根目錄執行 `python scripts/check_span.py`（需有 `data/gmwds_t_session.parquet`），確認可跑或依預期報錯。
+- 確認 `doc/one_time_scripts/` 內含 README.md 與所有 patch_*.py、fix_trainer.py；`scripts/one_time/` 已無檔案。
+- 閱讀 PROJECT.md「產出與可執行腳本約定」與 README 架構之 Scripts 一行，確認與現狀一致。
+
+### pytest 結果
+```
+1065 passed, 44 skipped, 9 subtests passed in 28.53s
+```
+（指令：`python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load`）
+
+### 下一步建議
+進行 **步驟 4（項目 2）**：trainer 子包建立與模組搬移、相容層、setup/entry points、測試與建包；或 **步驟 5（項目 8）**：README/package 註明 frontend 可選與未來可提層。
+
+---
+
+## Phase 2 前結構整理 — 項目 8：前端與靜態資源（文件面）
+
+**Date**: 2026-03-14
+
+### 目標
+依 PLAN.md § 項目 8：在 README／PROJECT.md 與 package/README.md 註明 `trainer/frontend/` 為可選、部署包可僅含 API、預設建包不含 frontend；可選註明未來可將 frontend 提到根目錄。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `README.md` | 架構小節：`trainer/frontend/` 改為「儀表板 SPA，**可選**；部署包可僅含 API（無前端），若需儀表板再自 repo 另行部署或建包時一併帶出。詳見 PROJECT.md『前端與部署』」。 |
+| `PROJECT.md` | 「前端與部署（項目 8）」新增一項：（可選）若未來前端擴充可考慮將 `trainer/frontend/` 提到根目錄 `frontend/`，建包時再產出到 deploy 目錄。 |
+| `package/README.md` | 建置部署包結果說明後新增 **Frontend**／**前端** 小段：預設建包**不含**儀表板 SPA；部署包僅含 API；若需儀表板可另行提供或日後建包帶出；若含前端則靜態檔置於部署輸出目錄下（例如 `deploy_dist/static/`）。 |
+
+### 手動驗證建議
+- 閱讀 README 架構中 `trainer/frontend/` 一項，確認有「可選」與「部署包可僅含 API」。
+- 閱讀 PROJECT.md「前端與部署」三點與 package/README.md 中英「Frontend／前端」段落，確認與現狀一致。
+- 執行 `python -m package.build_deploy_package` 後檢查 `deploy_dist/` 無 frontend 靜態檔（僅 API），符合文件說明。
+
+### pytest 結果
+```
+1070 passed, 44 skipped, 9 subtests passed in 25.94s
+```
+（指令：`python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load`）
+
+### 下一步建議
+進行 **步驟 4（項目 2）**：trainer 子包建立與模組搬移、相容層、setup/entry points、測試與建包。
+
+---
+
+### Code Review：項目 8 變更（高可靠性標準）
+
+**Date**: 2026-03-14
+
+**審查範圍**：PLAN.md 項目 8、STATUS 本輪修改摘要；`README.md`、`PROJECT.md`、`package/README.md`（均為文件面）。以下僅列潛在問題與建議，**不重寫整套**。
+
+---
+
+#### 1. 一致性：README 多語架構未同步「frontend 可選」
+
+**問題**：項目 8 僅在 README **繁體**架構小節將 `trainer/frontend/` 改為「可選；部署包可僅含 API…」。**簡體**架構（約 line 180）與**英文**架構（約 line 316）仍為「儀表盘 SPA」／「Dashboard SPA」而無「可選」與「部署包可僅含 API」，讀者若只看簡體或英文會以為 frontend 為必備。
+
+**具體修改建議**：在 README 簡體架構與英文架構中，將 `trainer/frontend/` 一項改為與繁體一致：註明可選、部署包可僅含 API、若需儀表板再另行部署或建包；可加一句「See PROJECT.md § 前端與部署」或 "See PROJECT.md § 前端與部署"。
+
+**建議新增測試**：契約測試（如 test_review_risks_phase0 或新建）：讀取 README.md，assert 三處架構（繁體／簡體／英文）中與 `frontend` 相關的條目皆含「可選」或 "optional" 及「僅含 API」或 "API-only"（或 "deploy package can be API-only"）之關鍵字，避免日後僅改一語系。
+
+---
+
+#### 2. 一致性：README 開頭「產出」描述與架構「可選」易矛盾
+
+**問題**：README 開頭「產出」寫「API 與前端儀表板供營運使用」（約 line 17），未註明前端為可選。與架構「可選；部署包可僅含 API」並列時，易被解讀為「產出同時包含 API 與儀表板」，而實際部署包預設僅 API。
+
+**具體修改建議**：將該句改為「API 供營運使用；前端儀表板為可選，部署包預設僅含 API」或類似，使與 PROJECT/package 說明一致。
+
+**建議新增測試**：可選。Assert README 前 50 行內若出現「前端儀表板」或「frontend dashboard」，同一句或鄰句須出現「可選」或 "optional" 或「僅含 API」等限定語。
+
+---
+
+#### 3. 文件與建包行為一致
+
+**問題**：package/README 與 PROJECT 寫「預設建包不含 frontend」「部署包僅含 API」。需確認 build_deploy_package.py 確未複製 `trainer/frontend/`，以免文件與行為不符。
+
+**具體修改建議**：已確認 build 腳本未複製 frontend；無需改程式。若日後新增「含 frontend 建包」選項，須同步更新 package/README 與 PROJECT，並讓靜態檔位置（如 `deploy_dist/static/`）與文件一致。
+
+**建議新增測試**：契約測試：執行 `python -m package.build_deploy_package`（或 mock 不實際建 wheel），檢查輸出目錄中不存在 `trainer/frontend/` 或 `static/` 下之儀表板檔（如 `main.html`），或 assert 輸出目錄僅含預期清單（main.py、models/、wheels/、data/ 等），不含 frontend 路徑。
+
+---
+
+#### 4. 文件滯後：package/README 預設 model-source
+
+**問題**：package/README 表格中 `--model-source` 預設仍寫 `trainer/models`；項目 4 後實際預設為 `out/models`（或 `MODEL_DIR` 環境變數）。屬文件滯後，非項目 8 直接疏漏，但會誤導建包指令。
+
+**具體修改建議**：將 package/README 中英兩處「預設」改為 `out/models`（或 "out/models or MODEL_DIR env"），與 build_deploy_package 及 config 約定一致。
+
+**建議新增測試**：無需針對項目 8 新增；若已有「建包預設 model 來源」之測試，可一併涵蓋文件與行為一致（例如 assert 預設為 out/models）。
+
+---
+
+#### 5. 安全性／效能
+
+**問題**：本輪為純文件變更，無程式邏輯、路徑或輸入處理，無安全性或效能風險。
+
+**具體修改建議**：無。
+
+**建議新增測試**：無。
+
+---
+
+**總結**：建議優先處理 **§1（多語架構 frontend 可選同步）** 與 **§2（產出描述與可選一致）**；**§3** 可加契約測試鎖定「建包不含 frontend」；**§4** 為建議後續修正；§5 無需。完成 §1、§2 後可補對應契約測試，再進行步驟 4（項目 2）。
+
+---
+
+#### 項目 8 Review 風險 → 最小可重現測試（僅 tests，未改 production）
+
+**Date**: 2026-03-14
+
+將上述 Review 風險點轉成最小可重現測試或契約，僅新增 tests，不修改 production code（含 README／PROJECT／package 文件與 build 腳本）。
+
+| Review § | 風險要點 | 測試檔 | 測試內容 |
+|----------|----------|--------|----------|
+| §1 | README 三處架構（繁／簡／英）frontend 條目須含「可選」與「僅含 API」 | `tests/test_review_risks_frontend_item8.py` | `TestReadmeFrontendOptionalApiOnlyAllSections`：四則（三語系 frontend 行 + 三小節存在）；**目前簡體、英文兩則會失敗**，直到 README 依 Review §1 補齊。 |
+| §2（可選） | 前 50 行若出現「前端儀表板」或 "frontend dashboard" 須有限定語 | 同上 | `TestReadmeOutputParagraphFrontendOptionalMention`：前 50 行有 frontend/dashboard 時 assert 出現可選或 API-only；目前通過。 |
+| §3 | 預設建包不含 frontend | 同上 | `TestBuildDeployPackageDoesNotCopyFrontend`：契約 assert build_deploy_package.py 未引用 `trainer/frontend`、未複製至 `output_dir/static`。 |
+
+**新增測試檔案**：`tests/test_review_risks_frontend_item8.py`
+
+**執行方式**（皆自 repo 根目錄）：
+
+```bash
+# 僅跑項目 8 Review 測試
+python -m pytest tests/test_review_risks_frontend_item8.py -v
+
+# 全量（排除 e2e/load）
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+```
+
+**目前結果**：7 則測試全數通過（見下方本輪實作後）。
+
+**Lint/typecheck**：本輪未新增 lint 或 typecheck 規則；項目 8 為文件面，無程式型別或風格規則補充。
+
+---
+
+#### 本輪：項目 8 Code Review 實作修正與驗證（tests/typecheck/lint 全過）
+
+**Date**: 2026-03-14
+
+依指示：不改 tests 除非測試本身錯或 decorator 過時；修改實作直至所有 tests/typecheck/lint 通過；結果追加 STATUS；最後更新 PLAN.md。
+
+**Production 修改**（README 多語架構與 項目 8 Review §1 對齊）：
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `README.md` | **簡體**架構（約 line 180）：`trainer/frontend/` 條目補上「**可选**；部署包可仅含 API（无前端），若需仪表板再自 repo 另行部署或建包时一并带出。详见 PROJECT.md「前端与部署」」。 |
+| `README.md` | **英文**架構（約 line 316）：`trainer/frontend/` 條目補上「**optional**; deploy package can be API-only (no frontend). If you need the dashboard, serve it from the repo or include it in the build. See PROJECT.md § 前端與部署.」 |
+
+**Tests 修正**（測試本身錯：簡體用字為「可选」「仅含 API」，原關鍵字僅繁體「可選」「僅含 API」）：
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `tests/test_review_risks_frontend_item8.py` | `OPTIONAL_KEYWORDS` 新增「可选」；`API_ONLY_KEYWORDS` 新增「仅含 API」，使 簡體架構條目通過契約。 |
+
+**執行指令與結果**（repo 根目錄）：
+
+```bash
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+python -m ruff check trainer/ package/ scripts/
+python -m mypy trainer/ package/ --ignore-missing-imports
+```
+
+| 項目 | 結果 |
+|------|------|
+| pytest | **1077 passed**, 44 skipped, 9 subtests passed |
+| ruff | **All checks passed!**（trainer/ package/ scripts/） |
+| mypy | **Success: no issues found in 28 source files** |
+
+**PLAN.md**：步驟 5（項目 8）已為 done；本輪補齊 Code Review §1 多語同步與契約測試全過，無需改 PLAN 狀態欄（仍為 done）。
+
+---
+
+## Phase 2 前結構整理 — 步驟 4（項目 2）本輪：2.1 子包目錄建立
+
+**Date**: 2026-03-14
+
+依 PLAN.md 建議執行順序，下一步為**步驟 4（項目 2）**。本輪僅實作 **2.1**（建立子包目錄與 `__init__.py`），不搬移模組、不改 import。
+
+### 目標
+PLAN 項目 2.1：在 `trainer/` 下建立子包目錄 `core/`、`features/`、`training/`、`serving/`、`etl/`，各目錄含 `__init__.py`。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/core/__init__.py` | 新增（僅註解說明未來放置 config、db_conn、schema_io、duckdb_schema）。 |
+| `trainer/training/__init__.py` | 新增（僅註解說明未來放置 trainer、time_fold、backtester）。 |
+| `trainer/serving/__init__.py` | 新增（僅註解說明未來放置 scorer、validator、api_server、status_server）。 |
+| `trainer/etl/__init__.py` | 新增（僅註解說明未來放置 etl_player_profile、profile_schedule）。 |
+
+**說明**：**未建立 `trainer/features/`**。因現有 `trainer/features.py` 存在，若建立 `trainer/features/` 目錄會使 `trainer.features` 變成套件而遮蔽模組，導致全量測試 collection 時 64 個 errors（`from trainer.features import ...` 失敗）。`features/` 子包留待 2.2 搬移時一併建立（例如將 `features.py` 移入 `trainer/features/features.py` 後再存在 `trainer/features/`）。
+
+### 手動驗證建議
+- 自 repo 根目錄執行 `python -c "import trainer.core, trainer.training, trainer.serving, trainer.etl; print('ok')"`，確認四子包可 import。
+- 確認既有 `from trainer.config import ...`、`from trainer.features import ...` 等仍可用（未搬移故行為不變）。
+- 執行 `python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load`，確認全數通過。
+
+### pytest 結果
+```
+1077 passed, 44 skipped, 9 subtests passed in 29.42s
+```
+（指令：`python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load`）
+
+### 下一步建議
+進行 **項目 2.2**：搬移模組（建議順序：core → etl → features → training → serving），並在 2.2 中為 features 建立 `trainer/features/` 同時將 `trainer/features.py` 移入 `trainer/features/features.py`（或依 PLAN 保留頂層 re-export）。完成 2.2 後再做 2.3 相容層、2.4 setup/entry points、2.5 全量測試與建包。
+
+---
+
+### Code Review：步驟 4（項目 2）2.1 子包目錄建立（高可靠性標準）
+
+**Date**: 2026-03-14
+
+**審查範圍**：PLAN.md 項目 2、STATUS 本輪「步驟 4（項目 2）本輪：2.1 子包目錄建立」；新增之 `trainer/core/__init__.py`、`trainer/training/__init__.py`、`trainer/serving/__init__.py`、`trainer/etl/__init__.py`；未建立之 `trainer/features/` 決策；PROJECT.md 目標目錄樹；setup.py 建包設定。以下僅列潛在問題與建議，**不重寫整套**。
+
+---
+
+#### 1. 文件與實作一致：PROJECT.md 目標樹與目前僅四子包
+
+**問題**：PROJECT.md 目標目錄樹寫「項目 2 後」trainer 下含 `core/`、`features/`、`training/`、`serving/`、`etl/`。目前 2.1 僅建立 core、training、serving、etl；**未建立 features/**（已於 STATUS 說明為避免遮蔽 `trainer/features.py`）。若有人僅讀 PROJECT 而以為五個子包皆已存在，可能誤用 `trainer.features` 為子包（目前仍為模組）。
+
+**具體修改建議**：在 PROJECT.md 目標目錄樹的 trainer 小節加註：「2.1 僅先建立 core、training、serving、etl；features 子包於 2.2 搬移時一併建立（目前 `trainer/features.py` 仍為頂層模組）。」或於 STATUS 本節保留即可，並在 2.2 完成後再將 PROJECT 改為與實作一致。
+
+**希望新增的測試**：契約測試：若 PROJECT.md 列出 trainer 子包清單（core、features、training、serving、etl），則 assert 對應目錄存在或文件內有「2.1 僅先建立…」「features 於 2.2」等說明，避免文件與目錄不一致。
+
+---
+
+#### 2. 建包／安裝：setup.py 未列舉子包
+
+**問題**：`setup.py` 使用 `packages=["walkaway_ml", "walkaway_ml.scripts"]`，未列舉 `walkaway_ml.core`、`walkaway_ml.training`、`walkaway_ml.serving`、`walkaway_ml.etl`。 setuptools 行為上，僅列頂層包時，部分情境下子包目錄仍會隨 `walkaway_ml` 一併納入（因 package_dir 指向 trainer/ 目錄）；但依文件與實務，**明確列舉 subpackages 或使用 find_packages()** 可避免建包後安裝環境缺子包。2.1 階段尚無程式 `import trainer.core` 等，故目前無立即失效；2.2 搬移後若頂層 re-export 使用 `from trainer.core.config import ...`，安裝為 walkaway_ml 時需 `walkaway_ml.core` 存在。
+
+**具體修改建議**：於 **2.4** 更新 setup.py／pyproject.toml 時，將 `trainer.core`、`trainer.training`、`trainer.serving`、`trainer.etl`（及 2.2 後的 `trainer.features`）對應之 `walkaway_ml.*` 一併列入 packages，或改為 `find_packages()` 並排除不需打包的目錄，確保安裝後 `import walkaway_ml.core` 等可成功。
+
+**希望新增的測試**：契約測試：執行 `python -m package.build_deploy_package` 後，於虛擬環境中 `pip install deploy_dist/wheels/walkaway_ml*.whl`，再執行 `python -c "import walkaway_ml.core, walkaway_ml.training, walkaway_ml.serving, walkaway_ml.etl; print('ok')"`，預期成功；或至少 assert setup.py 或 pyproject.toml 中 packages 含上述子包（或使用 find_packages）。
+
+---
+
+#### 3. 邊界：未來 2.2 搬移時 features 子包與模組同名
+
+**問題**：2.2 若建立 `trainer/features/` 並將 `trainer/features.py` 移為 `trainer/features/features.py`，則 `trainer.features` 由模組變為套件，所有 `from trainer.features import ...` 需改為 `from trainer.features.features import ...` 或在 `trainer/features/__init__.py` 內 re-export。本輪正確選擇不先建 features/，避免 64 個 collection errors；2.2 時需一次性處理所有 references。
+
+**具體修改建議**：2.2 搬移前以 grep 彙整所有 `trainer.features`、`from trainer import features`、`from trainer.features import` 的用法；搬移後在 `trainer/features/__init__.py` 做 re-export（例如 `from trainer.features.features import *` 或列舉公開符號），使既有 `from trainer.features import X` 不需改動；或全量替換為 `from trainer.features.features import X` 並跑全量測試。
+
+**希望新增的測試**：2.2 完成後：全量 pytest 通過；可選契約測試 assert 無 `from trainer.features.features import` 殘留於 tests 以外之 production 碼（若約定一律經 __init__ re-export）。
+
+---
+
+#### 4. 循環 import（2.2／2.3 時）
+
+**問題**：本輪四支 __init__.py 僅註解，無 import，故無循環依賴。2.2／2.3 若在子包 __init__.py 或 trainer/__init__.py 內做 re-export（如 `from trainer.core.config import ...`），可能出現 trainer → trainer.core → trainer.xxx 之循環。PLAN 已註明相容層在頂層 re-export，需注意 import 順序與延遲 import。
+
+**具體修改建議**：2.3 相容層盡量以「頂層薄層 re-export」為之，子包 __init__.py 僅 re-export 本包內模組，不從 trainer 頂層或兄弟子包 import；若需延遲 import，在函數內或 TYPE_CHECKING 內處理。
+
+**希望新增的測試**：可選：啟動時 `import trainer` 後再 `import trainer.core; import trainer.training; ...`，assert 不觸發 ImportError 或循環；或 CI 全量 pytest 即涵蓋此行為。
+
+---
+
+#### 5. 安全性／效能
+
+**問題**：本輪僅新增四個註解檔，無執行邏輯、無路徑與使用者輸入、無網路，無安全性或效能風險。
+
+**具體修改建議**：無。
+
+**希望新增的測試**：無。
+
+---
+
+**總結**：建議 **§1** 在 PROJECT 或 STATUS 保留「2.1 僅四子包、features 於 2.2」之說明並可加契約測試；**§2** 於 2.4 建包設定時一併補齊子包列舉或 find_packages 與安裝後 import 契約測試；**§3**、**§4** 為 2.2／2.3 實作時注意；§5 無需。本輪 2.1 變更風險低，可依建議於後續步驟補齊即可。
+
+---
+
+#### 項目 2.1 Review 風險 → 最小可重現測試（僅 tests，未改 production）
+
+**Date**: 2026-03-14
+
+將上述 Review 風險點轉成最小可重現測試，僅新增 tests，不修改 production code。
+
+| Review § | 風險要點 | 測試檔 | 測試內容 |
+|----------|----------|--------|----------|
+| §1 | PROJECT 列出五子包時須目錄存在或文件有延後說明 | `tests/test_review_risks_item2_subpackages.py` | `TestProjectMdSubpackagesMatchRealityOrDisclaimer`：PROJECT 樹列出 core/、features/、training/、serving/、etl/ 時，assert trainer/features/ 存在或 PROJECT/STATUS 含「2.1 僅先建立」「features 於 2.2」等說明。 |
+| §2 | setup.py 須列舉子包或 find_packages | 同上 | `TestSetupPySubpackagesContract`：assert setup.py 的 packages= 含 walkaway_ml.core、.training、.serving、.etl 或使用 find_packages()。 |
+| §4 | import 子包無 ImportError／循環 | 同上 | `TestTrainerSubpackagesImportNoCycle`：import trainer 後 import trainer.core、.training、.serving、.etl 無錯誤；assert trainer.features 仍為模組（__file__ 存在）。 |
+
+**新增測試檔案**：`tests/test_review_risks_item2_subpackages.py`
+
+**執行方式**（皆自 repo 根目錄）：
+
+```bash
+# 僅跑項目 2.1 Review 測試
+python -m pytest tests/test_review_risks_item2_subpackages.py -v
+
+# 全量（排除 e2e/load）
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+```
+
+**目前結果**：4 則測試全數通過（見下方本輪實作後）。
+
+**Lint/typecheck**：本輪未新增 lint 或 typecheck 規則。
+
+---
+
+#### 本輪：項目 2.1 Code Review §2 實作（setup.py 子包列舉）— tests/typecheck/lint 全過
+
+**Date**: 2026-03-14
+
+依指示：不改 tests 除非測試本身錯或 decorator 過時；修改實作直至所有 tests/typecheck/lint 通過；結果追加 STATUS；最後更新 PLAN.md。
+
+**Production 修改**（Code Review 項目 2.1 §2）：
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `setup.py` | `packages=` 新增 `walkaway_ml.core`、`walkaway_ml.training`、`walkaway_ml.serving`、`walkaway_ml.etl`，確保安裝後可 `import walkaway_ml.core` 等；加註「項目 2.1：子包須列舉…STATUS Code Review 項目 2.1 §2」。 |
+
+**執行指令與結果**（repo 根目錄）：
+
+```bash
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+python -m ruff check trainer/ package/ scripts/
+python -m mypy trainer/ package/ --ignore-missing-imports
+```
+
+| 項目 | 結果 |
+|------|------|
+| pytest | **1081 passed**, 44 skipped, 9 subtests passed |
+| ruff | **All checks passed!**（trainer/ package/ scripts/） |
+| mypy | **Success: no issues found in 32 source files** |
+
+**PLAN.md**：步驟 4（項目 2）仍為 **待辦**；本輪僅完成 2.1 子包目錄與 2.4 之子包列舉部分，2.2 搬移、2.3 相容層、2.4 entry points、2.5 全量建包驗證尚未實作。
+
+---
+
+## Phase 2 前結構整理 — 步驟 4（項目 2）本輪：2.2 core 子包搬移
+
+**Date**: 2026-03-14
+
+依 PLAN 項目 2.2 建議順序，本輪實作 **core** 子包搬移：將 config、db_conn、schema_io、duckdb_schema 移入 `trainer/core/`，頂層改為 re-export，使既有 `from trainer.config import ...` 等仍可工作。
+
+### 目標
+PLAN 項目 2.2：core/ 放置 config、db_conn、schema_io、duckdb_schema；2.3 相容層以頂層 re-export 保留既有 import。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/core/config.py` | 新增（自 trainer/config.py 複製）；`_REPO_ROOT` 改為 `Path(__file__).resolve().parent.parent.parent`（core 在 trainer/core/）。 |
+| `trainer/core/db_conn.py` | 新增（自 trainer/db_conn.py 複製）；import 改為 `from . import config`。 |
+| `trainer/core/schema_io.py` | 新增（自 trainer/schema_io.py 複製，內容不變）。 |
+| `trainer/core/duckdb_schema.py` | 新增（自 trainer/duckdb_schema.py 複製，內容不變）。 |
+| `trainer/core/__init__.py` | 新增 re-export：`from trainer.core import config, db_conn, schema_io, duckdb_schema`。 |
+| `trainer/config.py` | 改為薄層 re-export：`from trainer.core.config import *` 及 `_REPO_ROOT`（因 `import *` 不匯出底線名稱）。 |
+| `trainer/db_conn.py` | 改為薄層 re-export：`from trainer.core.db_conn import *`。 |
+| `trainer/schema_io.py` | 改為薄層 re-export：`from trainer.core.schema_io import *`。 |
+| `trainer/duckdb_schema.py` | 改為薄層 re-export：`from trainer.core.duckdb_schema import *`。 |
+| `tests/test_config_risks.py` | 契約改讀 `trainer/core/config.py`（SSOT 已移至 core）。 |
+| `tests/test_review_risks_round182_plan_b_config.py` | 契約路徑改為 `trainer/core/config.py`。 |
+| `tests/test_review_risks_round213_duckdb_temp_cleanup.py` | 取得 config 來源改為 `inspect.getsource(trainer.core.config)`。 |
+| `tests/test_review_risks_round389_canonical_duckdb_dynamic_ram.py` | patch 目標改為 `trainer.core.config.DUCKDB_RAM_FRACTION`。 |
+| `tests/test_review_risks_round80.py` | 契約改讀 `trainer/core/db_conn.py`；接受 `from . import config` 或原 try/except。 |
+
+### 手動驗證建議
+- 自 repo 根目錄執行 `python -c "from trainer.config import DEFAULT_MODEL_DIR, _REPO_ROOT; from trainer.core.config import get_duckdb_memory_limit_bytes; print('ok')"`。
+- 執行 `python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load`，確認全數通過。
+- 執行 `python -m package.build_deploy_package`（可選），確認建包仍可完成。
+
+### pytest 結果
+```
+1081 passed, 44 skipped, 9 subtests passed in 30.25s
+```
+（指令：`python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load`）
+
+### 下一步建議
+進行 **項目 2.2** 其餘子包搬移：**etl**（etl_player_profile、profile_schedule）→ **features**（建立 trainer/features/ 並移入 features.py、feature_spec/）→ **training**（trainer、time_fold、backtester）→ **serving**（scorer、validator、api_server、status_server）。每搬一子包跑一輪 pytest。完成 2.2 後做 2.3 相容層補齊、2.4 entry points、2.5 全量建包驗證。
+
+---
+
+### Code Review：步驟 4（項目 2）2.2 core 子包搬移（高可靠性標準）
+
+**Date**: 2026-03-14
+
+**審查範圍**：PLAN.md 項目 2.2、STATUS 本輪「2.2 core 子包搬移」；`trainer/core/config.py`、`trainer/core/db_conn.py`、`trainer/core/schema_io.py`、`trainer/core/duckdb_schema.py`；頂層 re-export（`trainer/config.py`、`trainer/db_conn.py`、`trainer/schema_io.py`、`trainer/duckdb_schema.py`）；`trainer/core/__init__.py`；相關測試變更。以下僅列潛在問題與建議，**不重寫整套**。
+
+---
+
+#### 1. 邊界／安裝環境：_REPO_ROOT 在 deploy（walkaway_ml）下之意義
+
+**問題**：`trainer/core/config.py` 以 `_REPO_ROOT = Path(__file__).resolve().parent.parent.parent` 推得「專案根目錄」。在**開發**時 __file__ 為 repo 內 `trainer/core/config.py`，故 _REPO_ROOT 正確為 repo 根。在**安裝為 walkaway_ml**（deploy）時，__file__ 為 site-packages 內 `.../walkaway_ml/core/config.py`，此時 parent.parent.parent 為 site-packages 目錄，**並非** deploy 目錄或「專案根」。故 `DEFAULT_MODEL_DIR`、`DEFAULT_BACKTEST_OUT` 在未設 `MODEL_DIR`／環境變數時會指向 site-packages 下之 `out/models`、`out/backtest`，易造成 deploy 機上產出路徑與預期不符。
+
+**具體修改建議**：在 `trainer/core/config.py` 或 deploy 文件（README_DEPLOY.txt、package/README）註明：**部署時請設定 `MODEL_DIR`（及必要時 `STATE_DB_PATH`、`DATA_DIR`）**，勿依賴預設路徑；或於 config 內在「若偵測為安裝環境（例如 __file__ 在 site-packages）」時，改以環境變數或當前工作目錄為 fallback 並於文件寫明。若維持現狀，至少於 STATUS 或 PLAN 註記此邊界，並於 deploy 說明中強調須設定 MODEL_DIR。
+
+**希望新增的測試**：契約測試：當以 `import sys; sys.modules["trainer"] = sys.modules["walkaway_ml"]` 或安裝 wheel 後 `import trainer.config`，assert `config.DEFAULT_MODEL_DIR` 存在且為 Path；可選 assert 若未設 MODEL_DIR 則 scorer/backtester 使用之預設路徑與文件說明一致，或僅在文件／註解中註明「deploy 須設 MODEL_DIR」。
+
+---
+
+#### 2. 邊界：頂層 re-export 未匯出之底線名稱
+
+**問題**：`from trainer.core.config import *` 不會匯出以底線開頭之名稱（如 `_REPO_ROOT`）。本輪已在 `trainer/config.py` 手動補上 `from trainer.core.config import _REPO_ROOT`，故 `trainer.config._REPO_ROOT` 可用。若日後 `trainer/core/config.py` 新增其他「需供外部或測試使用」的底線名稱（例如 `_some_helper`），易遺漏於頂層 re-export，導致 `trainer.config._some_helper` 不存在。
+
+**具體修改建議**：維持目前僅明確 re-export `_REPO_ROOT`；若 core 再新增需對外之底線名稱，同步在 `trainer/config.py` 補一行。或於 trainer/config.py 頂端加註：凡 core.config 中需自 trainer.config 存取之底線名稱，須於此處顯式 import。
+
+**希望新增的測試**：契約測試：assert `hasattr(trainer.config, "_REPO_ROOT")` 且 `trainer.config._REPO_ROOT == trainer.core.config._REPO_ROOT`；可選 assert `trainer.config.DEFAULT_MODEL_DIR` 與 `trainer.core.config.DEFAULT_MODEL_DIR` 為同一物件。
+
+---
+
+#### 3. 依賴與循環 import
+
+**問題**：`trainer.core.__init__.py` 做 `from trainer.core import config, db_conn, ...`；`trainer.core.db_conn` 做 `from . import config`。順序為先載入 core.config（無依賴 core 他模組），再載入 core.db_conn（依賴 .config），無循環。若日後 core 內某模組改為依賴另一子包（例如 trainer.features）或頂層 trainer，而該模組又被頂層 re-export 或 core.__init__ 先 import，可能出現循環。目前設計無此問題。
+
+**具體修改建議**：維持 core 子包內僅相對 import（. import config）；頂層 re-export 僅「from trainer.core.xxx import *」，不從兄弟子包或 trainer 頂層再 import。若未來 2.2 搬移 features/training/serving 後，core 與彼等有依賴，須注意 import 順序與延遲 import。
+
+**希望新增的測試**：可選：依序 `import trainer`、`import trainer.core`、`import trainer.config`、`import trainer.db_conn`，assert 無 ImportError；或依賴現有全量 pytest 涵蓋。
+
+---
+
+#### 4. 安全性
+
+**問題**：config 讀取環境變數與 .env，無使用者輸入組路徑；db_conn、schema_io、duckdb_schema 無從外部注入路徑。本輪為搬移與 re-export，未新增從使用者輸入組路徑或執行任意程式之邏輯，無新增安全性風險。
+
+**具體修改建議**：無。
+
+**希望新增的測試**：無。
+
+---
+
+#### 5. 效能
+
+**問題**：多一層 re-export（trainer.config → trainer.core.config）僅增加一次 import 時的間接參照，執行時屬性查詢與原先同為模組全域，無額外開銷。無效能疑慮。
+
+**具體修改建議**：無。
+
+**希望新增的測試**：無。
+
+---
+
+#### 6. 文件與 SSOT 一致
+
+**問題**：部分測試已改為讀取 `trainer/core/config.py`、`trainer/core/db_conn.py` 作為契約來源，與「config/db_conn 實作在 core」一致。PROJECT.md、README 若仍只寫「trainer/config.py」而未註明「實作在 trainer/core/」，對新讀者可能略為混淆。
+
+**具體修改建議**：可選：於 PROJECT.md 目標樹或「trainer/」職責一節加一句：「config、db_conn、schema_io、duckdb_schema 實作於 trainer/core/，頂層為 re-export。」或於 2.2 全部完成後一併更新文件。
+
+**希望新增的測試**：無（屬文件約定）。
+
+---
+
+**總結**：建議**§1** 在 deploy 文件或 config 註解中註明「部署時須設定 MODEL_DIR」並可加契約測試鎖定 _REPO_ROOT 存在；**§2** 可加契約測試 assert trainer.config._REPO_ROOT 與 core 一致；§3、§4、§5、§6 依上述無需或可選補強。完成 §1 文件或註解後可繼續 2.2 etl/features/training/serving。
+
+---
+
+#### 項目 2.2 core Review 風險 → 最小可重現測試
+
+| 風險點（Code Review §） | 對應測試 |
+|-------------------------|----------|
+| §1 邊界／deploy：config 預設路徑存在且為 Path，deploy 須設 MODEL_DIR 之契約 | `TestConfigDefaultPathsExistAndArePath`：`DEFAULT_MODEL_DIR`、`DEFAULT_BACKTEST_OUT` 存在且為 `Path` |
+| §2 頂層 re-export 未匯出底線名稱：`_REPO_ROOT` 須自 `trainer.config` 可存取且與 core 同一物件 | `TestConfigReexportUnderscoreRepoRoot`：`hasattr(trainer.config, "_REPO_ROOT")` 且 `trainer.config._REPO_ROOT is trainer.core.config._REPO_ROOT`；`DEFAULT_MODEL_DIR` 與 core 同一物件 |
+| §3 依賴與循環 import：依序 import 不觸發 ImportError | `TestCoreImportNoCycle`：依序 `import trainer`、`trainer.core`、`trainer.config`、`trainer.db_conn`、`trainer.schema_io`、`trainer.duckdb_schema` 無錯誤 |
+
+- **新增測試檔**：`tests/test_review_risks_item2_core_move.py`
+- **執行方式**（須自 repo 根目錄）：
+  - 僅跑本檔：`python -m pytest tests/test_review_risks_item2_core_move.py -v`
+  - 全量 pytest：`python -m pytest -v`
+- **目前結果**：5 passed（2026-03-14 已執行）。
+
+---
+
+## 本輪驗證 — tests/typecheck/lint 全過（2026-03-14）
+
+**指示**：以最高可靠性標準處理；不改 tests（除非測試本身錯或 decorator 過時）；修改實作直到所有 tests/typecheck/lint 通過；每輪把結果追加到 STATUS.md；最後修訂 PLAN.md 並回報剩餘項目。
+
+**結果**：本輪**無需修改任何 production code**。tests、typecheck（mypy）、lint（ruff）均已通過。
+
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| pytest | `python -m pytest tests/ -v --tb=short` | 1086 passed, 44 skipped, 9 subtests passed |
+| typecheck | `python -m mypy trainer/ --ignore-missing-imports` | Success: no issues found in 34 source files |
+| lint | `ruff check trainer/` | All checks passed! |
+
+**PLAN.md 狀態**：已於同日在「建議執行順序」後補驗證註記；剩餘項目仍為**步驟 4（項目 2）**：2.2 etl/features/training/serving 搬移、2.3 相容層、2.4 entry points、2.5 全量測試與建包。
+
+---
+
+## 本輪實作 — 步驟 4（項目 2）2.2 etl 子包搬移（2026-03-14）
+
+**目標**：依 PLAN.md 項目 2.2，將 etl_player_profile、profile_schedule 搬入 `trainer/etl/`，頂層保留相容 re-export。
+
+### 修改摘要
+
+| 檔案／變更 | 內容 |
+|------------|------|
+| `trainer/etl/profile_schedule.py` | 新增：自原 `trainer/profile_schedule.py` 複製內容（無 import 變更）。 |
+| `trainer/etl/etl_player_profile.py` | 新增：自原 `trainer/etl_player_profile.py` 複製；改 `from .db_conn` → `from trainer.db_conn`、`from trainer.profile_schedule` → `from .profile_schedule`；`BASE_DIR`/`PROJECT_ROOT` 改為 `Path(__file__).resolve().parent` 與 `parent.parent`（實作在 etl 子包下）。 |
+| `trainer/etl/__init__.py` | 改為 `from trainer.etl import etl_player_profile, profile_schedule`。 |
+| `trainer/etl_player_profile.py` | 改為薄層：`sys.modules["trainer.etl_player_profile"] = trainer.etl.etl_player_profile`，使既有 import 與 patch 目標一致。 |
+| `trainer/profile_schedule.py` | 改為 re-export：`from trainer.etl.profile_schedule import *`。 |
+| `tests/test_review_risks_round70.py` | `_ETL_PATH` 改為 `trainer/etl/etl_player_profile.py`（AST 檢查改指實作檔）。 |
+| `tests/test_review_risks_round80.py` | 同上。 |
+| `tests/test_review_risks_round90.py` | 同上。 |
+| `tests/test_review_risks_round100.py` | 同上。 |
+
+### 手動驗證建議
+
+- 自 repo 根目錄：`python -c "from trainer.etl_player_profile import compute_profile_schema_hash; from trainer.profile_schedule import month_end_dates; print(compute_profile_schema_hash()[:8], len(month_end_dates(__import__('datetime').date(2025,1,1), __import__('datetime').date(2025,12,31))))"`
+- 執行 `python -m pytest tests/test_profile_schedule.py tests/test_profile_schema_hash.py -v` 應全過。
+- （可選）執行 `python -m trainer.etl.etl_player_profile --help` 或既有 ETL CLI 一次。
+
+### pytest 結果（本輪完成後）
+
+```
+1086 passed, 44 skipped, 9 subtests passed in 29.83s
+```
+（指令：`python -m pytest tests/ -q --tb=line`）
+
+### 下一步建議
+
+進行 **2.2 features 子包搬移**：將 `trainer/features.py` 移入 `trainer/features/features.py`、`trainer/feature_spec/` 移入 `trainer/features/feature_spec/`，頂層 `trainer/features.py` 改為 re-export 或 `sys.modules` 指向實作；搬移後跑 pytest 並更新 STATUS。
+
+---
+
+## 本輪實作 — 步驟 4（項目 2）2.2 features 子包搬移（2026-03-14）
+
+**目標**：依 PLAN.md 項目 2.2，將 features 實作移入 `trainer/features/`，頂層 `trainer.features` 為子包 re-export。
+
+### 修改摘要
+
+| 檔案／變更 | 內容 |
+|------------|------|
+| `trainer/features/features.py` | 新增：自原 `trainer/features.py` 複製；docstring 路徑改為 `trainer/features/features.py`。 |
+| `trainer/features/feature_spec/` | 新增：自 `trainer/feature_spec/` 複製（原目錄保留供 trainer/scorer/backtester 路徑）。 |
+| `trainer/features/__init__.py` | 改為 `from trainer.features.features import *` 並顯式 re-export `_LOOKBACK_MAX_HOURS`、`_PROFILE_FEATURE_MIN_DAYS`、`_validate_feature_spec`、`_streak_lookback_numba`、`_run_boundary_lookback_numba`。 |
+| `trainer/features.py` | 刪除（改由套件 `trainer/features/` 提供）。 |
+| `setup.py` | 新增 `walkaway_ml.features` 至 `packages`。 |
+| `tests/test_review_risks_round60.py` | `_FEATURES_PATH` 改為 `trainer/features/features.py`。 |
+| `tests/test_review_risks_round395.py` | `_FEATURES_PY` 改為 `trainer/features/features.py`。 |
+| `tests/test_review_risks_item2_subpackages.py` | 測試改為接受 `trainer.features` 為 package 且具 `PROFILE_FEATURE_COLS` 或 `__path__`。 |
+| `tests/test_review_risks_run_boundary_numba_lookback.py` | patch 目標改為 `trainer.features.features.RUN_BREAK_MIN`、`trainer.features.features._run_boundary_lookback_numba`。 |
+| `tests/test_review_risks_lookback_hours_trainer_align.py` | patch 目標改為 `trainer.features.features._streak_lookback_numba`。 |
+
+### 手動驗證建議
+
+- `python -c "from trainer.features import compute_run_boundary, PROFILE_FEATURE_COLS; print(len(PROFILE_FEATURE_COLS))"`
+- `python -m pytest tests/test_features.py tests/test_feature_spec_yaml.py -q`
+
+### pytest 結果（本輪完成後）
+
+```
+1086 passed, 44 skipped, 9 subtests passed in 28.17s
+```
+（指令：`python -m pytest tests/ -q --tb=line`）
+
+### 下一步建議
+
+進行 **2.2 training 子包搬移**：將 `trainer.py`、`time_fold.py`、`backtester.py` 移入 `trainer/training/`，頂層改為 re-export；搬移後跑 pytest 並更新 STATUS。
+
+---
+
+## pytest -q 結果（2026-03-14 本輪實作後）
+
+**指令**（repo 根目錄）：
+```bash
+python -m pytest tests/ -q
+```
+
+**結果**：
+```
+1086 passed, 44 skipped, 9 subtests passed in 28.23s
+```
+
+**說明**：本輪已完成 2.2 **etl** 與 2.2 **features** 子包搬移；2.2 training、2.2 serving、2.3 相容層、2.4 entry points、2.5 全量建包尚未實作，待後續輪次完成。
+
+---
+
+### Code Review：步驟 4（項目 2）2.2 etl / features 子包搬移（高可靠性標準）
+
+**Date**: 2026-03-14
+
+**審查範圍**：PLAN.md 項目 2.2、STATUS 本輪「2.2 etl 子包搬移」與「2.2 features 子包搬移」修改摘要；`trainer/etl/`、`trainer/features/`、頂層 re-export（`trainer/etl_player_profile.py`、`trainer/profile_schedule.py`）、`trainer/scripts/auto_build_player_profile.py` 之 ETL_SCRIPT、`setup.py`、相關測試變更。以下僅列潛在問題與建議，**不重寫整套**。
+
+---
+
+#### 1. 邊界／CLI 入口：`python -m trainer.etl_player_profile` 不執行 main
+
+**問題**：頂層 `trainer/etl_player_profile.py` 僅做 `sys.modules["trainer.etl_player_profile"] = _impl`，**未**在 `if __name__ == "__main__":` 時呼叫 `_impl.main()`。因此以 `python -m trainer.etl_player_profile` 或 `python trainer/etl_player_profile.py` 執行時，會只載入薄層並結束，**不會跑 ETL CLI**。文件與錯誤訊息中曾建議「Run as package (e.g. python -m trainer.etl_player_profile)」，目前該入口無效；`trainer/scripts/auto_build_player_profile.py` 之 `ETL_SCRIPT = PROJECT_ROOT / "trainer" / "etl_player_profile.py"` 若以 subprocess 執行該檔為腳本，同樣不會進入 main。
+
+**具體修改建議**：在 `trainer/etl_player_profile.py` 末行追加：
+```python
+if __name__ == "__main__":
+    _impl.main()
+```
+並在檔頭註解註明「作為 __main__ 時轉發至實作模組的 main()」。若 `auto_build_player_profile` 以 subprocess 執行 ETL_SCRIPT，應改為 `python -m trainer.etl.etl_player_profile` 或保留路徑但依賴上述轉發。
+
+**希望新增的測試**：契約測試：以 subprocess 執行 `python -m trainer.etl_player_profile --help`（或無參數、預期非零 exit 或印出 usage），預期 stderr/stdout 含 usage 或 help 訊息，且 exit code 為 0（--help）；或至少 assert 不發生「無任何輸出即 exit 0」的靜默結束。
+
+---
+
+#### 2. 邊界／路徑雙份：feature_spec 目錄與 YAML 雙來源
+
+**問題**：本輪將 `trainer/feature_spec/` **複製**至 `trainer/features/feature_spec/`，**未刪除**原目錄。`trainer/features/features.py` 在 repo 路徑下使用 `Path(__file__).parent / "feature_spec" / "features_candidates.yaml"`（即 `trainer/features/feature_spec/`）；`trainer/trainer.py`、`trainer/scorer.py`、`trainer/backtester.py` 仍使用 `BASE_DIR / "feature_spec" / "features_candidates.yaml"`（即 `trainer/feature_spec/`）。兩處目錄並存，若只更新其一，會出現 **YAML 內容不同步**（例如只改 `trainer/features/feature_spec/features_candidates.yaml` 而 trainer/scorer 仍讀舊的 `trainer/feature_spec/`），導致訓練與推論用到的 feature spec 不一致。
+
+**具體修改建議**：擇一並在文件註明：(A) **單一 SSOT**：將 trainer.py / scorer.py / backtester.py 的 FEATURE_SPEC_PATH 改為指向 `Path(__file__).parent / "features" / "feature_spec" / "features_candidates.yaml"`（或從 `trainer.features` 取得同路徑），並刪除或改為 symlink 的 `trainer/feature_spec/`，避免雙份；(B) **維持雙份**：在 PROJECT.md 或 STATUS 明確寫明「`trainer/feature_spec/` 與 `trainer/features/feature_spec/` 須保持內容一致；任何 YAML 變更須兩處同步」，並可選在 CI 或 pre-commit 比對兩檔 checksum。
+
+**希望新增的測試**：契約測試：assert `Path("trainer/feature_spec/features_candidates.yaml").read_bytes() == Path("trainer/features/feature_spec/features_candidates.yaml").read_bytes()`（或至少比對關鍵 key 如 `track_profile.candidates` 長度），若專案採單一 SSOT 則改為 assert 僅存在其一或 symlink 關係；可選：執行 load_feature_spec 分別從兩路徑載入，assert 取得之 PROFILE_FEATURE_COLS 或 track_llm candidates 一致。
+
+---
+
+#### 3. 邊界／import 順序：sys.modules 覆寫前提
+
+**問題**：`trainer/etl_player_profile.py` 在載入時執行 `sys.modules["trainer.etl_player_profile"] = _impl`。若在**該薄層被 import 之前**，已有程式碼手動註冊 `sys.modules["trainer.etl_player_profile"] = something_else`（例如測試或 mock），則薄層載入後會覆寫為 _impl，行為可能與預期不符；反之，若先 import 薄層，再 patch trainer.etl_player_profile，則 patch 會作用在 _impl 上（因已覆寫）。目前測試與正常使用皆為「先 import trainer.etl_player_profile」，故實務上較無問題，屬邊界情境。
+
+**具體修改建議**：無需強制修改。可於薄層檔頭註解註明：「本模組載入後會將 sys.modules['trainer.etl_player_profile'] 設為實作模組；請勿在 import 前手動註冊同名模組。」
+
+**希望新增的測試**：可選：依序 `import trainer.etl_player_profile`、再 `assert sys.modules["trainer.etl_player_profile"] is trainer.etl.etl_player_profile`，鎖定契約。
+
+---
+
+#### 4. 維護性／features 底線名稱 re-export 遺漏
+
+**問題**：`trainer/features/__init__.py` 以 `from trainer.features.features import *` 加上顯式列舉 `_LOOKBACK_MAX_HOURS`、`_PROFILE_FEATURE_MIN_DAYS`、`_validate_feature_spec`、`_streak_lookback_numba`、`_run_boundary_lookback_numba`。若日後在 `trainer/features/features.py` 新增其他需供測試或 etl 使用的底線名稱（例如 `_some_new_helper`），而未在 __init__.py 補上，會導致 `from trainer.features import _some_new_helper` 或既有測試 patch 時 **AttributeError**。
+
+**具體修改建議**：在 `trainer/features/__init__.py` 頂端加註：「凡 features.features 中需自 trainer.features 存取之底線名稱，須於下方顯式 import；import * 不匯出底線名稱。」若希望降低遺漏機率，可選：在 features/features.py 定義 `__all__` 並包含需對外之底線名單，於 __init__.py 改為依 `getattr(_m, "__all__", ())` 或固定清單迴圈 import（需權衡與現有 import * 風格一致）。
+
+**希望新增的測試**：可選：靜態檢查或單元測試，對 `trainer.features.features` 中名稱以 `_` 開頭且被 tests 或 trainer 其他模組引用者，assert 其亦存在於 `trainer.features`（例如 hasattr(trainer.features, name)）；或依賴全量 pytest 與手動補齊 re-export。
+
+---
+
+#### 5. 安全性
+
+**問題**：本輪變更為目錄搬移與 re-export，未新增從使用者輸入組路徑或執行任意程式之邏輯。config、db_conn、feature spec 路徑仍來自環境變數或 __file__ 相對路徑，無新暴露面。
+
+**具體修改建議**：無。
+
+**希望新增的測試**：無。
+
+---
+
+#### 6. 效能
+
+**問題**：多一層 package（trainer.features、trainer.etl）與 re-export，僅增加 import 時的一次性開銷；執行期屬性存取與原先同為模組全域或同一物件，無額外熱徑成本。
+
+**具體修改建議**：無。
+
+**希望新增的測試**：無。
+
+---
+
+#### 7. setup.py 與測試契約：walkaway_ml.features 未納入 SUBPAIRS_WALKAWAY
+
+**問題**：`setup.py` 已列 `walkaway_ml.features`，但 `tests/test_review_risks_item2_subpackages.py` 之 `SUBPAIRS_WALKAWAY = ("walkaway_ml.core", "walkaway_ml.training", "walkaway_ml.serving", "walkaway_ml.etl")` **未含** `walkaway_ml.features`。因此若有人日後從 setup.py 刪除 `walkaway_ml.features`，該測試仍會通過，契約未涵蓋 features 子包。
+
+**具體修改建議**：將 `SUBPAIRS_WALKAWAY` 改為包含 `"walkaway_ml.features"`（與 setup.py 一致），確保安裝後可 `import walkaway_ml.features` 的契約被測試覆蓋。
+
+**希望新增的測試**：同上（更新 SUBPAIRS_WALKAWAY 即為契約測試之修正）；可選：建包後 `pip install` wheel 再 `python -c "import walkaway_ml.features; print(len(walkaway_ml.features.PROFILE_FEATURE_COLS))"` 預期成功。
+
+---
+
+**總結**：最建議優先處理 **§1（etl_player_profile 薄層 __main__ 轉發）**，否則 `python -m trainer.etl_player_profile` 與以 ETL_SCRIPT 執行該檔皆無法進入 main；**§2（feature_spec 雙份／單一 SSOT）** 建議擇一定案並文件化或加契約測試，避免 YAML 不同步；**§7（SUBPAIRS_WALKAWAY 補上 walkaway_ml.features）** 為低成本契約補齊。§3、§4、§5、§6 依上述為可選註解或靜態/契約測試即可。
+
+---
+
+#### 項目 2.2 etl/features Review 風險 → 最小可重現測試
+
+| 風險點（Code Review §） | 對應測試 |
+|------------------------|----------|
+| §1 ETL CLI 入口不執行 main | `TestEtlPlayerProfileCliHelpContract.test_etl_player_profile_help_prints_and_exits_zero`：subprocess 執行 `python -m trainer.etl_player_profile --help`，預期 exit 0 且 stdout/stderr 含 usage/help，非靜默結束。**已通過**（production 已補上 `if __name__ == "__main__": _impl.main()`）。 |
+| §2 feature_spec 雙份 YAML 不同步 | `TestFeatureSpecYamlSyncContract.test_feature_spec_yaml_byte_identical_when_both_exist`：兩路徑 `features_candidates.yaml` 存在時須 byte 一致。 |
+| §3 sys.modules 覆寫契約 | `TestEtlPlayerProfileModuleIdentityContract.test_sys_modules_etl_player_profile_is_implementation`：`import trainer.etl_player_profile` 後 `sys.modules["trainer.etl_player_profile"] is trainer.etl.etl_player_profile`。 |
+| §4 features 底線名稱 re-export 遺漏 | `TestFeaturesUnderscoreReexportContract`：assert `trainer.features` 具 `_validate_feature_spec`、`_streak_lookback_numba`、`_run_boundary_lookback_numba`、`_LOOKBACK_MAX_HOURS`、`_PROFILE_FEATURE_MIN_DAYS`。 |
+| §7 walkaway_ml.features 未納入契約 | `test_review_risks_item2_subpackages.py`：`SUBPAIRS_WALKAWAY` 已補上 `"walkaway_ml.features"`，`test_setup_py_packages_include_subpackages_or_find_packages` 涵蓋之。 |
+
+- **新增測試檔**：`tests/test_review_risks_item2_etl_features.py`
+- **修改測試檔**：`tests/test_review_risks_item2_subpackages.py`（`SUBPAIRS_WALKAWAY` 加入 `walkaway_ml.features`）
+- **執行方式**（須自 repo 根目錄）：
+  - 僅跑 2.2 etl/features 契約：`python -m pytest tests/test_review_risks_item2_etl_features.py -v`
+  - 僅跑 subpackages 契約（含 §7）：`python -m pytest tests/test_review_risks_item2_subpackages.py -v`
+  - 全量 pytest：`python -m pytest tests/ -q`
+- **目前結果**：§1 已由 production 補上 ETL 薄層 `__main__` 轉發後全過。`test_review_risks_item2_etl_features.py` 共 6 個測試 **6 passed**；`test_review_risks_item2_subpackages.py` 4 passed。見下方「本輪：項目 2.2 §1 實作 + typecheck 修復」。
+
+---
+
+#### 本輪：項目 2.2 §1 實作 + typecheck 修復（tests/typecheck/lint 全過）
+
+**Date**: 2026-03-14
+
+**指示**：以最高可靠性標準處理；不改 tests（除非測試本身錯或 decorator 過時）；修改實作直到所有 tests/typecheck/lint 通過；每輪把結果追加到 STATUS.md；最後修訂 PLAN.md 並回報剩餘項目。
+
+**修改摘要**（僅 production code）：
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/etl_player_profile.py` | ① Code Review §1：新增 `if __name__ == "__main__": _impl.main()`，使 `python -m trainer.etl_player_profile --help` 正確印出 usage 並 exit 0。② Mypy：新增 type-checker 可見之 re-export（`backfill`、`compute_profile_schema_hash`、`LOCAL_PROFILE_SCHEMA_HASH`），解決 `trainer.training.trainer` 自 `trainer.etl_player_profile` import 時之 attr-defined 錯誤（runtime 仍以 sys.modules 覆寫為準）。 |
+
+**驗證結果**：
+
+| 項目 | 指令 | 結果 |
+|------|------|------|
+| pytest | `python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load` | 1092 passed, 44 skipped, 9 subtests passed in 29.24s |
+| lint | `python -m ruff check .` | All checks passed! |
+| typecheck | `python -m mypy trainer/ --ignore-missing-imports` | Success: no issues found in 37 source files |
+
+**小結**：項目 2.2 etl/features 之 Code Review §1（ETL CLI __main__ 轉發）已實作；§2–§4、§7 已由既有測試覆蓋且通過。無改動 tests。
+
+---
+
+## 本輪實作 — 步驟 4（項目 2）2.2 training 子包搬移（2026-03-14）
+
+**目標**：依 PLAN.md 項目 2.2，將 trainer、time_fold、backtester 搬入 `trainer/training/`，頂層改為薄層 re-export（sys.modules + __main__ 轉發）；僅實作此一步，不貪多。
+
+### 修改摘要
+
+| 檔案／變更 | 內容 |
+|------------|------|
+| `trainer/training/trainer.py` | 新增：自 `trainer/trainer.py` 複製；except 區塊 `from .db_conn` 改為 `from trainer.db_conn`；`BASE_DIR` 改為 `Path(__file__).resolve().parent.parent`（指向 `trainer/`）以維持 feature_spec、.data、models 路徑。 |
+| `trainer/training/time_fold.py` | 新增：自 `trainer/time_fold.py` 複製（無 import 變更）。 |
+| `trainer/training/backtester.py` | 新增：自 `trainer/backtester.py` 複製；`BASE_DIR` 改為 `Path(__file__).resolve().parent.parent`；fallback feature_spec 路徑改為 `BASE_DIR / "feature_spec" / "features_candidates.yaml"`。 |
+| `trainer/training/__init__.py` | 維持僅註解、不預先 import 子模組，避免 circular import（backtester → trainer.trainer）。 |
+| `trainer/trainer.py` | 改為薄層：`sys.modules["trainer.trainer"] = trainer.training.trainer`，`if __name__ == "__main__": _impl.main()`。 |
+| `trainer/time_fold.py` | 改為薄層 + re-export `get_monthly_chunks`、`get_train_valid_test_split`（供 test_time_fold_risks 以 bare `time_fold` 自 trainer/ 目錄 import 時使用）。 |
+| `trainer/backtester.py` | 改為薄層：`sys.modules["trainer.backtester"] = trainer.training.backtester`，`if __name__ == "__main__": _impl.main()`。 |
+| 多個 tests | `_TRAINER_PATH`／`_BACKTESTER_PATH` 或 `path = .../trainer.py` 改為指向 `trainer/training/trainer.py` 或 `trainer/training/backtester.py`（實作原始碼位置）；`_read_text("trainer/trainer.py")`／`trainer/backtester.py` 改為 `trainer/training/...`；package_entrypoint 測試改為讀取 `trainer/training/trainer.py` 檢查 try/except 註解。 |
+
+### 手動驗證建議
+
+- 自 repo 根目錄：`python -c "from trainer.trainer import run_pipeline; from trainer.time_fold import get_monthly_chunks; from trainer.backtester import load_dual_artifacts; print(get_monthly_chunks.__module__, load_dual_artifacts.__module__)"` 應印出 `trainer.training.time_fold`、`trainer.training.backtester`。
+- `python -m trainer.trainer --help`、`python -m trainer.backtester --help` 應印出 usage。
+- （可選）執行 `python -m pytest tests/test_trainer.py tests/test_backtester.py tests/test_time_fold_risks.py -v` 確認契約與行為不變。
+
+### pytest 結果（本輪完成後）
+
+**指令**（repo 根目錄）：
+```bash
+python -m pytest tests/ -q
+```
+
+**結果**：
+```
+1092 passed, 44 skipped, 9 subtests passed in 27.92s
+```
+
+### 下一步建議
+
+進行 **2.2 serving 子包搬移**：將 scorer、validator、api_server、status_server 移入 `trainer/serving/`，頂層改為薄層 re-export；或先跑 `mypy trainer/`、`ruff check .` 確認本輪無遺漏，再進行 2.2 serving。
+
+---
+
+### Code Review：步驟 4（項目 2）2.2 training 子包搬移（高可靠性標準）
+
+**Date**: 2026-03-14
+
+**審查範圍**：PLAN.md 項目 2.2、STATUS 本輪「2.2 training 子包搬移」修改摘要；`trainer/training/`（trainer.py、time_fold.py、backtester.py）、頂層薄層（trainer/trainer.py、time_fold.py、backtester.py）、`trainer/training/__init__.py`、相關測試路徑變更、`doc/one_time_scripts/` 內對 `trainer/trainer.py` 的引用。以下僅列潛在問題與建議，**不重寫整套**。
+
+---
+
+#### 1. 邊界／one_time 腳本仍指向頂層 `trainer/trainer.py`
+
+**問題**：`doc/one_time_scripts/patch_trainer.py`、`fix_trainer.py` 使用 `open("trainer/trainer.py", ...)` 讀寫。搬移後該路徑為**薄層 stub**（約 10 行），實作在 `trainer/training/trainer.py`。若有人自 repo root 執行上述 patch，會對 stub 做 regex 替換：既有的替換目標（如 `TRACK_B_FEATURE_COLS`、`ALL_FEATURE_COLS`）在 stub 中不存在，替換會無效或破壞 stub，且實作檔未被修改。
+
+**具體修改建議**：
+- 在 `doc/one_time_scripts/README.md` 註明：「`patch_trainer.py`、`fix_trainer.py` 針對之實作已移至 `trainer/training/trainer.py`；若需手動 patch 訓練邏輯，請改為編輯 `trainer/training/trainer.py`。本目錄腳本僅供參考、勿直接執行。」
+- 或（可選）：將兩腳本內路徑改為 `trainer/training/trainer.py`，並在腳本頂端加註「實作位置已變更（PLAN 2.2 training）」。
+
+**希望新增的測試**：
+- 契約測試：`Path("trainer/training/trainer.py").read_text()` 包含 `BASE_DIR = Path(__file__).resolve().parent.parent`（或等同註解），以鎖定實作位置；可選：subprocess 自 `doc/one_time_scripts/` 執行 `patch_trainer.py` 時，assert `trainer/trainer.py` 行數或內容與 stub 一致（未被誤 patch）。
+
+---
+
+#### 2. 邊界／Mypy 對薄層 `trainer.trainer`、`trainer.backtester` 無 re-export
+
+**問題**：頂層 `trainer/trainer.py`、`trainer/backtester.py` 僅做 `sys.modules` 覆寫與 `__main__` 轉發，**未**像 `trainer/etl_player_profile.py` 般對常用符號做 type-checker 可見的 re-export。若 mypy 檢查到 `from trainer.trainer import MODEL_DIR` 或 `from trainer.backtester import load_dual_artifacts` 等，會依 stub 檔解析，可能報 `attr-defined`（視 mypy 是否以 stub 為該模組的型別來源）。目前若 mypy 僅檢查 `trainer/` 且未嚴格依 stub，可能仍通過；日後若啟用 stub 優先或檢查 call site 時易暴露。
+
+**具體修改建議**：
+- 與 etl_player_profile 一致：在 `trainer/trainer.py` 薄層末（`if __name__` 前）對 backtester／tests 常用符號做 re-export，例如 `run_pipeline = _impl.run_pipeline`、`MODEL_DIR = _impl.MODEL_DIR`、`load_clickhouse_data = _impl.load_clickhouse_data` 等（可依 mypy 報錯或既有 `from trainer.trainer import ...` 清單補齊）；`trainer/backtester.py` 同理，對 `load_dual_artifacts`、`backtest` 等做 re-export。註解註明「Type-checker visible; runtime 仍以 sys.modules 為準」。
+
+**希望新增的測試**：
+- 可選：執行 `python -m mypy trainer/ --ignore-missing-imports`，確認無 `trainer.trainer` 或 `trainer.backtester` 之 attr-defined；或新增單元測試 `from trainer.trainer import run_pipeline, MODEL_DIR` 與 `from trainer.backtester import load_dual_artifacts`，確保可 import 且為實作模組之屬性（例如 `run_pipeline.__module__ == "trainer.training.trainer"`）。
+
+---
+
+#### 3. 邊界／`time_fold` 薄層僅 re-export 兩函數
+
+**問題**：`trainer/time_fold.py` 在「bare `time_fold`」模式（例如 `sys.path.insert(0, trainer/)` 後 `import time_fold`）僅暴露 `get_monthly_chunks`、`get_train_valid_test_split`。若未來有程式或測試自 `trainer/` 目錄以 bare `time_fold` 匯入其他名稱（如 `_month_start`、內部常數），會 `AttributeError`。目前僅 `test_time_fold_risks` 依賴該模式且只用到上述兩函數，風險有限。
+
+**具體修改建議**：
+- 維持現狀即可；若希望契約明確，可在薄層檔頭註解註明：「Bare import 時僅保證 `get_monthly_chunks`、`get_train_valid_test_split`；其餘請用 `trainer.time_fold`。」
+
+**希望新增的測試**：
+- 可選：契約測試 `import time_fold`（在將 `trainer/` 加入 path 後）後 `assert hasattr(time_fold, "get_monthly_chunks") and hasattr(time_fold, "get_train_valid_test_split")`，並 assert 兩者 callable；若未來有第三方依賴其他名稱，再補測試。
+
+---
+
+#### 4. 邊界／`BASE_DIR` 與 `cwd` 在安裝後環境
+
+**問題**：`trainer/training/trainer.py` 與 `backtester.py` 以 `BASE_DIR = Path(__file__).resolve().parent.parent` 指向 `trainer/`，使 `feature_spec`、`.data`、`models`、`out_backtest` 等路徑落在 `trainer/` 下。在 **pip install -e .** 或開發環境下 `__file__` 仍在 repo 內，行為正確。若以 **wheel 安裝** 至 site-packages，`__file__` 可能為 `.../site-packages/walkaway_ml/training/trainer.py`（依 setup 對應），此時 `BASE_DIR` 為 package 根目錄，該處可能無 `feature_spec/` 或 `scripts/`，需依 config／環境變數提供路徑。PLAN 2.4／2.5 已涵蓋 entry points 與建包驗證，本步未改安裝後路徑邏輯。
+
+**具體修改建議**：
+- 無需本輪修改。建議在 2.4／2.5 全量建包與安裝測試時，確認「以 `python -m trainer.trainer` 自安裝環境執行」時，`FEATURE_SPEC_PATH`、`MODEL_DIR` 等由 config 或環境變數提供，或文件註明「安裝後須設 MODEL_DIR／DATA_DIR 或自 repo 拷貝 feature_spec」。
+
+**希望新增的測試**：
+- 可選：建包後 `pip install` wheel，於暫存目錄執行 `python -c "from trainer.trainer import FEATURE_SPEC_PATH; print(FEATURE_SPEC_PATH)"`，預期為 config 或 fallback 路徑；或僅在 2.5 全量測試中手動驗證。
+
+---
+
+#### 5. 安全性
+
+**問題**：本輪變更為模組搬移與薄層 re-export，未新增由使用者輸入組路徑或執行任意指令之邏輯。`BASE_DIR`、`PROJECT_ROOT` 仍來自 `__file__` 解析；subprocess 呼叫者為固定 `auto_script`（`trainer/scripts/auto_build_player_profile.py`）或 `git`，無注入點。
+
+**具體修改建議**：無。
+
+**希望新增的測試**：無。
+
+---
+
+#### 6. 效能
+
+**問題**：多一層 `trainer.training` 與薄層 import，僅增加一次載入時的 indirection；執行期 `trainer.trainer`、`trainer.backtester` 經 `sys.modules` 指向實作，屬性存取與原先相同。`training/__init__.py` 不預先 import 子模組，避免 circular import，不增加啟動成本。
+
+**具體修改建議**：無。
+
+**希望新增的測試**：無。
+
+---
+
+**總結**：最建議優先處理 **§1（one_time 腳本與文件）**，避免有人誤對 stub 執行 patch；**§2（mypy re-export）** 可依目前 mypy 結果決定是否補齊，以降低日後型別檢查或 IDE 報錯。§3、§4 為文件或後續步驟（2.5）驗證即可；§5、§6 無需本輪變更。
+
+---
+
+#### 項目 2.2 training Review 風險 → 最小可重現測試
+
+| 風險點（Code Review §） | 對應測試 |
+|------------------------|----------|
+| §1 實作位置／one_time 腳本指向頂層 stub | `TestTrainingImplementationLocationContract.test_implementation_file_contains_base_dir_resolve`：`trainer/training/trainer.py` 須含 `BASE_DIR` 與 `parent.parent`（鎖定實作位置）。`test_toplevel_trainer_py_remains_stub`：`trainer/trainer.py` 須含 `sys.modules["trainer.trainer"]` 且行數 < 20（確認為薄層 stub）。 |
+| §2 trainer.trainer／trainer.backtester 解析為實作 | `TestTrainerBacktesterModuleIdentityContract`：`from trainer.trainer import run_pipeline, MODEL_DIR` 後 `run_pipeline.__module__ == "trainer.training.trainer"`；`from trainer.backtester import load_dual_artifacts` 後 `load_dual_artifacts.__module__ == "trainer.training.backtester"`，且兩者 callable。 |
+| §3 time_fold bare import 僅保證兩函數 | `TestTimeFoldBareImportContract.test_bare_time_fold_has_get_monthly_chunks_and_get_train_valid_test_split`：將 `trainer/` 加入 sys.path 後 `import time_fold`，assert 具 `get_monthly_chunks`、`get_train_valid_test_split` 且皆 callable。 |
+
+- **新增測試檔**：`tests/test_review_risks_item2_training.py`（僅 tests，未改 production）
+- **執行方式**（須自 repo 根目錄）：
+  - 僅跑 2.2 training 契約：`python -m pytest tests/test_review_risks_item2_training.py -v`
+  - 全量 pytest：`python -m pytest tests/ -q`
+- **目前結果**：5 passed（§1×2、§2×2、§3×1）。§4（安裝後路徑）留待 2.5 建包驗證；§5、§6 無需測試。
+
+---
+
+#### 本輪：2.2 training mypy 修復（tests/typecheck/lint 全過）
+
+**Date**: 2026-03-14
+
+**指示**：以最高可靠性標準處理；不改 tests（除非測試本身錯或 decorator 過時）；修改實作直到所有 tests/typecheck/lint 通過；每輪結果追加 STATUS.md；最後修訂 PLAN.md 並回報剩餘項目。
+
+**修改摘要**（僅 production code）：
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/trainer.py` | Code Review 2.2 training §2：薄層新增 type-checker 可見 re-export（`MODEL_DIR`、`CHUNK_DIR`、`LOCAL_PARQUET_DIR`、`HISTORY_BUFFER_DAYS`、`load_clickhouse_data`、`load_local_parquet`、`apply_dq`、`add_track_human_features`、`compute_track_llm_features`、`load_feature_spec`、`load_player_profile`、`join_player_profile`、`_to_hk`），消除 mypy attr-defined（trainer.training.backtester、trainer.scripts.recommend_training_config 自 trainer.trainer import 時）。runtime 仍以 sys.modules 覆寫為準；stub 行數仍 < 20，契約測試通過。 |
+
+**驗證結果**：
+
+| 項目 | 指令 | 結果 |
+|------|------|------|
+| pytest | `python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load` | 1097 passed, 44 skipped, 9 subtests passed in 28.35s |
+| typecheck | `python -m mypy trainer/ --ignore-missing-imports` | Success: no issues found in 40 source files |
+| lint | `python -m ruff check .` | All checks passed! |
+
+**小結**：無改動 tests。2.2 training 薄層 mypy re-export 已補齊；tests、typecheck、lint 全過。
+
+---
+
+### Code Review：項目 5 變更（高可靠性標準）
+
+**Date**: 2026-03-14
+
+**審查範圍**：PLAN.md 項目 5、STATUS 本輪修改摘要；`scripts/check_span.py`、`doc/one_time_scripts/`（README 與 patch 腳本）、`PROJECT.md`、`README.md`、`tests/test_review_risks_round395.py`。以下僅列潛在問題與建議，**不重寫整套**。
+
+---
+
+#### 1. 邊界／CWD 依賴：scripts/check_span.py 相對路徑與空結果
+
+**問題**：`check_span.py` 使用 DuckDB `read_parquet('data/gmwds_t_session.parquet')`，路徑相對於**當前工作目錄**。若自 repo 根目錄執行 `python scripts/check_span.py` 則正確；若自 `scripts/` 執行（`cd scripts && python check_span.py`）或自其他目錄執行，會讀不到檔或讀到錯誤路徑。此外，查詢結果若為空（無 unrated 資料），`df[col][0]` 會觸發 `IndexError`。
+
+**具體修改建議**：
+- **CWD**：在腳本頂端加註「須自專案根目錄執行（relative path `data/...`）」，或開頭檢查 `Path("data/gmwds_t_session.parquet").exists()`，不存在時 `sys.exit("Run from repo root so data/gmwds_t_session.parquet is visible.")` 或等同說明。
+- **空結果**：輸出前檢查 `if df.empty`，若為空則印出說明（例如 "No unrated patrons in query."）並 return，避免 `df[col][0]`。
+
+**建議新增測試**：
+- 契約測試：以 subprocess 自 **非** repo root 的 cwd 執行 `python scripts/check_span.py`（或 mock 無 `data/gmwds_t_session.parquet`），預期非零 exit 或明確錯誤訊息，且未發生誤寫入他處。
+- 可選：在測試中準備最小 Parquet（0 筆符合 WHERE 的資料），執行 check_span 並 assert 不拋 `IndexError`、有明確空結果行為。
+
+---
+
+#### 2. 邊界／CWD 依賴：doc/one_time_scripts 內 patch 腳本
+
+**問題**：所有 patch 腳本使用 `open("trainer/trainer.py")`、`open("trainer/backtester.py")` 等相對路徑，**須自 repo root 執行**。若自 `doc/one_time_scripts/` 或其他目錄執行，會對錯誤路徑讀寫（例如 `doc/one_time_scripts/trainer/trainer.py` 不存在則開檔失敗，或若該目錄下恰有 `trainer/` 則可能誤改他處）。README 已註明 "run from the project root"；腳本本身未檢查 cwd 或路徑存在。
+
+**具體修改建議**：
+- 維持「僅供參考、勿直接執行」定位下，可選：在每個 patch 腳本開頭檢查 `Path("trainer").is_dir()` 或目標檔存在，若否則 `sys.exit("Run from repo root. Expected trainer/... to exist.")`，降低誤用風險。
+- 或僅在 `doc/one_time_scripts/README.md` 再加一筆：「執行前請確認當前目錄為專案根目錄（`ls trainer/` 可見）。」
+
+**建議新增測試**：
+- 可選：subprocess 自 `doc/one_time_scripts/` 為 cwd 執行某個 patch 腳本，預期非零 exit 或 FileNotFoundError，且 repo 內 `trainer/trainer.py` 等未被修改（或先備份再還原）。
+
+---
+
+#### 3. 安全性
+
+**問題**：`check_span.py` 與 `doc/one_time_scripts/*.py` 均未從使用者輸入組路徑；路徑為固定相對路徑或注入到目標模組的 `__file__`。one_time 腳本會寫入 `trainer/*.py`，若被從惡意或錯誤的目錄執行，有可能覆寫該目錄下的檔案；此屬**操作／環境風險**，已以「勿直接執行」與「須自 repo root」減緩。
+
+**具體修改建議**：無需改動。若未來允許從 CLI 傳入路徑，建議限定在 repo root 下並做 `resolve()` 與 `relative_to(repo_root)` 檢查。
+
+**建議新增測試**：無需針對本輪變更新增。
+
+---
+
+#### 4. 效能
+
+**問題**：`check_span.py` 單次 DuckDB 查詢；one_time 腳本為一次性、非熱徑。無效能疑慮。
+
+**具體修改建議**：無。
+
+**建議新增測試**：無。
+
+---
+
+#### 5. 文件與目錄一致性
+
+**問題**：若 `scripts/one_time/` 空目錄仍存在，可能讓人誤以為 one_time 腳本仍在該處。PLAN 與 STATUS 已說明搬至 `doc/one_time_scripts/`。
+
+**具體修改建議**：可於 PROJECT.md 或 README Scripts 小節加一句：「原 `scripts/one_time/` 已移至 `doc/one_time_scripts/`；若遺留空目錄可手動刪除。」或於後續清理時刪除 `scripts/one_time` 空目錄。
+
+**建議新增測試**：無（屬目錄狀態／文件說明）。
+
+---
+
+**總結**：最建議處理者為 **§1（check_span 的 CWD 註明或檢查、空結果防 IndexError）**；§2 可選加強 one_time 腳本或 README；§3、§4、§5 無需或僅文件／清理即可。完成 §1 後可補對應契約或邊界測試，再進行步驟 4 或 5。
+
+---
+
+#### 項目 5 Review 風險 → 最小可重現測試（僅 tests，未改 production）
+
+**Date**: 2026-03-14
+
+將上述 Review 風險點轉成最小可重現測試，僅新增測試、不修改 production code。
+
+| Review § | 風險要點 | 測試檔 | 測試內容 |
+|----------|----------|--------|----------|
+| §1 | check_span 須自 repo root 執行（CWD） | `tests/test_review_risks_output_scripts_item5.py` | `TestCheckSpanRequiresRepoRoot`：自 cwd=scripts/ 或 cwd=doc/one_time_scripts/ 執行 `python scripts/check_span.py`，預期 non-zero exit。 |
+| §1 | 空結果時 df[col][0] 會 IndexError | 同上 | `TestCheckSpanEmptyResultContract`：§1 已實作，測試改為 assert 腳本含 `df.empty` 防呆。 |
+| §2 | one_time patch 須自 repo root 執行 | 同上 | `TestOneTimeScriptsRequireRepoRoot`：自 cwd=doc/one_time_scripts/ 執行 patch_backtester.py 預期失敗；且 `trainer/backtester.py` 內容不變。 |
+
+**新增測試檔案**：`tests/test_review_risks_output_scripts_item5.py`
+
+**執行方式**（皆自 repo 根目錄）：
+
+```bash
+# 僅跑項目 5 Review 測試
+python -m pytest tests/test_review_risks_output_scripts_item5.py -v
+
+# 全量（排除 e2e/load）
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+```
+
+**Lint/typecheck**：本輪未新增 lint 或 typecheck 規則；§3（安全性）、§4（效能）、§5（文件／目錄）依 Review 結論無需針對本輪變更新增測試。
+
+**本輪全量 pytest**：見下方「本輪：實作 項目 5 Code Review §1」；§1 已實作後為 1070 passed。
+
+---
+
+#### 本輪：實作 項目 5 Code Review §1 至 tests/typecheck/lint 全過
+
+**Date**: 2026-03-14
+
+依指示：不改 tests 除非測試本身錯或 decorator 過時；修改實作直至所有 tests/typecheck/lint 通過；結果追加 STATUS；最後更新 PLAN.md。
+
+**Production 修改**：
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `scripts/check_span.py` | 開頭加 docstring 與 CWD 檢查：若 `Path("data/gmwds_t_session.parquet").exists()` 為 False 則 stderr 印出「Run from repo root...」並 `sys.exit(1)`。查詢後若 `df.empty` 則印出「No unrated patrons in query.」並 `sys.exit(0)`，避免 `df[col][0]` 之 IndexError（STATUS Code Review 項目 5 §1）。 |
+
+**Tests**：`test_review_risks_output_scripts_item5.py` 中 `TestCheckSpanEmptyResultContract::test_check_span_source_has_no_empty_df_guard` 改為 `test_check_span_source_has_empty_df_guard`，斷言腳本內含 `df.empty` 防呆（production 已加入，測試改為 assert 防呆存在）。
+
+**執行指令與結果**（repo 根目錄）：
+
+```bash
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+python -m ruff check trainer/ package/ scripts/
+python -m mypy trainer/ package/ --ignore-missing-imports
+```
+
+| 項目 | 結果 |
+|------|------|
+| pytest | **1070 passed**, 44 skipped, 9 subtests passed |
+| ruff | **All checks passed!**（trainer/ package/ scripts/） |
+| mypy | **Success: no issues found in 28 source files** |
+
+---
+
+### Code Review：項目 4 變更（高可靠性標準）
+
+**Date**: 2026-03-14
+
+**審查範圍**：PLAN.md 項目 4、STATUS 本輪修改摘要；`trainer/config.py`、`trainer/trainer.py`、`trainer/backtester.py`、`trainer/scorer.py`、`package/build_deploy_package.py`、`.gitignore`。以下僅列潛在問題與建議，**不重寫整套**。
+
+---
+
+#### 1. 邊界／一致性：環境變數為空白字串時視為「未設定」
+
+**問題**：`scorer` 對 `DATA_DIR` 已採「僅在非空且 `strip()` 後非空才視為設定」（DEC-028）。`MODEL_DIR`、`STATE_DB_PATH` 與 `build_deploy_package` 的 `MODEL_DIR` 目前僅用 `if _model_dir_env`／`if _state_db_env`。空字串 `""` 為 falsy，故不會誤用 `Path("")`；但 **僅空白**（如 `"  "`）為 truthy，會得到 `Path("  ")` 或 `Path("  ").parent`（STATE_DB_PATH 時為上層目錄），語意偏離「未設定」且與 DATA_DIR 不一致。
+
+**具體修改建議**：
+- **scorer**：`_model_dir_env = os.environ.get("MODEL_DIR")` 後，僅在 `_model_dir_env and _model_dir_env.strip()` 時使用 `Path(_model_dir_env.strip())`，否則走 `getattr(config, "DEFAULT_MODEL_DIR", None) or (BASE_DIR / "models")`。同邏輯套用 `_state_db_env`（STATE_DIR / STATE_DB_PATH）。
+- **build_deploy_package**：`_model_dir_env = os.environ.get("MODEL_DIR")` 後，僅在 `_model_dir_env and _model_dir_env.strip()` 時設 `Path(_model_dir_env.strip())`，否則預設 `REPO_ROOT / "out" / "models"`。
+
+**建議新增測試**：
+- **scorer**：在測試中 patch `os.environ` 設 `MODEL_DIR="  "` 或 `STATE_DB_PATH="  "`（並在 import scorer 前或 patch 模組層常數），驗證實際使用的路徑為 config 預設／BASE_DIR 下的路徑，而非 `Path("  ")` 或其 parent。
+- **build_deploy_package**：在測試中設 `os.environ["MODEL_DIR"] = "  "` 後呼叫 `main()` 或解析預設 `--model-source`，驗證預設為 `REPO_ROOT / "out" / "models"`，且建包不會從 cwd 當成 model 目錄。
+
+---
+
+#### 2. 邊界／可移植性：config 的 _REPO_ROOT 在「非 repo 執行」時語意
+
+**問題**：`config._REPO_ROOT = Path(__file__).resolve().parent.parent` 假設 `config` 位於 `.../trainer/config.py`，故 `parent.parent` 為 repo 根。若以 **非 editable 安裝**（例如 `pip install wheel`）執行，`__file__` 可能在 `site-packages/...`，`_REPO_ROOT` 會變成 site-packages 或其上層，`DEFAULT_MODEL_DIR`／`DEFAULT_BACKTEST_OUT` 會指向非預期的位置。部署情境下通常會設 `MODEL_DIR`，故多數不受影響；未設時則可能出錯。
+
+**具體修改建議**：
+- **文件**：在 README 或 deploy 說明中註明：「自 repo 執行時預設產出在 `out/`；若以安裝套件方式執行（非 repo），請設定 `MODEL_DIR`／`BACKTEST_OUT` 或等同機制，勿依賴 config 預設路徑。」
+- **可選防呆**：在 config 中若偵測到 `"trainer" not in Path(__file__).parts`（或類似條件），可將 `DEFAULT_MODEL_DIR`／`DEFAULT_BACKTEST_OUT` 設為 `None`，並在 trainer/backtester/scorer 的 fallback 註明「安裝環境下應由呼叫方或環境變數提供路徑」。
+
+**建議新增測試**：
+- 在 **從 repo 執行** 的 pytest 中（例如 `tests/` 下）：驗證 `config.DEFAULT_MODEL_DIR` 與 `config.DEFAULT_BACKTEST_OUT` 的 `resolve()` 路徑包含 `"out"` 且為 `config._REPO_ROOT` 之子路徑；且 `config._REPO_ROOT` 存在且為目錄（若存在）。
+
+---
+
+#### 3. 健壯性：BACKTEST_OUT.mkdir 於 import 時執行
+
+**問題**：`backtester` 在模組載入時執行 `BACKTEST_OUT.mkdir(parents=True, exist_ok=True)`。若 `BACKTEST_OUT` 位於唯讀檔案系統或權限不足，**import backtester** 即會拋錯，錯誤發生點在 import 而非實際寫入時，較難除錯。
+
+**具體修改建議**：維持現有行為亦可（與 trainer 對 MODEL_DIR 等目錄的 mkdir 一致）。若希望更穩健，可改為在**首次寫入 backtest 產出前**再 `mkdir`（例如在寫 `backtest_predictions.parquet` 的函數內），或包一層 `try/except OSError` 並以 logger 記錄後再 raise，使錯誤訊息明確標示為「無法建立 backtest 輸出目錄」。
+
+**建議新增測試**：可選。若改為延遲 mkdir，可加測試：mock 或設定唯讀路徑，驗證在 import 時不失敗、在首次寫入時才拋出明確的 OSError。
+
+---
+
+#### 4. 安全性／路徑解析
+
+**問題**：本輪變更未新增從使用者輸入直接組路徑的邏輯；`MODEL_DIR`／`BACKTEST_OUT` 來自 config 或環境變數，建包 `--model-source` 來自 CLI。路徑均經 `Path` 處理，未見 path traversal 或命令注入。風險為低。
+
+**具體修改建議**：無需改動。若未來允許從設定檔讀取路徑，建議一律 `resolve()` 後限制在預期根目錄下（或拒絕含 `..` 的相對路徑）。
+
+**建議新增測試**：無需針對本輪變更新增。
+
+---
+
+#### 5. 效能
+
+**問題**：僅新增常數與目錄建立，無迴圈或 I/O 熱徑變更。`Path(__file__).resolve().parent.parent` 在 import 時執行一次，成本可忽略。
+
+**具體修改建議**：無。
+
+**建議新增測試**：無。
+
+---
+
+#### 6. .gitignore 寫法
+
+**問題**：目前使用 `out/`，僅會忽略「目錄」`out`；若存在**檔名**為 `out`（非目錄），不會被忽略。與 `trainer/models/` 等一致用「目錄」寫法；若希望與 `data/` 等一致（同時忽略檔與目錄），可改為 `out`。
+
+**具體修改建議**：維持 `out/` 即可（產出為目錄為常態）；若專案慣例為「凡產出皆忽略」，可改為單行 `out` 以同時忽略同名檔案。
+
+**建議新增測試**：無（.gitignore 不影響程式行為）。
+
+---
+
+**總結**：最建議處理者為 **§1（空白環境變數與 DATA_DIR 一致）**，可選為 **§2（文件或防呆）**、**§3（延遲或明確 mkdir 錯誤）**。§4、§5、§6 無需或僅需文件/風格調整。完成 §1 後建議補上對應單元／整合測試，再進行步驟 3（項目 5）。
+
+---
+
+#### 項目 4 Review 風險 → 最小可重現測試（僅 tests，未改 production）
+
+**Date**: 2026-03-14
+
+將上述 Review 風險點轉成最小可重現測試或契約，僅新增測試、不修改 production code。
+
+| Review § | 風險要點 | 測試檔 | 測試內容 |
+|----------|----------|--------|----------|
+| §1 | 環境變數僅空白時視為未設定 | `tests/test_review_risks_output_paths_item4.py` | `TestScorerWhitespaceEnvTreatedAsUnset`：§1 已實作（scorer、build_deploy_package 將空白 env 視為未設定）；兩則 `@expectedFailure` 已移除，全通過。 |
+| §1 | build_deploy_package 預設 model-source | 同上 | `TestBuildDeployPackageDefaultModelSourceContract`：契約「空白 env → 預設 REPO_ROOT/out/models」；以及 `MODEL_DIR` 未設時 subprocess 驗證預設為 out/models。 |
+| §2 | config 從 repo 執行時預設路徑語意 | 同上 | `TestConfigDefaultOutputPathsFromRepo`：`_REPO_ROOT` 存在且為目錄；`DEFAULT_MODEL_DIR`／`DEFAULT_BACKTEST_OUT` 在 _REPO_ROOT 下且 path 含 `out`、`models`／`backtest`。 |
+| §3 | BACKTEST_OUT 型別與 import | 同上 | `TestBacktesterOutputPathSanity`：可 import backtester、`BACKTEST_OUT` 為 Path、路徑在 repo/out 或 trainer 下。 |
+
+**新增測試檔案**：`tests/test_review_risks_output_paths_item4.py`
+
+**執行方式**（皆自 repo 根目錄）：
+
+```bash
+# 僅跑項目 4 Review 測試
+python -m pytest tests/test_review_risks_output_paths_item4.py -v
+
+# 全量（含 e2e/load 以外）
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+```
+
+**最近一次全量結果**：見下方「本輪：實作 Code Review §1」；§1 已實作，全量 1065 passed、0 xfailed。
+
+**Lint/typecheck**：本輪未新增 lint 或 typecheck 規則；§4（安全性）、§5（效能）、§6（.gitignore）依 Review 結論無需針對本輪變更新增測試。
+
+---
+
+#### 本輪：實作 Code Review §1 至 tests/typecheck/lint 全過
+
+**Date**: 2026-03-14
+
+依指示：不改 tests 除非測試本身錯或 decorator 過時；修改實作直至所有 tests/typecheck/lint 通過；結果追加 STATUS；最後更新 PLAN.md。
+
+**Production 修改**：
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/scorer.py` | `STATE_DB_PATH`／`MODEL_DIR`：僅在 env 非空且 `strip()` 後非空時視為已設定，否則用預設路徑（與 DATA_DIR 一致，STATUS Code Review §1）。 |
+| `package/build_deploy_package.py` | 預設 `--model-source`：僅在 `MODEL_DIR` 非空且 `strip()` 後非空時用 env，否則 `REPO_ROOT / "out" / "models"`。 |
+
+**Tests**：移除 `test_review_risks_output_paths_item4.py` 中兩則 `@unittest.expectedFailure`（§1 已實作，decorator 過時）。
+
+**執行指令與結果**（repo 根目錄）：
+
+```bash
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+python -m ruff check trainer/ package/
+python -m mypy trainer/ package/ --ignore-missing-imports
+```
+
+| 項目 | 結果 |
+|------|------|
+| pytest | **1065 passed**, 44 skipped, 9 subtests passed |
+| ruff | **All checks passed!**（ruff.toml 排除 tests/，僅檢查 trainer/ package/） |
+| mypy | **Success: no issues found in 28 source files** |
+
+---
+
 ## Validator：all alerts MATCH — empty bet_list 導致誤判
 
 **Date**: 2026-03-13
@@ -2010,5 +3198,1108 @@ python -m pytest tests/test_review_risks_package_entrypoint_db_conn.py -v --tb=s
 
 1. 若需全量測試綠燈：可於未安裝 walkaway_ml 之環境（或 `pip uninstall walkaway_ml` 後自 repo 根目錄執行 pytest）驗證；或修正該 35 則測試之 import 方式以相容 walkaway_ml 安裝情境。
 2. PLAN 剩餘 **pending**：**Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）**；其餘與 Option A 相關項目已標為 completed。
+
+---
+
+## 本輪：Step 8 Feature Screening — DuckDB 算 std 避免 OOM（Phase 1 實作）
+
+**Date**: 2026-03-13
+
+### 目標
+
+依 PLAN「Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）」實作 **Phase 1**：以 DuckDB 對 train（Parquet 或 DataFrame）算 `stddev_pop` 取得零變異篩選，避免 `X.std()` 全量 33M×71 產生 ~17.6 GiB 暫存陣列導致 OOM；僅實作 1–2 步，不貪多。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/features.py` | 新增 `_duckdb_quote_identifier`、`compute_column_std_duckdb(columns, *, path=None, df=None)`：以 DuckDB `stddev_pop` 單次查詢回傳每欄 std（path=Parquet 或 df=註冊 DataFrame）。`screen_features` 新增可選參數 `train_path`、`train_df`；當任一提供時優先以 DuckDB 算 std 得 nonzero，再以 `feature_matrix`（樣本）做 corr/MI/LGBM；失敗則 fallback 原 pandas `X.std()` 路徑。 |
+| `trainer/trainer.py` | Step 8：當 `train_df` 不為 None 且未設 `STEP8_SCREEN_SAMPLE_ROWS` 時，改為 `_matrix_for_screen = train_df.head(_cap)`（_cap=2_000_000 或 config），並傳入 `train_path=step7_train_path`、`train_df=train_df` 給 `screen_features`，使 zv 在全量上以 DuckDB 計算、corr/MI/LGBM 在 cap 樣本上執行，避免 OOM。 |
+
+### 手動驗證
+
+1. **Step 8 相關單元測試**：  
+   `python -m pytest tests/test_review_risks_round210.py tests/test_review_risks_late_rounds.py tests/test_review_risks_round168.py tests/test_features_review_risks_round9.py tests/test_review_risks_round184_step8_sample.py -q`  
+   → **63 passed, 1 skipped**（與本輪修改相關測試全過）。
+
+2. **整合／全量**：  
+   `python -m pytest -q`  
+   → **1018 passed, 43 skipped, 8 failed**。8 個失敗皆為既有問題（lookback/run_boundary numba parity、Windows cp932 trainer --help UnicodeEncodeError），非本輪引入。
+
+3. **實際 pipeline（可選）**：  
+   `python -m trainer.trainer --use-local-parquet --days 120`  
+   預期：Step 8 不再因 `X.std()` 觸發 `ArrayMemoryError`；若 `STEP7_KEEP_TRAIN_ON_DISK` 或 in-memory 全量 train，日誌可見「std via DuckDB」或「matrix capped at 2000000 rows for corr/MI/LGBM」。
+
+### 下一步建議
+
+1. **PLAN Phase 2（可選）**：將 `_correlation_prune` 改為以 DuckDB `CORR` 算相關矩陣，僅拉回 K×K；為 DuckDB std 路徑加小 DataFrame/Parquet 單元測試，確認與 pandas std 數值一致。
+2. 將 PLAN 中 **step8-duckdb-stats** 標為 **in_progress** 或 Phase 1 完成後標註「Phase 1 done；Phase 2 pending」。
+
+### pytest -q 結果（本輪執行）
+
+```text
+python -m pytest -q
+# 1018 passed, 43 skipped, 8 failed in 33.53s
+# 8 failed: test_review_risks_lookback_hours_trainer_align (3), test_review_risks_package_entrypoint_db_conn (1, UnicodeEncodeError cp932), test_review_risks_run_boundary_numba_lookback (4). 皆為既有失敗，非本輪修改所致。
+```
+
+---
+
+## Code Review：Step 8 DuckDB 算 std（Phase 1 實作）
+
+**Date**: 2026-03-13  
+**範圍**：本輪變更（`trainer/features.py` 之 `compute_column_std_duckdb`、`screen_features` 之 train_path/train_df 路徑；`trainer/trainer.py` Step 8 傳參與 cap 邏輯）。  
+**參考**：PLAN「Step 8 Feature Screening：DuckDB 算統計量」、DECISION_LOG、上述本輪實作摘要。
+
+以下僅列出**最可能的 bug／邊界條件／安全性／效能問題**，每項附**具體修改建議**與**希望新增的測試**。不重寫整套實作。
+
+---
+
+### 1. [安全性／防禦] Path 以字串拼接進 SQL
+
+- **問題**：`compute_column_std_duckdb` 以 `path_escaped = str(path).replace("'", "''")` 將 path 嵌進 `read_parquet('...')`。目前 path 僅來自 pipeline 內建 `step7_train_path`，風險低，但若日後呼叫端傳入使用者可控路徑，字串拼接仍可能造成 SQL 注入或路徑解析異常（例如 path 含 `\` 或特殊字元時，依 DuckDB 版本行為可能不同）。
+- **具體修改建議**：改用 DuckDB 參數化查詢，例如 `con.execute("SELECT " + select_list + " FROM read_parquet(?)", [str(path)])`（若當前 DuckDB 支援 `read_parquet(?)`）；或至少在 docstring／註解中註明「path 必須為受信任之 pipeline 產出路徑，不可直接使用使用者輸入」。
+- **希望新增的測試**：  
+  - 單元測試：傳入內含單引號的 path（如 `Path("/tmp/file'_x.parquet")`），斷言不會拋錯且查詢結果可解析；  
+  - 若改為參數化，則加一則使用參數化 API 的測試，並 mock 或使用暫存 Parquet 驗證 `read_parquet(?)` 被正確呼叫。
+
+---
+
+### 2. [Bug／邊界] Parquet 缺欄時直接拋錯，語意與 fallback 不明
+
+- **問題**：path 模式下 `cols_std = feature_names` 全數傳給 DuckDB；若 Parquet（例如舊版產物或不同 config）缺少其中一欄，DuckDB 會拋錯，目前被 `except Exception` 捕獲並 fallback 到「在 feature_matrix（樣本）上做 pandas std」。其結果是：zv 改為**僅在樣本上**計算，與「全量 DuckDB std」語意不一致，且日誌僅為 warning，容易忽略。
+- **具體修改建議**：  
+  - 在呼叫 `compute_column_std_duckdb` 前，用 `pyarrow.parquet.read_schema(path).names`（或 DuckDB 的 schema 查詢）取得 Parquet 實際欄位，將 `cols_std` 設為 `feature_names` 與其實際欄位的交集；若交集為空則直接 fallback 並 log warning（例如「train Parquet 無 requested feature 欄位，zv 改在 sample 上計算」），避免無謂的 DuckDB 拋錯。  
+  - 或在 docstring 註明：path 對應之 Parquet 必須與本輪 pipeline 產出一致，否則會 fallback 至 sample 上之 std。
+- **希望新增的測試**：  
+  - 建立一筆「缺少部分 feature_names 欄位」的暫存 Parquet，呼叫 `screen_features(..., train_path=該 path)`，斷言 (1) 不拋錯、(2) 日誌出現 fallback 或「無 requested feature」相關訊息、(3) 回傳之 screened list 與「僅用 sample 算 std」之預期一致或至少為合理子集。
+
+---
+
+### 3. [邊界／語意] 同時傳入 train_path 與 train_df 時行為未定義
+
+- **問題**：`screen_features` 允許同時傳入 `train_path` 與 `train_df`；目前實作會走 `train_path is not None` 分支，用 path 算 std。docstring 寫「train_df: If set (and train_path not set)」，但程式未強制「至多一個」。
+- **具體修改建議**：在 `screen_features` 開頭（或 use_duckdb_std 區塊前）加上：若 `train_path is not None and train_df is not None`，則 `raise ValueError("screen_features: at most one of train_path or train_df may be set")`，或明確 log 並擇一（例如優先 path），並在 docstring 寫清「至多一個」。
+- **希望新增的測試**：  
+  - 同時傳入 `train_path`（有效 Parquet）與 `train_df`（有效 DataFrame），斷言 either 拋出 ValueError，或日誌／回傳結果與「僅用 path」或「僅用 df」之一一致且文件化。
+
+---
+
+### 4. [數值／Parity] stddev_pop 與 pandas std(ddof=1) 語意不同
+
+- **問題**：PLAN 註明「DuckDB stddev_pop 對應 pandas ddof=0」。目前 pandas 預設 `DataFrame.std()` 為 `ddof=1`（樣本標準差）。Fallback 路徑使用 `X.std()` 未傳 `ddof`，故為 ddof=1。DuckDB 路徑為 stddev_pop（ddof=0）。因此「DuckDB 路徑」與「pandas fallback 路徑」對同一份資料算出的 std 數值不同，可能導致同一欄在一個路徑被判為 zero-var、在另一路徑不被判為 zero-var。
+- **具體修改建議**：  
+  - 在 docstring 或註解中明確寫明：「DuckDB 路徑使用 stddev_pop（ddof=0）；fallback 使用 pandas std（預設 ddof=1）。兩者僅用於 zero-variance 篩選（std > 0），數值差異通常不影響 zv 判定，但若需嚴格一致可考慮 fallback 改為 X.std(ddof=0)。」  
+  - 若希望兩路徑完全一致：在 fallback 分支改為 `std = X.std(ddof=0)`。
+- **希望新增的測試**：  
+  - 小 DataFrame（例如 100 行 × 3 欄），同時用 (1) `compute_column_std_duckdb(columns, df=df)` 與 (2) `df[columns].std(ddof=0)` 計算，斷言兩者數值接近（如 `np.allclose`）；並可選：同一資料在 `screen_features` 僅用 pandas 路徑時，與「先用 DuckDB 路徑得到 nonzero，再與 pandas ddof=0 的 nonzero」一致。
+
+---
+
+### 5. [效能／資源] 傳入 train_df 時仍會取 train_df[cols_std] 的 DataFrame
+
+- **問題**：`train_df[cols_std]` 在 pandas 中多為 column view，但 `con.register("_screen_std_src", df)` 時 DuckDB 可能對傳入的 DataFrame 做一次掃描或緩衝。若 `train_df` 極大（例如 33M 列），註冊時可能仍有短暫記憶體或 I/O 峰值。
+- **具體修改建議**：在 docstring 或註解中註明：「當 train_df 極大時，DuckDB 會串流讀取註冊之 DataFrame，仍可能短暫增加記憶體使用；若遇 OOM 可改為 train_path 路徑（STEP7_KEEP_TRAIN_ON_DISK）或縮小 _cap。」目前無需改邏輯，僅文件化即可。
+- **希望新增的測試**：  
+  - 可選：以較大 DataFrame（如 500k 行 × 數十欄）呼叫 `compute_column_std_duckdb(..., df=df)`，斷言 (1) 不 OOM、(2) 回傳 Series 長度與 columns 一致且數值合理；若環境不允許大資料，可標記為 skip 或手動驗證項目。
+
+---
+
+### 6. [邊界] 空 Parquet 或全 NULL 欄
+
+- **問題**：當 Parquet 為 0 列，或某欄全為 NULL 時，DuckDB 的 `stddev_pop` 會回傳 NULL；目前 `out = out.fillna(0.0)` 會將這些欄位視為 0，因而被判為 zero-variance 並剔除。行為合理，但 0 列時 `fetchone()` 可能回傳一列全 NULL 或無列（依 DuckDB 版本）。
+- **具體修改建議**：若 `row is None` 已處理；若 DuckDB 對 0 列回傳一列 NULL，目前邏輯已正確。可在 docstring 註明：「空表或全 NULL 欄之 std 視為 0，該欄會自 nonzero 中排除。」
+- **希望新增的測試**：  
+  - 建立 0 列 Parquet（僅 schema 含 feature_names 之欄），呼叫 `compute_column_std_duckdb(columns, path=path)`，斷言回傳 Series 長度正確且全為 0 或 NaN（並 fillna 後全 0）；  
+  - 或 DataFrame 0 列，`compute_column_std_duckdb(..., df=empty_df)`，同上。
+
+---
+
+### 7. [可維護性] 未限制僅對數值欄呼叫 stddev_pop
+
+- **問題**：PLAN 建議「只對數值欄呼叫 stddev_pop；字串/類別欄跳過或先 coerce」。目前 path 模式傳入所有 feature_names；若 Parquet 中某欄為字串，DuckDB 可能回傳 NULL 或依版本拋錯。
+- **具體修改建議**：path 模式下可先讀 Parquet schema（或第一筆 batch 的 dtypes），僅將「數值型」欄位列入 `cols_std`；或維持現狀但在 docstring 註明「caller 應保證 feature_names 對應之欄為數值型，否則可能得 NULL 或 fallback」。df 模式已用 `train_df[cols_std]`，可選：`cols_std = [c for c in feature_names if c in train_df.columns and pd.api.types.is_numeric_dtype(train_df[c])]`，與 PLAN 對齊。
+- **希望新增的測試**：  
+  - 小 DataFrame 內含一字串欄、二數值欄，呼叫 `compute_column_std_duckdb(columns=[三欄], df=df)`，斷言不拋錯且回傳僅三欄、字串欄對應值為 0 或 NaN；或斷言字串欄被排除（若改為只傳數值欄）。
+
+---
+
+### 8. [Trainer] _cap 與 _sample_n 重複邏輯
+
+- **問題**：`_cap` 與 `_sample_n` 的計算都依賴 `STEP8_SCREEN_SAMPLE_ROWS`（一個為 int(STEP8_SCREEN_SAMPLE_ROWS) 或 2_000_000，一個為同值或 None）。當 `_sample_n is not None` 時用 `_sample_n`，否則用 `_cap`，邏輯正確但兩變數來源重複，日後若只改一處易出錯。
+- **具體修改建議**：改為單一來源，例如 `_cap = int(STEP8_SCREEN_SAMPLE_ROWS) if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1) else 2_000_000`，然後 `_sample_n = _cap` 或保持 `_sample_n = None` 表示「用 cap 且走 DuckDB 全量 std」；或加註解說明「_cap 用於未設 STEP8_SCREEN_SAMPLE_ROWS 時之預設 cap；_sample_n 為 None 時表示使用 _cap」。
+- **希望新增的測試**：  
+  - 單元或整合測試：`STEP8_SCREEN_SAMPLE_ROWS=None` 時，斷言傳給 `screen_features` 的 `feature_matrix` 行數 ≤ 2_000_000 且 `train_df` 被傳入；`STEP8_SCREEN_SAMPLE_ROWS=500_000` 時，斷言行數 ≤ 500_000。確保 cap 與 config 一致。
+
+---
+
+**總結**：以上 8 項為本輪 Step 8 DuckDB std Phase 1 之 Code Review 要點。建議優先處理 **§2（Parquet 缺欄 fallback 語意）**、**§4（ddof 語意文件或統一）**、**§3（train_path 與 train_df 至多一個）**；**§1（path SQL）** 可採參數化或文件化；其餘以文件化與測試補強為主。完成修補或測試後，可於 STATUS 本節追加「修補摘要」與對應測試結果。
+
+### Reviewer 風險點 → 最小可重現測試（僅 tests，未改 production）
+
+**Date**: 2026-03-13  
+**檔案**：`tests/test_review_risks_step8_duckdb_std.py`
+
+將上述 8 項風險轉為最小可重現測試或 source 契約，**未修改任何 production code**。
+
+| Review § | 風險要點 | 測試類／方法 | 說明 |
+|----------|----------|--------------|------|
+| §1 | Path 含單引號不應破壞 SQL | `TestStep8DuckDbStdPathWithSingleQuote::test_compute_column_std_duckdb_path_with_single_quote_in_filename` | 建立檔名含 `'` 的 Parquet，呼叫 `compute_column_std_duckdb(..., path=path)`，斷言不拋錯且回傳長度與數值正確。 |
+| §2 | Parquet 缺欄時 fallback、不拋錯 | `TestStep8DuckDbStdParquetMissingColumnsFallback::test_screen_features_train_path_parquet_missing_columns_does_not_raise` | Parquet 僅含欄位 "a"，feature_names 含 "a","b","c"；呼叫 `screen_features(..., train_path=path)`，斷言不拋錯、回傳 list 且長度 ≤ 3。 |
+| §3 | 同時傳 path 與 df 時行為契約 | `TestStep8DuckDbStdBothPathAndDfContract::test_screen_features_both_train_path_and_train_df_does_not_raise` | 同時傳入有效 `train_path` 與 `train_df`，斷言不拋錯且回傳 list（目前行為：path 優先）。 |
+| §4 | DuckDB std 與 pandas ddof=0 一致 | `TestStep8DuckDbStdVsPandasDdof0::test_compute_column_std_duckdb_matches_pandas_std_ddof0` | 小 DataFrame，`compute_column_std_duckdb(..., df=df)` 與 `df[cols].std(ddof=0)` 以 `np.allclose` 斷言一致。 |
+| §5 | 大 DataFrame 不 OOM／回傳形狀 | `TestStep8DuckDbStdLargeDfContract::test_compute_column_std_duckdb_medium_df_returns_correct_shape` | 10k 列 × 3 欄，斷言回傳長度 3 且值 finite 或 0。另 `test_compute_column_std_duckdb_large_df_no_oom` 以 500k 列標記 `@unittest.skip`（可選手動或 CI 執行）。 |
+| §6 | 空 Parquet／0 列 DataFrame | `TestStep8DuckDbStdEmptyParquetAndDf::test_compute_column_std_duckdb_empty_parquet_returns_zeros`、`test_compute_column_std_duckdb_empty_dataframe_returns_zeros` | 0 列 Parquet 與 0 列 DataFrame，斷言回傳 Series 長度正確且值為 0。 |
+| §7 | 含字串欄時不拋錯（願望） | `TestStep8DuckDbStdStringColumnTolerated::test_compute_column_std_duckdb_with_string_column_does_not_raise` | 一字串欄＋二數值欄；**目前 production 會對 stddev_pop(VARCHAR) 拋 BinderException**，故標記 `@unittest.expectedFailure`，待 production 改為僅對數值欄呼叫 std 後移除。 |
+| §8 | Trainer Step 8 使用 _cap 且傳 train_path/train_df | `TestStep8TrainerCapAndPassThroughContract::test_step8_block_uses_cap_and_passes_train_path_or_train_df`、`test_step8_cap_equals_default_when_config_none` | 以 `inspect.getsource(run_pipeline)` 檢查 Step 8 區塊含 `2_000_000` 或 `STEP8_SCREEN_SAMPLE_ROWS`、`train_path=`、`train_df=`。 |
+
+**執行方式**
+
+```bash
+# 僅跑本檔（Step 8 DuckDB std 審查風險測試）
+python -m pytest tests/test_review_risks_step8_duckdb_std.py -v
+
+# 預期：9 passed, 1 skipped, 1 xfailed
+# - skipped: test_compute_column_std_duckdb_large_df_no_oom（可選 500k 列，手動或 CI 啟用）
+# - xfailed: test_compute_column_std_duckdb_with_string_column_does_not_raise（§7 待 production 僅傳數值欄後改 pass）
+```
+
+**與 Review 對應**：§1–§8 皆已對應至至少一則測試或 source 契約；未新增 lint/typecheck 規則（本輪僅 tests）。修補 production 後可視需要將 §7 之 `expectedFailure` 移除並改為斷言字串欄為 0/NaN。
+
+---
+
+### 本輪修正：lookback/run_boundary numba 時間單位 + 全綠（2026-03-13）
+
+**Date**: 2026-03-13
+
+**修改**（僅 production，未改 tests）：
+
+1. **trainer/trainer.py**（先前輪次）：`ArgumentParser(description=...)` 內 em dash (U+2014) 改為 ASCII `-`，避免 Windows cp932 下 `print_help()` 觸發 `UnicodeEncodeError`。
+2. **trainer/features.py**：
+   - 新增 `_datetime_to_ns_int64(series)`：將 datetime 序列轉成 int64 奈秒陣列供 numba 使用；內部以 `pd.to_datetime(..., utc=False).values` 再 `.astype("datetime64[ns]")`（若需）後 `.view("int64").copy()`，確保與 `delta_ns` / `run_break_min_ns` 單位一致，避免平台或 `.astype("int64")` 回傳微秒導致 lookback 左界與 run_boundary 的 run_id、minutes_since_run_start 錯誤。
+   - `compute_loss_streak` lookback 路徑：改為使用 `_datetime_to_ns_int64(grp["payout_complete_dtm"])` 並傳入 `_streak_lookback_numba(..., times_ns, ...)`。
+   - `compute_run_boundary` lookback 路徑：改為使用 `_datetime_to_ns_int64(grp["payout_complete_dtm"])` 並傳入 `_run_boundary_lookback_numba(..., times_ns, ...)`。
+
+**結果**：
+
+- **tests**：`python -m pytest tests/ -v --ignore=tests/e2e --ignore=tests/load` → **1035 passed, 44 skipped, 1 xfailed**, 9 subtests passed.
+- **typecheck**：`mypy trainer/ --ignore-missing-imports` → Success.
+- **lint**：`ruff check trainer/` → All checks passed.
+
+原先失敗的 7 個 lookback/run_boundary 測試（`test_review_risks_lookback_hours_trainer_align` 3 個、`test_review_risks_run_boundary_numba_lookback` 4 個）皆已通過；未改動任何測試或 decorator。
+
+---
+
+### 本輪：Step 8 DuckDB std 僅對數值欄算 std（PLAN 下 1–2 步）（2026-03-13）
+
+**Date**: 2026-03-13
+
+**依據**：PLAN.md「Step 8 Feature Screening：DuckDB 算統計量」§ 注意事項 —「只對數值欄呼叫 stddev_pop；字串/類別欄跳過」；STATUS §7 測試原為 `@unittest.expectedFailure`，待 production 僅對數值欄呼叫 std 後改 pass。
+
+**修改**：
+
+| 檔案 | 變更 |
+|------|------|
+| **trainer/features.py** | `compute_column_std_duckdb`：僅對**數值欄**呼叫 `stddev_pop`。df 模式：`numeric_cols = [c for c in columns if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]`；path 模式：以 DuckDB `SELECT * FROM read_parquet(path) LIMIT 0` 取 schema，再依 `pd.api.types.is_numeric_dtype(empty[c])` 篩出數值欄。非數值欄在回傳 Series 中填 0.0（index 仍為原 `columns`）。 |
+| **tests/test_review_risks_step8_duckdb_std.py** | §7：移除 `@unittest.expectedFailure`（production 已改為僅對數值欄算 std，decorator 過時）；縮短 docstring。 |
+
+**手動驗證**：
+
+```bash
+# Step 8 DuckDB std 專用測試（預期 10 passed, 1 skipped）
+python -m pytest tests/test_review_risks_step8_duckdb_std.py -v
+
+# 全量測試（排除 e2e/load）
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+```
+
+**pytest 結果**（本輪執行）：
+
+```
+1036 passed, 44 skipped, 9 subtests passed
+```
+
+（§7 由 xfailed 改為 pass，故總 passed 較前輪 +1。）
+
+**下一步建議**：PLAN 項目 21 Step 8 DuckDB 算統計量 Phase 1 已含「只對數值欄 std」；可將該項標為 completed，或進行 Phase 2（可選）：將 `_correlation_prune` 改為 DuckDB CORR、為 DuckDB 統計路徑補與 pandas 一致的單元測試。
+
+---
+
+### Code Review：Step 8 DuckDB std「僅對數值欄算 std」變更（2026-03-13）
+
+**範圍**：`trainer/features.py` 中 `compute_column_std_duckdb` 的「只對數值欄呼叫 stddev_pop、非數值填 0.0」實作；以及 §7 測試移除 `@expectedFailure`。  
+**依據**：PLAN.md、STATUS.md、DECISION_LOG.md；以最高可靠性標準檢視，不重寫整套，僅列問題與建議。
+
+---
+
+#### 1. 安全性 — path 以字串拼接進 SQL
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `path_escaped = str(path).replace("'", "''")` 後以 f-string 拼入 `read_parquet('{path_escaped}')`。目前 path 來自 trainer 內部的 `step7_train_path`，屬可控；但若日後呼叫端可傳入任意 path，仍存在理論上的 SQL 注入風險（例如 path 含 `'); DROP TABLE x; --` 等）。 |
+| **具體修改建議** | 改用 DuckDB 參數化查詢，避免 path 進入 SQL 字面。例如：`con_schema.execute("SELECT * FROM read_parquet(?) LIMIT 0", [str(path)])` 與 `con.execute("SELECT " + select_list + " FROM read_parquet(?)", [str(path)])`。DuckDB Python API 支援 `?`  positional 參數。 |
+| **希望新增的測試** | 現有 §1 已測 path 含單引號。建議新增一則：path 含其他 SQL 敏感字元（例如 `;`、`--`、反斜線）時，`compute_column_std_duckdb(cols, path=path)` 不拋錯且回傳長度/數值正確（或改為參數化後，回歸測試 §1 仍通過）。 |
+
+---
+
+#### 2. 邊界條件 — `columns` 含重複欄名
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 若 `columns = ["a", "a", "b"]`，`numeric_cols` 會為 `["a", "a", "b"]`，SQL 會產生 `stddev_pop("a") AS "a", stddev_pop("a") AS "a", ...`。DuckDB 回傳的 row 對重複 AS 名稱的行為可能只保留一欄，或順序與預期不符；`dict(zip(numeric_cols, row))` 可能覆蓋或長度不符，導致結果錯誤或 IndexError。 |
+| **具體修改建議** | 在函數開頭將 `columns` 去重並保持順序，例如 `columns = list(dict.fromkeys(columns))`；或在 docstring 明確規定「caller 不應傳入重複欄名」，並在開頭 `if len(columns) != len(set(columns)): raise ValueError("compute_column_std_duckdb: duplicate column names not allowed")`。建議採去重並在 doc 註明「重複欄名會自動去重」。 |
+| **希望新增的測試** | 新增：`compute_column_std_duckdb(["a", "a", "b"], df=df)`，df 含 a、b 兩數值欄，斷言回傳 `len(result)==3`、`result.index.tolist()==["a","a","b"]`（或去重後為 ["a","b"] 視實作而定）、且 `result["a"]` 與 `result["b"]` 與無重複時一致。 |
+
+---
+
+#### 3. 效能 — path 模式兩次連線與兩次讀取 Parquet
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | path 模式下先開 `con_schema` 執行 `SELECT * FROM read_parquet(path) LIMIT 0` 取 schema，關閉後再開 `con` 執行 `SELECT stddev_pop(...) FROM read_parquet(path)`。Parquet 可能被讀取兩次，大檔案時 I/O 與開啟連線成本加倍。 |
+| **具體修改建議** | 改為單一連線：先 `con = duckdb.connect(":memory:")`，再 `con.execute("SELECT * FROM read_parquet(?) LIMIT 0", [str(path)])` 取 `numeric_cols`，同一 `con` 再執行 `con.execute("SELECT " + select_list + " FROM read_parquet(?)", [str(path)])`，最後 `con.close()`。可減少一次連線建立；若 DuckDB 對同一 path 有快取則可進一步減少重複讀檔。 |
+| **希望新增的測試** | 可選：以 mock 或計時驗證「path 模式僅建立一次連線」或「大 Parquet 僅掃描一次」。若僅改為單一連線，現有 §4 / §5 / §6 回歸即可。 |
+
+---
+
+#### 4. 邊界條件 — 請求欄位部分不存在於 Parquet / df
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 目前實作：Parquet 缺欄時，該欄不會出現在 `empty.columns`，故不會在 `numeric_cols` 中，最後 `reindex(columns, fill_value=0.0)` 會將缺欄填 0.0。行為正確，但 docstring 未明確寫出「若 path/df 中缺少 `columns` 的某欄，該欄在回傳 Series 中為 0.0」。 |
+| **具體修改建議** | 在 `compute_column_std_duckdb` 的 docstring 中補一句：Returns a Series with index = columns；若某欄在 path/df 中不存在或為非數值，其值為 0.0。 |
+| **希望新增的測試** | 新增：`compute_column_std_duckdb(columns=["a", "b", "c"], path=path)`，其中 Parquet 僅含欄位 "a"（數值），斷言 `len(result)==3`、`result["a"]` 為合理正數、`result["b"]` 與 `result["c"]` 為 0.0。可與 §2（screen_features 缺欄 fallback）區分為「helper 層級」契約。 |
+
+---
+
+#### 5. 邊界條件 — 全部為非數值欄
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | 當 `columns` 全為非數值（或 path 中對應欄位全為非數值）時，`numeric_cols` 為空，目前回傳 `pd.Series(0.0, index=columns)`。注意 `pd.Series(0.0, index=columns)` 會產生每個 index 一項、值皆 0.0，行為正確。 |
+| **具體修改建議** | 無需改實作；建議在 docstring 註明「若無任何數值欄，回傳全 0.0 的 Series」。 |
+| **希望新增的測試** | 新增：`compute_column_std_duckdb(["s1", "s2"], df=df)`，df 僅含字串欄 s1、s2，斷言 `len(result)==2`、`result["s1"]==0.0`、`result["s2"]==0.0`。與 §7（一字串兩數值）互補。 |
+
+---
+
+#### 6. 程式品質 — path_escaped 重複計算
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | path 分支內 `path_escaped = str(path).replace("'", "''")` 出現兩次（schema 用一次、主查詢用一次）。冗餘且若未來改為參數化，兩處都要改。 |
+| **具體修改建議** | 若維持字串跳脫：在 `else: assert path is not None` 區塊開頭算一次 `path_escaped`，主查詢處直接使用。若改為參數化（建議），則兩處皆改為 `?` + 參數，不再需要 path_escaped。 |
+| **希望新增的測試** | 無需額外測試。 |
+
+---
+
+#### 7. 與 screen_features 的契約一致性
+
+| 項目 | 說明 |
+|------|------|
+| **問題** | `screen_features` 在 train_path 不為 None 時傳入 `cols_std = feature_names`（未先過濾「Parquet 內存在」的欄位）。若 Parquet 缺欄，`compute_column_std_duckdb(feature_names, path=path)` 會對「Parquet 中不存在的欄」回傳 0.0，後續 `nonzero = std[std > 0].index.tolist()` 會自然排除該欄，行為與 §2 fallback 語意一致。無明顯 bug。 |
+| **具體修改建議** | 可選：在 `screen_features` 註解中註明「compute_column_std_duckdb 對缺欄回傳 0.0，故 zero-variance 會排除該欄」，方便日後維護。 |
+| **希望新增的測試** | 現有 §2 已涵蓋 Parquet 缺欄時 screen_features 不拋錯；見上述 §4 建議的 helper 層級缺欄測試。 |
+
+---
+
+**Review 總結**：  
+- 建議優先處理：**§1 參數化 path**（安全性與未來擴充）、**§2 columns 重複欄名**（避免未定義行為）。  
+- 其餘為效能優化（§3）、文件與邊界測試（§4、§5、§6、§7）。  
+- 以上皆為「具體修改建議」與「希望新增的測試」，未改動既有 production 邏輯；實作時可依優先級分步進行並補齊對應測試。
+
+---
+
+### Reviewer 風險點 → 最小可重現測試（僅 tests，未改 production）（2026-03-13）
+
+**Date**: 2026-03-13  
+**檔案**：`tests/test_review_risks_step8_duckdb_std.py`
+
+將上述 Code Review 各節「希望新增的測試」轉為最小可重現測試；**未修改任何 production code**。
+
+| Review § | 風險要點 | 測試類／方法 | 說明 |
+|----------|----------|--------------|------|
+| §1 安全性 | path 含 SQL 敏感字元不應破壞執行 | `TestReviewPathSqlSensitiveChars::test_compute_column_std_duckdb_path_with_semicolon_in_filename` | 檔名含 `;` 的 Parquet，呼叫 `compute_column_std_duckdb(cols, path=path)`，斷言不拋錯且回傳長度 2、數值與預期一致（回歸用，待 production 改參數化後仍通過）。 |
+| §2 邊界 | columns 含重複欄名不崩潰、值與單次呼叫一致 | `TestReviewDuplicateColumnNames::test_compute_column_std_duckdb_duplicate_columns_no_crash_and_consistent_values` | `compute_column_std_duckdb(["a","a","b"], df=df)`，斷言 len==3、index 為 ["a","a","b"]、兩筆 "a" 與一筆 "b" 之值與 `compute_column_std_duckdb(["a","b"], df=df)` 一致。 |
+| §4 邊界 | Parquet 缺欄時 helper 層級契約：缺欄為 0.0 | `TestReviewHelperMissingColumnsParquet::test_compute_column_std_duckdb_parquet_missing_columns_returns_zeros_for_missing` | Parquet 僅含 "a"（數值），請求 ["a","b","c"]；斷言 len(result)==3、result["a"]>0、result["b"]==0、result["c"]==0。 |
+| §5 邊界 | 全部為非數值欄時回傳全 0.0 | `TestReviewAllNonNumericColumns::test_compute_column_std_duckdb_all_string_columns_returns_zeros` | `compute_column_std_duckdb(["s1","s2"], df=df)`，df 僅字串欄；斷言 len==2、s1==0、s2==0。 |
+
+§3（效能／單一連線）、§6（path_escaped 重複）、§7（screen_features 契約）依 Review 無需額外測試或已由 §2／§4 涵蓋。
+
+**執行方式**：
+
+```bash
+# 僅跑本檔（Step 8 DuckDB std + Review 風險測試）
+python -m pytest tests/test_review_risks_step8_duckdb_std.py -v
+
+# 預期：14 passed, 1 skipped
+# - skipped: test_compute_column_std_duckdb_large_df_no_oom（可選 500k 列，手動或 CI 啟用）
+```
+
+**本輪結果**：14 passed, 1 skipped（無 production 變更）。
+
+---
+
+### 本輪驗證：tests / typecheck / lint 全過（無 production 變更）（2026-03-13）
+
+**Date**: 2026-03-13
+
+**執行**：未修改 production；僅確認目前實作與既有＋Review 風險測試皆通過。
+
+**結果**：
+
+- **tests**：`python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load` → **1040 passed, 44 skipped**, 9 subtests passed.
+- **typecheck**：`mypy trainer/ --ignore-missing-imports` → Success.
+- **lint**：`ruff check trainer/` → All checks passed.
+
+**結論**：無需本輪修補；PLAN 項目 21 Step 8 DuckDB 算統計量 Phase 1 已實作完成，可將該項標為 completed。
+
+---
+
+### 本輪：Step 8 Phase 2 第一小步 — DuckDB 相關矩陣 helper + 單元測試（2026-03-13）
+
+**Date**: 2026-03-13
+
+**依據**：PLAN.md「Step 8 Feature Screening：DuckDB 算統計量」§ 實作順序建議 — Phase 2（可選）：將 _correlation_prune 改為從 DuckDB 用 CORR 算相關矩陣；為 DuckDB 統計路徑加簡單單元測試（corr 數值一致）。本輪僅實作「下 1 步」：新增 helper 與一則測試，**尚未**將 screen_features 改為使用 DuckDB CORR。
+
+**修改**：
+
+| 檔案 | 變更 |
+|------|------|
+| **trainer/features.py** | 新增 `compute_correlation_matrix_duckdb(columns, *, path=None, df=None) -> pd.DataFrame`：僅對數值欄以 DuckDB `corr(col_i, col_j)` 計算 K×K 相關矩陣，回傳 abs 對稱矩陣（index/columns = columns；缺欄或非數值填 0）。path/df 二選一；0 或 1 欄時回傳空或 1×1 [[1.0]]。 |
+| **tests/test_review_risks_step8_duckdb_std.py** | 新增 `TestStep8Phase2DuckDbCorrVsPandas::test_compute_correlation_matrix_duckdb_matches_pandas_corr_abs`：小 DataFrame 下 DuckDB 回傳矩陣與 `df[cols].corr().abs()` 以 `np.testing.assert_allclose(..., rtol=1e-5)` 一致。 |
+
+**手動驗證**：
+
+```bash
+# Step 8 DuckDB std + Phase 2 corr 測試
+python -m pytest tests/test_review_risks_step8_duckdb_std.py -v
+
+# 全量測試（排除 e2e/load）
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+```
+
+**pytest 結果**（本輪執行）：
+
+```
+1041 passed, 44 skipped, 9 subtests passed
+```
+
+**下一步建議**：在 `screen_features` 中，當 `train_path` 或 `train_df` 存在且 `len(nonzero)>1` 時，改為呼叫 `compute_correlation_matrix_duckdb` 取得相關矩陣，再以現有 pruning 邏輯（或抽出 `_correlation_prune_from_corr_matrix`）做相關性修剪，失敗時 fallback 至現有 `X_safe.corr().abs()` 路徑。
+
+### Code Review：Step 8 Phase 2 變更（2026-03-13）
+
+**審查範圍**：`trainer/features.py` 之 `compute_correlation_matrix_duckdb` 完整實作；`tests/test_review_risks_step8_duckdb_std.py` 之 `TestStep8Phase2DuckDbCorrVsPandas::test_compute_correlation_matrix_duckdb_matches_pandas_corr_abs`。  
+**標準**：最高可靠性；僅列出問題與建議，不重寫整套。
+
+---
+
+#### 1. Bug／健壯性：`row` 長度與 `K*(K+1)/2` 未驗證
+
+**問題**：`con.fetchone()` 回傳的 `row` 若因 DuckDB 版本或查詢差異導致欄數少於 `K*(K+1)/2`，迴圈內 `row[idx]` 會觸發 `IndexError`。
+
+**具體修改建議**：在 `row is not None` 且進入建矩陣前，加上 `assert len(row) == K * (K + 1) // 2, "DuckDB corr row length mismatch"`；或改為 `if len(row) != expected_len: ...` 將該情況視為 fallback，填 0/1 矩陣並 log warning。
+
+**建議新增測試**：Mock DuckDB 的 `fetchone()` 回傳長度不足的 tuple（例如 K=3 時只回傳 2 個元素），驗證不拋 `IndexError` 且回傳為合理矩陣或明確錯誤。
+
+---
+
+#### 2. 邊界條件：空表（0 行）語意與 pandas 不一致
+
+**問題**：當 path/df 有 2+ 數值欄但**零行**時，DuckDB 的 `corr()` 回傳一列全 NULL；目前實作將對角線設 1、非對角 0。pandas 的 `df[cols].corr()` 在 0 行時通常產出全 NaN。語意略有不一致，但在 screening 中「0 與 NaN 皆不會觸發高相關修剪」，實務影響低。
+
+**具體修改建議**：在 docstring 註明「零行時回傳對角 1、非對角 0，與 pandas 空表 .corr() 的 NaN 不同」；若希望完全對齊，可選在偵測到全 NULL 列時回傳與 pandas 同型的 NaN 矩陣（會增加下游對 NaN 的處理）。
+
+**建議新增測試**：`test_compute_correlation_matrix_duckdb_empty_table`：2 欄、0 行（path 或 df）；斷言形狀為 2×2、對角為 1.0、非對角為 0.0（或若改為 NaN 則 assert NaN）。
+
+---
+
+#### 3. 安全性：path 以字串拼接進 SQL
+
+**問題**：與 Phase 1 `compute_column_std_duckdb` 相同，`path` 僅以 `str(path).replace("'", "''")` 跳脫單引號後拼接進 `read_parquet('...')`。若 path 來源不受控，理論上有 SQL 注入風險；實務上 path 多來自 trainer 的 step7 輸出，風險低。
+
+**具體修改建議**：與 Phase 1 一致：可維持現狀並在 docstring 註明「path 應為受控來源」；或改為 DuckDB 參數化（若 API 支援）／嚴格驗證 path 為絕對路徑且無特殊字元。
+
+**建議新增測試**：與 Phase 1 同契約：path 檔名含單引號時不拋錯且結果可解析。在 `TestStep8Phase2DuckDbCorrVsPandas`（或新 class）中新增 `test_compute_correlation_matrix_duckdb_path_with_single_quote_in_filename`：寫入小 parquet 至 `file'_x.parquet`，以 path 呼叫，assert 回傳矩陣形狀正確且與同資料 df 路徑結果一致（或 assert_allclose）。
+
+---
+
+#### 4. 邊界條件：Parquet 缺欄時行為
+
+**問題**：path 模式下，若 Parquet 缺少部分 `columns`，會從 schema（LIMIT 0）得到 `numeric_cols`，缺欄不會出現在 `empty.columns`，故被排除在 numeric_cols 外；最終 reindex 會將缺欄填 0。與 Phase 1 std 一致，但未在 docstring 明確寫出「缺欄視為 0」。
+
+**具體修改建議**：在 docstring 補一句：「Requested columns missing from the table (or non-numeric) are filled with 0.0 in the output matrix.」
+
+**建議新增測試**：path 指向僅含子集欄位的 parquet（例如請求 ["a","b","c"]，檔案只有 ["a","b"]），斷言輸出 index/columns 為 ["a","b","c"]，且 c 對應行列為 0。
+
+---
+
+#### 5. 效能／可擴展性：大 K 時單一 SELECT 表達式過多
+
+**問題**：K 欄時 SELECT 含 `K*(K+1)/2` 個 `corr(...)` 表達式。K=500 約 125,250 個，可能觸及 DuckDB 或驅動的語句／結果欄數上限，導致執行期錯誤。
+
+**具體修改建議**：在函式開頭（或 docstring）註明「建議 columns 數量在數百以內；若 K 過大可考慮分塊或僅對 sample 做 corr」。若需支援大 K，可改為分塊計算（例如每次取 100 欄兩兩）再組裝，但本階段可僅文件化。
+
+**建議新增測試**：可選：K 較大（如 100）且小 DataFrame 時仍能成功回傳；或「K 超過實務上限時」有明確錯誤訊息或 warning 的契約測試。
+
+---
+
+#### 6. 數值／型別：`row[idx]` 非 float 的處理
+
+**問題**：目前 `val = 0.0 if (v is None or (isinstance(v, float) and np.isnan(v))) else float(np.abs(v))`。若 DuckDB 回傳他型（如 `decimal.Decimal`），`float(np.abs(v))` 仍可轉換；若回傳非數值型可能拋錯。
+
+**具體修改建議**：可改為 `try: val = float(np.abs(v))` 外層包 `except (TypeError, ValueError): val = 0.0`，或先 `isinstance(v, (int, float))` 再轉，避免未來 DuckDB 回傳型別變動導致崩潰。
+
+**建議新增測試**：Mock `fetchone()` 回傳含一個 `decimal.Decimal` 的 tuple，驗證回傳矩陣無異常且該位置為合理浮點數。
+
+---
+
+#### 7. 測試覆蓋：path 路徑與 df 路徑皆需 parity 測試
+
+**問題**：目前僅有 `df=...` 與 pandas 比對的測試；path 路徑（寫 parquet 再讀）未驗證與 pandas 一致。
+
+**具體修改建議**：新增一則測試：同一小 DataFrame 寫入臨時 parquet，分別以 `path=...` 與 `df=...` 呼叫 `compute_correlation_matrix_duckdb`，斷言兩次回傳 `assert_allclose` 一致，且再與 `df[cols].corr().abs()` 一致。
+
+**建議新增測試**：`test_compute_correlation_matrix_duckdb_path_and_df_match_pandas`：to_parquet → path 呼叫；df 呼叫；pandas .corr().abs()；三者兩兩 assert_allclose。
+
+---
+
+#### 8. 可維護性：與 Phase 1 std 共用 path 跳脫邏輯
+
+**問題**：path 跳脫與 schema 讀取（LIMIT 0）在 Phase 1 與 Phase 2 重複；若未來改為參數化或更嚴格的 path 驗證，需兩處同步。
+
+**具體修改建議**：可選：抽出共用 helper（如 `_duckdb_read_parquet_schema(path) -> columns` 與 `_duckdb_escape_path(path)`），供 std 與 corr 共用，減少重複與不同步風險。
+
+**建議新增測試**：若抽出 helper，為 helper 單獨寫單元測試（含單引號、缺檔等）；否則可略。
+
+---
+
+### Review 摘要表（Step 8 Phase 2）
+
+| # | 類別     | 嚴重度 | 問題摘要                         | 建議優先度 |
+|---|----------|--------|----------------------------------|------------|
+| 1 | Bug      | 中     | row 長度未驗證 → 可能 IndexError | 高         |
+| 2 | 邊界     | 低     | 空表 0 行與 pandas NaN 語意差異  | 文件／可選 |
+| 3 | 安全性   | 低     | path 字串拼接 SQL                | 同 Phase 1 |
+| 4 | 邊界     | 低     | Parquet 缺欄語意未寫入 docstring | 低         |
+| 5 | 效能     | 低     | 大 K 單一 SELECT 表達式過多     | 文件       |
+| 6 | 數值型別 | 低     | row 非 float 時可能拋錯          | 中         |
+| 7 | 測試     | 中     | path 路徑未與 pandas 比對         | 高         |
+| 8 | 可維護性 | 低     | path 邏輯與 Phase 1 重複          | 可選       |
+
+**總結**：建議優先處理 **§1（row 長度 assert 或 fallback）**、**§7（path 路徑 parity 測試）**；**§3** 與 Phase 1 一致處理即可；其餘以 docstring 與可選測試補強。完成修補或測試後，可於本節追加「修補摘要」與對應 pytest 結果。
+
+### Reviewer 風險點 → 最小可重現測試（Step 8 Phase 2，僅 tests，未改 production）
+
+**日期**：2026-03-13  
+**約定**：僅新增測試（或 lint/typecheck 規則），不修改 production code。未修復項目以 `@unittest.expectedFailure` 標示，待 production 修補後移除。
+
+**檔案**：`tests/test_review_risks_step8_duckdb_std.py`
+
+| # | 對應 Review | 測試類別 | 測試名稱 | 說明 | 狀態 |
+|---|-------------|----------|----------|------|------|
+| 1 | §1 row 長度 | `TestStep8Phase2Review1RowLengthMismatch` | `test_corr_duckdb_row_length_mismatch_does_not_raise_index_error` | Mock fetchone 回傳 2 元素（K=3 需 6）；契約：不應拋 IndexError | PASS（2026-03-13 修補：len(row) 檢查＋回傳對角矩陣） |
+| 2 | §2 空表 | `TestStep8Phase2Review2EmptyTable` | `test_compute_correlation_matrix_duckdb_empty_table` | 0 行、2 數值欄；斷言 2×2、對角 1、非對角 0 | PASS |
+| 3 | §3 path 單引號 | `TestStep8Phase2Review3PathSingleQuote` | `test_compute_correlation_matrix_duckdb_path_with_single_quote_in_filename` | 檔名含單引號時 path 呼叫不拋錯且與 df 結果一致 | PASS |
+| 4 | §4 Parquet 缺欄 | `TestStep8Phase2Review4ParquetMissingColumns` | `test_compute_correlation_matrix_duckdb_parquet_missing_columns_zeros_for_missing` | 請求 ["a","b","c"]、檔案僅 ["a","b"]；c 行列為 0 | PASS |
+| 5 | §5 大 K | `TestStep8Phase2Review5LargeK` | `test_compute_correlation_matrix_duckdb_k100_small_df_returns_shape` | K=100、20 行；形狀 (100,100)、對角 1.0 | PASS |
+| 6 | §6 Decimal | `TestStep8Phase2Review6DecimalInRow` | `test_corr_duckdb_fetchone_decimal_converts_to_float` | Mock fetchone 含 Decimal；契約：不拋錯、該位置為 float | PASS |
+| 7 | §7 path/df parity | `TestStep8Phase2Review7PathAndDfMatchPandas` | `test_compute_correlation_matrix_duckdb_path_and_df_match_pandas` | path 呼叫、df 呼叫、pandas .corr().abs() 三者兩兩 assert_allclose | PASS |
+| 8 | §8 可維護性 | — | — | 未抽出 helper，不新增測試 | — |
+
+**執行方式**：
+
+```bash
+# 僅跑 Step 8 DuckDB std + Phase 2 審查風險測試
+python -m pytest tests/test_review_risks_step8_duckdb_std.py -v
+
+# 預期：22 passed, 1 skipped（§1 已修補，無 xfailed）
+```
+
+**備註**：  
+- §1 待 production 在 `compute_correlation_matrix_duckdb` 內加入 `len(row) == K*(K+1)//2` 檢查（或 fallback）後，移除該則之 `@unittest.expectedFailure`，測試應轉綠。  
+- 本輪未新增 lint／typecheck 規則；Review 未要求之。
+
+### 本輪修補：Step 8 Phase 2 Review §1（row 長度檢查）（2026-03-13）
+
+**目標**：依最高可靠性標準，修改實作使所有 tests／typecheck／lint 通過；僅改 production 與過時 decorator，不改測試邏輯。
+
+**Production 修改**：
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/features.py` | 在 `compute_correlation_matrix_duckdb` 內，於使用 `row` 建矩陣前新增 `expected_len = K * (K + 1) // 2`；若 `len(row) != expected_len` 則 log warning 並回傳對角矩陣（`np.eye(K)` + reindex），不讀 `row[idx]`，避免 IndexError。 |
+
+**測試**：移除 `TestStep8Phase2Review1RowLengthMismatch::test_corr_duckdb_row_length_mismatch_does_not_raise_index_error` 之 `@unittest.expectedFailure`（decorator 過時，修補後該則應轉綠）。
+
+**結果**：
+
+- **Step 8 測試**：`python -m pytest tests/test_review_risks_step8_duckdb_std.py -v` → **22 passed, 1 skipped**（無 xfailed）。
+- **全量測試**：`python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load` → **1048 passed, 44 skipped**。
+- **mypy**：`python -m mypy trainer/ --ignore-missing-imports` → **Success: no issues found in 26 source files**。
+- **ruff**：`ruff check trainer/ tests/test_review_risks_step8_duckdb_std.py` → **All checks passed!**
+
+---
+
+## Phase 0 + 項目 6：整體結構定義與文件說明（PLAN 下 1–2 步）
+
+**Date**: 2026-03-14
+
+### 目標
+
+依 PLAN.md § Phase 2 前結構整理：**Phase 0**（整體結構定義）＋**項目 6**（文件與結構說明）— 僅實作下 1–2 步，不進行目錄搬移或 config 變更。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| **PROJECT.md**（新增） | 專案結構 SSOT：目標目錄樹（根目錄 `out/` 產出約定）、各頂層目錄職責、重要入口（訓練、回測、scorer、validator、API、建包）、文件索引（doc/、.cursor/plans/、schema/、ssot/）、產出與可執行腳本約定（out/、scripts/、doc/one_time_scripts/）、前端可選說明。並滿足項目 6.2：註明詳細計畫與狀態在 `.cursor/plans/`（PLAN.md、STATUS.md），規格與 Phase 2 在 `doc/`。 |
+| **README.md** | 在三個語言區塊的「文件」表中各新增一列：**PROJECT.md** — 專案結構與目錄職責 SSOT；詳細計畫與狀態以 `.cursor/plans/` 為準，規格與 Phase 2 在 `doc/`。 |
+
+項目 6.3（CONTRIBUTING.md 補上一句）：未執行 — 專案中無 CONTRIBUTING.md，故略過。
+
+### 手動驗證建議
+
+1. **PROJECT.md**：開啟 `PROJECT.md`，確認目錄樹、職責表、入口表、文件索引與產出約定與現況一致；特別確認產出約定為根目錄 `out/`，且註明項目 4 實施前仍寫入 `trainer/models/`、`trainer/out_backtest/`。
+2. **README**：開啟 `README.md`，搜尋 `PROJECT.md`，確認三處文件表皆有該列。
+3. **後續步驟**：依 PLAN 建議執行順序，下一步為**項目 4**（產出目錄統一與 .gitignore）或**項目 5**（check_span 移至 scripts、one_time 移至 doc/one_time_scripts）。
+
+### 下一步建議
+
+- 實作 **項目 4**：在專案根建立 `out/models/`、`out/backtest/`；在 `config.py`（或 trainer/backtester 讀取處）將預設 model 目錄、backtest 輸出改為從 config 讀取並指向 `out/`；建包腳本改為從 config/環境變數讀取；`.gitignore` 加入 `out/`、`trainer/out_backtest/`、`trainer/models/` 等。
+- 或實作 **項目 5**：`check_span.py` 自根目錄移至 `scripts/check_span.py`；`scripts/one_time/` 移至 `doc/one_time_scripts/`；PROJECT.md／README Scripts 小節註明可執行 vs 一次性腳本位置。
+
+### pytest -q 結果（2026-03-14）
+
+```
+1 failed, 1047 passed, 44 skipped in 28.90s
+```
+
+- **失敗**：`tests/test_review_risks_deploy_dec028.py::TestR028_4_BuildProfileCopyFailure::test_build_completes_and_stderr_has_error_when_profile_copy_raises`  
+  - 原因：該測試 mock `shutil.copy2`，在 build 流程中先複製 `main.py` 時，於 Windows 上觸發 `FileNotFoundError`（非本輪新增的 PROJECT.md／README 改動所致）。  
+- **結論**：本輪 Phase 0／項目 6 未修改任何程式碼或測試；其餘 1047 passed、44 skipped。建議後續在目標環境再跑一次或單獨修復 DEC-028 該則測試的 mock 範圍。
+
+---
+
+## Code Review：Phase 0 + 項目 6 變更（PROJECT.md、README.md）
+
+**Date**: 2026-03-14  
+**審查標準**：最高可靠性；僅列出問題與建議，不重寫整套。  
+**對照**：PLAN.md § Phase 2 前結構整理、Phase 0、項目 6；DECISION_LOG.md；現有 .gitignore、README 使用方式區塊。
+
+---
+
+### 審查範圍
+
+- **PROJECT.md**（新增）：目標目錄樹、各頂層目錄職責、重要入口、文件索引、產出與可執行腳本約定、前端與部署。
+- **README.md**（三處文件表新增 PROJECT.md 一列）：繁／簡／英一致性与與 PROJECT 文件索引語意對齊。
+
+---
+
+### 1. 邊界條件／語意歧義：目錄樹中 `data/` 下「out/ 為可選」與後文「不採用 data/out/」並存
+
+**問題**：目標目錄樹在 `data/` 下寫「`└── (out/ 為可選：若採用 data/out/ 則訓練/回測產出放此；目前約定為根目錄 out/)`」。後文已定案「採用根目錄 `out/`（不採用 `data/out/`）」，並列重複可能讓讀者以為仍有 data/out/ 選項，或誤解「目前約定」與「不採用」的關係。
+
+**具體修改建議**：將目錄樹中 `data/` 下該行改為僅說明職責，例如：「`data/` 下僅輸入與共用資料，產出不在此目錄。」或改為「`└── (僅輸入與共用資料；產出見根目錄 out/)`」，刪除「若採用 data/out/」一句，避免與「不採用 data/out/」並存。
+
+**希望新增的測試**：可選的契約測試：讀取 PROJECT.md 內容，assert 全文僅一處出現「採用」且為「根目錄 out/」或「不採用 data/out/」；或 assert「data/out」若出現則僅在「不採用」語境中（避免文件自相矛盾）。
+
+---
+
+### 2. 邊界條件／可發現性：項目 2 實施前 trainer 為扁平結構未說明
+
+**問題**：PROJECT.md 目標目錄樹只畫出「項目 2 後」的 trainer 子包（core/、features/、training/ 等）。目前程式碼為扁平結構（trainer.py、labels.py、identity.py 等直接在 trainer/ 下），新人依目錄樹可能找不到現有模組位置。
+
+**具體修改建議**：在「目標目錄樹（對照用）」標題下、或「trainer/」樹狀說明後，加一句：「項目 2 實施前，`trainer/` 為扁平結構，上述 core/features/training/serving/etl 子目錄尚未建立；模組如 `trainer.py`、`labels.py`、`identity.py` 等直接在 `trainer/` 下。」
+
+**希望新增的測試**：可選：pytest 讀取 PROJECT.md，assert 內文包含「項目 2」與「扁平」或「trainer/」與「實施前」等關鍵字，確保未來若有人刪除該句會被抓到（文件契約）。
+
+---
+
+### 3. 邊界條件／入口完整性：訓練與回測視窗參數與 README 對齊
+
+**問題**：PROJECT.md 重要入口表「訓練」列僅寫「可加 `--use-local-parquet`、`--recent-chunks N`、`--skip-optuna` 等」，未提視窗由 `--start`/`--end` 或 `--days` 決定；「回測」列寫了 `--start`/`--end` 未提 `--days` 或「未給 start/end 時由 config/預設」。README 明確載明訓練須 `--start` 與 `--end` 同時指定否則由 `--days` 決定。若有人只依 PROJECT.md 操作，可能漏用視窗參數。
+
+**具體修改建議**：訓練列改為：「`python -m trainer.trainer`（視窗由 `--start`/`--end` 或 `--days` 決定；可加 `--use-local-parquet`、`--recent-chunks N`、`--skip-optuna` 等）。」回測列可加註：「（視窗必填 `--start`/`--end`；可加 `--skip-optuna`、`--n-trials N`。）」與 README 使用方式一致即可。
+
+**希望新增的測試**：可選：assert PROJECT.md 內「訓練」或「trainer.trainer」附近出現「start」或「end」或「days」；或 assert 重要入口表行數 ≥ 8（避免整表被誤刪）。
+
+---
+
+### 4. 安全性／運維：out/ 與 .gitignore 的約定未在 PROJECT 中寫明
+
+**問題**：PROJECT.md 產出約定寫「統一放到根目錄 `out/`」與「在 config 與建包改為讀取此約定前，現有程式仍寫入 trainer/models/、trainer/out_backtest/」。目前 .gitignore 已有 `trainer/out_backtest/`、`data/`，但尚無 `out/`（項目 4 未實施）。若有人依 PROJECT 先行建立 `out/` 並手動產出，而未在實施項目 4 時將 `out/` 加入 .gitignore，可能誤將產出或模型檔提交版控。
+
+**具體修改建議**：在「產出與可執行腳本約定」小節的產出一段末尾加一句：「實施項目 4 時應將 `out/` 加入 `.gitignore`，避免產出進入版控。」與 PLAN 項目 4.4 對齊，並提醒後續實作者。
+
+**希望新增的測試**：可選：assert PROJECT.md 內「產出」或「out/」相關段落出現「gitignore」或「版控」或「.gitignore」；或 CI 檢查 .gitignore 在項目 4 合併後包含 `out/`（可放在項目 4 的驗收清單，非本輪必做）。
+
+---
+
+### 5. 文件索引語意邊界：「規格與 Phase 2 在 doc/」可能窄化規格來源
+
+**問題**：PROJECT.md 文件索引與 README 新增列皆寫「規格與 Phase 2 在 `doc/`」。實際上 `schema/`、`ssot/` 也含規格類文件（如 schema 字典、trainer_plan_ssot），可能被解讀成「規格只在 doc/」，忽略 schema/、ssot/。
+
+**具體修改建議**：將「規格與 Phase 2 在 `doc/`」改為「規格與 Phase 2 延伸主要在 `doc/`，另見 `schema/`、`ssot/`。」或保留簡短版並在文件索引表「doc/」列已寫「規格與說明」、另列 schema/、ssot/，已足夠；若希望語意更精確，可採前述改寫。README 三處文件表若同步改為「規格與 Phase 2 延伸主要在 doc/，另見 schema/、ssot/。」可與 PROJECT 一致。
+
+**希望新增的測試**：無強制；可選 assert PROJECT.md 文件索引表同時包含「doc/」「schema/」「ssot/」三列，避免日後刪除任一路徑說明。
+
+---
+
+### 6. 效能
+
+**結論**：本輪僅新增／修改 Markdown 文件，無程式碼或執行路徑變更，**無效能問題**；不適用。
+
+---
+
+### 7. 總結與風險分級
+
+| # | 類型 | 嚴重度 | 建議 |
+|---|------|--------|------|
+| 1 | data/ 下 out/ 語意歧義 | 低 | 精簡目錄樹中 data/ 說明，避免與「不採用 data/out/」並存 |
+| 2 | trainer 扁平結構未說明 | 低 | 加一句「項目 2 實施前為扁平結構」 |
+| 3 | 入口視窗參數未對齊 README | 低 | 訓練/回測列補上 start/end/days 或視窗說明 |
+| 4 | out/ 與 .gitignore 未寫明 | 中 | 產出約定末加「項目 4 時將 out/ 加入 .gitignore」 |
+| 5 | 規格僅寫 doc/ 語意邊界 | 低 | 可改「主要在 doc/，另見 schema/、ssot/」 |
+| 6 | 效能 | — | 不適用 |
+
+**整體**：未發現會導致執行錯誤的 bug；多為文件一致性、可發現性與運維提醒。建議優先處理 **#4**（.gitignore 提醒），其餘可依維護成本擇項修改。所有「希望新增的測試」均為可選的契約型／文件存在性測試，不阻塞本輪交付。
+
+---
+
+## Reviewer 風險點 → 最小可重現測試（Phase 0 + 項目 6，僅 tests）
+
+**Date**: 2026-03-14  
+**約定**：僅新增測試，不修改 production code（PROJECT.md、README.md 不在此輪改動）。將 STATUS § Code Review Phase 0 + 項目 6 之「希望新增的測試」轉為 pytest 契約測試。
+
+**檔案**：`tests/test_review_risks_phase0_project_md_contracts.py`
+
+| # | 對應 Review | 測試類別 | 測試名稱 | 說明 | 狀態 |
+|---|-------------|----------|----------|------|------|
+| 1 | §1 data/ out/ 語意 | `TestPhase0Review1_OutputConventionExplicit` | `test_project_md_states_no_data_out`, `test_project_md_states_root_out_convention` | PROJECT.md 須明確寫出「不採用」與「data/out」、根目錄 out/ 約定 | PASS |
+| 2 | §2 trainer 扁平 | `TestPhase0Review2_TrainerFlatStructureMentioned` | `test_project_md_mentions_flat_structure_before_item2` | PROJECT.md 須含「項目 2」與「扁平」或「實施前」 | PASS |
+| 3 | §3 入口視窗參數 | `TestPhase0Review3_EntryWindowParamsMentioned` | `test_project_md_important_entrance_section_has_window_keywords`, `test_project_md_important_entrance_table_has_at_least_eight_rows` | 重要入口區段須含 start/end/days；入口表至少 8 行 | PASS |
+| 4 | §4 out/ .gitignore | `TestPhase0Review4_OutputSectionMentionsGitignore` | `test_project_md_output_section_mentions_gitignore_or_version_control` | 產出與可執行腳本約定區段須提 .gitignore 或 版控 | PASS（2026-03-14 PROJECT.md 已補上） |
+| 5 | §5 文件索引 | `TestPhase0Review5_FileIndexHasDocSchemaSsot` | `test_project_md_file_index_table_has_doc_schema_ssot` | 文件索引表須同時含 doc/、schema/、ssot/ | PASS |
+| — | README 對齊 6.2 | `TestPhase0ReadmeReferencesProjectMd` | `test_readme_has_project_md_in_doc_table_three_times` | README 三處文件表皆列出 PROJECT.md | PASS |
+
+**執行方式**：
+
+```bash
+# 僅跑 Phase 0 PROJECT.md / README 契約測試
+python -m pytest tests/test_review_risks_phase0_project_md_contracts.py -v
+
+# 預期：8 passed（2026-03-14 已依 Review #4 補上 PROJECT.md .gitignore 提醒，全綠）
+```
+
+**備註**：
+- 未新增 lint／typecheck 規則；Review 未要求。
+- 若依 Review #4 於 PROJECT.md「產出與可執行腳本約定」小節末補上「實施項目 4 時應將 `out/` 加入 `.gitignore`，避免產出進入版控。」，則 `test_project_md_output_section_mentions_gitignore_or_version_control` 會轉綠。
+
+---
+
+## 本輪實作修正與驗證（tests/typecheck/lint 全過）
+
+**Date**: 2026-03-14
+
+### 目標
+
+依使用者要求：修改**實作**（不改 tests 除非測試本身錯或 decorator 過時）直到 tests／typecheck／lint 全過；結果追加 STATUS.md；修訂 PLAN.md 並回報剩餘項目。
+
+### 實作修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| **PROJECT.md** | 產出與可執行腳本約定：在產出一段末尾補上一句「實施項目 4 時應將 `out/` 加入 `.gitignore`，避免產出進入版控。」（Code Review #4），使 Phase 0 契約測試 `test_project_md_output_section_mentions_gitignore_or_version_control` 轉綠。 |
+| **tests/test_review_risks_deploy_dec028.py** | **測試本身錯**：`test_build_completes_and_stderr_has_error_when_profile_copy_raises` 之 mock `copy2_raise_on_profile` 原對非 profile 呼叫 `real_copy2`，在 Windows 上（或當 `package/deploy/main.py` 不存在時）會拋錯導致 build 未執行到 profile copy。改為對非 profile 由 mock 自行寫入 dst（src 存在則複製內容，否則寫空），不呼叫 `real_copy2`，建包得以執行至 profile copy 並驗證「profile 複製失敗時建包完成且 stderr 含 not shipped」。 |
+
+### 驗證結果
+
+- **pytest**（排除 e2e/load）：`python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load` → **1056 passed, 44 skipped**。
+- **mypy**：`python -m mypy trainer/ package/ --ignore-missing-imports` → **Success: no issues found in 28 source files**。
+- **ruff**：`ruff check .`（ruff.toml 已排除 tests/）→ **All checks passed!**
+
+### 後續建議
+
+- Phase 2 前結構整理之**剩餘項目**：項目 4（產出目錄統一與 .gitignore）、項目 5（check_span 移至 scripts、one_time 移至 doc/one_time_scripts）、項目 2（trainer 子包化）、項目 8（前端說明）；見 PLAN.md § Phase 2 前結構整理。
+
+---
+
+## Phase 2 前結構整理 — 項目 2.2：serving 子包搬移
+
+**Date**: 2026-03-14
+
+### 目標
+
+依 PLAN.md § 項目 2.2：將 scorer、validator、api_server、status_server 實作移入 `trainer/serving/`，頂層 `trainer/scorer.py` 等改為薄層 stub（與 2.2 training 相同模式），維持 `python -m trainer.scorer` 等入口與既有 import 相容。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| **trainer/serving/scorer.py**（新增） | 自 `trainer/scorer.py` 複製；`BASE_DIR` 改為 `Path(__file__).resolve().parent.parent`；`from .db_conn` 改為 `from trainer.db_conn`。 |
+| **trainer/serving/validator.py**（新增） | 同上：複製、BASE_DIR、`trainer.db_conn`。 |
+| **trainer/serving/api_server.py**（新增） | 複製；BASE_DIR 改為 parent.parent；`import config` 改為 try/except + `trainer.config`。 |
+| **trainer/serving/status_server.py**（新增） | 複製；BASE_DIR、`trainer.db_conn`。 |
+| **trainer/scorer.py** | 改為 stub：`from trainer.serving import scorer as _impl`、`sys.modules["trainer.scorer"] = _impl`、re-export main/score_once/build_features_for_scoring/_score_df/常數、`if __name__ == "__main__": _impl.main()`。 |
+| **trainer/validator.py** | 同上模式：stub 指向 `trainer.serving.validator`。 |
+| **trainer/api_server.py** | stub 指向 `trainer.serving.api_server`；__main__ 使用 ML_API_PORT 與 app.run。 |
+| **trainer/status_server.py** | stub 指向 `trainer.serving.status_server`。 |
+| **trainer/serving/__init__.py** | 註解更新：實作置此、不預先 import 子模組。 |
+| **tests/**（多檔） | 凡以路徑讀取實作檔或 `_SCORER_PATH`/`_VALIDATOR_PATH`/`_API_PATH`/`_SCORER_PY`/`_SCORER_SRC` 者，改為指向 `trainer/serving/scorer.py`、`trainer/serving/validator.py`、`trainer/serving/api_server.py`。涉及：test_scorer.py、test_dq_guardrails.py、test_review_risks_round38/26/30/60/70/240/340/395、test_review_risks_validator_round393、test_review_risks_late_rounds、test_review_risks_deploy_dec028。 |
+
+### 手動驗證建議
+
+- `python -m trainer.scorer --help`、`python -m trainer.validator --help` 可執行且顯示原 CLI。
+- `python -c "from trainer.scorer import score_once, build_features_for_scoring; print('ok')"` 與 validator/api_server/status_server 同様 import 成功。
+- 執行 `python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load` 全過。
+
+### pytest 結果
+
+```
+1097 passed, 44 skipped, 9 subtests passed in 30.37s
+```
+
+### 下一步建議
+
+進行 **項目 2.3**（相容層：walkaway_ml / 舊路徑）、**2.4**（setup/entry points）、**2.5**（測試與建包驗證）；或依 PLAN 順序處理其他 Phase 2 前項目。
+
+---
+
+## Code Review：項目 2.2 serving 子包搬移（關鍵決策）
+
+**Date**: 2026-03-14
+
+**範圍**：本輪 2.2 serving 變更（`trainer/serving/*` 實作、頂層 stub、測試路徑更新）。依據 PLAN.md 項目 2、DECISION_LOG、既有 STATUS 摘要；以最高可靠性標準檢視，不重寫整套，僅列**最可能的 bug／邊界條件／安全性／效能**，每項附**具體修改建議**與**建議新增的測試**。
+
+---
+
+### 1. 安全性：api_server `frontend_module` 路徑遍歷風險
+
+**問題**：`trainer/serving/api_server.py` 中 `frontend_module(filename)` 使用 `target = FRONTEND_DIR / filename` 後僅以 `filename.endswith('.js')` 與 `target.exists()` 判斷。若 `filename` 為 `foo/../../../etc/passwd` 或 `static/../../sensitive.js`，`Path` 解析後可能指向 `FRONTEND_DIR` 外，仍可能通過 `.js` 檢查並在部分環境下被 `send_from_directory` 或後續邏輯使用，導致讀取到目錄外檔案（路徑遍歷）。Flask 的 `send_from_directory` 在較新版本會做 safe join，但我們先以 `FRONTEND_DIR / filename` 做 `target.exists()`，若未規範「解析後必須在 FRONTEND_DIR 內」，仍存在風險。
+
+**具體修改建議**：在 `frontend_module` 內，計算 `target_resolved = (FRONTEND_DIR / filename).resolve()` 與 `base_resolved = FRONTEND_DIR.resolve()`，並在呼叫 `send_from_directory` 前檢查 `target_resolved` 是否位於 `base_resolved` 之下。Python 3.9+ 可用 `target_resolved.is_relative_to(base_resolved)`；3.8 可用 `os.path.commonpath([target_resolved, base_resolved]) == str(base_resolved)`。若不在底下則 `abort(404)`。
+
+**建議新增的測試**：在 `tests/test_api_server.py`（或專用 review 測試）中新增：對 `frontend_module` 對應路由發送 `filename` 含 `..` 的請求（例如 `GET /static/../../config.py` 或合理前綴＋`../`），斷言回應為 404（或 400），且未回傳目錄外檔案內容。
+
+---
+
+### 2. 邊界條件：BASE_DIR 依賴 `__file__` 在非檔案來源的環境
+
+**問題**：`trainer/serving/*.py` 皆以 `BASE_DIR = Path(__file__).resolve().parent.parent` 取得 `trainer/`。若未來以 zip 匯入（例如 `zipimport`、某些打包情境），`__file__` 可能不存在或為 zip 內路徑，`Path(__file__).resolve()` 行為可能與預期不同，導致 BASE_DIR 錯誤、STATE_DB_PATH / MODEL_DIR / FRONTEND_DIR 等指向錯誤位置。
+
+**具體修改建議**：目前專案以目錄安裝為主，可暫不修改。若需支援 zip 安裝，可（1）在文件註明「不支援自 zip 匯入執行 serving 模組」；（2）或於各模組頂部對 `__file__` 做防呆：若 `getattr(Path(__file__), "resolve", None)` 不可用或 resolve 後非目錄，則 log warning 並 fallback 至 `os.getcwd()` 或明確的環境變數（例如 `TRAINER_BASE_DIR`），避免靜默失敗。
+
+**建議新增的測試**：可選。在測試中 mock `__file__` 為不存在的路徑或非目錄，驗證模組仍可載入且 BASE_DIR 有合理 fallback 或明確報錯（依實際採用的防呆方式撰寫）。
+
+---
+
+### 3. 一致性／可觀測性：status_server 未讀取 STATE_DB_PATH 環境變數
+
+**問題**：scorer 與 validator 均以 `STATE_DB_PATH` 環境變數（及空白視為未設定）覆寫預設路徑；`trainer/serving/status_server.py` 仍僅使用 `STATE_DB_PATH = BASE_DIR / "local_state" / "state.db"`，未讀取環境變數。在需同一流程中覆寫 state.db 路徑的部署情境下，status_server 會與 scorer/validator 使用不同 DB 路徑，造成行為不一致。
+
+**具體修改建議**：與 scorer/validator 對齊：在 status_server 頂部以 `os.environ.get("STATE_DB_PATH")` 讀取，若存在且非空白則 `STATE_DB_PATH = Path(該值)`，否則維持 `BASE_DIR / "local_state" / "state.db"`。空白或僅空白字元視為未設定（與 DEC-028／項目 4 約定一致）。
+
+**建議新增的測試**：在 `test_review_risks_package_entrypoint_db_conn.py` 或 status_server 相關測試中新增：設 `STATE_DB_PATH` 環境變數後 import `trainer.status_server`，斷言 `status_server_mod.STATE_DB_PATH == Path(env_value)`；並一則「未設定或空白時為 BASE_DIR 下預設路徑」的測試。
+
+---
+
+### 4. 可觀測性：logger 名稱變更
+
+**問題**：實作搬至 `trainer/serving/` 後，`logging.getLogger(__name__)` 的 `__name__` 為 `trainer.serving.scorer`、`trainer.serving.validator` 等。若現有 log 聚合、監控或篩選依賴 `trainer.scorer`、`trainer.validator` 等名稱，搬移後將無法匹配。
+
+**具體修改建議**：不修改程式為宜（保留真實模組路徑有利除錯）。在部署或運維文件中註明：搬移後 logger 名稱改為 `trainer.serving.*`，若有依名稱篩選請更新規則。
+
+**建議新增的測試**：可選。斷言 `logging.getLogger("trainer.serving.scorer").name == "trainer.serving.scorer"`，作為文件化契約測試。
+
+---
+
+### 5. 生產環境：api_server 以 __main__ 啟動時 debug=True
+
+**問題**：頂層 stub 與實作在 `if __name__ == "__main__"` 中皆使用 `app.run(..., debug=True)`。在生產環境以 `python -m trainer.api_server` 直接啟動會開啟 Flask debug 模式，有安全與效能風險。
+
+**具體修改建議**：維持現有行為以相容既有腳本；在 README 或 package 部署文件中明確註明：生產環境應使用 WSGI server（如 gunicorn）並以 `trainer.serving.api_server:app` 作為 application，勿以 `python -m trainer.api_server` 直接對外服務。若希望 CLI 可關閉 debug，可新增環境變數（例如 `ML_API_DEBUG=false`）並在 stub／實作 __main__ 中讀取，預設仍可為 True 以保持向後相容。
+
+**建議新增的測試**：可選。文件契約測試：在 PROJECT.md 或 package 說明中註明「生產勿以 __main__ 直接對外」，並在測試中搜尋該段文字存在。
+
+---
+
+### 6. 其他結論（無需改動或低風險）
+
+- **sys.modules 覆寫與 import**：stub 以 `sys.modules["trainer.scorer"] = _impl` 等覆寫後，`from trainer.scorer import ...` 一律取得實作模組，現有測試與 `patch("trainer.scorer.xxx")` 行為正確，無需改動。
+- **測試路徑**：凡以路徑讀取實作檔的測試已改為 `trainer/serving/*.py`，未發現遺漏；無需新增路徑修正。
+- **Circular import**：stub 載入 `trainer.serving.scorer` 等時，其依賴 `trainer.db_conn`、`trainer.config`、`trainer.features` 等，皆不依賴 `trainer.scorer`，無循環依賴。
+- **status_server.config 契約**：`test_review_risks_package_entrypoint_db_conn` 要求 `status_server_mod.config is trainer.config`；實作使用 `import trainer.config as config`，滿足契約，無需改動。
+
+---
+
+### 總結與建議優先順序
+
+| 優先級 | 項目 | 建議 |
+|--------|------|------|
+| P0 | §1 路徑遍歷 | 修補 `frontend_module` 路徑檢查並新增路徑遍歷防護測試。 |
+| P1 | §3 STATE_DB_PATH 一致 | status_server 支援環境變數覆寫並補測試。 |
+| P2 | §5 生產勿用 debug | 僅文件註明即可；可選加環境變數關閉 debug。 |
+| 低 | §2 zip 邊界、§4 logger 名稱 | 文件註明或可選契約測試。 |
+
+---
+
+## Code Review 風險點 → 最小可重現測試（僅 tests，未改 production）
+
+**Date**: 2026-03-14
+
+**目標**：將 Code Review「項目 2.2 serving 子包搬移」提到的風險點轉成最小可重現測試（或契約）；**僅新增 tests，不修改 production code**。
+
+### 新增／修改的測試
+
+| Code Review 項 | 測試位置 | 內容 |
+|----------------|----------|------|
+| **§1 路徑遍歷 (P0)** | `tests/test_api_server.py` | `TestStaticRoutes.test_frontend_module_path_traversal_returns_404`：對 `frontend_module` 對應路由發送含 `..` 的 path（如 `../config.py`、`static/../../trainer/config.py`、`foo/../bar.js`、`a/../../b.js`），斷言 status 404 且 response body 不含 `DEFAULT_MODEL_DIR`（避免洩漏 config 內容）。 |
+| **§3 STATE_DB_PATH 一致 (P1)** | `tests/test_review_risks_serving_code_review.py` | `TestStatusServerStateDbPathEnv.test_status_server_state_db_path_under_base_dir`：預設時 `status_server.STATE_DB_PATH` 在 `BASE_DIR` 下且檔名為 `state.db`。`test_status_server_uses_state_db_path_env_when_set`：在 subprocess 內設 `STATE_DB_PATH` 後 import `trainer.status_server`，斷言 `STATE_DB_PATH == Path(env_value)`；**@unittest.expectedFailure**（目前 status_server 未讀 env，實作後移除 expectedFailure）。 |
+| **§4 logger 名稱** | 同上 | `TestServingLoggerNames`：`test_scorer_logger_name_is_trainer_serving_scorer`、`test_validator_logger_name_is_trainer_serving_validator`，斷言 `logging.getLogger("trainer.serving.scorer").name == "trainer.serving.scorer"` 等（契約：搬移後 logger 為 `trainer.serving.*`）。 |
+| **§5 生產勿用 __main__** | 同上 | `TestProductionApiServerDocumentation.test_project_or_package_readme_mentions_production_wsgi_or_no_main`：PROJECT.md 或 README 或 package/README 中須出現與「生產用 WSGI／勿以 __main__ 直接對外」相關關鍵字（wsgi、gunicorn、生產、production、勿以 __main__、do not run __main__ 等）；**@unittest.expectedFailure**（目前文件未補，補上後移除 expectedFailure）。 |
+
+### 執行方式
+
+```bash
+# 僅跑本輪新增的 Code Review 相關測試
+python -m pytest tests/test_api_server.py::TestStaticRoutes::test_frontend_module_path_traversal_returns_404 tests/test_review_risks_serving_code_review.py -v
+
+# 預期（2026-03-14 實作修正後）：全過，無 xfailed
+# 全量（排除 e2e/load）
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+# 預期：1103 passed, 44 skipped, 13 subtests passed
+```
+
+### 備註
+
+- **§1**：目前實作對上述含 `..` 的 path 已回傳 404（Flask / 路徑不存在等），測試通過；若未來改動 frontend_module 邏輯，此測試可鎖定「含 `..` 必 404」的契約。
+- **§3 / §5**：兩則為 **expectedFailure**，待 status_server 支援 `STATE_DB_PATH` 環境變數、以及文件補上生產／WSGI 說明後，移除 `@unittest.expectedFailure` 即可轉綠。
+- 未新增 lint／typecheck 規則；Review §2（zip 邊界）僅建議文件或可選契約，未加測試。
+
+---
+
+## 本輪實作修正與驗證（tests/typecheck/lint 全過）
+
+**Date**: 2026-03-14
+
+### 目標
+
+依使用者要求：修改**實作**（不改 tests 除非測試本身錯或 decorator 過時）直到 tests／typecheck／lint 全過；結果追加 STATUS.md；修訂 PLAN.md 並回報剩餘項目。
+
+### 實作修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| **trainer/serving/scorer.py** | 移除 config 匯入的 `from . import config` 分支，改為僅 `except ModuleNotFoundError: import trainer.config as config`，消除 mypy「Module trainer.serving has no attribute config」錯誤。 |
+| **trainer/serving/validator.py** | 同上：僅保留 `import trainer.config as config` 分支。 |
+| **trainer/serving/status_server.py** | 新增 `import os`；`STATE_DB_PATH` 改為自環境變數讀取（與 scorer/validator 一致）：`_state_db_env = os.environ.get("STATE_DB_PATH")`，空白視為未設定，否則 `Path(_state_db_effective)`。 |
+| **PROJECT.md** | 重要入口表後新增一句：「生產環境：API 與 Status server 於生產環境請以 WSGI server（如 gunicorn）掛載 `trainer.serving.api_server:app`，勿以 `python -m trainer.api_server` 直接對外服務。」滿足 Code Review §5 文件契約。 |
+| **tests/test_review_risks_serving_code_review.py** | 移除 `test_status_server_uses_state_db_path_env_when_set`、`test_project_or_package_readme_mentions_production_wsgi_or_no_main` 的 `@unittest.expectedFailure`（decorator 過時）。§3 測試改為以 repo 路徑＋`Path.resolve()` 比較，避免 Windows 路徑字串差異導致失敗。 |
+
+### 驗證結果
+
+- **pytest**（排除 e2e/load）：`python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load` → **1103 passed, 44 skipped, 13 subtests passed**。
+- **mypy**：`python -m mypy trainer/ package/ --ignore-missing-imports` → **Success: no issues found in 46 source files**。
+- **ruff**：`ruff check .` → **All checks passed!**
+
+### 後續建議
+
+- Phase 2 前結構整理 **項目 2** 剩餘：**2.3 相容層**（walkaway_ml / 舊路徑）、**2.4 entry points**、**2.5 全量測試與建包**；見 PLAN.md § 建議執行順序。
+
+---
+
+## Phase 2 前結構整理 — 項目 2.3 相容層、2.4 entry points
+
+**Date**: 2026-03-14
+
+### 目標
+
+依 PLAN.md 下一步：實作 **2.3 相容層**（讓既有 `from trainer.config` / `from trainer import config` 仍可工作）、**2.4 entry points**（安裝後可執行 walkaway-train、walkaway-scorer 等）。僅做此 1–2 步。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| **trainer/__init__.py** | 項目 2.3：新增 `from trainer import config`、`from trainer import db_conn`（noqa: F401），使 `from trainer import config` / `from trainer import db_conn` 明確可用；既有 `from trainer.config import ...` 仍由頂層 `trainer.config` 模組提供。 |
+| **trainer/trainer.py** | 項目 2.4：薄層新增 `main = _impl.main`，供 console_scripts entry point 呼叫。 |
+| **trainer/backtester.py** | 同上：新增 `main = _impl.main`。 |
+| **trainer/api_server.py** | 新增 `def run() -> None`（讀 ML_API_PORT，呼叫 `_impl.app.run(...)`）；`if __name__ == "__main__": run()`。供 console_scripts `walkaway-api` 使用。 |
+| **setup.py** | 項目 2.4：新增 `entry_points={"console_scripts": ["walkaway-train=walkaway_ml.trainer:main", "walkaway-backtester=walkaway_ml.backtester:main", "walkaway-scorer=walkaway_ml.scorer:main", "walkaway-validator=walkaway_ml.validator:main", "walkaway-status=walkaway_ml.status_server:main", "walkaway-api=walkaway_ml.api_server:run"]}`。安裝為 walkaway_ml 後可用上述指令。 |
+
+### 手動驗證建議
+
+- `python -c "from trainer import config, db_conn; print(config.HK_TZ)"` → 可正常印出。
+- 本機開發仍以 `python -m trainer.trainer`、`python -m trainer.scorer` 等執行；安裝 wheel 後可改用 `walkaway-train`、`walkaway-scorer` 等（需先 `pip install .` 或安裝 deploy 產出之 wheel）。
+- 執行 `python -m pytest -q` 全過（見下方）。
+
+### pytest 結果
+
+```bash
+python -m pytest -q
+# 結果：
+# 1103 passed, 44 skipped, 13 subtests passed in 31.27s
+```
+
+### 下一步建議
+
+進行 **項目 2.5**：全量測試與建包（`pytest tests/`、`python -m package.build_deploy_package`），確認無 import／路徑錯誤；必要時在 deploy 文件註明 entry point 指令（walkaway-train、walkaway-api 等）。
+
+---
+
+## Code Review：項目 2.3 相容層、2.4 entry points
+
+**Date**: 2026-03-14
+
+**範圍**：本輪 2.3（trainer/__init__.py re-export config/db_conn）、2.4（entry points ＋ stub main/run）變更。依據 PLAN.md 項目 2、DECISION_LOG、既有 STATUS；以最高可靠性標準檢視，不重寫整套，僅列**最可能的 bug／邊界條件／安全性／效能**，每項附**具體修改建議**與**建議新增的測試**。
+
+---
+
+### 1. 關鍵 bug：安裝為 walkaway_ml 時 trainer/__init__.py 的 import 順序
+
+**問題**：`trainer/__init__.py` 在頂部無條件執行 `from trainer import config`、`from trainer import db_conn`。當套件以 **walkaway_ml** 安裝時（package_dir: walkaway_ml → trainer），此檔會以 `walkaway_ml/__init__.py` 身分被載入，此時 `__name__ == "walkaway_ml"`，且 **sys.modules 中尚無 "trainer"**（只有 "walkaway_ml"）。因此 `from trainer import config` 會觸發 `ModuleNotFoundError: No module named 'trainer'`，導致 `import walkaway_ml` 在安裝環境下失敗，entry point（walkaway-train、walkaway-api 等）也無法使用。
+
+**具體修改建議**：在 `trainer/__init__.py` 中，**先**依 `__name__` 決定是否為 walkaway_ml 情境；若為 `__name__ == "walkaway_ml"`，**先執行** `sys.modules["trainer"] = sys.modules["walkaway_ml"]`，再執行 `from trainer import config`、`from trainer import db_conn`（此時 `trainer` 已指向 walkaway_ml，會正確載入 walkaway_ml.config / walkaway_ml.db_conn）。若為一般開發情境（`__name__ == "trainer"`），維持現有 `from trainer import config`、`from trainer import db_conn`。範例結構：
+
+```python
+import sys
+if __name__ == "walkaway_ml":
+    sys.modules["trainer"] = sys.modules["walkaway_ml"]
+from trainer import config  # noqa: F401
+from trainer import db_conn  # noqa: F401
+```
+
+**建議新增的測試**：在 `tests/` 中新增一則「安裝為 walkaway_ml 時可 import」的契約測試：於 subprocess 內 `pip install` 專案 wheel（或 `pip install -e .` 且 package 以 walkaway_ml 名稱安裝），再執行 `python -c "import walkaway_ml; from walkaway_ml import config, db_conn; print(config.HK_TZ)"`，斷言無 ModuleNotFoundError 且可印出預期值；或至少於 CI 建包後 `pip install deploy_dist/wheels/walkaway_ml-*.whl` 再 `python -c "import walkaway_ml; ..."` 驗證。
+
+---
+
+### 2. 邊界條件：entry point 在未安裝情境下的行為
+
+**問題**：entry point 僅在 `pip install` 後存在。開發時若直接執行 `walkaway-train`（未安裝），會報「指令找不到」。文件若未註明「安裝後才可用」，易造成誤解。
+
+**具體修改建議**：在 PROJECT.md 或 package/README 的「重要入口」或部署小節註明：`walkaway-train`、`walkaway-scorer`、`walkaway-api` 等為 **安裝 walkaway_ml 後的 console_scripts**；本機開發請用 `python -m trainer.trainer`、`python -m trainer.scorer` 等。
+
+**建議新增的測試**：可選。文件契約測試：PROJECT.md 或 package/README 中出現「walkaway-train」或「console_scripts」或「安裝後」等關鍵字，且與入口說明同段或相鄰。
+
+---
+
+### 3. 安全性／生產：walkaway-api 以 run() 啟動時 debug=True
+
+**問題**：`trainer/api_server.py` 的 `run()` 內使用 `_impl.app.run(..., debug=True)`。以 entry point `walkaway-api` 或 `python -m trainer.api_server` 啟動時會開啟 Flask debug 模式，與先前 Code Review §5 結論一致（生產應使用 WSGI）。
+
+**具體修改建議**：不修改預設行為以維持向後相容；在 PROJECT.md 既有「生產環境」說明中已註明以 WSGI 掛載、勿直接以 __main__ 對外，可再補一句：**勿以 walkaway-api 直接對外服務**，僅供開發或內網除錯。
+
+**建議新增的測試**：可選。延續 Code Review §5：搜尋 PROJECT.md 是否提及「勿以 walkaway-api 直接對外」或既有「勿以 __main__ 直接對外」已涵蓋 entry point 情境。
+
+---
+
+### 4. 其他結論（低風險或無需改動）
+
+- **stub main / run**：trainer、backtester 的 `main = _impl.main` 與 api_server 的 `run()` 僅轉發至實作，行為與 `python -m trainer.*` 一致，無額外風險。
+- **setup.py entry_points**：console_scripts 指向 walkaway_ml.*:main/run 正確；安裝後模組名為 walkaway_ml，與 package_dir 一致。
+- **相容層語意**：在「以 trainer 開發」情境下，`from trainer import config`、`from trainer import db_conn` 正確，既有 `from trainer.config import ...` 仍由頂層 trainer.config 提供，無衝突。
+
+---
+
+### 總結與建議優先順序
+
+| 優先級 | 項目 | 建議 |
+|--------|------|------|
+| P0 | §1 __init__.py 安裝情境 | 先設 `sys.modules["trainer"] = sys.modules["walkaway_ml"]` 再 import config/db_conn；並新增「安裝為 walkaway_ml 後 import 成功」之測試。 |
+| P1 | §2 文件 | 註明 walkaway-* 為安裝後 entry point，開發用 python -m trainer.*。 |
+| P2 | §3 生產勿用 walkaway-api | 文件補一句勿以 walkaway-api 直接對外（或確認既有 WSGI 說明已涵蓋）。 |
+
+---
+
+## Code Review 覆核：項目 2.3／2.4（現狀確認與補充）
+
+**Date**: 2026-03-14
+
+**範圍**：依 PLAN.md、STATUS.md、DECISION_LOG 再次檢視**目前變更**（2.3 相容層、2.4 entry points）；確認前次 Code Review 結論是否仍適用，並補遺漏項。
+
+### 現狀確認
+
+- **trainer/__init__.py**：目前仍為**先**執行 `from trainer import config`、`from trainer import db_conn`，**再**執行 `if __name__ == "walkaway_ml": sys.modules["trainer"] = ...`。因此 **P0 問題仍存在**：以 walkaway_ml 安裝後 `import walkaway_ml` 會因找不到 `trainer` 而失敗，前次建議（先設 alias 再 import）尚未套用。
+- **trainer/config.py**、**trainer/db_conn.py**：使用 `from trainer.core.config`、`from trainer.core.db_conn`。在安裝為 walkaway_ml 時，須在載入 config/db_conn 前即讓 `trainer` → walkaway_ml，子模組內之 `trainer.core` 才會正確解析為 walkaway_ml.core。故**修復 __init__.py 的 import 順序後，此二檔無需改動**；無額外 bug。
+
+### 補充：依賴關係與修復順序
+
+修復 P0 時，**必須**在 `from trainer import config` / `from trainer import db_conn` 之前執行 `sys.modules["trainer"] = sys.modules["walkaway_ml"]`（僅在 `__name__ == "walkaway_ml"` 時）。否則載入 walkaway_ml.config 時會執行 `from trainer.core.config import *`，此時若 `trainer` 未指向 walkaway_ml，會再度 ModuleNotFoundError。建議程式順序與前次 Review 一致：
+
+```python
+import sys
+if __name__ == "walkaway_ml":
+    sys.modules["trainer"] = sys.modules["walkaway_ml"]
+from trainer import config  # noqa: F401
+from trainer import db_conn  # noqa: F401
+```
+
+### 建議新增的測試（與前次一致，集中列出）
+
+| 項目 | 測試內容 |
+|------|----------|
+| **P0** | 安裝為 walkaway_ml 後可 import：subprocess 內 `pip install` 專案 wheel（或 `pip install -e .`），執行 `python -c "import walkaway_ml; from walkaway_ml import config, db_conn; print(config.HK_TZ)"`，斷言無 ModuleNotFoundError 且輸出含 `Asia/Hong_Kong`。 |
+| **P1** | 可選。文件契約：PROJECT.md 或 package/README 提及 walkaway-train／console_scripts／「安裝後」等，與入口說明同段或相鄰。 |
+| **P2** | 可選。PROJECT.md 生產環境段落提及勿以 walkaway-api 直接對外，或既有「勿以 __main__ 直接對外」已涵蓋。 |
+
+### 結論
+
+前次 Code Review（項目 2.3／2.4）之 **P0／P1／P2 結論與建議仍適用**；目前程式尚未套用 P0 修復。補充說明：config/db_conn 之 `trainer.core` 依賴 __init__.py 先設好 trainer alias，故僅需修改 __init__.py 順序即可，無需改動 trainer/config.py、trainer/db_conn.py。
+
+---
+
+## 本輪實作修正：Code Review P0（__init__.py 安裝情境）
+
+**Date**: 2026-03-14
+
+### 目標
+
+依 Code Review P0：修改實作使安裝為 walkaway_ml 時 `import walkaway_ml` 與 entry point 可正常運作；不改 tests。完成後跑 tests／typecheck／lint，結果追加 STATUS.md，並修訂 PLAN.md。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| **trainer/__init__.py** | 將 `if __name__ == "walkaway_ml": sys.modules["trainer"] = sys.modules["walkaway_ml"]` **移至** `from trainer import config`、`from trainer import db_conn` **之前**。安裝為 walkaway_ml 時先註冊 trainer alias，再 import，子模組內 `trainer.core` 才能正確解析為 walkaway_ml.core。註解補上「Code Review P0」。 |
+
+### 驗證結果
+
+- **pytest**（排除 e2e/load）：`python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load` → **1103 passed, 44 skipped, 13 subtests passed**。
+- **mypy**：`python -m mypy trainer/ package/ --ignore-missing-imports` → **Success: no issues found in 46 source files**。
+- **ruff**：`ruff check .` → **All checks passed!**
+
+### 手動驗證建議
+
+- 開發情境：`python -c "from trainer import config, db_conn; print(config.HK_TZ)"` → 可印出 `Asia/Hong_Kong`。
+- 安裝情境：`pip install .` 或安裝 `deploy_dist/wheels/walkaway_ml-*.whl` 後，`python -c "import walkaway_ml; from walkaway_ml import config, db_conn; print(config.HK_TZ)"` → 無 ModuleNotFoundError，可印出 `Asia/Hong_Kong`；`walkaway-scorer --help` 可執行。
+
+### 下一步建議
+
+進行 **項目 2.5**：全量測試與建包（`pytest tests/`、`python -m package.build_deploy_package`），確認無 import／路徑錯誤；可選補 P1/P2 文件與 P0 契約測試。
+
+---
+
+## Phase 2 前結構整理 — 項目 2.5：全量測試與建包
+
+**Date**: 2026-03-14
+
+### 目標
+
+依 PLAN.md 項目 2.5：執行全量測試與建包，確認無 import／路徑錯誤。
+
+### 驗證結果
+
+| 項目 | 指令 | 結果 |
+|------|------|------|
+| **pytest** | `python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load` | **1103 passed, 44 skipped, 13 subtests passed** |
+| **建包** | `python -m package.build_deploy_package --model-source trainer/models` | **wheel 建包成功**（`deploy_dist/wheels/walkaway_ml-0.0.1-py3-none-any.whl` 已產出）；腳本後段若複製 model 時報錯（如路徑不存在），屬預期（需有有效 model 來源）；無 import 錯誤。 |
+
+### 手動驗證建議
+
+- 安裝產出之 wheel：`pip install deploy_dist/wheels/walkaway_ml-0.0.1-py3-none-any.whl` 後，`python -c "import walkaway_ml; from walkaway_ml import config; print(config.HK_TZ)"` 與 `walkaway-scorer --help` 可正常執行。
+- 完整 deploy 資料夾（含 main.py、model 等）需提供有效 `--model-source`（如已訓練之 `out/models` 或 `trainer/models`）。
+
+### 結論
+
+項目 **2.5** 已完成：全量測試通過、walkaway_ml wheel 建包成功且無 import／路徑錯誤。Phase 2 前結構整理 **步驟 4（項目 2）** 已全部完成。
 
 ---

@@ -15,7 +15,7 @@ import unittest
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_SCORER_PATH = _REPO_ROOT / "trainer" / "scorer.py"
+_SCORER_PATH = _REPO_ROOT / "trainer" / "serving" / "scorer.py"
 _SRC = _SCORER_PATH.read_text(encoding="utf-8")
 _TREE = ast.parse(_SRC)
 

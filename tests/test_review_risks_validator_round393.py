@@ -19,7 +19,7 @@ import trainer.validator as validator_mod
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_VALIDATOR_PATH = _REPO_ROOT / "trainer" / "validator.py"
+_VALIDATOR_PATH = _REPO_ROOT / "trainer" / "serving" / "validator.py"
 _VALIDATOR_SRC = _VALIDATOR_PATH.read_text(encoding="utf-8")
 
 

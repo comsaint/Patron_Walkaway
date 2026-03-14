@@ -102,7 +102,7 @@ todos:
     content: "Optuna HPO 階段 train/valid 抽樣：僅設 OPTUNA_HPO_SAMPLE_ROWS；valid 與 train 同比例；stratified 抽樣、random_state=42；最終訓練仍用全量。見「Optuna HPO 階段 train/valid 抽樣（計畫）」一節。"
     status: completed
   - id: track-b-lookback-vectorization
-    content: "Track Human Lookback 向量化（critical）：Phase 1 解封（trainer lookback_hours=None）與 Step 6 tqdm 進度條已完成。Phase 2：compute_loss_streak lookback 已以 numba two-pointer 實作並通過 Review #1/#2；compute_run_boundary lookback 已以 numba 單 pass 實作，並完成 Code Review 修補（wager NaN 填 0、run_break_min_ns 上限）。見「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。"
+    content: "Track Human Lookback 向量化（critical）：Phase 1 解封（trainer lookback_hours=None）與 Step 6 tqdm 進度條已完成。Phase 2：compute_loss_streak lookback 已以 numba two-pointer 實作並通過 Review #1/#2；compute_run_boundary lookback 已以 numba 單 pass 實作，並完成 Code Review 修補（wager NaN 填 0、run_break_min_ns 上限）。2026-03-13 本輪完成 numba 時間單位修正（_datetime_to_ns_int64），lookback/run_boundary 全測試通過。見「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。"
     status: completed
   - id: canonical-step3-schema-check-oom
     content: "Canonical mapping Step 3：Schema 檢查改為僅讀 metadata，避免 build_canonical_links_and_dummy_from_duckdb 整份讀入 session parquet 導致 OOM。見「Canonical mapping Step 3 Schema 檢查改為僅讀 metadata（避免 OOM）」一節。"
@@ -129,8 +129,8 @@ todos:
     content: "CLI for month-end-only player_profile：profile_schedule、ETL --month-end、auto_build --month-end、測試、文件；見「CLI for month-end-only player_profile」一節。"
     status: completed
   - id: step8-duckdb-stats
-    content: "Step 8 Feature Screening：DuckDB 算統計量（std/可選 corr）避免 X.std() 全量 OOM；並檢視其他類似全量統計是否可一併優化。見「Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）」一節。"
-    status: pending
+    content: "Step 8 Feature Screening：DuckDB 算統計量（std/可選 corr）避免 X.std() 全量 OOM；並檢視其他類似全量統計是否可一併優化。見「Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）」一節。Phase 1 已完成：compute_column_std_duckdb（path/df、僅數值欄）、screen_features 使用、trainer 傳 train_path/train_df；Review 風險測試已加入（STATUS 2026-03-13）。Phase 2：compute_correlation_matrix_duckdb helper 與 Review §1 row 長度修補已完成（2026-03-13）；接線 screen_features 為可選。"
+    status: completed
   - id: package-entrypoint-db-conn-imports
     content: "套件 entrypoint + 相對匯入（Option A）：統一以 package 方式執行、db_conn 等僅用相對匯入、無 try/except 包名猜測；需 ClickHouse 時若無法取得 client 即 raise。見「套件 entrypoint 與 db_conn 相對匯入（Option A）」一節。"
     status: completed
@@ -189,18 +189,157 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 16 | **取得 bet 後排除 unrated 再送模型** | completed | 下方「取得 bet 後排除 unrated 再送模型（計畫）」一節。Round 402/403 實作並通過 R402 審查測試。 |
 | 17 | **OOM 預檢查** | completed | Step 6 以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC；已於 Round 210/211/212 實作並通過 Review 修復。規格見下方「OOM 預檢查：Step 5 後以 Chunk 1 實測大小決定 NEG_SAMPLE_FRAC」一節。 |
 | 18 | **Round 222 Review production 補強** | completed | 四項均已實作：項目 1（Track LLM 失敗 warning + track_llm_degraded）、項目 2（canonical_ids=[]）、項目 3（use_local_parquet 從 CLI 傳入）、項目 4（candidates 型別防呆）。Round 406 完成項目 1、3 與 R222 測試契約更新。規格見下方「Round 222 Review production 補強（實作計畫）」一節。 |
-| 19 | **Track Human Lookback 向量化 + Step 6 進度條** | completed | Phase 1 解封與 Step 6 tqdm 已完成。Phase 2 **compute_loss_streak** 與 **compute_run_boundary** lookback 均已以 numba 單 pass 實作；Code Review 修補（wager NaN 填 0、run_break_min_ns 上限）已完成。見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。 |
+| 19 | **Track Human Lookback 向量化 + Step 6 進度條** | completed | Phase 1 解封與 Step 6 tqdm 已完成。Phase 2 **compute_loss_streak** 與 **compute_run_boundary** lookback 均已以 numba 單 pass 實作；Code Review 修補（wager NaN 填 0、run_break_min_ns 上限）已完成。2026-03-13 本輪完成 **numba 時間單位修正**（`_datetime_to_ns_int64` 確保傳入 kernel 為奈秒），lookback/run_boundary 相關 7 則測試全過。見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 doc/track_human_lookback_vectorization_plan.md。 |
 | 20 | **Deploy DEC-028 修補（player_profile 打包／canonical 持久化）** | completed | DEPLOY_PLAN §8、DECISION_LOG DEC-028。Production 修補：scorer DATA_DIR 空/空白視為未設定；build 時 profile 複製失敗 try/except 建包仍完成；deploy main 遲 import 加 noqa: E402；scorer _DATA_DIR 型別註解。tests/test_review_risks_deploy_dec028.py 7/7 通過；tests/typecheck/lint 全過。見 STATUS.md「DEC-028 本輪實作修正與驗證」。 |
-| 21 | **Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）** | pending | 以 DuckDB 對 train（Parquet 或註冊 DataFrame）算 stddev_pop 取得零變異篩選，避免 pandas X.std() 產生 ~17.6 GiB 暫存陣列；可選將相關矩陣改為 DuckDB CORR；其餘類似全量統計一併檢視。見「Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）」一節。 |
+| 21 | **Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）** | completed | Phase 1：compute_column_std_duckdb（path/df、僅數值欄）、screen_features 優先使用、trainer Step 8 傳 train_path/train_df；Review 風險測試已加入（STATUS 2026-03-13）。Phase 2：compute_correlation_matrix_duckdb helper 與 Review §1 row 長度修補已完成（2026-03-13）；接線 screen_features 為可選。見「Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）」一節。 |
 | 22 | **CLI for month-end-only player_profile** | completed | profile_schedule、ETL `--month-end`／`--snapshot-interval-days`、auto_build_player_profile `--month-end`、測試、文件；Lint E402 已修正（import 移至頂部）。見「CLI for month-end-only player_profile」一節與 STATUS.md 本輪。 |
 
-**Plan 狀態摘要**：上表 1～19 項均為 **completed**（第 18 項於 Round 406 完成項目 1、3；第 19 項 Track Human Lookback 向量化於本輪完成 Phase 2 compute_run_boundary numba 與 Code Review 修補 wager NaN／run_break_min_ns 上限）。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
+**Plan 狀態摘要**：上表 1～19 項均為 **completed**（第 18 項於 Round 406 完成項目 1、3；第 19 項 Track Human Lookback 向量化已含 Phase 2 numba 與 Code Review 修補，2026-03-13 完成 numba 時間單位修正 _datetime_to_ns_int64，lookback/run_boundary 全測試通過）。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
 
-**剩餘項目**：上表 1～20 項與 **canonical-step3-schema-check-oom**、**config-consolidation**（DEC-027）、**progress-bars-long-steps**、**training-config-recommender** 均已完成。DEC-027 與 progress-bars Code Review 修補已通過對應測試；training-config-recommender 已實作並完成 Code Review 修補；**項目 20** Deploy DEC-028 修補已完成；**項目 22** CLI for month-end-only player_profile 已實作完成（含 Lint E402 修正），tests/typecheck/lint 全過。目前 **pending**：**項目 21** Step 8 DuckDB 算統計量（見上方 todos 與下方對應一節）。
+**剩餘項目**：上表 1～22 項與 **canonical-step3-schema-check-oom**、**config-consolidation**（DEC-027）、**progress-bars-long-steps**、**training-config-recommender** 均已完成。**項目 21** Step 8 DuckDB 算統計量 Phase 1 與 Phase 2 helper（含 Review §1 row 長度修補）已於 2026-03-13 完成。**Populate casino_player_id** 已完成（見下方「Populate casino_player_id in ML API」一節狀態 2026-03-12）。目前 **無 pending 項目**；可選／後續見下方各節（如 Step 8 將 DuckDB CORR 接線至 screen_features、Canonical 生產增量更新 Phase 2、table_hc 啟用等）。
 
 **建議實作順序**：可選／後續見下方各節（Step 7 out-of-core 排序、Optuna early stop 等）。
 
 **可選／後續**（非阻斷）：(1) OOM 預檢查已於 Round 210/211/212 實作，視為 **completed**（見上表項目 17）。(2) Round 222 Review production 補強見上表項目 18 與下方「Round 222 Review production 補強（實作計畫）」一節。(3) **項目 19** Track Human Lookback 向量化已完成（見下方「Track Human Lookback 向量化與 Step 6 進度條（計畫）」一節與 `doc/track_human_lookback_vectorization_plan.md`）。
+
+---
+
+## Phase 2 前結構整理（修訂計畫）
+
+> **範圍**：項目 2（trainer 子包化）、4（產出目錄統一）、5（根目錄與腳本）、6（文件與結構說明）、8（前端說明）。先定整體結構再動目錄；其餘（大檔拆分、測試合併 round 等）留後續。
+
+### 原則
+
+- **先定整體結構再動目錄**：先寫清楚目標目錄與職責（PROJECT.md／README），再搬檔案與改 import。
+- **產出**：PROJECT.md（或 README 更新）＝整體結構的 SSOT，後續 2、4、5、8 都對齊這份。
+- **Phase 0 與 項目 6**：已於 2026-03-14 完成（PROJECT.md 新增、README 文件表更新、Code Review #4 產出約定補 .gitignore、契約測試全綠、DEC-028 測試 mock 修正；見 STATUS.md）。
+
+### 目標結構（對照用）
+
+```
+Patron_Walkaway/
+├── PROJECT.md              # 或 README 內「專案結構」一節（Phase 0）
+├── README.md
+├── pyproject.toml, setup.py, requirements.txt, ruff.toml
+├── data/                   # 輸入資料（可選）、共用資料
+│   └── out/               # 或單獨 out/：訓練/回測/model 產出（項目 4）
+├── out/                    # 若不用 data/out，則根目錄 out/
+│   ├── models/
+│   ├── backtest/
+│   └── ...
+├── doc/
+│   └── one_time_scripts/   # 原 scripts/one_time 搬入（項目 5）
+├── schema/, ssot/, .cursor/plans/
+├── scripts/                # 僅可重複執行腳本（項目 5）
+│   └── check_span.py      # 自根目錄移入
+├── package/
+├── tests/
+│   └── (現有結構暫不變，或後續再分 unit/integration/review_risks)
+└── trainer/                # 項目 2：底下分子包
+    ├── __init__.py
+    ├── core/               # config, db_conn, schema_io, duckdb_schema
+    ├── features/           # 原 features 相關 + feature_spec/
+    ├── training/           # trainer, time_fold, backtester
+    ├── serving/            # scorer, validator, api_server, status_server
+    ├── etl/                # etl_player_profile, profile_schedule
+    ├── scripts/            # 既有 trainer/scripts（analyze, auto_build, recommend_config, ...）
+    └── frontend/           # 保留；項目 8 在文件註明「可選、部署可僅含 API」
+```
+
+（要採用 `data/out/` 還是根目錄 `out/` 在 Phase 0 就定案並寫進 PROJECT.md。）
+
+---
+
+### Phase 0：整體結構定義（先做）
+
+1. **新增或擴充 PROJECT.md（或 README 專案結構區塊）**，內容包含：**目標目錄樹**（見上）、**各頂層目錄職責**、**重要入口**（訓練、回測、scorer、validator、API、建包指令）、**文件索引**（doc/、.cursor/plans/、schema/、ssot/ 的用途與主要檔案）。
+2. **在計畫裡寫明「產出與可執行腳本」的約定**：產出統一放到 `out/`（或 `data/out/`）；預設 model 目錄、backtest 目錄的約定；可重複執行的腳本在 `scripts/`；一次性／歷史腳本在 `doc/one_time_scripts/` 或 `archive/`。
+
+---
+
+### 項目 6：文件與結構說明（緊接 Phase 0）
+
+| 步驟 | 內容 |
+|------|------|
+| 6.1 | 完成 PROJECT.md（或 README 的「專案結構」「目錄職責」「入口與文件索引」）。 |
+| 6.2 | 在 README 或 PROJECT.md 中加一兩句：詳細計畫與狀態在 `.cursor/plans/`（PLAN.md、STATUS.md），規格與 Phase 2 在 `doc/`。 |
+| 6.3 | 若已有 CONTRIBUTING.md，補上「改動目錄或新增模組時請同步更新 PROJECT.md」。 |
+
+**依賴**：無。**產出**：整體結構與文件位置清楚，供 2、4、5、8 對齊。
+
+---
+
+### 項目 4：產出目錄統一與 .gitignore
+
+| 步驟 | 內容 |
+|------|------|
+| 4.1 | 在專案根建立約定產出目錄（例如 `out/models/`、`out/backtest/`，或 `data/out/...`），與 Phase 0 一致。 |
+| 4.2 | 在 `config.py`（或對應設定處）將「預設 model 目錄、backtest 輸出目錄」改為指向該約定路徑（若目前寫死 `trainer/out_backtest/`、`trainer/models`，改為從 config 讀，預設值＝新路徑）。 |
+| 4.3 | 建包腳本（`package/build_deploy_package.py`）改為從 config 或環境變數讀取 model 目錄，不再依賴 `trainer/models` 等寫死路徑。 |
+| 4.4 | `.gitignore`：加入 `out/`（或 `data/out/`）、`trainer/out_backtest/`、`trainer/models/`、`trainer/models_90d_weak/` 等；若 `trainer/sample data/` 為可再生成或本機用，一併忽略或註明。 |
+| 4.5 | （可選）將現有 `trainer/out_backtest/`、`trainer/models_90d_weak/` 改為符號連結或遷移腳本指向新位置，或僅在文件註明「新產出請放到 out/，舊目錄不再使用」。 |
+
+**依賴**：Phase 0（路徑約定已在 PROJECT.md）。**產出**：產出集中、不進版控、建包用同一約定。
+
+---
+
+### 項目 5：根目錄與零散腳本
+
+| 步驟 | 內容 |
+|------|------|
+| 5.1 | `check_span.py`：自根目錄移至 `scripts/check_span.py`（或 `trainer/scripts/`）；若有引用或文件提到「根目錄 check_span」，一併改為 `scripts/check_span.py`。 |
+| 5.2 | `scripts/one_time/`：整目錄移至 `doc/one_time_scripts/`（或 `archive/one_time_patches/`）；原 `scripts/one_time/README.md` 內容併入 `doc/one_time_scripts/README.md`，說明「僅供參考、勿直接執行」。 |
+| 5.3 | 在 PROJECT.md／README 的 Scripts 小節註明：可執行腳本在 `scripts/`；歷史／一次性腳本在 `doc/one_time_scripts/`。 |
+
+**依賴**：無（可與 4 並行）。**產出**：根目錄乾淨、腳本職責分明。
+
+---
+
+### 項目 2：trainer/ 子包化（core / features / training / serving / etl）
+
+| 步驟 | 內容 |
+|------|------|
+| 2.1 | 在 `trainer/` 下建立子包目錄：`core/`、`features/`、`training/`、`serving/`、`etl/`；各目錄含 `__init__.py`。 |
+| 2.2 | **搬移模組**（建議順序）：**core/**：config、db_conn、schema_io、duckdb_schema（注意：其他模組大量 from trainer.config，需改為 from trainer.core.config 或保留 trainer 頂層 re-export）。**etl/**：etl_player_profile、profile_schedule。**features/**：現有 features.py 整檔暫不移檔名，可先搬進 `trainer/features/` 成 `trainer/features/features.py`，並把 `feature_spec/` 移入 `trainer/features/feature_spec/`；或保留 `trainer/features.py` 僅在頂層 re-export。**training/**：trainer、time_fold、backtester。**serving/**：scorer、validator、api_server、status_server。 |
+| 2.3 | **相容層**：在 `trainer/__init__.py`（或頂層）做 re-export，讓既有 `from trainer.config import ...` 仍可工作。 |
+| 2.4 | 更新 `setup.py`／`pyproject.toml`：若需列出 subpackages（如 walkaway_ml.core、walkaway_ml.training），補上；entry points 改為 `python -m trainer.training.trainer` 或保留舊入口並在薄層模組轉發。 |
+| 2.5 | 全量測試與建包：`pytest tests/`、`python -m package.build_deploy_package`，確認無 import 錯誤與路徑錯誤。 |
+
+**依賴**：Phase 0 ＋ 項目 6（結構已定義）。**產出**：trainer 邊界清楚、後續可再拆大檔。
+
+---
+
+### 項目 8：前端與靜態資源（文件面）
+
+| 步驟 | 內容 |
+|------|------|
+| 8.1 | 在 README 或 PROJECT.md 的「架構」或「目錄職責」中註明：`trainer/frontend/` 為儀表板 SPA，**可選**；部署包可僅含 API（無前端），若需儀表板再一併打包。 |
+| 8.2 | 在 `package/README.md` 或 deploy 說明中註明：預設建包是否含 frontend、若含則靜態檔放在何處。 |
+| 8.3 | （可選）註明：若未來前端擴充（例如監控 UI），可考慮將 `trainer/frontend/` 提到根目錄 `frontend/`，建包時再產出到 deploy 目錄。 |
+
+**依賴**：無。**產出**：前端角色與部署方式寫清楚，避免誤解。
+
+---
+
+### 建議執行順序（總表）
+
+| 步驟 | 內容 | 對應項目 | 狀態 |
+|------|------|----------|------|
+| 0 | 定義目標目錄樹與職責，寫入 PROJECT.md（或 README） | 整體結構 | **done**（2026-03-14） |
+| 1 | 完成 PROJECT.md ＋ 文件索引 ＋ 入口說明 | **6** | **done**（2026-03-14） |
+| 2 | 產出目錄約定、config／建包改用新路徑、.gitignore | **4** | **done**（2026-03-14；Code Review §1 空白 env 視為未設定已實作） |
+| 3 | check_span 移至 scripts；one_time 移至 doc/one_time_scripts；README 說明 | **5** | **done**（2026-03-14；Code Review §1 check_span CWD/空結果防呆已實作） |
+| 4 | trainer 子包建立與模組搬移、相容層、setup/entry points、測試與建包 | **2** | **done**（2026-03-14；2.1～2.5 已完成：含 2.5 全量測試與 wheel 建包） |
+| 5 | README/package 註明 frontend 可選與未來可提層 | **8** | **done**（2026-03-14；Code Review §1 多語同步＋項目 8 契約測試全過） |
+
+**Phase 2 前結構整理剩餘項目**：**無**。步驟 0～5 均已完成。項目 2（2.1～2.5）已於 2026-03-14 完成：含 2.5 全量測試（pytest 1103 passed）與 walkaway_ml wheel 建包成功。
+
+**2026-03-14 驗證**：`pytest tests/`（1103 passed）、`python -m package.build_deploy_package`（wheel 建包成功）；項目 2 已全部完成。
+
+### 風險與注意
+
+- **項目 2**：import 與 entry point 多，建議在分支上做、每搬一子包就跑一輪 pytest 與建包；re-export 可讓其他 repo 或舊腳本暫時不壞。
+- **項目 4**：改預設路徑後，本機既有 `trainer/out_backtest/`、`trainer/models/` 需手動遷移或符號連結，或在 README 寫一筆「遷移說明」。
 
 ---
 

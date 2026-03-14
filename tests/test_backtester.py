@@ -18,7 +18,7 @@ import pandas as pd
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_BACKTESTER_PATH = _REPO_ROOT / "trainer" / "backtester.py"
+_BACKTESTER_PATH = _REPO_ROOT / "trainer" / "training" / "backtester.py"
 _SRC = _BACKTESTER_PATH.read_text(encoding="utf-8")
 _TREE = ast.parse(_SRC)
 

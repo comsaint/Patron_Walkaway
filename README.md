@@ -28,9 +28,10 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 ```
 
 - **`trainer/`** — `config.py`、`db_conn.py`、`trainer.py`、`identity.py`、`labels.py`、`features.py`、`time_fold.py`、`backtester.py`、`scorer.py`、`validator.py`、`api_server.py`、`status_server.py`，以及 ETL 與腳本。
-- **`trainer/frontend/`** — 儀表板 SPA（地圖、告警、驗證趨勢、人流）。
+- **`trainer/frontend/`** — 儀表板 SPA（地圖、告警、驗證趨勢、人流），**可選**；部署包可僅含 API（無前端），若需儀表板再自 repo 另行部署或建包時一併帶出。詳見 PROJECT.md「前端與部署」。
 - **`tests/`** — 單元與整合測試（pytest）。
 - **`doc/`** — 規格、發現、API 協定。**`schema/`** — 資料表/欄位字典與 DQ 提示。
+- **Scripts**：可執行腳本在 **`scripts/`**（含 `check_span.py`）；歷史／一次性腳本在 **`doc/one_time_scripts/`**（僅供參考、勿直接執行）。詳見 PROJECT.md。
 
 ### 開發狀態（對應 `.cursor/plans/`）
 
@@ -135,6 +136,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `doc/PLAN_VS_TRAINER_COMPARISON.md` | 計畫與實作對照 |
 | `doc/TRAINER_ISSUES.md` | 已知問題與備註 |
 | `.cursor/plans/` | 實作計畫（PLAN.md）、狀態（STATUS.md）、決策紀錄（DECISION_LOG.md） |
+| **PROJECT.md** | 專案結構與目錄職責 SSOT；詳細計畫與狀態以 `.cursor/plans/` 為準，規格與 Phase 2 在 `doc/`。 |
 
 ### 產物（trainer 輸出）
 
@@ -175,7 +177,7 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 ```
 
 - **`trainer/`** — `config.py`、`db_conn.py`、`trainer.py`、`identity.py`、`labels.py`、`features.py`、`time_fold.py`、`backtester.py`、`scorer.py`、`validator.py`、`api_server.py`、`status_server.py`，以及 ETL 与脚本。
-- **`trainer/frontend/`** — 仪表盘 SPA（地图、告警、验证趋势、人流）。
+- **`trainer/frontend/`** — 仪表盘 SPA（地图、告警、验证趋势、人流），**可选**；部署包可仅含 API（无前端），若需仪表板再自 repo 另行部署或建包时一并带出。详见 PROJECT.md「前端与部署」。
 - **`tests/`** — 单元与集成测试（pytest）。
 - **`doc/`** — 规格、发现、API 协议。**`schema/`** — 表/字段字典与 DQ 提示。
 
@@ -270,6 +272,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `doc/PLAN_VS_TRAINER_COMPARISON.md` | 计划与实现对照 |
 | `doc/TRAINER_ISSUES.md` | 已知问题与备注 |
 | `.cursor/plans/` | 实现计划（PLAN.md）、状态（STATUS.md）、决策记录（DECISION_LOG.md） |
+| **PROJECT.md** | 项目结构与目录职责 SSOT；详细计划与状态以 `.cursor/plans/` 为准，规格与 Phase 2 在 `doc/`。 |
 
 ### 产物（trainer 输出）
 
@@ -310,7 +313,7 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 ```
 
 - **`trainer/`** — `config.py`, `db_conn.py`, `trainer.py`, `identity.py`, `labels.py`, `features.py`, `time_fold.py`, `backtester.py`, `scorer.py`, `validator.py`, `api_server.py`, `status_server.py`, ETL and scripts.
-- **`trainer/frontend/`** — Dashboard SPA (map, alerts, validation trends, headcount).
+- **`trainer/frontend/`** — Dashboard SPA (map, alerts, validation trends, headcount), **optional**; deploy package can be API-only (no frontend). If you need the dashboard, serve it from the repo or include it in the build. See PROJECT.md § 前端與部署.
 - **`tests/`** — Unit and integration tests (pytest).
 - **`doc/`** — Specs, findings, API protocol. **`schema/`** — Table/column dictionary and DQ hints.
 
@@ -505,6 +508,7 @@ mypy trainer/ --ignore-missing-imports
 | `doc/PLAN_VS_TRAINER_COMPARISON.md` | Plan vs implementation comparison |
 | `doc/TRAINER_ISSUES.md` | Known issues / notes |
 | `.cursor/plans/` | Implementation plan (PLAN.md), status (STATUS.md), decision log (DECISION_LOG.md) |
+| **PROJECT.md** | Project structure and directory responsibilities (SSOT); detailed plan and status in `.cursor/plans/`, specs and Phase 2 in `doc/`. |
 
 ---
 

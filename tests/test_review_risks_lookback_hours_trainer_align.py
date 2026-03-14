@@ -204,7 +204,7 @@ class TestLookbackPathSemantics(unittest.TestCase):
         p1 = _bets([(0, 1, "LOSE"), (30, 2, "LOSE"), (60, 3, "LOSE")], canonical_id="P1")
         p2 = _bets([(0, 4, "LOSE"), (60, 5, "LOSE")], canonical_id="P2")
         df = pd.concat([p1, p2], ignore_index=True)
-        with patch("trainer.features._streak_lookback_numba", None):
+        with patch("trainer.features.features._streak_lookback_numba", None):
             r_fallback = compute_loss_streak(df, cutoff_time=None, lookback_hours=1.0)
         r_numba = compute_loss_streak(df, cutoff_time=None, lookback_hours=1.0)
         pd.testing.assert_series_equal(r_fallback, r_numba, check_names=False, check_index=True)
@@ -222,7 +222,7 @@ class TestPhase2LookbackReviewRisks(unittest.TestCase):
         """Review #1: 同一 canonical_id 內一筆 NaT、一筆正常時間，numba 路徑與 fallback 路徑輸出一致。目前 numba 路徑未處理 NaT，導致輸出不一致。"""
         df = _bets([(0, 1, "LOSE"), (30, 2, "LOSE")], canonical_id="P1")
         df.loc[df.index[1], "payout_complete_dtm"] = pd.NaT
-        with patch("trainer.features._streak_lookback_numba", None):
+        with patch("trainer.features.features._streak_lookback_numba", None):
             r_fallback = compute_loss_streak(df, cutoff_time=None, lookback_hours=1.0)
         r_numba = compute_loss_streak(df, cutoff_time=None, lookback_hours=1.0)
         self.assertEqual(len(r_numba), len(df), "result length must match input")
@@ -284,7 +284,7 @@ class TestPhase2LookbackReviewRisks(unittest.TestCase):
         p1 = _bets([(0, 1, "LOSE"), (30, 2, "LOSE")], canonical_id="P1")
         p2 = _bets([(0, 3, "WIN"), (60, 4, "LOSE")], canonical_id="P2")
         df = pd.concat([p1, p2], ignore_index=True)
-        with patch("trainer.features._streak_lookback_numba", None):
+        with patch("trainer.features.features._streak_lookback_numba", None):
             r_full_fallback = compute_loss_streak(df, cutoff_time=None, lookback_hours=1.0)
         r_numba = compute_loss_streak(df, cutoff_time=None, lookback_hours=1.0)
         pd.testing.assert_series_equal(r_full_fallback, r_numba, check_names=False, check_index=True)
@@ -296,7 +296,7 @@ class TestPhase2LookbackReviewRisks(unittest.TestCase):
         p2 = _bets([(0, 3, "WIN")], canonical_id="B")
         p3 = _bets([(0, 4, "LOSE"), (20, 5, "LOSE"), (40, 6, "WIN")], canonical_id="C")
         df = pd.concat([p1, p2, p3], ignore_index=True)
-        with patch("trainer.features._streak_lookback_numba", None):
+        with patch("trainer.features.features._streak_lookback_numba", None):
             r_fallback = compute_loss_streak(df, cutoff_time=None, lookback_hours=1.0)
         r_numba = compute_loss_streak(df, cutoff_time=None, lookback_hours=1.0)
         self.assertTrue(r_numba.index.equals(df.index))
@@ -307,7 +307,7 @@ class TestPhase2LookbackReviewRisks(unittest.TestCase):
     def test_review7_no_numba_result_equals_with_numba(self):
         """Review #7: 無 numba 時不拋錯，結果與有 numba 時一致。"""
         df = _bets([(0, 1, "LOSE"), (30, 2, "WIN"), (60, 3, "LOSE")])
-        with patch("trainer.features._streak_lookback_numba", None):
+        with patch("trainer.features.features._streak_lookback_numba", None):
             r_no_numba = compute_loss_streak(df, cutoff_time=None, lookback_hours=1.0)
         r_with_numba = compute_loss_streak(df, cutoff_time=None, lookback_hours=1.0)
         pd.testing.assert_series_equal(r_no_numba, r_with_numba, check_names=False, check_index=True)

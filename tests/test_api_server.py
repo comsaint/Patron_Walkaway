@@ -87,6 +87,20 @@ class TestStaticRoutes(unittest.TestCase):
         resp = self.client.get("/definitely_not_there_12345.js")
         self.assertEqual(resp.status_code, 404)
 
+    def test_frontend_module_path_traversal_returns_404(self):
+        """Code Review §1 (P0): Paths containing '..' must return 404 to prevent path traversal."""
+        for path in ("../config.py", "static/../../trainer/config.py", "foo/../bar.js", "a/../../b.js"):
+            with self.subTest(path=path):
+                resp = self.client.get("/" + path)
+                self.assertEqual(resp.status_code, 404, f"Path {path!r} must return 404")
+                # Ensure we do not leak content from outside FRONTEND_DIR (e.g. config)
+                if resp.data:
+                    self.assertNotIn(
+                        b"DEFAULT_MODEL_DIR",
+                        resp.data,
+                        "Must not serve trainer config content via path traversal",
+                    )
+
 
 class TestGetFloorStatus(unittest.TestCase):
     def setUp(self):

@@ -14,9 +14,9 @@ import unittest
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_VALIDATOR_PATH = _REPO_ROOT / "trainer" / "validator.py"
-_SCORER_PATH = _REPO_ROOT / "trainer" / "scorer.py"
-_TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
+_VALIDATOR_PATH = _REPO_ROOT / "trainer" / "serving" / "validator.py"
+_SCORER_PATH = _REPO_ROOT / "trainer" / "serving" / "scorer.py"
+_TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 
 _VALIDATOR_SRC = _VALIDATOR_PATH.read_text(encoding="utf-8")
 _SCORER_SRC = _SCORER_PATH.read_text(encoding="utf-8")

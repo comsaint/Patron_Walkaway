@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_SCORER_SRC = (_REPO_ROOT / "trainer" / "scorer.py").read_text(encoding="utf-8")
+_SCORER_SRC = (_REPO_ROOT / "trainer" / "serving" / "scorer.py").read_text(encoding="utf-8")
 _BUILD_SRC = (_REPO_ROOT / "package" / "build_deploy_package.py").read_text(encoding="utf-8")
 
 
@@ -117,12 +117,19 @@ class TestR028_4_BuildProfileCopyFailure(unittest.TestCase):
                 return True
             return real_exists(self)
 
-        real_copy2 = __import__("shutil").copy2
-
         def copy2_raise_on_profile(src, dst, *args, **kwargs):
             if str(dst).endswith("player_profile.parquet"):
                 raise OSError("simulated copy failure")
-            return real_copy2(src, dst, *args, **kwargs)
+            # For non-profile copies, write src -> dst so build continues (avoids real_copy2
+            # failing on Windows temp paths; also works when deploy files are missing in repo).
+            dst = Path(dst)
+            src = Path(src)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_file():
+                dst.write_bytes(src.read_bytes())
+            else:
+                dst.write_bytes(b"")
+            return dst
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

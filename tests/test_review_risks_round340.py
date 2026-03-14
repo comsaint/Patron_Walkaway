@@ -106,7 +106,7 @@ class TestR2320ApiScoreNumericValidation(unittest.TestCase):
     """R2320: /score should validate numeric feature value types before inference."""
 
     def test_api_score_should_contain_numeric_type_validation(self):
-        src = _read_text("trainer/api_server.py")
+        src = _read_text("trainer/serving/api_server.py")
         self.assertIn(
             "isinstance(v, (int, float, bool))",
             src,
@@ -119,7 +119,7 @@ class TestR2323PathTraversalGuard(unittest.TestCase):
     """R2323: frontend module route should use safe path join."""
 
     def test_frontend_module_should_use_safe_join(self):
-        src = _read_text("trainer/api_server.py")
+        src = _read_text("trainer/serving/api_server.py")
         self.assertIn(
             "safe_join",
             src,

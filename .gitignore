@@ -215,5 +215,8 @@ trainer/out_trainer/
 trainer/local_state/
 trainer/.data/
 trainer/out_backtest/
+trainer/models/
+trainer/models_90d_weak/
+out/
 deploy_dist/
 deploy_dist.zip

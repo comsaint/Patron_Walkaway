@@ -16,7 +16,7 @@ import re
 import unittest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
+_TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 _BACKTESTER_PATH = _REPO_ROOT / "trainer" / "backtester.py"
 
 _TRAINER_SRC = _TRAINER_PATH.read_text(encoding="utf-8")

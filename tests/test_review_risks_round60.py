@@ -14,9 +14,9 @@ import unittest
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
-_FEATURES_PATH = _REPO_ROOT / "trainer" / "features.py"
-_SCORER_PATH = _REPO_ROOT / "trainer" / "scorer.py"
+_TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
+_FEATURES_PATH = _REPO_ROOT / "trainer" / "features" / "features.py"  # 項目 2.2: 實作在 features 子包
+_SCORER_PATH = _REPO_ROOT / "trainer" / "serving" / "scorer.py"
 
 _TRAINER_SRC = _TRAINER_PATH.read_text(encoding="utf-8")
 _FEATURES_SRC = _FEATURES_PATH.read_text(encoding="utf-8")

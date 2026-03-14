@@ -15,7 +15,7 @@ from pathlib import Path
 import pandas as pd
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
+_TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 _SRC = _TRAINER_PATH.read_text(encoding="utf-8")
 _TREE = ast.parse(_SRC)
 

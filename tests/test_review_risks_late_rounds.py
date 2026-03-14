@@ -465,7 +465,7 @@ class TestR1902BacktesterArtifactPath(unittest.TestCase):
     """R1902: backtester should prefer model.pkl under single-model v10."""
 
     def test_backtester_loader_should_reference_model_pkl(self):
-        src = _read_text("trainer/backtester.py")
+        src = _read_text("trainer/training/backtester.py")
         self.assertIn(
             '"model.pkl"',
             src,
@@ -477,12 +477,12 @@ class TestR1903ScorerApiArtifactPath(unittest.TestCase):
     """R1903: scorer/api loader should prefer model.pkl under single-model v10."""
 
     def test_scorer_loader_should_reference_model_pkl(self):
-        src = _read_text("trainer/scorer.py")
+        src = _read_text("trainer/serving/scorer.py")
         self.assertIn('"model.pkl"', src, "scorer loader should read model.pkl in v10.")
 
     @pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")
     def test_api_loader_should_reference_model_pkl(self):
-        src = _read_text("trainer/api_server.py")
+        src = _read_text("trainer/serving/api_server.py")
         self.assertIn('"model.pkl"', src, "api loader should read model.pkl in v10.")
 
 
@@ -490,7 +490,7 @@ class TestR1904TrainerDocstringStale(unittest.TestCase):
     """R1904: trainer module doc should no longer describe dual-model artifacts."""
 
     def test_trainer_doc_should_not_mention_nonrated_model_pkl(self):
-        src = _read_text("trainer/trainer.py")
+        src = _read_text("trainer/training/trainer.py")
         head = "\n".join(src.splitlines()[:60]).lower()
         self.assertNotIn("nonrated_model.pkl", head)
 
@@ -587,7 +587,7 @@ class TestR1607BacktesterDocstringStale(unittest.TestCase):
     """R1607: backtester module docstring should reflect single-threshold mode."""
 
     def test_backtester_doc_should_not_claim_dual_2d_threshold_search(self):
-        src = _read_text("trainer/backtester.py").lower()
+        src = _read_text("trainer/training/backtester.py").lower()
         head = "\n".join(src.splitlines()[:25])
         self.assertNotIn("dual-model backtester", head)
         self.assertNotIn("2d threshold search", head)

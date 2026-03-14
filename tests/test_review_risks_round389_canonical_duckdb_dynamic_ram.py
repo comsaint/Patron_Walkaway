@@ -24,7 +24,7 @@ from trainer.trainer import (
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
+_TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 _TRAINER_SRC = _TRAINER_PATH.read_text(encoding="utf-8")
 
 
@@ -74,8 +74,9 @@ class TestR389_2_InvalidConfigTypeRaises(unittest.TestCase):
     def test_ram_fraction_string_raises(self):
         """When DUCKDB_RAM_FRACTION is a string, get_duckdb_memory_limit_bytes raises. DEC-027: budget from config."""
         import trainer.config as config
+        import trainer.core.config as core_config
 
-        with patch.object(config, "DUCKDB_RAM_FRACTION", "0.5"):
+        with patch.object(core_config, "DUCKDB_RAM_FRACTION", "0.5"):
             with self.assertRaises((TypeError, ValueError)):
                 config.get_duckdb_memory_limit_bytes("canonical_map", int(1e9))
 

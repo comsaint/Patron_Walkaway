@@ -32,9 +32,9 @@ import trainer.etl_player_profile as profile_mod
 import trainer.validator as validator_mod
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_SCORER_PATH = _REPO_ROOT / "trainer" / "scorer.py"
-_VALIDATOR_PATH = _REPO_ROOT / "trainer" / "validator.py"
-_TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
+_SCORER_PATH = _REPO_ROOT / "trainer" / "serving" / "scorer.py"
+_VALIDATOR_PATH = _REPO_ROOT / "trainer" / "serving" / "validator.py"
+_TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 _SCORER_POLL_SQL = (
     _REPO_ROOT / "trainer" / "scripts" / "scorer_poll_queries.sql"
 ).read_text(encoding="utf-8")

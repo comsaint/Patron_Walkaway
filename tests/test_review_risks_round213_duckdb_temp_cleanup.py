@@ -56,7 +56,9 @@ class TestR213Step7TempDirDocstringOrConfigMentionsSingleProcess(unittest.TestCa
             hasattr(config_mod, "STEP7_DUCKDB_TEMP_DIR"),
             "STEP7_DUCKDB_TEMP_DIR must exist in config",
         )
-        config_src = inspect.getsource(config_mod)
+        # After PLAN 項目 2.2, config implementation lives in trainer.core.config
+        import trainer.core.config as core_config
+        config_src = inspect.getsource(core_config)
         # Optional: comment or docstring near STEP7_DUCKDB_TEMP_DIR mentioning temp / spill / single process
         # We only require the constant exists; comment is optional for this test to pass
         self.assertIn("STEP7_DUCKDB_TEMP_DIR", config_src)

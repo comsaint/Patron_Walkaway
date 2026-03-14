@@ -16,7 +16,7 @@ from unittest.mock import patch
 import pandas as pd
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
+_TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 _CONFIG_PATH = _REPO_ROOT / "trainer" / "config.py"
 _SRC = _TRAINER_PATH.read_text(encoding="utf-8")
 _CONFIG_SRC = _CONFIG_PATH.read_text(encoding="utf-8")

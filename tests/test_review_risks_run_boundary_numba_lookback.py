@@ -61,7 +61,7 @@ class TestRunBoundaryLookbackWagerNanContract(unittest.TestCase):
     def test_wager_finite_numba_vs_python_fallback_parity(self):
         """同一輸入、wager 全為有限值時，numba 路徑與 Python fallback 四欄一致。"""
         df = _bets([(0, 1), (30, 2), (45, 3)], canonical_id="P1")
-        with patch("trainer.features._run_boundary_lookback_numba", None):
+        with patch("trainer.features.features._run_boundary_lookback_numba", None):
             result_fallback = compute_run_boundary(df, cutoff_time=None, lookback_hours=1.0)
         result_numba = compute_run_boundary(df, cutoff_time=None, lookback_hours=1.0)
         for col in ("run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far"):
@@ -91,7 +91,7 @@ class TestRunBoundaryLookbackRunBreakMinOverflowContract(unittest.TestCase):
     def test_run_break_min_huge_raises_value_error(self):
         """RUN_BREAK_MIN 設為極大值時，compute_run_boundary(..., lookback_hours=8) 應拋 ValueError 且訊息提及 RUN_BREAK_MIN 或範圍。"""
         df = _bets([(0, 1)], with_wager=True)
-        with patch("trainer.features.RUN_BREAK_MIN", 1e10):
+        with patch("trainer.features.features.RUN_BREAK_MIN", 1e10):  # 2.2: 實作在 features.features
             with self.assertRaises(ValueError) as ctx:
                 compute_run_boundary(df, cutoff_time=None, lookback_hours=8.0)
         msg = str(ctx.exception).lower()
@@ -125,7 +125,7 @@ class TestRunBoundaryLookbackNumbaVsPythonParity(unittest.TestCase):
         """單一 canonical_id、多筆 bet、含 wager、間隔涵蓋新 run 與同 run；numba 與 fallback 四欄一致。"""
         # 0, 20, 40, 100 min → gap 20,20,60；若 RUN_BREAK_MIN=30 則 run: 0,0,0,1
         df = _bets([(0, 1), (20, 2), (40, 3), (100, 4)], canonical_id="P1")
-        with patch("trainer.features._run_boundary_lookback_numba", None):
+        with patch("trainer.features.features._run_boundary_lookback_numba", None):
             result_fallback = compute_run_boundary(df, cutoff_time=None, lookback_hours=2.0)
         result_numba = compute_run_boundary(df, cutoff_time=None, lookback_hours=2.0)
         self._assert_four_columns_equal(result_fallback, result_numba, "single group 2h lookback")
@@ -135,7 +135,7 @@ class TestRunBoundaryLookbackNumbaVsPythonParity(unittest.TestCase):
         p1 = _bets([(0, 1), (10, 2), (20, 3)], canonical_id="P1")
         p2 = _bets([(0, 4), (60, 5)], canonical_id="P2")
         df = pd.concat([p1, p2], ignore_index=True)
-        with patch("trainer.features._run_boundary_lookback_numba", None):
+        with patch("trainer.features.features._run_boundary_lookback_numba", None):
             result_fallback = compute_run_boundary(df, cutoff_time=None, lookback_hours=2.0)
         result_numba = compute_run_boundary(df, cutoff_time=None, lookback_hours=2.0)
         self._assert_four_columns_equal(result_fallback, result_numba, "two groups 2h lookback")
@@ -143,7 +143,7 @@ class TestRunBoundaryLookbackNumbaVsPythonParity(unittest.TestCase):
     def test_no_wager_column_parity(self):
         """無 wager 欄時 numba 與 fallback 四欄一致（wager_sum_in_run_so_far 皆 0）。"""
         df = _bets([(0, 1), (15, 2)], with_wager=False)
-        with patch("trainer.features._run_boundary_lookback_numba", None):
+        with patch("trainer.features.features._run_boundary_lookback_numba", None):
             result_fallback = compute_run_boundary(df, cutoff_time=None, lookback_hours=1.0)
         result_numba = compute_run_boundary(df, cutoff_time=None, lookback_hours=1.0)
         self._assert_four_columns_equal(result_fallback, result_numba, "no wager column")

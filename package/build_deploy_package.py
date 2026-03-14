@@ -23,6 +23,7 @@ Usage (from repo root):
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -267,11 +268,19 @@ def main() -> int:
         default=REPO_ROOT / "deploy_dist",
         help="Output folder (default: ./deploy_dist)",
     )
+    # Treat empty or whitespace-only as unset (STATUS Code Review 項目 4 §1).
+    _model_dir_env = os.environ.get("MODEL_DIR")
+    _model_dir_effective = (
+        _model_dir_env.strip() if (_model_dir_env and _model_dir_env.strip()) else None
+    )
+    _default_model_source = (
+        Path(_model_dir_effective) if _model_dir_effective else (REPO_ROOT / "out" / "models")
+    )
     parser.add_argument(
         "--model-source",
         type=Path,
-        default=REPO_ROOT / "trainer" / "models",
-        help="Source of model artifacts and YAML (default: trainer/models)",
+        default=_default_model_source,
+        help="Source of model artifacts and YAML (default: out/models or MODEL_DIR env)",
     )
     parser.add_argument(
         "--archive",

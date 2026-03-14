@@ -19,7 +19,7 @@ import trainer.scorer as scorer_mod
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _BACKTESTER_PATH = _REPO_ROOT / "trainer" / "backtester.py"
-_SCORER_PATH = _REPO_ROOT / "trainer" / "scorer.py"
+_SCORER_PATH = _REPO_ROOT / "trainer" / "serving" / "scorer.py"
 _BACKTESTER_SRC = _BACKTESTER_PATH.read_text(encoding="utf-8")
 _SCORER_SRC = _SCORER_PATH.read_text(encoding="utf-8")
 

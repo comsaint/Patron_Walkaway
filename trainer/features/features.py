@@ -1,5 +1,5 @@
-"""trainer/features.py
-======================
+"""trainer/features/features.py
+=============================
 Shared feature engineering — Train-Serve Parity core (TRN-05/07/08).
 
 Architecture (DEC-022: Track Profile / Track LLM / Track Human)
@@ -34,6 +34,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -75,6 +76,19 @@ _RUN_BREAK_MAX_NS = _RUN_BREAK_MAX_MIN * 60 * 10**9
 _RUN_BREAK_BOUNDS_MSG = (
     "RUN_BREAK_MIN must be in [0, 10000] minutes for lookback computation"
 )
+
+
+def _datetime_to_ns_int64(series: pd.Series) -> np.ndarray:
+    """Convert datetime series to int64 nanoseconds for numba lookback kernels.
+
+    Uses .view('int64') on datetime64[ns] so the kernel receives nanoseconds (same
+    unit as delta_ns / run_break_min_ns). Avoids platform/astype(int64) giving us.
+    """
+    arr = pd.to_datetime(series, utc=False).values
+    if arr.dtype != np.dtype("datetime64[ns]"):
+        arr = arr.astype("datetime64[ns]")
+    return arr.view("int64").copy()  # copy so kernel gets contiguous int64
+
 
 # ---------------------------------------------------------------------------
 # player_profile — Phase 1 feature column list (PLAN Step 4 / DEC-011)
@@ -446,7 +460,7 @@ def compute_loss_streak(
                             streak_sub = _is_lose.groupby(_reset_grp.values, sort=False).cumsum().astype("int32")
                             out_list.append((idx, int(streak_sub.iloc[-1])))
                         continue
-                    times_ns = pd.to_datetime(grp["payout_complete_dtm"], utc=False).astype("int64")
+                    times_ns = _datetime_to_ns_int64(grp["payout_complete_dtm"])
                     status_arr = (
                         grp["status"]
                         .map({"LOSE": 1, "WIN": 2, "PUSH": 3})
@@ -455,7 +469,7 @@ def compute_loss_streak(
                     )
                     out_arr = np.zeros(len(grp), dtype=np.int32)
                     _streak_lookback_numba(
-                        times_ns.values,
+                        times_ns,
                         status_arr.values,
                         np.int8(push_resets_int),
                         np.int64(delta_ns),
@@ -656,7 +670,7 @@ def compute_run_boundary(
                     if times.isna().any():
                         _run_boundary_python_loop(grp, times)
                         continue
-                    times_ns = times.astype("int64")
+                    times_ns = _datetime_to_ns_int64(grp["payout_complete_dtm"])
                     wager_arr = (
                         grp["wager"].fillna(0.0).to_numpy(dtype=np.float64, copy=True)
                         if "wager" in grp.columns
@@ -667,7 +681,7 @@ def compute_run_boundary(
                     out_bets_in_run = np.zeros(len(grp), dtype=np.int32)
                     out_wager_sum = np.zeros(len(grp), dtype=np.float64)
                     _run_boundary_lookback_numba(
-                        times_ns.values,
+                        times_ns,
                         wager_arr,
                         np.int64(run_break_min_ns),
                         np.int64(delta_ns),
@@ -849,6 +863,182 @@ def compute_table_hc(
 # Feature screening
 # ---------------------------------------------------------------------------
 
+# Step 8 DuckDB std (PLAN: Step 8 Feature Screening DuckDB 算統計量)
+def _duckdb_quote_identifier(name: str) -> str:
+    """Escape identifier for DuckDB SQL (double-quote and double any internal ")."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def compute_column_std_duckdb(
+    columns: List[str],
+    *,
+    path: Optional[Path] = None,
+    df: Optional[pd.DataFrame] = None,
+) -> pd.Series:
+    """Compute population std (stddev_pop) per column via DuckDB; avoids full-df .std() OOM.
+
+    Exactly one of path or df must be set. Returns a Series with index = columns and
+    values = std (0.0 where column is missing or non-numeric). Uses stddev_pop (ddof=0).
+    Only numeric columns are passed to stddev_pop (PLAN § 注意事項: 字串/類別欄跳過).
+    """
+    if (path is None) == (df is None):
+        raise ValueError("compute_column_std_duckdb: exactly one of path or df must be provided")
+    if not columns:
+        return pd.Series(dtype=float)
+
+    import duckdb
+
+    # Only numeric columns: avoid stddev_pop(VARCHAR) BinderException (PLAN §7).
+    if df is not None:
+        numeric_cols = [
+            c for c in columns
+            if c in df.columns and pd.api.types.is_numeric_dtype(df[c])
+        ]
+    else:
+        assert path is not None
+        path_escaped = str(path).replace("'", "''")
+        con_schema = duckdb.connect(":memory:")
+        try:
+            con_schema.execute(f"SELECT * FROM read_parquet('{path_escaped}') LIMIT 0")
+            empty = con_schema.fetchdf()
+            numeric_cols = [
+                c for c in columns
+                if c in empty.columns and pd.api.types.is_numeric_dtype(empty[c])
+            ]
+        finally:
+            con_schema.close()
+
+    if not numeric_cols:
+        return pd.Series(0.0, index=columns)
+
+    quoted = [_duckdb_quote_identifier(c) for c in numeric_cols]
+    select_list = ", ".join(f"stddev_pop({q}) AS {q}" for q in quoted)
+    con = duckdb.connect(":memory:")
+    try:
+        if path is not None:
+            path_escaped = str(path).replace("'", "''")
+            con.execute(f"SELECT {select_list} FROM read_parquet('{path_escaped}')")
+        else:
+            assert df is not None
+            con.register("_screen_std_src", df[numeric_cols])
+            con.execute("SELECT " + select_list + " FROM _screen_std_src")
+        row = con.fetchone()
+        if row is None:
+            out = pd.Series(index=columns, dtype=float)
+        else:
+            out = pd.Series(dict(zip(numeric_cols, list(row))), dtype=float)
+            out = out.reindex(columns, fill_value=0.0)
+        out = out.fillna(0.0)
+        return out
+    finally:
+        con.close()
+
+
+def compute_correlation_matrix_duckdb(
+    columns: List[str],
+    *,
+    path: Optional[Path] = None,
+    df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Compute K×K absolute correlation matrix via DuckDB (PLAN Step 8 Phase 2).
+
+    Exactly one of path or df must be set. Returns a DataFrame with index and
+    columns = requested columns; only numeric columns are used for CORR, missing
+    or non-numeric get 0.0. Uses DuckDB corr(); result is symmetric with 1.0 on
+    diagonal (abs). For 0 or 1 column returns empty or 1×1 [[1.0]].
+    """
+    if (path is None) == (df is None):
+        raise ValueError(
+            "compute_correlation_matrix_duckdb: exactly one of path or df must be provided"
+        )
+    if not columns:
+        return pd.DataFrame()
+
+    import duckdb
+
+    # Only numeric columns (same as compute_column_std_duckdb).
+    if df is not None:
+        numeric_cols = [
+            c for c in columns
+            if c in df.columns and pd.api.types.is_numeric_dtype(df[c])
+        ]
+    else:
+        assert path is not None
+        path_escaped = str(path).replace("'", "''")
+        con_schema = duckdb.connect(":memory:")
+        try:
+            con_schema.execute(f"SELECT * FROM read_parquet('{path_escaped}') LIMIT 0")
+            empty = con_schema.fetchdf()
+            numeric_cols = [
+                c for c in columns
+                if c in empty.columns and pd.api.types.is_numeric_dtype(empty[c])
+            ]
+        finally:
+            con_schema.close()
+
+    if not numeric_cols:
+        return pd.DataFrame(0.0, index=columns, columns=columns)
+    if len(numeric_cols) == 1:
+        out = pd.DataFrame([[1.0]], index=numeric_cols, columns=numeric_cols)
+        out = out.reindex(index=columns, columns=columns, fill_value=0.0)
+        return out.astype(float)
+
+    quoted = [_duckdb_quote_identifier(c) for c in numeric_cols]
+    K = len(numeric_cols)
+    select_parts = []
+    for i in range(K):
+        for j in range(i, K):
+            alias = f"_c{i}_{j}"
+            select_parts.append(f"corr({quoted[i]}, {quoted[j]}) AS {alias}")
+    select_sql = ", ".join(select_parts)
+    con = duckdb.connect(":memory:")
+    try:
+        if path is not None:
+            path_escaped = str(path).replace("'", "''")
+            con.execute(f"SELECT {select_sql} FROM read_parquet('{path_escaped}')")
+        else:
+            assert df is not None
+            con.register("_corr_src", df[numeric_cols])
+            con.execute("SELECT " + select_sql + " FROM _corr_src")
+        row = con.fetchone()
+    finally:
+        con.close()
+
+    if row is None:
+        mat = pd.DataFrame(0.0, index=numeric_cols, columns=numeric_cols)
+        mat = mat.reindex(index=columns, columns=columns, fill_value=0.0)
+        return mat
+
+    expected_len = K * (K + 1) // 2
+    if len(row) != expected_len:
+        logger.warning(
+            "compute_correlation_matrix_duckdb: DuckDB row length %d != expected %d; returning diagonal matrix",
+            len(row),
+            expected_len,
+        )
+        diag_mat = np.eye(K, dtype=float)
+        mat = pd.DataFrame(diag_mat, index=numeric_cols, columns=numeric_cols)
+        mat = mat.reindex(index=columns, columns=columns, fill_value=0.0)
+        return mat.astype(float)
+
+    # Build upper triangle from row, then symmetrize (row has K*(K+1)/2 values).
+    idx = 0
+    corr_abs = np.zeros((K, K))
+    for i in range(K):
+        for j in range(i, K):
+            v = row[idx]
+            idx += 1
+            val = 0.0 if (v is None or (isinstance(v, float) and np.isnan(v))) else float(np.abs(v))
+            if i == j:
+                corr_abs[i, j] = 1.0
+            else:
+                corr_abs[i, j] = val
+                corr_abs[j, i] = val
+    out = pd.DataFrame(corr_abs, index=numeric_cols, columns=numeric_cols)
+    out = out.reindex(index=columns, columns=columns, fill_value=0.0)
+    return out.astype(float)
+
+
 # Sentinel used to distinguish "caller did not pass top_k" from "caller passed None".
 # When top_k is _SCREEN_TOP_K_UNSET, screen_features() falls back to
 # SCREEN_FEATURES_TOP_K from config.py (DEC-020).
@@ -864,6 +1054,8 @@ def screen_features(
     use_lgbm: bool = False,
     screen_method: str = "lgbm",
     random_state: int = 42,
+    train_path: Optional[Path] = None,
+    train_df: Optional[pd.DataFrame] = None,
 ) -> List[str]:
     """Feature screening (SSOT §8.2-D, DEC-020; PLAN screen-lgbm-default).
 
@@ -874,6 +1066,10 @@ def screen_features(
 
     MI is only run when ``screen_method`` is "mi" or "mi_then_lgbm". LGBM stage must
     only be called on training data (anti-leakage, SSOT §8.2-D / TRN-09).
+
+    When ``train_path`` or ``train_df`` is provided, zero-variance (zv) is computed via
+    DuckDB (stddev_pop) on the full train to avoid pandas X.std() OOM; ``feature_matrix``
+    is then used only for correlation/MI/LGBM (typically a sample).
 
     Parameters
     ----------
@@ -893,6 +1089,10 @@ def screen_features(
         "lgbm" | "mi" | "mi_then_lgbm". Default from config ``SCREEN_FEATURES_METHOD``.
     random_state : int
         Random seed for reproducibility.
+    train_path : Path or None
+        If set, path to train Parquet; used for DuckDB std (zv) on full data.
+    train_df : DataFrame or None
+        If set (and train_path not set), full train DataFrame for DuckDB std (zv).
 
     Returns
     -------
@@ -916,14 +1116,54 @@ def screen_features(
             f"screen_features: top_k must be a positive integer or None, got {effective_top_k!r}"
         )
 
-    X = feature_matrix[feature_names].copy()
-    coerce_feature_dtypes(X, list(X.columns))
-    std = X.std()
-    nonzero = std[std > 0].index.tolist()
+    # Zero-variance: use DuckDB on full train when provided to avoid X.std() OOM (PLAN Step 8 DuckDB 算統計量).
+    use_duckdb_std = (train_path is not None or train_df is not None) and len(feature_names) > 0
+    if use_duckdb_std:
+        try:
+            if train_path is not None:
+                cols_std = feature_names
+                if cols_std:
+                    std = compute_column_std_duckdb(cols_std, path=train_path)
+                    nonzero = std[std > 0].index.tolist()
+                else:
+                    std = pd.Series(dtype=float)
+                    nonzero = []
+            else:
+                assert train_df is not None
+                cols_std = [c for c in feature_names if c in train_df.columns]
+                if cols_std:
+                    std = compute_column_std_duckdb(cols_std, df=train_df[cols_std])
+                    nonzero = std[std > 0].index.tolist()
+                else:
+                    std = pd.Series(dtype=float)
+                    nonzero = []
+            nonzero = [c for c in nonzero if c in feature_matrix.columns]
+            if cols_std:
+                logger.info(
+                    "screen_features: std via DuckDB (path=%s, df=%s); %d nonzero-variance",
+                    train_path is not None,
+                    train_df is not None,
+                    len(nonzero),
+                )
+        except Exception as exc:
+            logger.warning(
+                "screen_features: DuckDB std failed, falling back to pandas on feature_matrix: %s",
+                exc,
+            )
+            use_duckdb_std = False
+
+    if not use_duckdb_std:
+        X = feature_matrix[feature_names].copy()
+        coerce_feature_dtypes(X, list(X.columns))
+        std = X.std()
+        nonzero = std[std > 0].index.tolist()
+
     dropped_zv = len(feature_names) - len(nonzero)
     if dropped_zv:
         logger.info("screen_features: dropped %d zero-variance features", dropped_zv)
-    X = X[nonzero]
+    X = feature_matrix[[c for c in nonzero if c in feature_matrix.columns]].copy()
+    if not X.empty:
+        coerce_feature_dtypes(X, list(X.columns))
     if X.empty:
         logger.warning(
             "screen_features: all features are zero-variance/NaN — returning empty list"

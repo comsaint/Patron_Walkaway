@@ -1,4 +1,14 @@
+"""Run from repo root so relative path data/gmwds_t_session.parquet is visible (STATUS Code Review 項目 5 §1)."""
+import sys
+from pathlib import Path
+
 import duckdb
+
+# CWD guard: must run from repo root (STATUS Code Review 項目 5 §1).
+_data_path = Path("data/gmwds_t_session.parquet")
+if not _data_path.exists():
+    print("Run from repo root so data/gmwds_t_session.parquet is visible.", file=sys.stderr)
+    sys.exit(1)
 
 con = duckdb.connect()
 
@@ -43,5 +53,8 @@ WHERE is_rated_ever = 0;
 """
 
 df = con.execute(query).df()
+if df.empty:
+    print("No unrated patrons in query.")
+    sys.exit(0)
 for col in df.columns:
     print(f"{col}: {df[col][0]}")

@@ -14,9 +14,10 @@ import unittest
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_DB_CONN_PATH = _REPO_ROOT / "trainer" / "db_conn.py"
-_ETL_PATH = _REPO_ROOT / "trainer" / "etl_player_profile.py"
-_TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
+# After PLAN 項目 2.2, implementation is in trainer/core/db_conn.py; trainer/db_conn.py is re-export
+_DB_CONN_PATH = _REPO_ROOT / "trainer" / "core" / "db_conn.py"
+_ETL_PATH = _REPO_ROOT / "trainer" / "etl" / "etl_player_profile.py"  # 項目 2.2: 實作在 etl 子包
+_TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 _PROFILE_HASH_TEST_PATH = _REPO_ROOT / "tests" / "test_profile_schema_hash.py"
 
 _DB_CONN_SRC = _DB_CONN_PATH.read_text(encoding="utf-8")
@@ -39,16 +40,17 @@ class TestR92DbConnImportCompatibility(unittest.TestCase):
     """R92: db_conn should support both package and non-package entrypoints."""
 
     def test_db_conn_config_import_uses_try_except_fallback(self):
-        self.assertRegex(
-            _DB_CONN_SRC,
-            r"try:\s*\n\s*import config\b",
-            "db_conn.py should first try plain `import config` (non-package mode) (R92)",
+        # After 項目 2.2, core/db_conn.py uses "from . import config" (package mode)
+        self.assertTrue(
+            "from . import config" in _DB_CONN_SRC or re.search(r"try:\s*\n\s*import config\b", _DB_CONN_SRC),
+            "trainer/core/db_conn.py should import config (from . import config or try/except) (R92)",
         )
-        self.assertRegex(
-            _DB_CONN_SRC,
-            r"except ModuleNotFoundError:\s*\n\s*import trainer\.config as config",
-            "db_conn.py should fallback to `trainer.config` import (package mode) (R92)",
-        )
+        if "from . import config" not in _DB_CONN_SRC:
+            self.assertRegex(
+                _DB_CONN_SRC,
+                r"except ModuleNotFoundError:\s*\n\s*import trainer\.config as config",
+                "db_conn.py should fallback to `trainer.config` import (package mode) (R92)",
+            )
 
 
 class TestR93ComputeProfileSnapshotDateDefinition(unittest.TestCase):

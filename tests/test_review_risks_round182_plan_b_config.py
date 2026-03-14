@@ -97,10 +97,10 @@ class TestR182Step8SampleRowsCommentContract(unittest.TestCase):
 
     def test_config_comment_mentions_positive_or_gt_zero_for_step8_sample_rows(self):
         """Config comment for STEP8_SCREEN_SAMPLE_ROWS should state integer must be > 0 (Round 182 Review P2)."""
-        path = Path(__file__).resolve().parent.parent / "trainer" / "config.py"
+        path = Path(__file__).resolve().parent.parent / "trainer" / "core" / "config.py"
         source = path.read_text(encoding="utf-8")
         start = source.find("STEP8_SCREEN_SAMPLE_ROWS")
-        self.assertGreater(start, -1, "STEP8_SCREEN_SAMPLE_ROWS not found")
+        self.assertGreater(start, -1, "STEP8_SCREEN_SAMPLE_ROWS not found in trainer/core/config.py")
         # Look at the comment block above the constant (same or previous lines)
         block = source[max(0, start - 800) : start + 200]
         has_positive_guard = (

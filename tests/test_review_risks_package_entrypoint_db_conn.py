@@ -214,9 +214,11 @@ class TestTrainerTryExceptBlockDocumented(unittest.TestCase):
         from pathlib import Path
 
         repo_root = Path(__file__).resolve().parents[1]
-        trainer_src = (repo_root / "trainer" / "trainer.py").read_text(encoding="utf-8")
-        # Look for comment in the import block (lines containing try/except and db_conn)
+        # Implementation has try/except import block (stub is thin re-export).
+        trainer_src = (repo_root / "trainer" / "training" / "trainer.py").read_text(encoding="utf-8")
         idx = trainer_src.find("from db_conn import get_clickhouse_client")
+        if idx == -1:
+            idx = trainer_src.find("from trainer.db_conn import get_clickhouse_client")
         if idx == -1:
             idx = trainer_src.find("from .db_conn import get_clickhouse_client")
         self.assertGreater(idx, 0, "trainer.py should contain db_conn import")

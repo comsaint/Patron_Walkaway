@@ -20,7 +20,7 @@ import pandas as pd
 
 # Paths for source inspection
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
+_TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 _TRAINER_SRC = _TRAINER_PATH.read_text(encoding="utf-8")
 _TRAINER_TREE = ast.parse(_TRAINER_SRC)
 

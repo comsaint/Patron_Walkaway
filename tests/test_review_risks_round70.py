@@ -14,8 +14,8 @@ import unittest
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_SCORER_PATH = _REPO_ROOT / "trainer" / "scorer.py"
-_ETL_PATH = _REPO_ROOT / "trainer" / "etl_player_profile.py"
+_SCORER_PATH = _REPO_ROOT / "trainer" / "serving" / "scorer.py"
+_ETL_PATH = _REPO_ROOT / "trainer" / "etl" / "etl_player_profile.py"  # 項目 2.2: 實作在 etl 子包
 
 _SCORER_SRC = _SCORER_PATH.read_text(encoding="utf-8")
 _ETL_SRC = _ETL_PATH.read_text(encoding="utf-8")

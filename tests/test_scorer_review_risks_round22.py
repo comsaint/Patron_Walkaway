@@ -25,8 +25,8 @@ def _features_mod():
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _FEATURE_SPEC_PATH = _REPO_ROOT / "trainer" / "feature_spec" / "features_candidates.yaml"
-_SCORER_PATH = _REPO_ROOT / "trainer" / "scorer.py"
-_TRAINER_PATH = _REPO_ROOT / "trainer" / "trainer.py"
+_SCORER_PATH = _REPO_ROOT / "trainer" / "serving" / "scorer.py"
+_TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 
 _SCORER_SRC = _SCORER_PATH.read_text(encoding="utf-8")
 _TRAINER_SRC = _TRAINER_PATH.read_text(encoding="utf-8")

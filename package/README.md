@@ -34,6 +34,8 @@ python -m package.build_deploy_package --model-source trainer/models_90d_weak --
 
 **Result:** A folder `deploy_dist/` (and optionally `deploy_dist.zip`) at repo root, containing everything needed on the target: `main.py`, `requirements.txt`, `.env.example`, `wheels/`, `models/`, `README_DEPLOY.txt`, etc.
 
+**Frontend:** The default build **does not include** the dashboard SPA (`trainer/frontend/`). The deploy package is API-only (GET `/alerts`, `/validation`). If you need the dashboard, serve it separately from the repo or add it to the build in a future step; static assets would then live under the deploy output (e.g. `deploy_dist/static/` or similar).
+
 **On the target machine:** Copy the folder (or unzip the .zip), then:
 
 1. `pip install -r requirements.txt`
@@ -140,6 +142,8 @@ python -m package.build_deploy_package --model-source trainer/models_90d_weak --
 | `--archive` | 關閉 | 另在輸出目錄上一層產生 `deploy_dist.zip`，便於單檔傳輸。 |
 
 **結果：** 在專案根目錄產生 `deploy_dist/`（及可選的 `deploy_dist.zip`），內含目標機所需一切：`main.py`、`requirements.txt`、`.env.example`、`wheels/`、`models/`、`README_DEPLOY.txt` 等。
+
+**前端：** 預設建包**不含**儀表板 SPA（`trainer/frontend/`），部署包僅含 API（GET `/alerts`、`/validation`）。若需儀表板，請自 repo 另行提供或於日後建包時一併帶出；若含前端，靜態檔將置於部署輸出目錄下（例如 `deploy_dist/static/`）。
 
 **在目標機上：** 複製該資料夾（或解壓 .zip）後：
 

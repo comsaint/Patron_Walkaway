@@ -1,5 +1,7 @@
 # One-time patch scripts
 
+**僅供參考、勿直接執行。**（Historical / one-off scripts; for reference only. Do not run unless re-applying the same migration on a fresh branch.)
+
 These scripts were used during migration/refactors to apply regex-based edits to source files (e.g. `trainer/trainer.py`, `trainer/backtester.py`, `trainer/features.py`). They are **one-off**; after the target code was updated, the scripts are kept here for reference only.
 
 **Do not run them** unless you are re-applying the same migration on a fresh branch—paths and regexes are tied to a specific code shape and may break or mis-patch if the target files have changed.
@@ -7,7 +9,7 @@ These scripts were used during migration/refactors to apply regex-based edits to
 If you do run any script, **run from the project root** so relative paths like `trainer/trainer.py` resolve correctly:
 
 ```bash
-python scripts/one_time/patch_backtester.py
+python doc/one_time_scripts/patch_backtester.py
 ```
 
 | Script | Target | Purpose |
