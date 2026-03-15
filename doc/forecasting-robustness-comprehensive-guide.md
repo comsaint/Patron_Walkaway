@@ -1,526 +1,310 @@
-# 預測模型近期未來穩健性：完整指南與行動計畫
+# Patron Walkaway 風險模型近期穩健性完整指南
 
-> **專案適用範圍：** Patron Walkaway  
-> **文件目的：** 整合原文獻整理、驗證結果與補充建議，形成可執行的實施路線圖  
-> **最後更新：** 2026-03-15
-
----
-
-## 執行摘要
-
-本文件整合了 Patron Walkaway 專案「預測模型近期未來穩健性」文獻整理的驗證結果與前沿補充建議。原文獻整理的**七大核心維度**已通過文獻交叉驗證，方法論紮實且具實用性。同時，本文件新增**六項前沿補充建議**（2024-2025 最新研究），涵蓋 Conformal Prediction、Test-Time Adaptation、時序基礎模型、評估指標強化、因果特徵選擇與層級對齊。
+> **問題設定：** 給定當前與近期歷史行為特徵，預測 patron 在未來一段時間內是否會 walk away（Y ∈ {0,1}），輸出為機率  
+> **目標：** 讓風險分數在時間推進、環境變化與資料延遲下，仍維持穩定的排序能力、合理機率刻度與可控維運成本  
+> **最後更新：** 2026-03-16
 
 ---
 
-## 第一部分：原文獻整理驗證結果
+## 1. 評估設計：用時間和分群逼出真實穩健性
 
-### ✅ 已驗證的核心維度
+### 1.1 嚴格維持時間順序
 
-#### 1. 多切點、多期評估（Walk-Forward Validation）
+- 不使用 random k-fold，因為會混淆時間，產生「用未來預測過去」的資訊洩漏。  
+- 採用多切點的時間切分：  
+  - 對每個切點 \(T_i\)：用 \(t \le T_i\) 訓練，用 \(T_i < t \le T_i + \Delta\) 評估。  
+  - 使用 expanding 或 rolling window，模擬真實上線場景。
 
-**原文獻觀點：**
-- 單一切點、單一 horizon 會高估穩健性
-- 需使用嚴格時間順序的 expanding/rolling window backtest
-- 避免 random k-fold（違反時間順序）
-- 切點應事先固定或規則化（避免 data snooping）
-- 多 horizon 評估應使用 Quaedvlieg 的 Uniform SPA / Average SPA
+### 1.2 多切點、多指標
 
-**驗證結果：** ✅ **完全支持**
-- Walk-forward 是最接近生產環境的評估方式，嚴格遵守時間因果性
-- Random k-fold 確實會造成「用未來預測過去」的資訊洩漏
-- 文獻一致支持 expanding window（穩定長期模式）vs rolling window（快速變化環境）的情境劃分
+對每個切點，至少記錄：
 
-**補充建議：**
-- 除平均誤差外，應報告**跨切點的標準差與 95 百分位數**（worst-case robustness 比平均表現更重要）
-- 每個切點應報告 multi-horizon 誤差（如 MAPE/sMAPE by h=1,2,...,H）
+- **Discrimination**  
+  - AUC  
+  - PR-AUC（在正例稀少時更敏感）
 
----
+- **Calibration**  
+  - Brier score  
+  - Calibration curve + ECE（Expected Calibration Error）
 
-#### 2. 結構性斷裂與 Regime 變化
+- **Decision metrics**  
+  - 在實際使用閾值（或多個候選閾值）下的 precision / recall / FPR / lift
 
-**原文獻觀點：**
-- 忽略結構性斷裂會導致近期未來表現崩潰
-- 應使用 Bai–Perron、PELT、ICSS 等檢測算法
-- 可採動態切換（不同 regime 用不同模型/權重）
-- 貝氏方法可建模「未來可能再發生斷裂」的不確定性
-- Break 日期的置信集平均優於單一點估計
+跨切點時，不只看平均，也要看標準差與「最差幾個切點」表現，因為 robustness 本質上是對「壞情況」的控制，而不是只看平均。
 
-**驗證結果：** ✅ **完全支持**
-- 2025 研究：PELT + Wavelet + TCN 混合架構在碳價預測上降低 RMSE 22.35%、MAE 18.63%
-- Bai–Perron 在無斷裂情境下有高達 88.3% 的誤判率，確認「置信集平均」的必要性
+### 1.3 分群穩健性
 
-**補充建議：**
-- 在 backtest 設計中**刻意跨越已知斷裂點**（如 COVID-19、政策變動），觀察模型在斷裂前後的誤差變化
-- 結合 **online regime detection**（如 CUSUM、ADWIN），在生產環境中即時標記新興 regime，無需等到下一次排程 backtest
+對以下 segment，在每個切點上分開評估上面指標：
+
+- 時段：peak / off-peak、weekday / weekend、特殊活動期間  
+- 場域：不同店、樓層、設備群  
+- 客群：新客 / 老客、高價值 / 一般 patron  
+- 其他關鍵情境：某些促銷或營運策略啟用期間
+
+**判斷準則：** 如果整體 AUC 很好，但某些重要 segment 的 AUC/校準或 decision metrics 一直很差，那模型「整體看起來穩健」只是錯覺。
 
 ---
 
-#### 3. 預測組合與集成
+## 2. 結構性變化（Regime）與行為轉換
 
-**原文獻觀點：**
-- M4 競賽：12/17 頂尖方法為組合方法
-- 純 ML 方法普遍不如組合
-- 組合可降低單一模型誤設風險
-- 可使用 FFORMA（依特徵自動權重）或簡單平均
+### 2.1 什麼算 regime change
 
-**驗證結果：** ✅ **完全支持**
-- M4 冠軍 Slawek Smyl 的 ES-RNN 是統計 + ML 的單一混合模型
-- 文獻確認組合同時降低 bias（誤設）與 variance（不確定性）
+在這裡，regime change 通常來自：
 
-**補充建議：**
-- 組合權重應依**最近 N 個切點的表現**動態調整（recency-weighted combination），而非全歷史平均
-- 考慮納入**時序基礎模型**（TSFMs，如 Chronos、TimesFM）作為集成成員（見第二部分補充建議 3）
+- 標籤定義或計算邏輯的更改（例如 walkaway 時間窗變了）  
+- 客群組成的變化（不同國家、不同年齡、不同博彩偏好）  
+- 流程或環境調整（等候策略、機台佈局、獎勵機制、營運時間）  
+- 外部衝擊（大型活動、疫情、政策調整）
 
----
+這些會讓 \(P(Y\mid X)\) 改變，而不只是 \(P(X)\) 或 \(P(Y)\) 改變。
 
-#### 4. 預測穩定性（Vertical & Horizontal）
+### 2.2 Regime-aware 分析
 
-**原文獻觀點：**
-- 垂直穩定性：同一目標日的預測不應隨 origin 往後移而劇烈修正
-- 水平穩定性：同一 origin 下預測在 horizon 上不應震盪
-- 過度頻繁重訓可能放大短期噪音
-- 可用動態 loss 權重同時考慮誤差與穩定性
+- 在設計時間切分時，刻意包含「事件前 vs 事件後」的切點。  
+- 分別觀察 regime 前後的：AUC、PR-AUC、Brier、ECE。  
+- 若在 regime 轉換前後，performance 有斷崖式變化，這是明確訊號，意味該 regime 需要區別對待。
 
-**驗證結果：** ✅ **支持**
-- 穩定性對供應鏈、排程、人力配置等營運決策的信任度至關重要
-- 更少重訓有時反而更穩定
+### 2.3 模型層應對
 
-**補充建議：**
-- **將穩定性正式化為 KPI**：例如「同一目標日在連續兩次預測間的平均絕對修正量」
-- 在 backtest 中除誤差指標外，也量測「同一目標日在不同切點下預測的變異」
+- 將明確的 regime（例如新系統上線後）編碼為特徵，如 `is_new_system`, `days_since_policy_change`。  
+- 若 regime 之間差異巨大，考慮：  
+  - 分別訓練多個子模型，  
+  - 或用 gating 機制在 inference 時選擇適合的子模型。
 
 ---
 
-#### 5. 概念漂移、共變量偏移與重訓策略
+## 3. 模型與集成（Ensemble）
 
-**原文獻觀點：**
-- Covariate shift（X 分布變了）vs Concept drift（P(Y|X) 變了）
-- 偵測方式：誤差監控、KS 檢定、自編碼器異常、CUSUM
-- 重訓策略：事件驅動（drift 達閾值）+ 週期性檢查
-- 選擇性重訓（只重訓受影響的模型/區段）可提升 ROI
+### 3.1 模型族群
 
-**驗證結果：** ✅ **支持**
-- 文獻確認固定週期重訓（如每季）既可能浪費（穩定期）也可能延遲（快速漂移）
-- 基於不確定性與預期效能的動態重訓優於簡單規則
+實際可用模型類型：
 
-**補充建議：**
-- 明確使用 **PSI（Population Stability Index）** 作為生產監控指標：
-  - PSI < 0.10：穩定
-  - 0.10–0.25：需關注
-  - \> 0.25：顯著漂移
-- 建立**兩層應對機制**（見第二部分補充建議 2）：
-  1. **RevIN** 作為常設架構層（吸收小幅分布偏移）
-  2. **Test-Time Adaptation（TTA）** 作為中度漂移應對（PSI 0.10–0.25）
-  3. **完整重訓** 作為嚴重漂移應對（PSI > 0.25）
+- Logistic / penalized GLM：強校準、可解釋，是穩定 baseline。  
+- Tree-based：XGBoost、LightGBM、Random Forest，擅長非線性與交互作用。  
+- 深度模型：  
+  - MLP over aggregated features  
+  - 若有行為序列：RNN / Transformer over event sequences，再接分類頭
 
----
+### 3.2 為什麼 ensemble 有助穩健性
 
-#### 6. 生產環境與 MLOps
+不同模型對 drifts、噪音與特徵偏移的敏感度和錯誤模式不同。透過 ensemble：
 
-**原文獻觀點：**
-- 資料統計層檢查（常數序列、突跳、過期資料）
-- 特徵品質常比模型選擇更重要
-- 特徵與模型一起版本化，確保 rollback 一致性
-- 訓練與 serving 一致（避免 training–serving skew）
-- Staged rollout、canary deployment 降低風險
+- 可以降低單一模型 misspecification 的風險。  
+- 在不同時間與 segment 上，通常表現會「少踩雷」，而不是只在某個 window 特別好。
 
-**驗證結果：** ✅ **完全支持**
-- 與 Microsoft Forecasting、AWS SageMaker、TSFM 等實務建議一致
-- 2024 年 AI incidents 上升 56.4%，強調監控重要性
+### 3.3 實作建議
 
-**補充建議：**
-- 除了 per-feature PSI，應加入**多變量漂移偵測**（如 MMD、Wasserstein distance），偵測特徵間聯合分布的微妙偏移
-- CI/CD pipeline 應包含自動化 multi-cutpoint backtest，作為合併前的必要檢查
+- 先確保每個 base 模型本身有合理 performance 與 calibration。  
+- 使用簡單的機率平均作為 baseline ensemble。  
+- 再進一步：  
+  - 依最近 K 個切點的 AUC/Brier 為模型加權（recency-weighted ensemble）。  
+  - 或用 stacking（使用 second-stage logistic regression 來整合各模型輸出的 logit/probability）。
+
+重新 ensemble 之後，記得再做一次 calibration（下一節）。
 
 ---
 
-#### 7. 機率預測與區間
+## 4. 機率校準與分數穩定性
 
-**原文獻觀點：**
-- M4 頂尖方法在 95% 區間覆蓋上表現也好
-- 評估時除覆蓋率外也應看銳度（區間寬度）
+### 4.1 校準（Calibration）
 
-**驗證結果：** ✅ **正確但不夠深入**
-- M4 確實驗證點預測與區間預測可一起優化
+風險分數會直接被用來管理告警、人工介入、人力配置與營運決策，因此需要「可以拿來當機率用」，而不只是排序分數。
 
-**補充建議：**
-- 此維度的主要缺口：應採用 **Conformal Prediction**（見第二部分補充建議 1）
+**建議流程：**
 
----
+1. 對訓練期最後一段時間保留作為 calibration window。  
+2. 在該 window 上，對模型預測進行：  
+   - Platt / logistic scaling，或  
+   - Isotonic regression，或  
+   - Beta calibration（如有必要）。  
+3. 每次 retrain 或大版本升級時，都重做這一步。
 
-## 第二部分：六項前沿補充建議（2024-2025）
+在多切點評估時，校準指標（Brier、ECE、reliability curve）的穩定性應被視為與 AUC 同等重要。
 
-### 補充建議 1：採用 Conformal Prediction 進行不確定性量化
+### 4.2 分數與排名穩定性
 
-#### 背景
-原文獻在機率預測部分著墨不深。**Conformal Prediction（CP）** 是目前理論最嚴謹的區間估計方法：
-- 無需假設分布（distribution-free）
-- 提供有限樣本覆蓋保證（finite-sample coverage guarantee）
-- 適用任何黑箱模型
+為了避免版本更新或小修小補造成現場混亂，可引入兩個指標：
 
-#### 關鍵技術
-- **EnbPI**（Ensemble Batch Prediction Intervals, 2021）：首個針對時序資料的 CP 方法，使用 bootstrap ensemble 構造非平穩與時空資料的近似邊際覆蓋區間
-- **2025 統一綜述**（arXiv:2511.13608）：整理所有當前 CP 時序方法，包括重加權校準資料、動態更新殘差分布、即時適應覆蓋水準等
-- **TSFMs + CP**：因基礎模型只需少量訓練資料，可釋出更多資料用於校準集，顯著提升區間品質
+- **Score stability**：  
+  - 在同一批樣本上，比較舊版與新版分數的絕對差 \(|p_{\text{old}}(x) - p_{\text{new}}(x)|\)。  
+  - 觀察平均、分位數（例如 90% 樣本差異小於 0.05）。
 
-#### 實施建議
-✅ **Action Item 1.1：** 在 Patron Walkaway 生產模型中加入 EnbPI 或 adaptive split-conformal 作為首選不確定性量化方法  
-✅ **Action Item 1.2：** 替換或補強現有的經驗分位數區間，無需重訓底層預測器即可獲得嚴格覆蓋保證  
-✅ **Action Item 1.3：** 在 multi-cutpoint backtest 中同時評估覆蓋率（calibration）與銳度（sharpness）
+- **Ranking stability**：  
+  - 比較不同版本 top-k high-risk 名單的重疊比例。  
+  - 可以分不同 segment 評估。
+
+在 release checklist 中，設定可接受的最大分數變動與排名變動門檻，有助於降低「模型更新造成操作策略崩壞」的風險。
 
 ---
 
-### 補充建議 2：Test-Time Adaptation（TTA）作為輕量漂移應對
+## 5. 漂移監控與重訓策略
 
-#### 背景
-原文獻的重訓策略是「偵測到 drift → 完整重訓」。**TTA** 提供中間層選項：只更新模型中少量參數（如正規化層的仿射參數），使用最近的無標籤生產資料，無需觸發完整重訓流程。
+### 5.1 監控什麼
 
-#### 關鍵技術
-- **DynaTTA**（ICML 2025）：
-  - 即時估計分布偏移嚴重程度（追蹤預測誤差與 embedding drift）
-  - 動態適應率與偏移嚴重度成正比
-  - Shift-conditioned gating 機制避免穩定期的不必要更新
-  - 模組化設計，可疊加於任何既有預訓練模型
+從三個面向監控 drift：
 
-- **RevIN**（Reversible Instance Normalization, ICLR 2022）：
-  - 引用超 1,340 次
-  - 使用 instance-level 統計對輸入正規化、輸出反正規化
-  - 模型無關的即插即用層，顯著降低分布偏移的性能落差
+1. **輸入特徵分布**  
+   - PSI（Population Stability Index）  
+   - 缺失率、值域、極端值比例  
+   - 重要特徵的直方圖或分位數隨時間變化
 
-#### 實施建議
-✅ **Action Item 2.1：** 將 **RevIN 作為常設架構層**整合至所有時序模型  
-✅ **Action Item 2.2：** 建立**兩層漂移應對機制**：
-- **Tier 1（小幅偏移）：** RevIN 自動吸收
-- **Tier 2（中度偏移，PSI 0.10–0.25）：** 觸發 TTA（如 DynaTTA），更新正規化參數
-- **Tier 3（嚴重偏移，PSI > 0.25）：** 完整模型重訓
+2. **預測分數分布**  
+   - 平均預測風險  
+   - top-k 比例（例如 predicted risk > 0.8 的比例）  
+   - 分數分布是否突然集中在 0 或 1
 
-✅ **Action Item 2.3：** 在 backtest 中比較「固定週期重訓」vs「TTA + 事件驅動重訓」的穩健性與成本
+3. **延遲回流的真實表現**  
+   - AUC / PR-AUC 隨時間的趨勢  
+   - Brier / ECE 隨時間的趨勢
 
----
+### 5.2 應對順序
 
-### 補充建議 3：時序基礎模型（TSFMs）作為集成基準
+一個穩健的應對順序：
 
-#### 背景
-原文獻的模型集中在 ARIMA/ETS、樹模型、簡單神經網路、Prophet。未涵蓋 **Time Series Foundation Models（TSFMs）**——在大規模異質時序語料上預訓練的大型模型。
+1. **監控與告警**：一旦 PSI 或預測分布異常，先標記再查原因。  
+2. **Recalibration 優先**：  
+   - 如果 discrimination（AUC）還可以，但 Brier/ECE 明顯變差，先考慮在最近一段有標籤的資料上重新 fit calibration map。  
+3. **選擇性重訓**：  
+   - 若 drift 很集中在某些店別、segment，先做局部重訓或 segment-specific model。  
+4. **完整重訓**：  
+   - 當 drift 是全局性的且長期持續，才進行完整 retrain，並重新 calibrate。
 
-#### 關鍵模型
-- **Chronos**（Amazon）：Transformer-based，在多領域時序資料上預訓練
-- **TimesFM**（Google）：在約 1,000 億時序資料點（Google Trends、Wikipedia pageviews）上訓練
-- **評估結果**：零樣本與微調設定下降低 15–30% 預測誤差，歷史資料有限時尤為有效
-- **ELF**（ICML 2025）：輕量線上適配器，可在新資料到達時增量改進 TSFM 預測，無需重訓大模型
+### 5.3 Test-Time Adaptation（TTA）
 
-#### 實施建議
-✅ **Action Item 3.1：** 在 multi-cutpoint backtest 中加入至少一個 TSFM（建議 Chronos-Bolt 速度快，或 TimesFM 零樣本穩健性高）  
-✅ **Action Item 3.2：** 將 TSFM 作為集成成員，特別用於**冷啟動場景**（新門市/產品/顧客區段，歷史資料不足）  
-✅ **Action Item 3.3：** 評估 TSFM + ELF 的組合，作為低資料成本的持續適配方案
+TTA 是中階選項：  
+- 不動整個模型，只調整少數層（例如 normalization 層或最後幾層）。  
+- 利用最近一小段無標籤資料，讓模型更好對齊新的輸入分布。  
+
+建議把它視為「drift 已出現但還沒嚴重到必須 retrain 時」的工具，而不是所有場景預設啟用。
 
 ---
 
-### 補充建議 4：強化評估指標體系
+## 6. Label Delay（標籤延遲）
 
-#### 背景
-原文獻以 MAPE/sMAPE 為主，但兩者有已知弱點：
-- **MAPE**：在近零值時未定義或爆炸
-- **sMAPE**：懲罰不對稱，0–200% 範圍不直觀
+### 6.1 問題本質
 
-#### 推薦指標矩陣
+對 walkaway 預測而言：
 
-| 指標 | 優勢 | 劣勢 | 最適用場景 |
-|------|------|------|-----------|
-| **MASE** | 無量綱、對零值穩健、跨序列可比 | 相對於 naïve baseline 的表現 | 跨序列比較、間歇需求 |
-| **sMAPE** | 無量綱百分比 | 懲罰不對稱、零值未定義 | 標準競賽基準 |
-| **CRPS** | 評估完整預測分布 | 需要機率預測 | 區間與分布評估 |
-| **PSI** | 偵測特徵/預測分布漂移 | 單特徵、非聯合分布 | 生產監控 |
-| **Worst-case %ile** | 捕捉尾部穩健性 | 對典型表現不敏感 | 營運 SLA 設定 |
+- 你預測「未來 X 分鐘內會走人」，但要等這個窗口過完（或 patron 實際走人）才知道標籤。  
+- 這意味著：  
+  - model performance（AUC/Brier）永遠是「落後現在」的一段時間。  
+  - 用 performance 來監控 drift 時，會免不了有 delay。
 
-#### 實施建議
-✅ **Action Item 4.1：** 採用 **MASE 作為主要無量綱準確度指標**（取代有零值序列的 MAPE）  
-✅ **Action Item 4.2：** 一旦引入機率輸出，加入 **CRPS** 評估完整預測分布  
-✅ **Action Item 4.3：** 追蹤生產輸入與預測的 **PSI**，在準確度下降前偵測分布漂移  
-✅ **Action Item 4.4：** 報告**第 95 百分位數誤差**（worst-case robustness），作為 SLA 設定依據
+### 6.2 實務對策
 
----
+- 把監控面板切成兩層：  
+  - 即時層：只看特徵分布與預測分布的 drift，偵測潛在異常。  
+  - 延遲層：等標籤到齊後再計算 performance 指標。
 
-### 補充建議 5：因果特徵選擇提升協變量穩健性
+- 避免在標籤尚未回流的期間，頻繁基於未驗證的 performance 直覺對模型做大幅更新。
 
-#### 背景
-原文獻提及協變量特徵但未涉及選擇方法。**因果特徵選擇**使用 PCMCI（PC algorithm + Momentary Conditional Independence）等算法識別對目標有直接因果路徑的變數，而非僅相關變數。
+### 6.3 Pseudo-labeling：條件式使用
 
-#### 為何重要
-- **穩健性**：因果特徵在 OOD（out-of-distribution）條件下更穩健，因相關性特徵可能在分布偏移時失效，而因果機制通常更穩定
-- **抗過擬合**：減少擬合訓練窗內存在但斷裂後消失的虛假相關性
-- **實證支持**：2025 年電力負荷預測研究顯示 PCMCI 選出的特徵在 OOD 天氣推論場景下，於 GRU、TCN、PatchTST 上均優於非因果選擇
+Pseudo-labeling 可以在標籤延遲時提供「代理標籤」支援增量更新，但前提是：
 
-#### 實施建議
-✅ **Action Item 5.1：** 對候選外生特徵集應用因果發現（如 PCMCI，使用 `tigramite` Python 套件）  
-✅ **Action Item 5.2：** 優先使用因果選出的特徵作為生產模型主要輸入  
-✅ **Action Item 5.3：** 將相關性特徵作為補充輸入保留於集成成員中  
-✅ **Action Item 5.4：** 在跨區段（如有行為訊號的顧客群）應用此方法時特別留意
+- 模型目前在該區段並沒有被強烈 drift 破壞；  
+- 只使用高信心、且經過漂移偵測檢查仍相對穩定的樣本；  
+- 有明確 rollback 機制。
+
+建議在文件中將它定位為「可選用、需要完整實驗驗證的進階方案」，而不是核心機制。
 
 ---
 
-### 補充建議 6：層級預測的穩健對齊（若有聚合需求）
+## 7. 動態類別不平衡與 Prior Shift
 
-#### 背景
-若 Patron Walkaway 專案需在多個聚合層次產出預測（如個別顧客 → 區段 → 整體），原文獻未涵蓋**層級預測一致性**（確保低層預測加總等於高層預測）。
+### 7.1 類別比例會隨時間漂移
 
-#### 關鍵技術
-- **標準 MinT**（Minimum Trace reconciliation）：假設預測誤差協方差矩陣估計良好，但在校準資料有限時會失效
-- **穩健最佳化框架**（2026 TMLR）：明確考慮協方差矩陣的估計不確定性，將問題建模為半正定規劃（semidefinite program），最小化 worst-case 加權殘差
-- **M-estimation 對齊**：使用 Huber/LAD loss 達成對離群序列的穩健性
+Walkaway rate 並非常數：
 
-#### 實施建議
-✅ **Action Item 6.1：** 若專案有層級聚合需求，實施穩健對齊步驟  
-✅ **Action Item 6.2：** 以 MinT estimator 作為 baseline，在 multi-cutpoint backtest 中評估半正定或 M-estimation 變體  
-✅ **Action Item 6.3：** 即使無層級需求，考慮 bottom-up coherence（加總細粒度預測）通常優於 top-down 方法
+- 尖峰 vs 離峰  
+- 活動日 vs 平日  
+- 不同季節、不同比例新客
 
----
+單一訓練時期估出的 prior \(P(Y)\) 若被硬套到所有未來時段，會破壞校準，特別是在正例率大幅偏離時。
 
-## 第三部分：實施優先級與時程建議
+### 7.2 動態處理建議
 
-### 立即實施（0-1 個月）
+- 定期估計最近一段時間的實際走人率。  
+- 在決策層（例如 threshold setting、資源分配）考慮現在的正例率，而不是固定使用訓練時期的想定。  
+- 在理論上瞭解 **prior shift** 的前提下，可以：  
+  - 將模型視為估計 \(P(X\mid Y)\) 或某種打分，再根據新的 \(P(Y)\) 用 Bayes 更新後驗機率。  
+  - 但要小心，這只在「主要變的是 P(Y)，而非 P(Y\mid X)」時成立。
 
-| 項目 | 工作量 | 影響 | 風險 |
-|------|--------|------|------|
-| **RevIN 架構層整合** | 低 | 中-高 | 低 |
-| **MASE 作為主要指標** | 低 | 中 | 低 |
-| **PSI 生產監控** | 低-中 | 高 | 低 |
-| **Multi-cutpoint backtest 自動化** | 中 | 高 | 低 |
-| **Worst-case percentile 報告** | 低 | 中 | 低 |
+### 7.3 實務落地方式
 
-### 短期實施（1-3 個月）
-
-| 項目 | 工作量 | 影響 | 風險 |
-|------|--------|------|------|
-| **TTA（DynaTTA）中度漂移應對** | 中 | 高 | 中 |
-| **TSFM（Chronos/TimesFM）集成** | 中 | 中-高 | 中 |
-| **Conformal Prediction（EnbPI）** | 中 | 高 | 低-中 |
-| **CRPS 評估機率預測** | 低 | 中 | 低 |
-| **Streaming break detection** | 中 | 中 | 中 |
-
-### 中期實施（3-6 個月）
-
-| 項目 | 工作量 | 影響 | 風險 |
-|------|--------|------|------|
-| **PCMCI 因果特徵選擇** | 中-高 | 中-高 | 中 |
-| **Multi-variate drift（MMD/Wasserstein）** | 中 | 中 | 中 |
-| **穩定性 KPI 正式化** | 低-中 | 中 | 低 |
-| **Forecast combination recency weighting** | 低-中 | 中 | 低 |
-
-### 長期實施（6+ 個月）
-
-| 項目 | 工作量 | 影響 | 風險 |
-|------|--------|------|------|
-| **層級穩健對齊（若需要）** | 高 | 高（若有層級） | 中-高 |
-| **Regime-conditioned ensemble** | 高 | 高 | 高 |
-| **Self-Adaptive Forecasting（SAF）** | 中-高 | 中 | 中 |
+- 把 dynamic prior update 定位為「低成本、適合處理純粹 prior drift 的工具」。  
+- 在文件裡明寫前提：如果分析顯示不同時期給定同樣特徵的走人行為仍類似，dynamic prior 很值得採用；若不是，就不能只改 prior，需要回到 drift / retrain 機制。
 
 ---
 
-## 第四部分：評估框架完整 Checklist
+## 8. 生產 MLOps 與治理
 
-### 評估設計
+### 8.1 資料與模型版本管理
 
-- [ ] **時間順序嚴格保持**（無 random k-fold）
-- [ ] **Multi-cutpoint backtest**（至少 5-10 個歷史切點）
-- [ ] **Multi-horizon 評估**（h=1,2,...,H，每個 horizon 單獨報告）
-- [ ] **Expanding vs Rolling window**（依據資料特性選擇）
-- [ ] **切點事先固定或規則化**（避免 data snooping）
-- [ ] **刻意跨越已知斷裂點**（如 COVID-19、政策變動）
+每次訓練都應記錄：
 
-### 評估指標
+- 特徵 schema 與 ETL/特徵工程邏輯版本  
+- 訓練資料時間範圍、樣本篩選條件  
+- 標籤定義（window、規則）  
+- 模型參數與架構版本  
+- 校準方法與參數  
+- 上線時間與對應版本號
 
-**準確度：**
-- [ ] **MASE**（主要無量綱指標）
-- [ ] sMAPE（次要，競賽基準）
-- [ ] RMSE（若需要絕對尺度）
-- [ ] **95 百分位數誤差**（worst-case robustness）
+這讓你可以在出現異常時追溯「這一批預測是用什麼訓練資料、什麼特徵與什麼校準」做出來的。
 
-**機率預測：**
-- [ ] **CRPS**（完整分布評估）
-- [ ] **覆蓋率 + 銳度**（calibration + sharpness）
+### 8.2 部署流程
 
-**穩定性：**
-- [ ] **垂直穩定性**（同一目標日連續預測的平均絕對修正）
-- [ ] **水平穩定性**（相鄰 horizon 預測的平滑度）
+建議部署包含：
 
-**生產監控：**
-- [ ] **PSI**（特徵與預測分布漂移）
-- [ ] **MMD/Wasserstein**（多變量聯合分布偏移）
+- Shadow / canary：新模型先在小流量或陰影模式運行，與現行模型並行比較。  
+- 上線前自動跑多切點 backtest。  
+- 在新模型上線的前後，特別關注 score stability 與 ranking stability，以及主要決策數字（例如被標為高風險的人數比例）是否合理。
 
-### 模型組合
+### 8.3 監控儀表板
 
-- [ ] 統計方法（ARIMA/ETS）
-- [ ] 樹模型（XGBoost/LightGBM）
-- [ ] 神經網路（LSTM/GRU/TCN）
-- [ ] Prophet（業務日曆）
-- [ ] **TSFM**（Chronos/TimesFM，零樣本基準）
-- [ ] **Recency-weighted combination**（最近 N 個切點的表現）
+至少要有：
 
-### 特徵工程
-
-- [ ] Lag features
-- [ ] Rolling aggregations
-- [ ] 日曆特徵（月、週、假日）
-- [ ] 業務指標
-- [ ] **PCMCI 因果特徵選擇**（優先使用因果特徵）
-
-### 架構增強
-
-- [ ] **RevIN 正規化層**（吸收分布偏移）
-- [ ] **Conformal Prediction 區間**（EnbPI）
-- [ ] **TTA 模組**（DynaTTA，中度漂移應對）
-
-### 重訓策略
-
-- [ ] **PSI 監控**（< 0.10 穩定；0.10–0.25 關注；> 0.25 嚴重）
-- [ ] **兩層應對機制**：
-  - Tier 1: RevIN 自動吸收
-  - Tier 2: TTA 觸發（PSI 0.10–0.25）
-  - Tier 3: 完整重訓（PSI > 0.25）
-- [ ] **Streaming break detection**（CUSUM/ADWIN）
-- [ ] **選擇性重訓**（只重訓受影響的模型/區段）
-
-### 生產 MLOps
-
-- [ ] 特徵與模型共版本化
-- [ ] 訓練-serving 一致性檢查
-- [ ] 資料品質統計監控（常數序列、突跳、過期資料）
-- [ ] Staged rollout / Canary deployment
-- [ ] CI/CD 自動化 multi-cutpoint backtest
-- [ ] 健康 / SLA 監控
-- [ ] Artifact 溯源（可追溯至特定訓練切點與特徵版本）
+- 特徵分布與 PSI  
+- 預測分數分布  
+- 延遲 performance（AUC、PR-AUC、Brier、ECE），按時間與 segment 分解  
+- 模型版本切換點標註在所有圖上
 
 ---
 
-## 第五部分：技術堆疊建議
+## 9. 執行優先級（對本問題最重要的層）
 
-### Python 套件
+### 核心必做（建議第一個月內完成）
 
-**評估與 Backtest：**
-- `skforecast`：Walk-forward backtesting
-- `sktime`：時序模型統一介面、MASE 等指標
+- 多切點時間切分評估 + 分群穩健性  
+- AUC / PR-AUC / Brier / ECE 作為標配指標  
+- 校準流程（Platt / Isotonic / Beta）與定期 recalibration  
+- PSI + 分數分布 drift 監控  
+- 特徵 / 標籤 / 模型 / 校準的版本化  
+- 基礎 ensemble（至少 logistic + tree-model）
 
-**因果發現：**
-- `tigramite`：PCMCI 因果特徵選擇
+### 建議做（第二階段）
 
-**Conformal Prediction：**
-- `MAPIE`：包含 EnbPI、split conformal 等方法
+- score / ranking stability 指標  
+- regime-aware 分析與必要時的 regime-specific model  
+- selective retraining policy（按 segment 或時間）  
+- Label Delay 的雙層 dashboard（即時 vs 延遲）
 
-**時序基礎模型：**
-- `chronos-forecasting`（Amazon）
-- `timesfm`（Google，需 TensorFlow）
+### 進階／條件式採用
 
-**Drift 偵測：**
-- `evidently`：PSI、MMD、data drift 監控
-- `alibi-detect`：CUSUM、ADWIN 等 streaming detection
-
-**RevIN：**
-- 自行實作（PyTorch/TensorFlow，約 20-30 行）
-- 參考：https://github.com/ts-kim/RevIN
-
-**結構斷裂：**
-- `ruptures`：Bai–Perron、PELT、ICSS 等算法
-
-### 監控與 MLOps
-
-- **Evidently AI**：Drift 監控、model quality reports
-- **MLflow / Weights & Biases**：Experiment tracking、model versioning
-- **Grafana + Prometheus**：生產指標監控（PSI、MASE、穩定性 KPI）
-- **Great Expectations**：資料品質檢查
+- Test-Time Adaptation  
+- pseudo-labeling 更新機制  
+- dynamic prior update（在 prior shift 假設成立時）
 
 ---
 
-## 第六部分：風險與注意事項
+## 10. Summary：面對「近期未來」的思路
 
-### 已知限制
+對 Patron Walkaway 這個問題，「穩健」可以拆成幾件具體可操作的事情：
 
-1. **RevIN 限制**：無法處理條件輸出分布偏移或空間異質性（2025 研究中）
-2. **TSFM 成本**：推論時間與記憶體需求較傳統模型高（需評估生產環境可行性）
-3. **Conformal Prediction**：覆蓋保證僅限於校準分布；若生產分布劇變仍需重校準
-4. **因果發現**：PCMCI 假設線性或非線性加法雜訊模型；強非線性因果關係可能遺漏
+- 用多切點、多 segment 的時間驗證，**逼出所有該在未來出現的壞情況**。  
+- 用 ensemble + 校準，把模型輸出的機率變成**可信的風險刻度**。  
+- 用 drift 監控 + recalibration + selective retrain，把模型維持在**不會突然崩壞**的狀態。  
+- 把 label delay 和 prior shift 的現實納入設計，而不是事後補救。  
+- 用 MLOps 把所有變化都變成**可回溯、可管控**的版本化事件，而不是「黑盒裡換了一個模型」。
 
-### 成本效益權衡
-
-| 技術 | 實施成本 | 維護成本 | 預期收益 | 建議 |
-|------|---------|---------|---------|------|
-| RevIN | 極低 | 極低 | 中-高 | ✅ 立即實施 |
-| PSI 監控 | 低 | 低 | 高 | ✅ 立即實施 |
-| MASE 指標 | 極低 | 極低 | 中 | ✅ 立即實施 |
-| TTA（DynaTTA） | 中 | 中 | 高 | ✅ 短期實施 |
-| Conformal Prediction | 中 | 低-中 | 高 | ✅ 短期實施 |
-| TSFM 集成 | 中 | 中-高 | 中-高 | ⚠️ 評估後決定 |
-| PCMCI 因果選擇 | 中-高 | 中 | 中-高 | ⚠️ 中期實施 |
-| 層級穩健對齊 | 高 | 中 | 高（若有層級） | ⚠️ 視需求決定 |
-
----
-
-## 第七部分：成功指標與驗收標準
-
-### 短期目標（3 個月）
-
-- [ ] Multi-cutpoint backtest 自動化（5-10 個歷史切點）
-- [ ] MASE 成為主要評估指標
-- [ ] PSI 生產監控上線（輸入與預測）
-- [ ] RevIN 整合至所有模型
-- [ ] Worst-case percentile 誤差報告
-
-### 中期目標（6 個月）
-
-- [ ] TTA 兩層漂移應對機制上線
-- [ ] TSFM 納入集成（至少一個）
-- [ ] Conformal Prediction 區間估計上線
-- [ ] CRPS 評估機率預測
-- [ ] 穩定性 KPI 正式追蹤
-
-### 長期目標（12 個月）
-
-- [ ] PCMCI 因果特徵選擇於所有新模型
-- [ ] Multi-variate drift 監控（MMD）
-- [ ] Regime-conditioned ensemble（若資料支持）
-- [ ] 完整 MLOps pipeline（CI/CD、staged rollout、artifact 溯源）
-
-### 量化目標
-
-| 指標 | Baseline | 3 個月目標 | 6 個月目標 | 12 個月目標 |
-|------|---------|-----------|-----------|------------|
-| **MASE（avg across folds）** | [待定] | -5% | -10% | -15% |
-| **95%ile error** | [待定] | -10% | -15% | -20% |
-| **垂直穩定性（avg revision）** | [待定] | -20% | -30% | -40% |
-| **Drift detection latency** | 週 | 天 | 小時 | 即時 |
-| **False retraining rate** | [待定] | -30% | -50% | -70% |
-
----
-
-## 總結：核心行動計畫
-
-### 立即行動（本週）
-
-1. ✅ 將 RevIN 整合為所有模型的標準架構層
-2. ✅ 切換主要評估指標為 MASE（取代 MAPE）
-3. ✅ 設定 PSI 生產監控儀表板（特徵 + 預測）
-
-### 短期行動（本月）
-
-4. ✅ 實施 multi-cutpoint backtest 自動化
-5. ✅ 報告 worst-case percentile 誤差
-6. ✅ 開始 TTA（DynaTTA）技術驗證
-
-### 中期行動（本季）
-
-7. ✅ 評估 Chronos/TimesFM 作為集成基準
-8. ✅ 實施 Conformal Prediction（EnbPI）區間估計
-9. ✅ 上線兩層漂移應對機制（RevIN + TTA + 重訓）
-
-### 持續優化
-
-10. ✅ 每季評估新前沿方法（TSFM、因果發現、層級對齊）
-11. ✅ 每月檢視穩健性指標趨勢（MASE、穩定性、PSI）
-12. ✅ 每次重大斷裂後進行 post-mortem（模型在斷裂前後的表現）
-
----
-
-**文件版本：** 1.0  
-**最後更新：** 2026-03-15  
-**維護者：** Patron Walkaway 專案團隊  
-**下次檢視：** 2026-06-15（3 個月後）
+這份文件的目的，就是讓上面這些原則具體化，變成你可以直接實作與 review 的 checklist。
