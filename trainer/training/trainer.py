@@ -92,6 +92,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger("trainer")
 
+
+def _agent_debug_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+    run_id: str = "pre-fix",
+) -> None:
+    """Append one NDJSON debug line for runtime investigation (debug mode session bc1669)."""
+    try:
+        payload = {
+            "sessionId": "bc1669",
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        candidates = [
+            Path.cwd() / "debug-bc1669.log",
+            Path(__file__).resolve().parents[2] / "debug-bc1669.log",
+        ]
+        _last_error: Optional[str] = None
+        for log_path in candidates:
+            try:
+                with open(log_path, "a", encoding="utf-8") as _f:
+                    _f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                return
+            except Exception as _e:  # pragma: no cover - debug-only fallback
+                _last_error = f"{type(_e).__name__}: {_e}"
+        logger.warning("agent debug log write failed for all candidates: %s", _last_error)
+    except Exception as _e:
+        # Debug logging must never interrupt training.
+        logger.warning("agent debug log payload/build failed: %s", _e)
+
 # ---------------------------------------------------------------------------
 # Config imports
 # ---------------------------------------------------------------------------
@@ -2233,6 +2269,17 @@ def _export_parquet_to_libsvm(
     export_dir.mkdir(parents=True, exist_ok=True)
     if not feature_cols:
         raise ValueError("feature_cols must be non-empty for LibSVM export")
+    # Exclude "label" so SELECT label, {cols} never doubles the label column (would yield 51 cols for 50 names).
+    export_cols = [c for c in feature_cols if c != "label"]
+    if len(export_cols) < len(feature_cols):
+        logger.warning(
+            "LibSVM export: excluded %r from feature_cols (already selected as first column); using %d features.",
+            "label",
+            len(export_cols),
+        )
+    if not export_cols:
+        raise ValueError("feature_cols must contain at least one column other than 'label' for LibSVM export")
+    feature_cols = export_cols
     if not train_path.exists():
         raise FileNotFoundError(f"Train Parquet not found: {train_path}")
     if not valid_path.exists():
@@ -2269,6 +2316,7 @@ def _export_parquet_to_libsvm(
         )
         batch_size = 50_000
         n_train = 0
+        _train_row_len_logged = False
         with open(train_libsvm_tmp, "w", encoding="utf-8") as f_lib, open(
             train_weight_tmp, "w", encoding="utf-8"
         ) as f_w:
@@ -2278,6 +2326,17 @@ def _export_parquet_to_libsvm(
                 if not rows:
                     break
                 for row in rows:
+                    if not _train_row_len_logged:
+                        _exp = 1 + len(feature_cols) + 1  # label + features + _w
+                        if len(row) != _exp:
+                            logger.warning(
+                                "LibSVM export (train): first row has %d columns (expected %d); "
+                                "writing only first %d feature dims to avoid feature_name/num_feature mismatch.",
+                                len(row),
+                                _exp,
+                                len(feature_cols),
+                            )
+                        _train_row_len_logged = True
                     raw_label = int(row[0])
                     label = 1 if raw_label else 0
                     if raw_label not in (0, 1):
@@ -2285,7 +2344,9 @@ def _export_parquet_to_libsvm(
                             "LibSVM export: non-binary label %s at row, coercing to 0/1",
                             raw_label,
                         )
-                    vals = row[1 : 1 + len(feature_cols)]
+                    # Exactly len(feature_cols) feature values; use 0-based indices (0..nf-1) for LightGBM (see #1776, #6149).
+                    nf = len(feature_cols)
+                    vals = [row[1 + i] for i in range(nf)]
                     w = float(row[-1])
                     parts = [str(label)]
                     for i, v in enumerate(vals):
@@ -2298,7 +2359,7 @@ def _export_parquet_to_libsvm(
                         if isinstance(x, float) and math.isnan(x):
                             x = 0.0
                         if x != 0.0:
-                            parts.append(f"{i + 1}:{x}")
+                            parts.append(f"{i}:{x}")
                     f_lib.write(" ".join(parts) + "\n")
                     f_w.write(f"{w}\n")
                     n_train += 1
@@ -2310,6 +2371,7 @@ def _export_parquet_to_libsvm(
         os.replace(train_weight_tmp, train_weight)
 
         n_valid = 0
+        _valid_row_len_logged = False
         with open(valid_libsvm_tmp, "w", encoding="utf-8") as f_lib:
             result = con.execute(valid_sql)
             while True:
@@ -2317,6 +2379,17 @@ def _export_parquet_to_libsvm(
                 if not rows:
                     break
                 for row in rows:
+                    if not _valid_row_len_logged:
+                        _exp = 1 + len(feature_cols)
+                        if len(row) != _exp:
+                            logger.warning(
+                                "LibSVM export (valid): first row has %d columns (expected %d); "
+                                "writing only first %d feature dims.",
+                                len(row),
+                                _exp,
+                                len(feature_cols),
+                            )
+                        _valid_row_len_logged = True
                     raw_label = int(row[0])
                     label = 1 if raw_label else 0
                     if raw_label not in (0, 1):
@@ -2324,7 +2397,8 @@ def _export_parquet_to_libsvm(
                             "LibSVM export: non-binary label %s at row, coercing to 0/1",
                             raw_label,
                         )
-                    vals = row[1 : 1 + len(feature_cols)]
+                    nf = len(feature_cols)
+                    vals = [row[1 + i] for i in range(nf)]
                     parts = [str(label)]
                     for i, v in enumerate(vals):
                         if v is None or (isinstance(v, float) and v == 0.0):
@@ -2336,7 +2410,7 @@ def _export_parquet_to_libsvm(
                         if isinstance(x, float) and math.isnan(x):
                             x = 0.0
                         if x != 0.0:
-                            parts.append(f"{i + 1}:{x}")
+                            parts.append(f"{i}:{x}")
                     f_lib.write(" ".join(parts) + "\n")
                     n_valid += 1
         os.replace(valid_libsvm_tmp, valid_libsvm)
@@ -2364,7 +2438,8 @@ def _export_parquet_to_libsvm(
                                 "LibSVM export (test): non-binary label %s, coercing to 0/1",
                                 raw_label,
                             )
-                        vals = row[1 : 1 + len(feature_cols)]
+                        nf = len(feature_cols)
+                        vals = [row[1 + i] for i in range(nf)]
                         parts = [str(label)]
                         for i, v in enumerate(vals):
                             if v is None or (isinstance(v, float) and v == 0.0):
@@ -2376,12 +2451,67 @@ def _export_parquet_to_libsvm(
                             if isinstance(x, float) and math.isnan(x):
                                 x = 0.0
                             if x != 0.0:
-                                parts.append(f"{i + 1}:{x}")
+                                parts.append(f"{i}:{x}")
                         f_lib.write(" ".join(parts) + "\n")
                         n_test += 1
             os.replace(test_libsvm_tmp, test_libsvm)
     finally:
         con.close()
+
+    _max_idx = -1
+    _min_idx = 10**9
+    _idx_51_count = 0
+    _token_count = 0
+    _line_count = 0
+    try:
+        with open(train_libsvm, encoding="utf-8") as _tf:
+            for _line in _tf:
+                _line = _line.strip()
+                if not _line:
+                    continue
+                _line_count += 1
+                _parts = _line.split()
+                for _tok in _parts[1:]:
+                    if ":" not in _tok:
+                        continue
+                    _k = _tok.split(":", 1)[0]
+                    try:
+                        _idx = int(_k)
+                    except ValueError:
+                        continue
+                    _token_count += 1
+                    if _idx > _max_idx:
+                        _max_idx = _idx
+                    if _idx < _min_idx:
+                        _min_idx = _idx
+                    if _idx == 51:
+                        _idx_51_count += 1
+    except Exception as _scan_e:
+        # #region agent log
+        _agent_debug_log(
+            hypothesis_id="H1",
+            location="trainer/training/trainer.py:_export_parquet_to_libsvm:post-export-scan",
+            message="Failed to scan exported train LibSVM",
+            data={"path": str(train_libsvm), "error": str(_scan_e)},
+        )
+        # #endregion
+    else:
+        # #region agent log
+        _agent_debug_log(
+            hypothesis_id="H1",
+            location="trainer/training/trainer.py:_export_parquet_to_libsvm:post-export-scan",
+            message="Exported train LibSVM index statistics",
+            data={
+                "path": str(train_libsvm),
+                "feature_cols_len": len(feature_cols),
+                "line_count": _line_count,
+                "token_count": _token_count,
+                "min_feature_index": (None if _token_count == 0 else _min_idx),
+                "max_feature_index": (None if _token_count == 0 else _max_idx),
+                "index_51_count": _idx_51_count,
+            },
+        )
+        # #endregion
 
     if test_libsvm is not None:
         logger.info(
@@ -2393,6 +2523,11 @@ def _export_parquet_to_libsvm(
             "Exported LibSVM for Plan B+: train %s (%d rows + weight), valid %s (%d rows)",
             train_libsvm, n_train, valid_libsvm, n_valid,
         )
+    # Remove stale .bin so Step 9 always builds Dataset from current LibSVM (avoids feature_name(50) vs num_feature(51)).
+    _bin_in_export = export_dir / (train_libsvm.stem + ".bin")
+    if _bin_in_export.is_file():
+        _bin_in_export.unlink(missing_ok=True)
+        logger.info("LibSVM export: removed stale %s so training uses current feature set.", _bin_in_export.name)
     return (train_libsvm, valid_libsvm, test_libsvm)
 
 
@@ -3080,6 +3215,24 @@ def _compute_test_metrics_from_scores(
     }
 
 
+def _dataframe_for_lgb_predict(
+    model: Union[lgb.LGBMClassifier, "_BoosterWrapper"],
+    df: pd.DataFrame,
+    avail_cols: List[str],
+) -> pd.DataFrame:
+    """Return a DataFrame with columns matching the booster's feature names for predict (e.g. f0..f49 when trained from LibSVM without feature_name)."""
+    X = df[avail_cols]
+    booster = getattr(model, "booster_", None)
+    if booster is None or not avail_cols:
+        return X
+    fnames = booster.feature_name()
+    if not fnames or fnames[0] != "f0" or len(fnames) != len(avail_cols):
+        return X
+    X = X.copy()
+    X.columns = fnames
+    return X
+
+
 def _compute_train_metrics(
     model: Union[lgb.LGBMClassifier, "_BoosterWrapper"],
     threshold: float,
@@ -3390,6 +3543,23 @@ def train_single_rated_model(
     X_tr, y_tr = train_rated[avail_cols], train_rated["label"]
     X_vl = val_rated[avail_cols] if not val_rated.empty else X_tr.head(0)
     y_vl = val_rated["label"] if not val_rated.empty else y_tr.head(0)
+    _dupe_cols = [c for c in set(avail_cols) if avail_cols.count(c) > 1]
+    # #region agent log
+    _agent_debug_log(
+        hypothesis_id="H2",
+        location="trainer/training/trainer.py:train_single_rated_model:avail-cols",
+        message="Prepared avail_cols for LightGBM Dataset",
+        data={
+            "use_from_libsvm": bool(use_from_libsvm),
+            "feature_cols_len": len(feature_cols),
+            "avail_cols_len": len(avail_cols),
+            "avail_cols_unique_len": len(set(avail_cols)),
+            "avail_cols_duplicates": _dupe_cols[:10],
+            "has_label_in_avail_cols": ("label" in avail_cols),
+            "avail_cols_head": avail_cols[:8],
+        },
+    )
+    # #endregion
 
     # PLAN 方案 B §6: HPO on in-memory (train/valid) for both paths; from-file then uses best params for lgb.train.
     # B+ §4.4: from LibSVM we use default hp (no in-memory HPO).
@@ -3455,6 +3625,22 @@ def train_single_rated_model(
                 and int((np.asarray(y_vl) == 0).sum()) >= 1
             )
             _bin_path = train_libsvm_p.parent / (train_libsvm_p.stem + ".bin")
+            # LibSVM export uses 0-based feature indices (0..49 for 50 features) so LightGBM infers num_feature=50 and matches feature_name.
+            # #region agent log
+            _agent_debug_log(
+                hypothesis_id="H4",
+                location="trainer/training/trainer.py:train_single_rated_model:libsvm-branch",
+                message="LibSVM training branch path status before Dataset construction",
+                data={
+                    "train_libsvm_path": str(train_libsvm_p),
+                    "valid_libsvm_path": str(valid_libsvm_p),
+                    "bin_path": str(_bin_path),
+                    "bin_exists": bool(_bin_path.is_file()),
+                    "train_libsvm_lines": int(_n_lines),
+                    "avail_cols_len": len(avail_cols),
+                },
+            )
+            # #endregion
             _libsvm_temp_to_remove: Optional[Path] = None
             if _bin_path.is_file():
                 dtrain = lgb.Dataset(str(_bin_path))
@@ -3497,6 +3683,45 @@ def train_single_rated_model(
                 )
                 if STEP9_SAVE_LGB_BINARY:
                     try:
+                        _max_idx_train = -1
+                        _idx_51_cnt = 0
+                        _min_idx_train = 10**9
+                        with open(_train_path_for_lgb, encoding="utf-8") as _scanf:
+                            for _li, _line in enumerate(_scanf):
+                                if _li >= 100_000:
+                                    break
+                                _line = _line.strip()
+                                if not _line:
+                                    continue
+                                _parts = _line.split()
+                                for _tok in _parts[1:]:
+                                    if ":" not in _tok:
+                                        continue
+                                    try:
+                                        _idx = int(_tok.split(":", 1)[0])
+                                    except ValueError:
+                                        continue
+                                    if _idx > _max_idx_train:
+                                        _max_idx_train = _idx
+                                    if _idx < _min_idx_train:
+                                        _min_idx_train = _idx
+                                    if _idx == 51:
+                                        _idx_51_cnt += 1
+                        # #region agent log
+                        _agent_debug_log(
+                            hypothesis_id="H1",
+                            location="trainer/training/trainer.py:train_single_rated_model:pre-save-binary-scan",
+                            message="Pre-save_binary sampled index stats from train LibSVM",
+                            data={
+                                "train_path_for_lgb": str(_train_path_for_lgb),
+                                "sampled_lines": 100000,
+                                "min_feature_index": (None if _max_idx_train < 0 else _min_idx_train),
+                                "max_feature_index": (None if _max_idx_train < 0 else _max_idx_train),
+                                "index_51_count_in_sample": _idx_51_cnt,
+                                "avail_cols_len": len(avail_cols),
+                            },
+                        )
+                        # #endregion
                         dtrain.save_binary(str(_bin_path))
                         logger.info("Plan B+: saved train Dataset to %s", _bin_path)
                     except OSError as _e:
@@ -3505,6 +3730,21 @@ def train_single_rated_model(
                             _bin_path,
                             _e,
                         )
+                    except Exception as _e:
+                        # #region agent log
+                        _agent_debug_log(
+                            hypothesis_id="H3",
+                            location="trainer/training/trainer.py:train_single_rated_model:save-binary-exception",
+                            message="save_binary raised exception",
+                            data={
+                                "error_type": type(_e).__name__,
+                                "error": str(_e),
+                                "bin_path": str(_bin_path),
+                                "avail_cols_len": len(avail_cols),
+                            },
+                        )
+                        # #endregion
+                        raise
             _default_hp = {
                 "n_estimators": 400,
                 "learning_rate": 0.05,
@@ -3776,7 +4016,12 @@ def train_single_rated_model(
         )
 
     train_m = _compute_train_metrics(
-        model, cast(float, metrics["threshold"]), train_rated[avail_cols], y_tr, label="rated", log_results=False
+        model,
+        cast(float, metrics["threshold"]),
+        _dataframe_for_lgb_predict(model, train_rated, avail_cols),
+        y_tr,
+        label="rated",
+        log_results=False,
     )
     metrics.update(train_m)
 
@@ -3789,7 +4034,7 @@ def train_single_rated_model(
             )
             test_m = {}
         else:
-            X_te = test_rated[avail_cols]
+            X_te = _dataframe_for_lgb_predict(model, test_rated, avail_cols)
             y_te = test_rated["label"]
             test_m = _compute_test_metrics(
                 model,
@@ -4045,6 +4290,25 @@ def save_artifact_bundle(
 
 def run_pipeline(args) -> None:
     """Phase-1 training pipeline entry point."""
+    logger.info(
+        "DBG bc1669: run_pipeline entry reached (pid=%s cwd=%s days=%s local=%s)",
+        os.getpid(),
+        os.getcwd(),
+        getattr(args, "days", None),
+        bool(getattr(args, "use_local_parquet", False)),
+    )
+    # #region agent log
+    _agent_debug_log(
+        hypothesis_id="H5",
+        location="trainer/training/trainer.py:run_pipeline:entry",
+        message="run_pipeline entry instrumentation reached",
+        data={
+            "days": getattr(args, "days", None),
+            "use_local_parquet": bool(getattr(args, "use_local_parquet", False)),
+            "pid": os.getpid(),
+        },
+    )
+    # #endregion
     pipeline_start = time.perf_counter()
     start, end = parse_window(args)
     use_local = getattr(args, "use_local_parquet", False)

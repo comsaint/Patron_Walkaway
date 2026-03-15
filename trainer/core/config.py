@@ -121,7 +121,7 @@ G1_FBETA = 0.5                   # [DEPRECATED] F-beta weight (beta < 1 → prec
 OPTUNA_N_TRIALS = 150            # Optuna TPE trials for threshold search (DEC-009/010). A27: total Step 9 time scales with this.
 # Optional Optuna time budget (seconds) for study.optimize. A27: tune to cap total HPO time.
 # Disable timeout by setting to None or a non-positive value (e.g. -1).
-OPTUNA_TIMEOUT_SECONDS: Optional[int] = 60 * 60 * 3 # -1 = no timeout, 10 * 60 = 10 minutes
+OPTUNA_TIMEOUT_SECONDS: Optional[int] = 60 * 60 * 1 # -1 = no timeout, 10 * 60 = 10 minutes
 # Optional study-level early stop: stop when best validation AP has not improved for
 # this many consecutive trials. None = disabled (run full n_trials; default for reproducibility).
 # Positive int (e.g. 40–60) = stop early to save time; recommend 40–60 to avoid stopping
@@ -130,7 +130,7 @@ OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = 40
 # HPO subsampling (PLAN "Optuna HPO 階段 train/valid 抽樣"): max rows used for Optuna search only.
 # A26: Set to subsample train/valid for HPO to reduce peak memory and trial time; final training uses full data.
 # None = no subsampling. Positive int (e.g. 1_500_000) = cap train rows; valid same proportion.
-OPTUNA_HPO_SAMPLE_ROWS: Optional[int] = None
+OPTUNA_HPO_SAMPLE_ROWS: Optional[int] = 1500000
 # Threshold selection objective (DEC-026): Optimize Precision at recall >= THRESHOLD_MIN_RECALL
 # (trainer: argmax(pr_prec) over valid_mask; backtester: Optuna maximises precision).
 # THRESHOLD_FBETA is still used for val_fbeta_05 / reporting only, not for choosing threshold.
@@ -279,24 +279,24 @@ STEP7_DUCKDB_PRESERVE_INSERTION_ORDER: bool = DUCKDB_PRESERVE_INSERTION_ORDER
 # are loaded. Step 8 then samples from train Parquet (first N rows) for screening; after
 # screening train is loaded once for export/Step 9. Reduces peak RAM between Step 7 and Step 8.
 # Requires STEP7_USE_DUCKDB=True; on DuckDB failure we raise (no pandas fallback) per PLAN.
-STEP7_KEEP_TRAIN_ON_DISK: bool = False
+STEP7_KEEP_TRAIN_ON_DISK: bool = True
 
 # --- Plan B+: LibSVM export (PLAN 方案 B+ 階段 3) ---
 # When True and step7_train_path is set (B+ path), stream export from Parquet to
 # train_for_lgb.libsvm + train_for_lgb.libsvm.weight and valid_for_lgb.libsvm
 # before loading train into memory. Requires STEP7_KEEP_TRAIN_ON_DISK and split paths.
-STEP9_EXPORT_LIBSVM: bool = False
+STEP9_EXPORT_LIBSVM: bool = True
 
 # --- Plan B: train from file (PLAN 方案 B) ---
 # When True, Step 9 will train from on-disk CSV/TSV (or equivalent) instead of
 # loading full train_df into memory. Requires export + Booster path (not yet implemented).
 # Default False until the full path is implemented and validated.
-STEP9_TRAIN_FROM_FILE: bool = False
+STEP9_TRAIN_FROM_FILE: bool = True
 
 # --- Plan B+ stage 5 (PLAN 方案 B+ 階段 5)：optional .bin for LibSVM path ---
 # When True and training from LibSVM (train_libsvm_paths), save dtrain to
 # train_for_lgb.bin after first build; on next run use .bin if present (faster I/O).
-STEP9_SAVE_LGB_BINARY: bool = False
+STEP9_SAVE_LGB_BINARY: bool = True
 # When set (e.g. 2_000_000), Step 8 feature screening uses only this many rows from
 # train (strategy A: sample-based screening to avoid loading full train). None = use
 # full train for screening (current behaviour). A23: For in-memory path suggest 2_000_000;

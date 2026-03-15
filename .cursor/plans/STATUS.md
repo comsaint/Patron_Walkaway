@@ -6,6 +6,27 @@
 
 ---
 
+## Plan B+ LibSVM Export：0-based feature index（feature_name 與 num_feature 一致）
+
+**Date**: 2026-03-15
+
+### 目標
+修正 LightGBM 從 LibSVM 讀取時「feature_name(50) 與 num_feature(51) 不符」錯誤。LightGBM 對 LibSVM 使用 **0-based** 欄位 index（見 GitHub #1776、#6149），傳統 1-based 寫法（1..50）會被解讀為 51 個 feature，導致與傳入的 50 個 feature_name 不一致。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/training/trainer.py` | **_export_parquet_to_libsvm**：train/valid/test 三處寫入 LibSVM 時改為 **0-based** index（`f"{i}:{x}"`，i=0..49），取代原 `f"{i+1}:{x}"`（1-based）；註解引用 LightGBM #1776、#6149。 |
+| `trainer/training/trainer.py` | **train_single_rated_model（LibSVM 路徑）**：建 Dataset 時恢復傳入 `feature_name=list(avail_cols)`；訓練後 `avail_cols = list(booster.feature_name())`；in-memory 驗證改回 `booster.predict(val_rated[avail_cols])`。 |
+
+### 手動驗證建議
+- 刪除既有 `trainer/.data/export/train_for_lgb.libsvm`（及 valid/test）或重新跑含 LibSVM export 的 pipeline，以產生 0-based 檔案。
+- 執行 `python -m trainer.training.trainer --days 7 --use-local-parquet`（或 --days 30），確認 Step 9 不再出現 `ValueError: Length of feature_name(50) and num_feature(51) don't match`。
+- artifact 與 feature_list 應保留真實特徵名稱。
+
+---
+
 ## Step 8：DuckDB CORR 接線至 screen_features（PLAN 可選／後續）
 
 **Date**: 2026-03-14
