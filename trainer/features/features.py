@@ -946,6 +946,9 @@ def compute_correlation_matrix_duckdb(
     columns = requested columns; only numeric columns are used for CORR, missing
     or non-numeric get 0.0. Uses DuckDB corr(); result is symmetric with 1.0 on
     diagonal (abs). For 0 or 1 column returns empty or 1×1 [[1.0]].
+
+    path should only come from controlled pipeline output (e.g. step7_train_path);
+    do not pass unvalidated user input.
     """
     if (path is None) == (df is None):
         raise ValueError(
@@ -1171,10 +1174,66 @@ def screen_features(
         return []
     X_safe = X.fillna(0)
 
-    def _correlation_prune(ordered_names: List[str], x: pd.DataFrame) -> List[str]:
+    # Optional DuckDB correlation matrix (PLAN Step 8 Phase 2: wire CORR into screen_features).
+    # When train_path/train_df is set we compute corr once for nonzero; use submatrix for MI path.
+    # len(nonzero) <= 1: skip DuckDB corr; _correlation_prune returns immediately.
+    corr_matrix_duckdb: Optional[pd.DataFrame] = None
+    if use_duckdb_std and len(nonzero) > 1:
+        try:
+            import duckdb
+            _corr_exc_types: tuple = (ValueError, OSError, duckdb.Error)
+        except ImportError:
+            _corr_exc_types = (ValueError, OSError)
+        try:
+            if train_path is not None:
+                corr_matrix_duckdb = compute_correlation_matrix_duckdb(nonzero, path=train_path)
+            else:
+                assert train_df is not None
+                cols_corr = [c for c in nonzero if c in train_df.columns]
+                if cols_corr:
+                    corr_matrix_duckdb = compute_correlation_matrix_duckdb(
+                        cols_corr, df=train_df[cols_corr]
+                    )
+            if corr_matrix_duckdb is not None and not corr_matrix_duckdb.empty:
+                logger.info(
+                    "screen_features: correlation via DuckDB (path=%s, df=%s); %d×%d matrix",
+                    train_path is not None,
+                    train_df is not None,
+                    len(corr_matrix_duckdb.index),
+                    len(corr_matrix_duckdb.columns),
+                )
+        except _corr_exc_types as exc:
+            logger.warning(
+                "screen_features: DuckDB correlation failed, falling back to pandas: %s",
+                exc,
+            )
+            corr_matrix_duckdb = None
+
+    def _correlation_prune(
+        ordered_names: List[str],
+        x: pd.DataFrame,
+        corr_matrix: Optional[pd.DataFrame] = None,
+    ) -> List[str]:
+        """Drop features that are highly correlated (|r| > corr_threshold) with one already kept.
+
+        When corr_matrix is provided (e.g. from DuckDB), it may cover only a subset of
+        ordered_names (e.g. df mode when train_df is missing some columns); if any
+        ordered_names are missing from corr_matrix, we fall back to x[ordered_names].corr().abs().
+        Caller must ensure ordered_names is a subset of x.columns when the fallback path is used.
+        """
         if len(ordered_names) <= 1:
             return ordered_names
-        corr = x[ordered_names].corr().abs()
+        if corr_matrix is not None and not corr_matrix.empty:
+            # Use precomputed matrix (e.g. from DuckDB); take submatrix for ordered_names.
+            # When corr_matrix index/columns do not cover ordered_names, fall back to pandas.
+            missing = [c for c in ordered_names if c not in corr_matrix.index or c not in corr_matrix.columns]
+            if missing:
+                corr = x[ordered_names].corr().abs()
+            else:
+                # Missing cells filled with 0.0 (no correlation). Pruning uses upper triangle only.
+                corr = corr_matrix.reindex(index=ordered_names, columns=ordered_names, fill_value=0.0).astype(float)
+        else:
+            corr = x[ordered_names].corr().abs()
         upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
         to_drop = set()
         for col in upper.columns:
@@ -1212,7 +1271,7 @@ def screen_features(
         return out
 
     if screen_method == "lgbm":
-        candidates = _correlation_prune(nonzero, X_safe)
+        candidates = _correlation_prune(nonzero, X_safe, corr_matrix=corr_matrix_duckdb)
         return _lgbm_rank_and_cap(candidates)
 
     # "mi" or "mi_then_lgbm": run mutual information
@@ -1224,7 +1283,12 @@ def screen_features(
     mi_df = pd.Series(mi, index=nonzero).sort_values(ascending=False)
     candidates = mi_df.index.tolist()
     logger.info("screen_features: %d candidates after MI ranking", len(candidates))
-    candidates = _correlation_prune(candidates, X_safe)
+    # Submatrix of DuckDB corr for MI-ranked candidates (all are in nonzero).
+    corr_sub = None
+    if corr_matrix_duckdb is not None and not corr_matrix_duckdb.empty:
+        if set(candidates).issubset(corr_matrix_duckdb.index) and set(candidates).issubset(corr_matrix_duckdb.columns):
+            corr_sub = corr_matrix_duckdb.loc[candidates, candidates].copy()
+    candidates = _correlation_prune(candidates, X_safe, corr_matrix=corr_sub)
 
     if screen_method == "mi":
         if effective_top_k is not None:

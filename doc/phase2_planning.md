@@ -50,3 +50,7 @@
 
 - **Time-to-event**：若需更細時間預測，可評估 Temporal Point Process（TPP）或 survival 模型（預測「離場時間」再轉成 15 分鐘內機率）；實務上固定窗二元分類多已足夠。
 - **線上學習**：在分佈持續快速變化時，可評估 River、Vowpal Wabbit 等 incremental learning；多數場景仍以週期性重訓 + 即時推論為主。
+
+### 延伸閱讀
+
+- **[預測模型近期未來穩健性文獻整理](forecasting_robustness_literature_review.md)**：多切點 backtest、結構斷裂、預測組合、穩定性、漂移與重訓、生產 MLOps 等之文獻與綜合建議。

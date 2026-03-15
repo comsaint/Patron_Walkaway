@@ -38,7 +38,7 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 - **Phase 1**：PLAN.md Step 0–10 均已實作完成（單一 Rated 模型、三軌特徵、DuckDB Track LLM、Feature Spec YAML 凍結進 artifact、閾值 F-beta 最大化）。
 - **Track A（Featuretools DFS）已移除**：特徵工程僅保留三軌——Track Profile（PIT/as-of join）、Track LLM（DuckDB + YAML）、Track Human（向量化 `loss_streak`/`run_boundary`）。
 - **Scorer / API**：僅對評級客（`is_rated`）產生告警；訓練結束後會清理舊版 `nonrated_model.pkl` / `rated_model.pkl`。
-- **測試**：全量 `pytest` 約 519 passed；實作計畫與狀態詳見 `.cursor/plans/PLAN.md`、`.cursor/plans/STATUS.md`、`.cursor/plans/DECISION_LOG.md`。
+- **測試**：全量 `pytest` 約 519 passed；實作計畫與狀態詳見 `.cursor/plans/PLAN.md`、`.cursor/plans/STATUS.md`、`.cursor/plans/DECISION_LOG.md`。Phase 2 規劃草稿見 `doc/phase2_planning.md`。
 
 ### 環境設定
 
@@ -136,6 +136,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `doc/PLAN_VS_TRAINER_COMPARISON.md` | 計畫與實作對照 |
 | `doc/TRAINER_ISSUES.md` | 已知問題與備註 |
 | `.cursor/plans/` | 實作計畫（PLAN.md）、狀態（STATUS.md）、決策紀錄（DECISION_LOG.md） |
+| `doc/phase2_planning.md` | Phase 2 規劃草稿（方向、文獻與業界建議） |
 | **PROJECT.md** | 專案結構與目錄職責 SSOT；詳細計畫與狀態以 `.cursor/plans/` 為準，規格與 Phase 2 在 `doc/`。 |
 
 ### 產物（trainer 輸出）
@@ -186,7 +187,7 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 - **Phase 1**：PLAN.md Step 0–10 均已实现完成（单一 Rated 模型、三轨特征、DuckDB Track LLM、Feature Spec YAML 冻结进 artifact、阈值 F-beta 最大化）。
 - **Track A（Featuretools DFS）已移除**：特征工程仅保留三轨——Track Profile（PIT/as-of join）、Track LLM（DuckDB + YAML）、Track Human（向量化 `loss_streak`/`run_boundary`）。
 - **Scorer / API**：仅对评级客（`is_rated`）产生告警；训练结束后会清理旧版 `nonrated_model.pkl` / `rated_model.pkl`。
-- **测试**：全量 `pytest` 约 519 passed；实现计划与状态详见 `.cursor/plans/PLAN.md`、`.cursor/plans/STATUS.md`、`.cursor/plans/DECISION_LOG.md`。
+- **测试**：全量 `pytest` 约 519 passed；实现计划与状态详见 `.cursor/plans/PLAN.md`、`.cursor/plans/STATUS.md`、`.cursor/plans/DECISION_LOG.md`。Phase 2 规划草稿见 `doc/phase2_planning.md`。
 
 ### 环境设置
 
@@ -272,6 +273,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `doc/PLAN_VS_TRAINER_COMPARISON.md` | 计划与实现对照 |
 | `doc/TRAINER_ISSUES.md` | 已知问题与备注 |
 | `.cursor/plans/` | 实现计划（PLAN.md）、状态（STATUS.md）、决策记录（DECISION_LOG.md） |
+| `doc/phase2_planning.md` | Phase 2 规划草稿（方向、文献与业界建议） |
 | **PROJECT.md** | 项目结构与目录职责 SSOT；详细计划与状态以 `.cursor/plans/` 为准，规格与 Phase 2 在 `doc/`。 |
 
 ### 产物（trainer 输出）
@@ -322,7 +324,7 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 - **Phase 1**: PLAN.md Steps 0–10 are implemented (single Rated model, three-track features, DuckDB Track LLM, Feature Spec YAML frozen into artifact, F-beta threshold maximization).
 - **Track A (Featuretools DFS) removed**: Feature engineering is three-track only — Track Profile (PIT/as-of join), Track LLM (DuckDB + YAML), Track Human (vectorized `loss_streak`/`run_boundary`).
 - **Scorer / API**: Alerts are emitted only for rated patrons (`is_rated`); stale `nonrated_model.pkl` / `rated_model.pkl` are cleaned up after training.
-- **Tests**: Full `pytest` ~519 passed; see `.cursor/plans/PLAN.md`, `.cursor/plans/STATUS.md`, `.cursor/plans/DECISION_LOG.md` for plan and status.
+- **Tests**: Full `pytest` ~519 passed; see `.cursor/plans/PLAN.md`, `.cursor/plans/STATUS.md`, `.cursor/plans/DECISION_LOG.md` for plan and status. Phase 2 planning draft: `doc/phase2_planning.md`.
 
 ---
 
@@ -508,6 +510,7 @@ mypy trainer/ --ignore-missing-imports
 | `doc/PLAN_VS_TRAINER_COMPARISON.md` | Plan vs implementation comparison |
 | `doc/TRAINER_ISSUES.md` | Known issues / notes |
 | `.cursor/plans/` | Implementation plan (PLAN.md), status (STATUS.md), decision log (DECISION_LOG.md) |
+| `doc/phase2_planning.md` | Phase 2 planning draft (directions, literature and industry notes) |
 | **PROJECT.md** | Project structure and directory responsibilities (SSOT); detailed plan and status in `.cursor/plans/`, specs and Phase 2 in `doc/`. |
 
 ---

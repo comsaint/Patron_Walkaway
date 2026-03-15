@@ -6,6 +6,175 @@
 
 ---
 
+## Step 8：DuckDB CORR 接線至 screen_features（PLAN 可選／後續）
+
+**Date**: 2026-03-14
+
+### 目標
+依 PLAN.md「Step 8 Feature Screening：DuckDB 算統計量」Phase 2：將 `compute_correlation_matrix_duckdb` 接線至 `screen_features`，使在提供 `train_path` 或 `train_df` 時，相關性修剪改由 DuckDB 計算 K×K 矩陣，避免大 DataFrame 上 `x.corr().abs()` 的記憶體風險；失敗時 fallback 至既有 pandas 路徑。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/features/features.py` | **screen_features**：在取得 `nonzero` 且 `use_duckdb_std` 為 True 時，呼叫 `compute_correlation_matrix_duckdb(nonzero, path=train_path)` 或 `(nonzero, df=train_df[cols_corr])` 取得全量相關矩陣；失敗時 log warning 並設為 None。新增 **corr_matrix_duckdb** 變數並傳入 _correlation_prune。 |
+| `trainer/features/features.py` | **_correlation_prune**：新增可選參數 `corr_matrix: Optional[pd.DataFrame] = None`。若提供且涵蓋 `ordered_names`，使用該矩陣之 submatrix（`reindex(index=ordered_names, columns=ordered_names)`）進行修剪；否則沿用 `x[ordered_names].corr().abs()`。 |
+| `trainer/features/features.py` | **lgbm 路徑**：`_correlation_prune(nonzero, X_safe, corr_matrix=corr_matrix_duckdb)`。 |
+| `trainer/features/features.py` | **mi / mi_then_lgbm 路徑**：先以 `corr_matrix_duckdb.loc[candidates, candidates]` 取得子矩陣（candidates 為 MI 排序後名單），再呼叫 `_correlation_prune(candidates, X_safe, corr_matrix=corr_sub)`。 |
+
+### 手動驗證建議
+- 執行 `python -m pytest tests/test_review_risks_step8_duckdb_std.py tests/test_features_review_risks_round9.py tests/test_review_risks_round168.py -v`，確認 Step 8 與 screen_features 相關測試全過。
+- 執行完整訓練 pipeline（例如 `python -m trainer.training.trainer --use-local-parquet --recent-chunks 1 --days 90`），觀察 log 是否出現 `screen_features: correlation via DuckDB (path=..., df=...); K×K matrix`；若 DuckDB 失敗應出現 `screen_features: DuckDB correlation failed, falling back to pandas`。
+- 比對：同一資料下以 `train_path`/`train_df` 與不傳（僅 sample）跑 screen_features，篩選結果可不同（DuckDB 用全量、pandas 用 sample），但皆不應報錯。
+
+### pytest 結果
+```
+77 passed, 2 skipped (test_review_risks_step8_duckdb_std + screen_features 相關)
+```
+（指令：`python -m pytest tests/test_review_risks_step8_duckdb_std.py tests/test_features_review_risks_round9.py tests/test_review_risks_round168.py tests/test_review_risks_round210.py tests/test_review_risks_late_rounds.py -v`）
+
+### 下一步建議
+- 可選：為「screen_features 使用 DuckDB corr 時結果與 pandas fallback 一致（小資料）」加一則契約測試（小 DataFrame + train_df 設定，assert 篩出名單一致或 log 含 "correlation via DuckDB"）。
+- 可更新 PLAN.md「可選／後續」一節，將「Step 8 將 DuckDB CORR 接線至 screen_features」標為已完成。
+
+---
+
+### Code Review：Step 8 DuckDB CORR 接線（高可靠性標準）
+
+**Date**: 2026-03-14
+
+**審查範圍**：PLAN.md § Step 8 Feature Screening：DuckDB 算統計量（Phase 2）、STATUS 本節修改摘要；`trainer/features/features.py` 中 screen_features 之 DuckDB CORR 接線、_correlation_prune 之 corr_matrix 參數、lgbm / mi 兩處呼叫；`compute_correlation_matrix_duckdb` 之既有行為（path/df、numeric_cols、reindex）。以下僅列潛在問題與建議，**不重寫整套**。
+
+---
+
+#### 1. 例外處理過寬：`except Exception` 可能遮蓋程式錯誤或中斷
+
+**問題**：screen_features 內 DuckDB CORR 區塊使用 `except Exception as exc`，會一併捕獲 `KeyboardInterrupt`、`SystemExit` 子類、以及 `AssertionError`、`TypeError` 等程式錯誤，導致 fallback 至 pandas 且僅 log warning，除錯時難以區分「預期之 DuckDB 失敗」與「實作疏失」。
+
+**具體修改建議**：改為捕獲明確例外類型，例如 `(ValueError, OSError)` 並視專案是否直接 import duckdb 而加入 `duckdb.Error`（若 duckdb 在函數內 import 則可用 `except (ValueError, OSError):`；若希望一併捕獲 DuckDB 查詢錯誤，在 `compute_correlation_matrix_duckdb` 內已 raise 的例外類型納入）。保留其餘未捕獲之例外向上拋出，避免遮蓋程式 bug。若暫不縮小範圍，至少在註解或 log 中註明「預期僅捕獲 DuckDB/IO/參數相關錯誤，其餘應視為 bug」。
+
+**希望新增的測試**：契約測試：當 `compute_correlation_matrix_duckdb` 因「可預期」原因失敗（例如 path 指向不存在檔案、或 df 為空且觸發 DuckDB 行為）時，screen_features 不拋錯且 log 含 "DuckDB correlation failed, falling back to pandas"；可選：mock 讓 `compute_correlation_matrix_duckdb` raise `ValueError`，assert 回傳值仍為合法 list 且為 pandas fallback 結果。
+
+---
+
+#### 2. 邊界：df 模式下 `cols_corr` 為 nonzero 之子集，corr_matrix 之 index/columns 與 nonzero 不一致
+
+**問題**：在 `train_df` 路徑下，`cols_corr = [c for c in nonzero if c in train_df.columns]`，若 Parquet/train_df 缺少部分 nonzero 欄位，則 `corr_matrix_duckdb` 的 index/columns 為 `cols_corr` 而非完整 `nonzero`。lgbm 路徑呼叫 `_correlation_prune(nonzero, X_safe, corr_matrix=corr_matrix_duckdb)` 時，`_correlation_prune` 內 `missing = [c for c in ordered_names if c not in corr_matrix.index or ...]` 會正確判定缺欄並 fallback 至 pandas，行為正確。但文件或註解未說明「corr_matrix 可能只涵蓋 subset，missing 時自動 fallback」，日後維護可能誤以為 corr_matrix 必與 ordered_names 完全一致。
+
+**具體修改建議**：在 screen_features 註解或 _correlation_prune docstring 中補一句：「當 corr_matrix 之 index/columns 未涵蓋 ordered_names 時，自動改用 x[ordered_names].corr().abs()，以支援 df 模式下 train_df 缺欄之情況。」無需改程式邏輯。
+
+**希望新增的測試**：契約測試：給定 `train_df` 僅含 `nonzero` 之**部分**欄位（例如少一欄），呼叫 screen_features(..., train_df=train_df)；assert 不拋錯、回傳為 list、且 log 中出現 "correlation via DuckDB" 或 "DuckDB correlation failed" 其一（依實作是否在缺欄時仍呼叫 DuckDB）；並 assert 篩選結果與「全部欄位皆存在時」在語義上可接受（例如至少回傳非空或與 pandas fallback 同構）。
+
+---
+
+#### 3. 語義：reindex 之 fill_value=0.0 對對角線與缺失格之影響
+
+**問題**：_correlation_prune 內使用 `corr_matrix.reindex(index=ordered_names, columns=ordered_names, fill_value=0.0)`。若僅為重排順序，對角線仍為 1.0；若 ordered_names 含 corr_matrix 中不存在的名稱（此時應已走 missing 分支而 fallback pandas，不進入此路徑），則 reindex 會產出 0.0 之行列。目前邏輯僅使用 upper triangle（k=1），不對角線取值，故 0.0 填補不影響修剪結果。惟文件未說明「缺失格視為 0 相關」，若未來有人改 pruning 邏輯可能誤用對角線。
+
+**具體修改建議**：在 _correlation_prune 內使用 precomputed matrix 的區段加註：「Missing cells are filled with 0.0 (no correlation). Diagonal is used only for reindex ordering; pruning uses upper triangle only.」無需改程式。
+
+**希望新增的測試**：可選。給定一個 2×2 之 corr_matrix（例如 [[1, 0.99], [0.99, 1]]），傳入 _correlation_prune(ordered_names, x, corr_matrix=that_df)，assert 修剪結果與用 x[ordered_names].corr().abs() 一致（或符合 threshold 語義）。已有 test_r17_screen_features_prunes_highly_correlated_pair 可視為部分覆蓋；可選再加一則「DuckDB 回傳之矩陣與 pandas 小資料結果一致」之契約。
+
+---
+
+#### 4. 效能／記憶體：df 模式下傳入 train_df[cols_corr] 之生命週期
+
+**問題**：PLAN § 注意事項提到「若用 con.register(df)，在 step 結束後關閉 connection 或 unregister」。目前 `compute_correlation_matrix_duckdb(..., df=train_df[cols_corr])` 會在其中 `con.register("_corr_src", df[numeric_cols])`，並在 `finally` 中 `con.close()`，故連線關閉後 DuckDB 不再持有引用。惟 `train_df[cols_corr]` 會產生 DataFrame 視圖或複本，在大型 train_df（例如 33M×K）時，若產生複本會短暫增加記憶體。多數情境下為 view，風險低。
+
+**具體修改建議**：無需改動。若未來觀測到 Step 8 記憶體尖峰，可再評估改為 path-only 路徑（先將 train 寫 Parquet 再算 corr）或限制 K 上限。可在 STATUS 或程式註解註記「df 路徑下 DuckDB 自 DataFrame 串流讀取，不額外複製全量；若 OOM 可考慮僅用 train_path 路徑」。
+
+**希望新增的測試**：無需針對本點新增；既有 Step 8 大型 df 契約（若有）或 OOM 導向測試已涵蓋。
+
+---
+
+#### 5. 路徑注入／安全性：train_path 之來源與 escaping
+
+**問題**：`compute_correlation_matrix_duckdb` 內 path 以 `str(path).replace("'", "''")` 嵌入 SQL。path 來自 pipeline 內部（step7_train_path），非使用者直接輸入，風險低。若未來 path 改為使用者可配置或上傳，僅替換單引號不足以防 SQL 注入或路徑 traversal。
+
+**具體修改建議**：維持現狀；在 `compute_correlation_matrix_duckdb` 或呼叫端註解註明「path 應僅來自受控之 pipeline 產出（如 step7_train_path），勿傳入未驗證之使用者輸入」。若日後支援使用者指定路徑，應改為參數化查詢或嚴格路徑驗證。
+
+**希望新增的測試**：無需針對本點新增。可選：既有 test 中 path 含單引號、分號等已涵蓋 escaping 行為。
+
+---
+
+#### 6. 邊界：len(nonzero) > 1 時才計算 DuckDB corr，len(nonzero) == 1 時不呼叫
+
+**問題**：當 `len(nonzero) == 1` 時不進入 DuckDB CORR 區塊，corr_matrix_duckdb 保持 None，_correlation_prune 收到 ordered_names 長度 1 會直接 return ordered_names。行為正確（單一特徵無需相關修剪）。無 bug。
+
+**具體修改建議**：無需改動。可選：在註解註明「len(nonzero) <= 1 時跳過 DuckDB corr，_correlation_prune 會直接回傳」。
+
+**希望新增的測試**：可選。screen_features(..., train_df=small_df, feature_names=[single_col], ...) 且該欄 nonzero，assert 回傳 [single_col] 且無 exception；可與既有 single-feature 測試合併。
+
+---
+
+#### 7. MI 路徑：corr_sub 之 candidates 順序與 .loc 行為
+
+**問題**：`corr_sub = corr_matrix_duckdb.loc[candidates, candidates].copy()` 會依 candidates 順序回傳行列。_correlation_prune 內使用 `corr_matrix.reindex(index=ordered_names, columns=ordered_names, ...)`，故順序以 ordered_names（即 candidates）為準。.loc[candidates, candidates] 已按 candidates 順序，與 reindex 一致。無 bug。
+
+**具體修改建議**：無需改動。
+
+**希望新增的測試**：可選。給定固定 small feature_matrix + labels，分別用 screen_method="mi" 與 "lgbm"，且 train_df 相同，assert 兩者皆完成且回傳 list；可選 assert 兩者篩選結果之長度或包含關係符合預期（不要求完全一致，因 MI 與 LGBM 排序不同）。
+
+---
+
+**總結**：建議優先處理 **§1（縮小例外類型或補註解）** 與 **§2（文件／註解補齊 subset 與 fallback 語義）**；**§3** 可加註解即可；**§4、§5、§6、§7** 依上述無需或可選補強。建議新增之測試：§1 之 DuckDB 失敗 fallback 契約、§2 之 train_df 缺欄仍不拋錯且結果可接受、§3 可選之 DuckDB 矩陣與 pandas 小資料一致契約。
+
+---
+
+### Code Review 第二輪（複核）
+
+**Date**: 2026-03-14
+
+**複核範圍**：已重新閱讀 PLAN.md § Step 8 Feature Screening：DuckDB 算統計量、STATUS.md 本節與第一輪審查、DECISION_LOG.md（DEC-020/023/025/027 等與 screening／DuckDB／OOM 相關）；並再次檢視 `trainer/features/features.py` 中 screen_features 之 DuckDB CORR 區塊、_correlation_prune 與兩處呼叫、以及與 nonzero／X_safe／candidates 之資料流。
+
+**複核結論**：第一輪所列 7 項（例外過寬、cols_corr 子集語義、reindex fill_value、df 生命週期、path 安全性、len(nonzero)==1、MI 路徑 .loc 順序）仍成立，程式碼與第一輪審查時一致，**未發現新 bug 或遺漏之邊界**。DECISION_LOG 未對 Step 8 CORR 接線另設決策，與 PLAN 一致即可。
+
+**補充建議（第一輪未單獨成條）**：
+
+- **caller 契約：ordered_names ⊆ x.columns**  
+  _correlation_prune 在 fallback 時使用 `x[ordered_names].corr().abs()`，若 `ordered_names` 含 `x.columns` 以外之名稱會觸發 KeyError。目前流程（nonzero 已濾至 feature_matrix.columns、X 自 nonzero 建、candidates ⊆ nonzero）可保證 lgbm 與 mi 路徑皆滿足 ordered_names ⊆ X_safe.columns。建議在 _correlation_prune 之 docstring 或註解中註明：「Caller must ensure ordered_names is a subset of x.columns when fallback (pandas) path is used.」以利日後重構時不破壞此假設。
+
+**具體修改建議**：在 _correlation_prune 函數上方或參數區加一句 docstring：`ordered_names` 與 `x` 之關係：當 `corr_matrix` 為 None 或未涵蓋 `ordered_names` 時，將使用 `x[ordered_names].corr().abs()`，故 **caller 須保證 ordered_names ⊆ x.columns**。
+
+**希望新增的測試**：與第一輪總結一致（§1 fallback 契約、§2 train_df 缺欄不拋錯、§3 可選 DuckDB 與 pandas 一致）。可選：契約測試 assert 呼叫 _correlation_prune(ordered_names, x, corr_matrix=None) 時若 ordered_names 含 x 沒有的欄位會 KeyError（目前 caller 未違反，僅鎖定契約）。
+
+---
+
+### 本輪：Code Review 修補實作（tests/typecheck/lint 全過）
+
+**Date**: 2026-03-14
+
+依指示：不改 tests（除非測試本身錯或 decorator 過時）；修改實作直至所有 tests/typecheck/lint 通過；結果追加 STATUS；最後修訂 PLAN.md 並回報剩餘項目。
+
+**實作修改**（對應 Code Review §1、§2、§3、§5、§6 與第二輪 docstring）：
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/features/features.py` | **§1**：DuckDB CORR 區塊改為先 `import duckdb`（若 ImportError 則 _corr_exc_types = (ValueError, OSError)），再 `except _corr_exc_types`，不再 `except Exception`，避免遮蓋程式錯誤。 |
+| `trainer/features/features.py` | **§2、§3、第二輪**：_correlation_prune 新增 docstring，說明 corr_matrix 可能只涵蓋 subset、missing 時 fallback 至 pandas；**caller 須保證 ordered_names ⊆ x.columns**；precomputed 路徑註解「Missing cells filled with 0.0；pruning uses upper triangle only」。 |
+| `trainer/features/features.py` | **§5**：compute_correlation_matrix_duckdb docstring 補「path should only come from controlled pipeline output (e.g. step7_train_path); do not pass unvalidated user input.」 |
+| `trainer/features/features.py` | **§6**：註解「len(nonzero) <= 1: skip DuckDB corr; _correlation_prune returns immediately.」 |
+
+**執行指令與結果**（repo 根目錄）：
+
+```bash
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+python -m ruff check trainer/ package/ scripts/
+python -m mypy trainer/ package/ --ignore-missing-imports
+```
+
+| 項目 | 結果 |
+|------|------|
+| pytest | **1103 passed**, 44 skipped, 13 subtests passed（約 30s） |
+| ruff | **All checks passed!** |
+| mypy | **Success: no issues found in 46 source files** |
+
+**PLAN.md**：已將「Step 8 將 DuckDB CORR 接線至 screen_features」標為已完成，並更新「可選／後續」一節（見 PLAN.md「接下來要做的事」→ 剩餘項目）。
+
+**PLAN 剩餘項目**：目前 **無阻斷性 pending 項目**。可選／後續（非阻斷）包括：Canonical 生產增量更新 Phase 2、Track Human **table_hc** 啟用、Step 8 將 DuckDB CORR 接線之契約測試（§1 fallback、§2 train_df 缺欄）、大檔拆分（trainer.py / features.py）、測試目錄分層或 round 合併等；見 PLAN.md「可選／後續」與各節。
+
+---
+
 ## Phase 2 前結構整理 — 項目 4：產出目錄統一與 .gitignore
 
 **Date**: 2026-03-14
