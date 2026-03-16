@@ -18,6 +18,7 @@
 | 10 | 資料品質 | 資料品質監控（DQ dashboard / 定期檢查） | 輸入 null、schema、volume 等，問題早發現 |
 | 11 | 穩定性 | Investigate memory- and computation-hungry code, optimize |  |
 | 12 | 穩定性 | Auto-detect enironment and choose reasonable memory / sampling settings etc. | |
+| 13 | 部署 | 減輕 ClickHouse 負載：scorer 與 validator 共用同一份 bets/sessions 查詢（同 process 內快取，一次查兩邊用） | 低優先級 |
 |  |  | （待補充） |  |
 
 ---
