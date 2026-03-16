@@ -2,11 +2,13 @@
 # When run as __main__ (e.g. python -m trainer.validator), forward to the implementation's main().
 import sys
 from trainer.serving import validator as _impl  # noqa: F401
+from trainer.db_conn import get_clickhouse_client  # noqa: F401
 
 sys.modules["trainer.validator"] = _impl
 
-# Type-checker visible re-exports
+# Type-checker visible re-exports (deploy main.py + test_review_risks_package_entrypoint_db_conn)
 main = _impl.main
+run_validator_loop = _impl.run_validator_loop
 STATE_DB_PATH = _impl.STATE_DB_PATH
 OUT_DIR = _impl.OUT_DIR
 

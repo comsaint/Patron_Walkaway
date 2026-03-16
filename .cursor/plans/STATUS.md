@@ -6,6 +6,26 @@
 
 ---
 
+## Deploy 套件 re-export 修補（walkaway_ml.scorer / walkaway_ml.validator）
+
+**Date**: 2026-03-16
+
+### 目標
+修復 deploy 建包後 `ImportError: cannot import name 'run_scorer_loop' from 'walkaway_ml.scorer'`（及同類 `run_validator_loop`、`get_clickhouse_client`）。根因：項目 2.2 serving 搬移後，頂層薄層 `trainer/scorer.py`、`trainer/validator.py` 未 re-export 程式化入口，導致 `package/deploy/main.py` 與 `tests/test_review_risks_package_entrypoint_db_conn` 所用符號在安裝為 walkaway_ml 時無法自頂層取得。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/scorer.py` | Re-export 新增 **run_scorer_loop** = _impl.run_scorer_loop（DEPLOY_PLAN §4：walkaway_ml.scorer.run_scorer_loop）。 |
+| `trainer/validator.py` | 新增 `from trainer.db_conn import get_clickhouse_client`；Re-export 新增 **run_validator_loop** = _impl.run_validator_loop、**get_clickhouse_client**（deploy main 與 test_review_risks_package_entrypoint_db_conn §7 契約）。 |
+
+### 驗證
+- 建包後 `from walkaway_ml.scorer import run_scorer_loop`、`from walkaway_ml.validator import run_validator_loop`、`from walkaway_ml.validator import get_clickhouse_client` 皆可成功。
+- 執行 `python main.py` 於 deploy_dist 或安裝 walkaway_ml 之環境，scorer/validator 迴圈與 Flask 正常啟動。
+
+---
+
 ## Plan B+ LibSVM Export：0-based feature index（feature_name 與 num_feature 一致）
 
 **Date**: 2026-03-15
@@ -4491,5 +4511,200 @@ from trainer import db_conn  # noqa: F401
 ### 結論
 
 項目 **2.5** 已完成：全量測試通過、walkaway_ml wheel 建包成功且無 import／路徑錯誤。Phase 2 前結構整理 **步驟 4（項目 2）** 已全部完成。
+
+---
+
+## Plan: ClickHouse Client Concurrency — 做法 1 實作（Step 1–2）
+
+**Date**: 2026-03-16
+
+### 目標
+
+依 PLAN.md「ClickHouse Client Concurrency」實作順序第 1–2 步：先實作做法 1（per-thread client），並以相關測試驗證。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/core/db_conn.py` | 移除 `@lru_cache(maxsize=1)`；新增 `threading.local()` 存 per-thread client；`get_clickhouse_client()` 改為若當前 thread 尚無 client 則建立並存於 `_thread_local.client`，否則回傳既有實例。保留相同連線參數（config.CH_*）。新增 `_clear_clickhouse_client_cache()` 並掛成 `get_clickhouse_client.cache_clear`，供既有測試（如 `test_review_risks_package_entrypoint_db_conn`）沿用。 |
+
+### pytest 結果
+
+```
+python -m pytest tests/test_review_risks_package_entrypoint_db_conn.py tests/test_trainer_review_risks_temp_table.py -v
+# 13 passed, 1 skipped
+```
+
+### 手動驗證建議
+
+- **本地／測試環境**：在具備 ClickHouse 連線的環境下，執行 deploy 流程（scorer + validator 同 process），觀察是否仍出現 `ProgrammingError: Attempt to execute concurrent queries within the same session`。例如：`cd package/deploy && python main.py`（需已設定 .env 與 MODEL_DIR），讓 scorer 與 validator 並行跑數個週期（可暫時縮短 `SCORER_POLL_INTERVAL_SECONDS` / `VALIDATOR_INTERVAL_SECONDS` 以增加並發機率），檢查 log 無上述錯誤。
+- **目標機部署**：重新建包並部署至目標機，跑一段時間觀察 scorer／validator 日誌；若出現連線數或資源相關錯誤，則依 PLAN 改採做法 2（全域鎖）。
+
+### 下一步建議
+
+- 完成上述手動驗證（本地 deploy 或目標機）後，於 STATUS 或 PLAN 將「做法 1 實作」標為已驗證。
+- 若做法 1 穩定，可選：在 DECISION_LOG 記錄「部署採用 per-thread ClickHouse client 以符合 clickhouse_connect 建議」。
+- 若需啟用做法 2：依 PLAN §3 在 `db_conn` 加入 `_ch_lock` 與帶鎖查詢介面，並視需要還原為單一 cached client。
+
+---
+
+### Code Review：ClickHouse 做法 1（per-thread client）
+
+**Date**: 2026-03-16
+
+**審查範圍**：PLAN.md「ClickHouse Client Concurrency」做法 1、STATUS 本節修改摘要、`trainer/core/db_conn.py` 現有實作（threading.local、get_clickhouse_client、cache_clear、query_df）。以下僅列潛在問題與建議，**不重寫整套**。
+
+---
+
+#### 1. 邊界：process fork 後使用
+
+**問題**：若在 import `db_conn` 後 fork process（例如 gunicorn preload + fork worker），child 會繼承 parent 的 memory；`threading.local()` 在 child 中可能仍指向 parent 建立的 connection／socket，在 child 使用可能導致不可預期行為或 socket 錯誤。
+
+**具體修改建議**：在模組或 `get_clickhouse_client` docstring 註明：「本模組假設單一 process、多 thread 使用；若以 fork 產生 worker（如 gunicorn），應在 child 內避免使用既有 client，或於 child 啟動時呼叫 `get_clickhouse_client.cache_clear()` 強制下次取得時重建。」目前 deploy 為單 process 多 thread，無需改程式邏輯。
+
+**希望新增的測試**：可選。文件化「不支援 fork 後直接沿用 parent 的 client」即可；若需自動化，可在 child process 內 import 後呼叫 `cache_clear()` 再 `get_clickhouse_client()`，assert 不拋錯（實際連線與否視環境）。
+
+---
+
+#### 2. 邊界：config 執行期變更
+
+**問題**：連線參數（CH_HOST、CH_PORT 等）在該 thread **首次** `get_clickhouse_client()` 時讀取並固定於該 thread 的 client；若執行中變更環境變數或 config，已存在的 thread 會繼續使用舊連線，直到該 thread 呼叫 `cache_clear()` 或 process 重啟。
+
+**具體修改建議**：在 `get_clickhouse_client` 或模組 docstring 補一句：「連線參數於該 thread 首次取得 client 時固定；執行期變更 config 僅對新 thread 或 `cache_clear()` 後之呼叫生效。」無需改程式邏輯。
+
+**希望新增的測試**：可選。同一 thread 內先 `get_clickhouse_client()` 存參考，patch config 某欄位（如 CH_HOST），`cache_clear()` 後再 `get_clickhouse_client()`，assert 新 client 為新物件（id 不同）；若可 mock `get_client` 則可 assert 第二次建立時收到新參數。
+
+---
+
+#### 3. 邊界：get_client() 建立失敗時不污染 _thread_local
+
+**問題**：若 `clickhouse_connect.get_client(...)` 拋錯（例如網路不可達、認證失敗），目前程式**不會**設定 `_thread_local.client`，下次同一 thread 呼叫會重試。行為正確。
+
+**具體修改建議**：無需改動。可選：在建立 client 的區段加註「get_client 拋錯時不寫入 _thread_local，下次呼叫會重試」。
+
+**希望新增的測試**：Mock `clickhouse_connect.get_client`：第一次 side_effect=RuntimeError("network"), 第二次 return mock_client；同一 thread 連續兩次 `get_clickhouse_client()`，第一次應 raise，第二次應回傳 mock_client，且之後同一 thread 再呼叫仍回傳同一 mock_client（未因第一次異常而污染）。
+
+---
+
+#### 4. 安全性
+
+**問題**：憑證仍來自 config（CH_USER, CH_PASS），未新增參數或外部輸入；`threading.local()` 僅 process 內可見，無跨 process 洩漏。無新安全疑慮。
+
+**具體修改建議**：無需改動。可選：在模組註解註明「credentials 來自 config，勿將未驗證之輸入傳入 get_clickhouse_client 或 query_df」。
+
+**希望新增的測試**：無需針對本點新增。
+
+---
+
+#### 5. 效能／資源
+
+**問題**：連線數 = 使用 ClickHouse 的 thread 數（deploy 至少 2：scorer + validator；若 Flask 或 status_server 也查則更多），可能增加 ClickHouse 端 `max_connections` 或負載。
+
+**具體修改建議**：PLAN / STATUS 已說明；可在 `db_conn` 模組頂部註解補一句：「Per-thread client 會使並行查詢之 thread 各持一連線；若遇連線數限制或資源不足，請依 PLAN 改採做法 2（全域鎖）。」無需改邏輯。
+
+**希望新增的測試**：無需針對本點新增。
+
+---
+
+#### 6. 測試缺口：per-thread 隔離
+
+**問題**：目前無測試直接驗證「不同 thread 取得不同 client 實例」，若日後有人誤改為單例，回歸可能未發現。
+
+**具體修改建議**：新增契約測試，見下。
+
+**希望新增的測試**：從兩條 thread 分別呼叫 `get_clickhouse_client()`，收集兩次回傳值，`assert c1 is not c2`（或 `id(c1) != id(c2)`）。可放在 `tests/test_review_risks_package_entrypoint_db_conn.py` 或新建 `tests/test_db_conn_per_thread.py`。需注意：若測試環境無 ClickHouse，可 mock `clickhouse_connect.get_client` 回傳 per-call 的 MagicMock，再 assert 兩 thread 取得的對象不同。
+
+---
+
+#### 7. 測試缺口：cache_clear 僅影響當前 thread
+
+**問題**：`cache_clear()` 只清當前 thread 的 client；其他 thread 的 client 不受影響。目前無測試覆蓋此行為。
+
+**具體修改建議**：新增契約測試，見下。
+
+**希望新增的測試**：Thread A 取得 `client_a` 並存參考；Thread B 取得 `client_b`；Thread B 呼叫 `get_clickhouse_client.cache_clear()`；Thread A 再呼叫 `get_clickhouse_client()` 應仍得 `client_a`（同一對象）；Thread B 再呼叫 `get_clickhouse_client()` 應得新 client（與 `client_b` 不同）。可與上則合併為一則「per-thread client 與 cache_clear 隔離」測試；若無真實 ClickHouse，以 mock get_client 回傳 thread-local 的 mock 實例即可。
+
+---
+
+**總結**：建議優先補 **§6、§7（per-thread 與 cache_clear 隔離之契約測試）**；**§1、§2、§5** 以註解／文件化即可；**§3** 可選加註或加一則異常重試測試；**§4** 無需改動。
+
+---
+
+### 風險點對應測試（最小可重現）
+
+**Date**: 2026-03-16
+
+Review 所列風險已轉成最小可重現測試，**僅新增 tests，未改 production code**。新檔：`tests/test_db_conn_per_thread.py`。
+
+| Review § | 風險要點 | 測試類／方法 | 說明 |
+|----------|----------|--------------|------|
+| §6 | 不同 thread 須取得不同 client 實例 | `TestPerThreadClientIsolation::test_per_thread_different_client_instances` | 兩條 thread 各呼叫 `get_clickhouse_client()`，assert 回傳的兩物件 `is not`。Mock `get_client` 每次回傳新 MagicMock。 |
+| §7 | cache_clear() 僅影響當前 thread | `TestCacheClearOnlyCurrentThread::test_cache_clear_affects_only_current_thread` | Thread A 取得 client_a，Thread B 取得 client_b 後呼叫 `cache_clear()`；A 再取仍為 client_a，B 再取為新 client（與 client_b 不同）。 |
+| §3 | get_client() 失敗不寫入 cache，重試可成功 | `TestGetClientFailureDoesNotPolluteCache::test_get_client_failure_then_retry_returns_same_cached_client` | Mock `get_client` 第一次 raise RuntimeError、第二次回傳 mock_client；第一次 `get_clickhouse_client()` 應 raise，第二、三次回傳同一 mock_client。 |
+| §2 | cache_clear() 後同 thread 取得新 client | `TestAfterCacheClearSameThreadGetsNewClient::test_after_cache_clear_same_thread_gets_new_client` | 同 thread：取 c1 → `cache_clear()` → 取 c2；assert c1 is not c2。 |
+| §1（可選） | fork/child 可呼叫 cache_clear() 不崩潰 | `TestForkChildCanCallCacheClear::test_child_process_can_import_and_call_cache_clear` | 以 subprocess 執行：import `trainer.core.db_conn`、呼叫 `cache_clear()`，assert 子 process exit 0。 |
+
+§4、§5 未要求新增測試；§1 以「子 process 可安全呼叫 cache_clear()」之契約測試涵蓋，不測實際 fork 語義。
+
+#### 執行方式
+
+```bash
+# 僅跑 db_conn per-thread 契約測試
+python -m pytest tests/test_db_conn_per_thread.py -v
+
+# 連同既有 db_conn / package entrypoint 相關一併跑
+python -m pytest tests/test_db_conn_per_thread.py tests/test_review_risks_package_entrypoint_db_conn.py tests/test_trainer_review_risks_temp_table.py -v
+```
+
+#### pytest 結果（2026-03-16）
+
+```
+tests/test_db_conn_per_thread.py::TestPerThreadClientIsolation::test_per_thread_different_client_instances PASSED
+tests/test_db_conn_per_thread.py::TestCacheClearOnlyCurrentThread::test_cache_clear_affects_only_current_thread PASSED
+tests/test_db_conn_per_thread.py::TestGetClientFailureDoesNotPolluteCache::test_get_client_failure_then_retry_returns_same_cached_client PASSED
+tests/test_db_conn_per_thread.py::TestAfterCacheClearSameThreadGetsNewClient::test_after_cache_clear_same_thread_gets_new_client PASSED
+tests/test_db_conn_per_thread.py::TestForkChildCanCallCacheClear::test_child_process_can_import_and_call_cache_clear PASSED
+# 5 passed
+```
+
+---
+
+### 本輪：tests / typecheck / lint 結果（實作未改）
+
+**Date**: 2026-03-16
+
+依指示僅以實作通過 tests/typecheck/lint；**未改 tests**（除非測試錯或 decorator 過時）；**本輪未改 production code**（做法 1 實作已正確）。
+
+#### 1. db_conn 相關測試
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/test_db_conn_per_thread.py tests/test_review_risks_package_entrypoint_db_conn.py tests/test_trainer_review_risks_temp_table.py -v` | **18 passed, 1 skipped** |
+
+#### 2. Lint（Ruff）
+
+| 範圍 | 結果 |
+|------|------|
+| `python -m ruff check trainer/core/db_conn.py` | All checks passed. |
+| `python -m ruff check trainer/` | All checks passed. |
+
+#### 3. Typecheck
+
+專案 `pyproject.toml` 未設定 mypy/pyright；無 typecheck 步驟可跑。未新增 typecheck 失敗。
+
+#### 4. 全量 pytest（參考）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load` | 52 failed, 1057 passed, 43 skipped |
+
+52 筆失敗為**既有問題**，與 ClickHouse 做法 1 無關：多數為 `ImportError: cannot import name 'trainer'/'backtester'/'identity'/'core'/'status_server' from 'walkaway_ml'`（以 repo 目錄跑 pytest 時未安裝 walkaway_ml，子模組路徑不同）、部分為 Step 7 DuckDB OOM、其餘為其他 review 契約（如 R207 bin path、R256 scorer 常數、R221 scorer 模組名）。本計畫範圍內之實作與 db_conn 相關測試均已通過。
+
+#### 5. PLAN.md 狀態更新與剩餘項目
+
+- **PLAN.md**「ClickHouse Client Concurrency」已更新：做法 1 標為已完成；實作順序步驟 1 打勾，步驟 2–3 標為待手動驗證，步驟 4 標為備援未實作。
+- **剩餘項目**：
+  1. **手動驗證**：本地或目標機跑 deploy（scorer + validator 同 process），確認無 concurrent session 錯誤；目標機觀察一段時間。
+  2. **做法 2（備援）**：僅在連線數過多、ClickHouse 拒絕連線或維運要求單一連線時啟用；實作鎖與帶鎖查詢介面（見 PLAN §3）。
 
 ---

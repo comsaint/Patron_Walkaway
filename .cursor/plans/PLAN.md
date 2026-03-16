@@ -3240,3 +3240,103 @@ Step 9 → lgb.Dataset(train.libsvm)，LightGBM 自動載入 .weight
 | 6 | 執行 tests / typecheck / lint；deploy 情境下驗證 validator 可正確取得 ClickHouse client 並驗證 alert。 |
 
 **Code Review 修補（2026-03-13）**：status_server config try/except、training_config_recommender 縮窄 except 並 re-raise RuntimeError、trainer.py try/except 註解已實作；Option A 專用測試 7 passed / 1 skipped。見 STATUS.md「本輪：Code Review 套件 entrypoint 與 db_conn 修補完成」。
+
+---
+
+# Plan: ClickHouse Client Concurrency (Per-Thread Client + Lock Backup)
+
+**目標**：解決部署時 `ProgrammingError: Attempt to execute concurrent queries within the same session`。同一 process 內 scorer、validator（及可能 Flask/status_server）多 thread 共用單一 cached ClickHouse client，導致並行查詢。先實作「每 thread 專用 client」，並保留「全域鎖」作為備援。
+
+**狀態**（2026-03-16）：
+- **做法 1**：已完成（`trainer/core/db_conn.py` 改為 per-thread client；契約測試見 `tests/test_db_conn_per_thread.py`；Code Review 與風險對應測試見 STATUS.md）。
+- **剩餘**：做法 2（備援，僅在連線數/資源不足或維運要求時啟用）；實作順序步驟 2–3 之手動驗證（本地 deploy、目標機觀察）。
+
+---
+
+## 1. 問題摘要
+
+- **現象**：`run_scorer_loop` 在 `fetch_recent_data` 呼叫 `client.query_df(bets_query)` 時拋錯：「Attempt to execute concurrent queries within the same session. Please use a separate client instance per thread/process.」
+- **根因**：`trainer/core/db_conn.py` 的 `get_clickhouse_client()` 使用 `@lru_cache(maxsize=1)`，全 process 共用一個 client；`package/deploy/main.py` 以 daemon thread 同時跑 scorer 與 validator，兩者並行呼叫同一 client。
+- **影響**：部署環境推論不穩定，scorer/validator 可能隨機失敗。
+
+---
+
+## 2. 做法 1（優先）：每 thread 專用 client
+
+**原則**：同一 process 內，每個會查 ClickHouse 的 thread 使用自己的 client 實例，避免同一 session 並行查詢。若 ClickHouse 或網路不允許多連線，再改用做法 2。
+
+### 2.1 修改範圍
+
+| 檔案 | 變更 |
+|------|------|
+| **trainer/core/db_conn.py** | 改為 per-thread client：移除 `@lru_cache(maxsize=1)`，改為以 `threading.local()` 或 `threading.get_ident()` 快取每個 thread 的 client；保留相同連線參數（config.CH_*）。 |
+| **trainer/db_conn.py** | 僅 re-export，若未直接改 core 則無需動。 |
+
+### 2.2 實作要點
+
+- 使用 `threading.local()` 存當前 thread 的 client；在 `get_clickhouse_client()` 內檢查 `local.client`，若無則建立並存回。
+- 建立 client 的參數與現有一致：`host`, `port`, `username`, `password`, `secure`, `database`（來自 config）。
+- 不主動關閉/清理 thread 的 client（與目前 lru_cache 行為一致；daemon thread 結束時 process 通常也結束）。
+- `query_df()` 仍透過 `get_clickhouse_client()` 取得 client，因此自動變成 per-thread。
+
+### 2.3 驗證與風險
+
+- **驗證**：部署後跑一段時間，觀察 scorer 與 validator 日誌是否再出現 concurrent session 錯誤；必要時可暫時縮短 scorer/validator interval 以增加並發機率。
+- **風險**：連線數 = 使用 ClickHouse 的 thread 數（至少 2：scorer + validator；若 Flask 或 status_server 也查則更多）。若 ClickHouse 或網路限制連線數，可能需改做法 2 或調整部署（例如減少同時查詢的 thread）。
+
+### 2.4 若做法 1 不可行時
+
+- 若出現連線數/資源相關錯誤，或營運/維運要求單一連線，則改採做法 2（全域鎖），並可選擇還原 `get_clickhouse_client()` 為單一 cached client。
+
+---
+
+## 3. 做法 2（備援）：以鎖串行化 ClickHouse 查詢
+
+**原則**：維持單一 client（可保留 `@lru_cache(maxsize=1)` 或 per-thread 還原為單例），所有 `client.query_df` / 透過該 client 的查詢前後用同一把 `threading.Lock()` 包住，保證同一時間只有一個 thread 使用 client。
+
+### 3.1 修改範圍
+
+| 檔案 | 變更 |
+|------|------|
+| **trainer/core/db_conn.py** | 新增 module-level `_ch_lock = threading.Lock()`；在 `get_clickhouse_client()` 回傳的包裝或在使用端加鎖。較簡潔方式：提供 `query_df_safe(sql, parameters)` 在內部 `with _ch_lock: client = get_clickhouse_client(); return client.query_df(...)`，並讓 scorer/validator/status_server 等改為呼叫此函式；或回傳一個 thin wrapper 讓 `query_df` 在鎖內執行。 |
+| **trainer/serving/scorer.py** | `fetch_recent_data` 內兩次 `client.query_df` 若改為透過「帶鎖的 query_df」則無需改呼叫方式，僅改 db_conn 介面即可。 |
+| **trainer/serving/validator.py** | 同上，若透過 db_conn 的帶鎖查詢介面則一致。 |
+| **trainer/serving/status_server.py** | 同上。 |
+
+### 3.2 實作要點
+
+- 鎖的粒度：僅包住「取得 client + 執行一次 query」即可，避免在鎖內做重邏輯。
+- 若做法 1 已上線，要切到做法 2：可保留 per-thread client 但加上同一把鎖（即每個 thread 有自己 client，但查詢時仍互斥）；或還原為單一 client + 鎖。前者可減少「同一 thread 內連續兩次 query」的鎖競爭，但實作較複雜；後者實作最簡單。
+
+### 3.3 何時啟用做法 2
+
+- 做法 1 上線後若出現：連線數過多、ClickHouse 拒絕連線、或維運要求單一連線時，啟用做法 2（並可還原為單一 client）。
+- 或一開始就希望改動最小、可接受查詢串行化時，可直接實作做法 2。
+
+---
+
+## 4. 實作順序建議
+
+1. ~~**先實作做法 1**（per-thread client）於 `trainer/core/db_conn.py`，不新增依賴。~~ **已完成**
+2. **本地/測試環境**跑 deploy 流程（scorer + validator 同 process），確認無 concurrent session 錯誤。（待手動驗證）
+3. **部署到目標機**，觀察一段時間；若穩定則維持做法 1。（待手動驗證）
+4. **若需啟用做法 2**：在 `db_conn` 加入鎖與帶鎖查詢介面，並將 scorer/validator/status_server 改為使用該介面（或統一透過 `query_df` 的鎖內實作）；必要時還原為單一 cached client。（備援，未實作）
+
+---
+
+## 5. 檔案清單（實作時對照）
+
+| 項目 | 做法 1 | 做法 2 |
+|------|--------|--------|
+| trainer/core/db_conn.py | 改 get_clickhouse_client 為 per-thread | 新增 _ch_lock、帶鎖查詢（及可選還原單例） |
+| trainer/serving/scorer.py | 無需改（仍用 get_clickhouse_client） | 若介面改為「只提供帶鎖 query」則可能改呼叫處 |
+| trainer/serving/validator.py | 無需改 | 同上 |
+| trainer/serving/status_server.py | 無需改 | 同上 |
+| package/deploy/main.py | 無需改 | 無需改 |
+
+---
+
+## 6. 備註
+
+- clickhouse_connect 文件建議「separate client instance per thread/process」，做法 1 與之相符。
+- 做法 2 會讓 scorer 與 validator 的查詢互等，可能增加延遲，若兩者 interval 已很緊可再評估。

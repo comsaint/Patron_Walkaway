@@ -8,6 +8,7 @@ sys.modules["trainer.scorer"] = _impl
 # Type-checker visible re-exports (tests and callers import these)
 main = _impl.main
 score_once = _impl.score_once
+run_scorer_loop = _impl.run_scorer_loop
 build_features_for_scoring = _impl.build_features_for_scoring
 _score_df = _impl._score_df
 STATE_DB_PATH = _impl.STATE_DB_PATH
