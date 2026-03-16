@@ -1819,9 +1819,8 @@ def _chunk_cache_key(
     data_hash = hashlib.md5(
         pd.util.hash_pandas_object(bets, index=False).values.tobytes()
     ).hexdigest()[:8]
-    # Effective lookback: same logic as process_chunk (TRAINER_USE_LOOKBACK → SCORER_LOOKBACK_HOURS or None)
-    _use_lookback = getattr(_cfg, "TRAINER_USE_LOOKBACK", False)
-    _effective_lookback = getattr(_cfg, "SCORER_LOOKBACK_HOURS", None) if _use_lookback else None
+    # Track Human lookback: always SCORER_LOOKBACK_HOURS (train–serve parity).
+    _effective_lookback = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)
     cfg_str = json.dumps({
         "WALKAWAY_GAP_MIN": WALKAWAY_GAP_MIN,
         "SESSION_AVAIL_DELAY_MIN": SESSION_AVAIL_DELAY_MIN,
@@ -1964,11 +1963,8 @@ def process_chunk(
     # --- Track Human features (on FULL bets incl. history, cutoff=window_end) ---
     # Computing before label filtering ensures cross-chunk state (loss_streak,
     # run_boundary) uses historical context from HISTORY_BUFFER_DAYS before window_start.
-    # When TRAINER_USE_LOOKBACK is True, use SCORER_LOOKBACK_HOURS for train–serve parity.
-    # Phase 1 unblock (PLAN § Track Human Lookback): default False so Step 6 uses
-    # vectorized no-lookback path and finishes in reasonable time (doc/track_human_lookback_vectorization_plan.md).
-    _use_lookback = getattr(_cfg, "TRAINER_USE_LOOKBACK", False)
-    _lookback_hours = getattr(_cfg, "SCORER_LOOKBACK_HOURS", None) if _use_lookback else None
+    # Always use SCORER_LOOKBACK_HOURS for train–serve parity (same window as scorer, default 8h).
+    _lookback_hours = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)
     bets = add_track_human_features(bets, canonical_map, window_end, lookback_hours=_lookback_hours)
 
     # --- Track LLM: DuckDB + Feature Spec YAML (DEC-022/023/024) ---
@@ -3625,6 +3621,7 @@ def train_single_rated_model(
                 and int((np.asarray(y_vl) == 0).sum()) >= 1
             )
             _bin_path = train_libsvm_p.parent / (train_libsvm_p.stem + ".bin")
+            # R207 #2: use .bin only when _bin_path.is_file() (avoid using a directory as .bin).
             # LibSVM export uses 0-based feature indices (0..49 for 50 features) so LightGBM infers num_feature=50 and matches feature_name.
             # #region agent log
             _agent_debug_log(

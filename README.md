@@ -68,6 +68,8 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 
 **訓練（完整流程）**（在專案根目錄）：
 
+訓練、評估與 serving 一律使用同一 lookback 視窗（config 中 `SCORER_LOOKBACK_HOURS`，預設 8 小時），以維持 train–serve parity。
+
 ```bash
 python -m trainer.trainer --use-local-parquet --days 365
 ```

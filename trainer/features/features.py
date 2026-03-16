@@ -1114,10 +1114,17 @@ def screen_features(
     effective_top_k: Optional[int] = (
         SCREEN_FEATURES_TOP_K if top_k is _SCREEN_TOP_K_UNSET else top_k  # type: ignore[assignment]
     )
-    if effective_top_k is not None and effective_top_k < 1:
-        raise ValueError(
-            f"screen_features: top_k must be a positive integer or None, got {effective_top_k!r}"
-        )
+    if effective_top_k is not None:
+        if not isinstance(effective_top_k, (int, float)):
+            try:
+                effective_top_k = int(effective_top_k)
+            except (TypeError, ValueError):
+                # Config or caller may pass a mock/sentinel; treat as no limit (None).
+                effective_top_k = None
+        if effective_top_k is not None and effective_top_k < 1:
+            raise ValueError(
+                f"screen_features: top_k must be a positive integer or None, got {effective_top_k!r}"
+            )
 
     # Zero-variance: use DuckDB on full train when provided to avoid X.std() OOM (PLAN Step 8 DuckDB 算統計量).
     use_duckdb_std = (train_path is not None or train_df is not None) and len(feature_names) > 0

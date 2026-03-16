@@ -66,6 +66,7 @@ try:
         _cfg, "THRESHOLD_MIN_ALERTS_PER_HOUR", None
     )
     UNRATED_VOLUME_LOG: bool = bool(getattr(_cfg, "UNRATED_VOLUME_LOG", True))
+    SCORER_LOOKBACK_HOURS: int = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
@@ -80,6 +81,7 @@ except ModuleNotFoundError:
     THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_MIN_ALERTS_PER_HOUR = getattr(_cfg, "THRESHOLD_MIN_ALERTS_PER_HOUR", None)
     UNRATED_VOLUME_LOG = bool(getattr(_cfg, "UNRATED_VOLUME_LOG", True))  # type: ignore[no-redef]
+    SCORER_LOOKBACK_HOURS = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)  # type: ignore[no-redef]
 
 try:
     from labels import compute_labels  # type: ignore[import]
@@ -570,8 +572,8 @@ def backtest(
         bets["canonical_id"] = bets["player_id"].astype(str)
     bets["canonical_id"] = bets["canonical_id"].fillna(bets["player_id"].astype(str))
 
-    # --- Track-B features (full history for context) ---
-    bets = add_track_human_features(bets, canonical_map, window_end)
+    # --- Track-B features (same lookback as trainer/scorer for parity) ---
+    bets = add_track_human_features(bets, canonical_map, window_end, lookback_hours=SCORER_LOOKBACK_HOURS)
 
     # --- Track LLM on FULL bets (PLAN § Train–Serve Parity) ---
     # Compute before label filtering so window features see same history as trainer/scorer.

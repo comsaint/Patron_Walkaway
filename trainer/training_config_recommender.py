@@ -316,7 +316,6 @@ def suggest_config(
     suggestions.append(("STEP7_USE_DUCKDB=True", "Avoid pandas fallback (A19)."))
     suggestions.append(("STEP8_SCREEN_SAMPLE_ROWS=2000000", "Cap screening memory (A23)."))
     suggestions.append(("SCREEN_FEATURES_METHOD=lgbm", "Faster than MI (A24)."))
-    suggestions.append(("TRAINER_USE_LOOKBACK=False", "Phase 1 default; enable after Phase 2 vectorization (A12)."))
 
     session_bytes = profile.get("session_data_bytes", 0)
     if session_bytes > (avail_gb * 0.4) * (1024 ** 3) and profile.get("data_source") == "parquet":

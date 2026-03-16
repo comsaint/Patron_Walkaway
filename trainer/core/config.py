@@ -56,16 +56,10 @@ VALIDATOR_ALERT_RETENTION_DAYS = 30   # Keep alerts visible to validator for las
 VALIDATION_RESULTS_RETENTION_DAYS = 180  # Keep validation_results history for last N days
 
 # ------------------ Scorer poll defaults (SSOT for scorer CLI) -----------------
-# Used by scorer.py --lookback-hours / --interval. Trainer can align Track Human/LLM
-# to SCORER_LOOKBACK_HOURS for train–serve parity.
-SCORER_LOOKBACK_HOURS = 8       # Hours of bet history to pull each cycle
+# Used by scorer.py --lookback-hours / --interval.
+# Training, backtester, and serving always use this for Track Human lookback (train–serve parity).
+SCORER_LOOKBACK_HOURS = 8       # Hours of bet history to pull each cycle (default 8)
 SCORER_POLL_INTERVAL_SECONDS = 45  # Polling interval in seconds (includes run time)
-
-# Phase 1 unblock (PLAN § Track Human Lookback 向量化): when False, trainer passes
-# lookback_hours=None to add_track_human_features so Step 6 uses vectorized no-lookback
-# path and finishes in reasonable time. Scorer still uses SCORER_LOOKBACK_HOURS.
-# Set True only when Phase 2 (numba lookback) is in place for full train–serve parity.
-TRAINER_USE_LOOKBACK = False
 
 # ------------------ Progress / UI (PLAN § progress-bars-long-steps) -----
 # When True, disable tqdm progress bars (Step 6 chunks, Step 9 Optuna, etc.) for CI / non-TTY.

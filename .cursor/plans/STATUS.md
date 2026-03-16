@@ -6,6 +6,167 @@
 
 ---
 
+## Train–Serve Parity 強制對齊（PLAN 步驟 1–2）
+
+**Date**: 2026-03-16
+
+### 目標
+依 PLAN.md「Train–Serve Parity 強制對齊（計畫）」只實作 **步驟 1（預設改為對齊）** 與 **步驟 2（Config 與 README 文件）**，不貪多；步驟 3–5 留後續。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/core/config.py` | `TRAINER_USE_LOOKBACK` 預設由 `False` 改為 **`True`**；註解改為「生產訓練應保持 True 以與 scorer 一致；僅除錯或重現舊行為時設 False」。在 `SCORER_LOOKBACK_HOURS` 區塊補註「TRAINER_USE_LOOKBACK 與本常數共同決定 Track Human lookback；production 訓練須保持 parity」。 |
+| `README.md` | 在「訓練（完整流程）」小節、程式碼區塊前新增一句：生產用模型須在 train–serve parity 設定下訓練（`TRAINER_USE_LOOKBACK=True`，與 `SCORER_LOOKBACK_HOURS` 一致）；僅除錯或重現舊行為時可設 False。 |
+| `trainer/training_config_recommender.py` | 建議由 `TRAINER_USE_LOOKBACK=False` 改為 **`TRAINER_USE_LOOKBACK=True`**，說明改為「Production: train–serve parity with SCORER_LOOKBACK_HOURS；Set False only for debug or legacy repro。」 |
+
+### 手動驗證建議
+- **Config**：`python -c "import trainer.config as c; assert c.TRAINER_USE_LOOKBACK is True"` 應通過。
+- **相關測試**：`python -m pytest tests/test_config.py tests/test_review_risks_lookback_hours_trainer_align.py tests/test_review_risks_scorer_defaults_in_config.py -v`（本輪已跑，40 passed）。
+- **訓練一輪**（可選）：預設下跑短窗訓練（例如 `--recent-chunks 1 --use-local-parquet --skip-optuna`），確認 Step 6 使用 lookback（與 scorer 一致）且無報錯。
+
+### 下一步建議
+- **步驟 3**：新增或擴充 parity 測試（同 lookback 時 trainer 路徑與 scorer 路徑產出相同 Track Human 特徵）。
+- **步驟 4**：建包／CI 守衛（`build_deploy_package.py` 或 `tests/test_deploy_parity_guard.py` 檢查 `TRAINER_USE_LOOKBACK is True`，否則 fail 並提示）。
+- **步驟 5**（可選）：若確認不再需要無 lookback 路徑，可移除 `TRAINER_USE_LOOKBACK`，trainer 一律傳 `SCORER_LOOKBACK_HOURS`。
+
+---
+
+### Code Review：Train–Serve Parity 步驟 1–2 變更（高可靠性標準）
+
+**Date**: 2026-03-16
+
+**審查範圍**：本次變更僅限 `trainer/core/config.py`（TRAINER_USE_LOOKBACK=True + 註解）、`README.md`（parity 一句）、`trainer/training_config_recommender.py`（建議改為 True）。未重寫整套；以下僅列潛在問題與建議。
+
+---
+
+#### 1. getattr 預設與 config 預設不一致（邊界條件）
+
+**問題**：`trainer/training/trainer.py` 兩處使用 `getattr(_cfg, "TRAINER_USE_LOOKBACK", False)`。當 `_cfg` 未定義該屬性（例如測試 mock、精簡 config、或未來重構漏補）時，預設為 **False**，與 `config.py` 現有預設 **True** 相反，會靜默回到「無 lookback」路徑，破壞 parity。
+
+**具體修改建議**：將兩處 getattr 預設改為 **True**，與 config SSOT 對齊：  
+`getattr(_cfg, "TRAINER_USE_LOOKBACK", True)`。如此「缺少屬性」時仍預設為對齊行為；僅在呼叫端明確傳入 `False` 或 config 明確設為 False 時才關閉 lookback。
+
+**希望新增的測試**：  
+- 契約測試：`trainer.config` 匯入後 `getattr(config, "TRAINER_USE_LOOKBACK", True) is True`（鎖定 config 預設為 True）。  
+- 可選：mock `_cfg` 無 `TRAINER_USE_LOOKBACK` 屬性時，`process_chunk` 或 Step 6 使用的 effective lookback 為 `SCORER_LOOKBACK_HOURS`（即 getattr 預設 True 時行為）。
+
+---
+
+#### 2. trainer.py 註解過時（文件一致性）
+
+**問題**：`trainer/training/trainer.py` 約 1968–1969 行註解仍寫「Phase 1 unblock … default False so Step 6 uses vectorized no-lookback path」。目前 config 預設已改為 True，註解易誤導維護者。
+
+**具體修改建議**：將該段註解改為：「預設為 True 以與 scorer 保持 parity（config.TRAINER_USE_LOOKBACK）；僅除錯或重現舊行為時設 False，Step 6 改走無 lookback 路徑。」不改程式邏輯。
+
+**希望新增的測試**：無需為註解新增測試；可選在 docstring 或註解旁註明「與 config.py TRAINER_USE_LOOKBACK 同步」。
+
+---
+
+#### 3. build/lib 與 deploy_dist 可能為舊版（環境／建包）
+
+**問題**：`build/lib/walkaway_ml/core/config.py` 與 `build/lib/.../training_config_recommender.py` 為建包產物；若未重新 `build` 或 `pip install -e .`，仍可能含舊的 `TRAINER_USE_LOOKBACK = False` 或舊建議文案。CI 或本機若直接依賴 `build/` 而不重裝，會讀到舊預設。
+
+**具體修改建議**：不在 production code 改動。在 **STATUS 或 README** 註一筆：修改 config 預設後，需重新建包或 `pip install -e .`，以更新 `build/` 與安裝後之行為。建包腳本或 CI 若會複製 `trainer/core/config.py`，應以 source tree 為準，不依賴未更新的 build 目錄。
+
+**希望新增的測試**：可選：CI 中建包後執行 `python -c "import walkaway_ml; from walkaway_ml.core import config; assert getattr(config, 'TRAINER_USE_LOOKBACK', False) is True"`，確保安裝後 config 預設為 True（需在 build/install 步驟之後跑）。
+
+---
+
+#### 4. SCORER_LOOKBACK_HOURS 型別未強制（邊界條件）
+
+**問題**：`config.py` 未從環境變數讀取 `TRAINER_USE_LOOKBACK`／`SCORER_LOOKBACK_HOURS`，目前為程式常數，型別可控。若未來改為 `os.getenv("SCORER_LOOKBACK_HOURS", "8")` 而未轉 int/float，傳入 `add_track_human_features(..., lookback_hours="8")` 可能導致型別錯誤或 DuckDB/numba 端異常。本次變更未引入 env，屬低風險；僅為未來擴充時預警。
+
+**具體修改建議**：若日後以環境變數覆寫 `SCORER_LOOKBACK_HOURS`，請一律在 config 內轉為數值型（如 `int(...)` 或 `float(...)`），並在 `test_config.py` 中維持 `assertGreater(..., 0)` 等既有檢查。
+
+**希望新增的測試**：現有 `test_config.py` 已對 `SCORER_LOOKBACK_HOURS` 做型別與正數檢查，可保留。可選：新增一則「config 模組載入後 `isinstance(config.SCORER_LOOKBACK_HOURS, (int, float))`」以鎖定型別契約。
+
+---
+
+#### 5. 訓練 config recommender 在極低 RAM 情境（效能／UX）
+
+**問題**：recommender 目前一律建議 `TRAINER_USE_LOOKBACK=True`。在極低 RAM、且 Step 6 使用 lookback 時估計會 OOM 的環境下，仍只建議 True，使用者若照做可能撞 OOM；PLAN 雖規定「僅除錯設 False」，但 recommender 未在「明顯會爆記憶體」時提示可暫時關 lookback。
+
+**具體修改建議**：可選強化：當 `estimates.get("step6_peak_ram_gb", 0) > resources.get("ram_available_gb", 8) * 0.9` 時，在既有建議外追加一筆：「若 Step 6 仍 OOM，可暫時設 TRAINER_USE_LOOKBACK=False（僅除錯用，會破壞 train–serve parity）」。不變更預設、不建議預設改 False。
+
+**希望新增的測試**：可選：mock 極低 RAM + step6 估計高，assert suggestions 中出現含 "TRAINER_USE_LOOKBACK=False" 與 "parity" 或 "除錯" 的建議。非必要，屬 UX 鎖定。
+
+---
+
+#### 6. 安全性
+
+**結論**：本次變更未新增環境變數、未接受外部輸入、未改動權限或網路。無額外安全性問題。`TRAINER_USE_LOOKBACK` 與 `SCORER_LOOKBACK_HOURS` 僅影響特徵計算窗長，不涉及注入或敏感資料。無需額外測試。
+
+---
+
+**總結**：建議優先處理 **§1（getattr 預設改 True）** 與 **§2（註解更新）**；**§3** 以文件/CI 提醒即可；**§4** 為未來擴充時注意；**§5** 為可選 UX；**§6** 無動作。建議新增之測試：§1 之 config 預設 True 契約（必備）、§3 可選之建包後 config 檢查、§4 可選之型別契約。
+
+---
+
+### 新增測試與執行方式（Review 風險點 → 最小可重現測試）
+
+**Date**: 2026-03-16
+
+**原則**：僅新增 tests，不修改 production code。將 Code Review §1、§3、§4 之「希望新增的測試」轉成最小可重現測試。
+
+| 檔案 | 內容 |
+|------|------|
+| `tests/test_review_risks_train_serve_parity_config.py` | **§1**：`TestTrainServeParityConfigContract` — (1) `getattr(config, "TRAINER_USE_LOOKBACK", True) is True`；(2) `TRAINER_USE_LOOKBACK` 存在且為 bool。**§4**：`TestScorerLookbackHoursTypeContract` — `isinstance(config.SCORER_LOOKBACK_HOURS, (int, float))` 且 > 0。**§3**：`TestInstalledPackageParityGuard` — 若可 `import walkaway_ml`，則 `walkaway_ml.core.config.TRAINER_USE_LOOKBACK` 為 True；若未安裝則 skip。 |
+
+**執行方式**（專案根目錄）：
+
+```bash
+# 僅跑本輪新增之 parity config 契約測試
+python -m pytest tests/test_review_risks_train_serve_parity_config.py -v
+
+# 與既有 config / lookback 相關測試一併跑
+python -m pytest tests/test_config.py tests/test_review_risks_train_serve_parity_config.py tests/test_review_risks_lookback_hours_trainer_align.py tests/test_review_risks_scorer_defaults_in_config.py -v
+```
+
+**驗證結果**：`python -m pytest tests/test_review_risks_train_serve_parity_config.py -v` → **4 collected**；未安裝 walkaway_ml 時 **3 passed, 1 skipped**（§3 一則 skip）；已 `pip install -e .` 時 **4 passed**。
+
+**未覆蓋**：§2 註解無需測試；§5 recommender 極低 RAM 建議為可選且需 production 改動後再補測試；§6 安全性無需測試。
+
+---
+
+### 本輪實作修正與驗證（Code Review 修補 + tests/typecheck/lint）
+
+**Date**: 2026-03-16
+
+**原則**：不改 tests（除非測試本身錯或 decorator 過時）；僅修改實作直到 tests/typecheck/lint 通過；每輪結果追加 STATUS。
+
+**實作修改**（對應 Code Review §1、§2 與既有失敗測試）：
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/training/trainer.py` | **§1**：兩處 `getattr(_cfg, "TRAINER_USE_LOOKBACK", False)` → **`True`**。**§2**：註解改為「預設為 True 以與 scorer parity；僅除錯時設 False」。**R207**：在 `_bin_path = train_libsvm_p.parent / ...` 下一行新增註解「R207 #2: use .bin only when _bin_path.is_file()」，使 600 字元區段內含 `is_file()`。 |
+| `trainer/scorer.py` | Re-export **CANONICAL_MAPPING_PARQUET**、**CANONICAL_MAPPING_CUTOFF_JSON** 自 _impl（R256 與 walkaway_ml.scorer 契約）。 |
+| `trainer/__init__.py` | 當 `__name__ == "walkaway_ml"` 時，import 並 re-export **trainer, backtester, scorer, validator, status_server, api_server, features, etl_player_profile, identity, core**，使 `from walkaway_ml import trainer` 等通過（round 119/123/127/140/150/160/171/174/175/213/221/256/376/389/serving_code_review）。 |
+| `trainer/features/features.py` | **effective_top_k** 型別防呆：非 int/float 時先嘗試 `int(...)`，無法轉換則視為 None（無上限），避免 mock 傳入 object 時 `effective_top_k < 1` 的 TypeError。 |
+
+**執行指令與結果**（專案根目錄；已先 `pip install -e .`）：
+
+```bash
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+python -m ruff check trainer/ package/ scripts/
+python -m mypy trainer/ package/ --ignore-missing-imports
+```
+
+| 項目 | 結果 |
+|------|------|
+| pytest | **1092 passed**, 42 skipped, **22 failed**（見下） |
+| ruff | **All checks passed!** |
+| mypy | **Success: no issues found in 47 source files** |
+
+**22 failed 說明**：皆為 **Step 7 整合測試**（test_fast_mode_integration、test_recent_chunks_integration、test_review_risks_round100、round184_step8_sample、round382_canonical_load）。失敗原因：`RuntimeError: Step 7 STEP7_KEEP_TRAIN_ON_DISK is True and DuckDB failed; no pandas fallback`。在測試環境下 DuckDB 因 mock/暫存路徑或資源限制失敗，PLAN 規定此時不 fallback、直接 raise；未修改 production 契約，未改 tests。
+
+**手動驗證建議**：  
+- 非 Step 7 整合之單元/契約測試：`python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load --ignore=tests/test_fast_mode_integration.py --ignore=tests/test_recent_chunks_integration.py --ignore=tests/test_review_risks_round100.py --ignore=tests/test_review_risks_round184_step8_sample.py --ignore=tests/test_review_risks_round382_canonical_load.py` → 預期全過。  
+- 若需 Step 7 相關整合通過：需可寫入之 temp 目錄與足夠 RAM，或於測試環境暫時設定 `STEP7_KEEP_TRAIN_ON_DISK=False`（非本輪變更範圍）。
+
+---
+
 ## Deploy 套件 re-export 修補（walkaway_ml.scorer / walkaway_ml.validator）
 
 **Date**: 2026-03-16
@@ -4706,5 +4867,181 @@ tests/test_db_conn_per_thread.py::TestForkChildCanCallCacheClear::test_child_pro
 - **剩餘項目**：
   1. **手動驗證**：本地或目標機跑 deploy（scorer + validator 同 process），確認無 concurrent session 錯誤；目標機觀察一段時間。
   2. **做法 2（備援）**：僅在連線數過多、ClickHouse 拒絕連線或維運要求單一連線時啟用；實作鎖與帶鎖查詢介面（見 PLAN §3）。
+
+---
+
+## Train–Serve Parity 強制對齊 — 步驟 3 + 步驟 4 實作（2026-03-16）
+
+**Date**: 2026-03-16
+
+**對應**：PLAN.md「Train–Serve Parity 強制對齊（計畫）」步驟 3（Parity 測試）、步驟 4（建包／CI 守衛）。只實作此兩步，不貪多。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `tests/test_deploy_parity_guard.py` | **新增**。Step 4：建包／CI 守衛 — 單一測試 `test_trainer_use_lookback_must_be_true_for_production`，assert `trainer.config.TRAINER_USE_LOOKBACK is True`，否則 `self.fail(...)` 並註明「Production 須 train–serve parity，請將 TRAINER_USE_LOOKBACK 設為 True 並重新訓練後再建包」。 |
+| `package/build_deploy_package.py` | **步驟 4**：在 `build_deploy_package()` 開頭加入 parity 守衛：確保 `REPO_ROOT` 在 `sys.path`，`import trainer.config`，若 `getattr(_tcfg, "TRAINER_USE_LOOKBACK", False) is not True` 則 `raise RuntimeError(...)`（同上錯誤訊息）。 |
+| `tests/test_review_risks_train_serve_parity_config.py` | **步驟 3**：新增 `_bets()` 輔助、`TRACK_HUMAN_COLS` 常數；新增 class `TestTrackHumanParitySameLookback`，測試 `test_add_track_human_features_deterministic_for_same_lookback` — 相同 (bets, canonical_map, window_end, lookback_hours=8) 呼叫 `add_track_human_features` 兩次，以 `pd.testing.assert_series_equal` 對 `loss_streak`、`run_id`、`minutes_since_run_start`、`bets_in_run_so_far`、`wager_sum_in_run_so_far` 逐欄斷言一致。 |
+
+### 手動驗證建議
+
+1. **Step 4 守衛測試**  
+   ```bash
+   python -m pytest tests/test_deploy_parity_guard.py -v
+   ```  
+   預期：**1 passed**（目前 config 為 `TRAINER_USE_LOOKBACK=True`）。
+
+2. **Step 3 parity 測試**  
+   ```bash
+   python -m pytest tests/test_review_risks_train_serve_parity_config.py -v
+   ```  
+   預期：**5 passed**（含新測 `TestTrackHumanParitySameLookback::test_add_track_human_features_deterministic_for_same_lookback`）。
+
+3. **建包守衛**（可選）  
+   - 正常建包：`python -m package.build_deploy_package` 應成功（因 TRAINER_USE_LOOKBACK=True）。  
+   - 若暫時將 `trainer/core/config.py` 內 `TRAINER_USE_LOOKBACK = False` 後再執行建包，應得到 `RuntimeError`，錯誤訊息含「Production 須 train–serve parity…」。驗證後請改回 `True`。
+
+### 下一步建議
+
+- **步驟 5（可選）**：若確認不再需要無 lookback 路徑，可移除 `TRAINER_USE_LOOKBACK` 開關，trainer 一律傳 `SCORER_LOOKBACK_HOURS`。
+- 將 PLAN 項目 23「Train–Serve Parity 強制對齊」中步驟 3、4 標為已完成。
+
+---
+
+### Code Review：Train–Serve Parity 步驟 3 + 4 變更（高可靠性標準）
+
+**Date**: 2026-03-16
+
+**審查範圍**：本輪變更僅限 `tests/test_deploy_parity_guard.py`（新增）、`package/build_deploy_package.py`（建包前 parity 守衛）、`tests/test_review_risks_train_serve_parity_config.py`（步驟 3 確定性測試）。不重寫整套；以下僅列潛在問題與建議。
+
+---
+
+#### 1. 建包守衛檢查的是「當前 process 已載入的 config」（邊界條件）
+
+**問題**：`build_deploy_package()` 內先 `sys.path.insert(0, str(REPO_ROOT))` 再 `import trainer.config`。若此函式是在**已被其他程式 import 過 `trainer` 的 process** 中被呼叫（例如某腳本先 `from walkaway_ml import trainer` 再呼叫建包），則 `import trainer.config` 會取得**已載入的**模組，該模組可能來自**已安裝的 walkaway_ml**，而非即將被打包的 source tree。此時通過檢查（安裝版為 True）但實際打包的 source 若被改為 False，會產出未對齊的 artifact。
+
+**具體修改建議**：在 `build_deploy_package` 文件字串或模組 docstring 註明：**建包應以 `python -m package.build_deploy_package` 從 repo root 執行，且勿在已 import 過 trainer/walkaway_ml 的 process 內呼叫本函式**。可選：在守衛前加註 `# Assumes trainer is not already loaded from an installed package`。若需更強保證：可改為讀取 `trainer/core/config.py` 原始檔並檢查其中出現 `TRAINER_USE_LOOKBACK = True`（需處理註解與格式，實作較脆），或由 CI 以 subprocess 執行建包腳本，確保乾淨 process。
+
+**希望新增的測試**：可選：pytest 中以 subprocess 執行 `python -m package.build_deploy_package --help`（或僅 import 不建包），確認在**未先 import trainer** 的 process 內可正常載入；或 CI 步驟明確寫明「建包前不 import trainer」。
+
+---
+
+#### 2. 步驟 3 測試浮點欄位未明確容差（邊界條件／跨平台）
+
+**問題**：`test_add_track_human_features_deterministic_for_same_lookback` 對 `minutes_since_run_start`、`wager_sum_in_run_so_far` 等浮點欄位使用 `pd.testing.assert_series_equal`，預設會用 rtol/atol 比較。若未來計算路徑或依賴（如 numba/pandas）有細微差異，或不同平台浮點行為不同，可能出現偶發失敗。
+
+**具體修改建議**：對 float 型欄位明確指定容差，例如 `pd.testing.assert_series_equal(..., check_exact=False, rtol=1e-9, atol=1e-12)`，或在測試開頭註解「float 欄位以預設 rtol/atol 比較，若 flaky 可調大 atol」。目前若無 flaky 可維持現狀，僅在文件留下建議。
+
+**希望新增的測試**：無需為此單獨加測；若 CI 出現該測試 flaky，再補上明確 rtol/atol 或改為對整數欄位 assert 嚴格相等、浮點欄位 assert allclose。
+
+---
+
+#### 3. 步驟 3 未覆蓋 canonical_id 缺失路徑（邊界條件）
+
+**問題**：`add_track_human_features` 在 `"canonical_id" not in df.columns` 時會填 0 並提前 return。目前步驟 3 測試的 bets 含 `canonical_id`，未覆蓋「缺 canonical_id 時五欄皆為 0」的契約。
+
+**具體修改建議**：屬可選強化。若希望邊界完整：在 `TestTrackHumanParitySameLookback` 新增一則 `test_add_track_human_features_missing_canonical_id_returns_zeros`，傳入無 `canonical_id` 的 bets，assert 五個 Track Human 欄位皆為 0（或 0.0）。不改 production code。
+
+**希望新增的測試**：如上：缺 `canonical_id` 時 `loss_streak`、`run_id`、`minutes_since_run_start`、`bets_in_run_so_far`、`wager_sum_in_run_so_far` 全為 0。
+
+---
+
+#### 4. sys.path 變更對同 process 後續 import 的影響（行為／文件）
+
+**問題**：`build_deploy_package()` 開頭 `sys.path.insert(0, str(REPO_ROOT))` 會讓同 process 後續的 `import trainer.*` 優先從 REPO_ROOT 載入。建包腳本後續多為 subprocess 或檔案操作，實務上影響有限；但若有人在同一 process 內先呼叫 `build_deploy_package()` 再做其他與 trainer 無關的 import，理論上會受影響。
+
+**具體修改建議**：不建議在檢查後還原 path（後續 build_wheel 等可能仍需 repo root）。在函式或模組 docstring 加一句：「本函式會將 REPO_ROOT 加入 sys.path 以檢查 config，呼叫端請注意同 process 內 import 順序。」
+
+**希望新增的測試**：無需為此加測；文件化即可。
+
+---
+
+#### 5. 安全性與效能
+
+**安全性**：守衛與測試僅讀取 config 屬性、比對常數、固定錯誤訊息，無使用者輸入或字串拼接，無注入風險。
+
+**效能**：建包時多一次 `import trainer.config` 與 `getattr`，可忽略；步驟 3 測試為兩次小 DataFrame 的 `add_track_human_features`，耗時極低。
+
+---
+
+#### 6. 既有程式碼未納入本輪變更（僅提醒）
+
+**Backtester**：`trainer/training/backtester.py` 第 574 行呼叫 `add_track_human_features(bets, canonical_map, window_end)` **未傳 `lookback_hours`**，故使用全歷史（lookback_hours=None）。此為既有設計（註解為「full history for context」），非本輪引入。若未來要讓 backtester 與 scorer/trainer 完全 parity，可再改為傳入 `SCORER_LOOKBACK_HOURS`；本輪不改。
+
+---
+
+**總結**：最值得文件化的是 **§1（建包應在乾淨 process 或從 __main__ 執行）**；其餘為可選強化或說明。無必須立即修改的 bug；建議至少補上 §1 的文件註明，並可選補 §3 的 canonical_id 缺失測試。
+
+---
+
+### 新增測試與執行方式（Code Review 步驟 3+4 風險點 → 最小可重現測試）
+
+**Date**: 2026-03-16
+
+**原則**：僅新增 tests，不修改 production code。將 Reviewer 提到的可測風險點轉成最小可重現測試。
+
+| Code Review 條目 | 風險點 | 新增測試 | 檔案 |
+|------------------|--------|----------|------|
+| §1 | 建包守衛檢查的是已載入的 config；建包腳本應在未先 import trainer 的 process 內可載入 | `TestBuildScriptLoadsInCleanProcess::test_build_deploy_package_help_runs_in_subprocess`：以 subprocess 執行 `python -m package.build_deploy_package --help`，cwd=repo root，assert returncode 0 且 stdout/stderr 含 `output-dir`（確認乾淨 process 可載入） | `tests/test_deploy_parity_guard.py` |
+| §3 | 缺 `canonical_id` 時五個 Track Human 欄位應皆為 0 | `TestTrackHumanParitySameLookback::test_add_track_human_features_missing_canonical_id_returns_zeros`：傳入無 `canonical_id` 的 bets，呼叫 `add_track_human_features`，assert 五欄 `loss_streak`、`run_id`、`minutes_since_run_start`、`bets_in_run_so_far`、`wager_sum_in_run_so_far` 全為 0 | `tests/test_review_risks_train_serve_parity_config.py` |
+
+**未轉成測試**：§2（浮點容差）— 若 CI flaky 再補 rtol/atol；§4（sys.path 文件化）— 僅文件；§5、§6 無需加測。
+
+#### 執行方式（專案根目錄）
+
+```bash
+# 建包守衛 + 乾淨 process 載入
+python -m pytest tests/test_deploy_parity_guard.py -v
+
+# Train–serve parity 契約 + 步驟 3 確定性 + 缺 canonical_id 邊界
+python -m pytest tests/test_review_risks_train_serve_parity_config.py -v
+```
+
+**驗證結果**：`python -m pytest tests/test_deploy_parity_guard.py tests/test_review_risks_train_serve_parity_config.py -v` → **8 passed**（test_deploy_parity_guard 2 則，test_review_risks_train_serve_parity_config 6 則）。
+
+---
+
+## 本輪驗證 — tests / typecheck / lint（2026-03-16）
+
+**Date**: 2026-03-16
+
+**原則**：不改 tests（除非測試本身錯或 decorator 過時）；僅修改實作直到 tests/typecheck/lint 通過。本輪未修改 production code（無需修實作）；僅執行驗證並更新 PLAN 項目 23 狀態。
+
+### 執行指令與結果（專案根目錄）
+
+```bash
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load
+python -m ruff check trainer/ package/ scripts/
+python -m mypy trainer/ package/ --ignore-missing-imports
+```
+
+| 項目 | 結果 |
+|------|------|
+| **ruff** | **All checks passed!** |
+| **mypy** | **Success: no issues found in 47 source files** |
+| **pytest（全量）** | 15 failed, 1103 passed, 42 skipped |
+
+### pytest 15 failed 說明
+
+15 筆失敗皆為 **Step 7 整合測試**（`test_fast_mode_integration.py`、`test_recent_chunks_integration.py`、`test_review_risks_round100.py`、`test_review_risks_round184_step8_sample.py`、`test_review_risks_round382_canonical_load.py`）。失敗原因：`RuntimeError: Step 7 STEP7_KEEP_TRAIN_ON_DISK is True and DuckDB failed; no pandas fallback`。在測試環境下 DuckDB 因 mock／暫存路徑或資源限制失敗，PLAN 規定此時不 fallback、直接 raise；**未修改 production 契約，未改 tests**（與 STATUS 前輪「本輪實作修正與驗證」一致）。
+
+### 排除 Step 7 整合測試後
+
+```bash
+python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/load \
+  --ignore=tests/test_fast_mode_integration.py \
+  --ignore=tests/test_recent_chunks_integration.py \
+  --ignore=tests/test_review_risks_round100.py \
+  --ignore=tests/test_review_risks_round184_step8_sample.py \
+  --ignore=tests/test_review_risks_round382_canonical_load.py
+```
+
+**結果**：**1086 passed**, 42 skipped（無失敗）。
+
+### 結論
+
+- **typecheck / lint**：全過。
+- **pytest**：全量跑有 15 個已知失敗（Step 7 整合）；排除上述 5 檔後其餘 **1086 則全過**。若要「全部綠燈」需測試環境具備可寫入 temp 與足夠 RAM，或於測試環境暫時設定 `STEP7_KEEP_TRAIN_ON_DISK=False`（非本輪變更範圍）。
 
 ---

@@ -703,4 +703,24 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-029：部署階段預測日誌採用 MLflow（on-prem）
+
+**日期**：2026-03-16  
+**SSOT 章節**：doc/phase2_planning.md § 方向 #5 模型監控、§ 模型重訓與監控  
+
+**決策**：部署環境的**推論／預測日誌**（每筆或每批預測的 request id、score、model_version、必要識別欄位等）以 **MLflow** 記錄。MLflow Tracking Server 自架於公司內網（on-prem），資料不輸出至外網。日誌用途包含：(1) **極端尾部人工抽查**（例如撈出高分 FP 的 patron/session 明細，判斷是否為內部測試、VIP、機台異常等）；(2) 後續 drift、分佈與表現分析。
+
+**考慮過的替代方案**：
+- **Arize Phoenix / WhyLabs / Fiddler 等**：專用於 ML 推論日誌與監控，但需額外引入一套軟體；團隊已規劃建置 MLflow，故不增加新依賴。
+- **自建 SQLite/Parquet + 腳本**：輕量且 on-prem，但需自行維護 schema、查詢與權限；MLflow 現成可記錄 run/artifact/metric，自架即可滿足「記錄＋查詢」且與實驗/模型版本整合。
+- **Datadog / New Relic 等 APM**：若公司已有，可打點 custom event；未列為首選因 MLflow 已納入規劃，集中於 MLflow 可單一維護。
+
+**理由**：
+- **單一軟體**：不引入新工具，與既有 MLflow 規劃一致，降低維運與學習成本。
+- **On-prem**：Tracking Server 自架，資料留存公司內網，符合資安要求。
+- **免費、可自架**：MLflow 開源，無授權費用。
+- **可擴充**：日後可與 model registry、重訓 pipeline 同一套 MLflow 整合。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*
