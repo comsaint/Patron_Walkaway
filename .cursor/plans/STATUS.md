@@ -6,6 +6,39 @@
 
 ---
 
+## 測試目錄分層（第一階段）實作與驗證
+
+**Date**: 2026-03-17
+
+依 PLAN.md「測試目錄分層（第一階段）」完成目錄分層與搬移，並修正因路徑變更導致的引用。
+
+### 變更摘要
+
+| 項目 | 內容 |
+|------|------|
+| **目錄** | 新增 `tests/unit/`、`tests/integration/`、`tests/review_risks/`。 |
+| **搬移** | 所有 `test_review_risks_*` 與 `test_*_review_risks_*` → `tests/review_risks/`；約 10 個純單元檔 → `tests/unit/`；其餘 16 個 → `tests/integration/`。 |
+| **路徑修正** | 測試檔改至子目錄後，`Path(__file__).resolve().parents[1]` 改為 `parents[2]` 以正確取得 repo root；6 處 `parent.parent / "trainer"/...` 改為 `parents[2] / "trainer"/...`；`test_review_risks_training_config_recommender.py` 內 cwd 改為 `parents[2]`。 |
+| **引用修正** | `test_review_risks_round80.py`、`round90.py`：`test_profile_schema_hash.py` 路徑改為 `tests/unit/test_profile_schema_hash.py`。`test_review_risks_round250_canonical_from_links.py`：`from test_identity import ...` 改為 `from tests.unit.test_identity import ...`。`test_review_risks_round376_canonical_duckdb.py`：`tests.test_canonical_mapping_duckdb_pandas_parity` 改為 `tests.integration.test_canonical_mapping_duckdb_pandas_parity`。 |
+| **文件** | 新增 `tests/README.md`，說明 unit / integration / review_risks 用途與建議指令。 |
+
+### 全量測試結果（搬移＋路徑修正後）
+
+- **指令**：`python -m pytest tests/ -q --tb=no`
+- **結果**：**1095 passed**，17 failed，44 skipped（約 32s）
+- **說明**：17 個失敗均為搬移前即存在之環境／行為：多數為 Step 7 DuckDB RAM 不足（`STEP7_KEEP_TRAIN_ON_DISK is True and DuckDB failed; no pandas fallback`），1 個為 `test_review_risks_round170.py` 之 `lookback_hours` 關鍵字參數不相容，與目錄搬移無關。round376 之 parity 模組 import 已修正並通過。
+
+### 建議指令（與 tests/README.md 一致）
+
+- 全量：`pytest tests/`
+- 僅單元：`pytest tests/unit/`
+- 僅整合：`pytest tests/integration/`
+- 僅 review_risks：`pytest tests/review_risks/`
+
+文件中若曾寫死 `tests/test_xxx.py`，現應改為 `tests/unit/`、`tests/integration/` 或 `tests/review_risks/` 下之對應路徑；PLAN/STATUS 其餘章節之範例路徑可於後續逐一更新。
+
+---
+
 ## Train–Serve Parity 強制對齊（PLAN 步驟 1–2）
 
 **Date**: 2026-03-16
@@ -23,12 +56,12 @@
 
 ### 手動驗證建議
 - **Config**：`python -c "import trainer.config as c; assert c.TRAINER_USE_LOOKBACK is True"` 應通過。
-- **相關測試**：`python -m pytest tests/test_config.py tests/test_review_risks_lookback_hours_trainer_align.py tests/test_review_risks_scorer_defaults_in_config.py -v`（本輪已跑，40 passed）。
+- **相關測試**：`python -m pytest tests/unit/test_config.py tests/review_risks/test_review_risks_lookback_hours_trainer_align.py tests/review_risks/test_review_risks_scorer_defaults_in_config.py -v`（本輪已跑，40 passed）。
 - **訓練一輪**（可選）：預設下跑短窗訓練（例如 `--recent-chunks 1 --use-local-parquet --skip-optuna`），確認 Step 6 使用 lookback（與 scorer 一致）且無報錯。
 
 ### 下一步建議
 - **步驟 3**：新增或擴充 parity 測試（同 lookback 時 trainer 路徑與 scorer 路徑產出相同 Track Human 特徵）。
-- **步驟 4**：建包／CI 守衛（`build_deploy_package.py` 或 `tests/test_deploy_parity_guard.py` 檢查 `TRAINER_USE_LOOKBACK is True`，否則 fail 並提示）。
+- **步驟 4**：建包／CI 守衛（`build_deploy_package.py` 或 `tests/integration/test_deploy_parity_guard.py` 檢查 `TRAINER_USE_LOOKBACK is True`，否則 fail 並提示）。
 - **步驟 5**（可選）：若確認不再需要無 lookback 路徑，可移除 `TRAINER_USE_LOOKBACK`，trainer 一律傳 `SCORER_LOOKBACK_HOURS`。
 
 ---

@@ -347,6 +347,54 @@ Patron_Walkaway/
 
 ---
 
+## 測試目錄分層（第一階段）：目錄分層、不併檔
+
+**目標**：解決「測試檔過多且命名以 round 為主」造成的可發現性問題。僅做**目錄分層**（unit / integration / review_risks），不合併檔案、不改 test 內容；`pytest tests/` 仍遞迴收集所有子目錄，行為不變。
+
+**範圍**：在 `tests/` 下新增三子目錄並依規則搬移既有 `test_*.py`；新增 `tests/README.md` 說明用途與執行方式；更新 PLAN/STATUS 等文件中對測試路徑的引用。
+
+### 目錄定義
+
+| 目錄 | 用途 | 搬移規則 |
+|------|------|----------|
+| **tests/unit/** | 純單元：不依賴 DB、Parquet、多模組協作；可 mock 或無 I/O。 | 檔名符合下表「unit 清單」者移入。 |
+| **tests/integration/** | 整合：需 DB、Parquet、trainer/backtester/scorer 流程、或跨模組。 | 檔名符合下表「integration 清單」者移入。 |
+| **tests/review_risks/** | Code Review／round 回歸：所有 `test_review_risks_*` 及 `test_*_review_risks_*`。 | 檔名以 `test_review_risks_` 開頭，或含 `_review_risks_round`／`_review_risks_` 者移入。 |
+
+### 搬移規則（依檔名）
+
+- **→ tests/review_risks/**：下列皆移入。
+  - 以 `test_review_risks_` 開頭的所有檔案（例如 test_review_risks_round26.py、test_review_risks_step8_duckdb_std.py、test_review_risks_phase0_project_md_contracts.py）。
+  - 檔名含 `_review_risks_round` 或 `_review_risks_` 者（例如 test_backtester_review_risks_round18.py、test_features_review_risks_round9.py、test_identity_review_risks_round3.py、test_labels_review_risks_round6.py、test_scorer_review_risks_round22.py、test_trainer_review_risks_round14.py、test_trainer_review_risks_temp_table.py、test_api_server_db_only_review_risks.py）。
+- **→ tests/unit/**：僅測單一模組、無 DB／Parquet／多步驟 pipeline 者（候選範例：test_config.py、test_config_risks.py、test_schema_io.py、test_profile_schedule.py、test_profile_schema_hash.py、test_identity.py、test_labels.py、test_dq_guardrails.py、test_feature_spec_yaml.py、test_time_fold_risks.py）。若單從檔名難以判斷，可暫放 integration 或保留於 tests/ 根，後續再調。
+- **→ tests/integration/**：其餘未列入 unit 與 review_risks 者（例如 test_trainer.py、test_backtester.py、test_scorer.py、test_api_server.py、test_etl_player_profile_month_end_cli.py、test_auto_build_player_profile_month_end.py、test_canonical_mapping_duckdb_pandas_parity.py、test_plan_b_inmemory_vs_fromfile_parity.py、test_features.py、test_fast_mode_integration.py、test_recent_chunks_integration.py、test_deploy_parity_guard.py、test_db_conn_per_thread.py、test_validator_datetime_naive_hk.py、test_feat_consolidation_step8.py 等）。
+
+**約定**：搬移時**僅移動檔案路徑**，不修改檔內 class/function 名稱、不併檔。pytest 依目錄遞迴收集，無需改 `pytest tests/` 指令。
+
+### 步驟
+
+| 步驟 | 內容 | 驗收 |
+|------|------|------|
+| 1 | 建立 `tests/unit/`、`tests/integration/`、`tests/review_risks/` 三目錄（可為空，僅結構）。 | 目錄存在。 |
+| 2 | 依上表規則，將所有 `test_review_risks_*` 及 `test_*_review_risks_*` 搬至 `tests/review_risks/`。 | `pytest tests/review_risks/` 可跑且通過數與搬移前該批一致。 |
+| 3 | 將判定為 unit 的少數檔搬至 `tests/unit/`。 | `pytest tests/unit/` 可跑且通過。 |
+| 4 | 將其餘目前位於 `tests/` 根目錄的 test 檔搬至 `tests/integration/`。 | `tests/` 根目錄下無（或僅剩 conftest/README）test_*.py。 |
+| 5 | 新增 `tests/README.md`：說明 unit / integration / review_risks 用途、建議指令（`pytest tests/`、`pytest tests/unit/`、`pytest tests/integration/`、`pytest tests/review_risks/`）、約定「round／Code Review 風險回歸皆在 review_risks」。 | 文件存在且與實作一致。 |
+| 6 | 全量執行 `pytest tests/`，確認通過數與搬移前一致（或僅因路徑變更而無行為差異）。 | 通過數不低於搬移前。 |
+| 7 | 更新 PLAN.md、STATUS.md、README 等內對具體測試檔路徑的引用（例如 `tests/test_review_risks_round222_train_serve_parity.py` → `tests/review_risks/test_review_risks_round222_train_serve_parity.py`）。 | 文件內路徑與實際一致。 |
+
+### 風險與注意
+
+- **CI**：若 CI 以 `pytest tests/` 或 `pytest tests/ --ignore=tests/e2e --ignore=tests/load` 執行，無需改動；若有寫死單一檔路徑，改為目錄或更新路徑。
+- **conftest**：目前專案無 `tests/conftest.py`；若日後新增，注意 conftest 放置目錄會影響 scope。
+- **不變**：不新增、不刪除、不修改 test 內容（除非路徑引用在檔內）；不進行第二階段「依功能域合併 round 檔」。
+
+### 後續（可選，非本計畫）
+
+- **第二階段**：在 `tests/review_risks/` 內依功能域（canonical、plan_b、api_server、backtester、step7、step8 等）合併多個 round 檔為少數幾個檔，以 class 或 pytest marker 區分 round；可於本階段完成並穩定後再規劃。
+
+---
+
 ## Populate casino_player_id in ML API（Protocol Update）
 
 **目標**：依 `package/ML_API_PROTOCOL.md` 更新，讓 `GET /alerts` 與 `GET /validation` 的 `casino_player_id` 欄位改為從資料庫實際填入，不再固定為 `null`。
