@@ -25,7 +25,7 @@
 
 ### 1.2 MLflow 具體約定
 
-- **連線**：訓練機與 scorer 將 `MLFLOW_TRACKING_URI` 指向 **GCP Tracking Server**（例如 `http://<e2-micro-ip>:5000`），直接寫入 run、params/tags、artifact（artifact 存 GCS）。無 GCP 連線時不寫入 MLflow（不 fallback 本地）。
+- **連線**：**訓練機**與**匯出程式**將 `MLFLOW_TRACKING_URI` 指向 **GCP Tracking Server**（例如 `http://<e2-micro-ip>:5000`），直接寫入 run、params/tags、artifact（artifact 存 GCS）。Scorer 不直接連 MLflow，僅寫入本地 SQLite。無 GCP 連線時不寫入 MLflow（不 fallback 本地）。
 - **Artifact 上傳路徑**：e2-micro 僅 1GB RAM，**artifact 必須由客戶端直傳 GCS**，不經 Tracking Server 記憶體（避免 OOM）。設定 MLflow 的 `--default-artifact-root` 為 GCS，客戶端依 MLflow 回傳的 artifact URI 直接上傳。
 - **部署預測日誌**：Scorer **僅將每筆預測寫入本地 SQLite**（專用 table），不阻塞主路徑、不累積於記憶體。**匯出與上傳**由**獨立程式／排程**負責：週期性（例如每 5–15 分鐘，可依負載調整）自 SQLite 讀取、匯出為壓縮檔（建議 **Parquet 壓縮**如 gzip/snappy，或 gzip CSV 以省頻寬）、上傳至 MLflow run 的 artifact（GCS）。匯出在**獨立 process** 執行，避免 GIL 阻塞 scorer。
 - **Production artifact**：仍為 **deploy 包內完整 artifact 目錄**；runtime 不從 GCS 拉取模型。
@@ -146,7 +146,7 @@ state.db alerts → validator (ClickHouse) → validation_results
 
 ### 5.2 預測日誌（SQLite 中央儲存 + 獨立匯出）
 
-- Scorer 僅寫入**本地 SQLite**，不阻塞、不累積於記憶體。**匯出程式**在**獨立 process** 執行（避免 GIL 阻塞 scorer），週期性（如 5–15 分鐘，可調）自 SQLite 讀取、匯出為壓縮檔（建議 Parquet 壓縮或 gzip CSV 以省頻寬）、上傳至 MLflow artifact（GCS），以控制單檔大小與檔案數量。
+- Scorer 僅寫入**本地 SQLite**，不阻塞、不累積於記憶體。**匯出程式**在**獨立 process** 執行（避免 GIL 阻塞 scorer），週期性（如 5–15 分鐘，可調）自 SQLite 讀取、匯出為壓縮檔（建議 Parquet 壓縮或 gzip CSV 以省頻寬）、上傳至 MLflow artifact（GCS），以控制單檔大小與檔案數量。**SQLite 應啟用 WAL mode**，以允許匯出程式讀取時 scorer 仍可寫入，避免 lock 阻塞。
 
 ### 5.3 Evidently 與原始資料
 
@@ -185,7 +185,7 @@ state.db alerts → validator (ClickHouse) → validation_results
 
 - Validator 輸入輸出與 state.db 結構（除必要欄位外）不變。
 - Scorer 的 scoring、artifact 載入、state.db 寫入不變；僅新增預測寫入本地 SQLite；匯出與上傳由獨立程式負責。
-- CLI 入口與必選參數相容；新功能以可選參數或環境變數啟用（如 `MLFLOW_TRACKING_URI`、是否啟用預測日誌、sync 開關）。
+- CLI 入口與必選參數相容；新功能以可選參數或環境變數啟用：**訓練機與匯出程式**以 `MLFLOW_TRACKING_URI` 指向 GCP；**scorer** 以 SQLite 路徑或開關啟用預測日誌寫入；Evidently sync 開關等。
 
 ---
 
@@ -210,7 +210,7 @@ state.db alerts → validator (ClickHouse) → validation_results
 
 1. **GCP Tracking Server 部署**：e2-micro 區域、防火牆、開機自動啟動 MLflow server、GCS bucket 與服務帳號權限；**artifact 由客戶端直傳 GCS**，不經 e2-micro。
 2. **MLFLOW_TRACKING_URI**：訓練機與匯出程式設為 GCP URL；Phase 2 不實作 fallback，無 GCP 時不寫 MLflow；預測日誌仍寫 SQLite。
-3. **預測日誌 SQLite**：schema（table、欄位）、與 state.db 同檔或分檔、保留策略。
+3. **預測日誌 SQLite**：schema（table、欄位）、與 state.db 同檔或分檔、保留策略；**啟用 WAL mode** 以利匯出程式讀取時 scorer 仍可寫入。
 4. **匯出程式**：觸發方式（cron vs 內建 timer）、週期（5–15 分鐘可調）、匯出格式（Parquet 壓縮建議 gzip/snappy，或 gzip CSV 省頻寬）。
 5. **Evidently 報告格式**：本地目錄結構與檔名約定，以便設計「sync 報告到 GCS」的腳本或路徑。
 6. **Evidently 輸入**：若日後在 GCP 上提供 Evidently API，on-prem 端送「彙總／抽樣」的 payload 格式與頻率（batch 檔、或小批次 API 呼叫）。

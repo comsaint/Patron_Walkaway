@@ -50,7 +50,7 @@
 | 項目 | 內容 |
 |------|------|
 | **產出** | 特徵計算邏輯/清單與 model 版本綁定；deploy/rollback 時 serving 使用的特徵與該 model 訓練時一致。 |
-| **實作方向** | (A) 特徵清單或 feature spec 隨 model artifact 一併存進 registry；或 (B) 在 registry 中記錄「model_version → feature_version / feature_commit」對應，deploy 時依此載入對應特徵邏輯。 |
+| **實作方向** | **採用 (A)**：特徵清單或 feature spec 隨 model artifact **同目錄**一併輸出；同目錄即同版本。Rollback 僅能**整包／整目錄**替換，禁止只換 model.pkl，以避免 training–serving skew。 |
 | **可接受標準** | (1) 回滾到某 model version 時，文件或機制上保證使用該 version 對應的特徵；(2) 新上線或回滾不需人工記憶「這版該配哪版特徵」。 |
 | **依賴** | 特徵計算有版本或 commit 可指涉（例如專案內 feature 程式或 config 的 version）；P0.1 的溯源可一併記錄 feature version。 |
 
@@ -76,7 +76,7 @@
 | **用途** | (1) 極端尾部人工抽查（如高分 FP）；(2) 依時間/模型版本做 score 分佈、drift、precision@recall=1% 分析。 |
 | **可接受標準** | (1) 日誌寫入 SQLite 且可經匯出上傳至 MLflow，可依 model_version、時間範圍查詢；(2) 不引入額外日誌產品，符合 DEC-029；(3) 留存策略與隱私/合規一致（如 GCP、保留天數）。離線時資料保留於 SQLite，恢復後可補傳。 |
 | **寫入策略** | **Scorer**：每筆預測寫入**本地 SQLite**，不阻塞主路徑、不累積於記憶體。**匯出程式**（**獨立 process**，如 cron 或獨立腳本）：週期性（如每 5–15 分鐘，可調）自 SQLite 讀取、匯出為壓縮檔（建議 Parquet 壓縮或 gzip CSV 以省頻寬）、上傳至 MLflow run 的 artifact（GCS）；匯出與上傳不與 scorer 共用 process，避免 GIL 阻塞。 |
-| **依賴** | 本地 SQLite（預測日誌 schema）；MLflow Tracking Server 於 GCP；匯出程式可連 GCP 時上傳；artifact 由客戶端直傳 GCS（不經 Tracking Server 記憶體）。 |
+| **依賴** | 本地 SQLite（預測日誌 schema，建議啟用 WAL mode 以利匯出讀取時 scorer 仍可寫入）；MLflow Tracking Server 於 GCP；匯出程式可連 GCP 時上傳；artifact 由客戶端直傳 GCS（不經 Tracking Server 記憶體）。 |
 
 ### P1.2 告警與 runbook
 
@@ -140,7 +140,7 @@
 ```
 P0.1 溯源欄位與 pipeline 寫入     ──┐
                                      ├── 並行（P1.1 不必等 P0 完成）
-P1.1 部署預測日誌（MLflow）        ──┘
+P1.1 部署預測日誌（SQLite + 匯出→MLflow GCP） ──┘
 P1.4 資料品質監控（可與 P1.1 並行）
     ↓
 P0.2 model–feature 版本綁定與 deploy/rollback 流程
