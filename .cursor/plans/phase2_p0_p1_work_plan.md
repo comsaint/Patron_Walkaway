@@ -8,20 +8,6 @@
 
 ---
 
-## Revision Notes
-
-本版修正前一版草案的幾個問題：
-
-1. 前版是「計畫去建立另一份計畫」，不是可直接執行的工作計畫；本版直接作為執行依據。
-2. 前版的 prediction export 狀態設計偏向 `exported_at` / 刪列；這會增加 SQLite 寫入放大與 lock 風險。本版改為 **append-only + watermark**。
-3. 前版把「啟用 WAL」當作待做事項，但 `trainer/serving/scorer.py` 已在 `init_state_db()` 啟用 WAL；本版改為「延用既有 WAL，擴充 schema 與讀寫策略」。
-4. 前版低估依賴變更範圍：repo 內有 `requirements.txt`、`package/deploy/requirements.txt`、`deploy_dist/requirements.txt`；本版區分 **training/export** 與 **deploy runtime** 所需依賴。
-5. 前版把 P1.4/P1.5 幾乎當成純文件工作；本版改為「**可手動執行的 script + 文件**」，才符合 Phase 2 的可操作性。
-6. 前版沒有明確寫出 retention / watermark / audit 設計；本版補上，避免 SQLite 無限成長。
-7. 前版沒有提醒 **不要修改 `build/lib/**`**；本版明確排除，避免改到打包產物。
-
----
-
 ## Guardrails
 
 - **不修改 `build/lib/**`**。如未來需要打包，應由正式 build 流程重新產出。
