@@ -52,18 +52,14 @@ class TestReviewRisksRound30(unittest.TestCase):
             ),
         )
 
-    def test_r42_validator_session_cache_should_be_canonical_id_based(self):
-        """R42: session lookup should follow canonical_id, not only player_id."""
-        src = ast.get_source_segment(
-            _VALIDATOR_SRC, _get_func_node(_VALIDATOR_TREE, "validate_alert_row")
-        ) or ""
+    def test_r42_validator_session_cache_parameter_retained(self):
+        """R42 (DEC-030): validate_alert_row retains session_cache parameter for API compatibility; verdict is bet-based only."""
+        func = _get_func_node(_VALIDATOR_TREE, "validate_alert_row")
+        args = [a.arg for a in func.args.args]
         self.assertIn(
-            "session_cache.get(canonical_id",
-            src,
-            msg=(
-                "validate_alert_row should look up sessions by canonical_id "
-                "to support player card swaps."
-            ),
+            "session_cache",
+            args,
+            msg="validate_alert_row must keep session_cache parameter for API compatibility (DEC-030: verdict bet-based only).",
         )
 
     def test_r43_scorer_session_query_contains_etl_insert_tiebreaker(self):

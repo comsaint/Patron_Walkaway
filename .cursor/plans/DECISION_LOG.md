@@ -723,4 +723,26 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-030：Validator 與 Trainer 標籤／常數對齊（常數共用 config、僅 bet-based 邏輯）
+
+**日期**：2026-03-17  
+**SSOT 章節**：doc/validator_trainer_parity_plan.md、PLAN.md 項目 24  
+
+**決策**：
+
+1. **常數單一來源**：Validator（`trainer/serving/validator.py`）不再寫死 15／30／45 分鐘，改為從與 trainer 相同的 config 讀取：`WALKAWAY_GAP_MIN`、`ALERT_HORIZON_MIN`、`LABEL_LOOKAHEAD_MIN`（及既有 `VALIDATOR_EXTENDED_WAIT_MINUTES`、`VALIDATOR_FRESHNESS_BUFFER_MINUTES`）。`find_gap_within_window` 與 `validate_alert_row` 內所有時長均改為使用上述 config。
+2. **標籤定義對齊**：Validator 的 MATCH／MISS 判決改為**僅依 bet stream**（與 `trainer/labels.py` 的 `compute_labels` 一致）。移除依 session 的 early return 與 late-arrival 判定；late arrival 僅以「是否有 bet 落在 (ALERT_HORIZON_MIN, LABEL_LOOKAHEAD_MIN]」為準，不再參考 session start。`session_cache` 參數保留以維持 API 相容，但不再用於 verdict。
+
+**背景**：
+- Trainer 的 label 來自 `labels.py`（僅 bet、使用 config 常數）；Validator 原先寫死 15/30/45 且含 session 路徑，存在常數與定義雙軌，導致 train–serve 標籤 parity 風險。
+- 嚴謹的 precision@recall 與離線 true label 計算需與訓練時標籤定義一致，故 production 驗證邏輯應與 trainer 對齊。
+
+**理由**：
+- 常數改 config：未來若調整 WALKAWAY_GAP_MIN／ALERT_HORIZON_MIN，一處修改即同步 trainer 與 validator，避免隱性偏離。
+- Bet-only：與訓練標籤定義一致，利於事後全量標註、precision@recall 計算與模型監控。
+
+**實作計畫**：見 doc/validator_trainer_parity_plan.md（Step 1 常數改 config；Step 2 移除 session 路徑、late arrival 僅看 bet；測試與驗收）。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

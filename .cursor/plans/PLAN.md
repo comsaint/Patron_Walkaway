@@ -136,7 +136,10 @@ todos:
     status: completed
   - id: train-serve-parity-enforce
     content: "Train–Serve Parity 強制對齊：單一來源、預設一致、守衛與測試（TRAINER_USE_LOOKBACK 預設 True；可選移除開關；parity 測試與建包檢查；文件化）；見「Train–Serve Parity 強制對齊（計畫）」一節。"
-    status: pending
+    status: completed
+  - id: validator-trainer-parity
+    content: "Validator–Trainer 標籤與常數對齊（DEC-030）：Validator 常數改從 config 讀取（WALKAWAY_GAP_MIN、ALERT_HORIZON_MIN、LABEL_LOOKAHEAD_MIN）；Validator 改為僅 bet-based 邏輯，與 trainer/labels.py 一致，移除 session 路徑用於 MATCH/MISS 判決。見 doc/validator_trainer_parity_plan.md。"
+    status: completed
 isProject: false
 ---
 
@@ -196,11 +199,12 @@ Phase 1 主體（Step 0～Step 10、DuckDB 動態天花板、特徵整合 YAML S
 | 20 | **Deploy DEC-028 修補（player_profile 打包／canonical 持久化）** | completed | DEPLOY_PLAN §8、DECISION_LOG DEC-028。Production 修補：scorer DATA_DIR 空/空白視為未設定；build 時 profile 複製失敗 try/except 建包仍完成；deploy main 遲 import 加 noqa: E402；scorer _DATA_DIR 型別註解。tests/test_review_risks_deploy_dec028.py 7/7 通過；tests/typecheck/lint 全過。見 STATUS.md「DEC-028 本輪實作修正與驗證」。 |
 | 21 | **Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）** | completed | Phase 1：compute_column_std_duckdb（path/df、僅數值欄）、screen_features 優先使用、trainer Step 8 傳 train_path/train_df；Review 風險測試已加入（STATUS 2026-03-13）。Phase 2：compute_correlation_matrix_duckdb helper 與 Review §1 row 長度修補已完成（2026-03-13）；接線 screen_features 為可選。見「Step 8 Feature Screening：DuckDB 算統計量（避免 OOM）」一節。 |
 | 22 | **CLI for month-end-only player_profile** | completed | profile_schedule、ETL `--month-end`／`--snapshot-interval-days`、auto_build_player_profile `--month-end`、測試、文件；Lint E402 已修正（import 移至頂部）。見「CLI for month-end-only player_profile」一節與 STATUS.md 本輪。 |
-| 23 | **Train–Serve Parity 強制對齊** | completed | 步驟 1–4 已完成：預設 True、getattr 預設 True、註解更新、scorer/re-exports、R207/R256/features top_k；**步驟 3** parity 測試（同 lookback 確定性、缺 canonical_id 邊界）；**步驟 4** 建包／CI 守衛（test_deploy_parity_guard、build_deploy_package 內檢查）。步驟 5（可選移除開關）留後續。見下方「Train–Serve Parity 強制對齊（計畫）」一節與 STATUS.md 本輪。 |
+| 23 | **Train–Serve Parity 強制對齊** | completed | 步驟 1–5 已完成：步驟 1–4（預設 True、getattr 預設 True、parity 測試、建包守衛）；**步驟 5**（2026-03-17）可選移除開關已完成 — TRAINER_USE_LOOKBACK 已移除，訓練／backtester／scorer 一律使用 SCORER_LOOKBACK_HOURS；config 註明單一來源。見 STATUS.md「Train–Serve Parity 步驟 5 完成」。 |
+| 24 | **Validator–Trainer 標籤與常數對齊（DEC-030）** | completed | Validator 常數改從 config 讀取（不寫死 15/30/45）；Validator 改為僅 bet-based 邏輯，與 trainer/labels.py 一致，移除 session 路徑用於 MATCH/MISS。見 doc/validator_trainer_parity_plan.md。2026-03-17 實作；Code Review §1（gap start ≥ alert_ts）已修補，DEC-030 parity 測試 5/5 通過。 |
 
 **Plan 狀態摘要**：上表 1～23 項均為 **completed**（第 18 項於 Round 406 完成項目 1、3；第 19 項 Track Human Lookback 向量化已含 Phase 2 numba 與 Code Review 修補，2026-03-13 完成 numba 時間單位修正 _datetime_to_ns_int64，lookback/run_boundary 全測試通過）。第 9 項 api_server 對齊 model_api_protocol 步驟 6（可選 doc）已於 Round 241 更新 doc，本輪補 Phase 1 alignment 註記並標為 completed。第 13 項 Scorer 預設移至 config 已實作並記錄於 STATUS.md；Review 跟進（CLI 拒絕非正數 lookback-hours/interval）已實作；可選後續「trainer 對齊 Track Human 至 SCORER_LOOKBACK_HOURS」已實作，Review #1/#2（lookback_hours≤0 raise、run_* 超出 cutoff 填 0）已修復，tests/typecheck/lint 通過。**第 14 項 Validator 對齊舊版**已於 Round 393 實作並標為 completed；Round 393 Code Review Risk #1（is_upgrade + NaN）、#2（session_id 安全轉換）已於 Round 394 修補，tests/typecheck/lint 全過。
 
-**剩餘項目**：上表 1～23 項與 **canonical-step3-schema-check-oom**、**config-consolidation**（DEC-027）、**progress-bars-long-steps**、**training-config-recommender** 均已完成。**項目 21** Step 8 DuckDB 算統計量 Phase 1 與 Phase 2 helper（含 Review §1 row 長度修補）已於 2026-03-13 完成；**Step 8 將 DuckDB CORR 接線至 screen_features** 已於 2026-03-14 完成（見 STATUS.md 本輪 Code Review 修補）。**Populate casino_player_id** 已完成（見下方「Populate casino_player_id in ML API」一節狀態 2026-03-12）。**項目 23** Train–Serve Parity 強制對齊步驟 1–4 已於 2026-03-16 完成（見 STATUS.md「Train–Serve Parity 強制對齊 — 步驟 3 + 步驟 4 實作」與本輪驗證）；步驟 5（可選移除開關）留後續。其餘可選／後續見下方各節（如 Canonical 生產增量更新 Phase 2、table_hc 啟用等）。
+**剩餘項目（Plan 內尚未完成）**：**無**。上表 1～24 項均 completed（含項目 23 步驟 5，2026-03-17）。**項目 21** Step 8 DuckDB 算統計量 Phase 1 與 Phase 2 helper（含 Review §1 row 長度修補）已於 2026-03-13 完成；**Step 8 將 DuckDB CORR 接線至 screen_features** 已於 2026-03-14 完成（見 STATUS.md 本輪 Code Review 修補）。**Populate casino_player_id** 已完成（見下方「Populate casino_player_id in ML API」一節狀態 2026-03-12）。**項目 23** Train–Serve Parity 強制對齊步驟 1–4 已於 2026-03-16 完成（見 STATUS.md「Train–Serve Parity 強制對齊 — 步驟 3 + 步驟 4 實作」與本輪驗證）。其餘可選／後續見下方各節（如 Canonical 生產增量更新 Phase 2、table_hc 啟用等）。
 
 **建議實作順序**：可選／後續見下方各節（Step 7 out-of-core 排序、Optuna early stop 等）。
 
@@ -2151,7 +2155,7 @@ study.optimize(objective, n_trials=OPTUNA_N_TRIALS)
 | 4 | **建包／CI 守衛** | 在 `package/build_deploy_package.py` 建包時，或於專用 pytest（如 `tests/test_deploy_parity_guard.py`）中，檢查 `TRAINER_USE_LOOKBACK is True`（或專案約定的 parity 條件）；若否則 raise 或 pytest.fail，錯誤訊息註明：production 須 train–serve parity，請將 `TRAINER_USE_LOOKBACK` 設為 True 並重新訓練後再建包。 |
 | 5 | **（可選）移除開關** | 若確認不再需要「無 lookback 訓練」路徑：移除 `TRAINER_USE_LOOKBACK`，trainer 的 `add_track_human_features` 一律傳入 `lookback_hours=getattr(config, "SCORER_LOOKBACK_HOURS", 8)`，從根上避免開關設錯。若保留開關，則至少完成步驟 1–4。 |
 
-**實作狀態（2026-03-16）**：步驟 1–4 已完成（parity 測試、建包守衛、Code Review 風險轉測試見 STATUS.md）；步驟 5 留後續。
+**實作狀態**：步驟 1–5 已完成。步驟 1–4 於 2026-03-16 完成（parity 測試、建包守衛、Code Review 風險轉測試見 STATUS.md）；**步驟 5**（可選移除 TRAINER_USE_LOOKBACK 開關）於 2026-03-17 完成 — TRAINER_USE_LOOKBACK 已移除，訓練／backtester／scorer 一律使用 SCORER_LOOKBACK_HOURS，見 STATUS.md「Train–Serve Parity 步驟 5 完成」。
 
 ### 驗收
 

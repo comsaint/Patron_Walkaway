@@ -77,7 +77,7 @@ class TestReviewRisksRound38(unittest.TestCase):
         self.assertIn("io.BytesIO", src)
 
     def test_r59_validator_should_handle_null_session_end_safely(self):
-        """R59: validator should have explicit NULL/NaT guard for session_end_dtm."""
+        """R59: fetch_sessions has NULL session_end handling; validate_alert_row (DEC-030) is bet-based only, no session_end in verdict path."""
         fetch_src = _get_func_src(_VALIDATOR_TREE, _VALIDATOR_SRC, "fetch_sessions_by_canonical_id")
         row_src = _get_func_src(_VALIDATOR_TREE, _VALIDATOR_SRC, "validate_alert_row")
         self.assertTrue(
@@ -87,9 +87,11 @@ class TestReviewRisksRound38(unittest.TestCase):
             ),
             msg="fetch_sessions_by_canonical_id has no explicit NULL session_end handling",
         )
-        self.assertTrue(
-            any(token in row_src for token in ("pd.isna(session_end)", "session_end is None")),
-            msg="validate_alert_row has no NaT guard before session_end arithmetic",
+        # DEC-030: validate_alert_row verdict is bet-based only; session_cache not used for MATCH/MISS, so no session_end in row_src.
+        self.assertNotIn(
+            "session_end",
+            row_src,
+            msg="validate_alert_row (DEC-030) must not use session for verdict; session_end should not appear.",
         )
 
     def test_r60_validator_bet_query_should_explicitly_filter_null_payout_time(self):

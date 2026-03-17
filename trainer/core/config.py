@@ -57,7 +57,8 @@ VALIDATION_RESULTS_RETENTION_DAYS = 180  # Keep validation_results history for l
 
 # ------------------ Scorer poll defaults (SSOT for scorer CLI) -----------------
 # Used by scorer.py --lookback-hours / --interval.
-# Training, backtester, and serving always use this for Track Human lookback (train–serve parity).
+# Single source for Track Human lookback: trainer, backtester, and serving all use this
+# (train–serve parity). TRAINER_USE_LOOKBACK has been removed (PLAN step 5).
 SCORER_LOOKBACK_HOURS = 8       # Hours of bet history to pull each cycle (default 8)
 SCORER_POLL_INTERVAL_SECONDS = 45  # Polling interval in seconds (includes run time)
 

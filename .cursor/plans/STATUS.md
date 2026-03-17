@@ -39,6 +39,180 @@
 
 ---
 
+## Validator–Trainer 標籤與常數對齊（DEC-030）— 本輪實作
+
+**Date**: 2026-03-17
+
+### 目標
+依 PLAN 項目 24 與 doc/validator_trainer_parity_plan.md，實作 **Step 1（常數改 config）** 與 **Step 2（僅 bet-based 邏輯）**，不貪多。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/serving/validator.py` | **Step 1**：`find_gap_within_window` 與 `validate_alert_row`、`validate_once` 內 15/30/45 改為 `config.ALERT_HORIZON_MIN`、`config.WALKAWAY_GAP_MIN`、`config.LABEL_LOOKAHEAD_MIN`；docstring 改為「Gap must start within ALERT_HORIZON_MIN… last >= WALKAWAY_GAP_MIN」；`validate_alert_row` docstring 註明 verdict 為 bet-based only、session_cache 僅 API 相容。 |
+| 同上 | **Step 2**：移除 session 路徑整段（原 679–734：matched_session、session_end、gap_to_next、minutes_to_end、15/30 下 PENDING/MISS）；late arrival 僅用 bet：`any_late_bet_in_window` 僅用 bet、移除 `any_late_session_in_window`；`any_late_bet_within_horizon` 僅用 bet、移除 `any_late_session_within_horizon`；`any_late_bet_in_extended` 僅用 bet、移除 `any_late_session_in_extended`。 |
+| `tests/review_risks/test_review_risks_round30.py` | R42：由「session_cache.get(canonical_id」改為檢查 `validate_alert_row` 仍保留 `session_cache` 參數（DEC-030 verdict bet-based only）。 |
+| `tests/review_risks/test_review_risks_round38.py` | R59：第二段改為 assert `validate_alert_row` 源碼不含 `session_end`（DEC-030 無 session 路徑，故無 session_end 運算）。 |
+
+### 手動驗證建議
+- **常數**：`python -c "import trainer.core.config as c; print(c.WALKAWAY_GAP_MIN, c.ALERT_HORIZON_MIN, c.LABEL_LOOKAHEAD_MIN)"` 應為 30 15 45。
+- **Validator 相關測試**：`python -m pytest tests/unit/ tests/integration/test_validator_datetime_naive_hk.py tests/review_risks/test_review_risks_round30.py tests/review_risks/test_review_risks_round38.py tests/review_risks/test_review_risks_validator_round393.py tests/review_risks/test_review_risks_casino_player_id.py -q` → 預期全過。
+- **可選**：patch config 為不同 15/30/45，確認 `find_gap_within_window` / `validate_alert_row` 結果隨之改變（見 doc/validator_trainer_parity_plan.md §1.3）。
+
+### 下一步建議
+- 將 PLAN 項目 24（validator-trainer-parity）標為 completed；可選補「與 labels.compute_labels 對齊」之測試（同一 bet stream → label=1 ⟺ MATCH）。
+- 若業務需 release note，說明部分歷史 alert 可能因改為僅 bet-based 而 verdict 變化（原 session 路徑 MATCH 可能變 bet 路徑 MISS 或反之）。
+
+### 全量 pytest 結果（本輪後）
+
+- **指令**：`python -m pytest tests/ -q --tb=no`
+- **結果**：**1098 passed**，16 failed，42 skipped（約 68s）
+- **說明**：16 個失敗為本輪前即存在：多數為 Step 7 DuckDB RAM 不足（`STEP7_KEEP_TRAIN_ON_DISK is True and DuckDB failed; no pandas fallback`），1 個為 `test_profile_schema_hash.py::TestComputeProfileSchemaHash::test_changes_when_profile_feature_cols_changes`。本輪修改之 validator 相關測試（round30 R42、round38 R59）已通過。
+
+---
+
+### Code Review：Validator–Trainer 對齊變更（DEC-030）— 高可靠性標準
+
+**Date**: 2026-03-17  
+**範圍**：本輪對 `trainer/serving/validator.py` 與兩則測試的變更；不重寫整套，僅列潛在問題與建議。
+
+---
+
+#### 1. find_gap_within_window：gap start 未強制 ≥ alert_ts（與 labels 語義偏離）
+
+**問題**：`trainer/labels.py` 的 `_compute_labels_vectorized` 定義為「gap_start 落在 [t, t + ALERT_HORIZON_MIN]」，即 gap 的**開始時間**必須 ≥ 當前 bet 時間 t。`find_gap_within_window` 目前只檢查 `(current_start - alert_ts).total_seconds() / 60.0 <= config.ALERT_HORIZON_MIN`（即 current_start ≤ alert_ts + ALERT_HORIZON_MIN），**未**要求 `current_start >= alert_ts`。當 `base_start = last_bet_before` 且 `last_bet_before < alert_ts`（例如 alert 前 14 分鐘有一筆）時，若下一筆在 alert_ts + 16min，則 gap 長度 ≥ 30min、current_start 為 last_bet_before（早於 alert_ts），仍會回傳 True，造成 validator MATCH 而 trainer 對同一邏輯會給 label=0（gap_start 不在 [bet_ts, bet_ts+ALERT_HORIZON_MIN]），產生 **train–validator 語義偏離**。
+
+**具體修改建議**：在 `find_gap_within_window` 內，兩處回傳 `True` 的條件一併加上「gap start 不早於 alert」：  
+`(current_start - alert_ts).total_seconds() >= 0`（或等價地 `current_start >= alert_ts`）。  
+即：  
+`if gap_minutes >= config.WALKAWAY_GAP_MIN and (current_start - alert_ts).total_seconds() / 60.0 <= config.ALERT_HORIZON_MIN:`  
+改為同時要求  
+`(current_start - alert_ts).total_seconds() >= 0`。
+
+**希望新增的測試**：  
+- 單元測試：給定 `alert_ts`、`base_start = alert_ts - 14min`、`bet_times = [alert_ts + 16min]`（gap 30min、但 gap start 在 alert 之前），`find_gap_within_window(alert_ts, bet_times, base_start=base_start)` 應回傳 `(False, None, 0.0)`（不 MATCH）。  
+- 可選：與 `labels.compute_labels` 對齊測試 — 同一 bet stream 建出 label=1 的 bet，用該 bet_ts 與對應 bet_list 呼叫 `validate_alert_row`，預期在 force_finalize 且無 late arrival 時為 MATCH；反之 label=0 的 bet 不應 MATCH。
+
+---
+
+#### 2. config 匯入來源依執行環境而定（邊界條件）
+
+**問題**：`validator.py` 頂部為 `import config` 或 `import trainer.config as config`。從專案根目錄或 `trainer/serving/` 執行時，若當前目錄存在同名 `config.py`，會先載入該檔而非 `trainer.config`，導致讀到錯誤的 `WALKAWAY_GAP_MIN`/`ALERT_HORIZON_MIN`/`LABEL_LOOKAHEAD_MIN`，verdict 與 trainer 不一致。
+
+**具體修改建議**：改為**一律**從 trainer 匯入，例如 `from trainer.core import config` 或 `from trainer import config`（依專案既有 re-export 約定），移除「先 `import config`」分支，避免 cwd 影響。
+
+**希望新增的測試**：  
+- 契約測試：`getattr(config, "WALKAWAY_GAP_MIN") == 30` 且 `getattr(config, "LABEL_LOOKAHEAD_MIN") == 45`（確保 validator 使用的 config 與 trainer/core/config 一致）；可於既有的 validator 或 config 契約測試中補一則「config 來源為 trainer」的 assertion（例如 `config.__name__` 含 `trainer`）。
+
+---
+
+#### 3. bet_cache 與 row 時間的 tz 一致性（邊界條件）
+
+**問題**：`validate_alert_row` 內 `bet_ts` 會依 row 做 tz_localize/tz_convert(HK_TZ)，但 `bet_list` 來自呼叫端傳入的 `bet_cache`，未在函式內正規化。若呼叫端傳入 naive datetime 或不同 tz 的 list，與 `bet_ts` 比較時可能觸發 `TypeError: Cannot compare tz-naive and tz-aware datetime` 或得到錯誤的 bisect / late-arrival 結果。
+
+**具體修改建議**：在 `validate_alert_row` 取得 `bet_list` 後、第一次使用前，對 `bet_list` 做與 `bet_ts` 相同的 tz 正規化（若為 naive 則 localize(HK_TZ)，若為 aware 則 convert(HK_TZ)），並寫入 docstring：「bet_cache 內 datetime 將被視為 HK 當地時間；若為 naive 會依 HK 正規化」。或於模組層級註明「caller 必須保證 bet_cache 與 row 的 bet_ts 同為 tz-naive HK 或同為 tz-aware HK」。
+
+**希望新增的測試**：  
+- 邊界測試：傳入 `bet_cache` 為 naive datetime list、row 的 `bet_ts` 為 tz-aware HK（或反之），預期不拋 TypeError 且 verdict 與「兩者皆為同一 tz 約定」時一致；或明確在 doc 註明不支援混用並在函式開頭檢查後 raise。
+
+---
+
+#### 4. 效能：late arrival 掃描範圍（可接受，僅記錄）
+
+**問題**：`any_late_bet_in_window` / `any_late_bet_within_horizon` / `any_late_bet_in_extended` 均對完整 `bet_list` 做 `any(...)`。若單一 canonical_id 的 bet 數很大，每筆 alert 會 O(n) 掃描。
+
+**具體修改建議**：目前行為可接受（validator 通常為單次/週期批次、單人 bet 數在合理範圍）。若日後需優化，可改為對 `bet_list` 做 bisect 取 `(late_threshold, horizon_end]` 區間再檢查，避免全表掃描；非本輪必要。
+
+**希望新增的測試**：無需為效能新增測試；若有負載測試需求可另立。
+
+---
+
+#### 5. 安全性
+
+**結論**：本輪變更未新增環境變數、未接受未經淨化的外部輸入、未改權限或網路。`config` 與 `bet_cache` 均為內部/呼叫端可控，無額外安全性問題。無需額外測試。
+
+---
+
+**總結**：建議優先處理 **§1（gap start ≥ alert_ts）** 以與 labels 語義一致；**§2（config 匯入）** 可一併改為固定從 trainer 匯入；**§3** 視是否允許呼叫端傳入不同 tz 決定正規化或文件化。建議新增之測試：§1 之「gap start 早於 alert 不 MATCH」單元測試與可選的 labels–validator 對齊測試；§2 之 config 來源契約；§3 之 tz 邊界或文件化。
+
+---
+
+### 新增測試：Review 風險點 → 最小可重現（tests only）
+
+**Date**: 2026-03-17  
+**原則**：僅新增 tests，不修改 production code。將 Code Review §1–§3 轉成最小可重現測試或契約。
+
+| 檔案 | 內容 |
+|------|------|
+| `tests/review_risks/test_review_risks_validator_dec030_parity.py` | **§1**：`TestFindGapWithinWindowGapStartNotBeforeAlert.test_gap_start_before_alert_returns_false` — 給定 `alert_ts`、`base_start = alert_ts - 14min`、`bet_times = [alert_ts + 16min]`（gap 30min、gap start 在 alert 前），`find_gap_within_window` 應回傳 `(False, None, 0.0)`。**目前為紅**：現有 production 未強制 gap_start ≥ alert_ts，故回傳 True；待 Code Review §1 修正後轉綠。 |
+| 同上 | **§2**：`TestValidatorConfigSourceContract` — (1) `validator.config.WALKAWAY_GAP_MIN == 30` 且 `LABEL_LOOKAHEAD_MIN == 45`；(2) `config.__name__` 含 `trainer`（避免 cwd config 遮蔽）。 |
+| 同上 | **§3**：`TestValidateAlertRowTzConsistency` — (1) `test_consistent_tz_aware_no_type_error`：bet_ts 與 bet_cache 皆 tz-aware HK 時不拋 TypeError；(2) `test_naive_bet_cache_with_aware_bet_ts_raises_type_error`：bet_cache naive、row bet_ts aware 時預期 TypeError（鎖定目前行為）。 |
+
+**執行方式**（專案根目錄）：
+
+```bash
+# 僅跑本輪新增之 DEC-030 parity 契約測試
+python -m pytest tests/review_risks/test_review_risks_validator_dec030_parity.py -v
+
+# 與既有 validator 相關測試一併跑
+python -m pytest tests/review_risks/test_review_risks_validator_dec030_parity.py tests/review_risks/test_review_risks_round30.py tests/review_risks/test_review_risks_round38.py tests/review_risks/test_review_risks_validator_round393.py tests/integration/test_validator_datetime_naive_hk.py -v
+```
+
+**驗證結果**（2026-03-17）：  
+- `python -m pytest tests/review_risks/test_review_risks_validator_dec030_parity.py -v` → **4 passed, 1 failed**（§1 失敗為預期，待 production 修正）。  
+- 其餘 §2、§3 共 4 則全過。
+
+**未覆蓋**：§4 效能、§5 安全性無需測試；可選的「與 labels.compute_labels 對齊」測試留後續。
+
+---
+
+### 本輪實作修正與驗證（Code Review §1 修補 + tests/typecheck/lint）
+
+**Date**: 2026-03-17  
+**原則**：不改 tests；僅修改實作直到 tests（本輪相關）/ typecheck / lint 通過；結果追加 STATUS。
+
+**實作修改**（對應 Code Review §1）：
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/serving/validator.py` | **§1**：`find_gap_within_window` 兩處回傳 True 的條件加入「gap start ≥ alert_ts」：`(current_start - alert_ts).total_seconds() >= 0`，與 `<= config.ALERT_HORIZON_MIN` 併為 `start_ok`，與 labels 語義一致。Docstring 補「Gap start must be >= alert_ts (labels parity)」。 |
+
+**執行指令與結果**（專案根目錄）：
+
+| 項目 | 結果 |
+|------|------|
+| `pytest tests/review_risks/test_review_risks_validator_dec030_parity.py -v` | **5 passed**（含 §1 test_gap_start_before_alert_returns_false） |
+| `pytest tests/ -q --tb=no` | **1103 passed**，16 failed，42 skipped（16 失敗為既有：Step 7 DuckDB RAM、test_profile_schema_hash，非本輪引入） |
+| `ruff check trainer/ package/ scripts/` | **All checks passed!** |
+| `mypy trainer/ package/ --ignore-missing-imports` | 依專案慣例執行；本輪僅動 validator，未改型別介面。 |
+
+**手動驗證建議**：  
+- `python -m pytest tests/review_risks/test_review_risks_validator_dec030_parity.py tests/review_risks/test_review_risks_round30.py tests/review_risks/test_review_risks_round38.py tests/review_risks/test_review_risks_validator_round393.py tests/integration/test_validator_datetime_naive_hk.py -v` → 預期全過（含 DEC-030 五則）。
+
+---
+
+## Train–Serve Parity 步驟 5 完成（可選移除 TRAINER_USE_LOOKBACK 開關）
+
+**Date**: 2026-03-17
+
+### 目標
+完成 PLAN「Train–Serve Parity 強制對齊」**步驟 5**：移除 `TRAINER_USE_LOOKBACK` 開關，訓練／backtester／serving 一律使用 `SCORER_LOOKBACK_HOURS`（單一來源）。
+
+### 現狀確認
+程式碼已處於步驟 5 狀態：`trainer/core/config.py` 無 `TRAINER_USE_LOOKBACK`；`trainer/training/trainer.py` 與 `trainer/training/backtester.py` 均直接使用 `getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)`；README 已說明「訓練、評估與 serving 一律使用同一 lookback 視窗（config 中 `SCORER_LOOKBACK_HOURS`）」。建包腳本無需再檢查已移除之開關；parity 契約測試（`test_review_risks_train_serve_parity_config.py`、`test_deploy_parity_guard.py`）已描述「TRAINER_USE_LOOKBACK 已移除」。
+
+### 本輪修改
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/core/config.py` | 在 `SCORER_LOOKBACK_HOURS` 區塊補註：Single source for Track Human lookback；**TRAINER_USE_LOOKBACK has been removed (PLAN step 5)**。 |
+
+### 驗證
+- `python -c "import trainer.core.config as c; assert not hasattr(c, 'TRAINER_USE_LOOKBACK'); assert getattr(c, 'SCORER_LOOKBACK_HOURS', None) == 8"` 應通過。
+- `python -m pytest tests/review_risks/test_review_risks_train_serve_parity_config.py tests/integration/test_deploy_parity_guard.py -v` → 預期通過。
+
+---
+
 ## Train–Serve Parity 強制對齊（PLAN 步驟 1–2）
 
 **Date**: 2026-03-16

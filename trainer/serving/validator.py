@@ -544,20 +544,22 @@ def parse_alerts(conn: sqlite3.Connection) -> pd.DataFrame:
 
 
 def find_gap_within_window(alert_ts: datetime, bet_times: List[datetime], base_start: Optional[datetime] = None) -> Tuple[bool, Optional[datetime], float]:
-    """Return (is_true, gap_start, gap_minutes). Gap must start within 15m of alert and last >=30m."""
-    horizon_end = alert_ts + timedelta(minutes=45)
+    """Return (is_true, gap_start, gap_minutes). Gap must start within ALERT_HORIZON_MIN of alert and last >= WALKAWAY_GAP_MIN (values from config). Gap start must be >= alert_ts (labels parity)."""
+    horizon_end = alert_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN)
     bet_times = [t for t in bet_times if t >= alert_ts and t <= horizon_end]
     bet_times.sort()
 
     current_start = base_start or alert_ts
     for bt in bet_times:
         gap_minutes = (bt - current_start).total_seconds() / 60.0
-        if gap_minutes >= 30 and (current_start - alert_ts).total_seconds() / 60.0 <= 15:
+        start_ok = (current_start - alert_ts).total_seconds() >= 0 and (current_start - alert_ts).total_seconds() / 60.0 <= config.ALERT_HORIZON_MIN
+        if gap_minutes >= config.WALKAWAY_GAP_MIN and start_ok:
             return True, current_start, gap_minutes
         current_start = bt
     # Tail gap to horizon end
     gap_minutes = (horizon_end - current_start).total_seconds() / 60.0
-    if gap_minutes >= 30 and (current_start - alert_ts).total_seconds() / 60.0 <= 15:
+    start_ok = (current_start - alert_ts).total_seconds() >= 0 and (current_start - alert_ts).total_seconds() / 60.0 <= config.ALERT_HORIZON_MIN
+    if gap_minutes >= config.WALKAWAY_GAP_MIN and start_ok:
         return True, current_start, gap_minutes
     return False, None, 0.0
 
@@ -581,6 +583,9 @@ def validate_alert_row(
     ``bet_cache`` is now keyed by ``canonical_id`` (str) to support rated players
     whose bets may span multiple ``player_id``s.  A player_id-based fallback is
     still used when canonical_id is absent (e.g., legacy alerts).
+
+    Verdict (MATCH/MISS/PENDING) is bet-based only; session_cache is not used for
+    verdict (retained for API compatibility).
     """
     score_ts = pd.to_datetime(row["ts"])
     if score_ts.tzinfo is None:
@@ -635,7 +640,7 @@ def validate_alert_row(
 
     # Only validate after the bet has aged past the alert horizon plus a small buffer
     freshness_buffer_min = getattr(config, "VALIDATOR_FRESHNESS_BUFFER_MINUTES", 2)
-    wait_minutes = 45 + max(0, freshness_buffer_min)
+    wait_minutes = config.LABEL_LOOKAHEAD_MIN + max(0, freshness_buffer_min)
     if bet_ts > now_hk - timedelta(minutes=wait_minutes):
         return {"result": None}  # too recent; special key to signal skip
 
@@ -647,7 +652,7 @@ def validate_alert_row(
         bet_list = bet_cache.get(str(int(player_id)) if pd.notna(player_id) else "", [])
 
     # Do not conclude MATCH when we have no bet data (e.g. fetch failed, wrong range, or TZ mismatch).
-    # Otherwise find_gap_within_window(..., []) would treat "no bets in window" as a 45m gap and we'd falsely MATCH.
+    # Otherwise find_gap_within_window(..., []) would treat "no bets in window" as a LABEL_LOOKAHEAD_MIN gap and we'd falsely MATCH.
     if not bet_list:
         logger.warning(
             "[validator] No bet data for canonical_id=%s player_id=%s bet_id=%s — leaving PENDING (cannot verify late arrivals)",
@@ -659,7 +664,7 @@ def validate_alert_row(
     # Find last bet before bet_ts
     idx = bisect_left(bet_list, bet_ts)
     last_bet_before = bet_list[idx - 1] if idx > 0 else None
-    if last_bet_before is not None and (bet_ts - last_bet_before) > timedelta(minutes=15):
+    if last_bet_before is not None and (bet_ts - last_bet_before) > timedelta(minutes=config.ALERT_HORIZON_MIN):
         res_base.update(
             {
                 "result": False,
@@ -672,74 +677,19 @@ def validate_alert_row(
 
     base_start = last_bet_before or bet_ts
 
-    # Bets within 45-minute horizon after bet_ts
-    horizon_end = bet_ts + timedelta(minutes=45)
+    # Bets within LABEL_LOOKAHEAD_MIN horizon after bet_ts (bet-based only; session_cache not used for verdict)
+    horizon_end = bet_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN)
     right_idx = bisect_right(bet_list, horizon_end)
     bet_times = bet_list[idx:right_idx]
 
-    # Session-based check keyed by canonical_id (R42 — supports multi-player_id rated players)
-    sessions = session_cache.get(canonical_id, []) if canonical_id is not None else []
-    session_id = row.get("session_id")
-    matched_session = None
-    if pd.notna(session_id):
-        for sess in sessions:
-            if sess.get("session_id") == int(session_id):
-                matched_session = sess
-                break
-    if matched_session is None:
-        # fallback: find session containing bet_ts
-        for sess in sessions:
-            if sess["start"] <= bet_ts <= sess["end"]:
-                matched_session = sess
-                break
-
-    if matched_session:
-        session_end = matched_session["end"]
-        if pd.isna(session_end):
-            # defensive guard: ongoing session has no recorded end (R59)
-            session_end = bet_ts + timedelta(hours=24)
-        next_start = matched_session.get("next_start")
-        # Skip walkaway logic for ongoing sessions (sentinel = far-future end);
-        # otherwise we would wrongly return MISS when there is no next session.
-        is_ongoing = getattr(session_end, "year", 0) >= 2090
-        if not is_ongoing:
-            gap_to_next = (next_start - session_end).total_seconds() / 60.0 if next_start is not None else 1e9
-            minutes_to_end = (session_end - bet_ts).total_seconds() / 60.0
-
-            # Exact match within 15 min window -> candidate MATCH
-            # Per policy, we treat this as a candidate and defer finalization
-            # until the extended wait window passes (to allow late arrivals to show up).
-            if gap_to_next >= 30 and 0 <= minutes_to_end <= 15:
-                res_base.update(
-                    {
-                        "result": None,  # signal to re-check later
-                        "gap_start": session_end.isoformat(),
-                        "gap_minutes": gap_to_next,
-                        "reason": "PENDING",
-                    }
-                )
-                # do not return yet; let the later logic decide after the extended wait
-
-            # Eventual walkaway (merged as MISS per requirement)
-            elif gap_to_next >= 30 and minutes_to_end > 15:
-                res_base.update(
-                    {
-                        "result": False,
-                        "gap_start": session_end.isoformat(),
-                        "gap_minutes": gap_to_next,
-                        "reason": "MISS",
-                    }
-                )
-                return res_base
-
-    # Fallback to bet-gap check
+    # Bet-gap check (aligned with trainer/labels.py compute_labels; DEC-030)
     is_true, gap_start, gap_minutes = find_gap_within_window(bet_ts, bet_times, base_start=base_start)
     
-    # If a gap was found via bets, we verify if it was within 15m or late (merged to MISS)
+    # If a gap was found via bets, we verify if it was within ALERT_HORIZON_MIN or late (merged to MISS)
     if is_true:
         # A detected gap is a candidate MATCH, but per policy we allow a short
         # extended wait window for late-arriving data (arrivals with timestamps
-        # in the (15m,45m] interval) before finalizing MATCH.
+        # in the (ALERT_HORIZON_MIN, LABEL_LOOKAHEAD_MIN] interval) before finalizing MATCH.
         res_base.update({
             "result": None,
             "gap_start": gap_start.isoformat() if gap_start is not None else None,
@@ -747,27 +697,23 @@ def validate_alert_row(
             "reason": "PENDING"
         })
         # If we're past the extended wait window, finalize now by checking whether any
-        # late arrival appeared whose timestamp falls within the 15-45m window.
+        # late arrival (bet only) appeared whose timestamp falls within the horizon window.
         extended_wait = getattr(config, 'VALIDATOR_EXTENDED_WAIT_MINUTES', 15)
-        late_threshold = bet_ts + timedelta(minutes=15)
-        horizon_end = bet_ts + timedelta(minutes=45)
-        extended_end = bet_ts + timedelta(minutes=45 + extended_wait)
+        late_threshold = bet_ts + timedelta(minutes=config.ALERT_HORIZON_MIN)
+        horizon_end = bet_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN)
+        extended_end = bet_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN + extended_wait)
 
         if now_hk >= extended_end or force_finalize:
             any_late_bet_in_window = any((bt > late_threshold and bt <= horizon_end) for bt in bet_list)
-            any_late_session_in_window = any(
-                (sess.get("start") is not None and sess["start"] > late_threshold and sess["start"] <= horizon_end)
-                for sess in sessions
-            )
             _gs_iso = gap_start.isoformat() if gap_start is not None else None
-            if any_late_bet_in_window or any_late_session_in_window:
+            if any_late_bet_in_window:
                 res_base.update({
                     "result": False,
                     "gap_start": _gs_iso,
                     "gap_minutes": gap_minutes,
                     "reason": "MISS"
                 })
-                logger.info("[validator] Finalizing candidate as MISS (late arrival in 15-45m window or forced) player=%s bet_id=%s", player_id, bet_id)
+                logger.info("[validator] Finalizing candidate as MISS (late arrival in horizon window or forced) player=%s bet_id=%s", player_id, bet_id)
             else:
                 res_base.update({
                     "result": True,
@@ -775,67 +721,58 @@ def validate_alert_row(
                     "gap_minutes": gap_minutes,
                     "reason": "MATCH"
                 })
-                logger.info("[validator] Finalizing candidate as MATCH (no late arrivals in 15-45m window or forced) player=%s bet_id=%s", player_id, bet_id)
+                logger.info("[validator] Finalizing candidate as MATCH (no late arrivals in horizon window or forced) player=%s bet_id=%s", player_id, bet_id)
     else:
         # No gap found within the horizon.
         # Policy:
-        #  - If any bet/session start exists after bet_ts + 15m and within the 45m horizon,
+        #  - If any bet exists after bet_ts + ALERT_HORIZON_MIN and within LABEL_LOOKAHEAD_MIN horizon,
         #    we can immediately conclude MISS (final at horizon).
         #  - Otherwise, if VALIDATOR_FINALIZE_ON_HORIZON is enabled, wait an extra
         #    VALIDATOR_EXTENDED_WAIT_MINUTES before finalizing; during this period we
         #    return a special {'result': None} to indicate re-check later.
         extended_wait = getattr(config, 'VALIDATOR_EXTENDED_WAIT_MINUTES', 15)
-        late_threshold = bet_ts + timedelta(minutes=15)
-        horizon_end = bet_ts + timedelta(minutes=45)
-        extended_end = bet_ts + timedelta(minutes=45 + extended_wait)
+        late_threshold = bet_ts + timedelta(minutes=config.ALERT_HORIZON_MIN)
+        horizon_end = bet_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN)
+        extended_end = bet_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN + extended_wait)
 
-        # Check for any bets after the 15m threshold up to the 45m horizon -> immediate MISS
+        # Check for any bets after ALERT_HORIZON_MIN threshold up to LABEL_LOOKAHEAD_MIN horizon -> immediate MISS (bet-based only)
         any_late_bet_within_horizon = any((bt > late_threshold and bt <= horizon_end) for bt in bet_list)
-        # Check for any session start after the 15m threshold up to the 45m horizon -> immediate MISS
-        any_late_session_within_horizon = any(
-            (sess.get("start") is not None and sess["start"] > late_threshold and sess["start"] <= horizon_end)
-            for sess in sessions
-        )
 
-        if any_late_bet_within_horizon or any_late_session_within_horizon:
+        if any_late_bet_within_horizon:
             res_base.update({
                 "result": False,
                 "gap_start": None,
                 "gap_minutes": 0,
                 "reason": "MISS"
             })
-            logger.info("[validator] Finalizing alert as MISS (evidence within 45m) player=%s bet_id=%s", player_id, bet_id)
+            logger.info("[validator] Finalizing alert as MISS (evidence within horizon) player=%s bet_id=%s", player_id, bet_id)
         else:
             if getattr(config, 'VALIDATOR_FINALIZE_ON_HORIZON', False):
                 # Still within extended wait window -> skip (to be re-checked later)
                 if now_hk < extended_end and not force_finalize:
                     return {"result": None}
 
-                # Either extended window passed or force_finalize requested; check for any late arrivals whose timestamps
-                # fall within the 15-45m window after bet_ts (arrivals beyond 45m do not change verdict).
+                # Either extended window passed or force_finalize requested; check for any late arrivals (bet only)
+                # whose timestamps fall within the horizon window after bet_ts.
                 any_late_bet_in_extended = any((bt > late_threshold and bt <= horizon_end) for bt in bet_list)
-                any_late_session_in_extended = any(
-                    (sess.get("start") is not None and sess["start"] > late_threshold and sess["start"] <= horizon_end)
-                    for sess in sessions
-                )
 
-                if any_late_bet_in_extended or any_late_session_in_extended:
+                if any_late_bet_in_extended:
                     res_base.update({
                         "result": False,
                         "gap_start": None,
                         "gap_minutes": 0,
                         "reason": "MISS"
                     })
-                    logger.info("[validator] Finalizing alert as MISS (late arrival in 15-45m window) player=%s bet_id=%s", player_id, bet_id)
+                    logger.info("[validator] Finalizing alert as MISS (late arrival in horizon window) player=%s bet_id=%s", player_id, bet_id)
                 else:
-                    # No late arrivals in the 15-45m window -> confirm MATCH
+                    # No late arrivals in the horizon window -> confirm MATCH
                     res_base.update({
                         "result": True,
                         "gap_start": None,
                         "gap_minutes": 0,
                         "reason": "MATCH"
                     })
-                    logger.info("[validator] Finalizing alert as MATCH (no late arrivals in 15-45m window) player=%s bet_id=%s", player_id, bet_id)
+                    logger.info("[validator] Finalizing alert as MATCH (no late arrivals in horizon window) player=%s bet_id=%s", player_id, bet_id)
             else:
                 res_base.update({
                     "result": False,
@@ -864,7 +801,7 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
         return
 
     freshness_buffer_min = getattr(config, "VALIDATOR_FRESHNESS_BUFFER_MINUTES", 2)
-    wait_minutes = 45 + max(0, freshness_buffer_min)
+    wait_minutes = config.LABEL_LOOKAHEAD_MIN + max(0, freshness_buffer_min)
     cutoff = now_hk - timedelta(minutes=wait_minutes)
     finality_cutoff = now_hk - timedelta(hours=getattr(config, 'VALIDATOR_FINALITY_HOURS', 1))
 
