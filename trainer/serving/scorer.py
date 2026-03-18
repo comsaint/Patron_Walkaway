@@ -963,6 +963,114 @@ def _load_profile_for_scoring(
     return df_loaded
 
 
+# ── Phase 2 P1.1 Prediction log (PLAN T4) ───────────────────────────────────────
+
+def _ensure_prediction_log_table(conn: sqlite3.Connection) -> None:
+    """Create prediction_log table if not exists (independent DB, WAL)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prediction_log (
+            prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scored_at TEXT NOT NULL,
+            bet_id TEXT,
+            session_id TEXT,
+            player_id TEXT,
+            canonical_id TEXT,
+            casino_player_id TEXT,
+            table_id TEXT,
+            model_version TEXT NOT NULL,
+            score REAL NOT NULL,
+            margin REAL NOT NULL,
+            is_alert INTEGER NOT NULL,
+            is_rated_obs INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prediction_log_scored_at ON prediction_log(scored_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prediction_log_model_version ON prediction_log(model_version)"
+    )
+    _ensure_prediction_export_meta(conn)
+
+
+def _ensure_prediction_export_meta(conn: sqlite3.Connection) -> None:
+    """Create export watermark and audit tables if not exist (PLAN T5)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prediction_export_meta (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prediction_export_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            start_ts TEXT NOT NULL,
+            end_ts TEXT,
+            min_prediction_id INTEGER,
+            max_prediction_id INTEGER,
+            row_count INTEGER,
+            artifact_path TEXT,
+            success INTEGER NOT NULL,
+            error_message TEXT
+        )
+        """
+    )
+
+
+def _append_prediction_log(
+    pl_path: str,
+    scored_at: str,
+    model_version: str,
+    df: pd.DataFrame,
+) -> None:
+    """Batch-insert scored rows into prediction_log DB. No-op if df is empty."""
+    if df.empty:
+        return
+    Path(pl_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(pl_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        _ensure_prediction_log_table(conn)
+        rows = []
+        for _, row in df.iterrows():
+            ialert = 1 if (row["margin"] >= 0 and row["is_rated_obs"] == 1) else 0
+            rows.append(
+                (
+                    scored_at,
+                    None if pd.isna(row.get("bet_id")) else str(row["bet_id"]),
+                    None if pd.isna(row.get("session_id")) else str(row["session_id"]),
+                    None if pd.isna(row.get("player_id")) else str(row["player_id"]),
+                    None if pd.isna(row.get("canonical_id")) else str(row["canonical_id"]),
+                    None if pd.isna(row.get("casino_player_id")) else str(row["casino_player_id"]),
+                    None if pd.isna(row.get("table_id")) else str(row["table_id"]),
+                    model_version,
+                    float(row["score"]),
+                    float(row["margin"]),
+                    ialert,
+                    int(row["is_rated_obs"]),
+                )
+            )
+        conn.executemany(
+            """
+            INSERT INTO prediction_log (
+                scored_at, bet_id, session_id, player_id, canonical_id,
+                casino_player_id, table_id, model_version, score, margin,
+                is_alert, is_rated_obs
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ── Scoring / H3 routing ──────────────────────────────────────────────────────
 
 def _score_df(
@@ -1333,6 +1441,19 @@ def score_once(
 
     # ── Score with H3 routing (rated only) ─────────────────────────────────
     features_df = _score_df(features_df, artifacts, feature_list)
+
+    # ── Phase 2 P1.1: append all scored rows to prediction_log (before alert filter) ──
+    pl_path = getattr(config, "PREDICTION_LOG_DB_PATH", None) or ""
+    if (pl_path and str(pl_path).strip() and features_df is not None and not features_df.empty):
+        try:
+            _append_prediction_log(
+                str(pl_path).strip(),
+                scored_at,
+                model_version,
+                features_df,
+            )
+        except Exception as exc:
+            logger.warning("[scorer] Prediction log write failed: %s", exc)
 
     # ── Alert candidates: score >= threshold AND rated observations only ──
     # Unrated observations are scored for volume telemetry (UNRATED_VOLUME_LOG)

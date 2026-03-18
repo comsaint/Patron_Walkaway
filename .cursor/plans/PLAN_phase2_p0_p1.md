@@ -58,7 +58,13 @@ flowchart LR
 
 ## Ordered Tasks
 
-### T0. Pre-flight decisions and dependency audit
+**Current status**（更新於 2026-03-18）：**T0**–**T10** 已完成。Phase 2 P0–P1 有序任務已全部完成。
+
+**Remaining items**（依執行順序）：無。後續可依 phase2_p0_p1_implementation_plan 或產品需求進行延伸（如告警傳遞、自動化 drift 監控等）。
+
+---
+
+### T0. Pre-flight decisions and dependency audit — ✅ Done
 
 - **Depends on**: none
 - **Goal**: 凍結最少必要決策，避免後續返工。
@@ -81,7 +87,7 @@ flowchart LR
   - `evidently` 是否只放 root/local script 已明確。
   - 不會有人去改 `build/lib/**`。
 
-### T1. Shared MLflow utility and provenance schema
+### T1. Shared MLflow utility and provenance schema — ✅ Done
 
 - **Depends on**: T0
 - **Goal**: 避免 trainer 與 export script 各自手寫 MLflow 邏輯。
@@ -112,7 +118,7 @@ flowchart LR
   - repo 內 MLflow 共用邏輯只有一份。
   - provenance key naming 已文檔化。
 
-### T2. P0.1 trainer provenance write
+### T2. P0.1 trainer provenance write — ✅ Done
 
 - **Depends on**: T1
 - **Goal**: 在訓練 artifact 完成後，把 provenance 寫到 GCP MLflow。
@@ -139,7 +145,7 @@ flowchart LR
   - 給定 `model_version`，能在 MLflow 找到 provenance。
   - URI 不可達時，訓練仍完成。
 
-### T3. P0.2 rollback and provenance query docs
+### T3. P0.2 rollback and provenance query docs — ✅ Done
 
 - **Depends on**: T2
 - **Goal**: 將 P0.2「整目錄 rollback」與查詢方式文件化。
@@ -159,7 +165,7 @@ flowchart LR
 - **Definition of done**
   - rollback 與 provenance query 均有可操作 runbook。
 
-### T4. P1.1 scorer prediction log schema and write path
+### T4. P1.1 scorer prediction log schema and write path — ✅ Done
 
 - **Depends on**: T0
 - **Goal**: scorer 每次 scoring 後，將必要欄位 append 到 SQLite，不做網路 I/O。
@@ -266,7 +272,7 @@ flowchart LR
   - DB size 有上界控制。
   - cleanup 不碰未匯出資料。
 
-### T7. P1.2 / P1.3 alert conditions, runbook, message format
+### T7. P1.2 / P1.3 alert conditions, runbook, message format — ✅ Done
 
 - **Depends on**: T4, T5
 - **Goal**: 先把人要怎麼看、怎麼處理寫清楚，即使不做 Slack/email。
@@ -288,7 +294,7 @@ flowchart LR
 - **Definition of done**
   - 有人能依文件完成 triage。
 
-### T8. P1.4 local Evidently report tooling
+### T8. P1.4 local Evidently report tooling — ✅ Done
 
 - **Depends on**: T0, T5
 - **Goal**: 提供可手動執行的 DQ / drift 報告產生工具，而不只是文件。
@@ -315,7 +321,7 @@ flowchart LR
   - 至少可手動產生一份本地 Evidently 報告。
   - OOM 風險與操作方式已文件化。
 
-### T9. P1.5 training-serving skew check tooling
+### T9. P1.5 training-serving skew check tooling — ✅ Done
 
 - **Depends on**: T4, T8
 - **Goal**: 讓 skew 驗證是可執行流程，不只停留在概念。
@@ -339,7 +345,7 @@ flowchart LR
 - **Definition of done**
   - 至少能完成一次可重現的 skew 檢查。
 
-### T10. P1.6 drift investigation template and first example report
+### T10. P1.6 drift investigation template and first example report — ✅ Done
 
 - **Depends on**: T5, T7, T8, T9
 - **Goal**: 讓 drift 調查有固定產出格式，且能落到 `doc/`。

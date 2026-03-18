@@ -1,0 +1,201 @@
+"""
+Phase 2 P0–P1: Unit tests for trainer.core.mlflow_utils.
+
+- URI unset: warning only, no raise; is_mlflow_available() returns False.
+- Mock MLflow: verify tags/params payload when available.
+- Code Review risk points (§1–§9): minimal reproducible tests (tests only, no production changes).
+"""
+
+import os
+from contextlib import nullcontext
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from trainer.core import mlflow_utils
+
+
+def _ensure_unset_uri_and_reset_cache():
+    """Isolate tests that require unset URI (Code Review §8)."""
+    os.environ.pop("MLFLOW_TRACKING_URI", None)
+    mlflow_utils.reset_availability_cache()
+
+
+def test_get_tracking_uri_unset():
+    """When MLFLOW_TRACKING_URI is unset, get_tracking_uri returns None."""
+    _ensure_unset_uri_and_reset_cache()
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("MLFLOW_TRACKING_URI", None)
+        assert mlflow_utils.get_tracking_uri() is None
+
+
+def test_get_tracking_uri_set():
+    """When MLFLOW_TRACKING_URI is set, get_tracking_uri returns it."""
+    with patch.dict(os.environ, {"MLFLOW_TRACKING_URI": "http://localhost:5000"}):
+        assert mlflow_utils.get_tracking_uri() == "http://localhost:5000"
+
+
+def test_get_tracking_uri_empty_string_treated_as_unset():
+    """Code Review §2: Empty string URI is treated as unset; get_tracking_uri returns None."""
+    with patch.dict(os.environ, {"MLFLOW_TRACKING_URI": ""}, clear=False):
+        assert mlflow_utils.get_tracking_uri() is None
+
+
+def test_get_tracking_uri_whitespace_only_returns_as_is():
+    """Code Review §2: Whitespace-only URI returns as-is (lock current behavior)."""
+    with patch.dict(os.environ, {"MLFLOW_TRACKING_URI": "  "}, clear=False):
+        assert mlflow_utils.get_tracking_uri() == "  "
+
+
+def test_uri_unset_warning_only_no_raise():
+    """When URI is unset, is_mlflow_available() returns False and does not raise."""
+    _ensure_unset_uri_and_reset_cache()
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("MLFLOW_TRACKING_URI", None)
+        result = mlflow_utils.is_mlflow_available()
+    assert result is False
+
+
+def test_cache_does_not_auto_update_when_uri_set_after_first_check():
+    """Code Review §1: Cache does not auto-update when env is set after first check."""
+    _ensure_unset_uri_and_reset_cache()
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("MLFLOW_TRACKING_URI", None)
+        first = mlflow_utils.is_mlflow_available()
+    assert first is False
+    # Set URI without calling reset_availability_cache(); second call should still see cached False.
+    with patch.dict(os.environ, {"MLFLOW_TRACKING_URI": "http://localhost:5000"}, clear=False):
+        second = mlflow_utils.is_mlflow_available()
+    assert second is False
+    # After reset, next call re-evaluates (may True or False depending on server).
+    mlflow_utils.reset_availability_cache()
+    with patch.dict(os.environ, {"MLFLOW_TRACKING_URI": "http://localhost:5000"}, clear=False):
+        third = mlflow_utils.is_mlflow_available()
+    # Without a real server, third is typically False; we only assert cache was bypassed (no crash).
+    assert third is False or third is True
+
+
+def test_log_params_safe_no_op_when_unavailable():
+    """log_params_safe does not raise when MLflow is unavailable."""
+    _ensure_unset_uri_and_reset_cache()
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("MLFLOW_TRACKING_URI", None)
+        mlflow_utils.is_mlflow_available()
+    mlflow_utils.log_params_safe({"model_version": "v1"})
+
+
+def test_log_tags_safe_no_op_when_unavailable():
+    """log_tags_safe does not raise when MLflow is unavailable."""
+    _ensure_unset_uri_and_reset_cache()
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("MLFLOW_TRACKING_URI", None)
+        mlflow_utils.is_mlflow_available()
+    mlflow_utils.log_tags_safe({"model_version": "v1"})
+
+
+def test_log_params_safe_calls_mlflow_when_available():
+    """When available, log_params_safe calls mlflow.log_params with the given dict."""
+    pytest.importorskip("mlflow")
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        with patch("mlflow.log_params") as mock_log_params:
+            mlflow_utils.log_params_safe({"model_version": "v1", "git_commit": "abc"})
+    mock_log_params.assert_called_once()
+    call_args = mock_log_params.call_args[0][0]
+    assert call_args == {"model_version": "v1", "git_commit": "abc"}
+
+
+def test_log_tags_safe_calls_mlflow_when_available():
+    """When available, log_tags_safe calls mlflow.set_tags with the given dict."""
+    pytest.importorskip("mlflow")
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        with patch("mlflow.set_tags") as mock_set_tags:
+            mlflow_utils.log_tags_safe({"model_version": "v1", "training_window_start": "2026-01-01"})
+    mock_set_tags.assert_called_once()
+    call_args = mock_set_tags.call_args[0][0]
+    assert call_args == {"model_version": "v1", "training_window_start": "2026-01-01"}
+
+
+def test_log_params_safe_when_available_no_active_run_does_not_raise():
+    """Code Review §3: log_params_safe does not raise when available but no active run."""
+    pytest.importorskip("mlflow")
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        with patch("mlflow.active_run", return_value=None):
+            with patch("mlflow.log_params"):
+                mlflow_utils.log_params_safe({"model_version": "v1"})
+
+
+def test_log_artifact_safe_nonexistent_path_warning_no_raise():
+    """Code Review §4: log_artifact_safe with failing path logs warning, does not raise."""
+    pytest.importorskip("mlflow")
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        with patch("mlflow.log_artifact", side_effect=FileNotFoundError("No such file")):
+            mlflow_utils.log_artifact_safe("/nonexistent/path")
+
+
+def test_log_params_safe_swallows_mlflow_exception_no_raise():
+    """Code Review §5: log_params_safe swallows MLflow exception, does not raise."""
+    pytest.importorskip("mlflow")
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        with patch("mlflow.log_params", side_effect=RuntimeError("network error")):
+            mlflow_utils.log_params_safe({"model_version": "v1"})
+
+
+def test_safe_start_run_returns_nullcontext_when_unavailable():
+    """Code Review §7: When unavailable, safe_start_run returns nullcontext; with-block exits cleanly."""
+    _ensure_unset_uri_and_reset_cache()
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("MLFLOW_TRACKING_URI", None)
+        mlflow_utils.is_mlflow_available()
+    ctx = mlflow_utils.safe_start_run()
+    assert type(ctx) is type(nullcontext())
+    with ctx:
+        pass
+
+
+def test_log_artifact_safe_no_op_when_unavailable():
+    """Code Review §9: log_artifact_safe does not raise when MLflow is unavailable."""
+    _ensure_unset_uri_and_reset_cache()
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("MLFLOW_TRACKING_URI", None)
+        mlflow_utils.is_mlflow_available()
+    mlflow_utils.log_artifact_safe("/any/path")
+
+
+def test_log_artifact_safe_calls_mlflow_when_available():
+    """Code Review §9: When available, log_artifact_safe calls mlflow.log_artifact with path."""
+    pytest.importorskip("mlflow")
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        with patch("mlflow.log_artifact") as mock_log_artifact:
+            mlflow_utils.log_artifact_safe("/some/artifact_dir/file.json", artifact_path="file.json")
+    mock_log_artifact.assert_called_once()
+    assert mock_log_artifact.call_args[0][0] == "/some/artifact_dir/file.json"
+    assert mock_log_artifact.call_args[1].get("artifact_path") == "file.json"
+
+
+def test_end_run_safe_no_op_when_unavailable():
+    """Code Review §9: end_run_safe does not raise when MLflow is unavailable."""
+    _ensure_unset_uri_and_reset_cache()
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("MLFLOW_TRACKING_URI", None)
+        mlflow_utils.is_mlflow_available()
+    mlflow_utils.end_run_safe()
+
+
+def test_end_run_safe_calls_end_run_when_available_and_active_run():
+    """Code Review §9: When available and active run, end_run_safe calls mlflow.end_run."""
+    pytest.importorskip("mlflow")
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        with patch("mlflow.active_run", return_value=MagicMock()):
+            with patch("mlflow.end_run") as mock_end_run:
+                mlflow_utils.end_run_safe()
+    mock_end_run.assert_called_once()
+
+
+def test_safe_start_run_context_when_unavailable_exits_cleanly():
+    """Code Review §9: with safe_start_run(): when unavailable, block runs and exits without error."""
+    _ensure_unset_uri_and_reset_cache()
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("MLFLOW_TRACKING_URI", None)
+        mlflow_utils.is_mlflow_available()
+    with mlflow_utils.safe_start_run():
+        pass

@@ -1,5 +1,7 @@
 # Deploy: run pip install -r requirements.txt from repo root (so -e .. resolves)
+# Phase 2 P0-P1: mlflow for export_predictions_to_mlflow when run on deploy machine (or same box as scorer).
 Flask>=2.0
+mlflow
 pandas
 numpy
 joblib

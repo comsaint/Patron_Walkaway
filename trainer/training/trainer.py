@@ -67,6 +67,10 @@ from sklearn.model_selection import train_test_split
 from zoneinfo import ZoneInfo
 
 from trainer.profile_schedule import latest_month_end_on_or_before, month_end_dates
+from trainer.core.mlflow_utils import (
+    log_params_safe,
+    safe_start_run,
+)
 
 try:
     from tqdm import tqdm as _tqdm_bar
@@ -4142,6 +4146,48 @@ def train_single_rated_model(
 # Artifact bundle
 # ---------------------------------------------------------------------------
 
+def _log_training_provenance_to_mlflow(
+    model_version: str,
+    artifact_dir: str,
+    training_window_start: Union[datetime, str],
+    training_window_end: Union[datetime, str],
+    feature_spec_path: str,
+    training_metrics_path: str,
+    git_commit: Optional[str] = None,
+) -> None:
+    """Phase 2 T2: Log training provenance to MLflow (no-op when URI unset/unreachable).
+
+    See doc/phase2_provenance_schema.md for key names. On failure (no URI, network
+    error), logs warning only; training is still considered successful.
+    """
+    if git_commit is None:
+        try:
+            git_commit = (
+                subprocess.check_output(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    cwd=BASE_DIR,
+                    stderr=subprocess.DEVNULL,
+                )
+                .decode()
+                .strip()
+            )
+        except Exception:
+            git_commit = "nogit"
+    _start = training_window_start.isoformat() if hasattr(training_window_start, "isoformat") else str(training_window_start)
+    _end = training_window_end.isoformat() if hasattr(training_window_end, "isoformat") else str(training_window_end)
+    params = {
+        "model_version": model_version,
+        "git_commit": git_commit,
+        "training_window_start": _start,
+        "training_window_end": _end,
+        "artifact_dir": artifact_dir,
+        "feature_spec_path": feature_spec_path,
+        "training_metrics_path": training_metrics_path,
+    }
+    with safe_start_run(run_name=model_version):
+        log_params_safe(params)
+
+
 def save_artifact_bundle(
     rated: Optional[dict],
     feature_cols: List[str],
@@ -5562,6 +5608,19 @@ def run_pipeline(args) -> None:
     _el = time.perf_counter() - t0
     print("[Step 10/10] Save artifact bundle done in %.1fs" % _el, flush=True)
     logger.info("save_artifact_bundle: %.1fs", _el)
+
+    # Phase 2 T2: Log provenance to MLflow (no-op when URI unset/unreachable).
+    try:
+        _log_training_provenance_to_mlflow(
+            model_version=model_version,
+            artifact_dir=str(MODEL_DIR),
+            training_window_start=effective_start,
+            training_window_end=effective_end,
+            feature_spec_path=str(FEATURE_SPEC_PATH),
+            training_metrics_path=str(MODEL_DIR / "training_metrics.json"),
+        )
+    except Exception as e:
+        logger.warning("MLflow provenance logging failed (training still succeeded): %s", e)
 
     # Remove stale nonrated_model.pkl / rated_model.pkl left over from previous
     # dual-model runs so scorer/backtester cannot accidentally fall back to a

@@ -48,6 +48,34 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_MODEL_DIR: Path = _REPO_ROOT / "out" / "models"
 DEFAULT_BACKTEST_OUT: Path = _REPO_ROOT / "out" / "backtest"
 
+# ------------------ Phase 2 P1.1 Prediction log (PLAN T4) -----------------
+# Independent SQLite for prediction log; set to empty string to disable.
+PREDICTION_LOG_DB_PATH: str = os.getenv(
+    "PREDICTION_LOG_DB_PATH",
+    str(_REPO_ROOT / "local_state" / "prediction_log.db"),
+)
+
+# ------------------ Phase 2 P1.1 Export (PLAN T5) -----------------
+# Only export rows with scored_at <= now - this lag (avoid in-flight data).
+PREDICTION_EXPORT_SAFETY_LAG_MINUTES: int = int(
+    os.getenv("PREDICTION_EXPORT_SAFETY_LAG_MINUTES", "5"),
+)
+# Max rows per export run (batch size).
+PREDICTION_EXPORT_BATCH_ROWS: int = int(
+    os.getenv("PREDICTION_EXPORT_BATCH_ROWS", "10000"),
+)
+
+# ------------------ Phase 2 P1.1 Prediction log retention (PLAN T6) -----------------
+# After export, delete rows where prediction_id <= watermark AND scored_at < (now - this many days).
+# Set to 0 to disable retention cleanup.
+PREDICTION_LOG_RETENTION_DAYS: int = int(
+    os.getenv("PREDICTION_LOG_RETENTION_DAYS", "30"),
+)
+# Batch size for each DELETE round (avoid long transaction).
+PREDICTION_LOG_RETENTION_DELETE_BATCH: int = int(
+    os.getenv("PREDICTION_LOG_RETENTION_DELETE_BATCH", "5000"),
+)
+
 # ------------------ Runtime Retention -----------------------------
 # Trim local CSV buffers to avoid unbounded growth
 SCORER_ALERT_RETENTION_DAYS = 30      # Keep scorer alerts for last N days

@@ -46,8 +46,10 @@ BUNDLE_FILES = [
 ]
 MODEL_PKL_NAMES = ["model.pkl", "rated_model.pkl", "walkaway_model.pkl"]
 
+# Phase 2 P0-P1: mlflow for export script when run on deploy (cron/scheduler on same or another machine).
 REQUIREMENTS_DEPS = [
     "Flask>=2.0",
+    "mlflow",
     "pandas",
     "numpy",
     "joblib",

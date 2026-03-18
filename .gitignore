@@ -221,3 +221,5 @@ out/
 deploy_dist/
 deploy_dist.zip
 model_*/
+credential/
+trainer/local_state/
