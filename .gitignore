@@ -223,4 +223,5 @@ deploy_dist.zip
 model_*/
 credential/
 trainer/local_state/
-local_state/
+local_state/mlflow.env
+local_state/prediction_log.db
