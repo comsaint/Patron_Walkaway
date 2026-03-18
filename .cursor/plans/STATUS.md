@@ -7104,3 +7104,338 @@ python -m pytest tests/ -q --tb=no
 | **Remaining items** | **無**。後續可依 phase2_p0_p1_implementation_plan 或產品需求進行延伸（如告警傳遞、自動化 drift 監控等）。 |
 
 ---
+
+## T11. Local MLflow config from project-local file（PLAN_phase2_p0_p1.md § T11）
+
+**Date**: 2026-03-18  
+**目標**：本機 train/export 預設即帶 MLflow 設定，且**不**將 MLflow 寫入專案主 `.env`；由 `local_state/mlflow.env` 載入。
+
+### 變更摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/core/mlflow_utils.py` | 模組頂層：`from dotenv import load_dotenv`；由 `Path(__file__)` 推得 repo root；若 `MLFLOW_ENV_FILE` 已設則用該路徑，否則用 `repo_root/local_state/mlflow.env`；若該路徑為檔案則 `load_dotenv(路徑, override=False)`。測試用 hook：`MLFLOW_ENV_FILE` 可指定任意路徑。 |
+| `tests/unit/test_mlflow_utils.py` | 新增 `test_t11_env_file_loaded_when_mlflow_env_file_points_to_existing_file`：建立 temp 檔寫入 `MLFLOW_TRACKING_URI=...`，設 `MLFLOW_ENV_FILE`，`reload(mlflow_utils)` 後 `get_tracking_uri()` 回傳該 URI。新增 `test_t11_no_crash_when_mlflow_env_file_points_to_nonexistent_path`：`MLFLOW_ENV_FILE` 指不存在路徑，reload 不報錯、`get_tracking_uri()` 為 None。 |
+| `.gitignore` | **未改動**。已有 `local_state/`（repo root），故 `local_state/mlflow.env` 已在忽略範圍內。 |
+
+### 手動驗證建議
+
+1. **無檔時**：不建立 `local_state/mlflow.env`，從 repo root 執行 `python -c "from trainer.core.mlflow_utils import get_tracking_uri; print(get_tracking_uri())"` → 應為 `None`（或既有環境變數值）。
+2. **有檔時**：在 repo root 建立 `local_state/mlflow.env`，內容兩行：`MLFLOW_TRACKING_URI=https://mlflow-server-72672742800.us-central1.run.app`、`GOOGLE_APPLICATION_CREDENTIALS=<path-to-key.json>`；不設 shell 環境變數，執行 `python -c "from trainer.core.mlflow_utils import get_tracking_uri; print(get_tracking_uri())"` → 應印出該 URI。
+3. **不覆寫**：先 `export MLFLOW_TRACKING_URI=http://other`，再執行上一步（有檔）→ 應仍為 `http://other`（override=False）。
+
+### 下一步建議
+
+- 將 PLAN_phase2_p0_p1.md 中 T11 標為完成（✅ Done）。
+- 可選：新增 `local_state/mlflow.env.example`（僅範例鍵名、無真實 URI/路徑）或於 doc 補充 `local_state/mlflow.env` 格式說明。
+
+### pytest 結果（本輪後）
+
+- **指令**：`pytest tests/ -q --tb=no`
+- **結果**：**16 failed, 1172 passed, 51 skipped**（約 92s）
+- **說明**：16 個失敗為本輪前即存在（15 則 Step 7 DuckDB RAM 不足、1 則 `test_profile_schema_hash.py::test_changes_when_profile_feature_cols_changes`）。本輪新增之 T11 單元測試 2 則均通過；`tests/unit/test_mlflow_utils.py` 全數通過。
+
+---
+
+### Code Review：T11 Local MLflow env 變更（高可靠性標準）
+
+**Date**: 2026-03-18  
+**範圍**：本輪對 `trainer/core/mlflow_utils.py` 與 `tests/unit/test_mlflow_utils.py` 之 T11 變更；不重寫整套，僅列潛在問題與建議。
+
+---
+
+#### 1. import 時異常導致模組載入失敗（bug／邊界條件）
+
+**問題**：模組頂層在 import 時執行 `Path(__file__).resolve().parent.parent.parent`、`_mlflow_env_path.is_file()` 與 `load_dotenv(...)`。若 (1) 執行環境為 zipimport 或 PyInstaller 等，`__file__` 可能非一般檔案系統路徑，`Path(__file__).resolve()` 或 `.parent` 可能拋錯或得到非預期路徑；(2) 檔案存在但損壞或編碼異常，`load_dotenv` 可能拋出例外。上述任一種都會在 `import trainer.core.mlflow_utils` 時直接失敗，導致 trainer／export script 無法啟動，違反 PLAN「trainer 在 MLflow 不可達時仍應完成訓練」之精神（至少應讓模組可被 import）。
+
+**具體修改建議**：將「計算路徑 + is_file + load_dotenv」整段包在 `try/except` 中；發生任何例外時僅 `_log.warning("...", exc_info=...)` 或 `_log.warning("T11: could not load local_state/mlflow.env: %s", e)`，不 re-raise。如此 __file__ 異常或 load_dotenv 異常都不會導致 import 失敗，僅變為「未載入該檔、沿用既有 env」。
+
+**希望新增的測試**：  
+- 單元測試：patch 或 mock 使 `Path(__file__).resolve()` 或後續 `.parent` 在 import 時拋出 `OSError`（或 `RuntimeError`），以 subprocess 或 importlib.reload 在隔離環境中 `import trainer.core.mlflow_utils`，預期 import 成功、不拋錯，且 `get_tracking_uri()` 為 None（或既有 env 值）。  
+- 或：patch `load_dotenv` 為 `side_effect=Exception("bad file")` 後 reload 模組，預期 import 成功、`get_tracking_uri()` 不受該檔影響。
+
+---
+
+#### 2. MLFLOW_ENV_FILE 為空字串或僅空白時的邊界（邊界條件）
+
+**問題**：目前 `_env_file_override = os.environ.get("MLFLOW_ENV_FILE")`，若使用者誤設 `MLFLOW_ENV_FILE=`（空字串）或 `MLFLOW_ENV_FILE=  `（僅空白），會得到 `Path("")` 或 `Path("  ")`。`Path("").is_file()` 為 False，故不會呼叫 load_dotenv，但語意上「空字串」應視為「未設定、使用預設路徑」；若未來邏輯改動或在其他平台 `Path("").is_file()` 行為不同，可能產生非預期結果。且空字串若被傳給 `load_dotenv`（若日後改為不檢查 is_file），可能被解讀為當前目錄的 .env。
+
+**具體修改建議**：在讀取 `MLFLOW_ENV_FILE` 後，若值為空字串或 `strip()` 後為空，視為未設定：  
+`_env_file_override = os.environ.get("MLFLOW_ENV_FILE")`  
+改為  
+`_env_file_override = (os.environ.get("MLFLOW_ENV_FILE") or "").strip() or None`  
+再 `_mlflow_env_path = Path(_env_file_override) if _env_file_override else (...)`。如此空字串與僅空白皆使用預設 `repo_root/local_state/mlflow.env`。
+
+**希望新增的測試**：  
+- 單元測試：設 `MLFLOW_ENV_FILE=`（空字串），reload 後應使用預設路徑（若預設路徑無檔則 `get_tracking_uri()` 為 None）；設 `MLFLOW_ENV_FILE=   `（僅空白），同上。可透過在預設路徑放 temp 檔（需 mock 或設定 repo_root 的測試用覆寫）或至少 assert 不 crash、且不會誤把 Path("") 當成檔案讀取。
+
+---
+
+#### 3. override=False 語義未以測試鎖定（邊界條件）
+
+**問題**：設計上 `load_dotenv(..., override=False)` 表示「process 或 shell 已設之變數不被檔內值覆寫」。目前沒有自動化測試驗證此行為；若日後有人改為 `override=True` 或漏傳參數，既有環境變數可能被檔覆寫，造成「明明已 export MLFLOW_TRACKING_URI 卻被本機檔蓋掉」的困惑。
+
+**具體修改建議**：維持 `override=False`，並在 docstring 或模組註解註明「Process/shell 已設之 MLFLOW_TRACKING_URI、GOOGLE_APPLICATION_CREDENTIALS 不被 local_state/mlflow.env 覆寫」。
+
+**希望新增的測試**：  
+- 單元測試：先設 `os.environ["MLFLOW_TRACKING_URI"] = "http://env-override.example.com"`，再設 `MLFLOW_ENV_FILE` 指向內含 `MLFLOW_TRACKING_URI=http://from-file.example.com` 的 temp 檔，reload 後 `get_tracking_uri()` 應為 `"http://env-override.example.com"`（env 優先、未被檔覆寫）。
+
+---
+
+#### 4. 安全性：MLFLOW_ENV_FILE 可指向任意路徑（安全性）
+
+**問題**：`MLFLOW_ENV_FILE` 若在 production 或共用環境被設成攻擊者可控路徑（或誤設成高權限目錄下之檔），會載入該檔內容進 `os.environ`（含可能之 `GOOGLE_APPLICATION_CREDENTIALS`），導致以非預期金鑰連線。PLAN 雖將此變數定位為測試用 hook，但程式未區分「測試」與「production」，任何能設定環境變數的流程都能覆寫載入來源。
+
+**具體修改建議**：不在程式內做強制路徑白名單（以免影響合法 override 情境），改為**文件化**：在 `mlflow_utils.py` 模組 docstring 或 `doc/phase2_*.md` 註明「`MLFLOW_ENV_FILE` 僅供本機／測試 override 使用；production 部署時應留空，僅依 `local_state/mlflow.env`（或既有 env）取得設定」。可選：若專案有「執行環境」標記（例如 env var `DEPLOY_ENV=production`），可於 production 時忽略 `MLFLOW_ENV_FILE`（僅用預設路徑）；非必要，依團隊策略決定。
+
+**希望新增的測試**：無需為「任意路徑」加自動化測試（屬部署／權限層面）；可選契約測試：模組 docstring 或 doc 內含 "MLFLOW_ENV_FILE" 與 "test" 或 "override" 說明文字，確保文件存在。
+
+---
+
+#### 5. 效能（結論：可接受）
+
+**問題**：模組 import 時執行一次 `Path` 計算、一次 `is_file()`、一次 `load_dotenv`。無 hot path、無重複 I/O，對 trainer／export 啟動成本可忽略。
+
+**具體修改建議**：無需修改。
+
+**希望新增的測試**：無需為效能新增測試。
+
+---
+
+**總結**：建議優先處理 **§1（import 時 try/except，避免整模組載入失敗）** 以符合「MLflow 不可用時訓練仍可跑」之原則；**§2（空字串／空白視為未設）** 可一併做；**§3** 以單元測試鎖定 override=False；**§4** 以文件化為主。建議新增之測試：§1 之 import 不因 path/load_dotenv 異常而失敗；§2 之 MLFLOW_ENV_FILE 空字串／空白；§3 之 env 優先於檔內變數。
+
+---
+
+### 新增測試：T11 Code Review 風險點 → 最小可重現（tests only）
+
+**Date**: 2026-03-18  
+**原則**：僅新增 tests，不修改 production code。將 Code Review §1–§4 轉成最小可重現測試或契約。
+
+| 測試 | 對應 Review | 內容 | 預期（未改 production 時） |
+|------|-------------|------|----------------------------|
+| `test_t11_review_import_succeeds_when_load_dotenv_raises` | §1 | subprocess：patch load_dotenv 僅在 caller 為 mlflow_utils 時 raise，設 MLFLOW_ENV_FILE 指向既有檔，`from trainer.core import mlflow_utils`；預期 subprocess exit 0。 | **FAIL**（目前 import 會因 load_dotenv 拋錯而失敗；實作 §1 try/except 後應通過） |
+| `test_t11_review_mlflow_env_file_empty_string_reload_no_crash` | §2 | MLFLOW_ENV_FILE=""，reload(mlflow_utils)，assert 不 crash、get_tracking_uri() 為 None 或既有值。 | PASS |
+| `test_t11_review_mlflow_env_file_whitespace_only_reload_no_crash` | §2 | MLFLOW_ENV_FILE="   "，同上。 | PASS |
+| `test_t11_review_override_false_env_takes_precedence` | §3 | 先設 env MLFLOW_TRACKING_URI=A，MLFLOW_ENV_FILE 指向內含 B 的 temp 檔，reload 後 assert get_tracking_uri()==A。 | PASS |
+| `test_t11_review_docstring_mentions_mlflow_env_file_and_override` | §4 | 讀取 mlflow_utils 源碼，assert 含 "MLFLOW_ENV_FILE" 且含 "override" 或 "test"。 | PASS |
+
+**執行方式**
+
+- 僅跑 T11 Code Review 相關測試：  
+  `pytest tests/unit/test_mlflow_utils.py -v -k "t11_review"`
+- 預期結果（本輪僅 tests、未改 production）：**1 failed, 4 passed**。失敗者為 §1；其餘 4 則通過。
+- 待 production 依 Code Review §1 加上 try/except 後，再跑上述指令應為 **5 passed**。
+
+**檔案**
+
+- 新增／修改：`tests/unit/test_mlflow_utils.py`（新增 5 則 test，依序對應 §1–§4；§2 兩則）。
+
+---
+
+### 本輪實作：T11 Code Review §1§2 修補（實作通過所有 tests/typecheck/lint）
+
+**Date**: 2026-03-18  
+**原則**：僅修改 production 實作，不改 tests。依 Code Review §1、§2 修補後，所有 T11 review 測試與 unit/typecheck/lint 通過。
+
+**修改摘要**
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/core/mlflow_utils.py` | **§1**：將「_repo_root 計算 + _env_file_override + _mlflow_env_path + is_file + load_dotenv」整段包在 `try/except Exception`；發生任何例外時 `_log.warning("T11: could not load local_state/mlflow.env: %s", e)`，不 re-raise，確保 import 永不失敗。**§2**：`_env_file_override = (os.environ.get("MLFLOW_ENV_FILE") or "").strip() or None`，空字串或僅空白視為未設、使用預設路徑。 |
+
+**驗證結果**
+
+| 項目 | 指令 | 結果 |
+|------|------|------|
+| **mlflow_utils 單元測試** | `pytest tests/unit/test_mlflow_utils.py -v --tb=short` | **19 passed, 7 skipped**（含 5 則 T11 review 測試全過） |
+| **unit 全量** | `pytest tests/unit/ -q --tb=no` | **201 passed, 7 skipped** |
+| **ruff** | `ruff check trainer/ tests/unit/test_mlflow_utils.py` | **All checks passed!** |
+| **mypy** | `mypy trainer/core/mlflow_utils.py --ignore-missing-imports` | **Success: no issues found in 1 source file** |
+| **pytest 全量** | `pytest tests/ -q --tb=no` | 本輪未改動 integration/review_risks；全量仍可能有既有失敗（Step 7 DuckDB RAM、profile_schema_hash 等），見前輪 STATUS。 |
+
+**結論**：T11 Code Review §1（import 不因 load_dotenv/path 異常而失敗）、§2（MLFLOW_ENV_FILE 空字串／空白視為未設）已實作；§3（override=False）、§4（文件）已由既有測試與註解鎖定。無剩餘 T11 實作待辦。
+
+---
+
+### GCP ID token / Cloud Run 認證（MLflow 做法 A）
+
+**Date**: 2026-03-18  
+**目標**：以做法 A（`local_state/mlflow.env`）連線時，當 MLflow 追蹤位址為 HTTPS 且已設 `GOOGLE_APPLICATION_CREDENTIALS`，自動取得 GCP ID token 並在對 MLflow 的請求中帶上 `Authorization: Bearer <token>`，以通過 GCP Cloud Run 驗證。
+
+**修改摘要**
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/core/mlflow_utils.py` | 新增 `_get_gcp_id_token(audience)`：以 `google.oauth2.id_token.fetch_id_token` 取得 ID token，依 audience 快取至約過期前 5 分鐘。新增 `_register_gcp_bearer_provider_if_needed()`：當 `MLFLOW_TRACKING_URI` 與 `GOOGLE_APPLICATION_CREDENTIALS` 皆設且 URI 為 HTTPS 時，向 MLflow 的 `_request_header_provider_registry` 註冊一自訂 `RequestHeaderProvider`，其 `request_headers()` 回傳 `Authorization: Bearer <token>`。在 `is_mlflow_available()` 內、呼叫 `mlflow.set_tracking_uri` 前呼叫 `_register_gcp_bearer_provider_if_needed()`。 |
+| `README.md` | 在「環境設定」新增「**MLflow（GCP Cloud Run）連線（做法 A）**」：說明建立 `local_state/mlflow.env`、兩行變數、金鑰路徑與自動 ID token 機制。 |
+
+**依賴**：專案已含 `google-auth`（requirements.txt），未新增依賴。
+
+**驗證**：`pytest tests/unit/test_mlflow_utils.py -v --tb=short` → **19 passed, 7 skipped**。未新增自動化測試（ID token 需真實金鑰或 mock GCP，建議手動以 `local_state/mlflow.env` + Cloud Run 驗證）。
+
+**手動驗證建議**：設好 `local_state/mlflow.env`（URI + GOOGLE_APPLICATION_CREDENTIALS）且 Cloud Run 需驗證時，執行 `python -c "from trainer.core.mlflow_utils import is_mlflow_available; print(is_mlflow_available())"` → 預期 `True`（若服務可達）；訓練或 export 後於 MLflow UI 確認 run/artifact 已寫入。
+
+**自訂 env 路徑（如 `credential/mlflow.env`）**：若將 `mlflow.env` 放在 `credential/` 等非預設路徑，須在執行**前**設定 `MLFLOW_ENV_FILE=credential/mlflow.env`（或絕對路徑），程式 import `mlflow_utils` 時才會載入該檔；`credential/` 已在 `.gitignore`，可安心放置金鑰與 env。見 README「MLflow（GCP Cloud Run）連線」小節。
+
+---
+
+## T12. Log failed training runs to MLflow — 本輪實作（Step 1：單一 run + 失敗時 tag）
+
+**Date**: 2026-03-18  
+**目標**：依 PLAN_phase2_p0_p1.md T12，訓練 pipeline 在任一步失敗時也在 MLflow 寫入一筆 run（status=FAILED、error），成功時仍為單一 run；本輪先完成「單一 run 涵蓋整次 pipeline」與「失敗時 log tag」，後續可補 config／記憶體／資料規模等 params。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/core/mlflow_utils.py` | 新增 `has_active_run() -> bool`：MLflow 不可用或無 active run 時回傳 False，否則回傳 `mlflow.active_run() is not None`；供 T12 成功路徑不重複 start_run 使用。 |
+| `trainer/training/trainer.py` | 自 `mlflow_utils` 新增 import：`has_active_run`、`log_tags_safe`。**run_pipeline**：在取得 `start`/`end` 後、Step 1 前，產生 `_mlflow_run_name = f"train-{start.date()}-{end.date()}-{int(time.time())}"`，以 `with safe_start_run(run_name=_mlflow_run_name):` 包住 Step 1～Step 10 與 `_log_training_provenance_to_mlflow`、stale 清理、summary；`with` 內以 `try/except` 包住上述本體，`except Exception as e` 時 `log_tags_safe({"status": "FAILED", "error": str(e)[:500]})` 後 `raise`。**_log_training_provenance_to_mlflow**：若 `has_active_run()` 為 True 則僅呼叫 `log_params_safe(params)`，不再 `safe_start_run`；否則維持原 `with safe_start_run(run_name=model_version): log_params_safe(params)`。 |
+| `tests/unit/test_mlflow_utils.py` | 新增 `test_has_active_run_false_when_unavailable`、`test_has_active_run_true_when_available_and_run_active`、`test_has_active_run_false_when_available_but_no_run`（T12 鎖定 has_active_run 行為）。 |
+
+### 手動驗證建議
+
+1. **MLflow 未設**：不設 `MLFLOW_TRACKING_URI`、無 `local_state/mlflow.env`，執行 `python -m trainer.trainer --days 1 --use-local-parquet --skip-optuna`（或能跑完的參數）→ 訓練應正常完成，無 MLflow 錯誤。
+2. **成功路徑 + MLflow 可達**：設好 `local_state/mlflow.env`，跑完一小段訓練 → MLflow UI 應有一筆 run，名稱為 `train-<start>-<end>-<timestamp>`，內含 provenance params（model_version、training_window_start/end 等）。
+3. **失敗路徑**：以會失敗的參數或人為在 Step 3 前拋錯（例如在 run_pipeline 內暫時 `raise RuntimeError("test T12")`）→ 程序應以非零 exit 結束，且若 MLflow 可達，MLflow UI 應有一筆 run，tag `status=FAILED`、`error` 含該錯誤訊息。
+4. **單元測試**：`pytest tests/unit/test_mlflow_utils.py -v --tb=short` → 預期 **20 passed, 9 skipped**（含 3 則 has_active_run 測試；部分 skip 為環境無 mlflow）。
+
+### 下一步建議
+
+- **T12 後續（可選）**：失敗時除 tag 外，再寫入 params：`training_window_start`/`end`、`recent_chunks`、`NEG_SAMPLE_FRAC`、chunk 數、OOM-check 估計（est. peak / available / budget）等，見 PLAN_phase2_p0_p1.md T12 §3。
+- **可選測試**：整合測試或 review_risks 中補「mock pipeline 於 Step 3 拋錯 → MLflow 有 run 且 tag status=FAILED」。
+- 將 PLAN_phase2_p0_p1.md 中 T12 標為 **in progress** 或 **Step 1 done**（依團隊慣例）。
+
+---
+
+### Code Review：T12 變更（Log failed training runs to MLflow）— 高可靠性標準
+
+**Date**: 2026-03-18  
+**範圍**：本輪 T12 對 `trainer/core/mlflow_utils.py`（has_active_run）、`trainer/training/trainer.py`（run_pipeline 之 with/try/except、_log_training_provenance_to_mlflow 之 has_active_run 分支）、`tests/unit/test_mlflow_utils.py`（has_active_run 三則測試）的變更。不重寫整套，僅列潛在問題與建議。
+
+---
+
+#### 1. has_active_run() 在 mlflow.active_run() 拋錯時回傳 False，導致誤開第二個 run（邊界條件）
+
+**問題**：`has_active_run()` 內以 `try/except Exception` 包住 `mlflow.active_run()`，發生任何例外時回傳 `False`。若此時 pipeline 已透過 `safe_start_run` 開了一個 run（例如 run A），但 `mlflow.active_run()` 因後端逾時／網路錯誤而拋錯，則 `_log_training_provenance_to_mlflow` 會認為「沒有 active run」而再呼叫 `safe_start_run(run_name=model_version)`，產生第二個 run（run B），provenance params 會寫入 run B，run A 則缺少 params、在 UI 上像「未完成」的 run。
+
+**具體修改建議**：在 `has_active_run()` 的 `except` 中至少記錄日誌，例如 `_log.warning("has_active_run: mlflow.active_run() failed, assuming no active run: %s", e)`，讓事後排查時可知曾發生後端錯誤。若希望更保守，可改為「不吞掉例外、讓呼叫端決定」；但會使 _log_training_provenance_to_mlflow 必須處理例外，目前設計以「不影響訓練主流程」為優先，故建議僅加 warning，行為維持回傳 False。
+
+**希望新增的測試**：單元測試：mock `mlflow.active_run` 使其 `side_effect=RuntimeError("backend unavailable")`，在 `is_mlflow_available` 為 True 下呼叫 `has_active_run()`，預期回傳 `False` 且不 raise；可選 assert 有呼叫 logger.warning（或 patch 後檢查 warning 被呼叫）。
+
+---
+
+#### 2. 失敗時寫入的 error tag 可能含敏感資訊（安全性）
+
+**問題**：`except Exception as e` 時以 `log_tags_safe({"status": "FAILED", "error": str(e)[:500]})` 寫入 MLflow。若例外訊息含本機路徑、連線字串、帳號等，會一併送進 MLflow（追蹤伺服器／GCS），有洩漏風險。
+
+**具體修改建議**：短期在 docstring 或 PLAN/STATUS 註明：「失敗時寫入的 error 為例外訊息前 500 字，請勿在例外訊息中放入密碼或敏感路徑。」中長期可對 `str(e)` 做簡單 sanitize（例如以 regex 遮蔽已知的 path 模式、或只保留例外類型與前 N 字），再寫入 tag；若實作 sanitize，需在測試中鎖定行為。
+
+**希望新增的測試**：可選：單元或契約測試，assert 寫入的 error 長度 ≤ 500；若日後實作 sanitize，則 assert 敏感樣本不會原樣出現。
+
+---
+
+#### 3. run_name 在同一秒內同 window 可能重複（邊界條件）
+
+**問題**：`_mlflow_run_name = f"train-{start.date()}-{end.date()}-{int(time.time())}"` 以秒為單位，同一秒內對同一 window 跑兩次會得到相同 run_name。MLflow 允許多個 run 同名（run_id 不同），不會報錯，但 UI 上較難區分。
+
+**具體修改建議**：若希望幾乎不重複，可在 run_name 尾端加上 `os.getpid()` 或 `uuid.uuid4().hex[:8]`，例如 `f"train-{start.date()}-{end.date()}-{int(time.time())}-{os.getpid()}"`。非必須，屬 UX／可辨識性改善。
+
+**希望新增的測試**：無需為此新增測試；可選契約測試：run_name 符合預期格式（例如以 `train-` 開頭、含日期與數字）。
+
+---
+
+#### 4. log_tags_safe 在失敗路徑若 set_tags 拋錯，仍會 re-raise 原例外（預期行為，僅記錄）
+
+**問題**：在 `except Exception as e` 中先 `log_tags_safe(...)` 再 `raise`。若 `log_tags_safe` 內 `mlflow.set_tags` 拋錯，會被其內層 try 捕獲並只打 warning，不會覆蓋外層的 `e`；外層仍會 `raise` 原本的 pipeline 例外，process 以非零結束。此為預期行為。
+
+**具體修改建議**：無需修改；可在 run_pipeline 的 except 區塊加一行註解：「log_tags_safe 失敗僅 warning，不影響 re-raise」。
+
+**希望新增的測試**：可選：mock log_tags_safe 或 mlflow.set_tags 使其在失敗路徑拋錯，assert 外層仍 raise 原例外（或 assert 進程 exit code 非零）。
+
+---
+
+#### 5. 僅捕獲 Exception，不捕獲 BaseException（KeyboardInterrupt / SystemExit）（設計取捨，記錄）
+
+**問題**：`except Exception as e` 不會捕獲 `KeyboardInterrupt`、`SystemExit`。使用者 Ctrl+C 或內部 `sys.exit()` 時，不會寫入 FAILED tag、也不會執行 log_tags_safe，run 會由 with 的 __exit__ 正常結束。此為常見且合理的取捨：中斷不算「訓練失敗」，不強制標為 FAILED。
+
+**具體修改建議**：維持僅捕獲 `Exception`；若希望「任何離開皆標記」，可再考慮 `except BaseException` 並對 `KeyboardInterrupt`/`SystemExit` 做不同 tag（例如 status=KILLED），但可能過度，建議維持現狀並在文件註明。
+
+**希望新增的測試**：無需新增；可選文件註明「僅捕獲 Exception，不包含 KeyboardInterrupt/SystemExit」。
+
+---
+
+#### 6. _log_training_provenance_to_mlflow 在 has_active_run() 為 True 時不寫入 run_name（行為一致，記錄）
+
+**問題**：成功路徑下，pipeline 已用 `train-<start>-<end>-<timestamp>` 開 run，provenance 只追加 params，該 run 的「名稱」仍是 pipeline 開頭設定的那個，不是 `model_version`。與 T2 行為一致（單一 run、名稱代表整次 pipeline），無誤。
+
+**具體修改建議**：無需修改。若希望 MLflow UI 上同時看到 model_version，可考慮在 log_params_safe 後再 set_tag `model_version`（已有 params 內 model_version），或於文件註明「成功 run 的 run_name 為 train-<window>-<ts>，model_version 在 params 內」。
+
+**希望新增的測試**：無需新增。
+
+---
+
+**總結**：建議優先處理 **§1（has_active_run 例外時打 warning）** 以利排查；**§2** 以文件化為主，可選 sanitize；**§3** 為可選 UX 改善。§4～§6 為確認或文件補充，無必須程式變更。建議新增之測試：§1 之「active_run 拋錯時 has_active_run 回傳 False 且可選 assert warning」；§2 可選；§4 可選。
+
+---
+
+### 新增測試：T12 Code Review 風險點 → 最小可重現（tests only）
+
+**Date**: 2026-03-18  
+**原則**：僅新增 tests，不修改 production code。將 Code Review §1–§4 轉成最小可重現測試或契約。
+
+| 檔案 | 對應條目 | 內容 |
+|------|----------|------|
+| `tests/unit/test_mlflow_utils.py` | §1 | `test_has_active_run_returns_false_when_active_run_raises`：mock `is_mlflow_available` True、`mlflow.active_run` 的 `side_effect=RuntimeError("backend unavailable")`，呼叫 `has_active_run()`，預期回傳 `False` 且不 raise。 |
+| `tests/review_risks/test_review_risks_phase2_mlflow_trainer.py` | §2 | `TestT12FailedRunErrorTagTruncation.test_run_pipeline_except_uses_error_tag_truncated_to_500`：檢查 `run_pipeline` 源碼，assert 失敗路徑使用 `[:500]` 截斷 error tag（契約：error 長度 ≤ 500）。 |
+| 同上 | §3 | `TestT12MlflowRunNameFormat.test_run_pipeline_mlflow_run_name_contains_train_and_time`：檢查 `run_pipeline` 源碼，assert run_name 含 `train-`、`start.date()`、`end.date()`、`time.time()`。 |
+| 同上 | §4 | `TestT12FailedPathReRaisesOriginalException.test_run_pipeline_failure_propagates_original_exception`：patch `get_monthly_chunks` 拋 `ValueError("simulated pipeline failure")`，呼叫 `run_pipeline(args)`，預期 `ValueError` 傳出。 |
+| 同上 | §2 / §4 | `TestT12FailedPathReRaisesOriginalException.test_run_pipeline_failure_calls_log_tags_safe_with_failed_and_error_truncated`：同上 patch 觸發失敗，mock `log_tags_safe`，assert 被呼叫一次且傳入 `status=FAILED`、`error` 長度 ≤ 500。 |
+
+**執行方式**（專案根目錄）：
+
+```bash
+# 僅跑 T12 Code Review 相關測試（unit §1 + review_risks §2–§4）
+python -m pytest tests/unit/test_mlflow_utils.py::test_has_active_run_returns_false_when_active_run_raises tests/review_risks/test_review_risks_phase2_mlflow_trainer.py::TestT12FailedRunErrorTagTruncation tests/review_risks/test_review_risks_phase2_mlflow_trainer.py::TestT12MlflowRunNameFormat tests/review_risks/test_review_risks_phase2_mlflow_trainer.py::TestT12FailedPathReRaisesOriginalException -v --tb=short
+
+# 或跑整個 phase2 mlflow review 檔（含既有 T2 契約 + T12 新增）
+python -m pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py -v --tb=short
+
+# 僅 unit mlflow_utils（含 §1；環境無 mlflow 時 §1 可能 skipped）
+python -m pytest tests/unit/test_mlflow_utils.py -v --tb=short
+```
+
+**驗證結果**（2026-03-18）：  
+- `pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py -v --tb=short` → **8 passed**（含 T12 新增 4 則：§2 契約、§3 契約、§4 兩則行為）。  
+- `test_has_active_run_returns_false_when_active_run_raises` 在環境無 `mlflow` 時為 **skipped**；有 `mlflow` 時應 **passed**。
+
+---
+
+### 本輪驗證：tests / typecheck / lint（T12 實作與 Review 測試）
+
+**Date**: 2026-03-18  
+**範圍**：T12 相關 production 程式（`trainer/core/mlflow_utils.py`、`trainer/training/trainer.py`）與對應 tests；未改 tests（除測試本身錯或 decorator 過時）。
+
+| 項目 | 指令 | 結果 |
+|------|------|------|
+| **mlflow_utils + phase2 mlflow review 測試** | `pytest tests/unit/test_mlflow_utils.py tests/review_risks/test_review_risks_phase2_mlflow_trainer.py -v --tb=short` | **28 passed, 10 skipped**（skip 多為環境無 mlflow；T12 契約與行為測試全過） |
+| **ruff** | `ruff check trainer/ tests/unit/test_mlflow_utils.py tests/review_risks/test_review_risks_phase2_mlflow_trainer.py` | **All checks passed!** |
+| **mypy** | `mypy trainer/core/mlflow_utils.py --ignore-missing-imports` | 依專案慣例執行；本輪未改型別介面，mlflow_utils 為既有型別。 |
+
+**結論**：T12 實作與 Code Review 新增測試均通過；ruff 通過。無需修改 production code 以通過本輪測試。
+
+---
+
+### 計畫狀態與剩餘項目（2026-03-18）
+
+**PLAN**：依 [PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md)。
+
+| 項目 | 狀態 |
+|------|------|
+| **T0–T11** | ✅ Done |
+| **T12 Step 1**（單一 run、失敗時 tag FAILED/error） | ✅ Done（本輪驗證通過） |
+| **T12 可選後續** | 未實作：失敗時寫入 params（window、recent_chunks、NEG_SAMPLE_FRAC、chunk 數、OOM 估計等）；可選 Code Review §1（has_active_run 例外時打 warning） |
+| **Phase 2 P0–P1 其餘** | 無強制待辦；可依產品需求延伸（告警傳遞、自動化 drift 監控等） |
+
+**剩餘項目摘要**：僅 **T12 可選後續**（失敗 run 的診斷 params、可選 §1 warning）；無其他必做項。
+
+---

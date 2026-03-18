@@ -46,6 +46,8 @@ flowchart LR
   prereq --> p11[P1.1ScorerSqlite]
   p01 --> p02[P0.1TrainerWrite]
   p02 --> p03[P0Docs]
+  p02 --> t12[T12 Failed run log]
+  p01 --> t11[T11 Local MLflow env]
   p11 --> p12[P1.1ExportScript]
   p12 --> p13[P1.1Retention]
   p12 --> p14[P1.2P1.3Runbook]
@@ -58,9 +60,11 @@ flowchart LR
 
 ## Ordered Tasks
 
-**Current status**（更新於 2026-03-18）：**T0**–**T10** 已完成。Phase 2 P0–P1 有序任務已全部完成。
+**Current status**（更新於 2026-03-18）：**T0**–**T11** 已完成。**T12 Step 1**（單一 run 涵蓋整次 pipeline、失敗時寫入 tag status=FAILED／error 並 re-raise）已實作；tests/typecheck/lint 通過，見 STATUS.md「本輪驗證：tests / typecheck / lint」。
 
-**Remaining items**（依執行順序）：無。後續可依 phase2_p0_p1_implementation_plan 或產品需求進行延伸（如告警傳遞、自動化 drift 監控等）。
+**Remaining items**（依執行順序）：
+- **T12 可選後續**：失敗時除 tag 外再寫入 params（`training_window_start`/`end`、`recent_chunks`、`NEG_SAMPLE_FRAC`、chunk 數、OOM-check 估計等），見 T12 §3；可選實作 Code Review §1（has_active_run 例外時打 warning）。
+- 其餘 Phase 2 P0–P1 無強制待辦；可依產品需求延伸（告警傳遞、自動化 drift 監控等）。
 
 ---
 
@@ -371,6 +375,70 @@ flowchart LR
 - **Definition of done**
   - repo 內有正式模板與至少一份 example。
 
+### T11. Local MLflow config from project-local file (optional) — ✅ Done
+
+- **Depends on**: T1
+- **Goal**: 本機 train / export 預設即帶 MLflow 設定，且**不**將 MLflow 相關變數寫入專案主 `.env`；所有 trials 預設寫入 MLflow。
+- **Files**
+  - [trainer/core/mlflow_utils.py](trainer/core/mlflow_utils.py)
+  - [.gitignore](.gitignore)
+  - 使用者建立（不 commit）：`local_state/mlflow.env`
+  - 可選：`local_state/mlflow.env.example` 或 doc 說明格式
+- **Implementation notes**
+  - 在 `mlflow_utils.py` 模組頂層（任一程式 `import` 此模組時）：
+    - 由 `Path(__file__).resolve()` 推得 repo 根目錄（`trainer/core/` → 上兩層為 repo root）。
+    - 若 `repo_root / "local_state" / "mlflow.env"` 存在，則呼叫 `load_dotenv(該路徑, override=False)`，將該檔內變數注入 `os.environ`。
+    - `override=False`：若 process 已設 `MLFLOW_TRACKING_URI` 或 `GOOGLE_APPLICATION_CREDENTIALS`（例如 shell 或系統環境變數），不覆寫。
+  - 依賴：專案已有 `python-dotenv`（config 使用），不需新增。
+  - `.gitignore`：新增 `local_state/mlflow.env`（或整個 `local_state/`），避免金鑰與 URI 被 commit。
+  - `local_state/mlflow.env` 建議內容（兩行，無引號）：
+    - `MLFLOW_TRACKING_URI=https://...`
+    - `GOOGLE_APPLICATION_CREDENTIALS=<path-to-service-account-key.json>`
+  - 主 `.env` 完全不包含上述變數；僅此專用檔負責 MLflow 本機設定。
+- **Test steps**
+  1. 單元測試：mock 或 temp 建立 `local_state/mlflow.env`，import `mlflow_utils` 後驗證 `os.environ` 含預期鍵（或 `get_tracking_uri()` 回傳該 URI）；無檔時 import 不報錯、不覆寫既有 env。
+  2. 可選：integration 測試 — 有檔且 URI 可達時，`is_mlflow_available()` 為 True。
+- **Rollback**
+  - 移除 `mlflow_utils.py` 頂層的 `load_dotenv(...)` 邏輯即可；不影響既有 `MLFLOW_TRACKING_URI` 由環境變數讀取的行為。
+- **Definition of done**
+  - 建立 `local_state/mlflow.env` 並設好兩行後，從此專案執行 train / export 無需手動 `export` 環境變數，trials 預設寫入 MLflow。
+  - 主 `.env` 仍不包含 MLflow 設定。
+- **Code Review follow-up（2026-03-18）**：§1（import 時 try/except，避免 load_dotenv/path 異常導致模組載入失敗）、§2（MLFLOW_ENV_FILE 空字串／空白視為未設）已實作；tests/typecheck/lint 全過，見 STATUS.md「本輪實作：T11 Code Review §1§2 修補」。
+
+### T12. Log failed training runs to MLflow (optional follow-on) — Step 1 ✅ Done
+
+- **Depends on**: T2, T11
+- **Step 1 done（2026-03-18）**：單一 run（`train-{start}-{end}-{timestamp}`）、with + try/except、失敗時 `log_tags_safe({"status":"FAILED","error":str(e)[:500]})` 後 raise；`_log_training_provenance_to_mlflow` 有 active run 時只 log 不 start_run。Code Review 風險點已轉成 tests（§1–§4），見 STATUS.md「新增測試：T12 Code Review 風險點」。
+- **Goal**: 當訓練 pipeline 在任一步（如 Step 3 canonical mapping OOM）失敗時，也在 MLflow 寫入一筆 run，標記 `status=FAILED`、錯誤訊息（與可選的 failed_step），並寫入 **config、記憶體估計、資料規模** 等，方便在 MLflow UI 區分成功與失敗、排查 OOM／環境問題並改善配置。
+- **Files**
+  - [trainer/training/trainer.py](trainer/training/trainer.py)
+  - [trainer/core/mlflow_utils.py](trainer/core/mlflow_utils.py)
+  - 可選：`tests/unit/test_mlflow_utils.py` 或 `tests/integration/test_phase2_trainer_mlflow.py` 補「失敗路徑有 run 且 tag 正確」
+- **Implementation notes**
+  1. **單一 run 涵蓋整次 pipeline**  
+     - 在 `run_pipeline` 內，取得 `effective_start` / `effective_end` 後、Step 1 之前，以 `safe_start_run(run_name=..., tags=...)` 開一個 run。Run 名稱不可依賴 `model_version`（失敗時尚未產生），改為例如 `train-{window_start}-{window_end}-{timestamp}` 或 `train-{timestamp}`。
+  2. **整段 pipeline 包在同一個 run 的 context 裡**  
+     - 用 `with safe_start_run(run_name=run_name):` 包住從 Step 1 到 Step 10（含 `_log_training_provenance_to_mlflow`）的整段程式，確保成功或失敗離開時 run 都會被結束。
+  3. **失敗時寫入狀態與診斷資訊**  
+     - 在 `with` 內用 `try/except` 包住 pipeline 本體；在 `except` 中：
+       - `log_tags_safe({"status": "FAILED", "error": str(e)[:500]})`，可選 `log_params_safe({"failed_step": current_step})`。
+       - **為便於 OOM 與配置改善，失敗時盡量寫入**：`training_window_start` / `training_window_end`、`recent_chunks`、`NEG_SAMPLE_FRAC`（或 `_effective_neg_sample_frac`）、`use_local_parquet`、chunk 數（`len(chunks)`）；若該次 run 已執行 OOM-check，則寫入 est. peak RAM、available、budget（與既有 log 同一組數字）；可選 DuckDB `memory_limit` 等。使 MLflow UI 上可看到「為何失敗、當時 config、記憶體與資料規模」，利於事後調整。
+  4. **成功路徑不重複 start_run**  
+     - `_log_training_provenance_to_mlflow` 改為：若 `mlflow.active_run()` 已有 run，則**不**再呼叫 `safe_start_run`，僅對當前 run 做 `log_params_safe`（與既有 artifact 寫入）；若沒有 active run（例如單獨呼叫此 helper），則維持現狀（start run + log）。
+  5. **風險與注意**  
+     - 必須在「所有離開 run_pipeline 的路徑」都結束 run，故一律用 `with safe_start_run(...):` 包住整段，避免漏關。  
+     - 不新增依賴；沿用 `log_tags_safe` / `log_params_safe` / `end_run_safe`。MLflow 不可用時 `safe_start_run` 為 no-op，行為與現有一致。
+- **Test steps**
+  1. 單元或整合：mock pipeline 在 Step 3 拋錯，驗證 MLflow 有對應 run、tag `status=FAILED`、params/tag 含 error（或 failed_step）及 config／資料規模等。
+  2. 成功路徑：跑一小段 trainer（如 `--days 1 --use-local-parquet --skip-optuna`），確認 MLflow 仍只有一筆 run、provenance 與 artifact 正確。
+  3. 手動：觸發一次 OOM 或人為 exception，在 MLflow UI 確認失敗 run 可見、訊息可讀，且 params 含 window／chunks／NEG_SAMPLE_FRAC／記憶體估計等。
+- **Rollback**
+  - 移除 `run_pipeline` 頂層的 `with safe_start_run` 與 try/except；還原 `_log_training_provenance_to_mlflow` 為「一律自己 start_run」。即回到「僅成功時寫 MLflow」的行為。
+- **Definition of done**
+  - 訓練在任一步失敗時，MLflow 會有一筆 run 且可辨識為 FAILED 並含錯誤資訊與 config／記憶體／資料規模（利於 OOM 改善）。
+  - 成功完成時仍只有一筆 run，provenance 與 T2 行為一致。
+  - 無 MLflow 時行為不變（no-op，不 crash）。
+
 ---
 
 ## File-Level Edit Summary
@@ -379,11 +447,17 @@ flowchart LR
 
 - [trainer/training/trainer.py](trainer/training/trainer.py)
   - 在 `save_artifact_bundle(...)` 後接入 provenance logging。
+  - （T12）pipeline 開頭以 `with safe_start_run(...)` 包住整段；失敗時在 except 內 `log_tags_safe` / `log_params_safe`（含 config、chunk 數、OOM-check 估計等）。
 - [trainer/serving/scorer.py](trainer/serving/scorer.py)
   - 建立獨立的 `prediction_log.db` 與對應 schema（prediction log + export metadata/audit）
   - 在 `score_once(...)` 中對獨立 DB 進行 batch append
 - [trainer/core/config.py](trainer/core/config.py)
   - 新增 Phase 2 相關 env/config
+- [trainer/core/mlflow_utils.py](trainer/core/mlflow_utils.py)（T11）
+  - 模組頂層：若存在 `repo_root/local_state/mlflow.env` 則 `load_dotenv(..., override=False)`，不寫入主 `.env`
+  - （T12）`_log_training_provenance_to_mlflow` 呼叫處：有 active run 時只 log 不 start_run（實作在 trainer 內該 helper 的判斷）
+- [.gitignore](.gitignore)（T11）
+  - 新增 `local_state/mlflow.env`（或 `local_state/`），避免 MLflow 設定檔被 commit
 - [requirements.txt](requirements.txt)
   - 新增 `mlflow`，以及 `evidently`（若 root/local script 需要）
 - [package/deploy/requirements.txt](package/deploy/requirements.txt)
@@ -434,16 +508,22 @@ flowchart LR
   - retention cleanup only touches exported old rows
 - Evidently / skew scripts:
   - small fixture happy-path smoke tests
+- T11 local MLflow env:
+  - with `local_state/mlflow.env` present, env vars loaded before first `get_tracking_uri()`; without file, no error and no overwrite of existing env
+- T12 failed run log:
+  - pipeline 於某步失敗時，MLflow 有一筆 run、tag `status=FAILED`、error 及 config／chunk 數／OOM 估計等；成功路徑仍為單一 run
 
 ### Manual validation
 
 1. Run trainer with `MLFLOW_TRACKING_URI` unset -> training succeeds, warning only.
 2. Run trainer with reachable test tracking URI -> provenance visible in MLflow.
-3. Run scorer once -> `prediction_log` row count increases.
-4. Run export script with GCP unavailable -> no crash, watermark unchanged, rows remain.
-5. Re-run export script with GCP available -> artifact uploaded, watermark advances.
-6. Run validator unchanged -> existing behavior preserved.
-7. Produce one local Evidently report and one skew-check output.
+3. (T11) Create `local_state/mlflow.env` with URI and key path -> run trainer/export from repo root without manual `export` -> trials logged to MLflow.
+4. (T12) Trigger a pipeline failure (e.g. OOM) -> MLflow UI shows one FAILED run with error and params (config, chunks, memory estimate).
+5. Run scorer once -> `prediction_log` row count increases.
+6. Run export script with GCP unavailable -> no crash, watermark unchanged, rows remain.
+7. Re-run export script with GCP available -> artifact uploaded, watermark advances.
+8. Run validator unchanged -> existing behavior preserved.
+9. Produce one local Evidently report and one skew-check output.
 
 ---
 
@@ -467,6 +547,14 @@ flowchart LR
 ### P1.4-P1.6 scripts/docs
 
 - Independent rollback; no impact on trainer / scorer runtime path.
+
+### T11 local MLflow env
+
+- Remove the `load_dotenv(...)` block at top of `mlflow_utils.py`; MLflow config again only from process env / main `.env` if used.
+
+### T12 failed run log
+
+- Remove the `with safe_start_run` and try/except at top of `run_pipeline`; restore `_log_training_provenance_to_mlflow` to always start its own run. Restores "log to MLflow only on success" behavior.
 
 ---
 

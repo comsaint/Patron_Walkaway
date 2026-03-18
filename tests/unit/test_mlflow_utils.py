@@ -3,11 +3,17 @@ Phase 2 P0–P1: Unit tests for trainer.core.mlflow_utils.
 
 - URI unset: warning only, no raise; is_mlflow_available() returns False.
 - Mock MLflow: verify tags/params payload when available.
+- T11: local_state/mlflow.env (or MLFLOW_ENV_FILE) loaded on import; no file -> no crash.
 - Code Review risk points (§1–§9): minimal reproducible tests (tests only, no production changes).
 """
 
+import importlib
 import os
+import subprocess
+import sys
+import tempfile
 from contextlib import nullcontext
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -191,6 +197,40 @@ def test_end_run_safe_calls_end_run_when_available_and_active_run():
     mock_end_run.assert_called_once()
 
 
+def test_has_active_run_false_when_unavailable():
+    """T12: has_active_run returns False when MLflow is not available."""
+    _ensure_unset_uri_and_reset_cache()
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("MLFLOW_TRACKING_URI", None)
+        mlflow_utils.is_mlflow_available()
+    assert mlflow_utils.has_active_run() is False
+
+
+def test_has_active_run_true_when_available_and_run_active():
+    """T12: has_active_run returns True when MLflow available and there is an active run."""
+    pytest.importorskip("mlflow")
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        with patch("mlflow.active_run", return_value=MagicMock()):
+            assert mlflow_utils.has_active_run() is True
+
+
+def test_has_active_run_false_when_available_but_no_run():
+    """T12: has_active_run returns False when MLflow available but no active run."""
+    pytest.importorskip("mlflow")
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        with patch("mlflow.active_run", return_value=None):
+            assert mlflow_utils.has_active_run() is False
+
+
+def test_has_active_run_returns_false_when_active_run_raises():
+    """T12 Code Review §1: has_active_run returns False and does not raise when mlflow.active_run() raises."""
+    pytest.importorskip("mlflow")
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        with patch("mlflow.active_run", side_effect=RuntimeError("backend unavailable")):
+            result = mlflow_utils.has_active_run()
+    assert result is False
+
+
 def test_safe_start_run_context_when_unavailable_exits_cleanly():
     """Code Review §9: with safe_start_run(): when unavailable, block runs and exits without error."""
     _ensure_unset_uri_and_reset_cache()
@@ -199,3 +239,157 @@ def test_safe_start_run_context_when_unavailable_exits_cleanly():
         mlflow_utils.is_mlflow_available()
     with mlflow_utils.safe_start_run():
         pass
+
+
+def test_t11_env_file_loaded_when_mlflow_env_file_points_to_existing_file():
+    """T11: When MLFLOW_ENV_FILE points to an existing file with MLFLOW_TRACKING_URI, reload loads it."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+        f.write("MLFLOW_TRACKING_URI=http://from-file.example.com\n")
+        tmp_path = f.name
+    try:
+        prev_uri = os.environ.pop("MLFLOW_TRACKING_URI", None)
+        prev_override = os.environ.pop("MLFLOW_ENV_FILE", None)
+        os.environ["MLFLOW_ENV_FILE"] = tmp_path
+        importlib.reload(mlflow_utils)
+        assert mlflow_utils.get_tracking_uri() == "http://from-file.example.com"
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+        os.environ.pop("MLFLOW_ENV_FILE", None)
+        if prev_override is not None:
+            os.environ["MLFLOW_ENV_FILE"] = prev_override
+        if prev_uri is not None:
+            os.environ["MLFLOW_TRACKING_URI"] = prev_uri
+        importlib.reload(mlflow_utils)
+
+
+def test_t11_no_crash_when_mlflow_env_file_points_to_nonexistent_path():
+    """T11: When MLFLOW_ENV_FILE points to non-existent path, reload does not crash; URI stays unset."""
+    prev_uri = os.environ.pop("MLFLOW_TRACKING_URI", None)
+    prev_override = os.environ.pop("MLFLOW_ENV_FILE", None)
+    os.environ["MLFLOW_ENV_FILE"] = "/nonexistent/path/mlflow.env"
+    try:
+        importlib.reload(mlflow_utils)
+        assert mlflow_utils.get_tracking_uri() is None
+    finally:
+        os.environ.pop("MLFLOW_ENV_FILE", None)
+        if prev_override is not None:
+            os.environ["MLFLOW_ENV_FILE"] = prev_override
+        if prev_uri is not None:
+            os.environ["MLFLOW_TRACKING_URI"] = prev_uri
+        importlib.reload(mlflow_utils)
+
+
+# --- Code Review T11: risk points → minimal reproducible tests (tests only, no production changes) ---
+
+
+def test_t11_review_import_succeeds_when_load_dotenv_raises():
+    """Code Review §1: When load_dotenv raises during mlflow_utils import, module still loads and get_tracking_uri() works."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+        f.write("MLFLOW_TRACKING_URI=http://test.example.com\n")
+        tmp_path = f.name
+    try:
+        # Only raise when load_dotenv is called from mlflow_utils (not from config.py).
+        # Pass MLFLOW_ENV_FILE so mlflow_utils actually calls load_dotenv.
+        code = """
+import os
+import sys
+os.environ["MLFLOW_ENV_FILE"] = sys.argv[1]
+import dotenv
+original = dotenv.load_dotenv
+def raising(*a, **k):
+    import inspect
+    for fr in inspect.stack():
+        if 'mlflow_utils' in (fr.filename or ''):
+            raise Exception("bad file")
+    return original(*a, **k)
+dotenv.load_dotenv = raising
+from trainer.core import mlflow_utils
+uri = mlflow_utils.get_tracking_uri()
+print(uri if uri is None else uri)
+sys.exit(0)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code, tmp_path],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, (
+            f"Subprocess failed: stdout={result.stdout!r} stderr={result.stderr!r}. "
+            "Code Review §1: import must not fail when load_dotenv raises; wrap in try/except."
+        )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def test_t11_review_mlflow_env_file_empty_string_reload_no_crash():
+    """Code Review §2: MLFLOW_ENV_FILE='' (empty string) → reload does not crash; URI unset when env cleared."""
+    prev_uri = os.environ.pop("MLFLOW_TRACKING_URI", None)
+    prev_override = os.environ.pop("MLFLOW_ENV_FILE", None)
+    os.environ["MLFLOW_ENV_FILE"] = ""
+    try:
+        importlib.reload(mlflow_utils)
+        # With empty string, Path("").is_file() is False so we don't load; expect None when env cleared.
+        got = mlflow_utils.get_tracking_uri()
+        assert got is None or got  # no crash; value is either None or whatever was already in env
+    finally:
+        os.environ.pop("MLFLOW_ENV_FILE", None)
+        if prev_override is not None:
+            os.environ["MLFLOW_ENV_FILE"] = prev_override
+        if prev_uri is not None:
+            os.environ["MLFLOW_TRACKING_URI"] = prev_uri
+        importlib.reload(mlflow_utils)
+
+
+def test_t11_review_mlflow_env_file_whitespace_only_reload_no_crash():
+    """Code Review §2: MLFLOW_ENV_FILE='   ' (whitespace only) → reload does not crash."""
+    prev_uri = os.environ.pop("MLFLOW_TRACKING_URI", None)
+    prev_override = os.environ.pop("MLFLOW_ENV_FILE", None)
+    os.environ["MLFLOW_ENV_FILE"] = "   "
+    try:
+        importlib.reload(mlflow_utils)
+        got = mlflow_utils.get_tracking_uri()
+        assert got is None or got
+    finally:
+        os.environ.pop("MLFLOW_ENV_FILE", None)
+        if prev_override is not None:
+            os.environ["MLFLOW_ENV_FILE"] = prev_override
+        if prev_uri is not None:
+            os.environ["MLFLOW_TRACKING_URI"] = prev_uri
+        importlib.reload(mlflow_utils)
+
+
+def test_t11_review_override_false_env_takes_precedence():
+    """Code Review §3: override=False → existing env MLFLOW_TRACKING_URI is not overwritten by file."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+        f.write("MLFLOW_TRACKING_URI=http://from-file.example.com\n")
+        tmp_path = f.name
+    try:
+        prev_uri = os.environ.pop("MLFLOW_TRACKING_URI", None)
+        prev_override = os.environ.pop("MLFLOW_ENV_FILE", None)
+        os.environ["MLFLOW_TRACKING_URI"] = "http://env-override.example.com"
+        os.environ["MLFLOW_ENV_FILE"] = tmp_path
+        importlib.reload(mlflow_utils)
+        assert mlflow_utils.get_tracking_uri() == "http://env-override.example.com"
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+        os.environ.pop("MLFLOW_ENV_FILE", None)
+        if prev_override is not None:
+            os.environ["MLFLOW_ENV_FILE"] = prev_override
+        if prev_uri is not None:
+            os.environ["MLFLOW_TRACKING_URI"] = prev_uri
+        else:
+            os.environ.pop("MLFLOW_TRACKING_URI", None)
+        importlib.reload(mlflow_utils)
+
+
+def test_t11_review_docstring_mentions_mlflow_env_file_and_override():
+    """Code Review §4 (optional): Module docstring or source documents MLFLOW_ENV_FILE as test/override."""
+    source_path = Path(mlflow_utils.__file__)
+    source = source_path.read_text(encoding="utf-8")
+    assert "MLFLOW_ENV_FILE" in source, "MLFLOW_ENV_FILE must be documented in mlflow_utils (doc or comment)."
+    assert "override" in source.lower() or "test" in source.lower(), (
+        "mlflow_utils must mention override or test for MLFLOW_ENV_FILE (Code Review §4)."
+    )

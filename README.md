@@ -48,6 +48,18 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 
 **資料（訓練/回測）**：預設為 ClickHouse，請確認 `SOURCE_DB` 與憑證正確。本地 Parquet（開發/測試）：在專案根目錄放置 `data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet`（可選 `data/player_profile.parquet`），執行 trainer 或 backtester 時加上 `--use-local-parquet`。
 
+**MLflow（GCP Cloud Run）連線（做法 A）**：訓練與 export 會將 run/artifact 寫入 MLflow。請建立 **`local_state/mlflow.env`**（或將檔案放在例如 **`credential/mlflow.env`**，此二目錄皆已被 `.gitignore` 涵蓋，勿 commit），內容兩行：
+
+```
+MLFLOW_TRACKING_URI=https://<your-mlflow-cloud-run-url>
+GOOGLE_APPLICATION_CREDENTIALS=<絕對路徑或相對專案根>/mlflow-key.json
+```
+
+若使用 **`credential/mlflow.env`**（非預設路徑），須在執行訓練或 export **前**設定環境變數：  
+`MLFLOW_ENV_FILE=credential/mlflow.env`（或 `MLFLOW_ENV_FILE=<絕對路徑>/credential/mlflow.env`），程式才會載入該檔。
+
+`mlflow-key.json` 為可存取該 Cloud Run 服務的 GCP 服務帳戶金鑰。程式會自動以該金鑰取得 **GCP ID token** 並在每次 MLflow 請求帶上 `Authorization: Bearer <token>`，以通過 Cloud Run 驗證。無須在主 `.env` 填寫 MLflow 相關變數。詳見 `trainer/core/mlflow_utils.py` 與 `.cursor/plans/STATUS.md`。
+
 **Canonical mapping 共用 artifact（Step 3）**：訓練 Step 3 會產出 `data/canonical_mapping.parquet` 與 `data/canonical_mapping.cutoff.json`（sidecar 記錄本次使用的 `train_end`）。若兩檔存在且 sidecar 的 `cutoff_dtm` ≥ 該次 run 的 `train_end`，且未指定 `--rebuild-canonical-mapping`，則 Step 3 會**載入既有 artifact 並跳過建表**。若 parquet 缺少必要欄位（`player_id`、`canonical_id`），Step 3 會記錄警告並改為從頭建表。共用 artifact 時（例如將 `data/` 複製至他機）：假設兩邊 session 資料一致且更新至同一時點，mapping 的 cutoff 應 ≥ 該次 run 的 `train_end`；請確保 `data/` 僅由受控程式寫入，勿讓未信任來源寫入該目錄。詳見 `.cursor/plans/PLAN.md` § Canonical mapping 寫出與載入。
 
 ### Data loading & preprocessing
@@ -348,6 +360,19 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 Copy `trainer/.env.example` to `trainer/.env` (or set env vars) for ClickHouse:
 
 - `CH_HOST`, `CH_TEAMDB_HOST`, `CH_PORT`, `CH_USER`, `CH_PASS`, `CH_SECURE`, `SOURCE_DB`
+
+**MLflow (GCP Cloud Run) — Option A**  
+To log runs and artifacts to MLflow on GCP Cloud Run, create **`local_state/mlflow.env`** (or put the file under **`credential/mlflow.env`**; both directories are gitignored). Add two lines:
+
+```
+MLFLOW_TRACKING_URI=https://<your-mlflow-cloud-run-url>
+GOOGLE_APPLICATION_CREDENTIALS=<absolute-or-repo-relative-path>/mlflow-key.json
+```
+
+If you use **`credential/mlflow.env`** (non-default path), set **before** running trainer or export:  
+`MLFLOW_ENV_FILE=credential/mlflow.env` (or an absolute path to that file), so the module loads it on import.
+
+Use a GCP service account key file (`mlflow-key.json`) that can invoke the Cloud Run service. The code will obtain a **GCP ID token** and send `Authorization: Bearer <token>` with each MLflow request so Cloud Run authentication succeeds. You do not need to put MLflow-related variables in the main `.env`. See `trainer/core/mlflow_utils.py` and `.cursor/plans/STATUS.md`.
 
 ### Data (for training / backtest)
 

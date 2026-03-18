@@ -68,7 +68,9 @@ from zoneinfo import ZoneInfo
 
 from trainer.profile_schedule import latest_month_end_on_or_before, month_end_dates
 from trainer.core.mlflow_utils import (
+    has_active_run,
     log_params_safe,
+    log_tags_safe,
     safe_start_run,
 )
 
@@ -4184,8 +4186,12 @@ def _log_training_provenance_to_mlflow(
         "feature_spec_path": feature_spec_path,
         "training_metrics_path": training_metrics_path,
     }
-    with safe_start_run(run_name=model_version):
+    # T12: if pipeline already started a run (e.g. at pipeline entry), log to it; else start one.
+    if has_active_run():
         log_params_safe(params)
+    else:
+        with safe_start_run(run_name=model_version):
+            log_params_safe(params)
 
 
 def save_artifact_bundle(
@@ -4411,306 +4417,371 @@ def run_pipeline(args) -> None:
 
     logger.info("Training window: %s -> %s  (local=%s)", start.date(), end.date(), use_local)
 
-    # 1. Monthly chunks (DEC-008 / SSOT §4.3)
-    print("[Step 1/10] Training window and monthly chunks…", flush=True)
-    t0 = time.perf_counter()
-    chunks = get_monthly_chunks(start, end)
-    _el = time.perf_counter() - t0
-    print("[Step 1/10] Training window and monthly chunks done in %.1fs" % _el, flush=True)
-    logger.info("Chunks: %d  (%.1fs)", len(chunks), _el)
-
-    # Debug/test mode: limit to most recent N chunks so data loading from both
-    # ClickHouse and local Parquet is proportionally restricted.
-    recent_chunks = getattr(args, "recent_chunks", None)
-    if recent_chunks is not None and recent_chunks > 0:
-        if recent_chunks < len(chunks):
-            chunks = chunks[-recent_chunks:]
-            logger.info(
-                "DEBUG MODE (--recent-chunks %d): trimmed to %s -> %s",
-                recent_chunks,
-                chunks[0]["window_start"].date(),
-                chunks[-1]["window_end"].date(),
-            )
-        else:
-            logger.info(
-                "DEBUG MODE (--recent-chunks %d): requested >= total chunks (%d), using all",
-                recent_chunks,
-                len(chunks),
-            )
-
-    # Effective window is derived from the chunk list after optional trimming.
-    # All subsequent data loading (identity/profile checks/profile load) must
-    # use this window so --recent-chunks applies consistently to all tables.
-    effective_start = chunks[0]["window_start"] if chunks else start
-    effective_end = chunks[-1]["window_end"] if chunks else end
-    # DEC-018: normalize effective window to tz-naive so all downstream helpers
-    # (ensure_player_profile_ready, load_player_profile, apply_dq
-    # called from the canonical-map path) receive tz-naive datetime arguments.
-    effective_start = effective_start.replace(tzinfo=None) if effective_start.tzinfo else effective_start
-    effective_end   = effective_end.replace(tzinfo=None)   if effective_end.tzinfo   else effective_end
-
-    # --- OOM pre-check (earliest feasible point: chunk list is final) ---
-    # Estimate Step 7 peak RAM and auto-reduce NEG_SAMPLE_FRAC when OOM is likely.
-    # Result may equal NEG_SAMPLE_FRAC (no change) or be lower (auto-adjusted).
-    _effective_neg_sample_frac: float = _oom_check_and_adjust_neg_sample_frac(
-        chunks, NEG_SAMPLE_FRAC
-    )
-
-    # 2. Chunk-level split — used ONLY to derive train_end for the canonical
-    #    mapping cutoff (B1 / R25 identity-leakage guard).  The actual row
-    #    assignment to train/valid/test happens later at row level (SSOT §9.2).
-    print("[Step 2/10] Chunk-level split (train_end derivation)…", flush=True)
-    t0 = time.perf_counter()
-    split = get_train_valid_test_split(chunks)
-    _el = time.perf_counter() - t0
-    print("[Step 2/10] Chunk-level split done in %.1fs" % _el, flush=True)
-    logger.info("Chunk-level split (train_end derivation): %.1fs", _el)
-    train_end = (
-        max(c["window_end"] for c in split["train_chunks"])
-        if split["train_chunks"] else end
-    )
-    if hasattr(train_end, "tzinfo") and train_end.tzinfo:
-        # DEC-018: tz_convert to HK first, then strip tz, matching labels.py semantics.
-        train_end = pd.Timestamp(train_end).tz_convert("Asia/Hong_Kong")
-        train_end = train_end.replace(tzinfo=None)
-
-    # 3. Build canonical mapping with TRAINING window cutoff (B1 — prevents
-    #    identity links that arose after training from leaking into training data).
-    #    Also get FND-12 dummy player_ids so we drop them from training (TRN-04).
-    #    PLAN steps 4/7/8: local path may load from artifact; else DuckDB or pandas build; write after build.
-    print("[Step 3/10] Build canonical identity mapping…", flush=True)
-    t0 = time.perf_counter()
-    logger.info("Building canonical identity mapping (cutoff=%s)…", train_end)
-    dummy_player_ids: set = set()
-    rebuild_canonical = getattr(args, "rebuild_canonical_mapping", False)
-    _canonical_built = False
-    # PLAN step 8: try load existing artifact once (use_local and ClickHouse paths both skip build if ok)
-    loaded_from_artifact = False
-    if not rebuild_canonical and CANONICAL_MAPPING_PARQUET.exists() and CANONICAL_MAPPING_CUTOFF_JSON.exists():
+    # T12: one MLflow run for the whole pipeline; on failure log status=FAILED and re-raise.
+    _mlflow_run_name = f"train-{start.date()}-{end.date()}-{int(time.time())}"
+    with safe_start_run(run_name=_mlflow_run_name):
         try:
-            with open(CANONICAL_MAPPING_CUTOFF_JSON, encoding="utf-8") as _f:
-                _sidecar = json.load(_f)
-            _cutoff_str = _sidecar.get("cutoff_dtm")
-            _cutoff_ts = pd.Timestamp(_cutoff_str) if _cutoff_str else None
-            if _cutoff_ts is not None:
-                _cutoff_naive = _cutoff_ts.replace(tzinfo=None) if _cutoff_ts.tz else _cutoff_ts
-                if _cutoff_naive >= train_end:
-                    canonical_map = pd.read_parquet(CANONICAL_MAPPING_PARQUET)
-                    if set(canonical_map.columns) >= {"player_id", "canonical_id"}:
-                        dummy_player_ids = set(_sidecar.get("dummy_player_ids") or [])
-                        dummy_player_ids = set(int(x) for x in dummy_player_ids)
-                        loaded_from_artifact = True
-                        logger.info(
-                            "Canonical mapping loaded from %s (cutoff %s >= train_end)",
-                            CANONICAL_MAPPING_PARQUET, _cutoff_str,
-                        )
-                    else:
-                        logger.warning(
-                            "Canonical mapping artifact missing required columns; will rebuild"
-                        )
-        except Exception as exc:
-            logger.warning("Load canonical mapping artifact failed (%s); will rebuild", exc)
-
-    if loaded_from_artifact:
-        pass  # canonical_map, dummy_player_ids already set; skip build for both use_local and ClickHouse
-    elif use_local:
-        sessions_all = None  # R403 guardrail: ensure release in every path; set again in pandas branch
-        use_full_sessions_pandas = getattr(_cfg, "CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS", False)
-        if use_full_sessions_pandas:
-            logger.warning(
-                "CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS=True: loading full session window into pandas (high OOM risk, A03). Use only for debugging; keep DuckDB path in production."
-            )
-            _, sessions_all = load_local_parquet(
-                effective_start,
-                effective_end + timedelta(days=1),
-                sessions_only=True,
-            )
-            _, sessions_all = normalize_bets_sessions(pd.DataFrame(), sessions_all)
-            _, sessions_all = apply_dq(
-                pd.DataFrame(columns=["bet_id"]),
-                sessions_all,
-                effective_start,
-                effective_end + timedelta(days=1),
-            )
-            canonical_map = build_canonical_mapping_from_df(sessions_all, cutoff_dtm=train_end)
-            try:
-                dummy_player_ids = get_dummy_player_ids_from_df(sessions_all, cutoff_dtm=train_end)
-            except Exception as exc:
-                logger.warning("get_dummy_player_ids_from_df failed (%s); not filtering dummies", exc)
-            sessions_all = None
-        else:
-            sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
-            links_df, dummy_pids = build_canonical_links_and_dummy_from_duckdb(sess_path, train_end)
-            canonical_map = build_canonical_mapping_from_links(links_df, dummy_pids)
-            dummy_player_ids = dummy_pids
-            sessions_all = None  # not used in DuckDB path; clear for peak memory guardrail (R403)
-        _canonical_built = True
-
-        if _canonical_built:
-            try:
-                canonical_map.to_parquet(CANONICAL_MAPPING_PARQUET, index=False)
-                _cutoff_iso = train_end.isoformat() if hasattr(train_end, "isoformat") else str(train_end)
-                with open(CANONICAL_MAPPING_CUTOFF_JSON, "w", encoding="utf-8") as _f:
-                    json.dump(
-                        {"cutoff_dtm": _cutoff_iso, "dummy_player_ids": list(dummy_player_ids)},
-                        _f,
-                        indent=0,
+            # 1. Monthly chunks (DEC-008 / SSOT §4.3)
+            print("[Step 1/10] Training window and monthly chunks…", flush=True)
+            t0 = time.perf_counter()
+            chunks = get_monthly_chunks(start, end)
+            _el = time.perf_counter() - t0
+            print("[Step 1/10] Training window and monthly chunks done in %.1fs" % _el, flush=True)
+            logger.info("Chunks: %d  (%.1fs)", len(chunks), _el)
+        
+            # Debug/test mode: limit to most recent N chunks so data loading from both
+            # ClickHouse and local Parquet is proportionally restricted.
+            recent_chunks = getattr(args, "recent_chunks", None)
+            if recent_chunks is not None and recent_chunks > 0:
+                if recent_chunks < len(chunks):
+                    chunks = chunks[-recent_chunks:]
+                    logger.info(
+                        "DEBUG MODE (--recent-chunks %d): trimmed to %s -> %s",
+                        recent_chunks,
+                        chunks[0]["window_start"].date(),
+                        chunks[-1]["window_end"].date(),
                     )
-                logger.info("Canonical mapping written to %s", CANONICAL_MAPPING_PARQUET)
-            except Exception as exc:
-                logger.warning("Write canonical mapping artifact failed (%s); next run will rebuild", exc)
-        sessions_all = None
-    else:
-        try:
-            client = get_clickhouse_client()
-            canonical_map = build_canonical_mapping(client, cutoff_dtm=train_end)
-            dummy_player_ids = get_dummy_player_ids(client, cutoff_dtm=train_end)
-        except Exception as exc:
-            logger.warning("ClickHouse canonical mapping failed (%s); using empty map", exc)
-            canonical_map = pd.DataFrame(columns=["player_id", "canonical_id"])
-            dummy_player_ids = set()
-        sessions_all = None
-        # PLAN § Canonical mapping 步驟 7：ClickHouse 路徑建完後也寫出，供共用／下次載入
-        if set(canonical_map.columns) >= {"player_id", "canonical_id"} and not canonical_map.empty:
-            try:
-                canonical_map.to_parquet(CANONICAL_MAPPING_PARQUET, index=False)
-                _cutoff_iso = train_end.isoformat() if hasattr(train_end, "isoformat") else str(train_end)
-                with open(CANONICAL_MAPPING_CUTOFF_JSON, "w", encoding="utf-8") as _f:
-                    json.dump(
-                        {"cutoff_dtm": _cutoff_iso, "dummy_player_ids": list(dummy_player_ids)},
-                        _f,
-                        indent=0,
+                else:
+                    logger.info(
+                        "DEBUG MODE (--recent-chunks %d): requested >= total chunks (%d), using all",
+                        recent_chunks,
+                        len(chunks),
                     )
-                logger.info("Canonical mapping written to %s (from ClickHouse)", CANONICAL_MAPPING_PARQUET)
-            except Exception as exc:
-                logger.warning("Write canonical mapping artifact failed (%s); next run will rebuild", exc)
-
-    _el = time.perf_counter() - t0
-    print("[Step 3/10] Build canonical identity mapping done in %.1fs" % _el, flush=True)
-    logger.info(
-        "Canonical mapping: %d rows; FND-12 dummy player_ids to exclude: %d  (%.1fs)",
-        len(canonical_map), len(dummy_player_ids), _el,
-    )
-
-    # Rated-patron sampling is an independent option controlled by --sample-rated N.
-    rated_whitelist: Optional[set] = None
-    if sample_rated_n is not None and not canonical_map.empty:
-        _sample = (
-            canonical_map["canonical_id"]
-            .astype(str)
-            .drop_duplicates()
-            .sort_values()
-            .head(sample_rated_n)
-        )
-        rated_whitelist = set(_sample.tolist())
-        logger.info(
-            "--sample-rated: sampled %d / %d rated canonical_ids (deterministic sort+head)",
-            len(rated_whitelist), canonical_map["canonical_id"].nunique(),
-        )
-
-    # 3b. Auto-check local player_profile freshness and backfill missing
-    #     ranges before training starts (one-command flow, OOM-safe helper).
-    print("[Step 4/10] Ensure player_profile ready (backfill if needed)…", flush=True)
-    t0 = time.perf_counter()
-    ensure_player_profile_ready(
-        effective_start,
-        effective_end,
-        use_local_parquet=use_local,
-        canonical_id_whitelist=rated_whitelist,
-        snapshot_interval_days=1,
-        preload_sessions=not no_preload,
-        canonical_map=canonical_map,
-        max_lookback_days=365,
-    )
-    _el = time.perf_counter() - t0
-    print("[Step 4/10] Ensure player_profile ready done in %.1fs" % _el, flush=True)
-    logger.info("ensure_player_profile_ready: %.1fs", _el)
-
-    # 3c. Load player_profile once for the entire training window (PLAN Step 4).
-    #     Pass the resulting DataFrame to every process_chunk call so each chunk
-    #     can do the PIT/as-of join without re-querying.  If load fails, profile
-    #     features are 0 for all rows (graceful degradation).
-    # R404 Review #1: empty map → [] so load_player_profile does not load full table (train-serve parity with backtester).
-    _rated_cids: Optional[List[str]] = (
-        list(rated_whitelist)
-        if rated_whitelist
-        else (
-            canonical_map["canonical_id"].astype(str).tolist()
-            if not canonical_map.empty
-            else []
-        )
-    )
-    print("[Step 5/10] Load player_profile for PIT join…", flush=True)
-    t0 = time.perf_counter()
-    profile_df = load_player_profile(
-        effective_start,
-        effective_end,
-        use_local_parquet=use_local,
-        canonical_ids=_rated_cids,
-    )
-    _el = time.perf_counter() - t0
-    if profile_df is not None:
-        print("[Step 5/10] Load player_profile done in %.1fs (%d rows)" % (_el, len(profile_df)), flush=True)
-        logger.info("player_profile: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), _el)
-    else:
-        print("[Step 5/10] Load player_profile done in %.1fs (not available)" % _el, flush=True)
-        logger.info("player_profile: not available — profile features will be NaN (%.1fs)", _el)
-
-    feature_spec = load_feature_spec(FEATURE_SPEC_PATH)
-    try:
-        feature_spec_hash = hashlib.md5(Path(FEATURE_SPEC_PATH).read_bytes()).hexdigest()[:12]
-    except Exception:
-        feature_spec_hash = "unknown"
-    logger.info(
-        "Track LLM: loaded feature spec from %s (spec_hash=%s)",
-        FEATURE_SPEC_PATH,
-        feature_spec_hash,
-    )
-
-    # 4. Process chunks -> write parquet
-    # When NEG_SAMPLE_FRAC_AUTO and there are chunks, run chunk 1 with frac=1.0 (OOM probe),
-    # measure size, possibly lower _effective_neg_sample_frac, then process remaining chunks.
-    _neg_sample_note = (
-        f"  neg-sample={_effective_neg_sample_frac:.2f}" if _effective_neg_sample_frac < 1.0 else ""
-    )
-    print(
-        f"[Step 6/10] Process chunks (DQ, labels, Track Human, Track LLM){_neg_sample_note}…",
-        flush=True,
-    )
-    t0 = time.perf_counter()
-    chunk_paths: List[Path] = []
-    _step6_disable_bar = getattr(_cfg, "DISABLE_PROGRESS_BAR", False)
-    pbar = (
-        _ProgressNoop()
-        if _step6_disable_bar
-        else _tqdm_bar(total=len(chunks), desc="Step 6 chunks", unit="chunk")
-    )
-    try:
-        if NEG_SAMPLE_FRAC_AUTO and len(chunks) > 0:
-            # OOM probe: process chunk 1 with frac=1.0, then decide effective frac.
-            print("[Step 6/10] OOM probe: chunk 1 with neg_sample_frac=1.0…", flush=True)
-            logger.info("OOM probe: processing chunk 1 with neg_sample_frac=1.0")
-            path1 = process_chunk(
-                chunks[0],
-                canonical_map,
-                dummy_player_ids=dummy_player_ids,
+        
+            # Effective window is derived from the chunk list after optional trimming.
+            # All subsequent data loading (identity/profile checks/profile load) must
+            # use this window so --recent-chunks applies consistently to all tables.
+            effective_start = chunks[0]["window_start"] if chunks else start
+            effective_end = chunks[-1]["window_end"] if chunks else end
+            # DEC-018: normalize effective window to tz-naive so all downstream helpers
+            # (ensure_player_profile_ready, load_player_profile, apply_dq
+            # called from the canonical-map path) receive tz-naive datetime arguments.
+            effective_start = effective_start.replace(tzinfo=None) if effective_start.tzinfo else effective_start
+            effective_end   = effective_end.replace(tzinfo=None)   if effective_end.tzinfo   else effective_end
+        
+            # --- OOM pre-check (earliest feasible point: chunk list is final) ---
+            # Estimate Step 7 peak RAM and auto-reduce NEG_SAMPLE_FRAC when OOM is likely.
+            # Result may equal NEG_SAMPLE_FRAC (no change) or be lower (auto-adjusted).
+            _effective_neg_sample_frac: float = _oom_check_and_adjust_neg_sample_frac(
+                chunks, NEG_SAMPLE_FRAC
+            )
+        
+            # 2. Chunk-level split — used ONLY to derive train_end for the canonical
+            #    mapping cutoff (B1 / R25 identity-leakage guard).  The actual row
+            #    assignment to train/valid/test happens later at row level (SSOT §9.2).
+            print("[Step 2/10] Chunk-level split (train_end derivation)…", flush=True)
+            t0 = time.perf_counter()
+            split = get_train_valid_test_split(chunks)
+            _el = time.perf_counter() - t0
+            print("[Step 2/10] Chunk-level split done in %.1fs" % _el, flush=True)
+            logger.info("Chunk-level split (train_end derivation): %.1fs", _el)
+            train_end = (
+                max(c["window_end"] for c in split["train_chunks"])
+                if split["train_chunks"] else end
+            )
+            if hasattr(train_end, "tzinfo") and train_end.tzinfo:
+                # DEC-018: tz_convert to HK first, then strip tz, matching labels.py semantics.
+                train_end = pd.Timestamp(train_end).tz_convert("Asia/Hong_Kong")
+                train_end = train_end.replace(tzinfo=None)
+        
+            # 3. Build canonical mapping with TRAINING window cutoff (B1 — prevents
+            #    identity links that arose after training from leaking into training data).
+            #    Also get FND-12 dummy player_ids so we drop them from training (TRN-04).
+            #    PLAN steps 4/7/8: local path may load from artifact; else DuckDB or pandas build; write after build.
+            print("[Step 3/10] Build canonical identity mapping…", flush=True)
+            t0 = time.perf_counter()
+            logger.info("Building canonical identity mapping (cutoff=%s)…", train_end)
+            dummy_player_ids: set = set()
+            rebuild_canonical = getattr(args, "rebuild_canonical_mapping", False)
+            _canonical_built = False
+            # PLAN step 8: try load existing artifact once (use_local and ClickHouse paths both skip build if ok)
+            loaded_from_artifact = False
+            if not rebuild_canonical and CANONICAL_MAPPING_PARQUET.exists() and CANONICAL_MAPPING_CUTOFF_JSON.exists():
+                try:
+                    with open(CANONICAL_MAPPING_CUTOFF_JSON, encoding="utf-8") as _f:
+                        _sidecar = json.load(_f)
+                    _cutoff_str = _sidecar.get("cutoff_dtm")
+                    _cutoff_ts = pd.Timestamp(_cutoff_str) if _cutoff_str else None
+                    if _cutoff_ts is not None:
+                        _cutoff_naive = _cutoff_ts.replace(tzinfo=None) if _cutoff_ts.tz else _cutoff_ts
+                        if _cutoff_naive >= train_end:
+                            canonical_map = pd.read_parquet(CANONICAL_MAPPING_PARQUET)
+                            if set(canonical_map.columns) >= {"player_id", "canonical_id"}:
+                                dummy_player_ids = set(_sidecar.get("dummy_player_ids") or [])
+                                dummy_player_ids = set(int(x) for x in dummy_player_ids)
+                                loaded_from_artifact = True
+                                logger.info(
+                                    "Canonical mapping loaded from %s (cutoff %s >= train_end)",
+                                    CANONICAL_MAPPING_PARQUET, _cutoff_str,
+                                )
+                            else:
+                                logger.warning(
+                                    "Canonical mapping artifact missing required columns; will rebuild"
+                                )
+                except Exception as exc:
+                    logger.warning("Load canonical mapping artifact failed (%s); will rebuild", exc)
+        
+            if loaded_from_artifact:
+                pass  # canonical_map, dummy_player_ids already set; skip build for both use_local and ClickHouse
+            elif use_local:
+                sessions_all = None  # R403 guardrail: ensure release in every path; set again in pandas branch
+                use_full_sessions_pandas = getattr(_cfg, "CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS", False)
+                if use_full_sessions_pandas:
+                    logger.warning(
+                        "CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS=True: loading full session window into pandas (high OOM risk, A03). Use only for debugging; keep DuckDB path in production."
+                    )
+                    _, sessions_all = load_local_parquet(
+                        effective_start,
+                        effective_end + timedelta(days=1),
+                        sessions_only=True,
+                    )
+                    _, sessions_all = normalize_bets_sessions(pd.DataFrame(), sessions_all)
+                    _, sessions_all = apply_dq(
+                        pd.DataFrame(columns=["bet_id"]),
+                        sessions_all,
+                        effective_start,
+                        effective_end + timedelta(days=1),
+                    )
+                    canonical_map = build_canonical_mapping_from_df(sessions_all, cutoff_dtm=train_end)
+                    try:
+                        dummy_player_ids = get_dummy_player_ids_from_df(sessions_all, cutoff_dtm=train_end)
+                    except Exception as exc:
+                        logger.warning("get_dummy_player_ids_from_df failed (%s); not filtering dummies", exc)
+                    sessions_all = None
+                else:
+                    sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+                    links_df, dummy_pids = build_canonical_links_and_dummy_from_duckdb(sess_path, train_end)
+                    canonical_map = build_canonical_mapping_from_links(links_df, dummy_pids)
+                    dummy_player_ids = dummy_pids
+                    sessions_all = None  # not used in DuckDB path; clear for peak memory guardrail (R403)
+                _canonical_built = True
+        
+                if _canonical_built:
+                    try:
+                        canonical_map.to_parquet(CANONICAL_MAPPING_PARQUET, index=False)
+                        _cutoff_iso = train_end.isoformat() if hasattr(train_end, "isoformat") else str(train_end)
+                        with open(CANONICAL_MAPPING_CUTOFF_JSON, "w", encoding="utf-8") as _f:
+                            json.dump(
+                                {"cutoff_dtm": _cutoff_iso, "dummy_player_ids": list(dummy_player_ids)},
+                                _f,
+                                indent=0,
+                            )
+                        logger.info("Canonical mapping written to %s", CANONICAL_MAPPING_PARQUET)
+                    except Exception as exc:
+                        logger.warning("Write canonical mapping artifact failed (%s); next run will rebuild", exc)
+                sessions_all = None
+            else:
+                try:
+                    client = get_clickhouse_client()
+                    canonical_map = build_canonical_mapping(client, cutoff_dtm=train_end)
+                    dummy_player_ids = get_dummy_player_ids(client, cutoff_dtm=train_end)
+                except Exception as exc:
+                    logger.warning("ClickHouse canonical mapping failed (%s); using empty map", exc)
+                    canonical_map = pd.DataFrame(columns=["player_id", "canonical_id"])
+                    dummy_player_ids = set()
+                sessions_all = None
+                # PLAN § Canonical mapping 步驟 7：ClickHouse 路徑建完後也寫出，供共用／下次載入
+                if set(canonical_map.columns) >= {"player_id", "canonical_id"} and not canonical_map.empty:
+                    try:
+                        canonical_map.to_parquet(CANONICAL_MAPPING_PARQUET, index=False)
+                        _cutoff_iso = train_end.isoformat() if hasattr(train_end, "isoformat") else str(train_end)
+                        with open(CANONICAL_MAPPING_CUTOFF_JSON, "w", encoding="utf-8") as _f:
+                            json.dump(
+                                {"cutoff_dtm": _cutoff_iso, "dummy_player_ids": list(dummy_player_ids)},
+                                _f,
+                                indent=0,
+                            )
+                        logger.info("Canonical mapping written to %s (from ClickHouse)", CANONICAL_MAPPING_PARQUET)
+                    except Exception as exc:
+                        logger.warning("Write canonical mapping artifact failed (%s); next run will rebuild", exc)
+        
+            _el = time.perf_counter() - t0
+            print("[Step 3/10] Build canonical identity mapping done in %.1fs" % _el, flush=True)
+            logger.info(
+                "Canonical mapping: %d rows; FND-12 dummy player_ids to exclude: %d  (%.1fs)",
+                len(canonical_map), len(dummy_player_ids), _el,
+            )
+        
+            # Rated-patron sampling is an independent option controlled by --sample-rated N.
+            rated_whitelist: Optional[set] = None
+            if sample_rated_n is not None and not canonical_map.empty:
+                _sample = (
+                    canonical_map["canonical_id"]
+                    .astype(str)
+                    .drop_duplicates()
+                    .sort_values()
+                    .head(sample_rated_n)
+                )
+                rated_whitelist = set(_sample.tolist())
+                logger.info(
+                    "--sample-rated: sampled %d / %d rated canonical_ids (deterministic sort+head)",
+                    len(rated_whitelist), canonical_map["canonical_id"].nunique(),
+                )
+        
+            # 3b. Auto-check local player_profile freshness and backfill missing
+            #     ranges before training starts (one-command flow, OOM-safe helper).
+            print("[Step 4/10] Ensure player_profile ready (backfill if needed)…", flush=True)
+            t0 = time.perf_counter()
+            ensure_player_profile_ready(
+                effective_start,
+                effective_end,
                 use_local_parquet=use_local,
-                force_recompute=force,
-                profile_df=profile_df,
-                feature_spec=feature_spec,
-                feature_spec_hash=feature_spec_hash,
-                neg_sample_frac=1.0,
+                canonical_id_whitelist=rated_whitelist,
+                snapshot_interval_days=1,
+                preload_sessions=not no_preload,
+                canonical_map=canonical_map,
+                max_lookback_days=365,
             )
-            if path1 is not None:
-                _path1 = Path(path1) if isinstance(path1, str) else path1
-                if getattr(_path1, "exists", lambda: False)() and _path1.is_file():
-                    size_chunk1 = _path1.stat().st_size
-                    _effective_neg_sample_frac = _oom_check_after_chunk1(
-                        size_chunk1, len(chunks), _effective_neg_sample_frac
+            _el = time.perf_counter() - t0
+            print("[Step 4/10] Ensure player_profile ready done in %.1fs" % _el, flush=True)
+            logger.info("ensure_player_profile_ready: %.1fs", _el)
+        
+            # 3c. Load player_profile once for the entire training window (PLAN Step 4).
+            #     Pass the resulting DataFrame to every process_chunk call so each chunk
+            #     can do the PIT/as-of join without re-querying.  If load fails, profile
+            #     features are 0 for all rows (graceful degradation).
+            # R404 Review #1: empty map → [] so load_player_profile does not load full table (train-serve parity with backtester).
+            _rated_cids: Optional[List[str]] = (
+                list(rated_whitelist)
+                if rated_whitelist
+                else (
+                    canonical_map["canonical_id"].astype(str).tolist()
+                    if not canonical_map.empty
+                    else []
+                )
+            )
+            print("[Step 5/10] Load player_profile for PIT join…", flush=True)
+            t0 = time.perf_counter()
+            profile_df = load_player_profile(
+                effective_start,
+                effective_end,
+                use_local_parquet=use_local,
+                canonical_ids=_rated_cids,
+            )
+            _el = time.perf_counter() - t0
+            if profile_df is not None:
+                print("[Step 5/10] Load player_profile done in %.1fs (%d rows)" % (_el, len(profile_df)), flush=True)
+                logger.info("player_profile: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), _el)
+            else:
+                print("[Step 5/10] Load player_profile done in %.1fs (not available)" % _el, flush=True)
+                logger.info("player_profile: not available — profile features will be NaN (%.1fs)", _el)
+        
+            feature_spec = load_feature_spec(FEATURE_SPEC_PATH)
+            try:
+                feature_spec_hash = hashlib.md5(Path(FEATURE_SPEC_PATH).read_bytes()).hexdigest()[:12]
+            except Exception:
+                feature_spec_hash = "unknown"
+            logger.info(
+                "Track LLM: loaded feature spec from %s (spec_hash=%s)",
+                FEATURE_SPEC_PATH,
+                feature_spec_hash,
+            )
+        
+            # 4. Process chunks -> write parquet
+            # When NEG_SAMPLE_FRAC_AUTO and there are chunks, run chunk 1 with frac=1.0 (OOM probe),
+            # measure size, possibly lower _effective_neg_sample_frac, then process remaining chunks.
+            _neg_sample_note = (
+                f"  neg-sample={_effective_neg_sample_frac:.2f}" if _effective_neg_sample_frac < 1.0 else ""
+            )
+            print(
+                f"[Step 6/10] Process chunks (DQ, labels, Track Human, Track LLM){_neg_sample_note}…",
+                flush=True,
+            )
+            t0 = time.perf_counter()
+            chunk_paths: List[Path] = []
+            _step6_disable_bar = getattr(_cfg, "DISABLE_PROGRESS_BAR", False)
+            pbar = (
+                _ProgressNoop()
+                if _step6_disable_bar
+                else _tqdm_bar(total=len(chunks), desc="Step 6 chunks", unit="chunk")
+            )
+            try:
+                if NEG_SAMPLE_FRAC_AUTO and len(chunks) > 0:
+                    # OOM probe: process chunk 1 with frac=1.0, then decide effective frac.
+                    print("[Step 6/10] OOM probe: chunk 1 with neg_sample_frac=1.0…", flush=True)
+                    logger.info("OOM probe: processing chunk 1 with neg_sample_frac=1.0")
+                    path1 = process_chunk(
+                        chunks[0],
+                        canonical_map,
+                        dummy_player_ids=dummy_player_ids,
+                        use_local_parquet=use_local,
+                        force_recompute=force,
+                        profile_df=profile_df,
+                        feature_spec=feature_spec,
+                        feature_spec_hash=feature_spec_hash,
+                        neg_sample_frac=1.0,
                     )
-                    if _effective_neg_sample_frac < 1.0:
-                        path1_rerun = process_chunk(
-                            chunks[0],
+                    if path1 is not None:
+                        _path1 = Path(path1) if isinstance(path1, str) else path1
+                        if getattr(_path1, "exists", lambda: False)() and _path1.is_file():
+                            size_chunk1 = _path1.stat().st_size
+                            _effective_neg_sample_frac = _oom_check_after_chunk1(
+                                size_chunk1, len(chunks), _effective_neg_sample_frac
+                            )
+                            if _effective_neg_sample_frac < 1.0:
+                                path1_rerun = process_chunk(
+                                    chunks[0],
+                                    canonical_map,
+                                    dummy_player_ids=dummy_player_ids,
+                                    use_local_parquet=use_local,
+                                    force_recompute=force,
+                                    profile_df=profile_df,
+                                    feature_spec=feature_spec,
+                                    feature_spec_hash=feature_spec_hash,
+                                    neg_sample_frac=_effective_neg_sample_frac,
+                                )
+                                if path1_rerun is not None:
+                                    chunk_paths.append(path1_rerun)
+                                    pbar.update(1)
+                                else:
+                                    chunk_paths.append(path1)
+                                    pbar.update(1)
+                            else:
+                                chunk_paths.append(path1)
+                                pbar.update(1)
+                        else:
+                            # Path does not exist (e.g. test mock): skip size-based adjustment
+                            chunk_paths.append(path1)
+                            pbar.update(1)
+                        gc.collect()
+                        for chunk in chunks[1:]:
+                            path = process_chunk(
+                                chunk,
+                                canonical_map,
+                                dummy_player_ids=dummy_player_ids,
+                                use_local_parquet=use_local,
+                                force_recompute=force,
+                                profile_df=profile_df,
+                                feature_spec=feature_spec,
+                                feature_spec_hash=feature_spec_hash,
+                                neg_sample_frac=_effective_neg_sample_frac,
+                            )
+                            if path is not None:
+                                chunk_paths.append(path)
+                                pbar.update(1)
+                            gc.collect()
+                    else:
+                        # Chunk 1 empty: no probe decision, use _effective_neg_sample_frac for all.
+                        for chunk in chunks:
+                            path = process_chunk(
+                                chunk,
+                                canonical_map,
+                                dummy_player_ids=dummy_player_ids,
+                                use_local_parquet=use_local,
+                                force_recompute=force,
+                                profile_df=profile_df,
+                                feature_spec=feature_spec,
+                                feature_spec_hash=feature_spec_hash,
+                                neg_sample_frac=_effective_neg_sample_frac,
+                            )
+                            if path is not None:
+                                chunk_paths.append(path)
+                                pbar.update(1)
+                            gc.collect()
+                else:
+                    for i, chunk in enumerate(chunks):
+                        path = process_chunk(
+                            chunk,
                             canonical_map,
                             dummy_player_ids=dummy_player_ids,
                             use_local_parquet=use_local,
@@ -4720,929 +4791,872 @@ def run_pipeline(args) -> None:
                             feature_spec_hash=feature_spec_hash,
                             neg_sample_frac=_effective_neg_sample_frac,
                         )
-                        if path1_rerun is not None:
-                            chunk_paths.append(path1_rerun)
+                        if path is not None:
+                            chunk_paths.append(path)
                             pbar.update(1)
-                        else:
-                            chunk_paths.append(path1)
-                            pbar.update(1)
-                    else:
-                        chunk_paths.append(path1)
-                        pbar.update(1)
-                else:
-                    # Path does not exist (e.g. test mock): skip size-based adjustment
-                    chunk_paths.append(path1)
-                    pbar.update(1)
-                gc.collect()
-                for chunk in chunks[1:]:
-                    path = process_chunk(
-                        chunk,
-                        canonical_map,
-                        dummy_player_ids=dummy_player_ids,
-                        use_local_parquet=use_local,
-                        force_recompute=force,
-                        profile_df=profile_df,
-                        feature_spec=feature_spec,
-                        feature_spec_hash=feature_spec_hash,
-                        neg_sample_frac=_effective_neg_sample_frac,
-                    )
-                    if path is not None:
-                        chunk_paths.append(path)
-                        pbar.update(1)
-                    gc.collect()
-            else:
-                # Chunk 1 empty: no probe decision, use _effective_neg_sample_frac for all.
-                for chunk in chunks:
-                    path = process_chunk(
-                        chunk,
-                        canonical_map,
-                        dummy_player_ids=dummy_player_ids,
-                        use_local_parquet=use_local,
-                        force_recompute=force,
-                        profile_df=profile_df,
-                        feature_spec=feature_spec,
-                        feature_spec_hash=feature_spec_hash,
-                        neg_sample_frac=_effective_neg_sample_frac,
-                    )
-                    if path is not None:
-                        chunk_paths.append(path)
-                        pbar.update(1)
-                    gc.collect()
-        else:
-            for i, chunk in enumerate(chunks):
-                path = process_chunk(
-                    chunk,
-                    canonical_map,
-                    dummy_player_ids=dummy_player_ids,
-                    use_local_parquet=use_local,
-                    force_recompute=force,
-                    profile_df=profile_df,
-                    feature_spec=feature_spec,
-                    feature_spec_hash=feature_spec_hash,
-                    neg_sample_frac=_effective_neg_sample_frac,
-                )
-                if path is not None:
-                    chunk_paths.append(path)
-                    pbar.update(1)
-                gc.collect()
-    finally:
-        pbar.close()
-
-    _el = time.perf_counter() - t0
-    print("[Step 6/10] Process chunks done in %.1fs (%d chunks)" % (_el, len(chunk_paths)), flush=True)
-    logger.info("Process chunks: %d produced  (%.1fs)", len(chunk_paths), _el)
-    if not chunk_paths:
-        raise SystemExit("No chunks produced any usable data — check data source / time window")
-
-    # --- Step 7 helpers (PLAN Step 7 Out-of-Core: DuckDB sort+split) ---
-    def _get_step7_available_ram_bytes() -> Optional[int]:
-        try:
-            import psutil as _psutil
-            return _psutil.virtual_memory().available
-        except Exception:
-            return None
-
-    def _compute_step7_duckdb_budget(available_bytes: Optional[int]) -> int:
-        """Compute DuckDB memory_limit (bytes) for Step 7 sort+split. DEC-027: uses config helper."""
-        get_limit = getattr(_cfg, "get_duckdb_memory_limit_bytes", None)
-        if get_limit is not None:
-            return get_limit("step7", available_bytes)
-        lo = int(getattr(_cfg, "DUCKDB_MEMORY_LIMIT_MIN_GB", 1.0) * 1024**3)
-        if available_bytes is None:
-            return lo
-        frac = getattr(_cfg, "DUCKDB_RAM_FRACTION", 0.5)
-        hi = int(getattr(_cfg, "DUCKDB_MEMORY_LIMIT_MAX_GB", 24.0) * 1024**3)
-        return max(lo, min(hi, int(available_bytes * frac)))
-
-    def _configure_step7_duckdb_runtime(con: Any, *, budget_bytes: int) -> None:
-        """Set memory_limit, threads, temp_directory, preserve_insertion_order on *con*. DEC-027: from get_duckdb_memory_config('step7')."""
-        get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
-        if get_cfg is not None:
-            _tup = get_cfg("step7")
-            threads = max(1, int(_tup[4]))
-            preserve_order = _tup[5]
-            temp_dir_raw = _tup[6] or str(DATA_DIR / "duckdb_tmp")
-        else:
-            threads = max(1, int(getattr(_cfg, "STEP7_DUCKDB_THREADS", 4)))
-            preserve_order = False
-            temp_dir_raw = getattr(_cfg, "STEP7_DUCKDB_TEMP_DIR", None) or str(DATA_DIR / "duckdb_tmp")
-        if "'" in temp_dir_raw:
-            temp_dir = str(DATA_DIR / "duckdb_tmp")
-            logger.warning("Step 7 DuckDB temp_directory contains single quote; using fallback %s", temp_dir)
-        else:
-            # DEC-027 Review #7: only allow path under DATA_DIR or exactly DATA_DIR/duckdb_tmp
-            try:
-                effective_resolved = Path(temp_dir_raw).resolve()
-                data_dir_resolved = DATA_DIR.resolve()
-                allowed_duckdb_tmp = (DATA_DIR / "duckdb_tmp").resolve()
-                if effective_resolved != allowed_duckdb_tmp:
-                    effective_resolved.relative_to(data_dir_resolved)
-            except (ValueError, OSError):
-                temp_dir = str(DATA_DIR / "duckdb_tmp")
-                logger.warning(
-                    "Step 7 DuckDB temp_directory outside DATA_DIR; using fallback %s",
-                    temp_dir,
-                )
-            else:
-                temp_dir = temp_dir_raw
-        budget_gb = budget_bytes / 1024**3
-        temp_dir_sql = temp_dir.replace("'", "''")
-        for _stmt, _label in [
-            (f"SET memory_limit='{budget_gb:.2f}GB'", "memory_limit"),
-            (f"SET threads={threads}", "threads"),
-            (f"SET temp_directory='{temp_dir_sql}'", "temp_directory"),
-        ]:
-            try:
-                con.execute(_stmt)
-            except Exception as exc:
-                logger.warning("Step 7 DuckDB SET %s failed (non-fatal): %s", _label, exc)
-        if not preserve_order:
-            try:
-                con.execute("SET preserve_insertion_order=false")
-            except Exception as exc:
-                logger.warning("Step 7 DuckDB SET preserve_insertion_order failed (non-fatal): %s", exc)
-        logger.info(
-            "Step 7 DuckDB runtime: memory_limit=%.2fGB  threads=%d  temp_directory=%s",
-            budget_gb, threads, temp_dir,
-        )
-
-    def _is_duckdb_oom(exc: BaseException) -> bool:
-        """Return True if *exc* is DuckDB OOM or MemoryError or 'unable to allocate' message."""
-        try:
-            import duckdb as _duckdb
-            oom_cls = getattr(_duckdb, "OutOfMemoryException", None)
-            if oom_cls is not None and isinstance(exc, oom_cls):
-                return True
-        except ImportError:
-            pass
-        if isinstance(exc, MemoryError):
-            return True
-        msg = str(exc.args[0]) if getattr(exc, "args", None) and exc.args else str(exc)
-        return "unable to allocate" in msg.lower() or "out of memory" in msg.lower()
-
-    def _step7_clean_duckdb_temp_dir() -> None:
-        """Remove Step 7 DuckDB temp directory if it exists (PLAN Step 7: 清理暫存).
-        Only deletes when path is DATA_DIR/duckdb_tmp or under DATA_DIR (R213 Review #1 whitelist).
-        DEC-027: temp_dir from get_duckdb_memory_config('step7').
-        """
-        get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
-        if get_cfg is not None:
-            temp_dir_raw = get_cfg("step7")[6] or str(DATA_DIR / "duckdb_tmp")
-        else:
-            temp_dir_raw = getattr(_cfg, "STEP7_DUCKDB_TEMP_DIR", None) or str(DATA_DIR / "duckdb_tmp")
-        if "'" in temp_dir_raw:
-            effective = DATA_DIR / "duckdb_tmp"
-        else:
-            effective = Path(temp_dir_raw)
-        data_dir_resolved = DATA_DIR.resolve()
-        effective_resolved = effective.resolve()
-        allowed_duckdb_tmp = (DATA_DIR / "duckdb_tmp").resolve()
-        if effective_resolved != allowed_duckdb_tmp:
-            try:
-                effective_resolved.relative_to(data_dir_resolved)
-            except ValueError:
-                logger.warning(
-                    "Step 7: refusing to remove DuckDB temp directory outside DATA_DIR: %s",
-                    effective,
-                )
-                return
-        if effective.exists() and effective.is_dir():
-            try:
-                shutil.rmtree(effective)
-                logger.info("Step 7: cleaned DuckDB temp directory %s", effective)
-            except OSError as _e:
-                logger.warning("Step 7: could not remove DuckDB temp directory %s: %s", effective, _e)
-
-    def _duckdb_sort_and_split(
-        chunk_paths: List[Path],
-        train_frac: float,
-        valid_frac: float,
-    ) -> Tuple[Path, Path, Path]:
-        """Sort chunk Parquets by payout_complete_dtm, canonical_id, bet_id and split into train/valid/test Parquet files.
-        Uses DuckDB out-of-core; returns (train_path, valid_path, test_path).
-        Creates step7_splits and DuckDB temp directory (or fallback DATA_DIR/duckdb_tmp when config path contains single quote).
-        DuckDB may remove its temp directory on close; caller should not assume it exists after return.
-        """
-        if not chunk_paths:
-            raise ValueError("chunk_paths must be non-empty")
-        if not (0 < train_frac and 0 < valid_frac and train_frac + valid_frac < 1.0):
-            raise ValueError(
-                "train_frac and valid_frac must be in (0, 1) and train_frac + valid_frac < 1"
-            )
-        import duckdb
-        path_list = [str(p) for p in chunk_paths]
-        step7_dir = DATA_DIR / "step7_splits" / str(os.getpid())
-        step7_dir.mkdir(parents=True, exist_ok=True)
-        train_path = step7_dir / "split_train.parquet"
-        valid_path = step7_dir / "split_valid.parquet"
-        test_path = step7_dir / "split_test.parquet"
-        get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
-        temp_dir_raw = (get_cfg("step7")[6] if get_cfg else None) or str(DATA_DIR / "duckdb_tmp")
-        if "'" in temp_dir_raw:
-            effective_temp_dir = str(DATA_DIR / "duckdb_tmp")
-        else:
-            # DEC-027 Review #7: only use path under DATA_DIR or exactly DATA_DIR/duckdb_tmp
-            try:
-                effective_resolved = Path(temp_dir_raw).resolve()
-                data_dir_resolved = DATA_DIR.resolve()
-                allowed_duckdb_tmp = (DATA_DIR / "duckdb_tmp").resolve()
-                if effective_resolved != allowed_duckdb_tmp:
-                    effective_resolved.relative_to(data_dir_resolved)
-            except (ValueError, OSError):
-                effective_temp_dir = str(DATA_DIR / "duckdb_tmp")
-                logger.warning(
-                    "Step 7 DuckDB temp_directory outside DATA_DIR; using fallback %s",
-                    effective_temp_dir,
-                )
-            else:
-                effective_temp_dir = temp_dir_raw
-        Path(effective_temp_dir).mkdir(parents=True, exist_ok=True)
-        con = duckdb.connect(":memory:")
-        try:
-            budget = _compute_step7_duckdb_budget(_get_step7_available_ram_bytes())
-            _configure_step7_duckdb_runtime(con, budget_bytes=budget)
-            # Avoid prepared statement with list (Binder Error in some DuckDB builds).
-            paths_escaped = [p.replace("'", "''") for p in path_list]
-            paths_sql = ",".join(f"'{p}'" for p in paths_escaped)
-            con.execute(f"SELECT count(*) AS n FROM read_parquet([{paths_sql}])")
-            _row = con.fetchone()
-            if _row is None:
-                raise ValueError("No rows in chunk Parquets")
-            n_rows = _row[0]
-            if n_rows == 0:
-                raise ValueError("No rows in chunk Parquets")
-            train_end_idx = int(n_rows * train_frac)
-            valid_end_idx = int(n_rows * (train_frac + valid_frac))
-            con.execute(
-                f"CREATE TEMP VIEW sorted_bets AS SELECT *, ROW_NUMBER() OVER (ORDER BY payout_complete_dtm NULLS LAST, canonical_id NULLS LAST, bet_id NULLS LAST) - 1 AS _rn FROM read_parquet([{paths_sql}])"
-            )
-            _tp = str(train_path).replace("'", "''")
-            _vp = str(valid_path).replace("'", "''")
-            _sp = str(test_path).replace("'", "''")
-            try:
-                con.execute(
-                    f"COPY (SELECT * EXCLUDE (_rn) FROM sorted_bets WHERE _rn >= 0 AND _rn < {train_end_idx}) TO '{_tp}' (FORMAT PARQUET)"
-                )
-                con.execute(
-                    f"COPY (SELECT * EXCLUDE (_rn) FROM sorted_bets WHERE _rn >= {train_end_idx} AND _rn < {valid_end_idx}) TO '{_vp}' (FORMAT PARQUET)"
-                )
-                con.execute(
-                    f"COPY (SELECT * EXCLUDE (_rn) FROM sorted_bets WHERE _rn >= {valid_end_idx}) TO '{_sp}' (FORMAT PARQUET)"
-                )
-            except Exception:
-                for p in (train_path, valid_path, test_path):
-                    if p.exists():
-                        p.unlink()
-                raise
-        finally:
-            con.close()
-        return (train_path, valid_path, test_path)
-
-    def _step7_oom_failsafe_next_frac(current_frac: float) -> Tuple[float, bool]:
-        """Compute next NEG_SAMPLE_FRAC after DuckDB OOM (halve); signal whether to retry.
-        Returns (new_frac, should_retry). If already at NEG_SAMPLE_FRAC_MIN, raises
-        with a clear message to reduce --days or add RAM. Orchestrator is responsible
-        for re-running Step 6 with the returned new_frac and retrying _duckdb_sort_and_split.
-        """
-        if not (0.0 < current_frac <= 1.0):
-            raise ValueError(
-                "current_frac must be in (0, 1], got %s" % current_frac
-            )
-        new_frac = max(NEG_SAMPLE_FRAC_MIN, current_frac / 2.0)
-        if new_frac >= current_frac:
-            raise RuntimeError(
-                "Step 7 DuckDB OOM and NEG_SAMPLE_FRAC already at floor (%.2f). "
-                "Reduce training window (--days / --start --end) or add RAM."
-                % NEG_SAMPLE_FRAC_MIN
-            )
-        return (new_frac, True)
-
-    def _read_parquet_head(path: Path, n: int) -> pd.DataFrame:
-        """Read first n rows from a Parquet file without loading full file (PLAN B+ Step 8 sample)."""
-        if n <= 0:
-            return pd.DataFrame()
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        pf = pq.ParquetFile(path)
-        batches: List[Any] = []
-        total = 0
-        for batch in pf.iter_batches(batch_size=min(n, 100_000)):
-            batches.append(batch)
-            total += len(batch)
-            if total >= n:
-                break
-        if not batches:
-            return pd.DataFrame()
-        table = pa.Table.from_batches(batches)
-        return table.slice(0, n).to_pandas()
-
-    def _step7_metadata_from_paths(
-        _train_path: Path, _valid_path: Path, _test_path: Path
-    ) -> Tuple[int, int, int, int, Optional[Any]]:
-        """(n_train, n_valid, n_test, label1_total, train_end_max) via DuckDB (PLAN B+)."""
-        import duckdb
-        con = duckdb.connect(":memory:")
-        try:
-            def _q_count(p: Path) -> int:
-                s = str(p).replace("'", "''")
-                r = con.execute(f"SELECT count(*) FROM read_parquet('{s}')").fetchone()
-                return int(r[0]) if r else 0
-
-            def _q_label_sum(p: Path) -> int:
-                s = str(p).replace("'", "''")
-                r = con.execute(
-                    f"SELECT coalesce(sum(cast(label AS INTEGER)), 0) FROM read_parquet('{s}')"
-                ).fetchone()
-                return int(r[0]) if r else 0
-
-            def _q_max_dtm(p: Path) -> Optional[Any]:
-                s = str(p).replace("'", "''")
-                r = con.execute(
-                    f"SELECT max(payout_complete_dtm) FROM read_parquet('{s}')"
-                ).fetchone()
-                if r is None or r[0] is None:
+                        gc.collect()
+            finally:
+                pbar.close()
+        
+            _el = time.perf_counter() - t0
+            print("[Step 6/10] Process chunks done in %.1fs (%d chunks)" % (_el, len(chunk_paths)), flush=True)
+            logger.info("Process chunks: %d produced  (%.1fs)", len(chunk_paths), _el)
+            if not chunk_paths:
+                raise SystemExit("No chunks produced any usable data — check data source / time window")
+        
+            # --- Step 7 helpers (PLAN Step 7 Out-of-Core: DuckDB sort+split) ---
+            def _get_step7_available_ram_bytes() -> Optional[int]:
+                try:
+                    import psutil as _psutil
+                    return _psutil.virtual_memory().available
+                except Exception:
                     return None
-                return pd.Timestamp(r[0])
-
-            n_train = _q_count(_train_path)
-            n_valid = _q_count(_valid_path)
-            n_test = _q_count(_test_path)
-            label1_total = _q_label_sum(_train_path) + _q_label_sum(_valid_path) + _q_label_sum(_test_path)
-            train_end_max = _q_max_dtm(_train_path)
-            return (n_train, n_valid, n_test, label1_total, train_end_max)
-        finally:
-            con.close()
-
-    def _step7_pandas_fallback(
-        chunk_paths: List[Path],
-        train_frac: float,
-        valid_frac: float,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[Path], Optional[Path], Optional[Path]]:
-        """Pandas in-memory concat + sort + row-level split (Layer 3 fallback).
-        Returns (train_df, valid_df, test_df, None, None, None). Caller remains responsible for
-        R700 log and MIN_VALID_TEST_ROWS warnings.
-        Chunk Parquets must contain column payout_complete_dtm.
-        """
-        if not chunk_paths:
-            raise ValueError("chunk_paths must be non-empty")
-        if not (
-            0 < train_frac and 0 < valid_frac and train_frac + valid_frac < 1.0
-        ):
-            raise ValueError(
-                "train_frac and valid_frac must be in (0, 1) and "
-                "train_frac + valid_frac < 1.0"
-            )
-        all_dfs = [pd.read_parquet(p) for p in chunk_paths]
-        full_df = pd.concat(all_dfs, ignore_index=True)
-        if "payout_complete_dtm" not in full_df.columns:
-            raise ValueError(
-                "chunk Parquets must contain column payout_complete_dtm"
-            )
-        _payout_ts = pd.to_datetime(full_df["payout_complete_dtm"])
-        if _payout_ts.dt.tz is not None:
-            _payout_ts = _payout_ts.dt.tz_localize(None)
-        _sort_cols = ["_sort_ts_tmp"] + [
-            c for c in ("canonical_id", "bet_id") if c in full_df.columns
-        ]
-        full_df["_sort_ts_tmp"] = _payout_ts
-        full_df.sort_values(_sort_cols, kind="stable", na_position="last", inplace=True)
-        full_df.drop(columns=["_sort_ts_tmp"], inplace=True)
-        full_df.reset_index(drop=True, inplace=True)
-        n_rows = len(full_df)
-        if n_rows == 0:
-            raise ValueError("chunk_paths produced no rows")
-        _train_end_idx = int(n_rows * train_frac)
-        _valid_end_idx = int(n_rows * (train_frac + valid_frac))
-        _row_pos = np.arange(n_rows)
-        full_df["_split"] = np.select(
-            [_row_pos < _train_end_idx, _row_pos < _valid_end_idx],
-            ["train", "valid"],
-            default="test",
-        )
-        _split_col = full_df["_split"]
-        train_df = full_df[_split_col == "train"].reset_index(drop=True)
-        valid_df = full_df[_split_col == "valid"].reset_index(drop=True)
-        test_df = full_df[~(_split_col.isin(("train", "valid")))].reset_index(drop=True)
-        del full_df, _split_col
-        return (train_df, valid_df, test_df, None, None, None)
-
-    def _step7_sort_and_split(
-        chunk_paths: List[Path],
-        train_frac: float,
-        valid_frac: float,
-        *,
-        step6_runner: Optional[Callable[[float], List[Path]]] = None,
-        current_neg_frac: Optional[float] = None,
-    ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[Path], Optional[Path], Optional[Path]]:
-        """Orchestrator: DuckDB sort+split (Layer 1), OOM retry (Layer 2), or pandas fallback (Layer 3).
-        Returns (train_df, valid_df, test_df, train_path, valid_path, test_path). When STEP7_KEEP_TRAIN_ON_DISK
-        and DuckDB succeed, train_df is None and paths are set (train not loaded). When STEP9_EXPORT_LIBSVM too,
-        valid_df and test_df are not loaded (PLAN B+ 階段 6 第 2 步). Otherwise paths are None.
-        When STEP7_KEEP_TRAIN_ON_DISK and DuckDB fails, raises (no pandas fallback) per PLAN B+.
-        If DuckDB returns but read_parquet of the split files fails, falls back to pandas using chunk_paths.
-        """
-        if not STEP7_USE_DUCKDB:
-            if STEP7_KEEP_TRAIN_ON_DISK:
-                raise ValueError(
-                    "STEP7_KEEP_TRAIN_ON_DISK=True requires STEP7_USE_DUCKDB=True. "
-                    "Either set STEP7_USE_DUCKDB=True or set STEP7_KEEP_TRAIN_ON_DISK=False."
+        
+            def _compute_step7_duckdb_budget(available_bytes: Optional[int]) -> int:
+                """Compute DuckDB memory_limit (bytes) for Step 7 sort+split. DEC-027: uses config helper."""
+                get_limit = getattr(_cfg, "get_duckdb_memory_limit_bytes", None)
+                if get_limit is not None:
+                    return get_limit("step7", available_bytes)
+                lo = int(getattr(_cfg, "DUCKDB_MEMORY_LIMIT_MIN_GB", 1.0) * 1024**3)
+                if available_bytes is None:
+                    return lo
+                frac = getattr(_cfg, "DUCKDB_RAM_FRACTION", 0.5)
+                hi = int(getattr(_cfg, "DUCKDB_MEMORY_LIMIT_MAX_GB", 24.0) * 1024**3)
+                return max(lo, min(hi, int(available_bytes * frac)))
+        
+            def _configure_step7_duckdb_runtime(con: Any, *, budget_bytes: int) -> None:
+                """Set memory_limit, threads, temp_directory, preserve_insertion_order on *con*. DEC-027: from get_duckdb_memory_config('step7')."""
+                get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
+                if get_cfg is not None:
+                    _tup = get_cfg("step7")
+                    threads = max(1, int(_tup[4]))
+                    preserve_order = _tup[5]
+                    temp_dir_raw = _tup[6] or str(DATA_DIR / "duckdb_tmp")
+                else:
+                    threads = max(1, int(getattr(_cfg, "STEP7_DUCKDB_THREADS", 4)))
+                    preserve_order = False
+                    temp_dir_raw = getattr(_cfg, "STEP7_DUCKDB_TEMP_DIR", None) or str(DATA_DIR / "duckdb_tmp")
+                if "'" in temp_dir_raw:
+                    temp_dir = str(DATA_DIR / "duckdb_tmp")
+                    logger.warning("Step 7 DuckDB temp_directory contains single quote; using fallback %s", temp_dir)
+                else:
+                    # DEC-027 Review #7: only allow path under DATA_DIR or exactly DATA_DIR/duckdb_tmp
+                    try:
+                        effective_resolved = Path(temp_dir_raw).resolve()
+                        data_dir_resolved = DATA_DIR.resolve()
+                        allowed_duckdb_tmp = (DATA_DIR / "duckdb_tmp").resolve()
+                        if effective_resolved != allowed_duckdb_tmp:
+                            effective_resolved.relative_to(data_dir_resolved)
+                    except (ValueError, OSError):
+                        temp_dir = str(DATA_DIR / "duckdb_tmp")
+                        logger.warning(
+                            "Step 7 DuckDB temp_directory outside DATA_DIR; using fallback %s",
+                            temp_dir,
+                        )
+                    else:
+                        temp_dir = temp_dir_raw
+                budget_gb = budget_bytes / 1024**3
+                temp_dir_sql = temp_dir.replace("'", "''")
+                for _stmt, _label in [
+                    (f"SET memory_limit='{budget_gb:.2f}GB'", "memory_limit"),
+                    (f"SET threads={threads}", "threads"),
+                    (f"SET temp_directory='{temp_dir_sql}'", "temp_directory"),
+                ]:
+                    try:
+                        con.execute(_stmt)
+                    except Exception as exc:
+                        logger.warning("Step 7 DuckDB SET %s failed (non-fatal): %s", _label, exc)
+                if not preserve_order:
+                    try:
+                        con.execute("SET preserve_insertion_order=false")
+                    except Exception as exc:
+                        logger.warning("Step 7 DuckDB SET preserve_insertion_order failed (non-fatal): %s", exc)
+                logger.info(
+                    "Step 7 DuckDB runtime: memory_limit=%.2fGB  threads=%d  temp_directory=%s",
+                    budget_gb, threads, temp_dir,
                 )
-            logger.warning(
-                "STEP7_USE_DUCKDB=False: using pandas fallback for Step 7 (high OOM risk). "
-                "Prefer STEP7_USE_DUCKDB=True or reduce --days / NEG_SAMPLE_FRAC. See doc/training_oom_and_runtime_audit.md A19."
-            )
-            return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
-        try:
-            train_path, valid_path, test_path = _duckdb_sort_and_split(
-                chunk_paths, train_frac, valid_frac
-            )
-            if STEP7_KEEP_TRAIN_ON_DISK:
-                if STEP9_EXPORT_LIBSVM:
+        
+            def _is_duckdb_oom(exc: BaseException) -> bool:
+                """Return True if *exc* is DuckDB OOM or MemoryError or 'unable to allocate' message."""
+                try:
+                    import duckdb as _duckdb
+                    oom_cls = getattr(_duckdb, "OutOfMemoryException", None)
+                    if oom_cls is not None and isinstance(exc, oom_cls):
+                        return True
+                except ImportError:
+                    pass
+                if isinstance(exc, MemoryError):
+                    return True
+                msg = str(exc.args[0]) if getattr(exc, "args", None) and exc.args else str(exc)
+                return "unable to allocate" in msg.lower() or "out of memory" in msg.lower()
+        
+            def _step7_clean_duckdb_temp_dir() -> None:
+                """Remove Step 7 DuckDB temp directory if it exists (PLAN Step 7: 清理暫存).
+                Only deletes when path is DATA_DIR/duckdb_tmp or under DATA_DIR (R213 Review #1 whitelist).
+                DEC-027: temp_dir from get_duckdb_memory_config('step7').
+                """
+                get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
+                if get_cfg is not None:
+                    temp_dir_raw = get_cfg("step7")[6] or str(DATA_DIR / "duckdb_tmp")
+                else:
+                    temp_dir_raw = getattr(_cfg, "STEP7_DUCKDB_TEMP_DIR", None) or str(DATA_DIR / "duckdb_tmp")
+                if "'" in temp_dir_raw:
+                    effective = DATA_DIR / "duckdb_tmp"
+                else:
+                    effective = Path(temp_dir_raw)
+                data_dir_resolved = DATA_DIR.resolve()
+                effective_resolved = effective.resolve()
+                allowed_duckdb_tmp = (DATA_DIR / "duckdb_tmp").resolve()
+                if effective_resolved != allowed_duckdb_tmp:
+                    try:
+                        effective_resolved.relative_to(data_dir_resolved)
+                    except ValueError:
+                        logger.warning(
+                            "Step 7: refusing to remove DuckDB temp directory outside DATA_DIR: %s",
+                            effective,
+                        )
+                        return
+                if effective.exists() and effective.is_dir():
+                    try:
+                        shutil.rmtree(effective)
+                        logger.info("Step 7: cleaned DuckDB temp directory %s", effective)
+                    except OSError as _e:
+                        logger.warning("Step 7: could not remove DuckDB temp directory %s: %s", effective, _e)
+        
+            def _duckdb_sort_and_split(
+                chunk_paths: List[Path],
+                train_frac: float,
+                valid_frac: float,
+            ) -> Tuple[Path, Path, Path]:
+                """Sort chunk Parquets by payout_complete_dtm, canonical_id, bet_id and split into train/valid/test Parquet files.
+                Uses DuckDB out-of-core; returns (train_path, valid_path, test_path).
+                Creates step7_splits and DuckDB temp directory (or fallback DATA_DIR/duckdb_tmp when config path contains single quote).
+                DuckDB may remove its temp directory on close; caller should not assume it exists after return.
+                """
+                if not chunk_paths:
+                    raise ValueError("chunk_paths must be non-empty")
+                if not (0 < train_frac and 0 < valid_frac and train_frac + valid_frac < 1.0):
+                    raise ValueError(
+                        "train_frac and valid_frac must be in (0, 1) and train_frac + valid_frac < 1"
+                    )
+                import duckdb
+                path_list = [str(p) for p in chunk_paths]
+                step7_dir = DATA_DIR / "step7_splits" / str(os.getpid())
+                step7_dir.mkdir(parents=True, exist_ok=True)
+                train_path = step7_dir / "split_train.parquet"
+                valid_path = step7_dir / "split_valid.parquet"
+                test_path = step7_dir / "split_test.parquet"
+                get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
+                temp_dir_raw = (get_cfg("step7")[6] if get_cfg else None) or str(DATA_DIR / "duckdb_tmp")
+                if "'" in temp_dir_raw:
+                    effective_temp_dir = str(DATA_DIR / "duckdb_tmp")
+                else:
+                    # DEC-027 Review #7: only use path under DATA_DIR or exactly DATA_DIR/duckdb_tmp
+                    try:
+                        effective_resolved = Path(temp_dir_raw).resolve()
+                        data_dir_resolved = DATA_DIR.resolve()
+                        allowed_duckdb_tmp = (DATA_DIR / "duckdb_tmp").resolve()
+                        if effective_resolved != allowed_duckdb_tmp:
+                            effective_resolved.relative_to(data_dir_resolved)
+                    except (ValueError, OSError):
+                        effective_temp_dir = str(DATA_DIR / "duckdb_tmp")
+                        logger.warning(
+                            "Step 7 DuckDB temp_directory outside DATA_DIR; using fallback %s",
+                            effective_temp_dir,
+                        )
+                    else:
+                        effective_temp_dir = temp_dir_raw
+                Path(effective_temp_dir).mkdir(parents=True, exist_ok=True)
+                con = duckdb.connect(":memory:")
+                try:
+                    budget = _compute_step7_duckdb_budget(_get_step7_available_ram_bytes())
+                    _configure_step7_duckdb_runtime(con, budget_bytes=budget)
+                    # Avoid prepared statement with list (Binder Error in some DuckDB builds).
+                    paths_escaped = [p.replace("'", "''") for p in path_list]
+                    paths_sql = ",".join(f"'{p}'" for p in paths_escaped)
+                    con.execute(f"SELECT count(*) AS n FROM read_parquet([{paths_sql}])")
+                    _row = con.fetchone()
+                    if _row is None:
+                        raise ValueError("No rows in chunk Parquets")
+                    n_rows = _row[0]
+                    if n_rows == 0:
+                        raise ValueError("No rows in chunk Parquets")
+                    train_end_idx = int(n_rows * train_frac)
+                    valid_end_idx = int(n_rows * (train_frac + valid_frac))
+                    con.execute(
+                        f"CREATE TEMP VIEW sorted_bets AS SELECT *, ROW_NUMBER() OVER (ORDER BY payout_complete_dtm NULLS LAST, canonical_id NULLS LAST, bet_id NULLS LAST) - 1 AS _rn FROM read_parquet([{paths_sql}])"
+                    )
+                    _tp = str(train_path).replace("'", "''")
+                    _vp = str(valid_path).replace("'", "''")
+                    _sp = str(test_path).replace("'", "''")
+                    try:
+                        con.execute(
+                            f"COPY (SELECT * EXCLUDE (_rn) FROM sorted_bets WHERE _rn >= 0 AND _rn < {train_end_idx}) TO '{_tp}' (FORMAT PARQUET)"
+                        )
+                        con.execute(
+                            f"COPY (SELECT * EXCLUDE (_rn) FROM sorted_bets WHERE _rn >= {train_end_idx} AND _rn < {valid_end_idx}) TO '{_vp}' (FORMAT PARQUET)"
+                        )
+                        con.execute(
+                            f"COPY (SELECT * EXCLUDE (_rn) FROM sorted_bets WHERE _rn >= {valid_end_idx}) TO '{_sp}' (FORMAT PARQUET)"
+                        )
+                    except Exception:
+                        for p in (train_path, valid_path, test_path):
+                            if p.exists():
+                                p.unlink()
+                        raise
+                finally:
+                    con.close()
+                return (train_path, valid_path, test_path)
+        
+            def _step7_oom_failsafe_next_frac(current_frac: float) -> Tuple[float, bool]:
+                """Compute next NEG_SAMPLE_FRAC after DuckDB OOM (halve); signal whether to retry.
+                Returns (new_frac, should_retry). If already at NEG_SAMPLE_FRAC_MIN, raises
+                with a clear message to reduce --days or add RAM. Orchestrator is responsible
+                for re-running Step 6 with the returned new_frac and retrying _duckdb_sort_and_split.
+                """
+                if not (0.0 < current_frac <= 1.0):
+                    raise ValueError(
+                        "current_frac must be in (0, 1], got %s" % current_frac
+                    )
+                new_frac = max(NEG_SAMPLE_FRAC_MIN, current_frac / 2.0)
+                if new_frac >= current_frac:
+                    raise RuntimeError(
+                        "Step 7 DuckDB OOM and NEG_SAMPLE_FRAC already at floor (%.2f). "
+                        "Reduce training window (--days / --start --end) or add RAM."
+                        % NEG_SAMPLE_FRAC_MIN
+                    )
+                return (new_frac, True)
+        
+            def _read_parquet_head(path: Path, n: int) -> pd.DataFrame:
+                """Read first n rows from a Parquet file without loading full file (PLAN B+ Step 8 sample)."""
+                if n <= 0:
+                    return pd.DataFrame()
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+                pf = pq.ParquetFile(path)
+                batches: List[Any] = []
+                total = 0
+                for batch in pf.iter_batches(batch_size=min(n, 100_000)):
+                    batches.append(batch)
+                    total += len(batch)
+                    if total >= n:
+                        break
+                if not batches:
+                    return pd.DataFrame()
+                table = pa.Table.from_batches(batches)
+                return table.slice(0, n).to_pandas()
+        
+            def _step7_metadata_from_paths(
+                _train_path: Path, _valid_path: Path, _test_path: Path
+            ) -> Tuple[int, int, int, int, Optional[Any]]:
+                """(n_train, n_valid, n_test, label1_total, train_end_max) via DuckDB (PLAN B+)."""
+                import duckdb
+                con = duckdb.connect(":memory:")
+                try:
+                    def _q_count(p: Path) -> int:
+                        s = str(p).replace("'", "''")
+                        r = con.execute(f"SELECT count(*) FROM read_parquet('{s}')").fetchone()
+                        return int(r[0]) if r else 0
+        
+                    def _q_label_sum(p: Path) -> int:
+                        s = str(p).replace("'", "''")
+                        r = con.execute(
+                            f"SELECT coalesce(sum(cast(label AS INTEGER)), 0) FROM read_parquet('{s}')"
+                        ).fetchone()
+                        return int(r[0]) if r else 0
+        
+                    def _q_max_dtm(p: Path) -> Optional[Any]:
+                        s = str(p).replace("'", "''")
+                        r = con.execute(
+                            f"SELECT max(payout_complete_dtm) FROM read_parquet('{s}')"
+                        ).fetchone()
+                        if r is None or r[0] is None:
+                            return None
+                        return pd.Timestamp(r[0])
+        
+                    n_train = _q_count(_train_path)
+                    n_valid = _q_count(_valid_path)
+                    n_test = _q_count(_test_path)
+                    label1_total = _q_label_sum(_train_path) + _q_label_sum(_valid_path) + _q_label_sum(_test_path)
+                    train_end_max = _q_max_dtm(_train_path)
+                    return (n_train, n_valid, n_test, label1_total, train_end_max)
+                finally:
+                    con.close()
+        
+            def _step7_pandas_fallback(
+                chunk_paths: List[Path],
+                train_frac: float,
+                valid_frac: float,
+            ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[Path], Optional[Path], Optional[Path]]:
+                """Pandas in-memory concat + sort + row-level split (Layer 3 fallback).
+                Returns (train_df, valid_df, test_df, None, None, None). Caller remains responsible for
+                R700 log and MIN_VALID_TEST_ROWS warnings.
+                Chunk Parquets must contain column payout_complete_dtm.
+                """
+                if not chunk_paths:
+                    raise ValueError("chunk_paths must be non-empty")
+                if not (
+                    0 < train_frac and 0 < valid_frac and train_frac + valid_frac < 1.0
+                ):
+                    raise ValueError(
+                        "train_frac and valid_frac must be in (0, 1) and "
+                        "train_frac + valid_frac < 1.0"
+                    )
+                all_dfs = [pd.read_parquet(p) for p in chunk_paths]
+                full_df = pd.concat(all_dfs, ignore_index=True)
+                if "payout_complete_dtm" not in full_df.columns:
+                    raise ValueError(
+                        "chunk Parquets must contain column payout_complete_dtm"
+                    )
+                _payout_ts = pd.to_datetime(full_df["payout_complete_dtm"])
+                if _payout_ts.dt.tz is not None:
+                    _payout_ts = _payout_ts.dt.tz_localize(None)
+                _sort_cols = ["_sort_ts_tmp"] + [
+                    c for c in ("canonical_id", "bet_id") if c in full_df.columns
+                ]
+                full_df["_sort_ts_tmp"] = _payout_ts
+                full_df.sort_values(_sort_cols, kind="stable", na_position="last", inplace=True)
+                full_df.drop(columns=["_sort_ts_tmp"], inplace=True)
+                full_df.reset_index(drop=True, inplace=True)
+                n_rows = len(full_df)
+                if n_rows == 0:
+                    raise ValueError("chunk_paths produced no rows")
+                _train_end_idx = int(n_rows * train_frac)
+                _valid_end_idx = int(n_rows * (train_frac + valid_frac))
+                _row_pos = np.arange(n_rows)
+                full_df["_split"] = np.select(
+                    [_row_pos < _train_end_idx, _row_pos < _valid_end_idx],
+                    ["train", "valid"],
+                    default="test",
+                )
+                _split_col = full_df["_split"]
+                train_df = full_df[_split_col == "train"].reset_index(drop=True)
+                valid_df = full_df[_split_col == "valid"].reset_index(drop=True)
+                test_df = full_df[~(_split_col.isin(("train", "valid")))].reset_index(drop=True)
+                del full_df, _split_col
+                return (train_df, valid_df, test_df, None, None, None)
+        
+            def _step7_sort_and_split(
+                chunk_paths: List[Path],
+                train_frac: float,
+                valid_frac: float,
+                *,
+                step6_runner: Optional[Callable[[float], List[Path]]] = None,
+                current_neg_frac: Optional[float] = None,
+            ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[Path], Optional[Path], Optional[Path]]:
+                """Orchestrator: DuckDB sort+split (Layer 1), OOM retry (Layer 2), or pandas fallback (Layer 3).
+                Returns (train_df, valid_df, test_df, train_path, valid_path, test_path). When STEP7_KEEP_TRAIN_ON_DISK
+                and DuckDB succeed, train_df is None and paths are set (train not loaded). When STEP9_EXPORT_LIBSVM too,
+                valid_df and test_df are not loaded (PLAN B+ 階段 6 第 2 步). Otherwise paths are None.
+                When STEP7_KEEP_TRAIN_ON_DISK and DuckDB fails, raises (no pandas fallback) per PLAN B+.
+                If DuckDB returns but read_parquet of the split files fails, falls back to pandas using chunk_paths.
+                """
+                if not STEP7_USE_DUCKDB:
+                    if STEP7_KEEP_TRAIN_ON_DISK:
+                        raise ValueError(
+                            "STEP7_KEEP_TRAIN_ON_DISK=True requires STEP7_USE_DUCKDB=True. "
+                            "Either set STEP7_USE_DUCKDB=True or set STEP7_KEEP_TRAIN_ON_DISK=False."
+                        )
+                    logger.warning(
+                        "STEP7_USE_DUCKDB=False: using pandas fallback for Step 7 (high OOM risk). "
+                        "Prefer STEP7_USE_DUCKDB=True or reduce --days / NEG_SAMPLE_FRAC. See doc/training_oom_and_runtime_audit.md A19."
+                    )
+                    return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
+                try:
+                    train_path, valid_path, test_path = _duckdb_sort_and_split(
+                        chunk_paths, train_frac, valid_frac
+                    )
+                    if STEP7_KEEP_TRAIN_ON_DISK:
+                        if STEP9_EXPORT_LIBSVM:
+                            _step7_clean_duckdb_temp_dir()
+                            return (None, None, None, train_path, valid_path, test_path)
+                        valid_df = pd.read_parquet(valid_path)
+                        test_df = pd.read_parquet(test_path)
+                        _step7_clean_duckdb_temp_dir()
+                        return (None, valid_df, test_df, train_path, valid_path, test_path)
+                    train_df = pd.read_parquet(train_path)
+                    valid_df = pd.read_parquet(valid_path)
+                    test_df = pd.read_parquet(test_path)
+                    for p in (train_path, valid_path, test_path):
+                        if p.exists():
+                            p.unlink(missing_ok=True)
                     _step7_clean_duckdb_temp_dir()
-                    return (None, None, None, train_path, valid_path, test_path)
-                valid_df = pd.read_parquet(valid_path)
-                test_df = pd.read_parquet(test_path)
-                _step7_clean_duckdb_temp_dir()
-                return (None, valid_df, test_df, train_path, valid_path, test_path)
-            train_df = pd.read_parquet(train_path)
-            valid_df = pd.read_parquet(valid_path)
-            test_df = pd.read_parquet(test_path)
-            for p in (train_path, valid_path, test_path):
-                if p.exists():
-                    p.unlink(missing_ok=True)
-            _step7_clean_duckdb_temp_dir()
-            return (train_df, valid_df, test_df, None, None, None)
-        except Exception as exc:
-            if (
-                _is_duckdb_oom(exc)
-                and step6_runner is not None
-                and current_neg_frac is not None
-            ):
-                current = current_neg_frac
-                if not (0.0 < current_neg_frac <= 1.0):
+                    return (train_df, valid_df, test_df, None, None, None)
+                except Exception as exc:
+                    if (
+                        _is_duckdb_oom(exc)
+                        and step6_runner is not None
+                        and current_neg_frac is not None
+                    ):
+                        current = current_neg_frac
+                        if not (0.0 < current_neg_frac <= 1.0):
+                            if STEP7_KEEP_TRAIN_ON_DISK:
+                                raise RuntimeError(
+                                    "Step 7 STEP7_KEEP_TRAIN_ON_DISK is True and DuckDB failed; "
+                                    "no pandas fallback. Reduce --days or add RAM."
+                                )
+                            logger.warning(
+                                "Step 7 Layer 2 skipped: current_neg_frac=%.2f not in (0, 1]; falling back to pandas.",
+                                current_neg_frac,
+                            )
+                            return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
+                        new_frac = None
+                        retries_left = 3
+                        while True:
+                            step6_completed = False
+                            train_path: Optional[Path] = None  # type: ignore[no-redef]
+                            valid_path: Optional[Path] = None  # type: ignore[no-redef]
+                            test_path: Optional[Path] = None  # type: ignore[no-redef]
+                            try:
+                                new_frac, _ = _step7_oom_failsafe_next_frac(current)
+                                chunk_paths = step6_runner(new_frac)
+                                if not chunk_paths:
+                                    raise ValueError("step6_runner returned no chunk paths")
+                                step6_completed = True
+                                train_path, valid_path, test_path = _duckdb_sort_and_split(
+                                    chunk_paths, train_frac, valid_frac
+                                )
+                                if STEP7_KEEP_TRAIN_ON_DISK:
+                                    if STEP9_EXPORT_LIBSVM:
+                                        _step7_clean_duckdb_temp_dir()
+                                        return (None, None, None, train_path, valid_path, test_path)
+                                    valid_df = pd.read_parquet(valid_path)
+                                    test_df = pd.read_parquet(test_path)
+                                    _step7_clean_duckdb_temp_dir()
+                                    return (None, valid_df, test_df, train_path, valid_path, test_path)
+                                train_df = pd.read_parquet(train_path)
+                                valid_df = pd.read_parquet(valid_path)
+                                test_df = pd.read_parquet(test_path)
+                                for p in (train_path, valid_path, test_path):
+                                    if p is not None and p.exists():
+                                        p.unlink(missing_ok=True)
+                                _step7_clean_duckdb_temp_dir()
+                                return (train_df, valid_df, test_df, None, None, None)
+                            except RuntimeError:
+                                raise
+                            except Exception as retry_exc:
+                                for p in (train_path, valid_path, test_path):
+                                    if p is not None and p.exists():
+                                        p.unlink(missing_ok=True)
+                                if (
+                                    _is_duckdb_oom(retry_exc)
+                                    and new_frac is not None
+                                    and step6_completed
+                                    and retries_left > 0
+                                ):
+                                    logger.warning(
+                                        "Step 7 DuckDB OOM retry with NEG_SAMPLE_FRAC=%.4f; re-ran Step 6.",
+                                        new_frac,
+                                    )
+                                    current = new_frac
+                                    retries_left -= 1
+                                    continue
+                                if STEP7_KEEP_TRAIN_ON_DISK:
+                                    raise RuntimeError(
+                                        "Step 7 STEP7_KEEP_TRAIN_ON_DISK: DuckDB failed after retries; "
+                                        "no pandas fallback. Reduce --days or add RAM."
+                                    ) from retry_exc
+                                logger.warning(
+                                    "Step 7 DuckDB failed (non-OOM) on retry; falling back to pandas: %s",
+                                    retry_exc,
+                                )
+                                return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
                     if STEP7_KEEP_TRAIN_ON_DISK:
                         raise RuntimeError(
                             "Step 7 STEP7_KEEP_TRAIN_ON_DISK is True and DuckDB failed; "
                             "no pandas fallback. Reduce --days or add RAM."
-                        )
-                    logger.warning(
-                        "Step 7 Layer 2 skipped: current_neg_frac=%.2f not in (0, 1]; falling back to pandas.",
-                        current_neg_frac,
-                    )
-                    return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
-                new_frac = None
-                retries_left = 3
-                while True:
-                    step6_completed = False
-                    train_path: Optional[Path] = None  # type: ignore[no-redef]
-                    valid_path: Optional[Path] = None  # type: ignore[no-redef]
-                    test_path: Optional[Path] = None  # type: ignore[no-redef]
-                    try:
-                        new_frac, _ = _step7_oom_failsafe_next_frac(current)
-                        chunk_paths = step6_runner(new_frac)
-                        if not chunk_paths:
-                            raise ValueError("step6_runner returned no chunk paths")
-                        step6_completed = True
-                        train_path, valid_path, test_path = _duckdb_sort_and_split(
-                            chunk_paths, train_frac, valid_frac
-                        )
-                        if STEP7_KEEP_TRAIN_ON_DISK:
-                            if STEP9_EXPORT_LIBSVM:
-                                _step7_clean_duckdb_temp_dir()
-                                return (None, None, None, train_path, valid_path, test_path)
-                            valid_df = pd.read_parquet(valid_path)
-                            test_df = pd.read_parquet(test_path)
-                            _step7_clean_duckdb_temp_dir()
-                            return (None, valid_df, test_df, train_path, valid_path, test_path)
-                        train_df = pd.read_parquet(train_path)
-                        valid_df = pd.read_parquet(valid_path)
-                        test_df = pd.read_parquet(test_path)
-                        for p in (train_path, valid_path, test_path):
-                            if p is not None and p.exists():
-                                p.unlink(missing_ok=True)
-                        _step7_clean_duckdb_temp_dir()
-                        return (train_df, valid_df, test_df, None, None, None)
-                    except RuntimeError:
-                        raise
-                    except Exception as retry_exc:
-                        for p in (train_path, valid_path, test_path):
-                            if p is not None and p.exists():
-                                p.unlink(missing_ok=True)
-                        if (
-                            _is_duckdb_oom(retry_exc)
-                            and new_frac is not None
-                            and step6_completed
-                            and retries_left > 0
-                        ):
-                            logger.warning(
-                                "Step 7 DuckDB OOM retry with NEG_SAMPLE_FRAC=%.4f; re-ran Step 6.",
-                                new_frac,
-                            )
-                            current = new_frac
-                            retries_left -= 1
-                            continue
-                        if STEP7_KEEP_TRAIN_ON_DISK:
-                            raise RuntimeError(
-                                "Step 7 STEP7_KEEP_TRAIN_ON_DISK: DuckDB failed after retries; "
-                                "no pandas fallback. Reduce --days or add RAM."
-                            ) from retry_exc
+                        ) from exc
+                    if _is_duckdb_oom(exc):
                         logger.warning(
-                            "Step 7 DuckDB failed (non-OOM) on retry; falling back to pandas: %s",
-                            retry_exc,
+                            "Step 7 DuckDB OOM; falling back to pandas in-memory sort+split: %s",
+                            exc,
                         )
-                        return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
-            if STEP7_KEEP_TRAIN_ON_DISK:
-                raise RuntimeError(
-                    "Step 7 STEP7_KEEP_TRAIN_ON_DISK is True and DuckDB failed; "
-                    "no pandas fallback. Reduce --days or add RAM."
-                ) from exc
-            if _is_duckdb_oom(exc):
+                    else:
+                        logger.warning(
+                            "Step 7 DuckDB failed (non-OOM); falling back to pandas: %s",
+                            exc,
+                        )
+                    return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
+        
+            # 5. Load all chunks, sort, row-level train/valid/test split (PLAN Step 7 Out-of-Core).
+            #    Orchestrator: DuckDB first (Layer 1), on failure pandas fallback (Layer 3).
+            print("[Step 7/10] Load all chunks, concat, row-level train/valid/test split…", flush=True)
+            t0 = time.perf_counter()
+            _chunk_total_bytes = sum(Path(p).stat().st_size for p in chunk_paths)
+            _est_ram_gb = (_chunk_total_bytes * CHUNK_CONCAT_RAM_FACTOR) / (1024**3)
+            if _chunk_total_bytes >= CHUNK_CONCAT_MEMORY_WARN_BYTES:
                 logger.warning(
-                    "Step 7 DuckDB OOM; falling back to pandas in-memory sort+split: %s",
-                    exc,
+                    "Chunk Parquets total %.2f GB on disk -> estimated %.1f GB RAM for concat + train/valid split. "
+                    "Reduce training window (--days / --start --end) or ensure sufficient RAM to avoid OOM.",
+                    _chunk_total_bytes / (1024**3),
+                    _est_ram_gb,
                 )
+            # R803: validate fractions at runtime so misconfiguration is caught early (-O safe).
+            if not (TRAIN_SPLIT_FRAC + VALID_SPLIT_FRAC < 1.0):
+                raise ValueError(
+                    f"TRAIN_SPLIT_FRAC ({TRAIN_SPLIT_FRAC}) + VALID_SPLIT_FRAC ({VALID_SPLIT_FRAC}) "
+                    "must be < 1.0 to leave room for the test set"
+                )
+        
+            def _run_step6(neg_frac: float) -> List[Path]:
+                """Re-run Step 6 with given neg_sample_frac and force_recompute=True (Layer 2 OOM retry)."""
+                paths: List[Path] = []
+                for _i, _chunk in enumerate(chunks):
+                    _path = process_chunk(
+                        _chunk,
+                        canonical_map,
+                        dummy_player_ids=dummy_player_ids,
+                        use_local_parquet=use_local,
+                        force_recompute=True,
+                        profile_df=profile_df,
+                        feature_spec=feature_spec,
+                        feature_spec_hash=feature_spec_hash,
+                        neg_sample_frac=neg_frac,
+                    )
+                    if _path is not None:
+                        paths.append(_path)
+                    gc.collect()
+                return paths
+        
+            _step7_result = _step7_sort_and_split(
+                chunk_paths,
+                TRAIN_SPLIT_FRAC,
+                VALID_SPLIT_FRAC,
+                step6_runner=_run_step6,
+                current_neg_frac=_effective_neg_sample_frac,
+            )
+            train_df, valid_df, test_df, step7_train_path, step7_valid_path, step7_test_path = _step7_result
+            _train_libsvm: Optional[Path] = None
+            _valid_libsvm: Optional[Path] = None
+            _test_libsvm: Optional[Path] = None
+            if step7_train_path is not None:
+                # R202 Review #3: guard so _step7_metadata_from_paths never receives None (B+ path contract).
+                if step7_valid_path is None or step7_test_path is None:
+                    raise ValueError(
+                        "step7_valid_path and step7_test_path must be set when step7_train_path is set (B+ path)."
+                    )
+                # PLAN B+ Stage 1–2: train not loaded; get metadata and sample for Step 8 from file.
+                _n_train, _n_valid, _n_test, _label1_total, _train_end_max = _step7_metadata_from_paths(
+                    step7_train_path, step7_valid_path, step7_test_path
+                )
+                _total_rows = _n_train + _n_valid + _n_test
+                _label1 = _label1_total
+                _actual_train_end = _train_end_max
+                _sample_n_disk = (
+                    int(STEP8_SCREEN_SAMPLE_ROWS)
+                    if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1)
+                    else 2_000_000
+                )
+                _train_for_screen = _read_parquet_head(step7_train_path, _sample_n_disk)
             else:
-                logger.warning(
-                    "Step 7 DuckDB failed (non-OOM); falling back to pandas: %s",
-                    exc,
-                )
-            return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
-
-    # 5. Load all chunks, sort, row-level train/valid/test split (PLAN Step 7 Out-of-Core).
-    #    Orchestrator: DuckDB first (Layer 1), on failure pandas fallback (Layer 3).
-    print("[Step 7/10] Load all chunks, concat, row-level train/valid/test split…", flush=True)
-    t0 = time.perf_counter()
-    _chunk_total_bytes = sum(Path(p).stat().st_size for p in chunk_paths)
-    _est_ram_gb = (_chunk_total_bytes * CHUNK_CONCAT_RAM_FACTOR) / (1024**3)
-    if _chunk_total_bytes >= CHUNK_CONCAT_MEMORY_WARN_BYTES:
-        logger.warning(
-            "Chunk Parquets total %.2f GB on disk -> estimated %.1f GB RAM for concat + train/valid split. "
-            "Reduce training window (--days / --start --end) or ensure sufficient RAM to avoid OOM.",
-            _chunk_total_bytes / (1024**3),
-            _est_ram_gb,
-        )
-    # R803: validate fractions at runtime so misconfiguration is caught early (-O safe).
-    if not (TRAIN_SPLIT_FRAC + VALID_SPLIT_FRAC < 1.0):
-        raise ValueError(
-            f"TRAIN_SPLIT_FRAC ({TRAIN_SPLIT_FRAC}) + VALID_SPLIT_FRAC ({VALID_SPLIT_FRAC}) "
-            "must be < 1.0 to leave room for the test set"
-        )
-
-    def _run_step6(neg_frac: float) -> List[Path]:
-        """Re-run Step 6 with given neg_sample_frac and force_recompute=True (Layer 2 OOM retry)."""
-        paths: List[Path] = []
-        for _i, _chunk in enumerate(chunks):
-            _path = process_chunk(
-                _chunk,
-                canonical_map,
-                dummy_player_ids=dummy_player_ids,
-                use_local_parquet=use_local,
-                force_recompute=True,
-                profile_df=profile_df,
-                feature_spec=feature_spec,
-                feature_spec_hash=feature_spec_hash,
-                neg_sample_frac=neg_frac,
+                assert train_df is not None  # step7_train_path is None implies train was loaded in Step 7
+                assert valid_df is not None and test_df is not None  # pandas path always has both
+                _train_for_screen = None
+                _n_valid = len(valid_df)
+                _n_test = len(test_df)
+                _total_rows = len(train_df) + _n_valid + _n_test
+                _label1 = int(train_df["label"].sum()) + int(valid_df["label"].sum()) + int(test_df["label"].sum())
+                _actual_train_end = train_df["payout_complete_dtm"].max() if not train_df.empty else None
+            _train_cols = (
+                train_df.columns
+                if train_df is not None
+                else (_train_for_screen.columns if _train_for_screen is not None else pd.Index([]))
             )
-            if _path is not None:
-                paths.append(_path)
-            gc.collect()
-        return paths
-
-    _step7_result = _step7_sort_and_split(
-        chunk_paths,
-        TRAIN_SPLIT_FRAC,
-        VALID_SPLIT_FRAC,
-        step6_runner=_run_step6,
-        current_neg_frac=_effective_neg_sample_frac,
-    )
-    train_df, valid_df, test_df, step7_train_path, step7_valid_path, step7_test_path = _step7_result
-    _train_libsvm: Optional[Path] = None
-    _valid_libsvm: Optional[Path] = None
-    _test_libsvm: Optional[Path] = None
-    if step7_train_path is not None:
-        # R202 Review #3: guard so _step7_metadata_from_paths never receives None (B+ path contract).
-        if step7_valid_path is None or step7_test_path is None:
-            raise ValueError(
-                "step7_valid_path and step7_test_path must be set when step7_train_path is set (B+ path)."
-            )
-        # PLAN B+ Stage 1–2: train not loaded; get metadata and sample for Step 8 from file.
-        _n_train, _n_valid, _n_test, _label1_total, _train_end_max = _step7_metadata_from_paths(
-            step7_train_path, step7_valid_path, step7_test_path
-        )
-        _total_rows = _n_train + _n_valid + _n_test
-        _label1 = _label1_total
-        _actual_train_end = _train_end_max
-        _sample_n_disk = (
-            int(STEP8_SCREEN_SAMPLE_ROWS)
-            if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1)
-            else 2_000_000
-        )
-        _train_for_screen = _read_parquet_head(step7_train_path, _sample_n_disk)
-    else:
-        assert train_df is not None  # step7_train_path is None implies train was loaded in Step 7
-        assert valid_df is not None and test_df is not None  # pandas path always has both
-        _train_for_screen = None
-        _n_valid = len(valid_df)
-        _n_test = len(test_df)
-        _total_rows = len(train_df) + _n_valid + _n_test
-        _label1 = int(train_df["label"].sum()) + int(valid_df["label"].sum()) + int(test_df["label"].sum())
-        _actual_train_end = train_df["payout_complete_dtm"].max() if not train_df.empty else None
-    _train_cols = (
-        train_df.columns
-        if train_df is not None
-        else (_train_for_screen.columns if _train_for_screen is not None else pd.Index([]))
-    )
-    n_rows = _total_rows  # for downstream summary (artifact, logs)
-    _n_train_print = _n_train if step7_train_path is not None else (len(train_df) if train_df is not None else 0)
-    logger.info("Total rows: %d  (label=1: %d)", _total_rows, _label1)
-
-    # R700: compare row-level _actual_train_end against chunk-level train_end.
-    # The canonical mapping cutoff (B1/R25 guard) always uses chunk-level train_end;
-    # this log makes any semantic drift between the two boundaries observable.
-    # R701 (known limitation): same run rows may be assigned to different split sets
-    # at row-level boundaries — group-aware split is a long-term improvement.
-    if _actual_train_end is not None and pd.notnull(_actual_train_end):
-        _te_chunk = pd.Timestamp(train_end) if train_end else None
-        # DEC-018: strip tz from _te_chunk so both sides are tz-naive for comparison
-        # (train_end comes from chunk["window_end"] which is tz-aware; _actual_train_end
-        # comes from payout_complete_dtm which is tz-naive after apply_dq).
-        if _te_chunk is not None and _te_chunk.tzinfo is not None:
-            _te_chunk = _te_chunk.replace(tzinfo=None)
-        _te_row = pd.Timestamp(str(_actual_train_end))
-        # DEC-018: strip tz from _te_row for the same reason as _te_chunk —
-        # payout_complete_dtm may be tz-aware when sourced from test mocks or
-        # external Parquet that skipped apply_dq().
-        if _te_row.tzinfo is not None:
-            _te_row = _te_row.replace(tzinfo=None)
-        if _te_chunk is not None and _te_row != _te_chunk:
-            logger.warning(
-                "R700: chunk-level train_end (%s) differs from row-level "
-                "_actual_train_end (%s) by %s — "
-                "B1/R25 canonical mapping cutoff uses chunk-level train_end.",
-                _te_chunk.date(), _te_row.date(),
-                abs(_te_row - _te_chunk),
-            )
-        else:
-            logger.info(
-                "R700: chunk-level train_end (%s) matches row-level _actual_train_end (%s).",
-                _te_chunk, _te_row,
-            )
-    _n_valid_print = _n_valid if valid_df is None else len(valid_df)
-    _n_test_print = _n_test if test_df is None else len(test_df)
-    _el = time.perf_counter() - t0
-    print("[Step 7/10] Load all chunks, concat, row-level split done in %.1fs (train=%d valid=%d test=%d)" % (_el, _n_train_print, _n_valid_print, _n_test_print), flush=True)
-    logger.info(
-        "Row-level split (%.0f/%.0f/%.0f) — train: %d  valid: %d  test: %d  (load+sort+split: %.1fs)",
-        TRAIN_SPLIT_FRAC * 100,
-        VALID_SPLIT_FRAC * 100,
-        (1.0 - TRAIN_SPLIT_FRAC - VALID_SPLIT_FRAC) * 100,
-        _n_train_print, _n_valid_print, _n_test_print,
-        _el,
-    )
-    if _n_valid_print < MIN_VALID_TEST_ROWS:
-        logger.warning(
-            "Validation set has only %d rows (MIN_VALID_TEST_ROWS=%d); "
-            "AP and Optuna results will be unreliable. "
-            "Consider adding more --recent-chunks.",
-            _n_valid_print, MIN_VALID_TEST_ROWS,
-        )
-    if _n_test_print < MIN_VALID_TEST_ROWS:
-        logger.warning(
-            "Test set has only %d rows (MIN_VALID_TEST_ROWS=%d); "
-            "backtester metrics will be unreliable.",
-            _n_test_print, MIN_VALID_TEST_ROWS,
-        )
-
-    active_feature_cols = get_all_candidate_feature_ids(feature_spec, screening_only=True)
-
-    # 5b. Full-feature screening (DEC-020).
-    # Runs on the TRAINING SET ONLY to comply with TRN-09 anti-leakage rules.
-    #
-    # Candidate set = active_feature_cols (Track Human + Legacy + Profile) PLUS
-    # Track LLM candidate columns declared in feature spec and present in train_df.
-    if feature_spec is not None:
-        _track_llm_cols = [
-            cand.get("feature_id")
-            for cand in (feature_spec.get("track_llm", {}) or {}).get("candidates", [])
-            if cand.get("feature_id") in _train_cols
-        ]
-        if _track_llm_cols:
-            logger.info(
-                "screen_features: loaded %d Track LLM candidate columns from feature spec",
-                len(_track_llm_cols),
-            )
-        _all_candidate_cols: List[str] = list(dict.fromkeys(active_feature_cols + _track_llm_cols))
-    else:
-        _all_candidate_cols = active_feature_cols
-
-    # Only screen columns that actually exist in train (or train sample when B+ on disk).
-    _present_candidate_cols = [c for c in _all_candidate_cols if c in _train_cols]
-    if not _present_candidate_cols:
-        logger.warning(
-            "screen_features: no candidate columns found in train_df — skipping screening"
-        )
-        # R1004: restrict active_feature_cols to columns actually present in train.
-        active_feature_cols = [c for c in active_feature_cols if c in _train_cols]
-        print("[Step 8/10] Feature screening skipped (no candidates)", flush=True)
-    else:
-        # PLAN 方案 B 策略 A / B+ Stage 2: use sample from memory or from file (_train_for_screen from _read_parquet_head when on disk).
-        # Step 8 DuckDB std (PLAN): pass train_path or train_df so zv is computed on full data via DuckDB; keep _matrix_for_screen as sample to avoid OOM in corr/MI/LGBM.
-        _cap = (
-            int(STEP8_SCREEN_SAMPLE_ROWS)
-            if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1)
-            else 2_000_000
-        )
-        if train_df is not None:
-            _sample_n = STEP8_SCREEN_SAMPLE_ROWS if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1) else None
-            if _sample_n is not None:
-                _sample_n = int(_sample_n)  # Round 184 Review P2: coerce float to int before head()
-                _matrix_for_screen = train_df.head(_sample_n)
-                if len(_matrix_for_screen) < _sample_n:
-                    logger.info(
-                        "Step 8 screening: using first %d rows (train smaller than cap STEP8_SCREEN_SAMPLE_ROWS=%d); full train has %d rows",
-                        len(_matrix_for_screen),
-                        _sample_n,
-                        len(train_df),
+            n_rows = _total_rows  # for downstream summary (artifact, logs)
+            _n_train_print = _n_train if step7_train_path is not None else (len(train_df) if train_df is not None else 0)
+            logger.info("Total rows: %d  (label=1: %d)", _total_rows, _label1)
+        
+            # R700: compare row-level _actual_train_end against chunk-level train_end.
+            # The canonical mapping cutoff (B1/R25 guard) always uses chunk-level train_end;
+            # this log makes any semantic drift between the two boundaries observable.
+            # R701 (known limitation): same run rows may be assigned to different split sets
+            # at row-level boundaries — group-aware split is a long-term improvement.
+            if _actual_train_end is not None and pd.notnull(_actual_train_end):
+                _te_chunk = pd.Timestamp(train_end) if train_end else None
+                # DEC-018: strip tz from _te_chunk so both sides are tz-naive for comparison
+                # (train_end comes from chunk["window_end"] which is tz-aware; _actual_train_end
+                # comes from payout_complete_dtm which is tz-naive after apply_dq).
+                if _te_chunk is not None and _te_chunk.tzinfo is not None:
+                    _te_chunk = _te_chunk.replace(tzinfo=None)
+                _te_row = pd.Timestamp(str(_actual_train_end))
+                # DEC-018: strip tz from _te_row for the same reason as _te_chunk —
+                # payout_complete_dtm may be tz-aware when sourced from test mocks or
+                # external Parquet that skipped apply_dq().
+                if _te_row.tzinfo is not None:
+                    _te_row = _te_row.replace(tzinfo=None)
+                if _te_chunk is not None and _te_row != _te_chunk:
+                    logger.warning(
+                        "R700: chunk-level train_end (%s) differs from row-level "
+                        "_actual_train_end (%s) by %s — "
+                        "B1/R25 canonical mapping cutoff uses chunk-level train_end.",
+                        _te_chunk.date(), _te_row.date(),
+                        abs(_te_row - _te_chunk),
                     )
                 else:
                     logger.info(
-                        "Step 8 screening: using first %d rows (cap STEP8_SCREEN_SAMPLE_ROWS); full train has %d rows",
-                        len(_matrix_for_screen),
-                        len(train_df),
+                        "R700: chunk-level train_end (%s) matches row-level _actual_train_end (%s).",
+                        _te_chunk, _te_row,
                     )
-            else:
-                _matrix_for_screen = train_df.head(_cap)
-                logger.info(
-                    "Step 8 screening: std via DuckDB on full train (%d rows); matrix capped at %d rows for corr/MI/LGBM",
-                    len(train_df),
-                    len(_matrix_for_screen),
-                )
-        else:
-            _matrix_for_screen = _train_for_screen
+            _n_valid_print = _n_valid if valid_df is None else len(valid_df)
+            _n_test_print = _n_test if test_df is None else len(test_df)
+            _el = time.perf_counter() - t0
+            print("[Step 7/10] Load all chunks, concat, row-level split done in %.1fs (train=%d valid=%d test=%d)" % (_el, _n_train_print, _n_valid_print, _n_test_print), flush=True)
             logger.info(
-                "Step 8 screening: using first %d rows from train file (STEP7_KEEP_TRAIN_ON_DISK); full train has %d rows",
-                len(_matrix_for_screen),
-                _n_train_print,
+                "Row-level split (%.0f/%.0f/%.0f) — train: %d  valid: %d  test: %d  (load+sort+split: %.1fs)",
+                TRAIN_SPLIT_FRAC * 100,
+                VALID_SPLIT_FRAC * 100,
+                (1.0 - TRAIN_SPLIT_FRAC - VALID_SPLIT_FRAC) * 100,
+                _n_train_print, _n_valid_print, _n_test_print,
+                _el,
             )
-        print("[Step 8/10] Feature screening…", flush=True)
-        t0 = time.perf_counter()
-        screened_cols = screen_features(
-            feature_matrix=_matrix_for_screen,
-            labels=_matrix_for_screen["label"],
-            feature_names=_present_candidate_cols,
-            screen_method=SCREEN_FEATURES_METHOD,
-            train_path=step7_train_path if step7_train_path is not None else None,
-            train_df=train_df if train_df is not None else None,
-        )
-        _el = time.perf_counter() - t0
-        print("[Step 8/10] Feature screening done in %.1fs (%d -> %d features)" % (_el, len(_present_candidate_cols), len(screened_cols)), flush=True)
-        logger.info(
-            "screen_features: %d -> %d features retained  (%.1fs)",
-            len(_present_candidate_cols), len(screened_cols), _el,
-        )
-        # R1001: post-screening sanity — ensure at least one Track Human feature survives.
-        # Use YAML feature_spec (SSOT) instead of hardcoded list (feat-consolidation R123-2).
-        _screened_set = set(screened_cols)
-        _yaml_track_human = (
-            set(get_candidate_feature_ids(feature_spec, "track_human", screening_only=True))
-            if feature_spec is not None
-            else set()
-        )
-        if _yaml_track_human and not _screened_set.intersection(_yaml_track_human):
-            _missing_track_human = [c for c in _yaml_track_human if c in _train_cols]
-            if _missing_track_human:
+            if _n_valid_print < MIN_VALID_TEST_ROWS:
                 logger.warning(
-                    "screen_features: no track_human features survived screening — "
-                    "re-appending %d track_human features as fallback (R1001)",
-                    len(_missing_track_human),
+                    "Validation set has only %d rows (MIN_VALID_TEST_ROWS=%d); "
+                    "AP and Optuna results will be unreliable. "
+                    "Consider adding more --recent-chunks.",
+                    _n_valid_print, MIN_VALID_TEST_ROWS,
                 )
-                screened_cols = screened_cols + [
-                    c for c in _missing_track_human if c not in _screened_set
+            if _n_test_print < MIN_VALID_TEST_ROWS:
+                logger.warning(
+                    "Test set has only %d rows (MIN_VALID_TEST_ROWS=%d); "
+                    "backtester metrics will be unreliable.",
+                    _n_test_print, MIN_VALID_TEST_ROWS,
+                )
+        
+            active_feature_cols = get_all_candidate_feature_ids(feature_spec, screening_only=True)
+        
+            # 5b. Full-feature screening (DEC-020).
+            # Runs on the TRAINING SET ONLY to comply with TRN-09 anti-leakage rules.
+            #
+            # Candidate set = active_feature_cols (Track Human + Legacy + Profile) PLUS
+            # Track LLM candidate columns declared in feature spec and present in train_df.
+            if feature_spec is not None:
+                _track_llm_cols = [
+                    cand.get("feature_id")
+                    for cand in (feature_spec.get("track_llm", {}) or {}).get("candidates", [])
+                    if cand.get("feature_id") in _train_cols
                 ]
-        active_feature_cols = screened_cols
-
-    # PLAN B+ Stage 2: load train from file after screening so export/Step 9 have train_df.
-    if step7_train_path is not None:
-        if STEP9_EXPORT_LIBSVM and active_feature_cols:
-            assert step7_valid_path is not None and step7_test_path is not None  # R202 guard
-            _train_libsvm, _valid_libsvm, _test_libsvm = _export_parquet_to_libsvm(
-                step7_train_path,
-                step7_valid_path,
+                if _track_llm_cols:
+                    logger.info(
+                        "screen_features: loaded %d Track LLM candidate columns from feature spec",
+                        len(_track_llm_cols),
+                    )
+                _all_candidate_cols: List[str] = list(dict.fromkeys(active_feature_cols + _track_llm_cols))
+            else:
+                _all_candidate_cols = active_feature_cols
+        
+            # Only screen columns that actually exist in train (or train sample when B+ on disk).
+            _present_candidate_cols = [c for c in _all_candidate_cols if c in _train_cols]
+            if not _present_candidate_cols:
+                logger.warning(
+                    "screen_features: no candidate columns found in train_df — skipping screening"
+                )
+                # R1004: restrict active_feature_cols to columns actually present in train.
+                active_feature_cols = [c for c in active_feature_cols if c in _train_cols]
+                print("[Step 8/10] Feature screening skipped (no candidates)", flush=True)
+            else:
+                # PLAN 方案 B 策略 A / B+ Stage 2: use sample from memory or from file (_train_for_screen from _read_parquet_head when on disk).
+                # Step 8 DuckDB std (PLAN): pass train_path or train_df so zv is computed on full data via DuckDB; keep _matrix_for_screen as sample to avoid OOM in corr/MI/LGBM.
+                _cap = (
+                    int(STEP8_SCREEN_SAMPLE_ROWS)
+                    if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1)
+                    else 2_000_000
+                )
+                if train_df is not None:
+                    _sample_n = STEP8_SCREEN_SAMPLE_ROWS if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1) else None
+                    if _sample_n is not None:
+                        _sample_n = int(_sample_n)  # Round 184 Review P2: coerce float to int before head()
+                        _matrix_for_screen = train_df.head(_sample_n)
+                        if len(_matrix_for_screen) < _sample_n:
+                            logger.info(
+                                "Step 8 screening: using first %d rows (train smaller than cap STEP8_SCREEN_SAMPLE_ROWS=%d); full train has %d rows",
+                                len(_matrix_for_screen),
+                                _sample_n,
+                                len(train_df),
+                            )
+                        else:
+                            logger.info(
+                                "Step 8 screening: using first %d rows (cap STEP8_SCREEN_SAMPLE_ROWS); full train has %d rows",
+                                len(_matrix_for_screen),
+                                len(train_df),
+                            )
+                    else:
+                        _matrix_for_screen = train_df.head(_cap)
+                        logger.info(
+                            "Step 8 screening: std via DuckDB on full train (%d rows); matrix capped at %d rows for corr/MI/LGBM",
+                            len(train_df),
+                            len(_matrix_for_screen),
+                        )
+                else:
+                    _matrix_for_screen = _train_for_screen
+                    logger.info(
+                        "Step 8 screening: using first %d rows from train file (STEP7_KEEP_TRAIN_ON_DISK); full train has %d rows",
+                        len(_matrix_for_screen),
+                        _n_train_print,
+                    )
+                print("[Step 8/10] Feature screening…", flush=True)
+                t0 = time.perf_counter()
+                screened_cols = screen_features(
+                    feature_matrix=_matrix_for_screen,
+                    labels=_matrix_for_screen["label"],
+                    feature_names=_present_candidate_cols,
+                    screen_method=SCREEN_FEATURES_METHOD,
+                    train_path=step7_train_path if step7_train_path is not None else None,
+                    train_df=train_df if train_df is not None else None,
+                )
+                _el = time.perf_counter() - t0
+                print("[Step 8/10] Feature screening done in %.1fs (%d -> %d features)" % (_el, len(_present_candidate_cols), len(screened_cols)), flush=True)
+                logger.info(
+                    "screen_features: %d -> %d features retained  (%.1fs)",
+                    len(_present_candidate_cols), len(screened_cols), _el,
+                )
+                # R1001: post-screening sanity — ensure at least one Track Human feature survives.
+                # Use YAML feature_spec (SSOT) instead of hardcoded list (feat-consolidation R123-2).
+                _screened_set = set(screened_cols)
+                _yaml_track_human = (
+                    set(get_candidate_feature_ids(feature_spec, "track_human", screening_only=True))
+                    if feature_spec is not None
+                    else set()
+                )
+                if _yaml_track_human and not _screened_set.intersection(_yaml_track_human):
+                    _missing_track_human = [c for c in _yaml_track_human if c in _train_cols]
+                    if _missing_track_human:
+                        logger.warning(
+                            "screen_features: no track_human features survived screening — "
+                            "re-appending %d track_human features as fallback (R1001)",
+                            len(_missing_track_human),
+                        )
+                        screened_cols = screened_cols + [
+                            c for c in _missing_track_human if c not in _screened_set
+                        ]
+                active_feature_cols = screened_cols
+        
+            # PLAN B+ Stage 2: load train from file after screening so export/Step 9 have train_df.
+            if step7_train_path is not None:
+                if STEP9_EXPORT_LIBSVM and active_feature_cols:
+                    assert step7_valid_path is not None and step7_test_path is not None  # R202 guard
+                    _train_libsvm, _valid_libsvm, _test_libsvm = _export_parquet_to_libsvm(
+                        step7_train_path,
+                        step7_valid_path,
+                        active_feature_cols,
+                        DATA_DIR / "export",
+                        test_path=step7_test_path,
+                    )
+                train_df = pd.read_parquet(step7_train_path)
+                if step7_train_path.exists():
+                    step7_train_path.unlink(missing_ok=True)
+                logger.info(
+                    "Step 7 B+: loaded train from file after screening (%d rows)%s",
+                    len(train_df),
+                    "; valid/test left on disk (B+ 階段 6 第 2 步)" if (valid_df is None and test_df is None) else "",
+                )
+        
+            if not active_feature_cols:
+                # R1613: explicit guardrail message for zero-feature situations.  In
+                # integration / debug contexts (e.g. heavily mocked tests) we still
+                # want the pipeline to run so that wiring between stages can be
+                # exercised, so we fall back to a single constant "bias" feature
+                # instead of terminating the process.
+                msg = (
+                    "screen_features + Track Human fallback both returned empty feature list. "
+                    "Cannot train any model. Check data quality and feature definitions."
+                )
+                logger.warning(msg)
+                print(msg, flush=True)
+                _placeholder_col = "bias"  # constant feature for integration/debug runs (R1605: named via explicit variable)
+                if train_df is not None and _placeholder_col not in train_df.columns:
+                    train_df[_placeholder_col] = 0.0
+                if valid_df is not None and not valid_df.empty and _placeholder_col not in valid_df.columns:
+                    valid_df[_placeholder_col] = 0.0
+                if test_df is not None and not test_df.empty and _placeholder_col not in test_df.columns:
+                    test_df[_placeholder_col] = 0.0
+                active_feature_cols = [_placeholder_col]
+        
+            # Plan B: export train/valid to CSV when training from file (PLAN 方案 B §3).
+            # Skip when B+ LibSVM path (valid_df not loaded) — validation uses LibSVM from file.
+            if STEP9_TRAIN_FROM_FILE and train_df is not None and valid_df is not None:
+                _export_dir = DATA_DIR / "export"
+                _train_csv, _valid_csv = _export_train_valid_to_csv(
+                    train_df, valid_df, active_feature_cols, _export_dir
+                )
+                print(
+                    "[Plan B] Exported train/valid to %s and %s"
+                    % (_train_csv, _valid_csv),
+                    flush=True,
+                )
+        
+            # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
+            #    test_df is passed so test-set metrics and feature importance are
+            #    computed immediately after training and included in the artifact.
+            print("[Step 9/10] Train single rated model (Optuna + LightGBM) + test-set eval…", flush=True)
+            t0 = time.perf_counter()
+            model_version = get_model_version()
+            _libsvm_paths = (_train_libsvm, _valid_libsvm) if (_train_libsvm is not None and _valid_libsvm is not None) else None
+            rated_art, _, combined_metrics = train_single_rated_model(
+                train_df,
+                valid_df,
                 active_feature_cols,
-                DATA_DIR / "export",
-                test_path=step7_test_path,
+                run_optuna=not skip_optuna,
+                test_df=test_df,
+                train_from_file=STEP9_TRAIN_FROM_FILE,
+                train_libsvm_paths=_libsvm_paths,
+                test_libsvm_path=_test_libsvm,
             )
-        train_df = pd.read_parquet(step7_train_path)
-        if step7_train_path.exists():
-            step7_train_path.unlink(missing_ok=True)
-        logger.info(
-            "Step 7 B+: loaded train from file after screening (%d rows)%s",
-            len(train_df),
-            "; valid/test left on disk (B+ 階段 6 第 2 步)" if (valid_df is None and test_df is None) else "",
-        )
+            _el = time.perf_counter() - t0
+            print("[Step 9/10] Train single rated model + test-set eval done in %.1fs" % _el, flush=True)
+            logger.info("train_single_rated_model + test eval: %.1fs", _el)
+        
+            # 7. Save artifacts
+            print("[Step 10/10] Save artifact bundle…", flush=True)
+            t0 = time.perf_counter()
+            save_artifact_bundle(
+                rated_art, active_feature_cols, combined_metrics, model_version,
+                sample_rated_n=sample_rated_n,
+                feature_spec_path=FEATURE_SPEC_PATH,
+                neg_sample_frac=_effective_neg_sample_frac,
+            )
+            _el = time.perf_counter() - t0
+            print("[Step 10/10] Save artifact bundle done in %.1fs" % _el, flush=True)
+            logger.info("save_artifact_bundle: %.1fs", _el)
+        
+            # Phase 2 T2: Log provenance to MLflow (no-op when URI unset/unreachable).
+            try:
+                _log_training_provenance_to_mlflow(
+                    model_version=model_version,
+                    artifact_dir=str(MODEL_DIR),
+                    training_window_start=effective_start,
+                    training_window_end=effective_end,
+                    feature_spec_path=str(FEATURE_SPEC_PATH),
+                    training_metrics_path=str(MODEL_DIR / "training_metrics.json"),
+                )
+            except Exception as e:
+                logger.warning("MLflow provenance logging failed (training still succeeded): %s", e)
+        
+            # Remove stale nonrated_model.pkl / rated_model.pkl left over from previous
+            # dual-model runs so scorer/backtester cannot accidentally fall back to a
+            # v9 artifact (v10 uses model.pkl only).
+            for _stale in ["nonrated_model.pkl", "rated_model.pkl"]:
+                _stale_path = MODEL_DIR / _stale
+                if _stale_path.exists():
+                    _stale_path.unlink()
+                    logger.info("Removed stale artifact: %s", _stale)
+        
+            total_sec = time.perf_counter() - pipeline_start
+            print("All steps completed. Pipeline total: %.1fs (%.1f min)" % (total_sec, total_sec / 60.0), flush=True)
+            logger.info("Pipeline total: %.1fs (%.1f min)", total_sec, total_sec / 60.0)
+        
+            summary = {
+                "model_version": model_version,
+                "window_start": start.isoformat(),
+                "window_end": end.isoformat(),
+                "total_rows": n_rows,
+                "metrics": combined_metrics,
+            }
+            print(json.dumps(summary, indent=2, default=str))
+        except Exception as e:
+            log_tags_safe({"status": "FAILED", "error": str(e)[:500]})
+            raise
 
-    if not active_feature_cols:
-        # R1613: explicit guardrail message for zero-feature situations.  In
-        # integration / debug contexts (e.g. heavily mocked tests) we still
-        # want the pipeline to run so that wiring between stages can be
-        # exercised, so we fall back to a single constant "bias" feature
-        # instead of terminating the process.
-        msg = (
-            "screen_features + Track Human fallback both returned empty feature list. "
-            "Cannot train any model. Check data quality and feature definitions."
-        )
-        logger.warning(msg)
-        print(msg, flush=True)
-        _placeholder_col = "bias"  # constant feature for integration/debug runs (R1605: named via explicit variable)
-        if train_df is not None and _placeholder_col not in train_df.columns:
-            train_df[_placeholder_col] = 0.0
-        if valid_df is not None and not valid_df.empty and _placeholder_col not in valid_df.columns:
-            valid_df[_placeholder_col] = 0.0
-        if test_df is not None and not test_df.empty and _placeholder_col not in test_df.columns:
-            test_df[_placeholder_col] = 0.0
-        active_feature_cols = [_placeholder_col]
-
-    # Plan B: export train/valid to CSV when training from file (PLAN 方案 B §3).
-    # Skip when B+ LibSVM path (valid_df not loaded) — validation uses LibSVM from file.
-    if STEP9_TRAIN_FROM_FILE and train_df is not None and valid_df is not None:
-        _export_dir = DATA_DIR / "export"
-        _train_csv, _valid_csv = _export_train_valid_to_csv(
-            train_df, valid_df, active_feature_cols, _export_dir
-        )
-        print(
-            "[Plan B] Exported train/valid to %s and %s"
-            % (_train_csv, _valid_csv),
-            flush=True,
-        )
-
-    # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
-    #    test_df is passed so test-set metrics and feature importance are
-    #    computed immediately after training and included in the artifact.
-    print("[Step 9/10] Train single rated model (Optuna + LightGBM) + test-set eval…", flush=True)
-    t0 = time.perf_counter()
-    model_version = get_model_version()
-    _libsvm_paths = (_train_libsvm, _valid_libsvm) if (_train_libsvm is not None and _valid_libsvm is not None) else None
-    rated_art, _, combined_metrics = train_single_rated_model(
-        train_df,
-        valid_df,
-        active_feature_cols,
-        run_optuna=not skip_optuna,
-        test_df=test_df,
-        train_from_file=STEP9_TRAIN_FROM_FILE,
-        train_libsvm_paths=_libsvm_paths,
-        test_libsvm_path=_test_libsvm,
-    )
-    _el = time.perf_counter() - t0
-    print("[Step 9/10] Train single rated model + test-set eval done in %.1fs" % _el, flush=True)
-    logger.info("train_single_rated_model + test eval: %.1fs", _el)
-
-    # 7. Save artifacts
-    print("[Step 10/10] Save artifact bundle…", flush=True)
-    t0 = time.perf_counter()
-    save_artifact_bundle(
-        rated_art, active_feature_cols, combined_metrics, model_version,
-        sample_rated_n=sample_rated_n,
-        feature_spec_path=FEATURE_SPEC_PATH,
-        neg_sample_frac=_effective_neg_sample_frac,
-    )
-    _el = time.perf_counter() - t0
-    print("[Step 10/10] Save artifact bundle done in %.1fs" % _el, flush=True)
-    logger.info("save_artifact_bundle: %.1fs", _el)
-
-    # Phase 2 T2: Log provenance to MLflow (no-op when URI unset/unreachable).
-    try:
-        _log_training_provenance_to_mlflow(
-            model_version=model_version,
-            artifact_dir=str(MODEL_DIR),
-            training_window_start=effective_start,
-            training_window_end=effective_end,
-            feature_spec_path=str(FEATURE_SPEC_PATH),
-            training_metrics_path=str(MODEL_DIR / "training_metrics.json"),
-        )
-    except Exception as e:
-        logger.warning("MLflow provenance logging failed (training still succeeded): %s", e)
-
-    # Remove stale nonrated_model.pkl / rated_model.pkl left over from previous
-    # dual-model runs so scorer/backtester cannot accidentally fall back to a
-    # v9 artifact (v10 uses model.pkl only).
-    for _stale in ["nonrated_model.pkl", "rated_model.pkl"]:
-        _stale_path = MODEL_DIR / _stale
-        if _stale_path.exists():
-            _stale_path.unlink()
-            logger.info("Removed stale artifact: %s", _stale)
-
-    total_sec = time.perf_counter() - pipeline_start
-    print("All steps completed. Pipeline total: %.1fs (%.1f min)" % (total_sec, total_sec / 60.0), flush=True)
-    logger.info("Pipeline total: %.1fs (%.1f min)", total_sec, total_sec / 60.0)
-
-    summary = {
-        "model_version": model_version,
-        "window_start": start.isoformat(),
-        "window_end": end.isoformat(),
-        "total_rows": n_rows,
-        "metrics": combined_metrics,
-    }
-    print(json.dumps(summary, indent=2, default=str))
 
 
 # ---------------------------------------------------------------------------
