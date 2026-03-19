@@ -121,6 +121,39 @@ def test_log_tags_safe_calls_mlflow_when_available():
     assert call_args == {"model_version": "v1", "training_window_start": "2026-01-01"}
 
 
+def test_log_metrics_safe_skips_non_numeric_values():
+    """Contract: log_metrics_safe should skip None and non-coercible values."""
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        # Inject a fake mlflow module so the test does not depend on real mlflow installation.
+        import types
+
+        dummy_mlflow = types.SimpleNamespace()
+        with patch.object(dummy_mlflow, "log_metrics", create=True) as mock_log_metrics:
+            with patch.dict(sys.modules, {"mlflow": dummy_mlflow}):
+                mlflow_utils.log_metrics_safe({"ok": 1.23, "bad_dict": {"a": 1}, "none": None})
+
+    mock_log_metrics.assert_called_once()
+    logged = mock_log_metrics.call_args[0][0]
+    assert logged == {"ok": 1.23}
+
+
+@pytest.mark.xfail(strict=False, reason="log_metrics_safe should filter NaN/inf values once implemented")
+def test_log_metrics_safe_filters_non_finite_values():
+    """Risk #4: log_metrics_safe should skip NaN/inf values (desired behavior)."""
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        import types
+
+        dummy_mlflow = types.SimpleNamespace()
+        with patch.object(dummy_mlflow, "log_metrics", create=True) as mock_log_metrics:
+            with patch.dict(sys.modules, {"mlflow": dummy_mlflow}):
+                mlflow_utils.log_metrics_safe({"nan": float("nan"), "inf": float("inf"), "ok": 1.0})
+
+    logged = mock_log_metrics.call_args[0][0]
+    assert "nan" not in logged
+    assert "inf" not in logged
+    assert logged == {"ok": 1.0}
+
+
 def test_log_params_safe_when_available_no_active_run_does_not_raise():
     """Code Review §3: log_params_safe does not raise when available but no active run."""
     pytest.importorskip("mlflow")
@@ -227,8 +260,10 @@ def test_has_active_run_returns_false_when_active_run_raises():
     pytest.importorskip("mlflow")
     with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
         with patch("mlflow.active_run", side_effect=RuntimeError("backend unavailable")):
-            result = mlflow_utils.has_active_run()
+            with patch("trainer.core.mlflow_utils._log.warning") as mock_warn:
+                result = mlflow_utils.has_active_run()
     assert result is False
+    assert mock_warn.call_count == 1
 
 
 def test_safe_start_run_context_when_unavailable_exits_cleanly():

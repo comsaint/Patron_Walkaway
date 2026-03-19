@@ -16,6 +16,7 @@ See doc/phase2_provenance_schema.md for provenance key names.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -165,7 +166,12 @@ def has_active_run() -> bool:
     try:
         import mlflow  # type: ignore[import-not-found]
         return mlflow.active_run() is not None
-    except Exception:
+    except Exception as e:
+        # Code Review §1: log when active_run() fails so failures are debuggable.
+        _log.warning(
+            "has_active_run: mlflow.active_run() failed; assuming no active run: %s",
+            e,
+        )
         return False
 
 
@@ -207,6 +213,38 @@ def log_tags_safe(tags: dict[str, str]) -> None:
         mlflow.set_tags(tags)
     except Exception as e:
         _log.warning("MLflow set_tags failed: %s", e)
+
+
+def log_metrics_safe(metrics: dict[str, Any]) -> None:
+    """
+    Log numeric metrics to current run if MLflow is available; otherwise no-op.
+
+    Contract-style behavior:
+    - Skip keys whose value is None.
+    - Best-effort coerce values via float(v); on failure skip that key.
+    - Never raise (log warning only) so training pipeline is not impacted.
+    """
+    if not is_mlflow_available():
+        return
+    try:
+        import mlflow  # type: ignore[import-not-found]
+        sanitized: dict[str, float] = {}
+        for k, v in metrics.items():
+            if v is None:
+                continue
+            try:
+                # mlflow.log_metrics expects numeric values.
+                fv = float(v)
+                # Code Review §4: avoid NaN/inf in MLflow metrics.
+                if not math.isfinite(fv):
+                    continue
+                sanitized[k] = fv
+            except Exception:
+                continue
+        if sanitized:
+            mlflow.log_metrics(sanitized)
+    except Exception as e:
+        _log.warning("MLflow log_metrics failed: %s", e)
 
 
 def log_artifact_safe(local_path: str | Path, artifact_path: Optional[str] = None) -> None:

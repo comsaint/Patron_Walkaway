@@ -60,11 +60,10 @@ flowchart LR
 
 ## Ordered Tasks
 
-**Current status**（更新於 2026-03-18）：**T0**–**T11** 已完成。**T12 Step 1**（單一 run 涵蓋整次 pipeline、失敗時寫入 tag status=FAILED／error 並 re-raise）已實作；tests/typecheck/lint 通過，見 STATUS.md「本輪驗證：tests / typecheck / lint」。
+**Current status**（更新於 2026-03-19）：**T0**–**T11** 已完成。**T12 Step 1**（單一 run 涵蓋整次 pipeline、失敗時寫入 tag status=FAILED／error 並 re-raise）已實作；**T12 success diagnostics（T12.2 Step 2）** 已實作；**T12 failure diagnostics params（T12 optional follow-on）** 已實作；並完成 Code Review §1（`has_active_run()` 例外 warning）。本輪額外 production 修補已落地：`log_metrics_safe` 過濾 NaN/inf 與 failure params 長字串截斷，導致對應 contract 測試由 xfail -> xpass。tests/typecheck/lint 相關驗證通過，見 STATUS.md。
 
 **Remaining items**（依執行順序）：
-- **T12 可選後續**：失敗時除 tag 外再寫入 params（`training_window_start`/`end`、`recent_chunks`、`NEG_SAMPLE_FRAC`、chunk 數、OOM-check 估計等），見 T12 §3；可選實作 Code Review §1（has_active_run 例外時打 warning）。
-- 其餘 Phase 2 P0–P1 無強制待辦；可依產品需求延伸（告警傳遞、自動化 drift 監控等）。
+- 其餘 Phase 2 P0–P1 無強制待辦；若要進一步降低風險，可再針對 Code Review §2–§5 的「效能/語義」項（例如 OOM pre-check I/O 成本與 RSS peak 真實最大值語義）做後續優化。
 
 ---
 

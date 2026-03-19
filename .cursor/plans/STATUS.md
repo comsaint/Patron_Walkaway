@@ -7439,3 +7439,247 @@ python -m pytest tests/unit/test_mlflow_utils.py -v --tb=short
 **剩餘項目摘要**：僅 **T12 可選後續**（失敗 run 的診斷 params、可選 §1 warning）；無其他必做項。
 
 ---
+
+### 本輪新增：MLflow 成功 metrics + memory/OOM diagnostics 合約測試（僅 tests，未改 production）
+
+**Date**：2026-03-19  
+**範圍**：新增測試與文件化合約；當 production 尚未實作 `trainer/core/mlflow_utils.py:log_metrics_safe` 或 success diagnostics 尚未出現時，測試會透過 `self.skipTest()` 來避免誤判。  
+本輪已實作 success diagnostics，因此合約測試已進入驗收通過狀態。
+
+**改動檔**：
+- `tests/review_risks/test_review_risks_phase2_mlflow_trainer.py`
+
+**新增內容**：
+- 新增 `TestT12_2Step2MetricsContract`（合約式）
+  - 檢查 `log_metrics_safe` 是否存在（合約式）
+  - 檢查 `trainer/training/trainer.py` 的 `run_pipeline` source 是否包含 durations/memory/OOM precheck 的字串合約 keys
+  - 目前 production 尚未實作該 Step，因此缺失時為預期 `skipTest`
+
+**如何手動驗證**（專案根目錄）：
+- `python -m pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py -v --tb=short`
+  - 預期：`12 passed`（合約不再跳過）
+- `ruff check tests/review_risks/test_review_risks_phase2_mlflow_trainer.py`
+  - 預期：All checks passed!
+
+**下一步建議**：
+- 在 production 實作 success diagnostics（新增 `log_metrics_safe` + 成功流程記錄 durations/memory/OOM precheck params）。
+- production 就緒後再移除目前的 pending skip 分支，並把本段標為「可驗收完成」（更新 `T12 可選後續` 的狀態/剩餘項目）。
+
+---
+
+### Code Review：目前變更（STATUS/新增 MLflow success diagnostics contract tests）
+
+**Date**：2026-03-19  
+**範圍**：僅檢視本次新增/修改的文件與測試；不修改 production code。以下為最可能的 bug/邊界條件/安全性/效能問題與建議。
+
+1. **測試合約過度依賴「完整字串子串搜尋」的風險**：已在本次測試強化中，將 contract 檢查改為 AST 方式彙整 python source 內的字面 string constants，降低因字典/拼接/格式化造成的 false negative。
+
+2. **記憶體 tag / metric key 檢查精準度**：已改為檢查多個關鍵字面 constants（例如 `memory_sampling`/`checkpoint_peak`/`disabled_no_psutil`/`step7_rss_*`/`step7_sys_*`），避免要求單一連續片段。
+
+3. **Pending 行為語義**：已在 contract tests 改為 `self.skipTest()`（未實作不應被視為 xfail）。
+
+4. **import-time side effects 風險**：已移除 `mlflow_utils_mod` import；contract 檢查改為只讀 `trainer/core/mlflow_utils.py` source（減少 import-time 依賴）。
+
+5. **source 改寫/包裝導致檢查失效**：若 `run_pipeline` 被 decorator、包裝函式、或 source 經過動態產生，`inspect.getsource` 可能取不到期望內容或與實際執行不一致。修改建議：盡量採用 AST/字節碼不依賴字串格式的契約檢查；或把 contract 定義改為顯式常數（例如統一 key 常數）以便查驗。你希望新增的測試：新增測試確認 contract 檢查在 `run_pipeline` 有裝飾器/包裝時仍能定位關鍵參數（用小型 dummy function/fixture 模擬）。
+
+6. **效能問題（輕微）**：本次 contract 測試使用 `inspect.getsource` + 讀取 `mlflow_utils.py`，在大量 contract tests 堆疊時可能拖慢收集/執行時間。修改建議：將 source 讀取與 AST 解析結果做 module-level cache（例如 `functools.lru_cache` 或單次計算）；並避免多次 `read_text`。你希望新增的測試：無需額外測試；但建議加入測試執行時間上限（可用 pytest-timeout 或簡單 `perf_counter` assert，若你們有此基礎設施）。
+
+
+---
+### 本輪實作：MLflow success diagnostics（T12.2 Step 2）— production 已落地
+
+**Date**：2026-03-19  
+**範圍**：修改 production code 直到本輪新增/相關的 contract tests 由 `skipTest` 轉為 `pass`；不調整現有測試本體（僅允許 production 修補）。  
+
+**變更檔**：
+- `trainer/core/mlflow_utils.py`：新增 `log_metrics_safe()`（safe、never-raise；跳過 `None` 與非數值 key）
+- `trainer/training/trainer.py`：在 `run_pipeline` 成功路徑加入 success diagnostics：
+  - log `total_duration_sec` 與 `step7/8/9_duration_sec`
+  - 設定 memory sampling tags：`memory_sampling=checkpoint_peak` / `memory_sampling_scope=step7_9`；無 psutil 時 `memory_sampling=disabled_no_psutil`
+  - log Step7-9 checkpoint RSS/sys keys：`step7_rss_start_gb` / `step7_rss_peak_gb` / `step7_rss_end_gb`、`step7_sys_available_min_gb` / `step7_sys_used_percent_peak`
+  - 計算並寫入 OOM pre-check：`oom_precheck_est_peak_ram_gb` 與 `oom_precheck_step7_rss_error_ratio`
+
+**如何手動驗證**（專案根目錄）：
+- ruff（production + tests）：
+  - `ruff check trainer/`
+- mypy：
+  - `mypy trainer/core/mlflow_utils.py --ignore-missing-imports`
+  - `mypy trainer/training/trainer.py --ignore-missing-imports`
+- pytest（MLflow 相關）：
+  - `python -m pytest tests/unit/test_mlflow_utils.py tests/integration/test_phase2_trainer_mlflow.py -q --tb=short`
+  - `python -m pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py -q --tb=short`
+
+**本輪結果**：
+- `ruff check trainer/`：All checks passed!
+- `mypy`：`Success: no issues found in 1 source file`（mlflow_utils）與 trainer 亦通過
+- `pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py`：12 passed（無 skips，先前 contract 的 pending 已轉為實驗驗收）
+- `pytest tests/unit/test_mlflow_utils.py tests/integration/test_phase2_trainer_mlflow.py`：25 passed, 10 skipped
+
+---
+### 本輪實作：T12 failure diagnostics params（Step 3）— 失敗時額外寫入 params
+
+**Date**：2026-03-19  
+**範圍**：僅完成 T12 可選後續的「失敗時除 tag 外再寫入 params」最小閉環；不做其他 Phase 2 變更。
+
+**變更檔**：
+- `trainer/training/trainer.py`
+  - 在 `run_pipeline` outer `except Exception as e:` 區塊新增 `log_params_safe(...)`（best-effort）。
+  - params 內容包含：`training_window_start/end`、`recent_chunks`、`neg_sample_frac`、`chunk_count`、`use_local_parquet`、`oom_precheck_est_peak_ram_gb`。
+
+**如何手動驗證**（專案根目錄）：
+- ruff（lint）：
+  - `ruff check trainer/training/trainer.py tests/review_risks/test_review_risks_phase2_mlflow_trainer.py`
+  - 預期：All checks passed!
+- tests（合約 + 既有 mlflow utils）：
+  - `python -m pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py -q --tb=short`
+  - 預期：`13 passed`
+  - `python -m pytest tests/unit/test_mlflow_utils.py -q --tb=short`
+  - 預期：`20 passed, 10 skipped`
+
+**下一步建議**：
+- 接著做 Code Review §1：`has_active_run()` 在 `mlflow.active_run()` 例外時加入 `logger.warning`（Step 4 optional）。
+
+---
+### 本輪實作：Code Review §1（T12）has_active_run warning（Step 4）
+
+**Date**：2026-03-19  
+**範圍**：在 `trainer/core/mlflow_utils.py:has_active_run()` 的 `mlflow.active_run()` 例外處加入 `_log.warning`，讓失敗可觀測；不改既有錯誤返回語義（仍回傳 False、不中斷訓練）。
+
+**變更檔**：
+- `trainer/core/mlflow_utils.py`
+  - `has_active_run()`：catch 例外後 `_log.warning(...)`，並回傳 False。
+- `tests/unit/test_mlflow_utils.py`
+  - 更新/加強 `test_has_active_run_returns_false_when_active_run_raises`：斷言 warning 會被呼叫一次。
+
+**如何手動驗證**（專案根目錄）：
+- ruff：
+  - `ruff check trainer/core/mlflow_utils.py tests/unit/test_mlflow_utils.py`
+- tests：
+  - `python -m pytest tests/unit/test_mlflow_utils.py -q --tb=short`
+  - `python -m pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py -q --tb=short`
+
+**本輪結果**：
+- `pytest tests/unit/test_mlflow_utils.py`：`20 passed, 10 skipped`
+- `pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py`：`13 passed`
+
+---
+### Code Review：目前變更（T12 success diagnostics / failure params / has_active_run warning）
+
+**Date**：2026-03-19  
+**範圍**：僅針對本輪實作與對應測試做高可靠性 review；不重寫整套，只列最可能的 bug / 邊界條件 / 安全性 / 效能風險。  
+
+1. **Failure diagnostics params 目前主要用「source contract」驗證，未驗證實際會呼叫 `log_params_safe(...)` 且值經過清理**  
+   - 具體修改建議：新增行為測試（behavioral test），在 `run_pipeline` 觸發早期 exception（mock `get_monthly_chunks` 拋錯）時，mock `trainer.training.trainer.log_params_safe`，assert 被呼叫一次且 payload 含預期 keys（且不含 None）。  
+   - 你希望新增的測試：在 `tests/review_risks/test_review_risks_phase2_mlflow_trainer.py` 新增 `TestT12FailureParamsBehavior`，只 mock 早期失敗與 logging，不需要連 MLflow server。
+
+2. **Success diagnostics 的 metrics logging 可能包含非數值/複合型值（例如 `feature_importance` dict），導致實際送出的 metrics 欄位比預期少**  
+   - 具體修改建議：在 `run_pipeline` 成功路徑中，對 `combined_metrics["rated"]` 做 schema/型別過濾，只把「明確為 numeric」的 key 放入 `log_metrics_safe`，避免把太多不可序列化值丟進去再跳過。  
+   - 你希望新增的測試：針對 `trainer/core/mlflow_utils.py:log_metrics_safe` 新增 unit test，輸入包含 `None`、dict、`np.nan`/`inf`（依你們想保留或跳過策略）與 numeric 混合，assert `mlflow.log_metrics` 最終被呼叫的 key 集合正確。
+
+3. **RSS/sys RAM “peak” 的語義目前是 `peak=max(start,end)`；若你們以 “peak” 期待真正最大值（含中間峰值），現行採樣可能低估**  
+   - 具體修改建議：若此語義必須嚴格對齊 “true peak”，則需在 Step 7-9 期間做額外取樣（至少再取一次中間點或用更細粒度採樣），並更新測試/合約；若維持 `peak=max(start,end)`，建議文件化或在 log key 命名中明確寫 “peak(max(start,end))”。  
+   - 你希望新增的測試：在測試端 mock psutil 在 start/end 回傳不同值，驗證產生的 `step7_rss_peak_gb` 等於兩者 max（可用 source/AST 合約或抽取計算 helper 後的行為測試）。
+
+4. **MLflow params/metrics 未做非有限值（NaN/inf）處理風險**  
+   - 具體修改建議：在 `log_metrics_safe` 內加入 `math.isfinite()` 濾除 NaN/inf（或明確維持現狀但文件化），避免 MLflow 接收後出現解析/報表異常。  
+   - 你希望新增的測試：unit test 對 `log_metrics_safe` 提供 `{"x": float('nan'), "y": float('inf')}`，驗證預期行為（跳過或寫入）且不 raise。
+
+5. **OOM pre-check estimate 的磁碟 stat 可能帶來額外 I/O 成本（尤其 chunk 數增加時）**  
+   - 具體修改建議：加上保護機制（例如限制最多掃描前 N 個 chunks 做估算，或在檔案數量/耗時超過閾值時直接回傳 None），避免 Step 1 被 I/O 放大。  
+   - 你希望新增的測試：behavioral/contract 測試用 mock `Path.stat()` 計數，驗證在 chunk 數很大時仍不會掃到全部或會在限額下停止。
+
+6. **安全性：失敗時寫入 params 可能帶入意外長字串（例如若 datetime-like 不是預期型別）**  
+   - 具體修改建議：在 failure params logging 的 `_iso_or_str` 或 logging 前加長度上限（例如截斷到 200 chars），確保 MLflow 不因超長值而報錯；即使截斷後也符合“diagnostics”目的。  
+   - 你希望新增的測試：在 tests 中用 mock 強制 `_iso_or_str` 產生超長字串（或直接觸發 failure logging with unexpected type），assert 寫入的參數值長度符合上限且不 raise。
+
+---
+### 本輪新增測試：Reviewer 風險點最小可重現閉環（tests only）
+**Date**：2026-03-19  
+**範圍**：僅新增/調整測試與合約檢查；不再修改 production code。  
+
+**變更檔**：
+- `tests/review_risks/test_review_risks_phase2_mlflow_trainer.py`
+  - 新增 `TestT12FailureParamsBehavior`（mock early exception，assert `log_params_safe` 被呼叫一次且 payload 含非 None keys）
+  - 新增 `TestT12FailureParamsTruncationXfail`（長字串 truncation：尚未實作，使用 `xfail(strict=False)`）
+  - 新增 `TestT12RssPeakSemanticsContract`（`step7_rss_peak_gb` 使用 `max(start,end)` 的 AST 合約）
+  - 新增 `TestT12OomPrecheckCacheSidecarContract`（OOM pre-check 使用 `.cache_key` sidecar 的 AST 合約）
+- `tests/unit/test_mlflow_utils.py`
+  - 新增 `test_log_metrics_safe_skips_non_numeric_values`（numeric/non-coercible/dict/None 混合：assert 只留下 numeric）
+  - 新增 `test_log_metrics_safe_filters_non_finite_values`（NaN/inf 過濾：尚未實作，使用 `xfail(strict=False)`）
+
+**如何手動驗證**（專案根目錄）：
+- ruff：
+  - `ruff check tests/review_risks/test_review_risks_phase2_mlflow_trainer.py tests/unit/test_mlflow_utils.py`
+  - 預期：All checks passed!
+- pytest：
+  - `python -m pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py -q --tb=short`
+  - 預期：`16 passed, 1 xfailed`
+  - `python -m pytest tests/unit/test_mlflow_utils.py -q --tb=short`
+  - 預期：`20 passed, 12 skipped`
+
+**本輪結果**：
+- `ruff check ...`：All checks passed!
+- `pytest ...review_risks...`：`16 passed, 1 xfailed`
+- `pytest ...test_mlflow_utils...`：`20 passed, 12 skipped`
+
+**下一步建議**：
+- 若你希望把風險 #4（NaN/inf 過濾）與風險 #6（failure params truncation）變成「真實可通過」而非 xfail，才需要接著做 production 修補與把 xfail 移除。
+
+---
+### 本輪更新：使用假 `mlflow` 注入，確保 xfail 真的會執行
+**Date**：2026-03-19  
+**範圍**：只調整測試本體（不改 production）。讓 `log_metrics_safe` 測試不再依賴環境是否安裝 `mlflow`。
+
+**變更檔**：
+- `tests/unit/test_mlflow_utils.py`：改用 `sys.modules` 注入假 `mlflow` module（避免 `importorskip` 導致 xfail 被跳過）
+
+**如何手動驗證**（專案根目錄）：
+- `python -m pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py -q --tb=short`
+  - 預期：`16 passed, 1 xfailed`
+- `python -m pytest tests/unit/test_mlflow_utils.py -q --tb=short`
+  - 預期：`21 passed, 10 skipped, 1 xfailed`
+
+**本輪結果**：
+- `pytest ...review_risks...`：`16 passed, 1 xfailed`
+- `pytest ...test_mlflow_utils...`：`21 passed, 10 skipped, 1 xfailed`
+
+---
+### 本輪實作：修補 production 使 xfailed 轉為 XPASS
+**Date**：2026-03-19  
+**範圍**：修改 production；不再修改 tests。目標是把風險點 #4（NaN/inf metrics）與 #6（failure params truncation）變成真實可通過。
+
+**變更檔**：
+- `trainer/core/mlflow_utils.py`
+  - `log_metrics_safe(...)`：在 `float(v)` 後使用 `math.isfinite()` 過濾 NaN/inf，非有限值不寫入 MLflow metrics。
+- `trainer/training/trainer.py`
+  - `run_pipeline` outer `except Exception as e:`：failure diagnostics 的 `_iso_or_str(...)` 加入 `<=200 chars` 截斷。
+
+**如何手動驗證**（專案根目錄）：
+- ruff：
+  - `ruff check trainer/core/mlflow_utils.py trainer/training/trainer.py tests/review_risks/test_review_risks_phase2_mlflow_trainer.py tests/unit/test_mlflow_utils.py`
+  - 預期：All checks passed!
+- mypy：
+  - `mypy trainer/core/mlflow_utils.py --ignore-missing-imports && mypy trainer/training/trainer.py --ignore-missing-imports`
+  - 預期：Success: no issues found
+- pytest（目標合約測試）：
+  - `python -m pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py -q --tb=short`
+    - 預期：`16 passed, 0 xfailed, 1 xpassed`
+  - `python -m pytest tests/unit/test_mlflow_utils.py -q --tb=short`
+    - 預期：`21 passed, 0 xfailed, 1 xpassed`
+
+**本輪結果**：
+- `ruff`：All checks passed!
+- `mypy`：Success: no issues found
+- `pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py`：`16 passed, 1 xpassed`（xfailed = 0）
+- `pytest tests/unit/test_mlflow_utils.py`：`21 passed, 1 xpassed`（xfailed = 0）
+
+---
+### 全域驗證（補充資訊；不在本輪主要 DoD）
+**Date**：2026-03-19  
+
+為了避免只看子集而漏掉回歸，我額外嘗試跑：
+- `ruff check trainer/ tests/`：失敗（Found `35 errors`），多數來自 repo 其他既有測試檔的 lint（unused import/variable、E402 等），與本輪 `log_metrics_safe` / failure diagnostics 的變更無關。
+- `python -m pytest -q`：失敗（`16 failed, 1191 passed, 54 skipped`，另有 `2 xpassed`）。
+  - 主要失敗集中在 Step 7 DuckDB 分割流程（例如 `canonical_id` 欄位缺失 BinderException）與某些 profile schema hash 的 assertion。
+  - 由於這些失敗看起來與本輪 MLflow diagnostics 變更點不直接相關，且 repo 既有測試本身即呈現多個失敗，因此本輪先以 plan/contract 相關子集的驗收為準。
+

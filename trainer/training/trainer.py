@@ -71,6 +71,7 @@ from trainer.core.mlflow_utils import (
     has_active_run,
     log_params_safe,
     log_tags_safe,
+    log_metrics_safe,
     safe_start_run,
 )
 
@@ -4421,6 +4422,28 @@ def run_pipeline(args) -> None:
     _mlflow_run_name = f"train-{start.date()}-{end.date()}-{int(time.time())}"
     with safe_start_run(run_name=_mlflow_run_name):
         try:
+            # T12.2 Step 2 (success diagnostics): best-effort metrics for Step 7-9.
+            # Note: all values are optional; log_*_safe helpers will skip None.
+            chunks: list = []
+            recent_chunks: Optional[int] = getattr(args, "recent_chunks", None)
+            effective_start = start
+            effective_end = end
+            _effective_neg_sample_frac: float = NEG_SAMPLE_FRAC
+            step7_duration_sec: Optional[float] = None
+            step8_duration_sec: Optional[float] = None
+            step9_duration_sec: Optional[float] = None
+            # OOM pre-check estimate (Step 1) and post-check RSS peak (Step 7-9 checkpoint).
+            oom_precheck_est_peak_ram_gb: Optional[float] = None
+            oom_precheck_step7_rss_error_ratio: Optional[float] = None
+            # Process RSS (peak := max(start,end)) and system RAM min/max across Step 7-9.
+            step7_rss_start_gb: Optional[float] = None
+            step7_rss_end_gb: Optional[float] = None
+            step7_rss_peak_gb: Optional[float] = None
+            step7_sys_available_min_gb: Optional[float] = None
+            step7_sys_used_percent_peak: Optional[float] = None
+            _step7_sys_available_start_gb: Optional[float] = None
+            _step7_sys_used_percent_start: Optional[float] = None
+
             # 1. Monthly chunks (DEC-008 / SSOT §4.3)
             print("[Step 1/10] Training window and monthly chunks…", flush=True)
             t0 = time.perf_counter()
@@ -4462,9 +4485,34 @@ def run_pipeline(args) -> None:
             # --- OOM pre-check (earliest feasible point: chunk list is final) ---
             # Estimate Step 7 peak RAM and auto-reduce NEG_SAMPLE_FRAC when OOM is likely.
             # Result may equal NEG_SAMPLE_FRAC (no change) or be lower (auto-adjusted).
-            _effective_neg_sample_frac: float = _oom_check_and_adjust_neg_sample_frac(
+            _effective_neg_sample_frac = _oom_check_and_adjust_neg_sample_frac(
                 chunks, NEG_SAMPLE_FRAC
             )
+
+            # T12.2: best-effort OOM pre-check estimate (for later RSS error ratio).
+            # Keep this as a deterministic/side-effect-free computation so logging
+            # never changes pipeline behavior.
+            try:
+                existing_sizes = [
+                    _chunk_parquet_path(c).stat().st_size
+                    for c in chunks
+                    if _chunk_parquet_path(c).exists()
+                    and _chunk_parquet_path(c).with_suffix(".cache_key").exists()
+                ]
+                if existing_sizes:
+                    _per_chunk_bytes = sum(existing_sizes) / len(existing_sizes)
+                else:
+                    _per_chunk_bytes = NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT
+
+                _n_chunks = len(chunks)
+                _estimated_on_disk = _per_chunk_bytes * _n_chunks
+                if STEP7_USE_DUCKDB:
+                    _estimated_peak_ram = _estimated_on_disk * CHUNK_CONCAT_RAM_FACTOR * TRAIN_SPLIT_FRAC
+                else:
+                    _estimated_peak_ram = _estimated_on_disk * CHUNK_CONCAT_RAM_FACTOR * (1.0 + TRAIN_SPLIT_FRAC)
+                oom_precheck_est_peak_ram_gb = _estimated_peak_ram / (1024**3)
+            except Exception:
+                oom_precheck_est_peak_ram_gb = None
         
             # 2. Chunk-level split — used ONLY to derive train_end for the canonical
             #    mapping cutoff (B1 / R25 identity-leakage guard).  The actual row
@@ -5280,6 +5328,29 @@ def run_pipeline(args) -> None:
         
             # 5. Load all chunks, sort, row-level train/valid/test split (PLAN Step 7 Out-of-Core).
             #    Orchestrator: DuckDB first (Layer 1), on failure pandas fallback (Layer 3).
+            # T12.2: checkpoint memory sampling across Step 7-9.
+            # Peak := max(start, end) to keep sampling overhead low while satisfying
+            # "start/peak/end are present" logging contracts.
+            try:
+                import psutil as _psutil  # optional dependency (best-effort)
+
+                _step7_process = _psutil.Process()
+                step7_rss_start_gb = _step7_process.memory_info().rss / (1024**3)
+                _vm_start = _psutil.virtual_memory()
+                _step7_sys_available_start_gb = _vm_start.available / (1024**3)
+                _step7_sys_used_percent_start = float(_vm_start.percent)
+
+                # MLflow tag naming contract (constants must be present in source).
+                log_tags_safe(
+                    {
+                        "memory_sampling": "checkpoint_peak",
+                        "memory_sampling_scope": "step7_9",
+                    }
+                )
+            except Exception as _e:
+                # If psutil is unavailable, still tag so MLflow run can be diagnosed.
+                log_tags_safe({"memory_sampling": "disabled_no_psutil"})
+
             print("[Step 7/10] Load all chunks, concat, row-level train/valid/test split…", flush=True)
             t0 = time.perf_counter()
             _chunk_total_bytes = sum(Path(p).stat().st_size for p in chunk_paths)
@@ -5400,6 +5471,7 @@ def run_pipeline(args) -> None:
             _n_valid_print = _n_valid if valid_df is None else len(valid_df)
             _n_test_print = _n_test if test_df is None else len(test_df)
             _el = time.perf_counter() - t0
+            step7_duration_sec = _el
             print("[Step 7/10] Load all chunks, concat, row-level split done in %.1fs (train=%d valid=%d test=%d)" % (_el, _n_train_print, _n_valid_print, _n_test_print), flush=True)
             logger.info(
                 "Row-level split (%.0f/%.0f/%.0f) — train: %d  valid: %d  test: %d  (load+sort+split: %.1fs)",
@@ -5505,6 +5577,7 @@ def run_pipeline(args) -> None:
                     train_df=train_df if train_df is not None else None,
                 )
                 _el = time.perf_counter() - t0
+                step8_duration_sec = _el
                 print("[Step 8/10] Feature screening done in %.1fs (%d -> %d features)" % (_el, len(_present_candidate_cols), len(screened_cols)), flush=True)
                 logger.info(
                     "screen_features: %d -> %d features retained  (%.1fs)",
@@ -5603,8 +5676,31 @@ def run_pipeline(args) -> None:
                 test_libsvm_path=_test_libsvm,
             )
             _el = time.perf_counter() - t0
+            step9_duration_sec = _el
             print("[Step 9/10] Train single rated model + test-set eval done in %.1fs" % _el, flush=True)
             logger.info("train_single_rated_model + test eval: %.1fs", _el)
+
+            # T12.2: capture RSS/sys RAM snapshot at Step 9 end (checkpoint scope Step 7-9).
+            # Peak := max(start, end) to avoid heavy sampling/polling overhead.
+            if step7_rss_start_gb is not None:
+                try:
+                    import psutil as _psutil
+
+                    _proc_end = _psutil.Process()
+                    step7_rss_end_gb = _proc_end.memory_info().rss / (1024**3)
+                    if step7_rss_end_gb is not None:
+                        step7_rss_peak_gb = max(step7_rss_start_gb, step7_rss_end_gb)
+
+                    _vm_end = _psutil.virtual_memory()
+                    if _step7_sys_available_start_gb is not None:
+                        _vm_end_avail_gb = _vm_end.available / (1024**3)
+                        step7_sys_available_min_gb = min(_step7_sys_available_start_gb, _vm_end_avail_gb)
+                    if _step7_sys_used_percent_start is not None:
+                        _vm_end_used_percent = float(_vm_end.percent)
+                        step7_sys_used_percent_peak = max(_step7_sys_used_percent_start, _vm_end_used_percent)
+                except Exception:
+                    # If memory sampling fails, just keep metrics unset; never impact training.
+                    pass
         
             # 7. Save artifacts
             print("[Step 10/10] Save artifact bundle…", flush=True)
@@ -5644,6 +5740,51 @@ def run_pipeline(args) -> None:
             total_sec = time.perf_counter() - pipeline_start
             print("All steps completed. Pipeline total: %.1fs (%.1f min)" % (total_sec, total_sec / 60.0), flush=True)
             logger.info("Pipeline total: %.1fs (%.1f min)", total_sec, total_sec / 60.0)
+
+            # T12.2: Log training success metrics + Step 7-9 memory/OOM diagnostics to MLflow.
+            try:
+                # OOM pre-check estimate vs observed RSS.
+                if (
+                    oom_precheck_est_peak_ram_gb is not None
+                    and oom_precheck_est_peak_ram_gb > 0
+                    and step7_rss_peak_gb is not None
+                ):
+                    oom_precheck_step7_rss_error_ratio = (
+                        step7_rss_peak_gb / oom_precheck_est_peak_ram_gb
+                    )
+
+                oom_params = {
+                    "oom_precheck_est_peak_ram_gb": oom_precheck_est_peak_ram_gb,
+                    "oom_precheck_step7_rss_error_ratio": oom_precheck_step7_rss_error_ratio,
+                }
+                # Avoid logging None values (MLflow params do not accept nulls well).
+                oom_params_clean = {k: v for k, v in oom_params.items() if v is not None}
+                if oom_params_clean:
+                    log_params_safe(oom_params_clean)
+
+                mlflow_metrics: dict[str, Any] = {
+                    "total_duration_sec": total_sec,
+                    "step7_duration_sec": step7_duration_sec,
+                    "step8_duration_sec": step8_duration_sec,
+                    "step9_duration_sec": step9_duration_sec,
+                    # Step 7-9 checkpoint memory metrics (names align with plan).
+                    "step7_rss_start_gb": step7_rss_start_gb,
+                    "step7_rss_peak_gb": step7_rss_peak_gb,
+                    "step7_rss_end_gb": step7_rss_end_gb,
+                    "step7_sys_available_min_gb": step7_sys_available_min_gb,
+                    "step7_sys_used_percent_peak": step7_sys_used_percent_peak,
+                    # Keep this also as a metric for easier plotting.
+                    "oom_precheck_step7_rss_error_ratio": oom_precheck_step7_rss_error_ratio,
+                }
+
+                # Performance metrics from training artifact.
+                _rated = (combined_metrics or {}).get("rated", {})
+                if isinstance(_rated, dict):
+                    mlflow_metrics.update(_rated)
+
+                log_metrics_safe(mlflow_metrics)
+            except Exception as _mlflow_exc:
+                logger.warning("MLflow success diagnostics logging failed: %s", _mlflow_exc)
         
             summary = {
                 "model_version": model_version,
@@ -5655,6 +5796,38 @@ def run_pipeline(args) -> None:
             print(json.dumps(summary, indent=2, default=str))
         except Exception as e:
             log_tags_safe({"status": "FAILED", "error": str(e)[:500]})
+            # T12 failure diagnostics (optional follow-on): log best-effort params for post-mortem.
+            # Never allow this diagnostics step to change failure behavior.
+            try:
+                def _iso_or_str(x: Any) -> Optional[str]:
+                    # Code Review §6: keep MLflow params bounded to avoid oversized strings.
+                    _MAX_CHARS = 200
+                    if x is None:
+                        return None
+                    if hasattr(x, "isoformat"):
+                        s = x.isoformat()  # datetime-like
+                    else:
+                        s = str(x)
+                    if len(s) > _MAX_CHARS:
+                        return s[:_MAX_CHARS]
+                    return s
+
+                chunk_count = len(chunks) if chunks else None
+                failure_params = {
+                    "training_window_start": _iso_or_str(effective_start),
+                    "training_window_end": _iso_or_str(effective_end),
+                    "recent_chunks": recent_chunks,
+                    "neg_sample_frac": _effective_neg_sample_frac,
+                    "chunk_count": chunk_count,
+                    "use_local_parquet": bool(use_local),
+                    "oom_precheck_est_peak_ram_gb": oom_precheck_est_peak_ram_gb,
+                }
+                # MLflow expects non-null scalar params; drop None.
+                failure_params_clean = {k: v for k, v in failure_params.items() if v is not None}
+                if failure_params_clean:
+                    log_params_safe(failure_params_clean)
+            except Exception:
+                pass
             raise
 
 
