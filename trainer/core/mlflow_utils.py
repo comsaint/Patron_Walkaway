@@ -182,7 +182,9 @@ def safe_start_run(
         from contextlib import nullcontext
         return nullcontext()
     import mlflow  # type: ignore[import-not-found]
-    return mlflow.start_run(experiment_name=experiment_name, run_name=run_name, tags=tags)
+    if experiment_name is not None:
+        mlflow.set_experiment(experiment_name)
+    return mlflow.start_run(run_name=run_name, tags=tags)
 
 
 def log_params_safe(params: dict[str, Any]) -> None:
