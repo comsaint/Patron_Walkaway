@@ -30,7 +30,7 @@ import logging
 import os
 import sqlite3
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -65,10 +65,7 @@ except ImportError:
 
 from trainer.db_conn import get_clickhouse_client  # serving lives under trainer; db_conn at package root
 
-try:
-    import config  # type: ignore[import]
-except ModuleNotFoundError:
-    import trainer.config as config  # type: ignore[import, no-redef]
+from trainer.core import config  # SSOT; avoid cwd config.py shadowing (Code Review §1)
 
 try:
     from features import (  # type: ignore[import]
@@ -657,6 +654,15 @@ def build_features_for_scoring(
     if bets.empty:
         return bets.copy()
 
+    # R3505 / Code Review: reject invalid cutoff_time (None, NaT, date)
+    if cutoff_time is None:
+        raise ValueError("build_features_for_scoring: cutoff_time is required and must be a valid datetime")
+    if isinstance(cutoff_time, date) and not isinstance(cutoff_time, datetime):
+        raise ValueError("build_features_for_scoring: cutoff_time must be a datetime, not date")
+    _ct = pd.Timestamp(cutoff_time)
+    if pd.isna(_ct):
+        raise ValueError("build_features_for_scoring: cutoff_time is required and must be a valid datetime")
+
     bets_df = bets.copy()
 
     # ── Normalise types (ClickHouse may return object/string; LightGBM needs int/float/bool) ──
@@ -678,8 +684,12 @@ def build_features_for_scoring(
         pcd = pcd.dt.tz_convert(HK_TZ).dt.tz_localize(None)
     bets_df["payout_complete_dtm"] = pcd
 
-    # Normalise cutoff_time to tz-naive
-    cutoff_naive = cutoff_time.replace(tzinfo=None) if cutoff_time.tzinfo is not None else cutoff_time
+    # Normalise cutoff_time to tz-naive HK (R3505: convert before strip; use HK_TZ for SSOT)
+    ct = _ct
+    if ct.tz is not None:
+        cutoff_naive = ct.tz_convert(HK_TZ).tz_localize(None).to_pydatetime()
+    else:
+        cutoff_naive = ct.to_pydatetime()
 
     # ── D2 identity ───────────────────────────────────────────────────────
     if not canonical_map.empty and "player_id" in canonical_map.columns:
@@ -699,12 +709,15 @@ def build_features_for_scoring(
         ["canonical_id", "payout_complete_dtm", "bet_id"], kind="stable"
     ).reset_index(drop=True)
 
-    # ── Track Human ──────────────────────────────────────────────────────────
+    # ── Track Human (same lookback as trainer for train–serve parity) ────────
+    _lookback_hours = getattr(config, "SCORER_LOOKBACK_HOURS", 8)
     bets_df["loss_streak"] = compute_loss_streak(
-        bets_df, cutoff_time=cutoff_naive
+        bets_df, cutoff_time=cutoff_naive, lookback_hours=_lookback_hours
     ).fillna(0)
 
-    rb = compute_run_boundary(bets_df, cutoff_time=cutoff_naive)
+    rb = compute_run_boundary(
+        bets_df, cutoff_time=cutoff_naive, lookback_hours=_lookback_hours
+    )
     bets_df["run_id"] = rb["run_id"] if "run_id" in rb.columns else 0
     bets_df["minutes_since_run_start"] = (
         rb["minutes_since_run_start"] if "minutes_since_run_start" in rb.columns else 0.0

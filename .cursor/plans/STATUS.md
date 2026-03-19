@@ -6,6 +6,129 @@
 
 ---
 
+## Scorer Track Human lookback parity fix
+
+**Date**: 2026-03-19
+
+### 目標
+對齊 scorer 的 Track Human 特徵計算與 trainer：在 `build_features_for_scoring` 中對 `compute_loss_streak` 與 `compute_run_boundary` 傳入 `lookback_hours=SCORER_LOOKBACK_HOURS`，消除 train–serve parity 缺口（先前僅 trainer/backtester 使用 config 的 lookback，scorer 未傳入）。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/serving/scorer.py` | 在 Track Human 區塊取得 `_lookback_hours = getattr(config, "SCORER_LOOKBACK_HOURS", 8)`，並將 `lookback_hours=_lookback_hours` 傳入 `compute_loss_streak` 與 `compute_run_boundary`。 |
+
+### 驗證
+
+- `python -m pytest tests/integration/test_feat_consolidation_step8.py tests/review_risks/test_review_risks_lookback_hours_trainer_align.py tests/integration/test_scorer.py -v` → **43 passed**.
+
+---
+
+### Code Review：Scorer Track Human lookback parity 變更 — 高可靠性標準
+
+**Date**: 2026-03-19  
+**範圍**：本輪對 `trainer/serving/scorer.py` 的 Track Human 區塊變更（`_lookback_hours` 取得與傳入 `compute_loss_streak` / `compute_run_boundary`）；不重寫整套，僅列潛在問題與建議。
+
+---
+
+#### 1. config 匯入來源依執行環境而定（邊界條件）
+
+**問題**：`scorer.py` 頂部為 `try: import config except ModuleNotFoundError: import trainer.config as config`。從專案根目錄或 `trainer/serving/` 執行時，若當前目錄存在同名 `config.py`，會先載入該檔而非 `trainer.config` / `trainer.core.config`，導致讀到錯誤的 `SCORER_LOOKBACK_HOURS`（或該屬性不存在時靜默用 8），與 trainer 使用之 config 不一致，parity 可能破功。
+
+**具體修改建議**：改為**一律**從 trainer 匯入，例如 `from trainer.core import config` 或 `from trainer import config`（依專案既有 re-export 約定），避免 cwd 影響。若專案現有慣例為 `trainer.config`（指向 core），則 scorer 改為與 validator 修補後一致：`from trainer.core import config`。
+
+**希望新增的測試**：契約測試：在 tests 中 assert `build_features_for_scoring` 所依賴的 config 來源為 trainer（例如呼叫前 patch `trainer.core.config.SCORER_LOOKBACK_HOURS = 4`，以固定 fixture 呼叫 `build_features_for_scoring`，assert 結果之 `loss_streak` / `minutes_since_run_start` 與 lookback=4 語義一致，例如與直接呼叫 `compute_loss_streak(..., lookback_hours=4)` 結果一致）；或較輕量：assert 模組層級 `config.__name__` 含 `trainer`（與 DEC-030 validator 契約同風格）。
+
+---
+
+#### 2. lookback_hours ≤ 0 或非數值時未在 scorer 防呆（邊界條件）
+
+**問題**：`getattr(config, "SCORER_LOOKBACK_HOURS", 8)` 在屬性不存在時回傳 8，但若 config 被 patch 或未來改為從環境變數讀取且未轉型，可能得到 `0`、負數或字串。`features.compute_loss_streak` / `compute_run_boundary` 在 `lookback_hours is not None and lookback_hours <= 0` 時會 `raise ValueError`，故 scorer 在 **lookback_hours=0 或負數** 時會崩潰；若傳入字串，`lookback_hours <= 0` 可能觸發 `TypeError` 或比較結果不預期。
+
+**具體修改建議**：在取得 `_lookback_hours` 後、傳入 Track Human 前，做一次防呆：若為非數值或 ≤ 0，則 log warning 並 fallback 為 8，或 raise ValueError 並提示設定錯誤。建議：`_lookback_hours = getattr(config, "SCORER_LOOKBACK_HOURS", 8)` 後加 `if not isinstance(_lookback_hours, (int, float)) or _lookback_hours <= 0: logger.warning("SCORER_LOOKBACK_HOURS invalid (%s), using 8", _lookback_hours); _lookback_hours = 8`，確保傳入 features 的必為正數。
+
+**希望新增的測試**：邊界測試：patch `config.SCORER_LOOKBACK_HOURS = 0` 或 `-1`，呼叫 `build_features_for_scoring`（最小 fixture），預期不 crash 且結果與 lookback=8 或與 fallback 後行為一致（或預期 raise 並 assert 錯誤訊息）；若採「字串誤設」情境，patch 為 `"8"`，assert 仍能正常完成（或明確轉型後通過）。
+
+---
+
+#### 3. 效能與安全性
+
+**結論**：僅多讀一次 config 屬性與兩個關鍵字參數傳遞，無額外 I/O 或迴圈，效能影響可忽略。未新增外部輸入或敏感資料暴露，無安全性問題。無需額外測試。
+
+---
+
+#### Review 總結
+
+| 項目 | 嚴重度 | 類型 |
+|------|--------|------|
+| config 匯入來源依 cwd | 中 | 邊界條件 |
+| lookback_hours ≤ 0 或非數值未防呆 | 低～中 | 邊界條件 |
+| 效能／安全性 | 無 | — |
+
+建議優先處理 **§1（config 匯入固定為 trainer）**；**§2** 可與既有 config 契約測試（如 `test_scorer_poll_defaults_exist_and_positive`）一併補強，或於日後改為 env 覆寫時再加型別與範圍檢查。
+
+---
+
+### 風險點對應測試與執行方式（僅 tests，未改 production）
+
+**Date**: 2026-03-19  
+**原則**：將 Code Review §1–§2 轉成最小可重現測試或契約；僅新增 tests，不修改 production code。
+
+| Review 項目 | 測試位置 | 說明 |
+|-------------|----------|------|
+| **§1** config 匯入來源為 trainer | `tests/review_risks/test_review_risks_scorer_lookback_parity.py::TestScorerLookbackConfigSourceContract::test_scorer_config_source_is_trainer` | 契約：`trainer.serving.scorer` 所用之 `config.__name__` 須含 `trainer`（避免 cwd config 遮蔽）。 |
+| **§1** config 具 SCORER_LOOKBACK_HOURS | `tests/review_risks/test_review_risks_scorer_lookback_parity.py::TestScorerLookbackConfigSourceContract::test_scorer_config_has_scorer_lookback_hours` | 契約：config 須有 `SCORER_LOOKBACK_HOURS` 且為正數。 |
+| **§2** lookback_hours=0 時 raise | `tests/review_risks/test_review_risks_scorer_lookback_parity.py::TestScorerLookbackHoursBoundary::test_lookback_hours_zero_raises_value_error` | 邊界：patch `SCORER_LOOKBACK_HOURS=0` 後呼叫 `build_features_for_scoring`，預期 `ValueError`（來自 features）；若 production 改為 fallback，可改為預期不 raise。 |
+| **§2** lookback_hours&lt;0 時 raise | `tests/review_risks/test_review_risks_scorer_lookback_parity.py::TestScorerLookbackHoursBoundary::test_lookback_hours_negative_raises_value_error` | 邊界：patch `-1`，預期 `ValueError`。 |
+| **§2** lookback_hours 字串 | `tests/review_risks/test_review_risks_scorer_lookback_parity.py::TestScorerLookbackHoursBoundary::test_lookback_hours_string_raises_or_completes` | 邊界：patch `"8"`，目前可能 `TypeError` 或完成；若 production 加型別轉換，可改為僅 assert 成功並有 Track Human 欄位。 |
+
+**執行方式**（專案根目錄）：
+
+```bash
+# 僅跑本輪新增之 Scorer lookback parity 契約／邊界測試
+python -m pytest tests/review_risks/test_review_risks_scorer_lookback_parity.py -v
+
+# 與既有 scorer / Track Human 相關測試一併跑
+python -m pytest tests/review_risks/test_review_risks_scorer_lookback_parity.py tests/integration/test_feat_consolidation_step8.py tests/review_risks/test_review_risks_lookback_hours_trainer_align.py tests/integration/test_scorer.py -v
+```
+
+**驗證結果**：`python -m pytest tests/review_risks/test_review_risks_scorer_lookback_parity.py -v` → **5 passed**。
+
+---
+
+### 本輪實作修正與驗證結果（Code Review §1 修補）
+
+**Date**: 2026-03-19  
+**原則**：不改 tests（除非測試本身錯或 decorator 過時）；僅修改實作直至相關 tests / typecheck / lint 通過；結果追加 STATUS。
+
+#### 實作修改
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/serving/scorer.py` | **§1**：config 匯入改為 `from trainer.core import config`，不再 `try: import config except: import trainer.config as config`，避免 cwd 下 `config.py` 遮蔽 trainer SSOT。 |
+
+§2（lookback_hours ≤ 0 或非數值時 fallback）未改動：目前 production 無防呆，features 會 raise ValueError；契約／邊界測試已鎖定此行為，若日後加 fallback 再調整測試預期。
+
+#### 驗證結果
+
+- **Scorer lookback parity + 相關**：`python -m pytest tests/review_risks/test_review_risks_scorer_lookback_parity.py tests/integration/test_scorer.py tests/unit/test_config.py tests/review_risks/test_review_risks_train_serve_parity_config.py -q` → **25 passed**。
+- **Ruff**：`ruff check trainer/` → **All checks passed!**
+- **Lint**：無新增診斷。
+
+#### 本輪後項目狀態與剩餘項目（Scorer Track Human lookback parity）
+
+| 項目 | 狀態 | 說明 |
+|------|------|------|
+| Scorer 傳入 lookback_hours | ✅ 已完成 | 前輪已實作。 |
+| Code Review §1 config 匯入 | ✅ 已完成 | 本輪改為 `from trainer.core import config`。 |
+| Code Review §2 lookback 防呆 | ⏸ 未實作 | 可選：非數值或 ≤ 0 時 log warning + fallback 8；目前測試鎖定「raise ValueError」。 |
+| 風險點對應測試 | ✅ 已就位 | 5 則契約／邊界測試，執行方式見上。 |
+
+**剩餘可選**：§2 防呆（若未來以 env 覆寫 `SCORER_LOOKBACK_HOURS`，建議在 scorer 或 config 加型別／範圍檢查或 fallback）。
+
+---
+
 ## Credential folder 整合（PLAN 下 1–2 步）
 
 **Date**: 2026-03-19

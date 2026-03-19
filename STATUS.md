@@ -2821,3 +2821,145 @@ ruff check trainer/config.py trainer/trainer.py tests/test_review_risks_dec027_c
 ```
 
 **說明**：`ruff check trainer/ tests/` 仍有 31 個既有錯誤（E402/F401 等於其他測試檔），非本輪引入；依「不改 tests 除非測試錯或 decorator 過時」未改動該等檔案。本輪修改之 trainer 與 DEC-027 測試檔通過 ruff。
+
+---
+
+## R3505 — build_features_for_scoring cutoff_time 香港時區正規化（2026-03-19）
+
+**目標**：在 `build_features_for_scoring` 中對 `cutoff_time` 先轉成香港時區再 strip（與 `compute_track_llm_features` / Round 103 一致），避免僅用 `replace(tzinfo=None)` 導致時區語意錯誤。
+
+### 本輪修改
+
+| 檔案 | 說明 |
+|------|------|
+| `trainer/serving/scorer.py` | 將 cutoff 正規化改為：`pd.Timestamp(cutoff_time)` → 若有 tz 則 `tz_convert("Asia/Hong_Kong").tz_localize(None).to_pydatetime()`，否則沿用原值；註解標註 R3505。 |
+
+### 手動驗證
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_round350.py::TestR3505UtcCutoffNormalization -v
+# 預期：1 passed
+```
+
+可再跑 scorer / build_features 相關與 parity 測試、以及 `ruff check trainer/serving/scorer.py`，確認無回歸。
+
+### 下一步建議
+
+- 若尚有其他 scoring 路徑使用 cutoff_time，可一併檢查是否需相同正規化。
+- 視需求補一則整合或單元測試，用帶 tz 的 cutoff 呼叫 `build_features_for_scoring` 並斷言結果時間為 HK 語意。
+
+---
+
+## Code Review：R3505 cutoff_time 正規化變更（2026-03-19）
+
+針對 `trainer/serving/scorer.py` 中 `build_features_for_scoring` 的 cutoff 正規化（約 L677–683）之 review，僅列問題與建議，不重寫整套。
+
+### 1. [一致性／可維護性] 時區字串與專案 SSOT 不一致
+
+*   **問題描述**：同一檔案其餘處皆用 `HK_TZ`（`ZoneInfo(config.HK_TZ)`），唯 R3505 區塊寫死 `"Asia/Hong_Kong"`。若未來 `config.HK_TZ` 調整，此處會與行為脫鉤。
+*   **具體修改建議**：改為使用既有常數，例如  
+    `cutoff_naive = ct.tz_convert(HK_TZ).tz_localize(None).to_pydatetime()`  
+    以與 L675、L760、L1304 等處一致。
+*   **希望新增的測試**：在 `tests/review_risks/test_review_risks_round350.py`（或同等）新增一則：`build_features_for_scoring` 的 cutoff 正規化邏輯使用與 `config.HK_TZ` / 檔案內 `HK_TZ` 一致之來源（例如透過 ast 或 source 檢查使用 `HK_TZ` 或 `config.HK_TZ`，而非硬編碼 `"Asia/Hong_Kong"` 字串）。
+
+### 2. [邊界條件] 無效或缺失的 cutoff_time（None / NaT）
+
+*   **問題描述**：函式簽名為 `cutoff_time: datetime`，但若呼叫方傳入 `None` 或經 `pd.Timestamp` 後得到 NaT，則 `ct.tz is None` 會走 else，`cutoff_naive = cutoff_time`（None 或 NaT）傳給 `compute_loss_streak` / `compute_run_boundary`。兩者雖接受 `Optional[datetime]`，但 NaT 會導致 `df["payout_complete_dtm"] <= cutoff_ts` 等比較全為 NaN/False，可能整段被濾掉或結果異常。
+*   **具體修改建議**：在正規化前加入防禦：若 `cutoff_time is None` 或 `pd.isna(pd.Timestamp(cutoff_time))`，則提早 raise `ValueError("build_features_for_scoring: cutoff_time is required and must be a valid datetime")`（或依專案慣例改為 log + 使用 fallback）；若採用 fallback，需在 docstring 註明。
+*   **希望新增的測試**：`test_build_features_for_scoring_rejects_none_or_nat_cutoff` — 傳入 `cutoff_time=None` 或 `cutoff_time=pd.NaT`（或等效），斷言 raise `ValueError` 或明確的錯誤型別，且錯誤訊息提及 cutoff。
+
+### 3. [邊界條件／型別] 無 tz 時回傳型別不一致
+
+*   **問題描述**：有 tz 時 `cutoff_naive` 為 `datetime`（`.to_pydatetime()`）；無 tz 時 `cutoff_naive = cutoff_time`（原物）。若呼叫方傳入 `pd.Timestamp` 或 `numpy.datetime64`，else 分支會把非 `datetime` 型別傳給下游，型別註解為 `datetime` 的 API 會不一致，且 mypy 可能報錯。
+*   **具體修改建議**：無 tz 時也統一為 `datetime`，例如  
+    `cutoff_naive = ct.to_pydatetime()`  
+    （`pd.Timestamp` 支援 `to_pydatetime()`）；若需相容僅有 `datetime` 的呼叫路徑，可寫  
+    `cutoff_naive = ct.to_pydatetime() if hasattr(ct, "to_pydatetime") else cutoff_time`，並在 docstring 註明「callers should pass datetime or timezone-aware Timestamp」。
+*   **希望新增的測試**：`test_build_features_for_scoring_cutoff_naive_type` — 傳入 naive `pd.Timestamp` 或 `datetime`，呼叫 `build_features_for_scoring` 後（可 mock 或斷言未拋錯），確認傳入 `compute_loss_streak` / `compute_run_boundary` 的 cutoff 為 `datetime` 型別（例如在測試中 patch 該二函式，記錄收到之 `cutoff_time` 型別並 assert type is datetime）。
+
+### 4. [邊界條件] date 與字串輸入
+
+*   **問題描述**：若呼叫方傳入 `date` 或字串（如 `"2025-01-01"`），`pd.Timestamp(...)` 會解析；若結果為 naive，會走 else 並把原 `date`/字串傳下去，下游可能預期 `datetime` 而 TypeError 或產生 24 小時邊界語意差異。
+*   **具體修改建議**：在 docstring 的 `cutoff_time` 參數註明「Must be a timezone-aware or naive datetime (or pd.Timestamp). date or string is not guaranteed.」；若有需要，可在正規化開頭用 `ct = pd.Timestamp(cutoff_time)` 後檢查 `isinstance(ct, pd.Timestamp) and not pd.isna(ct)`，若為 date 或無法轉成單一時刻則 raise 或轉成當日 00:00:00 並在 doc 註明。
+*   **希望新增的測試**：`test_build_features_for_scoring_cutoff_date_or_string` — 傳入 `date(2025,1,1)` 或 `"2025-01-01 00:00:00"`，斷言 either 明確支援（行為與 doc 一致）或 明確 raise / 明確 doc 不支援。
+
+### 5. [效能]
+
+*   **結論**：每呼叫一次僅多一次 `pd.Timestamp` 與一次 `tz_convert`，O(1)，無額外大記憶體，無明顯效能問題。
+
+### 6. [安全性]
+
+*   **結論**：純時間計算、無使用者輸入注入、無敏感資料外洩風險，未發現安全性問題。
+
+---
+
+## 本次已新增：R3505 正規化 Review 風險 → 最小可重現測試（tests-only）
+
+將上述 Code Review 四項風險轉成最小可重現測試或 source/lint 規則；**僅新增 tests，未改 production**。
+
+**新增檔案**：`tests/review_risks/test_review_risks_r3505_cutoff.py`
+
+**覆蓋項目**（對應 Review §1–§4）：
+
+| 測試 | 對應風險 | 說明 | 目前狀態 |
+|------|----------|------|----------|
+| `TestR3505CutoffUsesHkTzConstant::test_cutoff_normalization_uses_hk_tz_not_literal` | §1 一致性 | Lint 規則：cutoff 正規化區塊內應使用 `tz_convert(HK_TZ)`，不得硬編碼 `"Asia/Hong_Kong"`（inspect 源碼擷取該區塊檢查）。 | 通過（Round 修補後） |
+| `TestR3505CutoffRejectsInvalid::test_build_features_for_scoring_rejects_none_cutoff` | §2 邊界 | 傳入 `cutoff_time=None` 時應 raise（ValueError/TypeError），錯誤訊息提及 cutoff。 | 通過 |
+| `TestR3505CutoffRejectsInvalid::test_build_features_for_scoring_rejects_nat_cutoff` | §2 邊界 | 傳入 `cutoff_time=pd.NaT` 時應 raise，避免下游比較全 NaN。 | 通過 |
+| `TestR3505CutoffDownstreamType::test_downstream_receives_datetime_when_naive_datetime_passed` | §3 型別 | 傳入 naive `datetime` 時，patch 下游 `compute_loss_streak` 並斷言收到之 `cutoff_time` 型別為 `datetime`。 | 通過 |
+| `TestR3505CutoffDownstreamType::test_downstream_receives_datetime_when_naive_timestamp_passed` | §3 型別 | 傳入 naive `pd.Timestamp` 時，下游應收到 `datetime`（非 Timestamp）。 | 通過 |
+| `TestR3505CutoffDateOrString::test_build_features_for_scoring_cutoff_date_raises` | §4 邊界 | 傳入 `date(2025,1,1)` 時應 raise 或 doc 明確不支援。 | 通過 |
+| `TestR3505CutoffDateOrString::test_build_features_for_scoring_cutoff_string_behavior` | §4 邊界 | 傳入字串 cutoff：要麼 raise，要麼回傳 DataFrame（不靜默崩潰）。 | 通過 |
+
+**執行方式**：
+
+```bash
+# 僅跑本檔
+python -m pytest tests/review_risks/test_review_risks_r3505_cutoff.py -v
+```
+
+**本機實跑結果**（新增時）：`2 passed, 5 xfailed`。待 production 依 Review 建議修改後，可逐項移除 `@unittest.expectedFailure` 使測試轉為強制通過。
+
+---
+
+## Round — R3505 正規化 Production 修補與 tests/typecheck/lint 全過（2026-03-19）
+
+**目標**：依 Code Review R3505 四項風險修改 production，使 `test_review_risks_r3505_cutoff.py` 全數通過；僅在 decorator 過時時移除 `@unittest.expectedFailure`；tests/typecheck/lint 通過後結果追加至 STATUS；更新 PLAN 狀態與剩餘項。
+
+### 本輪修改（production）
+
+| 檔案 | 說明 |
+|------|------|
+| `trainer/serving/scorer.py` | **§1**：cutoff 正規化改為 `tz_convert(HK_TZ)`（不再硬編碼 `"Asia/Hong_Kong"`）。**§2**：正規化前防禦 — `cutoff_time is None` 或 `pd.isna(pd.Timestamp(cutoff_time))` 時 raise `ValueError("...cutoff_time is required and must be a valid datetime")`。**§2**：`isinstance(cutoff_time, date) and not isinstance(cutoff_time, datetime)` 時 raise（拒絕 `date`）。**§3**：無 tz 時 `cutoff_naive = ct.to_pydatetime()`，下游一律收到 `datetime`。`datetime` 新增 import `date`；正規化區塊使用共用 `_ct = pd.Timestamp(cutoff_time)` 供後段使用。 |
+
+### 本輪修改（tests — 僅 decorator 過時）
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/review_risks/test_review_risks_r3505_cutoff.py` | 移除 5 處已過時之 `@unittest.expectedFailure`（§1 一則、§2 兩則、§3 一則、§4 一則）。 |
+
+### 驗證結果
+
+```text
+python -m pytest tests/review_risks/test_review_risks_r3505_cutoff.py -v
+# 7 passed
+
+python -m pytest tests/review_risks/test_review_risks_round350.py tests/integration/test_feat_consolidation_step8.py -q
+# 24 passed
+
+python -m mypy trainer/ --ignore-missing-imports
+# Success: no issues found in 48 source files
+
+ruff check trainer/serving/scorer.py
+# All checks passed!
+```
+
+建議再跑全量 `python -m pytest -q` 與 `ruff check trainer/` 確認無回歸。
+
+### PLAN 狀態更新與剩餘項
+
+- **已完成**：R3505 cutoff_time 正規化 production 修補與對應 7 則測試、mypy、ruff 通過；PLAN「Current status」已加入本輪說明。
+- **剩餘項**（依 PLAN_phase2_p0_p1.md，未改動）：
+  1. **Credential folder**：Migration（既有 local_state/mlflow.env、repo/.env 搬至 credential/ 並拆分）、可選 deploy 路徑、可選 .gitignore 調整。
+  2. **Scorer lookback（可選）**：Code Review §2 — `SCORER_LOOKBACK_HOURS` 非數值或 ≤ 0 時 fallback（log warning + 8）。
+  3. 其餘 Phase 2 P0–P1 無強制待辦；可選後續優化 Code Review §2–§5 效能/語義項。

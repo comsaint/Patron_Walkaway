@@ -60,10 +60,11 @@ flowchart LR
 
 ## Ordered Tasks
 
-**Current status**（更新於 2026-03-19）：**T0**–**T11** 已完成。**T12** 已完成（含 Step 1、Step 2、optional follow-on、Code Review §1）。**Credential folder consolidation** Step 1–2 已實作（config 自 credential/.env 載入、mlflow_utils 自 credential/mlflow.env 優先、.gitignore 與範本）；Code Review §1（config load_dotenv try/except）、§2（mlflow 例外 log 不洩路徑）已修補，五則 credential_review 測試全過。tests/ruff/lint 通過，見 STATUS.md。
+**Current status**（更新於 2026-03-19）：**T0**–**T11** 已完成。**T12** 已完成（含 Step 1、Step 2、optional follow-on、Code Review §1）。**Credential folder consolidation** Step 1–2 已實作（config 自 credential/.env 載入、mlflow_utils 自 credential/mlflow.env 優先、.gitignore 與範本）；Code Review §1（config load_dotenv try/except）、§2（mlflow 例外 log 不洩路徑）已修補，五則 credential_review 測試全過。**Scorer Track Human lookback parity**：scorer 已傳入 `lookback_hours=SCORER_LOOKBACK_HOURS`；Code Review §1（scorer config 改為 `from trainer.core import config`）已修補；5 則契約／邊界測試就位；tests/ruff 通過，見 STATUS.md § Scorer Track Human lookback parity fix。**R3505 cutoff_time 正規化**：Code Review §1–§4 已修補（HK_TZ 常數、拒絕 None/NaT/date、下游一律收 datetime）；7 則 `test_review_risks_r3505_cutoff.py` 全過；mypy trainer/、ruff check scorer 通過，見 STATUS.md § Round — R3505 正規化 Production 修補。
 
 **Remaining items**（依執行順序）：
 - **Credential folder**：Migration（既有 local_state/mlflow.env、repo/.env 搬至 credential/ 並拆分）、可選 deploy 路徑（main.py 改讀 credential/.env）、可選 .gitignore 改為忽略整個 credential/ 再 negate examples）。
+- **Scorer lookback（可選）**：Code Review §2 — `SCORER_LOOKBACK_HOURS` 非數值或 ≤ 0 時於 scorer 加 fallback（log warning + 用 8）；若實作須同步調整邊界測試預期。
 - 其餘 Phase 2 P0–P1 無強制待辦；若要進一步降低風險，可再針對 Code Review §2–§5 的「效能/語義」項（例如 OOM pre-check I/O 成本與 RSS peak 真實最大值語義）做後續優化。
 
 ---

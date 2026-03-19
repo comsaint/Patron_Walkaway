@@ -2,6 +2,8 @@
 
 **Current execution plan**: [PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md) (Phase 2 P0–P1).
 
+**Investigation**：Test vs production 性能落差根因與調查步驟見 [INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md](INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md)。
+
 **Phase 2 status**（2026-03-18）：**T0–T10 已完成**（詳見 PLAN_phase2_p0_p1.md § Ordered Tasks 與 Remaining items）。
 
 This file exists so README and review tests (R384, R147) that reference `.cursor/plans/PLAN.md` pass. The 特徵整合計畫 section below is retained for round147 contract (no Step 9+ in that section).
