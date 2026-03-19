@@ -6,6 +6,27 @@
 
 ---
 
+## 統一 .env 載入（trainer / scorer / validator）
+
+**Date**: 2026-03-19
+
+### 目標
+讓 `python -m trainer.trainer`、`python -m trainer.scorer`、`python -m trainer.validator` 在 production（已設 `STATE_DB_PATH` / `MODEL_DIR`）時仍能從 `.env` 讀取 `CH_USER` / `CH_PASS`，建置 ClickHouse client 不失敗。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/core/config.py` | 移除「僅在未設 STATE_DB_PATH 且未設 MODEL_DIR 時才 `load_dotenv()`」的條件。改為一律嘗試載入：先 `load_dotenv(_REPO_ROOT / ".env", override=False)`，再 `load_dotenv(override=False)`（cwd）。`override=False` 不覆寫既有環境變數，deploy main.py 先載入的 CH_* 會保留。將 `_REPO_ROOT` 提前至檔首定義，供 .env 路徑與後續 DEFAULT_MODEL_DIR 等共用。 |
+
+### 全量 pytest 結果（本輪後）
+
+- **指令**：`python -m pytest tests/ -q --tb=no`
+- **結果**：**1191 passed**，16 failed，54 skipped，2 xpassed（約 79s）
+- **說明**：16 個失敗均為本輪前即存在：多數為 Step 7 DuckDB RAM 不足（`STEP7_KEEP_TRAIN_ON_DISK is True and DuckDB failed; no pandas fallback`），1 個為 `test_profile_schema_hash.py::TestComputeProfileSchemaHash::test_changes_when_profile_feature_cols_changes`。本輪 config 變更未新增失敗。
+
+---
+
 ## 測試目錄分層（第一階段）實作與驗證
 
 **Date**: 2026-03-17

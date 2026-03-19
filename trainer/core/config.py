@@ -7,10 +7,14 @@ from dotenv import load_dotenv
 
 _log = logging.getLogger(__name__)
 
-# Load environment variables from .env file.
-# In deploy, main.py already loads from deploy root; skip loading from cwd to avoid overwriting CH_*.
-if not os.getenv("STATE_DB_PATH") and not os.getenv("MODEL_DIR"):
-    load_dotenv()
+# Repo root (this file lives in trainer/core/). Used for .env and default paths.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Unify .env loading for trainer, scorer, validator: always try to load so CH_USER/CH_PASS
+# are available in production when STATE_DB_PATH/MODEL_DIR are set. override=False so we
+# never overwrite existing env (e.g. deploy main.py already loaded from deploy root).
+load_dotenv(_REPO_ROOT / ".env", override=False)
+load_dotenv(override=False)  # cwd (e.g. deploy root when started from there)
 
 NUMEXPR_MAX_THREADS = 12
 
@@ -43,8 +47,6 @@ HISTORY_BUFFER_DAYS: int = 2
 
 # ------------------ Output paths (PLAN § Phase 2 前結構整理 項目 4) -----------------
 # Default model and backtest output dirs under repo root out/ (PROJECT.md convention).
-# This file lives in trainer/core/, so repo root is parent.parent.parent.
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_MODEL_DIR: Path = _REPO_ROOT / "out" / "models"
 DEFAULT_BACKTEST_OUT: Path = _REPO_ROOT / "out" / "backtest"
 
