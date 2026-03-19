@@ -221,7 +221,12 @@ out/
 deploy_dist/
 deploy_dist.zip
 model_*/
-credential/
+# credential/ (PLAN: Credential folder consolidation). Ignore secrets; keep examples.
+credential/.env
+credential/mlflow.env
+credential/*.json
+!credential/.env.example
+!credential/mlflow.env.example
 trainer/local_state/
 local_state/mlflow.env
 local_state/prediction_log.db

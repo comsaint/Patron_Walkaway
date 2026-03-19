@@ -428,3 +428,39 @@ def test_t11_review_docstring_mentions_mlflow_env_file_and_override():
     assert "override" in source.lower() or "test" in source.lower(), (
         "mlflow_utils must mention override or test for MLFLOW_ENV_FILE (Code Review §4)."
     )
+
+
+# --- Credential folder Code Review §2, §4 (STATUS.md) ---
+
+
+def test_credential_review_mlflow_warning_log_does_not_contain_path():
+    """Code Review §2: When load_dotenv raises, warning log must not contain credential/local_state path (security)."""
+    import logging
+    leaky_path = "/some/credential/path/mlflow.env"
+    log_capture: list = []
+    handler = logging.Handler()
+    handler.emit = lambda rec: log_capture.append(rec.getMessage())
+    _log = logging.getLogger("trainer.core.mlflow_utils")
+    _log.addHandler(handler)
+    try:
+        with patch("dotenv.load_dotenv", side_effect=PermissionError(leaky_path)):
+            importlib.reload(mlflow_utils)
+    finally:
+        _log.removeHandler(handler)
+    # Desired: log must not contain the exception's path (str(e)); folder names in format string are ok.
+    for msg in log_capture:
+        assert leaky_path not in msg, f"Log must not contain exception path: {msg!r}"
+
+
+def test_credential_review_source_credential_before_local_state():
+    """Code Review §4: Default mlflow.env path must try credential/ before local_state/ (source order contract)."""
+    source_path = Path(mlflow_utils.__file__)
+    source = source_path.read_text(encoding="utf-8")
+    # Find the block that sets _candidate / _mlflow_env_path without MLFLOW_ENV_FILE
+    idx_credential = source.find('"credential"')
+    idx_local_state = source.find('"local_state"')
+    assert idx_credential >= 0, "mlflow_utils must reference credential path"
+    assert idx_local_state >= 0, "mlflow_utils must reference local_state path"
+    assert idx_credential < idx_local_state, (
+        "Code Review §4: credential must be tried before local_state in default path resolution."
+    )

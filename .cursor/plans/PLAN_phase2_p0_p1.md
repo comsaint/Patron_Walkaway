@@ -60,9 +60,10 @@ flowchart LR
 
 ## Ordered Tasks
 
-**Current status**（更新於 2026-03-19）：**T0**–**T11** 已完成。**T12 Step 1**（單一 run 涵蓋整次 pipeline、失敗時寫入 tag status=FAILED／error 並 re-raise）已實作；**T12 success diagnostics（T12.2 Step 2）** 已實作；**T12 failure diagnostics params（T12 optional follow-on）** 已實作；並完成 Code Review §1（`has_active_run()` 例外 warning）。本輪額外 production 修補已落地：`log_metrics_safe` 過濾 NaN/inf 與 failure params 長字串截斷，導致對應 contract 測試由 xfail -> xpass。tests/typecheck/lint 相關驗證通過，見 STATUS.md。
+**Current status**（更新於 2026-03-19）：**T0**–**T11** 已完成。**T12** 已完成（含 Step 1、Step 2、optional follow-on、Code Review §1）。**Credential folder consolidation** Step 1–2 已實作（config 自 credential/.env 載入、mlflow_utils 自 credential/mlflow.env 優先、.gitignore 與範本）；Code Review §1（config load_dotenv try/except）、§2（mlflow 例外 log 不洩路徑）已修補，五則 credential_review 測試全過。tests/ruff/lint 通過，見 STATUS.md。
 
 **Remaining items**（依執行順序）：
+- **Credential folder**：Migration（既有 local_state/mlflow.env、repo/.env 搬至 credential/ 並拆分）、可選 deploy 路徑（main.py 改讀 credential/.env）、可選 .gitignore 改為忽略整個 credential/ 再 negate examples）。
 - 其餘 Phase 2 P0–P1 無強制待辦；若要進一步降低風險，可再針對 Code Review §2–§5 的「效能/語義」項（例如 OOM pre-check I/O 成本與 RSS peak 真實最大值語義）做後續優化。
 
 ---
@@ -438,6 +439,31 @@ flowchart LR
   - 成功完成時仍只有一筆 run，provenance 與 T2 行為一致。
   - 無 MLflow 時行為不變（no-op，不 crash）。
 
+### Credential folder consolidation — Step 1–2 ✅ Done；Code Review §1 §2 ✅ Done
+
+- **Step 1–2 已完成**（2026-03-19）：config 自 `_REPO_ROOT/credential/.env` 優先載入（含 try/except）；mlflow_utils 自 `credential/mlflow.env` 再 `local_state/mlflow.env`；.gitignore 與 credential 範本已就位。Code Review §1（config 載入 try/except）、§2（mlflow warning 僅 log 例外類型不洩路徑）已修補。
+- **Depends on**: T11（原為 `local_state/mlflow.env` 與主 `.env` 分散）。
+- **Goal**: 將所有敏感與環境設定檔集中至單一目錄 `credential/`（repo 根目錄下），便於權限、備份與 .gitignore；並明確區分「一般 env」與「Cloud/MLflow」設定。
+- **Target layout**（repo root 下）：
+  - `credential/.env` — ClickHouse（CH_HOST, CH_PORT, CH_USER, CH_PASS, SOURCE_DB）、STATE_DB_PATH、MODEL_DIR 等；**不**包含 `GOOGLE_APPLICATION_CREDENTIALS`。
+  - `credential/.env.example` — 上述變數之範本（可 commit）。
+  - `credential/mlflow.env` — MLflow 與 Cloud 相關：`MLFLOW_TRACKING_URI`、`GOOGLE_APPLICATION_CREDENTIALS=<path-to-key.json>`；**GCP 金鑰路徑僅放於此檔，不放入主 .env**。
+  - `credential/mlflow.env.example` — 上述兩行範本（可 commit）。
+  - `credential/<gcp-key>.json` — GCP 服務帳戶 key 檔（不 commit）；路徑由 `mlflow.env` 內 `GOOGLE_APPLICATION_CREDENTIALS` 指定（可為絕對路徑或相對 repo root）。
+- **Separation rule**: `GOOGLE_APPLICATION_CREDENTIALS` 屬 Cloud/MLflow 用途，僅出現在 `credential/mlflow.env`，不出現在 `credential/.env`。
+- **Files to touch**（實作時）：
+  - [trainer/core/config.py](trainer/core/config.py)：改為自 `_REPO_ROOT / "credential" / ".env"` 載入（並可保留 `load_dotenv(override=False)` 從 cwd 補齊）。
+  - [trainer/core/mlflow_utils.py](trainer/core/mlflow_utils.py)：預設路徑由 `repo_root / "local_state" / "mlflow.env"` 改為 `repo_root / "credential" / "mlflow.env"`；`MLFLOW_ENV_FILE` override 邏輯保留。
+  - [package/deploy/main.py](package/deploy/main.py)（可選）：若 deploy 亦採用同一結構，改為 `DEPLOY_ROOT / "credential" / ".env"`，並於 deploy 包內提供 `credential/mlflow.env` 與 key 檔。
+  - [.gitignore](.gitignore)：忽略 `credential/` 內實際密鑰與 env（例如 `credential/.env`、`credential/mlflow.env`、`credential/*.json`），保留 `!credential/.env.example`、`!credential/mlflow.env.example`。
+- **Migration**: 既有 `local_state/mlflow.env` 與 `trainer/.env`（或 repo root `.env`）搬至 `credential/` 並依上述規則拆分內容；`local_state/` 保留給 state.db、prediction_log.db 等執行期資料。
+- **Definition of done**
+  - 單一目錄 `credential/` 含 .env、mlflow.env、GCP key；主 .env 不含 Cloud 相關變數；程式自 `credential/` 讀取後 train / scorer / validator 與 deploy 行為一致。
+- **剩餘項目**（可選／後續）：
+  - Migration：既有 `local_state/mlflow.env`、repo root 或 `trainer/.env` 內容搬至 `credential/` 並依規則拆分。
+  - Deploy（可選）：`package/deploy/main.py` 改為自 `DEPLOY_ROOT/credential/.env` 載入；deploy 包內提供 `credential/` 與範本。
+  - .gitignore（可選）：改為忽略整個 `credential/` 再以 `!credential/.env.example`、`!credential/mlflow.env.example` 排除範本。
+
 ---
 
 ## File-Level Edit Summary
@@ -452,11 +478,14 @@ flowchart LR
   - 在 `score_once(...)` 中對獨立 DB 進行 batch append
 - [trainer/core/config.py](trainer/core/config.py)
   - 新增 Phase 2 相關 env/config
+  - （Credential folder 實作時）改為自 `_REPO_ROOT/credential/.env` 載入
 - [trainer/core/mlflow_utils.py](trainer/core/mlflow_utils.py)（T11）
   - 模組頂層：若存在 `repo_root/local_state/mlflow.env` 則 `load_dotenv(..., override=False)`，不寫入主 `.env`
   - （T12）`_log_training_provenance_to_mlflow` 呼叫處：有 active run 時只 log 不 start_run（實作在 trainer 內該 helper 的判斷）
+  - （Credential folder 實作時）預設路徑改為 `repo_root/credential/mlflow.env`
 - [.gitignore](.gitignore)（T11）
   - 新增 `local_state/mlflow.env`（或 `local_state/`），避免 MLflow 設定檔被 commit
+  - （Credential folder 實作時）改為忽略 `credential/` 內敏感檔、保留 `credential/*.example`
 - [requirements.txt](requirements.txt)
   - 新增 `mlflow`，以及 `evidently`（若 root/local script 需要）
 - [package/deploy/requirements.txt](package/deploy/requirements.txt)
@@ -550,6 +579,7 @@ flowchart LR
 ### T11 local MLflow env
 
 - Remove the `load_dotenv(...)` block at top of `mlflow_utils.py`; MLflow config again only from process env / main `.env` if used.
+- **若已實作 Credential folder**：改回從 `local_state/mlflow.env` 或原 `.env` 路徑載入即可。
 
 ### T12 failed run log
 

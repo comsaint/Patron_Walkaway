@@ -31,17 +31,23 @@ _gcp_id_token_cache: Optional[tuple[str, float]] = None
 _gcp_provider_registered = False
 
 # T11: Load project-local MLflow env file so train/export get config without main .env.
-# MLFLOW_ENV_FILE (optional): override path for tests; else repo_root/local_state/mlflow.env.
+# MLFLOW_ENV_FILE (optional): override path for tests; else credential/mlflow.env, then local_state/mlflow.env (PLAN Credential folder).
 # Code Review §1: wrap in try/except so import never fails (zip/frozen or load_dotenv error).
 # Code Review §2: empty or whitespace MLFLOW_ENV_FILE → treat as unset, use default path.
 try:
     _repo_root = Path(__file__).resolve().parent.parent.parent
     _env_file_override = (os.environ.get("MLFLOW_ENV_FILE") or "").strip() or None
-    _mlflow_env_path = Path(_env_file_override) if _env_file_override else (_repo_root / "local_state" / "mlflow.env")
+    if _env_file_override:
+        _mlflow_env_path = Path(_env_file_override)
+    else:
+        _candidate = _repo_root / "credential" / "mlflow.env"
+        if not _candidate.is_file():
+            _candidate = _repo_root / "local_state" / "mlflow.env"
+        _mlflow_env_path = _candidate
     if _mlflow_env_path.is_file():
         load_dotenv(str(_mlflow_env_path), override=False)
 except Exception as e:
-    _log.warning("T11: could not load local_state/mlflow.env: %s", e)
+    _log.warning("T11: could not load mlflow.env (credential/ or local_state/): %s", type(e).__name__)
 
 # Cached after first check to avoid repeated connection attempts on hot path.
 _mlflow_available: Optional[bool] = None

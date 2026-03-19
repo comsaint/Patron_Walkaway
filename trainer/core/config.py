@@ -13,8 +13,16 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # Unify .env loading for trainer, scorer, validator: always try to load so CH_USER/CH_PASS
 # are available in production when STATE_DB_PATH/MODEL_DIR are set. override=False so we
 # never overwrite existing env (e.g. deploy main.py already loaded from deploy root).
-load_dotenv(_REPO_ROOT / ".env", override=False)
-load_dotenv(override=False)  # cwd (e.g. deploy root when started from there)
+# Credential folder (PLAN): try credential/.env first, then repo root .env, then cwd.
+# Code Review §1: wrap in try/except so process does not crash on permission/I/O errors.
+try:
+    _env_credential = _REPO_ROOT / "credential" / ".env"
+    if _env_credential.is_file():
+        load_dotenv(str(_env_credential), override=False)
+    load_dotenv(_REPO_ROOT / ".env", override=False)
+    load_dotenv(override=False)  # cwd (e.g. deploy root when started from there)
+except Exception as e:
+    _log.warning("could not load .env (credential/repo/cwd): %s", type(e).__name__)
 
 NUMEXPR_MAX_THREADS = 12
 
