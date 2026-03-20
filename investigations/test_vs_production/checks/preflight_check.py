@@ -16,7 +16,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 
 REQUIRED_DATA_FILES = (
@@ -54,24 +54,35 @@ def _parse_env_line(line: str) -> Optional[Tuple[str, str]]:
     return key, value
 
 
-def load_env_candidates(paths: Tuple[Path, ...]) -> Dict[str, Any]:
+def load_env_candidates(
+    paths: Tuple[Path, ...],
+    required_keys: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
     loaded: Dict[str, str] = {}
     used_file: Optional[str] = None
+    checked_files: list[str] = []
+    required = set(required_keys or ("PREDICTION_LOG_DB_PATH", "DATA_DIR"))
     for p in paths:
         if not p.exists() or not p.is_file():
             continue
         try:
+            checked_files.append(str(p))
+            current: Dict[str, str] = {}
             for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
                 parsed = _parse_env_line(line)
                 if parsed is None:
                     continue
                 k, v = parsed
-                loaded[k] = v
+                current[k] = v
+            if required and not required.issubset(set(current.keys())):
+                # Continue searching when this candidate does not contain required keys.
+                continue
+            loaded = current
             used_file = str(p)
             break
         except Exception:
             continue
-    return {"used_file": used_file, "vars": loaded}
+    return {"used_file": used_file, "vars": loaded, "checked_files": checked_files}
 
 
 def _now_utc() -> datetime:
@@ -125,7 +136,7 @@ def check_prediction_log(path_str: Optional[str], freshness_minutes: int) -> Che
         )
 
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(str(db_path), timeout=10)
         cur = conn.cursor()
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prediction_log'")
         has_table = cur.fetchone() is not None
@@ -322,7 +333,10 @@ def main() -> int:
         repo_root / "credential" / ".env",
         repo_root / ".env",
     )
-    env_load = load_env_candidates(env_candidates)
+    env_load = load_env_candidates(
+        env_candidates,
+        required_keys=("PREDICTION_LOG_DB_PATH", "DATA_DIR"),
+    )
     file_env = env_load["vars"]
 
     # precedence: CLI arg > process env > loaded env file

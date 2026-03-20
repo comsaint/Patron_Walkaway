@@ -12,6 +12,7 @@ from pathlib import Path
 import json
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # trainer/ (serving lives under trainer)
+PROJECT_ROOT = BASE_DIR.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 
 # Point Flask's static handler to the actual frontend/static folder for Chart.js, etc.
@@ -21,7 +22,9 @@ app = Flask(
     static_url_path="/static",
 )
 HK_TZ = ZoneInfo(config.HK_TZ)
-STATE_DB_PATH = BASE_DIR / "local_state" / "state.db"
+_state_db_env = os.environ.get("STATE_DB_PATH")
+_state_db_effective = _state_db_env.strip() if (_state_db_env and _state_db_env.strip()) else None
+STATE_DB_PATH = Path(_state_db_effective) if _state_db_effective else (PROJECT_ROOT / "local_state" / "state.db")
 STATUS_JSON_PATH = BASE_DIR / "out_status" / "table_status.json"
 HC_PATH = BASE_DIR / "out_status" / "table_hc.csv"
 

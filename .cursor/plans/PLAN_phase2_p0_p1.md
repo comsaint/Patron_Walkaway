@@ -64,6 +64,7 @@ flowchart LR
 
 **Remaining items**（依執行順序）：
 - **Credential folder**：Migration（既有 local_state/mlflow.env、repo/.env 搬至 credential/ 並拆分）、可選 deploy 路徑（main.py 改讀 credential/.env）、可選 .gitignore 改為忽略整個 credential/ 再 negate examples）。
+- **DB path consolidation（新增）**：統一 runtime DB 目錄（`STATE_DB_PATH`、`PREDICTION_LOG_DB_PATH` 指向同一 `local_state/`），避免 state 與 prediction log 分散在 `trainer/local_state` 與 `local_state` 造成維運與調查口徑混淆。
 - **Scorer lookback（可選）**：Code Review §2 — `SCORER_LOOKBACK_HOURS` 非數值或 ≤ 0 時於 scorer 加 fallback（log warning + 用 8）；若實作須同步調整邊界測試預期。
 - 其餘 Phase 2 P0–P1 無強制待辦；若要進一步降低風險，可再針對 Code Review §2–§5 的「效能/語義」項（例如 OOM pre-check I/O 成本與 RSS peak 真實最大值語義）做後續優化。
 
@@ -489,6 +490,35 @@ flowchart LR
   - Deploy（可選）：`package/deploy/main.py` 改為自 `DEPLOY_ROOT/credential/.env` 載入；deploy 包內提供 `credential/` 與範本。
   - .gitignore（可選）：改為忽略整個 `credential/` 再以 `!credential/.env.example`、`!credential/mlflow.env.example` 排除範本。
 
+### DB path consolidation（state.db / prediction_log.db 同目錄）— Planned
+
+- **Depends on**: T4, T5, Credential folder consolidation
+- **Goal**: 將 runtime SQLite 路徑統一為同一個 `local_state/` 目錄，降低部署、備份、故障排查與調查口徑混用風險。
+- **Background（現況差異）**：
+  - `STATE_DB_PATH` 在 serving 預設常落於 `trainer/local_state/state.db`（若未覆寫）。
+  - `PREDICTION_LOG_DB_PATH` 預設為 repo root `local_state/prediction_log.db`。
+  - 兩者分散導致：路徑誤判、跨機器調查不一致、腳本需額外猜測位置。
+- **Target state**：
+  - `STATE_DB_PATH=<runtime_root>/local_state/state.db`
+  - `PREDICTION_LOG_DB_PATH=<runtime_root>/local_state/prediction_log.db`
+  - 二者同目錄、不同檔名（**不**合併為單一 SQLite 檔）。
+- **Execution steps（建議最小風險）**：
+  1. 在 production `credential/.env` 明確設定上述兩個絕對路徑（不依賴 fallback）。
+  2. 若舊路徑已有 DB，先停寫服務再搬移（或複製）至新目錄，保留舊檔快照供回滾。
+  3. 依序啟動 scorer → validator → API/export，避免讀取端先起造成誤判。
+  4. 執行 investigation preflight 與 R2 腳本，確認兩 DB 均由新路徑解析且查詢成功。
+- **Validation steps**：
+  - `preflight_check.py` 顯示 `PREDICTION_LOG_DB_PATH` 與 `DATA_DIR` resolved 正確，prediction log freshness 正常。
+  - `investigate_r2_window.py` 的 `resolution` 區段顯示 `pred_db_path` / `state_db_path` 均在同一 `local_state/`。
+  - 交叉查詢：prediction_log `MAX(scored_at)` 持續前進、alerts 表可查且筆數增長符合預期。
+- **Rollback**：
+  - 停服務，將 `.env` 兩個路徑改回舊值；重新啟動服務。
+  - 若新路徑資料不完整，使用搬移前快照回復。
+- **Definition of done**：
+  - runtime 不再依賴預設 fallback 推測 DB 位置。
+  - 所有運維／調查腳本可在不指定 path 的情況下讀到正確 DB。
+  - 路徑與備份策略文件化（runbook/STATUS）。
+
 ---
 
 ## File-Level Edit Summary
@@ -653,4 +683,5 @@ flowchart LR
 2. export artifact 路徑命名規則。
 3. Evidently current data 的前置整理方式。
 4. 是否需要 `prediction_export_runs` audit table；本計畫建議加，但若想先簡化，可先只做 `meta` watermark。
+5. 是否將 state / prediction runtime DB 路徑統一為同一 `local_state/`（本計畫建議統一，且以 env 明確設定為準，不依賴 fallback）。
 

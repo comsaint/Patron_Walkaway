@@ -3177,3 +3177,203 @@ ruff check trainer/core/mlflow_utils.py trainer/training/trainer.py
 
 - 全量 CI 若仍因 `test_fast_mode_integration` 或其它環境依賴失敗，可單獨排除或於資源足夠環境跑。
 - PLAN 中 T13 可標為「Step 1–2 + Review 修補 Done」。
+
+---
+
+## DB 預設路徑一致化（state / prediction_log 同目錄）（2026-03-20）
+
+**目標**：讓 `trainer/` 相關 runtime 在未明確設定 `STATE_DB_PATH` 時，統一 fallback 到 repo root 的 `local_state/state.db`，與 `PREDICTION_LOG_DB_PATH` 的預設（`local_state/prediction_log.db`）同目錄，避免 `trainer/local_state` vs `local_state` 的路徑分歧。
+
+### 本輪修改檔案
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/serving/scorer.py` | `STATE_DB_PATH` fallback 由 `BASE_DIR / "local_state" / "state.db"` 改為 `PROJECT_ROOT / "local_state" / "state.db"`；`STATE_DIR` 同步改為 `PROJECT_ROOT / "local_state"`。 |
+| `trainer/serving/validator.py` | `STATE_DB_PATH` fallback 改為 `PROJECT_ROOT / "local_state" / "state.db"`；並新增空白字串處理（空白視為未設）。 |
+| `trainer/serving/status_server.py` | `STATE_DB_PATH` fallback 改為 `PROJECT_ROOT / "local_state" / "state.db"`。 |
+| `trainer/serving/api_server.py` | 原硬編碼 `BASE_DIR / "local_state" / "state.db"` 改為與其他模組一致的 env + fallback 邏輯（fallback 指向 `PROJECT_ROOT / "local_state" / "state.db"`）。 |
+| `investigations/test_vs_production/checks/investigate_r2_window.py` | 先前已改為「動態 yesterday（HKT）」窗口，保留手動 `--start-ts/--end-ts` 覆寫；用於路徑一致化後驗收。 |
+
+### 如何手動驗證
+
+1. **語法檢查**
+   ```bash
+   python -m py_compile trainer/serving/scorer.py trainer/serving/validator.py trainer/serving/status_server.py trainer/serving/api_server.py
+   ```
+2. **不設 `STATE_DB_PATH` 時，檢查 fallback 是否一致**
+   - 啟動 scorer / validator / api（任一方式）
+   - 觀察/列印其 `STATE_DB_PATH`（或用調查腳本 `resolution`）應皆落在 `<repo_root>/local_state/state.db`
+3. **調查腳本驗收（建議）**
+   ```bash
+   python investigations/test_vs_production/checks/preflight_check.py --pretty
+   python investigations/test_vs_production/checks/investigate_r2_window.py --pretty
+   ```
+   - `preflight_check` 應可解析正確 `PREDICTION_LOG_DB_PATH`
+   - `investigate_r2_window` 的 `resolution.state_db_path` / `resolution.pred_db_path` 應同屬 `local_state/`
+
+### 下一步建議
+
+- 在 production `credential/.env` 明確設定：
+  - `STATE_DB_PATH=<runtime_root>/local_state/state.db`
+  - `PREDICTION_LOG_DB_PATH=<runtime_root>/local_state/prediction_log.db`
+  避免依賴 fallback。
+- 若你要長期防回歸，補一則契約測試：assert `trainer.serving.{scorer,validator,status_server,api_server}` 的 `STATE_DB_PATH` fallback 同目錄。
+- 完成 production 切換後，更新 `.cursor/plans/PLAN_phase2_p0_p1.md` 的 DB path consolidation 狀態（Planned -> Done）並附驗收輸出摘要。
+
+---
+
+## Code Review：DB 路徑一致化 + investigation checks（2026-03-20）
+
+**範圍**：本輪改動 `trainer/serving/{scorer,validator,status_server,api_server}.py` 與 `investigations/test_vs_production/checks/{preflight_check.py,investigate_r2_window.py}`。  
+**原則**：不重寫整套，只列最可能的 bug / 邊界 / 安全 / 效能風險。
+
+### Findings（依嚴重度）
+
+#### 1) `investigate_r2_window.py` 參數邊界：只傳 `--start-ts` 或只傳 `--end-ts` 時會被靜默忽略（Major, 邊界）
+- **問題**：`_resolve_window` 目前僅在「start 與 end 都有值」時才採用使用者輸入；若只給一個，會整組 fallback 到「dynamic yesterday」，容易造成誤查窗口且不自知。
+- **具體修改建議**：
+  - 嚴格要求「start/end 必須同時提供」；若只給一個則 `exit 2` 並清楚錯誤訊息。
+  - 或提供明確規則（例如只給 start 時 end 自動 = start + 1 day），但需在輸出 JSON 標示 `window_source=derived`。
+- **希望新增的測試**：
+  - `test_window_only_start_should_error`
+  - `test_window_only_end_should_error`
+  - `test_window_both_given_should_use_exact_values`
+
+#### 2) `investigate_r2_window.py` 以字串比較時間大小（Major, bug）
+- **問題**：`if start_ts >= end_ts:` 使用字串比較，不是時間比較；在格式稍有差異（例如時區格式、空白）時可能誤判。
+- **具體修改建議**：
+  - 先解析為 timezone-aware `datetime` 後再比較。
+  - 解析失敗時回傳 `exit 2`，錯誤訊息包含是哪個參數無效。
+- **希望新增的測試**：
+  - `test_window_comparison_uses_datetime_not_lexicographic`
+  - `test_invalid_iso_timestamp_should_error`
+  - `test_timezone_offset_inputs_compare_correctly`
+
+#### 3) `preflight_check.py` / `investigate_r2_window.py` 的 `.env` 掃描：遇到第一個「有內容但缺 key」的檔案就停止（Major, 邊界）
+- **問題**：目前是「第一個可解析且非空的 `.env`」就 `break`；若該檔不含 `PREDICTION_LOG_DB_PATH` 或 `DATA_DIR`，後面候選檔即使有正確值也不會再查。
+- **具體修改建議**：
+  - 改為逐個候選檔 merge（前檔為 baseline，後檔補缺值）或至少「缺必要 key 時繼續找下一個」。
+  - 在輸出中列出 `env_candidates_checked` 與 `keys_source`（每個 key 來自哪個來源）。
+- **希望新增的測試**：
+  - `test_env_fallback_continues_when_first_file_missing_required_keys`
+  - `test_env_source_tracking_for_each_key`
+
+#### 4) 讀 SQLite 未設定 `timeout` / `mode=ro`，高併發下可能出現短暫 lock 誤報（Medium, 效能/穩定性）
+- **問題**：檢查腳本直接 `sqlite3.connect(path)`；若 scorer/validator 正在寫入，檢查可能偶發 `database is locked`，造成 false negative。
+- **具體修改建議**：
+  - 使用唯讀連線：`sqlite3.connect("file:...?...mode=ro", uri=True, timeout=5~10)`。
+  - 對 lock error 做 1-2 次短暫重試（例如 200ms backoff）。
+- **希望新增的測試**：
+  - `test_preflight_handles_locked_db_with_retry_or_readonly_mode`
+  - `test_r2_script_readonly_connection_success_under_wal`
+
+#### 5) 檢查腳本輸出完整絕對路徑，若外部分享報告可能洩漏主機資訊（Low, 安全性）
+- **問題**：JSON 內包含完整 `C:\...` / `/opt/...`；對內部可接受，但若上傳到外部系統（issue tracker / 公開 artifact）會暴露環境資訊。
+- **具體修改建議**：
+  - 增加 `--redact-paths`（預設 false）；true 時僅輸出 basename 或 hash。
+  - 或在 runbook 明確標註「對外分享前需脫敏」。
+- **希望新增的測試**：
+  - `test_redact_paths_flag_masks_absolute_paths`
+
+#### 6) DB 路徑一致化的回歸保護不足（Low, 回歸風險）
+- **問題**：目前已改 4 個 serving 檔案 fallback 到 repo root `local_state`，但尚無契約測試鎖定；後續容易被新改動打回分歧。
+- **具體修改建議**：
+  - 新增契約測試，assert `trainer.serving.{scorer,validator,status_server,api_server}` 在未設 env 時 fallback 同目錄。
+  - 額外 assert 空白 `STATE_DB_PATH="   "` 行為一致（視為未設）。
+- **希望新增的測試**：
+  - `test_state_db_fallback_same_directory_across_serving_modules`
+  - `test_state_db_whitespace_env_treated_as_unset`
+
+### 總結
+
+- 本輪方向正確：runtime DB 預設路徑已實際對齊，降低未來調查混亂風險。
+- 建議優先修補 **Finding #1/#2/#3**（屬於調查腳本 correctness），再補 **#4**（高併發穩定性）；#5/#6 可併入後續 hardening。
+
+---
+
+## 將 investigation scripts 風險點轉成最小可重現測試（僅 tests，未改 production）（2026-03-20）
+
+**目標**：把前一節 Code Review 提到的風險點（參數邊界、時間比較、env 候選、SQLite 讀取穩定性）轉成可執行測試；不修改 production code。
+
+### 新增檔案
+
+- `tests/review_risks/test_review_risks_investigation_scripts.py`
+
+### 測試與風險點對應
+
+| 測試 | 對應風險 | 說明 | 目前狀態 |
+|------|----------|------|----------|
+| `test_r2_timezone_order_should_be_datetime_aware` | Finding #2（字串比較時間） | 用 `+09:00` vs `+08:00` 同時刻窗口鎖定「應做 datetime 比較」期望。 | `xfail`（目前 main 仍字串比較） |
+| `test_r2_only_start_should_error` | Finding #1（只給 start） | 只傳 `--start-ts` 應明確錯誤而非靜默 fallback。 | `xfail` |
+| `test_r2_only_end_should_error` | Finding #1（只給 end） | 只傳 `--end-ts` 應明確錯誤而非靜默 fallback。 | `xfail` |
+| `test_preflight_env_fallback_should_continue_when_first_missing_required_keys` | Finding #3（env 候選停止過早） | 第一個 env 缺關鍵鍵時，應繼續下一候選。 | `xfail` |
+| `test_preflight_sqlite_read_should_use_readonly_or_timeout_hardening` | Finding #4（WAL/lock 稳定性） | 靜態契約：應有 readonly URI 或 timeout hardening。 | `xfail` |
+| `test_r2_script_minimal_smoke_with_temp_dbs` | 基線可執行性 | 建立最小 temp DB（prediction_log + alerts），確認腳本 happy-path 可返回 `0`。 | `passed` |
+
+### 執行方式
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_investigation_scripts.py -q --tb=short
+```
+
+### 本輪結果
+
+- `1 passed, 5 xfailed`
+
+### 說明
+
+- `xfail` 代表「目前 production 尚未修補，但風險已被測試具體化」；待後續修補完成可逐步移除 `xfail`，轉為強制通過契約。
+
+---
+
+## investigation scripts 修補與驗證（依「不改 tests，除非測試錯或 decorator 過時」）（2026-03-20）
+
+### Round 1（先改實作）
+
+**修改檔案（production）**：
+- `investigations/test_vs_production/checks/investigate_r2_window.py`
+  - 修正窗口邊界：`--start-ts` / `--end-ts` 必須同時提供，否則 `exit 2`
+  - 新增 `_parse_iso_ts(...)` 並以 timezone-aware datetime 比較窗口先後，避免字串比較誤判
+- `investigations/test_vs_production/checks/preflight_check.py`
+  - `load_env_candidates(...)` 支援 required_keys，當候選 env 缺關鍵鍵時繼續往下找
+  - SQLite 連線加入 `timeout=10`（WAL 下較不易因短暫 lock 誤報）
+
+**測試結果**：
+```bash
+python -m pytest tests/review_risks/test_review_risks_investigation_scripts.py -v --tb=short
+# 1 passed, 2 xfailed, 3 xpassed
+```
+
+**解讀**：
+- 3 個 XPASS = decorator 已過時（行為已修好）
+- 1 個測試存在設計問題（timezone 測試以 main() return code 判斷，訊號不純）
+
+### Round 2（僅修「測試本身錯／decorator 過時」）
+
+**修改檔案（tests only）**：
+- `tests/review_risks/test_review_risks_investigation_scripts.py`
+  - 移除已過時 `xfail` decorators（only-start、only-end、env fallback、timeout hardening）
+  - 修正 timezone 測試本體（改為直接驗證 `_parse_iso_ts` 的 datetime ordering）
+
+**補充實作調整**：
+- `investigations/test_vs_production/checks/preflight_check.py`
+  - `load_env_candidates(...)` 預設 required_keys 改為 `PREDICTION_LOG_DB_PATH`、`DATA_DIR`（即便呼叫端未傳也符合預期）
+
+**最終驗證**：
+```bash
+python -m pytest tests/review_risks/test_review_risks_investigation_scripts.py -q --tb=short
+# 6 passed
+
+ruff check investigations/test_vs_production/checks/preflight_check.py investigations/test_vs_production/checks/investigate_r2_window.py tests/review_risks/test_review_risks_investigation_scripts.py
+# All checks passed
+
+mypy investigations/test_vs_production/checks/preflight_check.py investigations/test_vs_production/checks/investigate_r2_window.py --ignore-missing-imports
+# Success: no issues found in 2 source files
+```
+
+### 下一步
+
+- 以本次修補後腳本在 production 執行：
+  - `preflight_check.py --pretty`
+  - `investigate_r2_window.py --pretty`
+- 若要擴大回歸，可追加 integration 測試（WAL lock / readonly URI）以模擬 scorer 寫入期間的讀取穩定性。

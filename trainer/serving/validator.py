@@ -41,8 +41,10 @@ HK_TZ = ZoneInfo(config.HK_TZ)
 _SENTINEL_SESSION_END = pd.Timestamp("2099-12-31 00:00:00", tz="UTC").tz_convert(HK_TZ)
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # trainer/ (serving lives under trainer)
+PROJECT_ROOT = BASE_DIR.parent
 _state_db_env = os.environ.get("STATE_DB_PATH")
-STATE_DB_PATH = Path(_state_db_env) if _state_db_env else (BASE_DIR / "local_state" / "state.db")
+_state_db_effective = _state_db_env.strip() if (_state_db_env and _state_db_env.strip()) else None
+STATE_DB_PATH = Path(_state_db_effective) if _state_db_effective else (PROJECT_ROOT / "local_state" / "state.db")
 OUT_DIR = BASE_DIR / "out_validator"
 OUT_DIR.mkdir(exist_ok=True)
 RESULTS_PATH = OUT_DIR / "validation_results.csv"  # legacy only (read-backfill); DB is source of truth

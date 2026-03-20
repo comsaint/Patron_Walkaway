@@ -111,13 +111,14 @@ logger = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────────────────────
 HK_TZ = ZoneInfo(config.HK_TZ)
 BASE_DIR = Path(__file__).resolve().parent.parent  # trainer/ (serving lives under trainer)
+PROJECT_ROOT = BASE_DIR.parent
 # Treat empty or whitespace-only env as unset (STATUS Code Review 項目 4 §1; align with DATA_DIR).
 _state_db_env = os.environ.get("STATE_DB_PATH")
 _state_db_effective = _state_db_env.strip() if (_state_db_env and _state_db_env.strip()) else None
 _model_dir_env = os.environ.get("MODEL_DIR")
 _model_dir_effective = _model_dir_env.strip() if (_model_dir_env and _model_dir_env.strip()) else None
-STATE_DIR = Path(_state_db_effective).parent if _state_db_effective else (BASE_DIR / "local_state")
-STATE_DB_PATH = Path(_state_db_effective) if _state_db_effective else (BASE_DIR / "local_state" / "state.db")
+STATE_DIR = Path(_state_db_effective).parent if _state_db_effective else (PROJECT_ROOT / "local_state")
+STATE_DB_PATH = Path(_state_db_effective) if _state_db_effective else (PROJECT_ROOT / "local_state" / "state.db")
 MODEL_DIR = (
     Path(_model_dir_effective)
     if _model_dir_effective
@@ -883,7 +884,6 @@ def _compute_reason_codes(
 
 # ── player_profile loading for real-time scoring (R79) ─────────────────
 
-PROJECT_ROOT = BASE_DIR.parent
 # In deploy, main.py sets DATA_DIR (e.g. deploy root / "data"); use it for profile + canonical.
 # Only treat as deploy path when non-empty after strip (avoid Path("") or Path("  ") = cwd).
 _data_dir_env = os.environ.get("DATA_DIR")

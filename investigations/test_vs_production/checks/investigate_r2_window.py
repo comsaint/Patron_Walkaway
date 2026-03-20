@@ -244,18 +244,39 @@ def parse_args() -> argparse.Namespace:
 
 
 def _resolve_window(start_ts: str, end_ts: str) -> Tuple[str, str]:
-    if start_ts.strip() and end_ts.strip():
-        return start_ts.strip(), end_ts.strip()
+    s = start_ts.strip()
+    e = end_ts.strip()
+    if bool(s) ^ bool(e):
+        raise ValueError("start-ts and end-ts must be provided together")
+    if s and e:
+        return s, e
     now_hk = datetime.now(HK_TZ)
     today_start = now_hk.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_start = today_start - timedelta(days=1)
     return yesterday_start.isoformat(), today_start.isoformat()
 
 
+def _parse_iso_ts(ts: str) -> datetime:
+    text = ts.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        raise ValueError(f"timestamp must include timezone offset: {ts}")
+    return dt
+
+
 def main() -> int:
     args = parse_args()
-    start_ts, end_ts = _resolve_window(args.start_ts, args.end_ts)
-    if start_ts >= end_ts:
+    try:
+        start_ts, end_ts = _resolve_window(args.start_ts, args.end_ts)
+        start_dt = _parse_iso_ts(start_ts)
+        end_dt = _parse_iso_ts(end_ts)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    if start_dt >= end_dt:
         print("start-ts must be earlier than end-ts", file=sys.stderr)
         return 2
 

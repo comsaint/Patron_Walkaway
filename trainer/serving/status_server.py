@@ -19,9 +19,10 @@ from trainer.db_conn import get_clickhouse_client
 
 HK_TZ = ZoneInfo(config.HK_TZ)
 BASE_DIR = Path(__file__).resolve().parent.parent  # trainer/ (serving lives under trainer)
+PROJECT_ROOT = BASE_DIR.parent
 _state_db_env = os.environ.get("STATE_DB_PATH")
 _state_db_effective = _state_db_env.strip() if (_state_db_env and _state_db_env.strip()) else None
-STATE_DB_PATH = Path(_state_db_effective) if _state_db_effective else (BASE_DIR / "local_state" / "state.db")
+STATE_DB_PATH = Path(_state_db_effective) if _state_db_effective else (PROJECT_ROOT / "local_state" / "state.db")
 STATUS_PATH = BASE_DIR / "out_status" / "table_status.json"  # legacy seed only
 HC_PATH = BASE_DIR / "out_status" / "table_hc.csv"  # legacy seed only
 REFRESH_SECONDS = getattr(config, "TABLE_STATUS_REFRESH_SECONDS", 45)
