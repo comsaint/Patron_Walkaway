@@ -485,7 +485,14 @@ def run_autolabel_mode(
         raise ValueError("Fetched bets do not map to canonical_id; cannot compute labels")
 
     bets["bet_id"] = bets["bet_id"].astype(str)
-    bets["payout_complete_dtm"] = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce")
+    _pcd = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce")
+    # Keep label computation tz semantics aligned with trainer.labels:
+    # normalize to HK local time and drop tz info before comparisons.
+    if getattr(_pcd.dt, "tz", None) is None:
+        _pcd = _pcd.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+    else:
+        _pcd = _pcd.dt.tz_convert(HK_TZ)
+    bets["payout_complete_dtm"] = _pcd.dt.tz_localize(None)
     bets = bets.dropna(subset=["payout_complete_dtm"]).copy()
 
     # 3) Compute labels with trainer-consistent logic
