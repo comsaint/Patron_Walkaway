@@ -65,6 +65,7 @@ flowchart LR
 **Remaining items**（依執行順序）：
 - **Credential folder**：Migration（既有 local_state/mlflow.env、repo/.env 搬至 credential/ 並拆分）、可選 deploy 路徑（main.py 改讀 credential/.env）、可選 .gitignore 改為忽略整個 credential/ 再 negate examples）。
 - **DB path consolidation（新增）**：統一 runtime DB 目錄（`STATE_DB_PATH`、`PREDICTION_LOG_DB_PATH` 指向同一 `local_state/`），避免 state 與 prediction log 分散在 `trainer/local_state` 與 `local_state` 造成維運與調查口徑混淆。
+- **T-TrainingMetricsSchema**：`training_metrics.json` 根層與 `rated` 巢狀對齊、調查 baseline 讀取修正；見下節 **T-TrainingMetricsSchema**。
 - **Scorer lookback（可選）**：Code Review §2 — `SCORER_LOOKBACK_HOURS` 非數值或 ≤ 0 時於 scorer 加 fallback（log warning + 用 8）；若實作須同步調整邊界測試預期。
 - 其餘 Phase 2 P0–P1 無強制待辦；若要進一步降低風險，可再針對 Code Review §2–§5 的「效能/語義」項（例如 OOM pre-check I/O 成本與 RSS peak 真實最大值語義）做後續優化。
 
@@ -519,6 +520,79 @@ flowchart LR
   - 所有運維／調查腳本可在不指定 path 的情況下讀到正確 DB。
   - 路徑與備份策略文件化（runbook/STATUS）。
 
+### T-TrainingMetricsSchema — `training_metrics.json` 結構與讀取對齊（P0 維運／調查）— ⏳ Planned
+
+- **Depends on**: 無強制相依（與 P0.1 trainer 寫 artifact、調查腳本可並行），但建議在 **一次訓練 smoke** 後驗證。
+- **Goal**: 讓 **`training_metrics.json` 的「可查詢形狀」與下游直覺一致**，避免把「數值其實在巢狀 `rated` 內」誤判成 **null／缺欄**；並明確區分 **結構問題** 與 **評估邏輯上合法的 JSON null**。
+
+#### 問題陳述（觀察到的現象）
+
+- 訓練後打開 `training_metrics.json`，或在 `run_r1_r6_analysis` 的 baseline 裡，**頂層**的 `test_precision_at_recall_0.01`、`threshold_at_recall_0.01`、`test_threshold_uncalibrated` 等常為 **null 或不存在**。
+- 同一檔案若展開 **`rated` 物件**，往往可看到上述鍵與完整 train/val/test 指標。
+
+#### 根因（程式與契約）
+
+1. **寫檔結構**  
+   `save_artifact_bundle` 使用 `json.dumps({ **combined_metrics, "model_version": ..., ... })`（見 [trainer/training/trainer.py](trainer/training/trainer.py)）。  
+   `combined_metrics` 來自 `train_single_rated_model`／`train_dual_model`，形狀為 **`{"rated": <metrics_dict>, ...}`**，其中 **`<metrics_dict>` 才是扁平的** `val_*` / `train_*` / `test_*` / `threshold` 等。  
+   因此 **`test_precision_at_recall_0.01` 等落在 `root.rated.*`，不在 `root.*`**。這不是「訓練沒算」，而是 **鍵的層級與消費端假設不一致**。
+
+2. **讀取端假設錯誤（具體 bug）**  
+   [investigations/test_vs_production/checks/run_r1_r6_analysis.py](investigations/test_vs_production/checks/run_r1_r6_analysis.py) 的 `_load_training_metrics_baseline` 對  
+   `test_precision_at_recall_0.01`、`threshold_at_recall_0.01`、`test_threshold_uncalibrated` 使用 **`data.get(...)` 僅查頂層**，未 fallback 至 **`data["rated"]`**，故 baseline 長期顯示 null（與實際 JSON 內容不符）。
+
+3. **與「真正的 null」分開看**（**非本次 schema bug**，但會同檔並存）  
+   `_compute_test_metrics` 在 test 集未過 guard（列數、正負樣本、NaN）、或 PR 曲線上無法達到目標 recall 等情況下，會**刻意**把部分鍵設為 **`None` → JSON `null`**；`alerts_per_minute_at_recall_*` 亦**設計上**為 null（trainer 無 test 窗長）。  
+   **修正 schema/讀取後，這些仍可能為 null**——屬**語意正確**，需在文件與調查解讀中保留。
+
+4. **`uncalibrated_threshold` 形狀**  
+   頂層為 **`{"rated": bool}`**（v10 單模型），**不是**單一布林；若下游當成「與 `test_threshold_uncalibrated` 同層級的同型欄位」會混淆。計畫中應**明文寫入 schema 說明**，必要時在 doc 範例 JSON 標註。
+
+#### 建議解法（可採「雙軌」以兼顧相容與清晰）
+
+**A. 寫檔（trainer，受益所有未來訓練）** — 擇一或併用：
+
+- **A1（推薦，向後相容）**：在 `save_artifact_bundle` 組出最終 dict 時，除保留既有 **`rated`（與 legacy 可能之 `nonrated`）巢狀物件**外，將 **審計／對外常用的一組鍵**（例如與 R1/R8 baseline、README 敘述一致的 `test_precision_at_recall_*`、`threshold_at_recall_*`、`test_threshold_uncalibrated`、`threshold`（若與 rated 決策閾值同義需註明））**複寫到 JSON 根層**（**僅在無鍵名衝突時**；現有根層已有 `model_version`、`spec_hash` 等，需逐一核對 `metrics` 內鍵名）。  
+  - **優點**：舊讀法與新讀法都能用；`/model_info` 原樣回傳檔案時也更直觀。  
+  - **成本**：單一 JSON 體積略增（通常可忽略）；**不重複計算**，僅多幾個鍵引用，無 OOM 疑慮。
+
+- **A2（最小改動）**：不複寫根層，只**更新文件與型別/註解**，強制所有消費端讀 **`rated`**。  
+  - **缺點**：人眼與舊腳本仍易踩坑；與「修 bug 讓未來訓練受益」的目標較弱。
+
+**建議採 A1 + 文件**，並在 doc 註明：**根層若出現與 `rated` 重複的鍵，數值應一致**（或註明「根層為 denormalized 快照」）。
+
+**B. 讀檔（調查腳本與任何內部工具）**
+
+- 修正 `_load_training_metrics_baseline`：**頂層優先，否則 fallback `data.get("rated")`** 再取子鍵（相容「僅巢狀」舊檔與「根層已複寫」新檔）。
+- **Grep** 全 repo：`training_metrics.json` / `test_precision_at_recall` / `threshold_at_recall` 的讀取處，**統一使用同一 helper**（例如 `trainer/core` 或 `investigations` 內小函式），避免下一個腳本再寫錯層級。
+
+#### 文件與契約
+
+- 更新 **[README.md](README.md)**（或 [doc/model_api_protocol_v2.md](doc/model_api_protocol_v2.md) 若需對齊 `/model_info` 回傳形狀）：說明 **根層 metadata** vs **`rated` 內 metrics**；列出 **可能為 JSON null 的鍵**及其語意（guard、PR 不可達、apm 未實作等）。
+- 若採 A1：在 [doc/phase2_provenance_schema.md](doc/phase2_provenance_schema.md) 或 [ssot/phase2_p0_p1_ssot.md](ssot/phase2_p0_p1_ssot.md) 增一節 **`training_metrics.json` 鍵層級**（簡短即可）。
+
+#### 測試與驗證
+
+- **Unit / 契約測試**（`tests/`）：  
+  - mock `save_artifact_bundle` 的輸入 `combined_metrics`，斷言寫出的 JSON **同時**含 `rated.test_precision_at_recall_0.01`（若該次 metrics 有值）與（若採 A1）**根層**同名鍵一致。  
+  - 針對 `_load_training_metrics_baseline`：**僅巢狀**與**根層複寫**兩種 fixture 皆能讀到相同 baseline。
+- **手動**：跑一次最小訓練或既有 `training_metrics.json` fixture，確認 R1/R6 分析輸出 baseline 不再無故 null。
+
+#### Rollback
+
+- 還原 `save_artifact_bundle` 的 denormalize 區塊即可；reader 的 fallback 應保留，對舊檔仍友善。
+
+#### Definition of done
+
+- 新產出之 `training_metrics.json`：**調查 baseline 與文件描述的鍵路徑一致**；`_load_training_metrics_baseline` 不再因層級錯誤回報 false null。  
+- **pytest / ruff** 通過；若有 touched 檔案在 mypy 範圍內則維持通過。  
+- 文件與（可選）SSOT 已更新，**並註明哪些 null 屬正常評估結果而非 bug**。
+
+#### 批判性提醒（實作時必讀）
+
+- **不要把「PR／test guard 造成的合法 `null`」當成同一個 bug 修掉**；否則會掩蓋「test 其實不可用」的訊號。
+- **A1 根層複寫**前務必 **grep `metrics` 內所有鍵名**，避免與 `model_version`、`spec_hash`、`uncalibrated_threshold` 等衝突；若有衝突，可改為 **`rated_` 前綴** 或只複寫白名單鍵（較安全）。
+
 ---
 
 ## File-Level Edit Summary
@@ -529,6 +603,9 @@ flowchart LR
   - 在 `save_artifact_bundle(...)` 後接入 provenance logging。
   - （T12）pipeline 開頭以 `with safe_start_run(...)` 包住整段；失敗時在 except 內 `log_tags_safe` / `log_params_safe`（含 config、chunk 數、OOM-check 估計等）。
   - （T13）在 `_log_training_provenance_to_mlflow` 第一次被呼叫前，若有 active run 則呼叫 warm-up（例如 `mlflow_utils` 提供之輕量 get_run 並套用相同 503 重試），再執行既有 provenance / metrics 寫入。
+  - （T-TrainingMetricsSchema）`save_artifact_bundle`：`training_metrics.json` 根層與 `rated` 巢狀對齊（建議 A1 denormalize 白名單鍵＋文件）。
+- [investigations/test_vs_production/checks/run_r1_r6_analysis.py](investigations/test_vs_production/checks/run_r1_r6_analysis.py)（T-TrainingMetricsSchema）
+  - `_load_training_metrics_baseline`：頂層優先、`rated` fallback；可選抽成共用 helper。
 - [trainer/serving/scorer.py](trainer/serving/scorer.py)
   - 建立獨立的 `prediction_log.db` 與對應 schema（prediction log + export metadata/audit）
   - 在 `score_once(...)` 中對獨立 DB 進行 batch append
@@ -648,6 +725,10 @@ flowchart LR
 ### T13 MLflow cold-start mitigation
 
 - Remove retry loop and backoff from `log_params_safe` / `log_metrics_safe` (and `log_tags_safe` if changed); remove warm-up call before `_log_training_provenance_to_mlflow` in trainer. Restores single-attempt log and warning on failure.
+
+### T-TrainingMetricsSchema (`training_metrics.json`)
+
+- Remove denormalized top-level metric keys from `save_artifact_bundle` if A1 was implemented; optionally revert `_load_training_metrics_baseline` to top-level-only if team accepts breaking old files (not recommended—prefer keeping reader fallback).
 
 ---
 

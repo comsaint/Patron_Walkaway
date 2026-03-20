@@ -45,6 +45,8 @@ import hashlib
 import inspect
 import json
 import logging
+import importlib
+import sys
 import os
 import tempfile
 from datetime import date, datetime, timedelta
@@ -235,10 +237,21 @@ def compute_profile_schema_hash(session_parquet: Optional[Path] = None) -> str:
     stored fingerprint to decide whether to invalidate the cache.
     """
     # Import PROFILE_FEATURE_COLS lazily to avoid circular imports.
-    try:
-        from features import PROFILE_FEATURE_COLS as _pfc  # type: ignore[import]
-    except ModuleNotFoundError:
-        from trainer.features import PROFILE_FEATURE_COLS as _pfc  # type: ignore[import, no-redef]
+    # Prefer trainer.features so runtime monkeypatch in tests uses same module object.
+    _feature_cols_by_module: Dict[str, List[str]] = {}
+    for _mod_name in ("trainer.features", "trainer.features.features", "features"):
+        _mod = sys.modules.get(_mod_name)
+        if _mod is None:
+            try:
+                _mod = importlib.import_module(_mod_name)
+            except ModuleNotFoundError:
+                continue
+        _feature_cols_by_module[_mod_name] = list(
+            getattr(_mod, "PROFILE_FEATURE_COLS", [])
+        )
+    _pfc: List[str] = sorted(
+        {c for cols in _feature_cols_by_module.values() for c in cols}
+    )
 
     # Hash the pandas aggregation logic so a computation change invalidates cache.
     # R98: normalize CRLF -> LF so the fingerprint is identical across OS.
@@ -262,7 +275,8 @@ def compute_profile_schema_hash(session_parquet: Optional[Path] = None) -> str:
     payload = json.dumps(
         {
             "profile_version": PROFILE_VERSION,
-            "feature_cols": sorted(_pfc),
+            "feature_cols": _pfc,
+            "feature_cols_by_module": _feature_cols_by_module,
             "session_cols": sorted(_SESSION_COLS),
             "compute_source_hash": compute_source_hash,
             "session_min_date": session_min_date,

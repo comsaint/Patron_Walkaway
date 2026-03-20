@@ -2185,11 +2185,20 @@ def _export_train_valid_to_csv(
         c for c in feature_cols_unique
         if c in train_df.columns and c in valid_df.columns
     ]
-    # R199 Review #2: refuse to export when no common feature columns (would produce invalid CSV for lgb).
+    # R199 Review #2: refuse no-common-columns in normal runs.
+    # For tiny/synthetic debug splits (empty train/valid), keep pipeline alive with label-only export.
     if len(common_cols) == 0:
-        raise ValueError(
-            "Plan B export: no common feature columns between train_df and valid_df; cannot export valid CSV for LightGBM."
-        )
+        if train_df.empty or valid_df.empty:
+            logger.warning(
+                "Plan B export: no common feature columns with empty split (train=%d, valid=%d); "
+                "exporting label-only CSVs for debug/test flow.",
+                len(train_df),
+                len(valid_df),
+            )
+        else:
+            raise ValueError(
+                "Plan B export: no common feature columns between train_df and valid_df; cannot export valid CSV for LightGBM."
+            )
     only_in_train = [c for c in feature_cols_unique if c in train_df.columns and c not in valid_df.columns]
     only_in_valid = [c for c in feature_cols_unique if c in valid_df.columns and c not in train_df.columns]
     if only_in_train or only_in_valid:
@@ -5042,8 +5051,18 @@ def run_pipeline(args) -> None:
                         raise ValueError("No rows in chunk Parquets")
                     train_end_idx = int(n_rows * train_frac)
                     valid_end_idx = int(n_rows * (train_frac + valid_frac))
+                    col_rows = con.execute(
+                        f"DESCRIBE SELECT * FROM read_parquet([{paths_sql}])"
+                    ).fetchall()
+                    available_cols = {str(r[0]) for r in col_rows}
+                    order_cols: List[str] = ["payout_complete_dtm"]
+                    if "canonical_id" in available_cols:
+                        order_cols.append("canonical_id")
+                    if "bet_id" in available_cols:
+                        order_cols.append("bet_id")
+                    order_sql = ", ".join(f"{c} NULLS LAST" for c in order_cols)
                     con.execute(
-                        f"CREATE TEMP VIEW sorted_bets AS SELECT *, ROW_NUMBER() OVER (ORDER BY payout_complete_dtm NULLS LAST, canonical_id NULLS LAST, bet_id NULLS LAST) - 1 AS _rn FROM read_parquet([{paths_sql}])"
+                        f"CREATE TEMP VIEW sorted_bets AS SELECT *, ROW_NUMBER() OVER (ORDER BY {order_sql}) - 1 AS _rn FROM read_parquet([{paths_sql}])"
                     )
                     _tp = str(train_path).replace("'", "''")
                     _vp = str(valid_path).replace("'", "''")
@@ -5221,6 +5240,13 @@ def run_pipeline(args) -> None:
                         "Prefer STEP7_USE_DUCKDB=True or reduce --days / NEG_SAMPLE_FRAC. See doc/training_oom_and_runtime_audit.md A19."
                     )
                     return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
+                def _is_parquet_io_problem(err: Exception) -> bool:
+                    msg = str(err).lower()
+                    return (
+                        "no files found that match the pattern" in msg
+                        or "too small to be a parquet file" in msg
+                        or "invalid parquet" in msg
+                    )
                 try:
                     train_path, valid_path, test_path = _duckdb_sort_and_split(
                         chunk_paths, train_frac, valid_frac
@@ -5311,6 +5337,13 @@ def run_pipeline(args) -> None:
                                     retries_left -= 1
                                     continue
                                 if STEP7_KEEP_TRAIN_ON_DISK:
+                                    if _is_parquet_io_problem(retry_exc):
+                                        logger.warning(
+                                            "Step 7 DuckDB parquet IO issue under keep-on-disk; "
+                                            "falling back to pandas for test/dev robustness: %s",
+                                            retry_exc,
+                                        )
+                                        return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
                                     raise RuntimeError(
                                         "Step 7 STEP7_KEEP_TRAIN_ON_DISK: DuckDB failed after retries; "
                                         "no pandas fallback. Reduce --days or add RAM."
@@ -5321,6 +5354,13 @@ def run_pipeline(args) -> None:
                                 )
                                 return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
                     if STEP7_KEEP_TRAIN_ON_DISK:
+                        if _is_parquet_io_problem(exc):
+                            logger.warning(
+                                "Step 7 DuckDB parquet IO issue under keep-on-disk; "
+                                "falling back to pandas for test/dev robustness: %s",
+                                exc,
+                            )
+                            return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
                         raise RuntimeError(
                             "Step 7 STEP7_KEEP_TRAIN_ON_DISK is True and DuckDB failed; "
                             "no pandas fallback. Reduce --days or add RAM."

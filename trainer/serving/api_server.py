@@ -1,7 +1,7 @@
 import sqlite3
 import os
 import numpy as np
-import pandas as pd
+import pandas as pd  # type: ignore[import-untyped]
 from flask import Flask, request, jsonify, send_from_directory, abort
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo

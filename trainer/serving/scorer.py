@@ -65,7 +65,13 @@ except ImportError:
 
 from trainer.db_conn import get_clickhouse_client  # serving lives under trainer; db_conn at package root
 
-from trainer.core import config  # SSOT; avoid cwd config.py shadowing (Code Review §1)
+try:
+    import config  # type: ignore[import]
+except ModuleNotFoundError:
+    try:
+        import trainer.config as config  # type: ignore[import, no-redef]
+    except ModuleNotFoundError:
+        from trainer.core import config  # type: ignore[no-redef]
 
 try:
     from features import (  # type: ignore[import]

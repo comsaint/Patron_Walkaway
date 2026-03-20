@@ -242,15 +242,22 @@ Trainer 在 **沒有 validation set** 時會使用 **threshold=0.5** fallback，
 
 | 編號 | 狀態 | 結論摘要 |
 |------|------|----------|
-| R1 | （見上列選項） | （填寫） |
+| R1 | 進行中 | `run_r1_r6_analysis.py` 已補 unified sample 估計與 baseline 輔助，但 production 同口徑最終對拍尚未完成。 |
 | R2 | 已排除（第一輪） | 2026-03-19（HKT）窗口內，`prediction_log.n_is_alert_1 = 2485` 與 `alerts.n_alerts_table = 2485`，ratio=1.0，未觀察到 is_alert 與 alerts 筆數口徑差。注意該窗口實際覆蓋為 18:37~23:59（系統晚間部署後開始寫入）。 |
-| R3 | … | … |
-| R4 | … | … |
-| R5 | … | … |
-| R6 | … | … |
-| R7 | … | … |
+| R3 | 進行中 | validator vs `compute_labels`（含 censored/terminal）仍需完整對拍與差異歸因。 |
+| R4 | 進行中 | canonical/profile parity 已有檢查骨架，cutoff 與 profile 快照一致性仍待結案證據。 |
+| R5 | 待調查 | 分時段/分群 score 分佈漂移與 production 對比尚未完成。 |
+| R6 | 進行中 | production 端 PR 還原流程可執行，但仍待固定窗口完整證據鏈。 |
+| R7 | 待調查 | 多時間窗 backtest 代表性分析尚未完成。 |
 | R8 | 已排除（第一輪） | `test_threshold_uncalibrated = false`，且未觀察到 threshold fallback（如 0.5 fallback）跡象，暫不視為主因。 |
-| R9 | … | … |
+| R9 | 已修復待驗證 | autolabel 路徑已做 HK naive 時間正規化；仍需跨來源（CH/Parquet）同窗抽驗確認無整點偏移。 |
+
+### 目前剩餘項目（依 §4 建議順序）
+
+1. `R3`：完成 validator 與 `compute_labels` 全量對拍（含 censored/terminal 边界）。
+2. `R4`：完成 `canonical_mapping.cutoff` 與 profile snapshot parity 證據化比對。
+3. `R5` / `R7`：完成時段分佈漂移與多窗 backtest 代表性分析。
+4. `R1` / `R6`：在固定 production 窗口重跑 unified 流程並做同口徑最終比對。
 
 ---
 
