@@ -30,7 +30,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from collections import defaultdict
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, cast
 from zoneinfo import ZoneInfo
 
 import pandas as pd  # type: ignore[import-untyped]
@@ -130,6 +131,56 @@ def _resolve_pred_db_path(env_file: str, pred_db_path: str) -> Tuple[str, Option
     return value.strip(), env_used
 
 
+def _resolve_env_path_for_key(
+    key: str,
+    env_file: str,
+    cli_override: str,
+    default_path: Path,
+) -> Tuple[str, Optional[str]]:
+    """Resolve a path from CLI, env file (with optional env-file precedence), or default."""
+    if cli_override.strip():
+        return cli_override.strip(), None
+
+    repo_root = _repo_root_from_script()
+    if env_file.strip():
+        env_candidates: Sequence[Path] = [Path(env_file).resolve()]
+    else:
+        env_candidates = [
+            Path.cwd() / "credential" / ".env",
+            Path.cwd() / ".env",
+            repo_root / "credential" / ".env",
+            repo_root / ".env",
+        ]
+
+    env_used = None
+    file_env: Dict[str, str] = {}
+    for p in env_candidates:
+        d = _load_env_file(p)
+        if key in d:
+            file_env = d
+            env_used = str(p)
+            break
+
+    if env_file.strip():
+        value = file_env.get(key) or os.getenv(key) or ""
+    else:
+        value = os.getenv(key) or file_env.get(key) or ""
+    value = value.strip()
+    if value:
+        return value, env_used
+    return str(default_path), env_used
+
+
+def _resolve_state_db_path(env_file: str, state_db_path: str) -> Tuple[str, Optional[str]]:
+    default = _repo_root_from_script() / "local_state" / "state.db"
+    return _resolve_env_path_for_key("STATE_DB_PATH", env_file, state_db_path, default)
+
+
+def _resolve_model_dir(env_file: str, model_dir: str) -> Tuple[str, Optional[str]]:
+    default = Path(str(getattr(config, "DEFAULT_MODEL_DIR", _repo_root_from_script() / "out" / "models")))
+    return _resolve_env_path_for_key("MODEL_DIR", env_file, model_dir, default)
+
+
 def _resolve_window(start_ts: str, end_ts: str) -> Tuple[str, str]:
     s = start_ts.strip()
     e = end_ts.strip()
@@ -207,13 +258,19 @@ def run_sample_mode(
     bins: int,
     seed: int,
     out_csv: Path,
+    candidate_filter: str = "below_threshold",
     overwrite: bool = False,
 ) -> Dict[str, object]:
-    _log(f"sample: starting (db={db_path}, window={start_ts} -> {end_ts}, sample_size={sample_size}, bins={bins})")
+    _log(
+        "sample: starting "
+        f"(db={db_path}, window={start_ts} -> {end_ts}, sample_size={sample_size}, bins={bins}, filter={candidate_filter})"
+    )
     if sample_size <= 0:
         raise ValueError("sample-size must be > 0")
     if bins <= 0:
         raise ValueError("bins must be > 0")
+    if candidate_filter not in {"below_threshold", "alert", "all_rated"}:
+        raise ValueError("candidate-filter must be one of: below_threshold, alert, all_rated")
 
     if out_csv.exists() and not overwrite:
         raise FileExistsError(f"output CSV already exists (set overwrite): {out_csv}")
@@ -242,16 +299,31 @@ def run_sample_mode(
         reservoirs: Dict[int, List[CandidateRow]] = {i: [] for i in range(bins)}
         seen_per_bin: Dict[int, int] = {i: 0 for i in range(bins)}
 
-        cursor = conn.execute(
+        if candidate_filter == "below_threshold":
+            sample_sql = """
+                SELECT bet_id, score, scored_at, is_alert, is_rated_obs
+                FROM prediction_log
+                WHERE scored_at >= ? AND scored_at < ?
+                  AND is_rated_obs = 1
+                  AND is_alert = 0
             """
-            SELECT bet_id, score, scored_at, is_alert, is_rated_obs
-            FROM prediction_log
-            WHERE scored_at >= ? AND scored_at < ?
-              AND is_rated_obs = 1
-              AND is_alert = 0
-            """,
-            (start_ts, end_ts),
-        )
+        elif candidate_filter == "alert":
+            sample_sql = """
+                SELECT bet_id, score, scored_at, is_alert, is_rated_obs
+                FROM prediction_log
+                WHERE scored_at >= ? AND scored_at < ?
+                  AND is_rated_obs = 1
+                  AND is_alert = 1
+            """
+        else:
+            sample_sql = """
+                SELECT bet_id, score, scored_at, is_alert, is_rated_obs
+                FROM prediction_log
+                WHERE scored_at >= ? AND scored_at < ?
+                  AND is_rated_obs = 1
+            """
+
+        cursor = conn.execute(sample_sql, (start_ts, end_ts))
         for bet_id, score, scored_at, is_alert, is_rated_obs in cursor:
             if bet_id is None or score is None:
                 continue
@@ -293,14 +365,74 @@ def run_sample_mode(
                 "n_rated": int(n_rated or 0),
                 "n_alert_rated": int(n_alert_rated or 0),
                 "n_below_rated": int(n_below_rated or 0),
+                "candidate_filter": candidate_filter,
                 "sample_size_requested": sample_size,
                 "sample_size_written": len(sampled),
                 "bins": bins,
                 "per_bin_target": per_bin_target,
             },
             "output_csv": str(out_csv),
-            "note": "Run offline labeling on output_csv bet_id, then use evaluate mode with labeled CSV.",
+            "note": (
+                "Run offline labeling on output_csv bet_id, then use evaluate mode with labeled CSV. "
+                "Use candidate_filter='alert' to diagnose precision drop; "
+                "use candidate_filter='below_threshold' to diagnose missed positives."
+            ),
         }
+    finally:
+        conn.close()
+
+
+def _sqlite_table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _evaluate_join_rows_from_labels(
+    db_path: str,
+    start_ts: str,
+    end_ts: str,
+    labels: Dict[str, Tuple[int, int]],
+) -> Tuple[List[Tuple[str, float, int, int, str]], int]:
+    """
+    Join prediction_log with offline labels. Returns rows:
+    (bet_id, score, is_alert, label, model_version) and count of censored rows excluded.
+    """
+    conn = sqlite3.connect(db_path, timeout=10)
+    n_censored_excluded = 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prediction_log'")
+        if cur.fetchone() is None:
+            raise RuntimeError("prediction_log table not found")
+
+        has_model_version = "model_version" in _sqlite_table_columns(conn, "prediction_log")
+        mv_sql = "p.model_version" if has_model_version else "NULL AS model_version"
+
+        conn.execute("DROP TABLE IF EXISTS _tmp_labels")
+        conn.execute(
+            "CREATE TEMP TABLE _tmp_labels (bet_id TEXT PRIMARY KEY, label INTEGER NOT NULL, censored INTEGER NOT NULL)"
+        )
+        conn.executemany(
+            "INSERT INTO _tmp_labels (bet_id, label, censored) VALUES (?, ?, ?)",
+            [(bid, y, c) for bid, (y, c) in labels.items()],
+        )
+
+        rows: List[Tuple[str, float, int, int, str]] = []
+        sql = f"""
+            SELECT p.bet_id, p.score, p.is_alert, l.label, l.censored, {mv_sql}
+            FROM prediction_log p
+            JOIN _tmp_labels l ON p.bet_id = l.bet_id
+            WHERE p.scored_at >= ? AND p.scored_at < ?
+              AND p.is_rated_obs = 1
+        """
+        for bet_id, score, is_alert, label, censored, model_version in conn.execute(sql, (start_ts, end_ts)):
+            if int(censored or 0) == 1:
+                n_censored_excluded += 1
+                continue
+            if score is None or bet_id is None:
+                continue
+            mv = str(model_version).strip() if model_version is not None else "unknown"
+            rows.append((str(bet_id), float(score), int(is_alert or 0), int(label), mv))
+        return rows, n_censored_excluded
     finally:
         conn.close()
 
@@ -596,6 +728,161 @@ def _precision_at_recall_target(rows: List[Tuple[float, int]], target_recall: fl
     }
 
 
+def _safe_div(numer: float, denom: float) -> float:
+    return numer / denom if denom > 0 else 0.0
+
+
+def _as_float(v: object) -> float:
+    return float(cast(float, v))
+
+
+def _cross_check_alerts_vs_prediction_log(
+    pred_db_path: str,
+    state_db_path: str,
+    start_ts: str,
+    end_ts: str,
+) -> Dict[str, object]:
+    """R2: compare prediction_log is_alert volume vs alerts table (duplicate suppression)."""
+    sp = Path(state_db_path)
+    if not sp.exists():
+        return {"status": "skipped", "reason": f"state DB not found: {state_db_path}"}
+
+    pred_conn = sqlite3.connect(pred_db_path, timeout=10)
+    try:
+        n_pl = int(
+            pred_conn.execute(
+                """
+                SELECT COUNT(*) FROM prediction_log
+                WHERE scored_at >= ? AND scored_at < ?
+                  AND is_rated_obs = 1 AND is_alert = 1
+                """,
+                (start_ts, end_ts),
+            ).fetchone()[0]
+        )
+    finally:
+        pred_conn.close()
+
+    st_conn = sqlite3.connect(str(sp), timeout=10)
+    try:
+        cur = st_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='alerts'",
+        )
+        if cur.fetchone() is None:
+            return {"status": "skipped", "reason": "alerts table missing in state DB"}
+        n_al = int(
+            st_conn.execute(
+                "SELECT COUNT(*) FROM alerts WHERE ts >= ? AND ts < ?",
+                (start_ts, end_ts),
+            ).fetchone()[0]
+        )
+    finally:
+        st_conn.close()
+
+    diff = n_pl - n_al
+    return {
+        "status": "ok",
+        "state_db_path": str(sp),
+        "n_prediction_log_is_alert_rows": n_pl,
+        "n_alerts_table_rows_ts_window": n_al,
+        "difference_pl_minus_alerts": diff,
+        "alerts_to_prediction_log_ratio": _safe_div(float(n_al), float(n_pl)) if n_pl else 0.0,
+        "note": (
+            "Compares counts in the same [start_ts, end_ts) string window on scored_at vs alerts.ts. "
+            "Mismatch may reflect duplicate suppression (R2) or timestamp semantics differences."
+        ),
+    }
+
+
+def _load_training_metrics_baseline(model_dir: Path) -> Dict[str, object]:
+    """R8 / R1 baseline: read trainer-written training_metrics.json when present."""
+    path = model_dir / "training_metrics.json"
+    if not path.is_file():
+        return {
+            "status": "skipped",
+            "reason": f"training_metrics.json not found under {model_dir}",
+        }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"status": "error", "reason": str(exc)}
+
+    baseline: Dict[str, object] = {
+        "status": "ok",
+        "path": str(path.resolve()),
+        "model_version": data.get("model_version"),
+        "test_precision_at_recall_0.01": data.get("test_precision_at_recall_0.01"),
+        "threshold_at_recall_0.01": data.get("threshold_at_recall_0.01"),
+        "test_threshold_uncalibrated": data.get("test_threshold_uncalibrated"),
+        "uncalibrated_threshold": data.get("uncalibrated_threshold"),
+    }
+    rated = data.get("rated")
+    if isinstance(rated, dict):
+        baseline["rated_threshold"] = rated.get("threshold")
+    return baseline
+
+
+def _build_unified_sample_evaluation(
+    pred_db_path: str,
+    start_ts: str,
+    end_ts: str,
+    labels_below: Dict[str, Tuple[int, int]],
+    labels_alert: Dict[str, Tuple[int, int]],
+    target_recall: float,
+) -> Dict[str, object]:
+    """
+    Merge labeled rows from both stratified branches for a single (score, pred, label) cohort.
+    Not an unbiased draw from production — see description field.
+    """
+    rows_b, c_b = _evaluate_join_rows_from_labels(pred_db_path, start_ts, end_ts, labels_below)
+    rows_a, c_a = _evaluate_join_rows_from_labels(pred_db_path, start_ts, end_ts, labels_alert)
+
+    merged: Dict[str, Tuple[str, float, int, int, str]] = {}
+    for r in rows_b:
+        merged[r[0]] = r
+    dup = 0
+    for r in rows_a:
+        if r[0] in merged:
+            dup += 1
+        merged[r[0]] = r
+    unified = list(merged.values())
+    triples: List[Tuple[float, int, int]] = [(s, p, y) for _bid, s, p, y, _mv in unified]
+
+    current = _precision_recall_at_current_threshold(triples)
+    pat = _precision_at_recall_target([(s, y) for s, _p, y in triples], target_recall)
+
+    by_mv: Dict[str, List[Tuple[float, int, int]]] = defaultdict(list)
+    for _bid, s, p, y, mv in unified:
+        by_mv[mv].append((s, p, y))
+
+    per_version: Dict[str, object] = {}
+    for mv, trip in sorted(by_mv.items(), key=lambda x: -len(x[1])):
+        per_version[mv] = {
+            "n_rows": len(trip),
+            "current_threshold_metrics": _precision_recall_at_current_threshold(trip),
+            "precision_at_recall_target": {
+                "target_recall": target_recall,
+                **_precision_at_recall_target([(s, y) for s, _p, y in trip], target_recall),
+            },
+        }
+
+    return {
+        "description": (
+            "Merged union of stratified below-threshold + stratified alert labeled samples. "
+            "NOT an i.i.d. or cohort-unbiased estimate of full production PR — use for unified "
+            "score–label diagnostics and model_version splits only."
+        ),
+        "n_rows_below_branch": len(rows_b),
+        "n_rows_alert_branch": len(rows_a),
+        "n_duplicate_bet_id_overlap": dup,
+        "n_rows_merged_unique": len(unified),
+        "n_censored_excluded_below": c_b,
+        "n_censored_excluded_alert": c_a,
+        "current_threshold_metrics": current,
+        "precision_at_recall_target": {"target_recall": target_recall, **pat},
+        "by_model_version": per_version,
+    }
+
+
 def run_evaluate_mode(
     db_path: str,
     start_ts: str,
@@ -611,66 +898,34 @@ def run_evaluate_mode(
     if not labels:
         raise ValueError("labels CSV contains no valid (bet_id,label) rows")
 
-    conn = sqlite3.connect(db_path, timeout=10)
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prediction_log'")
-        if cur.fetchone() is None:
-            raise RuntimeError("prediction_log table not found")
+    detail_rows, n_censored_excluded = _evaluate_join_rows_from_labels(
+        db_path, start_ts, end_ts, labels
+    )
+    rows: List[Tuple[float, int, int]] = [(s, p, y) for _bid, s, p, y, _mv in detail_rows]
 
-        # Create temp label table for efficient join.
-        conn.execute("DROP TABLE IF EXISTS _tmp_labels")
-        conn.execute(
-            "CREATE TEMP TABLE _tmp_labels (bet_id TEXT PRIMARY KEY, label INTEGER NOT NULL, censored INTEGER NOT NULL)"
-        )
-        conn.executemany(
-            "INSERT INTO _tmp_labels (bet_id, label, censored) VALUES (?, ?, ?)",
-            [(bid, y, c) for bid, (y, c) in labels.items()],
-        )
+    if not rows:
+        raise ValueError("No labeled rows matched prediction_log in the selected window")
 
-        rows: List[Tuple[float, int, int]] = []
-        n_censored_excluded = 0
-        for score, is_alert, label, censored in conn.execute(
-            """
-            SELECT p.score, p.is_alert, l.label, l.censored
-            FROM prediction_log p
-            JOIN _tmp_labels l ON p.bet_id = l.bet_id
-            WHERE p.scored_at >= ? AND p.scored_at < ?
-              AND p.is_rated_obs = 1
-            """,
-            (start_ts, end_ts),
-        ):
-            if int(censored or 0) == 1:
-                n_censored_excluded += 1
-                continue
-            if score is None:
-                continue
-            rows.append((float(score), int(is_alert or 0), int(label)))
+    current = _precision_recall_at_current_threshold(rows)
+    pat = _precision_at_recall_target([(s, y) for s, _pred, y in rows], target_recall)
 
-        if not rows:
-            raise ValueError("No labeled rows matched prediction_log in the selected window")
-
-        current = _precision_recall_at_current_threshold(rows)
-        pat = _precision_at_recall_target([(s, y) for s, _pred, y in rows], target_recall)
-
-        return {
-            "mode": "evaluate",
-            "window": {"start_ts": start_ts, "end_ts": end_ts},
-            "db_path": db_path,
-            "labels_csv": str(labels_csv),
-            "n_labeled_input": len(labels),
-            "n_labeled_matched": len(rows),
-            "n_censored_excluded": n_censored_excluded,
-            "current_threshold_metrics": current,
-            "precision_at_recall_target": {
-                "target_recall": target_recall,
-                **pat,
-            },
-            "note": "Compare current_threshold_metrics and precision_at_recall_target against offline test metrics with same definition.",
-        }
-    finally:
-        conn.close()
-        _log("evaluate: done")
+    out = {
+        "mode": "evaluate",
+        "window": {"start_ts": start_ts, "end_ts": end_ts},
+        "db_path": db_path,
+        "labels_csv": str(labels_csv),
+        "n_labeled_input": len(labels),
+        "n_labeled_matched": len(rows),
+        "n_censored_excluded": n_censored_excluded,
+        "current_threshold_metrics": current,
+        "precision_at_recall_target": {
+            "target_recall": target_recall,
+            **pat,
+        },
+        "note": "Compare current_threshold_metrics and precision_at_recall_target against offline test metrics with same definition.",
+    }
+    _log("evaluate: done")
+    return out
 
 
 def parse_args() -> argparse.Namespace:
@@ -680,11 +935,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--end-ts", default="", help="Window end timestamp (exclusive). Default: dynamic today start in HKT.")
     p.add_argument("--env-file", default="", help="Optional .env file path.")
     p.add_argument("--pred-db-path", default="", help="Override prediction log DB path.")
+    p.add_argument("--state-db-path", default="", help="Override STATE_DB_PATH for alerts cross-check (R2).")
+    p.add_argument("--model-dir", default="", help="Override MODEL_DIR for training_metrics.json baseline (R1/R8).")
     p.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
     p.add_argument("--overwrite", action="store_true", help="Allow overwriting existing output CSV files.")
 
     # sample mode args
     p.add_argument("--sample-size", type=int, default=4000, help="Target below-threshold sample size.")
+    p.add_argument(
+        "--candidate-filter",
+        choices=["below_threshold", "alert", "all_rated"],
+        default="below_threshold",
+        help="Sample candidate source: below-threshold (`is_alert=0`), alert (`is_alert=1`), or all rated.",
+    )
     p.add_argument("--bins", type=int, default=10, help="Number of score bins for stratified sampling.")
     p.add_argument("--seed", type=int, default=42, help="Deterministic seed for reservoir replacement.")
     p.add_argument(
@@ -724,6 +987,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     _log(f"main: start (mode={args.mode})")
+    candidate_filter = getattr(args, "candidate_filter", "below_threshold")
     try:
         start_ts, end_ts = _resolve_window(args.start_ts, args.end_ts)
         start_dt = _parse_iso_ts(start_ts)
@@ -743,6 +1007,10 @@ def main() -> int:
         return 2
     _log(f"main: using prediction_log DB ({pred_db_path})")
 
+    state_db_path, state_env_file_used = _resolve_state_db_path(args.env_file, getattr(args, "state_db_path", ""))
+    model_dir_str, model_dir_env_file_used = _resolve_model_dir(args.env_file, getattr(args, "model_dir", ""))
+    _log(f"main: resolved state DB ({state_db_path}), model_dir ({model_dir_str})")
+
     default_sample_csv, default_labels_csv = _default_snapshot_paths(start_ts, end_ts)
     effective_out_csv = Path(args.out_csv) if args.out_csv.strip() else default_sample_csv
     effective_sample_csv = Path(args.sample_csv) if args.sample_csv.strip() else effective_out_csv
@@ -757,6 +1025,7 @@ def main() -> int:
                 start_ts=start_ts,
                 end_ts=end_ts,
                 sample_size=args.sample_size,
+                candidate_filter=candidate_filter,
                 bins=args.bins,
                 seed=args.seed,
                 out_csv=effective_out_csv,
@@ -783,52 +1052,136 @@ def main() -> int:
                 target_recall=args.target_recall,
             )
         else:
-            # all: sample -> autolabel -> evaluate
-            try:
-                _log("main: executing all-mode step sample")
-                sample_payload = run_sample_mode(
-                    db_path=pred_db_path,
-                    start_ts=start_ts,
-                    end_ts=end_ts,
-                    sample_size=args.sample_size,
-                    bins=args.bins,
-                    seed=args.seed,
-                    out_csv=effective_out_csv,
-                    overwrite=getattr(args, "overwrite", False),
-                )
-            except Exception as exc:
-                raise RuntimeError(f"all-mode step 'sample' failed: {exc}") from exc
-            try:
-                _log("main: executing all-mode step autolabel")
-                autolabel_payload = run_autolabel_mode(
-                    db_path=pred_db_path,
-                    start_ts=start_ts,
-                    end_ts=end_ts,
-                    sample_csv=effective_sample_csv,
-                    out_labels_csv=effective_out_labels_csv,
-                    player_chunk_size=args.player_chunk_size,
-                    max_players=args.max_players,
-                )
-            except Exception as exc:
-                raise RuntimeError(f"all-mode step 'autolabel' failed: {exc}") from exc
-            try:
-                _log("main: executing all-mode step evaluate")
-                evaluate_payload = run_evaluate_mode(
-                    db_path=pred_db_path,
-                    start_ts=start_ts,
-                    end_ts=end_ts,
-                    labels_csv=effective_labels_csv,
-                    target_recall=args.target_recall,
-                )
-            except Exception as exc:
-                raise RuntimeError(f"all-mode step 'evaluate' failed: {exc}") from exc
-            payload = {
-                "mode": "all",
-                "sample": sample_payload,
-                "autolabel": autolabel_payload,
-                "evaluate": evaluate_payload,
+            # all: run two diagnosis branches automatically:
+            # - below_threshold (missed positives / FN concentration)
+            # - alert (current precision / FP concentration)
+            # This keeps one-line UX and avoids requiring extra params.
+            branches: Dict[str, Dict[str, object]] = {}
+            for branch_name, branch_filter in (
+                ("below_threshold", "below_threshold"),
+                ("alert", "alert"),
+            ):
+                _log(f"main: executing all-mode branch {branch_name}")
+                try:
+                    sample_payload = run_sample_mode(
+                        db_path=pred_db_path,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        sample_size=args.sample_size,
+                        candidate_filter=branch_filter,
+                        bins=args.bins,
+                        seed=args.seed,
+                        out_csv=effective_out_csv.with_name(
+                            f"{effective_out_csv.stem}_{branch_name}{effective_out_csv.suffix}"
+                        ),
+                        overwrite=getattr(args, "overwrite", False),
+                    )
+                except Exception as exc:
+                    raise RuntimeError(f"all-mode branch '{branch_name}' step 'sample' failed: {exc}") from exc
+                try:
+                    autolabel_payload = run_autolabel_mode(
+                        db_path=pred_db_path,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        sample_csv=Path(str(sample_payload["output_csv"])),
+                        out_labels_csv=effective_out_labels_csv.with_name(
+                            f"{effective_out_labels_csv.stem}_{branch_name}{effective_out_labels_csv.suffix}"
+                        ),
+                        player_chunk_size=args.player_chunk_size,
+                        max_players=args.max_players,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(f"all-mode branch '{branch_name}' step 'autolabel' failed: {exc}") from exc
+                try:
+                    evaluate_payload = run_evaluate_mode(
+                        db_path=pred_db_path,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        labels_csv=Path(str(autolabel_payload["output_labels_csv"])),
+                        target_recall=args.target_recall,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(f"all-mode branch '{branch_name}' step 'evaluate' failed: {exc}") from exc
+                branches[branch_name] = {
+                    "sample": sample_payload,
+                    "autolabel": autolabel_payload,
+                    "evaluate": evaluate_payload,
+                }
+
+            below_eval = cast(Dict[str, object], branches["below_threshold"]["evaluate"])
+            alert_eval = cast(Dict[str, object], branches["alert"]["evaluate"])
+            below_current = cast(Dict[str, float], below_eval["current_threshold_metrics"])
+            alert_current = cast(Dict[str, float], alert_eval["current_threshold_metrics"])
+            below_autolabel = cast(Dict[str, object], branches["below_threshold"]["autolabel"])
+            alert_autolabel = cast(Dict[str, object], branches["alert"]["autolabel"])
+            below_summary = cast(Dict[str, object], below_autolabel["summary"])
+            alert_summary = cast(Dict[str, object], alert_autolabel["summary"])
+
+            below_fn_rate = _safe_div(_as_float(below_current["fn"]), _as_float(below_eval["n_labeled_matched"]))
+            alert_fp_rate = _safe_div(
+                _as_float(alert_current["fp"]),
+                _as_float(alert_current["tp"]) + _as_float(alert_current["fp"]),
+            )
+            diagnostics = {
+                "one_line_intent": "R1/R6 comprehensive run completed with both below-threshold and alert-side analyses.",
+                "below_threshold": {
+                    "n_labeled_matched": below_eval["n_labeled_matched"],
+                    "fn": below_current["fn"],
+                    "fn_rate_within_below_threshold_sample": below_fn_rate,
+                    "n_unmatched_sample_bet_id": below_summary["n_unmatched_sample_bet_id"],
+                },
+                "alert": {
+                    "n_labeled_matched": alert_eval["n_labeled_matched"],
+                    "tp": alert_current["tp"],
+                    "fp": alert_current["fp"],
+                    "current_threshold_precision": alert_current["precision"],
+                    "fp_rate_within_alert_sample": alert_fp_rate,
+                    "n_unmatched_sample_bet_id": alert_summary["n_unmatched_sample_bet_id"],
+                },
+                "interpretation_hints": [
+                    "Use alert.current_threshold_precision to diagnose precision drop.",
+                    "Use below_threshold.fn_rate_within_below_threshold_sample to quantify missed-positive concentration.",
+                    "See unified_sample_evaluation for merged (below+alert) score–label metrics; not an unbiased prod cohort.",
+                    "See r2_prediction_log_vs_alerts for duplicate-suppression / count parity signals.",
+                    "See training_artifact_baseline for offline test_precision_at_recall_0.01 vs current merged sample.",
+                ],
             }
-            _log("main: all-mode completed")
+
+            _log("main: unified merge + R2 cross-check + training artifact baseline")
+            labels_below_d = _load_labels_csv(Path(str(below_autolabel["output_labels_csv"])))
+            labels_alert_d = _load_labels_csv(Path(str(alert_autolabel["output_labels_csv"])))
+            unified_sample_evaluation = _build_unified_sample_evaluation(
+                pred_db_path,
+                start_ts,
+                end_ts,
+                labels_below_d,
+                labels_alert_d,
+                args.target_recall,
+            )
+            r2_prediction_log_vs_alerts = _cross_check_alerts_vs_prediction_log(
+                pred_db_path,
+                state_db_path,
+                start_ts,
+                end_ts,
+            )
+            training_artifact_baseline = _load_training_metrics_baseline(Path(model_dir_str))
+
+            try:
+                # Backward-compat fields point to below-threshold branch.
+                payload = {
+                    "mode": "all",
+                    "sample": branches["below_threshold"]["sample"],
+                    "autolabel": branches["below_threshold"]["autolabel"],
+                    "evaluate": branches["below_threshold"]["evaluate"],
+                    "branches": branches,
+                    "diagnostics": diagnostics,
+                    "unified_sample_evaluation": unified_sample_evaluation,
+                    "r2_prediction_log_vs_alerts": r2_prediction_log_vs_alerts,
+                    "training_artifact_baseline": training_artifact_baseline,
+                }
+                _log("main: all-mode completed")
+            except Exception as exc:
+                raise RuntimeError(f"all-mode payload assembly failed: {exc}") from exc
     except Exception as exc:
         print(f"R1/R6 script failed: {exc}", file=sys.stderr)
         return 2
@@ -836,6 +1189,10 @@ def main() -> int:
     payload["resolution"] = {
         "pred_db_path": pred_db_path,
         "env_file_used": env_file_used,
+        "state_db_path": state_db_path,
+        "state_env_file_used": state_env_file_used,
+        "model_dir": model_dir_str,
+        "model_dir_env_file_used": model_dir_env_file_used,
         "window": {"start_ts": start_ts, "end_ts": end_ts},
         "mode": args.mode,
         "effective_paths": {

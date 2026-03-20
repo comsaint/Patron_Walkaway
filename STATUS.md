@@ -3826,6 +3826,78 @@ python -m pytest tests/review_risks/test_review_risks_r1_r6_one_line_automation.
 - `python -m mypy --follow-imports=skip investigations/test_vs_production/checks/run_r1_r6_analysis.py tests/review_risks/test_review_risks_r1_r6_one_line_automation.py`
   - 結果：`Success: no issues found in 2 source files`
 
+---
+
+## Precision drop 調查補強：支援 alert-side 一行分析（2026-03-20）
+
+### 修改檔案
+
+- `investigations/test_vs_production/checks/run_r1_r6_analysis.py`
+
+### 變更內容
+
+1. 新增 `--candidate-filter`（`below_threshold` / `alert` / `all_rated`）：
+   - `below_threshold`：`is_alert=0`（原本行為，偏 FN 診斷）
+   - `alert`：`is_alert=1`（新增，偏 precision drop 診斷）
+   - `all_rated`：`is_rated_obs=1` 全樣本
+2. `sample` 階段依 `candidate_filter` 動態切換 SQL 過濾條件，並於輸出 summary 回報 `candidate_filter`。
+3. `sample.note` 補充用途說明：`alert` 用於 precision drop、`below_threshold` 用於 missed positives。
+4. `main()` 加入 `candidate_filter` 相容性 fallback（`getattr(args, "candidate_filter", "below_threshold")`），避免舊測試/舊呼叫端缺欄位時失敗。
+
+### 驗證結果
+
+- `python -m pytest tests/review_risks/test_review_risks_r1_r6_script.py tests/review_risks/test_review_risks_r1_r6_one_line_automation.py -q --tb=short`
+  - 結果：`13 passed`
+- `python -m ruff check investigations/test_vs_production/checks/run_r1_r6_analysis.py`
+  - 結果：`All checks passed!`
+- `python -m mypy --follow-imports=skip investigations/test_vs_production/checks/run_r1_r6_analysis.py`
+  - 結果：`Success: no issues found in 1 source file`
+
+### 使用方式（precision drop）
+
+```bash
+python investigations/test_vs_production/checks/run_r1_r6_analysis.py --candidate-filter alert --pretty
+```
+
+---
+
+## 一行執行補強：`all` 自動覆蓋 R1/R6 兩種診斷視角（2026-03-20）
+
+### 修改檔案
+
+- `investigations/test_vs_production/checks/run_r1_r6_analysis.py`
+
+### 本輪變更
+
+1. `--mode all` 不再只跑單一路徑，改為**自動跑兩條 branch**（使用者無須新增參數）：
+   - `below_threshold`（`is_alert=0`）→ 觀察 missed-positive / FN 濃度
+   - `alert`（`is_alert=1`）→ 觀察 current precision / FP 濃度
+2. all-mode payload 新增：
+   - `branches.below_threshold.{sample,autolabel,evaluate}`
+   - `branches.alert.{sample,autolabel,evaluate}`
+   - `diagnostics`：提供高層摘要（alert precision、below-threshold FN rate、各自 unmatched）。
+3. 保留 backward compatibility：
+   - 原本 `sample/autolabel/evaluate` 欄位仍保留（對應 below-threshold branch）。
+4. 補相容性：
+   - `candidate_filter` 以 `getattr(..., "below_threshold")` 取得，避免舊測試/舊呼叫端 `SimpleNamespace` 缺欄位而失敗。
+
+### 驗證結果
+
+- `python -m mypy --follow-imports=skip investigations/test_vs_production/checks/run_r1_r6_analysis.py`
+  - 結果：`Success: no issues found in 1 source file`
+- `python -m pytest tests/review_risks/test_review_risks_r1_r6_script.py tests/review_risks/test_review_risks_r1_r6_one_line_automation.py -q --tb=short`
+  - 結果：`13 passed`
+- `python -m ruff check investigations/test_vs_production/checks/run_r1_r6_analysis.py`
+  - 結果：`All checks passed!`
+
+### 使用方式（不需新參數）
+
+```bash
+python investigations/test_vs_production/checks/run_r1_r6_analysis.py --pretty
+```
+
+說明：上述一行會同時輸出「alert-side precision 診斷」與「below-threshold FN 診斷」，可直接用於 precision drop 排查。
+
 ### 備註
 
 - 本輪遵守「不要改 tests（除非測試本身錯或 decorator 過時）」原則：未修改 tests，僅改實作。
@@ -3862,3 +3934,160 @@ python -m pytest tests/review_risks/test_review_risks_r1_r6_one_line_automation.
 
 - `python -m mypy --follow-imports=skip investigations/test_vs_production/checks/run_r1_r6_analysis.py tests/review_risks/test_review_risks_r1_r6_one_line_automation.py`
   - 結果：`Success: no issues found in 2 source files`
+
+---
+
+## `all` 模式再補強：unified 合併、R2 交叉核對、artifact baseline（2026-03-20）
+
+### 修改檔案
+
+- `investigations/test_vs_production/checks/run_r1_r6_analysis.py`
+
+### 本輪變更（仍維持一行預設；新參數僅選填 override）
+
+1. **`unified_sample_evaluation`**
+   - 將 below-threshold 與 alert 兩 branch 的離線標註列合併（依 `bet_id` 去重），在同一組 (score, is_alert, label) 上計算 `current_threshold_metrics` 與 `precision_at_recall_target`。
+   - 追加 **`by_model_version`**：依 `prediction_log.model_version` 分層（舊表無該欄則 `unknown`）。
+   - 輸出 `description` 明註：**非 i.i.d. 全體母體估計**，僅供統一視角診斷。
+
+2. **`r2_prediction_log_vs_alerts`（R2）**
+   - 自動解析 `STATE_DB_PATH`（與 prediction DB 相同 env 掃描邏輯；預設 `<repo>/local_state/state.db`）。
+   - 比較同窗內：`prediction_log`（`is_alert=1` 且 `is_rated_obs=1`）vs `alerts.ts` 筆數；缺檔或缺表則 `skipped`。
+
+3. **`training_artifact_baseline`（R1/R8）**
+   - 自動解析 `MODEL_DIR`，讀取 `training_metrics.json`（若存在）：`test_precision_at_recall_0.01`、`threshold_at_recall_0.01`、`test_threshold_uncalibrated` 等。
+
+4. **`resolution` 追加**：`state_db_path`、`state_env_file_used`、`model_dir`、`model_dir_env_file_used`。
+
+5. **選填 CLI**：`--state-db-path`、`--model-dir`（可不傳）。
+
+### 驗證結果
+
+- `pytest`（`test_review_risks_r1_r6_script` + `test_review_risks_r1_r6_one_line_automation`）：`13 passed`
+- `ruff`、`mypy`（`run_r1_r6_analysis.py`）：通過
+
+### 仍無法由此腳本單獨閉環者
+
+- **R3** validator 對拍、**R4** profile/canonical parity、**R5** 全體分佈漂移：仍需其他檢查或資料來源。
+
+---
+
+## 操作摘要：`run_r1_r6_analysis.py` 最新一輪（追加｜2026-03-20）
+
+### 改了哪些檔
+
+- **`investigations/test_vs_production/checks/run_r1_r6_analysis.py`**（主要變更：`all` 模式 unified 合併、R2 state.db 交叉核對、`training_metrics.json` baseline、`STATE_DB_PATH` / `MODEL_DIR` 解析、join 列支援缺 `model_version` 之向後相容）
+- **`STATUS.md`**（本則與前段技術說明之追加）
+
+### 如何手動驗證
+
+1. **一行端到端（production / 同源機器，需 ClickHouse + 正確 `.env`）**
+   ```bash
+   python investigations/test_vs_production/checks/run_r1_r6_analysis.py --pretty
+   ```
+   - 確認 JSON 頂層含：`branches`、`diagnostics`、`unified_sample_evaluation`、`r2_prediction_log_vs_alerts`、`training_artifact_baseline`。
+   - 確認 `resolution` 含：`pred_db_path`、`state_db_path`、`model_dir`、`effective_paths`。
+
+2. **R2 交叉核對**
+   - 若 `r2_prediction_log_vs_alerts.status == "ok"`：檢視 `n_prediction_log_is_alert_rows` 與 `n_alerts_table_rows_ts_window` 是否合理（計畫預期 duplicate suppression 時可不同）。
+   - 若 `skipped`：檢查 `STATE_DB_PATH` 是否指向實際 `state.db`，或該環境是否本來就無 alerts 表。
+
+3. **Artifact baseline**
+   - 確認 `MODEL_DIR` 下是否有 `training_metrics.json`；若有，`training_artifact_baseline.status` 應為 `ok` 且含 `test_precision_at_recall_0.01` 等欄位。
+
+4. **自動化回歸（開發機）**
+   ```bash
+   python -m pytest tests/review_risks/test_review_risks_r1_r6_script.py tests/review_risks/test_review_risks_r1_r6_one_line_automation.py -q --tb=short
+   python -m ruff check investigations/test_vs_production/checks/run_r1_r6_analysis.py
+   python -m mypy --follow-imports=skip investigations/test_vs_production/checks/run_r1_r6_analysis.py
+   ```
+
+### 下一步建議
+
+1. 在 **production** 跑上述一行指令，將完整 JSON 存進 `investigations/test_vs_production/snapshots/`（另存檔名，勿覆蓋舊證據）。
+2. 對照 **`training_artifact_baseline`** 與 **`unified_sample_evaluation.precision_at_recall_target`** / **`branches.alert.evaluate`**，區分「離線基準 vs 本次合併樣本」差異來源。
+3. 若 **`by_model_version`** 出現多版本：優先排查是否混版部署或 log 跨版本窗。
+4. 續跑計畫其餘項：**R3**（validator vs `compute_labels`）、**R4**（`canonical_mapping.cutoff` / profile）、**R5**（score 分佈時段切片）——仍建議依 `.cursor/plans/INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md` §4 順序補做。
+
+---
+
+## Code Review：`run_r1_r6_analysis.py`（unified / R2 / artifact 擴充後）（2026-03-20）
+
+**範圍**：`investigations/test_vs_production/checks/run_r1_r6_analysis.py` 近期變更（`all` 雙 branch、`_evaluate_join_rows_from_labels`、`_cross_check_alerts_vs_prediction_log`、`_load_training_metrics_baseline`、`_build_unified_sample_evaluation`）。  
+**目標**：列最可能的 bug / 邊界 / 安全 / 效能問題，附具體修改建議與建議測試。
+
+### Findings（依嚴重度）
+
+#### 1) R2 交叉核對：`alerts.ts` 與 `prediction_log.scored_at` 字串比較可能口徑不一致（Major, 正確性）
+- **問題**：`_cross_check_alerts_vs_prediction_log` 以同一組 `(start_ts, end_ts)` 字串同時過濾 `scored_at` 與 `alerts.ts`。若兩欄存的是不同 offset 格式（例如一邊 `+08:00`、一邊 UTC `Z`）、或一邊缺 offset，**字典序比較不等於時間序**，會出現假陽性/假陰性的「筆數不符」。
+- **具體修改建議**：
+  - 兩邊都先 parse 成 timezone-aware `datetime` 再過濾；或統一在 SQL 外先將窗轉成兩種欄位各自慣用格式再查。
+  - 在輸出中加 `ts_format_note` / `comparison_mode`（`lexical` vs `parsed`），避免誤判 R2。
+- **希望新增的測試**：
+  - `test_r2_cross_check_detects_ts_format_mismatch`（fixture：`scored_at` 與 `alerts.ts` 同瞬間但字串表示不同，預期要嘛 parse 後一致、要嘛明確 warning）
+  - `test_r2_cross_check_uses_parsed_window_when_enabled`
+
+#### 2) `training_metrics.json` baseline 可能讀不到實際欄位（Medium, 可觀測性）
+- **問題**：trainer 寫入的結構可能把 `test_precision_at_recall_0.01` 等放在巢狀 dict（例如 `rated.metrics`），目前僅 `data.get(...)` 頂層，**baseline 常為 null** 卻仍 `status=ok`，易讓使用者以為「已對齊」其實沒載到。
+- **具體修改建議**：
+  - 實作小型 `_extract_nested_metrics(data)`，按已知 trainer 鍵路徑嘗試讀取；若皆缺則 `status=partial` 並列出「嘗試過的 keys」。
+- **希望新增的測試**：
+  - `test_training_baseline_extracts_nested_test_precision_at_recall`
+  - `test_training_baseline_partial_when_keys_missing`
+
+#### 3) unified 合併：`bet_id` 重疊時靜默覆寫為 alert branch（Medium, 邊界）
+- **問題**：理論上 below 與 alert 抽樣應互斥；若因資料異常或重跑污染導致同一 `bet_id` 出現在兩邊 CSV，合併時 **alert 覆寫 below**，`n_duplicate_bet_id_overlap` 有計數但列資料未保留雙版本，除錯時易漏。
+- **具體修改建議**：
+  - 重疊時改為 fail-fast 或保留 `branch_conflict` 列表（前 N 筆 `bet_id`）；或在 `diagnostics` 加 `overlap_resolution_policy: alert_wins`。
+- **希望新增的測試**：
+  - `test_unified_merge_records_overlap_count_and_optional_conflict_list`
+  - `test_unified_merge_fails_fast_when_overlap_and_strict_mode`
+
+#### 4) `all` 模式重複掃描 DB（Medium, 效能）
+- **問題**：每 branch 已 `evaluate` 一次（內含 join）；unified 又對 below/alert 各呼叫 `_evaluate_join_rows_from_labels` 共 **2 次**，等價於同一窗內多次建立 `_tmp_labels` 與 scan。**在筆電 + 大 labels dict 時** I/O 與 CPU 重複。
+- **具體修改建議**：
+  - 在 `all` 路徑快取各 branch 的 `detail_rows`（或只跑一次 join 並分支計算 metrics），避免 4 次重複 join。
+- **希望新增的測試**：
+  - `test_all_mode_invokes_evaluate_join_at_most_once_per_branch_when_cache_enabled`（可用 monkeypatch 計數器）
+
+#### 5) `PRAGMA table_info({table})` 字串插值（Low, 安全性/穩健性）
+- **問題**：`_sqlite_table_columns` 以 f-string 插入表名；目前呼叫端固定 `prediction_log`，風險低；若未來改為參數化表名且來自外部輸入，有 SQL 注入面。
+- **具體修改建議**：
+  - 白名單驗證表名 `^[A-Za-z0-9_]+$`；不符則 raise。
+- **希望新增的測試**：
+  - `test_sqlite_table_columns_rejects_invalid_table_name`
+
+#### 6) `training_metrics.json` 大小與解析（Low, 效能/穩定性）
+- **問題**：`json.loads(path.read_text())` 一次讀入記憶體；極端大檔或損壞 JSON 會吃 RAM 或抛錯（目前已 catch 回 `status=error`，尚可）。
+- **具體修改建議**：
+  - 加 `max_bytes`（例如 20MB）超過則 `skipped`；或僅 stream 解析所需 top-level keys（若改為 json 流式太複雜則 bytes 上限即可）。
+- **希望新增的測試**：
+  - `test_training_baseline_skips_when_file_exceeds_max_bytes`
+
+### 總結
+
+- **unified + R2 + baseline** 方向正確，能補上計畫中多數「可自動化」缺口；優先建議修 **#1（時間字串比較）** 與 **#2（baseline 巢狀鍵）**，以免 production 誤判。
+- **#4** 在長期常跑調查腳本時值得做，否則調查窗一大就容易重複成本偏高。
+
+### Reviewer 風險 — 最小可重現測試（僅 `tests/`｜2026-03-20）
+
+**檔案**：`tests/review_risks/test_review_risks_r1_r6_reviewer_risks.py`（**未改 production**）。
+
+| 測試類別 | 對應 Finding | 行為／斷言摘要 |
+|---------|--------------|----------------|
+| `TestReviewerR2LexicalTimestampWindow` | #1 | 同一瞬間以 `Z` 存 `scored_at`、以 `+08:00` 存 `alerts.ts` 時，字串窗可讓 `n_prediction_log_is_alert_rows=0` 但 `n_alerts_table_rows_ts_window=1`。 |
+| `TestReviewerTrainingMetricsNested` | #2 | `rated.metrics.*` 巢狀數值存在時，`test_precision_at_recall_0.01` 仍為 `null` 且 `status=ok`。 |
+| `TestReviewerUnifiedOverlap` | #3 | 同一 `bet_id` 在 below／alert labels 並存時 `n_duplicate_bet_id_overlap==1`，且合併後指標與「僅 alert labels」一致（alert 覆寫）。 |
+| `TestReviewerAllModeJoinRedundancy` | #4 | 模擬 `all` 路徑兩次 `run_evaluate_mode` + `_build_unified_sample_evaluation`，`_evaluate_join_rows_from_labels` **被呼叫 4 次**（優化快取後應下修此期望值）。 |
+| `TestReviewerSqlitePragmaInterpolation` | #5 | 畸形表名觸發 `sqlite3.DatabaseError`；另以原始碼字串斷言 `PRAGMA table_info` 仍為 f-string 插值。 |
+| `TestReviewerLargeTrainingMetricsFile` | #6 | `training_metrics.json` >500KB 仍完整 `read_text` + `json.loads`，`status=ok`（無 bytes 上限）。 |
+
+**執行方式**（可併入既有 R1/R6 回歸）：
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_r1_r6_reviewer_risks.py -q --tb=short
+# 與既有 R1/R6 測試一併
+python -m pytest tests/review_risks/test_review_risks_r1_r6_script.py tests/review_risks/test_review_risks_r1_r6_one_line_automation.py tests/review_risks/test_review_risks_r1_r6_reviewer_risks.py -q --tb=short
+```
+
+**備註**：未新增獨立 ruff/mypy 規則；`TestReviewerSqlitePragmaInterpolation.test_pragma_uses_f_string_interpolation_documented_in_source` 為輕量「原始碼契約」式守門，若改寫 `PRAGMA` 實作需一併更新斷言。
