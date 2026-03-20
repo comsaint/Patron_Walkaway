@@ -243,13 +243,13 @@ Trainer 在 **沒有 validation set** 時會使用 **threshold=0.5** fallback，
 | 編號 | 狀態 | 結論摘要 |
 |------|------|----------|
 | R1 | （見上列選項） | （填寫） |
-| R2 | … | … |
+| R2 | 已排除（第一輪） | 2026-03-19（HKT）窗口內，`prediction_log.n_is_alert_1 = 2485` 與 `alerts.n_alerts_table = 2485`，ratio=1.0，未觀察到 is_alert 與 alerts 筆數口徑差。注意該窗口實際覆蓋為 18:37~23:59（系統晚間部署後開始寫入）。 |
 | R3 | … | … |
 | R4 | … | … |
 | R5 | … | … |
 | R6 | … | … |
 | R7 | … | … |
-| R8 | … | … |
+| R8 | 已排除（第一輪） | `test_threshold_uncalibrated = false`，且未觀察到 threshold fallback（如 0.5 fallback）跡象，暫不視為主因。 |
 | R9 | … | … |
 
 ---
