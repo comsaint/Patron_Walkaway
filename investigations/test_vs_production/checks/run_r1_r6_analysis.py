@@ -22,8 +22,11 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -44,6 +47,7 @@ from trainer.labels import compute_labels  # noqa: E402
 
 HK_TZ = ZoneInfo("Asia/Hong_Kong")
 DEFAULT_TARGET_RECALL = 0.01
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass
@@ -112,7 +116,12 @@ def _resolve_pred_db_path(env_file: str, pred_db_path: str) -> Tuple[str, Option
             env_used = str(p)
             break
 
-    value = os.getenv("PREDICTION_LOG_DB_PATH") or file_env.get("PREDICTION_LOG_DB_PATH") or ""
+    # If caller explicitly passes --env-file, prefer that file over process env to
+    # avoid stale shell env unexpectedly pointing to another machine's DB.
+    if env_file.strip():
+        value = file_env.get("PREDICTION_LOG_DB_PATH") or os.getenv("PREDICTION_LOG_DB_PATH") or ""
+    else:
+        value = os.getenv("PREDICTION_LOG_DB_PATH") or file_env.get("PREDICTION_LOG_DB_PATH") or ""
     return value.strip(), env_used
 
 
@@ -127,6 +136,20 @@ def _resolve_window(start_ts: str, end_ts: str) -> Tuple[str, str]:
     today_start = now_hk.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_start = today_start - timedelta(days=1)
     return yesterday_start.isoformat(), today_start.isoformat()
+
+
+def _default_snapshot_paths(start_ts: str, end_ts: str) -> Tuple[Path, Path]:
+    """
+    Build deterministic per-window artifact paths under investigation snapshots.
+    """
+    _ = end_ts  # reserved for future naming needs
+    start_dt = _parse_iso_ts(start_ts).astimezone(HK_TZ)
+    window_tag = start_dt.strftime("%Y%m%d")
+    run_tag = f"{datetime.now(HK_TZ).strftime('%H%M%S_%f')}_{time.time_ns()}_{uuid.uuid4().hex[:8]}"
+    base = _repo_root_from_script() / "investigations" / "test_vs_production" / "snapshots"
+    sample_csv = base / f"latest_r1_r6_below_threshold_sample_{window_tag}_{run_tag}.csv"
+    labels_csv = base / f"latest_r1_r6_labeled_{window_tag}_{run_tag}.csv"
+    return sample_csv, labels_csv
 
 
 def _parse_iso_ts(ts: str) -> datetime:
@@ -179,11 +202,15 @@ def run_sample_mode(
     bins: int,
     seed: int,
     out_csv: Path,
+    overwrite: bool = False,
 ) -> Dict[str, object]:
     if sample_size <= 0:
         raise ValueError("sample-size must be > 0")
     if bins <= 0:
         raise ValueError("bins must be > 0")
+
+    if out_csv.exists() and not overwrite:
+        raise FileExistsError(f"output CSV already exists (set overwrite): {out_csv}")
 
     conn = sqlite3.connect(db_path, timeout=10)
     try:
@@ -301,16 +328,29 @@ def _load_labels_csv(path: Path) -> Dict[str, Tuple[int, int]]:
     return labels
 
 
-def _load_sample_bet_ids(path: Path) -> List[str]:
+def _load_sample_bet_ids_with_stats(path: Path) -> Tuple[List[str], int, int, int]:
     out: List[str] = []
+    seen: set[str] = set()
+    n_input_rows = 0
+    n_duplicate_bet_id = 0
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         if "bet_id" not in set(reader.fieldnames or []):
             raise ValueError("sample CSV must contain column: bet_id")
         for row in reader:
             bid = str(row.get("bet_id", "")).strip()
-            if bid:
-                out.append(bid)
+            n_input_rows += 1
+            if not bid or bid in seen:
+                if bid in seen:
+                    n_duplicate_bet_id += 1
+                continue
+            seen.add(bid)
+            out.append(bid)
+    return out, n_input_rows, len(out), n_duplicate_bet_id
+
+
+def _load_sample_bet_ids(path: Path) -> List[str]:
+    out, _n_input, _n_unique, _n_dup = _load_sample_bet_ids_with_stats(path)
     return out
 
 
@@ -331,7 +371,7 @@ def run_autolabel_mode(
     if player_chunk_size <= 0:
         raise ValueError("player-chunk-size must be > 0")
 
-    sample_bids = _load_sample_bet_ids(sample_csv)
+    sample_bids, n_input_rows, n_unique_bet_id, n_duplicate_bet_id = _load_sample_bet_ids_with_stats(sample_csv)
     if not sample_bids:
         raise ValueError("sample CSV contains no bet_id rows")
     sample_bid_set = set(sample_bids)
@@ -395,6 +435,8 @@ def run_autolabel_mode(
 
     client = get_clickhouse_client()
     all_bets: List[pd.DataFrame] = []
+    if not _IDENT_RE.fullmatch(str(config.SOURCE_DB)) or not _IDENT_RE.fullmatch(str(config.TBET)):
+        raise ValueError("invalid SOURCE_DB/TBET identifier")
     tbl = f"{config.SOURCE_DB}.{config.TBET}"
     query = f"""
         SELECT
@@ -458,6 +500,9 @@ def run_autolabel_mode(
         "output_labels_csv": str(out_labels_csv),
         "summary": {
             "n_sample_input": len(sample_bids),
+            "n_sample_rows_input": int(n_input_rows),
+            "n_unique_bet_id": int(n_unique_bet_id),
+            "n_duplicate_bet_id": int(n_duplicate_bet_id),
             "n_players": len(players),
             "n_bets_fetched": int(len(bets)),
             "n_labeled_rows": int(len(labeled_sample_out)),
@@ -608,46 +653,47 @@ def run_evaluate_mode(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run R1/R6 investigation helper.")
-    p.add_argument("--mode", choices=["sample", "autolabel", "evaluate", "all"], default="sample")
+    p.add_argument("--mode", choices=["sample", "autolabel", "evaluate", "all"], default="all")
     p.add_argument("--start-ts", default="", help="Window start timestamp (inclusive). Default: dynamic yesterday start in HKT.")
     p.add_argument("--end-ts", default="", help="Window end timestamp (exclusive). Default: dynamic today start in HKT.")
     p.add_argument("--env-file", default="", help="Optional .env file path.")
     p.add_argument("--pred-db-path", default="", help="Override prediction log DB path.")
     p.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
+    p.add_argument("--overwrite", action="store_true", help="Allow overwriting existing output CSV files.")
 
     # sample mode args
-    p.add_argument("--sample-size", type=int, default=5000, help="Target below-threshold sample size.")
+    p.add_argument("--sample-size", type=int, default=4000, help="Target below-threshold sample size.")
     p.add_argument("--bins", type=int, default=10, help="Number of score bins for stratified sampling.")
     p.add_argument("--seed", type=int, default=42, help="Deterministic seed for reservoir replacement.")
     p.add_argument(
         "--out-csv",
-        default="investigations/test_vs_production/snapshots/latest_r1_r6_below_threshold_sample.csv",
-        help="Output CSV for sample mode.",
+        default="",
+        help="Output CSV for sample mode. Default: auto path under snapshots by window date.",
     )
 
     # evaluate mode args
-    p.add_argument("--labels-csv", default="", help="CSV with columns bet_id,label (required for evaluate mode).")
+    p.add_argument("--labels-csv", default="", help="CSV with columns bet_id,label. Default: auto labels path by window date.")
     p.add_argument("--target-recall", type=float, default=DEFAULT_TARGET_RECALL, help="Recall target for precision@recall.")
     p.add_argument(
         "--sample-csv",
-        default="investigations/test_vs_production/snapshots/latest_r1_r6_below_threshold_sample.csv",
-        help="Input sample CSV (for autolabel mode).",
+        default="",
+        help="Input sample CSV (for autolabel mode). Default: auto sample path by window date.",
     )
     p.add_argument(
         "--out-labels-csv",
-        default="investigations/test_vs_production/snapshots/latest_r1_r6_labeled.csv",
-        help="Output labeled CSV path (for autolabel mode).",
+        default="",
+        help="Output labeled CSV path (for autolabel mode). Default: auto labels path by window date.",
     )
     p.add_argument(
         "--player-chunk-size",
         type=int,
-        default=500,
+        default=200,
         help="ClickHouse player_id IN chunk size for autolabel mode.",
     )
     p.add_argument(
         "--max-players",
         type=int,
-        default=20000,
+        default=5000,
         help="Guardrail: maximum distinct players allowed in autolabel mode.",
     )
     return p.parse_args()
@@ -673,6 +719,12 @@ def main() -> int:
         print(f"prediction log DB not found: {pred_db_path}", file=sys.stderr)
         return 2
 
+    default_sample_csv, default_labels_csv = _default_snapshot_paths(start_ts, end_ts)
+    effective_out_csv = Path(args.out_csv) if args.out_csv.strip() else default_sample_csv
+    effective_sample_csv = Path(args.sample_csv) if args.sample_csv.strip() else effective_out_csv
+    effective_out_labels_csv = Path(args.out_labels_csv) if args.out_labels_csv.strip() else default_labels_csv
+    effective_labels_csv = Path(args.labels_csv) if args.labels_csv.strip() else effective_out_labels_csv
+
     try:
         if args.mode == "sample":
             payload = run_sample_mode(
@@ -682,26 +734,25 @@ def main() -> int:
                 sample_size=args.sample_size,
                 bins=args.bins,
                 seed=args.seed,
-                out_csv=Path(args.out_csv),
+                out_csv=effective_out_csv,
+                overwrite=args.overwrite,
             )
         elif args.mode == "autolabel":
             payload = run_autolabel_mode(
                 db_path=pred_db_path,
                 start_ts=start_ts,
                 end_ts=end_ts,
-                sample_csv=Path(args.sample_csv),
-                out_labels_csv=Path(args.out_labels_csv),
+                sample_csv=effective_sample_csv,
+                out_labels_csv=effective_out_labels_csv,
                 player_chunk_size=args.player_chunk_size,
                 max_players=args.max_players,
             )
         elif args.mode == "evaluate":
-            if not args.labels_csv.strip():
-                raise ValueError("--labels-csv is required in evaluate mode")
             payload = run_evaluate_mode(
                 db_path=pred_db_path,
                 start_ts=start_ts,
                 end_ts=end_ts,
-                labels_csv=Path(args.labels_csv),
+                labels_csv=effective_labels_csv,
                 target_recall=args.target_recall,
             )
         else:
@@ -714,7 +765,8 @@ def main() -> int:
                     sample_size=args.sample_size,
                     bins=args.bins,
                     seed=args.seed,
-                    out_csv=Path(args.out_csv),
+                    out_csv=effective_out_csv,
+                    overwrite=getattr(args, "overwrite", False),
                 )
             except Exception as exc:
                 raise RuntimeError(f"all-mode step 'sample' failed: {exc}") from exc
@@ -723,8 +775,8 @@ def main() -> int:
                     db_path=pred_db_path,
                     start_ts=start_ts,
                     end_ts=end_ts,
-                    sample_csv=Path(args.out_csv),
-                    out_labels_csv=Path(args.out_labels_csv),
+                    sample_csv=effective_sample_csv,
+                    out_labels_csv=effective_out_labels_csv,
                     player_chunk_size=args.player_chunk_size,
                     max_players=args.max_players,
                 )
@@ -735,7 +787,7 @@ def main() -> int:
                     db_path=pred_db_path,
                     start_ts=start_ts,
                     end_ts=end_ts,
-                    labels_csv=Path(args.out_labels_csv),
+                    labels_csv=effective_labels_csv,
                     target_recall=args.target_recall,
                 )
             except Exception as exc:
@@ -755,6 +807,12 @@ def main() -> int:
         "env_file_used": env_file_used,
         "window": {"start_ts": start_ts, "end_ts": end_ts},
         "mode": args.mode,
+        "effective_paths": {
+            "out_csv": str(effective_out_csv),
+            "sample_csv": str(effective_sample_csv),
+            "out_labels_csv": str(effective_out_labels_csv),
+            "labels_csv": str(effective_labels_csv),
+        },
     }
 
     if args.pretty:

@@ -3610,3 +3610,255 @@ python -m pytest tests/review_risks/test_review_risks_r1_r6_script.py -q --tb=sh
 ### 備註
 
 - 這輪僅處理本次 review_risks 相關實作與測試收斂；未擴大改動其他 production 模組。
+
+---
+
+## `run_r1_r6_analysis.py` 一行執行自動化（2026-03-20）
+
+### 改了哪些檔
+
+- `investigations/test_vs_production/checks/run_r1_r6_analysis.py`
+
+### 本次重點修改
+
+1. **一行執行預設**
+   - `--mode` 預設由 `sample` 改為 `all`，使用者執行：
+     - `python investigations/test_vs_production/checks/run_r1_r6_analysis.py --pretty`
+     即可跑完 `sample -> autolabel -> evaluate`。
+
+2. **時間窗與路徑自動化**
+   - 保持「昨天 HKT」作為預設視窗（若未手動指定 `--start-ts/--end-ts`）。
+   - 新增 `_default_snapshot_paths(...)`，依視窗日期自動產生 output 檔名：
+     - `latest_r1_r6_below_threshold_sample_YYYYMMDD.csv`
+     - `latest_r1_r6_labeled_YYYYMMDD.csv`
+   - `--out-csv / --sample-csv / --out-labels-csv / --labels-csv` 皆支援空值時自動 fallback，不需手動填一堆參數。
+
+3. **預設參數調整（降低誤用/資源風險）**
+   - `sample_size`: `5000 -> 4000`
+   - `player_chunk_size`: `500 -> 200`
+   - `max_players`: `20000 -> 5000`
+   - 目標：在一般筆電與有限資源環境下，降低 CH 壓力與 OOM 風險。
+
+4. **穩定性修補**
+   - `autolabel` 前讀 sample 時，`bet_id` 改為自動去重，避免重複 `bet_id` 造成 temp table 主鍵衝突（`UNIQUE constraint failed: _tmp_sample_bids.bet_id`）。
+
+5. **可觀測性強化**
+   - `resolution` 追加 `effective_paths`，清楚回報本次實際使用的 sample/labels 路徑，便於跨機器排查。
+
+### 如何手動驗證
+
+1. **一行端到端（有 ClickHouse 環境）**
+   ```bash
+   python investigations/test_vs_production/checks/run_r1_r6_analysis.py --pretty
+   ```
+   - 期待：
+     - 成功時輸出 JSON，`mode="all"`，且包含 `sample/autolabel/evaluate` 三段。
+     - `resolution.effective_paths` 有自動解析後的實際路徑。
+
+2. **檢查自動輸出檔**
+   - 到 `investigations/test_vs_production/snapshots/` 檢查是否有：
+     - `latest_r1_r6_below_threshold_sample_YYYYMMDD.csv`
+     - `latest_r1_r6_labeled_YYYYMMDD.csv`
+
+3. **測試與品質檢查（本機）**
+   ```bash
+   python -m pytest tests/review_risks/test_review_risks_r1_r6_script.py -q --tb=short
+   python -m ruff check investigations/test_vs_production/checks/run_r1_r6_analysis.py
+   python -m mypy --follow-imports=skip investigations/test_vs_production/checks/run_r1_r6_analysis.py
+   ```
+   - 本輪結果：
+     - `pytest`: `7 passed`
+     - `ruff`: `All checks passed!`
+     - `mypy`: `Success: no issues found in 1 source file`
+
+4. **注意（環境依賴）**
+   - 若機器未安裝/未配置 ClickHouse 連線，`autolabel` 會失敗並顯示：
+     - `clickhouse_connect not available; install clickhouse-connect and ensure .env is loaded`
+   - 這屬環境前置條件，不是流程本身故障。
+
+### 下一步建議
+
+1. 在 production 機器執行上述一行命令，貼上完整 JSON 結果（特別是 `evaluate` 區塊）。
+2. 將目前 sample 檔副檔名由 `.xls` 改成 `.csv`（內容實為 CSV），避免操作混淆與人工誤判。
+3. 可再加一層「人類可讀摘要」輸出（例如 PASS/FAIL + 三個核心指標），降低現場判讀成本。
+
+---
+
+## Code Review：`run_r1_r6_analysis.py` 一行化改動（2026-03-20）
+
+**範圍**：僅 review 本輪「預設改為 `--mode all` + 路徑自動化 + 去重修補」變更，不重寫整套。  
+**目標**：列最可能的 bug / 邊界 / 安全 / 效能風險，附具體修改建議與希望新增測試。
+
+### Findings（依嚴重度）
+
+#### 1) `autolabel` 記憶體峰值仍偏高（Major, 效能/穩定性）
+- **問題**：
+  - 目前把每個 CH chunk 的 DataFrame 全部放入 `all_bets`，最後 `pd.concat(all_bets)`；當 `max_players` 接近上限、每位玩家 bet 多時，仍可能導致高 RAM 佔用甚至 OOM（尤其筆電）。
+- **具體修改建議**：
+  - 改為 chunk-by-chunk 處理：每批先 map canonical、清洗欄位，再把最小必要欄位 append 到磁碟暫存（或逐批累積統計），避免一次持有全部 raw chunk。
+  - 增加 `max_bets_fetched` guardrail（例如 2M rows）超限 fail-fast，訊息提示縮窗。
+- **希望新增的測試**：
+  - `test_autolabel_fails_fast_when_bets_fetched_exceed_guardrail`
+  - `test_autolabel_chunk_processing_does_not_accumulate_unbounded_frames`（可用 monkeypatch 觀察 concat/input 行為）
+
+#### 2) 預設自動檔名可能覆寫同日重跑結果（Major, 可追溯性）
+- **問題**：
+  - `_default_snapshot_paths()` 只用 `YYYYMMDD` 命名；同一天重跑會直接覆蓋前一次 sample/labels，調查可追溯性下降。
+- **具體修改建議**：
+  - 預設檔名加入執行時間戳（如 `YYYYMMDD_HHMMSS`）或 run id。
+  - 或提供 `--overwrite` 明確開關；未指定時若檔案存在即 fail-fast。
+- **希望新增的測試**：
+  - `test_default_snapshot_paths_should_not_collide_within_same_day`
+  - `test_run_all_should_fail_without_overwrite_when_output_exists`
+
+#### 3) sample 去重後未回報重複量，可能掩蓋資料品質問題（Medium, 邊界/可觀測性）
+- **問題**：
+  - `_load_sample_bet_ids()` 現在 silent dedupe，雖修正 PK 衝突，但使用者看不到重複筆數，可能誤以為原始 sample 品質正常。
+- **具體修改建議**：
+  - 回傳 `n_input_rows`、`n_unique_bet_id`、`n_duplicate_bet_id`，並放入 `autolabel.summary`。
+  - 若 duplicate ratio 過高（如 >1%）給 warning。
+- **希望新增的測試**：
+  - `test_autolabel_summary_reports_duplicate_bet_ids`
+  - `test_autolabel_warns_on_high_duplicate_ratio`
+
+#### 4) DB 路徑來源優先序仍可能造成跨環境誤指向（Medium, 正確性）
+- **問題**：
+  - `_resolve_pred_db_path()` 目前優先 `os.getenv` 再 `.env`。在 shell 殘留舊 env 時，可能無視專案 `.env`，造成「看起來同機其實不同 DB」。
+- **具體修改建議**：
+  - 新增 `--env-precedence`（`process|file`）或 `--strict-env-file`。
+  - 在輸出中新增 `pred_db_source`（process env / env file / cli）以便快速排錯。
+- **希望新增的測試**：
+  - `test_resolve_pred_db_path_can_prefer_env_file_over_process_env`
+  - `test_resolution_contains_pred_db_source`
+
+#### 5) SQL 物件名由設定直插字串，缺少格式檢查（Low, 安全性/穩定性）
+- **問題**：
+  - `tbl = f"{config.SOURCE_DB}.{config.TBET}"` 直接插入 SQL，若設定值含非預期字元（誤設或惡意），可能產生查詢失敗或非預期語句。
+- **具體修改建議**：
+  - 對 `SOURCE_DB`、`TBET` 加白名單格式驗證（例如 `^[A-Za-z_][A-Za-z0-9_]*$`），不符合就 fail-fast。
+- **希望新增的測試**：
+  - `test_autolabel_rejects_invalid_table_identifier_from_config`
+
+### 總結
+
+- 一行化方向正確，使用體驗大幅提升；但要達到「穩定可審計」的生產調查工具，建議優先補 **#1（RAM guardrail/串流）** 與 **#2（避免覆寫）**，其次是 **#4（路徑來源可解釋）**。
+
+---
+
+## 將「一行自動化」review 風險轉成最小可重現測試（僅 tests，未改 production）（2026-03-20）
+
+**目標**：把上一輪 reviewer 提到的風險點轉為可執行測試；只提交 tests，不修改 production code。
+
+### 新增檔案
+
+- `tests/review_risks/test_review_risks_r1_r6_one_line_automation.py`
+
+### 測試與風險點對應
+
+| 測試 | 對應風險 | 說明 | 目前狀態 |
+|------|----------|------|----------|
+| `test_default_snapshot_paths_should_not_collide_within_same_day` | 檔名碰撞/覆寫 | 同日重跑預設檔名應避免碰撞。 | `xfail` |
+| `test_run_all_should_fail_without_overwrite_when_output_exists` | 覆寫防護 | 既有輸出存在時，預期 fail-fast 或需明確 overwrite。 | `xfail` |
+| `test_autolabel_summary_reports_duplicate_bet_ids` | 去重可觀測性 | sample 有重複 bet_id 時，summary 應回報重複數。 | `xfail` |
+| `test_resolve_pred_db_path_can_prefer_env_file_over_process_env` | 路徑來源優先序 | 期望可配置 `.env` 優先於 process env。 | `xfail` |
+| `test_autolabel_rejects_invalid_table_identifier_from_config` | 設定安全性 | SOURCE_DB/TBET 非法識別字應 fail-fast。 | `xfail` |
+| `test_review_risks_file_loads` | 收集煙霧測試 | 確認測試檔可被 pytest 收集。 | `passed` |
+
+### 執行方式
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_r1_r6_one_line_automation.py -q --tb=short
+```
+
+### 本輪結果
+
+- `1 passed, 5 xfailed`
+
+### 說明
+
+- 以上 `xfail` 用來鎖定「尚未實作」的風險契約，避免問題被遺忘。
+- 後續修補 production 後，應逐條移除對應 `xfail`，轉為強制通過。
+
+---
+
+## Round 1：依「只改實作」修補 one-line automation 風險（2026-03-20）
+
+### 修改檔案（production only）
+
+- `investigations/test_vs_production/checks/run_r1_r6_analysis.py`
+
+### 本輪實作修補
+
+1. **同日檔名碰撞**
+   - `_default_snapshot_paths()` 由 `YYYYMMDD` 改為 `YYYYMMDD_HHMMSS_microseconds`，避免同日重跑覆寫。
+
+2. **覆寫防護**
+   - `run_sample_mode()` 新增 `overwrite: bool = False`。
+   - 當輸出檔已存在且未開 `overwrite` 時，fail-fast (`FileExistsError`)。
+   - CLI 新增 `--overwrite`（預設關閉）。
+
+3. **sample 去重可觀測性**
+   - 新增 `_load_sample_bet_ids_with_stats()` 回傳：
+     - `n_sample_rows_input`
+     - `n_unique_bet_id`
+     - `n_duplicate_bet_id`
+   - `autolabel.summary` 追加上述欄位。
+
+4. **DB path 優先序（明確 env-file 時）**
+   - `_resolve_pred_db_path()`：若有指定 `--env-file`，優先採用該檔內 `PREDICTION_LOG_DB_PATH`，再 fallback process env。
+
+5. **SQL identifier 驗證**
+   - 新增 `SOURCE_DB` / `TBET` 格式檢查（`^[A-Za-z_][A-Za-z0-9_]*$`）。
+   - 非法時 fail-fast：`ValueError("invalid SOURCE_DB/TBET identifier")`。
+
+### 本輪驗證結果
+
+- `python -m pytest tests/review_risks/test_review_risks_r1_r6_one_line_automation.py -q --tb=short`
+  - 結果：`1 passed, 5 xpassed`
+  - 說明：代表先前 `xfail` 風險測試已被實作修補命中。
+
+- `python -m pytest tests/review_risks/test_review_risks_r1_r6_script.py -q --tb=short`
+  - 結果：`7 passed`
+
+- `python -m ruff check investigations/test_vs_production/checks/run_r1_r6_analysis.py`
+  - 結果：`All checks passed!`
+
+- `python -m mypy --follow-imports=skip investigations/test_vs_production/checks/run_r1_r6_analysis.py tests/review_risks/test_review_risks_r1_r6_one_line_automation.py`
+  - 結果：`Success: no issues found in 2 source files`
+
+### 備註
+
+- 本輪遵守「不要改 tests（除非測試本身錯或 decorator 過時）」原則：未修改 tests，僅改實作。
+
+---
+
+## Round 2：清理過時 `xfail` decorators（2026-03-20）
+
+### 變更檔案
+
+- `tests/review_risks/test_review_risks_r1_r6_one_line_automation.py`
+- `investigations/test_vs_production/checks/run_r1_r6_analysis.py`（配合實際失敗補強）
+
+### 本輪內容
+
+1. **Decorator 清理**
+   - 將 one-line automation 測試檔中已 `xpassed` 的 5 個 `xfail` 移除，轉為強制通過契約。
+
+2. **回歸失敗修補（實作）**
+   - `test_default_snapshot_paths_should_not_collide_within_same_day` 在移除 `xfail` 後失敗：
+     - 原因：極端情況下連續呼叫仍可能拿到相同 `run_tag`。
+   - 修補：`_default_snapshot_paths()` 的 `run_tag` 增加 `uuid4` 後綴，保證同程序瞬間連續呼叫也不碰撞。
+
+### 本輪驗證結果
+
+- `python -m pytest tests/review_risks/test_review_risks_r1_r6_one_line_automation.py -q --tb=short`
+  - 結果：`6 passed`
+
+- `python -m pytest tests/review_risks/test_review_risks_r1_r6_script.py tests/review_risks/test_review_risks_r1_r6_one_line_automation.py -q --tb=short`
+  - 結果：`13 passed`
+
+- `python -m ruff check investigations/test_vs_production/checks/run_r1_r6_analysis.py tests/review_risks/test_review_risks_r1_r6_one_line_automation.py`
+  - 結果：`All checks passed!`
+
+- `python -m mypy --follow-imports=skip investigations/test_vs_production/checks/run_r1_r6_analysis.py tests/review_risks/test_review_risks_r1_r6_one_line_automation.py`
+  - 結果：`Success: no issues found in 2 source files`
