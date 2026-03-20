@@ -60,6 +60,11 @@ class CandidateRow:
     bin_id: int
 
 
+def _log(msg: str) -> None:
+    # Keep machine-readable JSON on stdout; progress goes to stderr.
+    print(f"[r1_r6] {msg}", file=sys.stderr)
+
+
 def _repo_root_from_script() -> Path:
     return Path(__file__).resolve().parents[3]
 
@@ -204,6 +209,7 @@ def run_sample_mode(
     out_csv: Path,
     overwrite: bool = False,
 ) -> Dict[str, object]:
+    _log(f"sample: starting (db={db_path}, window={start_ts} -> {end_ts}, sample_size={sample_size}, bins={bins})")
     if sample_size <= 0:
         raise ValueError("sample-size must be > 0")
     if bins <= 0:
@@ -276,6 +282,7 @@ def run_sample_mode(
             w.writerow(["bet_id", "score", "scored_at", "is_alert", "is_rated_obs", "bin_id"])
             for r in sampled:
                 w.writerow([r.bet_id, f"{r.score:.10f}", r.scored_at, r.is_alert, r.is_rated_obs, r.bin_id])
+        _log(f"sample: done (rows={len(sampled)}, output={out_csv})")
 
         return {
             "mode": "sample",
@@ -368,6 +375,10 @@ def run_autolabel_mode(
     player_chunk_size: int,
     max_players: int = 20000,
 ) -> Dict[str, object]:
+    _log(
+        "autolabel: starting "
+        f"(db={db_path}, sample_csv={sample_csv}, window={start_ts} -> {end_ts}, chunk={player_chunk_size}, max_players={max_players})"
+    )
     if player_chunk_size <= 0:
         raise ValueError("player-chunk-size must be > 0")
 
@@ -451,6 +462,7 @@ def run_autolabel_mode(
           AND toString(player_id) IN %(player_ids)s
     """
     for chunk in _chunks(players, player_chunk_size):
+        _log(f"autolabel: querying ClickHouse chunk (players={len(chunk)})")
         df = client.query_df(
             query,
             parameters={
@@ -488,6 +500,7 @@ def run_autolabel_mode(
     out_labels_csv.parent.mkdir(parents=True, exist_ok=True)
     labeled_sample_out = labeled_sample[["bet_id", "label", "censored"]].copy()
     labeled_sample_out.to_csv(out_labels_csv, index=False)
+    _log(f"autolabel: done (labeled_rows={len(labeled_sample_out)}, output={out_labels_csv})")
 
     n_censored = int(labeled_sample_out["censored"].sum()) if not labeled_sample_out.empty else 0
     n_unmatched = len(sample_bids) - len(labeled_sample_out)
@@ -583,6 +596,7 @@ def run_evaluate_mode(
     labels_csv: Path,
     target_recall: float,
 ) -> Dict[str, object]:
+    _log(f"evaluate: starting (db={db_path}, labels_csv={labels_csv}, window={start_ts} -> {end_ts})")
     if target_recall <= 0 or target_recall > 1:
         raise ValueError("target-recall must be in (0, 1]")
 
@@ -649,6 +663,7 @@ def run_evaluate_mode(
         }
     finally:
         conn.close()
+        _log("evaluate: done")
 
 
 def parse_args() -> argparse.Namespace:
@@ -701,6 +716,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    _log(f"main: start (mode={args.mode})")
     try:
         start_ts, end_ts = _resolve_window(args.start_ts, args.end_ts)
         start_dt = _parse_iso_ts(start_ts)
@@ -718,6 +734,7 @@ def main() -> int:
     if not Path(pred_db_path).exists():
         print(f"prediction log DB not found: {pred_db_path}", file=sys.stderr)
         return 2
+    _log(f"main: using prediction_log DB ({pred_db_path})")
 
     default_sample_csv, default_labels_csv = _default_snapshot_paths(start_ts, end_ts)
     effective_out_csv = Path(args.out_csv) if args.out_csv.strip() else default_sample_csv
@@ -727,6 +744,7 @@ def main() -> int:
 
     try:
         if args.mode == "sample":
+            _log("main: executing step sample")
             payload = run_sample_mode(
                 db_path=pred_db_path,
                 start_ts=start_ts,
@@ -738,6 +756,7 @@ def main() -> int:
                 overwrite=args.overwrite,
             )
         elif args.mode == "autolabel":
+            _log("main: executing step autolabel")
             payload = run_autolabel_mode(
                 db_path=pred_db_path,
                 start_ts=start_ts,
@@ -748,6 +767,7 @@ def main() -> int:
                 max_players=args.max_players,
             )
         elif args.mode == "evaluate":
+            _log("main: executing step evaluate")
             payload = run_evaluate_mode(
                 db_path=pred_db_path,
                 start_ts=start_ts,
@@ -758,6 +778,7 @@ def main() -> int:
         else:
             # all: sample -> autolabel -> evaluate
             try:
+                _log("main: executing all-mode step sample")
                 sample_payload = run_sample_mode(
                     db_path=pred_db_path,
                     start_ts=start_ts,
@@ -771,6 +792,7 @@ def main() -> int:
             except Exception as exc:
                 raise RuntimeError(f"all-mode step 'sample' failed: {exc}") from exc
             try:
+                _log("main: executing all-mode step autolabel")
                 autolabel_payload = run_autolabel_mode(
                     db_path=pred_db_path,
                     start_ts=start_ts,
@@ -783,6 +805,7 @@ def main() -> int:
             except Exception as exc:
                 raise RuntimeError(f"all-mode step 'autolabel' failed: {exc}") from exc
             try:
+                _log("main: executing all-mode step evaluate")
                 evaluate_payload = run_evaluate_mode(
                     db_path=pred_db_path,
                     start_ts=start_ts,
@@ -798,6 +821,7 @@ def main() -> int:
                 "autolabel": autolabel_payload,
                 "evaluate": evaluate_payload,
             }
+            _log("main: all-mode completed")
     except Exception as exc:
         print(f"R1/R6 script failed: {exc}", file=sys.stderr)
         return 2
@@ -819,6 +843,7 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(json.dumps(payload, ensure_ascii=False))
+    _log("main: finished successfully")
     return 0
 
 
