@@ -8004,3 +8004,28 @@ python -m pytest tests/unit/test_mlflow_utils.py -v --tb=short
   - 主要失敗集中在 Step 7 DuckDB 分割流程（例如 `canonical_id` 欄位缺失 BinderException）與某些 profile schema hash 的 assertion。
   - 由於這些失敗看起來與本輪 MLflow diagnostics 變更點不直接相關，且 repo 既有測試本身即呈現多個失敗，因此本輪先以 plan/contract 相關子集的驗收為準。
 
+---
+### 本輪更新：建立 Test vs Production 調查專屬工作區骨架
+**Date**：2026-03-20  
+**範圍**：僅建立調查結構與模板，未修改 production 邏輯。
+
+**新增路徑**：
+- `investigations/test_vs_production/README.md`
+- `investigations/test_vs_production/runbook.md`
+- `investigations/test_vs_production/checks/preflight_check.py`
+- `investigations/test_vs_production/checks/collect_snapshot.py`
+- `investigations/test_vs_production/analysis/README.md`
+- `investigations/test_vs_production/sql/prediction_log_queries.sql`
+- `investigations/test_vs_production/reports/investigation_report_v1.md`
+- `investigations/test_vs_production/snapshots/.gitkeep`
+
+**同步文件更新**：
+- `.cursor/plans/INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md`
+  - 新增 Section 6「專屬調查工作區（Investigation Workspace）」
+  - 補充骨架路徑、執行規範與證據追溯要求
+
+**目的**：
+- 將 production 檢查、快照採集、R1~R9 分析與最終報告集中管理
+- 避免跨機器調查造成證據分散或結論不可重現
+- 以「快照僅新增、不覆蓋」確保審計軌跡完整
+

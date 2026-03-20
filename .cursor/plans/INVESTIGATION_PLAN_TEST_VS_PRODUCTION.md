@@ -254,6 +254,30 @@ Trainer 在 **沒有 validation set** 時會使用 **threshold=0.5** fallback，
 
 ---
 
+## 6. 專屬調查工作區（Investigation Workspace）
+
+為避免跨機器（非 production vs production）與跨輪調查造成證據分散，本計畫新增專屬工作區：
+
+- 路徑：`investigations/test_vs_production/`
+- 核心檔案：
+  - `README.md`（範圍、規則、資料夾用途）
+  - `runbook.md`（執行順序）
+  - `checks/preflight_check.py`（§0 / §1.2 前置條件檢查骨架）
+  - `checks/collect_snapshot.py`（快照採集骨架）
+  - `sql/prediction_log_queries.sql`（重複可執行查詢樣板）
+  - `reports/investigation_report_v1.md`（結案報告模板）
+- 產物目錄：
+  - `snapshots/`（每次 production 採樣一個時間戳目錄，不覆蓋）
+  - `analysis/`（R1~R9 分項分析筆記與證據）
+
+執行規範：
+
+1. 任何結論需可追溯到 `snapshots/`、`sql/` 或 `checks/` 產物。
+2. 先做 preflight，再做 snapshot，再做 R1~R9 分析，最後輸出 report。
+3. 快照僅新增，不覆蓋，以保留完整證據鏈與審計軌跡。
+
+---
+
 ## 附錄：與程式碼庫的對應
 
 - **Prediction log 實作**：`trainer/serving/scorer.py` 的 `_append_prediction_log()`，寫入欄位含 bet_id, score, margin, model_version, is_rated_obs, scored_at；是否寫入由 `PREDICTION_LOG_DB_PATH`（config）控制。
@@ -262,5 +286,5 @@ Trainer 在 **沒有 validation set** 時會使用 **threshold=0.5** fallback，
 - **Profile 載入**：scorer 使用 `_profile_cache` 與 1h TTL；trainer 的 `load_player_profile()` 為 window 區間＋PIT join。
 - **Canonical mapping**：scorer 在 DATA_DIR 設定時使用 `CANONICAL_MAPPING_PARQUET` 與 `CANONICAL_MAPPING_CUTOFF_JSON`；未設定時 fallback 至 `PROJECT_ROOT/data/`；`--rebuild-canonical-mapping` 可強制重建。
 
-**文件版本**：初版；已納入第一至第五輪程式碼庫點評及最終收尾（含 §1.3 步驟 2 資料來源優先順序、Section 5 狀態選項擴充、附錄 extended_end 說明）。  
-**最後更新**：依 .cursor/plans 慣例由執行者更新。
+**文件版本**：初版；已納入第一至第五輪程式碼庫點評及最終收尾（含 §1.3 步驟 2 資料來源優先順序、Section 5 狀態選項擴充、附錄 extended_end 說明），並新增 Section 6 專屬調查工作區。  
+**最後更新**：2026-03-20（新增 investigation workspace 骨架與執行規範）。
