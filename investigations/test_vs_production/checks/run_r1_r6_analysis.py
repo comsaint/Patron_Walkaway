@@ -18,15 +18,28 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
+
+import pandas as pd  # type: ignore[import-untyped]
+
+# Ensure repo root is importable when script is executed by file path.
+_REPO_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT_FOR_IMPORT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT_FOR_IMPORT))
+
+from trainer.core import config  # noqa: E402
+from trainer.db_conn import get_clickhouse_client  # noqa: E402
+from trainer.labels import compute_labels  # noqa: E402
 
 
 HK_TZ = ZoneInfo("Asia/Hong_Kong")
@@ -139,14 +152,21 @@ def _bin_from_score(score: float, bins: int) -> int:
     return idx
 
 
+def _stable_randint(upper_exclusive: int, seed: int, key: str) -> int:
+    if upper_exclusive <= 0:
+        return 0
+    digest = hashlib.sha256(f"{seed}:{key}".encode("utf-8")).digest()
+    v = int.from_bytes(digest[:8], "big", signed=False)
+    return v % upper_exclusive
+
+
 def _reservoir_update(reservoir: List[CandidateRow], item: CandidateRow, seen: int, target_size: int, rng_seed: int) -> None:
-    # Deterministic pseudo-randomness without global random state.
-    # Hash-based replacement for low-overhead reproducibility.
+    # Deterministic across processes: avoid builtin hash() randomization.
     if len(reservoir) < target_size:
         reservoir.append(item)
         return
     # pseudo-random integer in [0, seen-1]
-    j = (hash((item.bet_id, seen, rng_seed)) & 0x7FFFFFFF) % seen
+    j = _stable_randint(seen, rng_seed, f"{item.bet_id}:{seen}:{item.bin_id}")
     if j < target_size:
         reservoir[j] = item
 
@@ -251,13 +271,15 @@ def run_sample_mode(
         conn.close()
 
 
-def _load_labels_csv(path: Path) -> Dict[str, int]:
-    labels: Dict[str, int] = {}
+def _load_labels_csv(path: Path) -> Dict[str, Tuple[int, int]]:
+    # value: (label, censored) where censored in {0,1}; absent column defaults to 0
+    labels: Dict[str, Tuple[int, int]] = {}
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         required = {"bet_id", "label"}
         if not required.issubset(set(reader.fieldnames or [])):
             raise ValueError("labels CSV must contain columns: bet_id,label")
+        has_censored = "censored" in set(reader.fieldnames or [])
         for row in reader:
             bid = str(row["bet_id"]).strip()
             if not bid:
@@ -268,8 +290,186 @@ def _load_labels_csv(path: Path) -> Dict[str, int]:
                 continue
             if y not in (0, 1):
                 continue
-            labels[bid] = y
+            c = 0
+            if has_censored:
+                try:
+                    c = int(str(row.get("censored", "0")).strip())
+                except ValueError:
+                    c = 0
+                c = 1 if c == 1 else 0
+            labels[bid] = (y, c)
     return labels
+
+
+def _load_sample_bet_ids(path: Path) -> List[str]:
+    out: List[str] = []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if "bet_id" not in set(reader.fieldnames or []):
+            raise ValueError("sample CSV must contain column: bet_id")
+        for row in reader:
+            bid = str(row.get("bet_id", "")).strip()
+            if bid:
+                out.append(bid)
+    return out
+
+
+def _chunks(seq: Sequence[str], size: int) -> Iterable[Sequence[str]]:
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def run_autolabel_mode(
+    db_path: str,
+    start_ts: str,
+    end_ts: str,
+    sample_csv: Path,
+    out_labels_csv: Path,
+    player_chunk_size: int,
+    max_players: int = 20000,
+) -> Dict[str, object]:
+    if player_chunk_size <= 0:
+        raise ValueError("player-chunk-size must be > 0")
+
+    sample_bids = _load_sample_bet_ids(sample_csv)
+    if not sample_bids:
+        raise ValueError("sample CSV contains no bet_id rows")
+    sample_bid_set = set(sample_bids)
+
+    # 1) Build bet_id -> (player_id, canonical_id) from prediction_log
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        conn.execute("DROP TABLE IF EXISTS _tmp_sample_bids")
+        conn.execute("CREATE TEMP TABLE _tmp_sample_bids (bet_id TEXT PRIMARY KEY)")
+        conn.executemany("INSERT INTO _tmp_sample_bids (bet_id) VALUES (?)", [(b,) for b in sample_bids])
+
+        pred_rows = list(
+            conn.execute(
+                """
+                SELECT p.bet_id, p.player_id, p.canonical_id
+                FROM prediction_log p
+                JOIN _tmp_sample_bids s ON p.bet_id = s.bet_id
+                """
+            )
+        )
+    finally:
+        conn.close()
+
+    bid_to_player: Dict[str, str] = {}
+    player_to_canonical: Dict[str, str] = {}
+    ambiguous_players = set()
+    for bet_id, player_id, canonical_id in pred_rows:
+        if bet_id is None or player_id is None or canonical_id is None:
+            continue
+        b = str(bet_id)
+        p = str(player_id)
+        c = str(canonical_id)
+        bid_to_player[b] = p
+        prev = player_to_canonical.get(p)
+        if prev is None:
+            player_to_canonical[p] = c
+        elif prev != c:
+            ambiguous_players.add(p)
+
+    if ambiguous_players:
+        raise ValueError(
+            f"ambiguous player->canonical mapping detected for {len(ambiguous_players)} player_id(s); "
+            "cannot autolabel safely"
+        )
+
+    players = sorted(player_to_canonical.keys())
+    if not players:
+        raise ValueError("No player/canonical mapping found in prediction_log for sample bet_ids")
+    if len(players) > max_players:
+        raise ValueError(
+            f"player set too large ({len(players)} > max_players={max_players}); "
+            "narrow window or increase guardrail explicitly"
+        )
+
+    # 2) Fetch bet stream from ClickHouse by involved players in chunks
+    start_dt = _parse_iso_ts(start_ts).astimezone(HK_TZ).replace(tzinfo=None)
+    end_dt = _parse_iso_ts(end_ts).astimezone(HK_TZ).replace(tzinfo=None)
+    # Pull a little extra range for label lookahead / terminal determinability.
+    pull_start = start_dt - timedelta(minutes=5)
+    pull_end = end_dt + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN + config.WALKAWAY_GAP_MIN)
+
+    client = get_clickhouse_client()
+    all_bets: List[pd.DataFrame] = []
+    tbl = f"{config.SOURCE_DB}.{config.TBET}"
+    query = f"""
+        SELECT
+            bet_id,
+            player_id,
+            payout_complete_dtm
+        FROM {tbl} FINAL
+        WHERE payout_complete_dtm >= %(start)s
+          AND payout_complete_dtm <= %(end)s
+          AND payout_complete_dtm IS NOT NULL
+          AND wager > 0
+          AND toString(player_id) IN %(player_ids)s
+    """
+    for chunk in _chunks(players, player_chunk_size):
+        df = client.query_df(
+            query,
+            parameters={
+                "start": pull_start,
+                "end": pull_end,
+                "player_ids": tuple(chunk),
+            },
+        )
+        if not df.empty:
+            all_bets.append(df)
+
+    if not all_bets:
+        raise ValueError("No bets fetched from ClickHouse for sampled players")
+
+    bets = pd.concat(all_bets, ignore_index=True)
+    bets["player_id"] = bets["player_id"].astype(str)
+    bets["canonical_id"] = bets["player_id"].map(player_to_canonical)
+    bets = bets.dropna(subset=["canonical_id"]).copy()
+    if bets.empty:
+        raise ValueError("Fetched bets do not map to canonical_id; cannot compute labels")
+
+    bets["bet_id"] = bets["bet_id"].astype(str)
+    bets["payout_complete_dtm"] = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce")
+    bets = bets.dropna(subset=["payout_complete_dtm"]).copy()
+
+    # 3) Compute labels with trainer-consistent logic
+    labeled = compute_labels(
+        bets_df=bets[["canonical_id", "bet_id", "payout_complete_dtm"]],
+        window_end=end_dt,
+        extended_end=pull_end,
+    )
+    labeled_sample = labeled[labeled["bet_id"].isin(sample_bid_set)].copy()
+
+    # Keep censored rows visible; downstream evaluate can choose to filter.
+    out_labels_csv.parent.mkdir(parents=True, exist_ok=True)
+    labeled_sample_out = labeled_sample[["bet_id", "label", "censored"]].copy()
+    labeled_sample_out.to_csv(out_labels_csv, index=False)
+
+    n_censored = int(labeled_sample_out["censored"].sum()) if not labeled_sample_out.empty else 0
+    n_unmatched = len(sample_bids) - len(labeled_sample_out)
+
+    return {
+        "mode": "autolabel",
+        "window": {"start_ts": start_ts, "end_ts": end_ts},
+        "db_path": db_path,
+        "sample_csv": str(sample_csv),
+        "output_labels_csv": str(out_labels_csv),
+        "summary": {
+            "n_sample_input": len(sample_bids),
+            "n_players": len(players),
+            "n_bets_fetched": int(len(bets)),
+            "n_labeled_rows": int(len(labeled_sample_out)),
+            "n_censored": n_censored,
+            "n_unmatched_sample_bet_id": n_unmatched,
+            "player_chunk_size": player_chunk_size,
+        },
+        "note": (
+            "Labels generated via trainer.labels.compute_labels(). "
+            "Rows with censored=1 should be excluded from strict evaluation."
+        ),
+    }
 
 
 def _precision_recall_at_current_threshold(rows: List[Tuple[float, int, int]]) -> Dict[str, float]:
@@ -354,16 +554,19 @@ def run_evaluate_mode(
 
         # Create temp label table for efficient join.
         conn.execute("DROP TABLE IF EXISTS _tmp_labels")
-        conn.execute("CREATE TEMP TABLE _tmp_labels (bet_id TEXT PRIMARY KEY, label INTEGER NOT NULL)")
+        conn.execute(
+            "CREATE TEMP TABLE _tmp_labels (bet_id TEXT PRIMARY KEY, label INTEGER NOT NULL, censored INTEGER NOT NULL)"
+        )
         conn.executemany(
-            "INSERT INTO _tmp_labels (bet_id, label) VALUES (?, ?)",
-            [(bid, y) for bid, y in labels.items()],
+            "INSERT INTO _tmp_labels (bet_id, label, censored) VALUES (?, ?, ?)",
+            [(bid, y, c) for bid, (y, c) in labels.items()],
         )
 
         rows: List[Tuple[float, int, int]] = []
-        for score, is_alert, label in conn.execute(
+        n_censored_excluded = 0
+        for score, is_alert, label, censored in conn.execute(
             """
-            SELECT p.score, p.is_alert, l.label
+            SELECT p.score, p.is_alert, l.label, l.censored
             FROM prediction_log p
             JOIN _tmp_labels l ON p.bet_id = l.bet_id
             WHERE p.scored_at >= ? AND p.scored_at < ?
@@ -371,6 +574,9 @@ def run_evaluate_mode(
             """,
             (start_ts, end_ts),
         ):
+            if int(censored or 0) == 1:
+                n_censored_excluded += 1
+                continue
             if score is None:
                 continue
             rows.append((float(score), int(is_alert or 0), int(label)))
@@ -388,6 +594,7 @@ def run_evaluate_mode(
             "labels_csv": str(labels_csv),
             "n_labeled_input": len(labels),
             "n_labeled_matched": len(rows),
+            "n_censored_excluded": n_censored_excluded,
             "current_threshold_metrics": current,
             "precision_at_recall_target": {
                 "target_recall": target_recall,
@@ -401,7 +608,7 @@ def run_evaluate_mode(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run R1/R6 investigation helper.")
-    p.add_argument("--mode", choices=["sample", "evaluate"], default="sample")
+    p.add_argument("--mode", choices=["sample", "autolabel", "evaluate", "all"], default="sample")
     p.add_argument("--start-ts", default="", help="Window start timestamp (inclusive). Default: dynamic yesterday start in HKT.")
     p.add_argument("--end-ts", default="", help="Window end timestamp (exclusive). Default: dynamic today start in HKT.")
     p.add_argument("--env-file", default="", help="Optional .env file path.")
@@ -421,6 +628,28 @@ def parse_args() -> argparse.Namespace:
     # evaluate mode args
     p.add_argument("--labels-csv", default="", help="CSV with columns bet_id,label (required for evaluate mode).")
     p.add_argument("--target-recall", type=float, default=DEFAULT_TARGET_RECALL, help="Recall target for precision@recall.")
+    p.add_argument(
+        "--sample-csv",
+        default="investigations/test_vs_production/snapshots/latest_r1_r6_below_threshold_sample.csv",
+        help="Input sample CSV (for autolabel mode).",
+    )
+    p.add_argument(
+        "--out-labels-csv",
+        default="investigations/test_vs_production/snapshots/latest_r1_r6_labeled.csv",
+        help="Output labeled CSV path (for autolabel mode).",
+    )
+    p.add_argument(
+        "--player-chunk-size",
+        type=int,
+        default=500,
+        help="ClickHouse player_id IN chunk size for autolabel mode.",
+    )
+    p.add_argument(
+        "--max-players",
+        type=int,
+        default=20000,
+        help="Guardrail: maximum distinct players allowed in autolabel mode.",
+    )
     return p.parse_args()
 
 
@@ -433,15 +662,15 @@ def main() -> int:
         if start_dt >= end_dt:
             raise ValueError("start-ts must be earlier than end-ts")
     except ValueError as exc:
-        print(str(exc))
+        print(str(exc), file=sys.stderr)
         return 2
 
     pred_db_path, env_file_used = _resolve_pred_db_path(args.env_file, args.pred_db_path)
     if not pred_db_path:
-        print("PREDICTION_LOG_DB_PATH is empty. Provide --pred-db-path or set env/.env.")
+        print("PREDICTION_LOG_DB_PATH is empty. Provide --pred-db-path or set env/.env.", file=sys.stderr)
         return 2
     if not Path(pred_db_path).exists():
-        print(f"prediction log DB not found: {pred_db_path}")
+        print(f"prediction log DB not found: {pred_db_path}", file=sys.stderr)
         return 2
 
     try:
@@ -455,7 +684,17 @@ def main() -> int:
                 seed=args.seed,
                 out_csv=Path(args.out_csv),
             )
-        else:
+        elif args.mode == "autolabel":
+            payload = run_autolabel_mode(
+                db_path=pred_db_path,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                sample_csv=Path(args.sample_csv),
+                out_labels_csv=Path(args.out_labels_csv),
+                player_chunk_size=args.player_chunk_size,
+                max_players=args.max_players,
+            )
+        elif args.mode == "evaluate":
             if not args.labels_csv.strip():
                 raise ValueError("--labels-csv is required in evaluate mode")
             payload = run_evaluate_mode(
@@ -465,8 +704,50 @@ def main() -> int:
                 labels_csv=Path(args.labels_csv),
                 target_recall=args.target_recall,
             )
+        else:
+            # all: sample -> autolabel -> evaluate
+            try:
+                sample_payload = run_sample_mode(
+                    db_path=pred_db_path,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    sample_size=args.sample_size,
+                    bins=args.bins,
+                    seed=args.seed,
+                    out_csv=Path(args.out_csv),
+                )
+            except Exception as exc:
+                raise RuntimeError(f"all-mode step 'sample' failed: {exc}") from exc
+            try:
+                autolabel_payload = run_autolabel_mode(
+                    db_path=pred_db_path,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    sample_csv=Path(args.out_csv),
+                    out_labels_csv=Path(args.out_labels_csv),
+                    player_chunk_size=args.player_chunk_size,
+                    max_players=args.max_players,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"all-mode step 'autolabel' failed: {exc}") from exc
+            try:
+                evaluate_payload = run_evaluate_mode(
+                    db_path=pred_db_path,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    labels_csv=Path(args.out_labels_csv),
+                    target_recall=args.target_recall,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"all-mode step 'evaluate' failed: {exc}") from exc
+            payload = {
+                "mode": "all",
+                "sample": sample_payload,
+                "autolabel": autolabel_payload,
+                "evaluate": evaluate_payload,
+            }
     except Exception as exc:
-        print(f"R1/R6 script failed: {exc}")
+        print(f"R1/R6 script failed: {exc}", file=sys.stderr)
         return 2
 
     payload["resolution"] = {

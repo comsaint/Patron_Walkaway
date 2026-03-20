@@ -100,6 +100,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("trainer")
 
+# MLflow namespace: keep this project isolated on shared tracking server.
+# Override via credential/mlflow.env (MLFLOW_EXPERIMENT_TRAIN).
+MLFLOW_EXPERIMENT_TRAIN = (
+    (os.environ.get("MLFLOW_EXPERIMENT_TRAIN") or "").strip()
+    or "patron/patron_walkaway/prod/train"
+)
+
 
 def _agent_debug_log(
     hypothesis_id: str,
@@ -4421,7 +4428,10 @@ def run_pipeline(args) -> None:
 
     # T12: one MLflow run for the whole pipeline; on failure log status=FAILED and re-raise.
     _mlflow_run_name = f"train-{start.date()}-{end.date()}-{int(time.time())}"
-    with safe_start_run(run_name=_mlflow_run_name):
+    with safe_start_run(
+        experiment_name=MLFLOW_EXPERIMENT_TRAIN,
+        run_name=_mlflow_run_name,
+    ):
         try:
             # T12.2 Step 2 (success diagnostics): best-effort metrics for Step 7-9.
             # Note: all values are optional; log_*_safe helpers will skip None.

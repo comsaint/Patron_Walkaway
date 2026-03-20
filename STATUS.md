@@ -3377,3 +3377,236 @@ mypy investigations/test_vs_production/checks/preflight_check.py investigations/
   - `preflight_check.py --pretty`
   - `investigate_r2_window.py --pretty`
 - 若要擴大回歸，可追加 integration 測試（WAL lock / readonly URI）以模擬 scorer 寫入期間的讀取穩定性。
+
+---
+
+## R1/R6 自動化腳本（sample + autolabel + evaluate + all-in-one）（2026-03-20）
+
+**目標**：將 R1/R6 的離線流程自動化，降低手動標註與多步命令失誤成本。  
+**範圍**：僅新增/修改 investigation 腳本與調查計畫記錄，不改模型訓練/serving production pipeline。
+
+### 本輪修改檔案
+
+| 檔案 | 變更 |
+|------|------|
+| `.cursor/plans/INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md` | 在 §5 記錄第一輪結論：R2（is_alert vs alerts ratio=1.0）與 R8（uncalibrated/fallback 排除）狀態更新。 |
+| `investigations/test_vs_production/checks/run_r1_r6_analysis.py` | 新增 R1/R6 主腳本並擴充三階段：`sample`（below-threshold 分層抽樣）、`autolabel`（ClickHouse + `trainer.labels.compute_labels` 產生 `bet_id,label,censored`）、`evaluate`（current threshold P/R 與 precision@recall=target）。新增 `all` 模式一鍵執行 sample→autolabel→evaluate。補上 script-path 執行時的 `sys.path` 注入，避免 `ModuleNotFoundError: trainer`。 |
+
+### 如何手動驗證
+
+1. **語法檢查**
+   ```bash
+   python -m py_compile investigations/test_vs_production/checks/run_r1_r6_analysis.py
+   ```
+
+2. **sample mode（本機 smoke）**
+   ```bash
+   python investigations/test_vs_production/checks/run_r1_r6_analysis.py --mode sample --sample-size 100 --bins 5 --pretty
+   ```
+   預期：輸出 JSON，包含 `summary.n_below_rated`、`sample_size_written`、`output_csv`。
+
+3. **production 一鍵全流程（all mode）**
+   ```bash
+   python investigations/test_vs_production/checks/run_r1_r6_analysis.py --mode all --start-ts "2026-03-19T00:00:00+08:00" --end-ts "2026-03-20T00:00:00+08:00" --sample-size 5000 --bins 10 --player-chunk-size 500 --target-recall 0.01 --pretty
+   ```
+   預期：輸出 JSON 含 `sample`、`autolabel`、`evaluate` 三段；exit code=0。
+
+4. **分步模式（必要時除錯）**
+   ```bash
+   # Step A: sample
+   python investigations/test_vs_production/checks/run_r1_r6_analysis.py --mode sample --pretty
+
+   # Step B: autolabel
+   python investigations/test_vs_production/checks/run_r1_r6_analysis.py --mode autolabel --pretty
+
+   # Step C: evaluate
+   python investigations/test_vs_production/checks/run_r1_r6_analysis.py --mode evaluate --labels-csv investigations/test_vs_production/snapshots/latest_r1_r6_labeled.csv --pretty
+   ```
+
+### 本輪已做的本機驗證
+
+- `py_compile run_r1_r6_analysis.py`：通過  
+- `--mode sample` smoke test：通過（輸出 JSON 且可寫出 sample CSV）  
+- lint diagnostics（針對新增腳本）：無新增錯誤
+
+### 下一步建議
+
+1. 在 production 先跑 `--mode all` 取得完整 JSON，保存到 `investigations/test_vs_production/snapshots/`。
+2. 依 `evaluate` 結果判讀：
+   - `current_threshold_metrics.precision/recall`
+   - `precision_at_recall_target.precision_at_target_recall`
+   與 test 指標做同口徑比較，判定 R1/R6 是否成立。
+3. 若 `autolabel.summary.n_unmatched_sample_bet_id` 偏高（例如 >5%），優先排查 ClickHouse 抽取窗口與 player mapping 覆蓋，再做結論判定。
+
+---
+
+## Code Review：`run_r1_r6_analysis.py`（2026-03-20）
+
+**範圍**：僅 review `investigations/test_vs_production/checks/run_r1_r6_analysis.py`，不重寫架構。  
+**目標**：列最可能的 bug / 邊界 / 安全 / 效能問題，附具體修改建議與建議測試。
+
+### Findings（依嚴重度）
+
+#### 1) `autolabel` 的 player→canonical 映射可能把歷史 bet 套到錯 canonical（Major, 正確性）
+- **問題**：目前 `player_to_canonical` 來自 sample 視窗內 `prediction_log`，接著把 ClickHouse 拉回來的同 player 全部 bet 套同一 canonical。若 player 在窗口內/外有 identity 變化（映射切換），可能產生錯 label。
+- **具體修改建議**：
+  - 在 `autolabel` 輸出中加入「映射唯一性檢查」統計（同 `player_id` 對應多個 `canonical_id` 的計數）。
+  - 若偵測到非唯一映射，採 fail-fast 或至少 warning + 將該 player 排除。
+  - 中長期：改為用與 serving 同源的 canonical mapping artifact（含 cutoff），避免當次 sample 反推映射。
+- **希望新增的測試**：
+  - `test_autolabel_player_to_multiple_canonical_should_warn_or_fail`
+  - `test_autolabel_excludes_ambiguous_player_mapping`
+
+#### 2) `evaluate` 目前把 `censored=1` 視同可評估樣本（Major, 指標偏差）
+- **問題**：`autolabel` 有輸出 `censored`，但 `evaluate` 只讀 `bet_id,label`，未排除 censored。依 `trainer/labels.py` 設計，censored 應排除於訓練與嚴謹評估；納入會偏移 R1/R6 指標。
+- **具體修改建議**：
+  - `evaluate` 支援可選欄位 `censored`；預設排除 `censored=1`。
+  - 輸出統計明確列出 `n_censored_excluded`。
+  - 若 labels CSV 不含 `censored`，至少在 payload 加 warning。
+- **希望新增的測試**：
+  - `test_evaluate_excludes_censored_rows_when_column_present`
+  - `test_evaluate_warns_when_censored_column_absent`
+
+#### 3) `all` 模式失敗可觀測性不足（Medium, 邊界）
+- **問題**：目前 `all` 任一步失敗只輸出 `R1/R6 script failed: ...`，不含「失敗於 sample/autolabel/evaluate 哪一段」與上下文統計，production 排障成本高。
+- **具體修改建議**：
+  - 在 `all` 模式加入 step-level try/except，錯誤訊息附 step 名稱。
+  - 輸出部分成功 payload（例如 sample 成功、autolabel 失敗時仍保留 sample 結果）。
+- **希望新增的測試**：
+  - `test_all_mode_failure_message_contains_step_name`
+  - `test_all_mode_partial_payload_preserved_on_later_step_failure`
+
+#### 4) 取樣 reservoir 使用 Python `hash()`，跨程序不可重現（Medium, 可重現性）
+- **問題**：`_reservoir_update` 依賴 `hash((...))`，Python 啟動時 hash seed 會隨機化（安全機制），不同 process 同 seed 仍可能不同結果，影響 investigation 可重現性。
+- **具體修改建議**：
+  - 改用穩定 hash（如 `hashlib.sha256` + seed）或 `random.Random(seed)` 的固定狀態。
+  - 在 payload 額外輸出 `sampling_algorithm_version`。
+- **希望新增的測試**：
+  - `test_sample_reproducible_across_process_with_same_seed`
+  - `test_sample_changes_when_seed_changes`
+
+#### 5) ClickHouse 查詢的 `IN` 大清單仍有壓力風險（Medium, 效能）
+- **問題**：雖有 `player_chunk_size`，但每 chunk 對 `TBET FINAL` + 時間窗查詢仍可能重，且 players 多時總 query 次數高；在高峰時可能拖慢調查或打壓 CH。
+- **具體修改建議**：
+  - 增加上限保護（如 `max_players` / `max_rows`），超限時 fail-fast 並提示縮窗。
+  - payload 輸出每個 chunk 耗時與總耗時，便於後續調參。
+  - 可選：先查 candidate players 的最小必要時間範圍再拉資料，避免固定大窗。
+- **希望新增的測試**：
+  - `test_autolabel_respects_player_chunk_size`
+  - `test_autolabel_fails_fast_when_players_exceed_guardrail`
+
+#### 6) 錯誤輸出未統一寫到 stderr（Low, 運維可用性）
+- **問題**：`main()` 的錯誤目前多用 `print(...)`（stdout），在 shell pipeline/監控系統中不易區分成功 JSON 與錯誤訊息。
+- **具體修改建議**：
+  - 錯誤路徑改為 `print(..., file=sys.stderr)`。
+  - 成功 JSON 保持 stdout，便於重導向。
+- **希望新增的測試**：
+  - `test_main_errors_written_to_stderr`
+
+### 總結
+
+- 腳本已可跑 end-to-end，但要把 R1/R6 做到「可審計且可重現」，建議優先修 **#1、#2、#4**（正確性 + 可重現性），再補 **#3、#5**（可觀測性 + 效能保護）。
+
+---
+
+## 將 `run_r1_r6_analysis.py` 風險點轉成最小可重現測試（僅 tests，未改 production）（2026-03-20）
+
+**目標**：將上一節 Code Review 的 6 個風險點具體化為可執行測試；不修改 production code。
+
+### 新增檔案
+
+- `tests/review_risks/test_review_risks_r1_r6_script.py`
+
+### 測試與風險點對應
+
+| 測試 | 對應風險 | 說明 | 目前狀態 |
+|------|----------|------|----------|
+| `test_autolabel_should_fail_on_ambiguous_player_to_canonical_mapping` | #1 映射歧義 | 同 player 對多 canonical 時，期望 fail/warn 而非靜默覆寫。 | `xfail` |
+| `test_evaluate_should_exclude_censored_rows` | #2 censored 排除 | labels 含 `censored=1` 時，evaluate 應排除。 | `xfail` |
+| `test_all_mode_error_message_should_include_failed_step` | #3 可觀測性 | `all` 模式失敗訊息應含 step 名稱（如 autolabel）。 | `xfail` |
+| `test_sampling_should_not_use_builtin_hash_for_reproducibility` | #4 可重現性 | 取樣不應依賴 process-randomized `hash()`。 | `xfail` |
+| `test_autolabel_should_have_guardrail_for_large_player_set` | #5 效能保護 | 應有 `max_players/max_rows` guardrail。 | `xfail` |
+| `test_main_errors_should_go_to_stderr` | #6 運維可用性 | 錯誤訊息應寫 stderr，不與 JSON stdout 混流。 | `xfail` |
+| `test_sample_mode_minimal_smoke` | 基線可用性 | 建立最小 prediction_log 後 sample mode 可成功產出 CSV。 | `passed` |
+
+### 執行方式
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_r1_r6_script.py -q --tb=short
+```
+
+### 本輪結果
+
+- `1 passed, 6 xfailed`
+
+### 說明
+
+- `xfail` 代表這些風險點已被測試鎖定，但目前 production 尚未實作修補。
+- 後續若修補對應風險，應移除各測試 `xfail`，轉為強制通過契約。
+
+---
+
+## Round 1：修改實作以消除 `run_r1_r6_analysis.py` 風險測試失敗（2026-03-20）
+
+### 修改檔案
+
+- `investigations/test_vs_production/checks/run_r1_r6_analysis.py`
+
+### 本輪實作變更（不改功能目標，只補風險防護）
+
+1. **Risk #1（映射歧義）**
+   - `autolabel` 新增 player->canonical 唯一性檢查；若同 `player_id` 對應多個 `canonical_id`，直接 `ValueError` fail-fast。
+2. **Risk #2（censored 口徑）**
+   - `evaluate` 支援讀取 labels 的可選 `censored` 欄位，預設排除 `censored=1`，並在 payload 增加 `n_censored_excluded`。
+3. **Risk #3（all mode 可觀測性）**
+   - `all` 模式改為 step-level try/except，錯誤訊息明確帶出 `sample/autolabel/evaluate` 失敗步驟。
+4. **Risk #4（取樣可重現性）**
+   - reservoir replacement 從 process-randomized `hash()` 改為 `sha256(seed+key)` 穩定雜湊。
+5. **Risk #5（效能 guardrail）**
+   - `autolabel` 新增 `--max-players`（預設 20000）上限保護，超限 fail-fast。
+6. **Risk #6（stderr/stdout 分流）**
+   - 錯誤訊息改走 `stderr`；成功 payload 仍在 `stdout`。
+7. **相容性**
+   - `run_autolabel_mode(..., max_players=20000)` 提供預設值，避免既有呼叫端破壞。
+
+### 驗證結果（Round 1）
+
+- `python -m pytest tests/review_risks/test_review_risks_r1_r6_script.py -q --tb=short`
+  - 結果：`1 passed, 1 xfailed, 5 xpassed`
+- 說明：剩餘 `xfailed` 來自測試 fixture 仍使用舊 CLI 參數/錯誤輸出通道假設（屬「decorator/測試過時」）。
+
+---
+
+## Round 2：僅更新過時測試 decorator/介面假設，收斂到全綠（2026-03-20）
+
+### 修改檔案
+
+- `tests/review_risks/test_review_risks_r1_r6_script.py`
+- `investigations/test_vs_production/checks/run_r1_r6_analysis.py`（僅 lint/typecheck 相容性微調）
+
+### 測試檔調整（符合「僅測試本身過時才可改」）
+
+1. 移除 6 個過時 `xfail` decorator（對應風險已實作修補）。
+2. `all` 模式測試補上 `max_players`（配合新 CLI 參數）。
+3. `all` 模式錯誤訊息斷言改檢查 `stderr`（符合 stdout 只留 JSON 的設計）。
+4. 為 `pandas` 引入加上 `type: ignore[import-untyped]`（避免缺 stub 造成 mypy 假性失敗）。
+
+### 風格/型別微調
+
+- `run_r1_r6_analysis.py`：
+  - 移除未使用 import。
+  - `trainer.*` imports 補 `# noqa: E402`（該檔需先動態調整 `sys.path`）。
+  - `pandas` import 補 `type: ignore[import-untyped]`。
+
+### 驗證結果（Round 2）
+
+- `python -m pytest tests/review_risks/test_review_risks_r1_r6_script.py tests/review_risks/test_review_risks_investigation_scripts.py -q --tb=short`
+  - 結果：`13 passed`
+- `python -m mypy --follow-imports=skip investigations/test_vs_production/checks/run_r1_r6_analysis.py tests/review_risks/test_review_risks_r1_r6_script.py`
+  - 結果：`Success: no issues found in 2 source files`
+- `python -m ruff check investigations/test_vs_production/checks/run_r1_r6_analysis.py tests/review_risks/test_review_risks_r1_r6_script.py`
+  - 結果：`All checks passed!`
+
+### 備註
+
+- 這輪僅處理本次 review_risks 相關實作與測試收斂；未擴大改動其他 production 模組。

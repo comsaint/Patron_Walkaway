@@ -12,6 +12,7 @@ Run from repo root: python -m trainer.scripts.export_predictions_to_mlflow [--dr
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import tempfile
 from datetime import datetime, timedelta
@@ -32,6 +33,10 @@ from trainer.core.mlflow_utils import (
 _log = logging.getLogger(__name__)
 
 META_KEY_LAST_EXPORTED_ID = "last_exported_prediction_id"
+MLFLOW_EXPERIMENT_EXPORT = (
+    (os.environ.get("MLFLOW_EXPERIMENT_EXPORT") or "").strip()
+    or "patron/patron_walkaway/prod/prediction_export"
+)
 
 
 def _ensure_export_meta_tables(conn: sqlite3.Connection) -> None:
@@ -230,7 +235,7 @@ def run_export(
         # On upload failure we must not advance watermark (plan: 上傳失敗 -> 不移動 watermark).
         # Use MLflow directly so exceptions propagate; log_artifact_safe no-ops and does not raise.
         with safe_start_run(
-            experiment_name="prediction_export",
+            experiment_name=MLFLOW_EXPERIMENT_EXPORT,
             run_name=f"export_{date_part}_{hour_part}_{min_id}_{max_id}",
             tags={"min_prediction_id": str(min_id), "max_prediction_id": str(max_id)},
         ):
