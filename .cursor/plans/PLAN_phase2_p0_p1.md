@@ -60,7 +60,7 @@ flowchart LR
 
 ## Ordered Tasks
 
-**Current status**（更新於 2026-03-19）：**T0**–**T11** 已完成。**T12** 已完成（含 Step 1、Step 2、optional follow-on、Code Review §1）。**Credential folder consolidation** Step 1–2 已實作（config 自 credential/.env 載入、mlflow_utils 自 credential/mlflow.env 優先、.gitignore 與範本）；Code Review §1（config load_dotenv try/except）、§2（mlflow 例外 log 不洩路徑）已修補，五則 credential_review 測試全過。**Scorer Track Human lookback parity**：scorer 已傳入 `lookback_hours=SCORER_LOOKBACK_HOURS`；Code Review §1（scorer config 改為 `from trainer.core import config`）已修補；5 則契約／邊界測試就位；tests/ruff 通過，見 STATUS.md § Scorer Track Human lookback parity fix。**R3505 cutoff_time 正規化**：Code Review §1–§4 已修補（HK_TZ 常數、拒絕 None/NaT/date、下游一律收 datetime）；7 則 `test_review_risks_r3505_cutoff.py` 全過；mypy trainer/、ruff check scorer 通過，見 STATUS.md § Round — R3505 正規化 Production 修補。
+**Current status**（更新於 2026-03-19）：**T0**–**T11** 已完成。**T12** 已完成（含 Step 1、Step 2、optional follow-on、Code Review §1）。**Credential folder consolidation** Step 1–2 已實作（config 自 credential/.env 載入、mlflow_utils 自 credential/mlflow.env 優先、.gitignore 與範本）；Code Review §1（config load_dotenv try/except）、§2（mlflow 例外 log 不洩路徑）已修補，五則 credential_review 測試全過。**Scorer Track Human lookback parity**：scorer 已傳入 `lookback_hours=SCORER_LOOKBACK_HOURS`；Code Review §1（scorer config 改為 `from trainer.core import config`）已修補；5 則契約／邊界測試就位；tests/ruff 通過，見 STATUS.md § Scorer Track Human lookback parity fix。**R3505 cutoff_time 正規化**：Code Review §1–§4 已修補；見 STATUS.md § Round — R3505 正規化 Production 修補。**T13 MLflow cold-start mitigation**：Step 1–2（重試＋退避、warm-up）與 Code Review #1/#3/#4 修補已完成，見 STATUS.md § T13 Code Review 修補 production。
 
 **Remaining items**（依執行順序）：
 - **Credential folder**：Migration（既有 local_state/mlflow.env、repo/.env 搬至 credential/ 並拆分）、可選 deploy 路徑（main.py 改讀 credential/.env）、可選 .gitignore 改為忽略整個 credential/ 再 negate examples）。
@@ -440,6 +440,30 @@ flowchart LR
   - 成功完成時仍只有一筆 run，provenance 與 T2 行為一致。
   - 無 MLflow 時行為不變（no-op，不 crash）。
 
+### T13. MLflow cold-start mitigation (optional follow-on) — ✅ Done
+
+- **Depends on**: T2, T12
+- **Goal**: 在 Cloud Run MLflow 維持 min instances = 0 的前提下，避免訓練結束後因 cold start 導致 `log-batch` 連續 503、provenance/metrics 寫入失敗。不增加常駐 instance 成本。
+- **Context**: 長時間訓練（例如 3 小時）期間無 MLflow 請求，Cloud Run 可能 scale to zero；訓練完成時第一次 `log_params` / `log_metrics` 觸發 cold start 而回 503，client 重試後仍失敗。實作兩層緩解：
+  1. **Client 重試＋退避**：在 `log_params_safe`、`log_metrics_safe`（與必要時 `log_tags_safe`）內，對暫時性錯誤（503、502、504 或 exception 訊息含 `too many 503`）做有限次數重試，並使用 exponential backoff（例如 30s、60s、120s）。Cold start 多數在 30–60s 內就緒，數次重試即可成功。
+  2. **Warm-up 請求**：在 Step 10 完成後、第一次呼叫 `_log_training_provenance_to_mlflow` / `log_params_safe` 之前，先發一筆輕量 MLflow API 請求（例如 `mlflow.get_run(active_run.info.run_id)`），並對該請求套用相同 503/502/504 重試＋退避邏輯；成功後再執行既有 provenance 與 metrics 寫入，使後續 `log-batch` 打到已 warm 的 instance。
+- **Files**
+  - [trainer/core/mlflow_utils.py](trainer/core/mlflow_utils.py)
+  - [trainer/training/trainer.py](trainer/training/trainer.py)
+- **Implementation notes**
+  1. **重試條件**：僅對「暫時性伺服器錯誤」重試（HTTP 503/502/504，或 MLflow/requests 拋出之 exception 的 `str(e)` 含 `"503"` / `"too many 503"`）；其他例外維持現狀（log warning、不重試）。
+  2. **重試參數**：最大重試次數（例如 3–5）、初始延遲與 backoff 倍率可為常數或 config，避免單次訓練結束後等待過長（例如總等待上界約 2–4 分鐘）。
+  3. **Warm-up 時機**：在 `run_pipeline` 內、`_log_training_provenance_to_mlflow(...)` 被呼叫之前；僅在 `has_active_run()` 為 True 時執行（已有 run 才需 warm-up，再 get_run 即可）。
+  4. **契約不變**：失敗時仍只 `logger.warning`，不 raise；訓練成功與否不受 MLflow 寫入成敗影響。
+- **Test steps**
+  1. 單元：mock MLflow client 使第一次呼叫拋 503、第二次成功，驗證 `log_params_safe` / `log_metrics_safe` 在重試後成功且僅呼叫預期次數。
+  2. 可選：mock 連續 503，驗證達最大重試後仍只 warning、不 raise。
+  3. 手動：在 Cloud Run min instances = 0 下跑完整訓練，確認結束後 provenance 與 metrics 能寫入（或至少重試日誌可觀測）。
+- **Rollback**
+  - 移除重試迴圈與 warm-up 呼叫，還原為單次呼叫＋失敗即 warning。
+- **Definition of done**
+  - 在 scale-to-zero MLflow 下，訓練結束後 provenance 與 metrics 能在一至數次重試內寫入，或明確在日誌中留下重試行為；不增加常駐 instance 成本。
+
 ### Credential folder consolidation — Step 1–2 ✅ Done；Code Review §1 §2 ✅ Done
 
 - **Step 1–2 已完成**（2026-03-19）：config 自 `_REPO_ROOT/credential/.env` 優先載入（含 try/except）；mlflow_utils 自 `credential/mlflow.env` 再 `local_state/mlflow.env`；.gitignore 與 credential 範本已就位。Code Review §1（config 載入 try/except）、§2（mlflow warning 僅 log 例外類型不洩路徑）已修補。
@@ -474,6 +498,7 @@ flowchart LR
 - [trainer/training/trainer.py](trainer/training/trainer.py)
   - 在 `save_artifact_bundle(...)` 後接入 provenance logging。
   - （T12）pipeline 開頭以 `with safe_start_run(...)` 包住整段；失敗時在 except 內 `log_tags_safe` / `log_params_safe`（含 config、chunk 數、OOM-check 估計等）。
+  - （T13）在 `_log_training_provenance_to_mlflow` 第一次被呼叫前，若有 active run 則呼叫 warm-up（例如 `mlflow_utils` 提供之輕量 get_run 並套用相同 503 重試），再執行既有 provenance / metrics 寫入。
 - [trainer/serving/scorer.py](trainer/serving/scorer.py)
   - 建立獨立的 `prediction_log.db` 與對應 schema（prediction log + export metadata/audit）
   - 在 `score_once(...)` 中對獨立 DB 進行 batch append
@@ -484,6 +509,7 @@ flowchart LR
   - 模組頂層：若存在 `repo_root/local_state/mlflow.env` 則 `load_dotenv(..., override=False)`，不寫入主 `.env`
   - （T12）`_log_training_provenance_to_mlflow` 呼叫處：有 active run 時只 log 不 start_run（實作在 trainer 內該 helper 的判斷）
   - （Credential folder 實作時）預設路徑改為 `repo_root/credential/mlflow.env`
+  - （T13）`log_params_safe` / `log_metrics_safe`（與必要時 `log_tags_safe`）：對 503/502/504 或 `too many 503` 做有限次數重試＋exponential backoff；可選新增 `_warm_up_mlflow_run()` 供 trainer 在第一次 log 前呼叫
 - [.gitignore](.gitignore)（T11）
   - 新增 `local_state/mlflow.env`（或 `local_state/`），避免 MLflow 設定檔被 commit
   - （Credential folder 實作時）改為忽略 `credential/` 內敏感檔、保留 `credential/*.example`
@@ -541,6 +567,8 @@ flowchart LR
   - with `local_state/mlflow.env` present, env vars loaded before first `get_tracking_uri()`; without file, no error and no overwrite of existing env
 - T12 failed run log:
   - pipeline 於某步失敗時，MLflow 有一筆 run、tag `status=FAILED`、error 及 config／chunk 數／OOM 估計等；成功路徑仍為單一 run
+- T13 MLflow cold-start mitigation:
+  - mock 503 後重試成功：`log_params_safe` / `log_metrics_safe` 在第一次 503、第二次成功時僅 warning 一次且最終寫入成功；可選 mock 連續 503 驗證達最大重試後不 raise
 
 ### Manual validation
 
@@ -548,11 +576,12 @@ flowchart LR
 2. Run trainer with reachable test tracking URI -> provenance visible in MLflow.
 3. (T11) Create `local_state/mlflow.env` with URI and key path -> run trainer/export from repo root without manual `export` -> trials logged to MLflow.
 4. (T12) Trigger a pipeline failure (e.g. OOM) -> MLflow UI shows one FAILED run with error and params (config, chunks, memory estimate).
-5. Run scorer once -> `prediction_log` row count increases.
-6. Run export script with GCP unavailable -> no crash, watermark unchanged, rows remain.
-7. Re-run export script with GCP available -> artifact uploaded, watermark advances.
-8. Run validator unchanged -> existing behavior preserved.
-9. Produce one local Evidently report and one skew-check output.
+5. (T13) With MLflow on Cloud Run min instances = 0, run full training -> after completion, provenance and metrics appear in MLflow (or retries visible in logs).
+6. Run scorer once -> `prediction_log` row count increases.
+7. Run export script with GCP unavailable -> no crash, watermark unchanged, rows remain.
+8. Re-run export script with GCP available -> artifact uploaded, watermark advances.
+9. Run validator unchanged -> existing behavior preserved.
+10. Produce one local Evidently report and one skew-check output.
 
 ---
 
@@ -585,6 +614,10 @@ flowchart LR
 ### T12 failed run log
 
 - Remove the `with safe_start_run` and try/except at top of `run_pipeline`; restore `_log_training_provenance_to_mlflow` to always start its own run. Restores "log to MLflow only on success" behavior.
+
+### T13 MLflow cold-start mitigation
+
+- Remove retry loop and backoff from `log_params_safe` / `log_metrics_safe` (and `log_tags_safe` if changed); remove warm-up call before `_log_training_provenance_to_mlflow` in trainer. Restores single-attempt log and warning on failure.
 
 ---
 

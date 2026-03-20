@@ -69,10 +69,11 @@ from zoneinfo import ZoneInfo
 from trainer.profile_schedule import latest_month_end_on_or_before, month_end_dates
 from trainer.core.mlflow_utils import (
     has_active_run,
+    log_metrics_safe,
     log_params_safe,
     log_tags_safe,
-    log_metrics_safe,
     safe_start_run,
+    warm_up_mlflow_run_safe,
 )
 
 try:
@@ -5714,7 +5715,11 @@ def run_pipeline(args) -> None:
             _el = time.perf_counter() - t0
             print("[Step 10/10] Save artifact bundle done in %.1fs" % _el, flush=True)
             logger.info("save_artifact_bundle: %.1fs", _el)
-        
+
+            # T13: Warm up MLflow (e.g. Cloud Run) before first log to reduce 503 on cold start.
+            if has_active_run():
+                warm_up_mlflow_run_safe()
+
             # Phase 2 T2: Log provenance to MLflow (no-op when URI unset/unreachable).
             try:
                 _log_training_provenance_to_mlflow(

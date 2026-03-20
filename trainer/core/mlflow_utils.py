@@ -55,6 +55,23 @@ _mlflow_available: Optional[bool] = None
 # ID token cache: (token, expiry_ts). Tokens typically valid 1h; refresh 5 min before.
 _GCP_TOKEN_REFRESH_BUFFER_SEC = 300
 
+# T13: Retry on transient server errors (e.g. Cloud Run cold start 503).
+# max_retries=3 → 4 attempts total; delays 30s, 60s, 120s → ~3.5 min max wait.
+_MLFLOW_RETRY_MAX_RETRIES = 3
+_MLFLOW_RETRY_INITIAL_DELAY_SEC = 30
+_MLFLOW_RETRY_BACKOFF_MULTIPLIER = 2
+
+
+def _is_transient_mlflow_error(exc: BaseException) -> bool:
+    """True if the exception indicates a transient server error (502/503/504, cold start)."""
+    msg = str(exc).lower()
+    return (
+        "502" in msg
+        or "503" in msg
+        or "504" in msg
+        or "too many 503" in msg
+    )
+
 
 def _get_gcp_id_token(audience: str) -> Optional[str]:
     """Fetch GCP ID token for the given audience (e.g. Cloud Run URL). Uses GOOGLE_APPLICATION_CREDENTIALS. Cached until ~5 min before expiry."""
@@ -181,6 +198,46 @@ def has_active_run() -> bool:
         return False
 
 
+def warm_up_mlflow_run_safe() -> None:
+    """T13: Lightweight MLflow API call to wake Cloud Run before first log-batch.
+    No-op if MLflow unavailable or no active run. Uses same 502/503/504 retry+backoff."""
+    if not is_mlflow_available():
+        return
+    import mlflow  # type: ignore[import-not-found]
+    run = mlflow.active_run()
+    if run is None:
+        return
+    # T13 Review #4: avoid get_run(None) when run_id is missing.
+    if not getattr(run, "info", None) or getattr(run.info, "run_id", None) is None:
+        _log.warning("MLflow warm-up skipped: no run_id")
+        return
+    delay_sec = float(_MLFLOW_RETRY_INITIAL_DELAY_SEC)
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MLFLOW_RETRY_MAX_RETRIES + 1):
+        try:
+            mlflow.get_run(run.info.run_id)
+            return
+        except Exception as e:
+            last_exc = e
+            if attempt < _MLFLOW_RETRY_MAX_RETRIES and _is_transient_mlflow_error(e):
+                _log.info(
+                    "MLflow warm-up transient error (attempt %d/%d), retry in %.0fs: %s",
+                    attempt + 1,
+                    _MLFLOW_RETRY_MAX_RETRIES + 1,
+                    delay_sec,
+                    type(e).__name__,
+                )
+                time.sleep(delay_sec)
+                delay_sec *= _MLFLOW_RETRY_BACKOFF_MULTIPLIER
+            else:
+                break
+    _log.warning(
+        "MLflow warm-up failed after %d attempts (provenance/metrics may still succeed): %s",
+        _MLFLOW_RETRY_MAX_RETRIES + 1,
+        type(last_exc).__name__ if last_exc is not None else "Unknown",
+    )
+
+
 def safe_start_run(
     experiment_name: Optional[str] = None,
     run_name: Optional[str] = None,
@@ -200,25 +257,73 @@ def safe_start_run(
 
 
 def log_params_safe(params: dict[str, Any]) -> None:
-    """Log params to current run if MLflow is available; otherwise no-op."""
+    """Log params to current run if MLflow is available; otherwise no-op.
+    T13: On 502/503/504 (e.g. cold start), retries with exponential backoff."""
     if not is_mlflow_available():
         return
-    try:
-        import mlflow  # type: ignore[import-not-found]
-        mlflow.log_params(params)
-    except Exception as e:
-        _log.warning("MLflow log_params failed: %s", e)
+    if not params:
+        return
+    delay_sec = float(_MLFLOW_RETRY_INITIAL_DELAY_SEC)
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MLFLOW_RETRY_MAX_RETRIES + 1):
+        try:
+            import mlflow  # type: ignore[import-not-found]
+            mlflow.log_params(params)
+            return
+        except Exception as e:
+            last_exc = e
+            if attempt < _MLFLOW_RETRY_MAX_RETRIES and _is_transient_mlflow_error(e):
+                _log.info(
+                    "MLflow log_params transient error (attempt %d/%d), retry in %.0fs: %s",
+                    attempt + 1,
+                    _MLFLOW_RETRY_MAX_RETRIES + 1,
+                    delay_sec,
+                    type(e).__name__,
+                )
+                time.sleep(delay_sec)
+                delay_sec *= _MLFLOW_RETRY_BACKOFF_MULTIPLIER
+            else:
+                break
+    _log.warning(
+        "MLflow log_params failed after %d attempts: %s",
+        _MLFLOW_RETRY_MAX_RETRIES + 1,
+        type(last_exc).__name__ if last_exc is not None else "Unknown",
+    )
 
 
 def log_tags_safe(tags: dict[str, str]) -> None:
-    """Log tags to current run if MLflow is available; otherwise no-op."""
+    """Log tags to current run if MLflow is available; otherwise no-op.
+    T13: On 502/503/504 (e.g. cold start), retries with exponential backoff."""
     if not is_mlflow_available():
         return
-    try:
-        import mlflow  # type: ignore[import-not-found]
-        mlflow.set_tags(tags)
-    except Exception as e:
-        _log.warning("MLflow set_tags failed: %s", e)
+    if not tags:
+        return
+    delay_sec = float(_MLFLOW_RETRY_INITIAL_DELAY_SEC)
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MLFLOW_RETRY_MAX_RETRIES + 1):
+        try:
+            import mlflow  # type: ignore[import-not-found]
+            mlflow.set_tags(tags)
+            return
+        except Exception as e:
+            last_exc = e
+            if attempt < _MLFLOW_RETRY_MAX_RETRIES and _is_transient_mlflow_error(e):
+                _log.info(
+                    "MLflow set_tags transient error (attempt %d/%d), retry in %.0fs: %s",
+                    attempt + 1,
+                    _MLFLOW_RETRY_MAX_RETRIES + 1,
+                    delay_sec,
+                    type(e).__name__,
+                )
+                time.sleep(delay_sec)
+                delay_sec *= _MLFLOW_RETRY_BACKOFF_MULTIPLIER
+            else:
+                break
+    _log.warning(
+        "MLflow set_tags failed after %d attempts: %s",
+        _MLFLOW_RETRY_MAX_RETRIES + 1,
+        type(last_exc).__name__ if last_exc is not None else "Unknown",
+    )
 
 
 def log_metrics_safe(metrics: dict[str, Any]) -> None:
@@ -229,28 +334,49 @@ def log_metrics_safe(metrics: dict[str, Any]) -> None:
     - Skip keys whose value is None.
     - Best-effort coerce values via float(v); on failure skip that key.
     - Never raise (log warning only) so training pipeline is not impacted.
+    T13: On 502/503/504 (e.g. cold start), retries with exponential backoff.
     """
     if not is_mlflow_available():
         return
-    try:
-        import mlflow  # type: ignore[import-not-found]
-        sanitized: dict[str, float] = {}
-        for k, v in metrics.items():
-            if v is None:
+    import mlflow  # type: ignore[import-not-found]
+    sanitized: dict[str, float] = {}
+    for k, v in metrics.items():
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+            if not math.isfinite(fv):
                 continue
-            try:
-                # mlflow.log_metrics expects numeric values.
-                fv = float(v)
-                # Code Review §4: avoid NaN/inf in MLflow metrics.
-                if not math.isfinite(fv):
-                    continue
-                sanitized[k] = fv
-            except Exception:
-                continue
-        if sanitized:
+            sanitized[k] = fv
+        except Exception:
+            continue
+    if not sanitized:
+        return
+    delay_sec = float(_MLFLOW_RETRY_INITIAL_DELAY_SEC)
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MLFLOW_RETRY_MAX_RETRIES + 1):
+        try:
             mlflow.log_metrics(sanitized)
-    except Exception as e:
-        _log.warning("MLflow log_metrics failed: %s", e)
+            return
+        except Exception as e:
+            last_exc = e
+            if attempt < _MLFLOW_RETRY_MAX_RETRIES and _is_transient_mlflow_error(e):
+                _log.info(
+                    "MLflow log_metrics transient error (attempt %d/%d), retry in %.0fs: %s",
+                    attempt + 1,
+                    _MLFLOW_RETRY_MAX_RETRIES + 1,
+                    delay_sec,
+                    type(e).__name__,
+                )
+                time.sleep(delay_sec)
+                delay_sec *= _MLFLOW_RETRY_BACKOFF_MULTIPLIER
+            else:
+                break
+    _log.warning(
+        "MLflow log_metrics failed after %d attempts: %s",
+        _MLFLOW_RETRY_MAX_RETRIES + 1,
+        type(last_exc).__name__ if last_exc is not None else "Unknown",
+    )
 
 
 def log_artifact_safe(local_path: str | Path, artifact_path: Optional[str] = None) -> None:

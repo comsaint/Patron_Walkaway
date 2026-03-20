@@ -2963,3 +2963,217 @@ ruff check trainer/serving/scorer.py
   1. **Credential folder**：Migration（既有 local_state/mlflow.env、repo/.env 搬至 credential/ 並拆分）、可選 deploy 路徑、可選 .gitignore 調整。
   2. **Scorer lookback（可選）**：Code Review §2 — `SCORER_LOOKBACK_HOURS` 非數值或 ≤ 0 時 fallback（log warning + 8）。
   3. 其餘 Phase 2 P0–P1 無強制待辦；可選後續優化 Code Review §2–§5 效能/語義項。
+
+---
+
+## T13 MLflow cold-start mitigation（2026-03-19）
+
+**目標**：依 PLAN_phase2_p0_p1.md T13，實作 client 端 503/502/504 重試＋退避，以及訓練結束後第一次 log 前輕量 warm-up，避免 Cloud Run scale-to-zero 導致 log-batch 連續 503。不增加常駐 instance 成本。
+
+### 改了哪些檔
+
+| 檔案 | 變更摘要 |
+|------|----------|
+| `trainer/core/mlflow_utils.py` | 新增 `_is_transient_mlflow_error(exc)`（502/503/504 或 "too many 503"）；新增常數 `_MLFLOW_RETRY_MAX_RETRIES=3`、`_MLFLOW_RETRY_INITIAL_DELAY_SEC=30`、`_MLFLOW_RETRY_BACKOFF_MULTIPLIER=2`。`log_params_safe`、`log_tags_safe`、`log_metrics_safe` 改為在暫時性錯誤時重試（最多 4 次，延遲 30s→60s→120s），非暫時性錯誤或達上限後僅 log warning 不 raise。新增 `warm_up_mlflow_run_safe()`：若有 active run 則呼叫 `mlflow.get_run(run.info.run_id)`，套用相同重試邏輯。 |
+| `trainer/training/trainer.py` | 自 `mlflow_utils` 匯入 `warm_up_mlflow_run_safe`；在 Step 10 完成、`_log_training_provenance_to_mlflow` 之前，若 `has_active_run()` 則呼叫 `warm_up_mlflow_run_safe()`。 |
+
+### 手動驗證
+
+1. **單元測試**（MLflow 不可用時行為不變）  
+   ```bash
+   python -m pytest tests/unit/test_mlflow_utils.py -v --tb=short
+   ```  
+   預期：23 passed, 10 skipped, 1 xpassed（與改動前一致）。
+
+2. **無 MLflow / URI 未設**：執行 `python -m trainer.trainer --days 1 --use-local-parquet --skip-optuna` 且不設 `MLFLOW_TRACKING_URI`，訓練應完成，僅出現「MLflow logging will be skipped」類警告，無 503 重試日誌。
+
+3. **有 MLflow、Cloud Run min instances = 0**：跑完整訓練（或長時間 run）後，觀察日誌。若發生 cold start，應出現「MLflow … transient error (attempt 1/4), retry in 30s」等 INFO，其後 log_params / log_metrics 成功；或 warm-up 先觸發冷啟動，後續 provenance 一次成功。
+
+4. **回歸**：可選跑全量 `python -m pytest -q` 與 `ruff check trainer/`、`mypy trainer/` 確認無回歸。
+
+### 下一步建議
+
+- **T13 測試補強（可選）**：依 PLAN T13 Test steps，新增單元測試 — mock MLflow 使第一次呼叫拋 503、第二次成功，驗證 `log_params_safe` / `log_metrics_safe` 重試後成功；可選 mock 連續 503 驗證達最大重試後僅 warning、不 raise。
+- **PLAN 狀態**：可於 `.cursor/plans/PLAN_phase2_p0_p1.md` 將 T13 標為「Step 1–2 Done」。
+- **剩餘項**：Credential folder migration、Scorer lookback §2 等仍依 PLAN 順序進行。
+
+---
+
+## Code Review：T13 MLflow cold-start mitigation 變更（2026-03-19）
+
+**範圍**：`trainer/core/mlflow_utils.py`（T13 重試＋warm_up）、`trainer/training/trainer.py`（warm_up 呼叫點）。依據 PLAN_phase2_p0_p1.md、既有 Credential Code Review §2（warning 不洩路徑）、DECISION_LOG 與 STATUS 脈絡。
+
+以下僅列出**最可能的 bug／邊界條件／安全性／效能問題**，每項附**具體修改建議**與**希望新增的測試**；不重寫整套實作。
+
+---
+
+### 1. [安全性／一致性] 失敗時 log 完整 exception 可能洩漏 tracking URI／主機名
+
+**問題**：`log_params_safe`、`log_tags_safe`、`log_metrics_safe`、`warm_up_mlflow_run_safe` 在達重試上限或非暫時性錯誤時以 `_log.warning("... %s", last_exc)` 記錄。MLflow/requests 的 exception 訊息常含完整 URL（例如 `API request to https://mlflow-server-72672742800.us-central1.run.app/... failed`），與既有 Credential Code Review §2「mlflow warning 僅 log 例外類型不洩路徑」不一致，且可能洩漏內部主機名或環境資訊。
+
+**具體修改建議**：  
+最終失敗時改為只記錄例外類型與簡短原因，不記錄 `str(last_exc)`。例如：  
+`_log.warning("MLflow log_params failed after %d attempts: %s", _MLFLOW_RETRY_MAX_RETRIES + 1, type(last_exc).__name__)`  
+若需區分「暫時性用盡」與「非暫時性」可加一句如 `"(transient)"` / `"(non-transient)"`，或僅在 debug 等級 log 完整訊息。  
+同一原則套用於 `log_tags_safe`、`log_metrics_safe`、`warm_up_mlflow_run_safe` 的對應 warning。
+
+**希望新增的測試**：  
+單元：mock 使 `log_params_safe` 在重試用盡後失敗，capture 該次 warning 的內容，斷言**不**包含 `https://`、`run.app`、`tracking`、`mlflow` 等 URI/主機名字串（或斷言僅包含 `type(e).__name__` 等允許的片段）。
+
+---
+
+### 2. [邊界條件] `_is_transient_mlflow_error` 誤判：訊息含數字 502/503/504 的非 HTTP 錯誤
+
+**問題**：目前以 `str(exc).lower()` 是否含 `"502"`、`"503"`、`"504"`、`"too many 503"` 判定。若未來某例外訊息恰好包含這些數字（例如錯誤代碼 `Error 50342: invalid state`），會被當成暫時性錯誤而重試，最多多等約 3.5 分鐘才失敗。
+
+**具體修改建議**：  
+- 選項 A（保守）：僅在明確為「HTTP 或連線相關」時才重試，例如檢查 `"503" in msg` 時一併要求 `"error" in msg or "response" in msg or "http" in msg` 等，縮小誤判範圍。  
+- 選項 B（維持現狀、文件化）：在 `_is_transient_mlflow_error` 的 docstring 註明「可能對非 HTTP 錯誤誤判為 transient，導致多等數分鐘」，接受此 trade-off。  
+建議先採 B，若日誌中出現不合理重試再考慮 A。
+
+**希望新增的測試**：  
+單元：傳入 `Exception("Error 50342: invalid state")` 至 `_is_transient_mlflow_error`，斷言目前行為（True 或 False）並在 docstring/註解中鎖定為預期；若日後改為 A，再改為斷言 False。
+
+---
+
+### 3. [邊界條件] `log_params_safe` / `log_tags_safe` 收到空 dict
+
+**問題**：`mlflow.log_params({})`、`mlflow.set_tags({})` 在 MLflow 端多為 no-op，但若某版本或後端對空 dict 行為不同（例如拋錯），會進入重試迴圈或直接 warning。
+
+**具體修改建議**：  
+在 `log_params_safe` 開頭加 `if not params: return`；在 `log_tags_safe` 開頭加 `if not tags: return`。可避免無意義的 API 呼叫與重試。
+
+**希望新增的測試**：  
+單元：呼叫 `log_params_safe({})`、`log_tags_safe({})`，在 MLflow 可用且已 start_run 的情況下，mock 確保**未**呼叫 `mlflow.log_params` / `mlflow.set_tags`（或呼叫時參數為空則不計入「實際寫入」的 mock 次數）。
+
+---
+
+### 4. [邊界條件] `warm_up_mlflow_run_safe` 中 `run.info.run_id` 為 None 或無 `info`
+
+**問題**：`run = mlflow.active_run()` 理論上可回傳 run 物件但 `run.info` 或 `run.info.run_id` 異常（例如舊版 API 或損壞狀態），`mlflow.get_run(run.info.run_id)` 可能拋出非 502/503/504 的例外，目前會直接 break 並 log warning，行為合理；但若 exception 訊息中剛好含 "503"，會被當成 transient 而重試，浪費時間。
+
+**具體修改建議**：  
+在呼叫 `mlflow.get_run(run.info.run_id)` 前，檢查 `getattr(run, "info", None) and getattr(run.info, "run_id", None)`；若缺則直接 log warning（例如 "MLflow warm-up skipped: no run_id"）並 return，不進入重試迴圈。
+
+**希望新增的測試**：  
+單元：mock `mlflow.active_run()` 回傳一物件其 `info.run_id` 為 None（或無 `info`），呼叫 `warm_up_mlflow_run_safe()`，斷言未呼叫 `mlflow.get_run`，且有一次 warning 提到 skip 或 no run_id。
+
+---
+
+### 5. [效能／可觀測性] 重試期間無進度 log，長時間 sleep 像卡住
+
+**問題**：重試延遲為 30s、60s、120s，總計可達約 3.5 分鐘。其間僅在「每次重試前」打一筆 INFO，若 logger 未即時 flush 或日誌被過濾，使用者可能以為 process 掛住。
+
+**具體修改建議**：  
+在 `time.sleep(delay_sec)` **之前** 的 INFO 中已包含「retry in Ns」，可視為足夠。若希望更明確，可在 sleep 後加一筆 debug：`_log.debug("MLflow retry sleep finished, attempting again")`。此項為可選，不影響正確性。
+
+**希望新增的測試**：  
+可選：mock 第一次 503、第二次成功，capture log 紀錄，斷言存在至少一筆含 "retry in" 的 INFO（或含 attempt 1/4 等），以鎖定可觀測性。
+
+---
+
+### 6. [Trainer 呼叫順序] warm_up 與 provenance 之間無原子性，run 理論上可被結束
+
+**問題**：在 trainer 中先 `has_active_run()` 再 `warm_up_mlflow_run_safe()`，再 `_log_training_provenance_to_mlflow(...)`。在單一主線程、無手動 end_run 的前提下，run 不會在這之間被結束。若未來改為多線程或在其他路徑呼叫，理論上 run 可能在 warm_up 與 provenance 之間被 end，導致 provenance 時沒有 active run，`_log_training_provenance_to_mlflow` 會改為 `safe_start_run` 再 log（見 T12 設計），行為仍正確，僅多開一筆 run。
+
+**具體修改建議**：  
+維持現狀即可。若希望防呆，可在 `_log_training_provenance_to_mlflow` 開頭註解註明「caller 應在 same run 內呼叫，若無 active run 會自動 start_run」，避免未來改動時誤解。
+
+**希望新增的測試**：  
+整合或單元：在「有 active run → warm_up_mlflow_run_safe → 人為 end_run → _log_training_provenance_to_mlflow」情境下，驗證不會 crash，且 provenance 仍被寫入（可能在新 run 或原 run，依現有 T12 邏輯）；可選，優先度低。
+
+---
+
+### 總結
+
+| # | 類別 | 嚴重度 | 建議 |
+|---|------|--------|------|
+| 1 | 安全性 | 中 | 失敗時不 log 完整 exception，僅 log 類型（與 Credential §2 一致）。 |
+| 2 | 邊界條件 | 低 | 文件化或收緊 `_is_transient_mlflow_error` 條件。 |
+| 3 | 邊界條件 | 低 | `log_params_safe` / `log_tags_safe` 對空 dict 提早 return。 |
+| 4 | 邊界條件 | 低 | `warm_up_mlflow_run_safe` 檢查 `run.info.run_id` 存在再 get_run。 |
+| 5 | 效能/可觀測 | 可選 | 維持現有 INFO，必要時加 debug。 |
+| 6 | Trainer 順序 | 可選 | 註解說明即可。 |
+
+建議優先處理 **#1（安全性／一致性）**，其餘依優先級與測試成本擇期補上；所有「希望新增的測試」均可作為後續 PR 或獨立小改的驗收條件。
+
+---
+
+## T13 Code Review 風險點 → 最小可重現測試（僅 tests，未改 production）（2026-03-19）
+
+**目標**：將上述 Code Review 六項風險點轉成最小可重現測試（或契約／guardrail）；僅新增測試，不修改 production code。
+
+### 新增檔案
+
+- `tests/review_risks/test_review_risks_t13_mlflow_cold_start.py`
+
+### 測試與 Review 項目對應
+
+| 測試 | 對應 | 說明 | 目前狀態 |
+|------|------|------|----------|
+| `test_t13_review1_log_params_failure_warning_must_not_contain_uri_or_hostname` | Review #1 安全性 | 重試用盡後 warning 不得包含 `https://`、`run.app`（Credential §2）。 | `@unittest.expectedFailure`（production 仍 log 完整 exception） |
+| `test_t13_review2_is_transient_mlflow_error_error_50342_locks_current_behavior` | Review #2 邊界 | `_is_transient_mlflow_error(Exception("Error 50342: invalid state"))` 鎖定現狀為 True；若採 option A 改為斷言 False。 | 通過 |
+| `test_t13_review3_log_params_safe_empty_dict_should_not_call_mlflow` | Review #3 邊界 | `log_params_safe({})` 不得呼叫 `mlflow.log_params`。 | `@unittest.expectedFailure`（production 未 early-return） |
+| `test_t13_review3_log_tags_safe_empty_dict_should_not_call_mlflow` | Review #3 邊界 | `log_tags_safe({})` 不得呼叫 `mlflow.set_tags`。 | `@unittest.expectedFailure`（production 未 early-return） |
+| `test_t13_review4_warm_up_mlflow_run_safe_no_run_id_should_not_call_get_run` | Review #4 邊界 | `active_run().info.run_id is None` 時不得呼叫 `mlflow.get_run`。 | `@unittest.expectedFailure`（production 未檢查 run_id） |
+| `test_t13_review4_warm_up_mlflow_run_safe_no_run_id_logs_at_least_one_warning` | Review #4 可觀測 | run_id 為 None 時至少 log 一則 warning、不 crash。 | 通過（有 mock get_run 拋錯） |
+| `test_t13_review5_retry_logs_info_with_retry_in_or_attempt` | Review #5 可觀測 | 發生重試時應有含 "retry" 或 "attempt" 的 INFO。 | 通過（需 mlflow 已安裝） |
+
+（Review #6 為可選整合情境，本輪未新增測試。）
+
+### 執行方式
+
+```bash
+# 僅跑本檔（需已安裝 mlflow 才能跑齊；無 mlflow 時 6 則 importorskip 跳過、1 則通過）
+python -m pytest tests/review_risks/test_review_risks_t13_mlflow_cold_start.py -v --tb=short
+```
+
+**預期結果**（當 `mlflow` 已安裝時）：
+
+- **修補後**（2026-03-19）：**7 passed**（Review #1/#3×2/#4×2/#5 契約已實作，已移除 4 處 `@unittest.expectedFailure`）。
+- **修補前**：3 passed、4 xfailed。
+
+若環境未安裝 `mlflow`：6 則會因 `pytest.importorskip("mlflow")` 而 **skipped**，僅 Review #2 **passed**。
+
+### 後續
+
+- Production 依 Review 修補 #1、#3、#4 後，移除對應測試上的 `@unittest.expectedFailure`，使契約轉為強制通過。
+- 未改 production 前，CI 可維持「1 passed, 4 xfailed, 2 passed」或「1 passed, 6 skipped」（視有無 mlflow）。
+
+---
+
+## T13 Code Review 修補 production + 移除過時 expectedFailure（2026-03-19）
+
+**目標**：依 Code Review #1、#3、#4 修改 production，使 T13 契約測試全數通過；移除已過時之 `@unittest.expectedFailure`。
+
+### 本輪修改（production）
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/core/mlflow_utils.py` | **#1**：`log_params_safe`、`log_tags_safe`、`log_metrics_safe`、`warm_up_mlflow_run_safe` 最終失敗時改為只 log `type(last_exc).__name__` 與 attempt 次數，不 log `str(last_exc)`（符合 Credential §2）。**#3**：`log_params_safe` 開頭加 `if not params: return`；`log_tags_safe` 開頭加 `if not tags: return`。**#4**：`warm_up_mlflow_run_safe` 在呼叫 `get_run` 前檢查 `getattr(run, "info", None)` 與 `getattr(run.info, "run_id", None)`，缺則 log "MLflow warm-up skipped: no run_id" 並 return。 |
+
+### 本輪修改（tests — 僅 decorator 過時）
+
+| 檔案 | 變更 |
+|------|------|
+| `tests/review_risks/test_review_risks_t13_mlflow_cold_start.py` | 移除 4 處已過時之 `@unittest.expectedFailure`（Review #1、#3×2、#4 第一則）。 |
+
+### 驗證結果
+
+```text
+python -m pytest tests/unit/test_mlflow_utils.py tests/review_risks/test_review_risks_t13_mlflow_cold_start.py tests/integration/test_phase2_trainer_mlflow.py tests/review_risks/test_review_risks_phase2_mlflow_trainer.py -v --tb=short
+# 45 passed, 16 skipped, 2 xpassed
+
+python -m mypy trainer/core/mlflow_utils.py trainer/training/trainer.py --ignore-missing-imports
+# Success: no issues found in 2 source files
+
+ruff check trainer/core/mlflow_utils.py trainer/training/trainer.py
+# All checks passed!
+```
+
+**全量 pytest**：`python -m pytest tests/ -q -x` 於本環境於 `tests/integration/test_fast_mode_integration.py` 一則失敗（Step 7 DuckDB/RAM，與 T13/mlflow 變更無關）；與 T13/mlflow 相關之測試全過。
+
+### 下一步建議
+
+- 全量 CI 若仍因 `test_fast_mode_integration` 或其它環境依賴失敗，可單獨排除或於資源足夠環境跑。
+- PLAN 中 T13 可標為「Step 1–2 + Review 修補 Done」。
