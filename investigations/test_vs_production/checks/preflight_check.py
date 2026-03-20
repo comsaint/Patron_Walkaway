@@ -35,6 +35,45 @@ class CheckResult:
     details: Dict[str, Any]
 
 
+def _repo_root_from_script() -> Path:
+    # .../investigations/test_vs_production/checks/preflight_check.py -> repo root
+    return Path(__file__).resolve().parents[3]
+
+
+def _parse_env_line(line: str) -> Optional[Tuple[str, str]]:
+    raw = line.strip()
+    if not raw or raw.startswith("#") or "=" not in raw:
+        return None
+    key, value = raw.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key:
+        return None
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        value = value[1:-1]
+    return key, value
+
+
+def load_env_candidates(paths: Tuple[Path, ...]) -> Dict[str, Any]:
+    loaded: Dict[str, str] = {}
+    used_file: Optional[str] = None
+    for p in paths:
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                parsed = _parse_env_line(line)
+                if parsed is None:
+                    continue
+                k, v = parsed
+                loaded[k] = v
+            used_file = str(p)
+            break
+        except Exception:
+            continue
+    return {"used_file": used_file, "vars": loaded}
+
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -260,6 +299,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Pretty-print JSON output.",
     )
+    parser.add_argument(
+        "--env-file",
+        default="",
+        help="Optional .env file path. If not set, script auto-searches common locations.",
+    )
     return parser.parse_args()
 
 
@@ -269,11 +313,33 @@ def main() -> int:
         print("freshness-minutes must be > 0", file=sys.stderr)
         return 2
 
+    repo_root = _repo_root_from_script()
+    env_candidates = (
+        Path(args.env_file).resolve(),
+    ) if args.env_file.strip() else (
+        Path.cwd() / "credential" / ".env",
+        Path.cwd() / ".env",
+        repo_root / "credential" / ".env",
+        repo_root / ".env",
+    )
+    env_load = load_env_candidates(env_candidates)
+    file_env = env_load["vars"]
+
+    # precedence: CLI arg > process env > loaded env file
+    pl_path = _safe_path(args.prediction_log_db_path) or _safe_path(os.getenv("PREDICTION_LOG_DB_PATH")) or _safe_path(file_env.get("PREDICTION_LOG_DB_PATH"))
+    data_dir = _safe_path(args.data_dir) or _safe_path(os.getenv("DATA_DIR")) or _safe_path(file_env.get("DATA_DIR"))
+
     results = (
-        check_prediction_log(args.prediction_log_db_path, args.freshness_minutes),
-        check_data_dir(args.data_dir),
+        check_prediction_log(pl_path, args.freshness_minutes),
+        check_data_dir(data_dir),
     )
     payload = summarize(results)
+    payload["resolution"] = {
+        "env_file_used": env_load["used_file"],
+        "prediction_log_db_path_effective": pl_path,
+        "data_dir_effective": data_dir,
+        "value_precedence": "cli > process_env > env_file",
+    }
     if args.pretty:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
