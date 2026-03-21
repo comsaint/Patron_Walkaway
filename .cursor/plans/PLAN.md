@@ -1,6 +1,16 @@
 # Plan index
 
-**Current execution plan**: [PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md) (Phase 2 P0–P1).
+## Phase 1（已結案）
+
+Phase 1 訓練／特徵／serving 主線已結案。歷史執行細節、回合紀錄與 gap 分析之完整脈絡見 **[archive/PLAN_phase1.md](archive/PLAN_phase1.md)**。本檔下方「特徵整合計畫」僅保留 **測試契約（R147 等）** 所需之最小摘要。
+
+---
+
+**Current execution plan**: [PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md) (Phase 2 P0–P1)。
+
+**STATUS 日誌**（執行與 code review 流水帳）：見 [STATUS.md](STATUS.md)。較舊之長段已分批移至 [archive/STATUS_archive.md](archive/STATUS_archive.md)（最近一次：**2026-03-22**，Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等區塊）。
+
+---
 
 **Investigation**：Test vs production 性能落差根因與調查步驟見 [INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md](INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md)。
 
@@ -25,7 +35,7 @@
 
 **Phase 2 status**（2026-03-18）：**T0–T10 已完成**（詳見 PLAN_phase2_p0_p1.md § Ordered Tasks 與 Remaining items）。
 
-This file exists so README and review tests (R384, R147) that reference `.cursor/plans/PLAN.md` pass. The 特徵整合計畫 section below is retained for round147 contract (no Step 9+ in that section).
+This file exists so README and review tests (R384, R147) that reference `.cursor/plans/PLAN.md` pass. The **Phase 1（已結案）** 一節與下方 **特徵整合計畫** 摘要並存：後者仍服務 round147 契約（該節不含 Step 9+）。
 
 ---
 

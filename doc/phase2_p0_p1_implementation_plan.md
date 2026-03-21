@@ -29,6 +29,7 @@
 - **Artifact 上傳路徑**：e2-micro 僅 1GB RAM，**artifact 必須由客戶端直傳 GCS**，不經 Tracking Server 記憶體（避免 OOM）。設定 MLflow 的 `--default-artifact-root` 為 GCS，客戶端依 MLflow 回傳的 artifact URI 直接上傳。
 - **部署預測日誌**：Scorer **僅將每筆預測寫入本地 SQLite**（專用 table），不阻塞主路徑、不累積於記憶體。**匯出與上傳**由**獨立程式／排程**負責：週期性（例如每 5–15 分鐘，可依負載調整）自 SQLite 讀取、匯出為壓縮檔（建議 **Parquet 壓縮**如 gzip/snappy，或 gzip CSV 以省頻寬）、上傳至 MLflow run 的 artifact（GCS）。匯出在**獨立 process** 執行，避免 GIL 阻塞 scorer。
 - **Production artifact**：仍為 **deploy 包內完整 artifact 目錄**；runtime 不從 GCS 拉取模型。
+- **Metrics 與 Inputs（lineage）**：`log_metrics_safe` 支援可選 `step`、以及以 `log_input_safe` 記錄訓練資料集 metadata（僅 metadata、不綁整份 DataFrame）；細部約定見 **§9** 與 **`doc/phase2_provenance_schema.md`**。
 
 ### 1.3 Evidently：本地為主、可選 sync 報告到 GCS
 
@@ -70,7 +71,7 @@
 
 | 模組／範圍 | 職責 | Phase 2 變更 |
 |------------|------|----------------------|
-| **trainer**（`run_pipeline`） | 產出 artifact 目錄。 | **擴充**：寫完 artifact 後，將 P0.1 溯源寫入 **MLflow run**（GCP Tracking Server）；需可連 GCP。 |
+| **trainer**（`run_pipeline`） | 產出 artifact 目錄。 | **擴充**：寫完 artifact 後，將 P0.1 溯源寫入 **MLflow run**（GCP Tracking Server）；需可連 GCP。**另**：於 Step 7 等時點以 `log_input_safe` 寫入兩筆訓練資料集 metadata（lineage），與既有 params 並存；見 **§9**。 |
 | **溯源** | 與 model_version 綁定且可查。 | 以 MLflow 為準（GCP）。Phase 2 不實作 sidecar。 |
 
 ### 3.2 部署側（Scorer 與預測日誌匯出）
@@ -108,6 +109,7 @@
 ```
 run_pipeline(args)
   → 產出 artifact 目錄
+  → [Step 7 起、見 §9] 寫入 MLflow Inputs（兩筆資料集 metadata，lineage）
   → 寫入 MLflow run（params/tags：溯源）→ GCP Tracking Server（artifact 存 GCS）
   （需可連 GCP）
 ```
@@ -193,7 +195,7 @@ state.db alerts → validator (ClickHouse) → validation_results
 
 | SSOT 項目 | 本計畫對應 |
 |-----------|------------|
-| P0.1 溯源 | §3.1 寫入 MLflow run（GCP）；§3.3 查詢；Phase 2 不實作 sidecar。 |
+| P0.1 溯源 | §3.1 寫入 MLflow run（GCP）；§3.3 查詢；Phase 2 不實作 sidecar。**另**見 §9（Inputs metadata 與 params 並存）。 |
 | P0.2 特徵與模型版本化 | 同目錄即同版本；rollback = 整包/整目錄；§6。 |
 | P1.1 部署預測日誌 | §3.2 Scorer 寫本地 SQLite；匯出程式週期性匯出並上傳 MLflow（GCP）；離線時保留於 SQLite、恢復後補傳。 |
 | P1.2 告警與 runbook | Phase 2 文件化告警條件與 runbook；傳遞（Slack/email）＝未來。 |
@@ -201,10 +203,73 @@ state.db alerts → validator (ClickHouse) → validation_results
 | P1.4 資料品質 | §3.4 Evidently 本地；可選 sync 報告到 GCS。 |
 | P1.5 Skew 驗證 | §3.4 Evidently（為輔）；同 key 特徵一致。 |
 | P1.6 Drift 調查 | §3.5 調查流程（觸發、假說、檢驗、產出）；正式紀錄存 doc/（markdown）；Evidently + MLflow + validator。 |
+| MLflow metrics `step` 與 Inputs | §9；欄位／鍵名 SSOT：`doc/phase2_provenance_schema.md`。 |
 
 ---
 
-## 9. 待確認與實作備註（Clarifications）
+## 9. MLflow 實作強化：metrics `step` 與訓練資料 lineage（Inputs）
+
+> 本節記錄**已拍板**的實作決策，補充 §1.2／§3.1；與「本文多為架構層」並存時，以本節為 **trainer／mlflow_utils** 行為之依據。  
+> **鍵名、dataset 語意、與 params 並存關係**之細表以 **`doc/phase2_provenance_schema.md`** 為準（實作時須與該檔同步維護）。
+
+### 9.1 Phase A1 — `log_metrics_safe` 加可選 `step`
+
+- **模組**：`trainer/core/mlflow_utils.py`。
+- **簽名**：`log_metrics_safe(metrics, step: Optional[int] = None)`（或等價：僅在 `step is not None` 時傳入 MLflow，以符合執行時 MLflow 版本語意）。
+- **目的**：允許同一 metric 鍵在 UI 呈現**時序曲線**，而非單點覆寫。
+- **相容**：預設 `None` 時行為與現況一致；既有呼叫端無須修改即可上線。
+
+### 9.2 Phase B1 — `log_input_safe`
+
+- **模組**：`trainer/core/mlflow_utils.py`（新建函式）。
+- **失敗策略**：與 **`log_artifact_safe` 一致**——單次 `try`、失敗僅 `warning`、**不 raise**；**不**套用 `log_metrics_safe`／`log_params_safe` 之 502/503/504 重試迴圈。
+- **封裝形狀**：對外只接受 **結構化 `dict`**（必填欄位由 SSOT 定義）及可選參數（例如固定來源字串）；**內部**組裝 MLflow 3.x 之 **Dataset（僅 metadata）**，**不**使用 `PandasDataset`、**不**綁定整份 DataFrame 本體。
+- **守衛**：與既有 helper 一致——追蹤 URI 不可用時 no-op；寫入須在**有效 active run** 內（與 `safe_start_run` 包住之 `run_pipeline` 一致）。
+- **MLflow 版本**：專案以 `requirements.txt` 之 **mlflow==3.10.x** 為準；若 API 微調，以「metadata-only、無資料本體」為不變條件收斂實作。
+
+### 9.3 Phase B2 — `trainer.run_pipeline` 兩筆資料集 metadata
+
+#### 9.3.1 兩筆 Inputs 的語意（皆須記錄）
+
+| 代號 | 語意（SSOT） | 建議區分方式 |
+|------|----------------|--------------|
+| **D1** | **合併後、切分前的 rated 母體**：全部訓練 chunk 依與現有 Step 7 **相同之時間排序鍵**合併並排序完成後、**尚未**套用 train/valid/test 列切分前，**僅 `is_rated == True`** 之列。 | 固定 `dataset` 名稱（或等價 tags），例如 `patron_rated_pre_split`（實際字串以 `phase2_provenance_schema.md` 為準）。 |
+| **D2** | **最終用於訓練的 train 子集**：與 **`train_single_rated_model` 實際使用母體一致**，即 **`train_df` 上 `is_rated == True` 之子集**（非未過濾之整份 `train_df`）。 | 固定名稱，例如 `patron_rated_train_split`。 |
+
+每筆 Input 之 metadata **至少**包含：
+
+- `training_window_start` / `training_window_end`：與 pipeline 已採用之 **`effective_start` / `effective_end`** 一致（ISO 字串）。
+- `row_count`：該資料集之列數。
+- `label_pos_count` / `label_neg_count`：由 **`label` 欄**推算；**正例** = `label == 1`；**負例** = 其餘（含 0 與無法解讀為 1 者，實作細則見 provenance schema）。
+- `label_pos_ratio`：衍生數值（可由前兩項計算，仍寫入 metadata 以利 UI／查詢）。
+
+#### 9.3.2 插入時機（「越早越好」——分兩次解讀）
+
+- **D1**：於 **Step 7**，在**排序完成後、套用 train/valid/test 切分前**之最早可行點寫入。
+- **D2**：於 **`train_df` 已就緒**（或從 train parquet 讀回之同等物件）、**Step 9 訓練開始前**之最早可行點寫入。
+
+**多路徑要求**：Step 7 存在 **DuckDB／記憶體 pandas／train 僅在 parquet 上**等分支；實作須保證**每一分支**皆能在**相同語意**下產出 D1／D2 之統計（必要時對 chunk 或 train parquet 做 **僅 aggregate 之查詢**，避免為 logging 載入全表）。
+
+**與 T13**：兩筆 `log_input` 建議置於 **`warm_up_mlflow_run_safe` 之後**（若該呼叫存在於成功路徑），與其餘 MLflow 寫入同一策略，以降低冷啟失敗率。
+
+#### 9.3.3 與既有 P0.1 provenance（params）之關係
+
+- **`_log_training_provenance_to_mlflow` 所寫入之 params**（含 `training_window_start` / `training_window_end` 等）**維持不變**。
+- B2 為 **additive**：**並存**於同一 run，**不**以 Inputs 取代 params。
+
+#### 9.3.4 資料來源敘述（`data_source`）
+
+- 使用**單一固定字串**（常數），**不**每次 run 寫入 ClickHouse URL、本機絕對路徑等環境相依識別（避免外洩與難以跨機比對）。
+- 具體字串值定於 **`doc/phase2_provenance_schema.md`**。
+
+### 9.4 測試與驗收（建議）
+
+- **單元**：`log_input_safe` 在 URI 不可用或 MLflow 拋錯時不 raise；成功路徑可 mock `mlflow.log_input`。
+- **契約／整合**：`run_pipeline` 在具 active run 時，對兩筆資料集各呼叫一次 `log_input_safe`（或等價），名稱與 context 符合 SSOT（可 mock，無需真連 tracking server）。
+
+---
+
+## 10. 待確認與實作備註（Clarifications）
 
 以下為實作時需再釐清或決策的點，請依實際環境確認：
 
