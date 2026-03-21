@@ -23,9 +23,10 @@ _EXPECTED_PRECISION_AT_RECALL_KEYS_BACKTESTER = frozenset(
     | {f"alerts_per_minute_at_recall_{r}" for r in _RECALL_STRINGS}
 )
 
-# Trainer test metrics: same + n_alerts (for contract / type tests).
+# Trainer test metrics: same + n_alerts + prod_adjusted precision@recall (for contract / type tests).
 _EXPECTED_PRECISION_AT_RECALL_KEYS_TRAINER = _EXPECTED_PRECISION_AT_RECALL_KEYS_BACKTESTER | frozenset(
     {f"n_alerts_at_recall_{r}" for r in _RECALL_STRINGS}
+    | {f"test_precision_at_recall_{r}_prod_adjusted" for r in _RECALL_STRINGS}
 )
 
 
@@ -131,6 +132,11 @@ class TestR398_4_MetricsValueTypes(unittest.TestCase):
             self.assertTrue(
                 v is None or isinstance(v, (int, np.integer)),
                 f"n_alerts_at_recall_{r} must be int or None, got {type(v)}.",
+            )
+            v = out.get(f"test_precision_at_recall_{r}_prod_adjusted")
+            self.assertTrue(
+                v is None or isinstance(v, (float, np.floating)),
+                f"test_precision_at_recall_{r}_prod_adjusted must be float or None, got {type(v)}.",
             )
 
 

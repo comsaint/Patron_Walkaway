@@ -2941,6 +2941,77 @@ def _train_one_model(
     return model, metrics
 
 
+def _precision_prod_adjusted(
+    prec: Optional[float],
+    *,
+    production_neg_pos_ratio: Optional[float],
+    test_neg_pos_ratio: Optional[float],
+) -> Optional[float]:
+    """Rescale raw precision for assumed production neg/pos ratio (test_precision_prod_adjusted formula).
+
+    Returns None when inputs are missing, non-finite, out of range, or when the closed form
+    would yield a non-finite or out-of-[0,1] value (JSON-safe contract).
+    """
+    if prec is None:
+        return None
+    p = float(prec)
+    if not math.isfinite(p) or p <= 0.0:
+        return None
+    if p > 1.0 + 1e-9:
+        return None
+    if p > 1.0:
+        p = 1.0
+    if production_neg_pos_ratio is None or test_neg_pos_ratio is None:
+        return None
+    pn = float(production_neg_pos_ratio)
+    tn = float(test_neg_pos_ratio)
+    if not math.isfinite(pn) or not math.isfinite(tn) or pn <= 0.0 or tn <= 0.0:
+        return None
+    scaling = pn / tn
+    if not math.isfinite(scaling):
+        return None
+    inv_p = 1.0 / p
+    if not math.isfinite(inv_p):
+        return None
+    term = (inv_p - 1.0) * scaling
+    if not math.isfinite(term):
+        return None
+    denom = 1.0 + term
+    if not math.isfinite(denom) or denom <= 0.0:
+        return None
+    adj = 1.0 / denom
+    if not math.isfinite(adj):
+        return None
+    if adj < -1e-9 or adj > 1.0 + 1e-9:
+        return None
+    if adj < 0.0:
+        return 0.0
+    if adj > 1.0:
+        return 1.0
+    return float(adj)
+
+
+def _warn_if_invalid_production_neg_pos_ratio(ratio: Optional[float]) -> None:
+    """Log one warning when production neg/pos ratio cannot be used for prod_adjusted fields."""
+    if ratio is None:
+        return
+    try:
+        r = float(ratio)
+    except (TypeError, ValueError):
+        logger.warning(
+            "PRODUCTION_NEG_POS_RATIO=%r is invalid (must be finite and > 0); "
+            "all prod_adjusted test precision fields (including precision@recall *_prod_adjusted) will be None.",
+            ratio,
+        )
+        return
+    if not math.isfinite(r) or r <= 0.0:
+        logger.warning(
+            "PRODUCTION_NEG_POS_RATIO=%r is invalid (must be finite and > 0); "
+            "all prod_adjusted test precision fields (including precision@recall *_prod_adjusted) will be None.",
+            ratio,
+        )
+
+
 def _compute_test_metrics(
     model: Union[lgb.LGBMClassifier, "_BoosterWrapper"],
     threshold: float,
@@ -2968,6 +3039,8 @@ def _compute_test_metrics(
     - test_precision_prod_adjusted: test_precision rescaled to the assumed production
       neg/pos ratio (production_neg_pos_ratio). Only computed when
       production_neg_pos_ratio is not None and > 0.
+    - test_precision_at_recall_{r}_prod_adjusted: same closed-form rescaling applied to each
+      test_precision_at_recall_{r} (approximation at that PR operating point; None when not JSON-safe).
     """
     _TARGET_RECALLS = (0.001, 0.01, 0.1, 0.5)  # DEC-026
     _zeroed_recall_keys: dict = {
@@ -2977,6 +3050,7 @@ def _compute_test_metrics(
         _zeroed_recall_keys[f"threshold_at_recall_{r}"] = None
         _zeroed_recall_keys[f"n_alerts_at_recall_{r}"] = None
         _zeroed_recall_keys[f"alerts_per_minute_at_recall_{r}"] = None
+        _zeroed_recall_keys[f"test_precision_at_recall_{r}_prod_adjusted"] = None
 
     # R1100: guard against all-positive labels (average_precision_score = 1.0 trivially)
     _has_test = (
@@ -3014,6 +3088,28 @@ def _compute_test_metrics(
         }
 
     test_scores = model.predict_proba(X_test)[:, 1]
+    if not np.isfinite(test_scores).all():
+        logger.warning(
+            "%s: test predict_proba scores contain non-finite values — test metrics will be zero.",
+            label or "model",
+        )
+        n_te = int(len(y_test))
+        n_te_pos = int(y_test.sum()) if not y_test.empty else 0
+        return {
+            "test_ap": 0.0,
+            "test_precision": 0.0,
+            "test_recall": 0.0,
+            "test_f1": 0.0,
+            "test_samples": n_te,
+            "test_positives": n_te_pos,
+            "test_random_ap": (n_te_pos / n_te) if n_te > 0 else 0.0,
+            "test_threshold_uncalibrated": _uncalibrated,
+            **_zeroed_recall_keys,
+            "test_precision_prod_adjusted": None,
+            "test_neg_pos_ratio": None,
+            "production_neg_pos_ratio_assumed": production_neg_pos_ratio,
+        }
+
     prauc = float(average_precision_score(y_test, test_scores))
     preds = (test_scores >= threshold).astype(int)
     # R1105: use .values to prevent pandas index misalignment with numpy preds array
@@ -3028,6 +3124,7 @@ def _compute_test_metrics(
     n_te_pos = int(y_test.sum())
     n_te_neg = int((y_test == 0).sum())
     test_random_ap = (n_te_pos / n_te) if n_te > 0 else 0.0
+    test_neg_pos_ratio: Optional[float] = (n_te_neg / n_te_pos) if n_te_pos > 0 else None
 
     # --- Precision at fixed recall levels (threshold-free, from PR curve) ---
     # For each target recall R, find the maximum precision among all PR-curve
@@ -3054,28 +3151,25 @@ def _compute_test_metrics(
             precision_at_recall[f"n_alerts_at_recall_{r}"] = None
             precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
 
+    for r in _TARGET_RECALLS:
+        _raw_par = precision_at_recall.get(f"test_precision_at_recall_{r}")
+        precision_at_recall[f"test_precision_at_recall_{r}_prod_adjusted"] = _precision_prod_adjusted(
+            float(_raw_par) if _raw_par is not None else None,
+            production_neg_pos_ratio=production_neg_pos_ratio,
+            test_neg_pos_ratio=test_neg_pos_ratio,
+        )
+
     # --- Production-prior adjusted precision ---
     # Rescales test precision to the expected production neg/pos ratio using the
     # Bayes-consistent approximation: 1/P - 1 scales linearly with neg/pos ratio.
     # Only meaningful when negatives were downsampled (neg_sample_frac < 1.0) and
     # production_neg_pos_ratio is provided.
-    test_neg_pos_ratio: Optional[float] = (n_te_neg / n_te_pos) if n_te_pos > 0 else None
-    test_precision_prod_adjusted: Optional[float] = None
-    if (
-        prec > 0.0
-        and production_neg_pos_ratio is not None
-        and production_neg_pos_ratio > 0.0
-        and test_neg_pos_ratio is not None
-        and test_neg_pos_ratio > 0.0
-    ):
-        scaling = production_neg_pos_ratio / test_neg_pos_ratio
-        test_precision_prod_adjusted = 1.0 / (1.0 + (1.0 / prec - 1.0) * scaling)
-    elif production_neg_pos_ratio is not None and production_neg_pos_ratio <= 0.0:
-        logger.warning(
-            "PRODUCTION_NEG_POS_RATIO=%.4f is invalid (must be > 0); "
-            "test_precision_prod_adjusted will be None.",
-            production_neg_pos_ratio,
-        )
+    test_precision_prod_adjusted = _precision_prod_adjusted(
+        prec,
+        production_neg_pos_ratio=production_neg_pos_ratio,
+        test_neg_pos_ratio=test_neg_pos_ratio,
+    )
+    _warn_if_invalid_production_neg_pos_ratio(production_neg_pos_ratio)
 
     if log_results:
         _adj_str = (
@@ -3138,6 +3232,7 @@ def _compute_test_metrics_from_scores(
         _zeroed_recall_keys[f"threshold_at_recall_{r}"] = None
         _zeroed_recall_keys[f"n_alerts_at_recall_{r}"] = None
         _zeroed_recall_keys[f"alerts_per_minute_at_recall_{r}"] = None
+        _zeroed_recall_keys[f"test_precision_at_recall_{r}_prod_adjusted"] = None
     y_arr = np.asarray(y_test).reshape(-1)
     scores_arr = np.asarray(test_scores).reshape(-1)
     if len(y_arr) != len(scores_arr):
@@ -3147,6 +3242,7 @@ def _compute_test_metrics_from_scores(
     n_te = int(len(y_arr))
     n_te_pos = int(np.nansum(y_arr))
     n_te_neg = int(np.sum(np.asarray(y_arr == 0, dtype=float)))
+    test_neg_pos_ratio: Optional[float] = (n_te_neg / n_te_pos) if n_te_pos > 0 else None
     _has_test = (
         n_te >= MIN_VALID_TEST_ROWS
         and int(np.isnan(y_arr).sum()) == 0
@@ -3157,6 +3253,25 @@ def _compute_test_metrics_from_scores(
         logger.warning(
             "%s: test from file too small or unbalanced (%d rows, %d pos, %d neg) — test metrics zero.",
             label or "model", n_te, n_te_pos, n_te_neg,
+        )
+        return {
+            "test_ap": 0.0,
+            "test_precision": 0.0,
+            "test_recall": 0.0,
+            "test_f1": 0.0,
+            "test_samples": n_te,
+            "test_positives": n_te_pos,
+            "test_random_ap": (n_te_pos / n_te) if n_te > 0 else 0.0,
+            "test_threshold_uncalibrated": _uncalibrated,
+            **_zeroed_recall_keys,
+            "test_precision_prod_adjusted": None,
+            "test_neg_pos_ratio": None,
+            "production_neg_pos_ratio_assumed": production_neg_pos_ratio,
+        }
+    if not np.isfinite(scores_arr).all():
+        logger.warning(
+            "%s: test scores (from file) contain non-finite values — test metrics will be zero.",
+            label or "model",
         )
         return {
             "test_ap": 0.0,
@@ -3202,17 +3317,19 @@ def _compute_test_metrics_from_scores(
             precision_at_recall[f"threshold_at_recall_{r}"] = None
             precision_at_recall[f"n_alerts_at_recall_{r}"] = None
             precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
-    test_neg_pos_ratio = (n_te_neg / n_te_pos) if n_te_pos > 0 else None
-    test_precision_prod_adjusted = None
-    if (
-        prec > 0.0
-        and production_neg_pos_ratio is not None
-        and production_neg_pos_ratio > 0.0
-        and test_neg_pos_ratio is not None
-        and test_neg_pos_ratio > 0.0
-    ):
-        scaling = production_neg_pos_ratio / test_neg_pos_ratio
-        test_precision_prod_adjusted = 1.0 / (1.0 + (1.0 / prec - 1.0) * scaling)
+    for r in _TARGET_RECALLS:
+        _raw_par = precision_at_recall.get(f"test_precision_at_recall_{r}")
+        precision_at_recall[f"test_precision_at_recall_{r}_prod_adjusted"] = _precision_prod_adjusted(
+            float(_raw_par) if _raw_par is not None else None,
+            production_neg_pos_ratio=production_neg_pos_ratio,
+            test_neg_pos_ratio=test_neg_pos_ratio,
+        )
+    test_precision_prod_adjusted = _precision_prod_adjusted(
+        prec,
+        production_neg_pos_ratio=production_neg_pos_ratio,
+        test_neg_pos_ratio=test_neg_pos_ratio,
+    )
+    _warn_if_invalid_production_neg_pos_ratio(production_neg_pos_ratio)
     if log_results:
         _adj_str = f"  prec_prod_adj={test_precision_prod_adjusted:.4f}" if test_precision_prod_adjusted is not None else ""
         logger.info(

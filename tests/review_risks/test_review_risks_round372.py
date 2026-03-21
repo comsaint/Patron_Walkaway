@@ -72,6 +72,10 @@ class TestR372ReviewerRiskGuards(unittest.TestCase):
             mask = r_arr >= r
             expected = float(p_arr[mask].max()) if mask.any() else None
             self.assertAlmostEqual(out[f"test_precision_at_recall_{r}"], expected)
+            self.assertIsNone(
+                out[f"test_precision_at_recall_{r}_prod_adjusted"],
+                "production_neg_pos_ratio=None → no prod_adjusted columns",
+            )
 
     def test_precision_at_recall_all_positive_returns_none_keys(self):
         """R372-2: all-positive test split uses early-return and None precision@recall."""
@@ -86,6 +90,8 @@ class TestR372ReviewerRiskGuards(unittest.TestCase):
         self.assertIsNone(out["test_precision_at_recall_0.01"])
         self.assertIsNone(out["test_precision_at_recall_0.1"])
         self.assertIsNone(out["test_precision_at_recall_0.5"])
+        for r in (0.001, 0.01, 0.1, 0.5):
+            self.assertIsNone(out[f"test_precision_at_recall_{r}_prod_adjusted"])
 
     def test_precision_at_recall_too_few_rows_returns_none_keys(self):
         """R372-3: small test split (< MIN_VALID_TEST_ROWS) returns None precision@recall."""
@@ -101,6 +107,8 @@ class TestR372ReviewerRiskGuards(unittest.TestCase):
         self.assertIsNone(out["test_precision_at_recall_0.01"])
         self.assertIsNone(out["test_precision_at_recall_0.1"])
         self.assertIsNone(out["test_precision_at_recall_0.5"])
+        for r in (0.001, 0.01, 0.1, 0.5):
+            self.assertIsNone(out[f"test_precision_at_recall_{r}_prod_adjusted"])
 
     def test_prod_adjusted_basic_formula(self):
         """R372-4: adjusted precision follows the documented closed-form formula."""
@@ -119,6 +127,15 @@ class TestR372ReviewerRiskGuards(unittest.TestCase):
         self.assertAlmostEqual(out["test_precision"], 0.5)
         self.assertAlmostEqual(out["test_neg_pos_ratio"], 1.0)
         self.assertAlmostEqual(out["test_precision_prod_adjusted"], 1.0 / 16.0)
+        scaling = 15.0
+        for r in (0.001, 0.01, 0.1, 0.5):
+            raw = out[f"test_precision_at_recall_{r}"]
+            adj = out[f"test_precision_at_recall_{r}_prod_adjusted"]
+            if raw is not None and raw > 0.0:
+                exp = 1.0 / (1.0 + (1.0 / raw - 1.0) * scaling)
+                self.assertAlmostEqual(adj, exp, places=6, msg=f"r={r}")
+            else:
+                self.assertIsNone(adj, msg=f"r={r}")
 
     def test_prod_adjusted_none_when_ratio_not_set(self):
         """R372-5: ratio=None disables adjusted precision."""
@@ -129,6 +146,8 @@ class TestR372ReviewerRiskGuards(unittest.TestCase):
             _FixedScoreModel(scores), 0.5, x, y_s, log_results=False, production_neg_pos_ratio=None
         )
         self.assertIsNone(out["test_precision_prod_adjusted"])
+        for r in (0.001, 0.01, 0.1, 0.5):
+            self.assertIsNone(out[f"test_precision_at_recall_{r}_prod_adjusted"])
 
     def test_prod_adjusted_none_when_ratio_zero_and_logs_warning(self):
         """R372-6: ratio=0 is invalid and should warn + return None."""
@@ -140,6 +159,8 @@ class TestR372ReviewerRiskGuards(unittest.TestCase):
                 _FixedScoreModel(scores), 0.5, x, y_s, log_results=False, production_neg_pos_ratio=0.0
             )
         self.assertIsNone(out["test_precision_prod_adjusted"])
+        for r in (0.001, 0.01, 0.1, 0.5):
+            self.assertIsNone(out[f"test_precision_at_recall_{r}_prod_adjusted"])
         self.assertTrue(any("invalid" in m.lower() for m in cm.output))
 
     def test_prod_adjusted_none_when_ratio_negative_and_logs_warning(self):
@@ -152,6 +173,8 @@ class TestR372ReviewerRiskGuards(unittest.TestCase):
                 _FixedScoreModel(scores), 0.5, x, y_s, log_results=False, production_neg_pos_ratio=-5.0
             )
         self.assertIsNone(out["test_precision_prod_adjusted"])
+        for r in (0.001, 0.01, 0.1, 0.5):
+            self.assertIsNone(out[f"test_precision_at_recall_{r}_prod_adjusted"])
         self.assertTrue(any("invalid" in m.lower() for m in cm.output))
 
     def test_prod_adjusted_prec_one_stays_one(self):
@@ -164,6 +187,11 @@ class TestR372ReviewerRiskGuards(unittest.TestCase):
         )
         self.assertAlmostEqual(out["test_precision"], 1.0)
         self.assertAlmostEqual(out["test_precision_prod_adjusted"], 1.0)
+        for r in (0.001, 0.01, 0.1, 0.5):
+            raw = out[f"test_precision_at_recall_{r}"]
+            adj = out[f"test_precision_at_recall_{r}_prod_adjusted"]
+            if raw is not None and raw >= 1.0 - 1e-9:
+                self.assertAlmostEqual(adj, 1.0, msg=f"r={r}")
 
     def test_prod_adjusted_prec_zero_stays_none(self):
         """R372-9: no predicted positives => precision=0 and adjusted precision stays None."""

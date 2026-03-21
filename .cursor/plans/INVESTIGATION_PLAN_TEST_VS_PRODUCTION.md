@@ -263,6 +263,8 @@ Trainer 在 **沒有 validation set** 時會使用 **threshold=0.5** fallback，
 
 ## 6. 專屬調查工作區（Investigation Workspace）
 
+**離線補強（無 ClickHouse）**：若僅有本地 Parquet，可依 **`OFFLINE_HOLDOUT_INVESTIGATION_PLAN.md`** 執行 train_cutoff ＋後續區間 holdout，補 R5／R7 等離線證據（**不**替代 R4／R9 之 production 對拍）。
+
 為避免跨機器（非 production vs production）與跨輪調查造成證據分散，本計畫新增專屬工作區：
 
 - 路徑：`investigations/test_vs_production/`

@@ -6,6 +6,239 @@
 
 ---
 
+## Training metrics：`test_precision_at_recall_*` 之 production prior 調整（raw + prod_adjusted）
+
+**Date**: 2026-03-21
+
+### 目標
+在 held-out test 上，除既有 **`test_precision`（raw）** 與 **`test_precision_prod_adjusted`**（validation 閾值下之調整 precision）外，讓每個 **precision@recall** 水準（0.001 / 0.01 / 0.1 / 0.5）同時產出 **raw** 與 **假設 production 負正比下之調整值**，便於與 subsampling 後之 test 分佈對照解讀。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/training/trainer.py` | 新增 **`_precision_prod_adjusted`**：與 `test_precision_prod_adjusted` 相同閉式公式（`1/(1+(1/p-1)*scaling)`，`scaling = production_neg_pos_ratio / test_neg_pos_ratio`）。**`_compute_test_metrics`** 與 **`_compute_test_metrics_from_scores`** 在算出各 `test_precision_at_recall_{r}` 後，寫入 **`test_precision_at_recall_{r}_prod_adjusted`**；test 過小／不平衡 early return 與 zeroed recall 鍵一併含四個 `*_prod_adjusted`（值為 `null`）。`test_precision_prod_adjusted` 改為呼叫同一 helper。 |
+| `tests/review_risks/test_review_risks_round220_plan_b_plus_stage6_step3.py` | **`_EXPECTED_TEST_METRICS_KEYS`** 納入四個 `test_precision_at_recall_*_prod_adjusted`（與 `_compute_test_metrics` / `_compute_test_metrics_from_scores` 鍵契約一致）。 |
+| `tests/review_risks/test_review_risks_round398.py` | Trainer precision@recall 契約鍵集與型別檢查含 **`test_precision_at_recall_{r}_prod_adjusted`**。 |
+| `tests/review_risks/test_review_risks_round372.py` | 補上 `production_neg_pos_ratio=None`、全正／樣本過少、公式與無效 ratio 等情境對新欄位之斷言。 |
+
+### 契約說明（鍵名）
+
+- **Raw**：`test_precision_at_recall_0.001`、`0.01`、`0.1`、`0.5`（不變）。
+- **Adjusted**：`test_precision_at_recall_0.001_prod_adjusted`、…、`0.5_prod_adjusted`；語意與 `test_precision_prod_adjusted` 相同，僅套用於 PR 曲線上該 recall 水準之最佳 precision 點。
+- 未設定有效 `production_neg_pos_ratio`、raw precision 為 0、或該 recall 無可行點時，對應 **`*_prod_adjusted` 為 `None`（JSON `null`）**。
+- **`alerts_per_minute_at_recall_*`** 未改動（trainer 路徑仍無 test 窗長，維持 `null`）。
+
+### 驗證
+
+- `python -m pytest tests/review_risks/test_review_risks_round372.py tests/review_risks/test_review_risks_round220_plan_b_plus_stage6_step3.py tests/review_risks/test_review_risks_round398.py tests/review_risks/test_review_risks_round230.py -q` → **33 passed**。
+
+### 後續
+
+- 重新訓練並寫出 artifact 後，`training_metrics.json` 內 **`rated`（或等同 metrics 巢狀）** 會帶入新鍵；既有已部署之 `training_metrics.json` 需重訓才會更新。
+
+---
+
+### Code Review：`test_precision_at_recall_*_prod_adjusted` 變更 — 高可靠性標準
+
+**Date**: 2026-03-21  
+**範圍**：`trainer/training/trainer.py` 之 **`_precision_prod_adjusted`**、**`_compute_test_metrics`**、**`_compute_test_metrics_from_scores`** 與相關 tests（R220／R372／R398）；不重寫整套，僅列潛在問題與可驗證補強。
+
+---
+
+#### 1. `prec` 為 NaN／inf 或非有限值時可能穿透公式（bug／JSON 契約）
+
+**問題**：`_precision_prod_adjusted` 僅排除 `None` 與 `prec <= 0.0`。對 **`float("nan")`**，`prec <= 0.0` 為 **False**，會繼續計算並得到 **NaN**；寫入 `training_metrics.json` 時 **`json.dump` 可能拋錯**或產出非標準 JSON（視 Python 版本／設定）。**`inf`** 同理可能產生非有限調整值。來源理論上為 sklearn PR 曲線與 `float(...)`，正常路徑少見，但 **分數含 NaN、極端溢出或未來改動** 時會成為硬故障點。
+
+**具體修改建議**：在 **`_precision_prod_adjusted` 開頭**（或回傳前）統一檢查：若 `prec` 非有限或不在合理區間則回傳 `None`，例如 `math.isfinite(prec)` 且 **`0.0 < prec <= 1.0`**（若擔心浮點誤差可允許 `prec <= 1.0 + 1e-9` 並 clamp）；對最終調整值 **`adj`** 再 assert **`math.isfinite(adj)`**，否則回傳 `None` 並可選 **debug-level log**。
+
+**希望新增的測試**：  
+- 單元測試：`_precision_prod_adjusted(float("nan"), ...)`、`_precision_prod_adjusted(float("inf"), ...)`、負數、`prec > 1.0`（若採嚴格區間）皆回傳 `None`。  
+- 整合測試（可選）：對 `_compute_test_metrics_from_scores` 餵入含 **NaN score** 且仍走進「有效 test」之路徑時，斷言產出之 **所有 `*_prod_adjusted` 與 `test_precision_prod_adjusted` 均為 `None` 或可 JSON 序列化**（`json.dumps` 不拋錯）。
+
+---
+
+#### 2. 極小 raw precision 與極大 `scaling` 的數值溢出／飽和（邊界條件）
+
+**問題**：公式中 **`(1.0 / prec - 1.0) * scaling`** 在 **prec 極小** 且 **production／test 負正比差距極大** 時可能 **overflow → inf**，則 **`1.0 / (1.0 + inf) == 0.0`**，呈現為「調整後 precision 為 0」而非 **`None`／明確標記不可信**，易造成 **誤讀**（與「無法計算」不同）。
+
+**具體修改建議**：計算中間量 **`term = (1.0 / prec - 1.0) * scaling`** 與 **`adj`** 後，若 **`not math.isfinite(term)` 或 not `math.isfinite(adj)`** 或 **`adj < 0` 或 `adj > 1`**（加容差），回傳 **`None`**；可選 **warning** 附 `prec`、`scaling` 數量級（避免 log 過長僅記 order of magnitude）。
+
+**希望新增的測試**：  
+- 以 **可控的極端參數** 呼叫 `_precision_prod_adjusted`（例如極小 `prec`、極大 `production_neg_pos_ratio`），斷言回傳 **`None` 或有限且在 [0,1]**（與產品決策一致後寫死契約）。  
+- 迴歸：與 **`test_prod_adjusted_basic_formula`** 同風格，增加一筆「正常範圍」對照，確保防呆未破壞常規數值。
+
+---
+
+#### 3. 方法論：對 PR 曲線操作點套用與閾值 precision **相同**的先驗縮放（決策／溝通風險）
+
+**問題**：**`test_precision_at_recall_*_prod_adjusted`** 與 **`test_precision_prod_adjusted`** 共用 **同一閉式**，假設 **`(1/p - 1)` 與 neg/pos 比線性可換算**。此假設在 **單一閾值下之 precision** 較直觀；在 **不同 recall 約束下選出的操作點** 上，**FP／TP 結構不同**，嚴格而言 **僅為近似**，可能被報表或決策誤讀為「與線上完全可比之校準 precision」。
+
+**具體修改建議**：在 **`_compute_test_metrics` docstring**、**`STATUS`／`DECISION_LOG` 或 `INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md`** 明確標註 **「與 `test_precision_prod_adjusted` 同公式之近似；非分數校準或完整 prior-shift 推導」**；若對外有 **model／metrics 契約文件**，新增鍵說明與 **禁止事項**（例如不可直接與未調整之線上 precision 畫等號而不看分佈）。
+
+**希望新增的測試**：**文件契約測試**（與既有 `test_training_metrics_json_has_production_ratio_key` 同風格）：`inspect.getsource(_compute_test_metrics)` 或獨立 **`METRICS_CONTRACT.md`** 被 assert 含關鍵字樣 **「approximation」／「approx」／「近似」** 之一（依團隊用語選定），避免語意漂移。
+
+---
+
+#### 4. `_compute_test_metrics` 與 `_compute_test_metrics_from_scores` 對 **無效 `production_neg_pos_ratio`** 的 **warning 不一致**（維運／可觀測性）
+
+**問題**：僅 **`_compute_test_metrics`** 在 **`production_neg_pos_ratio <= 0`** 時 **`logger.warning`**；**`_compute_test_metrics_from_scores`** 路徑 **靜默**回傳 `None`（與調整前相同，但現在同時影響 **五個 adjusted 欄位**）。排錯時若僅看 **「test from file」** log，可能 **漏掉設定錯誤**。
+
+**具體修改建議**：在 **`_compute_test_metrics_from_scores`** 於計算 **`test_precision_prod_adjusted`** 之後，對 **`production_neg_pos_ratio is not None and production_neg_pos_ratio <= 0`** 補上與另一路徑 **相同或子字串一致** 的 **warning**（可共用常數訊息模板）。
+
+**希望新增的測試**：**`assertLogs("trainer", level="WARNING")`**：`production_neg_pos_ratio=0.0` 且有效 test 資料呼叫 **`_compute_test_metrics_from_scores`**，斷言 log 含 **`invalid`** 或與現有 **`_compute_test_metrics`** 相同關鍵句。
+
+---
+
+#### 5. Warning 文案仍只寫 **`test_precision_prod_adjusted`**（維運）
+
+**問題**：訊息 **「test_precision_prod_adjusted will be None」** 未提及 **`test_precision_at_recall_*_prod_adjusted`**，運維可能以為僅主 precision 受影響。
+
+**具體修改建議**：改為 **「… adjusted precision keys (including precision@recall *_prod_adjusted) will be None」** 或簡短 **「all prod_adjusted test precision fields」**。
+
+**希望新增的測試**：在 **R372-6／R372-7** 之 `assertLogs` 中增加 **`assertIn("prod_adjusted", ...)`** 或對完整訊息做 **子字串比對**（與修改後文案對齊）。
+
+---
+
+#### 6. 下游 schema／儀表板嚴格鍵集合（整合風險）
+
+**問題**：新增四鍵後，若某處以 **封閉 allow-list** 驗證 `training_metrics.json`，可能 **失敗或靜默丟棄**；若儀表板寫死欄位，新欄位 **不會顯示**（功能上非 bug，但與「關鍵決策」可視性有關）。
+
+**具體修改建議**：盤點 **R1/R6 baseline、`run_r1_r6_analysis`、MLflow log、內部儀表**；在 **allow-list** 或 **文件** 中納入 **`test_precision_at_recall_*_prod_adjusted`**；**MLflow** 若需跨 run 比較，可選 **顯式 `log_metric`** 四個 recall 之 adjusted（避免只存在 JSON artifact）。
+
+**希望新增的測試**：若專案有 **「artifact JSON schema」或「鍵集合」測試**，擴充預期鍵；否則在 **investigations** 或 **review_risks** 加一則 **grep／集合包含** 測試，鎖定 **`save_artifact_bundle` 寫出之 `rated` metrics** 含新鍵（與 R220 契約互補）。
+
+---
+
+#### 7. 效能
+
+**結論**：每筆 test 僅多 **常數次**（約 5 次）helper 呼叫與 **一輪四鍵**賦值，相對於 **`predict_proba`／PR 曲線** 可忽略；**無 O(n) 額外負擔**。無需為效能單獨加測試。
+
+---
+
+#### 8. 安全性
+
+**結論**：新邏輯 **未引入** 新外部輸入路徑；**`production_neg_pos_ratio`** 仍為既有 config／呼叫端數值。日誌僅既有 **warning** 可能帶入該 **float**，**無 PII**。若未來 log **完整 metrics dict**，需注意 **artifact 路徑** 不寫入 log（屬既有慣例延續）。無需額外安全測試。
+
+---
+
+#### Review 總結
+
+| 項目 | 嚴重度 | 類型 |
+|------|--------|------|
+| NaN／inf／非有限 `prec` 或結果 | 中～高（遇則可能 JSON 失敗） | bug／契約 |
+| 極端 prec／scaling 溢出與 0.0 飽和 | 中 | 邊界條件／誤讀 |
+| 先驗縮放語意（PR 操作點） | 中（決策面） | 方法論／文件 |
+| `from_scores` 無效 ratio 不 warn | 低～中 | 可觀測性 |
+| Warning 文案未涵蓋新鍵 | 低 | 維運 |
+| 下游 allow-list／儀表／MLflow | 低～中（依部署） | 整合 |
+
+**建議優先序**：**§1（有限性與 JSON 安全）** → **§2（極端數值）** → **§3（文件與決策語意）**；**§4–§6** 依實際觀測與發版流程排程。
+
+---
+
+### Code Review（第二輪補遺）：`test_precision_at_recall_*_prod_adjusted` — 高可靠性標準
+
+**Date**: 2026-03-21  
+**說明**：承接上一段 **§1–§8**（實作尚未依該段全面修補前之再審）；本輪補充 **額外邊界與測試脆弱度**，不重複已寫死之建議全文。
+
+---
+
+#### 9. `production_neg_pos_ratio`（或理論上 `test_neg_pos_ratio`）為 **NaN** 時會繞過 `<= 0` 檢查（bug）
+
+**問題**：`_precision_prod_adjusted` 以 **`production_neg_pos_ratio <= 0.0`** 判斷無效。對 **`float("nan")`**，**`nan <= 0.0` 為 False**，且 **`nan > 0` 亦為 False**，條件 **`is None or <= 0`** **不成立**，會進入 **`scaling = nan / test_neg_pos_ratio`** 與後續公式，產出 **NaN 調整值**，**JSON 序列化與第一輪 §1 同級風險**。來源可能是 **錯誤的 env／型別轉換**、或測試／呼叫端誤傳 **`math.nan`**（實務機率低但邏輯上為洞）。
+
+**具體修改建議**：在 helper 開頭對 **`production_neg_pos_ratio`**、**`test_neg_pos_ratio`**（及輸入 **`prec`**）一併要求 **`math.isfinite(x)`**（且 `> 0`），否則 **回傳 `None`**；或在呼叫端保證 **`PRODUCTION_NEG_POS_RATIO`** 解析後為 **正有限 float**，否則 **warning + 視同未設定**。
+
+**希望新增的測試**：**`_precision_prod_adjusted(0.5, production_neg_pos_ratio=float("nan"), test_neg_pos_ratio=1.0)`** 回傳 **`None`**；**`production_neg_pos_ratio=1.0, test_neg_pos_ratio=float("nan")`** 回傳 **`None`**（若從公式路徑可達）。可選：**`+inf`／`-inf`** 作為 ratio 時同樣回傳 **`None`**。
+
+---
+
+#### 10. `test_scores`／`predict_proba` 含 **NaN／inf** 時 sklearn 與 metrics 連鎖（邊界／契約）
+
+**問題**：**`_compute_test_metrics`** 在 **`average_precision_score`**、**`precision_recall_curve`** 前**未**斷言 **`test_scores`** 全為有限值。若模型或 wrapper 回傳非有限機率，**`test_ap`、raw precision@recall、`*_prod_adjusted`** 可能出現 **NaN**，第一輪 §1 仍適用；此條強調 **污染源在分數** 而非僅 helper。
+
+**具體修改建議**：在 **`predict_proba` 之後**（或與既有 R1100 guard 同區塊）檢查 **`np.isfinite(test_scores).all()`**；若否則 **warning** 並走 **與 test 無效相近之 zeroed／None 鍵策略**（需與產品約定：要 crash 還是降級），並確保 **寫 artifact 前無 nan**。
+
+**希望新增的測試**：**`_FixedScoreModel`** 或 mock 回傳 **單一 NaN** 分數、**`MIN_VALID_TEST_ROWS`** 仍滿足時，斷言 **不拋未處理例外** 且 **`json.dumps` 可序列化之 metrics 子集無 NaN**（或明確約定拋錯並 assert）。
+
+---
+
+#### 11. R372 `test_precision_at_recall_known_curve` 在 **`expected is None`** 時會失敗（測試脆弱度）
+
+**問題**：迴圈內一律 **`assertAlmostEqual(out[...], expected)`**；若某日資料或 sklearn 版本使 **`mask.any()` 為 False**，**`expected` 為 `None`**，**`assertAlmostEqual(None, x)` 會失敗**。目前 fixture 避開此情況，屬 **隱性依賴**。
+
+**具體修改建議**：改為 **`if expected is None: self.assertIsNone(out[...]) else: self.assertAlmostEqual(...)`**（並對 **`out`** 同步斷言）。
+
+**希望新增的測試**：刻意構造 **PR 曲線無法達成任一目標 recall** 之最小資料集（若存在），或 **mock `precision_recall_curve`** 回傳空 mask 情境，鎖定 **None 分支**。
+
+---
+
+#### 12. 兩段 `for r in _TARGET_RECALLS` 可合併（可維護性／非功能 bug）
+
+**問題**：先填 raw／threshold／`n_alerts`，再第二輪填 **`*_prod_adjusted`**，邏輯正確但 **重複遍歷**；日後若有人在第一段 return 或漏跑第二段，易 **漏鍵**（目前無此 bug）。
+
+**具體修改建議**：在第一段 **`if mask.any()`** 分支末尾直接呼叫 **`_precision_prod_adjusted`** 寫入 **`*_prod_adjusted`**（需 **`test_neg_pos_ratio`** 已算好，現狀已滿足）；**`else`** 分支設 **`*_prod_adjusted = None`**。可刪除第二個迴圈。
+
+**希望新增的測試**：無需新增（**R220 鍵集合**與 **R372** 已覆蓋行為）；若重構後跑同一組測試即可。
+
+---
+
+#### 13. 效能與安全性（第二輪結論）
+
+**效能**：第二輪 §12 若合併迴圈，僅減少常數次迭代，**邊際收益極小**。  
+**安全性**：§9 之 **NaN ratio** 不屬 PII；§10 之異常分數亦不新增外洩面。重點仍在 **數值契約與 artifact 可寫入性**。
+
+---
+
+#### Review 總結（第二輪）
+
+| 項目 | 嚴重度 | 類型 |
+|------|--------|------|
+| ratio 為 NaN 繞過 `<= 0` | 中～高（遇則 NaN 指標／JSON） | bug |
+| test_scores 非有限 | 中（連鎖污染） | 邊界／契約 |
+| R372 測試在 expected=None | 低～中 | 測試脆弱度 |
+| 雙迴圈可合併 | 低 | 可維護性 |
+
+**與第一輪合併之優先序建議**：**§9 與 §1 一併以 `math.isfinite` 收斂輸入與輸出** → **§2（極端 overflow）** → **§10（分數源頭）** → **§4–§5（觀測性）** → **§11（測試）** → **§12（可選重構）**。
+
+---
+
+### 實作修補與驗證結果（prod_adjusted Code Review 對齊）
+
+**Date**: 2026-03-21  
+**原則**：**未改 tests**（測試檔未動）；僅改實作與阻擋 **`mypy trainer/`** 之 typing 小修。
+
+#### 實作修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/training/trainer.py` | **`_precision_prod_adjusted`**：對 **`prec`**、**`production_neg_pos_ratio`**、**`test_neg_pos_ratio`**、**`scaling`**、**`term`**、**`adj`** 做 **`math.isfinite`**；**`prec > 1+1e-9`** 回傳 **`None`**，**`(1,1+1e-9]`** 視為 **1.0**；**`adj`** 須落在 **[0,1]**（容差），否則 **`None`**。新增 **`_warn_if_invalid_production_neg_pos_ratio`**：**`ratio` 非 `None` 且（無法轉 `float`／非有限／≤0）** 時 **單次 `logger.warning`**，文案明示 **含 precision@recall `*_prod_adjusted`**。**`_compute_test_metrics`**：若 **`test_scores`** 含非有限值 → **warning + 與 test 無效相同之 zeroed return**；成功路徑於計算完 adjusted 後呼叫 **`_warn_if_invalid_production_neg_pos_ratio`**（取代僅 **`<= 0`** 之舊訊息）。**`_compute_test_metrics_from_scores`**：**trim 後**若 **`scores_arr`** 非有限 → **warning + 同上 zeroed**；成功路徑同樣呼叫 **`_warn_if_invalid...`**。`_compute_test_metrics` docstring 補 **approximation** 語意。 |
+| `trainer/etl/etl_player_profile.py` | **`typing` 補 `Dict`**（修復 **`mypy`** `Name "Dict" is not defined`；與 prod_adjusted 無業務邏輯關聯）。 |
+
+#### 驗證結果
+
+- **相關 review_risks**：`test_review_risks_round220_plan_b_plus_stage6_step3.py`、`round230`、`round372`、`round398`、`round182_plan_b_config` → **37 passed**。
+- **Lint**：`python -m ruff check trainer/`（**`ruff.toml` 排除 `tests/`**）→ **All checks passed**。
+- **Typecheck**：`python -m mypy trainer/ --ignore-missing-imports` → **Success: no issues found**（48 source files）。
+- **全量** `python -m pytest tests/ -q`（本機）：**1245 passed, 4 failed** — 失敗項為 **`test_review_risks_r1_r6_script`**（缺 **`prediction_log.db`** 致 stderr 未含預期子字串）、**`test_review_risks_round159`**（**`payout_complete_dtm`**）、**`test_review_risks_serving_code_review`**（**`STATE_DB_PATH`** 與 **BASE_DIR** 關係）等，**與本輪 `trainer/training/trainer.py` prod_adjusted 變更無直接關聯**；請於具備對應 DB／目錄約束之環境複驗全綠。
+
+#### 與 Code Review 條目對照
+
+| 條目 | 狀態 |
+|------|------|
+| §1／§9 有限性與 JSON 安全 | ✅ |
+| §2 極端 overflow／非有限 `adj` | ✅ |
+| §3 方法論（approximation） | ✅ docstring |
+| §4 `from_scores` 無效 ratio 可觀測 | ✅ 共用 warning |
+| §5 warning 涵蓋新鍵語意 | ✅ |
+| §10 分數非有限 | ✅ early zeroed |
+| §11 R372 `expected=None` | ⏸ 未改 tests |
+| §12 合併迴圈 | ⏸ 可選，未做 |
+| §6 下游 allow-list／MLflow | ⏸ 未改 |
+
+---
+
 ## Scorer Track Human lookback parity fix
 
 **Date**: 2026-03-19

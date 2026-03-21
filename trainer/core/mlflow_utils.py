@@ -9,6 +9,9 @@ Phase 2 P0–P1: Shared MLflow helpers for trainer and export script.
 - GCP Cloud Run: when GOOGLE_APPLICATION_CREDENTIALS is set and tracking URI is HTTPS,
   fetches a GCP ID token and registers a RequestHeaderProvider so MLflow requests include
   Authorization: Bearer <token> for Cloud Run auth.
+- IAP in front of Cloud Run: set MLFLOW_IAP_AUDIENCE to the IAP OAuth client ID
+  (…apps.googleusercontent.com). Using the tracking URI as audience will fail with
+  "Invalid JWT audience".
 
 See doc/phase2_provenance_schema.md for provenance key names.
 """
@@ -26,8 +29,8 @@ from dotenv import load_dotenv
 
 _log = logging.getLogger(__name__)
 
-# Cache for GCP ID token: (token_str, expiry_ts). Refresh when now >= expiry_ts - 300.
-_gcp_id_token_cache: Optional[tuple[str, float]] = None
+# Cache for GCP ID token per audience: audience -> (token_str, expiry_ts).
+_gcp_id_token_cache: dict[str, tuple[str, float]] = {}
 _gcp_provider_registered = False
 
 # T11: Load project-local MLflow env file so train/export get config without main .env.
@@ -74,11 +77,12 @@ def _is_transient_mlflow_error(exc: BaseException) -> bool:
 
 
 def _get_gcp_id_token(audience: str) -> Optional[str]:
-    """Fetch GCP ID token for the given audience (e.g. Cloud Run URL). Uses GOOGLE_APPLICATION_CREDENTIALS. Cached until ~5 min before expiry."""
+    """Fetch GCP ID token for the given audience (Cloud Run URL, or IAP OAuth client ID). Uses GOOGLE_APPLICATION_CREDENTIALS. Cached per audience."""
     global _gcp_id_token_cache
     now = time.time()
-    if _gcp_id_token_cache is not None:
-        _token, expiry = _gcp_id_token_cache
+    cached = _gcp_id_token_cache.get(audience)
+    if cached is not None:
+        _token, expiry = cached
         if now < expiry - _GCP_TOKEN_REFRESH_BUFFER_SEC:
             return _token
     try:
@@ -88,7 +92,7 @@ def _get_gcp_id_token(audience: str) -> Optional[str]:
         token = google.oauth2.id_token.fetch_id_token(request, audience)
         if token:
             # ID tokens typically expire in 3600s; use 3500 to be safe.
-            _gcp_id_token_cache = (token, now + 3500)
+            _gcp_id_token_cache[audience] = (token, now + 3500)
             return token
     except Exception as e:
         _log.warning("Failed to fetch GCP ID token for MLflow: %s", e)
@@ -118,7 +122,9 @@ def _register_gcp_bearer_provider_if_needed() -> None:
                 u = get_tracking_uri()
                 if not u:
                     return {}
-                token = _get_gcp_id_token(u)
+                iap = (os.environ.get("MLFLOW_IAP_AUDIENCE") or "").strip()
+                audience = iap or u
+                token = _get_gcp_id_token(audience)
                 if not token:
                     return {}
                 return {"Authorization": f"Bearer {token}"}
