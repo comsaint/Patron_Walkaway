@@ -18,4 +18,9 @@ dependencies = [
     "clickhouse-driver",
 ]
 
+# Optional: MLflow system metrics (MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING) need psutil in-process.
+# Pure API deploy images that do not train and do not enable system metrics can omit this extra.
+[project.optional-dependencies]
+mlflow-system-metrics = ["psutil"]
+
 # Package mapping: install trainer/ as walkaway_ml (see setup.py)

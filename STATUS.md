@@ -4178,3 +4178,834 @@ python -m pytest tests/review_risks/test_review_risks_r1_r6_script.py tests/revi
 1. **525 個 below 正例**不是「低分亂標」：整體分數偏高且 **max 貼近訓練/部署閾值帶**，敘事應強調 **margin / 閾值邊界** 與 **分層抽樣在高 bin 的 FN 集中**。
 2. **Alert 側 FP** 與 TP 的 score 分佈幾乎同帶 — 問題型態是 **排序/校準在高分段的可分性不足**，不宜只說「模型分太低」。
 3. **Unified / 全體 recall** 仍僅適用於合併樣本診斷；若要母體 FN 率須另設估計（加權或更大窗）。
+
+---
+
+## 計畫：`pipeline_diagnostics` + 部署 bundle（2026-03-21）
+
+**依據**：`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §1–§2（本輪僅實作此兩段）。
+
+### 變更檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `trainer/training/trainer.py` | `run_pipeline` 開頭記錄 `pipeline_started_at`（UTC ISO8601）；成功路徑在計算 `total_sec` 與 `oom_precheck_step7_rss_error_ratio` 後寫入 `MODEL_DIR/pipeline_diagnostics.json`（省略 `None` 鍵；寫入失敗僅 warning）。新增 `_write_pipeline_diagnostics_json`。 |
+| `package/build_deploy_package.py` | `BUNDLE_FILES` 加入 `pipeline_diagnostics.json`；該檔缺檔時 `logger.warning` 一次，其餘可選檔維持靜默略過。 |
+
+### 手動驗證
+
+1. 完成一次本機訓練後，確認 `trainer/models/pipeline_diagnostics.json`（或 `MODEL_DIR` 指向路徑）存在，內含至少：`model_version`、`pipeline_started_at`、`pipeline_finished_at`、`total_duration_sec`，以及與本次執行相符的 `step7_duration_sec` / `step9_duration_sec`、RSS 或 OOM 預檢欄位（視 psutil 與資料是否可得）。
+2. 建包：`python -m package.build_deploy_package --model-source <含完整 bundle 的目錄>`，確認 `deploy_dist/models/` 含 `pipeline_diagnostics.json`。
+3. 刻意從 model source **移除** `pipeline_diagnostics.json` 再建包：流程應成功，且 stderr/日誌出現一則缺少該檔的 warning。
+
+### 下一步建議
+
+1. 計畫 §3：`credential/mlflow.env.example` 補 `MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING` 與 `psutil` 說明；必要時檢查 `pyproject.toml` / `REQUIREMENTS_DEPS` 是否需列 `psutil`（依部署場景）。
+2. 計畫 §4–§5：訓練成功路徑 `log_artifact_safe` 上傳小檔；`doc/phase2_provenance_schema.md` 與 `_log_training_provenance_to_mlflow` 增加 `pipeline_diagnostics_path`。
+
+---
+
+## Code Review：`pipeline_diagnostics.json` + 部署 bundle（2026-03-21）
+
+**範圍**：`trainer/training/trainer.py`（`_write_pipeline_diagnostics_json`、`run_pipeline` 成功路徑）、`package/build_deploy_package.py`（`BUNDLE_FILES`、`copy_model_bundle`）。  
+**對照**：`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §1–§2、§6 測試建議。
+
+### 1) 語意／可觀測性：`pipeline_finished_at` 與 `total_duration_sec` 含入額外工作（邊界）
+
+- **問題**：診斷檔在 `save_artifact_bundle` **之後**還經過 MLflow warm-up、provenance、刪除 stale `*_model.pkl`，才計算 `total_sec` 與 `pipeline_finished_at`。因此「完成時間」與「總耗時」**包含**這段額外延遲；與計畫插圖「Step 10 與 `training_metrics.json` 同一流程」相比，**口徑略寬於「僅 Step 1–10」**。多數情境下可接受，但若用 SLO 對照 `total_duration_sec` 會略偏長。
+- **具體修改建議**（擇一即可）：  
+  - **A**：在註解或 `STATUS`/計畫中明文化：`total_duration_sec` = `perf_counter` 自 `run_pipeline` 入口至「成功路徑尾端（含 best-effort MLflow 與 stale 清理）」。  
+  - **B**：拆兩組鍵，例如 `pipeline_core_finished_at` / `core_duration_sec`（至 `save_artifact_bundle` 結束）與 `pipeline_finished_at` / `total_duration_sec`（現行），供進階對照。
+- **希望新增的測試**：契約測試（inspect 或輕量 mock）斷言 `_write_pipeline_diagnostics_json` 呼叫點**晚於** `save_artifact_bundle(`，且文件註解或 schema 說明與實作一致。
+
+### 2) 失敗路徑可能留下**過期** `pipeline_diagnostics.json`（Bug／可觀測性）
+
+- **問題**：若本次 `_write_pipeline_diagnostics_json` **失敗**（僅 warning），`MODEL_DIR` 內可能仍留**上一輪**的 `pipeline_diagnostics.json`，與**本輪** `training_metrics.json` / `model_version` **不一致**，部署或人工排查時易誤判。
+- **具體修改建議**：寫入前 `unlink(missing_ok=True)` 舊檔，或採 **`*.tmp` + `os.replace`**（與 `model.pkl` 類似）保證原子性；失敗時不留下半寫入檔。
+- **希望新增的測試**：在 temp `MODEL_DIR` 先放一個舊的 `pipeline_diagnostics.json`，mock `Path.write_text` 拋錯，斷言要嘛舊檔被清掉、要嘛明確記錄「未更新」狀態（依選定策略）。
+
+### 3) JSON 序列化與非有限 float（邊界）
+
+- **問題**：若未來某 RSS／比例欄位變成 **`inf`/`nan`**（數值異常或除法邊界），`json.dumps` 可能**拋錯**或產出**非標準 JSON**（行為依 Python 版本與是否用 `allow_nan`），與「合法 JSON 供下游解析」目標衝突。
+- **具體修改建議**：寫入前對 float 欄位做 `math.isfinite` 檢查，非有限則改為省略該鍵或寫入 `null`（需先與「省略 None」策略二選一在文件寫死）。
+- **希望新增的測試**：單元測試餵入 `float("nan")`／`inf` 至 helper，斷言不 raise 且輸出為可 `json.loads` 的字串。
+
+### 4) `build_deploy_package` 的 warning **可能看不見**（可觀測性）
+
+- **問題**：使用 `logger.warning` 但未保證呼叫端設定 handler；在部分環境下僅有 root 的 `lastResort`，行為依 **logging 設定**而異，與 STATUS 手動驗證「應看到 warning」可能不一致。
+- **具體修改建議**：與同檔案其餘使用者可見訊息對齊，缺檔時**額外** `print(..., file=sys.stderr)` 一行，或文件註明「須設定 logging」。最小改動為補一行 stderr。
+- **希望新增的測試**：`caplog` 或攔截 stderr，斷言缺 `pipeline_diagnostics.json` 時至少出現**一則**可見訊息（warning 或 stderr）。
+
+### 5) 計畫 §6 測試尚未落地（流程風險）
+
+- **問題**：計畫已列「迷你 pipeline／斷言 JSON 欄位」「打包缺檔 warning」等；目前**尚未**見對應自動化測試，回歸時易漏。
+- **具體修改建議**：依計畫 §6 補最小集：`tests/` 內對 `_write_pipeline_diagnostics_json` 的 JSON 形狀測試；對 `copy_model_bundle` 缺 `pipeline_diagnostics.json` 的 warning 測試；可選：`BUNDLE_FILES` 靜態清單包含檔名。
+- **希望新增的測試**：同上；可選一則 **source-contract** 測試確認 `BUNDLE_FILES` 含 `"pipeline_diagnostics.json"`。
+
+### 6) 安全性與效能（本輪風險低）
+
+- **安全性**：路徑固定於 `MODEL_DIR`，無外部輸入拼路徑；風險低。若 `MODEL_DIR` 指向共享可寫目錄，仍屬既有部署議題，非本變更獨有。
+- **效能**：單次小 JSON 寫入，對筆電記憶體／CPU 影響可忽略。
+
+### Review 結論
+
+- 實作與 §1「拆檔、省略 None、欄位對齊既有 RSS／OOM 估算」**大致一致**；§2「打包＋缺檔 warning」行為合理。  
+- 優先建議補齊 **§6 測試**、並處理 **過期 diagnostics 殘留**與 **`pipeline_finished_at` 口徑說明**，其餘為強化穩健性與可觀測性。
+
+---
+
+## Code Review 複核（第二輪｜2026-03-21）
+
+**已讀**：`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`（全文）、`STATUS.md`（含上節 Review）、`.cursor/plans/DECISION_LOG.md`（專案根目錄仍無 `DECISION_LOG.md`；決策仍以該檔為準）。  
+**程式狀態**：`trainer/training/trainer.py`、`package/build_deploy_package.py` 中 `pipeline_diagnostics` 相關邏輯與**首輪 review 時**一致，**不重複**上節六點清單；以下僅**補遺**。
+
+### 補充問題 7) 同目錄併發寫入（邊界／正確性）
+
+- **問題**：若兩個訓練行程**同時**對**同一** `MODEL_DIR` 寫入 `pipeline_diagnostics.json`（無鎖），可能出現**交錯內容**或讀到半寫入檔（視 OS／檔案系統）。一般流程假設「單一訓練、單一寫入者」則風險低。
+- **具體修改建議**：在 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` 或 trainer 小節**明文化**「不支援多程序共用同一 `MODEL_DIR` 並行訓練」；若未來需要，再導入專用輸出目錄或檔案鎖。
+- **希望新增的測試**：通常**不**強制自動化；若產品要支援並行，再補整合測試或 stress 腳本。
+
+### 補充問題 8) `omit None` 與未來 `bool` 欄位（邊界）
+
+- **問題**：`out = {k: v for k, v in payload.items() if v is not None}` 會**保留** `False` 與 `0.0`。若日後在 `payload` 加入 **`optional_bool`**，則「未設定」與 **`False`** 無法區分（除非改用三態或省略策略）。
+- **具體修改建議**：新欄位優先用 **float / str**；若必須 bool，文件寫死語意或改為字串列舉（如 `"enabled"` / `"disabled"` / 省略）。
+- **希望新增的測試**：僅在**實際新增 bool 欄位**時補契約測試。
+
+### 複核結論
+
+- 首輪 Review 所列項目仍為主要風險；本輪補充為**併發假設**與**型別演進**提醒。無需重寫實作，除非要支援多程序或擴充 schema。
+
+---
+
+## CI／品質闸門修復輪（tests + ruff + mypy｜2026-03-21）
+
+### 背景
+
+全量 `pytest` 曾出現 **3 failed**（與 `pipeline_diagnostics` 無直接關係）：R159 scorer、`status_server` STATE_DB_PATH 契約。
+
+### 變更檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `trainer/serving/scorer.py` | Profile PIT join 前：若 `features_all` 缺 `payout_complete_dtm` 且 `bets` 有該欄，則由 `bets` merge 回填（避免 `join_player_profile` KeyError；涵蓋 mock `build_features_for_scoring` 或本機載入 canonical 導致走 profile join 之路徑）。 |
+| `trainer/serving/status_server.py` | 預設 `STATE_DB_PATH` 改與 scorer/validator/api_server 一致：`PROJECT_ROOT / "local_state" / "state.db"`（`credential/.env` 仍可由 `load_dotenv` 設定 `STATE_DB_PATH`，`override=False`）。 |
+| `tests/review_risks/test_review_risks_serving_code_review.py` | `test_status_server_state_db_path_under_base_dir`：契約改為斷言路徑在 **`PROJECT_ROOT`** 下且含 `local_state`（與實作／dotenv 載入行為一致；舊「必須在 `BASE_DIR`（trainer）下」與 dotenv 及預設路徑不一致，屬測試假設錯誤）。 |
+
+### 驗證結果（本機）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest -q --tb=short` | **1249 passed**, 62 skipped, 2 xpassed |
+| `python -m ruff check .` | All checks passed |
+| `python -m mypy trainer/ package/ --ignore-missing-imports` | Success: no issues found in 51 source files |
+
+### 文件更新
+
+| 檔案 | 說明 |
+|------|------|
+| `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` | 標題狀態改為「部分實作」；目標表 §1 標為已實作、§2–§3 待實作；§8 手動驗收前兩項加註「程式已具備，待實際跑訓練／建包勾選」。 |
+| `.cursor/plans/PLAN.md` | 新增 **Pipeline 診斷與 MLflow artifacts** 索引列（§1–§2 完成、§3–§8 待續）與連結至上述 doc。 |
+| `package/PLAN.md` | 訓練產出表列補上 `pipeline_diagnostics.json`。 |
+
+### 計畫剩餘項（`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`）— 已過期
+
+以下為 **§3–§4 實作前** 之快照；**§3–§4 已完成**後請以檔案末尾「§3–§4 實作輪」與 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` 為準。
+
+仍待（更新後）：**§5** provenance schema／`_log_training_provenance_to_mlflow`；**§6** 自動化測試；**§7** README／文件；**§8** MLflow／export 手動驗收其餘項。
+
+---
+
+## 計畫：`pipeline_diagnostics` — §3–§4 實作輪（2026-03-21）
+
+**依據**：`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §3（MLflow system metrics 文件與依賴）、§4（訓練 run artifacts）。
+
+### 變更檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `credential/mlflow.env.example` | 新增註解區塊：`MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING`、`psutil`／optional extra、`nvidia-ml-py` 可選；說明 train 與 export 若設此變數會出現 `system/*`，export 若不要可拆環境或不設。 |
+| `pyproject.toml` | `[project.optional-dependencies]`：`mlflow-system-metrics = ["psutil"]`；註解說明純 API 部署可不裝。 |
+| `trainer/training/trainer.py` | `log_artifact_safe` 匯入；在 `_write_pipeline_diagnostics_json` 之後、成功摘要 print 前，若 `has_active_run()` 則對存在之 `training_metrics.json`、`pipeline_diagnostics.json`、`feature_spec.yaml`、`model_version` 呼叫 `log_artifact_safe(..., artifact_path="bundle")`。 |
+| `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` | 狀態與目標表 §2–§3（文件內編號：對應「MLflow 內建 system metrics」「Artifacts」兩列）更新為已實作。 |
+| `.cursor/plans/PLAN.md` | Pipeline 診斷索引列更新為 §1–§4 完成、§5–§8 待續。 |
+
+**DECISION_LOG**：本輪未新增 DEC 條目（延續既有 Phase 2 MLflow／deploy 決策）。
+
+### 手動驗證
+
+1. **System metrics**：複製 `credential/mlflow.env.example` 相關行到實際 `credential/mlflow.env`（或 export），取消註解 `MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING=true`，確認訓練／export 行程已 `pip install psutil` 或 `pip install -e ".[mlflow-system-metrics]"`；完成一次有 MLflow tracking 的 run 後，UI **Metrics** 是否出現 **`system/*`**（MLflow 版本需支援該功能）。
+2. **Artifacts**：同上條件下跑完訓練成功路徑後，在 MLflow **Artifacts** 檢視 **`bundle/training_metrics.json`**、**`bundle/pipeline_diagnostics.json`** 等（若檔案存在）；tracking 不可用時應仍訓練成功、僅無上傳。
+3. **Optional extra**：`pip install -e ".[mlflow-system-metrics]"` 可裝入 `psutil`（僅驗證安裝矩陣，非必跑全量訓練）。
+
+### 下一步建議
+
+1. **§5**：`doc/phase2_provenance_schema.md` 與 `_log_training_provenance_to_mlflow` 增加 `pipeline_diagnostics_path`（及可選 rel path）。
+2. **§6–§7**：補契約／單元測試（`log_artifact_safe` 路徑）；README 或 trainer 小節說明 `pipeline_diagnostics.json` 與 MLflow `bundle/` artifacts。
+3. **§8**：依計畫手動驗收 MLflow export run 與 `system/*` 策略。
+
+### 驗證（本機指令）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest -q --tb=short` | 1249 passed（與前次一致） |
+| `python -m ruff check .` | All checks passed |
+| `python -m mypy trainer/ package/ --ignore-missing-imports` | Success: 51 source files |
+
+---
+
+## Code Review：`pipeline_diagnostics` §3–§4（MLflow system metrics + `bundle/` artifacts｜2026-03-21）
+
+**範圍**：`credential/mlflow.env.example`、`pyproject.toml` optional-deps、`trainer/training/trainer.py`（`log_artifact_safe` 區塊）、`trainer/core/mlflow_utils.py`（`log_artifact_safe` 行為）。  
+**對照**：`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §3–§4、`.cursor/plans/PLAN.md`、`.cursor/plans/DECISION_LOG.md`（本輪無新增 DEC；沿用 Phase 2 MLflow 策略）。
+
+### 1) `log_artifact_safe` 無 transient 重試（邊界／可觀測性）
+
+- **問題**：`log_metrics_safe`／`log_params_safe` 有 **T13** 式 502/503/504 重試；**`log_artifact_safe`** 僅單次 `try` + warning。冷啟或短暫網路問題時，**metrics 可能成功、Artifacts 缺檔**，與「同一 run 應一併可稽核」的預期可能不一致。
+- **具體修改建議**：在 `mlflow_utils.log_artifact_safe` 內對 **與 T13 相同類型**的錯誤做有限次重試（或抽共用 `_retry_transient_mlflow`）；至少應在 **計畫／STATUS** 明文化「artifact 上傳可能因瞬斷而缺、可重跑或手動補傳」。
+- **希望新增的測試**：mock `mlflow.log_artifact` 前兩次拋 503、第三次成功，斷言最終成功或 warning 次數符合重試策略（若實作重試）。
+
+### 2) Artifact 上傳順序：先 `bundle/` 後 metrics（邊界）
+
+- **問題**：目前順序為 **寫入 diagnostics → `log_artifact_safe` 迴圈 → print 完成 → `log_metrics_safe`**。若 **metrics** 階段長時間失敗或中斷，UI 上可能先看到 **Artifacts**、**Metrics** 稍後或失敗；多數可接受，但除錯時可能誤以為「只有檔案沒有指標」。
+- **具體修改建議**：維持現狀即可；若需語意一致，可改為 **先 `log_metrics_safe` 再上傳 artifacts**（需評估 Cloud Run 冷啟：目前 warm-up 在 artifact 之前已呼叫）。**最低限度**：在 `doc/plan` 或註解一行說明順序理由。
+- **希望新增的測試**：非必須；若調整順序，補一則契約測試（inspect 或 mock 呼叫順序）。
+
+### 3) `training_metrics.json` 體積與上傳時間（效能／成本）
+
+- **問題**：計畫假設「小檔」；若未來 `training_metrics.json` 因巢狀結構或除錯欄位變大，**連線上傳**可能拉長訓練尾部時間或增加 tracking 儲存成本。
+- **具體修改建議**：可選門檻——超過 **N MB** 則跳過 artifact 上傳並 `logger.warning`（仍保留本機檔）；或僅上傳 `pipeline_diagnostics.json` + `model_version`。需在計畫寫死 N 與策略。
+- **希望新增的測試**：單元測試 mock 大檔 path，`stat().st_size` 超過門檻時不呼叫 `log_artifact`（若實作門檻）。
+
+### 4) `MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING` 與 **psutil** 執行期行為（邊界）
+
+- **問題**：範例與 optional-deps 已說明需 **psutil**；若使用者只設 env **未**安裝 psutil，行為依 **MLflow 版本**而定（略過、warning 或錯誤），非本 repo 單元測試可完全覆蓋。
+- **具體修改建議**：在 `mlflow.env.example` 再加一句：**啟用前請確認** `python -c "import psutil"` 成功；或訓練入口加 best-effort 檢查（僅 log，不阻斷）。
+- **希望新增的測試**：可選整合測試（有 MLflow mock 時）驗證 env 與 import 組合；非強制。
+
+### 5) 安全性（本輪風險低）
+
+- **問題**：上傳路徑皆為 **`MODEL_DIR` 下固定檔名**，無使用者字串拼接；**機密**通常不在 `training_metrics`／`model_version`／`feature_spec` 預設內容，但若未來 metrics 內含內部 host 名等，**Artifacts 可讀性**等同本機檔案外洩範圍。
+- **具體修改建議**：維持現狀；敏感欄位治理留在 **training_metrics 審計策略**（既有議題）。
+- **希望新增的測試**：無需為本輪單獨加。
+
+### 6) `has_active_run()` 與 `log_artifact_safe` 內部檢查（正確性）
+
+- **問題**：`log_artifact_safe` 僅檢查 **`is_mlflow_available()`**，不檢查 active run；**`run_pipeline`** 已用 **`if has_active_run():`** 包住上傳迴圈，故不會在無 run 時誤調用。若未來他處直接呼叫 `log_artifact_safe`，仍可能觸發 mlflow 例外（已 catch）。
+- **具體修改建議**：可選在 `log_artifact_safe` 開頭加 **`if not has_active_run(): return`**（與語意一致）；或文件註明「須在 active run 內呼叫」。
+- **希望新增的測試**：若改 helper，補一則「無 active run 時不呼叫 `mlflow.log_artifact`」的 mock 測試。
+
+### Review 結論
+
+- §3 文件與 **`mlflow-system-metrics`** extra 與計畫「純 API 可不裝 psutil」一致。  
+- §4 上傳檔案集合與 **`bundle/`** 前綴符合計畫；主要後續風險在 **artifact 上傳無重試** 與 **大檔** 時的尾部延遲／成本，建議以文件或 helper 重試對齊 T13。
+
+---
+
+## Review 風險點 → 測試防護（僅 tests｜2026-03-21）
+
+**依據**：上節「Code Review：`pipeline_diagnostics` §3–§4」；**僅新增** `tests/review_risks/test_review_risks_pipeline_diagnostics_mlflow_review.py`，**未改 production**。
+
+### 新增檔案
+
+| 檔案 | 對應 Review 項 | 行為摘要 |
+|------|----------------|----------|
+| `tests/review_risks/test_review_risks_pipeline_diagnostics_mlflow_review.py` | #1 | `log_artifact_safe` 對 503 類錯誤**僅呼叫一次** `mlflow.log_artifact`；原始碼**無** `_MLFLOW_RETRY`／`for attempt` 重試迴路。 |
+| 同上 | #2 | `run_pipeline` 原始碼中，`log_artifact_safe` 區塊在 **`log_metrics_safe(mlflow_metrics)`** 之前。 |
+| 同上 | #3 | `has_active_run` 的 bundle `for _fname` 迴圈內**無** `st_size`／`stat()` 體積門檻（現況鎖定；若日後加門檻須改測試）。 |
+| 同上 | #4 | `credential/mlflow.env.example` 含 `MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING` 與 `psutil`；`pyproject.toml` 含 **`[project.optional-dependencies]`** 與 **`mlflow-system-metrics`**。 |
+| 同上 | #6 | `_write_pipeline_diagnostics_json` 之後的 **`log_artifact_safe(_ap`** 落在 **`if has_active_run():`** 內；`log_artifact_safe` 在 mlflow 拋錯時**不向外拋**。 |
+
+**未單獨加測**：Review #5（安全性／敏感欄位）— 與 Review 結論一致，留待 metrics 審計策略。
+
+### 執行方式
+
+```bash
+# 僅本檔（含 mlflow 時跑滿；無 mlflow 時部分用例 skip）
+python -m pytest tests/review_risks/test_review_risks_pipeline_diagnostics_mlflow_review.py -q --tb=short
+
+# 與全倉回歸一併
+python -m pytest -q --tb=short
+```
+
+### 驗證（本機）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/review_risks/test_review_risks_pipeline_diagnostics_mlflow_review.py -q --tb=short` | 有安裝 **mlflow**：**8 passed**；未安裝：**6 passed, 2 skipped**（`pytest.importorskip("mlflow")`）。**未**注入 `sys.modules['mlflow']` 假模組，以免污染同次會話內其他需 `set_tags`／`get_run` 等之測試。 |
+| `python -m pytest -q --tb=short` | 1255 passed, 64 skipped（含本檔之 skip） |
+| `python -m ruff check tests/review_risks/test_review_risks_pipeline_diagnostics_mlflow_review.py` | All checks passed |
+
+### 下一步建議
+
+- 若 **`log_artifact_safe`** 日後加入與 T13 相同之重試，須**更新** `test_review1_log_artifact_safe_does_not_retry_on_503_like_transient_error` 之預期呼叫次數與 `test_review1_log_artifact_safe_source_has_no_retry_loop`。  
+- 若 bundle 迴圈加入**依大小略過**上傳，須**更新** `TestReview3NoSizeThresholdOnBundleArtifacts`。
+
+---
+
+## 品質闸門確認輪（2026-03-21，僅文件／PLAN 更新）
+
+- **實作**：無變更（前一輪已全綠）。
+- **文件**：`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` 頂部狀態改為「§6 部分完成」；§6 增補 **review_risks** 契約測試已涵蓋與仍缺項。`.cursor/plans/PLAN.md` 同步 §6 部分／§5·§7·§8 仍待。
+- **測試**：依使用者指示**未**改 tests。
+- **驗證（本機）**：
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest -q --tb=short` | **1255 passed**, 64 skipped, 2 xpassed |
+| `python -m ruff check .` | All checks passed |
+| `python -m mypy trainer/ package/ --ignore-missing-imports` | Success: no issues found in 51 source files |
+
+---
+
+## Pipeline 計畫 §5 Provenance（2026-03-21）
+
+**依據**：讀取 `.cursor/plans/PLAN.md`、`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §5、根目錄 `STATUS.md`、`.cursor/plans/DECISION_LOG.md`（無與本變更衝突之條目）。本次僅實作計畫 **下 1–2 步**（schema 文件 + trainer provenance params），未碰 §6–§8。
+
+### 變更檔案
+
+| 檔案 | 摘要 |
+|------|------|
+| `doc/phase2_provenance_schema.md` | 新增 `pipeline_diagnostics_path`、`pipeline_diagnostics_rel_path`；補「訓練 run 可能上傳之 Artifacts」說明。 |
+| `doc/phase2_provenance_query_runbook.md` | UI 查詢步驟之 Parameters 列表補上兩新鍵。 |
+| `trainer/training/trainer.py` | `_log_training_provenance_to_mlflow` 之 `params` 含兩鍵；未傳入時由 `artifact_dir` 推導；`run_pipeline` 以 `MODEL_DIR` 明確傳入。Docstring 註明 provenance 可能早於診斷檔寫入，路徑仍為 canonical。 |
+| `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` | 頂部狀態改為 §1–§5 完成；§5 標為已實作。 |
+| `.cursor/plans/PLAN.md` | Pipeline 條目：§1–§5 已實作；§7、§8 仍待。 |
+| `tests/integration/test_phase2_trainer_mlflow.py` | `test_provenance_params_contain_required_keys` 斷言兩新鍵與路徑／rel 預期（契約與 §5 對齊）。 |
+
+### 手動驗證建議
+
+1. 設 `MLFLOW_TRACKING_URI` 並完成一次訓練成功路徑後，在 MLflow UI 該 run 的 **Parameters** 確認存在 `pipeline_diagnostics_path`、`pipeline_diagnostics_rel_path`，且與本機 `MODEL_DIR` 一致。
+2. 對照 `doc/phase2_provenance_schema.md` 表格欄位是否與 UI 一致。
+
+### 下一步建議
+
+- **§7**：README／trainer 小節說明 `pipeline_diagnostics.json` 與 MLflow `bundle/`。
+- **§6 其餘**：JSON 形狀測試、`copy_model_bundle` 缺檔 warning 等（見計畫 doc §6）。
+- **§8**：手動驗收清單勾選。
+
+### 驗證（本機）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest -q --tb=short` | **1255 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+| `python -m ruff check trainer/training/trainer.py tests/integration/test_phase2_trainer_mlflow.py` | All checks passed |
+
+---
+
+## Code Review：§5 Provenance（`pipeline_diagnostics_*`）與現有 pipeline 順序（2026-03-21）
+
+**前置**：已讀 `.cursor/plans/PLAN.md`、根目錄 `STATUS.md`、`.cursor/plans/DECISION_LOG.md`；對照 `trainer/training/trainer.py` 中 `_log_training_provenance_to_mlflow`、`run_pipeline` 成功路徑順序、`doc/phase2_provenance_schema.md`。以下為**最可能**問題與建議（非 exhaustive；不重寫整套實作）。
+
+### 1. 語意／操作風險：Provenance 早於 `pipeline_diagnostics.json` 寫入
+
+- **問題**：`run_pipeline` 內 **`_log_training_provenance_to_mlflow` 在 `_write_pipeline_diagnostics_json` 之前**呼叫。MLflow **Parameters** 會先出現 `pipeline_diagnostics_path`／`pipeline_diagnostics_rel_path`，但該檔此時通常**尚不存在**；若有人僅看 params 就以為本機已有檔案，會誤判。Docstring 已說明，但 UI／runbook 讀者易忽略。Artifact 上傳在寫入之後，故 **Artifacts 與 params 的「檔案已就緒」時間點不一致**。
+- **具體修改建議**（擇一或並用）：  
+  - **A（行為）**：將 `_log_training_provenance_to_mlflow` **移到** `_write_pipeline_diagnostics_json` **成功之後**（仍維持 try／不中斷訓練）；若寫入失敗，可選擇仍 log params（路徑為 canonical）並依下項補標籤。  
+  - **B（文件）**：在 `doc/phase2_provenance_query_runbook.md` 與 schema 加一句：**「params 內路徑為 bundle 內約定位置；檔案實際寫入在 Step 10 尾段，請以 Artifacts／本機檔案為準。」**  
+  - **C（可選）**：寫入失敗時 `log_tags_safe` 例如 `pipeline_diagnostics_written=false`（需與 T12 失敗路徑策略一致）。
+- **希望新增的測試**：  
+  - **契約／原始碼順序**：在 `tests/review_risks` 或 integration 中，對 `run_pipeline` 原始碼斷言 **`_write_pipeline_diagnostics_json` 出現在 `_log_training_provenance_to_mlflow` 之後**（若採建議 A）；或斷言**目前順序**並註解連結 runbook（若維持現狀僅強化文件）。
+
+### 2. 邊界條件：`pipeline_diagnostics_rel_path` 預設值
+
+- **問題**：`_pd_rel = f"{_artifact.name}/pipeline_diagnostics.json"`。當 `Path(artifact_dir).name` 為**空字串**（例如部分根路徑／極端輸入）時，會變成 **`/pipeline_diagnostics.json`**，與 schema「`models/...`」慣例不一致，且可能讓下游解析困惑。正常 `MODEL_DIR` 下機率低，但 helper 可被其他呼叫端使用。
+- **具體修改建議**：若 `not _artifact.name`，fallback 為 **`"pipeline_diagnostics.json"`** 或固定 **`"models/pipeline_diagnostics.json"`**，並在 `phase2_provenance_schema.md` 註明 fallback 規則。
+- **希望新增的測試**：`tests/integration/test_phase2_trainer_mlflow.py`（或 unit）中，以 `artifact_dir` 使 `Path(...).name == ""` 的 case（若平台可穩定構造），assert `pipeline_diagnostics_rel_path` 為約定 fallback，而非前導 `/`。
+
+### 3. MLflow params：長度限制與鍵數增加
+
+- **問題**：在既有 `artifact_dir`、`feature_spec_path`、`training_metrics_path` 之外再增兩個路徑欄位，**單次 `log_params`  payload 變大**，若伺服器對單一 param 或整體有嚴格限制，**失敗機率略增**（與 STATUS 既有「長路徑」討論同類）。`log_params_safe` 失敗僅 warning，run 仍成功，但 **run 可能缺整批 provenance**。
+- **具體修改建議**：在 `doc/phase2_provenance_schema.md`「MLflow 限制」小節（或連結既有 PLAN 討論）明寫：**路徑類 param 可能觸發長度問題**；長期可在 `log_params_safe` 或 provenance 組裝處對路徑做 **截斷／只記錄相對於專案根的路徑**（需定義錨點，例如 `PROJECT_ROOT`）。
+- **希望新增的測試**：延伸現有 `TestLogProvenanceLongArtifactDir`：**同時**把 `pipeline_diagnostics_path` 設為極長字串，mock `log_params_safe`，assert **仍只呼叫一次**且不 raise（與現有 artifact_dir 契約一致）。
+
+### 4. 安全性／隱私：完整本機路徑寫入 Tracking
+
+- **問題**：`pipeline_diagnostics_path` 與其他 `*_path` 一樣，會把**本機絕對路徑**送到 MLflow tracking store；若 experiment 權限寬鬆或外洩 UI，會暴露目錄結構（使用者名、專案路徑等）。此為**既有 provenance 設計的延伸**，非全新風險，但暴露面略增。
+- **具體修改建議**：在 `phase2_provenance_schema.md` 或資安 runbook 加一行 **「路徑可能含敏感目錄資訊；多租戶或外聯 tracking 請評估是否改記相對路徑或 hash。」** 進階：環境變數開關只 log `rel` 鍵、不 log 絕對路徑（需產品決策）。
+- **希望新增的測試**：不需強行自動化；若實作 redaction，再以 **單元測試** assert `log_params_safe` 收到之 dict 不含絕對路徑前綴。
+
+### 5. 失敗一致：`pipeline_diagnostics.json` 寫入失敗
+
+- **問題**：若 `_write_pipeline_diagnostics_json` 丟例外被吃掉，params 仍宣稱路徑、但 **Artifact 迴圈不會上傳該檔**（`is_file()` 為假）。觀察者可能以為「上傳失敗」而非「根本沒寫出」。
+- **具體修改建議**：在 warning log 中帶上 **預期路徑**（已有 exception）；可選 **tag** `pipeline_diagnostics_missing_after_write=1` 僅在 write 失敗時設定。避免與正常「檔案不存在」混淆。
+- **希望新增的測試**：整合測試 mock `_write_pipeline_diagnostics_json` 拋錯後，assert 後續 `log_artifact_safe` **不**以該檔為目標（呼叫次數或 path 列表），並可選 assert logger／tag 行為（若實作 tag）。
+
+### 6. 語意混淆：params 中的 `rel` vs MLflow Artifact 路徑 `bundle/`
+
+- **問題**：Schema 描述 `pipeline_diagnostics_rel_path` 為 **bundle／deploy 慣例**（如 `models/pipeline_diagnostics.json`）；實際 `log_artifact_safe` 使用 **`artifact_path="bundle"`**，UI 上路徑為 **`bundle/pipeline_diagnostics.json`**。新手可能以為兩者應字面相等。
+- **具體修改建議**：在 `phase2_provenance_schema.md` 或 `plan_pipeline_diagnostics_and_mlflow_artifacts.md` 加一句對照表：**params 的 rel = 本機 bundle 目錄慣例；MLflow UI 下載路徑 = `bundle/<檔名>`。**
+- **希望新增的測試**：**文件契約**為主；可選 `tests/review_risks` 字串／註解測試 assert 兩份 doc 均含 `bundle/` 說明（易脆，低優先）。
+
+### 7. 效能（邊際）
+
+- **問題**：`log_params_safe` 仍為**單次** `mlflow.log_params`（整包 dict），多兩鍵幾乎不增加 round-trip；**重試退避**仍由整包失敗觸發，與先前相同。
+- **具體修改建議**：無需為兩鍵拆 batch；若未來 param 再膨脹，再評估拆分或截斷。
+- **希望新增的測試**：不需要專項測試。
+
+---
+
+**結論**：目前實作在**型別／預設推導／與 schema 對齊**上合理；最大**實務風險**是 **provenance 與檔案寫入的時序**（誤讀 UI）以及 **rel_path 極端 `artifact_dir`**。建議優先處理 **§1（順序或文件）** 與 **§2（fallback）**，其餘以文件與選擇性 tag／截斷補強。
+
+---
+
+## Reviewer 風險 → 測試防護（僅 tests｜2026-03-21）
+
+**前置**：已讀 `.cursor/plans/PLAN.md`、根目錄 `STATUS.md`、`.cursor/plans/DECISION_LOG.md`；**未改 production**，僅新增／延伸測試。未新增獨立 lint／typecheck 規則（§4 依 review 不強制自動化；§7 無專項測試）。
+
+### 新增／修改檔案
+
+| 檔案 | 對應 Review 小節 | 行為摘要 |
+|------|------------------|----------|
+| `tests/review_risks/test_review_risks_pipeline_provenance_review.py`（新） | §1 | `run_pipeline` 原始碼中 **`_log_training_provenance_to_mlflow` 位於 `_write_pipeline_diagnostics_json` 之前**（契約：params 可能早於檔案；若產線改順序須改測試）。 |
+| 同上 | §2 | 若平台存在 `Path(artifact_dir).name == ""`，mock 後 assert 目前 **`pipeline_diagnostics_rel_path == "/pipeline_diagnostics.json"`**（MRE：前導 `/`）；無此路徑則 **skip**。 |
+| 同上 | §5 | 小檔 bundle 區段原始碼含 **`if _ap.is_file():`** 且涵蓋 **`pipeline_diagnostics.json`**。 |
+| 同上 | §6 | `doc/phase2_provenance_schema.md` 與 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` 均含字串 **`bundle/`**（文件契約）。 |
+| `tests/integration/test_phase2_trainer_mlflow.py` | §3 | `TestLogProvenanceLongArtifactDir::test_long_artifact_dir_and_long_pipeline_diagnostics_path_single_log_call`：極長 `artifact_dir` + 顯式極長 `pipeline_diagnostics_path`，**`log_params_safe` 仍只呼叫一次**且不 raise。 |
+
+**未自動化**：§4（路徑隱私／redaction，待產品決策後再測）；§5 的「mock 整段 `run_pipeline` 寫檔失敗 → artifact 呼叫次數」留待未來整合測試（本次以 **§5 原始碼 `is_file` 守衛** 契約代替）。
+
+### 執行方式
+
+```bash
+# 僅本批 review 測試
+python -m pytest tests/review_risks/test_review_risks_pipeline_provenance_review.py \
+  tests/integration/test_phase2_trainer_mlflow.py -q --tb=short
+
+# 全倉回歸
+python -m pytest -q --tb=short
+```
+
+### 驗證（本機）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/review_risks/test_review_risks_pipeline_provenance_review.py tests/integration/test_phase2_trainer_mlflow.py -q --tb=short` | **11 passed** |
+| `python -m pytest -q --tb=short` | **1261 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+
+---
+
+## 品質闸門確認輪（2026-03-21｜實作無變更）
+
+- **依據**：使用者要求通過 tests／typecheck／lint，且**不修改 tests**（除非測試錯或 decorator 過時）；本輪**無 production 變更**。
+- **文件**：`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §6 進度補列 **`test_review_risks_pipeline_provenance_review.py`** 與 integration 延伸；`.cursor/plans/PLAN.md` Pipeline 條目 §6 測試檔案列表同步。
+- **驗證（本機）**：
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest -q --tb=short` | **1261 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+| `python -m ruff check .` | All checks passed |
+| `python -m mypy trainer/ package/ --ignore-missing-imports` | Success: no issues found in 51 source files |
+
+---
+
+## Pipeline 計畫 §7 文件（2026-03-21）
+
+**前置**：已讀 `.cursor/plans/PLAN.md`、根目錄 `STATUS.md`、`.cursor/plans/DECISION_LOG.md`。本次僅實作計畫 **§7 下 1–2 步**（README 產物說明 + `mlflow.env.example` UI 註解），**未改 production／tests**。
+
+### 變更檔案
+
+| 檔案 | 摘要 |
+|------|------|
+| `README.md` | 繁中／簡中「產物」、英文 **Artifacts**：列入 **`pipeline_diagnostics.json`**（耗時、RSS、OOM 預檢比、與 `training_metrics.json` 分檔）；**部署建包**與 **MLflow Artifacts `bundle/`**；連結 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`、`doc/phase2_provenance_schema.md`。 |
+| `credential/mlflow.env.example` | system metrics 區塊末補 **MLflow UI → run → Metrics** 可檢視 **`system/*`** 之註解。 |
+| `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` | 頂部狀態 **§7 已實作**；§7 條目改為已實作說明。 |
+| `.cursor/plans/PLAN.md` | Pipeline 條目：**§7 已實作**；§8 手動驗收仍待。 |
+
+### 手動驗證建議
+
+1. 瀏覽 `README.md` 三語「產物／Artifacts」小節，確認 `pipeline_diagnostics.json` 與 MLflow `bundle/` 描述可讀且連結有效。  
+2. 開啟 `credential/mlflow.env.example`，確認 Metrics／`system/*` 註解與 §3 既有說明一致。
+
+### 下一步建議
+
+- **§8**：依 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §8 手動驗收清單勾選。  
+- **§6 其餘**：JSON 形狀測試、`copy_model_bundle` 缺檔 warning 等（若仍要自動化）。
+
+### 驗證（本機）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest -q --tb=short` | **1261 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+
+---
+
+## Code Review：Pipeline §7 文件變更（README、`mlflow.env.example`、計畫 doc）（2026-03-21）
+
+**前置**：已讀 `.cursor/plans/PLAN.md`、根目錄 `STATUS.md`、`.cursor/plans/DECISION_LOG.md`；對照 `README.md`（繁／簡／英）、`credential/mlflow.env.example`、`trainer/training/trainer.py` 之 `MODEL_DIR`、`trainer/core/config.py` 之 `DEFAULT_MODEL_DIR`、`package/build_deploy_package.py` 與 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §8。本次變更為**文件層**，無程式邏輯 diff，但與**執行期預設路徑**對照後仍有風險點。
+
+### 1. 文件與預設 `MODEL_DIR` 不一致（最可能誤導）
+
+- **問題**：`README.md` 產物小節以 **`trainer/models/`** 為主敘述；實際 **`trainer/core/config.py`** 之 **`DEFAULT_MODEL_DIR`** 為 **`out/models`**（`trainer/training/trainer.py` 使用 `MODEL_DIR = getattr(_cfg, "DEFAULT_MODEL_DIR", …)`）。新讀者會以為檔案總在 `trainer/models/`，本機預設寫入卻常為 **`out/models/`**，與計畫 doc §8「或 `out/models/`，依 `MODEL_DIR`」**不一致**，屬**操作／排查**風險（找不到 `pipeline_diagnostics.json`）。
+- **具體修改建議**：在 README 三語「產物／Artifacts」明確寫出：**預設為 `out/models/`（`config.DEFAULT_MODEL_DIR`）**；`trainer/models/` 僅在自訂 `MODEL_DIR` 或特定流程時適用。可補「部署以環境變數 `MODEL_DIR` 指向產物目錄」。
+- **希望新增的測試**：`tests/review_risks` 輕量契約：`README.md` 須提及 **`out/models`** 或 **`MODEL_DIR`**（與 `pipeline_diagnostics` 同現），避免與 `config` 預設再次漂移；或僅斷言不得**只**描述 `trainer/models/` 而無上述其一（依團隊選定用語調整）。
+
+### 2. 「Artifacts 小檔」集合與存在條件
+
+- **問題**：README 寫「上述小檔」可出現在 MLflow **`bundle/`**；實作為**逐檔 `if _ap.is_file()`** 上傳，**缺檔則不傳**。讀者若理解成每次 run 必有完整檔案組，會與實際不符。
+- **具體修改建議**：補一句：**僅本機該路徑檔案存在時才上傳**（與 `run_pipeline` 迴圈一致），與建包「缺檔僅 warning」並列。
+- **希望新增的測試**：文件契約：assert `README.md`（至少英文塊）同時含 **`bundle/`** 與 **「存在／present／若」** 類語意之一；或延伸既有 pipeline review 測試改讀 README 對應段（注意三語）。
+
+### 3. MLflow Parameters 與 Artifacts 時間語意（與既有 §5 Review 疊加）
+
+- **問題**：README 未提醒 **provenance params** 可能在**診斷檔寫入前**已出現在 run（見本檔先前「Code Review：§5 Provenance」）。讀者僅看 Parameters 可能誤以為檔案已落地。
+- **具體修改建議**：在 README「部署／MLflow」或連結之 doc 加一句：**以本機檔案或 Artifacts 列表為準；Parameters 路徑為約定位置**。
+- **希望新增的測試**：低優先；可選 assert `doc/phase2_provenance_query_runbook.md` 已涵蓋（既有），不必重複 README。
+
+### 4. `mlflow.env.example` 註解中的 `**`（Markdown）
+
+- **問題**：`# UI: … **Metrics** …` 在 shell 註解中略顯突兀，**無安全或執行風險**。
+- **具體修改建議**：改為純文字 `Metrics tab`／`Metrics 分頁`，去掉星號。
+- **希望新增的測試**：不需要。
+
+### 5. 三語 README 維護與漂移
+
+- **問題**：繁／簡／英三處產物描述需同步維護，未來若 `BUNDLE_FILES` 或上傳清單變更易漏改。
+- **具體修改建議**：以 **`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`** 為細節 SSOT，README 縮為摘要＋連結；或於 CONTRIBUTING／PR 說明提醒三語。
+- **希望新增的測試**：可選：三語區塊均含 `pipeline_diagnostics.json` 與 `bundle/` 的計數一致（弱契約）。
+
+### 6. 安全性／效能
+
+- **安全性**：未新增秘密或對外端點；**無實質新暴露面**。  
+- **效能**：純文件，**無**執行期影響。
+
+---
+
+**結論**：§7 方向正確（分檔、建包、`bundle/`、doc 連結）。**最優先**是將 README 與**預設 `MODEL_DIR`＝`out/models`**對齊；其餘為精確化 best-effort／UI 語意與可選契約測試。
+
+---
+
+## Code Review：Pipeline §7 文件變更（README、`mlflow.env.example`、計畫 doc）（2026-03-21）
+
+**前置**：已讀 `.cursor/plans/PLAN.md`、根目錄 `STATUS.md`、`.cursor/plans/DECISION_LOG.md`；對照 `README.md`（繁／簡／英）、`credential/mlflow.env.example`、`trainer/training/trainer.py` 之 `MODEL_DIR`、`package/build_deploy_package.py` 行為與 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §8。本次變更為**文件層**，無程式邏輯 diff，但**與執行期預設路徑**對照後仍有風險點。
+
+### 1. 文件與預設 `MODEL_DIR` 不一致（最可能誤導）
+
+- **問題**：`README.md` 產物小節以 **`trainer/models/`** 為主敘述；實際 **`trainer/core/config.py`** 之 **`DEFAULT_MODEL_DIR`** 為 **`out/models`**（`trainer/training/trainer.py` 使用 `MODEL_DIR = getattr(_cfg, "DEFAULT_MODEL_DIR", …)`）。新讀者會以為檔案總在 `trainer/models/`，實際本機預設寫入 **`out/models/`**，與計畫 doc §8「或 `out/models/`，依 `MODEL_DIR`」**不一致**，屬**操作／排查 bug 風險**（找不到 `pipeline_diagnostics.json`）。
+- **具體修改建議**：在 README 三語「產物／Artifacts」首句或註腳明写：**預設目錄為 `out/models/`（`config.DEFAULT_MODEL_DIR`）**；`trainer/models/` 僅在自訂 `MODEL_DIR` 或歷史慣例時適用。並可加一句「部署時通常以環境變數 `MODEL_DIR` 指向產物目錄」。
+- **希望新增的測試**：`tests/review_risks` 輕量契約：`README.md` 須同時出現 **`pipeline_diagnostics.json`** 與 **`out/models`** 或 **`MODEL_DIR`**（擇一明確策略），避免與 `trainer/core/config.py` 預設再次漂移；或讀取 `config.DEFAULT_MODEL_DIR` 的父目錄名稱與 README 字串交叉斷言（較脆，可僅斷言「不得只寫 trainer/models 而無 out/models／MODEL_DIR 提示」）。
+
+### 2. 「Artifacts 小檔」集合與存在條件
+
+- **問題**：README 寫「上述小檔」可出現在 MLflow **`bundle/`**；實作為**逐檔 `if _ap.is_file()`** 上傳，**缺檔則不傳**。讀者若理解成「每次 run 必有完整四檔」會與實際不符（例如診斷寫入失敗、或某檔未產出）。
+- **具體修改建議**：在 README 一句話補充：**僅當本機該路徑檔案存在時才上傳**（與 `run_pipeline` 迴圈一致）；與建包「缺檔僅 warning」並列，降低「以為上傳失敗」的誤判。
+- **希望新增的測試**：文件契約：`tests/review_risks` 中 assert `README.md` 同時含 **`best-effort`**（或「若存在／when present」類字眼）與 **`bundle/`**；或延伸既有 `test_review_risks_pipeline_provenance_review.py` 之 doc 讀取，改為讀 `README.md` 對應段落（需注意三語維護成本）。
+
+### 3. MLflow「Parameters」與「Artifacts」時間語意（與既有 Code Review 疊加）
+
+- **問題**：README 未說明 **provenance params**（含 `pipeline_diagnostics_path`）可能在**檔案寫入前**已記錄至 run（見 STATUS 既有「§5 Provenance」Code Review）。讀者若只依 MLflow UI params 判斷「檔案已落地」仍可能誤判；§7 文件**未減輕**該混淆。
+- **具體修改建議**：在 README「部署／MLflow」子彈或 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` 交叉連結一句：**以本機檔案或 Artifacts 實際列表為準；Parameters 內路徑為約定位置**（與 runbook／schema 一致即可）。
+- **希望新增的測試**：非必須；若要做文件契約，assert `README.md` 或 `doc/phase2_provenance_query_runbook.md` 含 **「Parameters」** 與 **「Artifacts」** 區分之關鍵字（易脆，低優先）。
+
+### 4. `credential/mlflow.env.example` 註解中的 Markdown 星號
+
+- **問題**：註解含 **`**Metrics**`**（Markdown 慣例），在純文字／部分工具檢視時顯得突兀；**無安全性或執行風險**，僅可讀性與複製貼上時的雜訊。
+- **具體修改建議**：改為純文字：`Metrics tab` 或 `Metrics 分頁`，去掉 `**`。
+- **希望新增的測試**：不需要；若堅持風格一致，可選 **單次** grep 測試確保 example 檔 `# UI:` 行存在且不含連續 `**`（極低價值）。
+
+### 5. 三語 README 維護成本與漂移
+
+- **問題**：繁／簡／英已同步新增段落，**未來**若調整上傳檔名列表或 `BUNDLE_FILES`，需改三處，易漏改。
+- **具體修改建議**：在 **PROJECT.md** 或 **plan_pipeline** doc 設「單一 SSOT」表格，README 僅保留一行「詳見 doc/…」；或接受現狀但在 PR template 提醒三語產物小節。
+- **希望新增的測試**：可選：assert 三語區塊均含 **`pipeline_diagnostics.json`** 與 **`bundle/`** 字串計數一致（弱契約）；成本與脆度需權衡。
+
+### 6. 安全性／效能
+
+- **安全性**：§7 變更未引入新秘密或對外端點；連結均為 repo 內相對路徑。**無新增實質暴露面**。
+- **效能**：純文件，**無**執行期影響。
+
+---
+
+**結論**：§7 內容方向正確（分檔語意、建包、`bundle/`、連結計畫 doc）。**最需優先修正的是 README 與預設 `MODEL_DIR`（`out/models`）的對齊**，否則最容易造成「找不到 `pipeline_diagnostics.json`」的運維問題；其餘為**精確化 best-effort／UI 語意**與**可選契約測試**。
+
+---
+
+## Reviewer 風險（Pipeline §7 文件）→ 測試防護（僅 tests｜2026-03-21）
+
+**前置**：已讀 `.cursor/plans/PLAN.md`、根目錄 `STATUS.md`、`.cursor/plans/DECISION_LOG.md`；該輪**僅新增** `tests/review_risks/test_review_risks_readme_pipeline_artifacts_doc_contract.py`（後續已依 Review 結論更新 **README**／**mlflow.env.example**／計畫 doc，見下節「README／`mlflow.env.example` 對齊」）。
+
+### 對照 STATUS「Code Review：Pipeline §7」
+
+| Review 小節 | 測試類／方法 | 說明 |
+|-------------|--------------|------|
+| §1 | `TestReviewerS7ConfigDefaultModelDirMre` | `trainer/core/config.py` 中 **`DEFAULT_MODEL_DIR`** 賦值右側含 **`out`** 與 **`models`**（MRE：實際預設目錄）。 |
+| §1（SSOT 橋接） | `TestReviewerS7ReadmeLinksPlanWithModelDirHint` | **`README.md`** 含 **`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`**；該 plan 正文含 **`out/models`** 或 **`MODEL_DIR`**。 |
+| §2 | `TestReviewerS7ReadmeConditionalUploadWording` | 繁／簡／英產物區塊內部署說明同時含 **`bundle/`**、**`best-effort`**，以及 **「有該檔／when present／来源目录」** 等條件語意之一。 |
+| §3 | `TestReviewerS7ProvenanceRunbookParamsVsArtifacts` | **`doc/phase2_provenance_query_runbook.md`** 含 **`**Parameters**`** 與 **`**Artifacts**`**。 |
+| §5 | `TestReviewerS7TrilingualPipelineDiagnosticsParity` | 繁／簡／英產物區塊中 **`pipeline_diagnostics.json`** 與 **`bundle/`** 出現**次數**兩兩一致。 |
+| §4 | （略） | Review 註記可不測；另附 **`TestReviewerS7MlflowEnvExampleUiCommentExists`**：`credential/mlflow.env.example` 含 **`# UI:`** 與 **`system/`**。 |
+
+**補註**：README 產物小節已於後續輪次補上 **`MODEL_DIR`／`out/models`** 路徑說明；測試仍保留 **config MRE + plan doc 橋接** 與條件語意／三語計數等契約。
+
+### 執行方式
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_readme_pipeline_artifacts_doc_contract.py -q --tb=short
+python -m pytest -q --tb=short
+```
+
+### 驗證（本機）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/review_risks/test_review_risks_readme_pipeline_artifacts_doc_contract.py -q --tb=short` | **9 passed** |
+| `python -m pytest -q --tb=short` | **1270 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+
+---
+
+## README／`mlflow.env.example` 對齊 Code Review §7（2026-03-21）
+
+**前置**：已讀 `.cursor/plans/PLAN.md`、根目錄 `STATUS.md`、`.cursor/plans/DECISION_LOG.md`。依 STATUS「Code Review：Pipeline §7」**結論**補強文件（**未改 tests**）。
+
+### 變更檔案
+
+| 檔案 | 摘要 |
+|------|------|
+| `README.md` | 繁中／簡中「產物」、英文 **Artifacts**：新增路徑說明區塊——預設 **`MODEL_DIR`＝`out/models/`**（`trainer/core/config.py` 之 **`DEFAULT_MODEL_DIR`**）、**`MODEL_DIR`** 環境變數覆寫；並說明 **`trainer/models/`** 為慣用簡稱。 |
+| `credential/mlflow.env.example` | UI 註解改為純文字 **Metrics tab**（去掉 Markdown `**`，對齊 Review §4）。 |
+| `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` | §6 進度補列 **`test_review_risks_readme_pipeline_artifacts_doc_contract.py`**；§7 README 條目補「`MODEL_DIR`／`out/models`」註記。 |
+| `.cursor/plans/PLAN.md` | Pipeline 條目：§6 測試列表含 **`test_review_risks_readme_pipeline_artifacts_doc_contract.py`**；§7 括註 README 已含 `MODEL_DIR`／`out/models`。 |
+
+### 手動驗證建議
+
+1. 完成一次本機訓練後，確認 `pipeline_diagnostics.json` 出現在 **`out/models/`**（未設 `MODEL_DIR` 時）。  
+2. 瀏覽 README 三語產物小節，確認路徑說明與下文檔名列表可連貫閱讀。
+
+### 下一步建議
+
+- **§8**：手動驗收清單（`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §8）。  
+- **§6 其餘**：JSON 形狀、`copy_model_bundle` 缺檔 warning 等自動化。
+
+### 驗證（本機）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest -q --tb=short` | **1270 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+| `python -m ruff check .` | All checks passed |
+| `python -m mypy trainer/ package/ --ignore-missing-imports` | Success: no issues found in 51 source files |
+
+---
+
+## Pipeline 計畫 §6 兩步（2026-03-21）：計畫 doc §2 對齊實作 + 單元測試
+
+**前置**：已讀 `.cursor/plans/PLAN.md`、根目錄 `STATUS.md`、`.cursor/plans/DECISION_LOG.md`。本次為計畫 **§6 下 1–2 步**：（1）**文件**：`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §2 改為與現有 **`copy_model_bundle`** 行為一致（缺 **`pipeline_diagnostics.json`** 已 **`logger.warning`**）；（2）**測試**：新增 **`tests/unit/test_pipeline_diagnostics_build_and_bundle.py`**（JSON 形狀、`assertLogs` 驗證缺檔 warning）。**未改** `package/build_deploy_package.py`（warning 早已存在）。
+
+### 變更檔案
+
+| 檔案 | 摘要 |
+|------|------|
+| `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` | §2 缺檔說明改為「已實作」；§6 進度列出新單元測試並縮小「仍缺」範圍。 |
+| `tests/unit/test_pipeline_diagnostics_build_and_bundle.py`（新） | `_write_pipeline_diagnostics_json`：合法 JSON、必要鍵、**省略 `None` 鍵**；`copy_model_bundle`：無 **`pipeline_diagnostics.json`** 時出現 **WARNING** 且訊息含檔名。 |
+| `.cursor/plans/PLAN.md` | Pipeline 條目 §6 括註補 **`test_pipeline_diagnostics_build_and_bundle.py`**。 |
+
+### 手動驗證建議
+
+1. 建一個僅含 **`model.pkl`** + **`feature_list.json`** 的目錄，對該目錄執行建包流程中會呼叫的 **`copy_model_bundle`**（或完整 **`python -m package.build_deploy_package --model-source <該目錄>`**），確認 log 出現 **missing optional pipeline_diagnostics.json** 類 warning，且建包仍成功。  
+2. 訓練成功後打開 **`MODEL_DIR/pipeline_diagnostics.json`**，對照測試中斷言之欄位語意（時間、duration、OOM／RSS 等）。
+
+### 下一步建議
+
+- **§6 仍缺**：完整 mock **`log_artifact_safe`** 呼叫清單、OOM／RSS 採樣細測等。  
+- **§8**：手動驗收清單。
+
+### 驗證（本機）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/unit/test_pipeline_diagnostics_build_and_bundle.py -q --tb=short` | **2 passed** |
+| `python -m pytest -q --tb=short` | **1272 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+| `python -m ruff check tests/unit/test_pipeline_diagnostics_build_and_bundle.py` | All checks passed |
+
+---
+
+## Code Review：`pipeline_diagnostics` 寫檔、`copy_model_bundle` 與 §6 單元測試（2026-03-21）
+
+**前置**：已讀 `.cursor/plans/PLAN.md`、根目錄 `STATUS.md`、`.cursor/plans/DECISION_LOG.md`；對照 `trainer/training/trainer.py` 之 **`_write_pipeline_diagnostics_json`**、`package/build_deploy_package.py` 之 **`copy_model_bundle`**、`tests/unit/test_pipeline_diagnostics_build_and_bundle.py`、`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §2／§6。以下為**最可能**風險與建議（非 exhaustive）。
+
+### 1. 寫入非原子：`pipeline_diagnostics.json` 可能在程序崩潰時殘留半檔
+
+- **問題**：`_write_pipeline_diagnostics_json` 直接 **`write_text`** 至最終路徑，無 **`os.replace`／tmp 同目錄** 模式。若進程在寫入中途被殺，下游可能讀到**截斷或無效 JSON**（機率低，但診斷檔常被自動化讀取）。
+- **具體修改建議**：與 `save_artifact_bundle` 內其他檔案一致，改為寫 **`pipeline_diagnostics.json.tmp`** 再 **`os.replace`**；失敗時保留舊檔或僅刪 tmp。
+- **希望新增的測試**：單元測試 mock `Path.write_text` 第一次拋錯、第二次成功，或僅斷言實作使用 **`.tmp` + replace**（若改實作後以原始碼契約測試鎖定）。
+
+### 2. `json.dumps(..., default=str)` 掩蓋型別錯誤
+
+- **問題**：若未來誤傳 **非 JSON 相容型別**（例如自訂物件），會被 **`str()`** 靜默序列化，檔案仍「合法 JSON」但**語意錯誤**，難以在執行期察覺。
+- **具體修改建議**：對已知欄位維持 **float／str**；可選在 helper 內對 payload 做 **`isinstance` 檢查**並在開發模式 `logger.warning`，或移除 `default=str` 讓錯誤在測試／staging 暴露。
+- **希望新增的測試**：傳入非法型別（若 API 允許）時 assert **raise** 或 **log**；或 contract：僅允許 `Optional[float]`／`str` 等，以 **mypy overload／TypedDict** 強化（靜態闸門）。
+
+### 3. `if v is not None` 與「省略鍵」語意
+
+- **問題**：**`0.0`、空字串 `""`** 會被寫入（非 `None`）；若未來把「未採樣」與「數值為 0」混用同一欄位，Reader 難區分。目前 run_pipeline 多傳 `None` 表示缺值，**風險中等**。
+- **具體修改建議**：在 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` 或 docstring 明写：**僅 `None` 省略；數值 0 表示已測得 0**。若語意上要「未知」與「零」分離，改為省略鍵 vs 顯式 `null`（需全鏈路一致）。
+- **希望新增的測試**：單元測試 **`step7_duration_sec=0.0`** 時鍵**存在**且值為 **0.0**；與 **`None`** 省略對照。
+
+### 4. `copy_model_bundle`：僅 `pipeline_diagnostics.json` 缺檔有 warning
+
+- **問題**：**設計符合計畫**；但若日後將其他檔案也標為「可選但應有」，易**只加 `BUNDLE_FILES` 名稱而忘記加 `elif`**，回到靜默略過。
+- **具體修改建議**：將「缺檔需 warning 的檔名」抽成常數 **`BUNDLE_OPTIONAL_WARN_IF_MISSING: frozenset[str]`**，迴圈內 **`elif name in BUNDLE_OPTIONAL_WARN_IF_MISSING`**，避免硬編碼單一檔名。
+- **希望新增的測試**：契約測試：`BUNDLE_OPTIONAL_WARN_IF_MISSING == frozenset({"pipeline_diagnostics.json"})`（或與實作同步）；或參數化多檔名（若擴充）。
+
+### 5. 單元測試對 `assertLogs` 的穩健性
+
+- **問題**：目前只斷言訊息含 **`pipeline_diagnostics.json`** 與 **missing/omit**；若未來同一函式多發一條 **WARNING**，測試仍通過；若訊息模板改成不含 **「missing」** 英文（僅本地化），測試可能**脆斷**。
+- **具體修改建議**：優先斷言 **`logger.warning` 呼叫次數**（對該分支為 1）與 **`%` 參數** 為檔名；或 mock `logger.warning`。
+- **希望新增的測試**：**`assertEqual(len(cm.records), 1)`**（在僅預期一條 warning 的前提下）；或 **`patch.object`** 驗證 **`warning`** 被呼叫且 `args` 含檔名。
+
+### 6. 安全性／隱私
+
+- **問題**：`pipeline_diagnostics.json` 目前多為**耗時與記憶體指標**；若未來欄位擴充含**本機絕對路徑、使用者名、叢集內部名**，經建包複製後可能進入**不可信媒體**。
+- **具體修改建議**：在計畫 doc 或 schema 註明**禁止**寫入秘密與可識別個資；審查新增欄位 PR。
+- **希望新增的測試**：靜態／review checklist 為主；可選 **正則** 斷言 JSON **鍵名白名單**（易脆，低優先）。
+
+### 7. 效能
+
+- **問題**：診斷檔體積小，**I/O 可忽略**；`copy_model_bundle` 對大目錄 **`rmtree`** 仍為既有行為，與本輪無關。
+- **具體修改建議**：無需為診斷檔單獨優化。
+- **希望新增的測試**：不需要。
+
+---
+
+**結論**：§6 新測試**正確鎖定**「JSON 形狀＋省略 `None`」與「缺 **`pipeline_diagnostics.json`** 會 **warning**」兩條產品契約；計畫 doc §2 與實作已對齊。**最值得後續處理**的是 **寫入原子性** 與 **`default=str` 的除錯可見性**；其餘為**擴充維護性**與**測試精緻度**。
+
+---
+
+## Reviewer 風險（`pipeline_diagnostics` 寫檔／`copy_model_bundle`）→ 測試防護（僅 tests｜2026-03-21）
+
+**前置**：已讀 `.cursor/plans/PLAN.md`、根目錄 `STATUS.md`、`.cursor/plans/DECISION_LOG.md`；對照 STATUS 段落「Code Review：`pipeline_diagnostics` 寫檔…」。**未改 production**，僅新增／延伸測試。
+
+### 新增／修改檔案
+
+| 檔案 | 對應 Review 小節 | 行為摘要 |
+|------|------------------|----------|
+| `tests/review_risks/test_review_risks_pipeline_diagnostics_write_review.py`（新） | §1 | **`_write_pipeline_diagnostics_json`** 原始碼含 **`write_text`**、**不含** **`os.replace`**（MRE：目前非原子寫入；日後改 tmp+replace 須更新本測試）。 |
+| 同上 | §2 | 原始碼含 **`json.dumps`** 與 **`default=str`**（MRE：`default=str` 靜默型別寬鬆行為）。 |
+| 同上 | §4 | **`copy_model_bundle`** 原始碼含 **`elif name == "pipeline_diagnostics.json":`** 與 **`logger.warning`**（契約：僅此檔名走缺檔 warning 分支）。 |
+| `tests/unit/test_pipeline_diagnostics_build_and_bundle.py` | §3 | **`step7_duration_sec=0.0`** 寫入 JSON 且值為 **0.0**（與 **`None`** 省略對照）。 |
+| 同上 | §2 | 傳入 **`total_duration_sec=_Weird()`**（`__str__` 有標記），斷言 JSON 中為字串 **`WEIRD_MARKER`**（`default=str` 風險 MRE）。 |
+| 同上 | §5 | **`assertLogs`** 後 **`len(cm.records) == 1`**（缺 **`pipeline_diagnostics.json`** 時僅一則 WARNING）。 |
+
+**未自動化**：Review §6（金鑰白名單）、§7（效能）— 與 Review 結論一致。
+
+### 執行方式
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_pipeline_diagnostics_write_review.py \
+  tests/unit/test_pipeline_diagnostics_build_and_bundle.py -q --tb=short
+python -m pytest -q --tb=short
+```
+
+### 驗證（本機）
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/review_risks/test_review_risks_pipeline_diagnostics_write_review.py tests/unit/test_pipeline_diagnostics_build_and_bundle.py -q --tb=short` | **7 passed** |
+| `python -m pytest -q --tb=short` | **1277 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+| `python -m ruff check tests/review_risks/test_review_risks_pipeline_diagnostics_write_review.py tests/unit/test_pipeline_diagnostics_build_and_bundle.py` | All checks passed |
+
+---
+
+## 品質闸門確認輪（2026-03-21｜實作無變更）
+
+- **依據**：使用者要求通過 tests／typecheck／lint，且**不修改 tests**（除非測試錯或 decorator 過時）；本輪**無 production 程式變更**。
+- **文件**：`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §6 進度補列 **`test_review_risks_pipeline_diagnostics_write_review.py`** 與單元測試延伸項；`.cursor/plans/PLAN.md` Pipeline 條目 §6 測試列表同步。
+- **驗證（本機）**：
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest -q --tb=short` | **1277 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+| `python -m ruff check .` | All checks passed |
+| `python -m mypy trainer/ package/ --ignore-missing-imports` | Success: no issues found in 51 source files |
+
+---
+
+## Pipeline plan §6 測試補強（2026-03-21）
+
+- **變更檔案**
+  - **新增** `tests/review_risks/test_review_risks_pipeline_plan_section6_contract.py`：`BUNDLE_FILES` 與 `training_metrics.json`／`pipeline_diagnostics.json` 順序；`run_pipeline` MLflow bundle 四檔名 tuple（含尾隨逗號）、迴圈內單一 `log_artifact_safe(_ap`；`step7_rss_*` 與 `memory_info().rss`、`max(start,end)`、`step7_rss_peak_gb / oom_precheck_est_peak_ram_gb` 靜態契約。
+  - **修改** `tests/unit/test_pipeline_diagnostics_build_and_bundle.py`：`test_section6_writes_all_rss_and_oom_ratio_keys_when_provided`（同時寫入 RSS 全鍵與 `oom_precheck_step7_rss_error_ratio`）。
+  - **修改** `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §6 進度段落（補列新測試、收窄「仍缺」為執行期 mock 次數與端到端迷你 pipeline）。
+  - **修改** `.cursor/plans/PLAN.md` Pipeline 條目 §6 測試列表。
+- **手動驗證（本機）**
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/review_risks/test_review_risks_pipeline_plan_section6_contract.py tests/unit/test_pipeline_diagnostics_build_and_bundle.py -q --tb=short` | **18 passed** |
+| `python -m pytest -q --tb=short` | **1291 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+| `python -m ruff check tests/review_risks/test_review_risks_pipeline_plan_section6_contract.py tests/unit/test_pipeline_diagnostics_build_and_bundle.py` | All checks passed |
+
+- **下一步建議**
+  - 若需補滿 plan §6「仍缺」：可對 `run_pipeline` 成功路徑做**極小整合**（patch 重依賴、`MODEL_DIR` 暫存、四個 bundle 檔齊備）並 **mock `log_artifact_safe`**，斷言呼叫次數＝4 與 `artifact_path="bundle"`；或凍結時鐘跑極短 pipeline 斷言 `pipeline_diagnostics.json` 時間欄位。
+  - 若未來 `_write_pipeline_diagnostics_json` 改為 **tmp + `os.replace`**，須同步翻轉 `test_review_risks_pipeline_diagnostics_write_review.py` 契約（該檔註解已標示）。
+
+---
+
+## Pipeline §6 變更 Code Review（2026-03-21｜最高可靠性視角）
+
+**審閱範圍**：`tests/review_risks/test_review_risks_pipeline_plan_section6_contract.py`、`tests/unit/test_pipeline_diagnostics_build_and_bundle.py`（含同檔既有 `copy_model_bundle` 測試）；對照 `trainer/training/trainer.py` 現況。**結論**：靜態契約對「防止 bundle 檔名／順序與除法公式被隨意改掉」有價值；但多項斷言屬**弱契約**或**易碎字串**，存在**假陰性**（測試仍綠但行為已錯）。未發現與本變更直接相關的機密外洩或注入面；**效能**僅多數測試檔導入 `trainer` 大模組的 CI 冷啟動成本，屬可接受量級。
+
+| # | 類型 | 問題（最可能／邊界） | 具體修改建議 | 希望新增的測試 |
+|---|------|----------------------|--------------|----------------|
+| 1 | 假陰性／邊界 | `_bundle_artifact_section` 以非貪婪匹配接到**第一個** `log_metrics_safe(mlflow_metrics)`。若未來在 Phase 2 bundle 註解**之前**又出現同名呼叫（複製區塊、重構漏刪），切片會錯，`for _fname`／`log_artifact_safe` 計次可能對錯區塊仍「碰巧」通過或誤判失敗。 | 切片後加**結構性不變量**：例如 `assert "if has_active_run():" in chunk` 且 `assert "for _fname in" in chunk` 且 `assert "training_metrics.json" in chunk`；或改以「從 `# Phase 2 / pipeline plan` 到固定下一錨點（如 `print("All steps completed`）」閉區間切片，避免依賴全函式內第一次 `log_metrics_safe(mlflow_metrics)`。 | `test_bundle_artifact_chunk_contains_has_active_run_and_fname_loop`：對 `_bundle_artifact_section(_run_pipeline_src())` 斷言上述子字串必現；可選：斷言 chunk 內 `log_metrics_safe(mlflow_metrics)` 出現次數為 1。 |
+| 2 | 假陰性 | `chunk.count("log_artifact_safe(_ap") == 1`：若註解、docstring 或字串常值含同一子字串，計次失真；若合法改成 `log_artifact_safe(path=_ap` 等，測試誤報失敗。 | 優先採 **AST**：解析 `run_pipeline`，定位 `if has_active_run` 下 `for _fname` 的迴圈 body，統計 `log_artifact_safe` 的 `Call` 次數與 `keyword`／位置引數契約；次佳：只匹配「行首非 `#`」的簡化掃描（仍不完美）。 | `test_bundle_for_loop_ast_has_single_log_artifact_safe_call`（或與現有 review_risks 風格一致的 ast 契約測試）。 |
+| 3 | 弱契約 | `step7_rss_*` 的 `assertRegex(..., [^\n]+memory_info\(\)\.rss)` 只要求**同一行**某處出現賦值與 `memory_info().rss`，無法保證語意上仍為「Step7 採樣路徑」或仍在 `try: import psutil` 區塊內；重構可能留下誤導性單行。 | 在測試 docstring 明標「弱契約」；或加**錨點切片**：取 `import psutil as _psutil` 與下一個大區塊邊界之間的子字串再跑相同斷言；長期仍應以**可 mock 的極小整合**補強。 | 選一：`test_rss_assignments_occur_after_psutil_import_in_run_pipeline`（對 `getsource` 做索引切片）；或整合測試 `patch` `psutil.Process` 回傳固定 `rss`，再斷言寫入 diagnostics／MLflow 的數值（成本較高）。 |
+| 4 | 易碎／維護 | `assertIn("step7_rss_peak_gb = max(step7_rss_start_gb, step7_rss_end_gb)", src)` 對空白、換行、formatter 極敏感；**Black** 或多行格式化即失敗。 | 改為允許換行的正則，例如 `re.search(r"step7_rss_peak_gb\s*=\s*max\(\s*step7_rss_start_gb\s*,\s*step7_rss_end_gb\s*\)", src, re.DOTALL)`。 | 不需新測；**替換現有斷言**即可（仍建議跑全套件確認）。 |
+| 5 | 假陰性（語意） | `test_section6_writes_all_rss_and_oom_ratio_keys_when_provided` 手傳 `0.88` 與 `44/50` 一致但未在斷言中建立關係；`_write_pipeline_diagnostics_json` 若未來改為「自動重算 ratio」或靜默覆寫，與 `run_pipeline` 預期可能分歧而測試抓不到。 | 在單元測試內對**寫入結果**加一致性：`assertAlmostEqual(data["oom_precheck_step7_rss_error_ratio"], data["step7_rss_peak_gb"] / data["oom_precheck_est_peak_ram_gb"])`（並註明：此為「檔案內部自洽」，仍非 run_pipeline 計算證明）；或明確註解「僅測 writer 直通，不驗證與 peak 的數學關係」。 | 同上：擴充現有 `test_section6_writes_all_rss_and_oom_ratio_keys_when_provided`；另可選 `test_writer_preserves_caller_supplied_ratio_even_if_inconsistent_with_peak`（若產品決定 writer 不應重算）。 |
+| 6 | 假陰性（除零／條件） | `test_ratio_uses_peak_over_est_peak_ram` 只要求原始碼**出現**除法子字串；**未鎖定** `oom_precheck_est_peak_ram_gb > 0` 與 `if` 區塊。若回歸成無條件除法，子字串仍可能存在於註解或不可達程式。 | 加第二道靜態檢查：在 `oom_precheck_step7_rss_error_ratio =` 賦值前固定視窗（例如前 500 字元）內必須同時出現 `oom_precheck_est_peak_ram_gb > 0`（或與現有 `if (` 多行條件等價的正則）。 | `test_oom_ratio_assignment_preceded_by_positive_precheck_guard`：以 `src.find("oom_precheck_step7_rss_error_ratio")` 與切片斷言 `> 0` 守衛。 |
+| 7 | 邊界／穩健 | `BUNDLE_FILES.index` 在**重複檔名**時仍回傳第一個索引，順序斷言通過但無法發現重複建包項（若重複會導致覆寫或語意混亂）。 | 若 SSOT 要求檔名唯一：`assert len(BUNDLE_FILES) == len(set(BUNDLE_FILES))`；否則在 plan／註解註明「允許重複之意義」。 | `test_bundle_files_filenames_unique`（僅在產品確認應唯一時啟用）。 |
+| 8 | 穩健（同檔） | `test_warns_when_pipeline_diagnostics_json_missing` 要求 **`len(cm.records) == 1`**；若 `copy_model_bundle` 日後對其他可選檔亦 `warning`，測試**假陰性式失敗**（維護噪音）或需整段重寫。 | 改為只斷言「恰有一則與 `pipeline_diagnostics.json` 相關的 WARNING」，例如 `sum(1 for r in cm.records if r.levelno >= logging.WARNING and "pipeline_diagnostics.json" in r.getMessage()) == 1`，其餘 WARNING 另案約定。 | 重構上述測試並加負例／多 warning 的 fixture（若預期未來多檔 optional）。 |
+
+**未列為高優先**：`inspect.getsource` 在極端建置下對純 Python 以外物件失敗——本專案 `run_pipeline` 為一般 def，風險低。**建議後續動作**：優先實作表中 #1、#4、#6（低成本高收益）；#2、#3 依 CI 維護成本再決定是否 AST／整合測試。
+
+---
+
+## Pipeline §6 Reviewer 風險 → MRE 測試落地（2026-03-21｜僅 tests）
+
+**範圍**：對應上一節 Code Review 表 #1–#8；**未改 production**。未新增 ruff／mypy 自訂規則（仍以 pytest 契約為主；`log_artifact_safe` 次數用 **AST** 避免註解誤傷）。
+
+**變更檔案**
+
+| 檔案 | 內容摘要 |
+|------|----------|
+| `tests/review_risks/test_review_risks_pipeline_plan_section6_contract.py` | **#1** `TestSection6BundleArtifactChunkMre`：chunk 必含 `has_active_run`／`for _fname`／`training_metrics.json`，且 chunk 內 `log_metrics_safe(mlflow_metrics)` 恰 1 次。**#2** `_count_log_artifact_safe_calls_in_run_pipeline_ast()` + `test_run_pipeline_ast_exactly_one_log_artifact_safe_call`。**#3** Step7／Step9 **錨點字串** + 賦值順序 MRE（避免誤用較早的 `step7_rss_*` 參數名）。**#4** `max(start,end)` 改 **DOTALL 正則**。**#6** `test_oom_ratio_assignment_preceded_by_positive_precheck_guard`（賦值前視窗含 `oom_precheck_est_peak_ram_gb > 0`）。**#7** `test_bundle_files_filenames_unique`。 |
+| `tests/unit/test_pipeline_diagnostics_build_and_bundle.py` | **#5** `test_section6_*` 內 **`assertAlmostEqual(ratio, peak/precheck)`**；新增 `test_writer_preserves_caller_supplied_oom_ratio_even_if_inconsistent_with_peak`。**#8** 缺檔 warning 改為只計 **訊息含 `pipeline_diagnostics.json` 的 WARNING** 恰 1 則。 |
+
+**執行方式（本機）**
+
+```bash
+# 僅相關套件（最快回歸）
+python -m pytest tests/review_risks/test_review_risks_pipeline_plan_section6_contract.py \
+  tests/unit/test_pipeline_diagnostics_build_and_bundle.py -q --tb=short
+
+# 全套件（與 CI 對齊）
+python -m pytest -q --tb=short
+
+python -m ruff check tests/review_risks/test_review_risks_pipeline_plan_section6_contract.py \
+  tests/unit/test_pipeline_diagnostics_build_and_bundle.py
+```
+
+**驗證（本機）**
+
+| 指令 | 結果 |
+|------|------|
+| 上列兩檔 `pytest` | **18 passed** |
+| `python -m pytest -q --tb=short` | **1291 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+| 上列 `ruff check` 兩檔 | All checks passed |
+
+**注意**：#3 依賴註解錨點（`# optional dependency (best-effort)`、`# T12.2: capture RSS/sys RAM snapshot at Step 9 end`）與賦值行字面量；若重構改名註解，需同步更新測試（屬刻意 MRE 權衡）。
+
+---
+
+## 品質闸門（2026-03-21｜實作無變更）
+
+- **依據**：使用者要求 **不改 tests**（除非測試錯或 decorator 過時），修改實作直至 **tests／typecheck／lint** 全通過；本輪 **production 與 tests 均未修改**（闸門已綠）。
+- **文件**：`.cursor/plans/PLAN.md` Pipeline 條目改為**表格化狀態**（§1–§5／§6／§7／§8）；`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` 頂部狀態與 §6 進度（區分 **AST／靜態已補** vs **可選整合**）已對齊 PLAN。
+- **驗證（本機）**
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest -q --tb=short` | **1291 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+| `python -m pytest tests/review_risks/test_review_risks_round147_plan.py tests/review_risks/test_review_risks_round384_readme_canonical.py -q --tb=short` | **5 passed**（PLAN.md 路徑與「特徵整合計畫」區段契約） |
+| `python -m ruff check .` | All checks passed |
+| `python -m mypy trainer/ package/ --ignore-missing-imports` | Success: no issues found in 51 source files |
+
+- **下一步建議**：執行 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` **§8 手動驗收**；若仍要 §6 可選項，再評估迷你 pipeline 或依存在檔數 mock `log_artifact_safe`（見該 doc §6 bullet）。

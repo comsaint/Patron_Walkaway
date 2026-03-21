@@ -25,23 +25,19 @@ class TestStatusServerStateDbPathEnv(unittest.TestCase):
     """§3: status_server should use STATE_DB_PATH env when set (same as scorer/validator)."""
 
     def test_status_server_state_db_path_under_base_dir(self):
-        """Default: STATE_DB_PATH is under BASE_DIR and ends with local_state/state.db."""
+        """STATE_DB_PATH resolves under project root (same default family as scorer/validator).
+
+        trainer.core.config load_dotenv may set STATE_DB_PATH from credential/.env; the
+        implementation default is PROJECT_ROOT/local_state/state.db (not trainer/).
+        """
         import trainer.status_server as status_server_mod
 
+        self.assertEqual(status_server_mod.STATE_DB_PATH.name, "state.db")
         self.assertTrue(
-            status_server_mod.STATE_DB_PATH.is_absolute() or "local_state" in str(status_server_mod.STATE_DB_PATH),
-            "STATE_DB_PATH should be under BASE_DIR",
+            str(status_server_mod.STATE_DB_PATH).startswith(str(status_server_mod.PROJECT_ROOT)),
+            "STATE_DB_PATH should be under PROJECT_ROOT (repo root)",
         )
-        self.assertEqual(
-            status_server_mod.STATE_DB_PATH.name,
-            "state.db",
-            "Default DB filename is state.db",
-        )
-        base = status_server_mod.BASE_DIR
-        self.assertTrue(
-            str(status_server_mod.STATE_DB_PATH).startswith(str(base)),
-            "STATE_DB_PATH should be under BASE_DIR",
-        )
+        self.assertIn("local_state", str(status_server_mod.STATE_DB_PATH).replace("\\", "/"))
 
     def test_status_server_uses_state_db_path_env_when_set(self):
         """When STATE_DB_PATH is set before first import, status_server must use it."""

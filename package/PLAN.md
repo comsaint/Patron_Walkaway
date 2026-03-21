@@ -9,7 +9,7 @@
 | Item | Current |
 |------|--------|
 | Training output dir | `trainer/models/` (`config.MODEL_DIR`) |
-| Files written by trainer | `model.pkl`, `feature_list.json`, `feature_spec.yaml`, `model_version`, `reason_code_map.json`, `training_metrics.json`, `walkaway_model.pkl` |
+| Files written by trainer | `model.pkl`, `feature_list.json`, `feature_spec.yaml`, `model_version`, `reason_code_map.json`, `training_metrics.json`, `pipeline_diagnostics.json`（訓練診斷，可選打包）, `walkaway_model.pkl` |
 | Scorer reads | `scorer.load_dual_artifacts(model_dir)` from same dir; fallback order: model.pkl → rated_model.pkl → walkaway_model.pkl |
 | API server | `trainer/api_server.py`: port **8000**, paths **/get_alerts**, **/get_validation**; reads `trainer/local_state/state.db` |
 | Protocol | Port **8001**, paths **/alerts**, **/validation**; query/response format in `doc/ML_API_PROTOCOL.md` |

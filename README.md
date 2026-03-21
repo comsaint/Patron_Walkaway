@@ -155,7 +155,11 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 ### 產物（trainer 輸出）
 
-`trainer/models/` 下：`model.pkl`（v10 單一評級客模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 凍結特徵規格，訓練時寫入 bundle，scorer 優先從此載入）、`reason_code_map.json`、`model_version`、`training_metrics.json`（僅 rated 指標）。另保留 legacy `walkaway_model.pkl`。訓練結束後若存在舊版 `nonrated_model.pkl` / `rated_model.pkl` 會自動刪除，避免 scorer/backtester 誤用。
+> **路徑**：預設寫入 **`MODEL_DIR`**＝專案根下 **`out/models/`**（`trainer/core/config.py` 之 **`DEFAULT_MODEL_DIR`**）；可設環境變數 **`MODEL_DIR`** 覆寫。下文 **`trainer/models/`** 表同一 bundle 目錄（慣用簡稱）。
+
+`trainer/models/` 下：`model.pkl`（v10 單一評級客模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 凍結特徵規格，訓練時寫入 bundle，scorer 優先從此載入）、`reason_code_map.json`、`model_version`、`training_metrics.json`（僅 rated 指標）、**`pipeline_diagnostics.json`**（訓練成功後寫入：pipeline 總／步驟耗時、`step7_rss_*`、OOM 預檢與 `oom_precheck_step7_rss_error_ratio` 等資源診斷；與模型效能指標分檔）。另保留 legacy `walkaway_model.pkl`。訓練結束後若存在舊版 `nonrated_model.pkl` / `rated_model.pkl` 會自動刪除，避免 scorer/backtester 誤用。
+
+- **部署／MLflow**：`python -m package.build_deploy_package` 會將 `pipeline_diagnostics.json` 一併拷貝到產物 `models/`（來源目錄有該檔時；缺檔時建包僅 warning）。若已設定 tracking 且該次訓練有 active run，上述小檔另可以 **`bundle/`** 前綴出現在該 run 的 **Artifacts**（best-effort，與 `training_metrics.json` 等並列）。詳見 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`、`doc/phase2_provenance_schema.md`。
 
 ### 注意事項
 
@@ -292,7 +296,11 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 ### 产物（trainer 输出）
 
-`trainer/models/` 下：`model.pkl`（v10 单一评级客模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 冻结特征规格，训练时写入 bundle，scorer 优先从此载入）、`reason_code_map.json`、`model_version`、`training_metrics.json`（仅 rated 指标）。另保留 legacy `walkaway_model.pkl`。训练结束后若存在旧版 `nonrated_model.pkl` / `rated_model.pkl` 会自动删除，避免 scorer/backtester 误用。
+> **路径**：默认写入 **`MODEL_DIR`**＝项目根下 **`out/models/`**（`trainer/core/config.py` 之 **`DEFAULT_MODEL_DIR`**）；可设环境变量 **`MODEL_DIR`** 覆盖。下文 **`trainer/models/`** 表同一 bundle 目录（惯用简称）。
+
+`trainer/models/` 下：`model.pkl`（v10 单一评级客模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 冻结特征规格，训练时写入 bundle，scorer 优先从此载入）、`reason_code_map.json`、`model_version`、`training_metrics.json`（仅 rated 指标）、**`pipeline_diagnostics.json`**（训练成功后写入：pipeline 总/步骤耗时、`step7_rss_*`、OOM 预检与 `oom_precheck_step7_rss_error_ratio` 等资源诊断；与模型效能指标分档）。另保留 legacy `walkaway_model.pkl`。训练结束后若存在旧版 `nonrated_model.pkl` / `rated_model.pkl` 会自动删除，避免 scorer/backtester 误用。
+
+- **部署／MLflow**：`python -m package.build_deploy_package` 会将 `pipeline_diagnostics.json` 一并拷贝到产物 `models/`（来源目录有该档时；缺档时建包仅 warning）。若已设定 tracking 且该次训练有 active run，上述小档另可以以 **`bundle/`** 前缀出现在该 run 的 **Artifacts**（best-effort）。详见 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`、`doc/phase2_provenance_schema.md`。
 
 ### 注意事项
 
@@ -544,6 +552,8 @@ mypy trainer/ --ignore-missing-imports
 
 ## Artifacts (trainer output)
 
+**Path**: The trainer writes to **`MODEL_DIR`**, default **`out/models/`** under the repo root (`DEFAULT_MODEL_DIR` in `trainer/core/config.py`). Override with the **`MODEL_DIR`** environment variable. Below, `trainer/models/` is shorthand for that bundle directory.
+
 Under `trainer/models/`:
 
 - `model.pkl` — Single rated LightGBM model (v10 DEC-021)
@@ -552,6 +562,9 @@ Under `trainer/models/`:
 - `reason_code_map.json` — Feature-to-reason-code mapping for SHAP
 - `model_version` — Version string (e.g. `20260228-153000-abc1234`)
 - `training_metrics.json` — Rated metrics only; flags such as `uncalibrated_threshold`, `sample_rated_n`
+- `pipeline_diagnostics.json` — Written on successful training: pipeline/step timings, `step7_rss_*`, OOM precheck vs observed (`oom_precheck_step7_rss_error_ratio`), etc.; **separate** from model metrics in `training_metrics.json`
+
+**Deploy / MLflow**: `python -m package.build_deploy_package` copies `pipeline_diagnostics.json` into the package `models/` when present (missing file → warning only). With tracking enabled and an active run, small files may also appear under the run’s **Artifacts** with the **`bundle/`** prefix (best-effort). See `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` and `doc/phase2_provenance_schema.md`.
 
 Legacy `walkaway_model.pkl` is still written for backward compatibility. After each run, any stale `nonrated_model.pkl` or `rated_model.pkl` from older dual-model runs is removed so the scorer and backtester do not load them.
 

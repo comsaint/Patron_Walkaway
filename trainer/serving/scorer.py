@@ -1410,7 +1410,22 @@ def score_once(
     # Attach rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
     # Non-rated bets and bets without a prior snapshot keep NaN — LightGBM handles
     # this natively via the default-child path trained in trainer.py (R74/R79).
+    # join_player_profile requires payout_complete_dtm; backfill from bets if missing
+    # (e.g. tests mock build_features_for_scoring, or partial feature frames).
     if _join_profile is not None and PROFILE_FEATURE_COLS and rated_canonical_ids:
+        if (
+            "payout_complete_dtm" not in features_all.columns
+            and "bet_id" in features_all.columns
+            and "payout_complete_dtm" in bets.columns
+        ):
+            _t = bets[["bet_id", "payout_complete_dtm"]].drop_duplicates(
+                subset=["bet_id"], keep="last"
+            )
+            _fa = features_all.copy()
+            if _fa["bet_id"].dtype != _t["bet_id"].dtype:
+                _t = _t.copy()
+                _t["bet_id"] = _t["bet_id"].astype(_fa["bet_id"].dtype)
+            features_all = _fa.merge(_t, on="bet_id", how="left")
         _profile_df = _load_profile_for_scoring(rated_canonical_ids, now_hk)
         if _profile_df is not None:
             features_all = _join_profile(features_all, _profile_df)

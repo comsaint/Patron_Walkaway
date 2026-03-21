@@ -22,7 +22,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # trainer/ (serving lives und
 PROJECT_ROOT = BASE_DIR.parent
 _state_db_env = os.environ.get("STATE_DB_PATH")
 _state_db_effective = _state_db_env.strip() if (_state_db_env and _state_db_env.strip()) else None
-_default_state_db_path = BASE_DIR / "local_state" / "state.db"
+# Default aligns with scorer/validator/api_server: repo root local_state (not trainer/).
+# credential/.env may set STATE_DB_PATH via load_dotenv (override=False).
+_default_state_db_path = PROJECT_ROOT / "local_state" / "state.db"
 STATE_DB_PATH = Path(_state_db_effective) if _state_db_effective else _default_state_db_path
 STATUS_PATH = BASE_DIR / "out_status" / "table_status.json"  # legacy seed only
 HC_PATH = BASE_DIR / "out_status" / "table_hc.csv"  # legacy seed only

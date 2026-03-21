@@ -23,6 +23,7 @@ Usage (from repo root):
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import shutil
 import subprocess
@@ -32,6 +33,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPLOY_DIR = REPO_ROOT / "package" / "deploy"
+
+logger = logging.getLogger(__name__)
 
 # Model/bundle files (pkl, feature_list.json, feature_spec.yaml, etc.)
 BUNDLE_FILES = [
@@ -43,6 +46,7 @@ BUNDLE_FILES = [
     "model_version",
     "reason_code_map.json",
     "training_metrics.json",
+    "pipeline_diagnostics.json",
 ]
 MODEL_PKL_NAMES = ["model.pkl", "rated_model.pkl", "walkaway_model.pkl"]
 
@@ -102,6 +106,11 @@ def copy_model_bundle(source_dir: Path, dest_models: Path) -> None:
         src = source_dir / name
         if src.exists():
             shutil.copy2(src, dest_models / name)
+        elif name == "pipeline_diagnostics.json":
+            logger.warning(
+                "Model source missing optional %s; deploy bundle will omit it.",
+                name,
+            )
 
 
 def write_requirements_txt(out_dir: Path, wheel_filename: str) -> None:

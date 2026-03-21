@@ -20,7 +20,7 @@
    - 以 **Run Name** 搜尋或篩選：輸入 `model_version` 字串（格式通常為 `YYYYMMDD-HHMMSS-<git7>`，例如 `20260318-120000-abc1234`）。
    - 或依 **Start Time** 排序，對照訓練時間找到對應 run。
 4. 點進該 run：
-   - **Parameters** 中可看到：`model_version`、`git_commit`、`training_window_start`、`training_window_end`、`artifact_dir`、`feature_spec_path`、`training_metrics_path`。
+   - **Parameters** 中可看到：`model_version`、`git_commit`、`training_window_start`、`training_window_end`、`artifact_dir`、`feature_spec_path`、`training_metrics_path`、`pipeline_diagnostics_path`、`pipeline_diagnostics_rel_path`。
    - **Artifacts** 若有上傳，可在此檢視或下載。
 
 ---

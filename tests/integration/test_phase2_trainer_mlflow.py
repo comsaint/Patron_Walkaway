@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from trainer.core import mlflow_utils
@@ -78,6 +79,16 @@ class TestTrainerProvenanceParamsPayload(unittest.TestCase):
                 self.assertIn("artifact_dir", params)
                 self.assertIn("feature_spec_path", params)
                 self.assertIn("training_metrics_path", params)
+                self.assertIn("pipeline_diagnostics_path", params)
+                self.assertEqual(
+                    params["pipeline_diagnostics_path"],
+                    str(Path("/art") / "pipeline_diagnostics.json"),
+                )
+                self.assertIn("pipeline_diagnostics_rel_path", params)
+                self.assertEqual(
+                    params["pipeline_diagnostics_rel_path"],
+                    f"{Path('/art').name}/pipeline_diagnostics.json",
+                )
 
     def test_safe_start_run_called_with_run_name_model_version(self):
         """Code Review §3: safe_start_run must be called with run_name=model_version."""
@@ -126,3 +137,24 @@ class TestLogProvenanceLongArtifactDir(unittest.TestCase):
                 mock_log.assert_called_once()
                 (params,) = mock_log.call_args[0]
                 self.assertEqual(params["artifact_dir"], long_path)
+
+    def test_long_artifact_dir_and_long_pipeline_diagnostics_path_single_log_call(
+        self,
+    ):
+        """STATUS Code Review §3: extra long path keys still one log_params_safe (no crash)."""
+        long_path = "C:\\" + "y" * 600
+        long_pd = long_path + "\\pipeline_diagnostics.json"
+        with patch.object(trainer_mod, "safe_start_run") as mock_start:
+            with patch.object(trainer_mod, "log_params_safe") as mock_log:
+                from contextlib import nullcontext
+                mock_start.return_value = nullcontext()
+                _call_log_provenance(
+                    artifact_dir=long_path,
+                    git_commit="abc",
+                    training_metrics_path=long_path + "\\training_metrics.json",
+                    pipeline_diagnostics_path=long_pd,
+                )
+                mock_log.assert_called_once()
+                (params,) = mock_log.call_args[0]
+                self.assertEqual(params["pipeline_diagnostics_path"], long_pd)
+                self.assertGreater(len(params["pipeline_diagnostics_path"]), 500)

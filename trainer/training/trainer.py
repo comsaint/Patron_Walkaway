@@ -52,7 +52,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Set, Tuple, Union, cast
 
@@ -69,6 +69,7 @@ from zoneinfo import ZoneInfo
 from trainer.profile_schedule import latest_month_end_on_or_before, month_end_dates
 from trainer.core.mlflow_utils import (
     has_active_run,
+    log_artifact_safe,
     log_metrics_safe,
     log_params_safe,
     log_tags_safe,
@@ -4291,11 +4292,17 @@ def _log_training_provenance_to_mlflow(
     feature_spec_path: str,
     training_metrics_path: str,
     git_commit: Optional[str] = None,
+    pipeline_diagnostics_path: Optional[str] = None,
+    pipeline_diagnostics_rel_path: Optional[str] = None,
 ) -> None:
     """Phase 2 T2: Log training provenance to MLflow (no-op when URI unset/unreachable).
 
     See doc/phase2_provenance_schema.md for key names. On failure (no URI, network
     error), logs warning only; training is still considered successful.
+
+    ``pipeline_diagnostics_*`` default from ``artifact_dir`` when omitted (same directory
+    as ``training_metrics.json`` convention). Provenance may run before the diagnostics
+    file is written; paths still denote the canonical bundle location.
     """
     if git_commit is None:
         try:
@@ -4312,6 +4319,13 @@ def _log_training_provenance_to_mlflow(
             git_commit = "nogit"
     _start = training_window_start.isoformat() if hasattr(training_window_start, "isoformat") else str(training_window_start)
     _end = training_window_end.isoformat() if hasattr(training_window_end, "isoformat") else str(training_window_end)
+    _artifact = Path(artifact_dir)
+    _pd_path = pipeline_diagnostics_path
+    if _pd_path is None:
+        _pd_path = str(_artifact / "pipeline_diagnostics.json")
+    _pd_rel = pipeline_diagnostics_rel_path
+    if _pd_rel is None:
+        _pd_rel = f"{_artifact.name}/pipeline_diagnostics.json"
     params = {
         "model_version": model_version,
         "git_commit": git_commit,
@@ -4320,6 +4334,8 @@ def _log_training_provenance_to_mlflow(
         "artifact_dir": artifact_dir,
         "feature_spec_path": feature_spec_path,
         "training_metrics_path": training_metrics_path,
+        "pipeline_diagnostics_path": _pd_path,
+        "pipeline_diagnostics_rel_path": _pd_rel,
     }
     # T12: if pipeline already started a run (e.g. at pipeline entry), log to it; else start one.
     if has_active_run():
@@ -4468,6 +4484,51 @@ def save_artifact_bundle(
     logger.info("Artifacts saved to %s  (version=%s)", MODEL_DIR, model_version)
 
 
+def _write_pipeline_diagnostics_json(
+    *,
+    model_version: str,
+    pipeline_started_at: str,
+    pipeline_finished_at: str,
+    total_duration_sec: float,
+    step7_duration_sec: Optional[float] = None,
+    step8_duration_sec: Optional[float] = None,
+    step9_duration_sec: Optional[float] = None,
+    oom_precheck_est_peak_ram_gb: Optional[float] = None,
+    oom_precheck_step7_rss_error_ratio: Optional[float] = None,
+    step7_rss_start_gb: Optional[float] = None,
+    step7_rss_peak_gb: Optional[float] = None,
+    step7_rss_end_gb: Optional[float] = None,
+    step7_sys_available_min_gb: Optional[float] = None,
+    step7_sys_used_percent_peak: Optional[float] = None,
+) -> None:
+    """Write resource/timing diagnostics to MODEL_DIR/pipeline_diagnostics.json (omit None keys).
+
+    See doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md — RSS/OOM fields align with
+    run_pipeline sampling and oom_precheck estimate, not OOM helper return values.
+    """
+    payload: dict[str, Any] = {
+        "model_version": model_version,
+        "pipeline_started_at": pipeline_started_at,
+        "pipeline_finished_at": pipeline_finished_at,
+        "total_duration_sec": total_duration_sec,
+        "step7_duration_sec": step7_duration_sec,
+        "step8_duration_sec": step8_duration_sec,
+        "step9_duration_sec": step9_duration_sec,
+        "oom_precheck_est_peak_ram_gb": oom_precheck_est_peak_ram_gb,
+        "oom_precheck_step7_rss_error_ratio": oom_precheck_step7_rss_error_ratio,
+        "step7_rss_start_gb": step7_rss_start_gb,
+        "step7_rss_peak_gb": step7_rss_peak_gb,
+        "step7_rss_end_gb": step7_rss_end_gb,
+        "step7_sys_available_min_gb": step7_sys_available_min_gb,
+        "step7_sys_used_percent_peak": step7_sys_used_percent_peak,
+    }
+    out = {k: v for k, v in payload.items() if v is not None}
+    (MODEL_DIR / "pipeline_diagnostics.json").write_text(
+        json.dumps(out, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main training pipeline
 # ---------------------------------------------------------------------------
@@ -4494,6 +4555,7 @@ def run_pipeline(args) -> None:
     )
     # #endregion
     pipeline_start = time.perf_counter()
+    pipeline_started_at_iso = datetime.now(timezone.utc).isoformat()
     start, end = parse_window(args)
     use_local = getattr(args, "use_local_parquet", False)
     force = getattr(args, "force_recompute", False)
@@ -5896,6 +5958,8 @@ def run_pipeline(args) -> None:
                     training_window_end=effective_end,
                     feature_spec_path=str(FEATURE_SPEC_PATH),
                     training_metrics_path=str(MODEL_DIR / "training_metrics.json"),
+                    pipeline_diagnostics_path=str(MODEL_DIR / "pipeline_diagnostics.json"),
+                    pipeline_diagnostics_rel_path=f"{MODEL_DIR.name}/pipeline_diagnostics.json",
                 )
             except Exception as e:
                 logger.warning("MLflow provenance logging failed (training still succeeded): %s", e)
@@ -5910,21 +5974,56 @@ def run_pipeline(args) -> None:
                     logger.info("Removed stale artifact: %s", _stale)
         
             total_sec = time.perf_counter() - pipeline_start
+            _pipeline_finished_at_iso = datetime.now(timezone.utc).isoformat()
+            if (
+                oom_precheck_est_peak_ram_gb is not None
+                and oom_precheck_est_peak_ram_gb > 0
+                and step7_rss_peak_gb is not None
+            ):
+                oom_precheck_step7_rss_error_ratio = (
+                    step7_rss_peak_gb / oom_precheck_est_peak_ram_gb
+                )
+            try:
+                _write_pipeline_diagnostics_json(
+                    model_version=model_version,
+                    pipeline_started_at=pipeline_started_at_iso,
+                    pipeline_finished_at=_pipeline_finished_at_iso,
+                    total_duration_sec=total_sec,
+                    step7_duration_sec=step7_duration_sec,
+                    step8_duration_sec=step8_duration_sec,
+                    step9_duration_sec=step9_duration_sec,
+                    oom_precheck_est_peak_ram_gb=oom_precheck_est_peak_ram_gb,
+                    oom_precheck_step7_rss_error_ratio=oom_precheck_step7_rss_error_ratio,
+                    step7_rss_start_gb=step7_rss_start_gb,
+                    step7_rss_peak_gb=step7_rss_peak_gb,
+                    step7_rss_end_gb=step7_rss_end_gb,
+                    step7_sys_available_min_gb=step7_sys_available_min_gb,
+                    step7_sys_used_percent_peak=step7_sys_used_percent_peak,
+                )
+            except Exception as _diag_exc:
+                logger.warning(
+                    "pipeline_diagnostics.json write failed (training still succeeded): %s",
+                    _diag_exc,
+                )
+
+            # Phase 2 / pipeline plan: small-file artifacts for MLflow UI (best-effort; no active run → no-op).
+            if has_active_run():
+                _bundle_artifact_path = "bundle"
+                for _fname in (
+                    "training_metrics.json",
+                    "pipeline_diagnostics.json",
+                    "feature_spec.yaml",
+                    "model_version",
+                ):
+                    _ap = MODEL_DIR / _fname
+                    if _ap.is_file():
+                        log_artifact_safe(_ap, artifact_path=_bundle_artifact_path)
+
             print("All steps completed. Pipeline total: %.1fs (%.1f min)" % (total_sec, total_sec / 60.0), flush=True)
             logger.info("Pipeline total: %.1fs (%.1f min)", total_sec, total_sec / 60.0)
 
             # T12.2: Log training success metrics + Step 7-9 memory/OOM diagnostics to MLflow.
             try:
-                # OOM pre-check estimate vs observed RSS.
-                if (
-                    oom_precheck_est_peak_ram_gb is not None
-                    and oom_precheck_est_peak_ram_gb > 0
-                    and step7_rss_peak_gb is not None
-                ):
-                    oom_precheck_step7_rss_error_ratio = (
-                        step7_rss_peak_gb / oom_precheck_est_peak_ram_gb
-                    )
-
                 oom_params = {
                     "oom_precheck_est_peak_ram_gb": oom_precheck_est_peak_ram_gb,
                     "oom_precheck_step7_rss_error_ratio": oom_precheck_step7_rss_error_ratio,
