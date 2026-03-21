@@ -1,5 +1,16 @@
 統一改進計劃（**v2**）：整合 codebase 檢視、效能與可觀測性討論後的單一路線圖。v1 曾建議提前過濾 `bets`/`new_bets`，已作廢（見 Task 1「原計劃問題」）。
 
+**執行狀態（2026-03-21，對齊 `.cursor/plans/PLAN.md`）**
+
+| Task | 狀態 |
+|------|------|
+| T1 Scorer 安全裁切 | ✅ 已完成 |
+| T2 Backtester → MLflow | ✅ 已完成 |
+| T3 Validator precision 歷史化 | ✅ 已完成 |
+| T4 Prediction log 聚合 | ✅ 已完成 |
+
+**索引**：本計劃條目亦摘要於 [PLAN.md](PLAN.md)（統一改進計劃 v2 表）。
+
 ***
 
 # 統一改進計劃：Patron Walkaway Detection（v2）

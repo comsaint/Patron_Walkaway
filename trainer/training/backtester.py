@@ -120,6 +120,17 @@ except ModuleNotFoundError:
         HISTORY_BUFFER_DAYS,
     )
 
+try:
+    from trainer.core.mlflow_utils import has_active_run, log_metrics_safe
+except ImportError:
+
+    def has_active_run() -> bool:  # type: ignore[misc]
+        return False
+
+    def log_metrics_safe(_metrics: Dict[str, Any]) -> None:  # type: ignore[misc]
+        return None
+
+
 HK_TZ = ZoneInfo(HK_TZ_STR)
 
 # Resolve to trainer/ so fallback feature_spec path is trainer/feature_spec/ (PLAN 2.2 move).
@@ -424,6 +435,23 @@ def _compute_section_metrics(
         **rated_micro,
         "rated_threshold": threshold,
     }
+
+
+def _flat_section_to_mlflow_metrics(flat: Dict[str, Any]) -> Dict[str, Any]:
+    """Map backtest flat metrics (JSON keys) to MLflow keys (Unified Plan v2: ``backtest_*``)."""
+    out: Dict[str, Any] = {}
+    for key, val in flat.items():
+        if val is None:
+            continue
+        if key == "threshold":
+            out["backtest_threshold"] = val
+        elif key == "rated_threshold":
+            out["backtest_rated_threshold"] = val
+        elif key.startswith("test_"):
+            out["backtest_" + key[len("test_") :]] = val
+        elif key in ("alerts", "alerts_per_hour"):
+            out["backtest_" + key] = val
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +785,11 @@ def backtest(
     metrics_path = BACKTEST_OUT / "backtest_metrics.json"
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, default=str)
+
+    if has_active_run():
+        _md = results.get("model_default")
+        if isinstance(_md, dict):
+            log_metrics_safe(_flat_section_to_mlflow_metrics(_md))
 
     results["predictions_path"] = str(pred_path)
     results["alerts_path"] = str(alerts_path)

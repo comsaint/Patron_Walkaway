@@ -1090,6 +1090,100 @@ def _append_prediction_log(
         conn.close()
 
 
+def _ensure_prediction_log_summary_table(conn: sqlite3.Connection) -> None:
+    """Create prediction_log_summary + indexes (Unified Plan v2 T4)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prediction_log_summary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recorded_at TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            window_minutes INTEGER NOT NULL,
+            row_count INTEGER NOT NULL,
+            alert_rate REAL NOT NULL,
+            mean_score REAL NOT NULL,
+            mean_margin REAL NOT NULL,
+            rated_obs_count INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prediction_log_summary_recorded_at "
+        "ON prediction_log_summary(recorded_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prediction_log_summary_model_version "
+        "ON prediction_log_summary(model_version)"
+    )
+
+
+def _export_prediction_log_summary(pl_path: str, model_version: str, scored_at: str) -> None:
+    """Aggregate last N minutes of prediction_log and append one summary row (T4).
+
+    Rows are filtered by ``model_version`` to match the current scorer bundle. ``scored_at``
+    (ISO) is the window anchor and becomes ``recorded_at`` on the summary row. Overlapping
+    windows + fixed poll interval yield correlated samples — treat as an approximate dashboard,
+    not i.i.d. statistics (Unified Plan v2).
+    """
+    window_min = int(getattr(config, "PREDICTION_LOG_SUMMARY_WINDOW_MINUTES", 60))
+    if window_min <= 0:
+        return
+    anchor = pd.Timestamp(scored_at)
+    if anchor.tz is None:
+        anchor = anchor.tz_localize(HK_TZ)
+    else:
+        anchor = anchor.tz_convert(HK_TZ)
+    cutoff = anchor - pd.Timedelta(minutes=window_min)
+    cutoff_str = cutoff.isoformat()
+
+    conn = sqlite3.connect(pl_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        _ensure_prediction_log_table(conn)
+        _ensure_prediction_log_summary_table(conn)
+        row = conn.execute(
+            """
+            SELECT COUNT(*),
+                   COALESCE(SUM(is_alert), 0),
+                   AVG(score),
+                   AVG(margin),
+                   COALESCE(SUM(is_rated_obs), 0)
+            FROM prediction_log
+            WHERE scored_at >= ? AND model_version = ?
+            """,
+            (cutoff_str, model_version),
+        ).fetchone()
+        n = int(row[0] or 0)
+        n_alert = int(row[1] or 0)
+        avg_score, avg_margin = row[2], row[3]
+        rated_sum = int(row[4] or 0)
+        alert_rate = float(n_alert) / float(n) if n > 0 else 0.0
+        mean_score = float(avg_score) if avg_score is not None and pd.notna(avg_score) else 0.0
+        mean_margin = float(avg_margin) if avg_margin is not None and pd.notna(avg_margin) else 0.0
+        conn.execute(
+            """
+            INSERT INTO prediction_log_summary (
+                recorded_at, model_version, window_minutes, row_count,
+                alert_rate, mean_score, mean_margin, rated_obs_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scored_at,
+                model_version,
+                window_min,
+                n,
+                alert_rate,
+                mean_score,
+                mean_margin,
+                rated_sum,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ── Scoring / H3 routing ──────────────────────────────────────────────────────
 
 def _score_df(
@@ -1386,6 +1480,29 @@ def score_once(
     # ── Features on full window (for rolling context) ─────────────────────
     features_all = build_features_for_scoring(bets, sessions, canonical_map, now_hk)
 
+    # Unified Plan v2 (T1): UNRATED_VOLUME_LOG counts must use full features_all ∩ new_bets
+    # *before* rated-only slice — otherwise unrated new rows disappear and telemetry lies.
+    new_ids = set(new_bets["bet_id"].astype(str))
+    n_features_full_pre_rated_slice = len(features_all)
+    _telemetry_new = features_all[features_all["bet_id"].astype(str).isin(new_ids)]
+    _tel_is_rated = _telemetry_new["canonical_id"].isin(rated_canonical_ids)
+    _tel_is_rated = _tel_is_rated.fillna(False).astype(bool)
+    n_rated_new_bets_pre_slice = int(_tel_is_rated.sum())
+    n_unrated_new_bets_pre_slice = int(len(_telemetry_new) - n_rated_new_bets_pre_slice)
+    unrated_players_new_bets_pre_slice = (
+        int(
+            _telemetry_new.loc[~_tel_is_rated, "player_id"]
+            .dropna()
+            .astype(str)
+            .nunique()
+        )
+        if n_unrated_new_bets_pre_slice > 0
+        else 0
+    )
+
+    # Rated-only slice before Track LLM + profile join (heavy steps); session rolling above unchanged.
+    features_all = features_all[features_all["canonical_id"].isin(rated_canonical_ids)].copy()
+
     # Track LLM: compute DuckDB features from feature spec when available.
     _feature_spec = artifacts.get("feature_spec")
     if _feature_spec is not None:
@@ -1436,9 +1553,12 @@ def score_once(
             )
 
     features_all["is_rated"] = features_all["canonical_id"].isin(rated_canonical_ids)
-    logger.info("[scorer] Feature rows (full window): %d", len(features_all))
+    logger.info(
+        "[scorer] Feature rows: full_window=%d rated_slice(LLM/profile path)=%d",
+        n_features_full_pre_rated_slice,
+        len(features_all),
+    )
 
-    new_ids = set(new_bets["bet_id"].astype(str))
     features_df = features_all[
         features_all["bet_id"].astype(str).isin(new_ids)
     ].copy()
@@ -1447,30 +1567,18 @@ def score_once(
         logger.info("[scorer] No usable rows after feature engineering; sleeping")
         return
 
-    # --- Exclude unrated before model (PLAN: 取得 bet 後排除 unrated 再送模型) ---
+    # --- Exclude unrated before model (post rated-only slice this should be all True; keep filter for safety) ---
     is_rated_mask = features_df["is_rated"].fillna(False).astype(bool)
-    n_rated = int(is_rated_mask.sum())
-    n_unrated = int(len(features_df) - n_rated)
-    unrated_players = (
-        int(
-            features_df.loc[~is_rated_mask, "player_id"]
-            .dropna()
-            .astype(str)
-            .nunique()
-        )
-        if n_unrated > 0
-        else 0
-    )
     features_df = features_df[is_rated_mask].copy()
     if features_df.empty:
         logger.info("[scorer] No rated bets to score; sleeping")
         return
-    if UNRATED_VOLUME_LOG and n_unrated > 0:
+    if UNRATED_VOLUME_LOG and n_unrated_new_bets_pre_slice > 0:
         logger.info(
             "[scorer] Excluded %d unrated bets (%d players); scoring %d rated bets.",
-            n_unrated,
-            unrated_players,
-            n_rated,
+            n_unrated_new_bets_pre_slice,
+            unrated_players_new_bets_pre_slice,
+            n_rated_new_bets_pre_slice,
         )
 
     # ── Score with H3 routing (rated only) ─────────────────────────────────
@@ -1486,12 +1594,17 @@ def score_once(
                 model_version,
                 features_df,
             )
+            try:
+                _export_prediction_log_summary(
+                    str(pl_path).strip(), model_version, scored_at
+                )
+            except Exception as exc2:
+                logger.warning("[scorer] Prediction log summary failed: %s", exc2)
         except Exception as exc:
             logger.warning("[scorer] Prediction log write failed: %s", exc)
 
     # ── Alert candidates: score >= threshold AND rated observations only ──
-    # Unrated observations are scored for volume telemetry (UNRATED_VOLUME_LOG)
-    # but must not be emitted as alerts (v10 DEC-021).
+    # UNRATED_VOLUME_LOG uses pre-slice new-bet counts; unrated rows are not scored (v10 DEC-021).
     alert_candidates = features_df[
         (features_df["margin"] >= 0) & (features_df["is_rated_obs"] == 1)
     ].copy()

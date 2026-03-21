@@ -79,11 +79,55 @@ _NEW_VAL_COLS: List[Tuple[str, str]] = [
     ("casino_player_id", "TEXT"),
 ]
 
-# Columns present since Phase 1 in the alerts table
-_ALERTS_PHASE1_COLS: List[Tuple[str, str]] = [
+# Alerts ALTERs aligned with trainer.serving.scorer.init_state_db (validator-first DB path; Unified Plan v2 T3).
+_ALERTS_MIGRATION_COLS: List[Tuple[str, str]] = [
     ("canonical_id", "TEXT"),
+    ("is_rated_obs", "INTEGER"),
+    ("reason_codes", "TEXT"),
     ("model_version", "TEXT"),
+    ("margin", "REAL"),
+    ("scored_at", "TEXT"),
+    ("casino_player_id", "TEXT"),
 ]
+
+
+def _latest_model_version_from_alerts(alerts_df: pd.DataFrame) -> Optional[str]:
+    """Newest alert by ``ts`` with non-empty ``model_version`` (Unified Plan v2 T3).
+
+    Semantic: **驗證當下認定的版本** for this validation cycle — not a global deploy SSOT.
+    """
+    if alerts_df.empty or "model_version" not in alerts_df.columns or "ts" not in alerts_df.columns:
+        return None
+    try:
+        sub = alerts_df.sort_values("ts", ascending=False)
+    except Exception:
+        return None
+    for val in sub["model_version"]:
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            continue
+        s = str(val).strip()
+        if s:
+            return s
+    return None
+
+
+def _append_validator_metrics(
+    conn: sqlite3.Connection,
+    *,
+    recorded_at: str,
+    model_version: Optional[str],
+    precision: float,
+    total: int,
+    matches: int,
+) -> None:
+    """Insert one cumulative-precision snapshot (``validator_metrics`` table)."""
+    conn.execute(
+        """
+        INSERT INTO validator_metrics (recorded_at, model_version, precision, total, matches)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (recorded_at, model_version or "", float(precision), int(total), int(matches)),
+    )
 
 
 def _build_cid_to_player_ids(alerts_df: pd.DataFrame) -> Dict[str, List[int]]:
@@ -360,6 +404,32 @@ def get_db_conn() -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts)")
+    existing_alert_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(alerts)").fetchall()
+    }
+    for col_name, col_type in _ALERTS_MIGRATION_COLS:
+        if col_name not in existing_alert_cols:
+            conn.execute(f"ALTER TABLE alerts ADD COLUMN {col_name} {col_type}")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS validator_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recorded_at TEXT NOT NULL,
+            model_version TEXT,
+            precision REAL NOT NULL,
+            total INTEGER NOT NULL,
+            matches INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_validator_metrics_recorded_at "
+        "ON validator_metrics(recorded_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_validator_metrics_model_version "
+        "ON validator_metrics(model_version)"
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS validation_results (
@@ -971,6 +1041,19 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
         matches = finalized_or_old["reason"].eq("MATCH").sum()
         precision = (matches / total) if total > 0 else 0
         logger.info("[validator] Cumulative Precision (15m window): %.2f%% (%d/%d)", precision * 100, matches, total)
+
+        try:
+            _mv = _latest_model_version_from_alerts(alerts)
+            _append_validator_metrics(
+                conn,
+                recorded_at=now_hk.isoformat(),
+                model_version=_mv,
+                precision=float(precision),
+                total=int(total),
+                matches=int(matches),
+            )
+        except Exception as exc:
+            logger.warning("[validator] validator_metrics insert failed: %s", exc)
 
         final_df["alert_ts_dt"] = pd.to_datetime(final_df["alert_ts"])
         final_df = final_df.sort_values("alert_ts_dt").drop(columns=["alert_ts_dt"])

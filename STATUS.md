@@ -5009,3 +5009,277 @@ python -m ruff check tests/review_risks/test_review_risks_pipeline_plan_section6
 | `python -m mypy trainer/ package/ --ignore-missing-imports` | Success: no issues found in 51 source files |
 
 - **下一步建議**：執行 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` **§8 手動驗收**；若仍要 §6 可選項，再評估迷你 pipeline 或依存在檔數 mock `log_artifact_safe`（見該 doc §6 bullet）。
+
+---
+
+## 統一計劃 v2 — T1 + T2（2026-03-21）
+
+- **依據**：`.cursor/plans/Unified Improvement Plan.md`（僅實作 **Task 1（安全版）**、**Task 2（Backtester → MLflow）**；T3/T4 未動）。
+- **變更檔案**
+  - `trainer/serving/scorer.py`：`score_once()` 在 `build_features_for_scoring` 之後、Track LLM / player_profile 之前，對 `features_all` 做 **rated-only** 裁切（`canonical_id.isin(rated_canonical_ids)`）。**UNRATED_VOLUME_LOG** 改為在裁切前以「完整 `features_all` ∩ 本輪 `new_bets`」預算 `n_unrated` / `n_rated` / unrated 玩家數，避免先裁切再交集導致 telemetry 失真。日誌改為一行同報 `full_window` 與 `rated_slice` 列數。
+  - `trainer/training/backtester.py`：寫入 `backtest_metrics.json` 後，若 `has_active_run()` 為真，以 `log_metrics_safe` 上傳 **`model_default`** 扁平指標，鍵名經 `_flat_section_to_mlflow_metrics` 轉成 `backtest_*`（含 `backtest_threshold`、`backtest_rated_threshold`、`test_*` → `backtest_*` 等）。無 active run 或無法 import `mlflow_utils` 時維持 no-op。
+- **自動驗證（本機已跑）**
+
+| 指令 | 結果 |
+|------|------|
+| `python -m ruff check trainer/serving/scorer.py trainer/training/backtester.py` | All checks passed |
+| `python -m pytest tests/review_risks/test_review_risks_round159.py tests/unit/test_mlflow_utils.py -q --tb=short` | **27 passed**（含 skipped/xpassed 如該套件常態） |
+| `python -m pytest tests/integration/test_backtester.py tests/review_risks/test_review_risks_round224_backtester_metrics_align.py -q --tb=short` | **12 passed** |
+
+- **手動驗證建議**
+  1. **T1（scorer）**：在含 unrated 新注的視窗跑一輪 scoring（或現有 staging／整合流程）；確認 log 仍會在有不符 rated 的新單時出現 `Excluded N unrated bets...`，且 `Feature rows: full_window=… rated_slice=…` 中 `full_window >= rated_slice`。
+  2. **T2（backtest + MLflow）**：在已設定 MLflow、且由 trainer／腳本 **`mlflow.start_run()` 作用域內** 呼叫 `backtest()` 的情況下，於 UI 檢查是否出現 `backtest_ap`、`backtest_precision`、`backtest_threshold` 等；單獨 CLI 跑 `backtester.py` 無 active run 時應無 MLflow 寫入、JSON 行為與先前一致。
+- **下一步建議**：依同一計劃實作 **T3**（`validator_metrics` 表 + INSERT）與 **T4**（`prediction_log_summary`）；若要在 MLflow 同時看到 **optuna** 區段指標，可另開小變更為 `backtest_optuna_*` 命名空間（本次僅 `model_default`）。
+
+---
+
+## Code Review：統一計劃 v2 — T1（scorer）+ T2（backtester MLflow）（2026-03-21）
+
+**範圍**：對照 `.cursor/plans/Unified Improvement Plan.md`、`STATUS.md` 上述實作小節、`.cursor/plans/DECISION_LOG.md`（train–serve parity、DEC-021 rated-only 等原則）；**不重寫實作**，僅列風險與建議。
+
+### 1. `bet_id` 字串化不一致 → 交集為空或計數錯（T1，Bug／邊界）
+
+- **問題**：`new_ids = set(new_bets["bet_id"].astype(str))` 與 `features_all["bet_id"].astype(str)` 若來源型別不同（例如一側 `int64`、一側 `float64` 來自 CH／parquet），`12345` 與 `"12345.0"` 會對不起來；結果可能是 `features_df` 空、`UNRATED_VOLUME_LOG` 的「本輪新單」計數與實際 scoring 列脫鉤。
+- **具體修改建議**：與 `score_once` 內既有 `bet_id` merge 邏輯對齊，統一為**同一正規化函式**（例如先 `astype(str)` 前對 float bet_id `astype("Int64")` 再 `str`，或與 `normalize_bets_sessions` 契約一致）；`new_ids` 與 `features_all` 篩選必須共用該函式。
+- **希望新增的測試**：整合或單元測試：`new_bets` 與 `features_all` 的 `bet_id` 分別為 `int` / `float` 表示同一注時，仍應得到非空 `features_df` 且 telemetry 列數與 scoring 列數一致（可 mock `build_features_for_scoring` 回傳固定 `bet_id` 型別）。
+
+### 2. Track LLM 在 rated 裁切後仍可能丟列 → 日誌語意誤導（T1，可觀測性／邊界）
+
+- **問題**：`compute_track_llm_features` 可在 cutoff 過濾後**縮短** `features_all`。`UNRATED_VOLUME_LOG` 在 LLM **之前**依「完整特徵列」預算；若隨後 rated 新單被 LLM 剃掉，可能出現「已 log 將 score N 筆 rated」但接著 `Rows to score` 為 0 或變少，運維誤判為 unrated 問題。
+- **具體修改建議**：在 LLM 之後若 `len(features_all)` 小於「進入 LLM 前的 rated∩new_ids 列數」，加一條 **專用 warning**（例如 `[scorer] Track LLM dropped rated new-bet rows after rated-only slice: ...`）；或將 UNRATED 行與「本輪實際進模型列數」分開 log。
+- **希望新增的測試**：mock `compute_track_llm_features` 回傳列數少於輸入時，斷言有新的 warning／counter（或契約測試 log 子字串），避免靜默縮窗。
+
+### 3. 缺少 `bet_id`／`canonical_id`／`player_id` 時直接崩潰（T1，邊界／測試替身）
+
+- **問題**：telemetry 區塊直接索引 `features_all["bet_id"]`、`_telemetry_new["canonical_id"]`、`_telemetry_new["...player_id"]`；若測試或異常資料只 mock 部分欄位，會 `KeyError`，比舊路徑更早失敗。
+- **具體修改建議**：與專案其他路徑一致，對缺欄採 **明確 guard**（缺 `bet_id` 則跳過 telemetry 預算並 log warning，或降級為全 0／與舊行為一致）；`player_id` 缺時 unrated 玩家數改為 0 並 log 一次 debug。
+- **希望新增的測試**：`build_features_for_scoring` mock 缺 `player_id` 時不 raise，且 `UNRATED_VOLUME_LOG` 仍可比對 `n_unrated`（玩家數可為 0）。
+
+### 4. `canonical_id` 與 `rated_canonical_ids` 元素型別不一致（T1，parity／邊界）
+
+- **問題**：若 mapping 產出 `canonical_id` 為字串、少數列因 merge 成數值（或相反），`isin` 可能全假 → `features_all` 被清空，靜默不 score。
+- **具體修改建議**：在裁切前對 `features_all["canonical_id"]` 與 `rated_canonical_ids` 採**單一標量正規化**（例如一律 `str(x)` 並對 `nan` 用 fillna），與 `build_features_for_scoring` 輸出契約寫進註解或 assert（僅 dev／測試）。
+- **希望新增的測試**：`rated_canonical_ids` 為 `{"1"}` 而列上為 `1`（int）時，仍應保留該列（或明確文檔禁止並在 DQ 層修）。
+
+### 5. 僅上傳 `model_default`，Optuna 與父層欄位遺漏（T2，產品／可觀測性）
+
+- **問題**：同一 run 若關心 threshold 搜尋結果，UI 只看得到 default threshold 的 `backtest_*`，`results["optuna"]` 未上傳；與 DEC-006／026「Optuna 閾值」敘事可能不一致。
+- **具體修改建議**：若 `results.get("optuna")` 為 dict，以 **`backtest_optuna_` 前綴**（或 `log_metrics_safe` 分兩次呼叫）上傳第二組扁平指標；鍵名寫入 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` 或 SSOT。
+- **希望新增的測試**：mock `has_active_run True` + mock `log_metrics_safe`，斷言 optuna 存在時呼叫次數與鍵前綴（契約測試即可，不必真連 MLflow）。
+
+### 6. `ImportError` 時靜默 no-op（T2，運維／可靠性）
+
+- **問題**：`backtester.py` 對 `trainer.core.mlflow_utils` 的 `except ImportError` 會讓 **任何** import 失敗都變成永不 log；除錯時易誤以為「沒開 active run」。
+- **具體修改建議**：`except ImportError` 內 `logger.debug` 一次；或改為 `importlib.util.find_spec` 分「模組不存在」與「其他錯誤」；若後者應 log warning。
+- **希望新增的測試**：可選：在 `sys.modules` 注入壞模組的 contract 測試較重，至少文件化「import 失敗時 backtest 仍寫 JSON」。
+
+### 7. MLflow 指標數量與非數值鍵（T2，效能／穩定性）
+
+- **問題**：`_flat_section_to_mlflow_metrics` 會展開多個 `precision_at_recall` 等鍵；單次 `log_metrics_safe` 批次偏大時，仍走 MLflow HTTP（已有重試）；非數值若未來進入 flat dict，`float()` 失敗會靜默跳過，造成「以為有上傳其實沒有」。
+- **具體修改建議**：維持現狀亦可；若鍵持續增加，可改為**只上傳核心 K 個**（ap/precision/recall/fbeta/threshold）+ 可選 env flag 展開全部；或在 debug 模式 log `sanitized` 鍵數。
+- **希望新增的測試**：單元測試：輸入含 `{"test_ap": "nan_string"}` 或非法值時，`log_metrics_safe` 不 raise 且對應鍵被跳過（與 `mlflow_utils` 契約一致）。
+
+### 8. 與 DEC-001／train–serve parity 的迴歸監控（T1，架構）
+
+- **問題**：T1 刻意保留全量 `build_features_for_scoring`，理論上與 DEC-001「共用特徵路徑」一致；但未來若有人在 **trainer** 路徑對 unrated 列也做 LLM／profile 最佳化而 **scorer** 已裁切，會再引入 parity 裂縫。
+- **具體修改建議**：在 `Unified Improvement Plan.md` 或 SSOT 加一句 **invariant**：「Train 與 serve 對 rated 列的 LLM／profile 輸入列集合必須對齊」；可選擇性加靜態檢查（grep／契約測試）確保 `compute_track_llm_features` 在 trainer 評估路徑的呼叫條件與 scorer 一致。
+- **希望新增的測試**：文件化為主；若有「golden」小 parquet，可做 trainer vs scorer 特徵列 hash 對照（成本高，列為長期項）。
+
+---
+
+**結論（簡要）**：T1 設計符合計劃 v2 與 session／state 安全前提；**最需優先關注**為 **`bet_id` 正規化一致**與 **LLM 剃列後的 log 語意**。T2 與現有 `log_metrics_safe` 契約相容；**產品缺口**為 optuna 區段未上傳、import 失敗過靜。**未發現**本次變更引入新的機密外洩面（僅聚合指標）；效能主成本仍在全量 `build_features_for_scoring`，與計劃預期一致。
+
+---
+
+## 統一計劃 v2 Review 風險 → MRE 測試（2026-03-21｜僅 tests）
+
+- **依據**：`.cursor/plans/Unified Improvement Plan.md`、上列 **Code Review：統一計劃 v2 — T1 + T2** 八點、`.cursor/plans/DECISION_LOG.md`（parity／DEC-021 脈絡）。**未修改 production**，僅新增測試。
+- **新增檔案**：`tests/review_risks/test_unified_plan_v2_review_risks.py`
+- **對照 Review 條目**
+
+| # | 測試類別／名稱（摘要） | 性質 |
+|---|------------------------|------|
+| 1 | `TestUnifiedV2BetIdStrAsymmetryMRE` — `astype(str)` 下 `1` vs `1.0` 交集為空；同型則成功 | 純 pandas MRE + 對照成功案例 |
+| 1 | `TestUnifiedV2ScoreOnceBetIdMismatchIntegration` — mock `score_once`，int/float `bet_id` 導致 log 含 `No usable rows after feature engineering` | 整合 MRE |
+| 2 | `TestUnifiedV2TrackLlmRowDropObservability` — LLM 回傳空表時有 `Track LLM dropped`，且**尚無** `rated new-bet` 專用訊息 | 可觀測性契約（現狀） |
+| 3 | `TestUnifiedV2TelemetryMissingPlayerId` — unrated 新單列缺 `player_id` → `KeyError` | 現狀脆性 MRE |
+| 4 | `TestUnifiedV2CanonicalIdTypeParity` — `rated_canonical_ids={"1"}` 與 `canonical_id` 整數欄 | pandas MRE |
+| 5 | `TestUnifiedV2BacktesterMlflowOptunaGap` — 鏡像 `backtest()` 尾段邏輯：僅 `model_default` 進 `log_metrics_safe` | 契約／產品缺口 |
+| 6 | `TestUnifiedV2BacktesterMlflowImportContract` — `backtester.py` 原始碼含 `mlflow_utils` + `except ImportError` | 靜態／lint 式 |
+| 7 | `TestUnifiedV2FlatMetricsNonNumeric` — `_flat_section_to_mlflow_metrics` + `log_metrics_safe` 遇非數值不 raise | 與 `mlflow_utils` 契約 |
+| 8 | `TestUnifiedV8TrainServeLlmOrderingContract` — `scorer.py` 中 rated slice 字串位於 `compute_track_llm_features` 之前；`backtester.py` 含 FULL bets LLM 註解 | 靜態 parity 提醒 |
+
+- **執行方式**
+
+```bash
+python -m pytest tests/review_risks/test_unified_plan_v2_review_risks.py -q --tb=short
+python -m ruff check tests/review_risks/test_unified_plan_v2_review_risks.py
+```
+
+- **自動驗證（本機）**
+
+| 指令 | 結果 |
+|------|------|
+| 上列 `pytest` 單檔 | **11 passed** |
+| 上列 `ruff check` | All checks passed |
+
+- **說明**：Windows 上無法 `patch` `Path.exists`，整合測試改為 `patch` `CANONICAL_MAPPING_PARQUET`／`CANONICAL_MAPPING_CUTOFF_JSON` 指向**保證不存在**的 repo 內路徑，強制走 `build_canonical_mapping_from_df`。**下一步**：若 production 修正 Review #1/#3/#4，可將對應測試改為預期成功路徑或 `xfail` 翻轉策略。
+
+---
+
+## 品質闸門（2026-03-21｜全倉 tests／lint／typecheck）
+
+- **依據**：使用者要求在不更動 `tests/review_risks/test_unified_plan_v2_review_risks.py` 等測試的前提下，確認實作與工具鏈全綠；並修訂 `.cursor/plans/PLAN.md`／`Unified Improvement Plan.md` 狀態。
+- **結果**：**無需新增 production diff** 即可全綠；本輪僅更新計劃文件與本 STATUS。
+- **自動驗證（本機）**
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest -q --tb=short` | **1302 passed**, 64 skipped, 2 xpassed, 13 subtests passed |
+| `python -m ruff check .` | All checks passed |
+| `python -m mypy trainer/ package/ --ignore-missing-imports` | Success: no issues found in 51 source files |
+
+- **計劃文件**：`.cursor/plans/PLAN.md` 已新增 **統一改進計劃 v2** 表（T1–T4 + MRE 測試列）；`Unified Improvement Plan.md` 頂部已加 **執行狀態** 表與 PLAN 索引連結。
+- **Review 硬ening 與測試的張力**（供後續決策）：STATUS Code Review #1 整合測試目前**要求** int/float `bet_id` 仍走「No usable rows」；#3 測試**要求**缺 `player_id` 時仍 `KeyError`。若在**不改這兩則測試**的前提下於 production 做 `bet_id` 正規化或缺欄 guard，CI 會紅。若要修 production，需依使用者規則將上列測試判定為「測試本身錯／過時」並更新期望，或另開新測試覆蓋「修復後」行為。
+- **Unified 計劃剩餘項**（本段後續已實作 T3，見下）：**T4**（`prediction_log_summary`）仍待實作；可選補強見原計劃 §Task 2（optuna 上 MLflow）、Code Review #2（LLM 剃列專用 log 字串需避開現有契約子字串 `rated new-bet`）等。
+
+---
+
+## 統一計劃 v2 — T3 Validator precision 歷史化（2026-03-21）
+
+- **依據**：`.cursor/plans/Unified Improvement Plan.md` Task 3（僅實作 **T3**；T4 未動）。
+- **變更檔案**
+  - `trainer/serving/validator.py`
+    - `get_db_conn()`：`CREATE TABLE IF NOT EXISTS validator_metrics`（`recorded_at`, `model_version`, `precision`, `total`, `matches` + 自增 `id`）；索引 `idx_validator_metrics_recorded_at`、`idx_validator_metrics_model_version`。
+    - `get_db_conn()`：對 `alerts` 依 `_ALERTS_MIGRATION_COLS` 做 **PRAGMA + ALTER**，與 `scorer.init_state_db` 之 Phase-1 欄位對齊（含 `model_version` 等），避免僅 validator 先建 DB 時缺欄。
+    - `_latest_model_version_from_alerts`：依本輪 `alerts` 的 `ts` 降序取第一個非空 `model_version`（語意：**驗證當下認定的版本**，docstring 已註明）。
+    - `_append_validator_metrics`：`validate_once` 在算出 cumulative precision 並 `logger.info` 後 **INSERT**；失敗僅 `warning`，不阻斷驗證主流程。
+- **計劃索引**：`.cursor/plans/PLAN.md`、`.cursor/plans/Unified Improvement Plan.md` 頂部狀態表已將 **T3** 標為 ✅。
+- **自動驗證（本機）**
+
+| 指令 | 結果 |
+|------|------|
+| `python -m pytest tests/integration/test_validator_datetime_naive_hk.py tests/review_risks/test_review_risks_validator_round393.py tests/review_risks/test_review_risks_validator_dec030_parity.py -q --tb=short` | **17 passed** |
+| `python -m pytest -q --tb=short`（全倉） | **1302 passed**, 64 skipped, 2 xpassed |
+| `python -m ruff check trainer/serving/validator.py` | All checks passed |
+| `python -m mypy trainer/serving/validator.py --ignore-missing-imports` | Success |
+
+- **手動驗證建議**
+  1. 跑一輪 validator（或 `validate_once`）且 `alerts`／`validation_results` 有資料、能算出 cumulative precision。
+  2. 以 `sqlite3 local_state/state.db`（或實際 `STATE_DB_PATH`）執行：  
+     `SELECT * FROM validator_metrics ORDER BY id DESC LIMIT 5;`  
+     確認 `recorded_at`、`precision`、`total`、`matches` 與 log 一致；`model_version` 與 alerts 中最新一筆有版本者一致（若欄位全空則為空字串）。
+- **下一步建議**：實作 **T4**（`prediction_log_summary` 聚合表）；可選為 `validator_metrics` 加保留天數 prune（目前僅 `validation_results`／`processed_alerts` 有 retention）。
+
+---
+
+## Code Review：統一計劃 v2 — T3 `validator_metrics` + `alerts` 遷移（2026-03-21）
+
+**範圍**：`trainer/serving/validator.py`（`_latest_model_version_from_alerts`、`_append_validator_metrics`、`get_db_conn` 內建表／索引／`alerts` ALTER、`validate_once` 寫入順序）；對照 Unified Plan Task 3 與 `.cursor/plans/DECISION_LOG.md`（可觀測性、未引入新決策衝突）。**不重寫實作**，僅列風險與建議。
+
+### 1. `model_version` 語意：全表 `alerts` 最新 `ts` vs KPI 相關子集（邊界／可解讀性）
+
+- **問題**：`_latest_model_version_from_alerts` 對 **`parse_alerts` 載入的整張 `alerts`** 依 `ts` 降序取第一個非空 `model_version`。計劃原文「當次 validation 視窗」可能被解讀為「與本輪 precision 計算相關的 alerts」（例如 `finalized_or_old` 對應的 bet／alert 列）。若庫內混有極新、與本輪 KPI 無關的 alert（或測試殘留），**指標列上的 `model_version` 可能與該次 precision 的母體不一致**，Grafana 上會誤判「哪個版本在該 precision 下表現」。
+- **具體修改建議**：二選一並寫入 docstring：（A）維持現狀但將欄位註解為「本輪讀入 alerts 中時間最新一筆之版本」；（B）改從 `finalized_or_old` 對應的 `alerts` 子集（或 `final_df` 內 `model_version`）取眾數／最新 `alert_ts`，與 KPI 母體對齊。
+- **希望新增的測試**：單元測試：構造兩筆 alerts——一筆 `ts` 很新但 `model_version` 為 `v-new`、另一筆較舊但為實際進入 `finalized_or_old` 的母體；斷言目前實作選到哪一筆（**契約測試**）；若未來改為（B），測試改為期望與 finalized 子集一致。
+
+### 2. `ts` 含 NaT／型別混雜時 `sort_values` 行為（邊界）
+
+- **問題**：`parse_alerts` 已做 `to_datetime(..., errors="coerce")`，列上可有 **NaT**。`sort_values("ts", ascending=False)` 對 NaT 的排序位置依 pandas 版本／選項而異；**極端情況下**可能反覆挑到非預期的列（若僅 NaT 列帶 `model_version`）。
+- **具體修改建議**：排序前 `sub = alerts_df.dropna(subset=["ts"])`，或 `sort_values(..., na_position="last")` 並在 docstring 註明 NaT 列永不作為「最新」。
+- **希望新增的測試**：`alerts` 一列 `ts=NaT` 且 `model_version="x"`、另一列有效 `ts` 與 `model_version="y"`，斷言回傳 `"y"`。
+
+### 3. 交易邊界：`validator_metrics` INSERT 與 `save_validation_results` 同一 commit（可靠性）
+
+- **問題**：INSERT 發生在 `save_validation_results` **之前**；後者的 `commit()` 會一併提交本連線上未提交的 `validator_metrics` 列。若未來有人在兩者之間插入其他會 `commit`/`rollback` 的邏輯，或重構 `save_validation_results` 改為不 `commit`，**原子性與現狀假設會變**。
+- **具體修改建議**：在 `validate_once` 該區塊加一行簡短註解：「metrics INSERT 依賴下方 `save_validation_results` 的 `commit`」；或改為顯式 `conn.commit()` 緊接在兩段寫入之後（並確認與 `mark_processed` 的互動）。
+- **希望新增的測試**：整合測試（memory sqlite）：mock 其餘流程，使 `validate_once` 走進 KPI 區塊，斷言 `validator_metrics` 與 `validation_results` 同時可見或同時缺席（依是否 mock save 失敗）。
+
+### 4. `validator_metrics` 無 retention（效能／運維）
+
+- **問題**：每次進入 `if existing_results:` 且算出 KPI 就 **INSERT** 一筆；長期運行表會線性增長，**查詢與備份體積**上升（單列很小，但頻率可能為每輪 validator tick）。
+- **具體修改建議**：比照 `prune_validator_retention`，新增可選 `VALIDATOR_METRICS_RETENTION_DAYS`；或僅在 precision／(total,matches) 相對上一筆有變化時 INSERT（降採樣）。
+- **希望新增的測試**：契約測試：設定 retention 後舊列被刪除（可 mock `now_hk`）。
+
+### 5. `_ALERTS_MIGRATION_COLS` 與 `scorer._NEW_ALERT_COLS` 雙份維護（維護性）
+
+- **問題**：兩處 tuple 列表需**手動同步**；若 scorer 新增欄位而 validator 未跟進，「validator 先建 DB」路徑仍可能缺欄。
+- **具體修改建議**：抽成單一 SSOT（例如 `trainer/serving/schema_alerts.py` 常數，由 scorer 與 validator 匯入），或單元測試斷言兩集合相等。
+- **希望新增的測試**：`test_alert_migration_cols_match_scorer`：import 或讀檔比對 `validator._ALERTS_MIGRATION_COLS` 與 `scorer._NEW_ALERT_COLS` 鍵順序與型別字串一致。
+
+### 6. SQL 注入與敏感資料（安全性）
+
+- **問題**：`ALTER TABLE ... ADD COLUMN {col_name}` 的 `col_name` 來自**程式內常數**，非使用者輸入，**風險低**。`validator_metrics` 不含 PII；`model_version` 通常為短字串。
+- **具體修改建議**：維持現狀；若未來改為動態遷移，必須對 `col_name` 做 allowlist。
+- **希望新增的測試**：不需要；靜態 review 即可。
+
+### 7. `matches` 型別與 `precision` 非有限值（邊界）
+
+- **問題**：`matches` 來自 pandas `sum()`，多為 `numpy.int64`；`int(matches)` 一般安全。`precision = matches/total` 在 `total>0` 時應為有限值；若資料汙染導致異常，**SQLite REAL** 仍可寫入，但圖表可能怪異。
+- **具體修改建議**：INSERT 前 `assert 0 <= precision <= 1`（或 clamp + log）；`matches <= total` 斷言（debug 模式）。
+- **希望新增的測試**：單元測試 `_append_validator_metrics` 對 `precision=0.0, total=0, matches=0` 與正常 (0.5, 2, 1) 各一筆。
+
+---
+
+**結論（簡要）**：T3 實作與計劃一致；**`model_version` 與 KPI 母體對齊**與 **`validator_metrics` 長期體積**是最值得產品／運維跟進的兩點。交易順序在目前 `save_validation_results(..., commit)` 下**一致且合理**，但值得註解防回歸。**安全性**無新增實質外洩面（聚合指標 + 版本字串）。
+
+---
+
+## T3 Code Review 風險 → MRE 測試（2026-03-21｜僅 tests）
+
+- **依據**：上列 **Code Review：統一計劃 v2 — T3** 七點（#6 安全性不新增測試，與 review 一致）。**未修改 production**。
+- **新增檔案**：`tests/review_risks/test_unified_plan_v2_t3_validator_metrics_review.py`
+- **對照 Review 條目**
+
+| # | 測試類別／摘要 | 性質 |
+|---|----------------|------|
+| 1 | `TestT3LatestModelVersionFromAlerts.test_mre_global_newest_ts_not_same_as_hypothetical_kpi_only_row` — 較新 `ts` 的 stray `model_version` 勝過較舊「KPI 母體」列 | **現狀契約**（若改為 KPI 子集需翻轉期望） |
+| 1 | `test_newest_ts_row_wins` | 基本行為 |
+| 2 | `test_nat_ts_row_does_not_win_over_valid_ts_review_2` | NaT vs 有效 `ts` |
+| 2 | 缺欄／全空 `model_version` | 邊界 |
+| 3 | `TestT3ValidateOnceWriteOrderContract` — `validate_once` 區塊內 `_append_validator_metrics` 在 `save_validation_results` 之前；`save_validation_results` 含 `conn.commit()` | 靜態／契約 |
+| 4 | `TestT3ValidatorMetricsNoRetentionContract` — `prune_validator_retention` 不含 `validator_metrics` | **缺功能**之現狀契約 |
+| 5 | `TestT3AlertsMigrationColsMatchScorer` — `_ALERTS_MIGRATION_COLS` == `scorer._NEW_ALERT_COLS` | 維護性 guard |
+| 7 | `TestT3AppendValidatorMetrics` — `(total=0,matches=0)` 與正常 `(2,1)` 寫入 memory sqlite | 單元 |
+
+- **執行方式**
+
+```bash
+python -m pytest tests/review_risks/test_unified_plan_v2_t3_validator_metrics_review.py -q --tb=short
+python -m ruff check tests/review_risks/test_unified_plan_v2_t3_validator_metrics_review.py
+```
+
+- **自動驗證（本機）**
+
+| 指令 | 結果 |
+|------|------|
+| 上列 `pytest` 單檔 | **11 passed** |
+| 上列 `ruff check` | All checks passed |
+| `python -m pytest -q --tb=short`（全倉） | **1313 passed**（+11） |
+
+---
+
+## 統一計劃 v2 — T4 Prediction log 聚合（2026-03-21）
+
+- **依據**：`.cursor/plans/Unified Improvement Plan.md` Task 4（僅實作 **T4**；tests 未改）。
+- **變更檔案**
+  - `trainer/core/config.py`：新增 **`PREDICTION_LOG_SUMMARY_WINDOW_MINUTES`**（env，預設 **60**；設 **≤0** 則跳過 summary 寫入）。
+  - `trainer/serving/scorer.py`
+    - **`_ensure_prediction_log_summary_table`**：`prediction_log_summary`（`recorded_at`, `model_version`, `window_minutes`, `row_count`, `alert_rate`, `mean_score`, `mean_margin`, `rated_obs_count`）+ 索引 `idx_prediction_log_summary_recorded_at`、`idx_prediction_log_summary_model_version`。
+    - **`_export_prediction_log_summary`**：以本輪 **`scored_at`** 為錨點，對 `prediction_log` 查 **`scored_at >= cutoff`** 且 **`model_version =`** 當前 bundle 之列，聚合後 **INSERT** 一筆 summary；**`conn.commit()`** 獨立於 `_append_prediction_log` 的 commit。
+    - **`score_once`**：在 **`_append_prediction_log` 成功後** 呼叫 export；export 失敗僅 **`logger.warning`**，不影響主流程。
+- **計劃索引**：`.cursor/plans/PLAN.md`、`.cursor/plans/Unified Improvement Plan.md` 已將 **T4** 標為 ✅。
+- **自動驗證（本機）**
+
+| 指令 | 結果 |
+|------|------|
+| `python -m ruff check trainer/serving/scorer.py trainer/core/config.py` | All checks passed |
+| `python -m mypy trainer/serving/scorer.py trainer/core/config.py --ignore-missing-imports` | Success |
+| `python -m pytest -q --tb=short`（全倉） | **1313 passed**, 64 skipped, 2 xpassed |
+
+- **手動驗證建議**
+  1. 設定 **`PREDICTION_LOG_DB_PATH`**（或預設 `local_state/prediction_log.db`），跑一輪會寫入 prediction_log 的 scoring。
+  2. `sqlite3` 開該 DB：`SELECT * FROM prediction_log_summary ORDER BY id DESC LIMIT 5;`  
+     確認 `row_count`、`alert_rate`、`mean_score` 與近窗內 `prediction_log` 一致；`window_minutes` 與 config 一致。
+  3. 設 **`PREDICTION_LOG_SUMMARY_WINDOW_MINUTES=0`**（或負值）時應**不新增** summary 列（僅 prediction_log 照常，若路徑有效）。
+- **下一步建議**：Unified v2 **T1–T4 主線已完成**；可選項見過往 STATUS（backtest **optuna** 上 MLflow、validator／prediction **retention** 擴充、scorer Review **bet_id**／**player_id** 硬ening 與對應測試翻轉）。若需文件化 env，可補 `credential/.env.example` 或 README 片段說明 **`PREDICTION_LOG_SUMMARY_WINDOW_MINUTES`**。

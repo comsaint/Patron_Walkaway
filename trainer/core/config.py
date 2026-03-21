@@ -86,6 +86,11 @@ PREDICTION_LOG_RETENTION_DELETE_BATCH: int = int(
     os.getenv("PREDICTION_LOG_RETENTION_DELETE_BATCH", "5000"),
 )
 
+# Sliding window (minutes) for prediction_log_summary aggregates (Unified Plan v2 T4). Set <= 0 to skip export.
+PREDICTION_LOG_SUMMARY_WINDOW_MINUTES: int = int(
+    os.getenv("PREDICTION_LOG_SUMMARY_WINDOW_MINUTES", "60"),
+)
+
 # ------------------ Runtime Retention -----------------------------
 # Trim local CSV buffers to avoid unbounded growth
 SCORER_ALERT_RETENTION_DAYS = 30      # Keep scorer alerts for last N days
