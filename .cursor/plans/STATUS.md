@@ -3593,3 +3593,188 @@ python -m pytest tests/unit/test_mlflow_utils.py -v --tb=short
 - 避免跨機器調查造成證據分散或結論不可重現
 - 以「快照僅新增、不覆蓋」確保審計軌跡完整
 
+---
+
+## 本輪：`log_metrics_safe` 可選 `step`（doc §9.1 / Phase A1）
+
+**Date**：2026-03-22  
+**依據**：已讀 `PLAN.md`（Current execution plan → `PLAN_phase2_p0_p1.md`）、`STATUS.md`、`DECISION_LOG.md`。`PLAN_phase2` 之 **Remaining items**（Credential 遷移、DB path 整合、`T-TrainingMetricsSchema` 等）牽涉面大，**本輪不碰**；僅落實 `doc/phase2_p0_p1_implementation_plan.md` **§9.1** 已定案之 **一步**（metrics 時序曲線能力），**未**實作 §9.2 `log_input_safe` 或 §9.3 trainer 兩筆 Inputs（留待後續 sprint）。
+
+### 修改摘要
+
+| 檔案 | 修改內容 |
+|------|----------|
+| `trainer/core/mlflow_utils.py` | `log_metrics_safe(metrics, step: Optional[int] = None)`；`step is not None` 時呼叫 `mlflow.log_metrics(sanitized, step=step)`，否則維持 `mlflow.log_metrics(sanitized)`（與既有 MLflow 行為一致）。docstring 補充 `step` 語意。 |
+| `tests/unit/test_mlflow_utils.py` | 既有「跳過非數值」測試斷言未傳 `step`；新增 `test_log_metrics_safe_forwards_step_when_provided`；NaN/inf xfail 案例改帶 `step=0` 以覆蓋有 step 之路徑。 |
+
+### 如何手動驗證（repo 根目錄）
+
+- `ruff check trainer/core/mlflow_utils.py tests/unit/test_mlflow_utils.py` → 預期 **All checks passed!**
+- `python -m pytest tests/unit/test_mlflow_utils.py -q --tb=short` → 預期全綠（本機：**24 passed**, 10 skipped；xfail 項可能為 **xpassed**，視環境而定）
+- `python -m pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py -q --tb=short` → 預期通過（與 `log_metrics_safe` 簽名相容）
+- （可選）安裝 `mlflow` 後，於 **active run** 內呼叫 `log_metrics_safe({"m": 1.0}, step=1)` 兩次、不同 `step`，於 MLflow UI 確認同一 metric 呈現為曲線而非單點覆寫
+
+### 本輪結果（自動化）
+
+- `ruff check trainer/core/mlflow_utils.py tests/unit/test_mlflow_utils.py`：**All checks passed!**
+- `pytest tests/unit/test_mlflow_utils.py`：**24 passed**, 10 skipped, 1 xpassed
+- `pytest tests/review_risks/test_review_risks_phase2_mlflow_trainer.py`：**16 passed**, 1 xpassed
+
+### 下一步建議
+
+1. **§9.2** `log_input_safe`（單次 try、dict→metadata Dataset、無 DataFrame 本體）— 需對照 `requirements.txt` 之 MLflow 3.x API 實測或 mock。
+2. **§9.3** `run_pipeline` 兩筆訓練資料 lineage（D1/D2、Step 7 多路徑統計）— 與 `warm_up_mlflow_run_safe` 順序對齊；並同步 `doc/phase2_provenance_schema.md`。
+3. 呼叫端若需時序：**validator／backtester／其他**在適當處傳入 `step=`（例如累積樣本數）；本輪**未**改 `trainer.py`／`backtester.py` 呼叫點。
+4. `PLAN_phase2_p0_p1.md` **Remaining items** 仍依序為：Credential migration、DB path consolidation、`T-TrainingMetricsSchema` 等—與本輪無衝突，可另開任務執行。
+
+---
+
+### Code Review：`log_metrics_safe` 可選 `step` 變更（高可靠性標準）
+
+**Date**：2026-03-22  
+**範圍**：`trainer/core/mlflow_utils.py` 之 `log_metrics_safe` 簽名與 `mlflow.log_metrics` 呼叫分支、`tests/unit/test_mlflow_utils.py` 相關測試。已對照 `PLAN.md`（Phase 2 執行計畫索引）、`STATUS.md` 本輪實作摘要、`DECISION_LOG.md`（本變更未牴觸既有 DEC；屬 MLflow 可觀測性實作細節）。**不重寫整套**，僅列最可能風險與可驗證補強。
+
+---
+
+#### 1. `step` 執行時型別未驗證（`bool`／浮點／非整數）
+
+**問題**：註解型別為 `Optional[int]`，但執行時**未**檢查。Python 中 **`bool` 為 `int` 子類**，`step=False` 會走 `step is not None` 分支並把 **`step=False`** 傳入 `mlflow.log_metrics(..., step=False)`（行為依 MLflow／protobuf 而定，可能報錯或靜默轉型）；`step=3.9`（`float`）亦可能通過並導致遠端 API 拒絕或截斷。**後果**：非預期型別時進入既有 **try／重試／warning** 路徑，**指標遺失**且除錯成本高（與「以 step 畫曲線」意圖不符）。
+
+**具體修改建議**：在進入重試迴圈前（或第一次呼叫前）正規化：僅接受 **`isinstance(step, int) and not isinstance(step, bool)`**，否則 **`_log.warning`**（不帶敏感資料）並 **視同 `step=None`** 呼叫 `mlflow.log_metrics(sanitized)`，或 **直接 return**（與產品偏好二選一，建議前者以保留純 metrics 寫入）。可選：允許 `numpy.integer` 則用 **`operator.index(step)`**（Python 3.8+）轉成 `int`。
+
+**希望新增的測試**：單元測試（假 `mlflow`）：`log_metrics_safe({"a": 1.0}, step=False)` 與 `step=1.5` 時，斷言 **不**以 `step=` 呼叫 `log_metrics`，或斷言改以無 `step` 呼叫一次；另加 **`step=0`** 仍傳 `step=0`（合法邊界）。
+
+---
+
+#### 2. 極舊或精簡 MLflow client 不支援 `log_metrics(..., step=…)` 關鍵字參數
+
+**問題**：專案 `requirements.txt` 鎖 **3.10.x**，但若某環境以 **mlflow-skinny／版本漂移／mock 不完整** 呼叫，`**kwargs` 不支援會 **`TypeError`**，落入與網路錯誤相同的 **except**，最終 **warning + 指標全批失敗**（含無 `step` 時亦可能因簽名誤用而失敗—機率低）。
+
+**具體修改建議**：在 `doc/phase2_provenance_schema.md` 或 `mlflow_utils` 模組 docstring 註明 **支援 `step` 之最低 MLflow 版本**（與 repo 一致）。可選防護：`try: mlflow.log_metrics(sanitized, step=step)` 若捕獲 **`TypeError`** 且訊息含 `unexpected keyword`，fallback **`mlflow.log_metrics(sanitized)`** 並 **`_log.warning` 一次**（類型名稱即可，符合 Credential 慣例）。
+
+**希望新增的測試**：mock `log_metrics` 在收到 `step=` 時 **`side_effect=TypeError("unexpected keyword argument 'step'")`**，斷言第二次呼叫（或 fallback）為 **無 `step` 的 `log_metrics(sanitized)`**，且不 raise。
+
+---
+
+#### 3. `pytest.mark.xfail` 與實作已不一致（測試可維護性／CI 訊號）
+
+**問題**：`test_log_metrics_safe_filters_non_finite_values` 仍標 **`xfail(strict=False)`**，理由為「實作後再過濾」；但 **`log_metrics_safe` 已以 `math.isfinite` 過濾**，該測在現況常態為 **XPASS**，使 **xfail 失去「預期失敗」語意**，且與 STATUS 本輪「1 xpassed」敘述疊加後，新人易誤以為仍有未竟項。
+
+**具體修改建議**：移除 **`@pytest.mark.xfail`**，改為一般通過測試；若需保留「曾經 xfail 的歷史」，在 docstring 一行註明「原 T12 review #4，已於 isfinite 落地」即可。
+
+**希望新增的測試**：無需新增；可選加一則 **`step` + 全鍵被過濾後 early return**（`{"nan": nan}` only）斷言 **`log_metrics` 未被呼叫**。
+
+---
+
+#### 4. `backtester.py` ImportError fallback 之 `log_metrics_safe` 簽名不含 `**kwargs`
+
+**問題**：當 **`trainer.core.mlflow_utils` 匯入失敗**（極少見，如打包／路徑錯誤）時，fallback 為 **`def log_metrics_safe(_metrics)`**。若未來呼叫端改為 **`log_metrics_safe(m, step=k)`** 會 **`TypeError`**，**中斷 backtest**—與「safe／不中斷」哲學不一致。
+
+**具體修改建議**：改為 **`def log_metrics_safe(_metrics, **_kwargs) -> None: return None`**（或顯式 `step: Any = None`），僅吞掉額外參數，**不**執行 MLflow。
+
+**希望新增的測試**：於 **`tests/unit/test_mlflow_utils.py` 或 backtester 專用小測** 中，**動態模擬** ImportError 路徑較重；較輕量：**契約測試**對 `backtester.py` 原始碼 assert fallback 函式簽名含 `**kwargs` 或 `step`（regex／AST，與專案其他 review_risks 風格一致）。
+
+---
+
+#### 5. 時序語意與「非單調 `step`」之產品／儀表風險（非程式 bug）
+
+**問題**：實作**正確轉發** `step`；若呼叫端傳入 **遞減或非單調 `step`**（例如資料重算、多執行緒），MLflow UI 曲線可能 **折返或難讀**，易被誤判為模型衰退。
+
+**具體修改建議**：在 **`doc/phase2_p0_p1_implementation_plan.md` §9.1** 或 **`phase2_provenance_schema.md`** 加一句 **caller 責任**：建議 **`step` 於同一 run 內單調非遞減**（或說明使用情境如 epoch／樣本累計）。**不強制**在 `log_metrics_safe` 內排序或拒絕（避免隱藏行為）。
+
+**希望新增的測試**：無需自動化（屬文件／runbook）；可選 **文件契約測試**：assert 上述 doc 檔含「單調」或「monotonic」或中文「遞減」告誡字樣之一。
+
+---
+
+#### 6. 效能與安全性（簡要結論）
+
+**效能**：相較原本僅多 **一次 `step is not None` 分支** 與可選關鍵字參數；**無額外 O(n)**；重試次數與 sleep 不變。**安全性**：**未**在 log 中新增 `step` 或 metrics 內容（維持既有 **僅記 exception 類型名** 之慣例）；**未**新增對外 I/O 面。**無需**單獨效能／安全測試。
+
+---
+
+#### Review 總結
+
+| 項目 | 嚴重度 | 類型 |
+|------|--------|------|
+| `step` 型別（bool／float） | 中 | 邊界／除錯成本 |
+| 舊 client 不支援 `step=` | 低～中（環境依賴） | 相容性 |
+| xfail 與 XPASS 不一致 | 低 | 測試可維護性／CI 訊號 |
+| backtester fallback 簽名 | 低（僅 ImportError 路徑） | 韌性 |
+| 非單調 `step` 儀表解讀 | 低（產品面） | 文件／溝通 |
+
+**建議優先序**：**§1（型別／bool）** → **§3（移除過時 xfail）** → **§4（fallback `**kwargs`）** → §2／§5 視部署環境與文件節奏。
+
+---
+
+### 本輪（tests-only）：Code Review 風險 → MRE／契約測試
+
+**Date**：2026-03-22  
+**依據**：已讀 `PLAN.md`、`STATUS.md`（上節 Code Review）、`DECISION_LOG.md`。**僅新增測試**，未改 production。
+
+#### 新增檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/review_risks/test_review_risks_mlflow_log_metrics_step_review_2026_03_22.py` | 對應上節 **§1–§5**：§1 鎖定現狀（`bool`／`float`／`0`／`numpy.integer` 轉發）；§3 全非有限值 + `step` 不呼叫 `log_metrics`；§2／§4／§5 為 **`@pytest.mark.xfail(strict=False)`**（待 production／文件補強後改斷言並移除 xfail）。 |
+
+#### 執行方式（repo 根目錄）
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_mlflow_log_metrics_step_review_2026_03_22.py -q --tb=short
+ruff check tests/review_risks/test_review_risks_mlflow_log_metrics_step_review_2026_03_22.py
+```
+
+**本輪預期輸出**：**5 passed**, **3 xfailed**（§2 `TypeError` fallback、§4 backtester `**kwargs`、§5 doc 單調告誡）。
+
+#### 下一步建議
+
+1. Production 依 Review **§1** 做 `step` 正規化後，**改寫** §1 四則 MRE 的預期（例如 `bool`／`float` 不再轉發 `step`），並保留 `step=0`／`numpy` 案例。  
+2. §2／§4 落地後 **移除對應 xfail**，必要時將 §2 改為 **strict** 避免回歸。  
+3. §5：於 `doc/phase2_p0_p1_implementation_plan.md` 或 `doc/phase2_provenance_schema.md` 加入 caller **單調／monotonic** 告誡後 **移除 xfail**。  
+4. 可選：`tests/unit/test_mlflow_utils.py` 內舊 **`@pytest.mark.xfail`**（NaN/inf）仍可能造成 XPASS—另開一小變更僅調測試（非本輪範圍）。
+
+---
+
+### 本輪（production + 測試 decorator 清理）：`log_metrics_safe` `step` 相容、backtester fallback、Review MRE 全綠
+
+**Date**：2026-03-22  
+
+#### 目標
+
+對齊上一節 Code Review **§2–§5** 與 MRE 檔：舊版 `mlflow.log_metrics` 不支援 `step=` 時安全降級；`backtester` ImportError stub 吸收 `**kwargs`；文件載明 caller 對 `step` 單調性責任；移除已過時之 **`xfail`**／**XPASS** 訊號。
+
+#### Production／文件
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/core/mlflow_utils.py` | 新增 **`_log_metrics_sanitized_with_step_fallback`**：`step is None` 僅 `log_metrics(sanitized)`；否則先帶 `step=`，遇 **`TypeError`** 且訊息同時含 **`unexpected keyword`** 與 **`step`** 時 **warning（僅例外型別名）** 後改呼叫無 `step` 的 `log_metrics(sanitized)`。**`log_metrics_safe`** 重試路徑改經此 helper。 |
+| `trainer/training/backtester.py` | `except ImportError` 內 stub：**`def log_metrics_safe(_metrics: Dict[str, Any], **_kwargs: Any) -> None`**，避免未來呼叫端傳 `step=` 時炸回測路徑。 |
+| `doc/phase2_p0_p1_implementation_plan.md` | **§9.1** 補 **Caller 責任**：同一 run 內建議 **`step` 單調非遞減**（monotonic non-decreasing）。 |
+
+#### 測試（僅 decorator 過時／契約對齊）
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `tests/review_risks/test_review_risks_mlflow_log_metrics_step_review_2026_03_22.py` | 移除 **§4** 之 **`@pytest.mark.xfail`**；區塊註解改為已落地（與檔首 docstring 一致）。 |
+| `tests/unit/test_mlflow_utils.py` | 移除 **`test_log_metrics_safe_filters_non_finite_values`** 上已過時之 **`xfail`**（`isfinite` 已落地）。 |
+| `tests/review_risks/test_review_risks_phase2_mlflow_trainer.py` | 移除 **`test_failure_except_truncates_long_training_window_strings`** 之 **`xfail`**（truncation 已實作，原為 **XPASS**）。 |
+
+#### 驗證（repo 根目錄）
+
+```bash
+python -m ruff check trainer/ package/ scripts/
+python -m mypy trainer/ package/ --ignore-missing-imports
+python -m pytest tests/ -q --tb=no --ignore=tests/e2e --ignore=tests/load
+```
+
+| 指令 | 結果 |
+|------|------|
+| **ruff**（trainer/ package/ scripts/） | **All checks passed!** |
+| **mypy**（trainer/ package/，`--ignore-missing-imports`） | **Success: no issues found in 51 source files** |
+| **pytest**（同上 ignore） | **1324 passed**, **64 skipped**, **0 xfailed**, **0 xpassed**；**13 subtests passed** |
+
+#### 後續（仍非本輪）
+
+- **§1**（`bool`／`float` `step` 正規化）仍為可選強化；MRE 測試目前鎖定「現狀轉發」。  
+- **PLAN_phase2_p0_p1.md** 之 **Remaining items**（Credential migration、DB path、`T-TrainingMetricsSchema`、可選 scorer lookback fallback 等）不變。
+

@@ -332,13 +332,37 @@ def log_tags_safe(tags: dict[str, str]) -> None:
     )
 
 
-def log_metrics_safe(metrics: dict[str, Any]) -> None:
+def _log_metrics_sanitized_with_step_fallback(
+    mlflow_mod: Any, sanitized: dict[str, float], step: Optional[int]
+) -> None:
+    """Call mlflow.log_metrics; if client rejects ``step=`` (TypeError), retry once without step."""
+    if step is None:
+        mlflow_mod.log_metrics(sanitized)
+        return
+    try:
+        mlflow_mod.log_metrics(sanitized, step=step)
+    except TypeError as e:
+        msg = str(e).lower()
+        if "unexpected keyword" in msg and "step" in msg:
+            _log.warning(
+                "MLflow log_metrics rejected step=; logging without step (%s)",
+                type(e).__name__,
+            )
+            mlflow_mod.log_metrics(sanitized)
+            return
+        raise
+
+
+def log_metrics_safe(metrics: dict[str, Any], step: Optional[int] = None) -> None:
     """
     Log numeric metrics to current run if MLflow is available; otherwise no-op.
 
     Contract-style behavior:
     - Skip keys whose value is None.
     - Best-effort coerce values via float(v); on failure skip that key.
+    - Optional ``step`` is forwarded to ``mlflow.log_metrics`` so the same keys can form
+      a time series in the UI instead of a single overwritten point.
+    - If the MLflow client does not support ``step=`` (TypeError), logs once without ``step``.
     - Never raise (log warning only) so training pipeline is not impacted.
     T13: On 502/503/504 (e.g. cold start), retries with exponential backoff.
     """
@@ -362,7 +386,7 @@ def log_metrics_safe(metrics: dict[str, Any]) -> None:
     last_exc: Optional[Exception] = None
     for attempt in range(_MLFLOW_RETRY_MAX_RETRIES + 1):
         try:
-            mlflow.log_metrics(sanitized)
+            _log_metrics_sanitized_with_step_fallback(mlflow, sanitized, step)
             return
         except Exception as e:
             last_exc = e

@@ -354,7 +354,6 @@ class TestT12FailureParamsBehavior(unittest.TestCase):
 class TestT12FailureParamsTruncationXfail(unittest.TestCase):
     """Risk #6: failure params may contain unexpectedly long strings."""
 
-    @pytest.mark.xfail(strict=False, reason="failure params string truncation not implemented yet")
     def test_failure_except_truncates_long_training_window_strings(self):
         import datetime as _dt
 

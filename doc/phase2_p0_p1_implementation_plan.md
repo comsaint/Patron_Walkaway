@@ -218,6 +218,7 @@ state.db alerts → validator (ClickHouse) → validation_results
 - **簽名**：`log_metrics_safe(metrics, step: Optional[int] = None)`（或等價：僅在 `step is not None` 時傳入 MLflow，以符合執行時 MLflow 版本語意）。
 - **目的**：允許同一 metric 鍵在 UI 呈現**時序曲線**，而非單點覆寫。
 - **相容**：預設 `None` 時行為與現況一致；既有呼叫端無須修改即可上線。
+- **Caller 責任**：同一 MLflow run 內建議 `step` **單調非遞減**（**monotonic non-decreasing**），避免 UI 曲線折返造成誤讀；實作不在 `log_metrics_safe` 內強制排序。
 
 ### 9.2 Phase B1 — `log_input_safe`
 

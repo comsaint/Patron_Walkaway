@@ -127,7 +127,7 @@ except ImportError:
     def has_active_run() -> bool:  # type: ignore[misc]
         return False
 
-    def log_metrics_safe(_metrics: Dict[str, Any]) -> None:  # type: ignore[misc]
+    def log_metrics_safe(_metrics: Dict[str, Any], **_kwargs: Any) -> None:  # type: ignore[misc]
         return None
 
 

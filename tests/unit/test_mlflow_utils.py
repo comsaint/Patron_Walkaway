@@ -135,18 +135,35 @@ def test_log_metrics_safe_skips_non_numeric_values():
     mock_log_metrics.assert_called_once()
     logged = mock_log_metrics.call_args[0][0]
     assert logged == {"ok": 1.23}
+    assert mock_log_metrics.call_args.kwargs.get("step") is None
 
 
-@pytest.mark.xfail(strict=False, reason="log_metrics_safe should filter NaN/inf values once implemented")
-def test_log_metrics_safe_filters_non_finite_values():
-    """Risk #4: log_metrics_safe should skip NaN/inf values (desired behavior)."""
+def test_log_metrics_safe_forwards_step_when_provided():
+    """phase2_p0_p1 §9.1: optional step is passed to mlflow.log_metrics for time-series metrics."""
     with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
         import types
 
         dummy_mlflow = types.SimpleNamespace()
         with patch.object(dummy_mlflow, "log_metrics", create=True) as mock_log_metrics:
             with patch.dict(sys.modules, {"mlflow": dummy_mlflow}):
-                mlflow_utils.log_metrics_safe({"nan": float("nan"), "inf": float("inf"), "ok": 1.0})
+                mlflow_utils.log_metrics_safe({"x": 2.0}, step=42)
+
+    mock_log_metrics.assert_called_once()
+    assert mock_log_metrics.call_args[0][0] == {"x": 2.0}
+    assert mock_log_metrics.call_args.kwargs.get("step") == 42
+
+
+def test_log_metrics_safe_filters_non_finite_values():
+    """Risk #4: log_metrics_safe skips NaN/inf values (isfinite filter)."""
+    with patch("trainer.core.mlflow_utils.is_mlflow_available", return_value=True):
+        import types
+
+        dummy_mlflow = types.SimpleNamespace()
+        with patch.object(dummy_mlflow, "log_metrics", create=True) as mock_log_metrics:
+            with patch.dict(sys.modules, {"mlflow": dummy_mlflow}):
+                mlflow_utils.log_metrics_safe(
+                    {"nan": float("nan"), "inf": float("inf"), "ok": 1.0}, step=0
+                )
 
     logged = mock_log_metrics.call_args[0][0]
     assert "nan" not in logged
