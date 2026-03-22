@@ -6,6 +6,8 @@ This document summarizes known **out-of-memory (OOM)** and **long-running-time**
 
 **Assumptions:** Training data from local Parquet (e.g. `data/gmwds_t_bet.parquet`, `data/gmwds_t_session.parquet`); training may run on 8GB / 32GB / 64GB machines.
 
+**Cross-reference — DEC-031 / train metrics (T-DEC031 step 7):** Step 9 model fitting avoids full-window dense `predict_proba` on the entire training matrix by using **batched prediction** where configured, and **Plan B+** paths may compute train metrics from **LibSVM** (`train_for_lgb.libsvm`) via `booster.predict` instead of materializing a full dense train matrix. For the exact call sites and env flags, see `trainer/training/trainer.py` (search `DEC-031`, `PREDICT_PROBA_BATCH_ROWS`, LibSVM / `from_file` training). OOM hotspots **A26** and Step 7 rows in the table below remain the primary RAM/time pairing with those mitigations.
+
 ---
 
 ## Summary Table

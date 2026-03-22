@@ -108,9 +108,9 @@ class TestReviewerR2LexicalTimestampWindow:
 
 
 class TestReviewerTrainingMetricsNested:
-    """Reviewer #2: baseline only reads top-level keys; nested trainer shapes stay invisible."""
+    """T-TrainingMetricsSchema: baseline falls back to ``rated.metrics`` when top-level absent."""
 
-    def test_nested_test_precision_not_surfaced_but_status_ok(self, tmp_path: Path) -> None:
+    def test_nested_test_precision_surfaced_via_rated_metrics_fallback(self, tmp_path: Path) -> None:
         model_dir = tmp_path / "model"
         model_dir.mkdir()
         payload = {
@@ -122,8 +122,8 @@ class TestReviewerTrainingMetricsNested:
         )
         baseline = r1r6._load_training_metrics_baseline(model_dir)
         assert baseline["status"] == "ok"
-        assert baseline["test_precision_at_recall_0.01"] is None
-        assert baseline["threshold_at_recall_0.01"] is None
+        assert baseline["test_precision_at_recall_0.01"] == 0.42
+        assert baseline["threshold_at_recall_0.01"] == 0.77
 
 
 class TestReviewerUnifiedOverlap:

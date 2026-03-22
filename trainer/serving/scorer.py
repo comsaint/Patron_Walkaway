@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -498,6 +499,139 @@ def init_state_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_session_player ON session_stats(player_id)"
         )
+        ensure_runtime_rated_threshold_schema(conn)
+        conn.commit()
+
+
+def ensure_runtime_rated_threshold_schema(conn: sqlite3.Connection) -> None:
+    """State DB: single-row override for rated alert threshold (T-OnlineCalibration / DEC-032)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runtime_rated_threshold (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            rated_threshold REAL NOT NULL,
+            updated_at TEXT NOT NULL,
+            source TEXT,
+            n_mature INTEGER,
+            n_pos INTEGER,
+            window_hours REAL,
+            recall_at_threshold REAL,
+            precision_at_threshold REAL
+        )
+        """
+    )
+
+
+def upsert_runtime_rated_threshold(
+    conn: sqlite3.Connection,
+    rated_threshold: float,
+    *,
+    source: str = "calibration",
+    n_mature: Optional[int] = None,
+    n_pos: Optional[int] = None,
+    window_hours: Optional[float] = None,
+    recall_at_threshold: Optional[float] = None,
+    precision_at_threshold: Optional[float] = None,
+) -> None:
+    """Replace the single runtime threshold row (id=1). Caller must commit if needed."""
+    t = float(rated_threshold)
+    if not math.isfinite(t) or t <= 0.0 or t >= 1.0:
+        raise ValueError(
+            f"rated_threshold must be strictly between 0 and 1; got {rated_threshold!r}"
+        )
+    ensure_runtime_rated_threshold_schema(conn)
+    now = datetime.now(HK_TZ).isoformat()
+    conn.execute(
+        """
+        INSERT INTO runtime_rated_threshold (
+            id, rated_threshold, updated_at, source, n_mature, n_pos,
+            window_hours, recall_at_threshold, precision_at_threshold
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            rated_threshold = excluded.rated_threshold,
+            updated_at = excluded.updated_at,
+            source = excluded.source,
+            n_mature = excluded.n_mature,
+            n_pos = excluded.n_pos,
+            window_hours = excluded.window_hours,
+            recall_at_threshold = excluded.recall_at_threshold,
+            precision_at_threshold = excluded.precision_at_threshold
+        """,
+        (
+            t,
+            now,
+            source,
+            n_mature,
+            n_pos,
+            window_hours,
+            recall_at_threshold,
+            precision_at_threshold,
+        ),
+    )
+
+
+def read_effective_runtime_rated_threshold(
+    conn: sqlite3.Connection, bundle_threshold: float
+) -> float:
+    """Return state DB override when valid and fresh; else ``bundle_threshold``."""
+    bundle_t = float(bundle_threshold)
+    if not math.isfinite(bundle_t):
+        bundle_t = 0.5
+    try:
+        row = conn.execute(
+            "SELECT rated_threshold, updated_at FROM runtime_rated_threshold WHERE id = 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return bundle_t
+    if not row:
+        return bundle_t
+    t = float(row[0])
+    ts_raw = row[1]
+    if not math.isfinite(t) or t <= 0.0 or t >= 1.0:
+        logger.warning(
+            "[scorer] runtime_rated_threshold out of range (%r); using bundle %.4f",
+            t,
+            bundle_t,
+        )
+        return bundle_t
+    max_age = getattr(config, "RUNTIME_THRESHOLD_MAX_AGE_HOURS", None)
+    ts_text: Optional[str] = None
+    if isinstance(ts_raw, str):
+        ts_text = ts_raw.strip() or None
+    elif ts_raw is not None:
+        ts_text = str(ts_raw).strip() or None
+    if max_age is not None and float(max_age) > 0.0:
+        if not ts_text:
+            logger.warning(
+                "[scorer] runtime_rated_threshold updated_at missing/blank with TTL; using bundle %.4f",
+                bundle_t,
+            )
+            return bundle_t
+        try:
+            ts = pd.Timestamp(ts_text)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize(HK_TZ)
+            else:
+                ts = ts.tz_convert(HK_TZ)
+            now = pd.Timestamp.now(tz=HK_TZ)
+            age_h = float((now - ts).total_seconds()) / 3600.0
+            if age_h > float(max_age):
+                logger.info(
+                    "[scorer] runtime_rated_threshold stale (%.2fh > max %.2fh); using bundle %.4f",
+                    age_h,
+                    float(max_age),
+                    bundle_t,
+                )
+                return bundle_t
+        except Exception as exc:
+            logger.warning(
+                "[scorer] runtime_rated_threshold updated_at parse failed (%s); using bundle",
+                exc,
+            )
+            return bundle_t
+    if abs(t - bundle_t) > 1e-9:
+        logger.info("[scorer] Using runtime_rated_threshold=%.4f (bundle was %.4f)", t, bundle_t)
+    return t
 
 
 def _get_last_processed_end(conn: sqlite3.Connection) -> Optional[pd.Timestamp]:
@@ -1041,6 +1175,42 @@ def _ensure_prediction_export_meta(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_prediction_calibration_schema(conn: sqlite3.Connection) -> None:
+    """prediction_log.db: labels + calibration audit tables (T-OnlineCalibration / DEC-032)."""
+    _ensure_prediction_log_table(conn)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prediction_ground_truth (
+            bet_id TEXT PRIMARY KEY,
+            label REAL NOT NULL,
+            status TEXT NOT NULL,
+            labeled_at TEXT,
+            prediction_id INTEGER
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pgt_status ON prediction_ground_truth(status)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS calibration_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at TEXT NOT NULL,
+            window_start TEXT,
+            window_end TEXT,
+            window_hours REAL,
+            n_rows_used INTEGER,
+            n_pos INTEGER,
+            suggested_threshold REAL,
+            applied_to_state INTEGER NOT NULL,
+            skipped_reason TEXT,
+            summary_json TEXT
+        )
+        """
+    )
+
+
 def _append_prediction_log(
     pl_path: str,
     scored_at: str,
@@ -1190,6 +1360,8 @@ def _score_df(
     df: pd.DataFrame,
     artifacts: dict,
     feature_list: List[str],
+    *,
+    rated_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
     """Score all observations with the rated model and compute margin.
 
@@ -1244,7 +1416,10 @@ def _score_df(
     df["score"] = scores
     df["is_rated_obs"] = is_rated.astype(int)
 
-    rated_t = float((rated_art or {}).get("threshold", 0.5))
+    bundle_t = float((rated_art or {}).get("threshold", 0.5))
+    rated_t = float(rated_threshold) if rated_threshold is not None else bundle_t
+    if not math.isfinite(rated_t):
+        rated_t = bundle_t
     df["margin"] = df["score"] - rated_t
 
     return df
@@ -1582,7 +1757,11 @@ def score_once(
         )
 
     # ── Score with H3 routing (rated only) ─────────────────────────────────
-    features_df = _score_df(features_df, artifacts, feature_list)
+    bundle_thr = float((artifacts.get("rated") or {}).get("threshold", 0.5))
+    effective_thr = read_effective_runtime_rated_threshold(conn, bundle_thr)
+    features_df = _score_df(
+        features_df, artifacts, feature_list, rated_threshold=effective_thr
+    )
 
     # ── Phase 2 P1.1: append all scored rows to prediction_log (before alert filter) ──
     pl_path = getattr(config, "PREDICTION_LOG_DB_PATH", None) or ""

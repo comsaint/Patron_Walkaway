@@ -6,6 +6,169 @@
 
 ---
 
+## Phase 2 Code Review 風險實裝修正（2026-03-22 追加）
+
+### 背景
+- 依「Code Review：Phase 2 剩餘項」與 MRE 測試，**修改 production**（非僅 tests）：lookback 上限、`read_effective` TTL／空白 `updated_at`、`upsert` 區間驗證、校準 CLI 空路徑；並**必要時**調整契約測試（§9、`test_phase2_remaining_code_review_mre`）。
+
+### 變更檔案
+| 檔案 | 說明 |
+|------|------|
+| [trainer/core/config.py](../../trainer/core/config.py) | 新增 **`SCORER_LOOKBACK_HOURS_MAX`**（預設 8760，可 env）；超上限 **cap** 並 `warning`。 |
+| [trainer/serving/scorer.py](../../trainer/serving/scorer.py) | **`upsert_runtime_rated_threshold`**：`0<t<1` 且 finite，否則 **`ValueError`**；**`read_effective_runtime_rated_threshold`**：TTL 開啟時 **`updated_at` 空白／缺漏** → 退回 bundle（與解析失敗一致）。 |
+| [trainer/scripts/calibrate_threshold_from_prediction_log.py](../../trainer/scripts/calibrate_threshold_from_prediction_log.py) | **`--init-schema`**：以**原始 env 字串**判斷空路徑（避免 Windows 上 `Path('')`→`'.'` 略過檢查）；明確 **`SystemExit` 訊息**。 |
+| [credential/.env.example](../../credential/.env.example) | 註解 **`SCORER_LOOKBACK_HOURS_MAX`**。 |
+| [tests/unit/test_config.py](../../tests/unit/test_config.py) | 斷言 **`SCORER_LOOKBACK_HOURS` ≤ `SCORER_LOOKBACK_HOURS_MAX`**。 |
+| [tests/review_risks/test_phase2_remaining_code_review_mre.py](../../tests/review_risks/test_phase2_remaining_code_review_mre.py)、[test_status_review_20260322_threshold_mre.py](../../tests/review_risks/test_status_review_20260322_threshold_mre.py) | 契約對齊新行為（§1 cap、§4 TTL+空字串、§5 upsert raise／手動 UPDATE、§6 訊息、§9 無效 upsert）。 |
+
+### 手動驗證
+1. `SCORER_LOOKBACK_HOURS=999999` 啟動 scorer 前：`python -c "import os; os.environ['SCORER_LOOKBACK_HOURS']='999999'; import trainer.core.config as c; print(c.SCORER_LOOKBACK_HOURS, c.SCORER_LOOKBACK_HOURS_MAX)"` → 應等於 **max**。  
+2. `python -m trainer.scripts.calibrate_threshold_from_prediction_log --init-schema` 於 `PREDICTION_LOG_DB_PATH=""` 應 **立即** 以訊息退出（無 `sqlite3` 開檔）。  
+3. 臨時 DB：`upsert_runtime_rated_threshold(conn, 2.0)` 應 **`ValueError`**。
+
+### 本輪驗證（代理環境）
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| Lint | `python -m ruff check .` | **通過**（`ruff.toml` 排除 `tests/`） |
+| Typecheck | `python -m mypy trainer/ package/ --ignore-missing-imports` | **通過**（55 source files） |
+| Pytest | `python -m pytest tests/ -q -p no:langsmith --tb=line` | **1392 passed**, **64 skipped**, 13 subtests passed |
+
+### 下一步建議
+- CH 閉環／營運遷移／Pipeline §6 可選、§8 人工仍見 PLAN；可選：`CALIBRATE_ALLOW_WRITE` 閘門（STATUS Review §8）。
+
+---
+
+## Phase 2 剩餘項落地：T-OnlineCalibration（MVP）、T-TrainingMetricsSchema、T-DEC031 步驟 7、scorer lookback、路徑註解（2026-03-22）
+
+### 背景
+- 對照 [PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md) **Remaining items**：一次實作可程式化部分（不含營運搬移、§8 人工驗收、完整 CH 校準迴圈）。
+
+### 變更檔案（摘要）
+| 區域 | 檔案 | 說明 |
+|------|------|------|
+| Config | [trainer/core/config.py](../../trainer/core/config.py) | `SCORER_LOOKBACK_HOURS` 支援 env，非法／≤0 → **8**；新增 **`RUNTIME_THRESHOLD_MAX_AGE_HOURS`**（可選 TTL）。 |
+| Scorer | [trainer/serving/scorer.py](../../trainer/serving/scorer.py) | `runtime_rated_threshold` 表、`read_effective_runtime_rated_threshold`／`upsert_runtime_rated_threshold`；`score_once` 以有效 runtime 列覆寫 bundle threshold；`ensure_prediction_calibration_schema`（`prediction_ground_truth`、`calibration_runs`）。 |
+| 校準 CLI | [trainer/scripts/calibrate_threshold_from_prediction_log.py](../../trainer/scripts/calibrate_threshold_from_prediction_log.py) | `--init-schema`、`--set-runtime-threshold`（MVP；完整 CH 標註／PR 校準可後續擴充）。 |
+| Baseline 讀取 | [investigations/test_vs_production/checks/run_r1_r6_analysis.py](../../investigations/test_vs_production/checks/run_r1_r6_analysis.py) | `_baseline_get_with_rated_fallback`：`training_metrics.json` 頂層缺鍵時讀 **`rated`／`rated.metrics`**。 |
+| Trainer artifact | [trainer/training/trainer.py](../../trainer/training/trainer.py) | `training_metrics.json` 頂層 **`threshold_selected_at_recall_floor`**（對齊 `THRESHOLD_MIN_RECALL`）。 |
+| Backtester 文件 | [trainer/training/backtester.py](../../trainer/training/backtester.py) | `compute_micro_metrics` docstring：**`test_ap` 全列 vs PR oracle 僅 rated**。 |
+| OOM 審計 doc | [doc/training_oom_and_runtime_audit.md](../../doc/training_oom_and_runtime_audit.md) | **T-DEC031 步驟 7**：與 train 指標分批／LibSVM 之交叉引用段落。 |
+| view_alerts | [trainer/scripts/view_alerts.py](../../trainer/scripts/view_alerts.py) | 預設 DB 改 **repo 根 `local_state/state.db`**（對齊 PLAN DB consolidation）。 |
+| 範例 env | [credential/.env.example](../../credential/.env.example) | `SCORER_LOOKBACK_HOURS`、`RUNTIME_THRESHOLD_MAX_AGE_HOURS` 註解。 |
+| 測試 | [tests/review_risks/test_review_risks_r1_r6_reviewer_risks.py](../../tests/review_risks/test_review_risks_r1_r6_reviewer_risks.py)、[test_status_review_20260322_threshold_mre.py](../../tests/review_risks/test_status_review_20260322_threshold_mre.py)、[tests/unit/test_config.py](../../tests/unit/test_config.py) | 對齊新契約（§9 改為 state DB 實測；Windows 單連線避免 WAL 鎖）。 |
+| Plan | [.cursor/plans/PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md) | **Remaining items**／**T-OnlineCalibration** 專節與本節對齊；標註 **MVP ✅**、CH 標註／自動 PR 寫 runtime 仍 **in progress**。 |
+
+### 手動驗證
+1. **校準 CLI（勿覆寫生產 DB 時請設 `STATE_DB_PATH`／`PREDICTION_LOG_DB_PATH` 指向臨時檔）**  
+   `python -m trainer.scripts.calibrate_threshold_from_prediction_log --init-schema`  
+   `python -m trainer.scripts.calibrate_threshold_from_prediction_log --set-runtime-threshold 0.62 --source smoke_test`
+2. **view_alerts 預設路徑**：於 repo 根執行 `python -m trainer.scripts.view_alerts --limit 5`（需有 `local_state/state.db` 或傳 `--db`）。
+3. **training_metrics 鍵**：訓練產出之 `training_metrics.json` 應含 **`threshold_selected_at_recall_floor`**；調查腳本 baseline 應能讀巢狀 `rated.metrics` 之 PR 鍵。
+
+### 本輪驗證（代理環境）
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| Lint | `python -m ruff check trainer/ ...` | **通過** |
+| Typecheck | `python -m mypy trainer/ package/ --ignore-missing-imports` | **通過**（55 source files） |
+| Pytest | `python -m pytest tests/ -q -p no:langsmith --tb=line` | **1381 passed**, **64 skipped** |
+
+### 仍待（非本輪可程式結案）
+- **營運**：`credential/` 搬移舊 `.env`、已部署分散 DB 路徑遷移。
+- **T-OnlineCalibration 完整閉環**：CH 拉標籤寫入 `prediction_ground_truth`、成熟樣本 PR + `pick_threshold_dec026`、自動寫 runtime（本輪僅 schema + 手動 upsert CLI）。
+- **test 集** `_compute_test_metrics_from_scores` 是否接共用選阈（可選）。
+- **Pipeline doc §6 可選補強**、**§8 人工驗收**。
+
+### 下一步建議
+- 排程校準 job：呼叫 CLI 或擴充腳本接上 CH + `compute_labels` 語意；監控 `calibration_runs.skipped_reason`。
+- 若 production 啟用 runtime 阈，設 **`RUNTIME_THRESHOLD_MAX_AGE_HOURS`** 避免長停後沿用過期列。
+
+### 追加（2026-03-22）：PLAN_phase2 同步
+- **變更檔**：僅 [.cursor/plans/PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md)（**Remaining items** 清單與 **T-OnlineCalibration** 小節改寫，與上表一致）。
+- **手動驗證**：開啟該檔確認「Remaining items」中已標 ✅ 之項（DEC031 步驟 7 doc、TrainingMetricsSchema 讀取端、lookback、round235／242、OnlineCalibration MVP）與仍待（營運、CH 閉環、§6／§8）敘述無矛盾。
+- **下一步**：與「仍待」同上；計畫索引仍以 [PLAN.md](PLAN.md) 為輔。
+
+---
+
+## Code Review（高可靠性覆核）：Phase 2 剩餘項 — runtime 阈／校準 schema／config／baseline／CLI（2026-03-22）
+
+**範圍**（未重寫整套；僅針對本輪 Phase 2 可程式化變更相關程式與調查腳本）：[`trainer/core/config.py`](../../trainer/core/config.py)（`SCORER_LOOKBACK_HOURS`、`RUNTIME_THRESHOLD_MAX_AGE_HOURS`）、[`trainer/serving/scorer.py`](../../trainer/serving/scorer.py)（`runtime_rated_threshold`、`read_effective_runtime_rated_threshold`、`upsert_runtime_rated_threshold`、`ensure_prediction_calibration_schema`、`score_once` 接線）、[`trainer/scripts/calibrate_threshold_from_prediction_log.py`](../../trainer/scripts/calibrate_threshold_from_prediction_log.py)、[`investigations/test_vs_production/checks/run_r1_r6_analysis.py`](../../investigations/test_vs_production/checks/run_r1_r6_analysis.py)（`_baseline_get_with_rated_fallback`）、[`trainer/training/trainer.py`](../../trainer/training/trainer.py)（`threshold_selected_at_recall_floor`）、[`trainer/scripts/view_alerts.py`](../../trainer/scripts/view_alerts.py)；並對照 [`tests/review_risks/test_status_review_20260322_threshold_mre.py`](../../tests/review_risks/test_status_review_20260322_threshold_mre.py) §9。
+
+**結論**：單列 runtime 覆寫 + TTL + `score_once` 讀取路徑清楚；SQLite 使用 parameterized SQL，無顯見 SQLi。下列為**最可能**影響可用性、觀測正確性或營運假設的項目（**未**於本節修改 production）。
+
+### 1. `SCORER_LOOKBACK_HOURS` 僅擋非法／≤0，未擋「過大正數」→ `timedelta`／`datetime` 可能 `OverflowError`
+
+- **風險**：`config` 將合法字串轉成很大的正整數後，scorer 在 `now_hk - timedelta(hours=lookback_hours)` 可能拋錯（代理環境驗證：`1e9` 小時已觸發 `OverflowError`）。結果是行程崩潰而非回退到預設 8。
+- **具體修改建議**：在 `trainer/core/config.py` 解析後增加**保守上限**（例如 ≤ 8760 小時＝約一年，或再以 `timedelta` 試算確認不溢位），超上限則 `warning` 並 **fallback 8**（或 cap 到上限而非 8，但需文件化）。可選：在 scorer 入口對 `lookback_hours` 再 assert 一次防禦性檢查。
+- **希望新增的測試**：`tests/unit/test_config.py`：設定 `SCORER_LOOKBACK_HOURS` 為極大值（如 `"1000000000"`），斷言最終常數為 fallback 或 cap；可選 subprocess 最小 `score_once` mock 測試確認不崩潰。
+
+### 2. `SCORER_LOOKBACK_HOURS` 使用 `int(float(...))` → 小數被**截斷**而非四捨五入
+
+- **風險**：`7.9` 變成 `7`，與直覺「約 8 小時」不符，屬設定誤讀而非崩潰。
+- **具體修改建議**：文件化行為（`credential/.env.example` 註明「僅接受整數語意；小數會截斷」）；或改為 `max(1, int(round(float(...))))` 並註明 breaking 風險（需產品同意）。
+- **希望新增的測試**：單元：`SCORER_LOOKBACK_HOURS="7.9"` 的實際整數結果與文件聲明一致（無論選截斷或 round）。
+
+### 3. `read_effective_runtime_rated_threshold`：啟用 TTL 時 `updated_at` **無法解析** → 一律退回 bundle
+
+- **風險**：若營運預期「寧可沿用 runtime 阈也不要突然變回 bundle」，目前行為是**偏保守**（退回 bundle）。若 DB 被手動寫入非 ISO 字串，會在**每次** `score_once` 打 warning 並忽略覆寫，可能與 on-call 預期相反。
+- **具體修改建議**：二選一並寫進 runbook：（a）維持現狀但將 log 級別／文案標成 **「TTL/時戳無效 → 停用覆寫」**；（b）在「解析失敗」時改為**視同過期**或**視為永遠有效**（需明確產品決策，避免靜默誤判）。
+- **希望新增的測試**：在 `test_status_review_20260322_threshold_mre.py` 或 `tests/unit`：`RUNTIME_THRESHOLD_MAX_AGE_HOURS` patch 為正數、`updated_at` 為垃圾字串時，斷言回傳 bundle 且（可選）`caplog` 含預期訊息；另加一則「合法 ISO + 過期」回 bundle 的測試。
+
+### 4. TTL 分支依賴 `ts_raw` 為真值：`updated_at == ""` 時可能**略過**鮮度檢查
+
+- **風險**：schema 上 `NOT NULL` 但 SQLite 不阻止 `""`；條件 `if max_age ... and ts_raw` 在空字串時不進入解析／鮮度邏輯，若 `rated_threshold` 仍合法，則**永久視為有效**。屬手動汙染或錯誤遷移的邊界。
+- **具體修改建議**：將條件改為 `ts_raw is not None` 並對 `str.strip() == ""` 視同「無效時間戳」：與解析失敗採**同一策略**（建議與議題 3 同一決策）。
+- **希望新增的測試**：建臨時 DB：`updated_at=''`、`RUNTIME_THRESHOLD_MAX_AGE_HOURS` mock 為小時數，斷言行為符合選定策略（退回 bundle 或拒絕覆寫）。
+
+### 5. `upsert_runtime_rated_threshold` 不在寫入時驗證區間；錯值僅在讀取端被拒
+
+- **風險**：非 CLI 呼叫者寫入 `≤0`、`≥1`、`NaN` 時，DB 狀態與實際生效不一致，僅 log warning，利於除錯但可能造成「以為已寫入」的誤解。
+- **具體修改建議**：在 `upsert_runtime_rated_threshold` 開頭對 `rated_threshold` 做 `math.isfinite` 與 `0 < t < 1`，非法則 `raise ValueError` 或改為 no-op + `logger.error`（與 CLI 契約對齊）。
+- **希望新增的測試**：單元：直接呼叫 `upsert_runtime_rated_threshold(conn, 1.5)` 預期 raise 或 no-op（與實作選擇一致）；確保與 §9 現有「寫 2.0 → read 回 bundle」測試相容。
+
+### 6. `calibrate_threshold_from_prediction_log`：`PREDICTION_LOG_DB_PATH` 為空時路徑退化
+
+- **風險**：`_prediction_log_path()` 變成 `Path('')`，`parent` 為 `'.'`，`--init-schema` 可能在**非預期 cwd** 建立／開啟 SQLite，難以察覺。
+- **具體修改建議**：`--init-schema` 前檢查 `pl_path` 是否為「空或僅空白」；若然則 `SystemExit` 並提示設定 `PREDICTION_LOG_DB_PATH` 或傳 `--prediction-log-db`。`--set-runtime-threshold` 路徑亦應拒絕空 `state-db` 解析結果（若未來支援從 env 空字串繼承）。
+- **希望新增的測試**：`tests/unit` 或 integration：monkeypatch `config.PREDICTION_LOG_DB_PATH` 為 `""` 並執行 CLI（subprocess 或呼叫 `main`）預期非零退出與錯誤訊息。
+
+### 7. `_baseline_get_with_rated_fallback`：`if v is not None` 語意（覆核後校正）
+
+- **風險（覆核校正）**：實作為 `v = data.get(key)` 後 **`if v is not None: return v`**，故頂層 JSON `null`（Python `None`）**會**繼續讀 `rated`／`rated.metrics`（與鍵缺失同路徑）。較需警惕的是頂層寫 **`0.0`／`False` 等「非 None 假值」** 時**不會**遞補巢狀較合理的值，調查 baseline 可能顯示 0 而忽略 `rated.metrics`。
+- **具體修改建議**：若產品要「0 視同缺失、改讀 metrics」：需改 helper 語意（例如僅對特定鍵用 sentinel）；否則在調查／文件標註「頂層 0 與缺失不同」。
+- **希望新增的測試**：契約測試鎖定「頂層 `0.0` 不遞補」與「頂層 `None` 會遞補」兩者（見下「MRE／契約測試落地」）。
+
+### 8. 安全與治理（非必修程式，但屬關鍵決策相關）
+
+- **風險**：`--set-runtime-threshold` 可指向任意 `--state-db`；能寫檔的 OS 使用者即可改線上阈，**無應用層鑑別**。屬預期中的 ops 工具邊界，但誤用成本高（大量漏報／誤報）。
+- **具體修改建議**：在 repo runbook／`calibrate_threshold_from_prediction_log.py` 模組 docstring 明列：**僅限特權環境**、建議搭配 `STATE_DB_PATH` 與檔案權限、寫入前備份；可選：要求環境變數 `CALIBRATE_ALLOW_WRITE=1` 才允許 `--set-runtime-threshold`（預設關閉）。
+- **希望新增的測試**：若加入 env 閘門：單元測試「未設 flag 時 exit 1」；否則僅文件與手動 checklist，不需自動測試。
+
+### MRE／契約測試落地（僅 tests；2026-03-22 追加）
+
+**新增檔案**：[tests/review_risks/test_phase2_remaining_code_review_mre.py](../../tests/review_risks/test_phase2_remaining_code_review_mre.py)（內含與 `run_r1_r6_analysis._baseline_get_with_rated_fallback` **行為須同步**之鏡像 helper，僅供測試）。
+
+| Reviewer § | 測試類 | 重現內容 |
+|------------|--------|----------|
+| §1 | `TestPhase2ReviewerLookbackTimedeltaOverflowMre` | 子程序設 `SCORER_LOOKBACK_HOURS=1000000000` → **cap 至 `SCORER_LOOKBACK_HOURS_MAX`**，`timedelta` **不** `OverflowError`（實裝後契約）。 |
+| §2 | `TestPhase2ReviewerLookbackTruncateMre` | `SCORER_LOOKBACK_HOURS=7.9` → 解析為 **`7`**（截斷）。 |
+| §3 | `TestPhase2ReviewerRuntimeTtlParseFailureMre` | TTL 開啟、`updated_at` 垃圾字串 → **`read_effective` 退回 bundle**（**注意**：須 `patch.object(trainer.serving.scorer.config, …)`）。 |
+| §4 | `TestPhase2ReviewerRuntimeEmptyUpdatedAtSkipsTtlMre` | `updated_at=''` 且 TTL 極小 → **退回 bundle**（實裝後與 §3 策略一致）。 |
+| （補） | `TestPhase2ReviewerRuntimeStaleRowMre` | 過期 ISO + TTL → **退回 bundle**。 |
+| §5 | `TestPhase2ReviewerUpsertOutOfRangeStoredMre` | **`upsert(1.5)` → `ValueError`**；手動 `UPDATE` 區外值 → **讀取端**退回 bundle。 |
+| §6 | `TestPhase2ReviewerCalibrateEmptyPredictionLogPathMre` | `PREDICTION_LOG_DB_PATH=""` 時 `--init-schema` **非零退出**，訊息含 **empty／PREDICTION_LOG_DB_PATH**（明確 `SystemExit`，非 `sqlite3` 先失敗）。 |
+| §7 | `TestPhase2ReviewerBaselineTopLevelFalsyMre` | 頂層 `0.0` 不遞補 metrics；頂層 `None` **會**遞補。 |
+| §8 | `TestPhase2ReviewerCalibrateNoEnvGateMre` | 無額外 env 閘門時 `--set-runtime-threshold` 對臨時 `--state-db` **成功**（現況治理邊界之契約）。 |
+
+**執行方式**（repo 根）：
+
+```bash
+python -m pytest tests/review_risks/test_phase2_remaining_code_review_mre.py -q -p no:langsmith --tb=short
+```
+
+**本檔驗證（代理環境）**：`pytest tests/review_risks/test_phase2_remaining_code_review_mre.py -q -p no:langsmith` → **11 passed**（2026-03-22，實裝修正後）；全量見上節「Phase 2 Code Review 風險實裝修正」。
+
+---
+
 ## 全量驗證回歸：ruff／mypy／pytest（2026-03-22）
 
 ### 背景
@@ -19,10 +182,10 @@
 | Pytest | `python -m pytest tests/ -q -p no:langsmith --tb=short` | **1379 passed**, **65 skipped**, 13 subtests passed |
 
 ### 備註
-- 與本 repo 近期變更對齊之契約測試含：`test_threshold_dec032_review_risks_mre.py`、`test_status_review_20260322_threshold_mre.py`（後者 §9 仍 **skipped** 至 T-OnlineCalibration）。
+- 與本 repo 近期變更對齊之契約測試含：`test_threshold_dec032_review_risks_mre.py`、`test_status_review_20260322_threshold_mre.py`（§9 為 state DB **實測**，非 skip；見上「Phase 2 剩餘項落地」）。
 
 ### 下一步建議
-- Phase 2 仍待項見 [PLAN.md](PLAN.md) 與 [PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md)（T-OnlineCalibration 後段、T-DEC031 步驟 7、T-TrainingMetricsSchema 等）。
+- Phase 2 仍待項見 [PLAN.md](PLAN.md) 與 [PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md)（**營運** credential／DB 遷移、**T-OnlineCalibration** CH 閉環、Pipeline **§6／§8** 等；T-DEC031 步驟 7 doc、TrainingMetricsSchema 讀取端、MVP 狀態已標 ✅）。
 
 ---
 
@@ -98,7 +261,7 @@
 | §6 | `TestStatusReview6InfWindowHoursAlertsPerHourAndWarning` | `window_hours=inf` → `alerts_per_hour==0`、sanitize **warning**、APM 為 0 或有限 |
 | §7 | `TestStatusReview7ComputeMicroMetricsSinglePrecisionRecallCurve` | mock `precision_recall_curve` 計數 **1**（與 `test_threshold_dec032_review_risks_mre` #1 同契約） |
 | §8 | `TestStatusReview8SubprocessImportIntegrationTestApiServer` | 子程序 `python -c` 自 **repo 根** `from tests.integration.test_api_server import ...` |
-| §9 | `TestStatusReview9RuntimeThresholdValidationPlaceholder` | **skipped** — 待 state／scorer 落地後補 |
+| §9 | `TestStatusReview9RuntimeThresholdStateDbContract` | state DB 單連線：`read_effective`／無效值 fallback（Windows WAL 安全） |
 
 **執行方式**（repo 根）：
 
@@ -110,7 +273,7 @@ python -m pytest tests/review_risks/test_status_review_20260322_threshold_mre.py
 python -m pytest tests/ -q -p no:langsmith --tb=line
 ```
 
-**本檔驗證（代理環境）**：`pytest tests/review_risks/test_status_review_20260322_threshold_mre.py` → **9 passed**, **1 skipped**；`ruff check` 該檔通過；全量 `pytest tests/ -q -p no:langsmith --tb=line` → **1379 passed**, **65 skipped**。
+**本檔驗證（代理環境）**：`pytest tests/review_risks/test_status_review_20260322_threshold_mre.py` → **10 passed**；全量見 STATUS「Phase 2 剩餘項落地」一節。
 
 **說明**：未新增獨立 mypy／ruff「規則檔」；§4 為輕量常數／鍵名契約，§7 為 mock 計數契約。若日後 production 修正 §2（`from_pr_arrays` 也打 warning）或 §5（拒絕非法 `fbeta_beta`），請同步調整對應測試預期。
 
@@ -168,8 +331,8 @@ python -m pytest tests/ -q -p no:langsmith --tb=line
 | Typecheck | `python -m mypy trainer/ --ignore-missing-imports` | **通過**（51 source files） |
 | Pytest | `python -m pytest tests/ -q -p no:langsmith --tb=line`（當時曾 `--ignore=...round235...`） | **1370 passed**, 60 skipped |
 
-### 仍屬 T-OnlineCalibration／DEC-032 待辦（未於本輪實作）
-- state DB **`runtime_rated_threshold`**、scorer 讀覆寫；校準腳本、`prediction_ground_truth`／`calibration_runs`；`_compute_test_metrics_from_scores` 是否接線共用選阈（review #6 仍為「分叉」契約）。
+### 仍屬 T-OnlineCalibration／DEC-032 待辦（本節為 threshold_selection／backtester oracle 輪次；**runtime／schema／CLI** 已於上「**Phase 2 剩餘項落地**」輪實作）
+- **仍待**：CH 標註寫 `prediction_ground_truth`、成熟樣本 PR + 自動 upsert runtime、`_compute_test_metrics_from_scores` 是否接共用選阈（review #6「分叉」契約可選收斂）。
 
 ---
 

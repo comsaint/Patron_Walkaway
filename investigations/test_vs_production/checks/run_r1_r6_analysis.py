@@ -793,6 +793,25 @@ def _cross_check_alerts_vs_prediction_log(
     }
 
 
+def _baseline_get_with_rated_fallback(data: Dict[str, object], key: str) -> object:
+    """Prefer top-level *key*; else ``rated[key]``; else ``rated['metrics'][key]`` (T-TrainingMetricsSchema)."""
+    v = data.get(key)
+    if v is not None:
+        return v
+    rated = data.get("rated")
+    if not isinstance(rated, dict):
+        return None
+    v2 = rated.get(key)
+    if v2 is not None:
+        return v2
+    m = rated.get("metrics")
+    if isinstance(m, dict):
+        v3 = m.get(key)
+        if v3 is not None:
+            return v3
+    return None
+
+
 def _load_training_metrics_baseline(model_dir: Path) -> Dict[str, object]:
     """R8 / R1 baseline: read trainer-written training_metrics.json when present."""
     path = model_dir / "training_metrics.json"
@@ -810,14 +829,27 @@ def _load_training_metrics_baseline(model_dir: Path) -> Dict[str, object]:
         "status": "ok",
         "path": str(path.resolve()),
         "model_version": data.get("model_version"),
-        "test_precision_at_recall_0.01": data.get("test_precision_at_recall_0.01"),
-        "threshold_at_recall_0.01": data.get("threshold_at_recall_0.01"),
-        "test_threshold_uncalibrated": data.get("test_threshold_uncalibrated"),
-        "uncalibrated_threshold": data.get("uncalibrated_threshold"),
+        "test_precision_at_recall_0.01": _baseline_get_with_rated_fallback(
+            data, "test_precision_at_recall_0.01"
+        ),
+        "threshold_at_recall_0.01": _baseline_get_with_rated_fallback(
+            data, "threshold_at_recall_0.01"
+        ),
+        "test_threshold_uncalibrated": _baseline_get_with_rated_fallback(
+            data, "test_threshold_uncalibrated"
+        ),
+        "uncalibrated_threshold": _baseline_get_with_rated_fallback(
+            data, "uncalibrated_threshold"
+        ),
     }
     rated = data.get("rated")
     if isinstance(rated, dict):
-        baseline["rated_threshold"] = rated.get("threshold")
+        rt = rated.get("threshold")
+        if rt is None:
+            m = rated.get("metrics")
+            if isinstance(m, dict):
+                rt = m.get("threshold")
+        baseline["rated_threshold"] = rt
     return baseline
 
 

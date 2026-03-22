@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Literal, Optional, Tuple
@@ -102,8 +103,40 @@ VALIDATION_RESULTS_RETENTION_DAYS = 180  # Keep validation_results history for l
 # Used by scorer.py --lookback-hours / --interval.
 # Single source for Track Human lookback: trainer, backtester, and serving all use this
 # (train–serve parity). TRAINER_USE_LOOKBACK has been removed (PLAN step 5).
-SCORER_LOOKBACK_HOURS = 8       # Hours of bet history to pull each cycle (default 8)
+# Env SCORER_LOOKBACK_HOURS: non-finite or <=0 → fallback 8 (Phase 2 hardening).
+# Cap avoids datetime/timedelta OverflowError in scorer when env is absurdly large (Code Review).
+try:
+    _max_lb = int(float(os.getenv("SCORER_LOOKBACK_HOURS_MAX", "8760")))
+    SCORER_LOOKBACK_HOURS_MAX: int = _max_lb if _max_lb > 0 else 8760
+except (TypeError, ValueError, OverflowError):
+    SCORER_LOOKBACK_HOURS_MAX = 8760
+_raw_scorer_lb = os.getenv("SCORER_LOOKBACK_HOURS", "8")
+try:
+    _scorer_lb_parsed = int(float(_raw_scorer_lb))
+    SCORER_LOOKBACK_HOURS = _scorer_lb_parsed if _scorer_lb_parsed > 0 else 8
+except (TypeError, ValueError, OverflowError):
+    _log.warning("SCORER_LOOKBACK_HOURS invalid (%r); using 8", _raw_scorer_lb)
+    SCORER_LOOKBACK_HOURS = 8
+if SCORER_LOOKBACK_HOURS > SCORER_LOOKBACK_HOURS_MAX:
+    _log.warning(
+        "SCORER_LOOKBACK_HOURS=%d exceeds SCORER_LOOKBACK_HOURS_MAX=%d; capping",
+        SCORER_LOOKBACK_HOURS,
+        SCORER_LOOKBACK_HOURS_MAX,
+    )
+    SCORER_LOOKBACK_HOURS = SCORER_LOOKBACK_HOURS_MAX
 SCORER_POLL_INTERVAL_SECONDS = 45  # Polling interval in seconds (includes run time)
+
+# T-OnlineCalibration: if set (>0), scorer ignores state DB runtime_rated_threshold older than this (hours).
+_rtt_age = os.getenv("RUNTIME_THRESHOLD_MAX_AGE_HOURS", "").strip()
+RUNTIME_THRESHOLD_MAX_AGE_HOURS: Optional[float]
+if not _rtt_age:
+    RUNTIME_THRESHOLD_MAX_AGE_HOURS = None
+else:
+    try:
+        _rtt_f = float(_rtt_age)
+        RUNTIME_THRESHOLD_MAX_AGE_HOURS = _rtt_f if math.isfinite(_rtt_f) and _rtt_f > 0 else None
+    except (TypeError, ValueError):
+        RUNTIME_THRESHOLD_MAX_AGE_HOURS = None
 
 # ------------------ Progress / UI (PLAN § progress-bars-long-steps) -----
 # When True, disable tqdm progress bars (Step 6 chunks, Step 9 Optuna, etc.) for CI / non-TTY.

@@ -10,8 +10,10 @@ STATUS.md —「Code Review（高可靠性覆核）」§1–§9（2026-03-22）
 from __future__ import annotations
 
 import math
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -244,12 +246,42 @@ class TestStatusReview8SubprocessImportIntegrationTestApiServer(unittest.TestCas
 
 
 # ---------------------------------------------------------------------------
-# §9 T-OnlineCalibration：非法 runtime 閾值 — 待功能落地後實作
+# §9 T-OnlineCalibration：state DB runtime 閾值由 scorer 讀取（有效列覆寫 bundle）
 # ---------------------------------------------------------------------------
-class TestStatusReview9RuntimeThresholdValidationPlaceholder(unittest.TestCase):
-    @unittest.skip("待 T-OnlineCalibration：state DB runtime 閾值驗證與 scorer fallback")
-    def test_illegal_runtime_threshold_falls_back_to_bundle(self) -> None:
-        raise AssertionError("unreachable until scorer reads runtime_rated_threshold")
+class TestStatusReview9RuntimeThresholdStateDbContract(unittest.TestCase):
+    def test_effective_threshold_matches_row_and_invalid_falls_back(self) -> None:
+        from trainer.serving.scorer import (
+            ensure_runtime_rated_threshold_schema,
+            read_effective_runtime_rated_threshold,
+            upsert_runtime_rated_threshold,
+        )
+
+        # Single connection: Windows may keep WAL locks if connections overlap temp cleanup.
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "state.db"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                ensure_runtime_rated_threshold_schema(conn)
+                self.assertAlmostEqual(
+                    read_effective_runtime_rated_threshold(conn, 0.55), 0.55
+                )
+                upsert_runtime_rated_threshold(conn, 0.71, source="mre_test")
+                conn.commit()
+                self.assertAlmostEqual(
+                    read_effective_runtime_rated_threshold(conn, 0.55), 0.71
+                )
+                with self.assertRaises(ValueError):
+                    upsert_runtime_rated_threshold(conn, 2.0, source="bad")
+                conn.execute(
+                    "UPDATE runtime_rated_threshold SET rated_threshold = ? WHERE id = 1",
+                    (2.0,),
+                )
+                conn.commit()
+                self.assertAlmostEqual(
+                    read_effective_runtime_rated_threshold(conn, 0.55), 0.55
+                )
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":

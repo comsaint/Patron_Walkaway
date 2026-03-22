@@ -1,6 +1,7 @@
 """View alerts from the scorer SQLite state DB.
 
-Default DB path: trainer/local_state/state.db (same as scorer, validator, api_server).
+Default DB path: ``<repo>/local_state/state.db`` (same default as scorer / validator when
+``STATE_DB_PATH`` is unset — PLAN Phase 2 DB path consolidation).
 
 Usage:
   python -m trainer.scripts.view_alerts
@@ -15,7 +16,8 @@ import argparse
 import sqlite3
 from pathlib import Path
 
-DEFAULT_DB = Path(__file__).resolve().parent.parent / "local_state" / "state.db"
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_DB = _REPO_ROOT / "local_state" / "state.db"
 
 
 def main() -> None:

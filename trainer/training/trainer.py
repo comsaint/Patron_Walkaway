@@ -4551,6 +4551,8 @@ def save_artifact_bundle(
                 "production_neg_pos_ratio": PRODUCTION_NEG_POS_RATIO,
                 # R703: uncalibrated_threshold=True means the 0.5 fallback was used.
                 "uncalibrated_threshold": _uncalibrated_threshold,
+                # DEC-032 / PLAN: artifact threshold is chosen at this recall floor (vs multi-recall backtester keys).
+                "threshold_selected_at_recall_floor": THRESHOLD_MIN_RECALL,
                 # DEC-024 / R3501: SHA-256 prefix of the frozen feature spec for audit.
                 "spec_hash": spec_hash,
             },

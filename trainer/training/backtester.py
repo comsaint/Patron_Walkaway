@@ -272,6 +272,11 @@ def compute_micro_metrics(
     alerts, alerts_per_hour; and test_precision_at_recall_* (DEC-026) computed with the
     same constraints as trainer / DEC-032: recall >= r, THRESHOLD_MIN_ALERT_COUNT, and
     optionally THRESHOLD_MIN_ALERTS_PER_HOUR when window_hours > 0.
+
+    **Metric scope:** ``test_ap`` / ``test_random_ap`` / headline P-R-F1 use the **full**
+    ``df`` (all ``is_rated`` values). ``test_precision_at_recall_*`` / ``threshold_at_recall_*``
+    / ``alerts_per_minute_at_recall_*`` use **rated rows only** (``is_rated`` True), matching
+    operational alert eligibility (STATUS Code Review 2026-03-22).
     None when empty/invalid/single-class or no feasible operating point.
     Empty or invalid (e.g. NaN labels, single-class) subset returns same keys with zeros.
 

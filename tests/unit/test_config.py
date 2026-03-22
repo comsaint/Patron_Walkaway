@@ -89,9 +89,21 @@ class TestConfigRequiredConstants(unittest.TestCase):
     def test_scorer_poll_defaults_exist_and_positive(self):
         """Scorer defaults in config (PLAN scorer-defaults-in-config); Review: must be positive int."""
         self.assertHasAttr("SCORER_LOOKBACK_HOURS", int)
+        self.assertHasAttr("SCORER_LOOKBACK_HOURS_MAX", int)
         self.assertHasAttr("SCORER_POLL_INTERVAL_SECONDS", int)
         self.assertGreater(getattr(self.config, "SCORER_LOOKBACK_HOURS"), 0)
+        self.assertGreater(getattr(self.config, "SCORER_LOOKBACK_HOURS_MAX"), 0)
+        self.assertLessEqual(
+            getattr(self.config, "SCORER_LOOKBACK_HOURS"),
+            getattr(self.config, "SCORER_LOOKBACK_HOURS_MAX"),
+        )
         self.assertGreater(getattr(self.config, "SCORER_POLL_INTERVAL_SECONDS"), 0)
+
+    def test_runtime_threshold_max_age_optional(self):
+        """T-OnlineCalibration: optional TTL for state DB runtime threshold."""
+        self.assertTrue(hasattr(self.config, "RUNTIME_THRESHOLD_MAX_AGE_HOURS"))
+        v = getattr(self.config, "RUNTIME_THRESHOLD_MAX_AGE_HOURS")
+        self.assertTrue(v is None or isinstance(v, float))
 
     def assertHasAttr(self, name: str, expected_type: type | tuple):
         self.assertTrue(hasattr(self.config, name), f"config must define {name}")

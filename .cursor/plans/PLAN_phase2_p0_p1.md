@@ -63,23 +63,24 @@ flowchart LR
 
 **Current status**（更新於 2026-03-22）：**T0**–**T11** 已完成。**T12** 已完成（含 Step 1、Step 2、optional follow-on、Code Review §1）；failure-params 長字串截斷已實作，對應 review 測試之過時 **`xfail` 已移除**（見 STATUS.md）。**`log_metrics_safe(..., step=...)`**：production 已對不支援 `step=` 之舊 MLflow client 做 **TypeError 降級**（僅 warning 型別名、不洩 metrics）；**backtester** ImportError stub 已 **`**_kwargs`**；**doc §9.1** 已載明 caller 對 **`step` 單調非遞減** 之責任；**`tests/review_risks/test_review_risks_mlflow_log_metrics_step_review_2026_03_22.py`** 與相關測試全綠、無殘留 XPASS。**Credential folder consolidation** Step 1–2 已實作（config 自 credential/.env 載入、mlflow_utils 自 credential/mlflow.env 優先、.gitignore 與範本）；Code Review §1（config load_dotenv try/except）、§2（mlflow 例外 log 不洩路徑）已修補，五則 credential_review 測試全過。**Scorer Track Human lookback parity**：scorer 已傳入 `lookback_hours=SCORER_LOOKBACK_HOURS`；Code Review §1（scorer config 改為 `from trainer.core import config`）已修補；5 則契約／邊界測試就位；見 STATUS.md。**R3505 cutoff_time 正規化**：Code Review §1–§4 已修補；見 STATUS.md § Round — R3505 正規化 Production 修補。**T13 MLflow cold-start mitigation**：Step 1–2（重試＋退避、warm-up）與 Code Review #1/#3/#4 修補已完成，見 STATUS.md § T13 Code Review 修補 production。
 
-**Remaining items**（依執行順序；**2026-03-22 對照程式庫修訂**）：
-- **Credential folder**：**程式已完成**（`trainer/core/config.py` 優先 `load_dotenv(credential/.env)`；`credential/.env.example`、`credential/mlflow.env.example` 已存在）。**仍待**僅為 **營運遷移**（使用者把既有 `local_state/mlflow.env`／repo 根 `.env` 搬入 `credential/`）、可選 deploy 啟動路徑、可選 `.gitignore` 策略微調。
-- **DB path consolidation**：**預設已對齊** — `STATE_DB_PATH` 預設 **`<repo>/local_state/state.db`**（`trainer/serving/scorer.py`、`status_server.py`、`serving/api_server.py`、`validator.py` 等）；`PREDICTION_LOG_DB_PATH` 預設 **`<repo>/local_state/prediction_log.db`**（`trainer/core/config.py`）。**仍待**：**過時註解**（例如 `trainer/scripts/view_alerts.py` 仍寫 `trainer/local_state`）、以及 **已部署環境**若曾設分散路徑之遷移／runbook。
-- ~~**T-DEC031（程式步驟 1–6）**~~：**✅ 已完成（2026-03-22）** — 見 [STATUS.md](STATUS.md)。**步驟 7**：已有 **[doc/training_oom_and_runtime_audit.md](../../doc/training_oom_and_runtime_audit.md)**（OOM／步驟風險總表）；**仍待**於該 doc 或 STATUS **補一句 DEC-031／train 指標分批與 LibSVM 檔**之交叉引用。**full-window／Step 9 人工驗收**仍列人工。
-- **T-TrainingMetricsSchema**：**⏳ 未完成** — `save_artifact_bundle` 仍 **`{**combined_metrics, ...}`**（指標多在 **`rated` 巢狀**）。**讀取端** [`run_r1_r6_analysis.py`](../../investigations/test_vs_production/checks/run_r1_r6_analysis.py) `_load_training_metrics_baseline` 已取 **`rated.threshold`**，但 **`test_precision_at_recall_*`／`threshold_at_recall_*`／`test_threshold_uncalibrated` 仍只查 JSON 頂層**（§根因 2 所述問題**仍大部存在**）。**仍待**：讀取端完整 **fallback `rated`** 或 **A1 根層白名單複寫**（見下節）。
-- ~~**T-PipelineStepDurations**~~：**✅ Done（2026-03-22）** — 見 `STATUS.md`。
-- **Scorer lookback（可選）**：`config.SCORER_LOOKBACK_HOURS` 仍為 **固定 int**；**仍待**（可選）非法 env／≤0 時 scorer **fallback 8**（見原 Code Review §2）。
-- ~~**測試收集（round235／242）**~~：**✅ 2026-03-22** — 兩檔已改 `from tests.integration.test_api_server import ...`；全量 pytest 不需 `--ignore`（見 [STATUS.md](STATUS.md)「round235／242」）。
-- **T-OnlineCalibration**（prediction_log 標註、runtime 閾值、backtest oracle 與 trainer 約束一致化）：**⏳ In progress（2026-03-22）** — 選阈共用模組與 backtester oracle（rated-only、單次 PR）已落地；runtime／校準／scorer 覆寫仍待。見下方專節與 [STATUS.md](STATUS.md)「DEC-032／T-OnlineCalibration」。
-- 其餘 Phase 2 P0–P1 無強制待辦；可選 Code Review §2–§5 效能／語義後續優化。
+**Remaining items**（**2026-03-22 末次對照程式庫**；細節以 [STATUS.md](STATUS.md)「**Phase 2 剩餘項落地**」為準）：
+- **Credential folder**：程式已完成；**仍待營運**搬移舊 `.env`／deploy 路徑。
+- **DB path consolidation**：預設已對齊 `local_state/`；`view_alerts` 預設路徑已修正；**仍待**已部署分散路徑之遷移／runbook。
+- ~~**T-DEC031 步驟 7（doc 交叉引用）**~~：**✅** — `doc/training_oom_and_runtime_audit.md` 已補 DEC-031／train 指標與 LibSVM 交叉引用。**full-window／Step 9 人工驗收**仍人工。
+- ~~**T-TrainingMetricsSchema（讀取端）**~~：**✅** — `_load_training_metrics_baseline` 對 PR／uncalibrated 鍵 **`rated`／`rated.metrics` fallback**；`training_metrics.json` 頂層新增 **`threshold_selected_at_recall_floor`**。**仍可選**：`save_artifact_bundle` 根層白名單大量複寫（A1）。
+- ~~**T-PipelineStepDurations**~~：**✅ Done**。
+- ~~**Scorer lookback env 防呆**~~：**✅** — `SCORER_LOOKBACK_HOURS` 非法／≤0 → **8**；超 **`SCORER_LOOKBACK_HOURS_MAX`**（預設 8760）→ **cap**（Code Review 實裝；見 STATUS「Phase 2 Code Review 風險實裝修正」）。
+- ~~**測試收集（round235／242）**~~：**✅**。
+- **T-OnlineCalibration**：**MVP ✅**（state `runtime_rated_threshold`、**`upsert` 區間驗證**、scorer 讀覆寫、TTL 含**空白 `updated_at` 退回 bundle**、`prediction_ground_truth`／`calibration_runs` schema、CLI **`--init-schema` 拒空路徑**／`--set-runtime-threshold`）。**仍待**：CH 標註成熟樣本、自動 PR 校準寫 state、（可選）test 集選阈接線、（可選）**`CALIBRATE_ALLOW_WRITE` 閘門**。見下方專節。
+- **Pipeline §6 可選**、**§8 人工** — 仍待。
+- 可選 Code Review §2–§5 效能／語義後續優化。
 
 ---
 
-### T-OnlineCalibration — `prediction_log` 標註、線上閾值校準與 train/backtest/serve 約束一致化 — ⏳ In progress（2026-03-22）
+### T-OnlineCalibration — `prediction_log` 標註、線上閾值校準與 train/backtest/serve 約束一致化 — ⏳ **MVP Done**；完整 CH 閉環仍 **In progress**（2026-03-22）
 
 - **Depends on**: T4（`prediction_log` 寫入路徑已存在）；建議與 **DB path consolidation**（state / prediction_log 同 `local_state/`）一併部署。
-- **進度（2026-03-22）**：`threshold_selection` 含 **`dec026_pr_alert_arrays`**（單次 sklearn PR + **`searchsorted`** 算 alert 數）、**`dec026_sanitize_per_hour_params`**、**`pick_threshold_dec026_from_pr_arrays`**、非嚴格二元標籤／NaN → **fallback**（不丟 multiclass）、**`min_alert_count` ≥1**、**`select_threshold_dec026`** 別名；**trainer** 驗證選阈；**backtester** `compute_micro_metrics` 之 PR oracle **僅 `is_rated==True`** 且 **四 recall 共用一條 PR 曲線**（見 [STATUS.md](STATUS.md)「DEC-032／T-OnlineCalibration」）。**尚未**：state runtime 閾值、校準腳本、`prediction_ground_truth` 表、scorer 讀覆寫、（可選）test 集 PR 報告路徑接 **`pick_threshold_dec026`**。
+- **進度（2026-03-22 末）**：選阈共用模組與 backtester oracle 已落地（見上）。**新增**：state DB 表 **`runtime_rated_threshold`**（單列 `id=1`）、**`read_effective_runtime_rated_threshold`**（TTL 下空白／缺 `updated_at` → bundle）／**`upsert_runtime_rated_threshold`**（**`ValueError`** 若阈 ∉ (0,1)）、可選 **`RUNTIME_THRESHOLD_MAX_AGE_HOURS`**；**scorer** `score_once` 使用有效 runtime 阈；**prediction_log.db** 上 **`prediction_ground_truth`**／**`calibration_runs`**（`ensure_prediction_calibration_schema`）；CLI **`trainer.scripts.calibrate_threshold_from_prediction_log`**（`--init-schema` 拒空 **`PREDICTION_LOG_DB_PATH`**、`--set-runtime-threshold`）。**尚未**：CH 拉取寫 `prediction_ground_truth`、成熟子集上 **`pick_threshold_dec026`** 自動 upsert、（可選）test 集 PR 報告接共用選阈。硬化細節見 [STATUS.md](STATUS.md)「**Phase 2 Code Review 風險實裝修正**」。
 - **Goal**:
   1. **訓練 / backtest / 線上校準**共用 **`trainer/core/config.py`** 之 **`THRESHOLD_MIN_RECALL`**、**`THRESHOLD_MIN_ALERT_COUNT`**、**`THRESHOLD_MIN_ALERTS_PER_HOUR`**（後者為 **`None` 時全線關閉 per-hour 檢查**）。
   2. **線上校準腳本**（低頻，例如每 30 分鐘）：**不預測**（預測僅 [trainer/serving/scorer.py](../../trainer/serving/scorer.py)）；自 ClickHouse 取資料，對 `prediction_log` 對應之 **`bet_id` 寫入一筆 ground truth**（**語意 = 訓練標籤定義**，與 [trainer/serving/validator.py](../../trainer/serving/validator.py) 之 MATCH/MISS **不強求逐筆一致**）。**太新、標籤未成熟** → 狀態 **`pending`**，**不納入本輪校準**。
