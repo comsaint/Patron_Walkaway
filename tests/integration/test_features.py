@@ -35,6 +35,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -407,6 +408,11 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
         }])
         result = compute_track_llm_features(bets, spec)
         self.assertIn("bets_cnt_w15m", result.columns)
+        self.assertEqual(
+            result["bets_cnt_w15m"].dtype,
+            np.float32,
+            "DEC-031: Track LLM candidate columns must be float32 after compute.",
+        )
         # All four bets at minutes 0,5,10,20 — bet at t=20 window covers [5,20] → 3 bets
         self.assertEqual(int(result.iloc[3]["bets_cnt_w15m"]), 3)
 
@@ -546,6 +552,11 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
         result = compute_track_llm_features(bets, spec)
         self.assertEqual(len(result), 0)
         self.assertIn("cnt", result.columns)
+        self.assertEqual(
+            result["cnt"].dtype,
+            np.float32,
+            "DEC-031: empty-frame feature columns should use float32 dtype.",
+        )
 
 
 if __name__ == "__main__":

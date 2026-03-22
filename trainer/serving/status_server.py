@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import math
 import os
@@ -5,10 +7,12 @@ import random
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
-import pandas as pd
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 try:
     import config  # type: ignore[import]
@@ -121,6 +125,8 @@ def load_recent_alert_stats(conn: sqlite3.Connection) -> dict:
 
 
 def prune_status(conn: sqlite3.Connection, now_hk: pd.Timestamp):
+    import pandas as pd
+
     try:
         cutoff = now_hk - pd.Timedelta(hours=STATUS_RETENTION_HOURS)
         conn.execute("DELETE FROM status_snapshots WHERE updated_at < ?", (cutoff.isoformat(),))
@@ -133,6 +139,8 @@ def prune_status(conn: sqlite3.Connection, now_hk: pd.Timestamp):
 
 
 def fetch_table_ids() -> pd.Series:
+    import pandas as pd
+
     client = get_clickhouse_client()
     query = f"""
         SELECT DISTINCT table_id
@@ -187,6 +195,7 @@ def choose_grid(n: int, aspect: float = TARGET_ASPECT) -> Tuple[int, int]:
 
 
 def build_layout(table_ids: pd.Series, aspect: float = TARGET_ASPECT, seed: int = EMPTY_SEED):
+    """table_ids is a pandas Series (import pandas only in callers that build Series)."""
     ids = table_ids.tolist()
     if not ids:
         return []
@@ -245,6 +254,8 @@ def load_base_layout(conn: sqlite3.Connection) -> list:
 
 
 def fetch_open_sessions_ch() -> pd.DataFrame:
+    import pandas as pd
+
     client = get_clickhouse_client()
     cutoff = pd.Timestamp.now(tz=HK_TZ) - pd.Timedelta(hours=LOOKBACK_HOURS)
     query = f"""
@@ -284,6 +295,8 @@ def fetch_open_sessions_ch() -> pd.DataFrame:
 
 
 def resolve_open_sessions() -> List[dict]:
+    import pandas as pd
+
     global LAST_OCCUPIED
     # Try ClickHouse
     df = pd.DataFrame()
@@ -413,6 +426,8 @@ def fetch_table_ids_for_layout() -> List[str]:
 
 
 def write_status(conn: sqlite3.Connection, occupied: List[dict]) -> None:
+    import pandas as pd
+
     alert_stats = load_recent_alert_stats(conn)
     # Build occupancy map: table_id -> seat_id -> rich seat info
     occ_map: Dict[str, Dict[str, Dict[str, Any]]] = {}

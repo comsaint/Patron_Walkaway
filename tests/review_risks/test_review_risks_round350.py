@@ -79,6 +79,20 @@ class TestR3502NoSilentTrackLlmFailure(unittest.TestCase):
             "trainer should avoid warning-only Track LLM failure path; raise or hard-flag it.",
         )
 
+    def test_process_chunk_dec031_track_llm_exceptions_not_swallowed(self):
+        """DEC-031 / T-DEC031 step 1: no try/except that logs and continues past Track LLM."""
+        src = inspect.getsource(trainer_mod.process_chunk)
+        self.assertNotIn(
+            "Track LLM full traceback",
+            src,
+            "process_chunk must not catch Track LLM failures; exceptions must propagate.",
+        )
+        self.assertNotIn(
+            "Track LLM failed —",
+            src,
+            "process_chunk must not use swallowed Track LLM error logging path.",
+        )
+
     def test_scorer_track_llm_failure_should_not_be_warning_only(self):
         src = inspect.getsource(scorer_mod.score_once)
         self.assertNotIn(

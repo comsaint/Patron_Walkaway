@@ -40,10 +40,10 @@ Data source switching
 
 from __future__ import annotations
 
-import argparse
 import gc
 import math
 import os
+from importlib import import_module as _import_module_threshold_selection
 import shutil
 import hashlib
 import json
@@ -196,6 +196,7 @@ try:
     STEP9_EXPORT_LIBSVM: bool = getattr(_cfg, "STEP9_EXPORT_LIBSVM", False)
     STEP9_TRAIN_FROM_FILE: bool = getattr(_cfg, "STEP9_TRAIN_FROM_FILE", False)
     STEP9_SAVE_LGB_BINARY: bool = getattr(_cfg, "STEP9_SAVE_LGB_BINARY", False)
+    TRAIN_METRICS_PREDICT_BATCH_ROWS: int = getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)
     STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
     # Canonical mapping DuckDB from get_duckdb_memory_config("canonical_map") (DEC-027).
     CASINO_PLAYER_ID_CLEAN_SQL: str = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END")
@@ -247,8 +248,17 @@ except ModuleNotFoundError:
     STEP9_EXPORT_LIBSVM = getattr(_cfg, "STEP9_EXPORT_LIBSVM", False)
     STEP9_TRAIN_FROM_FILE = getattr(_cfg, "STEP9_TRAIN_FROM_FILE", False)
     STEP9_SAVE_LGB_BINARY = getattr(_cfg, "STEP9_SAVE_LGB_BINARY", False)
+    TRAIN_METRICS_PREDICT_BATCH_ROWS = getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)
     STEP8_SCREEN_SAMPLE_ROWS = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
     CASINO_PLAYER_ID_CLEAN_SQL = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END")
+
+try:
+    _threshold_selection_mod = _import_module_threshold_selection(
+        "trainer.training.threshold_selection"
+    )
+except ModuleNotFoundError:
+    _threshold_selection_mod = _import_module_threshold_selection("training.threshold_selection")
+pick_threshold_dec026 = _threshold_selection_mod.pick_threshold_dec026
 
 # Module-level pipeline imports: try = run from trainer dir with modules on path (e.g. dev);
 # except = run as package (python -m trainer.trainer). Only the except path uses relative db_conn.
@@ -367,7 +377,7 @@ LOCAL_PARQUET_DIR = PROJECT_ROOT / "data"
 CANONICAL_MAPPING_PARQUET = LOCAL_PARQUET_DIR / "canonical_mapping.parquet"
 CANONICAL_MAPPING_CUTOFF_JSON = LOCAL_PARQUET_DIR / "canonical_mapping.cutoff.json"
 FEATURE_SPEC_PATH = BASE_DIR / "feature_spec" / "features_candidates.yaml"
-MODEL_DIR = getattr(_cfg, "DEFAULT_MODEL_DIR", BASE_DIR / "models")
+MODEL_DIR: Path = cast(Path, getattr(_cfg, "DEFAULT_MODEL_DIR", BASE_DIR / "models"))
 OUT_DIR = BASE_DIR / "out_trainer"
 
 for _d in (DATA_DIR, CHUNK_DIR, LOCAL_PARQUET_DIR, MODEL_DIR, OUT_DIR):
@@ -1988,43 +1998,35 @@ def process_chunk(
     # BEFORE label filtering so window features see the same history as the scorer
     # (train-serve parity).  The result is merged back onto bets by bet_id so that
     # compute_labels still receives the extended-zone rows it needs for right-censoring.
+    # DEC-031 / T-DEC031: Track LLM errors propagate — no silent skip of LLM features.
     _bets_llm_feature_cols: list = []
     if feature_spec is not None:
-        try:
-            _t0_llm = time.perf_counter()
-            _bets_llm_result = compute_track_llm_features(
-                bets,
-                feature_spec=feature_spec,
-                cutoff_time=window_end,
+        _t0_llm = time.perf_counter()
+        _bets_llm_result = compute_track_llm_features(
+            bets,
+            feature_spec=feature_spec,
+            cutoff_time=window_end,
+        )
+        _llm_cand_ids = [
+            c.get("feature_id")
+            for c in (feature_spec.get("track_llm") or {}).get("candidates", [])
+        ]
+        _bets_llm_feature_cols = [
+            fid for fid in _llm_cand_ids
+            if fid and fid in _bets_llm_result.columns
+        ]
+        if _bets_llm_feature_cols and "bet_id" in _bets_llm_result.columns:
+            bets = bets.merge(
+                _bets_llm_result[["bet_id"] + _bets_llm_feature_cols].drop_duplicates("bet_id"),
+                on="bet_id",
+                how="left",
             )
-            _llm_cand_ids = [
-                c.get("feature_id")
-                for c in (feature_spec.get("track_llm") or {}).get("candidates", [])
-            ]
-            _bets_llm_feature_cols = [
-                fid for fid in _llm_cand_ids
-                if fid and fid in _bets_llm_result.columns
-            ]
-            if _bets_llm_feature_cols and "bet_id" in _bets_llm_result.columns:
-                bets = bets.merge(
-                    _bets_llm_result[["bet_id"] + _bets_llm_feature_cols].drop_duplicates("bet_id"),
-                    on="bet_id",
-                    how="left",
-                )
-            logger.info(
-                "Chunk %s–%s: Track LLM computed (%.1fs)",
-                window_start.date(),
-                window_end.date(),
-                time.perf_counter() - _t0_llm,
-            )
-        except Exception as exc:
-            logger.error(
-                "Chunk %s–%s: Track LLM failed — %s",
-                window_start.date(),
-                window_end.date(),
-                exc,
-            )
-            logger.exception("Track LLM full traceback")
+        logger.info(
+            "Chunk %s–%s: Track LLM computed (%.1fs)",
+            window_start.date(),
+            window_end.date(),
+            time.perf_counter() - _t0_llm,
+        )
 
     # --- Labels (C1 extended pull) ---
     labeled = compute_labels(
@@ -2867,48 +2869,25 @@ def _train_one_model(
         val_scores = model.predict_proba(X_val)[:, 1]
         prauc = float(average_precision_score(y_val, val_scores)) if y_val.sum() > 0 else 0.0
 
-        # Threshold selection: vectorised PR-curve scan (R65 — avoids O(N²) loop).
-        # precision_recall_curve returns arrays aligned so that for each threshold
-        # index i: preds = val_scores >= thresholds[i].  DEC-026: choose threshold by
-        # maximising Precision subject to recall >= THRESHOLD_MIN_RECALL and min alerts.
-        pr_prec, pr_rec, pr_thresholds = precision_recall_curve(y_val, val_scores)
-        # pr_prec / pr_rec have one extra element (last = 1/0); align with thresholds
-        pr_prec = pr_prec[:-1]
-        pr_rec = pr_rec[:-1]
-        # Minimum-alert guard: vectorised via searchsorted (R68 — O(N log N) total)
-        _sorted_scores = np.sort(val_scores)
-        alert_counts = len(val_scores) - np.searchsorted(
-            _sorted_scores, pr_thresholds, side="left"
+        # Threshold selection: shared DEC-026 helper (threshold_selection.pick_threshold_dec026).
+        _pick = pick_threshold_dec026(
+            np.asarray(y_val, dtype=float),
+            np.asarray(val_scores, dtype=float),
+            recall_floor=THRESHOLD_MIN_RECALL,
+            min_alert_count=THRESHOLD_MIN_ALERT_COUNT,
+            min_alerts_per_hour=None,
+            window_hours=None,
+            fbeta_beta=THRESHOLD_FBETA,
         )
-        valid_mask = alert_counts >= THRESHOLD_MIN_ALERT_COUNT
-        if THRESHOLD_MIN_RECALL is not None:
-            valid_mask = valid_mask & (pr_rec >= THRESHOLD_MIN_RECALL)
-        if valid_mask.any():
-            # DEC-026: argmax(pr_prec) over valid_mask (optimise Precision at recall >= 0.01).
-            prec_arr = np.where(valid_mask, pr_prec, -1.0)
-            best_idx = int(np.argmax(prec_arr))
-            # F-beta at chosen threshold (for metrics/logging only; not used for selection).
-            b = THRESHOLD_FBETA
-            denom = b * b * pr_prec + pr_rec
-            with np.errstate(divide="ignore", invalid="ignore"):
-                fbeta_arr = np.where(
-                    denom > 0,
-                    (1.0 + b * b) * pr_prec * pr_rec / denom,
-                    0.0,
-                )
-            best_fbeta = float(fbeta_arr[best_idx])
-            best_t = float(pr_thresholds[best_idx])
-            best_prec = float(pr_prec[best_idx])
-            best_rec = float(pr_rec[best_idx])
-            # F1 at chosen threshold (for reporting / backward compat)
-            best_f1 = (
-                2.0 * best_prec * best_rec / (best_prec + best_rec)
-                if (best_prec + best_rec) > 0
-                else 0.0
-            )
-        else:
+        if _pick.is_fallback:
             best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
             best_fbeta = 0.0
+        else:
+            best_t = _pick.threshold
+            best_prec = _pick.precision
+            best_rec = _pick.recall
+            best_fbeta = _pick.fbeta
+            best_f1 = _pick.f1
     else:
         prauc = 0.0
         best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
@@ -3371,6 +3350,98 @@ def _dataframe_for_lgb_predict(
     return X
 
 
+def _batched_booster_predict_scores(
+    booster: lgb.Booster,
+    X_train: pd.DataFrame,
+    batch_rows: int,
+) -> np.ndarray:
+    """Chunked ``booster.predict`` on in-memory features (DEC-031 / T-DEC031).
+
+    Avoids sklearn ``predict_proba`` allocating one huge dense probability matrix for
+    large training sets when only the positive-class score is needed.
+    """
+    n = int(len(X_train))
+    if n == 0:
+        return np.asarray([], dtype=np.float64)
+    br = max(1, int(batch_rows))
+    parts: list[np.ndarray] = []
+    for start in range(0, n, br):
+        chunk = X_train.iloc[start : start + br]
+        arr = np.ascontiguousarray(chunk.to_numpy(dtype=np.float32, copy=True))
+        raw = booster.predict(arr)
+        pa = np.asarray(raw).reshape(-1)
+        parts.append(pa.astype(np.float64, copy=False))
+    return np.concatenate(parts, axis=0)
+
+
+def _train_metrics_dict_from_y_scores(
+    y_train: Union[np.ndarray, pd.Series],
+    train_scores: np.ndarray,
+    threshold: float,
+    label: str = "",
+    log_results: bool = True,
+) -> dict:
+    """Build train_* metrics from parallel label/score arrays (same rules as legacy train metrics)."""
+    y_arr = np.asarray(y_train, dtype=float).reshape(-1)
+    scores_arr = np.asarray(train_scores, dtype=float).reshape(-1)
+    if len(y_arr) != len(scores_arr):
+        n_fix = min(len(y_arr), len(scores_arr))
+        y_arr = y_arr[:n_fix]
+        scores_arr = scores_arr[:n_fix]
+    n_tr = int(len(y_arr))
+    if n_tr == 0:
+        return {
+            "train_ap": 0.0,
+            "train_precision": 0.0,
+            "train_recall": 0.0,
+            "train_f1": 0.0,
+            "train_samples": 0,
+            "train_positives": 0,
+            "train_random_ap": 0.0,
+        }
+    n_tr_pos = int(np.sum(y_arr == 1))
+    train_random_ap = (n_tr_pos / n_tr) if n_tr > 0 else 0.0
+    if not np.isfinite(scores_arr).all():
+        logger.warning(
+            "%s train: scores contain non-finite values — train metrics set to zero.",
+            label or "model",
+        )
+        return {
+            "train_ap": 0.0,
+            "train_precision": 0.0,
+            "train_recall": 0.0,
+            "train_f1": 0.0,
+            "train_samples": n_tr,
+            "train_positives": n_tr_pos,
+            "train_random_ap": train_random_ap,
+        }
+    has_both = n_tr_pos >= 1 and (n_tr - n_tr_pos) >= 1
+    # sklearn average_precision_score requires binary {0,1} y; use strict-positive mask only for AP.
+    y_ap = np.asarray(y_arr == 1, dtype=np.float64).reshape(-1)
+    train_prauc = float(average_precision_score(y_ap, scores_arr)) if has_both else 0.0
+    preds = (scores_arr >= threshold).astype(int)
+    tp = int(((preds == 1) & (y_arr == 1)).sum())
+    fp = int(((preds == 1) & (y_arr == 0)).sum())
+    fn = int(((preds == 0) & (y_arr == 1)).sum())
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    if log_results:
+        logger.info(
+            "%s train: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  random_ap=%.4f",
+            label, train_prauc, f1, prec, rec, train_random_ap,
+        )
+    return {
+        "train_ap": train_prauc,
+        "train_precision": prec,
+        "train_recall": rec,
+        "train_f1": f1,
+        "train_samples": n_tr,
+        "train_positives": n_tr_pos,
+        "train_random_ap": train_random_ap,
+    }
+
+
 def _compute_train_metrics(
     model: Union[lgb.LGBMClassifier, "_BoosterWrapper"],
     threshold: float,
@@ -3394,34 +3465,32 @@ def _compute_train_metrics(
             "train_positives": 0,
             "train_random_ap": 0.0,
         }
-    n_tr = int(len(y_train))
-    n_tr_pos = int(y_train.sum())
-    train_random_ap = (n_tr_pos / n_tr) if n_tr > 0 else 0.0
+    booster = getattr(model, "booster_", None)
+    if booster is not None:
+        try:
+            batched = _batched_booster_predict_scores(
+                booster, X_train, TRAIN_METRICS_PREDICT_BATCH_ROWS
+            )
+            return _train_metrics_dict_from_y_scores(
+                y_train,
+                batched,
+                threshold,
+                label=label,
+                log_results=log_results,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Train metrics: batched booster.predict failed (%s); falling back to predict_proba.",
+                exc,
+            )
     train_scores = model.predict_proba(X_train)[:, 1]
-    has_both = n_tr_pos >= 1 and (n_tr - n_tr_pos) >= 1
-    train_prauc = float(average_precision_score(y_train, train_scores)) if has_both else 0.0
-    preds = (train_scores >= threshold).astype(int)
-    y_arr = y_train.values
-    tp = int(((preds == 1) & (y_arr == 1)).sum())
-    fp = int(((preds == 1) & (y_arr == 0)).sum())
-    fn = int(((preds == 0) & (y_arr == 1)).sum())
-    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-    if log_results:
-        logger.info(
-            "%s train: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  random_ap=%.4f",
-            label, train_prauc, f1, prec, rec, train_random_ap,
-        )
-    return {
-        "train_ap": train_prauc,
-        "train_precision": prec,
-        "train_recall": rec,
-        "train_f1": f1,
-        "train_samples": n_tr,
-        "train_positives": n_tr_pos,
-        "train_random_ap": train_random_ap,
-    }
+    return _train_metrics_dict_from_y_scores(
+        y_train,
+        np.asarray(train_scores, dtype=np.float64).reshape(-1),
+        threshold,
+        label=label,
+        log_results=log_results,
+    )
 
 
 def _compute_feature_importance(
@@ -3947,34 +4016,24 @@ def train_single_rated_model(
                 _has_val = _has_val_from_file
             if _has_val and np.asarray(y_vl).sum() > 0:
                 prauc = float(average_precision_score(y_vl, val_scores))
-                pr_prec, pr_rec, pr_thresholds = precision_recall_curve(y_vl, val_scores)
-                pr_prec = pr_prec[:-1]
-                pr_rec = pr_rec[:-1]
-                _sorted_scores = np.sort(val_scores)
-                alert_counts = len(val_scores) - np.searchsorted(_sorted_scores, pr_thresholds, side="left")
-                valid_mask = alert_counts >= THRESHOLD_MIN_ALERT_COUNT
-                if THRESHOLD_MIN_RECALL is not None:
-                    valid_mask = valid_mask & (pr_rec >= THRESHOLD_MIN_RECALL)
-                if valid_mask.any():
-                    # DEC-026: argmax(pr_prec) over valid_mask (optimise Precision at recall >= 0.01).
-                    prec_arr = np.where(valid_mask, pr_prec, -1.0)
-                    best_idx = int(np.argmax(prec_arr))
-                    best_t = float(pr_thresholds[best_idx])
-                    best_prec = float(pr_prec[best_idx])
-                    best_rec = float(pr_rec[best_idx])
-                    b = THRESHOLD_FBETA
-                    denom = b * b * pr_prec + pr_rec
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        fbeta_arr = np.where(denom > 0, (1.0 + b * b) * pr_prec * pr_rec / denom, 0.0)
-                    best_fbeta = float(fbeta_arr[best_idx])
-                    best_f1 = (
-                        2.0 * best_prec * best_rec / (best_prec + best_rec)
-                        if (best_prec + best_rec) > 0
-                        else 0.0
-                    )
-                else:
+                _pick = pick_threshold_dec026(
+                    np.asarray(y_vl, dtype=float),
+                    np.asarray(val_scores, dtype=float),
+                    recall_floor=THRESHOLD_MIN_RECALL,
+                    min_alert_count=THRESHOLD_MIN_ALERT_COUNT,
+                    min_alerts_per_hour=None,
+                    window_hours=None,
+                    fbeta_beta=THRESHOLD_FBETA,
+                )
+                if _pick.is_fallback:
                     best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
                     best_fbeta = 0.0
+                else:
+                    best_t = _pick.threshold
+                    best_prec = _pick.precision
+                    best_rec = _pick.recall
+                    best_fbeta = _pick.fbeta
+                    best_f1 = _pick.f1
             else:
                 prauc = 0.0
                 best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
@@ -4099,34 +4158,24 @@ def train_single_rated_model(
                 )
             if _has_val and y_vl.sum() > 0:
                 prauc = float(average_precision_score(y_vl, val_scores))
-                pr_prec, pr_rec, pr_thresholds = precision_recall_curve(y_vl, val_scores)
-                pr_prec = pr_prec[:-1]
-                pr_rec = pr_rec[:-1]
-                _sorted_scores = np.sort(val_scores)
-                alert_counts = len(val_scores) - np.searchsorted(_sorted_scores, pr_thresholds, side="left")
-                valid_mask = alert_counts >= THRESHOLD_MIN_ALERT_COUNT
-                if THRESHOLD_MIN_RECALL is not None:
-                    valid_mask = valid_mask & (pr_rec >= THRESHOLD_MIN_RECALL)
-                if valid_mask.any():
-                    # DEC-026: argmax(pr_prec) over valid_mask (optimise Precision at recall >= 0.01).
-                    prec_arr = np.where(valid_mask, pr_prec, -1.0)
-                    best_idx = int(np.argmax(prec_arr))
-                    best_t = float(pr_thresholds[best_idx])
-                    best_prec = float(pr_prec[best_idx])
-                    best_rec = float(pr_rec[best_idx])
-                    b = THRESHOLD_FBETA
-                    denom = b * b * pr_prec + pr_rec
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        fbeta_arr = np.where(denom > 0, (1.0 + b * b) * pr_prec * pr_rec / denom, 0.0)
-                    best_fbeta = float(fbeta_arr[best_idx])
-                    best_f1 = (
-                        2.0 * best_prec * best_rec / (best_prec + best_rec)
-                        if (best_prec + best_rec) > 0
-                        else 0.0
-                    )
-                else:
+                _pick = pick_threshold_dec026(
+                    np.asarray(y_vl, dtype=float),
+                    np.asarray(val_scores, dtype=float),
+                    recall_floor=THRESHOLD_MIN_RECALL,
+                    min_alert_count=THRESHOLD_MIN_ALERT_COUNT,
+                    min_alerts_per_hour=None,
+                    window_hours=None,
+                    fbeta_beta=THRESHOLD_FBETA,
+                )
+                if _pick.is_fallback:
                     best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
                     best_fbeta = 0.0
+                else:
+                    best_t = _pick.threshold
+                    best_prec = _pick.precision
+                    best_rec = _pick.recall
+                    best_fbeta = _pick.fbeta
+                    best_f1 = _pick.f1
             else:
                 prauc = 0.0
                 best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
@@ -4154,14 +4203,55 @@ def train_single_rated_model(
             X_tr, y_tr, X_vl, y_vl, sw_rated, hp, label="rated", log_results=False
         )
 
-    train_m = _compute_train_metrics(
-        model,
-        cast(float, metrics["threshold"]),
-        _dataframe_for_lgb_predict(model, train_rated, avail_cols),
-        y_tr,
-        label="rated",
-        log_results=False,
-    )
+    X_tr_pred = _dataframe_for_lgb_predict(model, train_rated, avail_cols)
+    train_thr = cast(float, metrics["threshold"])
+    _train_booster = getattr(model, "booster_", None)
+    used_libsvm_train_metrics = False
+    if use_from_libsvm and train_libsvm_paths is not None and _train_booster is not None:
+        _train_libsvm_p = train_libsvm_paths[0]
+        _train_under_data_dir = False
+        try:
+            _train_libsvm_p.resolve().relative_to(DATA_DIR.resolve())
+            _train_under_data_dir = True
+        except ValueError:
+            pass
+        if _train_under_data_dir and _train_libsvm_p.is_file():
+            y_tr_file = _labels_from_libsvm(_train_libsvm_p)
+            if len(y_tr_file) > 0:
+                try:
+                    _raw_tr = _train_booster.predict(str(_train_libsvm_p))
+                    tr_scores = (
+                        np.asarray(_raw_tr).reshape(-1)
+                        if np.ndim(_raw_tr)
+                        else np.asarray([_raw_tr]).reshape(-1)
+                    )
+                    if len(tr_scores) != len(y_tr_file):
+                        _ntr = min(len(tr_scores), len(y_tr_file))
+                        tr_scores = tr_scores[:_ntr]
+                        y_tr_file = y_tr_file[:_ntr]
+                    train_m = _train_metrics_dict_from_y_scores(
+                        y_tr_file,
+                        tr_scores,
+                        train_thr,
+                        label="rated",
+                        log_results=False,
+                    )
+                    used_libsvm_train_metrics = True
+                except Exception as exc:
+                    logger.warning(
+                        "Plan B+: train metrics via LibSVM file failed (%s); "
+                        "falling back to batched in-memory predict.",
+                        exc,
+                    )
+    if not used_libsvm_train_metrics:
+        train_m = _compute_train_metrics(
+            model,
+            train_thr,
+            X_tr_pred,
+            y_tr,
+            label="rated",
+            log_results=False,
+        )
     metrics.update(train_m)
 
     if test_rated is not None and not test_rated.empty:
@@ -4490,9 +4580,16 @@ def _write_pipeline_diagnostics_json(
     pipeline_started_at: str,
     pipeline_finished_at: str,
     total_duration_sec: float,
+    step1_duration_sec: Optional[float] = None,
+    step2_duration_sec: Optional[float] = None,
+    step3_duration_sec: Optional[float] = None,
+    step4_duration_sec: Optional[float] = None,
+    step5_duration_sec: Optional[float] = None,
+    step6_duration_sec: Optional[float] = None,
     step7_duration_sec: Optional[float] = None,
     step8_duration_sec: Optional[float] = None,
     step9_duration_sec: Optional[float] = None,
+    step10_duration_sec: Optional[float] = None,
     oom_precheck_est_peak_ram_gb: Optional[float] = None,
     oom_precheck_step7_rss_error_ratio: Optional[float] = None,
     step7_rss_start_gb: Optional[float] = None,
@@ -4511,9 +4608,16 @@ def _write_pipeline_diagnostics_json(
         "pipeline_started_at": pipeline_started_at,
         "pipeline_finished_at": pipeline_finished_at,
         "total_duration_sec": total_duration_sec,
+        "step1_duration_sec": step1_duration_sec,
+        "step2_duration_sec": step2_duration_sec,
+        "step3_duration_sec": step3_duration_sec,
+        "step4_duration_sec": step4_duration_sec,
+        "step5_duration_sec": step5_duration_sec,
+        "step6_duration_sec": step6_duration_sec,
         "step7_duration_sec": step7_duration_sec,
         "step8_duration_sec": step8_duration_sec,
         "step9_duration_sec": step9_duration_sec,
+        "step10_duration_sec": step10_duration_sec,
         "oom_precheck_est_peak_ram_gb": oom_precheck_est_peak_ram_gb,
         "oom_precheck_step7_rss_error_ratio": oom_precheck_step7_rss_error_ratio,
         "step7_rss_start_gb": step7_rss_start_gb,
@@ -4621,16 +4725,23 @@ def run_pipeline(args) -> None:
         run_name=_mlflow_run_name,
     ):
         try:
-            # T12.2 Step 2 (success diagnostics): best-effort metrics for Step 7-9.
+            # T12.2 / T-PipelineStepDurations: best-effort per-step wall times (Step 1–10).
             # Note: all values are optional; log_*_safe helpers will skip None.
             chunks: list = []
             recent_chunks: Optional[int] = getattr(args, "recent_chunks", None)
             effective_start = start
             effective_end = end
             _effective_neg_sample_frac: float = NEG_SAMPLE_FRAC
+            step1_duration_sec: Optional[float] = None
+            step2_duration_sec: Optional[float] = None
+            step3_duration_sec: Optional[float] = None
+            step4_duration_sec: Optional[float] = None
+            step5_duration_sec: Optional[float] = None
+            step6_duration_sec: Optional[float] = None
             step7_duration_sec: Optional[float] = None
             step8_duration_sec: Optional[float] = None
             step9_duration_sec: Optional[float] = None
+            step10_duration_sec: Optional[float] = None
             # OOM pre-check estimate (Step 1) and post-check RSS peak (Step 7-9 checkpoint).
             oom_precheck_est_peak_ram_gb: Optional[float] = None
             oom_precheck_step7_rss_error_ratio: Optional[float] = None
@@ -4648,6 +4759,7 @@ def run_pipeline(args) -> None:
             t0 = time.perf_counter()
             chunks = get_monthly_chunks(start, end)
             _el = time.perf_counter() - t0
+            step1_duration_sec = _el
             print("[Step 1/10] Training window and monthly chunks done in %.1fs" % _el, flush=True)
             logger.info("Chunks: %d  (%.1fs)", len(chunks), _el)
         
@@ -4720,6 +4832,7 @@ def run_pipeline(args) -> None:
             t0 = time.perf_counter()
             split = get_train_valid_test_split(chunks)
             _el = time.perf_counter() - t0
+            step2_duration_sec = _el
             print("[Step 2/10] Chunk-level split done in %.1fs" % _el, flush=True)
             logger.info("Chunk-level split (train_end derivation): %.1fs", _el)
             train_end = (
@@ -4843,6 +4956,7 @@ def run_pipeline(args) -> None:
                         logger.warning("Write canonical mapping artifact failed (%s); next run will rebuild", exc)
         
             _el = time.perf_counter() - t0
+            step3_duration_sec = _el
             print("[Step 3/10] Build canonical identity mapping done in %.1fs" % _el, flush=True)
             logger.info(
                 "Canonical mapping: %d rows; FND-12 dummy player_ids to exclude: %d  (%.1fs)",
@@ -4880,6 +4994,7 @@ def run_pipeline(args) -> None:
                 max_lookback_days=365,
             )
             _el = time.perf_counter() - t0
+            step4_duration_sec = _el
             print("[Step 4/10] Ensure player_profile ready done in %.1fs" % _el, flush=True)
             logger.info("ensure_player_profile_ready: %.1fs", _el)
         
@@ -4906,6 +5021,7 @@ def run_pipeline(args) -> None:
                 canonical_ids=_rated_cids,
             )
             _el = time.perf_counter() - t0
+            step5_duration_sec = _el
             if profile_df is not None:
                 print("[Step 5/10] Load player_profile done in %.1fs (%d rows)" % (_el, len(profile_df)), flush=True)
                 logger.info("player_profile: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), _el)
@@ -5046,6 +5162,7 @@ def run_pipeline(args) -> None:
                 pbar.close()
         
             _el = time.perf_counter() - t0
+            step6_duration_sec = _el
             print("[Step 6/10] Process chunks done in %.1fs (%d chunks)" % (_el, len(chunk_paths)), flush=True)
             logger.info("Process chunks: %d produced  (%.1fs)", len(chunk_paths), _el)
             if not chunk_paths:
@@ -5942,6 +6059,7 @@ def run_pipeline(args) -> None:
                 neg_sample_frac=_effective_neg_sample_frac,
             )
             _el = time.perf_counter() - t0
+            step10_duration_sec = _el
             print("[Step 10/10] Save artifact bundle done in %.1fs" % _el, flush=True)
             logger.info("save_artifact_bundle: %.1fs", _el)
 
@@ -5989,9 +6107,16 @@ def run_pipeline(args) -> None:
                     pipeline_started_at=pipeline_started_at_iso,
                     pipeline_finished_at=_pipeline_finished_at_iso,
                     total_duration_sec=total_sec,
+                    step1_duration_sec=step1_duration_sec,
+                    step2_duration_sec=step2_duration_sec,
+                    step3_duration_sec=step3_duration_sec,
+                    step4_duration_sec=step4_duration_sec,
+                    step5_duration_sec=step5_duration_sec,
+                    step6_duration_sec=step6_duration_sec,
                     step7_duration_sec=step7_duration_sec,
                     step8_duration_sec=step8_duration_sec,
                     step9_duration_sec=step9_duration_sec,
+                    step10_duration_sec=step10_duration_sec,
                     oom_precheck_est_peak_ram_gb=oom_precheck_est_peak_ram_gb,
                     oom_precheck_step7_rss_error_ratio=oom_precheck_step7_rss_error_ratio,
                     step7_rss_start_gb=step7_rss_start_gb,
@@ -6022,7 +6147,7 @@ def run_pipeline(args) -> None:
             print("All steps completed. Pipeline total: %.1fs (%.1f min)" % (total_sec, total_sec / 60.0), flush=True)
             logger.info("Pipeline total: %.1fs (%.1f min)", total_sec, total_sec / 60.0)
 
-            # T12.2: Log training success metrics + Step 7-9 memory/OOM diagnostics to MLflow.
+            # T12.2: Log training success metrics + per-step durations + Step 7–9 memory/OOM diagnostics to MLflow.
             try:
                 oom_params = {
                     "oom_precheck_est_peak_ram_gb": oom_precheck_est_peak_ram_gb,
@@ -6033,25 +6158,36 @@ def run_pipeline(args) -> None:
                 if oom_params_clean:
                     log_params_safe(oom_params_clean)
 
-                mlflow_metrics: dict[str, Any] = {
-                    "total_duration_sec": total_sec,
-                    "step7_duration_sec": step7_duration_sec,
-                    "step8_duration_sec": step8_duration_sec,
-                    "step9_duration_sec": step9_duration_sec,
-                    # Step 7-9 checkpoint memory metrics (names align with plan).
-                    "step7_rss_start_gb": step7_rss_start_gb,
-                    "step7_rss_peak_gb": step7_rss_peak_gb,
-                    "step7_rss_end_gb": step7_rss_end_gb,
-                    "step7_sys_available_min_gb": step7_sys_available_min_gb,
-                    "step7_sys_used_percent_peak": step7_sys_used_percent_peak,
-                    # Keep this also as a metric for easier plotting.
-                    "oom_precheck_step7_rss_error_ratio": oom_precheck_step7_rss_error_ratio,
-                }
-
-                # Performance metrics from training artifact.
+                # Training metrics from artifact, then pipeline timing + memory/OOM last so
+                # combined_metrics["rated"] cannot overwrite reserved keys (vs pipeline_diagnostics.json).
+                mlflow_metrics: dict[str, Any] = {}
                 _rated = (combined_metrics or {}).get("rated", {})
                 if isinstance(_rated, dict):
                     mlflow_metrics.update(_rated)
+
+                mlflow_metrics.update(
+                    {
+                        "total_duration_sec": total_sec,
+                        "step1_duration_sec": step1_duration_sec,
+                        "step2_duration_sec": step2_duration_sec,
+                        "step3_duration_sec": step3_duration_sec,
+                        "step4_duration_sec": step4_duration_sec,
+                        "step5_duration_sec": step5_duration_sec,
+                        "step6_duration_sec": step6_duration_sec,
+                        "step7_duration_sec": step7_duration_sec,
+                        "step8_duration_sec": step8_duration_sec,
+                        "step9_duration_sec": step9_duration_sec,
+                        "step10_duration_sec": step10_duration_sec,
+                        # Step 7-9 checkpoint memory metrics (names align with plan).
+                        "step7_rss_start_gb": step7_rss_start_gb,
+                        "step7_rss_peak_gb": step7_rss_peak_gb,
+                        "step7_rss_end_gb": step7_rss_end_gb,
+                        "step7_sys_available_min_gb": step7_sys_available_min_gb,
+                        "step7_sys_used_percent_peak": step7_sys_used_percent_peak,
+                        # Keep this also as a metric for easier plotting.
+                        "oom_precheck_step7_rss_error_ratio": oom_precheck_step7_rss_error_ratio,
+                    }
+                )
 
                 log_metrics_safe(mlflow_metrics)
             except Exception as _mlflow_exc:
@@ -6108,58 +6244,9 @@ def run_pipeline(args) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Patron Walkaway - Phase 1 Trainer")
-    parser.add_argument("--start", default=None, help="Training window start (YYYY-MM-DD or ISO)")
-    parser.add_argument("--end",   default=None, help="Training window end")
-    parser.add_argument(
-        "--days", type=int, default=TRAINER_DAYS,
-        help="Last N days ending 30m ago (used when --start/--end are not given)",
-    )
-    parser.add_argument(
-        "--use-local-parquet", action="store_true",
-        help="Read from data/ Parquet instead of ClickHouse",
-    )
-    parser.add_argument(
-        "--rebuild-canonical-mapping", action="store_true",
-        help="Force rebuild canonical mapping (do not load from data/canonical_mapping.parquet); write after build.",
-    )
-    parser.add_argument(
-        "--force-recompute", action="store_true",
-        help="Ignore cached chunk Parquet files and recompute",
-    )
-    parser.add_argument(
-        "--skip-optuna", action="store_true",
-        help="Skip Optuna search and use default LightGBM hyperparameters",
-    )
-    parser.add_argument(
-        "--recent-chunks", type=int, default=None, metavar="N",
-        help=(
-            "Debug/test mode: use only the last N monthly chunks from the training "
-            "window. Limits data loaded from both ClickHouse and local Parquet. "
-            "Recommended N>=3 to keep train/valid/test all non-empty. "
-            "E.g. --recent-chunks 3 uses roughly the last 3 months of data."
-        ),
-    )
-    parser.add_argument(
-        "--no-preload", action="store_true",
-        help=(
-            "Disable full-table session Parquet preload during profile backfill. "
-            "Instead, each snapshot day reads only the relevant time window via "
-            "PyArrow pushdown filters. Recommended for machines with <=8 GB RAM "
-            "where the full session Parquet (~74M rows) would cause OOM. "
-            "Trade-off: backfill is slower but memory-safe. "
-            "By default (flag absent) the entire session table is loaded once."
-        ),
-    )
-    parser.add_argument(
-        "--sample-rated", type=int, default=None, metavar="N",
-        help=(
-            "Deterministically sample N rated canonical_ids (sorted lexicographically, "
-            "head N). Default: no sampling (all rated canonical_ids are used). "
-            "Example: --sample-rated 1000 to train on a 1k patron subset."
-        ),
-    )
-    args = parser.parse_args()
+    from trainer.training.trainer_argparse import build_trainer_argparser
+
+    args = build_trainer_argparser().parse_args()
     run_pipeline(args)
 
 

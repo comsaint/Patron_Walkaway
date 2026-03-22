@@ -5283,3 +5283,250 @@ python -m ruff check tests/review_risks/test_unified_plan_v2_t3_validator_metric
      確認 `row_count`、`alert_rate`、`mean_score` 與近窗內 `prediction_log` 一致；`window_minutes` 與 config 一致。
   3. 設 **`PREDICTION_LOG_SUMMARY_WINDOW_MINUTES=0`**（或負值）時應**不新增** summary 列（僅 prediction_log 照常，若路徑有效）。
 - **下一步建議**：Unified v2 **T1–T4 主線已完成**；可選項見過往 STATUS（backtest **optuna** 上 MLflow、validator／prediction **retention** 擴充、scorer Review **bet_id**／**player_id** 硬ening 與對應測試翻轉）。若需文件化 env，可補 `credential/.env.example` 或 README 片段說明 **`PREDICTION_LOG_SUMMARY_WINDOW_MINUTES`**。
+
+---
+
+## T-PipelineStepDurations — 全步驟耗時 → `pipeline_diagnostics.json` / MLflow（2026-03-22）
+
+- **依據**：`.cursor/plans/PLAN_phase2_p0_p1.md` 小節 **T-PipelineStepDurations**（接續既有 T12.2 Step 7–9 計時）。
+- **變更檔案**
+  - `trainer/training/trainer.py`
+    - `run_pipeline`：`step1_duration_sec` … `step10_duration_sec` 初始化；Step 1–6、10 在既有 `perf_counter` 區段賦值（Step 1 計時僅含 `get_monthly_chunks`，不含 `--recent-chunks` 裁剪與 OOM pre-check，與既有 stdout 語意一致）。
+    - `_write_pipeline_diagnostics_json`：參數與 `payload` 新增 `step1`…`step10_duration_sec`（`None` 仍不寫入 JSON）。
+    - 成功路徑 `mlflow_metrics`：同上十個鍵（`log_metrics_safe` 會略過 `None`，Step 8 跳過 screening 時行為不變）。
+  - `tests/review_risks/test_review_risks_phase2_mlflow_trainer.py`：`test_run_pipeline_logs_step_durations_on_success` 契約擴充為 `step1`…`step10`。
+  - `tests/unit/test_pipeline_diagnostics_build_and_bundle.py`：新增 `test_step1_and_step10_durations_written_when_provided`。
+- **計畫索引**：可將 `PLAN_phase2_p0_p1.md` 內 **T-PipelineStepDurations** 由 Planned 改為 Done（與本段對齊）。
+- **自動驗證（建議本機執行；代理環境匯入 `trainer` 可能極慢）**
+
+```bash
+python -m pytest tests/unit/test_pipeline_diagnostics_build_and_bundle.py tests/review_risks/test_review_risks_phase2_mlflow_trainer.py::TestT12_2Step2MetricsContract::test_run_pipeline_logs_step_durations_on_success -q --tb=short
+python -m ruff check trainer/training/trainer.py tests/unit/test_pipeline_diagnostics_build_and_bundle.py tests/review_risks/test_review_risks_phase2_mlflow_trainer.py
+```
+
+- **Agent 本機**：`ruff check trainer/training/trainer.py tests/unit/test_pipeline_diagnostics_build_and_bundle.py` → **All checks passed**；`pytest` 因匯入 `trainer` 逾時未在此環境跑完，請以上列指令於本機確認。
+
+- **手動驗證建議**
+  1. 完成一輪成功訓練（或最小 smoke：`--days 1` 等既有用法）。
+  2. 開 `MODEL_DIR/pipeline_diagnostics.json`（或 bundle 內同名檔），確認含 `step1_duration_sec` … `step10_duration_sec`（Step 8 若跳過則可無 `step8_duration_sec` 鍵）。
+  3. 若已設 `MLFLOW_TRACKING_URI`：在 MLflow UI 該 run 的 metrics 中確認同上鍵（非 `None` 者應出現）。
+- **下一步建議**
+  - 可選：更新 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` § 步驟耗時欄位列表，納入 Step 1–6、10。
+  - 可選：失敗路徑（T12 FAILED run）是否附帶「已完成步驟」耗時 — 需另開任務，非本次範圍。
+
+---
+
+## Code Review：T-PipelineStepDurations（全步驟耗時，2026-03-22）
+
+**範圍**：`trainer/training/trainer.py`（`run_pipeline` 內 `step1`…`step10_duration_sec`、`_write_pipeline_diagnostics_json`、`mlflow_metrics` + `update(_rated)`）、相關單元／契約測試。**原則**：不重寫整套 pipeline；僅列高機率風險與可選小改。
+
+### 1. [語意／可觀測性] `mlflow_metrics.update(_rated)` 可覆寫 `stepN_duration_sec`（鍵碰撞）
+
+- **問題**：成功路徑先建立含 `step1_duration_sec`…`step10_duration_sec` 的 `mlflow_metrics`，再執行 `mlflow_metrics.update(_rated)`（`_rated` = `combined_metrics["rated"]`）。若未來或某條訓練路徑在 **rated metrics 字典內**使用同名鍵（或測試 mock 誤塞），**牆鐘耗時會被訓練指標覆蓋**，MLflow 上與 `pipeline_diagnostics.json` 不一致；屬 **靜默錯誤**。
+- **具體修改建議**（擇一，皆為小改）：  
+  - **A（推薦）**：改為先 `base = dict(_rated)` 再刪除與 pipeline 保留鍵衝突的鍵，或 **先 `update(_rated)`，再對 `total_duration_sec` 與 `step1`…`step10_duration_sec` 第二次賦值覆寫**（最短路徑、保證牆鐘為準）。  
+  - **B**：`update` 僅允許白名單鍵（從 `_rated` 挑已知訓練 metric 名），不整包 merge。
+- **希望新增的測試**：  
+  - 單元或極小整合：`combined_metrics["rated"]` 內故意含 `step3_duration_sec=999.0`，斷言送進 `log_metrics_safe` 前（可 mock `log_metrics_safe` 並擷取第一參數）**`step3_duration_sec` 仍等於計時變數**（或與 JSON writer 一致）；或靜態註解＋契約測試：「`update` 後須再寫入 step durations」之 AST／原始碼片段存在性。
+
+### 2. [語意／邊界] Step 1 的 `step1_duration_sec` 與操作者直覺不一致
+
+- **問題**：`step1_duration_sec` 僅涵蓋 **`get_monthly_chunks`**；**`--recent-chunks` 裁剪、OOM pre-check、effective window 重算** 皆在其後，**不計入** Step 1。報表若把 Step 1 解讀為「到 Step 2 前所有準備工作」會 **低估** 準備階段耗時。
+- **具體修改建議**：在 Step 1 賦值處（或 `pipeline_diagnostics` 說明）加 **一行註解**；並在 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`（或 SSOT）用一句話定義「Step 1 duration = chunk 列舉耗時，不含 trim／OOM pre-check」。若產品要單一「準備階段」數字，另增可選鍵 `step1b_...` 或拉長 `t0` 範圍（**不必**為預設行為，避免改變既有 log 語意）。
+- **希望新增的測試**：文件／契約測試可選：原始碼中 `step1_duration_sec = _el` 與 `get_monthly_chunks` 之間無 `recent_chunks` 裁剪（僅作弱 MRE）；或手動 checklist 寫入 STATUS／runbook。
+
+### 3. [邊界] Step 8 跳過 screening 時 JSON 與 MLflow 對齊、但「十步齊全」假設不成立
+
+- **問題**：與既有 Step 7–9 行為一致：`step8_duration_sec` 維持 `None` 時 **JSON 無該鍵**、MLflow **不送該 metric**。消費端若以「必有 10 個 step 鍵」做 schema 驗證會 **誤判失敗**。
+- **具體修改建議**：在診斷文件與任何 JSON schema（若有）標明 **step8 可缺**；若儀表板需要齊全鍵，可選在 skip 分支設 `step8_duration_sec=0.0` 並註解「skipped, not timed」（**產品決策**，會改變現有「省略 None」語意）。
+- **希望新增的測試**：可選整合／契約：`screen_features` 跳過路徑下（或 mock）斷言 `pipeline_diagnostics` **無** `step8_duration_sec` 且 **不** crash；與「有 screening」路徑對照。
+
+### 4. [邊界／除錯] 失敗路徑仍無「已完成步驟」耗時
+
+- **問題**：T12 會記 FAILED run，但 **step 變數僅在成功收尾**寫入 diagnostics／部分 MLflow；中途失敗時 **無結構化每步耗時**，OOM／hang 定位仍依賴 stdout 時間戳。
+- **具體修改建議**：維持現狀可接受；若要做，在 `except` 內 best-effort 將已賦值之 `step1`…`stepN` 以 **params 或單一 JSON 字串** 寫入 MLflow（注意 **500 字元／param 上限**），**不**必重寫成功路徑。
+- **希望新增的測試**：mock Step 4 拋錯，斷言（若實作）failed run 帶 `step1_duration_sec` 等；未實作則本項僅作 backlog 無測試。
+
+### 5. [效能] 影響可忽略；JSON 體積略增
+
+- **問題**：僅多十個浮點欄位與 dict 鍵，**無**熱路徑額外 I/O；`pipeline_diagnostics.json` 略大，可忽略。
+- **具體修改建議**：無需改程式；若極端在意檔案大小，可改為單一巢狀 `"step_durations_sec": {"1": ...}`（**不建議**為此重構，破壞下游鍵名）。
+- **希望新增的測試**：不需要。
+
+### 6. [安全性] 低風險
+
+- **問題**：新增欄位為 **數值耗時**，無使用者輸入直接寫入；檔案仍為 `MODEL_DIR` 下既有 artifact，與其他診斷並列。
+- **具體修改建議**：維持現狀；bundle 上傳仍依既有 MLflow／GCS 權限。
+- **希望新增的測試**：不需要（非攻擊面擴張）。
+
+### 結論（簡要）
+
+實作與「僅擴充觀測、不改訓練邏輯」一致；**#1（`update(_rated)` 覆寫順序）** 已於 **2026-03-22** production 修補（見 STATUS 末段「輪次：…MLflow `mlflow_metrics` 合併順序」）。**#2** 以文件／註解即可。**#3** 需消費端 schema 自知 optional。**#4** 為可選增強。**#5–#6** 非阻擋項。
+
+---
+
+## T-PipelineStepDurations Review 風險 → MRE／契約測試（2026-03-22｜僅 tests）
+
+- **新增檔案**：[`tests/review_risks/test_t_pipeline_step_durations_review_mre.py`](tests/review_risks/test_t_pipeline_step_durations_review_mre.py)  
+- **原則**：**不修改 production**；多數案例直接讀取 `trainer/training/trainer.py` 原始碼字串，**不依賴匯入 `trainer` 模組**（避免冷啟動過慢）；以純 Python 模擬 dict merge／None 過濾作 MRE。
+- **對照 Review 條目**
+
+| # | 測試類別／摘要 |
+|---|----------------|
+| 1 | `TestReview1MlflowMetricsRatedMergeCollisionMre` — dict 先 pipeline 鍵再 `update(rated)` 時碰撞覆寫之 **MRE**；`trainer.py` 內 `mlflow_metrics.update(_rated)` 在 `log_metrics_safe(mlflow_metrics)` **之前**（結構契約） |
+| 2 | `TestReview2Step1DurationScopeContract` — `step1_duration_sec = _el` 在 `chunks = chunks[-recent_chunks:]` **之前** |
+| 3 | `TestReview3Step8OptionalInDiagnosticsJson` — writer 含 `if v is not None` 過濾行與 `step8` payload 鍵；另 **MRE** 模擬 None 省略 |
+| 4 | `TestReview4FailurePathNoStepDurationParams` — `# T12 failure diagnostics` 區段內 **無** `stepN_duration_sec` |
+| 5 | `TestReview5DiagnosticsWriterBoundedStepKeys` — `_write_pipeline_diagnostics_json` 內十個 `"stepN_duration_sec": stepN_duration_sec` 各 **恰出現一次** |
+| 6 | `TestReview6StepDurationKeysNoPathOrSecretPattern` — writer 片段內 `step\d+_duration_sec` 鍵名 **1–10 連續** |
+
+- **執行方式**
+
+```bash
+python -m ruff check tests/review_risks/test_t_pipeline_step_durations_review_mre.py
+python -m pytest tests/review_risks/test_t_pipeline_step_durations_review_mre.py -q --tb=short
+```
+
+- **自動驗證（本機）**：上列指令結果 — **ruff**：All checks passed；**pytest**：**8 passed**（約 0.1s，無匯入 trainer）。
+- **下一步建議**：若 production 修正 #1（`update` 後再覆寫 step 鍵），可追加單元測試 mock `combined_metrics["rated"]` 含碰撞牆鐘鍵並 assert 最終送進 `log_metrics_safe` 仍為管線計時；本檔 MRE（dict 碰撞語意）仍保留作迴歸說明。
+
+---
+
+## 輪次：T-PipelineStepDurations production — MLflow `mlflow_metrics` 合併順序修補（2026-03-22）
+
+- **對齊**：上列 Code Review **#1**（`combined_metrics["rated"]` 與牆鐘／RSS 鍵碰撞）。
+- **變更檔案**：[`trainer/training/trainer.py`](trainer/training/trainer.py) — 成功路徑 `mlflow_metrics`：先 **`mlflow_metrics: dict[str, Any] = {}`**，**`mlflow_metrics.update(_rated)`**，再以第二個 **`mlflow_metrics.update({...})`** 寫入 **`total_duration_sec`**、**`step1_duration_sec` … `step10_duration_sec`**、**`step7_rss_*`／`step7_sys_*`／`oom_precheck_step7_rss_error_ratio`**，最後 **`log_metrics_safe(mlflow_metrics)`**。
+- **Lint**
+  - `python -m ruff check .` → **All checks passed**
+  - `python -m ruff check trainer/training/trainer.py` → **All checks passed**
+- **Typecheck**
+  - `python -m mypy trainer/training/trainer.py --ignore-missing-imports` → **Success: no issues found**
+- **測試（本輪於 agent 可完成者）**
+  - `python -m pytest tests/review_risks/test_t_pipeline_step_durations_review_mre.py -q --tb=short` → **8 passed**（約 0.1s；不依賴匯入 `trainer`）
+- **測試（請本機補跑）**：`python -m pytest tests/ -q`（或至少 `tests/review_risks/test_review_risks_phase2_mlflow_trainer.py`、`test_review_risks_pipeline_plan_section6_contract.py`、`tests/unit/test_pipeline_diagnostics_build_and_bundle.py`）— 本環境對 **`import trainer.training.trainer` 常逾時**，全倉 pytest 未在此收尾。
+- **計畫索引**：已更新 [`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md) Phase 2 狀態列、[`.cursor/plans/PLAN_phase2_p0_p1.md`](.cursor/plans/PLAN_phase2_p0_p1.md) **T-PipelineStepDurations**「現況」與 Review #1 說明。
+- **下一步建議**：本機全綠後可選：mock `log_metrics_safe` 驗證碰撞鍵下牆鐘仍正；`doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` 一句話註明 MLflow merge 順序。
+
+---
+
+## 輪次：T-OnlineCalibration — 步驟 1–2（共用 DEC-026 選阈 + backtester oracle 與 trainer 約束對齊）（2026-03-22）
+
+**對齊**： [.cursor/plans/PLAN_phase2_p0_p1.md](.cursor/plans/PLAN_phase2_p0_p1.md) **T-OnlineCalibration**、 [DECISION_LOG.md](.cursor/plans/DECISION_LOG.md) **DEC-032**。本輪**僅**完成「共用函式 + trainer／backtester 接線」，**未**實作 state DB runtime 閾值、校準腳本、`prediction_ground_truth` 表。
+
+### 變更檔案
+
+| 檔案 | 說明 |
+|------|------|
+| [trainer/training/threshold_selection.py](trainer/training/threshold_selection.py) | **新增**：`pick_threshold_dec026`、`Dec026ThresholdPick` — PR 曲線上在 recall 下限、min alert **筆數**、可選 **alerts／hour**（僅當 `window_hours > 0`）下 **argmax precision**；無可行點時 fallback `threshold=0.5`（與原 trainer 行為一致）。 |
+| [trainer/training/trainer.py](trainer/training/trainer.py) | `_train_one_model` 與 `train_single_rated_model`（Plan B+ 兩段 val 選阈）改呼叫 `pick_threshold_dec026`（`window_hours=None`，不套用每小時密度）。`importlib` 載入模組以避免 mypy `no-redef`。 |
+| [trainer/training/backtester.py](trainer/training/backtester.py) | `compute_micro_metrics` 之 `test_precision_at_recall_*`／`threshold_at_recall_*`／`alerts_per_minute_at_recall_*` 改以 **同一函式** 計算，並讀取 **`THRESHOLD_MIN_ALERT_COUNT`** 與 **`THRESHOLD_MIN_ALERTS_PER_HOUR`**（當 `window_hours` 有效時）。移除未使用之 `precision_recall_curve` 直接 import。 |
+| [tests/unit/test_threshold_selection_dec026.py](tests/unit/test_threshold_selection_dec026.py) | **新增**：隨機二值標籤與內嵌 legacy 參照實作對照、`min_alerts_per_hour` 行為、empty／NaN fallback。 |
+| [tests/review_risks/test_review_risks_round40.py](tests/review_risks/test_review_risks_round40.py) | R65：契約改為 `_train_one_model` 含 `pick_threshold_dec026`，且 `threshold_selection.py` 內仍使用 `precision_recall_curve`。 |
+
+### 自動驗證（本機 agent 已跑）
+
+- `python -m ruff check trainer/training/threshold_selection.py trainer/training/backtester.py trainer/training/trainer.py tests/unit/test_threshold_selection_dec026.py tests/review_risks/test_review_risks_round40.py` → **All checks passed**
+- `python -m mypy trainer/training/threshold_selection.py trainer/training/trainer.py trainer/training/backtester.py --ignore-missing-imports` → **Success: no issues found**
+- `python -m pytest tests/unit/test_threshold_selection_dec026.py tests/review_risks/test_review_risks_round40.py tests/review_risks/test_review_risks_round398.py tests/review_risks/test_review_risks_round224_backtester_metrics_align.py -q --tb=short` → **31 passed**
+
+### 手動驗證建議
+
+1. **小窗 backtest**：對已知 `labeled` 資料跑一次 backtest，檢查 `backtest_metrics.json` 中 `model_default` 的 `threshold_at_recall_0.01` 等：在樣本數 **低於 `THRESHOLD_MIN_ALERT_COUNT`** 時應多為 **`null`**（屬預期，與 trainer  guard 一致）。
+2. **訓練 smoke**：極短 `--days` 訓練一輪，確認 `training_metrics.json` 之 `rated.threshold` 與 val 指標仍合理、無例外堆疊。
+3. **全倉 pytest**（若本機可負擔 `import trainer.training.trainer`）：`python -m pytest tests/ -q`
+
+### 語意提醒（避免誤讀）
+
+- **Test 集** `_compute_test_metrics_from_scores` 之 precision@recall 報告仍為 **閾值自由 PR 曲線**（與本輪 backtester「oracle + 約束」可並存不同語意）；若需 test 集也加 min-alerts／hour，屬 **後續** 單獨決策。
+- Backtest **Optuna** 區塊仍為既有邏輯；與 `model_default` 內固定阈／PR oracle 並列，未於本輪統一為單一函式（可列後續）。
+
+### 下一步建議（PLAN 順序）
+
+1. **State DB** `runtime_rated_threshold` 表 + **scorer** 讀取覆寫（含 `RUNTIME_THRESHOLD_MAX_AGE_HOURS` config）。
+2. **校準腳本** + **`prediction_log.db`** 之 `prediction_ground_truth`／`calibration_runs`。
+3. 可選：將 **backtester Optuna** 與 **test 集 PR 報告** 是否改呼叫 `pick_threshold_dec026` 納入 DEC-032 延伸討論後再動。
+
+---
+
+## Code Review：`pick_threshold_dec026`／trainer／backtester（T-OnlineCalibration 步驟 1–2）（2026-03-22）
+
+**範圍**：已讀 [.cursor/plans/PLAN.md](.cursor/plans/PLAN.md)、[STATUS.md](STATUS.md) 末段 T-OnlineCalibration、[DECISION_LOG.md](.cursor/plans/DECISION_LOG.md) **DEC-032**；對照 [trainer/training/threshold_selection.py](trainer/training/threshold_selection.py)、[trainer/training/trainer.py](trainer/training/trainer.py) 選阈呼叫、[trainer/training/backtester.py](trainer/training/backtester.py) `compute_micro_metrics`、[_compute_section_metrics](trainer/training/backtester.py)（`rated_sub` 語意）。**結論**：主路徑（backtest 經 `rated_sub`、validation 二元標籤）合理；下列為**最可能**風險與可驗證補強，**不要求**本節一次改完 production。
+
+### 1. 效能：`compute_micro_metrics` 對同一 `(label, score)` 重複建 PR 曲線
+
+- **問題**：對 `_TARGET_RECALLS` 四個 `r` 各呼叫一次 `pick_threshold_dec026`，內部皆執行 `precision_recall_curve` + `searchsorted`，同一 DataFrame 上為 **O(4 × (n log n 量級))** 冗餘（n 大時 backtest 報表路徑可感覺）。
+- **具體修改建議**：在 `compute_micro_metrics` 內（單類別 guard 之後）**只算一次** `pr_prec[:-1]`、`pr_rec[:-1]`、`pr_thresholds`、`alert_counts`，再對每個 `r` 只做 **mask + argmax**（可抽 `pick_threshold_dec026_from_pr_arrays(...)` 或於 `threshold_selection` 增加可選「預計算陣列」入口）；trainer 路徑維持單次呼叫即可不改。
+- **希望新增的測試**：單元測試 mock `precision_recall_curve` 計數器，斷言 `compute_micro_metrics`（固定 6 列小型 `DataFrame`）在 **四個 recall 水準下僅觸發一次** sklearn PR 曲線（或斷言內部 helper 呼叫次數）；另可選 pytest `monkeypatch` 包 `sklearn.metrics.precision_recall_curve`。
+
+### 2. 邊界：`window_hours` 或 `min_alerts_per_hour` 為 NaN／inf 時的靜默行為
+
+- **問題**：`pick_threshold_dec026` 中 `wh = float(window_hours)` 若為 **NaN**，則 `wh > 0` 為 False，**每小時密度約束被略過**，但呼叫端（或未來校準腳本）可能以為仍生效；`inf` 則可能讓約束過鬆或數值難以解讀。
+- **具體修改建議**：對 `window_hours`、`min_alerts_per_hour`（若需）使用 **`math.isfinite`**：非有限則視同「不套用 per-hour 守衛」並 **`logger.warning` 一次**（或與 `compute_micro_metrics` 一致改走 zeroed／fallback 策略，但需先產品決策）。
+- **希望新增的測試**：`pick_threshold_dec026(..., min_alerts_per_hour=1.0, window_hours=float("nan"))` 斷言與「不套用 per-hour」之參照結果一致，且（若實作 log）可選 `caplog` 含預期子字串；對 `inf` 加一則類似測試。
+
+### 3. 邊界：`min_alert_count <= 0` 或異常 config
+
+- **問題**：`valid = alert_counts >= int(min_alert_count)` 若 `min_alert_count` 為 **0 或負**，則 **alert 筆數守衛形同無效**，與 DEC-027／DEC-032「最小告警量」意圖不符；目前依賴 config 正確性，無防呆。
+- **具體修改建議**：在 `pick_threshold_dec026` 開頭將 `min_alert_count` **clamp 為 `max(1, int(min_alert_count))`**，或在載入 config 時 assert ≥1；並在模組 docstring 註明「語意上至少 1」。
+- **希望新增的測試**：`min_alert_count=0` 與 `min_alert_count=1` 對同一組 `(y, s)` 結果應一致（若採 clamp）；或 `min_alert_count=-3` 時 assert 拋出 `ValueError`（若採嚴格 validate）。
+
+### 4. 邊界：標籤非嚴格二元（0／1 以外）
+
+- **問題**：`n_pos = sum(y==1)`、`n_neg = sum(y==0)`；若存在 **2、-1、0.5** 等，可能 **n_pos + n_neg < n** 仍通過 guard，交給 `precision_recall_curve`，行為依 sklearn 版本／輸入而定，**與訓練管線假設不一致**。
+- **具體修改建議**：在 `pick_threshold_dec026`（或僅 trainer 路徑）對 `y_t` 做 **`np.isin(y_t, [0.0, 1.0]).all()`** 檢查，否則 **fallback** 並 log；訓練路徑亦可在上游保證。
+- **希望新增的測試**：`y_true=[0,1,2]`、`y_score` 任意合法向量 → 斷言 `is_fallback is True`（或預期之明確例外）。
+
+### 5. 契約：`compute_micro_metrics` 若混入 `is_rated=False` 列
+
+- **問題**：主線 `_compute_section_metrics` 已說明僅對 **`rated_sub`** 呼叫，語意正確；若**其他呼叫端**傳入含 unrated 之列，則 **PR oracle 仍用全部列** 算 `alert_counts`／recall，與 **`is_alert` 僅對 rated 生效** 的 micro P/R **不一致**（易誤解為 bug）。
+- **具體修改建議**（擇一）：(A) 在 docstring 加 **硬性契約**：「oracle 與 micro 均假設列已為 rated-only」；(B) 在函式內對 `df["is_rated"]` 若存在則 **`df = df[df["is_rated"]]`** 再算 oracle（**行為變更**，需跑全 backtest 相關測試）。目前 **backtest 主路徑無需 (B)**。
+- **希望新增的測試**：建一 DataFrame：半數 `is_rated=False` 且 `score` 極高，半數 rated；**oracle 路徑**與「僅 rated 子集」預期差異之**文件化測試**（若維持現狀）或 **filter 後與現狀一致**（若採 B）。
+
+### 6. 語意／可觀測性：test 集 `_compute_test_metrics_from_scores` 與 backtester oracle 仍不同口徑
+
+- **問題**：STATUS 已提醒；DEC-032 §6 仍寫「待程式對齊」之敘述與現況（backtester 已用共用函式、test 報告仍閾值自由）可能讓讀者以為 **已全部一致**。
+- **具體修改建議**：在 [DECISION_LOG.md](.cursor/plans/DECISION_LOG.md) **DEC-032** 或 `threshold_selection` 模組 docstring **加一句**：「Test-set `test_precision_at_recall_*` 報告仍可能為 PR 曲線無約束 oracle，與本函式之 operating-point 約束可並存不同語意。」必要時將 PLAN 中「待對齊」改為「**backtester 已對齊；test 報告另議**」。
+- **希望新增的測試**：契約／文件測試：`_compute_test_metrics_from_scores` 原始碼仍含「僅 `pr_r >= r`」之邏輯且**不** import `pick_threshold_dec026`（或對照註解說明），避免未來誤合併。
+
+### 7. 安全性（當前變更範圍內與後續）
+
+- **問題**：本輪僅數值閾值選擇，**無**新對外介面；**未來** DEC-032 之 **state DB runtime 覆寫** 若寫入未驗證，可能被本機其他程式篡改導致告警風暴或沈默（屬**後續**風險）。
+- **具體修改建議（後續實作時）**：runtime 表寫入限單一校準身分、閾值範圍 **[0,1]**、可選簽章／只允許單 process 寫入；scorer 讀取失敗 **必** fallback bundle。
+- **希望新增的測試（後續）**：整合測試：惡意／越界 `rated_threshold` 寫入 DB → scorer 拒用或 clamp。
+
+### 8. 命名／文件漂移
+
+- **問題**：DEC-032 與 PLAN 寫 **`select_threshold_dec026`**，程式為 **`pick_threshold_dec026`**，搜尋與 onboarding 易混淆。
+- **具體修改建議**：在 `threshold_selection.py` 頂部 docstring 加一行「PLAN／DEC-032 所稱 `select_threshold_dec026` 即本模組之 `pick_threshold_dec026`」；或加 **別名** `select_threshold_dec026 = pick_threshold_dec026`（typing 與 re-export 需一致）。
+- **希望新增的測試**：可選：assert 別名存在且為同一物件 `is`。
+
+---
+
+**審查者說明**：以上依「寧可列出可驗證項、不草率宣稱無風險」整理；**未**將建議全部實作為本 review 之一部分。
+
+### Review 風險點 → MRE／契約測試（2026-03-22｜僅 tests）
+
+- **新增檔案**：[`tests/review_risks/test_threshold_dec032_review_risks_mre.py`](tests/review_risks/test_threshold_dec032_review_risks_mre.py)  
+- **原則**：**不修改 production**；對應上列 Code Review **#1–#8**。
+
+| # | 測試類別／摘要 |
+|---|----------------|
+| 1 | `TestReview1PrecisionRecallCurveCalledFourTimesPerComputeMicroMetrics` — `patch` `threshold_selection.precision_recall_curve`，斷言 `compute_micro_metrics` 觸發 **4 次**（四個 recall 水準冗餘熱點） |
+| 2 | `TestReview2NanWindowHoursSkipsPerHourGuardSilently` — `window_hours=float("nan")` 與 `None` 在設 `min_alerts_per_hour` 時 **`pick` 結果相同** |
+| 3 | `TestReview3NonPositiveMinAlertCountWeakensGuardNoRaise` — `min_alert_count=-3` **不 raise**（守衛被削弱之現況） |
+| 4 | `TestReview4NonBinaryLabelsPosNegUndercountMre` — 標籤 `[0,1,2]` 通過雙類 guard 後 **sklearn 擲 `ValueError: multiclass`** |
+| 5 | `TestReview5UnratedRowsSkewOracleVersusRatedOnlySubset` — 混入 `is_rated=False` 高分列會改變 **`threshold_at_recall_0.01`**，`alerts`（僅 rated）可不變 |
+| 6 | `TestReview6TestMetricsScoresPathDoesNotImportSharedPicker` — 讀 `trainer.py` 文字，**`_compute_test_metrics_from_scores` 不含 `pick_threshold_dec026`** |
+| 7 | `TestReview7ThresholdSelectionModuleHasNoSqliteContract` — `threshold_selection.py` 原始碼 **不含 `sqlite`** |
+| 8 | `TestReview8NamingDriftSelectVsPickDocumented` — 模組有 **`pick_threshold_dec026`**、無 **`select_threshold_dec026`** 別名 |
+
+**執行方式**（本機）：
+
+```bash
+python -m ruff check tests/review_risks/test_threshold_dec032_review_risks_mre.py
+python -m pytest tests/review_risks/test_threshold_dec032_review_risks_mre.py -v --tb=short
+```
+
+**自動驗證（本機 agent）**：ruff **All checks passed**；pytest **8 passed**（約 1.4s）。
+
+**說明**：若日後 production 將 `compute_micro_metrics` 改為「單次 PR 曲線 + 四 recall」，請同步將 **#1** 之預期呼叫次數改為 **1**（或改為 assert ≤1）。

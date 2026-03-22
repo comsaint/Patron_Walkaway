@@ -1,16 +1,33 @@
 # Marks trainer/ as a regular Python package so that
 # `from trainer.time_fold import ...` works from the project root.
 #
-# 項目 2.3 相容層：re-export config / db_conn 讓既有 "from trainer.config import ..."
-# 與 "from trainer import config" 仍可工作（config 實作在 trainer.core，頂層 trainer.config 為 re-export）。
+# 項目 2.3 相容層：lazy re-export config / db_conn（避免 import trainer 時連帶拉重鏈）。
 # 安裝為 walkaway_ml 時須先設 trainer alias，再 import，否則 trainer.core 無法解析（Code Review P0）。
 # 並 re-export 子模組供 "from walkaway_ml import trainer" 等（tests/round 119, 123, 127, 140, 150, 160, 171, 174, 175, 213, 221, 256, 376, 389, serving_code_review）。
+from __future__ import annotations
+
 import sys
+from typing import Any
 
 if __name__ == "walkaway_ml":
     sys.modules["trainer"] = sys.modules["walkaway_ml"]
-from trainer import config  # noqa: F401  # re-export for "from trainer import config"
-from trainer import db_conn  # noqa: F401  # re-export for "from trainer import db_conn"
+
+
+def __getattr__(name: str) -> Any:
+    if name == "config":
+        import trainer.config as cfg
+
+        return cfg
+    if name == "db_conn":
+        import trainer.db_conn as dbc
+
+        return dbc
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | {"config", "db_conn"})
+
 
 if __name__ == "walkaway_ml":
     import trainer.trainer  # noqa: F401

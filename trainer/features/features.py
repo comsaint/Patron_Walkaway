@@ -1738,6 +1738,8 @@ def compute_track_llm_features(
     - ``NaN``/``NULL`` handling follows each candidate's ``postprocess.fill``
       strategy (``"zero"`` → 0; ``"ffill"`` → forward-fill; otherwise left NaN).
     - Numeric clipping is applied after fill if ``postprocess.clip`` is present.
+    - **DEC-031**: each candidate feature column is stored as ``float32`` after
+      postprocess to cut peak RAM on downstream ``merge`` / training paths.
     - DuckDB 1.x is required (``RANGE BETWEEN INTERVAL … PRECEDING`` syntax).
     """
     import duckdb
@@ -1776,7 +1778,7 @@ def compute_track_llm_features(
 
     if df.empty:
         for cand in candidates:
-            df[cand["feature_id"]] = pd.Series(dtype="float64")
+            df[cand["feature_id"]] = pd.Series(dtype="float32")
         return df
 
     # ── Ensure payout_complete_dtm is tz-naive (DEC-018) ───────────────────
@@ -1924,6 +1926,15 @@ def compute_track_llm_features(
                 lo = clip_spec.get("min")
                 hi = clip_spec.get("max")
                 result_df[fid] = result_df[fid].clip(lower=lo, upper=hi)
+
+    # DEC-031: float32 for all candidate feature columns (numeric only).
+    for cand in candidates:
+        fid = cand["feature_id"]
+        if fid not in result_df.columns:
+            continue
+        ser = result_df[fid]
+        if pd.api.types.is_numeric_dtype(ser):
+            result_df[fid] = ser.astype(np.float32)
 
     logger.info(
         "compute_track_llm_features: computed %d Track LLM features for %d bets",

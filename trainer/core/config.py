@@ -335,6 +335,12 @@ STEP9_TRAIN_FROM_FILE: bool = True
 # When True and training from LibSVM (train_libsvm_paths), save dtrain to
 # train_for_lgb.bin after first build; on next run use .bin if present (faster I/O).
 STEP9_SAVE_LGB_BINARY: bool = True
+
+# --- DEC-031 / T-DEC031: train metrics without full dense predict_proba on X_train ---
+# Rows per batch for lgb.Booster.predict on in-memory DataFrame when computing train_* metrics.
+# When Plan B+ computes train metrics from train LibSVM file, this is unused.
+TRAIN_METRICS_PREDICT_BATCH_ROWS: int = 500_000
+
 # When set (e.g. 2_000_000), Step 8 feature screening uses only this many rows from
 # train (strategy A: sample-based screening to avoid loading full train). None = use
 # full train for screening (current behaviour). A23: For in-memory path suggest 2_000_000;

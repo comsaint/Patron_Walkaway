@@ -6,6 +6,570 @@
 
 ---
 
+## 全量驗證回歸：ruff／mypy／pytest（2026-03-22）
+
+### 背景
+- 依工作流要求確認 **lint／typecheck／全量 pytest**；**本輪無失敗**，故**未**修改 production 與 **未**改 tests（測試無誤、decorator 無需更新）。
+
+### 本輪驗證（代理環境）
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| Lint | `python -m ruff check .` | **通過** |
+| Typecheck | `python -m mypy trainer/ package/ --ignore-missing-imports` | **通過**（54 source files） |
+| Pytest | `python -m pytest tests/ -q -p no:langsmith --tb=short` | **1379 passed**, **65 skipped**, 13 subtests passed |
+
+### 備註
+- 與本 repo 近期變更對齊之契約測試含：`test_threshold_dec032_review_risks_mre.py`、`test_status_review_20260322_threshold_mre.py`（後者 §9 仍 **skipped** 至 T-OnlineCalibration）。
+
+### 下一步建議
+- Phase 2 仍待項見 [PLAN.md](PLAN.md) 與 [PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md)（T-OnlineCalibration 後段、T-DEC031 步驟 7、T-TrainingMetricsSchema 等）。
+
+---
+
+## Code Review（高可靠性覆核）：DEC-032 `threshold_selection`／`compute_micro_metrics`／round235 import（2026-03-22）
+
+**範圍**：[`trainer/training/threshold_selection.py`](../../trainer/training/threshold_selection.py)、[`trainer/training/backtester.py`](../../trainer/training/backtester.py) `compute_micro_metrics` oracle 段、[`trainer/training/trainer.py`](../../trainer/training/trainer.py) 對 `pick_threshold_dec026` 的呼叫方式；[`tests/review_risks/test_review_risks_round235_api_server_score.py`](../../tests/review_risks/test_review_risks_round235_api_server_score.py)／[`round242`](../../tests/review_risks/test_review_risks_round242_api_server.py) 之 `tests.integration.test_api_server` import。**結論**：核心數學路徑（單次 PR + `searchsorted`、`dec026_sanitize_per_hour_params`、非二元 fallback）與 trainer 驗證選阈接線合理；下列為**最可能**的 bug／邊界／安全／效能風險與建議（未於本節改 production）。
+
+### 1. 語意分叉：`test_ap` 用全列、PR oracle 僅 rated
+
+- **風險**：`compute_micro_metrics` 在 `n_pos`／`n_samples` 與 `average_precision_score` 上仍用**完整 `df`**；`test_precision_at_recall_*`／`threshold_at_recall_*` 則僅 **`is_rated==True`**。若正例大量落在 `is_rated=False`，會出現「整體 AP 有值、PR@recall 全 `None`」或兩者敘述同一個「測試集」卻口徑不同，**監控／對標 MLflow 時易誤讀**（非必為實作錯誤，屬產品／文件風險）。
+- **具體修改建議**：在 `compute_micro_metrics` docstring 與（若有）匯出 metrics 的欄位說明中，**明確標註** `test_ap`＝全列、`test_precision_at_recall_*`＝rated-only oracle；可選在 flat dict 加註後綴鍵或 `metrics_provenance` 小節（不重寫整套 schema 的前提下，至少文件要寫死）。
+- **希望新增的測試**：`tests/review_risks/` 或 integration：建構「全 df 雙類、但 rated 子集單類或無正例」的 `DataFrame`，斷言 `test_ap` 非 0／非單類邏輯與 `test_precision_at_recall_0.01 is None` **同時成立**，並與 docstring 聲明一致。
+
+### 2. `pick_threshold_dec026_from_pr_arrays`：未 sanitize 的 `window_hours` 為 NaN 時靜默略過 per-hour
+
+- **風險**：`pick_threshold_dec026` 會先經 `dec026_sanitize_per_hour_params`，故 **NaN 會打 warning 並關閉 per-hour**；若未來**校準腳本或其它呼叫端**直接呼叫 `pick_threshold_dec026_from_pr_arrays` 並傳入 raw `window_hours=float("nan")`，則分支 `wh = float(window_hours); if wh > 0.0` 因 **NaN > 0 為 False** 會**略過 per-hour 且無 log**，與高層 API 行為不一致。
+- **具體修改建議**：在 `pick_threshold_dec026_from_pr_arrays` 開頭對 `window_hours`／`min_alerts_per_hour` 若**非 None** 則 `math.isfinite(float(...))` 校驗；非有限則 **`logger.warning` 一次**並視同不套用 per-hour（與 `dec026_sanitize_per_hour_params` 對齊），或**強制**文件註明「僅接受已 sanitize 參數」並在 debug 模式 `assert`。二選一即可，重點是**消滅靜默分歧**。
+- **希望新增的測試**：單元：`pick_threshold_dec026_from_pr_arrays(..., window_hours=float("nan"), min_alerts_per_hour=1.0, ...)` 預期與 `window_hours=None` 同結果，且（若採行 warning 路線）`caplog` 或 mock logger 斷言**至少一則** warning；並與經 `dec026_sanitize_per_hour_params` 後呼叫的結果一致。
+
+### 3. 嚴格二元檢查：`y==0.0|1.0` 與浮點 label
+
+- **風險**：`dec026_pr_alert_arrays` 以 **`np.all((y_t == 0.0) | (y_t == 1.0))`** 判斷二元；若上游因 pandas／運算誤差出現 **`0.999999999`、`-0.0` 以外之「幾乎二元」**，會回 `None` → **fallback 0.5**，與 `sklearn` 若強制 cast 後可能仍可算 PR 的行為不同，**難以察覺**。
+- **具體修改建議**：在 ETL／`compute_labels` 出口保證 label 為 **int/bool 再入模**；或在 `dec026_pr_alert_arrays` 內對 `y_t` 增加可選 **`np.isclose` 容差 round 到 {0,1}**（需產品決策，避免把 0.5 當正例）。最小成本為 **資料進模前 assert／coerce**。
+- **希望新增的測試**：單元：`y=[0.0, 1.0, 1.0-1e-12]` 時現況應 fallback；若日後採容差或 coerce，則測試改為預期**非 fallback**並鎖定行為。
+
+### 4. 訓練閾值 recall 與 backtester 多 recall 報表易混淆
+
+- **風險**：trainer 選操作點使用 **`THRESHOLD_MIN_RECALL`（單一 `recall_floor`）**；backtester 對 **`_TARGET_RECALLS` 多個 r** 各算一組 `threshold_at_recall_*`。儀表板若把「artifact threshold」與「`threshold_at_recall_0.01`」混為同一語意，會**錯配運營閾值**。
+- **具體修改建議**：在 artifact／`training_metrics` 寫檔與 internal doc 標明 **`rated.threshold` 對應之 `recall_floor` 參數值**（例如重複寫入 `threshold_selected_at_recall_floor=THRESHOLD_MIN_RECALL`）；DECISION_LOG／PLAN 一句話對照表。
+- **希望新增的測試**：契約測試（讀 config 常數 + trainer 寫出 JSON 鍵名）：斷言 bundle 或 metrics 中可追溯到**選阈當時使用的 recall_floor**（mock 小訓練即可，不必全 pipeline）。
+
+### 5. `fbeta_beta` 非有限或 ≤0
+
+- **風險**：`pick_threshold_dec026_from_pr_arrays` 將 `fbeta_beta` 直接 `float()` 代入分母與 Fβ；若為 **NaN、inf 或 ≤0**，`best_fbeta`／`best_f1` 可能為無意義值，仍可能 `is_fallback=False`（mask 仍可能選到點）。
+- **具體修改建議**：在 `pick_threshold_dec026` 入口（或 config 載入）對 `THRESHOLD_FBETA` **assert 有限且 >0**；非法時 fallback 至 **0.5** 並 `logger.warning`。
+- **希望新增的測試**：單元：`fbeta_beta=float("nan")` 與 `fbeta_beta=-1.0` 兩案，預期 **warning + 合理降級**（或明確 fallback pick）；鎖定不產生 silent NaN 指標被寫入 artifact（若目前會寫入則測試應 fail）。
+
+### 6. `window_hours=+inf` 與 `alerts_per_hour`／`alerts_per_minute_at_recall_*`
+
+- **風險**：`compute_micro_metrics` 中 `window_hours is not None and window_hours > 0` 對 **inf** 為真 → **`alerts_per_hour = n_alerts / inf = 0.0`**；oracle 段 `window_minutes` 同為 inf → **APM 可能為 0**。`dec026_sanitize_per_hour_params` 會把 **非有限** window 置 `None`，故 **per-hour 守衛**不啟用，但**外層** `alerts_per_hour` 仍走除法，**兩處對「無效窗長」的處理不一致**。
+- **具體修改建議**：計算 `alerts_per_hour`／`window_minutes` 前共用 **`dec026_sanitize_per_hour_params` 或 `math.isfinite`**：非有限則視同「未提供窗長」→ `alerts_per_hour=None`、`window_minutes=None`（與 oracle 一致）。
+- **希望新增的測試**：`compute_micro_metrics(df, threshold, window_hours=float("inf"))` 斷言 `alerts_per_hour is None`（或與 `window_hours=None` 對齊之明確規格）；並斷言 `alerts_per_minute_at_recall_*` 不會依賴 inf 分母產生假 0。
+
+### 7. 效能：超大 n 時單次 PR + 全排序
+
+- **風險**：`dec026_pr_alert_arrays` 每呼叫一次 **`precision_recall_curve`（O(n log n) 量級）** + **`np.sort`**。backtester 已從四次減為一次；若單窗 **n>1e7**，筆電仍可能壓力大（**記憶體**為 sklearn 配置與 dtype）。
+- **具體修改建議**：維持現狀下在 docstring／runbook 註明「超大批次可改抽樣校準或分塊」；若需工程化：對 **校準腳本**設 **`MAX_ROWS_FOR_PR`** 與層級式抽樣（另開議題，不重寫現有 backtester 迴圈）。
+- **希望新增的測試**：可選 **效能／契約**：mock `precision_recall_curve` 計數，`compute_micro_metrics` 單次呼叫仍為 **1**（已有 MRE）；另加註 **記憶體**：大 n 用例標 `@pytest.mark.slow` 或僅文件化，避免 CI 預設跑爆。
+
+### 8. round235／242：`tests.integration` 路徑依賴 repo 根為 cwd
+
+- **風險**：`from tests.integration.test_api_server import ...` 依賴 pytest／Python **將 repo 根置於 `sys.path`**。若未來以「只把 `tests/review_risks` 加入 path」的怪異 runner 執行，可能失敗（**低機率**）。
+- **具體修改建議**：維持現狀即可；CI 明確 **`cd` 到 repo 根**再跑 pytest。若需極致穩健：改為 **`importlib` 依 `__file__` 相對載入** helpers（較醜，僅在出現真實失敗時再做）。
+- **希望新增的測試**：已滿足於 **`--collect-only` 全綠**；可選加一則 **子程序** `python -c "from tests.integration.test_api_server import _make_stub_artifacts"` 於 repo 根（與現有慣例一致）。
+
+### 9. 安全：日後 runtime 閾值／校準写入（預先提醒）
+
+- **風險**：本輪 **`threshold_selection` 仍無 sqlite**（契約測試已覆蓋）。**T-OnlineCalibration** 若寫入 state DB 的閾值**未驗證範圍**（NaN、極大／極小），scorer 可能 **告警風暴或全沈默**。
+- **具體修改建議**：實作 state 覆寫時：**`math.isfinite`、\[0,1\]（或模型分數域）** clamp／拒寫；`updated_at` 與 TTL；審計 log。
+- **希望新增的測試**：整合測試：注入非法 `rated_threshold` 列，斷言 scorer **fallback bundle** 並記錄 reason（待該功能落地後補）。
+
+### MRE／契約測試落地（僅 tests，2026-03-22）
+
+新增檔案：[tests/review_risks/test_status_review_20260322_threshold_mre.py](../../tests/review_risks/test_status_review_20260322_threshold_mre.py) — 將上列 §1–§9 風險轉成可執行斷言（§9 為 `@unittest.skip` 占位，待 T-OnlineCalibration）。
+
+| STATUS Review § | 測試類別 | 說明 |
+|-----------------|----------|------|
+| §1 | `TestStatusReview1ApFullFrameVsOracleRatedOnly` | 正例僅在 unrated → `test_ap`>0 且 `test_precision_at_recall_0.01 is None` |
+| §2 | `TestStatusReview2FromPrArraysNanWindowSilentVsPickLogs` | `from_pr_arrays`+NaN 窗與 `None` 同結果且 **無** WARNING；`pick_threshold_dec026`+NaN 有 **non-finite** warning |
+| §3 | `TestStatusReview3NearOneLabelFailsStrictBinary` | `np.nextafter(1,0)` 標籤 → `is_fallback` |
+| §4 | `TestStatusReview4SingleTrainingRecallVsMultiBacktesterKeys` | `len(_TARGET_RECALLS)>1` 且每個 `threshold_at_recall_{r}` 存在；`config.THRESHOLD_MIN_RECALL` 非空語意 |
+| §5 | `TestStatusReview5IllegalFbetaBetaCurrentContract` | `fbeta_beta` 為 nan／-1／0 時 **鎖定現況** fβ 數值（日後防呆可改預期） |
+| §6 | `TestStatusReview6InfWindowHoursAlertsPerHourAndWarning` | `window_hours=inf` → `alerts_per_hour==0`、sanitize **warning**、APM 為 0 或有限 |
+| §7 | `TestStatusReview7ComputeMicroMetricsSinglePrecisionRecallCurve` | mock `precision_recall_curve` 計數 **1**（與 `test_threshold_dec032_review_risks_mre` #1 同契約） |
+| §8 | `TestStatusReview8SubprocessImportIntegrationTestApiServer` | 子程序 `python -c` 自 **repo 根** `from tests.integration.test_api_server import ...` |
+| §9 | `TestStatusReview9RuntimeThresholdValidationPlaceholder` | **skipped** — 待 state／scorer 落地後補 |
+
+**執行方式**（repo 根）：
+
+```bash
+# 僅本檔
+python -m pytest tests/review_risks/test_status_review_20260322_threshold_mre.py -v --tb=short -p no:langsmith
+
+# 連同全量（建議）
+python -m pytest tests/ -q -p no:langsmith --tb=line
+```
+
+**本檔驗證（代理環境）**：`pytest tests/review_risks/test_status_review_20260322_threshold_mre.py` → **9 passed**, **1 skipped**；`ruff check` 該檔通過；全量 `pytest tests/ -q -p no:langsmith --tb=line` → **1379 passed**, **65 skipped**。
+
+**說明**：未新增獨立 mypy／ruff「規則檔」；§4 為輕量常數／鍵名契約，§7 為 mock 計數契約。若日後 production 修正 §2（`from_pr_arrays` 也打 warning）或 §5（拒絕非法 `fbeta_beta`），請同步調整對應測試預期。
+
+---
+
+## round235／242：`test_api_server` import 修復（collect 安全，2026-03-22）
+
+### 背景
+- `test_review_risks_round235_api_server_score.py`、`test_review_risks_round242_api_server.py` 使用 `from test_api_server import ...`，pytest **collect** 階段即 **`ModuleNotFoundError`**，全目錄跑測需 `--ignore` 該檔。
+
+### 變更檔案
+| 檔案 | 說明 |
+|------|------|
+| [tests/review_risks/test_review_risks_round235_api_server_score.py](../../tests/review_risks/test_review_risks_round235_api_server_score.py) | 改為 `from tests.integration.test_api_server import _make_stub_artifacts, _score_payload` |
+| [tests/review_risks/test_review_risks_round242_api_server.py](../../tests/review_risks/test_review_risks_round242_api_server.py) | 同上 |
+
+### 手動驗證
+1. **Collect**：`python -m pytest tests/review_risks/test_review_risks_round235_api_server_score.py tests/review_risks/test_review_risks_round242_api_server.py --collect-only` — 應成功列出 10 項（兩檔仍整模組 `pytest.mark.skip`，執行時為 skipped）。
+2. **全量**：於 repo 根目錄 `python -m pytest tests/ -q -p no:langsmith --tb=line` — **無需** `--ignore=tests/review_risks/test_review_risks_round235_api_server_score.py`。
+
+### 本輪驗證（代理環境）
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| Lint | `python -m ruff check .` | **通過** |
+| Pytest | `python -m pytest tests/ -q -p no:langsmith --tb=line` | **1370 passed**, 64 skipped |
+
+### 下一步建議
+- CI 或本機腳本若仍帶 `--ignore=...round235...`，可移除。
+- [PLAN.md](PLAN.md)／[PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md) 中「round235／242 import → collect 失敗」可視為已解；後續若恢復 model API，可再檢視是否取消模組級 `skip`。
+
+---
+
+## DEC-032／T-OnlineCalibration：threshold_selection 強化 + backtester oracle（2026-03-22）
+
+### 背景
+- Code review（STATUS 末段 #1–#8）：`compute_micro_metrics` 對四個 recall 重複建 PR；非 0/1 標籤丟進 sklearn；oracle 含 unrated 列；`select_*` 命名等。
+
+### Production 變更
+| 檔案 | 說明 |
+|------|------|
+| [trainer/training/threshold_selection.py](../../trainer/training/threshold_selection.py) | `dec026_pr_alert_arrays`（單次 `precision_recall_curve` + `searchsorted` 算 `alert_counts`）；`dec026_sanitize_per_hour_params`（非有限 per-hour 參數 warning 後略過）；`pick_threshold_dec026_from_pr_arrays`；非二元／NaN → fallback；`min_alert_count` clamp ≥1；`select_threshold_dec026` 別名。 |
+| [trainer/training/backtester.py](../../trainer/training/backtester.py) | `compute_micro_metrics` 之 PR oracle：**僅 `is_rated==True`**；**單次** PR 陣列 + 對四 recall 呼叫 `pick_threshold_dec026_from_pr_arrays`；匯入上述符號。 |
+
+### 測試（僅契約／過時處）
+| 檔案 | 說明 |
+|------|------|
+| [tests/review_risks/test_threshold_dec032_review_risks_mre.py](../../tests/review_risks/test_threshold_dec032_review_risks_mre.py) | #1 預期 **1 次** PR；#4 fallback；#5 rated-only oracle；#8 別名存在。 |
+| [tests/review_risks/test_review_risks_round50.py](../../tests/review_risks/test_review_risks_round50.py) | R68：`searchsorted` 於 `threshold_selection.py`，`pick_threshold_dec026` 於 `_train_one_model`。 |
+| [tests/unit/test_threshold_selection_dec026.py](../../tests/unit/test_threshold_selection_dec026.py) | `_legacy_pick` 改為 compose `dec026_pr_alert_arrays` + sanitize + `pick_threshold_dec026_from_pr_arrays`。 |
+
+### 本輪驗證（代理環境）
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| Lint | `python -m ruff check trainer/` | **通過** |
+| Typecheck | `python -m mypy trainer/ --ignore-missing-imports` | **通過**（51 source files） |
+| Pytest | `python -m pytest tests/ -q -p no:langsmith --tb=line`（當時曾 `--ignore=...round235...`） | **1370 passed**, 60 skipped |
+
+### 仍屬 T-OnlineCalibration／DEC-032 待辦（未於本輪實作）
+- state DB **`runtime_rated_threshold`**、scorer 讀覆寫；校準腳本、`prediction_ground_truth`／`calibration_runs`；`_compute_test_metrics_from_scores` 是否接線共用選阈（review #6 仍為「分叉」契約）。
+
+---
+
+## T-DEC031／R031：train AP 與 sklearn 相容修補＋全量測試（2026-03-22）
+
+### 背景
+- `tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py` 之 **`test_non_binary_label_two_counts_as_non_positive_for_eq1`**：`y` 含 **`2`** 時，`sklearn.metrics.average_precision_score(y, scores)` 拋錯（目標值非嚴格二元時之驗證／形狀管線）。
+
+### Production 變更（未改測試）
+| 檔案 | 說明 |
+|------|------|
+| `trainer/training/trainer.py` | **`_train_metrics_dict_from_y_scores`**：`train_ap` 改以 **`y_ap = (y_arr == 1)` 轉 float** 再呼叫 **`average_precision_score(y_ap, scores_arr)`**；`train_positives` 與 P／R／F1 仍用原 **`y_arr` 及 `== 1`／`== 0`**（額外標籤值列不計入 tp／fp／fn 之與 0 比對）。 |
+
+### 本輪驗證
+| 檢查 | 指令／範圍 | 結果 |
+|------|------------|------|
+| Lint | `python -m ruff check trainer/ package/ scripts/` | **通過** |
+| Typecheck | `python -m mypy trainer/ package/ --ignore-missing-imports` | **通過**（53 source files） |
+| Pytest | `python -m pytest tests/ -q -p no:langsmith --tb=line --ignore=tests/review_risks/test_review_risks_round235_api_server_score.py` | **1356 passed**, 60 skipped（約 47s） |
+
+### 備註
+- **round235／242 collect**：已於本檔較新節 **「round235／242：`test_api_server` import 修復」** 修復；歷史列之 `--ignore` 可省略。
+- **計畫索引**：已修訂 [PLAN.md](PLAN.md)、[PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md)（**T-DEC031** 程式步驟 1–6 標為完成；**步驟 7** 文件與 **full-window 人工驗收**仍列為待辦）。
+
+### 仍待項目對照（2026-03-22 — 與程式庫核實）
+
+| 計畫項 | 程式現況（核實摘要） | 仍待 |
+|--------|----------------------|------|
+| Credential folder | `config` 已 **`credential/.env` → 根 `.env` → cwd**；範本在 `credential/` | **營運**搬移舊檔、可選 deploy |
+| DB path | **`STATE_DB_PATH`** 預設 **`<repo>/local_state/state.db`**；**`PREDICTION_LOG_DB_PATH`** **`<repo>/local_state/prediction_log.db`** | 修正 **`view_alerts.py` 等過時註解**、舊 env 遷移 |
+| T-DEC031 步驟 7 | **[doc/training_oom_and_runtime_audit.md](../../doc/training_oom_and_runtime_audit.md)** 已詳列 OOM／步驟 | **補 DEC-031／train 指標分批＋LibSVM 短句** |
+| T-TrainingMetricsSchema | `_load_training_metrics_baseline` 有 **`rated_threshold`** | **`test_precision_at_recall_*` 等仍只讀頂層**；或 A1 寫檔 |
+| round235／242 | ~~`from test_api_server import …`~~ | **✅ 已改** `tests.integration.test_api_server`（見本檔最新「round235／242」節） |
+| Scorer lookback | `SCORER_LOOKBACK_HOURS` 固定 **8** | 可選非法值 **fallback** |
+
+---
+
+## 冷啟動／子程序逾時修補（import 鏈瘦身 + CLI 輕量路徑）
+
+**Date**: 2026-03-22
+
+### 背景
+全量 `pytest tests/` 曾出現多項 **`subprocess.TimeoutExpired`**（10–30s）：冷子程序執行 `import trainer.*` 或 `python -m trainer.trainer --help` 時，**急切匯入**拉進 `pandas`／完整訓練模組，於部分環境超過測試逾時。
+
+### 本輪 production 變更（未改測試）
+| 區域 | 檔案 | 說明 |
+|------|------|------|
+| `trainer.core` | `trainer/core/__init__.py` | 移除對 `schema_io`／`duckdb_schema` 的 package 層急切 import，避免 `import trainer.core.db_conn` 連帶載入 pandas。 |
+| `trainer` 根包 | `trainer/__init__.py` | `config`／`db_conn` 改 **`__getattr__` 延遲載入**，避免 `import trainer` 即拉子模組。 |
+| Trainer CLI | `trainer/training/trainer_argparse.py`（新） | 僅 stdlib + `trainer.core.config` 的 argparse 建構；`python -m trainer.trainer --help` 先 `parse_args()` 再載入 `trainer.training.trainer`。 |
+| Trainer stub | `trainer/trainer.py` | `__main__` 走輕量 argparse；`else` 仍 `sys.modules` 覆寫 + 符號 re-export（維持 item2 契約與 mypy）。 |
+| Backtester | `trainer/training/backtester.py` | 由 `trainer.training.trainer` 匯入訓練符號（取代 `trainer.trainer`／`trainer` 混用），配合 `MODEL_DIR: Path = cast(...)` 通過 mypy。 |
+| Training | `trainer/training/trainer.py` | `main()` 改用共用 argparse；`MODEL_DIR` 標註為 `Path`；移除未使用之 `import argparse`。 |
+| Status server | `trainer/serving/status_server.py` | `pandas` 改為 **函式內 import** + `TYPE_CHECKING` 註解，僅讀 `STATE_DB_PATH` 的 import 不再觸發 pandas。 |
+| ETL 包 | `trainer/etl/__init__.py` | 移除對 `etl_player_profile` 的急切 import（先前會在 `import trainer.etl.etl_player_profile_argparse` 時載入整包 ETL）。 |
+| ETL CLI | `trainer/etl/etl_player_profile_argparse.py`（新）、`trainer/etl_player_profile.py`、`trainer/etl/etl_player_profile.py` | `--help` 與 argparse 與實作分離；stub 的 `__main__` 先輕量 `parse_args` 再載入實作。 |
+
+### 本輪驗證（代理環境）
+| 檢查 | 指令／範圍 | 結果 |
+|------|------------|------|
+| Lint | `python -m ruff check trainer/ package/ scripts/` | **All checks passed** |
+| Typecheck | `python -m mypy trainer/ package/ --ignore-missing-imports` | **Success**（53 source files） |
+| Pytest（精選） | `pytest`：`test_dec031_review_risks`、`TestForkChildCanCallCacheClear`、`test_trainer_help_succeeds`、`test_etl_player_profile_help_*`、`test_status_server_uses_state_db_path_env_when_set`、`TestRecommender_R2_CLIDaysValidation`、`test_credential_review_risks`、`test_t11_review_import_succeeds_when_load_dotenv_raises`、`test_review_risks_item2_subpackages`、`test_review_risks_item2_etl_features` 等，**`-p no:langsmith`** | **通過** |
+| 全量 `pytest tests/` | 建議本機執行；首次載入 `trainer.training.trainer` 可能仍耗時數分鐘（LightGBM／sklearn 等），非本次 diff 可再縮之範圍。 | 未在代理內跑完 |
+
+---
+
+## DEC-031 / T-DEC031：步驟 1–2 實作（Track LLM fail-fast + 候選特徵 float32）
+
+**Date**: 2026-03-22
+
+### 目標
+依 [PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md) **T-DEC031** 與 [DECISION_LOG.md](DECISION_LOG.md) **DEC-031**，本次**僅**完成計畫中**步驟 1–2**（其餘 train 指標／config 分批 predict 留待下一步）。
+
+### 修改檔案
+
+| 檔案 | 內容 |
+|------|------|
+| `trainer/training/trainer.py` | `process_chunk`：移除 Track LLM 外層 `try/except`；`compute_track_llm_features` 失敗時**例外向上傳播**，不再 log 後繼續（DEC-031 fail-fast）。 |
+| `trainer/features/features.py` | `compute_track_llm_features`：空 frame 時候選欄 dtype 改 `float32`；postprocess 後對**候選**數值欄統一 `astype(np.float32)`；docstring 註記 DEC-031。 |
+| `tests/review_risks/test_review_risks_round350.py` | `test_process_chunk_dec031_track_llm_exceptions_not_swallowed`：原始碼不得含已移除之吞例外 log 字串。 |
+| `tests/review_risks/test_dec031_review_risks.py` | Code Review（下節 §1–§8）風險對照之**僅測試**守衛：讀檔 + `ast` 擷取函式本文、numpy 最小可重現；**不**頂層 `import trainer.trainer`／`pandas`（避免收集／首次 import 過慢）。 |
+| `tests/integration/test_features.py` | `TestComputeTrackLlmFeatures`：斷言候選欄為 `np.float32`（含空 bets 邊界）。 |
+| `.cursor/plans/PLAN_phase2_p0_p1.md` | T-DEC031 標為 **In progress**，並註記步驟 1–2 已完成。 |
+
+### 刻意未改（避免超出「下 1–2 步」）
+- **scorer**／**backtester** 內 Track LLM 仍可能有 `try/except` 降級 — 非本次 `process_chunk` 範圍；與線上／回測行為對齊需另議。
+- **T-DEC031 步驟 3–6** 已於本檔下一節 **「DEC-031 / T-DEC031：步驟 3–6 實作」** 追蹤（config 分批常數、LibSVM train 指標、`_compute_train_metrics` 分批）。
+
+### 如何手動驗證
+1. **單元／整合測試**（建議於 repo 根目錄）：
+   ```bash
+   python -m pytest tests/integration/test_features.py::TestComputeTrackLlmFeatures -q
+   python -m pytest tests/review_risks/test_review_risks_round350.py::TestR3502NoSilentTrackLlmFailure -q
+   python -m pytest tests/review_risks/test_dec031_review_risks.py -q -p no:langsmith
+   ```
+2. **行為驗證**：對 `process_chunk` 注入會讓 `compute_track_llm_features` 失敗的資料／mock 時，預期 **整段 chunk 處理失敗**（不再產出缺 LLM 欄位之 chunk Parquet）。完整 pipeline 需有 `feature_spec` 且 Track LLM 會執行之路徑。
+
+### 下一步建議
+1. 見本檔 **「DEC-031 / T-DEC031：步驟 3–6 實作」** 一節（已完成 config／分批 predict／LibSVM train 指標）；後續可補步驟 7 文件與 full-window 驗收。
+2. （可選）統一 **scorer／backtester** 與 trainer 之「Track LLM 失敗是否硬失敗」產品語意，並更新對應測試（如 R222 仍預期 backtest 降級時需明確文件化）。
+
+---
+
+## DEC-031 / T-DEC031：步驟 3–6 實作（train 指標分批 predict + Plan B+ LibSVM train 檔）
+
+**Date**: 2026-03-22
+
+### 目標
+依 [PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md) **T-DEC031** 步驟 3–6 與 [DECISION_LOG.md](DECISION_LOG.md) **DEC-031**：避免全訓練集單次 `predict_proba` 稠密配置；Plan B+ 時 train 指標優先自 **train LibSVM** 路徑 `booster.predict`。
+
+### 修改檔案
+
+| 檔案 | 內容 |
+|------|------|
+| `trainer/core/config.py` | 新增 **`TRAIN_METRICS_PREDICT_BATCH_ROWS`**（預設 `500_000`），供 in-memory train 指標分批 `booster.predict` 使用。 |
+| `trainer/training/trainer.py` | 兩路 `config` 匯入皆 **`getattr(..., "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)`**；新增 **`_batched_booster_predict_scores`**、**`_train_metrics_dict_from_y_scores`**；**`_compute_train_metrics`** 有 `booster_` 時走分批 predict，失敗則 warning 後 **fallback** `predict_proba`；**`train_single_rated_model`** 在 `use_from_libsvm` 且 train 檔在 **`DATA_DIR` 下** 且 `booster_` 存在時，train 指標優先 **`_labels_from_libsvm` + `booster.predict(str(path))`**，長度 trim、失敗則 warning 後 fallback **`_compute_train_metrics`**。 |
+
+### 如何手動驗證
+
+1. **靜態檢查**（repo 根目錄）：
+   ```bash
+   python -m ruff check trainer/core/config.py trainer/training/trainer.py
+   python -m mypy trainer/core/config.py trainer/training/trainer.py --ignore-missing-imports
+   ```
+2. **單元／契約測試**（首次 `import trainer.training.trainer` 可能較久，建議 `-p no:langsmith`）：
+   ```bash
+   python -m pytest tests/review_risks/test_review_risks_round182_plan_b_config.py \
+     tests/review_risks/test_review_risks_round216_plan_b_plus_stage6.py \
+     tests/review_risks/test_review_risks_round195_plan_b_parity.py \
+     tests/review_risks/test_review_risks_round230.py -q -p no:langsmith
+   ```
+3. **行為驗證**：以 Plan B+（`train_libsvm_paths` 兩檔存在）跑一小段訓練，確認 log 無異常、**`training_metrics.json`**（或 MLflow）之 **train_ap／train_f1** 等鍵仍存在；若故意將 train LibSVM 路徑置於 `DATA_DIR` 外，預期走 **in-memory 分批**（與 test LibSVM 路徑守衛一致）。
+
+### 本輪驗證（代理環境）
+
+| 檢查 | 結果 |
+|------|------|
+| `ruff`（上列兩檔） | **通過** |
+| `mypy`（上列兩檔，`--ignore-missing-imports`） | **通過** |
+| `pytest`（上列 review_risks） | **未在代理內跑完**：`import trainer.training.trainer` 冷啟動曾超過 60s，建議本機執行上列 pytest 指令。 |
+
+### 下一步建議
+
+1. T-DEC031 **步驟 7**（可選）：於 `doc/training_oom_and_runtime_audit.md` 或本 STATUS 維持一句話指向 **DEC-031**／分批與 LibSVM train 指標。
+2. **T-TrainingMetricsSchema** 與調查腳本：若需將 `train_*` 鍵納入 schema／baseline，對齊 `save_artifact_bundle` 產出。
+3. （可選）新增 **mock LibSVM + booster** 之單元測試，明確斷言 train 指標走 **檔案分支** 與 fallback 路徑。
+
+### Code Review：DEC-031 / T-DEC031 步驟 3–6（高可靠性標準）
+
+**Date**: 2026-03-22  
+**範圍**：`trainer/core/config.py`（`TRAIN_METRICS_PREDICT_BATCH_ROWS`）、`trainer/training/trainer.py` 之 `_batched_booster_predict_scores`、`_train_metrics_dict_from_y_scores`、`_compute_train_metrics`、`train_single_rated_model`（Plan B+ train LibSVM 指標分支）。**不重寫整套**；下列為最可能出問題之處與可驗證補強。
+
+---
+
+#### R031-1. `X_train` 與 `y_train` 長度不一致時，新版可能「靜默 trim」而非失敗（掩蓋 caller bug／行為與舊路徑不一致）
+
+**問題**：`_train_metrics_dict_from_y_scores` 在 `len(y) != len(scores)` 時取 **min 長度**繼續算。舊版整段 `predict_proba` + `average_precision_score` 在長度不符時通常 **`ValueError`**，問題較早暴露。若上游曾誤傳錯誤 slice，新版可能產出 **看起來合法但基於截斷資料** 的 `train_*`，不利稽核。
+
+**具體修改建議**：在 **`_compute_train_metrics`**（於 empty 檢查之後、呼叫分批或 `predict_proba` 之前）若 `len(X_train) != len(y_train)`：至少 **`logger.warning`**（兩邊長度、label）；若產品偏好 **fail-fast**，可加 config **`STRICT_TRAIN_METRICS_ALIGNMENT`**（預設 `False` 維持相容）為 `True 時 raise ValueError`。LibSVM 檔分支在 **trim 預測與標籤**時同樣建議 **warning**（見 R031-3）。
+
+**希望新增的測試**：建 **`_train_metrics_dict_from_y_scores` 或 `_compute_train_metrics`** 用例：`X_train` 5 列、`y_train` 3 列（或相反），斷言 **log 含長度不符**（與可選 **raise** 若啟用 strict）。
+
+---
+
+#### R031-2. 分批 `booster.predict` 失敗後 fallback `predict_proba`，**未必能解決 OOM**（效能／DEC-031 目標落差）
+
+**問題**：`_BoosterWrapper.predict_proba` 仍會對整個 `X` 得到 **稠密 (n, 2)** 機率矩陣（`np.hstack`）。若分批路徑失敗原因與 **記憶體峰值**有關，fallback **可能再次 OOM**，與「避免全 train 稠密配置」之決策敘述不一致。
+
+**具體修改建議**：（1）在 warning 文案中明寫：**「若為 OOM，請改小 `TRAIN_METRICS_PREDICT_BATCH_ROWS` 或確保 train LibSVM 檔路徑可用」**。（2）可選第二層 fallback：**以更小 batch（例如 halving）重試**，最後才 `predict_proba`。（3）長期可抽 **單欄分數** API，避免 `hstack` 配置第二欄。
+
+**希望新增的測試**：以 **mock** `booster.predict` 第一次拋錯、第二次成功，斷言會走 fallback 且 metrics 鍵完整；**完整 OOM** 依環境難穩定測，建議以 **文件／runbook** 註記與可選 **手動** 降 batch 驗證。
+
+---
+
+#### R031-3. Train LibSVM：`predict` 與 `_labels_from_libsvm` **長度不一致時僅 silent trim**（可觀測性／與 test 分支一致但不利除錯）
+
+**問題**：與 test LibSVM 路徑相同，**無 log** 即截斷，實務上多為 **管線 bug 或檔案損毀**，應讓營運／除錯一眼看見。
+
+**具體修改建議**：當 `len(tr_scores) != len(y_tr_file)` 時 **`logger.warning`**，含 **兩邊長度與 path**（可截斷顯示）；若長度差超過某門檻（例如 >1% 或 >100 列）可升級為 **error** 或 **skip 檔案分支**改走 in-memory（需產品決策）。
+
+**希望新增的測試**：**臨時目錄**寫入合法 LibSVM、`patch` booster.predict 回傳 **較短 ndarray**，`caplog` 或 mock logger 斷言 **出現 trimming warning**；再驗證 **仍寫入** `train_ap` 等鍵（與現行行為一致）。
+
+---
+
+#### R031-4. 正樣本計數由 `y_train.sum()` 變為 **`np.sum(y_arr == 1)`**（邊界：非嚴格 0/1 標籤）
+
+**問題**：若未來或某路徑出現 **標籤為 -1/2、或 0.999** 等，**`== 1` 與 `sum()` 對「正類」定義可能分歧**，`train_random_ap`、`has_both` 與舊行為不一致。
+
+**具體修改建議**：在 **`_train_metrics_dict_from_y_scores` docstring** 與 **DEC-031** 一句話寫明契約：**訓練標籤必須為二元 0/1（或可 `astype(int)` 之 bool）**。可選在 **debug／strict** 下對 `y_arr` 做 **`set(np.unique)` 子集於 {0,1}** 之檢查，否則 warning。
+
+**希望新增的測試**：**`y = [0.0, 1.0, 1.0]`** 與 **`y = [0, 1, 1]`** 對同一 `scores`，斷言 **`n_tr_pos`／`train_random_ap` 一致**；可選負測：**含 2 與 0** 的標籤在 strict 模式下預期 warning 或 raise（若實作檢查）。
+
+---
+
+#### R031-5. Plan B+：**磁碟 train LibSVM** 與 **記憶體 `train_rated`** 若不同步，**檔案分支的 train 指標 SSOT 與敘述可能衝突**（正確性／產品語意）
+
+**問題**：檔案分支以 **LibSVM 檔**為準；fallback／其餘路徑以 **`train_rated` + X** 為準。若 export 與後續記憶體表 **列數或順序**曾不一致（雖非預期），報表上 **train_ap** 解讀會混淆。
+
+**具體修改建議**：在 **PLAN／DEC-031 或 export 註解**寫明：**Plan B+ 完成時，train 指標（檔案路徑成功時）以 train LibSVM 為準**。可選：在 `train_single_rated_model` 若同時有 **非空 `train_rated`** 與檔案路徑，對 **`len(train_rated)` 與 LibSVM 行數**做 **輕量比對**（或 hash），不一致則 **warning**。
+
+**希望新增的測試**：延伸 **parity** 類測試（如 round195）：**相同隨機資料** export 後，**檔案分支**與 **僅 in-memory 分批** 之 `train_ap`／`train_f1` 在 **數值容差**內一致（小表即可）。
+
+---
+
+#### R031-6. **`except Exception`** 過寬（可靠性：除錯與非預期錯誤可見度）
+
+**問題**：檔案 `predict` 與分批路徑皆 **`except Exception`**；多數情況合理，但 **程式錯誤（TypeError、AssertionError）** 也可能被當成「可 fallback」而掩蓋根因。
+
+**具體修改建議**：改為 **白名單**：例如 **`OSError`、`ValueError`、`lightgbm.basic.LightGBMError`**（或專案既有 LGBM 例外型別）才 fallback；**其餘 `logger.exception` 後 re-raise**。若需維持最大相容，至少對 **非預期型別** 用 **`logger.exception`** 而非僅 `warning("%s", exc)`。
+
+**希望新增的測試**：mock **`booster.predict` 拋 `LightGBMError`** → 預期 fallback；拋 **`RuntimeError("bug")`** → 預期 **re-raise** 或 **exception 級 log**（依最終政策）。
+
+---
+
+#### R031-7. **`TRAIN_METRICS_PREDICT_BATCH_ROWS` 僅程式常數、無環境變數覆寫**（運維／筆電 RAM）
+
+**問題**：RAM 緊張時無法 **不改 code** 調降 batch；與 DEC-031 敘述中「可調批次」精神略有不便。
+
+**具體修改建議**：與其他設定對齊，採 **`os.getenv("TRAIN_METRICS_PREDICT_BATCH_ROWS", "500000")`**，`strip()` 後 **`int`**，**無效則回退 500_000**，並 **`max(1, v)`**。
+
+**希望新增的測試**：`monkeypatch.setenv` 設為 **`1000`**，reload 或透過 **已注入 config** 斷言分批迴圈次數／mock `predict` 呼叫次數（若可觀測）。
+
+---
+
+#### R031-8. 路徑安全：**`relative_to(DATA_DIR)`**（與現有 test LibSVM 一致；低優先但需知悉）
+
+**問題**：與 test 分支相同：**防路徑逃逸**依賴 **`resolve()`** 與 **`relative_to`**；**race（TOCTOU）**或 **惡意替換檔案**在單機訓練場景風險低，但若 `DATA_DIR` 為 **多人可寫**，理論上可影響 **讀取內容**（非本次 diff 獨有）。
+
+**具體修改建議**：維持現狀即可；若在 **共用儲存**訓練，於 **runbook** 註明 **DATA_DIR 權限**與 **artifact 完整性**（hash）。無強制程式變更。
+
+**希望新增的測試**：現有 **round216** 等路徑守衛測試已覆蓋 **源碼契約**；可選 **整合測試**：路徑在 `DATA_DIR` 外時 **不觸發**檔案型 train 指標（與 test 一致）。
+
+---
+
+### R031 風險 → 可執行測試（tests-only，無 production 變更）
+
+**Date**: 2026-03-22
+
+新增檔案：**[tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py](../../tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py)**（相對於本 STATUS 檔之路徑）。將上列 **R031-1～R031-8** 與廣義 **`except Exception`** 契約轉成 **最小行為重現**（需 `import trainer.trainer`／LightGBM）或 **讀檔 `ast`／regex 之靜態契約**（不依賴載入完整訓練模組於**檔案頂層**；與 `test_dec031_review_risks.py` 精神一致）。
+
+| Review 項 | 測試類（節錄） | 性質 |
+|-----------|----------------|------|
+| R031-1 靜默截斷 | `TestR031_1_MismatchedLengthSilentTrim` | 行為：`train_samples == min(len y, len scores)`；源碼：`min(len(y_arr), len(scores_arr))` 不可誤刪 |
+| R031-2 fallback／稠密 proba | `TestR031_2_BatchedFallbackStillUsesDenseProba` | `MemoryError` patch → 仍回傳 metrics；`_BoosterWrapper.predict_proba` shape `(n, 2)` |
+| R031-3 trim 無 log | `TestR031_3_LibsvmTrainMetricsTrimSilentInSource` | 源碼契約：`len(tr_scores)!=len(y_tr_file)` 鄰近區塊**目前**不含 `logger.warning`（日後若加 warning 應改測試預期） |
+| R031-4 標籤語意 | `TestR031_4_LabelDtypeZeroOneEquivalence` | `0.0/1.0` 與 `int` 一致；`label==2` 不計入 `==1` 正類 |
+| R031-5 檔案分支 | `TestR031_5_LibsvmTrainMetricsBranchContract` | 源碼含 `used_libsvm_train_metrics`、`_labels_from_libsvm(_train_libsvm_p)` 等 |
+| R031-6 廣義 except | `TestR031_6_BroadExceptAllowsRuntimeErrorFallback` | `RuntimeError` patch 分批 → 仍回傳 `train_samples` |
+| R031-7 無 env | `TestR031_7_BatchRowsNotEnvDrivenYet` | `config.py` 指派行不含 `getenv`；runtime 與 `trainer.core.config` 一致 |
+| R031-8 DATA_DIR | `TestR031_8_TrainLibsvmPathUnderDataDirContract` | 源碼含 `_train_libsvm_p.resolve().relative_to(DATA_DIR.resolve())` |
+| 審閱標記 | `TestR031_LintContract_BroadExceptStillPresent` | `_compute_train_metrics` 仍含 `except Exception` 與分批呼叫（收窄 except 時更新） |
+
+**執行方式**（repo 根目錄）：
+
+```bash
+python -m ruff check tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py
+python -m pytest tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py -q -p no:langsmith --tb=short
+```
+
+**快速子集（不 `import trainer.trainer`；約 1s 內）** — 僅 **源碼／config 契約** 六則：
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py -q -p no:langsmith --tb=short \
+  -k "test_contract_source or test_length_mismatch_trim or test_train_single_rated_model_contains or test_config_train_metrics or test_train_libsvm_metrics_branch or test_compute_train_metrics_contains"
+```
+
+**說明**：**完整檔**首次執行會載入 **`trainer.training.trainer`**（LightGBM／sklearn），可能需 **數十秒至數分鐘**；與現有其他 `review_risks` 相同。未另加 **mypy** 規則（僅測試檔）；若需對 production 強制「不得 silent trim」等，須另開 production／插件政策（本次依指示僅測試）。
+
+---
+
+### Code Review：DEC-031 / T-DEC031 步驟 1–2（高可靠性標準）
+
+**Date**: 2026-03-22  
+**範圍**：`trainer/training/trainer.py` 之 `process_chunk`（Track LLM）、`trainer/features/features.py` 之 `compute_track_llm_features`（float32）、`tests/review_risks/test_review_risks_round350.py`、`tests/integration/test_features.py`。不重寫整套，僅列風險與可驗證補強。
+
+---
+
+#### 1. 「運算成功但候選欄缺失」仍屬靜默降級（正確性／與 DEC-031 意圖間隙）
+
+**問題**：`compute_track_llm_features` 若不拋錯但回傳 DataFrame **缺少** YAML 中宣告之部分 `feature_id`（SQL 別名錯誤、DuckDB 丟欄、實作變更等），`process_chunk` 仍會用 **`_bets_llm_feature_cols` 過濾後 merge**，等於 **帶著「缺一批 LLM 欄位」的 chunk 繼續跑**，與「失敗即中止、不產無效模型」的產品敘述仍有落差（與「merge OOM 拋錯」不同，此路徑不拋錯）。
+
+**具體修改建議**：在 merge 前對 **`feature_spec` 內非 derived 之候選 `feature_id` 清單**（或「預期必須出現在 result 之集合」）做 **硬斷言**：若 `result_df` 缺任一欄 → **`logger.error` + `raise ValueError`（或自訂 `TrackLlmContractError`）**；若僅想先觀測，可先用 **`STRICT_TRACK_LLM_COLUMNS` config** 預設 `True`，本機除錯可關閉。另可選：對 `candidates` 逐項檢查 `feature_id` 鍵存在於 spec。
+
+**希望新增的測試**：  
+- **整合／單元**：`patch` `compute_track_llm_features` 回傳「少一欄」之合法 DataFrame，呼叫 `process_chunk`（或抽一小段 helper）預期 **raise** 且 log 含契約違反訊息。  
+- **契約測試**：從 `features_candidates.yaml` 抽樣候選 id 集合，與「成功路徑 result columns」做子集檢查（可選 smoke）。
+
+---
+
+#### 2. float32 對大整數 COUNT／大數值聚合的精度與溢位（邊界／模型語意）
+
+**問題**：`astype(np.float32)` 對 **極大 `COUNT(*)`、大額 `SUM`（已 clip 仍很大）** 可能 **失去整數精確性**（> ~2^24 量級）或 **inf**（極端少見）。樹模型多仍可用，但與 **歷史以 float64 訓練之 artifact 可比性** 與 **極端尾部分裂點** 可能微變。
+
+**具體修改建議**：在 **DEC-031／spec 文件** 明文寫入「Track LLM 輸出預設 float32，超大計數特徵可能有舍入」；若產品要求 **COUNT 類必須整數精確**：對 `type==window` 且 expression 為純計數之候選 **排除於 float32 強制轉換**（維持 int64 或 float64），其餘仍 float32。或於 YAML 加 **`storage_dtype: float64`** 每欄覆寫。
+
+**希望新增的測試**：  
+- 建一個 **COUNT** 視窗特徵、人為放大列數或 count 值，斷言 **轉 float32 後與 float64 參考值** 在允許誤差內（或若政策為「count 不轉」則斷言 dtype 仍為 int64）。  
+- **迴歸**：現有 `TestComputeTrackLlmFeatures` 已覆蓋小表；可加 **單列極大 wager + SUM** 是否 `finite` 且 clip 後合理。
+
+---
+
+#### 3. DuckDB→pandas 之非標準數值 dtype（object／decimal）可能略過 float32 轉換（下游風險）
+
+**問題**：`pd.api.types.is_numeric_dtype(ser)` 對 **object 欄內含 Decimal、字串數字** 可能為 **False**，則 **不會 cast**，merge 後該「候選」欄仍可能以 object 進入後續 parquet／訓練，**LightGBM 或 screening 路徑** 才爆或靜默轉壞。
+
+**具體修改建議**：對每個候選 `fid`，若 **非** `is_numeric_dtype`，先 **`pd.to_numeric(ser, errors="coerce")`**（或僅對 `ftype in ("window","lag",...)` 強制），再 `astype(float32)`；若仍無法轉成有限浮點 → **raise** 並附欄名／dtype。若擔心誤殺合法 passthrough 字串欄，僅對 **非 passthrough** 候選套用強制轉換。
+
+**希望新增的測試**：  
+- 若可在測試內 **mock `con.execute(sql).df()`** 回傳一欄 `object` 型小數字串，斷言 pipeline 要嘛 **轉成 float32** 要嘛 **明確失敗**。  
+- 靜態／review：列一份「Track LLM 候選欄必須為有限 float」之 assert 清單。
+
+---
+
+#### 4. 契約測試僅依賴「字串不存在」（脆弱／與行為脫鉤）
+
+**問題**：`test_process_chunk_dec031_track_llm_exceptions_not_swallowed` 只斷言原始碼 **不含** `Track LLM full traceback` 等字串；若未來重構改成 **`except: ... raise` 仍記錄別的訊息**，或改在 **wrapper** 吞例外，測試可能仍綠但行為已錯。
+
+**具體修改建議**：保留現有靜態測試作 **快速 guard**，另增 **行為測試**：`unittest.mock.patch` 將 `compute_track_llm_features` 設為 **`side_effect=RuntimeError("boom")`**，以 **最小 dummy chunk**（或呼叫 `process_chunk` 所需之最少 kwargs／fixture）執行，預期 **例外穿透**、且 **不寫出 chunk parquet**（若可觀察 exit／return）。若 `process_chunk` 參數過重，可抽 **`_run_track_llm_in_process_chunk`** 小函式專測（需權衡重構範圍）。
+
+**希望新增的測試**：  
+- **`test_process_chunk_propagates_track_llm_runtime_error`**：mock 失敗，斷言 `pytest.raises` 或 `assertRaises` 與例外型別／訊息。  
+- （可選）**回歸**：確保 **成功路徑** mock 仍產出與現有一致之欄位。
+
+---
+
+#### 5. `pandas.merge` 峰值 RAM 仍可能 OOM（效能／與原痛點關係）
+
+**問題**：float32 約 **减半** 該側特徵矩陣記憶體；**`bets.merge(..., how="left")`** 在內部仍可能觸發 **consolidate／臨時 float64**（依 pandas 版本與欄位混合而定），**無法保證** 解決使用者先前觀察之 **8–9 GiB 單塊配置**。步驟 1 讓失敗 **可見**；步驟 2 **緩解但非證明消除**。
+
+**具體修改建議**：延續 T-DEC031 **步驟 3–6**（train 指標）與／或評估 **`merge` 改 dtype 對齊、分块 join、或先下採樣再合併**（需與訓練語意對齊）；在 `doc/training_oom_and_runtime_audit.md` 註明 **float32 為必要非充分條件**。
+
+**希望新增的測試**：  
+- **可選壓力／標記 `@pytest.mark.slow`**：合成 **百万列級** 左表 + 少欄右表，量測或斷言 **不觸發** 某已知 OOM 路徑（難在 CI 穩定跑，僅作本機 profile）。  
+- **較實際**：完成 LibSVM／分批 predict 後，在 STATUS 記一次 **full-window 本機跑通** 之觀測。
+
+---
+
+#### 6. Trainer 與 scorer／backtester 失敗語意不一致（運維／安全意識）
+
+**問題**：訓練 **hard fail**；**scorer** 仍可能 log error 後繼續；**backtester** 仍 **degrade + `track_llm_degraded`**。非程式 bug，但 **on-call** 可能誤以為「線上與訓練同樣嚴格」。與「安全性」關係為 **可用性／誤警報** 而非資安。
+
+**具體修改建議**：在 **DECISION_LOG／runbook** 加一小節 **「Trainer DEC-031 僅約束訓練 pipeline；scorer／backtester 行為見某檔」**；若產品要一致，另開 **P1** 為 scorer 加 **`STRICT_TRACK_LLM`**（預設與環境一致）。
+
+**希望新增的測試**：  
+- **文件契約測試**（pytest）：讀 `scorer.score_once`／`backtester.backtest` 原始碼，斷言仍含 `try` 或 `track_llm_degraded` 等 **與 trainer 差異之記錄**（防止無意中被改成 silent 一致而未更新文件）。或僅 **STATUS／SSOT 連結測試**。
+
+---
+
+#### 7. 成功日誌語意：`feature_spec` 非空但無候選時仍印「Track LLM computed」（可觀測性）
+
+**問題**：`track_llm.candidates` 為空時，`compute_track_llm_features` 早退；`process_chunk` 仍印 **「Track LLM computed」**，易讓日誌讀者以為 **有算 DuckDB 視窗特徵**。
+
+**具體修改建議**：分支 log：無候選時改 **`Track LLM skipped (no candidates in spec)`**（level info）；有候選且成功維持現行訊息。
+
+**希望新增的測試**：  
+- 靜態或輕量整合：對 `candidates=[]` 之 spec 呼叫路徑，斷言 log **不**含誤導句或 **含**新句（需 `caplog`）。
+
+---
+
+#### 8. 每欄 `astype` 的短暫記憶體尖峰（效能／次要）
+
+**問題**：每個候選欄 **`astype(float32)`** 可能產生 **暫時雙份** 該欄緩衝（舊陣列釋放前），在 **欄數多、列數極大** 時尖峰略增；通常遠小於 merge 尖峰。
+
+**具體修改建議**：一般 **可接受**；若剖析後仍尖峰：改為 **單次對多欄 `result_df[candidate_cols] = result_df[candidate_cols].astype(np.float32)`**（pandas 可能優化），或 **in-place** 對可寫入之 array。非當前必改。
+
+**希望新增的測試**：無需專測；若日後做 perf PR，附 **before/after RSS** 筆記於 STATUS 即可。
+
+---
+
+### Code Review → 已落地測試與執行方式（tests-only，2026-03-22）
+
+**檔案**：[`tests/review_risks/test_dec031_review_risks.py`](../../tests/review_risks/test_dec031_review_risks.py)
+
+**對照**（Review 原文 §8 明訂無需專測，故無對應測試案例）：
+
+| Review 條目 | 測試類別／方法 | 備註 |
+|-------------|----------------|------|
+| §1 靜默缺欄 merge | `TestDec031Risk01PartialLlmColumnsMerge` | 靜態：`process_chunk` 片段含 `fid in _bets_llm_result.columns`。 |
+| §2 float32 大整數精度 | `TestDec031Risk02Float32IntegerPrecision` | 最小可重現：`np.float32(16777217)==np.float32(16777216)`。 |
+| §3 object／非數值 dtype | `TestDec031Risk03ObjectDtypeSkippedByNumericGuard` | 靜態：`compute_track_llm_features` 含 `is_numeric_dtype` 與 `astype(np.float32)`；**未**在此檔 `import pandas`（部分環境首次 import 極慢）。若需行為層 mock DuckDB 回傳 object 欄，建議放在 `tests/integration/`。 |
+| §4 契約測試脆弱 | `TestDec031Risk04NoSwallowBetweenLlmAndLabels` | 靜態：`process_chunk` 自 `compute_track_llm_features` 指派起至 `# --- Labels` 前**不得**出現 `except`；與 `test_review_risks_round350` 字串否定測試互補。**行為測試**（mock `side_effect` 穿透）仍待後續若允許抽 helper 或動 production。 |
+| §5 merge 峰值／記憶體 | `TestDec031Risk05Float32HalvesStorageVsFloat64` | 理論守衛：float32／float64 `itemsize` 比值（非壓力測試）。 |
+| §6 trainer vs scorer／backtester | `TestDec031Risk06ScorerBacktesterDegradePaths` | 靜態：`score_once` 於 Track LLM 呼叫周邊含 `try`／`except Exception`；`backtest` 含 `_track_llm_degraded = True`。 |
+| §7 成功日誌語意 | `TestDec031Risk07LoggingWhenFeatureSpecNonNull` | 靜態：「Track LLM computed」出現在 merge 條件 `if` 之後（與「無候選仍印成功」風險對照）。 |
+| §7 延伸（早退可觀測性） | `TestDec031Risk08ComputeEarlyExitNoCandidates` | 靜態：`compute_track_llm_features` 仍含 `track_llm has no candidates` 之 warning 路徑。 |
+| §8 每欄 astype 尖峰 | （無） | Review 明訂無需專測。 |
+
+**執行方式**（於 repo 根目錄）：
+
+```bash
+# 較輕量（不依賴 pytest 外掛載入路徑）
+python -m unittest tests.review_risks.test_dec031_review_risks -v
+
+# 或使用 pytest（若 `collecting ...` 長時間停住，可嘗試停用 langsmith）
+python -m pytest tests/review_risks/test_dec031_review_risks.py -q -p no:langsmith
+```
+
+---
+
 ## Training metrics：`test_precision_at_recall_*` 之 production prior 調整（raw + prod_adjusted）
 
 **Date**: 2026-03-21

@@ -18,9 +18,11 @@ import unittest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 _BACKTESTER_PATH = _REPO_ROOT / "trainer" / "backtester.py"
+_THRESHOLD_SELECTION_PATH = _REPO_ROOT / "trainer" / "training" / "threshold_selection.py"
 
 _TRAINER_SRC = _TRAINER_PATH.read_text(encoding="utf-8")
 _BACKTESTER_SRC = _BACKTESTER_PATH.read_text(encoding="utf-8")
+_THRESHOLD_SELECTION_SRC = _THRESHOLD_SELECTION_PATH.read_text(encoding="utf-8")
 
 _TRAINER_TREE = ast.parse(_TRAINER_SRC)
 _BACKTESTER_TREE = ast.parse(_BACKTESTER_SRC)
@@ -58,8 +60,11 @@ def _func_names_defined(tree: ast.Module) -> set[str]:
 # ===================================================================
 
 class TestR68AlertCountVectorised(unittest.TestCase):
-    """R68: The minimum-alert guard in _train_one_model must not use a
-    per-threshold Python loop.  searchsorted (or equivalent) is expected."""
+    """R68: Alert-count guard must be vectorised (searchsorted), not a Python loop.
+
+    Implementation lives in ``threshold_selection.dec026_pr_alert_arrays``;
+    ``_train_one_model`` calls ``pick_threshold_dec026`` instead of inlining PR math.
+    """
 
     def setUp(self) -> None:
         self.src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "_train_one_model")
@@ -76,8 +81,9 @@ class TestR68AlertCountVectorised(unittest.TestCase):
         )
 
     def test_uses_searchsorted(self):
-        """searchsorted is the expected O(N log N) replacement."""
-        self.assertIn("searchsorted", self.src)
+        """searchsorted lives in shared threshold_selection; trainer wires pick_threshold_dec026."""
+        self.assertIn("searchsorted", _THRESHOLD_SELECTION_SRC)
+        self.assertIn("pick_threshold_dec026", self.src)
 
 
 # ===================================================================

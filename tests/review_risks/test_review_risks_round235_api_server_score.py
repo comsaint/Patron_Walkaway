@@ -31,8 +31,8 @@ if "trainer.api_server" not in sys.modules:
 
 import trainer.api_server as api_server  # noqa: E402
 
-# Reuse helpers from test_api_server for stub artifacts and payload shape
-from test_api_server import _make_stub_artifacts, _score_payload  # noqa: E402
+# Reuse helpers from integration test module (collect-safe package path).
+from tests.integration.test_api_server import _make_stub_artifacts, _score_payload  # noqa: E402
 
 
 def _one_row(features: list, **kw):

@@ -203,13 +203,25 @@ class TestT12_2Step2MetricsContract(unittest.TestCase):
         self.assertTrue(True)
 
     def test_run_pipeline_logs_step_durations_on_success(self):
-        """Contract: run_pipeline should log total_duration_sec + step7/8/9_duration_sec on success."""
+        """Contract: run_pipeline should log total_duration_sec + step1–10_duration_sec on success."""
         src = _run_pipeline_src()
         if "log_metrics_safe" not in src:
             self.skipTest("T12.2 Step 2 pending: run_pipeline does not call log_metrics_safe")
 
         constants = _collect_string_constants(src)
-        required = {"total_duration_sec", "step7_duration_sec", "step8_duration_sec", "step9_duration_sec"}
+        required = {
+            "total_duration_sec",
+            "step1_duration_sec",
+            "step2_duration_sec",
+            "step3_duration_sec",
+            "step4_duration_sec",
+            "step5_duration_sec",
+            "step6_duration_sec",
+            "step7_duration_sec",
+            "step8_duration_sec",
+            "step9_duration_sec",
+            "step10_duration_sec",
+        }
         missing = sorted(required - constants)
         if missing:
             self.fail(f"T12.2 Step 2 missing duration key contracts: {missing}")

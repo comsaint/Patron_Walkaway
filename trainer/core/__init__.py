@@ -1,5 +1,5 @@
-# trainer.core — 項目 2.1/2.2：config、db_conn、schema_io、duckdb_schema
-from trainer.core import config  # noqa: F401
-from trainer.core import db_conn  # noqa: F401
-from trainer.core import schema_io  # noqa: F401
-from trainer.core import duckdb_schema  # noqa: F401
+# trainer.core — keep package __init__ minimal.
+#
+# Do not eagerly import schema_io / duckdb_schema here: they pull pandas and
+# slow down `import trainer.core.db_conn` in cold subprocesses (pytest timeouts).
+# Use `from trainer.core import config` or `import trainer.core.db_conn` explicitly.

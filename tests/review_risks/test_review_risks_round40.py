@@ -69,10 +69,12 @@ class TestReviewRisksRound40(unittest.TestCase):
         self.assertIn("if bets.empty", src)
 
     def test_r65_train_threshold_selection_uses_precision_recall_curve(self):
-        """R65: threshold selection should use vectorized PR-curve scan."""
+        """R65: threshold selection uses shared PR-curve helper (vectorized scan inside it)."""
         src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "_train_one_model")
-        self.assertIn("precision_recall_curve", src)
+        self.assertIn("pick_threshold_dec026", src)
         self.assertNotIn("for t in thresholds", src)
+        ts_path = _REPO_ROOT / "trainer" / "training" / "threshold_selection.py"
+        self.assertIn("precision_recall_curve", ts_path.read_text(encoding="utf-8"))
 
     def test_r66_process_chunk_actually_uses_chunk_cache_key(self):
         """R66: TRN-07 cache key function should be invoked by process_chunk."""

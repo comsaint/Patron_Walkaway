@@ -153,6 +153,26 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
         self.assertIn("step7_duration_sec", data)
         self.assertEqual(data["step7_duration_sec"], 0.0)
 
+    def test_step1_and_step10_durations_written_when_provided(self):
+        """T-PipelineStepDurations: optional step1/step10 keys appear in JSON like step7."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td)
+            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+                trainer_mod._write_pipeline_diagnostics_json(
+                    model_version="mv",
+                    pipeline_started_at="2026-03-22T00:00:00+00:00",
+                    pipeline_finished_at="2026-03-22T01:00:00+00:00",
+                    total_duration_sec=100.0,
+                    step1_duration_sec=1.5,
+                    step10_duration_sec=2.5,
+                )
+            data = json.loads((model_dir / "pipeline_diagnostics.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["step1_duration_sec"], 1.5)
+        self.assertEqual(data["step10_duration_sec"], 2.5)
+        self.assertNotIn("step2_duration_sec", data)
+
     def test_non_serializable_value_becomes_string_via_default_str_documents_risk(self):
         """STATUS Code Review §2 MRE: default=str coerces unknown types — file stays valid JSON."""
 

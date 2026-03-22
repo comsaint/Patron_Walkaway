@@ -745,4 +745,112 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-031：特徵工程失敗即中止；數值 float32；train 指標避免全量稠密 predict
+
+**日期**：2026-03-22  
+**SSOT 章節**：§8.2（特徵工程）、§4.3（管線穩定性／記憶體）  
+**關聯**：DEC-022（三軌）、DEC-023（DuckDB）、Plan B+ LibSVM 路徑  
+**執行計畫**：[PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md) 一節 **T-DEC031**
+
+**背景（合併兩項問題）**：
+
+1. **Silent failure**：部分 chunk 在 Track LLM 結果 `merge` 回 `bets` 時 OOM，外層 `try/except` 吞掉後管線繼續，導致**同一模型在不同月份缺 LLM 欄位**，產出與 Feature Spec 不一致，卻仍耗時完成訓練。  
+2. **Train 指標 OOM**：Plan B+ 訓練雖可走 LibSVM，但 `_compute_train_metrics` 曾對整份 in-memory `X_train` 呼叫 `predict_proba`，觸發**稠密 float64 矩陣**（例如 50 × 3.9e7）配置失敗。與此相關，`merge`／pandas consolidate 亦常因 **float64** 放大單塊配置。
+
+**決策**：
+
+1. **Fail-fast（目前無可選軌道）**  
+   Track Profile / Track LLM / Track Human 在 chunk 級特徵工程中**任一失敗即中止整條 pipeline**（不再僅 log 後繼續）。未來若引入可選軌道，再以顯式設定（`required` / `optional_tracks`）縮小範圍。
+
+2. **數值預設 float32**  
+   Track LLM（DuckDB 產出）、合併回主表之浮點特徵、以及進入 LightGBM 前可統一之數值欄，**預設 float32**（SQL `CAST`／pandas `astype`／Arrow），以降低峰值 RAM；更低精度（float16 等）另案評估。
+
+3. **Train 指標：檔案推論優先 + 分批 fallback**  
+   - 當 **Plan B+** 且存在 **`train_for_lgb.libsvm`**、路徑在 **`DATA_DIR` 下**、模型為 **Booster**：train 指標改為 **`_labels_from_libsvm(train_path)`** + **`booster.predict(str(train_path))`**（與 valid／test 檔案推論同一契約），避免在 Python 配置全訓練集稠密矩陣。  
+   - **其餘路徑**（無 LibSVM、或檔案 predict 失敗回退）：`_compute_train_metrics` 內對 `X_train` **按列分批**，每批 **`to_numpy(dtype=float32)`** 後 **`booster.predict`**，批次大小由 **`TRAIN_METRICS_PREDICT_BATCH_ROWS`**（預設例如 `500_000`）控制。  
+   - 無 `booster_` 的估計器維持既有 `predict_proba`（僅小資料或測試 mock）。
+
+**實作計畫（checklist）**：
+
+| 區域 | 工作 |
+|------|------|
+| `process_chunk` | 移除特徵工程「吞例外」；錯誤向上傳播或 log 後 **`raise`**。 |
+| `features.py`／Track LLM SQL | 浮點產出統一 float32；merge 前避免被動升回 float64。 |
+| Profile／Human | 盤點進模組型別，與缺失值策略相容下維持 float32。 |
+| `train_single_rated_model` | `use_from_libsvm` 且路徑合法時，train 指標走 **LibSVM + 共用 scores→metrics 函式**；否則走 **`_compute_train_metrics`（分批）**。 |
+| `trainer.py` | 新增 **`_batched_booster_predict_scores`**、**`_train_metrics_dict_from_y_scores`**；重構 `_compute_train_metrics` 使用分批 + 共用 dict。 |
+| `trainer/core/config.py` | 新增 **`TRAIN_METRICS_PREDICT_BATCH_ROWS`**；`trainer.py` config 匯入兩路（package／legacy `config`）。 |
+| 測試 | 特徵步驟失敗 → 非零 exit；可選：小表 dtype／train 指標分批或 mock LibSVM 路徑。 |
+| 文件 | `doc/training_oom_and_runtime_audit.md` 或 PLAN 一句話引用 **DEC-031**。 |
+
+**非本次必達／後續**：
+
+- Step 9 前 **`pd.read_parquet` 全 train** 仍佔大量 RAM——與「train 指標 predict」分開；若要再降峰值需另議（例如延後載入 train 或僅 export 後不保留 `train_df`）。  
+- 若需本機實驗「壞 chunk 略過」，未來可加 **`STRICT_FEATURE_ENGINEERING=False`**；**預設 strict**。
+
+**回退**：還原 `try/except`、還原 train 指標單次 `predict_proba`、還原 float64（不建議於 full-window 本機跑）。
+
+---
+
+## DEC-032：線上閾值校準（prediction_log 標註）、runtime 閾值覆寫與 train／backtest 約束一致化
+
+**日期**：2026-03-22  
+**關聯**：DEC-026（Precision at recall=0.01）、DEC-027（`THRESHOLD_MIN_*` 命名與 config SSOT）、DEC-030（validator 與訓練標籤 bet-only 對齊）  
+**執行計畫**：[PLAN_phase2_p0_p1.md](PLAN_phase2_p0_p1.md) 一節 **T-OnlineCalibration**
+
+**背景**：
+
+- 訓練時在 validation 上以 DEC-026 規則選阈（recall ≥ `THRESHOLD_MIN_RECALL`、min alert 筆數、可選 min alerts/hour）；線上僅使用 artifact 固定閾值時，分佈偏移會使實際 recall 偏離目標。
+- `prediction_log`（Phase 2）已記錄每次 scorer 之 rated 預測；validator 僅對 **alerts** 做 MATCH/MISS，無法單獨還原「全量 PR 曲線」所需之負樣本標註。
+- 需一條**低頻**、與 scorer／validator **並行**的管線：為預測補 ground truth、報表、並可選更新線上有效閾值。
+
+**決策**：
+
+1. **新腳本（不取代 validator）**  
+   - **不**做推論（推論僅 `trainer/serving/scorer.py`）。  
+   - 以 **ClickHouse** 為資料來源（與 validator 同源）；**標籤語意以訓練定義為準**（與 `compute_labels`／chunk 標籤管線一致，延續 DEC-030 之 bet-only 精神）。實作應**重用或對齊**訓練標籤邏輯，而非僅複製 validator 產出當唯一真理。  
+   - **頻率**顯著低於 scorer（例如每 30 分鐘）；具體間隔與樣本下限可 config。
+
+2. **Ground truth 儲存（`prediction_log.db`，方案 A）**  
+   - 新增表（名稱可定稿，例如 **`prediction_ground_truth`**）：**一 `bet_id` 一筆**；欄位含 `label`（0/1）、`status`（**太新未成熟 → `pending`**）、`labeled_at`；可選 `prediction_id` 利於 join。  
+   - **`pending` 不納入本輪校準**。遲到資料可能導致日後更正——現階段接受，不強制版本鏈；仍建議保留 `labeled_at` 以利稽核。
+
+3. **可選稽核**：表 **`calibration_runs`**（每輪建議阈、是否寫入 state、skip 原因、窗長與樣本數摘要等）。
+
+4. **Runtime 閾值覆寫（state DB，與 `alerts` 同庫）**  
+   - 新增表（例如 **`runtime_rated_threshold`**）存放當前建議／生效之 `rated_threshold` 與 metadata。  
+   - **Scorer 讀取順序**：有效且（可選）未過期之 runtime 列 → 否則 fallback **artifact `rated.threshold`**。  
+   - **`prediction_log.db` 不作** scorer 讀取閾值來源（日誌與執行期參數分離）。  
+   - 可選 config：**`RUNTIME_THRESHOLD_MAX_AGE_HOURS`**，避免校準 job 長停後長期沿用舊阈。
+
+5. **選阈與約束 — 全專案單一 config 來源**  
+   - **`trainer/core/config.py`**：`THRESHOLD_MIN_RECALL`、`THRESHOLD_MIN_ALERT_COUNT`、`THRESHOLD_MIN_ALERTS_PER_HOUR`。  
+   - 若 **`THRESHOLD_MIN_ALERTS_PER_HOUR is None`**：trainer、backtest、線上校準**一律不**套用每小時密度檢查（僅 recall + min alert count）。  
+   - **線上校準與 backtest** 對 **每小時告警**之口徑：**整段校準／評估窗一個 `window_hours`**，要求 `n_alerts_at_threshold / window_hours >= THRESHOLD_MIN_ALERTS_PER_HOUR`（當該常數非 `None`）。`window_hours` 由本輪納入校準之成熟列之時間跨度（如 `scored_at` max−min）導出，並設下限避免除零。  
+   - **不**在本階段要求逐小時桶或逐 gaming_day 強制通過。
+
+6. **共用實作**  
+   - 抽出 **`select_threshold_dec026(scores, labels, window_hours=None)`**（名稱可定稿）：trainer、backtester、校準腳本共用。validation 路徑傳 **`window_hours=None`** 時僅套用 min alert **筆數** + recall；有 `window_hours` 時另套用 **`THRESHOLD_MIN_ALERTS_PER_HOUR`**。  
+   - **Backtest**：`compute_micro_metrics` 之 PR oracle（`test_precision_at_recall_*` / `threshold_at_recall_*`）須與上述 **同一 `valid_mask`**（現況 oracle 僅 `pr_rec >= r`，**待程式對齊**）。
+
+7. **與 validator 的關係**  
+   - Scorer、validator、校準腳本**並行**監控；validator **不**被本腳本取代。  
+   - 因遲到資料與快照差異，**validator 結果不強求與校準 label 逐筆一致**；營運驗證仍以 validator 為準，離線 metric／選阈語意以訓練標籤為準。
+
+**考慮過的替代方案**：
+
+- **僅用 validator 對 alerts 標註推全 PR**：負樣本不完整，無法還原與訓練一致之 operating point 搜尋。  
+- **把 runtime 阈寫在 `prediction_log.db`**：與高頻日誌同庫、語意混淆；scorer 已分離 state／prediction log，維持分離較清晰。  
+- **未校準之未標記資料強行當負例**：會扭曲 recall／precision，拒絕採用。
+
+**理由**：
+
+- 單一 config 與單一選阈函式可降低「訓練說一套、backtest／線上另一套」之混淆。  
+- 成熟門檻 + `pending` 避免在 label 未結算時誤校準。  
+- State DB 覆寫使線上可漸進適應分佈偏移，且 failure 時可 fallback bundle。
+
+**實作**：見 **T-OnlineCalibration**（新腳本路徑、測試、Rollback、DoD 已列於該節）。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

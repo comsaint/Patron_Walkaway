@@ -54,6 +54,7 @@ flowchart LR
   p12 --> p15[P1.4Evidently]
   p15 --> p16[P1.5Skew]
   p12 --> p17[P1.6DriftTemplate]
+  p11 --> p18[T-OnlineCalibration]
 ```
 
 ---
@@ -62,12 +63,75 @@ flowchart LR
 
 **Current status**（更新於 2026-03-22）：**T0**–**T11** 已完成。**T12** 已完成（含 Step 1、Step 2、optional follow-on、Code Review §1）；failure-params 長字串截斷已實作，對應 review 測試之過時 **`xfail` 已移除**（見 STATUS.md）。**`log_metrics_safe(..., step=...)`**：production 已對不支援 `step=` 之舊 MLflow client 做 **TypeError 降級**（僅 warning 型別名、不洩 metrics）；**backtester** ImportError stub 已 **`**_kwargs`**；**doc §9.1** 已載明 caller 對 **`step` 單調非遞減** 之責任；**`tests/review_risks/test_review_risks_mlflow_log_metrics_step_review_2026_03_22.py`** 與相關測試全綠、無殘留 XPASS。**Credential folder consolidation** Step 1–2 已實作（config 自 credential/.env 載入、mlflow_utils 自 credential/mlflow.env 優先、.gitignore 與範本）；Code Review §1（config load_dotenv try/except）、§2（mlflow 例外 log 不洩路徑）已修補，五則 credential_review 測試全過。**Scorer Track Human lookback parity**：scorer 已傳入 `lookback_hours=SCORER_LOOKBACK_HOURS`；Code Review §1（scorer config 改為 `from trainer.core import config`）已修補；5 則契約／邊界測試就位；見 STATUS.md。**R3505 cutoff_time 正規化**：Code Review §1–§4 已修補；見 STATUS.md § Round — R3505 正規化 Production 修補。**T13 MLflow cold-start mitigation**：Step 1–2（重試＋退避、warm-up）與 Code Review #1/#3/#4 修補已完成，見 STATUS.md § T13 Code Review 修補 production。
 
-**Remaining items**（依執行順序）：
-- **Credential folder**：Migration（既有 local_state/mlflow.env、repo/.env 搬至 credential/ 並拆分）、可選 deploy 路徑（main.py 改讀 credential/.env）、可選 .gitignore 改為忽略整個 credential/ 再 negate examples）。
-- **DB path consolidation（新增）**：統一 runtime DB 目錄（`STATE_DB_PATH`、`PREDICTION_LOG_DB_PATH` 指向同一 `local_state/`），避免 state 與 prediction log 分散在 `trainer/local_state` 與 `local_state` 造成維運與調查口徑混淆。
-- **T-TrainingMetricsSchema**：`training_metrics.json` 根層與 `rated` 巢狀對齊、調查 baseline 讀取修正；見下節 **T-TrainingMetricsSchema**。
-- **Scorer lookback（可選）**：Code Review §2 — `SCORER_LOOKBACK_HOURS` 非數值或 ≤ 0 時於 scorer 加 fallback（log warning + 用 8）；若實作須同步調整邊界測試預期。
-- 其餘 Phase 2 P0–P1 無強制待辦；若要進一步降低風險，可再針對 Code Review §2–§5 的「效能/語義」項（例如 OOM pre-check I/O 成本與 RSS peak 真實最大值語義）做後續優化。
+**Remaining items**（依執行順序；**2026-03-22 對照程式庫修訂**）：
+- **Credential folder**：**程式已完成**（`trainer/core/config.py` 優先 `load_dotenv(credential/.env)`；`credential/.env.example`、`credential/mlflow.env.example` 已存在）。**仍待**僅為 **營運遷移**（使用者把既有 `local_state/mlflow.env`／repo 根 `.env` 搬入 `credential/`）、可選 deploy 啟動路徑、可選 `.gitignore` 策略微調。
+- **DB path consolidation**：**預設已對齊** — `STATE_DB_PATH` 預設 **`<repo>/local_state/state.db`**（`trainer/serving/scorer.py`、`status_server.py`、`serving/api_server.py`、`validator.py` 等）；`PREDICTION_LOG_DB_PATH` 預設 **`<repo>/local_state/prediction_log.db`**（`trainer/core/config.py`）。**仍待**：**過時註解**（例如 `trainer/scripts/view_alerts.py` 仍寫 `trainer/local_state`）、以及 **已部署環境**若曾設分散路徑之遷移／runbook。
+- ~~**T-DEC031（程式步驟 1–6）**~~：**✅ 已完成（2026-03-22）** — 見 [STATUS.md](STATUS.md)。**步驟 7**：已有 **[doc/training_oom_and_runtime_audit.md](../../doc/training_oom_and_runtime_audit.md)**（OOM／步驟風險總表）；**仍待**於該 doc 或 STATUS **補一句 DEC-031／train 指標分批與 LibSVM 檔**之交叉引用。**full-window／Step 9 人工驗收**仍列人工。
+- **T-TrainingMetricsSchema**：**⏳ 未完成** — `save_artifact_bundle` 仍 **`{**combined_metrics, ...}`**（指標多在 **`rated` 巢狀**）。**讀取端** [`run_r1_r6_analysis.py`](../../investigations/test_vs_production/checks/run_r1_r6_analysis.py) `_load_training_metrics_baseline` 已取 **`rated.threshold`**，但 **`test_precision_at_recall_*`／`threshold_at_recall_*`／`test_threshold_uncalibrated` 仍只查 JSON 頂層**（§根因 2 所述問題**仍大部存在**）。**仍待**：讀取端完整 **fallback `rated`** 或 **A1 根層白名單複寫**（見下節）。
+- ~~**T-PipelineStepDurations**~~：**✅ Done（2026-03-22）** — 見 `STATUS.md`。
+- **Scorer lookback（可選）**：`config.SCORER_LOOKBACK_HOURS` 仍為 **固定 int**；**仍待**（可選）非法 env／≤0 時 scorer **fallback 8**（見原 Code Review §2）。
+- ~~**測試收集（round235／242）**~~：**✅ 2026-03-22** — 兩檔已改 `from tests.integration.test_api_server import ...`；全量 pytest 不需 `--ignore`（見 [STATUS.md](STATUS.md)「round235／242」）。
+- **T-OnlineCalibration**（prediction_log 標註、runtime 閾值、backtest oracle 與 trainer 約束一致化）：**⏳ In progress（2026-03-22）** — 選阈共用模組與 backtester oracle（rated-only、單次 PR）已落地；runtime／校準／scorer 覆寫仍待。見下方專節與 [STATUS.md](STATUS.md)「DEC-032／T-OnlineCalibration」。
+- 其餘 Phase 2 P0–P1 無強制待辦；可選 Code Review §2–§5 效能／語義後續優化。
+
+---
+
+### T-OnlineCalibration — `prediction_log` 標註、線上閾值校準與 train/backtest/serve 約束一致化 — ⏳ In progress（2026-03-22）
+
+- **Depends on**: T4（`prediction_log` 寫入路徑已存在）；建議與 **DB path consolidation**（state / prediction_log 同 `local_state/`）一併部署。
+- **進度（2026-03-22）**：`threshold_selection` 含 **`dec026_pr_alert_arrays`**（單次 sklearn PR + **`searchsorted`** 算 alert 數）、**`dec026_sanitize_per_hour_params`**、**`pick_threshold_dec026_from_pr_arrays`**、非嚴格二元標籤／NaN → **fallback**（不丟 multiclass）、**`min_alert_count` ≥1**、**`select_threshold_dec026`** 別名；**trainer** 驗證選阈；**backtester** `compute_micro_metrics` 之 PR oracle **僅 `is_rated==True`** 且 **四 recall 共用一條 PR 曲線**（見 [STATUS.md](STATUS.md)「DEC-032／T-OnlineCalibration」）。**尚未**：state runtime 閾值、校準腳本、`prediction_ground_truth` 表、scorer 讀覆寫、（可選）test 集 PR 報告路徑接 **`pick_threshold_dec026`**。
+- **Goal**:
+  1. **訓練 / backtest / 線上校準**共用 **`trainer/core/config.py`** 之 **`THRESHOLD_MIN_RECALL`**、**`THRESHOLD_MIN_ALERT_COUNT`**、**`THRESHOLD_MIN_ALERTS_PER_HOUR`**（後者為 **`None` 時全線關閉 per-hour 檢查**）。
+  2. **線上校準腳本**（低頻，例如每 30 分鐘）：**不預測**（預測僅 [trainer/serving/scorer.py](../../trainer/serving/scorer.py)）；自 ClickHouse 取資料，對 `prediction_log` 對應之 **`bet_id` 寫入一筆 ground truth**（**語意 = 訓練標籤定義**，與 [trainer/serving/validator.py](../../trainer/serving/validator.py) 之 MATCH/MISS **不強求逐筆一致**）。**太新、標籤未成熟** → 狀態 **`pending`**，**不納入本輪校準**。
+  3. **校準子集**上計算 **`window_hours`**（成熟列之 `scored_at` 的 max−min，小時；設下限避免除零），並以 **整段校準窗單一門檻** 檢查 **`n_alerts_at_threshold / window_hours >= THRESHOLD_MIN_ALERTS_PER_HOUR`**（當該常數非 `None`）。
+  4. **選阈規則**與 DEC-026 一致：在 **`valid_mask`**（recall ≥ `THRESHOLD_MIN_RECALL`、min alert count、可選 min alerts/hour）上 **argmax precision**。
+  5. **Backtest**：`compute_micro_metrics` 之 PR oracle 已套用 **與 trainer 相同之 `valid_mask`**（recall floor、min alert count、可選 alerts/hour），且 **僅 rated 列** 參與 PR（2026-03-22）。
+  6. **Scorer**：自 **state DB**（與 `alerts` 同庫）讀 **runtime 閾值覆寫**；無效／缺失／可選過期則 fallback **artifact `rated.threshold`**。`prediction_log.db` **不作** scorer 讀取閾值來源。
+- **Non-goals（本階段）**: 逐小時桶強制通過；逐 gaming_day 強制；`bet_id` label 版本鏈（可接受遲到資料日後更正；表內建議仍保留 **`labeled_at`**）。
+
+#### Schema（`prediction_log.db`）
+
+- 新表（方案 A，名稱可定稿）：**`prediction_ground_truth`**  
+  - 至少：`bet_id`（UNIQUE，一 bet 一筆）、`label`（0/1）、`status`（`pending` / `labeled` 或同等）、`labeled_at`；可選 `prediction_id` 利於 join。
+- 可選稽核表：**`calibration_runs`** — `run_at`、`window_start`/`window_end`、`window_hours`、`n_rows_used`、`n_pos`、`suggested_threshold`、`applied_to_state`、`skipped_reason`、JSON 摘要等。
+
+#### Schema（state DB）
+
+- 新表（名稱可定稿）：**`runtime_rated_threshold`**（或 key-value 等價）  
+  - `rated_threshold`、`updated_at`、`source`、`n_mature`、`n_pos`、`window_hours`；可選 `recall_at_threshold`、`precision_at_threshold` 供監控。
+- **Config（建議新增）**：例如 **`RUNTIME_THRESHOLD_MAX_AGE_HOURS`** — 覆寫超過此年齡則 scorer fallback bundle（避免校準 job 長停後沿用舊阈）。
+
+#### 新腳本（建議路徑）
+
+- `trainer/scripts/calibrate_threshold_from_prediction_log.py`（或同等命名）  
+  - 讀 `PREDICTION_LOG_DB_PATH`、CH、config。  
+  - 每輪：掃需標註列 → 成熟與否 → 寫/更新 `prediction_ground_truth` → 匯總校準子集 → 樣本不足則 skip 並寫 `calibration_runs` → 否則 PR 掃描 + `valid_mask` → 條件滿足則 **UPSERT state `runtime_rated_threshold`**。
+
+#### 共用程式（強烈建議）
+
+- 抽出 **`select_threshold_dec026(scores, labels, window_hours=None)`**（純函式）：trainer、backtester、校準腳本共用。  
+  - **`window_hours is None`**（例如 validation）：僅 **`THRESHOLD_MIN_ALERT_COUNT` + recall**；**有值**時另套用 **`THRESHOLD_MIN_ALERTS_PER_HOUR`**（與線上／backtest 一致）。
+
+#### 與 validator 分工
+
+- **並行監控**：scorer 寫 log、validator 驗 alerts、校準腳本標全量 + 更新阈。  
+- **資料來源**：CH 與 validator 同源；**標籤語意以訓練為準**（實作應重用或對齊 **`compute_labels`** 所在管線，避免僅複製 validator 判決當 ground truth）。
+
+#### 測試與驗證
+
+- 單元：`select_threshold_dec026` 合成資料 — recall、min count、alerts/hour、`None` per-hour。  
+- 整合：temp `prediction_log` + mock CH → 腳本一輪 → state DB 預期閾值。  
+- 契約：scorer 在存在有效 runtime 列時使用覆寫閾值。
+
+#### Rollback
+
+- 停校準排程；清空或忽略 `runtime_rated_threshold` 列；scorer 回到僅 bundle。  
+- 保留 `prediction_ground_truth` 歷史不刪，利於事後分析。
+
+#### Definition of done
+
+- config 單一來源；backtest oracle 與 trainer／線上選阈 **同一套約束**。  
+- 校準腳本可排程運行；scorer 可讀 state 覆寫；文件註明 validator 與校準 label **不需逐筆一致**。
 
 ---
 
@@ -520,9 +584,10 @@ flowchart LR
   - 所有運維／調查腳本可在不指定 path 的情況下讀到正確 DB。
   - 路徑與備份策略文件化（runbook/STATUS）。
 
-### T-TrainingMetricsSchema — `training_metrics.json` 結構與讀取對齊（P0 維運／調查）— ⏳ Planned
+### T-TrainingMetricsSchema — `training_metrics.json` 結構與讀取對齊（P0 維運／調查）— ⏳ Planned（讀取端部分進度）
 
 - **Depends on**: 無強制相依（與 P0.1 trainer 寫 artifact、調查腳本可並行），但建議在 **一次訓練 smoke** 後驗證。
+- **進度（2026-03-22 對照程式）**：[`run_r1_r6_analysis.py`](../../investigations/test_vs_production/checks/run_r1_r6_analysis.py) `_load_training_metrics_baseline` 已從 **`rated`** 取出 **`rated_threshold`**；**尚未**對 `test_precision_at_recall_0.01`、`threshold_at_recall_0.01`、`test_threshold_uncalibrated` 等做 **頂層優先／`rated` fallback**。**寫檔**（A1 根層 denormalize）**未**實作。
 - **Goal**: 讓 **`training_metrics.json` 的「可查詢形狀」與下游直覺一致**，避免把「數值其實在巢狀 `rated` 內」誤判成 **null／缺欄**；並明確區分 **結構問題** 與 **評估邏輯上合法的 JSON null**。
 
 #### 問題陳述（觀察到的現象）
@@ -593,6 +658,117 @@ flowchart LR
 - **不要把「PR／test guard 造成的合法 `null`」當成同一個 bug 修掉**；否則會掩蓋「test 其實不可用」的訊號。
 - **A1 根層複寫**前務必 **grep `metrics` 內所有鍵名**，避免與 `model_version`、`spec_hash`、`uncalibrated_threshold` 等衝突；若有衝突，可改為 **`rated_` 前綴** 或只複寫白名單鍵（較安全）。
 
+### T-PipelineStepDurations — 全步驟耗時寫入 `pipeline_diagnostics.json` / MLflow — ✅ Done（2026-03-22）
+
+- **Depends on**: T2、T12（`run_pipeline` 已成功路徑寫入 diagnostics／metrics 之既有接線）；無新依賴。
+- **Goal**: 訓練 pipeline **Step 1–10** 的牆鐘耗時（秒）在成功完成時，一併出現在 **`MODEL_DIR/pipeline_diagnostics.json`** 與 **MLflow `log_metrics_safe`**。現況 Step 7–9 已記錄；本任務補齊 **Step 1–6、10**（鍵名：`step1_duration_sec` … `step10_duration_sec`）。
+
+#### 現況（對齊程式）
+
+- [trainer/training/trainer.py](trainer/training/trainer.py) 內 `run_pipeline` 已對 Step 1–10 使用 `time.perf_counter()` 並 `print` 耗時；**Step 1–10** 賦值至 `stepN_duration_sec`，由 `_write_pipeline_diagnostics_json` 與成功路徑 **MLflow** 寫出。
+- **Code Review #1（2026-03-22）**：成功路徑先 `mlflow_metrics.update(_rated)`，再以第二個 **`mlflow_metrics.update({...})`** 覆寫 `total_duration_sec`、`step1`–`step10`、`step7_rss_*`、`step7_sys_*`、`oom_precheck_step7_rss_error_ratio`，避免 `combined_metrics["rated"]` 鍵名碰撞時覆寫牆鐘／記憶體指標（與 `pipeline_diagnostics.json` 不一致）。
+- `log_metrics_safe`（[trainer/core/mlflow_utils.py](trainer/core/mlflow_utils.py)）對 **`value is None` 會略過該鍵**，與 Step 8 跳過 screening 時 `step8_duration_sec` 可能為 `None` 相容。
+- `_write_pipeline_diagnostics_json` 以 **`{k: v for ... if v is not None}`** 省略空鍵。
+
+#### 實作步驟（檔案級）
+
+1. **`run_pipeline` 變數**  
+   在既有 `step7_duration_sec` … `step9_duration_sec` 旁宣告 `step1_duration_sec` … `step6_duration_sec`、`step10_duration_sec`，型別 **`Optional[float] = None`**。
+
+2. **每步賦值（沿用現有 `t0`／`_el` 邊界）**  
+   - **Step 1**：在 `get_monthly_chunks` 完成後的 `_el` 處設 `step1_duration_sec = _el`。  
+     - **語意提醒**：目前計時**僅**涵蓋 `get_monthly_chunks`；`--recent-chunks` 裁剪與 OOM pre-check **不在**此段內。若產品要求「整段都算 Step 1」，需另行拉大 `t0`…`t0` 範圍（本計畫預設維持與現有 print 一致）。  
+   - **Step 2**：`get_train_valid_test_split` 之 `_el` → `step2_duration_sec`。  
+   - **Step 3**：canonical mapping 區塊結尾 `_el` → `step3_duration_sec`。  
+   - **Step 4**：`ensure_player_profile_ready` 區塊 `_el` → `step4_duration_sec`。  
+   - **Step 5**：`load_player_profile` 各成功分支之 `_el` → `step5_duration_sec`（有資料／not available 兩分支皆須賦值）。  
+   - **Step 6**：在整段 chunk 處理（含 OOM probe）之**最後** `_el = time.perf_counter() - t0` 後 → `step6_duration_sec`（與現有「Process chunks done」print 一致）。  
+   - **Step 10**：`save_artifact_bundle` 後之 `_el` → `step10_duration_sec`。  
+   - Step 7–9：維持現狀。
+
+3. **`_write_pipeline_diagnostics_json`**（同檔案）  
+   - 函式參數與 `payload` 新增 `step1_duration_sec` … `step6_duration_sec`、`step10_duration_sec`（建議鍵名排序 `step1`…`step10` 以利閱讀）。  
+   - 成功路徑呼叫處傳入對應變數。
+
+4. **MLflow**  
+   成功路徑 `mlflow_metrics` 字典加入 `step1_duration_sec` … `step6_duration_sec`、`step10_duration_sec`（與 7–9 並列）。無需手動過濾 `None`。
+
+5. **註解／文件（可選）**  
+   將 `run_pipeline` 內「T12.2 … Step 7-9」類註解改為涵蓋全步驟；[doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md](doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md) 若仍只列 7–9，補列 1–6、10。
+
+#### 測試與契約
+
+- 更新 [tests/review_risks/test_review_risks_phase2_mlflow_trainer.py](tests/review_risks/test_review_risks_phase2_mlflow_trainer.py)（或同等契約測試）：若要求「成功 run 必帶齊 step1–10」，將 `step1`…`step6`、`step10` 納入 required；**Step 8 跳過時** `step8_duration_sec` 仍可能為 `None` — 若 MLflow 契約改為「鍵必存在」，需在 skip 分支明確寫入 `0.0` 或放寬契約為「非 None 才要求出現在 sanitized metrics」（需與產品一致）。
+- 更新 [tests/unit/test_pipeline_diagnostics_build_and_bundle.py](tests/unit/test_pipeline_diagnostics_build_and_bundle.py) 等：payload 鍵集合／writer 單元測試涵蓋 `step1`…`step10`（含 `0.0` 與 `None` 省略對照，比照既有 step7 慣例）。
+
+#### 解讀注意
+
+- **`total_duration_sec` 通常 ≠ Σ stepN_duration_sec**：步驟之間尚有邏輯與 I/O 間隙。  
+- 失敗路徑若未寫入 diagnostics，維持現狀；若日後要在 **FAILED run** 附帶「已完成步驟耗時」，屬 T12 follow-on，非本任務必要條件。
+
+#### Rollback
+
+- 移除新增參數／payload 鍵／`mlflow_metrics` 鍵與各 `stepN_duration_sec = _el` 賦值即可。
+
+#### Definition of done
+
+- 成功跑完 `run_pipeline` 後，`pipeline_diagnostics.json` 在資料可得時含 **`step1_duration_sec` … `step10_duration_sec`**（`None` 步驟不出現在 JSON）；MLflow run 之 metrics 含相同鍵（`None` 由 `log_metrics_safe` 略過）。  
+- 相關 pytest 更新並通過。
+
+### T-DEC031 — 訓練管線：特徵 fail-fast、float32、train 指標 LibSVM／分批 predict — ⏳ 程式完成／驗收與文件待續
+
+- **進度（2026-03-22）**：**步驟 1–6 已實作並通過 ruff／mypy／pytest（見 STATUS）**（含 `TRAIN_METRICS_PREDICT_BATCH_ROWS`、分批 predict、LibSVM train 指標、**`_train_metrics_dict_from_y_scores` 之 AP 對 sklearn 二元標籤相容**）。**步驟 7**：**[doc/training_oom_and_runtime_audit.md](../../doc/training_oom_and_runtime_audit.md)** 已涵蓋訓練 OOM／步驟風險；**仍待**補 **DEC-031／train 指標分批與 LibSVM** 之**短交叉引用**（一句話級）。**full-window 實跑驗收**仍人工。
+- **Depends on**：無強制相依（與 Phase 2 MLflow／prediction log 正交）；建議與 **DEC-031**（[DECISION_LOG.md](DECISION_LOG.md)）同步實作與驗收。
+- **Goal**：(1) 避免特徵工程靜默失敗產出無效模型；(2) 降低大表 merge／指標計算之峰值 RAM；(3) 消除全訓練集單次 `predict_proba` 之稠密 float64 OOM。
+
+#### 背景
+
+- Chunk 級 Track LLM `merge` OOM 被 catch 後管線繼續 → 部分月份缺 LLM 欄位。  
+- Plan B+ 已寫出 `train_for_lgb.libsvm`，但 train 指標仍對 in-memory `X_train` 一次性預測 → numpy 配置數 GB～十餘 GB 失敗。
+
+#### 實作步驟（檔案級）
+
+1. **`trainer/training/trainer.py` — `process_chunk`**  
+   - 移除／縮小 Track LLM（及其他軌）外層吞例外；**失敗即中止**（或 log context 後 `raise`）。  
+   - Human／Profile 路徑不得靜默略過關鍵錯誤。
+
+2. **`trainer/features/features.py` 與 Track LLM DuckDB 產出**  
+   - 浮點特徵統一 **float32**（SQL `CAST`／回傳 DataFrame `astype`）；`merge` 前避免升回 float64。
+
+3. **`trainer/core/config.py`**  
+   - 新增 **`TRAIN_METRICS_PREDICT_BATCH_ROWS`**（預設例如 `500_000`）。  
+   - `trainer.py` 兩路 config import 皆需讀取該常數。
+
+4. **`trainer.py` — 共用輔助函式**  
+   - **`_batched_booster_predict_scores(booster, X_train, batch_rows)`**：按列分批、`to_numpy(dtype=float32)`、`booster.predict`、`concat`。  
+   - **`_train_metrics_dict_from_y_scores(y, scores, threshold, ...)`**：與現有 `_compute_train_metrics` 之 AP／P／R／F1 邏輯一致，供 LibSVM 與分批兩路共用。
+
+5. **`_compute_train_metrics`**  
+   - 有 `booster_` 時改走 **`_batched_booster_predict_scores`**（無 `booster_` 時維持 `predict_proba`）。
+
+6. **`train_single_rated_model`**  
+   - 當 **`use_from_libsvm`**、**`train_libsvm_paths[0]`** 存在、路徑在 **`DATA_DIR` 下**、且 **`model.booster_`** 存在：train 指標使用 **`_labels_from_libsvm`** + **`booster.predict(str(path))`**，再呼叫 **`_train_metrics_dict_from_y_scores`**；長度不一致時 trim 至 min（與 test LibSVM 分支一致）。  
+   - **`predict(str(path))` 失敗**：`logger.warning` 後 **fallback** 至分批 `_compute_train_metrics`。  
+   - 其餘情況維持呼叫 `_compute_train_metrics`（內部已分批）。
+
+7. **文件（可選）**  
+   - [doc/training_oom_and_runtime_audit.md](doc/training_oom_and_runtime_audit.md) 或 STATUS：一句話指向 **DEC-031**／**T-DEC031**。
+
+#### 測試與驗證
+
+- 單元／整合：模擬特徵步驟拋錯 → pipeline **非零 exit**（若現有測試為吞例外，需更新預期）。  
+- 可選：mock LibSVM 路徑 + booster，驗證 train 指標走檔案分支且 metrics 鍵完整。  
+- 可選：小表驗證分批 predict 與單次 predict 之 `train_ap`／F1 數值一致（容差）。
+
+#### Rollback
+
+- 還原 `process_chunk` 之 try/except、還原 `_compute_train_metrics` 單次 `predict_proba`、移除 LibSVM train 指標分支與 config 常數。
+
+#### Definition of done
+
+- **DECISION_LOG [DEC-031](DECISION_LOG.md)** 與本節 T-DEC031 所列程式變更完成；full-window 本機跑 Step 9 不再因全 train `predict_proba` 稠密矩陣 OOM；特徵工程失敗不再靜默產出「缺軌」模型。  
+- **pytest**（與 touched 檔案相關者）通過。
+
 ---
 
 ## File-Level Edit Summary
@@ -600,17 +776,29 @@ flowchart LR
 ### Existing files likely to change
 
 - [trainer/training/trainer.py](trainer/training/trainer.py)
+  - （**T-DEC031**／**DEC-031**）`process_chunk`：特徵工程失敗即 raise；`_batched_booster_predict_scores`、`_train_metrics_dict_from_y_scores`；`train_single_rated_model`：Plan B+ train 指標優先 `booster.predict(train LibSVM path)`；`_compute_train_metrics` 分批 float32 predict。
   - 在 `save_artifact_bundle(...)` 後接入 provenance logging。
   - （T12）pipeline 開頭以 `with safe_start_run(...)` 包住整段；失敗時在 except 內 `log_tags_safe` / `log_params_safe`（含 config、chunk 數、OOM-check 估計等）。
   - （T13）在 `_log_training_provenance_to_mlflow` 第一次被呼叫前，若有 active run 則呼叫 warm-up（例如 `mlflow_utils` 提供之輕量 get_run 並套用相同 503 重試），再執行既有 provenance / metrics 寫入。
+  - （T-PipelineStepDurations）`run_pipeline`：Step 1–6、10 之 `_el` 賦予 `stepN_duration_sec`；擴充 `_write_pipeline_diagnostics_json` 與成功路徑 `mlflow_metrics`（`step1_duration_sec` … `step10_duration_sec`）。
   - （T-TrainingMetricsSchema）`save_artifact_bundle`：`training_metrics.json` 根層與 `rated` 巢狀對齊（建議 A1 denormalize 白名單鍵＋文件）。
+  - （**T-OnlineCalibration**）抽出並使用 **`select_threshold_dec026`**（與 backtester／校準腳本共用；validation 傳 `window_hours=None`）
 - [investigations/test_vs_production/checks/run_r1_r6_analysis.py](investigations/test_vs_production/checks/run_r1_r6_analysis.py)（T-TrainingMetricsSchema）
   - `_load_training_metrics_baseline`：頂層優先、`rated` fallback；可選抽成共用 helper。
+- [trainer/features/features.py](trainer/features/features.py)（**T-DEC031**）
+  - Track LLM／合併鏈浮點欄 float32（與 DEC-031 一致）
 - [trainer/serving/scorer.py](trainer/serving/scorer.py)
   - 建立獨立的 `prediction_log.db` 與對應 schema（prediction log + export metadata/audit）
   - 在 `score_once(...)` 中對獨立 DB 進行 batch append
+  - （**T-OnlineCalibration**）讀取 state DB **`runtime_rated_threshold`**（或同等表）；有效且未過期則覆寫 `rated_t`，否則 fallback bundle
+- [trainer/serving/validator.py](trainer/serving/validator.py)
+  - （**T-OnlineCalibration**）**無需取代**；可選文件註明與校準 label 語意差異
+- [trainer/training/backtester.py](trainer/training/backtester.py)（**T-OnlineCalibration**）
+  - `compute_micro_metrics` 之 PR oracle 與 **`select_threshold_dec026`** 約束對齊
 - [trainer/core/config.py](trainer/core/config.py)
+  - （**T-DEC031**）新增 `TRAIN_METRICS_PREDICT_BATCH_ROWS`
   - 新增 Phase 2 相關 env/config
+  - （**T-OnlineCalibration**）可選 `RUNTIME_THRESHOLD_MAX_AGE_HOURS`、校準最低樣本數等
   - （Credential folder 實作時）改為自 `_REPO_ROOT/credential/.env` 載入
 - [trainer/core/mlflow_utils.py](trainer/core/mlflow_utils.py)（T11）
   - 模組頂層：若存在 `repo_root/local_state/mlflow.env` 則 `load_dotenv(..., override=False)`，不寫入主 `.env`
@@ -633,6 +821,7 @@ flowchart LR
 - `trainer/scripts/export_predictions_to_mlflow.py`
 - `trainer/scripts/generate_evidently_report.py`
 - `trainer/scripts/check_training_serving_skew.py`
+- `trainer/scripts/calibrate_threshold_from_prediction_log.py`（**T-OnlineCalibration**）
 - `doc/phase2_provenance_schema.md`
 - `doc/phase2_provenance_query_runbook.md`
 - `doc/phase2_model_rollback_runbook.md`
@@ -676,6 +865,14 @@ flowchart LR
   - pipeline 於某步失敗時，MLflow 有一筆 run、tag `status=FAILED`、error 及 config／chunk 數／OOM 估計等；成功路徑仍為單一 run
 - T13 MLflow cold-start mitigation:
   - mock 503 後重試成功：`log_params_safe` / `log_metrics_safe` 在第一次 503、第二次成功時僅 warning 一次且最終寫入成功；可選 mock 連續 503 驗證達最大重試後不 raise
+- T-PipelineStepDurations：
+  - 契約測試：`step1`…`step10_duration_sec` 與產品決定一致（全鍵必存 vs. None 省略）；`pipeline_diagnostics` writer：`0.0` 寫入與 `None` 省略對照
+- T-DEC031：
+  - 特徵步驟失敗 → 預期非零 exit（或契約測試更新）
+  - 可選：LibSVM train 指標路徑 mock；分批 vs 單次 predict 數值一致（小表）
+- T-OnlineCalibration：
+  - `select_threshold_dec026` 單元測試（recall、min count、alerts/hour、`THRESHOLD_MIN_ALERTS_PER_HOUR=None`）
+  - 校準腳本整合測試（mock CH / fixture DB）；scorer 讀 runtime 覆寫閾值之契約測試
 
 ### Manual validation
 
@@ -689,6 +886,7 @@ flowchart LR
 8. Re-run export script with GCP available -> artifact uploaded, watermark advances.
 9. Run validator unchanged -> existing behavior preserved.
 10. Produce one local Evidently report and one skew-check output.
+11. （T-OnlineCalibration）排程校準腳本 → 確認 `prediction_ground_truth` / `calibration_runs` 寫入；state DB 覆寫後 scorer 日誌或 dry-run 顯示有效 `rated_threshold`。
 
 ---
 
@@ -730,6 +928,19 @@ flowchart LR
 
 - Remove denormalized top-level metric keys from `save_artifact_bundle` if A1 was implemented; optionally revert `_load_training_metrics_baseline` to top-level-only if team accepts breaking old files (not recommended—prefer keeping reader fallback).
 
+### T-PipelineStepDurations
+
+- Revert `_write_pipeline_diagnostics_json` 參數與 payload、`run_pipeline` 內 `mlflow_metrics` 與各 `step1`…`step6`/`step10_duration_sec` 賦值；還原相關測試 expected keys。
+
+### T-DEC031（訓練管線 strict／OOM）
+
+- 還原 `process_chunk` try/except、train 指標 LibSVM 分支、`_batched_booster_predict_scores`／`_train_metrics_dict_from_y_scores`、config `TRAIN_METRICS_PREDICT_BATCH_ROWS`；還原 `features.py` dtype 變更（若已改）。
+
+### T-OnlineCalibration（runtime 閾值與標註）
+
+- 停校準排程；移除或清空 state DB `runtime_rated_threshold`；scorer 還原為僅讀 artifact。  
+- `prediction_log.db` 內新表可保留以利稽核；若需回滾 schema，以 migration 或 `CREATE IF NOT EXISTS` 之互斥策略處理。
+
 ---
 
 ## Phase-Level Definition of Done
@@ -765,4 +976,5 @@ flowchart LR
 3. Evidently current data 的前置整理方式。
 4. 是否需要 `prediction_export_runs` audit table；本計畫建議加，但若想先簡化，可先只做 `meta` watermark。
 5. 是否將 state / prediction runtime DB 路徑統一為同一 `local_state/`（本計畫建議統一，且以 env 明確設定為準，不依賴 fallback）。
+6. **T-OnlineCalibration**：校準排程間隔（預設 30 分）、`RUNTIME_THRESHOLD_MAX_AGE_HOURS`、校準子集最少樣本／正例數之下限；state 表最終表名。
 

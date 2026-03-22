@@ -24,6 +24,7 @@ Evaluation (observation-level, trainer-aligned)
 from __future__ import annotations
 
 import argparse
+from importlib import import_module as _import_module_threshold_selection
 import json
 import logging
 from datetime import datetime, timedelta
@@ -34,7 +35,7 @@ import joblib
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import average_precision_score, fbeta_score, precision_recall_curve
+from sklearn.metrics import average_precision_score, fbeta_score
 from zoneinfo import ZoneInfo
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -62,6 +63,7 @@ try:
     BACKTEST_HOURS: int = getattr(_cfg, "BACKTEST_HOURS", 6)
     BACKTEST_OFFSET_HOURS: int = getattr(_cfg, "BACKTEST_OFFSET_HOURS", 1)
     THRESHOLD_MIN_RECALL: Optional[float] = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
+    THRESHOLD_MIN_ALERT_COUNT: int = getattr(_cfg, "THRESHOLD_MIN_ALERT_COUNT", 5)
     THRESHOLD_MIN_ALERTS_PER_HOUR: Optional[float] = getattr(
         _cfg, "THRESHOLD_MIN_ALERTS_PER_HOUR", None
     )
@@ -79,16 +81,28 @@ except ModuleNotFoundError:
     BACKTEST_HOURS = getattr(_cfg, "BACKTEST_HOURS", 6)
     BACKTEST_OFFSET_HOURS = getattr(_cfg, "BACKTEST_OFFSET_HOURS", 1)
     THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
+    THRESHOLD_MIN_ALERT_COUNT = getattr(_cfg, "THRESHOLD_MIN_ALERT_COUNT", 5)
     THRESHOLD_MIN_ALERTS_PER_HOUR = getattr(_cfg, "THRESHOLD_MIN_ALERTS_PER_HOUR", None)
     UNRATED_VOLUME_LOG = bool(getattr(_cfg, "UNRATED_VOLUME_LOG", True))  # type: ignore[no-redef]
     SCORER_LOOKBACK_HOURS = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)  # type: ignore[no-redef]
+
+try:
+    _threshold_selection_mod = _import_module_threshold_selection(
+        "trainer.training.threshold_selection"
+    )
+except ModuleNotFoundError:
+    _threshold_selection_mod = _import_module_threshold_selection("threshold_selection")
+pick_threshold_dec026 = _threshold_selection_mod.pick_threshold_dec026
+dec026_pr_alert_arrays = _threshold_selection_mod.dec026_pr_alert_arrays
+pick_threshold_dec026_from_pr_arrays = _threshold_selection_mod.pick_threshold_dec026_from_pr_arrays
+dec026_sanitize_per_hour_params = _threshold_selection_mod.dec026_sanitize_per_hour_params
 
 try:
     from labels import compute_labels  # type: ignore[import]
     from identity import build_canonical_mapping_from_df  # type: ignore[import]
     from schema_io import normalize_bets_sessions  # type: ignore[import]
     from features import coerce_feature_dtypes  # type: ignore[import]
-    from trainer import (  # type: ignore[import, attr-defined]
+    from trainer.training.trainer import (
         MODEL_DIR,
         load_clickhouse_data,
         load_local_parquet,
@@ -106,7 +120,7 @@ except ModuleNotFoundError:
     from trainer.identity import build_canonical_mapping_from_df  # type: ignore[import]
     from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
     from trainer.features import coerce_feature_dtypes  # type: ignore[import]
-    from trainer.trainer import (  # type: ignore[import]
+    from trainer.training.trainer import (
         MODEL_DIR,
         load_clickhouse_data,
         load_local_parquet,
@@ -255,8 +269,10 @@ def compute_micro_metrics(
 
     Returns a flat dict with trainer-style keys: test_ap, test_precision, test_recall,
     test_f1, test_fbeta_05, threshold, test_samples, test_positives, test_random_ap,
-    alerts, alerts_per_hour; and test_precision_at_recall_0.01/0.1/0.5 (PLAN § Backtester
-    precision-at-recall; None when empty/invalid/single-class).
+    alerts, alerts_per_hour; and test_precision_at_recall_* (DEC-026) computed with the
+    same constraints as trainer / DEC-032: recall >= r, THRESHOLD_MIN_ALERT_COUNT, and
+    optionally THRESHOLD_MIN_ALERTS_PER_HOUR when window_hours > 0.
+    None when empty/invalid/single-class or no feasible operating point.
     Empty or invalid (e.g. NaN labels, single-class) subset returns same keys with zeros.
 
     Parameters
@@ -321,26 +337,60 @@ def compute_micro_metrics(
             precision_at_recall[f"threshold_at_recall_{r}"] = None
             precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
     else:
-        pr_prec, pr_rec, pr_thresholds = precision_recall_curve(df["label"], df["score"])
-        pr_p = pr_prec[:-1]
-        pr_r = pr_rec[:-1]
+        # Oracle (PR@recall): rated-only rows — aligns with operational alerts (DEC-032 review).
+        df_o = df.loc[df["is_rated"].fillna(False).astype(bool)]
         window_minutes = (window_hours * 60.0) if (window_hours is not None and window_hours > 0) else None
-        for r in _TARGET_RECALLS:
-            mask = pr_r >= r
-            if mask.any():
-                valid_idx = np.where(mask)[0]
-                best_local = int(np.argmax(pr_p[valid_idx]))
-                best_idx = int(valid_idx[best_local])
-                thr_r = float(pr_thresholds[best_idx])
-                n_at_r = int((df["score"].values >= thr_r).sum())
-                apm_r = (n_at_r / window_minutes) if window_minutes else None
-                precision_at_recall[f"test_precision_at_recall_{r}"] = float(pr_p[best_idx])
-                precision_at_recall[f"threshold_at_recall_{r}"] = thr_r
-                precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = apm_r
-            else:
+        if df_o.empty:
+            for r in _TARGET_RECALLS:
                 precision_at_recall[f"test_precision_at_recall_{r}"] = None
                 precision_at_recall[f"threshold_at_recall_{r}"] = None
                 precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
+        else:
+            n_pos_o = int((df_o["label"] == 1).sum())
+            n_so = len(df_o)
+            if n_pos_o == 0 or n_pos_o == n_so:
+                for r in _TARGET_RECALLS:
+                    precision_at_recall[f"test_precision_at_recall_{r}"] = None
+                    precision_at_recall[f"threshold_at_recall_{r}"] = None
+                    precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
+            else:
+                labels_arr = np.asarray(df_o["label"].values, dtype=float)
+                scores_arr = np.asarray(df_o["score"].values, dtype=float)
+                prep = dec026_pr_alert_arrays(labels_arr, scores_arr)
+                if prep is None:
+                    for r in _TARGET_RECALLS:
+                        precision_at_recall[f"test_precision_at_recall_{r}"] = None
+                        precision_at_recall[f"threshold_at_recall_{r}"] = None
+                        precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
+                else:
+                    pr_p, pr_r, pr_th, ac, _n = prep
+                    wh_eff, mah_eff = dec026_sanitize_per_hour_params(
+                        window_hours,
+                        THRESHOLD_MIN_ALERTS_PER_HOUR,
+                    )
+                    for r in _TARGET_RECALLS:
+                        _pick = pick_threshold_dec026_from_pr_arrays(
+                            pr_p,
+                            pr_r,
+                            pr_th,
+                            ac,
+                            recall_floor=float(r),
+                            min_alert_count=THRESHOLD_MIN_ALERT_COUNT,
+                            min_alerts_per_hour=mah_eff,
+                            window_hours=wh_eff,
+                            fbeta_beta=THRESHOLD_FBETA,
+                        )
+                        if _pick.is_fallback:
+                            precision_at_recall[f"test_precision_at_recall_{r}"] = None
+                            precision_at_recall[f"threshold_at_recall_{r}"] = None
+                            precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
+                        else:
+                            thr_r = _pick.threshold
+                            n_at_r = int((scores_arr >= thr_r).sum())
+                            apm_r = (n_at_r / window_minutes) if window_minutes else None
+                            precision_at_recall[f"test_precision_at_recall_{r}"] = _pick.precision
+                            precision_at_recall[f"threshold_at_recall_{r}"] = thr_r
+                            precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = apm_r
 
     return {
         "test_ap": ap,
