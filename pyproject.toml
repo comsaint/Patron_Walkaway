@@ -15,7 +15,7 @@ dependencies = [
     "lightgbm",
     "pyyaml",
     "python-dotenv",
-    "clickhouse-driver",
+    "clickhouse-connect==0.13.0",
 ]
 
 # Optional: MLflow system metrics (MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING) need psutil in-process.

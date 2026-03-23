@@ -60,7 +60,7 @@ REQUIREMENTS_DEPS = [
     "lightgbm",
     "pyyaml",
     "python-dotenv",
-    "clickhouse-driver",
+    "clickhouse-connect==0.13.0",
 ]
 
 
