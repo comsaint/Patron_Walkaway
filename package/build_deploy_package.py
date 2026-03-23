@@ -162,7 +162,19 @@ Target machine can be Windows, Linux, or Mac. Steps below cover all.
    Scorer, validator, and Flask API run in one process.
    Endpoints: http://0.0.0.0:8001/alerts  and  http://0.0.0.0:8001/validation
 
-5. To swap the model: replace files in the models/ folder with a new bundle, then restart (step 4).
+5. To swap the model only (same code / same requirements as before):
+   Replace the files in the models/ folder with the new bundle, then restart (step 4).
+   No pip — the model is files on disk, not a Python package.
+
+6. To update after a new deploy package (new wheel and/or new dependencies):
+   Keep the same venv from step 2. Copy or merge the new folder over the old one so
+   wheels/ and requirements.txt match the new build. Then run again:
+     pip install -r requirements.txt
+   Pip usually only installs what changed (e.g. a new walkaway_ml wheel filename).
+   To reinstall only the application wheel and skip other packages:
+     pip install --upgrade --no-deps wheels/<wheel filename>
+   Use the exact .whl name from the first line of requirements.txt or under wheels/.
+   More detail: see package/deploy/README.md in the repository (section "Production bundle: updates").
 """,
         encoding="utf-8",
     )
