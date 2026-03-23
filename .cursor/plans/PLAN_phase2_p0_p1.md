@@ -71,13 +71,13 @@ flowchart LR
 - ~~**T-PipelineStepDurations**~~：**✅ Done**。
 - ~~**Scorer lookback env 防呆**~~：**✅** — `SCORER_LOOKBACK_HOURS` 非法／≤0 → **8**；超 **`SCORER_LOOKBACK_HOURS_MAX`**（預設 8760）→ **cap**（Code Review 實裝；見 STATUS「Phase 2 Code Review 風險實裝修正」）。
 - ~~**測試收集（round235／242）**~~：**✅**。
-- **T-OnlineCalibration**：**MVP ✅**（state `runtime_rated_threshold`、**`upsert` 區間驗證**、scorer 讀覆寫、TTL 含**空白 `updated_at` 退回 bundle**、`prediction_ground_truth`／`calibration_runs` schema、CLI **`--init-schema` 拒空路徑**／`--set-runtime-threshold`）。**仍待**：CH 標註成熟樣本、自動 PR 校準寫 state、（可選）test 集選阈接線、（可選）**`CALIBRATE_ALLOW_WRITE` 閘門**。見下方專節。
+- **T-OnlineCalibration**：**MVP ✅**（同上）。**仍待**：**全量標註腳本** `label_predictions_from_ch.py`（見下方 **「全量標註實作計畫」**）、**`prediction_log.bet_ts`** 與 **`prediction_ground_truth` 欄位調整**、自動 PR 校準寫 state、（可選）test 集選阈接線、（可選）**`CALIBRATE_ALLOW_WRITE` 閘門**。
 - **Pipeline §6 可選**、**§8 人工** — 仍待。
 - 可選 Code Review §2–§5 效能／語義後續優化。
 
 ---
 
-### T-OnlineCalibration — `prediction_log` 標註、線上閾值校準與 train/backtest/serve 約束一致化 — ⏳ **MVP Done**；完整 CH 閉環仍 **In progress**（2026-03-22）
+### T-OnlineCalibration — `prediction_log` 標註、線上閾值校準與 train/backtest/serve 約束一致化 — ⏳ **MVP Done**；完整 CH 閉環仍 **In progress**（2026-03-22；**全量標註實作計畫** 2026-03-23 見下）
 
 - **Depends on**: T4（`prediction_log` 寫入路徑已存在）；建議與 **DB path consolidation**（state / prediction_log 同 `local_state/`）一併部署。
 - **進度（2026-03-22 末）**：選阈共用模組與 backtester oracle 已落地（見上）。**新增**：state DB 表 **`runtime_rated_threshold`**（單列 `id=1`）、**`read_effective_runtime_rated_threshold`**（TTL 下空白／缺 `updated_at` → bundle）／**`upsert_runtime_rated_threshold`**（**`ValueError`** 若阈 ∉ (0,1)）、可選 **`RUNTIME_THRESHOLD_MAX_AGE_HOURS`**；**scorer** `score_once` 使用有效 runtime 阈；**prediction_log.db** 上 **`prediction_ground_truth`**／**`calibration_runs`**（`ensure_prediction_calibration_schema`）；CLI **`trainer.scripts.calibrate_threshold_from_prediction_log`**（`--init-schema` 拒空 **`PREDICTION_LOG_DB_PATH`**、`--set-runtime-threshold`）。**尚未**：CH 拉取寫 `prediction_ground_truth`、成熟子集上 **`pick_threshold_dec026`** 自動 upsert、（可選）test 集 PR 報告接共用選阈。硬化細節見 [STATUS.md](STATUS.md)「**Phase 2 Code Review 風險實裝修正**」。
@@ -90,10 +90,66 @@ flowchart LR
   6. **Scorer**：自 **state DB**（與 `alerts` 同庫）讀 **runtime 閾值覆寫**；無效／缺失／可選過期則 fallback **artifact `rated.threshold`**。`prediction_log.db` **不作** scorer 讀取閾值來源。
 - **Non-goals（本階段）**: 逐小時桶強制通過；逐 gaming_day 強制；`bet_id` label 版本鏈（可接受遲到資料日後更正；表內建議仍保留 **`labeled_at`**）。
 
+#### T-OnlineCalibration — 全量標註實作計畫（`label_predictions_from_ch.py`）（2026-03-23）
+
+**決策對照**：[DECISION_LOG.md](DECISION_LOG.md) **DEC-030**（validator 與訓練 bet-only、常數同源；全量標註重用 **`validate_alert_row`**／**`find_gap_within_window`** 即與 validator **同一種標籤**）、**DEC-032**（ground truth 在 `prediction_log.db`、**`pending` 不納入校準**、不取代 validator；**validator 與校準 label 不強求逐筆一致**）。
+
+**原則**
+
+- **標籤演算法**：與 [trainer/serving/validator.py](../../trainer/serving/validator.py) 一致——**`validate_alert_row`** + **`fetch_bets_by_canonical_id`**；**`fetch_start`** = 本批 **`effective_ts`（`bet_ts` 優先，否則 `scored_at`）** 之 **min − 1 hour**，**`fetch_end`** = **`now_hk`**（同 `validate_once`）；**verdict 不依 session**（DEC-030）。**`session_cache`** 傳空即可。
+- **執行邊界**：腳本**僅**讀寫 **`PREDICTION_LOG_DB_PATH`** 與 **ClickHouse**；**不**改 [trainer/serving/scorer.py](../../trainer/serving/scorer.py)／[trainer/serving/validator.py](../../trainer/serving/validator.py) 之**對外 API 行為**（scorer 僅擴充寫入 prediction log 欄位）。
+- **Dry-run**：**仍執行 ClickHouse 查詢**；**不**對 SQLite 做 **commit／UPSERT `prediction_ground_truth`**（可將將寫入之 `bet_id, status, label, reason` 摘要輸出至 log／stdout 供測試）。
+
+**A. `prediction_log` 表：新增 `bet_ts`**
+
+- **目的**：標註腳本無需再依 `bet_id` 回查 CH 取結算時間；與 **`validate_alert_row`** 之 **`bet_ts`** 對齊。
+- **Schema**：`prediction_log` 增加 **`bet_ts TEXT`**（可 NULL）；既有 DB 以 **`ALTER TABLE ... ADD COLUMN`** 補欄（若欄已存在則跳過）。
+- **[trainer/serving/scorer.py](../../trainer/serving/scorer.py)** **`_append_prediction_log`**：`INSERT` 帶入 **`bet_ts`**；取值優先 **`payout_complete_dtm`**，否則 **`bet_ts`**（與 `score_once` 路徑上 feature 列一致）；正規化為 **HK 語意之 ISO 字串**（與 alerts 寫入相容）。缺值則 **NULL**，標註腳本對該列 **`error`/`skipped` + reason**（如 `missing_bet_ts`）。
+- **相容**：檢查 **`export_predictions_to_mlflow`**、調查腳本等是否依賴固定欄位列表並更新。
+
+**B. `prediction_ground_truth`：schema 調整（實作時 migration）**
+
+| 欄位 | 說明 |
+|------|------|
+| `bet_id` | `TEXT PRIMARY KEY` |
+| `label` | `REAL` **NULL**；僅 **`status = 'labeled'`** 時為 **0 或 1** |
+| `status` | `TEXT NOT NULL`：`pending` \| `labeled` \| `error` \| `skipped`（`error`／`skipped` 可用 `reason` 細分） |
+| `reason` | `TEXT`；**`error`／`skipped` 建議必填** |
+| `labeled_at` | `TEXT`；每次腳本**更新該列**時寫入 **job 之 HK ISO 時間**（含 `pending` 重試可寫「最後嘗試時間」— 實作時定稿） |
+| `prediction_id` | 可選；本計畫可不使用 |
+
+**C. 標籤映射（`validate_alert_row` → 表列）**
+
+- **`reason == 'MATCH'`** 且 **`result` 為真** → **`label = 1`**（walkaway 正類；若與模型正類定義相反則於程式**單一處**註解並反轉）。
+- **`MISS`／`result` 假** → **`label = 0`**。
+- **`IGNORED_REASONS`**（與 validator 一致，如 `gap_started_before_alert`、`missing_player_id`）→ **`skipped` + reason**。
+- **`result is None`**（觀察尚未成熟）→ **`pending`**，`label` NULL。
+- **CH 查無 bets／無法組 canonical／log 缺必填欄** → **`error` 或 `skipped` + reason**（與 **`pending`** 分開）。
+
+**D. `trainer/scripts/label_predictions_from_ch.py`（建議路徑）**
+
+- 環境：**僅 `PREDICTION_LOG_DB_PATH`** + CH（`get_clickhouse_client`）。
+- 讀 **`prediction_log`**，組 **`cid_to_pids`**（重用 **`validator._build_cid_to_player_ids`** 邏輯）。
+- 合成餵給 **`validate_alert_row`** 之 row：**`ts`** ← `scored_at`；**`bet_ts`** ← **`prediction_log.bet_ts`**（需能 parse 為與 validator 一致之 tz）。
+- 批次：本輪所有「待標註」之 `bet_id`（`pending` 可重試、`labeled` 是否覆寫由 policy 定稿）；**分 chunk** 控制記憶體與 CH **`IN`** 大小（沿用 **`_PLAYER_ID_CHUNK_SIZE`** 思路）。
+- CLI：**`--dry-run`** — 行為見上節「Dry-run」。
+
+**E. 測試與驗收**
+
+- Scorer：契約測試 **`prediction_log`** 新列含 **`bet_ts`**（mock `features_df`）。
+- 標註腳本：**`--dry-run`** 斷言 **無 SQLite 寫入**；非 dry-run 之 fixture 斷言 **`labeled`／`pending`／`skipped`**。
+- Migration：舊 DB **`ALTER`** 補欄不失敗。
+
+**F. 本階段仍不做（後續 PR）**
+
+- **`pick_threshold_dec026`** 自動寫 **`runtime_rated_threshold`**、**`calibration_runs`** 彙總選阈。
+
+---
+
 #### Schema（`prediction_log.db`）
 
-- 新表（方案 A，名稱可定稿）：**`prediction_ground_truth`**  
-  - 至少：`bet_id`（UNIQUE，一 bet 一筆）、`label`（0/1）、`status`（`pending` / `labeled` 或同等）、`labeled_at`；可選 `prediction_id` 利於 join。
+- 表 **`prediction_log`**（T4）：除既有欄位外，**新增 `bet_ts TEXT`**（可 NULL）— 見上 **「全量標註實作計畫」§A**。
+- 表 **`prediction_ground_truth`**（方案 A）：欄位以 **「全量標註實作計畫」§B** 為準（`label` 可 NULL、`status` 含 `pending`／`labeled`／`error`／`skipped`、`reason`）；**可選 `prediction_id`**。
 - 可選稽核表：**`calibration_runs`** — `run_at`、`window_start`/`window_end`、`window_hours`、`n_rows_used`、`n_pos`、`suggested_threshold`、`applied_to_state`、`skipped_reason`、JSON 摘要等。
 
 #### Schema（state DB）
@@ -104,9 +160,10 @@ flowchart LR
 
 #### 新腳本（建議路徑）
 
-- `trainer/scripts/calibrate_threshold_from_prediction_log.py`（或同等命名）  
-  - 讀 `PREDICTION_LOG_DB_PATH`、CH、config。  
-  - 每輪：掃需標註列 → 成熟與否 → 寫/更新 `prediction_ground_truth` → 匯總校準子集 → 樣本不足則 skip 並寫 `calibration_runs` → 否則 PR 掃描 + `valid_mask` → 條件滿足則 **UPSERT state `runtime_rated_threshold`**。
+- `trainer/scripts/label_predictions_from_ch.py` — **全量標註**（詳見上 **「全量標註實作計畫」**）：讀 **`PREDICTION_LOG_DB_PATH`** 與 CH；**`--dry-run`** 時仍查 CH、**不寫** SQLite。
+- `trainer/scripts/calibrate_threshold_from_prediction_log.py`  
+  - 現況：schema／手動 runtime 阈 MVP。  
+  - 後續：掃成熟標註列 → 匯總校準子集 → 樣本不足則 skip 並寫 `calibration_runs` → 否則 PR 掃描 + `valid_mask` → 條件滿足則 **UPSERT state `runtime_rated_threshold`**。
 
 #### 共用程式（強烈建議）
 
@@ -115,14 +172,15 @@ flowchart LR
 
 #### 與 validator 分工
 
-- **並行監控**：scorer 寫 log、validator 驗 alerts、校準腳本標全量 + 更新阈。  
-- **資料來源**：CH 與 validator 同源；**標籤語意以訓練為準**（實作應重用或對齊 **`compute_labels`** 所在管線，避免僅複製 validator 判決當 ground truth）。
+- **並行監控**：scorer 寫 log、validator 驗 alerts、**`label_predictions_from_ch`** 對 **全量 prediction_log** 貼標（不取代 validator）、校準腳本（後續）更新阈。  
+- **資料來源**：CH 與 validator 同源。**全量標註腳本**依 **DEC-030** 與 **validator 同一套 `validate_alert_row` 判決**（bet-only、常數同源）；DEC-032 仍允許與 validator **逐筆不完全一致**（遲到／快照差異）。
 
 #### 測試與驗證
 
 - 單元：`select_threshold_dec026` 合成資料 — recall、min count、alerts/hour、`None` per-hour。  
-- 整合：temp `prediction_log` + mock CH → 腳本一輪 → state DB 預期閾值。  
-- 契約：scorer 在存在有效 runtime 列時使用覆寫閾值。
+- 整合：**`label_predictions_from_ch`** temp `prediction_log` + mock CH → **`--dry-run`** 無 SQLite 寫入；非 dry-run → `prediction_ground_truth` 預期列。  
+- 整合（校準後續）：temp DB + mock CH → state DB 預期閾值。  
+- 契約：scorer 在存在有效 runtime 列時使用覆寫閾值；**`prediction_log.bet_ts`** 與 scorer 寫入一致。
 
 #### Rollback
 
@@ -791,9 +849,10 @@ flowchart LR
 - [trainer/serving/scorer.py](trainer/serving/scorer.py)
   - 建立獨立的 `prediction_log.db` 與對應 schema（prediction log + export metadata/audit）
   - 在 `score_once(...)` 中對獨立 DB 進行 batch append
+  - （**T-OnlineCalibration**）**`prediction_log.bet_ts`**：`_append_prediction_log` 寫入（見 **全量標註實作計畫 §A**）；**不改對外 API**
   - （**T-OnlineCalibration**）讀取 state DB **`runtime_rated_threshold`**（或同等表）；有效且未過期則覆寫 `rated_t`，否則 fallback bundle
 - [trainer/serving/validator.py](trainer/serving/validator.py)
-  - （**T-OnlineCalibration**）**無需取代**；可選文件註明與校準 label 語意差異
+  - （**T-OnlineCalibration**）**全量標註腳本**可 **import** **`validate_alert_row`**／**`fetch_bets_by_canonical_id`** 等；**不取代** validator 服務與 **state.db** 流程
 - [trainer/training/backtester.py](trainer/training/backtester.py)（**T-OnlineCalibration**）
   - `compute_micro_metrics` 之 PR oracle 與 **`select_threshold_dec026`** 約束對齊
 - [trainer/core/config.py](trainer/core/config.py)
@@ -823,6 +882,7 @@ flowchart LR
 - `trainer/scripts/generate_evidently_report.py`
 - `trainer/scripts/check_training_serving_skew.py`
 - `trainer/scripts/calibrate_threshold_from_prediction_log.py`（**T-OnlineCalibration**）
+- `trainer/scripts/label_predictions_from_ch.py`（**T-OnlineCalibration** 全量標註）
 - `doc/phase2_provenance_schema.md`
 - `doc/phase2_provenance_query_runbook.md`
 - `doc/phase2_model_rollback_runbook.md`
@@ -853,6 +913,7 @@ flowchart LR
 - scorer prediction log:
   - schema creation
   - append all scored rows, not only alerts
+  - **`bet_ts`** 寫入與 `payout_complete_dtm`／feature 列一致
   - WAL-compatible read/write assumptions
 - export script:
   - watermark progression
@@ -873,6 +934,7 @@ flowchart LR
   - 可選：LibSVM train 指標路徑 mock；分批 vs 單次 predict 數值一致（小表）
 - T-OnlineCalibration：
   - `select_threshold_dec026` 單元測試（recall、min count、alerts/hour、`THRESHOLD_MIN_ALERTS_PER_HOUR=None`）
+  - **`label_predictions_from_ch`**：`--dry-run` 仍查 CH、**無** `prediction_ground_truth` 寫入；非 dry-run fixture；**`prediction_log.bet_ts`** 與 scorer 一致
   - 校準腳本整合測試（mock CH / fixture DB）；scorer 讀 runtime 覆寫閾值之契約測試
 
 ### Manual validation
@@ -887,7 +949,8 @@ flowchart LR
 8. Re-run export script with GCP available -> artifact uploaded, watermark advances.
 9. Run validator unchanged -> existing behavior preserved.
 10. Produce one local Evidently report and one skew-check output.
-11. （T-OnlineCalibration）排程校準腳本 → 確認 `prediction_ground_truth` / `calibration_runs` 寫入；state DB 覆寫後 scorer 日誌或 dry-run 顯示有效 `rated_threshold`。
+11. （T-OnlineCalibration）**`label_predictions_from_ch --dry-run`** → CH 有查詢、**SQLite 無** ground-truth 寫入；正式跑 → `prediction_ground_truth` 預期列；**`prediction_log.bet_ts`** 有值。
+12. （T-OnlineCalibration）排程校準腳本（後續）→ 確認 `calibration_runs` 寫入與 state DB 覆寫；scorer 日誌顯示有效 `rated_threshold`。
 
 ---
 
@@ -977,5 +1040,5 @@ flowchart LR
 3. Evidently current data 的前置整理方式。
 4. 是否需要 `prediction_export_runs` audit table；本計畫建議加，但若想先簡化，可先只做 `meta` watermark。
 5. 是否將 state / prediction runtime DB 路徑統一為同一 `local_state/`（本計畫建議統一，且以 env 明確設定為準，不依賴 fallback）。
-6. **T-OnlineCalibration**：校準排程間隔（預設 30 分）、`RUNTIME_THRESHOLD_MAX_AGE_HOURS`、校準子集最少樣本／正例數之下限；state 表最終表名。
+6. **T-OnlineCalibration**：校準排程間隔（預設 30 分）、`RUNTIME_THRESHOLD_MAX_AGE_HOURS`、校準子集最少樣本／正例數之下限；state 表最終表名。**全量標註**：已 **`labeled`** 之列是否允許重算覆寫；每輪 chunk／批次上限。
 
