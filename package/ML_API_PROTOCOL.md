@@ -30,7 +30,7 @@ Returns walkaway alerts.
 | `ts`    | string | —       | ISO timestamp; return only alerts **after** this time |
 | `limit` | int    | —       | Max number of alerts (only used when `ts` is absent) |
 
-If neither is given, returns alerts from the **last 24 hours**.
+If neither is given, returns alerts from the **last 1 hour**.
 
 ### Response
 
@@ -82,7 +82,7 @@ Returns detailed validation results.
 | `bet_id` | string | —       | Single bet ID lookup |
 | `bet_ids`| string | —       | Comma-separated bet IDs (e.g. `123,456,789`) |
 
-If none given, returns results from the **last 24 hours**.
+If none given, returns results from the **last 1 hour**.
 
 ### Response
 

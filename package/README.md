@@ -63,8 +63,8 @@ The server reads from `trainer/local_state/state.db`. Run the **scorer** (and op
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/alerts` | Walkaway alerts (query: `ts`, `limit`; no params = last 24h) |
-| GET | `/validation` | Validation results (query: `ts`, `bet_id`, `bet_ids`) |
+| GET | `/alerts` | Walkaway alerts (query: `ts`, `limit`; no params = last 1h) |
+| GET | `/validation` | Validation results (query: `ts`, `bet_id`, `bet_ids`; no params = last 1h) |
 
 Example: `curl "http://localhost:8001/alerts"`. Full format: **`doc/ML_API_PROTOCOL.md`**.
 
@@ -170,8 +170,8 @@ python -m trainer.api_server
 
 | 方法 | 路徑 | 用途 |
 |--------|------|---------|
-| GET | `/alerts` | 離桌告警（query：`ts`、`limit`；無參數 = 最近 24 小時） |
-| GET | `/validation` | 驗證結果（query：`ts`、`bet_id`、`bet_ids`） |
+| GET | `/alerts` | 離桌告警（query：`ts`、`limit`；無參數 = 最近 1 小時） |
+| GET | `/validation` | 驗證結果（query：`ts`、`bet_id`、`bet_ids`；無參數 = 最近 1 小時） |
 
 範例：`curl "http://localhost:8001/alerts"`。完整格式見 **`doc/ML_API_PROTOCOL.md`**。
 

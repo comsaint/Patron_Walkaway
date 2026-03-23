@@ -91,15 +91,15 @@ def _format_ts_hk_iso(series):
     return s.str.replace(r"(\+|-)(\d{2})(\d{2})$", r"\1\2:\3", regex=True)
 
 
-def _alerts_24h_cutoff():
-    return datetime.now(HK_TZ) - timedelta(hours=24)
+def _alerts_1h_cutoff():
+    return datetime.now(HK_TZ) - timedelta(hours=1)
 
 
-def _validation_24h_cutoff():
-    return datetime.now(HK_TZ) - timedelta(hours=24)
+def _validation_1h_cutoff():
+    return datetime.now(HK_TZ) - timedelta(hours=1)
 
 
-def _query_alerts_df(ts_param=None, limit_param=None, default_24h=False):
+def _query_alerts_df(ts_param=None, limit_param=None, default_1h=False):
     """Per ML_API_PROTOCOL: limit only used when ts is absent."""
     with get_db_conn() as conn:
         df = pd.read_sql_query("SELECT * FROM alerts", conn)
@@ -117,8 +117,8 @@ def _query_alerts_df(ts_param=None, limit_param=None, default_24h=False):
             df = df[df["ts_dt"] > ts_dt]
         except Exception:
             pass
-    elif default_24h:
-        df = df[df["ts_dt"] > _alerts_24h_cutoff()]
+    elif default_1h:
+        df = df[df["ts_dt"] > _alerts_1h_cutoff()]
     if limit_param is not None and not ts_param:
         try:
             limit = int(limit_param)
@@ -172,7 +172,7 @@ def _alerts_to_protocol_records(df):
     return records
 
 
-def _query_validation_df(ts_param=None, bet_id_param=None, bet_ids_param=None, default_24h=False):
+def _query_validation_df(ts_param=None, bet_id_param=None, bet_ids_param=None, default_1h=False):
     with get_db_conn() as conn:
         df = pd.read_sql_query("SELECT * FROM validation_results", conn)
     if df.empty:
@@ -200,8 +200,8 @@ def _query_validation_df(ts_param=None, bet_id_param=None, bet_ids_param=None, d
             df = df[df["validated_at"] > ts_dt]
         except Exception:
             pass
-    elif default_24h and not bet_id_param and not bet_ids_param:
-        df = df[df["validated_at"] > _validation_24h_cutoff()]
+    elif default_1h and not bet_id_param and not bet_ids_param:
+        df = df[df["validated_at"] > _validation_1h_cutoff()]
     return df
 
 
@@ -242,7 +242,7 @@ app = Flask(__name__)
 def alerts():
     ts_param = request.args.get("ts")
     limit_param = request.args.get("limit")
-    df = _query_alerts_df(ts_param=ts_param, limit_param=limit_param, default_24h=True)
+    df = _query_alerts_df(ts_param=ts_param, limit_param=limit_param, default_1h=True)
     records = _alerts_to_protocol_records(df)
     resp = jsonify({"alerts": records})
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -254,7 +254,7 @@ def validation():
     ts_param = request.args.get("ts")
     bet_id_param = request.args.get("bet_id")
     bet_ids_param = request.args.get("bet_ids")
-    df = _query_validation_df(ts_param=ts_param, bet_id_param=bet_id_param, bet_ids_param=bet_ids_param, default_24h=True)
+    df = _query_validation_df(ts_param=ts_param, bet_id_param=bet_id_param, bet_ids_param=bet_ids_param, default_1h=True)
     records = _validation_to_protocol_records(df)
     resp = jsonify({"results": records})
     resp.headers["Access-Control-Allow-Origin"] = "*"

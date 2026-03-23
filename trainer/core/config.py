@@ -232,6 +232,11 @@ THRESHOLD_MIN_ALERTS_PER_HOUR: Optional[float] = 1.0
 TABLE_HC_WINDOW_MIN = 30         # Lookback window for table headcount feature (D1)
 PLACEHOLDER_PLAYER_ID = -1       # Invalid player_id sentinel in t_bet (E4/F1)
 UNRATED_VOLUME_LOG = True        # DEC-021: log unrated player/bet counts per poll cycle
+# Scorer SHAP reason-code generation (CPU heavy on large alert batches).
+# Default OFF for production latency; set env SCORER_ENABLE_SHAP_REASON_CODES=1 to enable.
+SCORER_ENABLE_SHAP_REASON_CODES = os.getenv(
+    "SCORER_ENABLE_SHAP_REASON_CODES", "0"
+).strip().lower() in ("1", "true", "t", "yes", "y")
 LOSS_STREAK_PUSH_RESETS = False  # Whether PUSH resets the loss-streak counter (F4)
 HIST_AVG_BET_CAP = 500_000       # Winsorization cap for avg_bet (F2; validate with EDA)
 

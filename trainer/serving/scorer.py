@@ -1793,12 +1793,18 @@ def score_once(
     logger.info("[scorer] Above-threshold rows: %d", len(alert_candidates))
 
     # ── SHAP reason codes for rated alert candidates ──────────────────────
+    # Guarded by config flag to avoid per-cycle SHAP overhead in production.
     alert_candidates["reason_codes"] = "[]"
     rated_art = artifacts.get("rated")
     rated_mask_ac = alert_candidates["is_rated_obs"].astype(bool)
 
     rated_idx = alert_candidates.index[rated_mask_ac].tolist()
-    if rated_idx and rated_art is not None and feature_list:
+    if (
+        getattr(config, "SCORER_ENABLE_SHAP_REASON_CODES", False)
+        and rated_idx
+        and rated_art is not None
+        and feature_list
+    ):
         _rated_feats = rated_art.get("features") or feature_list
         X_r = alert_candidates.loc[rated_idx, _rated_feats]
         rc_r = _compute_reason_codes(rated_art["model"], X_r, artifacts["reason_code_map"])
