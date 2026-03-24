@@ -1120,7 +1120,7 @@ def build_features_for_scoring(
         for window in (5, 15, 30):
             win_ns = window * 60 * int(1e9)
             lo = 0
-            counts = np.empty(n, dtype=np.float64)
+            counts: np.ndarray = np.empty(n, dtype=np.float64)
             for i, t in enumerate(ts):
                 while t - ts[lo] > win_ns:
                     lo += 1
@@ -1129,7 +1129,7 @@ def build_features_for_scoring(
         for window in (10, 30):
             win_ns = window * 60 * int(1e9)
             lo = 0
-            sums = np.empty(n, dtype=np.float64)
+            sums: np.ndarray = np.empty(n, dtype=np.float64)
             for i, t in enumerate(ts):
                 while t - ts[lo] > win_ns:
                     lo += 1
@@ -1585,7 +1585,7 @@ def _score_df(
         if "is_rated" in df.columns
         else np.zeros(len(df), dtype=bool)
     )
-    scores = np.zeros(len(df), dtype=float)
+    scores: np.ndarray = np.zeros(len(df), dtype=float)
 
     if rated_art is not None and len(df) > 0:
         model_features = rated_art.get("features") or feature_list

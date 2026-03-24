@@ -77,9 +77,10 @@ class TestReviewRisksRound40(unittest.TestCase):
         self.assertIn("precision_recall_curve", ts_path.read_text(encoding="utf-8"))
 
     def test_r66_process_chunk_actually_uses_chunk_cache_key(self):
-        """R66: TRN-07 cache key function should be invoked by process_chunk."""
+        """R66: TRN-07 cache fingerprint path should be invoked by process_chunk."""
         src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "process_chunk")
-        self.assertIn("_chunk_cache_key(", src)
+        self.assertIn("_chunk_cache_components(", src)
+        self.assertIn("_fingerprint_from_chunk_cache_components(", src)
 
     def test_r67_run_id_not_used_as_model_feature(self):
         """R67: run_id must not be a model feature (YAML SSOT); trainer must not redefine

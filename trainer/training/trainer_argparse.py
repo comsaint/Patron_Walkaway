@@ -79,4 +79,15 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
             "Example: --sample-rated 1000 to train on a 1k patron subset."
         ),
     )
+    parser.add_argument(
+        "--lgbm-device",
+        type=str,
+        default=None,
+        metavar="cpu|gpu",
+        help=(
+            "LightGBM training device for Step 9 (OpenCL GPU on Windows via device_type=gpu). "
+            "Overrides LIGHTGBM_DEVICE_TYPE env / config for this run only. "
+            "Default: use LIGHTGBM_DEVICE_TYPE (trainer.core.config, default cpu)."
+        ),
+    )
     return parser

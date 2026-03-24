@@ -1264,7 +1264,16 @@ def screen_features(
                 "lightgbm is required for LGBM feature screening. pip install lightgbm"
             ) from exc
         dtrain = lgb.Dataset(X_safe[names], label=labels)
-        params = {"objective": "binary", "verbosity": -1, "num_leaves": 31, "seed": random_state}
+        # Step 8 screening: CPU-only (GPU plan Phase A — avoid GPU context churn on small matrices).
+        params = {
+            "objective": "binary",
+            "verbosity": -1,
+            "num_leaves": 31,
+            "seed": random_state,
+            "device_type": "cpu",
+            "force_col_wise": True,
+            "n_jobs": -1,
+        }
         model = lgb.train(params, dtrain, num_boost_round=100)
         importance = pd.Series(
             model.feature_importance(importance_type="split"), index=names

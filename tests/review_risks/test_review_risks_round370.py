@@ -42,8 +42,8 @@ class TestR370NegativeSamplingRiskGuards(unittest.TestCase):
         src = inspect.getsource(trainer_mod.process_chunk)
         self.assertRegex(
             src,
-            r"_chunk_cache_key\([^)]*neg_sample_frac\s*=\s*neg_sample_frac",
-            "process_chunk should forward neg_sample_frac when building current_key",
+            r"_chunk_cache_components\([^)]*neg_sample_frac\s*=\s*neg_sample_frac",
+            "process_chunk should forward neg_sample_frac when building cache components",
         )
 
     def test_training_metrics_records_neg_sample_frac(self):

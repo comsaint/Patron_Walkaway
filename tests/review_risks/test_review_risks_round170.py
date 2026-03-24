@@ -106,16 +106,17 @@ class TestR503R504DesignGuardrails(unittest.TestCase):
     """R503/R504: keep explicit structural guardrails around cache and split logic."""
 
     def test_chunk_cache_key_uses_original_chunk_isoformat(self):
-        src = inspect.getsource(trainer_mod._chunk_cache_key)
+        # Task 7 R3: components builder holds window isoformat; wrapper delegates to it.
+        src = inspect.getsource(trainer_mod._chunk_cache_components)
         self.assertIn(
             'ws = chunk["window_start"].isoformat()',
             src,
-            "_chunk_cache_key should keep original chunk isoformat for stable key semantics.",
+            "_chunk_cache_components should keep original chunk isoformat for stable key semantics.",
         )
         self.assertIn(
             'we = chunk["window_end"].isoformat()',
             src,
-            "_chunk_cache_key should keep original chunk isoformat for stable key semantics.",
+            "_chunk_cache_components should keep original chunk isoformat for stable key semantics.",
         )
 
     def test_concat_split_keeps_defensive_tz_strip(self):

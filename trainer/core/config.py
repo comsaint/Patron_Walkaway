@@ -2,7 +2,7 @@ import logging
 import math
 import os
 from pathlib import Path
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple, cast
 
 from dotenv import load_dotenv
 
@@ -240,6 +240,25 @@ OPTUNA_HPO_SAMPLE_ROWS: Optional[int] = 1500000
 # THRESHOLD_FBETA is still used for val_fbeta_05 / reporting only, not for choosing threshold.
 THRESHOLD_FBETA: float = 0.5
 THRESHOLD_OPTIMIZE_PRECISION_AT_RECALL: float = 0.01  # DEC-026: target recall for precision optimisation
+
+# --- LightGBM device (GPU enable plan Phase A) ---
+# Training only: `cpu` (default) or `gpu` (OpenCL on Windows via NVIDIA driver; not `cuda` on Windows).
+# Override with env LIGHTGBM_DEVICE_TYPE=gpu or optional root `config.py` LIGHTGBM_DEVICE_TYPE.
+# Thread count when device_type=gpu (avoid n_jobs=-1 oversubscribing CPU alongside GPU work).
+_LIGHTGBM_DEVICE_RAW = os.getenv("LIGHTGBM_DEVICE_TYPE", "cpu").strip().lower()
+if _LIGHTGBM_DEVICE_RAW not in ("cpu", "gpu"):
+    _log.warning(
+        "LIGHTGBM_DEVICE_TYPE=%r invalid (use cpu or gpu); defaulting to cpu",
+        _LIGHTGBM_DEVICE_RAW,
+    )
+    LIGHTGBM_DEVICE_TYPE: Literal["cpu", "gpu"] = "cpu"
+else:
+    LIGHTGBM_DEVICE_TYPE = cast(Literal["cpu", "gpu"], _LIGHTGBM_DEVICE_RAW)
+try:
+    _lgb_gpu_nj = int(os.getenv("LIGHTGBM_GPU_N_JOBS", "4"))
+    LIGHTGBM_GPU_N_JOBS: int = _lgb_gpu_nj if _lgb_gpu_nj > 0 else 1
+except (TypeError, ValueError):
+    LIGHTGBM_GPU_N_JOBS = 4
 
 # --- Feature screening (DEC-020, PLAN screen-lgbm-default) ---
 # Maximum number of features to keep after screen_features().

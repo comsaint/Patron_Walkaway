@@ -910,4 +910,28 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-036：Task 7 R1（chunk cache `data_hash`）順序不敏感——若採序列模型須重審
+
+**日期**：2026-03-24  
+**SSOT 章節**：[PATCH_20260324.md](PATCH_20260324.md) — Task 7 / R1  
+**關聯**：Step 6 chunk Parquet 快取（[`trainer/training/trainer.py`](../../trainer/training/trainer.py) `_chunk_cache_key`／`process_chunk`）
+
+**背景**：
+
+- R1 目標是以**順序不敏感**的 `data_hash`（或等效 commutative 指紋）減少「同一批 `bets`、僅因來源回傳列順不同」造成的假 cache miss。
+- **目前主力模型**為 tabular／tree-based（LightGBM），訓練表徵在慣例上把每筆 bet 當獨立列；同一組合內列重排通常**不改**標籤與多數手算特徵的語意。
+
+**決策（紀錄性／條件式）**：
+
+1. **在現行 GBDT／tabular 路線下**，R1 與「多重集合」式 `bets` 語意對齊，可作為 cache 指紋策略的預設假設。
+2. **若未來引入序列模型**（例如 **Temporal Fusion Transformer** 或其他 **explicit sequence** 架構），**原始或預處理後的列順序可能成為模型輸入語意的一部分**；此時**不得**在未重新審查的情況下沿用「純順序不敏感」的 chunk `data_hash` 作為唯一有效性判斷。
+3. **遷移時應至少擇一**（可多項並行）：
+   - 改回 **order-aware** fingerprint，或
+   - **先將 bets 依契約排序**（例如 `bet_time`、tie-break `bet_id`）再計算 hash，使「語意序列」穩定，或
+   - 將 `.cache_key`／`data_hash` **與 model family + sequence 定義版本**綁定，避免錯誤共用舊 chunk cache。
+
+**理由**：避免在模型假設從「列無序等價」變為「序列有意義」時，仍以舊快取指紋誤判命中，導致訓練資料與模型假設不一致（高風險語意錯誤）。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

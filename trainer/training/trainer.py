@@ -41,6 +41,7 @@ Data source switching
 from __future__ import annotations
 
 import gc
+import importlib
 import math
 import os
 from importlib import import_module as _import_module_threshold_selection
@@ -54,7 +55,7 @@ import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Set, Tuple, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, cast
 
 import joblib
 import lightgbm as lgb
@@ -251,6 +252,33 @@ except ModuleNotFoundError:
     TRAIN_METRICS_PREDICT_BATCH_ROWS = getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)
     STEP8_SCREEN_SAMPLE_ROWS = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
     CASINO_PLAYER_ID_CLEAN_SQL = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END")
+
+# LightGBM device: env + trainer.core.config default, optional override via root config.py (GPU plan Phase A).
+# importlib: avoid ruff E402 (imports must follow the try/except _cfg block above).
+_core_trainer_config = importlib.import_module("trainer.core.config")
+
+_LIGHTGBM_DEV = str(
+    getattr(_cfg, "LIGHTGBM_DEVICE_TYPE", _core_trainer_config.LIGHTGBM_DEVICE_TYPE)
+).strip().lower()
+if _LIGHTGBM_DEV not in ("cpu", "gpu"):
+    logger.warning("LIGHTGBM_DEVICE_TYPE=%r invalid (use cpu or gpu); using cpu", _LIGHTGBM_DEV)
+    LIGHTGBM_DEVICE_TYPE: str = "cpu"
+else:
+    LIGHTGBM_DEVICE_TYPE = _LIGHTGBM_DEV
+try:
+    LIGHTGBM_GPU_N_JOBS = int(
+        getattr(_cfg, "LIGHTGBM_GPU_N_JOBS", _core_trainer_config.LIGHTGBM_GPU_N_JOBS)
+    )
+except (TypeError, ValueError):
+    LIGHTGBM_GPU_N_JOBS = _core_trainer_config.LIGHTGBM_GPU_N_JOBS
+if LIGHTGBM_GPU_N_JOBS < 1:
+    LIGHTGBM_GPU_N_JOBS = 1
+
+# Effective device for this process: updated by configure_lightgbm_device_for_run() in run_pipeline.
+_EFFECTIVE_LIGHTGBM_DEVICE: str = LIGHTGBM_DEVICE_TYPE
+_LIGHTGBM_GPU_FALLBACK_USED: bool = False
+_REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS: str = LIGHTGBM_DEVICE_TYPE
+_CLI_LIGHTGBM_DEVICE_OVERRIDE: Optional[str] = None
 
 try:
     _threshold_selection_mod = _import_module_threshold_selection(
@@ -1592,6 +1620,46 @@ def _chunk_parquet_path(chunk: dict) -> Path:
     return CHUNK_DIR / f"chunk_{ws}_{we}.parquet"
 
 
+def _chunk_prefeatures_parquet_path(chunk: dict) -> Path:
+    """Task 7 R6: Parquet of bets after Track Human, before Track LLM."""
+    ws = chunk["window_start"].strftime("%Y%m%d")
+    we = chunk["window_end"].strftime("%Y%m%d")
+    return CHUNK_DIR / f"chunk_{ws}_{we}.prefeatures.parquet"
+
+
+def _chunk_prefeatures_sidecar_path(chunk: dict) -> Path:
+    """Sidecar for :func:`_chunk_prefeatures_parquet_path` (same fingerprint pipe format)."""
+    ws = chunk["window_start"].strftime("%Y%m%d")
+    we = chunk["window_end"].strftime("%Y%m%d")
+    return CHUNK_DIR / f"chunk_{ws}_{we}.prefeatures.cache_key"
+
+
+# Sentinel in ``feature_spec_hash`` slot for R6 pre-LLM stage keys (not a real spec hash).
+_CHUNK_PREFEATURES_SPEC_PLACEHOLDER = "__pre_llm__"
+
+
+def _prefeatures_cache_components(components: dict) -> dict:
+    """Task 7 R6: key material for post-Track-Human bets (LLM spec + neg-sample excluded)."""
+    return {
+        **components,
+        "feature_spec_hash": _CHUNK_PREFEATURES_SPEC_PLACEHOLDER,
+        "neg_sample_frac": 1.0,
+    }
+
+
+def _chunk_two_stage_cache_enabled() -> bool:
+    """R6 opt-in via ``CHUNK_TWO_STAGE_CACHE=1`` (or ``true`` / ``yes``)."""
+    v = (os.environ.get("CHUNK_TWO_STAGE_CACHE") or "").strip().lower()
+    return v in ("1", "true", "yes")
+
+
+def _bump_chunk_cache_stat(stats: Optional[Dict[str, int]], key: str) -> None:
+    """Increment optional Step 6 cache counters for pipeline_diagnostics (Task 7 DoD)."""
+    if stats is None:
+        return
+    stats[key] = stats.get(key, 0) + 1
+
+
 def _oom_check_and_adjust_neg_sample_frac(
     chunks: list,
     current_frac: float,
@@ -1821,6 +1889,203 @@ def _oom_check_after_chunk1(
     return auto_frac
 
 
+# Task 7 / R3: structured `.cache_key` sidecar version (fingerprint string unchanged).
+_CHUNK_CACHE_SIDECAR_VERSION = 1
+
+
+def _chunk_cache_components(
+    chunk: dict,
+    bets: Optional[pd.DataFrame] = None,
+    profile_hash: str = "none",
+    feature_spec_hash: str = "none",
+    neg_sample_frac: float = 1.0,
+    *,
+    data_hash: Optional[str] = None,
+) -> dict:
+    """Pipeline components that determine chunk cache validity (TRN-07 / Task 7 R3).
+
+    When ``data_hash`` is set (Task 7 R5 local parquet metadata path), ``bets`` may be
+    omitted. Otherwise ``bets`` is required and row content is hashed (ClickHouse path).
+    """
+    ws = chunk["window_start"].isoformat()
+    we = chunk["window_end"].isoformat()
+    if data_hash is not None:
+        _dh = str(data_hash).strip()
+        if not _dh:
+            raise ValueError("data_hash must be non-empty when provided")
+        data_hash = _dh
+    elif bets is not None:
+        # R1 (Task 7): order-insensitive data fingerprint.
+        data_hash = _order_insensitive_bets_hash(bets)
+    else:
+        raise ValueError("_chunk_cache_components: need bets or data_hash")
+    _effective_lookback = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)
+    cfg_str = json.dumps({
+        "WALKAWAY_GAP_MIN": WALKAWAY_GAP_MIN,
+        "SESSION_AVAIL_DELAY_MIN": SESSION_AVAIL_DELAY_MIN,
+        "HISTORY_BUFFER_DAYS": HISTORY_BUFFER_DAYS,
+        "TRACK_HUMAN_LOOKBACK_HOURS": _effective_lookback,
+    }, sort_keys=True)
+    cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:6]
+    return {
+        "window_start": ws,
+        "window_end": we,
+        "data_hash": data_hash,
+        "cfg_hash": cfg_hash,
+        "profile_hash": profile_hash,
+        "feature_spec_hash": feature_spec_hash,
+        "neg_sample_frac": float(neg_sample_frac),
+    }
+
+
+def _local_parquet_source_data_hash(
+    window_start: datetime,
+    extended_end: datetime,
+) -> str:
+    """Task 7 R5: fingerprint local bet/session parquet **files** without reading row data.
+
+    Uses size, mtime, Parquet footer ``num_rows``, and the same logical filter bounds as
+    ``load_local_parquet`` so chunk keys update when exports or window bounds change.
+
+    **Trade-off**: assumes file replacement updates mtime/size; same-stats in-place byte
+    edits could false-hit cache (acceptable for local/offline iteration).
+    """
+    bets_path = LOCAL_PARQUET_DIR / "gmwds_t_bet.parquet"
+    sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+    bets_lo = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
+    sess_lo = window_start - timedelta(days=1)
+    sess_hi = extended_end + timedelta(days=1)
+    import pyarrow.parquet as pq
+
+    def _file_token(label: str, p: Path) -> str:
+        if not p.exists():
+            return f"{label}:missing:{p.name}"
+        st = p.stat()
+        try:
+            nrows = int(pq.read_metadata(p).num_rows)
+        except Exception as _meta_exc:
+            nrows = -1
+            logger.warning(
+                "Task 7 R5: read_metadata failed for %s (%s): %s",
+                p, label, _meta_exc,
+            )
+        return f"{label}|{p.name}|{st.st_size}|{st.st_mtime_ns}|{nrows}"
+
+    payload = json.dumps({
+        "bet_filter_lo": bets_lo.isoformat(),
+        "bet_filter_hi": extended_end.isoformat(),
+        "sess_filter_lo": sess_lo.isoformat(),
+        "sess_filter_hi": sess_hi.isoformat(),
+        "bet_file": _file_token("bet", bets_path),
+        "sess_file": _file_token("sess", sess_path),
+    }, sort_keys=True)
+    return hashlib.md5(payload.encode()).hexdigest()[:8]
+
+
+def _fingerprint_from_chunk_cache_components(components: dict) -> str:
+    """Legacy-compatible single-line fingerprint (same format as pre-R3)."""
+    ns = float(components["neg_sample_frac"])
+    return (
+        f"{components['window_start']}|{components['window_end']}|{components['data_hash']}"
+        f"|{components['cfg_hash']}|{components['profile_hash']}"
+        f"|spec{components['feature_spec_hash']}|ns{ns:.4f}"
+    )
+
+
+def _parse_chunk_cache_fingerprint_pipe(fingerprint: str) -> Optional[dict]:
+    """Parse a legacy pipe fingerprint into component dict for miss_reason diffing."""
+    parts = fingerprint.strip().split("|")
+    if len(parts) != 7:
+        return None
+    ws, we, dh, ch, ph, spec_part, ns_part = parts
+    if not spec_part.startswith("spec") or not ns_part.startswith("ns"):
+        return None
+    try:
+        ns = float(ns_part[2:])
+    except ValueError:
+        return None
+    return {
+        "window_start": ws,
+        "window_end": we,
+        "data_hash": dh,
+        "cfg_hash": ch,
+        "profile_hash": ph,
+        "feature_spec_hash": spec_part[4:],
+        "neg_sample_frac": ns,
+    }
+
+
+def _read_chunk_cache_sidecar(raw: str) -> Tuple[str, Optional[dict]]:
+    """Return (fingerprint, optional pipeline components) from sidecar file body."""
+    text = raw.strip()
+    if not text:
+        return "", None
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            return text, None
+        fp = obj.get("fingerprint") or obj.get("fp")
+        if not isinstance(fp, str) or not fp:
+            return text, None
+        pipe = obj.get("pipeline")
+        if isinstance(pipe, dict):
+            return fp, pipe
+        return fp, _parse_chunk_cache_fingerprint_pipe(fp)
+    return text, _parse_chunk_cache_fingerprint_pipe(text)
+
+
+def _write_chunk_cache_sidecar(
+    fingerprint: str,
+    components: dict,
+    *,
+    source_mode: str,
+) -> str:
+    """Serialize R3 JSON sidecar; `fingerprint` must match components."""
+    payload = {
+        "v": _CHUNK_CACHE_SIDECAR_VERSION,
+        "fingerprint": fingerprint,
+        "pipeline": {k: components[k] for k in (
+            "window_start", "window_end", "data_hash", "cfg_hash",
+            "profile_hash", "feature_spec_hash", "neg_sample_frac",
+        )},
+        "source": {"mode": source_mode},
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _chunk_cache_miss_reasons(
+    stored_fingerprint: str,
+    stored_components: Optional[dict],
+    current_components: dict,
+) -> List[str]:
+    """Return coarse miss_reason tags: data/config/profile/spec/neg_sample/window."""
+    current_fp = _fingerprint_from_chunk_cache_components(current_components)
+    if stored_fingerprint == current_fp:
+        return []
+    prev = stored_components
+    if prev is None:
+        prev = _parse_chunk_cache_fingerprint_pipe(stored_fingerprint)
+    if prev is None:
+        return ["unparsed_stored_key"]
+    reasons: List[str] = []
+    if prev.get("window_start") != current_components.get("window_start") \
+            or prev.get("window_end") != current_components.get("window_end"):
+        reasons.append("window")
+    if prev.get("data_hash") != current_components.get("data_hash"):
+        reasons.append("data")
+    if prev.get("cfg_hash") != current_components.get("cfg_hash"):
+        reasons.append("config")
+    if prev.get("profile_hash") != current_components.get("profile_hash"):
+        reasons.append("profile")
+    if prev.get("feature_spec_hash") != current_components.get("feature_spec_hash"):
+        reasons.append("spec")
+    if "neg_sample_frac" in prev and "neg_sample_frac" in current_components:
+        if float(prev["neg_sample_frac"]) != float(current_components["neg_sample_frac"]):
+            reasons.append("neg_sample")
+    return reasons or ["fingerprint_mismatch"]
+
+
 def _chunk_cache_key(
     chunk: dict,
     bets: pd.DataFrame,
@@ -1840,21 +2105,67 @@ def _chunk_cache_key(
     R-NEG-1: neg_sample_frac is included so that changing the downsampling ratio
     forces a cache miss and prevents stale full/partial chunks being served.
     """
-    ws = chunk["window_start"].isoformat()
-    we = chunk["window_end"].isoformat()
-    data_hash = hashlib.md5(
-        pd.util.hash_pandas_object(bets, index=False).values.tobytes()
-    ).hexdigest()[:8]
-    # Track Human lookback: always SCORER_LOOKBACK_HOURS (train–serve parity).
-    _effective_lookback = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)
-    cfg_str = json.dumps({
-        "WALKAWAY_GAP_MIN": WALKAWAY_GAP_MIN,
-        "SESSION_AVAIL_DELAY_MIN": SESSION_AVAIL_DELAY_MIN,
-        "HISTORY_BUFFER_DAYS": HISTORY_BUFFER_DAYS,
-        "TRACK_HUMAN_LOOKBACK_HOURS": _effective_lookback,
-    }, sort_keys=True)
-    cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:6]
-    return f"{ws}|{we}|{data_hash}|{cfg_hash}|{profile_hash}|spec{feature_spec_hash}|ns{neg_sample_frac:.4f}"
+    components = _chunk_cache_components(
+        chunk, bets,
+        profile_hash=profile_hash,
+        feature_spec_hash=feature_spec_hash,
+        neg_sample_frac=neg_sample_frac,
+    )
+    return _fingerprint_from_chunk_cache_components(components)
+
+
+def _commutative_frame_row_digest(df: pd.DataFrame) -> str:
+    """Short order-insensitive fingerprint for DataFrame rows (Task 7 R1 / R4)."""
+    row_hash = pd.util.hash_pandas_object(df, index=False).to_numpy(dtype=np.uint64, copy=False)
+    count = np.uint64(row_hash.size)
+    sum64 = np.uint64(row_hash.sum(dtype=np.uint64))
+    xor64 = np.uint64(np.bitwise_xor.reduce(row_hash, dtype=np.uint64)) if row_hash.size else np.uint64(0)
+    sq_sum64 = np.uint64((row_hash * row_hash).sum(dtype=np.uint64)) if row_hash.size else np.uint64(0)
+    digest = hashlib.md5(
+        f"{int(count)}|{int(sum64)}|{int(xor64)}|{int(sq_sum64)}".encode()
+    ).hexdigest()
+    return digest[:8]
+
+
+def _order_insensitive_bets_hash(bets: pd.DataFrame) -> str:
+    """Return a short order-insensitive fingerprint for chunk raw bets."""
+    return _commutative_frame_row_digest(bets)
+
+
+def _profile_hash_chunk_scoped(
+    profile_df: Optional[pd.DataFrame],
+    window_end: datetime,
+) -> str:
+    """Task 7 R4: profile cache component scoped to rows usable for this chunk's PIT join.
+
+    ``join_player_profile`` picks the latest snapshot with ``snapshot_dtm <= payout_complete_dtm``.
+    Training rows in the chunk have ``payout_complete_dtm < window_end`` (DEC-018 naive bounds),
+    so snapshots with ``snapshot_dtm > window_end`` cannot affect this chunk — excluding them
+    avoids invalidating older chunk caches when new month-end snapshots are appended for later chunks.
+
+    Falls back to the legacy run-level fingerprint when ``snapshot_dtm`` is missing.
+    """
+    if profile_df is None or profile_df.empty:
+        return "none"
+    _profile_cols_key = "|".join(sorted(profile_df.columns.tolist()))
+    if "snapshot_dtm" not in profile_df.columns:
+        return hashlib.md5(
+            f"{len(profile_df)}:{_profile_cols_key}".encode()
+        ).hexdigest()[:6]
+    we = window_end.replace(tzinfo=None) if getattr(window_end, "tzinfo", None) else window_end
+    snap = pd.to_datetime(profile_df["snapshot_dtm"])
+    if snap.dt.tz is not None:
+        snap = snap.dt.tz_convert(HK_TZ_STR).dt.tz_localize(None)
+    mask = snap <= we
+    sub = profile_df.loc[mask]
+    if sub.empty:
+        return hashlib.md5(
+            f"p0|{_profile_cols_key}|{we.isoformat()}".encode()
+        ).hexdigest()[:6]
+    body = _commutative_frame_row_digest(sub.reset_index(drop=True))
+    return hashlib.md5(
+        f"{len(sub)}|{_profile_cols_key}|{body}".encode()
+    ).hexdigest()[:6]
 
 
 def process_chunk(
@@ -1867,6 +2178,7 @@ def process_chunk(
     feature_spec: Optional[dict] = None,
     feature_spec_hash: str = "none",
     neg_sample_frac: float = NEG_SAMPLE_FRAC,
+    chunk_cache_stats: Optional[Dict[str, int]] = None,
 ) -> Optional[Path]:
     """Process one monthly chunk; return path to written Parquet or None if empty.
 
@@ -1881,6 +2193,14 @@ def process_chunk(
     neg_sample_frac: fraction of label=0 rows to keep (1.0 = keep all).  Overrides
         the module-level NEG_SAMPLE_FRAC; normally supplied by run_pipeline after the
         OOM pre-check (_oom_check_and_adjust_neg_sample_frac).
+
+    Task 7 R6: set env ``CHUNK_TWO_STAGE_CACHE=1`` to enable a pre-LLM Parquet cache
+    (``*.prefeatures.parquet``) so Track Human can be skipped when only spec/neg_sample
+    (downstream) changes; default off to avoid extra disk use.
+
+    chunk_cache_stats:
+        Optional mutable dict; keys ``step6_chunk_cache_*`` are incremented for
+        :func:`_write_pipeline_diagnostics_json` (Task 7 DoD).
     """
     window_start = chunk["window_start"]
     window_end = chunk["window_end"]
@@ -1899,9 +2219,44 @@ def process_chunk(
             f"DEC-018: {_bname} must be tz-naive inside process_chunk (got {_bval!r})"
 
     chunk_path = _chunk_parquet_path(chunk)
+    key_path = chunk_path.with_suffix(".cache_key")
+    _source_mode = "local_parquet" if use_local_parquet else "clickhouse"
 
-    # --- Load data ---
+    # R77 / Task 7 R4: profile snapshot fingerprint (chunk-scoped).
+    _profile_hash = _profile_hash_chunk_scoped(profile_df, window_end)
+
+    # --- Load data (local: metadata cache key first so cache hits skip Parquet IO) ---
     if use_local_parquet:
+        # Task 7 R5: file-level fingerprint + filter bounds aligned with load_local_parquet.
+        _dh_local = _local_parquet_source_data_hash(window_start, extended_end)
+        _cache_components = _chunk_cache_components(
+            chunk,
+            None,
+            profile_hash=_profile_hash,
+            feature_spec_hash=feature_spec_hash,
+            neg_sample_frac=neg_sample_frac,
+            data_hash=_dh_local,
+        )
+        current_key = _fingerprint_from_chunk_cache_components(_cache_components)
+        if not force_recompute and chunk_path.exists():
+            stored_raw = key_path.read_text(encoding="utf-8") if key_path.exists() else ""
+            stored_key, stored_comp = _read_chunk_cache_sidecar(stored_raw)
+            if stored_key == current_key:
+                logger.info(
+                    "Chunk %s–%s: cache hit (key=%s, local metadata)",
+                    window_start.date(), window_end.date(), current_key,
+                )
+                _bump_chunk_cache_stat(chunk_cache_stats, "step6_chunk_cache_final_hit_total")
+                _bump_chunk_cache_stat(
+                    chunk_cache_stats, "step6_chunk_cache_final_hit_local_metadata_total",
+                )
+                return chunk_path
+            else:
+                miss_reasons = _chunk_cache_miss_reasons(stored_key, stored_comp, _cache_components)
+                logger.info(
+                    "Chunk %s–%s: cache stale (key mismatch, miss_reason=%s), recomputing",
+                    window_start.date(), window_end.date(), miss_reasons,
+                )
         bets_raw, sessions_raw = load_local_parquet(window_start, extended_end)
     else:
         bets_raw, sessions_raw = load_clickhouse_data(window_start, extended_end)
@@ -1910,43 +2265,35 @@ def process_chunk(
         logger.warning("Chunk %s–%s: no bets, skipping", window_start.date(), window_end.date())
         return None
 
-    # --- TRN-07: cache validity via content hash ---
-    # Compute the cache key from chunk metadata + raw bets hash so that DQ rule
-    # or config changes (which alter bets_raw content) automatically invalidate
-    # the cached Parquet even when force_recompute=False.
-    # R77: include profile snapshot shape/col list so profile table changes also
-    # bust the cache.
-    _profile_hash: str
-    if profile_df is not None and not profile_df.empty:
-        _profile_cols_key = "|".join(sorted(profile_df.columns.tolist()))
-        _profile_hash = hashlib.md5(
-            f"{len(profile_df)}:{_profile_cols_key}".encode()
-        ).hexdigest()[:6]
-    else:
-        _profile_hash = "none"
-    current_key = _chunk_cache_key(
-        chunk, bets_raw, profile_hash=_profile_hash,
-        feature_spec_hash=feature_spec_hash,
-        neg_sample_frac=neg_sample_frac)
-    key_path = chunk_path.with_suffix(".cache_key")
-    if not force_recompute and chunk_path.exists():
-        stored_key = key_path.read_text(encoding="utf-8").strip() if key_path.exists() else ""
-        if stored_key == current_key:
-            try:
-                cached = pd.read_parquet(chunk_path)
+    # --- TRN-07: ClickHouse path — cache key from raw bets content hash ---
+    if not use_local_parquet:
+        _cache_components = _chunk_cache_components(
+            chunk,
+            bets_raw,
+            profile_hash=_profile_hash,
+            feature_spec_hash=feature_spec_hash,
+            neg_sample_frac=neg_sample_frac,
+        )
+        current_key = _fingerprint_from_chunk_cache_components(_cache_components)
+        if not force_recompute and chunk_path.exists():
+            stored_raw = key_path.read_text(encoding="utf-8") if key_path.exists() else ""
+            stored_key, stored_comp = _read_chunk_cache_sidecar(stored_raw)
+            if stored_key == current_key:
                 logger.info(
-                    "Chunk %s–%s: cache hit (%d rows, key=%s)",
-                    window_start.date(), window_end.date(), len(cached), current_key,
+                    "Chunk %s–%s: cache hit (key=%s)",
+                    window_start.date(), window_end.date(), current_key,
+                )
+                _bump_chunk_cache_stat(chunk_cache_stats, "step6_chunk_cache_final_hit_total")
+                _bump_chunk_cache_stat(
+                    chunk_cache_stats, "step6_chunk_cache_final_hit_after_load_total",
                 )
                 return chunk_path
-            except Exception:
-                logger.warning(
-                    "Chunk %s–%s: cache corrupt, recomputing", window_start.date(), window_end.date()
+            else:
+                miss_reasons = _chunk_cache_miss_reasons(stored_key, stored_comp, _cache_components)
+                logger.info(
+                    "Chunk %s–%s: cache stale (key mismatch, miss_reason=%s), recomputing",
+                    window_start.date(), window_end.date(), miss_reasons,
                 )
-        else:
-            logger.info(
-                "Chunk %s–%s: cache stale (key mismatch), recomputing", window_start.date(), window_end.date()
-            )
 
     # --- Post-Load Normalizer (PLAN § Post-Load Normalizer Phase 2) ---
     bets_norm, sessions_norm = normalize_bets_sessions(bets_raw, sessions_raw)
@@ -1990,8 +2337,43 @@ def process_chunk(
     # Computing before label filtering ensures cross-chunk state (loss_streak,
     # run_boundary) uses historical context from HISTORY_BUFFER_DAYS before window_start.
     # Always use SCORER_LOOKBACK_HOURS for train–serve parity (same window as scorer, default 8h).
+    # Task 7 R6: optional pre-LLM Parquet cache (skip Track Human when key matches).
     _lookback_hours = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)
-    bets = add_track_human_features(bets, canonical_map, window_end, lookback_hours=_lookback_hours)
+    _two_stage = _chunk_two_stage_cache_enabled()
+    _pref_path = _chunk_prefeatures_parquet_path(chunk)
+    _pref_key_path = _chunk_prefeatures_sidecar_path(chunk)
+    _pref_comps = _prefeatures_cache_components(_cache_components)
+    _pref_key = _fingerprint_from_chunk_cache_components(_pref_comps)
+    _skip_track_human = False
+    if _two_stage and not force_recompute and _pref_path.exists():
+        stored_pref = _pref_key_path.read_text(encoding="utf-8") if _pref_key_path.exists() else ""
+        sk, sc = _read_chunk_cache_sidecar(stored_pref)
+        if sk == _pref_key:
+            logger.info(
+                "Chunk %s–%s: prefeatures cache hit (key=%s), skipping Track Human",
+                window_start.date(), window_end.date(), _pref_key,
+            )
+            bets = pd.read_parquet(_pref_path)
+            _skip_track_human = True
+            _bump_chunk_cache_stat(chunk_cache_stats, "step6_chunk_cache_prefeatures_hit_total")
+        else:
+            miss_reasons = _chunk_cache_miss_reasons(sk, sc, _pref_comps)
+            logger.info(
+                "Chunk %s–%s: prefeatures cache stale (miss_reason=%s), recomputing Track Human",
+                window_start.date(), window_end.date(), miss_reasons,
+            )
+
+    if not _skip_track_human:
+        bets = add_track_human_features(bets, canonical_map, window_end, lookback_hours=_lookback_hours)
+        if _two_stage:
+            _bump_chunk_cache_stat(
+                chunk_cache_stats, "step6_chunk_cache_prefeatures_track_human_recompute_total",
+            )
+            bets.to_parquet(_pref_path, index=False)
+            _pref_key_path.write_text(
+                _write_chunk_cache_sidecar(_pref_key, _pref_comps, source_mode=_source_mode),
+                encoding="utf-8",
+            )
 
     # --- Track LLM: DuckDB + Feature Spec YAML (DEC-022/023/024) ---
     # R3500: compute on the FULL bets DataFrame (with HISTORY_BUFFER_DAYS context)
@@ -2133,8 +2515,11 @@ def process_chunk(
     )
 
     labeled.to_parquet(chunk_path, index=False)
-    # Persist the cache key so future runs can detect stale data (TRN-07)
-    key_path.write_text(current_key, encoding="utf-8")
+    # Persist structured cache sidecar (Task 7 R3); fingerprint matches legacy pipe format.
+    key_path.write_text(
+        _write_chunk_cache_sidecar(current_key, _cache_components, source_mode=_source_mode),
+        encoding="utf-8",
+    )
     return chunk_path
 
 
@@ -2577,15 +2962,84 @@ class _BoosterWrapper:
 # Optuna hyperparameter search (per model type)
 # ---------------------------------------------------------------------------
 
-def _base_lgb_params() -> dict:
-    return {
+def _lightgbm_gpu_probe_ok() -> bool:
+    """Tiny fit to verify OpenCL GPU path works on this machine (Windows: device_type=gpu)."""
+    try:
+        X = np.random.RandomState(0).rand(80, 6).astype(np.float32)
+        y = (X[:, 0] > 0.5).astype(np.int32)
+        clf = lgb.LGBMClassifier(
+            objective="binary",
+            device_type="gpu",
+            n_estimators=3,
+            max_depth=3,
+            num_leaves=8,
+            verbose=-1,
+            n_jobs=1,
+        )
+        clf.fit(X, y)
+        return True
+    except Exception as exc:
+        logger.warning("LightGBM GPU probe failed: %s", exc)
+        return False
+
+
+def configure_lightgbm_device_for_run(args: Any) -> None:
+    """Resolve CLI override, optional GPU probe, set effective device for this pipeline run."""
+    global _EFFECTIVE_LIGHTGBM_DEVICE, _LIGHTGBM_GPU_FALLBACK_USED
+    global _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS, _CLI_LIGHTGBM_DEVICE_OVERRIDE
+
+    raw = getattr(args, "lgbm_device", None)
+    if raw is None or (isinstance(raw, str) and not str(raw).strip()):
+        _CLI_LIGHTGBM_DEVICE_OVERRIDE = None
+    else:
+        s = str(raw).strip().lower()
+        if s not in ("cpu", "gpu"):
+            raise SystemExit("Invalid --lgbm-device %r; use cpu or gpu." % (raw,))
+        _CLI_LIGHTGBM_DEVICE_OVERRIDE = s
+
+    req = _CLI_LIGHTGBM_DEVICE_OVERRIDE if _CLI_LIGHTGBM_DEVICE_OVERRIDE is not None else LIGHTGBM_DEVICE_TYPE
+    _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS = req
+    _LIGHTGBM_GPU_FALLBACK_USED = False
+
+    if req == "cpu":
+        _EFFECTIVE_LIGHTGBM_DEVICE = "cpu"
+        logger.info("LightGBM: effective device=cpu (requested)")
+        return
+
+    if _lightgbm_gpu_probe_ok():
+        _EFFECTIVE_LIGHTGBM_DEVICE = "gpu"
+        logger.info("LightGBM: effective device=gpu (requested, probe ok)")
+        return
+
+    _EFFECTIVE_LIGHTGBM_DEVICE = "cpu"
+    _LIGHTGBM_GPU_FALLBACK_USED = True
+    logger.warning(
+        "LightGBM: GPU requested but probe failed; using cpu for this run "
+        "(fix OpenCL/driver or pass --lgbm-device cpu / LIGHTGBM_DEVICE_TYPE=cpu)."
+    )
+
+
+def _lgb_params_for_pipeline() -> dict:
+    """LightGBM params shared by Optuna, final fit, and lgb.train (device-aware)."""
+    dev = _EFFECTIVE_LIGHTGBM_DEVICE
+    out: dict[str, Any] = {
         "objective": "binary",
         "class_weight": "balanced",
-        "force_col_wise": True,
         "verbose": -1,
-        "n_jobs": -1,
         "random_state": 42,
+        "device_type": dev,
     }
+    if dev == "cpu":
+        out["force_col_wise"] = True
+        out["n_jobs"] = -1
+    else:
+        out["n_jobs"] = int(LIGHTGBM_GPU_N_JOBS)
+    return out
+
+
+def _base_lgb_params() -> dict:
+    """Backward-compat alias for :func:`_lgb_params_for_pipeline`."""
+    return _lgb_params_for_pipeline()
 
 
 def run_optuna_search(
@@ -2667,7 +3121,7 @@ def run_optuna_search(
 
     def objective(trial: optuna.Trial) -> float:
         params = {
-            **_base_lgb_params(),
+            **_lgb_params_for_pipeline(),
             "n_estimators": trial.suggest_int("n_estimators", 100, 800, step=50),
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
             "max_depth": trial.suggest_int("max_depth", 3, 10),
@@ -2828,7 +3282,7 @@ def _train_one_model(
             "%s: training set has only one class (y_train.nunique()=%d); need both 0 and 1."
             % (label or "model", int(y_train.nunique()))
         )
-    params = {**_base_lgb_params(), **hyperparams}
+    params = {**_lgb_params_for_pipeline(), **hyperparams}
     model = lgb.LGBMClassifier(**params)
 
     # bug-empty-valid-test-when-few-chunks: LightGBM raises ValueError when
@@ -3962,7 +4416,7 @@ def train_single_rated_model(
             }
             hp_resolved = {**_default_hp, **hp}
             hp_lgb = {
-                **_base_lgb_params(),
+                **_lgb_params_for_pipeline(),
                 "learning_rate": hp_resolved["learning_rate"],
                 "num_leaves": hp_resolved["num_leaves"],
                 "max_depth": hp_resolved["max_depth"],
@@ -4098,7 +4552,7 @@ def train_single_rated_model(
             }
             hp_resolved = {**_default_rated_hp, **hp}
             hp_lgb = {
-                **_base_lgb_params(),
+                **_lgb_params_for_pipeline(),
                 "learning_rate": hp_resolved["learning_rate"],
                 "num_leaves": hp_resolved["num_leaves"],
                 "max_depth": hp_resolved["max_depth"],
@@ -4358,6 +4812,10 @@ def train_single_rated_model(
             )
         logger.info("rated test PR-curve: %s", "  ".join(_par_parts))
 
+    metrics["lightgbm_device_requested"] = _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS
+    metrics["lightgbm_device_type"] = _EFFECTIVE_LIGHTGBM_DEVICE
+    metrics["lightgbm_device_fallback"] = bool(_LIGHTGBM_GPU_FALLBACK_USED)
+
     metrics["feature_importance"] = _compute_feature_importance(model, avail_cols)
     metrics["importance_method"] = "gain"
 
@@ -4599,11 +5057,15 @@ def _write_pipeline_diagnostics_json(
     step7_rss_end_gb: Optional[float] = None,
     step7_sys_available_min_gb: Optional[float] = None,
     step7_sys_used_percent_peak: Optional[float] = None,
+    chunk_cache_stats: Optional[Dict[str, int]] = None,
 ) -> None:
     """Write resource/timing diagnostics to MODEL_DIR/pipeline_diagnostics.json (omit None keys).
 
     See doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md — RSS/OOM fields align with
     run_pipeline sampling and oom_precheck estimate, not OOM helper return values.
+
+    ``chunk_cache_stats``: optional Step 6 cache counters from :func:`process_chunk`
+    (keys ``step6_chunk_cache_*``) for Task 7 DoD / hit-ratio analysis.
     """
     payload: dict[str, Any] = {
         "model_version": model_version,
@@ -4629,6 +5091,10 @@ def _write_pipeline_diagnostics_json(
         "step7_sys_used_percent_peak": step7_sys_used_percent_peak,
     }
     out = {k: v for k, v in payload.items() if v is not None}
+    if chunk_cache_stats:
+        for _ck, _cv in chunk_cache_stats.items():
+            if _cv is not None:
+                out[_ck] = _cv
     (MODEL_DIR / "pipeline_diagnostics.json").write_text(
         json.dumps(out, indent=2, default=str),
         encoding="utf-8",
@@ -4666,6 +5132,7 @@ def run_pipeline(args) -> None:
     use_local = getattr(args, "use_local_parquet", False)
     force = getattr(args, "force_recompute", False)
     skip_optuna = getattr(args, "skip_optuna", False)
+    configure_lightgbm_device_for_run(args)
     # --no-preload: disable session full-table preload; use per-day PyArrow
     # pushdown reads instead.  Reduces peak RAM for low-RAM machines.
     no_preload = getattr(args, "no_preload", False)
@@ -4755,6 +5222,8 @@ def run_pipeline(args) -> None:
             step7_sys_used_percent_peak: Optional[float] = None
             _step7_sys_available_start_gb: Optional[float] = None
             _step7_sys_used_percent_start: Optional[float] = None
+            # Task 7 DoD: Step 6 chunk cache counters -> pipeline_diagnostics.json
+            chunk_cache_stats: Dict[str, int] = {}
 
             # 1. Monthly chunks (DEC-008 / SSOT §4.3)
             print("[Step 1/10] Training window and monthly chunks…", flush=True)
@@ -5075,6 +5544,7 @@ def run_pipeline(args) -> None:
                         feature_spec=feature_spec,
                         feature_spec_hash=feature_spec_hash,
                         neg_sample_frac=1.0,
+                        chunk_cache_stats=chunk_cache_stats,
                     )
                     if path1 is not None:
                         _path1 = Path(path1) if isinstance(path1, str) else path1
@@ -5094,6 +5564,7 @@ def run_pipeline(args) -> None:
                                     feature_spec=feature_spec,
                                     feature_spec_hash=feature_spec_hash,
                                     neg_sample_frac=_effective_neg_sample_frac,
+                                    chunk_cache_stats=chunk_cache_stats,
                                 )
                                 if path1_rerun is not None:
                                     chunk_paths.append(path1_rerun)
@@ -5120,6 +5591,7 @@ def run_pipeline(args) -> None:
                                 feature_spec=feature_spec,
                                 feature_spec_hash=feature_spec_hash,
                                 neg_sample_frac=_effective_neg_sample_frac,
+                                chunk_cache_stats=chunk_cache_stats,
                             )
                             if path is not None:
                                 chunk_paths.append(path)
@@ -5138,6 +5610,7 @@ def run_pipeline(args) -> None:
                                 feature_spec=feature_spec,
                                 feature_spec_hash=feature_spec_hash,
                                 neg_sample_frac=_effective_neg_sample_frac,
+                                chunk_cache_stats=chunk_cache_stats,
                             )
                             if path is not None:
                                 chunk_paths.append(path)
@@ -5155,6 +5628,7 @@ def run_pipeline(args) -> None:
                             feature_spec=feature_spec,
                             feature_spec_hash=feature_spec_hash,
                             neg_sample_frac=_effective_neg_sample_frac,
+                            chunk_cache_stats=chunk_cache_stats,
                         )
                         if path is not None:
                             chunk_paths.append(path)
@@ -5732,6 +6206,7 @@ def run_pipeline(args) -> None:
                         feature_spec=feature_spec,
                         feature_spec_hash=feature_spec_hash,
                         neg_sample_frac=neg_frac,
+                        chunk_cache_stats=chunk_cache_stats,
                     )
                     if _path is not None:
                         paths.append(_path)
@@ -6126,6 +6601,7 @@ def run_pipeline(args) -> None:
                     step7_rss_end_gb=step7_rss_end_gb,
                     step7_sys_available_min_gb=step7_sys_available_min_gb,
                     step7_sys_used_percent_peak=step7_sys_used_percent_peak,
+                    chunk_cache_stats=chunk_cache_stats,
                 )
             except Exception as _diag_exc:
                 logger.warning(
@@ -6159,6 +6635,14 @@ def run_pipeline(args) -> None:
                 oom_params_clean = {k: v for k, v in oom_params.items() if v is not None}
                 if oom_params_clean:
                     log_params_safe(oom_params_clean)
+
+                log_params_safe(
+                    {
+                        "lightgbm_device_requested": _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS,
+                        "lightgbm_device_effective": _EFFECTIVE_LIGHTGBM_DEVICE,
+                        "lightgbm_device_fallback": str(bool(_LIGHTGBM_GPU_FALLBACK_USED)),
+                    }
+                )
 
                 # Training metrics from artifact, then pipeline timing + memory/OOM last so
                 # combined_metrics["rated"] cannot overwrite reserved keys (vs pipeline_diagnostics.json).

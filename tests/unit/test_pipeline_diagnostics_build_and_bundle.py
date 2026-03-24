@@ -194,3 +194,24 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
             raw = (model_dir / "pipeline_diagnostics.json").read_text(encoding="utf-8")
             data = json.loads(raw)
         self.assertEqual(data["total_duration_sec"], "WEIRD_MARKER")
+
+    def test_chunk_cache_stats_merged_into_pipeline_diagnostics(self) -> None:
+        """Task 7 DoD: optional chunk_cache_stats keys appear in pipeline_diagnostics.json."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td)
+            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+                trainer_mod._write_pipeline_diagnostics_json(
+                    model_version="mv",
+                    pipeline_started_at="2026-03-24T00:00:00+00:00",
+                    pipeline_finished_at="2026-03-24T01:00:00+00:00",
+                    total_duration_sec=10.0,
+                    chunk_cache_stats={
+                        "step6_chunk_cache_final_hit_total": 2,
+                        "step6_chunk_cache_prefeatures_hit_total": 1,
+                    },
+                )
+            data = json.loads((model_dir / "pipeline_diagnostics.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["step6_chunk_cache_final_hit_total"], 2)
+        self.assertEqual(data["step6_chunk_cache_prefeatures_hit_total"], 1)
