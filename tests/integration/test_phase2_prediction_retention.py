@@ -16,7 +16,6 @@ from pathlib import Path
 from trainer.serving import scorer as scorer_mod
 from trainer.scripts.export_predictions_to_mlflow import (
     _ensure_export_meta_tables,
-    _get_last_exported_id,
     _run_retention_cleanup,
     _set_last_exported_id,
 )

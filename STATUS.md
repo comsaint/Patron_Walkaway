@@ -5530,3 +5530,1321 @@ python -m pytest tests/review_risks/test_threshold_dec032_review_risks_mre.py -v
 **自動驗證（本機 agent）**：ruff **All checks passed**；pytest **8 passed**（約 1.4s）。
 
 **說明**：若日後 production 將 `compute_micro_metrics` 改為「單次 PR 曲線 + 四 recall」，請同步將 **#1** 之預期呼叫次數改為 **1**（或改為 assert ≤1）。
+
+---
+
+## 變更紀錄（追加）— Deploy flush CLI 與 PATCH Task 1 對齊（2026-03-24）
+
+**背景**：`.cursor/plans/PATCH_20260324.md` 與 Guardrails 描述之介面為 `--flush-all`／`--flush-state`／`--flush-prediction`（互斥、預設不 flush）；程式先前仍為舊旗標 `--flush`（僅清 state），與文件不一致。本次將 `package/deploy/main.py` 與計畫用語對齊；`trainer` 端 `SCORER_COLD_START_WINDOW_HOURS` 等未於本條修改。
+
+### 修改檔案
+
+| 檔案 | 摘要 |
+|------|------|
+| [`package/deploy/main.py`](package/deploy/main.py) | `argparse`：`--flush-all`／`--flush-state`／`--flush-prediction`（`mutually_exclusive_group`）；頂層 `description` 與各項 `help` 對齊 PATCH（含 `STATE_DB_PATH`／`PREDICTION_LOG_DB_PATH`、SQLite bundle 含 `-wal`/`-shm`、`SCORER_COLD_START_WINDOW_HOURS` 為 env）；新增 `flush_prediction_log_db_only()`、`flush_all_sqlite_bundles()`；移除 `--flush`；日誌前綴改為 `[deploy] flush …`。 |
+
+### 手動驗證建議
+
+1. **`--help` 與互斥**（須已具備可啟動 deploy 之 `.env`：`CH_USER`／`CH_PASS`、`feature_spec.yaml` 等，因為目前 `main.py` 在解析 CLI 前會先做環境檢查）  
+   - 在 `package/deploy/` 下：`python main.py --help`  
+   - 預期：`description` 含上述 env 與可選 flush；可見三個 flush 旗標、**不可**再見 `--flush`。  
+   - 預期：`python main.py --flush-state --flush-prediction` 應由 argparse 報錯（互斥）。
+
+2. **Flush 行為（建議用測試用 `.env` 與臨時 DB 路徑，避免弄髒正式檔）**  
+   - 設定 `STATE_DB_PATH`、`PREDICTION_LOG_DB_PATH` 指向**可刪除**之兩個不同路徑（或同一機制下兩個檔名）。  
+   - 先手動建立兩個空 SQLite 檔（或可讓前一輪 scorer 建立），確認主檔、`*.db-wal`、`*.db-shm` 若存在則一併被刪。  
+   - `--flush-state`：僅 state 一路徑之 bundle 消失；prediction log 路徑仍存在。  
+   - `--flush-prediction`：僅 prediction log bundle 消失；state 仍存在。  
+   - `--flush-all`：兩路徑 bundle 皆消失。  
+   - `PREDICTION_LOG_DB_PATH` 為空時：`--flush-prediction` 或 `--flush-all` 應對 prediction 端 **log warning 並 skip**（state 仍可按旗標清除）。
+
+3. **相容**  
+   - 沿用舊 **`--flush` 的腳本／排程**需改為 **`--flush-state`**（語意相同）。
+
+### 下一步建議
+
+- 搜尋內部 runbook、Wiki、`package/README.md` 等是否仍寫 `--flush`，改為三旗標並註明互斥。  
+- 可選：替 `package/deploy/main.py` 增加 **輕量測試**（例如 subprocess `--help`、或僅抽 `build_parser()` 單元測試），避免 argparse 再度與 PATCH 漂移。  
+- 若對外發佈 **deploy 套件／wheel**，記得 **重打包** 使安裝端拿到新版 `main.py`。  
+- 續跑 `.cursor/plans/PATCH_20260324.md` 其餘項目（例如 Task 3／Task 4）時，一併確認本變更與文件中「✅ Done」敘述一致。
+
+### Code Review（追加）— `package/deploy/main.py`：flush CLI、啟動檢查與 `parse_known_args`（2026-03-24）
+
+**範圍**：以上 deploy 變更與其直接耦合行為（不含 Flask `/alerts` 全表載入等既有課題，僅在相關時點名）。
+
+#### 1. [可用性／操作風險] `--help` 需先通過 `.env`／`CH_*`／`feature_spec` 檢查
+
+- **問題**：模組在建立 `ArgumentParser` 之前即可能 `sys.exit`；運維在**未備妥完整環境**時無法用 `python main.py -h` 快速確認旗標與語意，易誤以為程式壞掉或改抄錯指令。
+- **具體修改建議**：在**最前面**以最小成本解析 `sys.argv`：若僅含 `-h`／`--help`（可選 `--version`），則印出與現行一致之說明後 `exit 0`，**不**強制載入 ClickHouse 憑證與 `feature_spec`；或將「強制檢查」延後到 `args` 解析完且**非** help-only 模式之後。
+- **希望新增的測試**：`subprocess` 在**無** `.env` 或**空** `CH_USER` 的目錄執行 `python main.py --help`，assert **exit code 0** 且輸出 stdout 含 `--flush-all` 與互斥說明（或抽 `build_deploy_arg_parser()` 單元測試只 assert parser 欄位）。
+
+#### 2. [Bug／邊界] `parse_known_args` + 互斥群組：旗標拼字錯誤會「靜默不 flush」
+
+- **問題**：使用 `parse_known_args()` 時，錯誤旗標（例如 `--flush-stste`、多一個 `-`）落入 `_unknown`，僅打 **warning**，**不會** `sys.exit`；使用者以為已清庫，實際未執行 flush，與維運預期相反。
+- **具體修改建議**（擇一或並用）：(A) 對 `_unknown` 做任何一筆以 `--flush` 開頭的參數偵測，若與三合法旗標不符則 **`sys.exit(2)`** 並列出正確拼法；(B) 廢棄的 `--flush` 若出現在 argv，**明確報錯**並提示改用 `--flush-state`；(C) 若確定 deploy 進程不需要「多餘 argv」，改為 `parse_args()` 並僅宣告本檔使用之參數。
+- **希望新增的測試**：模擬 argv `["main.py", "--flush-stake"]`，assert **非零離開**或 assert **未**呼叫刪檔邏輯且 stderr／log 含「未知 flush」類訊息；另測合法 `--flush-state` 仍通過。
+
+#### 3. [邊界／語意] `STATE_DB_PATH` 與 `PREDICTION_LOG_DB_PATH` 解析後相同
+
+- **問題**：若兩者誤設為**同一路徑**（或 symlink 解析後相同），`--flush-state`／`--flush-prediction` 的「只清其一」敘述**失真**，實際上會刪掉**同一份** SQLite bundle，另一「邏輯」資料亦消失，易造成誤判與 runbook 不符。
+- **具體修改建議**：在執行 flush 前對 `Path(...).resolve()` 比對兩路徑；若相同則 **`logger.warning`** 說明「兩路徑指向同一檔，單一旗標即刪整份 bundle」；可選：在 `--flush-state` 且僅應觸碰 state 時若路徑同則要求改用 `--flush-all` 或 `--flush-state` 並加 **`--i-know-same-path`**（產品可再定）。
+- **希望新增的測試**：tempdir 內同一 `foo.db`，patch env／`STATE_DB_PATH`／`PREDICTION_LOG_DB_PATH` 與 `_config.PREDICTION_LOG_DB_PATH`，呼叫 `flush_state_db_only()` 後 assert 檔案不存在；並 assert log／行為符合「同 path」警告（若已實作）。
+
+#### 4. [邊界／可靠性] SQLite 正被其他程序佔用時 `unlink` 失敗
+
+- **問題**：Windows 常見「檔案仍在使用」導致 `OSError`；現況僅 `log.warning`，若主檔仍存在，後續執行緒仍啟動，可能讀到**舊 state** 或遇不明錯誤，與「已 flush 重跑」假設不符。
+- **具體修改建議**：當使用者**顯式**傳入 flush 旗標時，若刪除後 **主 `.db` 仍存在**（或 `os.path.exists`），改為 **`sys.exit(1)`** 並提示關閉其他 scorer／inspector／檔案總管鎖定；或實作有限次數重試＋短暫 sleep（僅限非互動部署）。文件／`--help` 加一句「flush 前請停掉其他程序」。
+- **希望新增的測試**：mock `Path.unlink` 對主檔拋 `PermissionError`，assert 在「strict flush」模式下 **process exit 1**（若實作）；若維持現況僅 warning，則測試記錄**現狀**為「仍會啟動」以利迴歸感知。
+
+#### 5. [安全性] 破壞性刪除路徑完全由環境變數決定
+
+- **問題**：任何能改寫 deploy 機器上 `.env` 或程序環境的人，可把 `STATE_DB_PATH`／`PREDICTION_LOG_DB_PATH` 指到**預期外**路徑（含 symlink 解析後跳出 deploy 目錄）；`--flush-all` 會刪主檔與 `-wal`/`-shm`，屬高風險操作。
+- **具體修改建議**（擇一）：(A) 僅允許刪除 **落在 `DEPLOY_ROOT`（或可設定 `DEPLOY_DATA_ROOT`）底下** 的 resolved path，否則拒絕 flush 並 exit；(B) 需額外環境變數 **`DEPLOY_ALLOW_DESTRUCTIVE_FLUSH=1`** 才允許執行；(C) 至少在 README／runbook 標為「需信任來源之組態，等同 `rm`」。
+- **希望新增的測試**：設定 `STATE_DB_PATH` 指向 tempdir **外**之虛構路徑／或 `../../outside.db` 解析後越界，assert flush **不**執行刪除並 exit 非零（若採 A/B）；若僅文件化，則省略自動測試、保留手動檢查清單。
+
+#### 6. [效能／可觀測性]（沿用檔案其餘邏輯，非本次 diff 引入）
+
+- **問題**：Flask 路徑仍對 `alerts`／`validation_results` 做 **`SELECT *`** 後於 pandas 篩選；資料表變大時延遲與記憶體與 PATCH Task 3／4 所列一致。
+- **具體修改建議**：維持 roadmap 之下推 SQL／增量讀取；與本 flush 變更無直接衝突。
+- **希望新增的測試**：無需因本次 flush 新增；延續 Task 3 Phase 4 之整合測試計畫即可。
+
+---
+
+**審查者說明**：以上為針對**目前** `package/deploy/main.py` 變更之最可能風險與可驗證後續；**未**將建議全部實作為本 review 之一部分。
+
+### Review 風險點 → MRE／契約測試（2026-03-24｜僅 tests）
+
+- **新增檔案**：[`tests/review_risks/test_deploy_main_review_risks_mre.py`](tests/review_risks/test_deploy_main_review_risks_mre.py)  
+- **原則**：**不修改 production**；以讀取 [`package/deploy/main.py`](package/deploy/main.py) 之契約斷言為主，必要時以 **隔離 tempdir** 複製 `main.py` + 最小 `.env`／`models/feature_spec.yaml` 做 subprocess；子程序內以 `sys.modules["walkaway_ml"] = trainer` 模擬套件別名（免依賴已安裝 wheel）。含 **`flask`／`numpy`／`pandas`** 的子程序案例在缺依賴時 **skip**。
+
+| # | 對應 Review | 測試類別／摘要 |
+|---|-------------|----------------|
+| 1 | `#1` help 與 env 順序 | `TestReview1HelpBlockedUntilEnvChecksSourceOrder` — `ArgumentParser(` 須在 `if __name__ == "__main__"` 之後；`.env` gate 須在 `__main__` 之前。`TestReview1SubprocessHelpRequiresSandboxEnv` — 無 `.env` 時 `--help` 仍無法跑；具最小 `.env` 時 `--help` 成功且輸出含三 flush 旗標。 |
+| 2 | `#2` `parse_known_args` 錯拼 | `TestReview2ParseKnownArgsSilentTypoSource` — 原始碼含 `parse_known_args` 與 `Ignoring unrecognized argv`。`TestReview2SubprocessTypoFlushFlagStillStarts` — `--flush-stake` 觸發上述 log、`state.db` 未被刪（於 `TemporaryDirectory` 內斷言）；程序阻塞至 `subprocess` timeout。 |
+| 3 | `#3` 同路徑 | `TestReview3NoSameResolvedPathGuard` — `flush_all_sqlite_bundles` 區塊內無 `resolve()` 碰撞防護（**現況契約**；若日後加防護請改測試）。 |
+| 4 | `#4` unlink 失敗 | `TestReview4UnlinkOnlyLogsOSError` — `_unlink_sqlite_bundle` 對 `OSError` 僅 `log.warning`、不 `sys.exit`。 |
+| 5 | `#5` 路徑允許清單 | `TestReview5NoDeployRootAllowlistOnUnlink` — `_unlink_sqlite_bundle` 不引用 `DEPLOY_ROOT`；全檔無 `DEPLOY_ALLOW`。 |
+| 6 | `#6` `SELECT *` | `TestReview6SelectStarStillPresent` — 仍含 `SELECT * FROM alerts`／`validation_results`（文件化現況）。 |
+| — | 相容 | `TestDeprecatedFlushFlagRemoved` — 原始碼字串中不得出現已廢棄之 `add_argument("--flush"` 字面量（避免舊單一 `--flush` 回流）。 |
+
+**執行方式**（repo 根目錄）：
+
+```bash
+python -m ruff check tests/review_risks/test_deploy_main_review_risks_mre.py
+python -m pytest tests/review_risks/test_deploy_main_review_risks_mre.py -v --tb=short
+```
+
+**自動驗證（本機 agent）**：ruff **All checks passed**；pytest **11 passed**（約 10s；含一次 subprocess 阻塞至 timeout）。
+
+**說明**：若 production 將「前置 `--help`」或「錯拼 flush 即 exit」實作完成，請同步調整 **#1／#2** 之 subprocess／契約預期，避免測試與新語意衝突。
+
+---
+
+## CI 修復輪（追加）— trainer／walkaway_ml 匯入別名與全套件 pytest（2026-03-24）
+
+### 現象
+
+- 全套 `pytest tests/` 曾出現 **`RecursionError`**（例如 `import trainer.config` 無限遞迴）：與 `tests/review_risks/test_api_server_db_only_review_risks.py` 將 `trainer.config` 註冊為頂層 `sys.modules["config"]`、加上 `sys.modules["trainer"]` 與 `walkaway_ml` 互別後，舊版 `trainer/__init__.py` 之 **`__getattr__("config")` 內寫 `import trainer.config`** 會再次觸發同一 `getattr` 有關。
+- 曾出現 **`ImportError: cannot import name 'training' / 'threshold_selection' from 'walkaway_ml.training'`**：`import trainer.training.*` 之 bytecode 對父包做 **`IMPORT_FROM`**，空之 `training/__init__.py` 未暴露子模組名。
+- 曾出現 **`AssertionError: precision_recall_curve` 呼叫次數 0 vs 1**：`trainer.training.threshold_selection` 與 `walkaway_ml.training.threshold_selection` 在 `sys.modules` 中曾為**不同模組物件**，`patch.object` 與 backtester 實際呼叫之參考不一致。
+
+### 修改檔案（僅 production／trainer）
+
+| 檔案 | 摘要 |
+|------|------|
+| [`trainer/__init__.py`](trainer/__init__.py) | `__getattr__` 改以 **`importlib.import_module("trainer.<name>")`** 為準，並將 **`trainer.<name>`** 與 **`walkaway_ml.<name>`** 對應到**同一** `sys.modules` 條目（`config`、`db_conn`、`training`、`serving`、`etl`、`scripts`）。 |
+| [`trainer/training/__init__.py`](trainer/training/__init__.py) | PEP 562 **`__getattr__`** 延遲載入 `trainer`、`backtester`、`time_fold`、`threshold_selection`；**統一** `trainer.training.*` 與 `walkaway_ml.training.*` 之 `sys.modules`。 |
+| [`trainer/training/threshold_selection.py`](trainer/training/threshold_selection.py) | 模組載入結束時**強制**填入 `sys.modules["trainer.training.threshold_selection"]` 與 `["walkaway_ml.training.threshold_selection"]` 為同一實例（避免 patch 分叉）。 |
+
+### 驗證結果（本機 agent）
+
+- **Lint**：`python -m ruff check trainer package` → **All checks passed**（`ruff.toml` 仍 exclude `tests/`）。
+- **測試**：`python -m pytest tests/ -q` → **1408 passed**, 62 skipped（約 102s）；warnings 含 werkzeug／pandas 既知 deprecation，非本次引入）。
+- **Typecheck**：repo 內未配置 pyright／mypy 之強制步驟；未執行。
+
+### 後續建議
+
+- 若其他 `trainer.training` 子模組亦需雙名稱 patch 安全，可採與 `threshold_selection` 相同之 **模組尾端 `sys.modules` 對齊**（或集中一處 import hook）。
+- 部署／文件層可註明：**優先以 `trainer.*` 作為 canonical import**，`walkaway_ml` 為安裝用別名。
+
+---
+
+## Task 3 / Phase 0（追加）— 推論路徑效能基線 instrumentation（2026-03-24）
+
+### 本次改動檔案
+
+- [`trainer/serving/scorer.py`](trainer/serving/scorer.py)
+  - 新增固定窗口（`maxlen=200`）的分段耗時統計器，避免長時間執行時記憶體無上限成長。
+  - 在 `score_once` 內加入分段量測：`clickhouse`、`feature_engineering`、`predict`、`sqlite`。
+  - 每輪輸出 `top_hotspots`（前 1–2 熱點）並附該 stage 歷史 `p50/p95` 與樣本數 `n`。
+- [`trainer/serving/validator.py`](trainer/serving/validator.py)
+  - 新增固定窗口分段耗時統計器（`maxlen=200`）。
+  - 在 `validate_once` 內加入分段量測：`clickhouse`、`sqlite`（含讀取 alerts/processed/results 與寫回 validation/processed）。
+  - 每輪輸出 `top_hotspots`（前 1–2 熱點）與 `p50/p95`。
+- [`package/deploy/main.py`](package/deploy/main.py)
+  - 在 Flask `/alerts`、`/validation` 請求路徑加入 API 基線量測：
+    - `api_query_alerts` / `api_query_validation`
+    - `api_transform_alerts` / `api_transform_validation`
+  - 每次請求輸出該次 top 熱點與對應 stage 的歷史 `p50/p95`（固定窗口 200）。
+
+### 如何手動驗證
+
+1. **Scorer 基線**
+   - 啟動 scorer（或 deploy 主程式）後觀察 log，應可看到：
+     - `[scorer][perf] top_hotspots: ...`
+     - 內容包含至少 1–2 個 stage，且含 `p50=...`, `p95=...`, `n=...`。
+2. **Validator 基線**
+   - 啟動 validator 後觀察 log，應可看到：
+     - `[validator][perf] top_hotspots: ...`
+     - stage 主要落在 `clickhouse` 或 `sqlite`（依資料量而定）。
+3. **API 基線**
+   - 呼叫：
+     - `GET /alerts`
+     - `GET /validation`
+   - 主控台應出現：
+     - `[api][perf] top_hotspots: ...`
+     - stage 名稱對應 `api_query_*` / `api_transform_*`。
+4. **資源風險檢查（記憶體）**
+   - 長時間跑多輪後，統計窗口維持固定 `n<=200`，不應因量測機制造成無限成長。
+
+### 下一步建議
+
+- 先跑一段真實流量（至少 30–50 輪 scorer/validator 與 API 請求）收集 Phase 0 基線，確認 top 1–2 熱點是否穩定。
+- 依目前計畫進入 **Task 3 / Phase 1**：停用 validator 的 session ClickHouse 查詢（保留 `session_cache` 參數相容，實際傳 `{}`）。
+- 若觀察到 API `api_query_*` 明顯偏高，Phase 4 可優先做 SQL 下推，減少 `SELECT *` + pandas 過濾。
+
+---
+
+## Task 3 / Phase 1（追加）— Validator 停用 session ClickHouse 查詢（2026-03-24）
+
+### 本次改動檔案
+
+- [`trainer/serving/validator.py`](trainer/serving/validator.py)
+  - 在 `validate_once` 中移除 `fetch_sessions_by_canonical_id(...)` 呼叫。
+  - 明確新增 `session_cache_disabled: Dict[str, List[Dict]] = {}`，保留 `validate_alert_row(..., session_cache, ...)` 函式簽名相容性。
+  - 所有 `validate_alert_row` 呼叫點改為傳入 `session_cache_disabled`（空 dict）。
+  - 目前 verdict 本來就採 bet-based 邏輯，這次只移除多餘 session 查詢負擔，不改 MATCH/MISS/PENDING 規則。
+
+### 如何手動驗證
+
+1. **確認不再查 session 表**
+   - 啟動 validator 一段時間，檢查日誌／ClickHouse 查詢紀錄，應只看到 bet 查詢路徑，不再有 session 查詢 SQL。
+2. **結果一致性抽查**
+   - 以同一批 alerts 比對修改前後：
+     - `MATCH` / `MISS` / `PENDING` 比例應無異常飄移。
+     - 逐筆抽樣幾個 bet_id，確認 verdict 與 reason 符合既有 bet-based 判定。
+3. **效能觀察（搭配 Phase 0）**
+   - 觀察 `[validator][perf] top_hotspots`，`clickhouse` 耗時理論上應下降（少一條 session 查詢）。
+
+### 下一步建議
+
+- 進入 **Task 3 / Phase 2**：把 `validation_results` 改為增量讀取（watermark）以避免每輪 `SELECT *`。
+- 若你要，我可以先做最小可回滾版本：先用 `rowid` watermark，不改 schema，快速驗證效能提升後再擴充。
+
+---
+
+## Review（追加）— Task 3 Phase 0/1 目前變更風險檢視（2026-03-24）
+
+> 範圍：[`trainer/serving/scorer.py`](trainer/serving/scorer.py)、[`trainer/serving/validator.py`](trainer/serving/validator.py)、[`package/deploy/main.py`](package/deploy/main.py)。
+> 目標：列出最可能問題（bug/邊界/安全/效能），每項附具體修改建議與希望新增測試。
+
+### 1) [高] API 耗時計時使用 wall-clock（`datetime.now().timestamp()`）可能出現負值或飄移
+
+- **位置**：[`package/deploy/main.py`](package/deploy/main.py) `alerts()` / `validation()` 的 `t_query`、`t_transform`。
+- **風險說明**：
+  - NTP 校時或系統時間調整時，`now().timestamp()` 差值可能異常（負值/跳動），會污染 p50/p95 基線，誤判熱點。
+  - 這是典型邊界條件 bug，尤其部署機器若有自動校時。
+- **具體修改建議**：
+  - 全部改用 monotonic timer：`time.perf_counter()`。
+  - 與 scorer/validator 保持一致，降低觀測語意分裂。
+- **希望新增的測試**：
+  - 單元測試 mock 時間來源，驗證 stage 耗時永不為負且可重現。
+  - 回歸測試檢查 log 中 `api_query_*` / `api_transform_*` 為非負浮點值。
+
+### 2) [高] API 每請求 `INFO` 打 perf log，可能在高 QPS 下反向放大延遲與 I/O
+
+- **位置**：[`package/deploy/main.py`](package/deploy/main.py) `_emit_api_perf_summary()` 每次請求都 `info`。
+- **風險說明**：
+  - 這次是為了量測，但目前在每個請求都輸出一行，QPS 高時主控台/檔案 I/O 會變成新瓶頸。
+  - 會導致「量測本身改變被量測系統」，基線失真，且 CPU 花在 format/log flush。
+- **具體修改建議**：
+  - 預設改 `DEBUG`；或引入節流（例如每 N 次/每 T 秒才輸出）。
+  - 也可加旗標（`DEPLOY_PERF_LOG_EVERY_N`）控制抽樣率。
+- **希望新增的測試**：
+  - 在 `INFO` 下模擬連續請求，assert logger 呼叫次數受節流控制（不是每次都 log）。
+  - 在 `DEBUG` 開啟時才完整輸出 perf 明細的契約測試。
+
+### 3) [中] `_API_STAGE_TIMINGS` 全域可變結構未加鎖，threaded Flask 下有競態風險
+
+- **位置**：[`package/deploy/main.py`](package/deploy/main.py) `_API_STAGE_TIMINGS`、`_record_api_stage_timing()`、`_emit_api_perf_summary()`。
+- **風險說明**：
+  - Flask `app.run` 在某些配置下可 threaded；多請求併發時，dict/deque 交錯寫入雖多半受 GIL 保護單步操作，但整段流程不是原子，可能造成統計瞬時不一致（p50/p95 抖動、n 非預期）。
+  - 不一定會 crash，但觀測品質不穩。
+- **具體修改建議**：
+  - 以 `threading.Lock` 包住讀寫；或改用每-stage lock。
+  - 若確定單執行緒，需在程式明確宣告/強制 `threaded=False` 並文件化。
+- **希望新增的測試**：
+  - 併發壓測型單元/整合測試（多執行緒並發呼叫 `_emit_api_perf_summary`）確保無例外且 `n` 不超過上限。
+  - 若採鎖，測試在高併發下統計資料結構維持完整。
+
+### 4) [中] `parse_known_args()` 靜默忽略未知參數，存在維運安全性/可靠性風險
+
+- **位置**：[`package/deploy/main.py`](package/deploy/main.py) `if __name__ == "__main__":` 解析 CLI。
+- **風險說明**：
+  - 例如 `--flush-stete` 拼錯會被忽略並繼續啟動，實際沒 flush；這類「以為做了破壞性操作但其實沒做」在維運上風險很高。
+  - 屬於操作安全（operational safety）問題。
+- **具體修改建議**：
+  - 對 `--flush*` 未知旗標改為 hard-fail（exit non-zero + 明確提示）。
+  - 或直接改 `parse_args()`，除非有明確需求要容忍未知參數。
+- **希望新增的測試**：
+  - subprocess 測試：傳入錯拼 flush 旗標時應失敗退出，且 stderr 含合法旗標提示。
+  - 合法旗標（`--flush-state`）仍可正常通過。
+
+### 5) [中] Validator Phase 1 雖停用 session 查詢，但缺「行為等價」保護測試
+
+- **位置**：[`trainer/serving/validator.py`](trainer/serving/validator.py) `validate_once()`。
+- **風險說明**：
+  - 設計上 verdict 已是 bet-based，這次移除 session 查詢理論應等價；但若未加測試，未來改動可能誤把 session 依賴帶回或造成 subtle regression。
+  - 這是回歸風險，不是立即 bug。
+- **具體修改建議**：
+  - 補上契約測試：`validate_once` 期間不得呼叫 `fetch_sessions_by_canonical_id`。
+  - 再補輸出一致性測試：同一 alerts + bet_cache 下，改前改後 MATCH/MISS/PENDING 結果一致。
+- **希望新增的測試**：
+  - mock `fetch_sessions_by_canonical_id`，assert call count = 0。
+  - 構造固定資料集，assert `validate_alert_row` 主要 verdict 與 reason 不受 `session_cache={}` 影響。
+
+### 6) [低] `validator` perf 統計使用 pandas `Series.quantile`，在高頻路徑增加不必要開銷
+
+- **位置**：[`trainer/serving/validator.py`](trainer/serving/validator.py) `_emit_validator_perf_summary()`。
+- **風險說明**：
+  - 每輪建立 `pd.Series` 只為算 p50/p95，對小窗口雖可接受，但在低延遲場景屬額外開銷。
+  - 目前影響等級低（窗口上限 200），但可再精簡。
+- **具體修改建議**：
+  - 改成 `numpy.asarray(hist)` + `np.percentile`，與 scorer/api 寫法一致。
+  - 可減少 pandas 物件建立與 GC 壓力。
+- **希望新增的測試**：
+  - 單元測試驗證 p50/p95 計算結果與既有輸出等價（容許極小浮點誤差）。
+  - micro-benchmark（非 CI 必跑）比較舊新方法 CPU 時間，確認優化方向成立。
+
+### 綜合建議（下一步）
+
+- 先處理 #1 與 #2（高優先）：確保量測數據可靠、避免量測本身造成顯著效能噪音。
+- 其後補 #5 測試保護網，再進入 Phase 2（`validation_results` 增量讀取）。
+
+---
+
+## Review 風險點 → 最小可重現測試（追加，tests only｜2026-03-24）
+
+依你的要求，已把 reviewer 提到的風險點轉成 **tests-only** 契約/MRE 測試，未修改 production code。
+
+### 新增檔案
+
+- [`tests/review_risks/test_task3_phase01_review_risks_mre.py`](tests/review_risks/test_task3_phase01_review_risks_mre.py)
+
+### 覆蓋風險點（對應 review #1–#6）
+
+1. **API 計時來源（wall-clock）**
+   - 驗證 `alerts()` / `validation()` 目前使用 `datetime.now().timestamp()`（文件化現況風險）。
+2. **API perf 日誌層級噪音**
+   - 驗證 `_emit_api_perf_summary` 目前為 `logger.info`（非 `debug`）。
+3. **API 統計共享狀態未加鎖**
+   - 驗證 `_API_STAGE_TIMINGS` 存在且目前未使用 `threading.Lock`。
+4. **CLI 未知參數靜默忽略**
+   - 驗證 `parse_known_args()` 與 `Ignoring unrecognized argv` 路徑存在。
+5. **Validator Phase 1 合約**
+   - 驗證 `validate_once` 內不再呼叫 `fetch_sessions_by_canonical_id(...)`。
+   - 驗證 `validate_alert_row(..., session_cache, ...)` 簽名仍保留相容參數。
+6. **Validator perf quantile 開銷**
+   - 驗證 `_emit_validator_perf_summary` 目前仍用 `pd.Series(...).quantile(...)`（文件化現況）。
+
+### 執行方式
+
+```bash
+python -m ruff check tests/review_risks/test_task3_phase01_review_risks_mre.py
+python -m pytest tests/review_risks/test_task3_phase01_review_risks_mre.py -v --tb=short
+```
+
+### 本機執行結果（agent）
+
+- `ruff`: **All checks passed**
+- `pytest`: **7 passed**（0.28s）
+
+---
+
+## 驗證輪次（追加）— 只改 production 前置驗證 / 全套綠燈檢查（2026-03-24）
+
+### Round 1 結果
+
+- **Lint**
+  - 指令：`python -m ruff check trainer package`
+  - 結果：**All checks passed**
+- **Typecheck**
+  - 指令：`pyright`、`python -m pyright`
+  - 結果：本機環境 **未安裝 pyright**（`command not found` / `No module named pyright`）
+  - 備註：這是工具缺失，不是程式型別錯誤。
+- **Tests**
+  - 指令：`python -m pytest tests -q`
+  - 結果：**1415 passed, 62 skipped**（100.92s）
+  - 警告：232 warnings（以第三方 `werkzeug` deprecation 為主，另有 1 筆 pandas future warning；非本輪新增）
+
+### 本輪 production 代碼調整
+
+- 無需調整（目前 lint / tests 已通過；typecheck 工具待安裝才可執行）。
+
+### 下一步建議
+
+- 若你要把「typecheck 通過」納入 gate，請先在環境安裝並固定一套工具（建議 `pyright` 或 `mypy` 擇一）。
+- 進入 Task 3 後續 Phase（優先 Phase 2：`validation_results` 增量讀取）。
+
+---
+
+## Task 3 / Phase 2（追加）— Validator `validation_results` 增量讀取（2026-03-24）
+
+### Round 1（實作 + 驗證）
+
+#### 改動檔案
+
+- [`trainer/serving/validator.py`](trainer/serving/validator.py)
+  - 新增 `validator_runtime_meta` schema（SQLite）保存 watermark。
+  - 新增 rowid watermark helper：
+    - `_get_validation_results_last_loaded_rowid`
+    - `_set_validation_results_last_loaded_rowid`
+  - 新增 `load_existing_results_incremental(conn, existing_results)`：
+    - 首次（watermark=0）做 bootstrap 全量讀取。
+    - 後續僅查 `rowid > watermark` 增量。
+    - 讀取後更新 watermark，降低每輪全表掃描與記憶體壓力。
+  - `validate_once` 改用增量載入入口（取代每輪 `SELECT *` 全量）。
+  - 補齊 ad-hoc/in-memory 連線容錯（缺 `validator_runtime_meta` 時不拋錯，回落為 0）。
+
+#### 測試/驗證結果
+
+1. **第一輪（發現回歸）**
+   - 指令：`python -m ruff check trainer/serving/validator.py && python -m pytest tests/review_risks/test_review_risks_validator_round393.py -q`
+   - 結果：`ruff` 通過；`pytest` 1 fail（`sqlite3.OperationalError: no such table: validator_runtime_meta`，發生在 `:memory:` 測試情境）。
+2. **第二輪（修復後）**
+   - 指令：
+     - `python -m ruff check trainer/serving/validator.py`
+     - `python -m pytest tests/review_risks/test_review_risks_validator_round393.py -q`
+     - `python -m pytest tests/review_risks/test_unified_plan_v2_t3_validator_metrics_review.py -q`
+   - 結果：全部通過（7 passed + 11 passed）。
+3. **全倉回歸**
+   - 指令：`python -m ruff check trainer package && python -m pytest tests -q`
+   - 結果：`ruff` 通過；`pytest` **1415 passed, 62 skipped**。
+
+#### 如何手動驗證
+
+- 啟動 validator 連跑多輪，觀察 log 與 SQLite I/O：
+  - 首輪可見較高 `sqlite`（bootstrap）
+  - 後續輪次 `load_existing_results` 相關耗時應下降（只讀 rowid 增量）
+- 用 SQLite 檢查：
+  - `validator_runtime_meta` 內有 `validation_results_last_loaded_rowid`
+  - `validation_results` 新增列時，watermark 單調遞增
+- 驗證邏輯不變：
+  - `MATCH` / `MISS` / `PENDING` 判定與既有 bet-based 行為一致
+
+#### 下一步建議
+
+- 進入 Task 3 **Phase 4**（Flask API SQL 下推）以消除 API 端每請求全表讀取瓶頸。
+- 若要再壓低 validator 記憶體，可把 `existing_results` 進一步限制為 rolling 視窗（配合 retention）。
+
+---
+
+## Review（追加）— Task 3 Phase 2 目前變更風險檢視（2026-03-24）
+
+> 範圍：[`trainer/serving/validator.py`](trainer/serving/validator.py) 的 `validation_results` rowid watermark 增量讀取實作。
+> 原則：不重寫整套，只列高機率風險 + 可落地修正 + 建議補測。
+
+### 1) [高] 例外被廣泛吞掉（`except Exception: pass`）可能造成「靜默資料遺失」
+
+- **位置**：`load_existing_results_incremental`、watermark helper 等多處。
+- **風險說明**：
+  - 若 `read_sql_query`、`MAX(rowid)`、watermark 更新失敗，流程會靜默回傳，可能導致 `existing_results` 不完整或 watermark 不前進，問題只在行為上慢慢累積。
+  - 在生產上較難第一時間察覺。
+- **具體修改建議**：
+  - 保留容錯，但至少 `logger.warning` 帶上錯誤類型與關鍵上下文（`last_loaded_rowid`、query mode）。
+  - 對真正不該忽略的錯誤（例如 SQL schema 異常）改為 fail-fast 或 fallback 到全量讀取並明確打 warning。
+- **希望新增的測試**：
+  - mock `pd.read_sql_query` 拋錯，assert 有 warning log 且函式回傳可預期 fallback。
+  - mock `_set_validation_results_last_loaded_rowid` 失敗，assert 不會 crash 且有 log 提示。
+
+### 2) [高] watermark 與實際表狀態可能失配，造成增量漏讀
+
+- **位置**：`_get/_set_validation_results_last_loaded_rowid` + `load_existing_results_incremental`。
+- **風險說明**：
+  - 若 DB 被人工覆寫/restore/重建（rowid 回退或表被清空），`last_loaded_rowid` 可能大於目前 `MAX(rowid)`；現況 query `rowid > watermark` 會讀不到任何資料，導致漏載入。
+- **具體修改建議**：
+  - 在每輪檢查 `current_max_rowid < last_loaded_rowid` 時自動觸發 re-bootstrap（重置 watermark 為 0 或直接全量掃描一次）。
+  - 將此情境記錄為 warning（便於維運追蹤）。
+- **希望新增的測試**：
+  - 建立情境：先寫入高 watermark，再清空/重建 `validation_results`，assert 會回落全量而非永久空增量。
+  - 驗證 `current_max_rowid < last_loaded_rowid` 時 log 含 reset 訊息。
+
+### 3) [中] `validator_runtime_meta` 更新與 `validation_results` 讀取非單一交易，邊界下可能重讀/少讀
+
+- **位置**：`load_existing_results_incremental` 末段寫 watermark。
+- **風險說明**：
+  - 目前先讀、後寫 watermark；若進程在中間中斷，下一輪可能重讀（通常可接受），但若混入外部寫入節奏，存在一致性邊界。
+  - 雖不是直接錯誤，但會影響效能與可預期性。
+- **具體修改建議**：
+  - 將「取 max rowid + 讀增量 + 更新 watermark」盡量包在同一 SQLite transaction。
+  - 至少文件化語意：允許 at-least-once 重讀，不允許漏讀。
+- **希望新增的測試**：
+  - 模擬中途中斷（mock 在 watermark 更新前拋錯），下一輪應可重讀但不漏讀。
+  - 併發寫入場景下，最終 `existing_results` 包含所有新增列。
+
+### 4) [中] 目前 `existing_results` 仍每輪在記憶體重建，Phase 2 只解決 DB 掃描，未完全解決 RAM 成長壓力
+
+- **位置**：`validate_once` 呼叫 `load_existing_results_incremental(conn, {})`。
+- **風險說明**：
+  - 雖已避免每輪全表 SQL，但每輪仍把「bootstrap + 增量」組成整個 dict，資料大時記憶體仍可能偏高（尤其長期 retention）。
+- **具體修改建議**：
+  - 下一步可把 `existing_results` 改為 process-level cache + 增量 in-place 更新（不每輪重建）。
+  - 或限制只載入必要視窗/欄位，減少 dict 體積。
+- **希望新增的測試**：
+  - 壓測型測試（大量 validation rows）比較 Phase 2 前後 peak memory 與每輪耗時。
+  - 契約測試：cache 模式下結果與現行輸出一致。
+
+### 5) [中] 安全/完整性：watermark 可被外部直接寫壞，導致行為偏移
+
+- **位置**：`validator_runtime_meta`（純文字 key/value，無檢核）。
+- **風險說明**：
+  - 若 DB 被人工改值成極大數，增量讀取長期變空；雖非傳統資安漏洞，但屬資料完整性與操作安全風險。
+- **具體修改建議**：
+  - 讀 watermark 時加入合理性檢查（例如不應遠大於 `MAX(rowid)`，超限就 reset + warning）。
+  - 可選：記錄最近一次 reset 原因至 log/metrics。
+- **希望新增的測試**：
+  - 手動寫入異常 watermark（超大值/負值/非數字），assert 會被修正並正常載入資料。
+  - 驗證異常輸入不會造成 crash 或永久空資料。
+
+### 6) [低] 仍存在 legacy CSV fallback 路徑，邊界情境可能與 DB 欄位語意不一致
+
+- **位置**：`load_existing_results_incremental` 的 bootstrap fallback（`RESULTS_PATH`）。
+- **風險說明**：
+  - CSV 與 DB schema 可能隨時間漂移；首次 bootstrap 混入 CSV 可能造成欄位型別不一致或舊資料覆蓋新語意。
+- **具體修改建議**：
+  - 若 deploy 生產不再依賴 CSV，可考慮以設定關閉 fallback。
+  - 至少在 fallback 生效時打明確 warning，並統計 fallback row 數。
+- **希望新增的測試**：
+  - CSV 欄位缺漏/型別不同時，assert 系統仍能穩定運行且不覆蓋 DB 新資料。
+  - 測試 fallback 僅在 bootstrap（`last_loaded_rowid<=0`）時觸發。
+
+### 綜合建議（下一步）
+
+- 先補 #1 + #2（可觀測性與漏讀風險），這兩項最影響生產可控性。
+- 再補 #5（異常 watermark 防護）與 #4（記憶體優化）以延伸 Phase 2 成果。
+
+---
+
+## Review 風險點（Phase 2）→ 最小可重現測試（追加，tests only｜2026-03-24）
+
+依你的要求，已把 Phase 2 reviewer 風險點轉成 **tests-only** 契約/MRE 測試，未修改 production code。
+
+### 新增檔案
+
+- [`tests/review_risks/test_validator_phase2_incremental_review_risks_mre.py`](tests/review_risks/test_validator_phase2_incremental_review_risks_mre.py)
+
+### 覆蓋風險點（對應本輪 Phase 2 review #1–#6）
+
+1. **例外吞掉風險**
+   - 驗證 `load_existing_results_incremental` 內存在 broad `except Exception` 路徑（文件化現況）。
+2. **watermark 漂移重置缺口**
+   - 驗證目前無明確 `current_max_rowid < last_loaded_rowid` reset 分支（文件化現況）。
+3. **交易邊界**
+   - 驗證 `_set_validation_results_last_loaded_rowid` 為獨立 commit 路徑（文件化現況）。
+4. **每輪重建 dict**
+   - 驗證 `validate_once` 目前以 `load_existing_results_incremental(conn, {})` 每輪從空 dict 載入。
+5. **watermark 防竄改強化缺口**
+   - 驗證 `validator_runtime_meta` 目前為簡單 key/value（無額外 CHECK 約束）。
+6. **legacy CSV fallback**
+   - 驗證 bootstrap (`last_loaded_rowid <= 0`) 仍保留 `RESULTS_PATH` fallback 路徑。
+
+### 執行方式
+
+```bash
+python -m ruff check tests/review_risks/test_validator_phase2_incremental_review_risks_mre.py
+python -m pytest tests/review_risks/test_validator_phase2_incremental_review_risks_mre.py -v --tb=short
+```
+
+### 本機執行結果（agent）
+
+- `ruff`: **All checks passed**
+- `pytest`: **6 passed**（0.31s）
+
+---
+
+## 驗證輪次（追加）— Phase 2 後實作收斂到全綠（2026-03-24）
+
+### Round 1（完整 gate，發現 typecheck 阻塞）
+
+- **指令**
+  - `python -m ruff check trainer package`
+  - `python -m mypy trainer package`
+  - `python -m pytest tests -q`
+- **結果**
+  - `ruff`：通過
+  - `mypy`：失敗，主因是第三方套件缺 stubs（`pandas` / `pyarrow` / `numba` / `mlflow` / `clickhouse_connect` / `walkaway_ml` import 路徑）
+  - 另外有 1 個可控型別問題：`trainer/serving/validator.py` 變數 `bid` 型別衝突
+- **處置**
+  - 先修可控實作錯誤（rename 區域變數 `bid` -> `pending_bid`，避免同函式先前 `str` 推斷衝突）
+
+### Round 2（可落地 typecheck + 全量回歸）
+
+- **指令**
+  - `python -m mypy trainer package --ignore-missing-imports`
+  - `python -m ruff check trainer package`
+  - `python -m pytest tests -q`
+- **結果**
+  - `mypy --ignore-missing-imports`：**Success: no issues found in 55 source files**
+  - `ruff`：**All checks passed**
+  - `pytest`：**1421 passed, 62 skipped**（88.62s）
+
+### 本輪改動檔案
+
+- [`trainer/serving/validator.py`](trainer/serving/validator.py)
+  - 僅調整區域變數命名以消除型別衝突（不改業務邏輯）。
+
+### 下一步建議
+
+- 若要把「嚴格 typecheck（不忽略第三方 import）」納入 CI gate，需先統一型別策略：
+  - 安裝對應 stubs，或
+  - 在 `mypy.ini/pyproject` 定義 `ignore_missing_imports` policy（按模組分級）。
+
+---
+
+## Task 3 / Phase 4（追加）— Flask API SQL 下推（Round 1，2026-03-24）
+
+### 本輪改動檔案
+
+- [`package/deploy/main.py`](package/deploy/main.py)
+  - `_query_alerts_df`：
+    - 將 `ts` / `default_1h` 條件下推到 SQLite `WHERE datetime(ts) > datetime(?)`。
+    - `limit`（僅 `ts` 缺席時生效）改為 SQL `ORDER BY ts DESC LIMIT ?`，再在程式端回復為時間升序 tail 語意。
+    - 減少原本 `SELECT *` 後再 pandas 過濾的資料量。
+  - `_query_validation_df`：
+    - 將 `bet_id` / `bet_ids`（`CAST(bet_id AS TEXT)`）與 `ts` / `default_1h` 條件下推到 SQLite `WHERE`。
+    - 以 `ORDER BY validated_at ASC` 回傳，維持既有排序語意。
+
+### 如何手動驗證（本輪）
+
+1. 啟動 deploy API，對 `/alerts`、`/validation` 發送：
+   - 無參數
+   - 僅 `ts`
+   - 僅 `limit`（alerts）
+   - `bet_id` / `bet_ids`（validation）
+2. 比對與舊行為一致性：
+   - `/alerts?limit=N`（無 `ts`）仍回傳最後 N 筆（時間升序）。
+   - `/alerts?ts=...&limit=N` 時 `limit` 仍不生效（協定語意）。
+   - `/validation` 在 `bet_id(s)` 存在時不套 1h 預設窗。
+3. 觀察 log：
+   - `[api][perf]` 之 query stage 在大表情境應有下降趨勢。
+
+### 下一步建議
+
+- 先跑 focused + 全量測試；若有「舊現況契約」測試（例如要求 `SELECT *`）失敗，應更新為新協定契約測試。
+- 若結果穩定，再把 `PATCH_20260324.md` 的 Phase 4 狀態更新為 Done。
+
+### Round 1 測試結果（本輪）
+
+- 指令：
+  - `python -m ruff check package/deploy/main.py`
+  - `python -m pytest tests/review_risks/test_deploy_main_review_risks_mre.py -q`
+  - `python -m pytest tests -q`
+- 結果：
+  - `ruff`：**All checks passed**
+  - deploy review tests：**11 passed**
+  - 全量測試：**1421 passed, 62 skipped**
+
+### 結論（本輪）
+
+- Phase 4 SQL 下推改動在目前測試面上相容，未引入回歸。
+- 下一步可將計畫檔中 Task 3 / Phase 4 標記為 Done，並進入 Phase 3 或 Phase 5。
+
+---
+
+## Task 6（Round 1，2026-03-24）— Validator 移除 `gap_started_before_alert` early return
+
+### 本輪改動檔案
+
+- [`trainer/serving/validator.py`](trainer/serving/validator.py)
+  - 移除 `validate_alert_row` 中 `gap_started_before_alert` 的 early return 分支。
+  - 保留 `last_bet_before` 僅作 `base_start = last_bet_before or bet_ts` 之計算上下文，不再作為直接判死 FP 依據。
+  - `IGNORED_REASONS` 移除 `gap_started_before_alert`（避免殘留忽略邏輯）。
+- [`tests/integration/test_four_bet_label_vs_validator_simulation.py`](tests/integration/test_four_bet_label_vs_validator_simulation.py)
+  - 將既有「10:22 必定 `gap_started_before_alert` FP」測試契約更新為 Task 6 新契約：10:22 不得再走該 early-return reason。
+  - 保留其餘 9:55 / 10:28 / 10:30 不觸發該 reason 的檢查。
+
+### 如何手動驗證（本輪）
+
+1. 執行：
+   - `PYTHONPATH=. pytest -q tests/integration/test_four_bet_label_vs_validator_simulation.py`
+2. 檢查 10:22 案例輸出：
+   - `validate_alert_row(..., force_finalize=True)` 回傳中 `reason != "gap_started_before_alert"`。
+3. 觀察 validator 日誌與行為：
+   - 不再出現新增的 `gap_started_before_alert` verdict（既有舊資料列除外）。
+   - `PENDING` / extended wait / late-arrival finalize 路徑仍可運作。
+
+### Round 1 驗證結果（本輪）
+
+- `PYTHONPATH=. pytest -q tests/integration/test_four_bet_label_vs_validator_simulation.py`：**2 passed**
+- `ruff check trainer/serving/validator.py tests/integration/test_four_bet_label_vs_validator_simulation.py`：**All checks passed**
+- `ReadLints`（上述兩檔）：**No linter errors found**
+- 備註：`mypy` 在本機環境執行此模組時超時（先前輪次亦有同類情況），本輪以 targeted pytest + ruff + IDE lints 完成回歸檢查。
+
+### 下一步建議
+
+- 補一個 validator integration 測試，直接覆蓋「10:22 在移除 early return 後之最終 verdict（MATCH/MISS/PENDING）」以防後續再引入短路邏輯。
+- 若你同意，我下一輪可跑更大範圍的 validator 相關測試群（`tests/integration/*validator*` + `tests/review_risks/*validator*`）並再追加 STATUS。
+
+---
+
+## Task 6（Round 2，2026-03-24）— 文件與計畫狀態同步
+
+### 本輪改動檔案
+
+- [`.cursor/plans/PATCH_20260324.md`](.cursor/plans/PATCH_20260324.md)
+  - 將 Task 6 狀態由 `Planned` 更新為 `✅ Done`。
+  - 在本檔 Changelog 追加 Task 6 完成紀錄。
+- [`doc/validator_gap_started_before_alert_issue.md`](doc/validator_gap_started_before_alert_issue.md)
+  - 補上狀態註記：Task 6 已移除 `gap_started_before_alert` early return；本文保留歷史脈絡。
+
+### 如何手動驗證（本輪）
+
+1. 打開計畫檔，確認 Task 6 標題顯示 `✅ Done`。
+2. 打開該 issue 文件，確認開頭有 `Update (2026-03-24, Task 6)` 註記。
+
+### 下一步建議
+
+- 若要完全收斂此議題，可把 `tests/review_risks` 中與舊語意強綁的文件型測試做一次掃描，確認沒有殘留「必須出現 gap_started_before_alert」的契約。
+
+---
+
+## Review（追加）— Task 6 目前變更風險檢視（2026-03-24）
+
+> 範圍：`trainer/serving/validator.py`、`tests/integration/test_four_bet_label_vs_validator_simulation.py`、`doc/validator_gap_started_before_alert_issue.md`。
+> 原則：不重寫整套，只列最可能的 bug/邊界/安全/效能問題；每項附具體修改建議與希望新增測試。
+
+### 1) [高] KPI 定義可能被「歷史舊資料」污染（`IGNORED_REASONS` 移除 `gap_started_before_alert`）
+
+- **問題**：
+  - 本輪把 `IGNORED_REASONS` 改為只剩 `missing_player_id`。若 `validation_results` 仍保有舊版產生的 `gap_started_before_alert` 列，這些歷史列會立即被納入 15m/1h precision 分母，造成指標在上線當下出現結構性跳變（非模型真實變化）。
+- **具體修改建議**：
+  - 過渡期（至少 retention 視窗內）保留 `gap_started_before_alert` 在 `IGNORED_REASONS`，等舊列自然淘汰後再移除；或用 `validator_version`/`rule_version` 區分新舊規則後再計入 KPI。
+- **希望新增的測試**：
+  - 建一個混合資料集（同時含舊 `gap_started_before_alert` 與新規則列），驗證 KPI 計算在過渡策略下不會被舊列拉歪。
+  - 驗證當資料全為新規則列時，移除 ignore 不影響預期 precision 口徑。
+
+### 2) [高] Task 6 新測試契約偏弱，無法防止「仍是 FP 但換 reason」的假綠燈
+
+- **問題**：
+  - 目前 10:22 測試只檢查 `reason != "gap_started_before_alert"`，但未檢查 `result`/`reason` 是否符合與 `compute_labels` 對齊的預期。實作若改成 `MISS`（仍 `result=False`）也會過測，可能掩蓋語意回歸。
+- **具體修改建議**：
+  - 對 10:22 追加更強契約：至少限制 `result` 與 `reason` 落在明確可接受集合（例如 `MATCH` 或在定義上可接受的 finalize 路徑），並與 `compute_labels` 標記結果一併比對。
+- **希望新增的測試**：
+  - 在現有四筆案例中，新增「10:22 的最終 verdict 與 label 對齊」斷言（含 `force_finalize=True`）。
+  - 新增一個「晚到資料」版本，驗證 `PENDING -> MATCH/MISS` 轉態在移除 early-return 後仍正確。
+
+### 3) [中] 仍有邊界風險：`base_start=last_bet_before` 會引入無效前置狀態，增加心智負擔與維護風險
+
+- **問題**：
+  - 雖已移除 early return，但仍把 `last_bet_before` 帶入 `find_gap_within_window(..., base_start=...)`。目前靠 `start_ok` 過濾掉 `< alert_ts` 的起點；功能上可行，但語意分散在兩處（呼叫端與函式內）且容易被後續重構破壞。
+- **具體修改建議**：
+  - 在呼叫前直接正規化 `base_start = max(last_bet_before or bet_ts, bet_ts)`，或封裝 helper 明確保證 `base_start >= alert_ts`，降低未來改壞風險。
+- **希望新增的測試**：
+  - 單元測試覆蓋 `last_bet_before < bet_ts`、`== bet_ts`、`is None` 三種分支，確保最終行為一致且不會再出現「前置起點導致誤判」。
+
+### 4) [中] 文件仍保留大量舊邏輯細節，容易被誤當現況規格
+
+- **問題**：
+  - `doc/validator_gap_started_before_alert_issue.md` 雖有加 Update 註記，但主體仍大量描述舊分支與舊表格，閱讀者可能只看內文就誤解為當前行為。
+- **具體修改建議**：
+  - 在文件最前面增加「已廢止行為」明顯小節，並把舊邏輯區塊改名為 `Historical behavior (pre-Task 6)`；另補一段「Task 6 後現行流程」摘要。
+- **希望新增的測試**：
+  - 文件型契約測試：檢查文件包含 `Historical behavior` 與 `Current behavior` 標記，避免未來再混淆。
+
+### 5) [低/效能] 移除 early return 後 validator 每筆平均計算量上升，缺乏保護性監控門檻
+
+- **問題**：
+  - 更多樣本會走完整 `find_gap_within_window` + finalize 路徑，CPU 成本上升屬預期；但目前缺「Task 6 前後 validator 週期耗時」的 guardrail，效能退化不易即時被發現。
+- **具體修改建議**：
+  - 用現有 `[validator][perf]` 指標補一個回歸門檻（例如 p95 不得超過基線 X%），至少在 pre-release 檢查一次。
+- **希望新增的測試**：
+  - 小型壓測/基準測試（非 CI 必跑）：固定資料量下比較 Task 6 前後 `validate_once` p50/p95，超標則告警。
+
+### 綜合建議（下一步）
+
+- 先補 #1、#2（這兩項最可能在功能正確性與監控口徑上造成實際事故）。
+- 再做 #3 的小重構與 #5 的效能門檻，確保 Task 6 上線後可維運性。
+
+---
+
+## Review 風險點（Task 6）→ 最小可重現測試（追加，tests only｜2026-03-24）
+
+依你的要求，已把本輪 Reviewer 提到的 Task 6 風險點轉成 **tests-only** 契約/MRE 測試，未修改 production code。
+
+### 新增檔案
+
+- [`tests/review_risks/test_task6_validator_review_risks_mre.py`](tests/review_risks/test_task6_validator_review_risks_mre.py)
+
+### 覆蓋風險點（對應本輪 review #1–#5）
+
+1. **KPI 過渡口徑風險**
+   - 驗證 `IGNORED_REASONS` 現況已不含 `gap_started_before_alert`。
+   - 驗證 KPI 計算仍以 `~reason.isin(IGNORED_REASONS)` 過濾（文件化現況風險）。
+2. **Task 6 整合測試契約偏弱**
+   - 驗證 `10:22` 案例目前只做 `reason != "gap_started_before_alert"` 的弱斷言（未強約束 `result`）。
+3. **`base_start` 邊界語意分散**
+   - 驗證 `validate_alert_row` 仍採 `base_start = last_bet_before or bet_ts`，並傳給 `find_gap_within_window(...)`。
+4. **文件可誤讀風險**
+   - 驗證 issue 文件雖有 `Update (Task 6)`，但仍缺顯式 `Current behavior`/`現行行為` 區段標記（文件化現況）。
+5. **效能 guardrail 缺口**
+   - 驗證 validator 模組目前無顯式 `VALIDATOR_PERF_*` 門檻常數（僅有 perf summary）。
+
+### 執行方式
+
+```bash
+python -m ruff check tests/review_risks/test_task6_validator_review_risks_mre.py
+PYTHONPATH=. python -m pytest tests/review_risks/test_task6_validator_review_risks_mre.py -q
+```
+
+### 本機執行結果（agent）
+
+- `ruff`: **All checks passed**
+- `pytest`: **6 passed**（0.23s）
+
+---
+
+## 驗證輪次（追加）—「不改 tests，修實作至全綠」Round 1（2026-03-24）
+
+### 執行指令
+
+1. `python -m ruff check trainer package tests`
+2. `PYTHONPATH=. python -m pytest tests -q`
+3. `PYTHONPATH=. python -m mypy trainer package --ignore-missing-imports`
+
+### 結果摘要
+
+- **pytest（全量）**：`1427 passed, 62 skipped`（通過）
+- **ruff（含 tests）**：失敗，主要為 `tests/**` 既有規則違反（如 `E402`、`F401`、`F841`），非本輪 production 實作引入。
+- **mypy**：在本機環境長時間未返回（多次執行超時/卡住，無最終 exit code）。
+
+### 本輪實作調整
+
+- 無 production 代碼變更（遵守「不要改 tests」要求；目前失敗項目來自 tests lint 與 typecheck 執行環境阻塞）。
+
+### 補充驗證（production 範圍）
+
+- `python -m ruff check trainer package`：**All checks passed**
+
+### 下一步建議
+
+- 若你同意「本任務不改 tests」的前提，lint gate 建議以 `trainer package` 為準（避免被既有 tests lint 債務阻塞）。
+- typecheck 需先解決本機 mypy 卡住問題（可改以 CI 既有 typecheck 指令、或先限縮到變更模組再擴大）。
+
+### Round 2（收斂：變更模組 typecheck）
+
+為避免 `mypy trainer package` 在本機卡住，本輪改採「變更模組」typecheck（不改 tests）：
+
+- `PYTHONPATH=. python -m mypy --ignore-missing-imports --follow-imports skip trainer/serving/validator.py`
+  - **Success: no issues found in 1 source file**
+- `PYTHONPATH=. python -m mypy --ignore-missing-imports --follow-imports skip package/deploy/main.py`
+  - **Success: no issues found in 1 source file**（僅 annotation-unchecked note）
+
+本輪結論：
+
+- `pytest tests -q`：全綠（Round 1 已驗證）。
+- `ruff trainer package`：全綠（Round 1 已驗證）。
+- `mypy`：在變更模組範圍全綠。
+
+---
+
+## 驗證輪次（追加）— 清理 `tests/**` lint 債務並達成全倉 Ruff 綠燈（2026-03-24）
+
+### Round 1（自動修復 + 剩餘問題盤點）
+
+- 指令：`python -m ruff check tests --fix`
+- 結果：
+  - 自動修復了部分可安全修復問題（unused import 等）。
+  - 尚餘 38 個錯誤（主要為 `E402`、少量 `F841`），集中在數個 `tests/review_risks/*api_server*.py` 與個別 integration/review test。
+
+### Round 2（手動修復剩餘 lint）
+
+本輪只改 tests 檔，未動 production：
+
+- [`tests/integration/test_phase2_prediction_export.py`](tests/integration/test_phase2_prediction_export.py)
+  - 移除未使用區域變數與未使用 `ZoneInfo` import。
+- [`tests/review_risks/test_api_server_db_only_review_risks.py`](tests/review_risks/test_api_server_db_only_review_risks.py)
+  - 對延後 import 加 `# noqa: E402`（保留測試初始化語意）。
+- [`tests/review_risks/test_review_risks_item2_subpackages.py`](tests/review_risks/test_review_risks_item2_subpackages.py)
+  - 移除未使用區域變數 `has_all_five`。
+- [`tests/review_risks/test_review_risks_round232_api_server.py`](tests/review_risks/test_review_risks_round232_api_server.py)
+  - 新增檔案層級 `# ruff: noqa: E402`。
+- [`tests/review_risks/test_review_risks_round235_api_server_score.py`](tests/review_risks/test_review_risks_round235_api_server_score.py)
+  - 新增檔案層級 `# ruff: noqa: E402`。
+- [`tests/review_risks/test_review_risks_round238_api_server.py`](tests/review_risks/test_review_risks_round238_api_server.py)
+  - 新增檔案層級 `# ruff: noqa: E402`。
+- [`tests/review_risks/test_review_risks_round242_api_server.py`](tests/review_risks/test_review_risks_round242_api_server.py)
+  - 新增檔案層級 `# ruff: noqa: E402`。
+- [`tests/review_risks/test_review_risks_round360.py`](tests/review_risks/test_review_risks_round360.py)
+  - 新增檔案層級 `# ruff: noqa: E402`。
+
+### 驗證結果
+
+- `python -m ruff check tests`：**All checks passed**
+- `python -m ruff check trainer package tests`：**All checks passed**
+
+### 下一步建議
+
+- 若你希望逐步減少 `# noqa: E402`，可後續分批把這些 review 測試改為「匯入在前、初始化在後」結構；本輪先以最低風險方式達成全倉 Ruff 綠燈。
+
+---
+
+## Task 4（Round 1，2026-03-24）— Deploy 降噪 + Validator KPI 對齊收斂
+
+### 本輪改動檔案
+
+- [`trainer/serving/scorer.py`](trainer/serving/scorer.py)
+  - 將高頻、每輪重複訊息由 `INFO` 降為 `DEBUG`：
+    - `Window`、`No bets in window`、`New bets since last tick`、`No new bets to score`
+    - `Track LLM computed`、`player_profile PIT join applied`
+    - `Rows to score`、`No usable rows`、`No rated bets to score`
+    - `No above-threshold alerts`、`Above-threshold rows`
+    - `Suppressed duplicate alerts`、`Alerts suppressed`
+    - `Payout-age cap` 訊息改為 `DEBUG`
+  - 保留 `INFO`：模型載入摘要、`Fetched bets/sessions`、`Emitted N alerts`、runtime threshold 切換訊息、`WARNING/ERROR`。
+- [`trainer/serving/validator.py`](trainer/serving/validator.py)
+  - 將高頻診斷/逐筆 finalize 訊息由 `INFO` 降為 `DEBUG`：
+    - `No alerts to validate`、`Alerts: ... Pending: 0`
+    - `pending_all ... min/max ...` 診斷兩條、`all too recent`
+    - `Processing N alerts`
+    - 每筆 `Finalizing ... MATCH/MISS` 訊息
+  - `--force-finalize` 提示由 `INFO` 改為 `WARNING`（符合「狀態/異常保留高層級」目標）。
+  - 保留 `INFO`：`Cumulative Precision (15m/1h)`、`Saved ... validations`、`[validator][perf]`、`WARNING/ERROR`。
+- [`package/deploy/main.py`](package/deploy/main.py)
+  - 新增 `DEPLOY_LOG_LEVEL`（fallback `LOGLEVEL`）控制根 logger level；預設 `INFO`。
+  - 將 `werkzeug` logger 設為 `WARNING`，避免每請求 access log 造成主控台噪音。
+
+### 如何手動驗證（本輪）
+
+1. 啟動 deploy：
+   - `python package/deploy/main.py`
+   - 連續打 `/alerts`、`/validation`，確認主控台不再每次噴出大量 scorer/validator 重複訊息；仍保留關鍵 `INFO`（例如 `Emitted N alerts`、`Cumulative Precision`）。
+2. 測試 log level 開關：
+   - 設 `DEPLOY_LOG_LEVEL=DEBUG` 再啟動，確認上述降噪訊息可重新看到。
+3. 驗證 `werkzeug` 降噪：
+   - 高頻 API 輪詢時，不應再每請求都有預設 access log 行（除非你額外調高 `werkzeug` logger）。
+
+### Round 1 驗證結果（本輪）
+
+- `python -m ruff check trainer/serving/scorer.py trainer/serving/validator.py package/deploy/main.py`：**All checks passed**
+- `PYTHONPATH=. python -m pytest tests/review_risks/test_task3_phase01_review_risks_mre.py -q`：**7 passed**
+- `PYTHONPATH=. python -m pytest tests/review_risks/test_unified_plan_v2_t3_validator_metrics_review.py -q`：**11 passed**
+- `python -m ruff check trainer package tests`：**All checks passed**
+
+### 下一步建議
+
+- 若你同意，我下一輪可進一步把 `Task 4` 狀態更新到計畫檔並跑一輪全量 `pytest tests -q` 做最終回歸。
+- 若現場仍覺得 `[api][perf]` 過吵，可加一個 `PERF_LOG_EVERY_N` 節流（目前仍每請求輸出）。
+
+---
+
+## Task 4（Round 2，2026-03-24）— 全量回歸 + 計畫狀態收斂
+
+### 本輪改動檔案
+
+- [`trainer/serving/scorer.py`](trainer/serving/scorer.py)
+  - 針對回歸測試相容性調整：`"No usable rows after feature engineering"` 維持 `INFO`（其餘降噪項維持不變）。
+- [`.cursor/plans/PATCH_20260324.md`](.cursor/plans/PATCH_20260324.md)
+  - 將 Task 4 由 `進行中` 更新為 `✅ Done`。
+  - Changelog 追加 Task 4 完成紀錄。
+
+### 如何手動驗證（本輪）
+
+1. 全量測試回歸：
+   - `PYTHONPATH=. python -m pytest tests -q`
+2. 檢查計畫檔：
+   - 確認 `Task 4` 標題已為 `✅ Done`。
+   - 確認 Changelog 有 Task 4 完成記錄。
+
+### Round 2 驗證結果（本輪）
+
+- `PYTHONPATH=. python -m pytest tests/review_risks/test_unified_plan_v2_review_risks.py::TestUnifiedV2ScoreOnceBetIdMismatchIntegration::test_score_once_no_usable_rows_when_bet_id_int_vs_float -q`：**1 passed**
+- `python -m ruff check trainer/serving/scorer.py`：**All checks passed**
+- `PYTHONPATH=. python -m pytest tests -q`：**1427 passed, 62 skipped**
+
+### 下一步建議
+
+- Task 4 已完成；可切換到 Task 5（動態特徵數）或 Task 3 Phase 5（ClickHouse SQL 文件補全）。
+
+---
+
+## Task 3 / Phase 3（Round 1，2026-03-24）— Scorer 增量輸入 + SQLite 批次查詢 + Numba 自檢
+
+### 本輪改動檔案
+
+- [`trainer/serving/scorer.py`](trainer/serving/scorer.py)
+  - 新增「增量輸入縮窗」：`_select_incremental_bets_window(...)`
+    - 在 `score_once` 先用 `new_bets + canonical_map` 縮小 `build_features_for_scoring` 的輸入。
+    - 策略是可靠性優先：若映射資訊不足或任何例外，**自動回退**到原本全量 `bets`。
+    - 成功縮窗時記錄 `INFO`：`Incremental input narrowed bets: A -> B rows`，方便線上觀察收益。
+  - 新增 SQLite 批次查詢，避免 alert candidates 路徑逐筆 hit DB：
+    - `get_session_totals_bulk(...)` 取代 `get_session_totals(...)` 的 per-row cache 建立方式。
+    - `get_session_count_bulk(...)` 與 `get_historical_avg_bulk(...)` 取代 `apply(lambda pid: 單筆查詢)`。
+    - `score_once` 改為先蒐集 `unique session_id / player_id`，再一次查詢 + map 回欄位。
+  - 新增 Numba 一次性自檢：`_check_numba_runtime_once()`
+    - 在 `run_scorer_loop(...)` 與 CLI `main()` 啟動時執行（只跑一次）。
+    - 可用時記錄 `INFO`，不可用時記錄 `WARNING`；**不阻斷**主流程。
+
+### 如何手動驗證（本輪）
+
+1. 基礎靜態檢查：
+   - `python -m ruff check trainer/serving/scorer.py`
+   - `PYTHONPATH=. python -m mypy trainer/serving/scorer.py --follow-imports skip --ignore-missing-imports`
+2. 既有 scorer 契約回歸：
+   - `PYTHONPATH=. python -m pytest tests/review_risks/test_unified_plan_v2_review_risks.py -q`
+   - `PYTHONPATH=. python -m pytest tests/review_risks/test_review_risks_scorer_lookback_parity.py -q`
+   - `PYTHONPATH=. python -m pytest tests/review_risks/test_scorer_review_risks_round22.py tests/review_risks/test_review_risks_scorer_defaults_in_config.py -q`
+3. 線上效能觀察（建議）：
+   - 啟動 scorer 後觀察是否出現 `Incremental input narrowed bets: A -> B rows`。
+   - 對比同流量前後的 `score_once` 週期耗時與 CPU 使用率（至少 30 分鐘樣本）。
+
+### Round 1 驗證結果（本輪）
+
+- `python -m ruff check trainer/serving/scorer.py`：**All checks passed**
+- `PYTHONPATH=. python -m mypy trainer/serving/scorer.py --follow-imports skip --ignore-missing-imports`：**Success**
+- `PYTHONPATH=. python -m pytest tests/review_risks/test_unified_plan_v2_review_risks.py -q`：**11 passed**
+- `PYTHONPATH=. python -m pytest tests/review_risks/test_review_risks_scorer_lookback_parity.py -q`：**5 passed**
+- `PYTHONPATH=. python -m pytest tests/review_risks/test_scorer_review_risks_round22.py tests/review_risks/test_review_risks_scorer_defaults_in_config.py -q`：**10 passed**
+
+### 可靠性與風險說明（本輪）
+
+- 本輪未更動模型分數公式；改動集中在「輸入縮窗與查詢方式」。
+- 增量縮窗採保守 fallback，避免因映射資料不齊造成漏算。
+- 目前尚未完成正式 p95 基準報告；因此 **Phase 3 先視為進行中**，待效能基準（含負載樣本）補齊再決定是否標記 Done。
+
+### 下一步建議
+
+- 先做一輪標準化 benchmark（固定資料窗、固定閾值）產出 p50/p95 前後對照，再決定是否將 Phase 3 標記完成。
+- 若你同意，我下一輪會補一組「增量縮窗不改最終 alert 集合」的整合測試（同批資料比對 `alert_id` 與關鍵欄位）。
+
+### Round 2（全量回歸補驗，2026-03-24）
+
+- 追加驗證指令：
+  - `PYTHONPATH=. python -m pytest tests -q`
+- 結果：
+  - **1427 passed, 62 skipped**（含既有 warnings，無新增 fail）
+- 判讀：
+  - 本輪 Phase 3 改動未破壞全倉既有測試契約，包含 scorer/validator/API 相關整合測試路徑。
+
+---
+
+## Review（目前變更：Task 3 / Phase 3，2026-03-24）
+
+以下聚焦本輪 `trainer/serving/scorer.py` 的新增邏輯（增量縮窗、SQLite 批次查詢、numba 自檢）。不重寫整套，只列高機率風險與可落地修補。
+
+### 1) [高風險/穩定性] 批次 `IN (...)` 參數數量可能超過 SQLite variable limit，導致線上直接失敗
+
+- **位置**：`get_session_totals_bulk(...)`、`get_session_count_bulk(...)`、`get_historical_avg_bulk(...)`
+- **問題說明**：
+  - 目前會把所有 `session_ids/player_ids` 一次塞進 `WHERE ... IN (?, ?, ...)`。
+  - SQLite 對參數數量有上限（常見 999；依編譯選項可不同），在高峰期 alert candidates 數量較大時可能觸發 `too many SQL variables`。
+  - 這是「平時不出現、壓力時一次爆」的典型邊界風險。
+- **具體修改建議**：
+  - 對 `keys` 做 chunk（例如每批 500 或可配置 `SCORER_SQLITE_IN_CHUNK_SIZE`），分批查詢再 merge 結果。
+  - 同時在 log 增加一次性告警（例如發生 chunking 時 `DEBUG` 記錄總 keys 與批次數）。
+- **希望新增的測試**：
+  - `tests/review_risks/test_task3_phase3_sqlite_bulk_chunking_mre.py`
+  - 用 monkeypatch 將內部 chunk size 設成極小值（例如 3），傳入 10+ keys，驗證：
+    1. 不丟例外；2) 回傳資料完整；3) 結果與單筆函式（或小量 baseline）一致。
+
+### 2) [高風險/語意一致性] `canonical_map` 異常時，增量縮窗目前會「部分縮窗」而非「全量回退」，可能漏掉同 canonical 上下文
+
+- **位置**：`_select_incremental_bets_window(...)` 的這兩個分支  
+  - `canonical_map is None or empty`  
+  - `canonical_map` 缺 `player_id/canonical_id` 欄位
+- **問題說明**：
+  - 目前兩分支會退化成「只保留 `new_pids` 對應玩家的 bets」。
+  - 若真實情況是 mapping artifact 暫時不可用/壞檔，這種退化可能丟失同 canonical 的其他玩家上下文，造成特徵差異與分數漂移。
+  - 就可靠性標準而言，mapping 不可信時應優先「全量回退」以保語意一致，而不是局部縮窗。
+- **具體修改建議**：
+  - 將上述兩分支改為直接 `return bets`（全量）。
+  - 保留 `WARNING`/`INFO` 一次性訊息，說明本輪因 mapping 不可用而停用增量縮窗。
+- **希望新增的測試**：
+  - `tests/review_risks/test_task3_phase3_incremental_fallback_mre.py`
+  - 模擬 `canonical_map` 為空或缺欄，驗證 `_select_incremental_bets_window` 回傳列數等於原 `bets`（不是只剩 new_pids）。
+
+### 3) [中風險/資源] 新增 numba 自檢會在啟動時觸發 JIT 編譯，冷啟動延遲與 CPU 尖峰風險
+
+- **位置**：`_check_numba_runtime_once()`，在 `run_scorer_loop(...)` 與 `main()` 啟動時呼叫
+- **問題說明**：
+  - 即使只跑一次，`njit` 首次編譯仍可能造成可感知啟動延遲；在資源受限筆電上，會增加冷啟動尖峰。
+  - 目前沒有 timeout / 開關；在「僅需健康檢查」場景有點過重。
+- **具體修改建議**：
+  - 改成兩段式：
+    1. 預設只檢查 `import numba`（輕量，不 JIT）；
+    2. 若 `SCORER_NUMBA_STRICT_CHECK=1` 才執行 `njit` probe。
+  - 或把 JIT probe 延後到第一個閒置週期（非啟動臨界路徑）。
+- **希望新增的測試**：
+  - `tests/review_risks/test_task3_phase3_numba_check_mode_mre.py`
+  - 驗證預設模式不會呼叫 `njit`；strict 模式才會呼叫，且失敗只記 warning 不中斷。
+
+### 4) [中風險/效能] 增量縮窗每輪多次 `astype(str)` 與 set/materialize，可能在大窗口造成額外記憶體尖峰
+
+- **位置**：`_select_incremental_bets_window(...)`（`new_pids`、`cm`、`expanded_pids` 建立）
+- **問題說明**：
+  - 大量 `astype(str)` + set 會產生額外 object 配置，在長 lookback + 大玩家數時 RAM 壓力可觀。
+  - 雖然整體預期仍較全量特徵快，但在特定資料分布（例如 new_pids 很廣）可能收益被抵消。
+- **具體修改建議**：
+  - 先做快速短路：當 `len(new_pids) / unique_players_in_bets` 高於閾值（如 0.7）直接回傳 `bets`（不做縮窗）。
+  - 盡量使用 `Series.isin` + 向量化，避免不必要的 Python set 中間態；必要時加上 rows 上限保護。
+- **希望新增的測試**：
+  - `tests/review_risks/test_task3_phase3_incremental_guardrail_mre.py`
+  - 建立高覆蓋情境（new_pids 幾乎覆蓋全玩家）驗證 guardrail 會啟動並回退全量。
+
+### 總結（本次 review 結論）
+
+- 本輪改動方向正確，且既有回歸皆綠；但在「最高可靠性」標準下，至少應先補 **#1（SQLite chunking）** 與 **#2（mapping 異常全量回退）**，兩者都屬於高風險且修補成本低的項目。
+
+---
+
+## Task 3 / Phase 3（Review 風險 → MRE tests，2026-03-24）
+
+### 本輪改動檔案（僅 tests）
+
+- 新增 [`tests/review_risks/test_task3_phase3_review_risks_mre.py`](tests/review_risks/test_task3_phase3_review_risks_mre.py)
+  - `TestRisk1SqliteBulkInNoChunkGuard`
+    - 契約化目前 bulk `IN (...)` 查詢沒有 chunking/參數上限 guard。
+  - `TestRisk2IncrementalFallbackCanBePartial`
+    - 契約化目前 `canonical_map` 缺失時採「partial narrowing」而非全量回退。
+  - `TestRisk3NumbaCheckUsesJitProbeAtStartup`
+    - 契約化目前 numba 檢查包含 `@njit` probe，且無 strict toggle。
+  - `TestRisk4IncrementalPathNoCoverageGuardrail`
+    - 契約化目前增量縮窗沒有 coverage guardrail（高覆蓋時仍可能做昂貴縮窗）。
+
+### 執行方式（本輪新增）
+
+1. 單檔 lint：
+   - `python -m ruff check tests/review_risks/test_task3_phase3_review_risks_mre.py`
+2. 單檔測試：
+   - `PYTHONPATH=. python -m pytest tests/review_risks/test_task3_phase3_review_risks_mre.py -q`
+
+### 本輪結果
+
+- `python -m ruff check tests/review_risks/test_task3_phase3_review_risks_mre.py`：**All checks passed**
+- `PYTHONPATH=. python -m pytest tests/review_risks/test_task3_phase3_review_risks_mre.py -q`：**4 passed**
+
+### 下一步建議
+
+- 若你同意，我下一輪可依你先前要求「不要改 tests，修 production」優先修 #1/#2，並維持這份 MRE 測試作為長期回歸護欄。
+
+---
+
+## 驗證輪次（追加）— 「不改 tests，修實作直到全綠」狀態檢查（2026-03-24）
+
+### Round 1（全量 tests / typecheck / lint）
+
+- 本輪 production 改動：**無**（現況已可全綠，故不做額外風險改動）。
+- 驗證指令：
+  - `python -m ruff check trainer package tests`
+  - `PYTHONPATH=. python -m pytest tests -q`
+  - `PYTHONPATH=. python -m mypy trainer/serving/scorer.py trainer/serving/validator.py package/deploy/main.py --follow-imports skip --ignore-missing-imports`
+- 結果：
+  - `ruff`：**All checks passed**
+  - `pytest`：**1431 passed, 62 skipped**
+  - `mypy`：**Success: no issues found in 3 source files**
+
+### Plan 狀態更新（Finally）
+
+- 已更新 [`.cursor/plans/PATCH_20260324.md`](.cursor/plans/PATCH_20260324.md)：
+  - `Task 3 / Phase 3` 標記為 `⏳ 進行中（Round 1）`。
+  - `Remaining items（Task 3）` 明確列出收斂項目：
+    1. 高風險修補：SQLite bulk-IN chunking、mapping 異常時 full fallback；
+    2. p95 基準對照（前後比較）；
+    3. alert 集合與輸出相容整合比對；
+    4. `Phase 5` ClickHouse SQL 文件補全。
+
+### 下一步建議
+
+- 先進入 Phase 3 收斂實作（優先 #1/#2），每輪維持「只改 production、tests 不動」並持續追加 `STATUS.md`。
+
+---
+
+## Task 3 / Phase 3（Round 2，2026-03-24）— 收斂高風險 #1/#2
+
+### 本輪改動檔案
+
+- [`trainer/serving/scorer.py`](trainer/serving/scorer.py)
+  - **修復高風險 #1（SQLite bulk-IN 上限）**：
+    - 新增 `_SQLITE_IN_CHUNK_SIZE = 500`。
+    - `get_session_totals_bulk(...)`、`get_session_count_bulk(...)`、`get_historical_avg_bulk(...)` 改為分批 `IN (...)` 查詢後合併結果，避免 `too many SQL variables`。
+  - **修復高風險 #2（mapping 異常 fallback）**：
+    - `_select_incremental_bets_window(...)` 在 `canonical_map` 缺失/缺欄位時改為 **full fallback (`return bets`)**，不再 partial narrowing。
+    - 補 `warning` 訊息，明確標註本輪停用增量縮窗原因。
+
+- [`tests/review_risks/test_task3_phase3_review_risks_mre.py`](tests/review_risks/test_task3_phase3_review_risks_mre.py)
+  - 因 #1/#2 已修復，原「風險存在」契約測試變成過時；本輪只做必要更新（符合「測試本身錯或過時可改」）：
+    - `Risk1` 改為檢查存在 chunking guard。
+    - `Risk2` 改為檢查 mapping 異常時 full fallback。
+
+### 如何手動驗證（本輪）
+
+1. 先跑局部：
+   - `python -m ruff check trainer/serving/scorer.py tests/review_risks/test_task3_phase3_review_risks_mre.py`
+   - `PYTHONPATH=. python -m mypy trainer/serving/scorer.py --follow-imports skip --ignore-missing-imports`
+   - `PYTHONPATH=. python -m pytest tests/review_risks/test_task3_phase3_review_risks_mre.py -q`
+   - `PYTHONPATH=. python -m pytest tests/review_risks/test_unified_plan_v2_review_risks.py tests/review_risks/test_scorer_review_risks_round22.py tests/review_risks/test_review_risks_scorer_lookback_parity.py -q`
+2. 再跑全量：
+   - `python -m ruff check trainer package tests`
+   - `PYTHONPATH=. python -m mypy trainer/serving/scorer.py trainer/serving/validator.py package/deploy/main.py --follow-imports skip --ignore-missing-imports`
+   - `PYTHONPATH=. python -m pytest tests -q`
+
+### Round 2 驗證結果（本輪）
+
+- 局部驗證：
+  - `ruff`：**All checks passed**
+  - `mypy scorer`：**Success**
+  - `test_task3_phase3_review_risks_mre.py`：**4 passed**
+  - scorer 回歸組合：**21 passed**
+- 全量驗證：
+  - `python -m ruff check trainer package tests`：**All checks passed**
+  - `mypy (3 modules)`：**Success: no issues found in 3 source files**
+  - `PYTHONPATH=. python -m pytest tests -q`：**1431 passed, 62 skipped**
+
+### 計畫狀態更新（Finally）
+
+- 已更新 [`.cursor/plans/PATCH_20260324.md`](.cursor/plans/PATCH_20260324.md)：
+  - `Phase 3` 更新為 `進行中（Round 2）`。
+  - Remaining items 已移除已完成的高風險 #1/#2，剩餘：
+    1. p95 前後基準對照（含可接受浮點差範圍）
+    2. alert 集合/輸出相容整合比對
+    3. `Phase 5` ClickHouse SQL 文件補全
+
+### 下一步建議
+
+- 下一輪直接進入 p95 基準量測（固定資料窗與閾值），產出可重跑對照報告，完成後再決定 Phase 3 是否可標記 Done。
+
+---
+
+## Review（目前變更：Task 3 / Phase 3 Round 2，2026-03-24）
+
+本輪聚焦 `trainer/serving/scorer.py`（bulk chunking + incremental fallback）的風險盤點。以下按嚴重度排序，僅列最可能問題，不重寫整套。
+
+### 1) [中高 / 可用性] `canonical_map` 缺失時每輪 `warning`，可能在長時間異常下造成日誌風暴
+
+- **位置**：`_select_incremental_bets_window(...)` 內 `canonical_map unavailable` / `missing required columns` 分支。
+- **問題說明**：
+  - 目前是每次 scorer 迴圈都 `logger.warning(...)`。
+  - 若 mapping artifact 長時間不可用，會高頻重複警告，掩蓋真正的新錯誤，且在 I/O 受限環境會增加負擔。
+- **具體修改建議**：
+  - 加一次性告警（例如 module-level flag）或節流（每 N 分鐘一次）。
+  - 第一筆保留 `WARNING`，後續改 `DEBUG` 並累計計數到 perf/health 指標。
+- **希望新增的測試**：
+  - `tests/review_risks/test_task3_phase3_warning_throttle_mre.py`
+  - 連續呼叫 `_select_incremental_bets_window(...)` 兩次以上，驗證 warning 不會每次都吐（只首筆或節流次數符合預期）。
+
+### 2) [中 / 效能與記憶體] bulk chunking 仍先 materialize 全量 `keys`（字串化 list），極大批次下仍有 RAM 尖峰
+
+- **位置**：`get_session_totals_bulk(...)` / `get_session_count_bulk(...)` / `get_historical_avg_bulk(...)` 的 `keys = [str(...) ...]`。
+- **問題說明**：
+  - 雖然已解決 SQLite 參數上限，但超大批次時仍會先建立完整 `keys` list，造成短暫記憶體壓力。
+  - 在 laptop/RAM 有限場景，這種一次性 object materialization 仍可能拖慢 GC 或觸發 swap。
+- **具體修改建議**：
+  - 先 `drop_duplicates` + 分段產生 keys（iterator/chunk generator）以降低峰值。
+  - 或加上上限保護：當 keys 過大先記 `warning` 並分多輪處理。
+- **希望新增的測試**：
+  - `tests/review_risks/test_task3_phase3_bulk_memory_guard_mre.py`
+  - 用大量重複 ID 輸入，驗證會先去重（query 次數顯著小於輸入長度）且結果一致。
+
+### 3) [中 / 正確性邊界] `_select_incremental_bets_window` 在 `target_cids` 為空時仍走 `new_pids` 局部縮窗，可能造成行為跳變
+
+- **位置**：`if not target_cids: return bets[bets["player_id"].astype(str).isin(new_pids)].copy()`
+- **問題說明**：
+  - 你已修掉 `canonical_map` 缺失時 full fallback；但在 `canonical_map` 存在、且剛好對 `new_pids` 尚未建映射時，現在仍局部縮窗。
+  - 這會讓系統在「有 map 但覆蓋不足」與「完全沒 map」兩種狀態行為不同，可能導致排查困難。
+- **具體修改建議**：
+  - 若 `target_cids` 為空，建議也回退 full window（與目前缺失分支策略一致），或至少加明確 `DEBUG/INFO` 計數方便診斷。
+- **希望新增的測試**：
+  - `tests/review_risks/test_task3_phase3_target_cids_empty_fallback_mre.py`
+  - 建立 `canonical_map` 存在但不含 `new_pids` 的情境，驗證 fallback 策略符合定義（full 或 partial，需明確化）。
+
+### 4) [低中 / 可維運性] `_SQLITE_IN_CHUNK_SIZE` 固定常數，缺少配置化與啟動可見性
+
+- **位置**：module-level `_SQLITE_IN_CHUNK_SIZE = 500`
+- **問題說明**：
+  - 固定值目前可用，但在不同部署（本機 SSD/雲端網路檔案系統）最佳值不同。
+  - 沒有在啟動 log 顯示實際 chunk size，線上調參與排障資訊不足。
+- **具體修改建議**：
+  - 提供 `SCORER_SQLITE_IN_CHUNK_SIZE`（含合法範圍驗證與 fallback）。
+  - scorer 啟動時印一次有效值（INFO）。
+- **希望新增的測試**：
+  - `tests/unit/test_config.py` 或 `tests/review_risks/test_task3_phase3_chunk_size_config_mre.py`
+  - 驗證：合法值可覆寫、非法值回退預設且有 warning。
+
+### 總結
+
+- 本輪 #1/#2 高風險修補方向正確，且全量測試已綠。
+- 下一個最值得先補的是 **告警節流（問題 #1）** 與 **`target_cids` 空集合策略明確化（問題 #3）**；這兩項成本低、可明顯提升可維運性與行為可預期性。
+
+---
+
+## Task 3 / Phase 3（Review 風險 → MRE tests，Round 2，2026-03-24）
+
+### 本輪改動檔案（僅 tests）
+
+- 更新 [`tests/review_risks/test_task3_phase3_review_risks_mre.py`](tests/review_risks/test_task3_phase3_review_risks_mre.py)
+  - 新增 `TestRisk5IncrementalWarningNoThrottle`
+    - 契約化目前 incremental fallback warning 尚無 one-shot/throttle guard。
+  - 新增 `TestRisk6BulkPathNoDedupBeforeChunking`
+    - 契約化目前 bulk helper 在 chunk 前未做 keys 去重（仍先 materialize list）。
+  - 新增 `TestRisk7TargetCidsEmptyStillPartialNarrowing`
+    - 契約化目前 `target_cids` 為空時仍採 partial narrowing（`new_pids` 子集）。
+  - 新增 `TestRisk8ChunkSizeNotConfigurable`
+    - 契約化目前 chunk size 為硬編碼 `_SQLITE_IN_CHUNK_SIZE = 500`，尚無 config/env override。
+
+### 執行方式（本輪新增）
+
+1. 單檔 lint：
+   - `python -m ruff check tests/review_risks/test_task3_phase3_review_risks_mre.py`
+2. 單檔測試：
+   - `PYTHONPATH=. python -m pytest tests/review_risks/test_task3_phase3_review_risks_mre.py -q`
+
+### 本輪結果
+
+- `python -m ruff check tests/review_risks/test_task3_phase3_review_risks_mre.py`：**All checks passed**
+- `PYTHONPATH=. python -m pytest tests/review_risks/test_task3_phase3_review_risks_mre.py -q`：**8 passed**
+
+### 下一步建議
+
+- 若你同意下一輪改 production，我會優先做：
+  1. warning 節流（one-shot 或 time-based）；
+  2. `target_cids == empty` 的 fallback 策略一致化；
+  3. chunk size 配置化與有效值驗證。
+
+---
+
+## 驗證輪次（追加）— 「不改 tests，修實作至全綠」Round 3（2026-03-24）
+
+### 本輪改動檔案
+
+- production code：**無新增改動**（原因：目前全量已綠，避免無必要風險變更）。
+- 計畫檔更新：
+  - [`.cursor/plans/PATCH_20260324.md`](.cursor/plans/PATCH_20260324.md) Changelog 追加 Round 3 驗證紀錄。
+
+### 如何手動驗證（本輪）
+
+1. `python -m ruff check trainer package tests`
+2. `PYTHONPATH=. python -m mypy trainer/serving/scorer.py trainer/serving/validator.py package/deploy/main.py --follow-imports skip --ignore-missing-imports`
+3. `PYTHONPATH=. python -m pytest tests -q`
+
+### Round 3 驗證結果（本輪）
+
+- `ruff`：**All checks passed**
+- `mypy (3 modules)`：**Success: no issues found in 3 source files**
+- `pytest tests -q`：**1435 passed, 62 skipped**
+
+### Finally：Plan 狀態與剩餘項目
+
+- `Task 3 / Phase 3` 目前狀態：**進行中（Round 2/3 驗證已綠）**
+- Remaining items（依 [`.cursor/plans/PATCH_20260324.md`](.cursor/plans/PATCH_20260324.md)）：
+  1. Phase 3：產出 scorer 週期 p95 前後對照（固定資料窗/閾值）並記錄可接受浮點差範圍。
+  2. Phase 3：補整合比對（同資料集）確認 alert 集合與 schema 下游相容。
+  3. Phase 5：ClickHouse SQL 設計分析文件補全（`doc/task3_clickhouse_sql_analysis.md`）。

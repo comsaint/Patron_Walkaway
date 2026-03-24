@@ -10,7 +10,7 @@ import inspect
 import pathlib
 import sys
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from unittest.mock import patch
 
 import pandas as pd

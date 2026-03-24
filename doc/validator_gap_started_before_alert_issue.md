@@ -1,82 +1,66 @@
-# Validator 逻辑问题说明
+# Trainer vs. Validator 差異發生點
 
-## 依据： `trainer/validator.py`
+> Update (2026-03-24, Task 6): `trainer/serving/validator.py` 已移除
+> `gap_started_before_alert` early-return 分支。本文保留為歷史問題說明與背景脈絡。
 
 ---
 
-## 实际逻辑（摘要）
+## 假設
 
-对一则 alert，设其 **`bet_ts`** = 该则对应的下注时间。在 `validate_alert_row` 中：
+* **10:30** 為該客人 **最後一筆下注**，且 **walkaway／`gap_start`** 與此筆對齊，故 **`gap_start` = 10:30**。
+* **`compute_labels`**：觀測點 \(t\) = 該筆 `payout_complete_dtm`；**label = 1** 若 **`gap_start` ∈ \[t, t + 15 分鐘\]**（**`ALERT_HORIZON_MIN`**）。
+* **Validator 結論**（**`WALKAWAY_GAP_MIN=30`**、**`LABEL_LOOKAHEAD_MIN=45`**、**`VALIDATOR_FINALIZE_ON_HORIZON=True`**。
+* **`now_hk`** 已足夠晚可 **finalize**。
 
-1. 在该客人的下注时间序列上，找 **`bet_ts` 之前**最后一笔下注 **`last_bet_before`**。
-2. 若 **`last_bet_before` 存在** 且 **`bet_ts - last_bet_before` > 15 分钟**，则：
-   - 判 **`result = False`（视为误报 / FP）**
-   - **`reason = "gap_started_before_alert"`**
-   - **`gap_start` 设为 `last_bet_before`**
-   - **`return`，不再执行**后续「从 `bet_ts` 往后看是否在观察窗内出现长空档」的完整路径。
+---
 
-对应原码（`trainer/validator.py`，**L393-L404**）：
+## Bets
 
-```python
-# L393
+| bet_ts | 說明 | Ground Truth (`compute_labels`) | Validator（`bet_ts` = 該筆） | **`TP`（API）** |
+|--------|------|------------------|------------------------------|----------------|
+| **9:55** | 首筆 | **0**（[9:55, 10:10] 不含 **10:30**） | **非** `gap_started_before_alert`（無 `last_bet_before`）；**`MISS`**（視窗內存在 **> bet_ts+15min** 之下注，例：**10:22**）→ **`result=False`** | **`"FP"`** |
+| <span style="color:red"><strong>10:22</strong></span> | <span style="color:red">alert 主線</span> | <span style="color:red"><strong>1</strong>（<strong>10:30</strong> ∈ \[10:22, 10:37\]）</span> | <span style="color:red"><strong>`result=False`</strong>，<strong>`reason=gap_started_before_alert`</strong>（<strong>10:22 − 9:55 = 27 分鐘</strong> &gt; **15**；<strong>提早 `return`</strong>）</span> | <span style="color:red"><code>"FP"</code></span> |
+| **10:28** | 介於 10:22 與 10:30 之間 | **1**（**10:30** ∈ \[10:28, 10:43\]） | **非** `gap_started_before_alert`（**10:28 − 10:22 = 6 分鐘**）；**L750+**（**`find_gap`**／**`MATCH`** 候選等，**finalize** 後常 **`result=True`**） | **`"TP"`** |
+| **10:30** | 最後一筆(walkaway)；**`gap_start`** 對齊 | **1**（**10:30** ∈ \[10:30, 10:45\]） | **非** `gap_started_before_alert`（**10:30 − 10:28 = 2 分鐘**）；**`MATCH`** 候選 → **`result=True`** | **`"TP"`** |
+
+---
+
+### 逐步說明（**`bet_ts` = 10:22** ）
+
+1. **`compute_labels`（觀測在 10:22）**：**10:30 ∈ \[10:22, 10:37\]** → **label = 1**。
+2. **`validate_alert_row`（`bet_ts` = 10:22）**：**`last_bet_before` = 9:55**，**10:22 − 9:55 = 27 分鐘** &gt; **15** → 進入 **`gap_started_before_alert`** → **`result = False`**，**`return`**，**不執行**後續與 Trainer 視窗對齊之 **L750+**。
+3. **對照**：同一時間軸上，**10:22** 可 **Trainer label = 1** 與 **Validator FP（協定 `TP="FP"`）** 並存；**10:28**、**10:30** 之下注因 **上一筆與 `bet_ts` 間隔 ≤ 15 分鐘**，**不會**觸發此提早分支。
+
+---
+
+## 分歧點（一句）
+
+**Trainer**：只問 **\[t, t+15 分鐘\]** 內是否出現 **`gap_start`(walkaway)**。  
+**Validator**：先問 **`bet_ts − last_bet_before` 是否 &gt; 15 分鐘**；若是，**直接 FP 並 `return`**，**不再**用 **`bet_ts` 之後**軌跡對齊 Trainer 視窗。
+
+---
+
+## 程式位置
+
+| 項目 | 內容 |
+|------|------|
+| **檔案** | `trainer/validator.py` |
+| **函式** | `validate_alert_row`（約 **L344** 起） |
+| **分支** | **L393–L404** |
+
+<pre><code># 摘錄自 trainer/validator.py（L393–L404）
 idx = bisect_left(bet_list, bet_ts)
-# L394
-last_bet_before = bet_list[idx - 1] if idx > 0 else None
-# L395
-if last_bet_before is not None and (bet_ts - last_bet_before) > timedelta(minutes=15):
-    # L396-L403
+last_bet_before = bet_list[idx - 1] if idx &gt; 0 else None
+<span style="color:red">if last_bet_before is not None and (bet_ts - last_bet_before) &gt; timedelta(minutes=15):</span>
     res_base.update(
         {
-            "result": False,  # L398
-            "gap_start": last_bet_before.isoformat(),  # L399
-            "gap_minutes": (bet_ts - last_bet_before).total_seconds() / 60.0,  # L400
-            "reason": "gap_started_before_alert",  # L401
+            "result": False,
+            "gap_start": last_bet_before.isoformat(),
+            "gap_minutes": (bet_ts - last_bet_before).total_seconds() / 60.0,
+            "reason": "gap_started_before_alert",
         }
     )
-    return res_base  # L404
-```
+    return res_base
+</code></pre>
 
-亦即：**一旦进入此分支，结论已锁死为 FP。**
-
----
-
-## 逻辑问题（重点）
-
-### 1. 与直觉上的「验证问题」不一致
-
-运营或产品上常见的验证命题是：
-
-> **在这笔 `bet_ts` 之后**，客人在约定窗口内是否出现「够长的无下注空档」（或是否离场）。
-
-但上述分支**完全没有**回答这个命题：它在 **`bet_ts` 之前**只看「上一笔距离 `bet_ts` 是否超过 15 分钟」，就**直接 FP**，**不再**验证 **`bet_ts` 之后**是否真的很快又进入长空档。
-
-因此可能出现：
-
-- **`bet_ts` 之后**客人**确实**在短时间内停止下注并形成长空档（直觉上「预测对了」），
-- 但 validator **仍标 FP**，只因 **`bet_ts` 前**已有一段超过 15 分钟的空档再接上这笔下注。
-
-这是**验证规则与「只关心 alert 之后是否发生」的语义不一致**。
-
-### 2. 理由用语容易误导
-
-`gap_started_before_alert` 搭配「上一笔很久以前」容易读成：
-
-> 「walkaway／长空档在 alert 之前就已经开始了。」
-
-但时间轴上常见情况是：**上一笔与 `bet_ts` 之间空了一段（>15 分钟），接着客人在 `bet_ts` 又下了一注**——这**不表示**「已经完成」另一套定义里的「30 分钟离场」之类结论；它只表示 **bet stream 上在 `bet_ts` 前有一段够长的 idle**。
-
-### 3. 若下游把 `gap_start` 当「离场时间」
-
-若 API 或报表把 **`gap_start`** 当成「实际 walkaway 时间」，在 FP + `gap_started_before_alert` 时常出现 **`gap_start`（或对应的 `walkaway_ts`）早于 `bet_ts`**。这在**时间顺序**上会让人困惑；实际上此字段此时比较像 **「用来标记 FP 理由的参考时间点」**，而非「这则 alert 所预测的离场发生时间」。
-
----
-
-## 建议与原作者厘清的方向（非实现指示）
-
-1. **当初设计意图**：此分支是要对齐某种 **offline label**，还是要测量 **「alert 之后是否发生」**？两者不同。
-2. **若目标是后者**：在 **`bet_ts - last_bet_before > 15m`** 时仍应否 **early return FP**，或应继续评估 **`bet_ts` 之后**的轨迹，需要明确定义。
-3. **命名与文档**：`gap_started_before_alert` 与对外字段语义是否应改名或分栏，避免与「离场时间」混淆。
-
----
-
-*文档目的：向最初撰写该段逻辑的开发者对齐「为何现场会认为不合理」，并以最早 commit 为唯一历史锚点。*
+此 **`return`** 之後才是「自 **`bet_ts`** 起在視窗內找空檔」等邏輯。

@@ -853,4 +853,61 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-033：線上 Scorer payout-age cap + Deploy flush 參數分流（state / prediction / all）
+
+**日期**：2026-03-24  
+**SSOT 章節**：[.cursor/plans/PATCH_20260324.md](PATCH_20260324.md) — Task 1  
+**關聯**：Guardrails（特徵全窗 vs 進入模型之路徑）
+
+**決策**：
+
+1. **環境變數 `SCORER_COLD_START_WINDOW_HOURS`**（名稱保留 “cold start”，但**每輪皆套用**）：當設為正數時，僅對 **`payout_complete_dtm` 落在最近 N 小時內**（香港時間、與欄位對齊後比較）的 **new bets** 執行 **模型推論、寫入 prediction log、產生 alerts**。未設或 `<=0` 或非法 → **關閉過濾**（行為與舊版一致）；數值 **cap** 於 **`SCORER_LOOKBACK_HOURS_MAX`**。
+2. **不縮減特徵視窗**：`update_state_with_new_bets`、ClickHouse fetch 視窗、**`build_features_for_scoring(bets, …)`** 仍依完整 lookback；**UNRATED／rated 計數 telemetry** 仍依 **全部** `new_bets`（如 `new_bet_ids_all`），避免日誌語意失真。
+3. **`package/deploy/main.py` flush 參數**（預設不 flush；建議互斥使用）：
+   - `--flush-state`：僅於啟動 scorer／validator／Flask **前** 刪除 **`STATE_DB_PATH`** 對應之 SQLite 主檔與 `-wal`/`-shm`。
+   - `--flush-prediction`：僅刪除 **`PREDICTION_LOG_DB_PATH`** 對應之 SQLite 主檔與 `-wal`/`-shm`。
+   - `--flush-all`：同時刪除 state 與 prediction 兩者。
+
+**理由**：在維持與訓練一致之特徵建置前提下，降低進入模型與 I/O 的負載；同時將 flush 控制顯式分流，讓運維可依場景精準清理 state、prediction 或兩者，避免誤刪。
+
+---
+
+## DEC-034：`/alerts` 與 `/validation` 無查詢參數時預設視窗改為最近 1 小時
+
+**日期**：2026-03-23–24  
+**SSOT 章節**：[package/ML_API_PROTOCOL.md](../../package/ML_API_PROTOCOL.md) §1–2；[PATCH_20260324.md](PATCH_20260324.md) — Task 2  
+**關聯**：現場回報大 payload／慢回應（舊預設 24h + 全表進 pandas 再過濾）
+
+**決策**：
+
+1. 對外協定由「無參數 = 最近 **24** 小時」改為「無參數 = 最近 **1** 小時」（香港時間語意、與既有 timestamp 欄位一致）。
+2. **`/alerts`**：`ts` → 僅回傳 `ts_dt` 在該時間**之後**；`limit` → **僅在未提供 `ts`** 時截尾；無參數 → `ts_dt > now_HK − 1h`。
+3. **`/validation`**：`ts` → `validated_at` 在該時間之後；`bet_id`／`bet_ids` → 依 ID 篩選（此時**不**套用 1h 預設窗）；僅在無上述參數時套用 **1h** 預設窗。
+4. Task 2 **未**做 SQL 層級下推；全表讀取後記憶體過濾若仍成瓶頸，改由 Task 3 Phase 4 處理。
+
+**理由**：預設 1h 可大幅縮小單次 JSON；參數語意維持利於既有增量拉取（`ts`）與 `/alerts` 之 `limit` 協定。
+
+---
+
+## DEC-035：推論路徑效能優化工作流（不改模型／不中斷輪詢週期）
+
+**日期**：2026-03-24  
+**SSOT 章節**：[PATCH_20260324.md](PATCH_20260324.md) — Task 3  
+**關聯**：DEC-030（validator bet-only、`session_cache` 不參與 verdict）、DEC-027（**不**合併 `SCORER_POLL_INTERVAL_SECONDS`）
+
+**決策**：
+
+1. **範圍與護欄**：優化 scorer／validator／deploy Flask 路徑之延遲與 I/O；**不重訓、不改模型權重**。**刻意不**以調整 **`SCORER_POLL_INTERVAL_SECONDS`** 作為此工作流手段（維持現狀，與 DEC-027「各元件週期獨立」精神一致）。
+2. **分階段執行**（實作順序見 PATCH）：Phase 0 量測基線 → Phase 1 Validator 停 session CH → Phase 2 Validator `validation_results` 增量讀 → Phase 4 Flask SQL 下推 → Phase 3 Scorer 增量特徵與 SQLite 批次等 → Phase 5 ClickHouse 文件分析。
+3. **Validator Phase 1（相容過渡）**：walkaway 判決已僅依 **bet 流**（DEC-030）；**保留** `validate_alert_row(..., session_cache, ...)` **簽名**，但 **不再**呼叫 `fetch_sessions_by_canonical_id`，**一律傳入空 `dict`**。canonical_id ↔ player_id 合併仍來自 **alerts** 與 **bet** fetch，**不依賴** validator 之 session 快取。
+4. **Validator Phase 2 前提**：目前**無**「手動改 DB」或「全量重算 processed 狀態」之維運計畫，增量讀取**不需**為此另建完整 fallback 路徑（若日後維運需求出現再單獨議題補上）。
+5. **Scorer 增量特徵**：允許相對全量重算之 **極小數值差**（浮點／合併順序），须於驗收或文件中註明容許範圍或對照方式；**schema／下游欄位相容**仍為必達。
+6. **Phase 4 範圍**：API 之 SQL 優化 **僅限** [`package/deploy/main.py`](../../package/deploy/main.py) 內 Flask 路由；端點與查詢參數 **以** [`package/ML_API_PROTOCOL.md`](../../package/ML_API_PROTOCOL.md) **為準**。
+7. **Phase 5 交付物**：於 [`doc/task3_clickhouse_sql_analysis.md`](../../doc/task3_clickhouse_sql_analysis.md) 對 **每條相關 SQL** 做專項設計分析（目的、欄位、時間窗、風險、可瘦身點）；**不要求**附線上實測或 `EXPLAIN` 實跑。
+8. **輔助手段**：確認 **numba** 於 production 可用；**SHAP reason code** 維持預設關閉或限縮（與既有 `SCORER_ENABLE_SHAP_REASON_CODES` 等設定一致）。
+
+**理由**：在不大改模型與決策語意之前提下，優先拿掉無效 I/O（validator session）、降低 SQLite／API 全表讀取、並以增量化與查詢下推處理資料成長；CH 以文件化分析先固化風險再逐步改 SQL。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

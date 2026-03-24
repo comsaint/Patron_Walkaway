@@ -126,6 +126,39 @@ if SCORER_LOOKBACK_HOURS > SCORER_LOOKBACK_HOURS_MAX:
     SCORER_LOOKBACK_HOURS = SCORER_LOOKBACK_HOURS_MAX
 SCORER_POLL_INTERVAL_SECONDS = 45  # Polling interval in seconds (includes run time)
 
+# Max age (hours) of payout_complete_dtm for rows that enter the model each score_once.
+# Despite the env name, this applies on *every* cycle when set: older new bets skip
+# scoring / prediction_log / alerts (feature build still uses full SCORER_LOOKBACK_HOURS).
+# Unset or <=0 disables. Capped at SCORER_LOOKBACK_HOURS_MAX.
+_csw_raw = os.getenv("SCORER_COLD_START_WINDOW_HOURS", "").strip()
+SCORER_COLD_START_WINDOW_HOURS: Optional[float]
+if not _csw_raw:
+    SCORER_COLD_START_WINDOW_HOURS = None
+else:
+    try:
+        _csw_p = float(_csw_raw)
+        if not math.isfinite(_csw_p) or _csw_p <= 0:
+            _log.warning(
+                "SCORER_COLD_START_WINDOW_HOURS invalid (%r); scoring age filter disabled",
+                _csw_raw,
+            )
+            SCORER_COLD_START_WINDOW_HOURS = None
+        elif _csw_p > float(SCORER_LOOKBACK_HOURS_MAX):
+            _log.warning(
+                "SCORER_COLD_START_WINDOW_HOURS=%s exceeds SCORER_LOOKBACK_HOURS_MAX=%d; capping",
+                _csw_raw,
+                SCORER_LOOKBACK_HOURS_MAX,
+            )
+            SCORER_COLD_START_WINDOW_HOURS = float(SCORER_LOOKBACK_HOURS_MAX)
+        else:
+            SCORER_COLD_START_WINDOW_HOURS = _csw_p
+    except (TypeError, ValueError, OverflowError):
+        _log.warning(
+            "SCORER_COLD_START_WINDOW_HOURS invalid (%r); scoring age filter disabled",
+            _csw_raw,
+        )
+        SCORER_COLD_START_WINDOW_HOURS = None
+
 # T-OnlineCalibration: if set (>0), scorer ignores state DB runtime_rated_threshold older than this (hours).
 _rtt_age = os.getenv("RUNTIME_THRESHOLD_MAX_AGE_HOURS", "").strip()
 RUNTIME_THRESHOLD_MAX_AGE_HOURS: Optional[float]

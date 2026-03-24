@@ -25,6 +25,7 @@ and writes alerts.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import logging
 import math
@@ -114,6 +115,35 @@ except ImportError:
         from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
 
 logger = logging.getLogger(__name__)
+
+_PERF_WINDOW_SIZE = 200
+_SCORER_STAGE_TIMINGS: Dict[str, deque[float]] = {}
+_NUMBA_CHECK_DONE = False
+_SQLITE_IN_CHUNK_SIZE = 500
+
+
+def _record_scorer_stage_timing(stage: str, seconds: float) -> None:
+    bucket = _SCORER_STAGE_TIMINGS.setdefault(stage, deque(maxlen=_PERF_WINDOW_SIZE))
+    bucket.append(max(0.0, float(seconds)))
+
+
+def _emit_scorer_perf_summary(cycle_stage_seconds: Dict[str, float]) -> None:
+    if not cycle_stage_seconds:
+        return
+    for stage, sec in cycle_stage_seconds.items():
+        _record_scorer_stage_timing(stage, sec)
+    top_stages = sorted(cycle_stage_seconds.items(), key=lambda x: x[1], reverse=True)[:2]
+    parts: List[str] = []
+    for stage, sec in top_stages:
+        hist = _SCORER_STAGE_TIMINGS.get(stage)
+        if not hist:
+            continue
+        arr = np.asarray(hist, dtype=float)
+        p50 = float(np.percentile(arr, 50))
+        p95 = float(np.percentile(arr, 95))
+        parts.append(f"{stage}={sec:.3f}s (p50={p50:.3f}s, p95={p95:.3f}s, n={len(arr)})")
+    if parts:
+        logger.info("[scorer][perf] top_hotspots: %s", "; ".join(parts))
 
 # ── Constants ────────────────────────────────────────────────────────────────
 HK_TZ = ZoneInfo(config.HK_TZ)
@@ -770,6 +800,154 @@ def get_session_count(conn: sqlite3.Connection, player_id: object) -> int:
         (str(player_id),),
     ).fetchone()
     return int(row[0]) if row else 0
+
+
+def get_session_totals_bulk(
+    conn: sqlite3.Connection,
+    session_ids: List[object],
+) -> Dict[str, Tuple[int, float, Optional[pd.Timestamp], Optional[pd.Timestamp]]]:
+    """Batch version of get_session_totals to avoid per-row SQLite queries."""
+    keys = [str(sid) for sid in session_ids if sid is not None and not pd.isna(sid)]
+    if not keys:
+        return {}
+    out: Dict[str, Tuple[int, float, Optional[pd.Timestamp], Optional[pd.Timestamp]]] = {}
+    for i in range(0, len(keys), _SQLITE_IN_CHUNK_SIZE):
+        chunk = keys[i : i + _SQLITE_IN_CHUNK_SIZE]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT session_id, bet_count, sum_wager, first_ts, last_ts
+            FROM session_stats
+            WHERE session_id IN ({placeholders})
+            """,
+            chunk,
+        ).fetchall()
+        for sid, bet_count, sum_wager, first_ts, last_ts in rows:
+            sid_str = str(sid)
+            out[sid_str] = (
+                int(bet_count) if bet_count is not None else 0,
+                float(sum_wager) if sum_wager is not None else 0.0,
+                pd.to_datetime(first_ts) if first_ts else None,
+                pd.to_datetime(last_ts) if last_ts else None,
+            )
+    return out
+
+
+def get_session_count_bulk(conn: sqlite3.Connection, player_ids: List[object]) -> Dict[str, int]:
+    """Batch player session counts."""
+    keys = [str(pid) for pid in player_ids if pid is not None and not pd.isna(pid)]
+    if not keys:
+        return {}
+    out: Dict[str, int] = {}
+    for i in range(0, len(keys), _SQLITE_IN_CHUNK_SIZE):
+        chunk = keys[i : i + _SQLITE_IN_CHUNK_SIZE]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT player_id, COUNT(*)
+            FROM session_stats
+            WHERE player_id IN ({placeholders})
+            GROUP BY player_id
+            """,
+            chunk,
+        ).fetchall()
+        for pid, cnt in rows:
+            out[str(pid)] = int(cnt)
+    return out
+
+
+def get_historical_avg_bulk(conn: sqlite3.Connection, player_ids: List[object]) -> Dict[str, float]:
+    """Batch historical average wager by player."""
+    keys = [str(pid) for pid in player_ids if pid is not None and not pd.isna(pid)]
+    if not keys:
+        return {}
+    out: Dict[str, float] = {}
+    for i in range(0, len(keys), _SQLITE_IN_CHUNK_SIZE):
+        chunk = keys[i : i + _SQLITE_IN_CHUNK_SIZE]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT player_id, SUM(sum_wager), SUM(bet_count)
+            FROM session_stats
+            WHERE player_id IN ({placeholders})
+            GROUP BY player_id
+            """,
+            chunk,
+        ).fetchall()
+        for pid, sum_wager, sum_bets in rows:
+            if sum_bets is None or float(sum_bets) == 0.0:
+                out[str(pid)] = 0.0
+            else:
+                out[str(pid)] = float(sum_wager) / float(sum_bets)
+    return out
+
+
+def _check_numba_runtime_once() -> None:
+    """One-time best-effort numba runtime check for deploy observability."""
+    global _NUMBA_CHECK_DONE
+    if _NUMBA_CHECK_DONE:
+        return
+    _NUMBA_CHECK_DONE = True
+    try:
+        from numba import njit  # type: ignore[import]
+
+        @njit(cache=False)
+        def _probe(x: int) -> int:
+            return x + 1
+
+        _ = _probe(1)
+        logger.info("[scorer] numba runtime check: available")
+    except Exception as exc:
+        logger.warning("[scorer] numba runtime check failed: %s", exc)
+
+
+def _select_incremental_bets_window(
+    bets: pd.DataFrame,
+    new_bets: pd.DataFrame,
+    canonical_map: pd.DataFrame,
+) -> pd.DataFrame:
+    """Shrink feature input to players linked to current new bets.
+
+    Reliability-first: only narrows when mapping signals are complete enough;
+    otherwise falls back to full bets window.
+    """
+    if bets.empty or new_bets.empty:
+        return bets
+    if "player_id" not in bets.columns or "player_id" not in new_bets.columns:
+        return bets
+
+    try:
+        new_pids = set(
+            new_bets["player_id"].dropna().astype(str).tolist()
+        )
+        if not new_pids:
+            return bets
+        if canonical_map is None or canonical_map.empty:
+            logger.warning("[scorer] Incremental narrowing disabled: canonical_map unavailable")
+            return bets
+        if not {"player_id", "canonical_id"}.issubset(canonical_map.columns):
+            logger.warning("[scorer] Incremental narrowing disabled: canonical_map missing required columns")
+            return bets
+
+        cm = canonical_map[["player_id", "canonical_id"]].dropna().copy()
+        cm["player_id"] = cm["player_id"].astype(str)
+        cm["canonical_id"] = cm["canonical_id"].astype(str)
+        target_cids = set(cm.loc[cm["player_id"].isin(new_pids), "canonical_id"].tolist())
+        if not target_cids:
+            return bets[bets["player_id"].astype(str).isin(new_pids)].copy()
+        expanded_pids = set(cm.loc[cm["canonical_id"].isin(target_cids), "player_id"].tolist())
+        narrowed = bets[bets["player_id"].astype(str).isin(expanded_pids)].copy()
+        if narrowed.empty:
+            return bets
+        logger.info(
+            "[scorer] Incremental input narrowed bets: %d -> %d rows",
+            len(bets),
+            len(narrowed),
+        )
+        return narrowed
+    except Exception as exc:
+        logger.warning("[scorer] Incremental input narrowing skipped: %s", exc)
+        return bets
 
 
 # ── Feature engineering ───────────────────────────────────────────────────────
@@ -1585,6 +1763,7 @@ def score_once(
     6. SHAP reason codes for rated alert candidates.
     7. Session stats, duplicate suppression, DB write.
     """
+    cycle_stage_seconds: Dict[str, float] = {}
     now_hk = datetime.now(HK_TZ)
     scored_at = now_hk.isoformat()
     feature_list: List[str] = artifacts["feature_list"]
@@ -1592,22 +1771,27 @@ def score_once(
 
     refresh_alert_history(alert_history, now_hk, conn)
     start = now_hk - timedelta(hours=lookback_hours)
-    logger.info("[scorer] Window: %s -> %s", start.isoformat(), now_hk.isoformat())
+    logger.debug("[scorer] Window: %s -> %s", start.isoformat(), now_hk.isoformat())
 
+    t_clickhouse = time.perf_counter()
     bets, sessions = fetch_recent_data(start, now_hk)
     # Post-Load Normalizer (PLAN § Post-Load Normalizer Phase 4)
     bets, sessions = normalize_bets_sessions(bets, sessions)
+    cycle_stage_seconds["clickhouse"] = time.perf_counter() - t_clickhouse
     if bets.empty:
-        logger.info("[scorer] No bets in window; sleeping")
+        logger.debug("[scorer] No bets in window; sleeping")
+        _emit_scorer_perf_summary(cycle_stage_seconds)
         return
 
     prune_old_state(conn, now_hk, retention_hours)
     new_bets = update_state_with_new_bets(conn, bets, now_hk)
-    logger.info("[scorer] New bets since last tick: %d", len(new_bets))
+    logger.debug("[scorer] New bets since last tick: %d", len(new_bets))
     if new_bets.empty:
-        logger.info("[scorer] No new bets to score; sleeping")
+        logger.debug("[scorer] No new bets to score; sleeping")
+        _emit_scorer_perf_summary(cycle_stage_seconds)
         return
 
+    t_features = time.perf_counter()
     # ── D2 identity ───────────────────────────────────────────────────────
     canonical_map = None
     if not rebuild_canonical_mapping and CANONICAL_MAPPING_PARQUET.exists() and CANONICAL_MAPPING_CUTOFF_JSON.exists():
@@ -1652,14 +1836,34 @@ def score_once(
         set(canonical_map["canonical_id"].unique()) if not canonical_map.empty else set()
     )
 
-    # ── Features on full window (for rolling context) ─────────────────────
-    features_all = build_features_for_scoring(bets, sessions, canonical_map, now_hk)
+    # ── Features on narrowed incremental window (Phase 3) ──────────────────
+    bets_for_features = _select_incremental_bets_window(bets, new_bets, canonical_map)
+    features_all = build_features_for_scoring(bets_for_features, sessions, canonical_map, now_hk)
 
     # Unified Plan v2 (T1): UNRATED_VOLUME_LOG counts must use full features_all ∩ new_bets
     # *before* rated-only slice — otherwise unrated new rows disappear and telemetry lies.
-    new_ids = set(new_bets["bet_id"].astype(str))
+    new_bet_ids_all = set(new_bets["bet_id"].astype(str))
+    new_ids = new_bet_ids_all
+    _csw = getattr(config, "SCORER_COLD_START_WINDOW_HOURS", None)
+    if _csw is not None and float(_csw) > 0:
+        _csw_f = min(float(_csw), float(getattr(config, "SCORER_LOOKBACK_HOURS_MAX", 8760)))
+        _floor_ts = pd.Timestamp(now_hk - timedelta(hours=_csw_f))
+        _pay = pd.to_datetime(new_bets["payout_complete_dtm"], errors="coerce")
+        if getattr(_pay.dt, "tz", None) is None:
+            _pay = _pay.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        else:
+            _pay = _pay.dt.tz_convert(HK_TZ)
+        _mask = _pay >= _floor_ts
+        _mask = _mask.fillna(False)
+        new_ids = set(new_bets.loc[_mask, "bet_id"].astype(str))
+        logger.debug(
+            "[scorer] Payout-age cap (SCORER_COLD_START_WINDOW_HOURS=%gh): score %d of %d new bets",
+            _csw_f,
+            len(new_ids),
+            len(new_bets),
+        )
     n_features_full_pre_rated_slice = len(features_all)
-    _telemetry_new = features_all[features_all["bet_id"].astype(str).isin(new_ids)]
+    _telemetry_new = features_all[features_all["bet_id"].astype(str).isin(new_bet_ids_all)]
     _tel_is_rated = _telemetry_new["canonical_id"].isin(rated_canonical_ids)
     _tel_is_rated = _tel_is_rated.fillna(False).astype(bool)
     n_rated_new_bets_pre_slice = int(_tel_is_rated.sum())
@@ -1694,7 +1898,7 @@ def score_once(
                     "[scorer] Track LLM dropped %d rows (cutoff filter)",
                     _n_before_llm - len(features_all),
                 )
-            logger.info("[scorer] Track LLM computed for scoring window")
+            logger.debug("[scorer] Track LLM computed for scoring window")
         except Exception as exc:
             logger.error("[scorer] Track LLM failed: %s", exc)
 
@@ -1721,7 +1925,7 @@ def score_once(
         _profile_df = _load_profile_for_scoring(rated_canonical_ids, now_hk)
         if _profile_df is not None:
             features_all = _join_profile(features_all, _profile_df)
-            logger.info("[scorer] player_profile PIT join applied")
+            logger.debug("[scorer] player_profile PIT join applied")
         else:
             logger.info(
                 "[scorer] player_profile unavailable — profile features will be NaN"
@@ -1737,16 +1941,19 @@ def score_once(
     features_df = features_all[
         features_all["bet_id"].astype(str).isin(new_ids)
     ].copy()
-    logger.info("[scorer] Rows to score (new bets): %d", len(features_df))
+    logger.debug("[scorer] Rows to score (new bets): %d", len(features_df))
+    cycle_stage_seconds["feature_engineering"] = time.perf_counter() - t_features
     if features_df.empty:
         logger.info("[scorer] No usable rows after feature engineering; sleeping")
+        _emit_scorer_perf_summary(cycle_stage_seconds)
         return
 
     # --- Exclude unrated before model (post rated-only slice this should be all True; keep filter for safety) ---
     is_rated_mask = features_df["is_rated"].fillna(False).astype(bool)
     features_df = features_df[is_rated_mask].copy()
     if features_df.empty:
-        logger.info("[scorer] No rated bets to score; sleeping")
+        logger.debug("[scorer] No rated bets to score; sleeping")
+        _emit_scorer_perf_summary(cycle_stage_seconds)
         return
     if UNRATED_VOLUME_LOG and n_unrated_new_bets_pre_slice > 0:
         logger.info(
@@ -1759,13 +1966,17 @@ def score_once(
     # ── Score with H3 routing (rated only) ─────────────────────────────────
     bundle_thr = float((artifacts.get("rated") or {}).get("threshold", 0.5))
     effective_thr = read_effective_runtime_rated_threshold(conn, bundle_thr)
+    t_predict = time.perf_counter()
     features_df = _score_df(
         features_df, artifacts, feature_list, rated_threshold=effective_thr
     )
+    cycle_stage_seconds["predict"] = time.perf_counter() - t_predict
 
     # ── Phase 2 P1.1: append all scored rows to prediction_log (before alert filter) ──
+    sqlite_seconds = 0.0
     pl_path = getattr(config, "PREDICTION_LOG_DB_PATH", None) or ""
     if (pl_path and str(pl_path).strip() and features_df is not None and not features_df.empty):
+        t_sqlite = time.perf_counter()
         try:
             _append_prediction_log(
                 str(pl_path).strip(),
@@ -1781,6 +1992,7 @@ def score_once(
                 logger.warning("[scorer] Prediction log summary failed: %s", exc2)
         except Exception as exc:
             logger.warning("[scorer] Prediction log write failed: %s", exc)
+        sqlite_seconds += time.perf_counter() - t_sqlite
 
     # ── Alert candidates: score >= threshold AND rated observations only ──
     # UNRATED_VOLUME_LOG uses pre-slice new-bet counts; unrated rows are not scored (v10 DEC-021).
@@ -1788,9 +2000,11 @@ def score_once(
         (features_df["margin"] >= 0) & (features_df["is_rated_obs"] == 1)
     ].copy()
     if alert_candidates.empty:
-        logger.info("[scorer] No above-threshold alerts this cycle")
+        logger.debug("[scorer] No above-threshold alerts this cycle")
+        cycle_stage_seconds["sqlite"] = sqlite_seconds
+        _emit_scorer_perf_summary(cycle_stage_seconds)
         return
-    logger.info("[scorer] Above-threshold rows: %d", len(alert_candidates))
+    logger.debug("[scorer] Above-threshold rows: %d", len(alert_candidates))
 
     # ── SHAP reason codes for rated alert candidates ──────────────────────
     # Guarded by config flag to avoid per-cycle SHAP overhead in production.
@@ -1817,10 +2031,10 @@ def score_once(
         .to_dict("index")
     )
     unique_sids = alert_candidates["session_id"].dropna().unique().tolist()
-    session_totals_cache = {sid: get_session_totals(conn, sid) for sid in unique_sids}
+    session_totals_cache = get_session_totals_bulk(conn, unique_sids)
 
     def _st(sid: object) -> Tuple[int, float, Optional[pd.Timestamp], Optional[pd.Timestamp]]:
-        return session_totals_cache.get(sid, (0, 0.0, None, None))
+        return session_totals_cache.get(str(sid), (0, 0.0, None, None))
 
     def _fallback_avg(sid: object) -> float:
         agg = session_agg.get(sid)
@@ -1851,11 +2065,14 @@ def score_once(
     alert_candidates["visit_end_ts"] = alert_candidates["session_id"].apply(
         lambda sid: _st(sid)[3]
     )
+    unique_pids = alert_candidates["player_id"].dropna().astype(str).unique().tolist()
+    session_count_cache = get_session_count_bulk(conn, unique_pids)
+    historical_avg_cache = get_historical_avg_bulk(conn, unique_pids)
     alert_candidates["session_count"] = alert_candidates["player_id"].apply(
-        lambda pid: get_session_count(conn, pid)
+        lambda pid: session_count_cache.get(str(pid), 0)
     )
     alert_candidates["historical_avg_bet"] = alert_candidates["player_id"].apply(
-        lambda pid: get_historical_avg(conn, pid)
+        lambda pid: historical_avg_cache.get(str(pid), 0.0)
     )
 
     # ── Duplicate suppression ─────────────────────────────────────────────
@@ -1867,17 +2084,23 @@ def score_once(
         ]
         suppressed = before - len(alert_candidates)
         if suppressed:
-            logger.info("[scorer] Suppressed %d duplicate alerts", suppressed)
+            logger.debug("[scorer] Suppressed %d duplicate alerts", suppressed)
         alert_candidates.drop(columns=["_bid_str"], inplace=True)
 
     if alert_candidates.empty:
-        logger.info("[scorer] Alerts suppressed (already sent)")
+        logger.debug("[scorer] Alerts suppressed (already sent)")
+        cycle_stage_seconds["sqlite"] = sqlite_seconds
+        _emit_scorer_perf_summary(cycle_stage_seconds)
         return
 
+    t_sqlite_alert = time.perf_counter()
     append_alerts(conn, alert_candidates)
     alert_history.update(alert_candidates["bet_id"].astype(str).tolist())
     logger.info("[scorer] Emitted %d alerts", len(alert_candidates))
     conn.commit()
+    sqlite_seconds += time.perf_counter() - t_sqlite_alert
+    cycle_stage_seconds["sqlite"] = sqlite_seconds
+    _emit_scorer_perf_summary(cycle_stage_seconds)
 
 
 # ── Programmatic entry (for deploy: one process runs scorer + validator + API) ──
@@ -1895,6 +2118,7 @@ def run_scorer_loop(
     lookback = lookback_hours if lookback_hours is not None else getattr(config, "SCORER_LOOKBACK_HOURS", 8)
     if interval <= 0 or lookback <= 0:
         raise ValueError("interval_seconds and lookback_hours must be positive")
+    _check_numba_runtime_once()
     artifacts = load_dual_artifacts(model_dir)
     logger.info(
         "[scorer] Loaded model v=%s, rated=%s, %d features",
@@ -1972,6 +2196,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    _check_numba_runtime_once()
     artifacts = load_dual_artifacts(args.model_dir)
     logger.info(
         "[scorer] Loaded model v=%s, rated=%s, %d features",

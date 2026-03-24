@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import logging
 import os
 import sqlite3
@@ -49,9 +50,36 @@ OUT_DIR = BASE_DIR / "out_validator"
 OUT_DIR.mkdir(exist_ok=True)
 RESULTS_PATH = OUT_DIR / "validation_results.csv"  # legacy only (read-backfill); DB is source of truth
 
-IGNORED_REASONS = {"gap_started_before_alert", "missing_player_id"}
+IGNORED_REASONS = {"missing_player_id"}
 
 logger = logging.getLogger(__name__)
+
+_PERF_WINDOW_SIZE = 200
+_VALIDATOR_STAGE_TIMINGS: Dict[str, deque[float]] = {}
+
+
+def _record_validator_stage_timing(stage: str, seconds: float) -> None:
+    bucket = _VALIDATOR_STAGE_TIMINGS.setdefault(stage, deque(maxlen=_PERF_WINDOW_SIZE))
+    bucket.append(max(0.0, float(seconds)))
+
+
+def _emit_validator_perf_summary(cycle_stage_seconds: Dict[str, float]) -> None:
+    if not cycle_stage_seconds:
+        return
+    for stage, sec in cycle_stage_seconds.items():
+        _record_validator_stage_timing(stage, sec)
+    top_stages = sorted(cycle_stage_seconds.items(), key=lambda x: x[1], reverse=True)[:2]
+    parts: List[str] = []
+    for stage, sec in top_stages:
+        hist = _VALIDATOR_STAGE_TIMINGS.get(stage)
+        if not hist:
+            continue
+        arr = pd.Series(hist, dtype="float64")
+        p50 = float(arr.quantile(0.5))
+        p95 = float(arr.quantile(0.95))
+        parts.append(f"{stage}={sec:.3f}s (p50={p50:.3f}s, p95={p95:.3f}s, n={len(arr)})")
+    if parts:
+        logger.info("[validator][perf] top_hotspots: %s", "; ".join(parts))
 
 VALIDATION_COLUMNS = [
     "alert_ts",
@@ -89,6 +117,7 @@ _ALERTS_MIGRATION_COLS: List[Tuple[str, str]] = [
     ("scored_at", "TEXT"),
     ("casino_player_id", "TEXT"),
 ]
+_VALIDATOR_META_KEY_LAST_ROWID = "validation_results_last_loaded_rowid"
 
 
 def _latest_model_version_from_alerts(alerts_df: pd.DataFrame) -> Optional[str]:
@@ -111,6 +140,30 @@ def _latest_model_version_from_alerts(alerts_df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+def _rolling_precision_by_alert_ts(
+    finalized_df: pd.DataFrame,
+    *,
+    now_hk: datetime,
+    window: timedelta,
+) -> Tuple[float, int, int]:
+    """MATCH rate over non-PENDING rows whose ``alert_ts`` falls in ``[now_hk - window, now_hk]`` (HK)."""
+    if finalized_df.empty or "alert_ts" not in finalized_df.columns:
+        return 0.0, 0, 0
+    at = pd.to_datetime(finalized_df["alert_ts"], errors="coerce")
+    if getattr(at.dt, "tz", None) is None:
+        at = at.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+    else:
+        at = at.dt.tz_convert(HK_TZ)
+    cutoff = now_hk - window
+    sub = finalized_df[(at >= cutoff) & (at <= now_hk)].copy()
+    if sub.empty:
+        return 0.0, 0, 0
+    total = len(sub)
+    matches = int(sub["reason"].eq("MATCH").sum()) if "reason" in sub.columns else 0
+    precision = (matches / total) if total > 0 else 0.0
+    return float(precision), matches, total
+
+
 def _append_validator_metrics(
     conn: sqlite3.Connection,
     *,
@@ -120,7 +173,10 @@ def _append_validator_metrics(
     total: int,
     matches: int,
 ) -> None:
-    """Insert one cumulative-precision snapshot (``validator_metrics`` table)."""
+    """Insert one precision snapshot (``validator_metrics`` table).
+
+    Intended to align with the rolling **15m-by-alert_ts** KPI logged in ``validate_once``.
+    """
     conn.execute(
         """
         INSERT INTO validator_metrics (recorded_at, model_version, precision, total, matches)
@@ -450,6 +506,14 @@ def get_db_conn() -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_val_alert_ts ON validation_results(alert_ts)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS validator_runtime_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
 
     # Schema migration: add Phase-1 columns if they don't exist yet (step 8)
     existing_val_cols = {
@@ -500,17 +564,80 @@ def prune_validator_retention(conn: sqlite3.Connection, now_hk: datetime) -> Non
 
 
 def load_existing_results(conn: sqlite3.Connection) -> Dict:
-    existing_results: Dict[str, Dict] = {}
+    return load_existing_results_incremental(conn, {})
+
+
+def _get_validation_results_last_loaded_rowid(conn: sqlite3.Connection) -> int:
     try:
-        df_db = pd.read_sql_query("SELECT * FROM validation_results", conn)
-        for _, r in df_db.iterrows():
-            key = str(r["bet_id"]) if pd.notnull(r["bet_id"]) else f"{r['player_id']}_{r['alert_ts']}"
-            existing_results[key] = r.to_dict()
+        row = conn.execute(
+            "SELECT value FROM validator_runtime_meta WHERE key = ?",
+            (_VALIDATOR_META_KEY_LAST_ROWID,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    if not row:
+        return 0
+    try:
+        return max(0, int(str(row[0]).strip()))
+    except Exception:
+        return 0
+
+
+def _set_validation_results_last_loaded_rowid(conn: sqlite3.Connection, rowid: int) -> None:
+    try:
+        conn.execute(
+            """
+            INSERT INTO validator_runtime_meta(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (_VALIDATOR_META_KEY_LAST_ROWID, str(max(0, int(rowid)))),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        # load_existing_results can be called with ad-hoc in-memory connections
+        # in tests that do not initialize full schema.
+        pass
+
+
+def load_existing_results_incremental(
+    conn: sqlite3.Connection,
+    existing_results: Dict[str, Dict],
+) -> Dict[str, Dict]:
+    """Load validation_results with a rowid watermark.
+
+    First cycle does one full bootstrap; subsequent cycles only load new rowid
+    deltas to reduce per-cycle SQLite read and memory pressure on large tables.
+    """
+    last_loaded_rowid = _get_validation_results_last_loaded_rowid(conn)
+    current_max_rowid = 0
+    try:
+        row = conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM validation_results").fetchone()
+        current_max_rowid = int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        current_max_rowid = 0
+
+    query = (
+        "SELECT rowid AS _rowid, * FROM validation_results"
+        if last_loaded_rowid <= 0
+        else "SELECT rowid AS _rowid, * FROM validation_results WHERE rowid > ?"
+    )
+    params: Tuple[int, ...] = tuple() if last_loaded_rowid <= 0 else (last_loaded_rowid,)
+    try:
+        df_db = pd.read_sql_query(query, conn, params=params)
+        if not df_db.empty:
+            for _, r in df_db.iterrows():
+                key = str(r["bet_id"]) if pd.notnull(r["bet_id"]) else f"{r['player_id']}_{r['alert_ts']}"
+                existing_results[key] = r.to_dict()
+            if "_rowid" in df_db.columns:
+                _max = pd.to_numeric(df_db["_rowid"], errors="coerce").max()
+                if pd.notna(_max):
+                    current_max_rowid = max(current_max_rowid, int(_max))
     except Exception:
         pass
 
-    # Legacy CSV fallback (only add entries not already in DB)
-    if RESULTS_PATH.exists():
+    # Legacy CSV fallback only for initial bootstrap.
+    if last_loaded_rowid <= 0 and RESULTS_PATH.exists():
         try:
             df_old = pd.read_csv(RESULTS_PATH)
             for _, r in df_old.iterrows():
@@ -519,6 +646,9 @@ def load_existing_results(conn: sqlite3.Connection) -> Dict:
                     existing_results[key] = r.to_dict()
         except Exception:
             pass
+
+    if current_max_rowid > last_loaded_rowid:
+        _set_validation_results_last_loaded_rowid(conn, current_max_rowid)
     return existing_results
 
 
@@ -733,20 +863,9 @@ def validate_alert_row(
         res_base.update({"result": None, "reason": "PENDING"})
         return res_base
 
-    # Find last bet before bet_ts
+    # Find last bet before bet_ts; keep as base_start context only.
     idx = bisect_left(bet_list, bet_ts)
     last_bet_before = bet_list[idx - 1] if idx > 0 else None
-    if last_bet_before is not None and (bet_ts - last_bet_before) > timedelta(minutes=config.ALERT_HORIZON_MIN):
-        res_base.update(
-            {
-                "result": False,
-                "gap_start": last_bet_before.isoformat(),
-                "gap_minutes": (bet_ts - last_bet_before).total_seconds() / 60.0,
-                "reason": "gap_started_before_alert",
-            }
-        )
-        return res_base
-
     base_start = last_bet_before or bet_ts
 
     # Bets within LABEL_LOOKAHEAD_MIN horizon after bet_ts (bet-based only; session_cache not used for verdict)
@@ -785,7 +904,7 @@ def validate_alert_row(
                     "gap_minutes": gap_minutes,
                     "reason": "MISS"
                 })
-                logger.info("[validator] Finalizing candidate as MISS (late arrival in horizon window or forced) player=%s bet_id=%s", player_id, bet_id)
+                logger.debug("[validator] Finalizing candidate as MISS (late arrival in horizon window or forced) player=%s bet_id=%s", player_id, bet_id)
             else:
                 res_base.update({
                     "result": True,
@@ -793,7 +912,7 @@ def validate_alert_row(
                     "gap_minutes": gap_minutes,
                     "reason": "MATCH"
                 })
-                logger.info("[validator] Finalizing candidate as MATCH (no late arrivals in horizon window or forced) player=%s bet_id=%s", player_id, bet_id)
+                logger.debug("[validator] Finalizing candidate as MATCH (no late arrivals in horizon window or forced) player=%s bet_id=%s", player_id, bet_id)
     else:
         # No gap found within the horizon.
         # Policy:
@@ -817,7 +936,7 @@ def validate_alert_row(
                 "gap_minutes": 0,
                 "reason": "MISS"
             })
-            logger.info("[validator] Finalizing alert as MISS (evidence within horizon) player=%s bet_id=%s", player_id, bet_id)
+            logger.debug("[validator] Finalizing alert as MISS (evidence within horizon) player=%s bet_id=%s", player_id, bet_id)
         else:
             if getattr(config, 'VALIDATOR_FINALIZE_ON_HORIZON', False):
                 # Still within extended wait window -> skip (to be re-checked later)
@@ -835,7 +954,7 @@ def validate_alert_row(
                         "gap_minutes": 0,
                         "reason": "MISS"
                     })
-                    logger.info("[validator] Finalizing alert as MISS (late arrival in horizon window) player=%s bet_id=%s", player_id, bet_id)
+                    logger.debug("[validator] Finalizing alert as MISS (late arrival in horizon window) player=%s bet_id=%s", player_id, bet_id)
                 else:
                     # No late arrivals in the horizon window -> confirm MATCH
                     res_base.update({
@@ -844,7 +963,7 @@ def validate_alert_row(
                         "gap_minutes": 0,
                         "reason": "MATCH"
                     })
-                    logger.info("[validator] Finalizing alert as MATCH (no late arrivals in horizon window) player=%s bet_id=%s", player_id, bet_id)
+                    logger.debug("[validator] Finalizing alert as MATCH (no late arrivals in horizon window) player=%s bet_id=%s", player_id, bet_id)
             else:
                 res_base.update({
                     "result": False,
@@ -857,19 +976,28 @@ def validate_alert_row(
 
 # ------------------ Main loop ------------------
 def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> None:
+    cycle_stage_seconds: Dict[str, float] = {}
     now_hk = datetime.now(HK_TZ)
+    t_sqlite = time.perf_counter()
     prune_validator_retention(conn, now_hk)
+    cycle_stage_seconds["sqlite"] = time.perf_counter() - t_sqlite
 
+    t_sqlite = time.perf_counter()
     alerts = parse_alerts(conn)
+    cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
     if alerts.empty:
-        logger.info("[validator] No alerts to validate")
+        logger.debug("[validator] No alerts to validate")
+        _emit_validator_perf_summary(cycle_stage_seconds)
         return
 
+    t_sqlite = time.perf_counter()
     processed = {str(bid) for bid in load_processed(conn)}
+    cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
     alerts["bet_id_str"] = alerts["bet_id"].astype(str)
     pending_all = alerts[~alerts["bet_id_str"].isin(processed)].copy()
     if pending_all.empty:
-        logger.info("[validator] Alerts: %d, Pending: 0 (all processed)", len(alerts))
+        logger.debug("[validator] Alerts: %d, Pending: 0 (all processed)", len(alerts))
+        _emit_validator_perf_summary(cycle_stage_seconds)
         return
 
     freshness_buffer_min = getattr(config, "VALIDATOR_FRESHNESS_BUFFER_MINUTES", 2)
@@ -891,28 +1019,31 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
             bet_ts_valid = bet_ts_valid.dt.tz_localize(HK_TZ)
         else:
             bet_ts_valid = bet_ts_valid.dt.tz_convert(HK_TZ)
-        logger.info(
+        logger.debug(
             "[validator] pending_all: n=%d, bet_ts min=%s, bet_ts max=%s, effective_ts min=%s, effective_ts max=%s, cutoff=%s (wait_min=%s)",
             len(pending_all), bet_ts_valid.min(), bet_ts_valid.max(),
             effective_ts.min(), effective_ts.max(), cutoff, wait_minutes,
         )
     else:
-        logger.info(
+        logger.debug(
             "[validator] pending_all: n=%d, bet_ts all NaT (using ts); effective_ts min=%s, max=%s, cutoff=%s (wait_min=%s)",
             len(pending_all), effective_ts.min(), effective_ts.max(), cutoff, wait_minutes,
         )
 
     pending = pending_all[effective_ts <= cutoff].copy()
     if pending.empty:
-        logger.info("[validator] %d pending, but all are too recent (<%sm)", len(pending_all), wait_minutes)
+        logger.debug("[validator] %d pending, but all are too recent (<%sm)", len(pending_all), wait_minutes)
+        _emit_validator_perf_summary(cycle_stage_seconds)
         return
 
     if force_finalize:
-        logger.info("[validator] WARNING: running with --force-finalize; PENDING candidates will be finalized now")
+        logger.warning("[validator] running with --force-finalize; PENDING candidates will be finalized now")
 
-    logger.info("[validator] Processing %d alerts (including re-checks)...", len(pending))
+    logger.debug("[validator] Processing %d alerts (including re-checks)...", len(pending))
 
-    existing_results = load_existing_results(conn)
+    t_sqlite = time.perf_counter()
+    existing_results = load_existing_results_incremental(conn, {})
+    cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
 
     # Build canonical_id → [player_ids] mapping from all relevant alerts (step 8)
     cid_to_pids = _build_cid_to_player_ids(alerts)
@@ -938,7 +1069,9 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
         pass
 
     bet_cache: Dict[str, List[datetime]] = {}
-    session_cache: Dict[str, List[Dict]] = {}
+    # Phase 1 (Task 3): keep validate_alert_row signature compatibility, but
+    # disable session fetch/query path in validator cycle to cut ClickHouse load.
+    session_cache_disabled: Dict[str, List[Dict]] = {}
     if player_ids or cid_to_pids:
         if get_clickhouse_client is None:
             raise RuntimeError(
@@ -948,12 +1081,13 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
         fetch_start = effective_ts[pending.index].min() - timedelta(hours=1)
         fetch_end = now_hk
         try:
+            t_clickhouse = time.perf_counter()
             # R41: errors propagate so the cycle aborts rather than producing false MISSes
             bet_cache = fetch_bets_by_canonical_id(cid_to_pids, fetch_start, fetch_end)
-            # R42: sessions grouped by canonical_id — supports multi-player_id rated players
-            session_cache = fetch_sessions_by_canonical_id(cid_to_pids, fetch_start, fetch_end)
+            cycle_stage_seconds["clickhouse"] = time.perf_counter() - t_clickhouse
         except Exception as exc:
             logger.warning("[validator] DB fetch error — skipping this validation cycle: %s", exc)
+            _emit_validator_perf_summary(cycle_stage_seconds)
             return
 
     new_processed_ids: List = []
@@ -965,7 +1099,12 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
             try:
                 match = alerts[alerts["bet_id_str"] == key]
                 if not match.empty:
-                    r = validate_alert_row(match.iloc[0], bet_cache, session_cache, force_finalize=force_finalize)
+                    r = validate_alert_row(
+                        match.iloc[0],
+                        bet_cache,
+                        session_cache_disabled,
+                        force_finalize=force_finalize,
+                    )
                     if r.get("result") is not None:
                         existing_results[key] = r
             except Exception:
@@ -974,10 +1113,19 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
     for key, saved_row in list(existing_results.items()):
         try:
             if saved_row.get("reason") == "PENDING":
-                bid = saved_row.get("bet_id")
-                match = alerts[alerts["bet_id_str"] == str(bid)] if pd.notna(bid) else pd.DataFrame()
+                pending_bid = saved_row.get("bet_id")
+                match = (
+                    alerts[alerts["bet_id_str"] == str(pending_bid)]
+                    if pd.notna(pending_bid)
+                    else pd.DataFrame()
+                )
                 if not match.empty:
-                    newr = validate_alert_row(match.iloc[0], bet_cache, session_cache, force_finalize=force_finalize)
+                    newr = validate_alert_row(
+                        match.iloc[0],
+                        bet_cache,
+                        session_cache_disabled,
+                        force_finalize=force_finalize,
+                    )
                     if newr.get("result") is not None and (newr.get("reason") != "PENDING"):
                         existing_results[key] = newr
                         updated_count += 1
@@ -985,7 +1133,12 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
             continue
 
     for _, row in pending.iterrows():
-        res = validate_alert_row(row, bet_cache, session_cache, force_finalize=force_finalize)
+        res = validate_alert_row(
+            row,
+            bet_cache,
+            session_cache_disabled,
+            force_finalize=force_finalize,
+        )
         if res.get("result") is None:
             continue
 
@@ -1037,10 +1190,24 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
 
         kpi_df = final_df[~final_df["reason"].isin(IGNORED_REASONS)]
         finalized_or_old = kpi_df[kpi_df["reason"] != "PENDING"].copy()
-        total = len(finalized_or_old)
-        matches = finalized_or_old["reason"].eq("MATCH").sum()
-        precision = (matches / total) if total > 0 else 0
-        logger.info("[validator] Cumulative Precision (15m window): %.2f%% (%d/%d)", precision * 100, matches, total)
+        precision_15m, matches_15m, total_15m = _rolling_precision_by_alert_ts(
+            finalized_or_old, now_hk=now_hk, window=timedelta(minutes=15)
+        )
+        precision_1h, matches_1h, total_1h = _rolling_precision_by_alert_ts(
+            finalized_or_old, now_hk=now_hk, window=timedelta(hours=1)
+        )
+        logger.info(
+            "[validator] Cumulative Precision (15m window): %.2f%% (%d/%d)",
+            precision_15m * 100,
+            matches_15m,
+            total_15m,
+        )
+        logger.info(
+            "[validator] Cumulative Precision (1h window): %.2f%% (%d/%d)",
+            precision_1h * 100,
+            matches_1h,
+            total_1h,
+        )
 
         try:
             _mv = _latest_model_version_from_alerts(alerts)
@@ -1048,22 +1215,27 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
                 conn,
                 recorded_at=now_hk.isoformat(),
                 model_version=_mv,
-                precision=float(precision),
-                total=int(total),
-                matches=int(matches),
+                precision=float(precision_15m),
+                total=int(total_15m),
+                matches=int(matches_15m),
             )
         except Exception as exc:
             logger.warning("[validator] validator_metrics insert failed: %s", exc)
 
         final_df["alert_ts_dt"] = pd.to_datetime(final_df["alert_ts"])
         final_df = final_df.sort_values("alert_ts_dt").drop(columns=["alert_ts_dt"])
+        t_sqlite = time.perf_counter()
         save_validation_results(conn, final_df)
+        cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
         logger.info(
             "[validator] Saved %d total validations to SQLite (Updated %d, Finalized %d)",
             len(final_df), updated_count, len(new_processed_ids),
         )
 
+    t_sqlite = time.perf_counter()
     mark_processed(conn, new_processed_ids)
+    cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
+    _emit_validator_perf_summary(cycle_stage_seconds)
     return
 
 

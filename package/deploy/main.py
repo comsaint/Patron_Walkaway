@@ -1,9 +1,12 @@
 """
 Deploy entry: scorer loop + validator loop + Flask (GET /alerts, GET /validation).
 Set STATE_DB_PATH and MODEL_DIR via env (or .env) before importing walkaway_ml.
+Optional startup flush: --flush-all | --flush-state | --flush-prediction (mutually exclusive; default none).
 """
 from __future__ import annotations
 
+import argparse
+from collections import deque
 import logging
 import os
 import sys
@@ -61,12 +64,20 @@ from walkaway_ml import config as _config  # noqa: E402
 from walkaway_ml.scorer import run_scorer_loop  # noqa: E402
 from walkaway_ml.validator import run_validator_loop  # noqa: E402
 
-# Scorer and validator logs: always include timestamp in deployment console
+# Scorer and validator logs: always include timestamp in deployment console.
+# Default INFO; can be overridden by DEPLOY_LOG_LEVEL / LOGLEVEL.
+_deploy_log_level_name = (
+    (os.environ.get("DEPLOY_LOG_LEVEL") or os.environ.get("LOGLEVEL") or "INFO")
+    .strip()
+    .upper()
+)
+_deploy_log_level = getattr(logging, _deploy_log_level_name, logging.INFO)
 logging.basicConfig(
-    level=logging.INFO,
+    level=_deploy_log_level,
     format="%(asctime)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -75,6 +86,68 @@ from flask import Flask, request, jsonify  # noqa: E402
 HK_TZ = ZoneInfo(_config.HK_TZ)
 STATE_DB_PATH = Path(os.environ["STATE_DB_PATH"])
 STATE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+_PERF_WINDOW_SIZE = 200
+_API_STAGE_TIMINGS: dict[str, deque[float]] = {}
+
+
+def _record_api_stage_timing(stage: str, seconds: float) -> None:
+    bucket = _API_STAGE_TIMINGS.setdefault(stage, deque(maxlen=_PERF_WINDOW_SIZE))
+    bucket.append(max(0.0, float(seconds)))
+
+
+def _emit_api_perf_summary(stage_seconds: dict[str, float]) -> None:
+    if not stage_seconds:
+        return
+    for stage, sec in stage_seconds.items():
+        _record_api_stage_timing(stage, sec)
+    top_stages = sorted(stage_seconds.items(), key=lambda x: x[1], reverse=True)[:2]
+    parts = []
+    for stage, sec in top_stages:
+        hist = _API_STAGE_TIMINGS.get(stage)
+        if not hist:
+            continue
+        arr = np.asarray(hist, dtype=float)
+        p50 = float(np.percentile(arr, 50))
+        p95 = float(np.percentile(arr, 95))
+        parts.append(f"{stage}={sec:.3f}s (p50={p50:.3f}s, p95={p95:.3f}s, n={len(arr)})")
+    if parts:
+        logging.getLogger(__name__).info("[api][perf] top_hotspots: %s", "; ".join(parts))
+
+
+def _unlink_sqlite_bundle(db_path: Path) -> None:
+    """Remove a SQLite file and its -wal / -shm siblings if present."""
+    db_path = Path(db_path).resolve()
+    log = logging.getLogger(__name__)
+    for suffix in ("", "-wal", "-shm"):
+        p = db_path.parent / (db_path.name + suffix) if suffix else db_path
+        try:
+            if p.is_file():
+                p.unlink()
+                log.warning("[deploy] flush removed %s", p)
+        except OSError as exc:
+            log.warning("[deploy] flush could not remove %s: %s", p, exc)
+
+
+def flush_state_db_only() -> None:
+    """Delete STATE_DB_PATH SQLite bundle only (does not touch PREDICTION_LOG_DB_PATH)."""
+    _unlink_sqlite_bundle(STATE_DB_PATH)
+
+
+def flush_prediction_log_db_only() -> None:
+    """Delete PREDICTION_LOG_DB_PATH SQLite bundle only (does not touch STATE_DB_PATH)."""
+    pl_raw = str(getattr(_config, "PREDICTION_LOG_DB_PATH", "") or "").strip()
+    if not pl_raw:
+        logging.getLogger(__name__).warning(
+            "[deploy] flush prediction: PREDICTION_LOG_DB_PATH is empty; skipped"
+        )
+        return
+    _unlink_sqlite_bundle(Path(pl_raw))
+
+
+def flush_all_sqlite_bundles() -> None:
+    """Delete STATE_DB_PATH and PREDICTION_LOG_DB_PATH bundles (same semantics as --flush-all)."""
+    flush_state_db_only()
+    flush_prediction_log_db_only()
 
 
 def get_db_conn() -> sqlite3.Connection:
@@ -101,12 +174,13 @@ def _validation_1h_cutoff():
 
 def _query_alerts_df(ts_param=None, limit_param=None, default_1h=False):
     """Per ML_API_PROTOCOL: limit only used when ts is absent."""
-    with get_db_conn() as conn:
-        df = pd.read_sql_query("SELECT * FROM alerts", conn)
-    if df.empty:
-        return df
-    df["ts_dt"] = pd.to_datetime(df["ts"], errors="coerce")
-    df = df.dropna(subset=["ts_dt"]).sort_values("ts_dt")
+    where_sql = []
+    params: list[object] = []
+    order_sql = " ORDER BY ts ASC"
+    post_sort = False
+    limit_sql = ""
+    effective_limit: int | None = None
+
     if ts_param:
         try:
             ts_dt = pd.to_datetime(ts_param)
@@ -114,18 +188,37 @@ def _query_alerts_df(ts_param=None, limit_param=None, default_1h=False):
                 ts_dt = ts_dt.tz_localize(HK_TZ)
             else:
                 ts_dt = ts_dt.tz_convert(HK_TZ)
-            df = df[df["ts_dt"] > ts_dt]
+            where_sql.append("datetime(ts) > datetime(?)")
+            params.append(ts_dt.isoformat())
         except Exception:
             pass
     elif default_1h:
-        df = df[df["ts_dt"] > _alerts_1h_cutoff()]
+        where_sql.append("datetime(ts) > datetime(?)")
+        params.append(_alerts_1h_cutoff().isoformat())
+
     if limit_param is not None and not ts_param:
         try:
             limit = int(limit_param)
             if limit > 0:
-                df = df.tail(limit)
+                # Keep protocol semantics (tail N by ts) via DESC LIMIT then resort to ASC.
+                effective_limit = limit
+                order_sql = " ORDER BY ts DESC"
+                post_sort = True
+                limit_sql = " LIMIT ?"
+                params.append(limit)
         except (ValueError, TypeError):
             pass
+
+    where_clause = f" WHERE {' AND '.join(where_sql)}" if where_sql else ""
+    query = f"SELECT * FROM alerts{where_clause}{order_sql}{limit_sql}"
+    with get_db_conn() as conn:
+        df = pd.read_sql_query(query, conn, params=params)
+    if df.empty:
+        return df
+    df["ts_dt"] = pd.to_datetime(df["ts"], errors="coerce")
+    df = df.dropna(subset=["ts_dt"]).sort_values("ts_dt")
+    if post_sort and effective_limit is not None and effective_limit > 0:
+        df = df.tail(effective_limit)
     return df
 
 
@@ -173,23 +266,25 @@ def _alerts_to_protocol_records(df):
 
 
 def _query_validation_df(ts_param=None, bet_id_param=None, bet_ids_param=None, default_1h=False):
-    with get_db_conn() as conn:
-        df = pd.read_sql_query("SELECT * FROM validation_results", conn)
-    if df.empty:
-        return df
-    df["validated_at"] = pd.to_datetime(df["validated_at"], errors="coerce")
-    df = df.dropna(subset=["validated_at"]).sort_values("validated_at")
+    where_sql = []
+    params: list[object] = []
+
     if bet_ids_param:
         try:
             ids = [s.strip() for s in str(bet_ids_param).split(",") if s.strip()]
-            df = df[df["bet_id"].astype(str).isin(ids)]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                where_sql.append(f"CAST(bet_id AS TEXT) IN ({placeholders})")
+                params.extend(ids)
         except Exception:
             pass
     elif bet_id_param:
         try:
-            df = df[df["bet_id"].astype(str) == str(bet_id_param)]
+            where_sql.append("CAST(bet_id AS TEXT) = ?")
+            params.append(str(bet_id_param))
         except Exception:
             pass
+
     if ts_param:
         try:
             ts_dt = pd.to_datetime(ts_param)
@@ -197,11 +292,22 @@ def _query_validation_df(ts_param=None, bet_id_param=None, bet_ids_param=None, d
                 ts_dt = ts_dt.tz_localize(HK_TZ)
             else:
                 ts_dt = ts_dt.tz_convert(HK_TZ)
-            df = df[df["validated_at"] > ts_dt]
+            where_sql.append("datetime(validated_at) > datetime(?)")
+            params.append(ts_dt.isoformat())
         except Exception:
             pass
     elif default_1h and not bet_id_param and not bet_ids_param:
-        df = df[df["validated_at"] > _validation_1h_cutoff()]
+        where_sql.append("datetime(validated_at) > datetime(?)")
+        params.append(_validation_1h_cutoff().isoformat())
+
+    where_clause = f" WHERE {' AND '.join(where_sql)}" if where_sql else ""
+    query = f"SELECT * FROM validation_results{where_clause} ORDER BY validated_at ASC"
+    with get_db_conn() as conn:
+        df = pd.read_sql_query(query, conn, params=params)
+    if df.empty:
+        return df
+    df["validated_at"] = pd.to_datetime(df["validated_at"], errors="coerce")
+    df = df.dropna(subset=["validated_at"]).sort_values("validated_at")
     return df
 
 
@@ -240,10 +346,16 @@ app = Flask(__name__)
 
 @app.route("/alerts", methods=["GET"])
 def alerts():
+    stage_seconds: dict[str, float] = {}
     ts_param = request.args.get("ts")
     limit_param = request.args.get("limit")
+    t_query = datetime.now().timestamp()
     df = _query_alerts_df(ts_param=ts_param, limit_param=limit_param, default_1h=True)
+    stage_seconds["api_query_alerts"] = datetime.now().timestamp() - t_query
+    t_transform = datetime.now().timestamp()
     records = _alerts_to_protocol_records(df)
+    stage_seconds["api_transform_alerts"] = datetime.now().timestamp() - t_transform
+    _emit_api_perf_summary(stage_seconds)
     resp = jsonify({"alerts": records})
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
@@ -251,11 +363,17 @@ def alerts():
 
 @app.route("/validation", methods=["GET"])
 def validation():
+    stage_seconds: dict[str, float] = {}
     ts_param = request.args.get("ts")
     bet_id_param = request.args.get("bet_id")
     bet_ids_param = request.args.get("bet_ids")
+    t_query = datetime.now().timestamp()
     df = _query_validation_df(ts_param=ts_param, bet_id_param=bet_id_param, bet_ids_param=bet_ids_param, default_1h=True)
+    stage_seconds["api_query_validation"] = datetime.now().timestamp() - t_query
+    t_transform = datetime.now().timestamp()
     records = _validation_to_protocol_records(df)
+    stage_seconds["api_transform_validation"] = datetime.now().timestamp() - t_transform
+    _emit_api_perf_summary(stage_seconds)
     resp = jsonify({"results": records})
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
@@ -279,6 +397,48 @@ def _run_validator():
 
 
 if __name__ == "__main__":
+    _parser = argparse.ArgumentParser(
+        description=(
+            "Deploy: scorer loop + validator loop + Flask ML API (GET /alerts, GET /validation). "
+            "Configure paths via env / .env (STATE_DB_PATH, MODEL_DIR, PREDICTION_LOG_DB_PATH, CH_*). "
+            "Scoring payout-age window: SCORER_COLD_START_WINDOW_HOURS (optional; see trainer config). "
+            "Flush flags run once before starting loops; default is no flush. Use at most one flush flag."
+        ),
+    )
+    _flush_grp = _parser.add_mutually_exclusive_group()
+    _flush_grp.add_argument(
+        "--flush-all",
+        action="store_true",
+        help=(
+            "Before start: delete SQLite bundles for STATE_DB_PATH and PREDICTION_LOG_DB_PATH "
+            "(each: main file plus -wal/-shm if present). Prediction bundle skipped if path is empty."
+        ),
+    )
+    _flush_grp.add_argument(
+        "--flush-state",
+        action="store_true",
+        help=(
+            "Before start: delete only the STATE_DB_PATH bundle; do not remove PREDICTION_LOG_DB_PATH."
+        ),
+    )
+    _flush_grp.add_argument(
+        "--flush-prediction",
+        action="store_true",
+        help=(
+            "Before start: delete only the PREDICTION_LOG_DB_PATH bundle; do not remove STATE_DB_PATH."
+        ),
+    )
+    _args, _unknown = _parser.parse_known_args()
+    if _unknown:
+        logging.getLogger(__name__).warning("[deploy] Ignoring unrecognized argv: %s", _unknown)
+
+    if _args.flush_all:
+        flush_all_sqlite_bundles()
+    elif _args.flush_state:
+        flush_state_db_only()
+    elif _args.flush_prediction:
+        flush_prediction_log_db_only()
+
     port = int(os.environ.get("PORT", os.environ.get("ML_API_PORT", "8001")))
     scorer_interval = getattr(_config, "SCORER_POLL_INTERVAL_SECONDS", 45)
     validator_interval = getattr(_config, "VALIDATOR_INTERVAL_SECONDS", 60)

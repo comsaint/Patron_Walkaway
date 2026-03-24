@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd

@@ -8,6 +8,8 @@ Reference: PLAN § api_server 對齊 model_api_protocol 步驟 5, STATUS Round 2
 
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 import pytest
 
 pytestmark = pytest.mark.skip(reason="api_server reverted to DB-only; model API removed")

@@ -15,7 +15,6 @@ import inspect
 import pathlib
 import textwrap
 import unittest
-import pytest
 from datetime import datetime
 from contextlib import nullcontext
 from types import SimpleNamespace

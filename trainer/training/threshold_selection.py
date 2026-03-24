@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -229,3 +230,8 @@ def pick_threshold_dec026(
 
 # DEC-032 / PLAN naming alignment
 select_threshold_dec026 = pick_threshold_dec026
+
+# trainer vs walkaway_ml 安裝名共用同一模組實例，避免 sys.modules 出現兩份 threshold_selection 致使 unittest.mock.patch 顯得不生效。
+_ts_mod = sys.modules[__name__]
+sys.modules["trainer.training.threshold_selection"] = _ts_mod
+sys.modules["walkaway_ml.training.threshold_selection"] = _ts_mod

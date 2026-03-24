@@ -49,10 +49,6 @@ class TestProjectMdSubpackagesMatchRealityOrDisclaimer(unittest.TestCase):
         """When PROJECT lists core/, features/, training/, serving/, etl/ under trainer, either all exist or doc has deferral (2.1 only four; features in 2.2)."""
         text = _project_text()
         # PROJECT 目標樹在 trainer/ 下列出這五個
-        has_all_five = all(
-            f"{name}/" in text or f"{name}" in text.split("trainer/")[-1].split("\n")[0]
-            for name in SUBPACKAGE_NAMES
-        )
         # 更寬鬆：只要樹裡有 core、features、training、serving、etl 在 trainer 段落即可
         trainer_section = ""
         if "trainer/" in text:

@@ -99,6 +99,15 @@ class TestConfigRequiredConstants(unittest.TestCase):
         )
         self.assertGreater(getattr(self.config, "SCORER_POLL_INTERVAL_SECONDS"), 0)
 
+    def test_scorer_cold_start_window_hours_optional(self):
+        """Payout-age cap for scoring: None or positive float; capped at SCORER_LOOKBACK_HOURS_MAX when set."""
+        self.assertTrue(hasattr(self.config, "SCORER_COLD_START_WINDOW_HOURS"))
+        v = getattr(self.config, "SCORER_COLD_START_WINDOW_HOURS")
+        self.assertTrue(v is None or isinstance(v, float))
+        if v is not None:
+            self.assertGreater(v, 0.0)
+            self.assertLessEqual(v, float(getattr(self.config, "SCORER_LOOKBACK_HOURS_MAX")))
+
     def test_runtime_threshold_max_age_optional(self):
         """T-OnlineCalibration: optional TTL for state DB runtime threshold."""
         self.assertTrue(hasattr(self.config, "RUNTIME_THRESHOLD_MAX_AGE_HOURS"))

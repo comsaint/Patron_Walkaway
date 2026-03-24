@@ -15,8 +15,6 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-from zoneinfo import ZoneInfo
-
 import pandas as pd
 
 from trainer.serving import scorer as scorer_mod
@@ -179,7 +177,6 @@ class TestExportWatermark(unittest.TestCase):
 
     def test_scored_at_cutoff_boundary_only_exports_rows_at_or_before_cutoff(self):
         """Review §5: Only rows with scored_at <= cutoff are in the batch (ISO HK string compare)."""
-        hk_tz = ZoneInfo("Asia/Hong_Kong")
         cutoff_ts = "2026-03-18T12:00:00+08:00"
         after_ts = "2026-03-18T12:00:01+08:00"
         fixed_now = datetime.fromisoformat(cutoff_ts)
