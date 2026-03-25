@@ -8380,4 +8380,39 @@ PYTHONPATH=. python -m pytest tests/review_risks/test_task6_validator_review_ris
 | `PYTHONPATH=. python -m pytest tests/integration -q` | ✅ **147 passed** |
 | `PYTHONPATH=. python -m pytest tests/review_risks/test_validator_phase2_incremental_review_risks_mre.py tests/review_risks/test_unified_plan_v2_t3_validator_metrics_review.py tests/integration/test_validator_datetime_naive_hk.py -q` | ✅ **22 passed** |
 
-**補充（2026-03-25）**：滾動 **Cumulative Precision（15m/1h）** 與 `validator_metrics` 之時間窗由 **`alert_ts`（發報/score 時間）** 改為以 **`bet_ts`（下注時間）** 為主，`bet_ts` 缺失時退回 `alert_ts`；日誌字串為 `(15m/1h window, by bet_ts)`。見 `trainer/serving/validator.py` 之 `_rolling_precision_by_bet_ts` 與 `tests/unit/test_validator_rolling_precision_bet_ts.py`。
+**補充（2026-03-25，已更正）**：曾嘗試將滾動 **Cumulative Precision（15m/1h）** 改為以 **`bet_ts`** 為時間窗；實務上在短窗內以「下注時間」歸屬會與「驗證完成／可觀測」語意不一致。**已還原**為與 commit **`22038a0`** 起一致：以 **`alert_ts`**（發報／寫入 alerts 的時間語意）作滾動窗，函式名 **`_rolling_precision_by_alert_ts`**；日誌為 `[validator] Cumulative Precision (15m window): …`／`(1h window): …`（無 `by bet_ts` 後綴）。`validator_metrics` 與該 KPI 對齊。測試：`tests/unit/test_validator_rolling_precision_alert_ts.py`（`test_validator_rolling_precision_bet_ts.py` 已移除）。
+
+---
+
+## Scorer 增量游標與倉儲時區（2026-03-25）
+
+### 背景
+
+- 生產觀察：若仅以 `payout_complete_dtm` 與牆鐘 `last_processed_end` 混用，**晚到入庫**（`__etl_insert_Dtm` 新、`payout_complete_dtm` 舊）的列可能被誤判為「無新注單」，導致 scorer 長時間不計分。
+- 樣本 Parquet（`data/gmwds_t_bet.parquet`）：`payout_complete_dtm` 與 `__etl_insert_Dtm` 皆為 `timestamp[*, tz=UTC]`；DBeaver 上常見 **`payout_complete_dtm` 顯示 +08、`__etl_insert_Dtm` 像 UTC**，屬業務欄位 vs 入庫欄位之常見差異。
+
+### 實作摘要（`trainer/serving/scorer.py`）
+
+- ClickHouse 拉注單時 **`SELECT` 帶出 `__etl_insert_Dtm`**。
+- **`fetch_recent_data`** 對 `payout_complete_dtm` 與 `__etl_insert_Dtm` 皆經 **`_warehouse_timestamp_series_to_hk`**：naive 視為 **UTC 牆鐘** 再轉 **HK**（與 Parquet 契約一致）；再與 `now_hk`、SQLite meta 比較。
+- 增量 **`new_bets`**：以 **`max(__etl_insert_Dtm)`**（對應系列化為 HK）寫入 **`meta.last_processed_etl_insert`**；保留 **`meta.last_processed_end`**（牆鐘）以相容舊版／rollback。
+- 測試：`tests/unit/test_scorer_incremental_cursor.py`（含 naive UTC 與顯式 UTC 一致之契約）。
+
+---
+
+## Validator「無 bet 資料」警告列（2026-03-25）
+
+### 背景
+
+- `bet_cache` 為空時之 `logger.warning` 需利於現場對照玩家與時間。
+
+### 實作摘要（`trainer/serving/validator.py` · `validate_alert_row`）
+
+- 訊息由 **`canonical_id=...`** 改為 **`casino_player_id=...`**，並加上 **`bet_ts=`**、**`scored_at=`**（ISO；`scored_at` 缺則以 `ts`／score 時間正規化後之值）。
+- 仍為 `[validator] No bet data for ... — leaving PENDING (cannot verify late arrivals)`。
+
+### 驗證（建立時）
+
+| 檢查 | 結果 |
+|------|------|
+| `python -m pytest tests/integration/test_validator_datetime_naive_hk.py -q` | ✅ **5 passed** |

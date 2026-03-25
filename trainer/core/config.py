@@ -133,7 +133,7 @@ SCORER_POLL_INTERVAL_SECONDS = 45  # Polling interval in seconds (includes run t
 _csw_raw = os.getenv("SCORER_COLD_START_WINDOW_HOURS", "").strip()
 SCORER_COLD_START_WINDOW_HOURS: Optional[float]
 if not _csw_raw:
-    SCORER_COLD_START_WINDOW_HOURS = None
+    SCORER_COLD_START_WINDOW_HOURS = 2
 else:
     try:
         _csw_p = float(_csw_raw)
