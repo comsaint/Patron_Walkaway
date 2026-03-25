@@ -31,16 +31,17 @@ class TestRisk1ExceptionSwallowingContract(unittest.TestCase):
         self.assertIn("except Exception:", block)
 
 
-class TestRisk2WatermarkDriftNoResetContract(unittest.TestCase):
-    """Risk #2: no explicit reset branch when max(rowid) < watermark."""
+class TestRisk2WatermarkDriftResetContract(unittest.TestCase):
+    """Risk #2 (remediated): reset when persisted watermark > max(rowid) (restore/trim)."""
 
-    def test_no_explicit_drift_reset_condition(self) -> None:
+    def test_drift_reset_condition_and_meta_delete(self) -> None:
         text = _validator_text()
         start = text.find("def load_existing_results_incremental(")
         end = text.find("\ndef ", start + 1)
         block = text[start:end if end != -1 else len(text)]
         self.assertIn("current_max_rowid", block)
-        self.assertNotIn("current_max_rowid < last_loaded_rowid", block)
+        self.assertIn("current_max_rowid < last_loaded_rowid", block)
+        self.assertIn("DELETE FROM validator_runtime_meta WHERE key = ?", block)
 
 
 class TestRisk3MetaWriteTransactionBoundaryContract(unittest.TestCase):
@@ -56,11 +57,17 @@ class TestRisk3MetaWriteTransactionBoundaryContract(unittest.TestCase):
 
 
 class TestRisk4PerCycleDictRebuildContract(unittest.TestCase):
-    """Risk #4: validate_once currently rebuilds existing_results from {} each cycle."""
+    """Risk #4 mitigated: validate_once loads DB-first, then fills missing keys from cache."""
 
-    def test_validate_once_passes_empty_dict_to_incremental_loader(self) -> None:
+    def test_validate_once_loads_incremental_db_first_with_warm_cache(self) -> None:
         text = _validator_text()
-        self.assertIn("existing_results = load_existing_results_incremental(conn, {})", text)
+        self.assertIn("DB-first", text)
+        self.assertIn("warm_cache=existing_results_cache", text)
+        self.assertIn(
+            "existing_results = load_existing_results_incremental(",
+            text,
+        )
+        self.assertIn("if _k not in existing_results:", text)
 
 
 class TestRisk5WatermarkTamperHardeningContract(unittest.TestCase):

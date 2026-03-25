@@ -98,6 +98,9 @@ SCORER_ALERT_RETENTION_DAYS = 30      # Keep scorer alerts for last N days
 SCORER_STATE_RETENTION_HOURS = 24     # Keep scorer SQLite state for this many hours
 VALIDATOR_ALERT_RETENTION_DAYS = 30   # Keep alerts visible to validator for last N days
 VALIDATION_RESULTS_RETENTION_DAYS = 180  # Keep validation_results history for last N days
+# In-memory validation_results cache prune: full-map scan at most once per interval (seconds).
+# 0 or negative = every validator cycle (legacy behavior; higher CPU on large caches).
+VALIDATOR_CACHE_PRUNE_INTERVAL_SECONDS = 300
 
 # ------------------ Scorer poll defaults (SSOT for scorer CLI) -----------------
 # Used by scorer.py --lookback-hours / --interval.
@@ -196,6 +199,9 @@ VALIDATOR_FINALITY_HOURS: int = 1             # Cutoff (hours) for finality
 VALIDATOR_FETCH_PRE_CONTEXT_MINUTES: int = 60
 VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES: int = 180
 VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES_CAP: int = 24 * 60  # hard cap to avoid runaway CH scans
+VALIDATOR_NO_BET_RETRY_MAX_ALERTS: int = 50  # Task 9B: targeted retry budget per validator cycle
+# Max span (minutes) for a single no-bet retry window (pre_context + lookahead+extras); avoids runaway CH scans.
+VALIDATOR_NO_BET_RETRY_MAX_WINDOW_MINUTES: int = 240
 
 # ============================================================
 # Phase 1 — Walkaway Model Constants (SSOT v10)

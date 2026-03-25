@@ -60,6 +60,13 @@ _VALIDATOR_STAGE_TIMINGS: Dict[str, deque[float]] = {}
 # Task 9 warnings: avoid log spam on misconfiguration.
 _WARNED_TASK9_LOOKBACK_TOO_SMALL = False
 _WARNED_TASK9_LOOKBACK_CLAMPED = False
+_WARNED_TASK9_RETRY_WINDOW_CLAMPED = False
+
+# Task 9B: round-robin offset for no-bet retry selection (fairness across > limit backlog).
+_NO_BET_RETRY_ROT_OFFSET: int = 0
+
+# Throttle O(n) in-memory cache prune (see VALIDATOR_CACHE_PRUNE_INTERVAL_SECONDS).
+_CACHE_PRUNE_LAST_MONO: float = 0.0
 
 
 def _safe_int_config(name: str, default: int, *, min_value: int) -> int:
@@ -236,6 +243,68 @@ def _append_validator_metrics(
     )
 
 
+def _retention_row_ts_hk(row: Dict[str, Any]) -> Optional[pd.Timestamp]:
+    """Primary ``validated_at``, fallback ``alert_ts`` — matches ``prune_validator_retention`` SQL."""
+    for col in ("validated_at", "alert_ts"):
+        vt = pd.to_datetime(row.get(col), errors="coerce")
+        if pd.isna(vt):
+            continue
+        if vt.tzinfo is None:
+            vt = vt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        else:
+            vt = vt.tz_convert(HK_TZ)
+        if pd.notna(vt):
+            return vt
+    return None
+
+
+def _prune_existing_results_cache(
+    existing_results: Dict[str, Dict[str, Any]],
+    *,
+    now_hk: datetime,
+) -> int:
+    """Drop cache rows older than retention horizon (aligned with DB prune).
+
+    Uses ``validated_at`` when present, else ``alert_ts``, same as
+    ``prune_validator_retention`` for ``validation_results``.
+    """
+    days = getattr(config, "VALIDATION_RESULTS_RETENTION_DAYS", None)
+    if days is None or days <= 0 or not existing_results:
+        return 0
+    cutoff = now_hk - timedelta(days=days)
+    removed = 0
+    for key, row in list(existing_results.items()):
+        try:
+            vt = _retention_row_ts_hk(row)
+            if vt is None or pd.isna(vt):
+                continue
+            if vt < cutoff:
+                existing_results.pop(key, None)
+                removed += 1
+        except Exception:
+            continue
+    return removed
+
+
+def _should_run_cache_prune() -> bool:
+    raw = getattr(config, "VALIDATOR_CACHE_PRUNE_INTERVAL_SECONDS", 300)
+    try:
+        interval = float(raw)
+    except Exception:
+        interval = 300.0
+    if interval <= 0:
+        return True
+    now = time.monotonic()
+    if _CACHE_PRUNE_LAST_MONO == 0.0 or (now - _CACHE_PRUNE_LAST_MONO) >= interval:
+        return True
+    return False
+
+
+def _mark_cache_prune_done() -> None:
+    global _CACHE_PRUNE_LAST_MONO
+    _CACHE_PRUNE_LAST_MONO = time.monotonic()
+
+
 def _build_cid_to_player_ids(alerts_df: pd.DataFrame) -> Dict[str, List[int]]:
     """Build {canonical_id: [player_ids]} reverse mapping from the alerts DataFrame.
 
@@ -349,6 +418,203 @@ def fetch_bets_by_canonical_id(
         cache[cid].sort()
 
     return cache
+
+
+def _fetch_bets_for_no_bet_rows(
+    missing_rows: List[pd.Series],
+    *,
+    pre_context_min: int,
+    freshness_buffer_min: int,
+    extended_wait_min: int,
+    max_alerts: int,
+) -> Tuple[Dict[str, List[datetime]], Dict[str, int]]:
+    """Targeted retry for alerts that hit ``No bet data`` in this cycle."""
+    if not missing_rows or get_clickhouse_client is None:
+        return {}, {"selected": 0, "queries": 0, "rows": 0, "failed_queries": 0}
+
+    selected_rows = missing_rows[: max(1, int(max_alerts))]
+    per_pid: Dict[int, Dict[str, Any]] = {}
+    lookahead_plus = int(config.LABEL_LOOKAHEAD_MIN + max(0, freshness_buffer_min) + max(0, extended_wait_min))
+    max_window_min = _safe_int_config("VALIDATOR_NO_BET_RETRY_MAX_WINDOW_MINUTES", 240, min_value=1)
+    global _WARNED_TASK9_RETRY_WINDOW_CLAMPED
+
+    for row in selected_rows:
+        pid_raw = row.get("player_id")
+        if pid_raw is None or pd.isna(pid_raw):
+            continue
+        try:
+            pid = int(pid_raw)
+        except Exception:
+            continue
+
+        bt_raw = row.get("bet_ts")
+        if bt_raw is None or pd.isna(bt_raw):
+            bt_raw = row.get("ts")
+        bt = pd.to_datetime(bt_raw, errors="coerce")
+        if pd.isna(bt):
+            continue
+        if bt.tzinfo is None:
+            bt = bt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        else:
+            bt = bt.tz_convert(HK_TZ)
+        if pd.isna(bt):
+            continue
+
+        retry_start = bt - timedelta(minutes=max(0, int(pre_context_min)))
+        retry_end = bt + timedelta(minutes=lookahead_plus)
+        span_min = (retry_end - retry_start).total_seconds() / 60.0
+        if span_min > float(max_window_min):
+            if not _WARNED_TASK9_RETRY_WINDOW_CLAMPED:
+                logger.warning(
+                    "[validator] no-bet retry window span %.1fmin exceeds cap %s; clamping (centered on bet_ts)",
+                    span_min,
+                    max_window_min,
+                )
+                _WARNED_TASK9_RETRY_WINDOW_CLAMPED = True
+            half = float(max_window_min) / 2.0
+            retry_start = bt - timedelta(minutes=half)
+            retry_end = bt + timedelta(minutes=half)
+        cid_raw = row.get("canonical_id")
+        cid = str(pid) if (cid_raw is None or pd.isna(cid_raw) or str(cid_raw).strip() == "") else str(cid_raw)
+
+        slot = per_pid.setdefault(pid, {"start": retry_start, "end": retry_end, "cids": set()})
+        if retry_start < slot["start"]:
+            slot["start"] = retry_start
+        if retry_end > slot["end"]:
+            slot["end"] = retry_end
+        slot["cids"].add(cid)
+
+    if not per_pid:
+        return {}, {"selected": len(selected_rows), "queries": 0, "rows": 0, "failed_queries": 0}
+
+    for pid, win in list(per_pid.items()):
+        span_agg = (win["end"] - win["start"]).total_seconds() / 60.0
+        if span_agg > float(max_window_min):
+            mid = win["start"] + (win["end"] - win["start"]) / 2
+            half = float(max_window_min) / 2.0
+            win["start"] = mid - timedelta(minutes=half)
+            win["end"] = mid + timedelta(minutes=half)
+
+    client = get_clickhouse_client()
+    cache: Dict[str, List[datetime]] = {}
+    total_queries = 0
+    total_rows = 0
+    failed_queries = 0
+    for pid, win in per_pid.items():
+        total_queries += 1
+        params = {"player": int(pid), "start": win["start"], "end": win["end"]}
+        query = f"""
+            SELECT payout_complete_dtm
+            FROM {config.SOURCE_DB}.{config.TBET} FINAL
+            WHERE player_id = %(player)s
+              AND player_id IS NOT NULL
+              AND player_id != {config.PLACEHOLDER_PLAYER_ID}
+              AND payout_complete_dtm >= %(start)s
+              AND payout_complete_dtm <= %(end)s
+              AND payout_complete_dtm IS NOT NULL
+              AND wager > 0
+            ORDER BY payout_complete_dtm
+        """
+        try:
+            df = client.query_df(query, parameters=params)
+        except Exception as exc:
+            failed_queries += 1
+            logger.warning(
+                "[validator] no-bet retry query failed player_id=%s start=%s end=%s: %s",
+                pid,
+                win["start"],
+                win["end"],
+                exc,
+            )
+            continue
+        if df.empty:
+            logger.debug(
+                "[validator] no-bet retry: player_id=%s start=%s end=%s rows=0",
+                pid,
+                win["start"],
+                win["end"],
+            )
+            continue
+
+        total_rows += len(df)
+        ts = pd.to_datetime(df["payout_complete_dtm"], errors="coerce")
+        if getattr(ts.dt, "tz", None) is None:
+            ts = ts.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        else:
+            ts = ts.dt.tz_convert(HK_TZ)
+        vals = [t for t in ts.tolist() if pd.notna(t)]
+        for cid in win["cids"]:
+            cache.setdefault(cid, [])
+            cache[cid].extend(vals)
+        logger.debug(
+            "[validator] no-bet retry: player_id=%s start=%s end=%s rows=%s cids=%s",
+            pid,
+            win["start"],
+            win["end"],
+            len(vals),
+            len(win["cids"]),
+        )
+
+    for cid in list(cache.keys()):
+        cache[cid] = sorted(set(cache[cid]))
+    return cache, {
+        "selected": len(selected_rows),
+        "queries": total_queries,
+        "rows": total_rows,
+        "failed_queries": failed_queries,
+    }
+
+
+def _apply_pending_validation_result(
+    *,
+    row: pd.Series,
+    res: Dict[str, Any],
+    existing_results: Dict[str, Dict[str, Any]],
+    processed: set,
+    finality_cutoff: datetime,
+) -> Tuple[int, bool]:
+    """Apply one pending-row validation result. Returns (updated_delta, processed_added)."""
+    if res.get("result") is None:
+        return 0, False
+
+    bid = str(row["bet_id"])
+    key = bid if bid != "nan" else f"{row['player_id']}_{row['ts']}"
+    updated_delta = 0
+    processed_added = False
+
+    is_new = key not in existing_results
+    stored = existing_results.get(key, {}).get("result")
+    stored_is_match = (
+        stored is True
+        or stored == 1
+        or (isinstance(stored, float) and not pd.isna(stored) and stored == 1.0)
+    )
+    is_upgrade = not is_new and res["result"] and not stored_is_match
+    was_pending = not is_new and existing_results.get(key, {}).get("reason") == "PENDING"
+    is_finalize = was_pending and res.get("reason") == "MISS"
+
+    if res.get("reason") in IGNORED_REASONS:
+        existing_results[key] = res
+        processed.add(row["bet_id"])
+        return 0, True
+
+    if is_new or is_upgrade or is_finalize:
+        existing_results[key] = res
+        if is_upgrade or is_finalize:
+            updated_delta += 1
+
+    alert_dt = pd.to_datetime(row["bet_ts"] if pd.notnull(row["bet_ts"]) else row["ts"])
+    if alert_dt.tzinfo is None:
+        alert_dt = alert_dt.replace(tzinfo=HK_TZ)
+
+    if res["result"] or alert_dt <= finality_cutoff:
+        if not res["result"]:
+            res["reason"] = "MISS"
+            existing_results[key] = res
+        processed.add(row["bet_id"])
+        processed_added = True
+
+    return updated_delta, processed_added
 
 
 def fetch_sessions_by_canonical_id(
@@ -608,8 +874,22 @@ def prune_validator_retention(conn: sqlite3.Connection, now_hk: datetime) -> Non
     if days is None or days <= 0:
         return
     cutoff = now_hk - timedelta(days=days)
-    conn.execute("DELETE FROM validation_results WHERE alert_ts < ?", (cutoff.isoformat(),))
-    conn.execute("DELETE FROM processed_alerts WHERE processed_ts < ?", (cutoff.isoformat(),))
+    cut_s = cutoff.isoformat()
+    # Align with in-memory cache / rolling KPI: primary validated_at, fallback alert_ts when missing.
+    conn.execute(
+        """
+        DELETE FROM validation_results
+        WHERE (
+            (validated_at IS NOT NULL AND validated_at != '' AND validated_at < ?)
+            OR (
+                (validated_at IS NULL OR validated_at = '')
+                AND alert_ts < ?
+            )
+        )
+        """,
+        (cut_s, cut_s),
+    )
+    conn.execute("DELETE FROM processed_alerts WHERE processed_ts < ?", (cut_s,))
     conn.commit()
 
 
@@ -653,11 +933,19 @@ def _set_validation_results_last_loaded_rowid(conn: sqlite3.Connection, rowid: i
 def load_existing_results_incremental(
     conn: sqlite3.Connection,
     existing_results: Dict[str, Dict],
+    *,
+    warm_cache: Optional[Dict[str, Dict]] = None,
 ) -> Dict[str, Dict]:
     """Load validation_results with a rowid watermark.
 
     First cycle does one full bootstrap; subsequent cycles only load new rowid
     deltas to reduce per-cycle SQLite read and memory pressure on large tables.
+
+    ``warm_cache``: when ``existing_results`` is empty but the process has a
+    warm in-memory dict from the previous tick (non-empty), we may use
+    incremental deltas without a full table scan. On cold start (no warm cache),
+    an empty ``existing_results`` still does a full bootstrap even if a rowid
+    watermark exists in meta.
     """
     last_loaded_rowid = _get_validation_results_last_loaded_rowid(conn)
     current_max_rowid = 0
@@ -667,12 +955,42 @@ def load_existing_results_incremental(
     except Exception:
         current_max_rowid = 0
 
+    # Persisted watermark above table max (e.g. DB restore / truncate): reset meta and full bootstrap.
+    if last_loaded_rowid > 0 and current_max_rowid < last_loaded_rowid:
+        logger.warning(
+            "[validator] validation_results rowid watermark drift (max_rowid=%s < last_loaded_rowid=%s); "
+            "resetting meta and full bootstrap",
+            current_max_rowid,
+            last_loaded_rowid,
+        )
+        try:
+            conn.execute(
+                "DELETE FROM validator_runtime_meta WHERE key = ?",
+                (_VALIDATOR_META_KEY_LAST_ROWID,),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        last_loaded_rowid = 0
+
+    # IMPORTANT:
+    # If caller cache is empty (e.g. fresh process start), we must do a full bootstrap
+    # even when runtime_meta has a persisted rowid watermark. Otherwise KPI/logging
+    # would only see post-watermark deltas and under-count rolling windows.
+    bootstrap_full = not bool(existing_results)
+    if bootstrap_full and last_loaded_rowid > 0 and bool(warm_cache):
+        # Empty accumulator but warm in-memory state will be merged after load — deltas only.
+        bootstrap_full = False
     query = (
         "SELECT rowid AS _rowid, * FROM validation_results"
-        if last_loaded_rowid <= 0
+        if bootstrap_full or last_loaded_rowid <= 0
         else "SELECT rowid AS _rowid, * FROM validation_results WHERE rowid > ?"
     )
-    params: Tuple[int, ...] = tuple() if last_loaded_rowid <= 0 else (last_loaded_rowid,)
+    params: Tuple[int, ...] = (
+        tuple()
+        if bootstrap_full or last_loaded_rowid <= 0
+        else (last_loaded_rowid,)
+    )
     try:
         df_db = pd.read_sql_query(query, conn, params=params)
         if not df_db.empty:
@@ -921,6 +1239,7 @@ def validate_alert_row(
             casino_player_id, player_id, bet_id, bet_ts.isoformat(), scored_at_hk.isoformat(),
         )
         res_base.update({"result": None, "reason": "PENDING"})
+        res_base["_no_bet_data"] = True
         return res_base
 
     # Find last bet before bet_ts; keep as base_start context only.
@@ -1035,7 +1354,7 @@ def validate_alert_row(
 
 
 # ------------------ Main loop ------------------
-def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> None:
+def validate_once(conn: sqlite3.Connection, force_finalize: bool = False, existing_results_cache: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
     cycle_stage_seconds: Dict[str, float] = {}
     now_hk = datetime.now(HK_TZ)
     t_sqlite = time.perf_counter()
@@ -1102,7 +1421,31 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
     logger.debug("[validator] Processing %d alerts (including re-checks)...", len(pending))
 
     t_sqlite = time.perf_counter()
-    existing_results = load_existing_results_incremental(conn, {})
+    # DB-first: load SQLite deltas into a fresh dict, then merge in-process cache keys
+    # only when absent from DB (avoids stale cache overwriting DB rows).
+    cache_before = len(existing_results_cache) if existing_results_cache else 0
+    existing_results = load_existing_results_incremental(
+        conn,
+        {},
+        warm_cache=existing_results_cache if existing_results_cache else None,
+    )
+    if existing_results_cache:
+        for _k, _v in existing_results_cache.items():
+            if _k not in existing_results:
+                existing_results[_k] = _v
+    if existing_results_cache is not None:
+        existing_results_cache.clear()
+        existing_results_cache.update(existing_results)
+    removed = 0
+    if _should_run_cache_prune():
+        removed = _prune_existing_results_cache(existing_results, now_hk=now_hk)
+        _mark_cache_prune_done()
+    logger.debug(
+        "[validator] existing_results cache: before=%d after_load=%d pruned=%d",
+        cache_before,
+        len(existing_results),
+        removed,
+    )
     cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
 
     # Build canonical_id → [player_ids] mapping from all relevant alerts (step 8)
@@ -1246,6 +1589,7 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
         except Exception:
             continue
 
+    no_bet_pending_rows: List[pd.Series] = []
     for _, row in pending.iterrows():
         res = validate_alert_row(
             row,
@@ -1254,47 +1598,77 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
             force_finalize=force_finalize,
         )
         if res.get("result") is None:
+            if bool(res.get("_no_bet_data")):
+                no_bet_pending_rows.append(row.copy())
             continue
-
-        bid = str(row["bet_id"])
-        key = bid if bid != "nan" else f"{row['player_id']}_{row['ts']}"
-
-        is_new = key not in existing_results
-        # Treat stored result as MATCH only when explicitly True/1/1.0 (R393: NaN/0/None allow upgrade to MATCH)
-        stored = existing_results.get(key, {}).get("result")
-        stored_is_match = (
-            stored is True
-            or stored == 1
-            or (isinstance(stored, float) and not pd.isna(stored) and stored == 1.0)
+        # is_upgrade / pending-finalize semantics are preserved in helper.
+        # stored_is_match / is_upgrade semantics are preserved in helper.
+        updated_delta, processed_added = _apply_pending_validation_result(
+            row=row,
+            res=res,
+            existing_results=existing_results,
+            processed=processed,
+            finality_cutoff=finality_cutoff,
         )
-        is_upgrade = not is_new and res["result"] and not stored_is_match
-        was_pending = not is_new and existing_results.get(key, {}).get("reason") == "PENDING"
-        is_finalize = was_pending and res.get("reason") == "MISS"
-
-        if res.get("reason") in IGNORED_REASONS:
-            existing_results[key] = res
-            processed.add(row["bet_id"])
+        updated_count += updated_delta
+        if processed_added:
             cycle_bet_to_reason[str(row["bet_id"])] = str(res.get("reason", "UNKNOWN"))
             new_processed_ids.append(row["bet_id"])
-            continue
 
-        if is_new or is_upgrade or is_finalize:
-            existing_results[key] = res
-            if is_upgrade or is_finalize:
-                updated_count += 1
+    # Task 9B: targeted retry for rows that hit "No bet data" this cycle.
+    retry_limit = _safe_int_config("VALIDATOR_NO_BET_RETRY_MAX_ALERTS", 50, min_value=1)
+    if no_bet_pending_rows:
+        global _NO_BET_RETRY_ROT_OFFSET
+        ext_wait_min = _safe_int_config("VALIDATOR_EXTENDED_WAIT_MINUTES", 15, min_value=0)
+        pre_context_min = _safe_int_config("VALIDATOR_FETCH_PRE_CONTEXT_MINUTES", 60, min_value=0)
+        n_nb = len(no_bet_pending_rows)
+        rot_start = _NO_BET_RETRY_ROT_OFFSET % n_nb
+        retry_slice = (no_bet_pending_rows[rot_start:] + no_bet_pending_rows[:rot_start])[:retry_limit]
+        _NO_BET_RETRY_ROT_OFFSET = (rot_start + len(retry_slice)) % max(n_nb, 1)
+        retry_cache, retry_stats = _fetch_bets_for_no_bet_rows(
+            retry_slice,
+            pre_context_min=pre_context_min,
+            freshness_buffer_min=max(0, int(freshness_buffer_min)),
+            extended_wait_min=ext_wait_min,
+            max_alerts=max(1, len(retry_slice)),
+        )
+        for cid, vals in retry_cache.items():
+            bet_cache.setdefault(cid, [])
+            bet_cache[cid].extend(vals)
+            bet_cache[cid] = sorted(set(bet_cache[cid]))
 
-        alert_dt = pd.to_datetime(row["bet_ts"] if pd.notnull(row["bet_ts"]) else row["ts"])
-        if alert_dt.tzinfo is None:
-            alert_dt = alert_dt.replace(tzinfo=HK_TZ)
+        logger.debug(
+            "[validator] no-bet retry summary: before=%s selected=%s queries=%s rows=%s failed_queries=%s resolved_cache_cids=%s limit=%s rot_start=%s",
+            len(no_bet_pending_rows),
+            retry_stats.get("selected", 0),
+            retry_stats.get("queries", 0),
+            retry_stats.get("rows", 0),
+            retry_stats.get("failed_queries", 0),
+            len(retry_cache),
+            retry_limit,
+            rot_start,
+        )
 
-        if res["result"] or alert_dt <= finality_cutoff:
-            if not res["result"]:
-                res["reason"] = "MISS"
-                existing_results[key] = res
-
-            processed.add(row["bet_id"])
-            cycle_bet_to_reason[str(row["bet_id"])] = str(res.get("reason", "UNKNOWN"))
-            new_processed_ids.append(row["bet_id"])
+        for row in retry_slice:
+            res = validate_alert_row(
+                row,
+                bet_cache,
+                session_cache_disabled,
+                force_finalize=force_finalize,
+            )
+            if res.get("result") is None:
+                continue
+            updated_delta, processed_added = _apply_pending_validation_result(
+                row=row,
+                res=res,
+                existing_results=existing_results,
+                processed=processed,
+                finality_cutoff=finality_cutoff,
+            )
+            updated_count += updated_delta
+            if processed_added:
+                cycle_bet_to_reason[str(row["bet_id"])] = str(res.get("reason", "UNKNOWN"))
+                new_processed_ids.append(row["bet_id"])
 
     if cycle_bet_to_reason:
         _vc = Counter(cycle_bet_to_reason.values())
@@ -1322,13 +1696,13 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
             finalized_or_old, now_hk=now_hk, window=timedelta(hours=1)
         )
         logger.info(
-            "[validator] Precision in recent 15m (by validate time): %.2f%% (%d/%d)",
+            "[validator] Cumulative Precision (15m window, by validated_at): %.2f%% (%d/%d)",
             precision_15m * 100,
             matches_15m,
             total_15m,
         )
         logger.info(
-            "[validator] Precision in recent 1h (by validate time): %.2f%% (%d/%d)",
+            "[validator] Cumulative Precision (1h window, by validated_at): %.2f%% (%d/%d)",
             precision_1h * 100,
             matches_1h,
             total_1h,
@@ -1352,7 +1726,7 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
         t_sqlite = time.perf_counter()
         save_validation_results(conn, final_df)
         cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
-        logger.info(
+        logger.debug(
             "[validator] Saved %d total validations to SQLite (Updated %d, Finalized %d)",
             len(final_df), updated_count, len(new_processed_ids),
         )
@@ -1360,6 +1734,9 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
     t_sqlite = time.perf_counter()
     mark_processed(conn, new_processed_ids)
     cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
+    if existing_results_cache is not None:
+        existing_results_cache.clear()
+        existing_results_cache.update(existing_results)
     _emit_validator_perf_summary(cycle_stage_seconds)
     return
 
@@ -1373,10 +1750,15 @@ def run_validator_loop(
     Uses STATE_DB_PATH from env if set.
     """
     conn = get_db_conn()
+    existing_results_cache: Dict[str, Dict[str, Any]] = {}
     while True:
         start_time = time.time()
         try:
-            validate_once(conn, force_finalize=force_finalize)
+            validate_once(
+                conn,
+                force_finalize=force_finalize,
+                existing_results_cache=existing_results_cache,
+            )
         except Exception as exc:
             logger.exception("[validator] ERROR: %s", exc)
         if once:
@@ -1402,11 +1784,16 @@ def main():
 
     conn = get_db_conn()
     interval = args.interval
+    existing_results_cache: Dict[str, Dict[str, Any]] = {}
 
     while True:
         start_time = time.time()
         try:
-            validate_once(conn, force_finalize=args.force_finalize)
+            validate_once(
+                conn,
+                force_finalize=args.force_finalize,
+                existing_results_cache=existing_results_cache,
+            )
         except Exception as exc:
             logger.exception("[validator] ERROR: %s", exc)
         if args.once:

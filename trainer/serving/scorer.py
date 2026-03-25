@@ -303,7 +303,7 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         }
         if not artifacts["feature_list"]:
             artifacts["feature_list"] = rb.get("features", [])
-        logger.info(
+        logger.debug(
             "[scorer] Single rated model loaded from model.pkl (v=%s, %d features)",
             artifacts["model_version"],
             len(artifacts["feature_list"]),
@@ -319,7 +319,7 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         }
         if not artifacts["feature_list"]:
             artifacts["feature_list"] = rb.get("features", [])
-        logger.info(
+        logger.debug(
             "[scorer] Rated model loaded from rated_model.pkl (v=%s, %d features)",
             artifacts["model_version"],
             len(artifacts["feature_list"]),
@@ -460,7 +460,7 @@ def fetch_recent_data(
         bets["__etl_insert_Dtm"] = _etl.dt.tz_convert(HK_TZ)
 
     sessions = client.query_df(session_query, parameters=params)
-    logger.info("[scorer] Fetched %d bets, %d sessions", len(bets), len(sessions))
+    logger.debug("[scorer] Fetched %d bets, %d sessions", len(bets), len(sessions))
     return bets, sessions
 
 
@@ -698,7 +698,7 @@ def read_effective_runtime_rated_threshold(
             now = pd.Timestamp.now(tz=HK_TZ)
             age_h = float((now - ts).total_seconds()) / 3600.0
             if age_h > float(max_age):
-                logger.info(
+                logger.debug(
                     "[scorer] runtime_rated_threshold stale (%.2fh > max %.2fh); using bundle %.4f",
                     age_h,
                     float(max_age),
@@ -712,7 +712,7 @@ def read_effective_runtime_rated_threshold(
             )
             return bundle_t
     if abs(t - bundle_t) > 1e-9:
-        logger.info("[scorer] Using runtime_rated_threshold=%.4f (bundle was %.4f)", t, bundle_t)
+        logger.debug("[scorer] Using runtime_rated_threshold=%.4f (bundle was %.4f)", t, bundle_t)
     return t
 
 
@@ -990,7 +990,7 @@ def _check_numba_runtime_once() -> None:
             return x + 1
 
         _ = _probe(1)
-        logger.info("[scorer] numba runtime check: available")
+        logger.debug("[scorer] numba runtime check: available")
     except Exception as exc:
         logger.warning("[scorer] numba runtime check failed: %s", exc)
 
@@ -1033,7 +1033,7 @@ def _select_incremental_bets_window(
         narrowed = bets[bets["player_id"].astype(str).isin(expanded_pids)].copy()
         if narrowed.empty:
             return bets
-        logger.info(
+        logger.debug(
             "[scorer] Incremental input narrowed bets: %d -> %d rows",
             len(bets),
             len(narrowed),
@@ -1366,7 +1366,7 @@ def _load_profile_for_scoring(
             # the most-recent row per canonical_id after sort by snapshot_dtm)
             df = df.sort_values("snapshot_dtm")
             df = df.groupby("canonical_id").last().reset_index()
-            logger.info("[scorer] player_profile: %d rows from local Parquet", len(df))
+            logger.debug("[scorer] player_profile: %d rows from local Parquet", len(df))
             df_loaded = df if not df.empty else None
         except Exception as exc:
             logger.debug("[scorer] profile local Parquet skipped: %s", exc)
@@ -1375,7 +1375,7 @@ def _load_profile_for_scoring(
     # t_session); it is never stored in ClickHouse.  The ClickHouse path is removed
     # to prevent spurious Code-60 errors on every scoring call.
     if df_loaded is None:
-        logger.info(
+        logger.debug(
             "[scorer] player_profile not found at %s — "
             "run etl_player_profile.py first; profile features will be NaN",
             _LOCAL_PARQUET_PROFILE,
@@ -1963,7 +1963,7 @@ def score_once(
                     json.dumps({"cutoff_dtm": now_hk.isoformat()}, indent=0),
                     encoding="utf-8",
                 )
-                logger.info("[scorer] Canonical mapping persisted to %s", CANONICAL_MAPPING_PARQUET)
+                logger.debug("[scorer] Canonical mapping persisted to %s", CANONICAL_MAPPING_PARQUET)
             except Exception as exc:
                 logger.warning("[scorer] Failed to persist canonical mapping: %s", exc)
 
@@ -2068,7 +2068,7 @@ def score_once(
             features_all = _join_profile(features_all, _profile_df)
             logger.debug("[scorer] player_profile PIT join applied")
         else:
-            logger.info(
+            logger.debug(
                 "[scorer] player_profile unavailable — profile features will be NaN"
             )
 
@@ -2097,7 +2097,7 @@ def score_once(
         _emit_scorer_perf_summary(cycle_stage_seconds)
         return
     if UNRATED_VOLUME_LOG and n_unrated_new_bets_pre_slice > 0:
-        logger.info(
+        logger.debug(
             "[scorer] Excluded %d unrated bets (%d players); scoring %d rated bets.",
             n_unrated_new_bets_pre_slice,
             unrated_players_new_bets_pre_slice,

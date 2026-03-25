@@ -6,6 +6,39 @@
 
 ---
 
+## Task 9B Validator 加固 Round 2 + 契約測試對齊（2026-03-25 追加）
+
+### 背景
+- 完成 PATCH Task 9B **pending**：補查 `query_df` 單筆失敗不中斷整輪、retry 時間窗 **硬上界**、`>50` **round-robin** 公平性、`existing_results_cache` **DB 優先** 合併語意（`load_existing_results_incremental(..., warm_cache=...)`）。
+- 本輪主要**補齊** review MRE：舊測試仍斷言「無 try/except／無 cap／固定前 N」等**已過時契約**，改為記錄現行緩解行為。
+
+### 變更檔案
+| 檔案 | 說明 |
+|------|------|
+| [tests/review_risks/test_validator_phase2_incremental_review_risks_mre.py](../../tests/review_risks/test_validator_phase2_incremental_review_risks_mre.py) | Risk4：`validate_once` 改斷言 **DB-first**、`warm_cache`、僅補 **DB 缺鍵**（`if _k not in existing_results`）。 |
+| [tests/review_risks/test_task9b_retry_review_risks_mre.py](../../tests/review_risks/test_task9b_retry_review_risks_mre.py) | Task9B：改為 **Mitigation** 契約（try/except + `failed_queries`、`VALIDATOR_NO_BET_RETRY_MAX_WINDOW_MINUTES` + clamp、`retry_slice` + `_NO_BET_RETRY_ROT_OFFSET`、merge 方向）。 |
+| [tests/review_risks/test_incident_remediation_followup_review_risks_mre.py](../../tests/review_risks/test_incident_remediation_followup_review_risks_mre.py) | Risk5：追加錨定字串 `warm_cache=existing_results_cache`（與 Phase2 Risk4 對齊）。 |
+| [trainer/serving/validator.py](../../trainer/serving/validator.py)、[trainer/core/config.py](../../trainer/core/config.py) | （前序輪已實作；本輪若僅跑測試可略）Round 2 行為所在檔。 |
+| [.cursor/plans/PATCH_20260324.md](PATCH_20260324.md) | Task 9B **Remaining** 更新為 Round 2 完成；Changelog 追加一行。 |
+
+### 手動驗證
+1. **契約測試**：`python -m pytest -q tests/review_risks/test_validator_phase2_incremental_review_risks_mre.py tests/review_risks/test_task9b_retry_review_risks_mre.py` → 應全綠。  
+2. **事件回歸**：`python -m pytest -q tests/review_risks/test_incident_validator_cache_bootstrap_2026_03_25.py tests/integration/test_validator_task9_fetch_window_old_bet_ts.py`。  
+3. （可選）於 `credential/.env` 設 **`VALIDATOR_NO_BET_RETRY_MAX_WINDOW_MINUTES=60`**，以 DEBUG 跑一輪 validator，確認超寬窗時出現 **warn-once** clamp 相關 log（需有 no-bet retry 路徑觸發）。
+
+### 本輪驗證（代理環境）
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| Pytest（上述 4 檔 + incident follow-up） | 同上四檔 + `tests/review_risks/test_incident_remediation_followup_review_risks_mre.py` | **15 + 7 passed**（2026-03-25） |
+| Ruff（兩個 MRE 檔） | `python -m ruff check tests/review_risks/test_validator_phase2_incremental_review_risks_mre.py tests/review_risks/test_task9b_retry_review_risks_mre.py` | **通過** |
+
+### 下一步建議
+- 全量回歸：`python -m pytest tests/ -q -p no:langsmith --tb=line`（或 CI 同等指令）。  
+- 可選：為 `failed_queries > 0` 或 retry clamp 增加 **整合測試**（mock CH）。  
+- Task 9 主線仍見 [PATCH_20260324.md](PATCH_20260324.md)（extended wait vs 45–47m 決策、No bet 比例觀測等）。
+
+---
+
 ## Phase 2 Code Review 風險實裝修正（2026-03-22 追加）
 
 ### 背景
