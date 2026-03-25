@@ -934,4 +934,39 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-037：Validator ClickHouse bet 拉取視窗改為「最舊待驗時間窗 + 上限保護」（方案 1）
+
+**日期**：2026-03-25  
+**SSOT 章節**：[PATCH_20260324.md](PATCH_20260324.md) — Task 9  
+**關聯**：DEC-030（validator bet-based verdict）、DEC-035（推論路徑效能優化護欄）
+
+**背景**：
+
+- Validator 需從 ClickHouse 拉取 bet 時序（依 `player_id` 合併到 `canonical_id`）以驗證 alerts（MATCH/MISS/PENDING）。
+- 現行以固定 `fetch_start = min(effective_ts[pending]) - 1h` 拉 bet，對「alert 新但 `bet_ts` 舊」（例如補資料、重跑、延遲發報）容易**窗太短**，造成 `bet_cache` 空、重複出現 `No bet data ... leaving PENDING`，且即使超過政策允許的 late-arrival 時間仍無法定案。
+- 既定政策：walkaway 驗證最遲接受窗口約 **45–47 分鐘**（`LABEL_LOOKAHEAD_MIN=45` + `VALIDATOR_FRESHNESS_BUFFER_MINUTES=2`；另有執行期 grace），超過後不再接受新 late arrival。
+
+**考慮過的替代方案**：
+
+1. **Per-alert union 視窗**：對每筆 pending alert 用 `[bet_ts - x, bet_ts + y]` 取 union 後查詢（語意最精準，但 SQL 複雜、CH 壓力與維護成本高）。
+2. **只讀 scorer 本地資料**：validator 不查 ClickHouse，改從 scorer 的本地資料（例如 state DB 或另存 DM）驗證（需高度依賴 scorer uptime／retention；仍需 fallback 以補洞）。
+
+**決策**：
+
+- 採用 **方案 1（最舊待驗時間窗）**：以「所有待驗 alerts 中最舊的 `effective_ts`」決定本輪 ClickHouse 拉取起點，並加入「最大回看上限」避免無界回溯造成 ClickHouse 壓力失控。
+- 將參數 **config 化**（`VALIDATOR_FETCH_PRE_CONTEXT_MINUTES`、`VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES`），並加入自洽檢查：`MAX_LOOKBACK` 必須覆蓋 policy late window + pre-context，否則提升/告警。
+
+**理由**：
+
+- 以最小實作複雜度修正 correctness：避免固定 `-1h` 對舊 `bet_ts` 漏資料，降低長期 PENDING 與誤判風險。
+- ClickHouse 壓力可控：最大回看上限提供硬邊界，避免「積壓很久的 pending」造成大窗掃描。
+- 與既有架構相容：仍沿用現行 `IN` chunking（R44）與「DB error abort cycle」（R41）設計，不引入 per-alert SQL 拼接。
+
+**後果 / 實作要點**：
+
+- Validator 每輪需額外記錄（DEBUG）`pending_min_ts`、`candidate_start`、`hard_floor`、`fetch_start`、policy 相關常數，以便 production 調參與追查。
+- 若 scorer/validator 長時間停機導致 pending 積壓，仍可能觸發較大 `max_lookback` 視窗；需搭配 retention/runbook 或後續 hybrid（本地 bet cache + CH fallback）策略。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*
