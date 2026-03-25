@@ -8380,7 +8380,7 @@ PYTHONPATH=. python -m pytest tests/review_risks/test_task6_validator_review_ris
 | `PYTHONPATH=. python -m pytest tests/integration -q` | ✅ **147 passed** |
 | `PYTHONPATH=. python -m pytest tests/review_risks/test_validator_phase2_incremental_review_risks_mre.py tests/review_risks/test_unified_plan_v2_t3_validator_metrics_review.py tests/integration/test_validator_datetime_naive_hk.py -q` | ✅ **22 passed** |
 
-**補充（2026-03-25，已更正）**：曾嘗試將滾動 **Cumulative Precision（15m/1h）** 改為以 **`bet_ts`** 為時間窗；實務上在短窗內以「下注時間」歸屬會與「驗證完成／可觀測」語意不一致。**已還原**為與 commit **`22038a0`** 起一致：以 **`alert_ts`**（發報／寫入 alerts 的時間語意）作滾動窗，函式名 **`_rolling_precision_by_alert_ts`**；日誌為 `[validator] Cumulative Precision (15m window): …`／`(1h window): …`（無 `by bet_ts` 後綴）。`validator_metrics` 與該 KPI 對齊。測試：`tests/unit/test_validator_rolling_precision_alert_ts.py`（`test_validator_rolling_precision_bet_ts.py` 已移除）。
+**補充（2026-03-25，決策更新）**：短窗（15m/1h）的滾動 **Cumulative Precision** 若以 **`bet_ts`**／`alert_ts`（事件時間）落窗，長期運行下常因驗證發生於事件很久之後而使視窗內樣本稀少甚至 `0/0`，不利即時監控。現行改為以 **`validated_at`**（驗證完成時間）落窗作為 SLO；函式為 **`_rolling_precision_by_validated_at`**；日誌為 `[validator] Cumulative Precision (15m window, by validated_at): …`／`(1h window, by validated_at): …`；`validator_metrics` 與 15m KPI 對齊。測試：`tests/unit/test_validator_rolling_precision_alert_ts.py`（已更新為 validated_at 語意）。
 
 ---
 

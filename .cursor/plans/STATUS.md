@@ -4505,3 +4505,151 @@ python -m pytest tests/ -q --tb=no --ignore=tests/e2e --ignore=tests/load
 - **§1**（`bool`／`float` `step` 正規化）仍為可選強化；MRE 測試目前鎖定「現狀轉發」。  
 - **PLAN_phase2_p0_p1.md** 之 **Remaining items**（Credential migration、DB path、`T-TrainingMetricsSchema`、可選 scorer lookback fallback 等）不變。
 
+---
+
+### 本輪（production）：Validator SLO 滾動 precision 改以 `validated_at` 落窗（15m/1h）
+
+**Date**：2026-03-25
+
+#### 修改摘要
+
+- 將 validator 主控台的「15m / 1h Cumulative Precision」由事件時間（`alert_ts`）落窗，改為以 **驗證完成時間 `validated_at`** 落窗，用於即時監控（SLO）。
+
+#### Production／文件
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/serving/validator.py` | 新增 `_rolling_precision_by_validated_at(...)`（以 `validated_at` 落窗）；`validate_once()` 的 15m/1h KPI 改呼叫該函式；兩條 log 字串加註 `by validated_at`；`_append_validator_metrics` docstring 改為 **15m-by-validated_at**。 |
+
+#### 手動驗證（建議）
+
+1. 啟動 validator，等待至少一輪有 finalize（MATCH/MISS）產生。
+2. 確認主控台 log 出現兩行且包含 `by validated_at`：
+   - `[validator] Cumulative Precision (15m window, by validated_at): ... (matches/total)`
+   - `[validator] Cumulative Precision (1h window, by validated_at): ... (matches/total)`
+3. 若可查 `validator_metrics` 表，確認新增列的 `precision/total/matches` 與 15m log 數字一致（同一輪）。
+
+#### 下一步建議
+
+- 補單元測試：覆蓋 `_rolling_precision_by_validated_at` 的時區與邊界（窗內/窗外/NaT）案例，避免未來回歸。
+
+---
+
+### 本輪（tests）：Validator rolling precision 測試改對齊 `validated_at`
+
+**Date**：2026-03-25
+
+#### 測試
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `tests/unit/test_validator_rolling_precision_alert_ts.py` | 改為驗證 `_rolling_precision_by_validated_at`：窗內/窗外/NaT 以 `validated_at` 為準，並調整 fixture 欄位。 |
+
+#### 驗證（repo 根目錄）
+
+```bash
+python -m pytest tests/unit/test_validator_rolling_precision_alert_ts.py -q --tb=short
+```
+
+---
+
+### 補充更正（文件一致性）：Validator 15m/1h KPI 以 `validated_at` 為準
+
+**Date**：2026-03-25
+
+- 本文件較早處曾記錄「滾動 Cumulative Precision 以 `alert_ts`（或曾嘗試 `bet_ts`）落窗」等敘述；該記錄已不再代表現況。
+- **現況（production）**：`trainer/serving/validator.py` 的 15m/1h Cumulative Precision 與 `validator_metrics` 對齊，**以 `validated_at` 落窗**（SLO / 即時監控語意）。
+
+---
+
+### Review（2026-03-25）：Validator SLO KPI（by `validated_at`）— 可能風險與建議
+
+本 review 針對近期變更：`trainer/serving/validator.py` 的 `_rolling_precision_by_validated_at` 與 `validate_once()` 的 15m/1h KPI。
+
+#### 1) 邊界條件：`now_hk` 若為 tz-naive 可能在比較時出錯
+
+- **風險**：`_rolling_precision_by_validated_at` 假設 `now_hk` 為 tz-aware（HK）。若未來呼叫端傳入 tz-naive，會在 `vt >= cutoff` 這類比較觸發 `TypeError`（tz-naive vs tz-aware）。
+- **具體修改建議（最小改動）**：
+  - 在 `_rolling_precision_by_validated_at` 開頭補一個 guard：`if now_hk.tzinfo is None: now_hk = now_hk.replace(tzinfo=HK_TZ)`（或 `tz_localize` 等價作法，視 `now_hk` 類型）。
+- **希望新增的測試**：
+  - `test_rolling_precision_accepts_naive_now_hk_localized_to_hk()`：`now_hk` 用 naive `datetime(...)`，`validated_at` 用 HK tz-aware，期望不丟例外且計數正確。
+
+#### 2) 邊界條件：`validated_at` 欄位若出現「混合 tz-aware 與 tz-naive」可能讓 `vt.dt` 路徑不穩
+
+- **風險**：`pd.to_datetime` 在混合輸入（部分有 offset、部分無 offset）時，回傳型別/`vt.dt` 行為可能不一致（甚至變成 object），導致 `.dt.tz_localize / .dt.tz_convert` 這段出錯或行為非預期。
+- **具體修改建議（偏保守，仍屬小改動）**：
+  - 在 `pd.to_datetime` 後增加一層健壯性處理：
+    - 先嘗試走現行 `.dt` 路徑；若遇到 `AttributeError`/`TypeError`（無 `.dt` 或 dtype 不支援），fallback 走逐列 normalize：對每個元素 `ts = pd.to_datetime(x, errors="coerce")`，`ts.tzinfo is None` 則 localize HK，否則轉 HK，最後再組回 `DatetimeIndex/Series`。
+  - （若你確認 DB 永遠寫入帶 offset 的 ISO 字串，可改成 assert + warning：偵測到混合就 warning，避免 silent miscount。）
+- **希望新增的測試**：
+  - `test_rolling_precision_mixed_validated_at_tz_does_not_crash()`：`validated_at` 內同時放 `2026-01-01T11:55:00+08:00` 與 `2026-01-01 11:56:00`（naive），確保函式不崩潰、並以「naive 視為 HK」的語意計數。
+
+#### 3) 效能／記憶體：每輪對整個 `finalized_or_old` 重新 `to_datetime` 是 O(n) 且會配置新陣列
+
+- **風險**：`validation_results` 變大後，每輪都對整欄 `validated_at` 做 `pd.to_datetime` 會逐步變成 CPU 熱點；`sub = ... .copy()` 也會額外複製。
+- **具體修改建議（不重寫整套的前提下）**：
+  - 移除 `.copy()`：`sub = finalized_df[(vt >= cutoff) & (vt <= now_hk)]`（後續僅讀取，避免不必要記憶體）。
+  - 在呼叫端（`validate_once`）先只保留需要欄位再計算 KPI：例如 `finalized_or_old[["validated_at","reason"]]`（減少 DataFrame 寬度）。
+  - 若仍嫌慢，再考慮把 KPI 改成「SQLite 層查最近 1h 的 finalized rows」再算（這是下一階段，不建議本輪就做）。
+- **希望新增的測試**：
+  -（輕量）`test_rolling_precision_does_not_require_extra_columns()`：傳入只含 `validated_at`+`reason` 的 df，確認正確（避免未來不小心依賴其他欄位）。
+  -（可選，非必要）簡單 micro-benchmark 不放 unit test；用 `scripts/` 或手動 runbook 量測即可，避免 CI 不穩。
+
+#### 4) 觀測一致性：`validator_metrics.recorded_at` 與落窗參考 `validated_at` 的關係
+
+- **風險**：目前 `validator_metrics` 仍以 `recorded_at=now_hk` 存入「本輪快照時間」，但分母分子是「validated_at ∈ [now-window, now]」的子集。兩者通常接近但不等同；若未來有人以 `recorded_at` 當作樣本時間，可能誤解。
+- **具體修改建議**：
+  - 在 `validator_metrics` 的 docstring / 欄位說明補一句：`recorded_at` 是「快照寫入時間」，precision 的落窗鍵是 `validated_at`（不是 `recorded_at`）。
+- **希望新增的測試**：
+  - 不需要新增測試（純文件語意），但可在 `tests/review_risks/` 加一個簡短契約測試，鎖定 log 字串包含 `by validated_at`，避免回退造成觀測混淆。
+
+---
+
+### 本輪（tests-only）：Reviewer 風險點最小可重現（Validator SLO by `validated_at`）
+
+**Date**：2026-03-25
+
+#### 新增檔案
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/review_risks/test_review_risks_validator_slo_precision_validated_at_2026_03_25.py` | 對應 Review §1–§4：tz-naive `now_hk`（xfail）、mixed tz `validated_at`（xfail）、僅需 `validated_at`+`reason` 之契約（pass）、KPI log 字串包含 `by validated_at` 之契約（pass）。 |
+
+#### 執行方式（repo 根目錄）
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_validator_slo_precision_validated_at_2026_03_25.py -q --tb=short
+```
+
+**本輪預期輸出**：**2 passed**, **2 xfailed**（兩個 xfail 即為已知風險的 MRE；待 production 依 Review 建議補 guard/fallback 後可改為一般斷言並移除 xfail）。
+
+---
+
+### 本輪（production + tests）：修補 tz-naive / mixed-tz 邊界，Review MRE 全綠
+
+**Date**：2026-03-25
+
+#### Production
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `trainer/serving/validator.py` | `_rolling_precision_by_validated_at`：`now_hk` tz-naive 時視為 HK；偵測 mixed tz 字串時走逐列 normalize fallback；移除不必要的 `DataFrame.copy()`；regex 改為 non-capturing group 避免 warnings。 |
+
+#### 測試
+
+| 檔案 | 修改摘要 |
+|------|----------|
+| `tests/review_risks/test_review_risks_validator_slo_precision_validated_at_2026_03_25.py` | 移除兩個 `xfail`（production 已修補），改為一般斷言。 |
+
+#### 驗證（repo 根目錄）
+
+```bash
+python -m ruff check trainer/serving/validator.py
+python -m pytest tests/review_risks/test_review_risks_validator_slo_precision_validated_at_2026_03_25.py -q --tb=short
+python -m ruff check trainer/ package/ scripts/
+python -m mypy trainer/ package/ --ignore-missing-imports
+python -m pytest tests/ -q --tb=no --ignore=tests/e2e --ignore=tests/load
+```
+
+**結果（建立時）**：ruff ✅；review_risks ✅（4 passed）；mypy ✅（Success: no issues found in 57 source files）；pytest ✅（1547 passed, 62 skipped）。
+

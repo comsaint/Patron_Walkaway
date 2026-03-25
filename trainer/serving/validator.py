@@ -156,22 +156,56 @@ def _latest_model_version_from_alerts(alerts_df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def _rolling_precision_by_alert_ts(
+def _rolling_precision_by_validated_at(
     finalized_df: pd.DataFrame,
     *,
     now_hk: datetime,
     window: timedelta,
 ) -> Tuple[float, int, int]:
-    """MATCH rate over non-PENDING rows whose ``alert_ts`` falls in ``[now_hk - window, now_hk]`` (HK)."""
-    if finalized_df.empty or "alert_ts" not in finalized_df.columns:
+    """MATCH rate over non-PENDING rows whose ``validated_at`` falls in ``[now_hk - window, now_hk]`` (HK)."""
+    if finalized_df.empty or "validated_at" not in finalized_df.columns:
         return 0.0, 0, 0
-    at = pd.to_datetime(finalized_df["alert_ts"], errors="coerce")
-    if getattr(at.dt, "tz", None) is None:
-        at = at.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
-    else:
-        at = at.dt.tz_convert(HK_TZ)
+    if now_hk.tzinfo is None:
+        now_hk = now_hk.replace(tzinfo=HK_TZ)
+
+    raw_col = finalized_df["validated_at"]
+    must_fallback = False
+    # Heuristic: mixed tz-aware (+08:00/Z) and tz-naive strings can silently coerce some rows to NaT.
+    if raw_col.dtype == "object":
+        try:
+            s = raw_col.astype(str)
+            _tz_suffix_re = r"(?:Z|[+-]\d\d:\d\d)$"
+            has_tz_suffix = s.str.contains(_tz_suffix_re, regex=True).any()
+            has_no_tz_suffix = (~s.str.contains(_tz_suffix_re, regex=True) & s.str.contains(r"^\d{4}-\d{2}-\d{2}", regex=True)).any()
+            if bool(has_tz_suffix) and bool(has_no_tz_suffix):
+                must_fallback = True
+        except Exception:
+            must_fallback = True
+
+    vt_raw = pd.to_datetime(raw_col, errors="coerce")
+    try:
+        # Fast path: datetime-like Series supports `.dt` accessors
+        if must_fallback:
+            raise ValueError("mixed tz string inputs; use fallback normalization")
+        if getattr(vt_raw.dt, "tz", None) is None:
+            vt = vt_raw.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        else:
+            vt = vt_raw.dt.tz_convert(HK_TZ)
+    except Exception:
+        # Fallback for mixed tz-aware / tz-naive inputs that may produce non-datetimelike dtype.
+        normalized: List[pd.Timestamp] = []
+        for x in finalized_df["validated_at"].tolist():
+            ts = pd.to_datetime(x, errors="coerce")
+            if ts is pd.NaT:
+                normalized.append(pd.NaT)
+                continue
+            if getattr(ts, "tzinfo", None) is None:
+                normalized.append(ts.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward"))
+            else:
+                normalized.append(ts.tz_convert(HK_TZ))
+        vt = pd.Series(pd.DatetimeIndex(normalized), index=finalized_df.index)
     cutoff = now_hk - window
-    sub = finalized_df[(at >= cutoff) & (at <= now_hk)].copy()
+    sub = finalized_df[(vt >= cutoff) & (vt <= now_hk)]
     if sub.empty:
         return 0.0, 0, 0
     total = len(sub)
@@ -191,7 +225,7 @@ def _append_validator_metrics(
 ) -> None:
     """Insert one precision snapshot (``validator_metrics`` table).
 
-    Intended to align with the rolling **15m-by-alert_ts** KPI logged in ``validate_once``.
+    Intended to align with the rolling **15m-by-validated_at** SLO KPI logged in ``validate_once``.
     """
     conn.execute(
         """
@@ -1281,20 +1315,20 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
 
         kpi_df = final_df[~final_df["reason"].isin(IGNORED_REASONS)]
         finalized_or_old = kpi_df[kpi_df["reason"] != "PENDING"].copy()
-        precision_15m, matches_15m, total_15m = _rolling_precision_by_alert_ts(
+        precision_15m, matches_15m, total_15m = _rolling_precision_by_validated_at(
             finalized_or_old, now_hk=now_hk, window=timedelta(minutes=15)
         )
-        precision_1h, matches_1h, total_1h = _rolling_precision_by_alert_ts(
+        precision_1h, matches_1h, total_1h = _rolling_precision_by_validated_at(
             finalized_or_old, now_hk=now_hk, window=timedelta(hours=1)
         )
         logger.info(
-            "[validator] Cumulative Precision (15m window): %.2f%% (%d/%d)",
+            "[validator] Cumulative Precision (15m window, by validated_at): %.2f%% (%d/%d)",
             precision_15m * 100,
             matches_15m,
             total_15m,
         )
         logger.info(
-            "[validator] Cumulative Precision (1h window): %.2f%% (%d/%d)",
+            "[validator] Cumulative Precision (1h window, by validated_at): %.2f%% (%d/%d)",
             precision_1h * 100,
             matches_1h,
             total_1h,
