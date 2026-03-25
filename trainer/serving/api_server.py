@@ -317,6 +317,9 @@ def _validation_to_protocol_records(df):
     """Shape validation to ML_API_PROTOCOL.md: TP as string; casino_player_id from DB when present; bet_id string; timestamps +08:00."""
     if df.empty:
         return []
+    df = df.copy()
+    if "bet_ts" not in df.columns:
+        df["bet_ts"] = None
     out = df[["alert_ts", "player_id", "bet_id", "gap_start", "result", "validated_at", "reason", "bet_ts"]].rename(columns={
         "alert_ts": "ts",
         "gap_start": "walkaway_ts",

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import deque
+from collections import Counter, deque
 import logging
 import os
 import sqlite3
@@ -79,7 +79,7 @@ def _emit_validator_perf_summary(cycle_stage_seconds: Dict[str, float]) -> None:
         p95 = float(arr.quantile(0.95))
         parts.append(f"{stage}={sec:.3f}s (p50={p50:.3f}s, p95={p95:.3f}s, n={len(arr)})")
     if parts:
-        logger.info("[validator][perf] top_hotspots: %s", "; ".join(parts))
+        logger.debug("[validator][perf] top_hotspots: %s", "; ".join(parts))
 
 VALIDATION_COLUMNS = [
     "alert_ts",
@@ -105,6 +105,7 @@ _NEW_VAL_COLS: List[Tuple[str, str]] = [
     ("canonical_id", "TEXT"),
     ("model_version", "TEXT"),
     ("casino_player_id", "TEXT"),
+    ("bet_ts", "TEXT"),  # legacy DBs created before bet_ts; API/protocol already expose bet_ts
 ]
 
 # Alerts ALTERs aligned with trainer.serving.scorer.init_state_db (validator-first DB path; Unified Plan v2 T3).
@@ -1092,6 +1093,8 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
 
     new_processed_ids: List = []
     updated_count = 0
+    # bet_id (str) -> verdict reason for one INFO summary line this cycle
+    cycle_bet_to_reason: Dict[str, str] = {}
 
     for bid in list(processed):
         key = str(bid)
@@ -1129,6 +1132,11 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
                     if newr.get("result") is not None and (newr.get("reason") != "PENDING"):
                         existing_results[key] = newr
                         updated_count += 1
+                        _pb = newr.get("bet_id")
+                        if _pb is None:
+                            _pb = saved_row.get("bet_id")
+                        if _pb is not None and pd.notna(_pb):
+                            cycle_bet_to_reason[str(_pb)] = str(newr.get("reason", "UNKNOWN"))
         except Exception:
             continue
 
@@ -1160,6 +1168,7 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
         if res.get("reason") in IGNORED_REASONS:
             existing_results[key] = res
             processed.add(row["bet_id"])
+            cycle_bet_to_reason[str(row["bet_id"])] = str(res.get("reason", "UNKNOWN"))
             new_processed_ids.append(row["bet_id"])
             continue
 
@@ -1178,7 +1187,17 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
                 existing_results[key] = res
 
             processed.add(row["bet_id"])
+            cycle_bet_to_reason[str(row["bet_id"])] = str(res.get("reason", "UNKNOWN"))
             new_processed_ids.append(row["bet_id"])
+
+    if cycle_bet_to_reason:
+        _vc = Counter(cycle_bet_to_reason.values())
+        _parts = ", ".join(f"{_r}={_vc[_r]}" for _r in sorted(_vc.keys()))
+        logger.info(
+            "[validator] This cycle: %d alert(s) verified — %s",
+            len(cycle_bet_to_reason),
+            _parts,
+        )
 
     if existing_results:
         final_df = pd.DataFrame(list(existing_results.values()))

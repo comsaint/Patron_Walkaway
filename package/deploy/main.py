@@ -82,6 +82,13 @@ logging.basicConfig(
     format="%(asctime)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# `from walkaway_ml ...` runs `trainer.training.trainer` module init, which calls
+# basicConfig(INFO) first; a second basicConfig is a no-op. Force level on root
+# and any handlers already attached so DEPLOY_LOG_LEVEL / LOGLEVEL still apply.
+_root_log = logging.getLogger()
+_root_log.setLevel(_deploy_log_level)
+for _h in _root_log.handlers:
+    _h.setLevel(_deploy_log_level)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 import numpy as np  # noqa: E402
@@ -116,7 +123,7 @@ def _emit_api_perf_summary(stage_seconds: dict[str, float]) -> None:
         p95 = float(np.percentile(arr, 95))
         parts.append(f"{stage}={sec:.3f}s (p50={p50:.3f}s, p95={p95:.3f}s, n={len(arr)})")
     if parts:
-        logging.getLogger(__name__).info("[api][perf] top_hotspots: %s", "; ".join(parts))
+        logging.getLogger(__name__).debug("[api][perf] top_hotspots: %s", "; ".join(parts))
 
 
 def _unlink_sqlite_bundle(db_path: Path) -> None:
@@ -320,6 +327,9 @@ def _validation_to_protocol_records(df):
     """Per ML_API_PROTOCOL: bet_id string, timestamps +08:00."""
     if df.empty:
         return []
+    df = df.copy()
+    if "bet_ts" not in df.columns:
+        df["bet_ts"] = None
     out = df[["alert_ts", "player_id", "bet_id", "gap_start", "result", "validated_at", "reason", "bet_ts"]].rename(columns={
         "alert_ts": "ts",
         "gap_start": "walkaway_ts",

@@ -1895,7 +1895,7 @@ def compute_track_llm_features(
             dtype = df_for_duckdb[col].dtype
             type_counts = df_for_duckdb[col].apply(type).value_counts().to_dict()
             type_counts_str = {k.__name__: int(v) for k, v in type_counts.items()}
-            logger.info(
+            logger.debug(
                 "compute_track_llm_features: %s dtype=%s type_dist=%s",
                 col,
                 dtype,
@@ -1945,7 +1945,7 @@ def compute_track_llm_features(
         if pd.api.types.is_numeric_dtype(ser):
             result_df[fid] = ser.astype(np.float32)
 
-    logger.info(
+    logger.debug(
         "compute_track_llm_features: computed %d Track LLM features for %d bets",
         len(candidates),
         len(result_df),

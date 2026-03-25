@@ -217,9 +217,11 @@ trainer/out_backtest/
 trainer/models/
 trainer/models_90d_weak/
 out/
+investigations/
 deploy_dist/
 deploy_dist.zip
 model_*/
+.tmp/
 # credential/ (PLAN: Credential folder consolidation). Ignore secrets; keep examples.
 credential/.env
 credential/mlflow.env

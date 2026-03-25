@@ -8248,3 +8248,136 @@ PYTHONPATH=. python -m pytest tests/review_risks/test_task6_validator_review_ris
 ### 下一步建議
 
 - 若 Review 表決定實裝 R2/R4/R7 等 production 加固，須同步修訂 `test_lightgbm_gpu_phase_a_review_risks_mre.py` 中對應斷言。
+
+---
+
+## Task 4（Round 3，2026-03-25）— `DEPLOY_LOG_LEVEL` 生效修補（root／handler `setLevel`）
+
+### 背景
+
+- 現場在 `.env` 設 `DEPLOY_LOG_LEVEL=DEBUG` 後仍看不到 `logger.debug` 輸出。
+- **根因**：`package/deploy/main.py` 在 `from walkaway_ml import config` 時會載入 `trainer.training.trainer`，其模組頂層已執行 `logging.basicConfig(level=INFO, ...)`；之後 deploy 的第二次 `basicConfig` 依 Python 語意為 **no-op**，root／handler 仍為 `INFO`，DEBUG 被濾掉。
+- **觀測補充**：降噪訊息為 `logger.debug("[scorer] ...")` 等，**不**會出現字面 `[DEBUG]` 前綴；`[deploy]` 來自 `print`，與層級無關。
+
+### 本輪改動檔案
+
+- [`package/deploy/main.py`](package/deploy/main.py)
+  - 在 `basicConfig` 之後對 **`logging.getLogger()`（root）** 與 **`root.handlers`** 逐一 **`setLevel(_deploy_log_level)`**，使 `DEPLOY_LOG_LEVEL`／`LOGLEVEL` 在匯入鏈搶先配置後仍生效。
+  - `werkzeug` 仍維持 `WARNING`（於上述步驟之後設定，避免 access log 洗版）。
+- [`deploy_dist/main.py`](deploy_dist/main.py) — 與上同構同步（散佈包入口）。
+- [`.cursor/plans/PATCH_20260324.md`](.cursor/plans/PATCH_20260324.md)
+  - Task 4「Deploy / Werkzeug」條目補充根因與修補說明；**Files** 清單移除過時「降噪待做」；Changelog 追加 **2026-03-25** 列。
+
+### 如何手動驗證（本輪）
+
+1. 於 `package/deploy/.env` 設 `DEPLOY_LOG_LEVEL=DEBUG`，啟動 `python package/deploy/main.py`。
+2. 確認主控台出現 `[scorer] Window:`、`[scorer] New bets since last tick` 等 **DEBUG** 內容（前綴仍為 `[scorer]`／`[validator]`，非 `[DEBUG]`）。
+3. 高頻打 API 時仍不應出現大量 werkzeug access 行。
+
+### 本輪結果（建立時）
+
+| 檢查 | 結果 |
+|------|------|
+| `python -m ruff check package/deploy/main.py deploy_dist/main.py` | ✅ All checks passed |
+| `PYTHONPATH=. python -m pytest tests/unit/test_deploy_env_example_contract.py -q` | ✅ **2 passed** |
+
+### 下一步建議
+
+- 重新建置／部署散佈包時一併帶入 `deploy_dist/main.py`；長期可評估將 `trainer.training.trainer` 頂層 `basicConfig` 改為「僅在 root 無 handler 時」再呼叫，減少與 deploy 的耦合。
+
+---
+
+## Task 4（Round 4，2026-03-25）— 商業使用者取向：`INFO` 再收斂（文件建議，待實作）
+
+### 背景
+
+- 現場回報：在 `DEPLOY_LOG_LEVEL=INFO` 下主控台仍偏吵；除已於 Round 1 降到 `DEBUG` 的訊息外，**多條仍為 `INFO` 的每輪／技術訊息**對「只看業務結果」的使用者幫助有限。
+- 本輪**僅更新計畫與 STATUS**：具體 `logger.info` → `logger.debug` 的程式修改列於 [`.cursor/plans/PATCH_20260324.md`](.cursor/plans/PATCH_20260324.md) Task 4；實作時再跑測試與手動驗證。
+
+### 商業使用者預設應在 `INFO` 看到的內容（建議準則）
+
+| 類別 | 建議保留 `INFO` | 說明 |
+|------|-----------------|------|
+| 警報 | `[scorer] Emitted N alerts` | 核心業務訊號（`N=0` 是否改 `DEBUG` 可產品決策） |
+| 驗證 KPI | `[validator] Cumulative Precision (15m/1h window)` | 與線上品質監看一致 |
+| 啟動 | `package/deploy/main.py` 的 `[deploy] ...` `print`；`run_scorer_loop` 內 **`Loaded model v=...`** 單行 | 上線／重啟可見性 |
+| 異常 | 所有 `warning`／`error`／`exception` | 不降噪 |
+
+### 建議下一輪改為 `DEBUG`（對照 `trainer/serving/scorer.py`／`validator.py`／`package/deploy/main.py`）
+
+**已完成（2026-03-25）**：`[scorer][perf]`、`[validator][perf]`、`[api][perf]` 之 `top_hotspots` 已改為 `logger.debug`（`deploy_dist/main.py` 同步）。
+
+**Scorer（每輪或技術細節）**
+
+- `Fetched %d bets, %d sessions`
+- `Single rated model loaded from model.pkl`／`Rated model loaded from rated_model.pkl`（與啟動 `Loaded model` 重複時，細節改 `DEBUG`）
+- `runtime_rated_threshold stale`／`Using runtime_rated_threshold=...`
+- `numba runtime check: available`（若確認每 process 僅一次可維持 `INFO`）
+- `Incremental input narrowed bets: ...`
+- `player_profile: N rows from local Parquet`；`player_profile not found at ...`；`player_profile unavailable`（常態洗版 → `DEBUG`；若需「首次缺檔」可見性可另做單次 `WARNING`）
+- `Canonical mapping loaded from ...`／`Canonical mapping persisted to ...`
+- `Feature rows: full_window=... rated_slice=...`
+- `No usable rows after feature engineering; sleeping`
+- `Excluded N unrated bets ...`
+
+**Validator**
+
+- `Saved %d total validations to SQLite (Updated ..., Finalized ...)`
+
+**Deploy**
+
+- （perf 熱點列已為 `DEBUG`；若仍過密可再加節流／`PERF_LOG_EVERY_N`，見 Task 4 Round 2 歷史建議）
+
+### 建議後續 DoD（實作輪）
+
+- 預設 `INFO`：每個 scorer tick + validator tick 主控台行數 **明顯低於現況**（目標：以「警報 + KPI + 異常」為主）。
+- `DEPLOY_LOG_LEVEL=DEBUG`：上述技術訊息仍可完整觀測。
+- 全量 `pytest`／`ruff` 綠燈；若測試有斷言 log 文字需同步調整。
+
+### 改動檔案（實作時預期）
+
+- [`trainer/serving/scorer.py`](trainer/serving/scorer.py)
+- [`trainer/serving/validator.py`](trainer/serving/validator.py)
+- [`package/deploy/main.py`](package/deploy/main.py)（及 [`deploy_dist/main.py`](deploy_dist/main.py) 若需同步）
+- [`.cursor/plans/PATCH_20260324.md`](.cursor/plans/PATCH_20260324.md) — 已於 Task 4 寫入對照清單
+
+---
+
+## Task 4（Round 5，2026-03-25）— 效能日誌 `[*][perf] top_hotspots` 全面 `DEBUG`
+
+### 本輪改動檔案
+
+- [`trainer/serving/scorer.py`](trainer/serving/scorer.py) — `_emit_scorer_perf_summary` 改 `logger.debug`
+- [`trainer/serving/validator.py`](trainer/serving/validator.py) — `_emit_validator_perf_summary` 改 `logger.debug`
+- [`package/deploy/main.py`](package/deploy/main.py)、[`deploy_dist/main.py`](deploy_dist/main.py) — `_emit_api_perf_summary` 改 `debug`
+- [`tests/review_risks/test_task3_phase01_review_risks_mre.py`](tests/review_risks/test_task3_phase01_review_risks_mre.py) — 契約改預期 `debug`、禁止 `info`
+- [`tests/unit/test_task3_phase3_validation_tools.py`](tests/unit/test_task3_phase3_validation_tools.py) — fixture 行內層級字樣改 `DEBUG`（解析 regex 不依賴層級）
+- [`.cursor/plans/PATCH_20260324.md`](.cursor/plans/PATCH_20260324.md) — Task 4 標註 perf 已完成；Changelog 追加
+- [`STATUS.md`](STATUS.md) — Task 4 Round 4 清單移除已實作 perf 項；本節紀錄
+
+### 本輪結果（建立時）
+
+| 檢查 | 結果 |
+|------|------|
+| `python -m ruff check trainer/serving/scorer.py trainer/serving/validator.py package/deploy/main.py deploy_dist/main.py tests/review_risks/test_task3_phase01_review_risks_mre.py tests/unit/test_task3_phase3_validation_tools.py` | ✅ All checks passed |
+| `PYTHONPATH=. python -m pytest tests/review_risks/test_task3_phase01_review_risks_mre.py tests/unit/test_task3_phase3_validation_tools.py -q` | ✅ **9 passed** |
+
+---
+
+## Task 4（Round 6，2026-03-25）— Track LLM／scorer 降噪 + validator 本週期驗證摘要（INFO）
+
+### 本輪改動
+
+- [`trainer/features/features.py`](trainer/features/features.py) — `compute_track_llm_features` 之 dtype 診斷與「computed N features for M bets」由 `INFO` 改 `DEBUG`。
+- [`trainer/serving/scorer.py`](trainer/serving/scorer.py) — `[scorer] Canonical mapping loaded from ...`、`[scorer] Feature rows: ...` 改 `DEBUG`。
+- [`trainer/serving/validator.py`](trainer/serving/validator.py) — 本週期內每筆新完成驗證（含 PENDING 升級、新列入 processed）彙總為單行 **`[validator] This cycle: K alert(s) verified — MATCH=a, MISS=b, ...`**（`INFO`）；以 `bet_id` 去重，理由鍵依 `reason` 欄排序。
+
+### 本輪結果（建立時）
+
+| 檢查 | 結果 |
+|------|------|
+| `python -m ruff check trainer/features/features.py trainer/serving/scorer.py trainer/serving/validator.py` | ✅ All checks passed |
+| `PYTHONPATH=. python -m pytest tests/integration -q` | ✅ **147 passed** |
+| `PYTHONPATH=. python -m pytest tests/review_risks/test_validator_phase2_incremental_review_risks_mre.py tests/review_risks/test_unified_plan_v2_t3_validator_metrics_review.py tests/integration/test_validator_datetime_naive_hk.py -q` | ✅ **22 passed** |
+
+**補充（2026-03-25）**：滾動 **Cumulative Precision（15m/1h）** 與 `validator_metrics` 之時間窗由 **`alert_ts`（發報/score 時間）** 改為以 **`bet_ts`（下注時間）** 為主，`bet_ts` 缺失時退回 `alert_ts`；日誌字串為 `(15m/1h window, by bet_ts)`。見 `trainer/serving/validator.py` 之 `_rolling_precision_by_bet_ts` 與 `tests/unit/test_validator_rolling_precision_bet_ts.py`。

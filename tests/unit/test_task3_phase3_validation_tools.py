@@ -14,8 +14,8 @@ def test_compare_p95_parses_and_computes_improvement(tmp_path: Path) -> None:
     baseline.write_text(
         "\n".join(
             [
-                "2026-03-24 INFO [scorer][perf] top_hotspots: feature_engineering=1.000s (p50=1.000s, p95=1.200s, n=20); sqlite=0.400s (p50=0.300s, p95=0.500s, n=20)",
-                "2026-03-24 INFO [scorer][perf] top_hotspots: feature_engineering=1.100s (p50=1.000s, p95=1.300s, n=21)",
+                "2026-03-24 DEBUG [scorer][perf] top_hotspots: feature_engineering=1.000s (p50=1.000s, p95=1.200s, n=20); sqlite=0.400s (p50=0.300s, p95=0.500s, n=20)",
+                "2026-03-24 DEBUG [scorer][perf] top_hotspots: feature_engineering=1.100s (p50=1.000s, p95=1.300s, n=21)",
             ]
         ),
         encoding="utf-8",
@@ -23,8 +23,8 @@ def test_compare_p95_parses_and_computes_improvement(tmp_path: Path) -> None:
     candidate.write_text(
         "\n".join(
             [
-                "2026-03-24 INFO [scorer][perf] top_hotspots: feature_engineering=0.800s (p50=0.700s, p95=0.900s, n=20); sqlite=0.300s (p50=0.250s, p95=0.350s, n=20)",
-                "2026-03-24 INFO [scorer][perf] top_hotspots: feature_engineering=0.850s (p50=0.750s, p95=1.000s, n=21)",
+                "2026-03-24 DEBUG [scorer][perf] top_hotspots: feature_engineering=0.800s (p50=0.700s, p95=0.900s, n=20); sqlite=0.300s (p50=0.250s, p95=0.350s, n=20)",
+                "2026-03-24 DEBUG [scorer][perf] top_hotspots: feature_engineering=0.850s (p50=0.750s, p95=1.000s, n=21)",
             ]
         ),
         encoding="utf-8",

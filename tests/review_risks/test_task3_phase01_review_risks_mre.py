@@ -41,13 +41,13 @@ class TestRisk1ApiTimingUsesWallClock(unittest.TestCase):
         )
 
 
-class TestRisk2ApiPerfLogLevelNoise(unittest.TestCase):
-    """Risk #2: API perf summary logs at INFO on every request."""
+class TestRisk2ApiPerfLogLevelDebug(unittest.TestCase):
+    """Contract: API perf summary uses DEBUG so default INFO consoles stay quiet."""
 
-    def test_api_perf_logs_at_info(self) -> None:
+    def test_api_perf_logs_at_debug(self) -> None:
         text = _deploy_text()
-        self.assertIn('info("[api][perf] top_hotspots: %s"', text)
-        self.assertNotIn('debug("[api][perf] top_hotspots: %s"', text)
+        self.assertIn('debug("[api][perf] top_hotspots: %s"', text)
+        self.assertNotIn('info("[api][perf] top_hotspots: %s"', text)
 
 
 class TestRisk3ApiTimingSharedStateNoLock(unittest.TestCase):

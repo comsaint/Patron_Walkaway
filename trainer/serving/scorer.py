@@ -143,10 +143,44 @@ def _emit_scorer_perf_summary(cycle_stage_seconds: Dict[str, float]) -> None:
         p95 = float(np.percentile(arr, 95))
         parts.append(f"{stage}={sec:.3f}s (p50={p50:.3f}s, p95={p95:.3f}s, n={len(arr)})")
     if parts:
-        logger.info("[scorer][perf] top_hotspots: %s", "; ".join(parts))
+        logger.debug("[scorer][perf] top_hotspots: %s", "; ".join(parts))
 
 # ── Constants ────────────────────────────────────────────────────────────────
 HK_TZ = ZoneInfo(config.HK_TZ)
+# ClickHouse / chunk Parquets use UTC-aware timestamps for payout + ETL insert
+# (see `data/gmwds_t_bet.parquet`: timestamp[ms, tz=UTC]).
+UTC_TZ = ZoneInfo("UTC")
+
+
+def _meta_iso_to_hk(val: object) -> Optional[pd.Timestamp]:
+    """Parse SQLite meta timestamps written by scorer (window_end, watermarks).
+
+    ISO strings from ``datetime.now(HK_TZ).isoformat()`` include an offset.
+    legacy naive strings are treated as **Hong Kong local** wall time.
+    """
+    if val is None:
+        return None
+    t = pd.Timestamp(val)
+    if pd.isna(t):
+        return None
+    if t.tzinfo is None:
+        return t.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+    return t.tz_convert(HK_TZ)
+
+
+def _warehouse_timestamp_series_to_hk(series: pd.Series) -> pd.Series:
+    """Normalize warehouse bet timestamps to tz-aware HK (single instant semantics).
+
+    Parquet samples store ``payout_complete_dtm`` / ``__etl_insert_Dtm`` as UTC.
+    Some drivers may return naive datetimes; those are interpreted as UTC, not HK,
+    before converting to HK for comparisons with ``now_hk`` and SQLite meta values.
+    """
+    ts = pd.to_datetime(series, errors="coerce")
+    if ts.empty:
+        return ts
+    if ts.dt.tz is None:
+        ts = ts.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
+    return ts.dt.tz_convert(HK_TZ)
 BASE_DIR = Path(__file__).resolve().parent.parent  # trainer/ (serving lives under trainer)
 PROJECT_ROOT = BASE_DIR.parent
 # Treat empty or whitespace-only env as unset (STATUS Code Review 項目 4 §1; align with DATA_DIR).
@@ -171,6 +205,10 @@ UNRATED_VOLUME_LOG: bool = bool(getattr(config, "UNRATED_VOLUME_LOG", True))
 SHAP_TOP_K = 3
 
 # New alert columns added in Phase 1 (+ casino_player_id for ML API protocol)
+_VALIDATION_RESULTS_MIGRATION_COLS: List[Tuple[str, str]] = [
+    ("bet_ts", "TEXT"),
+]
+
 _NEW_ALERT_COLS: List[Tuple[str, str]] = [
     ("canonical_id", "TEXT"),
     ("is_rated_obs", "INTEGER"),
@@ -349,6 +387,7 @@ def fetch_recent_data(
             is_back_bet,
             base_ha,
             bet_type,
+            __etl_insert_Dtm,
             payout_complete_dtm,
             COALESCE(gaming_day, toDate(payout_complete_dtm)) AS gaming_day,
             session_id,
@@ -407,14 +446,15 @@ def fetch_recent_data(
     if len(bets) != before:
         logger.debug("[scorer] filtered zero-wager bets: %d->%d", before, len(bets))
 
-    # Normalize payout_complete_dtm to tz-aware HK time so Track LLM cutoff_time
-    # (now_hk, tz-aware) stays consistent with scoring window timestamps.
+    # Align with warehouse: UTC instants -> tz-aware HK (see _warehouse_timestamp_series_to_hk).
     if not bets.empty and "payout_complete_dtm" in bets.columns:
-        pcd = pd.to_datetime(bets["payout_complete_dtm"])
-        if pcd.dt.tz is None:
-            bets["payout_complete_dtm"] = pcd.dt.tz_localize(HK_TZ)
-        else:
-            bets["payout_complete_dtm"] = pcd.dt.tz_convert(HK_TZ)
+        bets["payout_complete_dtm"] = _warehouse_timestamp_series_to_hk(
+            bets["payout_complete_dtm"]
+        )
+    if not bets.empty and "__etl_insert_Dtm" in bets.columns:
+        bets["__etl_insert_Dtm"] = _warehouse_timestamp_series_to_hk(
+            bets["__etl_insert_Dtm"]
+        )
 
     sessions = client.query_df(session_query, parameters=params)
     logger.info("[scorer] Fetched %d bets, %d sessions", len(bets), len(sessions))
@@ -515,6 +555,15 @@ def init_state_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_validation_alert_ts "
             "ON validation_results(alert_ts)"
         )
+        existing_validation_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(validation_results)").fetchall()
+        }
+        for col_name, col_type in _VALIDATION_RESULTS_MIGRATION_COLS:
+            if col_name not in existing_validation_cols:
+                conn.execute(
+                    f"ALTER TABLE validation_results ADD COLUMN {col_name} {col_type}"
+                )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS processed_alerts (
@@ -668,7 +717,18 @@ def _get_last_processed_end(conn: sqlite3.Connection) -> Optional[pd.Timestamp]:
     row = conn.execute(
         "SELECT value FROM meta WHERE key='last_processed_end'"
     ).fetchone()
-    return pd.to_datetime(row[0]) if row else None
+    return _meta_iso_to_hk(row[0]) if row else None
+
+
+def _get_last_processed_etl_insert(conn: sqlite3.Connection) -> Optional[pd.Timestamp]:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='last_processed_etl_insert'"
+    ).fetchone()
+    if row:
+        # Watermark max(__etl_insert_Dtm) is written from HK-zoned Timestamps.
+        return _meta_iso_to_hk(row[0])
+    # Backward compatibility: bootstrap from legacy watermark if present.
+    return _get_last_processed_end(conn)
 
 
 def _set_last_processed_end(conn: sqlite3.Connection, dt: datetime) -> None:
@@ -679,6 +739,32 @@ def _set_last_processed_end(conn: sqlite3.Connection, dt: datetime) -> None:
         """,
         (dt.isoformat(),),
     )
+
+
+def _set_last_processed_etl_insert(conn: sqlite3.Connection, dt: datetime) -> None:
+    conn.execute(
+        """
+        INSERT INTO meta(key, value) VALUES ('last_processed_etl_insert', ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (dt.isoformat(),),
+    )
+
+
+def _effective_incremental_cursor(bets: pd.DataFrame) -> pd.Series:
+    """Use __etl_insert_Dtm as incremental cursor; fallback to payout_complete_dtm.
+
+    Assumes ``fetch_recent_data`` already HK-normalized both columns when present;
+    this path repeats the same UTC→HK contract so unit tests / stubs stay safe.
+    """
+    if "__etl_insert_Dtm" in bets.columns:
+        cursor = _warehouse_timestamp_series_to_hk(bets["__etl_insert_Dtm"])
+    else:
+        cursor = pd.Series(pd.NaT, index=bets.index)
+    if "payout_complete_dtm" in bets.columns:
+        payout_ts = _warehouse_timestamp_series_to_hk(bets["payout_complete_dtm"])
+        cursor = cursor.fillna(payout_ts)
+    return cursor
 
 
 def prune_old_state(
@@ -735,9 +821,10 @@ def update_state_with_new_bets(
     bets: pd.DataFrame,
     window_end: datetime,
 ) -> pd.DataFrame:
-    last_processed = _get_last_processed_end(conn)
+    last_processed = _get_last_processed_etl_insert(conn)
+    effective_cursor = _effective_incremental_cursor(bets)
     new_bets = (
-        bets[bets["payout_complete_dtm"] > last_processed]
+        bets[effective_cursor > last_processed]
         if last_processed is not None
         else bets
     )
@@ -754,6 +841,10 @@ def update_state_with_new_bets(
             group.get("player_id", pd.Series([None])).iloc[0],
             group.get("table_id", pd.Series([None])).iloc[0],
         )
+    max_cursor = effective_cursor.max()
+    if pd.notna(max_cursor):
+        _set_last_processed_etl_insert(conn, pd.Timestamp(max_cursor).to_pydatetime())
+    # Keep legacy key updated for rollback compatibility.
     _set_last_processed_end(conn, window_end)
     conn.commit()
     return new_bets
@@ -1630,6 +1721,49 @@ def refresh_alert_history(
     return alert_history
 
 
+# DB-wide alerts/hour uses span of reference times; floor avoids ÷0 when all share one instant.
+_MIN_ALERT_RATE_DB_SPAN_HOURS = 1.0
+
+
+def _avg_alerts_per_hour_db_by_bet_ts(conn: sqlite3.Connection) -> Optional[float]:
+    """Alerts per hour over all rows in ``alerts``: ``count / span_hours``.
+
+    Reference time per row is ``bet_ts`` when present, else ``ts`` (alert/score time).
+    ``span_hours`` is ``max(ref) - min(ref)`` in hours, at least
+    ``_MIN_ALERT_RATE_DB_SPAN_HOURS``. Returns ``None`` if the table is empty or times
+    are unusable.
+    """
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*), MIN(COALESCE(bet_ts, ts)), MAX(COALESCE(bet_ts, ts)) FROM alerts"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row or int(row[0]) <= 0:
+        return None
+    n_total, tmin_s, tmax_s = int(row[0]), row[1], row[2]
+    if not tmin_s or not tmax_s:
+        return None
+    try:
+        t_min = pd.to_datetime(tmin_s, errors="coerce")
+        t_max = pd.to_datetime(tmax_s, errors="coerce")
+    except Exception:
+        return None
+    if pd.isna(t_min) or pd.isna(t_max):
+        return None
+    if t_min.tzinfo is None:
+        t_min = t_min.tz_localize(HK_TZ)
+    else:
+        t_min = t_min.tz_convert(HK_TZ)
+    if t_max.tzinfo is None:
+        t_max = t_max.tz_localize(HK_TZ)
+    else:
+        t_max = t_max.tz_convert(HK_TZ)
+    delta_h = (t_max - t_min).total_seconds() / 3600.0
+    span_h = max(delta_h, _MIN_ALERT_RATE_DB_SPAN_HOURS)
+    return float(n_total) / span_h
+
+
 def append_alerts(conn: sqlite3.Connection, alerts_df: pd.DataFrame) -> None:
     """Upsert alert rows; handles both legacy and new Phase-1 columns."""
 
@@ -1810,7 +1944,7 @@ def score_once(
                     _df = pd.read_parquet(CANONICAL_MAPPING_PARQUET)
                     if set(_df.columns) >= {"player_id", "canonical_id"}:
                         canonical_map = _df
-                        logger.info(
+                        logger.debug(
                             "[scorer] Canonical mapping loaded from %s (cutoff %s)",
                             CANONICAL_MAPPING_PARQUET, _cutoff_str,
                         )
@@ -1932,7 +2066,7 @@ def score_once(
             )
 
     features_all["is_rated"] = features_all["canonical_id"].isin(rated_canonical_ids)
-    logger.info(
+    logger.debug(
         "[scorer] Feature rows: full_window=%d rated_slice(LLM/profile path)=%d",
         n_features_full_pre_rated_slice,
         len(features_all),
@@ -2096,7 +2230,15 @@ def score_once(
     t_sqlite_alert = time.perf_counter()
     append_alerts(conn, alert_candidates)
     alert_history.update(alert_candidates["bet_id"].astype(str).tolist())
-    logger.info("[scorer] Emitted %d alerts", len(alert_candidates))
+    _rate = _avg_alerts_per_hour_db_by_bet_ts(conn)
+    if _rate is not None:
+        logger.info(
+            "[scorer] Emitted %d alerts; avg. number of alerts per hour = %.2f",
+            len(alert_candidates),
+            _rate,
+        )
+    else:
+        logger.info("[scorer] Emitted %d alerts", len(alert_candidates))
     conn.commit()
     sqlite_seconds += time.perf_counter() - t_sqlite_alert
     cycle_stage_seconds["sqlite"] = sqlite_seconds
