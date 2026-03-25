@@ -815,6 +815,16 @@ def validate_alert_row(
         canonical_id = str(cid_raw)
 
     model_version = row.get("model_version")
+    casino_player_id = _norm_casino_player_id(row.get("casino_player_id"))
+    scored_at = row.get("scored_at")
+    if pd.isna(scored_at):
+        scored_at_hk = score_ts
+    else:
+        scored_at_hk = pd.to_datetime(scored_at)
+        if scored_at_hk.tzinfo is None:
+            scored_at_hk = scored_at_hk.tz_localize(HK_TZ)
+        else:
+            scored_at_hk = scored_at_hk.tz_convert(HK_TZ)
 
     now_hk = datetime.now(HK_TZ)
 
@@ -828,7 +838,7 @@ def validate_alert_row(
             "bet_id": bet_id,
             "score": row.get("score"),
             "player_id": int(player_id) if pd.notna(player_id) else None,
-            "casino_player_id": _norm_casino_player_id(row.get("casino_player_id")),
+            "casino_player_id": casino_player_id,
             "canonical_id": canonical_id,
             "table_id": row.get("table_id"),
             "position_idx": row.get("position_idx"),
@@ -858,8 +868,8 @@ def validate_alert_row(
     # Otherwise find_gap_within_window(..., []) would treat "no bets in window" as a LABEL_LOOKAHEAD_MIN gap and we'd falsely MATCH.
     if not bet_list:
         logger.warning(
-            "[validator] No bet data for canonical_id=%s player_id=%s bet_id=%s — leaving PENDING (cannot verify late arrivals)",
-            canonical_id, player_id, bet_id,
+            "[validator] No bet data for casino_player_id=%s player_id=%s bet_id=%s bet_ts=%s scored_at=%s — leaving PENDING (cannot verify late arrivals)",
+            casino_player_id, player_id, bet_id, bet_ts.isoformat(), scored_at_hk.isoformat(),
         )
         res_base.update({"result": None, "reason": "PENDING"})
         return res_base
