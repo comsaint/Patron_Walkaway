@@ -1322,13 +1322,13 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
             finalized_or_old, now_hk=now_hk, window=timedelta(hours=1)
         )
         logger.info(
-            "[validator] Cumulative Precision (15m window, by validated_at): %.2f%% (%d/%d)",
+            "[validator] Precision in recent 15m (by validate time): %.2f%% (%d/%d)",
             precision_15m * 100,
             matches_15m,
             total_15m,
         )
         logger.info(
-            "[validator] Cumulative Precision (1h window, by validated_at): %.2f%% (%d/%d)",
+            "[validator] Precision in recent 1h (by validate time): %.2f%% (%d/%d)",
             precision_1h * 100,
             matches_1h,
             total_1h,
