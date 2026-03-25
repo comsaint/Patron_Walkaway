@@ -57,6 +57,21 @@ logger = logging.getLogger(__name__)
 _PERF_WINDOW_SIZE = 200
 _VALIDATOR_STAGE_TIMINGS: Dict[str, deque[float]] = {}
 
+# Task 9 warnings: avoid log spam on misconfiguration.
+_WARNED_TASK9_LOOKBACK_TOO_SMALL = False
+_WARNED_TASK9_LOOKBACK_CLAMPED = False
+
+
+def _safe_int_config(name: str, default: int, *, min_value: int) -> int:
+    """Parse int config with fallback; never raise."""
+    try:
+        raw = getattr(config, name, default)
+        v = int(raw)  # accepts numeric strings too
+    except Exception:
+        logger.warning("[validator] Invalid %s=%r; using default %s", name, getattr(config, name, None), default)
+        v = int(default)
+    return max(int(min_value), v)
+
 
 def _record_validator_stage_timing(stage: str, seconds: float) -> None:
     bucket = _VALIDATOR_STAGE_TIMINGS.setdefault(stage, deque(maxlen=_PERF_WINDOW_SIZE))
@@ -1089,8 +1104,55 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False) -> Non
                 "Validator requires ClickHouse to fetch bets/sessions for validation; "
                 "get_clickhouse_client is unavailable. Run as package (e.g. python -m trainer.validator)."
             )
-        fetch_start = effective_ts[pending.index].min() - timedelta(hours=1)
+        pending_min_ts = effective_ts[pending.index].min()
+        pre_context_min = _safe_int_config("VALIDATOR_FETCH_PRE_CONTEXT_MINUTES", 60, min_value=0)
+        max_lookback_min = _safe_int_config("VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES", 180, min_value=1)
+        cap_min = _safe_int_config("VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES_CAP", 24 * 60, min_value=1)
+        if max_lookback_min > cap_min:
+            global _WARNED_TASK9_LOOKBACK_CLAMPED
+            if not _WARNED_TASK9_LOOKBACK_CLAMPED:
+                logger.warning(
+                    "[validator] VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES=%s exceeds cap %s; clamping",
+                    max_lookback_min,
+                    cap_min,
+                )
+                _WARNED_TASK9_LOOKBACK_CLAMPED = True
+            max_lookback_min = cap_min
+
+        policy_late_min = int(config.LABEL_LOOKAHEAD_MIN + max(0, freshness_buffer_min))
+        ext_wait_min = _safe_int_config("VALIDATOR_EXTENDED_WAIT_MINUTES", 15, min_value=0)
+        required_min = policy_late_min + ext_wait_min + pre_context_min
+        if max_lookback_min < required_min:
+            global _WARNED_TASK9_LOOKBACK_TOO_SMALL
+            if not _WARNED_TASK9_LOOKBACK_TOO_SMALL:
+                logger.warning(
+                    "[validator] VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES=%s too small for policy (%s) + extended_wait (%s) + pre_context (%s); using %s",
+                    max_lookback_min,
+                    policy_late_min,
+                    ext_wait_min,
+                    pre_context_min,
+                    required_min,
+                )
+                _WARNED_TASK9_LOOKBACK_TOO_SMALL = True
+            max_lookback_min = required_min
+
+        candidate_start = pending_min_ts - timedelta(minutes=pre_context_min)
+        hard_floor = now_hk - timedelta(minutes=max_lookback_min)
+        fetch_start = max(candidate_start, hard_floor)
         fetch_end = now_hk
+        logger.debug(
+            "[validator] CH bet fetch window: pending_min_ts=%s candidate_start=%s hard_floor=%s fetch_start=%s fetch_end=%s (policy_late_min=%s ext_wait_min=%s pre_context_min=%s max_lookback_min=%s cap_min=%s)",
+            pending_min_ts,
+            candidate_start,
+            hard_floor,
+            fetch_start,
+            fetch_end,
+            policy_late_min,
+            ext_wait_min,
+            pre_context_min,
+            max_lookback_min,
+            cap_min,
+        )
         try:
             t_clickhouse = time.perf_counter()
             # R41: errors propagate so the cycle aborts rather than producing false MISSes

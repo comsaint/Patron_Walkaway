@@ -446,15 +446,18 @@ def fetch_recent_data(
     if len(bets) != before:
         logger.debug("[scorer] filtered zero-wager bets: %d->%d", before, len(bets))
 
-    # Align with warehouse: UTC instants -> tz-aware HK (see _warehouse_timestamp_series_to_hk).
+    # Align with warehouse: UTC instants -> tz-aware HK.
+    # Some drivers return naive datetimes; interpret as UTC then tz_convert(HK_TZ).
     if not bets.empty and "payout_complete_dtm" in bets.columns:
-        bets["payout_complete_dtm"] = _warehouse_timestamp_series_to_hk(
-            bets["payout_complete_dtm"]
-        )
+        _pc = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce")
+        if getattr(_pc.dt, "tz", None) is None:
+            _pc = _pc.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        bets["payout_complete_dtm"] = _pc.dt.tz_convert(HK_TZ)
     if not bets.empty and "__etl_insert_Dtm" in bets.columns:
-        bets["__etl_insert_Dtm"] = _warehouse_timestamp_series_to_hk(
-            bets["__etl_insert_Dtm"]
-        )
+        _etl = pd.to_datetime(bets["__etl_insert_Dtm"], errors="coerce")
+        if getattr(_etl.dt, "tz", None) is None:
+            _etl = _etl.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        bets["__etl_insert_Dtm"] = _etl.dt.tz_convert(HK_TZ)
 
     sessions = client.query_df(session_query, parameters=params)
     logger.info("[scorer] Fetched %d bets, %d sessions", len(bets), len(sessions))
@@ -1979,7 +1982,7 @@ def score_once(
     new_bet_ids_all = set(new_bets["bet_id"].astype(str))
     new_ids = new_bet_ids_all
     _csw = getattr(config, "SCORER_COLD_START_WINDOW_HOURS", None)
-    if _csw is not None and float(_csw) > 0:
+    if _csw is not None and float(_csw) > 0 and "payout_complete_dtm" in new_bets.columns:
         _csw_f = min(float(_csw), float(getattr(config, "SCORER_LOOKBACK_HOURS_MAX", 8760)))
         _floor_ts = pd.Timestamp(now_hk - timedelta(hours=_csw_f))
         _pay = pd.to_datetime(new_bets["payout_complete_dtm"], errors="coerce")
@@ -1995,6 +1998,10 @@ def score_once(
             _csw_f,
             len(new_ids),
             len(new_bets),
+        )
+    elif _csw is not None and float(_csw) > 0 and "payout_complete_dtm" not in new_bets.columns:
+        logger.debug(
+            "[scorer] Payout-age cap configured but payout_complete_dtm missing from new_bets; skipping age filter"
         )
     n_features_full_pre_rated_slice = len(features_all)
     _telemetry_new = features_all[features_all["bet_id"].astype(str).isin(new_bet_ids_all)]

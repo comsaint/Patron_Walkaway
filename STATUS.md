@@ -8416,3 +8416,148 @@ PYTHONPATH=. python -m pytest tests/review_risks/test_task6_validator_review_ris
 | 檢查 | 結果 |
 |------|------|
 | `python -m pytest tests/integration/test_validator_datetime_naive_hk.py -q` | ✅ **5 passed** |
+
+---
+
+## Task 9（進行中，2026-03-25）— Validator ClickHouse bet 拉取視窗：最舊待驗時間窗 + 上限保護（DEC-037）
+
+### 本輪改動
+
+- **`trainer/core/config.py`**
+  - 新增 `VALIDATOR_FETCH_PRE_CONTEXT_MINUTES`（預設 60）
+  - 新增 `VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES`（預設 180）
+- **`trainer/serving/validator.py`**
+  - `validate_once` 將固定 `fetch_start = min(effective_ts[pending]) - 1h` 改為：
+    - `pending_min_ts = min(effective_ts[pending])`
+    - `candidate_start = pending_min_ts - pre_context_min`
+    - `hard_floor = now_hk - max_lookback_min`
+    - `fetch_start = max(candidate_start, hard_floor)`
+  - 增加 `DEBUG`：印出 `pending_min_ts/candidate_start/hard_floor/fetch_start/fetch_end` 與 policy 參數。
+  - 若 `max_lookback_min < (policy_late_min + pre_context_min)`，會 `WARNING` 並提升使用值（避免配置自相矛盾）。
+- **`tests/integration/test_validator_task9_fetch_window_old_bet_ts.py`**
+  - 新增整合測試：模擬 `bet_ts=2h ago`、`ts=scored recently`，確保 validator 的 CH 拉取視窗起點 **<= bet_ts**，且可寫入 `validation_results`（非 PENDING）。
+
+### 手動驗證建議（production / staging）
+
+1. 將 deploy 端 `DEPLOY_LOG_LEVEL=DEBUG`（或僅開 `trainer.serving.validator`）跑 1–2 個 validator tick。
+2. 找到 `[validator] CH bet fetch window: ... fetch_start=...`：
+   - 觀察 `fetch_start` 是否能覆蓋最舊待驗 `bet_ts`（尤其是「alert 新但 bet_ts 舊」案例）。
+3. 觀察 `No bet data ... leaving PENDING` 的比例是否顯著下降；若仍大量出現，優先比對：
+   - `fetch_start/fetch_end` 是否涵蓋該筆 bet 的 `payout_complete_dtm`
+   - `cid_to_pids` 是否包含該玩家（canonical_id/player_id mapping）
+
+### 本輪結果（建立時）
+
+| 檢查 | 結果 |
+|------|------|
+| `python -m pytest tests/integration/test_validator_task9_fetch_window_old_bet_ts.py -q` | ✅ **1 passed** |
+| `python -m pytest tests/integration/test_validator_datetime_naive_hk.py tests/integration/test_scorer.py -q` | ✅ **11 passed** |
+
+### 下一步建議
+
+- 依 production log 觀測調參：
+  - `VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES`：若仍遇到舊 bet_ts 漏資料，先加大；若 CH 壓力偏高再下調並找出積壓來源（flush/重跑/延遲發報）。
+  - `VALIDATOR_FETCH_PRE_CONTEXT_MINUTES`：若 `last_bet_before` 上下文常缺，可適度加大；若成本過高可下調。
+- 若要嚴格對齊「最遲 45–47 分鐘定案」政策，需另案檢視 `VALIDATOR_EXTENDED_WAIT_MINUTES=15` 是否會使部分路徑延後至 `bet_ts + 60m`（目前仍可能）。
+
+### Code Review（Task 9 目前變更，2026-03-25）
+
+以下僅針對本輪 Task 9 相關改動（`trainer/core/config.py`、`trainer/serving/validator.py`、`tests/integration/test_validator_task9_fetch_window_old_bet_ts.py`）提出最可能風險，**不重寫整套**。
+
+#### 1. [邊界條件 / 潛在 Bug] `int(getattr(...))` 解析不防呆，非整數配置會直接拋錯中止 validator cycle
+
+- **問題**：`pre_context_min = int(getattr(config, ...))` 與 `max_lookback_min = int(getattr(config, ...))` 若被環境覆寫為非法字串（例如 `"60m"`、`""`、`None`）會拋 `ValueError/TypeError`，目前不在局部 try/except 內，可能導致整輪驗證中斷。
+- **具體修改建議**：新增小型安全解析 helper（如 `_safe_int(name, default, min_value)`），對非法值做 fallback + warning，不讓 cycle 中斷。
+- **希望新增的測試**：單元測試 monkeypatch `config.VALIDATOR_FETCH_PRE_CONTEXT_MINUTES = "bad"`、`VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES = None`，斷言 `validate_once` 不拋錯、並使用預設值繼續執行。
+
+#### 2. [政策一致性] `required_min` 只用 `LABEL_LOOKAHEAD + freshness`，未納入 `VALIDATOR_EXTENDED_WAIT_MINUTES`
+
+- **問題**：Task 9 設計目標有「最遲 45–47 分鐘」政策，但程式實際仍保留 `VALIDATOR_EXTENDED_WAIT_MINUTES=15` 路徑，某些 case 可能到 `bet_ts + 60m` 才 finalize。`required_min` 若不含 extended wait，可能低估查詢窗需求，造成「政策/實作不一致」。
+- **具體修改建議**：明確二選一：
+  1) 若政策定案是 47 分鐘，將 extended wait 納入收斂（設 0 或在邏輯上 clamp）；  
+  2) 若保留 extended wait，`required_min` 公式應納入該值並同步文件。
+- **希望新增的測試**：整合測試覆蓋 `VALIDATOR_EXTENDED_WAIT_MINUTES>0` 情境，驗證 fetch window 與 finalize 時間點符合預期政策（47 或 60 其一，需先定義）。
+
+#### 3. [效能 / 觀測] 每輪 misconfig warning 可能洗版，且缺少 `No bet data` 比率統計
+
+- **問題**：當 `max_lookback_min < required_min` 時，每輪都會 warning，長跑會洗版；另外 Task 9 關鍵 KPI（`No bet data` 降幅）尚未有每輪比例統計，難以量化調參效果。
+- **具體修改建議**：
+  - misconfig warning 改 one-shot（進程內只報一次）或節流；
+  - 增加每輪 DEBUG 指標：`no_bet_data_count / pending_count` 與近 N 輪移動平均。
+- **希望新增的測試**：  
+  1) 單元測試重複呼叫 `validate_once`，斷言 misconfig warning 不會每輪重複；  
+  2) 單元測試 `No bet data` 計數輸出格式與分母正確。
+
+#### 4. [效能上限] `VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES` 缺少硬上界 guard，誤設可能放大 CH 掃描成本
+
+- **問題**：目前僅有下界保護，若配置為極大值（例如數天）會顯著擴大 ClickHouse 掃描範圍，對筆電與生產共用資源都有壓力風險。
+- **具體修改建議**：加一個可見的上界（例如 `VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES_CAP`，預設 24h）或在超過建議值時 warning 並 clamp。
+- **希望新增的測試**：配置極大 lookback（如 100000）時，斷言實際 fetch_start 被 clamp 到上界，且有對應 warning。
+
+#### 5. [測試覆蓋缺口] 目前新測試只覆蓋「成功路徑」，尚未覆蓋 hard-floor 裁切與 timezone 邊界
+
+- **問題**：`test_validator_task9_fetch_window_old_bet_ts` 驗證了「2h 舊 bet_ts 可覆蓋」，但未測 `candidate_start < hard_floor` 的裁切分支，以及 naive/aware 時區混合輸入時窗口計算是否一致。
+- **具體修改建議**：補兩個 case：
+  - `candidate_start` 早於 `hard_floor` 時，`fetch_start` 應等於 `hard_floor`；
+  - `bet_ts` naive 與 aware 混合輸入時，`fetch_start` 仍是 HK-aware 且比較正確。
+- **希望新增的測試**：新增 integration 或 unit 測試覆蓋上述兩分支，並檢查 `fetch_start.tzinfo` 與值域。
+
+---
+
+## Task 9 Review 風險點 → MRE／契約測試（2026-03-25｜tests-only）
+
+- **新增檔案**：`tests/review_risks/test_validator_task9_fetch_window_review_risks_mre.py`
+- **目的**：把 Task 9 review 的高機率風險點轉為「可回歸的靜態契約測試」，**不修改 production code**。
+- **覆蓋項目**（均為文件化現況之契約）：
+  1. `int(getattr(...))` 缺少 local try/except fallback（非法配置可能炸整輪）
+  2. `required_min` 未納入 `VALIDATOR_EXTENDED_WAIT_MINUTES`（政策一致性風險）
+  3. misconfig warning 無 one-shot/throttle guard（可能洗版）
+  4. config 無 `MAX_LOOKBACK` cap 常數（誤設會放大 CH 壓力）
+  5. hard-floor 分支尚無 dedicated 測試檔（命名契約）
+  6. Task 9 config 目前為靜態常數、未走 env 解析（運維覆寫風險）
+
+### 執行方式
+
+```bash
+python -m pytest -q tests/review_risks/test_validator_task9_fetch_window_review_risks_mre.py
+```
+
+### 本輪結果（建立時）
+
+- ✅ `6 passed in 0.21s`
+
+---
+
+## Task 9（進行中，2026-03-25）— Task 9 加固：安全解析 / lookback cap / warn-once / extended-wait 納入 required_min
+
+### 本輪改動
+
+- **`trainer/serving/validator.py`**
+  - 加入 `_safe_int_config(...)`：避免 `int(getattr(...))` 因非法配置導致整輪 validator 中斷（fallback + warning）。
+  - 新增 `VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES_CAP` 支援，並對過大 `max_lookback_min` 做 clamp（warn-once）。
+  - misconfig warning（`max_lookback_min < required_min`）改 **warn-once**，避免每輪洗版。
+  - `required_min` 改為 `policy_late_min + VALIDATOR_EXTENDED_WAIT_MINUTES + pre_context_min`，避免低估查詢窗需求。
+  - `DEBUG` 観測列補上 `ext_wait_min` / `cap_min`。
+- **`trainer/core/config.py`**
+  - 新增 `VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES_CAP = 1440`（預設 24h 硬上限）。
+  - 修正 `SCORER_COLD_START_WINDOW_HOURS` 預設型別為 `float`（`2.0`），符合型別契約測試。
+- **`trainer/serving/scorer.py`**
+  - `fetch_recent_data`：在函式本體內明確做 `tz_localize(UTC_TZ) -> tz_convert(HK_TZ)` 正規化，對齊時區契約測試。
+  - `score_once`：當 `new_bets` 缺 `payout_complete_dtm`（例如被 mock 的 update_state 回傳簡化欄位）時，跳過 payout-age cap，而不是直接 KeyError。
+- **`tests/review_risks/test_validator_task9_fetch_window_review_risks_mre.py`**
+  - 契約測試由「文件化風險」更新為「文件化修正後的契約」（避免修正後變成過時契約）。
+
+### 手動驗證建議（production / staging）
+
+1. 在 deploy 設 `DEPLOY_LOG_LEVEL=DEBUG`（或只開 `trainer.serving.validator`）。
+2. 找到 `[validator] CH bet fetch window: ... (policy_late_min=... ext_wait_min=... cap_min=...)`：
+   - 確認 `max_lookback_min` 被 cap 時只 warning 一次（進程內）。
+   - 確認 misconfig warning（too small for policy...）只 warning 一次（進程內）。
+3. 若要檢查 cap 行為：暫時把 `VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES` 設很大，觀察是否 clamp。
+
+### 本輪結果
+
+| 檢查 | 結果 |
+|------|------|
+| `python -m pytest -q` | ✅ **1543 passed, 62 skipped** |
+| `python -m ruff check .` | ✅ **All checks passed** |

@@ -133,7 +133,7 @@ SCORER_POLL_INTERVAL_SECONDS = 45  # Polling interval in seconds (includes run t
 _csw_raw = os.getenv("SCORER_COLD_START_WINDOW_HOURS", "").strip()
 SCORER_COLD_START_WINDOW_HOURS: Optional[float]
 if not _csw_raw:
-    SCORER_COLD_START_WINDOW_HOURS = 2
+    SCORER_COLD_START_WINDOW_HOURS = 2.0
 else:
     try:
         _csw_p = float(_csw_raw)
@@ -191,6 +191,11 @@ VALIDATOR_FINALIZE_MINUTES = 45  # Horizon minutes to finalize as MISS when enab
 VALIDATOR_FRESHNESS_BUFFER_MINUTES: int = 2   # Freshness buffer (minutes)
 VALIDATOR_EXTENDED_WAIT_MINUTES: int = 15     # Extended wait before finalize (minutes)
 VALIDATOR_FINALITY_HOURS: int = 1             # Cutoff (hours) for finality
+# Task 9 / DEC-037: ClickHouse bet fetch window for validator.
+# Pre-context helps "last bet before bet_ts" lookup; max lookback caps CH pressure.
+VALIDATOR_FETCH_PRE_CONTEXT_MINUTES: int = 60
+VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES: int = 180
+VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES_CAP: int = 24 * 60  # hard cap to avoid runaway CH scans
 
 # ============================================================
 # Phase 1 — Walkaway Model Constants (SSOT v10)
