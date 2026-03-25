@@ -11,6 +11,7 @@ python-dotenv==1.2.1
 clickhouse-connect==0.13.0
 numba==0.64.0
 llvmlite==0.46.0
+pyarrow==23.0.1
 
 # Application package (walkaway_ml). From repo root: -e . installs this repo as walkaway_ml
 -e .

@@ -2,7 +2,7 @@
 Phase 2 P0–P1: Contract tests for deploy mlflow dependency (Code Review §10).
 
 Assert that both package/deploy/requirements.txt and build_deploy_package.REQUIREMENTS_DEPS
-contain mlflow, so deploy_dist and deploy install paths stay in sync.
+contain mlflow, numba, and pyarrow, so deploy_dist and deploy install paths stay in sync.
 Tests only; no production code changes.
 """
 
@@ -26,3 +26,27 @@ def test_build_deploy_package_requirements_deps_contains_mlflow():
     from package.build_deploy_package import REQUIREMENTS_DEPS
     deps_lower = [d.split("==")[0].split(">=")[0].split("[")[0].strip().lower() for d in REQUIREMENTS_DEPS]
     assert "mlflow" in deps_lower, "REQUIREMENTS_DEPS should contain mlflow"
+
+
+def _deploy_requirements_lines_lower() -> list[str]:
+    assert DEPLOY_REQUIREMENTS.exists(), f"Missing {DEPLOY_REQUIREMENTS}"
+    text = DEPLOY_REQUIREMENTS.read_text(encoding="utf-8")
+    return [
+        line.strip().lower()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#") and not line.strip().startswith("-e ")
+    ]
+
+
+def test_deploy_requirements_txt_contains_numba_and_pyarrow():
+    lines = _deploy_requirements_lines_lower()
+    assert any(line.startswith("numba") for line in lines), "package/deploy/requirements.txt should list numba"
+    assert any(line.startswith("pyarrow") for line in lines), "package/deploy/requirements.txt should list pyarrow"
+
+
+def test_build_deploy_package_requirements_deps_contains_numba_and_pyarrow():
+    from package.build_deploy_package import REQUIREMENTS_DEPS
+
+    deps_lower = [d.split("==")[0].split(">=")[0].split("[")[0].strip().lower() for d in REQUIREMENTS_DEPS]
+    assert "numba" in deps_lower, "REQUIREMENTS_DEPS should contain numba"
+    assert "pyarrow" in deps_lower, "REQUIREMENTS_DEPS should contain pyarrow"

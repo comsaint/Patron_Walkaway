@@ -15,6 +15,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from package.build_deploy_package import REQUIREMENTS_DEPS  # noqa: E402
+
+
+class TestDeployBundleRuntimeDeps(unittest.TestCase):
+    """Deploy-generated requirements.txt must include Parquet + numba stack used by serving (align package/deploy)."""
+
+    def test_requirements_deps_include_numba_and_pyarrow(self):
+        joined = "\n".join(REQUIREMENTS_DEPS).lower()
+        self.assertIn("numba", joined)
+        self.assertIn("pyarrow", joined)
+
 
 class TestBuildScriptLoadsInCleanProcess(unittest.TestCase):
     """STATUS Code Review §1：建包腳本應在未先 import trainer 的 process 內可正常載入。"""

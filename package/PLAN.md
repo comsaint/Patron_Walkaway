@@ -53,9 +53,9 @@
   - `--output-dir`: Default `deploy_dist` (repo root); output folder (or `.zip` with `--archive`).
   - `--archive`: Optional; also create `deploy_dist.zip` for single-file transfer.
 - **Logic**:
-  1. Build `walkaway_ml` wheel; copy `main.py`, `.env.example`, app config.
+  1. Build `walkaway_ml` wheel; copy `main.py`, `.env.example` (documents all deploy-relevant env vars), app config, and `package/ML_API_PROTOCOL.md` as `ML_API_PROTOCOL.md`.
   2. Copy model bundle from `--model-source` into `output-dir/models/` (flush existing first). Require at least one of `model.pkl`, `rated_model.pkl`, `walkaway_model.pkl` and `feature_list.json`.
-  3. Write `requirements.txt`, `README_DEPLOY.txt`; create `local_state/`.
+  3. Write `requirements.txt` (wheel + PyPI deps including **numba** and **pyarrow** for serving), `README_DEPLOY.txt`; create `local_state/`.
 - **Errors**: Exit non-zero with clear message if required model files are missing.
 
 ### 3.4 Usage

@@ -39,6 +39,11 @@ if not _env_path.exists():
 load_dotenv(_env_path)
 os.environ.setdefault("STATE_DB_PATH", str(DEPLOY_ROOT / "local_state" / "state.db"))
 os.environ.setdefault("MODEL_DIR", str(DEPLOY_ROOT / "models"))
+# Before importing walkaway_ml.config: default prediction log next to state (avoids wheel site-packages path).
+os.environ.setdefault(
+    "PREDICTION_LOG_DB_PATH",
+    str(DEPLOY_ROOT / "local_state" / "prediction_log.db"),
+)
 
 # Require ClickHouse credentials (fail fast)
 if not os.environ.get("CH_USER") or not os.environ.get("CH_PASS"):

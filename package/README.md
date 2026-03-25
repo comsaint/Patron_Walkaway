@@ -3,7 +3,7 @@
 This folder provides:
 
 1. **Deploy package** — One folder (or one `.zip`) you copy to the target machine and run there. It includes the app, model, and `requirements.txt`; no repo is needed on the target.
-2. **ML API server** — GET `/alerts` and GET `/validation` at `http://localhost:8001` for the dashboard (see `doc/ML_API_PROTOCOL.md`).
+2. **ML API server** — GET `/alerts` and GET `/validation` at `http://localhost:8001` for the dashboard (contract: `package/ML_API_PROTOCOL.md`, also copied into each deploy bundle as `ML_API_PROTOCOL.md`).
 
 Full design: **PLAN.md** in this folder.
 
@@ -32,14 +32,14 @@ python -m package.build_deploy_package --model-source trainer/models_90d_weak --
 | `--output-dir` | `deploy_dist` | Output folder (default: ./deploy_dist at repo root). |
 | `--archive` | Off | Also create `deploy_dist.zip` in the parent of output-dir for a single-file transfer. |
 
-**Result:** A folder `deploy_dist/` (and optionally `deploy_dist.zip`) at repo root, containing everything needed on the target: `main.py`, `requirements.txt`, `.env.example`, `wheels/`, `models/`, `README_DEPLOY.txt`, etc.
+**Result:** A folder `deploy_dist/` (and optionally `deploy_dist.zip`) at repo root, containing everything needed on the target: `main.py`, `requirements.txt` (includes **numba**, **pyarrow**, and other serving deps), `.env.example`, `ML_API_PROTOCOL.md`, `wheels/`, `models/`, `README_DEPLOY.txt`, etc.
 
 **Frontend:** The default build **does not include** the dashboard SPA (`trainer/frontend/`). The deploy package is API-only (GET `/alerts`, `/validation`). If you need the dashboard, serve it separately from the repo or add it to the build in a future step; static assets would then live under the deploy output (e.g. `deploy_dist/static/` or similar).
 
 **On the target machine:** Copy the folder (or unzip the .zip), then:
 
 1. `pip install -r requirements.txt`
-2. Copy `.env.example` to `.env` and set ClickHouse credentials.
+2. Copy `.env.example` to `.env`, set **`CH_USER`** and **`CH_PASS`** (required), and uncomment any optional vars (log level, scorer windows, paths — see comments in the file).
 3. `python main.py`
 
 Endpoints: `http://0.0.0.0:8001/alerts`, `/validation`. See **README_DEPLOY.txt** inside the package for step-by-step and platform-specific commands.
@@ -112,7 +112,7 @@ python -m trainer.scripts.auto_build_player_profile --local-parquet --month-end
 本目錄提供：
 
 1. **部署包** — 單一資料夾（或單一 `.zip`），複製到目標機即可在該機執行。內含應用、模型與 `requirements.txt`，目標機不需 repo。
-2. **ML API 服務** — 在 `http://localhost:8001` 提供 GET `/alerts` 與 GET `/validation` 給儀表板使用（見 `doc/ML_API_PROTOCOL.md`）。
+2. **ML API 服務** — 在 `http://localhost:8001` 提供 GET `/alerts` 與 GET `/validation` 給儀表板使用（協定：`package/ML_API_PROTOCOL.md`；建包時會複製到部署目錄的 `ML_API_PROTOCOL.md`）。
 
 完整設計見本目錄 **PLAN.md**。
 
@@ -141,14 +141,14 @@ python -m package.build_deploy_package --model-source trainer/models_90d_weak --
 | `--output-dir` | `deploy_dist` | 輸出資料夾（預設為專案根目錄 ./deploy_dist）。 |
 | `--archive` | 關閉 | 另在輸出目錄上一層產生 `deploy_dist.zip`，便於單檔傳輸。 |
 
-**結果：** 在專案根目錄產生 `deploy_dist/`（及可選的 `deploy_dist.zip`），內含目標機所需一切：`main.py`、`requirements.txt`、`.env.example`、`wheels/`、`models/`、`README_DEPLOY.txt` 等。
+**結果：** 在專案根目錄產生 `deploy_dist/`（及可選的 `deploy_dist.zip`），內含目標機所需一切：`main.py`、`requirements.txt`（含 **numba**、**pyarrow** 等 serving 相依）、`.env.example`、`ML_API_PROTOCOL.md`、`wheels/`、`models/`、`README_DEPLOY.txt` 等。
 
 **前端：** 預設建包**不含**儀表板 SPA（`trainer/frontend/`），部署包僅含 API（GET `/alerts`、`/validation`）。若需儀表板，請自 repo 另行提供或於日後建包時一併帶出；若含前端，靜態檔將置於部署輸出目錄下（例如 `deploy_dist/static/`）。
 
 **在目標機上：** 複製該資料夾（或解壓 .zip）後：
 
 1. `pip install -r requirements.txt`
-2. 將 `.env.example` 複製為 `.env` 並填寫 ClickHouse 等設定。
+2. 將 `.env.example` 複製為 `.env`，填寫 **`CH_USER`**、**`CH_PASS`**（必填），其餘選項見檔內註解（日誌層級、scorer 視窗、路徑等）。
 3. `python main.py`
 
 端點：`http://0.0.0.0:8001/alerts`、`/validation`。詳見包內 **README_DEPLOY.txt** 的步驟與各平台指令。

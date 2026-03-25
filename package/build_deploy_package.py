@@ -7,10 +7,10 @@ After you run this script, you get either:
   - A single file: deploy_dist.zip   (copy this file, then unzip on target; works well on Windows)
 
 Contents: walkaway_ml wheel (from current trainer/ code), main.py, .env.example,
-model artifacts (model.pkl, feature_list.json, feature_spec.yaml, etc.),
-generated requirements.txt, and local_state dir. On the target you only:
+ML_API_PROTOCOL.md (API contract for ops), model artifacts (model.pkl, feature_list.json, etc.),
+generated requirements.txt (includes numba + pyarrow for serving parity with package/deploy), and local_state dir. On the target you only:
   pip install -r requirements.txt
-  cp .env.example .env  &&  edit .env  (set ClickHouse)
+  cp .env.example .env  &&  edit .env  (CH_* required; see .env.example for log level, scorer windows, paths)
   python main.py
 Then GET /alerts and GET /validation are available at http://0.0.0.0:8001.
 
@@ -51,6 +51,9 @@ BUNDLE_FILES = [
 MODEL_PKL_NAMES = ["model.pkl", "rated_model.pkl", "walkaway_model.pkl"]
 
 # Phase 2 P0-P1: mlflow for export script when run on deploy (cron/scheduler on same or another machine).
+# Keep aligned with package/deploy/requirements.txt for serving: Parquet I/O (profile, canonical map)
+# and numba-accelerated feature lookbacks in trainer.features; scorer logs numba availability at startup.
+# Optional: enable SCORER_ENABLE_SHAP_REASON_CODES on target requires `pip install shap` (not bundled by default).
 REQUIREMENTS_DEPS = [
     "Flask>=2.0",
     "mlflow",
@@ -61,6 +64,8 @@ REQUIREMENTS_DEPS = [
     "pyyaml",
     "python-dotenv",
     "clickhouse-connect==0.13.0",
+    "numba",
+    "pyarrow",
 ]
 
 
@@ -145,7 +150,9 @@ Target machine can be Windows, Linux, or Mac. Steps below cover all.
    (Use py -m pip or python3 -m pip if pip is not on PATH.)
 
 3. Configure environment
-   Create .env from the example and set ClickHouse: CH_HOST, CH_PORT, CH_USER, CH_PASS, SOURCE_DB.
+   Create .env from the example and set ClickHouse: CH_USER, CH_PASS (required); CH_HOST, CH_PORT, SOURCE_DB, etc. as needed.
+   See .env.example in this folder for optional tuning: DEPLOY_LOG_LEVEL / LOGLEVEL, SCORER_LOOKBACK_HOURS,
+   SCORER_COLD_START_WINDOW_HOURS, PREDICTION_LOG_DB_PATH, SCORER_ENABLE_SHAP_REASON_CODES, and more.
    Optional: PORT or ML_API_PORT (default 8001).
 
    Windows (cmd):     copy .env.example .env
@@ -161,6 +168,7 @@ Target machine can be Windows, Linux, or Mac. Steps below cover all.
 
    Scorer, validator, and Flask API run in one process.
    Endpoints: http://0.0.0.0:8001/alerts  and  http://0.0.0.0:8001/validation
+   Query parameters and default time windows are documented in ML_API_PROTOCOL.md (included in this folder).
 
 5. To swap the model only (same code / same requirements as before):
    Replace the files in the models/ folder with the new bundle, then restart (step 4).
@@ -221,6 +229,14 @@ def build_deploy_package(
     if (DEPLOY_DIR / "app.yaml").exists():
         shutil.copy2(DEPLOY_DIR / "app.yaml", output_dir / "app.yaml")
     print("  -> main.py, .env.example, app.yaml")
+
+    # 2a. API contract (GET /alerts, /validation) for operators and integrators
+    _protocol_src = REPO_ROOT / "package" / "ML_API_PROTOCOL.md"
+    if _protocol_src.is_file():
+        shutil.copy2(_protocol_src, output_dir / "ML_API_PROTOCOL.md")
+        print("  -> ML_API_PROTOCOL.md")
+    else:
+        logger.warning("Missing %s; deploy bundle will omit API protocol doc.", _protocol_src)
 
     # 2b. Player profile: ship if exists (repo data/ = trainer LOCAL_PARQUET_DIR)
     data_dir = output_dir / "data"

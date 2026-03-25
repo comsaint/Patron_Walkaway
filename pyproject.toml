@@ -16,6 +16,8 @@ dependencies = [
     "pyyaml",
     "python-dotenv",
     "clickhouse-connect==0.13.0",
+    "numba",
+    "pyarrow",
 ]
 
 # Optional: MLflow system metrics (MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING) need psutil in-process.

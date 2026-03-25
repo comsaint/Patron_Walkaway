@@ -13,13 +13,12 @@ Single process: continuously fetches from ClickHouse, runs scorer and validator,
 |---|---------------------------|----------------------------------------------------------------|
 | Purpose | Local dev / CI; editable install | Copy `deploy_dist/` or `.zip` to the target; **no repo** on the machine |
 | `walkaway_ml` | `package/deploy/requirements.txt` uses `-e .` from **repo root** | Built **wheel** under `wheels/`; generated `requirements.txt` lists `wheels/walkaway_ml-….whl` then PyPI deps |
-| Docs for the bundle | — | `README_DEPLOY.txt` inside the built folder |
+| Docs for the bundle | — | `README_DEPLOY.txt` and `ML_API_PROTOCOL.md` inside the built folder |
 
 ## Setup
 
 1. **Copy env file**  
-   Copy `.env.example` to `.env` in this directory (e.g. `cp .env.example .env`) and fill in ClickHouse and optional settings:
-   - `CH_HOST`, `CH_PORT`, `CH_USER`, `CH_PASS`, `SOURCE_DB` (required)
+   Copy `.env.example` to `.env` in this directory (e.g. `cp .env.example .env`) and fill in at least **`CH_USER`** and **`CH_PASS`**. Optional settings are documented inline in `.env.example` (e.g. `CH_HOST`, `CH_PORT`, `SOURCE_DB`, **`DEPLOY_LOG_LEVEL`** / **`LOGLEVEL`**, **`SCORER_COLD_START_WINDOW_HOURS`**, **`SCORER_LOOKBACK_HOURS`**, paths, SHAP, prediction-log retention).  
    - `PORT` or `ML_API_PORT` (default 8001)
 
 2. **Install dependencies** (repo development only)  
@@ -102,13 +101,12 @@ No code changes required; the app loads the model from `MODEL_DIR` at startup.
 |---|----------------|--------------------------------------------------------|
 | 用途 | 本機開發／CI；可編輯安裝 | 將 `deploy_dist/` 或 `.zip` 複製到目標機；**不需**完整 repo |
 | `walkaway_ml` | 在 **repo 根目錄** 用 `package/deploy/requirements.txt` 的 `-e .` | 建好的 **wheel** 在 `wheels/`；產生的 `requirements.txt` 先列 `wheels/walkaway_ml-….whl`，再列 PyPI 依賴 |
-| 部署包說明 | — | 建置後資料夾內的 `README_DEPLOY.txt` |
+| 部署包說明 | — | 建置後資料夾內的 `README_DEPLOY.txt` 與 `ML_API_PROTOCOL.md` |
 
 ### 設定步驟
 
 1. **環境檔**  
-   將本目錄的 `.env.example` 複製為 `.env`，填寫 ClickHouse 等設定：  
-   `CH_HOST`、`CH_PORT`、`CH_USER`、`CH_PASS`、`SOURCE_DB`（必填）；`PORT` 或 `ML_API_PORT`（預設 8001）。
+   將本目錄的 `.env.example` 複製為 `.env`，至少填寫 **`CH_USER`**、**`CH_PASS`**。其餘選項見 `.env.example` 內註解（如 `CH_HOST`、`SOURCE_DB`、**`DEPLOY_LOG_LEVEL`**／**`LOGLEVEL`**、**`SCORER_COLD_START_WINDOW_HOURS`**、**`SCORER_LOOKBACK_HOURS`**、路徑、SHAP、prediction log 保留等）。`PORT` 或 `ML_API_PORT`（預設 8001）。
 
 2. **安裝依賴**（僅 **repo 開發**）  
    建議建立 venv。在 **repository root**：
