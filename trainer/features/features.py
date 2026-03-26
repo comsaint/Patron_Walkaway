@@ -1369,7 +1369,7 @@ def join_player_profile(
             result[col] = np.nan
 
     if profile_df is None or (isinstance(profile_df, pd.DataFrame) and profile_df.empty):
-        logger.info("join_player_profile: profile_df absent/empty — profile features are NaN")
+        logger.debug("join_player_profile: profile_df absent/empty — profile features are NaN")
         return result
 
     available_cols = [c for c in feature_cols if c in profile_df.columns]
@@ -1451,7 +1451,7 @@ def join_player_profile(
         result[col] = _vals.reindex(np.arange(len(result))).values
 
     n_rated_with_profile = int(pd.notna(result[available_cols[0]]).sum())
-    logger.info(
+    logger.debug(
         "join_player_profile: attached %d profile cols; %d/%d bets have profile snapshot",
         len(available_cols),
         n_rated_with_profile,
