@@ -688,18 +688,25 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
    - 部署端由 main.py 設定 `DATA_DIR = DEPLOY_ROOT / "data"` 並寫入環境變數，scorer 優先從 `DATA_DIR / "player_profile.parquet"` 讀取；若不存在則維持現有 warning、profile 特徵為 NaN。
 
 3. **canonical mapping**  
-   - **不**在套件內預先打包 canonical mapping。  
-   - Scorer 在部署端一律採「由當輪 sessions 建出」邏輯；建出後將結果**持久化**到 `DATA_DIR`（`canonical_mapping.parquet` + `canonical_mapping.cutoff.json`）。  
-   - 重啟後若該二檔存在且 cutoff 仍有效則從磁碟載入，避免重啟後重新計算；否則再從 sessions 重建並覆寫。
+   - **不**在套件內預先打包 canonical mapping（建包原則）；持久化路徑為 `DATA_DIR` 下的 `canonical_mapping.parquet` 與 `canonical_mapping.cutoff.json`。  
+   - **重建時**由 `build_canonical_mapping_from_df(sessions, cutoff_dtm=now_hk)` 從當輪 sessions 建出，並將結果寫入上述二檔（僅在觸發重建分支且 map 非空時）。  
+   - **穩定態載入**：見下方「實作行為澄清」——與「每輪輪詢都重新從 sessions 計算」不同。
 
 **理由**：  
 - 單一來源路徑（repo `data/`）與現有 trainer/etl 一致，避免多處路徑設定。  
 - 有 profile 就帶出、沒有就明確錯誤提示，方便建包時發現遺漏。  
-- Canonical 不預建、僅在目標機持久化，可隨 sessions 更新且重啟不重算。
+- Canonical 不預建、僅在目標機持久化；**設計意圖**是身分對照可在目標機**首次建立或重建時**反映當下 CH sessions，且**重啟後**可讀檔跳過重算（DEC-028 註解）；**實際是否隨時間自動刷新**依 scorer 實作（見下）。
 
 **設計理由（為何帶 profile 不帶 canonical mapping）**：  
 - **player_profile**：計算成本高、變動慢（目前僅每月更新一次），適合隨套件一併帶出；且模型本身約每月也會用新資料重訓幾次，帶出 profile 與重訓節奏一致。  
-- **canonical_mapping**：變動快、具動態性，且計算量不大，故不在建包時預先打包，改由部署端依當下 sessions 建出並持久化，既能反映最新身份對應，又不會增加建包複雜度。
+- **canonical_mapping**：變動快、具動態性，且計算量不大，故**原則上**不在建包時預先打包，改由部署端在**觸發重建時**依當下 sessions 建出並持久化；**不**將「變動快」解讀為「deploy 長跑過程中每輪自動重算」——目前實作並未如此（見下）。
+
+**實作行為澄清（2026-03-25 追加，對齊 `trainer/serving/scorer.py`）**：
+
+- **`DATA_DIR` 已設定**（`package/deploy/main.py` 在 import 前寫入 `os.environ["DATA_DIR"]`）：`score_once` 內 `use_persisted` 在載入邏輯中為真，只要 `canonical_mapping.parquet` 與 `canonical_mapping.cutoff.json` **存在且讀取成功**，**每一輪** scoring 都**從磁碟載入**同一份 mapping，**不會**每輪呼叫 `build_canonical_mapping_from_df`。**長時間運行**下檔案 **mtime 不變**屬預期，除非發生重建。  
+- **何時重建並覆寫 Parquet**：檔案缺失、讀檔/解析失敗、或 `rebuild_canonical_mapping=True`。Deploy 路徑 `run_scorer_loop(...)` **固定**傳 `rebuild_canonical_mapping=False`，故穩定態幾乎永遠走「讀檔」。若建包時**已將** `canonical_mapping.parquet` 複製進部署 `data/`，程序可能**從未**走過「首輪從 sessions 現建」。  
+- **無 `DATA_DIR`（本機預設）**：僅當 sidecar 的 `cutoff_dtm` 仍視為有效（程式以 `cutoff >= now` 判斷）才沿用磁碟檔；否則當輪重建。重建結果**僅在** `_DATA_DIR is not None` 時寫回磁碟（本機無 `DATA_DIR` 時通常不落盤，與 trainer 另寫 `repo/data/` 的路徑分離）。  
+- **與 player_profile 對照**：profile 為**讀取**為主、TTL 快取；canonical 在 deploy 下為「**有檔則每輪讀檔**」，二者**都非**「每輪從 ClickHouse 重算整份 canonical map」。若產品需要**定期**反映新 `player_id` ↔ 卡號連結，需另案：排程刪檔、`--rebuild-canonical-mapping`、或改 scorer 邏輯（例如僅啟動時讀檔、之後每輪重建／節流重建）。
 
 ---
 

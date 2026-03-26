@@ -83,6 +83,25 @@ class TestTask9BRisk4RetryTimezoneAssumptionContract(unittest.TestCase):
         self.assertNotIn("UTC_TZ", block)
 
 
+class TestTask9CBetIdAnchoredLookup(unittest.TestCase):
+    """Task 9C: TBET FINAL by bet_id when player_id window misses (INCIDENT TBET drift)."""
+
+    def test_config_has_bet_id_lookup_flags(self) -> None:
+        cfg = _config_text()
+        self.assertIn("VALIDATOR_NO_BET_BET_ID_LOOKUP_ENABLED", cfg)
+        self.assertIn("VALIDATOR_NO_BET_BET_ID_CHUNK_SIZE", cfg)
+
+    def test_fetch_bet_payout_times_by_bet_ids_defined(self) -> None:
+        text = _validator_text()
+        self.assertIn("def fetch_bet_payout_times_by_bet_ids(", text)
+
+    def test_no_bet_retry_merges_bet_id_hits(self) -> None:
+        block = _func_block(_validator_text(), "_fetch_bets_for_no_bet_rows")
+        self.assertIn("fetch_bet_payout_times_by_bet_ids", block)
+        self.assertIn("bet_id_failed_queries", block)
+        self.assertIn("_no_bet_bet_id_lookup_enabled", block)
+
+
 class TestTask9BMitigation5ExistingResultsCacheDbFirstMerge(unittest.TestCase):
     """Mitigation #5: DB rows win; in-process cache only fills keys missing from DB."""
 

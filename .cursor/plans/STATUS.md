@@ -6,6 +6,116 @@
 
 ---
 
+## Task 9C — No-bet retry 以 `bet_id` 錨定 TBET（2026-03-26 追加）
+
+### 背景
+- 對應 [INCIDENT.md](INCIDENT.md) 第二則（TBET `player_id` 漂移）與 [PATCH_20260324.md](PATCH_20260324.md) **Task 9C**。
+- 在 Task 9B per-`player_id` 時間窗 retry 仍 `rows=0` 時，改以 **`bet_id IN (...)`** 自 `TBET FINAL` 取 `payout_complete_dtm`（及 TBET `player_id` 供 DEBUG），合併入 `bet_cache`，避免長期 `No bet data`。
+
+### 變更檔案
+| 檔案 | 說明 |
+|------|------|
+| [trainer/core/config.py](../../trainer/core/config.py) | 新增 `VALIDATOR_NO_BET_BET_ID_LOOKUP_ENABLED`（預設 `True`）、`VALIDATOR_NO_BET_BET_ID_CHUNK_SIZE`（預設 `500`）。 |
+| [trainer/serving/validator.py](../../trainer/serving/validator.py) | `_no_bet_bet_id_lookup_enabled()`；`fetch_bet_payout_times_by_bet_ids`（chunked 查詢、同 `bet_id` 取 **max(payout)**）；`_fetch_bets_for_no_bet_rows` 合併 bet_id 命中、統計 `bet_id_chunks`／`bet_id_rows_raw`／`bet_id_hits`／`bet_id_failed_queries`；`per_pid` 為空時仍可做 bet_id 補查；`no-bet retry summary` DEBUG 增列 bet_id 欄位。 |
+| [tests/unit/test_validator_bet_id_lookup.py](../../tests/unit/test_validator_bet_id_lookup.py) | Mock CH：chunking、同 bet 多列取最新 payout、查詢失敗計數。 |
+| [tests/review_risks/test_task9b_retry_review_risks_mre.py](../../tests/review_risks/test_task9b_retry_review_risks_mre.py) | 新增 `TestTask9CBetIdAnchoredLookup`（config／函式／`_fetch_bets_for_no_bet_rows` 契約）。 |
+| [tests/review_risks/test_task9c_bet_id_lookup_review_risks_mre.py](../../tests/review_risks/test_task9c_bet_id_lookup_review_risks_mre.py) | Code Review 風險 **#1–#5、#7** 之 MRE／靜態契約（**#6** 待 fast-follow 後補）。 |
+| [.cursor/plans/PATCH_20260324.md](PATCH_20260324.md) | Task 9C 標為 **Done（MVP）**；Changelog 追加。 |
+
+### 手動驗證
+1. **單元**：`python -m pytest -q tests/unit/test_validator_bet_id_lookup.py`  
+2. **契約**：`python -m pytest -q tests/review_risks/test_task9b_retry_review_risks_mre.py`  
+2b. **Review MRE**：`python -m pytest -q tests/review_risks/test_task9c_bet_id_lookup_review_risks_mre.py`（見下「Code Review」小節對照表）  
+3. **靜態**：`python -m ruff check trainer/serving/validator.py trainer/core/config.py`；`python -m mypy trainer/serving/validator.py --ignore-missing-imports`  
+4. **生產（建議）**：`DEPLOY_LOG_LEVEL=DEBUG` 下觀察觸發 no-bet retry 時是否出現  
+   - `[validator] no-bet bet_id lookup: n_ids=… chunks=… rows_raw=… hits=…`  
+   - `[validator] no-bet retry summary: … bet_id_chunks=… bet_id_hits=…`  
+   若需關閉補查：在程式 config 設 `VALIDATOR_NO_BET_BET_ID_LOOKUP_ENABLED=False`（目前未接 env，與多數 `VALIDATOR_*` 一致）。  
+5. **ClickHouse 抽樣**：對曾 `No bet` 的 `bet_id` 執行 `SELECT bet_id, player_id, payout_complete_dtm FROM … FINAL WHERE bet_id=…`，與 alert 比對。
+
+### 本輪驗證（代理環境）
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| Pytest | 同上 + `test_task9c_bet_id_lookup_review_risks_mre.py` + `test_incident_remediation_followup_review_risks_mre.py` + `test_validator_task9_fetch_window_old_bet_ts.py` | **通過**（2026-03-26；Task9C MRE **10** cases） |
+| Pytest（**全量**） | `python -m pytest tests/ -q -p no:langsmith --tb=line` | **1578 passed**, **62 skipped**（見下「全 repo 閘門」） |
+| Ruff | `trainer/serving/validator.py` `trainer/core/config.py` `tests/unit/test_validator_bet_id_lookup.py` `tests/review_risks/test_task9c_bet_id_lookup_review_risks_mre.py` | **通過** |
+| Ruff（**全 repo**） | `python -m ruff check .` | **通過**（見下） |
+| Mypy | `trainer/serving/validator.py` | **通過** |
+| Mypy（**trainer+package**） | `python -m mypy trainer/ package/ --ignore-missing-imports` | **通過**（57 files，見下） |
+
+### 下一步建議
+- 上線後比對 **`No bet data` 警告率**與 `validation_results` 中長期 PENDING 是否下降。  
+- **Fast-follow（可選）**：當 TBET `player_id` ≠ alert `player_id` 時，再以 CH 回傳的 `player_id` 拉一輪窄時間窗，補齊 gap 所需鄰近注單（見 PATCH Task 9C Design notes）。  
+- 若 CH 壓力上升，可調低 `VALIDATOR_NO_BET_BET_ID_CHUNK_SIZE` 或暫時關閉 `VALIDATOR_NO_BET_BET_ID_LOOKUP_ENABLED`。
+
+### Code Review — Task 9C 實作（2026-03-26 追加；僅審查、不重寫）
+
+以下為**最可能**影響正確性／維運的點；每項含**具體修改建議**與**建議新增測試**。
+
+| # | 類型 | 問題 | 具體修改建議 | 希望新增的測試 |
+|---|------|------|----------------|----------------|
+| 1 | Bug（邊界） | `fetch_bet_payout_times_by_bet_ids` 內 `best_idx = sub["_payout_hk"].idxmax()` 後 `sub.loc[best_idx]`：若 `sub` 的 **index 有重複**，`loc` 可能回傳 **多列 DataFrame**（非 Series），則 `row["player_id"]`／`row.get` 行為不穩定或拋錯。 | 在 group 內改為不依賴 index：`row = sub.loc[sub["_payout_hk"].idxmax()]` 前先 `sub = sub.reset_index(drop=True)`，或 `row = sub.nlargest(1, "_payout_hk").iloc[0]`，或 `iloc[int(sub["_payout_hk"].values.argmax())]`。 | Mock 回傳兩列同 `bet_id`、**重複 index**（例如兩列都是 index `0`），斷言函式仍回傳單一 `(payout, player_id)` 且不拋錯。 |
+| 2 | 邊界／語意 | 同 `bet_id` 多列時取 **`max(payout_complete_dtm)`**；若 ETL 錯誤寫入**未來時間**或重送**錯誤時間戳**，會選到錯列，gap 判決可能偏差（INCIDENT Open question 已提及）。 | 短期：註解／文件標明假設；中期：若表有 `__etl_insert_Dtm`（或類似版本欄），改 SQL 用 `argMax(payout_complete_dtm, __etl_insert_Dtm)` 或 `ORDER BY ... LIMIT 1 BY bet_id` 與 DBA 對齊語意。 | 契約或單元：兩列同 `bet_id`，一列 payout 明顯「未來不合理」— 可先只斷言「目前實作取 max」之行為（避免 silent 改語意），另開整合測試待 SQL 改動後再更新期望。 |
+| 3 | Bug（健壯性） | `client.query_df` 若因驅動／版本回傳 **缺欄**（無 `bet_id`／`payout_complete_dtm`／`player_id`），目前會在後續 `df["bet_id"]` 等處 **KeyError**，使該 chunk 未計入 `failed_queries`（與 player retry 的「單次 try/except」語意不一致）。 | 在處理前檢查 `required = {"bet_id", "payout_complete_dtm", "player_id"}`；缺欄則 `logger.warning`、該 chunk `failed_queries += 1`（或獨立 `schema_errors` 計數）後 `continue`。 | Mock 回傳空欄位或僅 `payout_complete_dtm` 的 DataFrame，斷言不冒泡、且失敗計數或 warning 路徑被觸發。 |
+| 4 | 效能 | 單一 chunk 內對 `bet_id` **pandas groupby** 在列數大時有額外 CPU；通常 chunk≤500 且僅 no-bet 路徑，風險低。 | 若 profiling 顯示熱點：可改在 ClickHouse 側 `GROUP BY bet_id` + `max(payout_complete_dtm)` 聚合，減少傳輸列數。 | 效能測試可選：mock 回傳 500 列多 `bet_id`，單測只斷言「仍完成」；真 p95 留給 deploy 觀測。 |
+| 5 | 安全性 | `SOURCE_DB`／`TBET` 來自 config、`bet_id` 走參數化 `IN %(ids)s`，**無**將使用者字串拼進 SQL，與既有 fetch 一致。 | 維持現狀；若未來允許從不可信來源覆寫 `SOURCE_DB`，需另案白名單校驗。 | 無需強制新測；可選 MRE 斷言 query 字串不含裸插值 `bet_id` 字面量（靜態契約）。 |
+| 6 | 邊界／產品語意 | 僅注入 **單筆** payout 到 `bet_cache` 時，`find_gap_within_window` 可能與「完整 player 時間序列」結論略有差異（PATCH 已列 Non-goal）。 | Fast-follow：當 DEBUG 偵測 `ch_pid != alert_player_id` 時，觸發第二輪 **窄窗** `player_id=ch_pid` 查詢合併（PATCH Task 9C 已規劃）。 | 整合測試：mock 第一查詢空、bet_id 命中且 `ch_pid` 不同，斷言第二輪查詢參數含 `ch_pid`（實作後啟用）。 |
+| 7 | 設定 | `VALIDATOR_NO_BET_BET_ID_LOOKUP_ENABLED` 對 **str** 已排除常見關閉字串以外的值；若為 **非 str 非 bool**（例如某 wrapper 物件），`bool(raw)` 可能永遠為 True。 | 與其他 flag 對齊：集中 `_parse_bool_env` 或僅允許 `bool`／`int` 0/1／`str`。 | 單測：`_no_bet_bet_id_lookup_enabled` 在 patch config 為 `0`、`"false"`、物件時的期望（若支援物件則明確定義）。 |
+
+**結論**：現有 MVP 在 **正常 CH schema、index 唯一** 假設下合理；優先處理 **#1（duplicate index）** 與 **#3（缺欄）** 可顯著降低線上偶發例外與靜默錯誤風險。
+
+#### Task 9C Review 風險 → MRE 測試（2026-03-26 追加，**僅 tests**）
+
+| 檔案 | [tests/review_risks/test_task9c_bet_id_lookup_review_risks_mre.py](../../tests/review_risks/test_task9c_bet_id_lookup_review_risks_mre.py) |
+|------|------|
+| 對照 Review 列 | 測試類／重點 |
+| **#1** duplicate index + `idxmax`/`loc` | `TestRisk1DuplicateIndexMre`：mock 回傳 **重複 index** 之 DataFrame，斷言 `fetch_bet_payout_times_by_bet_ids` 拋 **`ValueError`** 且訊息含 `ambiguous`（**最小重現**；修 prod 後須改為成功路徑斷言或移除例外期望）。 |
+| **#2** 同 `bet_id` 多列取 max／平手 | `TestRisk2MaxPayoutTieMre`：`payout` 完全相同時 **idxmax 先出現列**之 `player_id`（文件化 pandas 行為）。 |
+| **#3** CH 回傳缺欄 | `TestRisk3MissingColumnsMre`：無 `bet_id` 欄 → **`KeyError('bet_id')`**（重現「未進 `failed_queries`」之前身）；修 prod 後改斷言優雅降級與計數。 |
+| **#4** chunk 與查詢次數 | `TestRisk4ChunkingQueryCountMre`：6 個 id、`chunk_size=2` → **`query_df` 呼叫 3 次**。 |
+| **#5** SQL 參數化 | `TestRisk5SqlInjectionContract`：原始碼區塊含 **`bet_id IN %(ids)s`**，且不以 `IN ( f"` 型式拼接（輕量靜態契約）。 |
+| **#6** 第二輪 `ch_pid` 窄窗 | **尚未有自動測試**（待 production 實作 fast-follow 後依上表補整合測試）。 |
+| **#7** 開關解析 | `TestRisk7BoolParsingMre`：`"false"`、`""`、`0` → 關；`1` → 開；任意 **`object()`** 走 `bool(raw)` → 視為開（**文件化** reviewer 風險）。每則 **try/finally** 還原 `config` 屬性。 |
+
+**執行方式**（repo 根）：
+
+```bash
+python -m pytest -q tests/review_risks/test_task9c_bet_id_lookup_review_risks_mre.py
+python -m ruff check tests/review_risks/test_task9c_bet_id_lookup_review_risks_mre.py
+```
+
+**本檔驗證（代理）**：上述 pytest **10 passed**、ruff **通過**（2026-03-26）。
+
+### Task 9C — 全 repo 閘門（2026-03-26 追加驗證）
+
+依指示**未改測試**；以**現行實作**跑完整 pytest、`ruff check .`、`mypy trainer/ package/`。**Production 程式碼變更**：無（本輪無需改碼即可全綠）。
+
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| Pytest（全量，排除 langsmith plugin） | `python -m pytest tests/ -q -p no:langsmith --tb=line` | **1578 passed**, **62 skipped**（2026-03-26） |
+| Ruff | `python -m ruff check .` | **All checks passed** |
+| Mypy | `python -m mypy trainer/ package/ --ignore-missing-imports` | **Success**（**57** source files；僅 `annotation-unchecked` notes，無錯誤） |
+
+#### Code Review 風險表 — 執行狀態 vs 計畫剩餘
+
+| # | 狀態 | 說明 |
+|---|------|------|
+| 1 | **MRE 鎖定現行行為** | `TestRisk1DuplicateIndexMre` 斷言重複 index → `ValueError`／`ambiguous`。若要落地 Review 建議（`reset_index`／`nlargest` 等），須**另輪協調更新測試**後再改 production。 |
+| 2 | **已文件化** | `TestRisk2MaxPayoutTieMre`；ETL 錯誤時間戳／`argMax` 語意仍見上表「具體修改建議」。 |
+| 3 | **MRE 鎖定現行行為** | `TestRisk3MissingColumnsMre` 斷言 `KeyError('bet_id')`。若要缺欄計入 `failed_queries`／warning，須**同步改測**。 |
+| 4–5 | **閘門綠** | Chunk 次數與 SQL 參數化契約通過。 |
+| 6 | **未實作** | PATCH Task 9C **fast-follow**：`ch_pid` ≠ alert 時第二輪窄窗合併（[PATCH_20260324.md](PATCH_20260324.md) Design notes §2）；尚無自動測試。 |
+| 7 | **MRE 綠** | 字串／整數關閉與 `object()` 走 `bool` 已由測試覆蓋；若需與他處對齊之嚴格型別化開關，屬可選加固。 |
+
+**計畫剩餘（與本主線相關；摘自 PATCH／Review）**
+
+- **Task 9C（PATCH）**：第二輪 **`ch_pid` 窄窗**（上表 #6）；可選**主路徑**對 pending 做輕量 `bet_id` batch；上線後觀測 **`No bet data` 率** 與長期 PENDING。  
+- **Review #1／#3**：與現有 MRE「最小重現」綁定；落地修補前需**測試契約輪**（否則與「不改測試」衝突）。  
+- **Task 9B（PATCH 可選）**：`>50` 補查之額外整合測試、`failed_queries` 監控儀表。  
+- **其它 PATCH 長線**（非本節實作範圍）：Task 3 Phase 3 之 p95／整合比對實測、Task 7 R4–R6／DoD 量化等——見 [PATCH_20260324.md](PATCH_20260324.md) 與 [PLAN.md](PLAN.md) 各節 Status。
+
+---
+
 ## Task 9B Validator 加固 Round 2 + 契約測試對齊（2026-03-25 追加）
 
 ### 背景

@@ -80,6 +80,13 @@ def _safe_int_config(name: str, default: int, *, min_value: int) -> int:
     return max(int(min_value), v)
 
 
+def _no_bet_bet_id_lookup_enabled() -> bool:
+    raw = getattr(config, "VALIDATOR_NO_BET_BET_ID_LOOKUP_ENABLED", True)
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(raw)
+
+
 def _record_validator_stage_timing(stage: str, seconds: float) -> None:
     bucket = _VALIDATOR_STAGE_TIMINGS.setdefault(stage, deque(maxlen=_PERF_WINDOW_SIZE))
     bucket.append(max(0.0, float(seconds)))
@@ -420,6 +427,93 @@ def fetch_bets_by_canonical_id(
     return cache
 
 
+def fetch_bet_payout_times_by_bet_ids(
+    bet_ids: List[int],
+    *,
+    chunk_size: int,
+) -> Tuple[Dict[str, Tuple[datetime, Optional[int]]], int, int, int]:
+    """Fetch ``payout_complete_dtm`` (and ``player_id``) from TBET FINAL by ``bet_id``.
+
+    Used when per-``player_id`` time-window queries return no rows but the bet row
+    may still exist under the same ``bet_id`` (TBET ``player_id`` drift after ETL).
+
+    Returns:
+        mapping: bet_id string -> (payout in HK_TZ, TBET player_id or None)
+        chunks_attempted: number of ClickHouse queries issued
+        rows_read: raw row count before per-bet_id dedup
+        failed_queries: chunk queries that raised
+    """
+    empty: Dict[str, Tuple[datetime, Optional[int]]] = {}
+    if not bet_ids or get_clickhouse_client is None:
+        return empty, 0, 0, 0
+
+    size = max(1, int(chunk_size))
+    client = get_clickhouse_client()
+    placeholder = int(getattr(config, "PLACEHOLDER_PLAYER_ID", -1))
+    acc: Dict[str, Tuple[datetime, Optional[int]]] = {}
+    chunks_attempted = 0
+    rows_read = 0
+    failed_queries = 0
+
+    for i in range(0, len(bet_ids), size):
+        chunk = tuple(int(x) for x in bet_ids[i : i + size])
+        if not chunk:
+            continue
+        chunks_attempted += 1
+        params = {"ids": chunk}
+        query = f"""
+            SELECT bet_id, payout_complete_dtm, player_id
+            FROM {config.SOURCE_DB}.{config.TBET} FINAL
+            WHERE bet_id IN %(ids)s
+              AND payout_complete_dtm IS NOT NULL
+              AND wager > 0
+              AND player_id IS NOT NULL
+              AND player_id != {placeholder}
+        """
+        try:
+            df = client.query_df(query, parameters=params)
+        except Exception as exc:
+            failed_queries += 1
+            logger.warning(
+                "[validator] no-bet bet_id lookup query failed ids=%s: %s",
+                chunk[:5],
+                exc,
+            )
+            continue
+        if df.empty:
+            continue
+        rows_read += len(df)
+        df = df.copy()
+        df["bet_id"] = pd.to_numeric(df["bet_id"], errors="coerce")
+        df = df.dropna(subset=["bet_id"])
+        df["bet_id"] = df["bet_id"].astype("int64")
+        ts = pd.to_datetime(df["payout_complete_dtm"], errors="coerce")
+        if getattr(ts.dt, "tz", None) is None:
+            ts = ts.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        else:
+            ts = ts.dt.tz_convert(HK_TZ)
+        df["_payout_hk"] = ts
+        df = df.dropna(subset=["_payout_hk"])
+        for bid_int, sub in df.groupby("bet_id", sort=False):
+            bkey = str(int(bid_int))
+            best_idx = sub["_payout_hk"].idxmax()
+            row = sub.loc[best_idx]
+            payout_hk = row["_payout_hk"]
+            if pd.isna(payout_hk):
+                continue
+            ch_pid: Optional[int] = None
+            try:
+                if pd.notna(row.get("player_id")):
+                    ch_pid = int(row["player_id"])
+            except Exception:
+                ch_pid = None
+            prev = acc.get(bkey)
+            if prev is None or payout_hk > prev[0]:
+                acc[bkey] = (payout_hk.to_pydatetime(), ch_pid)
+
+    return acc, chunks_attempted, rows_read, failed_queries
+
+
 def _fetch_bets_for_no_bet_rows(
     missing_rows: List[pd.Series],
     *,
@@ -430,7 +524,17 @@ def _fetch_bets_for_no_bet_rows(
 ) -> Tuple[Dict[str, List[datetime]], Dict[str, int]]:
     """Targeted retry for alerts that hit ``No bet data`` in this cycle."""
     if not missing_rows or get_clickhouse_client is None:
-        return {}, {"selected": 0, "queries": 0, "rows": 0, "failed_queries": 0}
+        z = {
+            "selected": 0,
+            "queries": 0,
+            "rows": 0,
+            "failed_queries": 0,
+            "bet_id_chunks": 0,
+            "bet_id_rows_raw": 0,
+            "bet_id_hits": 0,
+            "bet_id_failed_queries": 0,
+        }
+        return {}, z
 
     selected_rows = missing_rows[: max(1, int(max_alerts))]
     per_pid: Dict[int, Dict[str, Any]] = {}
@@ -484,26 +588,24 @@ def _fetch_bets_for_no_bet_rows(
             slot["end"] = retry_end
         slot["cids"].add(cid)
 
-    if not per_pid:
-        return {}, {"selected": len(selected_rows), "queries": 0, "rows": 0, "failed_queries": 0}
-
-    for pid, win in list(per_pid.items()):
-        span_agg = (win["end"] - win["start"]).total_seconds() / 60.0
-        if span_agg > float(max_window_min):
-            mid = win["start"] + (win["end"] - win["start"]) / 2
-            half = float(max_window_min) / 2.0
-            win["start"] = mid - timedelta(minutes=half)
-            win["end"] = mid + timedelta(minutes=half)
-
-    client = get_clickhouse_client()
     cache: Dict[str, List[datetime]] = {}
     total_queries = 0
     total_rows = 0
     failed_queries = 0
-    for pid, win in per_pid.items():
-        total_queries += 1
-        params = {"player": int(pid), "start": win["start"], "end": win["end"]}
-        query = f"""
+
+    if per_pid:
+        client = get_clickhouse_client()
+        for pid, win in list(per_pid.items()):
+            span_agg = (win["end"] - win["start"]).total_seconds() / 60.0
+            if span_agg > float(max_window_min):
+                mid = win["start"] + (win["end"] - win["start"]) / 2
+                half = float(max_window_min) / 2.0
+                win["start"] = mid - timedelta(minutes=half)
+                win["end"] = mid + timedelta(minutes=half)
+        for pid, win in per_pid.items():
+            total_queries += 1
+            params = {"player": int(pid), "start": win["start"], "end": win["end"]}
+            query = f"""
             SELECT payout_complete_dtm
             FROM {config.SOURCE_DB}.{config.TBET} FINAL
             WHERE player_id = %(player)s
@@ -515,45 +617,112 @@ def _fetch_bets_for_no_bet_rows(
               AND wager > 0
             ORDER BY payout_complete_dtm
         """
-        try:
-            df = client.query_df(query, parameters=params)
-        except Exception as exc:
-            failed_queries += 1
-            logger.warning(
-                "[validator] no-bet retry query failed player_id=%s start=%s end=%s: %s",
-                pid,
-                win["start"],
-                win["end"],
-                exc,
-            )
-            continue
-        if df.empty:
-            logger.debug(
-                "[validator] no-bet retry: player_id=%s start=%s end=%s rows=0",
-                pid,
-                win["start"],
-                win["end"],
-            )
-            continue
+            try:
+                df = client.query_df(query, parameters=params)
+            except Exception as exc:
+                failed_queries += 1
+                logger.warning(
+                    "[validator] no-bet retry query failed player_id=%s start=%s end=%s: %s",
+                    pid,
+                    win["start"],
+                    win["end"],
+                    exc,
+                )
+                continue
+            if df.empty:
+                logger.debug(
+                    "[validator] no-bet retry: player_id=%s start=%s end=%s rows=0",
+                    pid,
+                    win["start"],
+                    win["end"],
+                )
+                continue
 
-        total_rows += len(df)
-        ts = pd.to_datetime(df["payout_complete_dtm"], errors="coerce")
-        if getattr(ts.dt, "tz", None) is None:
-            ts = ts.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
-        else:
-            ts = ts.dt.tz_convert(HK_TZ)
-        vals = [t for t in ts.tolist() if pd.notna(t)]
-        for cid in win["cids"]:
-            cache.setdefault(cid, [])
-            cache[cid].extend(vals)
-        logger.debug(
-            "[validator] no-bet retry: player_id=%s start=%s end=%s rows=%s cids=%s",
-            pid,
-            win["start"],
-            win["end"],
-            len(vals),
-            len(win["cids"]),
-        )
+            total_rows += len(df)
+            ts = pd.to_datetime(df["payout_complete_dtm"], errors="coerce")
+            if getattr(ts.dt, "tz", None) is None:
+                ts = ts.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+            else:
+                ts = ts.dt.tz_convert(HK_TZ)
+            vals = [t for t in ts.tolist() if pd.notna(t)]
+            for cid in win["cids"]:
+                cache.setdefault(cid, [])
+                cache[cid].extend(vals)
+            logger.debug(
+                "[validator] no-bet retry: player_id=%s start=%s end=%s rows=%s cids=%s",
+                pid,
+                win["start"],
+                win["end"],
+                len(vals),
+                len(win["cids"]),
+            )
+
+    bet_id_chunks = 0
+    bet_id_rows_raw = 0
+    bet_id_hits = 0
+    bet_id_failed_queries = 0
+    if _no_bet_bet_id_lookup_enabled():
+        bid_chunk_sz = _safe_int_config("VALIDATOR_NO_BET_BET_ID_CHUNK_SIZE", 500, min_value=1)
+        bet_to_cids: Dict[str, set] = {}
+        bet_to_alert_pid: Dict[str, int] = {}
+        unique_bids: List[int] = []
+        seen_bids: set = set()
+        for row in selected_rows:
+            bid_raw = row.get("bet_id")
+            if bid_raw is None or pd.isna(bid_raw):
+                continue
+            try:
+                bid_int = int(bid_raw)
+            except Exception:
+                continue
+            pid_raw = row.get("player_id")
+            if pid_raw is None or pd.isna(pid_raw):
+                continue
+            try:
+                alert_pid = int(pid_raw)
+            except Exception:
+                continue
+            bkey = str(bid_int)
+            if bid_int not in seen_bids:
+                seen_bids.add(bid_int)
+                unique_bids.append(bid_int)
+            cid_raw = row.get("canonical_id")
+            cid = (
+                str(alert_pid)
+                if (cid_raw is None or pd.isna(cid_raw) or str(cid_raw).strip() == "")
+                else str(cid_raw)
+            )
+            bet_to_cids.setdefault(bkey, set()).add(cid)
+            bet_to_alert_pid.setdefault(bkey, alert_pid)
+
+        if unique_bids:
+            bid_map, bet_id_chunks, bet_id_rows_raw, bet_id_failed_queries = fetch_bet_payout_times_by_bet_ids(
+                unique_bids,
+                chunk_size=bid_chunk_sz,
+            )
+            bet_id_hits = len(bid_map)
+            for bid_str, (payout_hk, ch_pid) in bid_map.items():
+                alert_player_id = bet_to_alert_pid.get(bid_str)
+                if alert_player_id is None:
+                    continue
+                if ch_pid is not None and int(ch_pid) != int(alert_player_id):
+                    logger.debug(
+                        "[validator] no-bet retry bet_id lookup: TBET player_id=%s != alert player_id=%s bet_id=%s",
+                        ch_pid,
+                        alert_player_id,
+                        bid_str,
+                    )
+                for cid in bet_to_cids.get(bid_str, ()):
+                    cache.setdefault(cid, [])
+                    cache[cid].append(payout_hk)
+            logger.debug(
+                "[validator] no-bet bet_id lookup: n_ids=%s chunks=%s rows_raw=%s hits=%s failed_chunks=%s",
+                len(unique_bids),
+                bet_id_chunks,
+                bet_id_rows_raw,
+                bet_id_hits,
+                bet_id_failed_queries,
+            )
 
     for cid in list(cache.keys()):
         cache[cid] = sorted(set(cache[cid]))
@@ -562,6 +731,10 @@ def _fetch_bets_for_no_bet_rows(
         "queries": total_queries,
         "rows": total_rows,
         "failed_queries": failed_queries,
+        "bet_id_chunks": bet_id_chunks,
+        "bet_id_rows_raw": bet_id_rows_raw,
+        "bet_id_hits": bet_id_hits,
+        "bet_id_failed_queries": bet_id_failed_queries,
     }
 
 
@@ -1638,12 +1811,18 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False, existi
             bet_cache[cid] = sorted(set(bet_cache[cid]))
 
         logger.debug(
-            "[validator] no-bet retry summary: before=%s selected=%s queries=%s rows=%s failed_queries=%s resolved_cache_cids=%s limit=%s rot_start=%s",
+            "[validator] no-bet retry summary: before=%s selected=%s queries=%s rows=%s failed_queries=%s "
+            "bet_id_chunks=%s bet_id_rows_raw=%s bet_id_hits=%s bet_id_failed=%s "
+            "resolved_cache_cids=%s limit=%s rot_start=%s",
             len(no_bet_pending_rows),
             retry_stats.get("selected", 0),
             retry_stats.get("queries", 0),
             retry_stats.get("rows", 0),
             retry_stats.get("failed_queries", 0),
+            retry_stats.get("bet_id_chunks", 0),
+            retry_stats.get("bet_id_rows_raw", 0),
+            retry_stats.get("bet_id_hits", 0),
+            retry_stats.get("bet_id_failed_queries", 0),
             len(retry_cache),
             retry_limit,
             rot_start,

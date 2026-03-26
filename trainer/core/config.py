@@ -202,6 +202,9 @@ VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES_CAP: int = 24 * 60  # hard cap to avoid run
 VALIDATOR_NO_BET_RETRY_MAX_ALERTS: int = 50  # Task 9B: targeted retry budget per validator cycle
 # Max span (minutes) for a single no-bet retry window (pre_context + lookahead+extras); avoids runaway CH scans.
 VALIDATOR_NO_BET_RETRY_MAX_WINDOW_MINUTES: int = 240
+# Task 9C: when player_id+time retry returns no rows, query TBET by bet_id (stable key) and merge payout times.
+VALIDATOR_NO_BET_BET_ID_LOOKUP_ENABLED: bool = True
+VALIDATOR_NO_BET_BET_ID_CHUNK_SIZE: int = 500  # max bet_ids per IN batch
 
 # ============================================================
 # Phase 1 — Walkaway Model Constants (SSOT v10)
