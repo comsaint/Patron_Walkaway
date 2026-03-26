@@ -53,6 +53,7 @@ MODEL_PKL_NAMES = ["model.pkl", "rated_model.pkl", "walkaway_model.pkl"]
 # Phase 2 P0-P1: mlflow for export script when run on deploy (cron/scheduler on same or another machine).
 # Keep aligned with package/deploy/requirements.txt for serving: Parquet I/O (profile, canonical map)
 # and numba-accelerated feature lookbacks in trainer.features; scorer logs numba availability at startup.
+# optuna + duckdb: walkaway_ml imports trainer.training.trainer (optuna) and features paths (duckdb) at load time.
 # Optional: enable SCORER_ENABLE_SHAP_REASON_CODES on target requires `pip install shap` (not bundled by default).
 REQUIREMENTS_DEPS = [
     "Flask>=2.0",
@@ -66,6 +67,8 @@ REQUIREMENTS_DEPS = [
     "clickhouse-connect==0.13.0",
     "numba",
     "pyarrow",
+    "optuna==4.7.0",
+    "duckdb==1.4.4",
 ]
 
 
