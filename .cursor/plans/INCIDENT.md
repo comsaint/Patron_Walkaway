@@ -169,3 +169,36 @@ Scope: `trainer/serving/validator.py`（CH bet fetch、no-bet retry）、ClickHo
 - **決策**：以 **`bet_id` 定向查 TBET（方案 C）** 補強 no-bet retry，將 `payout_complete_dtm` 併入 `bet_cache`；不以「僅把 `canonical_id` 當 `player_id` 查」作為唯一修復。  
 - **完整目標、設計取捨、實作步驟、DoD、開放問題**：見 [`PATCH_20260324.md`](PATCH_20260324.md) **Task 9C — Validator：No-bet 補查以 `bet_id` 錨定 TBET（方案 C）**。
 
+---
+
+# INCIDENT — Deploy 啟動時 SQLite `database is locked`
+
+Date: 2026-03-26  
+Scope: `package/deploy/main.py`（scorer / validator 背景執行緒）、`STATE_DB_PATH`、`trainer/serving/scorer.py`、`trainer/serving/validator.py`
+
+## Summary
+
+以 `python package/deploy/main.py` 啟動時，validator 端偶發 **`sqlite3.OperationalError: database is locked`**；訊息通常短暫出現後自行消失。  
+與 **scorer、validator 幾乎同時**對同一顆 **`state.db`** 做初始化／DDL／寫入有關；Python `sqlite3` 預設 **`busy_timeout=0`**，遇鎖時不等待即失敗。
+
+## Impact
+
+- 啟動日誌出現 ERROR／exception 堆疊，干擾 on-call 與「是否健康啟動」判讀。  
+- 功能上多為暫時性；少數環境若寫入極慢，可能放大錯誤頻率或延長競爭窗口。
+
+## Root cause（結論）
+
+1. **併發**：`main.py` 以兩條 daemon thread 先後 `start()` scorer 與 validator，實際上幾乎同時進入 DB。  
+2. **Scorer 首輪**：`init_state_db()`、長連線、`score_once` 內多處 SQLite 寫入／`commit`。  
+3. **Validator 啟動**：`run_validator_loop` 開頭即 `get_db_conn()`，內含多項 **`CREATE`／`ALTER`／索引**（與 scorer 之 `init_state_db` 重疊語意）。  
+4. **無 busy 等待**：連線未設 `PRAGMA busy_timeout` 時，與寫入／DDL 重疊的另一連線易立即得到 **locked**。
+
+## Remediation（計畫，非本檔實作）
+
+- **首選（已入 PATCH）**：延後 validator 執行緒至 scorer **第一次 `score_once` 完整回傳後**再開始 `run_validator_loop`（`threading.Event` 同步）；**不要求** `alerts` 已有資料。  
+- **Fast-follow（建議另條目）**：於 scorer／validator／Flask 讀寫 `STATE_DB_PATH` 之連線統一設定 **`PRAGMA busy_timeout`**，作為第二道防線。
+
+完整設計、檔案清單、DoD、rollback：見 [`PATCH_20260324.md`](PATCH_20260324.md) **Task 10 — Deploy：SQLite 啟動鎖競爭 — 延後 validator 至 scorer 首輪完成**。
+
+**狀態（2026-03-26）**：Task 10 已落地（`run_scorer_loop` 之 `first_cycle_done`、`package/deploy/main.py` Event 同步與可選逾時）；驗證步驟見 [`STATUS.md`](STATUS.md) **Task 10**。
+

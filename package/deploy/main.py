@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import logging
+import math
 import os
 import sys
 import sqlite3
@@ -394,16 +395,66 @@ def validation():
     return resp
 
 
-def _run_scorer():
+def _deploy_validator_start_wait_timeout() -> float | None:
+    """Seconds to wait for scorer's first cycle before starting validator.
+
+    ``DEPLOY_VALIDATOR_START_TIMEOUT_SECONDS``: unset defaults to 600; ``0`` /
+    ``0.0`` / empty / ``none`` / ``inf`` / ``infinite`` (case-insensitive) means
+    wait indefinitely. A negative numeric value also means wait indefinitely.
+    ``nan`` logs a warning and falls back to 600s. Other non-numeric strings log
+    a warning and fall back to 600s.
+    """
+    raw = os.environ.get("DEPLOY_VALIDATOR_START_TIMEOUT_SECONDS")
+    if raw is None:
+        return 600.0
+    s = raw.strip()
+    if not s or s.lower() in ("0", "none", "inf", "infinite"):
+        return None
+    try:
+        v = float(s)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "[deploy] Invalid DEPLOY_VALIDATOR_START_TIMEOUT_SECONDS=%r; using 600s",
+            raw,
+        )
+        return 600.0
+    if math.isnan(v):
+        logging.getLogger(__name__).warning(
+            "[deploy] DEPLOY_VALIDATOR_START_TIMEOUT_SECONDS is NaN (%r); using 600s",
+            raw,
+        )
+        return 600.0
+    if math.isinf(v):
+        return None
+    if v == 0.0:
+        return None
+    if v < 0:
+        return None
+    return v
+
+
+def _run_scorer(first_cycle_done: threading.Event | None):
     run_scorer_loop(
         interval_seconds=getattr(_config, "SCORER_POLL_INTERVAL_SECONDS", 45),
         lookback_hours=getattr(_config, "SCORER_LOOKBACK_HOURS", 8),
         model_dir=None,
         once=False,
+        first_cycle_done=first_cycle_done,
     )
 
 
-def _run_validator():
+def _run_validator_deferred(
+    first_cycle_done: threading.Event,
+    wait_timeout: float | None,
+) -> None:
+    log = logging.getLogger(__name__)
+    if wait_timeout is None:
+        first_cycle_done.wait()
+    elif not first_cycle_done.wait(timeout=wait_timeout):
+        log.warning(
+            "[deploy] Scorer first cycle did not finish within %.1fs; starting validator anyway.",
+            wait_timeout,
+        )
     run_validator_loop(
         interval_seconds=getattr(_config, "VALIDATOR_INTERVAL_SECONDS", 60),
         once=False,
@@ -461,12 +512,30 @@ if __name__ == "__main__":
     print(f"[deploy] STATE_DB_PATH={STATE_DB_PATH}")
     print(f"[deploy] MODEL_DIR={os.environ.get('MODEL_DIR')}")
     print(f"[deploy] Scorer running in background (poll every {scorer_interval}s)")
-    print(f"[deploy] Validator running in background (poll every {validator_interval}s)")
+    _v_wait = _deploy_validator_start_wait_timeout()
+    if _v_wait is None:
+        print(
+            f"[deploy] Validator starts after scorer's first cycle completes "
+            f"(no timeout; poll every {validator_interval}s once started)"
+        )
+    else:
+        print(
+            f"[deploy] Validator starts after scorer's first cycle "
+            f"(or after {_v_wait:.0f}s timeout; then poll every {validator_interval}s)"
+        )
     print(f"[deploy] ML API: http://0.0.0.0:{port}/alerts, http://0.0.0.0:{port}/validation")
 
-    # Start scorer and validator in daemon threads
-    scorer_thread = threading.Thread(target=_run_scorer, daemon=True)
-    validator_thread = threading.Thread(target=_run_validator, daemon=True)
+    scorer_first_cycle_done = threading.Event()
+    scorer_thread = threading.Thread(
+        target=_run_scorer,
+        args=(scorer_first_cycle_done,),
+        daemon=True,
+    )
+    validator_thread = threading.Thread(
+        target=_run_validator_deferred,
+        args=(scorer_first_cycle_done, _v_wait),
+        daemon=True,
+    )
     scorer_thread.start()
     validator_thread.start()
 

@@ -31,6 +31,7 @@ import logging
 import math
 import os
 import sqlite3
+import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -2259,9 +2260,14 @@ def run_scorer_loop(
     lookback_hours: int | None = None,
     model_dir: Optional[Path] = None,
     once: bool = False,
+    first_cycle_done: threading.Event | None = None,
 ) -> None:
     """Run the scorer loop (no argparse). Used by package/deploy/main.py.
     Uses STATE_DB_PATH and MODEL_DIR from env if set.
+
+    If ``first_cycle_done`` is set, it is signaled exactly once after the first
+    ``score_once`` call returns (success or exception), so deploy can defer
+    validator startup and avoid SQLite startup lock races.
     """
     interval = interval_seconds if interval_seconds is not None else getattr(config, "SCORER_POLL_INTERVAL_SECONDS", 45)
     lookback = lookback_hours if lookback_hours is not None else getattr(config, "SCORER_LOOKBACK_HOURS", 8)
@@ -2280,6 +2286,7 @@ def run_scorer_loop(
     conn.execute("PRAGMA synchronous=NORMAL;")
     init_state_db()
     alert_history = load_alert_history(conn)
+    first_iteration = True
     while True:
         t_start = time.time()
         try:
@@ -2293,6 +2300,11 @@ def run_scorer_loop(
             )
         except Exception as exc:
             logger.error("[scorer] ERROR: %s", exc, exc_info=True)
+        finally:
+            if first_iteration:
+                first_iteration = False
+                if first_cycle_done is not None:
+                    first_cycle_done.set()
         elapsed = time.time() - t_start
         sleep_for = max(0, interval - elapsed)
         if once:

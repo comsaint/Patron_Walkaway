@@ -6,6 +6,84 @@
 
 ---
 
+## Task 10 — Deploy：validator 延後至 scorer 首輪完成（SQLite 啟動鎖）（2026-03-26 追加）
+
+### 背景
+- 對應 [INCIDENT.md](INCIDENT.md) 第三則（Deploy 啟動 `database is locked`）與 [PATCH_20260324.md](PATCH_20260324.md) **Task 10**。
+- scorer 與 validator 背景執行緒幾乎同時打 `STATE_DB_PATH` 時，預設 `busy_timeout=0` 易出現短暫 `sqlite3.OperationalError: database is locked`。
+
+### 變更檔案
+| 檔案 | 說明 |
+|------|------|
+| [trainer/serving/scorer.py](../../trainer/serving/scorer.py) | `run_scorer_loop(..., first_cycle_done: threading.Event \| None = None)`；首輪 `score_once` 結束後（`try`／`finally`，含例外）**僅一次** `event.set()`。 |
+| [package/deploy/main.py](../../package/deploy/main.py) | `threading.Event` 同步；`_run_validator_deferred` 在 `wait` 後才呼叫 `run_validator_loop`；`_deploy_validator_start_wait_timeout()` 解析 **`DEPLOY_VALIDATOR_START_TIMEOUT_SECONDS`**（預設 **600s**；`0`／**`0.0`**／`none`／`inf`／空字串／負值 → 無限等待；**`nan`**／非法字串 → warning 並用 600s）。 |
+| [deploy_dist/main.py](../../deploy_dist/main.py) | 與 `package/deploy/main.py` 同邏輯。 |
+| [tests/unit/test_scorer_first_cycle_event.py](../../tests/unit/test_scorer_first_cycle_event.py) | `first_cycle_done` 於 `once=True` 後已 set、`score_once` 拋錯仍 set、`None` 不崩潰。 |
+| [tests/review_risks/test_task10_deploy_sqlite_lock_review_risks_mre.py](../../tests/review_risks/test_task10_deploy_sqlite_lock_review_risks_mre.py) | Task 10 Code Review **#1–#7** 之 MRE：逾時解析行為對照、`package/deploy` 與 `deploy_dist` 逾時函式同步、原始碼契約（`0.0`／`isnan`／`isinf`／`get_db_conn` 無 `busy_timeout`）、`load_dual_artifacts` 啟動前失敗則 Event 不 set。 |
+
+### 手動驗證
+1. **單元**：`python -m pytest -q tests/unit/test_scorer_first_cycle_event.py`
+2. **Task 10 Review MRE（僅 tests，不需可 import deploy main）**：`python -m pytest -q tests/review_risks/test_task10_deploy_sqlite_lock_review_risks_mre.py`
+3. **Deploy（需有效 `.env` 與 CH）**：`python package/deploy/main.py` 冷啟動數次，主控台應先完成 scorer 首輪相關日誌，再出現 validator 週期日誌；啟動段應**不再**出現 validator 因 SQLite locked 的 ERROR（若仍偶發，建議補 `PRAGMA busy_timeout`）。
+4. **逾時行為**：`DEPLOY_VALIDATOR_START_TIMEOUT_SECONDS=1` 且人為延遲 scorer 首輪（或斷 CH）時，應於約 1s 後出現 `[deploy] Scorer first cycle did not finish within ...` warning，validator 仍會啟動。
+5. **靜態**：`python -m ruff check trainer/serving/scorer.py package/deploy/main.py deploy_dist/main.py tests/unit/test_scorer_first_cycle_event.py tests/review_risks/test_task10_deploy_sqlite_lock_review_risks_mre.py`；`python -m mypy trainer/serving/scorer.py --ignore-missing-imports`
+
+### 本輪驗證（代理環境）
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| Pytest | `tests/unit/test_scorer_first_cycle_event.py` | **3 passed**（2026-03-26） |
+| Pytest | `tests/review_risks/test_task10_deploy_sqlite_lock_review_risks_mre.py` | **15 passed**（2026-03-26） |
+| Ruff | 上列檔案含 Task10 MRE | **通過** |
+| Mypy | `trainer/serving/scorer.py` | **通過** |
+
+### 全 repo 驗證輪（2026-03-26 追加）
+
+本輪**未改 tests**；實作已與現有測試／靜態檢查一致。
+
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| Pytest（全量） | `python -m pytest tests/ -q -p no:langsmith --tb=line` | **1596 passed**, **62 skipped**（約 109s） |
+| Ruff（全 repo） | `python -m ruff check .` | **通過** |
+| Mypy（trainer + package） | `python -m mypy trainer/ package/ --ignore-missing-imports` | **通過**（57 files；`annotation-unchecked` 僅 note） |
+
+### 下一步建議
+- **Fast-follow**：凡連線 `STATE_DB_PATH` 處（scorer／validator／Flask `get_db_conn`）統一 `PRAGMA busy_timeout`（毫秒），降低執行期中併讀寫鎖失敗率。
+- 若發佈 **walkaway_ml** wheel：確認 `run_scorer_loop` 簽名變更已納入版本說明。
+
+### Code Review — Task 10 實作（2026-03-26 追加；僅審查、不重寫）
+
+以下為**最可能**影響正確性／維運的點；每項含**具體修改建議**與**建議新增測試**。另：`_deploy_validator_start_wait_timeout` 之 docstring 曾與實作不符（負值／非法值敘述），已於 `package/deploy/main.py`／`deploy_dist/main.py` **對齊實際行為**（本 review 前已修）。
+
+| # | 類型 | 問題 | 具體修改建議 | 希望新增的測試 |
+|---|------|------|----------------|----------------|
+| 1 | Bug（啟動／同步） | `first_cycle_done` 僅在 **進入 `while` 且第一輪 `finally`** 才 `set()`。若 **`load_dual_artifacts`、`sqlite3.connect`、`init_state_db`、`load_alert_history`** 任一在進入迴圈**前**拋錯，執行緒可能終止而 **Event 永不 set**，validator 執行緒會 **等滿逾時**（預設 600s）或 **無限 `wait`**（`0`／`none` 等），期間無 validator。 | （a）在 `run_scorer_loop` 最外層加 `try`／`finally`：於離開函式前若 `first_cycle_done` 仍未 set 則 `set()`（語意變成「scorer 已放棄首輪或已結束」— 需文件化）；或（b）維持現狀但在 **README／.env.example** 註明「模型路徑錯誤等會阻塞 validator 啟動直到逾時」；或（c）deploy 對 scorer 執行緒用 wrapper 捕捉未處理例外並 `set()` + log critical。 | 單元：`patch` 使 `load_dual_artifacts` 拋錯，斷言 **逾時路徑**下 validator 仍會啟動（可抽 `_deploy_validator_start_wait_timeout` + 迷你 thread 整合測）；或斷言「永不 set」時 `wait(timeout=…)` 回 `False` 後行為。 |
+| 2 | 邊界（環境變數語意） | 字串 **`"0"`** 與 **`"0.0"`** 行為不一致：`"0"` 經特判為 **無限等待**；`"0.0"` 會 `float` 成 **0.0**，走 `wait(timeout=0.0)` → **立即返回 False**，validator **馬上**啟動，**失去**「延後至首輪完成」效果，啟動鎖競爭可能復現。 | 將 **`v == 0.0`**（或 `math.isclose(v, 0.0)`）與空字串一併視為「無限等待」；或明確禁止 `0.0` 並在 `0 < v < 1` 時 **warning + clamp 到至少 1s**；並在 **STATUS／PATCH** 的 env 說明表列出陷阱。 | 單元：`monkeypatch.setenv("DEPLOY_VALIDATOR_START_TIMEOUT_SECONDS", "0.0")` 後呼叫 `_deploy_validator_start_wait_timeout()`，斷言回傳 **`None`** 或 **`≥1.0`**（與選定策略一致）；並對 `"0"` 斷言 `None`。 |
+| 3 | 邊界（數值） | **`float('nan')`**：`v < 0` 為 False，函式回傳 **nan**；`threading.Event.wait(timeout=float('nan'))` 行為依實作／版本可能 **非預期**（立即返回或異常）。**`float('inf')`** 目前回傳 `inf`，`wait(timeout=inf)` 實質等同長等，尚可接受但與字串 `"inf"` 特判重疊。 | 若 `not math.isfinite(v)`：視為 **無限等待**（`return None`）或 **warning + 600s**；與文件一致即可。 | 單元：`setenv` 為 `"nan"`，斷言不回傳 nan、行為符合選定策略；可選對 `"inf"` 斷言為 `None`。 |
+| 4 | 效能／緩解強度 | **逾時過短**（例如 `1` 秒）時，validator 在 scorer **首輪尚未結束**（長 CH fetch）即啟動，**與「首輪完成再驗證」設計衝突**，`database is locked` **仍可能**出現。 | 若 `0 < v < 5`（可調）印 **warning**：「低於建議下限，可能無法避免 SQLite 啟動競爭」；或強制 `max(v, 5.0)`（產品決策需記錄）。 | 文件化單測可選；主依賴手動／staging 啟動 log 驗證。 |
+| 5 | 正確性（部分緩解） | 本設計只序化 **「validator 開始呼叫 `run_validator_loop`」** 與 **「首輪 `score_once` 返回」**；**無法**保證 validator 首次 `get_db_conn()` 時 scorer **無**後續長交易。若 locked 仍發生，需 **`busy_timeout`** 或更細鎖策略。 | 維持 PATCH 已列 **fast-follow：`PRAGMA busy_timeout`**；可選在 validator 首次連線前 **短 sleep（jitter）**（治標，優先級低）。 | 無需強制自動測；壓力／整合環境重啟計數 locked log。 |
+| 6 | 安全性 | **`DEPLOY_VALIDATOR_START_TIMEOUT_SECONDS`** 僅本機／容器 env，**無**遠端注入面；惡意設極大值僅造成 **validator 延後啟動**（可用性），屬營運設定風險。 | 維持現狀；若未來由 **不可信來源**寫入 env，需白名單或上限（例如 `min(v, 86400)`）。 | 可選：單測極大數值被 cap（若實作上限）。 |
+| 7 | 可測性 | **`package/deploy/main.py`** 之 `_deploy_validator_start_wait_timeout`、執行緒編排便攜邏輯 **無**專屬單元測試，迴歸易與 **#2/#3** 類似問題脫鉤。 | 將逾時解析抽至 **可 import 之小函式**（已為模組層級），新增 **`tests/unit/test_deploy_validator_start_timeout.py`**（`monkeypatch` env）；或 **review_risks** 靜態契約測「`0` vs `0.0`」條件分支。 | 見 #2/#3 列之測試案例；另加 `"   "`、`" 600 "` 等 trim 行為。 |
+
+**結論**：現作在 **「首輪 `score_once` 正常完成」** 路徑上合理；營運上須注意 **#1（啟動前即崩）**。**#2／#3** 已於同日在 `package/deploy/main.py`／`deploy_dist/main.py` 以 **`v == 0.0` → 無限等待**、`math.isnan` → **warning + 600s**、`math.isinf` → **無限等待** 落地，並更新函式 docstring。**#7** 已由下表 MRE（雙檔函式 diff + 行為 oracle）覆蓋；若將解析抽成獨立模組可改為直接 `import` 單測並刪減 oracle 重複。
+
+#### Task 10 Review 風險 → MRE 測試（2026-03-26 追加，**僅 tests**）
+
+| 檔案 | [tests/review_risks/test_task10_deploy_sqlite_lock_review_risks_mre.py](../../tests/review_risks/test_task10_deploy_sqlite_lock_review_risks_mre.py) |
+|------|------|
+| **執行方式**（repo 根） | `python -m pytest -q tests/review_risks/test_task10_deploy_sqlite_lock_review_risks_mre.py` |
+| 對照 Review | 測試重點 |
+| **#1** | `TestRisk1FirstCycleEventNotSetIfLoadFailsBeforeLoop`：`load_dual_artifacts` 在進入 `while` 前拋錯 → `first_cycle_done` **不** set；`test_risk1_regression_when_load_succeeds_event_still_set` 對照成功路徑。 |
+| **#2** | `TestReferenceParseDeployValidatorTimeout.test_risk2_zero_point_zero_means_infinite_wait_not_immediate_timeout`；靜態：`TestDeployMainSourceContract.test_risk2_contains_zero_point_zero_guard`。 |
+| **#3** | `TestReferenceParseDeployValidatorTimeout.test_risk3_nan_and_inf_numeric`；靜態：`test_risk3_contains_isnan_isinf`、`test_import_math_for_timeout_parse`。 |
+| **#4** | `TestDeployMainSourceContract.test_risk4_no_low_timeout_warning_string`（文件化：目前無「短逾時」警告字串）。 |
+| **#5** | `TestDeployMainSourceContract.test_risk5_get_db_conn_has_no_busy_timeout_yet`（契約：`get_db_conn` 區塊不含 `busy_timeout`，直至 fast-follow 實作後須改斷言或移除）。 |
+| **#6** | （無獨立測）Reviewer 判定為本機 env、低風險；若未來加 env 上限可增參數化斷言。 |
+| **#7** | `TestPackageAndDeployDistTimeoutFnInSync`：兩份 `main.py` 之 `_deploy_validator_start_wait_timeout` **全文一致**；`TestReferenceParseDeployValidatorTimeout` 為行為對照（**須與 production 同步維護**）。 |
+
+**說明**：MRE **不** `import package.deploy.main`（該模組啟動即要求 `.env`／CH／模型檔）；逾時語意以測內 **`reference_parse_deploy_validator_start_wait_timeout`** 為 oracle，並以**讀檔字串**做靜態契約與雙檔同步。
+
+---
+
 ## Task 9C — No-bet retry 以 `bet_id` 錨定 TBET（2026-03-26 追加）
 
 ### 背景
