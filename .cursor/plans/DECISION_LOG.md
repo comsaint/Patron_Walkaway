@@ -976,4 +976,35 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-038：Validator 滾動 precision 上界採「驗證週期結束時刻」（與 `validated_at` 一致）
+
+**日期**：2026-03-26  
+**SSOT 章節**：[PATCH_20260324.md](PATCH_20260324.md) — **Task 11**；延續 Task 4／DEC-034 護欄下之 serving 觀測 KPI  
+
+**背景**：
+
+- 線上滾動 KPI：`trainer/serving/validator.py` 之 `_rolling_precision_by_validated_at` 以 **`validated_at` 落於 `[now − window, now]`**（HK）計算 15m／1h precision，並以 15m 結果寫入 `validator_metrics`。
+- 實作上 `validate_once` 曾以**週期開頭**之 `now_hk` 作為該 `now`，而每筆結果之 **`validated_at`** 於 `validate_alert_row` 內以**該筆驗證當下**之 `datetime.now(HK_TZ)` 寫入。若週期內有 I/O 與多筆處理，常見 **`validated_at` 晚於週期起點**，導致 **`validated_at <= now`（週期起點）** 不成立，同一輪剛驗證之列被濾光，日誌出現 **`0/0`**，與同輪「N alert(s) verified」並存；**首輪**無歷史列時尤其明顯。
+
+**考慮過的替代方案**：
+
+1. **在呼叫滾動 KPI 前刷新 `now`**（上界＝**週期結束時刻**）：保留 `validated_at` 為「實際驗證完成時間」；僅將 KPI 上界與其對齊。實作面小、稽核語意不變。
+2. **將 `validated_at` 改為週期起點或統一錨點時間**：可機械對齊窗格，但**扭曲** `validation_results`／API **`sync_ts`** 之「何時完成驗證」語意，不利稽核與除錯。
+3. **移除上界、僅 `validated_at >= now − window`**：會把**未來時間戳**（時鐘誤差、異常資料）納入，需另定防禦規則。
+
+**決策**：
+
+- 採用 **方案 1**：滾動 KPI（15m／1h）之 **`now` 上界**語意為 **`validate_once` 執行至滾動計算／寫入 metrics 時之「週期結束」時刻**（由呼叫端以 `datetime.now(HK_TZ)` 取得，與現行每筆 `validated_at` 之產生方式相容）。
+- **週期開頭**之 `now_hk` **仍保留**於 retention、finality、fetch 窗、pending 篩選等路徑，避免單一變更牽動整輪時間語意。
+- **`validator_metrics.recorded_at`**：預設與該 KPI 上界（週期結束錨點）一致，除非產品明確要求以週期起點記錄（須文件化二選一）。
+
+**理由**：
+
+- **與 `validated_at` 定義一致**：完成驗證的列應納入「以週期結束為上界」之滾動窗，避免假陰性與「延遲一輪才出現分母」的運維困惑。
+- **不犧牲資料真實性**：相較統一改寫 `validated_at`，更利於對外 API 與事後追查。
+
+**實作追蹤**：見 [PATCH_20260324.md](PATCH_20260324.md) **Task 11**。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

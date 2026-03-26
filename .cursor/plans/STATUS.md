@@ -6,6 +6,79 @@
 
 ---
 
+## Task 11 — Validator 滾動 KPI：上界＝驗證週期結束（DEC-038 / PATCH Task 11）（2026-03-26 追加）
+
+### 背景
+- 對應 [PATCH_20260324.md](PATCH_20260324.md) **Task 11**、[DECISION_LOG.md](DECISION_LOG.md) **DEC-038**。
+- `validate_once` 開頭的 `now_hk` 仍用於 retention、finality、CH fetch、pending 篩選等；滾動 precision 若沿用該值作上界，而 `validated_at` 於 `validate_alert_row` 內以**每筆驗證當下**寫入，則常出現 **`validated_at` 晚於週期起點** → 同輪 Cumulative Precision **`(0/0)`** 與「This cycle: N verified」並存（首輪尤甚）。
+
+### 變更檔案
+| 檔案 | 說明 |
+|------|------|
+| [trainer/serving/validator.py](../../trainer/serving/validator.py) | 計算 `_rolling_precision_by_validated_at` 與寫入 `validator_metrics` 前取 **`kpi_now_hk = datetime.now(HK_TZ)`** 作滾動窗上界與 **`recorded_at`**；`_rolling_precision_by_validated_at` docstring 註明呼叫端應傳週期結束錨點。 |
+| [tests/unit/test_validator_rolling_precision_alert_ts.py](../../tests/unit/test_validator_rolling_precision_alert_ts.py) | 新增 **`test_rolling_precision_validated_at_after_stale_now_needs_cycle_end_anchor`**：上界早於 `validated_at` 時分母為 0，較晚上界則納入（迴歸 Task 11 根因）。 |
+
+### 手動驗證
+1. **單元**：`python -m pytest -q tests/unit/test_validator_rolling_precision_alert_ts.py -p no:langsmith`
+2. **相關 SLO MRE**：`python -m pytest -q tests/review_risks/test_review_risks_validator_slo_precision_validated_at_2026_03_25.py -p no:langsmith`
+3. **Deploy（需 `.env` + CH）**：冷啟後首輪 validator 若有 verified 非 PENDING 列，**INFO** 兩行 `Cumulative Precision (15m/1h window, by validated_at)` 不應再為 **`0.00% (0/0)`**（除非該窗內確無 finalize 列）。
+4. **靜態**：`python -m ruff check trainer/serving/validator.py tests/unit/test_validator_rolling_precision_alert_ts.py`；`python -m mypy trainer/serving/validator.py --ignore-missing-imports`
+
+### 本輪驗證（代理環境）
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| Pytest | `tests/unit/test_validator_rolling_precision_alert_ts.py` + `test_review_risks_validator_slo_precision_validated_at_2026_03_25.py` | **8 passed**（2026-03-26） |
+| Pytest | Task 11 Review MRE + 滾動 precision 單元（見下段「Task 11 Review 風險 → MRE」指令） | **14 passed**（2026-03-26） |
+| Pytest（全量） | `python -m pytest tests/ -q -p no:langsmith --tb=line` | **1607 passed**, **62 skipped**（2026-03-26，約 131s） |
+| Ruff | 上列兩檔 | **通過** |
+| Mypy | `trainer/serving/validator.py` | **通過** |
+
+### 下一步建議
+- 可選：全量 `python -m pytest tests/ -q -p no:langsmith --tb=line`、`python -m ruff check .`、`python -m mypy trainer/ package/ --ignore-missing-imports` 作迴歸輪。
+- [PATCH_20260324.md](PATCH_20260324.md) **Task 11** 已標 **Done** 並寫入 Changelog（2026-03-26）。
+
+### Code Review — Task 11 實作（`kpi_now_hk`）（2026-03-26 追加；靜態審查）
+
+以下聚焦 **最可能**影響正確性／維運／觀測的點；每項含**具體修改建議**與**建議新增測試**。
+
+| # | 類型 | 問題 | 具體修改建議 | 希望新增的測試 |
+|---|------|------|----------------|----------------|
+| 1 | 邊界（時鐘） | **`validated_at` 晚於 `kpi_now_hk`**（他機寫入 DB、NTP 回撥後又寫入、手動改表、極端並行）時，仍被 **`vt <= now_hk`** 排除，該批列不進滾動分母；與「同週期起點過緊」不同，屬**另一種**假陰性。 | （a）維持現狀但在 `_rolling_precision_by_validated_at` 或 `validate_once` 對 **`(vt > kpi_now_hk).sum() > 0`** 打 **DEBUG** 計數（勿預設 INFO 洗版）；（b）若產品要納入：僅在 **`vt <= kpi_now_hk + timedelta(seconds=1)`** 等小容忍內擴上界，並文件化風險（會放大窗）。 | 單元：`now_hk` 固定、`validated_at` 為 **+5 分鐘「未來」** → 斷言 **total=0**（鎖定**刻意排除**行為）；可選第二例：容忍上界若實作則斷言納入條件。 |
+| 2 | 邊界（語意／報表） | **`validator_metrics.recorded_at`** 改為 **`kpi_now_hk`** 後，代表 **「KPI 計算時刻」**，未必等於 **`save_validation_results` 提交**或週期起點；若下游以 `recorded_at` 與 **`validation_results` 檔案落盤時間**對齊，可能差 **數百 ms～數秒**（SQLite 寫入耗時）。 | 在 `_append_validator_metrics` 註解或內部 runbook／PATCH：**明載 `recorded_at` = rolling 計算錨點（週期末 wall clock）**；儀表板若需「commit 時間」應另欄或未來 trigger。 | 可選整合／契約：mock `save_validation_results` 延遲，斷言 **insert metrics 發生在 save 之前**（僅順序，不需真 DB）；或文件測（MRE 讀原始碼行序）。 |
+| 3 | 邊界（窗格寬度） | 上界由「週期起點」改為「週期結束」後，**同一個 15m／1h 窗**在 wall-clock 上**右端點變晚**，可納入更多「剛好在週期內被驗證」的列；若單輪極長（例如 CH 阻塞數分鐘後一次驗證大量列），**15m 分母**可能一次跳升，屬**預期**但可能觸發誤判為異常的告警規則。 | 監控側將「單輪耗時」與 KPI 連動，或對 **`total_15m` 單輪增量**設合理上限告警；程式側**不必**為此再改窗（避免與 DEC-038 衝突）。 | 單元：固定 `finalized_or_old` 兩筆 `validated_at` 分別落在 **窗左緣內／外**，對同一 `kpi_now` 斷言邊界；可選 property-style 測試：**較晚的 `now_hk` 不會減少** `total`（單調性）。 |
+| 4 | 正確性（未來並行） | 現假設 **單執行緒**循序呼叫 `validate_alert_row`，故每筆 **`validated_at` ≤ 後續取得的 `kpi_now_hk`**。若日後改 **執行緒池／async** 並行驗證，可能出現 **某筆 `validated_at` 略大於** 主執行緒在彙總前取的 `kpi_now_hk`（競態），該筆仍被排除。 | 並行化時改為：**所有工作完成後**再取 **`kpi_now_hk = datetime.now(HK_TZ)`**，或以 **`max(各結果 validated_at 解析值, datetime.now(HK_TZ))`** 作上界（需慎防未來時間放大窗）；並行化 PR 必含設計小節。 | 並行化落地時：`concurrent.futures` 模擬兩筆完成時間交錯，斷言 KPI 上界 **不早於** `max(validated_at)`（或採選定策略之 oracle）。 |
+| 5 | 安全性 | **無新增對外輸入面**：`kpi_now_hk` 來自本機 `datetime.now`，寫入 SQLite 之格式與補丁前相同。 | 維持現狀；若未來從客戶端傳入「觀測 now」，應拒絕或僅限內部除錯旗標。 | 無需專項測（除非新增 API）。 |
+| 6 | 效能 | 每輪多 **一次** `datetime.now(HK_TZ)`，相對 CH／SQLite **可忽略**。 | 無需優化。 | 無。 |
+
+**結論**：Task 11 修正 **週期起點 vs `validated_at`** 的假陰性，與 DEC-038 一致；上列以 **#1（未來時間戳）**、**#4（未來並行）** 為後續最值得補強或文件化的風險。
+
+#### Task 11 Review 風險 → MRE／單元測試（2026-03-26 追加，**僅 tests**）
+
+| 檔案 | 說明 |
+|------|------|
+| [tests/review_risks/test_task11_kpi_review_risks_mre.py](../../tests/review_risks/test_task11_kpi_review_risks_mre.py) | **#2** 靜態契約：`validate_once` 原始區塊內 **`kpi_now_hk`** 早於 **`_append_validator_metrics(`**，且 **`_append_validator_metrics(`** 早於 **`save_validation_results(`**。**#4** 兩筆 `validated_at`、`now_hk` 介於其間時只計 1 筆；`now_hk` 抵最後一筆時計 2 筆。 |
+| [tests/unit/test_validator_rolling_precision_alert_ts.py](../../tests/unit/test_validator_rolling_precision_alert_ts.py) | **#1** `validated_at` 比 `now_hk` 晚 5 分鐘 → `total=0`。**#3** 上界含等號（`validated_at==now_hk` 納入）、單列參數化窗格、**`now_hk` 遞增時 total 單調不減**。 |
+
+**執行方式**（repo 根）：
+
+```bash
+python -m pytest -q tests/review_risks/test_task11_kpi_review_risks_mre.py tests/unit/test_validator_rolling_precision_alert_ts.py -p no:langsmith
+```
+
+**未自動化（Review #5/#6）**：#5 無新增輸入面，未加 lint；#6 多一次 `datetime.now` 可忽略，未加效能測。
+
+### 驗證輪 — 全量 tests / ruff / mypy（2026-03-26 追加，**無 production 變更**）
+
+依指示**不修改 tests**（除非測試錯或 decorator 過時）；本輪僅重跑工具鏈。結果：**無需改實作**即全綠。
+
+| 檢查 | 指令 | 結果 |
+|------|------|------|
+| Pytest | `python -m pytest tests/ -q -p no:langsmith --tb=short` | **1607 passed**, **62 skipped**（約 128s） |
+| Ruff | `python -m ruff check .` | **通過** |
+| Mypy | `python -m mypy trainer/ package/ --ignore-missing-imports` | **Success: no issues found**（57 files；既有 `annotation-unchecked` note 僅 deploy `main.py`／`validator.py` 等） |
+
+---
+
 ## Task 10 — Deploy：validator 延後至 scorer 首輪完成（SQLite 啟動鎖）（2026-03-26 追加）
 
 ### 背景

@@ -176,7 +176,12 @@ def _rolling_precision_by_validated_at(
     now_hk: datetime,
     window: timedelta,
 ) -> Tuple[float, int, int]:
-    """MATCH rate over non-PENDING rows whose ``validated_at`` falls in ``[now_hk - window, now_hk]`` (HK)."""
+    """MATCH rate over rows whose ``validated_at`` falls in ``[now_hk - window, now_hk]`` (HK).
+
+    ``now_hk`` is the **window upper bound** chosen by the caller. In ``validate_once`` it must be
+    **end-of-cycle** ``datetime.now(HK_TZ)`` so rows stamped with per-alert ``validated_at`` during
+    the same cycle are not excluded by ``validated_at > cycle_start`` (see Task 11 / DEC-038).
+    """
     if finalized_df.empty or "validated_at" not in finalized_df.columns:
         return 0.0, 0, 0
     if now_hk.tzinfo is None:
@@ -1868,11 +1873,13 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False, existi
 
         kpi_df = final_df[~final_df["reason"].isin(IGNORED_REASONS)]
         finalized_or_old = kpi_df[kpi_df["reason"] != "PENDING"].copy()
+        # Upper bound for rolling KPI: cycle end, not cycle start (validated_at is per-row "now").
+        kpi_now_hk = datetime.now(HK_TZ)
         precision_15m, matches_15m, total_15m = _rolling_precision_by_validated_at(
-            finalized_or_old, now_hk=now_hk, window=timedelta(minutes=15)
+            finalized_or_old, now_hk=kpi_now_hk, window=timedelta(minutes=15)
         )
         precision_1h, matches_1h, total_1h = _rolling_precision_by_validated_at(
-            finalized_or_old, now_hk=now_hk, window=timedelta(hours=1)
+            finalized_or_old, now_hk=kpi_now_hk, window=timedelta(hours=1)
         )
         logger.info(
             "[validator] Cumulative Precision (15m window, by validated_at): %.2f%% (%d/%d)",
@@ -1891,7 +1898,7 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False, existi
             _mv = _latest_model_version_from_alerts(alerts)
             _append_validator_metrics(
                 conn,
-                recorded_at=now_hk.isoformat(),
+                recorded_at=kpi_now_hk.isoformat(),
                 model_version=_mv,
                 precision=float(precision_15m),
                 total=int(total_15m),
