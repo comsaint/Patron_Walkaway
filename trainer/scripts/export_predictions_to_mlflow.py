@@ -192,7 +192,8 @@ def run_export(
             """
             SELECT prediction_id, scored_at, bet_id, session_id, player_id,
                    canonical_id, casino_player_id, table_id, model_version,
-                   score, margin, is_alert, is_rated_obs
+                   score, margin, is_alert, is_rated_obs,
+                   hour_of_day, day_of_week, is_weekend, bet_size_bucket
             FROM prediction_log
             WHERE prediction_id > ? AND scored_at <= ?
             ORDER BY prediction_id

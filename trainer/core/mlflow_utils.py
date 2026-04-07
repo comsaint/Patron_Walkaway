@@ -420,6 +420,44 @@ def log_artifact_safe(local_path: str | Path, artifact_path: Optional[str] = Non
         _log.warning("MLflow log_artifact failed for %s: %s", local_path, e)
 
 
+def log_artifacts_safe(local_dir: str | Path, artifact_path: Optional[str] = None) -> None:
+    """Log a directory tree as MLflow artifacts; no-op when MLflow is unavailable.
+
+    Retries on transient 502/503/504 (same policy as ``log_metrics_safe``).
+    Training must not fail when upload fails; warnings only.
+    """
+    if not is_mlflow_available():
+        return
+    import mlflow  # type: ignore[import-not-found]
+
+    delay_sec = float(_MLFLOW_RETRY_INITIAL_DELAY_SEC)
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MLFLOW_RETRY_MAX_RETRIES + 1):
+        try:
+            mlflow.log_artifacts(str(local_dir), artifact_path=artifact_path)
+            return
+        except Exception as e:
+            last_exc = e
+            if attempt < _MLFLOW_RETRY_MAX_RETRIES and _is_transient_mlflow_error(e):
+                _log.info(
+                    "MLflow log_artifacts transient error (attempt %d/%d), retry in %.0fs: %s",
+                    attempt + 1,
+                    _MLFLOW_RETRY_MAX_RETRIES + 1,
+                    delay_sec,
+                    type(e).__name__,
+                )
+                time.sleep(delay_sec)
+                delay_sec *= _MLFLOW_RETRY_BACKOFF_MULTIPLIER
+            else:
+                break
+    _log.warning(
+        "MLflow log_artifacts failed for %s after %d attempts: %s",
+        local_dir,
+        _MLFLOW_RETRY_MAX_RETRIES + 1,
+        type(last_exc).__name__ if last_exc is not None else "Unknown",
+    )
+
+
 def end_run_safe() -> None:
     """End the current run if active and MLflow is available; otherwise no-op."""
     if not is_mlflow_available():

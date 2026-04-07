@@ -236,7 +236,19 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         model_version   : str
         feature_spec    : parsed YAML dict or None
     """
-    d = model_dir or MODEL_DIR
+    if model_dir is not None:
+        d = model_dir.expanduser().resolve()
+    else:
+        d = MODEL_DIR.resolve()
+        # Versioned training writes ``out/models/<model_version>/model.pkl`` + manifest at root.
+        if not (d / "model.pkl").exists():
+            try:
+                from trainer.core.model_bundle_paths import read_latest_bundle_dir
+
+                d = read_latest_bundle_dir(d)
+                logger.info("[scorer] Loaded model bundle from latest manifest: %s", d)
+            except (FileNotFoundError, ValueError, OSError):
+                pass
     model_path = d / "model.pkl"      # v10 single-model artifact
     rated_path = d / "rated_model.pkl"
     feature_list_path = d / "feature_list.json"
@@ -1391,6 +1403,73 @@ def _load_profile_for_scoring(
 
 # ── Phase 2 P1.1 Prediction log (PLAN T4) ───────────────────────────────────────
 
+_PREDICTION_LOG_SEGMENT_COLS: List[Tuple[str, str]] = [
+    ("hour_of_day", "INTEGER"),
+    ("day_of_week", "INTEGER"),
+    ("is_weekend", "INTEGER"),
+    ("bet_size_bucket", "TEXT"),
+]
+
+
+def _migrate_prediction_log_segment_columns(conn: sqlite3.Connection) -> None:
+    """Add P1.6 segment columns to prediction_log when missing (idempotent)."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(prediction_log)").fetchall()}
+    for col_name, col_type in _PREDICTION_LOG_SEGMENT_COLS:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE prediction_log ADD COLUMN {col_name} {col_type}")
+
+
+def _hk_ts_for_prediction_log_row(row: pd.Series, scored_at_iso: str) -> Optional[pd.Timestamp]:
+    """Resolve HK wall-clock instant for segmentation: prefer ``bet_ts``, else *scored_at_iso*."""
+    bt = row.get("bet_ts")
+    if bt is not None and not pd.isna(bt):
+        hk_ser = _warehouse_timestamp_series_to_hk(pd.Series([bt]))
+        t0 = hk_ser.iloc[0]
+        if pd.notna(t0):
+            return t0
+    return _meta_iso_to_hk(scored_at_iso)
+
+
+def _bet_size_bucket_from_wager(wager_val: object, edges: Tuple[float, ...]) -> str:
+    """Map wager (HKD) to a fixed bucket label; missing or non-finite values → ``unknown``."""
+    if wager_val is None or pd.isna(wager_val):
+        return "unknown"
+    try:
+        w = float(wager_val)
+    except (TypeError, ValueError):
+        return "unknown"
+    if not math.isfinite(w) or w < 0:
+        return "unknown"
+    if len(edges) < 2:
+        return "unknown"
+    if w >= edges[-1]:
+        return f"{int(edges[-1])}_plus"
+    for i in range(len(edges) - 1):
+        lo, hi = edges[i], edges[i + 1]
+        if lo <= w < hi:
+            return f"{int(lo)}_{int(hi)}"
+    return "unknown"
+
+
+def _prediction_log_segment_fields(
+    row: pd.Series, scored_at_iso: str
+) -> Tuple[Optional[int], Optional[int], Optional[int], str]:
+    """Derive hour_of_day, day_of_week, is_weekend (HK), and bet_size_bucket for one row."""
+    edges = getattr(
+        config,
+        "PREDICTION_LOG_BET_SIZE_EDGES_HKD",
+        (0.0, 100.0, 500.0, 2000.0, 10000.0),
+    )
+    ts = _hk_ts_for_prediction_log_row(row, scored_at_iso)
+    bucket = _bet_size_bucket_from_wager(row.get("wager"), edges)
+    if ts is None or pd.isna(ts):
+        return None, None, None, bucket
+    hour = int(ts.hour)
+    dow = int(ts.dayofweek)
+    weekend = 1 if dow >= 5 else 0
+    return hour, dow, weekend, bucket
+
+
 def _ensure_prediction_log_table(conn: sqlite3.Connection) -> None:
     """Create prediction_log table if not exists (independent DB, WAL)."""
     conn.execute(
@@ -1408,10 +1487,15 @@ def _ensure_prediction_log_table(conn: sqlite3.Connection) -> None:
             score REAL NOT NULL,
             margin REAL NOT NULL,
             is_alert INTEGER NOT NULL,
-            is_rated_obs INTEGER NOT NULL
+            is_rated_obs INTEGER NOT NULL,
+            hour_of_day INTEGER,
+            day_of_week INTEGER,
+            is_weekend INTEGER,
+            bet_size_bucket TEXT
         )
         """
     )
+    _migrate_prediction_log_segment_columns(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_prediction_log_scored_at ON prediction_log(scored_at)"
     )
@@ -1502,6 +1586,7 @@ def _append_prediction_log(
         rows = []
         for _, row in df.iterrows():
             ialert = 1 if (row["margin"] >= 0 and row["is_rated_obs"] == 1) else 0
+            hod, dow, iwk, bsb = _prediction_log_segment_fields(row, scored_at)
             rows.append(
                 (
                     scored_at,
@@ -1516,6 +1601,10 @@ def _append_prediction_log(
                     float(row["margin"]),
                     ialert,
                     int(row["is_rated_obs"]),
+                    hod,
+                    dow,
+                    iwk,
+                    bsb,
                 )
             )
         conn.executemany(
@@ -1523,8 +1612,9 @@ def _append_prediction_log(
             INSERT INTO prediction_log (
                 scored_at, bet_id, session_id, player_id, canonical_id,
                 casino_player_id, table_id, model_version, score, margin,
-                is_alert, is_rated_obs
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_alert, is_rated_obs,
+                hour_of_day, day_of_week, is_weekend, bet_size_bucket
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

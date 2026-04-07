@@ -5,7 +5,83 @@
 > **相關**：DEC-030（Validator–Trainer 標籤／常數對齊，已完成）、Phase 2 P1.1（prediction log 由 scorer 寫入 **SQLite**，可再經 export 匯出至 MLflow）、ssot/phase2_p0_p1_ssot.md（precision@recall=1% 監控）。
 
 ---
-快速入口：首次調查從 §0 開始；只查某根因直接跳 §2 對應編號；執行順序見 §4；記錄結果填 §5。
+快速入口：先看「Priority 1（離線上界評估）」，再看 §4 的根因調查順序；只查某根因可直接跳 §2 對應編號；記錄結果填 §5。
+---
+
+## Priority 1（最高優先）：離線上界評估與可追溯留存
+
+> 本段為 2026-04-07 修訂：第一優先不是線上監控或即時調參，而是先回答  
+> **「在固定 recall 或固定 alert 頻率下，precision 的最大可達上限是多少？」**
+
+### P1.1 目標與邊界
+
+- **主要目標**：用固定 train/test 時窗，產出 precision 上界（frontier）與時間粒度漂移軌跡。
+- **本階段非目標**：不做線上 threshold 決策流程、不做即時調參策略、不做 A/B 上線決策。
+- **評估口徑**：以 prediction-level 明細重建 PR/ROC 與 precision frontier，避免只看單一聚合值。
+
+### P1.2 時窗與輸出粒度（當前預設）
+
+- **訓練窗**：`2024-01-01 ~ 2025-12-31`
+- **測試窗**：`2026-01-01 ~ 2026-03-31`
+- **輸出粒度**：至少日級；並可由全量 prediction 明細重算週/月/任意切片。
+
+### P1.3 模型版本化與不覆蓋（新增）
+
+**目的**：每次訓練產物必須可追溯且互不覆蓋，支援跨版本回測對照。
+
+1. 每次訓練寫入獨立目錄：`out/models/<model_version>/...`（不得覆蓋既有版本）。
+2. 保留一個明確「最新版本」索引（manifest 或等效機制），供預設載入。
+3. `model_version` 必須寫入 artifact 與後續 prediction 紀錄。
+
+**驗收**：連續訓練 N 次，N 份 artifact 皆可獨立回測，內容不互相覆蓋。
+
+### P1.4 Backtester/Scorer 指定模型版本（新增）
+
+**目的**：回測與評分可明確選擇模型版本；預設使用 latest。
+
+1. Backtester 增加模型選擇參數（例如 `--model-version` 與/或 `--model-dir`）。
+2. Scorer 維持可指定模型目錄能力，並補齊與 backtester 同口徑的「版本優先順序」。
+3. 若未指定，預設載入 latest；不得依賴不穩定的檔案時間排序。
+
+**驗收**：同一測試窗切換不同 `model_version`，可重現並比較差異。
+
+### P1.5 訓練模型備份到 MLflow（新增）
+
+**目的**：除了本地版本目錄，另有遠端備份可供還原與審計。
+
+1. 每次訓練將完整 model bundle 上傳 MLflow artifact（非僅 metrics 小檔）。
+2. 記錄 `model_version`、檔案 checksum、關鍵設定（train/test 時窗、feature spec/hash）。
+3. 若 MLflow 暫時不可用：訓練本身仍成功；上傳失敗需可重試且有明確記錄。
+
+**驗收**：可從 MLflow 下載指定版本 bundle，成功供 backtester/scorer 載入。
+
+### P1.6 Prediction 全量留存與分群欄位（新增）
+
+**目的**：為後續任意圖表（PR/ROC、precision@recall、alerts/hour）與分群門檻實驗提供統一底表。
+
+1. 留存 prediction-level 明細（至少含 `scored_at`, `model_version`, `score`, `margin`, `is_alert`, `is_rated_obs`, `table_id`, bet 主鍵）。
+2. 一併留存分群欄位（至少）：  
+   - 時段：`hour_of_day`, `day_of_week`, `is_weekend`  
+   - 金額桶：`bet_size_bucket`（固定分桶規則）  
+   - 場地：`table_id`（必要）；`table_class/table_type` 僅在有穩定對照資料時加入
+3. 匯出到 MLflow 時使用 Parquet 壓縮與分區策略，保留可重算性並控制體積。
+
+**重要提醒（邏輯檢查）**：
+- 「桌類」欄位目前可能沒有穩定維表可直接 join；若資料來源不穩定，先保留 `table_id`，後續再 enrich，避免污染分析口徑。
+- 不建議把全量特徵矩陣全部寫入 prediction log（儲存/查詢成本過高）；只存重建指標所需欄位即可。
+
+### P1.7 主要交付（本階段）
+
+1. 2026Q1 全量 prediction 明細（可追溯、可重算）。
+2. 整體與日級的：
+   - precision@recall（含 0.001/0.01/0.1/0.5）
+   - threshold@recall
+   - 固定 alerts/hour 條件下 precision frontier
+   - PR/ROC 曲線資料點（供未來重畫）
+3. MLflow 中可檢索到：
+   - 每版 model bundle
+   - 每次回測輸出與 prediction 匯出 artifact
+
 ---
 
 ## 0. 關鍵先決確認（調查前必做）
@@ -221,18 +297,19 @@ Trainer 在 **沒有 validation set** 時會使用 **threshold=0.5** fallback，
 
 ---
 
-## 4. 建議調查順序
+## 4. 建議調查順序（Priority 1 之後）
 
-0. **關鍵先決（§0）**：確認 prediction_log 最新 `scored_at`、`PREDICTION_LOG_DB_PATH` 與 **`DATA_DIR`**（含 player_profile.parquet、canonical_mapping.parquet 版本）在 production 已正確設定；若 prediction log 缺失則 R1/R2/R6 無法推進，應優先修復。
-1. **R2（指標口徑）**：先釐清 test 與 production 各自量的是什麼，避免誤比；建立同口徑比較方式。
-2. **R8（uncalibrated）**：快速檢查 artifact／log，排除 fallback 閾值造成的假落差。
-3. **R3 — censored（terminal bet）比對**：validator 與 `labels.py` 對 censored 樣本處理是否一致，成本低、對 precision 偏差影響大。**本步驟不依賴 prediction log**：即使 §0 發現 prediction log 未啟用，仍可推進——只需自 ClickHouse 或 Parquet 取一批 production bets，直接以 `labels.py` 與 validator 邏輯做 censored 比對（見 R3 調查方式步驟 3）。
-4. **R4 前 — canonical_mapping cutoff 快速驗證**：比對 `canonical_mapping.cutoff.json` 的 `cutoff_dtm` 與最近一次訓練的 `window_end`，確認差距是否可接受（約 5 分鐘可完成）。
-5. **R9（時區一致性）**：同一批 bets 在 trainer 與 scorer 資料源比對 payout_complete_dtm 的 tz-naive HK 是否一致；**整點偏移（如 8h）視為高風險並優先修正**。時區轉換錯誤屬**系統性資料偏差**，若存在會污染 R1/R4/R5 的分析結果；R9 不依賴 prediction log，成本低、影響面廣，故排在 profile／canonical 費時比對之前執行。
-6. **R3（其餘）**：確認 DEC-030 已部署，同批 bet 比對 trainer 與 validator 的 label；below-threshold 抽樣或全量標註補 FN。**前提：R9 已排除時區偏移，或已確認偏移不影響 label 邊界（例如 gap 遠離 30min 臨界）**；否則 R3 的 `compute_labels`／validator 比對結果可能被 `payout_complete_dtm` 時區錯誤污染。
-7. **R1、R6（閾值與嚴謹指標）**：在具備 prediction log ＋ 離線標註後，還原 production PR、與 test 同口徑比較；注意 prediction_log 與 alerts 表筆數交叉核對。
-8. **R4（其餘）**：若 R1/R3 無法解釋落差，再查 profile TTL（可先用 §R4 步驟 1 的臨時驗證路徑）、rated、資料源與 FND-01；必要時 scorer 加 log profile_snapshot_dtm。
-9. **R5、R7（分佈與 backtest 代表性）**：分時段／群體與多窗 backtest，評估分佈與視窗代表性。
+0. **先執行 Priority 1**：完成離線上界評估、模型版本化、模型可選載入、MLflow 模型備份、prediction 分群留存（見前述 P1.1~P1.7）。
+1. **關鍵先決（§0）**：確認 prediction_log 最新 `scored_at`、`PREDICTION_LOG_DB_PATH` 與 **`DATA_DIR`**（含 player_profile.parquet、canonical_mapping.parquet 版本）在 production 已正確設定；若 prediction log 缺失則 R1/R2/R6 無法推進，應優先修復。
+2. **R2（指標口徑）**：先釐清 test 與 production 各自量的是什麼，避免誤比；建立同口徑比較方式。
+3. **R8（uncalibrated）**：快速檢查 artifact／log，排除 fallback 閾值造成的假落差。
+4. **R3 — censored（terminal bet）比對**：validator 與 `labels.py` 對 censored 樣本處理是否一致，成本低、對 precision 偏差影響大。**本步驟不依賴 prediction log**。
+5. **R4 前 — canonical_mapping cutoff 快速驗證**：比對 `canonical_mapping.cutoff.json` 的 `cutoff_dtm` 與最近一次訓練 `window_end` 差距（快速檢查）。
+6. **R9（時區一致性）**：同批 bets 比對 tz-naive HK 時間是否一致；若有整點偏移（如 8h）視為高風險，先修再做後續比較。
+7. **R3（其餘）**：確認 DEC-030 已部署，同批 bet 比對 trainer 與 validator label；必要時做 below-threshold 抽樣補 FN。
+8. **R1、R6（閾值與嚴謹指標）**：在具備 prediction log＋離線標註後，還原 production PR，與 test 同口徑比較。
+9. **R4（其餘）**：若前述仍無法解釋落差，再查 profile TTL、rated 集合、資料源與 FND-01 差異。
+10. **R5、R7（分佈與代表性）**：分時段／分群與多窗 backtest，檢視漂移與視窗代表性。
 
 ---
 

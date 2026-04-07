@@ -68,9 +68,14 @@ from sklearn.model_selection import train_test_split
 from zoneinfo import ZoneInfo
 
 from trainer.profile_schedule import latest_month_end_on_or_before, month_end_dates
+from trainer.core.model_bundle_paths import (
+    safe_version_subdirectory,
+    write_latest_model_manifest,
+)
 from trainer.core.mlflow_utils import (
     has_active_run,
     log_artifact_safe,
+    log_artifacts_safe,
     log_metrics_safe,
     log_params_safe,
     log_tags_safe,
@@ -4893,6 +4898,18 @@ def _log_training_provenance_to_mlflow(
             log_params_safe(params)
 
 
+def _sha256_file_hex(path: Path, chunk_bytes: int = 1 << 20) -> str:
+    """Return lowercase hex SHA-256 of the file at *path* (streaming, bounded chunk size)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_bytes)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def save_artifact_bundle(
     rated: Optional[dict],
     feature_cols: List[str],
@@ -4901,8 +4918,13 @@ def save_artifact_bundle(
     sample_rated_n: Optional[int] = None,
     feature_spec_path: Optional[Path] = None,
     neg_sample_frac: float = 1.0,
+    bundle_dir: Optional[Path] = None,
 ) -> None:
     """Write all model artifacts atomically (v10 single rated model, DEC-021).
+
+    When *bundle_dir* is set, artifacts are written there; otherwise :data:`MODEL_DIR`
+    (typically ``out/models``). Versioned training uses
+    ``out/models/<model_version>/`` (see Priority 1 investigation plan).
 
     v10 single-model format
     -----------------------
@@ -4917,6 +4939,8 @@ def save_artifact_bundle(
     -----------------------------------------------------------------------
     models/walkaway_model.pkl     {"model", "features", "threshold"}
     """
+    _out: Path = bundle_dir if bundle_dir is not None else MODEL_DIR
+    _out.mkdir(parents=True, exist_ok=True)
     # DEC-024 / R3501: freeze a copy of the feature spec into the artifact bundle so
     # the scorer can load an exact match to training-time spec_hash for reproducibility.
     spec_hash: Optional[str] = None
@@ -4924,12 +4948,12 @@ def save_artifact_bundle(
     _fsp = Path(feature_spec_path) if feature_spec_path is not None else FEATURE_SPEC_PATH
     if _fsp.exists():
         import shutil as _shutil
-        _shutil.copy2(_fsp, MODEL_DIR / "feature_spec.yaml")
+        _shutil.copy2(_fsp, _out / "feature_spec.yaml")
         spec_hash = hashlib.md5(_fsp.read_bytes()).hexdigest()[:12]
         feature_spec = load_feature_spec(_fsp)
     # v10 single-model format (DEC-021): one model.pkl only
     if rated:
-        _pkl_path = MODEL_DIR / "model.pkl"
+        _pkl_path = _out / "model.pkl"
         _tmp = _pkl_path.with_suffix(".pkl.tmp")
         joblib.dump(
             {"model": rated["model"], "threshold": rated["threshold"], "features": rated["features"]},
@@ -4952,7 +4976,7 @@ def save_artifact_bundle(
         }
         for c in feature_cols
     ]
-    (MODEL_DIR / "feature_list.json").write_text(
+    (_out / "feature_list.json").write_text(
         json.dumps(feature_list, indent=2), encoding="utf-8"
     )
 
@@ -4975,11 +4999,11 @@ def save_artifact_bundle(
             else:
                 reason_code_map[feat] = f"FEAT_{feat[:30].upper()}"
 
-    (MODEL_DIR / "reason_code_map.json").write_text(
+    (_out / "reason_code_map.json").write_text(
         json.dumps(reason_code_map, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
-    (MODEL_DIR / "model_version").write_text(model_version, encoding="utf-8")
+    (_out / "model_version").write_text(model_version, encoding="utf-8")
     # R703: flag when the fallback (uncalibrated) 0.5 threshold was used.
     # R804: read from the _uncalibrated code-path flag set by _train_one_model,
     # not from `threshold == 0.5` — a legitimately-optimised threshold of 0.5
@@ -4993,7 +5017,7 @@ def save_artifact_bundle(
             else rated.get("_uncalibrated", False)
         ),
     }
-    (MODEL_DIR / "training_metrics.json").write_text(
+    (_out / "training_metrics.json").write_text(
         json.dumps(
             {
                 **combined_metrics,
@@ -5028,10 +5052,10 @@ def save_artifact_bundle(
                 "features": rated["features"],
                 "threshold": rated["threshold"],
             },
-            MODEL_DIR / "walkaway_model.pkl",
+            _out / "walkaway_model.pkl",
         )
 
-    logger.info("Artifacts saved to %s  (version=%s)", MODEL_DIR, model_version)
+    logger.info("Artifacts saved to %s  (version=%s)", _out, model_version)
 
 
 def _write_pipeline_diagnostics_json(
@@ -5058,8 +5082,11 @@ def _write_pipeline_diagnostics_json(
     step7_sys_available_min_gb: Optional[float] = None,
     step7_sys_used_percent_peak: Optional[float] = None,
     chunk_cache_stats: Optional[Dict[str, int]] = None,
+    output_dir: Optional[Path] = None,
 ) -> None:
-    """Write resource/timing diagnostics to MODEL_DIR/pipeline_diagnostics.json (omit None keys).
+    """Write resource/timing diagnostics to ``output_dir/pipeline_diagnostics.json`` (omit None keys).
+
+    *output_dir* defaults to :data:`MODEL_DIR` when omitted.
 
     See doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md — RSS/OOM fields align with
     run_pipeline sampling and oom_precheck estimate, not OOM helper return values.
@@ -5095,7 +5122,8 @@ def _write_pipeline_diagnostics_json(
         for _ck, _cv in chunk_cache_stats.items():
             if _cv is not None:
                 out[_ck] = _cv
-    (MODEL_DIR / "pipeline_diagnostics.json").write_text(
+    _dir = output_dir if output_dir is not None else MODEL_DIR
+    (_dir / "pipeline_diagnostics.json").write_text(
         json.dumps(out, indent=2, default=str),
         encoding="utf-8",
     )
@@ -6526,15 +6554,31 @@ def run_pipeline(args) -> None:
                     # If memory sampling fails, just keep metrics unset; never impact training.
                     pass
         
-            # 7. Save artifacts
+            # 7. Save artifacts (versioned subdir under MODEL_DIR; see Priority 1 investigation plan).
             print("[Step 10/10] Save artifact bundle…", flush=True)
             t0 = time.perf_counter()
+            _versions_root = MODEL_DIR
+            _bundle_dir = safe_version_subdirectory(_versions_root, model_version)
+            if _bundle_dir.exists() and (_bundle_dir / "model.pkl").exists():
+                raise FileExistsError(
+                    f"Refusing to overwrite existing model bundle: {_bundle_dir}. "
+                    "Remove the directory or wait for a new model_version timestamp."
+                )
+            _bundle_dir.mkdir(parents=True, exist_ok=True)
             save_artifact_bundle(
                 rated_art, active_feature_cols, combined_metrics, model_version,
                 sample_rated_n=sample_rated_n,
                 feature_spec_path=FEATURE_SPEC_PATH,
                 neg_sample_frac=_effective_neg_sample_frac,
+                bundle_dir=_bundle_dir,
             )
+            try:
+                write_latest_model_manifest(_versions_root, model_version, _bundle_dir)
+            except Exception as _man_exc:
+                logger.warning(
+                    "Failed to write latest model manifest (artifacts saved): %s",
+                    _man_exc,
+                )
             _el = time.perf_counter() - t0
             step10_duration_sec = _el
             print("[Step 10/10] Save artifact bundle done in %.1fs" % _el, flush=True)
@@ -6548,13 +6592,13 @@ def run_pipeline(args) -> None:
             try:
                 _log_training_provenance_to_mlflow(
                     model_version=model_version,
-                    artifact_dir=str(MODEL_DIR),
+                    artifact_dir=str(_bundle_dir),
                     training_window_start=effective_start,
                     training_window_end=effective_end,
                     feature_spec_path=str(FEATURE_SPEC_PATH),
-                    training_metrics_path=str(MODEL_DIR / "training_metrics.json"),
-                    pipeline_diagnostics_path=str(MODEL_DIR / "pipeline_diagnostics.json"),
-                    pipeline_diagnostics_rel_path=f"{MODEL_DIR.name}/pipeline_diagnostics.json",
+                    training_metrics_path=str(_bundle_dir / "training_metrics.json"),
+                    pipeline_diagnostics_path=str(_bundle_dir / "pipeline_diagnostics.json"),
+                    pipeline_diagnostics_rel_path=f"{_bundle_dir.name}/pipeline_diagnostics.json",
                 )
             except Exception as e:
                 logger.warning("MLflow provenance logging failed (training still succeeded): %s", e)
@@ -6563,7 +6607,7 @@ def run_pipeline(args) -> None:
             # dual-model runs so scorer/backtester cannot accidentally fall back to a
             # v9 artifact (v10 uses model.pkl only).
             for _stale in ["nonrated_model.pkl", "rated_model.pkl"]:
-                _stale_path = MODEL_DIR / _stale
+                _stale_path = _versions_root / _stale
                 if _stale_path.exists():
                     _stale_path.unlink()
                     logger.info("Removed stale artifact: %s", _stale)
@@ -6602,6 +6646,7 @@ def run_pipeline(args) -> None:
                     step7_sys_available_min_gb=step7_sys_available_min_gb,
                     step7_sys_used_percent_peak=step7_sys_used_percent_peak,
                     chunk_cache_stats=chunk_cache_stats,
+                    output_dir=_bundle_dir,
                 )
             except Exception as _diag_exc:
                 logger.warning(
@@ -6610,7 +6655,28 @@ def run_pipeline(args) -> None:
                 )
 
             # Phase 2 / pipeline plan: small-file artifacts for MLflow UI (best-effort; no active run → no-op).
+            # P1.5: full bundle under model_bundle/ (log_artifacts_safe) + SHA-256 params; keeps bundle/ copies below.
             if has_active_run():
+                _checksum_params: Dict[str, str] = {}
+                _mpath = _bundle_dir / "model.pkl"
+                if _mpath.is_file():
+                    try:
+                        _checksum_params["model_pkl_sha256"] = _sha256_file_hex(_mpath)
+                    except Exception as _h_exc:
+                        logger.warning("model.pkl checksum failed (MLflow param skipped): %s", _h_exc)
+                if FEATURE_SPEC_PATH.is_file():
+                    try:
+                        _checksum_params["feature_spec_sha256"] = _sha256_file_hex(FEATURE_SPEC_PATH)
+                    except Exception as _h_exc:
+                        logger.warning("feature_spec checksum failed (MLflow param skipped): %s", _h_exc)
+                if _checksum_params:
+                    try:
+                        log_params_safe(_checksum_params)
+                    except Exception as _p_exc:
+                        logger.warning("MLflow checksum params failed (training still succeeded): %s", _p_exc)
+                # P1.5: full bundle (includes model.pkl); transient retries in helper.
+                log_artifacts_safe(_bundle_dir, artifact_path="model_bundle")
+                # Legacy UI path: small files under bundle/ (contract tests + existing dashboards).
                 _bundle_artifact_path = "bundle"
                 for _fname in (
                     "training_metrics.json",
@@ -6618,7 +6684,7 @@ def run_pipeline(args) -> None:
                     "feature_spec.yaml",
                     "model_version",
                 ):
-                    _ap = MODEL_DIR / _fname
+                    _ap = _bundle_dir / _fname
                     if _ap.is_file():
                         log_artifact_safe(_ap, artifact_path=_bundle_artifact_path)
 

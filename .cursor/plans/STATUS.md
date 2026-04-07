@@ -4947,3 +4947,63 @@ python -m pytest tests/ -q --tb=no --ignore=tests/e2e --ignore=tests/load
 
 **結果（建立時）**：ruff ✅；review_risks ✅（4 passed）；mypy ✅（Success: no issues found in 57 source files）；pytest ✅（1547 passed, 62 skipped）。
 
+---
+
+### 本輪 — INVESTIGATION_PLAN Priority 1（P1.3–P1.6 程式面）+ `/cycle_code`（2026-04-07）
+
+**對應**：[INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md](INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md) **Priority 1**（離線上界／可追溯）。
+
+#### STEP 1 — Builder（實作摘要）
+
+| 檔案 | 說明 |
+|------|------|
+| [trainer/core/model_bundle_paths.py](../../trainer/core/model_bundle_paths.py) | 版本子目錄、`_latest_model_manifest.json`、legacy 根目錄 `model.pkl`、`resolve_model_bundle_dir`（先前輪次；本輪延續使用）。 |
+| [trainer/training/trainer.py](../../trainer/training/trainer.py) | Step 10 版本化目錄、`save_artifact_bundle(..., bundle_dir=)`、**P1.5**：`model_pkl_sha256`／`feature_spec_sha256` 寫入 MLflow params；`log_artifacts_safe(..., artifact_path="model_bundle")` 上傳**整包**；保留 **Phase 2** `bundle/` 四小檔 + 錨點註解以通過既有契約測試。 |
+| [trainer/core/mlflow_utils.py](../../trainer/core/mlflow_utils.py) | 新增 **`log_artifacts_safe`**（目錄上傳、503 類**重試**）。 |
+| [trainer/training/backtester.py](../../trainer/training/backtester.py) | **`resolve_model_bundle_dir`** 匯入移至檔案頂部，移除中段重複 import（修 **E402**）。 |
+| [trainer/serving/scorer.py](../../trainer/serving/scorer.py) | **P1.6**：`prediction_log` 新增 `hour_of_day`／`day_of_week`／`is_weekend`／`bet_size_bucket`（CREATE + idempotent `ALTER`）；寫入時以 **`bet_ts`→HK** 優先、否則 **`scored_at`**；`wager`→分桶。 |
+| [trainer/core/config.py](../../trainer/core/config.py) | **`PREDICTION_LOG_BET_SIZE_EDGES_HKD`** 固定 HKD 分桶邊界。 |
+| [trainer/scripts/export_predictions_to_mlflow.py](../../trainer/scripts/export_predictions_to_mlflow.py) | 匯出 SQL **SELECT** 含上述四欄（舊列為 NULL）。 |
+
+#### 手動驗證建議
+
+1. **訓練**：連跑兩次完整 `run_pipeline`，確認 `out/models/<model_version>/` 各一且第二次不因覆蓋靜默失敗；根目錄有 `_latest_model_manifest.json`。
+2. **MLflow**：在 active run 下確認 artifact **`model_bundle/`** 含 `model.pkl`，run params 含 **`model_pkl_sha256`**、**`feature_spec_sha256`**（URI 未設時仍應完成訓練）。
+3. **回測**：`python -m trainer.backtester --help` 確認 `--model-dir`／`--model-version`；以不同版本目錄跑同一測試窗比對輸出。
+4. **Prediction log**：啟用 `PREDICTION_LOG_DB_PATH` 跑一輪 scorer 後 `SELECT hour_of_day, bet_size_bucket FROM prediction_log LIMIT 5`。
+5. **向後相容**：既有 DB 僅執行 export、尚未經 scorer 開表時，若 SQLite 尚無新欄位，需先讓 scorer 寫入一次觸發 migration，或接受 export 查詢失敗直至 migration。
+
+#### STEP 2 — Reviewer（風險與建議）
+
+| # | 類型 | 說明 | 建議 | 測試／工具 |
+|---|------|------|------|------------|
+| 1 | 效能／頻寬 | **`log_artifacts_safe` + `bundle/` 四檔** 對小檔**重複上傳**（刻意保留以維持契約與舊 UI）。 | 若流量成問題：可改測試契約後只保留 `model_bundle/`，或僅上傳 `model.pkl` + manifest。 | 監控 MLflow artifact 體積；可選單次訓練手動比對上傳量。 |
+| 2 | 儲存／記憶體 | **整包目錄上傳**含大 `model.pkl`，筆電或慢網路訓練尾段耗時增加。 | 失敗僅 warning（與既有 MLflow 策略一致）；必要時關閉 tracking URI 或改離線。 | 手動量測 Step 10 後至結束耗時。 |
+| 3 | 語意 | **`bet_ts` 缺漏**時分群時間欄位改以 **`scored_at`** 推算，**不是**下注本地時間。 | 分析報表註記；必要時補 CH 欄位或拒寫分群欄。 | 抽樣含／不含 `bet_ts` 的列。 |
+| 4 | Schema | 極舊的 `prediction_log` 若由**非**本 scorer 建立且無 migration 路徑，**SELECT 新欄**可能失敗。 | 以本 repo `scorer` 或 `_ensure_prediction_log_table` 開表一次。 | 整合測試已覆蓋標準路徑。 |
+| 5 | 安全性 | **`log_artifacts_safe` 上傳整目錄**；目錄內不應含敏感暫存檔。 | 維持 bundle 目錄僅產物；勿手動塞金鑰。 | 流程／code review。 |
+
+#### STEP 3 — Tester（測試策略）
+
+依 **project-context**：**未修改 `tests/`**。Reviewer 風險改以**既有契約／整合測試**覆蓋；**未**新增獨立測試檔。
+
+#### STEP 4 — Tester（修實作至工具鏈）
+
+| 檢查 | 指令 | 結果（代理環境） |
+|------|------|------------------|
+| Ruff | `ruff check trainer/core/mlflow_utils.py trainer/core/config.py trainer/serving/scorer.py trainer/training/trainer.py trainer/scripts/export_predictions_to_mlflow.py trainer/training/backtester.py` | **通過** |
+| Pytest（prediction log / export / schema / backtester smoke / MLflow 契約） | `pytest tests/integration/test_phase2_prediction_log_sqlite.py tests/integration/test_phase2_prediction_export.py tests/review_risks/test_review_risks_phase2_prediction_log_schema.py tests/review_risks/test_review_risks_round240.py tests/review_risks/test_review_risks_pipeline_diagnostics_mlflow_review.py tests/review_risks/test_review_risks_pipeline_provenance_review.py tests/review_risks/test_review_risks_pipeline_plan_section6_contract.py tests/integration/test_phase2_trainer_mlflow.py -q` | **通過**（含 23+21+6 等；見執行記錄） |
+
+#### 計畫狀態與下一步
+
+- **P1.3 / P1.4**：版本化目錄、manifest、backtester／scorer 解析 latest（**已完成**，見上列檔案）。
+- **P1.5**：MLflow **完整 bundle** + checksum params（**已完成**）；「上傳失敗可重試」：目錄上傳具重試；**未**另寫獨立「重試佇列」後台。
+- **P1.6**：prediction log **分群欄位** + export SELECT（**已完成**）；Parquet **分區策略**仍依現有 export 路徑慣例，未改 partition 維度。
+- **建議後續**：全量 `pytest tests/ -q -p no:langsmith`；**P1.7** 與調查 §0 營運檢查（production `PREDICTION_LOG_DB_PATH`／`DATA_DIR`）屬 runbook，非本輪程式範圍。
+
+---
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成**（未改 tests；依賴既有測試） · ✅ **STEP 4 完成**
+
+✅ **全部完成，CYCLE 結束**
+

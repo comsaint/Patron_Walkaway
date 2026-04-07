@@ -92,6 +92,10 @@ PREDICTION_LOG_SUMMARY_WINDOW_MINUTES: int = int(
     os.getenv("PREDICTION_LOG_SUMMARY_WINDOW_MINUTES", "60"),
 )
 
+# P1.6 (investigation plan): HKD wager edges for prediction_log.bet_size_bucket.
+# Buckets are half-open [edge[i], edge[i+1]); final open-ended bucket is f"{int(edges[-1])}_plus".
+PREDICTION_LOG_BET_SIZE_EDGES_HKD: Tuple[float, ...] = (0.0, 100.0, 500.0, 2000.0, 10000.0)
+
 # ------------------ Runtime Retention -----------------------------
 # Trim local CSV buffers to avoid unbounded growth
 SCORER_ALERT_RETENTION_DAYS = 30      # Keep scorer alerts for last N days

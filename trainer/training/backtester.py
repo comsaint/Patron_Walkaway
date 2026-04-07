@@ -38,6 +38,8 @@ import pandas as pd
 from sklearn.metrics import average_precision_score, fbeta_score
 from zoneinfo import ZoneInfo
 
+from trainer.core.model_bundle_paths import resolve_model_bundle_dir
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logging.basicConfig(
     level=logging.INFO,
@@ -157,8 +159,11 @@ BACKTEST_OUT.mkdir(parents=True, exist_ok=True)
 # Artifact loading
 # ---------------------------------------------------------------------------
 
-def load_dual_artifacts() -> Dict[str, Any]:
+def load_dual_artifacts(bundle_dir: Optional[Path] = None) -> Dict[str, Any]:
     """Load model bundle for backtesting (v10 single rated model, DEC-021).
+
+    *bundle_dir* defaults to :data:`MODEL_DIR`. Use a versioned path such as
+    ``out/models/<model_version>/`` when comparing trained bundles.
 
     Priority:
     1. ``model.pkl``         — v10 single rated model
@@ -169,17 +174,20 @@ def load_dual_artifacts() -> Dict[str, Any]:
     the key ``"feature_list_meta"`` so that backtest() can distinguish profile
     features from non-profile features for NaN-fill logic (R127-1).
     """
+    root = bundle_dir if bundle_dir is not None else MODEL_DIR
+    root = root.resolve()
+
     def _try(path: Path) -> Optional[dict]:
         if path.exists():
             return joblib.load(path)
         return None
 
-    single = _try(MODEL_DIR / "model.pkl")
+    single = _try(root / "model.pkl")
     if single is not None:
         artifacts: Dict[str, Any] = {"rated": single}
     else:
-        rated = _try(MODEL_DIR / "rated_model.pkl")
-        legacy = _try(MODEL_DIR / "walkaway_model.pkl")
+        rated = _try(root / "rated_model.pkl")
+        legacy = _try(root / "walkaway_model.pkl")
 
         if rated is None and legacy is not None:
             logger.warning("rated_model.pkl not found; using walkaway_model.pkl as fallback")
@@ -187,12 +195,12 @@ def load_dual_artifacts() -> Dict[str, Any]:
 
         if rated is None:
             raise FileNotFoundError(
-                f"No model artifacts found in {MODEL_DIR}. "
+                f"No model artifacts found in {root}. "
                 "Run trainer.py first to produce model.pkl / rated_model.pkl."
             )
         artifacts = {"rated": rated}
 
-    _fl_path = MODEL_DIR / "feature_list.json"
+    _fl_path = root / "feature_list.json"
     if _fl_path.exists():
         try:
             artifacts["feature_list_meta"] = json.loads(_fl_path.read_text(encoding="utf-8"))
@@ -611,6 +619,7 @@ def backtest(
     run_optuna: bool = True,
     n_optuna_trials: int = OPTUNA_N_TRIALS,
     use_local_parquet: bool = False,
+    model_bundle_dir: Optional[Path] = None,
 ) -> dict:
     """Full backtest pipeline for one time window (v10 single rated model, DEC-021).
 
@@ -661,7 +670,8 @@ def backtest(
     # --- Track LLM on FULL bets (PLAN § Train–Serve Parity) ---
     # Compute before label filtering so window features see same history as trainer/scorer.
     _track_llm_degraded = False
-    _spec_path = MODEL_DIR / "feature_spec.yaml"
+    _bundle_root = model_bundle_dir if model_bundle_dir is not None else MODEL_DIR
+    _spec_path = _bundle_root / "feature_spec.yaml"
     if _spec_path.exists():
         feature_spec = load_feature_spec(_spec_path)
     else:
@@ -891,9 +901,32 @@ def main() -> None:
         "--n-trials", type=int, default=OPTUNA_N_TRIALS,
         help=f"Optuna trials for threshold search (default: {OPTUNA_N_TRIALS})",
     )
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Explicit model bundle directory (must contain model.pkl). Overrides --model-version.",
+    )
+    parser.add_argument(
+        "--model-version",
+        type=str,
+        default=None,
+        metavar="VER",
+        help=(
+            "Model version subdirectory under the versions root (same as MODEL_DIR / default out/models). "
+            "If neither flag is set, use _latest_model_manifest.json or legacy flat model.pkl."
+        ),
+    )
     args = parser.parse_args()
 
-    artifacts = load_dual_artifacts()
+    _mv = (args.model_version or "").strip() or None
+    _bundle_dir = resolve_model_bundle_dir(
+        MODEL_DIR,
+        explicit_dir=args.model_dir,
+        model_version=_mv,
+    )
+    logger.info("Backtest model bundle directory: %s", _bundle_dir)
+    artifacts = load_dual_artifacts(_bundle_dir)
     start, end = _parse_window(args)
 
     logger.info("Backtest window: %s -> %s", start, end)
@@ -914,6 +947,7 @@ def main() -> None:
         run_optuna=not args.skip_optuna,
         n_optuna_trials=args.n_trials,
         use_local_parquet=args.use_local_parquet,
+        model_bundle_dir=_bundle_dir,
     )
     print(json.dumps(result, indent=2, default=str))
 
