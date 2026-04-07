@@ -5009,6 +5009,61 @@ python -m pytest tests/ -q --tb=no --ignore=tests/e2e --ignore=tests/load
 
 ---
 
+## 2026-04-08 — P1.2 訓練＋回測端到端腳本 / `cycle_code`
+
+對齊 [INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md](INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md) **P1.2** 預設時窗（訓練 2024-01-01～2025-12-31、回測 2026-01-01～2026-03-31）。
+
+### STEP 1 — Builder
+
+| 檔案 | 說明 |
+|------|------|
+| [trainer/scripts/run_train_backtest_investigation_windows.py](../../trainer/scripts/run_train_backtest_investigation_windows.py) | 以 subprocess 串接 `python -m trainer.trainer` 與 `python -m trainer.backtester`；支援 `--dry-run`、`--use-local-parquet`、`--skip-optuna`／分別跳過 train 或 backtest Optuna、`--recent-chunks`／`--sample-rated`／`--no-preload`（僅訓練）、`--model-version`／`--model-dir`、`--train-only`／`--backtest-only`。 |
+
+**手動驗證**（repo 根）：
+
+```bash
+python -m trainer.scripts.run_train_backtest_investigation_windows --dry-run
+python -m trainer.scripts.run_train_backtest_investigation_windows --dry-run --use-local-parquet --skip-optuna
+# 實跑（需 CH 或本機 Parquet + 足夠資源）：
+# python -m trainer.scripts.run_train_backtest_investigation_windows
+```
+
+**下一步建議**：筆電試跑可加 `--recent-chunks 3 --sample-rated 500 --no-preload`；只看回測可加 `--backtest-only`。
+
+### STEP 2 — Reviewer（風險）
+
+| # | 類型 | 說明 | 建議 | 測試／緩解 |
+|---|------|------|------|------------|
+| 1 | 資源 | 預設兩年訓練窗在一般機器上易 OOM／極久。 | 文件中已建議 `--recent-chunks` 等；執行前先看 `trainer.trainer --help`。 | 手動；可選在腳本內偵測 RAM 僅 warning（未實作）。 |
+| 2 | 契約 | `trainer.trainer`／`trainer.backtester` CLI 更名時腳本 silently 錯誤。 | CI 整合測試已覆蓋 argv 組裝；重大 CLI 變更時同步改腳本與測試。 | 見 STEP 3。 |
+| 3 | 路徑 | `cwd` 固定為 repo root；從他處呼叫需先 `cd`。 | docstring 註明「從 repo 根執行」；`--dry-run` 可確認指令。 | dry-run 測試。 |
+| 4 | 終止碼 | 訓練失敗則不啟動回測（有意行為）。 | 若需「總跑回測」可加旗標（未實作）。 | 文件化現行語意。 |
+
+### STEP 3 — Tester
+
+| 檔案 | 說明 |
+|------|------|
+| [tests/integration/test_run_train_backtest_investigation_windows.py](../../tests/integration/test_run_train_backtest_investigation_windows.py) | `dry_run` 回傳 0、`_build_train_cmd`／`_build_backtest_cmd` 轉發 flag、`main` 拒絕 `--train-only --backtest-only`、`_repo_root()` 路徑存在性。 |
+
+```bash
+python -m pytest tests/integration/test_run_train_backtest_investigation_windows.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+| 檢查 | 結果（代理環境） |
+|------|------------------|
+| Ruff | `trainer/scripts/run_train_backtest_investigation_windows.py`、`tests/integration/...` ✅ |
+| Pytest | 上列整合測試 **5 passed** ✅ |
+
+**計畫對應**：呼應 PLAN 索引之 [INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md](INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md) 與 Consolidated Plan「離線／同窗評估」執行便利度；**未**取代 doc §8 其他手動驗收項。
+
+**建議下一項**：全量 `pytest tests/ -q -p no:langsmith`；或回 PATCH／Consolidated 表中下一個 In progress 任務。
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**
+
+---
+
 ## 2026-04-07 — PLAN_chunk_cache_portable_hit（Phase B1 + Phase A）/ `cycle_code`
 
 ### STEP 1 — Builder（實作範圍）
