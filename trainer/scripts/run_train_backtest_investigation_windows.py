@@ -9,6 +9,17 @@ Runs two subprocesses (same entrypoints as manual runs)::
   python -m trainer.trainer   --start … --end … [flags]
   python -m trainer.backtester --start … --end … [flags]
 
+**Laptop / skip training — use a pretrained bundle**
+
+Train elsewhere, copy ``out/models/<version>/`` (with ``model.pkl``) here, then::
+
+  python -m trainer.scripts.run_train_backtest_investigation_windows \\
+      --backtest-only --use-local-parquet \\
+      --model-dir out/models/<version>
+
+Omit ``--model-dir`` / ``--model-version`` to use ``_latest_model_manifest.json``
+(or legacy flat ``model.pkl`` under ``MODEL_DIR``), same as ``trainer.backtester``.
+
 From repo root::
 
   python -m trainer.scripts.run_train_backtest_investigation_windows --help
@@ -27,10 +38,10 @@ from typing import List, Optional, Sequence
 _log = logging.getLogger(__name__)
 
 # INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md § P1.2
-_DEFAULT_TRAIN_START = "2026-02-27"
-_DEFAULT_TRAIN_END = "2026-02-28"
-_DEFAULT_BACKTEST_START = "2026-03-01"
-_DEFAULT_BACKTEST_END = "2026-03-07"
+_DEFAULT_TRAIN_START = "2024-01-01"
+_DEFAULT_TRAIN_END = "2025-12-31"
+_DEFAULT_BACKTEST_START = "2026-01-01"
+_DEFAULT_BACKTEST_END = "2026-03-31"
 
 
 def _repo_root() -> Path:
@@ -128,6 +139,15 @@ def run_pipeline(
 ) -> int:
     """Execute train and/or backtest; return 0 on success, non-zero on failure."""
     root = _repo_root()
+    if backtest_only:
+        if model_dir is not None:
+            _log.info("Backtest-only: using model bundle directory %s", model_dir.resolve())
+        elif model_version:
+            _log.info("Backtest-only: using --model-version %s (under MODEL_DIR)", model_version)
+        else:
+            _log.info(
+                "Backtest-only: no --model-dir/--model-version; backtester resolves latest manifest or legacy bundle",
+            )
     if dry_run:
         if not backtest_only:
             print("[dry-run] train:", " ".join(_build_train_cmd(
@@ -187,7 +207,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Train + backtest with INVESTIGATION_PLAN P1.2 default windows "
-            "(override with --train-start / --backtest-end, etc.)."
+            "(override with --train-start / --backtest-end, etc.). "
+            "Use --backtest-only or --eval-only to skip training and run backtest on an existing bundle."
         ),
     )
     p.add_argument(
@@ -267,8 +288,13 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--backtest-only",
+        "--eval-only",
         action="store_true",
-        help="Only run backtester (expects an existing model bundle).",
+        dest="backtest_only",
+        help=(
+            "Only run backtester (skip training). Use --model-dir or --model-version to pick a bundle; "
+            "otherwise backtester uses latest manifest / legacy MODEL_DIR."
+        ),
     )
     p.add_argument(
         "--dry-run",

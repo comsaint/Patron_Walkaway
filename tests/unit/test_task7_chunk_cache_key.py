@@ -236,6 +236,16 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
             finally:
                 trainer_mod.LOCAL_PARQUET_DIR = old_root
 
+    def test_parquet_stable_rowgroups_schema_digest_succeeds_on_minimal_file(self) -> None:
+        """Guard: digest must not depend on ParquetSchema.num_columns (removed in some pyarrow)."""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "minimal.parquet"
+            pq.write_table(pa.table({"a": [1, 2], "b": ["x", "y"]}), p)
+            meta = pq.read_metadata(p)
+            d = trainer_mod._parquet_stable_rowgroups_schema_digest(meta)
+        self.assertRegex(d, r"^[0-9a-f]{16}$")
+        self.assertNotEqual(d, "0" * 16)
+
     def test_local_parquet_source_data_hash_ignores_mtime_only_changes(self) -> None:
         """Portable fp_v2: same bytes + bounds → same hash after utime-only touch."""
         ws = pd.Timestamp("2026-01-01 00:00:00")

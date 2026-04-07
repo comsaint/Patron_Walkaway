@@ -1,5 +1,57 @@
 # Code Review: ClickHouse 臨時表方案 (load_player_profile)
 
+---
+
+## 2026-04-07 CYCLE — CONSOLIDATED_PLAN §B 訓練速度與成本（STEP 1 Builder）
+
+### 本輪變更
+
+- **`trainer/training/trainer.py`**：`_parquet_stable_rowgroups_schema_digest` 以 `len(meta.schema)` 作為欄位數（不再讀 `FileMetaData.num_columns`）。部分 PyArrow 建置上 `num_columns` 會連到已移除的 `ParquetSchema.num_columns`，造成 `pq.read_metadata` 後計 digest 失敗、log 出現 `read_metadata failed ... num_columns`，`data_hash` 退化成全零 digest，Chunk / prefeatures cache 指紋失真。
+
+### 手動驗證
+
+```bash
+python -m pytest tests/unit/test_task7_chunk_cache_key.py \
+  tests/review_risks/test_task7_r5_local_metadata_review_risks_mre.py \
+  tests/review_risks/test_task7_dod_chunk_cache_stats_review_risks_mre.py -q --tb=short
+```
+
+（本機：`39 passed`。）
+
+### 下一步建議
+
+- §B 續作：Dynamic K Phase-A，或 Chunk Cache 跨機複製命中之實測紀錄；push 前再跑專案 pre-commit（ruff/mypy/pytest 全套）。
+
+### STEP 2 — Reviewer（本輪變更）
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|-----------|
+| 極舊 PyArrow | 若某版 `ParquetSchema` 不實作 `__len__`，`len(schema)` 可能失敗 | 與 CI 下限版本對照；必要時 `try/except` 改以 `schema.num_columns` 僅在屬性存在時 fallback | 在最低支援 pyarrow 的 matrix job 跑 `test_task7_chunk_cache_key` |
+| 毀損 footer | 異常 metadata 下 `len(schema)` 與 row group 不一致 | 維持現狀：digest 僅用於快取鍵，錯檔更傾向 cache miss | 可選：餵損壞 parquet 預期落入 `_file_token` 警告分支 |
+| 雜湊碰撞 | 與既有 fp_v2 文件相同：僅 metadata 層級指紋 | 無須改程式；營運仍以「寧可 miss」為預期 | 既有 bounds / row 變更測試已覆蓋 |
+
+### STEP 3 — Tester（僅 tests）
+
+- 新增：`tests/unit/test_task7_chunk_cache_key.py` 內 `test_parquet_stable_rowgroups_schema_digest_succeeds_on_minimal_file`，直接對 `pq.read_metadata` 呼叫 `_parquet_stable_rowgroups_schema_digest`，斷言 16 hex 且非全零，避免回歸到 `ParquetSchema.num_columns` 路徑。
+
+```bash
+python -m pytest tests/unit/test_task7_chunk_cache_key.py::TestTask7ChunkCacheKey::test_parquet_stable_rowgroups_schema_digest_succeeds_on_minimal_file -q
+```
+
+### STEP 4 — Tester（實作）
+
+- 無需再改 production（STEP 1 已修）；以 pytest 子集確認。
+
+```bash
+python -m pytest tests/unit/test_task7_chunk_cache_key.py -q --tb=short
+```
+
+→ **2026-04-07 實跑**：`18 passed`.
+
+**計畫後續（CONSOLIDATED §B）**：可攜式指紋 + R6 預設已與本修對齊；建議下一項優先 **Dynamic K Phase-A** 或 **R6 跨機 cache hit 實測紀錄**；GPU 項補 **CPU vs GPU benchmark** 數據至既有 runbook。
+
+---
+
 ## 1. [Bug/資源洩漏] ClickHouse Session Client 未正確關閉 (Connection Leak)
 *   **問題描述**：每次 `canonical_ids` 超過 5,000 時，都會實例化一個全新的 `session_client` (`_cc.get_client(...)`)，但在完成查詢並回傳 `df` 後，並沒有呼叫 `.close()`。這會導致背後的 HTTP 連線池 (urllib3) 與對應的 socket 沒有及時釋放，頻繁呼叫可能會導致 Connection Exhaustion 或資源洩漏。
 *   **具體修改建議**：使用 `try...finally` 確保 client 關閉。

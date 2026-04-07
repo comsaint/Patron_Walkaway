@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import io
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -79,6 +79,17 @@ class TestInvestigationE2eScript(unittest.TestCase):
                 rc = e2e_mod.main()
         self.assertEqual(rc, 2)
         self.assertIn("Cannot combine", stderr.getvalue())
+
+    def test_eval_only_alias_same_as_backtest_only_dry_run(self) -> None:
+        """--eval-only must map to backtest_only (no train line in dry-run output)."""
+        stdout = io.StringIO()
+        with patch.object(e2e_mod.sys, "argv", ["prog", "--eval-only", "--dry-run"]):
+            with redirect_stdout(stdout):
+                rc = e2e_mod.main()
+        self.assertEqual(rc, 0)
+        out = stdout.getvalue()
+        self.assertIn("[dry-run] backtest:", out)
+        self.assertNotIn("[dry-run] train:", out)
 
     def test_repo_root_points_at_workspace(self) -> None:
         """Script lives under trainer/scripts → repo root is two parents up."""

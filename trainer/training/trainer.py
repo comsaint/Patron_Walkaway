@@ -1954,11 +1954,10 @@ def _parquet_stable_rowgroups_schema_digest(meta: Any) -> str:
         rg = meta.row_group(i)
         rgs.append([int(rg.num_rows), int(rg.total_byte_size)])
     schema = meta.schema
-    # PyArrow: FileMetaData.num_columns is the portable count; ParquetSchema may
-    # omit num_columns in some versions (use len(schema) as fallback).
-    _n_cols = getattr(meta, "num_columns", None)
-    if _n_cols is None:
-        _n_cols = len(schema)
+    # PyArrow: never use FileMetaData.num_columns here — some builds implement it
+    # via ParquetSchema.num_columns, which was removed (AttributeError). len(schema)
+    # is the portable column count across tested pyarrow versions.
+    _n_cols = len(schema)
     cols: List[Tuple[str, str, str]] = []
     for i in range(int(_n_cols)):
         col = schema.column(i)
