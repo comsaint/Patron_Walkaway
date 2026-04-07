@@ -133,6 +133,38 @@ if SCORER_LOOKBACK_HOURS > SCORER_LOOKBACK_HOURS_MAX:
     SCORER_LOOKBACK_HOURS = SCORER_LOOKBACK_HOURS_MAX
 SCORER_POLL_INTERVAL_SECONDS = 45  # Polling interval in seconds (includes run time)
 
+# ------------------ Step 6 chunk cache (Task 7 R6 prefeatures) ------------------
+# PLAN: ``.cursor/plans/PLAN_chunk_cache_portable_hit.md`` — default ON for Track-Human skip
+# on prefeatures hits; OOM/disk notes in ``doc/training_oom_and_runtime_audit.md``.
+CHUNK_TWO_STAGE_CACHE_DEFAULT: bool = True
+
+
+def chunk_two_stage_cache_enabled() -> bool:
+    """Return whether R6 two-stage prefeatures Parquet cache is enabled.
+
+    When env ``CHUNK_TWO_STAGE_CACHE`` is unset or empty, returns
+    :data:`CHUNK_TWO_STAGE_CACHE_DEFAULT`. Otherwise:
+
+    - Enable: ``1``, ``true``, ``yes``, ``on`` (case-insensitive).
+    - Disable: ``0``, ``false``, ``no``, ``off``.
+
+    Other values log a warning and fall back to :data:`CHUNK_TWO_STAGE_CACHE_DEFAULT`.
+    """
+    raw = (os.getenv("CHUNK_TWO_STAGE_CACHE") or "").strip().lower()
+    if not raw:
+        return CHUNK_TWO_STAGE_CACHE_DEFAULT
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    _log.warning(
+        "CHUNK_TWO_STAGE_CACHE=%r invalid; using default %s",
+        os.getenv("CHUNK_TWO_STAGE_CACHE"),
+        CHUNK_TWO_STAGE_CACHE_DEFAULT,
+    )
+    return CHUNK_TWO_STAGE_CACHE_DEFAULT
+
+
 # Max age (hours) of payout_complete_dtm for rows that enter the model each score_once.
 # Despite the env name, this applies on *every* cycle when set: older new bets skip
 # scoring / prediction_log / alerts (feature build still uses full SCORER_LOOKBACK_HOURS).

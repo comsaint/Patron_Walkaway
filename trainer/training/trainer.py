@@ -1653,9 +1653,8 @@ def _prefeatures_cache_components(components: dict) -> dict:
 
 
 def _chunk_two_stage_cache_enabled() -> bool:
-    """R6 opt-in via ``CHUNK_TWO_STAGE_CACHE=1`` (or ``true`` / ``yes``)."""
-    v = (os.environ.get("CHUNK_TWO_STAGE_CACHE") or "").strip().lower()
-    return v in ("1", "true", "yes")
+    """R6 prefeatures cache: default from ``trainer.core.config`` (on); env overrides."""
+    return bool(_core_trainer_config.chunk_two_stage_cache_enabled())
 
 
 def _bump_chunk_cache_stat(stats: Optional[Dict[str, int]], key: str) -> None:
@@ -1943,17 +1942,52 @@ def _chunk_cache_components(
     }
 
 
+def _parquet_stable_rowgroups_schema_digest(meta: Any) -> str:
+    """Stable digest from Parquet metadata only (no mtime, no file ``created_by``).
+
+    Incorporates footer ``num_rows``, per-row-group ``num_rows`` / ``total_byte_size``,
+    and column path + physical/logical types so copies across machines with different
+    mtime still match; schema changes bust the digest without scanning row data.
+    """
+    rgs: List[List[int]] = []
+    for i in range(meta.num_row_groups):
+        rg = meta.row_group(i)
+        rgs.append([int(rg.num_rows), int(rg.total_byte_size)])
+    schema = meta.schema
+    cols: List[Tuple[str, str, str]] = []
+    for i in range(schema.num_columns):
+        col = schema.column(i)
+        path = col.path
+        if hasattr(path, "as_tuple"):
+            path_key = ".".join(str(x) for x in path.as_tuple())
+        elif isinstance(path, str):
+            path_key = path
+        else:
+            path_key = str(path)
+        cols.append((path_key, str(col.physical_type), str(col.logical_type)))
+    cols.sort(key=lambda t: t[0])
+    blob = {
+        "columns": [[a, b, c] for a, b, c in cols],
+        "fp_v": 2,
+        "nrows": int(meta.num_rows),
+        "row_groups": rgs,
+    }
+    raw = json.dumps(blob, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def _local_parquet_source_data_hash(
     window_start: datetime,
     extended_end: datetime,
 ) -> str:
-    """Task 7 R5: fingerprint local bet/session parquet **files** without reading row data.
+    """Task 7 R5 (+ portable fp_v2): fingerprint local bet/session Parquet without row scan.
 
-    Uses size, mtime, Parquet footer ``num_rows``, and the same logical filter bounds as
+    Uses file size, footer ``num_rows``, a stable metadata digest (row groups + schema;
+    excludes ``st_mtime`` and file ``created_by``), and the same logical filter bounds as
     ``load_local_parquet`` so chunk keys update when exports or window bounds change.
 
-    **Trade-off**: assumes file replacement updates mtime/size; same-stats in-place byte
-    edits could false-hit cache (acceptable for local/offline iteration).
+    **Trade-off**: extreme in-place edits keeping identical Parquet metadata could
+    theoretically false-hit; prefer false miss for content changes that alter metadata.
     """
     bets_path = LOCAL_PARQUET_DIR / "gmwds_t_bet.parquet"
     sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
@@ -1967,14 +2001,17 @@ def _local_parquet_source_data_hash(
             return f"{label}:missing:{p.name}"
         st = p.stat()
         try:
-            nrows = int(pq.read_metadata(p).num_rows)
+            meta = pq.read_metadata(p)
+            nrows = int(meta.num_rows)
+            digest = _parquet_stable_rowgroups_schema_digest(meta)
         except Exception as _meta_exc:
             nrows = -1
+            digest = "0" * 16
             logger.warning(
                 "Task 7 R5: read_metadata failed for %s (%s): %s",
                 p, label, _meta_exc,
             )
-        return f"{label}|{p.name}|{st.st_size}|{st.st_mtime_ns}|{nrows}"
+        return f"{label}|{p.name}|{st.st_size}|{nrows}|{digest}"
 
     payload = json.dumps({
         "bet_filter_lo": bets_lo.isoformat(),
@@ -2199,9 +2236,11 @@ def process_chunk(
         the module-level NEG_SAMPLE_FRAC; normally supplied by run_pipeline after the
         OOM pre-check (_oom_check_and_adjust_neg_sample_frac).
 
-    Task 7 R6: set env ``CHUNK_TWO_STAGE_CACHE=1`` to enable a pre-LLM Parquet cache
-    (``*.prefeatures.parquet``) so Track Human can be skipped when only spec/neg_sample
-    (downstream) changes; default off to avoid extra disk use.
+    Task 7 R6: pre-LLM Parquet cache (``*.prefeatures.parquet``) is **on by default**
+    (``trainer.core.config.CHUNK_TWO_STAGE_CACHE_DEFAULT``) so Track Human can be skipped
+    when only spec/neg_sample (downstream) changes. Disable with env
+    ``CHUNK_TWO_STAGE_CACHE=0`` / ``false`` / ``no`` / ``off`` if RAM or disk is tight
+    (see ``doc/training_oom_and_runtime_audit.md``).
 
     chunk_cache_stats:
         Optional mutable dict; keys ``step6_chunk_cache_*`` are incremented for

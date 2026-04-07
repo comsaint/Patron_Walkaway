@@ -74,6 +74,9 @@ This document summarizes known **out-of-memory (OOM)** and **long-running-time**
 | `SCREEN_FEATURES_METHOD` | "lgbm" | "mi" / "mi_then_lgbm" add mutual_info_classif (slower, more memory). |
 | `PROFILE_PRELOAD_MAX_BYTES` | 1.5 GB | Session file larger than this skips preload in profile backfill. |
 | `--no-preload` (CLI) | False | Disables full session preload during profile backfill. |
+| `CHUNK_TWO_STAGE_CACHE` | (unset → **on**) | Step 6 R6 **prefeatures** cache: when enabled, a hit loads `*.prefeatures.parquet` with **`pd.read_parquet` (full table)** — same peak RAM class as loading the chunk without R6; multi-chunk parallel runs do not reduce that peak automatically. Set to `0` / `false` / `no` / `off` to disable (saves disk and avoids double Parquet writes on miss). SSOT default: `trainer.core.config.CHUNK_TWO_STAGE_CACHE_DEFAULT`. |
+
+**Step 6 R6 (prefeatures) — disk:** On cache miss with two-stage enabled, the pipeline may write both `chunk_*_*.prefeatures.parquet` and the final `chunk_*.parquet` (~2× Parquet write volume vs R6 off). See `.cursor/plans/PLAN_chunk_cache_portable_hit.md`.
 
 ---
 

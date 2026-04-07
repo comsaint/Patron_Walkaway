@@ -131,24 +131,23 @@ class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
             "load_local_parquet should read_schema at least for bet + session filter paths.",
         )
 
-    # --- 5) schema not part of R5 file token ---
+    # --- 5) schema in R5 file token (fp_v2 digest) — still no separate read_schema() ---
 
     def test_risk5_r5_has_no_read_schema_in_source(self) -> None:
-        """MRE: R5 hash does not incorporate Parquet schema fingerprint today."""
+        """MRE: R5 hash does not call pq.read_schema (metadata path uses read_metadata only)."""
         src = inspect.getsource(trainer_mod._local_parquet_source_data_hash)
         self.assertNotIn("read_schema", src)
 
-    def test_risk5_two_schemas_same_counts_can_collide_if_stat_identical_debt_note(self) -> None:
-        """Document collision class: different logical schema but identical file token inputs.
-
-        When production fixes risk 5, replace this with a stricter inequality assertion.
-        """
+    def test_risk5_two_schemas_differing_bet_columns_yield_different_hashes(self) -> None:
+        """fp_v2: Parquet schema + row groups enter digest — distinct bet layouts must bust key."""
         with tempfile.TemporaryDirectory() as td_a, tempfile.TemporaryDirectory() as td_b:
             root_a = Path(td_a)
             root_b = Path(td_b)
-            # Same single row int column; second file adds nullable column with default (shape 1 row).
             pq.write_table(pa.table({"x": [1]}), root_a / "gmwds_t_bet.parquet")
-            pq.write_table(pa.table({"x": [1], "y": pa.array([None], type=pa.int64())}), root_b / "gmwds_t_bet.parquet")
+            pq.write_table(
+                pa.table({"x": [1], "y": pa.array([None], type=pa.int64())}),
+                root_b / "gmwds_t_bet.parquet",
+            )
             pq.write_table(pa.table({"s": [1]}), root_a / "gmwds_t_session.parquet")
             pq.write_table(pa.table({"s": [1]}), root_b / "gmwds_t_session.parquet")
 
@@ -166,13 +165,7 @@ class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
                     trainer_mod.LOCAL_PARQUET_DIR = old
 
             ha, hb = _h(root_a), _h(root_b)
-        # Usually file sizes differ so hashes differ; if equal, MRE flags collision class.
-        if ha == hb:
-            self.fail(
-                "R5 hashes equal for different bet schemas — schema should enter hash "
-                f"(debt confirmed: ha={ha!r} hb={hb!r}).",
-            )
-        # When this test merely passes because sizes differ, risk 5 (schema omission) remains; guarded by read_schema MRE above.
+        self.assertNotEqual(ha, hb, f"expected different data_hash for different bet schemas: {ha!r} vs {hb!r}")
 
     # --- 6) cache hit skips probe (local metadata path) ---
 

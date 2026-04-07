@@ -1007,4 +1007,20 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-039：Step 6 兩階段 prefeatures 快取預設開啟；local `data_hash` 可攜式指紋（fp_v2）
+
+**日期**：2026-04-07  
+**SSOT 章節**：`.cursor/plans/PLAN_chunk_cache_portable_hit.md`；`trainer/core/config.py`；`trainer/training/trainer.py`（Task 7 R5/R6）
+
+**決策**：
+
+1. **`CHUNK_TWO_STAGE_CACHE`**：預設改為 **啟用**（`CHUNK_TWO_STAGE_CACHE_DEFAULT=True`），以重用 `*.prefeatures.parquet`、在僅變更下游 spec／neg 時略過 Track Human。環境變數 **顯式** `0`／`false`／`no`／`off`／`on`／`1` 等可覆寫；非法值記 warning 後回退預設。
+2. **Local Parquet `data_hash`**：移除對 **`st_mtime_ns`** 的依賴；改以 **檔案大小**、footer **`num_rows`**、以及 **`fp_v=2`** 之 **row group 統計 + Parquet schema（路徑／physical／logical type）** 之 SHA256 短 digest 組 token，使 **複製／換機** 仍可比對命中；**首次升級後**既有 `.cache_key` 與 prefeatures sidecar 會與新指紋不一致 → **預期全 miss 重算 Step 6**。
+
+**理由**：mtime 僅反映複製時間，導致可攜 miss；schema／row group 納入 digest 可降低「同 size／同 nrows 不同欄位」之 silent false hit，並排除 file-level `created_by` 依賴。
+
+**風險與緩解**：prefeatures hit 仍為整表 `read_parquet`、miss 時雙寫 Parquet — 見 `doc/training_oom_and_runtime_audit.md` 與 PLAN 文件。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

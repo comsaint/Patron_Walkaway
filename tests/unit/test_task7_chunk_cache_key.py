@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 import trainer.trainer as trainer_mod
+from trainer.core import config as core_config
 
 
 class TestTask7ChunkCacheKey(unittest.TestCase):
@@ -232,6 +235,43 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
                 self.assertNotEqual(h1, h3)
             finally:
                 trainer_mod.LOCAL_PARQUET_DIR = old_root
+
+    def test_local_parquet_source_data_hash_ignores_mtime_only_changes(self) -> None:
+        """Portable fp_v2: same bytes + bounds → same hash after utime-only touch."""
+        ws = pd.Timestamp("2026-01-01 00:00:00")
+        ee = pd.Timestamp("2026-02-01 00:00:00")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bet = root / "gmwds_t_bet.parquet"
+            sess = root / "gmwds_t_session.parquet"
+            pq.write_table(pa.table({"k": [1]}), bet)
+            pq.write_table(pa.table({"s": [1]}), sess)
+            old_root = trainer_mod.LOCAL_PARQUET_DIR
+            trainer_mod.LOCAL_PARQUET_DIR = root
+            try:
+                h0 = trainer_mod._local_parquet_source_data_hash(ws.to_pydatetime(), ee.to_pydatetime())
+                t_future = os.path.getmtime(bet) + 86400.0
+                os.utime(bet, (t_future, t_future))
+                os.utime(sess, (t_future + 1.0, t_future + 1.0))
+                h1 = trainer_mod._local_parquet_source_data_hash(ws.to_pydatetime(), ee.to_pydatetime())
+            finally:
+                trainer_mod.LOCAL_PARQUET_DIR = old_root
+        self.assertEqual(h0, h1)
+
+    def test_chunk_two_stage_env_empty_uses_default_true(self) -> None:
+        with patch.dict(os.environ, {"CHUNK_TWO_STAGE_CACHE": ""}):
+            self.assertTrue(core_config.chunk_two_stage_cache_enabled())
+
+    def test_chunk_two_stage_env_false_disables(self) -> None:
+        with patch.dict(os.environ, {"CHUNK_TWO_STAGE_CACHE": "false"}):
+            self.assertFalse(core_config.chunk_two_stage_cache_enabled())
+        with patch.dict(os.environ, {"CHUNK_TWO_STAGE_CACHE": "off"}):
+            self.assertFalse(core_config.chunk_two_stage_cache_enabled())
+
+    def test_trainer_chunk_two_stage_matches_config_module(self) -> None:
+        with patch.dict(os.environ, {"CHUNK_TWO_STAGE_CACHE": "0"}):
+            self.assertFalse(core_config.chunk_two_stage_cache_enabled())
+            self.assertFalse(trainer_mod._chunk_two_stage_cache_enabled())
 
 
 if __name__ == "__main__":

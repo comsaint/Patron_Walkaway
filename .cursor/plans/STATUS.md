@@ -5007,3 +5007,65 @@ python -m pytest tests/ -q --tb=no --ignore=tests/e2e --ignore=tests/load
 
 ✅ **全部完成，CYCLE 結束**
 
+---
+
+## 2026-04-07 — PLAN_chunk_cache_portable_hit（Phase B1 + Phase A）/ `cycle_code`
+
+### STEP 1 — Builder（實作範圍）
+
+對齊 `.cursor/plans/PLAN_chunk_cache_portable_hit.md` 之 **B1** 與 **A**：
+
+| 檔案 | 變更摘要 |
+|------|----------|
+| [trainer/core/config.py](../../trainer/core/config.py) | 新增 `CHUNK_TWO_STAGE_CACHE_DEFAULT=True`、`chunk_two_stage_cache_enabled()`（env 覆寫：`1/true/yes/on` 開、`0/false/no/off` 關；非法值 warning 後回退預設）。 |
+| [trainer/training/trainer.py](../../trainer/training/trainer.py) | `_chunk_two_stage_cache_enabled()` 改讀 `_core_trainer_config.chunk_two_stage_cache_enabled()`；新增 `_parquet_stable_rowgroups_schema_digest`；`_local_parquet_source_data_hash` 移除 mtime、改 `size|nrows|digest` token；`process_chunk` docstring 更新 R6 預設開啟說明。 |
+| [doc/training_oom_and_runtime_audit.md](../../doc/training_oom_and_runtime_audit.md) | Config 表新增 `CHUNK_TWO_STAGE_CACHE` 列與 R6 RAM／雙寫簡述。 |
+| [.cursor/plans/DECISION_LOG.md](DECISION_LOG.md) | **DEC-039** 記錄預設兩階段快取與 fp_v2 local 指紋。 |
+
+#### 手動驗證建議
+
+1. **R6 預設開**：不設 `CHUNK_TWO_STAGE_CACHE` 跑一輪 local Step 6，應產生 `*.prefeatures.parquet`（若路徑可寫）；設 `CHUNK_TWO_STAGE_CACHE=off` 應不寫／不讀 prefeatures。
+2. **可攜指紋**：同一 `data/` parquet **只改 mtime**（`touch`）後再跑，**`data_hash` 應與 touch 前一致**（相對於舊版含 mtime 之行為）。
+3. **首次升級**：升級後第一次訓練預期 Step 6 chunk cache **全 miss**（新 token 格式），屬預期。
+
+### STEP 2 — Reviewer（風險與建議）
+
+| # | 類型 | 說明 | 建議 | 測試／工具 |
+|---|------|------|------|------------|
+| 1 | 相容性 | 既有 CI／筆電若假設 R6 關閉，預設開啟會多磁碟與整表 read。 | 於 RAM 緊張之 job 設 `CHUNK_TWO_STAGE_CACHE=0`。 | 見下 STEP 3 env 單元測試。 |
+| 2 | 正確性 | 極罕見：in-place 竄改資料但 Parquet footer／RG 統計未變。 | 接受 PLAN 所述；必要時另加「驗證用全檔 hash」模式。 | 文件已註 trade-off。 |
+| 3 | PyArrow | `ColumnPath`／metadata API 版本差異。 | 已用 `as_tuple`／`str` 後備；若某版失敗看單測。 | `test_local_parquet_source_data_hash_*`。 |
+| 4 | 觀測 | 非法 env 字串僅 warning。 | 可選：改為硬關閉或 fail-fast（產品決策）。 | 手動設 `CHUNK_TWO_STAGE_CACHE=maybe`。 |
+
+### STEP 3 — Tester（新增／調整測試）
+
+| 檔案 | 內容 |
+|------|------|
+| [tests/unit/test_task7_chunk_cache_key.py](../../tests/unit/test_task7_chunk_cache_key.py) | `test_local_parquet_source_data_hash_ignores_mtime_only_changes`；`chunk_two_stage_cache_enabled`／`_chunk_two_stage_cache_enabled` 與 env 之對齊測試。 |
+| [tests/review_risks/test_task7_r5_local_metadata_review_risks_mre.py](../../tests/review_risks/test_task7_r5_local_metadata_review_risks_mre.py) | risk5 改為 **schema 不同必不等 hash**；`read_schema` MRE 改述為「仍不呼叫 read_schema」。 |
+
+**執行方式（代理已跑子集）**：
+
+```bash
+PYTHONPATH=. python -m pytest tests/unit/test_task7_chunk_cache_key.py \
+  tests/review_risks/test_task7_r5_local_metadata_review_risks_mre.py \
+  tests/review_risks/test_task7_r6_prefeatures_review_risks_mre.py \
+  tests/review_risks/test_task7_dod_chunk_cache_stats_review_risks_mre.py \
+  tests/unit/test_pipeline_diagnostics_build_and_bundle.py -q
+```
+
+### STEP 4 — Tester（實作與工具鏈）
+
+| 檢查 | 指令 | 結果（本輪代理環境） |
+|------|------|------------------------|
+| Ruff | `ruff check trainer/core/config.py trainer/training/trainer.py` | **通過** |
+| Pytest（上表子集） | 同上 | **57 passed** |
+
+#### 計畫狀態與建議下一步
+
+- **PLAN_chunk_cache_portable_hit.md**：**B1**、**A** 已落地；**D**（搬移 checklist／doc 交叉連結）可另開短 PR 補 `doc/` 或 plans 連結。
+- **B2**（語義 spec hash）：維持延後。
+- **PATCH Task 7**：可於 `PATCH_20260324.md`／`PLAN.md` 表格註記 R6 預設開與 R5 fp_v2（選做，避免與本輪重複大改）。
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**（chunk cache portable + R6 default）
+
