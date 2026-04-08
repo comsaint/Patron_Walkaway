@@ -1,6 +1,6 @@
 # Precision 提升衝刺計畫（Recall=1%）
 
-> 最後更新：2026-04-08  
+> 最後更新：2026-04-08（納入外部審查：Week 1 對照 STATUS 歷史與時程重排閘門）  
 > 目標：在相同評估口徑下，將 `precision@recall=1%` 由目前約 40% 提升至 **>60%**。
 
 ---
@@ -23,12 +23,24 @@
 
 | 任務 | 具體內容 | 產出 |
 | :--- | :--- | :--- |
+| 歷史紀錄對照（STATUS） | 對照 `STATUS.md` 過去迭代，盤點是否已有相同或相近的 label noise / lag / censored 發現被擱置，並標記「可直接沿用 / 需重驗 / 已失效」。 | `status_history_crosscheck` |
 | 錯誤切片分析 | 依日期、table、玩家層級、新舊戶、下注額、活躍度切片，檢查 `precision@1% recall` 與樣本占比。 | `slice_performance_report`，列出 top 拖累切片 |
 | 標籤品質稽核 | 量化 censored / 延遲標註比例；抽樣高分 false positive 判斷是否標註延遲或真噪音。 | `label_noise_audit` |
 | 特徵可用時點對齊 | 確認 train/serve 特徵 timestamp 對齊與無 leakage。 | `point_in_time_parity_check` |
 | 現行上限確認 | 在固定契約下重跑「已知 threshold」上限測試，驗證 40% 結論可重現。 | `upper_bound_repro` |
 
-**Week 1 Gate**：完成 RCA，明確指出「模型限制 vs 標籤/資料限制」主因排序。
+**Week 1 Gate**：完成 RCA，明確指出「模型限制 vs 標籤/資料限制」主因排序，並完成 `STATUS.md` 對照。
+若結論顯示「標籤流程/資料契約」是主因，則啟動 **Timeline 重排**（先資料修復，後模型衝刺）。
+
+---
+
+### Timeline 重排規則（Week 1 觸發）
+
+| 觸發條件 | 動作 |
+| :--- | :--- |
+| `label_noise_audit` 判定主要瓶頸在標籤流程（例如延遲標註、censored 處理、契約不一致） | 將 Week 2~4 改為「資料/標籤修復優先」：先修標註與契約，模型 A/B/C 順延 |
+| `status_history_crosscheck` 發現歷史上已有同類問題且曾暫緩 | 將該議題提升為本輪必做，要求附「為何當時暫緩、此次是否解除阻礙」說明 |
+| 觸發重排後一週內仍無法收斂標籤品質指標 | 啟動 scope cut：暫停 ensemble 與大規模特徵擴張，集中修復資料鏈路 |
 
 ---
 
@@ -107,6 +119,7 @@
 2. 若任一路線 uplift 小於 +3pp 且不穩定，立即降級投入，避免無限調參。  
 3. 若結果僅在單一時間窗成立，不納入定版候選。  
 4. Ensemble 若僅帶來微小提升但大幅增加複雜度，優先保留可維運性更高方案。  
+5. 若 `STATUS.md` 對照證實問題早已存在但前提未解，先補齊阻礙清單與責任歸屬，再批准進入下一週。  
 
 ---
 
@@ -115,4 +128,5 @@
 - 每週固定一次 checkpoint：更新主指標、切片排名、路線保留/淘汰決策。  
 - 每兩週一次決策會：是否切換主路線、是否提早進入定版。  
 - 每次 checkpoint 必須附實驗矩陣更新，不接受口頭結論。  
+- Week 1 checkpoint 必附 `status_history_crosscheck`（含「歷史結論是否被沿用」對照表）。  
 
