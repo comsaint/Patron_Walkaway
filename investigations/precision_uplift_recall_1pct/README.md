@@ -7,18 +7,69 @@
 - 將 `precision@recall=1%` 由約 40% 提升至 `>=60%`。
 - 提升結果需在多時間窗（forward/purged）下仍穩定成立。
 
-## 先看哪兩份文件
+## 先看哪些文件
 
-- 總計畫：`.cursor/plans/PLAN_precision_uplift_sprint.md`
-- 執行儀表板：`investigations/precision_uplift_recall_1pct/EXECUTION_PLAN.md`
+- 總計畫（SSoT）：`.cursor/plans/PLAN_precision_uplift_sprint.md`
+- 執行儀表板與 Phase 1~4 runbook：`PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md`
+- Ad-hoc 流程與腳本實作藍圖：`PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md`
+- Phase 1 Orchestrator MVP 開發任務：`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`
+
+---
+
+## 四個 Phase 在做什麼（高階）
+
+四個階段回答**不同層次的問題**：先釐清「值不值得、該往哪裡用力」，再試「哪種建模策略有效」，接著在勝者路線上「加深」，最後「凍結並驗收能否上線」。
+
+### Phase 1：根因診斷（RCA）與上限／契約
+
+**核心問題：** `precision@recall=1%` 上不去或變差時，**主因是模型不夠好，還是標籤／資料／評估契約在拖累？**
+
+**會涵蓋：** 歷史對照（STATUS）、切片拖累、標註品質與 censored／延遲、train／serve／驗證時點一致與洩漏風險、在固定契約下重現 baseline／上限。
+
+**產出意義：** 排出「模型 vs 標籤／資料」主因排序，並決定是否 **先修資料再衝模型**（timeline 重排）。
+
+### Phase 2：高槓桿建模路線（A / B / C）
+
+**核心問題：** 在 Phase 1 鎖定的**同一評估契約**下，**哪一種建模策略**最有機會帶來可重現的 uplift，而非單窗僥倖？
+
+**路線直覺：** Track A 對齊排序與硬負例；Track B 分群與 gating；Track C 時序穩定性過濾。
+
+**產出意義：** 至少一條路線達到可量化 uplift（例如 +3~5pp）且跨窗大致站得住，才進入 Phase 3。
+
+### Phase 3：特徵深化與集成收斂
+
+**核心問題：** 在 **Phase 2 勝者路線**上，還能靠**哪些特徵／哪些切片／哪種融合**再擠出增益，又不把系統變成難維運的黑箱？
+
+**會涵蓋：** 行為類特徵、拖累切片定向特徵包、輕量集成與消融、高分段校準與決策邊界。
+
+**產出意義：** 相對 Phase 2 勝者再提升，且穩定性與切片沒有明顯換爛，才適合定版。
+
+### Phase 4：定版、回放與 Go / No-Go
+
+**核心問題：** **已凍結**的資料窗、特徵、模型與閾值，在**多時間窗／營運條件**下是否仍達標？上線後**告警量、誤報、業務影響**是否可接受？
+
+**會涵蓋：** 候選凍結、多窗回放、影響估算、風險與回滾、最終 Go／No-Go。
+
+**產出意義：** 正式上線與否的決策，以及監控與退路。
+
+### 一句話對照
+
+| Phase | 一句話 |
+| :--- | :--- |
+| **1** | 先搞清楚是「模型不行」還是「資料／標籤／契約不行」。 |
+| **2** | 在對的契約下，試三種建模策略哪條真能帶 uplift。 |
+| **3** | 在勝者身上加深特徵與融合，並把高分段壓實。 |
+| **4** | 凍結後全面驗收，用營運與風險語言決定上不上線。 |
+
+正式欄位與 Gate 仍以 `.cursor/plans/PLAN_precision_uplift_sprint.md` 與 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` 為準；本節為高階詮釋。
 
 ---
 
 ## 要怎麼做（照順序）
 
-1. 先打開 `EXECUTION_PLAN.md`，更新「進度儀表板」與「當前 Phase」。
+1. 先打開 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md`，更新「進度儀表板」與「當前 Phase」。
 2. 進入對應 `phaseX/` 目錄，依 checklist 填寫該階段所有工件。
-3. 每完成一項工件，立刻回填 `EXECUTION_PLAN.md` 的勾選狀態與里程碑。
+3. 每完成一項工件，立刻回填 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` 的勾選狀態與里程碑。
 4. 每週做一次 checkpoint：更新主指標、切片排名、保留/淘汰決策。
 5. 只有在當前 Phase Gate 達成後，才可進入下一階段。
 
@@ -58,4 +109,4 @@
 
 - 不接受口頭結論；每個判斷都要有對應檔案證據。
 - 檔案命名與欄位請沿用模板，不要自行改名，避免後續彙整困難。
-- 若有 blocker，請在 `EXECUTION_PLAN.md` 的儀表板即時標記 `🔴 阻塞` 與解除條件。
+- 若有 blocker，請在 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` 的儀表板即時標記 `🔴 阻塞` 與解除條件。
