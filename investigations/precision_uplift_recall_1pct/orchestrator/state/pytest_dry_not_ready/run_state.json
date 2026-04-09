@@ -1,0 +1,100 @@
+{
+  "run_id": "pytest_dry_not_ready",
+  "phase": "phase1",
+  "updated_at": "2026-04-09T09:06:52+00:00",
+  "input_summary": {
+    "config_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_dry_run_cli_not_ready_ret0\\cfg.yaml",
+    "model_dir": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_dry_run_cli_not_ready_ret0\\models",
+    "state_db_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_dry_run_cli_not_ready_ret0\\state.db",
+    "prediction_log_db_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_dry_run_cli_not_ready_ret0\\pred.db",
+    "window": {
+      "end_ts": "2026-01-08T00:00:00+08:00",
+      "start_ts": "2026-01-01T00:00:00+08:00"
+    },
+    "thresholds": {
+      "min_finalized_alerts_gate": 800,
+      "min_finalized_alerts_preliminary": 300,
+      "min_finalized_true_positives_gate": 50,
+      "min_finalized_true_positives_preliminary": 30,
+      "min_hours_gate": 72,
+      "min_hours_preliminary": 48
+    },
+    "r1_r6_script": "missing_r1_script_abc.py",
+    "fingerprint": "835a0d35c49e602981711a0d5c9e8018305e26c918a92fd78fc9a92445076b0f"
+  },
+  "steps": {
+    "preflight": {
+      "status": "success",
+      "error_code": null,
+      "message": null,
+      "checks": [
+        {
+          "name": "paths",
+          "ok": true,
+          "message": null
+        },
+        {
+          "name": "prediction_db_tables",
+          "ok": true,
+          "message": null
+        },
+        {
+          "name": "state_db_tables",
+          "ok": true,
+          "message": null
+        }
+      ],
+      "finished_at": "2026-04-09T09:06:52+00:00"
+    },
+    "dry_run_readiness": {
+      "status": "failed",
+      "finished_at": "2026-04-09T09:06:52+00:00",
+      "artifacts": {
+        "state_dir": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\pytest_dry_not_ready",
+        "logs_dir": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\pytest_dry_not_ready\\logs",
+        "phase1_dir": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\phase1"
+      },
+      "error_code": "E_DRY_RUN_NOT_READY",
+      "message": "r1_r6_cli_smoke_failed"
+    }
+  },
+  "mode": "dry_run",
+  "readiness": {
+    "status": "NOT_READY",
+    "checks": [
+      {
+        "name": "r1_r6_cli_smoke",
+        "ok": false,
+        "message": "r1_r6 script not found: C:\\Users\\longp\\Patron_Walkaway\\missing_r1_script_abc.py"
+      },
+      {
+        "name": "backtester_cli_smoke",
+        "ok": true,
+        "message": "skipped by --skip-backtest-smoke"
+      },
+      {
+        "name": "writable_state_dir",
+        "ok": true,
+        "message": null
+      },
+      {
+        "name": "writable_logs_dir",
+        "ok": true,
+        "message": null
+      },
+      {
+        "name": "writable_phase1_dir",
+        "ok": true,
+        "message": null
+      }
+    ],
+    "blocking_reasons": [
+      "r1_r6_cli_smoke_failed"
+    ],
+    "artifacts": {
+      "state_dir": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\pytest_dry_not_ready",
+      "logs_dir": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\pytest_dry_not_ready\\logs",
+      "phase1_dir": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\phase1"
+    }
+  }
+}

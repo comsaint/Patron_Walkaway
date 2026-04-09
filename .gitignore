@@ -230,3 +230,4 @@ credential/*.json
 !credential/mlflow.env.example
 local_state/prediction_log.db
 local_state/state.db
+trainer/out_*/

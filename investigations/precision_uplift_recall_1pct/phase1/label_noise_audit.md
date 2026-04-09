@@ -1,24 +1,21 @@
 # label_noise_audit
 
-## 觀察摘要
+## Run metadata (orchestrator)
 
-- 結論：TBD
-- 是否判定為主瓶頸：否/是
+- **run_id**: `pytest_resume_skip`
+- **Window**: `2026-01-01T00:00:00+08:00` → `2026-01-08T00:00:00+08:00`
+- **model_dir**: `C:\Users\longp\AppData\Local\Temp\pytest-of-longp\pytest-139\test_resume_skips_preflight_wh0\missing_models`
+- **state_db_path**: `s.db`
+- **prediction_log_db_path**: `p.db`
+- **collect_bundle**: `investigations/precision_uplift_recall_1pct/orchestrator/state/pytest_resume_skip/collect_bundle.json`
 
-## 指標
 
-| 指標 | 數值 | 說明 |
-| :--- | ---: | :--- |
-| censored_ratio | 0.0000 | TBD |
-| delayed_label_ratio | 0.0000 | TBD |
-| high_score_fp_sample_size | 0 | TBD |
+## Unified sample (R1/R6)
 
-## 代表案例
+*No `unified_sample_evaluation` in R1 final payload.*
 
-- case_1: TBD
-- case_2: TBD
+## Full R1 final payload (reference)
 
-## 建議動作
-
-- [ ] 修標籤流程
-- [ ] 先做模型優化
+```json
+{}
+```

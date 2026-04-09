@@ -21,6 +21,10 @@
 
 ### 1.2 執行順序（一次跑完）
 
+0. **Dry-run 快檢（production 前 2~10 分鐘）**
+   - 先跑 orchestrator `--dry-run`，確認 config / 路徑 / DB / 命令可啟動性。
+   - 僅做 readiness 檢查，不產生正式結論。
+
 1. **Preflight（15~30 分）**
    - 驗證路徑與連線可用（model / state DB / prediction DB / ClickHouse）。
    - 先跑一個短窗 backtest（可先 `--skip-optuna`）確認輸出正常。
@@ -122,9 +126,11 @@
 - `python run_pipeline.py --phase all --config config/run_full.yaml`
 - `python run_pipeline.py --phase phase1 --resume --run-id <run_id>`
 - `python run_pipeline.py --phase phase1 --collect-only`
+- `python run_pipeline.py --phase phase1 --dry-run --config config/run_phase1.yaml --run-id <run_id>`
 
 ### 2.4 核心流程（Phase 1 MVP）
 
+0. （可選）`--dry-run`：只做 readiness 檢查，輸出 `READY / NOT_READY`。
 1. 載入 config + 驗證 schema（缺欄位直接 fail）。
 2. 執行 preflight（路徑、DB、必要表、模型 artifact）。
 3. 啟動 scorer/validator 子程序（或 attach 現有程序）。
@@ -151,6 +157,7 @@
 
 ### 2.7 效能與穩定性（必做）
 
+- production 長跑前先做 `--dry-run`，避免連線/路徑問題延遲到長跑中後段才發現。
 - 預設保守參數：
   - `sample_size` 先小（如 1000）
   - `player_chunk_size` 100~200

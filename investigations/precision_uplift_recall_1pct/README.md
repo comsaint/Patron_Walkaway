@@ -110,3 +110,108 @@
 - 不接受口頭結論；每個判斷都要有對應檔案證據。
 - 檔案命名與欄位請沿用模板，不要自行改名，避免後續彙整困難。
 - 若有 blocker，請在 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` 的儀表板即時標記 `🔴 阻塞` 與解除條件。
+
+---
+
+## Orchestrator 實跑指南（Production）
+
+以下只涵蓋 `phase1` orchestrator（`investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py`）。
+
+### 0) 先準備 config（必做）
+
+1. 複製 `investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase1.yaml`。
+2. 依環境填好：
+   - `model_dir`
+   - `state_db_path`
+   - `prediction_log_db_path`
+   - `window.start_ts` / `window.end_ts`（建議統一 HKT）
+   - `thresholds.*`
+3. 若你要讀非預設 backtest 檔，設定 `backtest_metrics_path`。
+
+---
+
+### 1) Dry-run：Production 上線前快檢（2~10 分鐘）
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase1 \
+  --config <your_phase1.yaml> \
+  --run-id <dry_run_id> \
+  --dry-run
+```
+
+若環境暫時不能跑 backtester CLI smoke，可先：
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase1 \
+  --config <your_phase1.yaml> \
+  --run-id <dry_run_id> \
+  --dry-run \
+  --skip-backtest-smoke
+```
+
+#### Dry-run 成功/失敗怎麼判斷
+
+- **成功（READY）**
+  - process exit code = `0`
+  - `orchestrator/state/<run_id>/run_state.json` 內：
+    - `mode == "dry_run"`
+    - `readiness.status == "READY"`
+    - `steps.dry_run_readiness.status == "success"`
+- **失敗（NOT_READY）**
+  - process exit code = `6`
+  - stderr 會列出 blocking reasons
+  - `run_state.json` 內：
+    - `mode == "dry_run"`
+    - `readiness.status == "NOT_READY"`
+    - `readiness.checks[]` 可定位哪一項失敗（DB、script、writable path 等）
+
+> dry-run 只做 readiness，不產生正式調查結論。
+
+---
+
+### 2) Full-run：正式 investigation 執行
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase1 \
+  --config <your_phase1.yaml> \
+  --run-id <run_id>
+```
+
+#### Full-run 產物檢查
+
+- `investigations/precision_uplift_recall_1pct/orchestrator/state/<run_id>/run_state.json`
+- `investigations/precision_uplift_recall_1pct/orchestrator/state/<run_id>/logs/*.log`
+- `investigations/precision_uplift_recall_1pct/orchestrator/state/<run_id>/collect_bundle.json`
+- `investigations/precision_uplift_recall_1pct/phase1/*.md`（報表）
+
+#### Full-run 成功/失敗判讀（快速）
+
+- **成功**：exit code = `0`，`run_state.json` 中 `steps` 關鍵步驟為 `success`。
+- **失敗**：非 0，常見：
+  - `3`：preflight fail
+  - `4`：R1/R6 分析 fail
+  - `5`：backtest fail
+  - `6`：dry-run NOT_READY
+
+請優先看：
+
+1. `run_state.json` 的 `steps.<step>.error_code / message`
+2. 對應 `logs/*.stderr.log`
+
+---
+
+### 3) Resume：中斷後續跑
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase1 \
+  --config <your_phase1.yaml> \
+  --run-id <run_id> \
+  --resume
+```
+
+- 若 `config` 指紋與既有 `run_state` 不同，會自動判定 resume invalid，重新執行 eligible steps（避免錯誤續跑）。
+- 重新跑前，請先確認你是否真的要在同 `run_id` 上延續；若要做新的調查契約，建議換新 `run_id`。
