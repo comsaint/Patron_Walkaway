@@ -21,29 +21,24 @@
 
 ### 1.2 執行順序（一次跑完）
 
-0. **Dry-run 快檢（production 前 2~10 分鐘）**
-   - 先跑 orchestrator `--dry-run`，確認 config / 路徑 / DB / 命令可啟動性。
-   - 僅做 readiness 檢查，不產生正式結論。
-
-1. **Preflight（15~30 分）**
-   - 驗證路徑與連線可用（model / state DB / prediction DB / ClickHouse）。
-   - 先跑一個短窗 backtest（可先 `--skip-optuna`）確認輸出正常。
-
-2. **啟動線上蒐證（長跑）**
-   - 啟動 `scorer`（持續寫 prediction/alerts）。
-   - 啟動 `validator`（持續寫 validation 與 precision 快照）。
-   - 兩者保持同一 run 設定，不中途切換模型與 DB。
-
-3. **中途健康檢查（建議 T+6h）**
-   - 手動執行一次 `run_r1_r6_analysis.py --mode all`。
-   - 目的：提早發現空樣本、censored 欄位缺失、window/DB 指向錯誤。
-
-4. **結束前採樣（終點）**
-   - 再執行一次 `run_r1_r6_analysis.py --mode all` 取得最終 payload。
-   - 跑一次固定窗口 backtest 產出最終 `backtest_metrics.json`。
-
-5. **彙整工件**
-   - 將輸出填入 `phase1/` 六份工件，完成 `phase1_gate_decision.md`。
+1. **Dry-run 快檢（production 前 2~10 分鐘）**
+  - 先跑 orchestrator `--dry-run`，確認 config / 路徑 / DB / 命令可啟動性。
+  - 僅做 readiness 檢查，不產生正式結論。
+2. **Preflight（15~30 分）**
+  - 驗證路徑與連線可用（model / state DB / prediction DB / ClickHouse）。
+  - 先跑一個短窗 backtest（可先 `--skip-optuna`）確認輸出正常。
+3. **啟動線上蒐證（長跑）**
+  - 啟動 `scorer`（持續寫 prediction/alerts）。
+  - 啟動 `validator`（持續寫 validation 與 precision 快照）。
+  - 兩者保持同一 run 設定，不中途切換模型與 DB。
+4. **中途健康檢查（建議 T+6h）**
+  - 手動執行一次 `run_r1_r6_analysis.py --mode all`。
+  - 目的：提早發現空樣本、censored 欄位缺失、window/DB 指向錯誤。
+5. **結束前採樣（終點）**
+  - 再執行一次 `run_r1_r6_analysis.py --mode all` 取得最終 payload。
+  - 跑一次固定窗口 backtest 產出最終 `backtest_metrics.json`。
+6. **彙整工件**
+  - 將輸出填入 `phase1/` 六份工件，完成 `phase1_gate_decision.md`。
 
 ### 1.3 輸出對應（Phase 1 工件 -> 證據來源）
 
@@ -63,19 +58,17 @@
 ### 1.4 運行時長建議（請明確採納）
 
 1. **最短可做初判：48 小時**
-   - 用途：只能做方向性判斷，不可做最終 Gate。
-   - 最低資料量建議：
-     - finalized alerts >= 300
-     - finalized true positives >= 30
-
-2. **建議用於 Phase 1 Gate：72~120 小時（3~5 天）**
-   - 用途：可做較可靠主因排序與是否重排判斷。
-   - 建議資料量：
-     - finalized alerts >= 800（理想 >= 1000）
-     - 主要切片各有足夠樣本（避免切片結論只由噪音驅動）
-
+  - 用途：只能做方向性判斷，不可做最終 Gate。
+  - 最低資料量建議：
+    - finalized alerts >= 300
+    - finalized true positives >= 30
+2. **建議用於 Phase 1 Gate：72~~120 小時（3~~5 天）**
+  - 用途：可做較可靠主因排序與是否重排判斷。
+  - 建議資料量：
+    - finalized alerts >= 800（理想 >= 1000）
+    - 主要切片各有足夠樣本（避免切片結論只由噪音驅動）
 3. **若要跨週期穩定性結論：>= 7 天**
-   - 用途：納入工作日/週末行為差異，降低單窗偏誤。
+  - 用途：納入工作日/週末行為差異，降低單窗偏誤。
 
 > 評語：若僅跑 6~12 小時就判定「模型不行/資料不行」，風險非常高；在 recall=1% 稀疏場景，這通常會導致錯誤決策。
 
@@ -85,7 +78,6 @@
   - 達到 1.4 的「建議用於 Gate」時長與資料量
   - `run_r1_r6_analysis` 兩次結果方向一致（非劇烈反轉）
   - censored / delayed label 指標波動進入可解釋範圍
-
 - **必須延長觀測**（任一成立）：
   - finalized alerts 不足（< 300 初判門檻）
   - 切片樣本嚴重不均、top-band 幾乎無可用標記
@@ -130,15 +122,15 @@
 
 ### 2.4 核心流程（Phase 1 MVP）
 
-0. （可選）`--dry-run`：只做 readiness 檢查，輸出 `READY / NOT_READY`。
-1. 載入 config + 驗證 schema（缺欄位直接 fail）。
-2. 執行 preflight（路徑、DB、必要表、模型 artifact）。
-3. 啟動 scorer/validator 子程序（或 attach 現有程序）。
-4. 監控觀測時長與樣本量門檻（時間 + finalized alerts + TP）。
-5. 在 T+6h 跑中途 `run_r1_r6_analysis --mode all`。
-6. 在終點跑最終 `run_r1_r6_analysis --mode all` + backtest。
-7. 收集 JSON/CSV/DB 指標，產出 `phase1/*.md`。
-8. 計算 Gate 狀態（PASS / PRELIMINARY / FAIL）並寫入 `phase1_gate_decision.md`。
+1. （可選）`--dry-run`：只做 readiness 檢查，輸出 `READY / NOT_READY`。
+2. 載入 config + 驗證 schema（缺欄位直接 fail）。
+3. 執行 preflight（路徑、DB、必要表、模型 artifact）。
+4. 啟動 scorer/validator 子程序（或 attach 現有程序）。
+5. 監控觀測時長與樣本量門檻（時間 + finalized alerts + TP）。
+6. 在 T+6h 跑中途 `run_r1_r6_analysis --mode all`。
+7. 在終點跑最終 `run_r1_r6_analysis --mode all` + backtest。
+8. 收集 JSON/CSV/DB 指標，產出 `phase1/*.md`。
+9. 計算 Gate 狀態（PASS / PRELIMINARY / FAIL）並寫入 `phase1_gate_decision.md`。
 
 ### 2.5 Gate 引擎（建議）
 
@@ -178,3 +170,4 @@
 
 - `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md`：保留高層目標、Gate、里程碑、最終 runbook摘要。
 - 本文件：承接 ad-hoc 細節與腳本實作藍圖，作為「執行手冊 + 開發規格」。
+

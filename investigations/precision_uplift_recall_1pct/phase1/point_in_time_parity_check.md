@@ -2,12 +2,12 @@
 
 ## Run metadata (orchestrator)
 
-- **run_id**: `pytest_resume_skip`
-- **Window**: `2026-01-01T00:00:00+08:00` → `2026-01-08T00:00:00+08:00`
-- **model_dir**: `C:\Users\longp\AppData\Local\Temp\pytest-of-longp\pytest-139\test_resume_skips_preflight_wh0\missing_models`
-- **state_db_path**: `s.db`
-- **prediction_log_db_path**: `p.db`
-- **collect_bundle**: `investigations/precision_uplift_recall_1pct/orchestrator/state/pytest_resume_skip/collect_bundle.json`
+- **run_id**: `prod_phase1_20260409`
+- **Window**: `2026-04-09T00:00:00+08:00` → `2026-04-15T00:00:00+08:00`
+- **model_dir**: `out/models/20260408-173809-e472fd0`
+- **state_db_path**: `local_state/state.db`
+- **prediction_log_db_path**: `local_state/prediction_log.db`
+- **collect_bundle**: `investigations/precision_uplift_recall_1pct/orchestrator/state/prod_phase1_20260409/collect_bundle.json`
 
 
 ## MVP 範圍（scaffold）
@@ -20,5 +20,5 @@
 
 ## 資料來源路徑（供 reviewer）
 
-- Prediction log DB: `p.db`
-- State DB: `s.db`
+- Prediction log DB: `local_state/prediction_log.db`
+- State DB: `local_state/state.db`

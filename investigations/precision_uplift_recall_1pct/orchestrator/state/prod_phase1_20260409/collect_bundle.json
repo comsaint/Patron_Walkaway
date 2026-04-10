@@ -1,0 +1,419 @@
+{
+  "run_id": "prod_phase1_20260409",
+  "errors": [],
+  "backtest_metrics": {
+    "window_start": "2026-03-12T03:07:11.851087",
+    "window_end": "2026-03-12T09:07:11.851087",
+    "window_hours": 6.0,
+    "observations": 133326,
+    "rated_obs": 107871,
+    "unrated_obs": 25455,
+    "track_llm_degraded": false,
+    "model_default": {
+      "test_ap": 0.2223823197784581,
+      "test_precision": 0.4419642857142857,
+      "test_recall": 0.013111714455996291,
+      "test_f1": 0.025467875747636502,
+      "test_fbeta_05": 0.05860415556739478,
+      "threshold": 0.95550174620155,
+      "test_samples": 107871,
+      "test_positives": 15101,
+      "test_random_ap": 0.13999128588777335,
+      "alerts": 448,
+      "alerts_per_hour": 74.66666666666667,
+      "test_precision_at_recall_0.001": 0.68,
+      "threshold_at_recall_0.001": 0.9835371983647799,
+      "alerts_per_minute_at_recall_0.001": 0.06944444444444445,
+      "test_precision_at_recall_0.01": 0.453781512605042,
+      "threshold_at_recall_0.01": 0.9597615826727451,
+      "alerts_per_minute_at_recall_0.01": 0.9916666666666667,
+      "test_precision_at_recall_0.1": 0.310253807106599,
+      "threshold_at_recall_0.1": 0.8313554287540448,
+      "alerts_per_minute_at_recall_0.1": 13.680555555555555,
+      "test_precision_at_recall_0.5": 0.20277091612071743,
+      "threshold_at_recall_0.5": 0.6132905296386935,
+      "alerts_per_minute_at_recall_0.5": 103.45555555555555,
+      "rated_threshold": 0.95550174620155
+    },
+    "optuna": {
+      "test_ap": 0.2223823197784581,
+      "test_precision": 0.4537313432835821,
+      "test_recall": 0.01006555857227998,
+      "test_f1": 0.01969422130085514,
+      "test_fbeta_05": 0.046225898667964234,
+      "threshold": 0.9608505494488366,
+      "test_samples": 107871,
+      "test_positives": 15101,
+      "test_random_ap": 0.13999128588777335,
+      "alerts": 335,
+      "alerts_per_hour": 55.833333333333336,
+      "test_precision_at_recall_0.001": 0.68,
+      "threshold_at_recall_0.001": 0.9835371983647799,
+      "alerts_per_minute_at_recall_0.001": 0.06944444444444445,
+      "test_precision_at_recall_0.01": 0.453781512605042,
+      "threshold_at_recall_0.01": 0.9597615826727451,
+      "alerts_per_minute_at_recall_0.01": 0.9916666666666667,
+      "test_precision_at_recall_0.1": 0.310253807106599,
+      "threshold_at_recall_0.1": 0.8313554287540448,
+      "alerts_per_minute_at_recall_0.1": 13.680555555555555,
+      "test_precision_at_recall_0.5": 0.20277091612071743,
+      "threshold_at_recall_0.5": 0.6132905296386935,
+      "alerts_per_minute_at_recall_0.5": 103.45555555555555,
+      "rated_threshold": 0.9608505494488366
+    }
+  },
+  "backtest_metrics_path": "C:\\Projects\\Patron_Walkaway\\trainer\\out_backtest\\backtest_metrics.json",
+  "r1_r6_final": {
+    "payload": {
+      "mode": "all",
+      "sample": {
+        "mode": "sample",
+        "window": {
+          "start_ts": "2026-04-09T00:00:00+08:00",
+          "end_ts": "2026-04-15T00:00:00+08:00"
+        },
+        "db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\prediction_log.db",
+        "summary": {
+          "n_total": 148043,
+          "n_rated": 148043,
+          "n_alert_rated": 758,
+          "n_below_rated": 147285,
+          "candidate_filter": "below_threshold",
+          "sample_size_requested": 4000,
+          "sample_size_written": 3117,
+          "bins": 10,
+          "per_bin_target": 400
+        },
+        "output_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_below_threshold_sample_20260409_191944_798717_1775733584798717200_106e90f7_below_threshold.csv",
+        "note": "Run offline labeling on output_csv bet_id, then use evaluate mode with labeled CSV. Use candidate_filter='alert' to diagnose precision drop; use candidate_filter='below_threshold' to diagnose missed positives."
+      },
+      "autolabel": {
+        "mode": "autolabel",
+        "window": {
+          "start_ts": "2026-04-09T00:00:00+08:00",
+          "end_ts": "2026-04-15T00:00:00+08:00"
+        },
+        "db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\prediction_log.db",
+        "sample_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_below_threshold_sample_20260409_191944_798717_1775733584798717200_106e90f7_below_threshold.csv",
+        "output_labels_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_labeled_20260409_191944_798717_1775733584798717200_106e90f7_below_threshold.csv",
+        "summary": {
+          "n_sample_input": 3116,
+          "n_sample_rows_input": 3117,
+          "n_unique_bet_id": 3116,
+          "n_duplicate_bet_id": 1,
+          "n_players": 1354,
+          "n_bets_fetched": 312236,
+          "n_labeled_rows": 3078,
+          "n_censored": 0,
+          "n_unmatched_sample_bet_id": 38,
+          "player_chunk_size": 200
+        },
+        "note": "Labels generated via trainer.labels.compute_labels(). Rows with censored=1 should be excluded from strict evaluation."
+      },
+      "evaluate": {
+        "mode": "evaluate",
+        "window": {
+          "start_ts": "2026-04-09T00:00:00+08:00",
+          "end_ts": "2026-04-15T00:00:00+08:00"
+        },
+        "db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\prediction_log.db",
+        "labels_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_labeled_20260409_191944_798717_1775733584798717200_106e90f7_below_threshold.csv",
+        "n_labeled_input": 3078,
+        "n_labeled_matched": 3106,
+        "n_censored_excluded": 0,
+        "current_threshold_metrics": {
+          "tp": 0.0,
+          "fp": 0.0,
+          "fn": 556.0,
+          "precision": 0.0,
+          "recall": 0.0
+        },
+        "precision_at_recall_target": {
+          "target_recall": 0.01,
+          "precision_at_target_recall": 0.34177215189873417,
+          "threshold_at_target": 0.8458334714864263,
+          "achieved_recall": 0.048561151079136694
+        },
+        "note": "Compare current_threshold_metrics and precision_at_recall_target against offline test metrics with same definition."
+      },
+      "branches": {
+        "below_threshold": {
+          "sample": {
+            "mode": "sample",
+            "window": {
+              "start_ts": "2026-04-09T00:00:00+08:00",
+              "end_ts": "2026-04-15T00:00:00+08:00"
+            },
+            "db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\prediction_log.db",
+            "summary": {
+              "n_total": 148043,
+              "n_rated": 148043,
+              "n_alert_rated": 758,
+              "n_below_rated": 147285,
+              "candidate_filter": "below_threshold",
+              "sample_size_requested": 4000,
+              "sample_size_written": 3117,
+              "bins": 10,
+              "per_bin_target": 400
+            },
+            "output_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_below_threshold_sample_20260409_191944_798717_1775733584798717200_106e90f7_below_threshold.csv",
+            "note": "Run offline labeling on output_csv bet_id, then use evaluate mode with labeled CSV. Use candidate_filter='alert' to diagnose precision drop; use candidate_filter='below_threshold' to diagnose missed positives."
+          },
+          "autolabel": {
+            "mode": "autolabel",
+            "window": {
+              "start_ts": "2026-04-09T00:00:00+08:00",
+              "end_ts": "2026-04-15T00:00:00+08:00"
+            },
+            "db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\prediction_log.db",
+            "sample_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_below_threshold_sample_20260409_191944_798717_1775733584798717200_106e90f7_below_threshold.csv",
+            "output_labels_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_labeled_20260409_191944_798717_1775733584798717200_106e90f7_below_threshold.csv",
+            "summary": {
+              "n_sample_input": 3116,
+              "n_sample_rows_input": 3117,
+              "n_unique_bet_id": 3116,
+              "n_duplicate_bet_id": 1,
+              "n_players": 1354,
+              "n_bets_fetched": 312236,
+              "n_labeled_rows": 3078,
+              "n_censored": 0,
+              "n_unmatched_sample_bet_id": 38,
+              "player_chunk_size": 200
+            },
+            "note": "Labels generated via trainer.labels.compute_labels(). Rows with censored=1 should be excluded from strict evaluation."
+          },
+          "evaluate": {
+            "mode": "evaluate",
+            "window": {
+              "start_ts": "2026-04-09T00:00:00+08:00",
+              "end_ts": "2026-04-15T00:00:00+08:00"
+            },
+            "db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\prediction_log.db",
+            "labels_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_labeled_20260409_191944_798717_1775733584798717200_106e90f7_below_threshold.csv",
+            "n_labeled_input": 3078,
+            "n_labeled_matched": 3106,
+            "n_censored_excluded": 0,
+            "current_threshold_metrics": {
+              "tp": 0.0,
+              "fp": 0.0,
+              "fn": 556.0,
+              "precision": 0.0,
+              "recall": 0.0
+            },
+            "precision_at_recall_target": {
+              "target_recall": 0.01,
+              "precision_at_target_recall": 0.34177215189873417,
+              "threshold_at_target": 0.8458334714864263,
+              "achieved_recall": 0.048561151079136694
+            },
+            "note": "Compare current_threshold_metrics and precision_at_recall_target against offline test metrics with same definition."
+          }
+        },
+        "alert": {
+          "sample": {
+            "mode": "sample",
+            "window": {
+              "start_ts": "2026-04-09T00:00:00+08:00",
+              "end_ts": "2026-04-15T00:00:00+08:00"
+            },
+            "db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\prediction_log.db",
+            "summary": {
+              "n_total": 148043,
+              "n_rated": 148043,
+              "n_alert_rated": 758,
+              "n_below_rated": 147285,
+              "candidate_filter": "alert",
+              "sample_size_requested": 4000,
+              "sample_size_written": 652,
+              "bins": 10,
+              "per_bin_target": 400
+            },
+            "output_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_below_threshold_sample_20260409_191944_798717_1775733584798717200_106e90f7_alert.csv",
+            "note": "Run offline labeling on output_csv bet_id, then use evaluate mode with labeled CSV. Use candidate_filter='alert' to diagnose precision drop; use candidate_filter='below_threshold' to diagnose missed positives."
+          },
+          "autolabel": {
+            "mode": "autolabel",
+            "window": {
+              "start_ts": "2026-04-09T00:00:00+08:00",
+              "end_ts": "2026-04-15T00:00:00+08:00"
+            },
+            "db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\prediction_log.db",
+            "sample_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_below_threshold_sample_20260409_191944_798717_1775733584798717200_106e90f7_alert.csv",
+            "output_labels_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_labeled_20260409_191944_798717_1775733584798717200_106e90f7_alert.csv",
+            "summary": {
+              "n_sample_input": 650,
+              "n_sample_rows_input": 652,
+              "n_unique_bet_id": 650,
+              "n_duplicate_bet_id": 2,
+              "n_players": 452,
+              "n_bets_fetched": 49053,
+              "n_labeled_rows": 617,
+              "n_censored": 0,
+              "n_unmatched_sample_bet_id": 33,
+              "player_chunk_size": 200
+            },
+            "note": "Labels generated via trainer.labels.compute_labels(). Rows with censored=1 should be excluded from strict evaluation."
+          },
+          "evaluate": {
+            "mode": "evaluate",
+            "window": {
+              "start_ts": "2026-04-09T00:00:00+08:00",
+              "end_ts": "2026-04-15T00:00:00+08:00"
+            },
+            "db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\prediction_log.db",
+            "labels_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_labeled_20260409_191944_798717_1775733584798717200_106e90f7_alert.csv",
+            "n_labeled_input": 617,
+            "n_labeled_matched": 624,
+            "n_censored_excluded": 0,
+            "current_threshold_metrics": {
+              "tp": 256.0,
+              "fp": 364.0,
+              "fn": 0.0,
+              "precision": 0.4129032258064516,
+              "recall": 1.0
+            },
+            "precision_at_recall_target": {
+              "target_recall": 0.01,
+              "precision_at_target_recall": 0.8571428571428571,
+              "threshold_at_target": 0.9568490171706183,
+              "achieved_recall": 0.0234375
+            },
+            "note": "Compare current_threshold_metrics and precision_at_recall_target against offline test metrics with same definition."
+          }
+        }
+      },
+      "diagnostics": {
+        "one_line_intent": "R1/R6 comprehensive run completed with both below-threshold and alert-side analyses.",
+        "below_threshold": {
+          "n_labeled_matched": 3106,
+          "fn": 556.0,
+          "fn_rate_within_below_threshold_sample": 0.17900837089504185,
+          "n_unmatched_sample_bet_id": 38
+        },
+        "alert": {
+          "n_labeled_matched": 624,
+          "tp": 256.0,
+          "fp": 364.0,
+          "current_threshold_precision": 0.4129032258064516,
+          "fp_rate_within_alert_sample": 0.5870967741935483,
+          "n_unmatched_sample_bet_id": 33
+        },
+        "interpretation_hints": [
+          "Use alert.current_threshold_precision to diagnose precision drop.",
+          "Use below_threshold.fn_rate_within_below_threshold_sample to quantify missed-positive concentration.",
+          "See unified_sample_evaluation for merged (below+alert) score\ufffdlabel metrics; not an unbiased prod cohort.",
+          "See r2_prediction_log_vs_alerts for duplicate-suppression / count parity signals.",
+          "See training_artifact_baseline for offline test_precision_at_recall_0.01 vs current merged sample."
+        ]
+      },
+      "unified_sample_evaluation": {
+        "description": "Merged union of stratified below-threshold + stratified alert labeled samples. NOT an i.i.d. or cohort-unbiased estimate of full production PR \ufffd use for unified score\ufffdlabel diagnostics and model_version splits only.",
+        "n_rows_below_branch": 3106,
+        "n_rows_alert_branch": 624,
+        "n_duplicate_bet_id_overlap": 7,
+        "n_rows_merged_unique": 3695,
+        "n_censored_excluded_below": 0,
+        "n_censored_excluded_alert": 0,
+        "current_threshold_metrics": {
+          "tp": 255.0,
+          "fp": 361.0,
+          "fn": 550.0,
+          "precision": 0.413961038961039,
+          "recall": 0.3167701863354037
+        },
+        "precision_at_recall_target": {
+          "target_recall": 0.01,
+          "precision_at_target_recall": 0.6470588235294118,
+          "threshold_at_target": 0.9406361541275423,
+          "achieved_recall": 0.02732919254658385
+        },
+        "by_model_version": {
+          "20260408-173809-e472fd0": {
+            "n_rows": 3695,
+            "current_threshold_metrics": {
+              "tp": 255.0,
+              "fp": 361.0,
+              "fn": 550.0,
+              "precision": 0.413961038961039,
+              "recall": 0.3167701863354037
+            },
+            "precision_at_recall_target": {
+              "target_recall": 0.01,
+              "precision_at_target_recall": 0.6470588235294118,
+              "threshold_at_target": 0.9406361541275423,
+              "achieved_recall": 0.02732919254658385
+            }
+          }
+        }
+      },
+      "r2_prediction_log_vs_alerts": {
+        "status": "ok",
+        "state_db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\state.db",
+        "n_prediction_log_is_alert_rows": 763,
+        "n_alerts_table_rows_ts_window": 760,
+        "difference_pl_minus_alerts": 3,
+        "alerts_to_prediction_log_ratio": 0.9960681520314548,
+        "note": "Compares counts in the same [start_ts, end_ts) string window on scored_at vs alerts.ts. Mismatch may reflect duplicate suppression (R2) or timestamp semantics differences."
+      },
+      "training_artifact_baseline": {
+        "status": "ok",
+        "path": "C:\\Projects\\Patron_Walkaway\\out\\models\\20260408-173809-e472fd0\\training_metrics.json",
+        "model_version": "20260408-173809-e472fd0",
+        "test_precision_at_recall_0.01": 0.7443921852387844,
+        "threshold_at_recall_0.01": 0.8567793547038658,
+        "test_threshold_uncalibrated": false,
+        "uncalibrated_threshold": {
+          "rated": false
+        },
+        "rated_threshold": 0.8613259987192541
+      },
+      "resolution": {
+        "pred_db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\prediction_log.db",
+        "env_file_used": null,
+        "state_db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\state.db",
+        "state_env_file_used": null,
+        "model_dir": "C:\\Projects\\Patron_Walkaway\\out\\models\\20260408-173809-e472fd0",
+        "model_dir_env_file_used": null,
+        "window": {
+          "start_ts": "2026-04-09T00:00:00+08:00",
+          "end_ts": "2026-04-15T00:00:00+08:00"
+        },
+        "mode": "all",
+        "effective_paths": {
+          "out_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_below_threshold_sample_20260409_191944_798717_1775733584798717200_106e90f7.csv",
+          "sample_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_below_threshold_sample_20260409_191944_798717_1775733584798717200_106e90f7.csv",
+          "out_labels_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_labeled_20260409_191944_798717_1775733584798717200_106e90f7.csv",
+          "labels_csv": "C:\\Projects\\Patron_Walkaway\\investigations\\test_vs_production\\snapshots\\latest_r1_r6_labeled_20260409_191944_798717_1775733584798717200_106e90f7.csv"
+        }
+      }
+    },
+    "stdout_log": "C:\\Projects\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\prod_phase1_20260409\\logs\\r1_r6.stdout.log",
+    "parse_error": null
+  },
+  "r1_r6_mid": {
+    "payload": null,
+    "stdout_log": "C:\\Projects\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\prod_phase1_20260409\\logs\\r1_r6_mid.stdout.log",
+    "parse_error": null
+  },
+  "state_db_stats": {
+    "state_db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\state.db",
+    "window_start_ts": "2026-04-09T00:00:00+08:00",
+    "window_end_ts": "2026-04-15T00:00:00+08:00",
+    "validation_results_rows_in_window": 674,
+    "finalized_alerts_count": 674,
+    "finalized_true_positives_count": 235,
+    "note": null
+  },
+  "thresholds": {
+    "min_hours_preliminary": 48,
+    "min_finalized_alerts_preliminary": 300,
+    "min_finalized_true_positives_preliminary": 30,
+    "min_hours_gate": 72,
+    "min_finalized_alerts_gate": 800,
+    "min_finalized_true_positives_gate": 50
+  },
+  "window": {
+    "start_ts": "2026-04-09T00:00:00+08:00",
+    "end_ts": "2026-04-15T00:00:00+08:00"
+  }
+}

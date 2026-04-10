@@ -2,38 +2,36 @@
 
 ## Run metadata (orchestrator)
 
-- **run_id**: `pytest_resume_skip`
-- **Window**: `2026-01-01T00:00:00+08:00` → `2026-01-08T00:00:00+08:00`
-- **model_dir**: `C:\Users\longp\AppData\Local\Temp\pytest-of-longp\pytest-139\test_resume_skips_preflight_wh0\missing_models`
-- **state_db_path**: `s.db`
-- **prediction_log_db_path**: `p.db`
-- **collect_bundle**: `investigations/precision_uplift_recall_1pct/orchestrator/state/pytest_resume_skip/collect_bundle.json`
+- **run_id**: `prod_phase1_20260409`
+- **Window**: `2026-04-09T00:00:00+08:00` → `2026-04-15T00:00:00+08:00`
+- **model_dir**: `out/models/20260408-173809-e472fd0`
+- **state_db_path**: `local_state/state.db`
+- **prediction_log_db_path**: `local_state/prediction_log.db`
+- **collect_bundle**: `investigations/precision_uplift_recall_1pct/orchestrator/state/prod_phase1_20260409/collect_bundle.json`
 
 
 ## Gate 結論 (orchestrator)
 
-- **status**: `FAIL`
+- **status**: `PRELIMINARY`
 
 ### blocking_reasons
 
-- `collect_error:E_COLLECT_BACKTEST_METRICS`
-- `collect_error:E_COLLECT_R1_PAYLOAD`
-- `collect_error:E_COLLECT_STATE_DB`
+- `below_gate_time_or_sample_thresholds`
 
 ### evidence_summary
 
-window_h=168.00; finalized_alerts=0; finalized_tp=0
+window_h=144.00; finalized_alerts=674; finalized_tp=235; pat@r_final=0.6471
 
 ### metrics
 
 ```json
 {
-  "window_hours": 168.0,
-  "finalized_alerts_count": 0,
-  "finalized_true_positives_count": 0,
-  "precision_at_target_recall_final": null,
+  "window_hours": 144.0,
+  "finalized_alerts_count": 674,
+  "finalized_true_positives_count": 235,
+  "precision_at_target_recall_final": 0.6470588235294118,
   "precision_at_target_recall_mid": null,
-  "has_backtest_metrics": false
+  "has_backtest_metrics": true
 }
 ```
 
