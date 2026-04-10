@@ -60,6 +60,14 @@
 
 **Phase 2 Gate**：至少 1 條路線相對基線有顯著 uplift（建議門檻：+3~5pp）。
 
+**調查 repo 對照（`run_pipeline.py --phase phase2`）**：細項見 [`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](../../investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md) **T10／T11** 與 `evaluators.evaluate_phase2_gate`。
+
+| Sprint 語意 | Orchestrator 契約（摘要） |
+| :--- | :--- |
+| 至少一條路線 uplift | 啟用軌道內 **per-job PAT@1% 預覽**：任一行 challenger 對 **YAML 序** baseline 之 uplift ≥ `gate.min_uplift_pp_vs_baseline`（範例 **3.0 pp**，落在 +3~5pp 建議下緣）→ **`PASS`** |
+| 跨窗／波動可控 | 可選 **`phase2_bundle.phase2_pat_series_by_experiment`** + `gate.max_std_pp_across_windows`：**uplift 已 PASS** 且任列樣本 stdev（pp）超標 → **`FAIL`**；無手寫多窗時 **`collectors.merge_phase2_pat_series_from_shared_and_per_job`** 可組兩點 MVP 序列 |
+| 產物／CI | **`phase2/phase2_gate_decision.md`**、**`phase2/track_*_results.md`**（uplift、PAT 序列與 std 摘要）；可選 **`--phase2-fail-on-gate-fail`**（exit **9**）、**`--phase2-fail-on-gate-blocked`**（exit **10**） |
+
 ---
 
 ### Phase 3：特徵深化與集成加碼（在勝者路線上）

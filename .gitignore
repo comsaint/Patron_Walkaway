@@ -217,6 +217,7 @@ trainer/out_backtest/
 trainer/models/
 trainer/models_90d_weak/
 investigations/test_vs_production/snapshots/*
+investigations/precision_uplift_recall_1pct/orchestrator/state/*
 out/
 deploy_dist/
 deploy_dist.zip
@@ -228,6 +229,5 @@ credential/mlflow.env
 credential/*.json
 !credential/.env.example
 !credential/mlflow.env.example
-local_state/prediction_log.db
-local_state/state.db
+local_state/*
 trainer/out_*/

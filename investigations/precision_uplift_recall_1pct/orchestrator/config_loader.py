@@ -256,6 +256,28 @@ def validate_phase2_config(raw: Mapping[str, Any], *, cli_run_id: str) -> dict[s
                 raise ConfigValidationError(
                     f"tracks.{tn}.experiments[{i}].overrides must be a mapping"
                 )
+            tm_opt = exp.get("training_metrics_repo_relative")
+            if tm_opt is not None:
+                if not isinstance(tm_opt, str) or not str(tm_opt).strip():
+                    raise ConfigValidationError(
+                        f"tracks.{tn}.experiments[{i}].training_metrics_repo_relative "
+                        "must be a non-empty string when set"
+                    )
+            pab = exp.get("precision_at_recall_1pct_by_window")
+            if pab is not None:
+                if not isinstance(pab, list) or not pab:
+                    raise ConfigValidationError(
+                        f"tracks.{tn}.experiments[{i}].precision_at_recall_1pct_by_window "
+                        "must be a non-empty list when set"
+                    )
+                for j, v in enumerate(pab):
+                    try:
+                        float(v)
+                    except (TypeError, ValueError) as exc:
+                        raise ConfigValidationError(
+                            f"tracks.{tn}.experiments[{i}].precision_at_recall_1pct_by_window[{j}] "
+                            "must be numeric"
+                        ) from exc
 
     gate = raw["gate"]
     if not isinstance(gate, Mapping):

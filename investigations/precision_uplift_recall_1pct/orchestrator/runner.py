@@ -1,18 +1,141 @@
-"""Preflight checks and subprocess runners for Phase 1."""
+"""Preflight checks and subprocess runners for Phase 1 and Phase 2 (T10)."""
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+import collectors
+
 PREDICTION_DB_REQUIRED_TABLES: tuple[str, ...] = ("prediction_log",)
 STATE_DB_REQUIRED_TABLES: tuple[str, ...] = ("alerts", "validation_results")
 
 DEFAULT_R1_R6_SCRIPT = "investigations/test_vs_production/checks/run_r1_r6_analysis.py"
 _LOG_TAIL_CHARS = 4000
+_TRAINER_ARTIFACTS_SAVED_RE = re.compile(
+    r"Artifacts saved to\s+(.+?)\s+\(version=",
+    re.MULTILINE,
+)
+# Contract: must stay aligned with ``logger.info`` in
+# ``trainer.training.trainer.save_artifact_bundle`` (see that file).
+TRAINER_ARTIFACTS_SAVED_LOGGER_INFO_FORMAT = (
+    'logger.info("Artifacts saved to %s  (version=%s)", _out, model_version)'
+)
+_TRAINER_LOG_TAIL_BYTES = 512_000
+
+
+def _tail_file_text(path: Path, max_bytes: int) -> str:
+    """Read a text file, or only the last ``max_bytes`` (UTF-8, replace errors)."""
+    if not path.is_file():
+        return ""
+    data = path.read_bytes()
+    if len(data) > max_bytes:
+        data = data[-max_bytes:]
+    return data.decode("utf-8", errors="replace")
+
+
+def infer_training_metrics_repo_relative_from_trainer_logs(
+    repo_root: Path,
+    *,
+    stdout_path: str | Path,
+    stderr_path: str | Path,
+    max_scan_bytes: int = _TRAINER_LOG_TAIL_BYTES,
+) -> str | None:
+    """Parse trainer stdout/stderr tail for ``save_artifact_bundle`` log line.
+
+    Matches ``trainer.training.trainer`` logger line
+    ``Artifacts saved to <dir>  (version=...)``.
+
+    Args:
+        repo_root: Repository root (artifact path must resolve under it).
+        stdout_path: Path to captured trainer stdout log.
+        stderr_path: Path to captured trainer stderr log (trainer often logs here).
+        max_scan_bytes: Max bytes read from the end of each file.
+
+    Returns:
+        POSIX path relative to ``repo_root`` for the bundle directory containing
+        ``training_metrics.json``, or None if not found or outside the repo.
+    """
+    text = "\n".join(
+        (
+            _tail_file_text(Path(stdout_path), max_scan_bytes),
+            _tail_file_text(Path(stderr_path), max_scan_bytes),
+        )
+    )
+    matches = list(_TRAINER_ARTIFACTS_SAVED_RE.finditer(text))
+    if not matches:
+        return None
+    raw = matches[-1].group(1).strip()
+    if not raw:
+        return None
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (repo_root / p).resolve()
+    else:
+        p = p.resolve()
+    root = repo_root.resolve()
+    try:
+        rel = p.relative_to(root).as_posix()
+    except ValueError:
+        return None
+    return rel
+
+
+def merge_inferred_training_metrics_paths_into_phase2_bundle(
+    bundle: dict[str, Any],
+    repo_root: Path,
+) -> None:
+    """Set ``job_specs[].training_metrics_repo_relative`` from successful trainer jobs.
+
+    Only fills specs that do not already define ``training_metrics_repo_relative``.
+    Inference uses per-job ``trainer_jobs.results[].inferred_training_metrics_repo_relative``.
+    """
+    tj = bundle.get("trainer_jobs")
+    if not isinstance(tj, Mapping):
+        return
+    results = tj.get("results")
+    if not isinstance(results, list):
+        return
+    specs = bundle.get("job_specs")
+    if not isinstance(specs, list):
+        return
+    by_key: dict[tuple[str, str], str] = {}
+    for r in results:
+        if not isinstance(r, Mapping) or not r.get("ok"):
+            continue
+        tr = str(r.get("track") or "").strip()
+        eid = str(r.get("exp_id") or "").strip()
+        inf = r.get("inferred_training_metrics_repo_relative")
+        if not tr or not eid:
+            continue
+        if isinstance(inf, str) and inf.strip():
+            # Re-validate under repo (defense in depth).
+            safe, _err = _safe_training_metrics_hint(repo_root, inf.strip())
+            if safe:
+                by_key[(tr, eid)] = safe
+    for spec in specs:
+        if not isinstance(spec, Mapping):
+            continue
+        if str(spec.get("training_metrics_repo_relative") or "").strip():
+            continue
+        tr = str(spec.get("track") or "").strip()
+        eid = str(spec.get("exp_id") or "").strip()
+        got = by_key.get((tr, eid))
+        if got:
+            spec["training_metrics_repo_relative"] = got
+
+
+def _safe_training_metrics_hint(repo_root: Path, rel: str) -> tuple[str | None, str | None]:
+    """Return canonical repo-relative POSIX path or ``(None, error)`` if invalid."""
+    base, err = collectors._safe_resolve_under_repo_root(repo_root, rel)
+    if err:
+        return None, err
+    assert base is not None
+    return base.relative_to(repo_root.resolve()).as_posix(), None
 
 
 def resolve_r1_r6_script(repo_root: Path, cfg: Mapping[str, Any]) -> Path:
@@ -233,7 +356,8 @@ def run_phase1_backtest(
 
     Args:
         repo_root: Repository root (cwd).
-        cfg: Validated Phase 1 config.
+        cfg: Validated Phase 1 config. Optional ``backtest_output_dir`` adds
+            ``--output-dir`` so metrics land outside the default trainer out dir.
         log_dir: Log directory.
         python_exe: Python interpreter.
         timeout_sec: Optional timeout.
@@ -260,6 +384,11 @@ def run_phase1_backtest(
     extras = cfg.get("backtest_extra_args")
     if isinstance(extras, list):
         argv.extend(str(x) for x in extras)
+    bod = cfg.get("backtest_output_dir")
+    if bod is not None and str(bod).strip():
+        out_p = Path(str(bod).strip())
+        out_p = out_p if out_p.is_absolute() else (repo_root / out_p)
+        argv.extend(["--output-dir", str(out_p.resolve())])
 
     base = run_logged_command(
         argv,
@@ -401,6 +530,449 @@ def run_r1_r6_cli_smoke(
         tail = (proc.stderr or proc.stdout or "").strip()[-500:]
         return False, f"r1_r6 smoke exit {proc.returncode}: {tail}"
     return True, None
+
+
+def ensure_phase2_job_log_dirs(
+    repo_root: Path,
+    job_specs: object,
+) -> tuple[bool, str | None]:
+    """Create log directories for each Phase 2 ``job_specs`` entry (T10).
+
+    Args:
+        repo_root: Repository root; each ``logs_subdir_relative`` is resolved under it.
+        job_specs: List of mappings with ``logs_subdir_relative`` (repo-relative POSIX
+            path from ``collect_phase2_plan_bundle``, under the investigation
+            ``orchestrator/state/<run_id>/logs/phase2/...`` tree).
+
+    Returns:
+        ``(True, None)`` on success, or ``(False, message)`` on first failure.
+    """
+    if not isinstance(job_specs, list):
+        return True, None
+    for i, spec in enumerate(job_specs):
+        if not isinstance(spec, Mapping):
+            continue
+        rel = str(spec.get("logs_subdir_relative") or "").strip()
+        if not rel:
+            return False, f"job_specs[{i}] missing logs_subdir_relative"
+        dest = (repo_root / rel).resolve()
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return False, f"cannot mkdir {dest}: {exc}"
+    return True, None
+
+
+def run_trainer_trainer_help_smoke(
+    repo_root: Path,
+    python_exe: str | None = None,
+) -> tuple[bool, str | None]:
+    """Run ``python -m trainer.trainer --help`` to verify training CLI imports (T10).
+
+    Args:
+        repo_root: Repository root (subprocess working directory).
+        python_exe: Interpreter; defaults to ``sys.executable``.
+
+    Returns:
+        ``(True, None)`` on success, or ``(False, message)`` on failure.
+    """
+    exe = python_exe or sys.executable
+    try:
+        proc = subprocess.run(
+            [exe, "-m", "trainer.trainer", "--help"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "trainer.trainer smoke: subprocess timeout"
+    except OSError as exc:
+        return False, f"trainer.trainer smoke: failed to spawn process: {exc}"
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-500:]
+        return False, f"trainer.trainer smoke exit {proc.returncode}: {tail}"
+    return True, None
+
+
+def phase2_experiment_overrides(
+    bundle: Mapping[str, Any],
+    track: str,
+    exp_id: str,
+) -> dict[str, Any]:
+    """Return experiment ``overrides`` dict for ``track`` / ``exp_id`` from a phase2 bundle."""
+    tracks = bundle.get("tracks")
+    if not isinstance(tracks, Mapping):
+        return {}
+    tnode = tracks.get(track)
+    if not isinstance(tnode, Mapping):
+        return {}
+    exps = tnode.get("experiments")
+    if not isinstance(exps, list):
+        return {}
+    for ex in exps:
+        if not isinstance(ex, Mapping):
+            continue
+        if str(ex.get("exp_id") or "").strip() != exp_id:
+            continue
+        ov = ex.get("overrides")
+        return dict(ov) if isinstance(ov, Mapping) else {}
+    return {}
+
+
+def build_phase2_trainer_argv(
+    bundle: Mapping[str, Any],
+    *,
+    track: str,
+    exp_id: str,
+    python_exe: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Build ``python -m trainer.trainer`` argv for one Phase 2 job (T10).
+
+    Experiment YAML ``overrides`` are not wired to trainer CLI yet; keys are returned
+    as ``unapplied`` for transparency in the bundle ``trainer_jobs`` record.
+
+    Args:
+        bundle: Phase 2 plan bundle (``common``, ``resources``, ``tracks``).
+        track: Track name (e.g. ``track_a``).
+        exp_id: Experiment id from config.
+        python_exe: Interpreter; defaults to ``sys.executable``.
+
+    Returns:
+        ``(argv, sorted_unapplied_override_keys)``.
+    """
+    exe = python_exe or sys.executable
+    common = bundle.get("common")
+    if not isinstance(common, Mapping):
+        raise ValueError("bundle['common'] must be a mapping")
+    win = common.get("window")
+    if not isinstance(win, Mapping):
+        raise ValueError("bundle['common']['window'] must be a mapping")
+    start = str(win.get("start_ts") or "").strip()
+    end = str(win.get("end_ts") or "").strip()
+    if not start or not end:
+        raise ValueError("bundle common.window requires non-empty start_ts and end_ts")
+
+    resources = (
+        bundle["resources"] if isinstance(bundle.get("resources"), Mapping) else {}
+    )
+    argv: list[str] = [exe, "-m", "trainer.trainer", "--start", start, "--end", end]
+    if bool(resources.get("backtest_skip_optuna")):
+        argv.append("--skip-optuna")
+    if bool(resources.get("trainer_use_local_parquet")):
+        argv.append("--use-local-parquet")
+
+    ov = phase2_experiment_overrides(bundle, track, exp_id)
+    unapplied = sorted(str(k) for k in ov.keys())
+    return argv, unapplied
+
+
+def _phase2_trainer_job_timeout_sec(bundle: Mapping[str, Any]) -> float | None:
+    """Optional per-job timeout from ``bundle['resources']['phase2_trainer_job_timeout_sec']``."""
+    res = bundle.get("resources")
+    if not isinstance(res, Mapping):
+        return None
+    raw = res.get("phase2_trainer_job_timeout_sec")
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def run_phase2_trainer_jobs(
+    repo_root: Path,
+    bundle: Mapping[str, Any],
+    *,
+    python_exe: str | None = None,
+    timeout_sec: float | None = None,
+) -> tuple[bool, str | None, list[dict[str, Any]]]:
+    """Run ``trainer.trainer`` once per ``job_specs`` entry with logging under each job log dir.
+
+    Args:
+        repo_root: Repository root (subprocess cwd).
+        bundle: Phase 2 bundle with ``common``, ``resources``, ``job_specs``.
+        python_exe: Interpreter; defaults to ``sys.executable``.
+        timeout_sec: Subprocess timeout per job; ``None`` uses bundle resource when set,
+            else no timeout.
+
+    Returns:
+        ``(all_ok, first_error_message_or_none, per_job_records)``.
+    """
+    specs_obj = bundle.get("job_specs")
+    if not isinstance(specs_obj, list):
+        return True, None, []
+    timeout = timeout_sec
+    if timeout is None:
+        timeout = _phase2_trainer_job_timeout_sec(bundle)
+
+    results: list[dict[str, Any]] = []
+    all_ok = True
+    first_err: str | None = None
+    exe = python_exe or sys.executable
+
+    for spec in specs_obj:
+        if not isinstance(spec, Mapping):
+            continue
+        track = str(spec.get("track") or "").strip()
+        eid = str(spec.get("exp_id") or "").strip()
+        rel = str(spec.get("logs_subdir_relative") or "").strip()
+        if not track or not eid or not rel:
+            msg = f"invalid job_spec entry (need track, exp_id, logs_subdir_relative): {spec!r}"
+            if all_ok:
+                all_ok = False
+                first_err = msg
+            results.append(
+                {
+                    "track": track or None,
+                    "exp_id": eid or None,
+                    "ok": False,
+                    "message": msg,
+                    "inferred_training_metrics_repo_relative": None,
+                }
+            )
+            continue
+
+        log_dir = (repo_root / rel).resolve()
+        try:
+            argv, unapplied = build_phase2_trainer_argv(
+                bundle, track=track, exp_id=eid, python_exe=exe
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            if all_ok:
+                all_ok = False
+                first_err = msg
+            results.append(
+                {
+                    "track": track,
+                    "exp_id": eid,
+                    "ok": False,
+                    "message": msg,
+                    "unapplied_overrides": sorted(
+                        str(k)
+                        for k in phase2_experiment_overrides(
+                            bundle, track, eid
+                        ).keys()
+                    ),
+                    "inferred_training_metrics_repo_relative": None,
+                }
+            )
+            continue
+
+        log_stem = f"trainer_job_{track}_{eid}".replace("/", "_").replace("\\", "_")
+        base = run_logged_command(
+            argv,
+            cwd=repo_root,
+            log_dir=log_dir,
+            log_stem=log_stem,
+            timeout_sec=timeout,
+        )
+        ok_job = bool(base.get("ok"))
+        if not ok_job and all_ok:
+            all_ok = False
+            first_err = (
+                base.get("message")
+                or f"trainer job {track}/{eid} exit {base.get('returncode')}"
+            )
+        out_path = base.get("stdout_path")
+        err_path = base.get("stderr_path")
+        inferred: str | None = None
+        if ok_job:
+            inferred = infer_training_metrics_repo_relative_from_trainer_logs(
+                repo_root,
+                stdout_path=str(out_path or ""),
+                stderr_path=str(err_path or ""),
+            )
+        results.append(
+            {
+                "track": track,
+                "exp_id": eid,
+                "ok": ok_job,
+                "returncode": base.get("returncode"),
+                "argv": list(argv),
+                "unapplied_overrides": unapplied,
+                "stdout_path": str(out_path) if out_path is not None else "",
+                "stderr_path": str(err_path) if err_path is not None else "",
+                "error_code": base.get("error_code"),
+                "message": base.get("message"),
+                "inferred_training_metrics_repo_relative": inferred,
+            }
+        )
+
+    return all_ok, first_err, results
+
+
+def _preview_precision_at_recall_1pct_from_metrics(
+    metrics: Mapping[str, Any],
+) -> float | None:
+    """Read ``model_default.test_precision_at_recall_0.01`` from backtest_metrics-shaped JSON."""
+    md = metrics.get("model_default")
+    if not isinstance(md, Mapping):
+        return None
+    raw = md.get("test_precision_at_recall_0.01")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def run_phase2_per_job_backtests(
+    repo_root: Path,
+    bundle: Mapping[str, Any],
+    backtest_cfg_template: Mapping[str, Any],
+    *,
+    run_id: str,
+    python_exe: str | None = None,
+    timeout_sec: float | None = None,
+) -> tuple[bool, str | None, list[dict[str, Any]]]:
+    """Run ``trainer.backtester`` once per ``job_specs`` row that has a training-metrics hint.
+
+    Uses ``job_specs[].training_metrics_repo_relative`` to resolve the model bundle directory
+    (see ``collectors.model_bundle_dir_from_training_metrics_hint``). Jobs without that
+    field are skipped.     After each successful subprocess, reads ``backtest_metrics.json`` from
+    ``collectors.phase2_per_job_backtest_metrics_repo_relative`` under that job's
+    ``_per_job_backtest`` log directory (isolated from the shared backtest path).
+
+    Args:
+        repo_root: Repository root (subprocess cwd).
+        bundle: Phase 2 bundle with ``job_specs`` and optional ``resources``.
+        backtest_cfg_template: Mapping suitable for ``run_phase1_backtest`` (window, etc.);
+            ``model_dir`` is overridden per job.
+        run_id: Orchestrator run id (for log paths).
+        python_exe: Interpreter; defaults to ``sys.executable``.
+        timeout_sec: Per-job subprocess timeout.
+
+    Returns:
+        ``(all_ok, first_error_message_or_none, per_job_records)``.
+    """
+    specs_obj = bundle.get("job_specs")
+    if not isinstance(specs_obj, list):
+        return True, None, []
+
+    results: list[dict[str, Any]] = []
+    all_ok = True
+    first_err: str | None = None
+    exe = python_exe or sys.executable
+
+    for spec in specs_obj:
+        if not isinstance(spec, Mapping):
+            continue
+        track = str(spec.get("track") or "").strip()
+        eid = str(spec.get("exp_id") or "").strip()
+        hint = str(spec.get("training_metrics_repo_relative") or "").strip()
+        if not track or not eid:
+            msg = (
+                "invalid job_spec entry (need track, exp_id): "
+                f"{spec!r}"
+            )
+            if all_ok:
+                first_err = msg
+            all_ok = False
+            results.append(
+                {
+                    "track": track or None,
+                    "exp_id": eid or None,
+                    "skipped": False,
+                    "ok": False,
+                    "message": msg,
+                }
+            )
+            continue
+
+        if not hint:
+            results.append(
+                {
+                    "track": track,
+                    "exp_id": eid,
+                    "skipped": True,
+                    "skip_reason": "no training_metrics_repo_relative",
+                    "ok": True,
+                }
+            )
+            continue
+
+        bundle_dir, berr = collectors.model_bundle_dir_from_training_metrics_hint(
+            repo_root, hint
+        )
+        if bundle_dir is None:
+            msg = berr or "cannot resolve model bundle from training_metrics_repo_relative"
+            if all_ok:
+                first_err = msg
+            all_ok = False
+            results.append(
+                {
+                    "track": track,
+                    "exp_id": eid,
+                    "skipped": False,
+                    "training_metrics_repo_relative": hint,
+                    "ok": False,
+                    "message": msg,
+                }
+            )
+            continue
+
+        cfg_job = dict(backtest_cfg_template)
+        cfg_job["model_dir"] = str(bundle_dir.resolve())
+        rel_log = collectors.phase2_per_job_backtest_logs_subdir_relative(
+            run_id, track, eid
+        )
+        log_dir = (repo_root / rel_log).resolve()
+        cfg_job["backtest_output_dir"] = str(log_dir.resolve())
+        mrel_job = collectors.phase2_per_job_backtest_metrics_repo_relative(
+            run_id, track, eid
+        )
+        res_bt = run_phase1_backtest(
+            repo_root,
+            cfg_job,
+            log_dir,
+            python_exe=exe,
+            timeout_sec=timeout_sec,
+        )
+        ok_sub = bool(res_bt.get("ok"))
+        preview: float | None = None
+        load_err: str | None = None
+        if ok_sub:
+            mobj, load_err = collectors.load_json_under_repo(repo_root, mrel_job)
+            if mobj is not None and not load_err:
+                preview = _preview_precision_at_recall_1pct_from_metrics(mobj)
+            else:
+                ok_sub = False
+
+        if not ok_sub:
+            if all_ok:
+                first_err = (
+                    load_err
+                    or res_bt.get("message")
+                    or f"per-job backtest failed for {track}/{eid}"
+                )
+            all_ok = False
+
+        results.append(
+            {
+                "track": track,
+                "exp_id": eid,
+                "skipped": False,
+                "training_metrics_repo_relative": hint,
+                "model_bundle_dir": str(bundle_dir.resolve()),
+                "metrics_repo_relative": mrel_job,
+                "ok": ok_sub,
+                "returncode": res_bt.get("returncode"),
+                "stdout_path": str(res_bt.get("stdout_path") or ""),
+                "stderr_path": str(res_bt.get("stderr_path") or ""),
+                "error_code": res_bt.get("error_code"),
+                "message": res_bt.get("message"),
+                "metrics_load_error": None if ok_sub else load_err,
+                "shared_precision_at_recall_1pct_preview": preview,
+            }
+        )
+
+    return all_ok, first_err, results
 
 
 def run_preflight(

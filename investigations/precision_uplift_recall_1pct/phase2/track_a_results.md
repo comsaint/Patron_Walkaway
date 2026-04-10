@@ -1,5 +1,59 @@
-# track_a_results
+# Phase 2 — track_a results
 
-| 實驗ID | 主要策略 | precision@recall=1% | uplift | 穩定性 | 決策 |
-| :--- | :--- | ---: | ---: | :--- | :--- |
-| TBD | 排序導向 + hard negative | 0.0000 | 0.0000 | 低/中/高 | keep/drop |
+## Run metadata
+
+- **run_id**: `pytest_phase2_resume_no_bundle`
+- **bundle status**: `plan_only`
+- **track enabled**: `True`
+
+## Experiments (YAML)
+
+- `a0`
+
+## Per-job training_metrics harvest
+
+> Harvest uses each job's optional ``training_metrics_repo_relative`` (YAML) when set, else ``{logs_subdir_relative}/training_metrics.json``.
+
+- `a0`: **not found** (file not found: C:\Users\longp\Patron_Walkaway\investigations\precision_uplift_recall_1pct\orchestrator\state\pytest_phase2_resume_no_bundle\logs\phase2\track_a\a0\training_metrics.json)
+
+## Per-job backtest preview
+
+> One ``trainer.backtester`` run per ``job_spec`` with ``training_metrics_repo_relative``; each job uses ``--output-dir`` under ``…/logs/phase2/<track>/<exp_id>/_per_job_backtest/`` so ``backtest_metrics.json`` is not overwritten by the next job (shared backtest still uses ``resources.backtest_metrics_path`` / default).
+
+- *(per-job backtests not run; pass ``--phase2-run-per-job-backtests``)*
+
+## Uplift vs baseline (gate)
+
+> First experiment with a PAT@1% preview in **YAML order** is the track baseline; challengers are later experiments with previews. Values come from ``evaluate_phase2_gate`` (``gate.min_uplift_pp_vs_baseline`` in percentage points).
+
+- *(uplift gate not evaluated — needs ``metrics_ingested`` plus per-job backtests with previews)*
+
+## PAT@1% series & std (gate)
+
+> Optional ``bundle['phase2_pat_series_by_experiment']``; std lines come from ``gate['metrics']`` when the uplift/std path ran (limit = ``gate.max_std_pp_across_windows`` in pp).
+
+### Bundle series (this track)
+
+- *(no `phase2_pat_series_by_experiment` entries for this track)*
+
+### Std gate (from evaluate_phase2_gate)
+
+- *(std gate not evaluated — e.g. `plan_only`, or uplift/std prerequisites missing)*
+
+## Metrics (shared backtest)
+
+> **Note**: Values below come from a **single** `trainer.backtester` run over `common.model_dir`, not per-experiment outputs. Per-track differentiation is T10+.
+
+- **Precision @ recall 1% (shared)**: *(not available in ingested backtest_metrics)*
+
+## Gate snapshot
+
+- **gate status**: `BLOCKED`
+
+### Blocking reasons
+
+- `phase2_bundle_plan_only_no_track_metrics`
+
+### Evidence summary
+
+bundle is plan_only; 3 experiment slot(s) declared but no training metrics ingested

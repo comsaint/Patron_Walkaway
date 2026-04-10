@@ -620,6 +620,7 @@ def backtest(
     n_optuna_trials: int = OPTUNA_N_TRIALS,
     use_local_parquet: bool = False,
     model_bundle_dir: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
 ) -> dict:
     """Full backtest pipeline for one time window (v10 single rated model, DEC-021).
 
@@ -631,6 +632,8 @@ def backtest(
     Caller (e.g. main) must pass already-normalized bets/sessions; parameter
     names are historical.  Unnormalized data leads to apply_dq/downstream type
     contract mismatch vs trainer/scorer (PLAN § Post-Load Normalizer).
+    When ``output_dir`` is set, metrics, predictions, and alerts are written there
+    instead of the default ``BACKTEST_OUT`` (orchestrator per-job isolation).
     """
     extended_end = window_end + timedelta(minutes=max(LABEL_LOOKAHEAD_MIN, 24 * 60))
     history_start = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
@@ -835,7 +838,10 @@ def backtest(
         )
 
     # --- Save predictions (R30: parquet for large windows; alerts stay CSV) ---
-    pred_path = BACKTEST_OUT / "backtest_predictions.parquet"
+    out_root = Path(output_dir).resolve() if output_dir is not None else BACKTEST_OUT
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    pred_path = out_root / "backtest_predictions.parquet"
     labeled.to_parquet(pred_path, index=False)
 
     labeled["is_alert"] = np.where(
@@ -844,10 +850,10 @@ def backtest(
         False,
     )
     alerts_df = labeled[labeled["is_alert"]].copy()
-    alerts_path = BACKTEST_OUT / "backtest_alerts.csv"
+    alerts_path = out_root / "backtest_alerts.csv"
     alerts_df.to_csv(alerts_path, index=False)
 
-    metrics_path = BACKTEST_OUT / "backtest_metrics.json"
+    metrics_path = out_root / "backtest_metrics.json"
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, default=str)
 
@@ -917,6 +923,15 @@ def main() -> None:
             "If neither flag is set, use _latest_model_manifest.json or legacy flat model.pkl."
         ),
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for backtest_metrics.json, predictions parquet, and alerts CSV "
+            "(default: trainer out_backtest from config)."
+        ),
+    )
     args = parser.parse_args()
 
     _mv = (args.model_version or "").strip() or None
@@ -948,6 +963,7 @@ def main() -> None:
         n_optuna_trials=args.n_trials,
         use_local_parquet=args.use_local_parquet,
         model_bundle_dir=_bundle_dir,
+        output_dir=args.output_dir,
     )
     print(json.dumps(result, indent=2, default=str))
 

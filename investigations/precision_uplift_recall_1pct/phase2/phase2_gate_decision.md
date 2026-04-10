@@ -1,18 +1,20 @@
 # phase2_gate_decision
 
-## Gate 結論
+## Run metadata
 
-- Gate：未達成 / 達成
-- 勝者路線：Track A / Track B / Track C
-- 是否達到 +3~5pp uplift：否 / 是
+- **run_id**: `pytest_phase2_resume_no_bundle`
+- **phase2_bundle**: `investigations/precision_uplift_recall_1pct/orchestrator/state/pytest_phase2_resume_no_bundle/phase2_bundle.json`
+- **bundle status**: `plan_only`
+- **model_dir**: `C:\Users\longp\AppData\Local\Temp\pytest-of-longp\pytest-191\test_phase2_resume_missing_bun0\models`
 
-## 依據工件
+## Gate outcome
 
-- `track_a_results.md`
-- `track_b_results.md`
-- `track_c_results.md`
+- **status**: **BLOCKED**
 
-## 下一步
+### Blocking reasons
 
-- [ ] 進入 Phase 3
-- [ ] 回到 Phase 1 補資料問題
+- `phase2_bundle_plan_only_no_track_metrics`
+
+### Evidence summary
+
+bundle is plan_only; 3 experiment slot(s) declared but no training metrics ingested

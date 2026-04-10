@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Precision uplift orchestrator CLI (Phase 1 MVP + Phase 2 scaffold T9)."""
+"""Precision uplift orchestrator CLI (Phase 1 MVP + Phase 2 T9–T11 scaffold)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -53,11 +54,25 @@ def _load_run_state(path: Path) -> dict[str, Any] | None:
 
 
 def _write_run_state(path: Path, payload: dict[str, Any]) -> None:
-    """Atomically write run state JSON (best-effort)."""
+    """Atomically write run state JSON (best-effort).
+
+    Retries ``replace`` on ``PermissionError`` (observed on Windows when AV or
+    concurrent readers briefly lock ``run_state.json``).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    tmp.replace(path)
+    last_pe: PermissionError | None = None
+    for attempt in range(8):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError as exc:
+            last_pe = exc
+            if attempt < 7:
+                time.sleep(0.05 * (attempt + 1))
+    assert last_pe is not None
+    raise last_pe
 
 
 def build_input_summary(cfg: dict[str, Any], config_path: Path) -> dict[str, Any]:
@@ -100,6 +115,62 @@ def phase2_common_to_preflight_cfg(common: Mapping[str, Any]) -> dict[str, Any]:
         "prediction_log_db_path": common["prediction_log_db_path"],
         "window": dict(common["window"]),
     }
+
+
+def phase2_cfg_to_backtest_cfg(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """Map phase2 config to keys expected by ``runner.run_phase1_backtest`` (T10)."""
+    com = cfg["common"]
+    res = cfg.get("resources")
+    res_d = dict(res) if isinstance(res, Mapping) else {}
+    out: dict[str, Any] = {
+        "model_dir": com["model_dir"],
+        "window": dict(com["window"]),
+        "backtest_skip_optuna": bool(res_d.get("backtest_skip_optuna", True)),
+    }
+    extras = res_d.get("backtest_extra_args")
+    if isinstance(extras, list):
+        out["backtest_extra_args"] = [str(x) for x in extras]
+    return out
+
+
+def _phase2_backtest_timeout_sec(cfg: Mapping[str, Any]) -> float | None:
+    """Optional ``resources.phase2_backtest_timeout_sec`` for shared backtest subprocess."""
+    res = cfg.get("resources")
+    if not isinstance(res, Mapping):
+        return None
+    raw = res.get("phase2_backtest_timeout_sec")
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def phase2_gate_cli_exit_code(
+    gate_result: Mapping[str, Any],
+    *,
+    fail_on_gate_fail: bool = False,
+    fail_on_gate_blocked: bool = False,
+) -> int | None:
+    """Return non-zero exit code after gate reports when policy requires failing the process.
+
+    Args:
+        gate_result: Output of ``evaluators.evaluate_phase2_gate``.
+        fail_on_gate_fail: When True and status is ``FAIL``, return ``9``.
+        fail_on_gate_blocked: When True and status is ``BLOCKED``, return ``10``.
+
+    Returns:
+        ``9`` / ``10`` when the CLI should exit with failure; ``None`` for exit 0.
+        ``FAIL`` is checked before ``BLOCKED`` when both flags are set.
+    """
+    st = str(gate_result.get("status") or "")
+    if fail_on_gate_fail and st == "FAIL":
+        return 9
+    if fail_on_gate_blocked and st == "BLOCKED":
+        return 10
+    return None
 
 
 def build_phase2_input_summary(cfg: dict[str, Any], config_path: Path) -> dict[str, Any]:
@@ -586,6 +657,63 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Skip trainer.backtester --help smoke check (for constrained envs)",
     )
     p.add_argument(
+        "--skip-phase2-trainer-smoke",
+        action="store_true",
+        help=(
+            "Phase 2 only: mkdir per-job log dirs after plan bundle but skip "
+            "python -m trainer.trainer --help"
+        ),
+    )
+    p.add_argument(
+        "--phase2-run-trainer-jobs",
+        action="store_true",
+        help=(
+            "Phase 2 only: after runner smoke, run python -m trainer.trainer once per "
+            "job_specs (uses common.window and resources.backtest_skip_optuna); "
+            "default is skip (records trainer_jobs.executed=false in bundle)"
+        ),
+    )
+    p.add_argument(
+        "--phase2-run-per-job-backtests",
+        action="store_true",
+        help=(
+            "Phase 2 only: after job metrics harvest, run trainer.backtester once per "
+            "job_spec that has training_metrics_repo_relative (logs under each job's "
+            "_per_job_backtest); skipped rows do not run. Runs before the shared "
+            "--phase2-run-backtest-jobs step; default is skip"
+        ),
+    )
+    p.add_argument(
+        "--phase2-run-backtest-jobs",
+        action="store_true",
+        help=(
+            "Phase 2 only: after optional per-job backtests, run one shared "
+            "trainer.backtester for common.window + model_dir; then ingest "
+            "resources.backtest_metrics_path or default "
+            "trainer/out_backtest/backtest_metrics.json (exit 8 if missing); "
+            "default is skip"
+        ),
+    )
+    p.add_argument(
+        "--phase2-fail-on-gate-fail",
+        action="store_true",
+        help=(
+            "Phase 2 only: after phase2_gate_report, if evaluate_phase2_gate status is "
+            "FAIL, mark step failed (E_PHASE2_GATE_FAIL) and exit 9 (reports still "
+            "written). BLOCKED/PASS unchanged. Default: gate outcome does not change exit code"
+        ),
+    )
+    p.add_argument(
+        "--phase2-fail-on-gate-blocked",
+        action="store_true",
+        help=(
+            "Phase 2 only: after phase2_gate_report, if evaluate_phase2_gate status is "
+            "BLOCKED, mark step failed (E_PHASE2_GATE_BLOCKED) and exit 10 (reports still "
+            "written). FAIL uses exit 9 when --phase2-fail-on-gate-fail is also set. "
+            "Use with care: plan_only runs are usually BLOCKED"
+        ),
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Run readiness checks only; do not run long investigation steps",
@@ -936,9 +1064,11 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
 
 
 def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
-    """Phase 2 scaffold (T9): validate config, preflight paths/DBs, write run_state.
+    """Phase 2: validate config, preflight, scaffold, plan bundle, runner smoke, jobs (T9–T10).
 
-    Track runner / collectors / gate / reports are deferred to T10–T11.
+    Per-job ``trainer.trainer`` runs are opt-in via ``--phase2-run-trainer-jobs`` (can be heavy).
+    Shared ``trainer.backtester`` + metrics ingest is opt-in via ``--phase2-run-backtest-jobs``.
+    Gate / track uplift remains T11 until per-track metrics exist.
     """
     try:
         cfg = config_loader.load_phase2_config(config_path, cli_run_id=args.run_id)
@@ -1050,17 +1180,555 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
             artifacts={"phase2_dir": str(phase2_dir.resolve())},
             message=(
                 "T9 scaffold: config validated and preflight ok; "
-                "track runner / phase2_bundle / reports deferred to T10–T11"
+                "plan-only phase2_bundle written in phase2_plan_bundle step (T10)"
             ),
         )
         merged["steps"]["phase2_scaffold"]["started_at"] = t0
         _write_run_state(state_file, merged)
 
-    merged["artifacts"] = {
+    bundle_path = _ORCHESTRATOR_DIR / "state" / args.run_id / "phase2_bundle.json"
+    skip_plan_bundle = resume_ok and _step_success(prev_steps, "phase2_plan_bundle")
+    if not skip_plan_bundle:
+        t_pb = _mark_step_running(merged, "phase2_plan_bundle")
+        _write_run_state(state_file, merged)
+        p2_bundle = collectors.collect_phase2_plan_bundle(args.run_id, cfg)
+        bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        bundle_path.write_text(
+            json.dumps(p2_bundle, indent=2, default=str),
+            encoding="utf-8",
+        )
+        merged["phase2_collect"] = collectors.collect_summary_phase2_plan_for_run_state(
+            p2_bundle
+        )
+        merged["phase2_bundle_path"] = str(bundle_path.resolve())
+        _attach_terminal_step(
+            merged,
+            "phase2_plan_bundle",
+            status="success",
+            artifacts={"phase2_bundle": str(bundle_path.resolve())},
+            message="T10: plan-only phase2_bundle.json from config (trainer runs deferred)",
+        )
+        merged["steps"]["phase2_plan_bundle"]["started_at"] = t_pb
+        _write_run_state(state_file, merged)
+    else:
+        try:
+            p2_bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                f"orchestrator: cannot load phase2_bundle.json for resume: {exc}",
+                file=sys.stderr,
+            )
+            return 4
+
+    skip_runner_smoke = resume_ok and _step_success(prev_steps, "phase2_runner_smoke")
+    if not skip_runner_smoke:
+        t_rs = _mark_step_running(merged, "phase2_runner_smoke")
+        _write_run_state(state_file, merged)
+        ok_ld, msg_ld = runner.ensure_phase2_job_log_dirs(
+            _REPO_ROOT, p2_bundle.get("job_specs")
+        )
+        if not ok_ld:
+            rs_fail: dict[str, Any] = {
+                "log_dirs_ok": False,
+                "log_dirs_error": msg_ld,
+                "trainer_help_skipped": True,
+                "trainer_help_ok": None,
+                "finished_at": _utc_now_iso(),
+            }
+            p2_bundle["runner_smoke"] = rs_fail
+            merged["phase2_collect"] = (
+                collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+            )
+            bundle_path.write_text(
+                json.dumps(p2_bundle, indent=2, default=str),
+                encoding="utf-8",
+            )
+            _attach_terminal_step(
+                merged,
+                "phase2_runner_smoke",
+                status="failed",
+                error_code="E_PHASE2_RUNNER_SMOKE",
+                message=msg_ld,
+            )
+            merged["steps"]["phase2_runner_smoke"]["started_at"] = t_rs
+            _write_run_state(state_file, merged)
+            print(msg_ld or "phase2_runner_smoke failed", file=sys.stderr)
+            return 5
+
+        th_skip = bool(args.skip_phase2_trainer_smoke)
+        if th_skip:
+            ok_th, msg_th = True, None
+        else:
+            ok_th, msg_th = runner.run_trainer_trainer_help_smoke(_REPO_ROOT)
+
+        rs_ok: dict[str, Any] = {
+            "log_dirs_ok": True,
+            "trainer_help_skipped": th_skip,
+            "trainer_help_ok": None if th_skip else ok_th,
+            "trainer_help_error": None if th_skip or ok_th else msg_th,
+            "finished_at": _utc_now_iso(),
+        }
+        p2_bundle["runner_smoke"] = rs_ok
+        merged["phase2_collect"] = collectors.collect_summary_phase2_plan_for_run_state(
+            p2_bundle
+        )
+        bundle_path.write_text(
+            json.dumps(p2_bundle, indent=2, default=str),
+            encoding="utf-8",
+        )
+        ok_rs = True if th_skip else bool(ok_th)
+        _attach_terminal_step(
+            merged,
+            "phase2_runner_smoke",
+            status="success" if ok_rs else "failed",
+            error_code=None if ok_rs else "E_PHASE2_RUNNER_SMOKE",
+            message=(
+                None
+                if ok_rs
+                else (msg_th or "trainer.trainer --help smoke failed")
+            ),
+        )
+        merged["steps"]["phase2_runner_smoke"]["started_at"] = t_rs
+        _write_run_state(state_file, merged)
+        if not ok_rs:
+            print(
+                msg_th or "phase2_runner_smoke failed",
+                file=sys.stderr,
+            )
+            return 5
+
+    skip_trainer_jobs = resume_ok and _step_success(prev_steps, "phase2_trainer_jobs")
+    if not skip_trainer_jobs:
+        t_tj = _mark_step_running(merged, "phase2_trainer_jobs")
+        _write_run_state(state_file, merged)
+        if not bool(getattr(args, "phase2_run_trainer_jobs", False)):
+            p2_bundle["trainer_jobs"] = {
+                "executed": False,
+                "skip_reason": (
+                    "pass --phase2-run-trainer-jobs to run trainer.trainer per job_spec"
+                ),
+                "all_ok": None,
+                "results": [],
+                "finished_at": _utc_now_iso(),
+            }
+            merged["phase2_collect"] = (
+                collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+            )
+            bundle_path.write_text(
+                json.dumps(p2_bundle, indent=2, default=str),
+                encoding="utf-8",
+            )
+            _attach_terminal_step(
+                merged,
+                "phase2_trainer_jobs",
+                status="success",
+                message="T10: trainer jobs skipped (no --phase2-run-trainer-jobs)",
+            )
+            merged["steps"]["phase2_trainer_jobs"]["started_at"] = t_tj
+            _write_run_state(state_file, merged)
+        else:
+            ok_tj, msg_tj, job_results = runner.run_phase2_trainer_jobs(
+                _REPO_ROOT, p2_bundle, python_exe=sys.executable
+            )
+            p2_bundle["trainer_jobs"] = {
+                "executed": True,
+                "skip_reason": None,
+                "all_ok": ok_tj,
+                "results": job_results,
+                "finished_at": _utc_now_iso(),
+            }
+            runner.merge_inferred_training_metrics_paths_into_phase2_bundle(
+                p2_bundle, _REPO_ROOT
+            )
+            merged["phase2_collect"] = (
+                collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+            )
+            bundle_path.write_text(
+                json.dumps(p2_bundle, indent=2, default=str),
+                encoding="utf-8",
+            )
+            _attach_terminal_step(
+                merged,
+                "phase2_trainer_jobs",
+                status="success" if ok_tj else "failed",
+                error_code=None if ok_tj else "E_PHASE2_TRAINER_JOBS",
+                message=None if ok_tj else (msg_tj or "phase2_trainer_jobs failed"),
+            )
+            merged["steps"]["phase2_trainer_jobs"]["started_at"] = t_tj
+            _write_run_state(state_file, merged)
+            if not ok_tj:
+                print(msg_tj or "phase2_trainer_jobs failed", file=sys.stderr)
+                return 7
+
+    skip_job_harvest = resume_ok and _step_success(prev_steps, "phase2_job_metrics_harvest")
+    if not skip_job_harvest:
+        t_jh = _mark_step_running(merged, "phase2_job_metrics_harvest")
+        _write_run_state(state_file, merged)
+        harvest_rows = collectors.harvest_phase2_job_training_metrics(_REPO_ROOT, p2_bundle)
+        p2_bundle["job_training_harvest"] = {
+            "finished_at": _utc_now_iso(),
+            "metrics_filename": collectors.PHASE2_JOB_TRAINING_METRICS_NAME,
+            "rows": harvest_rows,
+        }
+        merged["phase2_collect"] = (
+            collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+        )
+        bundle_path.write_text(
+            json.dumps(p2_bundle, indent=2, default=str),
+            encoding="utf-8",
+        )
+        _attach_terminal_step(
+            merged,
+            "phase2_job_metrics_harvest",
+            status="success",
+            message="T10: scan job log dirs for training_metrics.json",
+        )
+        merged["steps"]["phase2_job_metrics_harvest"]["started_at"] = t_jh
+        _write_run_state(state_file, merged)
+
+    skip_per_job_bt = resume_ok and _step_success(
+        prev_steps, "phase2_per_job_backtest_jobs"
+    )
+    if not skip_per_job_bt:
+        t_pjb = _mark_step_running(merged, "phase2_per_job_backtest_jobs")
+        _write_run_state(state_file, merged)
+        if not bool(getattr(args, "phase2_run_per_job_backtests", False)):
+            p2_bundle["per_job_backtest_jobs"] = {
+                "executed": False,
+                "skip_reason": (
+                    "pass --phase2-run-per-job-backtests to run trainer.backtester "
+                    "per job_spec with training_metrics_repo_relative"
+                ),
+                "all_ok": None,
+                "results": [],
+                "finished_at": _utc_now_iso(),
+            }
+            merged["phase2_collect"] = (
+                collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+            )
+            bundle_path.write_text(
+                json.dumps(p2_bundle, indent=2, default=str),
+                encoding="utf-8",
+            )
+            _attach_terminal_step(
+                merged,
+                "phase2_per_job_backtest_jobs",
+                status="success",
+                message=(
+                    "T10: per-job backtests skipped (no --phase2-run-per-job-backtests)"
+                ),
+            )
+            merged["steps"]["phase2_per_job_backtest_jobs"]["started_at"] = t_pjb
+            _write_run_state(state_file, merged)
+        else:
+            bt_cfg_t = phase2_cfg_to_backtest_cfg(cfg)
+            to_pjb = _phase2_backtest_timeout_sec(cfg)
+            ok_pjb, msg_pjb, pjb_results = runner.run_phase2_per_job_backtests(
+                _REPO_ROOT,
+                p2_bundle,
+                bt_cfg_t,
+                run_id=args.run_id,
+                python_exe=sys.executable,
+                timeout_sec=to_pjb,
+            )
+            p2_bundle["per_job_backtest_jobs"] = {
+                "executed": True,
+                "skip_reason": None,
+                "all_ok": ok_pjb,
+                "results": pjb_results,
+                "finished_at": _utc_now_iso(),
+            }
+            merged["phase2_collect"] = (
+                collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+            )
+            bundle_path.write_text(
+                json.dumps(p2_bundle, indent=2, default=str),
+                encoding="utf-8",
+            )
+            _attach_terminal_step(
+                merged,
+                "phase2_per_job_backtest_jobs",
+                status="success" if ok_pjb else "failed",
+                error_code=None if ok_pjb else "E_PHASE2_PER_JOB_BACKTEST_JOBS",
+                message=None if ok_pjb else (msg_pjb or "phase2_per_job_backtest_jobs failed"),
+            )
+            merged["steps"]["phase2_per_job_backtest_jobs"]["started_at"] = t_pjb
+            _write_run_state(state_file, merged)
+            if not ok_pjb:
+                print(
+                    msg_pjb or "phase2_per_job_backtest_jobs failed",
+                    file=sys.stderr,
+                )
+                return 8
+
+    skip_backtest_jobs = resume_ok and _step_success(prev_steps, "phase2_backtest_jobs")
+    if not skip_backtest_jobs:
+        t_bj = _mark_step_running(merged, "phase2_backtest_jobs")
+        _write_run_state(state_file, merged)
+        if not bool(getattr(args, "phase2_run_backtest_jobs", False)):
+            p2_bundle["backtest_jobs"] = {
+                "executed": False,
+                "skip_reason": (
+                    "pass --phase2-run-backtest-jobs to run trainer.backtester "
+                    "and ingest backtest_metrics"
+                ),
+                "subprocess_ok": None,
+                "metrics_loaded": None,
+                "metrics_path": None,
+                "finished_at": _utc_now_iso(),
+            }
+            merged["phase2_collect"] = (
+                collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+            )
+            bundle_path.write_text(
+                json.dumps(p2_bundle, indent=2, default=str),
+                encoding="utf-8",
+            )
+            _attach_terminal_step(
+                merged,
+                "phase2_backtest_jobs",
+                status="success",
+                message="T10: backtest jobs skipped (no --phase2-run-backtest-jobs)",
+            )
+            merged["steps"]["phase2_backtest_jobs"]["started_at"] = t_bj
+            _write_run_state(state_file, merged)
+        else:
+            rel_bt = collectors.phase2_shared_backtest_logs_subdir_relative(args.run_id)
+            log_bt = (_REPO_ROOT / rel_bt).resolve()
+            bt_cfg = phase2_cfg_to_backtest_cfg(cfg)
+            to_bt = _phase2_backtest_timeout_sec(cfg)
+            res_bt = runner.run_phase1_backtest(
+                _REPO_ROOT,
+                bt_cfg,
+                log_bt,
+                timeout_sec=to_bt,
+            )
+            ok_sub = bool(res_bt.get("ok"))
+            res_map = cfg.get("resources")
+            mrel = collectors.DEFAULT_BACKTEST_METRICS
+            if isinstance(res_map, Mapping):
+                bmp = res_map.get("backtest_metrics_path")
+                if bmp is not None and str(bmp).strip():
+                    mrel = str(bmp).strip()
+            mpath = collectors._resolve_under_root(_REPO_ROOT, mrel)
+            if not ok_sub:
+                p2_bundle["backtest_jobs"] = {
+                    "executed": True,
+                    "skip_reason": None,
+                    "subprocess_ok": False,
+                    "metrics_loaded": False,
+                    "metrics_path": str(mpath),
+                    "backtest_error_code": res_bt.get("error_code"),
+                    "backtest_message": res_bt.get("message"),
+                    "finished_at": _utc_now_iso(),
+                }
+                merged["phase2_collect"] = (
+                    collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+                )
+                bundle_path.write_text(
+                    json.dumps(p2_bundle, indent=2, default=str),
+                    encoding="utf-8",
+                )
+                _attach_terminal_step(
+                    merged,
+                    "phase2_backtest_jobs",
+                    status="failed",
+                    error_code="E_PHASE2_BACKTEST_JOBS",
+                    message=res_bt.get("message") or "phase2 backtest subprocess failed",
+                )
+                merged["steps"]["phase2_backtest_jobs"]["started_at"] = t_bj
+                _write_run_state(state_file, merged)
+                print(
+                    res_bt.get("message") or "phase2_backtest_jobs failed",
+                    file=sys.stderr,
+                )
+                return 8
+            metrics_obj, metrics_err = collectors.load_json_under_repo(_REPO_ROOT, mrel)
+            if metrics_obj is None or metrics_err:
+                p2_bundle.setdefault("errors", [])
+                if isinstance(p2_bundle["errors"], list):
+                    err_item: dict[str, str] = {
+                        "code": "E_ARTIFACT_MISSING",
+                        "message": metrics_err
+                        or f"backtest_metrics not loaded after subprocess ok: {mpath}",
+                        "path": str(mpath),
+                    }
+                    p2_bundle["errors"].append(err_item)
+                p2_bundle["backtest_jobs"] = {
+                    "executed": True,
+                    "skip_reason": None,
+                    "subprocess_ok": True,
+                    "metrics_loaded": False,
+                    "metrics_path": str(mpath),
+                    "ingest_error": metrics_err,
+                    "finished_at": _utc_now_iso(),
+                }
+                merged["phase2_collect"] = (
+                    collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+                )
+                bundle_path.write_text(
+                    json.dumps(p2_bundle, indent=2, default=str),
+                    encoding="utf-8",
+                )
+                _attach_terminal_step(
+                    merged,
+                    "phase2_backtest_jobs",
+                    status="failed",
+                    error_code="E_ARTIFACT_MISSING",
+                    message=metrics_err or f"missing or invalid metrics at {mpath}",
+                )
+                merged["steps"]["phase2_backtest_jobs"]["started_at"] = t_bj
+                _write_run_state(state_file, merged)
+                print(
+                    metrics_err or f"phase2_backtest_jobs: missing metrics at {mpath}",
+                    file=sys.stderr,
+                )
+                return 8
+            p2_bundle["backtest_metrics"] = metrics_obj
+            p2_bundle["backtest_metrics_path"] = str(mpath)
+            p2_bundle["status"] = "metrics_ingested"
+            p2_bundle["backtest_jobs"] = {
+                "executed": True,
+                "skip_reason": None,
+                "subprocess_ok": True,
+                "metrics_loaded": True,
+                "metrics_path": str(mpath),
+                "finished_at": _utc_now_iso(),
+            }
+            merged["phase2_collect"] = (
+                collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+            )
+            bundle_path.write_text(
+                json.dumps(p2_bundle, indent=2, default=str),
+                encoding="utf-8",
+            )
+            _attach_terminal_step(
+                merged,
+                "phase2_backtest_jobs",
+                status="success",
+                message="T10: shared backtest + backtest_metrics ingest",
+            )
+            merged["steps"]["phase2_backtest_jobs"]["started_at"] = t_bj
+            _write_run_state(state_file, merged)
+
+    skip_gate_report = resume_ok and _step_success(prev_steps, "phase2_gate_report")
+    if not skip_gate_report:
+        t_gr = _mark_step_running(merged, "phase2_gate_report")
+        _write_run_state(state_file, merged)
+        merged_pat = collectors.merge_phase2_pat_series_from_shared_and_per_job(p2_bundle)
+        if merged_pat:
+            bundle_path.write_text(
+                json.dumps(p2_bundle, indent=2, default=str),
+                encoding="utf-8",
+            )
+            merged["phase2_collect"] = (
+                collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+            )
+            _write_run_state(state_file, merged)
+        gate_p2 = evaluators.evaluate_phase2_gate(p2_bundle)
+        merged["phase2_gate_decision"] = {
+            "status": gate_p2.get("status"),
+            "blocking_reasons": list(gate_p2.get("blocking_reasons") or []),
+            "evidence_summary": str(gate_p2.get("evidence_summary") or ""),
+        }
+        gate_md = phase2_dir / "phase2_gate_decision.md"
+        report_builder.write_phase2_gate_decision(
+            gate_md, args.run_id, cfg, p2_bundle, gate_p2
+        )
+        track_mds = report_builder.write_phase2_track_results(
+            phase2_dir, args.run_id, cfg, p2_bundle, gate_p2
+        )
+        tr_art: dict[str, str] = {
+            f"phase2_{p.stem}": str(p.resolve()) for p in track_mds
+        }
+        tr_art["phase2_gate_decision"] = str(gate_md.resolve())
+        fail_on_gf = bool(getattr(args, "phase2_fail_on_gate_fail", False))
+        fail_on_gb = bool(getattr(args, "phase2_fail_on_gate_blocked", False))
+        gate_exit = phase2_gate_cli_exit_code(
+            gate_p2,
+            fail_on_gate_fail=fail_on_gf,
+            fail_on_gate_blocked=fail_on_gb,
+        )
+        if gate_exit is not None:
+            ev_msg = str(gate_p2.get("evidence_summary") or "")
+            gst = str(gate_p2.get("status") or "")
+            err_c = (
+                "E_PHASE2_GATE_FAIL"
+                if gst == "FAIL"
+                else "E_PHASE2_GATE_BLOCKED"
+            )
+            msg_def = (
+                "evaluate_phase2_gate returned FAIL"
+                if gst == "FAIL"
+                else "evaluate_phase2_gate returned BLOCKED"
+            )
+            _attach_terminal_step(
+                merged,
+                "phase2_gate_report",
+                status="failed",
+                artifacts=tr_art,
+                error_code=err_c,
+                message=(ev_msg[:2000] if ev_msg else msg_def),
+            )
+        else:
+            _attach_terminal_step(
+                merged,
+                "phase2_gate_report",
+                status="success",
+                artifacts=tr_art,
+                message=(
+                    "T11: evaluate_phase2_gate + phase2_gate_decision.md + "
+                    "track_*_results.md"
+                ),
+            )
+        merged["steps"]["phase2_gate_report"]["started_at"] = t_gr
+        _write_run_state(state_file, merged)
+        if gate_exit is not None:
+            art_fail: dict[str, str] = {
+                "run_state": str(state_file.resolve()),
+                "config_path": str(config_path.resolve()),
+                "phase2_dir": str(phase2_dir.resolve()),
+            }
+            p2_bpf = merged.get("phase2_bundle_path")
+            if isinstance(p2_bpf, str) and p2_bpf.strip():
+                art_fail["phase2_bundle"] = p2_bpf.strip()
+            gate_md_fail = phase2_dir / "phase2_gate_decision.md"
+            if gate_md_fail.is_file():
+                art_fail["phase2_gate_decision"] = str(gate_md_fail.resolve())
+            for stem in ("track_a_results", "track_b_results", "track_c_results"):
+                trp_f = phase2_dir / f"{stem}.md"
+                if trp_f.is_file():
+                    art_fail[f"phase2_{stem}"] = str(trp_f.resolve())
+            merged["artifacts"] = art_fail
+            merged["updated_at"] = _utc_now_iso()
+            _write_run_state(state_file, merged)
+            print(
+                gate_p2.get("evidence_summary")
+                or (
+                    "phase2 gate FAIL"
+                    if str(gate_p2.get("status") or "") == "FAIL"
+                    else "phase2 gate BLOCKED"
+                ),
+                file=sys.stderr,
+            )
+            return gate_exit
+
+    art: dict[str, str] = {
         "run_state": str(state_file.resolve()),
         "config_path": str(config_path.resolve()),
         "phase2_dir": str(phase2_dir.resolve()),
     }
+    p2_bp = merged.get("phase2_bundle_path")
+    if isinstance(p2_bp, str) and p2_bp.strip():
+        art["phase2_bundle"] = p2_bp.strip()
+    gate_md_path = phase2_dir / "phase2_gate_decision.md"
+    if gate_md_path.is_file():
+        art["phase2_gate_decision"] = str(gate_md_path.resolve())
+    for stem in ("track_a_results", "track_b_results", "track_c_results"):
+        trp = phase2_dir / f"{stem}.md"
+        if trp.is_file():
+            art[f"phase2_{stem}"] = str(trp.resolve())
+    merged["artifacts"] = art
     merged["updated_at"] = _utc_now_iso()
     _write_run_state(state_file, merged)
     return 0

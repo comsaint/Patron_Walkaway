@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import statistics
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -254,4 +255,513 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
         "blocking_reasons": [],
         "evidence_summary": _evidence(),
         "metrics": metrics,
+    }
+
+
+PHASE2_BACKTEST_PR1_KEY = "test_precision_at_recall_0.01"
+
+
+def _job_training_harvest_counts(bundle: Mapping[str, Any]) -> tuple[int, int]:
+    """Return (row_count, found_count) from ``bundle['job_training_harvest']``."""
+    jh = bundle.get("job_training_harvest")
+    if not isinstance(jh, Mapping):
+        return 0, 0
+    rows = jh.get("rows")
+    if not isinstance(rows, list):
+        return 0, 0
+    n = len(rows)
+    n_found = sum(1 for r in rows if isinstance(r, Mapping) and r.get("found"))
+    return n, n_found
+
+
+def phase2_per_job_backtest_metrics(bundle: Mapping[str, Any]) -> dict[str, Any]:
+    """Summarize ``bundle['per_job_backtest_jobs']`` for gate metrics (T11).
+
+    Returns:
+        Empty dict when the key is missing or not a mapping; otherwise includes
+        execution flags and a normalized list of per-job preview rows.
+    """
+    pjb = bundle.get("per_job_backtest_jobs")
+    if not isinstance(pjb, Mapping):
+        return {}
+    out: dict[str, Any] = {
+        "per_job_backtest_executed": pjb.get("executed"),
+        "per_job_backtest_all_ok": pjb.get("all_ok"),
+    }
+    res = pjb.get("results")
+    previews: list[dict[str, Any]] = []
+    if isinstance(res, list):
+        for r in res:
+            if not isinstance(r, Mapping):
+                continue
+            tr = str(r.get("track") or "").strip()
+            eid = str(r.get("exp_id") or "").strip()
+            if not tr or not eid:
+                continue
+            raw_pv = r.get("shared_precision_at_recall_1pct_preview")
+            pv: float | None
+            if raw_pv is None:
+                pv = None
+            else:
+                try:
+                    pv = float(raw_pv)
+                except (TypeError, ValueError):
+                    pv = None
+            previews.append(
+                {
+                    "track": tr,
+                    "exp_id": eid,
+                    "skipped": bool(r.get("skipped")),
+                    "ok": r.get("ok"),
+                    "shared_precision_at_recall_1pct_preview": pv,
+                }
+            )
+    out["per_job_backtest_previews"] = previews
+    out["per_job_backtest_preview_count"] = sum(
+        1 for p in previews if p.get("shared_precision_at_recall_1pct_preview") is not None
+    )
+    return out
+
+
+def _phase2_per_job_backtest_evidence_suffix(bundle: Mapping[str, Any]) -> str:
+    """Short human-readable fragment for gate ``evidence_summary``."""
+    pjb = bundle.get("per_job_backtest_jobs")
+    if not isinstance(pjb, Mapping) or pjb.get("executed") is not True:
+        return ""
+    pj = phase2_per_job_backtest_metrics(bundle)
+    prev_rows = pj.get("per_job_backtest_previews")
+    if not isinstance(prev_rows, list):
+        return ""
+    with_pv = [
+        x
+        for x in prev_rows
+        if isinstance(x, Mapping)
+        and x.get("shared_precision_at_recall_1pct_preview") is not None
+    ]
+    if with_pv:
+        bits = [
+            f"{x['track']}/{x['exp_id']}="
+            f"{float(x['shared_precision_at_recall_1pct_preview']):.4f}"
+            for x in with_pv
+        ]
+        return "; per-job PAT@1% preview(s): " + ", ".join(bits)
+    return "; per-job backtests executed; no numeric PAT@1% previews parsed"
+
+
+def _parse_float_gate(
+    gate: Mapping[str, Any], key: str, default: float
+) -> float:
+    """Read a float from ``gate[key]`` with fallback when missing or invalid."""
+    raw = gate.get(key)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _phase2_preview_map_from_bundle(bundle: Mapping[str, Any]) -> dict[tuple[str, str], float]:
+    """Map (track, exp_id) -> PAT@1% preview for successful non-skipped per-job rows."""
+    pj = phase2_per_job_backtest_metrics(bundle)
+    rows = pj.get("per_job_backtest_previews")
+    if not isinstance(rows, list):
+        return {}
+    out: dict[tuple[str, str], float] = {}
+    for r in rows:
+        if not isinstance(r, Mapping) or r.get("skipped"):
+            continue
+        if r.get("ok") is not True:
+            continue
+        pv = r.get("shared_precision_at_recall_1pct_preview")
+        if pv is None:
+            continue
+        tr = str(r.get("track") or "").strip()
+        eid = str(r.get("exp_id") or "").strip()
+        if tr and eid:
+            out[(tr, eid)] = float(pv)
+    return out
+
+
+def _phase2_try_uplift_gate_from_per_job(
+    bundle: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """If per-job backtests ran, evaluate uplift vs first YAML experiment per enabled track.
+
+    Baseline per track is the first experiment (YAML order) that has a numeric preview.
+    Each later experiment with a preview is compared; uplift is ``(pv - baseline) * 100``
+    percentage points. Uses ``gate.min_uplift_pp_vs_baseline`` (default 3.0).
+
+    Multi-window stability uses optional ``bundle["phase2_pat_series_by_experiment"]``
+    (see ``_phase2_apply_std_gate``); until present, ``phase2_std_gate_evaluated`` is
+    False.
+
+    Returns:
+        ``None`` when ``per_job_backtest_jobs.executed`` is not True; otherwise a dict
+        with ``decision`` (``PASS`` / ``FAIL`` / ``BLOCKED``), ``reasons``, ``metrics``,
+        ``evidence_extra``.
+    """
+    pjb = bundle.get("per_job_backtest_jobs")
+    if not isinstance(pjb, Mapping) or pjb.get("executed") is not True:
+        return None
+
+    gate_cfg = bundle.get("gate") if isinstance(bundle.get("gate"), Mapping) else {}
+    min_uplift = _parse_float_gate(gate_cfg, "min_uplift_pp_vs_baseline", 3.0)
+
+    prev_map = _phase2_preview_map_from_bundle(bundle)
+    tracks = bundle.get("tracks")
+    if not isinstance(tracks, Mapping):
+        tracks = {}
+
+    eligible = False
+    any_meets = False
+    uplift_rows: list[dict[str, Any]] = []
+
+    for tname in ("track_a", "track_b", "track_c"):
+        tnode = tracks.get(tname)
+        if not isinstance(tnode, Mapping) or not tnode.get("enabled"):
+            continue
+        exps = tnode.get("experiments")
+        if not isinstance(exps, list):
+            continue
+        baseline_eid: str | None = None
+        base_pv: float | None = None
+        for exp in exps:
+            if not isinstance(exp, Mapping):
+                continue
+            eid = str(exp.get("exp_id") or "").strip()
+            if not eid:
+                continue
+            pv = prev_map.get((tname, eid))
+            if pv is None:
+                continue
+            if base_pv is None:
+                baseline_eid, base_pv = eid, pv
+                uplift_rows.append(
+                    {
+                        "track": tname,
+                        "exp_id": eid,
+                        "preview": base_pv,
+                        "role": "baseline",
+                    }
+                )
+            else:
+                eligible = True
+                uplift_pp = (pv - base_pv) * 100.0
+                meets = uplift_pp >= min_uplift
+                if meets:
+                    any_meets = True
+                uplift_rows.append(
+                    {
+                        "track": tname,
+                        "exp_id": eid,
+                        "preview": pv,
+                        "baseline_exp_id": baseline_eid,
+                        "uplift_pp_vs_baseline": uplift_pp,
+                        "meets_min_uplift": meets,
+                    }
+                )
+
+    metrics_u: dict[str, Any] = {
+        "phase2_uplift_gate_evaluated": True,
+        "phase2_uplift_min_pp_vs_baseline": min_uplift,
+        "phase2_uplift_rows": uplift_rows,
+        "phase2_std_gate_evaluated": False,
+        "phase2_std_gate_note": (
+            "max_std_pp_across_windows not applied (no multi-window series in bundle)"
+        ),
+    }
+
+    if not eligible:
+        return {
+            "decision": "BLOCKED",
+            "reasons": ["phase2_uplift_insufficient_comparisons"],
+            "metrics": metrics_u,
+            "evidence_extra": (
+                "; uplift gate: BLOCKED — no enabled track has two experiments "
+                "with PAT@1% previews (baseline + challenger)"
+            ),
+        }
+
+    if any_meets:
+        metrics_u["phase2_uplift_pass"] = True
+        return {
+            "decision": "PASS",
+            "reasons": [],
+            "metrics": metrics_u,
+            "evidence_extra": (
+                "; uplift gate: PASS — at least one experiment meets "
+                f"min_uplift_pp_vs_baseline (>={min_uplift:.2f} pp vs track baseline)"
+            ),
+        }
+
+    metrics_u["phase2_uplift_pass"] = False
+    return {
+        "decision": "FAIL",
+        "reasons": ["phase2_uplift_below_min_pp_vs_baseline"],
+        "metrics": metrics_u,
+        "evidence_extra": (
+            "; uplift gate: FAIL — no experiment meets "
+            f"min_uplift_pp_vs_baseline (>={min_uplift:.2f} pp vs track baseline)"
+        ),
+    }
+
+
+def _phase2_apply_std_gate(
+    bundle: Mapping[str, Any], uplift_out: dict[str, Any]
+) -> dict[str, Any]:
+    """Optional std gate on PAT@1% series per (track, exp_id).
+
+    Expects ``bundle["phase2_pat_series_by_experiment"]`` as a mapping
+    ``track_name -> {exp_id: [p0, p1, ...]}`` with PAT values in ``[0, 1]`` (same
+    scale as previews). Sample standard deviation of each list with length >= 2 is
+    converted to **percentage points** (×100) and compared to
+    ``gate.max_std_pp_across_windows`` (default 2.5).
+
+    When uplift decision is **PASS** and any series exceeds the limit, outcome becomes
+    **FAIL** with ``phase2_std_exceeds_max_pp_across_windows``. Non-PASS uplift decisions
+    still record std metrics when evaluable, without upgrading to FAIL from std alone.
+
+    Args:
+        bundle: Phase 2 bundle (may include optional series payload).
+        uplift_out: Result dict from ``_phase2_try_uplift_gate_from_per_job`` (mutated).
+
+    Returns:
+        The same ``uplift_out`` dict (possibly updated).
+    """
+    series_root = bundle.get("phase2_pat_series_by_experiment")
+    if not isinstance(series_root, Mapping) or not series_root:
+        return uplift_out
+
+    gate_cfg = bundle.get("gate") if isinstance(bundle.get("gate"), Mapping) else {}
+    max_allowed = _parse_float_gate(gate_cfg, "max_std_pp_across_windows", 2.5)
+    metrics = uplift_out["metrics"]
+    per_series: list[dict[str, Any]] = []
+    max_pp = 0.0
+    any_valid = False
+
+    for tkey, exp_map in series_root.items():
+        tr = str(tkey).strip()
+        if not tr.startswith("track_"):
+            continue
+        if not isinstance(exp_map, Mapping):
+            continue
+        for eid_raw, raw_list in exp_map.items():
+            eid = str(eid_raw).strip()
+            if not eid or not isinstance(raw_list, list) or len(raw_list) < 2:
+                continue
+            vals: list[float] = []
+            bad = False
+            for x in raw_list:
+                try:
+                    vals.append(float(x))
+                except (TypeError, ValueError):
+                    bad = True
+                    break
+            if bad or len(vals) < 2:
+                continue
+            st_pp = statistics.stdev(vals) * 100.0
+            any_valid = True
+            max_pp = max(max_pp, st_pp)
+            per_series.append(
+                {"track": tr, "exp_id": eid, "n_windows": len(vals), "std_pp": st_pp}
+            )
+
+    if not any_valid:
+        metrics["phase2_std_gate_note"] = (
+            "phase2_pat_series_by_experiment present but no track/exp list with "
+            ">=2 numeric PAT@1% values"
+        )
+        return uplift_out
+
+    metrics["phase2_std_gate_evaluated"] = True
+    metrics["phase2_std_max_pp_across_experiments"] = max_pp
+    metrics["phase2_std_pp_limit"] = max_allowed
+    metrics["phase2_std_per_series"] = per_series
+    metrics.pop("phase2_std_gate_note", None)
+
+    extra = (
+        f"; std gate: max PAT@1% stdev across series={max_pp:.4f} pp "
+        f"(limit {max_allowed:.4f} pp)"
+    )
+    if uplift_out["decision"] == "PASS":
+        if max_pp > max_allowed:
+            uplift_out["decision"] = "FAIL"
+            uplift_out["reasons"] = ["phase2_std_exceeds_max_pp_across_windows"]
+            uplift_out["evidence_extra"] += extra + " — FAIL"
+        else:
+            uplift_out["evidence_extra"] += extra + " — PASS"
+    else:
+        uplift_out["evidence_extra"] += extra + " (informational; uplift not PASS)"
+
+    return uplift_out
+
+
+def extract_phase2_shared_precision_at_recall_1pct(
+    backtest_metrics: Mapping[str, Any] | None,
+) -> float | None:
+    """Read shared PAT @ recall 1% from ingested ``backtest_metrics`` (``model_default``)."""
+    if not isinstance(backtest_metrics, Mapping):
+        return None
+    md = backtest_metrics.get("model_default")
+    if not isinstance(md, Mapping):
+        return None
+    raw = md.get(PHASE2_BACKTEST_PR1_KEY)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def evaluate_phase2_gate(bundle: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate Phase 2 gate from a phase2 bundle (T11 minimal).
+
+    When ``bundle["status"] == "plan_only"``, no per-track metrics exist yet; returns
+    **BLOCKED** so the run is not mistaken for a passed uplift gate.
+    When ``status == "metrics_ingested"``, shared backtest JSON is present; gate stays
+    **BLOCKED** until per-track baseline/uplift exists, but evidence includes PAT@1% when
+    parsable.
+
+    When ``per_job_backtest_jobs.executed`` is True, ``metrics`` and ``evidence_summary``
+    also include per-job PAT@1% previews from ``phase2_per_job_backtest_metrics``.
+
+    When ``status == "metrics_ingested"`` and per-job backtests ran, an **uplift gate**
+    compares each track's experiments (YAML order) using those previews vs
+    ``gate.min_uplift_pp_vs_baseline``; may return **PASS** / **FAIL** / **BLOCKED**.
+    Optional ``bundle["phase2_pat_series_by_experiment"]`` enables
+    ``max_std_pp_across_windows`` when per-job uplift gate runs.
+
+    Args:
+        bundle: Output of ``collectors.collect_phase2_plan_bundle`` or a future
+            enriched bundle with training metrics.
+
+    Returns:
+        Dict with ``status`` (``BLOCKED`` / ``FAIL`` / ``PASS``), ``blocking_reasons``,
+        ``evidence_summary``, and ``metrics``.
+    """
+    reasons: list[str] = []
+    errors = bundle.get("errors")
+    if isinstance(errors, list) and errors:
+        for e in errors:
+            if isinstance(e, Mapping) and e.get("code"):
+                reasons.append(str(e["code"]))
+        return {
+            "status": "FAIL",
+            "blocking_reasons": reasons or ["phase2_collector_errors"],
+            "evidence_summary": "collector recorded errors in phase2 bundle",
+            "metrics": {},
+        }
+
+    st = str(bundle.get("status") or "")
+    if st == "plan_only":
+        reasons.append("phase2_bundle_plan_only_no_track_metrics")
+        idx = bundle.get("experiments_index")
+        n_idx = len(idx) if isinstance(idx, list) else 0
+        n_h, n_hf = _job_training_harvest_counts(bundle)
+        m_plan: dict[str, Any] = {
+            "plan_experiment_slots": n_idx,
+            "bundle_kind": bundle.get("bundle_kind"),
+        }
+        if n_h:
+            m_plan["job_training_harvest_rows"] = n_h
+            m_plan["job_training_harvest_found"] = n_hf
+        pj_m = phase2_per_job_backtest_metrics(bundle)
+        if pj_m:
+            m_plan.update(pj_m)
+        ev_plan = (
+            f"bundle is plan_only; {n_idx} experiment slot(s) declared "
+            "but no training metrics ingested"
+        )
+        ev_plan += _phase2_per_job_backtest_evidence_suffix(bundle)
+        return {
+            "status": "BLOCKED",
+            "blocking_reasons": reasons,
+            "evidence_summary": ev_plan,
+            "metrics": m_plan,
+        }
+
+    if st == "metrics_ingested":
+        reasons.append("phase2_shared_metrics_no_per_track_uplift")
+        pr1 = extract_phase2_shared_precision_at_recall_1pct(
+            bundle.get("backtest_metrics")
+            if isinstance(bundle.get("backtest_metrics"), Mapping)
+            else None
+        )
+        pjb_bt = bundle.get("per_job_backtest_jobs")
+        will_uplift = (
+            isinstance(pjb_bt, Mapping) and pjb_bt.get("executed") is True
+        )
+        if will_uplift:
+            ev = (
+                "shared backtest metrics ingested; per-job backtest previews drive "
+                "uplift gate; optional bundle phase2_pat_series_by_experiment enables "
+                "max_std_pp_across_windows when series are valid"
+            )
+        else:
+            ev = (
+                "shared backtest metrics ingested; per-track baseline/uplift and std gate "
+                "not evaluable until per-experiment metrics exist"
+            )
+        if pr1 is not None:
+            ev += f"; observed shared PAT@1%={pr1:.4f} (informational only)"
+        n_h, n_hf = _job_training_harvest_counts(bundle)
+        if n_h:
+            ev += (
+                f"; job log dirs: training_metrics.json found for {n_hf}/{n_h} "
+                "job_spec(s) (per-job trainer output path is T10+)"
+            )
+        m_met: dict[str, Any] = {
+            "has_backtest_metrics": bundle.get("backtest_metrics") is not None,
+            "shared_precision_at_recall_1pct": pr1,
+            "bundle_kind": bundle.get("bundle_kind"),
+        }
+        if n_h:
+            m_met["job_training_harvest_rows"] = n_h
+            m_met["job_training_harvest_found"] = n_hf
+        pj_met = phase2_per_job_backtest_metrics(bundle)
+        if pj_met:
+            m_met.update(pj_met)
+        ev += _phase2_per_job_backtest_evidence_suffix(bundle)
+
+        upl = _phase2_try_uplift_gate_from_per_job(bundle)
+        if upl is not None:
+            upl = _phase2_apply_std_gate(bundle, upl)
+            m_met.update(upl["metrics"])
+            ev += upl["evidence_extra"]
+            if upl["decision"] == "PASS":
+                return {
+                    "status": "PASS",
+                    "blocking_reasons": [],
+                    "evidence_summary": ev,
+                    "metrics": m_met,
+                }
+            if upl["decision"] == "FAIL":
+                return {
+                    "status": "FAIL",
+                    "blocking_reasons": list(upl["reasons"]),
+                    "evidence_summary": ev,
+                    "metrics": m_met,
+                }
+            return {
+                "status": "BLOCKED",
+                "blocking_reasons": list(upl["reasons"]),
+                "evidence_summary": ev,
+                "metrics": m_met,
+            }
+
+        return {
+            "status": "BLOCKED",
+            "blocking_reasons": reasons,
+            "evidence_summary": ev,
+            "metrics": m_met,
+        }
+
+    reasons.append("phase2_gate_unsupported_bundle_status")
+    return {
+        "status": "BLOCKED",
+        "blocking_reasons": reasons,
+        "evidence_summary": f"unsupported phase2 bundle status for gate: {st!r}",
+        "metrics": {},
     }

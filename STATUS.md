@@ -4,6 +4,1106 @@
 
 ---
 
+## 2026-04-10 CYCLE — Phase 2：`precision_at_recall_1pct_by_window`（plan bundle）+ PAT 序列合併行為（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)、[`.cursor/plans/PLAN_precision_uplift_sprint.md`](.cursor/plans/PLAN_precision_uplift_sprint.md)、[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md)；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`orchestrator/config_loader.py`**：實驗層可選 **`precision_at_recall_1pct_by_window`**（非空 list、元素可轉 **float**）。
+- **`orchestrator/collectors.py`**：**`build_phase2_pat_series_from_plan_tracks`**；**`collect_phase2_plan_bundle`** 將上述欄位寫入 **`tracks` 快照**並組出 **`phase2_pat_series_by_experiment`**（若有資料）；**`merge_phase2_pat_series_from_shared_and_per_job`** 改為 **deepcopy 合併**，且 **僅在該 (track, exp_id) 尚無非空 list 時** 填入兩點 bridge（避免覆寫 YAML 單點／手寫序列）。
+- **`orchestrator/config/run_phase2.yaml`**：註解範例 **`precision_at_recall_1pct_by_window`**。
+
+#### 手動驗證
+
+- 在 phase2 YAML 某實驗下加入 **`precision_at_recall_1pct_by_window: [0.5, 0.51]`**，跑 **`collect_phase2_plan_bundle`**（或 **`run_pipeline --phase phase2`** 產出 plan bundle），確認 bundle 含 **`phase2_pat_series_by_experiment`**。
+- 情境：bundle 已有單點 YAML **`c0`**、per-job 結果含 **`c0`+`c1`** → 預期 **`c0` 不變**、**`c1`** 得 **`[shared, preview]`**。
+
+#### 下一步建議
+
+- **T10** 完整 A/B/C 與 **`E_ARTIFACT_MISSING`**／**`E_NO_DATA_WINDOW`** fail-fast；真實多窗矩陣若來自 backtest 產物，再接到同一 **`phase2_pat_series_by_experiment`** 形狀。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 型別非 list 的 YAML | 驗證只檢「有設定時」為 list | 維持現有 **`ConfigValidationError`** | **`test_phase2_config_precision_at_recall_by_window_empty_raises`** |
+| 合併略過「髒」既有值 | **`cur[eid]`** 非 list 但 truthy → 視為佔位不覆寫 | 長期可正規化為 list 或清掉鍵 | 可選髒 bundle |
+| 整數／字串數字 | **`float(x)`** 與 JSON 往返 | 文件標註 0–1 比例 | **`test_collect_phase2_plan_bundle_propagates_precision_at_recall_by_window`** |
+| 僅補新 exp、舊 exp 永遠不補兩點 | 若 YAML 誤留單點且希望被 bridge 取代 | 需明確「清空鍵」或設定旗標 | **`test_merge_phase2_pat_series_preserves_nonempty_yaml_fills_other_exp`** |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_phase2_config_precision_at_recall_by_window_*`**、**`test_collect_phase2_plan_bundle_propagates_precision_at_recall_by_window`**、**`test_build_phase2_pat_series_from_plan_tracks_coerces_numeric`**、**`test_merge_phase2_pat_series_preserves_nonempty_yaml_fills_other_exp`**、**`test_merge_phase2_pat_series_noop_when_only_nonempty_yaml_matches_results`**。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **129 passed**（同上 pytest）。
+- **計畫下一步**：T10 矩陣與 fail-fast；若多窗序列來自 artifact pipeline，與 **`merge_*`** 的優先順序寫入 MVP_TASKLIST／sprint 對照表。
+
+---
+
+## 2026-04-10 CYCLE — 文件：Phase 2 Gate（sprint ↔ orchestrator）對照 + MVP_TASKLIST 同步（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)、[`.cursor/plans/PLAN_precision_uplift_sprint.md`](.cursor/plans/PLAN_precision_uplift_sprint.md)、[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md)；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`.cursor/plans/PLAN_precision_uplift_sprint.md`**：在 **Phase 2 Gate** 段落下新增 **「調查 repo 對照」** 小表（uplift／std／產物與 exit 9／10），並鏈結 **MVP_TASKLIST T10／T11** 與 **`evaluate_phase2_gate`**。
+- **`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T10 per-job 回測改為 **`--output-dir`** + **`phase2_per_job_backtest_metrics_repo_relative`**；T11 Gate／**`report_builder`** 條目改為已勾選之 **MVP** 敘述並對齊現有 md 小節。
+- **`orchestrator/config/run_phase2.yaml`**：**`gate:`** 區塊補註解（對齊 sprint、**`evaluate_phase2_gate`**、欄位語意）。
+
+#### 手動驗證
+
+- 開啟 **`.cursor/plans/PLAN_precision_uplift_sprint.md`** Phase 2 區塊，確認對照表與連結可讀。
+- 通讀 **MVP_TASKLIST** T10／T11 與 **`run_phase2.yaml`** gate 註解是否與程式一致。
+
+#### 下一步建議
+
+- **真多窗** `phase2_pat_series_by_experiment` 資料鏈（取代／補強兩點 bridge）；T10「完整 A/B/C」與 fail-fast 細項。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 連結相對路徑 | sprint 內 markdown 鏈結依 repo 佈局 | 搬檔時同步更新 | 下表單測掃描關鍵字 |
+| 文字與程式漂移 | 門檻敘述變更未回寫 sprint | 改 gate 預設時跑契約測 | **`test_run_phase2_example_yaml_*`** |
+| MVP_TASKLIST 過長 | 讀者漏看 per-job 路徑修正 | 維持 T10 單條為 SSOT | — |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_run_phase2_example_yaml_documents_phase2_gate_contract`**、**`test_plan_precision_uplift_sprint_phase2_gate_orchestrator_bridge`**。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **123 passed**（同上 pytest）；本輪無需改 production 程式邏輯。
+- **計畫下一步**：多窗 PAT 序列 collector／runner；T10 完整矩陣與 **`E_ARTIFACT_MISSING`**／**`E_NO_DATA_WINDOW`**。
+
+---
+
+## 2026-04-10 CYCLE — T11：`track_*_results.md` 新增 PAT@1% 序列／std gate 小節（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)、[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md)；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`report_builder.py`**：**`_format_phase2_pat_series_values`**、**`_phase2_std_and_pat_series_markdown_for_track`**；**`write_phase2_track_results`** 在 **Uplift** 與 **Metrics (shared backtest)** 之間插入 **`## PAT@1% series & std (gate)`**（bundle 該軌 **`phase2_pat_series_by_experiment`** + **`gate['metrics']`** 之 std／**`phase2_std_per_series`** 篩軌）。
+- 移除檔尾誤植註解行（**`# Fix typo: _ORNS...`**）。
+
+#### 手動驗證
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t11_trackstd --skip-backtest-smoke \
+  --skip-phase2-trainer-smoke
+# 檢查 phase2/track_{a,b,c}_results.md 是否含「PAT@1% series & std (gate)」小節
+```
+
+#### 下一步建議
+
+- 真多窗 **`phase2_pat_series_by_experiment`** 資料源（取代／補強兩點 MVP）；**`PLAN_precision_uplift_sprint.md`** Phase 2 Gate 實測敘述對齊。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 長序列 md 膨脹 | 實驗多、窗多時列表很長 | 已截斷 **max_elems=8**；之後可改附檔或連結 | **`test_write_phase2_track_results_std_section_*`** |
+| gate-wide max 重複 | 三份 track md 都印全域 max pp | 維持自洽；長期可只寫入 `phase2_gate_decision.md` | — |
+| 缺 metrics 鍵 | 舊 gate 結果無 std | 顯示「未評估」句 | plan_only 路徑 |
+| `float('nan')` 格式化 | 異常數值 | 維持 try/float；失敗回退 `str(x)` | 可選髒資料列 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_write_phase2_track_results_std_section_shows_evaluated_metrics`**；**`test_write_phase2_track_results_writes_three_files`**／**`test_write_phase2_track_results_per_job_backtest_section`** 斷言新標題。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **121 passed**（同上 pytest）。
+- **計畫下一步**：多窗矩陣 collector；sprint Phase 2 **Go/證據** 與現有 gate 欄位對照表。
+
+---
+
+## 2026-04-10 CYCLE — T10/T11：per-job `backtest_metrics` 獨立輸出路徑（`--output-dir`）（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)、[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md)；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`trainer/training/backtester.py`**：**`backtest(..., output_dir=...)`**；寫入 metrics／parquet／csv 前 **`out_root.mkdir(parents=True, exist_ok=True)`**；CLI **`--output-dir`**。
+- **`orchestrator/runner.py`**：**`run_phase1_backtest`** 若 **`cfg["backtest_output_dir"]`** 則附加 **`--output-dir`**（相對路徑對 **repo 根** 解析）；**`run_phase2_per_job_backtests`** 對每 job 設 **`backtest_output_dir`** 為該 job 之 **`_per_job_backtest`** log 目錄，並自 **`collectors.phase2_per_job_backtest_metrics_repo_relative`** 讀取 JSON（不再用共用 **`phase2_backtest_metrics_repo_relative`**）。
+- **`collectors.py`**：**`phase2_per_job_backtest_metrics_repo_relative(run_id, track, exp_id)`**。
+- **`report_builder.py`**、**`orchestrator/config/run_phase2.yaml`**：更新 per-job 與共用路徑之說明。
+
+#### 手動驗證
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t10_pjb_out --skip-backtest-smoke \
+  --skip-phase2-trainer-smoke --phase2-run-per-job-backtests
+# 預期：每 job 的 .../_per_job_backtest/backtest_metrics.json 存在且互不覆寫；bundle per_job 列 metrics_repo_relative 指向該檔
+```
+
+#### 下一步建議
+
+- **report_builder**：可選 **std／`phase2_pat_series_by_experiment`** 摘要列；真多窗矩陣；Phase 1 若需自訂輸出亦可傳 **`backtest_output_dir`**（進階）。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 磁碟用量 | 每 job 另存 parquet／csv | 文件註明；之後可加「僅 metrics」模式 | — |
+| 權限 | `--output-dir` 不可寫 | backtester 既有的 mkdir／write 會丟錯 | 既有 subprocess 失敗路徑 |
+| 相對路徑基準 | 與 orchestrator cwd=repo 根一致 | 維持 **`run_phase1_backtest`** 解析方式 | **`test_run_phase1_backtest_includes_output_dir_argv`** |
+| CLI 相容 | 舊版 trainer 無 `--output-dir` | 僅 per-job 路徑需新版 backtester | 升級說明可寫 runbook |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_phase2_per_job_backtest_metrics_repo_relative`**、**`test_run_phase1_backtest_includes_output_dir_argv`**；擴充 **`test_run_phase2_per_job_backtests_resolves_model_dir_and_preview`**（**`backtest_output_dir`**、**`metrics_repo_relative`**、**`load_json_under_repo`** 路徑）。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **120 passed**（同上 pytest）。
+- **計畫下一步**：track md **std／序列** 小節；真多窗 **`phase2_pat_series_by_experiment`**；**`.cursor/plans/PLAN_precision_uplift_sprint.md`** Phase 2 Gate 實測對齊。
+
+---
+
+## 2026-04-10 CYCLE — T11：collector 自動 merge `phase2_pat_series_by_experiment`（shared + per-job 兩點 MVP）（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)、[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md) **T11**；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`collectors.py`**：**`phase2_pat_series_mapping_has_evaluable_series`**；**`merge_phase2_pat_series_from_shared_and_per_job`**（在尚無「可評估」手寫序列時，對每個 **ok** 的 per-job 列組 **`[shared PAT@1%, shared_precision_at_recall_1pct_preview]`**；**MVP bridge**，非真多窗矩陣）；**`collect_summary_phase2_plan_for_run_state`** 可選 **`phase2_pat_series_auto_merge_skipped`**／**`phase2_pat_series_auto_merge_eligible`**。
+- **`run_pipeline.py`**：**`phase2_gate_report`** 在 **`evaluate_phase2_gate`** 前呼叫 merge；若變更 bundle 則寫回 **`phase2_bundle.json`** 並刷新 **`phase2_collect`**／**`run_state`**。
+- **`orchestrator/config/run_phase2.yaml`**：註解自動 merge 與跳過條件（任一 **`track_*`** 下列長度 ≥2 則不覆寫）。
+
+#### 手動驗證
+
+```bash
+# 需：metrics_ingested（共享 backtest_metrics）+ 曾跑 --phase2-run-per-job-backtests 且結果 ok
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t11_autoser --skip-backtest-smoke \
+  --skip-phase2-trainer-smoke --phase2-run-per-job-backtests --phase2-run-backtest-jobs
+# gate 前檢查 phase2_bundle.json 是否出現 phase2_pat_series_by_experiment（兩點列表）
+```
+
+#### 下一步建議
+
+- **每 job 獨立 `backtest_metrics` 路徑**（避免共用檔互蓋）；**report_builder** track md 顯示 std／序列摘要；真多窗矩陣進 bundle 後可關閉或縮小兩點 proxy 依賴。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 兩點 stdev 語意 | `[shared, preview]` 大差異 → std 易超標（像一致性檢查而非時序穩定） | YAML／runbook 註明；真多窗就緒後改資料來源 | 門檻放寬之整合測 |
+| 手寫單點序列 | 僅 `[x]` 不視為「已手動提供」，merge 會整包重寫 | 文件註明；可選合併策略 | 現以 len≥2 為「保留」門檻 |
+| 僅 resume gate | 舊 bundle 無 merge 欄位時，本輪 gate 前會補寫 | 維持現狀 | gate 前 merge 管線測 |
+| `collectors`→`evaluators` 依賴 | 新增 import | 之後可抽共用 PAT 讀取常數 | — |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_phase2_pat_series_mapping_has_evaluable_series`**、**`test_merge_phase2_pat_series_*`**、**`test_evaluate_phase2_gate_after_auto_merge_std_evaluated`**、**`test_collect_summary_phase2_pat_series_merge_hints`**。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- 調整 **`test_evaluate_phase2_gate_after_auto_merge_std_evaluated`** 之 **`max_std_pp_across_windows`**（兩點序列在 preview 遠離 shared 時 stdev 大，此測僅鎖定「merge 後會跑 std」路徑）。
+- **118 passed**（同上 pytest）。
+- **計畫下一步**：per-job **backtest_metrics** 獨立路徑；**report_builder** 可選 std／序列；**`.cursor/plans/PLAN_precision_uplift_sprint.md`** Phase 2 真多窗證據鏈。
+
+---
+
+## 2026-04-10 CYCLE — T11：Std gate（`phase2_pat_series_by_experiment`）+ `--phase2-fail-on-gate-blocked`（exit 10）（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)、[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md) **T11**；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`evaluators.py`**：**`import statistics`**；**`_phase2_apply_std_gate`**：讀 **`bundle["phase2_pat_series_by_experiment"]`**（`track_* → { exp_id: [PAT@1% 每窗…] }`）；長度 ≥2 之數值列算 **`statistics.stdev`×100**（pp），取跨序列 **max**，與 **`gate.max_std_pp_across_windows`**（預設 2.5）比較；**uplift 已 PASS** 且 **max_pp > limit** → **FAIL**、**`blocking_reasons`** 含 **`phase2_std_exceeds_max_pp_across_windows`**；uplift 非 PASS 時僅寫入 std **metrics**／**informational evidence**，不因 std 單獨升級 FAIL。**`evaluate_phase2_gate`** 在 **`metrics_ingested`** 且跑 uplift 時：先 **`_phase2_try_uplift_gate_from_per_job`** 再 **`_phase2_apply_std_gate`**；evidence 開頭註明可選 **`phase2_pat_series_by_experiment`**。
+- **`run_pipeline.py`**：**`phase2_gate_cli_exit_code`** 新增 **`fail_on_gate_blocked: bool = False`**；**FAIL + fail_on_gate_fail → 9**；**BLOCKED + fail_on_gate_blocked → 10**；兩旗標皆開時 **先判 FAIL（9）**；CLI **`--phase2-fail-on-gate-blocked`**；**`phase2_gate_report`** 非零 exit 時依 **`gate_p2["status"]`** 設 **`E_PHASE2_GATE_FAIL`** 或 **`E_PHASE2_GATE_BLOCKED`**，stderr 區分 FAIL／BLOCKED。
+- **`orchestrator/config/run_phase2.yaml`**、**`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：exit 10、bundle 欄位與 **`max_std_pp_across_windows`** 語意；std 子項標為已落地（collector 自動灌入可再強化）。
+
+#### 手動驗證
+
+```bash
+# BLOCKED + 可選非零 exit（需 bundle gate 為 BLOCKED）
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t11_blocked --skip-backtest-smoke \
+  --skip-phase2-trainer-smoke --phase2-fail-on-gate-blocked
+# 預期：gate BLOCKED 時 exit 10（與 --phase2-fail-on-gate-fail 並用時 FAIL 仍優先 9）
+```
+
+#### 下一步建議
+
+- **Collector／runner** 自動填入 **`phase2_pat_series_by_experiment`**；**每 job 獨立 `backtest_metrics` 路徑**；**`report_builder`** 在 track md 顯示 std（可選）。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 僅 2 點 stdev | 兩窗變異度估計粗 | 文件註明；之後可改 rolling／IQR | 低／高波動序列單測 |
+| 非 `track_*` 鍵 | 若未過濾可能誤入 max | 僅掃 `track_` 前綴或明列 tracks | 可選：非 track 鍵忽略 |
+| 空 `{}` 誤判 | 先前空 mapping 曾走「有欄位但無有效序列」分支 | **已修**：`not series_root` 時等同未提供、直接 return uplift | 依賴既有 uplift-only 路徑 |
+| exit 10 與 9 並存 | CI 需明確政策 | runbook／yaml 註解 | 雙旗標優先順序單測 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_phase2_gate_cli_exit_code_blocked_exit_10`**、**`test_phase2_gate_cli_fail_precedes_blocked_when_both_flags`**、**`test_evaluate_phase2_gate_std_pass_with_low_variance_series`**、**`test_evaluate_phase2_gate_std_fail_when_series_too_volatile`**、**`test_evaluate_phase2_gate_std_informational_when_uplift_fail`**。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **`evaluators._phase2_apply_std_gate`**：**`phase2_pat_series_by_experiment` 為空 mapping（`{}`）時視為未提供**，不覆寫 uplift 結果（避免錯誤的「present but invalid」訊息）。
+- **112 passed**（同上 pytest）。
+- **計畫下一步**：collector 自動灌入 **`phase2_pat_series_by_experiment`**；per-job **backtest_metrics** 獨立路徑；track md 可選 std 欄；對齊 **`.cursor/plans/PLAN_precision_uplift_sprint.md`** Phase 2 Gate 其餘觀測項。
+
+---
+
+## 2026-04-10 CYCLE — T11：`--phase2-fail-on-gate-fail`（exit 9／resume 友善）（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)、[`.cursor/plans/PLAN_precision_uplift_sprint.md`](.cursor/plans/PLAN_precision_uplift_sprint.md)；[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md) **T11**；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`run_pipeline.py`**：**`phase2_gate_cli_exit_code`**（**`fail_on_gate_fail`** 且 gate **`FAIL`** → **9**）；CLI **`--phase2-fail-on-gate-fail`**；**`phase2_gate_report`** 在該情境下 **failed** + **`E_PHASE2_GATE_FAIL`**（報表仍寫入）；**`return` 前**補寫 **`merged["artifacts"]`** 與 **`_write_run_state`**；**BLOCKED**／**PASS** 不觸發 exit 9。
+- **`orchestrator/config/run_phase2.yaml`**、**`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：註解／條目。
+
+#### 手動驗證
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t11_gatefail --skip-backtest-smoke \
+  --skip-phase2-trainer-smoke --phase2-fail-on-gate-fail
+# 若 gate 為 FAIL：exit 9、run_state.steps.phase2_gate_report.status=failed；修正 bundle 後 --resume 可重跑 gate
+```
+
+#### 下一步建議
+
+- **Std gate**（多窗 bundle）；**每 job 獨立 backtest_metrics 路徑**。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 僅 FAIL 觸發 | BLOCKED 在 CI 仍 exit 0 | 文件註明；可另加 `--phase2-fail-on-gate-blocked` | — |
+| stderr 冗長 | 整段 evidence 印出 | 之後改只印 blocking 摘要 | — |
+| 雙重 `_write_run_state` | gate 區塊先寫後再寫（含 artifacts） | 之後可合併為單一 finalize | — |
+| exit 9 與他碼混淆 | 7／8 已用於 trainer／backtest | 在 runbook 列對照表 | helper 單測 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_phase2_gate_cli_exit_code_when_disabled`**、**`test_phase2_gate_cli_exit_code_on_fail_enabled`**、**`test_phase2_gate_cli_exit_code_pass_and_blocked_unchanged`**。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **107 passed**（同上 pytest）。
+- **計畫下一步**：**std gate**；可選 **`--phase2-fail-on-gate-blocked`**；**per-job backtest_metrics** 獨立路徑。
+
+---
+
+## 2026-04-10 CYCLE — T11：uplift gate（per-job 預覽 vs YAML baseline）（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)、[`.cursor/plans/PLAN_precision_uplift_sprint.md`](.cursor/plans/PLAN_precision_uplift_sprint.md)；[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md) **T11**；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`evaluators.py`**：**`_parse_float_gate`**、**`_phase2_preview_map_from_bundle`**、**`_phase2_try_uplift_gate_from_per_job`**；**`metrics_ingested`** 時若 **`per_job_backtest_jobs.executed`**：改寫 evidence 開頭、合併 **`phase2_uplift_*`**／**`phase2_std_gate_*`** 指標；**`PASS`**／**`FAIL`**（`phase2_uplift_below_min_pp_vs_baseline`）／**`BLOCKED`**（`phase2_uplift_insufficient_comparisons`）；未執行 per-job 時維持 **`phase2_shared_metrics_no_per_track_uplift`**。
+- **`report_builder.py`**：**`_phase2_uplift_rows_markdown_for_track`**；**`write_phase2_track_results`** 新增 **`## Uplift vs baseline (gate)`**。
+- **`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T11 uplift 子項勾選；std 仍待多窗。
+
+#### 手動驗證
+
+```bash
+# phase2 bundle：metrics_ingested + per_job_backtest_jobs.executed + tracks 與預覽列齊後跑 gate 報表
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py --phase phase2 ... 
+# 檢查 phase2_gate_decision.md 的 status／blocking；track_*_results.md 的 Uplift 小節
+```
+
+#### 下一步建議
+
+- **Std gate**：bundle 契約（多窗 PAT 序列）+ **`max_std_pp_across_windows`** 實評；可選 **pipeline 在 gate FAIL 時非零 exit**（產品政策）。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| baseline 語意 | 第一個「有預覽」非必為實驗 YAML 第一列 | 文件註明；之後可強制 exp_id 排序 | 已有 YAML 順序單測 |
+| 多軌同時達標 | 任軌任一 challenger 達標即 PASS | 與 sprint「至少一條路線」一致 | PASS 單測 |
+| `ok` 非嚴格 bool | 非 True 列不進 preview map | 維持 `is not True` | **`test_phase2_preview_map_excludes_failed_per_job_rows`** |
+| std 未評估但 YAML 有門檻 | 易誤以為已把關 | metrics **`phase2_std_gate_note`** | — |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_evaluate_phase2_gate_metrics_ingested_includes_per_job_preview_evidence`**（改為 **PASS** 情境）、**`test_evaluate_phase2_gate_metrics_ingested_uplift_blocked_single_preview`**、**`test_evaluate_phase2_gate_metrics_ingested_uplift_fail_below_min`**、**`test_phase2_preview_map_excludes_failed_per_job_rows`**；track md：**`test_write_phase2_track_results_per_job_backtest_section`**、**`test_write_phase2_track_results_writes_three_files`** 斷言 **Uplift** 標題。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **104 passed**（同上 pytest）。
+- **計畫下一步**：**std gate** 與多窗 bundle；可選 **gate FAIL → exit code**；**每 job 獨立 backtest_metrics 路徑**。
+
+---
+
+## 2026-04-10 CYCLE — T11：`per_job_backtest` 預覽進 Gate／track md（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)、[`.cursor/plans/PLAN_precision_uplift_sprint.md`](.cursor/plans/PLAN_precision_uplift_sprint.md)；[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md) **T11**；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`evaluators.py`**：**`phase2_per_job_backtest_metrics`**（正規化 **`per_job_backtest_jobs.results`**、**`per_job_backtest_preview_count`**）；**`_phase2_per_job_backtest_evidence_suffix`**；**`evaluate_phase2_gate`** 在 **`plan_only`** 與 **`metrics_ingested`** 分支把上述併入 **`metrics`** 與 **`evidence_summary`**（**`per_job_backtest_jobs.executed`** 為真時）。
+- **`report_builder.py`**：**`_phase2_per_job_backtest_markdown_for_track`**；**`write_phase2_track_results`** 新增 **`## Per-job backtest preview`**（含共用 **backtest_metrics** 路徑可能互蓋之說明）。
+- **`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T11 勾選／敘述更新。
+
+#### 手動驗證
+
+```bash
+# 跑過 phase2 且 bundle 含 per_job_backtest_jobs（含 --phase2-run-per-job-backtests）後：
+# 檢查 phase2_gate_decision.md / track_*_results.md 是否出現 per-job PAT@1% 預覽與 gate evidence 片段
+```
+
+#### 下一步建議
+
+- T11 完整 Gate：**uplift／std**（仍待 per-track 指標矩陣與可配置門檻）；可選 **每 job 獨立 backtest_metrics 輸出路徑** 以移除檔案互蓋。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| evidence 過長 | 實驗多時 preview 字串膨脹 | 之後改附表或截斷 + 指 bundle | 現用少量 job |
+| `ok` 非 bool | 怪異列型別 | 維持 **truthy** 與現有 runner 一致 | metrics 單測 |
+| 與 shared 段落語意 | 讀者混淆兩種 PAT | md 已註明 **shared vs per-job** | track md 單測 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_phase2_per_job_backtest_metrics_normalizes_rows`**、**`test_evaluate_phase2_gate_plan_only_includes_per_job_preview_evidence`**、**`test_evaluate_phase2_gate_metrics_ingested_includes_per_job_preview_evidence`**、**`test_write_phase2_track_results_per_job_backtest_section`**；**`test_write_phase2_track_results_writes_three_files`** 斷言 **Per-job backtest preview** 標題。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **101 passed**（同上 pytest）。
+- **計畫下一步**：T11 **uplift／std PASS 規則**；Phase 2 sprint **gate 數值化**（對齊 `PLAN_precision_uplift_sprint` §Phase 2 Gate）。
+
+---
+
+## 2026-04-10 CYCLE — T10：每實驗回測 `phase2_per_job_backtest_jobs`（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)；[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md) **T10**；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`runner.py`**：**`run_phase2_per_job_backtests`**（依 **`training_metrics_repo_relative`** 解析 bundle、`phase2_cfg_to_backtest_cfg` 覆寫 **`model_dir`**、**`run_phase1_backtest`**、log 於 **`collectors.phase2_per_job_backtest_logs_subdir_relative`**；成功後讀 **`phase2_backtest_metrics_repo_relative`** 並填 **`shared_precision_at_recall_1pct_preview`**）；**`_preview_precision_at_recall_1pct_from_metrics`**。
+- **`run_pipeline.py`**：**`--phase2-run-per-job-backtests`**；步驟 **`phase2_per_job_backtest_jobs`**（插在 **`phase2_job_metrics_harvest` 與 `phase2_backtest_jobs` 之間**）；**`--resume`** 可跳過；失敗 **exit 8**、**`E_PHASE2_PER_JOB_BACKTEST_JOBS`**；預設 bundle **`per_job_backtest_jobs.executed: false`**。
+- **`collectors.py`**：**`collect_summary_phase2_plan_for_run_state`** 增加 **`per_job_backtest_jobs_*`** 摘要欄位（先前已具 **`phase2_per_job_backtest_logs_subdir_relative`**／**`phase2_backtest_metrics_repo_relative`**／**`model_bundle_dir_from_training_metrics_hint`**）。
+- **`orchestrator/config/run_phase2.yaml`**、**`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T10 每實驗回測說明。
+
+#### 手動驗證
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t10_pjb --skip-backtest-smoke --skip-phase2-trainer-smoke \
+  --phase2-run-per-job-backtests
+# 預期：有 training_metrics_repo_relative 的 job 會跑 backtester；bundle per_job_backtest_jobs.results；共享回測仍由 --phase2-run-backtest-jobs 觸發
+```
+
+#### 下一步建議
+
+- T11：gate／報表消化 **per_job** 預覽欄位；可選讓每 job 寫入獨立 **backtest_metrics** 路徑以免共用檔互蓋。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 共用 `backtest_metrics.json` | 多 job 連跑會彼此覆寫檔案；僅結果內 snapshot 可靠 | 文件註明；長期可改 CLI／設定 per-job 輸出路徑 | 已 mock **load** 驗證 preview |
+| 缺 hint 全 skip | `all_ok` 仍 true | 維持現狀；報表看 **executed**／**results** | skip 單測 |
+| `first_err` 僅第一筆 | 與 trainer batch 一致 | 維持 | — |
+| Resume + 改旗標 | 已成功步驟不重跑 | 與既有 phase2 步驟一致 | resume 單測 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_collect_summary_phase2_plan_includes_per_job_backtest_jobs`**、**`test_model_bundle_dir_from_training_metrics_hint_file_and_directory`**、**`test_run_phase2_per_job_backtests_skips_without_hint`**、**`test_run_phase2_per_job_backtests_resolves_model_dir_and_preview`**、**`test_phase2_resume_skips_completed_per_job_backtest_jobs`**。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **97 passed**（同上 pytest）。
+- **計畫下一步**：T11 將 **per_job** 預覽納入 gate／track md；可選獨立 **metrics** 輸出路徑。
+
+---
+
+## 2026-04-10 CYCLE — T10：`phase2_collect` 指標路徑計數 + trainer／orchestrator log 契約（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)；[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md) **T10**；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`collectors.py`**：**`collect_summary_phase2_plan_for_run_state`** 新增 **`job_specs_training_metrics_hint_count`**（`job_specs` 中含非空 **`training_metrics_repo_relative`** 的筆數，含 YAML 手填與 runner merge 後）。
+- **`runner.py`**：模組常數 **`TRAINER_ARTIFACTS_SAVED_LOGGER_INFO_FORMAT`**（與 trainer 原始碼 **`logger.info`** 行字串對齊，供契約測／文件）。
+- **`trainer/training/trainer.py`**：**`save_artifact_bundle`** 內 **`Artifacts saved to`** 行前加 **契約註解**（指向 orchestrator **`runner.py`**）。
+
+#### 手動驗證
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t10_hintcnt --skip-backtest-smoke --skip-phase2-trainer-smoke
+# 預期：run_state.phase2_collect.job_specs_training_metrics_hint_count 與 bundle 一致
+```
+
+#### 下一步建議
+
+- T10 每實驗回測鏈；T11 uplift／std gate。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 常數字串與 trainer 分行／換行 | 編排工具改格式 → 契約測誤報 | 以 **子字串** 或 **正則** 放寬 | 原始碼掃描單測 |
+| `hint_count` 與 harvest found 混淆 | 前者=有路徑提示，後者=檔案讀到 | 文件／欄位命名維持 | 摘要單測 |
+| trainer 改 `logger.info` 文案 | regex 與常數雙破 | 單測失敗即提醒同步 **runner** regex | 契約單測 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_trainer_artifacts_saved_log_line_contract_for_orchestrator`**、**`test_collect_summary_phase2_plan_counts_training_metrics_hints`**；**`test_collect_phase2_plan_bundle_shape`** 補 **`job_specs_training_metrics_hint_count == 0`**。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **92 passed**（`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short`）。
+- 無需改實作；契約測與 **`job_specs_training_metrics_hint_count`** 摘要已通過。
+- **計畫下一步**：T10 **每實驗回測** subprocess；T11 **per-track 指標矩陣**與 uplift／std **PASS**。
+
+---
+
+## 2026-04-10 CYCLE — T10：trainer log 推斷並回填 `training_metrics_repo_relative`（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)；[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md) **T10**；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`runner.py`**：**`infer_training_metrics_repo_relative_from_trainer_logs`**（掃描 stdout/stderr 尾段，比對 trainer `Artifacts saved to …  (version=`）；**`merge_inferred_training_metrics_paths_into_phase2_bundle`**；**`run_phase2_trainer_jobs`** 每筆 result 附 **`inferred_training_metrics_repo_relative`**；**`import collectors`** 以重用 **`_safe_resolve_under_repo_root`** 驗證推斷路徑。
+- **`run_pipeline.py`**：`phase2_trainer_jobs` **實跑**後呼叫 **`merge_inferred_training_metrics_paths_into_phase2_bundle`**，再寫 bundle／`phase2_collect`（利於後續 **harvest**）。
+- **`orchestrator/config/run_phase2.yaml`**：註解說明自動回填行為。
+- **`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T10 trainer 列補上 log 推斷回填。
+
+#### 手動驗證
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t10_infer --phase2-run-trainer-jobs \
+  --skip-backtest-smoke --skip-phase2-trainer-smoke
+# 預期：訓練成功後 phase2_bundle.json 的 job_specs 出現 training_metrics_repo_relative（若 YAML 未先設）；
+# trainer_jobs.results[].inferred_training_metrics_repo_relative 有值；harvest 可 found
+```
+
+#### 下一步建議
+
+- Trainer log 格式變更時同步 regex；T10 每實驗回測鏈；T11 uplift gate。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| Log 格式漂移 | `Artifacts saved to` 文案變更 → 推斷失敗 | 與 trainer **單一 log 行**對齊或整合測 | 合成 log 單測 |
+| 多行／多 match | 同一 log 尾段多次保存 | 取 **最後一筆** match | 兩筆路徑單測 |
+| 推斷路徑逃出 repo | 惡意或誤設絕對路徑 | **`_safe_resolve`** 過濾 | merge 單測 |
+| YAML 已指定路徑 | 不應被推斷覆寫 | merge 跳過已有鍵 | 覆寫防護單測 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_infer_training_metrics_repo_relative_from_trainer_logs_*`**、**`test_merge_inferred_training_metrics_paths_into_phase2_bundle_*`**；**`test_run_phase2_trainer_jobs_invalid_spec`** 斷言 **`inferred_training_metrics_repo_relative`**。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **90 passed**（`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short`）。
+- 無需再改實作；本輪測試已覆蓋推斷、最後 match、repo 外路徑、merge 回填與 **不覆寫 YAML**。
+- **計畫下一步**：T10 **每實驗回測** subprocess 鏈；trainer log 與 regex **契約測**（可選）；T11 **uplift／std PASS**。
+
+---
+
+## 2026-04-10 CYCLE — T10：`training_metrics_repo_relative`（YAML→harvest 契約）（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)；[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md) **T10**（investigation pipeline 產物路徑）；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`config_loader.py`**：實驗可選 **`training_metrics_repo_relative`**（若出現則須為非空字串）。
+- **`collectors.py`**：**`_safe_resolve_under_repo_root`**（禁絕對路徑、禁逃出 repo 根）、**`_phase2_job_training_metrics_path`**；**`harvest_phase2_job_training_metrics`** 優先讀該路徑（檔或目錄 + `training_metrics.json`），否則沿用 log 目錄；**`collect_phase2_plan_bundle`** 將欄位寫入 **`tracks.*.experiments`**、**`experiments_index`**、**`job_specs`**；bundle **note** 更新。
+- **`orchestrator/config/run_phase2.yaml`**：註解範例。
+- **`report_builder.py`**：track results harvest 區塊說明對齊。
+- **`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T10 harvest 項改寫為含 **`training_metrics_repo_relative`**。
+
+#### 手動驗證
+
+```bash
+# 在 phase2 YAML 某實驗下設定 training_metrics_repo_relative: out/models/<run>/training_metrics.json
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t10_tmrel --skip-backtest-smoke --skip-phase2-trainer-smoke
+# 預期：phase2_bundle job_specs 含該鍵；job_training_harvest 對應列 found=true（檔存在時）
+```
+
+#### 下一步建議
+
+- Runner 於訓練成功後**自動**回填 `training_metrics_repo_relative`（或寫入 log 目錄）；T10 每實驗回測鏈仍待。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| `resolve()` 語意 | symlink／大小寫（Windows）可能與預期不同 | 文件註明以 **resolve 後** 須落在 repo 內 | escape 路徑單測 |
+| 目錄下缺 `training_metrics.json` | `found=false` | 維持現有 load 錯誤訊息 | dir 無檔案 |
+| 僅設相對路徑 | 仍依賴人工對齊產物 | 後續 runner 自動寫 bundle | config 傳遞單測 |
+| Windows `run_state` replace | 整包 pytest 偶發 **PermissionError** | **`_write_run_state`** 對 replace 短重試 | subprocess 整合測 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_phase2_config_training_metrics_repo_relative_*`**、**`test_collect_phase2_plan_bundle_propagates_training_metrics_repo_relative`**、**`test_harvest_prefers_training_metrics_repo_relative_over_logs`**、**`test_harvest_training_metrics_repo_relative_file_path`**、**`test_harvest_training_metrics_repo_relative_rejects_escape`**、**`test_harvest_training_metrics_repo_relative_rejects_absolute`**（斷言含 absolute 或 escapes，因 OS 對 `/etc/...` 解析差異）。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **85 passed**（同上指令）。
+- **`run_pipeline._write_run_state`**：`tmp.replace(run_state.json)` 遇 **PermissionError** 時最多 **8** 次、遞增 sleep（緩解 Windows 鎖檔／防毒）。
+- **計畫下一步**：runner 訓練成功後自動寫入 **`training_metrics_repo_relative`** 或複製至 log 目錄；T10 **每實驗回測鏈**；T11 uplift／std **PASS** 規則。
+
+---
+
+## 2026-04-10 CYCLE — T10：`phase2_job_metrics_harvest` + `job_training_harvest` + track md 小節（/cycle_code 全四步）
+
+> 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)（專案總表）、[`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md) **T10**；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`collectors.py`**（延續）：`PHASE2_JOB_TRAINING_METRICS_NAME`、`harvest_phase2_job_training_metrics`、`collect_summary_phase2_plan_for_run_state` 之 **`job_training_harvest_*`** 摘要。
+- **`evaluators.py`**（延續）：`_job_training_harvest_counts`；`plan_only`／`metrics_ingested` 之 **`gate.metrics`** 與 evidence 帶 harvest 列數／found 數。
+- **`run_pipeline.py`**：步驟 **`phase2_job_metrics_harvest`**（`phase2_trainer_jobs` 之後、`phase2_backtest_jobs` 之前）；寫入 **`p2_bundle["job_training_harvest"]`**；**`--resume`** 且該步已成功則跳過。
+- **`report_builder.py`**：**`write_phase2_track_results`** 新增 **「Per-job training_metrics harvest」**（**`_phase2_harvest_markdown_for_track`**：每軌道 found／相對路徑／error，不 dump 整份 JSON）。
+- **`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T10 勾選 harvest 與 track md 說明。
+
+#### 手動驗證
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t10_harvest --skip-backtest-smoke --skip-phase2-trainer-smoke
+# 預期：phase2_bundle.json 含 job_training_harvest.rows（每 job 一列；檔不在 log 目錄則 found=false）；
+# run_state.steps.phase2_job_metrics_harvest = success
+# phase2/track_*_results.md 含「Per-job training_metrics harvest」
+```
+
+#### 下一步建議
+
+- Trainer／runner 將 **`training_metrics.json`** 寫入 **`logs_subdir_relative`**（或複製）以讓 harvest **found**；後續可改為 bundle 只存路徑＋摘要以避免 JSON 膨脹。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| `job_training_harvest` 內嵌完整 `training_metrics` | 大實驗使 **`phase2_bundle.json` 過大** | 後續只存路徑＋精簡欄位 | 文件／可選上限 |
+| 預設 **found=false** | Trainer 仍寫 model bundle 而非 job log | STATUS／tasklist 已註記；對齊輸出路徑 | harvest 單測 |
+| Windows **`run_state.json` 原子 replace** | 偶發 **`PermissionError`**（全 suite 連跑） | 可評估 `_write_run_state` 重試或關閉即 flush | `test_phase2_resume_skips_completed_job_metrics_harvest`（曾單測重跑即過） |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_harvest_phase2_job_training_metrics_*`**、**`test_collect_summary_phase2_plan_includes_job_training_harvest`**、擴充 **`test_write_phase2_track_results_writes_three_files`**、**`test_phase2_bundle_includes_job_training_harvest_after_pipeline`**、**`test_phase2_resume_skips_completed_job_metrics_harvest`**。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（實作）
+
+- **78 passed**（同上指令；若 Windows 上整包曾出現 `run_state` replace 權限錯誤，可重跑單測或整包確認）。
+- **計畫下一步**：Trainer 輸出對齊 job log 目錄；每實驗回測鏈／uplift 矩陣（T10 剩餘項、T11 gate）。
+
+---
+
+## 2026-04-10 CYCLE — T11：`track_*_results.md` + `metrics_ingested` gate 證據（/cycle_code 全四步）
+
+> 計畫索引：`.cursor/plans/PLAN.md`；`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T11**；`DECISION_LOG.md`：`.cursor/plans/DECISION_LOG.md`。
+
+### STEP 1 — Builder
+
+- **`evaluators.py`**：`PHASE2_BACKTEST_PR1_KEY`、`extract_phase2_shared_precision_at_recall_1pct`；**`metrics_ingested`** 改 **blocking** 為 **`phase2_shared_metrics_no_per_track_uplift`**，**evidence**／**`gate.metrics.shared_precision_at_recall_1pct`** 帶共享 PAT@1%（可解析時）。
+- **`report_builder.py`**：**`write_phase2_track_results`** → `phase2/track_a_results.md`、`track_b_results.md`、`track_c_results.md`（YAML 實驗清單 + 共享 PAT@1% 免責聲明 + gate 摘要）。
+- **`run_pipeline.py`**：`phase2_gate_report` 步驟於 gate md 後寫入三份 track md；**`artifacts`** 含 **`phase2_track_*_results`**；結尾 **`merged.artifacts`** 同步路徑。
+- **`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T11 track 報表 stub ✅；gate 完整 uplift／std 仍待。
+
+#### 手動驗證
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t11_docs --skip-backtest-smoke --skip-phase2-trainer-smoke
+# 預期：investigations/precision_uplift_recall_1pct/phase2/track_{a,b,c}_results.md 更新；
+# metrics_ingested 時檔內含 PAT@1%；plan_only 時 PAT 列為不可用
+```
+
+#### 下一步建議
+
+- Per-track／per-experiment 指標與 **uplift vs baseline**、跨窗 **std**；gate **PASS** 條件。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 三份 track md 內容重複 | 易誤讀為獨立實驗結果 | 已加 **Note**；可再加檔首 warning | `test_write_phase2_track_results_*` |
+| `model_default` 缺鍵 | PAT 為 None | evidence 仍 BLOCKED | extractor 單測 |
+| `import evaluators` 在 report_builder 函數內 | 循環 import 風險低 | 維持 lazy import | 無 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_extract_phase2_shared_precision_at_recall_1pct`**、**`test_evaluate_phase2_gate_metrics_ingested_includes_pat_in_evidence`**、**`test_write_phase2_track_results_writes_three_files`**；更新 **`test_evaluate_phase2_gate_metrics_ingested_blocked`**（新 blocking code）。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（實作）
+
+- **72 passed**（同上指令）。
+- **計畫下一步**：per-experiment 指標矩陣、uplift／std gate、**PASS** 語意。
+
+---
+
+## 2026-04-10 CYCLE — T10：`phase2_backtest_jobs`（共享回測 + `backtest_metrics` ingest）（/cycle_code 全四步）
+
+> 計畫索引：`.cursor/plans/PLAN.md`；`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T10**；`DECISION_LOG.md`：`.cursor/plans/DECISION_LOG.md`。
+
+### STEP 1 — Builder
+
+- **`collectors.py`**：`phase2_shared_backtest_logs_subdir_relative`、`load_json_under_repo`；`phase2_collect` 摘要含 **`backtest_jobs_*`**、**`phase2_has_backtest_metrics`**。
+- **`run_pipeline.py`**：`phase2_cfg_to_backtest_cfg`、`_phase2_backtest_timeout_sec`；CLI **`--phase2-run-backtest-jobs`**；步驟 **`phase2_backtest_jobs`**（於 `phase2_trainer_jobs` 之後、`phase2_gate_report` 之前）；預設略過並寫 **`backtest_jobs.executed: false`**；實跑時呼叫 **`runner.run_phase1_backtest`**，再 ingest **`resources.backtest_metrics_path`** 或 **`trainer/out_backtest/backtest_metrics.json`**；成功則 **`bundle.status: metrics_ingested`** 並寫入 **`backtest_metrics`**；子程序失敗或缺檔／無效 JSON → **exit 8**（缺檔時 bundle **`errors`** 附 **`E_ARTIFACT_MISSING`**）；**`--resume`** 且該步已成功則跳過。
+- **`evaluators.py`**：`evaluate_phase2_gate` 對 **`metrics_ingested`** → **BLOCKED**（`phase2_uplift_gate_not_implemented`，待 T11）。
+- **`orchestrator/config/run_phase2.yaml`**：註解 `phase2_backtest_timeout_sec`、`backtest_metrics_path`。
+- **`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T10 共享回測項 ✅；每實驗回測仍待。
+
+#### 手動驗證
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t10_bt --skip-backtest-smoke --skip-phase2-trainer-smoke
+# 預期：phase2_bundle.json 含 backtest_jobs.executed=false
+
+python ... --phase2-run-backtest-jobs
+# 預期：logs/phase2/_shared_backtest/backtest.*.log；ingest 成功則 status=metrics_ingested；缺 metrics 檔或子程序失敗 → exit 8
+```
+
+#### 下一步建議
+
+- 每實驗回測／`training_metrics`、跨窗彙整；T11 uplift／std 與 `track_*_results.md`。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 僅「共享」一回測 | 與多 job 訓練不同步、非每實驗一模型 | 文件標註；後續每 job model_dir 契約 | gate `metrics_ingested` 單測 |
+| 預設 metrics 路徑 | backtester 寫入與預設讀取不一致時 ingest 失敗 | 用 `resources.backtest_metrics_path` 對齊 | `load_json_under_repo` |
+| exit 8 雙義 | 子程序失敗與缺檔皆為 8 | 看 `run_state` step message / bundle `errors` | pipeline 預設跳過單測 |
+| 逾時 | 長回測無上限 | `phase2_backtest_timeout_sec` | 可選 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_phase2_cfg_to_backtest_cfg_maps_window_and_skip_optuna`**、**`test_phase2_shared_backtest_logs_subdir_relative`**、**`test_load_json_under_repo_*`**、**`test_evaluate_phase2_gate_metrics_ingested_blocked`**、**`test_phase2_bundle_backtest_jobs_skipped_after_pipeline`**、**`test_phase2_resume_skips_completed_backtest_jobs`**。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（實作）
+
+- **69 passed**（同上指令）。
+- **計畫下一步**：每實驗回測與指標、T11 uplift／`track_*_results.md`。
+
+---
+
+## 2026-04-10 CYCLE — T10：`phase2_trainer_jobs`（可選 `trainer.trainer` 批次）（/cycle_code 全四步）
+
+> 計畫索引：`.cursor/plans/PLAN.md`；`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T10**；`DECISION_LOG.md`：`.cursor/plans/DECISION_LOG.md`。
+
+### STEP 1 — Builder
+
+- **`investigations/precision_uplift_recall_1pct/orchestrator/runner.py`**：`phase2_experiment_overrides`、`build_phase2_trainer_argv`、`run_phase2_trainer_jobs`（每 `job_specs` 一次子程序；可選 `resources.phase2_trainer_job_timeout_sec`、`trainer_use_local_parquet`）；YAML `overrides` 列於 `unapplied_overrides`。
+- **`run_pipeline.py`**：新步驟 **`phase2_trainer_jobs`**（於 `phase2_runner_smoke` 之後、`phase2_gate_report` 之前）；CLI **`--phase2-run-trainer-jobs`** 才實跑；否則 bundle 寫 **`trainer_jobs.executed: false`**；失敗 **exit 7**；**`--resume`** 且該步已成功則跳過。
+- **`collectors.py`**：`phase2_collect` 摘要含 **`trainer_jobs_executed`**、**`trainer_jobs_all_ok`**、**`trainer_jobs_count`**。
+- **`orchestrator/config/run_phase2.yaml`**：註解可選 `trainer_use_local_parquet`、`phase2_trainer_job_timeout_sec`。
+- **`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T10 拆成「可選 trainer 批次」✅ 與「回測鏈／fail-fast」仍待。
+
+#### 手動驗證
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t10_jobs --skip-backtest-smoke --skip-phase2-trainer-smoke
+# 預期：phase2_bundle.json 含 trainer_jobs.executed=false、skip_reason 說明
+
+python ... --phase2-run-trainer-jobs
+# 預期：每 job 目錄有 trainer_job_*.stdout.log；任務失敗則 exit 7（訓練可能極久／需 CH 或 local parquet）
+```
+
+#### 下一步建議
+
+- 接回測 CLI、指標 ingest、`status` 由 plan_only 進階；`E_ARTIFACT_MISSING` 等；T11 uplift 規則。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 預設不跑仍寫 bundle | 舊 consumer 若嚴格 schema 可能不認 `trainer_jobs` | 視為 bundle 擴充；文件已註明 | 讀 bundle 斷言鍵存在 |
+| 每 job 全量訓練 | 筆電／CI 耗時、CH 依賴 | 維持 opt-in；可設 `phase2_trainer_job_timeout_sec` | resume 跳步單測；argv 單元測試 |
+| `overrides` 未接 CLI | 實驗矩陣誤以為已套用 | 以 `unapplied_overrides` 明示 | 斷言非空 overrides 鍵出現在列表 |
+| exit 7 語意 | 與 dry-run 6、runner 5 並存 | 文件／STATUS 已標 | 可選：mock 失敗子程序 → exit 7 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_build_phase2_trainer_argv_skip_optuna`**、**`test_build_phase2_trainer_argv_unapplied_overrides`**、**`test_build_phase2_trainer_argv_use_local_parquet`**、**`test_run_phase2_trainer_jobs_invalid_spec`**、**`test_run_phase2_trainer_jobs_empty_job_specs`**、**`test_phase2_bundle_trainer_jobs_skipped_after_pipeline`**、**`test_phase2_resume_skips_completed_trainer_jobs`**。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（實作）
+
+- **62 passed**（同上指令）。
+- **計畫下一步**：T10 接上 **backtest／指標 ingest**、bundle **`status`** 演進、`E_ARTIFACT_MISSING`／`E_NO_DATA_WINDOW`；T11 uplift／`track_*_results.md`。
+
+---
+
+## 2026-04-10 — Phase2 `job_specs` log 路徑與 state 同樹
+
+- **`collectors.collect_phase2_plan_bundle`**：`logs_subdir_relative` 改為相對 repo 根之 `investigations/precision_uplift_recall_1pct/orchestrator/state/<run_id>/logs/phase2/...`（與 `phase2_bundle.json`／`run_state.json` 同目錄樹）。
+- **搬移**：原誤建在 repo 根 `orchestrator/state/*/logs/` 者，已合併至上述 investigation `state/*/logs/`；repo 根 `orchestrator/` 目錄已移除（若為空）。
+- **測試**：`tests/unit/test_precision_uplift_phase1_orchestrator.py` 路徑斷言已更新；fixture `phase2_bundle.json`（t10_smoke 等）已同步。
+
+---
+
+## 2026-04-10 CYCLE — T10：`phase2_runner_smoke`（mkdir + trainer `--help`）（/cycle_code 全四步）
+
+> 計畫索引：`.cursor/plans/PLAN.md`；`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T10**；`DECISION_LOG.md`：`.cursor/plans/DECISION_LOG.md`。
+
+### STEP 1 — Builder
+
+- **`investigations/precision_uplift_recall_1pct/orchestrator/runner.py`**：`ensure_phase2_job_log_dirs`、`run_trainer_trainer_help_smoke`（`python -m trainer.trainer --help`，timeout 120s）。
+- **`investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py`**：`--skip-phase2-trainer-smoke`；`phase2_runner_smoke` 步驟（`plan_bundle` 之後、`gate_report` 之前）；寫回 `phase2_bundle.json` 之 `runner_smoke`；log mkdir 失敗或 trainer smoke 失敗 → **exit 5**；`--resume` 可跳過已完成之該步。
+- **`investigations/precision_uplift_recall_1pct/orchestrator/collectors.py`**：`phase2_collect` 摘要含 `runner_log_dirs_ok`、`runner_trainer_help_skipped`、`runner_trainer_help_ok`。
+- **`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T10 區分 smoke／實際訓練 runner；§3 已完成補述。
+
+#### 手動驗證
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <yaml> --run-id t10_smoke --skip-backtest-smoke
+# 預期：每 job log 目錄被建立；trainer --help 通過；bundle 有 runner_smoke
+
+python ... --skip-phase2-trainer-smoke
+# 預期：仍建 log 目錄；trainer_help_skipped
+```
+
+#### 下一步建議
+
+- 依 `job_specs` 呼叫真實訓練 CLI、收集指標、替換 `plan_only`／豐富 gate。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| `trainer.trainer --help` 冷啟動慢 | 120s timeout | 與 backtest smoke 類似；CI 可 `--skip-phase2-trainer-smoke` | 單測預設 skip |
+| exit 5 與 phase1 碼語意 | 僅 phase2 使用 | 文件註明 | 無 |
+| 舊 `run_state` 無 `phase2_runner_smoke` | 首次 resume 會補跑 | 預期行為 | `test_phase2_resume_skips_completed_runner_smoke` |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`test_ensure_phase2_job_log_dirs_creates`**、`**test_phase2_resume_skips_completed_runner_smoke**`；phase2 scaffold／resume no bundle 測試加上 `--skip-phase2-trainer-smoke`。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（實作）
+
+- **55 passed**（同上指令）。
+
+**計畫狀態**：T10 **smoke runner** 已接線；建議下一項 **每實驗真實訓練 subprocess + 指標回填 bundle**。
+
+---
+
+## 2026-04-10 CYCLE — T10：`phase2_bundle.job_specs` + resume 缺檔 exit 4 測試（/cycle_code 全四步）
+
+> 計畫索引：`.cursor/plans/PLAN.md`；`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T10**；`DECISION_LOG.md`：`.cursor/plans/DECISION_LOG.md`。
+
+### STEP 1 — Builder
+
+- **`investigations/precision_uplift_recall_1pct/orchestrator/collectors.py`**
+  - `collect_phase2_plan_bundle` 新增 **`job_specs`**：僅含 **track 已 enable** 且 **`exp_id` 非空** 之實驗；每筆含 `logs_subdir_relative`（相對 repo 根，與 bundle 同樹：`investigations/precision_uplift_recall_1pct/orchestrator/state/<run_id>/logs/phase2/<track>/<exp_id>/`）。
+  - `collect_summary_phase2_plan_for_run_state` 新增 **`job_specs_count`**。
+- **`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T10 collector 子項補述 `job_specs`。
+
+#### 手動驗證
+
+- 跑一次 `--phase phase2`（有效 paths）後開啟 `phase2_bundle.json`，確認存在 `job_specs` 且筆數等於啟用軌道上有 `exp_id` 的實驗數。
+
+#### 下一步建議
+
+- T10 runner：依 `job_specs` 建目錄、spawn trainer、回填 bundle。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| `logs_subdir_relative` 僅為約定 | runner 未建目錄前路徑不存在 | T10 實作時 `mkdir -p` | 無 |
+| `job_specs` 與 `experiments_index` 冗餘 | 維護兩份 | 保留：index 全量、job_specs 為「可執行子集」 | `test_collect_phase2_plan_bundle_shape` 已擴充 |
+| `run_id` 特殊字元 | 路徑片段若含 `/` 可能異常 | 現由 YAML／CLI 限制；必要時 sanitize | 可選 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`tests/unit/test_precision_uplift_phase1_orchestrator.py`**
+  - 擴充 `test_collect_phase2_plan_bundle_shape`（`job_specs`／`job_specs_count`／路徑前綴）。
+  - `test_phase2_resume_missing_bundle_exits_4`（刪 bundle 後 `--resume` → exit 4）。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（實作）
+
+- **53 passed**（同上指令）。
+
+**計畫狀態**：T10 **列 job + log 路徑契約**已進 bundle；建議下一項 **T10 subprocess runner**。
+
+---
+
+## 2026-04-10 CYCLE — T11 最小：Phase2 gate + `phase2_gate_decision.md`（/cycle_code 全四步）
+
+> 計畫索引：`.cursor/plans/PLAN.md`；`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T11**；`DECISION_LOG.md`：`.cursor/plans/DECISION_LOG.md`。
+
+### STEP 1 — Builder
+
+- **`investigations/precision_uplift_recall_1pct/orchestrator/evaluators.py`**：`evaluate_phase2_gate`（`plan_only` → `BLOCKED`；`errors` → `FAIL`；未知 `status` → `BLOCKED`）。
+- **`investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py`**：`write_phase2_gate_decision` → `investigations/precision_uplift_recall_1pct/phase2/phase2_gate_decision.md`。
+- **`investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py`**：`_main_phase2` 在 `phase2_plan_bundle` 後載入 `p2_bundle`（resume 自磁碟）；`phase2_gate_report` 步驟；`run_state.phase2_gate_decision`；resume 可跳過；缺 bundle 之 resume → exit **4**。
+- **`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T11／§3／§4 對齊現況（uplift 規則與 track 報表仍 `[ ]`）。
+
+#### 手動驗證
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 --config <你的 run_phase2.yaml> --run-id t11_smoke --skip-backtest-smoke
+# 預期：phase2/phase2_gate_decision.md 內 status 為 BLOCKED（plan_only）；run_state 有 phase2_gate_decision
+```
+
+#### 下一步建議
+
+- **T10 runner** 產物與 bundle 擴充；**T11** uplift／std 規則與 `track_*_results.md`。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| `BLOCKED` vs `FAIL` | plan_only 用 BLOCKED；collector errors 用 FAIL | 文件與 gate md 已區分 | `test_evaluate_phase2_gate_*` |
+| Resume 缺 `phase2_bundle.json` | exit 4 | Runbook 一句 | 可選：刪 bundle 後 `--resume` |
+| 覆寫共用 `phase2_gate_decision.md` | 多 run_id 寫同一 path | 與 phase1 類似以 investigation 目錄為 SSOT；長跑可改 run_id 子目錄（後續） | 無 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`tests/unit/test_precision_uplift_phase1_orchestrator.py`**：`test_evaluate_phase2_gate_plan_only_blocked`、`test_evaluate_phase2_gate_errors_fail`、`test_evaluate_phase2_gate_unsupported_status_blocked`；擴充 phase2 scaffold CLI 斷言 `phase2_gate_report` 與 gate md。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（實作）
+
+- **52 passed**（同上指令）。
+
+**計畫狀態**：T11 **骨架**已落地；建議下一項 **T10 track runner**（餵養 bundle 與後續 PASS／FAIL uplift gate）。
+
+---
+
+## 2026-04-10 CYCLE — MVP_TASKLIST 對齊 T10 plan-only + 操作備註（/cycle_code 全四步）
+
+> 計畫索引：`.cursor/plans/PLAN.md`；`DECISION_LOG.md`：`.cursor/plans/DECISION_LOG.md`。接續 T10 plan bundle 落地，**只改文件 + 契約單測**。
+
+### STEP 1 — Builder
+
+- **`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**
+  - **T10 完成定義**：拆成 **plan_only 可重現** `[x]` 與 **runner 階段**仍 `[ ]`；stdout／artifacts 可追溯仍待 runner。
+  - **§3**：「已完成」加入 T10 部分（plan bundle／`phase2_plan_bundle`）；Sprint A 改為 T9 ✅、T10 進行中、T11。
+  - **§4 DoD**：`--phase phase2` 一行改寫，納入 plan-only bundle 與仍待項。
+  - **§5**：`run_phase2.yaml` 的 `model_dir`／DB 本機路徑提醒；讀 `phase2_bundle.json` 必看 `status`（`plan_only` 語意）。
+
+#### 手動驗證
+
+- 通讀 MVP_TASKLIST **T10**、**§3**、**§4**、**§5** 與 orchestrator 行為是否一致。
+
+#### 下一步建議
+
+- T10 runner；T11 evaluator；或 Runbook 單句鏈結 MVP §5。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 「可重現」範圍 | 僅保證 config→bundle；未承諾跨 Python 版本 float 序 | MVP 已寫「僅由 config 展開」 | `test_collect_phase2_plan_bundle_deterministic_json` |
+| Sprint A 字樣過長 | 表格換行可讀性 | 維持一行；必要時改 footnote | 無 |
+| §5 與 Runbook 重複 | 兩處維護 | Runbook 可「見 MVP §5」 | 無 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`tests/unit/test_precision_uplift_phase1_orchestrator.py`**：`test_collect_phase2_plan_bundle_deterministic_json`（canonical JSON 相等）。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（實作）
+
+- 無需改 production；**49 passed**（同上指令）。
+
+**計畫狀態**：MVP_TASKLIST 與 **T10 plan-only** 邊界已寫清；建議下一項 **T10 track runner**。
+
+---
+
+## 2026-04-10 CYCLE — T10 起手：phase2 plan-only `phase2_bundle.json`（/cycle_code 全四步）
+
+> 計畫索引：`.cursor/plans/PLAN.md`；precision uplift：`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T10**；`DECISION_LOG.md` 見 `.cursor/plans/DECISION_LOG.md`。
+
+### STEP 1 — Builder
+
+- **`investigations/precision_uplift_recall_1pct/orchestrator/collectors.py`**
+  - `collect_phase2_plan_bundle`：由已驗證 phase2 config 產出可重現 bundle（`bundle_kind: phase2_plan_v1`、`status: plan_only`、`experiments_index`）。
+  - `collect_summary_phase2_plan_for_run_state`：寫入 `run_state.phase2_collect` 摘要。
+- **`investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py`**
+  - `_main_phase2`（非 dry-run、非 collect-only）：在 `phase2_scaffold` 後新增 `phase2_plan_bundle` 步驟，原子寫入 `orchestrator/state/<run_id>/phase2_bundle.json`；`artifacts.phase2_bundle`；`--resume` 且該步已 success 時跳過。
+- **`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**：T10「collector」子項標記 plan-only 範圍已 `[x]`，並註明 trainer 產物仍待。
+
+#### 手動驗證
+
+```bash
+# 與 T9 相同前置（本機 model_dir + 兩 DB 通過 preflight）
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 \
+  --config investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase2.yaml \
+  --run-id my_p2_bundle \
+  --skip-backtest-smoke
+# 預期：orchestrator/state/my_p2_bundle/phase2_bundle.json 存在且 status=plan_only
+```
+
+#### 下一步建議
+
+- T10 其餘：A/B/C **runner**、由產物回填 bundle（替換 `plan_only`）、`E_ARTIFACT_MISSING`／`E_NO_DATA_WINDOW`。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| `plan_only` 誤當訓練完成 | 下游若只看檔名 `phase2_bundle.json` 可能誤解 | 報表／gate 必讀 `status` 與 `bundle_kind`；Runbook 一句話 | 單測斷言 `plan_only` |
+| Resume 跳過寫入 | 改 YAML 後若 fingerprint 未變極少見；一般會因 fingerprint 重跑 | 維持現有 `input_summary` fingerprint | 可選：resume 雙次 CLI |
+| 大型 overrides | `json.dumps(common)` 複製整份 common | 可接受；未來 runner 應避免把秘密寫進 yaml | 無 |
+| `collect_only` 無 bundle | 與 T9 語意一致（僅 preflight） | 文件註明；若要 collect-only 也出 plan 可另開任務 | 既有 collect_only 測試 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`tests/unit/test_precision_uplift_phase1_orchestrator.py`**
+  - `test_collect_phase2_plan_bundle_shape`、`test_collect_phase2_plan_bundle_raises_on_non_mapping`、`test_collect_phase2_plan_bundle_raises_on_bad_tracks`
+  - 擴充 `test_run_pipeline_phase2_scaffold_writes_run_state`：斷言 `phase2_plan_bundle` 步驟與 `phase2_bundle.json`
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（實作）
+
+- 無需額外修 production；**48 passed**（同上指令）。
+
+**計畫狀態**：T10 **plan-only bundle** 已落地；建議下一項 **T10 runner**（或 T11 evaluator 可先設計介面）。
+
+---
+
+## 2026-04-10 CYCLE — MVP_TASKLIST 對齊 T16A（文件 + checklist 契約測試，/cycle_code 全四步）
+
+> 計畫索引：`.cursor/plans/PLAN.md`；決策：`.cursor/plans/DECISION_LOG.md`。接續同日 T16A 實作，**同步** `PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`。
+
+### STEP 1 — Builder
+
+- **`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**
+  - **T16A** 已落地項改為 `[x]`，並註明 phase3／4 為 **minimal schema**、`run_full`／`DRY_RUN_FLAG_DEFAULTS` 為 checklist SSOT。
+  - **T16** 第一項改為 `[x]`（**僅 `--dry-run`**），其餘長跑／DAG 仍 `[ ]`。
+  - **T12／T14**：`run_phase3.yaml`／`run_phase4.yaml` 範例標為 **T16A 最小範例** `[x]`；`--phase phase3|phase4` 仍 `[ ]`。
+  - **§3 建議順序**：已完成區塊補 T16A；Sprint D 改為「T16A ✅、T16 剩餘」。
+  - **§4 DoD**：新增 `--phase all --dry-run` 勾選；區分 all-phase **長跑** resume（T16）與現況。
+
+#### 手動驗證
+
+- 開啟 `PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`，確認 T16A 區塊與 T16／T12／T14 邊界說明可讀、與 `orchestrator/` 實作一致。
+
+#### 下一步建議
+
+- **T10／T11** Phase 2 主線；**T16** 非 dry-run `--phase all`；**T12／T14** 完整 schema 與 `--phase phase3|phase4`。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 文件與程式 checklist 漂移 | MVP 逐條列 `dry_run` 鍵，若程式改名易不一致 | 以 `config_loader.DRY_RUN_FLAG_DEFAULTS` 為 SSOT；task list 指回該常數 | 單測斷言鍵集合與 T16A 契約一致 |
+| 「T12 yaml 已勾選」誤解 | 讀者以為 Phase 3 runner 已完成 | 文內已標 **T16A 最小**；必要時在 T12 標題加「runner 仍待」 | 人工掃一眼 T12 第一條仍 `[ ]` |
+| Sprint D 字樣 | 「✅」在 markdown 列表可讀性 | 維持簡短；Release note 可再展開 | 無 |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`tests/unit/test_precision_uplift_phase1_orchestrator.py`**：`test_t16a_dry_run_checklist_keys_match_config_loader_contract`（`DRY_RUN_FLAG_DEFAULTS` 鍵集合）。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（實作）
+
+- 無需改 production；**45 passed**（`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short`）。
+
+**計畫狀態**：MVP_TASKLIST 與 **T16A** 實作對齊；建議下一項 **T10（Phase 2 track runner）** 或 **T16（all-phase 長跑）**。
+
+---
+
 ## 2026-04-10 CYCLE — precision_uplift T16A（`--phase all` + `run_full.yaml` all-phase dry-run，/cycle_code 全四步）
 
 > 計畫索引：`.cursor/plans/PLAN.md`；決策：`.cursor/plans/DECISION_LOG.md`。對齊 MVP／Runbook **T16A**（長跑前 all-phase dry-run）。

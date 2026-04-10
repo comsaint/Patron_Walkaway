@@ -5098,6 +5098,8 @@ def save_artifact_bundle(
             _out / "walkaway_model.pkl",
         )
 
+    # Contract: precision uplift phase2 orchestrator regex-parses this line
+    # (``investigations/precision_uplift_recall_1pct/orchestrator/runner.py``).
     logger.info("Artifacts saved to %s  (version=%s)", _out, model_version)
 
 

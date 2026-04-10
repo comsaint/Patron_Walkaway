@@ -185,31 +185,39 @@
 
 #### T10 - Phase 2 Track Runner + Collector
 
-- [ ] runner 支援 A/B/C 路線批次執行（至少每路線 1 組 baseline + 1 組候選）
+- [x] runner **smoke 與 log 目錄**（`phase2_runner_smoke`）：依 `job_specs` 建 **`investigations/precision_uplift_recall_1pct/orchestrator/state/<run_id>/logs/phase2/...`**（與 `run_state`／`phase2_bundle` 同樹；相對路徑見 bundle 內 `logs_subdir_relative`）；可選 `python -m trainer.trainer --help`（`--skip-phase2-trainer-smoke` 略過）；結果寫入 `phase2_bundle.runner_smoke`；失敗 exit **5**
+- [x] runner **可選**對每個 `job_specs` 呼叫 `python -m trainer.trainer`（`--phase2-run-trainer-jobs`；`common.window` + `resources.backtest_skip_optuna`／可選 `trainer_use_local_parquet`、可選 `phase2_trainer_job_timeout_sec`）；預設略過並在 bundle 寫入 `trainer_jobs.executed: false`；任務失敗 exit **7**；YAML `overrides` 尚未接 trainer CLI（列於 `unapplied_overrides`）；訓練**成功**後自 log **推斷**產物目錄並回填 **`job_specs[].training_metrics_repo_relative`**（僅當 YAML 未手動指定；見 **`runner.infer_training_metrics_repo_relative_from_trainer_logs`**／**`merge_inferred_training_metrics_paths_into_phase2_bundle`**）
+- [x] runner **每實驗回測**（`phase2_per_job_backtest_jobs`）：**`--phase2-run-per-job-backtests`** 對有 **`training_metrics_repo_relative`** 的 `job_specs` 各跑 **`trainer.backtester`**（`phase2_cfg_to_backtest_cfg` 覆寫 `model_dir`）；**`--output-dir`** 指向 `…/_per_job_backtest/`，成功後讀同目錄 **`backtest_metrics.json`**（**`collectors.phase2_per_job_backtest_metrics_repo_relative`**）寫入 **`per_job_backtest_jobs.results[].shared_precision_at_recall_1pct_preview`**；共享回測仍寫 **`resources.backtest_metrics_path`**／預設路徑；步驟順序仍為 **per-job 在前、共享在後**（利於 gate 合併 shared PAT 與 per-job 預覽）；無 hint 的列 **skip**；失敗 **exit 8** **`E_PHASE2_PER_JOB_BACKTEST_JOBS`**；預設略過 **`per_job_backtest_jobs.executed: false`**
+- [x] runner **共享回測**（`phase2_backtest_jobs`）：**`--phase2-run-backtest-jobs`** 跑單次 `trainer.backtester`（`phase2_cfg_to_backtest_cfg`）；log 於 `state/<run_id>/logs/phase2/_shared_backtest/`；ingest `resources.backtest_metrics_path` 或預設 `trainer/out_backtest/backtest_metrics.json`；成功則 **`status: metrics_ingested`**；子程序失敗／缺檔 ingest **exit 8** + **`E_ARTIFACT_MISSING`**（bundle `errors`）；預設略過並寫 **`backtest_jobs.executed: false`**
+- [x] **`phase2_job_metrics_harvest`**（於 `phase2_trainer_jobs` 之後、`phase2_backtest_jobs` 之前）：`collectors.harvest_phase2_job_training_metrics` 對每個 `job_specs` 讀取訓練指標：**優先**實驗選填 **`training_metrics_repo_relative`**（repo 相對路徑：檔案或含 `training_metrics.json` 的目錄；拒絕絕對路徑與逃出 repo 根）；**否則** **`{logs_subdir_relative}/training_metrics.json`**；寫入 **`phase2_bundle.job_training_harvest`**；`phase2_collect`／gate **`metrics`** 附 **`job_training_harvest_*`**；**`--resume`** 成功步驟可跳過
+- [ ] runner **完整** A/B/C：**每實驗**回測鏈、指標彙整、跨窗統計；缺檔／無資料等 fail-fast（與共享回測並行演進）
 - [ ] 產出統一結果結構（每 track 的主指標、切片、跨窗統計）
-- [ ] collector 讀取 track 產物並彙整為 `phase2_bundle.json`
+- [x] collector 自 phase2 YAML 產出 **plan-only** `phase2_bundle.json`（`bundle_kind: phase2_plan_v1`、`status: plan_only`；寫入 `orchestrator/state/<run_id>/`；含 **`job_specs`**（啟用實驗 + 建議 `logs_subdir_relative`，供 T10 runner 掛 stdout／stderr）；**best-effort 讀取** job log 下 **`training_metrics.json`** 見上列 **`job_training_harvest`**；**`phase2_collect`** 含 **`job_specs_training_metrics_hint_count`**（已填 **`training_metrics_repo_relative`** 的 job 數）；完整每實驗訓練產物矩陣仍待 runner／契約）
 - [ ] fail-fast 保護：
   - [ ] 任一路線輸出缺檔 → `E_ARTIFACT_MISSING`
   - [ ] 窗口無資料 → `E_NO_DATA_WINDOW`
 
 **完成定義**
-- [ ] `phase2_bundle.json` 可重現同一輸入下同一輸出
+- [x] **（plan_only 階段）** 同一 phase2 YAML + 固定 `run_id` 下，`phase2_bundle.json`（`bundle_kind: phase2_plan_v1`）內容可重現（僅由 config 展開；不含 trainer 隨機性）
+- [ ] **（runner 階段）** 含訓練／回測產物後仍滿足可重現與可追溯
 - [ ] stdout/stderr 與每路線 artifacts 可追溯
 
 #### T11 - Phase 2 Evaluator + 報表
 
-- [ ] `evaluators.py` 新增 `evaluate_phase2_gate(...)`
-- [ ] Gate 規則最小版：
-  - [ ] 至少 1 條路線相對基線達成 uplift（預設 +3~5pp 可配置）
-  - [ ] 跨窗波動未超門檻（例如 std/tolerance 可配置）
-- [ ] `report_builder.py` 新增輸出：
-  - [ ] `phase2/track_a_results.md`
-  - [ ] `phase2/track_b_results.md`
-  - [ ] `phase2/track_c_results.md`
-  - [ ] `phase2/phase2_gate_decision.md`
+- [x] `evaluators.py` 新增 `evaluate_phase2_gate(...)`（**plan_only** → `BLOCKED`；bundle 含 `errors` → `FAIL`；其餘 status 暫 `BLOCKED` 直至 runner 產物契約落地）
+- [x] Gate（`metrics_ingested`）：**`extract_phase2_shared_precision_at_recall_1pct`**（`model_default.test_precision_at_recall_0.01`）寫入 **`gate.metrics`** 與 **evidence**；仍 **BLOCKED**（`phase2_shared_metrics_no_per_track_uplift`）
+- [x] Gate／報表消化 **`per_job_backtest_jobs`**：**`evaluators.phase2_per_job_backtest_metrics`**、**`plan_only`／`metrics_ingested`** 的 **evidence** 附 **per-job PAT@1% preview** 摘要；**`report_builder`** 每軌道 **`## Per-job backtest preview`**
+- [x] Gate 規則（**uplift／std**，MVP；**真多窗矩陣資料源**仍待強化／取代兩點 bridge）：
+  - [x] **Uplift（per-job 預覽）**：啟用軌道內 **YAML 順序**第一個有 PAT@1% 預覽之實驗為 baseline；後續有預覽者之 uplift（**pp** = 差值×100）達 **`gate.min_uplift_pp_vs_baseline`**（預設 3.0）→ **`evaluate_phase2_gate` `PASS`**；否則 **`FAIL`**（`phase2_uplift_below_min_pp_vs_baseline`）或 **`BLOCKED`**（`phase2_uplift_insufficient_comparisons`）；未跑 per-job 回測時仍 **`phase2_shared_metrics_no_per_track_uplift`**
+  - [x] **Std（MVP）**：**`phase2_pat_series_by_experiment`** + **`max_std_pp_across_windows`**；**`merge_phase2_pat_series_from_shared_and_per_job`**（兩點序列 bridge）；手寫／collector 多窗序列可再強化
+- [x] `report_builder.py` 軌道結果（每軌道 `phase2/track_{a,b,c}_results.md`：實驗清單、共享 PAT@1%、**Per-job training_metrics harvest**、**Per-job backtest preview**、**Uplift vs baseline**、**PAT@1% series & std (gate)**、**Gate snapshot**；註明共享 **model_dir** 與 per-job **`--output-dir`** 語意）
+- [x] `report_builder.py` 新增 **`phase2/phase2_gate_decision.md`**（與 `run_state.phase2_gate_decision` 同步；**plan_only 僅能記錄 BLOCKED 與 blocking reasons**）
+- [x] **`run_pipeline.py`**：可選 **`--phase2-fail-on-gate-fail`**（**FAIL** → **exit 9**／**`E_PHASE2_GATE_FAIL`**）、**`--phase2-fail-on-gate-blocked`**（**BLOCKED** → **exit 10**／**`E_PHASE2_GATE_BLOCKED`**）；**`phase2_gate_report`** **failed** 時利於 **`--resume`** 重跑
+- [x] **Std gate（MVP）**：bundle 可選 **`phase2_pat_series_by_experiment`**（`track -> {exp_id: [PAT@1% 每窗]}`）；**`statistics.stdev`×100** 與 **`gate.max_std_pp_across_windows`** 比較；僅在 **uplift 已 PASS** 時 std 超標 → **`FAIL`**（**`phase2_std_exceeds_max_pp_across_windows`**）；否則 std 結果僅 **informational**
 
 **完成定義**
-- [ ] `phase2_gate_decision.md` 含勝者路線、淘汰理由、evidence
+- [x] **（現況）** `phase2_gate_decision.md` 含 gate status、blocking reasons、evidence 摘要（**尚無**勝者路線／uplift 數值，待 T10 metrics）
+- [ ] **（目標）** 含勝者路線、淘汰理由、可稽核 evidence（PAT／uplift 等）
 
 ---
 
@@ -218,7 +226,7 @@
 #### T12 - Phase 3 Config + Runner
 
 - [ ] `run_pipeline.py` 支援 `--phase phase3`
-- [ ] 新增 `orchestrator/config/run_phase3.yaml`
+- [x] 新增 `orchestrator/config/run_phase3.yaml`（**T16A 最小範例** + `config_loader.validate_phase3_config_minimal`；完整 T12 schema／runner 仍待）
 - [ ] 只允許 Phase 2 勝者路線作為輸入（避免全域盲試）
 - [ ] runner 支援特徵加深與集成消融工作流
 
@@ -246,7 +254,7 @@
 #### T14 - Phase 4 Config + Multi-window Runner
 
 - [ ] `run_pipeline.py` 支援 `--phase phase4`
-- [ ] 新增 `orchestrator/config/run_phase4.yaml`
+- [x] 新增 `orchestrator/config/run_phase4.yaml`（**T16A 最小範例** + `config_loader.validate_phase4_config_minimal`；完整 T14 schema／runner 仍待）
 - [ ] 支援 candidate freeze metadata 與多窗回放矩陣
 - [ ] runner 執行多窗回放並限制資源上限（避免 OOM/長跑失控）
 
@@ -272,7 +280,7 @@
 
 #### T16 - Multi-phase DAG 與 Gate-driven 流程控制
 
-- [ ] `run_pipeline.py` 支援 `--phase all`
+- [x] `run_pipeline.py` 支援 `--phase all`（**目前僅 `--dry-run`**，見 T16A；非 dry-run 長跑串接仍待下列項目）
 - [ ] 預設順序：phase1 -> phase2 -> phase3 -> phase4
 - [ ] Gate 未達時：
   - [ ] 預設 stop（可選 `--force-next`，但需高風險警告）
@@ -280,24 +288,24 @@
 
 #### T16A - All-phase dry-run（上線前必做）
 
-- [ ] `run_pipeline.py` 支援 `--phase all --dry-run`
-- [ ] dry-run 覆蓋 phase1~4 config schema、phase dependency、路徑可寫、CLI smoke
-- [ ] dry-run 輸出統一 `READY / NOT_READY` 與 blocking reasons
-- [ ] `run_state` 寫入 all-phase readiness 摘要（供 CI / 人工審核）
-- [ ] `run_full.yaml` 定義 checklist 欄位：
-  - [ ] `validate_phase_configs_exist`
-  - [ ] `validate_phase_schemas`
-  - [ ] `validate_phase_dependencies`
-  - [ ] `validate_contract_consistency`
-  - [ ] `validate_paths_readable`
-  - [ ] `validate_writable_targets`
-  - [ ] `validate_cli_smoke_per_phase`
-  - [ ] `validate_resource_limits`
-  - [ ] `fail_on_any_check`
+- [x] `run_pipeline.py` 支援 `--phase all --dry-run`（未帶 `--dry-run` 之 `--phase all` 回報 exit 2，直至 T16 長跑實作）
+- [x] dry-run 覆蓋 phase1~4：**phase1／2 完整 schema**；**phase3／4 為 minimal schema**（`validate_phase3_config_minimal`／`validate_phase4_config_minimal`，完整形狀見 T12／T14）、phase dependency、路徑可讀、可寫目標、CLI smoke（含 `validate_cli_smoke_per_phase` 與 `--skip-backtest-smoke` 互動）、resource limits
+- [x] dry-run 輸出統一 `READY`／`NOT_READY` 與 `blocking_reasons`（見 `run_all_phases_dry_run_readiness`）
+- [x] `run_state` 寫入 `phase: all`、`mode: dry_run`、`readiness`（含 checks／blocking／artifacts 摘要，供 CI／人工審核）
+- [x] `orchestrator/config/run_full.yaml` + `load_run_full_config`：可選 `dry_run` 區塊覆寫預設 checklist（預設鍵如下，SSOT：`config_loader.DRY_RUN_FLAG_DEFAULTS`）
+  - [x] `validate_phase_configs_exist`
+  - [x] `validate_phase_schemas`
+  - [x] `validate_phase_dependencies`
+  - [x] `validate_contract_consistency`
+  - [x] `validate_paths_readable`
+  - [x] `validate_writable_targets`
+  - [x] `validate_cli_smoke_per_phase`
+  - [x] `validate_resource_limits`
+  - [x] `fail_on_any_check`
 
 **完成定義**
-- [ ] 一條命令可完整跑完 all-phase（或在 gate block 點可恢復）
-- [ ] full run 前可先執行 all-phase dry-run，並明確得知是否可安全啟動長跑
+- [ ] 一條命令可**完整執行** all-phase 長跑（或在 gate block 點可恢復）— **屬 T16**，非 T16A
+- [x] full run 前可先執行 **`--phase all --dry-run`**，並以 `READY`／`NOT_READY` 得知是否通過靜態／preflight／smoke 關卡（**長跑本體仍須 T16 就緒**）
 
 ### V5 - 全自動 E2E（單一命令，零人工介入）
 
@@ -331,13 +339,16 @@
 
 ### 已完成
 - Day 1~3：T1~T8（Phase 1 MVP）
+- **T16A**（2026-04-10）：`--phase all --dry-run`、`run_full.yaml`、`run_state.readiness`、phase3／4 **minimal** 範例與驗證（見 STATUS 同日 CYCLE）
+- **T10 部分**（2026-04-10）：`collect_phase2_plan_bundle`、`job_specs`、`phase2_plan_bundle`；**`phase2_runner_smoke`**（mkdir + `trainer.trainer --help` 可選略過）；bundle 內 **`runner_smoke`**；**實驗訓練矩陣 subprocess** 與產物彙整仍待
+- **T11 部分**（2026-04-10）：`evaluate_phase2_gate`、`phase2_gate_report` 步驟、`phase2/phase2_gate_decision.md`（plan_only → **BLOCKED**；uplift gate 規則仍待 T10 指標）
 
 ### 下一輪建議
 - Sprint A0（3~5 天）：T8A~T8D（Phase 1 Autonomous 閉環）
-- Sprint A（3~5 天）：T9~T11（Phase 2）
+- Sprint A（3~5 天）：T9 ✅、**T10 進行中**（plan bundle ✅／runner 待）、**T11 進行中**（gate+gate md ✅／uplift 規則與 track 報表待）
 - Sprint B（3~5 天）：T12~T13（Phase 3）
 - Sprint C（3~5 天）：T14~T15（Phase 4）
-- Sprint D（2~3 天）：T16 + T16A（`--phase all` Gate 串接 + all-phase dry-run）
+- Sprint D（2~3 天）：**T16A ✅**；**T16** 剩餘（`--phase all` 非 dry-run Gate 串接、resume 到 phase 級）
 - Sprint E（2~4 天）：T17~T20（E2E autonomous 驗收與穩定性）
 
 ---
@@ -350,11 +361,12 @@
 - [x] `run_state` / `resume` / `dry-run` 可用
 
 ### Phase 2~4（待完成）
-- [x] `--phase phase2` 可獨立執行（T9：config 驗證 + preflight + `run_state` + `phase2_scaffold`；T10+ track runner／bundle／報表待補）
+- [x] `--phase phase2` 可獨立執行（T9：config + preflight + `run_state` + `phase2_scaffold`；T10：`phase2_bundle.json` + **`job_specs`** + **`phase2_runner_smoke`**（log 目錄 + 可選 `trainer.trainer --help`）；T11：gate + `phase2_gate_decision.md`；**實驗級訓練**、uplift gate 數值、各 track `.md` 仍待）
 - [ ] `--phase phase3|phase4` 可獨立執行
+- [x] **`--phase all --dry-run`** 可跑 all-phase readiness（T16A；含 phase3／4 **minimal** schema）
 - [ ] 每 phase 都有 config schema + preflight + collector + evaluator + report
 - [ ] 每 phase 都有明確錯誤碼與可追蹤 logs
-- [ ] `--phase all` 可 Gate-driven 串接，且可 resume
+- [ ] `--phase all` 可 Gate-driven **長跑**串接，且可 resume（T16；dry-run 已部分支援 `--resume` 跳過 preflight，見 orchestrator 實作）
 - [ ] 所有 phase 報告均含 run_id、window、model_version、evidence
 - [ ] autonomous mode 可無人工介入連跑 72~120h（含中斷恢復）
 - [ ] phase1 mid/final snapshot 由程式自動產生（不需手動補檔）
@@ -363,6 +375,9 @@
 
 ## 5. 開發注意事項（全階段）
 
+- 範例組態（如 `orchestrator/config/run_phase2.yaml`）內 **`model_dir` 須為本機存在的目錄**、`state_db_path`／`prediction_log_db_path` 須為可開啟的 SQLite 檔；否則 preflight 失敗（路徑錯誤非 orchestrator bug）。
+- 解讀 `phase2_bundle.json` 時必看 **`status`**：`plan_only` 僅代表實驗清單由 YAML 展開，**不代表** track 訓練已完成。
+- Phase 2 預設在 `phase2_runner_smoke` 會跑 **`python -m trainer.trainer --help`**（冷啟動可能較慢）；受限環境可 **`--skip-phase2-trainer-smoke`**（仍會建立各 job 的 log 目錄）。
 - 先以小矩陣/短窗 smoke，再擴到正式觀測窗
 - 任何 phase 都要固定 run 契約，禁止中途漂移
 - 大檔優先 parquet；避免一次載入全量資料到記憶體

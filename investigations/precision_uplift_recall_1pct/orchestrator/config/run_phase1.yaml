@@ -4,9 +4,9 @@
 #   backtest_skip_optuna: true
 #   backtest_extra_args: []  # extra CLI tokens for trainer.backtester
 #   backtest_metrics_path: trainer/out_backtest/backtest_metrics.json
-model_dir: trainer/models
-state_db_path: trainer/local_state/state.db
-prediction_log_db_path: trainer/local_state/prediction_log.db
+model_dir: out/models/20260408-173809-e472fd0/
+state_db_path: local_state/state.db
+prediction_log_db_path: local_state/prediction_log.db
 
 window:
   start_ts: "2026-01-01T00:00:00+08:00"

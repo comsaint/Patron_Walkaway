@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Mapping
 from unittest import mock
 
 import pytest
@@ -197,6 +198,59 @@ def test_phase2_config_run_id_mismatch_raises() -> None:
         config_loader.validate_phase2_config(raw, cli_run_id="cli_rid")
 
 
+def test_phase2_gate_cli_exit_code_when_disabled() -> None:
+    """Without --phase2-fail-on-gate-fail policy, CLI helper returns None."""
+    assert (
+        run_pipeline.phase2_gate_cli_exit_code({"status": "FAIL"}, fail_on_gate_fail=False)
+        is None
+    )
+
+
+def test_phase2_gate_cli_exit_code_on_fail_enabled() -> None:
+    """With fail policy, FAIL status maps to exit code 9."""
+    assert (
+        run_pipeline.phase2_gate_cli_exit_code({"status": "FAIL"}, fail_on_gate_fail=True)
+        == 9
+    )
+
+
+def test_phase2_gate_cli_exit_code_pass_and_blocked_unchanged() -> None:
+    """PASS and BLOCKED never request exit 9 from this helper."""
+    assert (
+        run_pipeline.phase2_gate_cli_exit_code({"status": "PASS"}, fail_on_gate_fail=True)
+        is None
+    )
+    assert (
+        run_pipeline.phase2_gate_cli_exit_code(
+            {"status": "BLOCKED"}, fail_on_gate_fail=True
+        )
+        is None
+    )
+
+
+def test_phase2_gate_cli_exit_code_blocked_exit_10() -> None:
+    """With blocked policy, BLOCKED maps to exit 10."""
+    assert (
+        run_pipeline.phase2_gate_cli_exit_code(
+            {"status": "BLOCKED"},
+            fail_on_gate_blocked=True,
+        )
+        == 10
+    )
+
+
+def test_phase2_gate_cli_fail_precedes_blocked_when_both_flags() -> None:
+    """FAIL returns 9 before BLOCKED would apply when both policies are on."""
+    assert (
+        run_pipeline.phase2_gate_cli_exit_code(
+            {"status": "FAIL"},
+            fail_on_gate_fail=True,
+            fail_on_gate_blocked=True,
+        )
+        == 9
+    )
+
+
 def test_build_phase2_input_summary_fingerprint_stable() -> None:
     """Phase 2 fingerprint changes when gate thresholds change."""
     model_dir = "/models"
@@ -318,6 +372,7 @@ def test_run_pipeline_phase2_scaffold_writes_run_state(tmp_path: Path) -> None:
             "--run-id",
             run_id,
             "--skip-backtest-smoke",
+            "--skip-phase2-trainer-smoke",
         ],
         cwd=_REPO_ROOT,
         capture_output=True,
@@ -330,6 +385,2058 @@ def test_run_pipeline_phase2_scaffold_writes_run_state(tmp_path: Path) -> None:
     assert data["phase"] == "phase2"
     assert data["steps"]["preflight"]["status"] == "success"
     assert data["steps"]["phase2_scaffold"]["status"] == "success"
+    assert data["steps"]["phase2_plan_bundle"]["status"] == "success"
+    assert data["steps"]["phase2_runner_smoke"]["status"] == "success"
+    bundle_path = _ORCHESTRATOR / "state" / run_id / "phase2_bundle.json"
+    assert bundle_path.is_file()
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert bundle.get("bundle_kind") == "phase2_plan_v1"
+    assert bundle.get("status") == "plan_only"
+    rs = bundle.get("runner_smoke")
+    assert isinstance(rs, dict)
+    assert rs.get("log_dirs_ok") is True
+    assert rs.get("trainer_help_skipped") is True
+    assert data.get("phase2_collect", {}).get("plan_experiment_slots", 0) >= 1
+    assert data.get("phase2_collect", {}).get("runner_trainer_help_skipped") is True
+    assert data["steps"]["phase2_gate_report"]["status"] == "success"
+    assert data["phase2_gate_decision"]["status"] == "BLOCKED"
+    gate_md = _ORCHESTRATOR.parent / "phase2" / "phase2_gate_decision.md"
+    assert gate_md.is_file()
+    text = gate_md.read_text(encoding="utf-8")
+    assert "phase2_bundle_plan_only_no_track_metrics" in text
+
+
+def test_evaluate_phase2_gate_plan_only_blocked() -> None:
+    """plan_only bundle must not pass Phase 2 gate."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    b = collectors.collect_phase2_plan_bundle("r", cfg)
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "BLOCKED"
+    assert "phase2_bundle_plan_only_no_track_metrics" in g["blocking_reasons"]
+
+
+def test_evaluate_phase2_gate_errors_fail() -> None:
+    """Non-empty collector errors in bundle → FAIL."""
+    b = {
+        "status": "plan_only",
+        "errors": [{"code": "E_TEST", "message": "x"}],
+        "experiments_index": [],
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "FAIL"
+    assert "E_TEST" in g["blocking_reasons"]
+
+
+def test_evaluate_phase2_gate_unsupported_status_blocked() -> None:
+    g = evaluators.evaluate_phase2_gate({"status": "unknown", "errors": []})
+    assert g["status"] == "BLOCKED"
+    assert "phase2_gate_unsupported_bundle_status" in g["blocking_reasons"]
+
+
+def test_collect_phase2_plan_bundle_deterministic_json() -> None:
+    """Same phase2 config + run_id yields identical canonical JSON (plan_only reproducibility)."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    b1 = collectors.collect_phase2_plan_bundle("same_run", cfg)
+    b2 = collectors.collect_phase2_plan_bundle("same_run", cfg)
+    s1 = json.dumps(b1, sort_keys=True, separators=(",", ":"), default=str)
+    s2 = json.dumps(b2, sort_keys=True, separators=(",", ":"), default=str)
+    assert s1 == s2
+
+
+def test_collect_phase2_plan_bundle_shape() -> None:
+    """Plan bundle lists experiments in stable track order."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    b = collectors.collect_phase2_plan_bundle("rid", cfg)
+    assert b["bundle_kind"] == "phase2_plan_v1"
+    assert b["status"] == "plan_only"
+    assert b["run_id"] == "rid"
+    tracks = b["tracks"]
+    assert tracks["track_a"]["enabled"] is True
+    assert len(tracks["track_a"]["experiments"]) == 1
+    idx = b["experiments_index"]
+    assert all("track" in e and "exp_id" in e for e in idx)
+    summ = collectors.collect_summary_phase2_plan_for_run_state(b)
+    assert summ["plan_experiment_slots"] == len(idx)
+    assert summ["plan_experiments_active"] >= 1
+    jobs = b["job_specs"]
+    assert isinstance(jobs, list) and len(jobs) == summ["plan_experiments_active"]
+    assert summ["job_specs_count"] == len(jobs)
+    assert summ.get("job_specs_training_metrics_hint_count") == 0
+    orch_rel = _ORCHESTRATOR.relative_to(_REPO_ROOT)
+    assert jobs[0]["logs_subdir_relative"].startswith(
+        f"{orch_rel.as_posix()}/state/rid/logs/phase2/"
+    )
+
+
+def test_ensure_phase2_job_log_dirs_creates(tmp_path: Path) -> None:
+    """Log dir paths from job_specs are created under repo root."""
+    orch_rel = _ORCHESTRATOR.relative_to(_REPO_ROOT)
+    rel_log = orch_rel / "state" / "rid" / "logs" / "phase2" / "track_a" / "e0"
+    specs = [
+        {
+            "track": "track_a",
+            "exp_id": "e0",
+            "logs_subdir_relative": rel_log.as_posix(),
+        }
+    ]
+    ok, msg = runner.ensure_phase2_job_log_dirs(tmp_path, specs)
+    assert ok, msg
+    d = tmp_path / rel_log
+    assert d.is_dir()
+
+
+def test_build_phase2_trainer_argv_skip_optuna() -> None:
+    """Argv includes window and --skip-optuna when resources say so."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    bundle = collectors.collect_phase2_plan_bundle("rid", cfg)
+    argv, unapplied = runner.build_phase2_trainer_argv(
+        bundle, track="track_a", exp_id="a0", python_exe="/x/python"
+    )
+    assert argv[:3] == ["/x/python", "-m", "trainer.trainer"]
+    assert "--start" in argv and "--end" in argv
+    i0 = argv.index("--start")
+    assert argv[i0 + 1] == "2026-01-01T00:00:00+08:00"
+    i1 = argv.index("--end")
+    assert argv[i1 + 1] == "2026-01-08T00:00:00+08:00"
+    assert "--skip-optuna" in argv
+    assert unapplied == []
+
+
+def test_build_phase2_trainer_argv_unapplied_overrides() -> None:
+    """YAML overrides are listed until wired to trainer CLI."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    cfg["tracks"]["track_a"]["experiments"] = [
+        {"exp_id": "a0", "overrides": {"hard_negative_weight": 2.0}}
+    ]
+    bundle = collectors.collect_phase2_plan_bundle("rid", cfg)
+    _, unapplied = runner.build_phase2_trainer_argv(
+        bundle, track="track_a", exp_id="a0", python_exe=sys.executable
+    )
+    assert unapplied == ["hard_negative_weight"]
+
+
+def test_build_phase2_trainer_argv_use_local_parquet() -> None:
+    """resources.trainer_use_local_parquet adds --use-local-parquet."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    cfg["resources"]["trainer_use_local_parquet"] = True
+    bundle = collectors.collect_phase2_plan_bundle("rid", cfg)
+    argv, _ = runner.build_phase2_trainer_argv(
+        bundle, track="track_a", exp_id="a0", python_exe="/py"
+    )
+    assert "--use-local-parquet" in argv
+
+
+def test_run_phase2_trainer_jobs_invalid_spec(tmp_path: Path) -> None:
+    """Invalid job_spec entries yield ok=False without spawning."""
+    bundle = {
+        "common": {
+            "window": {
+                "start_ts": "2026-01-01T00:00:00+08:00",
+                "end_ts": "2026-01-02T00:00:00+08:00",
+            }
+        },
+        "resources": {"backtest_skip_optuna": True},
+        "tracks": {},
+        "job_specs": [
+            {"track": "", "exp_id": "e", "logs_subdir_relative": "logs/a"},
+        ],
+    }
+    ok, msg, res = runner.run_phase2_trainer_jobs(tmp_path, bundle)
+    assert ok is False
+    assert msg and "invalid job_spec" in msg
+    assert len(res) == 1
+    assert res[0].get("ok") is False
+    assert res[0].get("inferred_training_metrics_repo_relative") is None
+
+
+def test_run_phase2_trainer_jobs_empty_job_specs(tmp_path: Path) -> None:
+    """Missing or empty job_specs is a no-op success."""
+    ok, msg, res = runner.run_phase2_trainer_jobs(tmp_path, {"job_specs": []})
+    assert ok is True and msg is None and res == []
+    ok2, msg2, res2 = runner.run_phase2_trainer_jobs(tmp_path, {})
+    assert ok2 is True and msg2 is None and res2 == []
+
+
+def test_infer_training_metrics_repo_relative_from_trainer_logs_stderr(
+    tmp_path: Path,
+) -> None:
+    """Parser finds trainer 'Artifacts saved to' line in stderr tail."""
+    bundle_dir = tmp_path / "out" / "models" / "v1"
+    bundle_dir.mkdir(parents=True)
+    err = tmp_path / "job.stderr.log"
+    err.write_text(
+        f"noise\nINFO trainer: Artifacts saved to {bundle_dir.resolve()}  (version=abc)\n",
+        encoding="utf-8",
+    )
+    got = runner.infer_training_metrics_repo_relative_from_trainer_logs(
+        tmp_path,
+        stdout_path=tmp_path / "missing.stdout",
+        stderr_path=err,
+    )
+    assert got == "out/models/v1"
+
+
+def test_infer_training_metrics_repo_relative_uses_last_match(tmp_path: Path) -> None:
+    """When multiple saves appear in the tail, use the last match."""
+    old = tmp_path / "out" / "models" / "old"
+    new = tmp_path / "out" / "models" / "new"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    err = tmp_path / "t.log"
+    err.write_text(
+        f"A Artifacts saved to {old.resolve()}  (version=o)\n"
+        f"B Artifacts saved to {new.resolve()}  (version=n)\n",
+        encoding="utf-8",
+    )
+    got = runner.infer_training_metrics_repo_relative_from_trainer_logs(
+        tmp_path,
+        stdout_path=tmp_path / "x",
+        stderr_path=err,
+    )
+    assert got == "out/models/new"
+
+
+def test_infer_training_metrics_repo_relative_outside_repo_returns_none(
+    tmp_path: Path,
+) -> None:
+    """Absolute artifact path outside repo_root yields None."""
+    err = tmp_path / "e.log"
+    err.write_text(
+        "Artifacts saved to /this/path/is/not/under/repo  (version=z)\n",
+        encoding="utf-8",
+    )
+    assert (
+        runner.infer_training_metrics_repo_relative_from_trainer_logs(
+            tmp_path,
+            stdout_path=tmp_path / "s",
+            stderr_path=err,
+        )
+        is None
+    )
+
+
+def test_merge_inferred_training_metrics_paths_into_phase2_bundle_fills_specs(
+    tmp_path: Path,
+) -> None:
+    """Successful trainer results backfill job_specs when YAML did not set path."""
+    bundle_dir = tmp_path / "m" / "run"
+    bundle_dir.mkdir(parents=True)
+    rel = bundle_dir.relative_to(tmp_path).as_posix()
+    p2: dict = {
+        "job_specs": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "logs_subdir_relative": "logs/a",
+            }
+        ],
+        "trainer_jobs": {
+            "results": [
+                {
+                    "track": "track_a",
+                    "exp_id": "a0",
+                    "ok": True,
+                    "inferred_training_metrics_repo_relative": rel,
+                }
+            ]
+        },
+    }
+    runner.merge_inferred_training_metrics_paths_into_phase2_bundle(p2, tmp_path)
+    assert p2["job_specs"][0]["training_metrics_repo_relative"] == rel
+
+
+def test_merge_inferred_training_metrics_paths_does_not_override_yaml(
+    tmp_path: Path,
+) -> None:
+    """Explicit training_metrics_repo_relative on job_spec is preserved."""
+    p2: dict = {
+        "job_specs": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "logs_subdir_relative": "logs/a",
+                "training_metrics_repo_relative": "yaml/wins",
+            }
+        ],
+        "trainer_jobs": {
+            "results": [
+                {
+                    "track": "track_a",
+                    "exp_id": "a0",
+                    "ok": True,
+                    "inferred_training_metrics_repo_relative": "infer/loses",
+                }
+            ]
+        },
+    }
+    runner.merge_inferred_training_metrics_paths_into_phase2_bundle(p2, tmp_path)
+    assert p2["job_specs"][0]["training_metrics_repo_relative"] == "yaml/wins"
+
+
+def test_phase2_bundle_trainer_jobs_skipped_after_pipeline(tmp_path: Path) -> None:
+    """Default phase2 run records trainer_jobs.executed=false in bundle."""
+    run_id = "pytest_phase2_trainer_jobs_skipped"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+    cfg_file = tmp_path / "p2tj.yaml"
+    cfg_file.write_text(
+        yaml.safe_dump(
+            _minimal_phase2_dict(
+                model_dir=str(model_dir),
+                state_db=str(state_db),
+                pred_db=str(pred_db),
+            )
+        ),
+        encoding="utf-8",
+    )
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    bundle_path = _ORCHESTRATOR / "state" / run_id / "phase2_bundle.json"
+    for p in (state_json, bundle_path):
+        if p.is_file():
+            p.unlink()
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_RUN_PIPELINE),
+            "--phase",
+            "phase2",
+            "--config",
+            str(cfg_file),
+            "--run-id",
+            run_id,
+            "--skip-backtest-smoke",
+            "--skip-phase2-trainer-smoke",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(bundle_path.read_text(encoding="utf-8"))
+    tj = data.get("trainer_jobs")
+    assert isinstance(tj, dict)
+    assert tj.get("executed") is False
+    assert tj.get("skip_reason")
+    assert tj.get("results") == []
+
+
+def test_phase2_resume_skips_completed_trainer_jobs(tmp_path: Path) -> None:
+    """Second --resume should skip phase2_trainer_jobs when step already success."""
+    run_id = "pytest_phase2_resume_trainer_skip"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+    cfg_file = tmp_path / "p2tjskip.yaml"
+    cfg_file.write_text(
+        yaml.safe_dump(
+            _minimal_phase2_dict(
+                model_dir=str(model_dir),
+                state_db=str(state_db),
+                pred_db=str(pred_db),
+            )
+        ),
+        encoding="utf-8",
+    )
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    if state_json.is_file():
+        state_json.unlink()
+    argv = [
+        sys.executable,
+        str(_RUN_PIPELINE),
+        "--phase",
+        "phase2",
+        "--config",
+        str(cfg_file),
+        "--run-id",
+        run_id,
+        "--skip-backtest-smoke",
+        "--skip-phase2-trainer-smoke",
+    ]
+    proc1 = subprocess.run(argv, cwd=_REPO_ROOT, capture_output=True, text=True, check=False)
+    assert proc1.returncode == 0, proc1.stderr
+    t1 = json.loads(state_json.read_text(encoding="utf-8"))["steps"]["phase2_trainer_jobs"][
+        "finished_at"
+    ]
+    proc2 = subprocess.run(
+        argv + ["--resume"], cwd=_REPO_ROOT, capture_output=True, text=True, check=False
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    t2 = json.loads(state_json.read_text(encoding="utf-8"))["steps"]["phase2_trainer_jobs"][
+        "finished_at"
+    ]
+    assert t1 == t2
+
+
+def test_phase2_cfg_to_backtest_cfg_maps_window_and_skip_optuna() -> None:
+    """phase2_cfg_to_backtest_cfg feeds run_phase1_backtest."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    bt = run_pipeline.phase2_cfg_to_backtest_cfg(cfg)
+    assert bt["model_dir"] == "m"
+    assert bt["window"]["start_ts"] == "2026-01-01T00:00:00+08:00"
+    assert bt["backtest_skip_optuna"] is True
+
+
+def test_run_phase1_backtest_includes_output_dir_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Optional cfg backtest_output_dir maps to trainer.backtester --output-dir."""
+    captured: list[list[str]] = []
+
+    def fake_logged(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        captured.append(list(argv))
+        log_dir = kwargs["log_dir"]
+        return {
+            "ok": True,
+            "returncode": 0,
+            "stdout_path": log_dir / "backtest.stdout.log",
+            "stderr_path": log_dir / "backtest.stderr.log",
+            "stdout_text": "",
+            "stderr_text": "",
+            "combined_text": "",
+            "error_code": None,
+            "message": None,
+        }
+
+    monkeypatch.setattr(runner, "run_logged_command", fake_logged)
+    (tmp_path / "m").mkdir()
+    out_d = tmp_path / "bt_out"
+    out_d.mkdir()
+    cfg = {
+        "model_dir": "m",
+        "window": {
+            "start_ts": "2026-01-01T00:00:00+08:00",
+            "end_ts": "2026-01-08T00:00:00+08:00",
+        },
+        "state_db_path": "s.db",
+        "prediction_log_db_path": "p.db",
+        "backtest_skip_optuna": True,
+        "backtest_output_dir": str(out_d),
+    }
+    log_d = tmp_path / "logs"
+    log_d.mkdir()
+    res = runner.run_phase1_backtest(tmp_path, cfg, log_d)
+    assert res.get("ok") is True
+    argv = captured[0]
+    idx = argv.index("--output-dir")
+    assert Path(argv[idx + 1]).resolve() == out_d.resolve()
+
+
+def test_phase2_shared_backtest_logs_subdir_relative() -> None:
+    """Shared backtest logs live under investigation orchestrator state."""
+    rel = collectors.phase2_shared_backtest_logs_subdir_relative("my_run")
+    orch_rel = _ORCHESTRATOR.relative_to(_REPO_ROOT)
+    assert rel == f"{orch_rel.as_posix()}/state/my_run/logs/phase2/_shared_backtest"
+
+
+def test_run_phase2_example_yaml_documents_phase2_gate_contract() -> None:
+    """Example run_phase2.yaml keeps gate keys and per-job / std bundle hints documented."""
+    p = (
+        _REPO_ROOT
+        / "investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase2.yaml"
+    )
+    text = p.read_text(encoding="utf-8")
+    assert "min_uplift_pp_vs_baseline:" in text
+    assert "max_std_pp_across_windows:" in text
+    assert "phase2_pat_series_by_experiment" in text
+    assert "_per_job_backtest" in text
+    assert "evaluate_phase2_gate" in text
+
+
+def test_plan_precision_uplift_sprint_phase2_gate_orchestrator_bridge() -> None:
+    """Sprint plan documents how Phase 2 Gate maps to the investigation orchestrator."""
+    plan = _REPO_ROOT / ".cursor/plans/PLAN_precision_uplift_sprint.md"
+    text = plan.read_text(encoding="utf-8")
+    assert "evaluate_phase2_gate" in text
+    assert "min_uplift_pp_vs_baseline" in text
+    assert "max_std_pp_across_windows" in text
+
+
+def test_phase2_per_job_backtest_metrics_repo_relative() -> None:
+    """Per-job metrics JSON sits under _per_job_backtest next to subprocess logs."""
+    orch_rel = _ORCHESTRATOR.relative_to(_REPO_ROOT)
+    rel = collectors.phase2_per_job_backtest_metrics_repo_relative(
+        "r1", "track_a", "exp0"
+    )
+    assert rel.endswith("/_per_job_backtest/backtest_metrics.json")
+    assert rel.startswith(f"{orch_rel.as_posix()}/state/r1/logs/phase2/track_a/exp0")
+
+
+def test_load_json_under_repo_ok(tmp_path: Path) -> None:
+    """load_json_under_repo reads JSON object under repo root."""
+    p = tmp_path / "sub" / "a.json"
+    p.parent.mkdir(parents=True)
+    p.write_text('{"k": 1}', encoding="utf-8")
+    obj, err = collectors.load_json_under_repo(tmp_path, "sub/a.json")
+    assert err is None and obj == {"k": 1}
+
+
+def test_load_json_under_repo_missing(tmp_path: Path) -> None:
+    obj, err = collectors.load_json_under_repo(tmp_path, "nope.json")
+    assert obj is None and err and "file not found" in err
+
+
+def test_harvest_phase2_job_training_metrics_empty_specs(tmp_path: Path) -> None:
+    """Non-list job_specs yields no harvest rows."""
+    assert collectors.harvest_phase2_job_training_metrics(tmp_path, {"job_specs": None}) == []
+
+
+def test_harvest_phase2_job_training_metrics_missing_logs_subdir(tmp_path: Path) -> None:
+    """Job spec without logs_subdir_relative records load_error."""
+    bundle = {"job_specs": [{"track": "track_a", "exp_id": "a0"}]}
+    rows = collectors.harvest_phase2_job_training_metrics(tmp_path, bundle)
+    assert len(rows) == 1
+    assert rows[0]["found"] is False
+    assert "logs_subdir_relative" in (rows[0].get("load_error") or "")
+
+
+def test_harvest_phase2_job_training_metrics_found_and_invalid_json(tmp_path: Path) -> None:
+    """Harvest loads valid JSON and surfaces invalid JSON as not found."""
+    d_ok = tmp_path / "logs" / "track_a" / "a0"
+    d_ok.mkdir(parents=True)
+    (d_ok / "training_metrics.json").write_text('{"auc": 0.9}', encoding="utf-8")
+    rel_ok = d_ok.relative_to(tmp_path).as_posix()
+
+    d_bad = tmp_path / "logs" / "track_b" / "b0"
+    d_bad.mkdir(parents=True)
+    (d_bad / "training_metrics.json").write_text("{", encoding="utf-8")
+    rel_bad = d_bad.relative_to(tmp_path).as_posix()
+
+    bundle = {
+        "job_specs": [
+            {"track": "track_a", "exp_id": "a0", "logs_subdir_relative": rel_ok},
+            {"track": "track_b", "exp_id": "b0", "logs_subdir_relative": rel_bad},
+        ]
+    }
+    rows = collectors.harvest_phase2_job_training_metrics(tmp_path, bundle)
+    assert len(rows) == 2
+    assert rows[0]["found"] is True
+    assert rows[0]["training_metrics"] == {"auc": 0.9}
+    assert rows[1]["found"] is False
+    assert rows[1]["training_metrics"] is None
+    assert "invalid JSON" in (rows[1].get("load_error") or "")
+
+
+def test_trainer_artifacts_saved_log_line_contract_for_orchestrator() -> None:
+    """Trainer save_artifact_bundle must keep logger.info shape expected by runner regex."""
+    trainer_py = _REPO_ROOT / "trainer" / "training" / "trainer.py"
+    src = trainer_py.read_text(encoding="utf-8")
+    assert runner.TRAINER_ARTIFACTS_SAVED_LOGGER_INFO_FORMAT in src
+
+
+def test_collect_summary_phase2_plan_counts_training_metrics_hints() -> None:
+    """job_specs_training_metrics_hint_count reflects non-empty training_metrics_repo_relative."""
+    b: dict = {
+        "bundle_kind": "phase2_plan_v1",
+        "experiments_index": [],
+        "job_specs": [
+            {"track": "track_a", "exp_id": "e1"},
+            {
+                "track": "track_b",
+                "exp_id": "e2",
+                "training_metrics_repo_relative": "out/models/run1",
+            },
+        ],
+    }
+    s = collectors.collect_summary_phase2_plan_for_run_state(b)
+    assert s.get("job_specs_training_metrics_hint_count") == 1
+
+
+def test_collect_summary_phase2_plan_includes_job_training_harvest() -> None:
+    """phase2_collect summary counts harvest rows and found files."""
+    b: dict = {
+        "bundle_kind": "phase2_plan_v1",
+        "tracks": {"track_a": {"enabled": True}},
+        "job_specs": [{"exp_id": "a0", "track": "track_a"}],
+        "job_training_harvest": {
+            "rows": [{"found": True}, {"found": False}, {"found": True}],
+        },
+    }
+    s = collectors.collect_summary_phase2_plan_for_run_state(b)
+    assert s.get("job_training_harvest_rows") == 3
+    assert s.get("job_training_harvest_found") == 2
+
+
+def test_collect_summary_phase2_plan_includes_per_job_backtest_jobs() -> None:
+    """phase2_collect summary exposes per_job_backtest_jobs execution flags."""
+    b: dict = {
+        "bundle_kind": "phase2_plan_v1",
+        "job_specs": [],
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [{"ok": True}, {"ok": True}],
+        },
+    }
+    s = collectors.collect_summary_phase2_plan_for_run_state(b)
+    assert s.get("per_job_backtest_jobs_executed") is True
+    assert s.get("per_job_backtest_jobs_all_ok") is True
+    assert s.get("per_job_backtest_jobs_count") == 2
+
+
+def test_model_bundle_dir_from_training_metrics_hint_file_and_directory(
+    tmp_path: Path,
+) -> None:
+    """Hint may be training_metrics.json path or bundle directory."""
+    d = tmp_path / "bundle"
+    d.mkdir()
+    tm = d / "training_metrics.json"
+    tm.write_text("{}", encoding="utf-8")
+    rel_tm = tm.relative_to(tmp_path).as_posix()
+    rel_d = d.relative_to(tmp_path).as_posix()
+    p1, e1 = collectors.model_bundle_dir_from_training_metrics_hint(tmp_path, rel_tm)
+    assert e1 is None and p1 == d.resolve()
+    p2, e2 = collectors.model_bundle_dir_from_training_metrics_hint(tmp_path, rel_d)
+    assert e2 is None and p2 == d.resolve()
+
+
+def test_run_phase2_per_job_backtests_skips_without_hint(tmp_path: Path) -> None:
+    """Jobs with no training_metrics_repo_relative are skipped and do not fail the batch."""
+    bundle = {
+        "job_specs": [
+            {"track": "track_a", "exp_id": "a0"},
+            {"track": "track_b", "exp_id": "b0", "training_metrics_repo_relative": ""},
+        ],
+        "resources": {},
+    }
+    template = {
+        "model_dir": "common",
+        "window": {"start_ts": "2026-01-01T00:00:00+08:00", "end_ts": "2026-01-08T00:00:00+08:00"},
+        "backtest_skip_optuna": True,
+    }
+    ok, err, rows = runner.run_phase2_per_job_backtests(
+        tmp_path, bundle, template, run_id="rid"
+    )
+    assert ok and err is None
+    assert len(rows) == 2
+    assert all(r.get("skipped") for r in rows)
+
+
+def test_run_phase2_per_job_backtests_resolves_model_dir_and_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-job backtest uses resolved bundle dir and records PAT@1% preview from metrics JSON."""
+    bundle_dir = tmp_path / "mbundle"
+    bundle_dir.mkdir()
+    (bundle_dir / "training_metrics.json").write_text("{}", encoding="utf-8")
+    hint = bundle_dir.relative_to(tmp_path).as_posix()
+    bundle = {
+        "job_specs": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "training_metrics_repo_relative": hint,
+            }
+        ],
+        "resources": {},
+    }
+    template = {
+        "model_dir": "ignored",
+        "window": {"start_ts": "2026-01-01T00:00:00+08:00", "end_ts": "2026-01-08T00:00:00+08:00"},
+        "backtest_skip_optuna": True,
+    }
+    captured: list[str] = []
+    captured_out: list[str | None] = []
+    rel_log = collectors.phase2_per_job_backtest_logs_subdir_relative(
+        "rid", "track_a", "a0"
+    )
+    expect_out = str((tmp_path / rel_log).resolve())
+
+    def fake_bt(
+        repo_root: Path,
+        cfg: Mapping[str, Any],
+        log_dir: Path,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        captured.append(str(Path(cfg["model_dir"]).resolve()))
+        captured_out.append(cfg.get("backtest_output_dir"))
+        return {
+            "ok": True,
+            "returncode": 0,
+            "stdout_path": log_dir / "backtest.stdout.log",
+            "stderr_path": log_dir / "backtest.stderr.log",
+        }
+
+    monkeypatch.setattr(runner, "run_phase1_backtest", fake_bt)
+
+    seen_metrics_paths: list[str] = []
+
+    def fake_load(
+        repo_root: Path, rel_path: str
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        seen_metrics_paths.append(rel_path)
+        return (
+            {"model_default": {"test_precision_at_recall_0.01": 0.42}},
+            None,
+        )
+
+    monkeypatch.setattr(collectors, "load_json_under_repo", fake_load)
+    ok, err, rows = runner.run_phase2_per_job_backtests(
+        tmp_path, bundle, template, run_id="rid", python_exe=sys.executable
+    )
+    assert ok and err is None
+    assert len(rows) == 1
+    assert captured == [str(bundle_dir.resolve())]
+    assert captured_out == [expect_out]
+    expect_m = collectors.phase2_per_job_backtest_metrics_repo_relative(
+        "rid", "track_a", "a0"
+    )
+    assert seen_metrics_paths == [expect_m]
+    assert rows[0].get("metrics_repo_relative") == expect_m
+    assert rows[0].get("shared_precision_at_recall_1pct_preview") == pytest.approx(0.42)
+
+
+def test_phase2_config_training_metrics_repo_relative_empty_raises() -> None:
+    """Whitespace-only training_metrics_repo_relative must fail validation."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["tracks"]["track_a"]["experiments"][0]["training_metrics_repo_relative"] = "   "
+    with pytest.raises(
+        config_loader.ConfigValidationError, match="training_metrics_repo_relative"
+    ):
+        config_loader.validate_phase2_config(raw, cli_run_id="rid")
+
+
+def test_phase2_config_training_metrics_repo_relative_non_string_raises() -> None:
+    """training_metrics_repo_relative must be a string when set."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["tracks"]["track_a"]["experiments"][0]["training_metrics_repo_relative"] = 1
+    with pytest.raises(
+        config_loader.ConfigValidationError, match="training_metrics_repo_relative"
+    ):
+        config_loader.validate_phase2_config(raw, cli_run_id="rid")
+
+
+def test_phase2_config_precision_at_recall_by_window_empty_raises() -> None:
+    """precision_at_recall_1pct_by_window must be non-empty list when set."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["tracks"]["track_a"]["experiments"][0][
+        "precision_at_recall_1pct_by_window"
+    ] = []
+    with pytest.raises(
+        config_loader.ConfigValidationError,
+        match="precision_at_recall_1pct_by_window",
+    ):
+        config_loader.validate_phase2_config(raw, cli_run_id="rid")
+
+
+def test_phase2_config_precision_at_recall_by_window_non_numeric_raises() -> None:
+    """precision_at_recall_1pct_by_window entries must be numeric."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["tracks"]["track_a"]["experiments"][0][
+        "precision_at_recall_1pct_by_window"
+    ] = [0.5, "x"]
+    with pytest.raises(
+        config_loader.ConfigValidationError,
+        match="precision_at_recall_1pct_by_window\\[1\\]",
+    ):
+        config_loader.validate_phase2_config(raw, cli_run_id="rid")
+
+
+def test_collect_phase2_plan_bundle_propagates_training_metrics_repo_relative() -> None:
+    """Optional experiment path appears on job_specs and tracks snapshot."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["tracks"]["track_a"]["experiments"][0][
+        "training_metrics_repo_relative"
+    ] = "out/models/run1"
+    cfg = config_loader.validate_phase2_config(raw, cli_run_id="rid")
+    b = collectors.collect_phase2_plan_bundle("rid", cfg)
+    spec_a0 = next(s for s in b["job_specs"] if s.get("exp_id") == "a0")
+    assert spec_a0.get("training_metrics_repo_relative") == "out/models/run1"
+    exp0 = b["tracks"]["track_a"]["experiments"][0]
+    assert exp0.get("training_metrics_repo_relative") == "out/models/run1"
+    summ = collectors.collect_summary_phase2_plan_for_run_state(b)
+    assert summ.get("job_specs_training_metrics_hint_count") == 1
+
+
+def test_collect_phase2_plan_bundle_propagates_precision_at_recall_by_window() -> None:
+    """Optional per-experiment PAT@1% series fills bundle phase2_pat_series_by_experiment."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["tracks"]["track_a"]["experiments"][0][
+        "precision_at_recall_1pct_by_window"
+    ] = [0.5, 0.51, 0.505]
+    cfg = config_loader.validate_phase2_config(raw, cli_run_id="rid")
+    b = collectors.collect_phase2_plan_bundle("rid", cfg)
+    exp0 = b["tracks"]["track_a"]["experiments"][0]
+    assert exp0.get("precision_at_recall_1pct_by_window") == [
+        0.5,
+        0.51,
+        0.505,
+    ]
+    assert b["phase2_pat_series_by_experiment"]["track_a"]["a0"] == [
+        0.5,
+        0.51,
+        0.505,
+    ]
+
+
+def test_build_phase2_pat_series_from_plan_tracks_coerces_numeric() -> None:
+    """Plan helper skips non-coercible list elements (config should already validate)."""
+    tracks = {
+        "track_a": {
+            "enabled": True,
+            "experiments": [
+                {"exp_id": "a0", "precision_at_recall_1pct_by_window": [0.1, 0.2]},
+            ],
+        },
+    }
+    got = collectors.build_phase2_pat_series_from_plan_tracks(tracks)
+    assert got["track_a"]["a0"] == [0.1, 0.2]
+
+
+def test_harvest_prefers_training_metrics_repo_relative_over_logs(tmp_path: Path) -> None:
+    """YAML hint wins over logs_subdir_relative/training_metrics.json."""
+    log_dir = tmp_path / "logs" / "track_a" / "a0"
+    log_dir.mkdir(parents=True)
+    (log_dir / "training_metrics.json").write_text('{"from": "logs"}', encoding="utf-8")
+    alt_dir = tmp_path / "out" / "models" / "run1"
+    alt_dir.mkdir(parents=True)
+    (alt_dir / "training_metrics.json").write_text('{"from": "hint"}', encoding="utf-8")
+    rel_log = log_dir.relative_to(tmp_path).as_posix()
+    rel_hint = alt_dir.relative_to(tmp_path).as_posix()
+    bundle = {
+        "job_specs": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "logs_subdir_relative": rel_log,
+                "training_metrics_repo_relative": rel_hint,
+            }
+        ]
+    }
+    rows = collectors.harvest_phase2_job_training_metrics(tmp_path, bundle)
+    assert len(rows) == 1
+    assert rows[0]["found"] is True
+    assert rows[0]["training_metrics"] == {"from": "hint"}
+
+
+def test_harvest_training_metrics_repo_relative_file_path(tmp_path: Path) -> None:
+    """Hint may point directly at training_metrics.json."""
+    f = tmp_path / "bundle" / "training_metrics.json"
+    f.parent.mkdir(parents=True)
+    f.write_text('{"direct": true}', encoding="utf-8")
+    rel = f.relative_to(tmp_path).as_posix()
+    bundle = {
+        "job_specs": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "logs_subdir_relative": "noop/logs",
+                "training_metrics_repo_relative": rel,
+            }
+        ]
+    }
+    rows = collectors.harvest_phase2_job_training_metrics(tmp_path, bundle)
+    assert rows[0]["found"] and rows[0]["training_metrics"] == {"direct": True}
+
+
+def test_harvest_training_metrics_repo_relative_rejects_escape(tmp_path: Path) -> None:
+    """Path must stay under repo root after resolve."""
+    bundle = {
+        "job_specs": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "logs_subdir_relative": "l/a",
+                "training_metrics_repo_relative": "..",
+            }
+        ]
+    }
+    rows = collectors.harvest_phase2_job_training_metrics(tmp_path, bundle)
+    assert rows[0]["found"] is False
+    assert "escapes" in (rows[0].get("load_error") or "").lower()
+
+
+def test_harvest_training_metrics_repo_relative_rejects_absolute(tmp_path: Path) -> None:
+    """Disallowed paths (absolute or outside repo) are rejected before load."""
+    bundle = {
+        "job_specs": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "logs_subdir_relative": "l/a",
+                "training_metrics_repo_relative": "/etc/passwd",
+            }
+        ]
+    }
+    rows = collectors.harvest_phase2_job_training_metrics(tmp_path, bundle)
+    assert rows[0]["found"] is False
+    err = (rows[0].get("load_error") or "").lower()
+    assert "absolute" in err or "escapes" in err
+
+
+def test_evaluate_phase2_gate_metrics_ingested_blocked() -> None:
+    """metrics_ingested bundle is BLOCKED until per-track uplift can be evaluated."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"precision": 0.5},
+        "bundle_kind": "phase2_plan_v1",
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "BLOCKED"
+    assert "phase2_shared_metrics_no_per_track_uplift" in g["blocking_reasons"]
+
+
+def test_extract_phase2_shared_precision_at_recall_1pct() -> None:
+    """Extractor reads model_default.test_precision_at_recall_0.01."""
+    m = {"model_default": {"test_precision_at_recall_0.01": 0.42}}
+    assert evaluators.extract_phase2_shared_precision_at_recall_1pct(m) == pytest.approx(
+        0.42
+    )
+    assert evaluators.extract_phase2_shared_precision_at_recall_1pct({}) is None
+    assert evaluators.extract_phase2_shared_precision_at_recall_1pct(None) is None
+
+
+def test_evaluate_phase2_gate_metrics_ingested_includes_pat_in_evidence() -> None:
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.55}},
+        "bundle_kind": "phase2_plan_v1",
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["metrics"].get("shared_precision_at_recall_1pct") == pytest.approx(0.55)
+    assert "0.5500" in (g.get("evidence_summary") or "")
+
+
+def test_phase2_per_job_backtest_metrics_normalizes_rows() -> None:
+    """phase2_per_job_backtest_metrics coerces previews and counts numeric entries."""
+    b: dict = {
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_a",
+                    "exp_id": "a0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.33,
+                },
+                {
+                    "track": "track_b",
+                    "exp_id": "b0",
+                    "skipped": True,
+                    "ok": True,
+                },
+            ],
+        }
+    }
+    m = evaluators.phase2_per_job_backtest_metrics(b)
+    assert m.get("per_job_backtest_preview_count") == 1
+    prev = m.get("per_job_backtest_previews")
+    assert isinstance(prev, list) and len(prev) == 2
+    assert prev[0].get("shared_precision_at_recall_1pct_preview") == pytest.approx(0.33)
+    assert prev[1].get("skipped") is True
+
+
+def test_evaluate_phase2_gate_plan_only_includes_per_job_preview_evidence() -> None:
+    """plan_only gate evidence lists per-job PAT@1% previews when batch ran."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    b = collectors.collect_phase2_plan_bundle("r", cfg)
+    b["per_job_backtest_jobs"] = {
+        "executed": True,
+        "all_ok": True,
+        "results": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "skipped": False,
+                "ok": True,
+                "shared_precision_at_recall_1pct_preview": 0.41,
+            },
+        ],
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "BLOCKED"
+    assert g["metrics"].get("per_job_backtest_preview_count") == 1
+    ev = g.get("evidence_summary") or ""
+    assert "per-job PAT@1%" in ev
+    assert "track_a/a0=" in ev
+    assert "0.4100" in ev
+
+
+def test_evaluate_phase2_gate_metrics_ingested_includes_per_job_preview_evidence() -> None:
+    """metrics_ingested + two per-job previews on one track can PASS uplift gate."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {"min_uplift_pp_vs_baseline": 3.0, "max_std_pp_across_windows": 2.5},
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.6,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.63,
+                },
+            ],
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "PASS"
+    assert g["blocking_reasons"] == []
+    ev = g.get("evidence_summary") or ""
+    assert "0.5000" in ev
+    assert "track_c/c0=" in ev
+    assert "uplift gate: PASS" in ev
+    assert g["metrics"].get("per_job_backtest_preview_count") == 2
+    assert g["metrics"].get("phase2_uplift_pass") is True
+
+
+def test_evaluate_phase2_gate_std_pass_with_low_variance_series() -> None:
+    """phase2_pat_series_by_experiment with low stdev keeps PASS after uplift PASS."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {"min_uplift_pp_vs_baseline": 3.0, "max_std_pp_across_windows": 2.5},
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.6,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.63,
+                },
+            ],
+        },
+        "phase2_pat_series_by_experiment": {
+            "track_c": {
+                "c0": [0.60, 0.6001, 0.5999],
+                "c1": [0.63, 0.6302, 0.6298],
+            },
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "PASS"
+    assert g["metrics"].get("phase2_std_gate_evaluated") is True
+    assert "std gate:" in (g.get("evidence_summary") or "")
+    assert "— PASS" in (g.get("evidence_summary") or "")
+
+
+def test_evaluate_phase2_gate_std_fail_when_series_too_volatile() -> None:
+    """High cross-window stdev fails gate after uplift PASS."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {"min_uplift_pp_vs_baseline": 3.0, "max_std_pp_across_windows": 2.5},
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.6,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.63,
+                },
+            ],
+        },
+        "phase2_pat_series_by_experiment": {
+            "track_c": {"c0": [0.5, 0.95, 0.52]},
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "FAIL"
+    assert "phase2_std_exceeds_max_pp_across_windows" in g["blocking_reasons"]
+
+
+def test_evaluate_phase2_gate_std_informational_when_uplift_fail() -> None:
+    """Std metrics recorded but do not replace uplift FAIL reason."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {"min_uplift_pp_vs_baseline": 3.0, "max_std_pp_across_windows": 2.5},
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.6,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.615,
+                },
+            ],
+        },
+        "phase2_pat_series_by_experiment": {
+            "track_c": {"c0": [0.5, 0.92]},
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "FAIL"
+    assert g["blocking_reasons"] == ["phase2_uplift_below_min_pp_vs_baseline"]
+    assert "informational" in (g.get("evidence_summary") or "")
+    assert g["metrics"].get("phase2_std_gate_evaluated") is True
+
+
+def test_phase2_pat_series_mapping_has_evaluable_series() -> None:
+    """Helper matches std-gate evaluable shape (track_* + len>=2)."""
+    assert collectors.phase2_pat_series_mapping_has_evaluable_series(None) is False
+    assert collectors.phase2_pat_series_mapping_has_evaluable_series({}) is False
+    assert (
+        collectors.phase2_pat_series_mapping_has_evaluable_series(
+            {"track_a": {"x": [0.1]}}
+        )
+        is False
+    )
+    assert (
+        collectors.phase2_pat_series_mapping_has_evaluable_series(
+            {"track_a": {"x": [0.1, 0.2]}, "noise": {"y": [1.0, 2.0]}}
+        )
+        is True
+    )
+    assert (
+        collectors.phase2_pat_series_mapping_has_evaluable_series(
+            {"noise": {"y": [1.0, 2.0]}}
+        )
+        is False
+    )
+
+
+def test_merge_phase2_pat_series_builds_two_point_series() -> None:
+    """MVP merge pairs shared PAT@1% with each ok per-job preview."""
+    b: dict = {
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.52,
+                },
+            ],
+        },
+    }
+    assert collectors.merge_phase2_pat_series_from_shared_and_per_job(b) is True
+    assert b["phase2_pat_series_by_experiment"]["track_c"]["c0"] == [0.5, 0.52]
+
+
+def test_merge_phase2_pat_series_skips_when_manual_len_ge_2() -> None:
+    """Do not overwrite user-provided multi-window series."""
+    b: dict = {
+        "phase2_pat_series_by_experiment": {"track_c": {"c0": [0.1, 0.2]}},
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.99,
+                },
+            ],
+        },
+    }
+    assert collectors.merge_phase2_pat_series_from_shared_and_per_job(b) is False
+    assert b["phase2_pat_series_by_experiment"]["track_c"]["c0"] == [0.1, 0.2]
+
+
+def test_merge_phase2_pat_series_preserves_nonempty_yaml_fills_other_exp() -> None:
+    """Auto-merge adds missing exp_ids without overwriting YAML single-point series."""
+    b: dict = {
+        "phase2_pat_series_by_experiment": {"track_c": {"c0": [0.55]}},
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.99,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.6,
+                },
+            ],
+        },
+    }
+    assert collectors.merge_phase2_pat_series_from_shared_and_per_job(b) is True
+    assert b["phase2_pat_series_by_experiment"]["track_c"]["c0"] == [0.55]
+    assert b["phase2_pat_series_by_experiment"]["track_c"]["c1"] == [0.5, 0.6]
+
+
+def test_merge_phase2_pat_series_noop_when_only_nonempty_yaml_matches_results() -> None:
+    """If every per-job row already has a non-empty series, merge makes no writes."""
+    b: dict = {
+        "phase2_pat_series_by_experiment": {"track_c": {"c0": [0.55]}},
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.99,
+                },
+            ],
+        },
+    }
+    assert collectors.merge_phase2_pat_series_from_shared_and_per_job(b) is False
+    assert b["phase2_pat_series_by_experiment"]["track_c"]["c0"] == [0.55]
+
+
+def test_merge_phase2_pat_series_noop_without_shared_pat() -> None:
+    """Without ingested shared PAT, cannot build two-point series."""
+    b: dict = {
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.52,
+                },
+            ],
+        },
+    }
+    assert collectors.merge_phase2_pat_series_from_shared_and_per_job(b) is False
+    assert "phase2_pat_series_by_experiment" not in b
+
+
+def test_evaluate_phase2_gate_after_auto_merge_std_evaluated() -> None:
+    """merge_phase2_pat_series_from_shared_and_per_job + gate runs std on two-point lists."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        # Two-point [shared, preview] stdev is large when preview differs from shared; use a
+        # loose std cap here to assert the auto-merge + std path, not production thresholds.
+        "gate": {"min_uplift_pp_vs_baseline": 3.0, "max_std_pp_across_windows": 50.0},
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.6,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.63,
+                },
+            ],
+        },
+    }
+    assert collectors.merge_phase2_pat_series_from_shared_and_per_job(b) is True
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "PASS"
+    assert g["metrics"].get("phase2_std_gate_evaluated") is True
+
+
+def test_collect_summary_phase2_pat_series_merge_hints() -> None:
+    """Summary flags when auto-merge is skipped or eligible."""
+    base: dict = {
+        "bundle_kind": "phase2_plan_v1",
+        "status": "metrics_ingested",
+        "tracks": {},
+        "experiments_index": [],
+    }
+    s_skip = collectors.collect_summary_phase2_plan_for_run_state(
+        {
+            **base,
+            "phase2_pat_series_by_experiment": {"track_a": {"e": [0.1, 0.2]}},
+        }
+    )
+    assert s_skip.get("phase2_pat_series_auto_merge_skipped") is True
+    s_elig = collectors.collect_summary_phase2_plan_for_run_state(
+        {
+            **base,
+            "per_job_backtest_jobs": {"executed": True},
+            "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.4}},
+        }
+    )
+    assert s_elig.get("phase2_pat_series_auto_merge_eligible") is True
+
+
+def test_evaluate_phase2_gate_metrics_ingested_uplift_blocked_single_preview() -> None:
+    """One preview only → cannot compare; BLOCKED with phase2_uplift_insufficient_comparisons."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {"min_uplift_pp_vs_baseline": 3.0, "max_std_pp_across_windows": 2.5},
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.6,
+                },
+            ],
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "BLOCKED"
+    assert "phase2_uplift_insufficient_comparisons" in g["blocking_reasons"]
+    assert g["metrics"].get("phase2_uplift_gate_evaluated") is True
+
+
+def test_phase2_preview_map_excludes_failed_per_job_rows() -> None:
+    """Failed per-job rows must not participate in uplift baseline/challenger."""
+    b: dict = {
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": False,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": False,
+                    "shared_precision_at_recall_1pct_preview": 0.9,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.65,
+                },
+            ],
+        }
+    }
+    m = evaluators._phase2_preview_map_from_bundle(b)
+    assert ("track_c", "c0") not in m
+    assert m.get(("track_c", "c1")) == pytest.approx(0.65)
+
+
+def test_evaluate_phase2_gate_metrics_ingested_uplift_fail_below_min() -> None:
+    """Two previews but uplift below min_uplift_pp_vs_baseline → FAIL."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {"min_uplift_pp_vs_baseline": 3.0, "max_std_pp_across_windows": 2.5},
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.6,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.615,
+                },
+            ],
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "FAIL"
+    assert "phase2_uplift_below_min_pp_vs_baseline" in g["blocking_reasons"]
+    assert g["metrics"].get("phase2_uplift_pass") is False
+
+
+def test_write_phase2_track_results_per_job_backtest_section(tmp_path: Path) -> None:
+    """Each track md lists per-job backtest rows when per_job_backtest_jobs ran."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    bundle = collectors.collect_phase2_plan_bundle("rid", cfg)
+    bundle["status"] = "plan_only"
+    bundle["per_job_backtest_jobs"] = {
+        "executed": True,
+        "all_ok": True,
+        "results": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "skipped": False,
+                "ok": True,
+                "shared_precision_at_recall_1pct_preview": 0.777,
+            },
+            {
+                "track": "track_a",
+                "exp_id": "a_extra",
+                "skipped": True,
+                "ok": True,
+                "skip_reason": "no training_metrics_repo_relative",
+            },
+            {
+                "track": "track_b",
+                "exp_id": "b0",
+                "skipped": True,
+                "ok": True,
+                "skip_reason": "no training_metrics_repo_relative",
+            },
+        ],
+    }
+    gate = evaluators.evaluate_phase2_gate(bundle)
+    p2 = tmp_path / "phase2"
+    report_builder.write_phase2_track_results(p2, "rid", cfg, bundle, gate)
+    ta = (p2 / "track_a_results.md").read_text(encoding="utf-8")
+    assert "## Per-job backtest preview" in ta
+    assert "0.7770" in ta
+    assert "**skipped**" in ta
+    tb = (p2 / "track_b_results.md").read_text(encoding="utf-8")
+    assert "## Per-job backtest preview" in tb
+    assert "no training_metrics_repo_relative" in tb
+    tc = (p2 / "track_c_results.md").read_text(encoding="utf-8")
+    assert "no rows for this track" in tc
+    assert "## Uplift vs baseline (gate)" in ta
+    assert "uplift gate not evaluated" in ta.lower()
+    assert "## PAT@1% series & std (gate)" in ta
+
+
+def test_write_phase2_track_results_std_section_shows_evaluated_metrics(
+    tmp_path: Path,
+) -> None:
+    """Track md includes bundle PAT@1% series and std gate rows for that track."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["tracks"]["track_c"]["experiments"] = [
+        {"exp_id": "c0", "overrides": {}},
+        {"exp_id": "c1", "overrides": {}},
+    ]
+    cfg = config_loader.validate_phase2_config(raw, cli_run_id="rid")
+    bundle = collectors.collect_phase2_plan_bundle("rid", cfg)
+    bundle["status"] = "metrics_ingested"
+    bundle["backtest_metrics"] = {"model_default": {"test_precision_at_recall_0.01": 0.5}}
+    bundle["per_job_backtest_jobs"] = {
+        "executed": True,
+        "all_ok": True,
+        "results": [
+            {
+                "track": "track_c",
+                "exp_id": "c0",
+                "skipped": False,
+                "ok": True,
+                "shared_precision_at_recall_1pct_preview": 0.6,
+            },
+            {
+                "track": "track_c",
+                "exp_id": "c1",
+                "skipped": False,
+                "ok": True,
+                "shared_precision_at_recall_1pct_preview": 0.63,
+            },
+        ],
+    }
+    bundle["phase2_pat_series_by_experiment"] = {
+        "track_c": {
+            "c0": [0.60, 0.6001, 0.5999],
+            "c1": [0.63, 0.6302, 0.6298],
+        },
+    }
+    gate = evaluators.evaluate_phase2_gate(bundle)
+    p2 = tmp_path / "phase2"
+    report_builder.write_phase2_track_results(p2, "rid", cfg, bundle, gate)
+    tc = (p2 / "track_c_results.md").read_text(encoding="utf-8")
+    assert "## PAT@1% series & std (gate)" in tc
+    assert "### Bundle series (this track)" in tc
+    assert "`c0`" in tc and "`c1`" in tc
+    assert "**evaluated**: yes" in tc
+    assert "max sample stdev (pp, gate-wide)" in tc
+    assert "n_windows=3" in tc
+    assert "std_pp=" in tc
+    ta = (p2 / "track_a_results.md").read_text(encoding="utf-8")
+    assert "no `phase2_pat_series_by_experiment` entries for this track" in ta
+
+
+def test_write_phase2_track_results_writes_three_files(tmp_path: Path) -> None:
+    """T11 stub writes one markdown per track."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    bundle = collectors.collect_phase2_plan_bundle("rid", cfg)
+    bundle["status"] = "metrics_ingested"
+    bundle["backtest_metrics"] = {"model_default": {"test_precision_at_recall_0.01": 0.1}}
+    bundle["job_training_harvest"] = {
+        "rows": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "found": True,
+                "metrics_relative": "orch/state/rid/logs/phase2/track_a/a0/training_metrics.json",
+            },
+            {
+                "track": "track_b",
+                "exp_id": "b0",
+                "found": False,
+                "load_error": "file not found",
+            },
+        ],
+    }
+    gate = evaluators.evaluate_phase2_gate(bundle)
+    p2 = tmp_path / "phase2"
+    paths = report_builder.write_phase2_track_results(p2, "rid", cfg, bundle, gate)
+    assert len(paths) == 3
+    for p in paths:
+        assert p.is_file()
+        text = p.read_text(encoding="utf-8")
+        assert "shared backtest" in text.lower() or "Shared" in text
+        assert "0.1000" in text
+        assert "## Per-job training_metrics harvest" in text
+        assert "## Per-job backtest preview" in text
+        assert "## Uplift vs baseline (gate)" in text
+        assert "## PAT@1% series & std (gate)" in text
+    track_a = p2 / "track_a_results.md"
+    assert "**found**" in track_a.read_text(encoding="utf-8")
+    assert "`a0`" in track_a.read_text(encoding="utf-8")
+    track_b = p2 / "track_b_results.md"
+    tb = track_b.read_text(encoding="utf-8")
+    assert "**not found**" in tb
+    assert "`b0`" in tb
+
+
+def test_phase2_bundle_backtest_jobs_skipped_after_pipeline(tmp_path: Path) -> None:
+    """Default phase2 run records backtest_jobs.executed=false."""
+    run_id = "pytest_phase2_backtest_skipped"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+    cfg_file = tmp_path / "p2bt.yaml"
+    cfg_file.write_text(
+        yaml.safe_dump(
+            _minimal_phase2_dict(
+                model_dir=str(model_dir),
+                state_db=str(state_db),
+                pred_db=str(pred_db),
+            )
+        ),
+        encoding="utf-8",
+    )
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    bundle_path = _ORCHESTRATOR / "state" / run_id / "phase2_bundle.json"
+    for p in (state_json, bundle_path):
+        if p.is_file():
+            p.unlink()
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_RUN_PIPELINE),
+            "--phase",
+            "phase2",
+            "--config",
+            str(cfg_file),
+            "--run-id",
+            run_id,
+            "--skip-backtest-smoke",
+            "--skip-phase2-trainer-smoke",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(bundle_path.read_text(encoding="utf-8"))
+    bj = data.get("backtest_jobs")
+    assert isinstance(bj, dict)
+    assert bj.get("executed") is False
+    assert bj.get("skip_reason")
+
+
+def test_phase2_bundle_includes_job_training_harvest_after_pipeline(tmp_path: Path) -> None:
+    """phase2_job_metrics_harvest writes job_training_harvest with one row per job_spec."""
+    run_id = "pytest_phase2_harvest_bundle"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+    cfg_file = tmp_path / "p2harvest.yaml"
+    cfg_file.write_text(
+        yaml.safe_dump(
+            _minimal_phase2_dict(
+                model_dir=str(model_dir),
+                state_db=str(state_db),
+                pred_db=str(pred_db),
+            )
+        ),
+        encoding="utf-8",
+    )
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    bundle_path = _ORCHESTRATOR / "state" / run_id / "phase2_bundle.json"
+    for p in (state_json, bundle_path):
+        if p.is_file():
+            p.unlink()
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_RUN_PIPELINE),
+            "--phase",
+            "phase2",
+            "--config",
+            str(cfg_file),
+            "--run-id",
+            run_id,
+            "--skip-backtest-smoke",
+            "--skip-phase2-trainer-smoke",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(bundle_path.read_text(encoding="utf-8"))
+    jh = data.get("job_training_harvest")
+    assert isinstance(jh, dict)
+    assert jh.get("metrics_filename") == collectors.PHASE2_JOB_TRAINING_METRICS_NAME
+    rows = jh.get("rows")
+    assert isinstance(rows, list) and len(rows) == 3
+    st = json.loads(state_json.read_text(encoding="utf-8"))
+    assert st["steps"]["phase2_job_metrics_harvest"]["status"] == "success"
+
+
+def test_phase2_resume_skips_completed_backtest_jobs(tmp_path: Path) -> None:
+    """Second --resume should skip phase2_backtest_jobs when step already success."""
+    run_id = "pytest_phase2_resume_backtest_skip"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+    cfg_file = tmp_path / "p2btskip.yaml"
+    cfg_file.write_text(
+        yaml.safe_dump(
+            _minimal_phase2_dict(
+                model_dir=str(model_dir),
+                state_db=str(state_db),
+                pred_db=str(pred_db),
+            )
+        ),
+        encoding="utf-8",
+    )
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    if state_json.is_file():
+        state_json.unlink()
+    argv = [
+        sys.executable,
+        str(_RUN_PIPELINE),
+        "--phase",
+        "phase2",
+        "--config",
+        str(cfg_file),
+        "--run-id",
+        run_id,
+        "--skip-backtest-smoke",
+        "--skip-phase2-trainer-smoke",
+    ]
+    proc1 = subprocess.run(argv, cwd=_REPO_ROOT, capture_output=True, text=True, check=False)
+    assert proc1.returncode == 0, proc1.stderr
+    t1 = json.loads(state_json.read_text(encoding="utf-8"))["steps"]["phase2_backtest_jobs"][
+        "finished_at"
+    ]
+    proc2 = subprocess.run(
+        argv + ["--resume"], cwd=_REPO_ROOT, capture_output=True, text=True, check=False
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    t2 = json.loads(state_json.read_text(encoding="utf-8"))["steps"]["phase2_backtest_jobs"][
+        "finished_at"
+    ]
+    assert t1 == t2
+
+
+def test_phase2_resume_skips_completed_per_job_backtest_jobs(tmp_path: Path) -> None:
+    """Second --resume should skip phase2_per_job_backtest_jobs when step already success."""
+    run_id = "pytest_phase2_resume_per_job_bt_skip"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+    cfg_file = tmp_path / "p2pjbskip.yaml"
+    cfg_file.write_text(
+        yaml.safe_dump(
+            _minimal_phase2_dict(
+                model_dir=str(model_dir),
+                state_db=str(state_db),
+                pred_db=str(pred_db),
+            )
+        ),
+        encoding="utf-8",
+    )
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    if state_json.is_file():
+        state_json.unlink()
+    argv = [
+        sys.executable,
+        str(_RUN_PIPELINE),
+        "--phase",
+        "phase2",
+        "--config",
+        str(cfg_file),
+        "--run-id",
+        run_id,
+        "--skip-backtest-smoke",
+        "--skip-phase2-trainer-smoke",
+        "--phase2-run-per-job-backtests",
+    ]
+    proc1 = subprocess.run(argv, cwd=_REPO_ROOT, capture_output=True, text=True, check=False)
+    assert proc1.returncode == 0, proc1.stderr
+    t1 = json.loads(state_json.read_text(encoding="utf-8"))["steps"][
+        "phase2_per_job_backtest_jobs"
+    ]["finished_at"]
+    proc2 = subprocess.run(
+        argv + ["--resume"], cwd=_REPO_ROOT, capture_output=True, text=True, check=False
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    t2 = json.loads(state_json.read_text(encoding="utf-8"))["steps"][
+        "phase2_per_job_backtest_jobs"
+    ]["finished_at"]
+    assert t1 == t2
+
+
+def test_phase2_resume_skips_completed_job_metrics_harvest(tmp_path: Path) -> None:
+    """Second --resume should skip phase2_job_metrics_harvest when step already success."""
+    run_id = "pytest_phase2_resume_harvest_skip"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+    cfg_file = tmp_path / "p2jhskip.yaml"
+    cfg_file.write_text(
+        yaml.safe_dump(
+            _minimal_phase2_dict(
+                model_dir=str(model_dir),
+                state_db=str(state_db),
+                pred_db=str(pred_db),
+            )
+        ),
+        encoding="utf-8",
+    )
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    if state_json.is_file():
+        state_json.unlink()
+    argv = [
+        sys.executable,
+        str(_RUN_PIPELINE),
+        "--phase",
+        "phase2",
+        "--config",
+        str(cfg_file),
+        "--run-id",
+        run_id,
+        "--skip-backtest-smoke",
+        "--skip-phase2-trainer-smoke",
+    ]
+    proc1 = subprocess.run(argv, cwd=_REPO_ROOT, capture_output=True, text=True, check=False)
+    assert proc1.returncode == 0, proc1.stderr
+    t1 = json.loads(state_json.read_text(encoding="utf-8"))["steps"][
+        "phase2_job_metrics_harvest"
+    ]["finished_at"]
+    proc2 = subprocess.run(
+        argv + ["--resume"], cwd=_REPO_ROOT, capture_output=True, text=True, check=False
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    t2 = json.loads(state_json.read_text(encoding="utf-8"))["steps"][
+        "phase2_job_metrics_harvest"
+    ]["finished_at"]
+    assert t1 == t2
+
+
+def test_phase2_resume_skips_completed_runner_smoke(tmp_path: Path) -> None:
+    """Second --resume should skip phase2_runner_smoke when step already success."""
+    run_id = "pytest_phase2_resume_runner_skip"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+    cfg_file = tmp_path / "p2skip.yaml"
+    cfg_file.write_text(
+        yaml.safe_dump(
+            _minimal_phase2_dict(
+                model_dir=str(model_dir),
+                state_db=str(state_db),
+                pred_db=str(pred_db),
+            )
+        ),
+        encoding="utf-8",
+    )
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    if state_json.is_file():
+        state_json.unlink()
+    argv = [
+        sys.executable,
+        str(_RUN_PIPELINE),
+        "--phase",
+        "phase2",
+        "--config",
+        str(cfg_file),
+        "--run-id",
+        run_id,
+        "--skip-backtest-smoke",
+        "--skip-phase2-trainer-smoke",
+    ]
+    proc1 = subprocess.run(
+        argv,
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc1.returncode == 0, proc1.stderr
+    t1 = json.loads(state_json.read_text(encoding="utf-8"))["steps"]["phase2_runner_smoke"][
+        "finished_at"
+    ]
+    proc2 = subprocess.run(
+        argv + ["--resume"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    t2 = json.loads(state_json.read_text(encoding="utf-8"))["steps"]["phase2_runner_smoke"][
+        "finished_at"
+    ]
+    assert t1 == t2
+
+
+def test_phase2_resume_missing_bundle_exits_4(tmp_path: Path) -> None:
+    """--resume after deleting phase2_bundle.json must exit 4 when plan step was success."""
+    run_id = "pytest_phase2_resume_no_bundle"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+
+    cfg_file = tmp_path / "phase2_resume.yaml"
+    cfg_file.write_text(
+        yaml.safe_dump(
+            _minimal_phase2_dict(
+                model_dir=str(model_dir),
+                state_db=str(state_db),
+                pred_db=str(pred_db),
+            )
+        ),
+        encoding="utf-8",
+    )
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    bundle_path = _ORCHESTRATOR / "state" / run_id / "phase2_bundle.json"
+    for p in (state_json, bundle_path):
+        if p.is_file():
+            p.unlink()
+
+    proc1 = subprocess.run(
+        [
+            sys.executable,
+            str(_RUN_PIPELINE),
+            "--phase",
+            "phase2",
+            "--config",
+            str(cfg_file),
+            "--run-id",
+            run_id,
+            "--skip-backtest-smoke",
+            "--skip-phase2-trainer-smoke",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc1.returncode == 0, proc1.stderr
+    assert bundle_path.is_file()
+    bundle_path.unlink()
+    assert not bundle_path.is_file()
+
+    proc2 = subprocess.run(
+        [
+            sys.executable,
+            str(_RUN_PIPELINE),
+            "--phase",
+            "phase2",
+            "--config",
+            str(cfg_file),
+            "--run-id",
+            run_id,
+            "--resume",
+            "--skip-backtest-smoke",
+            "--skip-phase2-trainer-smoke",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc2.returncode == 4
+    assert "cannot load phase2_bundle.json" in proc2.stderr
+
+
+def test_collect_phase2_plan_bundle_raises_on_non_mapping() -> None:
+    with pytest.raises(TypeError, match="mapping"):
+        collectors.collect_phase2_plan_bundle("r", "not-a-mapping")  # type: ignore[arg-type]
+
+
+def test_collect_phase2_plan_bundle_raises_on_bad_tracks() -> None:
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    cfg["tracks"] = "broken"
+    with pytest.raises(ValueError, match="tracks"):
+        collectors.collect_phase2_plan_bundle("r", cfg)
 
 
 def test_backtest_smoke_failure_returns_non_ok() -> None:
@@ -1183,3 +3290,21 @@ def test_run_all_phases_dry_run_readiness_ready(tmp_path: Path) -> None:
                 )
     assert out["status"] == "READY", out
     assert out["blocking_reasons"] == []
+
+
+def test_t16a_dry_run_checklist_keys_match_config_loader_contract() -> None:
+    """T16A ``dry_run`` checklist keys stay aligned with MVP_TASKLIST / run_full SSOT."""
+    expected = frozenset(
+        {
+            "validate_phase_configs_exist",
+            "validate_phase_schemas",
+            "validate_phase_dependencies",
+            "validate_contract_consistency",
+            "validate_paths_readable",
+            "validate_writable_targets",
+            "validate_cli_smoke_per_phase",
+            "validate_resource_limits",
+            "fail_on_any_check",
+        }
+    )
+    assert frozenset(config_loader.DRY_RUN_FLAG_DEFAULTS.keys()) == expected

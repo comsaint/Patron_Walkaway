@@ -5,8 +5,8 @@ phase: phase2
 
 common:
   model_dir: out/models/20260408-173809-e472fd0
-  state_db_path: trainer/local_state/state.db
-  prediction_log_db_path: trainer/local_state/prediction_log.db
+  state_db_path: local_state/state.db
+  prediction_log_db_path: local_state/prediction_log.db
   window:
     start_ts: "2026-04-09T00:00:00+08:00"
     end_ts: "2026-04-15T00:00:00+08:00"
@@ -20,6 +20,35 @@ resources:
   max_trials_per_track: 6
   max_parallel_jobs: 1
   backtest_skip_optuna: true
+  # Optional (T10 trainer batch): trainer_use_local_parquet: false
+  # Optional wall-clock cap per job (seconds); omit for no timeout:
+  # phase2_trainer_job_timeout_sec: 7200
+  # Optional (T10 shared backtest): wall-clock cap for trainer.backtester subprocess:
+  # phase2_backtest_timeout_sec: 7200
+  # Optional: override default trainer/out_backtest/backtest_metrics.json after backtest:
+  # backtest_metrics_path: trainer/out_backtest/backtest_metrics.json
+  #
+  # After --phase2-run-trainer-jobs: orchestrator parses trainer stderr/stdout for
+  # "Artifacts saved to …" and fills job_specs.training_metrics_repo_relative when
+  # the experiment did not set it in YAML (see runner.infer_training_metrics_repo_relative_from_trainer_logs).
+  #
+  # Optional CLI --phase2-run-per-job-backtests (after harvest, before shared backtest):
+  # runs trainer.backtester per job_spec that has training_metrics_repo_relative; logs
+  # under each job's logs/.../<exp_id>/_per_job_backtest/ with --output-dir there so
+  # backtest_metrics.json is per-job (shared backtest still writes default/global path).
+  #
+  # Optional CLI --phase2-fail-on-gate-fail: if evaluate_phase2_gate returns FAIL after
+  # phase2_gate_report, exit 9 and mark step failed (reports still written; BLOCKED/PASS
+  # do not trigger exit 9).
+  # Optional CLI --phase2-fail-on-gate-blocked: BLOCKED -> exit 10, E_PHASE2_GATE_BLOCKED
+  # (plan_only runs are usually BLOCKED — use only when you intend CI to fail on BLOCKED).
+  #
+  # Optional bundle field (for gate std): phase2_pat_series_by_experiment:
+  #   track_c: { c0: [0.50, 0.51, 0.505], c1: [...] }  # PAT@1% per window, same scale as previews
+  # Compared to gate.max_std_pp_across_windows (pp of sample stdev across windows).
+  # If unset and phase2_gate_report runs: collectors.merge_phase2_pat_series_from_shared_and_per_job
+  # may build a two-point series [shared PAT@1%, per-job preview] per ok job (MVP bridge until
+  # true multi-window series exist); skipped when any manual list already has len>=2.
 
 tracks:
   track_a:
@@ -27,6 +56,10 @@ tracks:
     experiments:
       - exp_id: a_baseline
         overrides: {}
+        # Optional (T10 harvest): repo-relative file or directory containing training_metrics.json
+        # training_metrics_repo_relative: out/models/20260408-173809-e472fd0
+        # Optional multi-window PAT@1% (0–1) for std gate; populates bundle phase2_pat_series_by_experiment:
+        # precision_at_recall_1pct_by_window: [0.50, 0.51, 0.505]
       - exp_id: a_hard_negative_v1
         overrides:
           hard_negative_weight: 2.0
@@ -41,6 +74,7 @@ tracks:
       - exp_id: c_baseline
         overrides: {}
 
+# Phase 2 Gate（對齊 .cursor/plans/PLAN_precision_uplift_sprint.md §Phase 2；實作 evaluate_phase2_gate）
 gate:
-  min_uplift_pp_vs_baseline: 3.0
-  max_std_pp_across_windows: 2.5
+  min_uplift_pp_vs_baseline: 3.0 # pp vs YAML-order baseline on each enabled track (per-job previews)
+  max_std_pp_across_windows: 2.5 # sample stdev of PAT@1% series (pp); optional phase2_pat_series_by_experiment
