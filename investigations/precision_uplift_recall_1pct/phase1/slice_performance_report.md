@@ -2,24 +2,24 @@
 
 ## Run metadata (orchestrator)
 
-- **run_id**: `prod_phase1_20260409`
-- **Window**: `2026-04-09T00:00:00+08:00` → `2026-04-15T00:00:00+08:00`
-- **model_dir**: `out/models/20260408-173809-e472fd0`
-- **state_db_path**: `local_state/state.db`
-- **prediction_log_db_path**: `local_state/prediction_log.db`
-- **collect_bundle**: `investigations/precision_uplift_recall_1pct/orchestrator/state/prod_phase1_20260409/collect_bundle.json`
+- **run_id**: `pytest_resume_skip`
+- **Window**: `2026-01-01T00:00:00+08:00` → `2026-01-08T00:00:00+08:00`
+- **model_dir**: `C:\Users\longp\AppData\Local\Temp\pytest-of-longp\pytest-145\test_resume_skips_preflight_wh0\missing_models`
+- **state_db_path**: `s.db`
+- **prediction_log_db_path**: `p.db`
+- **collect_bundle**: `investigations/precision_uplift_recall_1pct/orchestrator/state/pytest_resume_skip/collect_bundle.json`
 
 
 ## validation_results aggregates (state DB)
 
 ```json
 {
-  "state_db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\state.db",
-  "window_start_ts": "2026-04-09T00:00:00+08:00",
-  "window_end_ts": "2026-04-15T00:00:00+08:00",
-  "validation_results_rows_in_window": 674,
-  "finalized_alerts_count": 674,
-  "finalized_true_positives_count": 235,
+  "state_db_path": "C:\\Users\\longp\\Patron_Walkaway\\s.db",
+  "window_start_ts": "2026-01-01T00:00:00+08:00",
+  "window_end_ts": "2026-01-08T00:00:00+08:00",
+  "validation_results_rows_in_window": null,
+  "finalized_alerts_count": null,
+  "finalized_true_positives_count": null,
   "note": null
 }
 ```
@@ -27,19 +27,26 @@
 
 ## R2 prediction_log vs alerts
 
-```json
-{
-  "status": "ok",
-  "state_db_path": "C:\\Projects\\Patron_Walkaway\\local_state\\state.db",
-  "n_prediction_log_is_alert_rows": 763,
-  "n_alerts_table_rows_ts_window": 760,
-  "difference_pl_minus_alerts": 3,
-  "alerts_to_prediction_log_ratio": 0.9960681520314548,
-  "note": "Compares counts in the same [start_ts, end_ts) string window on scored_at vs alerts.ts. Mismatch may reflect duplicate suppression (R2) or timestamp semantics differences."
-}
-```
-
+*No `r2_prediction_log_vs_alerts` in R1 final payload.*
 
 ## Collector errors (if any)
 
-*None.*
+```json
+[
+  {
+    "code": "E_COLLECT_BACKTEST_METRICS",
+    "message": "file not found: C:\\Users\\longp\\Patron_Walkaway\\trainer\\out_backtest\\backtest_metrics.json",
+    "path": "C:\\Users\\longp\\Patron_Walkaway\\trainer\\out_backtest\\backtest_metrics.json"
+  },
+  {
+    "code": "E_COLLECT_R1_PAYLOAD",
+    "message": "r1_r6 log not found: C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\pytest_resume_skip\\logs\\r1_r6.stdout.log",
+    "path": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\pytest_resume_skip\\logs\\r1_r6.stdout.log"
+  },
+  {
+    "code": "E_COLLECT_STATE_DB",
+    "message": "state DB path is not a file",
+    "path": "C:\\Users\\longp\\Patron_Walkaway\\s.db"
+  }
+]
+```

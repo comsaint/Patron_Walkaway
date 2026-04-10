@@ -14,6 +14,7 @@
 | 最新更新日 | `YYYY-MM-DD` |
 | 目前主指標 `precision@recall=1%` | `TBD` |
 | 目標門檻 | `>= 60%` |
+| 執行模式 | `Autonomous（無人工介入） / Manual fallback` |
 | 是否觸發重排 | `否 / 是（原因）` |
 | Blocker | `無 / 有（簡述）` |
 | 下一個里程碑 | `Phase 1 Gate` |
@@ -28,13 +29,20 @@
 - 提升需可跨時間窗穩定成立（forward/purged 驗證）。
 - 任何階段結論都必須有對應工件，不接受口頭結論。
 
+### 1.1 執行原則（本版更新）
+
+- 以單一命令為主：`run_pipeline.py --phase all --mode autonomous`。
+- 使用者只需提供固定 run 契約（model、window、DB 路徑、資源上限）；其餘由 orchestrator 全自動執行。
+- 手動步驟保留為 fallback（除錯或緊急接手），不是日常主流程。
+- Go/No-Go 的商業簽核仍由人決策，但證據蒐集與報告產生應全自動。
+
 ---
 
 ## 2. 階段總覽（完成 / 未完成一眼可見）
 
 | Phase | 名稱 | 狀態 | Gate 狀態  |
 | :--- | :--- | :--- | :---  |
-| Phase 1 | 根因診斷（RCA）與限制條件確認 | ⚪ 未開始 | ⚪ 未達成 |  
+| Phase 1 | 根因診斷（RCA）與限制條件確認 | 🟡 進行中 | ⚪ 未達成 |  
 | Phase 2 | 高槓桿建模路線（A/B/C） | ⚪ 未開始 | ⚪ 未達成 | 
 | Phase 3 | 特徵深化與集成收斂 | ⚪ 未開始 | ⚪ 未達成  |
 | Phase 4 | 定版、回放與 Go/No-Go | ⚪ 未開始 | ⚪ 未達成 |
@@ -147,7 +155,7 @@
 
 ---
 
-## 8. 一次性 Ad-hoc 執行方案（不使用 cron）
+## 8. 一次性 Ad-hoc 執行方案（Manual fallback，不使用 cron）
 
 本節已移至獨立文件：  
 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md`
@@ -160,9 +168,9 @@
 
 ---
 
-## 9. Ad-hoc 全階段延伸（Phase 2~4）
+## 9. Manual fallback 全階段延伸（Phase 2~4）
 
-> 目標：在完成 Phase 1 後，不改成 cron，直接以「手動分批執行」方式推進到 Phase 4。  
+> 目標：在 Autonomous 流程受阻時，提供可回退的「手動分批執行」方案推進到 Phase 4。  
 > 原則：每個 Phase 都以「固定 run_id + 固定資料契約 + 固定評估口徑」執行，避免跨階段結果不可比。
 
 ### 9.1 Phase 2（高槓桿模型路線 A/B/C）
@@ -270,6 +278,54 @@
 > 本節是 **Phase 1~4 的唯一執行版**。  
 > 章節 9 與 `PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` 可作補充說明，但實際執行請以本節為準。
 
+### 10.0 啟動方式（預設全自動）
+
+**推薦命令（目標型態）**
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase all \
+  --mode autonomous \
+  --config investigations/precision_uplift_recall_1pct/orchestrator/config/run_full.yaml \
+  --run-id <run_id>
+```
+
+**full run 前 dry-run（必做）**
+
+```bash
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase all \
+  --dry-run \
+  --config investigations/precision_uplift_recall_1pct/orchestrator/config/run_full.yaml \
+  --run-id <run_id>
+```
+
+- 只有 dry-run 回報 `READY` 才啟動 full run。
+- 若 `NOT_READY`，先依 blocking reasons 修復後再啟動長跑。
+
+**`run_full.yaml` dry-run checklist（規格）**
+
+- `validate_phase_configs_exist`
+- `validate_phase_schemas`
+- `validate_phase_dependencies`
+- `validate_contract_consistency`
+- `validate_paths_readable`
+- `validate_writable_targets`
+- `validate_cli_smoke_per_phase`
+- `validate_resource_limits`
+- `fail_on_any_check`（建議 `true`）
+
+> 建議：上述欄位任一失敗即 `NOT_READY`，不得啟動 full run。
+
+**預期行為**
+
+- 自動管理 scorer/validator 生命週期（啟動、健康檢查、重啟、回收）。
+- 自動產生 Phase 1 mid/final R1/R6 snapshots（不需人工補 `r1_r6_mid.stdout.log`）。
+- 自動執行各 phase 所需訓練、回測、蒐證、Gate 與報告。
+- 程式中斷後可 `--resume` 從 checkpoint 接續。
+
+> 若需人工除錯，可切回 manual/ad-hoc；但 manual 不應作為常態流程。
+
 ### 10.1 全階段結論門檻（何時可下結論）
 
 | Phase | 最短時長（僅初判） | 建議時長（可決策） | 可下結論條件（至少滿足） |
@@ -299,6 +355,8 @@
 | P1-4 | 觀測期末再跑一次 R1/R6 + 固定窗 backtest | 最終 payload + `trainer/out_backtest/backtest_metrics.json` | 與中途結果方向劇烈反轉、樣本不足 |
 | P1-5 | 回填 Phase 1 六份工件 | `phase1/*.md` 全部完成 | 任一工件缺主證據、口徑不一致 |
 
+> Autonomous 模式下，P1-1~P1-5 由 orchestrator 自動完成；手動命令僅作 fallback。
+
 **Phase 1 可下結論（Gate）**
 
 - 可進 Phase 2：主瓶頸排序完成，且非單窗幻覺。
@@ -313,6 +371,8 @@
 | P2-3 | 寫入 `phase2/track_a_results.md`、`track_b_results.md`、`track_c_results.md` | 三份 track 工件完整 | 缺 `precision@recall=1%` 或缺切片/波動資訊 |
 | P2-4 | Gate 決策寫入 `phase2/phase2_gate_decision.md` | 明確保留/淘汰路線 | 無淘汰理由、重複試錯 |
 
+> Autonomous 模式下，P2-1~P2-4 由 orchestrator runner 依 config matrix 自動執行與蒐證。
+
 **Phase 2 可下結論（Gate）**
 
 - 至少 1 條路線達到 +3~5pp uplift（相對基線）且跨窗可重現，才能進 Phase 3。
@@ -324,6 +384,8 @@
 | P3-1 | 只在 Phase 2 勝者路線加特徵（先切片定向、後全域） | 特徵 uplift 對照表 | 特徵變多但主指標不升、訓練時間暴增 |
 | P3-2 | 跑集成/融合消融與高分段校準 | `phase3/ensemble_ablation.md`、`top_band_calibration_report.md` | ensemble 僅微幅提升但複雜度大幅上升 |
 | P3-3 | 匯整 Phase 3 工件與 Gate | `phase3/phase3_gate_decision.md` | 只看 overall，不看切片退化 |
+
+> Autonomous 模式下，僅允許延續 Phase 2 winner track，避免全域盲試。
 
 **Phase 3 可下結論（Gate）**
 
@@ -338,16 +400,50 @@
 | P4-3 | 上線影響估算（告警量/誤報量/業務成本） | `phase4/impact_estimation.md` | 僅報主指標，無告警量與誤報成本 |
 | P4-4 | Go/No-Go 決策包 | `phase4/go_no_go_pack.md` | 缺風險清單與 fallback 計畫 |
 
+> Autonomous 模式下，P4-1~P4-4 由 orchestrator 自動生成；人工只負責最終簽核。
+
 **Phase 4 可下結論（最終）**
 
 - `precision@recall=1% >= 60%` 且多窗一致成立。
 - 無重大切片退化，且營運可承受告警量與誤報成本。
 
-### 10.7 手動執行節拍（不用 cron 也要固定節奏）
+### 10.7 手動執行節拍（fallback；非預設）
 
 - 每日 1 次：更新 backtest + R1/R6 + 工件草稿
 - 每 2~3 日：做一次 Phase Gate 預審
 - 每週 1 次：正式更新里程碑與決策日誌
 
 > 即使不用排程，也要用固定節拍；否則很容易退化成「憑印象調參」。
+
+---
+
+## 11. 全自動落地規格（E2E，無人工介入）
+
+### 11.1 核心能力（必做）
+
+1. **單一命令啟動全 phase**  
+   - `--phase all --mode autonomous`，依 Gate 推進 phase1->2->3->4。  
+2. **長跑 supervisor**  
+   - 管理 scorer/validator，做健康檢查與自動重啟。  
+3. **自動 checkpoint snapshots**  
+   - 依 phase1 checkpoint policy 自動落 mid/final R1。  
+4. **統一 artifacts index**  
+   - 每 run 輸出 `artifacts_index.json`，報告只讀 index 指向路徑。  
+5. **可恢復性**  
+   - 任一步驟失敗或中斷後可 `--resume` 無損接續。  
+
+### 11.2 資源與風險控制（筆電優先）
+
+- heavy job 並行上限預設 1（避免 OOM / swap 暴增）。
+- 設定 `max_runtime_hours`、`max_windows`、`max_trials` 的硬上限。
+- 大檔採分塊與延遲載入；禁止一次載入全量資料到記憶體。
+- 達到資源上限時 fail-fast，輸出可執行的 blocking reason。
+
+### 11.3 自動化驗收標準（DoD）
+
+- 使用者僅指定 model + time period + config，即可跑完整調查流程。
+- 連跑數天不需人工觸碰，最終產出 phase1~4 全部工件。
+- 產出 `go_no_go_pack.md` 與完整證據鏈（logs + bundle + gate + report）。
+- 若流程被 Gate 擋下，需自動輸出「停止原因 + 下一步建議」。
+- full run 之前可執行 `--phase all --dry-run`，並輸出 `READY / NOT_READY` 與可執行修復項。
 

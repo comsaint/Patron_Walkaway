@@ -4,6 +4,135 @@
 
 ---
 
+## 2026-04-10 CYCLE — precision_uplift T16A（`--phase all` + `run_full.yaml` all-phase dry-run，/cycle_code 全四步）
+
+> 計畫索引：`.cursor/plans/PLAN.md`；決策：`.cursor/plans/DECISION_LOG.md`。對齊 MVP／Runbook **T16A**（長跑前 all-phase dry-run）。
+
+### STEP 1 — Builder
+
+- **`investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py`**
+  - `build_run_full_input_summary`、`run_all_phases_dry_run_readiness`（checklist：`dry_run` 旗標、`phase_configs` 解析、schema／依賴／contract／paths／resource_limits、phase1+2 preflight、可寫入與 CLI smoke／writable 透過 `run_dry_run_readiness`）。
+  - `skip_phase1_preflight` / `skip_phase2_preflight`：避免與 `_main_all` 開頭 phase1 preflight 重複；`--resume` 且 preflight 已成功時兩段 embedded preflight 皆跳過（與 phase1 resume 風險同型）。
+  - `_main_all`：`--phase all` 僅允許 **`--dry-run`**（非 dry-run → exit 2）；不支援 `--collect-only`；載入 `run_full.yaml`、寫入 `run_state.json`（`phase: all`、`mode: dry_run`、`readiness`）。
+- **`investigations/precision_uplift_recall_1pct/orchestrator/config/run_full.yaml`**、`run_phase3.yaml`、`run_phase4.yaml`：範例組態（phase3／4 為 T16A 最小形狀，待 T12／T14 完整 schema）。
+- **`investigations/precision_uplift_recall_1pct/orchestrator/config_loader.py`**：前序輪已含 `load_run_full_config`、phase3／4 minimal validate（本輪沿用）。
+
+#### 手動驗證
+
+```bash
+# 必須帶 --dry-run；否則 exit 2
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase all \
+  --config investigations/precision_uplift_recall_1pct/orchestrator/config/run_full.yaml \
+  --run-id my_all_dry \
+  --dry-run \
+  --skip-backtest-smoke
+```
+
+（範例 `run_phase1`／`run_phase2` 路徑須在本機存在且通過 preflight；否則預期 `NOT_READY` 或 preflight exit 3。）
+
+#### 下一步建議
+
+- **T12／T14**：以完整 phase3／phase4 schema 取代 minimal validator。
+- **Autonomous `all`**：實作非 dry-run 的 phase 序列與 gate 行為後，再放寬 `--phase all` 限制。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| Resume 跳過 phase2 preflight | `--resume` 時 `skip_phase2_preflight=True`，與 phase1 resume 相同「信任舊 state」風險 | 文件註明；若要強化可在 `dry_run` 加旗標強制重跑 | 可選：resume 後改 phase2 路徑仍顯 READY 之 MRE |
+| `fail_on_any_check: false` | `_append_check` 不寫 blocking，但 preflight 子項仍手動 `blocking.append` | 若需完整語意，preflight 失敗也應尊重 `fail_on_any_check` | 可選：`dry_run.fail_on_any_check: false` 行為單測 |
+| 重複 path 檢查 | `validate_paths_readable` 與 preflight 部分重疊 | 可接受為「顯式 checklist」；留意維護成本 | 現有 integration 路徑已覆蓋 |
+| 範例 `run_full.yaml` 相對路徑 | 依 repo 根解析；cwd 非 repo 根時行為依 CLI `cwd` | Runbook 註明於 repo 根執行 | 已有 `_resolve_config_path` 單元情境 |
+
+### STEP 3 — Tester（僅 tests）
+
+- 擴充：`tests/unit/test_precision_uplift_phase1_orchestrator.py` — `run_full` run_id mismatch、`build_run_full_input_summary` fingerprint、`--phase all` 無 dry-run exit 2、`run_all_phases_dry_run_readiness` READY（smoke／phase2 preflight mock）。
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（實作）
+
+- 實作與上述測試對齊；**44 passed**（同上指令）。
+
+**計畫狀態**：T16A（all-phase dry-run 骨架）已落地；建議下一項 **T10／T12** 依 MVP 優先序推進。
+
+---
+
+## 2026-04-10 CYCLE — precision_uplift Phase 2 T9（CLI + phase2 config + scaffold，/cycle_code 全四步）
+
+> 計畫：`.cursor/plans/PLAN.md`（索引）+ `PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T9**。根目錄無 `PLAN.md`；`DECISION_LOG.md` 見 `.cursor/plans/DECISION_LOG.md`。
+
+### STEP 1 — Builder（本輪變更）
+
+- **`investigations/precision_uplift_recall_1pct/orchestrator/config_loader.py`**
+  - 新增 `validate_phase2_config` / `load_phase2_config`（`phase`、`common`、`resources`、`tracks` A/B/C、`gate`；`yaml run_id` 若存在須與 CLI `--run-id` 一致）。
+- **`investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase2.yaml`**
+  - Phase 2 範例組態（對齊 runbook 草稿）。
+- **`investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py`**
+  - 支援 `--phase phase2`：`common` → `run_preflight` 所需欄位；`dry-run` 額外檢查 `phase2/` 可寫；`--collect-only` 僅 preflight、不寫 `phase2_scaffold`；完整跑則寫入 `steps.phase2_scaffold`（註明 T10–T11 待實作）。
+  - Phase 1 主流程抽成 `_main_phase1`；`main` 分流 `phase1` / `phase2`。
+  - `run_dry_run_readiness(..., extra_writable=...)` 可選加寫入目標檢查。
+- **`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**
+  - T9 完成項勾選；DoD 註記 phase2 T9 scaffold 範圍。
+
+#### 手動驗證
+
+```bash
+# Phase 2：需本機 paths + 兩 DB 表通過 preflight（範例路徑請改為實際存在）
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 \
+  --config investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase2.yaml \
+  --run-id my_phase2_run \
+  --skip-backtest-smoke
+
+# Dry-run（含 phase2 目錄可寫）
+python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+  --phase phase2 \
+  --config investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase2.yaml \
+  --run-id my_phase2_dry \
+  --dry-run \
+  --skip-backtest-smoke
+```
+
+#### 下一步建議
+
+- **T10**：Phase 2 track runner + `phase2_bundle.json` + collectors。
+- **T11**：`evaluate_phase2_gate` + `phase2/*.md` 報表。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| Phase2 仍無實驗執行 | `phase2_scaffold` 易誤解為「Phase2 已跑完」 | README／runbook 標註 T10 前僅 config+preflight；報表勿引用空 bundle | 已測：run_state 含 scaffold message |
+| `run_phase2.yaml` 預設路徑 | 範例 `out/models/...` 多數環境不存在 | 複製後改路徑；或 preflight 失敗屬預期 | 手動或整合測 with tmp_path（單元已覆蓋） |
+| `tracks.experiments` 結構 | 目前只驗證 schema，不執行 | T10 實作時對齊 trainer CLI 契約 | golden：最小 phase2 yaml round-trip |
+| `extra_writable` 命名碰撞 | 若與既有 `writable_*` 同名會覆蓋 artifacts | 命名空間前綴或禁止重複 key | 已測：`phase2_dir` 獨立 |
+| Resume + phase 混用 | 同 `run_id` 先 phase1 後 phase2 可能混淆 | 文件建議不同 run_id；或可選偵測 `prev.phase` | 可選後續測試 |
+| `phase2 --collect-only` | 與 phase1「仍跑 collect」語意不同 | 文件註明：phase2 在 T10 前無 collect，collect-only = 僅 preflight | 已測：`phase2_scaffold` 不存在 |
+
+### STEP 3 — Tester（僅 tests）
+
+- 擴充：`tests/unit/test_precision_uplift_phase1_orchestrator.py`
+  - Phase2 schema：`track` 缺失、`run_id` mismatch、`build_phase2_input_summary` fingerprint
+  - `run_dry_run_readiness(..., extra_writable=...)`
+  - CLI：`--phase phase2` 寫入 `run_state` + `phase2_scaffold`
+  - CLI：`--phase phase2 --collect-only` 不建立 `phase2_scaffold`
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q --tb=short
+```
+
+### STEP 4 — Tester（實作）
+
+- 補上 phase2 `--collect-only` 行為後再跑 pytest；**40 passed**（同上指令）。
+
+**計畫狀態**：MVP_TASKLIST **T9 完成**；建議下一項 **T10（track runner + phase2_bundle）**。
+
+---
+
 ## 2026-04-09 CYCLE — precision_uplift Phase1 Orchestrator MVP（T1+T2，STEP 1 Builder）
 
 > 計畫來源：repo 根目錄無 `PLAN.md`；本輪依 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` Day 1（T1 骨架+CLI、T2 config+preflight）。已讀 `.cursor/plans/DECISION_LOG.md`（架構決策參考）。

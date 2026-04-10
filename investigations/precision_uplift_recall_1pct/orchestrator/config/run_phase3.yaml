@@ -1,0 +1,15 @@
+# Phase 3 orchestrator config (minimal schema for T16A dry-run; full T12 schema later).
+phase: phase3
+upstream:
+  phase2_run_id: phase2_placeholder
+  winner_track: track_a
+  winner_exp_id: a_baseline
+common:
+  contract:
+    metric: precision_at_recall_1pct
+    timezone: Asia/Hong_Kong
+    exclude_censored: true
+resources:
+  max_parallel_jobs: 1
+workstreams: {}
+gate: {}

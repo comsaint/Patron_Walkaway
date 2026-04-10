@@ -1,0 +1,18 @@
+# All-phase root config (T16A): use with --phase all --dry-run until autonomous mode exists.
+phase: all
+execution:
+  phase_order:
+    - phase1
+    - phase2
+    - phase3
+    - phase4
+  stop_on_gate_block: true
+  allow_force_next: false
+phase_configs:
+  phase1: investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase1.yaml
+  phase2: investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase2.yaml
+  phase3: investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase3.yaml
+  phase4: investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase4.yaml
+# Optional: yaml run_id must match CLI --run-id when set.
+# run_id: my_all_phase_dry_run
+# Optional dry_run checklist overrides (defaults in orchestrator/config_loader.DRY_RUN_FLAG_DEFAULTS).

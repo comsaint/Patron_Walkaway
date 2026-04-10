@@ -1,4 +1,4 @@
-"""Unit tests for Phase 1 precision uplift orchestrator (MVP T1–T8)."""
+"""Unit tests for precision uplift orchestrator (Phase 1 MVP T1–T8, Phase 2 T9)."""
 
 from __future__ import annotations
 
@@ -103,7 +103,7 @@ def test_preflight_ok_minimal_dbs(tmp_path: Path) -> None:
     assert out["ok"] is True, out
 
 
-def test_run_pipeline_rejects_non_phase1() -> None:
+def test_run_pipeline_rejects_unsupported_phase() -> None:
     """CLI must exit 2 for unsupported --phase."""
     cfg_path = _ORCHESTRATOR / "config" / "run_phase1.yaml"
     proc = subprocess.run(
@@ -125,6 +125,211 @@ def test_run_pipeline_rejects_non_phase1() -> None:
     )
     assert proc.returncode == 2
     assert "phase9" in proc.stderr or "phase9" in proc.stdout
+
+
+def _minimal_phase2_dict(
+    *,
+    model_dir: str,
+    state_db: str,
+    pred_db: str,
+    yaml_run_id: str | None = None,
+) -> dict:
+    body: dict = {
+        "phase": "phase2",
+        "common": {
+            "model_dir": model_dir,
+            "state_db_path": state_db,
+            "prediction_log_db_path": pred_db,
+            "window": {
+                "start_ts": "2026-01-01T00:00:00+08:00",
+                "end_ts": "2026-01-08T00:00:00+08:00",
+            },
+            "contract": {
+                "metric": "precision_at_recall_1pct",
+                "timezone": "Asia/Hong_Kong",
+                "exclude_censored": True,
+            },
+        },
+        "resources": {
+            "max_windows": 2,
+            "max_trials_per_track": 2,
+            "max_parallel_jobs": 1,
+            "backtest_skip_optuna": True,
+        },
+        "tracks": {
+            "track_a": {
+                "enabled": True,
+                "experiments": [{"exp_id": "a0", "overrides": {}}],
+            },
+            "track_b": {
+                "enabled": True,
+                "experiments": [{"exp_id": "b0", "overrides": {}}],
+            },
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0", "overrides": {}}],
+            },
+        },
+        "gate": {
+            "min_uplift_pp_vs_baseline": 3.0,
+            "max_std_pp_across_windows": 2.5,
+        },
+    }
+    if yaml_run_id is not None:
+        body["run_id"] = yaml_run_id
+    return body
+
+
+def test_phase2_config_missing_track_raises() -> None:
+    """Phase 2 config must include track_a/b/c."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    del raw["tracks"]["track_c"]
+    with pytest.raises(config_loader.ConfigValidationError, match="E_CONFIG_INVALID"):
+        config_loader.validate_phase2_config(raw, cli_run_id="rid")
+
+
+def test_phase2_config_run_id_mismatch_raises() -> None:
+    """Optional yaml run_id must match CLI --run-id."""
+    raw = _minimal_phase2_dict(
+        model_dir="m", state_db="s", pred_db="p", yaml_run_id="yaml_rid"
+    )
+    with pytest.raises(config_loader.ConfigValidationError, match="run_id mismatch"):
+        config_loader.validate_phase2_config(raw, cli_run_id="cli_rid")
+
+
+def test_build_phase2_input_summary_fingerprint_stable() -> None:
+    """Phase 2 fingerprint changes when gate thresholds change."""
+    model_dir = "/models"
+    cfg1 = _minimal_phase2_dict(model_dir=model_dir, state_db="s", pred_db="p")
+    cfg2 = _minimal_phase2_dict(model_dir=model_dir, state_db="s", pred_db="p")
+    cfg2["gate"]["min_uplift_pp_vs_baseline"] = 9.0
+    p = Path("/tmp/phase2.yaml")
+    f1 = run_pipeline.build_phase2_input_summary(cfg1, p)["fingerprint"]
+    f2 = run_pipeline.build_phase2_input_summary(cfg2, p)["fingerprint"]
+    assert f1 != f2
+
+
+def test_run_dry_run_readiness_extra_writable_check(tmp_path: Path) -> None:
+    """extra_writable adds writable_* checks and artifacts when ok."""
+    cfg = _minimal_config_dict()
+    extra = tmp_path / "phase2_out"
+    with mock.patch("run_pipeline.runner.run_r1_r6_cli_smoke", return_value=(True, None)):
+        with mock.patch("run_pipeline.runner.run_backtest_cli_smoke", return_value=(True, None)):
+            out = run_pipeline.run_dry_run_readiness(
+                tmp_path,
+                tmp_path / "orch",
+                "dry_extra",
+                cfg,
+                skip_backtest_smoke=False,
+                extra_writable={"phase2_dir": extra},
+            )
+    assert out["status"] == "READY"
+    assert "writable_phase2_dir" in {c["name"] for c in out["checks"]}
+    assert "phase2_dir" in out["artifacts"]
+
+
+def test_run_pipeline_phase2_collect_only_skips_scaffold(tmp_path: Path) -> None:
+    """Phase 2 --collect-only stops after preflight (no phase2_scaffold step)."""
+    run_id = "pytest_phase2_collect_only"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+
+    cfg_file = tmp_path / "phase2_co.yaml"
+    cfg_file.write_text(
+        yaml.safe_dump(
+            _minimal_phase2_dict(
+                model_dir=str(model_dir),
+                state_db=str(state_db),
+                pred_db=str(pred_db),
+            )
+        ),
+        encoding="utf-8",
+    )
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    if state_json.is_file():
+        state_json.unlink()
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_RUN_PIPELINE),
+            "--phase",
+            "phase2",
+            "--config",
+            str(cfg_file),
+            "--run-id",
+            run_id,
+            "--collect-only",
+            "--skip-backtest-smoke",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(state_json.read_text(encoding="utf-8"))
+    assert "phase2_scaffold" not in data.get("steps", {})
+
+
+def test_run_pipeline_phase2_scaffold_writes_run_state(tmp_path: Path) -> None:
+    """Phase 2 run completes after preflight and records phase2_scaffold (T9)."""
+    run_id = "pytest_phase2_scaffold"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+
+    cfg_file = tmp_path / "phase2.yaml"
+    cfg_file.write_text(
+        yaml.safe_dump(
+            _minimal_phase2_dict(
+                model_dir=str(model_dir),
+                state_db=str(state_db),
+                pred_db=str(pred_db),
+            )
+        ),
+        encoding="utf-8",
+    )
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    if state_json.is_file():
+        state_json.unlink()
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_RUN_PIPELINE),
+            "--phase",
+            "phase2",
+            "--config",
+            str(cfg_file),
+            "--run-id",
+            run_id,
+            "--skip-backtest-smoke",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert state_json.is_file()
+    data = json.loads(state_json.read_text(encoding="utf-8"))
+    assert data["phase"] == "phase2"
+    assert data["steps"]["preflight"]["status"] == "success"
+    assert data["steps"]["phase2_scaffold"]["status"] == "success"
 
 
 def test_backtest_smoke_failure_returns_non_ok() -> None:
@@ -791,3 +996,190 @@ def test_dry_run_cli_not_ready_returns_6_and_writes_readiness(tmp_path: Path) ->
     data = json.loads(state_json.read_text(encoding="utf-8"))
     assert data["mode"] == "dry_run"
     assert data["readiness"]["status"] == "NOT_READY"
+
+
+def _minimal_run_full_dict(p1: str, p2: str, p3: str, p4: str) -> dict:
+    """Minimal ``run_full`` root mapping for tests."""
+    return {
+        "phase": "all",
+        "execution": {
+            "phase_order": ["phase1", "phase2", "phase3", "phase4"],
+            "stop_on_gate_block": True,
+            "allow_force_next": False,
+        },
+        "phase_configs": {
+            "phase1": p1,
+            "phase2": p2,
+            "phase3": p3,
+            "phase4": p4,
+        },
+    }
+
+
+def test_run_full_config_run_id_mismatch_raises() -> None:
+    """Optional yaml run_id must match CLI --run-id for run_full."""
+    raw = _minimal_run_full_dict("a.yaml", "b.yaml", "c.yaml", "d.yaml")
+    raw["run_id"] = "yaml_rid"
+    with pytest.raises(config_loader.ConfigValidationError, match="run_id mismatch"):
+        config_loader.validate_run_full_config(raw, cli_run_id="cli_rid")
+
+
+def test_build_run_full_input_summary_fingerprint_stable(tmp_path: Path) -> None:
+    """Same run_full inputs must yield stable fingerprint."""
+    p = tmp_path / "rf.yaml"
+    paths = {k: tmp_path / f"{k}.yaml" for k in ("phase1", "phase2", "phase3", "phase4")}
+    rf = _minimal_run_full_dict(
+        str(paths["phase1"]),
+        str(paths["phase2"]),
+        str(paths["phase3"]),
+        str(paths["phase4"]),
+    )
+    cfg = config_loader.validate_run_full_config(rf, cli_run_id="rid")
+    rp = {k: paths[k].resolve() for k in paths}
+    f1 = run_pipeline.build_run_full_input_summary(cfg, p, rp)["fingerprint"]
+    f2 = run_pipeline.build_run_full_input_summary(cfg, p, rp)["fingerprint"]
+    assert f1 == f2
+
+
+def test_cli_phase_all_without_dry_run_exits_2(tmp_path: Path) -> None:
+    """--phase all without --dry-run must exit 2 (autonomous mode not implemented)."""
+    rf_path = tmp_path / "run_full.yaml"
+    rf_path.write_text(
+        yaml.safe_dump(
+            _minimal_run_full_dict("x.yaml", "y.yaml", "z.yaml", "w.yaml")
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_RUN_PIPELINE),
+            "--phase",
+            "all",
+            "--config",
+            str(rf_path),
+            "--run-id",
+            "pytest_all_nodry",
+            "--skip-backtest-smoke",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 2
+
+
+def test_run_all_phases_dry_run_readiness_ready(tmp_path: Path) -> None:
+    """All-phase dry-run readiness READY when paths and checks pass (smokes mocked)."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+
+    p1 = _minimal_config_dict()
+    p1["model_dir"] = str(model_dir)
+    p1["state_db_path"] = str(state_db)
+    p1["prediction_log_db_path"] = str(pred_db)
+
+    p1_path = tmp_path / "phase1.yaml"
+    p1_path.write_text(yaml.safe_dump(p1), encoding="utf-8")
+
+    p2_body = _minimal_phase2_dict(
+        model_dir=str(model_dir),
+        state_db=str(state_db),
+        pred_db=str(pred_db),
+    )
+    p2_path = tmp_path / "phase2.yaml"
+    p2_path.write_text(yaml.safe_dump(p2_body), encoding="utf-8")
+
+    p3_body = {
+        "phase": "phase3",
+        "upstream": {
+            "phase2_run_id": "p2rid",
+            "winner_track": "track_a",
+            "winner_exp_id": "a0",
+        },
+        "common": {
+            "contract": {
+                "metric": "precision_at_recall_1pct",
+                "timezone": "Asia/Hong_Kong",
+                "exclude_censored": True,
+            }
+        },
+        "resources": {"max_parallel_jobs": 1},
+        "workstreams": {},
+        "gate": {},
+    }
+    p3_path = tmp_path / "phase3.yaml"
+    p3_path.write_text(yaml.safe_dump(p3_body), encoding="utf-8")
+
+    p4_body = {
+        "phase": "phase4",
+        "candidate": {
+            "model_dir": str(model_dir),
+            "source_phase3_run_id": "p3rid",
+            "threshold_strategy": "holdout_selected",
+        },
+        "evaluation": {
+            "windows": [
+                {
+                    "start_ts": "2026-01-01T00:00:00+08:00",
+                    "end_ts": "2026-01-08T00:00:00+08:00",
+                }
+            ],
+            "contract": {
+                "metric": "precision_at_recall_1pct",
+                "timezone": "Asia/Hong_Kong",
+                "exclude_censored": True,
+            },
+        },
+        "resources": {"max_parallel_jobs": 1},
+        "gate": {},
+    }
+    p4_path = tmp_path / "phase4.yaml"
+    p4_path.write_text(yaml.safe_dump(p4_body), encoding="utf-8")
+
+    rf = _minimal_run_full_dict(
+        str(p1_path), str(p2_path), str(p3_path), str(p4_path)
+    )
+    rf_cfg = config_loader.validate_run_full_config(rf, cli_run_id="all_rid")
+    resolved = {
+        "phase1": p1_path.resolve(),
+        "phase2": p2_path.resolve(),
+        "phase3": p3_path.resolve(),
+        "phase4": p4_path.resolve(),
+    }
+    orch = tmp_path / "orch"
+    with mock.patch.object(
+        run_pipeline.runner,
+        "run_preflight",
+        return_value={"ok": True, "checks": []},
+    ):
+        with mock.patch.object(
+            run_pipeline.runner,
+            "run_r1_r6_cli_smoke",
+            return_value=(True, None),
+        ):
+            with mock.patch.object(
+                run_pipeline.runner,
+                "run_backtest_cli_smoke",
+                return_value=(True, None),
+            ):
+                out = run_pipeline.run_all_phases_dry_run_readiness(
+                    tmp_path,
+                    orch,
+                    "run1",
+                    rf_cfg,
+                    resolved,
+                    skip_backtest_smoke=False,
+                    skip_phase1_preflight=True,
+                    skip_phase2_preflight=False,
+                )
+    assert out["status"] == "READY", out
+    assert out["blocking_reasons"] == []

@@ -11,10 +11,10 @@
 | 2026-03-25 | Task 9B 追加 `retry_end` = lookahead + extended wait + freshness buffer，補強延遲標註補查策略 | 已實作二階段補查以緩解 delayed label | 補查策略可能增加計算延遲與資源成本 | 部分 | 重驗 | 需補觀測：補查命中率、延遲分佈、對 precision@1% 實際影響 |
 
 <!-- ORCHESTRATOR_RUN_NOTE_START -->
-**Last orchestrator run**: `prod_phase1_20260409`
+**Last orchestrator run**: `pytest_resume_skip`
 
-- **Gate status**: `PRELIMINARY`
-- **blocking_reasons**: `['below_gate_time_or_sample_thresholds']`
+- **Gate status**: `FAIL`
+- **blocking_reasons**: `['collect_error:E_COLLECT_BACKTEST_METRICS', 'collect_error:E_COLLECT_R1_PAYLOAD', 'collect_error:E_COLLECT_STATE_DB']`
 - Please keep narrative cross-check above this block; edit conflicts rare.
 
 <!-- ORCHESTRATOR_RUN_NOTE_END -->

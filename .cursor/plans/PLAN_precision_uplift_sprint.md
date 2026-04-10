@@ -1,7 +1,7 @@
 # Precision 提升衝刺計畫（Recall=1%）
 
-> 最後更新：2026-04-08（納入外部審查：Phase 1 對照 STATUS 歷史與時程重排閘門）  
-> 目標：在相同評估口徑下，將 `precision@recall=1%` 由目前約 40% 提升至 **>60%**。
+> 最後更新：2026-04-10（對齊 Autonomous-first 執行策略）  
+> 目標：在相同評估口徑下，將 `precision@recall=1%` 由目前約 40% 提升至 **>=60%**。
 
 ---
 
@@ -14,6 +14,11 @@
 | 評估約束 | 同資料切分、同時間窗、同標籤定義（避免口徑漂移） |
 | 穩定性要求 | Forward/Purged 時序驗證平均達標，且波動可控 |
 | 上線門檻 | 不只單一 holdout 漂亮，需跨窗一致成立 |
+
+### 1.1 執行策略（對齊文件）
+
+- 預設採用 `run_pipeline.py --phase all --mode autonomous` 單一命令流程。
+- Manual/ad-hoc 流程僅作 fallback（除錯、緊急接手），非日常主流程。
 
 ---
 
