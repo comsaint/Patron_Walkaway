@@ -1,0 +1,70 @@
+# Phase 2 — 已依本機產物填寫（model: 20260408-173809-e472fd0）
+#
+# 使用方式（CLI --run-id 為準；若下方設定 run_id 則須與 CLI 一致）：
+#   python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
+#     --phase phase2 --config investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase2.patron_e472fd0.yaml \
+#     --run-id phase2_patron_e472fd0_001 --dry-run
+#
+# 若 dry-run 在 backtester smoke 失敗（trainer 預期 out/models/feature_spec.yaml 而實際在 model 子目錄）：
+#   加上 --skip-backtest-smoke，或將 deploy 用的 feature_spec 放到 trainer 預期路徑。
+#
+# 已代填：
+# - common.model_dir、state_db_path、prediction_log_db_path（與 run_phase1.yaml 一致）
+# - common.window 與 run_phase1.yaml 相同，利於 Phase 1 / 2 同契約對照
+# - resources.trainer_use_local_parquet: true（repo 內 data/*.parquet 存在時供 trainer 使用）
+# - 各軌 baseline 的 training_metrics_repo_relative → 現有訓練產物目錄（不需先重訓即可 harvest / per-job backtest）
+#
+# 仍須你方後續處理：
+# - YAML overrides 尚未接到 trainer.trainer；a_hard_negative_v1 等若要不同訓練，需擴充 CLI 或手動產出另一目錄後填 training_metrics_repo_relative
+# - 調整 window 時請同步檢查與資料／標籤成熟規則是否一致
+
+phase: phase2
+
+common:
+  model_dir: out/models/20260408-173809-e472fd0
+  state_db_path: local_state/state.db
+  prediction_log_db_path: local_state/prediction_log.db
+  window:
+    start_ts: "2026-01-01T00:00:00+08:00"
+    end_ts: "2026-01-08T00:00:00+08:00"
+  contract:
+    metric: precision_at_recall_1pct
+    timezone: Asia/Hong_Kong
+    exclude_censored: true
+
+resources:
+  max_windows: 3
+  max_trials_per_track: 6
+  max_parallel_jobs: 1
+  backtest_skip_optuna: true
+  trainer_use_local_parquet: true
+  # 可視牆鐘打開（秒）：
+  # phase2_trainer_job_timeout_sec: 7200
+  # phase2_backtest_timeout_sec: 7200
+
+tracks:
+  track_a:
+    enabled: true
+    experiments:
+      - exp_id: a_baseline
+        overrides: {}
+        training_metrics_repo_relative: out/models/20260408-173809-e472fd0
+      - exp_id: a_hard_negative_v1
+        overrides:
+          hard_negative_weight: 2.0
+  track_b:
+    enabled: true
+    experiments:
+      - exp_id: b_baseline
+        overrides: {}
+        training_metrics_repo_relative: out/models/20260408-173809-e472fd0
+  track_c:
+    enabled: true
+    experiments:
+      - exp_id: c_baseline
+        overrides: {}
+        training_metrics_repo_relative: out/models/20260408-173809-e472fd0
+
+gate:
+  min_uplift_pp_vs_baseline: 3.0
+  max_std_pp_across_windows: 2.5

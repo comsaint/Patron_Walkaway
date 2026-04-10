@@ -3,6 +3,14 @@
 > 來源：`PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` §2  
 > 目標：先完成 Phase 1 MVP，並以同一框架擴充到 Phase 2~4 與 `--phase all` 無人值守自動化。
 
+## 文件契約（避免 singleton plans）
+
+- 本文件是 **工程實作真相（Implementation SSoT）**：已完成/未完成、限制、DoD 以此為準。
+- `PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` 是 **操作真相（Operations SSoT）**：流程步驟、執行命令、故障處理。
+- 若兩文件敘述衝突，以本文件的實作狀態為準；Runbook 必須引用本文件對應任務（例如 T10A/T10B/T11A）。
+- 任何新增 Phase 2 策略參數（如 hard negative/focal/gating）必須先在本文件登記「trainer 是否已支援」與對應任務狀態。
+- **與 `.cursor/plans/STATUS.md` 的關係**：該檔為整 repo（trainer／deploy／validator 等）的**總覽與歷史輪次**，**通常不含**本調查 orchestrator 的細項；**precision uplift orchestrator 的實作狀態以本文件 + `orchestrator/run_pipeline.py` 為準**。
+
 ---
 
 ## 0. 範圍與版本策略
@@ -14,17 +22,26 @@
 - [x] 支援 collect、Gate 判斷、`phase1/*.md` 報告輸出
 - [x] 支援 `run_state.json`、`--resume`、`--dry-run`
 
-### 0.2 待擴充（V2 / V3 / V4 / V5）
+### 0.2 實作現況快照（與 `run_pipeline.py` 對齊）
 
-- [ ] `--phase phase2` 自動化（Track A/B/C runner + Phase 2 Gate）
+| `--phase` | 現況（2026-04-11） |
+| :--- | :--- |
+| `phase1` | **Full run 可用**：preflight → R1/R6 → backtest → collect → Gate → `phase1/*.md` |
+| `phase2` | **Full run 可用（部分能力）**：preflight → plan bundle → runner smoke →（可選）`trainer.trainer` 每 job、harvest、（可選）per-job / shared backtest → gate → `phase2/*.md`。YAML `overrides` **尚未**接到 trainer；科學有效性 Gate 見 **T11A（待辦）**；真多窗自動彙整見 T10 未完成項 |
+| `all` | **僅 `--dry-run`**：all-phase readiness（T16A）。**非 dry-run 的 `--phase all` 會 exit 2**，`--mode autonomous` **不存在**於現有 CLI |
+| `phase3` \| `phase4` | **無獨立 full run**；僅 all-phase dry-run 下的 **minimal schema** 驗證（T16A） |
+
+### 0.3 待擴充（V2 / V3 / V4 / V5）
+
+- [ ] **`phase2` 完整**自動化：T10 未完成項（每實驗跨窗矩陣、統一結果結構、fail-fast）、**T10A/T10B/T11A**（參數白名單、能力矩陣、科學 Gate）
 - [ ] `--phase phase3` 自動化（勝者路線加深 + Phase 3 Gate）
 - [ ] `--phase phase4` 自動化（freeze/multi-window/impact/go-no-go）
-- [ ] `--phase all` 多 phase 串接（依 Gate 決定是否進下一階段）
-- [ ] Autonomous supervisor（長跑狀態機、checkpoint、故障自復）
+- [ ] `--phase all` **非 dry-run** 多 phase 串接（依 Gate 決定是否進下一階段；**T16**）
+- [ ] Autonomous supervisor（長跑狀態機、checkpoint、故障自復；**T8A–T8D / T17**）
 - [ ] 中途/期末 snapshot 全自動（不需手動落 `r1_r6_mid.stdout.log`）
 - [ ] scorer/validator 生命週期全自動（啟動、健康檢查、重啟、回收）
 
-### 0.3 明確不在近期範圍（先不做）
+### 0.4 明確不在近期範圍（先不做）
 
 - 複雜分散式排程與高度並行化 DAG（本專案先維持單機單流程）
 - 全自動最終商業決策（Go/No-Go 仍需人工簽核）
@@ -197,6 +214,38 @@
   - [ ] 任一路線輸出缺檔 → `E_ARTIFACT_MISSING`
   - [ ] 窗口無資料 → `E_NO_DATA_WINDOW`
 
+#### T10A - Strategy Parameters Wiring（trainer ↔ orchestrator）
+
+- [ ] Phase 2 config 新增 `trainer_params` 白名單（取代任意 `overrides` 直接宣稱可用）
+  - [ ] 初始白名單先對齊現有 trainer CLI：`use_local_parquet`、`skip_optuna`、`recent_chunks`、`sample_rated`、`lgbm_device`
+  - [ ] 進階策略（如 `hard_negative_weight`）僅在 trainer 已實作且有明確入口時加入白名單
+- [ ] `runner.build_phase2_trainer_argv` 將白名單參數映射為實際 CLI argv
+- [ ] config 驗證：白名單外 key 一律 `E_CONFIG_INVALID`（禁止 silently unapplied）
+- [ ] 每個 `job_spec` 落地 `resolved_trainer_argv` 與 `argv_fingerprint`（可稽核、可重現）
+- [ ] `phase2_bundle`／`track_*_results.md` 顯示「參數已套用」證據欄位
+
+#### T10B - Trainer Capability Matrix（策略能力矩陣）
+
+- [ ] 在本文件維護「策略欄位 -> trainer 狀態」矩陣（`supported` / `planned` / `blocked`）
+- [ ] matrix 至少包含：`objective_variant`、`hard_negative_weight`、`gating_strategy`、`time_cv_policy`
+- [ ] 若欄位為 `planned` 或 `blocked`，Runbook 不得把該欄位當作可執行實驗參數
+
+**Trainer Capability Matrix（v0，2026-04-11）**
+
+| 欄位 / 策略能力 | 狀態 | trainer 現況（摘要） | orchestrator Phase 2 現況 | 下一步（任務） |
+| :--- | :--- | :--- | :--- | :--- |
+| `use_local_parquet` | `supported` | `trainer.trainer` CLI 已支援 `--use-local-parquet` | `build_phase2_trainer_argv` 已可透過 resources 傳遞 | 納入 T10A 白名單並加 argv 證據落地 |
+| `skip_optuna` | `supported` | `trainer.trainer` CLI 已支援 `--skip-optuna` | `build_phase2_trainer_argv` 已可透過 resources 傳遞 | 納入 T10A 白名單並加 argv 證據落地 |
+| `recent_chunks` | `supported` | `trainer.trainer` CLI 已支援 `--recent-chunks` | 尚未由 phase2 YAML 映射到 argv | T10A 實作映射 + schema 驗證 |
+| `sample_rated` | `supported` | `trainer.trainer` CLI 已支援 `--sample-rated` | 尚未由 phase2 YAML 映射到 argv | T10A 實作映射 + schema 驗證 |
+| `lgbm_device` | `supported` | `trainer.trainer` CLI 已支援 `--lgbm-device` | 尚未由 phase2 YAML 映射到 argv | T10A 實作映射 + schema 驗證 |
+| `objective_variant` | `planned` | 尚無通用 CLI 入口切換 objective（需明確設計） | YAML 可表達意圖，但目前不保證生效 | T10A 定義白名單語意 + trainer 端接口 |
+| `hard_negative_weight` | `blocked` | 未見對應 CLI 或訓練邏輯（僅 YAML 意圖） | `overrides` 目前列為 `unapplied_overrides` | 先實作 trainer 能力，再納入 T10A |
+| `gating_strategy`（Track B） | `blocked` | trainer 目前無明確「分群路由/子模型 gating」接口 | YAML 尚無可執行語意映射 | 先定義訓練/推論契約，再接 orchestrator |
+| `time_cv_policy`（Track C） | `planned` | backtester/驗證可做時序評估，但尚無完整「每實驗多窗策略」契約 | gate 目前有 MVP bridge（兩點序列），非完整多窗 | T10 + T11A 補齊 per-exp per-window 結構 |
+
+> 狀態定義：`supported` = trainer 已有可用入口且可由 orchestrator 穩定映射；`planned` = 設計方向存在但未落地完整接口；`blocked` = 目前無 trainer 能力或契約不足，不能當作可執行實驗參數。
+
 **完成定義**
 - [x] **（plan_only 階段）** 同一 phase2 YAML + 固定 `run_id` 下，`phase2_bundle.json`（`bundle_kind: phase2_plan_v1`）內容可重現（僅由 config 展開；不含 trainer 隨機性）
 - [ ] **（runner 階段）** 含訓練／回測產物後仍滿足可重現與可追溯
@@ -214,6 +263,13 @@
 - [x] `report_builder.py` 新增 **`phase2/phase2_gate_decision.md`**（與 `run_state.phase2_gate_decision` 同步；**plan_only 僅能記錄 BLOCKED 與 blocking reasons**）
 - [x] **`run_pipeline.py`**：可選 **`--phase2-fail-on-gate-fail`**（**FAIL** → **exit 9**／**`E_PHASE2_GATE_FAIL`**）、**`--phase2-fail-on-gate-blocked`**（**BLOCKED** → **exit 10**／**`E_PHASE2_GATE_BLOCKED`**）；**`phase2_gate_report`** **failed** 時利於 **`--resume`** 重跑
 - [x] **Std gate（MVP）**：bundle 可選 **`phase2_pat_series_by_experiment`**（`track -> {exp_id: [PAT@1% 每窗]}`）；**`statistics.stdev`×100** 與 **`gate.max_std_pp_across_windows`** 比較；僅在 **uplift 已 PASS** 時 std 超標 → **`FAIL`**（**`phase2_std_exceeds_max_pp_across_windows`**）；否則 std 結果僅 **informational**
+
+#### T11A - Scientific Validity Gate（避免「流程有跑但不可下結論」）
+
+- [ ] Gate 新增 `strategy_effective` 檢查：每個候選實驗必須具備「已套用參數證據」（`resolved_trainer_argv` + fingerprint）
+- [ ] 若實驗參數未生效（例如僅有 YAML 宣告、無 trainer 支援），`evaluate_phase2_gate` 必須回 `BLOCKED` 並列出 `phase2_strategy_params_not_effective`
+- [ ] 至少兩個時間窗且有可比 uplift/std，才可輸出「winner track」；否則不得給決策級結論
+- [ ] `phase2/phase2_gate_decision.md` 新增 `conclusion_strength`：`exploratory` / `comparative` / `decision_grade`
 
 **完成定義**
 - [x] **（現況）** `phase2_gate_decision.md` 含 gate status、blocking reasons、evidence 摘要（**尚無**勝者路線／uplift 數值，待 T10 metrics）
@@ -339,13 +395,14 @@
 
 ### 已完成
 - Day 1~3：T1~T8（Phase 1 MVP）
-- **T16A**（2026-04-10）：`--phase all --dry-run`、`run_full.yaml`、`run_state.readiness`、phase3／4 **minimal** 範例與驗證（見 STATUS 同日 CYCLE）
-- **T10 部分**（2026-04-10）：`collect_phase2_plan_bundle`、`job_specs`、`phase2_plan_bundle`；**`phase2_runner_smoke`**（mkdir + `trainer.trainer --help` 可選略過）；bundle 內 **`runner_smoke`**；**實驗訓練矩陣 subprocess** 與產物彙整仍待
-- **T11 部分**（2026-04-10）：`evaluate_phase2_gate`、`phase2_gate_report` 步驟、`phase2/phase2_gate_decision.md`（plan_only → **BLOCKED**；uplift gate 規則仍待 T10 指標）
+- **T16A**（2026-04-10）：`--phase all --dry-run`、`run_full.yaml`、`run_state.readiness`、phase3／4 **minimal** 範例與驗證
+- **T9**（phase2）：`--phase phase2`、schema、`run_phase2.yaml`
+- **T10 部分**（2026-04-10 起）：plan bundle、`job_specs`、`phase2_plan_bundle`、**`phase2_runner_smoke`**、**可選** `--phase2-run-trainer-jobs`（每 job `trainer.trainer`）、**`phase2_job_metrics_harvest`**、可選 **`--phase2-run-per-job-backtests`** / **`--phase2-run-backtest-jobs`**
+- **T11 部分**（2026-04-10 起）：`evaluate_phase2_gate`、`phase2_gate_report`、`phase2/phase2_gate_decision.md`、`phase2/track_*_results.md`（MVP uplift/std；真多窗與 **T11A** 仍待）
 
 ### 下一輪建議
 - Sprint A0（3~5 天）：T8A~T8D（Phase 1 Autonomous 閉環）
-- Sprint A（3~5 天）：T9 ✅、**T10 進行中**（plan bundle ✅／runner 待）、**T11 進行中**（gate+gate md ✅／uplift 規則與 track 報表待）
+- Sprint A（3~5 天）：T9 ✅、**T10 收尾**（跨窗矩陣、fail-fast、統一結果結構）+ **T10A/T10B**（白名單參數、能力矩陣落地）、**T11A**（科學有效性 Gate）
 - Sprint B（3~5 天）：T12~T13（Phase 3）
 - Sprint C（3~5 天）：T14~T15（Phase 4）
 - Sprint D（2~3 天）：**T16A ✅**；**T16** 剩餘（`--phase all` 非 dry-run Gate 串接、resume 到 phase 級）
@@ -361,7 +418,7 @@
 - [x] `run_state` / `resume` / `dry-run` 可用
 
 ### Phase 2~4（待完成）
-- [x] `--phase phase2` 可獨立執行（T9：config + preflight + `run_state` + `phase2_scaffold`；T10：`phase2_bundle.json` + **`job_specs`** + **`phase2_runner_smoke`**（log 目錄 + 可選 `trainer.trainer --help`）；T11：gate + `phase2_gate_decision.md`；**實驗級訓練**、uplift gate 數值、各 track `.md` 仍待）
+- [x] `--phase phase2` 可獨立執行（T9–T11 MVP）：config、preflight、`phase2_bundle`、`job_specs`、runner smoke、**可選**訓練／回測旗標、gate、`phase2/*.md`。**未完成**：YAML `overrides`→trainer、真多窗自動彙整、T10A/T10B/T11A、T10 列為未勾之 fail-fast／統一結果結構
 - [ ] `--phase phase3|phase4` 可獨立執行
 - [x] **`--phase all --dry-run`** 可跑 all-phase readiness（T16A；含 phase3／4 **minimal** schema）
 - [ ] 每 phase 都有 config schema + preflight + collector + evaluator + report

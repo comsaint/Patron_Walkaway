@@ -2,11 +2,19 @@
 
 > 適用情境：已有訓練完成模型，但尚未開始 backtest / scorer / validator 蒐證。  
 > 目標：以**單次調查 run**收齊證據，並落地腳本化執行。  
-> 執行原則：**Autonomous 為預設，Ad-hoc/手動僅作 fallback**（除錯或緊急接手）。
+> 執行原則：**長期目標**為 Autonomous 單一命令閉環；**目前 orchestrator 可執行**者為 `--phase phase1` / `phase2` 的 full run 與 `--phase all --dry-run`（見 §1.2a）。其餘 Autonomous 步驟為 **Tasklist 待辦**（T8A–T8D、T16–T17），Ad-hoc／手動為現況補位。
+
+## 0) 文件契約與同步規則（避免 singleton plans）
+
+- 本文件是 **Operations SSoT**（怎麼跑、怎麼檢查、失敗怎麼處理）。
+- `PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` 是 **Implementation SSoT**（功能是否已實作、限制、DoD）。
+- 若兩文件敘述衝突，以 Tasklist 為準；本文件不得把 Tasklist 中 `planned` / `blocked` 的功能寫成可直接執行。
+- Phase 2 的策略欄位（如 `hard_negative_weight`）是否可用，必須先對照 Tasklist 的 **T10A/T10B/T11A**。
+- **`.cursor/plans/STATUS.md`**：整 repo 狀態與歷史輪次（trainer／deploy 等）；**不含**本調查 orchestrator 的權威細項。**本調查執行現況**以 Tasklist **§0.2 快照**與 `orchestrator/run_pipeline.py` 為準。
 
 ---
 
-## 1) 一次性執行方案（Autonomous 預設，原 EXECUTION_PLAN §8）
+## 1) 執行方案（原 EXECUTION_PLAN §8；分「現況可跑」與「目標 Autonomous」）
 
 ### 1.1 Run 定義（先固定，不可中途漂移）
 
@@ -20,31 +28,31 @@
 
 > 原則：run 期間不更換模型、不改 threshold 策略、不改標籤契約；避免結論不可比較。
 
-### 1.2 執行順序（一次跑完，無人工介入）
+### 1.2a 目前可執行（orchestrator 現況；與 Tasklist §0.2 一致）
 
-1. **Dry-run 快檢（production 前 2~10 分鐘）**
-  - 跑 orchestrator `--phase all --dry-run`，確認 phase1~4 config / 路徑 / DB / 相依 / 命令可啟動性。
-  - 僅做 readiness 檢查，不產生正式結論。
-2. **啟動 autonomous run（單一命令）**
-  - 跑 `run_pipeline.py --phase all --mode autonomous --run-id ... --config ...`。
-  - 由 orchestrator 接管長跑，不再要求人工分段執行。
-3. **自動 preflight + 觀測啟動**
-  - 自動驗證路徑與連線可用（model / state DB / prediction DB / ClickHouse）。
-  - 自動啟動並監控 `scorer` / `validator` 子程序（健康檢查、重啟、回收）。
-4. **自動 checkpoint 蒐證（mid/final）**
-  - 依設定（例如 `t+6h`、`t+24h`、`end`）自動執行 `run_r1_r6_analysis.py --mode all`。
-  - 自動產生 mid/final snapshots（不可互相覆寫）。
-5. **自動終點採樣與回測**
-  - 在終點自動產生 final R1/R6 payload。
-  - 自動執行固定窗口 backtest，產出 run 綁定的 `backtest_metrics`。
-6. **自動彙整工件與 Gate**
-  - 自動生成 `phase1/` 六份工件與 Gate 結論。
-  - 若流程中斷，可 `--resume` 從 checkpoint 接續。
+1. **All-phase dry-run（建議每次改 config 後執行）**
+   - `run_pipeline.py --phase all --dry-run --config .../run_full.yaml --run-id <id>`
+   - **注意**：CLI **無** `--mode`；`--phase all` **必須**帶 `--dry-run`，否則 exit **2**（長跑串接未實作）。
+   - 僅 readiness，不產正式調查結論。
+2. **Phase 1 full run**
+   - `run_pipeline.py --phase phase1 --config .../run_phase1.yaml --run-id <id>`（可加 `--dry-run` / `--resume` / `--collect-only`）
+3. **Phase 2 full run**
+   - `run_pipeline.py --phase phase2 --config .../run_phase2.yaml --run-id <id>`（可加 `--dry-run`、`--resume`、**`--phase2-run-trainer-jobs`**、**`--phase2-run-per-job-backtests`**、**`--phase2-run-backtest-jobs`**、`--skip-backtest-smoke`、`--skip-phase2-trainer-smoke` 等）
+   - **跨窗**：單次 run 仍以 `common.window` 為主；多窗可比需 **多次 run** 或 YAML **`precision_at_recall_1pct_by_window`**（見 Tasklist T10／T11），全自動多窗矩陣仍待 T10 收尾。
+
+### 1.2b 目標流程（Autonomous 單一命令；對應 Tasklist T8A–T8D、T16–T17，**尚未實作**）
+
+以下為**規格願景**，勿當成現有 CLI 可直接跑通：
+
+1. Dry-run 後啟動 **單一 autonomous 命令**（orchestrator 代管長跑）。
+2. 自動 preflight、觀測、checkpoint（mid/final R1/R6）、終點 backtest、彙整工件與 Gate；中斷可 `--resume`。
+
+> 實作完成後，應回寫本節與 Tasklist §0.2，並補上**實際**旗標與 exit code。
 
 ### 1.3 輸出對應（Phase 1 工件 -> 證據來源）
 
 - `phase1/status_history_crosscheck.md`
-  - 來源：`STATUS.md` 歷史對照 + 本輪人工判定（沿用/重驗/已失效）
+  - 來源：調查用 **`STATUS.md`（或同等歷史對照文件）** + 本輪人工判定（沿用/重驗/已失效）。**勿與** `.cursor/plans/STATUS.md`（全 repo 技術狀態日誌）混淆；兩者用途不同。
 - `phase1/slice_performance_report.md`
   - 來源：`prediction_log` + `alerts` + `validation_results` 切片統計
 - `phase1/label_noise_audit.md`
@@ -93,20 +101,31 @@
 - backtest 日常蒐證優先 `--skip-optuna`，將重型搜索留到補充實驗。
 - 每次 ad-hoc 命令要保留輸出 payload（JSON）與 run_id，避免不可追溯。
 
-### 1.7 Dry-run 指令與判讀（全流程）
+### 1.7 Dry-run 指令與判讀（all-phase readiness）
 
 ```bash
 python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
   --phase all \
   --dry-run \
-  --mode autonomous \
   --config investigations/precision_uplift_recall_1pct/orchestrator/config/run_full.yaml \
   --run-id <run_id>
 ```
 
-- `READY`：可啟動 full run。
-- `NOT_READY`：不得啟動 full run，先依 `blocking_reasons` 修復。
+（可選）略過 backtest CLI smoke：`--skip-backtest-smoke`
+
+- `READY`：靜態／preflight／（可選）smoke 通過；可繼續跑 **`phase1` / `phase2` full run**（見 §1.2a）。**不代表** `--phase all` 非 dry-run 已可執行。
+- `NOT_READY`：先依 `blocking_reasons` 修復。
 - 建議：每次變更 config、model_dir、window 或 DB 路徑後都重跑 dry-run。
+
+### 1.8 Phase 2 科學可判讀前置清單（必做）
+
+> 目的：避免「流程有跑」但無法回答哪條策略最有希望。
+
+- [ ] **策略參數已生效**：每個候選實驗可產生 `resolved_trainer_argv`（對照 Tasklist `T10A`）。
+- [ ] **能力矩陣已確認**：實驗使用欄位在 Tasklist `T10B` 為 `supported`，非 `planned`/`blocked`。
+- [ ] **契約一致**：與 Phase 1 同 `metric/timezone/censored`，且比較窗可對齊。
+- [ ] **至少雙窗**：每路線至少 2 個時間窗可比結果，避免單窗幻覺（對照 Tasklist `T11A`）。
+- [ ] **結論強度標註**：報告需標 `exploratory` / `comparative` / `decision_grade`，不可省略。
 
 ---
 
@@ -116,8 +135,9 @@ python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py 
 
 - 目標：將目前手動流程改為可重跑、可中斷續跑、可生成工件的 orchestrator，最終覆蓋 Phase 1~4，並達成單一命令 E2E。
 - 範圍：
-  - 已完成：Phase 1 MVP（`--phase phase1` + `--dry-run` + `--resume`）。
-  - 下一步：先完成 Phase 1 Autonomous 閉環，再擴充 Phase 2~4（track runner、phase gate、go/no-go pack）。
+  - **已完成**：Phase 1 MVP；**`--phase phase2` MVP**（plan／可選訓練與回測／gate／報表）；**`--phase all --dry-run`**（T16A）。
+  - **進行中**：Phase 2 完整矩陣與科學 Gate（T10 收尾、T10A/T10B/T11A）。
+  - **未開始**：Phase 3/4 獨立 full run；`--phase all` 非 dry-run 串接；Autonomous supervisor（T8A–T8D、T17）。
   - 保留人工決策：最終上線裁決仍由 reviewer/owner 簽核，orchestrator 提供證據與建議。
 
 ### 2.2 建議檔案結構
@@ -138,15 +158,17 @@ python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py 
 
 ### 2.3 CLI 設計
 
-- `python run_pipeline.py --phase phase1 --config config/run_phase1.yaml`
-- `python run_pipeline.py --phase phase2 --config config/run_phase2.yaml`
-- `python run_pipeline.py --phase phase3 --config config/run_phase3.yaml`
-- `python run_pipeline.py --phase phase4 --config config/run_phase4.yaml`
-- `python run_pipeline.py --phase all --config config/run_full.yaml`
-- `python run_pipeline.py --phase all --mode autonomous --config config/run_full.yaml --run-id <run_id>`
-- `python run_pipeline.py --phase phase1 --resume --run-id <run_id>`
-- `python run_pipeline.py --phase phase1 --collect-only`
-- `python run_pipeline.py --phase phase1 --dry-run --config config/run_phase1.yaml --run-id <run_id>`
+**已實作（`run_pipeline.py`）**（路徑請自 repo 根調整；均需 `--run-id`）：
+
+- `--phase phase1` + `--config .../run_phase1.yaml`（可選 `--dry-run`、`--resume`、`--collect-only`、`--skip-backtest-smoke`）
+- `--phase phase2` + `--config .../run_phase2.yaml`（可選 `--dry-run`、`--resume`、`--skip-backtest-smoke`、`--skip-phase2-trainer-smoke`、`--phase2-run-trainer-jobs`、`--phase2-run-per-job-backtests`、`--phase2-run-backtest-jobs`、`--phase2-fail-on-gate-fail`、`--phase2-fail-on-gate-blocked`）
+- `--phase all` + `--config .../run_full.yaml` + **`--dry-run` 必備**（可選 `--resume`、`--skip-backtest-smoke`）
+
+**規劃中（尚未實作；勿寫進操作 runbook 當現況命令）**：
+
+- `--phase phase3` / `--phase phase4` 獨立 full run
+- `--phase all` 非 dry-run、Gate-driven 串接
+- `--mode autonomous`（目前 **不存在**）
 
 ### 2.3.1 最小 config schema 草稿（可直接做為實作起點）
 
@@ -202,6 +224,9 @@ gate:
   max_std_pp_across_windows: 2.5
 ```
 
+> 注意：上例 `overrides.hard_negative_weight` 僅為「策略意圖」示例；是否可執行取決於 trainer 是否已實作且已完成 orchestrator 映射。  
+> 在 Tasklist `T10A/T10B` 完成前，不可把該欄位視為已生效訓練參數。
+
 #### B) `run_phase3.yaml`（Winner route 加深）
 
 ```yaml
@@ -211,7 +236,8 @@ run_id: "phase3_20260412"
 upstream:
   phase2_run_id: "phase2_20260410"
   winner_track: track_a
-  winner_exp_id: a_hard_negative_v1
+  # 示意：請替換為 Phase 2 實際勝者 exp_id（勿預設為 hard-negative 名稱，除非 T10B 已標為 supported）
+  winner_exp_id: a_candidate_winner
 
 common:
   model_dir: out/models/20260408-173809-e472fd0
@@ -352,7 +378,8 @@ phase_configs:
 
 1. **Phase 2（Track A/B/C）**
   - 讀取 phase2 config（固定 run 契約 + track 實驗矩陣 + 資源上限）。
-  - 執行 A/B/C 路線（至少 baseline + candidate），彙整跨窗結果。
+  - 先跑「科學可判讀前置清單」（見 §1.8）；未通過者只能做 exploratory，不可進決策級結論。
+  - 執行 A/B/C 路線（至少 baseline + candidate）；**跨窗**在現況 orchestrator 需多次 run 或手寫 `precision_at_recall_1pct_by_window`，全自動多窗彙整見 Tasklist T10 未完成項。
   - 產出 `phase2/*.md` 與 `phase2_gate_decision.md`。
 2. **Phase 3（勝者路線加深）**
   - 僅接受 Phase 2 winner track 作為輸入（防止範圍漂移）。
