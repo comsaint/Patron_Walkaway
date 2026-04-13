@@ -361,6 +361,147 @@ def _parse_float_gate(
         return default
 
 
+def _parse_min_pat_windows_required(gate: Mapping[str, Any]) -> int:
+    """Minimum PAT@1% series length required for uplift **PASS** (T11A dual-window gate).
+
+    Reads ``gate.min_pat_windows_for_pass`` (default **2**). Values ``<= 0`` disable the check.
+    """
+    raw = gate.get("min_pat_windows_for_pass", 2)
+    if raw is None:
+        return 2
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        return 2
+    return v
+
+
+def _phase2_uplift_winner_metrics(
+    uplift_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Pick best experiment that ``meets_min_uplift`` (max pp, then track_a/b/c, then YAML order)."""
+    rank = {"track_a": 0, "track_b": 1, "track_c": 2}
+    best_key: tuple[float, int, int] | None = None
+    best_row: dict[str, Any] | None = None
+    for i, r in enumerate(uplift_rows):
+        if not isinstance(r, Mapping) or r.get("meets_min_uplift") is not True:
+            continue
+        try:
+            u = float(r["uplift_pp_vs_baseline"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        tr = str(r.get("track") or "").strip()
+        key = (-u, rank.get(tr, 9), i)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_row = dict(r)
+    if best_row is None:
+        return {}
+    be = str(best_row.get("baseline_exp_id") or "").strip()
+    eid = str(best_row.get("exp_id") or "").strip()
+    trw = str(best_row.get("track") or "").strip()
+    out: dict[str, Any] = {
+        "phase2_winner_track": trw,
+        "phase2_winner_exp_id": eid,
+        "phase2_winner_baseline_exp_id": be or None,
+        "phase2_winner_uplift_pp_vs_baseline": float(best_row["uplift_pp_vs_baseline"]),
+    }
+    try:
+        out["phase2_winner_preview_pat"] = float(best_row["preview"])
+    except (KeyError, TypeError, ValueError):
+        out["phase2_winner_preview_pat"] = None
+    return out
+
+
+def _phase2_elimination_rows_for_uplift(
+    uplift_rows: list[dict[str, Any]],
+    *,
+    min_uplift_pp: float,
+    winner_track: str | None,
+    winner_exp_id: str | None,
+) -> list[dict[str, Any]]:
+    """Non-winner challengers with auditable reasons (T11 report narrative).
+
+    Every row in ``uplift_rows`` that carries ``uplift_pp_vs_baseline`` (challenger vs
+    track baseline) is listed except the global winner (when ``winner_*`` are set).
+    """
+    out: list[dict[str, Any]] = []
+    wtr = str(winner_track or "").strip() or None
+    we = str(winner_exp_id or "").strip() or None
+    for r in uplift_rows:
+        if not isinstance(r, Mapping) or "uplift_pp_vs_baseline" not in r:
+            continue
+        tr = str(r.get("track") or "").strip()
+        eid = str(r.get("exp_id") or "").strip()
+        if wtr and we and tr == wtr and eid == we:
+            continue
+        be = str(r.get("baseline_exp_id") or "").strip()
+        try:
+            upp = float(r["uplift_pp_vs_baseline"])
+        except (TypeError, ValueError):
+            continue
+        meets = r.get("meets_min_uplift") is True
+        if meets:
+            rc = "meets_min_uplift_but_not_global_winner"
+            detail = (
+                f"uplift {upp:.4f} pp >= {min_uplift_pp:.2f} pp vs baseline `{be}`; "
+                f"global winner `{wtr}/{we}`"
+            )
+        else:
+            rc = "below_min_uplift_pp_vs_baseline"
+            detail = (
+                f"uplift {upp:.4f} pp < {min_uplift_pp:.2f} pp vs baseline `{be}`"
+            )
+        out.append(
+            {
+                "track": tr,
+                "exp_id": eid,
+                "reason_code": rc,
+                "baseline_exp_id": be or None,
+                "uplift_pp_vs_baseline": upp,
+                "gate_min_uplift_pp_vs_baseline": min_uplift_pp,
+                "detail": detail,
+            }
+        )
+    return out
+
+
+def _phase2_apply_min_pat_windows_gate_for_pass(
+    bundle: Mapping[str, Any],
+    uplift_out: dict[str, Any],
+    gate_cfg: Mapping[str, Any],
+) -> dict[str, Any]:
+    """After uplift (+ std), require max PAT series length >= N for **PASS** (default N=2)."""
+    if uplift_out.get("decision") != "PASS":
+        return uplift_out
+    req = _parse_min_pat_windows_required(gate_cfg)
+    if req <= 0:
+        return uplift_out
+    n = _phase2_max_pat_series_window_count(bundle)
+    metrics = dict(uplift_out["metrics"])
+    metrics["phase2_pat_windows_max"] = n
+    metrics["phase2_pat_windows_required"] = req
+    base_ev = str(uplift_out.get("evidence_extra") or "")
+    if n >= req:
+        uplift_out = dict(uplift_out)
+        uplift_out["metrics"] = metrics
+        uplift_out["evidence_extra"] = (
+            base_ev
+            + f"; dual-window gate: max PAT@1% series len={n} (required >={req}) — OK"
+        )
+        return uplift_out
+    uplift_out = dict(uplift_out)
+    uplift_out["metrics"] = metrics
+    uplift_out["decision"] = "BLOCKED"
+    uplift_out["reasons"] = ["phase2_insufficient_pat_windows_for_pass"]
+    uplift_out["evidence_extra"] = (
+        base_ev
+        + f"; dual-window gate: BLOCKED — max PAT@1% series length is {n}, "
+        f"requires >={req} (`phase2_pat_series_by_experiment`)"
+    )
+    return uplift_out
+
+
 def _phase2_preview_map_from_bundle(bundle: Mapping[str, Any]) -> dict[tuple[str, str], float]:
     """Map (track, exp_id) -> PAT@1% preview for successful non-skipped per-job rows."""
     pj = phase2_per_job_backtest_metrics(bundle)
@@ -462,10 +603,30 @@ def _phase2_try_uplift_gate_from_per_job(
                     }
                 )
 
+    win_m: dict[str, Any] = (
+        _phase2_uplift_winner_metrics(uplift_rows) if any_meets else {}
+    )
+    wt = (
+        str(win_m.get("phase2_winner_track") or "").strip() or None
+        if any_meets
+        else None
+    )
+    weid = (
+        str(win_m.get("phase2_winner_exp_id") or "").strip() or None
+        if any_meets
+        else None
+    )
+    elim = _phase2_elimination_rows_for_uplift(
+        uplift_rows,
+        min_uplift_pp=min_uplift,
+        winner_track=wt,
+        winner_exp_id=weid,
+    )
     metrics_u: dict[str, Any] = {
         "phase2_uplift_gate_evaluated": True,
         "phase2_uplift_min_pp_vs_baseline": min_uplift,
         "phase2_uplift_rows": uplift_rows,
+        "phase2_elimination_rows": elim,
         "phase2_std_gate_evaluated": False,
         "phase2_std_gate_note": (
             "max_std_pp_across_windows not applied (no multi-window series in bundle)"
@@ -485,6 +646,13 @@ def _phase2_try_uplift_gate_from_per_job(
 
     if any_meets:
         metrics_u["phase2_uplift_pass"] = True
+        metrics_u.update(win_m)
+        w_tr = metrics_u.get("phase2_winner_track")
+        w_e = metrics_u.get("phase2_winner_exp_id")
+        win_ev = (
+            f"; uplift winner: `{w_tr}/{w_e}` "
+            f"(uplift_pp_vs_baseline={metrics_u.get('phase2_winner_uplift_pp_vs_baseline')})"
+        )
         return {
             "decision": "PASS",
             "reasons": [],
@@ -492,6 +660,7 @@ def _phase2_try_uplift_gate_from_per_job(
             "evidence_extra": (
                 "; uplift gate: PASS — at least one experiment meets "
                 f"min_uplift_pp_vs_baseline (>={min_uplift:.2f} pp vs track baseline)"
+                + win_ev
             ),
         }
 
@@ -597,6 +766,146 @@ def _phase2_apply_std_gate(
     return uplift_out
 
 
+def _phase2_trainer_params_nonempty_for_exp(
+    bundle: Mapping[str, Any], track: str, exp_id: str
+) -> bool:
+    """True when ``bundle['tracks'][track].experiments`` lists ``exp_id`` with non-empty ``trainer_params``."""
+    tracks = bundle.get("tracks")
+    if not isinstance(tracks, Mapping):
+        return False
+    tnode = tracks.get(track)
+    if not isinstance(tnode, Mapping):
+        return False
+    exps = tnode.get("experiments")
+    if not isinstance(exps, list):
+        return False
+    for ex in exps:
+        if not isinstance(ex, Mapping):
+            continue
+        if str(ex.get("exp_id") or "").strip() != exp_id:
+            continue
+        tp = ex.get("trainer_params")
+        return isinstance(tp, Mapping) and bool(tp)
+    return False
+
+
+def _phase2_evaluate_strategy_effective(bundle: Mapping[str, Any]) -> tuple[bool, list[str], dict[str, Any]]:
+    """T11A: require argv fingerprint evidence for experiments that declare ``trainer_params``.
+
+    Returns:
+        ``(strategy_ok, blocking_reasons, metrics_to_merge)``. When ``trainer_jobs`` did not
+        run, ``strategy_ok`` is False but ``blocking_reasons`` is empty (non-blocking).
+    """
+    tj = bundle.get("trainer_jobs")
+    base: dict[str, Any] = {
+        "phase2_strategy_effective": False,
+        "phase2_trainer_jobs_executed": False,
+    }
+    if not isinstance(tj, Mapping) or tj.get("executed") is not True:
+        base["phase2_strategy_note"] = (
+            "trainer_jobs not executed; subprocess argv/fingerprint not audited (T11A)"
+        )
+        return False, [], base
+
+    base["phase2_trainer_jobs_executed"] = True
+    results = tj.get("results")
+    if not isinstance(results, list):
+        base["phase2_strategy_note"] = "trainer_jobs.executed but results is not a list"
+        return False, ["phase2_strategy_params_not_effective"], base
+
+    failures: list[str] = []
+    for r in results:
+        if not isinstance(r, Mapping):
+            continue
+        tr = str(r.get("track") or "").strip()
+        eid = str(r.get("exp_id") or "").strip()
+        if not tr or not eid:
+            continue
+        if not _phase2_trainer_params_nonempty_for_exp(bundle, tr, eid):
+            continue
+        fp = r.get("argv_fingerprint")
+        argv = r.get("resolved_trainer_argv")
+        if not (isinstance(fp, str) and fp.strip()):
+            failures.append(f"{tr}/{eid}: missing argv_fingerprint")
+            continue
+        if not isinstance(argv, list) or len(argv) < 3:
+            failures.append(f"{tr}/{eid}: missing resolved_trainer_argv")
+            continue
+        if r.get("ok") is not True:
+            failures.append(f"{tr}/{eid}: trainer job not ok")
+
+    if failures:
+        base["phase2_strategy_effective_detail"] = failures
+        base["phase2_strategy_note"] = "; ".join(failures[:8])
+        if len(failures) > 8:
+            base["phase2_strategy_note"] += f"; … (+{len(failures) - 8} more)"
+        return False, ["phase2_strategy_params_not_effective"], base
+
+    base["phase2_strategy_effective"] = True
+    base["phase2_strategy_note"] = (
+        "T11A: every experiment with trainer_params has argv_fingerprint + "
+        "resolved_trainer_argv on ok trainer_jobs rows"
+    )
+    return True, [], base
+
+
+def _phase2_max_pat_series_window_count(bundle: Mapping[str, Any]) -> int:
+    """Largest PAT@1% series length in ``phase2_pat_series_by_experiment``."""
+    root = bundle.get("phase2_pat_series_by_experiment")
+    if not isinstance(root, Mapping):
+        return 0
+    mx = 0
+    for exp_map in root.values():
+        if not isinstance(exp_map, Mapping):
+            continue
+        for raw_list in exp_map.values():
+            if isinstance(raw_list, list):
+                mx = max(mx, len(raw_list))
+    return mx
+
+
+def _phase2_conclusion_strength(
+    *,
+    bundle: Mapping[str, Any],
+    gate_status: str,
+    strategy_effective: bool,
+    trainer_jobs_executed: bool,
+) -> str:
+    """T11A label: exploratory / comparative / decision_grade (best-effort heuristics)."""
+    pjb = bundle.get("per_job_backtest_jobs")
+    pjb_ok = isinstance(pjb, Mapping) and pjb.get("executed") is True
+    mw = _phase2_max_pat_series_window_count(bundle)
+    sci = strategy_effective and trainer_jobs_executed and pjb_ok
+    st = str(gate_status).strip().upper()
+    if st == "PASS" and sci and mw >= 2:
+        return "decision_grade"
+    if st == "PASS" and sci:
+        return "comparative"
+    if sci:
+        return "comparative"
+    return "exploratory"
+
+
+def _phase2_append_scientific_validity(
+    out: dict[str, Any], bundle: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Attach ``conclusion_strength`` (T11A) to gate output dict."""
+    met = dict(out.get("metrics") or {})
+    se = bool(met.get("phase2_strategy_effective"))
+    tje = bool(met.get("phase2_trainer_jobs_executed"))
+    cs = _phase2_conclusion_strength(
+        bundle=bundle,
+        gate_status=str(out.get("status") or ""),
+        strategy_effective=se,
+        trainer_jobs_executed=tje,
+    )
+    met["conclusion_strength"] = cs
+    out = dict(out)
+    out["conclusion_strength"] = cs
+    out["metrics"] = met
+    return out
+
+
 def extract_phase2_shared_precision_at_recall_1pct(
     backtest_metrics: Mapping[str, Any] | None,
 ) -> float | None:
@@ -633,13 +942,38 @@ def evaluate_phase2_gate(bundle: dict[str, Any]) -> dict[str, Any]:
     Optional ``bundle["phase2_pat_series_by_experiment"]`` enables
     ``max_std_pp_across_windows`` when per-job uplift gate runs.
 
+    **T11A (scientific validity)** runs on ``metrics_ingested`` **before** the uplift gate:
+    when ``trainer_jobs.executed`` is True, every experiment with non-empty
+    ``trainer_params`` in ``bundle["tracks"]`` must have a matching
+    ``trainer_jobs.results[]`` row with ``argv_fingerprint``, ``resolved_trainer_argv``,
+    and ``ok: true``; otherwise **BLOCKED** with ``phase2_strategy_params_not_effective``.
+    ``conclusion_strength`` labels how strong a read is (**exploratory** /
+    **comparative** / **decision_grade**).
+
+    **T11A (dual-window hard gate)**: after uplift (+ optional std), a **PASS** requires
+    ``max(len(series)) >= gate.min_pat_windows_for_pass`` (default **2**) across
+    ``bundle["phase2_pat_series_by_experiment"]``; otherwise **BLOCKED** with
+    ``phase2_insufficient_pat_windows_for_pass``. Set ``min_pat_windows_for_pass`` to
+    **0** to disable.
+
+    When uplift **PASS**, ``metrics`` includes **winner** fields (best ``meets_min_uplift``
+    row: ``phase2_winner_track``, ``phase2_winner_exp_id``, ``phase2_winner_baseline_exp_id``,
+    ``phase2_winner_uplift_pp_vs_baseline``, ``phase2_winner_preview_pat``).
+
+    When the uplift gate evaluates (per-job backtests executed), ``metrics`` includes
+    ``phase2_elimination_rows``: structured **non-winner challengers** with
+    ``reason_code`` ``below_min_uplift_pp_vs_baseline`` or
+    ``meets_min_uplift_but_not_global_winner`` (T11 narrative; not a full multi-window
+    matrix).
+
     Args:
         bundle: Output of ``collectors.collect_phase2_plan_bundle`` or a future
             enriched bundle with training metrics.
 
     Returns:
         Dict with ``status`` (``BLOCKED`` / ``FAIL`` / ``PASS``), ``blocking_reasons``,
-        ``evidence_summary``, and ``metrics``.
+        ``evidence_summary``, ``metrics``, ``conclusion_strength`` (T11A), and optional
+        strategy-audit fields inside ``metrics``.
     """
     reasons: list[str] = []
     errors = bundle.get("errors")
@@ -647,12 +981,16 @@ def evaluate_phase2_gate(bundle: dict[str, Any]) -> dict[str, Any]:
         for e in errors:
             if isinstance(e, Mapping) and e.get("code"):
                 reasons.append(str(e["code"]))
-        return {
-            "status": "FAIL",
-            "blocking_reasons": reasons or ["phase2_collector_errors"],
-            "evidence_summary": "collector recorded errors in phase2 bundle",
-            "metrics": {},
-        }
+        _, _, sm_err = _phase2_evaluate_strategy_effective(bundle)
+        return _phase2_append_scientific_validity(
+            {
+                "status": "FAIL",
+                "blocking_reasons": reasons or ["phase2_collector_errors"],
+                "evidence_summary": "collector recorded errors in phase2 bundle",
+                "metrics": sm_err,
+            },
+            bundle,
+        )
 
     st = str(bundle.get("status") or "")
     if st == "plan_only":
@@ -675,12 +1013,17 @@ def evaluate_phase2_gate(bundle: dict[str, Any]) -> dict[str, Any]:
             "but no training metrics ingested"
         )
         ev_plan += _phase2_per_job_backtest_evidence_suffix(bundle)
-        return {
-            "status": "BLOCKED",
-            "blocking_reasons": reasons,
-            "evidence_summary": ev_plan,
-            "metrics": m_plan,
-        }
+        _, _, strat_plan = _phase2_evaluate_strategy_effective(bundle)
+        m_plan.update(strat_plan)
+        return _phase2_append_scientific_validity(
+            {
+                "status": "BLOCKED",
+                "blocking_reasons": reasons,
+                "evidence_summary": ev_plan,
+                "metrics": m_plan,
+            },
+            bundle,
+        )
 
     if st == "metrics_ingested":
         reasons.append("phase2_shared_metrics_no_per_track_uplift")
@@ -725,43 +1068,77 @@ def evaluate_phase2_gate(bundle: dict[str, Any]) -> dict[str, Any]:
             m_met.update(pj_met)
         ev += _phase2_per_job_backtest_evidence_suffix(bundle)
 
+        _, strat_reas, strat_m = _phase2_evaluate_strategy_effective(bundle)
+        m_met.update(strat_m)
+        if strat_reas:
+            ev += f"; T11A strategy audit: BLOCKED — {strat_m.get('phase2_strategy_note', '')}"
+            return _phase2_append_scientific_validity(
+                {
+                    "status": "BLOCKED",
+                    "blocking_reasons": list(strat_reas),
+                    "evidence_summary": ev,
+                    "metrics": m_met,
+                },
+                bundle,
+            )
+
         upl = _phase2_try_uplift_gate_from_per_job(bundle)
         if upl is not None:
+            gate_cfg = (
+                bundle.get("gate") if isinstance(bundle.get("gate"), Mapping) else {}
+            )
             upl = _phase2_apply_std_gate(bundle, upl)
+            upl = _phase2_apply_min_pat_windows_gate_for_pass(bundle, upl, gate_cfg)
             m_met.update(upl["metrics"])
             ev += upl["evidence_extra"]
             if upl["decision"] == "PASS":
-                return {
-                    "status": "PASS",
-                    "blocking_reasons": [],
-                    "evidence_summary": ev,
-                    "metrics": m_met,
-                }
+                return _phase2_append_scientific_validity(
+                    {
+                        "status": "PASS",
+                        "blocking_reasons": [],
+                        "evidence_summary": ev,
+                        "metrics": m_met,
+                    },
+                    bundle,
+                )
             if upl["decision"] == "FAIL":
-                return {
-                    "status": "FAIL",
+                return _phase2_append_scientific_validity(
+                    {
+                        "status": "FAIL",
+                        "blocking_reasons": list(upl["reasons"]),
+                        "evidence_summary": ev,
+                        "metrics": m_met,
+                    },
+                    bundle,
+                )
+            return _phase2_append_scientific_validity(
+                {
+                    "status": "BLOCKED",
                     "blocking_reasons": list(upl["reasons"]),
                     "evidence_summary": ev,
                     "metrics": m_met,
-                }
-            return {
+                },
+                bundle,
+            )
+
+        return _phase2_append_scientific_validity(
+            {
                 "status": "BLOCKED",
-                "blocking_reasons": list(upl["reasons"]),
+                "blocking_reasons": reasons,
                 "evidence_summary": ev,
                 "metrics": m_met,
-            }
-
-        return {
-            "status": "BLOCKED",
-            "blocking_reasons": reasons,
-            "evidence_summary": ev,
-            "metrics": m_met,
-        }
+            },
+            bundle,
+        )
 
     reasons.append("phase2_gate_unsupported_bundle_status")
-    return {
-        "status": "BLOCKED",
-        "blocking_reasons": reasons,
-        "evidence_summary": f"unsupported phase2 bundle status for gate: {st!r}",
-        "metrics": {},
-    }
+    _, _, sm_un = _phase2_evaluate_strategy_effective(bundle)
+    return _phase2_append_scientific_validity(
+        {
+            "status": "BLOCKED",
+            "blocking_reasons": reasons,
+            "evidence_summary": f"unsupported phase2 bundle status for gate: {st!r}",
+            "metrics": sm_un,
+        },
+        bundle,
+    )

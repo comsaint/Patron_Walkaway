@@ -1,12 +1,12 @@
 {
   "run_id": "pytest_preflight_fail",
   "phase": "phase1",
-  "updated_at": "2026-04-09T09:06:51+00:00",
+  "updated_at": "2026-04-10T18:33:23+00:00",
   "input_summary": {
-    "config_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_run_state_written_on_pref0\\cfg.yaml",
-    "model_dir": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_run_state_written_on_pref0\\models",
-    "state_db_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_run_state_written_on_pref0\\nostate.db",
-    "prediction_log_db_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_run_state_written_on_pref0\\nopred.db",
+    "config_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-86\\test_run_state_written_on_pref0\\cfg.yaml",
+    "model_dir": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-86\\test_run_state_written_on_pref0\\models",
+    "state_db_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-86\\test_run_state_written_on_pref0\\nostate.db",
+    "prediction_log_db_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-86\\test_run_state_written_on_pref0\\nopred.db",
     "window": {
       "end_ts": "2026-01-08T00:00:00+08:00",
       "start_ts": "2026-01-01T00:00:00+08:00"
@@ -19,21 +19,21 @@
       "min_hours_gate": 72,
       "min_hours_preliminary": 48
     },
-    "fingerprint": "196742cc3fd0bfdc9c62ea9c620e4c55489b82c9d534d7760692df5e5368f165"
+    "fingerprint": "acf16011e42a522d1a86cf2f0d444da1560e1956355c1c825446f27dbdaec6f5"
   },
   "steps": {
     "preflight": {
       "status": "failed",
       "error_code": "E_ARTIFACT_MISSING",
-      "message": "state_db_path not found: C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_run_state_written_on_pref0\\nostate.db",
+      "message": "state_db_path not found: C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-86\\test_run_state_written_on_pref0\\nostate.db",
       "checks": [
         {
           "name": "paths",
           "ok": false,
-          "message": "state_db_path not found: C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_run_state_written_on_pref0\\nostate.db"
+          "message": "state_db_path not found: C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-86\\test_run_state_written_on_pref0\\nostate.db"
         }
       ],
-      "finished_at": "2026-04-09T09:06:51+00:00"
+      "finished_at": "2026-04-10T18:33:23+00:00"
     }
   }
 }

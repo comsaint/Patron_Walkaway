@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sqlite3
 import subprocess
@@ -10,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 import collectors
+import evaluators
 
 PREDICTION_DB_REQUIRED_TABLES: tuple[str, ...] = ("prediction_log",)
 STATE_DB_REQUIRED_TABLES: tuple[str, ...] = ("alerts", "validation_results")
@@ -202,7 +205,9 @@ def run_logged_command(
         timeout_sec: Optional timeout in seconds (``None`` = none).
 
     Returns:
-        Dict with returncode, paths, and captured text fields.
+        Dict with returncode, paths, and captured text fields. On
+        ``subprocess.TimeoutExpired``, ``error_code`` is ``E_SUBPROCESS_TIMEOUT``
+        (distinct from backtest ``E_NO_DATA_WINDOW`` / empty-window cases).
     """
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = log_dir / f"{log_stem}.stdout.log"
@@ -220,7 +225,7 @@ def run_logged_command(
                 timeout=timeout_sec,
                 check=False,
             )
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         tail = f"command timeout after {timeout_sec}s: {argv[0]!r}"
         return {
             "ok": False,
@@ -230,7 +235,7 @@ def run_logged_command(
             "stdout_text": "",
             "stderr_text": tail,
             "combined_text": tail,
-            "error_code": "E_NO_DATA_WINDOW",
+            "error_code": "E_SUBPROCESS_TIMEOUT",
             "message": tail,
         }
     except OSError as exc:
@@ -621,6 +626,43 @@ def phase2_experiment_overrides(
     return {}
 
 
+def phase2_experiment_trainer_params(
+    bundle: Mapping[str, Any],
+    track: str,
+    exp_id: str,
+) -> dict[str, Any]:
+    """Return validated ``trainer_params`` for ``track`` / ``exp_id`` from a phase2 bundle (T10A)."""
+    tracks = bundle.get("tracks")
+    if not isinstance(tracks, Mapping):
+        return {}
+    tnode = tracks.get(track)
+    if not isinstance(tnode, Mapping):
+        return {}
+    exps = tnode.get("experiments")
+    if not isinstance(exps, list):
+        return {}
+    for ex in exps:
+        if not isinstance(ex, Mapping):
+            continue
+        if str(ex.get("exp_id") or "").strip() != exp_id:
+            continue
+        tp = ex.get("trainer_params")
+        return dict(tp) if isinstance(tp, Mapping) else {}
+    return {}
+
+
+def phase2_trainer_argv_fingerprint(argv: Sequence[str]) -> str:
+    """Stable short fingerprint of trainer argv (from ``-m`` onward) for audit (T10A)."""
+    lst = list(argv)
+    try:
+        mi = lst.index("-m")
+        seq = lst[mi:]
+    except ValueError:
+        seq = lst
+    blob = json.dumps(seq, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
+
+
 def build_phase2_trainer_argv(
     bundle: Mapping[str, Any],
     *,
@@ -628,10 +670,11 @@ def build_phase2_trainer_argv(
     exp_id: str,
     python_exe: str | None = None,
 ) -> tuple[list[str], list[str]]:
-    """Build ``python -m trainer.trainer`` argv for one Phase 2 job (T10).
+    """Build ``python -m trainer.trainer`` argv for one Phase 2 job (T10 / T10A).
 
-    Experiment YAML ``overrides`` are not wired to trainer CLI yet; keys are returned
-    as ``unapplied`` for transparency in the bundle ``trainer_jobs`` record.
+    Applies ``resources`` defaults, then per-experiment ``trainer_params`` (whitelist only;
+    validated at config load). Non-empty legacy ``overrides`` in the bundle raise
+    ``ValueError`` (stale plan artifact).
 
     Args:
         bundle: Phase 2 plan bundle (``common``, ``resources``, ``tracks``).
@@ -640,7 +683,7 @@ def build_phase2_trainer_argv(
         python_exe: Interpreter; defaults to ``sys.executable``.
 
     Returns:
-        ``(argv, sorted_unapplied_override_keys)``.
+        ``(argv, unapplied)`` — ``unapplied`` is always ``[]`` (retained for call-site compat).
     """
     exe = python_exe or sys.executable
     common = bundle.get("common")
@@ -657,15 +700,41 @@ def build_phase2_trainer_argv(
     resources = (
         bundle["resources"] if isinstance(bundle.get("resources"), Mapping) else {}
     )
+    ov = phase2_experiment_overrides(bundle, track, exp_id)
+    if ov:
+        bad = sorted(str(k) for k in ov.keys())
+        raise ValueError(
+            f"bundle has non-empty overrides for {track}/{exp_id}: {bad}; "
+            "rebuild phase2_bundle from validated YAML (T10A disallows legacy overrides)"
+        )
+
+    tp = phase2_experiment_trainer_params(bundle, track, exp_id)
+
     argv: list[str] = [exe, "-m", "trainer.trainer", "--start", start, "--end", end]
-    if bool(resources.get("backtest_skip_optuna")):
+
+    if "skip_optuna" in tp:
+        skip_opt = bool(tp["skip_optuna"])
+    else:
+        skip_opt = bool(resources.get("backtest_skip_optuna"))
+    if skip_opt:
         argv.append("--skip-optuna")
-    if bool(resources.get("trainer_use_local_parquet")):
+
+    if "use_local_parquet" in tp:
+        use_lp = bool(tp["use_local_parquet"])
+    else:
+        use_lp = bool(resources.get("trainer_use_local_parquet"))
+    if use_lp:
         argv.append("--use-local-parquet")
 
-    ov = phase2_experiment_overrides(bundle, track, exp_id)
-    unapplied = sorted(str(k) for k in ov.keys())
-    return argv, unapplied
+    if "recent_chunks" in tp:
+        argv.extend(["--recent-chunks", str(int(tp["recent_chunks"]))])
+    if "sample_rated" in tp:
+        argv.extend(["--sample-rated", str(int(tp["sample_rated"]))])
+    if "lgbm_device" in tp:
+        dev = str(tp["lgbm_device"]).strip()
+        argv.extend(["--lgbm-device", dev])
+
+    return argv, []
 
 
 def _phase2_trainer_job_timeout_sec(bundle: Mapping[str, Any]) -> float | None:
@@ -752,12 +821,7 @@ def run_phase2_trainer_jobs(
                     "exp_id": eid,
                     "ok": False,
                     "message": msg,
-                    "unapplied_overrides": sorted(
-                        str(k)
-                        for k in phase2_experiment_overrides(
-                            bundle, track, eid
-                        ).keys()
-                    ),
+                    "unapplied_overrides": [],
                     "inferred_training_metrics_repo_relative": None,
                 }
             )
@@ -794,6 +858,8 @@ def run_phase2_trainer_jobs(
                 "ok": ok_job,
                 "returncode": base.get("returncode"),
                 "argv": list(argv),
+                "resolved_trainer_argv": list(argv),
+                "argv_fingerprint": phase2_trainer_argv_fingerprint(argv),
                 "unapplied_overrides": unapplied,
                 "stdout_path": str(out_path) if out_path is not None else "",
                 "stderr_path": str(err_path) if err_path is not None else "",
@@ -937,10 +1003,19 @@ def run_phase2_per_job_backtests(
         ok_sub = bool(res_bt.get("ok"))
         preview: float | None = None
         load_err: str | None = None
+        ingest_error_code: str | None = None
         if ok_sub:
             mobj, load_err = collectors.load_json_under_repo(repo_root, mrel_job)
             if mobj is not None and not load_err:
                 preview = _preview_precision_at_recall_1pct_from_metrics(mobj)
+                if preview is None:
+                    ok_sub = False
+                    pr_key = evaluators.PHASE2_BACKTEST_PR1_KEY
+                    load_err = (
+                        f"backtest_metrics lacks parseable model_default.{pr_key} "
+                        "(PAT@1% for observation window)"
+                    )
+                    ingest_error_code = "E_NO_DATA_WINDOW"
             else:
                 ok_sub = False
 
@@ -968,6 +1043,7 @@ def run_phase2_per_job_backtests(
                 "error_code": res_bt.get("error_code"),
                 "message": res_bt.get("message"),
                 "metrics_load_error": None if ok_sub else load_err,
+                "ingest_error_code": ingest_error_code,
                 "shared_precision_at_recall_1pct_preview": preview,
             }
         )

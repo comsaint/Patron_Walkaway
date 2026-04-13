@@ -10,6 +10,33 @@
 
 - `a0`
 
+## Trainer CLI evidence (T10A)
+
+> Per-experiment ``trainer_params`` and resolved ``trainer.trainer`` argv fingerprint.
+
+> ``trainer_jobs`` not executed: fingerprints below are **planned** (from ``runner.build_phase2_trainer_argv`` on this bundle), not subprocess audit. Run with ``--phase2-run-trainer-jobs`` to record executed argv.
+
+### `a0`
+
+- **YAML `trainer_params`**: *(none — booleans from `resources` only)*
+
+- **argv_fingerprint (planned)**: `1753ad3c7bd5a779c7f334a7`
+- **resolved_trainer_argv (planned)**:
+
+```json
+[
+  "python",
+  "-m",
+  "trainer.trainer",
+  "--start",
+  "2026-01-01T00:00:00+08:00",
+  "--end",
+  "2026-01-08T00:00:00+08:00",
+  "--skip-optuna"
+]
+```
+
+
 ## Per-job training_metrics harvest
 
 > Harvest uses each job's optional ``training_metrics_repo_relative`` (YAML) when set, else ``{logs_subdir_relative}/training_metrics.json``.

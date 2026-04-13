@@ -2,11 +2,6 @@
   "run_id": "pytest_resume_skip",
   "errors": [
     {
-      "code": "E_COLLECT_BACKTEST_METRICS",
-      "message": "file not found: C:\\Users\\longp\\Patron_Walkaway\\trainer\\out_backtest\\backtest_metrics.json",
-      "path": "C:\\Users\\longp\\Patron_Walkaway\\trainer\\out_backtest\\backtest_metrics.json"
-    },
-    {
       "code": "E_COLLECT_R1_PAYLOAD",
       "message": "r1_r6 log not found: C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\pytest_resume_skip\\logs\\r1_r6.stdout.log",
       "path": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\pytest_resume_skip\\logs\\r1_r6.stdout.log"
@@ -17,7 +12,41 @@
       "path": "C:\\Users\\longp\\Patron_Walkaway\\s.db"
     }
   ],
-  "backtest_metrics": null,
+  "backtest_metrics": {
+    "window_start": "2026-02-06T00:00:00",
+    "window_end": "2026-02-13T00:00:00",
+    "window_hours": 168.0,
+    "observations": 1,
+    "rated_obs": 1,
+    "unrated_obs": 0,
+    "track_llm_degraded": false,
+    "model_default": {
+      "test_ap": 0.0,
+      "test_precision": 0.0,
+      "test_recall": 0.0,
+      "test_f1": 0.0,
+      "test_fbeta_05": 0.0,
+      "threshold": 0.5,
+      "test_samples": 1,
+      "test_positives": 0,
+      "test_random_ap": 0.0,
+      "alerts": 1,
+      "alerts_per_hour": 0.005952380952380952,
+      "test_precision_at_recall_0.001": null,
+      "threshold_at_recall_0.001": null,
+      "alerts_per_minute_at_recall_0.001": null,
+      "test_precision_at_recall_0.01": null,
+      "threshold_at_recall_0.01": null,
+      "alerts_per_minute_at_recall_0.01": null,
+      "test_precision_at_recall_0.1": null,
+      "threshold_at_recall_0.1": null,
+      "alerts_per_minute_at_recall_0.1": null,
+      "test_precision_at_recall_0.5": null,
+      "threshold_at_recall_0.5": null,
+      "alerts_per_minute_at_recall_0.5": null,
+      "rated_threshold": 0.5
+    }
+  },
   "backtest_metrics_path": "C:\\Users\\longp\\Patron_Walkaway\\trainer\\out_backtest\\backtest_metrics.json",
   "r1_r6_final": {
     "payload": null,

@@ -496,6 +496,38 @@ def collect_phase1_artifacts(
 _PHASE2_TRACK_ORDER: tuple[str, ...] = ("track_a", "track_b", "track_c")
 
 
+def count_phase2_yaml_pat_matrix_experiments(tracks: Any) -> int:
+    """Count experiments under ``track_*`` with non-empty ``precision_at_recall_1pct_by_window``.
+
+    Used for ``run_state.phase2_collect`` observability (T10 multi-window matrix intent).
+
+    Args:
+        tracks: ``bundle['tracks']`` from a phase2 plan or enriched bundle.
+
+    Returns:
+        Number of experiment rows that declare at least one window PAT value in YAML.
+    """
+    if not isinstance(tracks, Mapping):
+        return 0
+    n = 0
+    for tname, tnode in tracks.items():
+        tr = str(tname).strip()
+        if not tr.startswith("track_"):
+            continue
+        if not isinstance(tnode, Mapping):
+            continue
+        exps = tnode.get("experiments")
+        if not isinstance(exps, list):
+            continue
+        for exp in exps:
+            if not isinstance(exp, Mapping):
+                continue
+            raw = exp.get("precision_at_recall_1pct_by_window")
+            if isinstance(raw, list) and len(raw) > 0:
+                n += 1
+    return n
+
+
 def build_phase2_pat_series_from_plan_tracks(tracks_out: Mapping[str, Any]) -> dict[str, dict[str, list[float]]]:
     """Aggregate optional per-experiment ``precision_at_recall_1pct_by_window`` into gate shape.
 
@@ -580,6 +612,11 @@ def collect_phase2_plan_bundle(run_id: str, cfg: Mapping[str, Any]) -> dict[str,
                     dict(overrides) if isinstance(overrides, Mapping) else {}
                 )
                 exp_row: dict[str, Any] = {"exp_id": eid, "overrides": ov_dict}
+                tp_raw = exp.get("trainer_params")
+                if isinstance(tp_raw, Mapping) and tp_raw:
+                    exp_row["trainer_params"] = {
+                        str(k): tp_raw[k] for k in sorted(tp_raw, key=str)
+                    }
                 idx_row: dict[str, Any] = {
                     "track": name,
                     "exp_id": eid,
@@ -695,6 +732,9 @@ def collect_summary_phase2_plan_for_run_state(
         "job_specs_training_metrics_hint_count": n_tm_hint,
         "tracks_enabled": sorted(tracks_enabled),
     }
+    n_pat_yaml = count_phase2_yaml_pat_matrix_experiments(tracks)
+    if n_pat_yaml > 0:
+        out["phase2_pat_matrix_yaml_experiment_count"] = n_pat_yaml
     rs = bundle.get("runner_smoke")
     if isinstance(rs, Mapping):
         out["runner_log_dirs_ok"] = rs.get("log_dirs_ok")
@@ -745,6 +785,30 @@ def collect_summary_phase2_plan_for_run_state(
             bundle.get("backtest_metrics")
         )
         out["phase2_pat_series_auto_merge_eligible"] = shared_hint is not None
+    ps_root = bundle.get("phase2_pat_series_by_experiment")
+    n_keys = 0
+    max_len = 0
+    n_ge2 = 0
+    if isinstance(ps_root, Mapping):
+        for tkey, exp_map in ps_root.items():
+            tr = str(tkey).strip()
+            if not tr.startswith("track_"):
+                continue
+            if not isinstance(exp_map, Mapping):
+                continue
+            for raw_list in exp_map.values():
+                if not isinstance(raw_list, list):
+                    continue
+                n_keys += 1
+                ell = len(raw_list)
+                if ell > max_len:
+                    max_len = ell
+                if ell >= 2:
+                    n_ge2 += 1
+    if n_keys > 0:
+        out["phase2_pat_series_key_count"] = n_keys
+        out["phase2_pat_series_max_len"] = max_len
+        out["phase2_pat_series_len_ge_2_count"] = n_ge2
     return out
 
 

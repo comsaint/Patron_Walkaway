@@ -209,6 +209,32 @@ def _write_status_history_crosscheck(path: Path, run_id: str, cfg: Mapping[str, 
     return path
 
 
+def _phase2_uplift_elimination_markdown(gm: Mapping[str, Any]) -> str:
+    """Markdown for ``metrics.phase2_elimination_rows`` (T11 uplift narrative)."""
+    raw = gm.get("phase2_elimination_rows")
+    if not isinstance(raw, list) or not raw:
+        return ""
+    lines: list[str] = [
+        "## Uplift elimination / non-winners (T11 narrative)",
+        "",
+        "Challenger experiments vs **track-local baseline** (YAML order); global winner excluded.",
+        "",
+    ]
+    for r in raw:
+        if not isinstance(r, Mapping):
+            continue
+        tr = str(r.get("track") or "").strip()
+        eid = str(r.get("exp_id") or "").strip()
+        rc = str(r.get("reason_code") or "").strip()
+        det = str(r.get("detail") or "").strip()
+        if tr and eid:
+            lines.append(f"- **`{tr}/{eid}`** — `{rc}`: {det}")
+        elif det:
+            lines.append(f"- `{rc}`: {det}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def write_phase2_gate_decision(
     path: Path,
     run_id: str,
@@ -238,9 +264,58 @@ def write_phase2_gate_decision(
         "",
         f"- **status**: **{gate.get('status')}**",
         "",
-        "### Blocking reasons",
-        "",
     ]
+    gm_pre = gate.get("metrics") if isinstance(gate.get("metrics"), Mapping) else {}
+    w_tr = gm_pre.get("phase2_winner_track")
+    w_eid = gm_pre.get("phase2_winner_exp_id")
+    if (
+        isinstance(w_tr, str)
+        and w_tr.strip()
+        and isinstance(w_eid, str)
+        and w_eid.strip()
+    ):
+        w_up = gm_pre.get("phase2_winner_uplift_pp_vs_baseline")
+        w_be = gm_pre.get("phase2_winner_baseline_exp_id")
+        lines.extend(
+            [
+                "## Winner track / experiment (T11A)",
+                "",
+                f"- **track**: `{w_tr.strip()}`",
+                f"- **exp_id**: `{w_eid.strip()}`",
+                (
+                    f"- **baseline_exp_id**: `{w_be}`"
+                    if w_be
+                    else "- **baseline_exp_id**: *(n/a)*"
+                ),
+                f"- **uplift_pp_vs_baseline**: `{w_up}`",
+                "",
+            ]
+        )
+    gm_elim = gate.get("metrics") if isinstance(gate.get("metrics"), Mapping) else {}
+    elim_md = _phase2_uplift_elimination_markdown(gm_elim)
+    if elim_md.strip():
+        lines.append(elim_md)
+    lines.extend(
+        [
+            "## Scientific validity (T11A)",
+            "",
+            f"- **conclusion_strength**: `{gate.get('conclusion_strength')}`",
+        ]
+    )
+    gm = gate.get("metrics") if isinstance(gate.get("metrics"), Mapping) else {}
+    lines.extend(
+        [
+            f"- **phase2_strategy_effective**: `{gm.get('phase2_strategy_effective')}`",
+            f"- **phase2_trainer_jobs_executed**: `{gm.get('phase2_trainer_jobs_executed')}`",
+            "",
+            "**Strategy audit note**:",
+            "",
+            str(gm.get("phase2_strategy_note") or "*(none)*"),
+            "",
+            "## Blocking reasons",
+            "",
+        ]
+    )
     br = gate.get("blocking_reasons") or []
     if isinstance(br, list) and br:
         for item in br:
@@ -250,7 +325,7 @@ def write_phase2_gate_decision(
     lines.extend(
         [
             "",
-            "### Evidence summary",
+            "## Evidence summary",
             "",
             str(gate.get("evidence_summary") or ""),
             "",
@@ -285,6 +360,106 @@ def _phase2_harvest_markdown_for_track(bundle: Mapping[str, Any], tname: str) ->
             err = str(r.get("load_error") or "missing")
             lines.append(f"- `{eid}`: **not found** ({err})")
     return "\n".join(lines) + "\n"
+
+
+def _phase2_trainer_cli_evidence_markdown_for_track(
+    bundle: Mapping[str, Any], cfg: Mapping[str, Any], tname: str
+) -> str:
+    """Markdown for YAML ``trainer_params`` plus argv fingerprint (T10A).
+
+    When ``trainer_jobs`` ran, uses recorded ``argv_fingerprint`` / ``resolved_trainer_argv``.
+    Otherwise shows **planned** argv from ``runner.build_phase2_trainer_argv`` (not a subprocess
+    audit).
+    """
+    import runner as _runner
+
+    lines: list[str] = []
+    tj = bundle.get("trainer_jobs")
+    executed = isinstance(tj, Mapping) and bool(tj.get("executed"))
+    results_by_key: dict[tuple[str, str], Mapping[str, Any]] = {}
+    if isinstance(tj, Mapping):
+        res = tj.get("results")
+        if isinstance(res, list):
+            for r in res:
+                if not isinstance(r, Mapping):
+                    continue
+                tr = str(r.get("track") or "").strip()
+                eid = str(r.get("exp_id") or "").strip()
+                if tr and eid:
+                    results_by_key[(tr, eid)] = r
+
+    tracks = cfg.get("tracks") if isinstance(cfg.get("tracks"), Mapping) else {}
+    tnode = tracks.get(tname) if isinstance(tracks, Mapping) else None
+    exps = tnode.get("experiments") if isinstance(tnode, Mapping) else None
+
+    if not isinstance(exps, list) or not exps:
+        return "- *(no experiments in config for this track)*\n"
+
+    if executed:
+        lines.append(
+            "> Source: ``bundle['trainer_jobs']['results']`` "
+            "(after ``--phase2-run-trainer-jobs``).\n"
+        )
+    else:
+        lines.append(
+            "> ``trainer_jobs`` not executed: fingerprints below are **planned** "
+            "(from ``runner.build_phase2_trainer_argv`` on this bundle), not subprocess audit. "
+            "Run with ``--phase2-run-trainer-jobs`` to record executed argv.\n"
+        )
+
+    for ex in exps:
+        if not isinstance(ex, Mapping):
+            continue
+        eid = str(ex.get("exp_id") or "").strip()
+        if not eid:
+            continue
+        lines.append(f"### `{eid}`")
+        lines.append("")
+        tp = ex.get("trainer_params")
+        if isinstance(tp, Mapping) and tp:
+            lines.append("- **YAML `trainer_params`**:")
+            lines.append("")
+            ordered = dict(sorted(tp.items(), key=lambda kv: str(kv[0])))
+            lines.append(_json_fence(ordered, max_chars=2000))
+        else:
+            lines.append(
+                "- **YAML `trainer_params`**: *(none — booleans from `resources` only)*"
+            )
+            lines.append("")
+
+        row = results_by_key.get((tname, eid))
+        if row:
+            fp = row.get("argv_fingerprint")
+            if fp:
+                lines.append(f"- **argv_fingerprint**: `{fp}`")
+            else:
+                lines.append("- **argv_fingerprint**: *(missing)*")
+            argvs = row.get("resolved_trainer_argv")
+            if not isinstance(argvs, list):
+                argvs = row.get("argv") if isinstance(row.get("argv"), list) else []
+            if isinstance(argvs, list) and argvs:
+                lines.append("- **resolved_trainer_argv** (recorded):")
+                lines.append("")
+                lines.append(_json_fence(argvs, max_chars=4000))
+            if row.get("ok") is False:
+                msg = str(row.get("message") or row.get("error_code") or "failed")
+                lines.append(f"- **trainer job**: failed — `{msg}`")
+        else:
+            try:
+                argv, _ = _runner.build_phase2_trainer_argv(
+                    bundle, track=tname, exp_id=eid, python_exe="python"
+                )
+            except (ValueError, TypeError) as exc:
+                lines.append(f"- **planned argv**: *(error: `{exc}`)*")
+            else:
+                fp = _runner.phase2_trainer_argv_fingerprint(argv)
+                lines.append(f"- **argv_fingerprint (planned)**: `{fp}`")
+                lines.append("- **resolved_trainer_argv (planned)**:")
+                lines.append("")
+                lines.append(_json_fence(argv, max_chars=4000))
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def _phase2_per_job_backtest_markdown_for_track(
@@ -471,8 +646,8 @@ def write_phase2_track_results(
 ) -> list[Path]:
     """Write ``phase2/track_{a,b,c}_results.md`` (T11; shared-backtest stub).
 
-    Each file lists the track's declared experiments. Numeric rows duplicate the **shared**
-    backtest PAT@1% until per-experiment artifacts are wired (T10+).
+    Each file lists the track's declared experiments, **Trainer CLI evidence (T10A)**,
+    harvest / per-job preview / uplift / PAT series, then shared PAT@1%.
 
     Args:
         phase2_dir: Investigation ``phase2`` directory.
@@ -534,6 +709,11 @@ def write_phase2_track_results(
             "",
             exp_block,
             "",
+            "## Trainer CLI evidence (T10A)",
+            "",
+            "> Per-experiment ``trainer_params`` and resolved ``trainer.trainer`` argv fingerprint.",
+            "",
+            _phase2_trainer_cli_evidence_markdown_for_track(bundle, cfg, tname),
             "## Per-job training_metrics harvest",
             "",
             "> Harvest uses each job's optional ``training_metrics_repo_relative`` (YAML) "

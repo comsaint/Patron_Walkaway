@@ -24,6 +24,7 @@ if str(_ORCHESTRATOR_DIR) not in sys.path:
 import collectors  # noqa: E402
 import config_loader  # noqa: E402
 import evaluators  # noqa: E402
+import phase2_exit_codes as phase2_exits  # noqa: E402
 import report_builder  # noqa: E402
 import runner  # noqa: E402
 
@@ -148,6 +149,61 @@ def _phase2_backtest_timeout_sec(cfg: Mapping[str, Any]) -> float | None:
     return v if v > 0 else None
 
 
+def _append_phase2_errors_for_failed_per_job_backtests(
+    p2_bundle: dict[str, Any],
+    pjb_results: list[Mapping[str, Any]],
+    *,
+    repo_root: Path,
+) -> None:
+    """Record structured errors for each failed non-skipped per-job backtest (T10).
+
+    Uses ``E_NO_DATA_WINDOW`` when the result row carries ``ingest_error_code`` (metrics
+    file readable but no parseable PAT@1%, aligned with shared backtest ingest); else
+    ``E_ARTIFACT_MISSING``. ``bundle['errors']`` feeds ``evaluate_phase2_gate`` → **FAIL**.
+    """
+    p2_bundle.setdefault("errors", [])
+    if not isinstance(p2_bundle["errors"], list):
+        p2_bundle["errors"] = []
+    err_list = p2_bundle["errors"]
+    for row in pjb_results:
+        if not isinstance(row, Mapping):
+            continue
+        if row.get("skipped"):
+            continue
+        if row.get("ok") is True:
+            continue
+        tr = str(row.get("track") or "").strip()
+        eid = str(row.get("exp_id") or "").strip()
+        detail = (
+            row.get("metrics_load_error")
+            or row.get("message")
+            or "per-job backtest failed"
+        )
+        detail_s = str(detail).strip() or "per-job backtest failed"
+        mrel = str(row.get("metrics_repo_relative") or "").strip()
+        path_s = ""
+        if mrel:
+            path_s = str((repo_root / mrel).resolve())
+        else:
+            hint = str(row.get("training_metrics_repo_relative") or "").strip()
+            if hint:
+                path_s = str((repo_root / hint).resolve())
+        prefix = f"{tr}/{eid}: " if tr and eid else ""
+        row_code = row.get("ingest_error_code")
+        err_code = (
+            "E_NO_DATA_WINDOW"
+            if str(row_code or "").strip() == "E_NO_DATA_WINDOW"
+            else "E_ARTIFACT_MISSING"
+        )
+        err_list.append(
+            {
+                "code": err_code,
+                "message": prefix + detail_s,
+                "path": path_s,
+            }
+        )
+
+
 def phase2_gate_cli_exit_code(
     gate_result: Mapping[str, Any],
     *,
@@ -158,18 +214,20 @@ def phase2_gate_cli_exit_code(
 
     Args:
         gate_result: Output of ``evaluators.evaluate_phase2_gate``.
-        fail_on_gate_fail: When True and status is ``FAIL``, return ``9``.
-        fail_on_gate_blocked: When True and status is ``BLOCKED``, return ``10``.
+        fail_on_gate_fail: When True and status is ``FAIL``, return
+            ``phase2_exit_codes.EXIT_PHASE2_GATE_FAIL``.
+        fail_on_gate_blocked: When True and status is ``BLOCKED``, return
+            ``phase2_exit_codes.EXIT_PHASE2_GATE_BLOCKED``.
 
     Returns:
-        ``9`` / ``10`` when the CLI should exit with failure; ``None`` for exit 0.
+        Gate policy exit code or ``None`` for exit 0 (see ``phase2_exit_codes``).
         ``FAIL`` is checked before ``BLOCKED`` when both flags are set.
     """
     st = str(gate_result.get("status") or "")
     if fail_on_gate_fail and st == "FAIL":
-        return 9
+        return phase2_exits.EXIT_PHASE2_GATE_FAIL
     if fail_on_gate_blocked and st == "BLOCKED":
-        return 10
+        return phase2_exits.EXIT_PHASE2_GATE_BLOCKED
     return None
 
 
@@ -1253,7 +1311,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
             merged["steps"]["phase2_runner_smoke"]["started_at"] = t_rs
             _write_run_state(state_file, merged)
             print(msg_ld or "phase2_runner_smoke failed", file=sys.stderr)
-            return 5
+            return phase2_exits.EXIT_PHASE2_RUNNER_SMOKE_FAILED
 
         th_skip = bool(args.skip_phase2_trainer_smoke)
         if th_skip:
@@ -1295,7 +1353,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
                 msg_th or "phase2_runner_smoke failed",
                 file=sys.stderr,
             )
-            return 5
+            return phase2_exits.EXIT_PHASE2_RUNNER_SMOKE_FAILED
 
     skip_trainer_jobs = resume_ok and _step_success(prev_steps, "phase2_trainer_jobs")
     if not skip_trainer_jobs:
@@ -1358,7 +1416,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
             _write_run_state(state_file, merged)
             if not ok_tj:
                 print(msg_tj or "phase2_trainer_jobs failed", file=sys.stderr)
-                return 7
+                return phase2_exits.EXIT_PHASE2_TRAINER_JOBS_FAILED
 
     skip_job_harvest = resume_ok and _step_success(prev_steps, "phase2_job_metrics_harvest")
     if not skip_job_harvest:
@@ -1431,6 +1489,12 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
                 python_exe=sys.executable,
                 timeout_sec=to_pjb,
             )
+            if not ok_pjb:
+                _append_phase2_errors_for_failed_per_job_backtests(
+                    p2_bundle,
+                    list(pjb_results),
+                    repo_root=_REPO_ROOT,
+                )
             p2_bundle["per_job_backtest_jobs"] = {
                 "executed": True,
                 "skip_reason": None,
@@ -1459,7 +1523,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
                     msg_pjb or "phase2_per_job_backtest_jobs failed",
                     file=sys.stderr,
                 )
-                return 8
+                return phase2_exits.EXIT_PHASE2_BACKTEST_OR_ARTIFACT_FAILURE
 
     skip_backtest_jobs = resume_ok and _step_success(prev_steps, "phase2_backtest_jobs")
     if not skip_backtest_jobs:
@@ -1542,7 +1606,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
                     res_bt.get("message") or "phase2_backtest_jobs failed",
                     file=sys.stderr,
                 )
-                return 8
+                return phase2_exits.EXIT_PHASE2_BACKTEST_OR_ARTIFACT_FAILURE
             metrics_obj, metrics_err = collectors.load_json_under_repo(_REPO_ROOT, mrel)
             if metrics_obj is None or metrics_err:
                 p2_bundle.setdefault("errors", [])
@@ -1583,7 +1647,60 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
                     metrics_err or f"phase2_backtest_jobs: missing metrics at {mpath}",
                     file=sys.stderr,
                 )
-                return 8
+                return phase2_exits.EXIT_PHASE2_BACKTEST_OR_ARTIFACT_FAILURE
+            pr1_shared = evaluators.extract_phase2_shared_precision_at_recall_1pct(
+                metrics_obj
+                if isinstance(metrics_obj, Mapping)
+                else None
+            )
+            if pr1_shared is None:
+                pr_key = evaluators.PHASE2_BACKTEST_PR1_KEY
+                p2_bundle.setdefault("errors", [])
+                if isinstance(p2_bundle["errors"], list):
+                    p2_bundle["errors"].append(
+                        {
+                            "code": "E_NO_DATA_WINDOW",
+                            "message": (
+                                f"shared backtest_metrics at {mpath} lacks parseable "
+                                f"model_default.{pr_key} (PAT@1% for observation window)"
+                            ),
+                            "path": str(mpath),
+                        }
+                    )
+                p2_bundle["backtest_jobs"] = {
+                    "executed": True,
+                    "skip_reason": None,
+                    "subprocess_ok": True,
+                    "metrics_loaded": True,
+                    "metrics_path": str(mpath),
+                    "shared_pat_extractable": False,
+                    "finished_at": _utc_now_iso(),
+                }
+                merged["phase2_collect"] = (
+                    collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+                )
+                bundle_path.write_text(
+                    json.dumps(p2_bundle, indent=2, default=str),
+                    encoding="utf-8",
+                )
+                _attach_terminal_step(
+                    merged,
+                    "phase2_backtest_jobs",
+                    status="failed",
+                    error_code="E_NO_DATA_WINDOW",
+                    message=(
+                        f"backtest_metrics missing PAT@1% field model_default.{pr_key} "
+                        f"at {mpath}"
+                    ),
+                )
+                merged["steps"]["phase2_backtest_jobs"]["started_at"] = t_bj
+                _write_run_state(state_file, merged)
+                print(
+                    f"phase2_backtest_jobs: E_NO_DATA_WINDOW — missing "
+                    f"model_default.{pr_key} at {mpath}",
+                    file=sys.stderr,
+                )
+                return phase2_exits.EXIT_PHASE2_BACKTEST_OR_ARTIFACT_FAILURE
             p2_bundle["backtest_metrics"] = metrics_obj
             p2_bundle["backtest_metrics_path"] = str(mpath)
             p2_bundle["status"] = "metrics_ingested"
@@ -1626,10 +1743,29 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
             )
             _write_run_state(state_file, merged)
         gate_p2 = evaluators.evaluate_phase2_gate(p2_bundle)
+        gmet = (
+            gate_p2.get("metrics")
+            if isinstance(gate_p2.get("metrics"), Mapping)
+            else {}
+        )
         merged["phase2_gate_decision"] = {
             "status": gate_p2.get("status"),
             "blocking_reasons": list(gate_p2.get("blocking_reasons") or []),
             "evidence_summary": str(gate_p2.get("evidence_summary") or ""),
+            "conclusion_strength": gate_p2.get("conclusion_strength"),
+            "phase2_strategy_effective": gmet.get("phase2_strategy_effective"),
+            "phase2_trainer_jobs_executed": gmet.get("phase2_trainer_jobs_executed"),
+            "phase2_winner_track": gmet.get("phase2_winner_track"),
+            "phase2_winner_exp_id": gmet.get("phase2_winner_exp_id"),
+            "phase2_winner_baseline_exp_id": gmet.get("phase2_winner_baseline_exp_id"),
+            "phase2_winner_uplift_pp_vs_baseline": gmet.get(
+                "phase2_winner_uplift_pp_vs_baseline"
+            ),
+            "phase2_elimination_row_count": (
+                len(gmet["phase2_elimination_rows"])
+                if isinstance(gmet.get("phase2_elimination_rows"), list)
+                else None
+            ),
         }
         gate_md = phase2_dir / "phase2_gate_decision.md"
         report_builder.write_phase2_gate_decision(

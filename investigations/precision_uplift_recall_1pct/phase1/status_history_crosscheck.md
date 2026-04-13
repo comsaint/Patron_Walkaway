@@ -14,7 +14,7 @@
 **Last orchestrator run**: `pytest_resume_skip`
 
 - **Gate status**: `FAIL`
-- **blocking_reasons**: `['collect_error:E_COLLECT_BACKTEST_METRICS', 'collect_error:E_COLLECT_R1_PAYLOAD', 'collect_error:E_COLLECT_STATE_DB']`
+- **blocking_reasons**: `['collect_error:E_COLLECT_R1_PAYLOAD', 'collect_error:E_COLLECT_STATE_DB']`
 - Please keep narrative cross-check above this block; edit conflicts rare.
 
 <!-- ORCHESTRATOR_RUN_NOTE_END -->

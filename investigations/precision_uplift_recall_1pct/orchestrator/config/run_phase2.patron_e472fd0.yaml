@@ -14,8 +14,8 @@
 # - resources.trainer_use_local_parquet: true（repo 內 data/*.parquet 存在時供 trainer 使用）
 # - 各軌 baseline 的 training_metrics_repo_relative → 現有訓練產物目錄（不需先重訓即可 harvest / per-job backtest）
 #
-# 仍須你方後續處理：
-# - YAML overrides 尚未接到 trainer.trainer；a_hard_negative_v1 等若要不同訓練，需擴充 CLI 或手動產出另一目錄後填 training_metrics_repo_relative
+# T10A：請用 trainer_params（白名單）區分實驗；非空 overrides 會於載入設定時 E_CONFIG_INVALID。
+# hard negative 等需 trainer 先實作並納入白名單後才可下結論。
 # - 調整 window 時請同步檢查與資料／標籤成熟規則是否一致
 
 phase: phase2
@@ -49,9 +49,10 @@ tracks:
       - exp_id: a_baseline
         overrides: {}
         training_metrics_repo_relative: out/models/20260408-173809-e472fd0
-      - exp_id: a_hard_negative_v1
-        overrides:
-          hard_negative_weight: 2.0
+      - exp_id: a_recent_chunks_v1
+        overrides: {}
+        trainer_params:
+          recent_chunks: 3
   track_b:
     enabled: true
     experiments:

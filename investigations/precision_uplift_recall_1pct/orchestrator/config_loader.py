@@ -137,6 +137,73 @@ PHASE2_RESOURCE_KEYS: tuple[str, ...] = (
 PHASE2_TRACK_NAMES: tuple[str, ...] = ("track_a", "track_b", "track_c")
 PHASE2_GATE_KEYS: tuple[str, ...] = ("min_uplift_pp_vs_baseline", "max_std_pp_across_windows")
 
+# T10A: only these keys may appear under ``tracks.*.experiments[].trainer_params`` (maps to trainer CLI).
+PHASE2_TRAINER_PARAM_KEYS: tuple[str, ...] = (
+    "use_local_parquet",
+    "skip_optuna",
+    "recent_chunks",
+    "sample_rated",
+    "lgbm_device",
+)
+
+
+def _validate_phase2_experiment_trainer_params(
+    tp: Mapping[str, Any],
+    *,
+    track: str,
+    exp_index: int,
+) -> None:
+    """Validate a single experiment's ``trainer_params`` mapping (T10A).
+
+    Raises:
+        ConfigValidationError: On unknown keys or wrong value types.
+    """
+    unknown = sorted(str(k) for k in tp if str(k) not in PHASE2_TRAINER_PARAM_KEYS)
+    if unknown:
+        raise ConfigValidationError(
+            f"tracks.{track}.experiments[{exp_index}].trainer_params has unknown keys {unknown}; "
+            f"allowed {list(PHASE2_TRAINER_PARAM_KEYS)}"
+        )
+    for key in PHASE2_TRAINER_PARAM_KEYS:
+        if key not in tp:
+            continue
+        val = tp[key]
+        if key in ("use_local_parquet", "skip_optuna"):
+            if not isinstance(val, bool):
+                raise ConfigValidationError(
+                    f"tracks.{track}.experiments[{exp_index}].trainer_params.{key} must be bool, "
+                    f"got {type(val).__name__}"
+                )
+        elif key in ("recent_chunks", "sample_rated"):
+            if isinstance(val, bool):
+                raise ConfigValidationError(
+                    f"tracks.{track}.experiments[{exp_index}].trainer_params.{key} must be int, "
+                    f"got {type(val).__name__}"
+                )
+            if isinstance(val, float) and not val.is_integer():
+                raise ConfigValidationError(
+                    f"tracks.{track}.experiments[{exp_index}].trainer_params.{key} must be a whole "
+                    f"number, got {val!r}"
+                )
+            try:
+                n = int(val)
+            except (TypeError, ValueError) as exc:
+                raise ConfigValidationError(
+                    f"tracks.{track}.experiments[{exp_index}].trainer_params.{key} must be int, "
+                    f"got {type(val).__name__}"
+                ) from exc
+            if n < 1:
+                raise ConfigValidationError(
+                    f"tracks.{track}.experiments[{exp_index}].trainer_params.{key} must be >= 1, "
+                    f"got {val!r}"
+                )
+        elif key == "lgbm_device":
+            if not isinstance(val, str) or not str(val).strip():
+                raise ConfigValidationError(
+                    f"tracks.{track}.experiments[{exp_index}].trainer_params.lgbm_device "
+                    "must be a non-empty string"
+                )
+
 
 def validate_phase2_config(raw: Mapping[str, Any], *, cli_run_id: str) -> dict[str, Any]:
     """Validate Phase 2 orchestrator YAML (T9 schema).
@@ -255,6 +322,25 @@ def validate_phase2_config(raw: Mapping[str, Any], *, cli_run_id: str) -> dict[s
             if not isinstance(ov, Mapping):
                 raise ConfigValidationError(
                     f"tracks.{tn}.experiments[{i}].overrides must be a mapping"
+                )
+            legacy_keys = [str(k) for k in ov if str(k).strip()]
+            if legacy_keys:
+                raise ConfigValidationError(
+                    f"tracks.{tn}.experiments[{i}].overrides must be empty (T10A); "
+                    f"found unsupported keys {sorted(legacy_keys)} — use "
+                    f"trainer_params with whitelist {list(PHASE2_TRAINER_PARAM_KEYS)}"
+                )
+            tp_raw = exp.get("trainer_params")
+            if tp_raw is None:
+                pass
+            elif not isinstance(tp_raw, Mapping):
+                raise ConfigValidationError(
+                    f"tracks.{tn}.experiments[{i}].trainer_params must be a mapping or omitted, "
+                    f"got {type(tp_raw).__name__}"
+                )
+            else:
+                _validate_phase2_experiment_trainer_params(
+                    tp_raw, track=tn, exp_index=i
                 )
             tm_opt = exp.get("training_metrics_repo_relative")
             if tm_opt is not None:

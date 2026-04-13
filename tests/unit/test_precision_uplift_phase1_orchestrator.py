@@ -16,6 +16,12 @@ import yaml
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ORCHESTRATOR = _REPO_ROOT / "investigations/precision_uplift_recall_1pct" / "orchestrator"
 _RUN_PIPELINE = _ORCHESTRATOR / "run_pipeline.py"
+_ADHOC_RUNBOOK = (
+    _REPO_ROOT
+    / "investigations"
+    / "precision_uplift_recall_1pct"
+    / "PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md"
+)
 
 if str(_ORCHESTRATOR) not in sys.path:
     sys.path.insert(0, str(_ORCHESTRATOR))
@@ -23,6 +29,7 @@ if str(_ORCHESTRATOR) not in sys.path:
 import collectors  # noqa: E402
 import config_loader  # noqa: E402
 import evaluators  # noqa: E402
+import phase2_exit_codes as phase2_exits  # noqa: E402
 import report_builder  # noqa: E402
 import run_pipeline  # noqa: E402
 import runner  # noqa: E402
@@ -207,10 +214,10 @@ def test_phase2_gate_cli_exit_code_when_disabled() -> None:
 
 
 def test_phase2_gate_cli_exit_code_on_fail_enabled() -> None:
-    """With fail policy, FAIL status maps to exit code 9."""
+    """With fail policy, FAIL status maps to EXIT_PHASE2_GATE_FAIL."""
     assert (
         run_pipeline.phase2_gate_cli_exit_code({"status": "FAIL"}, fail_on_gate_fail=True)
-        == 9
+        == phase2_exits.EXIT_PHASE2_GATE_FAIL
     )
 
 
@@ -229,26 +236,38 @@ def test_phase2_gate_cli_exit_code_pass_and_blocked_unchanged() -> None:
 
 
 def test_phase2_gate_cli_exit_code_blocked_exit_10() -> None:
-    """With blocked policy, BLOCKED maps to exit 10."""
+    """With blocked policy, BLOCKED maps to EXIT_PHASE2_GATE_BLOCKED."""
     assert (
         run_pipeline.phase2_gate_cli_exit_code(
             {"status": "BLOCKED"},
             fail_on_gate_blocked=True,
         )
-        == 10
+        == phase2_exits.EXIT_PHASE2_GATE_BLOCKED
     )
 
 
 def test_phase2_gate_cli_fail_precedes_blocked_when_both_flags() -> None:
-    """FAIL returns 9 before BLOCKED would apply when both policies are on."""
+    """FAIL returns gate-fail exit before BLOCKED would apply when both policies are on."""
     assert (
         run_pipeline.phase2_gate_cli_exit_code(
             {"status": "FAIL"},
             fail_on_gate_fail=True,
             fail_on_gate_blocked=True,
         )
-        == 9
+        == phase2_exits.EXIT_PHASE2_GATE_FAIL
     )
+
+
+def test_phase2_failure_step_cli_exit_mapping_matches_constants() -> None:
+    """Documented step→CLI exit mapping stays aligned with integer constants."""
+    m = phase2_exits.PHASE2_FAILURE_STEP_CLI_EXITS
+    assert m["phase2_runner_smoke"] == phase2_exits.EXIT_PHASE2_RUNNER_SMOKE_FAILED
+    assert m["phase2_trainer_jobs"] == phase2_exits.EXIT_PHASE2_TRAINER_JOBS_FAILED
+    assert (
+        m["phase2_per_job_backtest_jobs"]
+        == phase2_exits.EXIT_PHASE2_BACKTEST_OR_ARTIFACT_FAILURE
+    )
+    assert m["phase2_backtest_jobs"] == phase2_exits.EXIT_PHASE2_BACKTEST_OR_ARTIFACT_FAILURE
 
 
 def test_build_phase2_input_summary_fingerprint_stable() -> None:
@@ -413,6 +432,228 @@ def test_evaluate_phase2_gate_plan_only_blocked() -> None:
     g = evaluators.evaluate_phase2_gate(b)
     assert g["status"] == "BLOCKED"
     assert "phase2_bundle_plan_only_no_track_metrics" in g["blocking_reasons"]
+    assert g.get("conclusion_strength") == "exploratory"
+    assert g["metrics"].get("phase2_strategy_effective") is False
+
+
+def test_evaluate_phase2_gate_t11a_blocks_when_trainer_params_job_missing_fingerprint() -> None:
+    """T11A: trainer_params experiments require argv_fingerprint when trainer_jobs ran."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [
+                    {
+                        "exp_id": "c0",
+                        "overrides": {},
+                        "trainer_params": {"recent_chunks": 2},
+                    },
+                ],
+            },
+        },
+        "trainer_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "ok": True,
+                    "resolved_trainer_argv": ["py", "-m", "trainer.trainer"],
+                },
+            ],
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "BLOCKED"
+    assert "phase2_strategy_params_not_effective" in g["blocking_reasons"]
+    assert "T11A strategy audit" in (g.get("evidence_summary") or "")
+    assert g.get("conclusion_strength") == "exploratory"
+
+
+def test_evaluate_phase2_gate_conclusion_strength_decision_grade_with_trainer_jobs_audit() -> None:
+    """T11A: PASS + multi-window series + trainer_jobs audit → decision_grade."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {"min_uplift_pp_vs_baseline": 3.0, "max_std_pp_across_windows": 2.5},
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.6,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.63,
+                },
+            ],
+        },
+        "phase2_pat_series_by_experiment": {
+            "track_c": {
+                "c0": [0.60, 0.6001, 0.5999],
+                "c1": [0.63, 0.6302, 0.6298],
+            },
+        },
+        "trainer_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "ok": True,
+                    "argv_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaa",
+                    "resolved_trainer_argv": ["py", "-m", "trainer.trainer"],
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "ok": True,
+                    "argv_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbb",
+                    "resolved_trainer_argv": ["py", "-m", "trainer.trainer"],
+                },
+            ],
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "PASS"
+    assert g.get("conclusion_strength") == "decision_grade"
+
+
+def test_write_phase2_gate_decision_includes_t11a_section(tmp_path: Path) -> None:
+    """phase2_gate_decision.md documents conclusion_strength and strategy flags."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    b = collectors.collect_phase2_plan_bundle("r", cfg)
+    g = evaluators.evaluate_phase2_gate(b)
+    out = tmp_path / "phase2_gate_decision.md"
+    report_builder.write_phase2_gate_decision(out, "r", cfg, b, g)
+    text = out.read_text(encoding="utf-8")
+    assert "## Scientific validity (T11A)" in text
+    assert "conclusion_strength" in text
+    assert "phase2_strategy_effective" in text
+
+
+def test_write_phase2_gate_decision_includes_winner_section(tmp_path: Path) -> None:
+    """T11A: gate metrics with winner fields produce Winner section in md."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    b: Mapping[str, Any] = {
+        "status": "metrics_ingested",
+        "bundle_kind": "phase2_plan_v1",
+    }
+    g: dict[str, Any] = {
+        "status": "PASS",
+        "blocking_reasons": [],
+        "evidence_summary": "synthetic",
+        "conclusion_strength": "comparative",
+        "metrics": {
+            "phase2_strategy_effective": True,
+            "phase2_trainer_jobs_executed": True,
+            "phase2_strategy_note": "ok",
+            "phase2_winner_track": "track_a",
+            "phase2_winner_exp_id": "a_win",
+            "phase2_winner_baseline_exp_id": "a0",
+            "phase2_winner_uplift_pp_vs_baseline": 4.2,
+        },
+    }
+    out = tmp_path / "phase2_gate_decision.md"
+    report_builder.write_phase2_gate_decision(out, "r", cfg, b, g)
+    text = out.read_text(encoding="utf-8")
+    assert "## Winner track / experiment (T11A)" in text
+    assert "`track_a`" in text
+    assert "`a_win`" in text
+    assert "4.2" in text
+
+
+def test_write_phase2_gate_decision_includes_elimination_section(tmp_path: Path) -> None:
+    """T11: gate metrics with phase2_elimination_rows produce elimination section."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    b: Mapping[str, Any] = {"status": "metrics_ingested", "bundle_kind": "phase2_plan_v1"}
+    g: dict[str, Any] = {
+        "status": "FAIL",
+        "blocking_reasons": ["phase2_uplift_below_min_pp_vs_baseline"],
+        "evidence_summary": "synthetic",
+        "conclusion_strength": "exploratory",
+        "metrics": {
+            "phase2_strategy_effective": False,
+            "phase2_trainer_jobs_executed": False,
+            "phase2_elimination_rows": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "reason_code": "below_min_uplift_pp_vs_baseline",
+                    "detail": "uplift 1.5000 pp < 3.00 pp vs baseline `c0`",
+                },
+            ],
+        },
+    }
+    out = tmp_path / "phase2_gate_decision.md"
+    report_builder.write_phase2_gate_decision(out, "r", cfg, b, g)
+    text = out.read_text(encoding="utf-8")
+    assert "## Uplift elimination / non-winners (T11 narrative)" in text
+    assert "track_c/c1" in text
+    assert "below_min_uplift_pp_vs_baseline" in text
+
+
+def test_adhoc_runbook_documents_phase2_t11a_gate_mechanics() -> None:
+    """ADHOC_RUNBOOK §1.8.1 stays aligned with evaluate_phase2_gate keywords (drift guard)."""
+    text = _ADHOC_RUNBOOK.read_text(encoding="utf-8")
+    assert "#### 1.8.1" in text
+    assert "min_pat_windows_for_pass" in text
+    assert "phase2_insufficient_pat_windows_for_pass" in text
+    assert "merge_phase2_pat_series_from_shared_and_per_job" in text
+    assert "conclusion_strength" in text
+    assert "phase2_winner_" in text
+
+
+def test_adhoc_runbook_documents_phase2_error_code_reference() -> None:
+    """ADHOC_RUNBOOK §1.8.2 documents E_SUBPROCESS_TIMEOUT vs E_NO_DATA_WINDOW and common codes."""
+    text = _ADHOC_RUNBOOK.read_text(encoding="utf-8")
+    assert "#### 1.8.2" in text
+    assert "E_SUBPROCESS_TIMEOUT" in text
+    assert "E_NO_DATA_WINDOW" in text
+    assert "E_ARTIFACT_MISSING" in text
+    assert "E_PHASE2_BACKTEST_JOBS" in text
+    assert "E_PHASE2_PER_JOB_BACKTEST_JOBS" in text
+    assert "E_CONFIG_INVALID" in text
+    assert "phase2_bundle.json" in text
+    assert "phase2_pat_matrix_yaml_experiment_count" in text
+    assert "phase2_exit_codes.py" in text
+    assert "phase2_runner_smoke" in text
+
+
+def test_adhoc_runbook_phase23_phase2_example_uses_t10a_trainer_params() -> None:
+    """§2.3.1 Phase 2 YAML draft must not revive non-empty overrides (T10A)."""
+    text = _ADHOC_RUNBOOK.read_text(encoding="utf-8")
+    assert "### 2.3.1" in text
+    assert "a_recent_chunks_v1" in text
+    assert "trainer_params:" in text
+    assert "a_hard_negative_v1" not in text
+    assert "hard_negative_weight:" not in text
 
 
 def test_evaluate_phase2_gate_errors_fail() -> None:
@@ -502,17 +743,122 @@ def test_build_phase2_trainer_argv_skip_optuna() -> None:
     assert unapplied == []
 
 
-def test_build_phase2_trainer_argv_unapplied_overrides() -> None:
-    """YAML overrides are listed until wired to trainer CLI."""
+def test_phase2_config_rejects_non_empty_overrides() -> None:
+    """T10A: non-empty overrides fail fast at config validation."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["tracks"]["track_a"]["experiments"] = [
+        {"exp_id": "a0", "overrides": {"legacy_key": 1}},
+    ]
+    with pytest.raises(config_loader.ConfigValidationError, match="T10A"):
+        config_loader.validate_phase2_config(raw, cli_run_id="rid")
+
+
+def test_phase2_config_accepts_integer_like_float_for_recent_chunks() -> None:
+    """YAML may parse small integers as float (e.g. 3.0); coerce to int (Review #1)."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["tracks"]["track_a"]["experiments"] = [
+        {
+            "exp_id": "a0",
+            "overrides": {},
+            "trainer_params": {"recent_chunks": 3.0},
+        },
+    ]
+    out = config_loader.validate_phase2_config(raw, cli_run_id="rid")
+    tp = out["tracks"]["track_a"]["experiments"][0]["trainer_params"]
+    assert tp["recent_chunks"] == 3.0
+
+
+def test_phase2_config_rejects_fractional_recent_chunks() -> None:
+    """Non-integer floats must not coerce silently."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["tracks"]["track_a"]["experiments"] = [
+        {
+            "exp_id": "a0",
+            "overrides": {},
+            "trainer_params": {"recent_chunks": 3.1},
+        },
+    ]
+    with pytest.raises(config_loader.ConfigValidationError, match="whole"):
+        config_loader.validate_phase2_config(raw, cli_run_id="rid")
+
+
+def test_phase2_config_rejects_unknown_trainer_params_key() -> None:
+    """trainer_params keys must stay on the whitelist."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["tracks"]["track_a"]["experiments"] = [
+        {
+            "exp_id": "a0",
+            "overrides": {},
+            "trainer_params": {"not_whitelisted": 1},
+        },
+    ]
+    with pytest.raises(config_loader.ConfigValidationError, match="unknown keys"):
+        config_loader.validate_phase2_config(raw, cli_run_id="rid")
+
+
+def test_build_phase2_trainer_argv_rejects_stale_bundle_overrides() -> None:
+    """Stale plan bundles with non-empty overrides must not silently train."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    bundle = collectors.collect_phase2_plan_bundle("rid", cfg)
+    bundle["tracks"]["track_a"]["experiments"][0]["overrides"] = {"stale": True}
+    with pytest.raises(ValueError, match="non-empty overrides"):
+        runner.build_phase2_trainer_argv(
+            bundle, track="track_a", exp_id="a0", python_exe=sys.executable
+        )
+
+
+def test_build_phase2_trainer_argv_trainer_params_recent_chunks() -> None:
+    """trainer_params.recent_chunks maps to --recent-chunks."""
     cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
     cfg["tracks"]["track_a"]["experiments"] = [
-        {"exp_id": "a0", "overrides": {"hard_negative_weight": 2.0}}
+        {
+            "exp_id": "a0",
+            "overrides": {},
+            "trainer_params": {"recent_chunks": 4},
+        },
     ]
+    cfg = config_loader.validate_phase2_config(cfg, cli_run_id="rid")
     bundle = collectors.collect_phase2_plan_bundle("rid", cfg)
-    _, unapplied = runner.build_phase2_trainer_argv(
-        bundle, track="track_a", exp_id="a0", python_exe=sys.executable
+    argv, unapplied = runner.build_phase2_trainer_argv(
+        bundle, track="track_a", exp_id="a0", python_exe="/py/bin/python"
     )
-    assert unapplied == ["hard_negative_weight"]
+    assert unapplied == []
+    i = argv.index("--recent-chunks")
+    assert argv[i + 1] == "4"
+    assert len(runner.phase2_trainer_argv_fingerprint(argv)) == 24
+
+
+def test_phase2_trainer_argv_fingerprint_ignores_python_executable() -> None:
+    """Fingerprint uses argv from ``-m`` onward so exe path does not matter."""
+    a = [
+        "/usr/bin/python3",
+        "-m",
+        "trainer.trainer",
+        "--start",
+        "s",
+        "--end",
+        "e",
+    ]
+    b = ["C:\\\\Python\\\\python.exe", "-m", "trainer.trainer", "--start", "s", "--end", "e"]
+    assert runner.phase2_trainer_argv_fingerprint(a) == runner.phase2_trainer_argv_fingerprint(b)
+
+
+def test_collect_phase2_plan_bundle_includes_trainer_params() -> None:
+    """Plan bundle snapshots trainer_params for audit."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    cfg["tracks"]["track_a"]["experiments"] = [
+        {
+            "exp_id": "a0",
+            "overrides": {},
+            "trainer_params": {"sample_rated": 100, "lgbm_device": "cpu"},
+        },
+    ]
+    cfg = config_loader.validate_phase2_config(cfg, cli_run_id="rid")
+    b = collectors.collect_phase2_plan_bundle("rid", cfg)
+    tp = b["tracks"]["track_a"]["experiments"][0].get("trainer_params")
+    assert isinstance(tp, dict)
+    assert tp["lgbm_device"] == "cpu"
+    assert tp["sample_rated"] == 100
 
 
 def test_build_phase2_trainer_argv_use_local_parquet() -> None:
@@ -987,6 +1333,53 @@ def test_collect_summary_phase2_plan_includes_per_job_backtest_jobs() -> None:
     assert s.get("per_job_backtest_jobs_count") == 2
 
 
+def test_append_phase2_errors_for_failed_per_job_backtests_appends_artifact_missing(
+    tmp_path: Path,
+) -> None:
+    """Non-skipped failed per-job rows append ``E_ARTIFACT_MISSING`` (T10 fail-fast)."""
+    mrel = "state/rid/logs/x/_per_job_backtest/backtest_metrics.json"
+    p2: dict[str, Any] = {"errors": []}
+    rows: list[dict[str, Any]] = [
+        {"track": "track_a", "exp_id": "a0", "skipped": True, "ok": True},
+        {
+            "track": "track_a",
+            "exp_id": "a1",
+            "skipped": False,
+            "ok": False,
+            "metrics_load_error": "ENOENT",
+            "metrics_repo_relative": mrel,
+        },
+        {"track": "track_a", "exp_id": "a2", "skipped": False, "ok": True},
+    ]
+    run_pipeline._append_phase2_errors_for_failed_per_job_backtests(
+        p2, rows, repo_root=tmp_path
+    )
+    errs = p2["errors"]
+    assert len(errs) == 1
+    assert errs[0]["code"] == "E_ARTIFACT_MISSING"
+    assert "track_a/a1" in str(errs[0]["message"])
+    assert errs[0]["path"] == str((tmp_path / mrel).resolve())
+
+
+def test_evaluate_phase2_gate_fails_on_e_no_data_window_in_errors() -> None:
+    """Pipeline-injected ``E_NO_DATA_WINDOW`` must surface as gate FAIL (collector errors)."""
+    b: dict[str, Any] = {
+        "status": "metrics_ingested",
+        "errors": [
+            {
+                "code": "E_NO_DATA_WINDOW",
+                "message": "missing PAT",
+                "path": "trainer/out_backtest/backtest_metrics.json",
+            }
+        ],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "FAIL"
+    assert "E_NO_DATA_WINDOW" in g["blocking_reasons"]
+
+
 def test_model_bundle_dir_from_training_metrics_hint_file_and_directory(
     tmp_path: Path,
 ) -> None:
@@ -1097,6 +1490,88 @@ def test_run_phase2_per_job_backtests_resolves_model_dir_and_preview(
     assert seen_metrics_paths == [expect_m]
     assert rows[0].get("metrics_repo_relative") == expect_m
     assert rows[0].get("shared_precision_at_recall_1pct_preview") == pytest.approx(0.42)
+
+
+def test_run_phase2_per_job_backtests_fails_when_metrics_missing_pat_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loaded backtest_metrics without parseable PAT@1% must fail (aligned with shared ingest)."""
+    bundle_dir = tmp_path / "mbundle"
+    bundle_dir.mkdir()
+    (bundle_dir / "training_metrics.json").write_text("{}", encoding="utf-8")
+    hint = bundle_dir.relative_to(tmp_path).as_posix()
+    bundle = {
+        "job_specs": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "training_metrics_repo_relative": hint,
+            }
+        ],
+        "resources": {},
+    }
+    template = {
+        "model_dir": "ignored",
+        "window": {"start_ts": "2026-01-01T00:00:00+08:00", "end_ts": "2026-01-08T00:00:00+08:00"},
+        "backtest_skip_optuna": True,
+    }
+
+    def fake_bt(
+        repo_root: Path,
+        cfg: Mapping[str, Any],
+        log_dir: Path,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "returncode": 0,
+            "stdout_path": log_dir / "backtest.stdout.log",
+            "stderr_path": log_dir / "backtest.stderr.log",
+        }
+
+    monkeypatch.setattr(runner, "run_phase1_backtest", fake_bt)
+
+    def fake_load(
+        repo_root: Path, rel_path: str
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        return ({"precision": 1.0}, None)
+
+    monkeypatch.setattr(collectors, "load_json_under_repo", fake_load)
+    ok, err, rows = runner.run_phase2_per_job_backtests(
+        tmp_path, bundle, template, run_id="rid", python_exe=sys.executable
+    )
+    assert not ok
+    assert err and "model_default" in err
+    assert len(rows) == 1
+    assert rows[0].get("ok") is False
+    assert rows[0].get("ingest_error_code") == "E_NO_DATA_WINDOW"
+    assert rows[0].get("metrics_load_error")
+    assert "test_precision_at_recall_0.01" in str(rows[0].get("metrics_load_error"))
+
+
+def test_append_phase2_errors_for_failed_per_job_backtests_respects_ingest_error_code(
+    tmp_path: Path,
+) -> None:
+    """Rows with ingest_error_code E_NO_DATA_WINDOW produce matching bundle errors."""
+    mrel = "state/rid/x/_per_job_backtest/backtest_metrics.json"
+    p2: dict[str, Any] = {"errors": []}
+    rows: list[dict[str, Any]] = [
+        {
+            "track": "track_a",
+            "exp_id": "a0",
+            "skipped": False,
+            "ok": False,
+            "ingest_error_code": "E_NO_DATA_WINDOW",
+            "metrics_load_error": "backtest_metrics lacks parseable model_default.x",
+            "metrics_repo_relative": mrel,
+        },
+    ]
+    run_pipeline._append_phase2_errors_for_failed_per_job_backtests(
+        p2, rows, repo_root=tmp_path
+    )
+    assert len(p2["errors"]) == 1
+    assert p2["errors"][0]["code"] == "E_NO_DATA_WINDOW"
+    assert "track_a/a0" in str(p2["errors"][0]["message"])
 
 
 def test_phase2_config_training_metrics_repo_relative_empty_raises() -> None:
@@ -1370,7 +1845,65 @@ def test_evaluate_phase2_gate_plan_only_includes_per_job_preview_evidence() -> N
 
 
 def test_evaluate_phase2_gate_metrics_ingested_includes_per_job_preview_evidence() -> None:
-    """metrics_ingested + two per-job previews on one track can PASS uplift gate."""
+    """metrics_ingested + two per-job previews + dual-window series → PASS + winner (T11A)."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {"min_uplift_pp_vs_baseline": 3.0, "max_std_pp_across_windows": 2.5},
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.6,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.63,
+                },
+            ],
+        },
+        "phase2_pat_series_by_experiment": {
+            "track_c": {"c0": [0.60, 0.601], "c1": [0.63, 0.631]},
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "PASS"
+    assert g["blocking_reasons"] == []
+    ev = g.get("evidence_summary") or ""
+    assert "0.5000" in ev
+    assert "track_c/c0=" in ev
+    assert "uplift gate: PASS" in ev
+    assert "dual-window gate:" in ev
+    assert "uplift winner:" in ev
+    assert g["metrics"].get("per_job_backtest_preview_count") == 2
+    assert g["metrics"].get("phase2_uplift_pass") is True
+    assert g["metrics"].get("phase2_winner_track") == "track_c"
+    assert g["metrics"].get("phase2_winner_exp_id") == "c1"
+    assert g["metrics"].get("phase2_winner_baseline_exp_id") == "c0"
+    assert g["metrics"].get("phase2_winner_uplift_pp_vs_baseline") == pytest.approx(3.0)
+    assert g["metrics"].get("phase2_pat_windows_max") == 2
+
+
+def test_evaluate_phase2_gate_dual_window_blocks_when_no_pat_series() -> None:
+    """T11A: uplift PASS but max PAT series length < min_pat_windows_for_pass → BLOCKED."""
     b: dict = {
         "status": "metrics_ingested",
         "errors": [],
@@ -1407,14 +1940,129 @@ def test_evaluate_phase2_gate_metrics_ingested_includes_per_job_preview_evidence
         },
     }
     g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "BLOCKED"
+    assert "phase2_insufficient_pat_windows_for_pass" in g["blocking_reasons"]
+    assert g["metrics"].get("phase2_winner_track") == "track_c"
+    assert g["metrics"].get("phase2_pat_windows_max") == 0
+    assert g["metrics"].get("phase2_pat_windows_required") == 2
+
+
+def test_evaluate_phase2_gate_min_pat_windows_zero_disables_dual_window_check() -> None:
+    """gate.min_pat_windows_for_pass <= 0 skips dual-window hard gate."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {
+            "min_uplift_pp_vs_baseline": 3.0,
+            "max_std_pp_across_windows": 2.5,
+            "min_pat_windows_for_pass": 0,
+        },
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.6,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.63,
+                },
+            ],
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
     assert g["status"] == "PASS"
-    assert g["blocking_reasons"] == []
-    ev = g.get("evidence_summary") or ""
-    assert "0.5000" in ev
-    assert "track_c/c0=" in ev
-    assert "uplift gate: PASS" in ev
-    assert g["metrics"].get("per_job_backtest_preview_count") == 2
-    assert g["metrics"].get("phase2_uplift_pass") is True
+    assert "dual-window gate:" not in (g.get("evidence_summary") or "")
+
+
+def test_evaluate_phase2_gate_winner_tiebreak_prefers_track_a_over_track_b() -> None:
+    """Same uplift_pp on two tracks → track_a wins (deterministic tie-break)."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {
+            "min_uplift_pp_vs_baseline": 3.0,
+            "max_std_pp_across_windows": 50.0,
+        },
+        "tracks": {
+            "track_a": {
+                "enabled": True,
+                "experiments": [{"exp_id": "a0"}, {"exp_id": "a1"}],
+            },
+            "track_b": {
+                "enabled": True,
+                "experiments": [{"exp_id": "b0"}, {"exp_id": "b1"}],
+            },
+            "track_c": {"enabled": False, "experiments": []},
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_a",
+                    "exp_id": "a0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.5,
+                },
+                {
+                    "track": "track_a",
+                    "exp_id": "a1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.56,
+                },
+                {
+                    "track": "track_b",
+                    "exp_id": "b0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.5,
+                },
+                {
+                    "track": "track_b",
+                    "exp_id": "b1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.56,
+                },
+            ],
+        },
+        "phase2_pat_series_by_experiment": {
+            "track_a": {"a0": [0.5, 0.51], "a1": [0.56, 0.57]},
+            "track_b": {"b0": [0.5, 0.51], "b1": [0.56, 0.57]},
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "PASS"
+    assert g["metrics"].get("phase2_winner_track") == "track_a"
+    assert g["metrics"].get("phase2_winner_exp_id") == "a1"
+    elim = g["metrics"].get("phase2_elimination_rows")
+    assert isinstance(elim, list)
+    b1 = [r for r in elim if isinstance(r, Mapping) and r.get("exp_id") == "b1"]
+    assert len(b1) == 1
+    assert b1[0]["reason_code"] == "meets_min_uplift_but_not_global_winner"
 
 
 def test_evaluate_phase2_gate_std_pass_with_low_variance_series() -> None:
@@ -1762,6 +2410,98 @@ def test_collect_summary_phase2_pat_series_merge_hints() -> None:
     assert s_elig.get("phase2_pat_series_auto_merge_eligible") is True
 
 
+def test_collect_summary_phase2_pat_series_coverage_counts() -> None:
+    """Summary reports PAT@1% series key count, max len, and len>=2 count."""
+    b: dict = {
+        "bundle_kind": "phase2_plan_v1",
+        "status": "metrics_ingested",
+        "tracks": {},
+        "experiments_index": [],
+        "phase2_pat_series_by_experiment": {
+            "track_a": {"e0": [0.1], "e1": [0.2, 0.21]},
+            "track_b": {"b0": [0.3, 0.31, 0.32]},
+            "not_a_track": {"x": [1.0, 2.0]},
+        },
+    }
+    s = collectors.collect_summary_phase2_plan_for_run_state(b)
+    assert s.get("phase2_pat_series_key_count") == 3
+    assert s.get("phase2_pat_series_max_len") == 3
+    assert s.get("phase2_pat_series_len_ge_2_count") == 2
+
+
+def test_count_phase2_yaml_pat_matrix_experiments() -> None:
+    """count_phase2_yaml_pat_matrix_experiments only counts track_* experiments with lists."""
+    assert collectors.count_phase2_yaml_pat_matrix_experiments(None) == 0
+    tr: dict[str, Any] = {
+        "track_a": {
+            "experiments": [
+                {"exp_id": "a0", "precision_at_recall_1pct_by_window": [0.1, 0.2]},
+                {"exp_id": "a1", "precision_at_recall_1pct_by_window": []},
+            ]
+        },
+        "other": {
+            "experiments": [{"exp_id": "x", "precision_at_recall_1pct_by_window": [0.9]}],
+        },
+    }
+    assert collectors.count_phase2_yaml_pat_matrix_experiments(tr) == 1
+
+
+def test_collect_summary_phase2_pat_matrix_yaml_experiment_count() -> None:
+    """phase2_collect includes phase2_pat_matrix_yaml_experiment_count when YAML lists exist."""
+    b: dict[str, Any] = {
+        "bundle_kind": "phase2_plan_v1",
+        "status": "plan_only",
+        "experiments_index": [],
+        "job_specs": [],
+        "tracks": {
+            "track_a": {
+                "enabled": True,
+                "experiments": [
+                    {"exp_id": "e1", "precision_at_recall_1pct_by_window": [0.1, 0.2]},
+                    {"exp_id": "e2", "precision_at_recall_1pct_by_window": [0.3]},
+                ],
+            }
+        },
+    }
+    s = collectors.collect_summary_phase2_plan_for_run_state(b)
+    assert s.get("phase2_pat_matrix_yaml_experiment_count") == 2
+
+
+def test_collect_summary_phase2_omits_pat_matrix_yaml_count_when_zero() -> None:
+    """No YAML PAT-by-window lists → summary omits the counter key."""
+    b: dict[str, Any] = {
+        "bundle_kind": "phase2_plan_v1",
+        "status": "plan_only",
+        "experiments_index": [],
+        "job_specs": [],
+        "tracks": {},
+    }
+    s = collectors.collect_summary_phase2_plan_for_run_state(b)
+    assert "phase2_pat_matrix_yaml_experiment_count" not in s
+
+
+def test_run_logged_command_timeout_uses_e_subprocess_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wall-clock timeout must not reuse E_NO_DATA_WINDOW (PAT / empty-window semantics)."""
+
+    def fake_run(*_a: Any, **_k: Any) -> None:
+        raise subprocess.TimeoutExpired(cmd="dummy", timeout=0.5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    log_dir = tmp_path / "logs_timeout"
+    r = runner.run_logged_command(
+        [sys.executable, "-c", "0"],
+        cwd=tmp_path,
+        log_dir=log_dir,
+        log_stem="to",
+        timeout_sec=0.5,
+    )
+    assert r.get("ok") is False
+    assert r.get("error_code") == "E_SUBPROCESS_TIMEOUT"
+    assert "timeout" in str(r.get("message") or "").lower()
+
+
 def test_evaluate_phase2_gate_metrics_ingested_uplift_blocked_single_preview() -> None:
     """One preview only → cannot compare; BLOCKED with phase2_uplift_insufficient_comparisons."""
     b: dict = {
@@ -1868,6 +2608,10 @@ def test_evaluate_phase2_gate_metrics_ingested_uplift_fail_below_min() -> None:
     assert g["status"] == "FAIL"
     assert "phase2_uplift_below_min_pp_vs_baseline" in g["blocking_reasons"]
     assert g["metrics"].get("phase2_uplift_pass") is False
+    elim = g["metrics"].get("phase2_elimination_rows")
+    assert isinstance(elim, list) and len(elim) == 1
+    assert elim[0]["exp_id"] == "c1"
+    assert elim[0]["reason_code"] == "below_min_uplift_pp_vs_baseline"
 
 
 def test_write_phase2_track_results_per_job_backtest_section(tmp_path: Path) -> None:
@@ -1906,6 +2650,7 @@ def test_write_phase2_track_results_per_job_backtest_section(tmp_path: Path) -> 
     p2 = tmp_path / "phase2"
     report_builder.write_phase2_track_results(p2, "rid", cfg, bundle, gate)
     ta = (p2 / "track_a_results.md").read_text(encoding="utf-8")
+    assert "## Trainer CLI evidence (T10A)" in ta
     assert "## Per-job backtest preview" in ta
     assert "0.7770" in ta
     assert "**skipped**" in ta
@@ -1973,6 +2718,55 @@ def test_write_phase2_track_results_std_section_shows_evaluated_metrics(
     assert "no `phase2_pat_series_by_experiment` entries for this track" in ta
 
 
+def test_write_phase2_track_results_trainer_cli_evidence_recorded_from_trainer_jobs(
+    tmp_path: Path,
+) -> None:
+    """T10A: when trainer_jobs ran, md shows recorded argv_fingerprint and trainer_params."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["tracks"]["track_a"]["experiments"] = [
+        {
+            "exp_id": "a0",
+            "overrides": {},
+            "trainer_params": {"recent_chunks": 2},
+        },
+    ]
+    cfg = config_loader.validate_phase2_config(raw, cli_run_id="rid")
+    bundle = collectors.collect_phase2_plan_bundle("rid", cfg)
+    bundle["status"] = "plan_only"
+    bundle["trainer_jobs"] = {
+        "executed": True,
+        "all_ok": True,
+        "results": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "ok": True,
+                "argv_fingerprint": "a1b2c3d4e5f6a7b8c9d0e1f2",
+                "resolved_trainer_argv": [
+                    "python",
+                    "-m",
+                    "trainer.trainer",
+                    "--start",
+                    "2026-01-01T00:00:00+08:00",
+                    "--end",
+                    "2026-01-08T00:00:00+08:00",
+                    "--recent-chunks",
+                    "2",
+                ],
+            },
+        ],
+    }
+    gate = evaluators.evaluate_phase2_gate(bundle)
+    p2 = tmp_path / "phase2"
+    report_builder.write_phase2_track_results(p2, "rid", cfg, bundle, gate)
+    ta = (p2 / "track_a_results.md").read_text(encoding="utf-8")
+    assert "## Trainer CLI evidence (T10A)" in ta
+    assert "a1b2c3d4e5f6a7b8c9d0e1f2" in ta
+    assert "recent_chunks" in ta
+    assert "**resolved_trainer_argv** (recorded)" in ta
+    assert "--recent-chunks" in ta
+
+
 def test_write_phase2_track_results_writes_three_files(tmp_path: Path) -> None:
     """T11 stub writes one markdown per track."""
     cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
@@ -2002,6 +2796,8 @@ def test_write_phase2_track_results_writes_three_files(tmp_path: Path) -> None:
     for p in paths:
         assert p.is_file()
         text = p.read_text(encoding="utf-8")
+        assert "## Trainer CLI evidence (T10A)" in text
+        assert "argv_fingerprint" in text
         assert "shared backtest" in text.lower() or "Shared" in text
         assert "0.1000" in text
         assert "## Per-job training_metrics harvest" in text

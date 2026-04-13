@@ -4,7 +4,7 @@
 
 - **run_id**: `pytest_resume_skip`
 - **Window**: `2026-01-01T00:00:00+08:00` → `2026-01-08T00:00:00+08:00`
-- **model_dir**: `C:\Users\longp\AppData\Local\Temp\pytest-of-longp\pytest-191\test_resume_skips_preflight_wh0\missing_models`
+- **model_dir**: `C:\Users\longp\AppData\Local\Temp\pytest-of-longp\pytest-86\test_resume_skips_preflight_wh0\missing_models`
 - **state_db_path**: `s.db`
 - **prediction_log_db_path**: `p.db`
 - **collect_bundle**: `investigations/precision_uplift_recall_1pct/orchestrator/state/pytest_resume_skip/collect_bundle.json`
@@ -33,11 +33,6 @@
 
 ```json
 [
-  {
-    "code": "E_COLLECT_BACKTEST_METRICS",
-    "message": "file not found: C:\\Users\\longp\\Patron_Walkaway\\trainer\\out_backtest\\backtest_metrics.json",
-    "path": "C:\\Users\\longp\\Patron_Walkaway\\trainer\\out_backtest\\backtest_metrics.json"
-  },
   {
     "code": "E_COLLECT_R1_PAYLOAD",
     "message": "r1_r6 log not found: C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\pytest_resume_skip\\logs\\r1_r6.stdout.log",

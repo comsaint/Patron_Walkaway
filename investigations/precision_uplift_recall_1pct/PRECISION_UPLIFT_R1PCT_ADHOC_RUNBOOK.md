@@ -122,10 +122,38 @@ python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py 
 > 目的：避免「流程有跑」但無法回答哪條策略最有希望。
 
 - [ ] **策略參數已生效**：每個候選實驗可產生 `resolved_trainer_argv`（對照 Tasklist `T10A`）。
-- [ ] **能力矩陣已確認**：實驗使用欄位在 Tasklist `T10B` 為 `supported`，非 `planned`/`blocked`。
+- [ ] **能力矩陣已確認**：實驗使用欄位在 Tasklist `T10B` 為 `supported`，非 `planned`/`blocked`。**禁止**將 `T10B` 表中標為 `planned` 或 `blocked` 的欄位（例如 `hard_negative_weight`、`gating_strategy`、`objective_variant` 在未支援前）寫進可執行 Phase 2 實驗參數並當成已生效策略；若 YAML 僅表達「意圖」而 trainer 無入口，結論必須降級為探索性敘述。
 - [ ] **契約一致**：與 Phase 1 同 `metric/timezone/censored`，且比較窗可對齊。
 - [ ] **至少雙窗**：每路線至少 2 個時間窗可比結果，避免單窗幻覺（對照 Tasklist `T11A`）。
 - [ ] **結論強度標註**：報告需標 `exploratory` / `comparative` / `decision_grade`，不可省略。
+
+#### 1.8.1 Phase 2 Gate 機械檢查（`evaluate_phase2_gate` / T11A）
+
+以下與 **`orchestrator/evaluators.py`** 行為對齊；判讀 **`phase2/phase2_gate_decision.md`** 與 **`run_state.phase2_gate_decision`** 時請一併閱讀 **`evidence_summary`** 與 **`conclusion_strength`**，**不可**只看 **PASS**／**FAIL**／**BLOCKED** 標籤。
+
+1. **雙窗硬 Gate（預設開）**：在 per-job uplift 已滿足 **`gate.min_uplift_pp_vs_baseline`** 且（若適用）std gate 未否決後，若要維持 **`PASS`**，bundle 內 **`phase2_pat_series_by_experiment`** 須存在至少一條 PAT@1% 序列，且**最長序列長度** ≥ **`gate.min_pat_windows_for_pass`**（預設 **2**）。否則狀態為 **BLOCKED**，blocking code **`phase2_insufficient_pat_windows_for_pass`**。
+2. **序列從哪來**：full **`run_pipeline.py --phase phase2`** 在寫入 gate 報表前會呼叫 **`collectors.merge_phase2_pat_series_from_shared_and_per_job`**（條件滿足時把共享 PAT 與 per-job 預覽併成兩點序列）。若未觸發 merge 或 YAML 未提供足夠長的手寫序列，仍可能觸發上一項 **BLOCKED**。
+3. **關閉雙窗檢查（僅限 smoke／除錯）**：Phase 2 YAML 的 **`gate.min_pat_windows_for_pass: 0`**（或 ≤0）可關閉上述硬 Gate；**不應**複製到宣稱可下產品結論的正式實驗設定。
+4. **勝者欄位**：uplift 路徑曾判定「達標」時，**metrics** 可能含 **`phase2_winner_*`**；若最終因雙窗或其他理由變為 **BLOCKED**，勝者欄位仍可能保留以利除錯——**以 `status` 與 `blocking_reasons` 為準**。
+
+#### 1.8.2 Phase 2 orchestrator 錯誤碼速查（runner／ingest／bundle）
+
+下列字串常見於 **`runner.run_logged_command` 回傳的 `error_code`**、**`run_pipeline.py` Phase 2 步驟的 `error_code`**，或 **`phase2_bundle.json` 的 `errors[].code`**（後者若存在，**`evaluate_phase2_gate`** 會將 bundle 判為 **FAIL** 並把 code 列入 **`blocking_reasons`**）。與 **§1.8.1** 的 **gate 專用 `blocking_reasons`（如 `phase2_insufficient_pat_windows_for_pass`）** 不同：gate 理由以 **`phase2_gate_decision.md`／`run_state.phase2_gate_decision`** 為準。
+
+**重要**：**`E_NO_DATA_WINDOW`** 在此專案 orchestrator 中主要表示「**資料或指標契約不足以評估該觀測窗／PAT@1%**」（例如 backtest stderr 暗示窗內無注單、或 **ingest 後 JSON 缺少可解析的 `model_default.test_precision_at_recall_0.01`**）。**子程序逾時**另有專用碼，勿混用。
+
+| Code | 典型情境（摘要） |
+|------|------------------|
+| **`E_SUBPROCESS_TIMEOUT`** | **`run_logged_command`** 觸發 **`subprocess.TimeoutExpired`**（`timeout_sec` 到限；程序過慢或卡住）。 |
+| **`E_NO_DATA_WINDOW`** | Backtest 失敗映射（**`classify_backtest_failure`**，如窗內無注單）；或共享／per-job **metrics 可讀但無可解析 PAT@1%**（與逾時無關）。 |
+| **`E_ARTIFACT_MISSING`** | 預期檔案缺路徑／無法載入 JSON、per-job 缺 **backtest_metrics**（檔案層級）等。 |
+| **`E_PHASE2_BACKTEST_JOBS`** | 共享 **`phase2_backtest_jobs`** 子程序失敗（非 ingest 缺欄位時見步驟訊息）。 |
+| **`E_PHASE2_PER_JOB_BACKTEST_JOBS`** | **`phase2_per_job_backtest_jobs`** 整批未全成功；細因見 **`errors[]`** 或各 job 結果列。 |
+| **`E_CONFIG_INVALID`** | Phase 2 YAML／bundle 與 **`config_loader.validate_phase2_config`** 不合（如非空 **`overrides`**、未知 **`trainer_params`**）。 |
+
+**程序退出碼（`--phase phase2`，非 dry-run／非 collect-only）**：與上表**字串** `error_code` 不同；**整數**定義之 SSOT 為 **`orchestrator/phase2_exit_codes.py`**。常見對照：**5** → **`phase2_runner_smoke`** 失敗；**7** → **`phase2_trainer_jobs`** 未全成功；**8** → **`phase2_per_job_backtest_jobs`** 或 **`phase2_backtest_jobs`** 失敗路徑；**9**／**10** → 已開 **`--phase2-fail-on-gate-fail`**／**`--phase2-fail-on-gate-blocked`** 且 gate 為 **FAIL**／**BLOCKED**。其餘（**2** 設定、**3** preflight、**4** resume 載入 bundle、**6** dry-run **NOT_READY** 等）見 **`run_pipeline.py`**。
+
+**觀測**：**`run_state.phase2_collect.phase2_pat_matrix_yaml_experiment_count`** 僅統計 YAML 已宣告 **`precision_at_recall_1pct_by_window`** 的實驗數，與 runner 是否已產出真多窗矩陣無必然相等關係（見 Tasklist **T10** 收尾項）。
 
 ---
 
@@ -173,7 +201,8 @@ python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py 
 ### 2.3.1 最小 config schema 草稿（可直接做為實作起點）
 
 > 原則：先求「可跑可追溯」，再加欄位；所有路徑預設用 repo root 相對路徑。  
-> 注意：以下為規格草稿，需在 `config_loader.py` 實際落地 schema 驗證。
+> **Phase 2 已落地**：`orchestrator/config_loader.py` 的 **`validate_phase2_config`**（**T10A**）— 每個實驗的 **`overrides` 必須為空 mapping（`{}`）**；非空鍵會 **`E_CONFIG_INVALID`**。可執行訓練 CLI 參數請寫在 **`trainer_params`**，且鍵名必須落在白名單內（與 repo 內 **`PHASE2_TRAINER_PARAM_KEYS`** 一致，例如 `use_local_parquet`、`skip_optuna`、`recent_chunks`、`sample_rated`、`lgbm_device`）。  
+> 諸如 **`hard_negative_weight`**、`objective_variant` 等仍屬 Tasklist **T10B** 之 `blocked`／`planned` 者，**不可**透過 `overrides` 繞過；待 trainer 有明確 CLI／契約後再納入白名單與 `trainer_params`。
 
 #### A) `run_phase2.yaml`（Track A/B/C）
 
@@ -205,9 +234,11 @@ tracks:
     experiments:
       - exp_id: a_baseline
         overrides: {}
-      - exp_id: a_hard_negative_v1
-        overrides:
-          hard_negative_weight: 2.0
+      # T10A：第二個實驗用 whitelist「trainer_params」對齊 trainer CLI（示例：較短 chunk 窗）
+      - exp_id: a_recent_chunks_v1
+        overrides: {}
+        trainer_params:
+          recent_chunks: 3
   track_b:
     enabled: true
     experiments:
@@ -222,10 +253,11 @@ tracks:
 gate:
   min_uplift_pp_vs_baseline: 3.0
   max_std_pp_across_windows: 2.5
+  # T11A 可選：雙窗硬 Gate（見 §1.8.1；省略時 evaluator 預設視為 2）
+  # min_pat_windows_for_pass: 2
 ```
 
-> 注意：上例 `overrides.hard_negative_weight` 僅為「策略意圖」示例；是否可執行取決於 trainer 是否已實作且已完成 orchestrator 映射。  
-> 在 Tasklist `T10A/T10B` 完成前，不可把該欄位視為已生效訓練參數。
+> 與 **`orchestrator/config/run_phase2.yaml`** 實檔對齊：僅 **`overrides: {}`** + 可選 **`trainer_params`**；勿在範例中復活非空 **`overrides`**。
 
 #### B) `run_phase3.yaml`（Winner route 加深）
 

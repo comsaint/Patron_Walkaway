@@ -27,7 +27,7 @@
 | `--phase` | 現況（2026-04-11） |
 | :--- | :--- |
 | `phase1` | **Full run 可用**：preflight → R1/R6 → backtest → collect → Gate → `phase1/*.md` |
-| `phase2` | **Full run 可用（部分能力）**：preflight → plan bundle → runner smoke →（可選）`trainer.trainer` 每 job、harvest、（可選）per-job / shared backtest → gate → `phase2/*.md`。YAML `overrides` **尚未**接到 trainer；科學有效性 Gate 見 **T11A（待辦）**；真多窗自動彙整見 T10 未完成項 |
+| `phase2` | **Full run 可用（部分能力）**：preflight → plan bundle → runner smoke →（可選）`trainer.trainer` 每 job、harvest、（可選）per-job / shared backtest → gate → `phase2/*.md`。**T10A** `trainer_params`／拒非空 `overrides` 已落地；**T11A** 科學 Gate／勝者／雙窗／`conclusion_strength` 已落地；**T11 目標**之「淘汰理由」敘事已部分落地（**`phase2_elimination_rows`** + gate md **Uplift elimination** + **`phase2_collect`** PAT 序列覆蓋摘要）。真多窗實驗矩陣、統一結果結構、fail-fast 仍見 **T10** 未完成項 |
 | `all` | **僅 `--dry-run`**：all-phase readiness（T16A）。**非 dry-run 的 `--phase all` 會 exit 2**，`--mode autonomous` **不存在**於現有 CLI |
 | `phase3` \| `phase4` | **無獨立 full run**；僅 all-phase dry-run 下的 **minimal schema** 驗證（T16A） |
 
@@ -203,7 +203,7 @@
 #### T10 - Phase 2 Track Runner + Collector
 
 - [x] runner **smoke 與 log 目錄**（`phase2_runner_smoke`）：依 `job_specs` 建 **`investigations/precision_uplift_recall_1pct/orchestrator/state/<run_id>/logs/phase2/...`**（與 `run_state`／`phase2_bundle` 同樹；相對路徑見 bundle 內 `logs_subdir_relative`）；可選 `python -m trainer.trainer --help`（`--skip-phase2-trainer-smoke` 略過）；結果寫入 `phase2_bundle.runner_smoke`；失敗 exit **5**
-- [x] runner **可選**對每個 `job_specs` 呼叫 `python -m trainer.trainer`（`--phase2-run-trainer-jobs`；`common.window` + `resources.backtest_skip_optuna`／可選 `trainer_use_local_parquet`、可選 `phase2_trainer_job_timeout_sec`）；預設略過並在 bundle 寫入 `trainer_jobs.executed: false`；任務失敗 exit **7**；YAML `overrides` 尚未接 trainer CLI（列於 `unapplied_overrides`）；訓練**成功**後自 log **推斷**產物目錄並回填 **`job_specs[].training_metrics_repo_relative`**（僅當 YAML 未手動指定；見 **`runner.infer_training_metrics_repo_relative_from_trainer_logs`**／**`merge_inferred_training_metrics_paths_into_phase2_bundle`**）
+- [x] runner **可選**對每個 `job_specs` 呼叫 `python -m trainer.trainer`（`--phase2-run-trainer-jobs`；`common.window` + `resources.backtest_skip_optuna`／可選 `trainer_use_local_parquet`、可選 `phase2_trainer_job_timeout_sec`）；預設略過並在 bundle 寫入 `trainer_jobs.executed: false`；任務失敗 exit **7**；**T10A**：非空 `overrides` 於載入設定時 **`E_CONFIG_INVALID`**；可執行參數見 **`trainer_params` 白名單**（`build_phase2_trainer_argv`）；成功列記 **`resolved_trainer_argv`**／**`argv_fingerprint`**；訓練**成功**後自 log **推斷**產物目錄並回填 **`job_specs[].training_metrics_repo_relative`**（僅當 YAML 未手動指定；見 **`runner.infer_training_metrics_repo_relative_from_trainer_logs`**／**`merge_inferred_training_metrics_paths_into_phase2_bundle`**）
 - [x] runner **每實驗回測**（`phase2_per_job_backtest_jobs`）：**`--phase2-run-per-job-backtests`** 對有 **`training_metrics_repo_relative`** 的 `job_specs` 各跑 **`trainer.backtester`**（`phase2_cfg_to_backtest_cfg` 覆寫 `model_dir`）；**`--output-dir`** 指向 `…/_per_job_backtest/`，成功後讀同目錄 **`backtest_metrics.json`**（**`collectors.phase2_per_job_backtest_metrics_repo_relative`**）寫入 **`per_job_backtest_jobs.results[].shared_precision_at_recall_1pct_preview`**；共享回測仍寫 **`resources.backtest_metrics_path`**／預設路徑；步驟順序仍為 **per-job 在前、共享在後**（利於 gate 合併 shared PAT 與 per-job 預覽）；無 hint 的列 **skip**；失敗 **exit 8** **`E_PHASE2_PER_JOB_BACKTEST_JOBS`**；預設略過 **`per_job_backtest_jobs.executed: false`**
 - [x] runner **共享回測**（`phase2_backtest_jobs`）：**`--phase2-run-backtest-jobs`** 跑單次 `trainer.backtester`（`phase2_cfg_to_backtest_cfg`）；log 於 `state/<run_id>/logs/phase2/_shared_backtest/`；ingest `resources.backtest_metrics_path` 或預設 `trainer/out_backtest/backtest_metrics.json`；成功則 **`status: metrics_ingested`**；子程序失敗／缺檔 ingest **exit 8** + **`E_ARTIFACT_MISSING`**（bundle `errors`）；預設略過並寫 **`backtest_jobs.executed: false`**
 - [x] **`phase2_job_metrics_harvest`**（於 `phase2_trainer_jobs` 之後、`phase2_backtest_jobs` 之前）：`collectors.harvest_phase2_job_training_metrics` 對每個 `job_specs` 讀取訓練指標：**優先**實驗選填 **`training_metrics_repo_relative`**（repo 相對路徑：檔案或含 `training_metrics.json` 的目錄；拒絕絕對路徑與逃出 repo 根）；**否則** **`{logs_subdir_relative}/training_metrics.json`**；寫入 **`phase2_bundle.job_training_harvest`**；`phase2_collect`／gate **`metrics`** 附 **`job_training_harvest_*`**；**`--resume`** 成功步驟可跳過
@@ -216,31 +216,31 @@
 
 #### T10A - Strategy Parameters Wiring（trainer ↔ orchestrator）
 
-- [ ] Phase 2 config 新增 `trainer_params` 白名單（取代任意 `overrides` 直接宣稱可用）
-  - [ ] 初始白名單先對齊現有 trainer CLI：`use_local_parquet`、`skip_optuna`、`recent_chunks`、`sample_rated`、`lgbm_device`
+- [x] Phase 2 config 新增 `trainer_params` 白名單（取代任意 `overrides` 直接宣稱可用）
+  - [x] 初始白名單先對齊現有 trainer CLI：`use_local_parquet`、`skip_optuna`、`recent_chunks`、`sample_rated`、`lgbm_device`
   - [ ] 進階策略（如 `hard_negative_weight`）僅在 trainer 已實作且有明確入口時加入白名單
-- [ ] `runner.build_phase2_trainer_argv` 將白名單參數映射為實際 CLI argv
-- [ ] config 驗證：白名單外 key 一律 `E_CONFIG_INVALID`（禁止 silently unapplied）
-- [ ] 每個 `job_spec` 落地 `resolved_trainer_argv` 與 `argv_fingerprint`（可稽核、可重現）
-- [ ] `phase2_bundle`／`track_*_results.md` 顯示「參數已套用」證據欄位
+- [x] `runner.build_phase2_trainer_argv` 將白名單參數映射為實際 CLI argv
+- [x] config 驗證：白名單外 key 一律 `E_CONFIG_INVALID`；非空 `overrides` 一律 `E_CONFIG_INVALID`（禁止 silently unapplied）
+- [x] `trainer_jobs.results[]` 落地 `resolved_trainer_argv` 與 `argv_fingerprint`（可稽核、可重現）
+- [x] `track_*_results.md` 顯示「參數已套用」證據（**`## Trainer CLI evidence (T10A)`**：YAML `trainer_params` + planned／recorded argv／fingerprint）；`phase2_bundle.json` 本身已含 `tracks.*.trainer_params`
 
 #### T10B - Trainer Capability Matrix（策略能力矩陣）
 
-- [ ] 在本文件維護「策略欄位 -> trainer 狀態」矩陣（`supported` / `planned` / `blocked`）
-- [ ] matrix 至少包含：`objective_variant`、`hard_negative_weight`、`gating_strategy`、`time_cv_policy`
-- [ ] 若欄位為 `planned` 或 `blocked`，Runbook 不得把該欄位當作可執行實驗參數
+- [x] 在本文件維護「策略欄位 -> trainer 狀態」矩陣（`supported` / `planned` / `blocked`）
+- [x] matrix 至少包含：`objective_variant`、`hard_negative_weight`、`gating_strategy`、`time_cv_policy`
+- [x] 若欄位為 `planned` 或 `blocked`，Runbook 不得把該欄位當作可執行實驗參數（見 **`PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` §1.8**）
 
 **Trainer Capability Matrix（v0，2026-04-11）**
 
 | 欄位 / 策略能力 | 狀態 | trainer 現況（摘要） | orchestrator Phase 2 現況 | 下一步（任務） |
 | :--- | :--- | :--- | :--- | :--- |
-| `use_local_parquet` | `supported` | `trainer.trainer` CLI 已支援 `--use-local-parquet` | `build_phase2_trainer_argv` 已可透過 resources 傳遞 | 納入 T10A 白名單並加 argv 證據落地 |
-| `skip_optuna` | `supported` | `trainer.trainer` CLI 已支援 `--skip-optuna` | `build_phase2_trainer_argv` 已可透過 resources 傳遞 | 納入 T10A 白名單並加 argv 證據落地 |
-| `recent_chunks` | `supported` | `trainer.trainer` CLI 已支援 `--recent-chunks` | 尚未由 phase2 YAML 映射到 argv | T10A 實作映射 + schema 驗證 |
-| `sample_rated` | `supported` | `trainer.trainer` CLI 已支援 `--sample-rated` | 尚未由 phase2 YAML 映射到 argv | T10A 實作映射 + schema 驗證 |
-| `lgbm_device` | `supported` | `trainer.trainer` CLI 已支援 `--lgbm-device` | 尚未由 phase2 YAML 映射到 argv | T10A 實作映射 + schema 驗證 |
+| `use_local_parquet` | `supported` | `trainer.trainer` CLI 已支援 `--use-local-parquet` | `trainer_params`／resources → argv；`track_*_results.md` T10A 區塊 | 進階策略鍵、T11A |
+| `skip_optuna` | `supported` | `trainer.trainer` CLI 已支援 `--skip-optuna` | 同上 | 同上 |
+| `recent_chunks` | `supported` | `trainer.trainer` CLI 已支援 `--recent-chunks` | 同上 | 同上 |
+| `sample_rated` | `supported` | `trainer.trainer` CLI 已支援 `--sample-rated` | 同上 | 同上 |
+| `lgbm_device` | `supported` | `trainer.trainer` CLI 已支援 `--lgbm-device` | 同上 | 同上 |
 | `objective_variant` | `planned` | 尚無通用 CLI 入口切換 objective（需明確設計） | YAML 可表達意圖，但目前不保證生效 | T10A 定義白名單語意 + trainer 端接口 |
-| `hard_negative_weight` | `blocked` | 未見對應 CLI 或訓練邏輯（僅 YAML 意圖） | `overrides` 目前列為 `unapplied_overrides` | 先實作 trainer 能力，再納入 T10A |
+| `hard_negative_weight` | `blocked` | 未見對應 CLI 或訓練邏輯（僅 YAML 意圖） | 非空 `overrides` 已拒載；需 trainer 實作後納入白名單 | 先實作 trainer 能力，再納入 T10A |
 | `gating_strategy`（Track B） | `blocked` | trainer 目前無明確「分群路由/子模型 gating」接口 | YAML 尚無可執行語意映射 | 先定義訓練/推論契約，再接 orchestrator |
 | `time_cv_policy`（Track C） | `planned` | backtester/驗證可做時序評估，但尚無完整「每實驗多窗策略」契約 | gate 目前有 MVP bridge（兩點序列），非完整多窗 | T10 + T11A 補齊 per-exp per-window 結構 |
 
@@ -266,14 +266,14 @@
 
 #### T11A - Scientific Validity Gate（避免「流程有跑但不可下結論」）
 
-- [ ] Gate 新增 `strategy_effective` 檢查：每個候選實驗必須具備「已套用參數證據」（`resolved_trainer_argv` + fingerprint）
-- [ ] 若實驗參數未生效（例如僅有 YAML 宣告、無 trainer 支援），`evaluate_phase2_gate` 必須回 `BLOCKED` 並列出 `phase2_strategy_params_not_effective`
-- [ ] 至少兩個時間窗且有可比 uplift/std，才可輸出「winner track」；否則不得給決策級結論
-- [ ] `phase2/phase2_gate_decision.md` 新增 `conclusion_strength`：`exploratory` / `comparative` / `decision_grade`
+- [x] Gate 新增 `strategy_effective` 檢查：對宣告 **`trainer_params`** 之實驗，在 **`trainer_jobs.executed`** 時要求 **`argv_fingerprint` + `resolved_trainer_argv` + `ok`**（見 `evaluators._phase2_evaluate_strategy_effective`）
+- [x] 缺證據時 **`evaluate_phase2_gate` → `BLOCKED`**，`blocking_reasons` 含 **`phase2_strategy_params_not_effective`**
+- [x] **winner track** 自動輸出與「至少雙窗」之硬 Gate（`evaluate_phase2_gate`：`metrics` 勝者欄位 + 預設 **`min_pat_windows_for_pass: 2`**；`phase2_gate_decision.md` **Winner** 區塊；`run_state.phase2_gate_decision` 鏡像鍵）；**`conclusion_strength`** 仍為輔助標籤（`decision_grade` 另需 trainer audit + per-job 回測等）
+- [x] **`conclusion_strength`**：`exploratory` / `comparative` / `decision_grade`（`gate` 回傳與 `metrics.conclusion_strength`）；**`phase2/phase2_gate_decision.md`** 與 **`run_state.phase2_gate_decision`** 附錄 T11A 欄位
 
 **完成定義**
-- [x] **（現況）** `phase2_gate_decision.md` 含 gate status、blocking reasons、evidence 摘要（**尚無**勝者路線／uplift 數值，待 T10 metrics）
-- [ ] **（目標）** 含勝者路線、淘汰理由、可稽核 evidence（PAT／uplift 等）
+- [x] **（現況）** `phase2_gate_decision.md` 含 gate status、blocking reasons、evidence 摘要；**T11A** 後含勝者欄位、**Uplift elimination**（`metrics.phase2_elimination_rows`）、T11A 科學欄位
+- [ ] **（目標）** 含勝者路線、淘汰理由、可稽核 evidence（PAT／uplift 等）— **仍待**：每實驗**完整多窗矩陣**與統一結果表（**T10**）；現行 elimination 僅覆蓋 **uplift gate 可比之 challenger**（per-job preview 口徑）
 
 ---
 

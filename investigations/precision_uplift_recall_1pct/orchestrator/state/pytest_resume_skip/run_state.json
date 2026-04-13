@@ -7,26 +7,26 @@
       "error_code": null,
       "message": "skipped (resume: preflight already success)",
       "checks": [],
-      "finished_at": "2026-04-09T09:06:52+00:00"
+      "finished_at": "2026-04-10T18:33:23+00:00"
     },
     "collect": {
       "status": "success",
-      "finished_at": "2026-04-09T09:06:52+00:00",
+      "finished_at": "2026-04-10T18:33:24+00:00",
       "artifacts": {
         "collect_bundle": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\pytest_resume_skip\\collect_bundle.json"
       }
     },
     "reports": {
       "status": "success",
-      "finished_at": "2026-04-09T09:06:52+00:00",
+      "finished_at": "2026-04-10T18:33:24+00:00",
       "artifacts": {
         "phase1_dir": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\phase1"
       }
     }
   },
   "input_summary": {
-    "config_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_resume_skips_preflight_wh0\\cfg.yaml",
-    "model_dir": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_resume_skips_preflight_wh0\\missing_models",
+    "config_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-86\\test_resume_skips_preflight_wh0\\cfg.yaml",
+    "model_dir": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-86\\test_resume_skips_preflight_wh0\\missing_models",
     "state_db_path": "s.db",
     "prediction_log_db_path": "p.db",
     "window": {
@@ -41,17 +41,16 @@
       "min_hours_gate": 72,
       "min_hours_preliminary": 48
     },
-    "fingerprint": "15f66a0a73a71d80f8c73cf754cb7835015e66f673536303bb257bea5f4cc5c7"
+    "fingerprint": "315e81fabaa9c9f23536d26775391c727896e6a488f6717baddc314353dad1d6"
   },
-  "updated_at": "2026-04-09T09:06:52+00:00",
+  "updated_at": "2026-04-10T18:33:24+00:00",
   "collect": {
-    "error_count": 3,
+    "error_count": 2,
     "error_codes": [
-      "E_COLLECT_BACKTEST_METRICS",
       "E_COLLECT_R1_PAYLOAD",
       "E_COLLECT_STATE_DB"
     ],
-    "has_backtest_metrics": false,
+    "has_backtest_metrics": true,
     "has_r1_final_payload": false,
     "has_r1_mid_payload": false,
     "finalized_alerts_count": null,
@@ -61,7 +60,6 @@
   "gate_decision": {
     "status": "FAIL",
     "blocking_reasons": [
-      "collect_error:E_COLLECT_BACKTEST_METRICS",
       "collect_error:E_COLLECT_R1_PAYLOAD",
       "collect_error:E_COLLECT_STATE_DB"
     ],
@@ -72,6 +70,6 @@
     "logs_dir": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\pytest_resume_skip\\logs",
     "collect_bundle": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\orchestrator\\state\\pytest_resume_skip\\collect_bundle.json",
     "phase1_dir": "C:\\Users\\longp\\Patron_Walkaway\\investigations\\precision_uplift_recall_1pct\\phase1",
-    "config_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-139\\test_resume_skips_preflight_wh0\\cfg.yaml"
+    "config_path": "C:\\Users\\longp\\AppData\\Local\\Temp\\pytest-of-longp\\pytest-86\\test_resume_skips_preflight_wh0\\cfg.yaml"
   }
 }

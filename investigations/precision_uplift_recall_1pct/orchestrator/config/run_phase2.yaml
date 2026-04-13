@@ -60,9 +60,11 @@ tracks:
         # training_metrics_repo_relative: out/models/20260408-173809-e472fd0
         # Optional multi-window PAT@1% (0–1) for std gate; populates bundle phase2_pat_series_by_experiment:
         # precision_at_recall_1pct_by_window: [0.50, 0.51, 0.505]
-      - exp_id: a_hard_negative_v1
-        overrides:
-          hard_negative_weight: 2.0
+      # T10A: per-experiment trainer CLI (whitelist); non-empty ``overrides`` are rejected at config load.
+      - exp_id: a_recent_chunks_v1
+        overrides: {}
+        trainer_params:
+          recent_chunks: 3
   track_b:
     enabled: true
     experiments:
