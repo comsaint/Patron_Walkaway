@@ -136,6 +136,21 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
     r1_mid_block = bundle.get("r1_r6_mid") if isinstance(bundle.get("r1_r6_mid"), Mapping) else {}
     r1_mid = r1_mid_block.get("payload") if isinstance(r1_mid_block.get("payload"), Mapping) else None
     pat_mid = extract_precision_at_target_recall(r1_mid)
+    mid_rows_obj = (
+        bundle.get("r1_r6_mid_snapshots")
+        if isinstance(bundle.get("r1_r6_mid_snapshots"), list)
+        else []
+    )
+    mid_pats: list[float] = []
+    for row in mid_rows_obj:
+        if not isinstance(row, Mapping):
+            continue
+        mp = row.get("payload")
+        if not isinstance(mp, Mapping):
+            continue
+        v = extract_precision_at_target_recall(mp)
+        if v is not None:
+            mid_pats.append(float(v))
 
     metrics: dict[str, Any] = {
         "window_hours": round(hours, 4),
@@ -143,6 +158,8 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
         "finalized_true_positives_count": n_tp_i,
         "precision_at_target_recall_final": pat_final,
         "precision_at_target_recall_mid": pat_mid,
+        "precision_at_target_recall_mid_snapshots": mid_pats or None,
+        "mid_snapshot_count": len(mid_rows_obj),
         "has_backtest_metrics": bundle.get("backtest_metrics") is not None,
     }
 
@@ -156,6 +173,8 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
             parts.append(f"pat@r_final={pat_final:.4f}")
         if pat_mid is not None:
             parts.append(f"pat@r_mid={pat_mid:.4f}")
+        if mid_pats:
+            parts.append(f"pat@r_mid_n={len(mid_pats)}")
         return "; ".join(parts)
 
     err_list = bundle.get("errors") or []
@@ -241,6 +260,16 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
             "metrics": metrics,
         }
 
+    if len(mid_pats) >= 2:
+        if max(mid_pats) - min(mid_pats) > pat_tol:
+            reasons.append("r1_multi_mid_precision_at_target_recall_divergence")
+            return {
+                "status": "FAIL",
+                "blocking_reasons": reasons,
+                "evidence_summary": _evidence(),
+                "metrics": metrics,
+            }
+
     if abs(pat_final - pat_mid) > pat_tol:
         reasons.append("r1_mid_final_precision_at_target_recall_divergence")
         return {
@@ -320,6 +349,30 @@ def phase2_per_job_backtest_metrics(bundle: Mapping[str, Any]) -> dict[str, Any]
     out["per_job_backtest_preview_count"] = sum(
         1 for p in previews if p.get("shared_precision_at_recall_1pct_preview") is not None
     )
+    return out
+
+
+def phase2_pat_series_source_counts(bundle: Mapping[str, Any]) -> dict[str, int]:
+    """Count PAT series source tags from ``phase2_pat_series_source_by_experiment``.
+
+    Returns:
+        Mapping from source tag to count (possibly empty when source map is absent).
+    """
+    root = bundle.get("phase2_pat_series_source_by_experiment")
+    if not isinstance(root, Mapping):
+        return {}
+    out: dict[str, int] = {}
+    for tkey, exp_map in root.items():
+        tr = str(tkey).strip()
+        if not tr.startswith("track_") or not isinstance(exp_map, Mapping):
+            continue
+        for row in exp_map.values():
+            if not isinstance(row, Mapping):
+                continue
+            src = str(row.get("source") or "").strip()
+            if not src:
+                continue
+            out[src] = out.get(src, 0) + 1
     return out
 
 
@@ -553,10 +606,16 @@ def _phase2_try_uplift_gate_from_per_job(
     tracks = bundle.get("tracks")
     if not isinstance(tracks, Mapping):
         tracks = {}
+    baseline_by_track_raw = gate_cfg.get("baseline_exp_id_by_track")
+    baseline_by_track: Mapping[str, Any] = (
+        baseline_by_track_raw if isinstance(baseline_by_track_raw, Mapping) else {}
+    )
 
     eligible = False
     any_meets = False
     uplift_rows: list[dict[str, Any]] = []
+    baseline_cfg_errors: list[str] = []
+    baseline_preview_missing: list[str] = []
 
     for tname in ("track_a", "track_b", "track_c"):
         tnode = tracks.get(tname)
@@ -565,8 +624,35 @@ def _phase2_try_uplift_gate_from_per_job(
         exps = tnode.get("experiments")
         if not isinstance(exps, list):
             continue
+        exp_ids = [
+            str(exp.get("exp_id") or "").strip()
+            for exp in exps
+            if isinstance(exp, Mapping)
+        ]
+        baseline_pref_raw = baseline_by_track.get(tname)
+        baseline_pref = str(baseline_pref_raw or "").strip()
+        if baseline_pref and baseline_pref not in exp_ids:
+            baseline_cfg_errors.append(
+                f"{tname}:{baseline_pref}(not_in_enabled_track_experiments)"
+            )
+            continue
         baseline_eid: str | None = None
         base_pv: float | None = None
+        if baseline_pref:
+            pv_pref = prev_map.get((tname, baseline_pref))
+            if pv_pref is None:
+                baseline_preview_missing.append(f"{tname}:{baseline_pref}")
+                continue
+            baseline_eid, base_pv = baseline_pref, pv_pref
+            uplift_rows.append(
+                {
+                    "track": tname,
+                    "exp_id": baseline_eid,
+                    "preview": base_pv,
+                    "role": "baseline",
+                    "baseline_source": "gate.baseline_exp_id_by_track",
+                }
+            )
         for exp in exps:
             if not isinstance(exp, Mapping):
                 continue
@@ -584,9 +670,12 @@ def _phase2_try_uplift_gate_from_per_job(
                         "exp_id": eid,
                         "preview": base_pv,
                         "role": "baseline",
+                        "baseline_source": "first_preview_in_yaml_order",
                     }
                 )
             else:
+                if baseline_eid is not None and eid == baseline_eid:
+                    continue
                 eligible = True
                 uplift_pp = (pv - base_pv) * 100.0
                 meets = uplift_pp >= min_uplift
@@ -632,6 +721,31 @@ def _phase2_try_uplift_gate_from_per_job(
             "max_std_pp_across_windows not applied (no multi-window series in bundle)"
         ),
     }
+    if baseline_cfg_errors:
+        metrics_u["phase2_uplift_baseline_config_errors"] = baseline_cfg_errors
+    if baseline_preview_missing:
+        metrics_u["phase2_uplift_baseline_preview_missing"] = baseline_preview_missing
+
+    if baseline_cfg_errors:
+        return {
+            "decision": "FAIL",
+            "reasons": ["phase2_uplift_baseline_config_invalid"],
+            "metrics": metrics_u,
+            "evidence_extra": (
+                "; uplift gate: FAIL — baseline_exp_id_by_track references unknown "
+                f"experiment(s): {', '.join(baseline_cfg_errors)}"
+            ),
+        }
+    if baseline_preview_missing:
+        return {
+            "decision": "BLOCKED",
+            "reasons": ["phase2_uplift_baseline_preview_missing"],
+            "metrics": metrics_u,
+            "evidence_extra": (
+                "; uplift gate: BLOCKED — configured baseline has no successful per-job "
+                f"PAT@1% preview: {', '.join(baseline_preview_missing)}"
+            ),
+        }
 
     if not eligible:
         return {
@@ -1008,10 +1122,16 @@ def evaluate_phase2_gate(bundle: dict[str, Any]) -> dict[str, Any]:
         pj_m = phase2_per_job_backtest_metrics(bundle)
         if pj_m:
             m_plan.update(pj_m)
+        src_counts = phase2_pat_series_source_counts(bundle)
+        if src_counts:
+            m_plan["phase2_pat_series_source_counts"] = src_counts
         ev_plan = (
             f"bundle is plan_only; {n_idx} experiment slot(s) declared "
             "but no training metrics ingested"
         )
+        if src_counts:
+            bits = ", ".join(f"{k}={v}" for k, v in sorted(src_counts.items()))
+            ev_plan += f"; PAT series source counts: {bits}"
         ev_plan += _phase2_per_job_backtest_evidence_suffix(bundle)
         _, _, strat_plan = _phase2_evaluate_strategy_effective(bundle)
         m_plan.update(strat_plan)
@@ -1066,7 +1186,13 @@ def evaluate_phase2_gate(bundle: dict[str, Any]) -> dict[str, Any]:
         pj_met = phase2_per_job_backtest_metrics(bundle)
         if pj_met:
             m_met.update(pj_met)
+        src_counts = phase2_pat_series_source_counts(bundle)
+        if src_counts:
+            m_met["phase2_pat_series_source_counts"] = src_counts
         ev += _phase2_per_job_backtest_evidence_suffix(bundle)
+        if src_counts:
+            bits = ", ".join(f"{k}={v}" for k, v in sorted(src_counts.items()))
+            ev += f"; PAT series source counts: {bits}"
 
         _, strat_reas, strat_m = _phase2_evaluate_strategy_effective(bundle)
         m_met.update(strat_m)

@@ -5666,3 +5666,757 @@ PYTHONPATH=. python -m pytest tests/unit/test_task7_chunk_cache_key.py \
 
 ✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**（chunk cache portable + R6 default）
 
+---
+
+## CYCLE 2026-04-14（Phase 2 orchestrator：baseline 明確化）
+
+### STEP 1 — Builder
+
+**依據（本輪僅做前 1–2 步）**
+
+- `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`
+  - T11（Phase 2 Gate 可決策化）前置缺口：目前 uplift baseline 依 YAML 第一個 preview，缺少明確 baseline 契約。
+  - 本輪只先落地兩步：  
+    1) gate config 支援 `baseline_exp_id_by_track`。  
+    2) uplift gate 依該 baseline 判定，並對錯誤配置/缺 preview 給明確阻斷原因。
+
+**實作變更**
+
+- `investigations/precision_uplift_recall_1pct/orchestrator/config_loader.py`
+  - 新增 `gate.baseline_exp_id_by_track`（optional）schema 驗證：
+    - key 必須是 `track_a|track_b|track_c`
+    - value 必須為非空 `exp_id` 字串
+- `investigations/precision_uplift_recall_1pct/orchestrator/evaluators.py`
+  - `_phase2_try_uplift_gate_from_per_job(...)` 支援 per-track baseline 指定。
+  - 新增 baseline 來源標記：
+    - `gate.baseline_exp_id_by_track`
+    - `first_preview_in_yaml_order`
+  - 新增明確 gate 訊號：
+    - `phase2_uplift_baseline_config_invalid`（FAIL）
+    - `phase2_uplift_baseline_preview_missing`（BLOCKED）
+
+**手動驗證建議**
+
+1. 在 `run_phase2.yaml` 加入：
+   - `gate.baseline_exp_id_by_track.track_c: c1`
+2. 執行 phase2（含 per-job backtest）後檢查 `phase2_gate_decision.md`：
+   - baseline 應使用 `c1`，不是 YAML 第一個有 preview 的實驗。
+3. 將 baseline 設成不存在 `exp_id`，確認 gate 轉 `FAIL` 並含 `phase2_uplift_baseline_config_invalid`。
+4. baseline 存在但該實驗無 preview，確認 gate 轉 `BLOCKED` 並含 `phase2_uplift_baseline_preview_missing`。
+
+**下一步建議**
+
+- T10/T11 下一步：把 baseline 指定寫入 `run_phase2.yaml` 範例與報表模板（track 結果頁）以避免人工誤解。
+- 長線：以真多窗序列取代目前 bridge（shared + per-job）做 std gate 主依據。
+
+✅ STEP 1 完成
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 風險點 | 修改建議 | 希望新增測試 |
+|---|------|--------|----------|--------------|
+| 1 | 正確性 | 同時存在 `r1_r6_mid_cpN` 與 `r1_r6_mid` 時，可能其實是同一 checkpoint 的重覆證據，會讓 `mid_pats` 欄位重覆計數。 | 先保留現行（因 alias 代表 canonical mid），但在 metrics 額外輸出 `mid_snapshot_unique_payload_count` 可觀察重覆風險。 | cp + alias 內容相同時，計數仍可解釋 |
+| 2 | 邊界條件 | 某些 cp log parse error 目前會進 `errors`，可能讓整體 gate 提早 FAIL（collect_error）而不是回到 PRELIMINARY。 | 可考慮把「非 canonical cp parse error」降為 warning（後續）；目前先維持 fail-fast。 | 多 cp 中一個壞 JSON 的 gate 行為測試 |
+| 3 | 可觀測性 | 新增 divergence reason 只在 `blocking_reasons`，report 目前沒有明確列 mid 序列數值。 | 在 `phase1_gate_decision.md` 補 `mid snapshots` 摘要欄位（後續）。 | gate report 出現 mid series 摘要（後續） |
+| 4 | 效能 | mid logs 掃描使用 glob，若 logs 目錄很大仍可能增加 I/O。 | 目前檔名 pattern 已很窄，影響可接受；後續若 logs 成長再加上限。 | （可選）大量無關 log 下效能 smoke |
+
+✅ STEP 2 完成
+
+### STEP 3 — Tester（寫測試）
+
+**新增測試（僅 tests）**
+
+- `tests/unit/test_precision_uplift_phase1_orchestrator.py`
+  - `test_collect_phase1_mid_snapshots_collects_cp_and_alias`
+    - 驗證 collector 會收 `mid_cp1/mid_cp2/mid(alias)`，且順序正確
+  - `test_gate_fail_on_multi_mid_divergence`
+    - 驗證多 mid 的 PAT spread 超過 tolerance 時，gate 會 `FAIL`
+
+**執行方式**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "collect_phase1_mid_snapshots_collects_cp_and_alias or gate_fail_on_multi_mid_divergence or collect_phase1_optional_r1_mid_stdout" -q
+```
+
+**結果**
+
+- `3 passed`
+
+✅ STEP 3 完成
+
+### STEP 4 — Tester（修實作）
+
+**結果**
+
+- STEP 3 測試通過後，補跑 phase1 gate/collector 相關子集回歸，全部通過。
+- `ReadLints` 檢查本輪變更檔：無新增 lint 問題。
+
+| 檢查 | 結果 |
+|------|------|
+| 新增多 mid collector/gate 測試 | 通過 |
+| phase1 `gate_` + `collect_phase1_` 子集回歸 | 通過（35 passed） |
+| Lints（collectors/evaluators/tests） | 無錯誤 |
+
+**Plan item 狀態更新（本輪）**
+
+- Phase 1 Autonomous / T8C：
+  - ✅ collector 支援多 mid snapshot logs（`r1_r6_mid_cp*` + alias）
+  - ✅ evaluator 支援多 mid divergence gate（spread > tolerance → FAIL）
+  - ⏳ 仍待：report 顯示 mid series 細節、非 canonical cp parse error 是否降級 warning 策略
+
+**建議下一項**
+
+- 優先：在 `phase1_gate_decision.md` 增加 `mid snapshots` 摘要（count、PAT 序列、來源檔）。
+- 次優先：新增 `strict_mid_snapshot_parse`（預設 false）讓非 canonical cp parse error 可選擇不阻斷 gate。
+
+✅ 全部完成，CYCLE 結束
+
+---
+
+## CYCLE 2026-04-14（Phase 2 orchestrator：gate 顯示 PAT source 統計）
+
+### STEP 1 — Builder
+
+**依據（本輪只做 1–2 步）**
+
+- 延續前輪建議：把 PAT 序列來源資訊不只放在 bundle/report，也進 gate 決策層。
+- 本輪僅做兩步：
+  1. `evaluate_phase2_gate` 產出 PAT source counts（metrics + evidence）。
+  2. `phase2_gate_decision.md` 顯示 PAT source counts 區塊。
+
+**實作變更**
+
+- `investigations/precision_uplift_recall_1pct/orchestrator/evaluators.py`
+  - 新增 `phase2_pat_series_source_counts(bundle)`：
+    - 從 `phase2_pat_series_source_by_experiment` 統計來源數量
+  - `evaluate_phase2_gate(...)`（`plan_only` / `metrics_ingested`）加上：
+    - `metrics.phase2_pat_series_source_counts`
+    - `evidence_summary` 追加 `PAT series source counts: ...`
+- `investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py`
+  - `write_phase2_gate_decision(...)` 新增章節：
+    - `### PAT series source counts`
+
+**手動驗證建議**
+
+1. 先有 `phase2_pat_series_source_by_experiment`（含 `per_job_window_series` 與/或 `shared_bridge`）。
+2. 執行 phase2 gate 後檢查：
+   - `run_state.phase2_gate_decision.metrics.phase2_pat_series_source_counts`
+   - `phase2/phase2_gate_decision.md` 是否有 source counts 區塊。
+3. 若 source map 不存在，`phase2_gate_decision.md` 應顯示 `not available`（不應報錯）。
+
+**下一步建議**
+
+- T11 下一步：在 gate 增加 bridge 佔比告警（例如 >50% 時標記 confidence 降級）。
+- T10 下一步：落地每窗窗口契約（window ids 與實際回測矩陣一致性檢查）。
+
+✅ STEP 1 完成
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 風險點 | 修改建議 | 希望新增測試 |
+|---|------|--------|----------|--------------|
+| 1 | 邊界條件 | source map 缺失時可能破壞 gate markdown。 | 缺失時顯示 `not available`。 | gate decision markdown fallback |
+| 2 | 正確性 | 非 `track_*` 鍵可能污染統計。 | helper 只計 `track_*`。 | helper filtering test |
+| 3 | 可觀測性 | 目前只給 counts，未給占比。 | 後續加百分比與告警閾值。 | 比例計算測試（後續） |
+
+✅ STEP 2 完成
+
+### STEP 3 — Tester（寫測試）
+
+**新增測試（僅 tests）**
+
+- `tests/unit/test_precision_uplift_phase1_orchestrator.py`
+  - `test_phase2_pat_series_source_counts_helper`
+  - `test_evaluate_phase2_gate_metrics_ingested_includes_source_counts`
+  - `test_write_phase2_gate_decision_includes_source_counts`
+
+**執行方式**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "source_counts_helper or includes_source_counts or gate_decision_includes_source_counts" -q
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "phase2_gate_decision or evaluate_phase2_gate or phase2_pat_series" -q
+```
+
+✅ STEP 3 完成
+
+### STEP 4 — Tester（修實作）
+
+**結果**
+
+- STEP 3 新增測試全通過。
+- phase2 gate / series 子集回歸通過。
+- `ReadLints` 無新問題。
+
+| 檢查 | 結果 |
+|------|------|
+| 新增 source-counts 測試 | 通過 |
+| phase2 gate/series 回歸子集 | 通過 |
+| Lints | 無錯誤 |
+
+**Plan item 狀態更新（本輪）**
+
+- Phase 2 / T11：
+  - ✅ Gate metrics 與 gate markdown 均可見 PAT source counts
+  - ⏳ 佔比告警與 confidence 分級仍待
+
+**建議下一項**
+
+- 建議下一步：在 `evaluate_phase2_gate` 補 `phase2_pat_series_bridge_ratio` 與閾值告警（例如 `phase2_pat_series_bridge_ratio_high`），讓「best track 可判斷性」有量化信心欄位。
+
+✅ 全部完成，CYCLE 結束
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 風險點 | 修改建議 | 希望新增測試 |
+|---|------|--------|----------|--------------|
+| 1 | 可觀測性 | 多 checkpoint 若第 N 個失敗，`run_state` 目前只記 step 失敗，缺「失敗 checkpoint index/ratio」；production 除錯要翻 logs。 | 在 `r1_r6_mid_snapshot` step message 補 `failed_checkpoint_index` / `failed_mid_end_ts`。 | 模擬第 2 checkpoint 失敗，斷言 step message 包含 index（後續） |
+| 2 | 邊界條件 | `midpoint_ratios` 若全部非法值，目前會默默 fallback 到單一 `midpoint_ratio`。這是寬鬆策略，容易掩蓋 config typo。 | 可考慮加 warning 或 fail-fast 開關（例如 `strict_midpoint_ratios=true`）。 | 全非法 list 時行為契約測試（目前先鎖定 fallback） |
+| 3 | 正確性 | 目前多 checkpoint 的 gate 仍只吃最後一個 `r1_r6_mid`；若前面 checkpoint 與最後一個方向矛盾，不會反映。 | 後續 collector/evaluator 可擴成讀取 `r1_r6_mid_cp*` 系列做完整方向檢查。 | collector 解析多 mid payload（後續） |
+| 4 | 效能 | 長窗 + 多 checkpoint 會線性增加 R1/R6 執行成本。 | runbook 建議先用 1–2 個 checkpoint；後續可加 `max_mid_snapshots` 上限。 | 設定 10 個 ratio 的防護測試（後續） |
+
+✅ STEP 2 完成
+
+### STEP 3 — Tester（寫測試）
+
+**新增測試（僅 tests）**
+
+- `tests/unit/test_precision_uplift_phase1_orchestrator.py`
+  - `test_phase1_mid_snapshot_windows_invalid_ratio_list_falls_back_to_single`
+    - 鎖定目前契約：`midpoint_ratios` 全非法時，回退到 `midpoint_ratio`
+
+**執行方式**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "mid_snapshot_windows_invalid_ratio_list_falls_back_to_single or midpoint_ratios or mid_snapshot_window" -q
+```
+
+**結果**
+
+- `5 passed`
+
+✅ STEP 3 完成
+
+### STEP 4 — Tester（修實作）
+
+**本輪修實作**
+
+- `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py`
+  - 多 checkpoint mid snapshot 失敗時，step message 補上：
+    - `checkpoint i/n`
+    - 失敗的 `end_ts`
+  - 目的：提升 run_state 可觀測性，減少 production 除錯成本。
+
+**驗證**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "mid_snapshot" -q
+```
+
+結果：`6 passed`
+
+`ReadLints`：無新增 lint 問題。
+
+| 檢查 | 結果 |
+|------|------|
+| mid snapshot 相關子集 | 通過 |
+| Lints（run_pipeline/tests） | 無錯誤 |
+
+**Plan item 狀態更新（本輪）**
+
+- Phase 1 Autonomous / T8C：
+  - ✅ 單 mid snapshot 自動化（上一輪）
+  - ✅ 多 checkpoint `midpoint_ratios` + 最後 mid 固定輸出 `r1_r6_mid.*`（本輪）
+  - ✅ mid 失敗點 run_state 可觀測訊息（本輪）
+  - ⏳ 仍待：collector/evaluator 吃多個 mid（目前仍只吃最後一個）
+
+**建議下一項**
+
+- 優先：collector 支援讀取 `r1_r6_mid_cp*.stdout.log`，evaluator 新增「多 mid 方向一致性」規則，避免只看最後一個 mid。
+- 次優先：新增 `strict_midpoint_ratios`（全非法 list 時 fail-fast 而非 fallback）。
+
+✅ 全部完成，CYCLE 結束
+
+---
+
+## CYCLE 2026-04-14（Phase 1 orchestrator：多 mid 證據收集與 gate）
+
+### STEP 1 — Builder
+
+**依據（本輪只做 1–2 步）**
+
+- 延續上一輪下一步：collector/evaluator 不該只看最後一個 mid。
+- 本輪只做兩步：
+  1. collector 讀取 `r1_r6_mid_cp*.stdout.log` 全部 mid snapshots。
+  2. evaluator 將多 mid 納入方向檢查（多 mid 彼此差異過大直接 FAIL）。
+
+**實作變更**
+
+- `investigations/precision_uplift_recall_1pct/orchestrator/collectors.py`
+  - 新增 `_collect_mid_snapshot_payloads(...)`：
+    - 掃描 `logs/r1_r6_mid_cp*.stdout.log`（按 checkpoint index 排序）
+    - 另納入 `r1_r6_mid.stdout.log`（canonical alias）
+    - 每筆記錄 `checkpoint_index/stdout_log/payload/parse_error`
+  - `collect_phase1_artifacts(...)` 新增 bundle 欄位：
+    - `r1_r6_mid_snapshots: list[...]`
+  - 向後相容：
+    - `r1_r6_mid` 仍保留，且預設取最後一筆 mid（canonical alias 存在時即 alias）
+- `investigations/precision_uplift_recall_1pct/orchestrator/evaluators.py`
+  - `evaluate_phase1_gate(...)` 新增多 mid 指標：
+    - `metrics.mid_snapshot_count`
+    - `metrics.precision_at_target_recall_mid_snapshots`
+  - 新增規則：
+    - 若 `len(mid_pats) >= 2` 且 `max(mid_pats)-min(mid_pats) > gate_pat_abs_tolerance`
+      → `FAIL` + reason `r1_multi_mid_precision_at_target_recall_divergence`
+  - 原規則保留：
+    - 缺 mid 仍是 `PRELIMINARY`
+    - 最後 mid vs final 差異超容忍仍 `FAIL`
+
+**手動驗證**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "collect_phase1_optional_r1_mid_stdout or gate_preliminary_when_mid_snapshot_missing or gate_fail_on_mid_final_pat_divergence or gate_pass_when_thresholds_and_direction_met" -q
+```
+
+結果：`3 passed`
+
+**下一步建議**
+
+- STEP 2 先 review：
+  1. 當 `r1_r6_mid_cp*` 與 alias 同時存在時是否可能重複計入同一 checkpoint。
+  2. parse error 是否應區分為「中間 checkpoint 可容忍」vs「canonical mid 不可容忍」。
+  3. 是否需要在 gate evidence 中列出 `mid_pats`（目前只有 count）。
+
+✅ STEP 1 完成
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 風險點 | 修改建議 | 希望新增測試 |
+|---|------|--------|----------|--------------|
+| 1 | 邊界條件 | `midpoint_ratio` 目前僅在 runtime 兜底（非法值回 0.5），但未驗證「超短 window + ratio 合法」時是否仍產生合理 mid。 | 在 helper 保留現行保守 fallback，但補測「end<=start / 極短窗」應回 `None`。 | `phase1_mid_snapshot_window` 對壞 window 回 `None` |
+| 2 | 正確性 | `--resume` 舊 run（無 `r1_r6_mid_snapshot` step）會補跑 mid 並可能跳過 final；此行為是合理但需明確契約，避免誤判成「resume 沒完整重跑」。 | 在 runbook/狀態欄位明示「resume 可單獨補 mid step」，並補一個 resume 合約測試。 | `resume` 下只補 mid、不重跑已成功 final/backtest |
+| 3 | 可觀測性 | `phase1_gate_decision.md` 目前只顯示 PAT mid 值，未直接標註 mid 檔來源路徑是否存在。 | 報表可額外顯示 `r1_r6_mid.stdout.log` path 與 parse 狀態，方便 production 快速除錯。 | gate/report 含 mid log path + has_mid flag（後續） |
+| 4 | 效能/資源 | mid snapshot 目前固定從 `window.start_ts` 跑到 mid，長窗時可能重算成本偏高。 | 後續可擴充 `checkpoints.mid_start_strategy`（例如 `from_start` / `rolling_recent_hours`）以降低中途成本。 | 參數化 start strategy 的單測（後續） |
+
+✅ STEP 2 完成
+
+### STEP 3 — Tester（寫測試）
+
+**新增測試（僅 tests）**
+
+- `tests/unit/test_precision_uplift_phase1_orchestrator.py`
+  - `test_phase1_mid_snapshot_window_invalid_bounds_returns_none`
+  - `test_phase1_config_checkpoints_type_validation`
+  - （沿用 STEP 1）`test_phase1_mid_snapshot_window_defaults_to_half_window`
+  - （沿用 STEP 1）`test_phase1_mid_snapshot_window_honors_disable_flag`
+  - （沿用 STEP 1）`test_run_phase1_r1_r6_all_mid_window_override_and_log_stem`
+
+**執行方式**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "phase1_mid_snapshot_window or phase1_config_checkpoints_type_validation or run_phase1_r1_r6_all_mid_window_override_and_log_stem" -q
+```
+
+**結果**
+
+- `5 passed`
+
+✅ STEP 3 完成
+
+### STEP 4 — Tester（修實作）
+
+**結果**
+
+- STEP 3 測試通過後，針對 mid 相關既有 gate/collector 子集做回歸，皆通過。
+- `ReadLints` 檢查本輪變更檔：無新增 lint 問題。
+
+| 檢查 | 結果 |
+|------|------|
+| `phase1_mid_snapshot_window` / runner mid log stem 測試 | 通過 |
+| `gate_preliminary_when_mid_snapshot_missing` 回歸 | 通過 |
+| `collect_phase1_optional_r1_mid_stdout` 回歸 | 通過 |
+| Lints（run_pipeline/runner/config_loader/tests） | 無錯誤 |
+
+**Plan item 狀態更新（本輪）**
+
+- Phase 1 Autonomous / T8C（自動 mid/final snapshot）：
+  - ✅ 已落地最小可用版本：orchestrator 自動產生 mid snapshot（`r1_r6_mid.stdout.log`）並納入 gate 證據鏈
+  - ⏳ 仍待擴充：多 checkpoint（不只 midpoint）、checkpoint 策略（例如 T+6h / T+24h）與 mid 來源可觀測欄位
+
+**建議下一項（從 plan 挑選）**
+
+- 優先做：`checkpoints` 支援多個中途點（list）+ 「最新有效 mid」選擇邏輯，對齊 runbook 的 `phase1.checkpoints` 契約。
+- 次優先：在 `phase1_gate_decision.md` / `run_state.collect` 顯示 mid log path 與 parse 狀態，縮短 production 除錯時間。
+
+✅ 全部完成，CYCLE 結束
+
+---
+
+## CYCLE 2026-04-14（Phase 1 orchestrator：多 checkpoint mid snapshots）
+
+### STEP 1 — Builder
+
+**依據（本輪只做 1–2 步）**
+
+- 延續上一輪建議：把 Phase 1 mid snapshot 從「單一 midpoint」升級成「多 checkpoint」最小可用版本。
+- 本輪只做兩步：
+  1. phase1 config 支援 `checkpoints.midpoint_ratios`（list）。
+  2. pipeline 依序跑多個 mid snapshots，最後一個固定落在 `r1_r6_mid.*`（供 collector/gate 直接使用）。
+
+**實作變更**
+
+- `investigations/precision_uplift_recall_1pct/orchestrator/config_loader.py`
+  - `validate_phase1_config` 新增：
+    - `checkpoints.midpoint_ratios` 必須為 non-empty list
+    - list 內每個元素必須 numeric
+- `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py`
+  - 新增 `phase1_mid_snapshot_windows(cfg)`：
+    - 支援 `midpoint_ratios`（若設定則覆蓋單一 `midpoint_ratio`）
+    - ratio 會去重並排序
+  - `phase1_mid_snapshot_window(cfg)` 改為相容 wrapper（回傳第一個 checkpoint）
+  - `_main_phase1` 的 `r1_r6_mid_snapshot` step 改為可跑多個 checkpoint：
+    - 前面 checkpoint log stem：`r1_r6_mid_cp1`, `r1_r6_mid_cp2`, ...
+    - 最後 checkpoint log stem：`r1_r6_mid`（保持 gate 讀取契約不變）
+    - 成功會在 step artifacts 記錄 `r1_r6_mid_stdout_log`
+- `investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase1.yaml`
+  - 補 `midpoint_ratios` 範例註解
+- `tests/unit/test_precision_uplift_phase1_orchestrator.py`
+  - 新增 `test_phase1_mid_snapshot_windows_supports_ratio_list`
+  - 擴充 `test_phase1_config_checkpoints_type_validation`：
+    - 空 list 應失敗
+    - list 含非數值應失敗
+
+**手動驗證**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "mid_snapshot_window or checkpoints_type_validation or midpoint_ratios" -q
+```
+
+預期：`5 passed`
+
+**下一步建議**
+
+- STEP 2（Reviewer）重點檢查：
+  1. 多 checkpoint 其中一個失敗時的 run_state 可觀測性是否足夠（目前只保留 step 級失敗）。
+  2. `midpoint_ratios` 全部無效時 fallback 行為是否應該 fail-fast（目前偏寬鬆）。
+  3. 是否要在 collect/report 顯示「採用哪個 checkpoint 當 mid」。
+
+✅ STEP 1 完成
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 風險點 | 修改建議 | 希望新增測試 |
+|---|------|--------|----------|--------------|
+| 1 | 正確性 | baseline 若配置到不存在的 exp，舊行為會 silently fallback。 | 直接 fail-fast。 | `configured_baseline_invalid_fails` |
+| 2 | 邊界條件 | baseline 存在但無成功 preview，舊行為會退回其他實驗。 | 改為 BLOCKED，避免錯誤比較。 | `configured_baseline_preview_missing_blocked` |
+| 3 | 可觀測性 | 無法從結果看出 baseline 來源。 | 在 uplift rows 加 `baseline_source`。 | `uses_configured_baseline_per_track` |
+
+✅ STEP 2 完成
+
+### STEP 3 — Tester（寫測試）
+
+**新增測試（僅 tests）**
+
+- `tests/unit/test_precision_uplift_phase1_orchestrator.py`
+  - `test_phase2_config_gate_baseline_exp_id_by_track_validation`
+  - `test_evaluate_phase2_gate_uses_configured_baseline_per_track`
+  - `test_evaluate_phase2_gate_configured_baseline_preview_missing_blocked`
+  - `test_evaluate_phase2_gate_configured_baseline_invalid_fails`
+
+**執行方式**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "baseline_exp_id_by_track or configured_baseline" -q
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "evaluate_phase2_gate and (uplift or std or metrics_ingested)" -q
+```
+
+✅ STEP 3 完成
+
+### STEP 4 — Tester（修實作）
+
+**結果**
+
+- 針對 STEP 3 測試，實作已通過；無需再改 tests。
+- `ReadLints` 檢查本輪變更檔：無新 linter 問題。
+
+| 檢查 | 結果 |
+|------|------|
+| Baseline 指定 uplift gate | 通過 |
+| baseline invalid/preview missing 分流 | 通過 |
+| 既有 phase2 uplift/std 測試子集 | 通過 |
+| Lints（三個變更檔） | 無錯誤 |
+
+**Plan item 狀態更新（本輪）**
+
+- Phase 2 / T11（Gate 可決策化）：
+  - ✅ 新增 baseline 契約與 fail-fast/blocked 訊號（本輪完成）
+  - ⏳ 真多窗序列與完整 runner 證據鏈（仍待）
+
+**建議下一項**
+
+- 優先做：T10 真多窗 per-track metrics 契約落地（每實驗跨窗 PAT 序列），讓 T11 std gate 不再依賴 bridge。
+
+✅ 全部完成，CYCLE 結束
+
+---
+
+## CYCLE 2026-04-14（Phase 1 orchestrator：自動 mid snapshot 落地）
+
+### STEP 1 — Builder
+
+**依據（本輪只做 1–2 步）**
+
+- 目標：讓 Phase 1 orchestrator 在 full-run 時「自己產生 mid snapshot」，不再依賴人工補 `r1_r6_mid.stdout.log`。
+- 本輪只做兩步：
+  1. phase1 config / pipeline 補 checkpoint(mid) 解析與執行。
+  2. runner 補 mid snapshot 視窗覆寫與 mid log 檔名能力。
+
+**實作變更**
+
+- `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py`
+  - 新增 `phase1_mid_snapshot_window(cfg)`：
+    - 讀 `checkpoints.enable_mid_snapshot`（預設 true）
+    - 讀 `checkpoints.midpoint_ratio`（預設 0.5）
+    - 由 `window.start_ts/end_ts` 自動計算 mid end_ts
+  - `_main_phase1` 新增 `r1_r6_mid_snapshot` step：
+    - 在 final `r1_r6_analysis` 前先跑一次 mid snapshot
+    - 成功時落 `logs/r1_r6_mid.stdout.log`
+    - 失敗時 fail-fast（exit 4），避免後續 gate 產生假完成感
+  - `build_input_summary` 納入 `checkpoints`，避免 `--resume` 指紋漏比對
+- `investigations/precision_uplift_recall_1pct/orchestrator/runner.py`
+  - `run_phase1_r1_r6_all(...)` 新增：
+    - `window_override`（可用 mid window 覆蓋原始 window）
+    - `log_stem`（可指定 `r1_r6_mid`）
+- `investigations/precision_uplift_recall_1pct/orchestrator/config_loader.py`
+  - phase1 config 驗證補上可選 `checkpoints` 型別檢查：
+    - `enable_mid_snapshot` 必須 bool
+    - `midpoint_ratio` 必須 numeric
+- `investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase1.yaml`
+  - 新增 checkpoint 範例欄位與註解（`enable_mid_snapshot`, `midpoint_ratio`）
+- `tests/unit/test_precision_uplift_phase1_orchestrator.py`
+  - 新增：
+    - `test_phase1_mid_snapshot_window_defaults_to_half_window`
+    - `test_phase1_mid_snapshot_window_honors_disable_flag`
+    - `test_run_phase1_r1_r6_all_mid_window_override_and_log_stem`
+
+**手動驗證**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "phase1_mid_snapshot_window or run_phase1_r1_r6_all_mid_window_override_and_log_stem" -q
+```
+
+預期：`3 passed`
+
+**下一步建議**
+
+- STEP 2（Reviewer）優先檢查：
+  1. `--resume` 下若舊 run 沒有 mid step，是否正確補跑且不重跑 final。
+  2. 極短 window（接近 0）與異常 ratio（<=0 或 >=1）的行為是否符合預期。
+  3. 是否需要支援多個 checkpoints（不只單一 midpoint），以符合 runbook 的「至少 1 個 mid」擴展需求。
+
+✅ STEP 1 完成
+
+---
+
+## CYCLE 2026-04-14（Phase 2 orchestrator：PAT 序列來源可審核化）
+
+### STEP 1 — Builder
+
+**依據（本輪只做 1–2 步）**
+
+- 延續上一輪下一步：在 `phase2_bundle` 增加 PAT 序列來源可審核資訊。
+- 本輪僅做兩步：
+  1. per-job ingest 補 `window_ids`。
+  2. merge/report 補 `pat_series_source` 與來源展示。
+
+**實作變更**
+
+- `investigations/precision_uplift_recall_1pct/orchestrator/runner.py`
+  - 新增 `_preview_precision_at_recall_1pct_window_ids_from_metrics(...)`
+  - 讀取 `model_default.test_precision_at_recall_0.01_window_ids`（可選）
+  - per-job row 新增 `precision_at_recall_1pct_window_ids_preview`
+- `investigations/precision_uplift_recall_1pct/orchestrator/collectors.py`
+  - `merge_phase2_pat_series_from_shared_and_per_job(...)` 寫入
+    `phase2_pat_series_source_by_experiment`
+  - 每個 `(track, exp_id)` 記錄：
+    - `source=per_job_window_series`（有多窗序列）
+    - `source=shared_bridge`（退回兩點 bridge）
+    - 可選 `window_ids`
+- `investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py`
+  - `track_*.md` 的 `PAT@1% series` 區塊顯示來源 metadata：
+    - `source=...`
+    - `window_ids=[...]`（若存在）
+
+**手動驗證建議**
+
+1. 讓 per-job `backtest_metrics.json` 同時包含：
+   - `test_precision_at_recall_0.01_by_window`
+   - `test_precision_at_recall_0.01_window_ids`
+2. 執行 phase2 後檢查 `phase2_bundle.json`：
+   - `phase2_pat_series_by_experiment`
+   - `phase2_pat_series_source_by_experiment`
+3. 檢查 `phase2/track_c_results.md` 是否出現：
+   - `source=per_job_window_series`
+   - `window_ids=[...]`
+4. 拿掉多窗序列欄位，確認 source 退回 `shared_bridge`。
+
+**下一步建議**
+
+- T10 下一步：把 `window_ids` 與實際回測窗口契約綁定（避免僅文字標籤）。
+- T11 下一步：Gate metrics 可追加「各序列 source 分佈」摘要（快速辨識 bridge 佔比）。
+
+✅ STEP 1 完成
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 風險點 | 修改建議 | 希望新增測試 |
+|---|------|--------|----------|--------------|
+| 1 | 邊界條件 | `window_ids` 長度可能與 PAT 序列不一致。 | 先允許（資訊用途），後續可加嚴格檢查/告警。 | 長度不一致但仍可輸出 source |
+| 2 | 正確性 | source map 可能被後續 merge 覆寫。 | 僅在寫入新序列時更新對應 source；不覆寫既有非空序列來源。 | 既有序列不被覆寫 |
+| 3 | 可觀測性 | Gate 尚未顯示 source 統計。 | 後續在 gate metrics 增 `phase2_pat_series_source_counts`。 | gate metrics source counts（後續） |
+
+✅ STEP 2 完成
+
+### STEP 3 — Tester（寫測試）
+
+**新增/調整測試（僅 tests）**
+
+- `tests/unit/test_precision_uplift_phase1_orchestrator.py`
+  - 強化 `test_run_phase2_per_job_backtests_resolves_model_dir_and_preview`
+    - 新增斷言 `precision_at_recall_1pct_window_ids_preview`
+  - `test_merge_phase2_pat_series_writes_source_map_for_bridge_and_series`
+  - `test_write_phase2_track_results_pat_series_shows_source_metadata`
+
+**執行方式**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "per_job_backtests_resolves_model_dir_and_preview or merge_phase2_pat_series_writes_source_map_for_bridge_and_series or write_phase2_track_results_pat_series_shows_source_metadata" -q
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "phase2_pat_series or evaluate_phase2_gate or track_results_std_section" -q
+```
+
+✅ STEP 3 完成
+
+### STEP 4 — Tester（修實作）
+
+**結果**
+
+- STEP 3 新測試全部通過。
+- phase2 gate/report 相關回歸子集通過。
+- `ReadLints`（runner/collectors/report_builder/tests）無新錯誤。
+
+| 檢查 | 結果 |
+|------|------|
+| 新增 source metadata 測試 | 通過 |
+| phase2_pat_series + gate/report 子集 | 通過 |
+| Lints | 無錯誤 |
+
+**Plan item 狀態更新（本輪）**
+
+- Phase 2 / T10→T11：
+  - ✅ PAT 序列來源（`per_job_window_series` / `shared_bridge`）可落地
+  - ✅ report 可顯示來源與 `window_ids`
+  - ⏳ source 統計進 gate、`window_ids` 契約嚴格檢查仍待
+
+**建議下一項**
+
+- 優先做：在 `evaluators.py` 補 `phase2_pat_series_source_counts`，並於 `phase2_gate_decision.md` 顯示 bridge 佔比，讓「best track 判斷信心」更透明。
+
+✅ 全部完成，CYCLE 結束
+
+---
+
+## CYCLE 2026-04-14（Phase 2 orchestrator：per-job 多窗 PAT 序列接線）
+
+### STEP 1 — Builder
+
+**依據（本輪只做 1–2 步）**
+
+- 延續上一輪「T10 真多窗 per-track metrics 契約落地」建議。
+- 本輪只落兩步（不擴 scope）：
+  1. per-job backtest ingest 支援可選多窗 PAT 序列欄位。
+  2. `merge_phase2_pat_series_from_shared_and_per_job` 優先使用該序列（有值時不再強制兩點 bridge）。
+
+**實作變更**
+
+- `investigations/precision_uplift_recall_1pct/orchestrator/runner.py`
+  - 新增 `_preview_precision_at_recall_1pct_series_from_metrics(...)`
+  - ingest `model_default.test_precision_at_recall_0.01_by_window`（list[float]）到每 job 結果欄位：
+    - `precision_at_recall_1pct_by_window_preview`
+- `investigations/precision_uplift_recall_1pct/orchestrator/collectors.py`
+  - `merge_phase2_pat_series_from_shared_and_per_job(...)` 新規則：
+    - 若 per-job row 有 `precision_at_recall_1pct_by_window_preview` 且長度 >=2，直接採用該序列。
+    - 否則 fallback 舊行為 `[shared_pat, shared_precision_at_recall_1pct_preview]` 兩點 bridge。
+
+**手動驗證建議**
+
+1. 準備 per-job `backtest_metrics.json`，包含：
+   - `model_default.test_precision_at_recall_0.01`
+   - `model_default.test_precision_at_recall_0.01_by_window`
+2. 跑 phase2 per-job backtest 流程，確認 `phase2_bundle.json` 的 `per_job_backtest_jobs.results[*]` 出現：
+   - `precision_at_recall_1pct_by_window_preview`
+3. 再看 gate 前 merge 結果：
+   - `phase2_pat_series_by_experiment.track_x.exp_y` 應為多窗序列（不是兩點）。
+4. 把 `*_by_window` 改成單點或移除，應自動退回兩點 bridge。
+
+**下一步建議**
+
+- T10 下一步：把每窗序列來源與 window_id 一起落地（目前只有值序列，尚未綁窗口名稱）。
+- T11 下一步：在 `phase2/track_*.md` 顯示序列來源（per-job multi-window vs bridge）。
+
+✅ STEP 1 完成
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 風險點 | 修改建議 | 希望新增測試 |
+|---|------|--------|----------|--------------|
+| 1 | 正確性 | `_by_window` 若含非數值，可能污染 std gate。 | 解析失敗時視為無效序列並回退 bridge。 | invalid element -> fallback bridge |
+| 2 | 邊界條件 | `_by_window` 只有 1 點，不能用於 stdev。 | 明確要求長度 >=2 才採用。 | short list -> fallback bridge |
+| 3 | 可觀測性 | 難辨識某序列來自真多窗還是 bridge。 | 後續在 report/gate metrics 增加 source 註記。 | report assertion（後續） |
+
+✅ STEP 2 完成
+
+### STEP 3 — Tester（寫測試）
+
+**新增/調整測試（僅 tests）**
+
+- `tests/unit/test_precision_uplift_phase1_orchestrator.py`
+  - `test_merge_phase2_pat_series_prefers_per_job_window_series`
+  - `test_merge_phase2_pat_series_short_series_falls_back_to_bridge`
+  - 強化 `test_run_phase2_per_job_backtests_resolves_model_dir_and_preview`：
+    - 驗證 `precision_at_recall_1pct_by_window_preview` 被寫入 per-job row
+
+**執行方式**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "per_job_backtests_resolves_model_dir_and_preview or merge_phase2_pat_series_prefers_per_job_window_series or merge_phase2_pat_series_short_series_falls_back_to_bridge" -q
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "phase2_pat_series or evaluate_phase2_gate" -q
+```
+
+✅ STEP 3 完成
+
+### STEP 4 — Tester（修實作）
+
+**結果**
+
+- STEP 3 測試皆通過；不需改 tests。
+- 相關 phase2 series/gate 子集回歸通過。
+- `ReadLints` 檢查本輪變更檔：無新 lint 問題。
+
+| 檢查 | 結果 |
+|------|------|
+| 新增 per-job 序列接線測試 | 通過 |
+| phase2_pat_series + evaluate_phase2_gate 子集 | 通過 |
+| Lints（runner/collectors/tests） | 無錯誤 |
+
+**Plan item 狀態更新（本輪）**
+
+- Phase 2 / T10→T11 資料鏈：
+  - ✅ per-job backtest 可帶 `precision_at_recall_1pct_by_window_preview`
+  - ✅ merge 優先採用真序列、不足時回退 bridge
+  - ⏳ 序列與 `window_id` 綁定、報表 source 顯示仍待
+
+**建議下一項**
+
+- 先做：在 `phase2_bundle` 增加 `pat_series_source`（per_job_window_series / shared_bridge）與可選 `window_ids`，讓 gate/report 可審核來源。
+
+✅ 全部完成，CYCLE 結束
+

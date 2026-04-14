@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Mapping
@@ -18,6 +19,7 @@ _REPO_ROOT = _ORCHESTRATOR_DIR.parents[2]
 ERR_BACKTEST_METRICS = "E_COLLECT_BACKTEST_METRICS"
 ERR_R1_PAYLOAD = "E_COLLECT_R1_PAYLOAD"
 ERR_STATE_DB_STATS = "E_COLLECT_STATE_DB"
+_MID_CP_STEM_RE = re.compile(r"^r1_r6_mid_cp(\d+)\.stdout\.log$")
 
 
 def _resolve_under_root(repo_root: Path, p: str | Path) -> Path:
@@ -299,6 +301,63 @@ def _parse_r1_stdout_file(path: Path) -> tuple[dict[str, Any] | None, str | None
     return raw, None
 
 
+def _collect_mid_snapshot_payloads(
+    logs_dir: Path,
+    errors: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    """Parse all discovered mid snapshot logs in deterministic checkpoint order.
+
+    Ordering:
+    1) ``r1_r6_mid_cpN.stdout.log`` by ascending N
+    2) ``r1_r6_mid.stdout.log`` (canonical last-mid alias)
+    """
+    rows: list[dict[str, Any]] = []
+    cp_paths: list[tuple[int, Path]] = []
+    for p in logs_dir.glob("r1_r6_mid_cp*.stdout.log"):
+        m = _MID_CP_STEM_RE.match(p.name)
+        if not m:
+            continue
+        cp_paths.append((int(m.group(1)), p))
+    cp_paths.sort(key=lambda x: x[0])
+    for idx, p in cp_paths:
+        payload, perr = _parse_r1_stdout_file(p)
+        if perr:
+            _append_error(
+                errors,
+                ERR_R1_PAYLOAD,
+                f"mid_cp{idx}: {perr}",
+                path=str(p),
+            )
+        rows.append(
+            {
+                "checkpoint_index": idx,
+                "stdout_log": str(p),
+                "payload": payload,
+                "parse_error": perr,
+            }
+        )
+    alias = logs_dir / "r1_r6_mid.stdout.log"
+    if alias.is_file():
+        payload, perr = _parse_r1_stdout_file(alias)
+        if perr:
+            _append_error(
+                errors,
+                ERR_R1_PAYLOAD,
+                f"mid: {perr}",
+                path=str(alias),
+            )
+        rows.append(
+            {
+                "checkpoint_index": None,
+                "stdout_log": str(alias),
+                "payload": payload,
+                "parse_error": perr,
+                "is_canonical_mid_alias": True,
+            }
+        )
+    return rows
+
+
 def _collect_state_db_window_stats(
     state_db: Path,
     window: Mapping[str, Any],
@@ -454,17 +513,15 @@ def collect_phase1_artifacts(
             path=str(r1_final_path),
         )
 
+    mid_rows = _collect_mid_snapshot_payloads(logs_dir, errors)
     r1_mid_payload: dict[str, Any] | None = None
     r1_mid_parse_err: str | None = None
-    if r1_mid_path.is_file():
-        r1_mid_payload, r1_mid_parse_err = _parse_r1_stdout_file(r1_mid_path)
-        if r1_mid_parse_err:
-            _append_error(
-                errors,
-                ERR_R1_PAYLOAD,
-                f"mid: {r1_mid_parse_err}",
-                path=str(r1_mid_path),
-            )
+    if mid_rows:
+        last = mid_rows[-1]
+        p = last.get("payload")
+        r1_mid_payload = p if isinstance(p, dict) else None
+        pe = last.get("parse_error")
+        r1_mid_parse_err = str(pe) if isinstance(pe, str) else None
 
     window = cfg_d.get("window") or {}
     state_db_raw = cfg_d.get("state_db_path", "")
@@ -486,6 +543,7 @@ def collect_phase1_artifacts(
             "stdout_log": str(r1_mid_path),
             "parse_error": r1_mid_parse_err,
         },
+        "r1_r6_mid_snapshots": mid_rows,
         "state_db_stats": state_stats,
         "thresholds": dict(cfg_d.get("thresholds") or {}),
         "window": dict(window) if isinstance(window, Mapping) else {},
@@ -831,8 +889,10 @@ def phase2_pat_series_mapping_has_evaluable_series(series_root: Any) -> bool:
 def merge_phase2_pat_series_from_shared_and_per_job(bundle: dict[str, Any]) -> bool:
     """Fill ``phase2_pat_series_by_experiment`` from shared ingest + per-job previews (MVP).
 
-    For each successful per-job backtest row with a numeric
-    ``shared_precision_at_recall_1pct_preview``, writes a two-sample series
+    For each successful per-job backtest row, prefers optional
+    ``precision_at_recall_1pct_by_window_preview`` (list[float]) when available and
+    length >= 2. Otherwise falls back to numeric
+    ``shared_precision_at_recall_1pct_preview`` with a two-sample bridge
     ``[shared_pat, preview]`` where ``shared_pat`` is parsed from ingested
     ``backtest_metrics`` (same path as the Phase 2 gate shared PAT extractor).
 
@@ -846,6 +906,10 @@ def merge_phase2_pat_series_from_shared_and_per_job(bundle: dict[str, Any]) -> b
 
     Args:
         bundle: Mutable Phase 2 bundle.
+
+    Also writes/merges optional provenance map
+    ``phase2_pat_series_source_by_experiment`` with per-series source tags:
+    ``per_job_window_series`` or ``shared_bridge`` and optional ``window_ids``.
 
     Returns:
         True if ``bundle`` gained a non-empty ``phase2_pat_series_by_experiment``.
@@ -867,6 +931,7 @@ def merge_phase2_pat_series_from_shared_and_per_job(bundle: dict[str, Any]) -> b
     if not isinstance(results, list):
         return False
     out_root: dict[str, dict[str, list[float]]] = {}
+    src_root: dict[str, dict[str, dict[str, Any]]] = {}
     for row in results:
         if not isinstance(row, Mapping) or row.get("skipped"):
             continue
@@ -874,6 +939,33 @@ def merge_phase2_pat_series_from_shared_and_per_job(bundle: dict[str, Any]) -> b
             continue
         tr = str(row.get("track") or "").strip()
         eid = str(row.get("exp_id") or "").strip()
+        seq_preview = row.get("precision_at_recall_1pct_by_window_preview")
+        if (
+            isinstance(seq_preview, list)
+            and len(seq_preview) >= 2
+            and tr
+            and eid
+            and tr.startswith("track_")
+        ):
+            seq_vals: list[float] = []
+            bad_seq = False
+            for x in seq_preview:
+                try:
+                    seq_vals.append(float(x))
+                except (TypeError, ValueError):
+                    bad_seq = True
+                    break
+            if not bad_seq and seq_vals:
+                out_root.setdefault(tr, {})[eid] = seq_vals
+                ids_raw = row.get("precision_at_recall_1pct_window_ids_preview")
+                ids: list[str] | None = None
+                if isinstance(ids_raw, list) and ids_raw:
+                    ids = [str(x) for x in ids_raw]
+                src_row: dict[str, Any] = {"source": "per_job_window_series"}
+                if ids is not None:
+                    src_row["window_ids"] = ids
+                src_root.setdefault(tr, {})[eid] = src_row
+                continue
         prev = row.get("shared_precision_at_recall_1pct_preview")
         if not tr or not eid or prev is None:
             continue
@@ -886,6 +978,7 @@ def merge_phase2_pat_series_from_shared_and_per_job(bundle: dict[str, Any]) -> b
             continue
         exp_map = out_root.setdefault(tr, {})
         exp_map[eid] = [sv, pv]
+        src_root.setdefault(tr, {})[eid] = {"source": "shared_bridge"}
     if not out_root:
         return False
     existing = bundle.get("phase2_pat_series_by_experiment")
@@ -893,6 +986,11 @@ def merge_phase2_pat_series_from_shared_and_per_job(bundle: dict[str, Any]) -> b
         copy.deepcopy(dict(existing)) if isinstance(existing, Mapping) else {}
     )
     changed = False
+    src_existing = bundle.get("phase2_pat_series_source_by_experiment")
+    src_merged: dict[str, Any] = (
+        copy.deepcopy(dict(src_existing)) if isinstance(src_existing, Mapping) else {}
+    )
+    src_changed = False
     for tr, em in out_root.items():
         cur = merged.setdefault(tr, {})
         if not isinstance(cur, dict):
@@ -904,9 +1002,20 @@ def merge_phase2_pat_series_from_shared_and_per_job(bundle: dict[str, Any]) -> b
                 continue
             cur[eid] = list(seq)
             changed = True
+            tr_src = src_root.get(tr, {})
+            src_row = tr_src.get(eid)
+            if isinstance(src_row, Mapping):
+                cur_src = src_merged.setdefault(tr, {})
+                if not isinstance(cur_src, dict):
+                    cur_src = {}
+                    src_merged[tr] = cur_src
+                cur_src[eid] = dict(src_row)
+                src_changed = True
     if not changed:
         return False
     bundle["phase2_pat_series_by_experiment"] = merged
+    if src_changed:
+        bundle["phase2_pat_series_source_by_experiment"] = src_merged
     return True
 
 

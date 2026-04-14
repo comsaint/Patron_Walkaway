@@ -331,6 +331,19 @@ def write_phase2_gate_decision(
             "",
         ]
     )
+    gm = gate.get("metrics") if isinstance(gate.get("metrics"), Mapping) else {}
+    src_counts = (
+        gm.get("phase2_pat_series_source_counts")
+        if isinstance(gm.get("phase2_pat_series_source_counts"), Mapping)
+        else None
+    )
+    lines.extend(["### PAT series source counts", ""])
+    if isinstance(src_counts, Mapping) and src_counts:
+        for k in sorted(src_counts.keys(), key=lambda x: str(x)):
+            lines.append(f"- `{k}`: {src_counts[k]}")
+    else:
+        lines.append("- *(not available)*")
+    lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
 
@@ -573,6 +586,8 @@ def _phase2_std_and_pat_series_markdown_for_track(
     lines: list[str] = []
     root = bundle.get("phase2_pat_series_by_experiment")
     exp_map = root.get(tname) if isinstance(root, Mapping) else None
+    src_root = bundle.get("phase2_pat_series_source_by_experiment")
+    src_map = src_root.get(tname) if isinstance(src_root, Mapping) else None
     lines.append("### Bundle series (this track)")
     lines.append("")
     if isinstance(exp_map, Mapping) and exp_map:
@@ -582,8 +597,20 @@ def _phase2_std_and_pat_series_markdown_for_track(
             if not isinstance(raw_list, list) or not raw_list:
                 lines.append(f"- `{eid}`: *(non-list or empty)*")
                 continue
+            src_note = ""
+            if isinstance(src_map, Mapping):
+                srow = src_map.get(eid_raw)
+                if isinstance(srow, Mapping):
+                    src = str(srow.get("source") or "").strip()
+                    if src:
+                        src_note = f"; source={src}"
+                    ids = srow.get("window_ids")
+                    if isinstance(ids, list) and ids:
+                        ids_join = ", ".join(str(x) for x in ids)
+                        src_note += f"; window_ids=[{ids_join}]"
             lines.append(
                 f"- `{eid}`: n={len(raw_list)} {_format_phase2_pat_series_values(raw_list)}"
+                f"{src_note}"
             )
     else:
         lines.append(

@@ -98,6 +98,39 @@ def validate_phase1_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             f"thresholds missing {t_missing}; required {list(REQUIRED_THRESHOLD_KEYS)}"
         )
 
+    checkpoints = raw.get("checkpoints")
+    if checkpoints is not None:
+        if not isinstance(checkpoints, Mapping):
+            raise ConfigValidationError(
+                f"checkpoints must be a mapping when set, got {type(checkpoints).__name__}"
+            )
+        if "enable_mid_snapshot" in checkpoints and not isinstance(
+            checkpoints["enable_mid_snapshot"], bool
+        ):
+            raise ConfigValidationError(
+                "checkpoints.enable_mid_snapshot must be bool when set"
+            )
+        if "midpoint_ratio" in checkpoints:
+            try:
+                float(checkpoints["midpoint_ratio"])
+            except (TypeError, ValueError) as exc:
+                raise ConfigValidationError(
+                    "checkpoints.midpoint_ratio must be numeric when set"
+                ) from exc
+        if "midpoint_ratios" in checkpoints:
+            vals = checkpoints["midpoint_ratios"]
+            if not isinstance(vals, list) or not vals:
+                raise ConfigValidationError(
+                    "checkpoints.midpoint_ratios must be a non-empty list when set"
+                )
+            for i, x in enumerate(vals):
+                try:
+                    float(x)
+                except (TypeError, ValueError) as exc:
+                    raise ConfigValidationError(
+                        f"checkpoints.midpoint_ratios[{i}] must be numeric"
+                    ) from exc
+
     return dict(raw)
 
 
@@ -136,6 +169,7 @@ PHASE2_RESOURCE_KEYS: tuple[str, ...] = (
 )
 PHASE2_TRACK_NAMES: tuple[str, ...] = ("track_a", "track_b", "track_c")
 PHASE2_GATE_KEYS: tuple[str, ...] = ("min_uplift_pp_vs_baseline", "max_std_pp_across_windows")
+PHASE2_GATE_BASELINE_BY_TRACK_KEY = "baseline_exp_id_by_track"
 
 # T10A: only these keys may appear under ``tracks.*.experiments[].trainer_params`` (maps to trainer CLI).
 PHASE2_TRAINER_PARAM_KEYS: tuple[str, ...] = (
@@ -373,6 +407,23 @@ def validate_phase2_config(raw: Mapping[str, Any], *, cli_run_id: str) -> dict[s
         raise ConfigValidationError(
             f"gate missing {g_missing}; required {list(PHASE2_GATE_KEYS)}"
         )
+    bbt = gate.get(PHASE2_GATE_BASELINE_BY_TRACK_KEY)
+    if bbt is not None:
+        if not isinstance(bbt, Mapping):
+            raise ConfigValidationError(
+                "gate.baseline_exp_id_by_track must be a mapping when set"
+            )
+        for tname, eid in bbt.items():
+            ts = str(tname).strip()
+            if ts not in PHASE2_TRACK_NAMES:
+                raise ConfigValidationError(
+                    f"gate.baseline_exp_id_by_track has unknown track {tname!r}; "
+                    f"allowed: {list(PHASE2_TRACK_NAMES)}"
+                )
+            if not isinstance(eid, str) or not eid.strip():
+                raise ConfigValidationError(
+                    f"gate.baseline_exp_id_by_track.{ts} must be a non-empty string exp_id"
+                )
 
     return dict(raw)
 

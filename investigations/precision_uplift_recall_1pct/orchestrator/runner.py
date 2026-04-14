@@ -289,6 +289,8 @@ def run_phase1_r1_r6_all(
     *,
     python_exe: str | None = None,
     timeout_sec: float | None = None,
+    window_override: Mapping[str, Any] | None = None,
+    log_stem: str = "r1_r6",
 ) -> dict[str, Any]:
     """Run ``run_r1_r6_analysis.py --mode all --pretty`` with DB paths from config.
 
@@ -298,6 +300,9 @@ def run_phase1_r1_r6_all(
         log_dir: Directory for stdout/stderr logs.
         python_exe: Python interpreter; default ``sys.executable``.
         timeout_sec: Optional wall-clock timeout.
+        window_override: Optional ``{"start_ts","end_ts"}`` mapping used instead of
+            ``cfg["window"]``. Useful for mid-snapshot checkpoints.
+        log_stem: Filename stem for subprocess logs (default ``r1_r6``).
 
     Returns:
         Result dict with ok, error_code, message, log paths, subprocess returncode.
@@ -318,7 +323,11 @@ def run_phase1_r1_r6_all(
     model_dir = _resolve_path(repo_root, str(cfg["model_dir"]))
     state_db = _resolve_path(repo_root, str(cfg["state_db_path"]))
     pred_db = _resolve_path(repo_root, str(cfg["prediction_log_db_path"]))
-    w = cfg["window"]
+    w_raw = window_override if isinstance(window_override, Mapping) else cfg["window"]
+    w = {
+        "start_ts": str(w_raw["start_ts"]),
+        "end_ts": str(w_raw["end_ts"]),
+    }
 
     argv: list[str] = [
         exe,
@@ -341,7 +350,7 @@ def run_phase1_r1_r6_all(
         argv,
         cwd=repo_root,
         log_dir=log_dir,
-        log_stem="r1_r6",
+        log_stem=log_stem,
         timeout_sec=timeout_sec,
     )
     if not base.get("ok") and base.get("error_code"):
@@ -888,6 +897,47 @@ def _preview_precision_at_recall_1pct_from_metrics(
         return None
 
 
+def _preview_precision_at_recall_1pct_series_from_metrics(
+    metrics: Mapping[str, Any],
+) -> list[float] | None:
+    """Read optional multi-window PAT@1% series from backtest metrics.
+
+    Contract (T10/T11 incremental): when present, expects
+    ``model_default.test_precision_at_recall_0.01_by_window`` as a list of numeric values
+    in [0, 1]-scale (same scale as preview PAT).
+    """
+    md = metrics.get("model_default")
+    if not isinstance(md, Mapping):
+        return None
+    raw = md.get("test_precision_at_recall_0.01_by_window")
+    if not isinstance(raw, list) or not raw:
+        return None
+    out: list[float] = []
+    for x in raw:
+        try:
+            out.append(float(x))
+        except (TypeError, ValueError):
+            return None
+    return out or None
+
+
+def _preview_precision_at_recall_1pct_window_ids_from_metrics(
+    metrics: Mapping[str, Any],
+) -> list[str] | None:
+    """Read optional window labels aligned with ``*_by_window`` PAT series.
+
+    Contract (incremental): ``model_default.test_precision_at_recall_0.01_window_ids``
+    as a non-empty list. Values are stringified for reporting consistency.
+    """
+    md = metrics.get("model_default")
+    if not isinstance(md, Mapping):
+        return None
+    raw = md.get("test_precision_at_recall_0.01_window_ids")
+    if not isinstance(raw, list) or not raw:
+        return None
+    return [str(x) for x in raw]
+
+
 def run_phase2_per_job_backtests(
     repo_root: Path,
     bundle: Mapping[str, Any],
@@ -1016,8 +1066,22 @@ def run_phase2_per_job_backtests(
                         "(PAT@1% for observation window)"
                     )
                     ingest_error_code = "E_NO_DATA_WINDOW"
+                    preview_series = None
+                    preview_window_ids = None
+                else:
+                    preview_series = _preview_precision_at_recall_1pct_series_from_metrics(
+                        mobj
+                    )
+                    preview_window_ids = (
+                        _preview_precision_at_recall_1pct_window_ids_from_metrics(mobj)
+                    )
             else:
                 ok_sub = False
+                preview_series = None
+                preview_window_ids = None
+        else:
+            preview_series = None
+            preview_window_ids = None
 
         if not ok_sub:
             if all_ok:
@@ -1045,6 +1109,8 @@ def run_phase2_per_job_backtests(
                 "metrics_load_error": None if ok_sub else load_err,
                 "ingest_error_code": ingest_error_code,
                 "shared_precision_at_recall_1pct_preview": preview,
+                "precision_at_recall_1pct_by_window_preview": preview_series,
+                "precision_at_recall_1pct_window_ids_preview": preview_window_ids,
             }
         )
 

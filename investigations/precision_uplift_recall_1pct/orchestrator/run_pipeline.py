@@ -34,6 +34,80 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _parse_iso_ts(raw: str) -> datetime:
+    """Parse ISO-8601 timestamp string (supports trailing ``Z``)."""
+    ts = raw.strip()
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    return datetime.fromisoformat(ts)
+
+
+def phase1_mid_snapshot_window(cfg: Mapping[str, Any]) -> dict[str, str] | None:
+    """Return the first auto mid-snapshot window for Phase 1.
+
+    Compatibility helper for tests/callers that expect one midpoint. Internally
+    the pipeline now supports multiple checkpoints via
+    ``phase1_mid_snapshot_windows``.
+    """
+    rows = phase1_mid_snapshot_windows(cfg)
+    return rows[0] if rows else None
+
+
+def phase1_mid_snapshot_windows(cfg: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Return auto mid-snapshot windows for Phase 1.
+
+    Config (all optional) under ``checkpoints``:
+    - ``enable_mid_snapshot``: bool, default True.
+    - ``midpoint_ratio``: float in (0, 1), default 0.5.
+    - ``midpoint_ratios``: optional list[float] in (0, 1); when set, overrides
+      the single ``midpoint_ratio``.
+    """
+    cp = cfg.get("checkpoints") if isinstance(cfg.get("checkpoints"), Mapping) else {}
+    enabled_raw = cp.get("enable_mid_snapshot", True)
+    enabled = bool(enabled_raw) if isinstance(enabled_raw, bool) else True
+    if not enabled:
+        return []
+
+    ratios_raw = cp.get("midpoint_ratios")
+    ratios: list[float] = []
+    if isinstance(ratios_raw, list) and ratios_raw:
+        for x in ratios_raw:
+            try:
+                v = float(x)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 < v < 1.0:
+                ratios.append(v)
+    if not ratios:
+        ratio_raw = cp.get("midpoint_ratio", 0.5)
+        try:
+            ratio = float(ratio_raw)
+        except (TypeError, ValueError):
+            ratio = 0.5
+        if not (0.0 < ratio < 1.0):
+            ratio = 0.5
+        ratios = [ratio]
+
+    window = cfg.get("window") if isinstance(cfg.get("window"), Mapping) else {}
+    start_raw = str(window.get("start_ts") or "").strip()
+    end_raw = str(window.get("end_ts") or "").strip()
+    if not start_raw or not end_raw:
+        return []
+    start_dt = _parse_iso_ts(start_raw)
+    end_dt = _parse_iso_ts(end_raw)
+    if end_dt <= start_dt:
+        return []
+
+    uniq_sorted = sorted(set(ratios))
+    out: list[dict[str, str]] = []
+    for r in uniq_sorted:
+        mid_dt = start_dt + (end_dt - start_dt) * r
+        if mid_dt <= start_dt or mid_dt >= end_dt:
+            continue
+        out.append({"start_ts": start_raw, "end_ts": mid_dt.isoformat()})
+    return out
+
+
 def _state_path(run_id: str) -> Path:
     """Return path to ``run_state.json`` for this run."""
     return _ORCHESTRATOR_DIR / "state" / run_id / "run_state.json"
@@ -100,6 +174,7 @@ def build_input_summary(cfg: dict[str, Any], config_path: Path) -> dict[str, Any
         "backtest_extra_args",
         "backtest_metrics_path",
         "gate_pat_abs_tolerance",
+        "checkpoints",
     ):
         if opt in cfg:
             summary[opt] = cfg[opt]
@@ -1042,8 +1117,77 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
 
     if not args.collect_only:
         log_dir = _logs_dir(args.run_id)
+        skip_mid = resume_ok and _step_success(prev_steps, "r1_r6_mid_snapshot")
         skip_r1 = resume_ok and _step_success(prev_steps, "r1_r6_analysis")
         skip_bt = resume_ok and _step_success(prev_steps, "backtest")
+
+        if not skip_mid:
+            mid_windows = phase1_mid_snapshot_windows(cfg)
+            if not mid_windows:
+                _attach_terminal_step(
+                    merged,
+                    "r1_r6_mid_snapshot",
+                    status="success",
+                    message="mid snapshot skipped (disabled or invalid checkpoint window)",
+                )
+                _write_run_state(state_file, merged)
+            else:
+                t_mid = _mark_step_running(merged, "r1_r6_mid_snapshot")
+                _write_run_state(state_file, merged)
+                r1_mid_last: dict[str, Any] | None = None
+                for idx, mid_window in enumerate(mid_windows):
+                    stem = (
+                        "r1_r6_mid"
+                        if idx == len(mid_windows) - 1
+                        else f"r1_r6_mid_cp{idx + 1}"
+                    )
+                    r1_mid = runner.run_phase1_r1_r6_all(
+                        _REPO_ROOT,
+                        cfg,
+                        log_dir,
+                        window_override=mid_window,
+                        log_stem=stem,
+                    )
+                    r1_mid_last = r1_mid
+                    if not r1_mid.get("ok"):
+                        fail_msg = (
+                            f"mid snapshot failed at checkpoint {idx + 1}/{len(mid_windows)} "
+                            f"(end_ts={mid_window.get('end_ts')})"
+                        )
+                        raw_msg = r1_mid.get("message")
+                        if isinstance(raw_msg, str) and raw_msg.strip():
+                            r1_mid["message"] = f"{fail_msg}; {raw_msg}"
+                        else:
+                            r1_mid["message"] = fail_msg
+                        _attach_step(
+                            merged, "r1_r6_mid_snapshot", r1_mid, started_at=t_mid
+                        )
+                        _write_run_state(state_file, merged)
+                        break
+                assert r1_mid_last is not None
+                if r1_mid_last.get("ok"):
+                    msg = f"mid snapshot(s) completed: {len(mid_windows)} checkpoint(s)"
+                    _attach_terminal_step(
+                        merged,
+                        "r1_r6_mid_snapshot",
+                        status="success",
+                        artifacts={
+                            "r1_r6_mid_stdout_log": str(
+                                log_dir / "r1_r6_mid.stdout.log"
+                            )
+                        },
+                        message=msg,
+                    )
+                    merged["steps"]["r1_r6_mid_snapshot"]["started_at"] = t_mid
+                    _write_run_state(state_file, merged)
+                else:
+                    print(
+                        r1_mid_last.get("message")
+                        or r1_mid_last.get("error_code")
+                        or "r1_r6_mid_snapshot failed",
+                        file=sys.stderr,
+                    )
+                    return 4
 
         if not skip_r1:
             t_r1 = _mark_step_running(merged, "r1_r6_analysis")

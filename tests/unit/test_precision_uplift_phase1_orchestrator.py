@@ -205,6 +205,22 @@ def test_phase2_config_run_id_mismatch_raises() -> None:
         config_loader.validate_phase2_config(raw, cli_run_id="cli_rid")
 
 
+def test_phase2_config_gate_baseline_exp_id_by_track_validation() -> None:
+    """gate.baseline_exp_id_by_track requires known track keys and non-empty exp ids."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["gate"]["baseline_exp_id_by_track"] = {"track_z": "z0"}
+    with pytest.raises(config_loader.ConfigValidationError, match="unknown track"):
+        config_loader.validate_phase2_config(raw, cli_run_id="rid")
+
+    raw2 = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw2["gate"]["baseline_exp_id_by_track"] = {"track_a": "   "}
+    with pytest.raises(
+        config_loader.ConfigValidationError,
+        match="baseline_exp_id_by_track.track_a must be a non-empty string exp_id",
+    ):
+        config_loader.validate_phase2_config(raw2, cli_run_id="rid")
+
+
 def test_phase2_gate_cli_exit_code_when_disabled() -> None:
     """Without --phase2-fail-on-gate-fail policy, CLI helper returns None."""
     assert (
@@ -1136,6 +1152,154 @@ def test_phase2_cfg_to_backtest_cfg_maps_window_and_skip_optuna() -> None:
     assert bt["backtest_skip_optuna"] is True
 
 
+def test_phase1_mid_snapshot_window_defaults_to_half_window() -> None:
+    """Without checkpoints override, Phase 1 mid snapshot uses 50% window end."""
+    cfg = _minimal_config_dict()
+    w = run_pipeline.phase1_mid_snapshot_window(cfg)
+    assert w is not None
+    assert w["start_ts"] == "2026-01-01T00:00:00+08:00"
+    assert w["end_ts"] == "2026-01-04T12:00:00+08:00"
+
+
+def test_phase1_mid_snapshot_window_honors_disable_flag() -> None:
+    """checkpoints.enable_mid_snapshot=false disables auto mid snapshot."""
+    cfg = _minimal_config_dict()
+    cfg["checkpoints"] = {"enable_mid_snapshot": False}
+    assert run_pipeline.phase1_mid_snapshot_window(cfg) is None
+
+
+def test_phase1_mid_snapshot_windows_supports_ratio_list() -> None:
+    """When midpoint_ratios is set, pipeline should produce sorted unique checkpoints."""
+    cfg = _minimal_config_dict()
+    cfg["checkpoints"] = {"midpoint_ratios": [0.75, 0.25, 0.25]}
+    ws = run_pipeline.phase1_mid_snapshot_windows(cfg)
+    assert [w["end_ts"] for w in ws] == [
+        "2026-01-02T18:00:00+08:00",
+        "2026-01-06T06:00:00+08:00",
+    ]
+
+
+def test_phase1_mid_snapshot_windows_invalid_ratio_list_falls_back_to_single() -> None:
+    """All-invalid midpoint_ratios currently fall back to midpoint_ratio/default."""
+    cfg = _minimal_config_dict()
+    cfg["checkpoints"] = {
+        "midpoint_ratios": [-1, 0, 1, 2],  # all invalid for (0,1)
+        "midpoint_ratio": 0.25,
+    }
+    ws = run_pipeline.phase1_mid_snapshot_windows(cfg)
+    assert [w["end_ts"] for w in ws] == ["2026-01-02T18:00:00+08:00"]
+
+
+def test_phase1_mid_snapshot_window_invalid_bounds_returns_none() -> None:
+    """Invalid or zero-length windows must disable auto mid snapshot."""
+    cfg = _minimal_config_dict()
+    cfg["window"] = {
+        "start_ts": "2026-01-08T00:00:00+08:00",
+        "end_ts": "2026-01-08T00:00:00+08:00",
+    }
+    assert run_pipeline.phase1_mid_snapshot_window(cfg) is None
+
+    cfg2 = _minimal_config_dict()
+    cfg2["window"] = {
+        "start_ts": "2026-01-09T00:00:00+08:00",
+        "end_ts": "2026-01-08T00:00:00+08:00",
+    }
+    assert run_pipeline.phase1_mid_snapshot_window(cfg2) is None
+
+
+def test_phase1_config_checkpoints_type_validation() -> None:
+    """Phase1 checkpoints schema must reject wrong primitive types."""
+    raw = _minimal_config_dict()
+    raw["checkpoints"] = {"enable_mid_snapshot": "yes"}  # type: ignore[assignment]
+    with pytest.raises(
+        config_loader.ConfigValidationError,
+        match="checkpoints.enable_mid_snapshot must be bool",
+    ):
+        config_loader.validate_phase1_config(raw)
+
+    raw2 = _minimal_config_dict()
+    raw2["checkpoints"] = {"midpoint_ratio": "bad"}  # type: ignore[assignment]
+    with pytest.raises(
+        config_loader.ConfigValidationError,
+        match="checkpoints.midpoint_ratio must be numeric",
+    ):
+        config_loader.validate_phase1_config(raw2)
+
+    raw3 = _minimal_config_dict()
+    raw3["checkpoints"] = {"midpoint_ratios": []}  # type: ignore[assignment]
+    with pytest.raises(
+        config_loader.ConfigValidationError,
+        match="checkpoints.midpoint_ratios must be a non-empty list",
+    ):
+        config_loader.validate_phase1_config(raw3)
+
+    raw4 = _minimal_config_dict()
+    raw4["checkpoints"] = {"midpoint_ratios": [0.3, "bad"]}  # type: ignore[list-item]
+    with pytest.raises(
+        config_loader.ConfigValidationError,
+        match=r"checkpoints.midpoint_ratios\[1\] must be numeric",
+    ):
+        config_loader.validate_phase1_config(raw4)
+
+
+def test_run_phase1_r1_r6_all_mid_window_override_and_log_stem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mid snapshot run must use overridden window and r1_r6_mid log stem."""
+    captured: list[list[str]] = []
+    captured_stems: list[str] = []
+
+    def fake_logged(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        captured.append(list(argv))
+        captured_stems.append(str(kwargs.get("log_stem") or ""))
+        log_dir = kwargs["log_dir"]
+        stem = str(kwargs["log_stem"])
+        return {
+            "ok": True,
+            "returncode": 0,
+            "stdout_path": log_dir / f"{stem}.stdout.log",
+            "stderr_path": log_dir / f"{stem}.stderr.log",
+            "stdout_text": "",
+            "stderr_text": "",
+            "combined_text": "",
+            "error_code": None,
+            "message": None,
+        }
+
+    monkeypatch.setattr(runner, "run_logged_command", fake_logged)
+    (tmp_path / "m").mkdir()
+    script = tmp_path / "dummy_r1.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    cfg = {
+        "model_dir": "m",
+        "window": {
+            "start_ts": "2026-01-01T00:00:00+08:00",
+            "end_ts": "2026-01-08T00:00:00+08:00",
+        },
+        "state_db_path": "s.db",
+        "prediction_log_db_path": "p.db",
+        "r1_r6_script": str(script),
+    }
+    log_d = tmp_path / "logs"
+    log_d.mkdir()
+    mid_w = {
+        "start_ts": "2026-01-01T00:00:00+08:00",
+        "end_ts": "2026-01-03T00:00:00+08:00",
+    }
+    res = runner.run_phase1_r1_r6_all(
+        tmp_path,
+        cfg,
+        log_d,
+        window_override=mid_w,
+        log_stem="r1_r6_mid",
+    )
+    assert res.get("ok") is True
+    argv = captured[0]
+    assert argv[argv.index("--start-ts") + 1] == mid_w["start_ts"]
+    assert argv[argv.index("--end-ts") + 1] == mid_w["end_ts"]
+    assert captured_stems == ["r1_r6_mid"]
+
+
 def test_run_phase1_backtest_includes_output_dir_argv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1472,7 +1636,13 @@ def test_run_phase2_per_job_backtests_resolves_model_dir_and_preview(
     ) -> tuple[dict[str, Any] | None, str | None]:
         seen_metrics_paths.append(rel_path)
         return (
-            {"model_default": {"test_precision_at_recall_0.01": 0.42}},
+            {
+                "model_default": {
+                    "test_precision_at_recall_0.01": 0.42,
+                    "test_precision_at_recall_0.01_by_window": [0.4, 0.42, 0.41],
+                    "test_precision_at_recall_0.01_window_ids": ["w0", "w1", "w2"],
+                }
+            },
             None,
         )
 
@@ -1490,6 +1660,8 @@ def test_run_phase2_per_job_backtests_resolves_model_dir_and_preview(
     assert seen_metrics_paths == [expect_m]
     assert rows[0].get("metrics_repo_relative") == expect_m
     assert rows[0].get("shared_precision_at_recall_1pct_preview") == pytest.approx(0.42)
+    assert rows[0].get("precision_at_recall_1pct_by_window_preview") == [0.4, 0.42, 0.41]
+    assert rows[0].get("precision_at_recall_1pct_window_ids_preview") == ["w0", "w1", "w2"]
 
 
 def test_run_phase2_per_job_backtests_fails_when_metrics_missing_pat_preview(
@@ -2251,6 +2423,54 @@ def test_merge_phase2_pat_series_builds_two_point_series() -> None:
     assert b["phase2_pat_series_by_experiment"]["track_c"]["c0"] == [0.5, 0.52]
 
 
+def test_merge_phase2_pat_series_prefers_per_job_window_series() -> None:
+    """When per-job window series exists, merge should use it instead of two-point bridge."""
+    b: dict = {
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "ok": True,
+                    "precision_at_recall_1pct_by_window_preview": [0.61, 0.63, 0.62],
+                    "precision_at_recall_1pct_window_ids_preview": ["wA", "wB", "wC"],
+                    "shared_precision_at_recall_1pct_preview": 0.52,
+                },
+            ],
+        },
+    }
+    assert collectors.merge_phase2_pat_series_from_shared_and_per_job(b) is True
+    assert b["phase2_pat_series_by_experiment"]["track_c"]["c0"] == [0.61, 0.63, 0.62]
+    src = b["phase2_pat_series_source_by_experiment"]["track_c"]["c0"]
+    assert src["source"] == "per_job_window_series"
+    assert src["window_ids"] == ["wA", "wB", "wC"]
+
+
+def test_merge_phase2_pat_series_short_series_falls_back_to_bridge() -> None:
+    """Single-point per-job series is not evaluable; merge falls back to [shared, preview]."""
+    b: dict = {
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "ok": True,
+                    "precision_at_recall_1pct_by_window_preview": [0.61],
+                    "shared_precision_at_recall_1pct_preview": 0.52,
+                },
+            ],
+        },
+    }
+    assert collectors.merge_phase2_pat_series_from_shared_and_per_job(b) is True
+    assert b["phase2_pat_series_by_experiment"]["track_c"]["c0"] == [0.5, 0.52]
+    src = b["phase2_pat_series_source_by_experiment"]["track_c"]["c0"]
+    assert src["source"] == "shared_bridge"
+
+
 def test_merge_phase2_pat_series_skips_when_manual_len_ge_2() -> None:
     """Do not overwrite user-provided multi-window series."""
     b: dict = {
@@ -2338,6 +2558,34 @@ def test_merge_phase2_pat_series_noop_without_shared_pat() -> None:
     }
     assert collectors.merge_phase2_pat_series_from_shared_and_per_job(b) is False
     assert "phase2_pat_series_by_experiment" not in b
+
+
+def test_merge_phase2_pat_series_writes_source_map_for_bridge_and_series() -> None:
+    """Merge should persist per-exp source metadata for auditing."""
+    b: dict = {
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "ok": True,
+                    "precision_at_recall_1pct_by_window_preview": [0.61, 0.63],
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.52,
+                },
+            ],
+        },
+    }
+    assert collectors.merge_phase2_pat_series_from_shared_and_per_job(b) is True
+    src = b["phase2_pat_series_source_by_experiment"]["track_c"]
+    assert src["c0"]["source"] == "per_job_window_series"
+    assert src["c1"]["source"] == "shared_bridge"
 
 
 def test_evaluate_phase2_gate_after_auto_merge_std_evaluated() -> None:
@@ -2614,6 +2862,148 @@ def test_evaluate_phase2_gate_metrics_ingested_uplift_fail_below_min() -> None:
     assert elim[0]["reason_code"] == "below_min_uplift_pp_vs_baseline"
 
 
+def test_evaluate_phase2_gate_uses_configured_baseline_per_track() -> None:
+    """Configured baseline_exp_id_by_track overrides implicit first-preview baseline."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {
+            "min_uplift_pp_vs_baseline": 3.0,
+            "max_std_pp_across_windows": 2.5,
+            "baseline_exp_id_by_track": {"track_c": "c1"},
+        },
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}, {"exp_id": "c2"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.70,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.60,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c2",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.64,
+                },
+            ],
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "PASS"
+    rows = g["metrics"].get("phase2_uplift_rows") or []
+    baseline_rows = [r for r in rows if isinstance(r, dict) and r.get("role") == "baseline"]
+    assert baseline_rows
+    assert baseline_rows[0].get("exp_id") == "c1"
+    assert baseline_rows[0].get("baseline_source") == "gate.baseline_exp_id_by_track"
+
+
+def test_evaluate_phase2_gate_configured_baseline_preview_missing_blocked() -> None:
+    """Configured baseline without successful preview blocks uplift gate."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {
+            "min_uplift_pp_vs_baseline": 3.0,
+            "max_std_pp_across_windows": 2.5,
+            "baseline_exp_id_by_track": {"track_c": "c1"},
+        },
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.60,
+                }
+            ],
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "BLOCKED"
+    assert "phase2_uplift_baseline_preview_missing" in g["blocking_reasons"]
+
+
+def test_evaluate_phase2_gate_configured_baseline_invalid_fails() -> None:
+    """Configured baseline not present in enabled track experiments fails fast."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {
+            "min_uplift_pp_vs_baseline": 3.0,
+            "max_std_pp_across_windows": 2.5,
+            "baseline_exp_id_by_track": {"track_c": "c_missing"},
+        },
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.60,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.65,
+                },
+            ],
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["status"] == "FAIL"
+    assert "phase2_uplift_baseline_config_invalid" in g["blocking_reasons"]
+
+
 def test_write_phase2_track_results_per_job_backtest_section(tmp_path: Path) -> None:
     """Each track md lists per-job backtest rows when per_job_backtest_jobs ran."""
     cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
@@ -2765,6 +3155,110 @@ def test_write_phase2_track_results_trainer_cli_evidence_recorded_from_trainer_j
     assert "recent_chunks" in ta
     assert "**resolved_trainer_argv** (recorded)" in ta
     assert "--recent-chunks" in ta
+
+
+def test_write_phase2_track_results_pat_series_shows_source_metadata(
+    tmp_path: Path,
+) -> None:
+    """Track series section should show source + optional window ids when provided."""
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    bundle = collectors.collect_phase2_plan_bundle("rid", cfg)
+    bundle["status"] = "metrics_ingested"
+    bundle["phase2_pat_series_by_experiment"] = {"track_c": {"c0": [0.61, 0.63, 0.62]}}
+    bundle["phase2_pat_series_source_by_experiment"] = {
+        "track_c": {
+            "c0": {"source": "per_job_window_series", "window_ids": ["wA", "wB", "wC"]}
+        }
+    }
+    gate = {"status": "BLOCKED", "blocking_reasons": [], "evidence_summary": "", "metrics": {}}
+    p2 = tmp_path / "phase2"
+    report_builder.write_phase2_track_results(p2, "rid", cfg, bundle, gate)
+    tc = (p2 / "track_c_results.md").read_text(encoding="utf-8")
+    assert "source=per_job_window_series" in tc
+    assert "window_ids=[wA, wB, wC]" in tc
+
+
+def test_phase2_pat_series_source_counts_helper() -> None:
+    """Count per-source rows from phase2_pat_series_source_by_experiment."""
+    b: dict = {
+        "phase2_pat_series_source_by_experiment": {
+            "track_c": {
+                "c0": {"source": "per_job_window_series"},
+                "c1": {"source": "shared_bridge"},
+            },
+            "track_b": {"b0": {"source": "shared_bridge"}},
+        }
+    }
+    out = evaluators.phase2_pat_series_source_counts(b)
+    assert out == {"per_job_window_series": 1, "shared_bridge": 2}
+
+
+def test_evaluate_phase2_gate_metrics_ingested_includes_source_counts() -> None:
+    """Gate metrics/evidence should include PAT series source count summary."""
+    b: dict = {
+        "status": "metrics_ingested",
+        "errors": [],
+        "backtest_metrics": {"model_default": {"test_precision_at_recall_0.01": 0.5}},
+        "bundle_kind": "phase2_plan_v1",
+        "gate": {"min_uplift_pp_vs_baseline": 3.0, "max_std_pp_across_windows": 2.5},
+        "tracks": {
+            "track_a": {"enabled": False, "experiments": []},
+            "track_b": {"enabled": False, "experiments": []},
+            "track_c": {
+                "enabled": True,
+                "experiments": [{"exp_id": "c0"}, {"exp_id": "c1"}],
+            },
+        },
+        "per_job_backtest_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [
+                {
+                    "track": "track_c",
+                    "exp_id": "c0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.6,
+                },
+                {
+                    "track": "track_c",
+                    "exp_id": "c1",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.64,
+                },
+            ],
+        },
+        "phase2_pat_series_source_by_experiment": {
+            "track_c": {
+                "c0": {"source": "shared_bridge"},
+                "c1": {"source": "per_job_window_series"},
+            }
+        },
+    }
+    g = evaluators.evaluate_phase2_gate(b)
+    assert g["metrics"].get("phase2_pat_series_source_counts") == {
+        "shared_bridge": 1,
+        "per_job_window_series": 1,
+    }
+    assert "PAT series source counts:" in g["evidence_summary"]
+
+
+def test_write_phase2_gate_decision_includes_source_counts(tmp_path: Path) -> None:
+    """Gate decision markdown prints PAT series source count section."""
+    p = tmp_path / "phase2_gate_decision.md"
+    cfg = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    bundle = {"status": "metrics_ingested"}
+    gate = {
+        "status": "PASS",
+        "blocking_reasons": [],
+        "evidence_summary": "ok",
+        "metrics": {"phase2_pat_series_source_counts": {"shared_bridge": 2}},
+    }
+    report_builder.write_phase2_gate_decision(p, "rid", cfg, bundle, gate)
+    text = p.read_text(encoding="utf-8")
+    assert "### PAT series source counts" in text
+    assert "`shared_bridge`: 2" in text
 
 
 def test_write_phase2_track_results_writes_three_files(tmp_path: Path) -> None:
@@ -3531,6 +4025,52 @@ def test_collect_phase1_optional_r1_mid_stdout(tmp_path: Path) -> None:
     assert bundle["r1_r6_final"]["payload"] == {"stage": "final"}
 
 
+def test_collect_phase1_mid_snapshots_collects_cp_and_alias(tmp_path: Path) -> None:
+    """Collector should expose cp snapshots plus canonical mid alias in order."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    orch = tmp_path / "orch"
+    run_id = "run_mid_multi"
+    logs = orch / "state" / run_id / "logs"
+    logs.mkdir(parents=True)
+    (logs / "r1_r6_mid_cp2.stdout.log").write_text(
+        json.dumps({"evaluate": {"precision_at_recall_target": {"precision_at_target_recall": 0.4}}}),
+        encoding="utf-8",
+    )
+    (logs / "r1_r6_mid_cp1.stdout.log").write_text(
+        json.dumps({"evaluate": {"precision_at_recall_target": {"precision_at_target_recall": 0.3}}}),
+        encoding="utf-8",
+    )
+    (logs / "r1_r6_mid.stdout.log").write_text(
+        json.dumps({"evaluate": {"precision_at_recall_target": {"precision_at_target_recall": 0.5}}}),
+        encoding="utf-8",
+    )
+    (logs / "r1_r6.stdout.log").write_text(
+        json.dumps({"stage": "final"}), encoding="utf-8"
+    )
+    metrics_dir = repo / "trainer" / "out_backtest"
+    metrics_dir.mkdir(parents=True)
+    (metrics_dir / "backtest_metrics.json").write_text("{}", encoding="utf-8")
+    state_db = repo / "state.db"
+    with sqlite3.connect(state_db) as conn_mid:
+        conn_mid.execute(
+            "CREATE TABLE validation_results (alert_ts TEXT, validated_at TEXT, result INT)"
+        )
+        conn_mid.commit()
+    cfg = _minimal_config_dict()
+    cfg["state_db_path"] = str(state_db)
+    bundle = collectors.collect_phase1_artifacts(
+        run_id, cfg, repo_root=repo, orchestrator_dir=orch
+    )
+    mids = bundle.get("r1_r6_mid_snapshots")
+    assert isinstance(mids, list)
+    assert len(mids) == 3
+    assert mids[0]["checkpoint_index"] == 1
+    assert mids[1]["checkpoint_index"] == 2
+    assert mids[2].get("is_canonical_mid_alias") is True
+    assert bundle["r1_r6_mid"]["payload"]["evaluate"]["precision_at_recall_target"]["precision_at_target_recall"] == 0.5
+
+
 def test_collect_summary_for_run_state_keys() -> None:
     """Summary view used in run_state must expose gate-oriented flags."""
     bundle = {
@@ -3690,6 +4230,24 @@ def test_gate_preliminary_when_mid_snapshot_missing() -> None:
     assert g["status"] == "PRELIMINARY"
     assert "missing_mid_r1_snapshot" in "".join(g["blocking_reasons"])
 
+
+def test_gate_fail_on_multi_mid_divergence() -> None:
+    """When mid snapshot PAT spread exceeds tolerance, gate should FAIL."""
+    b = _gate_bundle(
+        hours_span="2026-01-06T00:00:00+08:00",
+        alerts=2000,
+        tp=200,
+        final_pat=0.6,
+        mid_pat=0.55,
+    )
+    b["r1_r6_mid_snapshots"] = [
+        {"checkpoint_index": 1, "payload": _pat_block(0.20)},
+        {"checkpoint_index": 2, "payload": _pat_block(0.50)},
+        {"checkpoint_index": None, "payload": _pat_block(0.40)},
+    ]
+    g = evaluators.evaluate_phase1_gate(b)
+    assert g["status"] == "FAIL"
+    assert "r1_multi_mid_precision_at_target_recall_divergence" in g["blocking_reasons"]
 
 def test_gate_fail_on_r2_large_gap() -> None:
     """R2 PL vs alerts mismatch heuristic → FAIL."""
