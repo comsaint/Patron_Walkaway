@@ -217,7 +217,7 @@ trainer/out_backtest/
 trainer/models/
 trainer/models_90d_weak/
 investigations/test_vs_production/snapshots/*
-investigations/precision_uplift_recall_1pct/orchestrator/state/*
+investigations/precision_uplift_recall_1pct/orchestrator/state/**
 out/
 deploy_dist/
 deploy_dist.zip
