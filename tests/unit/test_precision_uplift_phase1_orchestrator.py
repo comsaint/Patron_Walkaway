@@ -2873,6 +2873,7 @@ def test_evaluate_phase2_gate_uses_configured_baseline_per_track() -> None:
             "min_uplift_pp_vs_baseline": 3.0,
             "max_std_pp_across_windows": 2.5,
             "baseline_exp_id_by_track": {"track_c": "c1"},
+            "min_pat_windows_for_pass": 0,
         },
         "tracks": {
             "track_a": {"enabled": False, "experiments": []},
