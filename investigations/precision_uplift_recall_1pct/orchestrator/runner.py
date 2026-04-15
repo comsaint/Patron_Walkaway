@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -194,6 +195,7 @@ def run_logged_command(
     log_dir: Path,
     log_stem: str,
     timeout_sec: float | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run a subprocess with stdout/stderr captured to files under ``log_dir``.
 
@@ -203,6 +205,8 @@ def run_logged_command(
         log_dir: Directory for ``{log_stem}.stdout.log`` and ``.stderr.log``.
         log_stem: Filename stem for log files.
         timeout_sec: Optional timeout in seconds (``None`` = none).
+        env: Optional full environment for the child (e.g. aligned ``MODEL_DIR``);
+            when ``None``, the child inherits the current process environment.
 
     Returns:
         Dict with returncode, paths, and captured text fields. On
@@ -212,19 +216,23 @@ def run_logged_command(
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = log_dir / f"{log_stem}.stdout.log"
     stderr_path = log_dir / f"{log_stem}.stderr.log"
+    run_kw: dict[str, Any] = {
+        "cwd": cwd,
+        "stdout": None,
+        "stderr": None,
+        "text": True,
+        "timeout": timeout_sec,
+        "check": False,
+    }
+    if env is not None:
+        run_kw["env"] = dict(env)
     try:
         with open(stdout_path, "w", encoding="utf-8", newline="") as fo, open(
             stderr_path, "w", encoding="utf-8", newline=""
         ) as fe:
-            proc = subprocess.run(
-                list(argv),
-                cwd=cwd,
-                stdout=fo,
-                stderr=fe,
-                text=True,
-                timeout=timeout_sec,
-                check=False,
-            )
+            run_kw["stdout"] = fo
+            run_kw["stderr"] = fe
+            proc = subprocess.run(list(argv), **run_kw)
     except subprocess.TimeoutExpired:
         tail = f"command timeout after {timeout_sec}s: {argv[0]!r}"
         return {
@@ -346,12 +354,16 @@ def run_phase1_r1_r6_all(
         "--model-dir",
         str(model_dir),
     ]
+    child_env = _subprocess_env_align_model_dir_bundle(
+        repo_root, config_model_dir=str(cfg["model_dir"]).strip()
+    )
     base = run_logged_command(
         argv,
         cwd=repo_root,
         log_dir=log_dir,
         log_stem=log_stem,
         timeout_sec=timeout_sec,
+        env=child_env,
     )
     if not base.get("ok") and base.get("error_code"):
         return base
@@ -404,12 +416,16 @@ def run_phase1_backtest(
         out_p = out_p if out_p.is_absolute() else (repo_root / out_p)
         argv.extend(["--output-dir", str(out_p.resolve())])
 
+    child_env = _subprocess_env_align_model_dir_bundle(
+        repo_root, config_model_dir=str(cfg["model_dir"]).strip()
+    )
     base = run_logged_command(
         argv,
         cwd=repo_root,
         log_dir=log_dir,
         log_stem="backtest",
         timeout_sec=timeout_sec,
+        env=child_env,
     )
     if not base.get("ok") and base.get("error_code"):
         return base
@@ -478,23 +494,86 @@ def _check_state_db(state_db: Path) -> tuple[bool, str | None]:
     return True, None
 
 
-def run_backtest_cli_smoke(repo_root: Path, python_exe: str | None = None) -> tuple[bool, str | None]:
+def _subprocess_env_align_model_dir_bundle(
+    repo_root: Path, *, config_model_dir: str | None
+) -> dict[str, str]:
+    """Build a child env where ``MODEL_DIR`` matches a versioned model bundle when possible.
+
+    When *config_model_dir* is set (repo-relative path from orchestrator YAML, e.g.
+    ``out/models/<version>``), sets ``MODEL_DIR`` to that directory's absolute path so
+    ``trainer.features`` finds ``feature_spec.yaml`` inside the bundle.
+
+    When *config_model_dir* is unset, if the parent ``MODEL_DIR`` points at a directory
+    without ``feature_spec.yaml`` (typical when the shell sets ``MODEL_DIR=out/models``
+    at the versions root), drops ``MODEL_DIR`` so the child uses repo
+    ``features_candidates.yaml``.
+
+    Args:
+        repo_root: Repository root for resolving relative paths.
+        config_model_dir: Bundle directory string from validated config, or ``None``.
+
+    Returns:
+        Full environment mapping for ``subprocess.run`` / ``run_logged_command``.
+    """
+    env: dict[str, str] = dict(os.environ)
+    if isinstance(config_model_dir, str) and config_model_dir.strip():
+        bd = _resolve_path(repo_root, config_model_dir.strip())
+        env["MODEL_DIR"] = str(bd.resolve())
+        return env
+    raw = env.get("MODEL_DIR")
+    if not raw or not str(raw).strip():
+        return env
+    rp = Path(str(raw).strip())
+    if not rp.is_absolute():
+        rp = (repo_root / rp).resolve()
+    else:
+        rp = rp.resolve()
+    if not (rp / "feature_spec.yaml").is_file():
+        env.pop("MODEL_DIR", None)
+    return env
+
+
+def _subprocess_env_for_cli_help_smoke(
+    repo_root: Path, *, config_model_dir: str | None
+) -> dict[str, str]:
+    """Build env for ``trainer.* --help`` subprocesses (aligned ``MODEL_DIR``, Windows UTF-8)."""
+    env = _subprocess_env_align_model_dir_bundle(repo_root, config_model_dir=config_model_dir)
+    if sys.platform == "win32":
+        env.setdefault("PYTHONUTF8", "1")
+    return env
+
+
+def run_backtest_cli_smoke(
+    repo_root: Path,
+    python_exe: str | None = None,
+    *,
+    config_model_dir: str | None = None,
+) -> tuple[bool, str | None]:
     """Run `python -m trainer.backtester --help` to ensure the CLI is importable.
 
     Args:
         repo_root: Repository root (cwd for subprocess).
         python_exe: Interpreter; defaults to ``sys.executable``.
+        config_model_dir: When set, subprocess ``MODEL_DIR`` is forced to this bundle
+            (repo-relative path as in orchestrator YAML). Mitigates a parent shell
+            ``MODEL_DIR`` pointing at ``out/models`` without a root ``feature_spec.yaml``.
 
     Returns:
         (ok, error_message).
     """
     exe = python_exe or sys.executable
+    smoke_env = _subprocess_env_for_cli_help_smoke(
+        repo_root, config_model_dir=config_model_dir
+    )
     try:
         proc = subprocess.run(
             [exe, "-m", "trainer.backtester", "--help"],
             cwd=repo_root,
+            env=smoke_env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
             check=False,
         )
@@ -580,23 +659,34 @@ def ensure_phase2_job_log_dirs(
 def run_trainer_trainer_help_smoke(
     repo_root: Path,
     python_exe: str | None = None,
+    *,
+    config_model_dir: str | None = None,
 ) -> tuple[bool, str | None]:
     """Run ``python -m trainer.trainer --help`` to verify training CLI imports (T10).
 
     Args:
         repo_root: Repository root (subprocess working directory).
         python_exe: Interpreter; defaults to ``sys.executable``.
+        config_model_dir: When set, subprocess ``MODEL_DIR`` matches the phase2 bundle
+            (repo-relative path from orchestrator YAML), avoiding a parent shell
+            ``MODEL_DIR=out/models`` without ``feature_spec.yaml``.
 
     Returns:
         ``(True, None)`` on success, or ``(False, message)`` on failure.
     """
     exe = python_exe or sys.executable
+    smoke_env = _subprocess_env_for_cli_help_smoke(
+        repo_root, config_model_dir=config_model_dir
+    )
     try:
         proc = subprocess.run(
             [exe, "-m", "trainer.trainer", "--help"],
             cwd=repo_root,
+            env=smoke_env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
             check=False,
         )
@@ -787,6 +877,16 @@ def run_phase2_trainer_jobs(
     if timeout is None:
         timeout = _phase2_trainer_job_timeout_sec(bundle)
 
+    common = bundle.get("common")
+    md_opt: str | None = None
+    if isinstance(common, Mapping):
+        md_raw = common.get("model_dir")
+        if isinstance(md_raw, str) and md_raw.strip():
+            md_opt = md_raw.strip()
+    child_env = _subprocess_env_align_model_dir_bundle(
+        repo_root, config_model_dir=md_opt
+    )
+
     results: list[dict[str, Any]] = []
     all_ok = True
     first_err: str | None = None
@@ -843,6 +943,7 @@ def run_phase2_trainer_jobs(
             log_dir=log_dir,
             log_stem=log_stem,
             timeout_sec=timeout,
+            env=child_env,
         )
         ok_job = bool(base.get("ok"))
         if not ok_job and all_ok:
@@ -1145,7 +1246,11 @@ def run_preflight(
         }
 
     if not skip_backtest_smoke:
-        ok, msg = run_backtest_cli_smoke(repo_root, python_exe=python_exe)
+        md_raw = cfg.get("model_dir")
+        md_opt = str(md_raw).strip() if isinstance(md_raw, str) and str(md_raw).strip() else None
+        ok, msg = run_backtest_cli_smoke(
+            repo_root, python_exe=python_exe, config_model_dir=md_opt
+        )
         checks.append({"name": "backtester_cli_smoke", "ok": ok, "message": msg})
         if not ok:
             return {

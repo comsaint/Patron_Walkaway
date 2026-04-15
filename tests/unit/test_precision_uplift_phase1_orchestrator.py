@@ -197,6 +197,50 @@ def test_phase2_config_missing_track_raises() -> None:
         config_loader.validate_phase2_config(raw, cli_run_id="rid")
 
 
+def test_phase2_config_model_version_resolves_model_dir() -> None:
+    """common.model_version + models_root materializes common.model_dir (versioned layout)."""
+    raw = _minimal_phase2_dict(model_dir="unused", state_db="s", pred_db="p")
+    del raw["common"]["model_dir"]
+    raw["common"]["models_root"] = "custom_models_root"
+    raw["common"]["model_version"] = "train_run_01"
+    out = config_loader.validate_phase2_config(raw, cli_run_id="rid")
+    assert out["common"]["model_dir"] == "custom_models_root/train_run_01"
+
+
+def test_phase2_config_model_version_default_models_root() -> None:
+    """Omitting models_root defaults to out/models under repo-relative resolution."""
+    raw = _minimal_phase2_dict(model_dir="unused", state_db="s", pred_db="p")
+    del raw["common"]["model_dir"]
+    raw["common"]["model_version"] = "v_only"
+    out = config_loader.validate_phase2_config(raw, cli_run_id="rid")
+    assert out["common"]["model_dir"] == "out/models/v_only"
+
+
+def test_phase2_config_model_dir_and_model_version_exclusive() -> None:
+    """common.model_dir and common.model_version cannot both be set."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["common"]["model_version"] = "v1"
+    with pytest.raises(config_loader.ConfigValidationError, match="mutually exclusive"):
+        config_loader.validate_phase2_config(raw, cli_run_id="rid")
+
+
+def test_phase2_config_models_root_without_model_version_raises() -> None:
+    """models_root is only meaningful with model_version."""
+    raw = _minimal_phase2_dict(model_dir="m", state_db="s", pred_db="p")
+    raw["common"]["models_root"] = "out/models"
+    with pytest.raises(config_loader.ConfigValidationError, match="models_root is only valid"):
+        config_loader.validate_phase2_config(raw, cli_run_id="rid")
+
+
+def test_phase2_config_model_version_path_traversal_rejected() -> None:
+    """model_version must be a single path segment (delegates to safe_version_subdirectory)."""
+    raw = _minimal_phase2_dict(model_dir="unused", state_db="s", pred_db="p")
+    del raw["common"]["model_dir"]
+    raw["common"]["model_version"] = "evil/../segment"
+    with pytest.raises(config_loader.ConfigValidationError, match="model_version"):
+        config_loader.validate_phase2_config(raw, cli_run_id="rid")
+
+
 def test_phase2_config_run_id_mismatch_raises() -> None:
     """Optional yaml run_id must match CLI --run-id."""
     raw = _minimal_phase2_dict(

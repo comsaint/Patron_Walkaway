@@ -153,8 +153,15 @@ PHASE2_ROOT_KEYS: tuple[str, ...] = (
     "tracks",
     "gate",
 )
+# ``model_dir`` (explicit bundle) XOR ``model_version`` (child under ``models_root``).
 PHASE2_COMMON_KEYS: tuple[str, ...] = (
     "model_dir",
+    "state_db_path",
+    "prediction_log_db_path",
+    "window",
+    "contract",
+)
+PHASE2_COMMON_REQUIRED_OTHER_KEYS: tuple[str, ...] = (
     "state_db_path",
     "prediction_log_db_path",
     "window",
@@ -179,6 +186,35 @@ PHASE2_TRAINER_PARAM_KEYS: tuple[str, ...] = (
     "sample_rated",
     "lgbm_device",
 )
+
+
+def _phase2_join_models_root_and_version(models_root: str, model_version: str) -> str:
+    """Build repo-relative bundle path ``<models_root>/<model_version>`` as posix.
+
+    ``model_version`` must be a single path segment (aligned with
+    ``trainer.core.model_bundle_paths.safe_version_subdirectory``).
+
+    Args:
+        models_root: Versions root directory, repo-relative (forward or backslashes ok).
+        model_version: One train-run folder name under *models_root*.
+
+    Returns:
+        Bundle path using ``/`` separators for stable YAML and bundle JSON.
+
+    Raises:
+        ValueError: If *model_version* or *models_root* violates the single-segment contract.
+    """
+    ver = (model_version or "").strip()
+    if not ver or "/" in ver or "\\" in ver or ".." in ver:
+        raise ValueError(
+            "model_version must be a single non-empty path segment "
+            f"(no /, \\\\, or ..); got {model_version!r}"
+        )
+    root = (models_root or "").strip().rstrip("/\\")
+    if not root:
+        raise ValueError("models_root must be non-empty when resolving model_version")
+    root_norm = root.replace("\\", "/")
+    return f"{root_norm}/{ver}"
 
 
 def _validate_phase2_experiment_trainer_params(
@@ -242,6 +278,11 @@ def _validate_phase2_experiment_trainer_params(
 def validate_phase2_config(raw: Mapping[str, Any], *, cli_run_id: str) -> dict[str, Any]:
     """Validate Phase 2 orchestrator YAML (T9 schema).
 
+    Model bundle: set either ``common.model_dir`` (repo-relative path to one train
+    run directory containing ``model.pkl``) **or** ``common.model_version`` plus optional
+    ``common.models_root`` (default ``out/models``), matching ``trainer.core.model_bundle_paths``
+    versioned layout under the versions root.
+
     Args:
         raw: Parsed YAML root mapping.
         cli_run_id: ``--run-id`` from CLI (authoritative for ``run_state`` paths).
@@ -276,10 +317,32 @@ def validate_phase2_config(raw: Mapping[str, Any], *, cli_run_id: str) -> dict[s
         raise ConfigValidationError(
             f"common must be a mapping, got {type(common).__name__}"
         )
-    c_missing = [k for k in PHASE2_COMMON_KEYS if k not in common]
+    c_missing = [k for k in PHASE2_COMMON_REQUIRED_OTHER_KEYS if k not in common]
+    md_raw = common.get("model_dir")
+    mv_raw = common.get("model_version")
+    md_set = isinstance(md_raw, str) and bool(str(md_raw).strip())
+    mv_set = isinstance(mv_raw, str) and bool(str(mv_raw).strip())
+    if md_set and mv_set:
+        raise ConfigValidationError(
+            "common.model_dir and common.model_version are mutually exclusive"
+        )
+    if not md_set and not mv_set:
+        c_missing.append("model_dir or model_version")
     if c_missing:
         raise ConfigValidationError(
-            f"common missing {c_missing}; required {list(PHASE2_COMMON_KEYS)}"
+            f"common missing {c_missing}; required {list(PHASE2_COMMON_REQUIRED_OTHER_KEYS)} "
+            "plus exactly one of model_dir or model_version"
+        )
+    root_raw = common.get("models_root")
+    if root_raw is not None and (
+        not isinstance(root_raw, str) or not str(root_raw).strip()
+    ):
+        raise ConfigValidationError(
+            "common.models_root must be a non-empty string when set"
+        )
+    if not mv_set and root_raw is not None:
+        raise ConfigValidationError(
+            "common.models_root is only valid together with common.model_version"
         )
 
     window = common["window"]
@@ -425,7 +488,23 @@ def validate_phase2_config(raw: Mapping[str, Any], *, cli_run_id: str) -> dict[s
                     f"gate.baseline_exp_id_by_track.{ts} must be a non-empty string exp_id"
                 )
 
-    return dict(raw)
+    out = dict(raw)
+    common_out = dict(common)
+    if mv_set:
+        root_s = (
+            str(root_raw).strip()
+            if isinstance(root_raw, str) and str(root_raw).strip()
+            else "out/models"
+        )
+        try:
+            joined = _phase2_join_models_root_and_version(root_s, str(mv_raw).strip())
+        except ValueError as exc:
+            raise ConfigValidationError(
+                f"common.model_version / models_root invalid: {exc}"
+            ) from exc
+        common_out["model_dir"] = joined
+    out["common"] = common_out
+    return out
 
 
 def load_phase2_config(path: Path, *, cli_run_id: str) -> dict[str, Any]:

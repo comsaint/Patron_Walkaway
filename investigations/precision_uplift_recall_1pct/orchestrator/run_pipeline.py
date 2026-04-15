@@ -1003,7 +1003,11 @@ def run_dry_run_readiness(
             }
         )
     else:
-        ok, msg = runner.run_backtest_cli_smoke(repo_root)
+        md_raw = cfg.get("model_dir")
+        md_opt = str(md_raw).strip() if isinstance(md_raw, str) and str(md_raw).strip() else None
+        ok, msg = runner.run_backtest_cli_smoke(
+            repo_root, config_model_dir=md_opt
+        )
         checks.append({"name": "backtester_cli_smoke", "ok": ok, "message": msg})
         if not ok:
             blocking.append("backtester_cli_smoke_failed")
@@ -1476,7 +1480,15 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
         if th_skip:
             ok_th, msg_th = True, None
         else:
-            ok_th, msg_th = runner.run_trainer_trainer_help_smoke(_REPO_ROOT)
+            common_rs = p2_bundle.get("common")
+            md_smoke: str | None = None
+            if isinstance(common_rs, Mapping):
+                md_raw_rs = common_rs.get("model_dir")
+                if isinstance(md_raw_rs, str) and md_raw_rs.strip():
+                    md_smoke = md_raw_rs.strip()
+            ok_th, msg_th = runner.run_trainer_trainer_help_smoke(
+                _REPO_ROOT, config_model_dir=md_smoke
+            )
 
         rs_ok: dict[str, Any] = {
             "log_dirs_ok": True,

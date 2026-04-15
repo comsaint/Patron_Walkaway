@@ -38,6 +38,7 @@
    - `run_pipeline.py --phase phase1 --config .../run_phase1.yaml --run-id <id>`（可加 `--dry-run` / `--resume` / `--collect-only`）
 3. **Phase 2 full run**
    - `run_pipeline.py --phase phase2 --config .../run_phase2.yaml --run-id <id>`（可加 `--dry-run`、`--resume`、**`--phase2-run-trainer-jobs`**、**`--phase2-run-per-job-backtests`**、**`--phase2-run-backtest-jobs`**、`--skip-backtest-smoke`、`--skip-phase2-trainer-smoke` 等）
+   - **逐步操作 Runbook（專文）**：[`PRECISION_UPLIFT_R1PCT_PHASE2_RUNBOOK.md`](PRECISION_UPLIFT_R1PCT_PHASE2_RUNBOOK.md)（產出路徑、完整結論所需旗標、資料與 preflight 說明）。
    - **跨窗**：單次 run 仍以 `common.window` 為主；多窗可比需 **多次 run** 或 YAML **`precision_at_recall_1pct_by_window`**（見 Tasklist T10／T11），全自動多窗矩陣仍待 T10 收尾。
 
 ### 1.2b 目標流程（Autonomous 單一命令；對應 Tasklist T8A–T8D、T16–T17，**尚未實作**）
@@ -218,7 +219,10 @@ phase: phase2
 run_id: "phase2_20260410"
 
 common:
-  model_dir: out/models/20260408-173809-e472fd0
+  # 版本化 bundle：與 trainer 產物 layout 一致（見 trainer/core/model_bundle_paths.py）
+  models_root: out/models
+  model_version: "20260408-173809-e472fd0"
+  # 或改為單一路徑： model_dir: out/models/20260408-173809-e472fd0（與 model_version 二擇一）
   state_db_path: local_state/state.db
   prediction_log_db_path: local_state/prediction_log.db
   window:

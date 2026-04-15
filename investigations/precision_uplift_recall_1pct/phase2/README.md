@@ -1,5 +1,7 @@
 # Phase 2：高槓桿建模路線（Track A / B / C）
 
+**Orchestrator 操作**（CLI、`run_phase2.yaml`、旗標、產出路徑、resume）：見同調查目錄內 [`PRECISION_UPLIFT_R1PCT_PHASE2_RUNBOOK.md`](../PRECISION_UPLIFT_R1PCT_PHASE2_RUNBOOK.md)。
+
 ## 為什麼要做這一階段
 
 Phase 1 鎖定**同一評估契約**後，需要驗證「哪種建模策略」最能提升 `precision@recall=1%` 與前段排序品質，且不是單一時間窗僥倖。並行 A/B/C 可避免團隊押在單一路線上過早收斂。

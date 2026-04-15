@@ -5,11 +5,11 @@
 #     --phase phase2 --config investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase2.patron_e472fd0.yaml \
 #     --run-id phase2_patron_e472fd0_001 --dry-run
 #
-# 若 dry-run 在 backtester smoke 失敗（trainer 預期 out/models/feature_spec.yaml 而實際在 model 子目錄）：
-#   加上 --skip-backtest-smoke，或將 deploy 用的 feature_spec 放到 trainer 預期路徑。
+# backtester smoke：orchestrator 會依 common 解析後的 bundle 強制子程序 MODEL_DIR；
+# 若 shell 的 MODEL_DIR 指到無 feature_spec.yaml 的目錄也會自動略過。仍失敗可加 --skip-backtest-smoke。
 #
 # 已代填：
-# - common.model_dir、state_db_path、prediction_log_db_path（與 run_phase1.yaml 一致）
+# - common.models_root + model_version（解析為 bundle model_dir）、state_db_path、prediction_log_db_path
 # - common.window 與 run_phase1.yaml 相同，利於 Phase 1 / 2 同契約對照
 # - resources.trainer_use_local_parquet: true（repo 內 data/*.parquet 存在時供 trainer 使用）
 # - 各軌 baseline 的 training_metrics_repo_relative → 現有訓練產物目錄（不需先重訓即可 harvest / per-job backtest）
@@ -21,7 +21,8 @@
 phase: phase2
 
 common:
-  model_dir: out/models/20260408-173809-e472fd0
+  models_root: out/models
+  model_version: "20260408-173809-e472fd0"
   state_db_path: local_state/state.db
   prediction_log_db_path: local_state/prediction_log.db
   window:

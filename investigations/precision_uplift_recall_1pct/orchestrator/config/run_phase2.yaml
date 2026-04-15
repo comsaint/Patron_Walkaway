@@ -4,12 +4,16 @@ phase: phase2
 # run_id: phase2_20260410
 
 common:
-  model_dir: out/models/20260408-173809-e472fd0
+  # Versioned layout: versions root + one path segment (see trainer/core/model_bundle_paths.py).
+  # Loads as common.model_dir == "<models_root>/<model_version>".
+  # Alternative: omit model_version and set model_dir to the bundle path directly.
+  models_root: out/models
+  model_version: "20260408-173809-e472fd0"
   state_db_path: local_state/state.db
   prediction_log_db_path: local_state/prediction_log.db
   window:
-    start_ts: "2026-04-09T00:00:00+08:00"
-    end_ts: "2026-04-15T00:00:00+08:00"
+    start_ts: "2026-03-01T00:00:00+08:00"
+    end_ts: "2026-04-09T00:00:00+08:00"
   contract:
     metric: precision_at_recall_1pct
     timezone: Asia/Hong_Kong
@@ -20,6 +24,7 @@ resources:
   max_trials_per_track: 6
   max_parallel_jobs: 1
   backtest_skip_optuna: true
+  trainer_use_local_parquet: true
   # Optional (T10 trainer batch): trainer_use_local_parquet: false
   # Optional wall-clock cap per job (seconds); omit for no timeout:
   # phase2_trainer_job_timeout_sec: 7200
