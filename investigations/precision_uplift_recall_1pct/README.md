@@ -114,13 +114,16 @@
 
 ## 各階段重點與必交工件
 
+- `phase1/`、`phase2/`：調查**階段資料夾**（README、人工摘要、輔助腳本等），與 orchestrator **自動產出報表**路徑分開。
+- **Orchestrator 報表（依 run 集中）**：`investigations/precision_uplift_recall_1pct/results/<run_id>/reports/phase1/`、`…/reports/phase2/`（見下方「Full-run 產物檢查」）。`run_state.json` 的 `artifacts.phase1_reports_dir` / `phase2_reports_dir` 會指向這些目錄。
+
 - `phase1/`：根因診斷（RCA）
   - 重點：先判斷瓶頸在模型，還是標籤/資料契約。
-  - 必交：`status_history_crosscheck.md`、`label_noise_audit.md`、`phase1_gate_decision.md` 等。
+  - 必交：`status_history_crosscheck.md`、`label_noise_audit.md`、`phase1_gate_decision.md` 等（可由 orchestrator 寫入 `results/.../reports/phase1/`，再同步或連結到本階段資料夾若流程需要）。
 
 - `phase2/`：模型路線並行比較（A/B/C）
   - 重點：至少一條路線達成相對基線顯著 uplift（+3~5pp）。
-  - 必交：`track_a_results.md`、`track_b_results.md`、`track_c_results.md`、`phase2_gate_decision.md`。
+  - 必交：`track_a_results.md`、`track_b_results.md`、`track_c_results.md`、`phase2_gate_decision.md`（預設同樣寫入 `results/.../reports/phase2/`）。
 
 - `phase3/`：特徵深化與集成收斂
   - 重點：在 Phase 2 勝者基礎上再提升，且不犧牲穩定性。
@@ -222,7 +225,7 @@ python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py 
 - `investigations/precision_uplift_recall_1pct/orchestrator/state/<run_id>/run_state.json`
 - `investigations/precision_uplift_recall_1pct/orchestrator/state/<run_id>/logs/*.log`
 - `investigations/precision_uplift_recall_1pct/orchestrator/state/<run_id>/collect_bundle.json`
-- `investigations/precision_uplift_recall_1pct/phase1/*.md`（報表）
+- `investigations/precision_uplift_recall_1pct/results/<run_id>/reports/phase1/*.md`（六份自動報表；`artifacts.phase1_reports_dir`）
 
 #### Full-run 成功/失敗判讀（快速）
 

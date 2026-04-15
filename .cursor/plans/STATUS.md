@@ -6448,3 +6448,53 @@ python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "tes
 
 ✅ 實作與測試完成
 
+---
+
+## Orchestrator 報表集中目錄：`results/<run_id>/reports/`（2026-04-14）
+
+**設計**
+
+- 根路徑：`investigations/precision_uplift_recall_1pct/results/<run_id>/reports/`
+- Phase 1 自動產出六份 `.md` → `…/reports/phase1/`
+- Phase 2 gate + `track_*_results.md` → `…/reports/phase2/`
+- 與 `phase1/`、`phase2/`（人工 checklist、README、輔助腳本）分離；同一 `run_id` 下 Phase 1 / 2 報表可並存於同一 `results/<run_id>/` 樹。
+
+**程式變更**
+
+- `run_pipeline.py`：`investigation_reports_subdir(run_id, phase)`；`_main_phase1` / Phase 2 gate 報告改寫入上述路徑。
+- `run_state.json` → `artifacts`：`phase1_reports_dir`、`phase2_reports_dir`（取代原 `phase1_dir`、`phase2_dir` 指向 phase 資料夾的語意）。
+- `run_dry_run_readiness` writable 檢查：`phase1_reports_dir`；`run_all_phases_dry_run_readiness` 內 `phase2_reports_dir`。
+- `report_builder.py`：docstring 標註慣例輸出路徑。
+- `investigations/precision_uplift_recall_1pct/README.md`：Full-run 產物與階段說明對齊新路徑。
+
+**測試**
+
+- `tests/unit/test_precision_uplift_phase1_orchestrator.py`：`extra_writable` / artifacts 鍵名更新；全檔 `179 passed`。
+
+✅ 完成
+
+---
+
+## Orchestrator 報表集中目錄：`results/<run_id>/reports/`（2026-04-14）
+
+**設計**
+
+- 根路徑：`investigations/precision_uplift_recall_1pct/results/<run_id>/reports/`
+- Phase 1 自動產出六份 `.md` → `…/reports/phase1/`
+- Phase 2 gate + `track_*_results.md` → `…/reports/phase2/`
+- 與 `phase1/`、`phase2/`（人工 checklist、README、輔助腳本）分離；同一 `run_id` 下 Phase 1 / 2 報表可並存於同一 `results/<run_id>/` 樹。
+
+**程式變更**
+
+- `run_pipeline.py`：`investigation_reports_subdir(run_id, phase)`；`_main_phase1` / Phase 2 gate 報告改寫入上述路徑。
+- `run_state.json` → `artifacts`：`phase1_reports_dir`、`phase2_reports_dir`（取代原 `phase1_dir`、`phase2_dir` 指向 phase 資料夾的語意）。
+- `run_dry_run_readiness` writable 檢查：`phase1_reports_dir`；`run_all_phases_dry_run_readiness` 內 `phase2_reports_dir`。
+- `report_builder.py`：docstring 標註慣例輸出路徑。
+- `investigations/precision_uplift_recall_1pct/README.md`：Full-run 產物與階段說明對齊新路徑。
+
+**測試**
+
+- `tests/unit/test_precision_uplift_phase1_orchestrator.py`：`extra_writable` / artifacts 鍵名更新；全檔 `179 passed`。
+
+✅ 完成
+

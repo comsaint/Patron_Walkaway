@@ -310,11 +310,11 @@ def test_run_dry_run_readiness_extra_writable_check(tmp_path: Path) -> None:
                 "dry_extra",
                 cfg,
                 skip_backtest_smoke=False,
-                extra_writable={"phase2_dir": extra},
+                extra_writable={"phase2_reports_dir": extra},
             )
     assert out["status"] == "READY"
-    assert "writable_phase2_dir" in {c["name"] for c in out["checks"]}
-    assert "phase2_dir" in out["artifacts"]
+    assert "writable_phase2_reports_dir" in {c["name"] for c in out["checks"]}
+    assert "phase2_reports_dir" in out["artifacts"]
 
 
 def test_run_pipeline_phase2_collect_only_skips_scaffold(tmp_path: Path) -> None:
@@ -435,7 +435,10 @@ def test_run_pipeline_phase2_scaffold_writes_run_state(tmp_path: Path) -> None:
     assert data.get("phase2_collect", {}).get("runner_trainer_help_skipped") is True
     assert data["steps"]["phase2_gate_report"]["status"] == "success"
     assert data["phase2_gate_decision"]["status"] == "BLOCKED"
-    gate_md = _ORCHESTRATOR.parent / "phase2" / "phase2_gate_decision.md"
+    gate_md = (
+        run_pipeline.investigation_reports_subdir(run_id, "phase2")
+        / "phase2_gate_decision.md"
+    )
     assert gate_md.is_file()
     text = gate_md.read_text(encoding="utf-8")
     assert "phase2_bundle_plan_only_no_track_metrics" in text

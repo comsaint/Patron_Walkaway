@@ -746,7 +746,8 @@ def write_phase2_track_results(
     harvest / per-job preview / uplift / PAT series, then shared PAT@1%.
 
     Args:
-        phase2_dir: Investigation ``phase2`` directory.
+        phase2_dir: Output directory for these markdown files (convention:
+            ``…/results/<run_id>/reports/phase2``).
         run_id: Orchestrator run id.
         cfg: Validated phase2 config.
         bundle: Phase2 bundle (may include ``backtest_metrics``).
@@ -876,7 +877,7 @@ def write_phase1_reports(
     """Write or update Phase 1 markdown artifacts under ``phase1_dir``.
 
     Args:
-        phase1_dir: Directory for investigation phase1 markdown files.
+        phase1_dir: Output directory (convention: ``…/results/<run_id>/reports/phase1``).
         run_id: Current run id.
         config: Validated orchestrator config.
         bundle: Collector output.

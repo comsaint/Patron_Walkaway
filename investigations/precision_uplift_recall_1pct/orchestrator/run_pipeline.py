@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 _ORCHESTRATOR_DIR = Path(__file__).resolve().parent
+# orchestrator/ -> precision_uplift_recall_1pct/ (investigation root)
+_INVESTIGATION_ROOT = _ORCHESTRATOR_DIR.parent
 # orchestrator/ -> precision_uplift_recall_1pct/ -> investigations/ -> repo root
 _REPO_ROOT = _ORCHESTRATOR_DIR.parents[2]
 
@@ -27,6 +29,18 @@ import evaluators  # noqa: E402
 import phase2_exit_codes as phase2_exits  # noqa: E402
 import report_builder  # noqa: E402
 import runner  # noqa: E402
+
+
+def investigation_reports_subdir(run_id: str, phase: str) -> Path:
+    """Orchestrator markdown output: ``results/<run_id>/reports/<phase>/``.
+
+    Use ``phase`` ``phase1`` or ``phase2`` so all automated reports for a run
+    live under one ``results/<run_id>/`` tree (separate from ``phase1/`` /
+    ``phase2/`` checklist folders).
+    """
+    rid = str(run_id).strip()
+    ph = str(phase).strip()
+    return _INVESTIGATION_ROOT / "results" / rid / "reports" / ph
 
 
 def _utc_now_iso() -> str:
@@ -736,7 +750,7 @@ def run_all_phases_dry_run_readiness(
             cfg1,
             skip_backtest_smoke=smoke_skip,
             extra_writable={
-                "phase2_dir": orchestrator_dir.parent / "phase2",
+                "phase2_reports_dir": investigation_reports_subdir(run_id, "phase2"),
                 "phase3_dir": phase3_dir,
                 "phase4_dir": phase4_dir,
             },
@@ -996,7 +1010,7 @@ def run_dry_run_readiness(
     writable_targets = {
         "state_dir": orchestrator_dir / "state" / run_id,
         "logs_dir": _logs_dir(run_id),
-        "phase1_dir": orchestrator_dir.parent / "phase1",
+        "phase1_reports_dir": investigation_reports_subdir(run_id, "phase1"),
     }
     writable_artifacts: dict[str, str] = {}
     for name, p in writable_targets.items():
@@ -1236,12 +1250,12 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
         "evidence_summary": str(gate.get("evidence_summary") or ""),
     }
     log_dir_resolved = _logs_dir(args.run_id)
-    phase1_dir = _ORCHESTRATOR_DIR.parent / "phase1"
+    phase1_reports_dir = investigation_reports_subdir(args.run_id, "phase1")
     merged["artifacts"] = {
         "run_state": str(state_file.resolve()),
         "logs_dir": str(log_dir_resolved.resolve()),
         "collect_bundle": str(collect_path.resolve()),
-        "phase1_dir": str(phase1_dir.resolve()),
+        "phase1_reports_dir": str(phase1_reports_dir.resolve()),
         "config_path": str(config_path.resolve()),
     }
     _attach_terminal_step(
@@ -1253,12 +1267,12 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
     merged["updated_at"] = _utc_now_iso()
     _write_run_state(state_file, merged)
 
-    report_builder.write_phase1_reports(phase1_dir, args.run_id, cfg, bundle, gate)
+    report_builder.write_phase1_reports(phase1_reports_dir, args.run_id, cfg, bundle, gate)
     _attach_terminal_step(
         merged,
         "reports",
         status="success",
-        artifacts={"phase1_dir": str(phase1_dir.resolve())},
+        artifacts={"phase1_reports_dir": str(phase1_reports_dir.resolve())},
     )
     _write_run_state(state_file, merged)
 
@@ -1327,7 +1341,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
         print(preflight.get("message") or "preflight failed", file=sys.stderr)
         return 3
 
-    phase2_dir = _ORCHESTRATOR_DIR.parent / "phase2"
+    phase2_reports_dir = investigation_reports_subdir(args.run_id, "phase2")
 
     if args.dry_run:
         readiness = run_dry_run_readiness(
@@ -1336,7 +1350,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
             args.run_id,
             preflight_cfg,
             skip_backtest_smoke=args.skip_backtest_smoke,
-            extra_writable={"phase2_dir": phase2_dir},
+            extra_writable={"phase2_reports_dir": phase2_reports_dir},
         )
         merged["mode"] = "dry_run"
         merged["readiness"] = readiness
@@ -1379,7 +1393,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
             merged,
             "phase2_scaffold",
             status="success",
-            artifacts={"phase2_dir": str(phase2_dir.resolve())},
+            artifacts={"phase2_reports_dir": str(phase2_reports_dir.resolve())},
             message=(
                 "T9 scaffold: config validated and preflight ok; "
                 "plan-only phase2_bundle written in phase2_plan_bundle step (T10)"
@@ -1911,12 +1925,12 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
                 else None
             ),
         }
-        gate_md = phase2_dir / "phase2_gate_decision.md"
+        gate_md = phase2_reports_dir / "phase2_gate_decision.md"
         report_builder.write_phase2_gate_decision(
             gate_md, args.run_id, cfg, p2_bundle, gate_p2
         )
         track_mds = report_builder.write_phase2_track_results(
-            phase2_dir, args.run_id, cfg, p2_bundle, gate_p2
+            phase2_reports_dir, args.run_id, cfg, p2_bundle, gate_p2
         )
         tr_art: dict[str, str] = {
             f"phase2_{p.stem}": str(p.resolve()) for p in track_mds
@@ -1967,16 +1981,16 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
             art_fail: dict[str, str] = {
                 "run_state": str(state_file.resolve()),
                 "config_path": str(config_path.resolve()),
-                "phase2_dir": str(phase2_dir.resolve()),
+                "phase2_reports_dir": str(phase2_reports_dir.resolve()),
             }
             p2_bpf = merged.get("phase2_bundle_path")
             if isinstance(p2_bpf, str) and p2_bpf.strip():
                 art_fail["phase2_bundle"] = p2_bpf.strip()
-            gate_md_fail = phase2_dir / "phase2_gate_decision.md"
+            gate_md_fail = phase2_reports_dir / "phase2_gate_decision.md"
             if gate_md_fail.is_file():
                 art_fail["phase2_gate_decision"] = str(gate_md_fail.resolve())
             for stem in ("track_a_results", "track_b_results", "track_c_results"):
-                trp_f = phase2_dir / f"{stem}.md"
+                trp_f = phase2_reports_dir / f"{stem}.md"
                 if trp_f.is_file():
                     art_fail[f"phase2_{stem}"] = str(trp_f.resolve())
             merged["artifacts"] = art_fail
@@ -1996,16 +2010,16 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
     art: dict[str, str] = {
         "run_state": str(state_file.resolve()),
         "config_path": str(config_path.resolve()),
-        "phase2_dir": str(phase2_dir.resolve()),
+        "phase2_reports_dir": str(phase2_reports_dir.resolve()),
     }
     p2_bp = merged.get("phase2_bundle_path")
     if isinstance(p2_bp, str) and p2_bp.strip():
         art["phase2_bundle"] = p2_bp.strip()
-    gate_md_path = phase2_dir / "phase2_gate_decision.md"
+    gate_md_path = phase2_reports_dir / "phase2_gate_decision.md"
     if gate_md_path.is_file():
         art["phase2_gate_decision"] = str(gate_md_path.resolve())
     for stem in ("track_a_results", "track_b_results", "track_c_results"):
-        trp = phase2_dir / f"{stem}.md"
+        trp = phase2_reports_dir / f"{stem}.md"
         if trp.is_file():
             art[f"phase2_{stem}"] = str(trp.resolve())
     merged["artifacts"] = art
