@@ -466,12 +466,27 @@ def _safe_ratio(num: int, den: int) -> float | None:
     return float(num) / float(den)
 
 
+def _capped_unit_ratio(num: int, den: int) -> float | None:
+    """Return ``min(1.0, num/den)`` when ``den > 0``; else ``None``."""
+    if den <= 0:
+        return None
+    return min(1.0, float(num) / float(den))
+
+
 def _collect_phase1_pit_parity(
     prediction_log_db: Path,
     state_db: Path,
     window: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Collect Phase 1 PIT parity diagnostics (MVP auto metrics, non-blocking)."""
+    """Collect Phase 1 PIT parity diagnostics (MVP auto metrics, non-blocking).
+
+    ``scored_at_in_window_ratio`` compares the same ``[start_ts, end_ts)`` window as R2:
+    ``prediction_log`` rows filtered by ``scored_at`` vs ``alerts`` rows filtered by ``ts``.
+    Uses the R2 slice ``is_alert = 1 AND is_rated_obs = 1`` when those columns exist;
+    otherwise falls back to all ``prediction_log`` rows in the ``scored_at`` window.
+    The ratio is ``min(1, numerator/denominator)`` so duplicate-suppression (PL > alerts)
+    does not read as a parity failure.
+    """
     start_ts = str(window.get("start_ts", ""))
     end_ts = str(window.get("end_ts", ""))
     out: dict[str, Any] = {
@@ -487,19 +502,39 @@ def _collect_phase1_pit_parity(
     }
 
     reasons: list[str] = []
+    n_pl_all_in_window: int | None = None
+    n_pl_alert_rated_in_window: int | None = None
+    n_alerts_in_window: int | None = None
+
     if prediction_log_db.is_file():
         try:
             with sqlite3.connect(f"file:{prediction_log_db}?mode=ro", uri=True) as conn:
                 cols = {row[1] for row in conn.execute("PRAGMA table_info(prediction_log)").fetchall()}
                 if "scored_at" in cols:
-                    n_window_total = int(
-                        conn.execute(
-                            "SELECT COUNT(*) FROM prediction_log WHERE scored_at >= ? AND scored_at < ?",
-                            (start_ts, end_ts),
-                        ).fetchone()[0]
-                    )
-                    n_scored_in = int(conn.execute("SELECT COUNT(*) FROM prediction_log WHERE scored_at >= ? AND scored_at < ? AND TRIM(COALESCE(scored_at, '')) != ''", (start_ts, end_ts)).fetchone()[0])
-                    out["scored_at_in_window_ratio"] = _safe_ratio(n_scored_in, n_window_total)
+                    win_params = (start_ts, end_ts)
+                    if "is_alert" in cols and "is_rated_obs" in cols:
+                        row_ct = conn.execute(
+                            """
+                            SELECT COUNT(*),
+                                   SUM(CASE WHEN is_alert = 1 AND is_rated_obs = 1 THEN 1 ELSE 0 END)
+                            FROM prediction_log
+                            WHERE scored_at >= ? AND scored_at < ?
+                            """,
+                            win_params,
+                        ).fetchone()
+                        n_pl_all_in_window = int(row_ct[0])
+                        rated_sum = row_ct[1]
+                        n_pl_alert_rated_in_window = (
+                            int(rated_sum) if rated_sum is not None else 0
+                        )
+                    else:
+                        n_pl_all_in_window = int(
+                            conn.execute(
+                                "SELECT COUNT(*) FROM prediction_log WHERE scored_at >= ? AND scored_at < ?",
+                                win_params,
+                            ).fetchone()[0]
+                        )
+                        reasons.append("prediction_log_missing_is_alert_or_is_rated_obs_for_pit_ratio")
                 else:
                     reasons.append("prediction_log_missing_scored_at")
                 if "scored_at" in cols and "is_alert" in cols:
@@ -525,6 +560,7 @@ def _collect_phase1_pit_parity(
                 acols = {row[1] for row in conn.execute("PRAGMA table_info(alerts)").fetchall()}
                 if "ts" in acols:
                     n_alerts = int(conn.execute("SELECT COUNT(*) FROM alerts WHERE ts >= ? AND ts < ?", (start_ts, end_ts)).fetchone()[0])
+                    n_alerts_in_window = n_alerts
                     gap = out.get("alerts_vs_prediction_log_gap")
                     if isinstance(gap, int):
                         out["alerts_vs_prediction_log_gap"] = int(gap + n_alerts)
@@ -534,6 +570,27 @@ def _collect_phase1_pit_parity(
             reasons.append("state_db_unavailable_for_pit")
     else:
         reasons.append("state_db_not_found_for_pit")
+
+    if (
+        n_alerts_in_window is not None
+        and n_alerts_in_window > 0
+        and n_pl_all_in_window is not None
+    ):
+        numer = (
+            n_pl_alert_rated_in_window
+            if n_pl_alert_rated_in_window is not None
+            else n_pl_all_in_window
+        )
+        out["scored_at_in_window_ratio"] = _capped_unit_ratio(numer, n_alerts_in_window)
+        out["scored_at_window_coverage_counts"] = {
+            "prediction_log_rows_scored_at_window": n_pl_all_in_window,
+            "prediction_log_alert_rated_rows_scored_at_window": n_pl_alert_rated_in_window,
+            "alerts_rows_ts_window": n_alerts_in_window,
+        }
+    elif n_pl_all_in_window is not None and (n_alerts_in_window is None or n_alerts_in_window <= 0):
+        out["scored_at_in_window_ratio"] = None
+        if n_alerts_in_window is not None and n_alerts_in_window == 0:
+            reasons.append("no_alerts_in_window_for_scored_at_coverage_ratio")
 
     out["reasons"] = reasons
     if reasons:
