@@ -492,9 +492,14 @@ def _collect_phase1_pit_parity(
             with sqlite3.connect(f"file:{prediction_log_db}?mode=ro", uri=True) as conn:
                 cols = {row[1] for row in conn.execute("PRAGMA table_info(prediction_log)").fetchall()}
                 if "scored_at" in cols:
-                    n_scored = int(conn.execute("SELECT COUNT(*) FROM prediction_log WHERE TRIM(COALESCE(scored_at, '')) != ''").fetchone()[0])
+                    n_window_total = int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM prediction_log WHERE scored_at >= ? AND scored_at < ?",
+                            (start_ts, end_ts),
+                        ).fetchone()[0]
+                    )
                     n_scored_in = int(conn.execute("SELECT COUNT(*) FROM prediction_log WHERE scored_at >= ? AND scored_at < ? AND TRIM(COALESCE(scored_at, '')) != ''", (start_ts, end_ts)).fetchone()[0])
-                    out["scored_at_in_window_ratio"] = _safe_ratio(n_scored_in, n_scored)
+                    out["scored_at_in_window_ratio"] = _safe_ratio(n_scored_in, n_window_total)
                 else:
                     reasons.append("prediction_log_missing_scored_at")
                 if "scored_at" in cols and "is_alert" in cols:
