@@ -1768,7 +1768,7 @@ def _oom_check_and_adjust_neg_sample_frac(
     )
 
     if estimated_peak_ram <= ram_budget:
-        print("[OOM-check] RAM looks OK — no adjustment to NEG_SAMPLE_FRAC.", flush=True)
+        print("[OOM-check] RAM looks OK - no adjustment to NEG_SAMPLE_FRAC.", flush=True)
         logger.info("OOM-check: peak %.1f GB <= budget %.1f GB -- no adjustment", estimated_peak_ram / (1024**3), ram_budget / (1024**3))
         return current_frac
 
@@ -1859,7 +1859,7 @@ def _oom_check_after_chunk1(
     )
 
     if estimated_peak_ram <= ram_budget:
-        print("[OOM-check (chunk 1 size)] RAM looks OK — no adjustment.", flush=True)
+        print("[OOM-check (chunk 1 size)] RAM looks OK - no adjustment.", flush=True)
         logger.info("OOM-check (chunk 1 size): peak <= budget — no adjustment")
         return current_frac
 

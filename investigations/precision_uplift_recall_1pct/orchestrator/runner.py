@@ -519,17 +519,18 @@ def _subprocess_env_align_model_dir_bundle(
     if isinstance(config_model_dir, str) and config_model_dir.strip():
         bd = _resolve_path(repo_root, config_model_dir.strip())
         env["MODEL_DIR"] = str(bd.resolve())
-        return env
-    raw = env.get("MODEL_DIR")
-    if not raw or not str(raw).strip():
-        return env
-    rp = Path(str(raw).strip())
-    if not rp.is_absolute():
-        rp = (repo_root / rp).resolve()
     else:
-        rp = rp.resolve()
-    if not (rp / "feature_spec.yaml").is_file():
-        env.pop("MODEL_DIR", None)
+        raw = env.get("MODEL_DIR")
+        if raw and str(raw).strip():
+            rp = Path(str(raw).strip())
+            if not rp.is_absolute():
+                rp = (repo_root / rp).resolve()
+            else:
+                rp = rp.resolve()
+            if not (rp / "feature_spec.yaml").is_file():
+                env.pop("MODEL_DIR", None)
+    if sys.platform == "win32":
+        env.setdefault("PYTHONUTF8", "1")
     return env
 
 
