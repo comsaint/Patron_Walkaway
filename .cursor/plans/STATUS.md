@@ -6420,3 +6420,31 @@ python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "pha
 
 ✅ 全部完成，CYCLE 結束
 
+---
+
+## Phase 1：`phase1_gate_decision.md` 詳列 mid snapshot（2026-04-14）
+
+**STEP 1 — Builder**
+
+- `investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py`
+  - 新增 `_phase1_mid_snapshots_section_lines(bundle)`：自 `bundle["r1_r6_mid_snapshots"]` 產出 Markdown 區段。
+  - `_write_phase1_gate_decision` 在 `### evidence_summary` 與 `### metrics` 之間插入 **「Mid R1/R6 snapshots（方向檢查）」**，含：
+    - **筆數（log 列）**
+    - **PAT 序列**（依 collector 順序、僅成功解析者）
+    - **逐列來源**：checkpoint 標籤（`cpN` 或 canonical `r1_r6_mid`）、PAT 或 parse 摘要、stdout 完整路徑
+  - 依賴 `evaluators.extract_precision_at_target_recall` 與 gate 相同口徑。
+
+**STEP 3 — Tester**
+
+- `tests/unit/test_precision_uplift_phase1_orchestrator.py`
+  - `test_write_phase1_reports_writes_six_markdown_files`：斷言無 mid 時仍出現 mid 區段且筆數為 0。
+  - `test_phase1_gate_decision_mid_snapshots_section_lists_paths_and_pats`：兩列 mid + PAT 序列與路徑。
+
+**Manual verification**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "test_write_phase1_reports_writes_six_markdown_files or test_phase1_gate_decision_mid_snapshots" -q
+```
+
+✅ 實作與測試完成
+

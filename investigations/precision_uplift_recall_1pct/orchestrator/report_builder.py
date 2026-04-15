@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+import evaluators
+
 _ORCH_NOTE_START = "<!-- ORCHESTRATOR_RUN_NOTE_START -->\n"
 _ORCH_NOTE_END = "\n<!-- ORCHESTRATOR_RUN_NOTE_END -->"
 _JSON_FENCE_MAX = 12000
@@ -140,6 +142,72 @@ def _write_point_in_time_parity(path: Path, run_id: str, cfg: Mapping[str, Any],
     return path
 
 
+def _phase1_mid_snapshots_section_lines(bundle: Mapping[str, Any]) -> list[str]:
+    """Markdown lines documenting mid R1/R6 stdout logs and parsed PAT sequence."""
+    raw = bundle.get("r1_r6_mid_snapshots")
+    rows = raw if isinstance(raw, list) else []
+    lines: list[str] = [
+        "## Mid R1/R6 snapshots（方向檢查）",
+        "",
+        "來源：collector 掃描 `logs/r1_r6_mid_cp*.stdout.log`（序號遞增）後接 `r1_r6_mid.stdout.log`。"
+        " PAT 欄位與 gate 相同，為 `precision_at_target_recall`（目標 recall 之 precision）。",
+        "",
+    ]
+    if not rows:
+        lines.extend(
+            [
+                "- **筆數（log 列）**: `0`",
+                "- **PAT 序列（可解析）**: *(無 — 未發現上述 mid stdout 或 bundle 缺 `r1_r6_mid_snapshots`)*",
+                "",
+            ]
+        )
+        return lines
+
+    parsed_pats: list[float] = []
+    detail: list[str] = []
+    for i, row in enumerate(rows, start=1):
+        if not isinstance(row, Mapping):
+            continue
+        log_path = str(row.get("stdout_log") or "").strip()
+        payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else None
+        perr = row.get("parse_error")
+        pat = evaluators.extract_precision_at_target_recall(payload) if payload is not None else None
+        if pat is not None:
+            parsed_pats.append(float(pat))
+
+        if row.get("is_canonical_mid_alias"):
+            label = "canonical `r1_r6_mid`"
+        else:
+            cp_idx = row.get("checkpoint_index")
+            label = f"checkpoint `cp{cp_idx}`" if isinstance(cp_idx, int) else "checkpoint `(unknown)`"
+
+        if pat is not None:
+            pat_s = f"`{pat:.4f}`"
+        else:
+            pat_s = "*(無法解析 PAT)*"
+            if isinstance(perr, str) and perr.strip():
+                short = perr.strip().replace("\n", " ")
+                if len(short) > 120:
+                    short = short[:117] + "..."
+                pat_s += f" — `{short}`"
+
+        detail.append(f"{i}. **{label}** · PAT@target_recall={pat_s} · `stdout`: `{log_path}`")
+
+    seq_s = ", ".join(f"{p:.4f}" for p in parsed_pats) if parsed_pats else "*(無可解析列)*"
+    lines.extend(
+        [
+            f"- **筆數（log 列）**: `{len(rows)}`",
+            f"- **PAT 序列（依上表順序、僅含成功解析者）**: `{seq_s}`",
+            "",
+            "### 逐列來源",
+            "",
+        ]
+    )
+    lines.extend(detail)
+    lines.append("")
+    return lines
+
+
 def _write_phase1_gate_decision(
     path: Path, run_id: str, cfg: Mapping[str, Any], bundle: Mapping[str, Any], gate: Mapping[str, Any]
 ) -> Path:
@@ -164,6 +232,7 @@ def _write_phase1_gate_decision(
     else:
         lines.append("- *(none)*")
     lines.extend(["", "### evidence_summary", "", evidence or "*empty*", ""])
+    lines.extend(_phase1_mid_snapshots_section_lines(bundle))
     lines.extend(["### metrics", "", _json_fence(metrics if metrics is not None else {})])
     lines.extend(
         [

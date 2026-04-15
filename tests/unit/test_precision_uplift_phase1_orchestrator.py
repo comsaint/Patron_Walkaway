@@ -4302,6 +4302,50 @@ def test_write_phase1_reports_writes_six_markdown_files(tmp_path: Path) -> None:
     gate_md = (phase1 / "phase1_gate_decision.md").read_text(encoding="utf-8")
     assert "`rep_run`" in gate_md or "rep_run" in gate_md
     assert str(gate["status"]) in gate_md
+    assert "Mid R1/R6 snapshots" in gate_md
+    assert "筆數（log 列）" in gate_md and "`0`" in gate_md
+
+
+def test_phase1_gate_decision_mid_snapshots_section_lists_paths_and_pats(tmp_path: Path) -> None:
+    """phase1_gate_decision.md lists mid row count, PAT sequence, and stdout paths."""
+    phase1 = tmp_path / "phase1"
+    cfg = _minimal_config_dict()
+    p0 = _pat_block(0.31)
+    p1 = _pat_block(0.32)
+    bundle = {
+        "run_id": "mid_rep",
+        "errors": [],
+        "window": dict(cfg["window"]),
+        "thresholds": dict(cfg["thresholds"]),
+        "backtest_metrics": None,
+        "state_db_stats": {"finalized_alerts_count": 1},
+        "r1_r6_final": {"payload": None},
+        "r1_r6_mid": {"payload": p1},
+        "r1_r6_mid_snapshots": [
+            {
+                "checkpoint_index": 1,
+                "stdout_log": "/tmp/orch/state/mid_rep/logs/r1_r6_mid_cp1.stdout.log",
+                "payload": p0,
+                "parse_error": None,
+            },
+            {
+                "checkpoint_index": None,
+                "stdout_log": "/tmp/orch/state/mid_rep/logs/r1_r6_mid.stdout.log",
+                "payload": p1,
+                "parse_error": None,
+                "is_canonical_mid_alias": True,
+            },
+        ],
+    }
+    gate = evaluators.evaluate_phase1_gate(bundle)
+    report_builder.write_phase1_reports(phase1, "mid_rep", cfg, bundle, gate)
+    gate_md = (phase1 / "phase1_gate_decision.md").read_text(encoding="utf-8")
+    assert "筆數（log 列）**: `2`" in gate_md
+    assert "0.3100, 0.3200" in gate_md
+    assert "r1_r6_mid_cp1.stdout.log" in gate_md
+    assert "r1_r6_mid.stdout.log" in gate_md
+    assert "checkpoint `cp1`" in gate_md
+    assert "canonical `r1_r6_mid`" in gate_md
 
 
 def test_status_history_crosscheck_orchestrator_block_replaced_not_stacked(tmp_path: Path) -> None:
