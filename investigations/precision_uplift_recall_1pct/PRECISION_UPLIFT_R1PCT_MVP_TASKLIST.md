@@ -122,9 +122,42 @@
   - [x] `phase1/upper_bound_repro.md`
   - [x] `phase1/label_noise_audit.md`
   - [x] `phase1/slice_performance_report.md`
-  - [x] `phase1/point_in_time_parity_check.md`
+  - [x] `phase1/point_in_time_parity_check.md`（**目前為 MVP scaffold + 人工核對清單**，非自動 parity 指標）
   - [x] `phase1/phase1_gate_decision.md`
 - [x] `status_history_crosscheck.md` 保留人工維護，附 orchestrator 區塊
+
+**MVP 限制（需明確告知 reviewer）**
+- `point_in_time_parity_check.md` 現況僅輸出資料來源與人工核對項，未自動計算 PIT/時區/成熟度一致性指標。
+- `evaluate_phase1_gate(...)` 現況不以 PIT parity 自動檢核作為 PASS 的必要條件。
+- 因此 `phase1_gate_decision.md` 的 `PASS` 代表「MVP Gate 規則通過」，不等同「PIT parity 已完成機械驗證」。
+
+**後續任務（P1 parity 補強）**
+- [ ] 新增 parity collector：輸出可機械判讀的 PIT 指標（`scored_at`、`validated_at`、時區/窗界一致性）。
+- [ ] 擴充 `point_in_time_parity_check.md`：除 checklist 外，附 JSON 指標摘要與 FAIL 條件。
+- [ ] 擴充 `evaluate_phase1_gate(...)`：新增可配置 parity blocking 規則（至少 `STRICT` / `WARN_ONLY` 兩種模式）。
+
+**P1 parity 最小規格（可直接開工）**
+- [x] `collectors.py` 新增 `collect_phase1_pit_parity(...) -> dict`，輸出鍵：
+  - [x] `status`（`ok` / `warn` / `fail`）
+  - [x] `scored_at_in_window_ratio`（`prediction_log` 中 `scored_at` 落在 `[start_ts, end_ts)` 的比例）
+  - [x] `validated_at_non_null_ratio`（`validation_results` 中 `validated_at` 非空比例）
+  - [x] `window_timezone_mismatch_count`（時區/窗界不一致筆數；無法判讀時至少回傳 `note`）
+  - [x] `alerts_vs_prediction_log_gap`（沿用 R2 差值，供 parity 區塊交叉引用）
+  - [x] `reasons[]`（違規原因代碼）
+- [x] `report_builder.py` 在 `point_in_time_parity_check.md` 新增 `## PIT parity metrics (auto)` JSON 區塊。
+- [x] `config/run_phase1.yaml` 新增：
+  - [x] `thresholds.pit_parity_mode`（`STRICT` / `WARN_ONLY`，預設 `WARN_ONLY`）
+  - [x] `thresholds.min_scored_at_in_window_ratio`（預設 `0.995`）
+  - [x] `thresholds.min_validated_at_non_null_ratio`（預設 `0.995`）
+  - [x] `thresholds.max_alert_prediction_gap_abs`（預設 `100`）
+- [x] `evaluators.py` 新增 gate 規則：
+  - [x] `STRICT`：任一 parity threshold 不達標 -> `FAIL`（blocking reason: `pit_parity_violation`）
+  - [x] `WARN_ONLY`：不阻斷 gate，但 `evidence_summary` 必須附 `pit_status=warn/fail`
+
+**P1 parity 完成定義（DoD）**
+- [x] 若 DB 缺欄位（如無 `validated_at`），collector 不崩潰，回傳 `status=warn` + `reasons[]`。
+- [x] `phase1_gate_decision.md` 的 `metrics` 含 `pit_parity_status` 與主要 ratio。
+- [ ] 新增最少 3 個單元測試：`STRICT fail`、`WARN_ONLY pass with warning`、`missing column -> warn`。
 
 ### T7 - run_state 與 Resume（中優先）
 

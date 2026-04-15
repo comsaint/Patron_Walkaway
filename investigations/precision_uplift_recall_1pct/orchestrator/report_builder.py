@@ -119,11 +119,22 @@ def _write_slice_performance_report(path: Path, run_id: str, cfg: Mapping[str, A
 
 
 def _write_point_in_time_parity(path: Path, run_id: str, cfg: Mapping[str, Any], bundle: Mapping[str, Any]) -> Path:
-    """Write ``point_in_time_parity_check.md`` (MVP: data-source + manual checklist)."""
+    """Write ``point_in_time_parity_check.md`` (MVP: auto metrics + manual checklist)."""
+    pit = bundle.get("pit_parity") if isinstance(bundle.get("pit_parity"), Mapping) else None
     lines = [
         "# point_in_time_parity_check",
         "",
         _meta_section(run_id, cfg, bundle),
+        "## PIT parity metrics (auto)",
+        "",
+    ]
+    if pit is None:
+        lines.append("*No `pit_parity` in collect bundle.*")
+    else:
+        lines.append(_json_fence(dict(pit), max_chars=4000))
+    lines.extend(
+        [
+            "",
         "## MVP 範圍（scaffold）",
         "",
         "本段由 orchestrator 產生；請人工核對：",
@@ -137,7 +148,8 @@ def _write_point_in_time_parity(path: Path, run_id: str, cfg: Mapping[str, Any],
         f"- Prediction log DB: `{cfg.get('prediction_log_db_path')}`",
         f"- State DB: `{cfg.get('state_db_path')}`",
         "",
-    ]
+        ]
+    )
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
 

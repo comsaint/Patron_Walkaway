@@ -27,6 +27,7 @@ if str(_ORCHESTRATOR) not in sys.path:
     sys.path.insert(0, str(_ORCHESTRATOR))
 
 import collectors  # noqa: E402
+import common_exit_codes as orch_exits  # noqa: E402
 import config_loader  # noqa: E402
 import evaluators  # noqa: E402
 import phase2_exit_codes as phase2_exits  # noqa: E402
@@ -131,7 +132,7 @@ def test_run_pipeline_rejects_unsupported_phase() -> None:
         text=True,
         check=False,
     )
-    assert proc.returncode == 2
+    assert proc.returncode == orch_exits.EXIT_CONFIG_INVALID
     assert "phase9" in proc.stderr or "phase9" in proc.stdout
 
 
@@ -284,6 +285,65 @@ def test_phase2_failure_step_cli_exit_mapping_matches_constants() -> None:
         == phase2_exits.EXIT_PHASE2_BACKTEST_OR_ARTIFACT_FAILURE
     )
     assert m["phase2_backtest_jobs"] == phase2_exits.EXIT_PHASE2_BACKTEST_OR_ARTIFACT_FAILURE
+
+
+def test_phase2_exit_codes_numeric_contract() -> None:
+    """Lock integer CLI contract for _main_phase2 early exits (historic magic numbers)."""
+    assert phase2_exits.EXIT_CONFIG_INVALID == 2
+    assert phase2_exits.EXIT_PREFLIGHT_FAILED == 3
+    assert phase2_exits.EXIT_RESUME_BUNDLE_LOAD_FAILED == 4
+    assert phase2_exits.EXIT_DRY_RUN_NOT_READY == 6
+
+
+def test_common_exit_codes_match_phase2_reexported_shared() -> None:
+    """Shared 2/3/6 must stay single source: common module == phase2 re-exports."""
+    assert orch_exits.EXIT_CONFIG_INVALID == phase2_exits.EXIT_CONFIG_INVALID
+    assert orch_exits.EXIT_PREFLIGHT_FAILED == phase2_exits.EXIT_PREFLIGHT_FAILED
+    assert orch_exits.EXIT_DRY_RUN_NOT_READY == phase2_exits.EXIT_DRY_RUN_NOT_READY
+
+
+def test_common_exit_codes_phase1_four_five_numeric_contract() -> None:
+    """Phase 1 mid/R1 and backtest CLI exits keep historic integers 4 and 5."""
+    assert orch_exits.EXIT_PHASE1_MID_OR_R1_FAILED == 4
+    assert orch_exits.EXIT_PHASE1_BACKTEST_FAILED == 5
+
+
+def test_exit_code_four_five_integer_collision_phase1_vs_phase2_documented() -> None:
+    """Same integers as Phase 2 exits 4/5; names disambiguate failing step."""
+    assert orch_exits.EXIT_PHASE1_MID_OR_R1_FAILED == phase2_exits.EXIT_RESUME_BUNDLE_LOAD_FAILED
+    assert orch_exits.EXIT_PHASE1_BACKTEST_FAILED == phase2_exits.EXIT_PHASE2_RUNNER_SMOKE_FAILED
+
+
+def test_run_pipeline_phase2_non_empty_overrides_exits_config_invalid(
+    tmp_path: Path,
+) -> None:
+    """T10A: non-empty experiment overrides fail config load before preflight (exit 2)."""
+    run_id = "pytest_phase2_bad_overrides"
+    raw = _minimal_phase2_dict(
+        model_dir="m", state_db="s", pred_db="p", yaml_run_id=run_id
+    )
+    raw["tracks"]["track_a"]["experiments"][0]["overrides"] = {"illegal": 1}
+    cfg_file = tmp_path / "bad_ov.yaml"
+    cfg_file.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_RUN_PIPELINE),
+            "--phase",
+            "phase2",
+            "--config",
+            str(cfg_file),
+            "--run-id",
+            run_id,
+            "--dry-run",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == phase2_exits.EXIT_CONFIG_INVALID
+    assert "E_CONFIG_INVALID" in proc.stderr or "overrides" in proc.stderr.lower()
 
 
 def test_build_phase2_input_summary_fingerprint_stable() -> None:
@@ -662,6 +722,9 @@ def test_adhoc_runbook_documents_phase2_error_code_reference() -> None:
     assert "phase2_bundle.json" in text
     assert "phase2_pat_matrix_yaml_experiment_count" in text
     assert "phase2_exit_codes.py" in text
+    assert "common_exit_codes.py" in text
+    assert "EXIT_PHASE1_MID_OR_R1_FAILED" in text
+    assert "EXIT_PHASE1_BACKTEST_FAILED" in text
     assert "phase2_runner_smoke" in text
 
 
@@ -2731,6 +2794,108 @@ def test_collect_summary_phase2_omits_pat_matrix_yaml_count_when_zero() -> None:
     assert "phase2_pat_matrix_yaml_experiment_count" not in s
 
 
+def test_extract_phase2_shared_pat_series_from_backtest_metrics_ok() -> None:
+    m: Mapping[str, Any] = {
+        "model_default": {"test_precision_at_recall_0.01_by_window": [0.42, 0.43]}
+    }
+    assert evaluators.extract_phase2_shared_pat_series_from_backtest_metrics(m) == [
+        0.42,
+        0.43,
+    ]
+
+
+def test_extract_phase2_shared_pat_series_from_backtest_metrics_bad_element() -> None:
+    m: Mapping[str, Any] = {
+        "model_default": {"test_precision_at_recall_0.01_by_window": [0.1, "nope"]}
+    }
+    assert (
+        evaluators.extract_phase2_shared_pat_series_from_backtest_metrics(m) is None
+    )
+
+
+def test_extract_phase2_shared_pat_window_ids_from_backtest_metrics() -> None:
+    m: Mapping[str, Any] = {
+        "model_default": {"test_precision_at_recall_0.01_window_ids": ["w1", 2]}
+    }
+    assert evaluators.extract_phase2_shared_pat_window_ids_from_backtest_metrics(
+        m
+    ) == ["w1", "2"]
+
+
+def test_collect_summary_phase2_includes_shared_backtest_pat_series_fields() -> None:
+    """run_state.phase2_collect can surface shared backtest multi-window PAT shape."""
+    b: dict[str, Any] = {
+        "bundle_kind": "phase2_plan_v1",
+        "status": "metrics_ingested",
+        "experiments_index": [],
+        "job_specs": [],
+        "backtest_metrics": {
+            "model_default": {
+                "test_precision_at_recall_0.01_by_window": [0.5, 0.6, 0.7],
+                "test_precision_at_recall_0.01_window_ids": ["a", "b", "c"],
+            }
+        },
+    }
+    s = collectors.collect_summary_phase2_plan_for_run_state(b)
+    assert s.get("phase2_shared_backtest_pat_series_len") == 3
+    assert s.get("phase2_shared_backtest_pat_window_ids_len") == 3
+
+
+def test_collect_summary_phase2_flags_pat_series_ids_mismatch_when_lengths_differ() -> None:
+    """When both series and window_ids exist but differ in length, summary flags mismatch."""
+    b: dict[str, Any] = {
+        "bundle_kind": "phase2_plan_v1",
+        "status": "metrics_ingested",
+        "experiments_index": [],
+        "job_specs": [],
+        "backtest_metrics": {
+            "model_default": {
+                "test_precision_at_recall_0.01_by_window": [0.1, 0.2],
+                "test_precision_at_recall_0.01_window_ids": ["only_one"],
+            }
+        },
+    }
+    s = collectors.collect_summary_phase2_plan_for_run_state(b)
+    assert s.get("phase2_shared_backtest_pat_series_len") == 2
+    assert s.get("phase2_shared_backtest_pat_window_ids_len") == 1
+    assert s.get("phase2_shared_backtest_pat_series_ids_mismatch") is True
+
+
+def test_collect_summary_phase2_omits_mismatch_when_series_and_ids_aligned() -> None:
+    b: dict[str, Any] = {
+        "bundle_kind": "phase2_plan_v1",
+        "status": "metrics_ingested",
+        "experiments_index": [],
+        "job_specs": [],
+        "backtest_metrics": {
+            "model_default": {
+                "test_precision_at_recall_0.01_by_window": [0.1, 0.2],
+                "test_precision_at_recall_0.01_window_ids": ["a", "b"],
+            }
+        },
+    }
+    s = collectors.collect_summary_phase2_plan_for_run_state(b)
+    assert "phase2_shared_backtest_pat_series_ids_mismatch" not in s
+
+
+def test_collect_summary_phase2_omits_mismatch_when_only_pat_series() -> None:
+    b: dict[str, Any] = {
+        "bundle_kind": "phase2_plan_v1",
+        "status": "metrics_ingested",
+        "experiments_index": [],
+        "job_specs": [],
+        "backtest_metrics": {
+            "model_default": {
+                "test_precision_at_recall_0.01_by_window": [0.5],
+            }
+        },
+    }
+    s = collectors.collect_summary_phase2_plan_for_run_state(b)
+    assert s.get("phase2_shared_backtest_pat_series_len") == 1
+    assert "phase2_shared_backtest_pat_window_ids_len" not in s
+    assert "phase2_shared_backtest_pat_series_ids_mismatch" not in s
+
+
 def test_run_logged_command_timeout_uses_e_subprocess_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3717,7 +3882,7 @@ def test_phase2_resume_missing_bundle_exits_4(tmp_path: Path) -> None:
         text=True,
         check=False,
     )
-    assert proc2.returncode == 4
+    assert proc2.returncode == phase2_exits.EXIT_RESUME_BUNDLE_LOAD_FAILED
     assert "cannot load phase2_bundle.json" in proc2.stderr
 
 
@@ -3735,8 +3900,6 @@ def test_collect_phase2_plan_bundle_raises_on_bad_tracks() -> None:
 
 def test_backtest_smoke_failure_returns_non_ok() -> None:
     """When trainer.backtester --help fails, preflight must not report ok."""
-    model_dir = Path("m")
-    # Use tmp_path pattern without fixture: minimal inline
     # This test patches subprocess at runner level.
     with mock.patch("runner.subprocess.run") as m_run:
         m_run.return_value = mock.Mock(returncode=1, stdout="", stderr="nope")
@@ -3777,7 +3940,7 @@ def test_run_state_written_on_preflight_failure(tmp_path: Path) -> None:
         text=True,
         check=False,
     )
-    assert proc.returncode == 3
+    assert proc.returncode == orch_exits.EXIT_PREFLIGHT_FAILED
     assert state_json.is_file(), "run_state.json should exist after failed preflight"
     data = json.loads(state_json.read_text(encoding="utf-8"))
     assert data["steps"]["preflight"]["status"] == "failed"
@@ -4500,7 +4663,7 @@ def test_dry_run_cli_not_ready_returns_6_and_writes_readiness(tmp_path: Path) ->
         text=True,
         check=False,
     )
-    assert proc.returncode == 6
+    assert proc.returncode == orch_exits.EXIT_DRY_RUN_NOT_READY
     state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
     data = json.loads(state_json.read_text(encoding="utf-8"))
     assert data["mode"] == "dry_run"
@@ -4576,7 +4739,7 @@ def test_cli_phase_all_without_dry_run_exits_2(tmp_path: Path) -> None:
         text=True,
         check=False,
     )
-    assert proc.returncode == 2
+    assert proc.returncode == orch_exits.EXIT_CONFIG_INVALID
 
 
 def test_run_all_phases_dry_run_readiness_ready(tmp_path: Path) -> None:

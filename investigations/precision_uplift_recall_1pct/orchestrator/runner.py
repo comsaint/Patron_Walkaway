@@ -900,42 +900,15 @@ def _preview_precision_at_recall_1pct_from_metrics(
 def _preview_precision_at_recall_1pct_series_from_metrics(
     metrics: Mapping[str, Any],
 ) -> list[float] | None:
-    """Read optional multi-window PAT@1% series from backtest metrics.
-
-    Contract (T10/T11 incremental): when present, expects
-    ``model_default.test_precision_at_recall_0.01_by_window`` as a list of numeric values
-    in [0, 1]-scale (same scale as preview PAT).
-    """
-    md = metrics.get("model_default")
-    if not isinstance(md, Mapping):
-        return None
-    raw = md.get("test_precision_at_recall_0.01_by_window")
-    if not isinstance(raw, list) or not raw:
-        return None
-    out: list[float] = []
-    for x in raw:
-        try:
-            out.append(float(x))
-        except (TypeError, ValueError):
-            return None
-    return out or None
+    """Delegate to ``evaluators.extract_phase2_shared_pat_series_from_backtest_metrics``."""
+    return evaluators.extract_phase2_shared_pat_series_from_backtest_metrics(metrics)
 
 
 def _preview_precision_at_recall_1pct_window_ids_from_metrics(
     metrics: Mapping[str, Any],
 ) -> list[str] | None:
-    """Read optional window labels aligned with ``*_by_window`` PAT series.
-
-    Contract (incremental): ``model_default.test_precision_at_recall_0.01_window_ids``
-    as a non-empty list. Values are stringified for reporting consistency.
-    """
-    md = metrics.get("model_default")
-    if not isinstance(md, Mapping):
-        return None
-    raw = md.get("test_precision_at_recall_0.01_window_ids")
-    if not isinstance(raw, list) or not raw:
-        return None
-    return [str(x) for x in raw]
+    """Delegate to ``evaluators.extract_phase2_shared_pat_window_ids_from_backtest_metrics``."""
+    return evaluators.extract_phase2_shared_pat_window_ids_from_backtest_metrics(metrics)
 
 
 def run_phase2_per_job_backtests(

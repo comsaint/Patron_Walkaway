@@ -1692,3 +1692,100 @@ python -m pytest tests/unit/test_task7_chunk_cache_key.py -q --tb=short
 **計畫後續（CONSOLIDATED §B）**：可攜式指紋 + R6 預設已與本修對齊；建議下一項優先 **Dynamic K Phase-A** 或 **R6 跨機 cache hit 實測紀錄**；GPU 項補 **CPU vs GPU benchmark** 數據至既有 runbook。
 
 ---
+
+## 2026-04-15 CYCLE — Phase1 PIT parity MVP wiring（STEP 1 Builder）
+
+> 計畫索引：`.cursor/plans/PLAN.md`；決策：`.cursor/plans/DECISION_LOG.md`。本輪依 `PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` 新增之 **P1 parity 最小規格**，先做前兩步（collector + report），不一次做完 gate 阻斷。
+
+### STEP 1 — Builder
+
+- **`investigations/precision_uplift_recall_1pct/orchestrator/collectors.py`**
+  - 新增 ` _collect_phase1_pit_parity(...)`（prediction/state DB 的 PIT 自動診斷，非阻斷）：
+    - `scored_at_in_window_ratio`
+    - `validated_at_non_null_ratio`
+    - `alerts_vs_prediction_log_gap`
+    - `status` / `reasons[]` / `note`
+  - `collect_phase1_artifacts(...)` 新增 bundle 鍵：`pit_parity`
+  - `collect_summary_for_run_state(...)` 新增 `pit_parity_status` 與兩個 ratio 摘要欄位。
+- **`investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py`**
+  - `point_in_time_parity_check.md` 新增 `## PIT parity metrics (auto)`，自動渲染 `bundle["pit_parity"]` JSON。
+- **`investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase1.yaml`**
+  - 補上 parity 相關 threshold/mode 註解（目前作為規格提示；gate enforce 下一步接）。
+
+#### 手動驗證
+
+1. 執行 phase1 collect（可 `--collect-only`），確認 `collect_bundle.json` 出現 `pit_parity` 區塊。  
+2. 檢查 `results/<run_id>/reports/phase1/point_in_time_parity_check.md` 是否含 `PIT parity metrics (auto)`。  
+3. 檢查 `run_state.json` 的 `phase1_collect` 摘要是否含 `pit_parity_status` 與 ratio 欄位。
+
+#### 下一步建議
+
+- 將 `pit_parity_mode`（`STRICT`/`WARN_ONLY`）與三個 threshold 真正接到 `evaluate_phase1_gate(...)`，完成 gate 阻斷策略。
+- 補齊對應測試（`STRICT fail`、`WARN_ONLY pass with warning`、`missing column -> warn`）。
+
+---
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| `validated_at_non_null_ratio` 未套觀測窗 | 目前以 `validation_results` 全表計算，長期資料會稀釋當窗異常 | 改為優先用 `alert_ts` 同窗計算；缺 `alert_ts` 才 fallback 全表並加 `reason` | `test_collect_phase1_pit_parity_uses_windowed_validation_ratio_when_alert_ts_exists` |
+| `alerts_vs_prediction_log_gap` 來源不一致風險 | 目前以 `prediction_log.scored_at` vs `alerts.ts` 計數，若語意漂移只會 `warn` | 在 `pit_parity` 補 `counts` 子欄位（兩邊原始 count）方便 reviewer 比對 | `test_collect_phase1_pit_parity_gap_includes_both_counts` |
+| 時區 mismatch 尚未機械化 | `window_timezone_mismatch_count` 目前固定 `None` + note | 後續若 schema 有時區欄位，補真正 mismatch 計數；否則維持 `warn` 並文件化限制 | `test_collect_phase1_pit_parity_timezone_count_none_with_reason` |
+| `prediction_log` 表缺失情境 | `PRAGMA table_info(prediction_log)` 在缺表時回空，不會丟錯 | 現行 `reason` 可判讀，但建議加一個明確 reason（例如 `prediction_log_table_missing`） | `test_collect_phase1_pit_parity_warns_when_prediction_log_table_missing` |
+| Gate 尚未吃 parity 門檻 | 本輪是 collector/report wiring，仍可出現 `PASS + pit warn` | 下一步接 `pit_parity_mode` 進 `evaluate_phase1_gate`，`STRICT` 時阻斷 | `test_evaluate_phase1_gate_strict_blocks_on_pit_parity_violation` |
+
+### STEP 3 — Tester（lint/typecheck 規則化，未改 production）
+
+> 依本 workspace 規範，本輪不新增/改動 `tests/` 內容；先把 Reviewer 風險轉為最小可執行規則，供下一輪落地單元測試。
+
+- **規則 R1（PIT 區塊必存在）**  
+  - 目標：避免回退成純 scaffold。  
+  - 指令：`rg "## PIT parity metrics \\(auto\\)" investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py`
+- **規則 R2（Bundle 必帶 pit_parity）**  
+  - 目標：確保 collector wiring 未遺失。  
+  - 指令：`rg "\"pit_parity\": pit_parity|pit_parity_status" investigations/precision_uplift_recall_1pct/orchestrator/collectors.py`
+- **規則 R3（Phase1 config 文件需含 parity threshold 註解）**  
+  - 目標：避免 config 契約漂移。  
+  - 指令：`rg "pit_parity_mode|min_scored_at_in_window_ratio|min_validated_at_non_null_ratio|max_alert_prediction_gap_abs" investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase1.yaml`
+- **規則 R4（Gate 仍未 enforce parity，需明示）**  
+  - 目標：避免 reviewer 誤判 `PASS` 含 parity 通過。  
+  - 指令：`rg "pit_parity_mode|pit_parity_violation" investigations/precision_uplift_recall_1pct/orchestrator/evaluators.py`（目前預期無命中，作為待辦提醒）
+
+#### 建議下一輪新增測試（待 `tests/` 開窗後）
+
+- `test_collect_phase1_pit_parity_uses_windowed_validation_ratio_when_alert_ts_exists`
+- `test_collect_phase1_pit_parity_warns_when_prediction_log_table_missing`
+- `test_write_point_in_time_parity_includes_auto_metrics_block`
+- `test_evaluate_phase1_gate_strict_blocks_on_pit_parity_violation`
+
+### STEP 4 — Tester（修實作，不改 tests）
+
+- **`investigations/precision_uplift_recall_1pct/orchestrator/evaluators.py`**
+  - `evaluate_phase1_gate(...)` 新增 parity threshold 讀取與 mode 行為：
+    - `pit_parity_mode`（`STRICT` / `WARN_ONLY`，預設 `WARN_ONLY`）
+    - `min_scored_at_in_window_ratio`
+    - `min_validated_at_non_null_ratio`
+    - `max_alert_prediction_gap_abs`
+  - `STRICT` 下 parity violation 會 `FAIL`（`pit_parity_violation` + 細項 reason）。
+  - `WARN_ONLY` 下不阻斷，但 evidence 與 metrics 會附 `pit_status`/violation 訊息。
+- **`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`**
+  - P1 parity 子項目狀態更新：collector / report / config / gate wiring 已勾選；測試項維持待辦。
+
+#### 檢查結果
+
+- `ReadLints`：本輪修改檔案 **無 IDE lint 錯誤**。
+- 依 workspace 規範，本輪未執行 `pytest/ruff/mypy`（quality tools 建議在 push 前統一跑）。
+
+#### Plan item 狀態更新（本輪）
+
+- **P1 parity 最小規格**：主要程式 wiring（collector + report + gate mode）已完成。
+- **P1 parity DoD**：測試項尚未完成（待下一輪補測）。
+
+#### 下一步建議（Plan）
+
+1. 補上 3 個 parity 單元測試（`STRICT` / `WARN_ONLY` / missing column）。  
+2. 將 `validated_at_non_null_ratio` 調整為「優先窗內計算，缺欄才 fallback 全表」。  
+3. 在 `pit_parity` 加入雙邊原始 count（alerts / prediction_log）提升稽核可讀性。
+
+

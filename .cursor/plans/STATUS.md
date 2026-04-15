@@ -1,5 +1,410 @@
 **Archive**: Past rounds and older STATUS blocks are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60, 67 Review–75 moved 2026-03-05; Rounds 79–99 moved 2026-03-05; Round 96 onward moved 2026-03-12; **2026-03-22**: Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等長段 → archive.)
 
+## T10 真多窗（最小可用）— 由 `gaming_day` 產出 PAT@1% 多窗序列（2026-04-15，`cycle_code`）
+
+### STEP 1 — Builder
+
+**背景**：對齊上一輪「`T10` 真多窗仍待」；本輪只做 1 個最小步驟：讓 backtester 在既有單一回測視窗內，依 `gaming_day` 真實分窗計算 `test_precision_at_recall_0.01_by_window`，不再只靠單窗 bridge。`PLAN.md` 仍為索引；`DECISION_LOG.md` 本輪無新增條目。
+
+| 檔案 | 說明 |
+|------|------|
+| `trainer/training/backtester.py` | 新增 `_build_pat_recall_1pct_series_from_gaming_day(rated_sub)`：按 `gaming_day` 分組，對每組跑 `compute_micro_metrics(..., window_hours=None)` 抽取 `test_precision_at_recall_0.01`，輸出對齊的 `(series, window_ids)`；並在 `_compute_section_metrics` 內優先寫入 `test_precision_at_recall_0.01_by_window` 與 `test_precision_at_recall_0.01_window_ids`（有值才寫）。既有 bridge 保留為 fallback。 |
+
+**手動驗證**：跑 backtest 且資料含 `gaming_day` 多天 → 檢查 `backtest_metrics.json` 的 `model_default`：若每窗可算出 PAT@1%，應出現長度 > 1 的 `test_precision_at_recall_0.01_by_window` 與同長度 `...window_ids`。
+
+**下一步建議**：STEP 2 Reviewer；STEP 3 測 `_build_pat_recall_1pct_series_from_gaming_day` 的對齊與缺欄位行為；下一輪可再接「獨立 investigation windows（跨多次 backtest）」而非僅 `gaming_day` 分窗。
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 問題 | 建議 | 希望新增的測試 |
+|---|------|------|------|----------------|
+| 1 | 閾值語意 | 分窗 helper 用 `compute_micro_metrics`，其 PAT@recall 受 `THRESHOLD_MIN_ALERT_COUNT` 契約影響，少樣本窗可能被濾成 `None`。 | 維持現行契約（與主流程一致），文件註明「小窗可能被過濾」。 | 小樣本窗回 `None` 時整窗跳過（現況契約） |
+| 2 | 效能 | 每個 `gaming_day` 會做一次 metrics 計算；窗數多時成本線性增加。 | 仍屬 O(窗數) 小 dict 計算；相較模型推論成本低，可接受。 | 無（僅行為測） |
+| 3 | 對齊 | `window_ids` 用 `str(gaming_day)`，不同 dtype（date/timestamp）字串格式可能不一致。 | 目前先保留字串化；若要跨系統一致可後續標準化 ISO。 | 檢查長度一致、順序遞增即可 |
+
+### STEP 3 — Tester（僅 tests）
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/unit/test_backtester_pat_recall_bridge.py` | 新增 `test_true_multi_window_series_from_gaming_day_returns_aligned_series`、`test_true_multi_window_series_from_gaming_day_skips_when_missing_column` |
+
+**執行**：`python -m pytest tests/unit/test_backtester_pat_recall_bridge.py -q -p no:langsmith --tb=line`
+
+### STEP 4 — Tester（修實作至全綠）
+
+| 檢查 | 結果（2026-04-15） |
+|------|---------------------|
+| Pytest | `tests/unit/test_backtester_pat_recall_bridge.py`：**15 passed** |
+| Ruff | `trainer/training/backtester.py`、上列測試檔：**通過** |
+
+**備註（修正）**：STEP 3 首次測試失敗（測試資料每窗樣本過少，觸發最小 alert count 契約導致 `None`）；已在 STEP 4 僅修正測試資料（每窗 10 筆）使其符合既有契約，未改 production 邏輯。
+
+**建議下一輪 Plan**：延伸到真正「跨回測窗」序列（例如 investigation windows 多次 backtest 匯總）並明確定義 `window_ids` 格式；`T10` 由「bridge」推進到「`gaming_day` 真分窗」，但仍非最終形態。
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**
+
+---
+
+## Backtester — MLflow 補記錄 `optuna` 區段（prefix 隔離）(2026-04-15，`cycle_code`)
+
+### STEP 1 — Builder
+
+**背景**：對齊上一輪（2026-04-15）Reviewer #1「`optuna` 橋接後仍未進 MLflow」；本輪採最小變更：維持 `model_default` 原鍵，新增 `optuna` 前綴鍵避免覆寫。`PLAN.md` 仍為索引；`DECISION_LOG.md` 本輪無新增條目。
+
+| 檔案 | 說明 |
+|------|------|
+| `trainer/training/backtester.py` | `\_flat_section_to_mlflow_metrics` 新增 `metric_prefix`（預設 `backtest_`）；`has_active_run()` 區塊在既有 `model_default` 之外，新增 `optuna` 記錄（prefix=`backtest_optuna_`），避免與主區段鍵衝突 |
+
+**手動驗證**：執行含 `run_optuna=true` 的 backtest 並確認 active run 時，MLflow 應同時出現 `backtest_ap` 與 `backtest_optuna_ap`（及對應 threshold/alerts 鍵）。
+
+**下一步建議**：STEP 2 Reviewer；STEP 3 補 `metric_prefix` 單元測試；後續可評估是否在 runbook 補充兩組鍵用途說明。
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 問題 | 建議 | 希望新增的測試 |
+|---|------|------|------|----------------|
+| 1 | 鍵名碰撞 | 若 `metric_prefix=""`，`optuna` 可能覆蓋 `model_default` 鍵。 | 目前呼叫端固定傳 `backtest_optuna_`；維持。 | 斷言 optuna 前綴輸出不含 `backtest_ap` |
+| 2 | 型別 | 映射函式會把 list 也放進 dict，實際由 `log_metrics_safe` 忽略。 | 行為可接受；不額外增 O(n) 清洗避免重複成本。 | 無（既有契約已覆蓋） |
+| 3 | 效能 | 多一次 `log_metrics_safe` 呼叫，成本為小型 dict 轉換 + no-op 過濾。 | 可接受，不會造成 OOM；僅 active run 且有 optuna 時觸發。 | 無 |
+
+### STEP 3 — Tester（僅 tests）
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/unit/test_backtester_pat_recall_bridge.py` | 新增 `test_flat_section_to_mlflow_metrics_default_prefix_contract`、`test_flat_section_to_mlflow_metrics_supports_optuna_prefix` |
+
+**執行**：`python -m pytest tests/unit/test_backtester_pat_recall_bridge.py -q -p no:langsmith --tb=line`
+
+### STEP 4 — Tester（修實作至全綠）
+
+| 檢查 | 結果（2026-04-15） |
+|------|---------------------|
+| Pytest | `tests/unit/test_backtester_pat_recall_bridge.py`：**13 passed** |
+| Ruff | `trainer/training/backtester.py`、上列測試檔：**通過** |
+
+**建議下一輪 Plan**：`T10` 真多窗產物仍待（實際多窗 `by_window`/`window_ids`）；或回到 `Phase 1 EXIT_PHASE1_*` subprocess smoke（契約回歸）。
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**
+
+---
+
+## Backtester — `optuna` 同步 PAT@1% 單窗橋接 + `_apply_pat_at_recall_bridges_for_json_sections`（2026-04-15，`cycle_code`）
+
+### STEP 1 — Builder
+
+**背景**：對齊上一輪（2026-04-15）STATUS **建議下一輪**之（2）「可選：對 **`optuna`** 區段套用相同橋接」；**PLAN.md** 仍為索引；**DECISION_LOG.md** 本輪無新增條目。
+
+| 檔案 | 說明 |
+|------|------|
+| `trainer/training/backtester.py` | 新增 **`_apply_pat_at_recall_bridges_for_json_sections`**：對 **`model_default`** 與 **`optuna`**（若為 **dict**）套用 **`_attach_single_window_pat_at_recall_bridge`**；寫 **`backtest_metrics.json` 前**改呼叫此函式（與僅 **`model_default`** 行為等價擴充） |
+
+**手動驗證**：開啟 **`run_optuna`** 之 backtest 產物 **`backtest_metrics.json`**，**`optuna`** 應在標量 PAT@1% 存在時具 **`test_precision_at_recall_0.01_by_window`**／**`..._window_ids`**（長度 1、與 **`model_default`** 同一 **`window_start`→`window_end`** 字串）。
+
+**下一步建議**：STEP 2 Reviewer；STEP 3 單元測試 **`_apply_pat_at_recall_bridges_for_json_sections`**；**T10** 真多窗仍 **[ ]**；**Phase 1 `EXIT_PHASE1_*` smoke** 仍為候選。
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 問題 | 建議 | 希望新增的測試 |
+|---|------|------|------|----------------|
+| 1 | MLflow | **`has_active_run()`** 仍只 **`log_metrics_safe(_flat_section_to_mlflow_metrics(model_default))`**；**`optuna`** 之新 list 鍵不會進 MLflow（與先前 **`model_default`** 一致：list 被 **`log_metrics_safe`** 略過）。 | 若需對照 Optuna 閾值曲線，另議 **`log_metrics`** 策略。 | 無（行為與單區段時一致） |
+| 2 | 邊界 | **`results`** 缺 **`window_start`／`window_end`** 時 **`window_ids`** 變 **`"->"`**（**`str(None)`** 不會發生，缺鍵為 **`""`**）。 | 寫入路徑始終設兩鍵；若未來重用此 helper 須自帶 window。 | 可選：僅 **`model_default`** 而無 window 鍵之 dict 單測 |
+| 3 | 對稱 | **`optuna`** 與 **`model_default`** 共用同一 **`window_ids`** 字串，語意為「評估窗」而非「閾值來源」。 | Runbook／註解一句即可。 | 已測兩區段 **ids** 皆 **`A->B`** |
+
+### STEP 3 — Tester（僅 tests）
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/unit/test_backtester_pat_recall_bridge.py` | **`test_apply_bridges_covers_model_default_and_optuna`**、**`test_apply_bridges_skips_non_dict_section_values`**、**`test_apply_bridges_only_model_default_when_optuna_absent`** |
+
+**執行**：`python -m pytest tests/unit/test_backtester_pat_recall_bridge.py -q -p no:langsmith --tb=line`
+
+### STEP 4 — Tester（修實作至全綠）
+
+| 檢查 | 結果（2026-04-15） |
+|------|---------------------|
+| Pytest | `tests/unit/test_backtester_pat_recall_bridge.py`：**11 passed** |
+| Ruff | `trainer/training/backtester.py`、上列測試檔：**通過** |
+
+**建議下一輪 Plan**：**T10** 真多窗 **`by_window`／`window_ids`**；**Phase 1 `EXIT_PHASE1_*`** subprocess smoke；可選 **MLflow** 是否記錄 **optuna** 區段純量 PAT。
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**
+
+---
+
+## Backtester — 單窗 PAT@1% 橋接 `by_window`／`window_ids`（2026-04-15，`cycle_code`）
+
+### STEP 1 — Builder
+
+**背景**：對齊上一輪（2026-04-19）STATUS **建議下一輪**：**`trainer/training/backtester.py`** 寫入 **`test_precision_at_recall_0.01_by_window`**（與 **`test_precision_at_recall_0.01_window_ids`**）並與 orchestrator **`phase2_collect`** 契約對齊長度；**PLAN.md** 仍為索引；**DECISION_LOG.md** 本輪無新增條目。
+
+| 檔案 | 說明 |
+|------|------|
+| `trainer/training/backtester.py` | 新增 **`_attach_single_window_pat_at_recall_bridge`**：當 **`model_default.test_precision_at_recall_0.01`** 為**有限 float** 且尚未有 **`test_precision_at_recall_0.01_by_window`** 時，寫入 **`[v]`** 與 **`["{window_start}->{window_end}"]`**；於寫 **`backtest_metrics.json` 前**對 **`results["model_default"]`** 套用（**T10** 真多窗前之單窗橋接） |
+
+**手動驗證**：跑一次 backtest（有 rated 樣本且 PAT@1% 非 None）→ 開 **`backtest_metrics.json`** 之 **`model_default`**，應見 **`test_precision_at_recall_0.01_by_window`**（長度 1）與對齊之 **`test_precision_at_recall_0.01_window_ids`**。
+
+**下一步建議**：STEP 2 Reviewer；STEP 3 單元測試 **`_attach_single_window_pat_at_recall_bridge`**；**optuna** 區段是否同橋接可再議。
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 問題 | 建議 | 希望新增的測試 |
+|---|------|------|------|----------------|
+| 1 | 覆寫 | 若 **`by_window` 已為 `[]`**（非 None），函式會跳過；與「顯式空序列」語意是否一致？ | 維持「僅 None 視為未設定」；文件註明。 | 已設 **`by_window=[]`** 時**不**覆寫 |
+| 2 | NaN | 標量為 **NaN** 時不應寫入 list。 | 已用 **`math.isfinite`**。 | **NaN**／**inf** 不產生兩欄位 |
+| 3 | 優先權 | 未來多窗寫入 **`by_window`** 時須非 None 以跳過橋接。 | 與 T10 銜接時保留此契約。 | **`by_window` 已有兩點**時長度不變 |
+| 4 | MLflow | **`_flat_section_to_mlflow_metrics`** 會帶入 list；**`log_metrics_safe`** 僅 float。 | 無行為變更（list 被略過）。 | 可選：斷言橋接後 flat 仍僅數值鍵進 MLflow（mock） |
+
+### STEP 3 — Tester（僅 tests）
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/unit/test_backtester_pat_recall_bridge.py` | **`_attach_single_window_pat_at_recall_bridge`**：finite PAT → 對齊長度 1；None／NaN／inf／已存在 **`by_window`**／**`by_window=[]`** 等 |
+
+**執行**：`python -m pytest tests/unit/test_backtester_pat_recall_bridge.py -q -p no:langsmith --tb=line`
+
+### STEP 4 — Tester（修實作至全綠）
+
+| 檢查 | 結果（2026-04-15） |
+|------|---------------------|
+| Pytest | `tests/unit/test_backtester_pat_recall_bridge.py`：**8 passed** |
+| Ruff | `trainer/training/backtester.py`、上列測試檔：**通過** |
+
+**Tasklist**：**T10** 真多窗產物鏈仍 **[ ]**；本輪僅**單窗橋接**。**建議下一輪 Plan**：（1）多窗 backtest 實際填入 **`by_window`**／**`window_ids`** 並與本橋接語意文件化；（2）可選：對 **`optuna`** 區段套用相同橋接；（3）Phase 1 **`EXIT_PHASE1_*`** subprocess smoke（若仍優先）。
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**
+
+---
+
+## Precision uplift orchestrator — `phase2_collect` PAT 序列／window_ids 長度不一致旗標（2026-04-19，`cycle_code`）
+
+### STEP 1 — Builder
+
+**背景**：對齊上一輪 STATUS（2026-04-18）STEP 2 Reviewer **#1**（**`series`** 與 **`window_ids`** 長度不一致時 summary 未標示）；**PLAN.md** 仍為 repo 索引；**DECISION_LOG.md** 本輪無新增條目。
+
+| 檔案 | 說明 |
+|------|------|
+| `investigations/precision_uplift_recall_1pct/orchestrator/collectors.py` | **`collect_summary_phase2_plan_for_run_state`**：當 **`backtest_metrics`** 同時具可解析之 **`test_precision_at_recall_0.01_by_window`** 與 **`test_precision_at_recall_0.01_window_ids`** 且 **len 不等**時，寫入 **`phase2_shared_backtest_pat_series_ids_mismatch: true`**（仍保留各自 **`phase2_shared_backtest_pat_*_len`**） |
+
+**手動驗證**：**`phase2_bundle.json`** 之 **`backtest_metrics.model_default`** 故意讓兩 list 長度不同 → 重算 **`run_state.phase2_collect`**，應見 **`phase2_shared_backtest_pat_series_ids_mismatch`**。
+
+**下一步建議**：STEP 2 Reviewer；STEP 3 單元測試；**backtester** 寫入多窗欄位時保證對齊或文件化；**T10** 仍 **[ ]**。
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 問題 | 建議 | 希望新增的測試 |
+|---|------|------|------|----------------|
+| 1 | 語意 | 僅在**兩者皆可解析**時比較長度；任一方解析失敗（**None**）則**不**設 mismatch（與「缺 ids」不同）。 | Runbook／觀測說明：無 **`window_ids`** ≠ mismatch。 | **`test_collect_summary_phase2_omits_mismatch_when_only_pat_series`** |
+| 2 | 型別 | **`window_ids`** 空 list 時 extractor 回 **None**，不觸發 mismatch（與「有 ids 但較短」區分）。 | 維持現行 extractor 契約。 | 可選：空 list bundle 單測 |
+| 3 | 下游 | 儀表板若只讀 **len** 未讀 mismatch，仍可能誤讀並列欄位。 | 監控規則可 alert **`phase2_shared_backtest_pat_series_ids_mismatch`**。 | mismatch 為 **True** 之單測 |
+
+### STEP 3 — Tester（僅 tests）
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | **`test_collect_summary_phase2_flags_pat_series_ids_mismatch_when_lengths_differ`**、**`test_collect_summary_phase2_omits_mismatch_when_series_and_ids_aligned`**、**`test_collect_summary_phase2_omits_mismatch_when_only_pat_series`** |
+
+**執行**：`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q -p no:langsmith --tb=line`
+
+### STEP 4 — Tester（修實作至全綠）
+
+| 檢查 | 結果（2026-04-19） |
+|------|---------------------|
+| Pytest | `tests/unit/test_precision_uplift_phase1_orchestrator.py`：**191 passed** |
+| Ruff | `collectors.py`、上列測試檔：**通過** |
+
+**Tasklist**：**T10** 真多窗產物鏈仍 **[ ]**。**建議下一輪 Plan**：**`trainer/training/backtester.py`** 寫入 **`test_precision_at_recall_0.01_by_window`**（與可選 **`_window_ids`**）並對齊長度；或 Phase 1 **`EXIT_PHASE1_*`** subprocess smoke。
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**
+
+---
+
+## Precision uplift orchestrator — 共享 backtest PAT 多窗序列 SSOT + `phase2_collect` 摘要（2026-04-18，`cycle_code`）
+
+### STEP 1 — Builder
+
+**背景**：對齊上一輪 STATUS（2026-04-17）「**backtester 多窗 PAT 寫入與 collector**」之**可觀測性／契約第一步**（尚未要求 trainer 實際產出該欄位）；**PLAN.md** 仍為 repo 索引；**DECISION_LOG.md** 本輪無新增條目。
+
+| 檔案 | 說明 |
+|------|------|
+| `investigations/precision_uplift_recall_1pct/orchestrator/evaluators.py` | **`extract_phase2_shared_pat_series_from_backtest_metrics`**、**`extract_phase2_shared_pat_window_ids_from_backtest_metrics`** — 解析 **`model_default.test_precision_at_recall_0.01_by_window`**／**`_window_ids`**（與既有 runner 契約一致） |
+| `investigations/precision_uplift_recall_1pct/orchestrator/runner.py` | **`_preview_precision_at_recall_1pct_series_from_metrics`**／**`_window_ids_*`** 改委派 **`evaluators`**（單一解析 SSOT） |
+| `investigations/precision_uplift_recall_1pct/orchestrator/collectors.py` | **`collect_summary_phase2_plan_for_run_state`**：當 **`backtest_metrics`** 含上列欄位時寫入 **`phase2_shared_backtest_pat_series_len`**、**`phase2_shared_backtest_pat_window_ids_len`** |
+
+**手動驗證**：在 **`phase2_bundle.json`** 的 **`backtest_metrics.model_default`** 手填 **`test_precision_at_recall_0.01_by_window`**（數值 list）後重跑 collect／寫入 **`run_state`**，檢查 **`phase2_collect.phase2_shared_backtest_pat_series_len`** 與 list 長度一致。
+
+**下一步建議**：STEP 2 Reviewer；STEP 3 單元測試；**trainer/backtester** 於真多窗評估時寫入 **`test_precision_at_recall_0.01_by_window`**（仍屬 **T10** backlog）。
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 問題 | 建議 | 希望新增的測試 |
+|---|------|------|------|----------------|
+| 1 | 契約 | **`series`** 與 **`window_ids`** 長度不一致時目前**不**在 summary 驗證；gate／runner 各管各的。 | Runbook 註明「對齊為呼叫端責任」；或 summary 加 **`phase2_shared_backtest_pat_series_ids_mismatch: true`**。 | 長度不等時 summary 仍只反映各自 **len**（可選斷言鍵存在性）。 |
+| 2 | 漂移 | 解析邏輯已集中 **`evaluators`**；若 backtester 改鍵名需同步兩處文件與 **runner** 呼叫點。 | 鍵名常數化（日後 **`PHASE2_BACKTEST_PR1_SERIES_KEY`**）。 | **`test_extract_phase2_shared_pat_series_*`** |
+| 3 | 效能 | 僅掃 ingested JSON，無額外 I/O。 | 維持。 | 無。 |
+
+### STEP 3 — Tester（僅 tests）
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | **`test_extract_phase2_shared_pat_series_from_backtest_metrics_ok`**、**`..._bad_element`**、**`test_extract_phase2_shared_pat_window_ids_from_backtest_metrics`**、**`test_collect_summary_phase2_includes_shared_backtest_pat_series_fields`** |
+
+**執行**：`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q -p no:langsmith --tb=line`
+
+### STEP 4 — Tester（修實作至全綠）
+
+| 檢查 | 結果（2026-04-18） |
+|------|---------------------|
+| Pytest | `tests/unit/test_precision_uplift_phase1_orchestrator.py`：**188 passed** |
+| Ruff | `evaluators.py`、`runner.py`、`collectors.py`、上列測試檔：**通過** |
+
+**Tasklist**：**T10**「產出統一結果結構／每實驗多窗」仍 **[ ]**；本輪完成 **ingested 共享 metrics 多窗 PAT 解析 SSOT** 與 **`run_state.phase2_collect` 可觀測長度**。**建議下一輪 Plan**：**`trainer/training/backtester.py`** 在有多窗評估資料時寫入 **`test_precision_at_recall_0.01_by_window`**；或 Phase 1 **`_main_phase1`** subprocess 對 **`EXIT_PHASE1_*`** 之整合 smoke。
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**
+
+---
+
+## Precision uplift orchestrator — Phase 1 退出碼 **4／5** 具名常數（2026-04-17，`cycle_code`）
+
+### STEP 1 — Builder
+
+**背景**：對齊上一輪 STATUS（2026-04-16）「**Phase 1 之 4／5 具名常數與 Runbook 對照表**」；**PLAN.md** 仍為 repo 索引；**DECISION_LOG.md** 本輪無新增條目。
+
+| 檔案 | 說明 |
+|------|------|
+| `investigations/precision_uplift_recall_1pct/orchestrator/common_exit_codes.py` | 新增 **`EXIT_PHASE1_MID_OR_R1_FAILED`**（**4**）、**`EXIT_PHASE1_BACKTEST_FAILED`**（**5**）；docstring 註明與 Phase 2 **4／5** 整數碰撞、語意不同 |
+| `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py` | **`_main_phase1`** 三處裸 **`return 4`／`return 5`** 改 **`orch_exits.*`** |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | **§1.8.2** 改寫為 **`common_exit_codes`** 具名對照；**5** 列補回 **`phase2_runner_smoke`** 字串（營運／契約測試可 grep） |
+
+**手動驗證**：Phase 1 人為讓 **mid／R1** 失敗 → exit **4**；讓 **backtest** 失敗 → exit **5**（與常數名一致；與 Phase 2 同整數時必讀 **`run_state.steps`**）。
+
+**下一步建議**：STEP 2 Reviewer；STEP 3 碰撞／數值契約測試；**T10** backtester 真多窗 PAT 仍列 backlog。
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 問題 | 建議 | 希望新增的測試 |
+|---|------|------|------|----------------|
+| 1 | 語意 | **`EXIT_PHASE1_BACKTEST_FAILED`** 與 **`EXIT_PHASE2_RUNNER_SMOKE_FAILED`** 同為 **5**，腳本若只 log 整數仍混淆。 | 失敗時 stderr 已含步驟訊息；儀表板應帶 **`phase` + step**。 | **`test_exit_code_four_five_integer_collision_phase1_vs_phase2_documented`** |
+| 2 | 相容性 | 整數未變；既有依 **4／5** 之自動化仍通過。 | 無需改外部腳本。 | **`test_common_exit_codes_phase1_four_five_numeric_contract`** |
+| 3 | Runbook | §1.8.2 精簡後曾遺失 **`phase2_runner_smoke`** 字面，**`test_adhoc_runbook_documents_phase2_error_code_reference`** 失敗。 | 退出碼段落保留 step 關鍵字或同步改測試鍵集合。 | Runbook 含 **`phase2_runner_smoke`**；測試增 **`EXIT_PHASE1_*`** 斷言 |
+
+### STEP 3 — Tester（僅 tests）
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | **`test_common_exit_codes_phase1_four_five_numeric_contract`**、**`test_exit_code_four_five_integer_collision_phase1_vs_phase2_documented`**；**`test_adhoc_runbook_documents_phase2_error_code_reference`** 增 **`EXIT_PHASE1_MID_OR_R1_FAILED`**／**`EXIT_PHASE1_BACKTEST_FAILED`** |
+
+**執行**：`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q -p no:langsmith --tb=line`
+
+### STEP 4 — Tester（修實作至全綠）
+
+| 檢查 | 結果（2026-04-17） |
+|------|---------------------|
+| Pytest | `tests/unit/test_precision_uplift_phase1_orchestrator.py`：**184 passed** |
+| Ruff | `common_exit_codes.py`、`run_pipeline.py`、上列測試檔：**通過** |
+| 補丁 | **Runbook §1.8.2** 補 **`phase2_runner_smoke`** 字面（修復 STEP 3 後之契約測試失敗；非改測試邏輯） |
+
+**Tasklist**：**T10** 真多窗產物鏈仍 **[ ]**。**建議下一輪**：**backtester** 多窗 PAT 寫入與 collector；或 **Phase 1 subprocess** 對 **`EXIT_PHASE1_*`** 之整合 smoke。
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**
+
+---
+
+## Precision uplift orchestrator — `common_exit_codes`（2／3／6）跨 phase1／phase2／all（2026-04-16，`cycle_code`）
+
+### STEP 1 — Builder
+
+**背景**：對齊上一輪 STATUS（2026-04-15）「**Phase 1／`--phase all` 之 2／3／6 是否共用常數**」；**PLAN.md** 仍為 repo 索引；**DECISION_LOG.md** 本輪無新增條目。
+
+| 檔案 | 說明 |
+|------|------|
+| `investigations/precision_uplift_recall_1pct/orchestrator/common_exit_codes.py` | **新建**：**`EXIT_OK`**、**`EXIT_CONFIG_INVALID`**（**2**）、**`EXIT_PREFLIGHT_FAILED`**（**3**）、**`EXIT_DRY_RUN_NOT_READY`**（**6**） |
+| `investigations/precision_uplift_recall_1pct/orchestrator/phase2_exit_codes.py` | 自 **`common_exit_codes`** 再匯出 **2／3／6**；Phase 2 專用 **4／5／7／8／9／10** 不變 |
+| `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py` | **`_main_phase1`**／**`_main_all`**／**`main()`** 之 **2／3／6** 改 **`orch_exits.*`**；**`_main_phase2`** 之 **2／3／6** 改 **`orch_exits`**（與 Phase 2 專用 **`phase2_exits`** 並用） |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | **§1.8.2**：程序退出碼敘述改為 **`common_exit_codes.py`**（跨 phase）+ **`phase2_exit_codes.py`**（Phase 2 專用）；註明 Phase 1 之 **4／5** 與 Phase 2 同整數但語意不同 |
+
+**手動驗證**：
+1. **`--phase phase1`**：無效 config → exit **2**；preflight 失敗 → **3**；dry-run **NOT_READY** → **6**。
+2. **`--phase all --dry-run`**：缺 **`--dry-run`** → **2**；preflight 失敗 → **3**；readiness **NOT_READY** → **6**。
+3. **`python -c "from phase2_exit_codes import EXIT_CONFIG_INVALID; import common_exit_codes as c; assert EXIT_CONFIG_INVALID==c.EXIT_CONFIG_INVALID"`**（於 **`orchestrator/`** 目錄下 **`sys.path`** 含 repo 根時執行）。
+
+**下一步建議**：STEP 2 Reviewer；STEP 3 契約測試；Phase 1 專屬 **4／5** 是否抽具名常數（避免與 Phase 2 **4／5** 語意混淆）列 backlog；**T10** 真多窗 backtester 產物鏈。
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 問題 | 建議 | 希望新增的測試 |
+|---|------|------|------|----------------|
+| 1 | 語意 | **整數 4／5** 在 Phase 1（mid／R1／backtest）與 Phase 2（resume bundle／runner smoke）語意不同；Runbook 已註明，若腳本只比整數仍易誤判。 | 除錯以 **`run_state.steps`** 為準；必要時為 Phase 1 引入 **`EXIT_PHASE1_*`** 別名（數值不變）。 | 無（本輪不變更 **4／5**）。 |
+| 2 | 匯入 | **`phase2_exit_codes`** 依賴 **`common_exit_codes`**；單測 **`sys.path`** 須含 **`orchestrator/`**（現狀已滿足）。 | 維持。 | **`test_common_exit_codes_match_phase2_reexported_shared`**。 |
+| 3 | 循環 | **`common_exit_codes`** 無依賴其他 orchestrator 模組；循環風險低。 | 維持。 | 無。 |
+
+### STEP 3 — Tester（僅 tests）
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | **`import common_exit_codes as orch_exits`**；**`test_common_exit_codes_match_phase2_reexported_shared`**；**`test_run_pipeline_rejects_unsupported_phase`**／**`test_run_state_written_on_preflight_failure`**／**`test_dry_run_cli_not_ready_returns_6_and_writes_readiness`**／**`test_cli_phase_all_without_dry_run_exits_2`** 改對 **`orch_exits`** 斷言；**`test_adhoc_runbook_documents_phase2_error_code_reference`** 增 **`common_exit_codes.py`** |
+
+**執行**：`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q -p no:langsmith --tb=line`
+
+### STEP 4 — Tester（修實作至全綠）
+
+| 檢查 | 結果（2026-04-16） |
+|------|---------------------|
+| Pytest | `tests/unit/test_precision_uplift_phase1_orchestrator.py`：**182 passed** |
+| Ruff | `common_exit_codes.py`、`phase2_exit_codes.py`、`run_pipeline.py`、上列測試檔：**通過**（**`phase2_exit_codes`** 以 **`_common_exit_codes.*` 賦值再匯出** 避免 **F401**） |
+
+**Tasklist**：**T10** 真多窗產物鏈仍 **[ ]**；本輪為 **跨 phase 退出碼 SSOT（2／3／6）**。**建議下一輪**：Phase 1 之 **4／5** 具名常數與 Runbook 對照表；或 **backtester** 多窗 PAT 寫入。
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**
+
+---
+
+## Precision uplift orchestrator — Phase 2 `_main_phase2` exit 2/3/4/6 常數化（2026-04-15，`cycle_code`）
+
+### STEP 1 — Builder
+
+**背景**：對齊上一輪 STATUS（2026-04-12）「**其餘 Phase 2 `return 2/3/4/6` 常數化**」與 **Runbook** 退出碼敘述；**PLAN.md** 仍為 repo 索引；**DECISION_LOG.md** 本輪無新增條目。
+
+| 檔案 | 說明 |
+|------|------|
+| `investigations/precision_uplift_recall_1pct/orchestrator/phase2_exit_codes.py` | 模組 docstring 補充 **`_main_phase2`** 對 **2／3／4／6** 與 **5／7／8／9／10** 之用途；與 Phase 1 重疊整數之契約說明 |
+| `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py` | **`_main_phase2`**：`ConfigValidationError` → **`EXIT_CONFIG_INVALID`**；preflight 失敗 → **`EXIT_PREFLIGHT_FAILED`**；dry-run **NOT_READY** → **`EXIT_DRY_RUN_NOT_READY`**；resume 無法載入 **`phase2_bundle.json`** → **`EXIT_RESUME_BUNDLE_LOAD_FAILED`** |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | **§1.8.2** 程序退出碼段：明寫 **`_main_phase2`** 對 **2／3／4／6** 亦使用 **`phase2_exit_codes`**；**`--phase phase2`** 涵蓋 dry-run |
+
+**手動驗證**：
+1. 故意 Phase 2 YAML 含非空 **`overrides`** → `python .../run_pipeline.py --phase phase2 --config ... --run-id t --dry-run` 預期 exit **2**（與 **`phase2_exit_codes.EXIT_CONFIG_INVALID`** 一致）。
+2. **`--resume`** 且刪除 **`phase2_bundle.json`**（plan 步驟曾成功）→ 預期 exit **4**。
+
+**下一步建議**：STEP 2 Reviewer；STEP 3 以 **`phase2_exits`** 斷言 subprocess／常數數值契約；**Phase 1**／**`--phase all`** 之裸 `return 2/3/6` 是否另抽模組可列 backlog。
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 問題 | 建議 | 希望新增的測試 |
+|---|------|------|------|----------------|
+| 1 | 範圍 | 僅 **`_main_phase2`** 常數化；**Phase 1**／**`main()`** 仍裸 **`return 2`** 等，營運文件若未讀細節可能以為「全 orchestrator」已統一。 | Runbook 已限定 **`_main_phase2`**；或後續抽 **`orchestrator/exit_codes.py`** 共用整數。 | subprocess：**非空 overrides** → **`EXIT_CONFIG_INVALID`**；**resume 缺 bundle** → **`EXIT_RESUME_BUNDLE_LOAD_FAILED`**。 |
+| 2 | 相容性 | 整數值未變；依賴 **magic number** 之腳本仍通過。 | 無需遷移外部腳本。 | 常數 **`== 2`**／**`4`** 之契約單測。 |
+| 3 | 可讀性 | **`collect-only`** 路徑仍 **`return 0`**，與 **0** 成功語意一致。 | 維持。 | 無。 |
+
+### STEP 3 — Tester（僅 tests）
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | **`test_phase2_exit_codes_numeric_contract`**；**`test_run_pipeline_phase2_non_empty_overrides_exits_config_invalid`**；**`test_phase2_resume_missing_bundle_exits_4`** 改對 **`phase2_exits.EXIT_RESUME_BUNDLE_LOAD_FAILED`** 斷言 |
+
+**執行**：`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q -p no:langsmith --tb=line`
+
+### STEP 4 — Tester（修實作至全綠）
+
+| 檢查 | 結果（2026-04-15） |
+|------|---------------------|
+| Pytest | `tests/unit/test_precision_uplift_phase1_orchestrator.py`：**181 passed** |
+| Ruff | `phase2_exit_codes.py`、`run_pipeline.py`、`test_precision_uplift_phase1_orchestrator.py`：**通過**（順手移除 **`test_backtest_smoke_failure_returns_non_ok`** 未使用 **`model_dir`** 以清 **F841**） |
+
+**Tasklist**：**T10**「產出統一結果結構／每實驗多窗」仍 **[ ]**；本輪為 **Phase 2 CLI 退出碼可維護性**。**建議下一輪**：**Phase 1**／**`--phase all`** 之 **2／3／6** 是否共用常數；**backtester** 真多窗 PAT 寫入。
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**
+
+---
+
 ## Precision uplift orchestrator — T10A trainer_params whitelist（2026-04-11，STEP 1 Builder）
 
 ### 背景

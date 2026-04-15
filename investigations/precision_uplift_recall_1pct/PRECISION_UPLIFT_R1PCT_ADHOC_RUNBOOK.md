@@ -59,6 +59,13 @@
   - 來源：`run_r1_r6_analysis.py` payload（`n_censored_excluded`、`precision_at_recall_target`）+ 高分 FP 抽樣
 - `phase1/point_in_time_parity_check.md`
   - 來源：scorer/validator 時戳與標籤成熟規則對照
+  - **現況說明（MVP）**：orchestrator 目前預設輸出 scaffold + 人工核對清單；不會自動填入 parity 指標
+  - **判讀規則**：若只有 checklist、無量化指標，僅可視為「待人工審核」，不得視為 parity pass
+  - **開發目標（下一步）**：新增 `PIT parity metrics (auto)` 區塊，至少含 `scored_at_in_window_ratio`、`validated_at_non_null_ratio`、`alerts_vs_prediction_log_gap`、`status`、`reasons`
+
+**PIT parity mode（建議先落地）**
+- `WARN_ONLY`（預設）：parity 異常不阻斷 gate，但 `phase1_gate_decision.md` 必須標註 `pit_status=warn/fail`
+- `STRICT`：parity 異常直接阻斷，Phase 1 Gate 不得 `PASS`
 - `phase1/upper_bound_repro.md`
   - 來源：`trainer/out_backtest/backtest_metrics.json` + baseline 指標
 - `phase1/phase1_gate_decision.md`
@@ -151,7 +158,7 @@ python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py 
 | **`E_PHASE2_PER_JOB_BACKTEST_JOBS`** | **`phase2_per_job_backtest_jobs`** 整批未全成功；細因見 **`errors[]`** 或各 job 結果列。 |
 | **`E_CONFIG_INVALID`** | Phase 2 YAML／bundle 與 **`config_loader.validate_phase2_config`** 不合（如非空 **`overrides`**、未知 **`trainer_params`**）。 |
 
-**程序退出碼（`--phase phase2`，非 dry-run／非 collect-only）**：與上表**字串** `error_code` 不同；**整數**定義之 SSOT 為 **`orchestrator/phase2_exit_codes.py`**。常見對照：**5** → **`phase2_runner_smoke`** 失敗；**7** → **`phase2_trainer_jobs`** 未全成功；**8** → **`phase2_per_job_backtest_jobs`** 或 **`phase2_backtest_jobs`** 失敗路徑；**9**／**10** → 已開 **`--phase2-fail-on-gate-fail`**／**`--phase2-fail-on-gate-blocked`** 且 gate 為 **FAIL**／**BLOCKED**。其餘（**2** 設定、**3** preflight、**4** resume 載入 bundle、**6** dry-run **NOT_READY** 等）見 **`run_pipeline.py`**。
+**程序退出碼**：與上表**字串** `error_code` 不同。**`orchestrator/common_exit_codes.py`**：**2**（**`EXIT_CONFIG_INVALID`**）、**3**（**`EXIT_PREFLIGHT_FAILED`**）、**6**（**`EXIT_DRY_RUN_NOT_READY`**）跨 **`--phase phase1`／`phase2`／`all`**；Phase 1 另含具名常數 **4**＝**`EXIT_PHASE1_MID_OR_R1_FAILED`**（mid／R1 步驟）、**5**＝**`EXIT_PHASE1_BACKTEST_FAILED`**（Phase 1 backtest 步驟）。**`orchestrator/phase2_exit_codes.py`**：**4**＝**`EXIT_RESUME_BUNDLE_LOAD_FAILED`**（resume 無法載入 **`phase2_bundle.json`**）、**5**＝**`EXIT_PHASE2_RUNNER_SMOKE_FAILED`**（典型失敗步驟名 **`phase2_runner_smoke`**）、**7**／**8**／**9**／**10** 等同上表 Phase 2 列。**整數 4／5** 在 Phase 1 與 Phase 2 語意不同；除錯必讀 **`run_state.steps`** 與 stderr。
 
 **觀測**：**`run_state.phase2_collect.phase2_pat_matrix_yaml_experiment_count`** 僅統計 YAML 已宣告 **`precision_at_recall_1pct_by_window`** 的實驗數，與 runner 是否已產出真多窗矩陣無必然相等關係（見 Tasklist **T10** 收尾項）。
 
@@ -429,6 +436,17 @@ phase_configs:
 - `PRELIMINARY`：達到最短時長（48h）但未達建議樣本量。
 - `PASS`：達到建議時長與樣本量，且自動產生的 mid/final R1 方向一致。
 - `FAIL`：關鍵資料缺失、口徑衝突、或指標明確不達條件。
+
+**Phase 1 parity 補充（避免誤判）**
+- 目前 MVP Gate 可在 parity 檔僅為 scaffold 時仍回傳 `PASS`；此 `PASS` 僅代表現行 gate 規則通過。
+- 若要升級為決策級結論，請先補齊可機械驗證的 parity 指標，再判定是否可進下一階段。
+
+**Phase 1 parity 建議閾值（初版）**
+- `min_scored_at_in_window_ratio = 0.995`
+- `min_validated_at_non_null_ratio = 0.995`
+- `max_alert_prediction_gap_abs = 100`
+
+> 這三個閾值是「先可運行」版本，後續可依實際資料穩定度調整；不要在未收斂前過度收緊，避免在筆電長跑時頻繁誤阻斷。
 
 補充（Phase 2~4）：
 

@@ -57,7 +57,7 @@
 - [ ] 建立 `phase1/status_history_crosscheck.md`（含沿用/重驗/失效分類）
 - [ ] 產出 `phase1/slice_performance_report.md`
 - [ ] 產出 `phase1/label_noise_audit.md`
-- [ ] 產出 `phase1/point_in_time_parity_check.md`
+- [ ] 產出 `phase1/point_in_time_parity_check.md`（若為 MVP orchestrator 產物，預期僅 scaffold + 人工核對清單）
 - [ ] 產出 `phase1/upper_bound_repro.md`
 - [ ] 產出 `phase1/phase1_gate_decision.md`
 
@@ -65,6 +65,13 @@
 - [ ] 已完成「模型能力 vs 標籤/資料契約」主因排序
 - [ ] 已完成 `STATUS.md` 歷史對照
 - [ ] 已決定是否啟動重排（先資料修復、後模型擴張）
+- [ ] 若宣稱「PIT parity 已通過」，需附可機械驗證指標；僅 scaffold 不得當作 parity 已驗證
+
+**PIT parity 最小門檻（Phase 1 決策級）**
+- [ ] `scored_at_in_window_ratio >= 0.995`
+- [ ] `validated_at_non_null_ratio >= 0.995`
+- [ ] `abs(alerts_vs_prediction_log_gap) <= 100`
+- [ ] 任一門檻不達：至少標記 `WARN`；若 mode=`STRICT`，不得給 `PASS`
 
 **交付物路徑**
 - `phase1/status_history_crosscheck.md`
@@ -330,7 +337,7 @@ python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py 
 
 | Phase | 最短時長（僅初判） | 建議時長（可決策） | 可下結論條件（至少滿足） |
 | :--- | :--- | :--- | :--- |
-| Phase 1 | 48h | 72~120h（3~5 天） | finalized alerts >= 800（理想 >=1000）、TP >= 30、R1/R6 兩次方向一致、可完成主因排序 |
+| Phase 1 | 48h | 72~120h（3~5 天） | finalized alerts >= 800（理想 >=1000）、TP >= 30、R1/R6 兩次方向一致、可完成主因排序；若要宣稱決策級結論，PIT parity 需有機械檢核證據（非僅 checklist） |
 | Phase 2 | 2~3 天 | 4~7 天 | 至少 1 條 A/B/C 路線 uplift +3~5pp，且至少 2 個時間窗非單窗幻覺 |
 | Phase 3 | 3 天 | 5~8 天 | 相對 Phase 2 勝者再提升，且切片改善與穩定性同時成立 |
 | Phase 4 | 2~3 天 | 4~7 天 | 多窗回放仍達標（`precision@recall=1% >= 60%`），且無重大切片退化 |
@@ -353,7 +360,7 @@ python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py 
 | P1-2 | 啟動 validator 長跑：`python -m trainer.validator` | `validation_results`、`validator_metrics` 持續增長 | `validator_metrics insert failed`、finalized 長期不增 |
 | P1-3 | 中途健康檢查（建議 T+6h）：`python investigations/test_vs_production/checks/run_r1_r6_analysis.py --mode all --pretty ...` | `snapshots/*.csv` + JSON payload（含 `n_censored_excluded`、`precision_at_recall_target`） | `sample CSV contains no bet_id rows`、`prediction_log table not found` |
 | P1-4 | 觀測期末再跑一次 R1/R6 + 固定窗 backtest | 最終 payload + `trainer/out_backtest/backtest_metrics.json` | 與中途結果方向劇烈反轉、樣本不足 |
-| P1-5 | 回填 Phase 1 六份工件 | `phase1/*.md` 全部完成 | 任一工件缺主證據、口徑不一致 |
+| P1-5 | 回填 Phase 1 六份工件（含 PIT parity auto 指標或明確標記為人工待核） | `phase1/*.md` 全部完成 | 任一工件缺主證據、口徑不一致 |
 
 > Autonomous 模式下，P1-1~P1-5 由 orchestrator 自動完成；手動命令僅作 fallback。
 
@@ -361,6 +368,8 @@ python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py 
 
 - 可進 Phase 2：主瓶頸排序完成，且非單窗幻覺。
 - 需重排：若 `label_noise_audit` 指向 delayed/censored/契約問題為主瓶頸，先修資料流程再做模型衝刺。
+
+> 注意（MVP 現況）：`point_in_time_parity_check.md` 在現行 orchestrator 可能僅為 scaffold。若未附自動指標，不應解讀為「PIT parity 已驗證通過」。
 
 ### 10.4 Phase 2 Runbook（A/B/C 路線並行比較）
 

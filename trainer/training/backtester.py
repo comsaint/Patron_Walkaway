@@ -26,10 +26,11 @@ from __future__ import annotations
 import argparse
 from importlib import import_module as _import_module_threshold_selection
 import json
+import math
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, MutableMapping, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -476,6 +477,86 @@ def compute_macro_by_gaming_day_metrics(
 # Combined + per-track metrics helper (reduces duplicate metric calls — R1204)
 # ---------------------------------------------------------------------------
 
+def _build_pat_recall_1pct_series_from_gaming_day(
+    rated_sub: pd.DataFrame,
+) -> Optional[Tuple[List[float], List[str]]]:
+    """Build true multi-window PAT@1% series from ``gaming_day`` groups.
+
+    Returns ``(series, window_ids)`` only when at least one gaming-day bucket has
+    a finite ``test_precision_at_recall_0.01``; otherwise returns ``None``.
+    """
+    if rated_sub.empty or "gaming_day" not in rated_sub.columns:
+        return None
+
+    work = rated_sub.loc[:, ["gaming_day", "label", "score", "is_rated"]].copy()
+    work = work[work["gaming_day"].notna()]
+    if work.empty:
+        return None
+
+    work = work.sort_values("gaming_day")
+    series: List[float] = []
+    window_ids: List[str] = []
+    for gaming_day, grp in work.groupby("gaming_day", sort=True):
+        metrics = compute_micro_metrics(grp, threshold=0.5, window_hours=None)
+        pat_1pct = metrics.get("test_precision_at_recall_0.01")
+        if pat_1pct is None:
+            continue
+        try:
+            v = float(pat_1pct)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(v):
+            continue
+        series.append(v)
+        window_ids.append(str(gaming_day))
+
+    if not series:
+        return None
+    return series, window_ids
+
+def _attach_single_window_pat_at_recall_bridge(
+    section_metrics: dict[str, Any],
+    *,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> None:
+    """Duplicate scalar PAT@1% as a one-point series for precision-uplift orchestrator (T10 bridge).
+
+    When ``test_precision_at_recall_0.01`` is a finite float and
+    ``test_precision_at_recall_0.01_by_window`` is not already set, add aligned
+    ``test_precision_at_recall_0.01_by_window`` and
+    ``test_precision_at_recall_0.01_window_ids`` so ``phase2_collect`` can surface
+    shared PAT lengths without true multi-window evaluation yet.
+    """
+    if section_metrics.get("test_precision_at_recall_0.01_by_window") is not None:
+        return
+    raw = section_metrics.get("test_precision_at_recall_0.01")
+    if raw is None:
+        return
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(v):
+        return
+    section_metrics["test_precision_at_recall_0.01_by_window"] = [v]
+    section_metrics["test_precision_at_recall_0.01_window_ids"] = [
+        f"{window_start_iso}->{window_end_iso}"
+    ]
+
+
+def _apply_pat_at_recall_bridges_for_json_sections(results: MutableMapping[str, Any]) -> None:
+    """Apply :func:`_attach_single_window_pat_at_recall_bridge` to ``model_default`` and ``optuna``."""
+    ws = str(results.get("window_start", ""))
+    we = str(results.get("window_end", ""))
+    for _key in ("model_default", "optuna"):
+        _sec = results.get(_key)
+        if isinstance(_sec, dict):
+            _attach_single_window_pat_at_recall_bridge(
+                _sec, window_start_iso=ws, window_end_iso=we
+            )
+
+
 def _compute_section_metrics(
     labeled: pd.DataFrame,
     rated_sub: pd.DataFrame,
@@ -494,26 +575,34 @@ def _compute_section_metrics(
     nest; backtest_metrics.json model_default/optuna are flat).
     """
     rated_micro = compute_micro_metrics(rated_sub, threshold, window_hours)
-    return {
+    out = {
         **rated_micro,
         "rated_threshold": threshold,
     }
+    by_day = _build_pat_recall_1pct_series_from_gaming_day(rated_sub)
+    if by_day is not None:
+        out["test_precision_at_recall_0.01_by_window"] = by_day[0]
+        out["test_precision_at_recall_0.01_window_ids"] = by_day[1]
+    return out
 
 
-def _flat_section_to_mlflow_metrics(flat: Dict[str, Any]) -> Dict[str, Any]:
-    """Map backtest flat metrics (JSON keys) to MLflow keys (Unified Plan v2: ``backtest_*``)."""
+def _flat_section_to_mlflow_metrics(
+    flat: Dict[str, Any],
+    metric_prefix: str = "backtest_",
+) -> Dict[str, Any]:
+    """Map flat backtest metrics (JSON keys) to MLflow keys with a caller-provided prefix."""
     out: Dict[str, Any] = {}
     for key, val in flat.items():
         if val is None:
             continue
         if key == "threshold":
-            out["backtest_threshold"] = val
+            out[f"{metric_prefix}threshold"] = val
         elif key == "rated_threshold":
-            out["backtest_rated_threshold"] = val
+            out[f"{metric_prefix}rated_threshold"] = val
         elif key.startswith("test_"):
-            out["backtest_" + key[len("test_") :]] = val
+            out[f"{metric_prefix}{key[len('test_') : ]}"] = val
         elif key in ("alerts", "alerts_per_hour"):
-            out["backtest_" + key] = val
+            out[f"{metric_prefix}{key}"] = val
     return out
 
 
@@ -853,6 +942,8 @@ def backtest(
     alerts_path = out_root / "backtest_alerts.csv"
     alerts_df.to_csv(alerts_path, index=False)
 
+    _apply_pat_at_recall_bridges_for_json_sections(results)
+
     metrics_path = out_root / "backtest_metrics.json"
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, default=str)
@@ -861,6 +952,14 @@ def backtest(
         _md = results.get("model_default")
         if isinstance(_md, dict):
             log_metrics_safe(_flat_section_to_mlflow_metrics(_md))
+        _opt = results.get("optuna")
+        if isinstance(_opt, dict):
+            log_metrics_safe(
+                _flat_section_to_mlflow_metrics(
+                    _opt,
+                    metric_prefix="backtest_optuna_",
+                )
+            )
 
     results["predictions_path"] = str(pred_path)
     results["alerts_path"] = str(alerts_path)

@@ -459,6 +459,83 @@ def _collect_state_db_window_stats(
         conn.close()
 
 
+def _safe_ratio(num: int, den: int) -> float | None:
+    """Return ``num / den`` when denominator is positive; else ``None``."""
+    if den <= 0:
+        return None
+    return float(num) / float(den)
+
+
+def _collect_phase1_pit_parity(
+    prediction_log_db: Path,
+    state_db: Path,
+    window: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Collect Phase 1 PIT parity diagnostics (MVP auto metrics, non-blocking)."""
+    start_ts = str(window.get("start_ts", ""))
+    end_ts = str(window.get("end_ts", ""))
+    out: dict[str, Any] = {
+        "status": "ok",
+        "window_start_ts": start_ts,
+        "window_end_ts": end_ts,
+        "scored_at_in_window_ratio": None,
+        "validated_at_non_null_ratio": None,
+        "alerts_vs_prediction_log_gap": None,
+        "window_timezone_mismatch_count": None,
+        "reasons": [],
+        "note": "MVP auto diagnostics; timezone mismatch count unavailable without explicit tz column contract.",
+    }
+
+    reasons: list[str] = []
+    if prediction_log_db.is_file():
+        try:
+            with sqlite3.connect(f"file:{prediction_log_db}?mode=ro", uri=True) as conn:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(prediction_log)").fetchall()}
+                if "scored_at" in cols:
+                    n_scored = int(conn.execute("SELECT COUNT(*) FROM prediction_log WHERE TRIM(COALESCE(scored_at, '')) != ''").fetchone()[0])
+                    n_scored_in = int(conn.execute("SELECT COUNT(*) FROM prediction_log WHERE scored_at >= ? AND scored_at < ? AND TRIM(COALESCE(scored_at, '')) != ''", (start_ts, end_ts)).fetchone()[0])
+                    out["scored_at_in_window_ratio"] = _safe_ratio(n_scored_in, n_scored)
+                else:
+                    reasons.append("prediction_log_missing_scored_at")
+                if "scored_at" in cols and "is_alert" in cols:
+                    n_pl_alerts = int(conn.execute("SELECT COUNT(*) FROM prediction_log WHERE scored_at >= ? AND scored_at < ? AND is_alert = 1", (start_ts, end_ts)).fetchone()[0])
+                    out["alerts_vs_prediction_log_gap"] = -n_pl_alerts
+                else:
+                    reasons.append("prediction_log_missing_is_alert_or_scored_at")
+        except sqlite3.Error:
+            reasons.append("prediction_log_db_unavailable")
+    else:
+        reasons.append("prediction_log_db_not_found")
+
+    if state_db.is_file():
+        try:
+            with sqlite3.connect(f"file:{state_db}?mode=ro", uri=True) as conn:
+                vcols = {row[1] for row in conn.execute("PRAGMA table_info(validation_results)").fetchall()}
+                if "validated_at" in vcols:
+                    n_rows = int(conn.execute("SELECT COUNT(*) FROM validation_results").fetchone()[0])
+                    n_valid = int(conn.execute("SELECT COUNT(*) FROM validation_results WHERE TRIM(COALESCE(validated_at, '')) != ''").fetchone()[0])
+                    out["validated_at_non_null_ratio"] = _safe_ratio(n_valid, n_rows)
+                else:
+                    reasons.append("validation_results_missing_validated_at")
+                acols = {row[1] for row in conn.execute("PRAGMA table_info(alerts)").fetchall()}
+                if "ts" in acols:
+                    n_alerts = int(conn.execute("SELECT COUNT(*) FROM alerts WHERE ts >= ? AND ts < ?", (start_ts, end_ts)).fetchone()[0])
+                    gap = out.get("alerts_vs_prediction_log_gap")
+                    if isinstance(gap, int):
+                        out["alerts_vs_prediction_log_gap"] = int(gap + n_alerts)
+                else:
+                    reasons.append("alerts_missing_ts")
+        except sqlite3.Error:
+            reasons.append("state_db_unavailable_for_pit")
+    else:
+        reasons.append("state_db_not_found_for_pit")
+
+    out["reasons"] = reasons
+    if reasons:
+        out["status"] = "warn"
+    return out
+
+
 def collect_phase1_artifacts(
     run_id: str,
     cfg: Mapping[str, Any] | None = None,
@@ -526,7 +603,18 @@ def collect_phase1_artifacts(
     window = cfg_d.get("window") or {}
     state_db_raw = cfg_d.get("state_db_path", "")
     state_db_path = _resolve_under_root(root, str(state_db_raw)) if state_db_raw else Path()
+    prediction_db_raw = cfg_d.get("prediction_log_db_path", "")
+    prediction_db_path = (
+        _resolve_under_root(root, str(prediction_db_raw))
+        if prediction_db_raw
+        else Path()
+    )
     state_stats = _collect_state_db_window_stats(state_db_path, window, errors)
+    pit_parity = _collect_phase1_pit_parity(
+        prediction_db_path,
+        state_db_path,
+        window if isinstance(window, Mapping) else {},
+    )
 
     bundle: dict[str, Any] = {
         "run_id": run_id,
@@ -545,6 +633,7 @@ def collect_phase1_artifacts(
         },
         "r1_r6_mid_snapshots": mid_rows,
         "state_db_stats": state_stats,
+        "pit_parity": pit_parity,
         "thresholds": dict(cfg_d.get("thresholds") or {}),
         "window": dict(window) if isinstance(window, Mapping) else {},
     }
@@ -830,6 +919,23 @@ def collect_summary_phase2_plan_for_run_state(
         res = pjb.get("results")
         out["per_job_backtest_jobs_count"] = len(res) if isinstance(res, list) else 0
     out["phase2_has_backtest_metrics"] = bundle.get("backtest_metrics") is not None
+    bm_sum = bundle.get("backtest_metrics")
+    ser_shared = evaluators.extract_phase2_shared_pat_series_from_backtest_metrics(
+        bm_sum if isinstance(bm_sum, Mapping) else None
+    )
+    if ser_shared is not None:
+        out["phase2_shared_backtest_pat_series_len"] = len(ser_shared)
+    wid_shared = evaluators.extract_phase2_shared_pat_window_ids_from_backtest_metrics(
+        bm_sum if isinstance(bm_sum, Mapping) else None
+    )
+    if wid_shared is not None:
+        out["phase2_shared_backtest_pat_window_ids_len"] = len(wid_shared)
+    if (
+        ser_shared is not None
+        and wid_shared is not None
+        and len(ser_shared) != len(wid_shared)
+    ):
+        out["phase2_shared_backtest_pat_series_ids_mismatch"] = True
     root_ps = bundle.get("phase2_pat_series_by_experiment")
     pjb_sum = bundle.get("per_job_backtest_jobs")
     if phase2_pat_series_mapping_has_evaluable_series(root_ps):
@@ -1024,6 +1130,7 @@ def collect_summary_for_run_state(bundle: Mapping[str, Any]) -> dict[str, Any]:
     r1f = bundle.get("r1_r6_final") if isinstance(bundle.get("r1_r6_final"), dict) else {}
     r1m = bundle.get("r1_r6_mid") if isinstance(bundle.get("r1_r6_mid"), dict) else {}
     stats = bundle.get("state_db_stats") if isinstance(bundle.get("state_db_stats"), dict) else {}
+    pit = bundle.get("pit_parity") if isinstance(bundle.get("pit_parity"), dict) else {}
     return {
         "error_count": len(bundle.get("errors") or []),
         "error_codes": [e.get("code", "") for e in (bundle.get("errors") or [])],
@@ -1032,4 +1139,7 @@ def collect_summary_for_run_state(bundle: Mapping[str, Any]) -> dict[str, Any]:
         "has_r1_mid_payload": r1m.get("payload") is not None,
         "finalized_alerts_count": stats.get("finalized_alerts_count"),
         "finalized_true_positives_count": stats.get("finalized_true_positives_count"),
+        "pit_parity_status": pit.get("status"),
+        "pit_scored_at_in_window_ratio": pit.get("scored_at_in_window_ratio"),
+        "pit_validated_at_non_null_ratio": pit.get("validated_at_non_null_ratio"),
     }

@@ -24,6 +24,7 @@ if str(_ORCHESTRATOR_DIR) not in sys.path:
     sys.path.insert(0, str(_ORCHESTRATOR_DIR))
 
 import collectors  # noqa: E402
+import common_exit_codes as orch_exits  # noqa: E402
 import config_loader  # noqa: E402
 import evaluators  # noqa: E402
 import phase2_exit_codes as phase2_exits  # noqa: E402
@@ -1045,7 +1046,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
         cfg = config_loader.load_phase1_config(config_path)
     except config_loader.ConfigValidationError as exc:
         print(str(exc), file=sys.stderr)
-        return 2
+        return orch_exits.EXIT_CONFIG_INVALID
 
     state_file = _state_path(args.run_id)
     prev_state = _load_run_state(state_file) if args.resume else None
@@ -1094,7 +1095,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
 
     if not preflight.get("ok"):
         print(preflight.get("message") or "preflight failed", file=sys.stderr)
-        return 3
+        return orch_exits.EXIT_PREFLIGHT_FAILED
 
     if args.dry_run:
         readiness = run_dry_run_readiness(
@@ -1121,7 +1122,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
                 "dry-run NOT_READY: " + ", ".join(readiness["blocking_reasons"]),
                 file=sys.stderr,
             )
-            return 6
+            return orch_exits.EXIT_DRY_RUN_NOT_READY
         return 0
 
     prev_steps: dict[str, Any] = (
@@ -1201,7 +1202,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
                         or "r1_r6_mid_snapshot failed",
                         file=sys.stderr,
                     )
-                    return 4
+                    return orch_exits.EXIT_PHASE1_MID_OR_R1_FAILED
 
         if not skip_r1:
             t_r1 = _mark_step_running(merged, "r1_r6_analysis")
@@ -1214,7 +1215,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
                     r1.get("message") or r1.get("error_code") or "r1_r6_analysis failed",
                     file=sys.stderr,
                 )
-                return 4
+                return orch_exits.EXIT_PHASE1_MID_OR_R1_FAILED
 
         if not skip_bt:
             t_bt = _mark_step_running(merged, "backtest")
@@ -1227,7 +1228,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
                     bt.get("message") or bt.get("error_code") or "backtest failed",
                     file=sys.stderr,
                 )
-                return 5
+                return orch_exits.EXIT_PHASE1_BACKTEST_FAILED
 
     bundle = collectors.collect_phase1_artifacts(
         args.run_id,
@@ -1290,7 +1291,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
         cfg = config_loader.load_phase2_config(config_path, cli_run_id=args.run_id)
     except config_loader.ConfigValidationError as exc:
         print(str(exc), file=sys.stderr)
-        return 2
+        return orch_exits.EXIT_CONFIG_INVALID
 
     state_file = _state_path(args.run_id)
     prev_state = _load_run_state(state_file) if args.resume else None
@@ -1339,7 +1340,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
 
     if not preflight.get("ok"):
         print(preflight.get("message") or "preflight failed", file=sys.stderr)
-        return 3
+        return orch_exits.EXIT_PREFLIGHT_FAILED
 
     phase2_reports_dir = investigation_reports_subdir(args.run_id, "phase2")
 
@@ -1368,7 +1369,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
                 "dry-run NOT_READY: " + ", ".join(readiness["blocking_reasons"]),
                 file=sys.stderr,
             )
-            return 6
+            return orch_exits.EXIT_DRY_RUN_NOT_READY
         return 0
 
     if args.collect_only:
@@ -1434,7 +1435,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
                 f"orchestrator: cannot load phase2_bundle.json for resume: {exc}",
                 file=sys.stderr,
             )
-            return 4
+            return phase2_exits.EXIT_RESUME_BUNDLE_LOAD_FAILED
 
     skip_runner_smoke = resume_ok and _step_success(prev_steps, "phase2_runner_smoke")
     if not skip_runner_smoke:
@@ -2036,14 +2037,14 @@ def _main_all(args: argparse.Namespace, config_path: Path) -> int:
             "(full autonomous execution is not implemented yet)",
             file=sys.stderr,
         )
-        return 2
+        return orch_exits.EXIT_CONFIG_INVALID
 
     if args.collect_only:
         print(
             "orchestrator: --phase all does not support --collect-only",
             file=sys.stderr,
         )
-        return 2
+        return orch_exits.EXIT_CONFIG_INVALID
 
     try:
         rf_cfg = config_loader.load_run_full_config(
@@ -2051,7 +2052,7 @@ def _main_all(args: argparse.Namespace, config_path: Path) -> int:
         )
     except config_loader.ConfigValidationError as exc:
         print(str(exc), file=sys.stderr)
-        return 2
+        return orch_exits.EXIT_CONFIG_INVALID
 
     pc = rf_cfg["phase_configs"]
     resolved_paths: dict[str, Path] = {
@@ -2098,7 +2099,7 @@ def _main_all(args: argparse.Namespace, config_path: Path) -> int:
             cfg1 = config_loader.load_phase1_config(resolved_paths["phase1"])
         except config_loader.ConfigValidationError as exc:
             print(str(exc), file=sys.stderr)
-            return 2
+            return orch_exits.EXIT_CONFIG_INVALID
         preflight = runner.run_preflight(
             _REPO_ROOT,
             cfg1,
@@ -2114,7 +2115,7 @@ def _main_all(args: argparse.Namespace, config_path: Path) -> int:
 
     if not preflight.get("ok"):
         print(preflight.get("message") or "preflight failed", file=sys.stderr)
-        return 3
+        return orch_exits.EXIT_PREFLIGHT_FAILED
 
     readiness = run_all_phases_dry_run_readiness(
         _REPO_ROOT,
@@ -2150,7 +2151,7 @@ def _main_all(args: argparse.Namespace, config_path: Path) -> int:
             "dry-run NOT_READY: " + ", ".join(readiness["blocking_reasons"]),
             file=sys.stderr,
         )
-        return 6
+        return orch_exits.EXIT_DRY_RUN_NOT_READY
     return 0
 
 
@@ -2173,7 +2174,7 @@ def main(argv: list[str] | None = None) -> int:
         "(supported: phase1, phase2, all)",
         file=sys.stderr,
     )
-    return 2
+    return orch_exits.EXIT_CONFIG_INVALID
 
 
 if __name__ == "__main__":

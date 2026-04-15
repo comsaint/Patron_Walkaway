@@ -26,6 +26,11 @@ thresholds:
   min_finalized_true_positives_gate: 50
   # Optional: absolute |pat_mid - pat_final| above this → FAIL (default 0.15 in code)
   # gate_pat_abs_tolerance: 0.15
+  # Optional (P1 PIT parity MVP, currently for report/diagnostics wiring):
+  # pit_parity_mode: WARN_ONLY  # STRICT / WARN_ONLY (gate enforcement to be wired)
+  # min_scored_at_in_window_ratio: 0.995
+  # min_validated_at_non_null_ratio: 0.995
+  # max_alert_prediction_gap_abs: 100
 
 # Optional mid/final checkpoint policy for Phase 1.
 # Mid snapshot runs once from window.start_ts to midpoint (ratio in (0,1)).

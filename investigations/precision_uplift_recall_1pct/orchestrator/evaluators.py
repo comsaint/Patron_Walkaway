@@ -85,6 +85,12 @@ def _threshold_float(t: Mapping[str, Any], key: str, default: float) -> float:
         return default
 
 
+def _threshold_mode(t: Mapping[str, Any], key: str, default: str) -> str:
+    """Parse mode string from thresholds and normalize to upper-case."""
+    raw = str(t.get(key, default) or default).strip().upper()
+    return raw if raw in {"STRICT", "WARN_ONLY"} else str(default).strip().upper()
+
+
 def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
     """Compute gate status, blocking reasons, and evidence summary.
 
@@ -120,6 +126,10 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
     gate_fin = _threshold_int(thr, "min_finalized_alerts_gate", 800)
     gate_tp = _threshold_int(thr, "min_finalized_true_positives_gate", 50)
     pat_tol = _threshold_float(thr, "gate_pat_abs_tolerance", DEFAULT_PAT_ABS_TOL)
+    pit_mode = _threshold_mode(thr, "pit_parity_mode", "WARN_ONLY")
+    pit_min_scored_ratio = _threshold_float(thr, "min_scored_at_in_window_ratio", 0.995)
+    pit_min_validated_ratio = _threshold_float(thr, "min_validated_at_non_null_ratio", 0.995)
+    pit_max_gap_abs = _threshold_float(thr, "max_alert_prediction_gap_abs", 100.0)
 
     hours = window_duration_hours(window)
 
@@ -152,6 +162,21 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
         if v is not None:
             mid_pats.append(float(v))
 
+    pit = bundle.get("pit_parity") if isinstance(bundle.get("pit_parity"), Mapping) else {}
+    pit_status = str(pit.get("status") or "unknown")
+    pit_scored_ratio = pit.get("scored_at_in_window_ratio")
+    pit_valid_ratio = pit.get("validated_at_non_null_ratio")
+    pit_gap = pit.get("alerts_vs_prediction_log_gap")
+    pit_violations: list[str] = []
+    if isinstance(pit_scored_ratio, (int, float)) and float(pit_scored_ratio) < pit_min_scored_ratio:
+        pit_violations.append("pit_scored_at_in_window_ratio_below_threshold")
+    if isinstance(pit_valid_ratio, (int, float)) and float(pit_valid_ratio) < pit_min_validated_ratio:
+        pit_violations.append("pit_validated_at_non_null_ratio_below_threshold")
+    if isinstance(pit_gap, (int, float)) and abs(float(pit_gap)) > pit_max_gap_abs:
+        pit_violations.append("pit_alert_prediction_gap_exceeds_threshold")
+    if pit_status.lower() == "fail":
+        pit_violations.append("pit_status_fail")
+
     metrics: dict[str, Any] = {
         "window_hours": round(hours, 4),
         "finalized_alerts_count": n_fin_i,
@@ -161,6 +186,12 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
         "precision_at_target_recall_mid_snapshots": mid_pats or None,
         "mid_snapshot_count": len(mid_rows_obj),
         "has_backtest_metrics": bundle.get("backtest_metrics") is not None,
+        "pit_parity_status": pit_status,
+        "pit_scored_at_in_window_ratio": pit_scored_ratio,
+        "pit_validated_at_non_null_ratio": pit_valid_ratio,
+        "pit_alerts_vs_prediction_log_gap": pit_gap,
+        "pit_parity_violation_count": len(pit_violations),
+        "pit_parity_mode": pit_mode,
     }
 
     def _evidence() -> str:
@@ -175,6 +206,9 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
             parts.append(f"pat@r_mid={pat_mid:.4f}")
         if mid_pats:
             parts.append(f"pat@r_mid_n={len(mid_pats)}")
+        parts.append(f"pit_status={pit_status}")
+        if pit_violations:
+            parts.append(f"pit_violation_n={len(pit_violations)}")
         return "; ".join(parts)
 
     err_list = bundle.get("errors") or []
@@ -272,6 +306,16 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
 
     if abs(pat_final - pat_mid) > pat_tol:
         reasons.append("r1_mid_final_precision_at_target_recall_divergence")
+        return {
+            "status": "FAIL",
+            "blocking_reasons": reasons,
+            "evidence_summary": _evidence(),
+            "metrics": metrics,
+        }
+
+    if pit_violations and pit_mode == "STRICT":
+        reasons.append("pit_parity_violation")
+        reasons.extend(pit_violations)
         return {
             "status": "FAIL",
             "blocking_reasons": reasons,
@@ -1036,6 +1080,48 @@ def extract_phase2_shared_precision_at_recall_1pct(
         return float(raw)
     except (TypeError, ValueError):
         return None
+
+
+def extract_phase2_shared_pat_series_from_backtest_metrics(
+    backtest_metrics: Mapping[str, Any] | None,
+) -> list[float] | None:
+    """Optional multi-window PAT @ recall 1% from ingested ``backtest_metrics``.
+
+    Contract (T10 incremental): ``model_default.test_precision_at_recall_0.01_by_window``
+    as a non-empty list of numeric values in [0, 1]-scale (same scale as
+    ``PHASE2_BACKTEST_PR1_KEY`` scalar). Used by per-job preview ingestion and
+    ``collect_summary_phase2_plan_for_run_state`` observability.
+    """
+    if not isinstance(backtest_metrics, Mapping):
+        return None
+    md = backtest_metrics.get("model_default")
+    if not isinstance(md, Mapping):
+        return None
+    raw = md.get("test_precision_at_recall_0.01_by_window")
+    if not isinstance(raw, list) or not raw:
+        return None
+    out: list[float] = []
+    for x in raw:
+        try:
+            out.append(float(x))
+        except (TypeError, ValueError):
+            return None
+    return out or None
+
+
+def extract_phase2_shared_pat_window_ids_from_backtest_metrics(
+    backtest_metrics: Mapping[str, Any] | None,
+) -> list[str] | None:
+    """Optional window labels aligned with ``test_precision_at_recall_0.01_by_window``."""
+    if not isinstance(backtest_metrics, Mapping):
+        return None
+    md = backtest_metrics.get("model_default")
+    if not isinstance(md, Mapping):
+        return None
+    raw = md.get("test_precision_at_recall_0.01_window_ids")
+    if not isinstance(raw, list) or not raw:
+        return None
+    return [str(x) for x in raw]
 
 
 def evaluate_phase2_gate(bundle: dict[str, Any]) -> dict[str, Any]:
