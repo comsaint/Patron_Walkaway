@@ -13,7 +13,7 @@
 - **上限重現**：在**固定契約**下重跑 baseline／backtest，確認既有結論可重現，避免單窗幻覺。
 - **線上蒐證**（若適用）：搭配 scorer／validator、`run_r1_r6_analysis` 等，補足 production 側證據。
 
-調查過程須與總計畫一致：`.cursor/plans/PLAN_precision_uplift_sprint.md` 與上層 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md`。
+調查過程須與總計畫一致：`.cursor/plans/PLAN_precision_uplift_sprint.md` 與上層 `PRECISION_UPLIFT_R1PCT_SSOT.md`。
 
 ## 預期產出（應填寫檔案）
 

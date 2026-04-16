@@ -60,7 +60,7 @@
 
 **Phase 2 Gate**：至少 1 條路線相對基線有顯著 uplift（建議門檻：+3~5pp）。
 
-**調查 repo 對照（`run_pipeline.py --phase phase2`）**：細項見 [`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`](../../investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md) **T10／T11** 與 `evaluators.evaluate_phase2_gate`。
+**調查 repo 對照（`run_pipeline.py --phase phase2`）**：細項見 [`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`](../../investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md) **W2** 與 `evaluators.evaluate_phase2_gate`。
 
 | Sprint 語意 | Orchestrator 契約（摘要） |
 | :--- | :--- |
