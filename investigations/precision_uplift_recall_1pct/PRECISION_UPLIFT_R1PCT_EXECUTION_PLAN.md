@@ -43,22 +43,29 @@
 
 ## 3. Phase-by-Phase 推進規格
 
-### 3.1 Phase 1（根因診斷）
+### 3.1 Phase 1（根因診斷，已升級為 decision-grade）
 
 **目的**
 - 回答 precision 未達標的主因：資料契約、標籤成熟、切片結構、模型能力哪個是主瓶頸。
 
 **最低交付**
-- `phase1/status_history_crosscheck.md`
+- `phase1/status_history_crosscheck.md` + `phase1/status_history_crosscheck.json`
 - `phase1/slice_performance_report.md`
 - `phase1/label_noise_audit.md`
 - `phase1/point_in_time_parity_check.md`
 - `phase1/upper_bound_repro.md`
 - `phase1/phase1_gate_decision.md`
 
+**RCA 5 項的最低可決策條件**
+- 歷史對照：必有 unresolved blocker 掃描結果（不可只留 run note）。
+- 細緻切片：必有 top 拖累切片排序（含樣本數與 delta）。
+- 標籤品質：必有 `label_bottleneck_assessment` 分級。
+- PIT：必有 `pit_contract_checks[]` 與 strict/warn 對應結論。
+- 上限重現：必有 `comparison_contract.comparable`。
+
 **退出條件（可進 Phase 2）**
-- 已完成主因排序且有證據鏈。
-- 非單窗偶然現象。
+- 已完成主因排序且有證據鏈（`root_cause_ranking`）。
+- `phase1_conclusion_strength` 至少為 `comparative`；要作決策建議需 `decision_grade`。
 - parity 結論與模式一致（`STRICT` 不可帶 violation 進 PASS）。
 
 ### 3.2 Phase 2（A/B/C 路線比較）
@@ -98,7 +105,36 @@
 
 ---
 
-## 4. 結論強度分級（避免過度解讀）
+## 4. Phase 1 執行清單（可直接開工）
+
+### 4.1 Sprint 內建議順序（兩週）
+
+1. `status_history` 結構化（先讓 blocker 可判定）
+2. `slice` 低成本維度排序（先拿到 top 拖累）
+3. `label_noise` 分級判定（連動 timeline 重排）
+4. `pit` critical checks（含 timezone/leakage）
+5. `upper_bound` 可比性契約
+6. `phase1_gate_decision` 匯總主因排序與結論強度
+
+### 4.2 每步驟的完成定義（Definition of Ready to Merge）
+
+- 有對應結構化欄位輸出（JSON 或 report 固定段落）
+- 有至少 1 個正向測試 + 1 個反向測試
+- 不增加長跑記憶體風險（預設並行仍為 1）
+- failure path 有明確 `blocking_reasons`（不可 silent degrade）
+
+### 4.3 Phase 1 重跑驗收（Definition of Done）
+
+- 同一契約下重跑 2 次，結論等級與主因排序不翻轉。
+- 六份報告都可回答：
+  - 結論是什麼
+  - 為什麼成立
+  - 還缺哪些證據
+- 若 `phase1_conclusion_strength != decision_grade`，必須在 gate 報告明確標示限制。
+
+---
+
+## 5. 結論強度分級（避免過度解讀）
 
 | 等級 | 說明 | 可否做產品決策 |
 | :--- | :--- | :--- |
@@ -112,7 +148,7 @@
 
 ---
 
-## 5. 執行節拍（建議）
+## 6. 執行節拍（建議）
 
 - 每日：更新一次核心輸出與阻塞清單。
 - 每 2~3 日：做一次 gate review（是否繼續、重排或暫停）。
@@ -120,16 +156,17 @@
 
 ---
 
-## 6. 資源控管（筆電限制）
+## 7. 資源控管（筆電限制）
 
 - 預設並行數 1，不先追求吞吐量。
 - 重任務先小窗/小樣本 smoke，再擴大。
+- slice 與 PIT 新檢查先從聚合/抽樣版本上線，再評估是否全量。
 - 若出現記憶體壓力或長時間無進展，立即縮窗或拆批。
 - 一旦發現 OOM 風險，不可忽略，必須先調整再繼續跑。
 
 ---
 
-## 7. 異常處理原則
+## 8. 異常處理原則
 
 - `CONFIG/PREFLIGHT` 錯誤：先修環境與契約，不進入長跑。
 - `EVIDENCE MISSING`：結論降級，必要時重跑，不補口頭推論。
@@ -138,7 +175,7 @@
 
 ---
 
-## 8. 跨文件導覽
+## 9. 跨文件導覽
 
 - SSOT：`PRECISION_UPLIFT_R1PCT_SSOT.md`
 - Implementation Plan：`PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`
