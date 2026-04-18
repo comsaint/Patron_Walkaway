@@ -9,10 +9,11 @@
 
 ## 先看哪些文件
 
-- 總計畫（SSoT）：`.cursor/plans/PLAN_precision_uplift_sprint.md`
-- 執行儀表板與 Phase 1~4 runbook：`PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md`
-- Ad-hoc 流程與腳本實作藍圖：`PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md`
-- Phase 1 Orchestrator MVP 開發任務：`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`
+- 全 repo 衝刺計畫：`.cursor/plans/PLAN_precision_uplift_sprint.md`
+- 本調查專案契約與能力邊界（SSOT）：`PRECISION_UPLIFT_R1PCT_SSOT.md`
+- 專案推進節奏與階段進退（Execution Plan）：`PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md`
+- 工程任務與 DoD（Implementation Plan）：`PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`
+- Orchestrator 操作與排障（Runbook）：`PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md`
 
 ---
 
@@ -61,7 +62,7 @@
 | **3** | 在勝者身上加深特徵與融合，並把高分段壓實。 |
 | **4** | 凍結後全面驗收，用營運與風險語言決定上不上線。 |
 
-正式欄位與 Gate 仍以 `.cursor/plans/PLAN_precision_uplift_sprint.md` 與 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` 為準；本節為高階詮釋。
+正式欄位與 Gate 仍以 `.cursor/plans/PLAN_precision_uplift_sprint.md` 與本目錄 `PRECISION_UPLIFT_R1PCT_SSOT.md` 為準；本節為高階詮釋。
 
 ### 四階段詳解（補充：內容、依賴與為何可能有效）
 
@@ -104,9 +105,9 @@
 
 ## 要怎麼做（照順序）
 
-1. 先打開 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md`，更新「進度儀表板」與「當前 Phase」。
+1. 先打開 `PRECISION_UPLIFT_R1PCT_SSOT.md` 確認現況能力邊界；依 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` 推進當前 Phase。
 2. 進入對應 `phaseX/` 目錄，依 checklist 填寫該階段所有工件。
-3. 每完成一項工件，立刻回填 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` 的勾選狀態與里程碑。
+3. 工程狀態與 DoD 勾選請更新 `PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`；里程碑敘述可寫入 sprint 計畫或本目錄 results／reports。
 4. 每週做一次 checkpoint：更新主指標、切片排名、保留/淘汰決策。
 5. 只有在當前 Phase Gate 達成後，才可進入下一階段。
 
@@ -149,7 +150,7 @@
 
 - 不接受口頭結論；每個判斷都要有對應檔案證據。
 - 檔案命名與欄位請沿用模板，不要自行改名，避免後續彙整困難。
-- 若有 blocker，請在 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` 的儀表板即時標記 `🔴 阻塞` 與解除條件。
+- 若有 blocker，請在 sprint 計畫或 issue 追蹤中標記，並在 `PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` 註記依賴與解除條件。
 
 ---
 

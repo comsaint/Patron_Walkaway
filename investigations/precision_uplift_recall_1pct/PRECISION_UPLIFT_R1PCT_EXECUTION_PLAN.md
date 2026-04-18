@@ -1,458 +1,182 @@
-# 執行計畫：Precision 提升（Recall=1%）
+# Precision Uplift R1PCT Execution Plan
 
-> 單一真相來源（Source of Truth）：`.cursor/plans/PLAN_precision_uplift_sprint.md`  
-> 工作主目錄：`investigations/precision_uplift_recall_1pct/`
-
----
-
-## 0. 進度儀表板（先看這裡）
-
-| 欄位 | 當前值 |
-| :--- | :--- |
-| 當前階段 | `Phase 1` |
-| 整體狀態 | `🟡 進行中` |
-| 最新更新日 | `YYYY-MM-DD` |
-| 目前主指標 `precision@recall=1%` | `TBD` |
-| 目標門檻 | `>= 60%` |
-| 執行模式 | `Autonomous（無人工介入） / Manual fallback` |
-| 是否觸發重排 | `否 / 是（原因）` |
-| Blocker | `無 / 有（簡述）` |
-| 下一個里程碑 | `Phase 1 Gate` |
-
-> 狀態圖例：`⚪ 未開始`、`🟡 進行中`、`🟢 已完成`、`🔴 阻塞`、`⏸ 暫停`
+> 角色：執行計畫（Execution Plan）。  
+> 目的：描述「怎麼推進專案」，不是「怎麼改程式」或「每個 CLI 旗標怎麼下」。  
+> 參考：能力邊界以 SSOT 為準；低層命令與排障請看 Orchestrator Runbook。
 
 ---
 
-## 1. 目標與完成定義
+## 1. 這份文件回答的問題
 
-- 在相同評估契約下，將 `precision@recall=1%` 由約 40% 提升至 `>=60%`。
-- 提升需可跨時間窗穩定成立（forward/purged 驗證）。
-- 任何階段結論都必須有對應工件，不接受口頭結論。
-
-### 1.1 執行原則（本版更新）
-
-- 以單一命令為主：`run_pipeline.py --phase all --mode autonomous`。
-- 使用者只需提供固定 run 契約（model、window、DB 路徑、資源上限）；其餘由 orchestrator 全自動執行。
-- 手動步驟保留為 fallback（除錯或緊急接手），不是日常主流程。
-- Go/No-Go 的商業簽核仍由人決策，但證據蒐集與報告產生應全自動。
+- 我們下一步要跑哪個 phase？
+- 每個 phase 的進入條件、退出條件是什麼？
+- 哪些輸出是可決策、哪些只是探索結果？
+- 在資源受限（筆電）下，如何穩定往前推？
 
 ---
 
-## 2. 階段總覽（完成 / 未完成一眼可見）
+## 2. 執行策略（單輪 run 的標準節奏）
 
-| Phase | 名稱 | 狀態 | Gate 狀態  |
-| :--- | :--- | :--- | :---  |
-| Phase 1 | 根因診斷（RCA）與限制條件確認 | 🟡 進行中 | ⚪ 未達成 |  
-| Phase 2 | 高槓桿建模路線（A/B/C） | ⚪ 未開始 | ⚪ 未達成 | 
-| Phase 3 | 特徵深化與集成收斂 | ⚪ 未開始 | ⚪ 未達成  |
-| Phase 4 | 定版、回放與 Go/No-Go | ⚪ 未開始 | ⚪ 未達成 |
+### 2.1 先固定 run 契約
+
+每次正式執行前，先凍結以下資訊：
+- `run_id`
+- `model_version/model_dir`
+- window（`start_ts/end_ts`）與時區
+- 標籤契約（含 censored 規則）
+- 主要資料路徑（state/prediction_log）
+
+只要上述任一項中途改動，該 run 視為失效，需重新起 run。
+
+### 2.2 再做 readiness
+
+- 所有正式執行前必做 dry-run/readiness 檢查。
+- 若是 all-phase，現況只允許 `--phase all --dry-run`，不得宣稱可直接 long run。
+
+### 2.3 最後做分階段推進
+
+- 按 `Phase1 -> Phase2 -> Phase3 -> Phase4` 推進。
+- Gate 若 `BLOCKED/FAIL`，先處理阻塞再進下一階段。
+- 不允許「先進下一階段，回頭補證據」。
 
 ---
 
-## 3. 各階段執行清單（可打勾）
+## 3. Phase-by-Phase 推進規格
 
-### Phase 1 - 根因診斷（RCA）與限制條件確認
+### 3.1 Phase 1（根因診斷，已升級為 decision-grade）
 
-**任務清單**
-- [ ] 建立 `phase1/status_history_crosscheck.md`（含沿用/重驗/失效分類）
-- [ ] 產出 `phase1/slice_performance_report.md`
-- [ ] 產出 `phase1/label_noise_audit.md`
-- [ ] 產出 `phase1/point_in_time_parity_check.md`（若為 MVP orchestrator 產物，預期僅 scaffold + 人工核對清單）
-- [ ] 產出 `phase1/upper_bound_repro.md`
-- [ ] 產出 `phase1/phase1_gate_decision.md`
+**目的**
+- 回答 precision 未達標的主因：資料契約、標籤成熟、切片結構、模型能力哪個是主瓶頸。
 
-**Gate 條件**
-- [ ] 已完成「模型能力 vs 標籤/資料契約」主因排序
-- [ ] 已完成 `STATUS.md` 歷史對照
-- [ ] 已決定是否啟動重排（先資料修復、後模型擴張）
-- [ ] 若宣稱「PIT parity 已通過」，需附可機械驗證指標；僅 scaffold 不得當作 parity 已驗證
-
-**PIT parity 最小門檻（Phase 1 決策級）**
-- [ ] `scored_at_in_window_ratio >= 0.995`
-- [ ] `validated_at_non_null_ratio >= 0.995`
-- [ ] `abs(alerts_vs_prediction_log_gap) <= 100`
-- [ ] 任一門檻不達：至少標記 `WARN`；若 mode=`STRICT`，不得給 `PASS`
-
-**交付物路徑**
-- `phase1/status_history_crosscheck.md`
+**最低交付**
+- `phase1/status_history_crosscheck.md` + `phase1/status_history_crosscheck.json`
 - `phase1/slice_performance_report.md`
 - `phase1/label_noise_audit.md`
 - `phase1/point_in_time_parity_check.md`
 - `phase1/upper_bound_repro.md`
 - `phase1/phase1_gate_decision.md`
 
-### Phase 2 - 高槓桿建模路線（A/B/C）
+**RCA 5 項的最低可決策條件**
+- 歷史對照：必有 unresolved blocker 掃描結果（不可只留 run note）。
+- 細緻切片：必有 top 拖累切片排序（含樣本數與 delta）。
+- 標籤品質：必有 `label_bottleneck_assessment` 分級。
+- PIT：必有 `pit_contract_checks[]` 與 strict/warn 對應結論。
+- 上限重現：必有 `comparison_contract.comparable`。
 
-**任務清單**
-- [ ] Track A：排序導向目標 + hard negative mining（`phase2/track_a_results.md`）
-- [ ] Track B：分群模型 + gating（`phase2/track_b_results.md`）
-- [ ] Track C：時序穩定性過濾（`phase2/track_c_results.md`）
-- [ ] 匯總 Gate 決策（`phase2/phase2_gate_decision.md`）
+**退出條件（可進 Phase 2）**
+- 已完成主因排序且有證據鏈（`root_cause_ranking`）。
+- `phase1_conclusion_strength` 至少為 `comparative`；要作決策建議需 `decision_grade`。
+- parity 結論與模式一致（`STRICT` 不可帶 violation 進 PASS）。
 
-**Gate 條件**
-- [ ] 至少 1 條路線相對基線達成顯著 uplift（+3 到 +5pp）
+### 3.2 Phase 2（A/B/C 路線比較）
 
-### Phase 3 - 特徵深化與集成收斂
+**目的**
+- 找出相對 baseline 最有希望的建模路線與勝者候選。
 
-**任務清單**
-- [ ] 動態行為特徵（`phase3/feature_uplift_table.md`）
-- [ ] 拖累切片專用特徵包（`phase3/slice_targeted_features.md`）
-- [ ] 集成/群融合消融（`phase3/ensemble_ablation.md`）
-- [ ] 高分段校準報告（`phase3/top_band_calibration_report.md`）
-- [ ] Gate 決策（`phase3/phase3_gate_decision.md`）
+**最低交付**
+- `phase2/track_a_results.md`
+- `phase2/track_b_results.md`
+- `phase2/track_c_results.md`
+- `phase2/phase2_gate_decision.md`
 
-**Gate 條件**
-- [ ] 在 Phase 2 勝者基礎上再提升且跨窗穩定
+**退出條件（可進 Phase 3）**
+- 至少 1 條路線有可稽核 uplift 證據。
+- 有跨窗穩定性資訊（不是只靠單窗）。
+- 淘汰路線有理由，不是「效果不好」這種空話。
 
-### Phase 4 - 定版、回放與 Go/No-Go
+### 3.3 Phase 3（勝者深化）
 
-**任務清單**
-- [ ] 候選設定凍結（`phase4/candidate_freeze.md`）
-- [ ] 多時間窗回放（`phase4/multi_window_backtest.md`）
-- [ ] 上線影響估算（`phase4/impact_estimation.md`）
-- [ ] Go/No-Go 決策包（`phase4/go_no_go_pack.md`）
+**目的**
+- 在 Phase 2 勝者基礎上做特徵深化與集成收斂。
 
-**Gate 條件**
-- [ ] 主指標達標（`>=60%`）且跨窗穩定
+**退出條件（可進 Phase 4）**
+- 相對 Phase 2 勝者有增量提升。
+- 不以犧牲穩定性或關鍵切片為代價。
 
----
+### 3.4 Phase 4（定版與決策）
 
-## 4. 時程重排規則（Phase 1 觸發）
+**目的**
+- 凍結候選、做多窗回放、輸出 go/no-go 證據包。
 
-- 若 `label_noise_audit` 顯示主要瓶頸在標籤流程：延後模型擴張，優先修復資料/標籤契約。
-- 若 `status_history_crosscheck` 顯示歷史阻礙仍未解除：升級為必做項目，解除前不可進下一階段。
-- 若重排後一週標籤品質 KPI 仍不收斂：執行 scope cut（暫停大型 ensemble 與大規模特徵擴張）。
-
----
-
-## 5. 里程碑與決策日誌
-
-| 日期 | 事件 | 結論 | 影響階段 | 下一步 |
-| :--- | :--- | :--- | :--- | :--- |
-| YYYY-MM-DD | 專案啟動 | TBD | Phase 1 | 建立 Phase 1 工件骨架 |
+**退出條件（可提交簽核）**
+- 主指標達標且跨窗一致。
+- 關鍵切片沒有重大退化。
+- 影響估算可被營運接受。
 
 ---
 
-## 6. 實驗登錄契約（每次實驗必填）
+## 4. Phase 1 執行清單（可直接開工）
 
-請在實驗結果檔至少包含以下欄位：
-- `experiment_id`
-- `data_window`
-- `split_protocol`
-- `label_contract`
-- `feature_set_version`
-- `model_config`
-- `objective_variant`
-- `precision_at_recall_1pct`
-- `pr_auc`
-- `top_k_precision`
-- `slice_metrics`
-- `cv_mean_std`
-- `decision`
-- `decision_reason`
+### 4.1 Sprint 內建議順序（兩週）
 
----
+1. `status_history` 結構化（先讓 blocker 可判定）
+2. `slice` 低成本維度排序（先拿到 top 拖累）
+3. `label_noise` 分級判定（連動 timeline 重排）
+4. `pit` critical checks（含 timezone/leakage）
+5. `upper_bound` 可比性契約
+6. `phase1_gate_decision` 匯總主因排序與結論強度
 
-## 7. 更新規則（維持可讀性）
+### 4.2 每步驟的完成定義（Definition of Ready to Merge）
 
-- 每次更新先改「進度儀表板」與「階段總覽」。
-- 任務完成後同時：勾選 checklist + 補對應工件路徑。
-- Gate 達成時必填「里程碑與決策日誌」。
-- 若有阻塞，將狀態改為 `🔴 阻塞` 並在 Blocker 欄說明解除條件。
+- 有對應結構化欄位輸出（JSON 或 report 固定段落）
+- 有至少 1 個正向測試 + 1 個反向測試
+- 不增加長跑記憶體風險（預設並行仍為 1）
+- failure path 有明確 `blocking_reasons`（不可 silent degrade）
 
----
+### 4.3 Phase 1 重跑驗收（Definition of Done）
 
-## 8. 一次性 Ad-hoc 執行方案（Manual fallback，不使用 cron）
-
-本節已移至獨立文件：  
-`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md`
-
-該文件包含：
-
-- 一次性 ad-hoc 執行方案（原 §8 完整內容）
-- 明確時長建議與停止/延長條件
-- 腳本化 implementation plan（模組拆分、CLI、Gate 引擎、里程碑）
+- 同一契約下重跑 2 次，結論等級與主因排序不翻轉。
+- 六份報告都可回答：
+  - 結論是什麼
+  - 為什麼成立
+  - 還缺哪些證據
+- 若 `phase1_conclusion_strength != decision_grade`，必須在 gate 報告明確標示限制。
 
 ---
 
-## 9. Manual fallback 全階段延伸（Phase 2~4）
+## 5. 結論強度分級（避免過度解讀）
 
-> 目標：在 Autonomous 流程受阻時，提供可回退的「手動分批執行」方案推進到 Phase 4。  
-> 原則：每個 Phase 都以「固定 run_id + 固定資料契約 + 固定評估口徑」執行，避免跨階段結果不可比。
+| 等級 | 說明 | 可否做產品決策 |
+| :--- | :--- | :--- |
+| `exploratory` | 方向探索、證據不完整 | 否 |
+| `comparative` | 可比較候選優劣 | 視風險，通常否 |
+| `decision_grade` | 證據完整、可審核 | 是（仍需人工簽核） |
 
-### 9.1 Phase 2（高槓桿模型路線 A/B/C）
-
-**執行方式（ad-hoc）**
-
-1. 鎖定 Phase 1 結論後的資料契約（特別是 censored / delayed label 規則）。
-2. 以相同 window/split 建立 A/B/C 三條路線實驗（可分批手動跑，不需同時）。
-3. 每條路線輸出到對應工件：
-   - `phase2/track_a_results.md`
-   - `phase2/track_b_results.md`
-   - `phase2/track_c_results.md`
-4. 以同一指標表比較 uplift 與穩定性，填 `phase2/phase2_gate_decision.md`。
-
-**每條路線最低證據**
-
-- 至少 2 個以上時間窗結果（避免單窗幻覺）
-- 必填：`precision@recall=1%`、`pr_auc`、`top_k_precision`、`slice_metrics`、`cv_mean_std`
-- 與 Phase 1 baseline 同口徑比較（不可換契約）
-
-**Gate 建議（可進 Phase 3）**
-
-- 至少 1 條路線達到 +3~5pp uplift（相對基線）
-- 跨窗波動可解釋（非單窗偶然）
-- 失敗路線必有淘汰理由（避免重複試錯）
-
-**建議時長**
-
-- 最短：2~3 天（僅初判）
-- 建議：4~7 天（含至少一次跨週期窗）
-
-### 9.2 Phase 3（特徵深化與集成收斂）
-
-**執行方式（ad-hoc）**
-
-1. 只在 Phase 2 勝者路線上加特徵，不做全域盲目擴張。
-2. 先做切片定向特徵，再做集成/融合消融。
-3. 每個變更都輸出對應工件：
-   - `phase3/feature_uplift_table.md`
-   - `phase3/slice_targeted_features.md`
-   - `phase3/ensemble_ablation.md`
-   - `phase3/top_band_calibration_report.md`
-4. 匯總寫入 `phase3/phase3_gate_decision.md`。
-
-**重點控制**
-
-- 若 ensemble 提升小但複雜度高，優先捨棄（維運優先）
-- 高分段（top band）校準必做，避免表面 uplift 實際誤報升高
-
-**Gate 建議（可進 Phase 4）**
-
-- 相對 Phase 2 勝者再提升（非持平）
-- 未犧牲跨窗穩定性
-- 拖累切片至少有 1~2 個被實質改善
-
-**建議時長**
-
-- 最短：3 天
-- 建議：5~8 天
-
-### 9.3 Phase 4（定版、回放、Go/No-Go）
-
-**執行方式（ad-hoc）**
-
-1. 凍結候選配置（資料窗、特徵、模型、閾值），填 `phase4/candidate_freeze.md`。
-2. 手動跑多窗回放，填 `phase4/multi_window_backtest.md`。
-3. 估算上線影響（告警量/誤報量/業務影響），填 `phase4/impact_estimation.md`。
-4. 生成 `phase4/go_no_go_pack.md`，做最終決策。
-
-**Go/No-Go 建議門檻**
-
-- 主指標達標（`precision@recall=1% >= 60%`）
-- 多窗一致，不依賴單窗
-- 切片無重大退化（尤其高價值玩家/高分段）
-
-**建議時長**
-
-- 最短：2~3 天（僅技術驗證）
-- 建議：4~7 天（含風險回放與影響估算）
-
-### 9.4 全階段手動節奏（不使用 cron 的推薦節拍）
-
-可用以下 ad-hoc 節拍推進（每次執行後人工審核）：
-
-- 每日 1 次：更新 backtest + R1/R6 + 工件草稿
-- 每 2~3 日 1 次：Phase Gate 預審（是否繼續/淘汰/重排）
-- 每週 1 次：正式決策紀錄（里程碑表）
-
-> 評語：Phase 2~4 若完全不做固定節拍，容易變成「憑印象調參」。即使不做 cron，也至少維持上述手動節拍。
-
-### 9.5 粗估總時程（Phase 1~4，ad-hoc 模式）
-
-- Phase 1：3~5 天（建議）
-- Phase 2：4~7 天（建議）
-- Phase 3：5~8 天（建議）
-- Phase 4：4~7 天（建議）
-
-**總計建議：16~27 天。**  
-若樣本稀疏或 delayed label 嚴重，請預留 +30~50% 緩衝。
+規則：
+- 若證據不足或僅 plan-only，最高只能到 `exploratory`。
+- 不得把 `BLOCKED` 包裝成「暫時 PASS」。
 
 ---
 
-## 10. 單一整合 Runbook（Phase 1~4，一次看完）
+## 6. 執行節拍（建議）
 
-> 本節是 **Phase 1~4 的唯一執行版**。  
-> 章節 9 與 `PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` 可作補充說明，但實際執行請以本節為準。
-
-### 10.0 啟動方式（預設全自動）
-
-**推薦命令（目標型態）**
-
-```bash
-python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
-  --phase all \
-  --mode autonomous \
-  --config investigations/precision_uplift_recall_1pct/orchestrator/config/run_full.yaml \
-  --run-id <run_id>
-```
-
-**full run 前 dry-run（必做）**
-
-```bash
-python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py \
-  --phase all \
-  --dry-run \
-  --config investigations/precision_uplift_recall_1pct/orchestrator/config/run_full.yaml \
-  --run-id <run_id>
-```
-
-- 只有 dry-run 回報 `READY` 才啟動 full run。
-- 若 `NOT_READY`，先依 blocking reasons 修復後再啟動長跑。
-
-**`run_full.yaml` dry-run checklist（規格）**
-
-- `validate_phase_configs_exist`
-- `validate_phase_schemas`
-- `validate_phase_dependencies`
-- `validate_contract_consistency`
-- `validate_paths_readable`
-- `validate_writable_targets`
-- `validate_cli_smoke_per_phase`
-- `validate_resource_limits`
-- `fail_on_any_check`（建議 `true`）
-
-> 建議：上述欄位任一失敗即 `NOT_READY`，不得啟動 full run。
-
-**預期行為**
-
-- 自動管理 scorer/validator 生命週期（啟動、健康檢查、重啟、回收）。
-- 自動產生 Phase 1 mid/final R1/R6 snapshots（不需人工補 `r1_r6_mid.stdout.log`）。
-- 自動執行各 phase 所需訓練、回測、蒐證、Gate 與報告。
-- 程式中斷後可 `--resume` 從 checkpoint 接續。
-
-> 若需人工除錯，可切回 manual/ad-hoc；但 manual 不應作為常態流程。
-
-### 10.1 全階段結論門檻（何時可下結論）
-
-| Phase | 最短時長（僅初判） | 建議時長（可決策） | 可下結論條件（至少滿足） |
-| :--- | :--- | :--- | :--- |
-| Phase 1 | 48h | 72~120h（3~5 天） | finalized alerts >= 800（理想 >=1000）、TP >= 30、R1/R6 兩次方向一致、可完成主因排序；若要宣稱決策級結論，PIT parity 需有機械檢核證據（非僅 checklist） |
-| Phase 2 | 2~3 天 | 4~7 天 | 至少 1 條 A/B/C 路線 uplift +3~5pp，且至少 2 個時間窗非單窗幻覺 |
-| Phase 3 | 3 天 | 5~8 天 | 相對 Phase 2 勝者再提升，且切片改善與穩定性同時成立 |
-| Phase 4 | 2~3 天 | 4~7 天 | 多窗回放仍達標（`precision@recall=1% >= 60%`），且無重大切片退化 |
-
-> 評語：在 recall=1% 稀疏場景，若低於上表建議時長就做最終結論，誤判風險很高。
-
-### 10.2 共通前置（所有 Phase 都先做）
-
-| 步驟 | 要跑什麼 | 預期產物 | 失敗要看哪個訊號 |
-| :--- | :--- | :--- | :--- |
-| P0-1 | 固定 run 契約：`run_id`、`MODEL_DIR`、`STATE_DB_PATH`、`PREDICTION_LOG_DB_PATH`、window、label contract | `run_id` 與參數記錄（可寫入里程碑） | run 期間參數被改動、模型版本漂移 |
-| P0-2 | 健康檢查：路徑存在、DB 可讀、ClickHouse 可查 | 可成功讀取 prediction/state/model artifact | 連線逾時、路徑不存在、權限錯誤 |
-| P0-3 | 短窗 backtest smoke test | `trainer/out_backtest/backtest_metrics.json` | 無輸出、`No bets for the requested window`、JSON 欄位缺失 |
-
-### 10.3 Phase 1 Runbook（RCA 與契約確認）
-
-| 步驟 | 要跑什麼 | 預期產物（路徑） | 失敗要看哪個訊號 |
-| :--- | :--- | :--- | :--- |
-| P1-1 | 啟動 scorer 長跑：`python -m trainer.scorer` | `prediction_log`/`alerts` 持續增長（state DB） | alerts 長期為 0、log 重複 exception、DB 無新增列 |
-| P1-2 | 啟動 validator 長跑：`python -m trainer.validator` | `validation_results`、`validator_metrics` 持續增長 | `validator_metrics insert failed`、finalized 長期不增 |
-| P1-3 | 中途健康檢查（建議 T+6h）：`python investigations/test_vs_production/checks/run_r1_r6_analysis.py --mode all --pretty ...` | `snapshots/*.csv` + JSON payload（含 `n_censored_excluded`、`precision_at_recall_target`） | `sample CSV contains no bet_id rows`、`prediction_log table not found` |
-| P1-4 | 觀測期末再跑一次 R1/R6 + 固定窗 backtest | 最終 payload + `trainer/out_backtest/backtest_metrics.json` | 與中途結果方向劇烈反轉、樣本不足 |
-| P1-5 | 回填 Phase 1 六份工件（含 PIT parity auto 指標或明確標記為人工待核） | `phase1/*.md` 全部完成 | 任一工件缺主證據、口徑不一致 |
-
-> Autonomous 模式下，P1-1~P1-5 由 orchestrator 自動完成；手動命令僅作 fallback。
-
-**Phase 1 可下結論（Gate）**
-
-- 可進 Phase 2：主瓶頸排序完成，且非單窗幻覺。
-- 需重排：若 `label_noise_audit` 指向 delayed/censored/契約問題為主瓶頸，先修資料流程再做模型衝刺。
-
-> 注意（MVP 現況）：`point_in_time_parity_check.md` 在現行 orchestrator 可能僅為 scaffold。若未附自動指標，不應解讀為「PIT parity 已驗證通過」。
-
-### 10.4 Phase 2 Runbook（A/B/C 路線並行比較）
-
-| 步驟 | 要跑什麼 | 預期產物（路徑） | 失敗要看哪個訊號 |
-| :--- | :--- | :--- | :--- |
-| P2-1 | 以同一 Phase 1 契約建立 Track A/B/C 設定，分批訓練與回測（沿用既有訓練入口，例如 `python -m trainer.trainer ...` + 對應 config） | 每條路線都有可追溯實驗紀錄與模型輸出（`models/...` 或 `out/models/...`） | 只剩口頭結論、無可重現 artifact |
-| P2-2 | 各路線跑固定窗 backtest + 至少第 2 個時間窗重跑 | 每路線至少 2 個窗的 metrics（可附 JSON/表格） | 僅單窗漂亮，第二窗崩潰 |
-| P2-3 | 寫入 `phase2/track_a_results.md`、`track_b_results.md`、`track_c_results.md` | 三份 track 工件完整 | 缺 `precision@recall=1%` 或缺切片/波動資訊 |
-| P2-4 | Gate 決策寫入 `phase2/phase2_gate_decision.md` | 明確保留/淘汰路線 | 無淘汰理由、重複試錯 |
-
-> Autonomous 模式下，P2-1~P2-4 由 orchestrator runner 依 config matrix 自動執行與蒐證。
-
-**Phase 2 可下結論（Gate）**
-
-- 至少 1 條路線達到 +3~5pp uplift（相對基線）且跨窗可重現，才能進 Phase 3。
-
-### 10.5 Phase 3 Runbook（特徵深化與集成收斂）
-
-| 步驟 | 要跑什麼 | 預期產物（路徑） | 失敗要看哪個訊號 |
-| :--- | :--- | :--- | :--- |
-| P3-1 | 只在 Phase 2 勝者路線加特徵（先切片定向、後全域） | 特徵 uplift 對照表 | 特徵變多但主指標不升、訓練時間暴增 |
-| P3-2 | 跑集成/融合消融與高分段校準 | `phase3/ensemble_ablation.md`、`top_band_calibration_report.md` | ensemble 僅微幅提升但複雜度大幅上升 |
-| P3-3 | 匯整 Phase 3 工件與 Gate | `phase3/phase3_gate_decision.md` | 只看 overall，不看切片退化 |
-
-> Autonomous 模式下，僅允許延續 Phase 2 winner track，避免全域盲試。
-
-**Phase 3 可下結論（Gate）**
-
-- 相對 Phase 2 勝者再提升，且跨窗穩定、切片改善非偶然，才能進 Phase 4。
-
-### 10.6 Phase 4 Runbook（定版、回放、Go/No-Go）
-
-| 步驟 | 要跑什麼 | 預期產物（路徑） | 失敗要看哪個訊號 |
-| :--- | :--- | :--- | :--- |
-| P4-1 | 凍結候選（資料窗/特徵/模型/閾值） | `phase4/candidate_freeze.md` | 候選設定仍持續變動、無凍結版本 |
-| P4-2 | 多時間窗回放（至少 3 窗，含不同流量特性） | `phase4/multi_window_backtest.md` | 僅單窗達標、其餘窗明顯退化 |
-| P4-3 | 上線影響估算（告警量/誤報量/業務成本） | `phase4/impact_estimation.md` | 僅報主指標，無告警量與誤報成本 |
-| P4-4 | Go/No-Go 決策包 | `phase4/go_no_go_pack.md` | 缺風險清單與 fallback 計畫 |
-
-> Autonomous 模式下，P4-1~P4-4 由 orchestrator 自動生成；人工只負責最終簽核。
-
-**Phase 4 可下結論（最終）**
-
-- `precision@recall=1% >= 60%` 且多窗一致成立。
-- 無重大切片退化，且營運可承受告警量與誤報成本。
-
-### 10.7 手動執行節拍（fallback；非預設）
-
-- 每日 1 次：更新 backtest + R1/R6 + 工件草稿
-- 每 2~3 日：做一次 Phase Gate 預審
-- 每週 1 次：正式更新里程碑與決策日誌
-
-> 即使不用排程，也要用固定節拍；否則很容易退化成「憑印象調參」。
+- 每日：更新一次核心輸出與阻塞清單。
+- 每 2~3 日：做一次 gate review（是否繼續、重排或暫停）。
+- 每週：固定決策會，更新里程碑與風險。
 
 ---
 
-## 11. 全自動落地規格（E2E，無人工介入）
+## 7. 資源控管（筆電限制）
 
-### 11.1 核心能力（必做）
+- 預設並行數 1，不先追求吞吐量。
+- 重任務先小窗/小樣本 smoke，再擴大。
+- slice 與 PIT 新檢查先從聚合/抽樣版本上線，再評估是否全量。
+- 若出現記憶體壓力或長時間無進展，立即縮窗或拆批。
+- 一旦發現 OOM 風險，不可忽略，必須先調整再繼續跑。
 
-1. **單一命令啟動全 phase**  
-   - `--phase all --mode autonomous`，依 Gate 推進 phase1->2->3->4。  
-2. **長跑 supervisor**  
-   - 管理 scorer/validator，做健康檢查與自動重啟。  
-3. **自動 checkpoint snapshots**  
-   - 依 phase1 checkpoint policy 自動落 mid/final R1。  
-4. **統一 artifacts index**  
-   - 每 run 輸出 `artifacts_index.json`，報告只讀 index 指向路徑。  
-5. **可恢復性**  
-   - 任一步驟失敗或中斷後可 `--resume` 無損接續。  
+---
 
-### 11.2 資源與風險控制（筆電優先）
+## 8. 異常處理原則
 
-- heavy job 並行上限預設 1（避免 OOM / swap 暴增）。
-- 設定 `max_runtime_hours`、`max_windows`、`max_trials` 的硬上限。
-- 大檔採分塊與延遲載入；禁止一次載入全量資料到記憶體。
-- 達到資源上限時 fail-fast，輸出可執行的 blocking reason。
+- `CONFIG/PREFLIGHT` 錯誤：先修環境與契約，不進入長跑。
+- `EVIDENCE MISSING`：結論降級，必要時重跑，不補口頭推論。
+- `GATE BLOCKED`：先解 `blocking_reasons`，不跳關。
+- `RUN INTERRUPTED`：優先 `--resume`；若契約已漂移，開新 run。
 
-### 11.3 自動化驗收標準（DoD）
+---
 
-- 使用者僅指定 model + time period + config，即可跑完整調查流程。
-- 連跑數天不需人工觸碰，最終產出 phase1~4 全部工件。
-- 產出 `go_no_go_pack.md` 與完整證據鏈（logs + bundle + gate + report）。
-- 若流程被 Gate 擋下，需自動輸出「停止原因 + 下一步建議」。
-- full run 之前可執行 `--phase all --dry-run`，並輸出 `READY / NOT_READY` 與可執行修復項。
+## 9. 跨文件導覽
 
+- SSOT：`PRECISION_UPLIFT_R1PCT_SSOT.md`
+- Implementation Plan：`PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`
+- Orchestrator Runbook（命令/旗標/排障）：`PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md`

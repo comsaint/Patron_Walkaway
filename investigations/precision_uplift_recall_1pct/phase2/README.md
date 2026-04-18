@@ -1,6 +1,6 @@
 # Phase 2：高槓桿建模路線（Track A / B / C）
 
-**Orchestrator 操作**（CLI、`run_phase2.yaml`、旗標、產出路徑、resume）：見同調查目錄內 [`PRECISION_UPLIFT_R1PCT_PHASE2_RUNBOOK.md`](../PRECISION_UPLIFT_R1PCT_PHASE2_RUNBOOK.md)。
+**Orchestrator 操作**（CLI、`run_phase2.yaml`、旗標、產出路徑、resume）：見同調查目錄內 [`PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md`](../PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md)。
 
 ## 為什麼要做這一階段
 

@@ -17,11 +17,11 @@ import yaml
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ORCHESTRATOR = _REPO_ROOT / "investigations/precision_uplift_recall_1pct" / "orchestrator"
 _RUN_PIPELINE = _ORCHESTRATOR / "run_pipeline.py"
-_ADHOC_RUNBOOK = (
+_ORCHESTRATOR_RUNBOOK = (
     _REPO_ROOT
     / "investigations"
     / "precision_uplift_recall_1pct"
-    / "PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md"
+    / "PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md"
 )
 
 if str(_ORCHESTRATOR) not in sys.path:
@@ -929,9 +929,9 @@ def test_write_phase2_gate_decision_includes_elimination_section(tmp_path: Path)
     assert "below_min_uplift_pp_vs_baseline" in text
 
 
-def test_adhoc_runbook_documents_phase2_t11a_gate_mechanics() -> None:
-    """ADHOC_RUNBOOK §1.8.1 stays aligned with evaluate_phase2_gate keywords (drift guard)."""
-    text = _ADHOC_RUNBOOK.read_text(encoding="utf-8")
+def test_orchestrator_runbook_documents_phase2_t11a_gate_mechanics() -> None:
+    """Orchestrator Runbook §9.1 / ####1.8.1 stays aligned with evaluate_phase2_gate keywords (drift guard)."""
+    text = _ORCHESTRATOR_RUNBOOK.read_text(encoding="utf-8")
     assert "#### 1.8.1" in text
     assert "min_pat_windows_for_pass" in text
     assert "phase2_insufficient_pat_windows_for_pass" in text
@@ -940,9 +940,9 @@ def test_adhoc_runbook_documents_phase2_t11a_gate_mechanics() -> None:
     assert "phase2_winner_" in text
 
 
-def test_adhoc_runbook_documents_phase2_error_code_reference() -> None:
-    """ADHOC_RUNBOOK §1.8.2 documents E_SUBPROCESS_TIMEOUT vs E_NO_DATA_WINDOW and common codes."""
-    text = _ADHOC_RUNBOOK.read_text(encoding="utf-8")
+def test_orchestrator_runbook_documents_phase2_error_code_reference() -> None:
+    """Orchestrator Runbook ####1.8.2 documents E_SUBPROCESS_TIMEOUT vs E_NO_DATA_WINDOW and common codes."""
+    text = _ORCHESTRATOR_RUNBOOK.read_text(encoding="utf-8")
     assert "#### 1.8.2" in text
     assert "E_SUBPROCESS_TIMEOUT" in text
     assert "E_NO_DATA_WINDOW" in text
@@ -961,9 +961,9 @@ def test_adhoc_runbook_documents_phase2_error_code_reference() -> None:
     assert "phase2_runner_smoke" in text
 
 
-def test_adhoc_runbook_phase23_phase2_example_uses_t10a_trainer_params() -> None:
-    """§2.3.1 Phase 2 YAML draft must not revive non-empty overrides (T10A)."""
-    text = _ADHOC_RUNBOOK.read_text(encoding="utf-8")
+def test_orchestrator_runbook_phase2_example_uses_t10a_trainer_params() -> None:
+    """###2.3.1 Phase 2 YAML draft must not revive non-empty overrides (T10A)."""
+    text = _ORCHESTRATOR_RUNBOOK.read_text(encoding="utf-8")
     assert "### 2.3.1" in text
     assert "a_recent_chunks_v1" in text
     assert "trainer_params:" in text
@@ -5753,7 +5753,7 @@ def test_run_all_phases_dry_run_readiness_ready(tmp_path: Path) -> None:
 
 
 def test_t16a_dry_run_checklist_keys_match_config_loader_contract() -> None:
-    """T16A ``dry_run`` checklist keys stay aligned with MVP_TASKLIST / run_full SSOT."""
+    """T16A ``dry_run`` checklist keys stay aligned with IMPLEMENTATION_PLAN / run_full YAML."""
     expected = frozenset(
         {
             "validate_phase_configs_exist",

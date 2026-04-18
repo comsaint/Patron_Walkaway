@@ -444,7 +444,7 @@
 |------|------|
 | `investigations/precision_uplift_recall_1pct/orchestrator/common_exit_codes.py` | 新增 **`EXIT_PHASE1_MID_OR_R1_FAILED`**（**4**）、**`EXIT_PHASE1_BACKTEST_FAILED`**（**5**）；docstring 註明與 Phase 2 **4／5** 整數碰撞、語意不同 |
 | `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py` | **`_main_phase1`** 三處裸 **`return 4`／`return 5`** 改 **`orch_exits.*`** |
-| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | **§1.8.2** 改寫為 **`common_exit_codes`** 具名對照；**5** 列補回 **`phase2_runner_smoke`** 字串（營運／契約測試可 grep） |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md` | **§1.8.2** 改寫為 **`common_exit_codes`** 具名對照；**5** 列補回 **`phase2_runner_smoke`** 字串（營運／契約測試可 grep） |
 
 **手動驗證**：Phase 1 人為讓 **mid／R1** 失敗 → exit **4**；讓 **backtest** 失敗 → exit **5**（與常數名一致；與 Phase 2 同整數時必讀 **`run_state.steps`**）。
 
@@ -491,7 +491,7 @@
 | `investigations/precision_uplift_recall_1pct/orchestrator/common_exit_codes.py` | **新建**：**`EXIT_OK`**、**`EXIT_CONFIG_INVALID`**（**2**）、**`EXIT_PREFLIGHT_FAILED`**（**3**）、**`EXIT_DRY_RUN_NOT_READY`**（**6**） |
 | `investigations/precision_uplift_recall_1pct/orchestrator/phase2_exit_codes.py` | 自 **`common_exit_codes`** 再匯出 **2／3／6**；Phase 2 專用 **4／5／7／8／9／10** 不變 |
 | `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py` | **`_main_phase1`**／**`_main_all`**／**`main()`** 之 **2／3／6** 改 **`orch_exits.*`**；**`_main_phase2`** 之 **2／3／6** 改 **`orch_exits`**（與 Phase 2 專用 **`phase2_exits`** 並用） |
-| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | **§1.8.2**：程序退出碼敘述改為 **`common_exit_codes.py`**（跨 phase）+ **`phase2_exit_codes.py`**（Phase 2 專用）；註明 Phase 1 之 **4／5** 與 Phase 2 同整數但語意不同 |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md` | **§1.8.2**：程序退出碼敘述改為 **`common_exit_codes.py`**（跨 phase）+ **`phase2_exit_codes.py`**（Phase 2 專用）；註明 Phase 1 之 **4／5** 與 Phase 2 同整數但語意不同 |
 
 **手動驗證**：
 1. **`--phase phase1`**：無效 config → exit **2**；preflight 失敗 → **3**；dry-run **NOT_READY** → **6**。
@@ -539,7 +539,7 @@
 |------|------|
 | `investigations/precision_uplift_recall_1pct/orchestrator/phase2_exit_codes.py` | 模組 docstring 補充 **`_main_phase2`** 對 **2／3／4／6** 與 **5／7／8／9／10** 之用途；與 Phase 1 重疊整數之契約說明 |
 | `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py` | **`_main_phase2`**：`ConfigValidationError` → **`EXIT_CONFIG_INVALID`**；preflight 失敗 → **`EXIT_PREFLIGHT_FAILED`**；dry-run **NOT_READY** → **`EXIT_DRY_RUN_NOT_READY`**；resume 無法載入 **`phase2_bundle.json`** → **`EXIT_RESUME_BUNDLE_LOAD_FAILED`** |
-| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | **§1.8.2** 程序退出碼段：明寫 **`_main_phase2`** 對 **2／3／4／6** 亦使用 **`phase2_exit_codes`**；**`--phase phase2`** 涵蓋 dry-run |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md` | **§1.8.2** 程序退出碼段：明寫 **`_main_phase2`** 對 **2／3／4／6** 亦使用 **`phase2_exit_codes`**；**`--phase phase2`** 涵蓋 dry-run |
 
 **手動驗證**：
 1. 故意 Phase 2 YAML 含非空 **`overrides`** → `python .../run_pipeline.py --phase phase2 --config ... --run-id t --dry-run` 預期 exit **2**（與 **`phase2_exit_codes.EXIT_CONFIG_INVALID`** 一致）。
@@ -579,7 +579,7 @@
 ## Precision uplift orchestrator — T10A trainer_params whitelist（2026-04-11，STEP 1 Builder）
 
 ### 背景
-- 對照 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T10A**（策略參數接線）：白名單、`build_phase2_trainer_argv` 映射、禁止 silent unapplied。
+- 對照 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` **T10A**（策略參數接線）：白名單、`build_phase2_trainer_argv` 映射、禁止 silent unapplied。
 
 ### 變更檔案
 | 檔案 | 說明 |
@@ -625,7 +625,7 @@
 | Pytest | `tests/unit/test_precision_uplift_phase1_orchestrator.py`：**136 passed** |
 | 實作補丁 | `trainer_params.recent_chunks`／`sample_rated` 允許 **整數型 float**（如 `3.0`），拒絕非整數（如 `3.1`） |
 
-**Tasklist 狀態**：`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T10A** 報表證據已落地（見本檔下方 **cycle_code** 區塊 STEP 4）；**仍待**：進階策略鍵、**T11A**。
+**Tasklist 狀態**：`PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` **T10A** 報表證據已落地（見本檔下方 **cycle_code** 區塊 STEP 4）；**仍待**：進階策略鍵、**T11A**。
 
 **建議下一輪**：`evaluators` **T11A**（`strategy_effective`、`conclusion_strength`）；可選 `phase2_bundle` 摘要欄指紋索引。
 
@@ -635,12 +635,12 @@
 
 ### STEP 1 — Builder
 
-**背景**：完成 `PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T10A** 剩餘項——`track_*_results.md` 顯示「參數已套用」證據。
+**背景**：完成 `PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` **T10A** 剩餘項——`track_*_results.md` 顯示「參數已套用」證據。
 
 | 檔案 | 說明 |
 |------|------|
 | `investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py` | 新增 **`_phase2_trainer_cli_evidence_markdown_for_track`**；`write_phase2_track_results` 插入 **`## Trainer CLI evidence (T10A)`**（YAML `trainer_params` + 已執行時之 `argv_fingerprint`／`resolved_trainer_argv`，未執行時 **planned** argv） |
-| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | T10A 報表項勾選（見 STEP 4） |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` | T10A 報表項勾選（見 STEP 4） |
 
 **手動驗證**：跑完 phase2 並產報表後，開 `investigations/precision_uplift_recall_1pct/phase2/track_a_results.md`，應見 **`## Trainer CLI evidence (T10A)`** 與各 `exp_id` 小節。
 
@@ -670,7 +670,7 @@
 | Pytest | `tests/unit/test_precision_uplift_phase1_orchestrator.py -q -p no:langsmith --tb=line` | **137 passed** |
 | Ruff | `ruff check investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py` | **通過** |
 
-**Tasklist**：`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T10A** 報表證據項已勾選；**T10B** 矩陣「下一步」已略調整。
+**Tasklist**：`PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` **T10A** 報表證據項已勾選；**T10B** 矩陣「下一步」已略調整。
 
 **建議下一輪 Plan 項目**：**T11A**（`evaluate_phase2_gate` 之 `strategy_effective`、`conclusion_strength`、`phase2_gate_decision.md`）；可選 **`phase2_bundle` 摘要欄** 附 `argv_fingerprint` 索引。
 
@@ -680,14 +680,14 @@
 
 ### STEP 1 — Builder
 
-**背景**：`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T11A**（策略證據、結論強度）。
+**背景**：`PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` **T11A**（策略證據、結論強度）。
 
 | 檔案 | 說明 |
 |------|------|
 | `investigations/precision_uplift_recall_1pct/orchestrator/evaluators.py` | **`_phase2_trainer_params_nonempty_for_exp`**、**`_phase2_evaluate_strategy_effective`**、**`_phase2_max_pat_series_window_count`**、**`_phase2_conclusion_strength`**、**`_phase2_append_scientific_validity`**；**`evaluate_phase2_gate`** 於 `metrics_ingested` 在 uplift 前先跑 T11A 稽核；回傳 **`conclusion_strength`** |
 | `investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py` | **`write_phase2_gate_decision`** 新增 **Scientific validity (T11A)** 區塊 |
 | `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py` | **`phase2_gate_decision`** 寫入 **`conclusion_strength`**、**`phase2_strategy_effective`**、**`phase2_trainer_jobs_executed`** |
-| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | T11A 勾選狀態更新（winner 自動輸出仍待） |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` | T11A 勾選狀態更新（winner 自動輸出仍待） |
 
 **手動驗證**：phase2 full run 後開 `phase2_gate_decision.md`，應見 **conclusion_strength** 與 strategy 欄位；若 YAML 有 **`trainer_params`** 且 **`--phase2-run-trainer-jobs`** 但缺 fingerprint，Gate 應 **BLOCKED**（`phase2_strategy_params_not_effective`）。
 
@@ -735,7 +735,7 @@
 ## Precision uplift orchestrator — T11A winner + dual-window hard gate（2026-04-11，`cycle_code` STEP 1 Builder）
 
 ### 背景
-- 對齊 `PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T11A** 剩餘勾選項：勝者軌道／實驗自動輸出、至少雙窗硬 Gate。
+- 對齊 `PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` **T11A** 剩餘勾選項：勝者軌道／實驗自動輸出、至少雙窗硬 Gate。
 
 ### 變更檔案
 | 檔案 | 說明 |
@@ -743,7 +743,7 @@
 | `investigations/precision_uplift_recall_1pct/orchestrator/evaluators.py` | **`_parse_min_pat_windows_required`**、**`_phase2_uplift_winner_metrics`**、**`_phase2_apply_min_pat_windows_gate_for_pass`**；uplift **PASS** 時寫入勝者 **`metrics`**；**PASS** 前檢查 **`phase2_pat_series_by_experiment`** 最長序列 ≥ **`gate.min_pat_windows_for_pass`**（預設 2，≤0 關閉） |
 | `investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py` | **`write_phase2_gate_decision`** 若有勝者欄位則插入 **`## Winner track / experiment (T11A)`** |
 | `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py` | **`phase2_gate_decision`** 寫入 **`phase2_winner_*`** 鏡像鍵 |
-| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | T11A 該項改為已勾選 |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` | T11A 該項改為已勾選 |
 
 ### 手動驗證
 1. 組裝 **`metrics_ingested`** bundle：per-job uplift **PASS** 但**無**長度 ≥2 之 `phase2_pat_series_by_experiment` → 呼叫 **`evaluate_phase2_gate`** 預期 **BLOCKED**、`phase2_insufficient_pat_windows_for_pass`。
@@ -795,8 +795,8 @@
 
 | 檔案 | 說明 |
 |------|------|
-| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | **§1.8** 能力矩陣項補「禁止 planned/blocked 當可執行參數」；新增 **§1.8.1**（雙窗硬 Gate、`merge_phase2_pat_series_from_shared_and_per_job`、`min_pat_windows_for_pass` 預設/關閉語意、`conclusion_strength` 判讀、BLOCKED 仍可能帶勝者 metrics） |
-| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | **T10B** 三項改為已勾選並連結 Runbook §1.8 |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md` | **§1.8** 能力矩陣項補「禁止 planned/blocked 當可執行參數」；新增 **§1.8.1**（雙窗硬 Gate、`merge_phase2_pat_series_from_shared_and_per_job`、`min_pat_windows_for_pass` 預設/關閉語意、`conclusion_strength` 判讀、BLOCKED 仍可能帶勝者 metrics） |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` | **T10B** 三項改為已勾選並連結 Runbook §1.8 |
 
 **手動驗證**：開 Runbook **§1.8.1**，確認與目前 `evaluators.evaluate_phase2_gate` 用語一致；Tasklist **T10B** 三勾。
 
@@ -845,7 +845,7 @@
 | `investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py` | **`_phase2_uplift_elimination_markdown`**；**`write_phase2_gate_decision`** 插入 **`## Uplift elimination / non-winners (T11 narrative)`** |
 | `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py` | **`phase2_gate_decision.phase2_elimination_row_count`** |
 | `investigations/precision_uplift_recall_1pct/orchestrator/collectors.py` | **`collect_summary_phase2_plan_for_run_state`** 可選 **`phase2_pat_series_key_count`**、**`phase2_pat_series_max_len`**、**`phase2_pat_series_len_ge_2_count`** |
-| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | **§0.2** Phase 2 快照與 **T11 完成定義** 對齊現況／餘項 |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` | **§0.2** Phase 2 快照與 **T11 完成定義** 對齊現況／餘項 |
 
 **手動驗證**：跑 uplift **FAIL** 或 **PASS**（多軌）後開 **`phase2_gate_decision.md`**，應見 **Uplift elimination**；**`run_state.phase2_collect`** 在 bundle 含 **`phase2_pat_series_by_experiment`** 時應見 **`phase2_pat_series_*`** 計數。
 
@@ -885,7 +885,7 @@
 
 ### STEP 1 — Builder
 
-**背景**：對齊 `PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T10** fail-fast：per-job 失敗時 bundle 需有結構化錯誤；共享回測 JSON 可讀但無 PAT@1% 鍵時明確 **`E_NO_DATA_WINDOW`**。
+**背景**：對齊 `PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` **T10** fail-fast：per-job 失敗時 bundle 需有結構化錯誤；共享回測 JSON 可讀但無 PAT@1% 鍵時明確 **`E_NO_DATA_WINDOW`**。
 
 | 檔案 | 說明 |
 |------|------|
@@ -1019,7 +1019,7 @@
 
 **Tasklist**：**T10**「產出統一結果結構／每實驗多窗」仍 **[ ]**；本輪為 **可觀測性契約**（timeout 碼分離 + YAML 矩陣實驗計數）。**PATCH／PLAN** 主線仍見根目錄 **PLAN.md** 索引。
 
-**建議下一輪 Plan**：backtester／collector 寫入 **真多窗** `precision_at_recall_1pct_by_window`（非僅 YAML 手填）；**ADHOC_RUNBOOK** 補 **`E_SUBPROCESS_TIMEOUT`** 與 gate／metrics 錯誤碼對照表。
+**建議下一輪 Plan**：backtester／collector 寫入 **真多窗** `precision_at_recall_1pct_by_window`（非僅 YAML 手填）；**ORCHESTRATOR_RUNBOOK** 補 **`E_SUBPROCESS_TIMEOUT`** 與 gate／metrics 錯誤碼對照表。
 
 ✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**
 
@@ -1029,11 +1029,11 @@
 
 ### STEP 1 — Builder
 
-**背景**：落實上一輪 STATUS「**ADHOC_RUNBOOK** 補 **`E_SUBPROCESS_TIMEOUT`** 與 gate／metrics 錯誤碼對照」；**PLAN.md** 仍為 repo 索引／PATCH 主線，本調查細項以 Tasklist／Runbook 為準；**DECISION_LOG** 本輪無新增條目。
+**背景**：落實上一輪 STATUS「**ORCHESTRATOR_RUNBOOK** 補 **`E_SUBPROCESS_TIMEOUT`** 與 gate／metrics 錯誤碼對照」；**PLAN.md** 仍為 repo 索引／PATCH 主線，本調查細項以 Tasklist／Runbook 為準；**DECISION_LOG** 本輪無新增條目。
 
 | 檔案 | 說明 |
 |------|------|
-| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | 新增 **§1.8.2**：**`E_SUBPROCESS_TIMEOUT`** 與 **`E_NO_DATA_WINDOW`** 語意分離、Phase 2 常見 **`error_code`／`errors[].code`** 表、**`phase2_gate` blocking** 與 bundle 碼之區別、**`phase2_pat_matrix_yaml_experiment_count`** 觀測提醒 |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md` | 新增 **§1.8.2**：**`E_SUBPROCESS_TIMEOUT`** 與 **`E_NO_DATA_WINDOW`** 語意分離、Phase 2 常見 **`error_code`／`errors[].code`** 表、**`phase2_gate` blocking** 與 bundle 碼之區別、**`phase2_pat_matrix_yaml_experiment_count`** 觀測提醒 |
 
 **手動驗證**：開 Runbook **§1.8.2**，確認表內 code 與 `runner.run_logged_command`、`run_pipeline` Phase 2 步驟用語一致。
 
@@ -1080,7 +1080,7 @@
 |------|------|
 | `investigations/precision_uplift_recall_1pct/orchestrator/phase2_exit_codes.py` | **新建**：**`EXIT_*`** 常數（2／3／4／5／6／7／8／9／10 等）、**`PHASE2_FAILURE_STEP_CLI_EXITS`**（步驟→典型失敗退出碼） |
 | `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py` | **`phase2_gate_cli_exit_code`** 與 Phase 2 **`return 5`／`7`／`8`** 路徑改用 **`phase2_exit_codes`** |
-| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | **§1.8.2** 增補**程序退出碼**段落（指 **`phase2_exit_codes.py`**、5／7／8／9／10 與步驟對照） |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md` | **§1.8.2** 增補**程序退出碼**段落（指 **`phase2_exit_codes.py`**、5／7／8／9／10 與步驟對照） |
 
 **手動驗證**：故意讓 **`phase2_runner_smoke`** 失敗 → 程序 exit **5**；開 gate fail 旗標且 **FAIL** → exit **9**（與模組常數一致）。
 
@@ -6250,7 +6250,7 @@ PYTHONPATH=. python -m pytest tests/unit/test_task7_chunk_cache_key.py \
 
 **依據（本輪僅做前 1–2 步）**
 
-- `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`
+- `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`
   - T11（Phase 2 Gate 可決策化）前置缺口：目前 uplift baseline 依 YAML 第一個 preview，缺少明確 baseline 契約。
   - 本輪只先落地兩步：  
     1) gate config 支援 `baseline_exp_id_by_track`。  
