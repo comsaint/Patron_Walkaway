@@ -20,7 +20,7 @@ MODEL_DIR= python -m pytest tests/integration/test_trainer.py::TestModelMetadata
 
 ## trainer — Feature spec 單一 SSOT（2026-04-18）
 
-**對齊**：候選 Feature Spec 僅保留 **`trainer/feature_spec/features_candidates.yaml`**（與 `FEATURE_SPEC_GUIDE.md`、`trainer/training/trainer.py` 之 `FEATURE_SPEC_PATH` 一致）。已刪除冗餘 **`trainer/features/feature_spec/features_candidates.yaml`**，避免雙份維護與路徑混淆；`trainer/features/features.py` 於未設定 `MODEL_DIR` 時亦自該路徑載入。
+**對齊**：候選 Feature Spec 僅保留 **`trainer/feature_spec/features_candidates.yaml`**（與 `FEATURE_SPEC_GUIDE.md`、`trainer/training/trainer.py` 之 `FEATURE_SPEC_PATH` 一致）。已刪除冗餘 **`trainer/features/feature_spec/features_candidates.yaml`**，避免雙份維護與路徑混淆；`trainer/features/features.py` 於未設定 `MODEL_DIR` 時自該路徑載入。**補充（同日）**：若環境變數 **`MODEL_DIR` 已設但該目錄無 `feature_spec.yaml`**（常見本機 `.env` 指到 `out/models`），模組載入時改為 **warning + 仍讀 repo 之 `features_candidates.yaml`**，避免 `python -m trainer.trainer` 在 import 階段即失敗；正式部署目錄仍應含凍結之 `feature_spec.yaml`。
 
 | 項目 | 說明 |
 |------|------|
