@@ -275,7 +275,7 @@ G1_FBETA = 0.5                   # [DEPRECATED] F-beta weight (beta < 1 → prec
 OPTUNA_N_TRIALS = 150            # Optuna TPE trials for threshold search (DEC-009/010). A27: total Step 9 time scales with this.
 # Optional Optuna time budget (seconds) for study.optimize. A27: tune to cap total HPO time.
 # Disable timeout by setting to None or a non-positive value (e.g. -1).
-OPTUNA_TIMEOUT_SECONDS: Optional[int] = 60 * 60 * 1 # -1 = no timeout, 10 * 60 = 10 minutes
+OPTUNA_TIMEOUT_SECONDS: Optional[int] = 10 * 60 * 1 # -1 = no timeout, 10 * 60 = 10 minutes
 # Optional study-level early stop: stop when best validation AP has not improved for
 # this many consecutive trials. None = disabled (run full n_trials; default for reproducibility).
 # Positive int (e.g. 40–60) = stop early to save time; recommend 40–60 to avoid stopping

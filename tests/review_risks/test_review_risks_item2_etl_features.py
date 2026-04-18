@@ -2,12 +2,12 @@
 
 對應 STATUS.md « Code Review：步驟 4（項目 2）2.2 etl / features 子包搬移 » §1、§2、§3、§4。
 §1：python -m trainer.etl_player_profile --help 應有 usage/help 輸出且 exit 0（契約：薄層 __main__ 轉發）。
-§2：trainer/feature_spec/ 與 trainer/features/feature_spec/ 下 features_candidates.yaml 內容一致（雙份時須同步）。
+§2：候選 spec 僅 **`trainer/feature_spec/features_candidates.yaml`**（SSOT）；**不得**再存在 `trainer/features/feature_spec/features_candidates.yaml`（已移除冗餘拷貝）。
 §3：import trainer.etl_player_profile 後 sys.modules["trainer.etl_player_profile"] 為實作模組。
 §4：trainer.features 顯式 re-export 之底線名稱存在（_validate_feature_spec、_streak_lookback_numba、_run_boundary_lookback_numba 等）。
 
 執行方式（repo 根目錄）：
-  python -m pytest tests/test_review_risks_item2_etl_features.py -v
+  python -m pytest tests/review_risks/test_review_risks_item2_etl_features.py -v
 """
 
 from __future__ import annotations
@@ -57,25 +57,27 @@ class TestEtlPlayerProfileCliHelpContract(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# §2 — feature_spec 雙份 YAML 內容一致
+# §2 — feature_spec 單一路徑（SSOT）
 # ---------------------------------------------------------------------------
 
 
-class TestFeatureSpecYamlSyncContract(unittest.TestCase):
-    """Review §2: When both paths exist, trainer/feature_spec/ and trainer/features/feature_spec/ YAML must match."""
+class TestFeatureSpecSingleSourceContract(unittest.TestCase):
+    """Review §2 (2026-04-18): Canonical candidates YAML only under trainer/feature_spec/."""
 
-    def test_feature_spec_yaml_byte_identical_when_both_exist(self):
-        """If both trainer/feature_spec/features_candidates.yaml and trainer/features/feature_spec/ exist, content must be identical."""
+    def test_canonical_features_candidates_yaml_exists(self):
+        """trainer/feature_spec/features_candidates.yaml must exist (SSOT)."""
         p1 = REPO_ROOT / "trainer" / "feature_spec" / "features_candidates.yaml"
+        self.assertTrue(
+            p1.is_file(),
+            "Canonical spec must exist at trainer/feature_spec/features_candidates.yaml (STATUS Code Review 2.2 etl/features §2).",
+        )
+
+    def test_redundant_features_subpackage_yaml_absent(self):
+        """Duplicate trainer/features/feature_spec/features_candidates.yaml must not exist."""
         p2 = REPO_ROOT / "trainer" / "features" / "feature_spec" / "features_candidates.yaml"
-        if not p1.exists():
-            self.skipTest("trainer/feature_spec/features_candidates.yaml not found")
-        if not p2.exists():
-            self.skipTest("trainer/features/feature_spec/features_candidates.yaml not found")
-        self.assertEqual(
-            p1.read_bytes(),
-            p2.read_bytes(),
-            "trainer/feature_spec/ and trainer/features/feature_spec/ features_candidates.yaml must be identical (STATUS Code Review 2.2 etl/features §2).",
+        self.assertFalse(
+            p2.exists(),
+            "Redundant trainer/features/feature_spec/features_candidates.yaml must not exist; edit trainer/feature_spec/features_candidates.yaml only (STATUS Code Review 2.2 etl/features §2).",
         )
 
 

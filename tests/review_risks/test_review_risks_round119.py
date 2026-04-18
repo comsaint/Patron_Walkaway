@@ -12,7 +12,9 @@ class TestRound119Risks(unittest.TestCase):
         After fix: a missing YAML should not crash on import — fallback to empty spec."""
         import trainer.features as features_mod
 
-        yaml_path = Path(features_mod.__file__).parent / "feature_spec" / "features_candidates.yaml"
+        yaml_path = (
+            Path(features_mod.__file__).parent.parent / "feature_spec" / "features_candidates.yaml"
+        )
         backup_path = yaml_path.with_suffix(".yaml.bak")
 
         if not yaml_path.exists():

@@ -18,6 +18,21 @@
 MODEL_DIR= python -m pytest tests/integration/test_trainer.py::TestModelMetadataPipelineWiring tests/integration/test_phase2_trainer_mlflow.py -q
 ```
 
+## trainer — Feature spec 單一 SSOT（2026-04-18）
+
+**對齊**：候選 Feature Spec 僅保留 **`trainer/feature_spec/features_candidates.yaml`**（與 `FEATURE_SPEC_GUIDE.md`、`trainer/training/trainer.py` 之 `FEATURE_SPEC_PATH` 一致）。已刪除冗餘 **`trainer/features/feature_spec/features_candidates.yaml`**，避免雙份維護與路徑混淆；`trainer/features/features.py` 於未設定 `MODEL_DIR` 時亦自該路徑載入。
+
+| 項目 | 說明 |
+|------|------|
+| 刪除 | `trainer/features/feature_spec/features_candidates.yaml`（及空目錄 `trainer/features/feature_spec/`） |
+| 測試 | [`tests/review_risks/test_review_risks_item2_etl_features.py`](../../tests/review_risks/test_review_risks_item2_etl_features.py) §2 改為：**canonical 檔必存在**、**冗餘路徑不得存在** |
+
+**驗證**（若 `.env` 將 `MODEL_DIR` 指到缺 `feature_spec.yaml` 的目錄，匯入 `trainer.features` 會失敗；可 **`MODEL_DIR=`** 前綴跑 pytest）：
+
+```bash
+MODEL_DIR= python -m pytest tests/review_risks/test_review_risks_item2_etl_features.py -q
+```
+
 ## baseline_models — Phase A（EXECUTION_PLAN F2 + smoke）（2026-04-18）✅ STEP 1–4（CYCLE 結束）
 
 **對齊**：[`baseline_models/EXECUTION_PLAN.md`](../../baseline_models/EXECUTION_PLAN.md) Phase A（F2 契約轉接 + smoke）、[`ssot/baseline_model_eval_ssot.md`](../../ssot/baseline_model_eval_ssot.md) §7 canonical 鍵名、錨點 `trainer/training/threshold_selection.py`（DEC-026）。

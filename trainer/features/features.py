@@ -102,7 +102,8 @@ def _datetime_to_ns_int64(series: pd.Series) -> np.ndarray:
 #: Phase 2 additions (wager_mean_180d, wager_p50_180d from t_bet) are not
 #: included here.  See doc/player_profile_spec.md §14.
 
-# Deploy: use MODEL_DIR/feature_spec.yaml and require it. Repo: use feature_spec/features_candidates.yaml.
+# Deploy: use MODEL_DIR/feature_spec.yaml and require it.
+# Repo SSOT: trainer/feature_spec/features_candidates.yaml (same as BASE_DIR in trainer.py).
 _model_dir_env = os.environ.get("MODEL_DIR")
 if _model_dir_env:
     _yaml_path = pathlib.Path(_model_dir_env) / "feature_spec.yaml"
@@ -114,7 +115,7 @@ if _model_dir_env:
     with open(_yaml_path, "r", encoding="utf-8") as _f:
         _TEMPLATE_SPEC = _yaml.safe_load(_f) or {}
 else:
-    _yaml_path = pathlib.Path(__file__).parent / "feature_spec" / "features_candidates.yaml"
+    _yaml_path = pathlib.Path(__file__).parent.parent / "feature_spec" / "features_candidates.yaml"
     try:
         with open(_yaml_path, "r", encoding="utf-8") as _f:
             _TEMPLATE_SPEC = _yaml.safe_load(_f) or {}
