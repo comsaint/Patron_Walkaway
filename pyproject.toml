@@ -17,6 +17,7 @@ dependencies = [
     "pyyaml",
     "python-dotenv",
     "clickhouse-connect==0.13.0",
+    "duckdb==1.4.4",
     "numba",
     "pyarrow",
 ]
