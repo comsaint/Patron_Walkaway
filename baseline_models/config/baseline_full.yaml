@@ -1,0 +1,107 @@
+# 完整 baseline 評估（與 `python -m baseline_models run` 相同程式路徑）
+# 資料：由 trainer chunk 匯出至倉庫根 `data/baseline_for_baseline_models.parquet`
+#
+# 與同窗 LightGBM 對齊（需 `reference_model.apply_training_provenance: true`）：
+# 先合併 `training_metrics.json` 頂層 `baseline_data_alignment`（trainer 新產物會寫入），
+# 再合併同目錄 `training_provenance.json`（可選手改覆蓋）。列切分對應 Step 7：
+# TRAIN_SPLIT_FRAC=0.7、VALID_SPLIT_FRAC=0.15 時 baseline 的 valid_frac=0.5
+#（剩餘 30% 列中一半 valid、一半 test）。
+#
+# 準備資料（倉庫根範例：2026-02 起與 provenance 一致）：
+#   python baseline_models/scripts/export_baseline_slice_from_chunk.py \
+#     --chunk trainer/.data/chunks/chunk_20260201_20260301.parquet \
+#     --out data/baseline_for_baseline_models.parquet \
+#     --bet-time-start 2026-02-01T00:00:00 --max-rows 300000
+#
+# R3 分子 `current_session_theo` 於此切片為 wager 之工程替代（chunk 無獨立欄位）。
+
+experiment_id: baseline_full_trainer_slice
+
+data_window:
+  start: null
+  end: null
+
+metadata:
+  split_protocol: temporal_slice_no_shuffle
+  feature_set_version: baseline_full_v1
+  label_contract_version: v0
+
+columns:
+  event_time: bet_time
+  label: label
+  censored: censored
+  score: smoke_score
+
+split:
+  train_frac: 0.70
+  valid_frac: 0.50
+
+data_source:
+  kind: parquet
+  path_or_uri: ../../data/baseline_for_baseline_models.parquet
+
+threshold_selection:
+  min_alert_count: 1
+  recall_floor: 0.01
+  min_alerts_per_hour: null
+  window_hours: null
+
+notes_contract:
+  net_sign_convention: "player_perspective_negative_is_loss"
+
+reference_model:
+  enabled: true
+  apply_training_provenance: true
+  training_metrics_path: out/models/20260408-173809-e472fd0/training_metrics.json
+  metrics_section: rated
+
+tier0:
+  r1:
+    enabled: true
+    signals:
+      - pace_drop_ratio
+  r2:
+    enabled: true
+    net_column: loss_proxy_net
+    wager_column: loss_proxy_wager
+  r3:
+    enabled: true
+    variants:
+      - adt30
+    current_session_theo_column: current_session_theo
+    tau_grid:
+      - 0.8
+      - 1.0
+      - 1.2
+      - 1.5
+      - 2.0
+
+tier1:
+  m1:
+    enabled: true
+    max_iter: 10000
+    feature_columns:
+      - pace_drop_ratio
+      - loss_proxy_net
+      - theo_win_sum_30d
+  m2:
+    enabled: true
+    max_iter: 5000
+    feature_columns:
+      - pace_drop_ratio
+      - loss_proxy_net
+      - theo_win_sum_30d
+  s1:
+    enabled: true
+    rankings:
+      - column: pace_drop_ratio
+        high_is_risk: true
+        proxy_type: null
+      - column: loss_proxy_net
+        high_is_risk: false
+        proxy_type: net
+
+tiers:
+  tier0_rules: true
+  tier1_linear_and_s1: true
+  tier2_optional_tree_nb: false

@@ -1,6 +1,6 @@
 """Phase 1 autonomous supervisor state machine (T8A skeleton).
 
-MVP backbone (``PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`` T8A)::
+MVP backbone (``PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`` §3.1 W1-A autonomous; 舊索引曾稱 T8A)::
 
     init -> observe -> mid_snapshot -> final_snapshot -> collect -> report
 

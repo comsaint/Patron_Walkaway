@@ -1,5 +1,240 @@
 **Archive**: Past rounds and older STATUS blocks are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60, 67 Review–75 moved 2026-03-05; Rounds 79–99 moved 2026-03-05; Round 96 onward moved 2026-03-12; **2026-03-22**: Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等長段 → archive.)
 
+## trainer — `model_metadata.json` + MLflow split 邊界（2026-04-18）
+
+**對齊**：Step 7 完成後以 row-level 資料（記憶體 DataFrame 或 DuckDB 讀 split Parquet）彙總 train/valid/test 之 `payout_complete_dtm` 界與列數／正負樣本數；artifact bundle 新增 **`model_metadata.json`**（`schema_version: v1`）；Phase 2 provenance 可選寫入 `model_metadata_path`／`split_train_*` 等字串 params。詳見 [`doc/phase2_provenance_schema.md`](../../doc/phase2_provenance_schema.md)。
+
+| 檔案 | 說明 |
+|------|------|
+| [`trainer/training/trainer.py`](../../trainer/training/trainer.py) | **新增**：`split_row_metadata_from_dataframes`、`split_row_metadata_from_parquet_paths`、`build_model_metadata_document`、`split_row_metadata_to_mlflow_string_params`；`run_pipeline` 組 `_model_meta_doc` 並傳 `save_artifact_bundle(..., model_metadata=...)`；`_log_training_provenance_to_mlflow` 擴充可選路徑與 split params；MLflow `bundle/` 小檔迴圈含 `model_metadata.json` |
+| [`doc/phase2_provenance_schema.md`](../../doc/phase2_provenance_schema.md) | **擴充**：可選 provenance 鍵與「詳盡來源為 `model_metadata.json`」註記 |
+| [`tests/integration/test_trainer.py`](../../tests/integration/test_trainer.py) | **擴充**：`TestModelMetadataPipelineWiring`（AST 契約） |
+
+**文件（公平比較，2026-04-18）**：[`baseline_models/EXECUTION_PLAN.md`](../../baseline_models/EXECUTION_PLAN.md) §4.1 判定表；[`baseline_models/IMPLEMENTATION_PLAN.md`](../../baseline_models/IMPLEMENTATION_PLAN.md) §4.6 E3；[`ssot/baseline_model_eval_ssot.md`](../../ssot/baseline_model_eval_ssot.md) §8.1（SSOT 版本 **v0.4**）。
+
+**驗證**（若本機 `MODEL_DIR` 指到缺 `feature_spec.yaml` 的 deploy 目錄，匯入 `trainer` 會失敗，請 unset 後跑 pytest）：
+
+```bash
+MODEL_DIR= python -m pytest tests/integration/test_trainer.py::TestModelMetadataPipelineWiring tests/integration/test_phase2_trainer_mlflow.py -q
+```
+
+## baseline_models — Phase A（EXECUTION_PLAN F2 + smoke）（2026-04-18）✅ STEP 1–4（CYCLE 結束）
+
+**對齊**：[`baseline_models/EXECUTION_PLAN.md`](../../baseline_models/EXECUTION_PLAN.md) Phase A（F2 契約轉接 + smoke）、[`ssot/baseline_model_eval_ssot.md`](../../ssot/baseline_model_eval_ssot.md) §7 canonical 鍵名、錨點 `trainer/training/threshold_selection.py`（DEC-026）。
+
+### STEP 1 — Builder（2026-04-18）
+
+| 檔案 | 說明 |
+|------|------|
+| `baseline_models/src/baseline_config.py` | **新增**：`BaselineRunConfig`、`load_run_config_yaml` |
+| `baseline_models/src/data_contract.py` | **擴充**：合成表、`apply_time_window`、時序切片（禁 shuffle）、`load_baseline_frame`（synthetic_smoke／parquet）、二元標籤檢查 |
+| `baseline_models/src/eval/dec026_imports.py` | **新增**：自 `walkaway_ml` 或 `trainer` 匯入 `pick_threshold_dec026` |
+| `baseline_models/src/eval/metrics.py` | **實作**：DEC-026 操作點、`pr_auc`、`build_smoke_metrics_row` |
+| `baseline_models/src/eval/runner.py` | **新增**：`run_smoke` 寫入 `baseline_metrics.json`／`run_state.json`／`baseline_summary.md` |
+| `baseline_models/__main__.py` | **接線**：`python -m baseline_models smoke --config … --run-id …` |
+| `baseline_models/config/baseline_default.yaml` | **補齊**：columns／split／metadata／threshold_selection／data_source |
+
+**手動驗證**
+
+```bash
+python -m baseline_models smoke --config baseline_models/config/baseline_default.yaml --run-id 20260418_baseline_smoke_ci
+```
+
+預期：`baseline_models/results/<run_id>/` 下三件套；`baseline_metrics.json` 內 `metrics[0]` 含 `precision_at_recall_0.01`、`threshold_at_recall_0.01`、`pr_auc`、`alerts`／`alerts_rate` 等 canonical 鍵。
+
+**下一輪建議**：Tier-0 R1 接真實欄位；`run_baseline_pipeline` 串 Tier；可選將 `sklearn` 納入 `pyproject.toml` 明確依賴（目前依 `requirements.txt`／可編輯安裝傳遞）。
+
+### STEP 2 — Reviewer（2026-04-18）
+
+| 風險 | 說明與建議 | 建議測試 |
+|------|------------|----------|
+| **R1** | `pick_threshold_dec026` 若兩種包名皆匯入失敗，僅在 import metrics 時爆 `ImportError`；訊息已提示 `pip install -e .`。 | 單測：`dec026_imports` 可載入（與既有 `test_threshold_selection_dec026` 環境一致） |
+| **R2** | `peak_memory_est_mb` 目前恒為 `None`；SSOT §7 要求有值 — smoke 可接受但 full run 需補估或 `psutil`。 | 單測：smoke 列允許 `None` 或改為 `0.0` 並文件化 |
+| **R3** | `proxy_type` 在 smoke 列為 `null`；Gate 前 Tier 實作應填列舉或於 `notes` 明示不可用原因。 | 單測：欄位存在即可；Tier 再斷言非 null |
+| **R4** | `alerts_rate` 定義為「test 上 score≥阈比例」，與營運 alerts/hour 可能不同；摘要已註明對齊 trainer 之 DEC-026。 | 與 `tests/unit/test_threshold_selection_dec026.py` 對照同一 `pick` |
+| **R5** | `temporal_train_valid_test_split` 若 `train_frac` 過大會 raise；YAML 錯誤易在 runtime 才發現。 | 單測：非法比例 `pytest.raises(ValueError)` |
+
+### STEP 3 — Tester（tests only）（2026-04-18）
+
+**新增**：`tests/unit/test_baseline_models_smoke.py`（`run_smoke` 三件套、canonical 鍵、censored 排除、時序切分邊界）
+
+**執行**
+
+```bash
+python -m pytest tests/unit/test_baseline_models_smoke.py -q
+```
+
+### STEP 4 — Tester（修實作至綠）（2026-04-18）
+
+- **pytest**：`tests/unit/test_baseline_models_smoke.py` → **7 passed**（本機 2026-04-18）。
+- **ruff**：`baseline_models/`、`tests/unit/test_baseline_models_smoke.py` → **All checks passed**。
+- **實作微調**：`peak_memory_est_mb` smoke 改為 **`0.0`**（滿足 SSOT §7「有值」；非實測記憶體）。
+
+**計畫下一項建議**
+
+1. Tier-0 **R1** pace 分數與真實欄位接線；**R2** net／wager 分開 metrics 列。
+2. **E2** `baseline_summary.md` 自動分章（pace／loss／ADT、S1）；可選 `baseline_predictions.parquet`。
+3. `pyproject.toml` 是否明列 **`scikit-learn`**（與 lockfile／容器一致）。
+
+## baseline_models — Tier-1 M2（SGDClassifier）（2026-04-18）`/cycle_code`
+
+### STEP 1 — Builder（2026-04-18）✅ STEP 1 完成
+
+| 檔案 | 說明 |
+|------|------|
+| `baseline_models/src/models/sgd_baseline.py` | **實作**：`fit_sgd_baseline`（`SGDClassifier`：`loss=log_loss`、`class_weight=balanced`、`penalty=l2`、`tol=1e-3`、`n_jobs=1`）、`predict_proba_positive` |
+| `baseline_models/src/baseline_config.py` | **新增**：`tier1_m2_enabled`／`tier1_m2_feature_columns`／`tier1_m2_max_iter` |
+| `baseline_models/src/eval/runner.py` | **接線**：train 擬合 M2、test `predict_proba`；`run_state.tier1_m2`；`baseline_summary` M2 小節 |
+| `baseline_models/config/baseline_default.yaml` | **新增**：`tier1.m2`（與 M1 同特徵欄、`max_iter: 5000`） |
+| `baseline_models/EXECUTION_PLAN.md` | **更新**：總表與 Phase C 之 M2 為 ✅ |
+
+**手動驗證**
+
+```bash
+python -m baseline_models smoke --config baseline_models/config/baseline_default.yaml --run-id 20260418_baseline_m2_ci
+```
+
+預期：`baseline_metrics.json` 含 `model_type=M2_SGDClassifier`；`run_state.json` 含 `tier1_m2`；`baseline_summary.md` 含「Tier-1 M2（SGDClassifier）」小節。
+
+**下一輪建議**：STEP 2 code review；STEP 3 單測（M2 列、`fit_sgd` 單類別 guard）；STEP 4 pytest／ruff；再接 **S1** 或 R3 `tau` 掃描。
+
+### STEP 2 — Reviewer（2026-04-18）✅ STEP 2 完成
+
+| 風險 | 說明與建議 | 建議測試 |
+|------|------------|----------|
+| **R1** | 訓練切片僅單一類別時 `fit_sgd_baseline` 與 M1 同樣 `ValueError`；runner 未先攔，錯訊來自 sklearn 前即自檢。 | 單測：`fit_sgd_baseline` 於全 0 標籤 raises |
+| **R2** | `peak_memory_est_mb` 仍為占位 `0.0`（與 M1 一致）；大表 smoke 若要真估需 `psutil` 或 RSS 取樣。 | 維持現狀；full run 再議 |
+| **R3** | M1／M2 特徵欄若 YAML 不一致，一欄缺會 `KeyError`；與 M1 分開驗證欄存在性。 | 單測：預設 yaml 下 smoke 成功即覆蓋 |
+| **R4** | `SGDClassifier` 未收斂時僅 sklearn warning，不影響 metrics；`max_iter` 過低可能劣於 M1。 | 預設 `max_iter: 5000`；觀察 CI warning |
+| **R5** | `predict_proba_positive` 若未來改用 `modified_huber` 等需確認 `classes_` 仍含 `1`。 | 單測：合成資料上機率 ∈ \[0,1\] 且 len 對齊 test |
+
+### STEP 3 — Tester（tests only）（2026-04-18）✅ STEP 3 完成
+
+**新增／調整**：`tests/unit/test_baseline_models_smoke.py` — `len(metrics) >= 7`、`M2_SGDClassifier` 列斷言、`tier1_m2` 設定斷言；`test_fit_sgd_baseline_rejects_single_class`（僅訓練標籤一類）。
+
+**執行**
+
+```bash
+python -m pytest tests/unit/test_baseline_models_smoke.py -q
+```
+
+### STEP 4 — Tester（修實作至綠）（2026-04-18）✅ 全部完成，CYCLE 結束
+
+- **pytest**：`tests/unit/test_baseline_models_smoke.py` → **15 passed**（本機 2026-04-18）。
+- **ruff**：`baseline_models/`、`tests/unit/test_baseline_models_smoke.py` → **All checks passed**。
+- **實作**：STEP 4 無需改 production（STEP 1 已滿足；STEP 3 測試全綠）。
+
+**計畫下一項建議**
+
+1. ~~**S1**~~：**✅ 已完成**（見下方「baseline_models — Tier-1 S1」輪次）。
+2. **R3 `tau` 網格**（若 Gate 要求）。
+3. **E2**：LightGBM 對照表、`baseline_predictions.parquet`（可選）。
+
+## baseline_models — Tier-1 S1（單特徵排名）（2026-04-18）`/cycle_code`
+
+### STEP 1 — Builder（2026-04-18）✅ STEP 1 完成
+
+| 檔案 | 說明 |
+|------|------|
+| `baseline_models/src/rules/single_feature_rank.py` | **硬化**：`to_numeric` 後 NaN fail-fast；回傳 `float64` |
+| `baseline_models/src/baseline_config.py` | **新增**：`tier1_s1_enabled`、`tier1_s1_rankings`（`list[tuple[column, high_is_risk, proxy_type]]`） |
+| `baseline_models/src/eval/runner.py` | **接線**：test 上 S1 分數、`build_eval_metrics_row`（`baseline_family=rule`、`model_type=S1_rank:<col>`）、`run_state.tier1_s1`、`baseline_summary` S1 小節 |
+| `baseline_models/config/baseline_default.yaml` | **新增**：`tier1.s1.rankings`（`pace_drop_ratio` + `loss_proxy_net`／`proxy_type=net`） |
+| `baseline_models/EXECUTION_PLAN.md` | **更新**：Phase C S1 ✅、E2 表列 S1 小節已自動 |
+
+**手動驗證**
+
+```bash
+python -m baseline_models smoke --config baseline_models/config/baseline_default.yaml --run-id 20260418_baseline_s1_ci
+```
+
+預期：`baseline_metrics.json` 含兩筆 `S1_rank:*`；`run_state.tier1_s1.rankings` 與 YAML 一致；summary 無「S1：尚未產出」占位句。
+
+**下一輪建議**：STEP 2 review；STEP 3 單測；STEP 4 pytest／ruff；再接 **R3 `tau`** 或 **E2 LightGBM**。
+
+### STEP 2 — Reviewer（2026-04-18）✅ STEP 2 完成
+
+| 風險 | 說明與建議 | 建議測試 |
+|------|------------|----------|
+| **R1** | `high_is_risk` 設錯會顛倒 PR 方向；YAML 須與欄位語意對齊（net 常用 `high_is_risk: false` 再取負）。 | 預設 yaml 斷言 `loss_proxy_net` 列 `proxy_type=net` |
+| **R2** | `tier1.s1.rankings` 非 list／元素非 mapping 時 `load_run_config_yaml` 即 raise；與其他 tier 一致。 | 可選：壞 YAML 單測 |
+| **R3** | S1 與 R1 共用 pace 欄但 **model_type** 不同；報表解讀時勿混為同一 baseline。 | smoke 同時存在 `R1_pace:` 與 `S1_rank:` |
+| **R4** | `proxy_type` 任意字串目前不驗證列舉；誤拼僅影響報表對齊 R2。 | 維持；Gate 前可 tighten |
+
+### STEP 3 — Tester（tests only）（2026-04-18）✅ STEP 3 完成
+
+**新增／調整**：`tests/unit/test_baseline_models_smoke.py` — `len(metrics) >= 9`、`S1_rank:*` 與 `proxy_type` 斷言、`tier1_s1_rankings` 設定、`test_single_feature_scores_rejects_nan`。
+
+**執行**：`python -m pytest tests/unit/test_baseline_models_smoke.py -q`
+
+### STEP 4 — Tester（修實作至綠）（2026-04-18）✅ 全部完成，CYCLE 結束
+
+- **pytest**：`tests/unit/test_baseline_models_smoke.py` → **16 passed**（本機 2026-04-18）。
+- **ruff**：`baseline_models/`、上列測試檔 → **All checks passed**。
+
+**計畫下一項建議**
+
+1. **R3 `tau` 網格掃描**（若 Gate 必備）。
+2. **E2**：LightGBM 同窗摘要、`run_state` 欄位化 0.3。
+3. **Phase E** O1／O2（可選）。
+
+## Precision uplift orchestrator — Phase 2 T10：訓練產物 fail-fast + `phase2_experiment_matrix`（2026-04-18）✅ STEP 1–4（CYCLE 完）
+
+**背景**（對齊 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` **W2-B** Phase 2 核心待辦）：在 **`--phase2-run-trainer-jobs`** 且 **`trainer_jobs.all_ok`** 時，補上 **訓練指標檔** 存在與 **PAT@1%** 可解析之 **fail-fast**（`E_ARTIFACT_MISSING`／`E_NO_DATA_WINDOW`）；並在 gate 前寫入 **`phase2_experiment_matrix`** 作為每實驗統一摘要（供 bundle／`phase2_collect`）。
+
+| 檔案 | 說明 |
+|------|------|
+| `investigations/precision_uplift_recall_1pct/orchestrator/collectors.py` | **`validate_phase2_training_metrics_after_trainer_jobs`**、**`build_phase2_experiment_matrix`**、**`_phase2_training_metrics_pat_preview`**；**`collect_summary_phase2_plan_for_run_state`** 增加 **`phase2_experiment_matrix_rows`** |
+| `investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py` | merge inferred 後呼叫 validate；失敗時 **`trainer_jobs.all_ok=False`**、**`bundle['errors']`**、step **failed**、**exit 7**；**`phase2_gate_report`** 前 build matrix 並 flush bundle／run_state |
+
+**手動驗證建議**
+
+1. 具完整 phase2 組態與 DB mock 時：`--phase phase2 --config … --run-id … --phase2-run-trainer-jobs`，確認成功後 **`phase2_bundle.json`** 含 **`phase2_experiment_matrix`**，且 **`job_specs`** 之 metrics 路徑可讀。
+2. 刻意刪除某 job 之 **`training_metrics.json`** 後重跑（或讓檔案不含 **`model_default.test_precision_at_recall_0.01`**）：應 **exit 7**，`errors[].code` 為 **`E_ARTIFACT_MISSING`** 或 **`E_NO_DATA_WINDOW`**。
+
+**下一輪建議**：STEP 2 code review；STEP 3 單元測試；STEP 4 修到 pytest／ruff 綠。
+
+**文件路徑更新（2026-04-18）**：舊檔 **`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`** 已由 **`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`** 承接（與 **`PRECISION_UPLIFT_R1PCT_SSOT.md`** 文件角色表一致）；本檔歷史段落中凡指涉 MVP tasklist 之路徑已改寫。
+
+### STEP 2 — Reviewer（2026-04-18）
+
+| 風險 | 說明與建議 | 建議測試 |
+|------|------------|----------|
+| **R1** | **`validate`** 僅在 **`trainer_jobs.executed` and `all_ok`** 時執行；若未來有人手改 bundle 讓 **`all_ok` True** 但某 **`results[].ok` False**，validate 仍可能漏該列。建議：改為「**任一** `results` 中 **`ok` True** 的列皆需通過 path／PAT」已與 `all_ok` 語意對齊；若需更嚴可改為逐 **`results`** 驗證而非僅 **`job_specs`** 交集。 | 單測：`all_ok` True、單一 result `ok` False（應維持現行由 runner 保證不發生） |
+| **R2** | **`build_phase2_experiment_matrix`** 在 **gate** 前執行；**`merge_phase2_pat_series_from_shared_and_per_job`** 仍可能改寫 bundle。矩陣內 **PAT 預覽** 來自 harvest／per-job，**不**自動重算 merge 後的 series。建議：報表若需與 gate 100% 一致，讀 **`phase2_pat_series_by_experiment`** 而非僅 matrix。 | 單測：有／無 **`job_training_harvest`** 時 matrix 欄位為 **None** 之行為 |
+| **R3** | **PAT 缺失** 一律 **`E_NO_DATA_WINDOW`**（與 shared backtest ingest 語意一致）；若 log 判讀者期望「僅窗內無資料」才用該碼，可能略寬。建議：維持現狀並在 Runbook 註明「訓練 metrics 無 PAT 視同觀測契約不足」。 | 單測：JSON 合法、`model_default` 無 **`test_precision_at_recall_0.01`** → **`E_NO_DATA_WINDOW`** |
+| **效能** | **`build_phase2_experiment_matrix`** 僅掃描已載入之 list，**O(n jobs)**；gate 前多一次 **bundle 寫碟**（與既有 `merged_pat` 路徑類比）。筆電可接受。 | 不需額外負載測試 |
+
+### STEP 3 — Tester（tests only）（2026-04-18）
+
+**新增測試**（`tests/unit/test_precision_uplift_phase1_orchestrator.py`）
+
+- **`test_validate_phase2_training_metrics_*`**：未執行 trainer／`all_ok` False 略過；有 PAT 通過；缺檔 **`E_ARTIFACT_MISSING`**；無 PAT **`E_NO_DATA_WINDOW`**
+- **`test_build_phase2_experiment_matrix_merges_harvest_and_per_job`**：矩陣欄位與 **`collect_summary_phase2_plan_for_run_state`** 之 **`phase2_experiment_matrix_rows`**
+
+**執行方式**
+
+```bash
+python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py \
+  -k "validate_phase2_training_metrics or build_phase2_experiment_matrix" -q
+```
+
+**結果**：6 passed（本機 2026-04-18）。
+
+### STEP 4 — Tester（修實作／對齊至全綠）（2026-04-18）
+
+- **pytest**：`tests/unit/test_precision_uplift_phase1_orchestrator.py` → **239 passed**
+- **ruff**：`investigations/precision_uplift_recall_1pct/orchestrator/collectors.py`、`run_pipeline.py`、`tests/unit/test_precision_uplift_phase1_orchestrator.py` → **All checks passed**
+- **Runbook drift**（測試未改）：`test_orchestrator_runbook_documents_phase2_error_code_reference` 需 **`EXIT_PHASE1_AUTONOMOUS_PENDING`**／**`--autonomous-once`** 字樣 → 已補 **`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md`** **§1.8.2** 程式退出碼段落
+
+**計畫下一項建議**
+
+1. **T10 其餘 fail-fast**：harvest 步驟在 **`--phase2-run-trainer-jobs`** 後對 **`found: false`** 硬失敗（與本次「trainer all_ok 後」驗證互補或收斂為單一路徑）。
+2. **報表**：`report_builder` 可選讀 **`phase2_experiment_matrix`** 摘要區塊（避免 gate 讀者只看 track md）。
+3. **跨窗矩陣**：仍待 **`per_window` 產物契約** 與 collector 彙整（見 MVP **T10** 大項未勾子項）。
+
+---
+
 ## Precision uplift orchestrator — T8A/FSM：`--autonomous-advance-mid-when-eligible`（2026-04-18）
 
 **背景**：stub tick 前預算 **`observe_context`** 傳入 **`after_stub_tick`**；**opt-in** 時 **`mid_snapshot_eligible`** 則 **observe→mid_snapshot**（該 tick **不**遞增 **`stub_observe_ticks`**）。**`--autonomous-mid-r1-once`** 補 **`allow_mid_this_tick`**（含 **init→observe** 且 eligible 之首 tick），避免 **mid** 無 op 重複 dispatch。
@@ -77,7 +312,7 @@
 |------|------|
 | `orchestrator/phase1_autonomous_fsm.py` | **`after_stub_tick`**：`tick_seq`、`checkpoint`（**`cursor_before`／`cursor_after`／`tick_at`／`config_fingerprint`**）；**`config_fingerprint`** 可選 |
 | `orchestrator/run_pipeline.py` | stub tick 傳入 **`input_summary.fingerprint`**；**`fingerprint_mismatch`** 時 **`pop("phase1_autonomous")`** 避免舊 cursor 污染新 config |
-| `PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | **T8A** checkpoint 項改 **[x]**（註明 stub／長跑仍待） |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` | **T8A** checkpoint 項改 **[x]**（註明 stub／長跑仍待） |
 | `tests/unit/test_precision_uplift_phase1_orchestrator.py` | checkpoint／**`tick_seq`** 斷言；**`test_phase1_autonomous_resume_once_continues_tick_seq`** |
 
 **手動驗證**：同一 **`run_id`** 先 **`--autonomous-once`** 再 **`--resume --autonomous-once`** → **`tick_seq`** 遞增、**`checkpoint.cursor_before`** 為 **`observe`**（第二 tick）。
@@ -93,7 +328,7 @@
 | `orchestrator/phase1_autonomous_fsm.py` | **`read_autonomous_cursor`**、**`after_stub_tick`**（**`init→observe`**；**`observe`** 自環 **`stub_observe_ticks`**） |
 | `orchestrator/run_pipeline.py` | **`--autonomous-once`**；**`main`** 與 **`--dry-run`**／非 phase1 autonomous 互斥 **exit 2**；**`_main_phase1`** 在 **`--autonomous-once`** 且無 fingerprint mismatch 時自磁碟合併 **`phase1_autonomous`** 再寫 preflight，避免 tick 鏈被覆蓋 |
 | `PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | **§1.8.2** 補 **`--autonomous-once`** 與 **exit 0** 語意 |
-| `PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | **T8A** 第一項補 **autonomous-once** |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` | **T8A** 第一項補 **autonomous-once** |
 | `tests/unit/test_precision_uplift_phase1_orchestrator.py` | FSM stub 單測 + CLI 互斥 + **雙次 once 鏈**（**`uuid`** `run_id` 防殘檔） |
 
 **手動驗證**：`... run_pipeline.py --phase phase1 --config ... --run-id <rid> --mode autonomous --autonomous-once --skip-backtest-smoke` 連跑兩次 → **`stub_observe_ticks`** 遞增；併 **`--dry-run`** 應 **exit 2**。
@@ -110,20 +345,20 @@
 | `investigations/.../orchestrator/run_pipeline.py` | **`--mode batch\|autonomous`**；**phase1**：autonomous + **非** dry-run → **exit 11**；autonomous + dry-run **READY** 時寫 **`phase1_autonomous`** + **`phase1_autonomous_fsm_snapshot`**；**`main`**：非 phase1 之 autonomous → **exit 2** |
 | `investigations/.../orchestrator/common_exit_codes.py` | **`EXIT_PHASE1_AUTONOMOUS_PENDING = 11`** |
 | `investigations/.../PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | **§1.8.2** 補 **11** 說明 |
-| `investigations/.../PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | **T8A** 前兩項改 **[x]**，checkpoint 仍 **[ ]** |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` | **T8A** 前兩項改 **[x]**，checkpoint 仍 **[ ]** |
 | `tests/unit/test_precision_uplift_phase1_orchestrator.py` | FSM 單測 + **`main`** 三情境（phase2 拒絕、dry-run 寫入、非 dry-run **11**） |
 
 **手動驗證**：`python investigations/.../run_pipeline.py --phase phase1 --config ... --run-id test_fsm --dry-run --mode autonomous`（預設 **`--mode batch`** 行為不變）；非 dry-run autonomous 應 **stderr** 提示並 **exit 11**。
 
 **建議下一輪**：T8A **checkpoint 寫入／`--resume` 驅動 `current_step` 前進**；或 **observe 單次 tick**（sleep + 條件檢查 stub）。
 
-## Precision uplift orchestrator — MVP_TASKLIST T6：後續任務與「最小規格」整併 + MVP 限制文案（2026-04-18）
+## Precision uplift orchestrator — Implementation Plan（PIT parity；舊輪稱 MVP_TASKLIST T6）：後續任務與「最小規格」整併 + MVP 限制文案（2026-04-18）
 
 **背景**：使用者 **「yes go on」** 承接上一輪 STATUS **建議下一輪**之 tasklist 雙軌整併；無程式變更。
 
 | 檔案 | 說明 |
 |------|------|
-| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | **§T6**：**「後續任務（P1 parity 補強）」** 三項改 **[x]** 並註明與 **「P1 parity 最小規格」** 單一真相；**MVP 限制** 改寫為 **`WARN_ONLY` vs `STRICT`**、自動 JSON 區塊與時區欄位現況 |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` | **§3.1 W1-A／W1-B4**：**「後續任務（P1 parity 補強）」** 三項改 **[x]** 並註明與 **「P1 parity 最小規格」** 單一真相；**MVP 限制** 改寫為 **`WARN_ONLY` vs `STRICT`**、自動 JSON 區塊與時區欄位現況 |
 
 **手動驗證**：開啟 tasklist **§T6**，確認 **後續任務** 與 **最小規格**／**DoD** 敘述一致、無互斥 **[ ]**。
 
@@ -133,11 +368,11 @@
 
 ### STEP 1 — Builder
 
-**背景**：對齊使用者請求 **「Phase 1 延伸」** 與 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T6** 之 **P1 parity DoD**（最少 3 個 gate／collector 單測）；**`PLAN.md`** 仍為 repo 總索引（本輪子範圍見 MVP tasklist）；**`DECISION_LOG.md`** 本輪無新增條目。
+**背景**：對齊使用者請求 **「Phase 1 延伸」** 與 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` **§3.1 W1-A／W1-B4** 之 **P1 parity DoD**（最少 3 個 gate／collector 單測）；**`PLAN.md`** 仍為 repo 總索引（本輪子範圍見 **Implementation Plan**）；**`DECISION_LOG.md`** 本輪無新增條目。
 
 | 檔案 | 說明 |
 |------|------|
-| `investigations/precision_uplift_recall_1pct/orchestrator/collectors.py` | 新增公開 **`collect_phase1_pit_parity(...)`** 委派 **`_collect_phase1_pit_parity`**；**`collect_phase1_artifacts`** 改呼叫公開函式（與 MVP tasklist 函式名一致） |
+| `investigations/precision_uplift_recall_1pct/orchestrator/collectors.py` | 新增公開 **`collect_phase1_pit_parity(...)`** 委派 **`_collect_phase1_pit_parity`**；**`collect_phase1_artifacts`** 改呼叫公開函式（與 Implementation Plan 函式名一致） |
 | `investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase1.yaml` | 註解更正：**`pit_parity_mode` STRICT／WARN_ONLY** 已由 **`evaluators.evaluate_phase1_gate`** 套用，非「待接線」 |
 
 **手動驗證**：`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q -p no:langsmith -k "strict_pit or warn_only_passes_with_pit or validated_at_column_missing" --tb=short`；全檔：`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q -p no:langsmith --tb=line`。
@@ -165,7 +400,7 @@
 | Pytest | **`tests/unit/test_precision_uplift_phase1_orchestrator.py`**：**199 passed** |
 | Ruff | **`collectors.py`**、上列測試檔：**通過** |
 
-**MVP_TASKLIST**：**T6 P1 parity DoD**「最少 3 個單元測試」已勾選（見 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`）。
+**Implementation Plan**：**P1 parity DoD**「最少 3 個單元測試」已勾選（見 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`）。
 
 **建議下一輪 Plan**：**T8A–T8D**（Phase 1 autonomous）；或 MVP **T6「後續任務」** 若仍與最小規格表並存，建議整併 tasklist 勾選避免雙軌敘述。
 

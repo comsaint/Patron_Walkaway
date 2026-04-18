@@ -18,8 +18,13 @@
 | `training_metrics_path` | string | 訓練指標檔案路徑（如 `training_metrics.json`）。 |
 | `pipeline_diagnostics_path` | string | Pipeline／資源診斷 JSON 路徑（與 artifact 目錄內 `pipeline_diagnostics.json` 對齊；見 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`）。 |
 | `pipeline_diagnostics_rel_path` | string | 相對路徑慣例（例如 `{artifact 目錄最後一層}/pipeline_diagnostics.json`，常見為 `models/pipeline_diagnostics.json`），便於跨機或 deploy bundle 對照。 |
+| `model_metadata_path` | string（可選） | 本機 `model_metadata.json` 絕對路徑（與 artifact bundle 同目錄）。 |
+| `model_metadata_rel_path` | string（可選） | 相對慣例：`{artifact 目錄最後一層}/model_metadata.json`。 |
+| `split_train_start` / `split_train_end` | string（可選） | 訓練切分內 `payout_complete_dtm` 最小／最大（ISO）；無資料則省略。 |
+| `split_valid_start` / `split_valid_end` | string（可選） | 驗證切分時間界。 |
+| `split_test_start` / `split_test_end` | string（可選） | 測試切分時間界。 |
 
-以上欄位以 **MLflow params 或 tags** 寫入 run；具體以 `trainer.core.mlflow_utils` 實作為準。  
+以上欄位以 **MLflow params 或 tags** 寫入 run；具體以 `trainer.core.mlflow_utils` 實作為準。完整 train/valid/test 摘要與訓練參數以 artifact **`model_metadata.json`**（schema `v1`）為單一詳盡來源。  
 給定 `model_version`，可於 MLflow UI 或 API 以 tag/param 查詢對應 run 與 artifact。
 
 **MLflow Artifacts（訓練 run，可選）**：除上述路徑欄位外，成功路徑可能另以 `log_artifact_safe` 上傳小檔（例如 `training_metrics.json`、`pipeline_diagnostics.json`、`feature_spec.yaml`、`model_version`），Artifact 路徑前綴常為 `bundle/`；細節見 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` §4。

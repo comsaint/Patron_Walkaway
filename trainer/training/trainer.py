@@ -4877,6 +4877,219 @@ def train_single_rated_model(
 
 
 # ---------------------------------------------------------------------------
+# Model bundle metadata (train/valid/test time bounds + run params)
+# ---------------------------------------------------------------------------
+
+
+def _payout_bounds_iso_from_series(series: pd.Series) -> Tuple[Optional[str], Optional[str]]:
+    """Return ``(min_iso, max_iso)`` for ``payout_complete_dtm``-like *series*; empty → (None, None)."""
+    if series is None or len(series) == 0:
+        return (None, None)
+    ts = pd.to_datetime(series, errors="coerce")
+    if bool(ts.isna().all()):
+        return (None, None)
+    ts_naive = ts.dt.tz_localize(None) if getattr(ts.dt, "tz", None) is not None else ts
+    mn = ts_naive.min()
+    mx = ts_naive.max()
+    if pd.isna(mn) or pd.isna(mx):
+        return (None, None)
+    return (str(pd.Timestamp(mn).isoformat()), str(pd.Timestamp(mx).isoformat()))
+
+
+def _one_split_block_from_dataframe(df: Optional[pd.DataFrame]) -> dict[str, Any]:
+    """Build one split summary dict from an in-memory DataFrame (may be empty)."""
+    if df is None or df.empty:
+        return {
+            "start": None,
+            "end": None,
+            "rows": 0,
+            "positives": 0,
+            "negatives": 0,
+        }
+    if "payout_complete_dtm" not in df.columns:
+        return {
+            "start": None,
+            "end": None,
+            "rows": int(len(df)),
+            "positives": 0,
+            "negatives": int(len(df)),
+        }
+    start_iso, end_iso = _payout_bounds_iso_from_series(df["payout_complete_dtm"])
+    n = int(len(df))
+    if "label" in df.columns:
+        pos = int(pd.to_numeric(df["label"], errors="coerce").fillna(0).astype(int).sum())
+        pos = max(0, min(n, pos))
+        neg = n - pos
+    else:
+        pos, neg = 0, n
+    return {
+        "start": start_iso,
+        "end": end_iso,
+        "rows": n,
+        "positives": pos,
+        "negatives": neg,
+    }
+
+
+def split_row_metadata_from_dataframes(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+) -> dict[str, dict[str, Any]]:
+    """Row-level split summaries from in-memory train/valid/test frames."""
+    return {
+        "train": _one_split_block_from_dataframe(train_df),
+        "valid": _one_split_block_from_dataframe(valid_df),
+        "test": _one_split_block_from_dataframe(test_df),
+    }
+
+
+def split_row_metadata_from_parquet_paths(
+    train_path: Path,
+    valid_path: Path,
+    test_path: Path,
+) -> dict[str, dict[str, Any]]:
+    """Row-level split summaries via DuckDB aggregates (no full-frame load)."""
+    import duckdb
+
+    def _q_one(p: Path) -> dict[str, Any]:
+        s = str(p).replace("'", "''")
+        con = duckdb.connect(":memory:")
+        try:
+            row = con.execute(
+                f"SELECT count(*) AS n, "
+                f"coalesce(sum(cast(label AS INTEGER)), 0) AS pos, "
+                f"min(payout_complete_dtm) AS dt_min, "
+                f"max(payout_complete_dtm) AS dt_max "
+                f"FROM read_parquet('{s}')"
+            ).fetchone()
+        finally:
+            con.close()
+        if row is None:
+            return {"start": None, "end": None, "rows": 0, "positives": 0, "negatives": 0}
+        n = int(row[0]) if row[0] is not None else 0
+        pos = int(row[1]) if row[1] is not None else 0
+        pos = max(0, min(n, pos))
+        neg = n - pos
+        dt_min = row[2]
+        dt_max = row[3]
+        start_iso = str(pd.Timestamp(dt_min).isoformat()) if dt_min is not None else None
+        end_iso = str(pd.Timestamp(dt_max).isoformat()) if dt_max is not None else None
+        return {
+            "start": start_iso,
+            "end": end_iso,
+            "rows": n,
+            "positives": pos,
+            "negatives": neg,
+        }
+
+    return {
+        "train": _q_one(train_path),
+        "valid": _q_one(valid_path),
+        "test": _q_one(test_path),
+    }
+
+
+def split_row_metadata_to_mlflow_string_params(
+    splits: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    """Flatten split ``start``/``end`` into MLflow string params (length-capped)."""
+    _max = 200
+    out: dict[str, str] = {}
+    for split_name in ("train", "valid", "test"):
+        block = splits.get(split_name) or {}
+        for k in ("start", "end"):
+            v = block.get(k)
+            if v is None:
+                continue
+            key = f"split_{split_name}_{k}"
+            s = str(v)
+            out[key] = s if len(s) <= _max else s[:_max]
+    return out
+
+
+def _git_commit_short_or_nogit() -> str:
+    """Return ``git rev-parse --short HEAD`` or ``\"nogit\"`` (same semantics as provenance)."""
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=BASE_DIR,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return "nogit"
+
+
+def build_model_metadata_document(
+    *,
+    model_version: str,
+    effective_start: Any,
+    effective_end: Any,
+    splits: dict[str, dict[str, Any]],
+    use_local_parquet: bool,
+    recent_chunks: Optional[int],
+    sample_rated_n: Optional[int],
+    skip_optuna: bool,
+    neg_sample_frac_effective: float,
+    bundle_dir: Path,
+    combined_metrics: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Assemble ``model_metadata.json`` payload (versioned schema v1)."""
+    def _iso_any(x: Any) -> Any:
+        if x is None:
+            return None
+        if hasattr(x, "isoformat"):
+            return x.isoformat()
+        return str(x)
+
+    _test_frac = max(0.0, 1.0 - float(TRAIN_SPLIT_FRAC) - float(VALID_SPLIT_FRAC))
+    _rated = (combined_metrics or {}).get("rated") if isinstance(combined_metrics, dict) else None
+    _rated_d = _rated if isinstance(_rated, dict) else {}
+    return {
+        "schema_version": "v1",
+        "model_version": model_version,
+        "git_commit": _git_commit_short_or_nogit(),
+        "trained_at_utc": datetime.now(timezone.utc).isoformat(),
+        "data_source": {
+            "type": "local_parquet" if use_local_parquet else "clickhouse",
+            "use_local_parquet": bool(use_local_parquet),
+            "recent_chunks": recent_chunks,
+        },
+        "global_window": {
+            "start": _iso_any(effective_start),
+            "end": _iso_any(effective_end),
+        },
+        "split_method": {
+            "type": "temporal_row_frac_sorted_by_payout_complete_dtm",
+            "train_frac": float(TRAIN_SPLIT_FRAC),
+            "valid_frac": float(VALID_SPLIT_FRAC),
+            "test_frac": float(_test_frac),
+        },
+        "splits": splits,
+        "training_params": {
+            "skip_optuna": bool(skip_optuna),
+            "sample_rated_n": sample_rated_n,
+            "neg_sample_frac_effective": float(neg_sample_frac_effective),
+            "threshold_min_recall": THRESHOLD_MIN_RECALL,
+            "threshold_min_alert_count": int(THRESHOLD_MIN_ALERT_COUNT),
+            "lightgbm_device_requested": _rated_d.get("lightgbm_device_requested"),
+            "lightgbm_device_effective": _rated_d.get("lightgbm_device_type"),
+            "lightgbm_device_fallback": _rated_d.get("lightgbm_device_fallback"),
+        },
+        "artifacts": {
+            "bundle_dir": str(bundle_dir.resolve()),
+            "training_metrics_path": str((bundle_dir / "training_metrics.json").resolve()),
+            "pipeline_diagnostics_path": str((bundle_dir / "pipeline_diagnostics.json").resolve()),
+            "model_metadata_path": str((bundle_dir / "model_metadata.json").resolve()),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Artifact bundle
 # ---------------------------------------------------------------------------
 
@@ -4890,6 +5103,9 @@ def _log_training_provenance_to_mlflow(
     git_commit: Optional[str] = None,
     pipeline_diagnostics_path: Optional[str] = None,
     pipeline_diagnostics_rel_path: Optional[str] = None,
+    model_metadata_path: Optional[str] = None,
+    model_metadata_rel_path: Optional[str] = None,
+    split_boundary_params: Optional[dict[str, str]] = None,
 ) -> None:
     """Phase 2 T2: Log training provenance to MLflow (no-op when URI unset/unreachable).
 
@@ -4899,6 +5115,9 @@ def _log_training_provenance_to_mlflow(
     ``pipeline_diagnostics_*`` default from ``artifact_dir`` when omitted (same directory
     as ``training_metrics.json`` convention). Provenance may run before the diagnostics
     file is written; paths still denote the canonical bundle location.
+
+    Optional ``model_metadata_*`` and ``split_boundary_params`` extend the Phase 2 schema
+    with per-split time bounds (string params) and ``model_metadata.json`` paths.
     """
     if git_commit is None:
         try:
@@ -4933,6 +5152,12 @@ def _log_training_provenance_to_mlflow(
         "pipeline_diagnostics_path": _pd_path,
         "pipeline_diagnostics_rel_path": _pd_rel,
     }
+    if model_metadata_path:
+        params["model_metadata_path"] = model_metadata_path
+    if model_metadata_rel_path:
+        params["model_metadata_rel_path"] = model_metadata_rel_path
+    if split_boundary_params:
+        params.update(split_boundary_params)
     # T12: if pipeline already started a run (e.g. at pipeline entry), log to it; else start one.
     if has_active_run():
         log_params_safe(params)
@@ -4953,6 +5178,41 @@ def _sha256_file_hex(path: Path, chunk_bytes: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
+def _make_baseline_training_alignment_payload(
+    effective_start: Any,
+    effective_end: Any,
+    train_split_frac: float,
+    valid_split_frac_of_total: float,
+) -> dict[str, Any]:
+    """供 ``baseline_data_alignment``／``training_provenance.json``：與 baseline 契約對齊。"""
+    def _iso(x: Any) -> Any:
+        if x is None:
+            return None
+        if hasattr(x, "isoformat"):
+            return x.isoformat()
+        return str(x)
+
+    den = 1.0 - float(train_split_frac)
+    baseline_valid = (
+        float(valid_split_frac_of_total) / den if den > 1e-15 else 0.5
+    )
+    return {
+        "data_window": {
+            "start": _iso(effective_start),
+            "end": _iso(effective_end),
+        },
+        "split": {
+            "train_frac": float(train_split_frac),
+            "valid_frac": float(baseline_valid),
+        },
+        "_trainer_split_row_fractions": {
+            "TRAIN_SPLIT_FRAC": float(train_split_frac),
+            "VALID_SPLIT_FRAC": float(valid_split_frac_of_total),
+            "note": "Baseline valid_frac = VALID_SPLIT_FRAC / (1 - TRAIN_SPLIT_FRAC).",
+        },
+    }
+
+
 def save_artifact_bundle(
     rated: Optional[dict],
     feature_cols: List[str],
@@ -4962,6 +5222,8 @@ def save_artifact_bundle(
     feature_spec_path: Optional[Path] = None,
     neg_sample_frac: float = 1.0,
     bundle_dir: Optional[Path] = None,
+    baseline_training_alignment: Optional[dict[str, Any]] = None,
+    model_metadata: Optional[dict[str, Any]] = None,
 ) -> None:
     """Write all model artifacts atomically (v10 single rated model, DEC-021).
 
@@ -4977,6 +5239,7 @@ def save_artifact_bundle(
     models/model_version          <version string>
     models/training_metrics.json  per-model metrics (rated only)
     models/feature_spec.yaml      frozen feature spec snapshot (DEC-024, R3501)
+    models/model_metadata.json    train/valid/test time bounds + run params (schema v1)
 
     Legacy single-model format (for backward compat with existing scorer)
     -----------------------------------------------------------------------
@@ -5060,32 +5323,44 @@ def save_artifact_bundle(
             else rated.get("_uncalibrated", False)
         ),
     }
+    _metrics_root: dict[str, Any] = {
+        **combined_metrics,
+        "model_version": model_version,
+        # R301: record sampling metadata so artifacts can be audited
+        # even when loaded later.  None = full rated population was used.
+        "sample_rated_n": sample_rated_n,
+        # R-NEG-2: record effective neg_sample_frac for auditability.
+        # 1.0 = no downsampling; < 1.0 = negatives were downsampled.
+        "neg_sample_frac": neg_sample_frac,
+        # Production neg/pos ratio assumed for test_precision_prod_adjusted.
+        # None = feature disabled (PRODUCTION_NEG_POS_RATIO not set in config).
+        "production_neg_pos_ratio": PRODUCTION_NEG_POS_RATIO,
+        # R703: uncalibrated_threshold=True means the 0.5 fallback was used.
+        "uncalibrated_threshold": _uncalibrated_threshold,
+        # DEC-032 / PLAN: artifact threshold is chosen at this recall floor (vs multi-recall backtester keys).
+        "threshold_selected_at_recall_floor": THRESHOLD_MIN_RECALL,
+        # DEC-024 / R3501: SHA-256 prefix of the frozen feature spec for audit.
+        "spec_hash": spec_hash,
+    }
+    if baseline_training_alignment is not None:
+        _metrics_root["baseline_data_alignment"] = baseline_training_alignment
+        (_out / "training_provenance.json").write_text(
+            json.dumps(baseline_training_alignment, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
     (_out / "training_metrics.json").write_text(
         json.dumps(
-            {
-                **combined_metrics,
-                "model_version": model_version,
-                # R301: record sampling metadata so artifacts can be audited
-                # even when loaded later.  None = full rated population was used.
-                "sample_rated_n": sample_rated_n,
-                # R-NEG-2: record effective neg_sample_frac for auditability.
-                # 1.0 = no downsampling; < 1.0 = negatives were downsampled.
-                "neg_sample_frac": neg_sample_frac,
-                # Production neg/pos ratio assumed for test_precision_prod_adjusted.
-                # None = feature disabled (PRODUCTION_NEG_POS_RATIO not set in config).
-                "production_neg_pos_ratio": PRODUCTION_NEG_POS_RATIO,
-                # R703: uncalibrated_threshold=True means the 0.5 fallback was used.
-                "uncalibrated_threshold": _uncalibrated_threshold,
-                # DEC-032 / PLAN: artifact threshold is chosen at this recall floor (vs multi-recall backtester keys).
-                "threshold_selected_at_recall_floor": THRESHOLD_MIN_RECALL,
-                # DEC-024 / R3501: SHA-256 prefix of the frozen feature spec for audit.
-                "spec_hash": spec_hash,
-            },
+            _metrics_root,
             indent=2,
             default=str,
         ),
         encoding="utf-8",
     )
+    if model_metadata is not None:
+        (_out / "model_metadata.json").write_text(
+            json.dumps(model_metadata, indent=2, default=str, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
 
     # Legacy backward-compat: write rated model as walkaway_model.pkl
     if rated:
@@ -6325,6 +6600,19 @@ def run_pipeline(args) -> None:
                 _total_rows = len(train_df) + _n_valid + _n_test
                 _label1 = int(train_df["label"].sum()) + int(valid_df["label"].sum()) + int(test_df["label"].sum())
                 _actual_train_end = train_df["payout_complete_dtm"].max() if not train_df.empty else None
+            if step7_train_path is not None:
+                assert step7_valid_path is not None and step7_test_path is not None
+                _split_row_meta = split_row_metadata_from_parquet_paths(
+                    step7_train_path,
+                    step7_valid_path,
+                    step7_test_path,
+                )
+            else:
+                _split_row_meta = split_row_metadata_from_dataframes(
+                    cast(pd.DataFrame, train_df),
+                    cast(pd.DataFrame, valid_df),
+                    cast(pd.DataFrame, test_df),
+                )
             _train_cols = (
                 train_df.columns
                 if train_df is not None
@@ -6610,12 +6898,34 @@ def run_pipeline(args) -> None:
                     "Remove the directory or wait for a new model_version timestamp."
                 )
             _bundle_dir.mkdir(parents=True, exist_ok=True)
+            _baseline_align = _make_baseline_training_alignment_payload(
+                effective_start,
+                effective_end,
+                float(TRAIN_SPLIT_FRAC),
+                float(VALID_SPLIT_FRAC),
+            )
+            _split_mlflow_meta = split_row_metadata_to_mlflow_string_params(_split_row_meta)
+            _model_meta_doc = build_model_metadata_document(
+                model_version=model_version,
+                effective_start=effective_start,
+                effective_end=effective_end,
+                splits=_split_row_meta,
+                use_local_parquet=use_local,
+                recent_chunks=getattr(args, "recent_chunks", None),
+                sample_rated_n=sample_rated_n,
+                skip_optuna=skip_optuna,
+                neg_sample_frac_effective=_effective_neg_sample_frac,
+                bundle_dir=_bundle_dir,
+                combined_metrics=combined_metrics,
+            )
             save_artifact_bundle(
                 rated_art, active_feature_cols, combined_metrics, model_version,
                 sample_rated_n=sample_rated_n,
                 feature_spec_path=FEATURE_SPEC_PATH,
                 neg_sample_frac=_effective_neg_sample_frac,
                 bundle_dir=_bundle_dir,
+                baseline_training_alignment=_baseline_align,
+                model_metadata=_model_meta_doc,
             )
             try:
                 write_latest_model_manifest(_versions_root, model_version, _bundle_dir)
@@ -6644,6 +6954,9 @@ def run_pipeline(args) -> None:
                     training_metrics_path=str(_bundle_dir / "training_metrics.json"),
                     pipeline_diagnostics_path=str(_bundle_dir / "pipeline_diagnostics.json"),
                     pipeline_diagnostics_rel_path=f"{_bundle_dir.name}/pipeline_diagnostics.json",
+                    model_metadata_path=str(_bundle_dir / "model_metadata.json"),
+                    model_metadata_rel_path=f"{_bundle_dir.name}/model_metadata.json",
+                    split_boundary_params=_split_mlflow_meta,
                 )
             except Exception as e:
                 logger.warning("MLflow provenance logging failed (training still succeeded): %s", e)
@@ -6726,6 +7039,7 @@ def run_pipeline(args) -> None:
                 for _fname in (
                     "training_metrics.json",
                     "pipeline_diagnostics.json",
+                    "model_metadata.json",
                     "feature_spec.yaml",
                     "model_version",
                 ):

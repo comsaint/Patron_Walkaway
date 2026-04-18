@@ -6,6 +6,7 @@ import copy
 import json
 import re
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -250,6 +251,194 @@ def harvest_phase2_job_training_metrics(
         }
         out.append(row)
     return out
+
+
+def _phase2_training_metrics_pat_preview(obj: Mapping[str, Any]) -> float | None:
+    """Parse PAT@1% from a ``training_metrics.json``-shaped object (T10)."""
+    md = obj.get("model_default")
+    if not isinstance(md, Mapping):
+        return None
+    key = evaluators.PHASE2_BACKTEST_PR1_KEY
+    raw = md.get(key)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def validate_phase2_training_metrics_after_trainer_jobs(
+    repo_root: Path,
+    bundle: Mapping[str, Any],
+) -> tuple[bool, str | None, str | None]:
+    """Fail-fast after successful per-job trainer runs: metrics file exists and PAT@1% parseable.
+
+    When ``trainer_jobs.executed`` is true and ``all_ok`` is true, each ``job_specs`` row
+    that has a matching successful trainer result must resolve to an on-disk
+    ``training_metrics.json`` (or YAML-hinted path) with a parseable
+    ``model_default.<PAT@1% key>`` (same key as shared backtest metrics). Missing file or
+    invalid JSON → ``E_ARTIFACT_MISSING``; readable JSON without PAT → ``E_NO_DATA_WINDOW``.
+
+    Returns:
+        ``(True, None, None)`` when validation is skipped or passes; else
+        ``(False, error_code, message)``.
+    """
+    tj = bundle.get("trainer_jobs")
+    if not isinstance(tj, Mapping) or not tj.get("executed") or not tj.get("all_ok"):
+        return True, None, None
+    results = tj.get("results")
+    if not isinstance(results, list):
+        return True, None, None
+    by_key: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for r in results:
+        if not isinstance(r, Mapping) or not r.get("ok"):
+            continue
+        tr = str(r.get("track") or "").strip()
+        eid = str(r.get("exp_id") or "").strip()
+        if tr and eid:
+            by_key[(tr, eid)] = r
+    specs = bundle.get("job_specs")
+    if not isinstance(specs, list):
+        return True, None, None
+    for spec in specs:
+        if not isinstance(spec, Mapping):
+            continue
+        tr = str(spec.get("track") or "").strip()
+        eid = str(spec.get("exp_id") or "").strip()
+        if not tr or not eid:
+            continue
+        if (tr, eid) not in by_key:
+            continue
+        path, rel_disp, pre_err = _phase2_job_training_metrics_path(repo_root, spec)
+        if pre_err is not None:
+            return False, "E_ARTIFACT_MISSING", f"{tr}/{eid}: {pre_err}"
+        assert path is not None
+        if not path.is_file():
+            return (
+                False,
+                "E_ARTIFACT_MISSING",
+                f"{tr}/{eid}: training_metrics artifact missing at {rel_disp}",
+            )
+        obj, err = _load_json_object(path)
+        if obj is None:
+            return (
+                False,
+                "E_ARTIFACT_MISSING",
+                f"{tr}/{eid}: {err or 'invalid training_metrics JSON'} ({rel_disp})",
+            )
+        if _phase2_training_metrics_pat_preview(obj) is None:
+            prk = evaluators.PHASE2_BACKTEST_PR1_KEY
+            return (
+                False,
+                "E_NO_DATA_WINDOW",
+                f"{tr}/{eid}: training_metrics lacks parseable model_default.{prk} ({rel_disp})",
+            )
+    return True, None, None
+
+
+def _index_phase2_rows_by_track_exp(
+    rows: list[Any] | None,
+) -> dict[tuple[str, str], Mapping[str, Any]]:
+    """Index list of dict rows by ``(track, exp_id)``."""
+    out: dict[tuple[str, str], Mapping[str, Any]] = {}
+    if not isinstance(rows, list):
+        return out
+    for r in rows:
+        if not isinstance(r, Mapping):
+            continue
+        tr = str(r.get("track") or "").strip()
+        eid = str(r.get("exp_id") or "").strip()
+        if tr and eid:
+            out[(tr, eid)] = r
+    return out
+
+
+def build_phase2_experiment_matrix(bundle: dict[str, Any]) -> None:
+    """Populate ``bundle['phase2_experiment_matrix']`` — unified per-experiment summary (T10).
+
+    Merges ``job_specs``, ``trainer_jobs.results``, ``job_training_harvest.rows``,
+    ``per_job_backtest_jobs.results``, and optional shared ``backtest_metrics`` PAT@1%
+    into one list for gate/report consumers.
+    """
+    specs = bundle.get("job_specs")
+    if not isinstance(specs, list):
+        return
+    tj = bundle.get("trainer_jobs")
+    tj_rows = tj.get("results") if isinstance(tj, Mapping) else []
+    tj_map = _index_phase2_rows_by_track_exp(
+        tj_rows if isinstance(tj_rows, list) else None
+    )
+    jh = bundle.get("job_training_harvest")
+    jh_list = jh.get("rows") if isinstance(jh, Mapping) else None
+    jh_map = _index_phase2_rows_by_track_exp(
+        jh_list if isinstance(jh_list, list) else None
+    )
+    pjb = bundle.get("per_job_backtest_jobs")
+    pj_list = pjb.get("results") if isinstance(pjb, Mapping) else None
+    pj_map = _index_phase2_rows_by_track_exp(
+        pj_list if isinstance(pj_list, list) else None
+    )
+    bm = bundle.get("backtest_metrics")
+    shared_pat = evaluators.extract_phase2_shared_precision_at_recall_1pct(
+        bm if isinstance(bm, Mapping) else None
+    )
+    out_rows: list[dict[str, Any]] = []
+    for spec in specs:
+        if not isinstance(spec, Mapping):
+            continue
+        tr = str(spec.get("track") or "").strip()
+        eid = str(spec.get("exp_id") or "").strip()
+        if not tr or not eid:
+            continue
+        key = (tr, eid)
+        tjr = tj_map.get(key)
+        jhr = jh_map.get(key)
+        pjr = pj_map.get(key)
+        tm_obj = jhr.get("training_metrics") if isinstance(jhr, Mapping) else None
+        train_preview = (
+            _phase2_training_metrics_pat_preview(tm_obj)
+            if isinstance(tm_obj, Mapping)
+            else None
+        )
+        row: dict[str, Any] = {
+            "track": tr,
+            "exp_id": eid,
+            "logs_subdir_relative": str(spec.get("logs_subdir_relative") or "").strip(),
+            "training_metrics_repo_relative": str(
+                spec.get("training_metrics_repo_relative") or ""
+            ).strip(),
+            "trainer_job_ok": bool(tjr.get("ok")) if isinstance(tjr, Mapping) else None,
+            "trainer_argv_fingerprint": (
+                str(tjr.get("argv_fingerprint") or "").strip()
+                if isinstance(tjr, Mapping)
+                else ""
+            ),
+            "job_training_harvest_found": (
+                bool(jhr.get("found")) if isinstance(jhr, Mapping) else None
+            ),
+            "training_precision_at_recall_1pct": train_preview,
+            "per_job_backtest_skipped": (
+                bool(pjr.get("skipped")) if isinstance(pjr, Mapping) else None
+            ),
+            "per_job_backtest_ok": (
+                bool(pjr.get("ok"))
+                if isinstance(pjr, Mapping) and not bool(pjr.get("skipped"))
+                else None
+            ),
+            "per_job_backtest_pat_preview": (
+                pjr.get("shared_precision_at_recall_1pct_preview")
+                if isinstance(pjr, Mapping)
+                else None
+            ),
+        }
+        out_rows.append(row)
+    bundle["phase2_experiment_matrix"] = {
+        "version": 1,
+        "built_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "shared_precision_at_recall_1pct": shared_pat,
+        "rows": out_rows,
+    }
 
 
 def _append_error(
@@ -991,6 +1180,11 @@ def collect_summary_phase2_plan_for_run_state(
     n_pat_yaml = count_phase2_yaml_pat_matrix_experiments(tracks)
     if n_pat_yaml > 0:
         out["phase2_pat_matrix_yaml_experiment_count"] = n_pat_yaml
+    em = bundle.get("phase2_experiment_matrix")
+    if isinstance(em, Mapping):
+        er = em.get("rows")
+        if isinstance(er, list):
+            out["phase2_experiment_matrix_rows"] = len(er)
     rs = bundle.get("runner_smoke")
     if isinstance(rs, Mapping):
         out["runner_log_dirs_ok"] = rs.get("log_dirs_ok")

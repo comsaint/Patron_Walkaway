@@ -1,0 +1,98 @@
+# 預設實驗骨架（對齊 SSOT §3、§7；Phase A smoke 可直接使用）
+#
+# run_id 建議：YYYYMMDD_baseline_<short_label>（EXECUTION_PLAN §0.4）
+
+experiment_id: null
+
+data_window:
+  start: null
+  end: null
+
+metadata:
+  split_protocol: temporal_slice_no_shuffle
+  feature_set_version: baseline_smoke_v0
+  label_contract_version: v0
+
+columns:
+  event_time: bet_time
+  label: label
+  censored: censored
+  score: smoke_score
+
+split:
+  train_frac: 0.70
+  valid_frac: 0.30
+
+data_source:
+  kind: synthetic_smoke
+  path_or_uri: null
+
+threshold_selection:
+  min_alert_count: 1
+  recall_floor: 0.01
+  min_alerts_per_hour: null
+  window_hours: null
+
+notes_contract:
+  net_sign_convention: "player_perspective_negative_is_loss"
+
+# Phase D：可選同窗 LightGBM（trainer training_metrics.json；路徑相對倉庫根）
+reference_model:
+  enabled: true
+  training_metrics_path: out/models/20260408-173809-e472fd0/training_metrics.json
+  metrics_section: rated
+
+# Tier-0 R1（pace）：與 SSOT §4.1 一致；合成資料已含下列欄位
+tier0:
+  r1:
+    enabled: true
+    signals:
+      - pace_drop_ratio
+  r2:
+    enabled: true
+    net_column: loss_proxy_net
+    wager_column: loss_proxy_wager
+  r3:
+    enabled: true
+    variants:
+      - adt30
+    current_session_theo_column: current_session_theo
+    # SSOT §4.1 R3：分母 ADT_est * tau 敏感度掃描（缺省或空列表時等同 tau=1）
+    tau_grid:
+      - 0.8
+      - 1.0
+      - 1.2
+      - 1.5
+      - 2.0
+
+# Tier-1 M1（SSOT §4.2）：僅 train 切片擬合，test 上 DEC-026
+tier1:
+  m1:
+    enabled: true
+    max_iter: 10000
+    feature_columns:
+      - pace_drop_ratio
+      - loss_proxy_net
+      - theo_win_sum_30d
+  m2:
+    enabled: true
+    max_iter: 5000
+    feature_columns:
+      - pace_drop_ratio
+      - loss_proxy_net
+      - theo_win_sum_30d
+  # S1（SSOT §4.2）：pace 類與 loss proxy 類各一欄；與 R1／R2 分列不同 model_type
+  s1:
+    enabled: true
+    rankings:
+      - column: pace_drop_ratio
+        high_is_risk: true
+        proxy_type: null
+      - column: loss_proxy_net
+        high_is_risk: false
+        proxy_type: net
+
+tiers:
+  tier0_rules: true
+  tier1_linear_and_s1: true
+  tier2_optional_tree_nb: false

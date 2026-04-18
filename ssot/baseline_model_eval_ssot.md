@@ -1,9 +1,9 @@
-# BASELINE_MODEL_EVAL_SSOT (Consolidated v0.2)
+# BASELINE_MODEL_EVAL_SSOT (Consolidated v0.3)
 
-> 版本：v0.2 (consolidated draft)  
+> 版本：v0.4（與 `baseline_models/IMPLEMENTATION_PLAN.md`、`baseline_models/EXECUTION_PLAN.md` 對齊：Tier-1 含 S1、§3.3 canonical 鍵名、§8 摘要、**§8.1 公平比較契約**）  
 > 目的：定義 Precision Uplift 專案 baseline 評估的唯一契約（SSOT）  
 > 主指標：`precision@recall=1%`（同現行 pipeline 口徑）  
-> 適用範圍：規則型 baseline + 簡單 ML baseline（不含強 boosting 競賽）
+> 適用範圍：規則型 baseline、**單特徵排名（無訓練）**、簡單 ML baseline（不含強 boosting 競賽）
 
 ---
 
@@ -33,11 +33,11 @@
 - 每個 baseline 必須產出：
   - `precision_at_recall_0.01`
   - `threshold_at_recall_0.01`
-  - PR-AUC
-  - alerts 量級（count / rate）
+  - `pr_auc`（PR-AUC 數值；鍵名以 §7 為準）
+  - `alerts`／`alerts_rate`（量級）
 - 至少完成：
   - Tier-0（規則型）全數
-  - Tier-1（Logistic + SGD）全數
+  - Tier-1 全數：`LogisticRegression`、`SGDClassifier`、**單特徵排名（無訓練）**（見 §4.2）
 
 ---
 
@@ -56,7 +56,8 @@
 ### 3.3 指標/門檻契約
 - 主指標固定為 `precision@recall=1%`
 - 以 PR 曲線操作點比較，不得私自改成 accuracy/F1 主導
-- 所有模型回報欄位命名與 trainer/backtester 對齊
+- 指標**語意**與 trainer／backtester 一致（含 PR 上 recall≥1% 之 precision 定義）
+- **`baseline_metrics.json` 對外鍵名以本文件 §7（canonical）為準**（例如 `pr_auc`、`precision_at_recall_0.01`）；若另附 trainer 風格鍵（如 `test_precision_at_recall_0.01`）僅可作**額外**除錯欄位，**不得**取代 §7 或讓驗收依賴欄位映射表
 
 ---
 
@@ -86,7 +87,7 @@
 
 ---
 
-## 4.2 Tier-1：簡單 ML（必跑）
+## 4.2 Tier-1：簡單 ML 與單特徵排名（必跑）
 
 1. LogisticRegression
    - `class_weight=balanced`
@@ -97,9 +98,10 @@
    - `class_weight=balanced`
    - 作為大樣本低記憶體基線
 
-3. 單特徵排名（無訓練）
-   - 對高訊號單欄位直接排序+門檻（如 pace 或 loss proxy）
-   - 作為「最低工程成本可解釋基線」
+3. 單特徵排名（無訓練；實作代號 **S1**）
+   - 對**單一**高訊號欄位直接排序，並以 PR 曲線取 recall=1% 操作點（與主指標契約一致）
+   - 建議至少覆蓋 **pace 類** 與 **loss proxy 類** 各一欄（與 §4.1 R2 之複合規則分列；不得合併成單一「loss baseline」分數）
+   - 報告欄位：`baseline_family=rule`；`model_type` 標明欄位名與排序方向；`proxy_type` 能對應列舉則填，否則於 `notes` 註明欄位語意
 
 ---
 
@@ -175,7 +177,50 @@
 - 與 LightGBM 同窗對照（pp 差異）
 - 規則型三類（pace/loss/ADT）分開結果
 - `loss` 兩種 proxy（net/wager）分開結果
+- **單特徵排名（S1）**獨立小節或表格（欄位名、方向；與 R1／R2 不得互換名義）
 - 若做校準，前後並列表格
+
+---
+
+## 8.1) 公平比較契約（Fair Compare Contract）
+
+為避免 baseline 與主模型（LightGBM／trainer）比較失真，下列條件為**強制**；任一不成立時，該次比較**不得**作為勝負結論，僅能標示為並列觀察或 BLOCKED。
+
+### 必要條件（A～F）
+
+- **A. 全域時間窗一致**  
+  baseline `data_window` 必須與 trainer `model_metadata.json` 之 `global_window`（起訖）一致。
+
+- **B. 切分規則一致**  
+  皆須時序切分、**禁止 shuffle**；train／valid／test 比例與協定與 trainer `split_method` 一致。
+
+- **C. 切分邊界一致**  
+  train／valid／test 之時間界須一致；若因欄位語意（例如 `bet_time` vs `payout_complete_dtm`）存在已知偏移，須在 `notes` 與 `fair_compare_checklist` 中**明文記錄**並宣告是否仍視為可比。
+
+- **D. 標籤契約一致**  
+  `label_contract_version` 一致，且 `censored` 排除規則一致。
+
+- **E. 指標口徑一致**  
+  比較時不得混用 raw 與 production-adjusted 指標（須同一口徑：raw 對 raw，或 adjusted 對 adjusted）。
+
+- **F. 資料來源可追溯**  
+  baseline 評估資料須可追溯到對應 trainer 訓練／評估視窗與資料定義（例如 `data_source`、`reference_model.apply_training_provenance`、匯出切片腳本與路徑）。
+
+### 判定結果
+
+- **PASS**：A～F 全部成立，可做公平比較。  
+- **BLOCKED**：缺少必要證據，暫不可比較。  
+- **FAIL**：存在明確不一致，不可比較。
+
+### 工件要求
+
+每次 run 必須在 `run_state.json` 記錄：
+
+- `fair_compare_checklist`（A～F 各自 pass／fail／blocked 與簡短理由）  
+- `overall_decision`（PASS／BLOCKED／FAIL）  
+- 證據路徑或鍵引用（例如 trainer `model_metadata.json`、`training_metrics.json` 路徑）
+
+`baseline_summary.md` 必須同步呈現上述判定（不得僅口頭宣稱同窗）。
 
 ---
 
@@ -183,8 +228,8 @@
 
 ### PASS
 - Tier-0 全部完成（含 loss 雙 proxy）
-- Tier-1 全部完成（Logistic + SGD）
-- 指標完整且與主流程口徑一致
+- Tier-1 全部完成：`LogisticRegression`、`SGDClassifier`、**單特徵排名 S1（無訓練）**
+- 指標完整且與主流程口徑一致；**§7 canonical 鍵名**已出現在 `baseline_metrics.json`
 - 有可執行結論（保留/淘汰名單）
 
 ### BLOCKED

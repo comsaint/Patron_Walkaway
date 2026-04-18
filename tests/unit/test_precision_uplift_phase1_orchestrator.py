@@ -1808,6 +1808,168 @@ def test_harvest_phase2_job_training_metrics_found_and_invalid_json(tmp_path: Pa
     assert "invalid JSON" in (rows[1].get("load_error") or "")
 
 
+def test_validate_phase2_training_metrics_skipped_when_trainer_not_executed(
+    tmp_path: Path,
+) -> None:
+    """Post-trainer validation is a no-op unless trainer_jobs ran successfully."""
+    ok, code, msg = collectors.validate_phase2_training_metrics_after_trainer_jobs(
+        tmp_path,
+        {"trainer_jobs": {"executed": False, "all_ok": True}},
+    )
+    assert ok and code is None and msg is None
+
+
+def test_validate_phase2_training_metrics_skipped_when_trainer_not_all_ok(
+    tmp_path: Path,
+) -> None:
+    ok, code, msg = collectors.validate_phase2_training_metrics_after_trainer_jobs(
+        tmp_path,
+        {"trainer_jobs": {"executed": True, "all_ok": False, "results": []}},
+    )
+    assert ok and code is None and msg is None
+
+
+def _write_min_training_metrics_with_pat(path: Path, pat: float = 0.41) -> None:
+    pr_key = evaluators.PHASE2_BACKTEST_PR1_KEY
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"model_default": {pr_key: pat}}),
+        encoding="utf-8",
+    )
+
+
+def test_validate_phase2_training_metrics_ok_when_file_has_pat(tmp_path: Path) -> None:
+    d = tmp_path / "logs" / "track_a" / "a0"
+    rel = d.relative_to(tmp_path).as_posix()
+    _write_min_training_metrics_with_pat(d / "training_metrics.json")
+    bundle = {
+        "job_specs": [
+            {"track": "track_a", "exp_id": "a0", "logs_subdir_relative": rel},
+        ],
+        "trainer_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [{"track": "track_a", "exp_id": "a0", "ok": True}],
+        },
+    }
+    ok, code, msg = collectors.validate_phase2_training_metrics_after_trainer_jobs(
+        tmp_path, bundle
+    )
+    assert ok and code is None and msg is None
+
+
+def test_validate_phase2_training_metrics_missing_file_is_artifact_missing(
+    tmp_path: Path,
+) -> None:
+    rel = "logs/track_a/a0"
+    bundle = {
+        "job_specs": [
+            {"track": "track_a", "exp_id": "a0", "logs_subdir_relative": rel},
+        ],
+        "trainer_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [{"track": "track_a", "exp_id": "a0", "ok": True}],
+        },
+    }
+    ok, code, msg = collectors.validate_phase2_training_metrics_after_trainer_jobs(
+        tmp_path, bundle
+    )
+    assert ok is False and code == "E_ARTIFACT_MISSING"
+    assert msg and "track_a/a0" in msg and "missing" in msg.lower()
+
+
+def test_validate_phase2_training_metrics_no_pat_is_no_data_window(
+    tmp_path: Path,
+) -> None:
+    d = tmp_path / "logs" / "track_a" / "a0"
+    rel = d.relative_to(tmp_path).as_posix()
+    d.mkdir(parents=True)
+    (d / "training_metrics.json").write_text('{"auc": 0.9}', encoding="utf-8")
+    bundle = {
+        "job_specs": [
+            {"track": "track_a", "exp_id": "a0", "logs_subdir_relative": rel},
+        ],
+        "trainer_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [{"track": "track_a", "exp_id": "a0", "ok": True}],
+        },
+    }
+    ok, code, msg = collectors.validate_phase2_training_metrics_after_trainer_jobs(
+        tmp_path, bundle
+    )
+    assert ok is False and code == "E_NO_DATA_WINDOW"
+    assert msg and "track_a/a0" in msg
+
+
+def test_build_phase2_experiment_matrix_merges_harvest_and_per_job(tmp_path: Path) -> None:
+    """Unified matrix lists each job_spec with trainer / harvest / per-job fields."""
+    d = tmp_path / "logs" / "track_a" / "a0"
+    rel = d.relative_to(tmp_path).as_posix()
+    _write_min_training_metrics_with_pat(d / "training_metrics.json", pat=0.5)
+    pr_key = evaluators.PHASE2_BACKTEST_PR1_KEY
+    bundle: dict = {
+        "job_specs": [
+            {
+                "track": "track_a",
+                "exp_id": "a0",
+                "logs_subdir_relative": rel,
+                "training_metrics_repo_relative": rel + "/training_metrics.json",
+            },
+        ],
+        "trainer_jobs": {
+            "results": [
+                {
+                    "track": "track_a",
+                    "exp_id": "a0",
+                    "ok": True,
+                    "argv_fingerprint": "abc123",
+                }
+            ]
+        },
+        "job_training_harvest": {
+            "rows": [
+                {
+                    "track": "track_a",
+                    "exp_id": "a0",
+                    "found": True,
+                    "training_metrics": {"model_default": {pr_key: 0.5}},
+                }
+            ]
+        },
+        "per_job_backtest_jobs": {
+            "results": [
+                {
+                    "track": "track_a",
+                    "exp_id": "a0",
+                    "skipped": False,
+                    "ok": True,
+                    "shared_precision_at_recall_1pct_preview": 0.51,
+                }
+            ]
+        },
+        "backtest_metrics": {"model_default": {pr_key: 0.99}},
+    }
+    collectors.build_phase2_experiment_matrix(bundle)
+    mx = bundle.get("phase2_experiment_matrix")
+    assert isinstance(mx, dict)
+    assert mx.get("version") == 1
+    assert mx.get("shared_precision_at_recall_1pct") == 0.99
+    rows = mx.get("rows")
+    assert isinstance(rows, list) and len(rows) == 1
+    r0 = rows[0]
+    assert r0["track"] == "track_a" and r0["exp_id"] == "a0"
+    assert r0["trainer_job_ok"] is True
+    assert r0["trainer_argv_fingerprint"] == "abc123"
+    assert r0["job_training_harvest_found"] is True
+    assert r0["training_precision_at_recall_1pct"] == 0.5
+    assert r0["per_job_backtest_ok"] is True
+    assert r0["per_job_backtest_pat_preview"] == 0.51
+    summ = collectors.collect_summary_phase2_plan_for_run_state(bundle)
+    assert summ.get("phase2_experiment_matrix_rows") == 1
+
+
 def test_trainer_artifacts_saved_log_line_contract_for_orchestrator() -> None:
     """Trainer save_artifact_bundle must keep logger.info shape expected by runner regex."""
     trainer_py = _REPO_ROOT / "trainer" / "training" / "trainer.py"

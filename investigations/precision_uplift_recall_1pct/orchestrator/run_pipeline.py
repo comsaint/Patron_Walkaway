@@ -1928,6 +1928,24 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
             runner.merge_inferred_training_metrics_paths_into_phase2_bundle(
                 p2_bundle, _REPO_ROOT
             )
+            ok_tm, ec_tm, msg_tm = (
+                collectors.validate_phase2_training_metrics_after_trainer_jobs(
+                    _REPO_ROOT, p2_bundle
+                )
+            )
+            if ok_tj and not ok_tm:
+                ok_tj = False
+                msg_tj = msg_tm or msg_tj
+                p2_bundle["trainer_jobs"]["all_ok"] = False
+                p2_bundle.setdefault("errors", [])
+                if isinstance(p2_bundle["errors"], list):
+                    p2_bundle["errors"].append(
+                        {
+                            "code": str(ec_tm or "E_ARTIFACT_MISSING"),
+                            "message": str(msg_tm or "training_metrics validation failed"),
+                            "path": "",
+                        }
+                    )
             merged["phase2_collect"] = (
                 collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
             )
@@ -2261,6 +2279,15 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
     skip_gate_report = resume_ok and _step_success(prev_steps, "phase2_gate_report")
     if not skip_gate_report:
         t_gr = _mark_step_running(merged, "phase2_gate_report")
+        _write_run_state(state_file, merged)
+        collectors.build_phase2_experiment_matrix(p2_bundle)
+        bundle_path.write_text(
+            json.dumps(p2_bundle, indent=2, default=str),
+            encoding="utf-8",
+        )
+        merged["phase2_collect"] = (
+            collectors.collect_summary_phase2_plan_for_run_state(p2_bundle)
+        )
         _write_run_state(state_file, merged)
         merged_pat = collectors.merge_phase2_pat_series_from_shared_and_per_job(p2_bundle)
         if merged_pat:

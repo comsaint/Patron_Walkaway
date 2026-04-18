@@ -129,6 +129,36 @@ class TestArtifactBundleCompleteness(unittest.TestCase):
         src = _get_func_src("save_artifact_bundle")
         self.assertIn("walkaway_model.pkl", src)
 
+    def test_save_artifact_bundle_supports_model_metadata_json(self):
+        """save_artifact_bundle may write model_metadata.json when caller passes model_metadata."""
+        src = _get_func_src("save_artifact_bundle")
+        self.assertIn("model_metadata.json", src)
+        self.assertIn("model_metadata", src)
+
+
+# ---------------------------------------------------------------------------
+# model_metadata.json — split summaries + run params (schema v1)
+# ---------------------------------------------------------------------------
+
+
+class TestModelMetadataPipelineWiring(unittest.TestCase):
+    """Source contracts: helpers exist and run_pipeline wires them into the bundle."""
+
+    def test_trainer_defines_split_metadata_helpers(self):
+        self.assertIn("def split_row_metadata_from_dataframes", _TRAINER_SRC)
+        self.assertIn("def split_row_metadata_from_parquet_paths", _TRAINER_SRC)
+        self.assertIn("def build_model_metadata_document", _TRAINER_SRC)
+        self.assertIn("def split_row_metadata_to_mlflow_string_params", _TRAINER_SRC)
+
+    def test_run_pipeline_computes_split_meta_and_passes_to_save_and_mlflow(self):
+        src = _get_func_src("run_pipeline")
+        self.assertIn("split_row_metadata_from_parquet_paths", src)
+        self.assertIn("split_row_metadata_from_dataframes", src)
+        self.assertIn("_split_row_meta", src)
+        self.assertIn("build_model_metadata_document(", src)
+        self.assertIn("model_metadata=_model_meta_doc", src)
+        self.assertIn("split_boundary_params=_split_mlflow_meta", src)
+
 
 # ---------------------------------------------------------------------------
 # Review risks: required DQ filter + reason_code_map.json presence

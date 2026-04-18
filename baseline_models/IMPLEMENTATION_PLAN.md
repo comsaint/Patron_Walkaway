@@ -1,14 +1,16 @@
 # 基線模型實作計畫
 
+可操作之執行順序、單次 run 檢查清單與 Gate 簽核，見同目錄 [`EXECUTION_PLAN.md`](EXECUTION_PLAN.md)。
+
 ## 1. 範圍
 
-本計畫將 `baseline_models/` 下的基線實驗落地，並對齊以下契約：
+本計畫將 `baseline_models/` 下的基線實驗落地，並對齊以下契約（含 **§8.1 公平比較契約**）：
 - `ssot/baseline_model_eval_ssot.md`
 - 目前專案指標契約（`precision@recall=1%`）
 - trainer/backtester 使用的時序切分與防洩漏規則
 
 目標：
-- 建立可重現的規則型與簡單 ML 基線模型。
+- 建立可重現的規則型、**單特徵排名（S1）**與簡單 ML 基線模型。
 - 在完全相同的評估契約下，將所有基線與現行 LightGBM 對比。
 - 讓執行時間與記憶體使用維持筆電可承受。
 
@@ -33,6 +35,7 @@
 ```text
 baseline_models/
   IMPLEMENTATION_PLAN.md
+  EXECUTION_PLAN.md
   README.md
   config/
     baseline_default.yaml
@@ -43,6 +46,7 @@ baseline_models/
       pace_rules.py
       loss_rules.py
       adt_rules.py
+      single_feature_rank.py
     models/
       logistic_baseline.py
       sgd_baseline.py
@@ -114,21 +118,31 @@ DoD：
 - 至少一個 ADT 變體完成評估與摘要。
 
 
-## 4.3 簡單 ML 基線（Tier-1）
+## 4.3 Tier-1：簡單 ML 與單特徵排名（必跑；對齊 SSOT §4.2）
 
 任務 M1 - 邏輯回歸基線
 - 僅使用時序切分訓練。
-- 先以 `class_weight=balanced` 起跑。
+- 先以 `class_weight=balanced` 起跑；solver 優先 `saga`（SSOT §4.2）。
 
 DoD：
-- 報告包含 `precision_at_recall_0.01`、PR-AUC、threshold。
+- 報告包含 SSOT §7 canonical：`precision_at_recall_0.01`、`threshold_at_recall_0.01`、`pr_auc`。
+- `baseline_family=linear`。
 
 任務 M2 - SGD 分類器基線
-- 以資源友善預設訓練 `SGDClassifier(loss="log_loss")`。
+- 以資源友善預設訓練 `SGDClassifier(loss="log_loss")`、`class_weight=balanced`（SSOT §4.2）。
 
 DoD：
 - 在目標筆電設定下可完成且不 OOM。
-- 使用與 M1 相同 evaluator 產出指標。
+- 使用與 M1 相同 evaluator 產出指標；`baseline_family=linear`。
+
+任務 S1 - 單特徵排名（無訓練）
+- 對**單一**高訊號欄位直接排序，並以與 E1 相同之 PR／recall=1% 口徑評估。
+- 建議至少：**pace 類**一欄、**loss proxy 類**一欄（`net` 與／或 `wager`；與 R2 分開列示，不得合併分數）。
+
+DoD：
+- `baseline_metrics.json` 至少兩筆合格 S1 列（pace + loss 各一，或等價覆蓋）。
+- `baseline_family=rule`；`model_type` 標明欄位名與排序方向；`proxy_type` 能對應 SSOT 列舉則填，否則於 `notes` 註明。
+- `baseline_summary.md` 含 S1 獨立小節（不得與 R1／R2 混名義）。
 
 
 ## 4.4 可選基線（Tier-2）
@@ -146,23 +160,55 @@ DoD：
 ## 4.5 評估與報告
 
 任務 E1 - 統一 evaluator
-- 對所有基線使用同一 evaluator：
+- 對所有基線使用同一 evaluator（語意對齊 trainer／backtester；**輸出鍵名對齊 SSOT §7**）：
   - `precision_at_recall_0.01`
   - `threshold_at_recall_0.01`
-  - PR-AUC
-  - alert 數量/速率
+  - `pr_auc`
+  - `alerts`／`alerts_rate`
 
 DoD：
-- 規則型與 ML 模型輸出 schema 一致。
+- 規則型、S1、ML 模型輸出 schema 一致（含 §7 身分欄與指標欄）。
 
 任務 E2 - 摘要產生器
 - 產生 markdown 報告，包含：
   - 與 LightGBM 基準對照表
   - pace/loss/ADT 分章呈現
   - `loss_proxy=net` 與 `loss_proxy=wager` 分列
+  - **S1 單特徵排名**獨立小節或表格（SSOT §8）
 
 DoD：
 - `baseline_summary.md` 可在 results 目錄自動產生。
+
+
+## 4.6 公平比較判定（Pass/Fail Gate）
+
+任務 **E3** — Fair Compare Gate（與 trainer `model_metadata.json` 對齊）
+
+### 任務目標
+
+在 baseline 與 LightGBM 對照前，先做機械化「公平比較檢查」，避免 apples-to-oranges。
+
+### 判定項（必做）
+
+1. **A** 全域時間窗一致  
+2. **B** 切分規則一致  
+3. **C** 切分邊界一致  
+4. **D** 標籤契約一致  
+5. **E** 指標口徑一致  
+6. **F** 資料來源可追溯  
+
+（各項定義與證據來源見 [`EXECUTION_PLAN.md`](EXECUTION_PLAN.md) §4.1 表；契約見 [`ssot/baseline_model_eval_ssot.md`](../ssot/baseline_model_eval_ssot.md) §8.1。）
+
+### DoD
+
+- 每次與 trainer 同窗對照之 run，`run_state.json` 含 `fair_compare_checklist`（A～F 各自 pass/fail 與證據路徑）。  
+- `baseline_summary.md` 含 `overall_decision`（PASS／BLOCKED／FAIL）。  
+- 若非 PASS，summary 必須明示：失敗項（A～F）、差異細節、是否僅能並列觀察（不可下勝負結論）。
+
+### 驗收規則
+
+- 僅當 `overall_decision=PASS` 時，該次 run 可作為「baseline 相對 LightGBM」之性能結論依據。  
+- `BLOCKED`／`FAIL` 之 run 可保留結果，但不得作為優劣定論依據。
 
 
 ## 5. 里程碑
@@ -171,10 +217,10 @@ M1（第 1-2 天）：基礎建設
 - F1、F2 完成，smoke run 綠燈。
 
 M2（第 3-4 天）：Tier-0 規則型
-- R1、R2 完成，產出首份報告。
+- R1、R2、**R3** 完成（含 loss **net／wager** 雙 proxy 分開報告、ADT 至少一變體），產出首份完整 Tier-0 報告。
 
-M3（第 5-6 天）：Tier-1 ML
-- M1、M2 完成，產出整合比較報告。
+M3（第 5-6 天）：Tier-1（ML + S1）
+- M1、M2、**S1** 完成，產出整合比較報告。
 
 M4（第 7 天）：收斂與穩定化
 - E1、E2 打磨，若時間允許補 O1/O2。
@@ -184,8 +230,8 @@ M4（第 7 天）：收斂與穩定化
 
 PASS：
 - Tier-0 完成（含 loss 兩種 proxy）。
-- Tier-1 完成（Logistic + SGD）。
-- 指標 schema 完整且契約一致。
+- Tier-1 完成：`LogisticRegression`、`SGDClassifier`、**S1 單特徵排名（無訓練）**。
+- 指標 schema 完整且契約一致（`baseline_metrics.json` 含 SSOT §7 canonical 鍵名）。
 
 BLOCKED：
 - 缺少必要工件。
@@ -230,6 +276,7 @@ FAIL：
 - [ ] 實作 ADT 基線
 - [ ] 實作 Logistic 基線
 - [ ] 實作 SGD 基線
+- [ ] 實作單特徵排名基線（S1，無訓練）
 - [ ] 串接統一 evaluator
 - [ ] 產出 baseline summary
 - [ ] 驗證 Gate 並封裝最終 run 產物
