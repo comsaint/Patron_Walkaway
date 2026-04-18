@@ -459,6 +459,43 @@ def _collect_state_db_window_stats(
         conn.close()
 
 
+def collect_phase1_state_db_observe_counts(
+    repo_root: Path,
+    cfg: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Lightweight ``validation_results`` aggregates for autonomous observe ticks.
+
+    Reuses :func:`_collect_state_db_window_stats` (COUNT-only, read-only SQLite)
+    without loading backtest metrics or R1 stdout logs.
+
+    Args:
+        repo_root: Repository root for resolving ``cfg['state_db_path']``.
+        cfg: Phase 1 config with ``window`` and ``state_db_path``.
+
+    Returns:
+        JSON-serializable counts: ``finalized_alerts_count``,
+        ``finalized_true_positives_count``, ``validation_results_rows_in_window``,
+        optional ``state_db_note``, and ``collect_errors`` when aggregation fails.
+    """
+    errors: list[dict[str, str]] = []
+    window_raw = cfg.get("window")
+    window = window_raw if isinstance(window_raw, Mapping) else {}
+    raw = cfg.get("state_db_path", "")
+    state_path = (
+        _resolve_under_root(repo_root, str(raw)) if str(raw).strip() else Path()
+    )
+    stats = _collect_state_db_window_stats(state_path, window, errors)
+    out: dict[str, Any] = {
+        "finalized_alerts_count": stats.get("finalized_alerts_count"),
+        "finalized_true_positives_count": stats.get("finalized_true_positives_count"),
+        "validation_results_rows_in_window": stats.get("validation_results_rows_in_window"),
+        "state_db_note": stats.get("note"),
+    }
+    if errors:
+        out["collect_errors"] = errors
+    return out
+
+
 def _safe_ratio(num: int, den: int) -> float | None:
     """Return ``num / den`` when denominator is positive; else ``None``."""
     if den <= 0:
@@ -471,6 +508,16 @@ def _capped_unit_ratio(num: int, den: int) -> float | None:
     if den <= 0:
         return None
     return min(1.0, float(num) / float(den))
+
+
+def collect_phase1_pit_parity(
+    prediction_log_db: Path,
+    state_db: Path,
+    window: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Public entry for Phase 1 PIT parity diagnostics (delegates to internal collector)."""
+
+    return _collect_phase1_pit_parity(prediction_log_db, state_db, window)
 
 
 def _collect_phase1_pit_parity(
@@ -672,7 +719,7 @@ def collect_phase1_artifacts(
         else Path()
     )
     state_stats = _collect_state_db_window_stats(state_db_path, window, errors)
-    pit_parity = _collect_phase1_pit_parity(
+    pit_parity = collect_phase1_pit_parity(
         prediction_db_path,
         state_db_path,
         window if isinstance(window, Mapping) else {},

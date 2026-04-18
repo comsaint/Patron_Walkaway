@@ -13,8 +13,8 @@ state_db_path: local_state/state.db
 prediction_log_db_path: local_state/prediction_log.db
 
 window:
-  start_ts: "2026-01-01T00:00:00+08:00"
-  end_ts: "2026-01-08T00:00:00+08:00"
+  start_ts: "2026-04-09T00:00:00+08:00"
+  end_ts: "2026-04-17T00:00:00+08:00"
 
 # Gate-oriented thresholds (orchestrator/evaluators will use these in later tasks).
 thresholds:
@@ -26,15 +26,18 @@ thresholds:
   min_finalized_true_positives_gate: 50
   # Optional: absolute |pat_mid - pat_final| above this → FAIL (default 0.15 in code)
   # gate_pat_abs_tolerance: 0.15
-  # Optional (P1 PIT parity MVP, currently for report/diagnostics wiring):
-  # pit_parity_mode: WARN_ONLY  # STRICT / WARN_ONLY (gate enforcement to be wired)
+  # Optional (P1 PIT parity MVP — gate reads these in evaluators.evaluate_phase1_gate):
+  # pit_parity_mode: WARN_ONLY  # STRICT blocks PASS when parity thresholds fail; WARN_ONLY records metrics only
   # min_scored_at_in_window_ratio: 0.995
   # min_validated_at_non_null_ratio: 0.995
   # max_alert_prediction_gap_abs: 100
 
 # Optional mid/final checkpoint policy for Phase 1.
-# Mid snapshot runs once from window.start_ts to midpoint (ratio in (0,1)).
+# Mid snapshot runs from window.start_ts to each interior end_ts (ratio in (0,1)
+# and/or wall-clock hours from start). Duplicate end times are deduped and sorted.
 checkpoints:
   enable_mid_snapshot: true
   midpoint_ratio: 0.5
+  # ratio_midpoints_enabled: false   # optional: only use wallclock_offsets_hours
+  # wallclock_offsets_hours: [6, 24]  # e.g. t+6h / t+24h from window.start_ts
   # midpoint_ratios: [0.25, 0.5]

@@ -1,5 +1,176 @@
 **Archive**: Past rounds and older STATUS blocks are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60, 67 Review–75 moved 2026-03-05; Rounds 79–99 moved 2026-03-05; Round 96 onward moved 2026-03-12; **2026-03-22**: Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等長段 → archive.)
 
+## Precision uplift orchestrator — T8A/FSM：`--autonomous-advance-mid-when-eligible`（2026-04-18）
+
+**背景**：stub tick 前預算 **`observe_context`** 傳入 **`after_stub_tick`**；**opt-in** 時 **`mid_snapshot_eligible`** 則 **observe→mid_snapshot**（該 tick **不**遞增 **`stub_observe_ticks`**）。**`--autonomous-mid-r1-once`** 補 **`allow_mid_this_tick`**（含 **init→observe** 且 eligible 之首 tick），避免 **mid** 無 op 重複 dispatch。
+
+| 檔案 | 說明 |
+|------|------|
+| `orchestrator/phase1_autonomous_fsm.py` | **`after_stub_tick(..., observe_context=, advance_mid_when_eligible=)`** |
+| `orchestrator/run_pipeline.py` | **`--autonomous-advance-mid-when-eligible`**；**`oc_pre`**；**mid_r1_once** 與 **checkpoint** 之 **`allow_mid_this_tick`** |
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | FSM 單測 + CLI + **雙 tick eligible** 整合測 |
+
+## Precision uplift orchestrator — T8C：`checkpoints.wallclock_offsets_hours`（2026-04-18）
+
+**背景**：以 **`window.start_ts` + timedelta(hours=…)** 表達 **t+6h／t+24h** 類 mid 窗尾；與 **ratio** 中點合併後以 epoch **去重、時間排序**；**`config_loader`** 驗證型別與 **≤64** 筆。
+
+| 檔案 | 說明 |
+|------|------|
+| `orchestrator/run_pipeline.py` | **`_phase1_ratio_midpoint_datetimes`**、**`_phase1_wallclock_offset_datetimes`**、**`_dedupe_sorted_mid_datetimes`**；**`phase1_mid_snapshot_windows`** 擴充 **`ratio_midpoints_enabled`** |
+| `orchestrator/config_loader.py` | **`wallclock_offsets_hours`**／**`ratio_midpoints_enabled`** 驗證 |
+| `orchestrator/config/run_phase1.yaml` | 註解範例 |
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | 合併去重、僅牆鐘、schema 單測 |
+
+**建議下一輪**：若需 **字面 `t+6h` 字串鍵** 再薄包一層 YAML 正規化；或 **FSM observe→mid_snapshot** 與 **eligible** 自動銜接（仍避免預設就改 stub 自環語意）。
+
+## Precision uplift orchestrator — T8C：`--autonomous-mid-r1-once` + 共用 mid dispatch（2026-04-18）
+
+**背景**：**`mid_snapshot_eligible`** 時可選跑與 **batch** 相同之 **`phase1_mid_snapshot_windows`** → **`runner.run_phase1_r1_r6_all`**；未 eligible 則 **exit 12**；**batch** 中段改呼叫 **`_phase1_mid_snapshot_dispatch`**。
+
+| 檔案 | 說明 |
+|------|------|
+| `orchestrator/common_exit_codes.py` | **`EXIT_PHASE1_AUTONOMOUS_MID_NOT_ELIGIBLE = 12`** |
+| `orchestrator/run_pipeline.py` | **`--autonomous-mid-r1-once`**（須 **`--autonomous-once`**）；**`_phase1_mid_snapshot_run_windows`**／**`_phase1_mid_snapshot_dispatch`**；**`prev_steps`／`resume_ok`** 提前；**`phase1_autonomous.last_autonomous_mid_r1_at`** |
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | CLI 互斥、**12**、**mock mid** 成功 |
+
+**建議下一輪**：**`phase1.checkpoints` t+6h** 時間表與 **cp*** 檔名不覆寫策略；**eligible 時 FSM observe→mid_snapshot** 與長跑 supervisor 對齊。
+
+## Precision uplift orchestrator — T8C hook：`mid_snapshot_eligible`（2026-04-18）
+
+**背景**：在 **`observe_context`** 加上 **gate** 時間／樣本提示與 **`mid_snapshot_eligible`**（四項皆滿足時為 True）；**不**自動跑 R1、不實作 checkpoint 檔名策略。
+
+| 檔案 | 說明 |
+|------|------|
+| `orchestrator/run_pipeline.py` | **`_phase1_gate_sample_hint_string`**、**`_phase1_gate_observe_slice`**；**`_phase1_autonomous_observe_context`** 寫入 **`min_*_gate`**、**`gate_hours_hint`**、**`gate_sample_hint`**、**`mid_snapshot_eligible`** |
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | **`test_phase1_autonomous_observe_context_gate_hints_and_eligible`**、**`..._not_eligible_low_gate_samples`**；鏈式 once 斷言 **eligible False** |
+
+**建議下一輪**：**eligible** 為 True 時（可選旗標）委派 **`runner`** 跑 **mid R1** 並寫 **`r1_r6_mid*.stdout.log`**；或 **`phase1.checkpoints`** 時間表與檔名不覆寫策略。
+
+## Precision uplift orchestrator — T8A：`observe_context` + state_db COUNT（2026-04-18）
+
+**背景**：在 **`--autonomous-once`** 的 **`observe`** tick 併入 **`collectors.collect_phase1_state_db_observe_counts`**（與 gate 相同之 **`_collect_state_db_window_stats`** COUNT 路徑）；**`samples_preliminary_hint`** 對齊 **`min_finalized_alerts_preliminary`／`min_finalized_true_positives_preliminary`**。
+
+| 檔案 | 說明 |
+|------|------|
+| `orchestrator/collectors.py` | **`collect_phase1_state_db_observe_counts`** |
+| `orchestrator/run_pipeline.py` | **`_phase1_samples_preliminary_hint`**、**`_phase1_autonomous_observe_context`**（取代僅窗長之 **`_phase1_observe_window_context`** 單獨寫入） |
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | **`samples_preliminary_hint`**／**`collect_phase1_state_db_observe_counts`** 單測；鏈式 once 斷言 **空表 → count 0** |
+
+**建議下一輪**：**T8C** mid R1 觸發；或 **PIT 比率** 僅在完整 collect 路徑（避免 tick 讀 prediction_log 過重，除非加旗標）。
+
+## Precision uplift orchestrator — T8A：`observe_context`（窗長 vs preliminary）（2026-04-18）
+
+**背景**：stub **`observe`** 階段寫入可稽核脈絡，作為日後 **observe → mid_snapshot** 真實條件的前置掛鉤。
+
+| 檔案 | 說明 |
+|------|------|
+| `orchestrator/run_pipeline.py` | **`_phase1_observe_window_context`**：`window_hours`、`min_hours_preliminary`、`observation_gate_hint`（**`preliminary_ok`／`below_preliminary`**）；**`--autonomous-once`** 且 **`current_step == observe`** 時寫入 **`phase1_autonomous.observe_context`** |
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | **`test_phase1_observe_window_context_preliminary_ok_and_below`**；鏈式 once 測試斷言 **`observe_context`** |
+
+**建議下一輪**：以 **collector／state_db** 補 **`observe_context`**（樣本數、validated_at 比例）或實作 **T8C** mid R1 觸發條件。
+
+## Precision uplift orchestrator — T8A：checkpoint 欄位 + resume 接續 stub tick（2026-04-18）
+
+**背景**：延續 **T8A**「可恢復 checkpoint」；仍非 **72~120h** 長跑本體。
+
+| 檔案 | 說明 |
+|------|------|
+| `orchestrator/phase1_autonomous_fsm.py` | **`after_stub_tick`**：`tick_seq`、`checkpoint`（**`cursor_before`／`cursor_after`／`tick_at`／`config_fingerprint`**）；**`config_fingerprint`** 可選 |
+| `orchestrator/run_pipeline.py` | stub tick 傳入 **`input_summary.fingerprint`**；**`fingerprint_mismatch`** 時 **`pop("phase1_autonomous")`** 避免舊 cursor 污染新 config |
+| `PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | **T8A** checkpoint 項改 **[x]**（註明 stub／長跑仍待） |
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | checkpoint／**`tick_seq`** 斷言；**`test_phase1_autonomous_resume_once_continues_tick_seq`** |
+
+**手動驗證**：同一 **`run_id`** 先 **`--autonomous-once`** 再 **`--resume --autonomous-once`** → **`tick_seq`** 遞增、**`checkpoint.cursor_before`** 為 **`observe`**（第二 tick）。
+
+**建議下一輪**：**observe** 內接真實「觀測成熟」條件再轉 **mid_snapshot**；或 **T8C** 自動 R1 checkpoint。
+
+## Precision uplift orchestrator — T8A：`--autonomous-once` 單次 stub tick（2026-04-18）
+
+**背景**：使用者要 **observe 單次 tick stub**；與 **`--dry-run`** 互斥；須 **`--mode autonomous --phase phase1`**。
+
+| 檔案 | 說明 |
+|------|------|
+| `orchestrator/phase1_autonomous_fsm.py` | **`read_autonomous_cursor`**、**`after_stub_tick`**（**`init→observe`**；**`observe`** 自環 **`stub_observe_ticks`**） |
+| `orchestrator/run_pipeline.py` | **`--autonomous-once`**；**`main`** 與 **`--dry-run`**／非 phase1 autonomous 互斥 **exit 2**；**`_main_phase1`** 在 **`--autonomous-once`** 且無 fingerprint mismatch 時自磁碟合併 **`phase1_autonomous`** 再寫 preflight，避免 tick 鏈被覆蓋 |
+| `PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | **§1.8.2** 補 **`--autonomous-once`** 與 **exit 0** 語意 |
+| `PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | **T8A** 第一項補 **autonomous-once** |
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | FSM stub 單測 + CLI 互斥 + **雙次 once 鏈**（**`uuid`** `run_id` 防殘檔） |
+
+**手動驗證**：`... run_pipeline.py --phase phase1 --config ... --run-id <rid> --mode autonomous --autonomous-once --skip-backtest-smoke` 連跑兩次 → **`stub_observe_ticks`** 遞增；併 **`--dry-run`** 應 **exit 2**。
+
+**建議下一輪**：observe tick 內接**真實條件**（窗內樣本／時間）再決定是否 **`observe→mid_snapshot`**；或 **T8A checkpoint** 與 **`--resume`** 對齊。
+
+## Precision uplift orchestrator — T8A：Phase 1 autonomous 狀態機骨架（2026-04-18）
+
+**背景**：使用者選擇 **狀態機骨架先**；長跑 observe 迴圈與 checkpoint 仍待後續輪次。
+
+| 檔案 | 說明 |
+|------|------|
+| `investigations/.../orchestrator/phase1_autonomous_fsm.py` | **新建**：步驟常數、**`ORDERED_STEPS`**、**`successor`／`can_transition`／`restore_cursor`／`run_state_block`** |
+| `investigations/.../orchestrator/run_pipeline.py` | **`--mode batch\|autonomous`**；**phase1**：autonomous + **非** dry-run → **exit 11**；autonomous + dry-run **READY** 時寫 **`phase1_autonomous`** + **`phase1_autonomous_fsm_snapshot`**；**`main`**：非 phase1 之 autonomous → **exit 2** |
+| `investigations/.../orchestrator/common_exit_codes.py` | **`EXIT_PHASE1_AUTONOMOUS_PENDING = 11`** |
+| `investigations/.../PRECISION_UPLIFT_R1PCT_ADHOC_RUNBOOK.md` | **§1.8.2** 補 **11** 說明 |
+| `investigations/.../PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | **T8A** 前兩項改 **[x]**，checkpoint 仍 **[ ]** |
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | FSM 單測 + **`main`** 三情境（phase2 拒絕、dry-run 寫入、非 dry-run **11**） |
+
+**手動驗證**：`python investigations/.../run_pipeline.py --phase phase1 --config ... --run-id test_fsm --dry-run --mode autonomous`（預設 **`--mode batch`** 行為不變）；非 dry-run autonomous 應 **stderr** 提示並 **exit 11**。
+
+**建議下一輪**：T8A **checkpoint 寫入／`--resume` 驅動 `current_step` 前進**；或 **observe 單次 tick**（sleep + 條件檢查 stub）。
+
+## Precision uplift orchestrator — MVP_TASKLIST T6：後續任務與「最小規格」整併 + MVP 限制文案（2026-04-18）
+
+**背景**：使用者 **「yes go on」** 承接上一輪 STATUS **建議下一輪**之 tasklist 雙軌整併；無程式變更。
+
+| 檔案 | 說明 |
+|------|------|
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` | **§T6**：**「後續任務（P1 parity 補強）」** 三項改 **[x]** 並註明與 **「P1 parity 最小規格」** 單一真相；**MVP 限制** 改寫為 **`WARN_ONLY` vs `STRICT`**、自動 JSON 區塊與時區欄位現況 |
+
+**手動驗證**：開啟 tasklist **§T6**，確認 **後續任務** 與 **最小規格**／**DoD** 敘述一致、無互斥 **[ ]**。
+
+**建議下一輪**：**T8A** 最小切片（例如 **`--mode autonomous` 僅 CLI 宣告 + dry-run 行為**）或 **§4 DoD** 第 454 行與 §2 現況對齊（Phase 2 敘述精簡）。
+
+## Precision uplift orchestrator — Phase 1 延伸：T6 PIT parity DoD 單元測試 + SSOT 命名（2026-04-18，`cycle_code`）
+
+### STEP 1 — Builder
+
+**背景**：對齊使用者請求 **「Phase 1 延伸」** 與 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md` **T6** 之 **P1 parity DoD**（最少 3 個 gate／collector 單測）；**`PLAN.md`** 仍為 repo 總索引（本輪子範圍見 MVP tasklist）；**`DECISION_LOG.md`** 本輪無新增條目。
+
+| 檔案 | 說明 |
+|------|------|
+| `investigations/precision_uplift_recall_1pct/orchestrator/collectors.py` | 新增公開 **`collect_phase1_pit_parity(...)`** 委派 **`_collect_phase1_pit_parity`**；**`collect_phase1_artifacts`** 改呼叫公開函式（與 MVP tasklist 函式名一致） |
+| `investigations/precision_uplift_recall_1pct/orchestrator/config/run_phase1.yaml` | 註解更正：**`pit_parity_mode` STRICT／WARN_ONLY** 已由 **`evaluators.evaluate_phase1_gate`** 套用，非「待接線」 |
+
+**手動驗證**：`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q -p no:langsmith -k "strict_pit or warn_only_passes_with_pit or validated_at_column_missing" --tb=short`；全檔：`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q -p no:langsmith --tb=line`。
+
+### STEP 2 — Reviewer
+
+| # | 類型 | 問題 | 建議 | 希望新增的測試 |
+|---|------|------|------|----------------|
+| 1 | 語意 | **`collect_phase1_pit_parity`** 與 **`_collect_phase1_pit_parity`** 雙層是否造成維護分叉？ | 公開函式僅委派一行；邏輯仍單一在 **`_collect_*`**。 | 無（契約與舊行為一致） |
+| 2 | Gate | **`pit_status=fail`** 與數值 threshold 違規**併存**時 **`blocking_reasons`** 可能變長。 | 維持 **`pit_parity_violation`** 置首＋細項 append；Reviewer 接受。 | STRICT 測已覆蓋 ratio 違規 |
+| 3 | DB | 測試用 SQLite **`validation_results`** 無 **`validated_at`** 與實際 schema 漂移時的 warn 清單是否一致？ | 與 **`PRAGMA table_info`** 分支一致；若未來改為「欄全 NULL」而非缺欄，需另測。 | 缺欄單測已加 |
+
+### STEP 3 — Tester（僅 tests）
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | **`_gate_bundle`** 支援 **`pit_parity`**／**`pit_threshold_overrides`**；新增 **`test_evaluate_phase1_gate_strict_pit_parity_violation_fails`**、**`test_evaluate_phase1_gate_warn_only_passes_with_pit_violation_in_metrics`**、**`test_collect_phase1_pit_parity_warns_when_validated_at_column_missing`** |
+
+**執行**：`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q -p no:langsmith -k "strict_pit or warn_only_passes_with_pit or validated_at_column_missing" --tb=short`
+
+### STEP 4 — Tester（修實作至全綠）
+
+| 檢查 | 結果（2026-04-18） |
+|------|---------------------|
+| Pytest | **`tests/unit/test_precision_uplift_phase1_orchestrator.py`**：**199 passed** |
+| Ruff | **`collectors.py`**、上列測試檔：**通過** |
+
+**MVP_TASKLIST**：**T6 P1 parity DoD**「最少 3 個單元測試」已勾選（見 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`）。
+
+**建議下一輪 Plan**：**T8A–T8D**（Phase 1 autonomous）；或 MVP **T6「後續任務」** 若仍與最小規格表並存，建議整併 tasklist 勾選避免雙軌敘述。
+
+✅ **STEP 1 完成** · ✅ **STEP 2 完成** · ✅ **STEP 3 完成** · ✅ **STEP 4 完成** · ✅ **全部完成，CYCLE 結束**
+
 ## T10 真多窗（最小可用）— 由 `gaming_day` 產出 PAT@1% 多窗序列（2026-04-15，`cycle_code`）
 
 ### STEP 1 — Builder

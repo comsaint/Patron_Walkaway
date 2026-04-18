@@ -127,14 +127,14 @@
 - [x] `status_history_crosscheck.md` 保留人工維護，附 orchestrator 區塊
 
 **MVP 限制（需明確告知 reviewer）**
-- `point_in_time_parity_check.md` 現況僅輸出資料來源與人工核對項，未自動計算 PIT/時區/成熟度一致性指標。
-- `evaluate_phase1_gate(...)` 現況不以 PIT parity 自動檢核作為 PASS 的必要條件。
-- 因此 `phase1_gate_decision.md` 的 `PASS` 代表「MVP Gate 規則通過」，不等同「PIT parity 已完成機械驗證」。
+- `point_in_time_parity_check.md` 仍含人工核對清單；自動指標見同檔 **`## PIT parity metrics (auto)`**（JSON）；**`window_timezone_mismatch_count`** 尚無欄位契約時維持 `note`／`null`。
+- **`thresholds.pit_parity_mode`**：**`WARN_ONLY`（預設）** 時 PIT 違規**不**阻斷 PASS，但 **`evidence_summary`** 會帶 **`pit_status`**／違規計數；**`STRICT`** 時任一 PIT 閾值違規 → **FAIL**（`pit_parity_violation`）。
+- 因此 **`WARN_ONLY`** 下 `phase1_gate_decision.md` 的 **`PASS`** 代表「核心 Gate（樣本／R1 方向／R2 等）通過」，**未必**代表「所有 PIT 機械指標達標」；**`STRICT`** 下 **`PASS`** 則包含 PIT 閾值通過。
 
-**後續任務（P1 parity 補強）**
-- [ ] 新增 parity collector：輸出可機械判讀的 PIT 指標（`scored_at`、`validated_at`、時區/窗界一致性）。
-- [ ] 擴充 `point_in_time_parity_check.md`：除 checklist 外，附 JSON 指標摘要與 FAIL 條件。
-- [ ] 擴充 `evaluate_phase1_gate(...)`：新增可配置 parity blocking 規則（至少 `STRICT` / `WARN_ONLY` 兩種模式）。
+**後續任務（P1 parity 補強）** — 與下方 **「P1 parity 最小規格」** 對齊後之單一真相（避免雙軌 checklist；2026-04-18 整併）。
+- [x] 新增 parity collector：可機械判讀之 PIT 指標（見 **`collect_phase1_pit_parity`**／**`collect_phase1_artifacts`** 之 **`pit_parity`**）。
+- [x] 擴充 `point_in_time_parity_check.md`：**`## PIT parity metrics (auto)`** JSON 區塊（閾值違規敘述見 gate／`reasons[]`）。
+- [x] 擴充 `evaluate_phase1_gate(...)`：**`STRICT`**／**`WARN_ONLY`**（見 **`thresholds.pit_parity_mode`** 與 **`evaluators.py`**）。
 
 **P1 parity 最小規格（可直接開工）**
 - [x] `collectors.py` 新增 `collect_phase1_pit_parity(...) -> dict`，輸出鍵：
@@ -157,7 +157,7 @@
 **P1 parity 完成定義（DoD）**
 - [x] 若 DB 缺欄位（如無 `validated_at`），collector 不崩潰，回傳 `status=warn` + `reasons[]`。
 - [x] `phase1_gate_decision.md` 的 `metrics` 含 `pit_parity_status` 與主要 ratio。
-- [ ] 新增最少 3 個單元測試：`STRICT fail`、`WARN_ONLY pass with warning`、`missing column -> warn`。
+- [x] 新增最少 3 個單元測試：`STRICT fail`、`WARN_ONLY pass with warning`、`missing column -> warn`（`tests/unit/test_precision_uplift_phase1_orchestrator.py`）。
 
 ### T7 - run_state 與 Resume（中優先）
 
@@ -180,9 +180,10 @@
 
 #### T8A - 長跑 Supervisor（Phase 1）
 
-- [ ] `run_pipeline.py` 新增 autonomous mode（例如 `--mode autonomous`）
-- [ ] 內建 phase1 狀態機：`init -> observe -> mid_snapshot -> final_snapshot -> collect -> report`
-- [ ] 支援可恢復 checkpoint（程序重啟後可從最近 step 接續）
+- [x] `run_pipeline.py` 新增 **`--mode autonomous`**（**骨架**：`--dry-run` 時寫入 **`run_state.phase1_autonomous`** 與 **`phase1_autonomous_fsm_snapshot`**；非 dry-run 且**無** **`--autonomous-once`** → **exit 11** `EXIT_PHASE1_AUTONOMOUS_PENDING`；**`--autonomous-once`** → 單次 stub tick 後 **exit 0**）
+- [x] 內建 phase1 狀態機骨架：**`orchestrator/phase1_autonomous_fsm.py`**（backbone：`init -> observe -> mid_snapshot -> final_snapshot -> collect -> report`；**`observe` 自環**已登記；可選 **`--autonomous-advance-mid-when-eligible`**：**`after_stub_tick`** 在 **`mid_snapshot_eligible`** 時 **observe→mid_snapshot**，該 tick **不**遞增 **`stub_observe_ticks`**）
+- [x] 支援可恢復 checkpoint（**stub**：**`phase1_autonomous.tick_seq`**／**`checkpoint`** 含 cursor 前後、**`tick_at`**、可選 **`config_fingerprint`**；**`--resume`** 可接續 **`--autonomous-once`**；config **fingerprint mismatch** 時清除 **`phase1_autonomous`**；**72~120h 長跑主迴圈**仍待）
+- [x] **`observe` 觀測脈絡**：**`--autonomous-once`** 且 cursor 為 **`observe`** 時寫入 **`phase1_autonomous.observe_context`**（**`window_hours`**、**`min_hours_preliminary`**、**`observation_gate_hint`**；**state_db** 經 **`collect_phase1_state_db_observe_counts`**：`finalized_*`／`validation_results_rows_in_window`／**`samples_preliminary_hint`**；**PIT／R1** 仍不在此 tick）
 
 **完成定義**
 - [ ] 單一命令可在 72~120h 觀測期內持續運作，不需人工介入
@@ -201,7 +202,9 @@
 
 #### T8C - 自動 mid/final R1 snapshot
 
-- [ ] 新增 `phase1.checkpoints` 設定（例：`t+6h`、`t+24h`、`end`）
+- [x] autonomous **`observe_context.mid_snapshot_eligible`**（**gate 級**時間＋樣本與 **preliminary** 窗／樣本四項皆滿足；**不**含實際 R1 子程序、檔名策略、collector 改動）
+- [x] **`--autonomous-mid-r1-once`**（須 **`--autonomous-once`**）：**eligible** 時跑與 **batch** 相同之 **mid R1/R6 checkpoint 迴圈**（沿用 **`r1_r6_mid`／`r1_r6_mid_cp*`** 檔名規則）；未 eligible → **exit 12**；仍**未**實作 **`t+6h` 時間表**與專用檔名策略
+- [x] **`checkpoints.wallclock_offsets_hours`**（自 **`window.start_ts`** 起算之正數小時；與 **ratio** 中點合併、**去重排序**；可選 **`ratio_midpoints_enabled: false`** 僅牆鐘；**最多 64** 筆；**`end`** 仍以主窗 **`window.end_ts`** 由 **final R1** 路徑涵蓋，非本列表鍵）
 - [ ] 自動執行 R1/R6 並按 checkpoint 產生檔名（不得覆寫彼此）
 - [ ] collector 改為讀取「最新有效 mid」與「final」進行方向檢查
 

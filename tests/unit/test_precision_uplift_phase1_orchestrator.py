@@ -6,6 +6,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 from unittest import mock
@@ -30,6 +31,7 @@ import collectors  # noqa: E402
 import common_exit_codes as orch_exits  # noqa: E402
 import config_loader  # noqa: E402
 import evaluators  # noqa: E402
+import phase1_autonomous_fsm as p1_fsm  # noqa: E402
 import phase2_exit_codes as phase2_exits  # noqa: E402
 import report_builder  # noqa: E402
 import run_pipeline  # noqa: E402
@@ -350,6 +352,191 @@ def test_common_exit_codes_phase1_four_five_numeric_contract() -> None:
     """Phase 1 mid/R1 and backtest CLI exits keep historic integers 4 and 5."""
     assert orch_exits.EXIT_PHASE1_MID_OR_R1_FAILED == 4
     assert orch_exits.EXIT_PHASE1_BACKTEST_FAILED == 5
+
+
+def test_common_exit_codes_phase1_autonomous_pending_is_eleven() -> None:
+    """T8A: autonomous without dry-run uses exit 11 until supervisor loop exists."""
+    assert orch_exits.EXIT_PHASE1_AUTONOMOUS_PENDING == 11
+
+
+def test_common_exit_codes_phase1_autonomous_mid_not_eligible_is_twelve() -> None:
+    """T8C: --autonomous-mid-r1-once without eligible observe_context uses exit 12."""
+    assert orch_exits.EXIT_PHASE1_AUTONOMOUS_MID_NOT_ELIGIBLE == 12
+
+
+def test_phase1_autonomous_fsm_linear_successors() -> None:
+    """T8A skeleton: backbone order matches MVP task list."""
+    assert p1_fsm.successor(p1_fsm.STEP_INIT) == p1_fsm.STEP_OBSERVE
+    assert p1_fsm.successor(p1_fsm.STEP_OBSERVE) == p1_fsm.STEP_MID_SNAPSHOT
+    assert p1_fsm.successor(p1_fsm.STEP_REPORT) is None
+
+
+def test_phase1_autonomous_fsm_observe_self_loop_allowed() -> None:
+    """Supervisor may idle in observe before mid_snapshot."""
+    assert p1_fsm.can_transition(p1_fsm.STEP_OBSERVE, p1_fsm.STEP_OBSERVE) is True
+    assert p1_fsm.can_transition(p1_fsm.STEP_OBSERVE, p1_fsm.STEP_MID_SNAPSHOT) is True
+
+
+def test_phase1_autonomous_fsm_restore_cursor_on_resume() -> None:
+    """restore_cursor reads run_state.phase1_autonomous.current_step when valid."""
+    prev = {"phase1_autonomous": {"current_step": p1_fsm.STEP_MID_SNAPSHOT}}
+    assert p1_fsm.restore_cursor(prev, resume=True) == p1_fsm.STEP_MID_SNAPSHOT
+    assert p1_fsm.restore_cursor(prev, resume=False) == p1_fsm.STEP_INIT
+    bad = {"phase1_autonomous": {"current_step": "unknown_step"}}
+    assert p1_fsm.restore_cursor(bad, resume=True) == p1_fsm.STEP_INIT
+
+
+def test_read_autonomous_cursor_reads_block_without_resume_semantics() -> None:
+    """read_autonomous_cursor always reads persisted block (for autonomous-once chain)."""
+    assert (
+        p1_fsm.read_autonomous_cursor({"phase1_autonomous": {"current_step": p1_fsm.STEP_OBSERVE}})
+        == p1_fsm.STEP_OBSERVE
+    )
+
+
+def test_after_stub_tick_init_to_observe() -> None:
+    """First stub tick moves init -> observe."""
+    out = p1_fsm.after_stub_tick(None, tick_iso="2026-04-18T00:00:00+00:00", config_fingerprint="fp9")
+    assert out["current_step"] == p1_fsm.STEP_OBSERVE
+    assert out["stub_last_note"] == "stub_tick: init -> observe"
+    assert out["tick_seq"] == 1
+    assert out["checkpoint"]["tick_seq"] == 1
+    assert out["checkpoint"]["cursor_before"] == p1_fsm.STEP_INIT
+    assert out["checkpoint"]["cursor_after"] == p1_fsm.STEP_OBSERVE
+    assert out["checkpoint"]["config_fingerprint"] == "fp9"
+
+
+def test_after_stub_tick_observe_increments_counter() -> None:
+    """Second+ ticks in observe increment stub_observe_ticks."""
+    first = p1_fsm.after_stub_tick(None, tick_iso="t1")
+    prev = {"phase1_autonomous": first}
+    second = p1_fsm.after_stub_tick(prev, tick_iso="t2")
+    assert second["stub_observe_ticks"] == 1
+    assert second["tick_seq"] == 2
+    third = p1_fsm.after_stub_tick({"phase1_autonomous": second}, tick_iso="t3")
+    assert third["stub_observe_ticks"] == 2
+    assert third["tick_seq"] == 3
+
+
+def test_after_stub_tick_advance_observe_to_mid_when_eligible() -> None:
+    """Eligible observe_context + advance flag moves observe -> mid_snapshot without stub tick."""
+    prev_block = {
+        "current_step": p1_fsm.STEP_OBSERVE,
+        "tick_seq": 1,
+        "stub_observe_ticks": 0,
+        "fsm_schema_version": 1,
+        "backbone": list(p1_fsm.ORDERED_STEPS),
+        "observe_self_loop": True,
+    }
+    oc: dict[str, Any] = {"mid_snapshot_eligible": True}
+    out = p1_fsm.after_stub_tick(
+        {"phase1_autonomous": prev_block},
+        tick_iso="t2",
+        observe_context=oc,
+        advance_mid_when_eligible=True,
+    )
+    assert out["current_step"] == p1_fsm.STEP_MID_SNAPSHOT
+    assert out.get("stub_observe_ticks") == 0
+    assert out["stub_last_note"] == "stub_tick: observe -> mid_snapshot (eligible)"
+
+
+def test_phase1_observe_window_context_preliminary_ok_and_below() -> None:
+    """``_phase1_observe_window_context`` mirrors gate window vs min_hours_preliminary."""
+    cfg_ok = _minimal_config_dict()
+    ctx_ok = run_pipeline._phase1_observe_window_context(cfg_ok)
+    assert ctx_ok["observation_gate_hint"] == "preliminary_ok"
+    assert ctx_ok["window_hours"] == 168.0
+    assert ctx_ok["min_hours_preliminary"] == 48.0
+
+    cfg_low = dict(cfg_ok)
+    cfg_low["window"] = {
+        "start_ts": "2026-01-01T00:00:00+08:00",
+        "end_ts": "2026-01-02T00:00:00+08:00",
+    }
+    ctx_low = run_pipeline._phase1_observe_window_context(cfg_low)
+    assert ctx_low["window_hours"] == 24.0
+    assert ctx_low["observation_gate_hint"] == "below_preliminary"
+
+
+def test_phase1_samples_preliminary_hint_ok_and_below_and_unknown() -> None:
+    """``_phase1_samples_preliminary_hint`` mirrors preliminary sample floors."""
+    cfg = _minimal_config_dict()
+    ok_db = {"finalized_alerts_count": 400, "finalized_true_positives_count": 40}
+    assert run_pipeline._phase1_samples_preliminary_hint(cfg, ok_db) == "preliminary_ok"
+    low_db = {"finalized_alerts_count": 1, "finalized_true_positives_count": 0}
+    assert run_pipeline._phase1_samples_preliminary_hint(cfg, low_db) == "below_preliminary"
+    unk: dict = {"collect_errors": [{"code": "E_COLLECT_STATE_DB"}]}
+    assert run_pipeline._phase1_samples_preliminary_hint(cfg, unk) == "unknown"
+
+
+def test_collect_phase1_state_db_observe_counts_returns_counts(tmp_path: Path) -> None:
+    """``collect_phase1_state_db_observe_counts`` uses COUNT-only path (no R1/backtest)."""
+    state_db = tmp_path / "s.db"
+    with sqlite3.connect(state_db) as conn:
+        conn.execute("CREATE TABLE validation_results (y INT)")
+        conn.execute("INSERT INTO validation_results VALUES (1)")
+        conn.commit()
+    cfg = _minimal_config_dict()
+    cfg["state_db_path"] = str(state_db)
+    out = collectors.collect_phase1_state_db_observe_counts(tmp_path, cfg)
+    assert out.get("collect_errors") is None
+    assert out["finalized_alerts_count"] == 1
+    assert out["finalized_true_positives_count"] == 0
+
+
+def test_phase1_autonomous_observe_context_gate_hints_and_eligible(
+    tmp_path: Path,
+) -> None:
+    """T8C hook: mid_snapshot_eligible when preliminary + gate time/samples all satisfied."""
+    state_db = tmp_path / "s.db"
+    start_w = "2026-01-01T00:00:00+08:00"
+    end_w = "2026-01-08T00:00:00+08:00"
+    with sqlite3.connect(state_db) as conn:
+        conn.execute(
+            "CREATE TABLE validation_results (alert_ts TEXT, validated_at TEXT, result INT)"
+        )
+        for _ in range(5):
+            conn.execute(
+                "INSERT INTO validation_results VALUES (?, ?, 1)",
+                ("2026-01-04T12:00:00+08:00", "2026-01-05T00:00:00+08:00"),
+            )
+        conn.commit()
+    cfg = _minimal_config_dict()
+    cfg["state_db_path"] = str(state_db)
+    cfg["window"] = {"start_ts": start_w, "end_ts": end_w}
+    thr = dict(cfg["thresholds"])
+    thr["min_hours_preliminary"] = 1
+    thr["min_finalized_alerts_preliminary"] = 2
+    thr["min_finalized_true_positives_preliminary"] = 2
+    thr["min_hours_gate"] = 1
+    thr["min_finalized_alerts_gate"] = 3
+    thr["min_finalized_true_positives_gate"] = 3
+    cfg["thresholds"] = thr
+    ctx = run_pipeline._phase1_autonomous_observe_context(cfg, tmp_path)
+    assert ctx["gate_hours_hint"] == "ok"
+    assert ctx["gate_sample_hint"] == "ok"
+    assert ctx["samples_preliminary_hint"] == "preliminary_ok"
+    assert ctx["observation_gate_hint"] == "preliminary_ok"
+    assert ctx["mid_snapshot_eligible"] is True
+
+
+def test_phase1_autonomous_observe_context_mid_snapshot_not_eligible_low_gate_samples(
+    tmp_path: Path,
+) -> None:
+    """Gate sample floor fails → mid_snapshot_eligible False even when preliminary ok."""
+    state_db = tmp_path / "s.db"
+    with sqlite3.connect(state_db) as conn:
+        conn.execute("CREATE TABLE validation_results (y INT)")
+        conn.execute("INSERT INTO validation_results VALUES (1)")
+        conn.commit()
+    cfg = _minimal_config_dict()
+    cfg["state_db_path"] = str(state_db)
+    thr = dict(cfg["thresholds"])
+    thr["min_finalized_alerts_gate"] = 9999
+    cfg["thresholds"] = thr
+    ctx = run_pipeline._phase1_autonomous_observe_context(cfg, tmp_path)
+    assert ctx["gate_sample_hint"] == "below"
+    assert ctx["mid_snapshot_eligible"] is False
 
 
 def test_exit_code_four_five_integer_collision_phase1_vs_phase2_documented() -> None:
@@ -769,6 +956,8 @@ def test_adhoc_runbook_documents_phase2_error_code_reference() -> None:
     assert "common_exit_codes.py" in text
     assert "EXIT_PHASE1_MID_OR_R1_FAILED" in text
     assert "EXIT_PHASE1_BACKTEST_FAILED" in text
+    assert "EXIT_PHASE1_AUTONOMOUS_PENDING" in text
+    assert "autonomous-once" in text
     assert "phase2_runner_smoke" in text
 
 
@@ -1298,6 +1487,75 @@ def test_phase1_mid_snapshot_windows_invalid_ratio_list_falls_back_to_single() -
     }
     ws = run_pipeline.phase1_mid_snapshot_windows(cfg)
     assert [w["end_ts"] for w in ws] == ["2026-01-02T18:00:00+08:00"]
+
+
+def test_phase1_mid_snapshot_windows_merges_wallclock_offsets_deduped() -> None:
+    """84h from start equals 50% of 7d window — merged list dedupes identical end_ts."""
+    cfg = _minimal_config_dict()
+    cfg["checkpoints"] = {"midpoint_ratio": 0.5, "wallclock_offsets_hours": [84.0]}
+    ws = run_pipeline.phase1_mid_snapshot_windows(cfg)
+    assert len(ws) == 1
+    assert ws[0]["start_ts"] == "2026-01-01T00:00:00+08:00"
+    assert ws[0]["end_ts"] == "2026-01-04T12:00:00+08:00"
+
+
+def test_phase1_mid_snapshot_windows_wallclock_only_sorted() -> None:
+    """ratio_midpoints_enabled false yields only wall-clock checkpoints, sorted."""
+    cfg = _minimal_config_dict()
+    cfg["checkpoints"] = {
+        "ratio_midpoints_enabled": False,
+        "wallclock_offsets_hours": [48.0, 6.0, 24.0],
+    }
+    ws = run_pipeline.phase1_mid_snapshot_windows(cfg)
+    assert [w["end_ts"] for w in ws] == [
+        "2026-01-01T06:00:00+08:00",
+        "2026-01-02T00:00:00+08:00",
+        "2026-01-03T00:00:00+08:00",
+    ]
+
+
+def test_phase1_config_wallclock_offsets_hours_must_be_list() -> None:
+    """checkpoints.wallclock_offsets_hours rejects non-list."""
+    raw = _minimal_config_dict()
+    raw["checkpoints"] = {"wallclock_offsets_hours": "6"}  # type: ignore[assignment]
+    with pytest.raises(
+        config_loader.ConfigValidationError,
+        match="wallclock_offsets_hours must be a list",
+    ):
+        config_loader.validate_phase1_config(raw)
+
+
+def test_phase1_config_wallclock_offsets_hours_entry_must_be_positive_finite() -> None:
+    """Each wallclock offset must be a finite positive number."""
+    raw = _minimal_config_dict()
+    raw["checkpoints"] = {"wallclock_offsets_hours": [0.0]}
+    with pytest.raises(
+        config_loader.ConfigValidationError,
+        match="wallclock_offsets_hours\\[0\\]",
+    ):
+        config_loader.validate_phase1_config(raw)
+
+
+def test_phase1_config_ratio_midpoints_enabled_must_be_bool() -> None:
+    """checkpoints.ratio_midpoints_enabled rejects non-bool."""
+    raw = _minimal_config_dict()
+    raw["checkpoints"] = {"ratio_midpoints_enabled": "yes"}  # type: ignore[assignment]
+    with pytest.raises(
+        config_loader.ConfigValidationError,
+        match="ratio_midpoints_enabled must be bool",
+    ):
+        config_loader.validate_phase1_config(raw)
+
+
+def test_phase1_config_wallclock_offsets_hours_max_length() -> None:
+    """At most 64 wall-clock checkpoint entries."""
+    raw = _minimal_config_dict()
+    raw["checkpoints"] = {"wallclock_offsets_hours": [1.0] * 65}
+    with pytest.raises(
+        config_loader.ConfigValidationError,
+        match="at most 64 entries",
+    ):
+        config_loader.validate_phase1_config(raw)
 
 
 def test_phase1_mid_snapshot_window_invalid_bounds_returns_none() -> None:
@@ -4324,25 +4582,30 @@ def _gate_bundle(
     mid_pat: float | None,
     errors: list | None = None,
     r2: dict | None = None,
+    pit_parity: dict[str, Any] | None = None,
+    pit_threshold_overrides: dict[str, Any] | None = None,
 ) -> dict:
     payload = dict(_pat_block(final_pat))
     if r2 is not None:
         payload["r2_prediction_log_vs_alerts"] = r2
+    thresholds: dict[str, Any] = {
+        "min_hours_preliminary": 48,
+        "min_hours_gate": 72,
+        "min_finalized_alerts_preliminary": 300,
+        "min_finalized_true_positives_preliminary": 30,
+        "min_finalized_alerts_gate": 800,
+        "min_finalized_true_positives_gate": 50,
+        "gate_pat_abs_tolerance": 0.15,
+    }
+    if pit_threshold_overrides:
+        thresholds.update(pit_threshold_overrides)
     b: dict = {
         "errors": list(errors) if errors is not None else [],
         "window": {
             "start_ts": "2026-01-01T00:00:00+08:00",
             "end_ts": hours_span,
         },
-        "thresholds": {
-            "min_hours_preliminary": 48,
-            "min_hours_gate": 72,
-            "min_finalized_alerts_preliminary": 300,
-            "min_finalized_true_positives_preliminary": 30,
-            "min_finalized_alerts_gate": 800,
-            "min_finalized_true_positives_gate": 50,
-            "gate_pat_abs_tolerance": 0.15,
-        },
+        "thresholds": thresholds,
         "state_db_stats": {
             "finalized_alerts_count": alerts,
             "finalized_true_positives_count": tp,
@@ -4351,6 +4614,8 @@ def _gate_bundle(
         "r1_r6_mid": {"payload": _pat_block(mid_pat) if mid_pat is not None else None},
         "backtest_metrics": {},
     }
+    if pit_parity is not None:
+        b["pit_parity"] = pit_parity
     return b
 
 
@@ -4478,6 +4743,592 @@ def test_gate_fail_on_r2_large_gap() -> None:
     g = evaluators.evaluate_phase1_gate(b)
     assert g["status"] == "FAIL"
     assert "r2_prediction_log_vs_alerts_mismatch" in g["blocking_reasons"]
+
+
+def test_evaluate_phase1_gate_strict_pit_parity_violation_fails() -> None:
+    """STRICT: parity threshold breach blocks PASS with pit_parity_violation (T6 DoD)."""
+    b = _gate_bundle(
+        hours_span="2026-01-04T10:00:00+08:00",
+        alerts=900,
+        tp=50,
+        final_pat=0.40,
+        mid_pat=0.41,
+        pit_parity={
+            "status": "ok",
+            "scored_at_in_window_ratio": 0.5,
+            "validated_at_non_null_ratio": 1.0,
+            "alerts_vs_prediction_log_gap": 0,
+        },
+        pit_threshold_overrides={
+            "pit_parity_mode": "STRICT",
+            "min_scored_at_in_window_ratio": 0.995,
+        },
+    )
+    g = evaluators.evaluate_phase1_gate(b)
+    assert g["status"] == "FAIL"
+    assert "pit_parity_violation" in g["blocking_reasons"]
+    assert "pit_scored_at_in_window_ratio_below_threshold" in g["blocking_reasons"]
+
+
+def test_evaluate_phase1_gate_warn_only_passes_with_pit_violation_in_metrics() -> None:
+    """WARN_ONLY: parity breach does not FAIL gate; metrics retain violation count (T6 DoD)."""
+    b = _gate_bundle(
+        hours_span="2026-01-04T10:00:00+08:00",
+        alerts=900,
+        tp=50,
+        final_pat=0.40,
+        mid_pat=0.41,
+        pit_parity={
+            "status": "warn",
+            "scored_at_in_window_ratio": 0.5,
+            "validated_at_non_null_ratio": 1.0,
+            "alerts_vs_prediction_log_gap": 0,
+        },
+        pit_threshold_overrides={
+            "pit_parity_mode": "WARN_ONLY",
+            "min_scored_at_in_window_ratio": 0.995,
+        },
+    )
+    g = evaluators.evaluate_phase1_gate(b)
+    assert g["status"] == "PASS"
+    assert g["blocking_reasons"] == []
+    assert int(g["metrics"]["pit_parity_violation_count"]) >= 1
+    assert "pit_violation_n=" in g["evidence_summary"]
+
+
+def test_collect_phase1_pit_parity_warns_when_validated_at_column_missing(
+    tmp_path: Path,
+) -> None:
+    """Missing validation_results.validated_at → collector warn + reason (T6 DoD)."""
+    pred_db = tmp_path / "prediction_log.db"
+    state_db = tmp_path / "state.db"
+    window = {
+        "start_ts": "2026-01-01T00:00:00+08:00",
+        "end_ts": "2026-01-08T00:00:00+08:00",
+    }
+    with sqlite3.connect(pred_db) as conn:
+        conn.execute(
+            "CREATE TABLE prediction_log (scored_at TEXT, is_alert INT, is_rated_obs INT)"
+        )
+        conn.execute(
+            "INSERT INTO prediction_log VALUES ('2026-01-02T12:00:00+08:00', 1, 1)"
+        )
+        conn.commit()
+    with sqlite3.connect(state_db) as conn:
+        conn.execute("CREATE TABLE validation_results (result INT)")
+        conn.execute("CREATE TABLE alerts (ts TEXT)")
+        conn.execute("INSERT INTO alerts VALUES ('2026-01-02T12:00:00+08:00')")
+        conn.commit()
+    out = collectors.collect_phase1_pit_parity(pred_db, state_db, window)
+    assert out["status"] == "warn"
+    assert "validation_results_missing_validated_at" in out["reasons"]
+
+
+# --- T8A: phase1 autonomous FSM (skeleton) ---
+
+
+def _write_minimal_phase1_yaml_for_fsm(tmp_path: Path) -> Path:
+    """Minimal phase1 YAML + SQLite stubs for orchestrator preflight."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+    cfg = _minimal_config_dict()
+    cfg["model_dir"] = str(model_dir)
+    cfg["state_db_path"] = str(state_db)
+    cfg["prediction_log_db_path"] = str(pred_db)
+    p = tmp_path / "phase1_fsm.yaml"
+    p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    return p
+
+
+def test_main_rejects_autonomous_mode_for_phase2(tmp_path: Path) -> None:
+    """--mode autonomous is only valid with --phase phase1."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    pred_db = tmp_path / "pred.db"
+    with sqlite3.connect(state_db) as c1:
+        c1.execute("CREATE TABLE alerts (x INT)")
+        c1.execute("CREATE TABLE validation_results (y INT)")
+    with sqlite3.connect(pred_db) as c2:
+        c2.execute("CREATE TABLE prediction_log (a INT)")
+    rid = "pytest_p2_autonomous_reject"
+    cfg_path = tmp_path / "p2.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            _minimal_phase2_dict(
+                model_dir=str(model_dir),
+                state_db=str(state_db),
+                pred_db=str(pred_db),
+                yaml_run_id=rid,
+            )
+        ),
+        encoding="utf-8",
+    )
+    rc = run_pipeline.main(
+        [
+            "--phase",
+            "phase2",
+            "--config",
+            str(cfg_path.resolve()),
+            "--run-id",
+            rid,
+            "--dry-run",
+            "--mode",
+            "autonomous",
+            "--skip-backtest-smoke",
+            "--skip-phase2-trainer-smoke",
+        ]
+    )
+    assert rc == orch_exits.EXIT_CONFIG_INVALID
+
+
+def test_main_autonomous_once_with_dry_run_is_config_invalid(tmp_path: Path) -> None:
+    """--autonomous-once is incompatible with --dry-run."""
+    cfg_path = _write_minimal_phase1_yaml_for_fsm(tmp_path)
+    rc = run_pipeline.main(
+        [
+            "--phase",
+            "phase1",
+            "--config",
+            str(cfg_path.resolve()),
+            "--run-id",
+            "pytest_p1_once_dry_bad",
+            "--dry-run",
+            "--skip-backtest-smoke",
+            "--mode",
+            "autonomous",
+            "--autonomous-once",
+        ]
+    )
+    assert rc == orch_exits.EXIT_CONFIG_INVALID
+
+
+def test_main_autonomous_once_requires_autonomous_mode(tmp_path: Path) -> None:
+    """--autonomous-once without --mode autonomous is invalid."""
+    cfg_path = _write_minimal_phase1_yaml_for_fsm(tmp_path)
+    rc = run_pipeline.main(
+        [
+            "--phase",
+            "phase1",
+            "--config",
+            str(cfg_path.resolve()),
+            "--run-id",
+            "pytest_p1_once_mode_bad",
+            "--skip-backtest-smoke",
+            "--autonomous-once",
+        ]
+    )
+    assert rc == orch_exits.EXIT_CONFIG_INVALID
+
+
+def test_main_autonomous_advance_mid_requires_autonomous_once(tmp_path: Path) -> None:
+    """--autonomous-advance-mid-when-eligible without --autonomous-once is invalid."""
+    cfg_path = _write_minimal_phase1_yaml_for_fsm(tmp_path)
+    rc = run_pipeline.main(
+        [
+            "--phase",
+            "phase1",
+            "--config",
+            str(cfg_path.resolve()),
+            "--run-id",
+            "pytest_p1_adv_mid_alone",
+            "--skip-backtest-smoke",
+            "--mode",
+            "autonomous",
+            "--autonomous-advance-mid-when-eligible",
+        ]
+    )
+    assert rc == orch_exits.EXIT_CONFIG_INVALID
+
+
+def test_main_autonomous_advance_mid_with_dry_run_is_config_invalid(tmp_path: Path) -> None:
+    """--autonomous-advance-mid-when-eligible is incompatible with --dry-run."""
+    cfg_path = _write_minimal_phase1_yaml_for_fsm(tmp_path)
+    rc = run_pipeline.main(
+        [
+            "--phase",
+            "phase1",
+            "--config",
+            str(cfg_path.resolve()),
+            "--run-id",
+            "pytest_p1_adv_mid_dry",
+            "--dry-run",
+            "--skip-backtest-smoke",
+            "--mode",
+            "autonomous",
+            "--autonomous-once",
+            "--autonomous-advance-mid-when-eligible",
+        ]
+    )
+    assert rc == orch_exits.EXIT_CONFIG_INVALID
+
+
+def test_main_autonomous_advance_mid_second_tick_moves_to_mid_when_eligible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two autonomous-once ticks with advance: observe -> mid_snapshot when eligible."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "st.db"
+    pred_db = tmp_path / "pr.db"
+    with sqlite3.connect(state_db) as conn:
+        conn.execute("CREATE TABLE alerts (x INT)")
+        conn.execute(
+            "CREATE TABLE validation_results (alert_ts TEXT, validated_at TEXT, result INT)"
+        )
+        for _ in range(5):
+            conn.execute(
+                "INSERT INTO validation_results VALUES (?, ?, 1)",
+                ("2026-01-04T12:00:00+08:00", "2026-01-05T00:00:00+08:00"),
+            )
+        conn.commit()
+    with sqlite3.connect(pred_db) as conn:
+        conn.execute("CREATE TABLE prediction_log (a INT)")
+        conn.commit()
+    cfg = _minimal_config_dict()
+    cfg["model_dir"] = str(model_dir)
+    cfg["state_db_path"] = str(state_db)
+    cfg["prediction_log_db_path"] = str(pred_db)
+    cfg["window"] = {
+        "start_ts": "2026-01-01T00:00:00+08:00",
+        "end_ts": "2026-01-08T00:00:00+08:00",
+    }
+    thr = dict(cfg["thresholds"])
+    thr["min_hours_preliminary"] = 1
+    thr["min_finalized_alerts_preliminary"] = 2
+    thr["min_finalized_true_positives_preliminary"] = 2
+    thr["min_hours_gate"] = 1
+    thr["min_finalized_alerts_gate"] = 3
+    thr["min_finalized_true_positives_gate"] = 3
+    cfg["thresholds"] = thr
+    cfg_path = tmp_path / "adv_mid.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    run_id = f"pytest_p1_adv_mid_{uuid.uuid4().hex[:10]}"
+    monkeypatch.setattr(
+        run_pipeline.runner,
+        "run_preflight",
+        lambda *a, **k: {"ok": True, "error_code": None, "message": None, "checks": []},
+    )
+    argv = [
+        "--phase",
+        "phase1",
+        "--config",
+        str(cfg_path.resolve()),
+        "--run-id",
+        run_id,
+        "--skip-backtest-smoke",
+        "--mode",
+        "autonomous",
+        "--autonomous-once",
+        "--autonomous-advance-mid-when-eligible",
+    ]
+    assert run_pipeline.main(argv) == 0
+    assert run_pipeline.main(argv) == 0
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    data = json.loads(state_json.read_text(encoding="utf-8"))
+    assert data["phase1_autonomous"]["current_step"] == p1_fsm.STEP_MID_SNAPSHOT
+    assert int(data["phase1_autonomous"].get("stub_observe_ticks") or 0) == 0
+
+
+def test_main_autonomous_mid_r1_once_requires_autonomous_once(tmp_path: Path) -> None:
+    """--autonomous-mid-r1-once without --autonomous-once is invalid."""
+    cfg_path = _write_minimal_phase1_yaml_for_fsm(tmp_path)
+    rc = run_pipeline.main(
+        [
+            "--phase",
+            "phase1",
+            "--config",
+            str(cfg_path.resolve()),
+            "--run-id",
+            "pytest_p1_mid_once_alone",
+            "--skip-backtest-smoke",
+            "--mode",
+            "autonomous",
+            "--autonomous-mid-r1-once",
+        ]
+    )
+    assert rc == orch_exits.EXIT_CONFIG_INVALID
+
+
+def test_main_autonomous_mid_r1_once_with_dry_run_is_config_invalid(tmp_path: Path) -> None:
+    """--autonomous-mid-r1-once is incompatible with --dry-run."""
+    cfg_path = _write_minimal_phase1_yaml_for_fsm(tmp_path)
+    rc = run_pipeline.main(
+        [
+            "--phase",
+            "phase1",
+            "--config",
+            str(cfg_path.resolve()),
+            "--run-id",
+            "pytest_p1_mid_dry_bad",
+            "--dry-run",
+            "--skip-backtest-smoke",
+            "--mode",
+            "autonomous",
+            "--autonomous-once",
+            "--autonomous-mid-r1-once",
+        ]
+    )
+    assert rc == orch_exits.EXIT_CONFIG_INVALID
+
+
+def test_main_autonomous_mid_r1_once_not_eligible_returns_twelve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--autonomous-mid-r1-once exits 12 when observe_context is not gate-eligible."""
+    cfg_path = _write_minimal_phase1_yaml_for_fsm(tmp_path)
+    run_id = f"pytest_p1_mid_ne_{uuid.uuid4().hex[:10]}"
+    monkeypatch.setattr(
+        run_pipeline.runner,
+        "run_preflight",
+        lambda *a, **k: {"ok": True, "error_code": None, "message": None, "checks": []},
+    )
+    rc = run_pipeline.main(
+        [
+            "--phase",
+            "phase1",
+            "--config",
+            str(cfg_path.resolve()),
+            "--run-id",
+            run_id,
+            "--skip-backtest-smoke",
+            "--mode",
+            "autonomous",
+            "--autonomous-once",
+            "--autonomous-mid-r1-once",
+        ]
+    )
+    assert rc == orch_exits.EXIT_PHASE1_AUTONOMOUS_MID_NOT_ELIGIBLE
+
+
+def test_main_autonomous_mid_r1_once_invokes_mid_when_eligible_mocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T8C: eligible observe_context + mocked R1 runner records mid snapshot success."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    state_db = tmp_path / "st.db"
+    pred_db = tmp_path / "pr.db"
+    with sqlite3.connect(state_db) as conn:
+        conn.execute("CREATE TABLE alerts (x INT)")
+        conn.execute(
+            "CREATE TABLE validation_results (alert_ts TEXT, validated_at TEXT, result INT)"
+        )
+        for _ in range(5):
+            conn.execute(
+                "INSERT INTO validation_results VALUES (?, ?, 1)",
+                ("2026-01-04T12:00:00+08:00", "2026-01-05T00:00:00+08:00"),
+            )
+        conn.commit()
+    with sqlite3.connect(pred_db) as conn:
+        conn.execute("CREATE TABLE prediction_log (a INT)")
+        conn.commit()
+    cfg = _minimal_config_dict()
+    cfg["model_dir"] = str(model_dir)
+    cfg["state_db_path"] = str(state_db)
+    cfg["prediction_log_db_path"] = str(pred_db)
+    cfg["window"] = {
+        "start_ts": "2026-01-01T00:00:00+08:00",
+        "end_ts": "2026-01-08T00:00:00+08:00",
+    }
+    thr = dict(cfg["thresholds"])
+    thr["min_hours_preliminary"] = 1
+    thr["min_finalized_alerts_preliminary"] = 2
+    thr["min_finalized_true_positives_preliminary"] = 2
+    thr["min_hours_gate"] = 1
+    thr["min_finalized_alerts_gate"] = 3
+    thr["min_finalized_true_positives_gate"] = 3
+    cfg["thresholds"] = thr
+    cfg_path = tmp_path / "mid_elig.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    run_id = f"pytest_p1_mid_ok_{uuid.uuid4().hex[:10]}"
+    monkeypatch.setattr(
+        run_pipeline.runner,
+        "run_preflight",
+        lambda *a, **k: {"ok": True, "error_code": None, "message": None, "checks": []},
+    )
+    calls: list[tuple[Any, ...]] = []
+
+    def fake_r1(*a: Any, **k: Any) -> dict[str, Any]:
+        calls.append((a, k))
+        return {
+            "ok": True,
+            "message": None,
+            "error_code": None,
+            "stdout_path": "/dev/null",
+            "stderr_path": "/dev/null",
+        }
+
+    monkeypatch.setattr(run_pipeline.runner, "run_phase1_r1_r6_all", fake_r1)
+    rc = run_pipeline.main(
+        [
+            "--phase",
+            "phase1",
+            "--config",
+            str(cfg_path.resolve()),
+            "--run-id",
+            run_id,
+            "--skip-backtest-smoke",
+            "--mode",
+            "autonomous",
+            "--autonomous-once",
+            "--autonomous-mid-r1-once",
+        ]
+    )
+    assert rc == 0
+    assert len(calls) >= 1
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    data = json.loads(state_json.read_text(encoding="utf-8"))
+    assert data["steps"].get("r1_r6_mid_snapshot", {}).get("status") == "success"
+    assert data["phase1_autonomous"].get("last_autonomous_mid_r1_at")
+
+
+def test_phase1_autonomous_dry_run_registers_fsm_in_run_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T8A: --dry-run + --mode autonomous writes phase1_autonomous + snapshot step."""
+    cfg_path = _write_minimal_phase1_yaml_for_fsm(tmp_path)
+    run_id = "pytest_p1_autonomous_fsm_dry"
+    monkeypatch.setattr(run_pipeline.runner, "run_r1_r6_cli_smoke", lambda *a, **k: (True, None))
+    monkeypatch.setattr(run_pipeline.runner, "run_backtest_cli_smoke", lambda *a, **k: (True, None))
+    rc = run_pipeline.main(
+        [
+            "--phase",
+            "phase1",
+            "--config",
+            str(cfg_path.resolve()),
+            "--run-id",
+            run_id,
+            "--dry-run",
+            "--skip-backtest-smoke",
+            "--mode",
+            "autonomous",
+        ]
+    )
+    assert rc == 0
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    data = json.loads(state_json.read_text(encoding="utf-8"))
+    assert data.get("cli_run_mode") == "autonomous"
+    pa = data.get("phase1_autonomous")
+    assert isinstance(pa, dict)
+    assert pa.get("fsm_schema_version") == 1
+    assert pa.get("current_step") == p1_fsm.STEP_INIT
+    assert data["steps"].get("phase1_autonomous_fsm_snapshot", {}).get("status") == "success"
+
+
+def test_phase1_autonomous_once_chains_observe_ticks_without_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T8A: two --autonomous-once invocations read disk cursor (no --resume required)."""
+    cfg_path = _write_minimal_phase1_yaml_for_fsm(tmp_path)
+    run_id = f"pytest_p1_autonomous_once_{uuid.uuid4().hex[:10]}"
+    monkeypatch.setattr(
+        run_pipeline.runner,
+        "run_preflight",
+        lambda *a, **k: {"ok": True, "error_code": None, "message": None, "checks": []},
+    )
+    argv_base = [
+        "--phase",
+        "phase1",
+        "--config",
+        str(cfg_path.resolve()),
+        "--run-id",
+        run_id,
+        "--skip-backtest-smoke",
+        "--mode",
+        "autonomous",
+        "--autonomous-once",
+    ]
+    assert run_pipeline.main(argv_base) == 0
+    assert run_pipeline.main(argv_base) == 0
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    data = json.loads(state_json.read_text(encoding="utf-8"))
+    pa = data.get("phase1_autonomous")
+    assert pa.get("current_step") == p1_fsm.STEP_OBSERVE
+    assert pa.get("stub_observe_ticks") == 1
+    assert pa.get("tick_seq") == 2
+    assert data["steps"].get("phase1_autonomous_stub_tick", {}).get("status") == "success"
+    oc = pa.get("observe_context")
+    assert isinstance(oc, dict)
+    assert oc.get("window_hours") == 168.0
+    assert oc.get("observation_gate_hint") == "preliminary_ok"
+    assert oc.get("samples_preliminary_hint") == "below_preliminary"
+    # FSM fixture creates empty validation_results (schema-only for preflight).
+    assert oc.get("finalized_alerts_count") == 0
+    assert oc.get("gate_hours_hint") == "ok"
+    assert oc.get("gate_sample_hint") == "below"
+    assert oc.get("mid_snapshot_eligible") is False
+
+
+def test_phase1_autonomous_resume_once_continues_tick_seq(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T8A: --resume reloads run_state so stub tick continues tick_seq (process restart sim)."""
+    cfg_path = _write_minimal_phase1_yaml_for_fsm(tmp_path)
+    run_id = f"pytest_p1_auto_resume_{uuid.uuid4().hex[:10]}"
+    monkeypatch.setattr(
+        run_pipeline.runner,
+        "run_preflight",
+        lambda *a, **k: {"ok": True, "error_code": None, "message": None, "checks": []},
+    )
+    argv_once = [
+        "--phase",
+        "phase1",
+        "--config",
+        str(cfg_path.resolve()),
+        "--run-id",
+        run_id,
+        "--skip-backtest-smoke",
+        "--mode",
+        "autonomous",
+        "--autonomous-once",
+    ]
+    assert run_pipeline.main(argv_once) == 0
+    argv_resume = argv_once + ["--resume"]
+    assert run_pipeline.main(argv_resume) == 0
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    data = json.loads(state_json.read_text(encoding="utf-8"))
+    pa = data.get("phase1_autonomous")
+    assert pa.get("tick_seq") == 2
+    assert pa.get("stub_observe_ticks") == 1
+    assert pa.get("checkpoint", {}).get("cursor_before") == p1_fsm.STEP_OBSERVE
+
+
+def test_phase1_autonomous_without_dry_run_returns_pending_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T8A: autonomous without --dry-run exits 11 after preflight (supervisor not implemented)."""
+    cfg_path = _write_minimal_phase1_yaml_for_fsm(tmp_path)
+    run_id = "pytest_p1_autonomous_pending"
+    monkeypatch.setattr(
+        run_pipeline.runner,
+        "run_preflight",
+        lambda *a, **k: {"ok": True, "error_code": None, "message": None, "checks": []},
+    )
+    rc = run_pipeline.main(
+        [
+            "--phase",
+            "phase1",
+            "--config",
+            str(cfg_path.resolve()),
+            "--run-id",
+            run_id,
+            "--skip-backtest-smoke",
+            "--mode",
+            "autonomous",
+        ]
+    )
+    assert rc == orch_exits.EXIT_PHASE1_AUTONOMOUS_PENDING
+    state_json = _ORCHESTRATOR / "state" / run_id / "run_state.json"
+    data = json.loads(state_json.read_text(encoding="utf-8"))
+    assert data["phase1_autonomous"].get("full_run_status") == "pending_t8a_supervisor"
 
 
 # --- T6: report_builder ---

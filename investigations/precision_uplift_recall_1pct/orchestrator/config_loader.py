@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -110,6 +111,34 @@ def validate_phase1_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             raise ConfigValidationError(
                 "checkpoints.enable_mid_snapshot must be bool when set"
             )
+        if "ratio_midpoints_enabled" in checkpoints and not isinstance(
+            checkpoints["ratio_midpoints_enabled"], bool
+        ):
+            raise ConfigValidationError(
+                "checkpoints.ratio_midpoints_enabled must be bool when set"
+            )
+        if "wallclock_offsets_hours" in checkpoints:
+            wo = checkpoints["wallclock_offsets_hours"]
+            if not isinstance(wo, list):
+                raise ConfigValidationError(
+                    "checkpoints.wallclock_offsets_hours must be a list when set"
+                )
+            if len(wo) > 64:
+                raise ConfigValidationError(
+                    "checkpoints.wallclock_offsets_hours must have at most 64 entries"
+                )
+            for i, x in enumerate(wo):
+                try:
+                    h = float(x)
+                except (TypeError, ValueError) as exc:
+                    raise ConfigValidationError(
+                        f"checkpoints.wallclock_offsets_hours[{i}] must be numeric"
+                    ) from exc
+                if not math.isfinite(h) or h <= 0.0:
+                    raise ConfigValidationError(
+                        f"checkpoints.wallclock_offsets_hours[{i}] must be a finite "
+                        f"positive number, got {x!r}"
+                    )
         if "midpoint_ratio" in checkpoints:
             try:
                 float(checkpoints["midpoint_ratio"])

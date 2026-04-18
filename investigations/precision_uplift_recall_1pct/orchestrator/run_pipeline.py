@@ -8,7 +8,7 @@ import hashlib
 import json
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -27,6 +27,7 @@ import collectors  # noqa: E402
 import common_exit_codes as orch_exits  # noqa: E402
 import config_loader  # noqa: E402
 import evaluators  # noqa: E402
+import phase1_autonomous_fsm  # noqa: E402
 import phase2_exit_codes as phase2_exits  # noqa: E402
 import report_builder  # noqa: E402
 import runner  # noqa: E402
@@ -68,14 +69,57 @@ def phase1_mid_snapshot_window(cfg: Mapping[str, Any]) -> dict[str, str] | None:
     return rows[0] if rows else None
 
 
+def _phase1_ratio_midpoint_datetimes(
+    start_dt: datetime, end_dt: datetime, ratios: list[float]
+) -> list[datetime]:
+    """Return strictly interior mid end datetimes from fractional window lengths."""
+    ends: list[datetime] = []
+    for r in sorted(set(ratios)):
+        mid_dt = start_dt + (end_dt - start_dt) * r
+        if mid_dt <= start_dt or mid_dt >= end_dt:
+            continue
+        ends.append(mid_dt)
+    return ends
+
+
+def _phase1_wallclock_offset_datetimes(
+    start_dt: datetime, end_dt: datetime, offsets_hours: list[float]
+) -> list[datetime]:
+    """Return mid end datetimes at ``start + timedelta(hours=h)`` strictly inside ``end_dt``."""
+    ends: list[datetime] = []
+    for h in offsets_hours:
+        try:
+            hrs = float(h)
+        except (TypeError, ValueError):
+            continue
+        if hrs <= 0.0:
+            continue
+        mid_dt = start_dt + timedelta(hours=hrs)
+        if mid_dt <= start_dt or mid_dt >= end_dt:
+            continue
+        ends.append(mid_dt)
+    return ends
+
+
+def _dedupe_sorted_mid_datetimes(candidates: list[datetime]) -> list[datetime]:
+    """Deduplicate by UTC epoch seconds then sort ascending."""
+    by_ts: dict[float, datetime] = {}
+    for dt in candidates:
+        by_ts[dt.timestamp()] = dt
+    return sorted(by_ts.values())
+
+
 def phase1_mid_snapshot_windows(cfg: Mapping[str, Any]) -> list[dict[str, str]]:
     """Return auto mid-snapshot windows for Phase 1.
 
     Config (all optional) under ``checkpoints``:
     - ``enable_mid_snapshot``: bool, default True.
+    - ``ratio_midpoints_enabled``: bool, default True (set False for wall-clock-only).
     - ``midpoint_ratio``: float in (0, 1), default 0.5.
     - ``midpoint_ratios``: optional list[float] in (0, 1); when set, overrides
       the single ``midpoint_ratio``.
+    - ``wallclock_offsets_hours``: optional list of positive hours from ``window.start_ts``
+      (merged with ratio checkpoints; duplicate end times are deduped).
     """
     cp = cfg.get("checkpoints") if isinstance(cfg.get("checkpoints"), Mapping) else {}
     enabled_raw = cp.get("enable_mid_snapshot", True)
@@ -83,25 +127,37 @@ def phase1_mid_snapshot_windows(cfg: Mapping[str, Any]) -> list[dict[str, str]]:
     if not enabled:
         return []
 
-    ratios_raw = cp.get("midpoint_ratios")
+    ratio_on_raw = cp.get("ratio_midpoints_enabled", True)
+    ratio_on = bool(ratio_on_raw) if isinstance(ratio_on_raw, bool) else True
     ratios: list[float] = []
-    if isinstance(ratios_raw, list) and ratios_raw:
-        for x in ratios_raw:
+    if ratio_on:
+        ratios_raw = cp.get("midpoint_ratios")
+        if isinstance(ratios_raw, list) and ratios_raw:
+            for x in ratios_raw:
+                try:
+                    v = float(x)
+                except (TypeError, ValueError):
+                    continue
+                if 0.0 < v < 1.0:
+                    ratios.append(v)
+        if not ratios:
+            ratio_raw = cp.get("midpoint_ratio", 0.5)
             try:
-                v = float(x)
+                ratio = float(ratio_raw)
+            except (TypeError, ValueError):
+                ratio = 0.5
+            if not (0.0 < ratio < 1.0):
+                ratio = 0.5
+            ratios = [ratio]
+
+    offsets_hours: list[float] = []
+    wo_raw = cp.get("wallclock_offsets_hours")
+    if isinstance(wo_raw, list):
+        for x in wo_raw:
+            try:
+                offsets_hours.append(float(x))
             except (TypeError, ValueError):
                 continue
-            if 0.0 < v < 1.0:
-                ratios.append(v)
-    if not ratios:
-        ratio_raw = cp.get("midpoint_ratio", 0.5)
-        try:
-            ratio = float(ratio_raw)
-        except (TypeError, ValueError):
-            ratio = 0.5
-        if not (0.0 < ratio < 1.0):
-            ratio = 0.5
-        ratios = [ratio]
 
     window = cfg.get("window") if isinstance(cfg.get("window"), Mapping) else {}
     start_raw = str(window.get("start_ts") or "").strip()
@@ -113,14 +169,12 @@ def phase1_mid_snapshot_windows(cfg: Mapping[str, Any]) -> list[dict[str, str]]:
     if end_dt <= start_dt:
         return []
 
-    uniq_sorted = sorted(set(ratios))
-    out: list[dict[str, str]] = []
-    for r in uniq_sorted:
-        mid_dt = start_dt + (end_dt - start_dt) * r
-        if mid_dt <= start_dt or mid_dt >= end_dt:
-            continue
-        out.append({"start_ts": start_raw, "end_ts": mid_dt.isoformat()})
-    return out
+    candidates: list[datetime] = []
+    if ratios:
+        candidates.extend(_phase1_ratio_midpoint_datetimes(start_dt, end_dt, ratios))
+    candidates.extend(_phase1_wallclock_offset_datetimes(start_dt, end_dt, offsets_hours))
+    uniq = _dedupe_sorted_mid_datetimes(candidates)
+    return [{"start_ts": start_raw, "end_ts": dt.isoformat()} for dt in uniq]
 
 
 def _state_path(run_id: str) -> Path:
@@ -866,6 +920,44 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Run readiness checks only; do not run long investigation steps",
     )
+    p.add_argument(
+        "--mode",
+        choices=("batch", "autonomous"),
+        default="batch",
+        help=(
+            "batch: default single-shot phase1/phase2 behavior. "
+            "autonomous: Phase1 T8A supervisor (FSM metadata on --dry-run; "
+            "non-dry-run exits 11 until long-run loop is implemented)"
+        ),
+    )
+    p.add_argument(
+        "--autonomous-once",
+        action="store_true",
+        help=(
+            "Phase1 + --mode autonomous only: after preflight, run one T8A stub "
+            "supervisor tick (init->observe or observe self-loop) and exit 0. "
+            "Incompatible with --dry-run."
+        ),
+    )
+    p.add_argument(
+        "--autonomous-mid-r1-once",
+        action="store_true",
+        help=(
+            "Phase1 + --mode autonomous + --autonomous-once only: after the stub tick, "
+            "if observe_context.mid_snapshot_eligible, run the same mid R1/R6 checkpoint "
+            "loop as batch mode (requires --autonomous-once). Incompatible with --dry-run."
+        ),
+    )
+    p.add_argument(
+        "--autonomous-advance-mid-when-eligible",
+        action="store_true",
+        help=(
+            "Phase1 + --mode autonomous + --autonomous-once only: pass observe_context "
+            "into the stub tick so when mid_snapshot_eligible the FSM may transition "
+            "observe -> mid_snapshot (no observe self-loop increment that tick). "
+            "Requires --autonomous-once. Incompatible with --dry-run."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -1044,6 +1136,228 @@ def run_dry_run_readiness(
     }
 
 
+def _phase1_observe_window_context(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """Summarize configured window length vs preliminary hours (T8A observe hook).
+
+    JSON-serializable; written under ``run_state['phase1_autonomous']['observe_context']``
+    after ``--autonomous-once`` when the stub cursor is ``observe``.
+    """
+    window_raw = cfg.get("window")
+    window = window_raw if isinstance(window_raw, Mapping) else {}
+    thr_raw = cfg.get("thresholds")
+    thr = thr_raw if isinstance(thr_raw, Mapping) else {}
+    hours = float(evaluators.window_duration_hours(window))
+    min_pre_raw = thr.get("min_hours_preliminary", 48)
+    try:
+        min_pre = float(min_pre_raw)
+    except (TypeError, ValueError):
+        min_pre = 48.0
+    if min_pre < 0.0:
+        min_pre = 0.0
+    hint = "preliminary_ok" if hours >= min_pre else "below_preliminary"
+    return {
+        "window_hours": round(hours, 4),
+        "min_hours_preliminary": min_pre,
+        "observation_gate_hint": hint,
+    }
+
+
+def _phase1_samples_preliminary_hint(
+    cfg: Mapping[str, Any],
+    db_counts: Mapping[str, Any],
+) -> str:
+    """Compare state_db counts to preliminary sample floors (matches gate semantics)."""
+    errs = db_counts.get("collect_errors")
+    if isinstance(errs, list) and len(errs) > 0:
+        return "unknown"
+    thr_raw = cfg.get("thresholds")
+    thr = thr_raw if isinstance(thr_raw, Mapping) else {}
+    try:
+        pre_fin = int(thr.get("min_finalized_alerts_preliminary", 300))
+    except (TypeError, ValueError):
+        pre_fin = 300
+    try:
+        pre_tp = int(thr.get("min_finalized_true_positives_preliminary", 30))
+    except (TypeError, ValueError):
+        pre_tp = 30
+    if pre_fin < 0:
+        pre_fin = 0
+    if pre_tp < 0:
+        pre_tp = 0
+    n_fin = db_counts.get("finalized_alerts_count")
+    n_tp = db_counts.get("finalized_true_positives_count")
+    nf = int(n_fin) if isinstance(n_fin, (int, float)) else 0
+    nt = int(n_tp) if isinstance(n_tp, (int, float)) else 0
+    if nf >= pre_fin and nt >= pre_tp:
+        return "preliminary_ok"
+    return "below_preliminary"
+
+
+def _phase1_gate_sample_hint_string(
+    db_counts: Mapping[str, Any],
+    *,
+    gate_fin: int,
+    gate_tp: int,
+) -> str:
+    """Return ``ok`` / ``below`` / ``unknown`` for gate-grade finalized counts."""
+    errs = db_counts.get("collect_errors")
+    if isinstance(errs, list) and len(errs) > 0:
+        return "unknown"
+    n_fin = db_counts.get("finalized_alerts_count")
+    n_tp = db_counts.get("finalized_true_positives_count")
+    nf = int(n_fin) if isinstance(n_fin, (int, float)) else 0
+    nt = int(n_tp) if isinstance(n_tp, (int, float)) else 0
+    if nf >= gate_fin and nt >= gate_tp:
+        return "ok"
+    return "below"
+
+
+def _phase1_gate_observe_slice(
+    cfg: Mapping[str, Any],
+    db_counts: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Gate-grade hour/sample hints for autonomous observe (T8C scheduling hook; no R1 run)."""
+    window_raw = cfg.get("window")
+    window = window_raw if isinstance(window_raw, Mapping) else {}
+    thr_raw = cfg.get("thresholds")
+    thr = thr_raw if isinstance(thr_raw, Mapping) else {}
+    hours = float(evaluators.window_duration_hours(window))
+    try:
+        min_h_gate = float(thr.get("min_hours_gate", 72))
+    except (TypeError, ValueError):
+        min_h_gate = 72.0
+    if min_h_gate < 0.0:
+        min_h_gate = 0.0
+    try:
+        gate_fin = int(thr.get("min_finalized_alerts_gate", 800))
+    except (TypeError, ValueError):
+        gate_fin = 800
+    try:
+        gate_tp = int(thr.get("min_finalized_true_positives_gate", 50))
+    except (TypeError, ValueError):
+        gate_tp = 50
+    gate_fin = max(0, gate_fin)
+    gate_tp = max(0, gate_tp)
+    gate_hours_hint = "ok" if hours >= min_h_gate else "below"
+    gate_sample_hint = _phase1_gate_sample_hint_string(
+        db_counts, gate_fin=gate_fin, gate_tp=gate_tp
+    )
+    return {
+        "min_hours_gate": min_h_gate,
+        "min_finalized_alerts_gate": gate_fin,
+        "min_finalized_true_positives_gate": gate_tp,
+        "gate_hours_hint": gate_hours_hint,
+        "gate_sample_hint": gate_sample_hint,
+    }
+
+
+def _phase1_autonomous_observe_context(cfg: Mapping[str, Any], repo_root: Path) -> dict[str, Any]:
+    """Window + state_db COUNT fields for ``phase1_autonomous.observe_context``."""
+    base = _phase1_observe_window_context(cfg)
+    db_counts = collectors.collect_phase1_state_db_observe_counts(repo_root, cfg)
+    out: dict[str, Any] = dict(base)
+    for k, v in db_counts.items():
+        out[k] = v
+    out["samples_preliminary_hint"] = _phase1_samples_preliminary_hint(cfg, db_counts)
+    out.update(_phase1_gate_observe_slice(cfg, db_counts))
+    obs_ok = out.get("observation_gate_hint") == "preliminary_ok"
+    sp_ok = out.get("samples_preliminary_hint") == "preliminary_ok"
+    gh_ok = out.get("gate_hours_hint") == "ok"
+    gs_ok = out.get("gate_sample_hint") == "ok"
+    out["mid_snapshot_eligible"] = bool(obs_ok and sp_ok and gh_ok and gs_ok)
+    return out
+
+
+def _phase1_mid_snapshot_run_windows(
+    merged: dict[str, Any],
+    cfg: Mapping[str, Any],
+    state_file: Path,
+    run_id: str,
+    mid_windows: list[dict[str, str]],
+    started_at: str,
+) -> int:
+    """Run R1/R6 for each mid checkpoint window (batch and autonomous T8C)."""
+    log_dir = _logs_dir(run_id)
+    r1_mid_last: dict[str, Any] | None = None
+    for idx, mid_window in enumerate(mid_windows):
+        stem = (
+            "r1_r6_mid"
+            if idx == len(mid_windows) - 1
+            else f"r1_r6_mid_cp{idx + 1}"
+        )
+        r1_mid = runner.run_phase1_r1_r6_all(
+            _REPO_ROOT,
+            cfg,
+            log_dir,
+            window_override=mid_window,
+            log_stem=stem,
+        )
+        r1_mid_last = r1_mid
+        if not r1_mid.get("ok"):
+            fail_msg = (
+                f"mid snapshot failed at checkpoint {idx + 1}/{len(mid_windows)} "
+                f"(end_ts={mid_window.get('end_ts')})"
+            )
+            raw_msg = r1_mid.get("message")
+            if isinstance(raw_msg, str) and raw_msg.strip():
+                r1_mid["message"] = f"{fail_msg}; {raw_msg}"
+            else:
+                r1_mid["message"] = fail_msg
+            _attach_step(merged, "r1_r6_mid_snapshot", r1_mid, started_at=started_at)
+            _write_run_state(state_file, merged)
+            break
+    assert r1_mid_last is not None
+    if r1_mid_last.get("ok"):
+        msg = f"mid snapshot(s) completed: {len(mid_windows)} checkpoint(s)"
+        _attach_terminal_step(
+            merged,
+            "r1_r6_mid_snapshot",
+            status="success",
+            artifacts={
+                "r1_r6_mid_stdout_log": str(log_dir / "r1_r6_mid.stdout.log"),
+            },
+            message=msg,
+        )
+        merged["steps"]["r1_r6_mid_snapshot"]["started_at"] = started_at
+        _write_run_state(state_file, merged)
+        return 0
+    print(
+        r1_mid_last.get("message")
+        or r1_mid_last.get("error_code")
+        or "r1_r6_mid_snapshot failed",
+        file=sys.stderr,
+    )
+    return orch_exits.EXIT_PHASE1_MID_OR_R1_FAILED
+
+
+def _phase1_mid_snapshot_dispatch(
+    merged: dict[str, Any],
+    cfg: Mapping[str, Any],
+    state_file: Path,
+    run_id: str,
+    *,
+    skip_mid: bool,
+) -> int:
+    """Run or skip Phase-1 mid R1/R6 checkpoints (shared by batch and autonomous)."""
+    if skip_mid:
+        return 0
+    mid_windows = phase1_mid_snapshot_windows(cfg)
+    if not mid_windows:
+        _attach_terminal_step(
+            merged,
+            "r1_r6_mid_snapshot",
+            status="success",
+            message="mid snapshot skipped (disabled or invalid checkpoint window)",
+        )
+        _write_run_state(state_file, merged)
+        return 0
+    t_mid = _mark_step_running(merged, "r1_r6_mid_snapshot")
+    _write_run_state(state_file, merged)
+    return _phase1_mid_snapshot_run_windows(
+        merged, cfg, state_file, run_id, mid_windows, t_mid
+    )
+
+
 def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
     """Run Phase 1 pipeline (R1/R6, backtest, collect, reports)."""
     try:
@@ -1054,6 +1368,9 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
 
     state_file = _state_path(args.run_id)
     prev_state = _load_run_state(state_file) if args.resume else None
+    prev_steps: dict[str, Any] = (
+        (prev_state.get("steps") or {}) if isinstance(prev_state, dict) else {}
+    )
 
     input_summary = build_input_summary(cfg, config_path)
     prev_fp = (prev_state.get("input_summary") or {}).get("fingerprint") if prev_state else None
@@ -1062,6 +1379,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
         and prev_state is not None
         and prev_fp != input_summary["fingerprint"]
     )
+    resume_ok = args.resume and not fingerprint_mismatch
     if fingerprint_mismatch:
         print(
             "orchestrator: resume invalid — config fingerprint differs from run_state "
@@ -1093,13 +1411,107 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
     merged = _merge_state(prev_state, args.run_id, args.phase, input_summary, preflight)
     if fingerprint_mismatch:
         merged["resume_invalidated"] = "config_fingerprint_mismatch"
+        merged.pop("phase1_autonomous", None)
     else:
         merged.pop("resume_invalidated", None)
+    if getattr(args, "autonomous_once", False) and not fingerprint_mismatch:
+        disk_fsm = _load_run_state(state_file)
+        if isinstance(disk_fsm, Mapping) and isinstance(
+            disk_fsm.get("phase1_autonomous"), Mapping
+        ):
+            merged["phase1_autonomous"] = dict(disk_fsm["phase1_autonomous"])
     _write_run_state(state_file, merged)
 
     if not preflight.get("ok"):
         print(preflight.get("message") or "preflight failed", file=sys.stderr)
         return orch_exits.EXIT_PREFLIGHT_FAILED
+
+    if args.mode == "autonomous" and not args.dry_run:
+        merged["cli_run_mode"] = "autonomous"
+        if args.autonomous_once:
+            disk = _load_run_state(state_file)
+            fp_raw = (merged.get("input_summary") or {}).get("fingerprint")
+            fp = fp_raw if isinstance(fp_raw, str) else None
+            oc_pre = _phase1_autonomous_observe_context(cfg, _REPO_ROOT)
+            merged["phase1_autonomous"] = phase1_autonomous_fsm.after_stub_tick(
+                disk,
+                tick_iso=_utc_now_iso(),
+                config_fingerprint=fp,
+                observe_context=oc_pre,
+                advance_mid_when_eligible=getattr(
+                    args, "autonomous_advance_mid_when_eligible", False
+                ),
+            )
+            merged["phase1_autonomous"]["observe_context"] = oc_pre
+            skip_mid = resume_ok and _step_success(prev_steps, "r1_r6_mid_snapshot")
+            if getattr(args, "autonomous_mid_r1_once", False):
+                oc = merged["phase1_autonomous"].get("observe_context")
+                ck = merged["phase1_autonomous"].get("checkpoint")
+                ck_m = ck if isinstance(ck, Mapping) else {}
+                c_before = str(ck_m.get("cursor_before") or "")
+                c_after = str(ck_m.get("cursor_after") or "")
+                allow_mid_this_tick = (
+                    c_before == phase1_autonomous_fsm.STEP_OBSERVE
+                    and (
+                        c_after == phase1_autonomous_fsm.STEP_OBSERVE
+                        or c_after == phase1_autonomous_fsm.STEP_MID_SNAPSHOT
+                    )
+                ) or (
+                    c_before == phase1_autonomous_fsm.STEP_INIT
+                    and c_after == phase1_autonomous_fsm.STEP_OBSERVE
+                    and isinstance(oc, Mapping)
+                    and bool(oc.get("mid_snapshot_eligible"))
+                )
+                if not isinstance(oc, Mapping) or not oc.get("mid_snapshot_eligible"):
+                    merged["updated_at"] = _utc_now_iso()
+                    _write_run_state(state_file, merged)
+                    print(
+                        "orchestrator: E_AUTONOMOUS_MID_NOT_ELIGIBLE: "
+                        "--autonomous-mid-r1-once requires observe_context.mid_snapshot_eligible "
+                        "(gate + preliminary time/samples).",
+                        file=sys.stderr,
+                    )
+                    return orch_exits.EXIT_PHASE1_AUTONOMOUS_MID_NOT_ELIGIBLE
+                if not allow_mid_this_tick:
+                    print(
+                        "orchestrator: --autonomous-mid-r1-once skipped (not an observe-phase "
+                        "stub tick; checkpoint cursor_before/after incompatible).",
+                        file=sys.stderr,
+                    )
+                else:
+                    rc_mid = _phase1_mid_snapshot_dispatch(
+                        merged, cfg, state_file, args.run_id, skip_mid=skip_mid
+                    )
+                    if rc_mid != 0:
+                        return rc_mid
+                    merged["phase1_autonomous"]["last_autonomous_mid_r1_at"] = _utc_now_iso()
+            merged["updated_at"] = _utc_now_iso()
+            _attach_terminal_step(
+                merged,
+                "phase1_autonomous_stub_tick",
+                status="success",
+                message=merged["phase1_autonomous"].get("stub_last_note"),
+            )
+            _write_run_state(state_file, merged)
+            print(
+                "orchestrator: T8A --autonomous-once stub tick applied "
+                "(see run_state.phase1_autonomous).",
+                file=sys.stderr,
+            )
+            return 0
+        cursor = phase1_autonomous_fsm.restore_cursor(prev_state, resume=args.resume)
+        merged["phase1_autonomous"] = phase1_autonomous_fsm.run_state_block(cursor)
+        merged["phase1_autonomous"]["full_run_status"] = "pending_t8a_supervisor"
+        merged["updated_at"] = _utc_now_iso()
+        _write_run_state(state_file, merged)
+        print(
+            "orchestrator: --mode autonomous (T8A) long-run supervisor is not implemented; "
+            "exiting without R1/backtest/collect. Use --dry-run to register FSM metadata "
+            "and readiness, pass --autonomous-once for a single stub tick, "
+            "or --mode batch for the standard pipeline.",
+            file=sys.stderr,
+        )
+        return orch_exits.EXIT_PHASE1_AUTONOMOUS_PENDING
 
     if args.dry_run:
         readiness = run_dry_run_readiness(
@@ -1120,6 +1532,20 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
             error_code=(None if readiness["status"] == "READY" else "E_DRY_RUN_NOT_READY"),
             message="; ".join(readiness.get("blocking_reasons", [])),
         )
+        if readiness["status"] == "READY" and args.mode == "autonomous":
+            merged["cli_run_mode"] = "autonomous"
+            cursor = phase1_autonomous_fsm.restore_cursor(prev_state, resume=args.resume)
+            merged["phase1_autonomous"] = phase1_autonomous_fsm.run_state_block(cursor)
+            _attach_terminal_step(
+                merged,
+                "phase1_autonomous_fsm_snapshot",
+                status="success",
+                message=(
+                    "T8A: FSM backbone registered in run_state (supervisor observe loop "
+                    "and checkpoint resume not implemented)"
+                ),
+            )
+        merged["updated_at"] = _utc_now_iso()
         _write_run_state(state_file, merged)
         if readiness["status"] != "READY":
             print(
@@ -1129,84 +1555,17 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
             return orch_exits.EXIT_DRY_RUN_NOT_READY
         return 0
 
-    prev_steps: dict[str, Any] = (
-        (prev_state.get("steps") or {}) if isinstance(prev_state, dict) else {}
-    )
-    resume_ok = args.resume and not fingerprint_mismatch
-
     if not args.collect_only:
         log_dir = _logs_dir(args.run_id)
         skip_mid = resume_ok and _step_success(prev_steps, "r1_r6_mid_snapshot")
         skip_r1 = resume_ok and _step_success(prev_steps, "r1_r6_analysis")
         skip_bt = resume_ok and _step_success(prev_steps, "backtest")
 
-        if not skip_mid:
-            mid_windows = phase1_mid_snapshot_windows(cfg)
-            if not mid_windows:
-                _attach_terminal_step(
-                    merged,
-                    "r1_r6_mid_snapshot",
-                    status="success",
-                    message="mid snapshot skipped (disabled or invalid checkpoint window)",
-                )
-                _write_run_state(state_file, merged)
-            else:
-                t_mid = _mark_step_running(merged, "r1_r6_mid_snapshot")
-                _write_run_state(state_file, merged)
-                r1_mid_last: dict[str, Any] | None = None
-                for idx, mid_window in enumerate(mid_windows):
-                    stem = (
-                        "r1_r6_mid"
-                        if idx == len(mid_windows) - 1
-                        else f"r1_r6_mid_cp{idx + 1}"
-                    )
-                    r1_mid = runner.run_phase1_r1_r6_all(
-                        _REPO_ROOT,
-                        cfg,
-                        log_dir,
-                        window_override=mid_window,
-                        log_stem=stem,
-                    )
-                    r1_mid_last = r1_mid
-                    if not r1_mid.get("ok"):
-                        fail_msg = (
-                            f"mid snapshot failed at checkpoint {idx + 1}/{len(mid_windows)} "
-                            f"(end_ts={mid_window.get('end_ts')})"
-                        )
-                        raw_msg = r1_mid.get("message")
-                        if isinstance(raw_msg, str) and raw_msg.strip():
-                            r1_mid["message"] = f"{fail_msg}; {raw_msg}"
-                        else:
-                            r1_mid["message"] = fail_msg
-                        _attach_step(
-                            merged, "r1_r6_mid_snapshot", r1_mid, started_at=t_mid
-                        )
-                        _write_run_state(state_file, merged)
-                        break
-                assert r1_mid_last is not None
-                if r1_mid_last.get("ok"):
-                    msg = f"mid snapshot(s) completed: {len(mid_windows)} checkpoint(s)"
-                    _attach_terminal_step(
-                        merged,
-                        "r1_r6_mid_snapshot",
-                        status="success",
-                        artifacts={
-                            "r1_r6_mid_stdout_log": str(
-                                log_dir / "r1_r6_mid.stdout.log"
-                            )
-                        },
-                        message=msg,
-                    )
-                    merged["steps"]["r1_r6_mid_snapshot"]["started_at"] = t_mid
-                    _write_run_state(state_file, merged)
-                else:
-                    print(
-                        r1_mid_last.get("message")
-                        or r1_mid_last.get("error_code")
-                        or "r1_r6_mid_snapshot failed",
-                        file=sys.stderr,
-                    )
-                    return orch_exits.EXIT_PHASE1_MID_OR_R1_FAILED
+        rc_mid = _phase1_mid_snapshot_dispatch(
+            merged, cfg, state_file, args.run_id, skip_mid=skip_mid
+        )
+        if rc_mid != 0:
+            return rc_mid
 
         if not skip_r1:
             t_r1 = _mark_step_running(merged, "r1_r6_analysis")
@@ -2173,6 +2532,72 @@ def main(argv: list[str] | None = None) -> int:
     config_path = args.config
     if not config_path.is_absolute():
         config_path = (_REPO_ROOT / config_path).resolve()
+
+    if args.autonomous_once:
+        if args.dry_run:
+            print(
+                "E_CONFIG_INVALID: --autonomous-once cannot be used with --dry-run",
+                file=sys.stderr,
+            )
+            return orch_exits.EXIT_CONFIG_INVALID
+        if args.mode != "autonomous" or args.phase != "phase1":
+            print(
+                "E_CONFIG_INVALID: --autonomous-once requires --mode autonomous "
+                "and --phase phase1",
+                file=sys.stderr,
+            )
+            return orch_exits.EXIT_CONFIG_INVALID
+
+    if getattr(args, "autonomous_mid_r1_once", False):
+        if args.dry_run:
+            print(
+                "E_CONFIG_INVALID: --autonomous-mid-r1-once cannot be used with --dry-run",
+                file=sys.stderr,
+            )
+            return orch_exits.EXIT_CONFIG_INVALID
+        if not args.autonomous_once:
+            print(
+                "E_CONFIG_INVALID: --autonomous-mid-r1-once requires --autonomous-once",
+                file=sys.stderr,
+            )
+            return orch_exits.EXIT_CONFIG_INVALID
+        if args.mode != "autonomous" or args.phase != "phase1":
+            print(
+                "E_CONFIG_INVALID: --autonomous-mid-r1-once requires --mode autonomous "
+                "and --phase phase1",
+                file=sys.stderr,
+            )
+            return orch_exits.EXIT_CONFIG_INVALID
+
+    if getattr(args, "autonomous_advance_mid_when_eligible", False):
+        if args.dry_run:
+            print(
+                "E_CONFIG_INVALID: --autonomous-advance-mid-when-eligible cannot be used "
+                "with --dry-run",
+                file=sys.stderr,
+            )
+            return orch_exits.EXIT_CONFIG_INVALID
+        if not args.autonomous_once:
+            print(
+                "E_CONFIG_INVALID: --autonomous-advance-mid-when-eligible requires "
+                "--autonomous-once",
+                file=sys.stderr,
+            )
+            return orch_exits.EXIT_CONFIG_INVALID
+        if args.mode != "autonomous" or args.phase != "phase1":
+            print(
+                "E_CONFIG_INVALID: --autonomous-advance-mid-when-eligible requires "
+                "--mode autonomous and --phase phase1",
+                file=sys.stderr,
+            )
+            return orch_exits.EXIT_CONFIG_INVALID
+
+    if args.mode == "autonomous" and args.phase != "phase1":
+        print(
+            "E_CONFIG_INVALID: --mode autonomous is only supported with --phase phase1",
+            file=sys.stderr,
+        )
+        return orch_exits.EXIT_CONFIG_INVALID
 
     if args.phase == "phase1":
         return _main_phase1(args, config_path)
