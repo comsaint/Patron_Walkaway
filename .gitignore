@@ -220,7 +220,7 @@ investigations/test_vs_production/snapshots/*
 investigations/precision_uplift_recall_1pct/orchestrator/state/**
 # Per-run orchestrator reports + ad-hoc copies (sibling to orchestrator/, not under it)
 investigations/precision_uplift_recall_1pct/results/**
-#out/
+out/
 baseline_models/results/**
 deploy_dist/
 deploy_dist.zip
