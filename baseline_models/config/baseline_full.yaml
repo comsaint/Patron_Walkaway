@@ -1,29 +1,39 @@
 # 完整 baseline 評估（與 `python -m baseline_models run` 相同程式路徑）
-# 資料：由 trainer chunk 匯出至倉庫根 `data/baseline_for_baseline_models.parquet`
 #
-# 與同窗 LightGBM 對齊（需 `reference_model.apply_training_provenance: true`）：
-# 先合併 `training_metrics.json` 頂層 `baseline_data_alignment`（trainer 新產物會寫入），
-# 再合併同目錄 `training_provenance.json`（可選手改覆蓋）。列切分對應 Step 7：
-# TRAIN_SPLIT_FRAC=0.7、VALID_SPLIT_FRAC=0.15 時 baseline 的 valid_frac=0.5
-#（剩餘 30% 列中一半 valid、一半 test）。
+# === 同窗錨點（公平比較 EXECUTION_PLAN §4.1 A～F）===
+# 對齊 bundle：`out/models/20260419-040815-6ec219f/model_metadata.json`
+#   + 同目錄 `training_provenance.json`（`apply_training_provenance: true` 時會合併）。
+# A 全域時間窗：`global_window` ↔ 下方 `data_window` ↔ provenance（半開 end 與 export `--bet-time-end` 一致）。
+# B 切分：時序、禁 shuffle；`train_frac`/`valid_frac` ↔ `split_method`（trainer 列比例 0.7/0.15/0.15
+#    ⇒ baseline `valid_frac=0.5` = 0.15/(1-0.7)）。
+# C 切分邊界：metadata `splits.*.start/end` 以 **全體 rated 列**、依 `payout_complete_dtm` 排序後切出；
+#    若 parquet 僅 `--max-rows` 子集，時間邊界未必與該 metadata 一致 → Gate C 可能 BLOCKED。
+# D 標籤：`label_contract_version`；排除 `censored`（與 trainer `process_chunk` 一致）。
+# E 指標：同窗 P@R=1% 採 prod_adjusted 對 prod_adjusted；`recall_floor` 與 trainer
+#    `threshold_min_recall` 一致；`min_alert_count` 對齊 metadata `training_params.threshold_min_alert_count`。
+# F 資料：單一來源為倉庫根 `data/baseline_for_baseline_models.parquet`（`path_or_uri` 相對本設定檔
+# 為 `../../data/...`）。若該檔仍為舊窗（例如 2025-03），與同窗 `data_window` 無交集會過濾成空表；
+# 請重新匯出覆寫此路徑。勿在 `baseline_models/data/` 另存重複 parquet，以免路徑混淆。
 #
-# 準備資料（倉庫根範例：2026-02 起與 provenance 一致）：
+# 準備資料（全窗半開區間 [start, end)，欄位時間對應匯出後之 `bet_time`）：
 #   python baseline_models/scripts/export_baseline_slice_from_chunk.py \
-#     --chunk trainer/.data/chunks/chunk_20260201_20260301.parquet \
+#     --chunk <trainer/.data/chunks/涵蓋_20260101_20260331_之_parquet> \
 #     --out data/baseline_for_baseline_models.parquet \
-#     --bet-time-start 2026-02-01T00:00:00 --max-rows 300000
+#     --bet-time-start 2026-01-01T00:00:00 \
+#     --bet-time-end 2026-03-31T00:00:00
+# （若需通過 C，建議在資源允許下提高 `--max-rows` 或串接多 chunk 直至覆蓋全窗。）
 #
 # R3 分子 `current_session_theo` 於此切片為 wager 之工程替代（chunk 無獨立欄位）。
 
-experiment_id: baseline_full_trainer_slice
+experiment_id: baseline_full_peer_20260419_6ec219f
 
 data_window:
-  start: null
-  end: null
+  start: "2026-01-01T00:00:00"
+  end: "2026-03-31T00:00:00"
 
 metadata:
-  split_protocol: temporal_slice_no_shuffle
-  feature_set_version: baseline_full_v1
+  split_protocol: temporal_row_frac_sorted_by_payout_complete_dtm
+  feature_set_version: baseline_full_peer_20260419
   label_contract_version: v0
 
 columns:
@@ -41,7 +51,7 @@ data_source:
   path_or_uri: ../../data/baseline_for_baseline_models.parquet
 
 threshold_selection:
-  min_alert_count: 1
+  min_alert_count: 5
   recall_floor: 0.01
   min_alerts_per_hour: null
   window_hours: null
@@ -52,7 +62,7 @@ notes_contract:
 reference_model:
   enabled: true
   apply_training_provenance: true
-  training_metrics_path: out/models/20260408-173809-e472fd0/training_metrics.json
+  training_metrics_path: out/models/20260419-040815-6ec219f/training_metrics.json
   metrics_section: rated
 
 tier0:

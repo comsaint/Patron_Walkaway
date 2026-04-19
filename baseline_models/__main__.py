@@ -34,6 +34,10 @@ def main(argv: list[str] | None = None) -> int:
     if ns.command in ("smoke", "run"):
         from baseline_models.src.eval.runner import run_smoke
 
+        print(
+            f"[baseline_models] CLI command={ns.command!r} run_id={ns.run_id!r}",
+            flush=True,
+        )
         run_smoke(ns.config, ns.run_id)
         return 0
     return 2

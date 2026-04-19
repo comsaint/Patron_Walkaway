@@ -64,6 +64,11 @@ def _write_json(path: Path, obj: Mapping[str, Any] | list[Any]) -> None:
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def _log_phase(msg: str) -> None:
+    """印出進度列至 stdout（供 ``python -m baseline_models`` 觀察）。"""
+    print(f"[baseline_models] {msg}", flush=True)
+
+
 def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
     """最小 smoke：載入／切分、於 **test** 上算 DEC-026 指標、寫三件套。
 
@@ -78,18 +83,48 @@ def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
         各種契約錯誤：見 ``data_contract``／設定載入。
     """
     t0 = time.perf_counter()
+    cfg_path = Path(config_path).resolve()
+    _log_phase(f"開始 run_id={run_id!r}；設定檔={cfg_path}")
     cfg = load_run_config_yaml(config_path)
+    _log_phase(
+        f"已載入設定：experiment_id={cfg.experiment_id!r}；"
+        f"data_source={cfg.data_source_kind!r}"
+        + (
+            f"；path={cfg.data_source_path!r}"
+            if cfg.data_source_path
+            else ""
+        )
+    )
     raw_frame = load_baseline_frame(cfg)
+    _log_phase(f"已載入資料表：列數={len(raw_frame)}")
     tw = cfg.data_window
     frame = apply_time_window(raw_frame, cfg.column_event_time, tw)
+    _tc = cfg.column_event_time
+    if _tc in frame.columns and not frame.empty:
+        _ts = pd.to_datetime(frame[_tc], errors="coerce")
+        _log_phase(
+            f"時間窗過濾後：列數={len(frame)}；{_tc} min={_ts.min()} max={_ts.max()}"
+        )
+    else:
+        _log_phase(f"時間窗過濾後：列數={len(frame)}")
     clean = validate_label_and_censor_columns(
         frame, cfg.column_label, cfg.column_censored
+    )
+    _log_phase(
+        f"排除 censored 後：列數={len(clean)}；"
+        f"切分 train_frac={cfg.split_train_frac} valid_frac={cfg.split_valid_frac}"
     )
     train_df, _valid_df, test_df, split_spec = temporal_train_valid_test_split(
         clean,
         cfg.column_event_time,
         cfg.split_train_frac,
         cfg.split_valid_frac,
+    )
+    _log_phase(
+        "時序切分完成："
+        f"train={len(train_df)} valid={len(_valid_df)} test={len(test_df)}；"
+        f"train_end={split_spec.train_end_exclusive!s} "
+        f"valid_end={split_spec.valid_end_exclusive!s}"
     )
     score_col = cfg.column_score or "smoke_score"
     if score_col not in test_df.columns:
@@ -115,9 +150,11 @@ def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
         peak_memory_est_mb=0.0,
     )
     rows.append(row)
+    _log_phase("已計算 smoke 分數列之 test 指標（1 列 metrics）")
     if cfg.tier0_r1_enabled and not cfg.tier0_r1_signals:
         raise ValueError("tier0.r1.enabled 為 true 但 tier0.r1.signals 為空；請至少指定一個 pace 訊號欄。")
     if cfg.tier0_r1_enabled:
+        _log_phase(f"Tier-0 R1 pace：評估 {len(cfg.tier0_r1_signals)} 個訊號 …")
         for sig in cfg.tier0_r1_signals:
             y_r1 = np.asarray(pace_rule_scores(test_df, sig).values, dtype=float)
             r1_row = build_eval_metrics_row(
@@ -143,7 +180,9 @@ def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
                 ),
             )
             rows.append(r1_row)
+        _log_phase("Tier-0 R1 完成")
     if cfg.tier0_r2_enabled:
+        _log_phase("Tier-0 R2 loss：評估 net / wager …")
         for proxy in ("net", "wager"):
             y_r2 = np.asarray(
                 loss_rule_scores(
@@ -183,11 +222,17 @@ def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
                 ),
             )
             rows.append(r2_row)
+        _log_phase("Tier-0 R2 完成")
     if cfg.tier0_r3_enabled and not cfg.tier0_r3_variants:
         raise ValueError(
             "tier0.r3.enabled 為 true 但 tier0.r3.variants 為空；請至少指定 adt30／adt180／theo_per_session 之一。"
         )
     if cfg.tier0_r3_enabled:
+        _n_r3 = len(cfg.tier0_r3_variants) * len(cfg.tier0_r3_tau_grid)
+        _log_phase(
+            f"Tier-0 R3：{len(cfg.tier0_r3_variants)} 個 variant × "
+            f"{len(cfg.tier0_r3_tau_grid)} 個 tau → {_n_r3} 組指標 …"
+        )
         specs = r3_formula_specs()
         for v in cfg.tier0_r3_variants:
             if v not in R3_ADT_VARIANTS:
@@ -228,12 +273,14 @@ def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
                     ),
                 )
                 rows.append(r3_row)
+        _log_phase("Tier-0 R3 完成")
     if cfg.tier1_m1_enabled and not cfg.tier1_m1_feature_columns:
         raise ValueError(
             "tier1.m1.enabled 為 true 但 tier1.m1.feature_columns 為空；請至少指定一個數值特徵欄。"
         )
     if cfg.tier1_m1_enabled:
         cols = cfg.tier1_m1_feature_columns
+        _log_phase(f"Tier-1 M1 LogisticRegression：擬合 train（特徵數={len(cols)}）…")
         train_x = select_feature_subset(train_df, cols)
         test_x = select_feature_subset(test_df, cols)
         train_y = train_df[cfg.column_label]
@@ -245,6 +292,7 @@ def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
         )
         y_m1 = predict_proba_positive(lr, test_x)
         m1_elapsed = time.perf_counter() - t_m1
+        _log_phase(f"Tier-1 M1 完成（擬合+推論約 {m1_elapsed:.2f}s）")
         m1_row = build_eval_metrics_row(
             experiment_id=exp_id,
             baseline_family="linear",
@@ -275,6 +323,7 @@ def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
         )
     if cfg.tier1_m2_enabled:
         cols_m2 = cfg.tier1_m2_feature_columns
+        _log_phase(f"Tier-1 M2 SGDClassifier：擬合 train（特徵數={len(cols_m2)}）…")
         train_x_m2 = select_feature_subset(train_df, cols_m2)
         test_x_m2 = select_feature_subset(test_df, cols_m2)
         train_y_m2 = train_df[cfg.column_label]
@@ -286,6 +335,7 @@ def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
         )
         y_m2 = predict_sgd_proba_positive(sgd, test_x_m2)
         m2_elapsed = time.perf_counter() - t_m2
+        _log_phase(f"Tier-1 M2 完成（擬合+推論約 {m2_elapsed:.2f}s）")
         m2_row = build_eval_metrics_row(
             experiment_id=exp_id,
             baseline_family="linear",
@@ -316,6 +366,7 @@ def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
             "{ column, high_is_risk, proxy_type? }。"
         )
     if cfg.tier1_s1_enabled:
+        _log_phase(f"Tier-1 S1 單特徵排名：{len(cfg.tier1_s1_rankings)} 組 …")
         for col_s1, high_is_risk, proxy_s1 in cfg.tier1_s1_rankings:
             y_s1 = np.asarray(
                 single_feature_scores(test_df, col_s1, high_is_risk).values,
@@ -351,14 +402,28 @@ def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
                 ),
             )
             rows.append(s1_row)
+        _log_phase("Tier-1 S1 完成")
     ref_block = build_reference_lightgbm_snapshot(
         enabled=cfg.reference_model_enabled,
         config_path=cfg.config_path,
         training_metrics_path=cfg.reference_model_training_metrics_path,
         metrics_section=cfg.reference_model_metrics_section,
     )
+    if cfg.reference_model_enabled:
+        _log_phase(
+            "同窗 reference_lightgbm："
+            f"status={ref_block.get('status')!r}"
+            + (
+                f"；path={ref_block.get('path')!r}"
+                if ref_block.get("path")
+                else ""
+            )
+        )
     out_dir = default_results_dir(run_id)
     out_dir.mkdir(parents=True, exist_ok=True)
+    _log_phase(
+        f"寫入結果目錄：{out_dir}（baseline_metrics.json、run_state.json、baseline_summary.md）"
+    )
     _write_json(out_dir / "baseline_metrics.json", {"metrics": rows})
     notes_contract = (cfg.raw.get("notes_contract") or {}) if isinstance(cfg.raw, Mapping) else {}
     run_state: dict[str, Any] = {
@@ -500,6 +565,10 @@ def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
         f"{s1_pending}"
     )
     _write_text(out_dir / "baseline_summary.md", summary)
+    _elapsed = time.perf_counter() - t0
+    _log_phase(
+        f"完成：metrics 列數={len(rows)}；總耗時約 {_elapsed:.2f}s；run_id={run_id!r}"
+    )
     return {"results_dir": str(out_dir), "metrics_path": str(out_dir / "baseline_metrics.json")}
 
 

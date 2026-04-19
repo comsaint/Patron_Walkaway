@@ -363,7 +363,7 @@ CHUNK_CONCAT_RAM_FACTOR = 15  # on-disk size × this × (1 + TRAIN_SPLIT_FRAC) �
 # Recommended: 0.3 when training on 90+ days of data to avoid Step 7 OOM,
 # or just leave it at 1.0 and let the OOM pre-check auto-adjust.
 # Example: 30 days × 27M rows → ~10M rows with NEG_SAMPLE_FRAC=0.3.
-NEG_SAMPLE_FRAC: float = 1.0
+NEG_SAMPLE_FRAC: float = 0.3
 
 # --- Production class-ratio assumption (for adjusted test precision reporting) ---
 # Expected negative-to-positive ratio in production (serving), used to adjust

@@ -153,6 +153,8 @@ def apply_time_window(
     if ts.isna().any():
         raise ValueError(f"時間欄 {time_col!r} 含無法解析之值")
     out[time_col] = ts
+    ts_min = ts.min()
+    ts_max = ts.max()
     start = window.get("start")
     end = window.get("end")
     if start is not None:
@@ -160,7 +162,14 @@ def apply_time_window(
     if end is not None:
         out = out.loc[out[time_col] < pd.Timestamp(end)]
     if out.empty:
-        raise ValueError("時間窗過濾後資料為空。")
+        raise ValueError(
+            "時間窗過濾後資料為空。"
+            f" 輸入列數={len(frame)}；請求窗 start={start!r}, end={end!r}"
+            "（end 為半開區間上界，即保留 bet_time < end）。"
+            f" 欄位 {time_col!r} 於過濾前 min={ts_min}, max={ts_max}。"
+            " 若與同窗 trainer 對齊，請依該次 model_metadata.global_window 重新匯出 parquet；"
+            "若僅作本機試跑，可暫將 data_window 設為 null 並關閉 apply_training_provenance（公平比較 Gate 不成立）。"
+        )
     return out
 
 
