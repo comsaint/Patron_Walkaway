@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -216,6 +217,19 @@ def run_logged_command(
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = log_dir / f"{log_stem}.stdout.log"
     stderr_path = log_dir / f"{log_stem}.stderr.log"
+    argv_preview = list(argv)
+    if len(argv_preview) > 12:
+        preview = " ".join(shlex.quote(str(a)) for a in argv_preview[:12]) + " ..."
+    else:
+        preview = " ".join(shlex.quote(str(a)) for a in argv_preview)
+    to_msg = f" timeout={timeout_sec}s" if timeout_sec is not None else ""
+    print(
+        f"[precision_uplift_orchestrator] subprocess: cwd={cwd} "
+        f"stdout={stdout_path.name} stderr={stderr_path.name}{to_msg}\n"
+        f"[precision_uplift_orchestrator]   cmd: {preview}",
+        file=sys.stderr,
+        flush=True,
+    )
     run_kw: dict[str, Any] = {
         "cwd": cwd,
         "stdout": None,
@@ -235,6 +249,11 @@ def run_logged_command(
             proc = subprocess.run(list(argv), **run_kw)
     except subprocess.TimeoutExpired:
         tail = f"command timeout after {timeout_sec}s: {argv[0]!r}"
+        print(
+            f"[precision_uplift_orchestrator] subprocess TIMEOUT: {tail} log_dir={log_dir}",
+            file=sys.stderr,
+            flush=True,
+        )
         return {
             "ok": False,
             "returncode": -1,
@@ -248,6 +267,11 @@ def run_logged_command(
         }
     except OSError as exc:
         tail = f"failed to run subprocess: {exc}"
+        print(
+            f"[precision_uplift_orchestrator] subprocess OS error: {tail} log_dir={log_dir}",
+            file=sys.stderr,
+            flush=True,
+        )
         return {
             "ok": False,
             "returncode": -1,
@@ -263,6 +287,13 @@ def run_logged_command(
     err_txt = stderr_path.read_text(encoding="utf-8", errors="replace")
     combined = f"{out_txt}\n{err_txt}"
     ok = proc.returncode == 0
+    status = "ok" if ok else "FAILED"
+    print(
+        f"[precision_uplift_orchestrator] subprocess {status}: "
+        f"returncode={proc.returncode} log_dir={log_dir}",
+        file=sys.stderr,
+        flush=True,
+    )
     return {
         "ok": ok,
         "returncode": proc.returncode,
@@ -938,6 +969,12 @@ def run_phase2_trainer_jobs(
             continue
 
         log_stem = f"trainer_job_{track}_{eid}".replace("/", "_").replace("\\", "_")
+        print(
+            f"[precision_uplift_orchestrator] phase2 trainer job: {track}/{eid} "
+            f"(log under {rel})",
+            file=sys.stderr,
+            flush=True,
+        )
         base = run_logged_command(
             argv,
             cwd=repo_root,
@@ -1077,6 +1114,12 @@ def run_phase2_per_job_backtests(
             continue
 
         if not hint:
+            print(
+                f"[precision_uplift_orchestrator] phase2 per-job backtest SKIP: {track}/{eid} "
+                "(no training_metrics_repo_relative)",
+                file=sys.stderr,
+                flush=True,
+            )
             results.append(
                 {
                     "track": track,
@@ -1117,6 +1160,12 @@ def run_phase2_per_job_backtests(
         cfg_job["backtest_output_dir"] = str(log_dir.resolve())
         mrel_job = collectors.phase2_per_job_backtest_metrics_repo_relative(
             run_id, track, eid
+        )
+        print(
+            f"[precision_uplift_orchestrator] phase2 per-job backtest: {track}/{eid} "
+            f"model_bundle={bundle_dir}",
+            file=sys.stderr,
+            flush=True,
         )
         res_bt = run_phase1_backtest(
             repo_root,
@@ -1211,6 +1260,12 @@ def run_preflight(
         Dict with keys ok (bool), error_code (str | None), message (str | None),
         checks (list of per-step records).
     """
+    print(
+        "[precision_uplift_orchestrator] preflight: checking model_dir, sqlite DBs, "
+        f"backtest_smoke={not skip_backtest_smoke}",
+        file=sys.stderr,
+        flush=True,
+    )
     checks: list[dict[str, Any]] = []
 
     ok, msg = _check_paths_exist(repo_root, cfg)
@@ -1261,4 +1316,9 @@ def run_preflight(
                 "checks": checks,
             }
 
+    print(
+        "[precision_uplift_orchestrator] preflight: all checks passed",
+        file=sys.stderr,
+        flush=True,
+    )
     return {"ok": True, "error_code": None, "message": None, "checks": checks}

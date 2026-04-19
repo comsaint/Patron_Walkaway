@@ -33,6 +33,11 @@ import report_builder  # noqa: E402
 import runner  # noqa: E402
 
 
+def _orch_log(msg: str) -> None:
+    """One-line progress on stderr (long runs otherwise look hung)."""
+    print(f"[precision_uplift_orchestrator] {msg}", file=sys.stderr, flush=True)
+
+
 def investigation_reports_subdir(run_id: str, phase: str) -> Path:
     """Orchestrator markdown output: ``results/<run_id>/reports/<phase>/``.
 
@@ -481,6 +486,10 @@ def run_all_phases_dry_run_readiness(
         ``artifacts``, and ``dry_run`` flags echo.
     """
     flags: dict[str, bool] = dict(run_full_cfg["dry_run"])
+    _orch_log(
+        "all-phase dry-run: validating phase configs, dependencies, and writable targets "
+        f"(fail_on_any_check={flags.get('fail_on_any_check', True)})"
+    )
     checks: list[dict[str, Any]] = []
     blocking: list[str] = []
     artifacts: dict[str, str] = {}
@@ -823,6 +832,7 @@ def run_all_phases_dry_run_readiness(
         "artifacts": artifacts,
         "dry_run": flags,
     }
+    _orch_log(f"all-phase dry-run: finished with status={status}")
     return out
 
 
@@ -1280,6 +1290,10 @@ def _phase1_mid_snapshot_run_windows(
     log_dir = _logs_dir(run_id)
     r1_mid_last: dict[str, Any] | None = None
     for idx, mid_window in enumerate(mid_windows):
+        _orch_log(
+            f"phase1 mid snapshot: checkpoint {idx + 1}/{len(mid_windows)} "
+            f"end_ts={mid_window.get('end_ts')}"
+        )
         stem = (
             "r1_r6_mid"
             if idx == len(mid_windows) - 1
@@ -1366,6 +1380,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
         print(str(exc), file=sys.stderr)
         return orch_exits.EXIT_CONFIG_INVALID
 
+    _orch_log(f"phase1: config loaded from {config_path}")
     state_file = _state_path(args.run_id)
     prev_state = _load_run_state(state_file) if args.resume else None
     prev_steps: dict[str, Any] = (
@@ -1395,6 +1410,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
     )
 
     if skip_preflight:
+        _orch_log("phase1: skipping preflight (resume, fingerprint match)")
         preflight = {
             "ok": True,
             "error_code": None,
@@ -1402,6 +1418,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
             "checks": [],
         }
     else:
+        _orch_log("phase1: running preflight (paths, sqlite, optional backtester smoke)")
         preflight = runner.run_preflight(
             _REPO_ROOT,
             cfg,
@@ -1514,6 +1531,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
         return orch_exits.EXIT_PHASE1_AUTONOMOUS_PENDING
 
     if args.dry_run:
+        _orch_log("phase1: --dry-run — computing readiness (no R1/backtest execution)")
         readiness = run_dry_run_readiness(
             _REPO_ROOT,
             _ORCHESTRATOR_DIR,
@@ -1553,9 +1571,14 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
                 file=sys.stderr,
             )
             return orch_exits.EXIT_DRY_RUN_NOT_READY
+        _orch_log("phase1: dry-run READY — exiting")
         return 0
 
     if not args.collect_only:
+        _orch_log(
+            "phase1: batch pipeline — mid R1/R6 checkpoints (if any), full-window R1/R6, "
+            "then backtest"
+        )
         log_dir = _logs_dir(args.run_id)
         skip_mid = resume_ok and _step_success(prev_steps, "r1_r6_mid_snapshot")
         skip_r1 = resume_ok and _step_success(prev_steps, "r1_r6_analysis")
@@ -1568,6 +1591,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
             return rc_mid
 
         if not skip_r1:
+            _orch_log("phase1: running R1/R6 analysis (full configured window)")
             t_r1 = _mark_step_running(merged, "r1_r6_analysis")
             _write_run_state(state_file, merged)
             r1 = runner.run_phase1_r1_r6_all(_REPO_ROOT, cfg, log_dir)
@@ -1581,6 +1605,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
                 return orch_exits.EXIT_PHASE1_MID_OR_R1_FAILED
 
         if not skip_bt:
+            _orch_log("phase1: running trainer.backtester")
             t_bt = _mark_step_running(merged, "backtest")
             _write_run_state(state_file, merged)
             bt = runner.run_phase1_backtest(_REPO_ROOT, cfg, log_dir)
@@ -1592,7 +1617,10 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
                     file=sys.stderr,
                 )
                 return orch_exits.EXIT_PHASE1_BACKTEST_FAILED
+        if skip_r1 and skip_bt and skip_mid:
+            _orch_log("phase1: skipped mid/R1/backtest steps (resume, already success)")
 
+    _orch_log("phase1: collecting artifacts and evaluating gate")
     bundle = collectors.collect_phase1_artifacts(
         args.run_id,
         cfg,
@@ -1631,6 +1659,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
     merged["updated_at"] = _utc_now_iso()
     _write_run_state(state_file, merged)
 
+    _orch_log(f"phase1: writing reports under {phase1_reports_dir}")
     report_builder.write_phase1_reports(phase1_reports_dir, args.run_id, cfg, bundle, gate)
     _attach_terminal_step(
         merged,
@@ -1640,6 +1669,7 @@ def _main_phase1(args: argparse.Namespace, config_path: Path) -> int:
     )
     _write_run_state(state_file, merged)
 
+    _orch_log("phase1: finished OK")
     return 0
 
 
@@ -1656,6 +1686,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
         print(str(exc), file=sys.stderr)
         return orch_exits.EXIT_CONFIG_INVALID
 
+    _orch_log(f"phase2: config loaded from {config_path}")
     state_file = _state_path(args.run_id)
     prev_state = _load_run_state(state_file) if args.resume else None
     input_summary = build_phase2_input_summary(cfg, config_path)
@@ -1681,6 +1712,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
     preflight_cfg = phase2_common_to_preflight_cfg(cfg["common"])
 
     if skip_preflight:
+        _orch_log("phase2: skipping preflight (resume, fingerprint match)")
         preflight = {
             "ok": True,
             "error_code": None,
@@ -1688,6 +1720,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
             "checks": [],
         }
     else:
+        _orch_log("phase2: running preflight (paths, sqlite, optional backtester smoke)")
         preflight = runner.run_preflight(
             _REPO_ROOT,
             preflight_cfg,
@@ -1708,6 +1741,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
     phase2_reports_dir = investigation_reports_subdir(args.run_id, "phase2")
 
     if args.dry_run:
+        _orch_log("phase2: --dry-run — readiness checks only")
         readiness = run_dry_run_readiness(
             _REPO_ROOT,
             _ORCHESTRATOR_DIR,
@@ -1733,9 +1767,11 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
                 file=sys.stderr,
             )
             return orch_exits.EXIT_DRY_RUN_NOT_READY
+        _orch_log("phase2: dry-run READY — exiting")
         return 0
 
     if args.collect_only:
+        _orch_log("phase2: --collect-only — updating run_state artifacts only, exiting")
         merged["artifacts"] = {
             "run_state": str(state_file.resolve()),
             "config_path": str(config_path.resolve()),
@@ -1750,6 +1786,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
     resume_ok = args.resume and not fingerprint_mismatch
     skip_scaffold = resume_ok and _step_success(prev_steps, "phase2_scaffold")
 
+    _orch_log("phase2: building plan bundle and optional trainer/backtest jobs")
     if not skip_scaffold:
         t0 = _mark_step_running(merged, "phase2_scaffold")
         _write_run_state(state_file, merged)
@@ -1769,6 +1806,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
     bundle_path = _ORCHESTRATOR_DIR / "state" / args.run_id / "phase2_bundle.json"
     skip_plan_bundle = resume_ok and _step_success(prev_steps, "phase2_plan_bundle")
     if not skip_plan_bundle:
+        _orch_log("phase2: writing phase2_bundle.json (plan from config)")
         t_pb = _mark_step_running(merged, "phase2_plan_bundle")
         _write_run_state(state_file, merged)
         p2_bundle = collectors.collect_phase2_plan_bundle(args.run_id, cfg)
@@ -1802,6 +1840,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
 
     skip_runner_smoke = resume_ok and _step_success(prev_steps, "phase2_runner_smoke")
     if not skip_runner_smoke:
+        _orch_log("phase2: runner smoke (job log dirs + optional trainer --help)")
         t_rs = _mark_step_running(merged, "phase2_runner_smoke")
         _write_run_state(state_file, merged)
         ok_ld, msg_ld = runner.ensure_phase2_job_log_dirs(
@@ -1915,6 +1954,10 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
             merged["steps"]["phase2_trainer_jobs"]["started_at"] = t_tj
             _write_run_state(state_file, merged)
         else:
+            _orch_log(
+                "phase2: running trainer.trainer for each job_spec "
+                "(this can take a long time)"
+            )
             ok_tj, msg_tj, job_results = runner.run_phase2_trainer_jobs(
                 _REPO_ROOT, p2_bundle, python_exe=sys.executable
             )
@@ -1968,6 +2011,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
 
     skip_job_harvest = resume_ok and _step_success(prev_steps, "phase2_job_metrics_harvest")
     if not skip_job_harvest:
+        _orch_log("phase2: harvesting training_metrics.json from job log dirs")
         t_jh = _mark_step_running(merged, "phase2_job_metrics_harvest")
         _write_run_state(state_file, merged)
         harvest_rows = collectors.harvest_phase2_job_training_metrics(_REPO_ROOT, p2_bundle)
@@ -2027,6 +2071,9 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
             merged["steps"]["phase2_per_job_backtest_jobs"]["started_at"] = t_pjb
             _write_run_state(state_file, merged)
         else:
+            _orch_log(
+                "phase2: per-job backtests (trainer.backtester per trained bundle)"
+            )
             bt_cfg_t = phase2_cfg_to_backtest_cfg(cfg)
             to_pjb = _phase2_backtest_timeout_sec(cfg)
             ok_pjb, msg_pjb, pjb_results = runner.run_phase2_per_job_backtests(
@@ -2105,6 +2152,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
             merged["steps"]["phase2_backtest_jobs"]["started_at"] = t_bj
             _write_run_state(state_file, merged)
         else:
+            _orch_log("phase2: shared-window trainer.backtester + backtest_metrics ingest")
             rel_bt = collectors.phase2_shared_backtest_logs_subdir_relative(args.run_id)
             log_bt = (_REPO_ROOT / rel_bt).resolve()
             bt_cfg = phase2_cfg_to_backtest_cfg(cfg)
@@ -2278,6 +2326,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
 
     skip_gate_report = resume_ok and _step_success(prev_steps, "phase2_gate_report")
     if not skip_gate_report:
+        _orch_log("phase2: gate evaluation + track / gate markdown reports")
         t_gr = _mark_step_running(merged, "phase2_gate_report")
         _write_run_state(state_file, merged)
         collectors.build_phase2_experiment_matrix(p2_bundle)
@@ -2424,6 +2473,7 @@ def _main_phase2(args: argparse.Namespace, config_path: Path) -> int:
     merged["artifacts"] = art
     merged["updated_at"] = _utc_now_iso()
     _write_run_state(state_file, merged)
+    _orch_log("phase2: finished OK")
     return 0
 
 
@@ -2452,6 +2502,7 @@ def _main_all(args: argparse.Namespace, config_path: Path) -> int:
         print(str(exc), file=sys.stderr)
         return orch_exits.EXIT_CONFIG_INVALID
 
+    _orch_log(f"all phases: loaded run_full config from {config_path}")
     pc = rf_cfg["phase_configs"]
     resolved_paths: dict[str, Path] = {
         k: _resolve_config_path(_REPO_ROOT, str(pc[k]))
@@ -2486,6 +2537,7 @@ def _main_all(args: argparse.Namespace, config_path: Path) -> int:
     )
 
     if skip_preflight:
+        _orch_log("all phases: skipping embedded phase1 preflight (resume)")
         preflight = {
             "ok": True,
             "error_code": None,
@@ -2493,6 +2545,7 @@ def _main_all(args: argparse.Namespace, config_path: Path) -> int:
             "checks": [],
         }
     else:
+        _orch_log("all phases: running phase1 preflight before multi-phase dry-run checks")
         try:
             cfg1 = config_loader.load_phase1_config(resolved_paths["phase1"])
         except config_loader.ConfigValidationError as exc:
@@ -2515,6 +2568,7 @@ def _main_all(args: argparse.Namespace, config_path: Path) -> int:
         print(preflight.get("message") or "preflight failed", file=sys.stderr)
         return orch_exits.EXIT_PREFLIGHT_FAILED
 
+    _orch_log("all phases: running cross-phase dry-run readiness suite")
     readiness = run_all_phases_dry_run_readiness(
         _REPO_ROOT,
         _ORCHESTRATOR_DIR,
@@ -2550,6 +2604,7 @@ def _main_all(args: argparse.Namespace, config_path: Path) -> int:
             file=sys.stderr,
         )
         return orch_exits.EXIT_DRY_RUN_NOT_READY
+    _orch_log("all phases: dry-run READY — exiting")
     return 0
 
 
@@ -2559,6 +2614,13 @@ def main(argv: list[str] | None = None) -> int:
     config_path = args.config
     if not config_path.is_absolute():
         config_path = (_REPO_ROOT / config_path).resolve()
+
+    co = bool(getattr(args, "collect_only", False))
+    _orch_log(
+        f"start phase={args.phase} run_id={args.run_id} mode={args.mode} "
+        f"dry_run={args.dry_run} resume={args.resume} collect_only={co} "
+        f"config={config_path}"
+    )
 
     if args.autonomous_once:
         if args.dry_run:
