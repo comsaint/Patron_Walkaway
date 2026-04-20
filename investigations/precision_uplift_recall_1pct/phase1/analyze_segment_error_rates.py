@@ -11,6 +11,19 @@ Purpose:
   ClickHouse fallback -> ``player_profile.parquet`` row-level as-of join on
   ``snapshot_dtm <= scored_at``) to fill missing profile fields.
 
+Optional **frozen segments (Phase 1 exploration)** — ``--frozen-segments-from-session-parquet``:
+  For each ``canonical_id``, aggregate **raw session Parquet** once at
+  ``--start-ts`` (T0, naive UTC if tz-naive) over a fixed lookback window
+  (default 365d). Every eval row uses that same per-player slice; no per-row
+  as-of profile join. Intended for “where to invest a dedicated model / features”,
+  not strict PIT parity with training.
+  If sessions have ``player_id`` but not ``canonical_id``, the script loads
+  sessions ``<=`` T0 and builds ``player_id``→``canonical_id`` with
+  ``trainer.identity.build_canonical_mapping_from_df`` (same as ``backtester``);
+  ``--frozen-segments-canonical-map-parquet`` is optional in that case when the
+  session file includes all columns required by that API (see ``trainer/identity.py``).
+  JSON profile keys stay ``*_30d`` for compatibility; values use ``--frozen-segment-lookback-days``.
+
 Row-retention policy:
 - Missing canonical profile (no profile row for canonical_id) is dropped.
 - Rows with incomplete/non-numeric profile fields or ``active_days_30d <= 0``
@@ -26,7 +39,9 @@ Runtime behavior:
   before HKT date bucketing to avoid off-by-one-day segment labels.
 
 Output:
-- JSON file with summary, notes, and per-segment metrics.
+- JSON file with summary, notes, per-segment metrics, and ``decile_bounds``
+  (per-bucket ``min``/``max``/``n_decile_sample`` for ADT/activity/turnover plus
+  optional cutpoints between adjacent buckets).
 - Console summary (top segments by precision-at-alert/error-rate ordering).
 """
 
@@ -36,7 +51,7 @@ import argparse
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +130,16 @@ def _eval_date_hkt(raw: str) -> str:
         return dt.date().isoformat()
 
 
+def _t0_naive_utc_from_start_ts(start_ts: str) -> datetime | None:
+    """Anchor instant for frozen-segment session aggregates (align with --start-ts)."""
+    dt = _parse_iso(str(start_ts or "").strip())
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).replace(tzinfo=None)
+
+
 def _normalize_backtest_ts(raw: str) -> str:
     """Normalize backtest timestamp for stable HKT date bucketing.
 
@@ -157,6 +182,51 @@ def _empirical_decile_labels(vals: list[float], prefix: str) -> list[str]:
             bucket = 10
         labels[idx] = f"{prefix}_d{bucket}"
     return labels
+
+
+def _decile_bucket_sort_key(segment_key: str) -> tuple[int, str]:
+    """Sort ``adt_d2``-style keys as d1, …, d10 before other strings."""
+    s = str(segment_key or "")
+    if "_d" not in s:
+        return (99, s)
+    try:
+        tail = s.split("_d", 1)[1]
+        return (int(tail), s)
+    except (ValueError, IndexError):
+        return (99, s)
+
+
+def _decile_dimension_bounds(values: list[float], labels: list[str]) -> dict[str, Any]:
+    """Per-bucket min/max and naive mid-cutpoints between adjacent deciles (same labels as segments)."""
+    by_label: dict[str, list[float]] = {}
+    for v, lb in zip(values, labels):
+        if not lb or "unknown" in str(lb).lower():
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        by_label.setdefault(str(lb), []).append(fv)
+    buckets: list[dict[str, Any]] = []
+    for lb in sorted(by_label, key=_decile_bucket_sort_key):
+        vs = by_label[lb]
+        buckets.append(
+            {
+                "segment_key": lb,
+                "min": min(vs),
+                "max": max(vs),
+                "n_decile_sample": len(vs),
+            }
+        )
+    cutpoints: list[float | None] = []
+    for i in range(len(buckets) - 1):
+        mx = float(buckets[i]["max"])
+        mn = float(buckets[i + 1]["min"])
+        if mx <= mn:
+            cutpoints.append((mx + mn) / 2.0)
+        else:
+            cutpoints.append(None)
+    return {"buckets": buckets, "cutpoints_asc_between_adjacent_buckets": cutpoints}
 
 
 def _load_eval_rows(
@@ -719,6 +789,319 @@ def _load_profiles_from_clickhouse(
     return out, notes
 
 
+# Columns required by ``trainer.identity.build_canonical_mapping_from_df`` (R11 parity with backtester).
+_IDENTITY_SESSION_COLS: frozenset[str] = frozenset(
+    {
+        "session_id",
+        "lud_dtm",
+        "player_id",
+        "casino_player_id",
+        "session_end_dtm",
+        "is_manual",
+        "is_deleted",
+        "is_canceled",
+        "num_games_with_wager",
+        "turnover",
+    }
+)
+
+
+def _auto_canonical_map_from_sessions_parquet(
+    session_parquet: Path,
+    cols: set[str],
+    *,
+    t0: datetime,
+) -> tuple[Any | None, list[str]]:
+    """Build player_id→canonical_id via ``trainer.identity.build_canonical_mapping_from_df`` (same as backtester)."""
+    notes: list[str] = []
+    missing = _IDENTITY_SESSION_COLS - cols
+    if missing:
+        return None, [f"frozen_segments_session_missing_cols_for_identity:{sorted(missing)}"]
+    try:
+        import duckdb  # type: ignore
+
+        try:
+            from trainer.identity import build_canonical_mapping_from_df
+        except ModuleNotFoundError:
+            from identity import build_canonical_mapping_from_df  # type: ignore[no-redef]
+    except Exception as exc:
+        return None, [f"frozen_segments_identity_import_failed:{exc!s}"]
+
+    t0_lit = t0.strftime("%Y-%m-%d %H:%M:%S")
+    load_cols = sorted(_IDENTITY_SESSION_COLS)
+    if "__etl_insert_Dtm" in cols:
+        load_cols.append("__etl_insert_Dtm")
+    col_sql = ", ".join(f"raw.{c}" for c in load_cols)
+    pq = str(session_parquet.resolve()).replace("\\", "/")
+    sql_load = f"""
+    SELECT {col_sql}
+    FROM read_parquet('{pq}') raw
+    WHERE COALESCE(
+        TRY_CAST(raw.session_end_dtm AS TIMESTAMP),
+        TRY_CAST(raw.lud_dtm AS TIMESTAMP)
+    ) <= TIMESTAMP '{t0_lit}'
+    """
+    try:
+        con = duckdb.connect(":memory:")
+        sessions_df = con.execute(sql_load).df()
+        con.close()
+    except Exception as exc:
+        return None, [f"frozen_segments_identity_session_load_failed:{exc!s}"]
+
+    if sessions_df is None or len(sessions_df) == 0:
+        return None, ["frozen_segments_identity_session_load_empty"]
+
+    try:
+        cmap = build_canonical_mapping_from_df(sessions_df, cutoff_dtm=t0)
+    except ValueError as exc:
+        return None, [f"frozen_segments_identity_build_failed:{exc!s}"]
+    except Exception as exc:
+        return None, [f"frozen_segments_identity_build_failed:{exc!s}"]
+
+    if cmap is None or len(cmap) == 0:
+        return None, ["frozen_segments_auto_canonical_map_empty"]
+
+    cmap = cmap.copy()
+    cmap["player_id"] = cmap["player_id"].astype(str)
+    cmap["canonical_id"] = cmap["canonical_id"].astype(str)
+    notes.append("frozen_segments_canonical_map:trainer_identity_auto")
+    notes.append(f"frozen_segments_auto_canonical_map_rows:{len(cmap)}")
+    return cmap, notes
+
+
+def _frozen_profiles_from_session_parquet(
+    session_parquet: Path,
+    eval_cids: list[str],
+    *,
+    t0: datetime,
+    lookback_days: int,
+    canonical_map_parquet: Path | None,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """One profile row per canonical_id from raw sessions at T0 (exploratory; not PIT-strict).
+
+    Aggregates over (T0 - lookback_days, T0] on session_ts = COALESCE(session_end_dtm, lud_dtm).
+    ``days_since_first_session`` uses the earliest session_date with session_ts <= T0.
+    """
+    notes: list[str] = []
+    uniq = sorted({str(c).strip() for c in eval_cids if str(c).strip()})
+    if not uniq:
+        return {}, ["frozen_segments_no_eval_cids"]
+    if lookback_days < 1:
+        return {}, ["frozen_segments_lookback_days_invalid"]
+    try:
+        import duckdb  # type: ignore
+        import pandas as pd  # type: ignore
+    except Exception:
+        return {}, ["duckdb_or_pandas_unavailable_for_frozen_segments"]
+
+    t_lo = t0 - timedelta(days=int(lookback_days))
+    # DuckDB TIMESTAMP literals (naive UTC strings)
+    t0_lit = t0.strftime("%Y-%m-%d %H:%M:%S")
+    t_lo_lit = t_lo.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        con_desc = duckdb.connect(":memory:")
+        cols = {
+            str(r[0])
+            for r in con_desc.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?)",
+                [str(session_parquet.resolve())],
+            ).fetchall()
+        }
+        con_desc.close()
+    except Exception:
+        return {}, ["frozen_segments_session_parquet_describe_failed"]
+
+    has_cid = "canonical_id" in cols
+    has_pid = "player_id" in cols
+    if not has_cid and not has_pid:
+        return {}, ["frozen_sessions_missing_player_id_and_canonical_id"]
+
+    auto_map_df: Any | None = None
+    map_path: str | None = None
+    if not has_cid:
+        if canonical_map_parquet is not None and canonical_map_parquet.is_file():
+            try:
+                con_m = duckdb.connect(":memory:")
+                map_cols = {
+                    str(r[0])
+                    for r in con_m.execute(
+                        "DESCRIBE SELECT * FROM read_parquet(?)",
+                        [str(canonical_map_parquet.resolve())],
+                    ).fetchall()
+                }
+                con_m.close()
+            except Exception:
+                return {}, ["frozen_segments_map_parquet_describe_failed"]
+            if not {"player_id", "canonical_id"}.issubset(map_cols):
+                return {}, ["frozen_segments_map_parquet_missing_player_id_or_canonical_id"]
+            map_path = str(canonical_map_parquet.resolve()).replace("\\", "/")
+        else:
+            auto_map_df, auto_notes = _auto_canonical_map_from_sessions_parquet(
+                session_parquet, cols, t0=t0
+            )
+            notes.extend(auto_notes)
+            if auto_map_df is None:
+                return {}, notes
+
+    sess_path = str(session_parquet.resolve()).replace("\\", "/")
+    # ``filt`` needs ``num_games_with_wager`` on ``sess`` (not only inside raw.{nm}).
+    has_nm_col = "num_games_with_wager" in cols
+    games_sel = (
+        "COALESCE(TRY_CAST(num_games_with_wager AS DOUBLE), 0.0) AS num_games_with_wager"
+        if has_nm_col
+        else "0.0::DOUBLE AS num_games_with_wager"
+    )
+
+    if has_cid:
+        cid_expr = "CAST(canonical_id AS VARCHAR)"
+        from_clause = f"FROM read_parquet('{sess_path}') raw"
+    elif map_path is not None:
+        cid_expr = "CAST(m.canonical_id AS VARCHAR)"
+        from_clause = f"""
+        FROM read_parquet('{sess_path}') raw
+        INNER JOIN read_parquet('{map_path}') m
+          ON CAST(raw.player_id AS VARCHAR) = CAST(m.player_id AS VARCHAR)
+        """
+    else:
+        cid_expr = "CAST(m.canonical_id AS VARCHAR)"
+        from_clause = """
+        FROM read_parquet('__SESS__') raw
+        INNER JOIN canonical_map_auto m
+          ON CAST(raw.player_id AS VARCHAR) = CAST(m.player_id AS VARCHAR)
+        """.replace(
+            "__SESS__", sess_path
+        )
+
+    sql = f"""
+    WITH sess AS (
+        SELECT
+            {cid_expr} AS canonical_id,
+            COALESCE(
+                TRY_CAST(session_end_dtm AS TIMESTAMP),
+                TRY_CAST(lud_dtm AS TIMESTAMP)
+            ) AS session_ts,
+            CAST(
+                COALESCE(
+                    TRY_CAST(session_end_dtm AS TIMESTAMP),
+                    TRY_CAST(lud_dtm AS TIMESTAMP)
+                ) AS DATE
+            ) AS session_date,
+            COALESCE(TRY_CAST(turnover AS DOUBLE), 0.0) AS turnover,
+            COALESCE(TRY_CAST(theo_win AS DOUBLE), 0.0) AS theo_win,
+            COALESCE(CAST(is_manual AS INTEGER), 0) AS is_manual,
+            COALESCE(CAST(is_deleted AS INTEGER), 0) AS is_deleted,
+            COALESCE(CAST(is_canceled AS INTEGER), 0) AS is_canceled,
+            {games_sel}
+        {from_clause}
+    ),
+    filt AS (
+        SELECT * FROM sess
+        WHERE canonical_id IS NOT NULL AND TRIM(canonical_id) != ''
+          AND session_ts IS NOT NULL
+          AND is_manual = 0 AND is_deleted = 0 AND is_canceled = 0
+          AND (COALESCE(turnover, 0.0) > 0 OR COALESCE(num_games_with_wager, 0.0) > 0)
+    ),
+    scoped AS (
+        SELECT f.*
+        FROM filt f
+        INNER JOIN eval_cids e ON f.canonical_id = e.canonical_id
+    ),
+    win AS (
+        SELECT
+            canonical_id,
+            COUNT(DISTINCT CASE
+                WHEN session_ts > TIMESTAMP '{t_lo_lit}'
+                 AND session_ts <= TIMESTAMP '{t0_lit}'
+                THEN session_date
+            END) AS active_days_30d,
+            SUM(CASE
+                WHEN session_ts > TIMESTAMP '{t_lo_lit}'
+                 AND session_ts <= TIMESTAMP '{t0_lit}'
+                THEN theo_win ELSE 0.0
+            END) AS theo_win_sum_30d,
+            SUM(CASE
+                WHEN session_ts > TIMESTAMP '{t_lo_lit}'
+                 AND session_ts <= TIMESTAMP '{t0_lit}'
+                THEN turnover ELSE 0.0
+            END) AS turnover_sum_30d,
+            MIN(CASE WHEN session_ts <= TIMESTAMP '{t0_lit}' THEN session_date END) AS first_session_date
+        FROM scoped
+        GROUP BY canonical_id
+    )
+    SELECT
+        canonical_id,
+        active_days_30d,
+        theo_win_sum_30d,
+        turnover_sum_30d,
+        CASE
+            WHEN first_session_date IS NULL THEN NULL
+            ELSE DATE_DIFF('day', first_session_date, CAST(TIMESTAMP '{t0_lit}' AS DATE))
+        END AS days_since_first_session
+    FROM win
+    """
+    rows: list[Any] = []
+    con = duckdb.connect(":memory:")
+    try:
+        df_cids = pd.DataFrame({"canonical_id": uniq})
+        con.register("eval_cids", df_cids)
+        if auto_map_df is not None:
+            con.register(
+                "canonical_map_auto",
+                auto_map_df[["player_id", "canonical_id"]],
+            )
+        rows = list(con.execute(sql).fetchall())
+    except Exception as exc:
+        notes.append("frozen_segments_session_query_failed")
+        notes.append(f"frozen_segments_session_query_error:{exc!s}")
+    finally:
+        try:
+            con.unregister("eval_cids")
+        except Exception:
+            pass
+        if auto_map_df is not None:
+            try:
+                con.unregister("canonical_map_auto")
+            except Exception:
+                pass
+        try:
+            con.close()
+        except Exception:
+            pass
+    if "frozen_segments_session_query_failed" in notes:
+        return {}, notes
+
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        cid = str(row[0] or "").strip()
+        if not cid:
+            continue
+        try:
+            ad = float(row[1])
+            theo = float(row[2])
+            to_v = float(row[3])
+        except (TypeError, ValueError):
+            continue
+        dsf = row[4]
+        try:
+            dsf_out = int(dsf) if dsf is not None else None
+        except (TypeError, ValueError):
+            dsf_out = None
+        out[cid] = {
+            "theo_win_sum_30d": theo,
+            "active_days_30d": ad,
+            "turnover_sum_30d": to_v,
+            "days_since_first_session": dsf_out,
+        }
+
+    notes.append(f"frozen_segments_cids_with_session_agg:{len(out)}")
+    notes.append(f"frozen_segments_eval_cids_requested:{len(uniq)}")
+    notes.append(f"frozen_segments_t0_utc_naive:{t0_lit}")
+    notes.append(f"frozen_segments_lookback_days:{int(lookback_days)}")
+    notes.append("frozen_segments_deciles_per_unique_canonical_id")
+    return out, notes
+
+
 def _aggregate_segment_error(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
     agg: dict[str, dict[str, Any]] = {}
     for r in rows:
@@ -826,6 +1209,31 @@ def main() -> int:
     p.add_argument("--clickhouse-source-db", default="")
     p.add_argument("--clickhouse-profile-table", default="")
     p.add_argument("--min-segment-n", type=int, default=30)
+    p.add_argument(
+        "--frozen-segments-from-session-parquet",
+        default="",
+        help=(
+            "If set to an existing Parquet path of raw sessions: build one profile per "
+            "canonical_id at --start-ts (UTC-naive if tz-naive) over --frozen-segment-lookback-days; "
+            "skip state_db / ClickHouse / player_profile as-of merge. Session rows must have "
+            "canonical_id, or use --frozen-segments-canonical-map-parquet with player_id."
+        ),
+    )
+    p.add_argument(
+        "--frozen-segments-canonical-map-parquet",
+        default="",
+        help=(
+            "Optional Parquet with player_id, canonical_id. When session data has no "
+            "canonical_id, omit this to auto-build mapping via trainer.identity "
+            "(requires casino_player_id and other identity columns on sessions)."
+        ),
+    )
+    p.add_argument(
+        "--frozen-segment-lookback-days",
+        type=int,
+        default=365,
+        help="Lookback window length ending at --start-ts for frozen session aggregates (default 365).",
+    )
     args = p.parse_args()
 
     model_bundle_dir = Path(args.model_bundle_dir).expanduser().resolve()
@@ -893,55 +1301,89 @@ def main() -> int:
         return 2
 
     cids = [r.canonical_id for r in eval_rows]
-    profiles = _profiles_from_backtest_rows(embedded_profile_rows)
+    frozen_sess_raw = str(args.frozen_segments_from_session_parquet or "").strip()
+    frozen_sess_path = Path(frozen_sess_raw).expanduser().resolve() if frozen_sess_raw else None
+    frozen_map_raw = str(args.frozen_segments_canonical_map_parquet or "").strip()
+    frozen_map_path = Path(frozen_map_raw).expanduser().resolve() if frozen_map_raw else None
+    lookback_days = int(args.frozen_segment_lookback_days or 365)
+
+    frozen_mode = bool(frozen_sess_path and frozen_sess_path.is_file())
+    if frozen_sess_raw and not frozen_mode:
+        print(
+            f"frozen-segments-from-session-parquet not found: {frozen_sess_raw}",
+            flush=True,
+        )
+        return 2
+
     profile_notes: list[str] = []
     source_parts: list[str] = []
-    if profiles:
-        source_parts.append("backtest_predictions_parquet_embedded")
-
-    need_cids = _missing_profile_cids(profiles, cids)
-    # Load from state_db as primary only when no embedded profiles exist.
-    # When embedded profiles exist, use state_db as supplementary source if provided.
-    has_state_db_arg = bool(str(args.state_db).strip())
-    if (not profiles) or (has_state_db_arg and need_cids):
-        st_profiles, st_notes = _load_profiles_from_state_db(
-            state_db, need_cids if need_cids else cids, str(args.profile_table)
-        )
-        profile_notes.extend(st_notes)
-        st_filled = _merge_profiles(profiles, st_profiles)
-        if st_filled > 0:
-            source_parts.append("state_db")
-            profile_notes.append(f"profile_fields_filled_from_state_db:{st_filled}")
-
-    parquet_path_raw = str(args.profile_parquet_path or "").strip()
-    parquet_path = Path(parquet_path_raw) if parquet_path_raw else (Path.cwd() / "data" / "player_profile.parquet")
-    tried_default_parquet = not bool(parquet_path_raw)
-
-    need_cids = _missing_profile_cids(profiles, cids)
-    if need_cids and args.use_clickhouse_fallback:
-        ch_profiles, cn = _load_profiles_from_clickhouse(
-            need_cids,
-            source_db=str(args.clickhouse_source_db),
-            profile_table=str(args.clickhouse_profile_table),
-        )
-        profile_notes.extend(cn)
-        ch_filled = _merge_profiles(profiles, ch_profiles)
-        if ch_filled > 0:
-            source_parts.append("clickhouse")
-            profile_notes.append(f"profile_fields_filled_from_clickhouse:{ch_filled}")
-
     parquet_row_profiles: list[dict[str, Any] | None] | None = None
-    if parquet_path.is_file():
-        parquet_row_profiles, pn = _load_profiles_parquet_asof_per_row(parquet_path, eval_rows)
-        profile_notes.extend(pn)
-        if parquet_row_profiles is not None:
-            source_parts.append("parquet_asof")
-            if _has_note_prefix(profile_notes, "state_db_profile_missing_cols:"):
-                profile_notes.append("state_db_profile_missing_cols_resolved_by_parquet")
-    elif tried_default_parquet:
-        profile_notes.append(
-            f"parquet_default_not_usable:{parquet_path.as_posix()}"
+
+    if frozen_mode:
+        t0 = _t0_naive_utc_from_start_ts(str(args.start_ts))
+        if t0 is None:
+            print("frozen segments require parseable --start-ts (ISO datetime)", flush=True)
+            return 2
+        cmap_arg = frozen_map_path if (frozen_map_path and frozen_map_path.is_file()) else None
+        profiles, fn_notes = _frozen_profiles_from_session_parquet(
+            frozen_sess_path,  # type: ignore[arg-type]
+            cids,
+            t0=t0,
+            lookback_days=lookback_days,
+            canonical_map_parquet=cmap_arg,
         )
+        profile_notes.extend(fn_notes)
+        if not profiles and "frozen_segments_session_query_failed" not in profile_notes:
+            profile_notes.append("frozen_segments_no_profiles_after_session_agg")
+        source_parts.append("frozen_sessions_t0")
+        eval_notes.append("segment_profile_mode:frozen_t0_sessions")
+    else:
+        profiles = _profiles_from_backtest_rows(embedded_profile_rows)
+        if profiles:
+            source_parts.append("backtest_predictions_parquet_embedded")
+
+        need_cids = _missing_profile_cids(profiles, cids)
+        # Load from state_db as primary only when no embedded profiles exist.
+        # When embedded profiles exist, use state_db as supplementary source if provided.
+        has_state_db_arg = bool(str(args.state_db).strip())
+        if (not profiles) or (has_state_db_arg and need_cids):
+            st_profiles, st_notes = _load_profiles_from_state_db(
+                state_db, need_cids if need_cids else cids, str(args.profile_table)
+            )
+            profile_notes.extend(st_notes)
+            st_filled = _merge_profiles(profiles, st_profiles)
+            if st_filled > 0:
+                source_parts.append("state_db")
+                profile_notes.append(f"profile_fields_filled_from_state_db:{st_filled}")
+
+        parquet_path_raw = str(args.profile_parquet_path or "").strip()
+        parquet_path = Path(parquet_path_raw) if parquet_path_raw else (Path.cwd() / "data" / "player_profile.parquet")
+        tried_default_parquet = not bool(parquet_path_raw)
+
+        need_cids = _missing_profile_cids(profiles, cids)
+        if need_cids and args.use_clickhouse_fallback:
+            ch_profiles, cn = _load_profiles_from_clickhouse(
+                need_cids,
+                source_db=str(args.clickhouse_source_db),
+                profile_table=str(args.clickhouse_profile_table),
+            )
+            profile_notes.extend(cn)
+            ch_filled = _merge_profiles(profiles, ch_profiles)
+            if ch_filled > 0:
+                source_parts.append("clickhouse")
+                profile_notes.append(f"profile_fields_filled_from_clickhouse:{ch_filled}")
+
+        if parquet_path.is_file():
+            parquet_row_profiles, pn = _load_profiles_parquet_asof_per_row(parquet_path, eval_rows)
+            profile_notes.extend(pn)
+            if parquet_row_profiles is not None:
+                source_parts.append("parquet_asof")
+                if _has_note_prefix(profile_notes, "state_db_profile_missing_cols:"):
+                    profile_notes.append("state_db_profile_missing_cols_resolved_by_parquet")
+        elif tried_default_parquet:
+            profile_notes.append(
+                f"parquet_default_not_usable:{parquet_path.as_posix()}"
+            )
 
     source = "+".join(source_parts) if source_parts else "none"
 
@@ -957,8 +1399,11 @@ def main() -> int:
         "profile_active_days_non_positive": 0,
     }
     for i, r in enumerate(eval_rows):
-        row_p = parquet_row_profiles[i] if parquet_row_profiles is not None else None
-        pr = _merge_parquet_row_into_cid_profile(row_p, profiles, r.canonical_id)
+        if frozen_mode:
+            pr = profiles.get(r.canonical_id)
+        else:
+            row_p = parquet_row_profiles[i] if parquet_row_profiles is not None else None
+            pr = _merge_parquet_row_into_cid_profile(row_p, profiles, r.canonical_id)
         if not pr:
             drop_counts["missing_profile_for_canonical_id"] += 1
             continue
@@ -970,10 +1415,11 @@ def main() -> int:
             if ad <= 0:
                 drop_counts["profile_active_days_non_positive"] += 1
             else:
-                adt = theo / ad
-                adt_vals.append(adt)
-                act_vals.append(ad)
-                to_vals.append(to_v)
+                if not frozen_mode:
+                    adt = theo / ad
+                    adt_vals.append(adt)
+                    act_vals.append(ad)
+                    to_vals.append(to_v)
                 metric_ready = True
         except KeyError:
             drop_counts["profile_missing_required_field"] += 1
@@ -992,7 +1438,7 @@ def main() -> int:
                 "_metric_ready": metric_ready,
             }
         )
-        if metric_ready:
+        if metric_ready and not frozen_mode:
             metric_ready_idx.append(len(enriched) - 1)
 
     if not enriched:
@@ -1015,21 +1461,68 @@ def main() -> int:
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 3
 
-    adt_lbl = _empirical_decile_labels(adt_vals, "adt")
-    act_lbl = _empirical_decile_labels(act_vals, "activity")
-    to_lbl = _empirical_decile_labels(to_vals, "to")
-    for row in enriched:
-        row["adt_percentile_bucket"] = "adt_unknown"
-        row["activity_percentile_bucket"] = "activity_unknown"
-        row["turnover_30d_percentile_bucket"] = "to_unknown"
-    for j, idx in enumerate(metric_ready_idx):
-        row = enriched[idx]
-        row["adt_percentile_bucket"] = adt_lbl[j]
-        row["activity_percentile_bucket"] = act_lbl[j]
-        row["turnover_30d_percentile_bucket"] = to_lbl[j]
-        row.pop("_metric_ready", None)
-    for row in enriched:
-        row.pop("_metric_ready", None)
+    if frozen_mode:
+        cid_triple: dict[str, tuple[float, float, float]] = {}
+        for cid, pr in sorted(profiles.items()):
+            try:
+                ad = float(pr["active_days_30d"])
+                theo = float(pr["theo_win_sum_30d"])
+                to_v = float(pr["turnover_sum_30d"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if ad <= 0:
+                continue
+            cid_triple[cid] = (theo / ad, ad, to_v)
+        sorted_cids = sorted(cid_triple)
+        adt_dec = _empirical_decile_labels([cid_triple[c][0] for c in sorted_cids], "adt")
+        act_dec = _empirical_decile_labels([cid_triple[c][1] for c in sorted_cids], "activity")
+        to_dec = _empirical_decile_labels([cid_triple[c][2] for c in sorted_cids], "to")
+        adt_vals_dec = [cid_triple[c][0] for c in sorted_cids]
+        act_vals_dec = [cid_triple[c][1] for c in sorted_cids]
+        to_vals_dec = [cid_triple[c][2] for c in sorted_cids]
+        decile_bounds_report = {
+            "grain": "unique_canonical_id",
+            "lookback_days_for_segment_metrics": int(lookback_days),
+            "adt_percentile_bucket": _decile_dimension_bounds(adt_vals_dec, adt_dec),
+            "activity_percentile_bucket": _decile_dimension_bounds(act_vals_dec, act_dec),
+            "turnover_30d_percentile_bucket": _decile_dimension_bounds(to_vals_dec, to_dec),
+        }
+        cid_adt = dict(zip(sorted_cids, adt_dec))
+        cid_act = dict(zip(sorted_cids, act_dec))
+        cid_to = dict(zip(sorted_cids, to_dec))
+        for row in enriched:
+            row["adt_percentile_bucket"] = "adt_unknown"
+            row["activity_percentile_bucket"] = "activity_unknown"
+            row["turnover_30d_percentile_bucket"] = "to_unknown"
+            cid = str(row.get("canonical_id") or "").strip()
+            if cid in cid_adt:
+                row["adt_percentile_bucket"] = cid_adt[cid]
+                row["activity_percentile_bucket"] = cid_act[cid]
+                row["turnover_30d_percentile_bucket"] = cid_to[cid]
+            row.pop("_metric_ready", None)
+    else:
+        adt_lbl = _empirical_decile_labels(adt_vals, "adt")
+        act_lbl = _empirical_decile_labels(act_vals, "activity")
+        to_lbl = _empirical_decile_labels(to_vals, "to")
+        decile_bounds_report = {
+            "grain": "eval_row",
+            "lookback_days_for_segment_metrics": None,
+            "adt_percentile_bucket": _decile_dimension_bounds(adt_vals, adt_lbl),
+            "activity_percentile_bucket": _decile_dimension_bounds(act_vals, act_lbl),
+            "turnover_30d_percentile_bucket": _decile_dimension_bounds(to_vals, to_lbl),
+        }
+        for row in enriched:
+            row["adt_percentile_bucket"] = "adt_unknown"
+            row["activity_percentile_bucket"] = "activity_unknown"
+            row["turnover_30d_percentile_bucket"] = "to_unknown"
+        for j, idx in enumerate(metric_ready_idx):
+            row = enriched[idx]
+            row["adt_percentile_bucket"] = adt_lbl[j]
+            row["activity_percentile_bucket"] = act_lbl[j]
+            row["turnover_30d_percentile_bucket"] = to_lbl[j]
+            row.pop("_metric_ready", None)
+        for row in enriched:
+            row.pop("_metric_ready", None)
 
     seg_dims = [
         "eval_date",
@@ -1063,6 +1556,8 @@ def main() -> int:
             "profile_join_drop_counts": drop_counts,
             "global_error_rate": (float(total_err) / float(total_n)) if total_n > 0 else None,
             "profile_source_used": source,
+            "frozen_segment_mode": bool(frozen_mode),
+            "frozen_segment_lookback_days": int(lookback_days) if frozen_mode else None,
             "backtest_predictions_parquet_used": str(bt_pred_path) if bt_pred_path is not None else "",
             "start_ts": str(args.start_ts),
             "end_ts": str(args.end_ts),
@@ -1072,6 +1567,7 @@ def main() -> int:
         },
         "notes": notes,
         "segments": seg_out,
+        "decile_bounds": decile_bounds_report,
     }
 
     if args.output_json:
