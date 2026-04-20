@@ -166,10 +166,7 @@ def load_dual_artifacts(bundle_dir: Optional[Path] = None) -> Dict[str, Any]:
     *bundle_dir* defaults to :data:`MODEL_DIR`. Use a versioned path such as
     ``out/models/<model_version>/`` when comparing trained bundles.
 
-    Priority:
-    1. ``model.pkl``         — v10 single rated model
-    2. ``rated_model.pkl``   — legacy rated slot
-    3. ``walkaway_model.pkl``— legacy single-model fallback
+    Loads ``model.pkl`` only (DEC-040). Missing file raises FileNotFoundError.
 
     Also loads ``feature_list.json`` (if present) into the returned dict under
     the key ``"feature_list_meta"`` so that backtest() can distinguish profile
@@ -178,28 +175,25 @@ def load_dual_artifacts(bundle_dir: Optional[Path] = None) -> Dict[str, Any]:
     root = bundle_dir if bundle_dir is not None else MODEL_DIR
     root = root.resolve()
 
-    def _try(path: Path) -> Optional[dict]:
-        if path.exists():
-            return joblib.load(path)
-        return None
-
-    single = _try(root / "model.pkl")
-    if single is not None:
-        artifacts: Dict[str, Any] = {"rated": single}
-    else:
-        rated = _try(root / "rated_model.pkl")
-        legacy = _try(root / "walkaway_model.pkl")
-
-        if rated is None and legacy is not None:
-            logger.warning("rated_model.pkl not found; using walkaway_model.pkl as fallback")
-            rated = legacy
-
-        if rated is None:
-            raise FileNotFoundError(
-                f"No model artifacts found in {root}. "
-                "Run trainer.py first to produce model.pkl / rated_model.pkl."
+    model_path = root / "model.pkl"
+    if not model_path.exists():
+        legacy_hits: list[str] = []
+        if (root / "rated_model.pkl").exists():
+            legacy_hits.append("rated_model.pkl")
+        if (root / "walkaway_model.pkl").exists():
+            legacy_hits.append("walkaway_model.pkl")
+        hint = ""
+        if legacy_hits:
+            hint = (
+                " (legacy files present but not loaded: "
+                + ", ".join(legacy_hits)
+                + "; use a bundle with model.pkl)"
             )
-        artifacts = {"rated": rated}
+        raise FileNotFoundError(
+            f"model.pkl required in {root}{hint}. "
+            "Backtester loads only model.pkl (DEC-040). Run trainer.py or point bundle_dir to a v10 bundle."
+        )
+    artifacts = {"rated": joblib.load(model_path)}
 
     _fl_path = root / "feature_list.json"
     if _fl_path.exists():

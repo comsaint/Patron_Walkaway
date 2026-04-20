@@ -115,7 +115,7 @@ This document summarizes how the approach in `ssot/patron_walkaway_phase_1.plan.
 
 | Aspect                  | Existing `trainer.py`                                      | Phase 1 Plan                                                                                            |
 | ----------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| **Model file(s)**       | `walkaway_model.pkl` (single model + features + threshold) | `rated_model.pkl`, `nonrated_model.pkl`                                                                 |
+| **Model file(s)**       | `walkaway_model.pkl` (single model + features + threshold) | **Current (v10 / DEC-040):** `model.pkl` only; trainer removes stale `rated_model.pkl` / `walkaway_model.pkl` / `nonrated_model.pkl` after each run |
 | **Feature definitions** | `feature_cols` in pickle                                   | `saved_feature_defs/` (Featuretools); `feature_list.json`; `features.py` (Track Human)                      |
 | **Reason codes**        | None                                                       | `reason_code_map.json`; SHAP top-k → 4 fixed codes                                                      |
 | **Versioning**          | None                                                       | `model_version` (e.g. `YYYYMMDD-HHMMSS-{git_short_hash}`)                                               |
@@ -273,7 +273,7 @@ The Phase 1 plan represents a comprehensive refactor that:
 
 | 面向 | 現有 `trainer.py` | Phase 1 計畫 |
 |------|-------------------|--------------|
-| **模型檔** | `walkaway_model.pkl`（單一模型 + features + threshold） | `rated_model.pkl`、`nonrated_model.pkl` |
+| **模型檔** | `walkaway_model.pkl`（單一模型 + features + threshold） | **現況（v10／DEC-040）：** 僅 **`model.pkl`**；訓練收尾會刪殘留之 `rated_model.pkl`／`walkaway_model.pkl`／`nonrated_model.pkl` |
 | **特徵定義** | pickle 內 `feature_cols` | `saved_feature_defs/`（Featuretools）；`feature_list.json`；`features.py`（軌道 B） |
 | **Reason codes** | 無 | `reason_code_map.json`；SHAP top-k → 4 組固定代碼 |
 | **版本控制** | 無 | `model_version`（如 `YYYYMMDD-HHMMSS-{git_short_hash}`） |

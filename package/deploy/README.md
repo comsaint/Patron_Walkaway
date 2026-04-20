@@ -37,7 +37,7 @@ Single process: continuously fetches from ClickHouse, runs scorer and validator,
    **Deploy bundle** (folder produced by `build_deploy_package`): on the target, use **that folder’s** `requirements.txt` (not `package/deploy/requirements.txt`). First install: `pip install -r requirements.txt` from inside the extracted folder.
 
 3. **Model bundle**  
-   When building the deploy package, `build_deploy_package.py` copies the model from `--model-source` (e.g. `trainer/models`) into `models/`. Required in that source: at least one of `model.pkl`, `rated_model.pkl`, `walkaway_model.pkl`, and `feature_list.json`. If you run the deploy app from this folder only (no full deploy package), put those files in `models/` yourself.
+   When building the deploy package, `build_deploy_package.py` copies the model from `--model-source` (e.g. `trainer/models`) into `models/`. Required in that source: **`model.pkl`** and `feature_list.json` (DEC-040: legacy `rated_model.pkl` / `walkaway_model.pkl` are not used). If you run the deploy app from this folder only (no full deploy package), put those files in `models/` yourself.
 
 ### Production bundle: updates without reinstalling everything
 
@@ -123,7 +123,7 @@ No code changes required; the app loads the model from `MODEL_DIR` at startup.
    **部署包**：在目標機請用**該部署資料夾內**的 `requirements.txt`（不是 `package/deploy/requirements.txt`）。首次安裝：在解壓後的資料夾內執行 `pip install -r requirements.txt`。
 
 3. **模型檔**  
-   執行 `build_deploy_package.py` 時會從 `--model-source`（例如 `trainer/models`）複製到 `models/`。來源至少需有 `model.pkl`、`rated_model.pkl` 或 `walkaway_model.pkl` 之一，以及 `feature_list.json`。若僅在本目錄跑、未用完整部署包，請自行將檔案放到 `models/`。
+   執行 `build_deploy_package.py` 時會從 `--model-source`（例如 `trainer/models`）複製到 `models/`。來源**必須**含 **`model.pkl`** 與 `feature_list.json`（DEC-040：不再接受以 `rated_model.pkl`／`walkaway_model.pkl` 替代）。若僅在本目錄跑、未用完整部署包，請自行將檔案放到 `models/`。
 
 ### 生產部署包：更新時不必重裝全部套件
 

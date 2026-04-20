@@ -197,6 +197,11 @@ class TestR3603ArtifactCleanupGuard(unittest.TestCase):
             src,
             "run_pipeline should cleanup stale nonrated_model.pkl after save_artifact_bundle.",
         )
+        self.assertIn(
+            "walkaway_model.pkl",
+            src,
+            "run_pipeline should cleanup stale walkaway_model.pkl (DEC-040).",
+        )
 
     def test_save_artifact_bundle_should_not_reference_nonrated_model_pkl(self):
         src = inspect.getsource(trainer_mod.save_artifact_bundle)

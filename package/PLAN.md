@@ -9,8 +9,8 @@
 | Item | Current |
 |------|--------|
 | Training output dir | `trainer/models/` (`config.MODEL_DIR`) |
-| Files written by trainer | `model.pkl`, `feature_list.json`, `feature_spec.yaml`, `model_version`, `reason_code_map.json`, `training_metrics.json`, `pipeline_diagnostics.json`（訓練診斷，可選打包）, `walkaway_model.pkl` |
-| Scorer reads | `scorer.load_dual_artifacts(model_dir)` from same dir; fallback order: model.pkl → rated_model.pkl → walkaway_model.pkl |
+| Files written by trainer | `model.pkl`, `feature_list.json`, `feature_spec.yaml`, `model_version`, `reason_code_map.json`, `training_metrics.json`, `pipeline_diagnostics.json`（訓練診斷，可選打包） |
+| Scorer reads | `scorer.load_dual_artifacts(model_dir)` from same dir; **only** `model.pkl` (DEC-040) |
 | API server | `trainer/api_server.py`: port **8000**, paths **/get_alerts**, **/get_validation**; reads `trainer/local_state/state.db` |
 | Protocol | Port **8001**, paths **/alerts**, **/validation**; query/response format in `doc/ML_API_PROTOCOL.md` |
 
@@ -30,9 +30,7 @@
 
 | File | Required | Notes |
 |------|----------|--------|
-| `model.pkl` | Yes (or one fallback below) | v10 primary artifact |
-| `rated_model.pkl` | Optional fallback | Legacy |
-| `walkaway_model.pkl` | Optional fallback | Legacy |
+| `model.pkl` | Yes | v10 primary artifact (sole model file for serve/backtest; DEC-040) |
 | `feature_list.json` | Yes | Feature order and names |
 | `feature_spec.yaml` | Recommended | Frozen spec for train–serve parity |
 | `model_version` | Recommended | Version string |
@@ -54,7 +52,7 @@
   - `--archive`: Optional; also create `deploy_dist.zip` for single-file transfer.
 - **Logic**:
   1. Build `walkaway_ml` wheel; copy `main.py`, `.env.example` (documents all deploy-relevant env vars), app config, and `package/ML_API_PROTOCOL.md` as `ML_API_PROTOCOL.md`.
-  2. Copy model bundle from `--model-source` into `output-dir/models/` (flush existing first). Require at least one of `model.pkl`, `rated_model.pkl`, `walkaway_model.pkl` and `feature_list.json`.
+  2. Copy model bundle from `--model-source` into `output-dir/models/` (flush existing first). Require **`model.pkl`** and `feature_list.json` (DEC-040).
   3. Write `requirements.txt` (wheel + PyPI deps including **numba** and **pyarrow** for serving), `README_DEPLOY.txt`; create `local_state/`.
 - **Errors**: Exit non-zero with clear message if required model files are missing.
 

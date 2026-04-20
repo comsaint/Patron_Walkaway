@@ -210,7 +210,7 @@ My thinking is 把 model.pkl 等產物打包成可部署的 artifact. So after t
 
 | 檔案 | 用途 |
 |------|------|
-| `model.pkl` | 主模型（v10 single rated）；沒有則 fallback 用 rated_model.pkl / walkaway_model.pkl |
+| `model.pkl` | 主模型（v10 single rated；**DEC-040**：推論僅載入此檔，無 rated／walkaway fallback） |
 | `feature_list.json` | 特徵順序與名稱，predict 時欄位要一致 |
 | `feature_spec.yaml` | 若存在則用 frozen 版（train–serve 一致） |
 | `model_version` | 版本字串（可選，給維運/日誌用） |
@@ -235,7 +235,7 @@ My thinking is 把 model.pkl 等產物打包成可部署的 artifact. So after t
 
 - 輸入：訓練輸出目錄（例如 `models/` 或 `out_trainer/models/`）。
 - 輸出：一個「bundle 目錄」或一個 `model_bundle_<version>.tar.gz`。
-- 邏輯：只複製上面列出的檔案到 bundle；若沒有 `model.pkl` 再考慮複製 `rated_model.pkl` / `walkaway_model.pkl`（與現有 scorer fallback 一致）。可順便寫一個 `MANIFEST.txt` 或 `bundle_version` 記錄版本與檔案列表，方便日後檢查。
+- 邏輯：只複製上面列出的檔案到 bundle；**必須**含 **`model.pkl`**（與 `package/build_deploy_package.py`／scorer **DEC-040** 一致）。可順便寫一個 `MANIFEST.txt` 或 `bundle_version` 記錄版本與檔案列表，方便日後檢查。
 
 這樣就是「把 model.pkl 等產物打包成可部署的 artifact」的具體做法，且與 ML_API_PROTOCOL 無關、可單獨做。
 
@@ -316,8 +316,8 @@ Yes please draft a plan
 | 項目 | 現況 |
 |------|------|
 | 訓練產出目錄 | `trainer/models/`（`config.MODEL_DIR` = `BASE_DIR / "models"`） |
-| 訓練寫入的檔案 | `model.pkl`, `feature_list.json`, `feature_spec.yaml`, `model_version`, `reason_code_map.json`, `training_metrics.json`, `walkaway_model.pkl`（legacy） |
-| Scorer 讀取 | `scorer.load_dual_artifacts(model_dir)`：同上目錄，fallback 順序 model.pkl → rated_model.pkl → walkaway_model.pkl |
+| 訓練寫入的檔案 | `model.pkl`, `feature_list.json`, `feature_spec.yaml`, `model_version`, `reason_code_map.json`, `training_metrics.json`（**DEC-040**：不再寫 `walkaway_model.pkl`） |
+| Scorer 讀取 | `scorer.load_dual_artifacts(model_dir)`：**僅**讀取 **`model.pkl`**（DEC-040） |
 | API Server | `trainer/api_server.py`：port **8000**，路徑 **/get_alerts**、**/get_validation**，讀 `trainer/local_state/state.db` |
 | 協定要求 | Port **8001**，路徑 **/alerts**、**/validation**，query/response 格式見 `ML_API_PROTOCOL.md` |
 
@@ -339,16 +339,14 @@ Yes please draft a plan
 
 | 檔案 | 必要 | 說明 |
 |------|------|------|
-| `model.pkl` | 是（或下列 fallback 之一） | v10 主 artifact |
-| `rated_model.pkl` | 若無 model.pkl 可選 | Legacy fallback |
-| `walkaway_model.pkl` | 若無 model.pkl 可選 | Legacy fallback |
+| `model.pkl` | 是 | v10 主 artifact（**DEC-040**：唯一可載入之模型檔） |
 | `feature_list.json` | 是 | 特徵順序與名稱 |
 | `feature_spec.yaml` | 建議 | Frozen spec（train–serve 一致） |
 | `model_version` | 建議 | 版本字串 |
 | `reason_code_map.json` | 建議 | SHAP reason codes |
 | `training_metrics.json` | 可選 | 維運/稽核用 |
 
-打包時至少要有：一個可載入的 model 檔（model.pkl 或 fallback）+ `feature_list.json`；其餘建議一併複製以利 scorer/backtester 直接使用。
+打包時至少要有：**`model.pkl`** + `feature_list.json`；其餘建議一併複製以利 scorer/backtester 直接使用。
 
 ### 3.2 輸出格式
 
@@ -365,7 +363,7 @@ Yes please draft a plan
   - `--version`：可選，若未提供則從 `source-dir/model_version` 讀取，若無則用時間戳。
   - `--archive`：可選，若設則額外產出 `.tar.gz`。
 - **邏輯**：
-  1. 檢查 source 至少存在 `model.pkl` 或 `rated_model.pkl` 或 `walkaway_model.pkl` 之一，以及 `feature_list.json`。
+  1. 檢查 source 含 **`model.pkl`** 與 `feature_list.json`（DEC-040）。
   2. 建立 `output-dir/<version>/`（或 `output-dir/model_bundle_<version>/`）。
   3. 複製上表檔案（若存在才複製，避免因缺少可選檔而失敗）。
   4. 可選：寫入 MANIFEST / bundle_info。
@@ -518,7 +516,7 @@ Summary of what’s in place:
 - **`package/__init__.py`** – Makes `package` a Python package.
 - **`package/package_model_bundle.py`** – Script that:
   - Takes `--source-dir` (default `trainer/models`), `--output-dir` (default `package/bundles`), optional `--version`, optional `--archive`.
-  - Requires at least one of `model.pkl`, `rated_model.pkl`, `walkaway_model.pkl` and `feature_list.json`.
+  - Requires **`model.pkl`** and `feature_list.json` (DEC-040).
   - Copies all present bundle files (e.g. `feature_spec.yaml`, `model_version`, `reason_code_map.json`, `training_metrics.json`) into `output_dir/<version>/`.
   - Writes `bundle_info.json` with version and file list.
   - With `--archive`, builds `model_bundle_<version>.tar.gz`.
@@ -890,7 +888,7 @@ package/deploy/
 3. **安裝依賴**：  
    - `.venv/bin/pip install -r requirements.txt`  
    - 若有 `wheels/`：`pip install --no-index -f wheels -r requirements.txt`。
-4. **檢查 `models/`**：至少存在 `model.pkl` 或 `rated_model.pkl` 或 `walkaway_model.pkl` 之一，以及 `feature_list.json`；缺則印出錯誤並說明「請先執行 package_model_bundle 並將 bundle 複製到 deploy/models/」。
+4. **檢查 `models/`**：必須有 **`model.pkl`** 與 `feature_list.json`（DEC-040）；缺則印出錯誤並說明「請先執行訓練／建包並將 bundle 複製到 deploy/models/」。
 5. **建立 `local_state`**：若不存在則 `mkdir local_state`。
 6. **啟動服務**：  
    - 使用 venv 的 Python：`.venv/bin/python app/server.py`（或 `python -m app.server`），  

@@ -7,7 +7,7 @@ After you run this script, you get either:
   - A single file: deploy_dist.zip   (copy this file, then unzip on target; works well on Windows)
 
 Contents: walkaway_ml wheel (from current trainer/ code), main.py, .env.example,
-ML_API_PROTOCOL.md (API contract for ops), model artifacts (model.pkl, feature_list.json, etc.),
+ML_API_PROTOCOL.md (API contract for ops), model artifacts (model.pkl required; feature_list.json, etc.),
 generated requirements.txt (includes numba + pyarrow for serving parity with package/deploy), and local_state dir. On the target you only:
   pip install -r requirements.txt
   cp .env.example .env  &&  edit .env  (CH_* required; see .env.example for log level, scorer windows, paths)
@@ -39,8 +39,6 @@ logger = logging.getLogger(__name__)
 # Model/bundle files (pkl, feature_list.json, feature_spec.yaml, etc.)
 BUNDLE_FILES = [
     "model.pkl",
-    "rated_model.pkl",
-    "walkaway_model.pkl",
     "feature_list.json",
     "feature_spec.yaml",
     "model_version",
@@ -48,7 +46,7 @@ BUNDLE_FILES = [
     "training_metrics.json",
     "pipeline_diagnostics.json",
 ]
-MODEL_PKL_NAMES = ["model.pkl", "rated_model.pkl", "walkaway_model.pkl"]
+MODEL_PKL_NAMES = ["model.pkl"]
 
 # Phase 2 P0-P1: mlflow for export script when run on deploy (cron/scheduler on same or another machine).
 # Keep aligned with package/deploy/requirements.txt for serving: Parquet I/O (profile, canonical map)
@@ -101,7 +99,7 @@ def copy_model_bundle(source_dir: Path, dest_models: Path) -> None:
     if not has_model:
         raise FileNotFoundError(
             f"No model artifact in {source_dir}. Expected one of: {MODEL_PKL_NAMES}. "
-            f"Found files: {names!r}. Run trainer or set --model-source to a directory containing model.pkl (or rated_model.pkl / walkaway_model.pkl)."
+            f"Found files: {names!r}. Run trainer or set --model-source to a directory containing model.pkl (DEC-040: rated_model.pkl / walkaway_model.pkl are not accepted)."
         )
     if not (source_dir / "feature_list.json").exists():
         raise FileNotFoundError(f"Missing {source_dir / 'feature_list.json'}. Found: {names!r}")

@@ -124,10 +124,10 @@ class TestArtifactBundleCompleteness(unittest.TestCase):
         self.assertIn("model_version", src)
         self.assertIn("feature_list.json", src)
 
-    def test_save_artifact_bundle_writes_legacy_walkaway_pkl(self):
-        """save_artifact_bundle must write walkaway_model.pkl for backward compat."""
+    def test_save_artifact_bundle_does_not_write_walkaway_pkl(self):
+        """save_artifact_bundle must not emit legacy walkaway_model.pkl (DEC-040)."""
         src = _get_func_src("save_artifact_bundle")
-        self.assertIn("walkaway_model.pkl", src)
+        self.assertNotIn("walkaway_model.pkl", src)
 
     def test_save_artifact_bundle_supports_model_metadata_json(self):
         """save_artifact_bundle may write model_metadata.json when caller passes model_metadata."""

@@ -25,11 +25,11 @@ models/
   model_version             YYYYMMDD-HHMMSS-<git7>  (plain text)
   training_metrics.json     validation + test metrics, feature importance (gain), Optuna best params
 
-Backward compatibility
-----------------------
-The legacy artifact walkaway_model.pkl (single-model dict) is ALSO written
-alongside the v10 bundle so that the existing scorer/validator can keep
-running until they are refactored in Steps 7–8.
+Model bundle contract (DEC-040)
+-------------------------------
+Serving and backtesting load **model.pkl** only. The trainer writes model.pkl
+(and does not emit legacy walkaway_model.pkl). Stale dual-model and legacy
+pickles are removed after each successful training run.
 
 Data source switching
 ---------------------
@@ -5240,10 +5240,6 @@ def save_artifact_bundle(
     models/training_metrics.json  per-model metrics (rated only)
     models/feature_spec.yaml      frozen feature spec snapshot (DEC-024, R3501)
     models/model_metadata.json    train/valid/test time bounds + run params (schema v1)
-
-    Legacy single-model format (for backward compat with existing scorer)
-    -----------------------------------------------------------------------
-    models/walkaway_model.pkl     {"model", "features", "threshold"}
     """
     _out: Path = bundle_dir if bundle_dir is not None else MODEL_DIR
     _out.mkdir(parents=True, exist_ok=True)
@@ -5360,17 +5356,6 @@ def save_artifact_bundle(
         (_out / "model_metadata.json").write_text(
             json.dumps(model_metadata, indent=2, default=str, ensure_ascii=False) + "\n",
             encoding="utf-8",
-        )
-
-    # Legacy backward-compat: write rated model as walkaway_model.pkl
-    if rated:
-        joblib.dump(
-            {
-                "model": rated["model"],
-                "features": rated["features"],
-                "threshold": rated["threshold"],
-            },
-            _out / "walkaway_model.pkl",
         )
 
     # Contract: precision uplift phase2 orchestrator regex-parses this line
@@ -6961,10 +6946,9 @@ def run_pipeline(args) -> None:
             except Exception as e:
                 logger.warning("MLflow provenance logging failed (training still succeeded): %s", e)
         
-            # Remove stale nonrated_model.pkl / rated_model.pkl left over from previous
-            # dual-model runs so scorer/backtester cannot accidentally fall back to a
-            # v9 artifact (v10 uses model.pkl only).
-            for _stale in ["nonrated_model.pkl", "rated_model.pkl"]:
+            # Remove stale dual-model and legacy pickles so operators do not assume
+            # they are loadable (DEC-040: only model.pkl is read).
+            for _stale in ["nonrated_model.pkl", "rated_model.pkl", "walkaway_model.pkl"]:
                 _stale_path = _versions_root / _stale
                 if _stale_path.exists():
                     _stale_path.unlink()

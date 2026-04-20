@@ -4,8 +4,8 @@ Near real-time scoring daemon.
 
 Key changes from pre-Phase-1 version
 --------------------------------------
-* Single rated-model artifact: model.pkl (v10 DEC-021; falls back to
-  rated_model.pkl or legacy walkaway_model.pkl when model.pkl is absent).
+* Single rated-model artifact: model.pkl (v10 DEC-021; DEC-040: scorer loads
+  model.pkl only — no rated_model.pkl or walkaway_model.pkl fallback).
 * D2 identity resolution via identity.py build_canonical_mapping_from_df.
 * Track Human features via features.py (compute_loss_streak / compute_run_boundary)
   — guarantees train-serve parity with trainer.py. (table_hc deferred to Phase 2.)
@@ -227,7 +227,7 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
 
     Model is loaded locally only; api_server does not serve /score.
 
-    Priority (v10): model.pkl → rated_model.pkl → walkaway_model.pkl.
+    Loads **model.pkl** only (DEC-040). Missing file raises FileNotFoundError.
 
     Returns dict:
         rated        : {"model": lgb.Booster, "threshold": float} or None
@@ -249,12 +249,10 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
                 logger.info("[scorer] Loaded model bundle from latest manifest: %s", d)
             except (FileNotFoundError, ValueError, OSError):
                 pass
-    model_path = d / "model.pkl"      # v10 single-model artifact
-    rated_path = d / "rated_model.pkl"
+    model_path = d / "model.pkl"  # v10 single-model artifact (DEC-040: sole loader input)
     feature_list_path = d / "feature_list.json"
     reason_map_path = d / "reason_code_map.json"
     version_path = d / "model_version"
-    legacy_path = d / "walkaway_model.pkl"
 
     artifacts: dict = {
         "rated": None,
@@ -306,7 +304,6 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         with reason_map_path.open(encoding="utf-8") as fh:
             artifacts["reason_code_map"] = json.load(fh)
 
-    # v10 single-model: prefer model.pkl
     if model_path.exists():
         rb = joblib.load(model_path)
         artifacts["rated"] = {
@@ -323,36 +320,21 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         )
         return artifacts
 
-    if rated_path.exists():
-        rb = joblib.load(rated_path)
-        artifacts["rated"] = {
-            "model": rb["model"],
-            "threshold": float(rb.get("threshold", 0.5)),
-            "features": rb.get("features", []),
-        }
-        if not artifacts["feature_list"]:
-            artifacts["feature_list"] = rb.get("features", [])
-        logger.debug(
-            "[scorer] Rated model loaded from rated_model.pkl (v=%s, %d features)",
-            artifacts["model_version"],
-            len(artifacts["feature_list"]),
+    legacy_hits: list[str] = []
+    if (d / "rated_model.pkl").exists():
+        legacy_hits.append("rated_model.pkl")
+    if (d / "walkaway_model.pkl").exists():
+        legacy_hits.append("walkaway_model.pkl")
+    hint = ""
+    if legacy_hits:
+        hint = (
+            " (legacy files present but not loaded: "
+            + ", ".join(legacy_hits)
+            + "; re-run trainer to emit model.pkl or copy a v10 bundle)"
         )
-        return artifacts
-
-    if legacy_path.exists():
-        bundle = joblib.load(legacy_path)
-        artifacts["rated"] = {
-            "model": bundle["model"],
-            "threshold": float(bundle.get("threshold", 0.5)),
-        }
-        if not artifacts["feature_list"]:
-            artifacts["feature_list"] = bundle.get("features", [])
-        logger.warning("[scorer] rated_model.pkl absent; using legacy walkaway_model.pkl")
-        return artifacts
-
     raise FileNotFoundError(
-        f"No model artifacts found in {d}. "
-        "Run trainer.py first or verify rated_model.pkl / walkaway_model.pkl exists."
+        f"model.pkl required in {d}{hint}. "
+        "Scorer loads only model.pkl (DEC-040). Run trainer.py or fix MODEL_DIR / manifest."
     )
 
 

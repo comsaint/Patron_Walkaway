@@ -9,7 +9,7 @@
 ```
 ClickHouse ──► scorer.py ──► SQLite (alerts table) ──► api_server.py ──► Frontend
                   │
-                  ├─ loads walkaway_model.pkl (joblib)
+                  ├─ loads model.pkl (joblib; DEC-040)
                   ├─ fetches raw bets + sessions from ClickHouse
                   ├─ engineers features internally
                   ├─ calls model.predict_proba()
@@ -237,7 +237,7 @@ Returns model metadata for monitoring and debugging.
 2. App team adds a `score_via_api()` function in `scorer.py` that POSTs features and parses the response.
 3. Run both paths (local `.pkl` + API) in shadow mode; compare scores to validate parity.
 4. Cut over: remove `joblib.load`, `model.predict_proba` from scorer; API becomes the single scoring path.
-5. Remove `models/walkaway_model.pkl` from the app repo.
+5. Remove legacy duplicate model files from the app repo once the service is the only scoring path; the in-repo scorer requires **`models/model.pkl`** (DEC-040).
 
 ---
 
@@ -250,7 +250,7 @@ from flask import Flask, request, jsonify
 import joblib, numpy as np
 
 app = Flask(__name__)
-bundle = joblib.load("walkaway_model.pkl")
+bundle = joblib.load("model.pkl")
 model = bundle["model"]
 FEATURES = bundle["features"]
 THRESHOLD = bundle.get("threshold", 0.5)

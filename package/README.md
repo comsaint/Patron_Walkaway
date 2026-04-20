@@ -28,7 +28,7 @@ python -m package.build_deploy_package --model-source trainer/models_90d_weak --
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--model-source` | `trainer/models` | Directory with model artifacts (`model.pkl` or `walkaway_model.pkl`, `feature_list.json`, etc.). |
+| `--model-source` | `trainer/models` | Directory with model artifacts (**`model.pkl`** required per DEC-040, `feature_list.json`, etc.). |
 | `--output-dir` | `deploy_dist` | Output folder (default: ./deploy_dist at repo root). |
 | `--archive` | Off | Also create `deploy_dist.zip` in the parent of output-dir for a single-file transfer. |
 
@@ -101,7 +101,7 @@ python -m trainer.scripts.auto_build_player_profile --local-parquet --month-end
 
 ## Troubleshooting
 
-- **"No model artifact found"** — Run the trainer first so that `trainer/models/` (or your `--model-source`) contains at least one of `model.pkl`, `rated_model.pkl`, `walkaway_model.pkl` and `feature_list.json`.
+- **"No model artifact found"** — Run the trainer first so that `trainer/models/` (or your `--model-source`) contains **`model.pkl`** and `feature_list.json` (DEC-040: `rated_model.pkl` / `walkaway_model.pkl` are not accepted as substitutes).
 - **Empty `/alerts` or `/validation`** — The server reads from `trainer/local_state/state.db`. Run the scorer (and validator) to populate data.
 - **Port in use** — Set another port with `ML_API_PORT=8002 python -m trainer.api_server`.
 
@@ -137,7 +137,7 @@ python -m package.build_deploy_package --model-source trainer/models_90d_weak --
 
 | 選項 | 預設 | 說明 |
 |--------|---------|-------------|
-| `--model-source` | `trainer/models` | 模型產物目錄（`model.pkl` 或 `walkaway_model.pkl`、`feature_list.json` 等）。 |
+| `--model-source` | `trainer/models` | 模型產物目錄（**必須**含 **`model.pkl`**（DEC-040）、`feature_list.json` 等）。 |
 | `--output-dir` | `deploy_dist` | 輸出資料夾（預設為專案根目錄 ./deploy_dist）。 |
 | `--archive` | 關閉 | 另在輸出目錄上一層產生 `deploy_dist.zip`，便於單檔傳輸。 |
 
@@ -208,6 +208,6 @@ python -m trainer.scripts.auto_build_player_profile --local-parquet --month-end
 
 ## 常見問題
 
-- **「No model artifact found」** — 請先執行訓練，讓 `trainer/models/`（或您的 `--model-source`）內至少存在 `model.pkl`、`rated_model.pkl`、`walkaway_model.pkl` 之一以及 `feature_list.json`。
+- **「No model artifact found」** — 請先執行訓練，讓 `trainer/models/`（或您的 `--model-source`）內含 **`model.pkl`** 與 `feature_list.json`（DEC-040：不接受以 `rated_model.pkl`／`walkaway_model.pkl` 替代）。
 - **`/alerts` 或 `/validation` 回傳空** — 服務從 `trainer/local_state/state.db` 讀取。請先執行 scorer（及 validator）寫入資料。
 - **Port 被佔用** — 可改用其他 port：`ML_API_PORT=8002 python -m trainer.api_server`。

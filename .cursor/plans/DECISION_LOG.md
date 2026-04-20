@@ -1023,4 +1023,24 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-040：模型載入與建包僅接受 `model.pkl`（廢止 rated／walkaway 備援與產出）
+
+**日期**：2026-04-20  
+**SSOT 章節**：`README.md`（產物／部署）；`package/PLAN.md`；`trainer/serving/scorer.py`、`trainer/training/backtester.py`
+
+**決策**：
+
+1. **`trainer.serving.scorer.load_dual_artifacts`** 與 **`trainer.training.backtester.load_dual_artifacts`** 僅從 bundle 目錄載入 **`model.pkl`**。若檔案不存在則 **立即** `FileNotFoundError`；**不**讀取 `rated_model.pkl` 或 `walkaway_model.pkl`（若僅存在這些 legacy 檔，錯誤訊息可提示其存在但未被載入）。
+2. **訓練產物**：`save_artifact_bundle` **不再**寫入 `walkaway_model.pkl`。`run_pipeline` 成功收尾時一併刪除殘留的 `walkaway_model.pkl`（與既有 `nonrated_model.pkl`／`rated_model.pkl` 清理一致）。
+3. **`package/build_deploy_package.py`**：`--model-source` 必須含 **`model.pkl`** 與 `feature_list.json`；不再將 `rated_model.pkl`／`walkaway_model.pkl` 視為可替代主模型或列入預設複製清單。
+
+**理由**：
+
+- 備援鏈易在部署錯置時 **靜默使用舊模型**，與「單一真實來源」的 v10 bundle 契約相衝突。
+- `walkaway_model.pkl` 與 `model.pkl` 內容重複，維運成本高且易誤解。
+
+**遷移**：僅有 legacy pickle、尚無 `model.pkl` 的目錄必須重新訓練或由維運手動產出 v10 bundle；不接受再以舊檔名啟動 scorer／backtester。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

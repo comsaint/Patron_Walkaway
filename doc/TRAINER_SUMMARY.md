@@ -8,7 +8,7 @@ The `trainer/` directory contains a real-time prediction and monitoring system f
 ```mermaid
 graph TD
     CH[(ClickHouse\nLive Data)] -->|Historical Data| Trainer[trainer.py\nModel Training]
-    Trainer -->|Model & Threshold| Models(models/walkaway_model.pkl)
+    Trainer -->|Model & Threshold| Models(models/model.pkl)
     
     CH -->|Recent History| Backtester[backtester.py\nPrecision Testing]
     Models --> Backtester

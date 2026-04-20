@@ -4,6 +4,26 @@
 
 ---
 
+## 2026-04-20 — DEC-040：僅載入 `model.pkl`；廢止 walkaway 產出與 legacy 備援
+
+**決策紀錄**：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md) **DEC-040**。
+
+### 變更摘要
+
+- **`trainer/serving/scorer.py`**、**`trainer/training/backtester.py`**：`load_dual_artifacts` 只讀 **`model.pkl`**；缺檔即 `FileNotFoundError`（若目錄內仅有 `rated_model.pkl`／`walkaway_model.pkl`，錯誤訊息會註明 legacy 檔未被載入）。
+- **`trainer/training/trainer.py`**：不再寫入 `walkaway_model.pkl`；`run_pipeline` 收尾刪除殘留 **`walkaway_model.pkl`**（與 `nonrated_model.pkl`／`rated_model.pkl` 一併清理）。
+- **`package/build_deploy_package.py`**：建包僅接受來源含 **`model.pkl`**；`BUNDLE_FILES` 不再列 legacy pkl。
+- **測試**：`tests/integration/test_trainer.py` 改為斷言 `save_artifact_bundle` 不含 walkaway 寫入；`tests/review_risks/test_review_risks_round360.py` 斷言 `run_pipeline` 含 `walkaway_model.pkl` 清理。
+- **文件**：`README.md`、`package/*`、`doc/` 內與 fallback／walkaway 相關敘述已對齊 DEC-040。
+
+### 建議驗證
+
+```bash
+python -m pytest tests/integration/test_trainer.py tests/review_risks/test_review_risks_round360.py tests/integration/test_scorer.py -q --tb=short
+```
+
+---
+
 ## 2026-04-10 CYCLE — Phase 2：`precision_at_recall_1pct_by_window`（plan bundle）+ PAT 序列合併行為（/cycle_code 全四步）
 
 > 計畫索引：[`.cursor/plans/PLAN.md`](.cursor/plans/PLAN.md)、[`.cursor/plans/PLAN_precision_uplift_sprint.md`](.cursor/plans/PLAN_precision_uplift_sprint.md)、[`PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`](investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md)；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。

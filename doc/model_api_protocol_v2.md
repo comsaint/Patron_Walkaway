@@ -10,9 +10,9 @@
 
 | Area | v1 | v2 (current implementation) |
 |------|----|-----------------------------|
-| **Primary model artifact** | `walkaway_model.pkl` | **`model.pkl`** (v10 DEC-021); fallbacks: `rated_model.pkl` → `walkaway_model.pkl` |
+| **Primary model artifact** | `walkaway_model.pkl` | **`model.pkl`** (v10 DEC-021); **DEC-040**: scorer loads **`model.pkl` only** (no `rated_model.pkl` / `walkaway_model.pkl`) |
 | **Feature list** | Fixed 17-feature schema in doc | **Dynamic**: from `feature_list.json` or `model.pkl` key `"features"`; each row may include `{"name", "track"}` with `track` ∈ `track_llm` / `track_human` / `track_profile` |
-| **Artifacts** | Single .pkl | **Full set**: `model.pkl`, `feature_list.json`, `feature_spec.yaml` (frozen), `reason_code_map.json`, `model_version`, `training_metrics.json`; legacy `walkaway_model.pkl` still written for backward compat |
+| **Artifacts** | Single .pkl | **Full set**: `model.pkl`, `feature_list.json`, `feature_spec.yaml` (frozen), `reason_code_map.json`, `model_version`, `training_metrics.json` (trainer does not emit `walkaway_model.pkl`; DEC-040) |
 | **Profile vs non-profile** | Not specified | **Profile** features may be NaN (no prior snapshot); **non-profile** filled 0; service/coerce per `coerce_feature_dtypes` for train–serve parity |
 | **Model version format** | Semantic e.g. `v2.1.0` | **`YYYYMMDD-HHMMSS-<git7>`** (from `get_model_version()`) |
 | **App api_server** | Implements /score, /health, /model_info | **Does not** expose scoring; only frontend, get_alerts, get_validation, get_floor_status, etc. The **Model Service** (separate) implements /score, /health, /model_info when decoupled |
@@ -22,12 +22,12 @@
 
 ## 1  Current Architecture (Monolith)
 
-**Changed (v2):** Diagram and artifact list reflect v10 and fallback chain.
+**Changed (v2):** Diagram and artifact list reflect v10 single-artifact loading (`model.pkl` only, DEC-040).
 
 ```
 ClickHouse ──► scorer.py ──► SQLite (alerts table) ──► api_server.py ──► Frontend
                   │
-                  ├─ loads model.pkl (v10) or rated_model.pkl or walkaway_model.pkl (joblib)
+                  ├─ loads model.pkl only (joblib; DEC-040)
                   ├─ feature list from feature_list.json (or pkl "features")
                   ├─ fetches raw bets + sessions from ClickHouse
                   ├─ engineers features internally (features.py; track_llm / track_human / track_profile)
@@ -35,7 +35,7 @@ ClickHouse ──► scorer.py ──► SQLite (alerts table) ──► api_ser
                   └─ writes alerts to SQLite
 ```
 
-Everything lives in one process. The model team's deliverable is the **models/** artifact directory: **model.pkl** (primary), **feature_list.json**, **feature_spec.yaml**, **reason_code_map.json**, **model_version**, **training_metrics.json**; optionally **rated_model.pkl** / **walkaway_model.pkl** for backward compatibility.
+Everything lives in one process. The model team's deliverable is the **models/** artifact directory: **model.pkl**, **feature_list.json**, **feature_spec.yaml**, **reason_code_map.json**, **model_version**, **training_metrics.json** (DEC-040: no alternate `.pkl` for serving).
 
 ---
 
@@ -240,7 +240,7 @@ Unchanged from v1.
 - **Feature list**: The set of required feature keys is determined by the service from **feature_list.json** (normalize to list of names) or from **model.pkl** key **"features"**. Each row must contain every feature in that list plus `bet_id`.
 - **Reserved key**: `is_rated` (optional, default false) is reserved and not treated as a feature or pass-through.
 - **Pass-through**: Any key in a row that is not in the feature list and not reserved is echoed as-is in the corresponding `scores[i]`. Server may log pass-through keys once per request.
-- **Model loading**: Load **model.pkl** first; if absent, **rated_model.pkl**; then **walkaway_model.pkl**. Each pkl is a dict: `{"model", "threshold", "features"}` (legacy may have `"features"` only in walkaway_model).
+- **Model loading**: Load **`model.pkl` only** (DEC-040). Dict shape: `{"model", "threshold", "features"}`.
 - **training_metrics** (`GET /model_info`): Sourced from **training_metrics.json** in the model directory. If the file is missing or read fails, or the root value is not a JSON object, the response uses `{}`. The value is returned as-is from the file (no reshaping).
 
 ---
@@ -272,19 +272,19 @@ Unchanged from v1.
 
 ## 7  Migration Path
 
-**Changed (v2):** Step 5 refers to **model.pkl** and legacy fallbacks.
+**Changed (v2):** Step 5 refers to removing **model.pkl** (and the rest of the bundle) from the app repo after API cutover.
 
 1. Model team stands up the service with `/score`, `/health`, `/model_info`.
 2. App team adds a `score_via_api()` function in `scorer.py` that POSTs features and parses the response.
 3. Run both paths (local **model.pkl** + API) in shadow mode; compare scores to validate parity.
 4. Cut over: remove `joblib.load`, `model.predict_proba` from scorer; API becomes the single scoring path.
-5. Remove **models/model.pkl** (and optionally **rated_model.pkl** / **walkaway_model.pkl**) from the app repo once the service is the only scoring path.
+5. Remove **models/model.pkl** (and other bundle JSON/YAML) from the app repo once the service is the only scoring path.
 
 ---
 
 ## 8  Quick-Start Example (Model Service)
 
-**Changed (v2):** Load **model.pkl** (with fallbacks), feature list from **feature_list.json** or pkl; use **model_version** file; support **training_metrics.json** in `/model_info`.
+**Changed (v2):** Load **`model.pkl` only** (DEC-040), feature list from **feature_list.json** or pkl; use **model_version** file; support **training_metrics.json** in `/model_info`.
 
 Minimal Flask scaffold for the model team:
 
@@ -297,13 +297,12 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 MODEL_DIR = Path("models")
 
-# Load artifact: model.pkl → rated_model.pkl → walkaway_model.pkl
+# Load artifact: model.pkl only (align with trainer.serving.scorer DEC-040)
 def load_bundle():
-    for name in ("model.pkl", "rated_model.pkl", "walkaway_model.pkl"):
-        p = MODEL_DIR / name
-        if p.exists():
-            return joblib.load(p), name
-    raise FileNotFoundError("No model.pkl / rated_model.pkl / walkaway_model.pkl found")
+    p = MODEL_DIR / "model.pkl"
+    if p.exists():
+        return joblib.load(p), p.name
+    raise FileNotFoundError("model.pkl required in %s" % MODEL_DIR)
 
 bundle, _ = load_bundle()
 model = bundle["model"]
