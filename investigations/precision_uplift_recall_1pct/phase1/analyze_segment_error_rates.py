@@ -1,12 +1,33 @@
 """Ad-hoc Phase 1 segment error analysis (W1-B2 quick path).
 
 Purpose:
-- Given ``prediction_log`` + ``state_db``, compute by-segment error rate and sample size.
-- Use Parquet / ClickHouse only when profile segment fields are unavailable in state DB.
+- Compute by-segment error metrics from either:
+  1) ``--backtest-predictions-parquet``; or
+  2) ``--prediction-log-db`` + ``--state-db``.
+- Enrich eval rows with profile fields required for segmentation:
+  ``theo_win_sum_30d``, ``active_days_30d``, ``turnover_sum_30d``,
+  ``days_since_first_session``.
+- Merge profile sources incrementally (embedded backtest fields -> state DB ->
+  ClickHouse fallback -> ``player_profile.parquet`` row-level as-of join on
+  ``snapshot_dtm <= scored_at``) to fill missing profile fields.
+
+Row-retention policy:
+- Missing canonical profile (no profile row for canonical_id) is dropped.
+- Rows with incomplete/non-numeric profile fields or ``active_days_30d <= 0``
+  are kept and assigned ``*_unknown`` percentile buckets, instead of being dropped.
+
+Runtime behavior:
+- ``--max-rows <= 0`` means uncapped/full-window evaluation.
+- Default ``--score-threshold`` is read from ``<--model-bundle-dir>/training_metrics.json``
+  as ``rated.threshold_at_recall_0.01`` (apple-to-apple with training); pass
+  ``--score-threshold`` only to override.
+- ClickHouse profile fallback is on by default; pass ``--no-use-clickhouse-fallback`` to disable.
+- For backtest parquet timestamps that are tz-naive, values are normalized as UTC
+  before HKT date bucketing to avoid off-by-one-day segment labels.
 
 Output:
-- JSON file with per-segment metrics and metadata.
-- Console summary (top segments by error rate, filtered by min sample size).
+- JSON file with summary, notes, and per-segment metrics.
+- Console summary (top segments by precision-at-alert/error-rate ordering).
 """
 
 from __future__ import annotations
@@ -15,7 +36,7 @@ import argparse
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +47,36 @@ PROFILE_FIELDS: tuple[str, ...] = (
     "turnover_sum_30d",
     "days_since_first_session",
 )
+
+# Row-level as-of join to player_profile.parquet (avoid OOM on laptop).
+PROFILE_PARQUET_ASOF_CHUNK: int = 250_000
+
+_SENTINEL_SCORE_THRESHOLD = object()
+
+
+def _load_rated_threshold_at_recall_0_01(model_bundle_dir: Path) -> float:
+    """Load ``rated.threshold_at_recall_0.01`` from ``training_metrics.json`` under the model bundle."""
+    metrics_path = (model_bundle_dir / "training_metrics.json").resolve()
+    if not metrics_path.is_file():
+        raise SystemExit(
+            f"training_metrics.json not found under --model-bundle-dir: {metrics_path}"
+        )
+    try:
+        data = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON in {metrics_path}: {exc}") from exc
+    rated = data.get("rated")
+    if not isinstance(rated, dict):
+        raise SystemExit(f"training_metrics.json missing dict 'rated': {metrics_path}")
+    key = "threshold_at_recall_0.01"
+    if key not in rated:
+        raise SystemExit(
+            f"rated.{key} missing in {metrics_path}; cannot align alert threshold with training."
+        )
+    try:
+        return float(rated[key])
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"rated.{key} is not numeric in {metrics_path}") from exc
 
 
 @dataclass(frozen=True)
@@ -62,6 +113,20 @@ def _eval_date_hkt(raw: str) -> str:
         return dt.astimezone(ZoneInfo("Asia/Hong_Kong")).date().isoformat()
     except Exception:
         return dt.date().isoformat()
+
+
+def _normalize_backtest_ts(raw: str) -> str:
+    """Normalize backtest timestamp for stable HKT date bucketing.
+
+    Backtest parquet often stores tz-naive timestamps that are effectively UTC.
+    To avoid off-by-one-day segment labels, treat naive values as UTC.
+    """
+    dt = _parse_iso(raw)
+    if dt is None:
+        return str(raw or "").strip()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.isoformat()
 
 
 def _tenure_bucket(v: Any) -> str:
@@ -125,15 +190,22 @@ def _load_eval_rows(
                 sel += ", is_alert"
             if has_score:
                 sel += ", score"
-            sql = (
-                f"SELECT {sel} FROM prediction_log WHERE scored_at >= ? AND scored_at < ?"
-                f"{rated_filter} ORDER BY scored_at ASC LIMIT ?"
-            )
-            rows = conn.execute(sql, (start_ts, end_ts, max_rows + 1)).fetchall()
+            if max_rows > 0:
+                sql = (
+                    f"SELECT {sel} FROM prediction_log WHERE scored_at >= ? AND scored_at < ?"
+                    f"{rated_filter} ORDER BY scored_at ASC LIMIT ?"
+                )
+                rows = conn.execute(sql, (start_ts, end_ts, max_rows + 1)).fetchall()
+            else:
+                sql = (
+                    f"SELECT {sel} FROM prediction_log WHERE scored_at >= ? AND scored_at < ?"
+                    f"{rated_filter} ORDER BY scored_at ASC"
+                )
+                rows = conn.execute(sql, (start_ts, end_ts)).fetchall()
     except sqlite3.Error:
         return [], ["prediction_log_db_unavailable"]
 
-    if len(rows) > max_rows:
+    if max_rows > 0 and len(rows) > max_rows:
         rows = rows[:max_rows]
         notes.append(f"eval_rows_truncated_at:{max_rows}")
 
@@ -283,20 +355,31 @@ def _load_eval_rows_from_backtest_parquet(
         pf_present = [c for c in PROFILE_FIELDS if c in cols]
         if pf_present:
             select_cols += ", " + ", ".join(pf_present)
-        sql = (
-            f"SELECT {select_cols} FROM read_parquet(?) "
-            f"WHERE {ts_col} >= ? AND {ts_col} < ? "
-            f"ORDER BY {ts_col} ASC LIMIT ?"
-        )
-        rows = con.execute(
-            sql,
-            [str(parquet_path), start_ts, end_ts, max_rows + 1],
-        ).fetchall()
+        if max_rows > 0:
+            sql = (
+                f"SELECT {select_cols} FROM read_parquet(?) "
+                f"WHERE {ts_col} >= ? AND {ts_col} < ? "
+                f"ORDER BY {ts_col} ASC LIMIT ?"
+            )
+            rows = con.execute(
+                sql,
+                [str(parquet_path), start_ts, end_ts, max_rows + 1],
+            ).fetchall()
+        else:
+            sql = (
+                f"SELECT {select_cols} FROM read_parquet(?) "
+                f"WHERE {ts_col} >= ? AND {ts_col} < ? "
+                f"ORDER BY {ts_col} ASC"
+            )
+            rows = con.execute(
+                sql,
+                [str(parquet_path), start_ts, end_ts],
+            ).fetchall()
         con.close()
     except Exception:
         return out, ["backtest_predictions_query_failed"], profile_rows
 
-    if len(rows) > max_rows:
+    if max_rows > 0 and len(rows) > max_rows:
         rows = rows[:max_rows]
         notes.append(f"eval_rows_truncated_at:{max_rows}")
 
@@ -321,6 +404,7 @@ def _load_eval_rows_from_backtest_parquet(
         i += 1 if has_bet_id else 0
         if not cid or not ts_raw:
             continue
+        ts_raw = _normalize_backtest_ts(ts_raw)
         if raw_alert is None:
             try:
                 is_alert = 1 if float(raw_score) >= score_threshold else 0
@@ -364,12 +448,170 @@ def _profiles_from_backtest_rows(rows: list[dict[str, Any]]) -> dict[str, dict[s
             if v is None:
                 continue
             cur[f] = v
-    # keep only complete profile rows
-    ready: dict[str, dict[str, Any]] = {}
-    for cid, pr in out.items():
-        if all(k in pr for k in PROFILE_FIELDS):
-            ready[cid] = pr
-    return ready
+    return out
+
+
+def _merge_profiles(base: dict[str, dict[str, Any]], incoming: dict[str, dict[str, Any]]) -> int:
+    """Merge profile maps, filling only missing required fields.
+
+    Returns:
+      Number of field values newly filled in ``base``.
+    """
+    filled = 0
+    for cid, src in incoming.items():
+        if not cid:
+            continue
+        dst = base.get(cid)
+        if dst is None:
+            dst = {}
+            base[cid] = dst
+        for f in PROFILE_FIELDS:
+            v = src.get(f)
+            if v is None:
+                continue
+            if dst.get(f) is None:
+                dst[f] = v
+                filled += 1
+    return filled
+
+
+def _missing_profile_cids(
+    profiles: dict[str, dict[str, Any]],
+    cids: list[str],
+) -> list[str]:
+    uniq = sorted({str(c).strip() for c in cids if str(c).strip()})
+    out: list[str] = []
+    for cid in uniq:
+        pr = profiles.get(cid)
+        if not isinstance(pr, dict):
+            out.append(cid)
+            continue
+        if any(pr.get(f) is None for f in PROFILE_FIELDS):
+            out.append(cid)
+    return out
+
+
+def _as_of_naive_utc_for_profile_join(scored_at: str) -> datetime | None:
+    """Interpret ``scored_at`` as an instant and return naive UTC for join to ``snapshot_dtm``."""
+    dt = _parse_iso(str(scored_at or "").strip())
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).replace(tzinfo=None)
+
+
+def _merge_parquet_row_into_cid_profile(
+    row_parq: dict[str, Any] | None,
+    profiles_by_cid: dict[str, dict[str, Any]],
+    cid: str,
+) -> dict[str, Any] | None:
+    """Prefer non-null PIT parquet fields over the CID-level profile map."""
+    out: dict[str, Any] = {}
+    base = profiles_by_cid.get(cid)
+    if isinstance(base, dict):
+        out.update(base)
+    if row_parq:
+        for f in PROFILE_FIELDS:
+            v = row_parq.get(f)
+            if v is not None:
+                out[f] = v
+    return out if out else None
+
+
+def _load_profiles_parquet_asof_per_row(
+    parquet_path: Path,
+    eval_rows: list[EvalRow],
+    *,
+    chunk_size: int = PROFILE_PARQUET_ASOF_CHUNK,
+) -> tuple[list[dict[str, Any] | None] | None, list[str]]:
+    """Latest ``player_profile`` row per eval row with ``snapshot_dtm <= as_of`` (PIT).
+
+    Returns:
+      List aligned with ``eval_rows`` (entries may be ``None``), or ``None`` if join cannot run.
+    """
+    notes: list[str] = []
+    if not eval_rows:
+        return [], notes
+    if not parquet_path.is_file():
+        return None, ["parquet_not_found_for_profiles"]
+    try:
+        import duckdb  # type: ignore
+        import pandas as pd  # type: ignore
+    except Exception:
+        return None, ["duckdb_or_pandas_unavailable_for_parquet_asof"]
+    try:
+        probe = duckdb.connect(":memory:")
+        cols = {
+            str(r[0])
+            for r in probe.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(parquet_path)]).fetchall()
+        }
+        probe.close()
+    except Exception:
+        return None, ["parquet_profile_describe_failed"]
+
+    req = {"canonical_id", "snapshot_dtm", *PROFILE_FIELDS}
+    if not req.issubset(cols):
+        return None, [f"parquet_profile_missing_cols_for_asof:{','.join(sorted(req - cols))}"]
+
+    pp = str(parquet_path.resolve())
+    sel = ", ".join(f"prof.{c}" for c in PROFILE_FIELDS)
+    sql = f"""
+    SELECT ev.rid, {sel}
+    FROM ev_chunk ev
+    LEFT JOIN read_parquet(?) prof
+      ON ev.canonical_id = prof.canonical_id
+     AND prof.snapshot_dtm <= ev.as_of
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY ev.rid ORDER BY prof.snapshot_dtm DESC NULLS LAST) = 1
+    """
+
+    out: list[dict[str, Any] | None] = [None] * len(eval_rows)
+    rows_with_any_field = 0
+    con = duckdb.connect(":memory:")
+    try:
+        for start in range(0, len(eval_rows), chunk_size):
+            end = min(start + chunk_size, len(eval_rows))
+            rids: list[int] = []
+            cids_chunk: list[str] = []
+            as_ofs: list[Any] = []
+            for i in range(start, end):
+                r = eval_rows[i]
+                ao = _as_of_naive_utc_for_profile_join(r.scored_at)
+                if ao is None:
+                    continue
+                rids.append(i)
+                cids_chunk.append(r.canonical_id)
+                as_ofs.append(ao)
+            if not rids:
+                continue
+            df = pd.DataFrame({"rid": rids, "canonical_id": cids_chunk, "as_of": as_ofs})
+            con.register("ev_chunk", df)
+            try:
+                res = con.execute(sql, [pp]).fetchall()
+            finally:
+                try:
+                    con.unregister("ev_chunk")
+                except Exception:
+                    pass
+            for row in res:
+                rid = int(row[0])
+                vals = list(row[1 : 1 + len(PROFILE_FIELDS)])
+                if all(v is None for v in vals):
+                    out[rid] = None
+                else:
+                    out[rid] = {PROFILE_FIELDS[j]: vals[j] for j in range(len(PROFILE_FIELDS))}
+                    rows_with_any_field += 1
+    except Exception:
+        try:
+            con.close()
+        except Exception:
+            pass
+        return None, ["parquet_asof_query_failed"]
+    con.close()
+
+    notes.append(f"profile_parquet_asof_rows_with_any_field:{rows_with_any_field}")
+    notes.append(f"profile_parquet_asof_chunk_size:{chunk_size}")
+    return out, notes
 
 
 def _load_profiles_from_state_db(state_db: Path, cids: list[str], table: str) -> tuple[dict[str, dict[str, Any]], list[str]]:
@@ -415,46 +657,6 @@ def _has_note_prefix(notes: list[str], prefix: str) -> bool:
         if str(n).startswith(prefix):
             return True
     return False
-
-
-def _load_profiles_from_parquet(parquet_path: Path, cids: list[str]) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    notes: list[str] = []
-    out: dict[str, dict[str, Any]] = {}
-    if not parquet_path.is_file():
-        return out, ["parquet_not_found_for_profiles"]
-    try:
-        import duckdb  # type: ignore
-    except Exception:
-        return out, ["duckdb_unavailable_for_parquet_profiles"]
-    uniq = sorted({c for c in cids if c})
-    if not uniq:
-        return out, ["no_canonical_ids"]
-    try:
-        con = duckdb.connect(":memory:")
-        cols = {str(r[0]) for r in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(parquet_path)]).fetchall()}
-        req = {"canonical_id", *PROFILE_FIELDS}
-        if not req.issubset(cols):
-            con.close()
-            return out, [f"parquet_profile_missing_cols:{','.join(sorted(req - cols))}"]
-        rows = con.execute(
-            "SELECT canonical_id, theo_win_sum_30d, active_days_30d, turnover_sum_30d, days_since_first_session "
-            "FROM read_parquet(?) WHERE canonical_id IN ?",
-            [str(parquet_path), tuple(uniq)],
-        ).fetchall()
-        con.close()
-    except Exception:
-        return out, ["parquet_query_failed_for_profiles"]
-    for r in rows:
-        cid = str(r[0] or "").strip()
-        if not cid or cid in out:
-            continue
-        out[cid] = {
-            "theo_win_sum_30d": r[1],
-            "active_days_30d": r[2],
-            "turnover_sum_30d": r[3],
-            "days_since_first_session": r[4],
-        }
-    return out, notes
 
 
 def _load_profiles_from_clickhouse(
@@ -586,27 +788,72 @@ def main() -> int:
     p.add_argument("--start-ts", required=True)
     p.add_argument("--end-ts", required=True)
     p.add_argument("--output-json", default="")
-    p.add_argument("--max-rows", type=int, default=200000)
-    p.add_argument("--score-threshold", type=float, default=0.5)
+    p.add_argument(
+        "--max-rows",
+        type=int,
+        default=0,
+        help="Max eval rows to load. <=0 means no cap (use all available rows).",
+    )
+    p.add_argument(
+        "--model-bundle-dir",
+        type=Path,
+        default=Path("out/models/20260419-040815-6ec219f"),
+        help=(
+            "Directory with training_metrics.json. Default score threshold is "
+            "rated.threshold_at_recall_0.01 from that file (unless --score-threshold is set)."
+        ),
+    )
+    p.add_argument(
+        "--score-threshold",
+        type=float,
+        default=_SENTINEL_SCORE_THRESHOLD,
+        help=(
+            "Alert if score >= this when ``is_alert`` is absent. "
+            "Default: read rated.threshold_at_recall_0.01 from --model-bundle-dir/training_metrics.json."
+        ),
+    )
     p.add_argument("--profile-table", default="player_profile")
     p.add_argument("--profile-parquet-path", default="")
-    p.add_argument("--use-clickhouse-fallback", action="store_true")
+    p.add_argument(
+        "--use-clickhouse-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After embedded/state/parquet profile merge, query ClickHouse for remaining gaps. "
+            "Default: on. Use --no-use-clickhouse-fallback to skip."
+        ),
+    )
     p.add_argument("--clickhouse-source-db", default="")
     p.add_argument("--clickhouse-profile-table", default="")
     p.add_argument("--min-segment-n", type=int, default=30)
     args = p.parse_args()
 
+    model_bundle_dir = Path(args.model_bundle_dir).expanduser().resolve()
+    if args.score_threshold is not _SENTINEL_SCORE_THRESHOLD:
+        score_threshold = float(args.score_threshold)
+        score_threshold_source = "cli_override"
+    else:
+        score_threshold = _load_rated_threshold_at_recall_0_01(model_bundle_dir)
+        score_threshold_source = "training_metrics.rated.threshold_at_recall_0.01"
+
     pred_db = Path(str(args.prediction_log_db).strip()) if str(args.prediction_log_db).strip() else Path()
     state_db = Path(str(args.state_db).strip()) if str(args.state_db).strip() else Path()
     bt_pred_path = Path(str(args.backtest_predictions_parquet).strip()) if str(args.backtest_predictions_parquet).strip() else None
     embedded_profile_rows: list[dict[str, Any]] = []
+    row_cap = int(args.max_rows)
+    if row_cap <= 0:
+        row_cap = 0
+        eval_cap = 0
+    else:
+        eval_cap = row_cap
+
     if bt_pred_path is not None:
         eval_rows, eval_notes, embedded_profile_rows = _load_eval_rows_from_backtest_parquet(
             bt_pred_path,
             start_ts=str(args.start_ts),
             end_ts=str(args.end_ts),
-            max_rows=max(1, int(args.max_rows)),
-            score_threshold=float(args.score_threshold),
+            max_rows=eval_cap,
+            score_threshold=score_threshold,
         )
         eval_notes.append("eval_source:backtest_predictions_parquet")
     else:
@@ -628,10 +875,16 @@ def main() -> int:
             state_db,
             start_ts=str(args.start_ts),
             end_ts=str(args.end_ts),
-            max_rows=max(1, int(args.max_rows)),
-            score_threshold=float(args.score_threshold),
+            max_rows=eval_cap,
+            score_threshold=score_threshold,
         )
         eval_notes.append("eval_source:prediction_log_state_db")
+    if eval_cap == 0:
+        eval_notes.append("eval_rows_uncapped")
+    eval_notes.append(
+        f"score_threshold_effective:{score_threshold}|source:{score_threshold_source}|"
+        f"model_bundle_dir:{model_bundle_dir.as_posix()}"
+    )
     if not eval_rows:
         out = {"notes": eval_notes + ["no_eval_rows"], "segments": {}, "summary": {}}
         if args.output_json:
@@ -642,75 +895,90 @@ def main() -> int:
     cids = [r.canonical_id for r in eval_rows]
     profiles = _profiles_from_backtest_rows(embedded_profile_rows)
     profile_notes: list[str] = []
-    source = "backtest_predictions_parquet_embedded" if profiles else "state_db"
-    if not profiles:
-        profiles, profile_notes = _load_profiles_from_state_db(
-            state_db, cids, str(args.profile_table)
-        )
+    source_parts: list[str] = []
+    if profiles:
+        source_parts.append("backtest_predictions_parquet_embedded")
 
-    # Fallback trigger: no profiles OR state_db profile schema is insufficient.
-    need_profile_fallback = (not profiles) or _has_note_prefix(
-        profile_notes, "state_db_profile_missing_cols:"
-    )
+    need_cids = _missing_profile_cids(profiles, cids)
+    # Load from state_db as primary only when no embedded profiles exist.
+    # When embedded profiles exist, use state_db as supplementary source if provided.
+    has_state_db_arg = bool(str(args.state_db).strip())
+    if (not profiles) or (has_state_db_arg and need_cids):
+        st_profiles, st_notes = _load_profiles_from_state_db(
+            state_db, need_cids if need_cids else cids, str(args.profile_table)
+        )
+        profile_notes.extend(st_notes)
+        st_filled = _merge_profiles(profiles, st_profiles)
+        if st_filled > 0:
+            source_parts.append("state_db")
+            profile_notes.append(f"profile_fields_filled_from_state_db:{st_filled}")
+
     parquet_path_raw = str(args.profile_parquet_path or "").strip()
     parquet_path = Path(parquet_path_raw) if parquet_path_raw else (Path.cwd() / "data" / "player_profile.parquet")
     tried_default_parquet = not bool(parquet_path_raw)
 
-    if need_profile_fallback:
-        parq_profiles, pn = _load_profiles_from_parquet(parquet_path, cids)
-        profile_notes.extend(pn)
-        if parq_profiles:
-            profiles = parq_profiles
-            source = "parquet"
-            if _has_note_prefix(profile_notes, "state_db_profile_missing_cols:"):
-                profile_notes.append("state_db_profile_missing_cols_resolved_by_parquet")
-        elif tried_default_parquet:
-            profile_notes.append(
-                f"parquet_default_not_usable:{parquet_path.as_posix()}"
-            )
-
-    if (not profiles) and args.use_clickhouse_fallback:
-        profiles, cn = _load_profiles_from_clickhouse(
-            cids,
+    need_cids = _missing_profile_cids(profiles, cids)
+    if need_cids and args.use_clickhouse_fallback:
+        ch_profiles, cn = _load_profiles_from_clickhouse(
+            need_cids,
             source_db=str(args.clickhouse_source_db),
             profile_table=str(args.clickhouse_profile_table),
         )
         profile_notes.extend(cn)
-        if profiles:
-            source = "clickhouse"
+        ch_filled = _merge_profiles(profiles, ch_profiles)
+        if ch_filled > 0:
+            source_parts.append("clickhouse")
+            profile_notes.append(f"profile_fields_filled_from_clickhouse:{ch_filled}")
+
+    parquet_row_profiles: list[dict[str, Any] | None] | None = None
+    if parquet_path.is_file():
+        parquet_row_profiles, pn = _load_profiles_parquet_asof_per_row(parquet_path, eval_rows)
+        profile_notes.extend(pn)
+        if parquet_row_profiles is not None:
+            source_parts.append("parquet_asof")
+            if _has_note_prefix(profile_notes, "state_db_profile_missing_cols:"):
+                profile_notes.append("state_db_profile_missing_cols_resolved_by_parquet")
+    elif tried_default_parquet:
+        profile_notes.append(
+            f"parquet_default_not_usable:{parquet_path.as_posix()}"
+        )
+
+    source = "+".join(source_parts) if source_parts else "none"
 
     enriched: list[dict[str, Any]] = []
     adt_vals: list[float] = []
     act_vals: list[float] = []
     to_vals: list[float] = []
+    metric_ready_idx: list[int] = []
     drop_counts: dict[str, int] = {
         "missing_profile_for_canonical_id": 0,
         "profile_missing_required_field": 0,
         "profile_non_numeric_field": 0,
         "profile_active_days_non_positive": 0,
     }
-    for r in eval_rows:
-        pr = profiles.get(r.canonical_id)
-        if not isinstance(pr, dict):
+    for i, r in enumerate(eval_rows):
+        row_p = parquet_row_profiles[i] if parquet_row_profiles is not None else None
+        pr = _merge_parquet_row_into_cid_profile(row_p, profiles, r.canonical_id)
+        if not pr:
             drop_counts["missing_profile_for_canonical_id"] += 1
             continue
+        metric_ready = False
         try:
             ad = float(pr["active_days_30d"])
             theo = float(pr["theo_win_sum_30d"])
             to_v = float(pr["turnover_sum_30d"])
+            if ad <= 0:
+                drop_counts["profile_active_days_non_positive"] += 1
+            else:
+                adt = theo / ad
+                adt_vals.append(adt)
+                act_vals.append(ad)
+                to_vals.append(to_v)
+                metric_ready = True
         except KeyError:
             drop_counts["profile_missing_required_field"] += 1
-            continue
         except (TypeError, ValueError):
             drop_counts["profile_non_numeric_field"] += 1
-            continue
-        if ad <= 0:
-            drop_counts["profile_active_days_non_positive"] += 1
-            continue
-        adt = theo / ad
-        adt_vals.append(adt)
-        act_vals.append(ad)
-        to_vals.append(to_v)
         enriched.append(
             {
                 "bet_id": r.bet_id,
@@ -721,8 +989,11 @@ def main() -> int:
                 "is_alert": int(r.is_alert),
                 "label": int(r.label),
                 "error": int(int(r.is_alert) != int(r.label)),
+                "_metric_ready": metric_ready,
             }
         )
+        if metric_ready:
+            metric_ready_idx.append(len(enriched) - 1)
 
     if not enriched:
         dropped_total = sum(drop_counts.values())
@@ -734,6 +1005,9 @@ def main() -> int:
                 "eval_rows_total": len(eval_rows),
                 "rows_after_profile_join": 0,
                 "profile_join_drop_counts": drop_counts,
+                "score_threshold_effective": score_threshold,
+                "score_threshold_source": score_threshold_source,
+                "model_bundle_dir": model_bundle_dir.as_posix(),
             },
         }
         if args.output_json:
@@ -744,10 +1018,18 @@ def main() -> int:
     adt_lbl = _empirical_decile_labels(adt_vals, "adt")
     act_lbl = _empirical_decile_labels(act_vals, "activity")
     to_lbl = _empirical_decile_labels(to_vals, "to")
-    for i, row in enumerate(enriched):
-        row["adt_percentile_bucket"] = adt_lbl[i]
-        row["activity_percentile_bucket"] = act_lbl[i]
-        row["turnover_30d_percentile_bucket"] = to_lbl[i]
+    for row in enriched:
+        row["adt_percentile_bucket"] = "adt_unknown"
+        row["activity_percentile_bucket"] = "activity_unknown"
+        row["turnover_30d_percentile_bucket"] = "to_unknown"
+    for j, idx in enumerate(metric_ready_idx):
+        row = enriched[idx]
+        row["adt_percentile_bucket"] = adt_lbl[j]
+        row["activity_percentile_bucket"] = act_lbl[j]
+        row["turnover_30d_percentile_bucket"] = to_lbl[j]
+        row.pop("_metric_ready", None)
+    for row in enriched:
+        row.pop("_metric_ready", None)
 
     seg_dims = [
         "eval_date",
@@ -765,9 +1047,12 @@ def main() -> int:
 
     total_n = len(enriched)
     total_err = sum(int(x["error"]) for x in enriched)
-    dropped_total = sum(drop_counts.values())
+    dropped_total = int(drop_counts["missing_profile_for_canonical_id"])
     notes = list(eval_notes) + list(profile_notes)
     notes.append(f"profile_join_dropped_total:{dropped_total}")
+    notes.append(
+        "profile_rows_kept_with_unknown_buckets_when_profile_missing_or_active_days_non_positive"
+    )
     for k, v in drop_counts.items():
         notes.append(f"profile_join_drop_{k}:{v}")
     result = {
@@ -781,6 +1066,9 @@ def main() -> int:
             "backtest_predictions_parquet_used": str(bt_pred_path) if bt_pred_path is not None else "",
             "start_ts": str(args.start_ts),
             "end_ts": str(args.end_ts),
+            "score_threshold_effective": score_threshold,
+            "score_threshold_source": score_threshold_source,
+            "model_bundle_dir": model_bundle_dir.as_posix(),
         },
         "notes": notes,
         "segments": seg_out,
