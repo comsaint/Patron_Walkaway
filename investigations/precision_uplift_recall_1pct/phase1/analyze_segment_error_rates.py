@@ -645,17 +645,29 @@ def main() -> int:
     adt_vals: list[float] = []
     act_vals: list[float] = []
     to_vals: list[float] = []
+    drop_counts: dict[str, int] = {
+        "missing_profile_for_canonical_id": 0,
+        "profile_missing_required_field": 0,
+        "profile_non_numeric_field": 0,
+        "profile_active_days_non_positive": 0,
+    }
     for r in eval_rows:
         pr = profiles.get(r.canonical_id)
         if not isinstance(pr, dict):
+            drop_counts["missing_profile_for_canonical_id"] += 1
             continue
         try:
             ad = float(pr["active_days_30d"])
             theo = float(pr["theo_win_sum_30d"])
             to_v = float(pr["turnover_sum_30d"])
-        except (KeyError, TypeError, ValueError):
+        except KeyError:
+            drop_counts["profile_missing_required_field"] += 1
+            continue
+        except (TypeError, ValueError):
+            drop_counts["profile_non_numeric_field"] += 1
             continue
         if ad <= 0:
+            drop_counts["profile_active_days_non_positive"] += 1
             continue
         adt = theo / ad
         adt_vals.append(adt)
@@ -675,10 +687,16 @@ def main() -> int:
         )
 
     if not enriched:
+        dropped_total = sum(drop_counts.values())
         out = {
-            "notes": eval_notes + profile_notes + ["no_rows_after_profile_join"],
+            "notes": eval_notes + profile_notes + [f"profile_join_dropped_total:{dropped_total}", "no_rows_after_profile_join"],
             "segments": {},
-            "summary": {"source": source, "eval_rows_total": len(eval_rows)},
+            "summary": {
+                "source": source,
+                "eval_rows_total": len(eval_rows),
+                "rows_after_profile_join": 0,
+                "profile_join_drop_counts": drop_counts,
+            },
         }
         if args.output_json:
             Path(args.output_json).write_text(json.dumps(out, indent=2), encoding="utf-8")
@@ -709,17 +727,24 @@ def main() -> int:
 
     total_n = len(enriched)
     total_err = sum(int(x["error"]) for x in enriched)
+    dropped_total = sum(drop_counts.values())
+    notes = list(eval_notes) + list(profile_notes)
+    notes.append(f"profile_join_dropped_total:{dropped_total}")
+    for k, v in drop_counts.items():
+        notes.append(f"profile_join_drop_{k}:{v}")
     result = {
         "summary": {
             "eval_rows_total": len(eval_rows),
             "rows_after_profile_join": total_n,
+            "rows_dropped_after_profile_join": dropped_total,
+            "profile_join_drop_counts": drop_counts,
             "global_error_rate": (float(total_err) / float(total_n)) if total_n > 0 else None,
             "profile_source_used": source,
             "backtest_predictions_parquet_used": str(bt_pred_path) if bt_pred_path is not None else "",
             "start_ts": str(args.start_ts),
             "end_ts": str(args.end_ts),
         },
-        "notes": eval_notes + profile_notes,
+        "notes": notes,
         "segments": seg_out,
     }
 
