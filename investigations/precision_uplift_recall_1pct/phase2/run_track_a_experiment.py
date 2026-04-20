@@ -74,6 +74,7 @@ class VariantResult:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for Track A experiment execution."""
     parser = argparse.ArgumentParser(
         description=(
             "Run Phase 2 Track A experiments with optional existing baseline model and "
@@ -237,6 +238,7 @@ def precision_at_recall_target(
     y_score: np.ndarray,
     target_recall: float,
 ) -> float | None:
+    """Return max precision among points where recall reaches target."""
     if y_true.size == 0:
         return None
     positives = int(np.sum(y_true == 1))
@@ -251,6 +253,7 @@ def precision_at_recall_target(
 
 
 def calc_pr_auc(y_true: np.ndarray, y_score: np.ndarray) -> float | None:
+    """Compute PR-AUC safely, returning None for degenerate label sets."""
     positives = int(np.sum(y_true == 1))
     negatives = int(np.sum(y_true == 0))
     if positives == 0 or negatives == 0:
@@ -259,6 +262,7 @@ def calc_pr_auc(y_true: np.ndarray, y_score: np.ndarray) -> float | None:
 
 
 def build_lgbm_classifier(args: argparse.Namespace) -> lgb.LGBMClassifier:
+    """Build a baseline LightGBM classifier from CLI hyperparameters."""
     return lgb.LGBMClassifier(
         objective="binary",
         random_state=42,
@@ -272,6 +276,7 @@ def build_lgbm_classifier(args: argparse.Namespace) -> lgb.LGBMClassifier:
 
 
 def compute_base_sample_weights(y: np.ndarray) -> np.ndarray:
+    """Compute simple class-balance weights for binary labels."""
     # Keep behavior explicit and stable across script runs.
     pos_count = float(np.sum(y == 1))
     neg_count = float(np.sum(y == 0))
@@ -284,12 +289,14 @@ def compute_base_sample_weights(y: np.ndarray) -> np.ndarray:
 
 
 def train_baseline_model(X: pd.DataFrame, y: np.ndarray, args: argparse.Namespace) -> Any:
+    """Train baseline LightGBM model without extra mining logic."""
     model = build_lgbm_classifier(args)
     model.fit(X, y)
     return model
 
 
 def train_focal_like_model(X: pd.DataFrame, y: np.ndarray, args: argparse.Namespace) -> tuple[Any, np.ndarray]:
+    """Train a focal-like weighted model and return final weights."""
     base_weights = compute_base_sample_weights(y)
     warm_model = build_lgbm_classifier(args)
     warm_model.fit(X, y, sample_weight=base_weights)
@@ -312,6 +319,7 @@ def train_focal_like_model(X: pd.DataFrame, y: np.ndarray, args: argparse.Namesp
 
 
 def train_hard_negative_model(X: pd.DataFrame, y: np.ndarray, args: argparse.Namespace) -> Any:
+    """Train focal-like model then upweight high-score negatives."""
     focal_model, focal_weights = train_focal_like_model(X, y, args)
     p = focal_model.predict_proba(X)[:, 1]
     neg_mask = y == 0
@@ -335,6 +343,7 @@ def train_hard_negative_model(X: pd.DataFrame, y: np.ndarray, args: argparse.Nam
 
 
 def model_predict_proba_1(model: Any, X: pd.DataFrame) -> np.ndarray:
+    """Extract positive-class scores from model prediction outputs."""
     if hasattr(model, "predict_proba"):
         out = model.predict_proba(X)
         if isinstance(out, np.ndarray) and out.ndim == 2 and out.shape[1] >= 2:
@@ -355,6 +364,7 @@ def forward_purged_splits(
     purge_hours: float,
     min_fold_size: int,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build forward time splits with optional purge gap before validation."""
     if n_splits < 2:
         raise ValueError("cv_splits must be >= 2 for robust time validation.")
     order = np.argsort(ts.values.astype("datetime64[ns]"))
@@ -388,6 +398,7 @@ def forward_purged_splits(
 
 
 def safe_mean_std(series: list[float]) -> tuple[float | None, float | None]:
+    """Return mean/std for a numeric list with empty/single guards."""
     if not series:
         return None, None
     if len(series) == 1:
@@ -396,11 +407,13 @@ def safe_mean_std(series: list[float]) -> tuple[float | None, float | None]:
 
 
 def load_existing_model(path: Path) -> Any:
+    """Load a pickled model artifact from disk."""
     with path.open("rb") as f:
         return pickle.load(f)
 
 
 def parse_feature_cols(raw: str) -> list[str]:
+    """Parse comma-separated feature names into a clean list."""
     cols = [x.strip() for x in raw.split(",")]
     out = [x for x in cols if x]
     if not out:
@@ -409,6 +422,7 @@ def parse_feature_cols(raw: str) -> list[str]:
 
 
 def resolve_input_parquet_path(args: argparse.Namespace) -> Path:
+    """Resolve parquet source path from explicit path or local-parquet mode."""
     if args.use_local_parquet:
         chunk_dir = Path("trainer/.data/chunks")
         if not chunk_dir.exists():
@@ -435,6 +449,7 @@ def resolve_input_parquet_path(args: argparse.Namespace) -> Path:
 
 
 def _try_load_latest_model_manifest_path() -> Path | None:
+    """Try resolving model.pkl path from latest model manifest."""
     manifest = Path("out/models/_latest_model_manifest.json")
     if not manifest.exists():
         return None
@@ -465,6 +480,7 @@ def _try_load_latest_model_manifest_path() -> Path | None:
 
 
 def resolve_existing_model_path(raw_path: str | None) -> Path:
+    """Resolve existing baseline model path from CLI or auto-discovery."""
     if raw_path:
         p = Path(raw_path)
         if not p.exists():
@@ -494,6 +510,7 @@ def read_dataset(
     time_col: str,
     max_rows: int,
 ) -> pd.DataFrame:
+    """Load parquet data, normalize time column, and apply row cap."""
     df = pd.read_parquet(parquet_path, columns=use_cols)
     if df.empty:
         raise ValueError("Loaded parquet is empty.")
@@ -507,6 +524,7 @@ def read_dataset(
 
 
 def ensure_binary_labels(df: pd.DataFrame, label_col: str) -> np.ndarray:
+    """Validate label column is binary and return numpy int labels."""
     raw = pd.to_numeric(df[label_col], errors="coerce")
     mask = raw.isin([0, 1])
     if not bool(mask.all()):
@@ -515,6 +533,7 @@ def ensure_binary_labels(df: pd.DataFrame, label_col: str) -> np.ndarray:
 
 
 def infer_feature_cols_from_model(model: Any, available_cols: list[str]) -> list[str]:
+    """Infer feature columns from fitted model feature-name attributes."""
     names: list[str] = []
     for attr in ("feature_name_", "feature_names_in_"):
         val = getattr(model, attr, None)
@@ -537,6 +556,7 @@ def infer_feature_cols_from_parquet_schema(
     parquet_path: Path,
     excluded: set[str],
 ) -> list[str]:
+    """Infer numeric feature columns from parquet while excluding reserved fields."""
     # Read one row only for type-safe schema sniffing with low memory overhead.
     df0 = pd.read_parquet(parquet_path).head(1)
     candidates: list[str] = []
@@ -555,6 +575,7 @@ def infer_feature_cols_from_parquet_schema(
 
 
 def parquet_columns_fast(parquet_path: Path) -> list[str]:
+    """Read parquet column names via pyarrow schema with pandas fallback."""
     try:
         import pyarrow.parquet as pq  # local optional dependency
 
@@ -573,6 +594,7 @@ def run_variant_holdout(
     train_fn: TrainFn,
     target_recall: float,
 ) -> tuple[float | None, float | None]:
+    """Train a variant and evaluate holdout PAT@target recall and PR-AUC."""
     model = train_fn(train_X, train_y)
     holdout_scores = model_predict_proba_1(model, holdout_X)
     pat = precision_at_recall_target(holdout_y, holdout_scores, target_recall)
@@ -590,6 +612,7 @@ def run_cv_series(
     min_fold_size: int,
     target_recall: float,
 ) -> list[float]:
+    """Run forward/purged CV and return PAT@target recall series."""
     folds = forward_purged_splits(ts, n_splits, purge_hours, min_fold_size)
     scores: list[float] = []
     for train_idx, valid_idx in folds:
@@ -608,6 +631,7 @@ def run_cv_series(
 
 
 def variant_to_dict(v: VariantResult) -> dict[str, Any]:
+    """Convert VariantResult dataclass into serializable dict."""
     return asdict(v)
 
 
@@ -621,6 +645,7 @@ def write_markdown_report(
     std_gate_pp: float,
     variants: list[VariantResult],
 ) -> None:
+    """Write human-readable markdown summary for Track A experiment results."""
     def fmt(x: float | None, pct: bool = False) -> str:
         if x is None or (isinstance(x, float) and math.isnan(x)):
             return "n/a"
@@ -672,6 +697,7 @@ def write_markdown_report(
 
 
 def main() -> None:
+    """Run end-to-end Track A experiment flow from CLI arguments."""
     args = parse_args()
     parquet_path = resolve_input_parquet_path(args)
     existing_model: Any | None = None
