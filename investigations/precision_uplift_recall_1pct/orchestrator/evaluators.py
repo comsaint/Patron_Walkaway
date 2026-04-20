@@ -334,6 +334,32 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
 PHASE2_BACKTEST_PR1_KEY = "test_precision_at_recall_0.01"
 
 
+def extract_phase2_precision_at_recall_1pct_from_metrics_mapping(
+    metrics: Mapping[str, Any] | None,
+) -> float | None:
+    """Parse PAT@1% from backtest JSON or from trainer ``training_metrics.json``.
+
+    Trainer artifacts nest holdout metrics under ``rated``; shared / per-job
+    ``backtest_metrics.json`` uses ``model_default``. Tries those sections in
+    that order and returns the first finite float, else ``None``.
+    """
+    if not isinstance(metrics, Mapping):
+        return None
+    prk = PHASE2_BACKTEST_PR1_KEY
+    for section in ("model_default", "rated"):
+        block = metrics.get(section)
+        if not isinstance(block, Mapping):
+            continue
+        raw = block.get(prk)
+        if raw is None:
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _job_training_harvest_counts(bundle: Mapping[str, Any]) -> tuple[int, int]:
     """Return (row_count, found_count) from ``bundle['job_training_harvest']``."""
     jh = bundle.get("job_training_harvest")

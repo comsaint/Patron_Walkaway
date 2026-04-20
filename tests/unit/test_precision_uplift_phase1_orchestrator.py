@@ -1858,6 +1858,34 @@ def test_validate_phase2_training_metrics_ok_when_file_has_pat(tmp_path: Path) -
     assert ok and code is None and msg is None
 
 
+def test_validate_phase2_training_metrics_ok_when_pat_under_rated_only(
+    tmp_path: Path,
+) -> None:
+    """Trainer ``training_metrics.json`` nests holdout metrics under ``rated``."""
+    d = tmp_path / "logs" / "track_a" / "a0"
+    rel = d.relative_to(tmp_path).as_posix()
+    pr_key = evaluators.PHASE2_BACKTEST_PR1_KEY
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "training_metrics.json").write_text(
+        json.dumps({"rated": {pr_key: 0.7337, "label": "rated"}}),
+        encoding="utf-8",
+    )
+    bundle = {
+        "job_specs": [
+            {"track": "track_a", "exp_id": "a0", "logs_subdir_relative": rel},
+        ],
+        "trainer_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [{"track": "track_a", "exp_id": "a0", "ok": True}],
+        },
+    }
+    ok, code, msg = collectors.validate_phase2_training_metrics_after_trainer_jobs(
+        tmp_path, bundle
+    )
+    assert ok and code is None and msg is None
+
+
 def test_validate_phase2_training_metrics_missing_file_is_artifact_missing(
     tmp_path: Path,
 ) -> None:

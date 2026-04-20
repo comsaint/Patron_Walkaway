@@ -1023,17 +1023,10 @@ def run_phase2_trainer_jobs(
 def _preview_precision_at_recall_1pct_from_metrics(
     metrics: Mapping[str, Any],
 ) -> float | None:
-    """Read ``model_default.test_precision_at_recall_0.01`` from backtest_metrics-shaped JSON."""
-    md = metrics.get("model_default")
-    if not isinstance(md, Mapping):
-        return None
-    raw = md.get("test_precision_at_recall_0.01")
-    if raw is None:
-        return None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
+    """PAT@1% from ``backtest_metrics`` (``model_default``) or trainer metrics (``rated``)."""
+    return evaluators.extract_phase2_precision_at_recall_1pct_from_metrics_mapping(
+        metrics
+    )
 
 
 def _preview_precision_at_recall_1pct_series_from_metrics(
@@ -1186,8 +1179,8 @@ def run_phase2_per_job_backtests(
                     ok_sub = False
                     pr_key = evaluators.PHASE2_BACKTEST_PR1_KEY
                     load_err = (
-                        f"backtest_metrics lacks parseable model_default.{pr_key} "
-                        "(PAT@1% for observation window)"
+                        f"backtest_metrics lacks parseable {pr_key} "
+                        "(expected under model_default or rated; PAT@1% for observation window)"
                     )
                     ingest_error_code = "E_NO_DATA_WINDOW"
                     preview_series = None

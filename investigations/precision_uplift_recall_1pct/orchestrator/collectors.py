@@ -254,18 +254,8 @@ def harvest_phase2_job_training_metrics(
 
 
 def _phase2_training_metrics_pat_preview(obj: Mapping[str, Any]) -> float | None:
-    """Parse PAT@1% from a ``training_metrics.json``-shaped object (T10)."""
-    md = obj.get("model_default")
-    if not isinstance(md, Mapping):
-        return None
-    key = evaluators.PHASE2_BACKTEST_PR1_KEY
-    raw = md.get(key)
-    if raw is None:
-        return None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
+    """Parse PAT@1% from a ``training_metrics.json`` or backtest-shaped object (T10)."""
+    return evaluators.extract_phase2_precision_at_recall_1pct_from_metrics_mapping(obj)
 
 
 def validate_phase2_training_metrics_after_trainer_jobs(
@@ -276,8 +266,8 @@ def validate_phase2_training_metrics_after_trainer_jobs(
 
     When ``trainer_jobs.executed`` is true and ``all_ok`` is true, each ``job_specs`` row
     that has a matching successful trainer result must resolve to an on-disk
-    ``training_metrics.json`` (or YAML-hinted path) with a parseable
-    ``model_default.<PAT@1% key>`` (same key as shared backtest metrics). Missing file or
+    ``training_metrics.json`` (or YAML-hinted path) with a parseable PAT@1%
+    (``model_default.<key>`` or trainer ``rated.<key>``). Missing file or
     invalid JSON → ``E_ARTIFACT_MISSING``; readable JSON without PAT → ``E_NO_DATA_WINDOW``.
 
     Returns:
@@ -332,7 +322,8 @@ def validate_phase2_training_metrics_after_trainer_jobs(
             return (
                 False,
                 "E_NO_DATA_WINDOW",
-                f"{tr}/{eid}: training_metrics lacks parseable model_default.{prk} ({rel_disp})",
+                f"{tr}/{eid}: training_metrics lacks parseable {prk} "
+                f"(expected under model_default or rated) ({rel_disp})",
             )
     return True, None, None
 
