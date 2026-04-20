@@ -1442,14 +1442,30 @@ def main() -> int:
             metric_ready_idx.append(len(enriched) - 1)
 
     if not enriched:
-        dropped_total = sum(drop_counts.values())
+        # Rows excluded from ``enriched`` are only those with no merged profile (``continue``).
+        # Other ``drop_counts`` keys count issues on rows that would have been kept if any row
+        # reached ``enriched``; they must not be added into ``rows_dropped_after_profile_join``.
+        dropped_total = len(eval_rows) - len(enriched)
+        profile_quality_issue_eval_rows = int(
+            drop_counts["profile_active_days_non_positive"]
+            + drop_counts["profile_missing_required_field"]
+            + drop_counts["profile_non_numeric_field"]
+        )
         out = {
-            "notes": eval_notes + profile_notes + [f"profile_join_dropped_total:{dropped_total}", "no_rows_after_profile_join"],
+            "notes": eval_notes
+            + profile_notes
+            + [
+                f"profile_join_dropped_total:{dropped_total}",
+                f"profile_join_quality_issue_eval_rows:{profile_quality_issue_eval_rows}",
+                "no_rows_after_profile_join",
+            ],
             "segments": {},
             "summary": {
                 "source": source,
                 "eval_rows_total": len(eval_rows),
                 "rows_after_profile_join": 0,
+                "rows_dropped_after_profile_join": dropped_total,
+                "profile_join_quality_issue_eval_rows": profile_quality_issue_eval_rows,
                 "profile_join_drop_counts": drop_counts,
                 "score_threshold_effective": score_threshold,
                 "score_threshold_source": score_threshold_source,
@@ -1540,9 +1556,16 @@ def main() -> int:
 
     total_n = len(enriched)
     total_err = sum(int(x["error"]) for x in enriched)
-    dropped_total = int(drop_counts["missing_profile_for_canonical_id"])
+    # True "drops": eval rows never appended (no merged profile). Equals missing_profile counter.
+    dropped_total = len(eval_rows) - total_n
+    profile_quality_issue_eval_rows = int(
+        drop_counts["profile_active_days_non_positive"]
+        + drop_counts["profile_missing_required_field"]
+        + drop_counts["profile_non_numeric_field"]
+    )
     notes = list(eval_notes) + list(profile_notes)
     notes.append(f"profile_join_dropped_total:{dropped_total}")
+    notes.append(f"profile_join_quality_issue_eval_rows:{profile_quality_issue_eval_rows}")
     notes.append(
         "profile_rows_kept_with_unknown_buckets_when_profile_missing_or_active_days_non_positive"
     )
@@ -1553,6 +1576,7 @@ def main() -> int:
             "eval_rows_total": len(eval_rows),
             "rows_after_profile_join": total_n,
             "rows_dropped_after_profile_join": dropped_total,
+            "profile_join_quality_issue_eval_rows": profile_quality_issue_eval_rows,
             "profile_join_drop_counts": drop_counts,
             "global_error_rate": (float(total_err) / float(total_n)) if total_n > 0 else None,
             "profile_source_used": source,
