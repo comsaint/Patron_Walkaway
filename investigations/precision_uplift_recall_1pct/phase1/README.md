@@ -32,10 +32,16 @@
 
 `python investigations/precision_uplift_recall_1pct/phase1/analyze_segment_error_rates.py --prediction-log-db <path> --state-db <path> --start-ts <ISO> --end-ts <ISO> --output-json investigations/precision_uplift_recall_1pct/phase1/segment_error_rates.json`
 
+若你已先完成 backtest，也可直接用 backtest 輸出的 `backtest_predictions.parquet`（推薦）：
+
+`python investigations/precision_uplift_recall_1pct/phase1/analyze_segment_error_rates.py --backtest-predictions-parquet <backtest_predictions.parquet> --start-ts <ISO> --end-ts <ISO> --output-json investigations/precision_uplift_recall_1pct/phase1/segment_error_rates.json`
+
 資料源優先序固定為：
 1. `prediction_log + state_db`（primary）
 2. `--profile-parquet-path`（僅當 profile segment 欄位在 state_db 不可用時；若未提供，會自動嘗試 `data/player_profile.parquet`）
 3. `--use-clickhouse-fallback`（僅當前兩者仍不可用時）
+
+> 若使用 `--backtest-predictions-parquet`，腳本會先用該檔內已存在之評估列與 profile 欄位；缺欄時才回退到上述來源鏈。
 
 此腳本為 ad-hoc 分析用途，不做 Gate 決策。
 

@@ -223,6 +223,155 @@ def _load_eval_rows(
     return out, notes
 
 
+def _load_eval_rows_from_backtest_parquet(
+    parquet_path: Path,
+    *,
+    start_ts: str,
+    end_ts: str,
+    max_rows: int,
+    score_threshold: float,
+) -> tuple[list[EvalRow], list[str], list[dict[str, Any]]]:
+    """Load eval rows directly from backtest predictions parquet.
+
+    Returns:
+      (eval_rows, notes, profile_rows)
+    """
+    notes: list[str] = []
+    out: list[EvalRow] = []
+    profile_rows: list[dict[str, Any]] = []
+    if not parquet_path.is_file():
+        return out, ["backtest_predictions_parquet_not_found"], profile_rows
+    try:
+        import duckdb  # type: ignore
+    except Exception:
+        return out, ["duckdb_unavailable_for_backtest_predictions"], profile_rows
+
+    start_dt = _parse_iso(start_ts)
+    end_dt = _parse_iso(end_ts)
+    if start_dt is None or end_dt is None:
+        return out, ["backtest_window_ts_unparseable"], profile_rows
+    try:
+        con = duckdb.connect(":memory:")
+        cols = {
+            str(r[0])
+            for r in con.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?)",
+                [str(parquet_path)],
+            ).fetchall()
+        }
+        if "canonical_id" not in cols or "label" not in cols:
+            con.close()
+            return out, ["backtest_predictions_missing_canonical_or_label"], profile_rows
+        ts_col = "scored_at" if "scored_at" in cols else ("payout_complete_dtm" if "payout_complete_dtm" in cols else "")
+        if not ts_col:
+            con.close()
+            return out, ["backtest_predictions_missing_time_col"], profile_rows
+        has_table_id = "table_id" in cols
+        has_alert = "is_alert" in cols
+        has_score = "score" in cols
+        has_bet_id = "bet_id" in cols
+        select_cols = "canonical_id, label, " + ts_col
+        if has_table_id:
+            select_cols += ", table_id"
+        if has_alert:
+            select_cols += ", is_alert"
+        if has_score:
+            select_cols += ", score"
+        if has_bet_id:
+            select_cols += ", bet_id"
+        # pull profile fields if present in backtest output
+        pf_present = [c for c in PROFILE_FIELDS if c in cols]
+        if pf_present:
+            select_cols += ", " + ", ".join(pf_present)
+        sql = (
+            f"SELECT {select_cols} FROM read_parquet(?) "
+            f"WHERE {ts_col} >= ? AND {ts_col} < ? "
+            f"ORDER BY {ts_col} ASC LIMIT ?"
+        )
+        rows = con.execute(
+            sql,
+            [str(parquet_path), start_ts, end_ts, max_rows + 1],
+        ).fetchall()
+        con.close()
+    except Exception:
+        return out, ["backtest_predictions_query_failed"], profile_rows
+
+    if len(rows) > max_rows:
+        rows = rows[:max_rows]
+        notes.append(f"eval_rows_truncated_at:{max_rows}")
+
+    for r in rows:
+        i = 0
+        cid = str(r[i] or "").strip()
+        i += 1
+        try:
+            label = int(r[i])
+        except (TypeError, ValueError):
+            continue
+        i += 1
+        ts_raw = str(r[i] or "").strip()
+        i += 1
+        table_id = str(r[i] or "").strip() if has_table_id else ""
+        i += 1 if has_table_id else 0
+        raw_alert = r[i] if has_alert else None
+        i += 1 if has_alert else 0
+        raw_score = r[i] if has_score else None
+        i += 1 if has_score else 0
+        bet_id = str(r[i] or "").strip() if has_bet_id else ""
+        i += 1 if has_bet_id else 0
+        if not cid or not ts_raw:
+            continue
+        if raw_alert is None:
+            try:
+                is_alert = 1 if float(raw_score) >= score_threshold else 0
+            except (TypeError, ValueError):
+                is_alert = 0
+        else:
+            try:
+                is_alert = 1 if int(raw_alert) == 1 else 0
+            except (TypeError, ValueError):
+                is_alert = 0
+        out.append(
+            EvalRow(
+                bet_id=bet_id or f"{cid}:{ts_raw}",
+                canonical_id=cid,
+                scored_at=ts_raw,
+                table_id=table_id or "UNKNOWN_TABLE",
+                is_alert=is_alert,
+                label=label,
+            )
+        )
+        if pf_present:
+            prow: dict[str, Any] = {"canonical_id": cid}
+            for j, c in enumerate(pf_present):
+                prow[c] = r[i + j]
+            profile_rows.append(prow)
+    return out, notes, profile_rows
+
+
+def _profiles_from_backtest_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        cid = str(r.get("canonical_id") or "").strip()
+        if not cid:
+            continue
+        cur = out.get(cid)
+        if cur is None:
+            cur = {}
+            out[cid] = cur
+        for f in PROFILE_FIELDS:
+            v = r.get(f)
+            if v is None:
+                continue
+            cur[f] = v
+    # keep only complete profile rows
+    ready: dict[str, dict[str, Any]] = {}
+    for cid, pr in out.items():
+        if all(k in pr for k in PROFILE_FIELDS):
+            ready[cid] = pr
+    return ready
+
+
 def _load_profiles_from_state_db(state_db: Path, cids: list[str], table: str) -> tuple[dict[str, dict[str, Any]], list[str]]:
     notes: list[str] = []
     out: dict[str, dict[str, Any]] = {}
@@ -393,8 +542,9 @@ def _aggregate_segment_error(rows: list[dict[str, Any]], key: str) -> list[dict[
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Ad-hoc by-segment error-rate analysis from prediction_log/state_db.")
-    p.add_argument("--prediction-log-db", required=True)
-    p.add_argument("--state-db", required=True)
+    p.add_argument("--prediction-log-db", default="")
+    p.add_argument("--state-db", default="")
+    p.add_argument("--backtest-predictions-parquet", default="")
     p.add_argument("--start-ts", required=True)
     p.add_argument("--end-ts", required=True)
     p.add_argument("--output-json", default="")
@@ -408,16 +558,42 @@ def main() -> int:
     p.add_argument("--min-segment-n", type=int, default=30)
     args = p.parse_args()
 
-    pred_db = Path(args.prediction_log_db)
-    state_db = Path(args.state_db)
-    eval_rows, eval_notes = _load_eval_rows(
-        pred_db,
-        state_db,
-        start_ts=str(args.start_ts),
-        end_ts=str(args.end_ts),
-        max_rows=max(1, int(args.max_rows)),
-        score_threshold=float(args.score_threshold),
-    )
+    pred_db = Path(str(args.prediction_log_db).strip()) if str(args.prediction_log_db).strip() else Path()
+    state_db = Path(str(args.state_db).strip()) if str(args.state_db).strip() else Path()
+    bt_pred_path = Path(str(args.backtest_predictions_parquet).strip()) if str(args.backtest_predictions_parquet).strip() else None
+    embedded_profile_rows: list[dict[str, Any]] = []
+    if bt_pred_path is not None:
+        eval_rows, eval_notes, embedded_profile_rows = _load_eval_rows_from_backtest_parquet(
+            bt_pred_path,
+            start_ts=str(args.start_ts),
+            end_ts=str(args.end_ts),
+            max_rows=max(1, int(args.max_rows)),
+            score_threshold=float(args.score_threshold),
+        )
+        eval_notes.append("eval_source:backtest_predictions_parquet")
+    else:
+        if not str(args.prediction_log_db).strip() or not str(args.state_db).strip():
+            out = {
+                "notes": [
+                    "missing_required_inputs",
+                    "require --backtest-predictions-parquet OR both --prediction-log-db and --state-db",
+                ],
+                "segments": {},
+                "summary": {},
+            }
+            if args.output_json:
+                Path(args.output_json).write_text(json.dumps(out, indent=2), encoding="utf-8")
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return 2
+        eval_rows, eval_notes = _load_eval_rows(
+            pred_db,
+            state_db,
+            start_ts=str(args.start_ts),
+            end_ts=str(args.end_ts),
+            max_rows=max(1, int(args.max_rows)),
+            score_threshold=float(args.score_threshold),
+        )
+        eval_notes.append("eval_source:prediction_log_state_db")
     if not eval_rows:
         out = {"notes": eval_notes + ["no_eval_rows"], "segments": {}, "summary": {}}
         if args.output_json:
@@ -426,10 +602,13 @@ def main() -> int:
         return 2
 
     cids = [r.canonical_id for r in eval_rows]
-    profiles, profile_notes = _load_profiles_from_state_db(
-        state_db, cids, str(args.profile_table)
-    )
-    source = "state_db"
+    profiles = _profiles_from_backtest_rows(embedded_profile_rows)
+    profile_notes: list[str] = []
+    source = "backtest_predictions_parquet_embedded" if profiles else "state_db"
+    if not profiles:
+        profiles, profile_notes = _load_profiles_from_state_db(
+            state_db, cids, str(args.profile_table)
+        )
 
     # Fallback trigger: no profiles OR state_db profile schema is insufficient.
     need_profile_fallback = (not profiles) or _has_note_prefix(
@@ -536,6 +715,7 @@ def main() -> int:
             "rows_after_profile_join": total_n,
             "global_error_rate": (float(total_err) / float(total_n)) if total_n > 0 else None,
             "profile_source_used": source,
+            "backtest_predictions_parquet_used": str(bt_pred_path) if bt_pred_path is not None else "",
             "start_ts": str(args.start_ts),
             "end_ts": str(args.end_ts),
         },
