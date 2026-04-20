@@ -13,7 +13,7 @@
 - **上限重現**：在**固定契約**下重跑 baseline／backtest，確認既有結論可重現，避免單窗幻覺。
 - **線上蒐證**（若適用）：搭配 scorer／validator、`run_r1_r6_analysis` 等，補足 production 側證據。
 
-調查過程須與總計畫一致：`.cursor/plans/PLAN_precision_uplift_sprint.md` 與上層 `PRECISION_UPLIFT_R1PCT_SSOT.md`。
+調查過程須與總計畫一致：`.cursor/plans/PLAN_precision_uplift_sprint.md`（單一 SSOT，含 §7 切片與 §8–§12 治理）。
 
 ## 預期產出（應填寫檔案）
 
@@ -25,6 +25,19 @@
 | `point_in_time_parity_check.md` | 時點／leakage 檢查結論 |
 | `upper_bound_repro.md` | baseline／上限重現紀錄 |
 | `phase1_gate_decision.md` | Phase 1 Gate 與主因排序 |
+
+## Ad-hoc 快速切片腳本
+
+你若只想快速回答「哪些 segment 錯誤率高」，可直接跑：
+
+`python investigations/precision_uplift_recall_1pct/phase1/analyze_segment_error_rates.py --prediction-log-db <path> --state-db <path> --start-ts <ISO> --end-ts <ISO> --output-json investigations/precision_uplift_recall_1pct/phase1/segment_error_rates.json`
+
+資料源優先序固定為：
+1. `prediction_log + state_db`（primary）
+2. `--profile-parquet-path`（僅當 profile segment 欄位在 state_db 不可用時）
+3. `--use-clickhouse-fallback`（僅當前兩者仍不可用時）
+
+此腳本為 ad-hoc 分析用途，不做 Gate 決策。
 
 ## 可依此做出的決策
 

@@ -1,5 +1,66 @@
 **Archive**: Past rounds and older STATUS blocks are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60, 67 Review–75 moved 2026-03-05; Rounds 79–99 moved 2026-03-05; Round 96 onward moved 2026-03-12; **2026-03-22**: Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等長段 → archive.)
 
+## precision_uplift_recall_1pct — W1-B2 `slice_contract` MVP（2026-04-20）`/cycle_code`
+
+**對齊**：`.cursor/plans/PLAN.md`（索引）、`DECISION_LOG.md`（無新增 DEC）；實作依 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md`（W1-B2 第一優先）與 `PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` W1-B2。
+
+### STEP 1 — Builder ✅
+
+| 檔案 | 說明 |
+|------|------|
+| [`investigations/precision_uplift_recall_1pct/orchestrator/slice_contract.py`](../../investigations/precision_uplift_recall_1pct/orchestrator/slice_contract.py) | **新增**：PLAN §7 之 `eval_date`（HKT）、tenure 桶、profile assertion、`slice_data_incomplete`／`slice_contract_violations`、六維 marginal 之 `top_drag_slices`（由內嵌 `eval_rows`+`profiles` 計算） |
+| [`investigations/precision_uplift_recall_1pct/orchestrator/collectors.py`](../../investigations/precision_uplift_recall_1pct/orchestrator/collectors.py) | **擴充**：`collect_phase1_artifacts` 若 `cfg["slice_contract"]` 含 `eval_rows` 則併入 `bundle["slice_contract"]`；例外 → `E_COLLECT_SLICE_CONTRACT` + stub bundle |
+| [`investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py`](../../investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py) | **`slice_performance_report.md`** 新增「## slice_contract」JSON 區塊（有 bundle 時） |
+| [`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`](../../investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md) | W1-B2 勾選「純計算 + 內嵌 spec MVP」；更新快照日期 |
+| [`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md`](../../investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md) | W1-B2 狀態 **⬜→🟡**；§1.2／§4.1 敘述同步 |
+
+**手動驗證**：在 Phase 1 YAML（或測試 cfg）加入 `slice_contract: { T0, eval_rows, profiles, recall_score_threshold }`，跑 `collect_phase1_artifacts` 後檢查 `collect_bundle.json` 內 `slice_contract.top_drag_slices`；再跑 `write_phase1_reports` 確認 `slice_performance_report.md` 出現 `## slice_contract`。
+
+**下一輪建議**（首輪後已部分完成者見下方「W1-B2 續」）：由 R1／backtest 產物自動組 `eval_rows`；T0 as-of **player_profile** Parquet join。
+
+### STEP 2 — Reviewer ✅
+
+| 風險 | 說明與建議 | 建議測試 |
+|------|------------|----------|
+| **R1** | 內嵌 spec 之 **decile** 用 midrank 近似，與 pandas `qcut` 在極端重複值時可能不完全一致；若與 DS 報表對拍有落差，需在 SSOT 或實作註明「契約實作版本」。 | 與固定種子 CSV 做 golden snapshot（後續） |
+| **R2** | `tenure_bucket` 缺失時以 `UNKNOWN_TENURE` 仍進聚合，可能掩蓋資料問題；建議後續改為 **排除該列** 或獨立 bucket。 | 單測：`days_since_first_session` NULL → incomplete（已有 `tenure_bucket_unavailable`） |
+| **R3** | `precision_at_target_recall` 在 slice 上為 **alert 條件下** tp/(tp+fp)，與 R1 全域 PAT@1% 操作點需一致；目前 threshold 來自 config `recall_score_threshold` 預設 0.5，**非**由 R1 動態阈自動帶入。 | 接線後：由 R1 `threshold_at_recall_target` 注入 spec |
+| **R4** | Collector 對 `slice_contract` 例外採 **廣捕** → 仍寫 stub；避免 silent pass，但訊息需可讀。 | 已覆蓋：inject 壞 spec（可選） |
+| **R5** | 大量 `eval_rows` 全 in-memory；筆電上應走 **Parquet 分塊** 或限制列數。 | 效能測：N=1e5（後續） |
+
+### STEP 3 — Tester ✅
+
+**新增**：[`tests/unit/test_slice_contract_w1b2.py`](../../tests/unit/test_slice_contract_w1b2.py)（bundle happy path、缺 profile、active_days=0、tenure 邊界、`eval_date` naive HK、`collect_phase1_artifacts` 合併 slice_contract）
+
+**執行**：
+
+```bash
+python -m pytest tests/unit/test_slice_contract_w1b2.py tests/unit/test_precision_uplift_phase1_orchestrator.py -k collect_phase1 -q
+```
+
+### STEP 4 — Tester（修實作至綠）✅
+
+- **pytest**：`tests/unit/test_slice_contract_w1b2.py` → **12 passed**；`-k collect_phase1` → **6 passed**；`test_write_phase1_reports_writes_six_markdown_files` → **1 passed**。
+- **ruff**：`slice_contract.py` / `collectors.py` / `test_slice_contract_w1b2.py` → **All checks passed**。
+
+**計畫下一項建議**（W1-B2 剩餘）：真實 **eval 列 + player_profile** join；`slice_contract_version` 與 PLAN 段落 hash；W1-B4 PIT `window_timezone_mismatch_count`（可並行排程）。
+
+### W1-B2 續：Phase 1 gate + `slice_performance.json`（2026-04-20）
+
+| 檔案 | 說明 |
+|------|------|
+| [`investigations/.../orchestrator/evaluators.py`](../../investigations/precision_uplift_recall_1pct/orchestrator/evaluators.py) | **`evaluate_phase1_gate`**：`slice_data_incomplete` → `blocking_reasons`（預設 PRELIMINARY，可 FAIL）；**`slice_contract:asof_contract_unavailable_strict` 強制 FAIL**；**`extract_threshold_at_target_recall`**（R1）；**`extract_threshold_at_recall_0_01_from_backtest_metrics`**（`model_default`／`rated`） |
+| [`investigations/.../orchestrator/report_builder.py`](../../investigations/precision_uplift_recall_1pct/orchestrator/report_builder.py) | bundle 含 **`slice_contract`** 鍵時寫 **`phase1/slice_performance.json`**（與 md 並存） |
+| [`investigations/.../orchestrator/collectors.py`](../../investigations/precision_uplift_recall_1pct/orchestrator/collectors.py)（續） | 內嵌 `slice_contract` 且 **未**設定 `recall_score_threshold` 時：**R1** `threshold_at_target` → 否則 **backtest_metrics** `threshold_at_recall_0.01`；另支援 `auto_eval_rows_from_prediction_log=true`（SQLite：rated + finalized label）與 `auto_profiles_from_state_db=true`（state_db primary；不可行時 `profile_parquet_path` Parquet fallback；仍失敗且 `auto_profiles_from_clickhouse=true` 時走 ClickHouse fallback） |
+| [`tests/unit/test_precision_uplift_phase1_orchestrator.py`](../../tests/unit/test_precision_uplift_phase1_orchestrator.py) | `_gate_bundle(..., slice_contract=…)`；`test_gate_preliminary_when_slice_contract_incomplete`、`test_gate_fail_when_slice_incomplete_status_fail`、`test_gate_fail_when_slice_asof_contract_unavailable_strict`、`test_write_phase1_reports_emits_slice_performance_json_when_slice_contract_present`；**`test_extract_threshold_at_target_recall_reads_unified_and_evaluate`** |
+| [`tests/unit/test_slice_contract_w1b2.py`](../../tests/unit/test_slice_contract_w1b2.py)（續） | **`test_collect_phase1_injects_recall_threshold_from_r1_when_omitted`**、**`test_collect_phase1_inline_recall_threshold_overrides_r1`**、**`test_collect_phase1_auto_eval_rows_from_prediction_log_sqlite`**、**`test_collect_phase1_auto_profiles_from_state_db_sqlite`**、**`test_collect_phase1_auto_profiles_missing_asof_strict_marks_incomplete`**、**`test_collect_phase1_auto_profiles_prefers_asof_row_at_or_before_t0`**、**`test_collect_phase1_profiles_fallback_to_parquet_when_state_db_infeasible`**、**`test_collect_phase1_profiles_fallback_to_clickhouse_when_state_db_and_parquet_fail`** |
+
+**pytest**（續）：`test_gate_pass_when_gate_thresholds_and_pat_aligned`、`test_gate_preliminary_when_slice_contract_incomplete`、`test_gate_fail_when_slice_incomplete_status_fail`、`test_gate_fail_when_slice_asof_contract_unavailable_strict`、`test_write_phase1_reports_emits_slice_performance_json_when_slice_contract_present`、`test_write_phase1_reports_writes_six_markdown_files`；`tests/unit/test_slice_contract_w1b2.py` 全檔 → **22 passed**（含 R1／backtest 阈注入、`auto_eval_rows_from_prediction_log`、`auto_profiles_from_state_db`、`as_of_ts<=T0`、STRICT asof fail、Parquet + ClickHouse fallback dispatcher）。本輪實跑：`test_slice_contract_w1b2.py` + strict gate case → **23 passed**；`ruff` 相關檔 → **All checks passed**。
+
+**下一項（仍屬 W1-B2）**：補 `slice_contract_version` 與 PLAN 段落 hash，並將 STRICT/WARN_ONLY 策略寫入 runbook 的操作準則（含預設值與例外流程）。
+
+---
+
 ## trainer — `model_metadata.json` + MLflow split 邊界（2026-04-18）
 
 **對齊**：Step 7 完成後以 row-level 資料（記憶體 DataFrame 或 DuckDB 讀 split Parquet）彙總 train/valid/test 之 `payout_complete_dtm` 界與列數／正負樣本數；artifact bundle 新增 **`model_metadata.json`**（`schema_version: v1`）；Phase 2 provenance 可選寫入 `model_metadata_path`／`split_train_*` 等字串 params。詳見 [`doc/phase2_provenance_schema.md`](../../doc/phase2_provenance_schema.md)。
@@ -209,7 +270,7 @@ python -m baseline_models smoke --config baseline_models/config/baseline_default
 
 **下一輪建議**：STEP 2 code review；STEP 3 單元測試；STEP 4 修到 pytest／ruff 綠。
 
-**文件路徑更新（2026-04-18）**：舊檔 **`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`** 已由 **`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`** 承接（與 **`PRECISION_UPLIFT_R1PCT_SSOT.md`** 文件角色表一致）；本檔歷史段落中凡指涉 MVP tasklist 之路徑已改寫。
+**文件路徑更新（2026-04-18）**：舊檔 **`PRECISION_UPLIFT_R1PCT_MVP_TASKLIST.md`** 已由 **`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`** 承接；原 **`PRECISION_UPLIFT_R1PCT_SSOT.md`** 已於 **2026-04-20** 併入 **`.cursor/plans/PLAN_precision_uplift_sprint.md` §8–§12**（單一 SSOT）。本檔歷史段落中凡指涉 MVP tasklist 之路徑已改寫。
 
 ### STEP 2 — Reviewer（2026-04-18）
 
@@ -7323,4 +7384,50 @@ python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "tes
 - `tests/unit/test_precision_uplift_phase1_orchestrator.py`：`extra_writable` / artifacts 鍵名更新；全檔 `179 passed`。
 
 ✅ 完成
+
+
+---
+
+## Precision uplift Phase 1 W1-B1：`status_history_registry` + crosscheck JSON + Gate（2026-04-20，`/cycle_code`）
+
+**對齊計畫**：`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` §4.1 W1-B1。
+
+### STEP 1 — Builder
+
+| 檔案 | 說明 |
+|------|------|
+| `investigations/precision_uplift_recall_1pct/phase1/status_history_registry.yaml` | 新增 registry（預設範本列不阻擋 Gate）。 |
+| `.../orchestrator/collectors.py` | `collect_status_history_crosscheck`、bundle `status_history_crosscheck`；STATUS 掃描前綴 256KiB；registry YAML 錯誤 → `E_COLLECT_STATUS_HISTORY_REGISTRY`。 |
+| `.../orchestrator/evaluators.py` | Gate：未解除 `blocks_phase1_decision` → FAIL；metrics `status_history_unresolved_blocker_count`。 |
+| `.../orchestrator/report_builder.py` | `status_history_crosscheck.json`；md orchestrator 區塊摘要。 |
+| `tests/unit/test_precision_uplift_phase1_orchestrator.py` | `write_phase1_reports` 產物數 6→7（+json）。 |
+| `.cursor/plans/DECISION_LOG.md` | DEC-041。 |
+
+**手動驗證**：跑 phase1 後檢查 `reports/phase1/status_history_crosscheck.json`；registry 設 deferred+block 應 FAIL。
+
+**下一輪建議**：W1-B2 `slice_contract`；本條目後續 STEP 2–4 見追加。
+
+### STEP 2 — Reviewer（2026-04-20）
+
+| 風險 | 說明與建議 | 建議測試 |
+|------|------------|----------|
+| **R1** | `resolution_status` 大小寫／別名（如 `pending`）若未正規化，可能誤判為非 open/deferred 而漏擋。建議文件明列允許列舉，必要時程式 `strip().lower()` 後白名單。 | 單測：`DEFERRED`／`Deferred` 是否觸發 blocker |
+| **R2** | Registry 檔缺失僅 `registry_load_error` 字串、不進 `errors` → Gate 仍可能 PASS；若產品要求「必須有 registry」需另設 strict 模式。 | 單測：缺檔時 `errors` 不含 E_COLLECT、gate 仍可走；可選第二測試 strict flag |
+| **R3** | STATUS 僅掃前綴：若關鍵議題只在檔案後段，keyword_hits 假陰性；需靠 `status_md_scan_truncated` 與人工區段。 | 單測：大檔截斷旗標；文件註記「最新內容應置於檔案前部」 |
+| **R4** | `collect_status_history_crosscheck` 在 `collect_phase1_artifacts` 末尾呼叫並可追加 `errors`，與 bundle 內 `errors` 為同一 list 參照 — 行為正確但依賴呼叫順序；未來若重排易漏。 | 單測：壞 YAML 後 `bundle["errors"]` 含 registry code |
+| **R5** | `issue_id` 重複或空列：目前跳過空 `issue_id`；重複 id 可能重複 blocking_reasons。 | 單測：兩列同 id 時 reasons 去重或接受重複（文件化） |
+
+### STEP 3 — Tester（新增測試）
+
+- 見 `tests/unit/test_precision_uplift_phase1_orchestrator.py` 內 **`TestStatusHistoryCrosscheckW1B1`**：bundle 未解除 blocker → gate FAIL、壞 registry YAML、`status_history_crosscheck.json` 產物、`collect_summary` 計數、registry `Deferred` 經 collector 進 `unresolved_blockers`。
+- 執行：`python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k TestStatusHistoryCrosscheckW1B1 -q`
+
+### STEP 4 — Tester（修實作至綠）
+
+- `python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -q` → **245 passed**（2026-04-20）。
+- `ruff check`（已變更之 orchestrator 檔）→ **All checks passed**。
+
+**計畫下一項建議**（對齊 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` Phase 1 Week 1）：**W1-B2** 切片契約（T0 as-of profile、六類 marginal、`top_drag_slices`、`slice_data_incomplete`）；可並行補強 **W1-B3** 標籤品質判定之 collector／報表欄位。
+
+✅ 全部完成，CYCLE 結束
 

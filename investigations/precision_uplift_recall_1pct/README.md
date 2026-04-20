@@ -9,8 +9,7 @@
 
 ## 先看哪些文件
 
-- 全 repo 衝刺計畫：`.cursor/plans/PLAN_precision_uplift_sprint.md`
-- 本調查專案契約與能力邊界（SSOT）：`PRECISION_UPLIFT_R1PCT_SSOT.md`
+- **單一 SSOT（衝刺 + 調查契約）**：`.cursor/plans/PLAN_precision_uplift_sprint.md`（§1 目標與路線、§7 `slice_contract`、§8–§12 文件分工／能力邊界／Gate）
 - 專案推進節奏與階段進退（Execution Plan）：`PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md`
 - 工程任務與 DoD（Implementation Plan）：`PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`
 - Orchestrator 操作與排障（Runbook）：`PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md`
@@ -62,7 +61,7 @@
 | **3** | 在勝者身上加深特徵與融合，並把高分段壓實。 |
 | **4** | 凍結後全面驗收，用營運與風險語言決定上不上線。 |
 
-正式欄位與 Gate 仍以 `.cursor/plans/PLAN_precision_uplift_sprint.md` 與本目錄 `PRECISION_UPLIFT_R1PCT_SSOT.md` 為準；本節為高階詮釋。
+正式欄位與 Gate 以 **`.cursor/plans/PLAN_precision_uplift_sprint.md`**（全文單一 SSOT）為準；本節為高階詮釋。
 
 ### 四階段詳解（補充：內容、依賴與為何可能有效）
 
@@ -105,7 +104,7 @@
 
 ## 要怎麼做（照順序）
 
-1. 先打開 `PRECISION_UPLIFT_R1PCT_SSOT.md` 確認現況能力邊界；依 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` 推進當前 Phase。
+1. 先打開 `.cursor/plans/PLAN_precision_uplift_sprint.md`（尤其 **§10** 現況能力、**§11** Gate）確認邊界；依 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` 推進當前 Phase。
 2. 進入對應 `phaseX/` 目錄，依 checklist 填寫該階段所有工件。
 3. 工程狀態與 DoD 勾選請更新 `PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`；里程碑敘述可寫入 sprint 計畫或本目錄 results／reports。
 4. 每週做一次 checkpoint：更新主指標、切片排名、保留/淘汰決策。

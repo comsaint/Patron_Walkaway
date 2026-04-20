@@ -41,3 +41,18 @@ checkpoints:
   # ratio_midpoints_enabled: false   # optional: only use wallclock_offsets_hours
   # wallclock_offsets_hours: [6, 24]  # e.g. t+6h / t+24h from window.start_ts
   # midpoint_ratios: [0.25, 0.5]
+
+# Optional W1-B2 slice_contract collector policy
+# (primary data source is state_db; Parquet/ClickHouse fallback when state_db is infeasible):
+# slice_contract:
+#   T0: "2026-04-17T00:00:00+08:00"
+#   auto_eval_rows_from_prediction_log: true
+#   auto_profiles_from_state_db: true
+#   profile_table: player_profile
+#   profile_parquet_path: data/player_profile.parquet
+#   auto_profiles_from_clickhouse: true
+#   # clickhouse_source_db: GDP_GMWDS_Raw
+#   # clickhouse_profile_table: player_profile
+#   # asof_mode: STRICT  # STRICT => missing as_of evidence marks slice_data_incomplete and gate FAIL
+#   # slice_contract_version: plan7-sha256:manual-override  # optional override; default auto from PLAN §7 hash
+#   # auto_eval_rows_limit: 100000

@@ -1,14 +1,15 @@
 # Precision Uplift R1PCT Implementation Plan
 
 > 角色：工程實作計畫（Implementation Plan）。  
-> 來源契約：名詞、能力現況、治理規則以 `PRECISION_UPLIFT_R1PCT_SSOT.md`（SSOT）為準。  
+> 來源契約：名詞、能力現況、治理與 Gate 以 **`../../.cursor/plans/PLAN_precision_uplift_sprint.md` §8–§12** 為準（與 §1 衝刺目標、§7 `slice_contract` 同檔單一 SSOT）。  
+> **Phase 1 錯誤切片（`slice_contract`）**：分段定義之單一真相見 **`../../.cursor/plans/PLAN_precision_uplift_sprint.md` §7**；W1-B2 實作須逐條對齊該節。  
 > 原則：本文件只管「要做什麼、做到哪裡、完成定義是什麼」。
 
 ---
 
 ## 1. 版本與狀態快照
 
-- 最後更新：`2026-04-17`
+- 最後更新：`2026-04-20`（W1-B2：`slice_contract.py` + collector 內嵌 spec + gate incomplete + `slice_performance.json`；W1-B3 標籤稽核半自動；§7 `slice_contract`）
 - 目前重點：補齊 Phase 1 RCA 的 decision-grade 證據鏈，避免「PASS 但結論不可審核」。
 - 嚴禁誤導：`--phase all` 非 dry-run、`phase3/phase4` full run、`--mode autonomous` 仍屬未完成能力。
 
@@ -53,18 +54,48 @@
 - [ ] Gate 整合：若有 `current_state=unresolved_blocker`，Phase 1 至少 `BLOCKED`
 
 #### W1-B2 細緻切片（slice RCA）可直接排序
-- [ ] collector 增加 slice 聚合（先低成本維度）：
-  - `date`, `player_tier`, `bet_amount_bucket`, `activity_bucket`
-- [ ] 報告輸出 `top_drag_slices`（至少 Top 10），每列含：
-  - `n`, `tp/fp/fn`, `precision_at_target_recall`, `delta_vs_global`, `confidence_flag`
-- [ ] fail-fast：任一必要維度缺失時，`slice_data_incomplete` 寫入 `blocking_reasons`
-- [ ] 效能限制：先做 SQL 聚合 + 分桶，避免 row-level 全量 materialize（筆電 RAM 優先）
 
-#### W1-B3 標籤品質（label noise）從統計升級到判定
-- [ ] 新增 lag 分桶統計（`<=1d`, `1-3d`, `3-7d`, `>7d`）
-- [ ] 新增 `label_bottleneck_assessment`：`none | minor | major | blocking`
-- [ ] 高分 FP 抽樣結果輸出結構化欄位（避免只留 narrative）
-- [ ] Gate 整合：`major/blocking` 且無已核准修復計畫時，觸發 timeline 重排建議
+契約全文：**`../../.cursor/plans/PLAN_precision_uplift_sprint.md` §7**（rated-only、`T0` as-of profile、十分位／tenure 規則、`slice_data_incomplete` 觸發條件）。以下為工程對照清單（實作時不得改用舊稱 `player_tier` / 未約定之 `activity_bucket` 語意）。
+
+- [x] **純計算 + 可選內嵌 spec（MVP）**：`orchestrator/slice_contract.py` 之 `build_slice_contract_bundle`；Phase 1 config 可選 **`slice_contract`**（`T0`、`eval_rows`、`profiles`、…）由 `collect_phase1_artifacts` 併入 bundle；`slice_performance_report.md` 輸出 **`slice_contract`** JSON 區塊。單測：`tests/unit/test_slice_contract_w1b2.py`。
+- [ ] **資料 join**：以與 **`precision@recall=1%`** 相同之 **eval／holdout 樣本列**（grain）為準；僅 **rated**；每列具 `decision_ts`（HKT 曆日見 §7.4）、`table_id`；能對每位 `canonical_id` 取得 **§7.2 T0 as-of** 之 `player_profile` 一列（`theo_win_sum_30d`、`active_days_30d`、`turnover_sum_30d`、`days_since_first_session`）。
+- [ ] **分桶計算**（與 §7 一致）：
+  - `eval_date`、`table_id`（§7.4–7.5）；
+  - `adt_percentile_bucket`：`ADT_30d = theo_win_sum_30d / active_days_30d`，玩家級常數（T0 profile），**十分位**於該次 eval **全體 rated 列**上估（列加權語意 §7.6）；
+  - `tenure_bucket`：`days_since_first_session` 玩家級常數 + **固定區間**（§7.7）；
+  - `activity_percentile_bucket`：`active_days_30d` 玩家級常數 + **十分位**（§7.8）；
+  - `turnover_30d_percentile_bucket`：`turnover_sum_30d` 玩家級常數 + **十分位**（§7.9）；
+  - **不**實作已廢止之 `value_tier` / `player_tier`（§7.10）。
+- [x] **Gate：`slice_data_incomplete` → `blocking_reasons`**：`evaluate_phase1_gate` 讀 `bundle["slice_contract"]`；若 `slice_data_incomplete` 為真，寫入 **`slice_data_incomplete`** 與 **`slice_contract:<code>`**；預設狀態 **PRELIMINARY**（`thresholds.slice_contract_incomplete_status` 可設 **`FAIL`** 強制失敗）。另：`slice_contract:asof_contract_unavailable_strict` 會 **強制 FAIL**。單測：`test_gate_preliminary_when_slice_contract_incomplete`、`test_gate_fail_when_slice_incomplete_status_fail`、`test_gate_fail_when_slice_asof_contract_unavailable_strict`。
+- [ ] **Assertion 與 `slice_data_incomplete`（bundle 內容）**（§7.3、§7.12）：`slice_contract.py` 已對內嵌列做 assertion／`blocking_profile_codes`；**仍待**與真實 eval／profile join 後之完整證據鏈與（若需要）**BLOCKED** 語意定稿。
+- [ ] **collector**：`collect_phase1_artifacts` 已支援 **內嵌** `slice_contract` spec；若 spec **未**含 `eval_rows` 且 `auto_eval_rows_from_prediction_log=true`，可由 SQLite 自動組 `eval_rows`（`prediction_log` 視窗內 `is_rated_obs=1` + `validation_results` finalized label）；若 spec **未**含/為空 `profiles` 且 `auto_profiles_from_state_db=true`，可依 `eval_rows.canonical_id` 回查 `state_db.player_profile` 五欄（`theo_win_sum_30d`/`active_days_30d`/`turnover_sum_30d`/`days_since_first_session`），且當表含 `as_of_ts` 時採 **`<= T0` 最近一筆**。**來源策略**：以 `state_db` 為 primary；當 `state_db` 不可行（缺欄/缺表/不可用）時，先嘗試 **Parquet fallback**（`profile_parquet_path`，DuckDB 讀取），仍失敗且 `auto_profiles_from_clickhouse=true` 時再走 **ClickHouse fallback**（最小查詢、按 canonical_id 小批 IN，`SOURCE_DB.TPROFILE` 可覆蓋）。若 spec **未**含 `recall_score_threshold`：先 R1 **`threshold_at_target`**，否則 **`backtest_metrics.threshold_at_recall_0.01`**（`model_default`／`rated`）。已自動附帶 `slice_contract_version`（預設 `plan7-sha256:<16>`）與 `slice_contract_plan_hash_sha256` / `slice_contract_plan_section`。**仍待** §7 全項驗收。
+- [x] **報告**：`slice_performance_report.md` 含 **`slice_contract`** JSON 區塊；bundle 含 **`slice_contract`** 鍵時另寫 **`slice_performance.json`**。`top_drag_slices` 欄位格式對齊 W1-B2（真資料 Top10 仍待驗收）。
+- [ ] **效能**：優先 **T0 上每 `canonical_id` 一列 profile** 再 join eval 列；十分位切點於聚合後小表計算；避免不必要之全量列 materialize（筆電 RAM，§6.2）。
+
+#### W1-B3 標籤品質（label noise）：**完整記錄優先**；分級／全自動 gate **待資料審閱後再凍結**
+
+> **治理**：`label_bottleneck_assessment` 之門檻映射、高分 FP「判因」枚舉是否收斂、以及「無已核准修復計畫 → 自動升級 BLOCK／timeline」等行為，在**未經實際資料審閱並凍結規則表前**不實作為**唯一依據的全自動 gate**（避免假精確）。在此之前，每次 run 必須輸出 **人類可讀 + 機器可讀之完整證據**，供事後定規則與簽核。
+
+- [ ] **定義（與 repo 對齊；寫入 audit bundle）**  
+  - **censored**：`trainer/labels.py` H1／右截尾：`censored=True` 為該 `canonical_id` 之 terminal 注單，且 `payout_complete_dtm + WALKAWAY_GAP_MIN` 無法在 `extended_end` 前被觀測滿足 → 訓練／嚴謹評估排除。輸出須註明所用 **`window_end` / `extended_end`、WALKAWAY_GAP_MIN、label 程式版本或 fingerprint**。  
+  - **lag**：`decision_ts` → **ground truth 穩定**時刻；**`gt_stable_ts` 之欄位來源與版本**須在 bundle 註記（資料驗證後可收斂為 **本衝刺計畫 §9** 單一句）。  
+  - **人口**：僅 **rated**（與 Phase 1 其餘口徑一致）。
+
+- [ ] **必落地輸出（缺任一視為 W1-B3 未完成）** — `phase1/label_noise_audit.md` **與** `phase1/label_noise_audit.json`（或 collector 中等價、與 md 同源）：  
+  - censored：**計數與比例**；分母（rated eval 列／注單列等）**必須文字說明**；並附與 run 契約 `exclude_censored` 是否一致之檢查欄位。  
+  - lag：於可算 lag 之子集上之 **`<=1d` / `1-3d` / `3-7d` / `>7d` 分桶**（計數+比例）；**`gt_stable_ts` 缺失**之列數與比例。  
+  - 高分 FP 抽樣：**逐列清單表**（每列固定欄位，允許人工欄為空但欄位不可刪）：至少含關聯 id（`bet_id` 或契約鍵）、`canonical_id`、`decision_ts`、分數或 alert 依據、決策當下所用 `label`、`gt_stable_ts`、`lag_bucket`、`censored`（若可得）、**`review_status`**（`pending` \| `reviewed`）、可選 **`reviewer_adjudication`**／**`reviewer_notes`**。  
+  - 摘要欄：`label_audit_evidence_complete`；**`label_audit_pending_human_decision: true`** 直至閾值／枚舉規則凍結（凍結後改 `false` 並附 `label_audit_rules_version`）。
+
+- [ ] **`label_bottleneck_assessment`（半自動）**：在無凍結門檻表前，固定輸出 **`pending_data_review`**（或等價單一枚舉），並在 md **醒目段**聲明：實際 `none|minor|major|blocking` 待人類依本 run 數據定案。**禁止**輸出偽造之 `none|minor|major|blocking`。規則凍結後才可輸出真實等級並附觸發證據索引。
+
+- [ ] **Gate（W1-B3）**：規則凍結前，**不得**僅憑 `label_bottleneck_assessment` 將 Phase 1 標為 `FAIL`／`BLOCKED`；可輸出 `WARN` 或 **`label_quality_human_review_recommended`**，以及敘述性 **timeline 重排建議**（對齊衝刺計畫語意，**不**自動改 W2+ 排程狀態）。凍結後若需自動化：以 config **顯式 `label_audit_auto_gate_enabled: true`** 才允許「major／blocking + 無修復計畫 → 升級」類邏輯。
+
+- [ ] （規則凍結後、可選）已核准修復計畫之機讀欄位與上項 auto-gate 聯動。
+
+**W1-B3 本階段 DoD**  
+- 任一正式 run 可僅憑工件還原：**censored 量、lag 分佈、FP 抽樣全表、gt_stable 缺失率**，無需翻 log。  
+- `phase1_gate_decision.md`（或 bundle）明示：標籤子證據已完整落地；**bottleneck 自動 gate 未啟用或未配置**。
 
 #### W1-B4 PIT parity 補齊 critical checks
 - [ ] 補 `window_timezone_mismatch_count` 可觀測能力（不再固定 null）
@@ -195,8 +226,8 @@
   - `blocking_reasons`（若無則明示空）
 - 至少 5 個關鍵測試：
   - status unresolved blocker -> gate blocked
-  - slice 維度缺失 -> fail-fast/block
-  - label bottleneck major -> timeline reorder signal
+  - **`slice_data_incomplete`**：模擬 §7.12 觸發（例如 **T0 無 profile**、**`theo_win_sum_30d` 為 NULL**、**`active_days_30d` 小於 1**、**`turnover_sum_30d` 為 NULL**）→ `blocking_reasons` 含預期代碼／gate 預期狀態
+  - label audit：`label_noise_audit.json` 含 censored／lag 分桶／FP 清單欄位；`label_audit_pending_human_decision=true`；**不得**僅因未凍結之 assessment 欄位而單獨將 gate 標為 `FAIL`（預設半自動契約）
   - PIT strict violation -> fail
   - upper bound incomparable -> preliminary
 
@@ -213,7 +244,7 @@
 - **OOM/長跑失控風險**：多窗 + 多實驗同時開會爆 RAM；預設並行維持 1。
 - **假陽性結論風險**：只有單窗或 plan-only 卻下決策級結論。
 - **契約漂移風險**：run 中途更換 model/window/label 規則造成不可比。
-- **切片計算放大風險**：slice 維度一次開太多導致 SQL/記憶體暴增，先低成本維度再擴充。
+- **切片計算放大風險**：§7 已定 **六類 marginal 維度**（含三個十分位）；實作先做 **單維 marginal** 與必要 join，**低階 joint** 僅在 `min_n` 門檻與資源評估通過後擴充；避免高階笛卡兒積一次全開。
 
 ---
 
@@ -221,4 +252,5 @@
 
 - 任務狀態只在本檔更新（不要在 runbook 重複打勾）。
 - 每次狀態變更要附「為何變更」一句描述，避免只改勾選。
+- **`slice_contract` 變更**：先改 **`../../.cursor/plans/PLAN_precision_uplift_sprint.md` §7**，再同步本檔 W1-B2、Runbook／config 說明；禁止只改 collector 而不改上游契約。
 - 若能力未完成，`PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md` 必須標示為「限制」，不可寫成可用。

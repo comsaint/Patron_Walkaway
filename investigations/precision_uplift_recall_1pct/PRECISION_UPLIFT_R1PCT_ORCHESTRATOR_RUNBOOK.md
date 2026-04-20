@@ -156,7 +156,7 @@ python investigations/precision_uplift_recall_1pct/orchestrator/run_pipeline.py 
 
 ## 8. 參考文件
 
-- SSOT：`PRECISION_UPLIFT_R1PCT_SSOT.md`
+- SSOT：`../../.cursor/plans/PLAN_precision_uplift_sprint.md`（§1–§12）
 - Implementation Plan：`PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`
 - Execution Plan：`PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md`
 

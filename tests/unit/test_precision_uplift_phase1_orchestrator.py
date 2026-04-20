@@ -4774,6 +4774,7 @@ def _gate_bundle(
     r2: dict | None = None,
     pit_parity: dict[str, Any] | None = None,
     pit_threshold_overrides: dict[str, Any] | None = None,
+    slice_contract: dict[str, Any] | None = None,
 ) -> dict:
     payload = dict(_pat_block(final_pat))
     if r2 is not None:
@@ -4806,7 +4807,179 @@ def _gate_bundle(
     }
     if pit_parity is not None:
         b["pit_parity"] = pit_parity
+    if slice_contract is not None:
+        b["slice_contract"] = slice_contract
     return b
+
+
+class TestStatusHistoryCrosscheckW1B1:
+    """W1-B1: registry + crosscheck JSON + gate unresolved blockers (STATUS cycle STEP 3)."""
+
+    def test_gate_fails_when_bundle_has_unresolved_blockers(self) -> None:
+        """Gate reads precomputed ``unresolved_blockers`` (any resolution_status string)."""
+        for raw_status in ("deferred", "Deferred", "DEFERRED"):
+            b = _gate_bundle(
+                hours_span="2026-01-04T10:00:00+08:00",
+                alerts=900,
+                tp=50,
+                final_pat=0.4,
+                mid_pat=0.41,
+            )
+            b["status_history_crosscheck"] = {
+                "unresolved_blockers": [
+                    {
+                        "issue_id": f"SH-{raw_status}",
+                        "title": "case probe",
+                        "resolution_status": raw_status,
+                    }
+                ]
+            }
+            g = evaluators.evaluate_phase1_gate(b)
+            assert g["status"] == "FAIL", raw_status
+            assert any(
+                str(r).startswith("status_history_unresolved_blocker:SH-")
+                for r in g["blocking_reasons"]
+            ), raw_status
+
+    def test_collect_registry_yaml_syntax_error_records_collect_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Invalid registry YAML must append E_COLLECT_STATUS_HISTORY_REGISTRY."""
+        repo = tmp_path / "repo"
+        reg = (
+            repo
+            / "investigations"
+            / "precision_uplift_recall_1pct"
+            / "phase1"
+            / "status_history_registry.yaml"
+        )
+        reg.parent.mkdir(parents=True)
+        reg.write_text("entries: [\n  - bad\n", encoding="utf-8")
+        orch = tmp_path / "orch"
+        run_id = "run_bad_reg"
+        (orch / "state" / run_id / "logs").mkdir(parents=True)
+        (repo / "trainer" / "out_backtest").mkdir(parents=True)
+        (repo / "trainer" / "out_backtest" / "backtest_metrics.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        (orch / "state" / run_id / "logs" / "r1_r6.stdout.log").write_text(
+            json.dumps({"ok": 1}), encoding="utf-8"
+        )
+        state_db = repo / "state.db"
+        with sqlite3.connect(state_db) as conn:
+            conn.execute(
+                "CREATE TABLE validation_results (alert_ts TEXT, validated_at TEXT, result INT)"
+            )
+            conn.commit()
+        cfg = _minimal_config_dict()
+        cfg["state_db_path"] = str(state_db)
+        cfg["backtest_metrics_path"] = "trainer/out_backtest/backtest_metrics.json"
+        bundle = collectors.collect_phase1_artifacts(
+            run_id, cfg, repo_root=repo, orchestrator_dir=orch
+        )
+        codes = {e["code"] for e in bundle["errors"]}
+        assert collectors.ERR_STATUS_HISTORY_REGISTRY in codes
+
+    def test_write_phase1_reports_emits_status_history_json(self, tmp_path: Path) -> None:
+        """status_history_crosscheck.json must mirror bundle slice."""
+        phase1 = tmp_path / "phase1"
+        cfg = _minimal_config_dict()
+        bundle = {
+            "run_id": "json_run",
+            "errors": [{"code": "E_COLLECT_BACKTEST_METRICS", "message": "missing"}],
+            "window": dict(cfg["window"]),
+            "thresholds": dict(cfg["thresholds"]),
+            "backtest_metrics": None,
+            "state_db_stats": {},
+            "r1_r6_final": {"payload": None},
+            "r1_r6_mid": {"payload": None},
+            "status_history_crosscheck": {
+                "run_id": "json_run",
+                "keyword_hits": [{"section": "S", "evidence_snippet": "label noise here"}],
+                "unresolved_blockers": [],
+            },
+        }
+        gate = evaluators.evaluate_phase1_gate(bundle)
+        report_builder.write_phase1_reports(phase1, "json_run", cfg, bundle, gate)
+        js = json.loads(
+            (phase1 / "status_history_crosscheck.json").read_text(encoding="utf-8")
+        )
+        assert js["run_id"] == "json_run"
+        assert len(js["keyword_hits"]) == 1
+
+    def test_collect_summary_counts_unresolved_blockers(self) -> None:
+        """collect_summary_for_run_state exposes status_history_unresolved_blocker_count."""
+        bundle = {
+            "errors": [],
+            "backtest_metrics": None,
+            "r1_r6_final": {"payload": {}},
+            "r1_r6_mid": {"payload": None},
+            "state_db_stats": {},
+            "status_history_crosscheck": {
+                "unresolved_blockers": [
+                    {"issue_id": "a"},
+                    {"issue_id": "b"},
+                ],
+            },
+        }
+        s = collectors.collect_summary_for_run_state(bundle)
+        assert s["status_history_unresolved_blocker_count"] == 2
+
+    def test_collect_registry_deferred_case_insensitive(self, tmp_path: Path) -> None:
+        """Collector normalizes resolution_status when building unresolved_blockers."""
+        repo = tmp_path / "repo"
+        reg = (
+            repo
+            / "investigations"
+            / "precision_uplift_recall_1pct"
+            / "phase1"
+            / "status_history_registry.yaml"
+        )
+        reg.parent.mkdir(parents=True)
+        reg.write_text(
+            yaml.safe_dump(
+                {
+                    "schema_version": "1",
+                    "entries": [
+                        {
+                            "issue_id": "SH-case-YAML",
+                            "title": "t",
+                            "resolution_status": "Deferred",
+                            "blocks_phase1_decision": True,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        orch = tmp_path / "orch"
+        run_id = "run_reg_def"
+        (orch / "state" / run_id / "logs").mkdir(parents=True)
+        (repo / "trainer" / "out_backtest").mkdir(parents=True)
+        (repo / "trainer" / "out_backtest" / "backtest_metrics.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        (orch / "state" / run_id / "logs" / "r1_r6.stdout.log").write_text(
+            json.dumps({"ok": 1}), encoding="utf-8"
+        )
+        state_db = repo / "state.db"
+        with sqlite3.connect(state_db) as conn:
+            conn.execute(
+                "CREATE TABLE validation_results (alert_ts TEXT, validated_at TEXT, result INT)"
+            )
+            conn.commit()
+        cfg = _minimal_config_dict()
+        cfg["state_db_path"] = str(state_db)
+        cfg["backtest_metrics_path"] = "trainer/out_backtest/backtest_metrics.json"
+        cfg["status_history_disable_keyword_scan"] = True
+        bundle = collectors.collect_phase1_artifacts(
+            run_id, cfg, repo_root=repo, orchestrator_dir=orch
+        )
+        sh = bundle.get("status_history_crosscheck")
+        assert isinstance(sh, Mapping)
+        ub = sh.get("unresolved_blockers")
+        assert isinstance(ub, list) and len(ub) == 1
+        assert ub[0]["issue_id"] == "SH-case-YAML"
 
 
 def test_window_duration_hours_positive() -> None:
@@ -4824,6 +4997,38 @@ def test_extract_precision_reads_unified_block() -> None:
     """PAT must be read from unified_sample_evaluation."""
     p = evaluators.extract_precision_at_target_recall(_pat_block(0.37))
     assert abs(p - 0.37) < 1e-9
+
+
+def test_extract_threshold_at_target_recall_reads_unified_and_evaluate() -> None:
+    """Score threshold at target recall (R1 ``threshold_at_target``) for slice_contract wiring."""
+    u = evaluators.extract_threshold_at_target_recall(
+        {
+            "unified_sample_evaluation": {
+                "precision_at_recall_target": {"threshold_at_target": 0.77},
+            }
+        }
+    )
+    assert u is not None and abs(u - 0.77) < 1e-9
+    e = evaluators.extract_threshold_at_target_recall(
+        {
+            "evaluate": {
+                "precision_at_recall_target": {"threshold_at_target": 0.12},
+            }
+        }
+    )
+    assert e is not None and abs(e - 0.12) < 1e-9
+    assert evaluators.extract_threshold_at_target_recall({"evaluate": {}}) is None
+
+
+def test_extract_threshold_at_recall_0_01_from_backtest_metrics_model_default_then_rated() -> None:
+    """Backtest JSON fallback for slice_contract when R1 omits threshold_at_target."""
+    m = {"model_default": {"threshold_at_recall_0.01": 0.66}}
+    v = evaluators.extract_threshold_at_recall_0_01_from_backtest_metrics(m)
+    assert v is not None and abs(v - 0.66) < 1e-9
+    m2 = {"rated": {"threshold_at_recall_0.01": 0.55}}
+    v2 = evaluators.extract_threshold_at_recall_0_01_from_backtest_metrics(m2)
+    assert v2 is not None and abs(v2 - 0.55) < 1e-9
+    assert evaluators.extract_threshold_at_recall_0_01_from_backtest_metrics({}) is None
 
 
 def test_gate_fail_when_collector_errors() -> None:
@@ -4867,6 +5072,60 @@ def test_gate_pass_when_gate_thresholds_and_pat_aligned() -> None:
     g = evaluators.evaluate_phase1_gate(b)
     assert g["status"] == "PASS"
     assert g["blocking_reasons"] == []
+
+
+def test_gate_preliminary_when_slice_contract_incomplete() -> None:
+    """W1-B2: ``slice_data_incomplete`` → PRELIMINARY + ``slice_contract:*`` reasons."""
+    b = _gate_bundle(
+        hours_span="2026-01-04T10:00:00+08:00",
+        alerts=900,
+        tp=50,
+        final_pat=0.40,
+        mid_pat=0.42,
+        slice_contract={
+            "slice_data_incomplete": True,
+            "blocking_profile_codes": ["T0_no_profile", "theo_win_sum_30d_null"],
+        },
+    )
+    g = evaluators.evaluate_phase1_gate(b)
+    assert g["status"] == "PRELIMINARY"
+    assert "slice_data_incomplete" in g["blocking_reasons"]
+    assert "slice_contract:T0_no_profile" in g["blocking_reasons"]
+    assert g["metrics"].get("slice_data_incomplete") is True
+
+
+def test_gate_fail_when_slice_incomplete_status_fail() -> None:
+    """Optional ``slice_contract_incomplete_status: FAIL`` forces FAIL."""
+    b = _gate_bundle(
+        hours_span="2026-01-04T10:00:00+08:00",
+        alerts=900,
+        tp=50,
+        final_pat=0.40,
+        mid_pat=0.42,
+        slice_contract={"slice_data_incomplete": True, "blocking_profile_codes": ["x"]},
+    )
+    b["thresholds"]["slice_contract_incomplete_status"] = "FAIL"
+    g = evaluators.evaluate_phase1_gate(b)
+    assert g["status"] == "FAIL"
+    assert "slice_data_incomplete" in g["blocking_reasons"]
+
+
+def test_gate_fail_when_slice_asof_contract_unavailable_strict() -> None:
+    """STRICT as-of contract code must force FAIL regardless incomplete default status."""
+    b = _gate_bundle(
+        hours_span="2026-01-04T10:00:00+08:00",
+        alerts=900,
+        tp=50,
+        final_pat=0.40,
+        mid_pat=0.42,
+        slice_contract={
+            "slice_data_incomplete": True,
+            "blocking_profile_codes": ["asof_contract_unavailable_strict"],
+        },
+    )
+    g = evaluators.evaluate_phase1_gate(b)
+    assert g["status"] == "FAIL"
+    assert "slice_contract:asof_contract_unavailable_strict" in g["blocking_reasons"]
 
 
 def test_gate_fail_on_mid_final_pat_divergence() -> None:
@@ -5525,7 +5784,7 @@ def test_phase1_autonomous_without_dry_run_returns_pending_exit(
 
 
 def test_write_phase1_reports_writes_six_markdown_files(tmp_path: Path) -> None:
-    """T6: all six phase1 artifacts are written with run metadata."""
+    """T6: six phase1 markdown artifacts + status_history_crosscheck.json (W1-B1)."""
     phase1 = tmp_path / "phase1"
     cfg = _minimal_config_dict()
     bundle = {
@@ -5540,7 +5799,7 @@ def test_write_phase1_reports_writes_six_markdown_files(tmp_path: Path) -> None:
     }
     gate = evaluators.evaluate_phase1_gate(bundle)
     paths = report_builder.write_phase1_reports(phase1, "rep_run", cfg, bundle, gate)
-    assert len(paths) == 6
+    assert len(paths) == 7
     names = {p.name for p in paths}
     assert names == {
         "upper_bound_repro.md",
@@ -5549,12 +5808,44 @@ def test_write_phase1_reports_writes_six_markdown_files(tmp_path: Path) -> None:
         "point_in_time_parity_check.md",
         "phase1_gate_decision.md",
         "status_history_crosscheck.md",
+        "status_history_crosscheck.json",
     }
     gate_md = (phase1 / "phase1_gate_decision.md").read_text(encoding="utf-8")
     assert "`rep_run`" in gate_md or "rep_run" in gate_md
     assert str(gate["status"]) in gate_md
     assert "Mid R1/R6 snapshots" in gate_md
     assert "筆數（log 列）" in gate_md and "`0`" in gate_md
+
+
+def test_write_phase1_reports_emits_slice_performance_json_when_slice_contract_present(
+    tmp_path: Path,
+) -> None:
+    """W1-B2: ``slice_performance.json`` when collect bundle includes ``slice_contract``."""
+    phase1 = tmp_path / "phase1"
+    cfg = _minimal_config_dict()
+    bundle = {
+        "run_id": "slice_json_run",
+        "errors": [],
+        "window": dict(cfg["window"]),
+        "thresholds": dict(cfg["thresholds"]),
+        "backtest_metrics": {},
+        "state_db_stats": {"finalized_alerts_count": 900, "finalized_true_positives_count": 50},
+        "r1_r6_final": {"payload": _pat_block(0.4)},
+        "r1_r6_mid": {"payload": _pat_block(0.41)},
+        "r1_r6_mid_snapshots": [],
+        "slice_contract": {
+            "slice_contract_version": "inline-v1",
+            "slice_data_incomplete": False,
+            "top_drag_slices": [],
+            "row_annotations": [],
+        },
+    }
+    gate = evaluators.evaluate_phase1_gate(bundle)
+    paths = report_builder.write_phase1_reports(phase1, "slice_json_run", cfg, bundle, gate)
+    names = {p.name for p in paths}
+    assert "slice_performance.json" in names
+    raw = json.loads((phase1 / "slice_performance.json").read_text(encoding="utf-8"))
+    assert raw["slice_contract"]["slice_data_incomplete"] is False
 
 
 def test_phase1_gate_decision_mid_snapshots_section_lists_paths_and_pats(tmp_path: Path) -> None:

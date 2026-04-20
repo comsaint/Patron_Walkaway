@@ -48,6 +48,31 @@ def extract_precision_at_target_recall(r1_payload: Mapping[str, Any] | None) -> 
     return None
 
 
+def extract_threshold_at_target_recall(r1_payload: Mapping[str, Any] | None) -> float | None:
+    """Read operating-point score threshold (``threshold_at_target``) from R1/R6 JSON.
+
+    Emitted by ``investigations/test_vs_production/checks/run_r1_r6_analysis.py`` under
+    ``precision_at_recall_target`` alongside ``precision_at_target_recall``.
+    """
+    if not isinstance(r1_payload, Mapping):
+        return None
+    for branch in ("unified_sample_evaluation", "evaluate"):
+        node = r1_payload.get(branch)
+        if not isinstance(node, Mapping):
+            continue
+        block = node.get("precision_at_recall_target")
+        if not isinstance(block, Mapping):
+            continue
+        v = block.get("threshold_at_target")
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _r2_mismatch_reason(r2: object) -> str | None:
     """Return a blocking code if R2 cross-check shows large PL vs alerts gap."""
     if not isinstance(r2, Mapping):
@@ -177,6 +202,13 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
     if pit_status.lower() == "fail":
         pit_violations.append("pit_status_fail")
 
+    sh0 = bundle.get("status_history_crosscheck")
+    sh_unresolved_n = 0
+    if isinstance(sh0, Mapping):
+        ub0 = sh0.get("unresolved_blockers")
+        if isinstance(ub0, list):
+            sh_unresolved_n = len(ub0)
+
     metrics: dict[str, Any] = {
         "window_hours": round(hours, 4),
         "finalized_alerts_count": n_fin_i,
@@ -192,6 +224,7 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
         "pit_alerts_vs_prediction_log_gap": pit_gap,
         "pit_parity_violation_count": len(pit_violations),
         "pit_parity_mode": pit_mode,
+        "status_history_unresolved_blocker_count": sh_unresolved_n,
     }
 
     def _evidence() -> str:
@@ -225,6 +258,24 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
             "evidence_summary": _evidence(),
             "metrics": metrics,
         }
+
+    if isinstance(sh0, Mapping):
+        ub_list = sh0.get("unresolved_blockers")
+        if isinstance(ub_list, list) and ub_list:
+            for item in ub_list:
+                if isinstance(item, Mapping):
+                    iid = str(item.get("issue_id") or "").strip()
+                    if iid:
+                        reasons.append(f"status_history_unresolved_blocker:{iid}")
+                elif isinstance(item, str) and item.strip():
+                    reasons.append(f"status_history_unresolved_blocker:{item.strip()}")
+            if reasons:
+                return {
+                    "status": "FAIL",
+                    "blocking_reasons": reasons,
+                    "evidence_summary": _evidence(),
+                    "metrics": metrics,
+                }
 
     if r1_final is None:
         reasons.append("missing_r1_r6_final_payload")
@@ -323,6 +374,33 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
             "metrics": metrics,
         }
 
+    sc = bundle.get("slice_contract")
+    if isinstance(sc, Mapping) and sc.get("slice_data_incomplete"):
+        metrics["slice_data_incomplete"] = True
+        codes = sc.get("blocking_profile_codes")
+        slice_codes: list[str] = []
+        if isinstance(codes, (list, tuple)):
+            slice_codes = [str(c) for c in codes if str(c).strip()]
+        sc_status = str(thr.get("slice_contract_incomplete_status", "PRELIMINARY") or "PRELIMINARY").strip().upper()
+        if sc_status not in {"PRELIMINARY", "FAIL"}:
+            sc_status = "PRELIMINARY"
+        if "asof_contract_unavailable_strict" in slice_codes:
+            sc_status = "FAIL"
+        br = ["slice_data_incomplete"]
+        for c in slice_codes:
+            br.append(f"slice_contract:{c}")
+        metrics["slice_contract_blocking_profile_codes"] = slice_codes
+        ev = _evidence() + "; slice_data_incomplete"
+        return {
+            "status": sc_status,
+            "blocking_reasons": br,
+            "evidence_summary": ev,
+            "metrics": metrics,
+        }
+
+    if isinstance(sc, Mapping):
+        metrics["slice_data_incomplete"] = False
+
     return {
         "status": "PASS",
         "blocking_reasons": [],
@@ -332,6 +410,32 @@ def evaluate_phase1_gate(bundle: dict[str, Any]) -> dict[str, Any]:
 
 
 PHASE2_BACKTEST_PR1_KEY = "test_precision_at_recall_0.01"
+BACKTEST_THRESHOLD_AT_RECALL_01_KEY = "threshold_at_recall_0.01"
+
+
+def extract_threshold_at_recall_0_01_from_backtest_metrics(
+    backtest_metrics: Mapping[str, Any] | None,
+) -> float | None:
+    """Read score threshold at recall 1% from trainer ``backtest_metrics.json``.
+
+    Tries ``model_default`` then ``rated`` (aligned with
+    :func:`extract_phase2_precision_at_recall_1pct_from_metrics_mapping`).
+    """
+    if not isinstance(backtest_metrics, Mapping):
+        return None
+    tkey = BACKTEST_THRESHOLD_AT_RECALL_01_KEY
+    for section in ("model_default", "rated"):
+        block = backtest_metrics.get(section)
+        if not isinstance(block, Mapping):
+            continue
+        raw = block.get(tkey)
+        if raw is None:
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def extract_phase2_precision_at_recall_1pct_from_metrics_mapping(

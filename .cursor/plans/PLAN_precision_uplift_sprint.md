@@ -1,6 +1,7 @@
 # Precision 提升衝刺計畫（Recall=1%）
 
-> 最後更新：2026-04-10（對齊 Autonomous-first 執行策略）  
+> **單一 SSOT**：本檔同時為 **衝刺目標／Phase 路線**、**Phase 1 `slice_contract`（§7）**，以及 **調查專案 `investigations/precision_uplift_recall_1pct` 之文件分工、能力邊界、Gate 契約（§8–§12）**。原 `investigations/.../PRECISION_UPLIFT_R1PCT_SSOT.md` 已併入本檔，請勿再新增第二份調查 SSOT。  
+> 最後更新：2026-04-20（§2 標籤品質稽核列對齊 §11.1／W1-B3；§8–§12 合併原調查 SSOT；§7 `slice_contract`；執行策略仍對齊 Autonomous-first）  
 > 目標：在相同評估口徑下，將 `precision@recall=1%` 由目前約 40% 提升至 **>=60%**。
 
 ---
@@ -29,8 +30,8 @@
 | 任務 | 具體內容 | 產出 |
 | :--- | :--- | :--- |
 | 歷史紀錄對照（STATUS） | 對照 `STATUS.md` 過去迭代，盤點是否已有相同或相近的 label noise / lag / censored 發現被擱置，並標記「可直接沿用 / 需重驗 / 已失效」。 | `status_history_crosscheck` |
-| 錯誤切片分析 | 依日期、table、玩家層級、新舊戶、下注額、活躍度切片，檢查 `precision@1% recall` 與樣本占比。 | `slice_performance_report`，列出 top 拖累切片 |
-| 標籤品質稽核 | 量化 censored / 延遲標註比例；抽樣高分 false positive 判斷是否標註延遲或真噪音。 | `label_noise_audit` |
+| 錯誤切片分析 | 依 **§7 `slice_contract`** 維度切片，檢查 `precision@recall=1%` 與樣本占比（rated-only；維度名見 §7）。 | `slice_performance_report`，列出 top 拖累切片 |
+| 標籤品質稽核 | **rated-only**（與 §7 族群一致）。量化 **censored**（`trainer/labels.py` H1 右截尾語意）與 **lag**（`decision_ts` → ground truth **穩定**時刻；分桶與 `gt_stable_ts` 缺失率等）；抽樣高分 false positive 並保留逐列證據。**產出與 Gate 細節**（`label_noise_audit` 之 md+json 同源、`label_audit_pending_human_decision`、凍結前不以 bottleneck 單獨 FAIL／BLOCKED）：見 **§11.1** 與 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` **W1-B3**。 | `label_noise_audit`（`phase1/label_noise_audit.md` + `label_noise_audit.json`） |
 | 特徵可用時點對齊 | 確認 train/serve 特徵 timestamp 對齊與無 leakage。 | `point_in_time_parity_check` |
 | 現行上限確認 | 在固定契約下重跑「已知 threshold」上限測試，驗證 40% 結論可重現。 | `upper_bound_repro` |
 
@@ -142,4 +143,187 @@
 - 每兩週一次決策會：是否切換主路線、是否提早進入定版。  
 - 每次 checkpoint 必須附實驗矩陣更新，不接受口頭結論。  
 - Phase 1 checkpoint 必附 `status_history_crosscheck`（含「歷史結論是否被沿用」對照表）。  
+
+---
+
+## 7. Phase 1 錯誤切片分析：分段定義（`slice_contract`）
+
+本節為衝刺內 **Phase 1 錯誤切片** 之 **單一真相**（`slice_metrics`、orchestrator W1-B2、調查 repo 實作皆須對齊）。與 `player_profile` 欄位語意對齊處以 `doc/player_profile_spec.md` 及 `ssot/baseline_model_eval_ssot.md` §4.1 R3 為準。
+
+### 7.1 範圍與 grain
+
+- **族群**：僅 **`canonical_id` 屬 rated**（D2 有效 `casino_player_id` 歸戶）之樣本列。Unrated 不納入本契約。
+- **切片 grain**：與主指標 **`precision@recall=1%`** 相同之 **eval／holdout 樣本列**（下稱 **eval 列**）。
+- **時區**：`decision_ts` 之曆法日換算採 **`Asia/Hong_Kong`**，與本專案 run 契約一致。
+- **`T0`**：該次 eval／holdout 契約所定義之 **評估窗起點時刻**（單一 timestamp）。下文 **「T0 as-of profile」** 均指此固定時點。
+
+### 7.2 T0 as-of profile（玩家級常數之唯一來源）
+
+對每位在該次 eval 內出現之 **`canonical_id`**：
+
+1. 自 **`player_profile`** 取滿足 **`snapshot_dtm <= T0`** 之 **最新一筆**（as-of **T0**）。
+2. 自該筆讀出下列欄位；同一玩家於 **整段 eval 內** 僅使用此一次取值（**全 eval 不變**）：
+   - `theo_win_sum_30d`
+   - `active_days_30d`（30d 內不重複 `gaming_day` 之個數，見 profile 規格）
+   - `turnover_sum_30d`
+   - `days_since_first_session`（tenure 用）
+
+若某玩家在 **T0 無可用 profile 列**：該玩家相關列不參與依 profile 之切片，並觸發 **`slice_data_incomplete`**（§7.12）。
+
+### 7.3 Assertion（硬條件；違反即 `slice_data_incomplete`）
+
+對每一位在 §7.2 成功取得 T0 profile 之 rated 玩家，**同時**滿足：
+
+1. **`active_days_30d >= 1`**（不得為 0；不得為契約下不可用之 NULL）。
+2. **`theo_win_sum_30d` 非 NULL**（計算 ADT 之必要條件）。
+3. **`turnover_sum_30d` 非 NULL**（§7.9 F 維度之必要條件）。
+
+任一玩家違反以上任一條 → 本次 run 之切片結論標記 **`slice_data_incomplete`**，並應寫入 **`blocking_reasons`**；**不得**在違反仍存在時宣稱 profile 型 decile 切片為完整、可決策結論。
+
+> **說明**：ADT 在數學上可寫 `theo / max(active_days, 1)` 以避免除零，但 **契約層級** 以 **`active_days_30d >= 1`** 為必成立；出現 0 視為資料或 PIT 對齊異常，不進入可信 decile 結論。
+
+### 7.4 維度 A：`eval_date`
+
+- **定義**：`eval_date = date(decision_ts AT TIME ZONE 'Asia/Hong_Kong')`。
+- **粒度**：日。
+- **`decision_ts` 缺失**：該列不納入切片聚合；計入資料完整性統計（是否升級為 §7.12 由 gate 規則決定）。
+
+### 7.5 維度 B：`table_id`
+
+- **定義**：eval 列主表之 **`table_id`**（全 repo 對外 **canonical 欄位名** 應單一鎖死）。
+- **缺失**：`NULL` 或空字串 → 桶 **`UNKNOWN_TABLE`**。
+
+### 7.6 維度 C：`adt_percentile_bucket`（十分位，10 桶）
+
+- **前提**：§7.3 assertion 對該玩家已全部成立。
+- **指標**：  
+  **`ADT_30d = theo_win_sum_30d / active_days_30d`**  
+  語意與 `ssot/baseline_model_eval_ssot.md` §4.1 R3（ADT 估算）一致；回溯窗 **固定 W = 30d**。
+- **玩家級常數**：每位玩家僅一個 **`ADT_30d`**；該玩家所有 eval 列帶 **同一數值、同一 decile 標籤**。
+- **分位切點**：在 **「該次 eval／holdout 之全體 rated eval 列」** 上，對每列所帶之 **該列玩家之常數 `ADT_30d`** 計經驗 **十分位**（九個切點），得到 **`adt_d1` … `adt_d10`**（或專案統一之等價命名）。
+- **權重語意**：同一玩家多列會重複同一 `ADT_30d` → 十分位為 **以 eval 列為權重** 之經驗分佈（非「每玩家一票」）。
+- **小樣本**：**不**因樣本量少而改粗粒度；維持 10 桶。極小樣本下 decile 不穩時，報表以 **`confidence_flag`** 標註，契約不另開豁免。
+
+### 7.7 維度 D：`tenure_bucket`（新舊戶；固定區間，非十分位）
+
+- **指標**：§7.2 T0 as-of 之 **`days_since_first_session`**（玩家級常數）。
+- **分桶**（全專案固定；邊界開閉整 repo 一致即可）：  
+  **`T0_seg`：`[0, 7]` 天**；**`T1`：`(7, 30]`**；**`T2`：`(30, 90]`**；**`T3`：`(90, ∞)`**。
+
+### 7.8 維度 E：`activity_percentile_bucket`（十分位）
+
+- **指標**：§7.2 T0 as-of 之 **`active_days_30d`**（與 §7.3 一致，必 **≥ 1**）。
+- **玩家級常數 + 十分位**：每位玩家一值；每 eval 列帶該玩家常數；在 **該次 eval／holdout 全體 rated eval 列** 上估 **`activity_d1` … `activity_d10`**（權重語意同 §7.6）。
+
+### 7.9 維度 F：`turnover_30d_percentile_bucket`（十分位）
+
+- **指標**：§7.2 T0 as-of 之 **`turnover_sum_30d`**（30d 累計 turnover）；**非 NULL** 為 §7.3 強制條件。
+- **玩家級常數 + 十分位**：同 §7.6／§7.8，得 **`to_d1` … `to_d10`**（或專案統一之命名）。
+
+### 7.10 廢止／不使用的舊稱
+
+- **`value_tier` / `player_tier`（舊「價值／玩家層級」）**：不再定義、不輸出；價值相關視角由 **`adt_percentile_bucket`**（§7.6）承擔。
+- 舊表「玩家層級、新舊戶、下注額、活躍度」口語分別對應：**本契約不採 unrated 切片**；**新舊戶 = `tenure_bucket`**；**下注額 = `turnover_30d_percentile_bucket`**；**活躍度 = `activity_percentile_bucket`**；**日期 / table = `eval_date` / `table_id`**。
+
+### 7.11 報表最低欄位（與調查 repo W1-B2 對齊）
+
+每個切片鍵（單維 **marginal** 或事先約定之低階 **joint**）至少包含：
+
+- `n`、`tp`／`fp`／`fn`、`precision_at_target_recall`、`delta_vs_global`、`confidence_flag`（小樣本或 decile 不穩時標註）。
+
+### 7.12 `slice_data_incomplete` 觸發條件（匯總）
+
+- 任一 rated eval 所涉玩家在 **T0 無可用 `player_profile` 列**。  
+- §7.3 **任一 assertion 失敗**（含 **`theo_win_sum_30d` 為 NULL**、**`turnover_sum_30d` 為 NULL**、**`active_days_30d` 未 ≥ 1**）。
+
+**治理**：變更本節須先更新本檔 **§7**，再同步 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md`（W1-B2）與 collector／gate 實作。調查專案之文件優先序、能力與 Gate 敘述以 **§8–§12** 為準。
+
+---
+
+## 8. 調查專案文件分工與治理（`precision_uplift_recall_1pct`）
+
+### 8.1 文件角色（固定契約）
+
+| 文件 | 唯一職責 | 是否可放命令 |
+| :--- | :--- | :--- |
+| **本檔** `PLAN_precision_uplift_sprint.md` | **SSOT**：衝刺目標、§7 切片契約、§8–§12 調查治理／能力／Gate | 否 |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` | **Implementation Plan**：工程任務、DoD、里程碑、狀態 | 否 |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` | **Execution Plan**：推進節奏、階段輸入輸出、決策節點 | 可（高層） |
+| `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md` | **Runbook**：CLI、旗標、故障排查 | 可（操作層） |
+
+**衝突優先序**：**本檔（PLAN）** > Implementation Plan > Execution Plan > Runbook。  
+**禁止**：Runbook 把 Implementation Plan 標為未完成的能力寫成「已可用」。
+
+### 8.2 變更流程（文件維護）
+
+每次調整流程、能力邊界或 Gate 契約時，建議順序：
+
+1. 先更新 **本檔**：§7（若動切片）、**§10**（現況能力）、**§11**（Gate）、必要時 §9。  
+2. 再改 `PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` 任務勾選與敘述。  
+3. 最後更新 `PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` 與 `PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md`。
+
+**禁止**：只改 Runbook 而不改本檔；把 roadmap 願景寫成「現況已可用」。
+
+---
+
+## 9. 調查專案非目標與名詞／Run 契約
+
+### 9.1 非目標（調查 repo 範圍內）
+
+- 不在此輪導入分散式排程系統。  
+- 不在此輪把最終商業決策自動化（Go/No-Go 仍需人工簽核）。
+
+### 9.2 名詞與契約
+
+- **Run 契約**：`run_id`、`model_version/model_dir`、時間窗、時區、標籤與 censored 規則、資料來源路徑。  
+- **Gate 狀態**：`PASS` / `BLOCKED` / `FAIL` / `PRELIMINARY`（依 phase 定義）。  
+- **結論強度**：`exploratory` / `comparative` / `decision_grade`。  
+- **證據鏈**：`run_state.json` + phase reports + metrics artifacts + stdout/stderr logs。  
+- **Phase 1 錯誤切片（`slice_contract`）**：見 **本檔 §7**（單一真相）。
+
+---
+
+## 10. 現況能力快照（調查 orchestrator，2026-04）
+
+| 能力 | 現況 |
+| :--- | :--- |
+| `--phase phase1` | 可完整跑（含 gate 與報表） |
+| `--phase phase2` | 可跑 MVP（含可選訓練/回測、gate、報表） |
+| `--phase all --dry-run` | 可用（readiness 檢查） |
+| `--phase all` 非 dry-run | **尚未實作** |
+| `--phase phase3` / `phase4` full run | **尚未實作** |
+| `--mode autonomous` | **尚未實作** |
+
+硬性說明：
+
+- 任何文件不得再出現「目前可直接使用 `--phase all --mode autonomous`」之描述。  
+- 若要宣稱 Phase 2 為決策級結論，必須有多窗與策略生效證據，不可只看單一 PASS 標籤。
+
+---
+
+## 11. Gate 契約（跨 Phase，調查 repo 與衝刺對齊）
+
+### 11.1 Phase 1
+
+- 最低要件：樣本量、觀測時長、R1/R6 一致性、主因排序。  
+- PIT parity 若為 `STRICT`，違規須阻斷 PASS；`WARN_ONLY` 可警示不阻斷。  
+- **標籤品質稽核（W1-B3）**：在門檻與判因規則**經資料審閱凍結前**，不以 `label_bottleneck_assessment` **單獨**將整體 Phase 1 gate 標為 `FAIL`／`BLOCKED`；但每次 run 仍須輸出 **完整可稽核證據**（`label_noise_audit` 之 md+json：censored 統計、lag 分桶、`gt_stable_ts` 缺失率、高分 FP 逐列清單等，細節見 `PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` W1-B3）。凍結後若啟用全自動判斷，須以 config **明示開啟**並帶 `label_audit_rules_version`。
+
+### 11.2 Phase 2
+
+- 需比較 uplift 與波動（至少可比 baseline/challenger）。  
+- 若證據不足（例如僅 plan-only），應為 `BLOCKED`，不可升級為 `PASS`。
+
+### 11.3 Phase 3/4
+
+- 目前僅定義目標，不宣稱已有可執行 full-run gate 引擎。
+
+---
+
+## 12. 效能與風險原則（筆電優先）
+
+- 預設 `max_parallel_jobs=1`，逐步放寬，不一次開並行。  
+- 先做 dry-run，再做長跑，避免中後段才發現路徑/權限問題。  
+- 任一步驟若缺證據或輸出缺檔，應 fail-fast 並保留可恢復狀態。  
+- 若觀測窗/試驗數過大，先縮窗做 smoke，通過後再擴大。
 

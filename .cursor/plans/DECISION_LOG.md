@@ -1043,4 +1043,20 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-041：Phase 1 `status_history_registry` + 機器可讀 crosscheck + Gate 未解除阻擋項
+
+**日期**：2026-04-20  
+**相關**：`PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md` W1-B1；`.cursor/plans/PLAN_precision_uplift_sprint.md` Phase 1 checkpoint
+
+**決策**：
+
+1. **Registry**：以 `investigations/precision_uplift_recall_1pct/phase1/status_history_registry.yaml` 為結構化議題來源（`entries[]`：`issue_id`、`resolution_status`、`blocks_phase1_decision` 等）；可選以 phase1 YAML 的 `status_history_registry_path` 覆寫路徑（相對 repo 根）。
+2. **機器可讀產出**：`collect_phase1_artifacts` 於 bundle 附帶 `status_history_crosscheck`；`write_phase1_reports` 另寫 `phase1/status_history_crosscheck.json`（與既有 `.md` 並存）。
+3. **關鍵字掃描（可選）**：預設掃描 `.cursor/plans/STATUS.md` 前綴至多 **256KiB** 以擷取 label／censored 等關鍵字命中（避免整檔載入造成筆電 OOM）；可用 `status_history_disable_keyword_scan: true` 關閉；`status_history_status_md_path` 可覆寫來源檔。
+4. **Gate**：若 registry 中任一列 **`blocks_phase1_decision: true`** 且 **`resolution_status`** 為 **`open`** 或 **`deferred`**，則 `evaluate_phase1_gate` 回傳 **FAIL**，`blocking_reasons` 含 `status_history_unresolved_blocker:<issue_id>`。Registry YAML 語法／結構錯誤 → collector **`E_COLLECT_STATUS_HISTORY_REGISTRY`**（與其他 collect error 一併 FAIL）。
+
+**理由**：滿足 W1-B1「歷史對照結構化 + 機器判定 + Gate 接 unresolved」；掃描字數上限對齊大 STATUS 檔之記憶體風險控管。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

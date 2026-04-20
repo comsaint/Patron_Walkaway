@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 import sqlite3
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import evaluators
+import slice_contract
+import yaml
 
 DEFAULT_BACKTEST_METRICS = "trainer/out_backtest/backtest_metrics.json"
 
@@ -20,7 +23,33 @@ _REPO_ROOT = _ORCHESTRATOR_DIR.parents[2]
 ERR_BACKTEST_METRICS = "E_COLLECT_BACKTEST_METRICS"
 ERR_R1_PAYLOAD = "E_COLLECT_R1_PAYLOAD"
 ERR_STATE_DB_STATS = "E_COLLECT_STATE_DB"
+ERR_STATUS_HISTORY_REGISTRY = "E_COLLECT_STATUS_HISTORY_REGISTRY"
+ERR_SLICE_CONTRACT = "E_COLLECT_SLICE_CONTRACT"
 _MID_CP_STEM_RE = re.compile(r"^r1_r6_mid_cp(\d+)\.stdout\.log$")
+_SLICE_AUTO_EVAL_ROWS_LIMIT_DEFAULT = 100_000
+
+# STATUS.md can grow very large; Phase 1 crosscheck only scans the prefix (newest content first).
+_STATUS_HISTORY_MD_SCAN_MAX_CHARS = 256_000
+_STATUS_HISTORY_KEYWORDS: tuple[str, ...] = (
+    "label noise",
+    "delayed label",
+    "label delay",
+    "censored",
+    "leakage",
+    "lookahead",
+    "point-in-time",
+    "label contract",
+    "contract drift",
+    "標註噪音",
+    "延遲標註",
+    "標註延遲",
+    "標籤噪音",
+    "標籤延遲",
+    "截尾",
+    "時點對齊",
+    "契約不一致",
+)
+_STATUS_HISTORY_PATTERN: re.Pattern[str] | None = None
 
 
 def _resolve_under_root(repo_root: Path, p: str | Path) -> Path:
@@ -825,6 +854,709 @@ def _collect_phase1_pit_parity(
     return out
 
 
+def _collect_slice_eval_rows_from_sqlite(
+    prediction_log_db: Path,
+    state_db: Path,
+    window: Mapping[str, Any],
+    *,
+    max_rows: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Build rated/labeled eval rows for ``slice_contract`` from SQLite artifacts.
+
+    Returns ``(eval_rows, notes)`` and never raises; notes describe degraded paths.
+    """
+    notes: list[str] = []
+    start_ts = str(window.get("start_ts", ""))
+    end_ts = str(window.get("end_ts", ""))
+    out: list[dict[str, Any]] = []
+    if not prediction_log_db.is_file():
+        return out, ["prediction_log_db_not_found"]
+    try:
+        with sqlite3.connect(f"file:{prediction_log_db}?mode=ro", uri=True) as conn:
+            cols = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(prediction_log)").fetchall()
+            }
+            required = {"bet_id", "canonical_id", "scored_at"}
+            if not required.issubset(cols):
+                missing = sorted(required - cols)
+                return out, [f"prediction_log_missing_cols:{','.join(missing)}"]
+            has_table_id = "table_id" in cols
+            has_score = "score" in cols
+            rated_clause = " AND is_rated_obs = 1" if "is_rated_obs" in cols else ""
+            if not rated_clause:
+                notes.append("prediction_log_missing_is_rated_obs")
+            select_cols = "bet_id, canonical_id, scored_at"
+            if has_table_id:
+                select_cols += ", table_id"
+            if has_score:
+                select_cols += ", score"
+            sql = (
+                f"SELECT {select_cols} FROM prediction_log "
+                "WHERE scored_at >= ? AND scored_at < ?"
+                f"{rated_clause} ORDER BY scored_at ASC LIMIT ?"
+            )
+            rows = conn.execute(sql, (start_ts, end_ts, max_rows + 1)).fetchall()
+    except sqlite3.Error:
+        return out, ["prediction_log_db_unavailable_for_slice_auto_eval_rows"]
+
+    if not rows:
+        return out, ["prediction_log_no_rows_in_window"]
+    if len(rows) > max_rows:
+        rows = rows[:max_rows]
+        notes.append(f"slice_eval_rows_truncated_at:{max_rows}")
+
+    pred_rows: list[dict[str, Any]] = []
+    for row in rows:
+        bet_id = str(row[0] or "").strip()
+        cid = str(row[1] or "").strip()
+        scored_at = str(row[2] or "").strip()
+        if not bet_id or not cid or not scored_at:
+            continue
+        idx = 3
+        table_id = row[idx] if has_table_id else None
+        idx += 1 if has_table_id else 0
+        score = row[idx] if has_score else None
+        pred_rows.append(
+            {
+                "bet_id": bet_id,
+                "canonical_id": cid,
+                "decision_ts": scored_at,
+                "table_id": table_id,
+                "score": score,
+            }
+        )
+    if not pred_rows:
+        return out, notes + ["prediction_log_rows_invalid_for_slice_eval_rows"]
+
+    labels: dict[str, int] = {}
+    if state_db.is_file():
+        try:
+            with sqlite3.connect(f"file:{state_db}?mode=ro", uri=True) as conn:
+                vcols = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(validation_results)").fetchall()
+                }
+                if "bet_id" in vcols and "result" in vcols:
+                    fin_clause = ""
+                    if "validated_at" in vcols:
+                        fin_clause = (
+                            " AND TRIM(COALESCE(validated_at, '')) != ''"
+                        )
+                    chunk = 800
+                    for i in range(0, len(pred_rows), chunk):
+                        bids = [r["bet_id"] for r in pred_rows[i : i + chunk]]
+                        placeholders = ",".join(["?"] * len(bids))
+                        sql = (
+                            "SELECT bet_id, result FROM validation_results "
+                            f"WHERE bet_id IN ({placeholders}){fin_clause}"
+                        )
+                        for bid_raw, res_raw in conn.execute(sql, tuple(bids)).fetchall():
+                            bid = str(bid_raw or "").strip()
+                            if not bid:
+                                continue
+                            try:
+                                labels[bid] = int(res_raw)
+                            except (TypeError, ValueError):
+                                continue
+                else:
+                    notes.append("validation_results_missing_bet_id_or_result")
+        except sqlite3.Error:
+            notes.append("state_db_unavailable_for_slice_auto_eval_rows")
+    else:
+        notes.append("state_db_not_found_for_slice_auto_eval_rows")
+
+    dropped_unlabeled = 0
+    for r in pred_rows:
+        lab = labels.get(r["bet_id"])
+        if lab is None:
+            dropped_unlabeled += 1
+            continue
+        out.append(
+            {
+                "bet_id": r["bet_id"],
+                "canonical_id": r["canonical_id"],
+                "decision_ts": r["decision_ts"],
+                "table_id": r["table_id"],
+                "score": r["score"],
+                "label": int(lab),
+            }
+        )
+    if dropped_unlabeled > 0:
+        notes.append(f"slice_eval_rows_dropped_unlabeled:{dropped_unlabeled}")
+    return out, notes
+
+
+def _collect_slice_profiles_from_state_db(
+    state_db: Path,
+    canonical_ids: list[str],
+    *,
+    profile_table: str,
+    t0_raw: Any = None,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Load minimal profile fields for target canonical IDs from state DB table."""
+    notes: list[str] = []
+    out: dict[str, dict[str, Any]] = {}
+    t0_dt: datetime | None = None
+    if t0_raw is not None:
+        t0_s = str(t0_raw).strip()
+        if t0_s:
+            ts = t0_s[:-1] + "+00:00" if t0_s.endswith("Z") else t0_s
+            try:
+                t0_dt = datetime.fromisoformat(ts)
+            except ValueError:
+                notes.append("slice_profiles_t0_unparseable_fallback_no_asof")
+    if not canonical_ids:
+        return out, ["slice_profiles_no_canonical_ids"]
+    if not state_db.is_file():
+        return out, ["state_db_not_found_for_slice_profiles"]
+    try:
+        with sqlite3.connect(f"file:{state_db}?mode=ro", uri=True) as conn:
+            cols = {
+                row[1]
+                for row in conn.execute(f"PRAGMA table_info({profile_table})").fetchall()
+            }
+            required = {
+                "canonical_id",
+                "theo_win_sum_30d",
+                "active_days_30d",
+                "turnover_sum_30d",
+                "days_since_first_session",
+            }
+            if not required.issubset(cols):
+                miss = sorted(required - cols)
+                return out, [f"player_profile_missing_cols:{','.join(miss)}"]
+            has_asof = "as_of_ts" in cols
+            if not has_asof:
+                notes.append("player_profile_missing_as_of_ts_fallback_no_asof")
+            elif t0_dt is None:
+                notes.append("slice_profiles_missing_t0_or_unparseable_fallback_no_asof")
+            uniq_ids = sorted({str(x).strip() for x in canonical_ids if str(x).strip()})
+            chunk = 800
+            asof_parse_err_count = 0
+            asof_after_t0_drop_count = 0
+            asof_no_candidate_count = 0
+            chosen_asof: dict[str, datetime] = {}
+            for i in range(0, len(uniq_ids), chunk):
+                part = uniq_ids[i : i + chunk]
+                placeholders = ",".join(["?"] * len(part))
+                select_cols = (
+                    "canonical_id, theo_win_sum_30d, active_days_30d, "
+                    "turnover_sum_30d, days_since_first_session"
+                )
+                if has_asof:
+                    select_cols += ", as_of_ts"
+                sql = f"SELECT {select_cols} FROM {profile_table} WHERE canonical_id IN ({placeholders})"
+                for row in conn.execute(sql, tuple(part)).fetchall():
+                    cid = str(row[0] or "").strip()
+                    if not cid:
+                        continue
+                    if has_asof and t0_dt is not None:
+                        as_of_raw = row[5]
+                        as_of_s = str(as_of_raw or "").strip()
+                        if not as_of_s:
+                            asof_no_candidate_count += 1
+                            continue
+                        as_of_norm = as_of_s[:-1] + "+00:00" if as_of_s.endswith("Z") else as_of_s
+                        try:
+                            as_of_dt = datetime.fromisoformat(as_of_norm)
+                        except ValueError:
+                            asof_parse_err_count += 1
+                            continue
+                        if as_of_dt > t0_dt:
+                            asof_after_t0_drop_count += 1
+                            continue
+                        prev = chosen_asof.get(cid)
+                        if prev is not None and as_of_dt <= prev:
+                            continue
+                        chosen_asof[cid] = as_of_dt
+                    elif cid in out:
+                        continue
+                    out[cid] = {
+                        "theo_win_sum_30d": row[1],
+                        "active_days_30d": row[2],
+                        "turnover_sum_30d": row[3],
+                        "days_since_first_session": row[4],
+                    }
+            if has_asof and t0_dt is not None:
+                missing_after_filter = sum(1 for cid in uniq_ids if cid not in out)
+                if asof_parse_err_count > 0:
+                    notes.append(f"slice_profiles_as_of_parse_errors:{asof_parse_err_count}")
+                if asof_after_t0_drop_count > 0:
+                    notes.append(f"slice_profiles_as_of_after_t0_dropped:{asof_after_t0_drop_count}")
+                if asof_no_candidate_count > 0:
+                    notes.append(f"slice_profiles_as_of_missing:{asof_no_candidate_count}")
+                if missing_after_filter > 0:
+                    notes.append(f"slice_profiles_no_asof_profile_at_or_before_t0:{missing_after_filter}")
+    except sqlite3.Error:
+        return out, ["state_db_unavailable_for_slice_profiles"]
+    return out, notes
+
+
+def _collect_slice_profiles_from_parquet(
+    parquet_path: Path,
+    canonical_ids: list[str],
+    *,
+    t0_raw: Any = None,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Best-effort Parquet fallback for slice profiles (small-ID set only)."""
+    notes: list[str] = []
+    out: dict[str, dict[str, Any]] = {}
+    if not canonical_ids:
+        return out, ["slice_profiles_no_canonical_ids"]
+    if not parquet_path.is_file():
+        return out, ["slice_profiles_parquet_not_found"]
+
+    t0_dt: datetime | None = None
+    t0_s = str(t0_raw or "").strip()
+    if t0_s:
+        ts = t0_s[:-1] + "+00:00" if t0_s.endswith("Z") else t0_s
+        try:
+            t0_dt = datetime.fromisoformat(ts)
+        except ValueError:
+            notes.append("slice_profiles_t0_unparseable_fallback_no_asof")
+
+    try:
+        import duckdb  # type: ignore
+    except Exception:
+        return out, ["slice_profiles_parquet_duckdb_unavailable"]
+
+    uniq_ids = sorted({str(x).strip() for x in canonical_ids if str(x).strip()})
+    if not uniq_ids:
+        return out, ["slice_profiles_no_canonical_ids"]
+    try:
+        con = duckdb.connect(":memory:")
+        cols = {
+            str(r[0])
+            for r in con.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?)",
+                [str(parquet_path)],
+            ).fetchall()
+        }
+        required = {
+            "canonical_id",
+            "theo_win_sum_30d",
+            "active_days_30d",
+            "turnover_sum_30d",
+            "days_since_first_session",
+        }
+        if not required.issubset(cols):
+            miss = sorted(required - cols)
+            con.close()
+            return out, [f"slice_profiles_parquet_missing_cols:{','.join(miss)}"]
+        has_asof = "as_of_ts" in cols
+        if not has_asof:
+            notes.append("slice_profiles_parquet_missing_as_of_ts_fallback_no_asof")
+        elif t0_dt is None:
+            notes.append("slice_profiles_missing_t0_or_unparseable_fallback_no_asof")
+
+        id_tuple = tuple(uniq_ids)
+        base_sql = (
+            "SELECT canonical_id, theo_win_sum_30d, active_days_30d, "
+            "turnover_sum_30d, days_since_first_session"
+        )
+        if has_asof:
+            base_sql += ", as_of_ts"
+        base_sql += " FROM read_parquet(?) WHERE canonical_id IN ?"
+        rows = con.execute(base_sql, [str(parquet_path), id_tuple]).fetchall()
+        con.close()
+    except Exception:
+        return out, ["slice_profiles_parquet_query_failed"]
+
+    chosen_asof: dict[str, datetime] = {}
+    asof_drop = 0
+    asof_parse_err = 0
+    for row in rows:
+        cid = str(row[0] or "").strip()
+        if not cid:
+            continue
+        if has_asof and t0_dt is not None:
+            as_of_s = str(row[5] or "").strip()
+            if not as_of_s:
+                continue
+            as_of_norm = as_of_s[:-1] + "+00:00" if as_of_s.endswith("Z") else as_of_s
+            try:
+                as_of_dt = datetime.fromisoformat(as_of_norm)
+            except ValueError:
+                asof_parse_err += 1
+                continue
+            if as_of_dt > t0_dt:
+                asof_drop += 1
+                continue
+            prev = chosen_asof.get(cid)
+            if prev is not None and as_of_dt <= prev:
+                continue
+            chosen_asof[cid] = as_of_dt
+        elif cid in out:
+            continue
+        out[cid] = {
+            "theo_win_sum_30d": row[1],
+            "active_days_30d": row[2],
+            "turnover_sum_30d": row[3],
+            "days_since_first_session": row[4],
+        }
+    if asof_drop > 0:
+        notes.append(f"slice_profiles_parquet_as_of_after_t0_dropped:{asof_drop}")
+    if asof_parse_err > 0:
+        notes.append(f"slice_profiles_parquet_as_of_parse_errors:{asof_parse_err}")
+    return out, notes
+
+
+def _collect_slice_profiles_from_clickhouse(
+    canonical_ids: list[str],
+    *,
+    t0_raw: Any = None,
+    source_db: str = "",
+    profile_table: str = "",
+    max_ids: int = 5000,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Best-effort ClickHouse fallback for slice profiles (small-ID set only)."""
+    notes: list[str] = []
+    out: dict[str, dict[str, Any]] = {}
+    uniq_ids = sorted({str(x).strip() for x in canonical_ids if str(x).strip()})
+    if not uniq_ids:
+        return out, ["slice_profiles_no_canonical_ids"]
+    if len(uniq_ids) > max_ids:
+        return out, [f"slice_profiles_clickhouse_id_limit_exceeded:{len(uniq_ids)}>{max_ids}"]
+
+    t0_dt: datetime | None = None
+    t0_s = str(t0_raw or "").strip()
+    if t0_s:
+        ts = t0_s[:-1] + "+00:00" if t0_s.endswith("Z") else t0_s
+        try:
+            t0_dt = datetime.fromisoformat(ts)
+        except ValueError:
+            notes.append("slice_profiles_t0_unparseable_fallback_no_asof")
+    try:
+        from trainer import db_conn as _db_conn  # lazy import
+        from trainer.core import config as _cfg  # lazy import
+    except Exception:
+        return out, ["slice_profiles_clickhouse_import_failed"]
+
+    db = str(source_db or _cfg.SOURCE_DB).strip()
+    table = str(profile_table or _cfg.TPROFILE).strip()
+    if not db or not table:
+        return out, ["slice_profiles_clickhouse_missing_source_table"]
+    full_table = f"{db}.{table}"
+
+    try:
+        cli = _db_conn.get_clickhouse_client()
+        ddf = cli.query_df(f"DESCRIBE TABLE {full_table}")
+    except Exception:
+        return out, ["slice_profiles_clickhouse_describe_failed"]
+    if "name" not in getattr(ddf, "columns", []):
+        return out, ["slice_profiles_clickhouse_describe_missing_name_col"]
+    cols = {str(x) for x in ddf["name"].tolist()}
+    required = {
+        "canonical_id",
+        "theo_win_sum_30d",
+        "active_days_30d",
+        "turnover_sum_30d",
+        "days_since_first_session",
+    }
+    if not required.issubset(cols):
+        miss = sorted(required - cols)
+        return out, [f"slice_profiles_clickhouse_missing_cols:{','.join(miss)}"]
+    has_asof = "as_of_ts" in cols
+    if not has_asof:
+        notes.append("slice_profiles_clickhouse_missing_as_of_ts_fallback_no_asof")
+    elif t0_dt is None:
+        notes.append("slice_profiles_missing_t0_or_unparseable_fallback_no_asof")
+
+    chosen_asof: dict[str, datetime] = {}
+    asof_drop = 0
+    asof_parse_err = 0
+    chunk = 800
+    for i in range(0, len(uniq_ids), chunk):
+        part = uniq_ids[i : i + chunk]
+        sel = (
+            "canonical_id, theo_win_sum_30d, active_days_30d, "
+            "turnover_sum_30d, days_since_first_session"
+        )
+        if has_asof:
+            sel += ", as_of_ts"
+        sql = f"SELECT {sel} FROM {full_table} WHERE canonical_id IN %(cids)s"
+        try:
+            pdf = cli.query_df(sql, parameters={"cids": tuple(part)})
+        except Exception:
+            notes.append("slice_profiles_clickhouse_query_failed")
+            continue
+        if pdf is None or len(pdf) == 0:
+            continue
+        for row in pdf.itertuples(index=False):
+            cid = str(getattr(row, "canonical_id", "") or "").strip()
+            if not cid:
+                continue
+            if has_asof and t0_dt is not None:
+                as_of_raw = getattr(row, "as_of_ts", None)
+                as_of_s = str(as_of_raw or "").strip()
+                if not as_of_s:
+                    continue
+                as_of_norm = as_of_s[:-1] + "+00:00" if as_of_s.endswith("Z") else as_of_s
+                try:
+                    as_of_dt = datetime.fromisoformat(as_of_norm)
+                except ValueError:
+                    asof_parse_err += 1
+                    continue
+                if as_of_dt > t0_dt:
+                    asof_drop += 1
+                    continue
+                prev = chosen_asof.get(cid)
+                if prev is not None and as_of_dt <= prev:
+                    continue
+                chosen_asof[cid] = as_of_dt
+            elif cid in out:
+                continue
+            out[cid] = {
+                "theo_win_sum_30d": getattr(row, "theo_win_sum_30d", None),
+                "active_days_30d": getattr(row, "active_days_30d", None),
+                "turnover_sum_30d": getattr(row, "turnover_sum_30d", None),
+                "days_since_first_session": getattr(row, "days_since_first_session", None),
+            }
+    if asof_drop > 0:
+        notes.append(f"slice_profiles_clickhouse_as_of_after_t0_dropped:{asof_drop}")
+    if asof_parse_err > 0:
+        notes.append(f"slice_profiles_clickhouse_as_of_parse_errors:{asof_parse_err}")
+    return out, notes
+
+
+def _slice_profiles_state_db_infeasible(notes: list[str]) -> bool:
+    """Hard-failure notes that justify fallback away from state_db primary."""
+    hard_prefixes = (
+        "state_db_not_found_for_slice_profiles",
+        "state_db_unavailable_for_slice_profiles",
+        "player_profile_missing_cols:",
+    )
+    for n in notes:
+        s = str(n)
+        if s.startswith(hard_prefixes):
+            return True
+    return False
+
+
+def _slice_profiles_asof_uncertain(notes: list[str]) -> bool:
+    """True when notes indicate as-of evidence is unavailable or degraded."""
+    prefixes = (
+        "player_profile_missing_as_of_ts_fallback_no_asof",
+        "slice_profiles_missing_t0_or_unparseable_fallback_no_asof",
+        "slice_profiles_no_asof_profile_at_or_before_t0:",
+        "slice_profiles_parquet_missing_as_of_ts_fallback_no_asof",
+        "slice_profiles_clickhouse_missing_as_of_ts_fallback_no_asof",
+    )
+    for n in notes:
+        s = str(n)
+        if s.startswith(prefixes):
+            return True
+    return False
+
+
+def _slice_contract_plan_section_hash(repo_root: Path) -> tuple[str | None, str | None]:
+    """Return (sha256_hex, section_id) for PLAN sprint §7 text."""
+    plan_path = repo_root / ".cursor" / "plans" / "PLAN_precision_uplift_sprint.md"
+    if not plan_path.is_file():
+        return None, None
+    try:
+        text = plan_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+    m_start = re.search(
+        r"^##\s+7\.\s+Phase 1 錯誤切片分析：分段定義（`slice_contract`）\s*$",
+        text,
+        re.MULTILINE,
+    )
+    if not m_start:
+        return None, None
+    start = m_start.start()
+    tail = text[m_start.end() :]
+    m_end = re.search(r"^##\s+8\.\s+", tail, re.MULTILINE)
+    end = (m_start.end() + m_end.start()) if m_end else len(text)
+    sec = text[start:end].strip()
+    if not sec:
+        return None, None
+    h = hashlib.sha256(sec.encode("utf-8")).hexdigest()
+    return h, "PLAN_precision_uplift_sprint.md#section-7"
+
+
+def _status_history_keyword_pattern() -> re.Pattern[str]:
+    """Compile lazily so module import stays light."""
+    global _STATUS_HISTORY_PATTERN
+    if _STATUS_HISTORY_PATTERN is None:
+        escaped = [re.escape(w) for w in _STATUS_HISTORY_KEYWORDS]
+        _STATUS_HISTORY_PATTERN = re.compile(
+            rf"({'|'.join(escaped)})", re.IGNORECASE
+        )
+    return _STATUS_HISTORY_PATTERN
+
+
+def _scan_status_md_keyword_hits(
+    status_text: str, *, max_hits: int = 200
+) -> list[dict[str, str]]:
+    """Return section + evidence snippets (same semantics as build_status_history_crosscheck)."""
+    pattern = _status_history_keyword_pattern()
+    section = "Uncategorized"
+    candidates: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_line in status_text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            section = line.removeprefix("## ").strip()
+            continue
+        if not line or len(line) < 12:
+            continue
+        if pattern.search(line):
+            evidence = line[:220]
+            key = (section, evidence)
+            if key not in seen:
+                seen.add(key)
+                candidates.append({"section": section, "evidence_snippet": evidence})
+                if len(candidates) >= max_hits:
+                    break
+    return candidates
+
+
+def _default_status_history_registry_path(repo_root: Path) -> Path:
+    """Canonical registry path under the investigation ``phase1/`` tree."""
+    return (
+        repo_root
+        / "investigations"
+        / "precision_uplift_recall_1pct"
+        / "phase1"
+        / "status_history_registry.yaml"
+    )
+
+
+def _default_status_history_status_md_path(repo_root: Path) -> Path:
+    return repo_root / ".cursor" / "plans" / "STATUS.md"
+
+
+def collect_status_history_crosscheck(
+    run_id: str,
+    repo_root: Path,
+    cfg: Mapping[str, Any],
+    errors: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Load registry + optional STATUS keyword scan (W1-B1 machine-readable bundle).
+
+    ``unresolved_blockers`` lists registry entries with ``blocks_phase1_decision`` and
+    ``resolution_status`` in ``open`` / ``deferred`` (case-insensitive).
+    """
+    reg_rel = str(cfg.get("status_history_registry_path") or "").strip()
+    reg_path = (
+        _resolve_under_root(repo_root, reg_rel)
+        if reg_rel
+        else _default_status_history_registry_path(repo_root)
+    )
+    status_rel = str(cfg.get("status_history_status_md_path") or "").strip()
+    status_path = (
+        _resolve_under_root(repo_root, status_rel)
+        if status_rel
+        else _default_status_history_status_md_path(repo_root)
+    )
+
+    out: dict[str, Any] = {
+        "run_id": run_id,
+        "registry_path": str(reg_path),
+        "status_md_path": str(status_path),
+        "registry_schema_version": None,
+        "registry_entries": [],
+        "registry_load_error": None,
+        "keyword_hits": [],
+        "status_md_scan_truncated": False,
+        "status_md_missing": False,
+        "unresolved_blockers": [],
+    }
+
+    entries: list[dict[str, Any]] = []
+    if reg_path.is_file():
+        try:
+            raw = yaml.safe_load(reg_path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            msg = f"invalid YAML in status_history registry: {exc}"
+            out["registry_load_error"] = msg
+            _append_error(errors, ERR_STATUS_HISTORY_REGISTRY, msg, path=str(reg_path))
+        else:
+            if isinstance(raw, Mapping):
+                out["registry_schema_version"] = raw.get("schema_version")
+                raw_entries = raw.get("entries")
+                if raw_entries is None:
+                    raw_entries = []
+                if not isinstance(raw_entries, list):
+                    msg = "status_history registry 'entries' must be a list"
+                    out["registry_load_error"] = msg
+                    _append_error(
+                        errors,
+                        ERR_STATUS_HISTORY_REGISTRY,
+                        msg,
+                        path=str(reg_path),
+                    )
+                else:
+                    for i, row in enumerate(raw_entries):
+                        if not isinstance(row, Mapping):
+                            continue
+                        issue_id = str(row.get("issue_id") or "").strip()
+                        if not issue_id:
+                            continue
+                        rs = str(row.get("resolution_status") or "").strip().lower()
+                        entry = {
+                            "issue_id": issue_id,
+                            "title": str(row.get("title") or "").strip(),
+                            "resolution_status": rs or "unknown",
+                            "blocks_phase1_decision": bool(row.get("blocks_phase1_decision")),
+                            "status_history_anchor": str(
+                                row.get("status_history_anchor") or ""
+                            ).strip(),
+                            "owner": str(row.get("owner") or "").strip(),
+                            "notes": str(row.get("notes") or "").strip(),
+                        }
+                        entries.append(entry)
+            else:
+                msg = "status_history registry root must be a mapping"
+                out["registry_load_error"] = msg
+                _append_error(
+                    errors,
+                    ERR_STATUS_HISTORY_REGISTRY,
+                    msg,
+                    path=str(reg_path),
+                )
+    else:
+        out["registry_load_error"] = "registry file not found (optional path)"
+
+    out["registry_entries"] = entries
+
+    disable_kw = bool(cfg.get("status_history_disable_keyword_scan"))
+    if not disable_kw and status_path.is_file():
+        try:
+            raw_text = status_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            out["keyword_hits"] = []
+            out["status_md_read_error"] = str(exc)
+        else:
+            scan_text = raw_text
+            if len(scan_text) > _STATUS_HISTORY_MD_SCAN_MAX_CHARS:
+                scan_text = scan_text[:_STATUS_HISTORY_MD_SCAN_MAX_CHARS]
+                out["status_md_scan_truncated"] = True
+            out["keyword_hits"] = _scan_status_md_keyword_hits(scan_text)
+    elif not disable_kw:
+        out["status_md_missing"] = True
+        out["keyword_hits"] = []
+
+    unresolved: list[dict[str, Any]] = []
+    for e in entries:
+        if not e.get("blocks_phase1_decision"):
+            continue
+        rs = str(e.get("resolution_status") or "").lower()
+        if rs in {"open", "deferred"}:
+            unresolved.append(
+                {
+                    "issue_id": e["issue_id"],
+                    "title": e.get("title"),
+                    "resolution_status": rs,
+                }
+            )
+    out["unresolved_blockers"] = unresolved
+    return out
+
+
 def collect_phase1_artifacts(
     run_id: str,
     cfg: Mapping[str, Any] | None = None,
@@ -926,6 +1658,141 @@ def collect_phase1_artifacts(
         "thresholds": dict(cfg_d.get("thresholds") or {}),
         "window": dict(window) if isinstance(window, Mapping) else {},
     }
+    bundle["status_history_crosscheck"] = collect_status_history_crosscheck(
+        run_id, root, cfg_d, errors
+    )
+    sc_spec = cfg_d.get("slice_contract")
+    if isinstance(sc_spec, Mapping):
+        try:
+            merged_sc = dict(sc_spec)
+            profile_notes: list[str] = []
+            eval_rows = merged_sc.get("eval_rows")
+            auto_rows_enabled = bool(merged_sc.get("auto_eval_rows_from_prediction_log"))
+            if (not isinstance(eval_rows, list)) and auto_rows_enabled:
+                max_rows_raw = merged_sc.get(
+                    "auto_eval_rows_limit", _SLICE_AUTO_EVAL_ROWS_LIMIT_DEFAULT
+                )
+                try:
+                    max_rows = max(1, int(max_rows_raw))
+                except (TypeError, ValueError):
+                    max_rows = _SLICE_AUTO_EVAL_ROWS_LIMIT_DEFAULT
+                auto_rows, auto_notes = _collect_slice_eval_rows_from_sqlite(
+                    prediction_db_path,
+                    state_db_path,
+                    window if isinstance(window, Mapping) else {},
+                    max_rows=max_rows,
+                )
+                merged_sc["eval_rows"] = auto_rows
+                if auto_notes:
+                    merged_sc["notes"] = "; ".join(auto_notes)
+            profiles = merged_sc.get("profiles")
+            auto_profiles_enabled = bool(merged_sc.get("auto_profiles_from_state_db"))
+            if (not isinstance(profiles, Mapping) or not profiles) and auto_profiles_enabled:
+                eval_rows_ready = merged_sc.get("eval_rows")
+                cids: list[str] = []
+                if isinstance(eval_rows_ready, list):
+                    for r in eval_rows_ready:
+                        if not isinstance(r, Mapping):
+                            continue
+                        cid = str(r.get("canonical_id") or "").strip()
+                        if cid:
+                            cids.append(cid)
+                ptable = str(merged_sc.get("profile_table") or "player_profile").strip() or "player_profile"
+                auto_profiles, profile_notes = _collect_slice_profiles_from_state_db(
+                    state_db_path,
+                    cids,
+                    profile_table=ptable,
+                    t0_raw=merged_sc.get("T0"),
+                )
+                if (not auto_profiles) and _slice_profiles_state_db_infeasible(profile_notes):
+                    p_rel = str(merged_sc.get("profile_parquet_path") or "").strip()
+                    if p_rel:
+                        p_path = _resolve_under_root(root, p_rel)
+                        parq_profiles, parq_notes = _collect_slice_profiles_from_parquet(
+                            p_path,
+                            cids,
+                            t0_raw=merged_sc.get("T0"),
+                        )
+                        if parq_profiles:
+                            auto_profiles = parq_profiles
+                        profile_notes.extend(parq_notes)
+                    if (not auto_profiles) and bool(merged_sc.get("auto_profiles_from_clickhouse")):
+                        ch_profiles, ch_notes = _collect_slice_profiles_from_clickhouse(
+                            cids,
+                            t0_raw=merged_sc.get("T0"),
+                            source_db=str(merged_sc.get("clickhouse_source_db") or "").strip(),
+                            profile_table=str(merged_sc.get("clickhouse_profile_table") or "").strip(),
+                        )
+                        if ch_profiles:
+                            auto_profiles = ch_profiles
+                        profile_notes.extend(ch_notes)
+                merged_sc["profiles"] = auto_profiles
+                if profile_notes:
+                    prior = str(merged_sc.get("notes") or "").strip()
+                    extra = "; ".join(profile_notes)
+                    merged_sc["notes"] = f"{prior}; {extra}".strip("; ").strip()
+            if "recall_score_threshold" not in merged_sc:
+                r1_thr = evaluators.extract_threshold_at_target_recall(r1_final)
+                if r1_thr is not None:
+                    merged_sc["recall_score_threshold"] = r1_thr
+                else:
+                    bt_thr = evaluators.extract_threshold_at_recall_0_01_from_backtest_metrics(
+                        metrics_obj
+                    )
+                    if bt_thr is not None:
+                        merged_sc["recall_score_threshold"] = bt_thr
+            if isinstance(merged_sc.get("eval_rows"), list):
+                sc_bundle = slice_contract.build_slice_contract_bundle(
+                    merged_sc
+                )
+                notes_joined = str(merged_sc.get("notes") or "").strip()
+                if notes_joined:
+                    prior = str(sc_bundle.get("notes") or "").strip()
+                    sc_bundle["notes"] = (
+                        f"{prior}; {notes_joined}".strip("; ").strip()
+                        if prior
+                        else notes_joined
+                    )
+                asof_mode = str(merged_sc.get("asof_mode", "STRICT") or "STRICT").strip().upper()
+                if asof_mode not in {"STRICT", "WARN_ONLY"}:
+                    asof_mode = "STRICT"
+                if asof_mode == "STRICT" and _slice_profiles_asof_uncertain(profile_notes):
+                    sc_bundle["slice_data_incomplete"] = True
+                    codes = sc_bundle.get("blocking_profile_codes")
+                    out_codes = (
+                        [str(c) for c in codes if str(c).strip()]
+                        if isinstance(codes, (list, tuple))
+                        else []
+                    )
+                    if "asof_contract_unavailable_strict" not in out_codes:
+                        out_codes.append("asof_contract_unavailable_strict")
+                    sc_bundle["blocking_profile_codes"] = sorted(set(out_codes))
+                plan_h, plan_ref = _slice_contract_plan_section_hash(root)
+                if plan_h is not None:
+                    sc_bundle["slice_contract_plan_hash_sha256"] = plan_h
+                    sc_bundle["slice_contract_plan_section"] = plan_ref
+                if not str(sc_bundle.get("slice_contract_version") or "").strip():
+                    if plan_h is not None:
+                        sc_bundle["slice_contract_version"] = f"plan7-sha256:{plan_h[:16]}"
+                    else:
+                        sc_bundle["slice_contract_version"] = "inline-v1"
+                bundle["slice_contract"] = sc_bundle
+        except Exception as exc:  # noqa: BLE001 — surface as collect error + stub bundle
+            _append_error(
+                errors,
+                ERR_SLICE_CONTRACT,
+                str(exc),
+                path="slice_contract:inline",
+            )
+            bundle["slice_contract"] = {
+                "slice_contract_version": "inline-v1",
+                "slice_data_incomplete": True,
+                "slice_contract_violations": [],
+                "blocking_profile_codes": ["slice_contract_exception"],
+                "top_drag_slices": [],
+                "row_annotations": [],
+                "notes": str(exc),
+            }
     return bundle
 
 
@@ -1425,6 +2292,12 @@ def collect_summary_for_run_state(bundle: Mapping[str, Any]) -> dict[str, Any]:
     r1m = bundle.get("r1_r6_mid") if isinstance(bundle.get("r1_r6_mid"), dict) else {}
     stats = bundle.get("state_db_stats") if isinstance(bundle.get("state_db_stats"), dict) else {}
     pit = bundle.get("pit_parity") if isinstance(bundle.get("pit_parity"), dict) else {}
+    sh = bundle.get("status_history_crosscheck")
+    sh_n = 0
+    if isinstance(sh, Mapping):
+        ub = sh.get("unresolved_blockers")
+        if isinstance(ub, list):
+            sh_n = len(ub)
     return {
         "error_count": len(bundle.get("errors") or []),
         "error_codes": [e.get("code", "") for e in (bundle.get("errors") or [])],
@@ -1436,4 +2309,5 @@ def collect_summary_for_run_state(bundle: Mapping[str, Any]) -> dict[str, Any]:
         "pit_parity_status": pit.get("status"),
         "pit_scored_at_in_window_ratio": pit.get("scored_at_in_window_ratio"),
         "pit_validated_at_non_null_ratio": pit.get("validated_at_non_null_ratio"),
+        "status_history_unresolved_blocker_count": sh_n,
     }

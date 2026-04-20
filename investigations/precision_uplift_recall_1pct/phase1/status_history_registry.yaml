@@ -1,0 +1,15 @@
+# Phase 1 — status_history_registry (W1-B1)
+# 單一結構化來源：歷史議題是否仍阻擋本輪 Phase 1 決策級結論。
+# Gate 規則：resolution_status 為 open 或 deferred 且 blocks_phase1_decision: true → FAIL（blocking_reasons 帶 issue_id）。
+
+schema_version: "1"
+entries:
+  - issue_id: SH-TEMPLATE-000
+    title: 範本列（預設已結案；請以真實議題取代或刪除）
+    resolution_status: resolved
+    blocks_phase1_decision: false
+    status_history_anchor: ".cursor/plans/STATUS.md"
+    owner: Orchestrator
+    notes: >
+      保留一列以利 YAML 結構與測試錨定。實務上請將暫緩議題標為 deferred + blocks_phase1_decision，
+      並在解除後改為 resolved。

@@ -112,9 +112,28 @@ def _write_slice_performance_report(path: Path, run_id: str, cfg: Mapping[str, A
         lines.append("*No `r2_prediction_log_vs_alerts` in R1 final payload.*")
     else:
         lines.append(_json_fence(r2))
+    sc = bundle.get("slice_contract")
+    lines.extend(["", "## slice_contract (PLAN §7 — W1-B2)", ""])
+    if isinstance(sc, Mapping) and sc:
+        lines.append(_json_fence(dict(sc)))
+    else:
+        lines.append(
+            "*No `slice_contract` in collect bundle.* "
+            "Optional: set `slice_contract` in Phase 1 config with inline `eval_rows` / `profiles` (see W1-B2)."
+        )
     lines.extend(["", "## Collector errors (if any)", ""])
     lines.append(_json_fence(list(errs)) if errs else "*None.*")
     path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def _write_slice_performance_json(path: Path, bundle: Mapping[str, Any]) -> Path | None:
+    """Persist ``slice_contract`` bundle for machines when collector populated it."""
+    if "slice_contract" not in bundle:
+        return None
+    sc = bundle.get("slice_contract")
+    out = {"slice_contract": sc}
+    path.write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
     return path
 
 
@@ -278,12 +297,45 @@ def _merge_status_history_crosscheck(path: Path, body: str) -> None:
     path.write_text(merged, encoding="utf-8")
 
 
-def _write_status_history_crosscheck(path: Path, run_id: str, cfg: Mapping[str, Any], gate: Mapping[str, Any]) -> Path:
+def _write_status_history_crosscheck_json(
+    path: Path, bundle: Mapping[str, Any]
+) -> Path:
+    """Write machine-readable ``status_history_crosscheck.json`` (W1-B1)."""
+    sh = bundle.get("status_history_crosscheck")
+    doc = sh if isinstance(sh, Mapping) else {}
+    path.write_text(
+        json.dumps(doc, indent=2, ensure_ascii=False, default=str) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_status_history_crosscheck(
+    path: Path,
+    run_id: str,
+    cfg: Mapping[str, Any],
+    gate: Mapping[str, Any],
+    bundle: Mapping[str, Any],
+) -> Path:
     """Update ``status_history_crosscheck.md`` orchestrator block only."""
+    sh = bundle.get("status_history_crosscheck")
+    n_kw = 0
+    n_un = 0
+    trunc = False
+    if isinstance(sh, Mapping):
+        hits = sh.get("keyword_hits")
+        if isinstance(hits, list):
+            n_kw = len(hits)
+        ub = sh.get("unresolved_blockers")
+        if isinstance(ub, list):
+            n_un = len(ub)
+        trunc = bool(sh.get("status_md_scan_truncated"))
     body = (
         f"**Last orchestrator run**: `{run_id}`\n\n"
         f"- **Gate status**: `{gate.get('status')}`\n"
         f"- **blocking_reasons**: `{gate.get('blocking_reasons')}`\n"
+        f"- **status_history_crosscheck.json**: keyword_hits≈{n_kw}, "
+        f"unresolved_blockers={n_un}, status_md_scan_truncated={trunc}\n"
         "- Please keep narrative cross-check above this block; edit conflicts rare.\n"
     )
     _merge_status_history_crosscheck(path, body)
@@ -907,7 +959,19 @@ def write_phase1_reports(
     written.append(_write_upper_bound_repro(phase1_dir / "upper_bound_repro.md", run_id, cfg_m, bundle_m))
     written.append(_write_label_noise_audit(phase1_dir / "label_noise_audit.md", run_id, cfg_m, bundle_m))
     written.append(_write_slice_performance_report(phase1_dir / "slice_performance_report.md", run_id, cfg_m, bundle_m))
+    sp_json = _write_slice_performance_json(phase1_dir / "slice_performance.json", bundle_m)
+    if sp_json is not None:
+        written.append(sp_json)
     written.append(_write_point_in_time_parity(phase1_dir / "point_in_time_parity_check.md", run_id, cfg_m, bundle_m))
     written.append(_write_phase1_gate_decision(phase1_dir / "phase1_gate_decision.md", run_id, cfg_m, bundle_m, gate_m))
-    written.append(_write_status_history_crosscheck(phase1_dir / "status_history_crosscheck.md", run_id, cfg_m, gate_m))
+    written.append(
+        _write_status_history_crosscheck(
+            phase1_dir / "status_history_crosscheck.md", run_id, cfg_m, gate_m, bundle_m
+        )
+    )
+    written.append(
+        _write_status_history_crosscheck_json(
+            phase1_dir / "status_history_crosscheck.json", bundle_m
+        )
+    )
     return written
