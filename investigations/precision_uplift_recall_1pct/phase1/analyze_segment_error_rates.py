@@ -261,6 +261,13 @@ def _load_profiles_from_state_db(state_db: Path, cids: list[str], table: str) ->
     return out, notes
 
 
+def _has_note_prefix(notes: list[str], prefix: str) -> bool:
+    for n in notes:
+        if str(n).startswith(prefix):
+            return True
+    return False
+
+
 def _load_profiles_from_parquet(parquet_path: Path, cids: list[str]) -> tuple[dict[str, dict[str, Any]], list[str]]:
     notes: list[str] = []
     out: dict[str, dict[str, Any]] = {}
@@ -423,12 +430,29 @@ def main() -> int:
         state_db, cids, str(args.profile_table)
     )
     source = "state_db"
-    if not profiles and args.profile_parquet_path:
-        profiles, pn = _load_profiles_from_parquet(Path(args.profile_parquet_path), cids)
+
+    # Fallback trigger: no profiles OR state_db profile schema is insufficient.
+    need_profile_fallback = (not profiles) or _has_note_prefix(
+        profile_notes, "state_db_profile_missing_cols:"
+    )
+    parquet_path_raw = str(args.profile_parquet_path or "").strip()
+    parquet_path = Path(parquet_path_raw) if parquet_path_raw else (Path.cwd() / "data" / "player_profile.parquet")
+    tried_default_parquet = not bool(parquet_path_raw)
+
+    if need_profile_fallback:
+        parq_profiles, pn = _load_profiles_from_parquet(parquet_path, cids)
         profile_notes.extend(pn)
-        if profiles:
+        if parq_profiles:
+            profiles = parq_profiles
             source = "parquet"
-    if not profiles and args.use_clickhouse_fallback:
+            if _has_note_prefix(profile_notes, "state_db_profile_missing_cols:"):
+                profile_notes.append("state_db_profile_missing_cols_resolved_by_parquet")
+        elif tried_default_parquet:
+            profile_notes.append(
+                f"parquet_default_not_usable:{parquet_path.as_posix()}"
+            )
+
+    if (not profiles) and args.use_clickhouse_fallback:
         profiles, cn = _load_profiles_from_clickhouse(
             cids,
             source_db=str(args.clickhouse_source_db),

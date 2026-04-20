@@ -34,7 +34,7 @@
 
 資料源優先序固定為：
 1. `prediction_log + state_db`（primary）
-2. `--profile-parquet-path`（僅當 profile segment 欄位在 state_db 不可用時）
+2. `--profile-parquet-path`（僅當 profile segment 欄位在 state_db 不可用時；若未提供，會自動嘗試 `data/player_profile.parquet`）
 3. `--use-clickhouse-fallback`（僅當前兩者仍不可用時）
 
 此腳本為 ad-hoc 分析用途，不做 Gate 決策。
