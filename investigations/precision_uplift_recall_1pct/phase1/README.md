@@ -45,6 +45,12 @@
 
 此腳本為 ad-hoc 分析用途，不做 Gate 決策。
 
+每個 segment 目前輸出指標包含：
+- `n`, `tp`, `fp`, `fn`, `alerts`
+- `precision_at_alert`（`TP/(TP+FP)`）
+- `error_rate`（`(FP+FN)/N`）
+- `alert_rate`（`alerts/N`）
+
 ## 可依此做出的決策
 
 - **進入 Phase 2**：主因排序完成，且評估契約可信；或模型為主因、資料側無阻斷級問題。

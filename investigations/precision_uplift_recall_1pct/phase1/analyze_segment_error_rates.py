@@ -521,22 +521,60 @@ def _aggregate_segment_error(rows: list[dict[str, Any]], key: str) -> list[dict[
     agg: dict[str, dict[str, Any]] = {}
     for r in rows:
         k = str(r.get(key) or f"UNKNOWN_{key.upper()}")
-        item = agg.setdefault(k, {"segment_key": k, "n": 0, "error_count": 0})
+        item = agg.setdefault(
+            k,
+            {
+                "segment_key": k,
+                "n": 0,
+                "error_count": 0,
+                "tp": 0,
+                "fp": 0,
+                "fn": 0,
+                "alerts": 0,
+            },
+        )
         item["n"] += 1
         item["error_count"] += int(r.get("error", 0))
+        is_alert = int(r.get("is_alert", 0))
+        label = int(r.get("label", 0))
+        if is_alert == 1:
+            item["alerts"] += 1
+            if label == 1:
+                item["tp"] += 1
+            else:
+                item["fp"] += 1
+        elif label == 1:
+            item["fn"] += 1
     out: list[dict[str, Any]] = []
     for x in agg.values():
         n = int(x["n"])
         e = int(x["error_count"])
+        tp = int(x["tp"])
+        fp = int(x["fp"])
+        fn = int(x["fn"])
+        alerts = int(x["alerts"])
         out.append(
             {
                 "segment_key": x["segment_key"],
                 "n": n,
                 "error_count": e,
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "alerts": alerts,
+                "precision_at_alert": (float(tp) / float(tp + fp)) if (tp + fp) > 0 else None,
                 "error_rate": (float(e) / float(n)) if n > 0 else None,
+                "alert_rate": (float(alerts) / float(n)) if n > 0 else None,
             }
         )
-    out.sort(key=lambda z: ((z["error_rate"] is None), -(z["error_rate"] or 0.0), -z["n"]))
+    out.sort(
+        key=lambda z: (
+            (z["precision_at_alert"] is None),  # prefer segments with defined precision
+            (z["precision_at_alert"] if z["precision_at_alert"] is not None else 1.0),  # lowest precision first
+            -(z["error_rate"] or 0.0),  # then higher error rate
+            -z["n"],
+        )
+    )
     return out
 
 
@@ -754,7 +792,7 @@ def main() -> int:
         out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
         print(f"[wrote] {out_path}")
 
-    print("Top segment drags (by error_rate):")
+    print("Top segment drags (by precision_at_alert, then error_rate):")
     for dim in seg_dims:
         rows = seg_out.get(dim) or []
         if not rows:
@@ -762,7 +800,13 @@ def main() -> int:
             continue
         top = rows[:5]
         line = ", ".join(
-            f"{r['segment_key']} err={r['error_rate']:.3f} n={r['n']}" for r in top if r["error_rate"] is not None
+            (
+                f"{r['segment_key']} "
+                f"prec={r['precision_at_alert']:.3f}" if r["precision_at_alert"] is not None else f"{r['segment_key']} prec=NA"
+            )
+            + f" err={r['error_rate']:.3f} alert_rate={r['alert_rate']:.3f} n={r['n']}"
+            for r in top
+            if r["error_rate"] is not None and r["alert_rate"] is not None
         )
         print(f"- {dim}: {line}")
     return 0
