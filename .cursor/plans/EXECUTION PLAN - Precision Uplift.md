@@ -38,8 +38,8 @@
 
 | 任務 | 狀態 | 備註 |
 | :--- | :--- | :--- |
-| `W1 / R1 precondition + objective freeze` | **⬜** | 尚未完成 precondition check 與 objective contract 凍結 |
-| `W2 / R1 objective implementation parity` | **⬜** | 尚未完成 trainer/backtester 報表與欄位對齊 |
+| `W1 / R1 Optuna precondition + objective freeze` | **⬜** | 尚未完成 Optuna / HPO precondition check 與 objective contract 凍結 |
+| `W2 / R1 Optuna objective implementation parity` | **⬜** | 尚未完成 `run_optuna_search` / winner-pick / 報表欄位對齊 |
 | `W3 / R2 ranking-focused training matrix` | **⬜** | 尚未形成可重跑的 weighting / HNM 配置矩陣 |
 | `W4 / R3 fair bakeoff` | **⬜** | 尚未建立單模公平比較與 winner / hold policy |
 | `W5 / R4 entry-gate decision` | **⬜** | 尚未判定二階段 PoC 是否應進場 |
@@ -51,7 +51,7 @@
 
 本檔覆蓋 **第一層主戰場前四項**，執行優先順序：
 
-1. 先凍結 `R1` 的 objective contract，避免後續各路線在不同目標上比較。
+1. 先凍結 `R1` 的 **Optuna / HPO objective contract**，避免後續各路線在不同目標上比較。
 2. 用 `R2` 驗證高分帶 FP 壓制是否真能帶動 field-test objective。
 3. 用 `R3` 建立單模公平比較基線，確認是否存在明顯較強的模型家族。
 4. 僅在 `R1`~`R3` 有可比性證據後，才啟動 `R4` PoC entry。
@@ -89,9 +89,9 @@
 
 | 狀態 | 任務 | 子任務 | Owner | 依賴 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **⬜** | `W1 / R1 precondition + objective freeze` | 1. 盤點 folds 的正例數、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小、test neg/pos ratio。 2. 明確定義 constrained objective、fallback fold semantics、guardrails。 3. 決定是否允許單一 objective 或需複合 objective。 | `DS owner` | 現有 trainer/backtester 基線可用、validation folds 與評估資料可取得 | `out/precision_uplift_field_test_objective/field_test_objective_precondition_check.json`、`trainer/precision_improvement_plan/field_test_objective_precondition_check.md`、objective 設計摘要 | 有完整 precondition 產物；明確寫出 `selection_mode`、fallback semantics、是否允許單一 constrained objective；不存在未定義欄位 |
-| **⬜** | `W2 / R1 objective implementation parity` | 1. 在 trainer / backtester 報表中對齊 objective 定義。 2. 確認欄位輸出含 `precision_raw` / `precision_prod_adjusted` / `recall` / `alerts_per_hour`。 3. 以同一資料窗比較 AP objective vs field-test objective。 | `DS owner` | `W1` | objective 對照報告、欄位對照表、run config 凍結紀錄 | 相同資料窗可重跑；新舊 objective 結果可並列比較；fallback / infeasible 情況可明確辨識 |
-| **⬜** | `W3 / R2 ranking-focused training matrix` | 1. 定義 weighting / hard-negative / top-band reweighting 的最小矩陣。 2. 跑小矩陣實驗。 3. 保留版本化配置與結果。 | `DS owner` | `W1` | ranking config matrix、實驗報告、保留/淘汰建議 | 至少一組配置完成同契約比較；結果能回答是否值得進一步擴展；無 silent resource blow-up |
+| **⬜** | `W1 / R1 Optuna precondition + objective freeze` | 1. 盤點 folds 的正例數、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小、test neg/pos ratio。 2. 明確定義 Optuna / HPO 要採用的 constrained objective、fallback fold semantics、guardrails。 3. 決定是否允許單一 objective 或需複合 objective。 | `DS owner` | 現有 trainer/backtester 基線可用、validation folds 與評估資料可取得 | `out/precision_uplift_field_test_objective/field_test_objective_precondition_check.json`、`trainer/precision_improvement_plan/field_test_objective_precondition_check.md`、objective 設計摘要 | 有完整 precondition 產物；明確寫出 `selection_mode`、Optuna objective 定義、fallback semantics、是否允許單一 constrained objective；不存在未定義欄位 |
+| **⬜** | `W2 / R1 Optuna objective implementation parity` | 1. 在 `run_optuna_search()`、winner-pick / early stopping 與 trainer / backtester 報表中對齊 objective 定義。 2. 確認欄位輸出含 `precision_raw` / `precision_prod_adjusted` / `recall` / `alerts_per_hour`。 3. 以同一資料窗比較 AP objective vs field-test objective。 | `DS owner` | `W1` | objective 對照報告、欄位對照表、run config 凍結紀錄 | 相同資料窗可重跑；新舊 objective 結果可並列比較；`run_optuna_search()` 與報表欄位語意一致；fallback / infeasible 情況可明確辨識 |
+| **⬜** | `W3 / R2 ranking-focused training matrix` | 1. 定義 weighting / hard-negative / top-band reweighting 的最小矩陣。 2. 跑小矩陣實驗。 3. 保留版本化配置與結果。 | `DS owner` | `W1`、`W2` | ranking config matrix、實驗報告、保留/淘汰建議 | 至少一組配置完成同契約比較；結果能回答是否值得進一步擴展；無 silent resource blow-up |
 
 ### 4.2 Batch B：單模比較與二階段 entry gate（P0/P1）
 
@@ -132,8 +132,9 @@
 ### 6.1 進入下一階段條件
 
 - `W2` 只有在 `W1` objective contract 凍結後才能正式開始。
+- `W3` 只有在 `W1` / `W2` 契約與欄位已可比後才能開始。
 - `W4` 只有在 `W1` / `W2` 契約與欄位已可比後才能開始。
-- `W5` 只有在 `W3` / `W4` 都產生可比性證據後才能做 go/no-go。
+- `W5` 只有在 `W2` / `W3` / `W4` 都產生可比性證據後才能做 go/no-go。
 - `W6` 僅在 `W5=GO` 時建立。
 
 ### 6.2 證據不足處理
