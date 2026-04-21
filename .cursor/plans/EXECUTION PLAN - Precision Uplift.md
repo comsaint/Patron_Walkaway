@@ -90,16 +90,16 @@
 | 狀態 | 任務 | 子任務 | Owner | 依賴 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **⬜** | `W1 / R1 Optuna precondition + objective freeze` | 1. 盤點 folds 的正例數、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小、test neg/pos ratio。 2. 明確定義 Optuna / HPO 要採用的 constrained objective、fallback fold semantics、guardrails。 3. 決定是否允許單一 objective 或需複合 objective。 | `DS owner` | 現有 trainer/backtester 基線可用、validation folds 與評估資料可取得 | `out/precision_uplift_field_test_objective/field_test_objective_precondition_check.json`、`trainer/precision_improvement_plan/field_test_objective_precondition_check.md`、objective 設計摘要 | 有完整 precondition 產物；明確寫出 `selection_mode`、Optuna objective 定義、fallback semantics、是否允許單一 constrained objective；不存在未定義欄位 |
-| **⬜** | `W2 / R1 Optuna objective implementation parity` | 1. 在 `run_optuna_search()`、winner-pick / early stopping 與 trainer / backtester 報表中對齊 objective 定義。 2. 確認欄位輸出含 `precision_raw` / `precision_prod_adjusted` / `recall` / `alerts_per_hour`。 3. 以同一資料窗比較 AP objective vs field-test objective。 | `DS owner` | `W1` | objective 對照報告、欄位對照表、run config 凍結紀錄 | 相同資料窗可重跑；新舊 objective 結果可並列比較；`run_optuna_search()` 與報表欄位語意一致；fallback / infeasible 情況可明確辨識 |
-| **⬜** | `W3 / R2 ranking-focused training matrix` | 1. 定義 weighting / hard-negative / top-band reweighting 的最小矩陣。 2. 跑小矩陣實驗。 3. 保留版本化配置與結果。 | `DS owner` | `W1`、`W2` | ranking config matrix、實驗報告、保留/淘汰建議 | 至少一組配置完成同契約比較；結果能回答是否值得進一步擴展；無 silent resource blow-up |
+| **⬜** | `W2 / R1 Optuna objective implementation parity` | 1. 在 `run_optuna_search()`、winner-pick / early stopping 與 trainer / backtester 報表中對齊 objective 定義。 2. 確認欄位輸出含 `precision_raw` / `precision_prod_adjusted` / `recall` / `alerts_per_hour`。 3. 以同一契約的多個資料窗比較 AP objective vs field-test objective，形成多窗對照報告。 | `DS owner` | `W1` | objective 對照報告（多窗）、欄位對照表、run config 凍結紀錄 | 至少完成同一契約下的多窗可重跑比較；新舊 objective 結果可跨窗並列比較；`run_optuna_search()` 與報表欄位語意一致；fallback / infeasible 情況可明確辨識 |
+| **⬜** | `W3 / R2 ranking-focused training matrix` | 1. 定義 weighting / hard-negative / top-band reweighting 的最小矩陣。 2. 跑小矩陣實驗。 3. 保留版本化配置與結果。 4. 輸出主指標 uplift 與穩定性摘要。 | `DS owner` | `W1`、`W2` | ranking config matrix、實驗報告（含主指標 uplift / 穩定性摘要）、保留/淘汰建議 | 至少一組配置完成同契約比較；結果能回答是否值得進一步擴展，且有主指標 uplift 與穩定性摘要；無 silent resource blow-up |
 
 ### 4.2 Batch B：單模比較與二階段 entry gate（P0/P1）
 
 | 狀態 | 任務 | 子任務 | Owner | 依賴 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **⬜** | `W4 / R3 fair bakeoff` | 1. 在同一特徵、切分、objective、報表下訓練 LGBM / CatBoost / XGBoost。 2. 輸出單模公平比較。 3. 明確給出 single winner / hold / reject。 | `DS owner` | `W1`、`W2` | bakeoff report、單模對照表、winner/hold policy | 三個模型家族結果可直接對照；比較欄位一致；結論明確寫出 single winner 只是 phase-level 收斂策略 |
-| **⬜** | `W5 / R4 entry-gate decision` | 1. 依 `W2`~`W4` 結果做 top-band FP error analysis。 2. 判定是否符合 stage-2 PoC entry criteria。 3. 若不符合，明確記錄不啟動理由。 | `DS owner + reviewer` | `W2`、`W3`、`W4` | entry-gate memo、top-band FP analysis、go/no-go decision | 有 go/no-go 決策；若 go，列出 PoC 邊界；若 no-go，列出阻塞證據與回頭任務 |
-| **⬜** | `W6 / R4 PoC task stub` | 僅在 `W5=GO` 時建立下一步 PoC 任務骨架：artifact、train/eval、serving parity、rollback。 | `DS owner` | `W5=GO` | stage-2 PoC stub | 只產生 PoC stub，不直接視為已開發；若 `W5=NO GO`，本列維持未開始 |
+| **⬜** | `W4 / R3 fair bakeoff` | 1. 在同一特徵、切分、objective、報表下訓練 LGBM / CatBoost / XGBoost。 2. 輸出含主指標、波動、成本的單模公平比較。 3. 明確給出 single winner / hold / reject。 | `DS owner` | `W1`、`W2` | bakeoff report（含主指標 / 波動 / 成本）、單模對照表、winner/hold policy | 三個模型家族結果可直接對照；比較欄位一致且含主指標、波動、成本；結論明確寫出 single winner 只是 phase-level 收斂策略 |
+| **⬜** | `W5 / R4 entry-gate decision` | 1. 依 `W2`~`W4` 結果做 top-band FP error analysis。 2. 判定是否符合 stage-2 PoC entry criteria，並明確記錄是否仍存在明顯殘餘 gap。 3. 盤點 serving 延遲、artifact 複雜度與 train-serve parity 成本是否在可接受範圍。 4. 若不符合，明確記錄不啟動理由。 | `DS owner + reviewer` | `W2`、`W3`、`W4` | entry-gate memo（含殘餘 gap / 複雜度評估）、top-band FP analysis、go/no-go decision | 有 go/no-go 決策，且明確標示此決策僅代表是否進入 stage-2 PoC、不是最終架構定案；若 go，列出 PoC 邊界、殘餘 gap 依據與 serving / artifact / parity 可接受性；若 no-go，列出阻塞證據與回頭任務 |
+| **⬜** | `W6 / R4 PoC task stub` | 僅在 `W5=GO` 時建立下一步 PoC 任務骨架：artifact、train/eval、單階基線公平對照、serving parity、rollback。 | `DS owner` | `W5=GO` | stage-2 PoC stub（含單階基線公平對照計畫） | 只產生 PoC stub，不直接視為已開發；stub 必須包含與單階最佳基線的公平對照設計；若 `W5=NO GO`，本列維持未開始 |
 
 ---
 
@@ -116,8 +116,10 @@
 
 - `W1`：若多數 folds 的 `T_feasible` 過小或常為空，不得硬切單一 constrained objective。
 - `W2`：trainer / backtester 必須對齊同一 objective contract 與 fallback semantics。
+- `W3`：ranking-focused 實驗至少要輸出主指標 uplift 與穩定性摘要，不接受只報單次最佳結果。
 - `W4`：模型家族比較必須是同特徵、同切分、同 objective、同報表，不接受 apples-to-oranges。
-- `W5`：二階段只能在 top-band FP 仍為主瓶頸時進場，不得憑直覺跳關。
+- `W5`：二階段只能在 top-band FP 仍為主瓶頸、且殘餘 gap 與 serving / artifact / parity 成本判定都已明確記錄時進場，不得憑直覺跳關。
+- `W6`：PoC stub 必須包含與單階最佳基線的公平對照設計，不得只寫二階段自身 train/eval 流程。
 
 ### 5.3 本輪最終 DoD
 
