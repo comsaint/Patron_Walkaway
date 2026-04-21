@@ -243,8 +243,16 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         # Same resolution as backtester CLI: manifest / versioned dir under MODEL_DIR
         # (``out/models/<model_version>/``) takes precedence over a legacy flat model.pkl
         # at the versions root when ``_latest_model_manifest.json`` exists.
-        d = resolve_model_bundle_dir(MODEL_DIR.resolve())
-        logger.info("[scorer] Resolved default model bundle directory: %s", d)
+        d = MODEL_DIR.resolve()
+        try:
+            d = resolve_model_bundle_dir(d)
+            logger.info("[scorer] Resolved default model bundle directory: %s", d)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            logger.warning(
+                "[scorer] Default bundle resolution failed (%s); falling back to MODEL_DIR root: %s",
+                exc,
+                d,
+            )
     model_path = d / "model.pkl"  # v10 single-model artifact (DEC-040: sole loader input)
     feature_list_path = d / "feature_list.json"
     reason_map_path = d / "reason_code_map.json"
