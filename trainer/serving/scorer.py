@@ -66,6 +66,7 @@ except ImportError:
         _join_profile = None  # type: ignore[assignment]
         coerce_feature_dtypes = None  # type: ignore[assignment]
 
+from trainer.core.model_bundle_paths import resolve_model_bundle_dir
 from trainer.db_conn import get_clickhouse_client  # serving lives under trainer; db_conn at package root
 
 try:
@@ -239,16 +240,11 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
     if model_dir is not None:
         d = model_dir.expanduser().resolve()
     else:
-        d = MODEL_DIR.resolve()
-        # Versioned training writes ``out/models/<model_version>/model.pkl`` + manifest at root.
-        if not (d / "model.pkl").exists():
-            try:
-                from trainer.core.model_bundle_paths import read_latest_bundle_dir
-
-                d = read_latest_bundle_dir(d)
-                logger.info("[scorer] Loaded model bundle from latest manifest: %s", d)
-            except (FileNotFoundError, ValueError, OSError):
-                pass
+        # Same resolution as backtester CLI: manifest / versioned dir under MODEL_DIR
+        # (``out/models/<model_version>/``) takes precedence over a legacy flat model.pkl
+        # at the versions root when ``_latest_model_manifest.json`` exists.
+        d = resolve_model_bundle_dir(MODEL_DIR.resolve())
+        logger.info("[scorer] Resolved default model bundle directory: %s", d)
     model_path = d / "model.pkl"  # v10 single-model artifact (DEC-040: sole loader input)
     feature_list_path = d / "feature_list.json"
     reason_map_path = d / "reason_code_map.json"

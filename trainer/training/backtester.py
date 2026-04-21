@@ -156,6 +156,20 @@ BACKTEST_OUT = getattr(_cfg, "DEFAULT_BACKTEST_OUT", BASE_DIR / "out_backtest")
 BACKTEST_OUT.mkdir(parents=True, exist_ok=True)
 
 
+def _default_model_bundle_root() -> Path:
+    """Resolve bundle dir for feature_spec / artifacts when caller omits an explicit path.
+
+    Prefer ``resolve_model_bundle_dir(MODEL_DIR)`` (manifest or legacy flat). If that
+    fails (e.g. empty ``out/models`` in a unit-test tree), fall back to *MODEL_DIR*
+    so ``backtest(..., model_bundle_dir=None)`` still loads repo ``feature_spec``
+    like the pre-versioned behavior.
+    """
+    try:
+        return resolve_model_bundle_dir(MODEL_DIR)
+    except FileNotFoundError:
+        return MODEL_DIR.resolve()
+
+
 # ---------------------------------------------------------------------------
 # Artifact loading
 # ---------------------------------------------------------------------------
@@ -172,8 +186,10 @@ def load_dual_artifacts(bundle_dir: Optional[Path] = None) -> Dict[str, Any]:
     the key ``"feature_list_meta"`` so that backtest() can distinguish profile
     features from non-profile features for NaN-fill logic (R127-1).
     """
-    root = bundle_dir if bundle_dir is not None else MODEL_DIR
-    root = root.resolve()
+    if bundle_dir is not None:
+        root = bundle_dir.expanduser().resolve()
+    else:
+        root = _default_model_bundle_root()
 
     model_path = root / "model.pkl"
     if not model_path.exists():
@@ -756,7 +772,7 @@ def backtest(
     # --- Track LLM on FULL bets (PLAN § Train–Serve Parity) ---
     # Compute before label filtering so window features see same history as trainer/scorer.
     _track_llm_degraded = False
-    _bundle_root = model_bundle_dir if model_bundle_dir is not None else MODEL_DIR
+    _bundle_root = model_bundle_dir if model_bundle_dir is not None else _default_model_bundle_root()
     _spec_path = _bundle_root / "feature_spec.yaml"
     if _spec_path.exists():
         feature_spec = load_feature_spec(_spec_path)
