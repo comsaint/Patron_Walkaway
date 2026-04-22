@@ -868,6 +868,169 @@ def build_phase2_trainer_argv(
     return argv, []
 
 
+def merge_phase2_field_test_precondition_into_trainer_env(
+    repo_root: Path,
+    bundle: Mapping[str, Any],
+    child_env: dict[str, str],
+) -> dict[str, Any]:
+    """When YAML lists fold metrics (or globs), build precondition JSON and set trainer env (W1-C4).
+
+    Precedence:
+    1. ``resources.field_test_objective_fold_metrics_json`` — non-empty list of
+       repo-relative paths (explicit).
+    2. Else ``resources.field_test_objective_fold_metrics_globs`` — non-empty list of
+       glob strings relative to repo root (e.g. ``investigations/**/fold_*.json``);
+       expands to unique ``*.json`` under the repo (cap 32 by default, see trainer module).
+
+    Optional:
+    ``resources.field_test_precondition_production_neg_pos_ratio`` (default 20),
+    ``resources.field_test_precondition_selection_mode`` (default ``field_test``).
+
+    On failure or misconfiguration, logs to stderr and returns a manifest with
+    ``applied: false`` without aborting trainer jobs.
+    """
+    from trainer.training.field_test_objective_precondition import (
+        build_field_test_precondition_for_orchestration,
+        expand_repo_relative_json_globs,
+        trainer_env_updates_from_precondition_manifest,
+    )
+
+    manifest: dict[str, Any] = {"applied": False, "reason": "not_configured"}
+    resources = bundle.get("resources")
+    if not isinstance(resources, Mapping):
+        return manifest
+
+    common = bundle.get("common")
+    if not isinstance(common, Mapping):
+        manifest = {"applied": False, "reason": "bundle_common_missing"}
+        return manifest
+    win = common.get("window")
+    if not isinstance(win, Mapping):
+        manifest = {"applied": False, "reason": "bundle_common_window_missing"}
+        return manifest
+    start_ts = str(win.get("start_ts") or "").strip()
+    end_ts = str(win.get("end_ts") or "").strip()
+    if not start_ts or not end_ts:
+        manifest = {"applied": False, "reason": "window_start_end_required"}
+        print(
+            "[precision_uplift_orchestrator] field_test precondition skipped: "
+            "common.window start_ts/end_ts required",
+            file=sys.stderr,
+            flush=True,
+        )
+        return manifest
+
+    rid = str(bundle.get("run_id") or "").strip()
+    if not rid:
+        manifest = {"applied": False, "reason": "bundle_run_id_missing"}
+        return manifest
+
+    raw_list = resources.get("field_test_objective_fold_metrics_json")
+    rels: list[str] = []
+    if raw_list is None:
+        pass
+    elif isinstance(raw_list, list):
+        rels = [str(x).strip() for x in raw_list if str(x).strip()]
+    else:
+        manifest = {
+            "applied": False,
+            "reason": "field_test_objective_fold_metrics_json_must_be_list",
+        }
+        print(
+            "[precision_uplift_orchestrator] field_test precondition skipped: "
+            "resources.field_test_objective_fold_metrics_json must be a list when set",
+            file=sys.stderr,
+            flush=True,
+        )
+        return manifest
+
+    abs_paths: list[Path] = []
+    root = repo_root.resolve()
+    glob_expand_meta: dict[str, Any] | None = None
+
+    if rels:
+        for rel in rels:
+            p = _resolve_path(repo_root, rel).resolve()
+            try:
+                p.relative_to(root)
+            except ValueError:
+                manifest = {
+                    "applied": False,
+                    "reason": "fold_metric_path_escapes_repo",
+                    "bad_path": rel,
+                }
+                print(
+                    f"[precision_uplift_orchestrator] field_test precondition skipped: "
+                    f"path outside repo ({rel!r})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return manifest
+            abs_paths.append(p)
+    else:
+        globs_raw = resources.get("field_test_objective_fold_metrics_globs")
+        if not isinstance(globs_raw, list) or not globs_raw:
+            return manifest
+        globs_list = [str(x).strip() for x in globs_raw if str(x).strip()]
+        if not globs_list:
+            return manifest
+        abs_paths, glob_expand_meta = expand_repo_relative_json_globs(
+            repo_root, globs_list
+        )
+        if not abs_paths:
+            manifest = {
+                "applied": False,
+                "reason": "empty_glob_match",
+                "glob_expand": glob_expand_meta,
+            }
+            print(
+                "[precision_uplift_orchestrator] field_test precondition skipped: "
+                "field_test_objective_fold_metrics_globs matched no json files under repo",
+                file=sys.stderr,
+                flush=True,
+            )
+            return manifest
+
+    ratio_raw = resources.get("field_test_precondition_production_neg_pos_ratio", 20.0)
+    try:
+        ratio = float(ratio_raw)
+    except (TypeError, ValueError):
+        ratio = 20.0
+
+    sel_raw = resources.get("field_test_precondition_selection_mode", "field_test")
+    sel_s = str(sel_raw).strip() if sel_raw is not None else "field_test"
+
+    manifest = build_field_test_precondition_for_orchestration(
+        repo_root,
+        run_id=rid,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        fold_metrics_abs_paths=abs_paths,
+        production_neg_pos_ratio=ratio,
+        selection_mode=sel_s,
+    )
+    if glob_expand_meta is not None:
+        manifest = {**manifest, "glob_expand": glob_expand_meta}
+    updates = trainer_env_updates_from_precondition_manifest(manifest)
+    if updates:
+        child_env.update(updates)
+        print(
+            "[precision_uplift_orchestrator] field_test precondition: "
+            f"wrote {manifest.get('output_json')} ({len(abs_paths)} fold files); "
+            "FIELD_TEST_OBJECTIVE_PRECONDITION_JSON set for trainer jobs.",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif not manifest.get("applied"):
+        print(
+            f"[precision_uplift_orchestrator] field_test precondition skipped: "
+            f"{manifest.get('reason')}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return manifest
+
+
 def _phase2_trainer_job_timeout_sec(bundle: Mapping[str, Any]) -> float | None:
     """Optional per-job timeout from ``bundle['resources']['phase2_trainer_job_timeout_sec']``."""
     res = bundle.get("resources")
@@ -918,6 +1081,11 @@ def run_phase2_trainer_jobs(
     child_env = _subprocess_env_align_model_dir_bundle(
         repo_root, config_model_dir=md_opt
     )
+    pre_manifest = merge_phase2_field_test_precondition_into_trainer_env(
+        repo_root, bundle, child_env
+    )
+    if isinstance(bundle, dict):
+        bundle["field_test_objective_precondition"] = pre_manifest
 
     results: list[dict[str, Any]] = []
     all_ok = True

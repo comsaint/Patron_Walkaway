@@ -1,5 +1,46 @@
 **Archive**: Past rounds and older STATUS blocks are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60, 67 Review–75 moved 2026-03-05; Rounds 79–99 moved 2026-03-05; Round 96 onward moved 2026-03-12; **2026-03-22**: Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等長段 → archive.)
 
+## Precision Uplift — Optuna 入口讀 W1 gate（2026-04-22）
+
+- `trainer/training/field_test_objective_precondition.py`：`precondition_constrained_optuna_allowed()`（與 `training_metrics_overlay_from_precondition` 的 constrained 旗標一致、不額外打 log）。
+- `trainer/training/trainer.py`：`run_optuna_search(..., field_test_constrained_optuna_objective_allowed=...)`；`False` 時 WARNING 說明仍僅優化 validation AP、W2 尚未接 field-test constrained study；`train_single_rated_model` 與 **遺留** `train_dual_model` 皆由 `_ft_pre_doc` 傳入；dual 僅在 **rated** 分支合併 `training_metrics` overlay（`nonrated` 不含 field_test 鍵）。
+- `tests/unit/test_field_test_objective_precondition_trainer.py`：gate 與 overlay 對照之單元測試；`test_train_dual_model_writes_field_test_overlay_on_rated_only`。
+
+```bash
+python -m pytest tests/unit/test_field_test_objective_precondition_trainer.py tests/unit/test_field_test_objective_precondition.py -q
+```
+
+本機：`19 passed`。
+
+---
+
+## Precision Uplift — Phase 2 orchestrator 自動 precondition（2026-04-22，接續）
+
+**完成項目**
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/training/field_test_objective_precondition.py` | 含 orchestration build、`expand_repo_relative_json_globs`（預設最多 32 個 JSON、去重、僅 repo 內）、2MB 讀檔上限、blocking_reasons schema 防呆。 |
+| `investigations/precision_uplift_recall_1pct/orchestrator/runner.py` | `merge_phase2_field_test_precondition_into_trainer_env`：顯式 `field_test_objective_fold_metrics_json` 優先，否則 `field_test_objective_fold_metrics_globs`；寫 `bundle["field_test_objective_precondition"]`、設子程序 env。 |
+| `investigations/.../config/run_phase2.yaml` | 註解範例（顯式路徑 + globs + 可選 ratio/selection_mode）。 |
+| `tests/unit/test_field_test_objective_precondition_trainer.py` | 含 glob 展開與截斷測試。 |
+
+**驗證**
+
+```bash
+python -m pytest tests/unit/test_field_test_objective_precondition_trainer.py tests/unit/test_field_test_objective_precondition.py -q
+```
+
+本機：`14 passed`（含 glob 單元測試）。
+
+**手動**：在 Phase 2 YAML 的 `resources` 加入 `field_test_objective_fold_metrics_json`（repo-relative 路徑列表）後跑 `--phase2-run-trainer-jobs`，應於 stderr 見 orchestrator 一行 log，且 `phase2_bundle.json` 內有 `field_test_objective_precondition`。
+
+**下一步建議**：由 R1/R6 或既有 fold 產物自動填入上述 list（減少手刻路徑）；W2 本體仍待實作 field-test constrained study（`run_optuna_search` 已讀 gate 並在禁止時 WARNING）。
+
+**後續（glob）**：`resources.field_test_objective_fold_metrics_globs` 已支援（預設最多 32 個 `*.json`）；顯式 `field_test_objective_fold_metrics_json` 仍優先。請把 glob 收窄到 `results/<run_id>/` 等子樹以免掃完整個 repo。
+
+---
+
 ## Precision Uplift — `/cycle_code`（W1-C4 trainer gate + metrics overlay，2026-04-22）
 
 ### STEP 1 — Builder

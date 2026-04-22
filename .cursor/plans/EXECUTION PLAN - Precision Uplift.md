@@ -109,9 +109,9 @@
 | 狀態 | 子項 | 內容 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- |
 | **⬜** | `W1-C1 precondition schema freeze` | 凍結 precondition JSON 最小欄位：`run_id`、`window`、`fold_stats[]`、`t_feasible_stats`、`test_neg_pos_ratio`、`production_neg_pos_ratio_assumption`、`single_objective_allowed`、`blocking_reasons[]`。 | `field_test_objective_precondition_check.json` schema 區塊或等價欄位 | 欄位定義完整且無待定 placeholder |
-| **🟡** | `W1-C2 fold evidence collect` | 依同一契約收集各 fold：正例數、finalized TP 數量級、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小。 | precondition JSON `fold_stats[]` | 腳本可聚合手動餵入之 fold metrics；尚未接 investigation / full run 自動餵檔 |
+| **🟡** | `W1-C2 fold evidence collect` | 依同一契約收集各 fold：正例數、finalized TP 數量級、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小。 | precondition JSON `fold_stats[]` | 腳本可聚合手動餵入之 fold metrics；Phase 2 可經顯式路徑或 `field_test_objective_fold_metrics_globs` 自動展開；仍待從 R1/R6 stdout 結構化抽取 fold 路徑（若有） |
 | **🟡** | `W1-C3 objective decision` | 依 `W1-C2` 證據判斷：`single constrained objective` 或 `composite objective`；明確寫 fallback fold semantics。 | `field_test_objective_precondition_check.md` 決策段落 | 腳本可輸出 `objective_decision` / `blocking_reasons`；MD 決策模板與 fallback 段落仍待加強 |
-| **🟡** | `W1-C4 gate readiness` | 將 `selection_mode`、objective 定義、fallback semantics 寫回 run contract，並生成本輪 objective freeze 摘要。 | objective 設計摘要 + run contract 凍結紀錄 | 已可經 `FIELD_TEST_OBJECTIVE_PRECONDITION_JSON` 將 precondition 摘要寫入 `training_metrics.json`；完整 run contract 凍結紀錄與 orchestration 自動產檔仍待補 |
+| **🟡** | `W1-C4 gate readiness` | 將 `selection_mode`、objective 定義、fallback semantics 寫回 run contract，並生成本輪 objective freeze 摘要。 | objective 設計摘要 + run contract 凍結紀錄 | 已可經 `FIELD_TEST_OBJECTIVE_PRECONDITION_JSON` 寫入 `training_metrics.json`；Phase 2 orchestrator 可經 `resources.field_test_objective_fold_metrics_json` 自動建檔並注入子程序 env；完整 run contract 凍結紀錄與「自動收集 fold 路徑」仍待補 |
 
 #### 4.1.2 `W1` 阻擋規則（Fail-fast）
 

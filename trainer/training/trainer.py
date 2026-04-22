@@ -72,6 +72,7 @@ from trainer.training.field_test_objective_precondition import (
     FIELD_TEST_OBJECTIVE_PRECONDITION_JSON_ENV,
     log_optuna_precondition_context,
     log_precondition_block_warning,
+    precondition_constrained_optuna_allowed,
     training_metrics_overlay_from_precondition,
     try_load_precondition_json,
 )
@@ -3105,9 +3106,15 @@ def run_optuna_search(
     sw_train: pd.Series,
     n_trials: int = OPTUNA_N_TRIALS,
     label: str = "",
+    field_test_constrained_optuna_objective_allowed: Optional[bool] = None,
 ) -> dict:
     """TPE hyperparameter search.  Optimises average precision (AP) on validation set.
-    Threshold selection uses F-0.5 separately."""
+    Threshold selection uses F-0.5 separately.
+
+    When ``field_test_constrained_optuna_objective_allowed`` is ``False`` (W1
+    precondition), this function still runs the AP study only; a field-test
+    single constrained objective must not be wired in until W2 adds that path.
+    """
     # R705: guard against empty validation input — return empty dict (base params)
     # rather than crashing inside LightGBM or average_precision_score.
     if X_val.empty or len(y_val) == 0:
@@ -3116,6 +3123,14 @@ def run_optuna_search(
             label or "model",
         )
         return {}
+
+    if field_test_constrained_optuna_objective_allowed is False:
+        logger.warning(
+            "%s: W1 precondition disallows field-test single constrained objective "
+            "(field_test_constrained_optuna_objective_allowed=False); "
+            "Optuna continues with validation AP only (W2 alternate objective not active).",
+            label or "model",
+        )
 
     # HPO subsampling (PLAN "Optuna HPO 階段 train/valid 抽樣"): use X_tr, y_tr, sw_tr, X_vl, y_vl in objective.
     X_tr = X_train
@@ -4097,6 +4112,20 @@ def train_dual_model(
     sw_rated = compute_sample_weights(train_rated)
     sw_nonrated = compute_sample_weights(train_nonrated)
 
+    _ft_pre_doc: Optional[Dict[str, Any]] = None
+    _ft_pre_path_raw = (os.environ.get(FIELD_TEST_OBJECTIVE_PRECONDITION_JSON_ENV) or "").strip()
+    if _ft_pre_path_raw:
+        _ft_pre_doc = try_load_precondition_json(Path(_ft_pre_path_raw))
+        if _ft_pre_doc is None:
+            logger.warning(
+                "%s set but file missing or invalid: %s",
+                FIELD_TEST_OBJECTIVE_PRECONDITION_JSON_ENV,
+                _ft_pre_path_raw,
+            )
+        else:
+            log_precondition_block_warning(_ft_pre_doc)
+    _ft_optuna_allowed = precondition_constrained_optuna_allowed(_ft_pre_doc)
+
     results: dict[str, Any] = {}
     for name, tr_df, vl_df, te_df, sw in [
         ("rated",    train_rated,    val_rated,    _test_rated,    sw_rated),
@@ -4115,7 +4144,16 @@ def train_dual_model(
         y_vl = vl_df["label"] if not vl_df.empty else y_tr.head(0)
 
         if run_optuna and not vl_df.empty and y_vl.sum() > 0:
-            hp = run_optuna_search(X_tr, y_tr, X_vl, y_vl, sw, label=name)
+            log_optuna_precondition_context(_ft_pre_doc)
+            hp = run_optuna_search(
+                X_tr,
+                y_tr,
+                X_vl,
+                y_vl,
+                sw,
+                label=name,
+                field_test_constrained_optuna_objective_allowed=_ft_optuna_allowed,
+            )
         else:
             # Default params when validation is empty or no positives
             hp = {
@@ -4161,6 +4199,13 @@ def train_dual_model(
         # Feature importance ranked by LightGBM gain.
         metrics["feature_importance"] = _compute_feature_importance(model, avail_cols)
         metrics["importance_method"] = "gain"
+
+        if name == "rated" and _ft_pre_doc is not None and _ft_pre_path_raw:
+            metrics.update(
+                training_metrics_overlay_from_precondition(
+                    _ft_pre_doc, source_path=_ft_pre_path_raw
+                )
+            )
 
         results[name] = {
             "model": model,
@@ -4303,7 +4348,16 @@ def train_single_rated_model(
         }
     elif run_optuna and not val_rated.empty and y_vl.sum() > 0:
         log_optuna_precondition_context(_ft_pre_doc)
-        hp = run_optuna_search(X_tr, y_tr, X_vl, y_vl, sw_rated, label="rated")
+        _ft_optuna_allowed = precondition_constrained_optuna_allowed(_ft_pre_doc)
+        hp = run_optuna_search(
+            X_tr,
+            y_tr,
+            X_vl,
+            y_vl,
+            sw_rated,
+            label="rated",
+            field_test_constrained_optuna_objective_allowed=_ft_optuna_allowed,
+        )
     else:
         hp = {
             "n_estimators": 400,

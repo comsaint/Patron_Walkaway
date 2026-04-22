@@ -33,6 +33,19 @@ resources:
   # Optional: override default trainer/out_backtest/backtest_metrics.json after backtest:
   # backtest_metrics_path: trainer/out_backtest/backtest_metrics.json
   #
+  # Optional (W1 / field-test objective): repo-relative paths to per-fold metrics JSON
+  # (same shape as ``--fold-metrics-json`` for ``trainer.scripts.build_field_test_objective_precondition``).
+  # When set, Phase 2 orchestrator builds ``out/precision_uplift_field_test_objective/phase2_<run_id>_...json``
+  # before trainer jobs and sets ``FIELD_TEST_OBJECTIVE_PRECONDITION_JSON`` for each subprocess.
+  # field_test_objective_fold_metrics_json:
+  #   - investigations/precision_uplift_recall_1pct/results/_example/fold_a.json
+  #   - investigations/precision_uplift_recall_1pct/results/_example/fold_b.json
+  # Or omit the explicit list and use globs (repo-relative; ** requires recursive=True; capped at 32 files):
+  # field_test_objective_fold_metrics_globs:
+  #   - "investigations/precision_uplift_recall_1pct/results/<run_id>/**/*.json"
+  # field_test_precondition_production_neg_pos_ratio: 20   # optional, default 20
+  # field_test_precondition_selection_mode: field_test     # optional
+  #
   # After --phase2-run-trainer-jobs: orchestrator parses trainer stderr/stdout for
   # "Artifacts saved to …" and fills job_specs.training_metrics_repo_relative when
   # the experiment did not set it in YAML (see runner.infer_training_metrics_repo_relative_from_trainer_logs).
