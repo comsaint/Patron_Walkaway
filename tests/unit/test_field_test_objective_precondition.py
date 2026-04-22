@@ -5,6 +5,8 @@ from pathlib import Path
 
 from trainer.scripts.build_field_test_objective_precondition import run
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -89,7 +91,7 @@ def test_single_override_rejected_when_blockers_exist(tmp_path: Path) -> None:
 
 
 def test_execution_plan_uses_any_fold_gate_wording() -> None:
-    plan_path = Path("c:/Users/longp/Patron_Walkaway/.cursor/plans/EXECUTION PLAN - Precision Uplift.md")
+    plan_path = _REPO_ROOT / ".cursor" / "plans" / "EXECUTION PLAN - Precision Uplift.md"
     text = plan_path.read_text(encoding="utf-8")
     assert "若多數 folds 的 `T_feasible` 過小或常為空，不得硬切單一 constrained objective。" not in text
     assert "若任一 fold 的 `T_feasible` 過小或常為空，不得硬切單一 constrained objective。" in text
