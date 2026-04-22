@@ -1048,7 +1048,7 @@ def _phase2_trainer_job_timeout_sec(bundle: Mapping[str, Any]) -> float | None:
 
 def run_phase2_trainer_jobs(
     repo_root: Path,
-    bundle: Mapping[str, Any],
+    bundle: dict[str, Any],
     *,
     python_exe: str | None = None,
     timeout_sec: float | None = None,
@@ -1057,7 +1057,8 @@ def run_phase2_trainer_jobs(
 
     Args:
         repo_root: Repository root (subprocess cwd).
-        bundle: Phase 2 bundle with ``common``, ``resources``, ``job_specs``.
+        bundle: Phase 2 bundle (mutable dict) with ``common``, ``resources``, ``job_specs``;
+            updated in-place with ``field_test_objective_precondition`` after precondition merge.
         python_exe: Interpreter; defaults to ``sys.executable``.
         timeout_sec: Subprocess timeout per job; ``None`` uses bundle resource when set,
             else no timeout.
@@ -1084,8 +1085,7 @@ def run_phase2_trainer_jobs(
     pre_manifest = merge_phase2_field_test_precondition_into_trainer_env(
         repo_root, bundle, child_env
     )
-    if isinstance(bundle, dict):
-        bundle["field_test_objective_precondition"] = pre_manifest
+    bundle["field_test_objective_precondition"] = pre_manifest
 
     results: list[dict[str, Any]] = []
     all_ok = True
