@@ -3,14 +3,14 @@
 ## Precision Uplift — Optuna 入口讀 W1 gate（2026-04-22）
 
 - `trainer/training/field_test_objective_precondition.py`：`precondition_constrained_optuna_allowed()`（與 `training_metrics_overlay_from_precondition` 的 constrained 旗標一致、不額外打 log）。
-- `trainer/training/trainer.py`：`run_optuna_search(..., field_test_constrained_optuna_objective_allowed=...)`；`False` 時 WARNING 說明仍僅優化 validation AP、W2 尚未接 field-test constrained study；`train_single_rated_model` 與 **遺留** `train_dual_model` 皆由 `_ft_pre_doc` 傳入；dual 僅在 **rated** 分支合併 `training_metrics` overlay（`nonrated` 不含 field_test 鍵）。
+- `trainer/training/trainer.py`：`run_optuna_search(..., field_test_constrained_optuna_objective_allowed=..., val_window_hours=...)`；W1 禁止時 WARNING 並仍用 validation AP；**W2（部分）**：field-test 路徑下 study 最大化 DEC-026 選出之 validation precision；若設 `PRODUCTION_NEG_POS_RATIO` 且 validation 有正例且 `neg/pos>0`，改以 `_precision_prod_adjusted`（與 `test_neg_pos_ratio` 同口徑之 `n_neg/n_pos`）作 trial 分數，否則 raw precision。`FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR` 預設 50。`train_single_rated_model` / `train_dual_model`（rated）傳入 `val_window_hours`。
 - `tests/unit/test_field_test_objective_precondition_trainer.py`：gate 與 overlay 對照之單元測試；`test_train_dual_model_writes_field_test_overlay_on_rated_only`。
 
 ```bash
 python -m pytest tests/unit/test_field_test_objective_precondition_trainer.py tests/unit/test_field_test_objective_precondition.py -q
 ```
 
-本機：`19 passed`。
+本機：`24 passed`（含 `_neg_pos_ratio_from_binary_labels`、prod-adjusted field-test HPO smoke）。
 
 ---
 

@@ -3098,6 +3098,81 @@ def _base_lgb_params() -> dict:
     return _lgb_params_for_pipeline()
 
 
+def _val_window_hours_from_payout_df(df: Optional[pd.DataFrame]) -> Optional[float]:
+    """Validation span in hours from ``payout_complete_dtm`` (for alerts/hour in HPO).
+
+    Returns ``None`` when the column is missing, rows are insufficient, or span is non-positive.
+    """
+    if df is None or df.empty or "payout_complete_dtm" not in df.columns:
+        return None
+    ts = pd.to_datetime(df["payout_complete_dtm"], errors="coerce")
+    if int(ts.notna().sum()) < 2:
+        return None
+    ts_naive = ts.dt.tz_localize(None) if getattr(ts.dt, "tz", None) is not None else ts
+    mn = ts_naive.min()
+    mx = ts_naive.max()
+    if pd.isna(mn) or pd.isna(mx):
+        return None
+    span_sec = float((mx - mn).total_seconds())
+    if not math.isfinite(span_sec) or span_sec <= 0.0:
+        return None
+    return span_sec / 3600.0
+
+
+def _neg_pos_ratio_from_binary_labels(y: Any) -> Optional[float]:
+    """Return neg/pos count ratio for binary 0/1 labels (``n_neg / n_pos``), same contract as ``test_neg_pos_ratio``."""
+    y_a = np.asarray(y, dtype=float)
+    n_pos = int(np.sum(y_a == 1.0))
+    n_neg = int(np.sum(y_a == 0.0))
+    if n_pos <= 0:
+        return None
+    r = float(n_neg) / float(n_pos)
+    if not math.isfinite(r) or r <= 0.0:
+        return None
+    return r
+
+
+def _rated_field_test_val_pick_per_hour_kwargs(
+    *,
+    label: str,
+    field_test_constrained_optuna_objective_allowed: Optional[bool],
+    val_df: pd.DataFrame,
+) -> tuple[Optional[float], Optional[float]]:
+    """Return ``(window_hours, min_alerts_per_hour)`` for validation DEC-026 pick matching field-test Optuna trials.
+
+    When W1 allows the constrained path, *label* is ``rated``, and payout span is known,
+    use the same floor as :func:`run_optuna_search` so refit winner metrics align with
+    trial scores (W2 winner-pick parity).  Otherwise ``(None, None)`` — historical pick
+    without per-hour density on validation.
+    """
+    if str(label or "").strip().lower() != "rated":
+        return None, None
+    if field_test_constrained_optuna_objective_allowed is not True:
+        return None, None
+    wh = _val_window_hours_from_payout_df(val_df)
+    if wh is None:
+        return None, None
+    _mah = getattr(_cfg, "FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR", 50.0)
+    try:
+        mf = float(_mah)
+    except (TypeError, ValueError):
+        mf = 50.0
+    if not math.isfinite(mf) or mf <= 0.0:
+        mf = 50.0
+    return float(wh), mf
+
+
+def _write_optuna_hpo_manifest(
+    sink: Optional[list[dict[str, Any]]],
+    payload: dict[str, Any],
+) -> None:
+    """Replace *sink* with a single-element list copy of *payload* (optional Optuna HPO provenance for metrics)."""
+    if sink is None:
+        return
+    sink.clear()
+    sink.append(dict(payload))
+
+
 def run_optuna_search(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -3107,13 +3182,24 @@ def run_optuna_search(
     n_trials: int = OPTUNA_N_TRIALS,
     label: str = "",
     field_test_constrained_optuna_objective_allowed: Optional[bool] = None,
+    val_window_hours: Optional[float] = None,
+    hpo_objective_manifest: Optional[list[dict[str, Any]]] = None,
 ) -> dict:
-    """TPE hyperparameter search.  Optimises average precision (AP) on validation set.
-    Threshold selection uses F-0.5 separately.
+    """TPE hyperparameter search on validation.
 
-    When ``field_test_constrained_optuna_objective_allowed`` is ``False`` (W1
-    precondition), this function still runs the AP study only; a field-test
-    single constrained objective must not be wired in until W2 adds that path.
+    Default: maximise average precision (AP).  When W1 allows a field-test path
+    (``field_test_constrained_optuna_objective_allowed is True``), ``label`` is
+    ``rated``, and ``val_window_hours`` is a finite positive span, the study
+    instead maximises DEC-026 validation **precision** at the best threshold
+    subject to ``FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR`` (default 50) and the usual
+    recall / min-alert-count guards — matching :func:`pick_threshold_dec026` semantics.
+    When ``PRODUCTION_NEG_POS_RATIO`` is set and validation has positives with
+    strictly positive neg/pos ratio, the trial score uses
+    :func:`_precision_prod_adjusted` on that raw precision (Implementation Plan R1);
+    otherwise the raw DEC-026 precision is maximised.
+
+    When *hpo_objective_manifest* is a list, it is cleared and receives one dict of
+    flat ``optuna_hpo_*`` keys for ``training_metrics.json`` (W2 provenance vs ``val_ap``).
     """
     # R705: guard against empty validation input — return empty dict (base params)
     # rather than crashing inside LightGBM or average_precision_score.
@@ -3122,6 +3208,13 @@ def run_optuna_search(
             "%s: empty validation set — skipping Optuna search, returning base params.",
             label or "model",
         )
+        _write_optuna_hpo_manifest(
+            hpo_objective_manifest,
+            {
+                "optuna_hpo_objective_mode": "skipped_empty_validation",
+                "optuna_hpo_study_best_trial_value": None,
+            },
+        )
         return {}
 
     if field_test_constrained_optuna_objective_allowed is False:
@@ -3129,6 +3222,37 @@ def run_optuna_search(
             "%s: W1 precondition disallows field-test single constrained objective "
             "(field_test_constrained_optuna_objective_allowed=False); "
             "Optuna continues with validation AP only (W2 alternate objective not active).",
+            label or "model",
+        )
+
+    _mah_ft = getattr(_cfg, "FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR", 50.0)
+    try:
+        _mah_ft_f = float(_mah_ft)
+    except (TypeError, ValueError):
+        _mah_ft_f = 50.0
+    if not math.isfinite(_mah_ft_f) or _mah_ft_f <= 0.0:
+        _mah_ft_f = 50.0
+
+    _vwh: Optional[float] = None
+    if val_window_hours is not None:
+        try:
+            _wf = float(val_window_hours)
+        except (TypeError, ValueError):
+            _wf = float("nan")
+        else:
+            if math.isfinite(_wf) and _wf > 0.0:
+                _vwh = _wf
+
+    _rated_l = str(label or "").strip().lower() == "rated"
+    _use_ft_hpo = (
+        field_test_constrained_optuna_objective_allowed is True
+        and _rated_l
+        and _vwh is not None
+    )
+    if field_test_constrained_optuna_objective_allowed is True and _rated_l and _vwh is None:
+        logger.warning(
+            "%s: field-test constrained HPO allowed but val_window_hours missing or invalid; "
+            "using validation AP (DEC-026 density guard needs a positive payout_complete_dtm span).",
             label or "model",
         )
 
@@ -3189,6 +3313,40 @@ def run_optuna_search(
             _hpo_ratio,
         )
 
+    _val_np_ratio: Optional[float] = _neg_pos_ratio_from_binary_labels(y_vl)
+    _ft_hpo_uses_prod_adj = (
+        _use_ft_hpo
+        and _val_np_ratio is not None
+        and PRODUCTION_NEG_POS_RATIO is not None
+    )
+    if _use_ft_hpo:
+        if _ft_hpo_uses_prod_adj:
+            logger.info(
+                "%s: Optuna study maximises validation precision_prod_adjusted "
+                "(DEC-026 pick; val neg/pos=%.4g vs PRODUCTION_NEG_POS_RATIO=%s; "
+                "min_alerts_per_hour=%.4g; window_hours=%.4g).",
+                label or "model",
+                float(_val_np_ratio),
+                PRODUCTION_NEG_POS_RATIO,
+                _mah_ft_f,
+                float(_vwh),
+            )
+        else:
+            logger.info(
+                "%s: Optuna study maximises validation precision (DEC-026 raw; "
+                "prod-adjust inactive — need positives + neg/pos ratio and "
+                "PRODUCTION_NEG_POS_RATIO) with min_alerts_per_hour=%.4g over window_hours=%.4g.",
+                label or "model",
+                _mah_ft_f,
+                float(_vwh),
+            )
+
+    _metric_label = (
+        "best_val_prec_dec026_prod_adj"
+        if _ft_hpo_uses_prod_adj
+        else ("best_val_prec_dec026" if _use_ft_hpo else "best_AP")
+    )
+
     def objective(trial: optuna.Trial) -> float:
         params = {
             **_lgb_params_for_pipeline(),
@@ -3217,6 +3375,26 @@ def run_optuna_search(
                 callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
             )
         scores = model.predict_proba(X_vl)[:, 1]
+        if _use_ft_hpo:
+            _pick = pick_threshold_dec026(
+                np.asarray(y_vl, dtype=float),
+                np.asarray(scores, dtype=float),
+                recall_floor=THRESHOLD_MIN_RECALL,
+                min_alert_count=THRESHOLD_MIN_ALERT_COUNT,
+                min_alerts_per_hour=_mah_ft_f,
+                window_hours=float(_vwh),
+                fbeta_beta=THRESHOLD_FBETA,
+            )
+            raw_p = float(_pick.precision)
+            if _ft_hpo_uses_prod_adj:
+                adj = _precision_prod_adjusted(
+                    raw_p,
+                    production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+                    test_neg_pos_ratio=_val_np_ratio,
+                )
+                if adj is not None:
+                    return float(adj)
+            return raw_p
         return average_precision_score(y_vl, scores)
 
     study = optuna.create_study(
@@ -3263,13 +3441,14 @@ def run_optuna_search(
             except ValueError:
                 # No trials completed yet (e.g. all failed so far); Optuna raises.
                 best_ap = None
-            ap_str = "%.4f" % (best_ap if best_ap is not None else float("nan"))
+            best_str = "%.4f" % (best_ap if best_ap is not None else float("nan"))
             logger.info(
-                "[Step 9] Optuna (%s) trial %d/%d  best_AP=%s  elapsed %.0fs (%.1f min)",
+                "[Step 9] Optuna (%s) trial %d/%d  %s=%s  elapsed %.0fs (%.1f min)",
                 label or "rated",
                 n,
                 n_trials,
-                ap_str,
+                _metric_label,
+                best_str,
                 elapsed,
                 elapsed / 60.0,
             )
@@ -3323,11 +3502,42 @@ def run_optuna_search(
     except ValueError:
         final_best_ap = None
     logger.info(
-        "Optuna (%s) best AP=%s, params=%s",
+        "Optuna (%s) %s=%s, params=%s",
         label or "model",
+        _metric_label,
         "%.4f" % final_best_ap if final_best_ap is not None else "N/A",
         best,
     )
+    _obj_mode = "validation_ap"
+    if _use_ft_hpo:
+        _obj_mode = (
+            "field_test_dec026_val_precision_prod_adj"
+            if _ft_hpo_uses_prod_adj
+            else "field_test_dec026_val_precision_raw"
+        )
+    _manifest_pay: dict[str, Any] = {
+        "optuna_hpo_objective_mode": _obj_mode,
+        "optuna_hpo_study_best_trial_value": (
+            float(final_best_ap) if final_best_ap is not None else None
+        ),
+    }
+    if _vwh is not None:
+        _manifest_pay["optuna_hpo_val_window_hours_used"] = float(_vwh)
+    if _use_ft_hpo:
+        _manifest_pay["optuna_hpo_field_test_min_alerts_per_hour"] = float(_mah_ft_f)
+        if _val_np_ratio is not None:
+            _manifest_pay["optuna_hpo_val_neg_pos_ratio"] = float(_val_np_ratio)
+        _manifest_pay["optuna_hpo_val_precision_prod_adjusted_active"] = bool(
+            _ft_hpo_uses_prod_adj
+        )
+        if PRODUCTION_NEG_POS_RATIO is not None:
+            try:
+                _manifest_pay["optuna_hpo_production_neg_pos_ratio_assumed"] = float(
+                    PRODUCTION_NEG_POS_RATIO
+                )
+            except (TypeError, ValueError):
+                pass
+    _write_optuna_hpo_manifest(hpo_objective_manifest, _manifest_pay)
     return best
 
 
@@ -3344,8 +3554,14 @@ def _train_one_model(
     hyperparams: dict,
     label: str = "",
     log_results: bool = True,
+    val_dec026_window_hours: Optional[float] = None,
+    val_dec026_min_alerts_per_hour: Optional[float] = None,
 ) -> Tuple[lgb.LGBMClassifier, dict]:
-    """Train a single LightGBM model and compute validation metrics."""
+    """Train a single LightGBM model and compute validation metrics.
+
+    When *val_dec026_window_hours* and *val_dec026_min_alerts_per_hour* are set (rated
+    field-test path), validation DEC-026 pick uses the same per-hour floor as Optuna trials.
+    """
     # R1509: guard single-class training set (LightGBM would train a constant predictor).
     if y_train.nunique() < 2:
         raise ValueError(
@@ -3399,8 +3615,8 @@ def _train_one_model(
             np.asarray(val_scores, dtype=float),
             recall_floor=THRESHOLD_MIN_RECALL,
             min_alert_count=THRESHOLD_MIN_ALERT_COUNT,
-            min_alerts_per_hour=None,
-            window_hours=None,
+            min_alerts_per_hour=val_dec026_min_alerts_per_hour,
+            window_hours=val_dec026_window_hours,
             fbeta_beta=THRESHOLD_FBETA,
         )
         if _pick.is_fallback:
@@ -3437,6 +3653,14 @@ def _train_one_model(
         # threshold of 0.5 is never falsely flagged as uncalibrated.
         "_uncalibrated": not _has_val,
     }
+    if (
+        val_dec026_window_hours is not None
+        and val_dec026_min_alerts_per_hour is not None
+    ):
+        metrics["val_dec026_pick_window_hours"] = float(val_dec026_window_hours)
+        metrics["val_dec026_pick_min_alerts_per_hour"] = float(
+            val_dec026_min_alerts_per_hour
+        )
     if log_results:
         logger.info(
             "%s valid: AP=%.4f  F0.5=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  thr=%.4f",
@@ -4143,8 +4367,13 @@ def train_dual_model(
         X_vl = vl_df[avail_cols] if not vl_df.empty else X_tr.head(0)
         y_vl = vl_df["label"] if not vl_df.empty else y_tr.head(0)
 
+        _vw_h = _val_window_hours_from_payout_df(vl_df) if name == "rated" else None
+        _ft_hpo_active = name == "rated" and _ft_optuna_allowed and _vw_h is not None
+        _optuna_hpo_manifest_loop: list[dict[str, Any]] = []
         if run_optuna and not vl_df.empty and y_vl.sum() > 0:
-            log_optuna_precondition_context(_ft_pre_doc)
+            log_optuna_precondition_context(
+                _ft_pre_doc, uses_field_test_hpo_objective=_ft_hpo_active
+            )
             hp = run_optuna_search(
                 X_tr,
                 y_tr,
@@ -4153,6 +4382,8 @@ def train_dual_model(
                 sw,
                 label=name,
                 field_test_constrained_optuna_objective_allowed=_ft_optuna_allowed,
+                val_window_hours=_vw_h,
+                hpo_objective_manifest=_optuna_hpo_manifest_loop,
             )
         else:
             # Default params when validation is empty or no positives
@@ -4164,7 +4395,25 @@ def train_dual_model(
                 "min_child_samples": 20,
             }
 
-        model, metrics = _train_one_model(X_tr, y_tr, X_vl, y_vl, sw, hp, label=name)
+        _dec026_wh, _dec026_mah = _rated_field_test_val_pick_per_hour_kwargs(
+            label=name,
+            field_test_constrained_optuna_objective_allowed=_ft_optuna_allowed,
+            val_df=vl_df,
+        )
+        model, metrics = _train_one_model(
+            X_tr,
+            y_tr,
+            X_vl,
+            y_vl,
+            sw,
+            hp,
+            label=name,
+            val_dec026_window_hours=_dec026_wh,
+            val_dec026_min_alerts_per_hour=_dec026_mah,
+        )
+
+        if _optuna_hpo_manifest_loop:
+            metrics.update(_optuna_hpo_manifest_loop[0])
 
         # Training set performance (for overfit / fit quality reporting).
         metrics.update(
@@ -4251,6 +4500,7 @@ def train_single_rated_model(
     """
     _ft_pre_doc: Optional[Dict[str, Any]] = None
     _ft_pre_path_raw = ""
+    _optuna_hpo_manifest: list[dict[str, Any]] = []
     if valid_df is None:
         valid_df = pd.DataFrame()
     use_from_libsvm = False
@@ -4336,6 +4586,13 @@ def train_single_rated_model(
         else:
             log_precondition_block_warning(_ft_pre_doc)
 
+    _ft_allowed = precondition_constrained_optuna_allowed(_ft_pre_doc)
+    _ft_thr_wh, _ft_thr_mah = _rated_field_test_val_pick_per_hour_kwargs(
+        label="rated",
+        field_test_constrained_optuna_objective_allowed=_ft_allowed,
+        val_df=val_rated,
+    )
+
     # PLAN 方案 B §6: HPO on in-memory (train/valid) for both paths; from-file then uses best params for lgb.train.
     # B+ §4.4: from LibSVM we use default hp (no in-memory HPO).
     if use_from_libsvm:
@@ -4347,8 +4604,11 @@ def train_single_rated_model(
             "min_child_samples": 20,
         }
     elif run_optuna and not val_rated.empty and y_vl.sum() > 0:
-        log_optuna_precondition_context(_ft_pre_doc)
-        _ft_optuna_allowed = precondition_constrained_optuna_allowed(_ft_pre_doc)
+        _val_wh = _val_window_hours_from_payout_df(val_rated)
+        _ft_hpo_active = _ft_allowed and _val_wh is not None
+        log_optuna_precondition_context(
+            _ft_pre_doc, uses_field_test_hpo_objective=_ft_hpo_active
+        )
         hp = run_optuna_search(
             X_tr,
             y_tr,
@@ -4356,7 +4616,9 @@ def train_single_rated_model(
             y_vl,
             sw_rated,
             label="rated",
-            field_test_constrained_optuna_objective_allowed=_ft_optuna_allowed,
+            field_test_constrained_optuna_objective_allowed=_ft_allowed,
+            val_window_hours=_val_wh,
+            hpo_objective_manifest=_optuna_hpo_manifest,
         )
     else:
         hp = {
@@ -4599,8 +4861,8 @@ def train_single_rated_model(
                     np.asarray(val_scores, dtype=float),
                     recall_floor=THRESHOLD_MIN_RECALL,
                     min_alert_count=THRESHOLD_MIN_ALERT_COUNT,
-                    min_alerts_per_hour=None,
-                    window_hours=None,
+                    min_alerts_per_hour=_ft_thr_mah,
+                    window_hours=_ft_thr_wh,
                     fbeta_beta=THRESHOLD_FBETA,
                 )
                 if _pick.is_fallback:
@@ -4633,6 +4895,9 @@ def train_single_rated_model(
                 "best_hyperparams": hp_resolved,
                 "_uncalibrated": not _has_val,
             }
+            if _ft_thr_wh is not None and _ft_thr_mah is not None:
+                metrics["val_dec026_pick_window_hours"] = float(_ft_thr_wh)
+                metrics["val_dec026_pick_min_alerts_per_hour"] = float(_ft_thr_mah)
             model = _BoosterWrapper(booster)
             if _libsvm_temp_to_remove is not None and _libsvm_temp_to_remove.exists():
                 _libsvm_temp_to_remove.unlink()
@@ -4741,8 +5006,8 @@ def train_single_rated_model(
                     np.asarray(val_scores, dtype=float),
                     recall_floor=THRESHOLD_MIN_RECALL,
                     min_alert_count=THRESHOLD_MIN_ALERT_COUNT,
-                    min_alerts_per_hour=None,
-                    window_hours=None,
+                    min_alerts_per_hour=_ft_thr_mah,
+                    window_hours=_ft_thr_wh,
                     fbeta_beta=THRESHOLD_FBETA,
                 )
                 if _pick.is_fallback:
@@ -4775,10 +5040,22 @@ def train_single_rated_model(
                 "best_hyperparams": hp_resolved,
                 "_uncalibrated": not _has_val,
             }
+            if _ft_thr_wh is not None and _ft_thr_mah is not None:
+                metrics["val_dec026_pick_window_hours"] = float(_ft_thr_wh)
+                metrics["val_dec026_pick_min_alerts_per_hour"] = float(_ft_thr_mah)
             model = _BoosterWrapper(booster)
     if not use_from_file and not use_from_libsvm:
         model, metrics = _train_one_model(
-            X_tr, y_tr, X_vl, y_vl, sw_rated, hp, label="rated", log_results=False
+            X_tr,
+            y_tr,
+            X_vl,
+            y_vl,
+            sw_rated,
+            hp,
+            label="rated",
+            log_results=False,
+            val_dec026_window_hours=_ft_thr_wh,
+            val_dec026_min_alerts_per_hour=_ft_thr_mah,
         )
 
     X_tr_pred = _dataframe_for_lgb_predict(model, train_rated, avail_cols)
@@ -4939,6 +5216,9 @@ def train_single_rated_model(
     metrics["lightgbm_device_requested"] = _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS
     metrics["lightgbm_device_type"] = _EFFECTIVE_LIGHTGBM_DEVICE
     metrics["lightgbm_device_fallback"] = bool(_LIGHTGBM_GPU_FALLBACK_USED)
+
+    if _optuna_hpo_manifest:
+        metrics.update(_optuna_hpo_manifest[0])
 
     if _ft_pre_doc is not None and _ft_pre_path_raw:
         metrics.update(

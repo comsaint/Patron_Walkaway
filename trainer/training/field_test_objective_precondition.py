@@ -186,8 +186,17 @@ def log_precondition_block_warning(doc: Mapping[str, Any]) -> None:
     )
 
 
-def log_optuna_precondition_context(doc: Optional[Mapping[str, Any]]) -> None:
-    """Log once before Optuna when a precondition doc is loaded (AP objective unchanged)."""
+def log_optuna_precondition_context(
+    doc: Optional[Mapping[str, Any]],
+    *,
+    uses_field_test_hpo_objective: bool = False,
+) -> None:
+    """Log once before Optuna (AP baseline vs W2 DEC-026 objective when *uses_field_test_hpo_objective*)."""
+    if uses_field_test_hpo_objective:
+        logger.info(
+            "Optuna HPO: objective is validation DEC-026 max precision under "
+            "min_alerts_per_hour density guard (W2 field-test alignment)."
+        )
     if doc is None:
         return
     blocking = doc.get("blocking_reasons")
@@ -199,10 +208,11 @@ def log_optuna_precondition_context(doc: Optional[Mapping[str, Any]]) -> None:
             "Precondition blocks single constrained field-test objective (%d reason(s)).",
             len(blocking),
         )
-    else:
+    elif not uses_field_test_hpo_objective:
         logger.info(
             "Optuna HPO: precondition reports no blockers; "
-            "single constrained field-test objective remains subject to W2 wiring."
+            "field-test DEC-026 HPO activates when rated validation has a positive "
+            "`payout_complete_dtm` span (else validation AP)."
         )
 
 
