@@ -32,6 +32,14 @@ class TestR229_1_ScoreNaN(unittest.TestCase):
         self.assertIsNone(out.get("test_precision_at_recall_0.01"))
         self.assertIsNone(out.get("test_precision_at_recall_0.1"))
         self.assertIsNone(out.get("test_precision_at_recall_0.5"))
+        self.assertEqual(out.get("test_precision_prod_adjusted_reason_code"), "invalid_input_nan")
+        for r in (0.001, 0.01, 0.1, 0.5):
+            self.assertIsNone(out.get(f"test_precision_at_recall_{r}_prod_adjusted"))
+            self.assertEqual(out.get(f"test_precision_at_recall_{r}_reason_code"), "invalid_input_nan")
+            self.assertEqual(
+                out.get(f"test_precision_at_recall_{r}_prod_adjusted_reason_code"),
+                "invalid_input_nan",
+            )
 
     def test_desired_score_nan_returns_safe_structure(self):
         """Score 含 NaN 時不拋錯且三鍵為 None（與 test_current 同一契約）。"""
@@ -45,6 +53,14 @@ class TestR229_1_ScoreNaN(unittest.TestCase):
         self.assertIsNone(out.get("test_precision_at_recall_0.01"))
         self.assertIsNone(out.get("test_precision_at_recall_0.1"))
         self.assertIsNone(out.get("test_precision_at_recall_0.5"))
+        self.assertEqual(out.get("test_precision_prod_adjusted_reason_code"), "invalid_input_nan")
+        for r in (0.001, 0.01, 0.1, 0.5):
+            self.assertIsNone(out.get(f"test_precision_at_recall_{r}_prod_adjusted"))
+            self.assertEqual(out.get(f"test_precision_at_recall_{r}_reason_code"), "invalid_input_nan")
+            self.assertEqual(
+                out.get(f"test_precision_at_recall_{r}_prod_adjusted_reason_code"),
+                "invalid_input_nan",
+            )
 
 
 class TestR229_2_MissingColumn(unittest.TestCase):
@@ -80,6 +96,14 @@ class TestR229_3_AllNegative(unittest.TestCase):
         self.assertIsNone(out["test_precision_at_recall_0.01"])
         self.assertIsNone(out["test_precision_at_recall_0.1"])
         self.assertIsNone(out["test_precision_at_recall_0.5"])
+        self.assertEqual(out["test_precision_prod_adjusted_reason_code"], "single_class")
+        for r in (0.001, 0.01, 0.1, 0.5):
+            self.assertIsNone(out[f"test_precision_at_recall_{r}_prod_adjusted"])
+            self.assertEqual(out[f"test_precision_at_recall_{r}_reason_code"], "single_class")
+            self.assertEqual(
+                out[f"test_precision_at_recall_{r}_prod_adjusted_reason_code"],
+                "single_class",
+            )
         self.assertEqual(out["test_positives"], 0)
         self.assertEqual(out["test_ap"], 0.0)
 

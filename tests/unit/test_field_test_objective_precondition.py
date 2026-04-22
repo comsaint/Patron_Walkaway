@@ -137,7 +137,7 @@ def test_single_override_rejected_when_blockers_exist(tmp_path: Path) -> None:
         tmp_path,
         extra_args=["--objective-decision-override", "single_constrained"],
     )
-    assert output["objective_decision"] == "composite"
+    assert output["objective_decision"] == "BLOCKED"
     assert output["single_objective_allowed"] is False
 
 

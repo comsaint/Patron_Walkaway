@@ -204,15 +204,15 @@ def log_optuna_precondition_context(
         blocking = []
     if blocking:
         logger.info(
-            "Optuna HPO: still optimising validation AP (baseline). "
-            "Precondition blocks single constrained field-test objective (%d reason(s)).",
+            "Optuna HPO: precondition blocks single constrained field-test objective "
+            "(%d reason(s)); DEC-043 contract requires GATE BLOCKED (no AP fallback).",
             len(blocking),
         )
     elif not uses_field_test_hpo_objective:
         logger.info(
             "Optuna HPO: precondition reports no blockers; "
             "field-test DEC-026 HPO activates when rated validation has a positive "
-            "`payout_complete_dtm` span (else validation AP)."
+            "`payout_complete_dtm` span (else GATE BLOCKED by DEC-043)."
         )
 
 

@@ -33,12 +33,12 @@
 
 ## 3) 實施路線（依 ROI 由高到低）
 
-### R1. HPO / 模型選擇目標對齊 field-test operating objective（ROI 16）
+### R1. HPO / 模型選擇目標對齊 field-test operating objective（ROI 16，DEC-043 對齊）
 
-- 方案：將 HPO objective 與 winner-pick 語意從 AP 對齊到 field-test operating objective：在 rated-eligible 樣本上，以 `**min_alerts_per_hour >= 50`**（及既有最小 alert guards）為主要可行條件，最大化 precision；若 validation / test 存在 negative sampling，優先使用 **production-adjusted precision proxy** 做排序。主 KPI 與其 prod-adjusted 版本保留為 guardrail / shadow metrics，而非唯一 driver。
+- 方案：將 HPO objective 與 winner-pick 語意從 AP 對齊到 field-test operating objective：在 rated-eligible 樣本上，以 `**min_alerts_per_hour >= 50`**（及既有最小 alert guards）為主要可行條件，最大化 precision；若 validation / test 存在 negative sampling，優先使用 **production-adjusted precision proxy** 做排序。主 KPI 與其 prod-adjusted 版本保留為 guardrail / shadow metrics，而非唯一 driver。**本輪依 DEC-043 採 field-test-only：不接受 AP fallback 作可比結果。**
 - 啟動前置條件（Precondition）：
   - 在修改 `run_optuna_search()` 或等價 HPO 路徑前，必須先統計現行 time-fold / validation folds 的 **walkaway 正例數 / finalized TP 數量級**、**總 rated bet 數與 `fold_duration_hours`**、**baseline 模型的可行 threshold 集合大小**，以及 **test neg/pos ratio**（若 validation / test 有負採樣）。
-  - 若任一 fold 顯示 field-test objective 的可行 threshold 太少、`T_feasible` 常為空、尾段指標支撐不足，或 `PRODUCTION_NEG_POS_RATIO` 假設不穩，則 **不得**直接切到單一 constrained objective；需改採複合目標、fold 聚合分數，或先調整驗證窗設計。
+  - 若任一 fold 顯示 field-test objective 的可行 threshold 太少、`T_feasible` 常為空、尾段指標支撐不足，或 `PRODUCTION_NEG_POS_RATIO` 假設不穩，則本輪 run 狀態為 **`BLOCKED` / `gate_blocked`**（不納入可比）；先調整驗證窗或資料契約後再重跑。
 - 關鍵交付：
   - 目標函數設計說明（含 field-test mode、何時用單一目標/複合目標）。
   - 新舊 objective 對照報告（多窗）。
@@ -47,8 +47,8 @@
   - 人類可讀摘要：`trainer/precision_improvement_plan/field_test_objective_precondition_check.md`
 - 主要風險：validation 正例過稀、可行 threshold 稀少，或 `prod_adjusted` 對 production neg/pos ratio 假設過度敏感，導致高方差。
 - 緩解：
-  - 優先使用 constrained objective；若其噪音仍高，改採 `α·field_test_precision + (1−α)·AP` 類複合目標，並用多窗平均分數穩定搜尋。
-  - 若某 fold 的 `T_feasible` 為空，實作上應視為 **fallback fold**；objective score 可回 `0.0`，但需顯式標記 `fallback / feasible=false`，且與 shared selector 的 fallback semantics 對齊，避免 trainer / backtester / calibration 三邊語意分裂。
+  - 先補齊 precondition 與 validation span 證據，再啟動 constrained objective；不以 AP fallback 掩蓋不可行 run。
+  - 若某 fold 的 `T_feasible` 為空或可行域不成立，實作上應輸出 **`BLOCKED` / `gate_blocked`** 與可稽核 reason code，避免 trainer / backtester / calibration 三邊語意分裂。
 
 ### R2. 排序導向訓練 + Hard Negative + Top-band Reweighting（ROI 14）
 
@@ -164,18 +164,19 @@
 - 建議新增明確 mode：
   - **research / legacy mode**：`recall_floor` 導向，在可行點中最大化 raw precision。
   - **field_test mode**：以 `**min_alerts_per_hour >= 50`** 為主要可行條件，保留 `min_alert_count`，並優先最大化 `**prod_adjusted precision**`；`recall_floor` 可退為 guardrail 或次級約束。
-- trainer / backtester / 後續 calibration 應顯式輸出 `selection_mode` 與 chosen threshold 對應的 `precision_raw`、`precision_prod_adjusted`、`recall`、`alerts_per_hour`，避免不同 operating contract 混用。
-- 若某次 threshold search 的 `T_feasible` 為空，shared contract 應提供可稽核 fallback semantics（例如 score=0.0、`feasible=false`、沿用既有 fallback threshold / zeroed metrics 契約），避免各模組各自定義「不可行」。
+- trainer / backtester / 後續 calibration 應顯式輸出 `selection_mode` 與 chosen threshold 對應的 `precision_raw`、`precision_prod_adjusted`、`recall`、`alerts_per_hour`，避免不同 operating contract 混用；本輪 `selection_mode` 固定 `field_test`。
+- 若某次 threshold search 的 `T_feasible` 為空或可行域不成立，shared contract 應輸出可稽核 **`BLOCKED` / `gate_blocked`** 與 reason code（不以 AP fallback 視為可比），避免各模組各自定義「不可行」。
 
 ---
 
 ## 5) 驗證與決策規則
 
-- objective contract（暫定凍結，進 implementation / execution 時沿用）：
+- objective contract（本輪已依 DEC-043 凍結，implementation / execution 需一致）：
   - **feasibility constraint**：`alerts_per_hour >= 50`（長期平均）。
   - **optimization target**：`prod_adjusted precision`。
   - **soft guardrails / shadow metrics**：主 KPI 與其 prod-adjusted 版本。
-- 若 precondition check 顯示 constrained objective 支撐不足（例如多數 folds 的 `T_feasible` 過小或常為空），不得硬切單一 objective；需退回複合目標或先調整驗證窗設計。
+- 若 precondition check 顯示 constrained objective 支撐不足（例如任一 fold 的 `T_feasible` 過小或常為空），run 應標記 **`BLOCKED` / `gate_blocked`**，不納入可比；先調整驗證窗設計後再重跑。
+- `None` 指標需遵循 `None -> 單一 reason_code` 契約（`empty_subset` / `single_class` / `invalid_input_nan` / `infeasible_constraint` / `missing_required_column`）。
 - 不設最小 uplift gate：**微小 uplift 也可保留**，但需滿足：
   - 同契約可重跑。
   - 多窗方向一致或可解釋。

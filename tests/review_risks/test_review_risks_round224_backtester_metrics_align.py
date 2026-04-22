@@ -23,6 +23,8 @@ import trainer.backtester as backtester_mod
 _EXPECTED_FLAT_KEYS = frozenset({
     "test_ap",
     "test_precision",
+    "test_precision_prod_adjusted",
+    "test_precision_prod_adjusted_reason_code",
     "test_recall",
     "test_f1",
     "test_fbeta_05",
@@ -33,9 +35,21 @@ _EXPECTED_FLAT_KEYS = frozenset({
     "alerts",
     "alerts_per_hour",
     "test_precision_at_recall_0.001",
+    "test_precision_at_recall_0.001_reason_code",
+    "test_precision_at_recall_0.001_prod_adjusted",
+    "test_precision_at_recall_0.001_prod_adjusted_reason_code",
     "test_precision_at_recall_0.01",
+    "test_precision_at_recall_0.01_reason_code",
+    "test_precision_at_recall_0.01_prod_adjusted",
+    "test_precision_at_recall_0.01_prod_adjusted_reason_code",
     "test_precision_at_recall_0.1",
+    "test_precision_at_recall_0.1_reason_code",
+    "test_precision_at_recall_0.1_prod_adjusted",
+    "test_precision_at_recall_0.1_prod_adjusted_reason_code",
     "test_precision_at_recall_0.5",
+    "test_precision_at_recall_0.5_reason_code",
+    "test_precision_at_recall_0.5_prod_adjusted",
+    "test_precision_at_recall_0.5_prod_adjusted_reason_code",
     "threshold_at_recall_0.001",
     "threshold_at_recall_0.01",
     "threshold_at_recall_0.1",
@@ -71,8 +85,19 @@ class TestR224_1_EmptyRatedSubFlatKeys(unittest.TestCase):
         self.assertEqual(out["test_random_ap"], 0.0)
         self.assertEqual(out["alerts"], 0)
         self.assertEqual(out["alerts_per_hour"], 0.0, "window_hours=1.0 → 0/1.0")
+        self.assertIsNone(out["test_precision_prod_adjusted"], "empty → None prod_adjusted headline")
+        self.assertEqual(out["test_precision_prod_adjusted_reason_code"], "empty_subset")
         for r in (0.001, 0.01, 0.1, 0.5):
             self.assertIsNone(out[f"test_precision_at_recall_{r}"], "empty → None (PLAN DEC-026)")
+            self.assertEqual(out[f"test_precision_at_recall_{r}_reason_code"], "empty_subset")
+            self.assertIsNone(
+                out[f"test_precision_at_recall_{r}_prod_adjusted"],
+                "empty → None prod_adjusted @recall",
+            )
+            self.assertEqual(
+                out[f"test_precision_at_recall_{r}_prod_adjusted_reason_code"],
+                "empty_subset",
+            )
 
     def test_compute_section_metrics_empty_rated_sub_returns_micro_with_flat_keys(self):
         """Section is flat (no 'micro' nest); downstream reads out['test_ap'] (PLAN step 3)."""
@@ -110,8 +135,16 @@ class TestR224_2_NaNLabelsSafeStructure(unittest.TestCase):
         self.assertEqual(out["test_ap"], 0.0)
         self.assertEqual(out["test_samples"], 0, "NaN label → same zeroed structure as empty")
         self.assertEqual(out["test_positives"], 0)
+        self.assertIsNone(out["test_precision_prod_adjusted"])
+        self.assertEqual(out["test_precision_prod_adjusted_reason_code"], "invalid_input_nan")
         for r in (0.001, 0.01, 0.1, 0.5):
             self.assertIsNone(out[f"test_precision_at_recall_{r}"], "NaN labels → None (PLAN DEC-026)")
+            self.assertEqual(out[f"test_precision_at_recall_{r}_reason_code"], "invalid_input_nan")
+            self.assertIsNone(out[f"test_precision_at_recall_{r}_prod_adjusted"])
+            self.assertEqual(
+                out[f"test_precision_at_recall_{r}_prod_adjusted_reason_code"],
+                "invalid_input_nan",
+            )
 
 
 class TestR224_3_AllPositiveAPBehavior(unittest.TestCase):
@@ -127,8 +160,16 @@ class TestR224_3_AllPositiveAPBehavior(unittest.TestCase):
         out = backtester_mod.compute_micro_metrics(df, threshold=0.5, window_hours=1.0)
         self.assertEqual(set(out.keys()), _EXPECTED_FLAT_KEYS)
         self.assertEqual(out["test_ap"], 0.0, "Single-class AP should be 0 (trainer-aligned)")
+        self.assertIsNone(out["test_precision_prod_adjusted"])
+        self.assertEqual(out["test_precision_prod_adjusted_reason_code"], "single_class")
         for r in (0.001, 0.01, 0.1, 0.5):
             self.assertIsNone(out[f"test_precision_at_recall_{r}"], "single-class → None (PLAN DEC-026)")
+            self.assertEqual(out[f"test_precision_at_recall_{r}_reason_code"], "single_class")
+            self.assertIsNone(out[f"test_precision_at_recall_{r}_prod_adjusted"])
+            self.assertEqual(
+                out[f"test_precision_at_recall_{r}_prod_adjusted_reason_code"],
+                "single_class",
+            )
 
 
 class TestR224_4_ModuleDocNoMacroByVisit(unittest.TestCase):

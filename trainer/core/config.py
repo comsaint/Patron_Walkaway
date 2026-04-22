@@ -373,6 +373,13 @@ NEG_SAMPLE_FRAC: float = 0.3
 # Example: 15.0 means production has ~15 negative observations per 1 positive.
 PRODUCTION_NEG_POS_RATIO: Optional[float] = 87.0/13.0
 
+# --- Threshold / reporting operating contract (W2 field-test vs legacy) ---
+# ``legacy``: historical behaviour (F-beta / AP-centric paths unchanged).
+# ``field_test``: DEC-026 field-test objective alignment (Optuna + validation pick
+# when precondition + data allow). Written to ``training_metrics.json`` and echoed
+# in ``backtest_metrics.json`` for calibration / scorer parity audits.
+SELECTION_MODE: str = "field_test"
+
 # --- OOM pre-check: auto-adjust NEG_SAMPLE_FRAC after Step 1 if RAM looks tight ---
 # After the chunk list is built, the pipeline estimates Step 7 peak RAM as
 #   on_disk_total × CHUNK_CONCAT_RAM_FACTOR × (1 + TRAIN_SPLIT_FRAC)

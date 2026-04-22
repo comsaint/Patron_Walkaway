@@ -19,14 +19,20 @@ _RECALL_STRINGS = ("0.001", "0.01", "0.1", "0.5")
 # Backtester flat metrics: precision@recall keys only (for key-name and contract tests).
 _EXPECTED_PRECISION_AT_RECALL_KEYS_BACKTESTER = frozenset(
     {f"test_precision_at_recall_{r}" for r in _RECALL_STRINGS}
+    | {f"test_precision_at_recall_{r}_reason_code" for r in _RECALL_STRINGS}
+    | {f"test_precision_at_recall_{r}_prod_adjusted" for r in _RECALL_STRINGS}
+    | {f"test_precision_at_recall_{r}_prod_adjusted_reason_code" for r in _RECALL_STRINGS}
     | {f"threshold_at_recall_{r}" for r in _RECALL_STRINGS}
     | {f"alerts_per_minute_at_recall_{r}" for r in _RECALL_STRINGS}
 )
 
 # Trainer test metrics: same + n_alerts + prod_adjusted precision@recall (for contract / type tests).
-_EXPECTED_PRECISION_AT_RECALL_KEYS_TRAINER = _EXPECTED_PRECISION_AT_RECALL_KEYS_BACKTESTER | frozenset(
-    {f"n_alerts_at_recall_{r}" for r in _RECALL_STRINGS}
+_EXPECTED_PRECISION_AT_RECALL_KEYS_TRAINER = frozenset(
+    {f"test_precision_at_recall_{r}" for r in _RECALL_STRINGS}
     | {f"test_precision_at_recall_{r}_prod_adjusted" for r in _RECALL_STRINGS}
+    | {f"threshold_at_recall_{r}" for r in _RECALL_STRINGS}
+    | {f"alerts_per_minute_at_recall_{r}" for r in _RECALL_STRINGS}
+    | {f"n_alerts_at_recall_{r}" for r in _RECALL_STRINGS}
 )
 
 
@@ -82,12 +88,25 @@ class TestR398_2_AllSameScoreEdgeNoCrash(unittest.TestCase):
         })
         out = backtester_mod.compute_micro_metrics(df, threshold=0.5, window_hours=1.0)
         for r in _RECALL_STRINGS:
-            for key in (f"test_precision_at_recall_{r}", f"threshold_at_recall_{r}", f"alerts_per_minute_at_recall_{r}"):
+            for key in (
+                f"test_precision_at_recall_{r}",
+                f"test_precision_at_recall_{r}_reason_code",
+                f"test_precision_at_recall_{r}_prod_adjusted",
+                f"test_precision_at_recall_{r}_prod_adjusted_reason_code",
+                f"threshold_at_recall_{r}",
+                f"alerts_per_minute_at_recall_{r}",
+            ):
                 v = out.get(key)
-                self.assertTrue(
-                    v is None or isinstance(v, (int, float, np.integer, np.floating)),
-                    f"Same score → {key} must be None or numeric, got {type(v)}.",
-                )
+                if key.endswith("_reason_code"):
+                    self.assertTrue(
+                        v is None or isinstance(v, str),
+                        f"Same score → {key} must be None or str, got {type(v)}.",
+                    )
+                else:
+                    self.assertTrue(
+                        v is None or isinstance(v, (int, float, np.integer, np.floating)),
+                        f"Same score → {key} must be None or numeric, got {type(v)}.",
+                    )
         self.assertTrue(
             _EXPECTED_PRECISION_AT_RECALL_KEYS_BACKTESTER.issubset(set(out.keys())),
             "Must contain all precision@recall keys (edge case must not drop keys).",
@@ -113,6 +132,12 @@ class TestR398_4_MetricsValueTypes(unittest.TestCase):
             self.assertTrue(v is None or isinstance(v, (float, np.floating)), f"threshold_at_recall_{r}")
             v = out.get(f"test_precision_at_recall_{r}")
             self.assertTrue(v is None or isinstance(v, (float, np.floating)), f"test_precision_at_recall_{r}")
+            v = out.get(f"test_precision_at_recall_{r}_prod_adjusted")
+            self.assertTrue(v is None or isinstance(v, (float, np.floating)), f"test_precision_at_recall_{r}_prod_adjusted")
+            v = out.get(f"test_precision_at_recall_{r}_reason_code")
+            self.assertTrue(v is None or isinstance(v, str), f"test_precision_at_recall_{r}_reason_code")
+            v = out.get(f"test_precision_at_recall_{r}_prod_adjusted_reason_code")
+            self.assertTrue(v is None or isinstance(v, str), f"test_precision_at_recall_{r}_prod_adjusted_reason_code")
             v = out.get(f"alerts_per_minute_at_recall_{r}")
             self.assertTrue(v is None or isinstance(v, (float, np.floating)), f"alerts_per_minute_at_recall_{r}")
 

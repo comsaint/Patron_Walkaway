@@ -259,19 +259,21 @@ def test_run_optuna_search_manifest_validation_ap_mode(
     y_val = pd.Series((rng.rand(nv) > 0.80).astype(int))
     sw = pd.Series(np.ones(n), dtype=float)
     manifest: list[dict] = []
-    tr_mod.run_optuna_search(
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        sw,
-        label="rated",
-        field_test_constrained_optuna_objective_allowed=False,
-        val_window_hours=24.0,
-        hpo_objective_manifest=manifest,
-    )
+    with pytest.raises(RuntimeError, match="GATE BLOCKED"):
+        tr_mod.run_optuna_search(
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            sw,
+            label="rated",
+            field_test_constrained_optuna_objective_allowed=False,
+            val_window_hours=24.0,
+            hpo_objective_manifest=manifest,
+        )
     assert len(manifest) == 1
-    assert manifest[0]["optuna_hpo_objective_mode"] == "validation_ap"
+    assert manifest[0]["optuna_hpo_objective_mode"] == "gate_blocked"
+    assert manifest[0]["optuna_hpo_gate_blocked_reason_code"] == "infeasible_constraint"
 
 
 def test_run_optuna_search_manifest_skipped_empty_val(

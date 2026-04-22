@@ -19,12 +19,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 ALLOWED_REASON_CODES: Sequence[str] = (
-    "missing_field:<field_name>",
-    "t_feasible_insufficient:<fold_id>",
-    "t_feasible_empty:<fold_id>",
-    "tail_support_insufficient:<fold_id>",
-    "prod_ratio_unstable",
-    "data_contract_mismatch",
+    "empty_subset",
+    "single_class",
+    "invalid_input_nan",
+    "infeasible_constraint",
+    "missing_required_column",
 )
 
 
@@ -100,7 +99,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--objective-decision-override",
-        choices=("single_constrained", "composite"),
+        choices=("single_constrained", "BLOCKED"),
         default=None,
         help="Override auto objective decision.",
     )
@@ -223,27 +222,30 @@ def _extract_fold_evidence(
     test_neg_pos_ratio = _to_float_or_none(_extract_first(data, ("test_neg_pos_ratio",)))
 
     reason_codes: List[str] = []
+    missing_required_column = False
     if positive_count is None:
-        reason_codes.append("missing_field:positive_count")
+        missing_required_column = True
     if finalized_tp_count is None:
-        reason_codes.append("missing_field:finalized_tp_count")
+        missing_required_column = True
     if rated_bet_count is None:
-        reason_codes.append("missing_field:rated_bet_count")
+        missing_required_column = True
     if fold_duration_hours is None:
-        reason_codes.append("missing_field:fold_duration_hours")
+        missing_required_column = True
     if test_neg_pos_ratio is None:
-        reason_codes.append("missing_field:test_neg_pos_ratio")
+        missing_required_column = True
+    if missing_required_column:
+        reason_codes.append("missing_required_column")
 
     if t_feasible_size <= 0:
-        reason_codes.append(f"t_feasible_empty:{fold_id}")
+        reason_codes.append("empty_subset")
     elif t_feasible_size < min_t_feasible_size:
-        reason_codes.append(f"t_feasible_insufficient:{fold_id}")
+        reason_codes.append("infeasible_constraint")
 
     tail_support_sufficient = (
         positive_count is not None and positive_count >= int(min_tail_positive_count)
     )
     if not tail_support_sufficient:
-        reason_codes.append(f"tail_support_insufficient:{fold_id}")
+        reason_codes.append("infeasible_constraint")
 
     return FoldEvidence(
         fold_id=fold_id,
@@ -284,7 +286,7 @@ def _aggregate_blocking_reasons(
         reasons.extend(fold.reason_codes)
 
     if production_neg_pos_ratio is None or production_neg_pos_ratio <= 0:
-        reasons.append("prod_ratio_unstable")
+        reasons.append("infeasible_constraint")
 
     # stable order + dedup
     deduped: List[str] = []
@@ -302,12 +304,12 @@ def _decide_objective(
     override: Optional[str],
 ) -> Tuple[str, bool]:
     if override is not None and override == "single_constrained" and blocking_reasons:
-        objective_decision = "composite"
+        objective_decision = "BLOCKED"
     elif override is not None:
         objective_decision = override
     else:
         objective_decision = (
-            "single_constrained" if len(blocking_reasons) == 0 else "composite"
+            "single_constrained" if len(blocking_reasons) == 0 else "BLOCKED"
         )
     single_allowed = objective_decision == "single_constrained" and len(blocking_reasons) == 0
     return objective_decision, single_allowed

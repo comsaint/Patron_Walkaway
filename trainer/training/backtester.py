@@ -16,8 +16,9 @@ Pipeline
 Evaluation (observation-level, trainer-aligned)
 ------------------------------------------------
 * Micro metrics: flat dict with trainer-style keys (test_ap, test_precision,
-  test_recall, test_f1, test_fbeta_05, threshold, test_samples, test_positives,
-  test_random_ap, alerts, alerts_per_hour). F-beta reference uses DEC-010 beta.
+  test_precision_prod_adjusted, test_recall, test_f1, test_fbeta_05, threshold,
+  test_samples, test_positives, test_random_ap, alerts, alerts_per_hour;
+  test_precision_at_recall_* and matching *_prod_adjusted). F-beta reference uses DEC-010 beta.
 * Empty or invalid subset returns same keys with zeros to avoid downstream KeyError.
 """
 
@@ -39,6 +40,7 @@ import pandas as pd
 from sklearn.metrics import average_precision_score, fbeta_score
 from zoneinfo import ZoneInfo
 
+from trainer.core.bundle_run_contract import read_bundle_run_contract_block
 from trainer.core.model_bundle_paths import resolve_model_bundle_dir
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -70,6 +72,9 @@ try:
     THRESHOLD_MIN_ALERTS_PER_HOUR: Optional[float] = getattr(
         _cfg, "THRESHOLD_MIN_ALERTS_PER_HOUR", None
     )
+    PRODUCTION_NEG_POS_RATIO: Optional[float] = getattr(
+        _cfg, "PRODUCTION_NEG_POS_RATIO", None
+    )
     UNRATED_VOLUME_LOG: bool = bool(getattr(_cfg, "UNRATED_VOLUME_LOG", True))
     SCORER_LOOKBACK_HOURS: int = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)
 except ModuleNotFoundError:
@@ -86,6 +91,7 @@ except ModuleNotFoundError:
     THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_MIN_ALERT_COUNT = getattr(_cfg, "THRESHOLD_MIN_ALERT_COUNT", 5)
     THRESHOLD_MIN_ALERTS_PER_HOUR = getattr(_cfg, "THRESHOLD_MIN_ALERTS_PER_HOUR", None)
+    PRODUCTION_NEG_POS_RATIO = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)  # type: ignore[no-redef]
     UNRATED_VOLUME_LOG = bool(getattr(_cfg, "UNRATED_VOLUME_LOG", True))  # type: ignore[no-redef]
     SCORER_LOOKBACK_HOURS = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)  # type: ignore[no-redef]
 
@@ -115,6 +121,8 @@ try:
         load_feature_spec,
         load_player_profile,
         join_player_profile,
+        _neg_pos_ratio_from_binary_labels,
+        _precision_prod_adjusted,
         _to_hk,
         HISTORY_BUFFER_DAYS,
     )
@@ -133,6 +141,8 @@ except ModuleNotFoundError:
         load_feature_spec,
         load_player_profile,
         join_player_profile,
+        _neg_pos_ratio_from_binary_labels,
+        _precision_prod_adjusted,
         _to_hk,
         HISTORY_BUFFER_DAYS,
     )
@@ -229,9 +239,18 @@ def load_dual_artifacts(bundle_dir: Optional[Path] = None) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _TARGET_RECALLS = (0.001, 0.01, 0.1, 0.5)  # DEC-026
+_NONE_REASON_EMPTY_SUBSET = "empty_subset"
+_NONE_REASON_SINGLE_CLASS = "single_class"
+_NONE_REASON_INVALID_NAN = "invalid_input_nan"
+_NONE_REASON_INFEASIBLE = "infeasible_constraint"
 
 
-def _zeroed_flat_metrics(threshold: float, window_hours: Optional[float]) -> dict:
+def _zeroed_flat_metrics(
+    threshold: float,
+    window_hours: Optional[float],
+    *,
+    none_reason_code: str = _NONE_REASON_EMPTY_SUBSET,
+) -> dict:
     """Return trainer-style flat metrics dict with zeros (empty/invalid subset).
 
     Includes test_precision_at_recall_{r}, threshold_at_recall_{r},
@@ -252,12 +271,36 @@ def _zeroed_flat_metrics(threshold: float, window_hours: Optional[float]) -> dic
         "test_random_ap": 0.0,
         "alerts": 0,
         "alerts_per_hour": alerts_per_hour,
+        "test_precision_prod_adjusted": None,
+        "test_precision_prod_adjusted_reason_code": none_reason_code,
     }
     for r in _TARGET_RECALLS:
         out[f"test_precision_at_recall_{r}"] = None
+        out[f"test_precision_at_recall_{r}_reason_code"] = none_reason_code
+        out[f"test_precision_at_recall_{r}_prod_adjusted"] = None
+        out[f"test_precision_at_recall_{r}_prod_adjusted_reason_code"] = none_reason_code
         out[f"threshold_at_recall_{r}"] = None
         out[f"alerts_per_minute_at_recall_{r}"] = None
     return out
+
+
+def _prod_adjusted_with_reason(
+    raw_precision: float,
+    *,
+    test_neg_pos_ratio: Optional[float],
+) -> tuple[Optional[float], Optional[str]]:
+    v = _precision_prod_adjusted(
+        raw_precision,
+        production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+        test_neg_pos_ratio=test_neg_pos_ratio,
+    )
+    if v is not None:
+        return v, None
+    if test_neg_pos_ratio is None:
+        return None, _NONE_REASON_SINGLE_CLASS
+    if PRODUCTION_NEG_POS_RATIO is None:
+        return None, _NONE_REASON_INFEASIBLE
+    return None, _NONE_REASON_INFEASIBLE
 
 
 def _score_df(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.DataFrame:
@@ -286,9 +329,10 @@ def compute_micro_metrics(
 ) -> dict:
     """Observation-level metrics aligned with trainer test_* key names (v10 single model).
 
-    Returns a flat dict with trainer-style keys: test_ap, test_precision, test_recall,
-    test_f1, test_fbeta_05, threshold, test_samples, test_positives, test_random_ap,
-    alerts, alerts_per_hour; and test_precision_at_recall_* (DEC-026) computed with the
+    Returns a flat dict with trainer-style keys: test_ap, test_precision,
+    test_precision_prod_adjusted, test_recall, test_f1, test_fbeta_05, threshold,
+    test_samples, test_positives, test_random_ap, alerts, alerts_per_hour; and
+    test_precision_at_recall_* / test_precision_at_recall_*_prod_adjusted (DEC-026) computed with the
     same constraints as trainer / DEC-032: recall >= r, THRESHOLD_MIN_ALERT_COUNT, and
     optionally THRESHOLD_MIN_ALERTS_PER_HOUR when window_hours > 0.
 
@@ -319,12 +363,20 @@ def compute_micro_metrics(
         logger.warning(
             "compute_micro_metrics: label contains NaN — returning zeroed flat metrics (trainer-aligned)."
         )
-        return _zeroed_flat_metrics(threshold, window_hours)
+        return _zeroed_flat_metrics(
+            threshold,
+            window_hours,
+            none_reason_code=_NONE_REASON_INVALID_NAN,
+        )
     if df["score"].isna().any():
         logger.warning(
             "compute_micro_metrics: score contains NaN — returning zeroed flat metrics (precision_at_recall keys None)."
         )
-        return _zeroed_flat_metrics(threshold, window_hours)
+        return _zeroed_flat_metrics(
+            threshold,
+            window_hours,
+            none_reason_code=_NONE_REASON_INVALID_NAN,
+        )
     df = df.copy()
     # v10: single model — only rated observations get alerts (DEC-021).
     df["is_alert"] = np.where(df["is_rated"], df["score"] >= threshold, False)
@@ -355,9 +407,15 @@ def compute_micro_metrics(
 
     # Precision at fixed recall levels + threshold and alerts_per_minute (DEC-026)
     precision_at_recall: Dict[str, Optional[float]] = {}
+    precision_none_reason_codes: Dict[str, Optional[str]] = {}
     if n_pos == 0 or n_pos == n_samples:
         for r in _TARGET_RECALLS:
             precision_at_recall[f"test_precision_at_recall_{r}"] = None
+            precision_none_reason_codes[f"test_precision_at_recall_{r}_reason_code"] = _NONE_REASON_SINGLE_CLASS
+            precision_at_recall[f"test_precision_at_recall_{r}_prod_adjusted"] = None
+            precision_none_reason_codes[
+                f"test_precision_at_recall_{r}_prod_adjusted_reason_code"
+            ] = _NONE_REASON_SINGLE_CLASS
             precision_at_recall[f"threshold_at_recall_{r}"] = None
             precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
     else:
@@ -367,6 +425,11 @@ def compute_micro_metrics(
         if df_o.empty:
             for r in _TARGET_RECALLS:
                 precision_at_recall[f"test_precision_at_recall_{r}"] = None
+                precision_none_reason_codes[f"test_precision_at_recall_{r}_reason_code"] = _NONE_REASON_EMPTY_SUBSET
+                precision_at_recall[f"test_precision_at_recall_{r}_prod_adjusted"] = None
+                precision_none_reason_codes[
+                    f"test_precision_at_recall_{r}_prod_adjusted_reason_code"
+                ] = _NONE_REASON_EMPTY_SUBSET
                 precision_at_recall[f"threshold_at_recall_{r}"] = None
                 precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
         else:
@@ -375,6 +438,11 @@ def compute_micro_metrics(
             if n_pos_o == 0 or n_pos_o == n_so:
                 for r in _TARGET_RECALLS:
                     precision_at_recall[f"test_precision_at_recall_{r}"] = None
+                    precision_none_reason_codes[f"test_precision_at_recall_{r}_reason_code"] = _NONE_REASON_SINGLE_CLASS
+                    precision_at_recall[f"test_precision_at_recall_{r}_prod_adjusted"] = None
+                    precision_none_reason_codes[
+                        f"test_precision_at_recall_{r}_prod_adjusted_reason_code"
+                    ] = _NONE_REASON_SINGLE_CLASS
                     precision_at_recall[f"threshold_at_recall_{r}"] = None
                     precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
             else:
@@ -384,6 +452,11 @@ def compute_micro_metrics(
                 if prep is None:
                     for r in _TARGET_RECALLS:
                         precision_at_recall[f"test_precision_at_recall_{r}"] = None
+                        precision_none_reason_codes[f"test_precision_at_recall_{r}_reason_code"] = _NONE_REASON_INFEASIBLE
+                        precision_at_recall[f"test_precision_at_recall_{r}_prod_adjusted"] = None
+                        precision_none_reason_codes[
+                            f"test_precision_at_recall_{r}_prod_adjusted_reason_code"
+                        ] = _NONE_REASON_INFEASIBLE
                         precision_at_recall[f"threshold_at_recall_{r}"] = None
                         precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
                 else:
@@ -392,6 +465,7 @@ def compute_micro_metrics(
                         window_hours,
                         THRESHOLD_MIN_ALERTS_PER_HOUR,
                     )
+                    rated_oracle_np = _neg_pos_ratio_from_binary_labels(df_o["label"])
                     for r in _TARGET_RECALLS:
                         _pick = pick_threshold_dec026_from_pr_arrays(
                             pr_p,
@@ -406,19 +480,44 @@ def compute_micro_metrics(
                         )
                         if _pick.is_fallback:
                             precision_at_recall[f"test_precision_at_recall_{r}"] = None
+                            precision_none_reason_codes[
+                                f"test_precision_at_recall_{r}_reason_code"
+                            ] = _NONE_REASON_INFEASIBLE
+                            precision_at_recall[f"test_precision_at_recall_{r}_prod_adjusted"] = None
+                            precision_none_reason_codes[
+                                f"test_precision_at_recall_{r}_prod_adjusted_reason_code"
+                            ] = _NONE_REASON_INFEASIBLE
                             precision_at_recall[f"threshold_at_recall_{r}"] = None
                             precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = None
                         else:
                             thr_r = _pick.threshold
                             n_at_r = int((scores_arr >= thr_r).sum())
                             apm_r = (n_at_r / window_minutes) if window_minutes else None
-                            precision_at_recall[f"test_precision_at_recall_{r}"] = _pick.precision
+                            raw_pr = float(_pick.precision)
+                            precision_at_recall[f"test_precision_at_recall_{r}"] = raw_pr
+                            precision_none_reason_codes[f"test_precision_at_recall_{r}_reason_code"] = None
+                            _adj_r, _adj_reason_r = _prod_adjusted_with_reason(
+                                raw_pr,
+                                test_neg_pos_ratio=rated_oracle_np,
+                            )
+                            precision_at_recall[f"test_precision_at_recall_{r}_prod_adjusted"] = _adj_r
+                            precision_none_reason_codes[
+                                f"test_precision_at_recall_{r}_prod_adjusted_reason_code"
+                            ] = _adj_reason_r
                             precision_at_recall[f"threshold_at_recall_{r}"] = thr_r
                             precision_at_recall[f"alerts_per_minute_at_recall_{r}"] = apm_r
+
+    full_np_ratio = _neg_pos_ratio_from_binary_labels(df["label"])
+    test_precision_prod_adjusted, test_precision_prod_adjusted_reason_code = _prod_adjusted_with_reason(
+        prec,
+        test_neg_pos_ratio=full_np_ratio,
+    )
 
     return {
         "test_ap": ap,
         "test_precision": prec,
+        "test_precision_prod_adjusted": test_precision_prod_adjusted,
+        "test_precision_prod_adjusted_reason_code": test_precision_prod_adjusted_reason_code,
         "test_recall": rec,
         "test_f1": f1,
         "test_fbeta_05": fb,
@@ -429,6 +528,7 @@ def compute_micro_metrics(
         "alerts": n_alerts,
         "alerts_per_hour": alerts_per_hour,
         **precision_at_recall,
+        **precision_none_reason_codes,
     }
 
 
@@ -726,6 +826,10 @@ def backtest(
     Returns a results dict with micro + macro metrics for both model-default
     thresholds and (optionally) Optuna-selected thresholds.
 
+    Top-level run contract (W2): ``selection_mode``, ``selection_mode_source``,
+    ``production_neg_pos_ratio`` — aligned with ``training_metrics.json`` when the
+    bundle contains that file.
+
     Notes
     -----
     Caller (e.g. main) must pass already-normalized bets/sessions; parameter
@@ -746,13 +850,18 @@ def backtest(
     ws_naive = window_start
     we_naive = window_end
 
+    _run_contract = read_bundle_run_contract_block(
+        model_bundle_dir,
+        production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+    )
+
     # --- DQ ---
     bets, sessions = apply_dq(
         bets_raw, sessions_raw, window_start, extended_end,
         bets_history_start=history_start,
     )
     if bets.empty:
-        return {"error": "No bets after DQ"}
+        return {"error": "No bets after DQ", **_run_contract}
 
     # --- Identity ---
     canonical_map = build_canonical_mapping_from_df(sessions, cutoff_dtm=window_end)
@@ -813,7 +922,11 @@ def backtest(
         & (labeled["payout_complete_dtm"] < we_naive)
     ].copy()
     if labeled.empty:
-        return {"error": "No rows after label filtering", "track_llm_degraded": _track_llm_degraded}
+        return {
+            "error": "No rows after label filtering",
+            "track_llm_degraded": _track_llm_degraded,
+            **_run_contract,
+        }
 
     # --- player_profile PIT join (PLAN § Train–Serve Parity) ---
     # R222 Review #2: pass [] when no rated players so load_player_profile does not load full table.
@@ -898,6 +1011,7 @@ def backtest(
             "unrated_obs": n_unrated_orig,
             "observations": n_unrated_orig,
             "track_llm_degraded": _track_llm_degraded,
+            **_run_contract,
         }
 
     # --- Score (rated only) ---
@@ -913,6 +1027,7 @@ def backtest(
     rated_t_default = float((artifacts.get("rated") or {}).get("threshold", 0.5))
 
     results: dict = {
+        **_run_contract,
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
         "window_hours": window_hours,

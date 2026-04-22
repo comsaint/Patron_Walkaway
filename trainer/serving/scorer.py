@@ -66,6 +66,7 @@ except ImportError:
         _join_profile = None  # type: ignore[assignment]
         coerce_feature_dtypes = None  # type: ignore[assignment]
 
+from trainer.core.bundle_run_contract import read_bundle_run_contract_block
 from trainer.core.model_bundle_paths import resolve_model_bundle_dir
 from trainer.db_conn import get_clickhouse_client  # serving lives under trainer; db_conn at package root
 
@@ -236,6 +237,9 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         reason_code_map : Dict[str, str]
         model_version   : str
         feature_spec    : parsed YAML dict or None
+        selection_mode / selection_mode_source / production_neg_pos_ratio :
+            W2 run contract (aligned with ``backtest_metrics.json``; ``selection_mode``
+            prefers ``training_metrics.json`` in the bundle when set).
     """
     if model_dir is not None:
         d = model_dir.expanduser().resolve()
@@ -321,6 +325,17 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
             "[scorer] Single rated model loaded from model.pkl (v=%s, %d features)",
             artifacts["model_version"],
             len(artifacts["feature_list"]),
+        )
+        _contract = read_bundle_run_contract_block(
+            d,
+            production_neg_pos_ratio=getattr(config, "PRODUCTION_NEG_POS_RATIO", None),
+        )
+        artifacts.update(_contract)
+        logger.info(
+            "[scorer] Run contract: selection_mode=%s (%s), production_neg_pos_ratio=%s",
+            _contract["selection_mode"],
+            _contract["selection_mode_source"],
+            _contract["production_neg_pos_ratio"],
         )
         return artifacts
 
@@ -597,10 +612,14 @@ def ensure_runtime_rated_threshold_schema(conn: sqlite3.Connection) -> None:
             n_pos INTEGER,
             window_hours REAL,
             recall_at_threshold REAL,
-            precision_at_threshold REAL
+            precision_at_threshold REAL,
+            selection_mode TEXT
         )
         """
     )
+    _cols = {row[1] for row in conn.execute("PRAGMA table_info(runtime_rated_threshold)").fetchall()}
+    if _cols and "selection_mode" not in _cols:
+        conn.execute("ALTER TABLE runtime_rated_threshold ADD COLUMN selection_mode TEXT")
 
 
 def upsert_runtime_rated_threshold(
@@ -613,8 +632,13 @@ def upsert_runtime_rated_threshold(
     window_hours: Optional[float] = None,
     recall_at_threshold: Optional[float] = None,
     precision_at_threshold: Optional[float] = None,
+    selection_mode: Optional[str] = None,
 ) -> None:
-    """Replace the single runtime threshold row (id=1). Caller must commit if needed."""
+    """Replace the single runtime threshold row (id=1). Caller must commit if needed.
+
+    *selection_mode* (W2): optional ``legacy`` / ``field_test`` audit tag persisted with
+    the runtime override; omitted or blank → stored as NULL.
+    """
     t = float(rated_threshold)
     if not math.isfinite(t) or t <= 0.0 or t >= 1.0:
         raise ValueError(
@@ -622,12 +646,15 @@ def upsert_runtime_rated_threshold(
         )
     ensure_runtime_rated_threshold_schema(conn)
     now = datetime.now(HK_TZ).isoformat()
+    _sel: Optional[str] = None
+    if selection_mode is not None:
+        _sel = str(selection_mode).strip() or None
     conn.execute(
         """
         INSERT INTO runtime_rated_threshold (
             id, rated_threshold, updated_at, source, n_mature, n_pos,
-            window_hours, recall_at_threshold, precision_at_threshold
-        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+            window_hours, recall_at_threshold, precision_at_threshold, selection_mode
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             rated_threshold = excluded.rated_threshold,
             updated_at = excluded.updated_at,
@@ -636,7 +663,8 @@ def upsert_runtime_rated_threshold(
             n_pos = excluded.n_pos,
             window_hours = excluded.window_hours,
             recall_at_threshold = excluded.recall_at_threshold,
-            precision_at_threshold = excluded.precision_at_threshold
+            precision_at_threshold = excluded.precision_at_threshold,
+            selection_mode = excluded.selection_mode
         """,
         (
             t,
@@ -647,6 +675,7 @@ def upsert_runtime_rated_threshold(
             window_hours,
             recall_at_threshold,
             precision_at_threshold,
+            _sel,
         ),
     )
 
@@ -1552,6 +1581,55 @@ def ensure_prediction_calibration_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+def insert_calibration_run_row(
+    conn: sqlite3.Connection,
+    *,
+    suggested_threshold: float,
+    applied_to_state: bool,
+    skipped_reason: Optional[str] = None,
+    window_start: Optional[str] = None,
+    window_end: Optional[str] = None,
+    window_hours: Optional[float] = None,
+    n_rows_used: Optional[int] = None,
+    n_pos: Optional[int] = None,
+    summary_extras: Optional[dict] = None,
+) -> int:
+    """Append one ``calibration_runs`` row; ``summary_json`` includes W2 bundle contract + *summary_extras*.
+
+    *suggested_threshold* is the calibrated / CLI-proposed value. *applied_to_state* should match
+    whether the state DB runtime row was updated in the same operation.
+    """
+    ensure_prediction_calibration_schema(conn)
+    run_at = datetime.now(HK_TZ).isoformat()
+    _contract = read_bundle_run_contract_block(
+        None,
+        production_neg_pos_ratio=getattr(config, "PRODUCTION_NEG_POS_RATIO", None),
+    )
+    payload: dict = {**_contract, **(summary_extras or {})}
+    summary_json = json.dumps(payload, ensure_ascii=False, default=str)
+    cur = conn.execute(
+        """
+        INSERT INTO calibration_runs (
+            run_at, window_start, window_end, window_hours, n_rows_used, n_pos,
+            suggested_threshold, applied_to_state, skipped_reason, summary_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_at,
+            window_start,
+            window_end,
+            window_hours,
+            n_rows_used,
+            n_pos,
+            float(suggested_threshold),
+            1 if applied_to_state else 0,
+            skipped_reason,
+            summary_json,
+        ),
+    )
+    return int(cur.lastrowid)
 
 
 def _append_prediction_log(

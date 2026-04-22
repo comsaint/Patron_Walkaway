@@ -31,15 +31,19 @@
 
 ### 1.1 已可用能力（可直接執行）
 
-- `trainer/training/trainer.py` 已具備 Optuna HPO、AP objective、validation scoring 與 artifact 輸出主路徑。
+- `trainer/training/trainer.py` 已具備 Optuna HPO；本輪依 **DEC-043** 走 `selection_mode=field_test` 契約：當 W1 precondition 允許 constrained、rated、且可由 `payout_complete_dtm` 得到正之 validation span 時，啟用 **field-test DEC-026 validation precision** 目標（可搭配 `PRODUCTION_NEG_POS_RATIO` → trial 分數 prod-adjusted）；若 precondition 不允許或 validation span 不可行，直接 **`GATE BLOCKED`**（不再 AP fallback）。`training_metrics` 可寫入 **`optuna_hpo_*`**（實際優化目標與 `val_ap` 區隔）。refit 後驗證集 **`pick_threshold_dec026`** 與 HPO 試驗共用 **`FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR`** + 同一 payout span（winner-pick 密度對齊）。
 - `trainer/training/threshold_selection.py` 已具備 DEC-026 shared selector、`min_alert_count` / `min_alerts_per_hour` guards 與 fallback semantics。
-- `trainer/training/backtester.py` 已能輸出主要離線指標與多窗回測基礎結果。
+- `trainer/training/backtester.py`：`compute_micro_metrics` 已與 trainer 測試指標鍵對齊 **`test_precision_prod_adjusted`** 與各 **`test_precision_at_recall_*_prod_adjusted`**，並補上 **`None -> single reason_code`**（`*_reason_code`）契約；`test_recall` / `alerts_per_hour` 等原有扁平鍵保留。
+- `trainer/scripts/build_field_test_objective_precondition.py` 可產出 precondition JSON/MD；trainer 可經 **`FIELD_TEST_OBJECTIVE_PRECONDITION_JSON`** 讀取並寫入 `training_metrics` overlay（W1 gate 基礎已就緒）。
 - `trainer/serving/scorer.py` 與 `prediction_log` / `runtime_rated_threshold` 已提供後續 DEC-032 對齊落點。
+- **W2 run contract（程式層）**：`trainer/core/config.py` 之 **`SELECTION_MODE`**；`save_artifact_bundle` 寫入 **`training_metrics.json`**（`selection_mode` + `production_neg_pos_ratio`）；**`trainer/core/bundle_run_contract.read_bundle_run_contract_block`** 為 SSOT；**`backtest_metrics.json`** 與 **`load_dual_artifacts`** 頂層皆含 `selection_mode` / `selection_mode_source` / `production_neg_pos_ratio`（scorer 載入時 `logger.info` 審計）。
+- **W2 證據工具（trainer 範圍）**：`trainer/scripts/report_w2_objective_parity.py` 可彙整多個 run 目錄，輸出 objective 對照 **CSV + Markdown** 與欄位對照快照；`trainer/scripts/calibrate_threshold_from_prediction_log.py --run-batch-calibration` 可由 SQLite `prediction_log` + `prediction_ground_truth` 自動選閾值並寫入 `calibration_runs`（可選擇同步 state DB）。
 
 ### 1.2 尚未完成能力（執行時視為限制）
 
-- HPO objective 尚未對齊 field-test objective；目前仍以 AP 為主。
-- `DEC-026 field_test mode` 尚未正式落地為 trainer/backtester/calibration 共用契約。
+- 依 **DEC-043**，本輪 run contract 固定 `selection_mode=field_test`；無有效 precondition／無 validation span／不滿足可行域時，視為 **`GATE BLOCKED`**（不納入可比 run），不以 AP fallback 充當可比結果。**此 fail-fast 行為已落地於 `run_optuna_search()`。**
+- **離線** trainer ↔ backtester 之 prod-adjusted / DEC-026 欄位已對齊；**`selection_mode` 與 bundle 契約**已寫入 `training_metrics` / `backtest_metrics` 並由 scorer 讀取；**state DB `runtime_rated_threshold.selection_mode`** 已可經 `upsert_runtime_rated_threshold` / `calibrate_threshold_from_prediction_log --selection-mode` 寫入（既有 DB 自動 `ALTER` 遷移）。**`calibration_runs`**：`insert_calibration_run_row` 將 W2 契約（`read_bundle_run_contract_block`）合併入 `summary_json`；校準 CLI 具備 `--log-calibration-run` 與 `--run-batch-calibration`。**仍待**：批次流程的排程化與長期穩定運行（定期 job / 監控）。
+- 同一契約下 **多窗**「AP objective vs field-test objective」對照 **腳本能力已具備**（`report_w2_objective_parity.py`），但 **正式多窗報告工件（CSV/MD）與凍結欄位對照表版本**仍待產出（W2 DoD 未滿）。
 - CatBoost / XGBoost bakeoff 尚未形成固定報表與單模公平比較基線。
 - 二階段模型尚未有 PoC artifact / serving / evaluation 契約。
 
@@ -47,8 +51,8 @@
 
 | 任務 | 狀態 | 備註 |
 | :--- | :--- | :--- |
-| `W1 / R1 Optuna precondition + objective freeze` | **🟡** | precondition JSON 工具 + trainer 讀檔寫入 `training_metrics` 已部分落地；objective contract 全文凍結與 orchestration 自動餵檔仍待補 |
-| `W2 / R1 Optuna objective implementation parity` | **⬜** | 尚未完成 `run_optuna_search` / winner-pick / 報表欄位對齊 |
+| `W1 / R1 Optuna precondition + objective freeze` | **🟡** | `DEC-043` 已入決策；precondition builder 已改為 `BLOCKED` 決策語意與固定 reason code 枚舉；trainer 已依 precondition + span 做 **GATE BLOCKED**。仍待：freeze 工件（多窗證據串接與版本化欄位對照）完整出檔 |
+| `W2 / R1 Optuna objective implementation parity` | **🟡** | `run_optuna_search` 已改為 field-test-only fail-fast（無 AP fallback）並寫 `optuna_hpo_gate_blocked_*`；`selection_mode` default / artifact 已封板 `field_test`；backtester 已補 `None -> single reason_code`。仍缺正式多窗對照工件、排程化批次校準、`precision_raw` 別名若採用 |
 | `W3 / R2 ranking-focused training matrix` | **⬜** | 尚未形成可重跑的 weighting / HNM 配置矩陣 |
 | `W4 / R3 fair bakeoff` | **⬜** | 尚未建立單模公平比較與 winner / hold policy |
 | `W5 / R4 entry-gate decision` | **⬜** | 尚未判定二階段 PoC 是否應進場 |
@@ -78,7 +82,7 @@
 - window（`start_ts/end_ts`）與時區
 - 標籤契約（含 censored 規則）
 - 主要資料路徑（state / prediction_log / warehouse）
-- `selection_mode`（`legacy` / `field_test`）
+- `selection_mode`（本輪依 **DEC-043** 固定為 `field_test`）
 - `objective_definition`（單一 constrained objective / 複合 objective）
 - `PRODUCTION_NEG_POS_RATIO`
 - `min_alert_count`
@@ -98,8 +102,8 @@
 
 | 狀態 | 任務 | 子任務 | Owner | 依賴 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **🟡** | `W1 / R1 Optuna precondition + objective freeze` | 1. 盤點 folds 的正例數、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小、test neg/pos ratio。 2. 明確定義 Optuna / HPO 要採用的 constrained objective、fallback fold semantics、guardrails。 3. 決定是否允許單一 objective 或需複合 objective。 | `DS owner` | 現有 trainer/backtester 基線可用、validation folds 與評估資料可取得 | `out/precision_uplift_field_test_objective/field_test_objective_precondition_check.json`、`trainer/precision_improvement_plan/field_test_objective_precondition_check.md`、objective 設計摘要 | 有完整 precondition 產物；明確寫出 `selection_mode`、Optuna objective 定義、fallback semantics、是否允許單一 constrained objective；不存在未定義欄位 |
-| **⬜** | `W2 / R1 Optuna objective implementation parity` | 1. 在 `run_optuna_search()`、winner-pick / early stopping 與 trainer / backtester 報表中對齊 objective 定義。 2. 確認欄位輸出含 `precision_raw` / `precision_prod_adjusted` / `recall` / `alerts_per_hour`。 3. 以同一契約的多個資料窗比較 AP objective vs field-test objective，形成多窗對照報告。 | `DS owner` | `W1` | objective 對照報告（多窗）、欄位對照表、run config 凍結紀錄 | 至少完成同一契約下的多窗可重跑比較；新舊 objective 結果可跨窗並列比較；`run_optuna_search()` 與報表欄位語意一致；fallback / infeasible 情況可明確辨識 |
+| **🟡** | `W1 / R1 Optuna precondition + objective freeze` | 1. 盤點 folds 的正例數、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小、test neg/pos ratio。 2. 明確定義 Optuna / HPO 要採用的 constrained objective、fail-fast semantics、guardrails。 3. 決定是否允許單一 objective 或需 `BLOCKED`。 | `DS owner` | 現有 trainer/backtester 基線可用、validation folds 與評估資料可取得 | `out/precision_uplift_field_test_objective/field_test_objective_precondition_check.json`、`trainer/precision_improvement_plan/field_test_objective_precondition_check.md`、objective 設計摘要 | 有完整 precondition 產物；明確寫出 `selection_mode`、Optuna objective 定義、fallback semantics、是否允許單一 constrained objective；不存在未定義欄位 |
+| **🟡** | `W2 / R1 Optuna objective implementation parity` | 1. 在 `run_optuna_search()`、winner-pick / early stopping 與 trainer / backtester 報表中對齊 objective 定義。 2. 確認欄位輸出含 `precision_raw` / `precision_prod_adjusted` / `recall` / `alerts_per_hour`（**進度**：trainer 以 `test_precision` / `test_precision_prod_adjusted`；backtester `compute_micro_metrics` 已補 `test_precision_prod_adjusted` 與 `test_precision_at_recall_*_prod_adjusted`；`test_recall` / `alerts_per_hour` 既有；**`selection_mode` 已入 `training_metrics` / `backtest_metrics` / scorer artifacts，SSOT 為 `bundle_run_contract`**）。 3. 以同一契約的多個資料窗比較 AP objective vs field-test objective，形成多窗對照報告（**仍待**）。 | `DS owner` | `W1` | objective 對照報告（多窗）、欄位對照表、run config 凍結紀錄 | **部分**：單窗離線已可並列審計 trainer vs backtester prod-adjusted 與 HPO manifest；**仍須**多窗對照報告、凍結欄位對照表、**批次校準／全自動寫入 `calibration_runs`**、實作計畫字面 `precision_raw` 若與 `test_precision` 分離；`run_optuna_search()` 與報表語意一致且 fallback 可辨識後方可標 ✅ |
 | **⬜** | `W3 / R2 ranking-focused training matrix` | 1. 定義 weighting / hard-negative / top-band reweighting 的最小矩陣。 2. 跑小矩陣實驗。 3. 保留版本化配置與結果。 4. 輸出主指標 uplift 與穩定性摘要。 | `DS owner` | `W1`、`W2` | ranking config matrix、實驗報告（含主指標 uplift / 穩定性摘要）、保留/淘汰建議 | 至少一組配置完成同契約比較；結果能回答是否值得進一步擴展，且有主指標 uplift 與穩定性摘要；無 silent resource blow-up |
 
 #### 4.1.1 `W1` 當日最小可執行切面（Kickoff Checklist）
@@ -108,17 +112,18 @@
 
 | 狀態 | 子項 | 內容 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- |
-| **⬜** | `W1-C1 precondition schema freeze` | 凍結 precondition JSON 最小欄位：`run_id`、`window`、`fold_stats[]`、`t_feasible_stats`、`test_neg_pos_ratio`、`production_neg_pos_ratio_assumption`、`single_objective_allowed`、`blocking_reasons[]`。 | `field_test_objective_precondition_check.json` schema 區塊或等價欄位 | 欄位定義完整且無待定 placeholder |
-| **🟡** | `W1-C2 fold evidence collect` | 依同一契約收集各 fold：正例數、finalized TP 數量級、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小。 | precondition JSON `fold_stats[]` | 腳本可聚合手動餵入之 fold metrics；Phase 2 可經顯式路徑或 `field_test_objective_fold_metrics_globs` 自動展開；仍待從 R1/R6 stdout 結構化抽取 fold 路徑（若有） |
-| **🟡** | `W1-C3 objective decision` | 依 `W1-C2` 證據判斷：`single constrained objective` 或 `composite objective`；明確寫 fallback fold semantics。 | `field_test_objective_precondition_check.md` 決策段落 | 腳本可輸出 `objective_decision` / `blocking_reasons`；MD 決策模板與 fallback 段落仍待加強 |
-| **🟡** | `W1-C4 gate readiness` | 將 `selection_mode`、objective 定義、fallback semantics 寫回 run contract，並生成本輪 objective freeze 摘要。 | objective 設計摘要 + run contract 凍結紀錄 | 已可經 `FIELD_TEST_OBJECTIVE_PRECONDITION_JSON` 寫入 `training_metrics.json`；Phase 2 orchestrator 可經 `resources.field_test_objective_fold_metrics_json` 自動建檔並注入子程序 env；完整 run contract 凍結紀錄與「自動收集 fold 路徑」仍待補 |
+| **✅** | `W1-C1 precondition schema freeze` | 凍結 precondition JSON 最小欄位：`run_id`、`window`、`fold_stats[]`、`t_feasible_stats`、`test_neg_pos_ratio`、`production_neg_pos_ratio_assumption`、`single_objective_allowed`、`blocking_reasons[]`，並固定 `allowed_reason_codes` 與 `objective_decision=BLOCKED` 語意。 | `field_test_objective_precondition_check.json` schema 區塊或等價欄位 | 欄位定義完整且無待定 placeholder |
+| **🟡** | `W1-C2 fold evidence collect` | 依同一契約收集各 fold：正例數、finalized TP 數量級、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小。 | precondition JSON `fold_stats[]` | 腳本可聚合手動餵入之 fold metrics；仍待把 fold 路徑蒐集流程固定化（trainer 範圍，避免人工漏檔） |
+| **🟡** | `W1-C3 objective decision` | 依 `W1-C2` 證據判斷：`single constrained objective` 或 `BLOCKED`；明確寫 fallback fold semantics（本輪為 no-fallback）。 | `field_test_objective_precondition_check.md` 決策段落 | 已依 **DEC-043** 凍結：`recall_floor=guardrail`、可行域不滿足一律 `gate_blocked`、`None -> 單一 reason_code`，且 precondition script 已輸出 `BLOCKED` 決策語意；仍待把所有 reason code 證據串進正式 freeze 工件 |
+| **🟡** | `W1-C4 gate readiness` | 將 `selection_mode`、objective 定義、fallback semantics 寫回 run contract，並生成本輪 objective freeze 摘要。 | objective 設計摘要 + run contract 凍結紀錄 | 已可經 `FIELD_TEST_OBJECTIVE_PRECONDITION_JSON` 寫入 `training_metrics.json`；**config `SELECTION_MODE` 已凍結寫入 artifact `training_metrics`**；`run_optuna_search` 已對 precondition fail/無效 span 實作 `GATE BLOCKED`；仍待補完整 freeze 工件與 fold 證據收集固定流程 |
 
 #### 4.1.2 `W1` 阻擋規則（Fail-fast）
 
 - 任一 fold 的關鍵欄位缺失且無 reason code：標記 `GATE BLOCKED`，不得進 `W2`。
-- 任一 fold 的 `T_feasible` 過小、常為空，或尾段支撐不足：不得硬切單一 constrained objective（需改採複合目標、fold 聚合分數，或先調整驗證窗設計）。
+- 任一 fold 的 `T_feasible` 過小、常為空，或尾段支撐不足：不得硬切單一 constrained objective；本輪依 DEC-043 直接 `BLOCKED`，不以複合目標視為同列可比。
 - `PRODUCTION_NEG_POS_RATIO` 假設無法交代來源或敏感度：不得把 `prod_adjusted` 作唯一 driver。
 - precondition 只產生 markdown、無 machine-readable JSON：視為未完成 `W1`。
+- 依 **DEC-043**：任何不滿足 field-test objective 可行域條件之 run，一律 `GATE BLOCKED`；`None` 指標必須且僅能對應單一 reason code。
 
 ### 4.2 Batch B：單模比較與二階段 entry gate（P0/P1）
 
@@ -141,7 +146,7 @@
 
 ### 5.2 本輪關鍵任務額外硬條件
 
-- `W1`：若任一 fold 的 `T_feasible` 過小或常為空，不得硬切單一 constrained objective。
+- `W1`：若任一 fold 的 `T_feasible` 過小或常為空，不得硬切單一 constrained objective（本輪輸出 `BLOCKED`）。
 - `W2`：trainer / backtester 必須對齊同一 objective contract 與 fallback semantics。
 - `W3`：ranking-focused 實驗至少要輸出主指標 uplift 與穩定性摘要，不接受只報單次最佳結果。
 - `W4`：模型家族比較必須是同特徵、同切分、同 objective、同報表，不接受 apples-to-oranges。
@@ -160,7 +165,7 @@
 
 ### 6.1 進入下一階段條件
 
-- `W2` 只有在 `W1` objective contract 凍結後才能正式開始。
+- `W2` 只有在 `W1` objective contract 凍結後才能**宣告整列 DoD 完成（✅）**；目前已允許在 **W1 部分落地**（precondition 可讀、Phase 2 可注入 env）下，先完成 **W2 程式層 parity**（見 §1.1 / §1.3），**不**等同 W2 已結案。
 - `W3` 只有在 `W1` / `W2` 契約與欄位已可比後才能開始。
 - `W4` 只有在 `W1` / `W2` 契約與欄位已可比後才能開始。
 - `W5` 只有在 `W2` / `W3` / `W4` 都產生可比性證據後才能做 go/no-go。
@@ -196,7 +201,8 @@
 - Recommendation / ROI：`trainer/precision_improvement_plan/PRECISION_UPLIFT_FIELD_TEST_OBJECTIVE_RECOMMENDED_ITEMS_ROI.md`
 - Implementation Plan：`trainer/precision_improvement_plan/PRECISION_UPLIFT_FIELD_TEST_OBJECTIVE_IMPLEMENTATION_PLAN.md`
 - Sprint Plan：`.cursor/plans/PLAN_precision_uplift_sprint.md`
-- Runbook：`investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_ORCHESTRATOR_RUNBOOK.md`
+- W2 parity report script：`trainer/scripts/report_w2_objective_parity.py`
+- Calibration CLI：`trainer/scripts/calibrate_threshold_from_prediction_log.py`
 
 ---
 

@@ -198,6 +198,7 @@ try:
     NEG_SAMPLE_RAM_SAFETY: float = getattr(_cfg, "NEG_SAMPLE_RAM_SAFETY", 0.75)
     NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT: int = getattr(_cfg, "NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT", 200 * 1024 * 1024)
     PRODUCTION_NEG_POS_RATIO: Optional[float] = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)
+    SELECTION_MODE: str = str(getattr(_cfg, "SELECTION_MODE", "field_test") or "field_test").strip() or "field_test"
     STEP7_USE_DUCKDB: bool = getattr(_cfg, "STEP7_USE_DUCKDB", True)
     # STEP7 DuckDB: runtime uses get_duckdb_memory_config("step7"); exposed for tests (DEC-027).
     STEP7_DUCKDB_RAM_FRACTION: float = getattr(_cfg, "STEP7_DUCKDB_RAM_FRACTION", 0.50)
@@ -251,6 +252,7 @@ except ModuleNotFoundError:
     NEG_SAMPLE_RAM_SAFETY = getattr(_cfg, "NEG_SAMPLE_RAM_SAFETY", 0.75)
     NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT = getattr(_cfg, "NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT", 200 * 1024 * 1024)
     PRODUCTION_NEG_POS_RATIO = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)  # type: ignore[no-redef]
+    SELECTION_MODE = str(getattr(_cfg, "SELECTION_MODE", "field_test") or "field_test").strip() or "field_test"  # type: ignore[no-redef]
     STEP7_USE_DUCKDB = getattr(_cfg, "STEP7_USE_DUCKDB", True)
     STEP7_DUCKDB_RAM_FRACTION = getattr(_cfg, "STEP7_DUCKDB_RAM_FRACTION", 0.50)
     STEP7_DUCKDB_RAM_MIN_GB = getattr(_cfg, "STEP7_DUCKDB_RAM_MIN_GB", 2.0)
@@ -3217,12 +3219,31 @@ def run_optuna_search(
         )
         return {}
 
-    if field_test_constrained_optuna_objective_allowed is False:
-        logger.warning(
-            "%s: W1 precondition disallows field-test single constrained objective "
-            "(field_test_constrained_optuna_objective_allowed=False); "
-            "Optuna continues with validation AP only (W2 alternate objective not active).",
-            label or "model",
+    def _raise_field_test_gate_blocked(
+        *,
+        reason_code: str,
+        details: str,
+    ) -> None:
+        _write_optuna_hpo_manifest(
+            hpo_objective_manifest,
+            {
+                "optuna_hpo_objective_mode": "gate_blocked",
+                "optuna_hpo_study_best_trial_value": None,
+                "optuna_hpo_gate_blocked": True,
+                "optuna_hpo_gate_blocked_reason_code": reason_code,
+                "optuna_hpo_gate_blocked_details": details,
+            },
+        )
+        raise RuntimeError(f"{label or 'model'}: {details}")
+
+    if field_test_constrained_optuna_objective_allowed is False and str(label or "").strip().lower() == "rated":
+        _raise_field_test_gate_blocked(
+            reason_code="infeasible_constraint",
+            details=(
+                "W1 precondition disallows field-test constrained objective "
+                "(field_test_constrained_optuna_objective_allowed=False); "
+                "DEC-043 contract requires GATE BLOCKED (no AP fallback)."
+            ),
         )
 
     _mah_ft = getattr(_cfg, "FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR", 50.0)
@@ -3250,10 +3271,13 @@ def run_optuna_search(
         and _vwh is not None
     )
     if field_test_constrained_optuna_objective_allowed is True and _rated_l and _vwh is None:
-        logger.warning(
-            "%s: field-test constrained HPO allowed but val_window_hours missing or invalid; "
-            "using validation AP (DEC-026 density guard needs a positive payout_complete_dtm span).",
-            label or "model",
+        _raise_field_test_gate_blocked(
+            reason_code="infeasible_constraint",
+            details=(
+                "field-test constrained HPO allowed but val_window_hours missing/invalid; "
+                "DEC-026 density guard requires positive payout_complete_dtm span "
+                "and DEC-043 requires GATE BLOCKED (no AP fallback)."
+            ),
         )
 
     # HPO subsampling (PLAN "Optuna HPO 階段 train/valid 抽樣"): use X_tr, y_tr, sw_tr, X_vl, y_vl in objective.
@@ -5694,6 +5718,8 @@ def save_artifact_bundle(
         # Production neg/pos ratio assumed for test_precision_prod_adjusted.
         # None = feature disabled (PRODUCTION_NEG_POS_RATIO not set in config).
         "production_neg_pos_ratio": PRODUCTION_NEG_POS_RATIO,
+        # W2: operating contract for threshold objective / prod-adjusted semantics.
+        "selection_mode": str(SELECTION_MODE or "field_test").strip() or "field_test",
         # R703: uncalibrated_threshold=True means the 0.5 fallback was used.
         "uncalibrated_threshold": _uncalibrated_threshold,
         # DEC-032 / PLAN: artifact threshold is chosen at this recall floor (vs multi-recall backtester keys).

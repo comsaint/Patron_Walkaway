@@ -1079,4 +1079,33 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-043：W1 語意封板（field-test-only）與 fail-fast 狀態凍結
+
+**日期**：2026-04-22  
+**相關**：`.cursor/plans/EXECUTION PLAN - Precision Uplift.md`（W1 / W2）；`trainer/precision_improvement_plan/PRECISION_UPLIFT_FIELD_TEST_OBJECTIVE_IMPLEMENTATION_PLAN.md`（R1）
+
+**決策**：
+
+1. **Operating contract（field-test-only）**：本輪 Precision Uplift 的 run contract 固定為 `selection_mode=field_test`。`legacy` 不納入本輪比較與結案證據。  
+2. **Objective guardrail**：`recall_floor` 定位為 **guardrail**，非主排序目標；主目標以 R1 field-test operating objective 為準（含 `min_alerts_per_hour >= 50` 之可行域約束語意）。  
+3. **Fallback 政策**：本輪不接受「降級到 AP 仍視為可比較」；遇到不滿足 field-test 可行條件的情況，一律視為 **`gate_blocked`**。  
+4. **Precondition fail 狀態**：precondition 不通過時，run 狀態固定為 **`BLOCKED`**（非 `PRELIMINARY`）。  
+5. **Precision 欄位語意**：`precision_raw := test_precision`（不新增 `precision_raw` 欄位）；`test_precision_prod_adjusted` 為 prod-adjusted 官方鍵。  
+6. **HPO best value 來源**：以 `optuna_hpo_study_best_trial_value` 作為 HPO 最佳值審計欄位（其語意由當次 objective contract 決定）。  
+7. **`None` + reason code 契約**：任何輸出為 `None` 的指標，必須且僅能對應一個 `reason_code`。  
+8. **Reason code 枚舉（凍結）**：
+   - `empty_subset`：該評估子集合為空。  
+   - `single_class`：標籤僅單一類別（無法形成有效 PR operating point）。  
+   - `invalid_input_nan`：關鍵輸入（label/score）含 NaN 或非法值。  
+   - `infeasible_constraint`：在既定約束（如 alerts/hour、min alerts、recall floor）下不可行。  
+   - `missing_required_column`：計算所需欄位缺失。  
+
+**理由**：
+
+- 先凍結語意，才能避免 trainer/backtester/scorer/report 之同名欄位出現異義，確保跨窗比較可審計。  
+- 以 `BLOCKED` 取代模糊降級可強化 gate 紀律，避免「看似可跑、實則不可比」的灰區。  
+- `None -> 單一 reason_code` 可防止後續報表誤解（例如把不可計算誤當低分）。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*
