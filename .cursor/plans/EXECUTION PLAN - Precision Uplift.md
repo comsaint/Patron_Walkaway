@@ -164,9 +164,10 @@
     3) 對應 run 的 freeze evidence JSON/MD  
   - 且三者的 `run_id` 可互相 trace。
 
-#### 4.1.4 `R2` 最小實驗矩陣（Laptop-friendly，立即可執行）
+#### 4.1.4 `R2` 最小實驗矩陣（Laptop-friendly，前置達成後可執行）
 
-> 目的：先用最小成本確認「高分帶 FP 壓制」是否有方向性 uplift；此階段輸出屬 comparative，不宣告 decision-grade。
+> 目的：先用最小成本確認「高分帶 FP 壓制」是否有方向性 uplift；此階段輸出屬 comparative，不宣告 decision-grade。  
+> 啟動前置：需符合 §6.1（`W3` 僅在 `W1` / `W2` 契約與欄位可比後開始）。
 
 - **固定契約（不得變動）**：
   - 沿用 `R1` 封板契約：`selection_mode=field_test`、`GATE BLOCKED` fail-fast、同一 objective 語意。
