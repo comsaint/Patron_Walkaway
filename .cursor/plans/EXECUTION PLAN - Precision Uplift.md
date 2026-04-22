@@ -164,6 +164,31 @@
     3) 對應 run 的 freeze evidence JSON/MD  
   - 且三者的 `run_id` 可互相 trace。
 
+#### 4.1.4 `R2` 最小實驗矩陣（Laptop-friendly，立即可執行）
+
+> 目的：先用最小成本確認「高分帶 FP 壓制」是否有方向性 uplift；此階段輸出屬 comparative，不宣告 decision-grade。
+
+- **固定契約（不得變動）**：
+  - 沿用 `R1` 封板契約：`selection_mode=field_test`、`GATE BLOCKED` fail-fast、同一 objective 語意。
+  - 不在 `R2` 期間改動資料窗定義、標籤契約、`PRODUCTION_NEG_POS_RATIO` 假設來源。
+- **最小配方矩陣（3 組）**：
+  - `r2_baseline`：延續當前 `R1` 既有訓練配方（作為對照組）。
+  - `r2_weighted_light`：輕量正負樣本權重調整（避免一次過強 reweight）。
+  - `r2_hnm_light`：輕量 hard-negative/mining 比率（僅小幅度）。
+- **執行模板（單機資源保護）**：
+  - 每組先跑小試：`max-optuna-trials` 低量（例：`10~20`），確認可跑再擴。
+  - 不同配方分批跑（序列化），避免筆電 RAM/CPU 峰值疊加。
+  - 優先用 `trainer/scripts/run_precision_uplift_bundle.py`，每次 run 必帶配方標記（`recipe_id`）進輸出摘要。
+- **命名與落檔規則（避免混檔）**：
+  - run label：`<date>-<recipe_id>-<shortsha>`（例：`20260422-r2_weighted_light-ab12cd`）。
+  - 比較輸出：`out/precision_uplift_r2/r2_matrix_summary.csv` + `trainer/precision_improvement_plan/r2_matrix_summary.md`。
+  - 每列至少含：`run_id`、`recipe_id`、`objective_mode`、`test_precision`、`test_precision_prod_adjusted`、`test_recall`、`alerts_per_hour`、`gate_blocked_reason_code`。
+- **`W3` 升級為 ⏳ 的最小條件**：
+  - 至少完成 1 組非 baseline 配方的可重跑 run，且能與 baseline 以同欄位並列比較。
+- **`W3` 維持/升級判定（本輪）**：
+  - 若三組皆無方向性 uplift：`W3` 保持 comparative、記錄「暫不擴矩陣」。
+  - 若至少一組有穩定 uplift（且非偶發）：才擴到下一輪矩陣。
+
 ### 4.2 Batch B：單模比較與二階段 entry gate（P0/P1）
 
 | 狀態 | 任務 | 子任務 | Owner | 依賴 | 輸出 | DoD |
