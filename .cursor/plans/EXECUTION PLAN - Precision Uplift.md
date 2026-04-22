@@ -116,7 +116,7 @@
 #### 4.1.2 `W1` 阻擋規則（Fail-fast）
 
 - 任一 fold 的關鍵欄位缺失且無 reason code：標記 `GATE BLOCKED`，不得進 `W2`。
-- `T_feasible` 在多數 folds 過小或常為空：不得硬切單一 constrained objective。
+- 任一 fold 的 `T_feasible` 過小、常為空，或尾段支撐不足：不得硬切單一 constrained objective（需改採複合目標、fold 聚合分數，或先調整驗證窗設計）。
 - `PRODUCTION_NEG_POS_RATIO` 假設無法交代來源或敏感度：不得把 `prod_adjusted` 作唯一 driver。
 - precondition 只產生 markdown、無 machine-readable JSON：視為未完成 `W1`。
 
