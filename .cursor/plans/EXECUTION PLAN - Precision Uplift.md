@@ -235,11 +235,11 @@
 - **執行模板（單機資源保護）**：
   - 每組先跑小試：`max-optuna-trials` 低量（例：`10~20`），確認可跑再擴。
   - 不同配方分批跑（序列化），避免筆電 RAM/CPU 峰值疊加。
-  - 優先用 `trainer/scripts/run_precision_uplift_bundle.py`，每次 run 必帶配方標記（`recipe_id`）進輸出摘要。
+  - 優先用 `trainer/scripts/run_precision_uplift_bundle.py`；目前腳本**未提供** `--recipe-id` 參數，配方標記請透過 run label / run 目錄命名顯式攜帶（見下方命名規則），再由彙總程序回填至摘要欄位。
 - **命名與落檔規則（避免混檔）**：
   - run label：`<date>-<recipe_id>-<shortsha>`（例：`20260422-r2_weighted_light-ab12cd`）。
   - 比較輸出：`out/precision_uplift_r2/r2_matrix_summary.csv` + `trainer/precision_improvement_plan/r2_matrix_summary.md`。
-  - 每列至少含：`run_id`、`recipe_id`、`objective_mode`、`test_precision`、`test_precision_prod_adjusted`、`test_recall`、`alerts_per_hour`、`gate_blocked_reason_code`。
+  - 每列至少含：`run_id`、`recipe_id`（由 run label/目錄命名回填）、`objective_mode`、`test_precision`、`test_precision_prod_adjusted`、`test_recall`、`alerts_per_hour`、`gate_blocked_reason_code`。
 - **`W3` 升級為 ⏳ 的最小條件**：
   - 至少完成 1 組非 baseline 配方的可重跑 run，且能與 baseline 以同欄位並列比較。
 - **`W3` 維持/升級判定（本輪）**：
