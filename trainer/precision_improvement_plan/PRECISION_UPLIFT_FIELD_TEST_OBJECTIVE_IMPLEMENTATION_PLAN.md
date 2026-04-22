@@ -236,6 +236,7 @@
 
 - 版本：v3 (dynamic-reorder enabled, field-test objective)
 - 建立日期：2026-04-21
+- 對齊註記：已對齊 `DEC-043`（2026-04-22），本輪採 `selection_mode=field_test`、`BLOCKED/gate_blocked` fail-fast、`None -> single reason_code` 契約。
 - 適用文件：
   - `trainer/precision_improvement_plan/PRECISION_UPLIFT_FIELD_TEST_OBJECTIVE_RECOMMENDED_ITEMS_ROI.md`
   - `.cursor/plans/PLAN_precision_uplift_sprint.md`
