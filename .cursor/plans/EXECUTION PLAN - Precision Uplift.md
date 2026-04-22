@@ -141,7 +141,7 @@
 
 ### 5.2 本輪關鍵任務額外硬條件
 
-- `W1`：若多數 folds 的 `T_feasible` 過小或常為空，不得硬切單一 constrained objective。
+- `W1`：若任一 fold 的 `T_feasible` 過小或常為空，不得硬切單一 constrained objective。
 - `W2`：trainer / backtester 必須對齊同一 objective contract 與 fallback semantics。
 - `W3`：ranking-focused 實驗至少要輸出主指標 uplift 與穩定性摘要，不接受只報單次最佳結果。
 - `W4`：模型家族比較必須是同特徵、同切分、同 objective、同報表，不接受 apples-to-oranges。

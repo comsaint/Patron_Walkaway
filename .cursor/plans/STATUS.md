@@ -1,5 +1,113 @@
 **Archive**: Past rounds and older STATUS blocks are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60, 67 Review–75 moved 2026-03-05; Rounds 79–99 moved 2026-03-05; Round 96 onward moved 2026-03-12; **2026-03-22**: Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等長段 → archive.)
 
+## Precision Uplift — `/cycle_code` STEP 1（Coding: W1-C2/W1-C3 tooling，2026-04-22）
+
+### STEP 1 — Builder
+
+**本輪只做 1–2 步（程式實作）**
+
+1. `W1-C2 fold evidence collect`：新增可重跑的 precondition evidence collector（從多個 fold metrics JSON 聚合）。  
+2. `W1-C3 objective decision`：在同一工具內加入 gate 判定（`single_constrained` / `composite`）與 `blocking_reasons` 輸出。
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/scripts/build_field_test_objective_precondition.py` | **新增腳本**：讀取多個 `--fold-metrics-json`，抽取 `positive_count/finalized_tp_count/rated_bet_count/fold_duration_hours/t_feasible_size/test_neg_pos_ratio`，產生 `field_test_objective_precondition_check.json` 與 `.md`；含 `allowed_reason_codes`、`blocking_reasons`、`objective_decision`、`single_objective_allowed`。 |
+
+**手動驗證**
+
+```bash
+python -m trainer.scripts.build_field_test_objective_precondition \
+  --fold-metrics-json <fold1.json> \
+  --fold-metrics-json <fold2.json> \
+  --run-id <run_id> \
+  --start-ts 2026-04-01T00:00:00+08:00 \
+  --end-ts 2026-04-08T00:00:00+08:00 \
+  --production-neg-pos-ratio 20 \
+  --output-json out/precision_uplift_field_test_objective/field_test_objective_precondition_check.json \
+  --output-md trainer/precision_improvement_plan/field_test_objective_precondition_check.md
+```
+
+本輪 smoke（臨時檔）結果：腳本 `rc=0`，成功輸出 JSON/MD，且可產生 `objective_decision` 與 `blocking_reasons`。
+
+**下一步建議**
+
+1. 把此腳本接進實際 run 流程（例如 investigation runner）並帶入真實 fold 資料來源。  
+2. 在 `trainer/training/trainer.py` 的 objective 路徑接 precondition gate（`blocking_reasons` 非空時禁止 single constrained）。  
+3. 補測試（解析欄位 fallback、reason code、objective 決策）。
+
+✅ STEP 1 完成
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明與建議 | 希望新增測試 |
+|------|------------|--------------|
+| **R1：`insufficient_fold_count` 門檻硬編碼** | `build_field_test_objective_precondition.py` 在 `t_feasible_stats.insufficient_fold_count` 以固定 `<3` 計算，未使用 CLI `--min-t-feasible-size`。建議改為用同一參數，避免報表與 gate 判定不一致。 | 傳入 `--min-t-feasible-size 5` 時，`insufficient_fold_count` 應依 5 計算。 |
+| **R2：neg/pos ratio 聚合偏差** | 目前 `test_neg_pos_ratio` 以 folds 簡單平均，樣本量差很大時會偏差。建議改為 weighted（依 `rated_bet_count` 或 `test_samples`）或至少在輸出註記 `aggregation=unweighted_mean`。 | 大小 fold 混合案例，驗證 weighted/unweighted 行為。 |
+| **R3：objective override 邏輯可產生自相矛盾** | 當 `--objective-decision-override single_constrained` 且有 `blocking_reasons` 時，JSON 會出現 `objective_decision=single_constrained` 但 `single_objective_allowed=false`。建議在有 blocker 時強制 `objective_decision=composite`（或拒絕 override）。 | 有 blocker + override single 時，預期拋錯或強制改為 composite。 |
+| **R4：上游 gate 文檔仍有「多數 folds」遺留** | `EXECUTION PLAN` §5.2 仍寫「若多數 folds 的 `T_feasible` 過小...」，與上游 Implementation「任一 fold」衝突。建議修正為「任一 fold」。 | 文件契約檢查：`§4.1.2` / `§5.2` 都需是「任一 fold」。 |
+
+✅ STEP 2 完成
+
+### STEP 3 — Tester（寫測試）
+
+**新增 tests（僅 tests，不改 production）**
+
+| 檔案 | 測試重點 |
+|------|----------|
+| `tests/unit/test_field_test_objective_precondition.py` | 覆蓋 4 個 review 風險：`min_t_feasible_size` 門檻一致、`test_neg_pos_ratio` 加權聚合、override 與 blocker 一致性、Execution Plan `任一 fold` 文案契約。 |
+
+**執行方式**
+
+```bash
+python -m pytest tests/unit/test_field_test_objective_precondition.py -q
+```
+
+**本輪結果**
+
+- `FFFF`（4 failed）
+  - `test_insufficient_fold_count_respects_cli_threshold`
+  - `test_test_neg_pos_ratio_uses_weighted_average`
+  - `test_single_override_rejected_when_blockers_exist`
+  - `test_execution_plan_uses_any_fold_gate_wording`
+
+> 以上失敗符合預期：已把 Reviewer 風險成功轉成可重現測試，待 STEP 4 修實作與文件契約。
+
+✅ STEP 3 完成
+
+### STEP 4 — Tester（修實作）
+
+**修正內容（不改 STEP 3 tests）**
+
+| 檔案 | 修正 |
+|------|------|
+| `trainer/scripts/build_field_test_objective_precondition.py` | 1) `insufficient_fold_count` 改為使用 `--min-t-feasible-size`；2) `test_neg_pos_ratio` 改為 weighted 聚合（優先用 `rated_bet_count`）；3) 當有 blocker 且 override 為 `single_constrained` 時，強制 `objective_decision=composite`。 |
+| `.cursor/plans/EXECUTION PLAN - Precision Uplift.md` | `§5.2` 的 `W1` gate 文案由「多數 folds」修正為「任一 fold」，對齊上游實施契約。 |
+
+**重跑結果**
+
+```bash
+python -m pytest tests/unit/test_field_test_objective_precondition.py -q
+```
+
+- `....`（`4 passed in 0.19s`）
+- `ReadLints`（本輪改動檔）: 無新錯誤
+
+**Plan item 狀態更新（Precision Uplift）**
+
+- `W1-C2`：**🟡**（collector 腳本已落地，可生成 precondition JSON/MD；尚未接真實 fold 流水）
+- `W1-C3`：**🟡**（objective decision gate 已落地於同腳本；尚未串接 trainer 主流程）
+- `W1-C4`：**⬜**（待 run contract freeze 與正式 gate 接線）
+
+**下一步建議（優先順序）**
+
+1. 把 `build_field_test_objective_precondition.py` 接進 investigation/full run orchestration，改由真實 fold artifacts 自動餵入。  
+2. 在 `trainer/training/trainer.py` 啟動 Optuna 前讀 precondition JSON；若 `blocking_reasons` 非空則禁止 single constrained objective。  
+3. 產出並固定 `field_test_objective_precondition_check.md` 的 decision 模板段落（single/composite fallback 依據）。
+
+✅ 全部完成，CYCLE 結束
+
+---
+
 ## Precision Uplift — PLAN 命名對齊 + W1 kickoff checklist（2026-04-22）
 
 **對齊**
