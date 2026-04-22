@@ -1,5 +1,35 @@
 **Archive**: Past rounds and older STATUS blocks are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60, 67 Review–75 moved 2026-03-05; Rounds 79–99 moved 2026-03-05; Round 96 onward moved 2026-03-12; **2026-03-22**: Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等長段 → archive.)
 
+## Precision Uplift — PLAN 命名對齊 + W1 kickoff checklist（2026-04-22）
+
+**對齊**
+
+- `PLAN.md`（對話語意）= `.cursor/plans/EXECUTION PLAN - Precision Uplift.md`
+- 決策：`.cursor/plans/DECISION_LOG.md`（新增 DEC-042）
+- 進度：`.cursor/plans/STATUS.md`
+
+**本輪變更**
+
+| 檔案 | 內容 |
+|------|------|
+| `.cursor/plans/EXECUTION PLAN - Precision Uplift.md` | 新增「§0 協作約定」；新增 `W1` 最小可執行切面（`W1-C1~C4`）與 `W1` fail-fast 阻擋規則。 |
+| `.cursor/plans/DECISION_LOG.md` | 新增 **DEC-042**（命名與記錄落點統一）。 |
+| `.cursor/plans/STATUS.md` | 新增本輪狀態摘要（本段）。 |
+
+**結果**
+
+- `W1` 已具體化到可執行 checklist（schema freeze、fold evidence、objective decision、gate readiness）。
+- `W2` 前置阻擋條件已明文化，避免在 precondition 不完整時跳關。
+- 三層文件分工維持一致，未混入 SSOT/Implementation 層內容。
+
+**下一步建議（直接可做）**
+
+1. 以 `W1-C1` 先凍結 precondition JSON 欄位與 reason code 列舉。  
+2. 以同一 run contract 跑 `W1-C2` fold evidence collect（先小窗 smoke，控制 RAM/runtime）。  
+3. 完成 `W1-C3` objective 決策 memo，再進 `W1-C4` gate readiness。
+
+---
+
 ## precision_uplift_recall_1pct — W1-B2 `slice_contract` MVP（2026-04-20）`/cycle_code`
 
 **對齊**：`.cursor/plans/PLAN.md`（索引）、`DECISION_LOG.md`（無新增 DEC）；實作依 `investigations/precision_uplift_recall_1pct/PRECISION_UPLIFT_R1PCT_EXECUTION_PLAN.md`（W1-B2 第一優先）與 `PRECISION_UPLIFT_R1PCT_IMPLEMENTATION_PLAN.md` W1-B2。

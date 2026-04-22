@@ -1059,4 +1059,24 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-042：Precision Uplift 文件命名與記錄落點統一（PLAN / DECISION / STATUS）
+
+**日期**：2026-04-22  
+**相關**：`.cursor/plans/EXECUTION PLAN - Precision Uplift.md`、`.cursor/plans/STATUS.md`
+
+**決策**：
+
+1. 在 Precision Uplift 工作流中，對話中提到 `PLAN.md` 時，統一指向 `.cursor/plans/EXECUTION PLAN - Precision Uplift.md`。  
+2. 所有與 Precision Uplift 相關之關鍵決策，統一落於本檔（`DECISION_LOG.md`）。  
+3. 所有執行狀態、進度、阻塞與驗證流水，統一落於 `STATUS.md`。  
+4. `EXECUTION PLAN` 僅維持 Working / Execution 層內容；若涉及 scope 或 architecture 變更，先更新上游 SSOT / Implementation Plan，再回寫 execution 層。
+
+**理由**：
+
+- 避免舊 `PLAN.md` 退場後的命名歧義，降低跨對話與跨輪次誤解。  
+- 維持三層規劃邏輯（SSOT / Implementation / Execution）與日誌職責分離，提升可追溯性。  
+- 對大型 `STATUS.md` 採單一落點，可減少資訊分散與遺漏風險。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*
