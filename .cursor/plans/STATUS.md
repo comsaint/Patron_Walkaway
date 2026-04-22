@@ -1,5 +1,88 @@
 **Archive**: Past rounds and older STATUS blocks are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60, 67 Review–75 moved 2026-03-05; Rounds 79–99 moved 2026-03-05; Round 96 onward moved 2026-03-12; **2026-03-22**: Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等長段 → archive.)
 
+## Precision Uplift — `/cycle_code`（W1-C4 trainer gate + metrics overlay，2026-04-22）
+
+### STEP 1 — Builder
+
+**本輪只做 1–2 步（程式實作）**
+
+1. **W1-C4（部分）**：在 `train_single_rated_model` 支援以環境變數載入 `field_test_objective_precondition_check.json`，於 Optuna 前記錄 gate 情境，並將摘要欄位寫入 rated `training_metrics`（run contract 可追溯）。  
+2. **可重用模組**：抽出 `trainer/training/field_test_objective_precondition.py`（讀檔、metrics overlay、log），避免把 JSON 解析散落在 `trainer.py`。
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/training/field_test_objective_precondition.py` | **新增**：`FIELD_TEST_OBJECTIVE_PRECONDITION_JSON`、`try_load_precondition_json`、`training_metrics_overlay_from_precondition`、`log_precondition_block_warning`、`log_optuna_precondition_context`。 |
+| `trainer/training/trainer.py` | 在 `train_single_rated_model` 內讀 env → 載入 JSON → `blocking_reasons` 非空時 WARNING；呼叫 Optuna 前 INFO 說明仍為 AP baseline；訓練末 `metrics.update(...)` 寫入 precondition 摘要鍵。 |
+| `.cursor/plans/EXECUTION PLAN - Precision Uplift.md` | `W1`、`W1-C2`~`C4` 狀態與 DoD 備註對齊目前落地程度（🟡）。 |
+
+**手動驗證**
+
+1. 先用 `build_field_test_objective_precondition` 產出 JSON（或任意符合欄位之最小 JSON）。  
+2. 設定環境變數後跑一輪 rated 訓練（會走 Optuna 的條件下尤佳）：
+
+```bash
+export FIELD_TEST_OBJECTIVE_PRECONDITION_JSON=/path/to/field_test_objective_precondition_check.json
+# Windows cmd: set FIELD_TEST_OBJECTIVE_PRECONDITION_JSON=...
+```
+
+3. 檢查 log 是否出現 precondition WARNING/INFO；打開產出之 `training_metrics.json`，確認含 `field_test_objective_decision`、`field_test_constrained_optuna_objective_allowed`、`field_test_precondition_blocking_reasons_head` 等鍵。
+
+**下一步建議**
+
+1. 將 `build_field_test_objective_precondition` 接進 investigation / full run orchestration，自動收集 fold metrics。  
+2. `run_optuna_search` 在引入 field-test constrained objective（W2）時讀取 `field_test_constrained_optuna_objective_allowed` 並 fail-fast 或強制 composite。  
+3. 補 E2E：帶 env 的輕量訓練 smoke（可 mock 小 DataFrame）若 CI 需要。
+
+✅ STEP 1 完成
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明與建議 | 希望新增測試 |
+|------|------------|--------------|
+| **R1：`train_dual_model` 路徑未寫入 overlay** | 僅 `train_single_rated_model`（v10 主路徑）寫 metrics；若仍有整合測試走 dual path，precondition 會靜默缺席。建議文件註記或同步 dual。 | 搜尋呼叫 `train_dual_model` 的測試／腳本，必要時 assert 不依賴 precondition 鍵。 |
+| **R2：JSON 過大或惡意檔** | 目前 `json.load` 整檔入記憶體；極大檔可能拖慢訓練開頭。建議上限（例如拒絕 >2MB）或只讀必要鍵（streaming 不適用 JSON）。 | 超大檔路徑：預期跳過或 warning（可選）。 |
+| **R3：`blocking_reasons` 非 list** | overlay 會當作空 list，`single_objective_allowed` 可能誤判為 True。建議對 schema 不符時 `logger.warning` 並視為 invalid。 | malformed `blocking_reasons` 型別 → overlay 標記 `unknown` 或 `field_test_precondition_parse_ok=false`。 |
+| **R4：W2 語意 gap** | metrics 宣告 `field_test_constrained_optuna_objective_allowed`，但 `run_optuna_search` 仍僅 AP；Reviewer 易誤以為已切 objective。建議在 PLAN/欄位說明標註「僅 gate 就緒，非 W2」。 | 欄位契約單元測試：鍵存在且型別固定。 |
+
+✅ STEP 2 完成
+
+### STEP 3 — Tester（寫測試）
+
+**新增 tests（僅 tests）**
+
+| 檔案 | 測試重點 |
+|------|----------|
+| `tests/unit/test_field_test_objective_precondition_trainer.py` | `try_load_precondition_json` 缺檔／合法／非 object；`training_metrics_overlay_from_precondition` 截斷與 malformed 預設。 |
+
+**執行方式**
+
+```bash
+python -m pytest tests/unit/test_field_test_objective_precondition_trainer.py tests/unit/test_field_test_objective_precondition.py -q
+```
+
+**本輪結果**：`9 passed`
+
+✅ STEP 3 完成
+
+### STEP 4 — Tester（修實作）
+
+- 本輪無需改 production（測試已綠）；若後續處理 R2/R3 再動實作。  
+- **Lint**：`trainer/training/trainer.py`、`field_test_objective_precondition.py`、新測試檔無新問題。
+
+**Plan item 狀態（見 `EXECUTION PLAN - Precision Uplift.md`）**
+
+- `W1`、`W1-C2`~`C4`：已與程式現況對齊標為 **🟡**；`W1-C1` 仍 **⬜**。
+
+**下一步建議（優先順序）**
+
+1. orchestration 自動餵 `--fold-metrics-json` 並寫死產物路徑供 env 指向。  
+2. W2：`run_optuna_search` 與 `field_test_constrained_optuna_objective_allowed` 接線。  
+3. 可選：malformed JSON 欄位型別之防呆（Reviewer R3）。
+
+✅ 全部完成，CYCLE 結束
+
+---
+
 ## Precision Uplift — `/cycle_code` STEP 1（Coding: W1-C2/W1-C3 tooling，2026-04-22）
 
 ### STEP 1 — Builder

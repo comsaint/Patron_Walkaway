@@ -68,6 +68,13 @@ from sklearn.model_selection import train_test_split
 from zoneinfo import ZoneInfo
 
 from trainer.profile_schedule import latest_month_end_on_or_before, month_end_dates
+from trainer.training.field_test_objective_precondition import (
+    FIELD_TEST_OBJECTIVE_PRECONDITION_JSON_ENV,
+    log_optuna_precondition_context,
+    log_precondition_block_warning,
+    training_metrics_overlay_from_precondition,
+    try_load_precondition_json,
+)
 from trainer.core.model_bundle_paths import (
     safe_version_subdirectory,
     write_latest_model_manifest,
@@ -4197,6 +4204,8 @@ def train_single_rated_model(
     When test_df is None and test_libsvm_path is set (PLAN B+ 階段 6 第 3 步), test
     labels and predictions are read from the test LibSVM file; path must be under DATA_DIR.
     """
+    _ft_pre_doc: Optional[Dict[str, Any]] = None
+    _ft_pre_path_raw = ""
     if valid_df is None:
         valid_df = pd.DataFrame()
     use_from_libsvm = False
@@ -4270,6 +4279,18 @@ def train_single_rated_model(
     )
     # #endregion
 
+    _ft_pre_path_raw = (os.environ.get(FIELD_TEST_OBJECTIVE_PRECONDITION_JSON_ENV) or "").strip()
+    if _ft_pre_path_raw:
+        _ft_pre_doc = try_load_precondition_json(Path(_ft_pre_path_raw))
+        if _ft_pre_doc is None:
+            logger.warning(
+                "%s set but file missing or invalid: %s",
+                FIELD_TEST_OBJECTIVE_PRECONDITION_JSON_ENV,
+                _ft_pre_path_raw,
+            )
+        else:
+            log_precondition_block_warning(_ft_pre_doc)
+
     # PLAN 方案 B §6: HPO on in-memory (train/valid) for both paths; from-file then uses best params for lgb.train.
     # B+ §4.4: from LibSVM we use default hp (no in-memory HPO).
     if use_from_libsvm:
@@ -4281,6 +4302,7 @@ def train_single_rated_model(
             "min_child_samples": 20,
         }
     elif run_optuna and not val_rated.empty and y_vl.sum() > 0:
+        log_optuna_precondition_context(_ft_pre_doc)
         hp = run_optuna_search(X_tr, y_tr, X_vl, y_vl, sw_rated, label="rated")
     else:
         hp = {
@@ -4863,6 +4885,13 @@ def train_single_rated_model(
     metrics["lightgbm_device_requested"] = _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS
     metrics["lightgbm_device_type"] = _EFFECTIVE_LIGHTGBM_DEVICE
     metrics["lightgbm_device_fallback"] = bool(_LIGHTGBM_GPU_FALLBACK_USED)
+
+    if _ft_pre_doc is not None and _ft_pre_path_raw:
+        metrics.update(
+            training_metrics_overlay_from_precondition(
+                _ft_pre_doc, source_path=_ft_pre_path_raw
+            )
+        )
 
     metrics["feature_importance"] = _compute_feature_importance(model, avail_cols)
     metrics["importance_method"] = "gain"

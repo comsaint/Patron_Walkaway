@@ -47,7 +47,7 @@
 
 | 任務 | 狀態 | 備註 |
 | :--- | :--- | :--- |
-| `W1 / R1 Optuna precondition + objective freeze` | **⬜** | 尚未完成 Optuna / HPO precondition check 與 objective contract 凍結 |
+| `W1 / R1 Optuna precondition + objective freeze` | **🟡** | precondition JSON 工具 + trainer 讀檔寫入 `training_metrics` 已部分落地；objective contract 全文凍結與 orchestration 自動餵檔仍待補 |
 | `W2 / R1 Optuna objective implementation parity` | **⬜** | 尚未完成 `run_optuna_search` / winner-pick / 報表欄位對齊 |
 | `W3 / R2 ranking-focused training matrix` | **⬜** | 尚未形成可重跑的 weighting / HNM 配置矩陣 |
 | `W4 / R3 fair bakeoff` | **⬜** | 尚未建立單模公平比較與 winner / hold policy |
@@ -98,7 +98,7 @@
 
 | 狀態 | 任務 | 子任務 | Owner | 依賴 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **⬜** | `W1 / R1 Optuna precondition + objective freeze` | 1. 盤點 folds 的正例數、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小、test neg/pos ratio。 2. 明確定義 Optuna / HPO 要採用的 constrained objective、fallback fold semantics、guardrails。 3. 決定是否允許單一 objective 或需複合 objective。 | `DS owner` | 現有 trainer/backtester 基線可用、validation folds 與評估資料可取得 | `out/precision_uplift_field_test_objective/field_test_objective_precondition_check.json`、`trainer/precision_improvement_plan/field_test_objective_precondition_check.md`、objective 設計摘要 | 有完整 precondition 產物；明確寫出 `selection_mode`、Optuna objective 定義、fallback semantics、是否允許單一 constrained objective；不存在未定義欄位 |
+| **🟡** | `W1 / R1 Optuna precondition + objective freeze` | 1. 盤點 folds 的正例數、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小、test neg/pos ratio。 2. 明確定義 Optuna / HPO 要採用的 constrained objective、fallback fold semantics、guardrails。 3. 決定是否允許單一 objective 或需複合 objective。 | `DS owner` | 現有 trainer/backtester 基線可用、validation folds 與評估資料可取得 | `out/precision_uplift_field_test_objective/field_test_objective_precondition_check.json`、`trainer/precision_improvement_plan/field_test_objective_precondition_check.md`、objective 設計摘要 | 有完整 precondition 產物；明確寫出 `selection_mode`、Optuna objective 定義、fallback semantics、是否允許單一 constrained objective；不存在未定義欄位 |
 | **⬜** | `W2 / R1 Optuna objective implementation parity` | 1. 在 `run_optuna_search()`、winner-pick / early stopping 與 trainer / backtester 報表中對齊 objective 定義。 2. 確認欄位輸出含 `precision_raw` / `precision_prod_adjusted` / `recall` / `alerts_per_hour`。 3. 以同一契約的多個資料窗比較 AP objective vs field-test objective，形成多窗對照報告。 | `DS owner` | `W1` | objective 對照報告（多窗）、欄位對照表、run config 凍結紀錄 | 至少完成同一契約下的多窗可重跑比較；新舊 objective 結果可跨窗並列比較；`run_optuna_search()` 與報表欄位語意一致；fallback / infeasible 情況可明確辨識 |
 | **⬜** | `W3 / R2 ranking-focused training matrix` | 1. 定義 weighting / hard-negative / top-band reweighting 的最小矩陣。 2. 跑小矩陣實驗。 3. 保留版本化配置與結果。 4. 輸出主指標 uplift 與穩定性摘要。 | `DS owner` | `W1`、`W2` | ranking config matrix、實驗報告（含主指標 uplift / 穩定性摘要）、保留/淘汰建議 | 至少一組配置完成同契約比較；結果能回答是否值得進一步擴展，且有主指標 uplift 與穩定性摘要；無 silent resource blow-up |
 
@@ -109,9 +109,9 @@
 | 狀態 | 子項 | 內容 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- |
 | **⬜** | `W1-C1 precondition schema freeze` | 凍結 precondition JSON 最小欄位：`run_id`、`window`、`fold_stats[]`、`t_feasible_stats`、`test_neg_pos_ratio`、`production_neg_pos_ratio_assumption`、`single_objective_allowed`、`blocking_reasons[]`。 | `field_test_objective_precondition_check.json` schema 區塊或等價欄位 | 欄位定義完整且無待定 placeholder |
-| **⬜** | `W1-C2 fold evidence collect` | 依同一契約收集各 fold：正例數、finalized TP 數量級、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小。 | precondition JSON `fold_stats[]` | 每個 fold 均有紀錄；缺值需顯式 reason code，不得靜默缺漏 |
-| **⬜** | `W1-C3 objective decision` | 依 `W1-C2` 證據判斷：`single constrained objective` 或 `composite objective`；明確寫 fallback fold semantics。 | `field_test_objective_precondition_check.md` 決策段落 | 結論可被 reviewer 直接重放判讀；含不採用方案與理由 |
-| **⬜** | `W1-C4 gate readiness` | 將 `selection_mode`、objective 定義、fallback semantics 寫回 run contract，並生成本輪 objective freeze 摘要。 | objective 設計摘要 + run contract 凍結紀錄 | `W2` 啟動前不再有未定義欄位 |
+| **🟡** | `W1-C2 fold evidence collect` | 依同一契約收集各 fold：正例數、finalized TP 數量級、rated bet 數、`fold_duration_hours`、baseline `T_feasible` 集合大小。 | precondition JSON `fold_stats[]` | 腳本可聚合手動餵入之 fold metrics；尚未接 investigation / full run 自動餵檔 |
+| **🟡** | `W1-C3 objective decision` | 依 `W1-C2` 證據判斷：`single constrained objective` 或 `composite objective`；明確寫 fallback fold semantics。 | `field_test_objective_precondition_check.md` 決策段落 | 腳本可輸出 `objective_decision` / `blocking_reasons`；MD 決策模板與 fallback 段落仍待加強 |
+| **🟡** | `W1-C4 gate readiness` | 將 `selection_mode`、objective 定義、fallback semantics 寫回 run contract，並生成本輪 objective freeze 摘要。 | objective 設計摘要 + run contract 凍結紀錄 | 已可經 `FIELD_TEST_OBJECTIVE_PRECONDITION_JSON` 將 precondition 摘要寫入 `training_metrics.json`；完整 run contract 凍結紀錄與 orchestration 自動產檔仍待補 |
 
 #### 4.1.2 `W1` 阻擋規則（Fail-fast）
 
