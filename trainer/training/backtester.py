@@ -1,6 +1,6 @@
 """trainer/backtester.py — Phase 1 Update
 ==========================================
-Patron Walkaway — Single Rated Model Backtester (F-beta threshold, DEC-010 / v10)
+Patron Walkaway — Rated Artifact Backtester (F-beta threshold, DEC-010 / v10)
 
 Pipeline
 --------
@@ -9,7 +9,7 @@ Pipeline
 3. Compute labels via labels.py (C1 extended pull).
 4. Compute Track-B features via features.py.
 5. Route observations: rated only (H3).
-6. Score with single rated model.
+6. Score with the rated artifact model object (single model or ensemble wrapper).
 7. Optuna TPE 1D threshold search (rated_threshold).
 8. Report observation-level (micro) metrics aligned with trainer keys.
 
@@ -185,7 +185,7 @@ def _default_model_bundle_root() -> Path:
 # ---------------------------------------------------------------------------
 
 def load_dual_artifacts(bundle_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """Load model bundle for backtesting (v10 single rated model, DEC-021).
+    """Load model bundle for backtesting (v10 rated artifact entry, DEC-021).
 
     *bundle_dir* defaults to :data:`MODEL_DIR`. Use a versioned path such as
     ``out/models/<model_version>/`` when comparing trained bundles.
@@ -304,10 +304,11 @@ def _prod_adjusted_with_reason(
 
 
 def _score_df(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.DataFrame:
-    """Add ``score`` column to *df* using the single rated model (v10 DEC-021).
+    """Add ``score`` column to *df* using the rated bundle model object.
 
     PLAN § Train–Serve Parity: uses full artifact feature list (order and set)
     for predict_proba; caller must ensure all columns exist (non-profile 0, profile NaN).
+    The bundle model may be a single estimator or an ensemble wrapper.
     """
     df = df.copy()
     df["score"] = 0.0
@@ -348,7 +349,7 @@ def compute_micro_metrics(
     df:
         Must contain ``score``, ``label``, ``is_rated`` columns.
     threshold:
-        Alert threshold (v10 single rated model; only rated observations receive alerts).
+        Alert threshold (v10 rated artifact; only rated observations receive alerts).
     window_hours:
         Duration of the evaluation window (used to compute alerts/hour).
     """
@@ -821,7 +822,7 @@ def backtest(
     model_bundle_dir: Optional[Path] = None,
     output_dir: Optional[Path] = None,
 ) -> dict:
-    """Full backtest pipeline for one time window (v10 single rated model, DEC-021).
+    """Full backtest pipeline for one time window (v10 rated artifact, DEC-021).
 
     Returns a results dict with micro + macro metrics for both model-default
     thresholds and (optionally) Optuna-selected thresholds.

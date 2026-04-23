@@ -28,7 +28,7 @@
 |:---:|:---:|:---|:---|:---|
 | 1 | **16** | **將 Optuna／模型選擇目標對齊 field-test operating objective**（`min_alerts_per_hour >= 50` 下最大化 `prod-adjusted precision`；主 KPI 改作 guardrail） | 訓練目標／HPO | `DEC-026` 已有 recall floor / alert count / alert density 護欄，但 `trainer/training/trainer.py` 的 `run_optuna_search` 仍以 `average_precision_score` 為 objective；下一步應對齊到 **alert-volume-constrained、production-adjusted precision** |
 | 2 | **14** | **排序導向訓練 + hard negative mining + top-band reweighting**（含 focal-like、對高分 FP 反覆加權／重採樣） | 訓練／取樣 | `PLAN_precision_uplift_sprint.md` Phase 2 已列；需在 `trainer` 主路徑落地並與 `sample_weight`、負採樣策略一致化 |
-| 3 | **11** | **CatBoost / XGBoost 與 LightGBM 的公平 bakeoff** | 模型族 | `DEC-003` 僅鎖 **Phase 1** 為 LGBM+Optuna；衝刺階段可另立實驗矩陣比較演算法，不改寫既有 SSOT 的 Phase 1 定義亦可並行 |
+| 3 | **11** | **LightGBM / CatBoost / XGBoost + equal-weight soft-vote 的公平 bakeoff** | 模型族／輕量集成 | `DEC-003` 僅鎖 **Phase 1** 為 LGBM+Optuna；衝刺階段可另立實驗矩陣比較演算法，不改寫既有 SSOT 的 Phase 1 定義亦可並行。此處將 **三個單模 + 1 個等權 soft-vote** 視為同一 bakeoff 內的四個候選 |
 | 4 | **10** | **二階段模型**：Stage-1 維持候選召回；Stage-2 僅在高分池訓練 **FP detector／reranker** | 架構 | 與 DEC-026「操作點在極端尾段」高度相容，但工程成本高；建議在 `#1`–`#3` 跑出多窗結論後再正式立項 |
 | 5 | **9** | **離線序列嵌入（SSL）→ 向量作為 GBDT 特徵** | 特徵／表示學習 | `ssot/trainer_plan_ssot.md` 已規劃 Phase 2「離線預訓練嵌入 + 日更／批次特徵」路線；屬「開上限」型投入 |
 | 6 | **8** | **分群建模 + learned gating**（2–4 experts + 輕量 gate） | 模型／路由 | `PLAN_precision_uplift_sprint.md` Phase 2/3 已列；比「純規則切桶」更可能吃到非線性路由紅利 |
@@ -61,12 +61,12 @@
 - **典型改動面**：LightGBM 的 `sample_weight`／自訂 objective（若走客製梯度）、或訓練迴圈外的 **多輪 mining 子迴圈**；需記錄 mining 版本以免不可重現。  
 - **注意**：過度採 hard negative 可能傷整體 recall；評估時至少要在 **同一 field-test operating contract** 下比較，並旁看主 KPI guardrail 是否被明顯破壞。
 
-**#3 CatBoost / XGBoost 與 LightGBM 的公平 bakeoff**
+**#3 LightGBM / CatBoost / XGBoost + equal-weight soft-vote 的公平 bakeoff**
 
-- **做什麼**：在 **同一特徵矩陣、同一時間切分、同一評估腳本** 下，平行訓練 **LightGBM、CatBoost、XGBoost（hist）** 等表格模型，以 **field-test objective** 為第一排序鍵，並以主 KPI 與多窗穩定性作治理 / guardrail 比較勝者。  
-- **為何有用**：不同 GBDT 實作對 **類別／缺失值／高階交互** 的處理不同，在「特徵已固定」時仍常有 **數個百分點** 級差異；成本低於大改特徵或上序列模型。  
-- **典型改動面**：新增可選 trainer 分支或獨立實驗腳本、依賴項（`catboost`、`xgboost`）、artifact 格式（仍建議輸出與現有 `model.pkl` + metrics 契約相容的包）。  
-- **注意**：這裡的「挑出 winner」是 **phase-level 的收斂策略**（先確認單模上限與可比性），**不是**最終架構教條。`DEC-003` 約束的是 **Phase 1 產品預設**；衝刺實驗可並行，但若某演算法勝出要變成 **預設上線演算法**，需走決策／SSOT 更新，避免與文件衝突。
+- **做什麼**：在 **同一特徵矩陣、同一時間切分、同一評估腳本** 下，平行訓練 **LightGBM、CatBoost、XGBoost（hist）** 三個表格模型，並額外將三者的 prediction score 做 **equal-weight soft-vote（平均分數）**，把它視為 **第 4 個候選模型** 一起比較；四個候選都以 **field-test objective** 為第一排序鍵，並以主 KPI 與多窗穩定性作治理 / guardrail 比較勝者。  
+- **為何有用**：不同 GBDT 實作對 **類別／缺失值／高階交互** 的處理不同，在「特徵已固定」時仍常有 **數個百分點** 級差異；而 **等權 soft-vote** 是在不引入 OOF meta-learner 與複雜 serving 編排的前提下，最低成本檢驗「基模型是否存在可利用互補性」的方法。  
+- **典型改動面**：新增可選 trainer 分支或獨立實驗腳本、依賴項（`catboost`、`xgboost`）、以及 artifact / metadata 契約；**至少**應把四個候選（LGBM、CatBoost、XGBoost、soft-vote）的 validation / test 評估結果完整寫入訓練 metadata，供後續審閱與回溯比較。  
+- **注意**：這裡的 **equal-weight soft-vote** 只是 bakeoff 內的 **第 4 個候選**，不是預設上線架構承諾；若後續證據顯示其增益不足、分數高度相關、或線上延遲 / 記憶體成本不划算，應允許保留單模勝者。`DEC-003` 約束的是 **Phase 1 產品預設**；衝刺實驗可並行，但若某演算法或 soft-vote 勝出要變成 **預設上線演算法**，仍需走決策／SSOT 更新，避免與文件衝突。
 
 **#4 二階段模型（Stage-1 + Stage-2 FP detector／reranker）**
 
@@ -148,7 +148,7 @@
 
 1. HPO／early stopping／winner pick **對齊 field-test objective**  
 2. 排序導向 + hard negative + top-band weighting  
-3. CatBoost / XGBoost bakeoff  
+3. LightGBM / CatBoost / XGBoost + equal-weight soft-vote bakeoff  
 4. 二階段 reranker／FP detector  
 
 ### 3.2 第二層：開上限（需要較長驗證鏈，但潛在報酬高）

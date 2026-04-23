@@ -1150,4 +1150,32 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-046：`model.pkl` 升級為 ensemble-capable 單一 artifact 入口
+
+**日期**：2026-04-23  
+**相關**：`trainer/training/gbm_bakeoff.py`；`trainer/core/model_wrappers.py`；`trainer/training/trainer.py`；`trainer/serving/scorer.py`；`trainer/training/backtester.py`
+
+**決策**：
+
+1. **保持單一入口**：`trainer` / `scorer` / `backtester` 仍只使用 **一個** `model.pkl`；但其內部 `model` 不再保證是單一 estimator，也可以是 **ensemble wrapper**。  
+2. **A3 第 4 候選**：在 LightGBM / CatBoost / XGBoost 之外，新增 **`soft_vote_equal`**（三者 class-1 score 的等權平均）作為第 4 個 bakeoff 候選。  
+3. **可直接上線**：若 `soft_vote_equal` 在 A3 中勝出，可直接作為 production rated artifact 寫入 `model.pkl`；不再要求「ensemble 只能等到 C3 再產品化」。  
+4. **bundle 契約擴充**：`model.pkl` 內 payload 除 `model` / `threshold` / `features` 外，補充 `model_kind`、`reason_codes_enabled`、`component_backends` 等欄位，供 serving / backtest 讀取。  
+5. **SHAP reason code 暫停**：對 **ensemble wrapper** 暫時停用 SHAP reason code，`scorer` 對此類 artifact 直接輸出空的 `reason_codes` 陣列；待未來有明確的 ensemble explanation 設計再恢復。  
+6. **metadata 要求**：A3 的 4 個候選（LGBM、CatBoost、XGBoost、`soft_vote_equal`）之 validation / test 結果需完整寫入 `training_metrics["rated"]["gbm_bakeoff"]` 與相關 metadata，供 review / 回溯。  
+
+**理由**：
+
+- 使用者明確要求採 **Plan B**，因為 ensemble 最遲在 C3 也會進入 production；與其晚點重拆 bundle 契約，不如現在先升級。  
+- 對外介面仍可維持 `predict_proba(X)`，因此 `scorer` / `backtester` 不必改成讀多個檔案，只需接受可序列化的 wrapper。  
+- 先停用 ensemble 的 SHAP，比硬塞一個不可靠的解釋層更誠實。
+
+**代價 / 影響**：
+
+- **artifact 體積增加**：若 `model.pkl` 內存的是 soft-vote wrapper，實際上會序列化 3 個基模型，bundle 體積會明顯大於單模型。  
+- **線上推論成本上升**：`soft_vote_equal` 需要 3 次 base-model forward，再做平均；在 CPU / 筆電環境下，推論延遲與記憶體占用會高於單模型。  
+- **reason code 暫時降級**：ensemble winner 上線時，alert 仍可產出，但 `reason_codes` 先為空陣列，直到後續補上 ensemble explanation 設計。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

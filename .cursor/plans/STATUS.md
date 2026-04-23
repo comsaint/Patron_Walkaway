@@ -66,21 +66,22 @@ python -m pytest tests/unit/test_ranking_recipe_weights.py tests/unit/test_gbm_b
 
 - 本輪實作已與上述測試一致；未再改 production。  
 - **Plan item**：`PRECISION_UPLIFT_DELIVERY_PLAN.md` **A2** 為 **✅**（四種 recipe 可經 CLI／env 切換；**預設 `r2_top_band_light`（DEC-044）**；`training_metrics` + **`model_metadata.training_params.ranking_recipe`**）。  
-- **下一步建議**：B1（`table_hc` 訓練主路徑接線）或其他 B 項；A3 核心 compare 已落地，但多窗治理仍待補（見下方 **A3** 區塊）。
+- **下一步建議**：B1（`table_hc` 訓練主路徑接線）或其他 B 項；A3 核心 compare（四候選含 soft-vote、勝者可為 ensemble `model.pkl`，DEC-046）已落地，但多窗治理仍待補（見下方 **A3** 區塊）。
 
 ✅ 全部完成，CYCLE 結束
 
-## Precision Uplift — A3 GBM family compare（LGBM / CatBoost / XGBoost）（2026-04-23）
+## Precision Uplift — A3 GBM family compare（LGBM / CatBoost / XGBoost / soft-vote）（2026-04-23）
 
-對照計畫：`trainer/precision_improvement_plan/PRECISION_UPLIFT_DELIVERY_PLAN.md` §A3、§C3；決策 **DEC-045**（`.cursor/plans/DECISION_LOG.md`）。
+對照計畫：`trainer/precision_improvement_plan/PRECISION_UPLIFT_DELIVERY_PLAN.md` §A3、§C3；決策 **DEC-045**（預設 bakeoff、同矩陣／同切分、field-test objective 第一排序鍵）、**DEC-046**（`model.pkl` 可裝 ensemble winner、`bundle` 契約擴充、ensemble 暫停 SHAP reason codes）（`.cursor/plans/DECISION_LOG.md`）。
 
 - **CLI**：預設啟用；`--no-gbm-bakeoff` 可關閉（`trainer/training/trainer_argparse.py`）。
-- **程式**：`trainer/training/gbm_bakeoff.py`（`train_and_select_rated_gbm_family`）；`run_pipeline` 預設將 A3 打開，`train_single_rated_model(..., gbm_bakeoff=True)` 會在主 LightGBM 路徑完成後，比較 **LightGBM / CatBoost / XGBoost** 並選 winner。
+- **程式**：`trainer/training/gbm_bakeoff.py`（`train_and_select_rated_gbm_family`，候選含 **`soft_vote_equal`**）；`trainer/core/model_wrappers.py`（`EqualWeightSoftVoteModel`：三 base 分數等權平均、`predict_proba` 與 joblib 可序列化）；`run_pipeline` 預設將 A3 打開，`train_single_rated_model(..., gbm_bakeoff=True)` 會在主 LightGBM 路徑完成後，於 **同一 rated 矩陣** 上比較 **LightGBM / CatBoost / XGBoost / equal-weight soft-vote** 並選 winner（field-test primary → AP → Fβ 等治理鍵）。
 - **依賴**：`requirements.txt` 使用 `catboost==1.2.10`、`xgboost==3.2.1`。
-- **Artifact**：`training_metrics["rated"]["gbm_bakeoff"]`；`model_metadata.json` → `training_params.model_backend`／`selected_backend`／`gbm_bakeoff_*`；**`model.pkl` 直接保存 winner backend**。
-- **Plan B / B+ 相容**：LightGBM 仍可用 LibSVM / `train_from_file` 降 RAM；A3 會額外從同一 split 載入 rated 矩陣，避免再用「因為省 RAM 所以完全不比較」的錯誤語意。
-- **資源控制**：CatBoost / XGBoost compare 矩陣 downcast 為 `float32`；train metrics 改為分批 `predict_proba`，降低筆電 RAM 峰值。
-- **仍待**：多窗穩定性 guardrail 尚未內建到 A3 自動選勝；目前先完成單次訓練下的三模型公平比較。
+- **Artifact**：`training_metrics["rated"]["gbm_bakeoff"]` 含 **四候選** 完整 metrics；`model_metadata.json` → `model_kind`、`reason_codes_enabled`、`component_backends`（若適用）、`training_params.model_backend`／`selected_backend`／`gbm_bakeoff_*`；**`model.pkl` 保存勝者**，可為單一 backend 或 **`EqualWeightSoftVoteModel` ensemble**（`save_artifact_bundle` 契約已擴充）。
+- **Serving / backtest**：`trainer/serving/scorer.py`、`trainer/training/backtester.py` 載入同一 `model.pkl` 契約；**ensemble winner 時 SHAP reason codes 關閉**（`supports_shap_reason_codes=False`，空 reason list + log），見 DEC-046。
+- **Plan B / B+ 相容**：LightGBM 仍可用 LibSVM / `train_from_file` 降 RAM；A3 會額外從同一 split Parquet 載入 rated 矩陣供 CatBoost／XGBoost／soft-vote，避免「省 RAM 就不比較」的語意錯誤。
+- **資源控制**：compare 矩陣 downcast 為 `float32`；train metrics 與 soft-vote 建構時以分批 `predict_proba` 降低 RAM 峰值；部署時 ensemble 推論為三次 `predict_proba` 之和／平均，**延遲與 `model.pkl` 體積**高於單模。
+- **仍待**：多窗穩定性 guardrail 尚未內建到 A3 自動選勝；目前先完成單次訓練下 **四候選** 公平比較與可追溯 metadata。
 - **測試**：`tests/unit/test_gbm_bakeoff.py`。
 
 ```bash

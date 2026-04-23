@@ -14,22 +14,23 @@ Pipeline (SSOT §4.3 / §9)
    70/15/15 — SSOT §9.2).  Chunks control ETL/cache volume only, not split semantics.
 5. sample_weight = 1 / N_run  (canonical_id × run_id from compute_run_boundary), train set only.
 6. Optuna TPE hyperparameter search on validation set (per model type).
-7. Train Rated LightGBM with class_weight='balanced' + sample_weight (v10 single-model, DEC-021).
+7. Train Rated GBDT family under the A3 contract; the final rated artifact may be a
+   single model or an ensemble wrapper, but the bundle still exposes one ``model.pkl``.
 8. Atomic artifact bundle -> trainer/models/.
 
-Artifact format (version-tagged, v10 single-model)
+Artifact format (version-tagged, v10 single-entry)
 --------------------------------------------------
 models/
-  model.pkl                 LightGBM model for rated (casino-card) players
+  model.pkl                 Rated artifact model object (single model or ensemble wrapper)
   feature_list.json         [{name, track}]  track ∈ {"track_llm", "track_human", "track_profile"} (PLAN Step 7)
   model_version             YYYYMMDD-HHMMSS-<git7>  (plain text)
   training_metrics.json     validation + test metrics, feature importance (gain), Optuna best params
 
 Model bundle contract (DEC-040)
 -------------------------------
-Serving and backtesting load **model.pkl** only. The trainer writes model.pkl
-(and does not emit legacy walkaway_model.pkl). Stale dual-model and legacy
-pickles are removed after each successful training run.
+Serving and backtesting load **model.pkl** only. The trainer writes one rated
+artifact entry into model.pkl (and does not emit legacy walkaway_model.pkl).
+Stale dual-model and legacy pickles are removed after each successful training run.
 
 Data source switching
 ---------------------
@@ -4556,7 +4557,7 @@ def train_single_rated_model(
     valid_split_parquet_path: Optional[Path] = None,
     test_split_parquet_path: Optional[Path] = None,
 ) -> Tuple[Optional[dict], Optional[dict], dict]:
-    """v10 single-model (DEC-021): train rated model only; return (rated_art, None, metrics).
+    """Train one rated artifact entry and return ``(rated_art, None, metrics)``.
 
     Only rows where is_rated==True are used for training, validation, and test
     evaluation.  Non-rated observations are intentionally excluded (DEC-009/010).
@@ -5374,6 +5375,12 @@ def train_single_rated_model(
             metrics["gbm_bakeoff"] = _bake_report
             metrics["selected_backend"] = _winner_backend
             metrics["selected_backend_source"] = "a3_gbm_family_compare"
+            metrics["model_kind"] = _winner_art.get("model_kind", _winner_backend)
+            metrics["reason_codes_enabled"] = bool(
+                _winner_art.get("reason_codes_enabled", True)
+            )
+            if _winner_art.get("component_backends") is not None:
+                metrics["component_backends"] = list(_winner_art.get("component_backends") or [])
             train_m = {
                 k: metrics[k]
                 for k in (
@@ -5397,10 +5404,14 @@ def train_single_rated_model(
             logger.warning("gbm_bakeoff failed (non-fatal): %s", _bake_exc)
             metrics["gbm_bakeoff"] = {"schema_version": "a3_v2", "error": str(_bake_exc)}
             metrics["model_backend"] = "lightgbm"
+            metrics["model_kind"] = "lightgbm"
+            metrics["reason_codes_enabled"] = True
             metrics["selected_backend"] = "lightgbm"
             metrics["selected_backend_source"] = "primary_train_fallback"
     else:
         metrics["model_backend"] = "lightgbm"
+        metrics["model_kind"] = "lightgbm"
+        metrics["reason_codes_enabled"] = True
         metrics["selected_backend"] = "lightgbm"
         metrics["selected_backend_source"] = "primary_train_only"
 
@@ -5456,8 +5467,10 @@ def train_single_rated_model(
             )
         )
 
-    metrics["feature_importance"] = _compute_feature_importance(model, avail_cols)
-    metrics["importance_method"] = "gain"
+    if "feature_importance" not in metrics:
+        metrics["feature_importance"] = _compute_feature_importance(model, avail_cols)
+    if "importance_method" not in metrics:
+        metrics["importance_method"] = "gain"
     metrics.update(ranking_meta_pre)
     if ranking_meta_hnm:
         metrics.update(ranking_meta_hnm)
@@ -5467,6 +5480,9 @@ def train_single_rated_model(
         "threshold": metrics["threshold"],
         "features": avail_cols,
         "metrics": metrics,
+        "model_kind": metrics.get("model_kind", metrics.get("model_backend")),
+        "reason_codes_enabled": bool(metrics.get("reason_codes_enabled", True)),
+        "component_backends": list(metrics.get("component_backends") or []),
     }
     return rated_art, None, {"rated": metrics}
 
@@ -5711,7 +5727,15 @@ def build_model_metadata_document(
                 if isinstance(_rated_d.get("gbm_bakeoff"), dict)
                 else None
             ),
+            "gbm_bakeoff_candidate_backends": (
+                list(((_rated_d.get("gbm_bakeoff") or {}).get("per_backend") or {}).keys())
+                if isinstance(_rated_d.get("gbm_bakeoff"), dict)
+                else []
+            ),
             "model_backend": _rated_d.get("model_backend"),
+            "model_kind": _rated_d.get("model_kind"),
+            "reason_codes_enabled": _rated_d.get("reason_codes_enabled"),
+            "component_backends": _rated_d.get("component_backends"),
             "selected_backend": _rated_d.get("selected_backend"),
             "selected_backend_source": _rated_d.get("selected_backend_source"),
         },
@@ -5860,15 +5884,15 @@ def save_artifact_bundle(
     baseline_training_alignment: Optional[dict[str, Any]] = None,
     model_metadata: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Write all model artifacts atomically (v10 single rated model, DEC-021).
+    """Write all model artifacts atomically (v10 rated artifact entry, DEC-021).
 
     When *bundle_dir* is set, artifacts are written there; otherwise :data:`MODEL_DIR`
     (typically ``out/models``). Versioned training uses
     ``out/models/<model_version>/`` (see Priority 1 investigation plan).
 
-    v10 single-model format
-    -----------------------
-    models/model.pkl               {"model", "threshold", "features"}
+    v10 single-entry format
+    ----------------------
+    models/model.pkl               {"model", "threshold", "features", "model_kind", ...}
     models/feature_list.json       [{name, track}]
     models/reason_code_map.json   {feature_name: reason_code} for scorer SHAP lookup
     models/model_version          <version string>
@@ -5888,12 +5912,19 @@ def save_artifact_bundle(
         _shutil.copy2(_fsp, _out / "feature_spec.yaml")
         spec_hash = hashlib.md5(_fsp.read_bytes()).hexdigest()[:12]
         feature_spec = load_feature_spec(_fsp)
-    # v10 single-model format (DEC-021): one model.pkl only
+    # v10 single-entry format (DEC-021 / ensemble-capable): one model.pkl only
     if rated:
         _pkl_path = _out / "model.pkl"
         _tmp = _pkl_path.with_suffix(".pkl.tmp")
         joblib.dump(
-            {"model": rated["model"], "threshold": rated["threshold"], "features": rated["features"]},
+            {
+                "model": rated["model"],
+                "threshold": rated["threshold"],
+                "features": rated["features"],
+                "model_kind": rated.get("model_kind", "lightgbm"),
+                "reason_codes_enabled": bool(rated.get("reason_codes_enabled", True)),
+                "component_backends": list(rated.get("component_backends") or []),
+            },
             _tmp,
         )
         os.replace(_tmp, _pkl_path)
@@ -5946,7 +5977,7 @@ def save_artifact_bundle(
     # not from `threshold == 0.5` — a legitimately-optimised threshold of 0.5
     # must not be falsely flagged as uncalibrated.
     # R2207: _uncalibrated is stored inside rated["metrics"], not at the top level.
-    # v10 single-model: only rated threshold is relevant; nonrated removed (R1606/R1908).
+    # v10 rated artifact entry: only rated threshold is relevant; nonrated removed (R1606/R1908).
     _uncalibrated_threshold = {
         "rated": rated is not None and bool(
             rated["metrics"].get("_uncalibrated", False)

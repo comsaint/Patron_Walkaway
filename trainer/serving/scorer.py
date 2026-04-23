@@ -4,8 +4,9 @@ Near real-time scoring daemon.
 
 Key changes from pre-Phase-1 version
 --------------------------------------
-* Single rated-model artifact: model.pkl (v10 DEC-021; DEC-040: scorer loads
-  model.pkl only — no rated_model.pkl or walkaway_model.pkl fallback).
+* Single rated artifact entry: model.pkl (v10 DEC-021; DEC-040: scorer loads
+  model.pkl only — no rated_model.pkl or walkaway_model.pkl fallback). The
+  stored model object may be a single estimator or an ensemble wrapper.
 * D2 identity resolution via identity.py build_canonical_mapping_from_df.
 * Track Human features via features.py (compute_loss_streak / compute_run_boundary)
   — guarantees train-serve parity with trainer.py. (table_hc deferred to Phase 2.)
@@ -14,7 +15,8 @@ Key changes from pre-Phase-1 version
   for non-rated bets and bets with no prior snapshot.
 * H3 model routing: is_rated_obs ← casino_player_id IS NOT NULL.
 * FND-01 CTE dedup + session_avail_dtm gate on session query (H2).
-* SHAP reason codes -> reason_code_map.json lookup, emitted with every alert.
+* SHAP reason codes -> reason_code_map.json lookup, emitted with alerts for
+  single-model artifacts; ensemble artifacts may explicitly disable them.
 * New alert DB columns: canonical_id, is_rated_obs, reason_codes,
   model_version, margin, scored_at.
 
@@ -232,7 +234,7 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
     Loads **model.pkl** only (DEC-040). Missing file raises FileNotFoundError.
 
     Returns dict:
-        rated        : {"model": lgb.Booster, "threshold": float} or None
+        rated        : {"model": object, "threshold": float, "model_kind": str} or None
         feature_list : List[str]
         reason_code_map : Dict[str, str]
         model_version   : str
@@ -257,7 +259,7 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
                 exc,
                 d,
             )
-    model_path = d / "model.pkl"  # v10 single-model artifact (DEC-040: sole loader input)
+    model_path = d / "model.pkl"  # v10 single-entry artifact (DEC-040: sole loader input)
     feature_list_path = d / "feature_list.json"
     reason_map_path = d / "reason_code_map.json"
     version_path = d / "model_version"
@@ -314,16 +316,26 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
 
     if model_path.exists():
         rb = joblib.load(model_path)
+        _model_obj = rb["model"]
         artifacts["rated"] = {
-            "model": rb["model"],
+            "model": _model_obj,
             "threshold": float(rb.get("threshold", 0.5)),
             "features": rb.get("features", []),
+            "model_kind": rb.get("model_kind", getattr(_model_obj, "model_kind", "single_model")),
+            "reason_codes_enabled": bool(
+                rb.get(
+                    "reason_codes_enabled",
+                    getattr(_model_obj, "supports_shap_reason_codes", True),
+                )
+            ),
+            "component_backends": list(rb.get("component_backends") or []),
         }
         if not artifacts["feature_list"]:
             artifacts["feature_list"] = rb.get("features", [])
         logger.debug(
-            "[scorer] Single rated model loaded from model.pkl (v=%s, %d features)",
+            "[scorer] Rated artifact loaded from model.pkl (v=%s, kind=%s, %d features)",
             artifacts["model_version"],
+            artifacts["rated"]["model_kind"],
             len(artifacts["feature_list"]),
         )
         _contract = read_bundle_run_contract_block(
@@ -1298,10 +1310,12 @@ def _compute_reason_codes(
 ) -> List[str]:
     """Return JSON-encoded reason-code lists (one per row in X).
 
-    Uses SHAP TreeExplainer; falls back to empty lists on any error
-    (e.g., shap not installed, model type unsupported).
+    Uses SHAP TreeExplainer for single-tree models; returns empty lists when SHAP is
+    disabled for the bundle model (e.g. equal-weight ensemble wrapper) or on any error.
     """
     try:
+        if not bool(getattr(model, "supports_shap_reason_codes", True)):
+            return ["[]" for _ in range(len(X))]
         import shap  # type: ignore[import]
 
         explainer = shap.TreeExplainer(model)
@@ -1793,7 +1807,7 @@ def _score_df(
     """Score all observations with the rated model and compute margin.
 
     Sets columns: score, is_rated_obs (int 0/1), margin.
-    All observations (rated and unrated) are scored with the single rated model
+    All observations (rated and unrated) are scored with the rated artifact model
     (v10 DEC-021).  Unrated observations are scored for volume telemetry only;
     alerts are only generated for rated observations (is_rated_obs == 1).
     """
@@ -2051,7 +2065,7 @@ def score_once(
        else build_canonical_mapping_from_df(sessions, cutoff_dtm=now_hk).
     3. Build Track Human + session rolling features (train-serve parity).
     4. Set is_rated flag: canonical_id in rated mapping.
-    5. Single rated model scoring via _score_df (v10 DEC-021).
+    5. Rated artifact scoring via _score_df (v10 DEC-021).
     6. SHAP reason codes for rated alert candidates.
     7. Session stats, duplicate suppression, DB write.
     """
@@ -2314,11 +2328,22 @@ def score_once(
         and rated_idx
         and rated_art is not None
         and feature_list
+        and bool(rated_art.get("reason_codes_enabled", True))
     ):
         _rated_feats = rated_art.get("features") or feature_list
         X_r = alert_candidates.loc[rated_idx, _rated_feats]
         rc_r = _compute_reason_codes(rated_art["model"], X_r, artifacts["reason_code_map"])
         alert_candidates.loc[rated_idx, "reason_codes"] = rc_r
+    elif (
+        getattr(config, "SCORER_ENABLE_SHAP_REASON_CODES", False)
+        and rated_idx
+        and rated_art is not None
+        and not bool(rated_art.get("reason_codes_enabled", True))
+    ):
+        logger.info(
+            "[scorer] SHAP reason codes disabled for model_kind=%s",
+            rated_art.get("model_kind", "unknown"),
+        )
 
     # ── Session stats ─────────────────────────────────────────────────────
     session_agg = (

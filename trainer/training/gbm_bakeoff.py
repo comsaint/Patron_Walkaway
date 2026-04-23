@@ -31,6 +31,7 @@ import pandas as pd
 from sklearn.metrics import average_precision_score
 
 from trainer.core import config as _cfg
+from trainer.core.model_wrappers import EqualWeightSoftVoteModel
 from trainer.training.threshold_selection import pick_threshold_dec026
 
 logger = logging.getLogger("trainer")
@@ -41,7 +42,13 @@ THRESHOLD_MIN_ALERT_COUNT: int = int(getattr(_cfg, "THRESHOLD_MIN_ALERT_COUNT", 
 THRESHOLD_FBETA: float = float(getattr(_cfg, "THRESHOLD_FBETA", 0.5))
 PRODUCTION_NEG_POS_RATIO = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)
 
-BAKEOFF_BACKENDS: Tuple[str, ...] = ("lightgbm", "catboost", "xgboost")
+SOFT_VOTE_BACKEND = "soft_vote_equal"
+BAKEOFF_BACKENDS: Tuple[str, ...] = (
+    "lightgbm",
+    "catboost",
+    "xgboost",
+    SOFT_VOTE_BACKEND,
+)
 
 
 def _has_strong_validation(X_val: pd.DataFrame, y_val: pd.Series) -> bool:
@@ -357,6 +364,121 @@ def _assign_dispositions(rows: Dict[str, Dict[str, Any]], winner: str) -> None:
             row["bakeoff_disposition"] = "hold"
 
 
+def _build_soft_vote_candidate(
+    candidate_artifacts: Mapping[str, Dict[str, Any]],
+    *,
+    feature_cols: List[str],
+    y_val: pd.Series,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: Optional[pd.DataFrame],
+    y_test: Optional[pd.Series],
+    val_dec026_window_hours: Optional[float],
+    val_dec026_min_alerts_per_hour: Optional[float],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Create the equal-weight soft-vote candidate from the 3 base models."""
+    from trainer.training.trainer import (
+        _compute_feature_importance,
+        _compute_test_metrics_from_scores,
+        _train_metrics_dict_from_y_scores,
+    )
+
+    required = ("lightgbm", "catboost", "xgboost")
+    missing = [backend for backend in required if backend not in candidate_artifacts]
+    if missing:
+        raise ValueError(
+            "soft_vote_equal requires all 3 base backends; missing %s"
+            % ",".join(missing)
+        )
+
+    comp_models = [candidate_artifacts[backend]["model"] for backend in required]
+    comp_thresholds = [
+        float(candidate_artifacts[backend]["metrics"].get("threshold", 0.5))
+        for backend in required
+    ]
+    comp_val_scores = [
+        np.asarray(candidate_artifacts[backend]["metrics"]["_val_scores"], dtype=np.float64)
+        for backend in required
+    ]
+    val_scores = np.mean(np.column_stack(comp_val_scores), axis=1, dtype=np.float64)
+    metrics = _val_block_from_scores(
+        y_val,
+        val_scores,
+        {},
+        label="rated_soft_vote_equal",
+        val_dec026_window_hours=val_dec026_window_hours,
+        val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
+    )
+    train_scores = np.mean(
+        np.column_stack(
+            [
+                np.asarray(candidate_artifacts[backend]["metrics"]["_train_scores"], dtype=np.float64)
+                for backend in required
+            ]
+        ),
+        axis=1,
+        dtype=np.float64,
+    )
+    metrics.update(
+        _train_metrics_dict_from_y_scores(
+            y_train,
+            train_scores,
+            float(metrics["threshold"]),
+            label="rated_soft_vote_equal",
+            log_results=False,
+        )
+    )
+    if X_test is not None and y_test is not None and not X_test.empty:
+        test_scores = np.mean(
+            np.column_stack(
+                [
+                    np.asarray(candidate_artifacts[backend]["metrics"]["_test_scores"], dtype=np.float64)
+                    for backend in required
+                ]
+            ),
+            axis=1,
+            dtype=np.float64,
+        )
+        metrics.update(
+            _compute_test_metrics_from_scores(
+                np.asarray(y_test, dtype=np.float64),
+                test_scores,
+                float(metrics["threshold"]),
+                label="rated_soft_vote_equal",
+                _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+                log_results=False,
+                production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+            )
+        )
+        metrics["_test_scores"] = test_scores
+    metrics["_val_scores"] = val_scores
+    metrics["_train_scores"] = train_scores
+    metrics["component_backends"] = list(required)
+    metrics["component_thresholds"] = {
+        backend: thr for backend, thr in zip(required, comp_thresholds)
+    }
+    model = EqualWeightSoftVoteModel(comp_models, feature_cols, required)
+    metrics["feature_importance"] = _compute_feature_importance(model, feature_cols)
+    metrics["importance_method"] = "mean_component_gain"
+    metrics["model_backend"] = SOFT_VOTE_BACKEND
+    metrics["reason_codes_enabled"] = False
+    artifact = {
+        "model": model,
+        "threshold": float(metrics["threshold"]),
+        "features": feature_cols,
+        "metrics": metrics,
+        "model_kind": SOFT_VOTE_BACKEND,
+        "reason_codes_enabled": False,
+        "component_backends": list(required),
+    }
+    row = {
+        "backend": SOFT_VOTE_BACKEND,
+        **{k: metrics[k] for k in metrics if k not in ("_val_scores", "_train_scores", "_test_scores")},
+        "label": "rated_soft_vote_equal",
+    }
+    return row, artifact
+
+
 def train_and_select_rated_gbm_family(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -371,8 +493,9 @@ def train_and_select_rated_gbm_family(
     val_dec026_window_hours: Optional[float] = None,
     val_dec026_min_alerts_per_hour: Optional[float] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Train all three backends on aligned splits and return winner + report."""
+    """Train 3 base backends plus soft-vote on aligned splits and return winner + report."""
     from trainer.training.trainer import (
+        _batched_model_positive_class_scores,
         _compute_feature_importance,
         _compute_test_metrics,
         _compute_train_metrics,
@@ -383,27 +506,37 @@ def train_and_select_rated_gbm_family(
     lightgbm_metrics = dict(lightgbm_artifact["metrics"])
     _add_field_test_primary_keys(lightgbm_metrics, y_val)
     lightgbm_metrics["model_backend"] = "lightgbm"
+    lightgbm_metrics["_val_scores"] = (
+        np.asarray(lightgbm_model.predict_proba(X_val)[:, 1], dtype=np.float64)
+        if _has_strong_validation(X_val, y_val)
+        else np.zeros(len(y_val), dtype=np.float64)
+    )
+    lightgbm_metrics["_train_scores"] = _batched_model_positive_class_scores(
+        lightgbm_model,
+        X_train,
+        int(getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)),
+    )
+    if X_test is not None and y_test is not None and not X_test.empty:
+        lightgbm_metrics["_test_scores"] = np.asarray(
+            lightgbm_model.predict_proba(X_test)[:, 1],
+            dtype=np.float64,
+        )
+    lightgbm_metrics["feature_importance"] = _compute_feature_importance(
+        lightgbm_model,
+        feature_cols,
+    )
+    lightgbm_metrics["importance_method"] = "gain"
+    lightgbm_metrics["reason_codes_enabled"] = True
 
     rows: Dict[str, Dict[str, Any]] = {
         "lightgbm": {
             "backend": "lightgbm",
             "source": "primary_train",
-            "val_ap": float(lightgbm_metrics.get("val_ap", 0.0)),
-            "val_precision": float(lightgbm_metrics.get("val_precision", 0.0)),
-            "val_recall": float(lightgbm_metrics.get("val_recall", 0.0)),
-            "val_f1": float(lightgbm_metrics.get("val_f1", 0.0)),
-            "val_fbeta_05": float(lightgbm_metrics.get("val_fbeta_05", 0.0)),
-            "threshold": float(lightgbm_metrics.get("threshold", 0.5)),
-            "val_samples": lightgbm_metrics.get("val_samples"),
-            "val_positives": lightgbm_metrics.get("val_positives"),
-            "val_random_ap": lightgbm_metrics.get("val_random_ap"),
-            "_uncalibrated": bool(lightgbm_metrics.get("_uncalibrated", False)),
-            "val_neg_pos_ratio": lightgbm_metrics.get("val_neg_pos_ratio"),
-            "val_field_test_primary_score": lightgbm_metrics.get("val_field_test_primary_score"),
-            "val_field_test_primary_score_mode": lightgbm_metrics.get("val_field_test_primary_score_mode"),
-            "test_ap": lightgbm_metrics.get("test_ap"),
-            "test_precision": lightgbm_metrics.get("test_precision"),
-            "test_f1": lightgbm_metrics.get("test_f1"),
+            **{
+                k: v
+                for k, v in lightgbm_metrics.items()
+                if k not in ("_val_scores", "_train_scores", "_test_scores")
+            },
         }
     }
     candidate_artifacts: Dict[str, Dict[str, Any]] = {
@@ -412,6 +545,8 @@ def train_and_select_rated_gbm_family(
             "threshold": float(lightgbm_metrics.get("threshold", 0.5)),
             "features": feature_cols,
             "metrics": lightgbm_metrics,
+            "model_kind": "lightgbm",
+            "reason_codes_enabled": True,
         }
     }
 
@@ -431,6 +566,14 @@ def train_and_select_rated_gbm_family(
                 val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
             )
             metrics = dict(metrics)
+            metrics["_val_scores"] = (
+                np.asarray(
+                    model.predict_proba(_to_float32_frame(X_val))[:, 1],
+                    dtype=np.float64,
+                )
+                if _has_strong_validation(X_val, y_val)
+                else np.zeros(len(y_val), dtype=np.float64)
+            )
             metrics.update(
                 _compute_train_metrics(
                     model,
@@ -440,6 +583,11 @@ def train_and_select_rated_gbm_family(
                     label=f"rated_{backend}",
                     log_results=False,
                 )
+            )
+            metrics["_train_scores"] = _batched_model_positive_class_scores(
+                model,
+                _to_float32_frame(X_train),
+                int(getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)),
             )
             if X_test is not None and y_test is not None and not X_test.empty:
                 test_metrics = _compute_test_metrics(
@@ -453,18 +601,29 @@ def train_and_select_rated_gbm_family(
                     production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
                 )
                 metrics.update(test_metrics)
+                metrics["_test_scores"] = np.asarray(
+                    model.predict_proba(_to_float32_frame(X_test))[:, 1],
+                    dtype=np.float64,
+                )
             metrics["feature_importance"] = _compute_feature_importance(model, feature_cols)
             metrics["importance_method"] = "gain"
             metrics["model_backend"] = backend
+            metrics["reason_codes_enabled"] = True
             candidate_artifacts[backend] = {
                 "model": model,
                 "threshold": float(metrics["threshold"]),
                 "features": feature_cols,
                 "metrics": metrics,
+                "model_kind": backend,
+                "reason_codes_enabled": True,
             }
             rows[backend] = {
                 "backend": backend,
-                **{k: metrics[k] for k in metrics if k != "label"},
+                **{
+                    k: metrics[k]
+                    for k in metrics
+                    if k not in ("label", "_val_scores", "_train_scores", "_test_scores")
+                },
                 "label": f"rated_{backend}",
             }
         except ImportError as exc:
@@ -481,6 +640,28 @@ def train_and_select_rated_gbm_family(
                 "bakeoff_disposition": "reject",
             }
             logger.warning("A3 gbm_bakeoff: %s training failed: %s", backend, exc)
+
+    try:
+        soft_row, soft_artifact = _build_soft_vote_candidate(
+            candidate_artifacts,
+            feature_cols=feature_cols,
+            y_val=y_val,
+            X_train=_to_float32_frame(X_train),
+            y_train=y_train,
+            X_test=_to_float32_frame(X_test) if X_test is not None else None,
+            y_test=y_test,
+            val_dec026_window_hours=val_dec026_window_hours,
+            val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
+        )
+        rows[SOFT_VOTE_BACKEND] = soft_row
+        candidate_artifacts[SOFT_VOTE_BACKEND] = soft_artifact
+    except Exception as exc:
+        rows[SOFT_VOTE_BACKEND] = {
+            "backend": SOFT_VOTE_BACKEND,
+            "error": str(exc),
+            "bakeoff_disposition": "reject",
+        }
+        logger.warning("A3 gbm_bakeoff: %s build failed: %s", SOFT_VOTE_BACKEND, exc)
 
     winner, rule = _pick_winner(rows)
     _assign_dispositions(rows, winner)
@@ -510,12 +691,18 @@ def train_and_select_rated_gbm_family(
             ),
         },
     }
+    for artifact in candidate_artifacts.values():
+        metrics_obj = artifact.get("metrics")
+        if isinstance(metrics_obj, dict):
+            for key in ("_val_scores", "_train_scores", "_test_scores"):
+                metrics_obj.pop(key, None)
     logger.info(
-        "A3 gbm_bakeoff winner=%s rule=%s catboost=%s xgboost=%s",
+        "A3 gbm_bakeoff winner=%s rule=%s catboost=%s xgboost=%s soft_vote=%s",
         winner,
         rule,
         rows.get("catboost", {}).get("bakeoff_disposition"),
         rows.get("xgboost", {}).get("bakeoff_disposition"),
+        rows.get(SOFT_VOTE_BACKEND, {}).get("bakeoff_disposition"),
     )
     winner_artifact = candidate_artifacts[winner]
     winner_artifact["metrics"]["gbm_bakeoff_winner_backend"] = winner
