@@ -812,6 +812,25 @@ def compute_run_boundary(
     return df
 
 
+def compute_run_boundary_features(
+    bets_df: pd.DataFrame,
+    cutoff_time: Optional[datetime] = None,
+    lookback_hours: Optional[float] = None,
+) -> pd.DataFrame:
+    """Compatibility wrapper for YAML ``function_name`` resolution.
+
+    Feature specs reference ``compute_run_boundary_features`` for Track Human
+    run-boundary families.  The canonical implementation lives in
+    :func:`compute_run_boundary`; this wrapper preserves that contract and keeps
+    train/serve/backtest parity when function dispatch is name-based.
+    """
+    return compute_run_boundary(
+        bets_df=bets_df,
+        cutoff_time=cutoff_time,
+        lookback_hours=lookback_hours,
+    )
+
+
 def compute_table_hc(
     bets_df: pd.DataFrame,
     cutoff_time: Optional[datetime],
