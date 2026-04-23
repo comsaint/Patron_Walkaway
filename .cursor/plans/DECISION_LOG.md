@@ -1108,4 +1108,44 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
+## DEC-044：A2 ranking recipe 預設改為 `r2_top_band_light`，並寫入 `model_metadata.json`
+
+**日期**：2026-04-23  
+**相關**：`trainer/training/ranking_recipe_weights.py`；`trainer/training/trainer.py`（`build_model_metadata_document`）；DEC-013（run-level 基底權重不變）
+
+**決策**：
+
+1. **預設 recipe**：當未傳入 `--ranking-recipe` 且環境變數 `PRECISION_UPLIFT_RANKING_RECIPE` 未設定或為空字串時，`resolve_ranking_recipe` 的預設值由 `baseline` 改為 **`r2_top_band_light`**（仍以 DEC-013 之 `compute_sample_weights` 為基底，再套用輕量 top-band 加權）。  
+2. **顯式關閉 A2 風格加權**：需 **`--ranking-recipe baseline`**（或於環境變數設為 `baseline` 且 CLI 不覆蓋）以回到純基底權重。  
+3. **未知 recipe**：維持 fallback 至 **`baseline`**（避免錯字導致 silent 啟用加權）。  
+4. **模型 bundle 審計**：`model_metadata.json` 之 `training_params.ranking_recipe` 與 `training_metrics.json` 內 rated 區塊之 `ranking_recipe`／`ranking_recipe_*` 對齊，便於離線比對與載入 bundle 時確認訓練時所用 recipe。
+
+**理由**：
+
+- 在不大幅疊加 pseudo-HNM／shallow 的前提下，讓主路徑預設帶入 R2 排序導向訊號；相較 `r2_combined_light` 對權重尖峰與管線分叉較溫和。  
+- 預設行為必須可從 artifact 還原：`training_metrics` 既有欄位保留；`model_metadata` 另寫一鍵以利 orchestration／registry 快速讀取。  
+- 保留 `baseline` 顯式入口，維持歷史實驗與嚴格可比 run 的可重現選項。
+
+---
+
+## DEC-045：A3 GBDT bakeoff（CatBoost／XGBoost 對照 LightGBM）與 C3 前置契約
+
+**日期**：2026-04-23  
+**相關**：`trainer/training/gbm_bakeoff.py`；`requirements.txt`（`catboost`、`xgboost`）；DEC-021（生產 artifact 仍為單一 rated LightGBM）
+
+**決策**：
+
+1. **公平比較**：在 **in-memory** rated 路徑上，於主模型 LightGBM 訓練與測評完成後，可選 **`--gbm-bakeoff`** 以 **相同** `X_train`／`X_val`（及可選 `X_test`）、**相同** `sample_weight`、**相同** LGBM-shaped `hp`（依後端映射）訓練 **CatBoost** 與 **XGBoost**；LightGBM 列為 **primary_train** 之 metrics 參照，不重複訓練第二顆 LGBM。  
+2. **路徑排除**：**LibSVM** 與 **`train_from_file` 最終訓練** 路徑不啟用 bakeoff（權重／矩陣語意與主 GBDT 分叉）。  
+3. **選勝與標記**：以 validation **AP → F0.5 → precision** 排序選出 `winner_backend`；各後端 `bakeoff_disposition` 為 **winner**／**hold**／**reject**（import 或訓練失敗為 reject，非致命）。  
+4. **Artifact**：完整報告寫入 **`training_metrics["rated"]["gbm_bakeoff"]`**；`model_metadata.json` → `training_params.gbm_bakeoff_enabled`／`gbm_bakeoff_winner_backend`。  
+5. **C3**：A3 僅輸出 **`ensemble_bridge`** 元資料（欄序、列數、`same_splits`）；**不**包含 OOF 分數匯出、meta-learner 或 scorer 多模型組合（留待 C3）。
+
+**理由**：
+
+- 滿足交付計畫 A3 DoD（三後端同一框架、可對照、winner/hold/reject），且不破壞既有單模型 bundle 與 scorer。  
+- 明確切分 A3（離線比較）與 C3（ensemble 產品化），避免半套線上 blend。
+
+---
+
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*

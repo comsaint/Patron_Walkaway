@@ -145,5 +145,6 @@ def test_execution_plan_uses_any_fold_gate_wording() -> None:
     plan_path = _REPO_ROOT / ".cursor" / "plans" / "EXECUTION PLAN - Precision Uplift.md"
     text = plan_path.read_text(encoding="utf-8")
     assert "若多數 folds 的 `T_feasible` 過小或常為空，不得硬切單一 constrained objective。" not in text
-    assert "若任一 fold 的 `T_feasible` 過小或常為空，不得硬切單一 constrained objective。" in text
+    # Allow trailing parenthetical (e.g. DEC-043 / BLOCKED) after the sentence.
+    assert "若任一 fold 的 `T_feasible` 過小或常為空，不得硬切單一 constrained objective" in text
 

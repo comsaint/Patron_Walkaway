@@ -76,6 +76,14 @@ from trainer.training.field_test_objective_precondition import (
     training_metrics_overlay_from_precondition,
     try_load_precondition_json,
 )
+from trainer.training.ranking_recipe_weights import (
+    RANKING_RECIPE_BASELINE,
+    RANKING_RECIPE_COMBINED,
+    RANKING_RECIPE_HNM,
+    apply_ranking_recipe_pre_optuna_weights,
+    refine_weights_hnm_shallow_lgbm,
+    resolve_ranking_recipe,
+)
 from trainer.core.model_bundle_paths import (
     safe_version_subdirectory,
     write_latest_model_manifest,
@@ -2612,6 +2620,8 @@ def _export_train_valid_to_csv(
     valid_df: pd.DataFrame,
     feature_cols: List[str],
     export_dir: Path,
+    *,
+    ranking_recipe: Optional[str] = None,
 ) -> Tuple[Path, Path]:
     """Export rated rows to CSV for LightGBM lgb.Dataset(path) (PLAN 方案 B 匯出).
 
@@ -2667,6 +2677,10 @@ def _export_train_valid_to_csv(
     )
     # Weight for train (same semantics as compute_sample_weights)
     weight_series = compute_sample_weights(train_rated)
+    _recipe_csv = resolve_ranking_recipe(ranking_recipe)
+    weight_series, _ = apply_ranking_recipe_pre_optuna_weights(
+        train_rated, weight_series, _recipe_csv, common_cols
+    )
     train_export = train_rated[cols_train_plus_label].copy()
     train_export.insert(len(cols_train_plus_label), "weight", weight_series.values)
     train_path = export_dir / "train_for_lgb.csv"
@@ -4313,6 +4327,7 @@ def train_dual_model(
     feature_cols: List[str],
     run_optuna: bool = True,
     test_df: Optional[pd.DataFrame] = None,
+    ranking_recipe: Optional[str] = None,
 ) -> Tuple[Optional[dict], Optional[dict], dict]:
     """Train Rated + Non-rated LightGBM models.
 
@@ -4357,8 +4372,9 @@ def train_dual_model(
         _test_rated = pd.DataFrame()
         _test_nonrated = pd.DataFrame()
 
-    sw_rated = compute_sample_weights(train_rated)
-    sw_nonrated = compute_sample_weights(train_nonrated)
+    sw_rated_base = compute_sample_weights(train_rated)
+    sw_nonrated_base = compute_sample_weights(train_nonrated)
+    _recipe_dual = resolve_ranking_recipe(ranking_recipe)
 
     _ft_pre_doc: Optional[Dict[str, Any]] = None
     _ft_pre_path_raw = (os.environ.get(FIELD_TEST_OBJECTIVE_PRECONDITION_JSON_ENV) or "").strip()
@@ -4375,9 +4391,9 @@ def train_dual_model(
     _ft_optuna_allowed = precondition_constrained_optuna_allowed(_ft_pre_doc)
 
     results: dict[str, Any] = {}
-    for name, tr_df, vl_df, te_df, sw in [
-        ("rated",    train_rated,    val_rated,    _test_rated,    sw_rated),
-        ("nonrated", train_nonrated, val_nonrated, _test_nonrated, sw_nonrated),
+    for name, tr_df, vl_df, te_df, sw_base in [
+        ("rated",    train_rated,    val_rated,    _test_rated,    sw_rated_base),
+        ("nonrated", train_nonrated, val_nonrated, _test_nonrated, sw_nonrated_base),
     ]:
         if tr_df.empty:
             logger.warning("%s model: no training rows, skipping", name)
@@ -4390,6 +4406,13 @@ def train_dual_model(
         X_tr, y_tr = tr_df[avail_cols], tr_df["label"]
         X_vl = vl_df[avail_cols] if not vl_df.empty else X_tr.head(0)
         y_vl = vl_df["label"] if not vl_df.empty else y_tr.head(0)
+
+        sw = sw_base.astype(float).copy()
+        _r2_meta: Dict[str, Any] = {}
+        if name == "rated":
+            sw, _r2_meta = apply_ranking_recipe_pre_optuna_weights(
+                tr_df, sw, _recipe_dual, avail_cols
+            )
 
         _vw_h = _val_window_hours_from_payout_df(vl_df) if name == "rated" else None
         _ft_hpo_active = name == "rated" and _ft_optuna_allowed and _vw_h is not None
@@ -4472,6 +4495,8 @@ def train_dual_model(
         # Feature importance ranked by LightGBM gain.
         metrics["feature_importance"] = _compute_feature_importance(model, avail_cols)
         metrics["importance_method"] = "gain"
+        if _r2_meta:
+            metrics.update(_r2_meta)
 
         if name == "rated" and _ft_pre_doc is not None and _ft_pre_path_raw:
             metrics.update(
@@ -4502,6 +4527,8 @@ def train_single_rated_model(
     train_from_file: bool = False,
     train_libsvm_paths: Optional[Tuple[Path, Path]] = None,
     test_libsvm_path: Optional[Path] = None,
+    ranking_recipe: Optional[str] = None,
+    gbm_bakeoff: bool = False,
 ) -> Tuple[Optional[dict], Optional[dict], dict]:
     """v10 single-model (DEC-021): train rated model only; return (rated_art, None, metrics).
 
@@ -4521,6 +4548,10 @@ def train_single_rated_model(
 
     When test_df is None and test_libsvm_path is set (PLAN B+ 階段 6 第 3 步), test
     labels and predictions are read from the test LibSVM file; path must be under DATA_DIR.
+
+    When *gbm_bakeoff* is True (A3 / R3), after primary LightGBM + test metrics, run an
+    optional CatBoost + XGBoost comparison on the same in-memory splits and append
+    ``gbm_bakeoff`` to rated metrics (skipped for LibSVM / train_from_file paths).
     """
     _ft_pre_doc: Optional[Dict[str, Any]] = None
     _ft_pre_path_raw = ""
@@ -4563,7 +4594,8 @@ def train_single_rated_model(
         logger.warning("rated model: no training rows, skipping")
         return None, None, {"rated": None}
 
-    sw_rated = compute_sample_weights(train_rated) if not train_rated.empty else pd.Series(dtype=float)
+    sw_base = compute_sample_weights(train_rated) if not train_rated.empty else pd.Series(dtype=float)
+    recipe_use = resolve_ranking_recipe(ranking_recipe)
     if use_from_libsvm:
         avail_cols = [c for c in feature_cols if c in val_rated.columns]
         if not avail_cols:
@@ -4597,6 +4629,34 @@ def train_single_rated_model(
         },
     )
     # #endregion
+
+    # A2 / R2: optional ranking-focused sample weights (rated train only; DEC-013 base retained).
+    if use_from_libsvm:
+        sw_rated = sw_base.astype(float).copy()
+        ranking_meta_pre = {
+            "ranking_recipe": recipe_use,
+            "ranking_recipe_pre_optuna_skipped": "libsvm_disk_weights",
+        }
+        if recipe_use != RANKING_RECIPE_BASELINE:
+            logger.warning(
+                "ranking_recipe=%s: LibSVM lgb.train uses on-disk .weight; "
+                "re-export LibSVM after changing --ranking-recipe for full parity.",
+                recipe_use,
+            )
+    else:
+        sw_rated, ranking_meta_pre = apply_ranking_recipe_pre_optuna_weights(
+            train_rated,
+            sw_base,
+            recipe_use,
+            avail_cols,
+        )
+        if not train_rated.empty:
+            logger.info(
+                "R2 ranking recipe=%s pre_optuna weight_mean=%.6f max=%.6f",
+                recipe_use,
+                float(ranking_meta_pre.get("ranking_recipe_weight_mean", 0.0)),
+                float(ranking_meta_pre.get("ranking_recipe_weight_max", 0.0)),
+            )
 
     _ft_pre_path_raw = (os.environ.get(FIELD_TEST_OBJECTIVE_PRECONDITION_JSON_ENV) or "").strip()
     if _ft_pre_path_raw:
@@ -4652,6 +4712,24 @@ def train_single_rated_model(
             "max_depth": 8,
             "min_child_samples": 20,
         }
+
+    ranking_meta_hnm = {}
+    if (
+        not use_from_libsvm
+        and not use_from_file
+        and recipe_use in (RANKING_RECIPE_HNM, RANKING_RECIPE_COMBINED)
+        and not train_rated.empty
+    ):
+        sw_rated, ranking_meta_hnm = refine_weights_hnm_shallow_lgbm(
+            X_tr,
+            y_tr,
+            sw_rated,
+            {**_lgb_params_for_pipeline(), **hp},
+        )
+        logger.info(
+            "R2 shallow HNM refine: boosted_negs=%s",
+            ranking_meta_hnm.get("ranking_recipe_hnm_shallow_neg_boosted"),
+        )
 
     if use_from_libsvm:
         # PLAN B+ §4.4: train from LibSVM file; LightGBM auto-loads .weight when beside .libsvm.
@@ -5199,6 +5277,40 @@ def train_single_rated_model(
     else:
         test_m = {}
 
+    # A3 / R3: optional fair GBDT bakeoff (CatBoost + XGBoost vs primary LightGBM metrics).
+    if (
+        gbm_bakeoff
+        and not use_from_libsvm
+        and not use_from_file
+        and not train_rated.empty
+    ):
+        try:
+            from trainer.training.gbm_bakeoff import run_rated_gbm_bakeoff
+
+            _x_te = None
+            _y_te = None
+            if test_rated is not None and not test_rated.empty:
+                _miss_te = [c for c in avail_cols if c not in test_rated.columns]
+                if not _miss_te:
+                    _x_te = test_rated[avail_cols]
+                    _y_te = test_rated["label"]
+            metrics["gbm_bakeoff"] = run_rated_gbm_bakeoff(
+                X_tr,
+                y_tr,
+                X_vl,
+                y_vl,
+                sw_rated,
+                hp,
+                lgbm_reference_metrics=metrics,
+                X_test=_x_te,
+                y_test=_y_te,
+                val_dec026_window_hours=_ft_thr_wh,
+                val_dec026_min_alerts_per_hour=_ft_thr_mah,
+            )
+        except Exception as _bake_exc:
+            logger.warning("gbm_bakeoff failed (non-fatal): %s", _bake_exc)
+            metrics["gbm_bakeoff"] = {"schema_version": "a3_v1", "error": str(_bake_exc)}
+
     # Log in order: train → valid → test (clear labels; valid was previously unlabeled).
     logger.info(
         "rated train: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  random_ap=%.4f",
@@ -5253,6 +5365,9 @@ def train_single_rated_model(
 
     metrics["feature_importance"] = _compute_feature_importance(model, avail_cols)
     metrics["importance_method"] = "gain"
+    metrics.update(ranking_meta_pre)
+    if ranking_meta_hnm:
+        metrics.update(ranking_meta_hnm)
 
     rated_art = {
         "model": model,
@@ -5463,9 +5578,17 @@ def build_model_metadata_document(
             "neg_sample_frac_effective": float(neg_sample_frac_effective),
             "threshold_min_recall": THRESHOLD_MIN_RECALL,
             "threshold_min_alert_count": int(THRESHOLD_MIN_ALERT_COUNT),
+            # A2 / DEC-044: echo rated training recipe (same key as training_metrics.json rated block).
+            "ranking_recipe": _rated_d.get("ranking_recipe"),
             "lightgbm_device_requested": _rated_d.get("lightgbm_device_requested"),
             "lightgbm_device_effective": _rated_d.get("lightgbm_device_type"),
             "lightgbm_device_fallback": _rated_d.get("lightgbm_device_fallback"),
+            "gbm_bakeoff_enabled": bool(isinstance(_rated_d.get("gbm_bakeoff"), dict)),
+            "gbm_bakeoff_winner_backend": (
+                (_rated_d.get("gbm_bakeoff") or {}).get("winner_backend")
+                if isinstance(_rated_d.get("gbm_bakeoff"), dict)
+                else None
+            ),
         },
         "artifacts": {
             "bundle_dir": str(bundle_dir.resolve()),
@@ -5854,6 +5977,8 @@ def run_pipeline(args) -> None:
     use_local = getattr(args, "use_local_parquet", False)
     force = getattr(args, "force_recompute", False)
     skip_optuna = getattr(args, "skip_optuna", False)
+    pipeline_ranking_recipe = resolve_ranking_recipe(getattr(args, "ranking_recipe", None))
+    logger.info("Precision uplift A2 ranking_recipe=%s", pipeline_ranking_recipe)
     configure_lightgbm_device_for_run(args)
     # --no-preload: disable session full-table preload; use per-day PyArrow
     # pushdown reads instead.  Reduces peak RAM for low-RAM machines.
@@ -7209,7 +7334,11 @@ def run_pipeline(args) -> None:
             if STEP9_TRAIN_FROM_FILE and train_df is not None and valid_df is not None:
                 _export_dir = DATA_DIR / "export"
                 _train_csv, _valid_csv = _export_train_valid_to_csv(
-                    train_df, valid_df, active_feature_cols, _export_dir
+                    train_df,
+                    valid_df,
+                    active_feature_cols,
+                    _export_dir,
+                    ranking_recipe=pipeline_ranking_recipe,
                 )
                 print(
                     "[Plan B] Exported train/valid to %s and %s"
@@ -7233,6 +7362,8 @@ def run_pipeline(args) -> None:
                 train_from_file=STEP9_TRAIN_FROM_FILE,
                 train_libsvm_paths=_libsvm_paths,
                 test_libsvm_path=_test_libsvm,
+                ranking_recipe=pipeline_ranking_recipe,
+                gbm_bakeoff=bool(getattr(args, "gbm_bakeoff", False)),
             )
             _el = time.perf_counter() - t0
             step9_duration_sec = _el

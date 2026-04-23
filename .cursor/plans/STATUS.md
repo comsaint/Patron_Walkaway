@@ -1,5 +1,92 @@
 **Archive**: Past rounds and older STATUS blocks are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60, 67 Review–75 moved 2026-03-05; Rounds 79–99 moved 2026-03-05; Round 96 onward moved 2026-03-12; **2026-03-22**: Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等長段 → archive.)
 
+## Precision Uplift — `/cycle_code` A2（R2 ranking recipe weights，2026-04-23）
+
+對照計畫：`trainer/precision_improvement_plan/PRECISION_UPLIFT_DELIVERY_PLAN.md` §A2；決策脈絡見 `.cursor/plans/DECISION_LOG.md`（**DEC-013**：run-level 基礎權重；**DEC-044**：預設 recipe 與 artifact 審計）。
+
+### STEP 1 — Builder
+
+**本輪 1–2 步（已做）**
+
+1. 新增 `trainer/training/ranking_recipe_weights.py`：`resolve_ranking_recipe`、`apply_ranking_recipe_pre_optuna_weights`（top-band + pseudo-HNM tail）、`refine_weights_hnm_shallow_lgbm`（第二道淺層 LGBM 對高分負例加權）。
+2. 接上主路徑：`trainer/training/trainer.py` 的 `train_single_rated_model`（寫入 `training_metrics`）、`train_dual_model`（rated 分支）、`run_pipeline`（`pipeline_ranking_recipe`）、Plan B `_export_train_valid_to_csv`（CSV weight 欄）；`trainer/training/trainer_argparse.py` 新增 `--ranking-recipe`。
+3. **DEC-044（2026-04-23 補登）**：`resolve_ranking_recipe` 在 CLI／`PRECISION_UPLIFT_RANKING_RECIPE` 皆未設時預設 **`r2_top_band_light`**；顯式 **`--ranking-recipe baseline`** 關閉 A2 風格加權。`build_model_metadata_document` 將 **`training_params.ranking_recipe`** 寫入 `model_metadata.json`（與 `training_metrics.json` rated 區塊之 `ranking_recipe` 對齊）。
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/training/ranking_recipe_weights.py` | R2 權重邏輯、`PRECISION_UPLIFT_RANKING_RECIPE`、`RANKING_RECIPE_DEFAULT`（`r2_top_band_light`）；未知 recipe 仍 fallback `baseline`。 |
+| `trainer/training/trainer.py` | 接上 sample_weight；shallow HNM 僅在 **非** LibSVM／**非** `train_from_file` 最終路徑；LibSVM 時 WARNING（on-disk `.weight`）；**`model_metadata.json` → `training_params.ranking_recipe`**。 |
+| `trainer/training/trainer_argparse.py` | `--ranking-recipe`（四選一；help 已述預設與 DEC-044）。 |
+
+**手動驗證**
+
+```bash
+python -m trainer.trainer --use-local-parquet --recent-chunks 3 --skip-optuna --ranking-recipe r2_top_band_light
+```
+
+不帶 `--ranking-recipe` 且未設 env 時，預設即 **`r2_top_band_light`**（DEC-044）。檢查產物 **`training_metrics.json`** 是否含 `ranking_recipe`、`ranking_recipe_weight_mean` 等鍵；**`model_metadata.json` → `training_params.ranking_recipe`** 是否與之一致。嚴格可比 baseline 請 `--ranking-recipe baseline`。
+
+**下一步建議**
+
+1. LibSVM 重新匯出 `.weight` 與 recipe 完全一致（或於 export 階段寫入 shallow HNM）。  
+2. `PRECISION_UPLIFT_DELIVERY_PLAN.md` §0／§A2 已與 DEC-044 對齊（狀態表 A2 **✅** 含預設與 metadata 說明）。
+
+✅ STEP 1 完成
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明與建議 | 希望新增測試 |
+|------|------------|--------------|
+| **R1：proxy 特徵列順序** | `_numeric_proxy` 只取前 N 個數值欄，順序依 `feature_cols`；與 screening 後欄序漂移時，不同 run 可比性略降。建議 metrics 寫入 `ranking_recipe_proxy_cols_used` 已部分緩解；必要時改為「固定 allowlist」。 | 固定小型 DataFrame 斷言 boosted 列數。 |
+| **R2：LibSVM / Plan B 權重不一致** | Optuna 仍用記憶體 `sw_rated`，最終 `lgb.train` 讀 on-disk 權重；recipe≠baseline 時已 WARNING。 | 已有行為說明；可選 E2E：比對 CSV weight 與 pre-Optuna sw 分佈（慢）。 |
+| **R3：shallow HNM 額外 fit** | `r2_hnm_light` / `r2_combined_light` 多一次 LGBM fit，筆電上增加 wall time；`n_estimators` 已 cap。 | `test_refine_hnm_boosts_some_negatives` 已覆蓋非空路徑。 |
+| **R4：`hp` 鍵與 sklearn LGBM 不相容** | 已改為呼叫端傳 `{**_lgb_params_for_pipeline(), **hp}`；若未來 `hp` 含非分類器鍵仍可能炸。 | 以最小 `hp` dict 做 smoke（可併入現有測試）。 |
+
+✅ STEP 2 完成
+
+### STEP 3 — Tester（寫測試）
+
+| 檔案 | 測試重點 |
+|------|----------|
+| `tests/unit/test_ranking_recipe_weights.py` | resolve、**預設 top_band**（CLI+env 未設）、explicit baseline、unknown→baseline、top-band、combined、shallow HNM skip／boost。 |
+| `tests/unit/test_gbm_bakeoff.py` | A3：`run_rated_gbm_bakeoff` schema、disposition、**ensemble_bridge**（C3 前置）。 |
+| `tests/unit/test_field_test_objective_precondition.py` | 放寬 EXECUTION PLAN 字串斷言（文件括號後綴）。 |
+
+**執行方式**
+
+```bash
+python -m pytest tests/unit/test_ranking_recipe_weights.py tests/unit/test_gbm_bakeoff.py tests/unit/test_field_test_objective_precondition.py tests/unit/test_field_test_objective_precondition_trainer.py -q
+```
+
+本機：`36 passed`
+
+✅ STEP 3 完成
+
+### STEP 4 — Tester（修實作）
+
+- 本輪實作已與上述測試一致；未再改 production。  
+- **Plan item**：`PRECISION_UPLIFT_DELIVERY_PLAN.md` **A2** 為 **✅**（四種 recipe 可經 CLI／env 切換；**預設 `r2_top_band_light`（DEC-044）**；`training_metrics` + **`model_metadata.training_params.ranking_recipe`**）。  
+- **下一步建議**：B1（`table_hc` 訓練主路徑接線）或其他 B 項；A3 已落地（見下方 **A3** 區塊）。
+
+✅ 全部完成，CYCLE 結束
+
+## Precision Uplift — A3 GBM bakeoff（CatBoost / XGBoost）（2026-04-23）
+
+對照計畫：`trainer/precision_improvement_plan/PRECISION_UPLIFT_DELIVERY_PLAN.md` §A3、§C3；決策 **DEC-045**（`.cursor/plans/DECISION_LOG.md`）。
+
+- **CLI**：`--gbm-bakeoff`（`trainer/training/trainer_argparse.py`）；`run_pipeline` → `train_single_rated_model(..., gbm_bakeoff=True)`。
+- **程式**：`trainer/training/gbm_bakeoff.py`（`run_rated_gbm_bakeoff`；`ensemble_bridge` 供 C3 延伸）；主線仍只產 **LightGBM** `model.pkl`（DEC-021）。
+- **依賴**：`requirements.txt` 已加入 `catboost==1.2.10`、`xgboost==3.2.0`（PyPI 穩定版）。
+- **Artifact**：`training_metrics["rated"]["gbm_bakeoff"]`；`model_metadata.json` → `training_params.gbm_bakeoff_enabled`、`gbm_bakeoff_winner_backend`。
+- **略過**：LibSVM、`train_from_file` 最終訓練路徑不跑 bakeoff。
+- **測試**：`tests/unit/test_gbm_bakeoff.py`。
+
+```bash
+python -m pytest tests/unit/test_gbm_bakeoff.py -q
+```
+
+---
+
 ## Precision Uplift — Optuna 入口讀 W1 gate（2026-04-22）
 
 - `trainer/training/field_test_objective_precondition.py`：`precondition_constrained_optuna_allowed()`（與 `training_metrics_overlay_from_precondition` 的 constrained 旗標一致、不額外打 log）。

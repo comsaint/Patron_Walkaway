@@ -90,4 +90,33 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
             "Default: use LIGHTGBM_DEVICE_TYPE (trainer.core.config, default cpu)."
         ),
     )
+    parser.add_argument(
+        "--ranking-recipe",
+        type=str,
+        default=None,
+        choices=(
+            "baseline",
+            "r2_top_band_light",
+            "r2_hnm_light",
+            "r2_combined_light",
+        ),
+        help=(
+            "Precision uplift A2/R2: optional rated-only sample_weight recipe before Optuna "
+            "(top-band / pseudo-HNM / shallow-HNM refine). When omitted, use env "
+            "PRECISION_UPLIFT_RANKING_RECIPE if set, else r2_top_band_light (DEC-044). "
+            "Pass baseline to disable A2-style reweighting. Ignored for Plan B+ LibSVM "
+            "final fit (on-disk weights); CSV export path applies recipe when set."
+        ),
+    )
+    parser.add_argument(
+        "--gbm-bakeoff",
+        action="store_true",
+        help=(
+            "Precision uplift A3/R3 (+ C3 hook): after primary rated LightGBM training, "
+            "train CatBoost and XGBoost on the same in-memory matrices, sample_weight, and "
+            "LightGBM-shaped hp; write gbm_bakeoff report (winner/hold/reject + ensemble_bridge) "
+            "into training_metrics. Ignored for LibSVM and train_from_file final paths. "
+            "Requires optional deps catboost and xgboost (see requirements.txt)."
+        ),
+    )
     return parser
