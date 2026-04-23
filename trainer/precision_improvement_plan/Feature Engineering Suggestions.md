@@ -252,3 +252,64 @@
 - `run_loss_acceleration`、所有 ratio 類特徵需先固定分母為 0 契約（`NULL` / 0 / epsilon），且 trainer / scorer / backtester 一致。  
 - 本章排序只針對 rated patron 路徑；評估時需維持 rated-only 口徑，避免混入 non-rated 稀釋 uplift。  
 - table-level 候選（即使僅用 `t_bet`）仍可能帶來 runtime 成本上升，建議在 Wave 3 前先看離線耗時與記憶體監測。  
+
+---
+
+## 補充章：由 Delivery Plan 反推的其他潛力方向（提醒用）
+
+> 來源：`trainer/precision_improvement_plan/PRECISION_UPLIFT_DELIVERY_PLAN.md` 工作流 B（B1–B6）。  
+> 目的：提醒「除了本文件主線候選外，仍有其他值得追蹤的方向」。  
+> 邊界：以下多屬**工程策略 / 建模架構**，不等同於已驗證的 feature uplift；不得直接覆寫本文件既有優先序。
+
+### P1. 桌況特徵主路徑接線（對應 B1 / R7）
+
+- 方向：把 `table_hc`（或同語意桌況特徵）完整接入 trainer / scorer 主路徑，並完成 train-serve parity。  
+- 潛在增量：可補強「桌面壅擠度 / 人數變化」對離場訊號的 context。  
+- 主要風險：
+  - 容易與本文件 B 類其他桌況候選（如 `table_num_players_*`）語意重疊，需做去冗餘。
+  - runtime 成本上升（跨玩家聚合 / 滾窗計算）。
+
+### P2. 候選特徵擴張管線治理（對應 B2 / R8）
+
+- 方向：建立更明確的「候選進 spec → screening → 訓練採用 → artifact 落盤」流水線治理。  
+- 潛在增量：縮短候選試作週期，降低「有想法但進不了主路徑」的摩擦。  
+- 主要風險：
+  - 若缺少候選 freeze / 版本化紀錄，容易出現回溯困難與實驗汙染。
+  - 同一批候選若未做成本評估，可能在筆電環境造成訓練時間暴增。
+
+### P3. Identity/PIT 正確性前移（對應 B3 / R9）
+
+- 方向：把 PIT-correct identity mapping 視為 feature engineering 的前置品質閘門。  
+- 潛在增量：減少資料洩漏與時間切分錯位，避免把無效 uplift 當成有效訊號。  
+- 主要風險：
+  - 變更 identity 主幹容易波及 trainer / scorer / backtester 一致性，需先做 smoke parity。
+
+### P4. History-depth 感知的特徵路由（對應 B4 / R11）
+
+- 方向：依玩家歷史深度（history depth / completeness）切換特徵子集或模型路徑。  
+- 潛在增量：對「冷啟玩家 vs 高歷史玩家」分流建模，降低單一路徑的偏差。  
+- 主要風險：
+  - 系統複雜度顯著上升（bundle、路由、監控、回滾）。
+  - 若分群樣本太小，可能導致不穩定或 overfit。
+
+### P5. 離線序列 embedding 融合（對應 B5 / R5）
+
+- 方向：引入離線序列表示（embedding）再 join 回表格模型。  
+- 潛在增量：捕捉長序列 / 高階行為樣式，補足純 hand-crafted 特徵上限。  
+- 主要風險：
+  - 工程與資源成本高（離線產線、特徵對齊、版本管理、訓練時間）。
+  - 在筆電條件下易遇到 OOM 或過長 wall time，需嚴格分階段驗證。
+
+### P6. Multi-expert + learned gating（對應 B6 / R6）
+
+- 方向：建立多專家模型，透過 gating 做樣本路由。  
+- 潛在增量：不同玩家型態可由不同 decision boundary 處理，提升整體穩健性。  
+- 主要風險：
+  - 產品化難度高（線上路由、監控、除錯、回滾都更複雜）。
+  - 若 gating 不穩或資料分佈漂移，可能比單模型更差。
+
+### 建議使用方式（避免和主線衝突）
+
+1. 本章項目先作「備選路線池」，不直接覆蓋本文件既有 Wave 1–3 排序。  
+2. 優先挑選低耦合、可回退、可量測成本的方向做小規模 POC。  
+3. 每次只推一條高風險路線（例如 embedding 或 gating），避免與主線 A/B/C 任務同時放大資源風險。

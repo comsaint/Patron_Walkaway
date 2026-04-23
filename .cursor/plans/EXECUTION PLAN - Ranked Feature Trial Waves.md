@@ -21,6 +21,41 @@
 - 所有 uplift 決策採 rated-only 評估口徑。
 - 每個波次需記錄 runtime 與 memory 變化；未經明確同意，不接受顯著回歸。
 
+## 目前進度快照（Status Snapshot）
+
+更新日期：2026-04-23
+
+- Wave 1：🟡 進行中（已完成實作與契約修正，待 screening/ablation）
+- Wave 2：⬜ 尚未開始
+- Wave 3：⬜ 尚未開始
+
+### Wave 1 詳細狀態
+
+已完成（Done）：
+1. 已新增 Wave 1 候選特徵：
+   - `net_win_in_run_so_far`
+   - `net_win_per_bet_in_run`
+   - `wager_slope_w10bets`
+   - `wager_w5m_over_w15m`
+2. 已完成 run-boundary 家族契約補強：
+   - `function_name` 對應修正（`compute_run_boundary_features` wrapper）
+   - `casino_win` 輸入欄位補齊
+   - `wager` 輸入欄位補齊（避免 `wager_sum_in_run_so_far` 全零）
+3. 已補基礎防回歸測試（spec 層），避免 run-boundary `input_columns` 再次漏 `wager`。
+
+進行中（In Progress）：
+1. Wave 1 第一輪 screening 與 ablation（尚未產出正式 uplift 結果）。
+2. runtime / memory 成本量測與門檻對照（尚待寫入正式紀錄）。
+
+下一步（Next）：
+1. 以目前 baseline 執行 Wave 1 screening（rated-only）。
+2. 輸出 precision / recall / PR-AUC / alert volume 與成本（runtime、memory）對照。
+3. 依證據做 go/no-go，更新 `STATUS.md` 與本文件狀態燈號。
+
+阻塞與風險（Blockers/Risks）：
+1. 若未先定義可接受的 runtime/memory 門檻，go/no-go 容易主觀化。
+2. 若僅單一切分有提升，可能是切片偶然性而非穩定 uplift。
+
 ## 執行波次
 
 ### Wave 1（最高優先、預期最快產生增益）
