@@ -1237,3 +1237,30 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 - 需要更新 feature spec、reason code map、報表欄位與模型 metadata 的命名對照。  
 - 若兩類特徵同時啟用，需在 screening 階段注意高度相關欄位共線性與成本控制。
+
+---
+
+## DEC-049：A4 二階段 MVP 採 `product` 融合，先以可回退為優先
+
+**日期**：2026-04-23  
+**相關**：`trainer/training/trainer.py`；`trainer/training/two_stage.py`；`trainer/serving/scorer.py`；`trainer/training/backtester.py`；`trainer/core/config.py`
+
+**決策**：
+
+1. **A4 先上 MVP**：採「Stage-1 產生候選 + Stage-2 FP detector」兩階段路徑，先解決高分池誤報問題。  
+2. **融合固定 `product`**：本輪最終分數固定為 `p_final = p1 * p2`；不引入多融合模式搜尋，避免額外複雜度。  
+3. **候選池限定**：Stage-2 訓練與推論只在 Stage-1 候選池執行（由 Stage-1 threshold 與 candidate multiplier 控制），降低 CPU / RAM。  
+4. **bundle 契約擴充**：`model.pkl` 保持單檔入口，新增可選欄位 `stage2_model`、`a4_enabled`、`a4_fusion_mode`、`a4_candidate_cutoff`、`stage2_features`，舊 bundle 仍可載入。  
+5. **強制可回退**：以 config 開關控制兩階段推論；關閉時直接退回 Stage-1 only，不改既有 threshold 契約。
+
+**理由**：
+
+- 目前目標是 precision uplift 且執行環境以筆電為主，`product` 融合最容易在不增加過多實作風險下抑制 FP。  
+- 先把 train/serve/backtest parity 走通，優先建立可驗證、可回退的最小可用版本，再考慮更複雜融合。  
+- 單檔 `model.pkl` 契約可避免再引入多檔載入複雜度，維持現有部署與回滾流程。
+
+**代價 / 影響**：
+
+- `product` 融合較保守，可能壓低 recall。  
+- 若 candidate cutoff 設定不當，Stage-2 可能可訓練樣本不足，需自動 fallback。  
+- 兩階段推論增加一次模型呼叫；雖僅作用於候選池，仍需監控延遲。

@@ -144,6 +144,41 @@ track_llm:
         clip: { min: 0.0, max: 500000000.0 }
       reason_code_category: "LOW_ACTIVITY_RECENTLY"
 
+    - feature_id: "wager_avg_w5m"
+      type: "window"
+      dtype: "float"
+      description: "過去 5 分鐘平均注碼"
+      rationale: "短窗平均注碼，供短中窗比值與注碼收縮偵測。"
+      expression: "AVG(wager)"
+      window_frame: "RANGE BETWEEN INTERVAL 5 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 500000000.0 }
+      reason_code_category: "LOW_ACTIVITY_RECENTLY"
+
+    - feature_id: "wager_w5m_over_w15m"
+      type: "derived"
+      dtype: "float"
+      description: "最近 5 分鐘 vs 15 分鐘平均注碼比（<1 代表注碼收縮）"
+      rationale: "捕捉注碼由中期基準向短期快速收縮的趨勢。"
+      depends_on: ["wager_avg_w5m", "wager_avg_w15m"]
+      expression: "CAST(wager_avg_w5m AS DOUBLE) / NULLIF(wager_avg_w15m, 0)"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 10.0 }
+      reason_code_category: "LOW_ACTIVITY_RECENTLY"
+
+    - feature_id: "wager_slope_w10bets"
+      type: "derived"
+      dtype: "float"
+      description: "最近 10 筆注碼趨勢斜率（負值代表減碼）"
+      rationale: "以近 10 筆 wager 變化率近似注碼方向性，補齊僅有水位/波動的限制。"
+      expression: "(CAST(wager AS DOUBLE) - CAST(LAG(wager, 10) OVER (PARTITION BY canonical_id ORDER BY payout_complete_dtm ASC, bet_id ASC) AS DOUBLE)) / 10.0"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: -500000000.0, max: 500000000.0 }
+      reason_code_category: "LOW_ACTIVITY_RECENTLY"
+
     - feature_id: "wager_std_w15m"
       type: "window"
       dtype: "float"
@@ -432,7 +467,7 @@ track_human:
       description: "距離 run 起點的分鐘數（run 以 gap>=RUN_BREAK_MIN 切分）"
       function_name: "compute_run_boundary_features"
       input_columns: ["canonical_id", "payout_complete_dtm", "bet_id"]
-      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
       postprocess:
         fill: { strategy: "zero" }
         clip: { min: 0.0, max: 1000000.0 }
@@ -443,7 +478,7 @@ track_human:
       description: "當筆為止同一 run 內下注筆數（1-based）"
       function_name: "compute_run_boundary_features"
       input_columns: ["canonical_id", "payout_complete_dtm", "bet_id"]
-      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
       postprocess:
         fill: { strategy: "zero" }
         clip: { min: 0, max: 10000000 }
@@ -454,10 +489,34 @@ track_human:
       description: "當筆為止同一 run 內下注金額累計"
       function_name: "compute_run_boundary_features"
       input_columns: ["canonical_id", "payout_complete_dtm", "bet_id"]
-      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
       postprocess:
         fill: { strategy: "zero" }
         clip: { min: 0.0, max: 1000000000000.0 }
+
+    - feature_id: "net_win_in_run_so_far"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "當筆為止同一 run 內玩家淨損益累計（player_net_win=-casino_win）"
+      function_name: "compute_run_boundary_features"
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "casino_win"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: -1000000000000.0, max: 1000000000000.0 }
+      reason_code_category: "LOSS_STREAK"
+
+    - feature_id: "net_win_per_bet_in_run"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "當前 run 每注平均淨損益（run 內累計淨損益/下注筆數）"
+      function_name: "compute_run_boundary_features"
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "casino_win"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: -1000000000.0, max: 1000000000.0 }
+      reason_code_category: "LOSS_STREAK"
 
   active:
     feature_ids: []

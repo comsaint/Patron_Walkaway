@@ -42,6 +42,13 @@ from zoneinfo import ZoneInfo
 
 from trainer.core.bundle_run_contract import read_bundle_run_contract_block
 from trainer.core.model_bundle_paths import resolve_model_bundle_dir
+from trainer.training.two_stage import (
+    A4_FUSION_MODE_PRODUCT,
+    candidate_cutoff_from_threshold,
+    candidate_mask_from_scores,
+    fuse_product_scores,
+    validate_fusion_mode,
+)
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logging.basicConfig(
@@ -77,6 +84,8 @@ try:
     )
     UNRATED_VOLUME_LOG: bool = bool(getattr(_cfg, "UNRATED_VOLUME_LOG", True))
     SCORER_LOOKBACK_HOURS: int = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)
+    A4_TWO_STAGE_ENABLE_INFERENCE: bool = bool(getattr(_cfg, "A4_TWO_STAGE_ENABLE_INFERENCE", False))
+    A4_TWO_STAGE_CANDIDATE_MULTIPLIER: float = float(getattr(_cfg, "A4_TWO_STAGE_CANDIDATE_MULTIPLIER", 0.9))
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
@@ -94,6 +103,8 @@ except ModuleNotFoundError:
     PRODUCTION_NEG_POS_RATIO = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)  # type: ignore[no-redef]
     UNRATED_VOLUME_LOG = bool(getattr(_cfg, "UNRATED_VOLUME_LOG", True))  # type: ignore[no-redef]
     SCORER_LOOKBACK_HOURS = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)  # type: ignore[no-redef]
+    A4_TWO_STAGE_ENABLE_INFERENCE = bool(getattr(_cfg, "A4_TWO_STAGE_ENABLE_INFERENCE", False))  # type: ignore[no-redef]
+    A4_TWO_STAGE_CANDIDATE_MULTIPLIER = float(getattr(_cfg, "A4_TWO_STAGE_CANDIDATE_MULTIPLIER", 0.9))  # type: ignore[no-redef]
 
 try:
     _threshold_selection_mod = _import_module_threshold_selection(
@@ -318,7 +329,38 @@ def _score_df(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.DataFrame:
         model_features = list(bundle.get("features") or [])
         if model_features:
             # Full feature list for train-serve parity (PLAN § Train–Serve Parity).
-            df["score"] = bundle["model"].predict_proba(df[model_features])[:, 1]
+            stage1_scores = np.asarray(
+                bundle["model"].predict_proba(df[model_features])[:, 1],
+                dtype=np.float64,
+            )
+            scores = stage1_scores
+            # A4 parity with scorer: optional Stage-2 product fusion.
+            if (
+                A4_TWO_STAGE_ENABLE_INFERENCE
+                and bool(bundle.get("a4_enabled", False))
+                and bundle.get("stage2_model") is not None
+                and validate_fusion_mode(bundle.get("a4_fusion_mode", A4_FUSION_MODE_PRODUCT)) == A4_FUSION_MODE_PRODUCT
+            ):
+                cutoff = bundle.get("a4_candidate_cutoff")
+                if cutoff is None:
+                    cutoff = candidate_cutoff_from_threshold(
+                        float(bundle.get("threshold", 0.5)),
+                        A4_TWO_STAGE_CANDIDATE_MULTIPLIER,
+                    )
+                rated_mask = df["is_rated"].to_numpy(dtype=bool) if "is_rated" in df.columns else np.zeros(len(df), dtype=bool)
+                cand_mask = np.zeros(len(df), dtype=bool)
+                if np.any(rated_mask):
+                    cand_local = candidate_mask_from_scores(stage1_scores[rated_mask], cutoff=float(cutoff))
+                    cand_mask[np.where(rated_mask)[0]] = cand_local
+                if np.any(cand_mask):
+                    stage2_features = list(bundle.get("stage2_features") or model_features)
+                    s2 = np.ones(len(df), dtype=np.float64)
+                    s2[cand_mask] = np.asarray(
+                        bundle["stage2_model"].predict_proba(df.loc[cand_mask, stage2_features])[:, 1],
+                        dtype=np.float64,
+                    )
+                    scores = fuse_product_scores(stage1_scores, s2)
+            df["score"] = scores
 
     return df
 

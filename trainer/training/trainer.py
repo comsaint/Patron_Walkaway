@@ -85,6 +85,13 @@ from trainer.training.ranking_recipe_weights import (
     refine_weights_hnm_shallow_lgbm,
     resolve_ranking_recipe,
 )
+from trainer.training.two_stage import (
+    A4_FUSION_MODE_PRODUCT,
+    candidate_cutoff_from_threshold,
+    candidate_mask_from_scores,
+    fuse_product_scores,
+    validate_fusion_mode,
+)
 from trainer.core.model_bundle_paths import (
     safe_version_subdirectory,
     write_latest_model_manifest,
@@ -221,6 +228,13 @@ try:
     STEP9_TRAIN_FROM_FILE: bool = getattr(_cfg, "STEP9_TRAIN_FROM_FILE", False)
     STEP9_SAVE_LGB_BINARY: bool = getattr(_cfg, "STEP9_SAVE_LGB_BINARY", False)
     TRAIN_METRICS_PREDICT_BATCH_ROWS: int = getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)
+    A4_TWO_STAGE_ENABLE_TRAINING: bool = bool(getattr(_cfg, "A4_TWO_STAGE_ENABLE_TRAINING", False))
+    A4_TWO_STAGE_FUSION_MODE: str = str(getattr(_cfg, "A4_TWO_STAGE_FUSION_MODE", A4_FUSION_MODE_PRODUCT) or A4_FUSION_MODE_PRODUCT)
+    A4_TWO_STAGE_CANDIDATE_MULTIPLIER: float = float(getattr(_cfg, "A4_TWO_STAGE_CANDIDATE_MULTIPLIER", 0.9))
+    A4_TWO_STAGE_MIN_TRAIN_ROWS: int = int(getattr(_cfg, "A4_TWO_STAGE_MIN_TRAIN_ROWS", 500))
+    A4_TWO_STAGE_MIN_TRAIN_POSITIVES: int = int(getattr(_cfg, "A4_TWO_STAGE_MIN_TRAIN_POSITIVES", 50))
+    A4_TWO_STAGE_MIN_VALID_ROWS: int = int(getattr(_cfg, "A4_TWO_STAGE_MIN_VALID_ROWS", 100))
+    A4_TWO_STAGE_PREDICT_BATCH_ROWS: int = int(getattr(_cfg, "A4_TWO_STAGE_PREDICT_BATCH_ROWS", 250_000))
     STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
     # Canonical mapping DuckDB from get_duckdb_memory_config("canonical_map") (DEC-027).
     CASINO_PLAYER_ID_CLEAN_SQL: str = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END")
@@ -274,6 +288,13 @@ except ModuleNotFoundError:
     STEP9_TRAIN_FROM_FILE = getattr(_cfg, "STEP9_TRAIN_FROM_FILE", False)
     STEP9_SAVE_LGB_BINARY = getattr(_cfg, "STEP9_SAVE_LGB_BINARY", False)
     TRAIN_METRICS_PREDICT_BATCH_ROWS = getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)
+    A4_TWO_STAGE_ENABLE_TRAINING = bool(getattr(_cfg, "A4_TWO_STAGE_ENABLE_TRAINING", False))
+    A4_TWO_STAGE_FUSION_MODE = str(getattr(_cfg, "A4_TWO_STAGE_FUSION_MODE", A4_FUSION_MODE_PRODUCT) or A4_FUSION_MODE_PRODUCT)
+    A4_TWO_STAGE_CANDIDATE_MULTIPLIER = float(getattr(_cfg, "A4_TWO_STAGE_CANDIDATE_MULTIPLIER", 0.9))
+    A4_TWO_STAGE_MIN_TRAIN_ROWS = int(getattr(_cfg, "A4_TWO_STAGE_MIN_TRAIN_ROWS", 500))
+    A4_TWO_STAGE_MIN_TRAIN_POSITIVES = int(getattr(_cfg, "A4_TWO_STAGE_MIN_TRAIN_POSITIVES", 50))
+    A4_TWO_STAGE_MIN_VALID_ROWS = int(getattr(_cfg, "A4_TWO_STAGE_MIN_VALID_ROWS", 100))
+    A4_TWO_STAGE_PREDICT_BATCH_ROWS = int(getattr(_cfg, "A4_TWO_STAGE_PREDICT_BATCH_ROWS", 250_000))
     STEP8_SCREEN_SAMPLE_ROWS = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
     CASINO_PLAYER_ID_CLEAN_SQL = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END")
 
@@ -396,6 +417,7 @@ _CANONICAL_MAP_SESSION_COLS: list = [
 #   - DQ / identity:    bet_id, session_id, player_id, table_id, payout_complete_dtm,
 #                       gaming_day, wager, lud_dtm, __etl_insert_Dtm
 #   - Track Human:      status  (loss_streak needs it; run_boundary uses payout_complete_dtm)
+#                       casino_win (run P&L features)
 #   - Track LLM YAML:   payout_odds, is_back_bet, position_idx  (allowed_columns whitelist)
 #   - Legacy / Track LLM: base_ha, etc. (see feature_spec YAML)
 #   - Output chunk:     run_id, canonical_id, is_rated, label added downstream
@@ -412,6 +434,7 @@ _REQUIRED_BET_PARQUET_COLS: list = [
     # DQ guard / Track Human state machines
     "wager",
     "status",
+    "casino_win",
     # Legacy / Track LLM features
     "payout_odds",
     "base_ha",
@@ -673,6 +696,7 @@ _BET_SELECT_COLS = """
     table_id,
     payout_complete_dtm,
     wager,
+    casino_win,
     status,
     COALESCE(gaming_day, toDate(payout_complete_dtm)) AS gaming_day,
     is_back_bet,
@@ -1576,7 +1600,7 @@ def apply_dq(
         bets["status"] = None
 
     # Numeric guard for legacy features; skip columns already categorical (PLAN § apply_dq 配合修改).
-    for col in ("wager", "payout_odds", "base_ha", "is_back_bet", "position_idx"):
+    for col in ("wager", "payout_odds", "base_ha", "is_back_bet", "position_idx", "casino_win"):
         if col not in bets.columns:
             continue
         if isinstance(bets[col].dtype, pd.CategoricalDtype):
@@ -1618,6 +1642,8 @@ def add_track_human_features(
         df["minutes_since_run_start"] = 0.0
         df["bets_in_run_so_far"] = 0
         df["wager_sum_in_run_so_far"] = 0.0
+        df["net_win_in_run_so_far"] = 0.0
+        df["net_win_per_bet_in_run"] = 0.0
         return df
 
     # loss_streak (cutoff = window_end so future bets don't influence streak)
@@ -1630,6 +1656,8 @@ def add_track_human_features(
     df["minutes_since_run_start"] = run_df["minutes_since_run_start"].reindex(df.index, fill_value=0.0).values
     df["bets_in_run_so_far"] = run_df["bets_in_run_so_far"].reindex(df.index, fill_value=0).values
     df["wager_sum_in_run_so_far"] = run_df["wager_sum_in_run_so_far"].reindex(df.index, fill_value=0.0).values
+    df["net_win_in_run_so_far"] = run_df["net_win_in_run_so_far"].reindex(df.index, fill_value=0.0).values
+    df["net_win_per_bet_in_run"] = run_df["net_win_per_bet_in_run"].reindex(df.index, fill_value=0.0).values
 
     return df
 
@@ -4147,6 +4175,56 @@ def _compute_test_metrics_from_scores(
     }
 
 
+def _compute_valid_metrics_from_scores(
+    y_valid: Union[np.ndarray, pd.Series],
+    valid_scores: np.ndarray,
+    threshold: float,
+) -> dict[str, Any]:
+    """Compute lightweight validation metrics from precomputed scores."""
+    y_arr = np.asarray(y_valid, dtype=float).reshape(-1)
+    s_arr = np.asarray(valid_scores, dtype=float).reshape(-1)
+    if len(y_arr) != len(s_arr):
+        n = min(len(y_arr), len(s_arr))
+        y_arr = y_arr[:n]
+        s_arr = s_arr[:n]
+    n_val = int(len(y_arr))
+    n_val_pos = int(np.sum(y_arr == 1))
+    n_val_neg = int(np.sum(y_arr == 0))
+    if n_val == 0:
+        return {
+            "val_ap": 0.0,
+            "val_precision": 0.0,
+            "val_recall": 0.0,
+            "val_f1": 0.0,
+            "val_fbeta_05": 0.0,
+            "val_samples": 0,
+            "val_positives": 0,
+            "val_random_ap": 0.0,
+        }
+    has_both = n_val_pos >= 1 and n_val_neg >= 1 and np.isfinite(s_arr).all()
+    val_ap = float(average_precision_score(y_arr == 1, s_arr)) if has_both else 0.0
+    preds = (s_arr >= float(threshold)).astype(int)
+    tp = int(((preds == 1) & (y_arr == 1)).sum())
+    fp = int(((preds == 1) & (y_arr == 0)).sum())
+    fn = int(((preds == 0) & (y_arr == 1)).sum())
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    beta = float(THRESHOLD_FBETA)
+    b2 = beta * beta
+    fbeta = ((1.0 + b2) * prec * rec / (b2 * prec + rec)) if (b2 * prec + rec) > 0 else 0.0
+    return {
+        "val_ap": val_ap,
+        "val_precision": prec,
+        "val_recall": rec,
+        "val_f1": f1,
+        "val_fbeta_05": fbeta,
+        "val_samples": n_val,
+        "val_positives": n_val_pos,
+        "val_random_ap": (n_val_pos / n_val) if n_val > 0 else 0.0,
+    }
+
+
 def _dataframe_for_lgb_predict(
     model: Union[lgb.LGBMClassifier, "_BoosterWrapper"],
     df: pd.DataFrame,
@@ -5443,6 +5521,145 @@ def train_single_rated_model(
         metrics["selected_backend"] = "lightgbm"
         metrics["selected_backend_source"] = "primary_train_only"
 
+    # A4 / R4 MVP: two-stage FP detector with product fusion on Stage-1 candidate pool.
+    metrics["a4_enabled"] = False
+    metrics["a4_fusion_mode"] = validate_fusion_mode(A4_TWO_STAGE_FUSION_MODE)
+    if A4_TWO_STAGE_ENABLE_TRAINING and not train_rated.empty:
+        _fusion_mode = validate_fusion_mode(A4_TWO_STAGE_FUSION_MODE)
+        _stage1_threshold = float(metrics.get("threshold", 0.5))
+        _candidate_cutoff = candidate_cutoff_from_threshold(
+            _stage1_threshold,
+            A4_TWO_STAGE_CANDIDATE_MULTIPLIER,
+        )
+        _x_tr_s1 = _dataframe_for_lgb_predict(model, train_rated, avail_cols)
+        _s1_tr = _batched_model_positive_class_scores(
+            model,
+            _x_tr_s1,
+            int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
+        )
+        _cand_mask_tr = candidate_mask_from_scores(_s1_tr, cutoff=_candidate_cutoff)
+        _n_cand_tr = int(np.sum(_cand_mask_tr))
+        _y2_tr = np.asarray(y_tr, dtype=float).reshape(-1)[_cand_mask_tr]
+        _pos2_tr = int(np.sum(_y2_tr == 1))
+        _neg2_tr = int(np.sum(_y2_tr == 0))
+        _stage2_ready = (
+            _n_cand_tr >= int(max(1, A4_TWO_STAGE_MIN_TRAIN_ROWS))
+            and _pos2_tr >= int(max(1, A4_TWO_STAGE_MIN_TRAIN_POSITIVES))
+            and _neg2_tr >= 1
+        )
+        metrics["a4_candidate_cutoff"] = float(_candidate_cutoff)
+        metrics["a4_candidate_rows_train"] = _n_cand_tr
+        metrics["a4_stage2_train_positives"] = _pos2_tr
+        metrics["a4_stage2_train_negatives"] = _neg2_tr
+        if _stage2_ready and _fusion_mode == A4_FUSION_MODE_PRODUCT:
+            _x2_tr = _x_tr_s1.loc[_cand_mask_tr, :].copy()
+            _sw2 = (
+                np.asarray(sw_rated, dtype=float).reshape(-1)[: len(_cand_mask_tr)][_cand_mask_tr]
+                if len(sw_rated) >= len(_cand_mask_tr)
+                else None
+            )
+            _stage2_hp = {
+                "n_estimators": 200,
+                "learning_rate": 0.05,
+                "num_leaves": 31,
+                "max_depth": 6,
+                "min_child_samples": 20,
+            }
+            _stage2 = lgb.LGBMClassifier(**_lgb_params_for_pipeline(), **_stage2_hp)
+            try:
+                _stage2.fit(
+                    _x2_tr,
+                    _y2_tr,
+                    sample_weight=_sw2 if _sw2 is not None else None,
+                )
+                _s2_tr = np.ones(len(_s1_tr), dtype=np.float64)
+                _s2_tr[_cand_mask_tr] = _batched_model_positive_class_scores(
+                    _stage2,
+                    _x2_tr,
+                    int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
+                )
+                _fused_tr = fuse_product_scores(_s1_tr, _s2_tr)
+                _a4_train = _train_metrics_dict_from_y_scores(
+                    y_tr,
+                    _fused_tr,
+                    _stage1_threshold,
+                    label="rated_a4_fused_train",
+                    log_results=False,
+                )
+                metrics.update({f"a4_{k}": v for k, v in _a4_train.items()})
+                if not val_rated.empty:
+                    _x_vl_s1 = _dataframe_for_lgb_predict(model, val_rated, avail_cols)
+                    _s1_vl = _batched_model_positive_class_scores(
+                        model,
+                        _x_vl_s1,
+                        int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
+                    )
+                    _cand_mask_vl = candidate_mask_from_scores(_s1_vl, cutoff=_candidate_cutoff)
+                    _s2_vl = np.ones(len(_s1_vl), dtype=np.float64)
+                    if int(np.sum(_cand_mask_vl)) > 0:
+                        _x2_vl = _x_vl_s1.loc[_cand_mask_vl, :]
+                        _s2_vl[_cand_mask_vl] = _batched_model_positive_class_scores(
+                            _stage2,
+                            _x2_vl,
+                            int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
+                        )
+                    _fused_vl = fuse_product_scores(_s1_vl, _s2_vl)
+                    _a4_valid = _compute_valid_metrics_from_scores(
+                        val_rated["label"].to_numpy(dtype=float),
+                        _fused_vl,
+                        _stage1_threshold,
+                    )
+                    metrics.update({f"a4_{k}": v for k, v in _a4_valid.items()})
+                    metrics["a4_candidate_rows_valid"] = int(np.sum(_cand_mask_vl))
+                else:
+                    metrics["a4_candidate_rows_valid"] = 0
+                if test_rated is not None and not test_rated.empty:
+                    _x_te_s1 = _dataframe_for_lgb_predict(model, test_rated, avail_cols)
+                    _s1_te = _batched_model_positive_class_scores(
+                        model,
+                        _x_te_s1,
+                        int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
+                    )
+                    _cand_mask_te = candidate_mask_from_scores(_s1_te, cutoff=_candidate_cutoff)
+                    _s2_te = np.ones(len(_s1_te), dtype=np.float64)
+                    if int(np.sum(_cand_mask_te)) > 0:
+                        _x2_te = _x_te_s1.loc[_cand_mask_te, :]
+                        _s2_te[_cand_mask_te] = _batched_model_positive_class_scores(
+                            _stage2,
+                            _x2_te,
+                            int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
+                        )
+                    _fused_te = fuse_product_scores(_s1_te, _s2_te)
+                    _a4_test = _compute_test_metrics_from_scores(
+                        test_rated["label"].to_numpy(dtype=float),
+                        _fused_te,
+                        _stage1_threshold,
+                        label="rated_a4_fused_test",
+                        _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+                        log_results=False,
+                        production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+                    )
+                    metrics.update({f"a4_{k}": v for k, v in _a4_test.items()})
+                    metrics["a4_candidate_rows_test"] = int(np.sum(_cand_mask_te))
+                else:
+                    metrics["a4_candidate_rows_test"] = 0
+                metrics["a4_enabled"] = True
+                metrics["a4_fusion_mode"] = _fusion_mode
+                metrics["a4_stage2_model_backend"] = "lightgbm"
+                metrics["a4_stage2_features"] = list(avail_cols)
+                metrics["_a4_stage2_model"] = _stage2
+            except Exception as _a4_exc:
+                logger.warning("A4 two-stage training failed (fallback to Stage-1 only): %s", _a4_exc)
+                metrics["a4_enabled"] = False
+                metrics["a4_failure_reason"] = str(_a4_exc)
+        else:
+            metrics["a4_enabled"] = False
+            metrics["a4_failure_reason"] = (
+                "insufficient_stage2_candidate_rows_or_class_balance"
+                if _fusion_mode == A4_FUSION_MODE_PRODUCT
+                else "unsupported_fusion_mode"
+            )
+
     # Log in order: train → valid → test (clear labels; valid was previously unlabeled).
     logger.info(
         "rated train: AP=%.4f  F1=%.4f  prec=%.4f  rec=%.4f  random_ap=%.4f",
@@ -5503,6 +5720,7 @@ def train_single_rated_model(
     if ranking_meta_hnm:
         metrics.update(ranking_meta_hnm)
 
+    _a4_stage2_model = metrics.pop("_a4_stage2_model", None)
     rated_art = {
         "model": model,
         "threshold": metrics["threshold"],
@@ -5511,6 +5729,11 @@ def train_single_rated_model(
         "model_kind": metrics.get("model_kind", metrics.get("model_backend")),
         "reason_codes_enabled": bool(metrics.get("reason_codes_enabled", True)),
         "component_backends": list(metrics.get("component_backends") or []),
+        "a4_enabled": bool(metrics.get("a4_enabled", False)),
+        "a4_fusion_mode": metrics.get("a4_fusion_mode", A4_FUSION_MODE_PRODUCT),
+        "a4_candidate_cutoff": metrics.get("a4_candidate_cutoff"),
+        "stage2_model": _a4_stage2_model,
+        "stage2_features": list(metrics.get("a4_stage2_features") or avail_cols),
     }
     return rated_art, None, {"rated": metrics}
 
@@ -5766,6 +5989,12 @@ def build_model_metadata_document(
             "component_backends": _rated_d.get("component_backends"),
             "selected_backend": _rated_d.get("selected_backend"),
             "selected_backend_source": _rated_d.get("selected_backend_source"),
+            "a4_enabled": bool(_rated_d.get("a4_enabled", False)),
+            "a4_fusion_mode": _rated_d.get("a4_fusion_mode"),
+            "a4_candidate_cutoff": _rated_d.get("a4_candidate_cutoff"),
+            "a4_candidate_rows_train": _rated_d.get("a4_candidate_rows_train"),
+            "a4_candidate_rows_valid": _rated_d.get("a4_candidate_rows_valid"),
+            "a4_candidate_rows_test": _rated_d.get("a4_candidate_rows_test"),
         },
         "artifacts": {
             "bundle_dir": str(bundle_dir.resolve()),
@@ -5952,6 +6181,11 @@ def save_artifact_bundle(
                 "model_kind": rated.get("model_kind", "lightgbm"),
                 "reason_codes_enabled": bool(rated.get("reason_codes_enabled", True)),
                 "component_backends": list(rated.get("component_backends") or []),
+                "a4_enabled": bool(rated.get("a4_enabled", False)),
+                "a4_fusion_mode": rated.get("a4_fusion_mode", A4_FUSION_MODE_PRODUCT),
+                "a4_candidate_cutoff": rated.get("a4_candidate_cutoff"),
+                "stage2_model": rated.get("stage2_model"),
+                "stage2_features": list(rated.get("stage2_features") or rated.get("features") or []),
             },
             _tmp,
         )

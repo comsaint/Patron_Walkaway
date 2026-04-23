@@ -70,6 +70,13 @@ except ImportError:
 
 from trainer.core.bundle_run_contract import read_bundle_run_contract_block
 from trainer.core.model_bundle_paths import resolve_model_bundle_dir
+from trainer.training.two_stage import (
+    A4_FUSION_MODE_PRODUCT,
+    candidate_cutoff_from_threshold,
+    candidate_mask_from_scores,
+    fuse_product_scores,
+    validate_fusion_mode,
+)
 from trainer.db_conn import get_clickhouse_client  # serving lives under trainer; db_conn at package root
 
 try:
@@ -329,6 +336,11 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
                 )
             ),
             "component_backends": list(rb.get("component_backends") or []),
+            "a4_enabled": bool(rb.get("a4_enabled", False)),
+            "a4_fusion_mode": validate_fusion_mode(rb.get("a4_fusion_mode", A4_FUSION_MODE_PRODUCT)),
+            "a4_candidate_cutoff": rb.get("a4_candidate_cutoff"),
+            "stage2_model": rb.get("stage2_model"),
+            "stage2_features": list(rb.get("stage2_features") or rb.get("features") or []),
         }
         if not artifacts["feature_list"]:
             artifacts["feature_list"] = rb.get("features", [])
@@ -421,6 +433,7 @@ def fetch_recent_data(
             table_id,
             position_idx,
             wager,
+            casino_win,
             payout_odds,
             status
         FROM {config.SOURCE_DB}.{config.TBET} FINAL
@@ -1097,7 +1110,7 @@ def build_features_for_scoring(
     Steps
     -----
     1. D2 identity: attach canonical_id from canonical_map.
-    2. Track Human (features.py): loss_streak, run_id, minutes_since_run_start
+    2. Track Human (features.py): loss_streak, run-boundary, run P&L
        — same functions as trainer.py. (table_hc deferred to Phase 2.)
     3. Session rolling stats: bets_last_5/15/30m, wager_last_10/30m,
        cum_bets, cum_wager, avg_wager_sofar, session_duration_min,
@@ -1120,10 +1133,10 @@ def build_features_for_scoring(
 
     # ── Normalise types (ClickHouse may return object/string; LightGBM needs int/float/bool) ──
     # Skip categorical columns set by normalizer (PLAN Phase 4: do not overwrite).
-    for col in ["position_idx", "payout_odds", "base_ha", "is_back_bet", "wager"]:
+    for col in ["position_idx", "payout_odds", "base_ha", "is_back_bet", "wager", "casino_win"]:
         if col not in bets_df.columns:
             bets_df[col] = 0.0
-    for col in ["position_idx", "payout_odds", "base_ha", "wager"]:
+    for col in ["position_idx", "payout_odds", "base_ha", "wager", "casino_win"]:
         if isinstance(bets_df[col].dtype, pd.CategoricalDtype):
             continue
         bets_df[col] = pd.to_numeric(bets_df[col], errors="coerce").fillna(0)
@@ -1180,6 +1193,12 @@ def build_features_for_scoring(
     )
     bets_df["wager_sum_in_run_so_far"] = (
         rb["wager_sum_in_run_so_far"] if "wager_sum_in_run_so_far" in rb.columns else 0.0
+    )
+    bets_df["net_win_in_run_so_far"] = (
+        rb["net_win_in_run_so_far"] if "net_win_in_run_so_far" in rb.columns else 0.0
+    )
+    bets_df["net_win_per_bet_in_run"] = (
+        rb["net_win_per_bet_in_run"] if "net_win_per_bet_in_run" in rb.columns else 0.0
     )
 
     # ── Session rolling stats (legacy parity) ─────────────────────────────
@@ -1852,7 +1871,41 @@ def _score_df(
 
     if rated_art is not None and len(df) > 0:
         model_features = rated_art.get("features") or feature_list
-        scores = rated_art["model"].predict_proba(df[model_features])[:, 1]
+        scores = np.asarray(
+            rated_art["model"].predict_proba(df[model_features])[:, 1],
+            dtype=np.float64,
+        )
+        # A4 two-stage inference: run Stage-2 only on Stage-1 candidate pool.
+        a4_on = (
+            bool(getattr(config, "A4_TWO_STAGE_ENABLE_INFERENCE", False))
+            and bool(rated_art.get("a4_enabled", False))
+            and rated_art.get("stage2_model") is not None
+            and validate_fusion_mode(rated_art.get("a4_fusion_mode", A4_FUSION_MODE_PRODUCT)) == A4_FUSION_MODE_PRODUCT
+        )
+        if a4_on:
+            try:
+                cutoff = rated_art.get("a4_candidate_cutoff")
+                if cutoff is None:
+                    cutoff = candidate_cutoff_from_threshold(
+                        float((rated_art or {}).get("threshold", 0.5)),
+                        float(getattr(config, "A4_TWO_STAGE_CANDIDATE_MULTIPLIER", 0.9)),
+                    )
+                stage2_features = rated_art.get("stage2_features") or model_features
+                rated_mask = is_rated.astype(bool)
+                cand_mask = np.zeros(len(scores), dtype=bool)
+                if np.any(rated_mask):
+                    cand_local = candidate_mask_from_scores(scores[rated_mask], cutoff=float(cutoff))
+                    cand_mask[np.where(rated_mask)[0]] = cand_local
+                if np.any(cand_mask):
+                    s2 = np.ones(len(scores), dtype=np.float64)
+                    x2 = df.loc[cand_mask, stage2_features]
+                    s2[cand_mask] = np.asarray(
+                        rated_art["stage2_model"].predict_proba(x2)[:, 1],
+                        dtype=np.float64,
+                    )
+                    scores = fuse_product_scores(scores, s2)
+            except Exception as exc:
+                logger.warning("[scorer] A4 two-stage inference failed; fallback to stage1: %s", exc)
 
     df["score"] = scores
     df["is_rated_obs"] = is_rated.astype(int)

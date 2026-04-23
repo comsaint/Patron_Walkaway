@@ -339,6 +339,24 @@ UNRATED_VOLUME_LOG = True        # DEC-021: log unrated player/bet counts per po
 SCORER_ENABLE_SHAP_REASON_CODES = os.getenv(
     "SCORER_ENABLE_SHAP_REASON_CODES", "0"
 ).strip().lower() in ("1", "true", "t", "yes", "y")
+# --- A4 two-stage (Stage-1 + Stage-2 FP detector) ---
+# Training and inference are opt-in for safe rollout / rollback.
+A4_TWO_STAGE_ENABLE_TRAINING = os.getenv(
+    "A4_TWO_STAGE_ENABLE_TRAINING", "0"
+).strip().lower() in ("1", "true", "t", "yes", "y")
+A4_TWO_STAGE_ENABLE_INFERENCE = os.getenv(
+    "A4_TWO_STAGE_ENABLE_INFERENCE", "0"
+).strip().lower() in ("1", "true", "t", "yes", "y")
+# MVP fusion mode is fixed to product. Invalid values should fallback to product.
+A4_TWO_STAGE_FUSION_MODE = (os.getenv("A4_TWO_STAGE_FUSION_MODE") or "product").strip().lower() or "product"
+# Stage-2 only scores rows where stage1_score >= stage1_threshold * multiplier.
+A4_TWO_STAGE_CANDIDATE_MULTIPLIER = float(
+    os.getenv("A4_TWO_STAGE_CANDIDATE_MULTIPLIER", "0.9")
+)
+A4_TWO_STAGE_MIN_TRAIN_ROWS = int(os.getenv("A4_TWO_STAGE_MIN_TRAIN_ROWS", "500"))
+A4_TWO_STAGE_MIN_TRAIN_POSITIVES = int(os.getenv("A4_TWO_STAGE_MIN_TRAIN_POSITIVES", "50"))
+A4_TWO_STAGE_MIN_VALID_ROWS = int(os.getenv("A4_TWO_STAGE_MIN_VALID_ROWS", "100"))
+A4_TWO_STAGE_PREDICT_BATCH_ROWS = int(os.getenv("A4_TWO_STAGE_PREDICT_BATCH_ROWS", "250000"))
 LOSS_STREAK_PUSH_RESETS = False  # Whether PUSH resets the loss-streak counter (F4)
 HIST_AVG_BET_CAP = 500_000       # Winsorization cap for avg_bet (F2; validate with EDA)
 
