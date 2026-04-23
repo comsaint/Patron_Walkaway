@@ -348,7 +348,14 @@ A4_TWO_STAGE_ENABLE_INFERENCE = os.getenv(
     "A4_TWO_STAGE_ENABLE_INFERENCE", "0"
 ).strip().lower() in ("1", "true", "t", "yes", "y")
 # MVP fusion mode is fixed to product. Invalid values should fallback to product.
-A4_TWO_STAGE_FUSION_MODE = (os.getenv("A4_TWO_STAGE_FUSION_MODE") or "product").strip().lower() or "product"
+_A4_TWO_STAGE_FUSION_MODE_RAW = (
+    (os.getenv("A4_TWO_STAGE_FUSION_MODE") or "product").strip().lower() or "product"
+)
+A4_TWO_STAGE_FUSION_MODE = (
+    _A4_TWO_STAGE_FUSION_MODE_RAW
+    if _A4_TWO_STAGE_FUSION_MODE_RAW in {"product"}
+    else "product"
+)
 # Stage-2 only scores rows where stage1_score >= stage1_threshold * multiplier.
 A4_TWO_STAGE_CANDIDATE_MULTIPLIER = float(
     os.getenv("A4_TWO_STAGE_CANDIDATE_MULTIPLIER", "0.9")
