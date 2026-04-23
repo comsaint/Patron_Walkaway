@@ -257,6 +257,41 @@ class TestTemplateDtypeIntegrity(unittest.TestCase):
                     )
 
 
+class TestTrackHumanRunBoundaryInputContract(unittest.TestCase):
+    """Run-boundary family must include wager in input_columns."""
+
+    _RUN_BOUNDARY_FIDS = {
+        "minutes_since_run_start",
+        "bets_in_run_so_far",
+        "wager_sum_in_run_so_far",
+        "net_win_in_run_so_far",
+        "net_win_per_bet_in_run",
+    }
+
+    def test_run_boundary_features_require_wager_input(self):
+        spec = features_mod.load_feature_spec(SPEC_YAML)
+        track_human = (spec.get("track_human") or {}).get("candidates", [])
+        by_id = {
+            c.get("feature_id"): c
+            for c in track_human
+            if isinstance(c, dict) and c.get("feature_id")
+        }
+
+        missing = sorted(fid for fid in self._RUN_BOUNDARY_FIDS if fid not in by_id)
+        self.assertFalse(
+            missing,
+            f"Missing expected run-boundary candidates in track_human: {missing}",
+        )
+
+        for fid in sorted(self._RUN_BOUNDARY_FIDS):
+            inputs = by_id[fid].get("input_columns") or []
+            self.assertIn(
+                "wager",
+                inputs,
+                f"{fid} must include 'wager' in input_columns to compute wager_sum_in_run_so_far correctly.",
+            )
+
+
 class TestLoadFeatureSpecFileNotFound(unittest.TestCase):
     """load_feature_spec raises FileNotFoundError for missing paths."""
 

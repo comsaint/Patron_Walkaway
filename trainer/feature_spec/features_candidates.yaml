@@ -466,7 +466,7 @@ track_human:
       dtype: "float"
       description: "距離 run 起點的分鐘數（run 以 gap>=RUN_BREAK_MIN 切分）"
       function_name: "compute_run_boundary_features"
-      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "casino_win"]
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "wager", "casino_win"]
       output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
       postprocess:
         fill: { strategy: "zero" }
@@ -477,7 +477,7 @@ track_human:
       dtype: "int"
       description: "當筆為止同一 run 內下注筆數（1-based）"
       function_name: "compute_run_boundary_features"
-      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "casino_win"]
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "wager", "casino_win"]
       output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
       postprocess:
         fill: { strategy: "zero" }
@@ -488,7 +488,7 @@ track_human:
       dtype: "float"
       description: "當筆為止同一 run 內下注金額累計"
       function_name: "compute_run_boundary_features"
-      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "casino_win"]
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "wager", "casino_win"]
       output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
       postprocess:
         fill: { strategy: "zero" }
@@ -499,7 +499,7 @@ track_human:
       dtype: "float"
       description: "當筆為止同一 run 內玩家淨損益累計（player_net_win=-casino_win）"
       function_name: "compute_run_boundary_features"
-      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "casino_win"]
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "wager", "casino_win"]
       output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
       postprocess:
         fill: { strategy: "zero" }
@@ -511,7 +511,7 @@ track_human:
       dtype: "float"
       description: "當前 run 每注平均淨損益（run 內累計淨損益/下注筆數）"
       function_name: "compute_run_boundary_features"
-      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "casino_win"]
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "wager", "casino_win"]
       output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
       postprocess:
         fill: { strategy: "zero" }
