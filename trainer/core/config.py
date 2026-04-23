@@ -478,6 +478,13 @@ STEP9_EXPORT_LIBSVM: bool = True
 # Default False until the full path is implemented and validated.
 STEP9_TRAIN_FROM_FILE: bool = True
 
+# --- A3: always-on GBDT family comparison ---
+# When True, Step 9 compares LightGBM / CatBoost / XGBoost on the same rated split
+# matrices and selects the winner by the field-test validation objective.  LightGBM
+# may still use Plan B / B+ file-based training for RAM safety; CatBoost / XGBoost
+# compare on the aligned in-memory matrices after the split is materialized.
+STEP9_COMPARE_ALL_GBMS: bool = True
+
 # --- Plan B+ stage 5 (PLAN 方案 B+ 階段 5)：optional .bin for LibSVM path ---
 # When True and training from LibSVM (train_libsvm_paths), save dtrain to
 # train_for_lgb.bin after first build; on next run use .bin if present (faster I/O).

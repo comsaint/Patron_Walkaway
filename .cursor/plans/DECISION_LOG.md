@@ -1128,23 +1128,25 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 
 ---
 
-## DEC-045：A3 GBDT bakeoff（CatBoost／XGBoost 對照 LightGBM）與 C3 前置契約
+## DEC-045：A3 GBDT family compare（LGBM／CatBoost／XGBoost）與 C3 前置契約
 
 **日期**：2026-04-23  
-**相關**：`trainer/training/gbm_bakeoff.py`；`requirements.txt`（`catboost`、`xgboost`）；DEC-021（生產 artifact 仍為單一 rated LightGBM）
+**相關**：`trainer/training/gbm_bakeoff.py`；`requirements.txt`（`catboost`、`xgboost`）；DEC-021（生產 artifact 為單一 rated `model.pkl`）
 
 **決策**：
 
-1. **公平比較**：在 **in-memory** rated 路徑上，於主模型 LightGBM 訓練與測評完成後，可選 **`--gbm-bakeoff`** 以 **相同** `X_train`／`X_val`（及可選 `X_test`）、**相同** `sample_weight`、**相同** LGBM-shaped `hp`（依後端映射）訓練 **CatBoost** 與 **XGBoost**；LightGBM 列為 **primary_train** 之 metrics 參照，不重複訓練第二顆 LGBM。  
-2. **路徑排除**：**LibSVM** 與 **`train_from_file` 最終訓練** 路徑不啟用 bakeoff（權重／矩陣語意與主 GBDT 分叉）。  
-3. **選勝與標記**：以 validation **AP → F0.5 → precision** 排序選出 `winner_backend`；各後端 `bakeoff_disposition` 為 **winner**／**hold**／**reject**（import 或訓練失敗為 reject，非致命）。  
-4. **Artifact**：完整報告寫入 **`training_metrics["rated"]["gbm_bakeoff"]`**；`model_metadata.json` → `training_params.gbm_bakeoff_enabled`／`gbm_bakeoff_winner_backend`。  
-5. **C3**：A3 僅輸出 **`ensemble_bridge`** 元資料（欄序、列數、`same_splits`）；**不**包含 OOF 分數匯出、meta-learner 或 scorer 多模型組合（留待 C3）。
+1. **預設啟用**：`run_pipeline` 預設啟用 A3 family compare；只有顯式指定 **`--no-gbm-bakeoff`** 才停用。  
+2. **同矩陣 / 同切分 / 同評估**：LightGBM 主訓練可繼續使用 **LibSVM**／**`train_from_file`** 路徑降 RAM；A3 會另外從同一 split 讀出 rated 矩陣，讓 **LightGBM / CatBoost / XGBoost** 在 **相同** `X_train`／`X_val`（及可選 `X_test`）、**相同** `sample_weight`、**相同** evaluation helper 下比較。  
+3. **選勝與標記**：以 validation **field-test primary score**（可 prod-adjust 的 DEC-026 precision）為第一排序鍵，再以 **AP → F0.5** 打平，選出 `winner_backend`；各後端 `bakeoff_disposition` 為 **winner**／**hold**／**reject**（import 或訓練失敗為 reject，非致命）。  
+4. **Artifact**：完整報告寫入 **`training_metrics["rated"]["gbm_bakeoff"]`**；`model.pkl` 直接保存 `winner_backend`；`model_metadata.json` → `training_params.model_backend`／`selected_backend`／`gbm_bakeoff_*`。  
+5. **資源控制**：CatBoost / XGBoost 比較路徑會將矩陣 downcast 到 **float32**，且 train metrics 走**分批 predict**，避免因為 A3 報表本身製造 train-time OOM。  
+6. **C3**：A3 僅輸出 **`ensemble_bridge`** 元資料（欄序、列數、`same_splits`）；**不**包含 OOF 分數匯出、meta-learner 或 scorer 多模型組合（留待 C3）。
 
 **理由**：
 
-- 滿足交付計畫 A3 DoD（三後端同一框架、可對照、winner/hold/reject），且不破壞既有單模型 bundle 與 scorer。  
-- 明確切分 A3（離線比較）與 C3（ensemble 產品化），避免半套線上 blend。
+- 修正先前把 A3 限縮成「只有 in-memory 才比較、而且主 artifact 仍固定 LGBM」的錯誤語意。  
+- 正常訓練主路徑現在確實會比較三後端，且最後保存的是被比較後的 winner，不再只是寫一份旁路報告。  
+- A3 與 C3 邊界仍清楚：A3 處理基模型家族比較；ensemble 產品化留待 C3。
 
 ---
 

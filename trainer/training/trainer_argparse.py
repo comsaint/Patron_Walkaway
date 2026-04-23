@@ -109,14 +109,13 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--gbm-bakeoff",
+        "--no-gbm-bakeoff",
         action="store_true",
         help=(
-            "Precision uplift A3/R3 (+ C3 hook): after primary rated LightGBM training, "
-            "train CatBoost and XGBoost on the same in-memory matrices, sample_weight, and "
-            "LightGBM-shaped hp; write gbm_bakeoff report (winner/hold/reject + ensemble_bridge) "
-            "into training_metrics. Ignored for LibSVM and train_from_file final paths. "
-            "Requires optional deps catboost and xgboost (see requirements.txt)."
+            "Disable default A3/R3 three-model comparison. By default the trainer compares "
+            "LightGBM / CatBoost / XGBoost on the same rated split matrices and selects the "
+            "winner by the field-test validation objective; this flag keeps only the primary "
+            "LightGBM training path. Requires optional deps catboost and xgboost when enabled."
         ),
     )
     return parser

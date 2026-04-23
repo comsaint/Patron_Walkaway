@@ -4160,6 +4160,32 @@ def _batched_booster_predict_scores(
     return np.concatenate(parts, axis=0)
 
 
+def _batched_model_positive_class_scores(
+    model: Any,
+    X: pd.DataFrame,
+    batch_rows: int,
+) -> np.ndarray:
+    """Chunked positive-class scores for any sklearn-like classifier.
+
+    LightGBM ``booster_`` keeps the dedicated fast path.  Other backends (CatBoost /
+    XGBoost sklearn wrappers) fall back to chunked ``predict_proba`` to avoid one giant
+    dense probability matrix on laptop-scale runs.
+    """
+    booster = getattr(model, "booster_", None)
+    if booster is not None:
+        return _batched_booster_predict_scores(booster, X, batch_rows)
+    n = int(len(X))
+    if n == 0:
+        return np.asarray([], dtype=np.float64)
+    br = max(1, int(batch_rows))
+    parts: list[np.ndarray] = []
+    for start in range(0, n, br):
+        chunk = X.iloc[start : start + br]
+        raw = model.predict_proba(chunk)[:, 1]
+        parts.append(np.asarray(raw, dtype=np.float64).reshape(-1))
+    return np.concatenate(parts, axis=0)
+
+
 def _train_metrics_dict_from_y_scores(
     y_train: Union[np.ndarray, pd.Series],
     train_scores: np.ndarray,
@@ -4251,24 +4277,22 @@ def _compute_train_metrics(
             "train_positives": 0,
             "train_random_ap": 0.0,
         }
-    booster = getattr(model, "booster_", None)
-    if booster is not None:
-        try:
-            batched = _batched_booster_predict_scores(
-                booster, X_train, TRAIN_METRICS_PREDICT_BATCH_ROWS
-            )
-            return _train_metrics_dict_from_y_scores(
-                y_train,
-                batched,
-                threshold,
-                label=label,
-                log_results=log_results,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Train metrics: batched booster.predict failed (%s); falling back to predict_proba.",
-                exc,
-            )
+    try:
+        batched = _batched_model_positive_class_scores(
+            model, X_train, TRAIN_METRICS_PREDICT_BATCH_ROWS
+        )
+        return _train_metrics_dict_from_y_scores(
+            y_train,
+            batched,
+            threshold,
+            label=label,
+            log_results=log_results,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Train metrics: batched positive-class predict failed (%s); falling back to predict_proba.",
+            exc,
+        )
     train_scores = model.predict_proba(X_train)[:, 1]
     return _train_metrics_dict_from_y_scores(
         y_train,
@@ -4529,6 +4553,8 @@ def train_single_rated_model(
     test_libsvm_path: Optional[Path] = None,
     ranking_recipe: Optional[str] = None,
     gbm_bakeoff: bool = False,
+    valid_split_parquet_path: Optional[Path] = None,
+    test_split_parquet_path: Optional[Path] = None,
 ) -> Tuple[Optional[dict], Optional[dict], dict]:
     """v10 single-model (DEC-021): train rated model only; return (rated_art, None, metrics).
 
@@ -4549,9 +4575,10 @@ def train_single_rated_model(
     When test_df is None and test_libsvm_path is set (PLAN B+ 階段 6 第 3 步), test
     labels and predictions are read from the test LibSVM file; path must be under DATA_DIR.
 
-    When *gbm_bakeoff* is True (A3 / R3), after primary LightGBM + test metrics, run an
-    optional CatBoost + XGBoost comparison on the same in-memory splits and append
-    ``gbm_bakeoff`` to rated metrics (skipped for LibSVM / train_from_file paths).
+    When *gbm_bakeoff* is True (A3 / R3), after the primary LightGBM path completes we
+    always compare LightGBM / CatBoost / XGBoost on the same rated train/valid/test
+    matrices and select the winner by field-test validation objective.  Main-path
+    LibSVM / CSV optimizations remain valid for LightGBM, but no longer suppress A3.
     """
     _ft_pre_doc: Optional[Dict[str, Any]] = None
     _ft_pre_path_raw = ""
@@ -5277,39 +5304,105 @@ def train_single_rated_model(
     else:
         test_m = {}
 
-    # A3 / R3: optional fair GBDT bakeoff (CatBoost + XGBoost vs primary LightGBM metrics).
-    if (
-        gbm_bakeoff
-        and not use_from_libsvm
-        and not use_from_file
-        and not train_rated.empty
-    ):
+    # A3 / R3: always compare LGBM / CatBoost / XGBoost on the same rated split matrices.
+    if gbm_bakeoff and not train_rated.empty:
         try:
-            from trainer.training.gbm_bakeoff import run_rated_gbm_bakeoff
+            from trainer.training.gbm_bakeoff import train_and_select_rated_gbm_family
 
-            _x_te = None
-            _y_te = None
-            if test_rated is not None and not test_rated.empty:
-                _miss_te = [c for c in avail_cols if c not in test_rated.columns]
-                if not _miss_te:
-                    _x_te = test_rated[avail_cols]
-                    _y_te = test_rated["label"]
-            metrics["gbm_bakeoff"] = run_rated_gbm_bakeoff(
+            _compare_valid = val_rated
+            if (
+                (_compare_valid is None or _compare_valid.empty)
+                and valid_split_parquet_path is not None
+                and valid_split_parquet_path.exists()
+            ):
+                _compare_valid = _load_rated_eval_split_from_parquet(
+                    valid_split_parquet_path,
+                    avail_cols,
+                )
+            _compare_test = test_rated
+            if (
+                (_compare_test is None or _compare_test.empty)
+                and test_split_parquet_path is not None
+                and test_split_parquet_path.exists()
+            ):
+                _compare_test = _load_rated_eval_split_from_parquet(
+                    test_split_parquet_path,
+                    avail_cols,
+                )
+
+            _x_vl_cmp = (
+                _compare_valid[avail_cols]
+                if _compare_valid is not None and not _compare_valid.empty
+                else X_vl
+            )
+            _y_vl_cmp = (
+                _compare_valid["label"]
+                if _compare_valid is not None and not _compare_valid.empty
+                else y_vl
+            )
+            _x_te_cmp = (
+                _compare_test[avail_cols]
+                if _compare_test is not None and not _compare_test.empty
+                else None
+            )
+            _y_te_cmp = (
+                _compare_test["label"]
+                if _compare_test is not None and not _compare_test.empty
+                else None
+            )
+
+            _winner_backend, _winner_art, _bake_report = train_and_select_rated_gbm_family(
                 X_tr,
                 y_tr,
-                X_vl,
-                y_vl,
+                _x_vl_cmp,
+                _y_vl_cmp,
                 sw_rated,
                 hp,
-                lgbm_reference_metrics=metrics,
-                X_test=_x_te,
-                y_test=_y_te,
+                lightgbm_artifact={
+                    "model": model,
+                    "threshold": metrics["threshold"],
+                    "features": avail_cols,
+                    "metrics": metrics,
+                },
+                X_test=_x_te_cmp,
+                y_test=_y_te_cmp,
                 val_dec026_window_hours=_ft_thr_wh,
                 val_dec026_min_alerts_per_hour=_ft_thr_mah,
             )
+            model = _winner_art["model"]
+            metrics = dict(_winner_art["metrics"])
+            metrics["gbm_bakeoff"] = _bake_report
+            metrics["selected_backend"] = _winner_backend
+            metrics["selected_backend_source"] = "a3_gbm_family_compare"
+            train_m = {
+                k: metrics[k]
+                for k in (
+                    "train_ap",
+                    "train_precision",
+                    "train_recall",
+                    "train_f1",
+                    "train_samples",
+                    "train_positives",
+                    "train_random_ap",
+                )
+                if k in metrics
+            }
+            test_m = {
+                k: metrics[k]
+                for k in metrics
+                if k.startswith("test_")
+                or k in ("test_neg_pos_ratio", "production_neg_pos_ratio_assumed")
+            }
         except Exception as _bake_exc:
             logger.warning("gbm_bakeoff failed (non-fatal): %s", _bake_exc)
-            metrics["gbm_bakeoff"] = {"schema_version": "a3_v1", "error": str(_bake_exc)}
+            metrics["gbm_bakeoff"] = {"schema_version": "a3_v2", "error": str(_bake_exc)}
+            metrics["model_backend"] = "lightgbm"
+            metrics["selected_backend"] = "lightgbm"
+            metrics["selected_backend_source"] = "primary_train_fallback"
+    else:
+        metrics["model_backend"] = "lightgbm"
+        metrics["selected_backend"] = "lightgbm"
+        metrics["selected_backend_source"] = "primary_train_only"
 
     # Log in order: train → valid → test (clear labels; valid was previously unlabeled).
     logger.info(
@@ -5396,6 +5489,35 @@ def _payout_bounds_iso_from_series(series: pd.Series) -> Tuple[Optional[str], Op
     if pd.isna(mn) or pd.isna(mx):
         return (None, None)
     return (str(pd.Timestamp(mn).isoformat()), str(pd.Timestamp(mx).isoformat()))
+
+
+def _load_rated_eval_split_from_parquet(
+    split_path: Path,
+    feature_cols: List[str],
+) -> pd.DataFrame:
+    """Load a minimal rated eval split from parquet for A3 family comparison.
+
+    This keeps Plan B / B+ semantics for the main LightGBM training path, while still
+    giving CatBoost / XGBoost the exact same time split and feature matrix for a fair
+    comparison on the selected columns.
+    """
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(split_path)
+    available = set(pf.schema.names)
+    cols = [c for c in feature_cols if c in available]
+    for extra in ("label", "is_rated"):
+        if extra in available and extra not in cols:
+            cols.append(extra)
+    if "label" not in cols:
+        raise ValueError(f"A3 compare split missing label column: {split_path}")
+    df = pd.read_parquet(split_path, columns=cols)
+    if "is_rated" in df.columns:
+        df = df[df["is_rated"]].copy()
+    for col in feature_cols:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df
 
 
 def _one_split_block_from_dataframe(df: Optional[pd.DataFrame]) -> dict[str, Any]:
@@ -5589,6 +5711,9 @@ def build_model_metadata_document(
                 if isinstance(_rated_d.get("gbm_bakeoff"), dict)
                 else None
             ),
+            "model_backend": _rated_d.get("model_backend"),
+            "selected_backend": _rated_d.get("selected_backend"),
+            "selected_backend_source": _rated_d.get("selected_backend_source"),
         },
         "artifacts": {
             "bundle_dir": str(bundle_dir.resolve()),
@@ -5979,6 +6104,10 @@ def run_pipeline(args) -> None:
     skip_optuna = getattr(args, "skip_optuna", False)
     pipeline_ranking_recipe = resolve_ranking_recipe(getattr(args, "ranking_recipe", None))
     logger.info("Precision uplift A2 ranking_recipe=%s", pipeline_ranking_recipe)
+    pipeline_gbm_bakeoff = bool(getattr(_cfg, "STEP9_COMPARE_ALL_GBMS", True)) and not bool(
+        getattr(args, "no_gbm_bakeoff", False)
+    )
+    logger.info("Precision uplift A3 gbm_bakeoff_enabled=%s", pipeline_gbm_bakeoff)
     configure_lightgbm_device_for_run(args)
     # --no-preload: disable session full-table preload; use per-day PyArrow
     # pushdown reads instead.  Reduces peak RAM for low-RAM machines.
@@ -7349,7 +7478,7 @@ def run_pipeline(args) -> None:
             # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
             #    test_df is passed so test-set metrics and feature importance are
             #    computed immediately after training and included in the artifact.
-            print("[Step 9/10] Train single rated model (Optuna + LightGBM) + test-set eval…", flush=True)
+            print("[Step 9/10] Train rated GBM family (LGBM/CatBoost/XGBoost compare) + test-set eval…", flush=True)
             t0 = time.perf_counter()
             model_version = get_model_version()
             _libsvm_paths = (_train_libsvm, _valid_libsvm) if (_train_libsvm is not None and _valid_libsvm is not None) else None
@@ -7363,12 +7492,14 @@ def run_pipeline(args) -> None:
                 train_libsvm_paths=_libsvm_paths,
                 test_libsvm_path=_test_libsvm,
                 ranking_recipe=pipeline_ranking_recipe,
-                gbm_bakeoff=bool(getattr(args, "gbm_bakeoff", False)),
+                gbm_bakeoff=pipeline_gbm_bakeoff,
+                valid_split_parquet_path=step7_valid_path,
+                test_split_parquet_path=step7_test_path,
             )
             _el = time.perf_counter() - t0
             step9_duration_sec = _el
-            print("[Step 9/10] Train single rated model + test-set eval done in %.1fs" % _el, flush=True)
-            logger.info("train_single_rated_model + test eval: %.1fs", _el)
+            print("[Step 9/10] Train rated GBM family + test-set eval done in %.1fs" % _el, flush=True)
+            logger.info("train_single_rated_model + A3 family compare + test eval: %.1fs", _el)
 
             # T12.2: capture RSS/sys RAM snapshot at Step 9 end (checkpoint scope Step 7-9).
             # Peak := max(start, end) to avoid heavy sampling/polling overhead.

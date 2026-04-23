@@ -49,7 +49,7 @@ python -m trainer.trainer --use-local-parquet --recent-chunks 3 --skip-optuna --
 | 檔案 | 測試重點 |
 |------|----------|
 | `tests/unit/test_ranking_recipe_weights.py` | resolve、**預設 top_band**（CLI+env 未設）、explicit baseline、unknown→baseline、top-band、combined、shallow HNM skip／boost。 |
-| `tests/unit/test_gbm_bakeoff.py` | A3：`run_rated_gbm_bakeoff` schema、disposition、**ensemble_bridge**（C3 前置）。 |
+| `tests/unit/test_gbm_bakeoff.py` | A3：`train_and_select_rated_gbm_family` schema、winner artifact、disposition、**ensemble_bridge**（C3 前置）。 |
 | `tests/unit/test_field_test_objective_precondition.py` | 放寬 EXECUTION PLAN 字串斷言（文件括號後綴）。 |
 
 **執行方式**
@@ -66,19 +66,21 @@ python -m pytest tests/unit/test_ranking_recipe_weights.py tests/unit/test_gbm_b
 
 - 本輪實作已與上述測試一致；未再改 production。  
 - **Plan item**：`PRECISION_UPLIFT_DELIVERY_PLAN.md` **A2** 為 **✅**（四種 recipe 可經 CLI／env 切換；**預設 `r2_top_band_light`（DEC-044）**；`training_metrics` + **`model_metadata.training_params.ranking_recipe`**）。  
-- **下一步建議**：B1（`table_hc` 訓練主路徑接線）或其他 B 項；A3 已落地（見下方 **A3** 區塊）。
+- **下一步建議**：B1（`table_hc` 訓練主路徑接線）或其他 B 項；A3 核心 compare 已落地，但多窗治理仍待補（見下方 **A3** 區塊）。
 
 ✅ 全部完成，CYCLE 結束
 
-## Precision Uplift — A3 GBM bakeoff（CatBoost / XGBoost）（2026-04-23）
+## Precision Uplift — A3 GBM family compare（LGBM / CatBoost / XGBoost）（2026-04-23）
 
 對照計畫：`trainer/precision_improvement_plan/PRECISION_UPLIFT_DELIVERY_PLAN.md` §A3、§C3；決策 **DEC-045**（`.cursor/plans/DECISION_LOG.md`）。
 
-- **CLI**：`--gbm-bakeoff`（`trainer/training/trainer_argparse.py`）；`run_pipeline` → `train_single_rated_model(..., gbm_bakeoff=True)`。
-- **程式**：`trainer/training/gbm_bakeoff.py`（`run_rated_gbm_bakeoff`；`ensemble_bridge` 供 C3 延伸）；主線仍只產 **LightGBM** `model.pkl`（DEC-021）。
-- **依賴**：`requirements.txt` 已加入 `catboost==1.2.10`、`xgboost==3.2.0`（PyPI 穩定版）。
-- **Artifact**：`training_metrics["rated"]["gbm_bakeoff"]`；`model_metadata.json` → `training_params.gbm_bakeoff_enabled`、`gbm_bakeoff_winner_backend`。
-- **略過**：LibSVM、`train_from_file` 最終訓練路徑不跑 bakeoff。
+- **CLI**：預設啟用；`--no-gbm-bakeoff` 可關閉（`trainer/training/trainer_argparse.py`）。
+- **程式**：`trainer/training/gbm_bakeoff.py`（`train_and_select_rated_gbm_family`）；`run_pipeline` 預設將 A3 打開，`train_single_rated_model(..., gbm_bakeoff=True)` 會在主 LightGBM 路徑完成後，比較 **LightGBM / CatBoost / XGBoost** 並選 winner。
+- **依賴**：`requirements.txt` 使用 `catboost==1.2.10`、`xgboost==3.2.1`。
+- **Artifact**：`training_metrics["rated"]["gbm_bakeoff"]`；`model_metadata.json` → `training_params.model_backend`／`selected_backend`／`gbm_bakeoff_*`；**`model.pkl` 直接保存 winner backend**。
+- **Plan B / B+ 相容**：LightGBM 仍可用 LibSVM / `train_from_file` 降 RAM；A3 會額外從同一 split 載入 rated 矩陣，避免再用「因為省 RAM 所以完全不比較」的錯誤語意。
+- **資源控制**：CatBoost / XGBoost compare 矩陣 downcast 為 `float32`；train metrics 改為分批 `predict_proba`，降低筆電 RAM 峰值。
+- **仍待**：多窗穩定性 guardrail 尚未內建到 A3 自動選勝；目前先完成單次訓練下的三模型公平比較。
 - **測試**：`tests/unit/test_gbm_bakeoff.py`。
 
 ```bash

@@ -1,19 +1,29 @@
-"""Precision uplift A3 / R3: fair GBDT bakeoff (LightGBM reference + CatBoost + XGBoost).
+"""Precision uplift A3 / R3: always-on GBDT family compare.
 
-Same train/valid/test matrices, same DEC-013 ``sample_weight`` row vector, and the same
-LightGBM-shaped hyperparameter dict from Optuna (mapped per backend). Each backend picks
-its own validation threshold via :func:`pick_threshold_dec026` on its validation scores.
+Contract
+--------
+- Same feature matrix, same temporal split, same evaluation helper.
+- Same DEC-013 / A2 sample_weight vector for all backends.
+- Primary winner key = field-test validation objective (DEC-026 operating point,
+  prod-adjusted when the contract allows it), not AP.
 
-LightGBM metrics are taken from the already-trained primary model (no second LGBM fit).
+The caller passes the already-trained LightGBM artifact (which may have been trained
+through in-memory / CSV / LibSVM main paths). This module then trains CatBoost and
+XGBoost on the same in-memory matrices and returns:
 
-C3 (stacking / blending): this module only emits a compact JSON-serializable report under
-``training_metrics["rated"]["gbm_bakeoff"]`` with ``ensemble_bridge`` metadata so a future
-meta-learner can align backends without re-defining splits.
+1. A JSON-serialisable report for ``training_metrics["rated"]["gbm_bakeoff"]``.
+2. Candidate artifacts for all backends.
+3. The selected winner backend/artifact so the caller can persist the actual winner as
+   ``model.pkl`` instead of silently keeping LightGBM.
+
+C3 (stacking / blending) is not implemented here; we only emit ``ensemble_bridge`` to
+record that all backends were compared on aligned splits.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -41,6 +51,84 @@ def _has_strong_validation(X_val: pd.DataFrame, y_val: pd.Series) -> bool:
         and int(y_val.isna().sum()) == 0
         and int(y_val.sum()) >= 1
         and int((y_val == 0).sum()) >= 1
+    )
+
+
+def _neg_pos_ratio_from_binary_labels(y: pd.Series) -> Optional[float]:
+    """Return neg/pos ratio for strict binary labels; None when invalid / unsupported."""
+    if y is None or len(y) == 0:
+        return None
+    ya = np.asarray(y, dtype=float).reshape(-1)
+    if not np.isfinite(ya).all():
+        return None
+    pos = int(np.sum(ya == 1.0))
+    neg = int(np.sum(ya == 0.0))
+    if pos <= 0 or neg <= 0:
+        return None
+    return float(neg / pos)
+
+
+def _precision_prod_adjusted(
+    prec: Optional[float],
+    *,
+    production_neg_pos_ratio: Optional[float],
+    test_neg_pos_ratio: Optional[float],
+) -> Optional[float]:
+    """Copy of trainer field-test primary-score rescaling (JSON-safe)."""
+    if prec is None:
+        return None
+    p = float(prec)
+    if not math.isfinite(p) or p <= 0.0:
+        return None
+    if p > 1.0 + 1e-9:
+        return None
+    if p > 1.0:
+        p = 1.0
+    if production_neg_pos_ratio is None or test_neg_pos_ratio is None:
+        return None
+    pn = float(production_neg_pos_ratio)
+    tn = float(test_neg_pos_ratio)
+    if not math.isfinite(pn) or not math.isfinite(tn) or pn <= 0.0 or tn <= 0.0:
+        return None
+    scaling = pn / tn
+    if not math.isfinite(scaling):
+        return None
+    inv_p = 1.0 / p
+    if not math.isfinite(inv_p):
+        return None
+    term = (inv_p - 1.0) * scaling
+    if not math.isfinite(term):
+        return None
+    denom = 1.0 + term
+    if not math.isfinite(denom) or denom <= 0.0:
+        return None
+    adj = 1.0 / denom
+    if not math.isfinite(adj):
+        return None
+    if adj < -1e-9 or adj > 1.0 + 1e-9:
+        return None
+    if adj < 0.0:
+        return 0.0
+    if adj > 1.0:
+        return 1.0
+    return float(adj)
+
+
+def _add_field_test_primary_keys(metrics: Dict[str, Any], y_val: pd.Series) -> None:
+    """Augment metrics with comparable field-test primary score keys."""
+    val_precision = metrics.get("val_precision")
+    val_np_ratio = _neg_pos_ratio_from_binary_labels(y_val)
+    val_primary_adj = _precision_prod_adjusted(
+        float(val_precision) if val_precision is not None else None,
+        production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+        test_neg_pos_ratio=val_np_ratio,
+    )
+    metrics["val_neg_pos_ratio"] = val_np_ratio
+    metrics["val_field_test_primary_score"] = (
+        float(val_primary_adj) if val_primary_adj is not None else float(val_precision or 0.0)
+    )
+    metrics["val_field_test_primary_score_mode"] = (
+        "precision_prod_adjusted" if val_primary_adj is not None else "precision_raw"
     )
 
 
@@ -104,7 +192,15 @@ def _val_block_from_scores(
     if val_dec026_window_hours is not None and val_dec026_min_alerts_per_hour is not None:
         out["val_dec026_pick_window_hours"] = float(val_dec026_window_hours)
         out["val_dec026_pick_min_alerts_per_hour"] = float(val_dec026_min_alerts_per_hour)
+    _add_field_test_primary_keys(out, y_val)
     return out
+
+
+def _to_float32_frame(X: pd.DataFrame) -> pd.DataFrame:
+    """Downcast numeric frames for non-LightGBM backends to reduce RAM pressure."""
+    if X.empty:
+        return X
+    return X.astype(np.float32, copy=False)
 
 
 def _map_hp_catboost(hp: Mapping[str, Any]) -> Dict[str, Any]:
@@ -157,19 +253,21 @@ def _train_catboost_backend(
     iterations = int(c_hp.pop("iterations"))
     early = int(c_hp.pop("early_stopping_rounds"))
     model = CatBoostClassifier(iterations=iterations, **c_hp)
+    X_tr = _to_float32_frame(X_train)
+    X_vl = _to_float32_frame(X_val)
     _has_val = _has_strong_validation(X_val, y_val)
     if _has_val:
         model.fit(
-            X_train,
+            X_tr,
             y_train.astype(np.int32),
             sample_weight=sw_train,
-            eval_set=(X_val, y_val.astype(np.int32)),
+            eval_set=(X_vl, y_val.astype(np.int32)),
             early_stopping_rounds=early,
             verbose=False,
         )
-        val_scores = np.asarray(model.predict_proba(X_val)[:, 1], dtype=float)
+        val_scores = np.asarray(model.predict_proba(X_vl)[:, 1], dtype=float)
     else:
-        model.fit(X_train, y_train.astype(np.int32), sample_weight=sw_train, verbose=False)
+        model.fit(X_tr, y_train.astype(np.int32), sample_weight=sw_train, verbose=False)
         val_scores = np.zeros(len(y_val), dtype=float)
     metrics = _val_block_from_scores(
         y_val,
@@ -198,21 +296,20 @@ def _train_xgboost_backend(
     x_hp = _map_hp_xgboost(hp)
     n_est = int(x_hp.pop("n_estimators"))
     model = xgb.XGBClassifier(n_estimators=n_est, **x_hp)
+    X_tr = _to_float32_frame(X_train)
+    X_vl = _to_float32_frame(X_val)
     _has_val = _has_strong_validation(X_val, y_val)
     if _has_val:
-        # XGBoost sklearn API varies by version (callbacks vs no early stopping on fit).
-        # Keep a single full fit on train+eval_set for loss logging without early stopping
-        # to stay compatible across 2.x / 3.x; n_estimators is capped via mapped hp.
         model.fit(
-            X_train,
+            X_tr,
             y_train,
             sample_weight=sw_train,
-            eval_set=[(X_val, y_val)],
+            eval_set=[(X_vl, y_val)],
             verbose=False,
         )
-        val_scores = np.asarray(model.predict_proba(X_val)[:, 1], dtype=float)
+        val_scores = np.asarray(model.predict_proba(X_vl)[:, 1], dtype=float)
     else:
-        model.fit(X_train, y_train, sample_weight=sw_train, verbose=False)
+        model.fit(X_tr, y_train, sample_weight=sw_train, verbose=False)
         val_scores = np.zeros(len(y_val), dtype=float)
     metrics = _val_block_from_scores(
         y_val,
@@ -227,22 +324,22 @@ def _train_xgboost_backend(
 
 def _pick_winner(rows: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     """Return (winner_backend, selection_rule)."""
-    rule = "max_val_ap_then_val_fbeta_05_then_val_precision"
+    rule = "max_val_field_test_primary_score_then_val_ap_then_val_fbeta_05"
     candidates: List[str] = []
-    for b in BAKEOFF_BACKENDS:
-        r = rows.get(b) or {}
-        if r.get("bakeoff_disposition") == "reject" or r.get("error"):
+    for backend in BAKEOFF_BACKENDS:
+        row = rows.get(backend) or {}
+        if row.get("bakeoff_disposition") == "reject" or row.get("error"):
             continue
-        candidates.append(b)
+        candidates.append(backend)
     if not candidates:
         return "lightgbm", rule
 
-    def _key(b: str) -> Tuple[float, float, float]:
-        r = rows[b]
+    def _key(backend: str) -> Tuple[float, float, float]:
+        row = rows[backend]
         return (
-            float(r.get("val_ap") or 0.0),
-            float(r.get("val_fbeta_05") or 0.0),
-            float(r.get("val_precision") or 0.0),
+            float(row.get("val_field_test_primary_score") or 0.0),
+            float(row.get("val_ap") or 0.0),
+            float(row.get("val_fbeta_05") or 0.0),
         )
 
     candidates.sort(key=_key, reverse=True)
@@ -250,17 +347,17 @@ def _pick_winner(rows: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
 
 
 def _assign_dispositions(rows: Dict[str, Dict[str, Any]], winner: str) -> None:
-    for b in BAKEOFF_BACKENDS:
-        r = rows.setdefault(b, {})
-        if r.get("error"):
-            r["bakeoff_disposition"] = "reject"
-        elif b == winner:
-            r["bakeoff_disposition"] = "winner"
+    for backend in BAKEOFF_BACKENDS:
+        row = rows.setdefault(backend, {})
+        if row.get("error"):
+            row["bakeoff_disposition"] = "reject"
+        elif backend == winner:
+            row["bakeoff_disposition"] = "winner"
         else:
-            r["bakeoff_disposition"] = "hold"
+            row["bakeoff_disposition"] = "hold"
 
 
-def run_rated_gbm_bakeoff(
+def train_and_select_rated_gbm_family(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_val: pd.DataFrame,
@@ -268,51 +365,62 @@ def run_rated_gbm_bakeoff(
     sw_train: pd.Series,
     hp: Mapping[str, Any],
     *,
-    lgbm_reference_metrics: Mapping[str, Any],
+    lightgbm_artifact: Mapping[str, Any],
     X_test: Optional[pd.DataFrame] = None,
     y_test: Optional[pd.Series] = None,
     val_dec026_window_hours: Optional[float] = None,
     val_dec026_min_alerts_per_hour: Optional[float] = None,
-) -> Dict[str, Any]:
-    """Compare CatBoost and XGBoost against an already-fitted LightGBM metrics row.
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Train all three backends on aligned splits and return winner + report."""
+    from trainer.training.trainer import (
+        _compute_feature_importance,
+        _compute_test_metrics,
+        _compute_train_metrics,
+    )
 
-    Returns a JSON-serializable dict (no model objects).
-    """
-    from trainer.training.trainer import _compute_test_metrics
+    lightgbm_model = lightgbm_artifact["model"]
+    feature_cols = list(lightgbm_artifact["features"])
+    lightgbm_metrics = dict(lightgbm_artifact["metrics"])
+    _add_field_test_primary_keys(lightgbm_metrics, y_val)
+    lightgbm_metrics["model_backend"] = "lightgbm"
 
-    rows: Dict[str, Dict[str, Any]] = {}
-
-    # LightGBm: reference only (primary path already trained).
-    lgbm_row: Dict[str, Any] = {
-        "backend": "lightgbm",
-        "source": "primary_train",
-        "val_ap": float(lgbm_reference_metrics.get("val_ap", 0.0)),
-        "val_precision": float(lgbm_reference_metrics.get("val_precision", 0.0)),
-        "val_recall": float(lgbm_reference_metrics.get("val_recall", 0.0)),
-        "val_f1": float(lgbm_reference_metrics.get("val_f1", 0.0)),
-        "val_fbeta_05": float(lgbm_reference_metrics.get("val_fbeta_05", 0.0)),
-        "threshold": float(lgbm_reference_metrics.get("threshold", 0.5)),
-        "val_samples": lgbm_reference_metrics.get("val_samples"),
-        "val_positives": lgbm_reference_metrics.get("val_positives"),
-        "val_random_ap": lgbm_reference_metrics.get("val_random_ap"),
-        "_uncalibrated": bool(lgbm_reference_metrics.get("_uncalibrated", False)),
+    rows: Dict[str, Dict[str, Any]] = {
+        "lightgbm": {
+            "backend": "lightgbm",
+            "source": "primary_train",
+            "val_ap": float(lightgbm_metrics.get("val_ap", 0.0)),
+            "val_precision": float(lightgbm_metrics.get("val_precision", 0.0)),
+            "val_recall": float(lightgbm_metrics.get("val_recall", 0.0)),
+            "val_f1": float(lightgbm_metrics.get("val_f1", 0.0)),
+            "val_fbeta_05": float(lightgbm_metrics.get("val_fbeta_05", 0.0)),
+            "threshold": float(lightgbm_metrics.get("threshold", 0.5)),
+            "val_samples": lightgbm_metrics.get("val_samples"),
+            "val_positives": lightgbm_metrics.get("val_positives"),
+            "val_random_ap": lightgbm_metrics.get("val_random_ap"),
+            "_uncalibrated": bool(lightgbm_metrics.get("_uncalibrated", False)),
+            "val_neg_pos_ratio": lightgbm_metrics.get("val_neg_pos_ratio"),
+            "val_field_test_primary_score": lightgbm_metrics.get("val_field_test_primary_score"),
+            "val_field_test_primary_score_mode": lightgbm_metrics.get("val_field_test_primary_score_mode"),
+            "test_ap": lightgbm_metrics.get("test_ap"),
+            "test_precision": lightgbm_metrics.get("test_precision"),
+            "test_f1": lightgbm_metrics.get("test_f1"),
+        }
     }
-    if X_test is not None and y_test is not None and not X_test.empty and not y_test.empty:
-        try:
-            # Test metrics already in reference — shallow copy keys for side-by-side table.
-            lgbm_row["test_ap"] = lgbm_reference_metrics.get("test_ap")
-            lgbm_row["test_precision"] = lgbm_reference_metrics.get("test_precision")
-            lgbm_row["test_f1"] = lgbm_reference_metrics.get("test_f1")
-        except Exception:
-            pass
-    rows["lightgbm"] = lgbm_row
+    candidate_artifacts: Dict[str, Dict[str, Any]] = {
+        "lightgbm": {
+            "model": lightgbm_model,
+            "threshold": float(lightgbm_metrics.get("threshold", 0.5)),
+            "features": feature_cols,
+            "metrics": lightgbm_metrics,
+        }
+    }
 
-    for trainer_fn, name in (
+    for trainer_fn, backend in (
         (_train_catboost_backend, "catboost"),
         (_train_xgboost_backend, "xgboost"),
     ):
         try:
-            _model, vmetrics = trainer_fn(
+            model, metrics = trainer_fn(
                 X_train,
                 y_train,
                 X_val,
@@ -322,60 +430,80 @@ def run_rated_gbm_bakeoff(
                 val_dec026_window_hours=val_dec026_window_hours,
                 val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
             )
-            row = {"backend": name, **{k: vmetrics[k] for k in vmetrics if k != "label"}}
-            row["label"] = f"rated_{name}"
+            metrics = dict(metrics)
+            metrics.update(
+                _compute_train_metrics(
+                    model,
+                    float(metrics["threshold"]),
+                    _to_float32_frame(X_train),
+                    y_train,
+                    label=f"rated_{backend}",
+                    log_results=False,
+                )
+            )
             if X_test is not None and y_test is not None and not X_test.empty:
-                try:
-                    test_m = _compute_test_metrics(
-                        _model,
-                        float(vmetrics["threshold"]),
-                        X_test,
-                        y_test,
-                        label=f"rated_{name}",
-                        _uncalibrated=bool(vmetrics.get("_uncalibrated", False)),
-                        log_results=False,
-                        production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
-                    )
-                    for k, v in test_m.items():
-                        if k.startswith("test_") or k in ("test_neg_pos_ratio", "production_neg_pos_ratio_assumed"):
-                            row[k] = v
-                except Exception as exc:
-                    row["test_error"] = str(exc)
-            del _model
+                test_metrics = _compute_test_metrics(
+                    model,
+                    float(metrics["threshold"]),
+                    _to_float32_frame(X_test),
+                    y_test,
+                    label=f"rated_{backend}",
+                    _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+                    log_results=False,
+                    production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+                )
+                metrics.update(test_metrics)
+            metrics["feature_importance"] = _compute_feature_importance(model, feature_cols)
+            metrics["importance_method"] = "gain"
+            metrics["model_backend"] = backend
+            candidate_artifacts[backend] = {
+                "model": model,
+                "threshold": float(metrics["threshold"]),
+                "features": feature_cols,
+                "metrics": metrics,
+            }
+            rows[backend] = {
+                "backend": backend,
+                **{k: metrics[k] for k in metrics if k != "label"},
+                "label": f"rated_{backend}",
+            }
         except ImportError as exc:
-            row = {
-                "backend": name,
+            rows[backend] = {
+                "backend": backend,
                 "error": f"import_error:{exc}",
                 "bakeoff_disposition": "reject",
             }
-            rows[name] = row
-            logger.warning("A3 gbm_bakeoff: %s skipped (%s)", name, exc)
-            continue
+            logger.warning("A3 gbm_bakeoff: %s skipped (%s)", backend, exc)
         except Exception as exc:
-            row = {
-                "backend": name,
+            rows[backend] = {
+                "backend": backend,
                 "error": str(exc),
                 "bakeoff_disposition": "reject",
             }
-            rows[name] = row
-            logger.warning("A3 gbm_bakeoff: %s training failed: %s", name, exc)
-            continue
-        rows[name] = row
+            logger.warning("A3 gbm_bakeoff: %s training failed: %s", backend, exc)
 
     winner, rule = _pick_winner(rows)
     _assign_dispositions(rows, winner)
+    for backend, row in rows.items():
+        if backend in candidate_artifacts:
+            candidate_artifacts[backend]["metrics"]["bakeoff_disposition"] = row.get("bakeoff_disposition")
+            candidate_artifacts[backend]["metrics"]["model_backend"] = backend
 
     report: Dict[str, Any] = {
-        "schema_version": "a3_v1",
+        "schema_version": "a3_v2",
         "winner_backend": winner,
         "selection_rule": rule,
+        "selection_mode": "field_test",
         "per_backend": rows,
         "ensemble_bridge": {
             "same_splits": True,
+            "same_time_split": True,
+            "same_eval_script": True,
+            "same_sample_weight_vector": True,
             "train_rows": int(len(X_train)),
             "valid_rows": int(len(X_val)),
             "test_rows": int(len(y_test)) if y_test is not None else 0,
-            "feature_columns": list(X_train.columns),
+            "feature_columns": feature_cols,
             "note": (
                 "C3 stacking/blending: OOF exports and meta-learner training are not in A3 scope; "
                 "this block records aligned backends and metrics for a future ensemble step."
@@ -389,4 +517,7 @@ def run_rated_gbm_bakeoff(
         rows.get("catboost", {}).get("bakeoff_disposition"),
         rows.get("xgboost", {}).get("bakeoff_disposition"),
     )
-    return report
+    winner_artifact = candidate_artifacts[winner]
+    winner_artifact["metrics"]["gbm_bakeoff_winner_backend"] = winner
+    winner_artifact["metrics"]["model_backend"] = winner
+    return winner, winner_artifact, report
