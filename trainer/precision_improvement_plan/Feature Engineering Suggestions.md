@@ -222,3 +222,33 @@
 *建立日期：2026-04-22*  
 *術語：run / visit = 玩家連續下注流程（間隔 < 30 分鐘）；session = 玩家 × 桌台邊界（smart table 原始定義，本文件不使用）*  
 *範圍：補充建議，不取代 `features_candidates.yaml` SSOT*
+
+---
+
+## 專章：建議試作排序（僅限 `t_bet` / `t_session`，允許其衍生 `player_profile`）
+
+> 本章為 execution ranking 草案。  
+> 排序規則：先看是否可在既有資料契約下快速落地（不新增資料表，僅使用 `t_bet` / `t_session` 與其衍生 `player_profile`）；同層再按預估 uplift 排序。  
+> 重要範圍：本章**不**納入需 `t_game` 或其他新資料來源的候選。
+
+| 排名 | Feature family / feature_id | 主要來源 | 是否需新資料表 | 預估 uplift | 建議波次 | 排序理由（精簡） |
+|:---:|---|---|:---:|:---:|:---:|---|
+| 1 | A1 `net_win_in_run_so_far`、`net_win_per_bet_in_run` | `t_bet` | 否 | 🔴 高 | Wave 1 | 現有 run 特徵缺損益維度；最接近離場觸發訊號。 |
+| 2 | A2 `wager_slope_w10bets`、`wager_w5m_over_w15m` | `t_bet` | 否 | 🔴 高 | Wave 1 | 補齊注碼「方向性」，與既有水位/波動特徵互補。 |
+| 3 | A3 `consecutive_non_win_cnt`、`push_cnt_w15m`、`non_win_rate_w15m` | `t_bet` | 否 | 🟡 中高 | Wave 2 | 補 `loss_streak` 未涵蓋的 PUSH / 非 WIN 心理狀態。 |
+| 4 | A4/A5 personalized baseline（以既有 profile 欄位組合） | `t_bet` + `player_profile` | 否 | 🟡 中高 | Wave 2 | 不需新表且可快速試；可區分「今天異常」vs「此人常態」。 |
+| 5 | profile ratio：`turnover_per_bet_30d_over_180d`、`turnover_30d_over_180d`、`sessions_30d_over_180d` | `player_profile` | 否 | 🟡 中 | Wave 3 | 工程成本低、訊號穩定，適合作為第二層增量驗證。 |
+| 6 | A1 次級衍生：`run_loss_acceleration` | `t_bet` | 否 | 🟡 中 | Wave 3 | 有機會增量，但分母為 0 / 極值治理成本較高。 |
+| 7 | B2（`t_bet` 版）`table_turnover_w5m_over_w15m`、`patron_share_of_table_turnover_w15m` | `t_bet` | 否 | 🟡 中 | Wave 3 | 可行但跨玩家聚合較重，優先度低於玩家自身動態。 |
+
+### 波次建議（可直接搬到 delivery plan）
+
+1. **Wave 1（先求高機率 uplift）**：排名 1–2（A1 核心 + A2 方向性）。  
+2. **Wave 2（補心理狀態與個人化）**：排名 3–4（A3 + A4/A5）。  
+3. **Wave 3（補穩健比值與桌級互動）**：排名 5–7（profile ratio + A1 次級衍生 + B2 t_bet 版）。  
+
+### 契約與評估提醒（避免 ranking 偏差）
+
+- `run_loss_acceleration`、所有 ratio 類特徵需先固定分母為 0 契約（`NULL` / 0 / epsilon），且 trainer / scorer / backtester 一致。  
+- 本章排序只針對 rated patron 路徑；評估時需維持 rated-only 口徑，避免混入 non-rated 稀釋 uplift。  
+- table-level 候選（即使僅用 `t_bet`）仍可能帶來 runtime 成本上升，建議在 Wave 3 前先看離線耗時與記憶體監測。  

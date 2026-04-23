@@ -2400,7 +2400,42 @@ def process_chunk(
     # all anonymous (non-rated) players from training data.
     bets["canonical_id"] = bets["canonical_id"].fillna(bets["player_id"].astype(str))
 
-    # --- Track Human features (on FULL bets incl. history, cutoff=window_end) ---
+    # H3 routing contract: every canonical_id in mapping is rated; unrated rows should
+    # not enter heavy FE path (Track Human / Track LLM / labels / profile join).
+    rated_ids: set = (
+        set(canonical_map["canonical_id"].astype(str).unique())
+        if not canonical_map.empty and "canonical_id" in canonical_map.columns
+        else set()
+    )
+    bets["canonical_id"] = bets["canonical_id"].astype(str)
+    if rated_ids:
+        _n_before_rated_prune = len(bets)
+        bets = bets[bets["canonical_id"].isin(rated_ids)].copy()
+        _n_pruned = _n_before_rated_prune - len(bets)
+        if _n_pruned > 0:
+            logger.info(
+                "Chunk %s–%s: early-pruned %d unrated rows before heavy FE (rated_rows=%d)",
+                window_start.date(),
+                window_end.date(),
+                _n_pruned,
+                len(bets),
+            )
+    else:
+        logger.warning(
+            "Chunk %s–%s: canonical_map empty -> no rated rows; skip heavy FE",
+            window_start.date(),
+            window_end.date(),
+        )
+        return None
+    if bets.empty:
+        logger.warning(
+            "Chunk %s–%s: empty after rated-only early prune",
+            window_start.date(),
+            window_end.date(),
+        )
+        return None
+
+    # --- Track Human features (on rated-only bets incl. history, cutoff=window_end) ---
     # Computing before label filtering ensures cross-chunk state (loss_streak,
     # run_boundary) uses historical context from HISTORY_BUFFER_DAYS before window_start.
     # Always use SCORER_LOOKBACK_HOURS for train–serve parity (same window as scorer, default 8h).
@@ -2521,14 +2556,7 @@ def process_chunk(
             labeled[col] = 0
     labeled[_non_profile_cols] = labeled[_non_profile_cols].fillna(0)
 
-    # Mark rated/non-rated (H3: identity.build_canonical_mapping* only builds entries
-    # for players who have a valid casino_player_id, so every canonical_id in the
-    # mapping is by definition a rated player.  Checking for a non-existent
-    # "casino_player_id" column was always False and caused Rated model to receive
-    # zero training rows (R36).
-    rated_ids: set = (
-        set(canonical_map["canonical_id"].unique()) if not canonical_map.empty else set()
-    )
+    # Mark rated/non-rated for downstream schema parity.
     labeled["is_rated"] = labeled["canonical_id"].isin(rated_ids)
 
     _n_total_before_sample = len(labeled)

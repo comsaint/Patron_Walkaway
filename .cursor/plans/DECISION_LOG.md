@@ -1179,3 +1179,61 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 ---
 
 *本文件隨專案演進持續更新。新決策請沿用 `DEC-XXX` 編號格式。*
+
+---
+
+## DEC-047：Rated-only early-prune 邊界前移與 `table_hc` 新語義隔離
+
+**日期**：2026-04-23  
+**相關**：`.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md`；`ssot/trainer_plan_ssot.md` §3.3  
+**影響範圍**：`trainer/training/trainer.py`、`trainer/training/backtester.py`、`trainer/serving/scorer.py`
+
+**決策**：
+
+1. **rated-only boundary 前移**：identity attach 後，立即建立 `is_rated_obs`（或等價路由欄），不得延後到訓練前最後一步才切。  
+2. **non-rated 路徑限制**：non-rated 觀測只允許保留在 volume telemetry；不得進入正式 FE、labels、profile join、model scoring。  
+3. **三路徑一致**：trainer / backtester / scorer 的 early-prune 邊界必須一致，避免 train-backtest-serving parity 偏移。  
+4. **`table_hc` 語義隔離**：若未來採 rated-only 桌況特徵，視為**新語義特徵**（需新名稱、新文件契約），不得沿用舊 `table_hc` 名稱偷換語義。  
+5. **本輪範圍鎖定**：本輪只落地 early-prune 與 parity；不啟用 `table_hc` 主路徑、不引入 `t_game`。
+
+**理由**：
+
+- SSOT 明定 non-rated 不參與建模與推論，現況「先全量 FE 再切 rated」存在明顯時間與記憶體浪費。  
+- Track LLM / 大型 DataFrame merge 對 non-rated 全量處理會放大 RAM 峰值，對筆電環境有 OOM 風險。  
+- 先做 early-prune 可直接降低 heavy path 成本；同時避免把 `table_hc` 語義改造與本輪性能修正混為一談。
+
+**代價 / 風險**：
+
+- 需同步改三條路徑，否則 parity 破裂。  
+- 若切點放錯（特別是 label extended-zone），可能造成 label coverage 缺失。  
+- scorer telemetry 若仍隱含依賴 full FE 產物，需拆分以避免數值漂移。
+
+---
+
+## DEC-048：桌況人數特徵拆為雙語義（rated-only vs total-players）
+
+**日期**：2026-04-23  
+**相關**：`DEC-047`、`ssot/trainer_plan_ssot.md` §3.3（non-rated 不參與建模/推論）  
+**影響範圍**：後續 `table_hc` / `t_game` 相關特徵命名與文件契約
+
+**決策**：
+
+1. **禁止語義偷換**：不得把舊名 `table_hc` 直接改成「只算 rated 人數」。  
+2. **rated-only 桌況特徵命名**：若以 rated patrons 計算桌況，名稱統一為：
+   - `rated_table_hc_w{window}m`（例如 `rated_table_hc_w30m`）
+3. **total-players 桌況特徵命名**：若未來由 `t_game`（或等價來源）提供全體玩家數，名稱統一為：
+   - `table_total_players_w{window}m`（窗口型）
+   - 或 `table_total_players_current`（即時點值）
+4. **兩者必須並存可辨識**：artifact metadata / feature spec 必須明確標示來源與語義，不得共用同欄位名。  
+5. **本輪不接線**：本決策只凍結命名與契約；`table_hc` 正式接入仍屬後續實作工作。
+
+**理由**：
+
+- `rated_table_hc_*` 與 `table_total_players_*` 反映的是不同人口語義（刷卡客密度 vs 桌面總擁擠度），若共用欄位名會造成評估誤讀與回溯困難。  
+- DEC-047 已確認 non-rated 不應進主 FE/model path；桌況特徵若需保留 non-rated 訊號，應透過獨立 total-players 特徵表示，而非破壞 rated-only 主路徑契約。  
+- 明確命名可避免後續 A/B 比較把不同資料來源誤當同一特徵。
+
+**代價 / 影響**：
+
+- 需要更新 feature spec、reason code map、報表欄位與模型 metadata 的命名對照。  
+- 若兩類特徵同時啟用，需在 screening 階段注意高度相關欄位共線性與成本控制。

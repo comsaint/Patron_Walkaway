@@ -2144,10 +2144,22 @@ def score_once(
 
     # ── Features on narrowed incremental window (Phase 3) ──────────────────
     bets_for_features = _select_incremental_bets_window(bets, new_bets, canonical_map)
+    # C2: formal FE path should process rated observations only.
+    rated_player_ids: set = (
+        set(canonical_map["player_id"].dropna().astype(str).tolist())
+        if not canonical_map.empty and "player_id" in canonical_map.columns
+        else set()
+    )
+    if rated_player_ids:
+        bets_for_features = bets_for_features[
+            bets_for_features["player_id"].astype(str).isin(rated_player_ids)
+        ].copy()
+    else:
+        bets_for_features = bets_for_features.iloc[0:0].copy()
     features_all = build_features_for_scoring(bets_for_features, sessions, canonical_map, now_hk)
 
-    # Unified Plan v2 (T1): UNRATED_VOLUME_LOG counts must use full features_all ∩ new_bets
-    # *before* rated-only slice — otherwise unrated new rows disappear and telemetry lies.
+    # Unified Plan v2 (T1): non-rated telemetry should come from raw new_bets + identity
+    # routing (not features_all) so telemetry does not depend on full FE output.
     new_bet_ids_all = set(new_bets["bet_id"].astype(str))
     new_ids = new_bet_ids_all
     _csw = getattr(config, "SCORER_COLD_START_WINDOW_HOURS", None)
@@ -2173,14 +2185,25 @@ def score_once(
             "[scorer] Payout-age cap configured but payout_complete_dtm missing from new_bets; skipping age filter"
         )
     n_features_full_pre_rated_slice = len(features_all)
-    _telemetry_new = features_all[features_all["bet_id"].astype(str).isin(new_bet_ids_all)]
-    _tel_is_rated = _telemetry_new["canonical_id"].isin(rated_canonical_ids)
+    _telemetry_new_from_bets = new_bets[["bet_id", "player_id"]].copy()
+    if not canonical_map.empty and {"player_id", "canonical_id"}.issubset(canonical_map.columns):
+        _telemetry_new_from_bets = _telemetry_new_from_bets.merge(
+            canonical_map[["player_id", "canonical_id"]].drop_duplicates("player_id"),
+            on="player_id",
+            how="left",
+        )
+    else:
+        _telemetry_new_from_bets["canonical_id"] = _telemetry_new_from_bets["player_id"].astype(str)
+    _telemetry_new_from_bets["canonical_id"] = _telemetry_new_from_bets["canonical_id"].fillna(
+        _telemetry_new_from_bets["player_id"].astype(str)
+    ).astype(str)
+    _tel_is_rated = _telemetry_new_from_bets["canonical_id"].isin(rated_canonical_ids)
     _tel_is_rated = _tel_is_rated.fillna(False).astype(bool)
     n_rated_new_bets_pre_slice = int(_tel_is_rated.sum())
-    n_unrated_new_bets_pre_slice = int(len(_telemetry_new) - n_rated_new_bets_pre_slice)
+    n_unrated_new_bets_pre_slice = int(len(_telemetry_new_from_bets) - n_rated_new_bets_pre_slice)
     unrated_players_new_bets_pre_slice = (
         int(
-            _telemetry_new.loc[~_tel_is_rated, "player_id"]
+            _telemetry_new_from_bets.loc[~_tel_is_rated, "player_id"]
             .dropna()
             .astype(str)
             .nunique()

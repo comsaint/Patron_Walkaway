@@ -875,6 +875,18 @@ def backtest(
     else:
         bets["canonical_id"] = bets["player_id"].astype(str)
     bets["canonical_id"] = bets["canonical_id"].fillna(bets["player_id"].astype(str))
+    bets["canonical_id"] = bets["canonical_id"].astype(str)
+
+    # Early rated-only prune for train-backtest parity with trainer heavy FE path.
+    rated_canonical_ids: set = (
+        set(canonical_map["canonical_id"].astype(str).unique())
+        if not canonical_map.empty and "canonical_id" in canonical_map.columns
+        else set()
+    )
+    is_rated_mask = bets["canonical_id"].isin(rated_canonical_ids)
+    bets = bets[is_rated_mask].copy()
+    if bets.empty:
+        return {"error": "No rated rows after early prune", **_run_contract}
 
     # --- Track-B features (same lookback as trainer/scorer for parity) ---
     bets = add_track_human_features(bets, canonical_map, window_end, lookback_hours=SCORER_LOOKBACK_HOURS)
@@ -980,9 +992,9 @@ def backtest(
     # canonical_map only contains entries for players with a valid casino_player_id,
     # so every canonical_id in the mapping is a rated player (R36 fix).
     rated_ids: set = (
-        set(canonical_map["canonical_id"].unique()) if not canonical_map.empty else set()
+        set(canonical_map["canonical_id"].astype(str).unique()) if not canonical_map.empty else set()
     )
-    labeled["is_rated"] = labeled["canonical_id"].isin(rated_ids)
+    labeled["is_rated"] = labeled["canonical_id"].astype(str).isin(rated_ids)
 
     # --- Exclude unrated before model (PLAN: 取得 bet 後排除 unrated 再送模型) ---
     n_rated_orig = int(labeled["is_rated"].sum())

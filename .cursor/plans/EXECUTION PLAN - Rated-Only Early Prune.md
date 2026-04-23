@@ -103,36 +103,36 @@
 
 | 狀態 | 任務 | 子任務 | Owner | 依賴 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **⬜** | `A1 rated-only boundary freeze` | 1. 明確定義 `is_rated_obs` / 等價布林欄位的生成位置。 2. 定義 trainer / backtester / scorer 各自的 early-prune 切點。 3. 明確列出 non-rated 允許保留的唯一用途（volume telemetry）。 | `DS/Eng owner` | 現有程式路徑盤點 | 邊界定義摘要、需修改函式清單 | 三條主路徑的切點位置與 non-rated 允許行為皆明確，無待定語義 |
-| **⬜** | `A2 decision bookkeeping` | 1. 將「`table_hc` rated-only 視為新語義特徵」記為待補 decision。 2. 明確標註其不屬於本輪交付範圍。 | `DS/Eng owner` | `A1` | decision note 或待辦條目 | 後續 coding 不會誤把 `table_hc` 當成本輪一起落地 |
+| **✅** | `A1 rated-only boundary freeze` | 1. 明確定義 `is_rated_obs` / 等價布林欄位的生成位置。 2. 定義 trainer / backtester / scorer 各自的 early-prune 切點。 3. 明確列出 non-rated 允許保留的唯一用途（volume telemetry）。 | `DS/Eng owner` | 現有程式路徑盤點 | 邊界定義摘要、需修改函式清單 | 三條主路徑的切點位置與 non-rated 允許行為皆明確，無待定語義 |
+| **✅** | `A2 decision bookkeeping` | 1. 將「`table_hc` rated-only 視為新語義特徵」記為待補 decision。 2. 明確標註其不屬於本輪交付範圍。 | `DS/Eng owner` | `A1` | decision note 或待辦條目 | 後續 coding 不會誤把 `table_hc` 當成本輪一起落地 |
 
 ### 4.2 Batch B：Trainer / Backtester 主路徑調整（P0）
 
 | 狀態 | 任務 | 子任務 | Owner | 依賴 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **⬜** | `B1 trainer early prune` | 1. attach `canonical_id` 後立刻標示 rated rows。 2. 僅保留 rated rows 進入 Track Human / Track LLM / labels / profile join。 3. 檢查 chunk cache / prefeatures cache key 是否需納入新邊界契約。 4. 更新 log / telemetry，清楚記錄被 early-prune 的 non-rated row 數。 | `Eng owner` | `A1` | trainer 主路徑補丁 | non-rated 不再進入 trainer heavy FE path，且 cache / log 契約無歧義 |
-| **⬜** | `B2 backtester parity` | 1. 同步套用與 trainer 相同的 early-prune 邊界。 2. 確保回測 labels / profile / score 口徑一致。 3. 補齊必要的 debug log。 | `Eng owner` | `B1` | backtester 主路徑補丁 | backtester 與 trainer 在 rated-only boundary 上一致，無額外 full-data FE 殘留 |
+| **✅** | `B1 trainer early prune` | 1. attach `canonical_id` 後立刻標示 rated rows。 2. 僅保留 rated rows 進入 Track Human / Track LLM / labels / profile join。 3. 檢查 chunk cache / prefeatures cache key 是否需納入新邊界契約。 4. 更新 log / telemetry，清楚記錄被 early-prune 的 non-rated row 數。 | `Eng owner` | `A1` | trainer 主路徑補丁 | non-rated 不再進入 trainer heavy FE path，且 cache / log 契約無歧義 |
+| **✅** | `B2 backtester parity` | 1. 同步套用與 trainer 相同的 early-prune 邊界。 2. 確保回測 labels / profile / score 口徑一致。 3. 補齊必要的 debug log。 | `Eng owner` | `B1` | backtester 主路徑補丁 | backtester 與 trainer 在 rated-only boundary 上一致，無額外 full-data FE 殘留 |
 
 ### 4.3 Batch C：Scorer 路徑拆分（P0）
 
 | 狀態 | 任務 | 子任務 | Owner | 依賴 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **⬜** | `C1 scorer telemetry split` | 1. 將 non-rated volume telemetry 從正式 FE path 中拆出。 2. 確認 telemetry 不再依賴 `features_all` 的 full FE 結果。 3. 保持既有 volume log 指標意義可追蹤。 | `Eng owner` | `A1` | scorer telemetry 補丁 | non-rated volume 統計可保留，但不需先跑完整 FE |
-| **⬜** | `C2 scorer rated-only FE path` | 1. 僅將 rated bets 丟入 `build_features_for_scoring()` 或等價正式 FE path。 2. 保持 Track LLM / profile join / scoring 僅對 rated rows 生效。 3. 更新 log，明確分開 telemetry rows 與 scored rows。 | `Eng owner` | `C1` | scorer 主路徑補丁 | scorer 真正符合「non-rated 不呼叫模型、不做正式 FE」 |
+| **✅** | `C1 scorer telemetry split` | 1. 將 non-rated volume telemetry 從正式 FE path 中拆出。 2. 確認 telemetry 不再依賴 `features_all` 的 full FE 結果。 3. 保持既有 volume log 指標意義可追蹤。 | `Eng owner` | `A1` | scorer telemetry 補丁 | non-rated volume 統計可保留，但不需先跑完整 FE |
+| **✅** | `C2 scorer rated-only FE path` | 1. 僅將 rated bets 丟入 `build_features_for_scoring()` 或等價正式 FE path。 2. 保持 Track LLM / profile join / scoring 僅對 rated rows生效。 3. 更新 log，明確分開 telemetry rows 與 scored rows。 | `Eng owner` | `C1` | scorer 主路徑補丁 | scorer 真正符合「non-rated 不呼叫模型、不做正式 FE」 |
 
 ### 4.4 Batch D：測試與證據（P0）
 
 | 狀態 | 任務 | 子任務 | Owner | 依賴 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **⬜** | `D1 trainer/backtester parity tests` | 1. 增加或更新測試，確認 early-prune 發生在 heavy FE 前。 2. 驗證 trainer / backtester 對 mixed rated/unrated 輸入的輸出 row 集合一致。 | `Eng owner` | `B1`,`B2` | 單元/契約測試 | 測試能抓到「non-rated 混入 FE」的回歸 |
-| **⬜** | `D2 scorer behavior tests` | 1. 驗證 non-rated 不進正式 FE / model path。 2. 驗證 rated rows 正常進 score。 3. 驗證 telemetry 仍保有 non-rated volume 計數。 | `Eng owner` | `C1`,`C2` | 單元/契約測試 | scorer 路徑拆分有測試保護 |
-| **⬜** | `D3 runtime evidence` | 1. 以至少一組代表性資料窗比較變更前後的 row counts / runtime / memory signals。 2. 將結果記錄到 `STATUS.md`。 | `DS/Eng owner` | `B1`,`B2`,`C2` | before/after evidence、狀態紀錄 | 能說明此變更確實降低 FE 成本，非純結構重排 |
+| **✅** | `D1 trainer/backtester parity tests` | 1. 增加或更新測試，確認 early-prune 發生在 heavy FE 前。 2. 驗證 trainer / backtester 對 mixed rated/unrated 輸入的輸出 row 集合一致。 | `Eng owner` | `B1`,`B2` | 單元/契約測試 | 測試能抓到「non-rated 混入 FE」的回歸 |
+| **✅** | `D2 scorer behavior tests` | 1. 驗證 non-rated 不進正式 FE / model path。 2. 驗證 rated rows 正常進 score。 3. 驗證 telemetry 仍保有 non-rated volume 計數。 | `Eng owner` | `C1`,`C2` | 單元/契約測試 | scorer 路徑拆分有測試保護 |
+| **✅** | `D3 runtime evidence` | 1. 以至少一組代表性資料窗比較變更前後的 row counts / runtime / memory signals。 2. 將結果記錄到 `STATUS.md`。 | `DS/Eng owner` | `B1`,`B2`,`C2` | before/after evidence、狀態紀錄 | 能說明此變更確實降低 FE 成本，非純結構重排 |
 
 ### 4.5 Batch E：`table_hc` 後續銜接（P1，非本輪實作）
 
 | 狀態 | 任務 | 子任務 | Owner | 依賴 | 輸出 | DoD |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **⬜** | `E1 new-semantic feature design` | 1. 若未來啟用 rated-only 桌況特徵，重新命名（如 `rated_table_hc_*`）。 2. 與未來 `t_game` 的 total-player 特徵分離。 3. 明確文件化新語義與 non-goal。 | `DS owner` | 本輪 early-prune 完成 | decision / implementation input | `table_hc` 不會以舊名偷換語義進主路徑 |
+| **✅** | `E1 new-semantic feature design` | 1. 若未來啟用 rated-only 桌況特徵，重新命名（如 `rated_table_hc_*`）。 2. 與未來 `t_game` 的 total-player 特徵分離。 3. 明確文件化新語義與 non-goal。 | `DS owner` | 本輪 early-prune 完成 | decision / implementation input | `table_hc` 不會以舊名偷換語義進主路徑 |
 
 ---
 
@@ -145,6 +145,28 @@
 5. `D1` + `D2`：補測試，鎖住回歸風險。
 6. `D3`：最後補 before/after 證據。
 7. `E1`：不阻擋本輪 coding，只作為下一輪新語義特徵入口。
+
+### 5.1 A1 Freeze 輸出（已凍結）
+
+- **共同規則**
+  - `canonical_map["canonical_id"]` 視為 rated 母體。
+  - `is_rated_obs`（或等價欄）在 identity attach 後立即可計算，禁止延後到 model train 前才切。
+  - non-rated 唯一允許保留用途：**volume telemetry**；不得進入正式 FE / label / scoring 路徑。
+
+- **Trainer（`trainer/training/trainer.py`）**
+  - 切點：attach `canonical_id` 並完成 fallback 後、`add_track_human_features` 之前。
+  - heavy path：`add_track_human_features`、`compute_track_llm_features`、`compute_labels`、`join_player_profile` 僅接受 rated rows（含其必要 history / extended-zone rows）。
+
+- **Backtester（`trainer/training/backtester.py`）**
+  - 切點：與 trainer 對齊（identity 後、heavy FE 前）。
+  - heavy path：Track Human、Track LLM、labels、profile join 均以 rated rows 為主，避免 train-backtest parity 偏移。
+
+- **Scorer（`trainer/serving/scorer.py`）**
+  - 切點：正式 FE path 應在入口即轉為 rated-only；non-rated telemetry path 獨立。
+  - heavy path：`build_features_for_scoring` / Track LLM / profile join / `_score_df` 只處理 rated rows。
+
+- **非本輪範圍**
+  - `table_hc` 不接線；若未來採 rated-only 桌況特徵，需以新名稱／新語義處理（見 `DEC-047`）。
 
 ---
 

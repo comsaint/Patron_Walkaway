@@ -1,5 +1,284 @@
 **Archive**: Past rounds and older STATUS blocks are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60, 67 Review–75 moved 2026-03-05; Rounds 79–99 moved 2026-03-05; Round 96 onward moved 2026-03-12; **2026-03-22**: Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等長段 → archive.)
 
+## Rated-Only Early Prune — `/cycle_code` STEP 1（A1/A2，2026-04-23）
+
+對照計畫：`.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md`（本輪 `PLAN.md`）。
+
+### STEP 1 — Builder
+
+**本輪只做 1–2 步（A1 + A2）**
+
+1. **A1 rated-only boundary freeze（✅）**  
+   - 在計畫檔補上可執行的切點契約：trainer / backtester / scorer 各自的 early-prune 位置、heavy path 限制、non-rated 僅可用於 telemetry。
+2. **A2 decision bookkeeping（✅）**  
+   - 補登 `DEC-047`：明確凍結「early-prune 前移」與「`table_hc` rated-only 屬新語義特徵、不可沿用舊名」。
+
+| 檔案 | 變更 |
+|------|------|
+| `.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md` | A1/A2 狀態改為 ✅；新增 `5.1 A1 Freeze 輸出（已凍結）`，列出三條主路徑切點與 non-rated 邊界。 |
+| `.cursor/plans/DECISION_LOG.md` | 新增 **DEC-047**（rated-only boundary 前移、table_hc 新語義隔離、本輪範圍鎖定）。 |
+
+**手動驗證**
+
+1. 開啟 `.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md`，確認 `4.1 Batch A` 兩列為 **✅**。  
+2. 確認 `5.1 A1 Freeze 輸出（已凍結）` 存在且含 trainer/backtester/scorer 三路徑切點。  
+3. 開啟 `.cursor/plans/DECISION_LOG.md`，確認新增 `DEC-047` 且內容包含：
+   - early-prune 前移；
+   - non-rated 僅 telemetry；
+   - table_hc rated-only 視為新語義特徵；
+   - 本輪不接 `table_hc` / 不引 `t_game`。
+
+**下一步建議**
+
+1. 進入 STEP 2（Reviewer）：先針對 A1 契約做風險盤點，聚焦 label coverage、cache key、scorer telemetry 依賴。  
+2. STEP 3 再把風險轉成最小測試；STEP 4 最後改 production code（先做 Slice 1：trainer/backtester）。
+
+✅ STEP 1 完成
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明與建議 | 希望新增測試 |
+|------|------------|--------------|
+| **R1：label coverage（extended-zone）被過早裁切** | 若在 `compute_labels` 前把 rated rows 以外的必要延伸列一併裁掉，會讓 terminal bet 的 censoring 判斷偏移。建議：切點後保留 rated patron 所需 `history + extended_end` 列，再進 labels。 | 建立 mixed rated/unrated fixture，assert early-prune 後 `compute_labels` 結果（`label` / `censored`）與 reference 寫法一致。 |
+| **R2：chunk/prefeatures cache 汙染** | trainer 目前有 chunk cache 與 prefeatures cache；若 key 未含新邊界契約，可能重用「舊版全量 FE」產物。建議：將 boundary version 或 rated filter 開關納入 key components。 | 單元測試：同一 chunk 在 boundary version 變更時，cache key 必須改變。 |
+| **R3：scorer telemetry 仍依賴 full FE** | 現況 non-rated volume 統計來源仍可能依賴 `features_all`。若拆分不完整，會出現數字漂移或重複統計。建議：先定義 telemetry datasource（`new_bets + canonical_map`），再拆 FE path。 | 測試 scorer 在有 non-rated 新注單時：telemetry 計數存在，但 `_score_df` 僅收到 rated rows。 |
+| **R4：trainer/backtester 切點不一致** | 只改 trainer 不改 backtester，會讓離線對標失真。建議：兩者沿用同一 helper 或同一切點規則，先做 B1+B2 再宣告完成。 | 契約測試：同一輸入資料下 trainer/backtester 的 heavy-path rated row 集合一致。 |
+| **R5：`is_rated_obs` 欄位命名/語意分裂** | 目前有 `is_rated`（feature row）與 `is_rated_obs`（prediction log）兩套欄位；若新增路由欄未統一，後續維護風險高。建議：保留既有輸出欄位，但在內部路由層固定一個 canonical 名稱並加註解。 | 單元測試：內部路由欄位存在時，輸出欄位仍維持既有 schema。 |
+
+✅ STEP 2 完成
+
+### STEP 3 — Tester（寫測試）
+
+**新增 tests（僅 tests，未改 production）**
+
+| 檔案 | 測試重點 |
+|------|----------|
+| `tests/review_risks/test_review_risks_round411_rated_early_prune.py` | R411 #1：trainer `process_chunk` 應在 Track Human 前建立 rated-only 路由；R411 #2：backtester `backtest` 應在 Track Human 前做 rated-only prune；R411 #3：scorer telemetry 不應依賴 `features_all` full FE output。 |
+
+**執行方式**
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_round411_rated_early_prune.py -q
+```
+
+**本輪結果**
+
+- `3 failed`（符合目前程式現況，作為 STEP 4 修實作目標）：
+  - trainer 尚未在 `add_track_human_features` 前建立 rated-only 路由；
+  - backtester 尚未在 `add_track_human_features` 前做 rated-only prune；
+  - scorer telemetry 目前仍由 `features_all` 來源計數。
+
+✅ STEP 3 完成
+
+### STEP 4 — Tester（修實作）
+
+**production 變更（依 STEP 3 failing tests 修正）**
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/training/trainer.py` | 在 `process_chunk` identity attach 後新增 `rated_ids` 路由與 early-prune；unrated rows 不再進入 Track Human / Track LLM / labels heavy path；無 rated rows 時直接返回。 |
+| `trainer/training/backtester.py` | 在 `backtest` identity 後新增 `is_rated_mask` early-prune；並修正 `labeled["is_rated"]` 的型別一致性（`canonical_id` 一律以 `str` 比對）。 |
+| `trainer/serving/scorer.py` | non-rated telemetry 計數來源改為 `new_bets + canonical_map`，移除對 `features_all` full FE output 的依賴。 |
+| `.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md` | 更新任務狀態：`B1`、`B2`、`C1` → ✅。 |
+
+**測試結果**
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_round411_rated_early_prune.py -q
+python -m pytest tests/review_risks/test_review_risks_round411_rated_early_prune.py tests/review_risks/test_review_risks_round222_train_serve_parity.py tests/review_risks/test_review_risks_round404_code_review.py -q
+```
+
+- 結果：`14 passed`
+- `ReadLints`：本輪修改檔案無新增 lint 問題。
+
+**Plan item 狀態更新（Rated-Only Early Prune）**
+
+- `A1` ✅（已完成）
+- `A2` ✅（已完成）
+- `B1` ✅（本輪完成）
+- `B2` ✅（本輪完成）
+- `C1` ✅（本輪完成）
+- `C2` ⬜（尚未完成）
+- `D1` ⬜（尚未完成）
+- `D2` ⬜（尚未完成）
+- `D3` ⬜（尚未完成）
+- `E1` ⬜（非本輪）
+
+**下一步建議（按優先序）**
+
+1. `C2 scorer rated-only FE path`：將 `build_features_for_scoring()` 的輸入改為 rated-only，完成「non-rated 不做正式 FE」最後一哩。  
+2. `D1 + D2`：補行為測試（非僅 source-contract），驗證 trainer/backtester/scorer 在 mixed rated/unrated 下 row-level 行為一致。  
+3. `D3`：跑一組代表性資料窗，補 before/after row-count、runtime、memory 證據到 `STATUS.md`。
+
+✅ 全部完成，CYCLE 結束
+
+## Rated-Only Early Prune — continue（C2 scorer rated-only FE path，2026-04-23）
+
+對照計畫：`.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md`
+
+**本輪完成**
+
+1. 完成 `C2 scorer rated-only FE path`：正式 FE 入口 `bets_for_features` 在 `score_once` 內先以 `rated_player_ids` 過濾後，才呼叫 `build_features_for_scoring()`。  
+2. 補一個對應的 review-risk 契約測試（R411 #4），鎖住 scorer 在 formal FE 前的 rated-only 過濾行為。
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/serving/scorer.py` | 新增 `rated_player_ids` 路由集合；`bets_for_features` 先過濾 `player_id`（string-typed 比對）再進 formal FE；無 rated player 時 formal FE 輸入為空。 |
+| `tests/review_risks/test_review_risks_round411_rated_early_prune.py` | 新增 `test_score_once_should_filter_bets_for_features_to_rated_before_formal_fe`。 |
+| `.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md` | `C2` 狀態更新為 ✅。 |
+
+**驗證**
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_round411_rated_early_prune.py tests/review_risks/test_review_risks_round222_train_serve_parity.py tests/review_risks/test_review_risks_round404_code_review.py -q
+```
+
+- 結果：`15 passed`
+- `ReadLints`：本輪修改檔案無新增 lint 問題。
+
+**目前 plan 狀態（摘要）**
+
+- `A1` ✅
+- `A2` ✅
+- `B1` ✅
+- `B2` ✅
+- `C1` ✅
+- `C2` ✅
+- `D1` ⬜
+- `D2` ⬜
+- `D3` ⬜
+- `E1` ⬜
+
+**下一步建議**
+
+1. 做 `D1`：補 trainer/backtester 的 behavior-level parity 測試（不只 source-contract）。  
+2. 做 `D2`：補 scorer 行為測試（mock `_score_df` 驗證 non-rated 完全不進 formal FE/model path）。  
+3. 做 `D3`：跑一組代表窗的 before/after row-count + runtime + memory 證據。
+
+## Rated-Only Early Prune — continue（D1/D2 behavior tests，2026-04-23）
+
+對照計畫：`.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md`
+
+**本輪完成**
+
+1. 完成 `D1 trainer/backtester parity tests`（behavior-level）。  
+2. 完成 `D2 scorer behavior tests`（behavior-level）。  
+3. 將對應 plan 狀態更新為 `D1 ✅`、`D2 ✅`。
+
+| 檔案 | 變更 |
+|------|------|
+| `tests/review_risks/test_review_risks_round412_rated_early_prune_behavior.py` | 新增行為測試：`process_chunk` heavy FE 僅吃 rated rows；`backtest` heavy FE 僅吃 rated rows；`score_once` formal FE 與 `_score_df` 輸入皆僅 rated rows。 |
+| `.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md` | `D1`、`D2` 狀態更新為 ✅。 |
+
+**驗證**
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_round412_rated_early_prune_behavior.py tests/review_risks/test_review_risks_round411_rated_early_prune.py tests/review_risks/test_review_risks_round222_train_serve_parity.py tests/review_risks/test_review_risks_round404_code_review.py -q
+```
+
+- 結果：`18 passed`
+- `ReadLints`：新增測試檔無 lint 問題。
+
+**目前 plan 狀態（摘要）**
+
+- `A1` ✅
+- `A2` ✅
+- `B1` ✅
+- `B2` ✅
+- `C1` ✅
+- `C2` ✅
+- `D1` ✅
+- `D2` ✅
+- `D3` ⬜
+- `E1` ⬜
+
+**下一步建議**
+
+1. 做 `D3 runtime evidence`：跑至少一個代表視窗，記錄 before/after 的 rated/unrated rows、FE 耗時、記憶體訊號。  
+2. 若 `D3` 證據完備，將本計畫主目標結案，`E1` 保留為下一輪新語義特徵設計入口。
+
+## Rated-Only Early Prune — continue（D3 tiny runtime evidence，2026-04-23）
+
+對照計畫：`.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md`
+
+**資源限制說明（本輪採低資源策略）**
+
+- 嘗試以 `python -m trainer.trainer --use-local-parquet --recent-chunks 1 --skip-optuna` 取得實窗證據時，環境顯示可用記憶體約 **0.5 GB**，並在 profile/backfill 階段造成極高風險（先前也發生過 OOM）。  
+- 為避免再次壓垮筆電，本輪改採 **tiny synthetic evidence**（兩列資料、全 mock heavy I/O），僅驗證 row-count 收斂與輕量耗時，不再跑全量 parquet/backfill。
+
+**本輪完成**
+
+1. 完成 `D3 runtime evidence`（tiny-data 版本）。  
+2. 新增最小證據測試：`tests/review_risks/test_review_risks_round413_runtime_evidence_tiny.py`。
+
+| 檔案 | 變更 |
+|------|------|
+| `tests/review_risks/test_review_risks_round413_runtime_evidence_tiny.py` | 兩組 tiny 證據：Trainer heavy path 列數由 baseline 2 列收斂到 1 列（rated only），且 tiny chunk 執行時間 < 5s；Scorer formal FE 輸入列數由 2 列收斂到 1 列。 |
+| `.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md` | `D3` 狀態更新為 ✅。 |
+
+**驗證**
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_round413_runtime_evidence_tiny.py tests/review_risks/test_review_risks_round412_rated_early_prune_behavior.py tests/review_risks/test_review_risks_round411_rated_early_prune.py -q
+```
+
+- 結果：`9 passed`
+- `ReadLints`：新增測試檔無 lint 問題。
+
+**目前 plan 狀態（摘要）**
+
+- `A1` ✅
+- `A2` ✅
+- `B1` ✅
+- `B2` ✅
+- `C1` ✅
+- `C2` ✅
+- `D1` ✅
+- `D2` ✅
+- `D3` ✅
+- `E1` ⬜
+
+**下一步建議**
+
+1. 目前 early-prune 主目標已完成，可將此執行計畫主體結案。  
+2. 下一輪進 `E1`：定義 `table_hc` 新語義特徵命名與契約（rated-only vs future `t_game` total players 分離）。
+
+## Rated-Only Early Prune — continue（E1 new-semantic feature design，2026-04-23）
+
+對照計畫：`.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md`
+
+**本輪完成**
+
+1. 完成 `E1 new-semantic feature design`。  
+2. 補登 `DEC-048`，凍結桌況人數特徵雙語義命名契約（rated-only 與 total-players 分離）。
+
+| 檔案 | 變更 |
+|------|------|
+| `.cursor/plans/DECISION_LOG.md` | 新增 **DEC-048**：禁止沿用 `table_hc` 偷換語義；凍結 `rated_table_hc_w{window}m` 與 `table_total_players_*` 命名規則；本輪不接線。 |
+| `.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md` | `E1` 狀態更新為 ✅。 |
+
+**目前 plan 狀態（最終）**
+
+- `A1` ✅
+- `A2` ✅
+- `B1` ✅
+- `B2` ✅
+- `C1` ✅
+- `C2` ✅
+- `D1` ✅
+- `D2` ✅
+- `D3` ✅
+- `E1` ✅
+
+**結論**
+
+- `Rated-Only Early Prune` 執行計畫已完成，可結案。
+
+**下一步建議（新計畫）**
+
+1. 建立下一份 implementation/working plan：`rated_table_hc_*` 與 `table_total_players_*` 的接線順序、feature spec 變更、成本評估。  
+2. 若要啟用桌況特徵，優先做最小 slice（單一窗口 + 單一路徑）並保留可回退開關，避免一次引入多源資料與高成本風險。
+
 ## Precision Uplift — `/cycle_code` A2（R2 ranking recipe weights，2026-04-23）
 
 對照計畫：`trainer/precision_improvement_plan/PRECISION_UPLIFT_DELIVERY_PLAN.md` §A2；決策脈絡見 `.cursor/plans/DECISION_LOG.md`（**DEC-013**：run-level 基礎權重；**DEC-044**：預設 recipe 與 artifact 審計）。
