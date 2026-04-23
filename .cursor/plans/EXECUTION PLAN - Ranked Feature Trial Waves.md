@@ -44,8 +44,8 @@
 3. 已補基礎防回歸測試（spec 層），避免 run-boundary `input_columns` 再次漏 `wager`。
 
 進行中（In Progress）：
-1. Wave 1 第一輪 screening 與 ablation（尚未產出正式 uplift 結果）。
-2. runtime / memory 成本量測與門檻對照（尚待寫入正式紀錄）。
+1. Wave 1 實作後契約一致性驗證與防回歸測試（已完成，待彙整成 screening 輸入基線）。
+2. runtime / memory 成本量測門檻定義與對照格式整理（尚待寫入正式紀錄）。
 
 下一步（Next）：
 1. 以目前 baseline 執行 Wave 1 screening（rated-only）。
