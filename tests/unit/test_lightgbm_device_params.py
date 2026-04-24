@@ -26,6 +26,35 @@ class TestLgbParamsForPipeline(unittest.TestCase):
         self.assertNotIn("force_col_wise", p)
         self.assertGreaterEqual(int(p.get("n_jobs", 0)), 1)
 
+    def test_backend_runtime_params_for_gpu_backends(self) -> None:
+        cat_params = tr.backend_runtime_params_for_backend(
+            "catboost",
+            device_mode="gpu",
+            gpu_id="1",
+        )
+        xgb_params = tr.backend_runtime_params_for_backend(
+            "xgboost",
+            device_mode="gpu",
+            gpu_id="2",
+        )
+        self.assertEqual(cat_params["task_type"], "GPU")
+        self.assertEqual(cat_params["devices"], "1")
+        self.assertEqual(xgb_params["device"], "cuda:2")
+        self.assertEqual(xgb_params["tree_method"], "hist")
+
+    def test_resolve_gbm_backend_runtime_plan_parallelizes_when_multiple_gpus_visible(self) -> None:
+        with unittest.mock.patch.object(tr, "GBM_BACKENDS_DEVICE_MODE", "auto"), unittest.mock.patch.object(
+            tr,
+            "GBM_BAKEOFF_MAX_PARALLEL_BACKENDS",
+            0,
+        ), unittest.mock.patch.object(tr, "discover_visible_gpu_ids", return_value=["0", "1"]):
+            plan = tr.resolve_gbm_backend_runtime_plan()
+        self.assertEqual(plan["effective_backend_device_mode"], "gpu")
+        self.assertEqual(plan["parallel_backend_workers"], 2)
+        self.assertTrue(plan["parallel_backend_execution"])
+        self.assertEqual(plan["gpu_assignments"]["catboost"], "0")
+        self.assertEqual(plan["gpu_assignments"]["xgboost"], "1")
+
 
 if __name__ == "__main__":
     unittest.main()

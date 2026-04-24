@@ -376,3 +376,80 @@ def test_backend_optuna_params_include_fair_imbalance_and_catboost_search_dims()
     )
     assert cat_defaults["class_weights"] == [1.0, pytest.approx(1.5)]
     assert xgb_defaults["scale_pos_weight"] == pytest.approx(1.5)
+
+
+def test_resolve_gbm_backend_runtime_plan_cpu_only() -> None:
+    with (
+        patch.object(trainer_mod, "TRAINER_GPU_IDS", None),
+        patch.object(trainer_mod, "GBM_BACKENDS_DEVICE_MODE", "auto"),
+        patch.object(trainer_mod, "GBM_BAKEOFF_MAX_PARALLEL_BACKENDS", 0),
+        patch("trainer.training.trainer.subprocess.run", side_effect=FileNotFoundError()),
+    ):
+        plan = trainer_mod.resolve_gbm_backend_runtime_plan()
+
+    assert plan["requested_backend_device_mode"] == "auto"
+    assert plan["effective_backend_device_mode"] == "cpu"
+    assert plan["visible_gpu_ids"] == []
+    assert plan["parallel_backend_execution"] is False
+    assert plan["parallel_backend_workers"] == 1
+    assert plan["backend_runtime_by_name"]["catboost"]["task_type"] == "CPU"
+    assert plan["backend_runtime_by_name"]["xgboost"]["device"] == "cpu"
+
+
+def test_resolve_gbm_backend_runtime_plan_multi_gpu_parallelizes_backends() -> None:
+    with (
+        patch.object(trainer_mod, "TRAINER_GPU_IDS", "2,5"),
+        patch.object(trainer_mod, "GBM_BACKENDS_DEVICE_MODE", "auto"),
+        patch.object(trainer_mod, "GBM_BAKEOFF_MAX_PARALLEL_BACKENDS", 0),
+    ):
+        plan = trainer_mod.resolve_gbm_backend_runtime_plan()
+
+    assert plan["effective_backend_device_mode"] == "gpu"
+    assert plan["visible_gpu_ids"] == ["2", "5"]
+    assert plan["gpu_assignments"] == {"catboost": "2", "xgboost": "5"}
+    assert plan["parallel_backend_execution"] is True
+    assert plan["parallel_backend_workers"] == 2
+    assert plan["backend_runtime_by_name"]["catboost"]["task_type"] == "GPU"
+    assert plan["backend_runtime_by_name"]["catboost"]["devices"] == "2"
+    assert plan["backend_runtime_by_name"]["xgboost"]["device"] == "cuda:5"
+
+
+def test_train_and_select_rated_gbm_family_emits_backend_runtime_metadata() -> None:
+    X_tr, y_tr, X_vl, y_vl, sw, hp = _synth_split(seed=5)
+
+    with patch(
+        "trainer.training.trainer.resolve_gbm_backend_runtime_plan",
+        return_value={
+            "requested_backend_device_mode": "auto",
+            "effective_backend_device_mode": "gpu",
+            "visible_gpu_ids": ["0", "1"],
+            "gpu_assignments": {"catboost": "0", "xgboost": "1"},
+            "backend_runtime_by_name": {
+                "catboost": {"task_type": "GPU", "devices": "0"},
+                "xgboost": {"device": "cuda:1", "tree_method": "hist"},
+            },
+            "parallel_backend_workers": 2,
+            "parallel_backend_execution": True,
+        },
+    ):
+        winner, winner_art, report = train_and_select_rated_gbm_family(
+            X_tr,
+            y_tr,
+            X_vl,
+            y_vl,
+            sw,
+            hp,
+            lightgbm_artifact=_lightgbm_artifact(X_tr, y_tr, X_vl, y_vl, sw, hp),
+            run_optuna=False,
+            X_test=X_vl,
+            y_test=y_vl,
+        )
+
+    assert winner in BAKEOFF_BACKENDS
+    assert winner_art["metrics"]["model_backend"] == winner
+    assert report["backend_runtime_plan"]["effective_backend_device_mode"] == "gpu"
+    assert report["backend_runtime_plan"]["parallel_backend_execution"] is True
+    assert report["per_backend"]["catboost"]["backend_device_mode"] == "gpu"
+    assert report["per_backend"]["catboost"]["backend_gpu_id"] == "0"
+    assert report["per_backend"]["xgboost"]["backend_device_mode"] == "gpu"
+    assert report["per_backend"]["xgboost"]["backend_gpu_id"] == "1"

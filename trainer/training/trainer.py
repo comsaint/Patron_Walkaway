@@ -322,6 +322,45 @@ except (TypeError, ValueError):
     LIGHTGBM_GPU_N_JOBS = _core_trainer_config.LIGHTGBM_GPU_N_JOBS
 if LIGHTGBM_GPU_N_JOBS < 1:
     LIGHTGBM_GPU_N_JOBS = 1
+_GBM_BACKENDS_DEVICE_MODE_RAW = str(
+    getattr(
+        _cfg,
+        "GBM_BACKENDS_DEVICE_MODE",
+        getattr(_core_trainer_config, "GBM_BACKENDS_DEVICE_MODE", "auto"),
+    )
+    or "auto"
+).strip().lower()
+if _GBM_BACKENDS_DEVICE_MODE_RAW not in ("auto", "cpu", "gpu"):
+    logger.warning(
+        "GBM_BACKENDS_DEVICE_MODE=%r invalid (use auto, cpu, or gpu); using auto",
+        _GBM_BACKENDS_DEVICE_MODE_RAW,
+    )
+    GBM_BACKENDS_DEVICE_MODE: str = "auto"
+else:
+    GBM_BACKENDS_DEVICE_MODE = _GBM_BACKENDS_DEVICE_MODE_RAW
+TRAINER_GPU_IDS: Optional[str] = (
+    str(
+        getattr(
+            _cfg,
+            "TRAINER_GPU_IDS",
+            getattr(_core_trainer_config, "TRAINER_GPU_IDS", None),
+        )
+        or ""
+    ).strip()
+    or None
+)
+try:
+    GBM_BAKEOFF_MAX_PARALLEL_BACKENDS = int(
+        getattr(
+            _cfg,
+            "GBM_BAKEOFF_MAX_PARALLEL_BACKENDS",
+            getattr(_core_trainer_config, "GBM_BAKEOFF_MAX_PARALLEL_BACKENDS", 0),
+        )
+    )
+except (TypeError, ValueError):
+    GBM_BAKEOFF_MAX_PARALLEL_BACKENDS = 0
+if GBM_BAKEOFF_MAX_PARALLEL_BACKENDS < 0:
+    GBM_BAKEOFF_MAX_PARALLEL_BACKENDS = 0
 
 # Effective device for this process: updated by configure_lightgbm_device_for_run() in run_pipeline.
 _EFFECTIVE_LIGHTGBM_DEVICE: str = LIGHTGBM_DEVICE_TYPE
@@ -3183,6 +3222,151 @@ def _lgb_params_for_pipeline() -> dict:
     return out
 
 
+def _parse_gpu_ids(raw: Optional[str]) -> list[str]:
+    """Parse a comma-delimited GPU id list, ignoring empty tokens."""
+    if raw is None:
+        return []
+    return [tok.strip() for tok in str(raw).split(",") if tok.strip()]
+
+
+def discover_visible_gpu_ids() -> list[str]:
+    """Best-effort CUDA-style GPU discovery for CatBoost/XGBoost scheduling."""
+    configured = _parse_gpu_ids(TRAINER_GPU_IDS)
+    if configured:
+        return configured
+
+    cuda_visible = os.getenv("CUDA_VISIBLE_DEVICES")
+    if cuda_visible is not None and str(cuda_visible).strip():
+        raw_ids = _parse_gpu_ids(cuda_visible)
+        if raw_ids:
+            # CUDA_VISIBLE_DEVICES remaps visible devices to local ordinals 0..N-1.
+            return [str(i) for i in range(len(raw_ids))]
+
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return []
+
+    discovered = []
+    for line in proc.stdout.splitlines():
+        tok = line.strip()
+        if tok:
+            discovered.append(tok)
+    return discovered
+
+
+def backend_runtime_params_for_backend(
+    backend: str,
+    *,
+    device_mode: str,
+    gpu_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return backend runtime params for CPU/GPU execution."""
+    backend_n = str(backend or "").strip().lower()
+    mode = str(device_mode or "cpu").strip().lower()
+    if backend_n == "lightgbm":
+        return {}
+    if backend_n == "catboost":
+        if mode == "gpu" and gpu_id is not None:
+            return {
+                "task_type": "GPU",
+                "devices": str(gpu_id),
+            }
+        return {
+            "task_type": "CPU",
+        }
+    if backend_n == "xgboost":
+        if mode == "gpu" and gpu_id is not None:
+            return {
+                "device": f"cuda:{gpu_id}",
+                "tree_method": "hist",
+            }
+        return {
+            "device": "cpu",
+            "tree_method": "hist",
+        }
+    return {}
+
+
+def _backend_runtime_manifest(
+    backend: str,
+    backend_runtime_params: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Return flat runtime metadata for metrics/report payloads."""
+    params = dict(backend_runtime_params or {})
+    backend_n = str(backend or "").strip().lower()
+    mode = "cpu"
+    gpu_id: Optional[str] = None
+    if backend_n == "catboost":
+        mode = "gpu" if str(params.get("task_type", "CPU")).strip().upper() == "GPU" else "cpu"
+        devices = params.get("devices")
+        if mode == "gpu" and devices is not None:
+            gpu_id = str(devices)
+    elif backend_n == "xgboost":
+        device = str(params.get("device", "cpu")).strip().lower()
+        if device.startswith("cuda"):
+            mode = "gpu"
+            if ":" in device:
+                gpu_id = device.split(":", 1)[1].strip() or None
+        else:
+            mode = "cpu"
+    elif backend_n == "lightgbm":
+        mode = _EFFECTIVE_LIGHTGBM_DEVICE
+    return {
+        "backend_device_mode": mode,
+        "backend_gpu_id": gpu_id,
+    }
+
+
+def resolve_gbm_backend_runtime_plan() -> dict[str, Any]:
+    """Plan bakeoff backend device allocation and safe parallelism."""
+    visible_gpu_ids = discover_visible_gpu_ids()
+    requested_mode = GBM_BACKENDS_DEVICE_MODE
+    effective_mode = requested_mode
+    if requested_mode == "auto":
+        effective_mode = "gpu" if visible_gpu_ids else "cpu"
+    elif requested_mode == "gpu" and not visible_gpu_ids:
+        logger.warning(
+            "GBM backend GPU mode requested but no CUDA-visible GPUs were found; using cpu."
+        )
+        effective_mode = "cpu"
+
+    bakeoff_backends = ("catboost", "xgboost")
+    backend_runtime_by_name: dict[str, dict[str, Any]] = {}
+    gpu_assignments: dict[str, str] = {}
+    for idx, backend in enumerate(bakeoff_backends):
+        gpu_id = None
+        if effective_mode == "gpu" and visible_gpu_ids:
+            gpu_id = visible_gpu_ids[idx % len(visible_gpu_ids)]
+            gpu_assignments[backend] = str(gpu_id)
+        backend_runtime_by_name[backend] = backend_runtime_params_for_backend(
+            backend,
+            device_mode=effective_mode,
+            gpu_id=gpu_id,
+        )
+
+    max_workers = min(len(bakeoff_backends), len(visible_gpu_ids))
+    if isinstance(GBM_BAKEOFF_MAX_PARALLEL_BACKENDS, int) and GBM_BAKEOFF_MAX_PARALLEL_BACKENDS > 0:
+        max_workers = min(max_workers, int(GBM_BAKEOFF_MAX_PARALLEL_BACKENDS))
+    parallel_backend_workers = max_workers if effective_mode == "gpu" and max_workers > 1 else 1
+    parallel_backend_execution = parallel_backend_workers > 1
+    return {
+        "requested_backend_device_mode": requested_mode,
+        "effective_backend_device_mode": effective_mode,
+        "visible_gpu_ids": list(visible_gpu_ids),
+        "gpu_assignments": dict(gpu_assignments),
+        "backend_runtime_by_name": backend_runtime_by_name,
+        "parallel_backend_workers": int(parallel_backend_workers),
+        "parallel_backend_execution": bool(parallel_backend_execution),
+    }
+
+
 def _base_lgb_params() -> dict:
     """Backward-compat alias for :func:`_lgb_params_for_pipeline`."""
     return _lgb_params_for_pipeline()
@@ -3542,6 +3726,7 @@ def run_backend_optuna_search(
     early_stop_patience: Optional[int] = None,
     hpo_sample_rows: Optional[int] = OPTUNA_HPO_SAMPLE_ROWS,
     hpo_objective_manifest: Optional[list[dict[str, Any]]] = None,
+    backend_runtime_params: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """TPE hyperparameter search on validation.
 
@@ -3560,6 +3745,10 @@ def run_backend_optuna_search(
     flat ``optuna_hpo_*`` keys for ``training_metrics.json`` (W2 provenance vs ``val_ap``).
     """
     backend_n = str(backend or "").strip().lower() or "lightgbm"
+    runtime_manifest = _backend_runtime_manifest(
+        backend_n,
+        backend_runtime_params=backend_runtime_params,
+    )
     budget = resolve_backend_optuna_budget(
         backend_n,
         default_n_trials=(n_trials if isinstance(n_trials, int) and n_trials > 0 else OPTUNA_N_TRIALS),
@@ -3583,6 +3772,8 @@ def run_backend_optuna_search(
             {
                 "optuna_hpo_backend": backend_n,
                 "optuna_hpo_enabled": True,
+                "optuna_hpo_backend_device_mode": runtime_manifest["backend_device_mode"],
+                "optuna_hpo_backend_gpu_id": runtime_manifest["backend_gpu_id"],
                 "optuna_hpo_n_trials_requested": n_trials_eff,
                 "optuna_hpo_timeout_seconds": timeout_eff,
                 "optuna_hpo_early_stop_patience": early_stop_patience_eff,
@@ -3602,6 +3793,8 @@ def run_backend_optuna_search(
             {
                 "optuna_hpo_backend": backend_n,
                 "optuna_hpo_enabled": True,
+                "optuna_hpo_backend_device_mode": runtime_manifest["backend_device_mode"],
+                "optuna_hpo_backend_gpu_id": runtime_manifest["backend_gpu_id"],
                 "optuna_hpo_n_trials_requested": n_trials_eff,
                 "optuna_hpo_timeout_seconds": timeout_eff,
                 "optuna_hpo_early_stop_patience": early_stop_patience_eff,
@@ -3754,6 +3947,8 @@ def run_backend_optuna_search(
 
     def objective(trial: optuna.Trial) -> float:
         params = _suggest_backend_optuna_params(backend_n, trial)
+        if backend_runtime_params:
+            params.update(dict(backend_runtime_params))
         scores = _fit_backend_hpo_scores(
             backend_n,
             params=params,
@@ -3917,6 +4112,8 @@ def run_backend_optuna_search(
     _manifest_pay: dict[str, Any] = {
         "optuna_hpo_backend": backend_n,
         "optuna_hpo_enabled": True,
+        "optuna_hpo_backend_device_mode": runtime_manifest["backend_device_mode"],
+        "optuna_hpo_backend_gpu_id": runtime_manifest["backend_gpu_id"],
         "optuna_hpo_n_trials_requested": n_trials_eff,
         "optuna_hpo_timeout_seconds": timeout_eff,
         "optuna_hpo_early_stop_patience": early_stop_patience_eff,
