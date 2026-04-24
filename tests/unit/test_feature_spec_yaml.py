@@ -292,6 +292,36 @@ class TestTrackHumanRunBoundaryInputContract(unittest.TestCase):
             )
 
 
+class TestTrackHumanWave2PersonalizedContract(unittest.TestCase):
+    """Wave 2 personalized features must use python_vectorized contract."""
+
+    _WAVE2_PERSONALIZED_FIDS = {
+        "run_duration_vs_personal_avg",
+        "bets_in_run_vs_personal_avg",
+        "pace_vs_personal_baseline",
+    }
+
+    def test_wave2_personalized_features_require_python_vectorized_contract(self):
+        spec = features_mod.load_feature_spec(SPEC_YAML)
+        track_human = (spec.get("track_human") or {}).get("candidates", [])
+        by_id = {
+            c.get("feature_id"): c
+            for c in track_human
+            if isinstance(c, dict) and c.get("feature_id")
+        }
+        for fid in sorted(self._WAVE2_PERSONALIZED_FIDS):
+            self.assertIn(fid, by_id, f"Missing expected Wave 2 feature: {fid}")
+            cand = by_id[fid]
+            self.assertEqual(cand.get("type"), "python_vectorized", f"{fid} must be python_vectorized")
+            self.assertEqual(
+                cand.get("function_name"),
+                "compute_wave2_personalized_features",
+                f"{fid} must use compute_wave2_personalized_features",
+            )
+            self.assertTrue(cand.get("input_columns"), f"{fid} must define input_columns")
+            self.assertTrue(cand.get("output_columns"), f"{fid} must define output_columns")
+
+
 class TestLoadFeatureSpecFileNotFound(unittest.TestCase):
     """load_feature_spec raises FileNotFoundError for missing paths."""
 

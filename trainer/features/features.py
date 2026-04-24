@@ -656,6 +656,22 @@ def add_wave2_personalized_baselines(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def compute_wave2_personalized_features(
+    bets_df: pd.DataFrame,
+    cutoff_time: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Compatibility wrapper for Wave 2 personalized Track Human features.
+
+    This keeps YAML `python_vectorized` contract explicit while reusing the
+    same vectorized implementation used in trainer/scorer code paths.
+    """
+    df = bets_df.copy()
+    if cutoff_time is not None and "payout_complete_dtm" in df.columns:
+        cutoff_ts = pd.Timestamp(cutoff_time)
+        df = df[df["payout_complete_dtm"] <= cutoff_ts].copy()
+    return add_wave2_personalized_baselines(df)
+
+
 def compute_run_boundary(
     bets_df: pd.DataFrame,
     cutoff_time: Optional[datetime] = None,

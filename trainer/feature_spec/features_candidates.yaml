@@ -555,23 +555,32 @@ track_human:
       reason_code_category: "LOSS_STREAK"
 
     - feature_id: "run_duration_vs_personal_avg"
-      type: "derived"
+      type: "python_vectorized"
       dtype: "float"
       description: "當前 run 時長相對個人 30 天平均 session 時長"
+      function_name: "compute_wave2_personalized_features"
+      input_columns: ["minutes_since_run_start", "avg_session_duration_min_30d", "bets_in_run_so_far", "num_bets_sum_30d", "sessions_30d", "bets_cnt_w15m"]
+      output_columns: ["run_duration_vs_personal_avg", "bets_in_run_vs_personal_avg", "pace_vs_personal_baseline"]
       screening_eligible: true
       reason_code_category: "BETTING_PACE_DROPPING"
 
     - feature_id: "bets_in_run_vs_personal_avg"
-      type: "derived"
+      type: "python_vectorized"
       dtype: "float"
       description: "當前 run 下注筆數相對個人 30 天平均每次 session 筆數"
+      function_name: "compute_wave2_personalized_features"
+      input_columns: ["minutes_since_run_start", "avg_session_duration_min_30d", "bets_in_run_so_far", "num_bets_sum_30d", "sessions_30d", "bets_cnt_w15m"]
+      output_columns: ["run_duration_vs_personal_avg", "bets_in_run_vs_personal_avg", "pace_vs_personal_baseline"]
       screening_eligible: true
       reason_code_category: "BETTING_PACE_DROPPING"
 
     - feature_id: "pace_vs_personal_baseline"
-      type: "derived"
+      type: "python_vectorized"
       dtype: "float"
       description: "當前 15 分鐘下注頻率相對個人 30 天基準頻率"
+      function_name: "compute_wave2_personalized_features"
+      input_columns: ["minutes_since_run_start", "avg_session_duration_min_30d", "bets_in_run_so_far", "num_bets_sum_30d", "sessions_30d", "bets_cnt_w15m"]
+      output_columns: ["run_duration_vs_personal_avg", "bets_in_run_vs_personal_avg", "pace_vs_personal_baseline"]
       screening_eligible: true
       reason_code_category: "BETTING_PACE_DROPPING"
 
