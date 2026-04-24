@@ -560,6 +560,24 @@ def compute_loss_streak(
     return streak
 
 
+def compute_loss_streak_features(
+    bets_df: pd.DataFrame,
+    cutoff_time: Optional[datetime] = None,
+    lookback_hours: Optional[float] = None,
+) -> pd.DataFrame:
+    """Return DataFrame output for YAML Track Human `loss_streak` contract."""
+    df = bets_df.copy()
+    if cutoff_time is not None and "payout_complete_dtm" in df.columns:
+        cutoff_ts = pd.Timestamp(cutoff_time)
+        df = df[df["payout_complete_dtm"] <= cutoff_ts].copy()
+    df["loss_streak"] = compute_loss_streak(
+        df,
+        cutoff_time=None,
+        lookback_hours=lookback_hours,
+    ).reindex(df.index, fill_value=0)
+    return df
+
+
 def compute_consecutive_non_win_streak(
     bets_df: pd.DataFrame,
     cutoff_time: Optional[datetime] = None,
@@ -601,6 +619,28 @@ def compute_consecutive_non_win_streak(
         .astype("int32")
     )
     return streak
+
+
+def compute_consecutive_non_win_features(
+    bets_df: pd.DataFrame,
+    cutoff_time: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Return DataFrame output for YAML Track Human contract.
+
+    The Feature Spec guide defines `output_columns` for Track Human
+    `python_vectorized` candidates. This wrapper keeps the Series-based kernel
+    for in-code usage while exposing a DataFrame with the declared output
+    column for YAML-driven execution paths.
+    """
+    df = bets_df.copy()
+    if cutoff_time is not None and "payout_complete_dtm" in df.columns:
+        cutoff_ts = pd.Timestamp(cutoff_time)
+        df = df[df["payout_complete_dtm"] <= cutoff_ts].copy()
+    df["consecutive_non_win_cnt"] = compute_consecutive_non_win_streak(
+        df,
+        cutoff_time=None,
+    ).reindex(df.index, fill_value=0)
+    return df
 
 
 def add_wave2_personalized_baselines(df: pd.DataFrame) -> pd.DataFrame:

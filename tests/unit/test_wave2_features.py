@@ -40,6 +40,38 @@ class TestConsecutiveNonWinStreak(unittest.TestCase):
         got = features_mod.compute_consecutive_non_win_streak(df)
         self.assertListEqual(got.tolist(), [1, 2, 0, 1, 2, 0])
 
+    def test_consecutive_non_win_wrapper_returns_dataframe_column(self) -> None:
+        df = pd.DataFrame(
+            {
+                "canonical_id": ["A", "A"],
+                "bet_id": [1, 2],
+                "payout_complete_dtm": pd.to_datetime(
+                    ["2026-01-01 10:00:00", "2026-01-01 10:01:00"]
+                ),
+                "status": ["LOSE", "PUSH"],
+            }
+        )
+        out = features_mod.compute_consecutive_non_win_features(df)
+        self.assertIn("consecutive_non_win_cnt", out.columns)
+        self.assertListEqual(out["consecutive_non_win_cnt"].tolist(), [1, 2])
+
+
+class TestLossStreakWrapper(unittest.TestCase):
+    def test_loss_streak_wrapper_returns_dataframe_column(self) -> None:
+        df = pd.DataFrame(
+            {
+                "canonical_id": ["A", "A", "A"],
+                "bet_id": [1, 2, 3],
+                "payout_complete_dtm": pd.to_datetime(
+                    ["2026-01-01 10:00:00", "2026-01-01 10:01:00", "2026-01-01 10:02:00"]
+                ),
+                "status": ["LOSE", "PUSH", "WIN"],
+            }
+        )
+        out = features_mod.compute_loss_streak_features(df)
+        self.assertIn("loss_streak", out.columns)
+        self.assertListEqual(out["loss_streak"].tolist(), [1, 1, 0])
+
 
 class TestWave2PersonalizedBaselines(unittest.TestCase):
     def test_add_wave2_personalized_baselines(self) -> None:

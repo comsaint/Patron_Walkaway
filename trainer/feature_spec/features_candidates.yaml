@@ -477,7 +477,7 @@ track_human:
       type: "python_vectorized"
       dtype: "int"
       description: "連輸計數（WIN 重置；PUSH 是否重置由 config 決定）"
-      function_name: "compute_loss_streak"
+      function_name: "compute_loss_streak_features"
       input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "status"]
       output_columns: ["loss_streak"]
       postprocess:
@@ -489,7 +489,7 @@ track_human:
       type: "python_vectorized"
       dtype: "int"
       description: "從最近一次 WIN 到現在，連續非 WIN（LOSE+PUSH）筆數"
-      function_name: "compute_consecutive_non_win_streak"
+      function_name: "compute_consecutive_non_win_features"
       input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "status"]
       output_columns: ["consecutive_non_win_cnt"]
       postprocess:

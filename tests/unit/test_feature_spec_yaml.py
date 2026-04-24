@@ -322,6 +322,48 @@ class TestTrackHumanWave2PersonalizedContract(unittest.TestCase):
             self.assertTrue(cand.get("output_columns"), f"{fid} must define output_columns")
 
 
+class TestTrackHumanConsecutiveNonWinContract(unittest.TestCase):
+    """consecutive_non_win_cnt should use DataFrame-producing wrapper."""
+
+    def test_consecutive_non_win_uses_wrapper_function(self):
+        spec = features_mod.load_feature_spec(SPEC_YAML)
+        track_human = (spec.get("track_human") or {}).get("candidates", [])
+        by_id = {
+            c.get("feature_id"): c
+            for c in track_human
+            if isinstance(c, dict) and c.get("feature_id")
+        }
+        self.assertIn("consecutive_non_win_cnt", by_id)
+        cand = by_id["consecutive_non_win_cnt"]
+        self.assertEqual(cand.get("type"), "python_vectorized")
+        self.assertEqual(
+            cand.get("function_name"),
+            "compute_consecutive_non_win_features",
+        )
+        self.assertEqual(cand.get("output_columns"), ["consecutive_non_win_cnt"])
+
+
+class TestTrackHumanLossStreakContract(unittest.TestCase):
+    """loss_streak should use DataFrame-producing wrapper."""
+
+    def test_loss_streak_uses_wrapper_function(self):
+        spec = features_mod.load_feature_spec(SPEC_YAML)
+        track_human = (spec.get("track_human") or {}).get("candidates", [])
+        by_id = {
+            c.get("feature_id"): c
+            for c in track_human
+            if isinstance(c, dict) and c.get("feature_id")
+        }
+        self.assertIn("loss_streak", by_id)
+        cand = by_id["loss_streak"]
+        self.assertEqual(cand.get("type"), "python_vectorized")
+        self.assertEqual(
+            cand.get("function_name"),
+            "compute_loss_streak_features",
+        )
+        self.assertEqual(cand.get("output_columns"), ["loss_streak"])
+
+
 class TestLoadFeatureSpecFileNotFound(unittest.TestCase):
     """load_feature_spec raises FileNotFoundError for missing paths."""
 
