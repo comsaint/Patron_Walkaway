@@ -11,12 +11,18 @@ Production code is not modified; tests document desired behavior.
 
 from __future__ import annotations
 
+import pathlib
+import sys
 import unittest
 from datetime import datetime
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from trainer.serving import scorer as scorer_impl
 
@@ -119,3 +125,72 @@ class TestScorerLookbackHoursBoundary(unittest.TestCase):
             except (TypeError, ValueError):
                 # Current: features may raise when comparing "8" <= 0
                 pass
+
+
+class TestScorerTrainerConsecutiveNonWinParity(unittest.TestCase):
+    """Parity guard: consecutive_non_win_cnt must match trainer Track Human path."""
+
+    def test_consecutive_non_win_cnt_matches_trainer_with_same_lookback(self):
+        from trainer.training.trainer import add_track_human_features
+
+        bets = pd.DataFrame({
+            "bet_id": [1, 2, 3, 4],
+            "session_id": ["s1", "s1", "s1", "s1"],
+            "player_id": [100, 100, 100, 100],
+            "table_id": ["t1", "t1", "t1", "t1"],
+            "payout_complete_dtm": pd.to_datetime(
+                [
+                    "2026-03-01 11:00:00",
+                    "2026-03-01 11:05:00",
+                    "2026-03-01 11:10:00",
+                    "2026-03-01 11:20:00",
+                ]
+            ),
+            "wager": [10.0, 20.0, 30.0, 40.0],
+            "casino_win": [5.0, -3.0, 2.0, -1.0],
+            "status": ["LOSE", "PUSH", "LOSE", "WIN"],
+            "payout_odds": [1.9, 2.0, 1.8, 2.1],
+            "base_ha": [0.02, 0.02, 0.02, 0.02],
+            "is_back_bet": [1, 1, 1, 1],
+            "position_idx": [0, 1, 0, 1],
+        })
+        sessions = pd.DataFrame()
+        canonical_map = pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]})
+        cutoff = datetime(2026, 3, 1, 12, 0, 0, tzinfo=HK_TZ)
+        lookback_hours = 0.2
+
+        with patch.object(scorer_impl.config, "SCORER_LOOKBACK_HOURS", lookback_hours):
+            scorer_out = scorer_impl.build_features_for_scoring(
+                bets.copy(),
+                sessions,
+                canonical_map,
+                cutoff,
+            )
+
+        trainer_bets = bets.copy()
+        trainer_bets["canonical_id"] = "c100"
+        trainer_out = add_track_human_features(
+            bets=trainer_bets,
+            canonical_map=canonical_map,
+            window_end=cutoff.replace(tzinfo=None),
+            lookback_hours=lookback_hours,
+        )
+
+        scorer_series = (
+            scorer_out.set_index("bet_id")["consecutive_non_win_cnt"]
+            .reindex(bets["bet_id"])
+            .fillna(0)
+            .astype("int32")
+        )
+        trainer_series = (
+            trainer_out.set_index("bet_id")["consecutive_non_win_cnt"]
+            .reindex(bets["bet_id"])
+            .fillna(0)
+            .astype("int32")
+        )
+        pd.testing.assert_series_equal(
+            scorer_series,
+            trainer_series,
+            check_names=False,
+            check_index=True,
+        )
