@@ -521,8 +521,10 @@ def train_and_select_rated_gbm_family(
     }
     if "optuna_hpo_backend" not in rows["lightgbm"]:
         rows["lightgbm"]["optuna_hpo_backend"] = "lightgbm"
+    # Bakeoff does not run Optuna for LightGBM (pre-trained primary artifact + hp).
+    # Only CatBoost/XGBoost branches may call run_backend_optuna_search here.
     if "optuna_hpo_enabled" not in rows["lightgbm"]:
-        rows["lightgbm"]["optuna_hpo_enabled"] = bool(run_optuna)
+        rows["lightgbm"]["optuna_hpo_enabled"] = False
     candidate_artifacts: Dict[str, Dict[str, Any]] = {
         "lightgbm": {
             "model": lightgbm_model,

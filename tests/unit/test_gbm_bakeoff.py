@@ -156,6 +156,8 @@ def test_train_single_rated_model_releases_a3_bakeoff_temp_matrices() -> None:
     assert "_x_vl_cmp = None" in window
     assert "_x_te_cmp = None" in window
     assert "gc.collect()" in window
+
+
 def test_train_and_select_rated_gbm_family_runs_per_backend_optuna_and_emits_metadata() -> None:
     X_tr, y_tr, X_vl, y_vl, sw, hp = _synth_split(seed=3)
     seen_backends: list[str] = []
@@ -251,6 +253,7 @@ def test_train_and_select_rated_gbm_family_runs_per_backend_optuna_and_emits_met
     assert per["xgboost"]["optuna_hpo_backend"] == "xgboost"
     assert per["xgboost"]["optuna_hpo_enabled"] is True
     assert per["xgboost"]["best_hyperparams"]["n_estimators"] == 150
+    assert per["lightgbm"]["optuna_hpo_enabled"] is False
 
 
 def test_train_and_select_rated_gbm_family_skips_backend_optuna_when_disabled() -> None:
