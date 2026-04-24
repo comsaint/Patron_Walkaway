@@ -13,6 +13,7 @@ pytest.importorskip("catboost")
 pytest.importorskip("xgboost")
 
 from trainer.training.gbm_bakeoff import BAKEOFF_BACKENDS, train_and_select_rated_gbm_family
+from trainer.training.oof_stacking import build_expanding_monthly_folds
 from trainer.training import trainer as trainer_mod
 
 
@@ -143,6 +144,62 @@ def test_train_and_select_rated_gbm_family_small_valid_still_has_winner() -> Non
     )
     assert winner in BAKEOFF_BACKENDS
     assert report["per_backend"][winner]["bakeoff_disposition"] == "winner"
+
+
+def test_build_expanding_monthly_folds_enforces_time_monotonicity() -> None:
+    ts = pd.to_datetime(
+        [
+            "2026-01-05 10:00:00",
+            "2026-01-20 10:00:00",
+            "2026-02-10 10:00:00",
+            "2026-02-18 10:00:00",
+            "2026-03-02 10:00:00",
+            "2026-03-28 10:00:00",
+            "2026-04-03 10:00:00",
+            "2026-04-18 10:00:00",
+            "2026-05-06 10:00:00",
+            "2026-05-25 10:00:00",
+        ]
+    )
+    df = pd.DataFrame(
+        {
+            "payout_complete_dtm": ts,
+            "label": [0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+        }
+    )
+    folds, meta = build_expanding_monthly_folds(
+        df,
+        holdout_months=1,
+        min_valid_positives=1,
+        max_months=None,
+    )
+    assert meta["scheme"] == "expanding_monthly"
+    assert len(folds) >= 2
+    for fold in folds:
+        assert fold.train_end < fold.valid_start
+        assert len(fold.train_idx) > 0
+        assert len(fold.valid_idx) > 0
+
+
+def test_train_and_select_rated_gbm_family_reports_stacking_skip_without_time_column() -> None:
+    X_tr, y_tr, X_vl, y_vl, sw, hp = _synth_split(seed=11)
+    winner, winner_art, report = train_and_select_rated_gbm_family(
+        X_tr,
+        y_tr,
+        X_vl,
+        y_vl,
+        sw,
+        hp,
+        lightgbm_artifact=_lightgbm_artifact(X_tr, y_tr, X_vl, y_vl, sw, hp),
+        X_test=X_vl,
+        y_test=y_vl,
+    )
+    assert winner in BAKEOFF_BACKENDS
+    assert winner_art["metrics"]["model_backend"] == winner
+    assert "stacking_oof" in report
+    assert report["stacking_oof"]["status"] == "skipped"
+    assert report["stacking_oof"]["reason"] == "rated_train_df_missing"
+    assert report["per_backend"]["stacked_logistic_oof"]["bakeoff_disposition"] == "reject"
 
 
 def test_train_single_rated_model_releases_a3_bakeoff_temp_matrices() -> None:

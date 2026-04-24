@@ -91,3 +91,60 @@ class EqualWeightSoftVoteModel:
             for model in self.models
         ]
         return np.mean(np.vstack(mats), axis=0, dtype=np.float64)
+
+
+class LogisticStackedModel:
+    """Two-layer stacker: base model probabilities -> logistic meta model."""
+
+    model_kind: str = "stacked_logistic_oof"
+    supports_shap_reason_codes: bool = False
+    reason_codes_disabled_reason: str = "stacked_logistic_reason_codes_disabled"
+
+    def __init__(
+        self,
+        base_models: Sequence[Any],
+        feature_names: Sequence[str],
+        component_backends: Sequence[str],
+        meta_model: Any,
+    ) -> None:
+        if len(base_models) < 2:
+            raise ValueError("LogisticStackedModel requires at least 2 base models.")
+        if len(base_models) != len(component_backends):
+            raise ValueError("base_models and component_backends must have the same length.")
+        self.base_models = tuple(base_models)
+        self.feature_names = tuple(str(x) for x in feature_names)
+        self.component_backends = tuple(str(x) for x in component_backends)
+        self.meta_model = meta_model
+        self.reason_codes_enabled = False
+
+    def _meta_features(self, X: pd.DataFrame) -> np.ndarray:
+        parts = [_positive_class_scores(model, X) for model in self.base_models]
+        return np.column_stack(parts).astype(np.float64, copy=False)
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        z = self._meta_features(X)
+        raw = self.meta_model.predict_proba(z)
+        arr = np.asarray(raw, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[1] < 2:
+            raise ValueError(
+                "meta_model.predict_proba must return shape (n, >=2); "
+                f"got {arr.shape!r}."
+            )
+        pos = np.clip(arr[:, 1].reshape(-1), 0.0, 1.0)
+        return np.column_stack([1.0 - pos, pos])
+
+    @property
+    def feature_importances_(self) -> np.ndarray:
+        n = len(self.feature_names)
+        if n <= 0:
+            return np.asarray([], dtype=np.float64)
+        mats = [_feature_importance_vector(model, n) for model in self.base_models]
+        coefs = np.asarray(getattr(self.meta_model, "coef_", np.ones((1, len(mats)))), dtype=np.float64)
+        if coefs.ndim != 2 or coefs.shape[0] < 1 or coefs.shape[1] != len(mats):
+            w = np.ones(len(mats), dtype=np.float64) / float(len(mats))
+        else:
+            w = np.abs(coefs[0]).astype(np.float64)
+            s = float(np.sum(w))
+            w = (w / s) if s > 0 else (np.ones(len(mats), dtype=np.float64) / float(len(mats)))
+        stacked = np.vstack(mats)
+        return np.sum(stacked * w.reshape(-1, 1), axis=0, dtype=np.float64)

@@ -109,3 +109,20 @@ HIST_AVG_BET_CAP = 500_000
 PRODUCTION_NEG_POS_RATIO: Optional[float] = 87.0 / 13.0
 SELECTION_MODE: str = "field_test"
 
+# OOF stacking (A3 extension): expanding-monthly OOF over rated training rows.
+OOF_STACKING_ENABLED: bool = os.getenv(
+    "OOF_STACKING_ENABLED", "1"
+).strip().lower() in ("1", "true", "t", "yes", "y")
+OOF_STACKING_MIN_FOLDS: int = int(os.getenv("OOF_STACKING_MIN_FOLDS", "2"))
+OOF_STACKING_HOLDOUT_MONTHS: int = int(os.getenv("OOF_STACKING_HOLDOUT_MONTHS", "1"))
+OOF_STACKING_MIN_VALID_POSITIVES: int = int(
+    os.getenv("OOF_STACKING_MIN_VALID_POSITIVES", "1")
+)
+try:
+    _oof_max_months_raw = int(os.getenv("OOF_STACKING_MAX_MONTHS", "0"))
+    OOF_STACKING_MAX_MONTHS: Optional[int] = (
+        _oof_max_months_raw if _oof_max_months_raw > 0 else None
+    )
+except (TypeError, ValueError):
+    OOF_STACKING_MAX_MONTHS = None
+
