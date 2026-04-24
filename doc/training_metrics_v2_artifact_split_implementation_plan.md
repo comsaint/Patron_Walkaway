@@ -59,6 +59,12 @@
 
 因此，**先雙寫、後切換** 是風險最低的遷移方式。
 
+本輪亦**明確不採**「Phase A/B 直接沿用 `training_metrics.json`，僅靠檔內 `schema_version` 區分 v1/v2」的方案；避免：
+
+- 既有 reader 誤把 v2 當 legacy v1 讀取
+- grep / triage / deploy 審核時無法從檔名直接判斷 artifact 世代
+- dual-write 過渡期的 bundle contract 變得不透明
+
 ### 2.1.1 Phase A deploy bundle 決策
 
 Phase A 起，下列新檔案一律視為 **required bundle artifacts**：
@@ -89,6 +95,14 @@ Phase A 起，下列新檔案一律視為 **required bundle artifacts**：
   - `selection_rule`
   - `winner_id`
   - `candidates`
+
+candidate `datasets.*` 的結構規則凍結如下：
+
+- 與 `training_metrics.v2.json` 採 **同名 schema**
+- **允許子集**
+- **不允許換名**
+
+也就是說，comparison family 內 candidate 可少部分欄位，但相同語意的欄位名稱必須與 `training_metrics.v2.json` 保持一致。
 
 ### 2.3 Feature importance 策略
 
@@ -134,6 +148,12 @@ canonical field-test metric 直接使用**人類可讀命名**，避免 `primary
 - 其定義是：**在 `alerts_per_hour >= 50` 可行條件下的 precision**
 - 舊的 `precision at 1% recall` 不再視為 canonical metric，只保留為 convenience / reference metric
 
+selection 相關 metadata 若需記錄「本次用哪種 metric 選模」，應以**直白命名**表達，例如：
+
+- `selection_metric: "field_test_precision"`
+
+本輪**不**再使用 `primary_metric` 作為 schema 名稱。
+
 本輪**不**引入下列命名：
 
 - `primary_score`
@@ -168,6 +188,8 @@ canonical field-test metric 直接使用**人類可讀命名**，避免 `primary
 - `datasets.test.field_test.precision_type`
 
 其中 `datasets.test.field_test.*` 為 winner 在 held-out test 上的 canonical field-test reporting 位置。
+
+本計畫將 `datasets.val.field_test.*` 視為 validation-side canonical field-test metric 位置；若另有 selection metadata，應視為 mirror / convenience metadata，不得以不同命名重複表達同一語意。
 
 `precision at 1% recall` 類指標應改以直白 convenience 命名表達，例如：
 
@@ -445,12 +467,11 @@ canonical field-test metric 直接使用**人類可讀命名**，避免 `primary
 4. `feature_list.json` 維持純 feature catalog，不混入 importance
 5. precision uplift 相關計畫文件對 artifact 位置的描述無互相衝突
 6. canonical field-test metric 直接以 `field_test.precision` 命名，無 `primary_score` / `proxy_score` 類術語殘留
+7. comparison family 內 candidate `datasets.*` 與 `training_metrics.v2.json` 同名、可子集、不換名
 
 ---
 
 ## 10. 開放問題
 
-1. `comparison_metrics.json` 中各 family 的 candidate dataset 明細是否完全對齊 v2 結構，或允許子集
-2. dual model / non-rated bundle 在 v2 下是否採與 rated 同檔不同 section，或維持只對 rated 先落地
-3. 後續 pipeline follow-up 是否要強制：canonical `datasets.test.field_test.precision` 僅能在 unsampled true-distribution test 上產出；若無法滿足，需明確標示為 non-canonical
+1. 後續 pipeline follow-up 是否要強制：canonical `datasets.test.field_test.precision` 僅能在 unsampled true-distribution test 上產出；若無法滿足，需明確標示為 non-canonical
 

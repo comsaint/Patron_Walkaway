@@ -66,12 +66,14 @@
 
 1. **檔名與版本策略**
    - Phase A/B：`training_metrics.json` 保持 legacy v1，新增 `training_metrics.v2.json`
+   - Phase A/B 不採「沿用 `training_metrics.json` + 檔內 `schema_version` 判斷 v1/v2」方案
    - Phase C/D：待 reader 全數遷移後，再評估是否切換 `training_metrics.json` 指向 v2
 2. **comparison artifact 策略**
    - 單一檔名：`comparison_metrics.json`
    - 單一總檔 + `families` registry
    - 不採 `candidate_metrics.json`
    - 不採每個 family 一檔的爆量策略
+   - candidate `datasets.*` 與 `training_metrics.v2.json` **同名 schema、允許子集、不允許換名**
 3. **run-contract 相容策略**
    - v2 在 Phase D 前保留頂層 denormalized keys：
      - `selection_mode`
@@ -83,7 +85,7 @@
 5. **winner / field-test reporting 關鍵鍵名凍結**
    - comparison family 的 winner 一律記於：
      - `comparison_metrics.json["families"][<family_name>]["winner_id"]`
-   - `selection.primary_metric` 僅代表 **selection-side metric**，不得拿來當 held-out test reporting
+   - 若需記錄本次選模使用的 metric，應以直白 metadata 表達，例如 `selection_metric="field_test_precision"`；不得再使用 `primary_metric`
    - field-test canonical metric 一律直接命名為 `precision`
    - precision 的口徑一律記於 `precision_type`，值只允許：
      - `raw`
@@ -155,6 +157,7 @@
   - `training_metrics.v2.json["datasets"]["val"]["field_test"]["precision_type"]`
   - `training_metrics.v2.json["datasets"]["test"]["field_test"]["precision"]`
   - `training_metrics.v2.json["datasets"]["test"]["field_test"]["precision_type"]`
+- comparison family 內 candidate `datasets.*` 一律與 `training_metrics.v2.json` 同名；允許子集，不允許換名
 
 **DoD**：對照表 reviewed；無「同一語意兩個欄位」之重複
 
@@ -255,24 +258,22 @@
    - `comparison_metrics.json["families"][<family_name>]["winner_id"]`
    - `training_metrics.v2.json["datasets"]["test"]["field_test"]["precision"]`
    - `training_metrics.v2.json["datasets"]["test"]["field_test"]["precision_type"]`
-5. `pytest` 相關子集綠（範圍由實作 PR 註記）
-6. `DECISION_LOG.md` 有單一段落描述 **檔案契約與 EOL 策略**
+5. comparison family 內 candidate `datasets.*` 與 `training_metrics.v2.json` 同名、可子集、不換名
+6. `pytest` 相關子集綠（範圍由實作 PR 註記）
+7. `DECISION_LOG.md` 有單一段落描述 **檔案契約與 EOL 策略**
 
 ---
 
 ## 10. 假設
 
 - 本計畫 **不** 改 label 定義、不改 DEC-026 選阈演算法本身；僅調整 **artifact 形狀與寫入位置**。
-- 短期內仍允許 **單一 rated bundle**（與現況一致）；dual model 若存在，採 **同一 helper** 分 `rated` / `nonrated` 兩條 v2 路徑或維持 v1 巢狀（**實作 PR 必須二選一寫死**）。
+- schema 為 **rated-only**；不引入 non-rated section。
 
 ---
 
-## 11. 未決問題（實作 PR 前需定案）
+## 11. 後續開放問題（不阻擋本輪實作）
 
-1. Phase A 的 v2 檔名要用 `training_metrics.v2.json` 還是直接讓 `training_metrics.json` 內含 `schema_version` 判斷（**影響部署與 grep 成本**）。
-2. `comparison_metrics.json` 中各 family 的 dataset 明細是否完全對齊 v2 結構，或允許子集。
-3. dual model / non-rated bundle 在 v2 下是否採與 rated 同檔不同 section，或維持只對 rated 先落地。
-4. 後續 pipeline follow-up 是否要強制：canonical `datasets.test.field_test.precision` 僅能在 unsampled true-distribution test 上產出；若無法滿足，需明確標示為 non-canonical。
+1. 後續 pipeline follow-up 是否要強制：canonical `datasets.test.field_test.precision` 僅能在 unsampled true-distribution test 上產出；若無法滿足，需明確標示為 non-canonical。
 
 ---
 
