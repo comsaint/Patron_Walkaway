@@ -133,11 +133,12 @@ def compute_labels(
         )
 
     # ------------------------------------------------------------------ #
-    # E3 + R12: drop rows with null payout_complete_dtm or null canonical_id (A16: single mask + one copy).
+    # E3 + R12: drop rows with null payout_complete_dtm or null canonical_id.
+    # Compute the mask against the caller frame first so large Step 6 chunks do
+    # not pay for an eager full-frame copy before we know which rows survive.
     # ------------------------------------------------------------------ #
-    df = bets_df.copy()
-    null_payout = df["payout_complete_dtm"].isna()
-    null_cid = df["canonical_id"].isna()
+    null_payout = bets_df["payout_complete_dtm"].isna()
+    null_cid = bets_df["canonical_id"].isna()
     combined_null = null_payout | null_cid
     if combined_null.any():
         logger.warning(
@@ -145,9 +146,12 @@ def compute_labels(
             null_payout.sum(),
             null_cid.sum(),
         )
-        df = df[~combined_null].copy()
+        filtered = bets_df.loc[~combined_null]
+    else:
+        filtered = bets_df
 
-    if df.empty:
+    if filtered.empty:
+        df = filtered.copy()
         df["label"] = pd.array([], dtype="int8")
         df["censored"] = pd.array([], dtype=bool)
         return df
@@ -156,7 +160,7 @@ def compute_labels(
     # G3: stable sort — (canonical_id, payout_complete_dtm, bet_id)
     # ------------------------------------------------------------------ #
     df = (
-        df.sort_values(
+        filtered.sort_values(
             ["canonical_id", "payout_complete_dtm", "bet_id"],
             ascending=True,
             kind="stable",       # preserves relative order for equal keys

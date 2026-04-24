@@ -24,7 +24,10 @@ models/
   model.pkl                 Rated artifact model object (single model or ensemble wrapper)
   feature_list.json         [{name, track}]  track ∈ {"track_llm", "track_human", "track_profile"} (PLAN Step 7)
   model_version             YYYYMMDD-HHMMSS-<git7>  (plain text)
-  training_metrics.json     validation + test metrics, feature importance (gain), Optuna best params
+  training_metrics.json     legacy v1: validation + test metrics, feature importance (gain), Optuna best params
+  training_metrics.v2.json  v2: nested datasets + selection summary (no long importance / no gbm_bakeoff blob)
+  feature_importance.json   winner gain importance list (split from v1 payload)
+  comparison_metrics.json   comparison families registry (e.g. A3 gbm_bakeoff)
 
 Model bundle contract (DEC-040)
 -------------------------------
@@ -96,6 +99,7 @@ from trainer.core.model_bundle_paths import (
     safe_version_subdirectory,
     write_latest_model_manifest,
 )
+from trainer.core.training_metrics_v2_bundle_write import write_training_metrics_v2_sidecars
 from trainer.core.mlflow_utils import (
     has_active_run,
     log_artifact_safe,
@@ -6153,7 +6157,10 @@ def save_artifact_bundle(
     models/feature_list.json       [{name, track}]
     models/reason_code_map.json   {feature_name: reason_code} for scorer SHAP lookup
     models/model_version          <version string>
-    models/training_metrics.json  per-model metrics (rated only)
+    models/training_metrics.json  legacy v1 per-model metrics (rated only)
+    models/training_metrics.v2.json  v2 metrics (datasets + selection; large blobs split out)
+    models/feature_importance.json  winner feature importance (gain list)
+    models/comparison_metrics.json  comparison families (e.g. gbm_bakeoff)
     models/feature_spec.yaml      frozen feature spec snapshot (DEC-024, R3501)
     models/model_metadata.json    train/valid/test time bounds + run params (schema v1)
     """
@@ -6281,6 +6288,12 @@ def save_artifact_bundle(
             default=str,
         ),
         encoding="utf-8",
+    )
+    write_training_metrics_v2_sidecars(
+        _out,
+        model_version=model_version,
+        metrics_root=_metrics_root,
+        model_metadata=model_metadata,
     )
     if model_metadata is not None:
         (_out / "model_metadata.json").write_text(

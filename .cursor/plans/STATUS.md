@@ -8062,3 +8062,65 @@ python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "tes
 
 ✅ 全部完成，CYCLE 結束
 
+
+
+---
+
+## training_metrics v2 Artifact Split（2026-04-24，/cycle_code）
+
+**對齊計畫**：`.cursor/plans/EXECUTION PLAN - training_metrics_v2_artifact_split.md`（Phase A dual-write、W1 map、DEC-050）
+
+### STEP 1 — Builder
+
+| 檔案 | 說明 |
+|------|------|
+| `trainer/core/training_metrics_v2_map.json` | W1：v1→v2 鍵位對照 + null 語意（machine-readable） |
+| `trainer/core/training_metrics_v2_bundle_write.py` | 組裝並寫出 `training_metrics.v2.json`、`feature_importance.json`、`comparison_metrics.json`；可選更新 `model_metadata.json` artifacts 三路徑 |
+| `trainer/training/trainer.py` | `save_artifact_bundle` 寫完 legacy `training_metrics.json` 後呼叫 dual-write；檔頭 artifact 註解更新 |
+| `package/build_deploy_package.py` | `BUNDLE_FILES` 納入三新檔（deploy required） |
+| `.cursor/plans/DECISION_LOG.md` | **DEC-050** |
+
+**手動驗證**：任一次訓練產物目錄應同時含 `training_metrics.json` 與上述三檔；開啟 `model_metadata.json` 確認 `artifacts` 含 `training_metrics_v2_path`、`feature_importance_path`、`comparison_metrics_path`；`training_metrics.v2.json` 內不應再含 `feature_importance` / `gbm_bakeoff` 大塊。
+
+**下一輪建議**：Phase B — `bundle_run_contract` / investigations collectors 優先讀 v2 + helper fallback；W1 map 擴充更多扁平鍵。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明與建議 | 建議測試 |
+|------|------------|----------|
+| R1 | v2 的 `selection_mode_source` 目前寫死為 `artifact_training_metrics.json`，語意上較像「與 legacy 讀取路徑一致」；Phase B 改為讀 v2 時應同步調整字串或分欄位。 | contract 單測：v2-only bundle 的 source 字串 |
+| R2 | `rated` 缺省或型別非 dict 時，v2 仍寫出空 `datasets`／空 importance；consumer 需能容忍。 | 可加 rated=None 案例 |
+| R3 | 無 A3 時 `comparison_metrics.families` 為 `{}`；下游若誤假設必有 `gbm_bakeoff` 會 KeyError。 | collector grep 後補防呆或 Phase B helper |
+| R4 | bakeoff candidate 轉 `datasets` 仍依賴 `default=str` 處理非有限浮點，與 v1 相同風險。 | 沿用既有 JSON 安全策略 |
+
+### STEP 3 — Tester（新增測試）
+
+| 檔案 | 說明 |
+|------|------|
+| `tests/unit/test_training_metrics_v2_bundle_write.py` | v2 field_test、`write_training_metrics_v2_sidecars`、map JSON 可解析 |
+
+**執行**：`python -m pytest tests/unit/test_training_metrics_v2_bundle_write.py -q`
+
+### STEP 4 — Tester（修實作至綠）
+
+- `python -m pytest tests/unit/test_training_metrics_v2_bundle_write.py -q` → **3 passed**
+- `python -m pytest tests/integration/test_trainer.py -q` → **16 passed**
+- `ruff check`（變更之 .py）→ **All checks passed**
+
+**計畫下一項建議**：`trainer/core/bundle_run_contract.py` 讀 v2 優先；investigations collectors / scorer 盤點。
+
+✅ 全部完成，CYCLE 結束
+
+
+---
+
+## training_metrics v2 Phase B（2026-04-24 續）
+
+- 新增 trainer/core/training_metrics_bundle.py：load_training_metrics_merged、load_training_metrics_for_contract（v2 優先）。
+- bundle_run_contract.read_bundle_run_contract_block 改讀 v2 優先；selection_mode_source 可為 artifact_training_metrics.v2.json。
+- report_w2_objective_parity、build_w1_freeze_evidence 改走 merged loader（v2-only bundle 可跑）。
+- training_metrics_v2_bundle_write 內 selection_mode_source 與讀端對齊為 v2 檔名語意。
+- investigations/precision_uplift_recall_1pct/orchestrator/collectors.py docstring 補 v2 路徑 hint。
+- 測試：tests/unit/test_training_metrics_bundle.py。
+
+驗證：pytest tests/unit/test_training_metrics_bundle.py tests/unit/test_bundle_run_contract.py tests/unit/test_report_w2_objective_parity.py tests/unit/test_build_w1_freeze_evidence.py -q 綠。

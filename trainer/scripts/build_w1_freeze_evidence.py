@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from trainer.core.training_metrics_bundle import load_training_metrics_merged
+
 
 DEC043_ALLOWED_REASON_CODES: tuple[str, ...] = (
     "empty_subset",
@@ -70,8 +72,12 @@ def _collect_reason_codes_from_metrics(metrics_obj: dict[str, Any]) -> list[str]
 
 def _row_from_run_dir(run_dir: Path) -> tuple[RunEvidenceRow, list[str]]:
     tm_path = run_dir / "training_metrics.json"
+    v2_path = run_dir / "training_metrics.v2.json"
     bt_path = run_dir / "backtest_metrics.json"
-    tm = _load_json_object(tm_path) if tm_path.is_file() else {}
+    if tm_path.is_file() or v2_path.is_file():
+        _src, tm = load_training_metrics_merged(run_dir)
+    else:
+        tm = {}
     bt = _load_json_object(bt_path) if bt_path.is_file() else {}
     run_id = _safe_text(tm.get("run_id")) or _safe_text(tm.get("model_version")) or run_dir.name
     reason_codes: list[str] = []
@@ -87,7 +93,7 @@ def _row_from_run_dir(run_dir: Path) -> tuple[RunEvidenceRow, list[str]]:
         RunEvidenceRow(
             run_id=run_id,
             run_dir=str(run_dir.resolve()),
-            has_training_metrics=tm_path.is_file(),
+            has_training_metrics=bool(tm_path.is_file() or v2_path.is_file()),
             has_backtest_metrics=bt_path.is_file(),
             selection_mode_training=_safe_text(tm.get("selection_mode")),
             selection_mode_backtest=_safe_text(bt.get("selection_mode")),

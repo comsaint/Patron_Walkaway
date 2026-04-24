@@ -123,8 +123,8 @@ def model_bundle_dir_from_training_metrics_hint(
 ) -> tuple[Path | None, str | None]:
     """Resolve ``training_metrics_repo_relative`` to the on-disk model bundle directory.
 
-    Accepts a path to ``training_metrics.json`` (parent dir = bundle) or to the bundle
-    directory itself.
+    Accepts a path to ``training_metrics.json`` or ``training_metrics.v2.json``
+    (parent dir = bundle) or to the bundle directory itself.
 
     Returns:
         ``(resolved_dir, None)`` or ``(None, error_message)``.

@@ -248,7 +248,7 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
         feature_spec    : parsed YAML dict or None
         selection_mode / selection_mode_source / production_neg_pos_ratio :
             W2 run contract (aligned with ``backtest_metrics.json``; ``selection_mode``
-            prefers ``training_metrics.json`` in the bundle when set).
+            prefers ``training_metrics.v2.json`` then ``training_metrics.json`` when set).
     """
     if model_dir is not None:
         d = model_dir.expanduser().resolve()

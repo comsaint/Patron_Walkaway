@@ -1432,17 +1432,19 @@ def join_player_profile(
     if feature_cols is None:
         feature_cols = PROFILE_FEATURE_COLS
 
-    result = bets_df.copy()
-
-    # R74: initialise profile columns as NaN (not 0.0) so that LightGBM can use its
-    # native NaN routing (default-child) to distinguish "no data" from "zero activity".
-    for col in feature_cols:
-        if col not in result.columns:
-            result[col] = np.nan
+    def _copy_bets_with_profile_placeholders() -> pd.DataFrame:
+        out = bets_df.copy()
+        # R74: initialise profile columns as NaN (not 0.0) so that LightGBM can use
+        # its native NaN routing (default-child) to distinguish "no data" from
+        # "zero activity".
+        for col in feature_cols:
+            if col not in out.columns:
+                out[col] = np.nan
+        return out
 
     if profile_df is None or (isinstance(profile_df, pd.DataFrame) and profile_df.empty):
         logger.debug("join_player_profile: profile_df absent/empty — profile features are NaN")
-        return result
+        return _copy_bets_with_profile_placeholders()
 
     available_cols = [c for c in feature_cols if c in profile_df.columns]
     if not available_cols:
@@ -1451,12 +1453,12 @@ def join_player_profile(
             "expected: %s",
             feature_cols[:5],
         )
-        return result
+        return _copy_bets_with_profile_placeholders()
 
     # Ensure tz-naive timestamps on both sides (apply_dq strips tz from bets;
     # profile_df may arrive tz-naive or tz-aware depending on data source).
     # R1702: convert to HK before stripping tz (DEC-018).
-    bet_time = pd.to_datetime(result["payout_complete_dtm"])
+    bet_time = pd.to_datetime(bets_df["payout_complete_dtm"])
     if bet_time.dt.tz is not None:
         bet_time = bet_time.dt.tz_convert("Asia/Hong_Kong").dt.tz_localize(None)
 
@@ -1467,7 +1469,7 @@ def join_player_profile(
     # Build working copies with a stable integer position tracker.
     # R75: cast canonical_id to str on both sides — ClickHouse may return Int64
     # while identity mapping uses str, causing merge_asof to silently produce all NaN.
-    bets_work = result[["canonical_id", "payout_complete_dtm"]].copy()
+    bets_work = bets_df[["canonical_id", "payout_complete_dtm"]].copy()
     bets_work["canonical_id"] = bets_work["canonical_id"].astype(str)
     bets_work["_bet_time"] = bet_time
     bets_work["_orig_idx"] = np.arange(len(bets_work))
@@ -1511,16 +1513,17 @@ def join_player_profile(
     # LightGBM routes NaN to the trained default-child, which is semantically
     # correct; zero-fill would conflate "no data" with "zero activity".
     # Do not sort merged by _orig_idx here: the scatter below uses _orig_idx as
-    # index and reindex(), so row order of merged is irrelevant. Skipping the
+    # tracked row positions, so row order of merged is irrelevant. Skipping the
     # sort avoids a ~10 GiB allocation on large chunks (e.g. 90-day training)
     # and prevents ArrayMemoryError in join_player_profile.
 
     # R800: when NaT rows were dropped before merge_asof, merged has fewer rows
     # than result.  Use _orig_idx to scatter values back into the correct positions;
     # dropped rows retain their NaN-initialised values (set above).
+    result = _copy_bets_with_profile_placeholders()
+    row_positions = merged["_orig_idx"].to_numpy(dtype=np.int64, copy=False)
     for col in available_cols:
-        _vals = pd.Series(merged[col].values, index=merged["_orig_idx"].values)
-        result[col] = _vals.reindex(np.arange(len(result))).values
+        result.iloc[row_positions, result.columns.get_loc(col)] = merged[col].to_numpy(copy=False)
 
     n_rated_with_profile = int(pd.notna(result[available_cols[0]]).sum())
     logger.debug(

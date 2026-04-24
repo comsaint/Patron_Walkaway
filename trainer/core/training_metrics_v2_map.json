@@ -1,0 +1,62 @@
+{
+  "schema_version": "training-metrics-v2-map.v1",
+  "description": "Incremental v1 (legacy training_metrics.json) to v2 (training_metrics.v2.json) pointer map. v1 paths use dot notation for nested keys.",
+  "null_semantics": {
+    "missing_key": "Field absent from JSON object.",
+    "json_null": "Explicit null — quantity not defined, not evaluated, or intentionally omitted for JSON safety (e.g. non-finite float).",
+    "empty_object": "Use {} only when the section exists but has no scalar payload (e.g. families with no bakeoff run)."
+  },
+  "frozen_v2_paths": [
+    "datasets.val.field_test.precision",
+    "datasets.val.field_test.precision_type",
+    "datasets.test.field_test.precision",
+    "datasets.test.field_test.precision_type"
+  ],
+  "mappings": [
+    {
+      "v1": "selection_mode",
+      "v2": "selection_mode",
+      "note": "Top-level run contract mirror on v2 until reader migration completes."
+    },
+    {
+      "v1": "production_neg_pos_ratio",
+      "v2": "production_neg_pos_ratio",
+      "note": "Bundle-level contract; mirrored on v2 top level."
+    },
+    {
+      "v1": "rated.val_precision",
+      "v2": "datasets.val.precision",
+      "note": "DEC-026 operating-point validation precision (raw); v2 also nests canonical field_test block."
+    },
+    {
+      "v1": "rated.val_field_test_primary_score",
+      "v2": "datasets.val.field_test.precision",
+      "note": "Canonical field-test precision on validation when selection uses prod-adjusted path; see precision_type."
+    },
+    {
+      "v1": "rated.val_field_test_primary_score_mode",
+      "v2": "datasets.val.field_test.precision_type",
+      "note": "Maps precision_prod_adjusted to prod_adjusted; precision_raw to raw."
+    },
+    {
+      "v1": "rated.test_precision",
+      "v2": "datasets.test.precision",
+      "note": "Held-out test precision at training threshold; v2 also nests canonical field_test block."
+    },
+    {
+      "v1": "rated.test_precision_prod_adjusted",
+      "v2": "datasets.test.field_test.precision",
+      "note": "When present, canonical field-test test reporting prefers prod_adjusted pair; see writer logic."
+    },
+    {
+      "v1": "rated.feature_importance",
+      "v2": "feature_importance.json.items",
+      "note": "Moved out of training_metrics v2 main file."
+    },
+    {
+      "v1": "rated.gbm_bakeoff",
+      "v2": "comparison_metrics.json.families.gbm_bakeoff",
+      "note": "A3 bakeoff report container; winner_backend maps to winner_id in comparison family."
+    }
+  ]
+}

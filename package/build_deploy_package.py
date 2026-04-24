@@ -44,6 +44,9 @@ BUNDLE_FILES = [
     "model_version",
     "reason_code_map.json",
     "training_metrics.json",
+    "training_metrics.v2.json",
+    "feature_importance.json",
+    "comparison_metrics.json",
     "pipeline_diagnostics.json",
 ]
 MODEL_PKL_NAMES = ["model.pkl"]

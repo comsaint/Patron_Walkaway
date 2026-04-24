@@ -1,7 +1,7 @@
 """Build W2 multi-window objective parity report from per-run artifacts.
 
 Inputs are run directories that contain:
-- ``training_metrics.json`` (required)
+- ``training_metrics.v2.json`` (preferred) and/or ``training_metrics.json`` (required if v2 absent)
 - ``backtest_metrics.json`` (optional; row kept with null backtest fields)
 
 Outputs:
@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 from typing import Any, Optional
+
+from trainer.core.training_metrics_bundle import load_training_metrics_merged
 
 
 @dataclass(frozen=True)
@@ -74,10 +76,15 @@ def _section(d: dict[str, Any], key: str) -> dict[str, Any]:
 
 def row_from_run_dir(run_dir: Path) -> RunRow:
     tm_path = run_dir / "training_metrics.json"
+    v2_path = run_dir / "training_metrics.v2.json"
     bt_path = run_dir / "backtest_metrics.json"
-    if not tm_path.is_file():
-        raise FileNotFoundError(f"Missing training_metrics.json: {tm_path}")
-    tm = _read_json(tm_path)
+    if not tm_path.is_file() and not v2_path.is_file():
+        raise FileNotFoundError(
+            f"Missing training_metrics.v2.json and training_metrics.json under {run_dir}"
+        )
+    _src, tm = load_training_metrics_merged(run_dir)
+    if not tm:
+        raise FileNotFoundError(f"Unreadable or empty training metrics under {run_dir}")
     bt = _read_json(bt_path) if bt_path.is_file() else {}
     bt_md = _section(bt, "model_default")
     bt_opt = _section(bt, "optuna")
@@ -182,7 +189,7 @@ def parse_args() -> argparse.Namespace:
         "--run-dir",
         action="append",
         default=[],
-        help="Run directory containing training_metrics.json (required) and backtest_metrics.json (optional). Repeatable.",
+        help="Run directory containing training_metrics.v2.json and/or training_metrics.json (required) and backtest_metrics.json (optional). Repeatable.",
     )
     p.add_argument(
         "--run-dir-glob",
