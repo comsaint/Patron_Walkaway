@@ -47,6 +47,8 @@ from zoneinfo import ZoneInfo
 try:
     from features import (  # type: ignore[import]
         PROFILE_FEATURE_COLS,
+        add_wave2_personalized_baselines,
+        compute_consecutive_non_win_streak,
         join_player_profile as _join_profile,
         coerce_feature_dtypes,
     )
@@ -54,17 +56,23 @@ except ImportError:
     try:
         from .features import (  # type: ignore[import, attr-defined]
             PROFILE_FEATURE_COLS,
+            add_wave2_personalized_baselines,
+            compute_consecutive_non_win_streak,
             join_player_profile as _join_profile,
             coerce_feature_dtypes,
         )
     except ImportError:
         from trainer.features import (  # type: ignore[import, attr-defined]
             PROFILE_FEATURE_COLS,
+            add_wave2_personalized_baselines,
+            compute_consecutive_non_win_streak,
             join_player_profile as _join_profile,
             coerce_feature_dtypes,
         )
     except ImportError:
         PROFILE_FEATURE_COLS = []  # type: ignore[assignment]
+        add_wave2_personalized_baselines = None  # type: ignore[assignment]
+        compute_consecutive_non_win_streak = None  # type: ignore[assignment]
         _join_profile = None  # type: ignore[assignment]
         coerce_feature_dtypes = None  # type: ignore[assignment]
 
@@ -1180,6 +1188,12 @@ def build_features_for_scoring(
     bets_df["loss_streak"] = compute_loss_streak(
         bets_df, cutoff_time=cutoff_naive, lookback_hours=_lookback_hours
     ).fillna(0)
+    if compute_consecutive_non_win_streak is not None:
+        bets_df["consecutive_non_win_cnt"] = compute_consecutive_non_win_streak(
+            bets_df, cutoff_time=cutoff_naive
+        ).reindex(bets_df.index, fill_value=0)
+    else:
+        bets_df["consecutive_non_win_cnt"] = 0
 
     rb = compute_run_boundary(
         bets_df, cutoff_time=cutoff_naive, lookback_hours=_lookback_hours
@@ -2316,6 +2330,8 @@ def score_once(
             logger.debug(
                 "[scorer] player_profile unavailable — profile features will be NaN"
             )
+    if add_wave2_personalized_baselines is not None:
+        features_all = add_wave2_personalized_baselines(features_all)
 
     features_all["is_rated"] = features_all["canonical_id"].isin(rated_canonical_ids)
     logger.debug(

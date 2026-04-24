@@ -560,6 +560,102 @@ def compute_loss_streak(
     return streak
 
 
+def compute_consecutive_non_win_streak(
+    bets_df: pd.DataFrame,
+    cutoff_time: Optional[datetime] = None,
+) -> pd.Series:
+    """Return consecutive non-win count (LOSE/PUSH) for each bet.
+
+    Semantics (Wave 2 A3):
+    - ``status in {'LOSE', 'PUSH'}`` -> count +1
+    - all other status values (including ``WIN`` / null / unknown) -> reset to 0
+
+    The value at row ``i`` is the count after processing row ``i``.
+    """
+    missing = _REQUIRED_STREAK_COLS - set(bets_df.columns)
+    if missing:
+        raise ValueError(
+            f"compute_consecutive_non_win_streak: missing columns {sorted(missing)}"
+        )
+
+    df = bets_df.copy()
+    if cutoff_time is not None:
+        cutoff_ts = pd.Timestamp(cutoff_time)
+        df = df[df["payout_complete_dtm"] <= cutoff_ts].copy()
+
+    if df.empty:
+        return pd.Series(dtype="int32")
+
+    df = df.sort_values(
+        ["canonical_id", "payout_complete_dtm", "bet_id"],
+        ascending=True,
+        kind="stable",
+    )
+    status_upper = df["status"].fillna("").astype(str).str.upper()
+    df["_is_non_win"] = status_upper.isin({"LOSE", "PUSH"}).astype("int8")
+    df["_is_reset"] = (1 - df["_is_non_win"]).astype("int8")
+    df["_reset_grp"] = df.groupby("canonical_id", sort=False)["_is_reset"].cumsum()
+    streak = (
+        df.groupby(["canonical_id", "_reset_grp"], sort=False)["_is_non_win"]
+        .cumsum()
+        .astype("int32")
+    )
+    return streak
+
+
+def add_wave2_personalized_baselines(df: pd.DataFrame) -> pd.DataFrame:
+    """Add Wave 2 personalized baseline features in-place on a copied DataFrame.
+
+    Features:
+    - run_duration_vs_personal_avg
+    - bets_in_run_vs_personal_avg
+    - pace_vs_personal_baseline
+    """
+    out = df.copy()
+
+    minutes_since = pd.to_numeric(
+        out.get("minutes_since_run_start", 0.0), errors="coerce"
+    ).fillna(0.0)
+    avg_session_duration = pd.to_numeric(
+        out.get("avg_session_duration_min_30d", np.nan), errors="coerce"
+    )
+    out["run_duration_vs_personal_avg"] = np.where(
+        avg_session_duration > 0,
+        minutes_since / avg_session_duration,
+        0.0,
+    )
+
+    bets_in_run = pd.to_numeric(out.get("bets_in_run_so_far", 0.0), errors="coerce").fillna(
+        0.0
+    )
+    num_bets_30d = pd.to_numeric(out.get("num_bets_sum_30d", np.nan), errors="coerce")
+    sessions_30d = pd.to_numeric(out.get("sessions_30d", np.nan), errors="coerce")
+    personal_bets_per_session = np.where(
+        sessions_30d > 0,
+        num_bets_30d / sessions_30d,
+        np.nan,
+    )
+    out["bets_in_run_vs_personal_avg"] = np.where(
+        personal_bets_per_session > 0,
+        bets_in_run / personal_bets_per_session,
+        0.0,
+    )
+
+    bets_cnt_w15m = pd.to_numeric(out.get("bets_cnt_w15m", 0.0), errors="coerce").fillna(0.0)
+    current_bets_per_min = bets_cnt_w15m / 15.0
+    personal_bets_per_min = np.where(
+        (sessions_30d > 0) & (avg_session_duration > 0),
+        num_bets_30d / (sessions_30d * avg_session_duration),
+        np.nan,
+    )
+    out["pace_vs_personal_baseline"] = np.where(
+        personal_bets_per_min > 0,
+        current_bets_per_min / personal_bets_per_min,
+        0.0,
+    )
+    return out
+
+
 def compute_run_boundary(
     bets_df: pd.DataFrame,
     cutoff_time: Optional[datetime] = None,

@@ -395,6 +395,8 @@ try:
     )
     from labels import compute_labels  # type: ignore[import]
     from features import (  # type: ignore[import]
+        add_wave2_personalized_baselines,
+        compute_consecutive_non_win_streak,
         compute_loss_streak,
         compute_run_boundary,
         compute_track_llm_features,
@@ -426,6 +428,8 @@ except ModuleNotFoundError:
     )
     from trainer.labels import compute_labels  # type: ignore[import]
     from trainer.features import (  # type: ignore[import]
+        add_wave2_personalized_baselines,
+        compute_consecutive_non_win_streak,
         compute_loss_streak,
         compute_run_boundary,
         compute_track_llm_features,
@@ -1716,6 +1720,7 @@ def add_track_human_features(
     if "canonical_id" not in df.columns:
         logger.warning("canonical_id missing; Track Human features will be zeros")
         df["loss_streak"] = 0
+        df["consecutive_non_win_cnt"] = 0
         df["run_id"] = 0
         df["minutes_since_run_start"] = 0.0
         df["bets_in_run_so_far"] = 0
@@ -1727,6 +1732,8 @@ def add_track_human_features(
     # loss_streak (cutoff = window_end so future bets don't influence streak)
     streak = compute_loss_streak(df, cutoff_time=window_end, lookback_hours=lookback_hours)
     df["loss_streak"] = streak.reindex(df.index, fill_value=0)
+    non_win_streak = compute_consecutive_non_win_streak(df, cutoff_time=window_end)
+    df["consecutive_non_win_cnt"] = non_win_streak.reindex(df.index, fill_value=0)
 
     # run_boundary (cutoff = window_end); reindex so rows beyond cutoff get 0 not NaN (Review #2)
     run_df = compute_run_boundary(df, cutoff_time=window_end, lookback_hours=lookback_hours)
@@ -2642,6 +2649,7 @@ def process_chunk(
     # Attaches Rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
     # Non-rated bets and bets without a prior snapshot receive 0 for all profile columns.
     labeled = join_player_profile(labeled, profile_df)
+    labeled = add_wave2_personalized_baselines(labeled)
 
     # Ensure all non-profile feature columns exist with numeric defaults.
     # R74: profile columns are intentionally left as NaN when a player has no

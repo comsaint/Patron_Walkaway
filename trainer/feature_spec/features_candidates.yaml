@@ -260,6 +260,30 @@ track_llm:
         clip: { min: 0.0, max: 1.0 }
       reason_code_category: "WIN_RATE"
 
+    - feature_id: "push_cnt_w15m"
+      type: "window"
+      dtype: "int"
+      description: "過去 15 分鐘 PUSH（和局）次數"
+      rationale: "補齊 WIN/LOSE 之外的局態，捕捉卡住不前的心理狀態。"
+      expression: "SUM(CASE WHEN status = 'PUSH' THEN 1 ELSE 0 END)"
+      window_frame: "RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 10000 }
+      reason_code_category: "LOSS_STREAK"
+
+    - feature_id: "non_win_rate_w15m"
+      type: "derived"
+      dtype: "float"
+      description: "過去 15 分鐘非 WIN 率（LOSE+PUSH）"
+      rationale: "把 PUSH 顯式納入，補強僅看 lose/win 的盲點。"
+      depends_on: ["lose_cnt_w15m", "push_cnt_w15m", "bets_cnt_w15m"]
+      expression: "CAST((lose_cnt_w15m + push_cnt_w15m) AS DOUBLE) / NULLIF(bets_cnt_w15m, 0)"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+      reason_code_category: "LOSS_STREAK"
+
     - feature_id: "prev_status"
       type: "lag"
       dtype: "str"
@@ -461,6 +485,18 @@ track_human:
         clip: { min: 0, max: 999 }
       reason_code_category: "LOSS_STREAK"
 
+    - feature_id: "consecutive_non_win_cnt"
+      type: "python_vectorized"
+      dtype: "int"
+      description: "從最近一次 WIN 到現在，連續非 WIN（LOSE+PUSH）筆數"
+      function_name: "compute_consecutive_non_win_streak"
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "status"]
+      output_columns: ["consecutive_non_win_cnt"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 999 }
+      reason_code_category: "LOSS_STREAK"
+
     - feature_id: "minutes_since_run_start"
       type: "python_vectorized"
       dtype: "float"
@@ -517,6 +553,27 @@ track_human:
         fill: { strategy: "zero" }
         clip: { min: -1000000000.0, max: 1000000000.0 }
       reason_code_category: "LOSS_STREAK"
+
+    - feature_id: "run_duration_vs_personal_avg"
+      type: "derived"
+      dtype: "float"
+      description: "當前 run 時長相對個人 30 天平均 session 時長"
+      screening_eligible: true
+      reason_code_category: "BETTING_PACE_DROPPING"
+
+    - feature_id: "bets_in_run_vs_personal_avg"
+      type: "derived"
+      dtype: "float"
+      description: "當前 run 下注筆數相對個人 30 天平均每次 session 筆數"
+      screening_eligible: true
+      reason_code_category: "BETTING_PACE_DROPPING"
+
+    - feature_id: "pace_vs_personal_baseline"
+      type: "derived"
+      dtype: "float"
+      description: "當前 15 分鐘下注頻率相對個人 30 天基準頻率"
+      screening_eligible: true
+      reason_code_category: "BETTING_PACE_DROPPING"
 
   active:
     feature_ids: []
