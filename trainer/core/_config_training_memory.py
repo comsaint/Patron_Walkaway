@@ -46,7 +46,9 @@ STEP9_COMPARE_ALL_GBMS: bool = True
 STEP9_SAVE_LGB_BINARY: bool = True
 
 # --- Step 8 / Step 9 memory-sensitive knobs ---
+# Keep this as a plain assignment for now; no getenv override contract yet.
 TRAIN_METRICS_PREDICT_BATCH_ROWS: int = 500_000
+# None = no extra sampling cap; if set, the integer must be > 0.
 STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = None
 
 # --- Canonical mapping fallback path ---

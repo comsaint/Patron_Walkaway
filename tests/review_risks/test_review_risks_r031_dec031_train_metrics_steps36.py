@@ -19,7 +19,7 @@ import pandas as pd
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
-_CONFIG_PATH = _REPO_ROOT / "trainer" / "core" / "config.py"
+_TRAINING_MEMORY_CONFIG_PATH = _REPO_ROOT / "trainer" / "core" / "_config_training_memory.py"
 _TRAINER_SRC = _TRAINER_PATH.read_text(encoding="utf-8")
 _TRAINER_TREE = ast.parse(_TRAINER_SRC)
 
@@ -217,9 +217,12 @@ class TestR031_7_BatchRowsNotEnvDrivenYet(unittest.TestCase):
     """R031-7: 目前 batch 常數為純指派；若改 getenv 應更新此測試。"""
 
     def test_config_train_metrics_batch_rows_line_has_no_getenv(self):
-        text = _CONFIG_PATH.read_text(encoding="utf-8")
+        text = _TRAINING_MEMORY_CONFIG_PATH.read_text(encoding="utf-8")
         m = re.search(r"^TRAIN_METRICS_PREDICT_BATCH_ROWS\s*[:=].+$", text, re.MULTILINE)
-        self.assertIsNotNone(m, "TRAIN_METRICS_PREDICT_BATCH_ROWS assignment not found in config.py")
+        self.assertIsNotNone(
+            m,
+            "TRAIN_METRICS_PREDICT_BATCH_ROWS assignment not found in _config_training_memory.py",
+        )
         line = m.group(0)
         self.assertNotIn(
             "getenv",
@@ -264,7 +267,11 @@ class TestR031_LintContract_BroadExceptStillPresent(unittest.TestCase):
     def test_compute_train_metrics_contains_except_exception_for_batched_fallback(self):
         src = _get_function_src("_compute_train_metrics")
         self.assertIn("except Exception", src)
-        self.assertIn("_batched_booster_predict_scores", src)
+        self.assertTrue(
+            "_batched_booster_predict_scores" in src
+            or "_batched_model_positive_class_scores" in src,
+            "Expected _compute_train_metrics to call a batched score helper before fallback.",
+        )
 
 
 if __name__ == "__main__":
