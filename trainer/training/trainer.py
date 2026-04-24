@@ -6180,6 +6180,7 @@ def train_single_rated_model(
                 _y_vl_cmp,
                 sw_rated,
                 hp,
+                rated_train_df=_get_train_rated(),
                 lightgbm_artifact={
                     "model": model,
                     "threshold": metrics["threshold"],
@@ -7210,6 +7211,8 @@ def run_pipeline(args) -> None:
     pipeline_gbm_bakeoff = bool(getattr(_cfg, "STEP9_COMPARE_ALL_GBMS", True)) and not bool(
         getattr(args, "no_gbm_bakeoff", False)
     )
+    if bool(getattr(args, "disable_oof_stacking", False)):
+        setattr(_cfg, "OOF_STACKING_ENABLED", False)
     logger.info("Precision uplift A3 gbm_bakeoff_enabled=%s", pipeline_gbm_bakeoff)
     configure_lightgbm_device_for_run(args)
     # --no-preload: disable session full-table preload; use per-day PyArrow

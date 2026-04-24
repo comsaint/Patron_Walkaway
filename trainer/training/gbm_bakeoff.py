@@ -33,6 +33,7 @@ from sklearn.metrics import average_precision_score
 
 from trainer.core import config as _cfg
 from trainer.core.model_wrappers import EqualWeightSoftVoteModel
+from trainer.training.oof_stacking import build_stacked_logistic_candidate
 from trainer.training.threshold_selection import pick_threshold_dec026
 
 logger = logging.getLogger("trainer")
@@ -44,11 +45,13 @@ THRESHOLD_FBETA: float = float(getattr(_cfg, "THRESHOLD_FBETA", 0.5))
 PRODUCTION_NEG_POS_RATIO = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)
 
 SOFT_VOTE_BACKEND = "soft_vote_equal"
+STACKED_LOGISTIC_BACKEND = "stacked_logistic_oof"
 BAKEOFF_BACKENDS: Tuple[str, ...] = (
     "lightgbm",
     "catboost",
     "xgboost",
     SOFT_VOTE_BACKEND,
+    STACKED_LOGISTIC_BACKEND,
 )
 
 
@@ -479,8 +482,9 @@ def train_and_select_rated_gbm_family(
     run_optuna: bool = True,
     field_test_constrained_optuna_objective_allowed: Optional[bool] = None,
     per_backend_hyperparams: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    rated_train_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Train 3 base backends plus soft-vote on aligned splits and return winner + report."""
+    """Train base backends + ensemble candidates on aligned splits and return winner + report."""
     from trainer.training.trainer import (
         _batched_model_positive_class_scores,
         _backend_runtime_manifest,
@@ -765,6 +769,41 @@ def train_and_select_rated_gbm_family(
         }
         logger.warning("A3 gbm_bakeoff: %s build failed: %s", SOFT_VOTE_BACKEND, exc)
 
+    stacking_report: Dict[str, Any] = {
+        "status": "skipped",
+        "reason": "not_attempted",
+    }
+    try:
+        stacked_row, stacked_artifact, stacking_report = build_stacked_logistic_candidate(
+            base_artifacts=candidate_artifacts,
+            feature_cols=feature_cols,
+            X_train=_to_float32_frame(X_train),
+            y_train=y_train,
+            rated_train_df=rated_train_df,
+            X_val=_to_float32_frame(X_val),
+            y_val=y_val,
+            X_test=_to_float32_frame(X_test) if X_test is not None else None,
+            y_test=y_test,
+            val_dec026_window_hours=val_dec026_window_hours,
+            val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
+        )
+        if stacked_row is not None and stacked_artifact is not None:
+            rows[STACKED_LOGISTIC_BACKEND] = stacked_row
+            candidate_artifacts[STACKED_LOGISTIC_BACKEND] = stacked_artifact
+        else:
+            rows[STACKED_LOGISTIC_BACKEND] = {
+                "backend": STACKED_LOGISTIC_BACKEND,
+                "error": str(stacking_report.get("reason") or "stacking_not_built"),
+                "bakeoff_disposition": "reject",
+            }
+    except Exception as exc:
+        rows[STACKED_LOGISTIC_BACKEND] = {
+            "backend": STACKED_LOGISTIC_BACKEND,
+            "error": str(exc),
+            "bakeoff_disposition": "reject",
+        }
+        logger.warning("A3 gbm_bakeoff: %s build failed: %s", STACKED_LOGISTIC_BACKEND, exc)
+
     winner, rule = _pick_winner(rows)
     _assign_dispositions(rows, winner)
     for backend, row in rows.items():
@@ -778,6 +817,7 @@ def train_and_select_rated_gbm_family(
         "selection_rule": rule,
         "selection_mode": "field_test",
         "per_backend": rows,
+        "stacking_oof": stacking_report,
         "backend_runtime_plan": {
             "requested_backend_device_mode": backend_runtime_plan.get("requested_backend_device_mode"),
             "effective_backend_device_mode": backend_runtime_plan.get("effective_backend_device_mode"),
@@ -809,12 +849,13 @@ def train_and_select_rated_gbm_family(
             for key in ("_val_scores", "_train_scores", "_test_scores"):
                 metrics_obj.pop(key, None)
     logger.info(
-        "A3 gbm_bakeoff winner=%s rule=%s catboost=%s xgboost=%s soft_vote=%s",
+        "A3 gbm_bakeoff winner=%s rule=%s catboost=%s xgboost=%s soft_vote=%s stacked=%s",
         winner,
         rule,
         rows.get("catboost", {}).get("bakeoff_disposition"),
         rows.get("xgboost", {}).get("bakeoff_disposition"),
         rows.get(SOFT_VOTE_BACKEND, {}).get("bakeoff_disposition"),
+        rows.get(STACKED_LOGISTIC_BACKEND, {}).get("bakeoff_disposition"),
     )
     winner_artifact = candidate_artifacts[winner]
     winner_artifact["metrics"]["gbm_bakeoff_winner_backend"] = winner

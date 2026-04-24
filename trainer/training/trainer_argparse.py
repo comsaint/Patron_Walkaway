@@ -118,4 +118,13 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
             "LightGBM training path. Requires optional deps catboost and xgboost when enabled."
         ),
     )
+    parser.add_argument(
+        "--disable-oof-stacking",
+        action="store_true",
+        help=(
+            "Disable OOF stacked logistic candidate inside A3 bakeoff. "
+            "By default A3 includes stacked_logistic_oof as an additional challenger "
+            "when PIT-safe monthly folds can be built."
+        ),
+    )
     return parser
