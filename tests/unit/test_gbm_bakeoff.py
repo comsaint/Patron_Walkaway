@@ -6,6 +6,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import pytest
+from unittest.mock import patch
 
 pytest.importorskip("catboost")
 pytest.importorskip("xgboost")
@@ -140,3 +141,127 @@ def test_train_and_select_rated_gbm_family_small_valid_still_has_winner() -> Non
     )
     assert winner in BAKEOFF_BACKENDS
     assert report["per_backend"][winner]["bakeoff_disposition"] == "winner"
+
+
+def test_train_and_select_rated_gbm_family_runs_per_backend_optuna_and_emits_metadata() -> None:
+    X_tr, y_tr, X_vl, y_vl, sw, hp = _synth_split(seed=3)
+    seen_backends: list[str] = []
+
+    def _fake_hpo(
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        sw_train: pd.Series,
+        *,
+        backend: str = "lightgbm",
+        n_trials: int | None = None,
+        label: str = "",
+        field_test_constrained_optuna_objective_allowed: bool | None = None,
+        val_window_hours: float | None = None,
+        timeout_seconds: int | None = None,
+        early_stop_patience: int | None = None,
+        hpo_sample_rows: int | None = None,
+        hpo_objective_manifest: list[dict[str, object]] | None = None,
+    ) -> dict:
+        seen_backends.append(backend)
+        payload = {
+            "catboost": {
+                "iterations": 120,
+                "learning_rate": 0.06,
+                "depth": 6,
+                "l2_leaf_reg": 2.5,
+                "random_seed": 42,
+                "verbose": False,
+                "early_stopping_rounds": 50,
+                "allow_writing_files": False,
+                "loss_function": "Logloss",
+                "thread_count": -1,
+            },
+            "xgboost": {
+                "n_estimators": 150,
+                "learning_rate": 0.07,
+                "max_depth": 5,
+                "reg_lambda": 0.3,
+                "reg_alpha": 0.1,
+                "subsample": 0.8,
+                "colsample_bytree": 0.85,
+                "min_child_weight": 2.0,
+                "objective": "binary:logistic",
+                "tree_method": "hist",
+                "random_state": 42,
+                "n_jobs": -1,
+                "verbosity": 0,
+            },
+        }[backend]
+        if hpo_objective_manifest is not None:
+            hpo_objective_manifest.clear()
+            hpo_objective_manifest.append(
+                {
+                    "optuna_hpo_backend": backend,
+                    "optuna_hpo_enabled": True,
+                    "optuna_hpo_n_trials_requested": n_trials,
+                    "optuna_hpo_timeout_seconds": timeout_seconds,
+                    "optuna_hpo_early_stop_patience": early_stop_patience,
+                    "optuna_hpo_objective_mode": "validation_ap",
+                    "optuna_hpo_study_best_trial_value": 0.321,
+                    "optuna_hpo_study_trials_completed": 3,
+                    "optuna_hpo_study_stopped_early": False,
+                }
+            )
+        return payload
+
+    with patch("trainer.training.trainer.run_backend_optuna_search", side_effect=_fake_hpo):
+        winner, winner_art, report = train_and_select_rated_gbm_family(
+            X_tr,
+            y_tr,
+            X_vl,
+            y_vl,
+            sw,
+            hp,
+            lightgbm_artifact=_lightgbm_artifact(X_tr, y_tr, X_vl, y_vl, sw, hp),
+            run_optuna=True,
+            X_test=X_vl,
+            y_test=y_vl,
+            val_dec026_window_hours=72.0,
+            val_dec026_min_alerts_per_hour=50.0,
+        )
+
+    assert sorted(seen_backends) == ["catboost", "xgboost"]
+    assert winner in BAKEOFF_BACKENDS
+    assert winner_art["metrics"]["model_backend"] == winner
+    per = report["per_backend"]
+    assert per["catboost"]["optuna_hpo_backend"] == "catboost"
+    assert per["catboost"]["optuna_hpo_enabled"] is True
+    assert per["catboost"]["optuna_hpo_objective_mode"] == "validation_ap"
+    assert per["catboost"]["best_hyperparams"]["iterations"] == 120
+    assert per["xgboost"]["optuna_hpo_backend"] == "xgboost"
+    assert per["xgboost"]["optuna_hpo_enabled"] is True
+    assert per["xgboost"]["best_hyperparams"]["n_estimators"] == 150
+
+
+def test_train_and_select_rated_gbm_family_skips_backend_optuna_when_disabled() -> None:
+    X_tr, y_tr, X_vl, y_vl, sw, hp = _synth_split(seed=4)
+
+    with patch("trainer.training.trainer.run_backend_optuna_search") as mocked_hpo:
+        winner, _winner_art, report = train_and_select_rated_gbm_family(
+            X_tr,
+            y_tr,
+            X_vl,
+            y_vl,
+            sw,
+            hp,
+            lightgbm_artifact=_lightgbm_artifact(X_tr, y_tr, X_vl, y_vl, sw, hp),
+            run_optuna=False,
+            X_test=X_vl,
+            y_test=y_vl,
+        )
+
+    assert winner in BAKEOFF_BACKENDS
+    mocked_hpo.assert_not_called()
+    per = report["per_backend"]
+    assert per["lightgbm"]["optuna_hpo_enabled"] is False
+    assert per["catboost"]["optuna_hpo_enabled"] is False
+    assert per["catboost"]["optuna_hpo_objective_mode"] == "disabled"
+    assert per["xgboost"]["optuna_hpo_enabled"] is False
+    assert per["xgboost"]["optuna_hpo_objective_mode"] == "disabled"

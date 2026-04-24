@@ -3246,16 +3246,225 @@ def _write_optuna_hpo_manifest(
     sink.append(dict(payload))
 
 
-def run_optuna_search(
+def _backend_hpo_defaults(backend: str) -> dict[str, Any]:
+    backend_n = str(backend or "").strip().lower()
+    if backend_n == "lightgbm":
+        return {
+            "n_estimators": 400,
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "max_depth": 8,
+            "min_child_samples": 20,
+        }
+    if backend_n == "catboost":
+        return {
+            "iterations": 400,
+            "learning_rate": 0.05,
+            "depth": 8,
+            "l2_leaf_reg": 3.0,
+            "random_seed": 42,
+            "verbose": False,
+            "early_stopping_rounds": 50,
+            "allow_writing_files": False,
+            "loss_function": "Logloss",
+            "thread_count": -1,
+        }
+    if backend_n == "xgboost":
+        return {
+            "n_estimators": 400,
+            "learning_rate": 0.05,
+            "max_depth": 8,
+            "reg_lambda": 1.0,
+            "reg_alpha": 0.0,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "min_child_weight": 4.0,
+            "objective": "binary:logistic",
+            "tree_method": "hist",
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbosity": 0,
+        }
+    raise ValueError(f"Unsupported HPO backend: {backend}")
+
+
+def resolve_backend_optuna_budget(
+    backend: str,
+    *,
+    default_n_trials: int = OPTUNA_N_TRIALS,
+    default_timeout_seconds: Optional[int] = OPTUNA_TIMEOUT_SECONDS,
+    default_early_stop_patience: Optional[int] = OPTUNA_EARLY_STOP_PATIENCE,
+) -> dict[str, Optional[int]]:
+    backend_key = str(backend or "").strip().upper()
+    if not backend_key:
+        backend_key = "LIGHTGBM"
+
+    def _as_positive_int_or_none(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        return None
+
+    n_trials = _as_positive_int_or_none(
+        getattr(_cfg, f"OPTUNA_{backend_key}_N_TRIALS", None)
+    )
+    timeout_seconds = _as_positive_int_or_none(
+        getattr(_cfg, f"OPTUNA_{backend_key}_TIMEOUT_SECONDS", None)
+    )
+    early_stop_patience = _as_positive_int_or_none(
+        getattr(_cfg, f"OPTUNA_{backend_key}_EARLY_STOP_PATIENCE", None)
+    )
+    if n_trials is None:
+        n_trials = default_n_trials if isinstance(default_n_trials, int) and default_n_trials > 0 else 1
+    if timeout_seconds is None:
+        timeout_seconds = (
+            default_timeout_seconds
+            if isinstance(default_timeout_seconds, int) and default_timeout_seconds > 0
+            else None
+        )
+    if early_stop_patience is None:
+        early_stop_patience = (
+            default_early_stop_patience
+            if isinstance(default_early_stop_patience, int) and default_early_stop_patience > 0
+            else None
+        )
+    return {
+        "n_trials": int(n_trials),
+        "timeout_seconds": timeout_seconds,
+        "early_stop_patience": early_stop_patience,
+    }
+
+
+def _suggest_backend_optuna_params(
+    backend: str,
+    trial: optuna.Trial,
+) -> dict[str, Any]:
+    backend_n = str(backend or "").strip().lower()
+    if backend_n == "lightgbm":
+        return {
+            **_lgb_params_for_pipeline(),
+            "n_estimators": trial.suggest_int("n_estimators", 100, 800, step=50),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "num_leaves": trial.suggest_int("num_leaves", 15, 127),
+            "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "subsample_freq": 1,
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
+        }
+    if backend_n == "catboost":
+        return {
+            "iterations": trial.suggest_int("iterations", 100, 800, step=50),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "depth": trial.suggest_int("depth", 4, 10),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 20.0, log=True),
+            "random_seed": 42,
+            "verbose": False,
+            "early_stopping_rounds": 50,
+            "allow_writing_files": False,
+            "loss_function": "Logloss",
+            "thread_count": -1,
+        }
+    if backend_n == "xgboost":
+        return {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 800, step=50),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 20.0, log=True),
+            "objective": "binary:logistic",
+            "tree_method": "hist",
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbosity": 0,
+        }
+    raise ValueError(f"Unsupported HPO backend: {backend}")
+
+
+def _fit_backend_hpo_scores(
+    backend: str,
+    *,
+    params: dict[str, Any],
+    X_tr: pd.DataFrame,
+    y_tr: pd.Series,
+    X_vl: pd.DataFrame,
+    y_vl: pd.Series,
+    sw_tr: pd.Series,
+) -> np.ndarray:
+    backend_n = str(backend or "").strip().lower()
+    if backend_n == "lightgbm":
+        model = lgb.LGBMClassifier(**params)
+        if y_tr.nunique() < 2:
+            model.fit(X_tr, y_tr, sample_weight=sw_tr)
+        else:
+            model.fit(
+                X_tr,
+                y_tr,
+                sample_weight=sw_tr,
+                eval_set=[(X_vl, y_vl)],
+                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+            )
+        return np.asarray(model.predict_proba(X_vl)[:, 1], dtype=np.float64)
+
+    X_tr_fit = X_tr.astype(np.float32, copy=False)
+    X_vl_fit = X_vl.astype(np.float32, copy=False)
+    if backend_n == "catboost":
+        from catboost import CatBoostClassifier
+
+        model = CatBoostClassifier(**params)
+        if y_tr.nunique() < 2:
+            model.fit(X_tr_fit, y_tr.astype(np.int32), sample_weight=sw_tr, verbose=False)
+        else:
+            model.fit(
+                X_tr_fit,
+                y_tr.astype(np.int32),
+                sample_weight=sw_tr,
+                eval_set=(X_vl_fit, y_vl.astype(np.int32)),
+                early_stopping_rounds=int(params.get("early_stopping_rounds", 50)),
+                verbose=False,
+            )
+        return np.asarray(model.predict_proba(X_vl_fit)[:, 1], dtype=np.float64)
+
+    if backend_n == "xgboost":
+        import xgboost as xgb
+
+        model = xgb.XGBClassifier(**params)
+        if y_tr.nunique() < 2:
+            model.fit(X_tr_fit, y_tr, sample_weight=sw_tr, verbose=False)
+        else:
+            model.fit(
+                X_tr_fit,
+                y_tr,
+                sample_weight=sw_tr,
+                eval_set=[(X_vl_fit, y_vl)],
+                verbose=False,
+            )
+        return np.asarray(model.predict_proba(X_vl_fit)[:, 1], dtype=np.float64)
+
+    raise ValueError(f"Unsupported HPO backend: {backend}")
+
+
+def run_backend_optuna_search(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_val: pd.DataFrame,
     y_val: pd.Series,
     sw_train: pd.Series,
-    n_trials: int = OPTUNA_N_TRIALS,
+    *,
+    backend: str = "lightgbm",
+    n_trials: Optional[int] = None,
     label: str = "",
     field_test_constrained_optuna_objective_allowed: Optional[bool] = None,
     val_window_hours: Optional[float] = None,
+    timeout_seconds: Optional[int] = None,
+    early_stop_patience: Optional[int] = None,
+    hpo_sample_rows: Optional[int] = OPTUNA_HPO_SAMPLE_ROWS,
     hpo_objective_manifest: Optional[list[dict[str, Any]]] = None,
 ) -> dict:
     """TPE hyperparameter search on validation.
@@ -3274,16 +3483,33 @@ def run_optuna_search(
     When *hpo_objective_manifest* is a list, it is cleared and receives one dict of
     flat ``optuna_hpo_*`` keys for ``training_metrics.json`` (W2 provenance vs ``val_ap``).
     """
+    backend_n = str(backend or "").strip().lower() or "lightgbm"
+    budget = resolve_backend_optuna_budget(
+        backend_n,
+        default_n_trials=(n_trials if isinstance(n_trials, int) and n_trials > 0 else OPTUNA_N_TRIALS),
+        default_timeout_seconds=timeout_seconds,
+        default_early_stop_patience=early_stop_patience,
+    )
+    n_trials_eff = int(budget["n_trials"] or 1)
+    timeout_eff = budget["timeout_seconds"]
+    early_stop_patience_eff = budget["early_stop_patience"]
+
     # R705: guard against empty validation input — return empty dict (base params)
     # rather than crashing inside LightGBM or average_precision_score.
     if X_val.empty or len(y_val) == 0:
         logger.warning(
-            "%s: empty validation set — skipping Optuna search, returning base params.",
+            "%s[%s]: empty validation set - skipping Optuna search, returning base params.",
             label or "model",
+            backend_n,
         )
         _write_optuna_hpo_manifest(
             hpo_objective_manifest,
             {
+                "optuna_hpo_backend": backend_n,
+                "optuna_hpo_enabled": True,
+                "optuna_hpo_n_trials_requested": n_trials_eff,
+                "optuna_hpo_timeout_seconds": timeout_eff,
+                "optuna_hpo_early_stop_patience": early_stop_patience_eff,
                 "optuna_hpo_objective_mode": "skipped_empty_validation",
                 "optuna_hpo_study_best_trial_value": None,
             },
@@ -3298,6 +3524,11 @@ def run_optuna_search(
         _write_optuna_hpo_manifest(
             hpo_objective_manifest,
             {
+                "optuna_hpo_backend": backend_n,
+                "optuna_hpo_enabled": True,
+                "optuna_hpo_n_trials_requested": n_trials_eff,
+                "optuna_hpo_timeout_seconds": timeout_eff,
+                "optuna_hpo_early_stop_patience": early_stop_patience_eff,
                 "optuna_hpo_objective_mode": "gate_blocked",
                 "optuna_hpo_study_best_trial_value": None,
                 "optuna_hpo_gate_blocked": True,
@@ -3305,7 +3536,7 @@ def run_optuna_search(
                 "optuna_hpo_gate_blocked_details": details,
             },
         )
-        raise RuntimeError(f"{label or 'model'}: {details}")
+        raise RuntimeError(f"{label or 'model'}[{backend_n}]: {details}")
 
     if field_test_constrained_optuna_objective_allowed is False and str(label or "").strip().lower() == "rated":
         _raise_field_test_gate_blocked(
@@ -3360,8 +3591,8 @@ def run_optuna_search(
     _hpo_ratio: Optional[float] = None
 
     _sample_rows = (
-        OPTUNA_HPO_SAMPLE_ROWS
-        if isinstance(OPTUNA_HPO_SAMPLE_ROWS, int) and OPTUNA_HPO_SAMPLE_ROWS > 0
+        hpo_sample_rows
+        if isinstance(hpo_sample_rows, int) and hpo_sample_rows > 0
         else None
     )
     if _sample_rows is not None and len(X_train) > _sample_rows:
@@ -3400,7 +3631,8 @@ def run_optuna_search(
             X_vl = X_val.iloc[idx_vl]
             y_vl = y_val.iloc[idx_vl]
         logger.info(
-            "Optuna HPO: subsampled train %d -> %d, valid %d -> %d (ratio=%.4f)",
+            "Optuna HPO[%s]: subsampled train %d -> %d, valid %d -> %d (ratio=%.4f)",
+            backend_n,
             len(X_train),
             len(X_tr),
             len(X_val),
@@ -3417,10 +3649,11 @@ def run_optuna_search(
     if _use_ft_hpo:
         if _ft_hpo_uses_prod_adj:
             logger.info(
-                "%s: Optuna study maximises validation precision_prod_adjusted "
+                "%s[%s]: Optuna study maximises validation precision_prod_adjusted "
                 "(DEC-026 pick; val neg/pos=%.4g vs PRODUCTION_NEG_POS_RATIO=%s; "
                 "min_alerts_per_hour=%.4g; window_hours=%.4g).",
                 label or "model",
+                backend_n,
                 float(_val_np_ratio),
                 PRODUCTION_NEG_POS_RATIO,
                 _mah_ft_f,
@@ -3428,10 +3661,11 @@ def run_optuna_search(
             )
         else:
             logger.info(
-                "%s: Optuna study maximises validation precision (DEC-026 raw; "
+                "%s[%s]: Optuna study maximises validation precision (DEC-026 raw; "
                 "prod-adjust inactive — need positives + neg/pos ratio and "
                 "PRODUCTION_NEG_POS_RATIO) with min_alerts_per_hour=%.4g over window_hours=%.4g.",
                 label or "model",
+                backend_n,
                 _mah_ft_f,
                 float(_vwh),
             )
@@ -3443,33 +3677,16 @@ def run_optuna_search(
     )
 
     def objective(trial: optuna.Trial) -> float:
-        params = {
-            **_lgb_params_for_pipeline(),
-            "n_estimators": trial.suggest_int("n_estimators", 100, 800, step=50),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-            "max_depth": trial.suggest_int("max_depth", 3, 10),
-            "num_leaves": trial.suggest_int("num_leaves", 15, 127),
-            "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
-            "subsample_freq": 1,
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
-        }
-        model = lgb.LGBMClassifier(**params)
-        # R410 #5: single-class y_tr + two-class y_vl would make LightGBM LabelEncoder
-        # raise on eval_set (unseen label). Fit without eval_set when train has one class.
-        if y_tr.nunique() < 2:
-            model.fit(X_tr, y_tr, sample_weight=sw_tr)
-        else:
-            model.fit(
-                X_tr,
-                y_tr,
-                sample_weight=sw_tr,
-                eval_set=[(X_vl, y_vl)],
-                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
-            )
-        scores = model.predict_proba(X_vl)[:, 1]
+        params = _suggest_backend_optuna_params(backend_n, trial)
+        scores = _fit_backend_hpo_scores(
+            backend_n,
+            params=params,
+            X_tr=X_tr,
+            y_tr=y_tr,
+            X_vl=X_vl,
+            y_vl=y_vl,
+            sw_tr=sw_tr,
+        )
         if _use_ft_hpo:
             _pick = pick_threshold_dec026(
                 np.asarray(y_vl, dtype=float),
@@ -3497,22 +3714,25 @@ def run_optuna_search(
         sampler=optuna.samplers.TPESampler(seed=42),
     )
     _timeout = (
-        float(OPTUNA_TIMEOUT_SECONDS)
-        if OPTUNA_TIMEOUT_SECONDS is not None and OPTUNA_TIMEOUT_SECONDS > 0
+        float(timeout_eff)
+        if timeout_eff is not None and timeout_eff > 0
         else None
     )
     if _timeout is None:
         logger.info(
-            "Optuna search (%s): n_trials=%d, timeout=disabled (OPTUNA_TIMEOUT_SECONDS=%s)",
+            "Optuna search (%s[%s]): n_trials=%d, timeout=disabled (OPTUNA_%s_TIMEOUT_SECONDS=%s)",
             label or "model",
-            n_trials,
-            OPTUNA_TIMEOUT_SECONDS,
+            backend_n,
+            n_trials_eff,
+            backend_n.upper(),
+            timeout_eff,
         )
     else:
         logger.info(
-            "Optuna search (%s): n_trials=%d, timeout=%.0fs (~%.1f min)",
+            "Optuna search (%s[%s]): n_trials=%d, timeout=%.0fs (~%.1f min)",
             label or "model",
-            n_trials,
+            backend_n,
+            n_trials_eff,
             _timeout,
             _timeout / 60.0,
         )
@@ -3523,13 +3743,13 @@ def run_optuna_search(
     optuna_pbar = (
         _ProgressNoop()
         if _disable_bar
-        else _tqdm_bar(total=n_trials, desc="Step 9 Optuna", unit="trial")
+        else _tqdm_bar(total=n_trials_eff, desc=f"Step 9 Optuna {backend_n}", unit="trial")
     )
 
     def _progress_callback(study: optuna.Study, trial: FrozenTrial) -> None:
         optuna_pbar.update(1)
         n = len(study.trials)
-        if n == 1 or n % 20 == 0 or n == n_trials:
+        if n == 1 or n % 20 == 0 or n == n_trials_eff:
             elapsed = time.perf_counter() - _start
             try:
                 best_ap = study.best_value
@@ -3538,10 +3758,11 @@ def run_optuna_search(
                 best_ap = None
             best_str = "%.4f" % (best_ap if best_ap is not None else float("nan"))
             logger.info(
-                "[Step 9] Optuna (%s) trial %d/%d  %s=%s  elapsed %.0fs (%.1f min)",
+                "[Step 9] Optuna (%s[%s]) trial %d/%d  %s=%s  elapsed %.0fs (%.1f min)",
                 label or "rated",
+                backend_n,
                 n,
-                n_trials,
+                n_trials_eff,
                 _metric_label,
                 best_str,
                 elapsed,
@@ -3566,25 +3787,31 @@ def run_optuna_search(
             _early_stop_state["no_improve_count"] = 0
         else:
             _early_stop_state["no_improve_count"] += 1
-        patience = OPTUNA_EARLY_STOP_PATIENCE if isinstance(OPTUNA_EARLY_STOP_PATIENCE, int) else 0
+        patience = (
+            early_stop_patience_eff
+            if isinstance(early_stop_patience_eff, int) and early_stop_patience_eff > 0
+            else 0
+        )
         if patience > 0 and _early_stop_state["no_improve_count"] >= patience:
             study.stop()
             n = len(study.trials)
             logger.info(
-                "[Step 9] Optuna early stop: no improvement for %d trials (stopped at trial %d/%d)",
+                "[Step 9] Optuna early stop (%s[%s]): no improvement for %d trials (stopped at trial %d/%d)",
+                label or "rated",
+                backend_n,
                 patience,
                 n,
-                n_trials,
+                n_trials_eff,
             )
 
     callbacks: List[Callable[[optuna.Study, FrozenTrial], None]] = [_progress_callback]
-    if isinstance(OPTUNA_EARLY_STOP_PATIENCE, int) and OPTUNA_EARLY_STOP_PATIENCE > 0:
+    if isinstance(early_stop_patience_eff, int) and early_stop_patience_eff > 0:
         callbacks.append(_early_stop_callback)
 
     try:
         study.optimize(
             objective,
-            n_trials=n_trials,
+            n_trials=n_trials_eff,
             timeout=_timeout,
             show_progress_bar=False,
             callbacks=callbacks,
@@ -3597,8 +3824,9 @@ def run_optuna_search(
     except ValueError:
         final_best_ap = None
     logger.info(
-        "Optuna (%s) %s=%s, params=%s",
+        "Optuna (%s[%s]) %s=%s, params=%s",
         label or "model",
+        backend_n,
         _metric_label,
         "%.4f" % final_best_ap if final_best_ap is not None else "N/A",
         best,
@@ -3611,11 +3839,24 @@ def run_optuna_search(
             else "field_test_dec026_val_precision_raw"
         )
     _manifest_pay: dict[str, Any] = {
+        "optuna_hpo_backend": backend_n,
+        "optuna_hpo_enabled": True,
+        "optuna_hpo_n_trials_requested": n_trials_eff,
+        "optuna_hpo_timeout_seconds": timeout_eff,
+        "optuna_hpo_early_stop_patience": early_stop_patience_eff,
+        "optuna_hpo_study_trials_completed": int(len(study.trials)),
+        "optuna_hpo_study_stopped_early": bool(len(study.trials) < n_trials_eff),
         "optuna_hpo_objective_mode": _obj_mode,
         "optuna_hpo_study_best_trial_value": (
             float(final_best_ap) if final_best_ap is not None else None
         ),
     }
+    if _sample_rows is not None:
+        _manifest_pay["optuna_hpo_sample_rows_cap"] = int(_sample_rows)
+    if _hpo_ratio is not None:
+        _manifest_pay["optuna_hpo_sample_ratio"] = float(_hpo_ratio)
+        _manifest_pay["optuna_hpo_sampled_train_rows"] = int(len(X_tr))
+        _manifest_pay["optuna_hpo_sampled_valid_rows"] = int(len(X_vl))
     if _vwh is not None:
         _manifest_pay["optuna_hpo_val_window_hours_used"] = float(_vwh)
     if _use_ft_hpo:
@@ -3634,6 +3875,34 @@ def run_optuna_search(
                 pass
     _write_optuna_hpo_manifest(hpo_objective_manifest, _manifest_pay)
     return best
+
+
+def run_optuna_search(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    sw_train: pd.Series,
+    n_trials: int = OPTUNA_N_TRIALS,
+    label: str = "",
+    field_test_constrained_optuna_objective_allowed: Optional[bool] = None,
+    val_window_hours: Optional[float] = None,
+    hpo_objective_manifest: Optional[list[dict[str, Any]]] = None,
+) -> dict:
+    """Backward-compatible LightGBM Optuna wrapper."""
+    return run_backend_optuna_search(
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        sw_train,
+        backend="lightgbm",
+        n_trials=n_trials,
+        label=label,
+        field_test_constrained_optuna_objective_allowed=field_test_constrained_optuna_objective_allowed,
+        val_window_hours=val_window_hours,
+        hpo_objective_manifest=hpo_objective_manifest,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5471,6 +5740,8 @@ def train_single_rated_model(
                     "features": avail_cols,
                     "metrics": metrics,
                 },
+                run_optuna=bool(run_optuna),
+                field_test_constrained_optuna_objective_allowed=_ft_allowed,
                 X_test=_x_te_cmp,
                 y_test=_y_te_cmp,
                 val_dec026_window_hours=_ft_thr_wh,
