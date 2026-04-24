@@ -53,6 +53,17 @@ class TestConfigRequiredConstants(unittest.TestCase):
     def test_optuna_n_trials_exist(self):
         self.assertHasAttr("OPTUNA_N_TRIALS", int)
 
+    def test_backend_specific_optuna_trials_and_patience_removed(self):
+        for name in (
+            "OPTUNA_LIGHTGBM_N_TRIALS",
+            "OPTUNA_CATBOOST_N_TRIALS",
+            "OPTUNA_XGBOOST_N_TRIALS",
+            "OPTUNA_LIGHTGBM_EARLY_STOP_PATIENCE",
+            "OPTUNA_CATBOOST_EARLY_STOP_PATIENCE",
+            "OPTUNA_XGBOOST_EARLY_STOP_PATIENCE",
+        ):
+            self.assertFalse(hasattr(self.config, name), f"config should not define {name}")
+
     def test_optuna_total_timeout_budget_exists(self):
         self.assertTrue(hasattr(self.config, "OPTUNA_TIMEOUT_SECONDS"))
         v = getattr(self.config, "OPTUNA_TIMEOUT_SECONDS")

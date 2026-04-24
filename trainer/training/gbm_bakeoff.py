@@ -228,10 +228,12 @@ def _train_catboost_backend(
     val_dec026_min_alerts_per_hour: Optional[float],
 ) -> Tuple[Any, Dict[str, Any]]:
     from catboost import CatBoostClassifier
+    from trainer.training.trainer import _apply_backend_imbalance_params
 
     c_hp = dict(hp)
     iterations = int(c_hp.pop("iterations"))
     early = int(c_hp.pop("early_stopping_rounds"))
+    c_hp = _apply_backend_imbalance_params("catboost", c_hp, y_train)
     model = CatBoostClassifier(iterations=iterations, **c_hp)
     X_tr = _to_float32_frame(X_train)
     X_vl = _to_float32_frame(X_val)
@@ -272,9 +274,11 @@ def _train_xgboost_backend(
     val_dec026_min_alerts_per_hour: Optional[float],
 ) -> Tuple[Any, Dict[str, Any]]:
     import xgboost as xgb
+    from trainer.training.trainer import _apply_backend_imbalance_params
 
     x_hp = dict(hp)
     n_est = int(x_hp.pop("n_estimators"))
+    x_hp = _apply_backend_imbalance_params("xgboost", x_hp, y_train)
     model = xgb.XGBClassifier(n_estimators=n_est, **x_hp)
     X_tr = _to_float32_frame(X_train)
     X_vl = _to_float32_frame(X_val)

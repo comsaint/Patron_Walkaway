@@ -3262,6 +3262,8 @@ def _backend_hpo_defaults(backend: str) -> dict[str, Any]:
             "learning_rate": 0.05,
             "depth": 8,
             "l2_leaf_reg": 3.0,
+            "random_strength": 1.0,
+            "rsm": 1.0,
             "random_seed": 42,
             "verbose": False,
             "early_stopping_rounds": 50,
@@ -3288,6 +3290,44 @@ def _backend_hpo_defaults(backend: str) -> dict[str, Any]:
     raise ValueError(f"Unsupported HPO backend: {backend}")
 
 
+def _balanced_binary_class_ratio(y: pd.Series) -> Optional[float]:
+    """Return neg/pos ratio for strict binary labels; None when unavailable."""
+    if y is None or len(y) == 0:
+        return None
+    ya = np.asarray(y, dtype=float).reshape(-1)
+    if ya.size == 0 or not np.isfinite(ya).all():
+        return None
+    pos = int(np.sum(ya == 1.0))
+    neg = int(np.sum(ya == 0.0))
+    if pos <= 0 or neg <= 0:
+        return None
+    return float(neg / pos)
+
+
+def _apply_backend_imbalance_params(
+    backend: str,
+    params: Mapping[str, Any],
+    y_train: pd.Series,
+) -> dict[str, Any]:
+    """Align imbalance handling across GBM backends for fair bakeoff."""
+    backend_n = str(backend or "").strip().lower()
+    out = dict(params)
+    if backend_n == "lightgbm":
+        return out
+
+    ratio = _balanced_binary_class_ratio(y_train)
+    if ratio is None:
+        return out
+
+    if backend_n == "catboost":
+        out.setdefault("class_weights", [1.0, float(ratio)])
+        return out
+    if backend_n == "xgboost":
+        out.setdefault("scale_pos_weight", float(ratio))
+        return out
+    return out
+
+
 def resolve_backend_optuna_budget(
     backend: str,
     *,
@@ -3307,18 +3347,16 @@ def resolve_backend_optuna_budget(
             return value if value > 0 else None
         return None
 
-    n_trials = _as_positive_int_or_none(
-        getattr(_cfg, f"OPTUNA_{backend_key}_N_TRIALS", None)
-    )
+    n_trials = None
     timeout_seconds = _as_positive_int_or_none(
         getattr(_cfg, f"OPTUNA_{backend_key}_TIMEOUT_SECONDS", None)
     )
-    early_stop_patience = _as_positive_int_or_none(
-        getattr(_cfg, f"OPTUNA_{backend_key}_EARLY_STOP_PATIENCE", None)
-    )
+    early_stop_patience = None
     if default_n_trials is None:
         default_n_trials = (
-            OPTUNA_N_TRIALS if isinstance(OPTUNA_N_TRIALS, int) and OPTUNA_N_TRIALS > 0 else 1
+            _as_positive_int_or_none(getattr(_cfg, "OPTUNA_N_TRIALS", None))
+            or _as_positive_int_or_none(OPTUNA_N_TRIALS)
+            or 1
         )
     if default_timeout_seconds is None:
         default_timeout_seconds = (
@@ -3382,6 +3420,8 @@ def _suggest_backend_optuna_params(
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
             "depth": trial.suggest_int("depth", 4, 10),
             "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 20.0, log=True),
+            "random_strength": trial.suggest_float("random_strength", 1e-3, 10.0, log=True),
+            "rsm": trial.suggest_float("rsm", 0.5, 1.0),
             "random_seed": 42,
             "verbose": False,
             "early_stopping_rounds": 50,
@@ -3438,7 +3478,8 @@ def _fit_backend_hpo_scores(
     if backend_n == "catboost":
         from catboost import CatBoostClassifier
 
-        model = CatBoostClassifier(**params)
+        fit_params = _apply_backend_imbalance_params(backend_n, params, y_tr)
+        model = CatBoostClassifier(**fit_params)
         if y_tr.nunique() < 2:
             model.fit(X_tr_fit, y_tr.astype(np.int32), sample_weight=sw_tr, verbose=False)
         else:
@@ -3447,7 +3488,7 @@ def _fit_backend_hpo_scores(
                 y_tr.astype(np.int32),
                 sample_weight=sw_tr,
                 eval_set=(X_vl_fit, y_vl.astype(np.int32)),
-                early_stopping_rounds=int(params.get("early_stopping_rounds", 50)),
+                early_stopping_rounds=int(fit_params.get("early_stopping_rounds", 50)),
                 verbose=False,
             )
         return np.asarray(model.predict_proba(X_vl_fit)[:, 1], dtype=np.float64)
@@ -3455,7 +3496,8 @@ def _fit_backend_hpo_scores(
     if backend_n == "xgboost":
         import xgboost as xgb
 
-        model = xgb.XGBClassifier(**params)
+        fit_params = _apply_backend_imbalance_params(backend_n, params, y_tr)
+        model = xgb.XGBClassifier(**fit_params)
         if y_tr.nunique() < 2:
             model.fit(X_tr_fit, y_tr, sample_weight=sw_tr, verbose=False)
         else:
