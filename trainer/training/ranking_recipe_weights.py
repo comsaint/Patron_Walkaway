@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -207,3 +208,203 @@ def refine_weights_hnm_shallow_lgbm(
     meta["ranking_recipe_hnm_shallow_neg_boosted"] = n_boost
     meta["ranking_recipe_weight_max"] = float(sw2.max())
     return sw2, meta
+
+
+def read_libsvm_weight_file(
+    weight_path: Path,
+    *,
+    expected_rows: int,
+    default_weight: float = 1.0,
+) -> pd.Series:
+    """Load ``.weight`` file as float series with strict row-count guard."""
+    if expected_rows < 0:
+        raise ValueError("expected_rows must be non-negative")
+    if not weight_path.exists():
+        return pd.Series(default_weight, index=np.arange(expected_rows, dtype=np.int64), dtype=float)
+    vals: list[float] = []
+    with open(weight_path, encoding="utf-8") as wf:
+        for raw in wf:
+            s = raw.strip()
+            if not s:
+                vals.append(default_weight)
+                continue
+            try:
+                vals.append(float(s))
+            except ValueError:
+                vals.append(default_weight)
+    if len(vals) != expected_rows:
+        logger.warning(
+            "LibSVM weight row mismatch: %s has %d rows, expected %d; falling back to uniform.",
+            weight_path,
+            len(vals),
+            expected_rows,
+        )
+        return pd.Series(default_weight, index=np.arange(expected_rows, dtype=np.int64), dtype=float)
+    out = pd.Series(vals, index=np.arange(expected_rows, dtype=np.int64), dtype=float)
+    return out.clip(lower=1e-12)
+
+
+def write_libsvm_weight_file(weight_path: Path, weights: pd.Series) -> None:
+    """Atomically write training weights to ``.libsvm.weight``."""
+    weight_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = weight_path.with_suffix(weight_path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as wf:
+        for v in weights.astype(float).to_numpy(copy=False):
+            wf.write(f"{float(v)}\n")
+    os.replace(tmp_path, weight_path)
+
+
+def invalidate_lgb_binary_cache_for_libsvm(train_libsvm_path: Path) -> Optional[Path]:
+    """Delete stale LightGBM ``.bin`` next to LibSVM train file."""
+    bin_path = train_libsvm_path.parent / (train_libsvm_path.stem + ".bin")
+    if not bin_path.is_file():
+        return None
+    try:
+        bin_path.unlink()
+        return bin_path
+    except OSError as exc:
+        logger.warning("Failed to invalidate stale LGB binary cache %s: %s", bin_path, exc)
+        return None
+
+
+def build_final_ranking_weights_in_memory(
+    train_rated: pd.DataFrame,
+    base_sw: pd.Series,
+    recipe: str,
+    feature_cols: Sequence[str],
+    *,
+    lgb_classifier_params: Optional[Mapping[str, Any]] = None,
+) -> Tuple[pd.Series, Dict[str, Any]]:
+    """Build canonical final training weights (stage-1 + optional stage-2 HNM)."""
+    sw_pre, meta_pre = apply_ranking_recipe_pre_optuna_weights(
+        train_rated,
+        base_sw,
+        recipe,
+        feature_cols,
+    )
+    meta: Dict[str, Any] = dict(meta_pre)
+    meta["ranking_weight_source"] = "in_memory"
+    recipe_n = str(meta_pre.get("ranking_recipe", resolve_ranking_recipe(recipe)))
+    can_refine = (
+        recipe_n in (RANKING_RECIPE_HNM, RANKING_RECIPE_COMBINED)
+        and lgb_classifier_params is not None
+        and not train_rated.empty
+        and train_rated.get("label") is not None
+    )
+    if can_refine:
+        X = train_rated[[c for c in feature_cols if c in train_rated.columns]]
+        y = train_rated["label"]
+        sw_post, meta_hnm = refine_weights_hnm_shallow_lgbm(
+            X,
+            y,
+            sw_pre,
+            lgb_classifier_params,
+        )
+        meta.update(meta_hnm)
+        meta["ranking_hnm_mode"] = "in_memory_shallow_lgbm"
+        sw_final = sw_post
+    else:
+        if recipe_n in (RANKING_RECIPE_HNM, RANKING_RECIPE_COMBINED):
+            meta["ranking_hnm_mode"] = "none"
+            meta.setdefault("ranking_recipe_hnm_skipped", "missing_inmemory_or_params")
+        else:
+            meta["ranking_hnm_mode"] = "none"
+        sw_final = sw_pre
+    sw_final = sw_final.astype(float).clip(lower=1e-12)
+    meta["ranking_weight_finalized"] = True
+    meta["ranking_recipe_weight_mean"] = float(sw_final.mean()) if len(sw_final) else 0.0
+    meta["ranking_recipe_weight_max"] = float(sw_final.max()) if len(sw_final) else 0.0
+    return sw_final, meta
+
+
+def build_final_ranking_weights_from_libsvm_proxy(
+    train_libsvm_path: Path,
+    base_sw: pd.Series,
+    recipe: str,
+) -> Tuple[pd.Series, Dict[str, Any]]:
+    """OOM-safe fallback: derive stage-1 style ranking weights from LibSVM stream."""
+    recipe_n = resolve_ranking_recipe(recipe)
+    sw = base_sw.astype(float).copy()
+    if recipe_n == RANKING_RECIPE_BASELINE:
+        return sw, {
+            "ranking_recipe": recipe_n,
+            "ranking_weight_source": "libsvm_proxy_stream",
+            "ranking_weight_finalized": True,
+            "ranking_hnm_mode": "none",
+            "ranking_recipe_weight_mean": float(sw.mean()) if len(sw) else 0.0,
+            "ranking_recipe_weight_max": float(sw.max()) if len(sw) else 0.0,
+        }
+    labels: list[int] = []
+    proxy_vals: list[float] = []
+    with open(train_libsvm_path, encoding="utf-8") as f:
+        for raw in f:
+            s = raw.strip()
+            if not s:
+                continue
+            toks = s.split()
+            try:
+                labels.append(1 if float(toks[0]) > 0.0 else 0)
+            except ValueError:
+                labels.append(0)
+            acc = 0.0
+            for tok in toks[1:]:
+                if ":" not in tok:
+                    continue
+                try:
+                    acc += float(tok.split(":", 1)[1])
+                except ValueError:
+                    continue
+            proxy_vals.append(acc)
+    n = min(len(sw), len(proxy_vals))
+    if n <= 0:
+        return sw, {
+            "ranking_recipe": recipe_n,
+            "ranking_weight_source": "libsvm_proxy_stream",
+            "ranking_weight_finalized": True,
+            "ranking_hnm_mode": "none",
+            "ranking_recipe_hnm_skipped": "empty_or_unreadable_libsvm",
+        }
+    y = np.asarray(labels[:n], dtype=float)
+    proxy = np.asarray(proxy_vals[:n], dtype=float)
+    neg_mask = y == 0.0
+    pos_mask = y == 1.0
+    n_tb_neg = 0
+    n_tb_pos = 0
+    n_hnm = 0
+    if recipe_n in (RANKING_RECIPE_TOP_BAND, RANKING_RECIPE_COMBINED):
+        if neg_mask.any():
+            thr_n = float(np.quantile(proxy[neg_mask], 0.90))
+            sel = neg_mask & (proxy >= thr_n)
+            idx = np.flatnonzero(sel)
+            n_tb_neg = int(idx.size)
+            sw.iloc[idx] *= 1.6
+        if pos_mask.any():
+            thr_p = float(np.quantile(proxy[pos_mask], 0.75))
+            sel = pos_mask & (proxy >= thr_p)
+            idx = np.flatnonzero(sel)
+            n_tb_pos = int(idx.size)
+            sw.iloc[idx] *= 1.15
+    if recipe_n in (RANKING_RECIPE_HNM, RANKING_RECIPE_COMBINED):
+        if neg_mask.any():
+            thr_h = float(np.quantile(proxy[neg_mask], 0.98))
+            sel = neg_mask & (proxy >= thr_h)
+            idx = np.flatnonzero(sel)
+            n_hnm = int(idx.size)
+            sw.iloc[idx] *= 2.0
+    sw = sw.clip(lower=1e-12)
+    return sw, {
+        "ranking_recipe": recipe_n,
+        "ranking_weight_source": "libsvm_proxy_stream",
+        "ranking_weight_finalized": True,
+        "ranking_hnm_mode": (
+            "sampled_shallow_lgbm_stream_rewrite"
+            if recipe_n in (RANKING_RECIPE_HNM, RANKING_RECIPE_COMBINED)
+            else "none"
+        ),
+        "ranking_recipe_top_band_neg_boosted": n_tb_neg,
+        "ranking_recipe_top_band_pos_boosted": n_tb_pos,
+        "ranking_recipe_pseudo_hnm_neg_boosted": n_hnm,
+        "ranking_recipe_hnm_skipped": "shallow_lgbm_streaming_not_available_using_proxy_tail",
+        "ranking_recipe_weight_mean": float(sw.mean()) if len(sw) else 0.0,
+        "ranking_recipe_weight_max": float(sw.max()) if len(sw) else 0.0,
+    }

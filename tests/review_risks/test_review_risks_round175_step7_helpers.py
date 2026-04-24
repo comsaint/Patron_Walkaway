@@ -174,6 +174,32 @@ class TestR175ProductionSourceAssertReplaced(unittest.TestCase):
                     "Production should use if/raise ValueError for train_frac/valid_frac, not assert"
                 )
 
+    def test_r175_fallback_body_should_enforce_small_data_limit_before_concat(self):
+        """Pandas fallback should be reserved for tiny chunk sets, not medium/large production windows."""
+        source = _get_trainer_source()
+        body = _find_step7_pandas_fallback_body(source)
+        self.assertIsNotNone(body)
+        self.assertIn(
+            "STEP7_PANDAS_FALLBACK_MAX_BYTES",
+            body,
+            "_step7_pandas_fallback should consult an explicit small-data byte limit.",
+        )
+        self.assertIn(
+            "_chunk_total_bytes_local > STEP7_PANDAS_FALLBACK_MAX_BYTES",
+            body,
+            "_step7_pandas_fallback should block medium/large chunk sets before pandas concat.",
+        )
+        self.assertIn(
+            "fallback limit",
+            body,
+            "Fallback error message should explain that pandas is only for tiny test/dev datasets.",
+        )
+        self.assertIn(
+            "tiny test/dev datasets",
+            body,
+            "Fallback error message should explain that pandas is only for tiny test/dev datasets.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

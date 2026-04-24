@@ -93,8 +93,8 @@ class TestR216_1_ValidDfNoneNoAttributeError(unittest.TestCase):
             self.assertIsNotNone(metrics.get("rated"))
             self.assertIn("val_ap", metrics.get("rated") or {})
 
-    def test_valid_df_none_libsvm_path_skips_inmemory_sample_weight_prep(self):
-        """LibSVM success path should not call compute_sample_weights when no in-memory fallback/A3/A4 is needed."""
+    def test_valid_df_none_libsvm_path_allows_inmemory_weight_prep_for_parity(self):
+        """LibSVM path may prepare in-memory weights to keep A2 parity; should still train without errors."""
         from trainer.trainer import train_single_rated_model, DATA_DIR
 
         feature_cols = ["f1", "f2"]
@@ -107,14 +107,13 @@ class TestR216_1_ValidDfNoneNoAttributeError(unittest.TestCase):
                 weight_lines=["1.0", "1.0"],
                 valid_lines=["0 0:0.0 1:0.0", "1 0:0.0 1:0.0"],
             )
-            with patch("trainer.trainer.compute_sample_weights", side_effect=AssertionError("should stay on LibSVM path")):
-                art, _, metrics = train_single_rated_model(
-                    train_df,
-                    None,
-                    feature_cols,
-                    run_optuna=False,
-                    train_libsvm_paths=(train_p, valid_p),
-                )
+            art, _, metrics = train_single_rated_model(
+                train_df,
+                None,
+                feature_cols,
+                run_optuna=False,
+                train_libsvm_paths=(train_p, valid_p),
+            )
             self.assertIsNotNone(art)
             self.assertIsNotNone(metrics.get("rated"))
 
@@ -239,6 +238,24 @@ class TestR216_6_ValidLibsvmPathUnderDataDir(unittest.TestCase):
             has_check,
             "R216 Review #6: between unpack and file use, valid_libsvm_p must be checked to be under DATA_DIR (resolve).",
         )
+
+
+class TestR216_7_LibsvmWeightParityContract(unittest.TestCase):
+    """LibSVM path should materialize final ranking weights and invalidate stale .bin."""
+
+    def test_train_single_rated_model_has_no_libsvm_skip_flag(self):
+        """Regression: do not emit legacy 'ranking_recipe_pre_optuna_skipped=libsvm_disk_weights'."""
+        src = _get_func_src("train_single_rated_model")
+        self.assertNotIn("ranking_recipe_pre_optuna_skipped", src)
+        self.assertNotIn("libsvm_disk_weights", src)
+
+    def test_train_single_rated_model_rewrites_weight_and_invalidates_bin(self):
+        """Contract: when using LibSVM path, canonical weights are rewritten and stale .bin is invalidated."""
+        src = _get_func_src("train_single_rated_model")
+        self.assertIn("write_libsvm_weight_file(", src)
+        self.assertIn("invalidate_lgb_binary_cache_for_libsvm(", src)
+        self.assertIn('ranking_meta_hnm["ranking_weight_source"] = "libsvm_rewritten"', src)
+        self.assertIn('ranking_meta_hnm["ranking_weight_finalized"] = True', src)
 
 
 if __name__ == "__main__":

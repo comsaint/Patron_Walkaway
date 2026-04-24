@@ -16,6 +16,8 @@ Exposure classes in this shard:
 # --- Step 7 on-disk footprint estimate (internal guards) ---
 CHUNK_CONCAT_MEMORY_WARN_BYTES = int(1 * (1024**3))  # 1 GB on-disk total
 CHUNK_CONCAT_RAM_FACTOR = 15  # on-disk size × this × (1 + TRAIN_SPLIT_FRAC) ≈ Step 7 peak RAM
+# Pandas fallback is reserved for tiny test/dev-sized chunk sets only.
+STEP7_PANDAS_FALLBACK_MAX_BYTES = 256 * 1024 * 1024
 
 # --- Negative sampling / OOM pre-check ---
 # User policy knob: keep all positives, optionally reduce negatives.

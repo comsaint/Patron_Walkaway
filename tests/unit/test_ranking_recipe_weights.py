@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from trainer.training.ranking_recipe_weights import (
+    build_final_ranking_weights_from_libsvm_proxy,
     RANKING_RECIPE_BASELINE,
     RANKING_RECIPE_COMBINED,
     RANKING_RECIPE_HNM,
     RANKING_RECIPE_TOP_BAND,
     apply_ranking_recipe_pre_optuna_weights,
     apply_top_band_reweighting,
+    read_libsvm_weight_file,
     refine_weights_hnm_shallow_lgbm,
     resolve_ranking_recipe,
+    write_libsvm_weight_file,
 )
 
 
@@ -133,3 +138,33 @@ def test_refine_hnm_boosts_some_negatives() -> None:
     )
     assert int(meta.get("ranking_recipe_hnm_shallow_neg_boosted", 0)) >= 1
     assert float(sw2.max()) > 1.0
+
+
+def test_read_and_write_libsvm_weight_file_roundtrip(tmp_path: Path) -> None:
+    p = tmp_path / "train.libsvm.weight"
+    w = pd.Series([1.0, 0.5, 2.25], dtype=float)
+    write_libsvm_weight_file(p, w)
+    got = read_libsvm_weight_file(p, expected_rows=3)
+    pd.testing.assert_series_equal(got, w, check_names=False)
+
+
+def test_build_final_weights_from_libsvm_proxy_applies_reweight(tmp_path: Path) -> None:
+    p = tmp_path / "train.libsvm"
+    lines = [
+        "0 0:0.1 1:0.1",
+        "0 0:5.0 1:4.0",
+        "0 0:6.0 1:5.0",
+        "1 0:0.2 1:0.2",
+        "1 0:4.0 1:4.5",
+    ]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    base = pd.Series(1.0, index=np.arange(len(lines)), dtype=float)
+    sw, meta = build_final_ranking_weights_from_libsvm_proxy(
+        p,
+        base,
+        RANKING_RECIPE_COMBINED,
+    )
+    assert len(sw) == len(lines)
+    assert float(sw.max()) > 1.0
+    assert meta["ranking_weight_source"] == "libsvm_proxy_stream"
+    assert meta["ranking_weight_finalized"] is True

@@ -70,9 +70,107 @@ python -m pytest tests/review_risks/test_review_risks_oom_phase1_phase2a.py test
 
 ### 下一步建議
 
-1. 往 **Step 7 / Step 8** 繼續：把 pandas fallback 更明確降級成僅小資料例外路徑，並收斂 Step 8 in-memory screening 的 full-train 預設。  
-2. 若要更進一步處理真實 OOM，再補一輪 behavior-level / tiny synthetic evidence，紀錄 Step 6 / Step 7 before-after 的 row-count、chunk bytes、runtime 與記憶體訊號。  
+1. 若要更進一步處理真實 OOM，再補一輪 behavior-level / tiny synthetic evidence，紀錄 Step 6 / Step 7 / Step 8 before-after 的 row-count、chunk bytes、runtime 與記憶體訊號。  
+2. 可再檢查 Step 8 / Step 9 之間是否還有 screening sample、`active_feature_cols` 或 train export 中間物件可更早釋放。  
 3. 若要整理治理面，下一份應補的是 **working / execution plan**，把 `Step 6 cleanup -> Step 7 fallback hardening -> Step 8 sample default -> Step 9 file-based tightening` 串成可執行波次。
+
+## OOM Step 7/8 Continue — pipeline diagnostics runtime evidence（2026-04-24）
+
+**本輪完成**
+
+1. `pipeline_diagnostics.json` 補上 Step 7/8 runtime evidence 欄位。  
+   - Step 7：新增 `step7_chunk_parquet_total_bytes`、`step7_chunk_parquet_est_ram_gb`。  
+   - Step 8：新增 `step8_screening_source`、`step8_screening_stats_source`、`step8_screening_sample_rows`、`step8_screening_full_train_rows`、`step8_screening_candidate_cols`、`step8_screened_feature_count`。  
+   - 這些欄位只在執行期有值時寫出，延續 helper 原本的「omit None keys」契約。
+
+2. `run_pipeline()` 已把最近幾輪 hardening 的關鍵數字接到 diagnostics。  
+   - Step 7 chunk parquet bytes / 估算 RAM 直接取自既有 warning 計算。  
+   - Step 8 會記錄 screening 是來自 `in_memory_head` 還是 `train_file_head`，以及 std/corr 的 stats source 是 `screening_sample_df` 還是 `train_path`。  
+   - 同時記下 sample rows、full train rows、candidate 欄位數、最終 screened feature 數，方便後續比對 before/after。
+
+3. 補 helper 與 call-site 契約測試。  
+   - helper 行為測試：直接寫出 `pipeline_diagnostics.json`，確認新欄位真的落盤。  
+   - run_pipeline source-contract：鎖住 `_write_pipeline_diagnostics_json(...)` 呼叫必須把 Step 7/8 evidence 欄位傳進去。
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/training/trainer.py` | `_write_pipeline_diagnostics_json()` 擴充 Step 7/8 runtime evidence 欄位；`run_pipeline()` 新增 Step 7 chunk parquet bytes/est RAM 與 Step 8 screening source/sample/full-row/candidate/screened-count 的接線。 |
+| `tests/review_risks/test_review_risks_pipeline_diagnostics_write_review.py` | 新增 helper 行為測試，確認 `pipeline_diagnostics.json` 會寫出 Step 7/8 evidence 欄位。 |
+| `tests/review_risks/test_review_risks_pipeline_plan_section6_contract.py` | 新增 source-contract，鎖住 `run_pipeline()` 對 `_write_pipeline_diagnostics_json(...)` 的 Step 7/8 evidence pass-through。 |
+
+**驗證**
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_pipeline_diagnostics_write_review.py tests/review_risks/test_review_risks_pipeline_plan_section6_contract.py tests/review_risks/test_review_risks_step8_duckdb_std.py tests/review_risks/test_review_risks_round184_step8_sample.py tests/integration/test_features.py -q
+```
+
+- 結果：`87 passed, 1 skipped`
+- `ReadLints`：本輪修改檔案無新增 lint 問題。
+
+## OOM Step 8 Continue — in-memory screening sample-only handoff（2026-04-24）
+
+**本輪完成**
+
+1. 收斂 Step 8 in-memory screening 的 full-train 預設。  
+   - 過去 `run_pipeline()` 雖然已把 `feature_matrix` cap 成 `_matrix_for_screen = train_df.head(...)`，但仍把整個 `train_df` 傳入 `screen_features(train_df=...)`。  
+   - `screen_features()` 在 `train_path is None` 時，DuckDB std/corr 會直接吃這個 `train_df`，等於 Step 8 還是會重新碰 full train。  
+   - 本輪改成 in-memory path 只把 `_screen_train_df = _matrix_for_screen` 傳入 `screen_features()`，讓 std/corr 與 MI/LGBM 一樣都只針對 screening sample。
+
+2. 保留 keep-on-disk / from-file 路徑的 full-train-from-path 行為。  
+   - 若 `step7_train_path` 存在，Step 8 仍可用 `train_path=...` 讓 DuckDB 從檔案做 std/corr。  
+   - 只有 in-memory path 才收斂成 sample-only handoff，避免額外把 full `train_df` 再送進 DuckDB df path。
+
+3. 補 Step 8 source-contract。  
+   - 鎖住 Step 8 block 必須維持 `_screen_train_df` 這個 screening 專用 handle。  
+   - 鎖住 `screen_features()` 的 in-memory 傳入改為 `train_df=_screen_train_df`。  
+   - 鎖住舊的 `train_df=train_df if train_df is not None else None` 不可回歸。
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/training/trainer.py` | Step 8 新增 `_screen_train_df`；in-memory path 以 `_matrix_for_screen` 作為 `screen_features(train_df=...)` 的唯一資料來源，不再把 full `train_df` 送入 DuckDB std/corr df path；keep-on-disk path 維持 `train_path`。 |
+| `tests/review_risks/test_review_risks_step8_duckdb_std.py` | 更新/新增 source-contract：要求 Step 8 維持 `_screen_train_df`，且 `screen_features()` 必須接收 `train_df=_screen_train_df`，禁止回退成 full `train_df` pass-through。 |
+
+**驗證**
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_step8_duckdb_std.py tests/review_risks/test_review_risks_round184_step8_sample.py tests/review_risks/test_review_risks_round219_plan_b_plus_stage6_step2.py tests/integration/test_features.py -q
+```
+
+- 結果：`74 passed, 1 skipped`
+- `ReadLints`：本輪修改檔案無新增 lint 問題。
+
+## OOM Step 7 Continue — pandas fallback small-data gate（2026-04-24）
+
+**本輪完成**
+
+1. `_step7_pandas_fallback()` 從「只有 RAM estimate guard」升級成「small-data byte gate + RAM guard」雙層阻擋。  
+   - 先計算 `chunk_paths` parquet 總 bytes。  
+   - 若總量已超過 `STEP7_PANDAS_FALLBACK_MAX_BYTES`，直接 fail-fast，不再讓中大型資料集落入 pandas concat/sort。  
+   - 只有通過 small-data gate 的 tiny test/dev dataset，才繼續做既有的 available-RAM 安全預估。
+
+2. 新增 `STEP7_PANDAS_FALLBACK_MAX_BYTES` internal guard。  
+   - 放在 `trainer/core/_config_training_memory.py`，目前預設 `256 * 1024 * 1024`。  
+   - 這不是日常調參 knob，而是用來把 pandas fallback 明確限縮為小資料例外路徑。
+
+3. 補 Step 7 source-contract。  
+   - 鎖住 `_step7_pandas_fallback()` 必須檢查 `STEP7_PANDAS_FALLBACK_MAX_BYTES`。  
+   - 鎖住 medium/large chunk sets 必須在 `pd.concat` 前就被 block。  
+   - 鎖住錯誤訊息需明確說明 pandas fallback 僅保留給 tiny test/dev datasets。
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/core/_config_training_memory.py` | 新增 internal guard `STEP7_PANDAS_FALLBACK_MAX_BYTES = 256 * 1024 * 1024`，註明 pandas fallback 僅保留給 tiny test/dev-sized chunk sets。 |
+| `trainer/training/trainer.py` | 兩個 config 匯入路徑都新增 `STEP7_PANDAS_FALLBACK_MAX_BYTES`；`_step7_pandas_fallback()` 的 guard 改為先做 small-data byte gate，再做 RAM budget guard。 |
+| `tests/review_risks/test_review_risks_round175_step7_helpers.py` | 新增 source-contract：要求 `_step7_pandas_fallback()` 檢查 `STEP7_PANDAS_FALLBACK_MAX_BYTES`、在 `pd.concat` 前 block 中大型 chunk sets，並在訊息中說明 tiny test/dev dataset 限制。 |
+
+**驗證**
+
+```bash
+python -m pytest tests/review_risks/test_review_risks_round175_step7_helpers.py tests/review_risks/test_review_risks_round177_step7_orchestrator.py tests/review_risks/test_review_risks_round219_plan_b_plus_stage6_step2.py tests/review_risks/test_review_risks_round184_step8_sample.py -q
+```
+
+- 結果：`34 passed`
+- `ReadLints`：本輪修改檔案無新增 lint 問題。
 
 ## OOM Step 6 Continue — identity canonical mapping pandas path（2026-04-24）
 

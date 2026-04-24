@@ -220,3 +220,20 @@ class TestSection6OomPrecheckRatioFormula(unittest.TestCase):
             "ratio assignment must remain under positive precheck guard",
         )
 
+    def test_pipeline_diagnostics_call_includes_step7_step8_runtime_evidence(self):
+        src = _run_pipeline_src()
+        i = src.find("_write_pipeline_diagnostics_json(")
+        self.assertGreater(i, 0, "expected pipeline diagnostics write call")
+        window = src[i : i + 2400]
+        for token in (
+            "step7_chunk_parquet_total_bytes=step7_chunk_parquet_total_bytes",
+            "step7_chunk_parquet_est_ram_gb=step7_chunk_parquet_est_ram_gb",
+            "step8_screening_source=step8_screening_source",
+            "step8_screening_stats_source=step8_screening_stats_source",
+            "step8_screening_sample_rows=step8_screening_sample_rows",
+            "step8_screening_full_train_rows=step8_screening_full_train_rows",
+            "step8_screening_candidate_cols=step8_screening_candidate_cols",
+            "step8_screened_feature_count=step8_screened_feature_count",
+        ):
+            self.assertIn(token, window)
+

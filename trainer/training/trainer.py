@@ -84,8 +84,11 @@ from trainer.training.ranking_recipe_weights import (
     RANKING_RECIPE_BASELINE,
     RANKING_RECIPE_COMBINED,
     RANKING_RECIPE_HNM,
-    apply_ranking_recipe_pre_optuna_weights,
-    refine_weights_hnm_shallow_lgbm,
+    build_final_ranking_weights_from_libsvm_proxy,
+    build_final_ranking_weights_in_memory,
+    invalidate_lgb_binary_cache_for_libsvm,
+    read_libsvm_weight_file,
+    write_libsvm_weight_file,
     resolve_ranking_recipe,
 )
 from trainer.training.two_stage import (
@@ -205,6 +208,7 @@ try:
     HISTORY_BUFFER_DAYS: int = getattr(_cfg, "HISTORY_BUFFER_DAYS", 2)
     CHUNK_CONCAT_MEMORY_WARN_BYTES: int = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 1 * (1024**3))
     CHUNK_CONCAT_RAM_FACTOR: float = getattr(_cfg, "CHUNK_CONCAT_RAM_FACTOR", 3)
+    STEP7_PANDAS_FALLBACK_MAX_BYTES: int = getattr(_cfg, "STEP7_PANDAS_FALLBACK_MAX_BYTES", 256 * 1024 * 1024)
     TRAIN_SPLIT_FRAC: float = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
     VALID_SPLIT_FRAC: float = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
     MIN_VALID_TEST_ROWS: int = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
@@ -266,6 +270,7 @@ except ModuleNotFoundError:
     HISTORY_BUFFER_DAYS = getattr(_cfg, "HISTORY_BUFFER_DAYS", 2)
     CHUNK_CONCAT_MEMORY_WARN_BYTES = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 1 * (1024**3))
     CHUNK_CONCAT_RAM_FACTOR = getattr(_cfg, "CHUNK_CONCAT_RAM_FACTOR", 3)
+    STEP7_PANDAS_FALLBACK_MAX_BYTES = getattr(_cfg, "STEP7_PANDAS_FALLBACK_MAX_BYTES", 256 * 1024 * 1024)
     TRAIN_SPLIT_FRAC = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
     VALID_SPLIT_FRAC = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
     MIN_VALID_TEST_ROWS = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
@@ -2752,8 +2757,12 @@ def _export_train_valid_to_csv(
     # Weight for train (same semantics as compute_sample_weights)
     weight_series = compute_sample_weights(train_rated)
     _recipe_csv = resolve_ranking_recipe(ranking_recipe)
-    weight_series, _ = apply_ranking_recipe_pre_optuna_weights(
-        train_rated, weight_series, _recipe_csv, common_cols
+    weight_series, _ = build_final_ranking_weights_in_memory(
+        train_rated,
+        weight_series,
+        _recipe_csv,
+        common_cols,
+        lgb_classifier_params=None,
     )
     train_export = train_rated[cols_train_plus_label].copy()
     train_export.insert(len(cols_train_plus_label), "weight", weight_series.values)
@@ -5192,9 +5201,10 @@ def train_single_rated_model(
     if (not use_from_libsvm) or gbm_bakeoff or A4_TWO_STAGE_ENABLE_TRAINING:
         _ensure_inmemory_train_views(avail_cols)
 
+    _train_rated_for_weights = _get_train_rated()
     sw_base = (
-        compute_sample_weights(_get_train_rated())
-        if train_rated is not None and not train_rated.empty
+        compute_sample_weights(_train_rated_for_weights)
+        if not _train_rated_for_weights.empty
         else pd.Series(dtype=float)
     )
     _dupe_cols = [c for c in set(avail_cols) if avail_cols.count(c) > 1]
@@ -5215,33 +5225,40 @@ def train_single_rated_model(
     )
     # #endregion
 
-    # A2 / R2: optional ranking-focused sample weights (rated train only; DEC-013 base retained).
-    if use_from_libsvm:
-        sw_rated = sw_base.astype(float).copy()
-        ranking_meta_pre = {
-            "ranking_recipe": recipe_use,
-            "ranking_recipe_pre_optuna_skipped": "libsvm_disk_weights",
-        }
-        if recipe_use != RANKING_RECIPE_BASELINE:
-            logger.warning(
-                "ranking_recipe=%s: LibSVM lgb.train uses on-disk .weight; "
-                "re-export LibSVM after changing --ranking-recipe for full parity.",
-                recipe_use,
-            )
-    else:
-        sw_rated, ranking_meta_pre = apply_ranking_recipe_pre_optuna_weights(
+    # A2 / R2 canonical stage-1 weights (shared source for all backends).
+    if not _get_train_rated().empty:
+        sw_rated, ranking_meta_pre = build_final_ranking_weights_in_memory(
             _get_train_rated(),
             sw_base,
             recipe_use,
             avail_cols,
+            lgb_classifier_params=None,
         )
-        if not _get_train_rated().empty:
-            logger.info(
-                "R2 ranking recipe=%s pre_optuna weight_mean=%.6f max=%.6f",
-                recipe_use,
-                float(ranking_meta_pre.get("ranking_recipe_weight_mean", 0.0)),
-                float(ranking_meta_pre.get("ranking_recipe_weight_max", 0.0)),
-            )
+    elif use_from_libsvm:
+        train_libsvm_p, _valid_libsvm_p = train_libsvm_paths  # type: ignore[misc]
+        _weight_path = Path(str(train_libsvm_p) + ".weight")
+        sw_base_file = read_libsvm_weight_file(_weight_path, expected_rows=int(_n_lines))
+        sw_rated, ranking_meta_pre = build_final_ranking_weights_from_libsvm_proxy(
+            train_libsvm_p,
+            sw_base_file,
+            recipe_use,
+        )
+    else:
+        sw_rated = sw_base.astype(float).copy()
+        ranking_meta_pre = {
+            "ranking_recipe": recipe_use,
+            "ranking_weight_source": "empty_train",
+            "ranking_weight_finalized": True,
+            "ranking_hnm_mode": "none",
+        }
+    if not _get_train_rated().empty:
+        logger.info(
+            "R2 ranking recipe=%s stage1 weight_mean=%.6f max=%.6f source=%s",
+            recipe_use,
+            float(ranking_meta_pre.get("ranking_recipe_weight_mean", 0.0)),
+            float(ranking_meta_pre.get("ranking_recipe_weight_max", 0.0)),
+            ranking_meta_pre.get("ranking_weight_source", "unknown"),
+        )
 
     _ft_pre_path_raw = (os.environ.get(FIELD_TEST_OBJECTIVE_PRECONDITION_JSON_ENV) or "").strip()
     if _ft_pre_path_raw:
@@ -5298,23 +5315,29 @@ def train_single_rated_model(
             "min_child_samples": 20,
         }
 
-    ranking_meta_hnm = {}
-    if (
-        not use_from_libsvm
-        and not use_from_file
-        and recipe_use in (RANKING_RECIPE_HNM, RANKING_RECIPE_COMBINED)
-        and not _get_train_rated().empty
-    ):
-        sw_rated, ranking_meta_hnm = refine_weights_hnm_shallow_lgbm(
-            X_tr,
-            y_tr,
-            sw_rated,
-            {**_lgb_params_for_pipeline(), **hp},
+    ranking_meta_hnm: Dict[str, Any] = {}
+    if recipe_use in (RANKING_RECIPE_HNM, RANKING_RECIPE_COMBINED) and not _get_train_rated().empty:
+        sw_rated, ranking_meta_hnm = build_final_ranking_weights_in_memory(
+            _get_train_rated(),
+            sw_base,
+            recipe_use,
+            avail_cols,
+            lgb_classifier_params={**_lgb_params_for_pipeline(), **hp},
         )
         logger.info(
-            "R2 shallow HNM refine: boosted_negs=%s",
+            "R2 final weights built with HNM mode=%s boosted_negs=%s",
+            ranking_meta_hnm.get("ranking_hnm_mode"),
             ranking_meta_hnm.get("ranking_recipe_hnm_shallow_neg_boosted"),
         )
+    if use_from_libsvm:
+        train_libsvm_p, _valid_libsvm_p = train_libsvm_paths  # type: ignore[misc]
+        _weight_path = Path(str(train_libsvm_p) + ".weight")
+        write_libsvm_weight_file(_weight_path, sw_rated)
+        _invalidated_bin = invalidate_lgb_binary_cache_for_libsvm(train_libsvm_p)
+        if _invalidated_bin is not None:
+            logger.info("R2 LibSVM parity: invalidated stale binary cache %s", _invalidated_bin)
+        ranking_meta_hnm["ranking_weight_source"] = "libsvm_rewritten"
+        ranking_meta_hnm["ranking_weight_finalized"] = True
 
     if use_from_libsvm:
         # PLAN B+ §4.4: train from LibSVM file; LightGBM auto-loads .weight when beside .libsvm.
@@ -5369,8 +5392,8 @@ def train_single_rated_model(
             weight_path = Path(str(train_libsvm_p) + ".weight")
             _train_path_for_lgb: Union[str, Path] = train_libsvm_p
             if weight_path.exists():
-                with open(weight_path, encoding="utf-8") as _wf:
-                    _train_weights = [float(line.strip()) for line in _wf]
+                _train_weights_s = read_libsvm_weight_file(weight_path, expected_rows=int(_n_lines))
+                _train_weights = _train_weights_s.to_list()
                 if len(_train_weights) != _n_lines:
                     logger.warning(
                         "Plan B+: .weight file line count (%s) does not match train LibSVM line count (%s); ignoring weights.",
@@ -6832,6 +6855,14 @@ def _write_pipeline_diagnostics_json(
     step7_rss_end_gb: Optional[float] = None,
     step7_sys_available_min_gb: Optional[float] = None,
     step7_sys_used_percent_peak: Optional[float] = None,
+    step7_chunk_parquet_total_bytes: Optional[int] = None,
+    step7_chunk_parquet_est_ram_gb: Optional[float] = None,
+    step8_screening_source: Optional[str] = None,
+    step8_screening_stats_source: Optional[str] = None,
+    step8_screening_sample_rows: Optional[int] = None,
+    step8_screening_full_train_rows: Optional[int] = None,
+    step8_screening_candidate_cols: Optional[int] = None,
+    step8_screened_feature_count: Optional[int] = None,
     chunk_cache_stats: Optional[Dict[str, int]] = None,
     output_dir: Optional[Path] = None,
 ) -> None:
@@ -6867,6 +6898,14 @@ def _write_pipeline_diagnostics_json(
         "step7_rss_end_gb": step7_rss_end_gb,
         "step7_sys_available_min_gb": step7_sys_available_min_gb,
         "step7_sys_used_percent_peak": step7_sys_used_percent_peak,
+        "step7_chunk_parquet_total_bytes": step7_chunk_parquet_total_bytes,
+        "step7_chunk_parquet_est_ram_gb": step7_chunk_parquet_est_ram_gb,
+        "step8_screening_source": step8_screening_source,
+        "step8_screening_stats_source": step8_screening_stats_source,
+        "step8_screening_sample_rows": step8_screening_sample_rows,
+        "step8_screening_full_train_rows": step8_screening_full_train_rows,
+        "step8_screening_candidate_cols": step8_screening_candidate_cols,
+        "step8_screened_feature_count": step8_screened_feature_count,
     }
     out = {k: v for k, v in payload.items() if v is not None}
     if chunk_cache_stats:
@@ -7007,6 +7046,14 @@ def run_pipeline(args) -> None:
             step7_sys_used_percent_peak: Optional[float] = None
             _step7_sys_available_start_gb: Optional[float] = None
             _step7_sys_used_percent_start: Optional[float] = None
+            step7_chunk_parquet_total_bytes: Optional[int] = None
+            step7_chunk_parquet_est_ram_gb: Optional[float] = None
+            step8_screening_source: Optional[str] = None
+            step8_screening_stats_source: Optional[str] = None
+            step8_screening_sample_rows: Optional[int] = None
+            step8_screening_full_train_rows: Optional[int] = None
+            step8_screening_candidate_cols: Optional[int] = None
+            step8_screened_feature_count: Optional[int] = None
             # Task 7 DoD: Step 6 chunk cache counters -> pipeline_diagnostics.json
             chunk_cache_stats: Dict[str, int] = {}
 
@@ -7731,6 +7778,16 @@ def run_pipeline(args) -> None:
                 def _guard_step7_pandas_fallback_memory() -> None:
                     """Fail fast when pandas fallback is very likely to OOM on current RAM."""
                     _chunk_total_bytes_local = sum(Path(p).stat().st_size for p in chunk_paths)
+                    if _chunk_total_bytes_local > STEP7_PANDAS_FALLBACK_MAX_BYTES:
+                        raise RuntimeError(
+                            "Step 7 pandas fallback blocked: chunk parquet total %.1f GB exceeds small-data "
+                            "fallback limit %.1f GB. Pandas fallback is reserved for tiny test/dev datasets; "
+                            "prefer STEP7_USE_DUCKDB=True, reduce --days / --start --end, or lower NEG_SAMPLE_FRAC."
+                            % (
+                                _chunk_total_bytes_local / (1024**3),
+                                STEP7_PANDAS_FALLBACK_MAX_BYTES / (1024**3),
+                            )
+                        )
                     _estimated_peak_bytes = int(
                         _chunk_total_bytes_local
                         * CHUNK_CONCAT_RAM_FACTOR
@@ -7992,6 +8049,8 @@ def run_pipeline(args) -> None:
             t0 = time.perf_counter()
             _chunk_total_bytes = sum(Path(p).stat().st_size for p in chunk_paths)
             _est_ram_gb = (_chunk_total_bytes * CHUNK_CONCAT_RAM_FACTOR) / (1024**3)
+            step7_chunk_parquet_total_bytes = _chunk_total_bytes
+            step7_chunk_parquet_est_ram_gb = _est_ram_gb
             if _chunk_total_bytes >= CHUNK_CONCAT_MEMORY_WARN_BYTES:
                 logger.warning(
                     "Chunk Parquets total %.2f GB on disk -> estimated %.1f GB RAM for concat + train/valid split. "
@@ -8185,11 +8244,13 @@ def run_pipeline(args) -> None:
                     if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1)
                     else 2_000_000
                 )
+                _screen_train_df: Optional[pd.DataFrame] = None
                 if train_df is not None:
                     _sample_n = STEP8_SCREEN_SAMPLE_ROWS if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1) else None
                     if _sample_n is not None:
                         _sample_n = int(_sample_n)  # Round 184 Review P2: coerce float to int before head()
                         _matrix_for_screen = train_df.head(_sample_n)
+                        _screen_train_df = _matrix_for_screen
                         if len(_matrix_for_screen) < _sample_n:
                             logger.info(
                                 "Step 8 screening: using first %d rows (train smaller than cap STEP8_SCREEN_SAMPLE_ROWS=%d); full train has %d rows",
@@ -8205,10 +8266,12 @@ def run_pipeline(args) -> None:
                             )
                     else:
                         _matrix_for_screen = train_df.head(_cap)
+                        _screen_train_df = _matrix_for_screen
                         logger.info(
-                            "Step 8 screening: std via DuckDB on full train (%d rows); matrix capped at %d rows for corr/MI/LGBM",
-                            len(train_df),
+                            "Step 8 screening: using first %d rows from in-memory train (full train has %d rows); "
+                            "screening no longer re-reads full train for DuckDB std/corr",
                             len(_matrix_for_screen),
+                            len(train_df),
                         )
                 else:
                     _matrix_for_screen = _train_for_screen
@@ -8217,6 +8280,18 @@ def run_pipeline(args) -> None:
                         len(_matrix_for_screen),
                         _n_train_print,
                     )
+                step8_screening_source = (
+                    "in_memory_head" if train_df is not None else "train_file_head"
+                )
+                step8_screening_stats_source = (
+                    "screening_sample_df" if train_df is not None else "train_path"
+                )
+                step8_screening_sample_rows = len(_matrix_for_screen)
+                step8_screening_full_train_rows = (
+                    len(train_df) if train_df is not None else _n_train_print
+                )
+                step8_screening_candidate_cols = len(_present_candidate_cols)
+                step8_screened_feature_count = None
                 print("[Step 8/10] Feature screening…", flush=True)
                 t0 = time.perf_counter()
                 screened_cols = screen_features(
@@ -8225,10 +8300,11 @@ def run_pipeline(args) -> None:
                     feature_names=_present_candidate_cols,
                     screen_method=SCREEN_FEATURES_METHOD,
                     train_path=step7_train_path if step7_train_path is not None else None,
-                    train_df=train_df if train_df is not None else None,
+                    train_df=_screen_train_df,
                 )
                 _el = time.perf_counter() - t0
                 step8_duration_sec = _el
+                step8_screened_feature_count = len(screened_cols)
                 print("[Step 8/10] Feature screening done in %.1fs (%d -> %d features)" % (_el, len(_present_candidate_cols), len(screened_cols)), flush=True)
                 logger.info(
                     "screen_features: %d -> %d features retained  (%.1fs)",
@@ -8489,6 +8565,14 @@ def run_pipeline(args) -> None:
                     step7_rss_end_gb=step7_rss_end_gb,
                     step7_sys_available_min_gb=step7_sys_available_min_gb,
                     step7_sys_used_percent_peak=step7_sys_used_percent_peak,
+                    step7_chunk_parquet_total_bytes=step7_chunk_parquet_total_bytes,
+                    step7_chunk_parquet_est_ram_gb=step7_chunk_parquet_est_ram_gb,
+                    step8_screening_source=step8_screening_source,
+                    step8_screening_stats_source=step8_screening_stats_source,
+                    step8_screening_sample_rows=step8_screening_sample_rows,
+                    step8_screening_full_train_rows=step8_screening_full_train_rows,
+                    step8_screening_candidate_cols=step8_screening_candidate_cols,
+                    step8_screened_feature_count=step8_screened_feature_count,
                     chunk_cache_stats=chunk_cache_stats,
                     output_dir=_bundle_dir,
                 )

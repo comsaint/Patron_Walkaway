@@ -221,6 +221,21 @@ class TestStep8TrainerCapAndPassThroughContract(unittest.TestCase):
         )
         self.assertIn("train_path=", src, "screen_features must be called with train_path=...")
         self.assertIn("train_df=", src, "screen_features must be called with train_df=...")
+        self.assertIn(
+            "_screen_train_df",
+            src,
+            "Step 8 should keep a dedicated screening DataFrame handle instead of always passing full train_df.",
+        )
+        self.assertIn(
+            "train_df=_screen_train_df",
+            src,
+            "In-memory Step 8 should pass the screening sample to screen_features, not the full train_df.",
+        )
+        self.assertNotIn(
+            "train_df=train_df if train_df is not None else None",
+            src,
+            "Step 8 should no longer forward the full in-memory train_df into screen_features.",
+        )
 
     def test_step8_cap_equals_default_when_config_none(self):
         """When STEP8_SCREEN_SAMPLE_ROWS is None, effective cap should be 2_000_000 (source contract)."""
