@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from trainer.core import config
+from trainer.core import _duckdb_runtime as duckdb_runtime
 
 
 class TestDuckDbRuntimePolicy(unittest.TestCase):
@@ -39,6 +41,15 @@ class TestDuckDbRuntimePolicy(unittest.TestCase):
         self.assertIn("SET memory_limit=", body)
         self.assertIn("SET threads=", body)
         self.assertIn("SET temp_directory=", body)
+
+    def test_sanitize_temp_directory_returns_resolved_absolute_path(self):
+        rel = str(Path("trainer") / ".data" / "duckdb_tmp")
+        sanitized = duckdb_runtime._sanitize_temp_directory(rel)
+        self.assertEqual(
+            sanitized,
+            str(Path(rel).resolve()),
+            "_sanitize_temp_directory should return resolved absolute path",
+        )
 
 
 if __name__ == "__main__":

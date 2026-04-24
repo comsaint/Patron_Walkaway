@@ -50,7 +50,7 @@ def _sanitize_temp_directory(temp_dir: Optional[str]) -> str:
             resolved.relative_to(_TRAINER_DATA_DIR)
     except (OSError, ValueError):
         return str(_DEFAULT_DUCKDB_TMP)
-    return raw
+    return str(resolved)
 
 
 def _stage_defaults(stage: DuckDBRuntimeStage) -> tuple[int, float, Optional[str]]:
