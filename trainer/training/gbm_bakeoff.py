@@ -210,37 +210,10 @@ def _to_float32_frame(X: pd.DataFrame) -> pd.DataFrame:
     return X.astype(np.float32, copy=False)
 
 
-def _map_hp_catboost(hp: Mapping[str, Any]) -> Dict[str, Any]:
-    return {
-        "iterations": int(hp.get("n_estimators", 400)),
-        "learning_rate": float(hp.get("learning_rate", 0.05)),
-        "depth": min(int(hp.get("max_depth", 8)), 16),
-        "l2_leaf_reg": max(float(hp.get("reg_lambda", 1.0)), 1e-8),
-        "random_seed": 42,
-        "verbose": False,
-        "early_stopping_rounds": 50,
-        "allow_writing_files": False,
-        "loss_function": "Logloss",
-        "thread_count": -1,
-    }
+def _default_backend_hyperparams(backend: str) -> Dict[str, Any]:
+    from trainer.training.trainer import _backend_hpo_defaults
 
-
-def _map_hp_xgboost(hp: Mapping[str, Any]) -> Dict[str, Any]:
-    return {
-        "n_estimators": int(hp.get("n_estimators", 400)),
-        "learning_rate": float(hp.get("learning_rate", 0.05)),
-        "max_depth": int(hp.get("max_depth", 8)),
-        "reg_lambda": float(hp.get("reg_lambda", 1.0)),
-        "reg_alpha": float(hp.get("reg_alpha", 0.0)),
-        "subsample": float(hp.get("subsample", 0.8)),
-        "colsample_bytree": float(hp.get("colsample_bytree", 0.8)),
-        "min_child_weight": max(float(hp.get("min_child_samples", 20)) / 5.0, 1.0),
-        "objective": "binary:logistic",
-        "tree_method": "hist",
-        "random_state": 42,
-        "n_jobs": -1,
-        "verbosity": 0,
-    }
+    return dict(_backend_hpo_defaults(backend))
 
 
 def _train_catboost_backend(
@@ -255,10 +228,12 @@ def _train_catboost_backend(
     val_dec026_min_alerts_per_hour: Optional[float],
 ) -> Tuple[Any, Dict[str, Any]]:
     from catboost import CatBoostClassifier
+    from trainer.training.trainer import _apply_backend_imbalance_params
 
-    c_hp = _map_hp_catboost(hp)
+    c_hp = dict(hp)
     iterations = int(c_hp.pop("iterations"))
     early = int(c_hp.pop("early_stopping_rounds"))
+    c_hp = _apply_backend_imbalance_params("catboost", c_hp, y_train)
     model = CatBoostClassifier(iterations=iterations, **c_hp)
     X_tr = _to_float32_frame(X_train)
     X_vl = _to_float32_frame(X_val)
@@ -299,9 +274,11 @@ def _train_xgboost_backend(
     val_dec026_min_alerts_per_hour: Optional[float],
 ) -> Tuple[Any, Dict[str, Any]]:
     import xgboost as xgb
+    from trainer.training.trainer import _apply_backend_imbalance_params
 
-    x_hp = _map_hp_xgboost(hp)
+    x_hp = dict(hp)
     n_est = int(x_hp.pop("n_estimators"))
+    x_hp = _apply_backend_imbalance_params("xgboost", x_hp, y_train)
     model = xgb.XGBClassifier(n_estimators=n_est, **x_hp)
     X_tr = _to_float32_frame(X_train)
     X_vl = _to_float32_frame(X_val)
@@ -492,6 +469,9 @@ def train_and_select_rated_gbm_family(
     y_test: Optional[pd.Series] = None,
     val_dec026_window_hours: Optional[float] = None,
     val_dec026_min_alerts_per_hour: Optional[float] = None,
+    run_optuna: bool = True,
+    field_test_constrained_optuna_objective_allowed: Optional[bool] = None,
+    per_backend_hyperparams: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Train 3 base backends plus soft-vote on aligned splits and return winner + report."""
     from trainer.training.trainer import (
@@ -499,11 +479,15 @@ def train_and_select_rated_gbm_family(
         _compute_feature_importance,
         _compute_test_metrics,
         _compute_train_metrics,
+        resolve_backend_optuna_budget,
+        run_backend_optuna_search,
     )
 
     lightgbm_model = lightgbm_artifact["model"]
     feature_cols = list(lightgbm_artifact["features"])
     lightgbm_metrics = dict(lightgbm_artifact["metrics"])
+    lightgbm_hp = dict((per_backend_hyperparams or {}).get("lightgbm") or hp)
+    lightgbm_metrics["best_hyperparams"] = dict(lightgbm_hp)
     _add_field_test_primary_keys(lightgbm_metrics, y_val)
     lightgbm_metrics["model_backend"] = "lightgbm"
     lightgbm_metrics["_val_scores"] = (
@@ -539,6 +523,10 @@ def train_and_select_rated_gbm_family(
             },
         }
     }
+    if "optuna_hpo_backend" not in rows["lightgbm"]:
+        rows["lightgbm"]["optuna_hpo_backend"] = "lightgbm"
+    if "optuna_hpo_enabled" not in rows["lightgbm"]:
+        rows["lightgbm"]["optuna_hpo_enabled"] = bool(run_optuna)
     candidate_artifacts: Dict[str, Dict[str, Any]] = {
         "lightgbm": {
             "model": lightgbm_model,
@@ -555,17 +543,56 @@ def train_and_select_rated_gbm_family(
         (_train_xgboost_backend, "xgboost"),
     ):
         try:
+            backend_manifest: list[dict[str, Any]] = []
+            if backend == "catboost":
+                hp_backend_default = _default_backend_hyperparams("catboost")
+            else:
+                hp_backend_default = _default_backend_hyperparams("xgboost")
+            hp_backend = dict((per_backend_hyperparams or {}).get(backend) or hp_backend_default)
+            if run_optuna and _has_strong_validation(X_val, y_val):
+                budget = resolve_backend_optuna_budget(backend)
+                hp_backend = run_backend_optuna_search(
+                    X_train,
+                    y_train,
+                    X_val,
+                    y_val,
+                    sw_train,
+                    backend=backend,
+                    n_trials=budget.get("n_trials"),
+                    label="rated",
+                    field_test_constrained_optuna_objective_allowed=field_test_constrained_optuna_objective_allowed,
+                    val_window_hours=val_dec026_window_hours,
+                    timeout_seconds=budget.get("timeout_seconds"),
+                    early_stop_patience=budget.get("early_stop_patience"),
+                    hpo_objective_manifest=backend_manifest,
+                )
+            else:
+                budget = resolve_backend_optuna_budget(backend)
+                backend_manifest.append(
+                    {
+                        "optuna_hpo_backend": backend,
+                        "optuna_hpo_enabled": False,
+                        "optuna_hpo_n_trials_requested": budget.get("n_trials"),
+                        "optuna_hpo_timeout_seconds": budget.get("timeout_seconds"),
+                        "optuna_hpo_early_stop_patience": budget.get("early_stop_patience"),
+                        "optuna_hpo_objective_mode": "disabled",
+                        "optuna_hpo_study_best_trial_value": None,
+                    }
+                )
             model, metrics = trainer_fn(
                 X_train,
                 y_train,
                 X_val,
                 y_val,
                 sw_train,
-                hp,
+                hp_backend,
                 val_dec026_window_hours=val_dec026_window_hours,
                 val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
             )
             metrics = dict(metrics)
+            metrics["best_hyperparams"] = dict(hp_backend)
+            if backend_manifest:
+                metrics.update(backend_manifest[0])
             metrics["_val_scores"] = (
                 np.asarray(
                     model.predict_proba(_to_float32_frame(X_val))[:, 1],

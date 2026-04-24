@@ -26,7 +26,11 @@ G1_PRECISION_MIN = 0.70
 G1_ALERT_VOLUME_MIN_PER_HOUR = 5
 G1_FBETA = 0.5
 OPTUNA_N_TRIALS = 150
+# Total HPO wall-clock budget for Step 9. When multiple GBM backends run HPO in
+# the same bakeoff, trainer.py splits this timeout evenly across the active
+# model candidates so all backends get the same time allowance.
 OPTUNA_TIMEOUT_SECONDS: Optional[int] = 10 * 60 * 1
+OPTUNA_ACTIVE_MODEL_COUNT_FOR_TOTAL_TIMEOUT_SPLIT: int = 3
 OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = 40
 OPTUNA_HPO_SAMPLE_ROWS: Optional[int] = 1500000
 THRESHOLD_FBETA: float = 0.5
