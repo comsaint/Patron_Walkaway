@@ -269,6 +269,8 @@ def harvest_phase2_job_training_metrics(
             continue
         assert path is not None
         obj, err = _load_json_object(path)
+        if obj is not None:
+            obj = _training_metrics_payload_for_bundle_json(path, obj)
         row: dict[str, Any] = {
             "track": track,
             "exp_id": eid,
@@ -346,13 +348,14 @@ def validate_phase2_training_metrics_after_trainer_jobs(
                 "E_ARTIFACT_MISSING",
                 f"{tr}/{eid}: {err or 'invalid training_metrics JSON'} ({rel_disp})",
             )
+        obj = _training_metrics_payload_for_bundle_json(path, obj)
         if _phase2_training_metrics_pat_preview(obj) is None:
             prk = evaluators.PHASE2_BACKTEST_PR1_KEY
             return (
                 False,
                 "E_NO_DATA_WINDOW",
                 f"{tr}/{eid}: training_metrics lacks parseable {prk} "
-                f"(expected under model_default or rated) ({rel_disp})",
+                f"(expected under model_default, rated, or merged top-level) ({rel_disp})",
             )
     return True, None, None
 
@@ -486,6 +489,25 @@ def _load_json_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(raw, dict):
         return None, f"expected JSON object at root, got {type(raw).__name__}"
     return raw, None
+
+
+def _training_metrics_payload_for_bundle_json(
+    path: Path, raw: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """When *path* is a bundle training metrics file, return v2-first merged view (Phase B)."""
+    if not isinstance(raw, dict):
+        return raw
+    if path.name not in ("training_metrics.json", "training_metrics.v2.json"):
+        return raw
+    try:
+        from trainer.core.training_metrics_bundle import load_training_metrics_merged
+
+        _src, merged = load_training_metrics_merged(path.parent)
+        if merged:
+            return merged
+    except ImportError:
+        pass
+    return raw
 
 
 def load_json_under_repo(repo_root: Path, rel_path: str) -> tuple[dict[str, Any] | None, str | None]:

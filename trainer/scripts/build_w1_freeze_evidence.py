@@ -283,7 +283,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--run-dir",
         action="append",
         default=[],
-        help="Run directory containing training_metrics.json/backtest_metrics.json. Repeatable.",
+        help="Run directory containing training_metrics.v2.json and/or training_metrics.json plus backtest_metrics.json. Repeatable.",
     )
     parser.add_argument(
         "--run-dir-glob",

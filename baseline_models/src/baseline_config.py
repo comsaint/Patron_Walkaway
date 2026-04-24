@@ -393,7 +393,17 @@ def merge_training_provenance_into_raw(data: Mapping[str, Any], config_path: Pat
     metrics_path = (root / str(metrics_rel).strip()).resolve()
     if metrics_path.is_file():
         try:
-            tm = json.loads(metrics_path.read_text(encoding="utf-8"))
+            if metrics_path.name in ("training_metrics.json", "training_metrics.v2.json"):
+                try:
+                    from trainer.core.training_metrics_bundle import load_training_metrics_merged
+
+                    _src, tm = load_training_metrics_merged(metrics_path.parent)
+                    if not tm:
+                        tm = json.loads(metrics_path.read_text(encoding="utf-8"))
+                except ImportError:
+                    tm = json.loads(metrics_path.read_text(encoding="utf-8"))
+            else:
+                tm = json.loads(metrics_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             tm = {}
         bda = tm.get("baseline_data_alignment")

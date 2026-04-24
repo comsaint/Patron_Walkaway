@@ -1,5 +1,79 @@
 **Archive**: Past rounds and older STATUS blocks are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60, 67 Review–75 moved 2026-03-05; Rounds 79–99 moved 2026-03-05; Round 96 onward moved 2026-03-12; **2026-03-22**: Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等長段 → archive.)
 
+## OOM Config Refactor + Step 6/7 Memory Cleanup（2026-04-24）
+
+**對齊**：`doc/training_oom_and_runtime_audit.md` 的 OOM 策略；先完成 config / OOM shard refactor，再沿 `Step 6 -> Step 7` 熱路徑清理大 DataFrame copy / DuckDB→pandas materialization / 高風險 pandas fallback。
+
+### 本輪完成
+
+1. **完成 config / OOM refactor facade 化**  
+   - `trainer.core.config` 保留穩定公開介面，DuckDB memory / training-memory 先拆到內部 shard。  
+   - 後續再把 env/path、ClickHouse、serving/runtime、validator、training-domain 也拆成內部模組，`trainer.config` 持續維持 compatibility facade。
+
+2. **補齊 facade 相容性測試**  
+   - 鎖住 `trainer.core.config` / `trainer.config` 的 re-export 契約。  
+   - 補 `chunk_two_stage_cache_enabled()` 對 facade monkeypatch 的相容 wrapper。
+
+3. **完成 Step 6 三段 memory cleanup**
+   - `compute_labels()`：避免 null-filter 前先對整個 bets frame 做 eager copy。  
+   - `join_player_profile()`：延後 full copy，並把 per-column `reindex` scatter 改成依 row position 回填。  
+   - `apply_dq()`：bets branch 改成先算 normalized Series 與 `_dq_mask`，只 copy surviving rows。
+
+4. **完成 Step 6 Track LLM materialization reduction**
+   - `compute_track_llm_features()` 不再把所有 passthrough 原始欄位從 DuckDB 一起 `.df()` materialize 回 pandas；DuckDB 只回傳 `"_orig_idx"` + `canonical_id` + Track LLM feature columns，再貼回原始 frame。
+
+5. **完成 Step 7 pandas fallback hardening**
+   - `_step7_pandas_fallback()` 新增 RAM guard：若估算 pandas fallback 峰值 RAM 已超過安全 available-RAM budget，直接 fail-fast，不再默默掉進高風險 concat/sort 路徑。
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/core/_config_duckdb_memory.py` | 新增 DuckDB runtime / memory shard（`DUCKDB_*`、`PROFILE_*`、`STEP7_*`、`CANONICAL_MAP_*`）。 |
+| `trainer/core/_config_training_memory.py` | 新增 training-memory / OOM shard（`NEG_SAMPLE_*`、`STEP7_*`、`STEP8_*`、`STEP9_*`、`TRAIN_METRICS_PREDICT_BATCH_ROWS`）。 |
+| `trainer/core/_config_env_paths.py` | 新增 env / path / prediction-export shard。 |
+| `trainer/core/_config_clickhouse_sources.py` | 新增 ClickHouse / source-table shard。 |
+| `trainer/core/_config_serving_runtime.py` | 新增 scorer/runtime/status-server shard；保留 `chunk_two_stage_cache_enabled(default=...)` 低階 helper。 |
+| `trainer/core/_config_validator.py` | 新增 validator shard。 |
+| `trainer/core/_config_training_domain.py` | 新增 training-domain / threshold / model-mode shard。 |
+| `trainer/core/config.py` | 改為穩定 facade，集中 re-export 各 shard；保留 `get_duckdb_memory_config()` / `get_duckdb_memory_limit_bytes()`；補 facade wrapper `chunk_two_stage_cache_enabled()`。 |
+| `trainer/config.py` | 維持 compatibility facade，持續 re-export `trainer.core.config`。 |
+| `tests/unit/test_config_facade_shards_contract.py` | 新增 facade/shard re-export 契約與 monkeypatch 契約測試。 |
+| `tests/unit/test_config_risks.py` | Source-contract 改檢查 `_config_training_domain.py` 的 `LABEL_LOOKAHEAD_MIN` 派生定義。 |
+| `tests/review_risks/test_review_risks_round182_plan_b_config.py` | Step 8 sample comment contract 改檢查 `_config_training_memory.py`。 |
+| `tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py` | train metrics batch rows source-contract 改檢查 `_config_training_memory.py`；容許新 batched helper 名稱。 |
+| `trainer/labels.py` | `compute_labels()`：先算 null mask，再 sort/split；避免大 frame 先 copy 再 drop。 |
+| `trainer/features/features.py` | `join_player_profile()`：延後 full copy、降低 scatter 成本；`compute_track_llm_features()`：只 materialize 最小 DuckDB 結果集。 |
+| `trainer/training/trainer.py` | `apply_dq()`：bets branch 改為先算 normalized Series 與 keep-mask；`_step7_pandas_fallback()` 新增 RAM fail-fast guard。 |
+
+### 驗證
+
+```bash
+python -c "import trainer.core.config as c; print(c.SCORER_LOOKBACK_HOURS); print(c.WALKAWAY_GAP_MIN); print(c.PREDICTION_LOG_DB_PATH)"
+python -m pytest tests/unit/test_config.py tests/unit/test_config_risks.py tests/unit/test_config_facade_shards_contract.py tests/review_risks/test_review_risks_item2_core_move.py tests/review_risks/test_review_risks_round182_plan_b_config.py tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py -q
+python -m pytest tests/unit/test_labels.py tests/review_risks/test_review_risks_oom_phase2b2c_phase3.py tests/review_risks/test_labels_review_risks_round6.py tests/integration/test_four_bet_label_vs_validator_simulation.py -q
+python -m pytest tests/review_risks/test_review_risks_round200.py tests/review_risks/test_review_risks_late_rounds.py tests/review_risks/test_review_risks_round60.py -q
+python -m pytest tests/review_risks/test_review_risks_round153.py tests/review_risks/test_review_risks_round250.py tests/review_risks/test_review_risks_round280.py tests/review_risks/test_review_risks_oom_phase2b2c_phase3.py tests/review_risks/test_review_risks_late_rounds.py tests/review_risks/test_review_risks_round170.py tests/review_risks/test_review_risks_round110.py tests/review_risks/test_review_risks_round156.py -k "not backtester_main_accepts_empty_sessions_without_crash" -q
+python -m pytest tests/integration/test_features.py tests/review_risks/test_review_risks_round350.py tests/review_risks/test_review_risks_round222_train_serve_parity.py -q
+python -m pytest tests/review_risks/test_review_risks_oom_phase1_phase2a.py tests/review_risks/test_review_risks_round175_step7_helpers.py tests/review_risks/test_review_risks_round219_plan_b_plus_stage6_step2.py tests/review_risks/test_review_risks_round200.py -q
+```
+
+- `config facade / shard`：`40 passed`
+- `labels`：`35 passed`
+- `join_player_profile`：`54 passed, 2 skipped`
+- `apply_dq`：`67 passed, 2 skipped, 1 deselected`
+- `Track LLM`：`56 passed`
+- `Step 7 contract`：`28 passed`
+- `ReadLints`：本輪修改檔案無新增 lint 問題。
+
+**補充**
+
+- `tests/review_risks/test_review_risks_round156.py::TestR1562BacktesterMainAcceptsEmptySessionsWithoutCrash` 在未 mock model bundle manifest 的情況下會因 `resolve_model_bundle_dir()` 找不到 `_latest_model_manifest.json` 而失敗；此問題落在 `trainer/core/model_bundle_paths.py`，與本輪 `apply_dq()` 修改無直接關係，因此驗證時明確排除該 case。
+
+### 下一步建議
+
+1. 往 **Step 7 / Step 8** 繼續：把 pandas fallback 更明確降級成僅小資料例外路徑，並收斂 Step 8 in-memory screening 的 full-train 預設。  
+2. 若要更進一步處理真實 OOM，再補一輪 behavior-level / tiny synthetic evidence，紀錄 Step 6 / Step 7 before-after 的 row-count、chunk bytes、runtime 與記憶體訊號。  
+3. 若要整理治理面，下一份應補的是 **working / execution plan**，把 `Step 6 cleanup -> Step 7 fallback hardening -> Step 8 sample default -> Step 9 file-based tightening` 串成可執行波次。
+
 ## Rated-Only Early Prune — `/cycle_code` STEP 1（A1/A2，2026-04-23）
 
 對照計畫：`.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md`（本輪 `PLAN.md`）。
@@ -8124,3 +8198,15 @@ python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "tes
 - 測試：tests/unit/test_training_metrics_bundle.py。
 
 驗證：pytest tests/unit/test_training_metrics_bundle.py tests/unit/test_bundle_run_contract.py tests/unit/test_report_w2_objective_parity.py tests/unit/test_build_w1_freeze_evidence.py -q 綠。
+
+
+---
+
+## training_metrics v2 consumer 延伸（2026-04-24 續 2）
+
+- **baseline_models**：`reference_model.load_training_metrics_reference`、`baseline_config.merge_training_provenance_into_raw` 在路徑為 bundle 內 `training_metrics*.json` 時改走 `load_training_metrics_merged`（ImportError 時退回純 JSON）。
+- **phase2 collectors**：`_training_metrics_payload_for_bundle_json` + validate / harvest 列皆用 merge 後物件；`evaluators.extract_phase2_precision_at_recall_1pct_from_metrics_mapping` 支援頂層 PAT 鍵（v2 扁平）。
+- **測試**：`tests/unit/test_baseline_reference_v2_metrics.py`；`test_precision_uplift_phase1_orchestrator` 新增 v2 merge / 扁平 PAT 案例。
+- **build_w1_freeze_evidence**：argparse help 補 v2 說明。
+
+驗證：`pytest tests/unit/test_baseline_reference_v2_metrics.py`、phase2 PAT 相關子集、`test_merge_baseline_data_alignment_from_metrics_then_provenance` 綠；`ruff check` 相關檔綠。

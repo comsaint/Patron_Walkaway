@@ -1520,34 +1520,28 @@ def apply_dq(
         dq_mask = dq_mask & ((_turnover > 0) | (_games > 0))
     sessions = sessions[dq_mask].copy()
 
-    # Defensive copy so apply_dq never mutates the caller's DataFrame.
-    # In-place column assignments below (payout_complete_dtm tz normalisation, etc.)
-    # require ownership of the data.  Callers that pass a freshly-filtered slice
-    # (e.g. from load_local_parquet) still benefit: pandas may hold a view rather
-    # than a copy, so the explicit copy here ensures safe mutation.
-    bets = bets.copy()
     if bets.empty:
         # Sessions-only path — return clean sessions, skip bets processing entirely.
         # This avoids a KeyError on payout_complete_dtm when called with a stub DataFrame.
         return bets, sessions
 
     # --- bets ---
-    bets["payout_complete_dtm"] = pd.to_datetime(bets["payout_complete_dtm"], utc=False)
+    payout_complete_dtm = pd.to_datetime(bets["payout_complete_dtm"], utc=False)
 
     # R23: Timezone normalisation — tz_localize naive, tz_convert aware to HK,
     # then strip tz so downstream callers (labels, features) receive tz-naive
     # HK local time and no naive/aware TypeError can occur at the boundary.
-    if bets["payout_complete_dtm"].dt.tz is None:
-        bets["payout_complete_dtm"] = bets["payout_complete_dtm"].dt.tz_localize(
+    if payout_complete_dtm.dt.tz is None:
+        payout_complete_dtm = payout_complete_dtm.dt.tz_localize(
             HK_TZ, nonexistent="shift_forward", ambiguous="NaT"
         )
     else:
-        bets["payout_complete_dtm"] = bets["payout_complete_dtm"].dt.tz_convert(HK_TZ)
+        payout_complete_dtm = payout_complete_dtm.dt.tz_convert(HK_TZ)
     # Strip tz after normalization — downstream (compute_labels, features) is tz-naive.
-    bets["payout_complete_dtm"] = bets["payout_complete_dtm"].dt.tz_localize(None)
+    payout_complete_dtm = payout_complete_dtm.dt.tz_localize(None)
     # DEC-018: unify datetime resolution to ns so merge_asof / comparisons always see
     # the same dtype regardless of Parquet file's stored precision ([ms] vs [us]).
-    bets["payout_complete_dtm"] = bets["payout_complete_dtm"].astype("datetime64[ns]")
+    payout_complete_dtm = payout_complete_dtm.astype("datetime64[ns]")
 
     # Boundary comparison — both sides are tz-naive after DEC-018 process_chunk strip.
     # The explicit .replace(tzinfo=None) guards here are kept as a defensive fallback
@@ -1557,21 +1551,27 @@ def apply_dq(
     _hi = extended_end.replace(tzinfo=None) if getattr(extended_end, "tzinfo", None) else extended_end
 
     # Key numeric only; table_id is categorical after normalizer (PLAN § apply_dq 配合修改).
+    numeric_key_cols: Dict[str, pd.Series] = {}
     for col in ("bet_id", "session_id", "player_id"):
         if col in bets.columns:
-            bets[col] = pd.to_numeric(bets.get(col), errors="coerce")
+            numeric_key_cols[col] = pd.to_numeric(bets.get(col), errors="coerce")
 
-    # Combine time-window filter, wager guard, and key-column dropna into one mask
-    # to avoid three consecutive .copy() calls on a large DataFrame (OOM risk).
+    # Build the keep-mask from normalized Series first, then copy only surviving rows.
+    # This avoids an eager full-frame copy of the Step 6 bets chunk before we know
+    # which rows survive DQ.
     _dq_mask = (
-        bets["payout_complete_dtm"].between(_lo, _hi, inclusive="left")
-        & bets["payout_complete_dtm"].notna()
-        & bets[["bet_id", "session_id"]].notna().all(axis=1)
+        payout_complete_dtm.between(_lo, _hi, inclusive="left")
+        & payout_complete_dtm.notna()
+        & numeric_key_cols["bet_id"].notna()
+        & numeric_key_cols["session_id"].notna()
     )
     if "wager" in bets.columns:
         # Defense-in-depth wager guard (R1602): applied inside the combined mask.
         _dq_mask &= bets["wager"].fillna(0).gt(0)
-    bets = bets.loc[_dq_mask].reset_index(drop=True)
+    bets = bets.loc[_dq_mask].copy().reset_index(drop=True)
+    bets["payout_complete_dtm"] = payout_complete_dtm.loc[_dq_mask].to_numpy()
+    for col, coerced in numeric_key_cols.items():
+        bets[col] = coerced.loc[_dq_mask].to_numpy()
 
     # G2: recover invalid/missing player_id from session player_id before the
     # E4/F1 drop (SSOT §5 G2 — COALESCE t_bet.player_id, t_session.player_id).
@@ -7225,6 +7225,34 @@ def run_pipeline(args) -> None:
                 R700 log and MIN_VALID_TEST_ROWS warnings.
                 Chunk Parquets must contain column payout_complete_dtm.
                 """
+                def _guard_step7_pandas_fallback_memory() -> None:
+                    """Fail fast when pandas fallback is very likely to OOM on current RAM."""
+                    _chunk_total_bytes_local = sum(Path(p).stat().st_size for p in chunk_paths)
+                    _estimated_peak_bytes = int(
+                        _chunk_total_bytes_local
+                        * CHUNK_CONCAT_RAM_FACTOR
+                        * (1.0 + train_frac)
+                    )
+                    _available_bytes = _get_step7_available_ram_bytes()
+                    _safe_budget_bytes = (
+                        int(_available_bytes * NEG_SAMPLE_RAM_SAFETY)
+                        if _available_bytes is not None and _available_bytes > 0
+                        else None
+                    )
+                    if (
+                        _safe_budget_bytes is not None
+                        and _estimated_peak_bytes > _safe_budget_bytes
+                    ):
+                        raise RuntimeError(
+                            "Step 7 pandas fallback blocked: estimated peak RAM %.1f GB exceeds safe available-RAM "
+                            "budget %.1f GB. Prefer STEP7_USE_DUCKDB=True, reduce --days / --start --end, "
+                            "or lower NEG_SAMPLE_FRAC."
+                            % (
+                                _estimated_peak_bytes / (1024**3),
+                                _safe_budget_bytes / (1024**3),
+                            )
+                        )
+
                 if not chunk_paths:
                     raise ValueError("chunk_paths must be non-empty")
                 if not (
@@ -7234,6 +7262,7 @@ def run_pipeline(args) -> None:
                         "train_frac and valid_frac must be in (0, 1) and "
                         "train_frac + valid_frac < 1.0"
                     )
+                _guard_step7_pandas_fallback_memory()
                 all_dfs = [pd.read_parquet(p) for p in chunk_paths]
                 full_df = pd.concat(all_dfs, ignore_index=True)
                 if "payout_complete_dtm" not in full_df.columns:

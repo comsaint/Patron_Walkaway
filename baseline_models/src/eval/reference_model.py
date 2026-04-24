@@ -17,7 +17,10 @@ def load_training_metrics_reference(
     metrics_path: Path,
     section: str,
 ) -> dict[str, Any]:
-    """讀取 trainer 產出之 ``training_metrics.json`` 中一區塊，供 E2 同窗表。
+    """讀取 trainer 產出之 training metrics（``training_metrics.json`` / ``.v2.json``）中一區塊，供 E2 同窗表。
+
+    若路徑為 bundle 內之 ``training_metrics*.json``，優先使用與 trainer 一致的
+    ``load_training_metrics_merged``（v2-first），以便與 Phase A 雙寫產物對齊。
 
     Args:
         metrics_path: JSON 檔絕對路徑。
@@ -34,7 +37,16 @@ def load_training_metrics_reference(
             "section": section,
         }
     try:
-        data = json.loads(metrics_path.read_text(encoding="utf-8"))
+        if metrics_path.name in ("training_metrics.json", "training_metrics.v2.json"):
+            try:
+                from trainer.core.training_metrics_bundle import load_training_metrics_merged
+
+                _src, merged = load_training_metrics_merged(metrics_path.parent)
+                data = merged if merged else json.loads(metrics_path.read_text(encoding="utf-8"))
+            except ImportError:
+                data = json.loads(metrics_path.read_text(encoding="utf-8"))
+        else:
+            data = json.loads(metrics_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
         return {
             "status": "error",
@@ -43,6 +55,9 @@ def load_training_metrics_reference(
             "section": section,
         }
     sec = data.get(section)
+    if not isinstance(sec, Mapping) and section == "rated":
+        # v2 merged / v1 扁平化後：指標在頂層，無 ``rated`` 巢狀。
+        sec = data
     if not isinstance(sec, Mapping):
         return {
             "status": "error",

@@ -441,11 +441,12 @@ def extract_threshold_at_recall_0_01_from_backtest_metrics(
 def extract_phase2_precision_at_recall_1pct_from_metrics_mapping(
     metrics: Mapping[str, Any] | None,
 ) -> float | None:
-    """Parse PAT@1% from backtest JSON or from trainer ``training_metrics.json``.
+    """Parse PAT@1% from backtest JSON or from trainer training metrics.
 
-    Trainer artifacts nest holdout metrics under ``rated``; shared / per-job
-    ``backtest_metrics.json`` uses ``model_default``. Tries those sections in
-    that order and returns the first finite float, else ``None``.
+    Trainer legacy artifacts nest holdout metrics under ``rated``; shared / per-job
+    ``backtest_metrics.json`` uses ``model_default``. v2-first merged trainer
+    payloads may expose :data:`PHASE2_BACKTEST_PR1_KEY` at the top level. Tries
+    ``model_default``, ``rated``, then top-level, and returns the first finite float.
     """
     if not isinstance(metrics, Mapping):
         return None
@@ -461,6 +462,13 @@ def extract_phase2_precision_at_recall_1pct_from_metrics_mapping(
             return float(raw)
         except (TypeError, ValueError):
             continue
+    # v2 merged / flat trainer payloads: PAT key at top level (no ``rated`` wrapper).
+    raw_top = metrics.get(prk)
+    if raw_top is not None:
+        try:
+            return float(raw_top)
+        except (TypeError, ValueError):
+            pass
     return None
 
 

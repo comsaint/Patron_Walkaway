@@ -1886,6 +1886,47 @@ def test_validate_phase2_training_metrics_ok_when_pat_under_rated_only(
     assert ok and code is None and msg is None
 
 
+def test_extract_phase2_pat_from_flat_top_level() -> None:
+    pr_key = evaluators.PHASE2_BACKTEST_PR1_KEY
+    v = evaluators.extract_phase2_precision_at_recall_1pct_from_metrics_mapping(
+        {pr_key: 0.88}
+    )
+    assert v == pytest.approx(0.88)
+
+
+def test_validate_phase2_training_metrics_ok_when_pat_from_v2_merge(
+    tmp_path: Path,
+) -> None:
+    """v1 檔無 PAT 時，同目錄 ``training_metrics.v2.json`` 經 merge 後應可通過 Gate。"""
+    d = tmp_path / "logs" / "track_a" / "a0"
+    rel = d.relative_to(tmp_path).as_posix()
+    d.mkdir(parents=True)
+    (d / "training_metrics.json").write_text(json.dumps({"junk": 1}), encoding="utf-8")
+    (d / "training_metrics.v2.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "training-metrics.v2",
+                "datasets": {"test": {"precision_at_recall_0.01": 0.66}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle = {
+        "job_specs": [
+            {"track": "track_a", "exp_id": "a0", "logs_subdir_relative": rel},
+        ],
+        "trainer_jobs": {
+            "executed": True,
+            "all_ok": True,
+            "results": [{"track": "track_a", "exp_id": "a0", "ok": True}],
+        },
+    }
+    ok, code, msg = collectors.validate_phase2_training_metrics_after_trainer_jobs(
+        tmp_path, bundle
+    )
+    assert ok and code is None and msg is None
+
+
 def test_validate_phase2_training_metrics_missing_file_is_artifact_missing(
     tmp_path: Path,
 ) -> None:

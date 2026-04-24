@@ -1865,6 +1865,8 @@ def compute_track_llm_features(
             df[cand["feature_id"]] = pd.Series(dtype="float32")
         return df
 
+    result = df
+
     # ── Ensure payout_complete_dtm is tz-naive (DEC-018) ───────────────────
     ts_col = pd.to_datetime(df["payout_complete_dtm"])
     if ts_col.dt.tz is not None:
@@ -1880,7 +1882,7 @@ def compute_track_llm_features(
     # instances of 'str' and 'float'" when columns have mixed types from Parquet.
     _cid = df["canonical_id"].astype(str)
     _bid = df["bet_id"].astype(str)
-    df = df.assign(_sort_cid=_cid, _sort_bid=_bid)
+    df = df.assign(_orig_idx=np.arange(len(df)), _sort_cid=_cid, _sort_bid=_bid)
     df = df.sort_values(
         ["_sort_cid", "payout_complete_dtm", "_sort_bid"], kind="stable"
     ).drop(columns=["_sort_cid", "_sort_bid"]).reset_index(drop=True)
@@ -1889,20 +1891,13 @@ def compute_track_llm_features(
     )
 
     # ── Build DuckDB window SELECT expressions ──────────────────────────────
-    # R2008: all passthrough column names are double-quoted to handle spaces and
-    # other special characters that would otherwise break the SQL parser.
-    fixed_cols = {"canonical_id", "payout_complete_dtm", "bet_id", _RANGE_SORT_COL}
-    passthrough_cols = [
-        c for c in df.columns
-        if c not in fixed_cols
-        and not any(c == cand["feature_id"] for cand in candidates)
-    ]
+    # OOM reduction: DuckDB only materializes stable row positions and computed
+    # Track LLM outputs. Original passthrough columns are kept on ``result`` and
+    # never duplicated through ``con.execute(...).df()``.
     select_exprs = [
+        '"_orig_idx"',
         '"canonical_id"',
-        '"payout_complete_dtm"',
-        '"bet_id"',
     ]
-    select_exprs.extend(f'"{c}"' for c in passthrough_cols)
 
     for cand in candidates:
         fid = cand["feature_id"]
@@ -2023,6 +2018,23 @@ def compute_track_llm_features(
     logger.debug(
         "compute_track_llm_features: computed %d Track LLM features for %d bets",
         len(candidates),
-        len(result_df),
+        len(result),
     )
-    return result_df
+
+    row_positions = result_df["_orig_idx"].to_numpy(dtype=np.int64, copy=False)
+    for cand in candidates:
+        fid = cand["feature_id"]
+        if fid not in result_df.columns:
+            continue
+        ser = result_df[fid]
+        if pd.api.types.is_numeric_dtype(ser):
+            fill_value = np.nan
+            dtype = ser.dtype
+            vals = np.full(len(result), fill_value, dtype=dtype)
+        else:
+            vals = np.empty(len(result), dtype=object)
+            vals[:] = None
+        vals[row_positions] = ser.to_numpy(copy=False)
+        result[fid] = vals
+
+    return result
