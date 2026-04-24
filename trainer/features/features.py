@@ -581,6 +581,7 @@ def compute_loss_streak_features(
 def compute_consecutive_non_win_streak(
     bets_df: pd.DataFrame,
     cutoff_time: Optional[datetime] = None,
+    lookback_hours: Optional[float] = None,
 ) -> pd.Series:
     """Return consecutive non-win count (LOSE/PUSH) for each bet.
 
@@ -596,34 +597,26 @@ def compute_consecutive_non_win_streak(
             f"compute_consecutive_non_win_streak: missing columns {sorted(missing)}"
         )
 
-    df = bets_df.copy()
-    if cutoff_time is not None:
-        cutoff_ts = pd.Timestamp(cutoff_time)
-        df = df[df["payout_complete_dtm"] <= cutoff_ts].copy()
-
-    if df.empty:
-        return pd.Series(dtype="int32")
-
-    df = df.sort_values(
-        ["canonical_id", "payout_complete_dtm", "bet_id"],
-        ascending=True,
-        kind="stable",
+    # Reuse compute_loss_streak's optimized lookback implementation:
+    # map non-win(LOSE/PUSH) -> LOSE, everything else -> WIN (reset).
+    proxy = bets_df.copy()
+    status_upper = proxy["status"].fillna("").astype(str).str.upper()
+    proxy["status"] = np.where(
+        status_upper.isin({"LOSE", "PUSH"}),
+        "LOSE",
+        "WIN",
     )
-    status_upper = df["status"].fillna("").astype(str).str.upper()
-    df["_is_non_win"] = status_upper.isin({"LOSE", "PUSH"}).astype("int8")
-    df["_is_reset"] = (1 - df["_is_non_win"]).astype("int8")
-    df["_reset_grp"] = df.groupby("canonical_id", sort=False)["_is_reset"].cumsum()
-    streak = (
-        df.groupby(["canonical_id", "_reset_grp"], sort=False)["_is_non_win"]
-        .cumsum()
-        .astype("int32")
+    return compute_loss_streak(
+        proxy,
+        cutoff_time=cutoff_time,
+        lookback_hours=lookback_hours,
     )
-    return streak
 
 
 def compute_consecutive_non_win_features(
     bets_df: pd.DataFrame,
     cutoff_time: Optional[datetime] = None,
+    lookback_hours: Optional[float] = None,
 ) -> pd.DataFrame:
     """Return DataFrame output for YAML Track Human contract.
 
@@ -639,37 +632,48 @@ def compute_consecutive_non_win_features(
     df["consecutive_non_win_cnt"] = compute_consecutive_non_win_streak(
         df,
         cutoff_time=None,
+        lookback_hours=lookback_hours,
     ).reindex(df.index, fill_value=0)
     return df
 
 
-def add_wave2_personalized_baselines(df: pd.DataFrame) -> pd.DataFrame:
-    """Add Wave 2 personalized baseline features in-place on a copied DataFrame.
+def add_wave2_personalized_baselines(
+    df: pd.DataFrame,
+    copy: bool = False,
+) -> pd.DataFrame:
+    """Add Wave 2 personalized baseline features.
 
     Features:
     - run_duration_vs_personal_avg
     - bets_in_run_vs_personal_avg
     - pace_vs_personal_baseline
-    """
-    out = df.copy()
 
-    minutes_since = pd.to_numeric(
-        out.get("minutes_since_run_start", 0.0), errors="coerce"
-    ).fillna(0.0)
-    avg_session_duration = pd.to_numeric(
-        out.get("avg_session_duration_min_30d", np.nan), errors="coerce"
-    )
+    Parameters
+    ----------
+    df : DataFrame
+        Input feature table.
+    copy : bool
+        When True, write to a copied DataFrame; False mutates in place to avoid
+        an expensive full-table copy on large training chunks.
+    """
+    out = df.copy() if copy else df
+
+    def _num_series(name: str, default: float) -> pd.Series:
+        if name in out.columns:
+            return pd.to_numeric(out[name], errors="coerce")
+        return pd.Series(default, index=out.index, dtype="float64")
+
+    minutes_since = _num_series("minutes_since_run_start", 0.0).fillna(0.0)
+    avg_session_duration = _num_series("avg_session_duration_min_30d", np.nan)
     out["run_duration_vs_personal_avg"] = np.where(
         avg_session_duration > 0,
         minutes_since / avg_session_duration,
         0.0,
     )
 
-    bets_in_run = pd.to_numeric(out.get("bets_in_run_so_far", 0.0), errors="coerce").fillna(
-        0.0
-    )
-    num_bets_30d = pd.to_numeric(out.get("num_bets_sum_30d", np.nan), errors="coerce")
-    sessions_30d = pd.to_numeric(out.get("sessions_30d", np.nan), errors="coerce")
+    bets_in_run = _num_series("bets_in_run_so_far", 0.0).fillna(0.0)
+    num_bets_30d = _num_series("num_bets_sum_30d", np.nan)
+    sessions_30d = _num_series("sessions_30d", np.nan)
     personal_bets_per_session = np.where(
         sessions_30d > 0,
         num_bets_30d / sessions_30d,
@@ -681,7 +685,7 @@ def add_wave2_personalized_baselines(df: pd.DataFrame) -> pd.DataFrame:
         0.0,
     )
 
-    bets_cnt_w15m = pd.to_numeric(out.get("bets_cnt_w15m", 0.0), errors="coerce").fillna(0.0)
+    bets_cnt_w15m = _num_series("bets_cnt_w15m", 0.0).fillna(0.0)
     current_bets_per_min = bets_cnt_w15m / 15.0
     personal_bets_per_min = np.where(
         (sessions_30d > 0) & (avg_session_duration > 0),

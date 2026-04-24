@@ -1190,7 +1190,9 @@ def build_features_for_scoring(
     ).fillna(0)
     if compute_consecutive_non_win_streak is not None:
         bets_df["consecutive_non_win_cnt"] = compute_consecutive_non_win_streak(
-            bets_df, cutoff_time=cutoff_naive
+            bets_df,
+            cutoff_time=cutoff_naive,
+            lookback_hours=_lookback_hours,
         ).reindex(bets_df.index, fill_value=0)
     else:
         bets_df["consecutive_non_win_cnt"] = 0

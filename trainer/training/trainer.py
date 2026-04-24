@@ -1732,7 +1732,11 @@ def add_track_human_features(
     # loss_streak (cutoff = window_end so future bets don't influence streak)
     streak = compute_loss_streak(df, cutoff_time=window_end, lookback_hours=lookback_hours)
     df["loss_streak"] = streak.reindex(df.index, fill_value=0)
-    non_win_streak = compute_consecutive_non_win_streak(df, cutoff_time=window_end)
+    non_win_streak = compute_consecutive_non_win_streak(
+        df,
+        cutoff_time=window_end,
+        lookback_hours=lookback_hours,
+    )
     df["consecutive_non_win_cnt"] = non_win_streak.reindex(df.index, fill_value=0)
 
     # run_boundary (cutoff = window_end); reindex so rows beyond cutoff get 0 not NaN (Review #2)
