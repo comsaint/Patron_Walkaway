@@ -281,3 +281,98 @@ def test_train_and_select_rated_gbm_family_skips_backend_optuna_when_disabled() 
     assert per["catboost"]["optuna_hpo_objective_mode"] == "disabled"
     assert per["xgboost"]["optuna_hpo_enabled"] is False
     assert per["xgboost"]["optuna_hpo_objective_mode"] == "disabled"
+
+
+def test_resolve_backend_optuna_budget_splits_total_timeout_equally() -> None:
+    with patch.object(trainer_mod._cfg, "OPTUNA_TIMEOUT_SECONDS", 60 * 60):
+        budget_l = trainer_mod.resolve_backend_optuna_budget(
+            "lightgbm",
+            timeout_budget_divisor=3,
+        )
+        budget_c = trainer_mod.resolve_backend_optuna_budget(
+            "catboost",
+            timeout_budget_divisor=3,
+        )
+        budget_x = trainer_mod.resolve_backend_optuna_budget(
+            "xgboost",
+            timeout_budget_divisor=3,
+        )
+
+    assert budget_l["timeout_seconds"] == 20 * 60
+    assert budget_c["timeout_seconds"] == 20 * 60
+    assert budget_x["timeout_seconds"] == 20 * 60
+    assert budget_l["n_trials"] == trainer_mod.OPTUNA_N_TRIALS
+    assert budget_l["early_stop_patience"] == trainer_mod.OPTUNA_EARLY_STOP_PATIENCE
+
+
+def test_resolve_backend_optuna_budget_uses_global_trials_and_patience_for_all_backends() -> None:
+    with (
+        patch.object(trainer_mod, "OPTUNA_N_TRIALS", 91),
+        patch.object(trainer_mod, "OPTUNA_EARLY_STOP_PATIENCE", 17),
+        patch.object(trainer_mod._cfg, "OPTUNA_N_TRIALS", 91),
+        patch.object(trainer_mod._cfg, "OPTUNA_EARLY_STOP_PATIENCE", 17),
+    ):
+        budget_l = trainer_mod.resolve_backend_optuna_budget("lightgbm")
+        budget_c = trainer_mod.resolve_backend_optuna_budget("catboost")
+        budget_x = trainer_mod.resolve_backend_optuna_budget("xgboost")
+
+    assert budget_l["n_trials"] == 91
+    assert budget_c["n_trials"] == 91
+    assert budget_x["n_trials"] == 91
+    assert budget_l["early_stop_patience"] == 17
+    assert budget_c["early_stop_patience"] == 17
+    assert budget_x["early_stop_patience"] == 17
+
+
+def test_backend_optuna_params_include_fair_imbalance_and_catboost_search_dims() -> None:
+    trial = trainer_mod.optuna.trial.FixedTrial(
+        {
+            "n_estimators": 150,
+            "learning_rate": 0.05,
+            "max_depth": 5,
+            "num_leaves": 31,
+            "min_child_samples": 20,
+            "colsample_bytree": 0.8,
+            "subsample": 0.8,
+            "reg_alpha": 0.1,
+            "reg_lambda": 0.2,
+            "iterations": 150,
+            "depth": 6,
+            "l2_leaf_reg": 2.0,
+            "random_strength": 1.5,
+            "rsm": 0.75,
+            "min_child_weight": 2.0,
+        }
+    )
+    y = pd.Series([0, 0, 0, 1, 1], dtype=int)
+
+    lgb_params = trainer_mod._suggest_backend_optuna_params("lightgbm", trial)
+    cat_params = trainer_mod._apply_backend_imbalance_params(
+        "catboost",
+        trainer_mod._suggest_backend_optuna_params("catboost", trial),
+        y,
+    )
+    xgb_params = trainer_mod._apply_backend_imbalance_params(
+        "xgboost",
+        trainer_mod._suggest_backend_optuna_params("xgboost", trial),
+        y,
+    )
+
+    assert lgb_params["class_weight"] == "balanced"
+    assert cat_params["class_weights"] == [1.0, pytest.approx(1.5)]
+    assert cat_params["random_strength"] == 1.5
+    assert cat_params["rsm"] == 0.75
+    assert xgb_params["scale_pos_weight"] == pytest.approx(1.5)
+
+    cat_defaults = trainer_mod._apply_backend_imbalance_params(
+        "catboost",
+        trainer_mod._backend_hpo_defaults("catboost"),
+        y,
+    )
+    xgb_defaults = trainer_mod._apply_backend_imbalance_params(
+        "xgboost",
+        trainer_mod._backend_hpo_defaults("xgboost"),
+        y,
+    )
+    assert cat_defaults["class_weights"] == [1.0, pytest.approx(1.5)]
+    assert xgb_defaults["scale_pos_weight"] == pytest.approx(1.5)

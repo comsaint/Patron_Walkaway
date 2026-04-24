@@ -228,10 +228,12 @@ def _train_catboost_backend(
     val_dec026_min_alerts_per_hour: Optional[float],
 ) -> Tuple[Any, Dict[str, Any]]:
     from catboost import CatBoostClassifier
+    from trainer.training.trainer import _apply_backend_imbalance_params
 
     c_hp = dict(hp)
     iterations = int(c_hp.pop("iterations"))
     early = int(c_hp.pop("early_stopping_rounds"))
+    c_hp = _apply_backend_imbalance_params("catboost", c_hp, y_train)
     model = CatBoostClassifier(iterations=iterations, **c_hp)
     X_tr = _to_float32_frame(X_train)
     X_vl = _to_float32_frame(X_val)
@@ -272,9 +274,11 @@ def _train_xgboost_backend(
     val_dec026_min_alerts_per_hour: Optional[float],
 ) -> Tuple[Any, Dict[str, Any]]:
     import xgboost as xgb
+    from trainer.training.trainer import _apply_backend_imbalance_params
 
     x_hp = dict(hp)
     n_est = int(x_hp.pop("n_estimators"))
+    x_hp = _apply_backend_imbalance_params("xgboost", x_hp, y_train)
     model = xgb.XGBClassifier(n_estimators=n_est, **x_hp)
     X_tr = _to_float32_frame(X_train)
     X_vl = _to_float32_frame(X_val)
@@ -536,6 +540,18 @@ def train_and_select_rated_gbm_family(
         }
     }
 
+    def _bakeoff_timeout_budget_divisor() -> Optional[int]:
+        if not (run_optuna and _has_strong_validation(X_val, y_val)):
+            return None
+        raw = getattr(_cfg, "OPTUNA_ACTIVE_MODEL_COUNT_FOR_TOTAL_TIMEOUT_SPLIT", 3)
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return n if n > 1 else None
+
+    _timeout_budget_divisor = _bakeoff_timeout_budget_divisor()
+
     for trainer_fn, backend in (
         (_train_catboost_backend, "catboost"),
         (_train_xgboost_backend, "xgboost"),
@@ -548,7 +564,10 @@ def train_and_select_rated_gbm_family(
                 hp_backend_default = _default_backend_hyperparams("xgboost")
             hp_backend = dict((per_backend_hyperparams or {}).get(backend) or hp_backend_default)
             if run_optuna and _has_strong_validation(X_val, y_val):
-                budget = resolve_backend_optuna_budget(backend)
+                budget = resolve_backend_optuna_budget(
+                    backend,
+                    timeout_budget_divisor=_timeout_budget_divisor,
+                )
                 hp_backend = run_backend_optuna_search(
                     X_train,
                     y_train,
@@ -565,7 +584,10 @@ def train_and_select_rated_gbm_family(
                     hpo_objective_manifest=backend_manifest,
                 )
             else:
-                budget = resolve_backend_optuna_budget(backend)
+                budget = resolve_backend_optuna_budget(
+                    backend,
+                    timeout_budget_divisor=_timeout_budget_divisor,
+                )
                 backend_manifest.append(
                     {
                         "optuna_hpo_backend": backend,
