@@ -20,6 +20,7 @@ dependencies = [
     "duckdb==1.4.4",
     "numba",
     "pyarrow",
+    "polars",
 ]
 
 # Optional: MLflow system metrics (MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING) need psutil in-process.
