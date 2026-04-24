@@ -5,8 +5,63 @@ from pathlib import Path
 from typing import Literal, Optional, Tuple, cast
 
 from dotenv import load_dotenv
+from trainer.core._config_duckdb_memory import (
+    CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB,
+    CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB,
+    CANONICAL_MAP_DUCKDB_RAM_FRACTION,
+    CANONICAL_MAP_DUCKDB_THREADS,
+    DUCKDB_MEMORY_LIMIT_MAX_GB,
+    DUCKDB_MEMORY_LIMIT_MIN_GB,
+    DUCKDB_PRESERVE_INSERTION_ORDER,
+    DUCKDB_RAM_FRACTION,
+    DUCKDB_RAM_MAX_FRACTION,
+    DUCKDB_THREADS,
+    PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB,
+    PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB,
+    PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER,
+    PROFILE_DUCKDB_RAM_FRACTION,
+    PROFILE_DUCKDB_RAM_MAX_FRACTION,
+    PROFILE_DUCKDB_THREADS,
+    STEP7_DUCKDB_PRESERVE_INSERTION_ORDER,
+    STEP7_DUCKDB_RAM_FRACTION,
+    STEP7_DUCKDB_RAM_MAX_GB,
+    STEP7_DUCKDB_RAM_MIN_GB,
+    STEP7_DUCKDB_TEMP_DIR,
+    STEP7_DUCKDB_THREADS,
+)
+from trainer.core._config_training_memory import (
+    CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS,
+    CHUNK_CONCAT_MEMORY_WARN_BYTES,
+    CHUNK_CONCAT_RAM_FACTOR,
+    MIN_VALID_TEST_ROWS,
+    NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT,
+    NEG_SAMPLE_FRAC,
+    NEG_SAMPLE_FRAC_ASSUMED_POS_RATE,
+    NEG_SAMPLE_FRAC_AUTO,
+    NEG_SAMPLE_FRAC_MIN,
+    NEG_SAMPLE_RAM_SAFETY,
+    PROFILE_PRELOAD_MAX_BYTES,
+    PROFILE_USE_DUCKDB,
+    STEP7_KEEP_TRAIN_ON_DISK,
+    STEP7_USE_DUCKDB,
+    STEP8_SCREEN_SAMPLE_ROWS,
+    STEP9_COMPARE_ALL_GBMS,
+    STEP9_EXPORT_LIBSVM,
+    STEP9_SAVE_LGB_BINARY,
+    STEP9_TRAIN_FROM_FILE,
+    TRAIN_METRICS_PREDICT_BATCH_ROWS,
+    TRAIN_SPLIT_FRAC,
+    VALID_SPLIT_FRAC,
+)
 
 _log = logging.getLogger(__name__)
+
+# Stable facade note:
+# - ``trainer.core.config`` remains the public SSOT import surface.
+# - ``trainer.config`` continues to re-export this module for backward compatibility.
+# - Internal shards are imported here so external callers do not need to change.
+# - Phase 1 of the refactor only extracts OOM / training-memory boundaries; other
+#   config sections stay in this facade module until a later, lower-risk split.
 
 # Repo root (this file lives in trainer/core/). Used for .env and default paths.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -367,29 +422,6 @@ A4_TWO_STAGE_PREDICT_BATCH_ROWS = int(os.getenv("A4_TWO_STAGE_PREDICT_BATCH_ROWS
 LOSS_STREAK_PUSH_RESETS = False  # Whether PUSH resets the loss-streak counter (F4)
 HIST_AVG_BET_CAP = 500_000       # Winsorization cap for avg_bet (F2; validate with EDA)
 
-# --- Step 7 / Chunk 記憶體估計 (DEC-027 OOM 區塊) ---
-# See doc/training_oom_and_runtime_audit.md for peak RAM formula and A19/A20.
-# If total size of chunk Parquet files exceeds this, pipeline logs a RAM warning.
-# Parquet files are heavily compressed; observed expansion from disk to in-memory
-# DataFrame is ~10–15x (e.g. 1.2 GB on-disk → ~15 GB RAM for 27M rows × 73 cols).
-# The Step 7 split further allocates the train split (~70%) while full_df is alive,
-# pushing the true peak to ~20x on-disk.  Factor 15 is a conservative lower-bound.
-# 1 GB: fire warning earlier so desktop users can reduce --days before Step 7 OOM.
-CHUNK_CONCAT_MEMORY_WARN_BYTES = int(1 * (1024**3))  # 1 GB on-disk total
-CHUNK_CONCAT_RAM_FACTOR = 15  # on-disk size × this × (1 + TRAIN_SPLIT_FRAC) ≈ Step 7 peak RAM
-
-# --- Neg sampling 與 OOM 預檢 (DEC-027 OOM 區塊) ---
-# When < 1.0: ALL label=1 rows are kept; label=0 rows are randomly downsampled
-# to this fraction before writing each chunk Parquet.  Combined with
-# class_weight='balanced' and per-run sample_weight, LightGBM compensates for
-# the reduced negative count automatically.
-# 1.0 = disabled (keep all negatives, original behaviour). When 1.0, the OOM
-# pre-check (see below) may still auto-reduce the effective fraction if RAM looks tight.
-# Recommended: 0.3 when training on 90+ days of data to avoid Step 7 OOM,
-# or just leave it at 1.0 and let the OOM pre-check auto-adjust.
-# Example: 30 days × 27M rows → ~10M rows with NEG_SAMPLE_FRAC=0.3.
-NEG_SAMPLE_FRAC: float = 0.3
-
 # --- Production class-ratio assumption (for adjusted test precision reporting) ---
 # Expected negative-to-positive ratio in production (serving), used to adjust
 # test set precision to a realistic estimate of serving precision when negatives
@@ -405,138 +437,17 @@ PRODUCTION_NEG_POS_RATIO: Optional[float] = 87.0/13.0
 # in ``backtest_metrics.json`` for calibration / scorer parity audits.
 SELECTION_MODE: str = "field_test"
 
-# --- OOM pre-check: auto-adjust NEG_SAMPLE_FRAC after Step 1 if RAM looks tight ---
-# After the chunk list is built, the pipeline estimates Step 7 peak RAM as
-#   on_disk_total × CHUNK_CONCAT_RAM_FACTOR × (1 + TRAIN_SPLIT_FRAC)
-# (full_df and train split coexist at peak). If that exceeds
-#   ram_budget = available_ram × NEG_SAMPLE_RAM_SAFETY,
-# it auto-computes a negative fraction: frac = (ram_budget/peak - pos_rate)/(1 - pos_rate),
-# then clamps to [NEG_SAMPLE_FRAC_MIN, 1.0]. So "how much" is controlled by the
-# constants below (and by CHUNK_CONCAT_RAM_FACTOR / TRAIN_SPLIT_FRAC), not a fixed value.
-# Only triggers when NEG_SAMPLE_FRAC == 1.0 (user-configured values are respected).
-NEG_SAMPLE_FRAC_AUTO: bool = True   # set False to disable auto-adjustment entirely
-NEG_SAMPLE_FRAC_MIN: float = 0.05  # hard floor: auto-reduce will never go below this
-# Assumed positive rate used in the auto-adjustment formula.
-# Default 0.15 (15%) is conservative; lower your actual positive rate for a tighter bound.
-NEG_SAMPLE_FRAC_ASSUMED_POS_RATE: float = 0.15
-# Target: keep Step 7 estimated peak RAM within this fraction of *available* RAM.
-# 0.75 = aim to use at most 75% of currently free RAM (leaves headroom for OS + other).
-NEG_SAMPLE_RAM_SAFETY: float = 0.75
-# Fallback per-chunk on-disk size estimate when no cached chunk Parquets exist (bytes).
-# 200 MB is a rough estimate for a ~2–3M-row monthly chunk.
-NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT: int = 200 * 1024 * 1024
-
-# --- Row-level train/valid/test split ratios (SSOT §9.2, todo-row-level-time-split) ---
-# Chunks control ETL/cache volume only; the actual split is applied at row level
-# after concatenating all chunk Parquets, sorted by payout_complete_dtm.
-TRAIN_SPLIT_FRAC = 0.70   # fraction of rows allocated to training
-VALID_SPLIT_FRAC = 0.15   # fraction of rows allocated to validation; test = remainder
-MIN_VALID_TEST_ROWS = 50  # warn if valid or test set falls below this count
-
-# --- Profile ETL 記憶體 / Preload (DEC-027 OOM 區塊) ─────────────────────────
-# When True, build_player_profile() reads the session Parquet directly in DuckDB
-# instead of loading the full table into pandas memory.  Set False to force the
-# pandas fallback path (useful for debugging or environments without DuckDB).
-PROFILE_USE_DUCKDB: bool = True
-
-# Threshold for the preload OOM guard in backfill().
-# If the session Parquet on-disk size exceeds this, the preload is skipped and
-# per-snapshot PyArrow pushdown is used instead.  Only applies to the pandas
-# fallback path; the DuckDB path (PROFILE_USE_DUCKDB=True) never preloads.
-# On 8/32GB machines use --no-preload or lower this value to avoid OOM (A05).
-PROFILE_PRELOAD_MAX_BYTES: int = int(1.5 * 1024**3)  # 1.5 GB on disk
-
-# --- DuckDB 共用（SSOT, DEC-027）---
-# All DuckDB-using stages (profile ETL, Step 7, canonical mapping) share these
-# defaults. Stage overrides below. Formula: limit = clamp(available_ram * FRACTION,
-# MIN_GB, effective_MAX); effective_MAX = max(MAX_GB, available_ram * RAM_MAX_FRACTION)
-# when RAM_MAX_FRACTION is set. See doc/training_oom_and_runtime_audit.md.
-DUCKDB_RAM_FRACTION: float = 0.5
-DUCKDB_MEMORY_LIMIT_MIN_GB: float = 1.0
-DUCKDB_MEMORY_LIMIT_MAX_GB: float = 24.0
-DUCKDB_RAM_MAX_FRACTION: Optional[float] = 0.45
-DUCKDB_THREADS: int = 2
-DUCKDB_PRESERVE_INSERTION_ORDER: bool = False
-
-# Profile ETL override: heavier queries use a lower ceiling (others from DUCKDB_*).
-PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB: float = 8.0
-# Backward-compat aliases (DEC-027): tests/ETL may still read these; budget uses get_duckdb_memory_limit_bytes.
-PROFILE_DUCKDB_RAM_FRACTION: float = DUCKDB_RAM_FRACTION
-PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB: float = DUCKDB_MEMORY_LIMIT_MIN_GB
-PROFILE_DUCKDB_RAM_MAX_FRACTION: Optional[float] = DUCKDB_RAM_MAX_FRACTION
-PROFILE_DUCKDB_THREADS: int = DUCKDB_THREADS
-PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER: bool = DUCKDB_PRESERVE_INSERTION_ORDER
-
-# --- Pipeline Step 7/8/9 與方案 B/B+ 開關 (DEC-027) ---
-# DuckDB 記憶體預算改由 DUCKDB_* 共用常數 + get_duckdb_memory_config("step7") 控制。
-# Step 7 DuckDB out-of-core sort (OOM-safe; PLAN Step 7 Out-of-Core, A19):
-# When True, Step 7 uses DuckDB to sort and split chunk Parquets (spills to disk
-# when over memory_limit). When False, pandas fallback (high OOM risk). See A19.
-STEP7_USE_DUCKDB: bool = True
-# Step 7 overrides: only temp dir and threads (memory from shared DUCKDB_*).
-STEP7_DUCKDB_THREADS: int = 4
-# Temp directory for DuckDB spill; None = caller uses DATA_DIR / "duckdb_tmp". A20.
-STEP7_DUCKDB_TEMP_DIR: Optional[str] = None
-# Backward-compat aliases (DEC-027): tests may still expect these on config.
-STEP7_DUCKDB_RAM_FRACTION: float = DUCKDB_RAM_FRACTION
-STEP7_DUCKDB_RAM_MIN_GB: float = DUCKDB_MEMORY_LIMIT_MIN_GB
-STEP7_DUCKDB_RAM_MAX_GB: float = DUCKDB_MEMORY_LIMIT_MAX_GB
-STEP7_DUCKDB_PRESERVE_INSERTION_ORDER: bool = DUCKDB_PRESERVE_INSERTION_ORDER
-
-
-# --- Plan B+: Step 7 keep train on disk (PLAN 方案 B+ 階段 1–2) ---
-# When True and DuckDB succeeds, Step 7 does not load train into memory; only valid/test
-# are loaded. Step 8 then samples from train Parquet (first N rows) for screening; after
-# screening train is loaded once for export/Step 9. Reduces peak RAM between Step 7 and Step 8.
-# Requires STEP7_USE_DUCKDB=True; on DuckDB failure we raise (no pandas fallback) per PLAN.
-STEP7_KEEP_TRAIN_ON_DISK: bool = True
-
-# --- Plan B+: LibSVM export (PLAN 方案 B+ 階段 3) ---
-# When True and step7_train_path is set (B+ path), stream export from Parquet to
-# train_for_lgb.libsvm + train_for_lgb.libsvm.weight and valid_for_lgb.libsvm
-# before loading train into memory. Requires STEP7_KEEP_TRAIN_ON_DISK and split paths.
-STEP9_EXPORT_LIBSVM: bool = True
-
-# --- Plan B: train from file (PLAN 方案 B) ---
-# When True, Step 9 will train from on-disk CSV/TSV (or equivalent) instead of
-# loading full train_df into memory. Requires export + Booster path (not yet implemented).
-# Default False until the full path is implemented and validated.
-STEP9_TRAIN_FROM_FILE: bool = True
-
-# --- A3: always-on GBDT family comparison ---
-# When True, Step 9 compares LightGBM / CatBoost / XGBoost on the same rated split
-# matrices and selects the winner by the field-test validation objective.  LightGBM
-# may still use Plan B / B+ file-based training for RAM safety; CatBoost / XGBoost
-# compare on the aligned in-memory matrices after the split is materialized.
-STEP9_COMPARE_ALL_GBMS: bool = True
-
-# --- Plan B+ stage 5 (PLAN 方案 B+ 階段 5)：optional .bin for LibSVM path ---
-# When True and training from LibSVM (train_libsvm_paths), save dtrain to
-# train_for_lgb.bin after first build; on next run use .bin if present (faster I/O).
-STEP9_SAVE_LGB_BINARY: bool = True
-
-# --- DEC-031 / T-DEC031: train metrics without full dense predict_proba on X_train ---
-# Rows per batch for lgb.Booster.predict on in-memory DataFrame when computing train_* metrics.
-# When Plan B+ computes train metrics from train LibSVM file, this is unused.
-TRAIN_METRICS_PREDICT_BATCH_ROWS: int = 500_000
-
-# When set (e.g. 2_000_000), Step 8 feature screening uses only this many rows from
-# train (strategy A: sample-based screening to avoid loading full train). None = use
-# full train for screening (current behaviour). A23: For in-memory path suggest 2_000_000;
-# B+ path already defaults to 2M. If set to an integer, must be > 0; 0 or negative invalid.
-STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = None
-
-# --- Canonical mapping: DuckDB path (PLAN Canonical mapping 全歷史 Step 1) ---
-# Memory from DUCKDB_* shared; override threads only (low RAM priority for full-history scan).
-CANONICAL_MAP_DUCKDB_THREADS: int = 1
-# When True, skip DuckDB path and build mapping from full sessions in pandas (debug only; A03).
-CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS: bool = False
-# Backward-compat aliases (DEC-027): tests may still expect these on config.
-CANONICAL_MAP_DUCKDB_RAM_FRACTION: float = DUCKDB_RAM_FRACTION
-CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB: float = DUCKDB_MEMORY_LIMIT_MIN_GB
-CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB: float = DUCKDB_MEMORY_LIMIT_MAX_GB
+# --- OOM / training-memory settings re-exported from internal shards ---
+# Exposure classes:
+# - user policy knobs: e.g. NEG_SAMPLE_FRAC, STEP8_SCREEN_SAMPLE_ROWS
+# - pipeline mode defaults: e.g. STEP7_USE_DUCKDB, STEP7_KEEP_TRAIN_ON_DISK
+# - internal guards: e.g. CHUNK_CONCAT_RAM_FACTOR, DUCKDB_* memory budget constants
+# The public import surface remains this module so tests and callers can continue
+# to monkeypatch ``trainer.core.config`` directly.
 
 # --- DuckDB helper: single SSOT for all stages (DEC-027) ---
+# These wrappers intentionally stay on the public facade module so that tests and
+# callers which monkeypatch ``trainer.core.config.DUCKDB_*`` affect runtime logic.
 def get_duckdb_memory_config(
     stage: Literal["profile", "step7", "canonical_map"],
 ) -> Tuple[float, float, float, Optional[float], int, bool, Optional[str]]:

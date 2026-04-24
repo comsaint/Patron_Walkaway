@@ -10,6 +10,90 @@ This document summarizes known **out-of-memory (OOM)** and **long-running-time**
 
 ---
 
+## Confirmed Incidents vs Audit Risks
+
+This document currently mixes two different kinds of information:
+
+1. **Confirmed incidents**: OOMs or runtime blow-ups that were observed in real runs and recorded in status / plan documents.
+2. **Audit risks**: code-path risks identified by inspection, profiling, or tests, but not always tied to a preserved production error log.
+
+That distinction matters when simplifying `trainer/core/config.py`: we should avoid turning every audit risk into a user-facing knob.
+
+### Confirmed incidents (preserved in repo docs)
+
+| Step | Class | Evidence | Root cause summary |
+|------|-------|----------|--------------------|
+| 4 | DuckDB query / ETL budget | `STATUS_archive.md` Round 108 / 109 | `_compute_profile_duckdb()` originally had no runtime `memory_limit`; large profile ETL could exhaust RAM before falling back cleanly. |
+| 6 | Large DataFrame copy | `STATUS_archive.md` "OOM 修復 (2026-03-06)" | `labeled = labeled[~labeled["censored"]].copy()` on a ~32M-row chunk triggered `ArrayMemoryError` (`Unable to allocate 4.04 GiB ... object`). Real issue: too many wide/object columns plus repeated copies. |
+| 6 | Sort / merge post-processing | `STATUS_archive.md` "join_player_profile OOM fix" | `join_player_profile()` used `merged.sort_values("_orig_idx").reset_index(drop=True)`, causing a single ~10 GiB allocation on a ~30M-row chunk. |
+| 7 | Full split materialization | audit + repeated test/runtime notes in `STATUS.md` / `STATUS_archive.md` | Pandas fallback (`read_parquet` all chunks -> `concat` -> `sort`) is a known peak-RAM killer; `full_df` and split DataFrames coexist at peak. |
+| 8 | Full-matrix statistics | `PLAN_phase1.md` and this audit | `screen_features()` calling `X.std()` on full train (example 33M x 71) caused an estimated / observed ~17.6 GiB temporary allocation and `ArrayMemoryError`. |
+
+### Likely / reported incidents without a preserved full error transcript
+
+| Step | Class | Current confidence | Note |
+|------|-------|--------------------|------|
+| 6 | DuckDB Track LLM materialization | Medium | The current user reported Step 6 failures of the form "DuckDB query fails: Unable to allocate x.xxGB for an array ...". That exact transcript is not preserved in the docs I reviewed, but it is consistent with hotspot **A14** (`compute_track_llm_features()` registers a large chunk in DuckDB and materializes the result back to pandas). |
+
+### Practical implication
+
+The historical OOMs are not one single problem. They fall into a few recurring classes:
+
+- **Wide-table copy OOM**: repeated `.copy()`, boolean filtering, `reset_index()`, or object-heavy frames.
+- **Join/sort OOM**: `merge_asof`, row-order restoration, and other large post-merge reshuffles.
+- **DuckDB/Pandas boundary OOM**: a query itself may be fine, but `.df()` or large registered inputs can still blow memory.
+- **Full-matrix analytics OOM**: `std()`, `corr()`, `mutual_info_classif`, dense `predict_proba`, or full-train eval.
+
+Treating all of these with more sampling knobs is the wrong abstraction. Step 6 incidents in particular were mostly caused by **copy / join / materialize patterns**, not by train/val/test split policy.
+
+## Recommended OOM Strategy
+
+### Design principle
+
+For each pipeline step, prefer **one primary defense line** rather than multiple overlapping knobs:
+
+| Step | Primary defense line | Why |
+|------|----------------------|-----|
+| 4 | DuckDB runtime budget + explicit fallback | This is a query-engine memory problem; budget and fallback are the right tools. |
+| 6 | Column pruning + copy elimination + avoid unnecessary materialization | Confirmed incidents here came from DataFrame engineering patterns, not split policy. |
+| 7 | DuckDB out-of-core split as the default path | Pandas fallback is structurally too memory-hungry for large windows. |
+| 8 | Sample-based screening + DuckDB aggregates for small outputs | Full-matrix screening does not scale on laptop RAM. |
+| 9 | File-based / batched training and evaluation paths | Full dense train/eval materialization should be the exception, not the default. |
+
+### Simplification guidance for config
+
+To reduce config sprawl, separate settings into three buckets:
+
+1. **User policy knobs**: high-level choices users may intentionally tune.
+   - Examples: `TRAINER_DAYS`, `NEG_SAMPLE_FRAC`, `STEP8_SCREEN_SAMPLE_ROWS`, `OPTUNA_HPO_SAMPLE_ROWS`, `STEP9_COMPARE_ALL_GBMS`
+2. **Pipeline mode defaults**: architectural defaults that should almost always stay fixed.
+   - Examples: `STEP7_USE_DUCKDB=True`, `STEP7_KEEP_TRAIN_ON_DISK=True`, `STEP9_EXPORT_LIBSVM=True`
+3. **Internal guard constants**: implementation details that should rarely be tuned manually.
+   - Examples: `DUCKDB_RAM_FRACTION`, `NEG_SAMPLE_RAM_SAFETY`, `NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT`, `TRAIN_METRICS_PREDICT_BATCH_ROWS`
+
+### Strategy recommendation
+
+When future OOMs happen, diagnose them in this order before adding a new setting:
+
+1. **Is this a copy/materialization problem?**
+   - If yes, reduce columns, merge masks, avoid `reset_index()` / extra `copy()`, or keep results on disk longer.
+2. **Is this a query-engine budget problem?**
+   - If yes, use DuckDB `memory_limit`, spill directory, or a smaller query output.
+3. **Is this a full-matrix analytics problem?**
+   - If yes, switch to sample-based / batched / file-based computation.
+4. **Only then ask whether data volume should be reduced.**
+   - Sampling is a volume control, not the first-line fix for engineering-side Step 6 OOMs.
+
+### Key conclusion
+
+If we want to simplify the OOM mechanism, the target is **not** "fewer protections at all costs". The target is:
+
+- keep the protections that match the real failure class,
+- remove duplicated or user-invisible knobs where possible,
+- and stop using split-policy settings to compensate for Step 6 copy / join / materialization issues.
+
+---
+
 ## Summary Table
 
 **Item IDs:** A01–A30 for quick reference (e.g. "fix A01", "A12 = Track Human lookback").
@@ -186,6 +270,90 @@ This document summarizes known **out-of-memory (OOM)** and **long-running-time**
 ---
 
 *稽核範圍：訓練路徑。Phase 2 lookback 計畫見 `doc/track_human_lookback_vectorization_plan.md`。*
+
+---
+
+## 已確認事故 vs 稽核風險
+
+目前這份文件同時混合了兩種資訊：
+
+1. **已確認事故**：真實跑訓練時曾經發生、且在狀態或計畫文件中有留痕的 OOM / runtime 爆炸。
+2. **稽核風險**：透過程式閱讀、測試或 profiling 判斷出來的高風險路徑，但不一定保留了完整 production 錯誤訊息。
+
+如果未來要收斂 `trainer/core/config.py` 的設定數量，這個區分很重要：**不要把每一條稽核風險都變成使用者可調 knob。**
+
+### 已確認事故（repo 文件內有明確留痕）
+
+| 步驟 | 類型 | 證據 | 根因摘要 |
+|------|------|------|----------|
+| 4 | DuckDB 查詢 / ETL 預算 | `STATUS_archive.md` Round 108 / 109 | `_compute_profile_duckdb()` 當時沒有 runtime `memory_limit`；大型 profile ETL 可能先吃爆記憶體，fallback 與 log 也不夠清楚。 |
+| 6 | 大型 DataFrame copy | `STATUS_archive.md`「OOM 修復（2026-03-06）」 | 約 32M-row chunk 上 `labeled = labeled[~labeled["censored"]].copy()` 觸發 `ArrayMemoryError`（`Unable to allocate 4.04 GiB ... object`）；本質是欄位太寬、object 欄多、且中間 copy 太多。 |
+| 6 | sort / merge 後處理 | `STATUS_archive.md`「join_player_profile OOM fix」 | `join_player_profile()` 內 `merged.sort_values("_orig_idx").reset_index(drop=True)` 在約 30M-row chunk 上造成單次 ~10 GiB 配置。 |
+| 7 | 全量 split materialization | `STATUS.md` / `STATUS_archive.md` 多處 + 本文件 audit | pandas fallback（全 chunk `read_parquet` -> `concat` -> `sort`）是已知高峰值記憶體路徑；`full_df` 與 split DataFrame 會在峰值共存。 |
+| 8 | 全矩陣統計 | `PLAN_phase1.md` 與本文件 audit | `screen_features()` 對全量 train 做 `X.std()`（例：33M x 71）會產生約 17.6 GiB 暫存陣列，導致 `ArrayMemoryError`。 |
+
+### 很可能發生過，但 repo 內未保留完整原始錯誤訊息
+
+| 步驟 | 類型 | 目前信心 | 備註 |
+|------|------|----------|------|
+| 6 | DuckDB Track LLM materialization | 中 | 使用者目前回報 Step 6 曾出現「DuckDB query fails: Unable to allocate x.xxGB for an array ...」。我在本輪閱讀的文件中沒找到完整原始 transcript，但它與 **A14**（`compute_track_llm_features()` 註冊大 chunk 進 DuckDB、再 `.df()` materialize 回 pandas）高度一致。 |
+
+### 實務含意
+
+歷史 OOM 並不是同一種問題，而是反覆出現在幾類模式：
+
+- **寬表 copy OOM**：重複 `.copy()`、布林過濾、`reset_index()`，加上 object-heavy frame。
+- **join/sort OOM**：`merge_asof` 後的大型 row-order restoration 或額外排序。
+- **DuckDB/Pandas 邊界 OOM**：查詢本身不一定失敗，但 `.df()` 或大型註冊輸入仍可能炸記憶體。
+- **全矩陣分析 OOM**：`std()`、`corr()`、`mutual_info_classif`、dense `predict_proba`、全量 train eval。
+
+因此，不應該把所有 OOM 都抽象成「再多加一些 sampling 設定」。尤其 Step 6 的已確認事故，多數本質上是 **copy / join / materialize 模式**，不是 split policy 問題。
+
+## 建議的 OOM 策略
+
+### 設計原則
+
+每個 pipeline step 優先只保留**一條主要防線**，避免多個重疊 knob 同時控制：
+
+| 步驟 | 主要防線 | 理由 |
+|------|----------|------|
+| 4 | DuckDB runtime budget + 明確 fallback | 這本質是查詢引擎記憶體問題，budget / fallback 才是正解。 |
+| 6 | Column pruning + 減少 copy + 避免不必要 materialization | 已確認事故主要來自 DataFrame 工程模式，而不是 split policy。 |
+| 7 | 預設走 DuckDB out-of-core split | pandas fallback 在大窗下結構性地太吃記憶體。 |
+| 8 | sample-based screening + DuckDB 聚合小結果 | 全矩陣 screening 不適合筆電 RAM。 |
+| 9 | file-based / batched training 與 evaluation 路徑 | 全量 dense train/eval materialization 應該是例外，而不是預設。 |
+
+### 對 config 收斂的建議
+
+為了降低 `trainer/core/config.py` 的複雜度，建議把設定分成三層理解：
+
+1. **使用者政策型 knob**：使用者真的可能主動調整的高階選擇。
+   - 例：`TRAINER_DAYS`、`NEG_SAMPLE_FRAC`、`STEP8_SCREEN_SAMPLE_ROWS`、`OPTUNA_HPO_SAMPLE_ROWS`、`STEP9_COMPARE_ALL_GBMS`
+2. **Pipeline mode 預設**：偏架構決策，通常不應頻繁修改。
+   - 例：`STEP7_USE_DUCKDB=True`、`STEP7_KEEP_TRAIN_ON_DISK=True`、`STEP9_EXPORT_LIBSVM=True`
+3. **Internal guard constants**：偏實作細節，通常不該成為日常手動調參入口。
+   - 例：`DUCKDB_RAM_FRACTION`、`NEG_SAMPLE_RAM_SAFETY`、`NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT`、`TRAIN_METRICS_PREDICT_BATCH_ROWS`
+
+### 後續新增 OOM 防護時的判斷順序
+
+未來再遇到 OOM，建議先依序判斷，而不是先加新設定：
+
+1. **這是不是 copy / materialization 問題？**
+   - 若是，先減欄位、合併 mask、避免 `reset_index()` / 額外 `copy()`，或讓資料更久留在磁碟。
+2. **這是不是 query-engine 預算問題？**
+   - 若是，用 DuckDB `memory_limit`、spill directory、或縮小 query output。
+3. **這是不是 full-matrix analytics 問題？**
+   - 若是，改 sample-based / batched / file-based 計算。
+4. **最後才問要不要減少資料量。**
+   - sampling 是資料量控制，不該作為 Step 6 工程型 OOM 的第一道修法。
+
+### 關鍵結論
+
+如果目標是簡化 OOM 機制，方向不應該是「無條件減少保護」，而應該是：
+
+- 保留真正對應故障型別的保護；
+- 盡量移除重複、難理解或使用者其實不需要碰的 knobs；
+- 不要再用 split-policy 設定去補償 Step 6 的 copy / join / materialization 問題。
 
 ---
 
