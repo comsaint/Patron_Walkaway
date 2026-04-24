@@ -50,6 +50,27 @@ try:
     LIGHTGBM_GPU_N_JOBS: int = _lgb_gpu_nj if _lgb_gpu_nj > 0 else 1
 except (TypeError, ValueError):
     LIGHTGBM_GPU_N_JOBS = 4
+_GBM_BACKENDS_DEVICE_MODE_RAW = os.getenv("GBM_BACKENDS_DEVICE_MODE", "auto").strip().lower()
+if _GBM_BACKENDS_DEVICE_MODE_RAW not in ("auto", "cpu", "gpu"):
+    _log.warning(
+        "GBM_BACKENDS_DEVICE_MODE=%r invalid (use auto, cpu, or gpu); defaulting to auto",
+        _GBM_BACKENDS_DEVICE_MODE_RAW,
+    )
+    GBM_BACKENDS_DEVICE_MODE: Literal["auto", "cpu", "gpu"] = "auto"
+else:
+    GBM_BACKENDS_DEVICE_MODE = cast(
+        Literal["auto", "cpu", "gpu"],
+        _GBM_BACKENDS_DEVICE_MODE_RAW,
+    )
+_TRAINER_GPU_IDS_RAW = (os.getenv("TRAINER_GPU_IDS") or "").strip()
+TRAINER_GPU_IDS: Optional[str] = _TRAINER_GPU_IDS_RAW or None
+try:
+    _bakeoff_workers_raw = int(os.getenv("GBM_BAKEOFF_MAX_PARALLEL_BACKENDS", "0"))
+    GBM_BAKEOFF_MAX_PARALLEL_BACKENDS: Optional[int] = (
+        _bakeoff_workers_raw if _bakeoff_workers_raw > 0 else None
+    )
+except (TypeError, ValueError):
+    GBM_BAKEOFF_MAX_PARALLEL_BACKENDS = None
 
 SCREEN_FEATURES_TOP_K: Optional[int] = 50
 SCREEN_FEATURES_METHOD: Literal["lgbm", "mi", "mi_then_lgbm"] = "lgbm"

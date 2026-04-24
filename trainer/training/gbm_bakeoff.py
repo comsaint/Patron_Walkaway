@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -224,6 +225,7 @@ def _train_catboost_backend(
     sw_train: pd.Series,
     hp: Mapping[str, Any],
     *,
+    backend_runtime_params: Optional[Mapping[str, Any]] = None,
     val_dec026_window_hours: Optional[float],
     val_dec026_min_alerts_per_hour: Optional[float],
 ) -> Tuple[Any, Dict[str, Any]]:
@@ -231,6 +233,8 @@ def _train_catboost_backend(
     from trainer.training.trainer import _apply_backend_imbalance_params
 
     c_hp = dict(hp)
+    if backend_runtime_params:
+        c_hp.update(dict(backend_runtime_params))
     iterations = int(c_hp.pop("iterations"))
     early = int(c_hp.pop("early_stopping_rounds"))
     c_hp = _apply_backend_imbalance_params("catboost", c_hp, y_train)
@@ -270,6 +274,7 @@ def _train_xgboost_backend(
     sw_train: pd.Series,
     hp: Mapping[str, Any],
     *,
+    backend_runtime_params: Optional[Mapping[str, Any]] = None,
     val_dec026_window_hours: Optional[float],
     val_dec026_min_alerts_per_hour: Optional[float],
 ) -> Tuple[Any, Dict[str, Any]]:
@@ -277,6 +282,8 @@ def _train_xgboost_backend(
     from trainer.training.trainer import _apply_backend_imbalance_params
 
     x_hp = dict(hp)
+    if backend_runtime_params:
+        x_hp.update(dict(backend_runtime_params))
     n_est = int(x_hp.pop("n_estimators"))
     x_hp = _apply_backend_imbalance_params("xgboost", x_hp, y_train)
     model = xgb.XGBClassifier(n_estimators=n_est, **x_hp)
@@ -476,9 +483,11 @@ def train_and_select_rated_gbm_family(
     """Train 3 base backends plus soft-vote on aligned splits and return winner + report."""
     from trainer.training.trainer import (
         _batched_model_positive_class_scores,
+        _backend_runtime_manifest,
         _compute_feature_importance,
         _compute_test_metrics,
         _compute_train_metrics,
+        resolve_gbm_backend_runtime_plan,
         resolve_backend_optuna_budget,
         run_backend_optuna_search,
     )
@@ -529,6 +538,7 @@ def train_and_select_rated_gbm_family(
     # Only CatBoost/XGBoost branches may call run_backend_optuna_search here.
     if "optuna_hpo_enabled" not in rows["lightgbm"]:
         rows["lightgbm"]["optuna_hpo_enabled"] = False
+    rows["lightgbm"].update(_backend_runtime_manifest("lightgbm"))
     candidate_artifacts: Dict[str, Dict[str, Any]] = {
         "lightgbm": {
             "model": lightgbm_model,
@@ -551,13 +561,20 @@ def train_and_select_rated_gbm_family(
         return n if n > 1 else None
 
     _timeout_budget_divisor = _bakeoff_timeout_budget_divisor()
+    backend_runtime_plan = resolve_gbm_backend_runtime_plan()
+    backend_runtime_by_name = dict(backend_runtime_plan.get("backend_runtime_by_name") or {})
 
-    for trainer_fn, backend in (
-        (_train_catboost_backend, "catboost"),
-        (_train_xgboost_backend, "xgboost"),
-    ):
+    def _run_backend_candidate(
+        trainer_fn: Any,
+        backend: str,
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
         try:
             backend_manifest: list[dict[str, Any]] = []
+            backend_runtime_params = dict(backend_runtime_by_name.get(backend) or {})
+            backend_runtime_manifest = _backend_runtime_manifest(
+                backend,
+                backend_runtime_params=backend_runtime_params,
+            )
             if backend == "catboost":
                 hp_backend_default = _default_backend_hyperparams("catboost")
             else:
@@ -582,6 +599,7 @@ def train_and_select_rated_gbm_family(
                     timeout_seconds=budget.get("timeout_seconds"),
                     early_stop_patience=budget.get("early_stop_patience"),
                     hpo_objective_manifest=backend_manifest,
+                    backend_runtime_params=backend_runtime_params,
                 )
             else:
                 budget = resolve_backend_optuna_budget(
@@ -606,11 +624,13 @@ def train_and_select_rated_gbm_family(
                 y_val,
                 sw_train,
                 hp_backend,
+                backend_runtime_params=backend_runtime_params,
                 val_dec026_window_hours=val_dec026_window_hours,
                 val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
             )
             metrics = dict(metrics)
             metrics["best_hyperparams"] = dict(hp_backend)
+            metrics.update(backend_runtime_manifest)
             if backend_manifest:
                 metrics.update(backend_manifest[0])
             metrics["_val_scores"] = (
@@ -656,7 +676,7 @@ def train_and_select_rated_gbm_family(
             metrics["importance_method"] = "gain"
             metrics["model_backend"] = backend
             metrics["reason_codes_enabled"] = True
-            candidate_artifacts[backend] = {
+            artifact = {
                 "model": model,
                 "threshold": float(metrics["threshold"]),
                 "features": feature_cols,
@@ -664,7 +684,8 @@ def train_and_select_rated_gbm_family(
                 "model_kind": backend,
                 "reason_codes_enabled": True,
             }
-            rows[backend] = {
+            candidate_artifacts[backend] = artifact
+            row = {
                 "backend": backend,
                 **{
                     k: metrics[k]
@@ -673,20 +694,54 @@ def train_and_select_rated_gbm_family(
                 },
                 "label": f"rated_{backend}",
             }
+            return backend, artifact, row
         except ImportError as exc:
-            rows[backend] = {
+            row = {
                 "backend": backend,
                 "error": f"import_error:{exc}",
                 "bakeoff_disposition": "reject",
+                **_backend_runtime_manifest(
+                    backend,
+                    backend_runtime_params=backend_runtime_by_name.get(backend),
+                ),
             }
             logger.warning("A3 gbm_bakeoff: %s skipped (%s)", backend, exc)
+            return backend, {}, row
         except Exception as exc:
-            rows[backend] = {
+            row = {
                 "backend": backend,
                 "error": str(exc),
                 "bakeoff_disposition": "reject",
+                **_backend_runtime_manifest(
+                    backend,
+                    backend_runtime_params=backend_runtime_by_name.get(backend),
+                ),
             }
             logger.warning("A3 gbm_bakeoff: %s training failed: %s", backend, exc)
+            return backend, {}, row
+
+    backend_jobs = (
+        (_train_catboost_backend, "catboost"),
+        (_train_xgboost_backend, "xgboost"),
+    )
+    parallel_workers = int(backend_runtime_plan.get("parallel_backend_workers") or 1)
+    if parallel_workers > 1:
+        with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
+            futures = [
+                pool.submit(_run_backend_candidate, trainer_fn, backend)
+                for trainer_fn, backend in backend_jobs
+            ]
+            for fut in as_completed(futures):
+                backend, artifact, row = fut.result()
+                rows[backend] = row
+                if artifact:
+                    candidate_artifacts[backend] = artifact
+    else:
+        for trainer_fn, backend in backend_jobs:
+            backend_name, artifact, row = _run_backend_candidate(trainer_fn, backend)
+            rows[backend_name] = row
+            if artifact:
+                candidate_artifacts[backend_name] = artifact
 
     try:
         soft_row, soft_artifact = _build_soft_vote_candidate(
@@ -723,6 +778,16 @@ def train_and_select_rated_gbm_family(
         "selection_rule": rule,
         "selection_mode": "field_test",
         "per_backend": rows,
+        "backend_runtime_plan": {
+            "requested_backend_device_mode": backend_runtime_plan.get("requested_backend_device_mode"),
+            "effective_backend_device_mode": backend_runtime_plan.get("effective_backend_device_mode"),
+            "visible_gpu_ids": list(backend_runtime_plan.get("visible_gpu_ids") or []),
+            "gpu_assignments": dict(backend_runtime_plan.get("gpu_assignments") or {}),
+            "parallel_backend_workers": int(backend_runtime_plan.get("parallel_backend_workers") or 1),
+            "parallel_backend_execution": bool(
+                backend_runtime_plan.get("parallel_backend_execution", False)
+            ),
+        },
         "ensemble_bridge": {
             "same_splits": True,
             "same_time_split": True,
