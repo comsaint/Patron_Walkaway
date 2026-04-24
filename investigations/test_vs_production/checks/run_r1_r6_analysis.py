@@ -813,21 +813,38 @@ def _baseline_get_with_rated_fallback(data: Dict[str, object], key: str) -> obje
 
 
 def _load_training_metrics_baseline(model_dir: Path) -> Dict[str, object]:
-    """R8 / R1 baseline: read trainer-written training_metrics.json when present."""
-    path = model_dir / "training_metrics.json"
-    if not path.is_file():
+    """R8 / R1 baseline: read trainer metrics (v2-first merge when trainer bundle is present)."""
+    path_v1 = model_dir / "training_metrics.json"
+    path_v2 = model_dir / "training_metrics.v2.json"
+    if not path_v1.is_file() and not path_v2.is_file():
         return {
             "status": "skipped",
-            "reason": f"training_metrics.json not found under {model_dir}",
+            "reason": (
+                f"no training_metrics.json or training_metrics.v2.json under {model_dir}"
+            ),
         }
+    data: Dict[str, object]
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {"status": "error", "reason": str(exc)}
+        from trainer.core.training_metrics_bundle import load_training_metrics_merged
+
+        _src, merged = load_training_metrics_merged(model_dir)
+        data = merged if merged else {}
+    except ImportError:
+        data = {}
+    if not data:
+        read_path = path_v1 if path_v1.is_file() else path_v2
+        try:
+            raw = json.loads(read_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return {"status": "error", "reason": "training_metrics root is not an object"}
+            data = raw
+        except Exception as exc:
+            return {"status": "error", "reason": str(exc)}
+    read_path = path_v1 if path_v1.is_file() else path_v2
 
     baseline: Dict[str, object] = {
         "status": "ok",
-        "path": str(path.resolve()),
+        "path": str(read_path.resolve()),
         "model_version": data.get("model_version"),
         "test_precision_at_recall_0.01": _baseline_get_with_rated_fallback(
             data, "test_precision_at_recall_0.01"
@@ -968,7 +985,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--env-file", default="", help="Optional .env file path.")
     p.add_argument("--pred-db-path", default="", help="Override prediction log DB path.")
     p.add_argument("--state-db-path", default="", help="Override STATE_DB_PATH for alerts cross-check (R2).")
-    p.add_argument("--model-dir", default="", help="Override MODEL_DIR for training_metrics.json baseline (R1/R8).")
+    p.add_argument(
+        "--model-dir",
+        default="",
+        help="Override MODEL_DIR for training_metrics bundle baseline (R1/R8; v2-first merge when present).",
+    )
     p.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
     p.add_argument("--overwrite", action="store_true", help="Allow overwriting existing output CSV files.")
 

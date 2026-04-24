@@ -31,8 +31,9 @@ Row-retention policy:
 
 Runtime behavior:
 - ``--max-rows <= 0`` means uncapped/full-window evaluation.
-- Default ``--score-threshold`` is read from ``<--model-bundle-dir>/training_metrics.json``
-  as ``rated.threshold_at_recall_0.01`` (apple-to-apple with training); pass
+- Default ``--score-threshold`` is read from ``<--model-bundle-dir>/`` training metrics
+  (``training_metrics.v2.json`` merged with ``training_metrics.json`` when present) as
+  ``threshold_at_recall_0.01`` (``rated.*`` or top-level after merge); pass
   ``--score-threshold`` only to override.
 - ClickHouse profile fallback is on by default; pass ``--no-use-clickhouse-fallback`` to disable.
 - For backtest parquet timestamps that are tz-naive, values are normalized as UTC
@@ -70,28 +71,49 @@ _SENTINEL_SCORE_THRESHOLD = object()
 
 
 def _load_rated_threshold_at_recall_0_01(model_bundle_dir: Path) -> float:
-    """Load ``rated.threshold_at_recall_0.01`` from ``training_metrics.json`` under the model bundle."""
-    metrics_path = (model_bundle_dir / "training_metrics.json").resolve()
-    if not metrics_path.is_file():
+    """Load ``threshold_at_recall_0.01`` from bundle metrics (v2-first merge, then ``rated``)."""
+    p_v1 = (model_bundle_dir / "training_metrics.json").resolve()
+    p_v2 = (model_bundle_dir / "training_metrics.v2.json").resolve()
+    if not p_v1.is_file() and not p_v2.is_file():
         raise SystemExit(
-            f"training_metrics.json not found under --model-bundle-dir: {metrics_path}"
+            f"no training_metrics.json or training_metrics.v2.json under --model-bundle-dir: "
+            f"{model_bundle_dir}"
         )
+    data: dict
     try:
-        data = json.loads(metrics_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"Invalid JSON in {metrics_path}: {exc}") from exc
-    rated = data.get("rated")
-    if not isinstance(rated, dict):
-        raise SystemExit(f"training_metrics.json missing dict 'rated': {metrics_path}")
+        from trainer.core.training_metrics_bundle import load_training_metrics_merged
+
+        _src, merged = load_training_metrics_merged(model_bundle_dir)
+        data = merged if merged else {}
+    except ImportError:
+        data = {}
+    if not data:
+        readp = p_v1 if p_v1.is_file() else p_v2
+        try:
+            raw = json.loads(readp.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Invalid JSON in {readp}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise SystemExit(f"training_metrics root must be object: {readp}")
+        data = raw
     key = "threshold_at_recall_0.01"
-    if key not in rated:
+    rated = data.get("rated")
+    raw_val = None
+    if isinstance(rated, dict) and key in rated:
+        raw_val = rated.get(key)
+    elif key in data:
+        raw_val = data.get(key)
+    if raw_val is None:
+        readp = p_v1 if p_v1.is_file() else p_v2
         raise SystemExit(
-            f"rated.{key} missing in {metrics_path}; cannot align alert threshold with training."
+            f"{key} missing in merged metrics (rated or top-level) under {readp.parent}; "
+            "cannot align alert threshold with training."
         )
     try:
-        return float(rated[key])
+        return float(raw_val)
     except (TypeError, ValueError) as exc:
-        raise SystemExit(f"rated.{key} is not numeric in {metrics_path}") from exc
+        readp = p_v1 if p_v1.is_file() else p_v2
+        raise SystemExit(f"{key} is not numeric in {readp}") from exc
 
 
 @dataclass(frozen=True)
@@ -1182,8 +1204,9 @@ def main() -> int:
         type=Path,
         default=Path("out/models/20260419-040815-6ec219f"),
         help=(
-            "Directory with training_metrics.json. Default score threshold is "
-            "rated.threshold_at_recall_0.01 from that file (unless --score-threshold is set)."
+            "Model bundle directory (training_metrics.v2.json + training_metrics.json when present). "
+            "Default score threshold is threshold_at_recall_0.01 from merged metrics "
+            "(unless --score-threshold is set)."
         ),
     )
     p.add_argument(
@@ -1192,7 +1215,7 @@ def main() -> int:
         default=_SENTINEL_SCORE_THRESHOLD,
         help=(
             "Alert if score >= this when ``is_alert`` is absent. "
-            "Default: read rated.threshold_at_recall_0.01 from --model-bundle-dir/training_metrics.json."
+            "Default: read threshold_at_recall_0.01 from merged training metrics under --model-bundle-dir."
         ),
     )
     p.add_argument("--profile-table", default="player_profile")

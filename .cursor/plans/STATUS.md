@@ -8210,3 +8210,12 @@ python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "tes
 - **build_w1_freeze_evidence**：argparse help 補 v2 說明。
 
 驗證：`pytest tests/unit/test_baseline_reference_v2_metrics.py`、phase2 PAT 相關子集、`test_merge_baseline_data_alignment_from_metrics_then_provenance` 綠；`ruff check` 相關檔綠。
+
+
+---
+
+## OOM follow-up：Step 8 screening sample peak-RAM cleanup（2026-04-24）
+
+- `trainer/training/trainer.py`：在 `STEP7_KEEP_TRAIN_ON_DISK` 路徑，Step 8 screening 完成後、重新 `pd.read_parquet(step7_train_path)` 前，先清掉 `_train_for_screen` / `_matrix_for_screen` 並 `gc.collect()`，避免 screening sample 與 full `train_df` 在切換階段短暫共存，降低峰值 RAM。
+- `tests/review_risks/test_review_risks_round184_step8_sample.py`：新增 source-contract，鎖住 keep-on-disk 路徑必須先釋放 screening sample 再載 full train。
+- 驗證：`python -m pytest tests/review_risks/test_review_risks_round184_step8_sample.py tests/review_risks/test_review_risks_step8_duckdb_std.py tests/review_risks/test_review_risks_round220.py -q` → **37 passed, 1 skipped**；`ReadLints` 檢查變更檔案無新 lint。

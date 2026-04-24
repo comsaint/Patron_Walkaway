@@ -546,7 +546,7 @@ def run_smoke(config_path: str, run_id: str) -> dict[str, Any]:
     elif not lgbm_md:
         lgbm_md = (
             "- **LightGBM 對照**：未啟用；於 YAML 設定 `reference_model` "
-            "可載入同窗 `training_metrics.json`（SSOT §8）。\n"
+            "可載入同窗 `training_metrics.json`／`training_metrics.v2.json` bundle（SSOT §8）。\n"
         )
     summary = (
         "# Baseline run summary\n\n"

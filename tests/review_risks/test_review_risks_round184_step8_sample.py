@@ -122,6 +122,30 @@ class TestR184Step8ZeroFeatureBiasFallbackContract(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# §3b — keep-on-disk 路徑：screen sample 應先釋放再載 full train
+# ---------------------------------------------------------------------------
+
+class TestR184Step8KeepOnDiskSampleReleasedBeforeFullTrainLoad(unittest.TestCase):
+    """Round 184 follow-up: keep-on-disk path should release screening sample before full train read."""
+
+    def test_step8_keep_on_disk_releases_sample_before_read_parquet_train(self):
+        """When step7_train_path is used, source should clear _train_for_screen/_matrix_for_screen before pd.read_parquet(step7_train_path)."""
+        src = inspect.getsource(trainer_mod.run_pipeline)
+        load_idx = src.find("train_df = pd.read_parquet(step7_train_path)")
+        self.assertGreater(load_idx, -1, "Expected keep-on-disk train load in run_pipeline")
+        window = src[max(0, load_idx - 1800): load_idx + 120]
+        has_release = (
+            "_train_for_screen = None" in window
+            and "_matrix_for_screen" in window
+            and "gc.collect()" in window
+        )
+        self.assertTrue(
+            has_release,
+            "Step 8 keep-on-disk path should release screening sample before reading full train parquet.",
+        )
+
+
+# ---------------------------------------------------------------------------
 # §4 — 使用語義：N 極小時 pipeline 仍完成不崩潰（可選）
 # ---------------------------------------------------------------------------
 

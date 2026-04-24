@@ -60,9 +60,15 @@ class TestSection6BundleFiles(unittest.TestCase):
 
     def test_pipeline_diagnostics_in_bundle_files_after_training_metrics(self):
         self.assertIn("training_metrics.json", BUNDLE_FILES)
+        for f in ("training_metrics.v2.json", "feature_importance.json", "comparison_metrics.json"):
+            self.assertIn(f, BUNDLE_FILES)
         self.assertIn("pipeline_diagnostics.json", BUNDLE_FILES)
         self.assertLess(
             BUNDLE_FILES.index("training_metrics.json"),
+            BUNDLE_FILES.index("training_metrics.v2.json"),
+        )
+        self.assertLess(
+            BUNDLE_FILES.index("comparison_metrics.json"),
             BUNDLE_FILES.index("pipeline_diagnostics.json"),
         )
 
@@ -96,26 +102,28 @@ class TestSection6MlflowBundleFnameOrder(unittest.TestCase):
     def test_for_fname_tuple_order(self):
         chunk = _bundle_artifact_section(_run_pipeline_src())
         m = re.search(
-            r'for _fname in \(\s*'
-            r'"([^"]+)"\s*,\s*'
-            r'"([^"]+)"\s*,\s*'
-            r'"([^"]+)"\s*,\s*'
-            r'"([^"]+)"\s*,?\s*\)',
+            r"for _fname in \(\s*((?:\"[^\"]+\"\s*,\s*)+\"[^\"]+\"\s*,?)\s*\)",
             chunk,
             re.DOTALL,
         )
-        self.assertIsNotNone(m, "expected for _fname in ( ... ) tuple of four string literals")
-        names = m.groups()
-        self.assertEqual(
-            names,
-            (
-                "training_metrics.json",
-                "pipeline_diagnostics.json",
-                "feature_spec.yaml",
-                "model_version",
-            ),
+        self.assertIsNotNone(m, "expected for _fname in ( ... ) tuple of string literals")
+        inner = m.group(1)
+        names = re.findall(r'"([^"]+)"', inner)
+        self.assertGreaterEqual(
+            len(names),
+            4,
+            "bundle small-file loop should enumerate at least four artifacts",
         )
-        self.assertEqual(chunk.count("log_artifact_safe(_ap"), 1, "one log_artifact_safe call inside bundle for-loop")
+        self.assertEqual(names[0], "training_metrics.json")
+        self.assertIn("pipeline_diagnostics.json", names)
+        self.assertIn("model_metadata.json", names)
+        self.assertIn("feature_spec.yaml", names)
+        self.assertEqual(names[-1], "model_version")
+        self.assertEqual(
+            chunk.count("log_artifact_safe(_ap,"),
+            1,
+            "one log_artifact_safe call inside bundle for-loop",
+        )
 
     def test_run_pipeline_ast_exactly_one_log_artifact_safe_call(self):
         """STATUS Code Review #2 MRE: AST count (whole run_pipeline), not fragile substring count in comments."""

@@ -7754,6 +7754,11 @@ def run_pipeline(args) -> None:
         
             # PLAN B+ Stage 2: load train from file after screening so export/Step 9 have train_df.
             if step7_train_path is not None:
+                if _train_for_screen is not None:
+                    _train_for_screen = None
+                    if "_matrix_for_screen" in locals():
+                        del _matrix_for_screen
+                    gc.collect()
                 if STEP9_EXPORT_LIBSVM and active_feature_cols:
                     assert step7_valid_path is not None and step7_test_path is not None  # R202 guard
                     _train_libsvm, _valid_libsvm, _test_libsvm = _export_parquet_to_libsvm(
