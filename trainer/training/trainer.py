@@ -646,30 +646,46 @@ HAVING COUNT(session_id) = 1
     Path(temp_dir).mkdir(parents=True, exist_ok=True)
     temp_dir_sql = temp_dir.replace("'", "''")
 
-    # Dynamic RAM budget (PLAN Canonical mapping DuckDB 對齊 Step 7)
+    # Dynamic RAM budget via shared runtime policy.
     try:
         import psutil as _psutil
-        _avail = _psutil.virtual_memory().available
+
+        _avail = int(_psutil.virtual_memory().available)
     except Exception:
         _avail = None
-    budget_bytes = _compute_canonical_map_duckdb_budget(_avail)
-    mem_gb = budget_bytes / 1024**3
+    _resolve_runtime = getattr(_cfg, "resolve_duckdb_runtime_policy", None)
+    if callable(_resolve_runtime):
+        runtime_policy = _resolve_runtime(
+            "canonical_map",
+            _avail,
+            input_bytes=int(path.stat().st_size),
+        )
+    else:
+        budget_bytes = _compute_canonical_map_duckdb_budget(_avail)
+        runtime_policy = {
+            "stage": "canonical_map",
+            "memory_limit_bytes": budget_bytes,
+            "threads": int(threads),
+            "temp_directory": temp_dir,
+            "preserve_insertion_order": False,
+        }
+    mem_gb = float(runtime_policy["memory_limit_bytes"]) / 1024**3
 
     con = duckdb.connect(":memory:")
     try:
-        con.execute(f"SET memory_limit = '{mem_gb}GB'")
-        con.execute(f"SET threads = {int(threads)}")
-        try:
+        _apply_runtime = getattr(_cfg, "apply_duckdb_runtime", None)
+        if callable(_apply_runtime):
+            _apply_runtime(con, runtime_policy)
+        else:
+            con.execute(f"SET memory_limit = '{mem_gb}GB'")
+            con.execute(f"SET threads = {int(threads)}")
             con.execute(f"SET temp_directory = '{temp_dir_sql}'")
-        except Exception as exc:
-            logger.warning("Canonical mapping DuckDB SET temp_directory failed (non-fatal): %s", exc)
-        try:
             con.execute("SET preserve_insertion_order = false")
-        except Exception as exc:
-            logger.warning("Canonical mapping DuckDB SET preserve_insertion_order failed (non-fatal): %s", exc)
         logger.info(
             "Canonical mapping DuckDB runtime: memory_limit=%.2fGB  threads=%d  temp_directory=%s",
-            mem_gb, int(threads), temp_dir,
+            mem_gb,
+            int(runtime_policy["threads"]),
+            str(runtime_policy["temp_directory"]),
         )
         try:
             links_df = con.execute(links_sql).df()
@@ -2904,6 +2920,23 @@ def _export_parquet_to_libsvm(
 
     con = duckdb.connect(":memory:")
     try:
+        _resolve_runtime = getattr(_cfg, "resolve_duckdb_runtime_policy", None)
+        _apply_runtime = getattr(_cfg, "apply_duckdb_runtime", None)
+        _available_bytes: Optional[int] = None
+        try:
+            import psutil as _psutil
+
+            _available_bytes = int(_psutil.virtual_memory().available)
+        except Exception:
+            _available_bytes = None
+        _input_bytes = int(train_path.stat().st_size + valid_path.stat().st_size)
+        if callable(_resolve_runtime) and callable(_apply_runtime):
+            _policy = _resolve_runtime(
+                "libsvm_export",
+                _available_bytes,
+                input_bytes=_input_bytes,
+            )
+            _apply_runtime(con, _policy)
         train_s = _esc_path(str(train_path))
         valid_s = _esc_path(str(valid_path))
         cols = ", ".join(_esc_col(c) for c in feature_cols)
@@ -7061,6 +7094,12 @@ def _write_pipeline_diagnostics_json(
     step8_screening_full_train_rows: Optional[int] = None,
     step8_screening_candidate_cols: Optional[int] = None,
     step8_screened_feature_count: Optional[int] = None,
+    duckdb_runtime_step7_memory_gb: Optional[float] = None,
+    duckdb_runtime_step7_threads: Optional[int] = None,
+    duckdb_runtime_screening_memory_gb: Optional[float] = None,
+    duckdb_runtime_screening_threads: Optional[int] = None,
+    duckdb_runtime_track_llm_memory_gb: Optional[float] = None,
+    duckdb_runtime_track_llm_threads: Optional[int] = None,
     chunk_cache_stats: Optional[Dict[str, int]] = None,
     output_dir: Optional[Path] = None,
 ) -> None:
@@ -7104,6 +7143,12 @@ def _write_pipeline_diagnostics_json(
         "step8_screening_full_train_rows": step8_screening_full_train_rows,
         "step8_screening_candidate_cols": step8_screening_candidate_cols,
         "step8_screened_feature_count": step8_screened_feature_count,
+        "duckdb_runtime_step7_memory_gb": duckdb_runtime_step7_memory_gb,
+        "duckdb_runtime_step7_threads": duckdb_runtime_step7_threads,
+        "duckdb_runtime_screening_memory_gb": duckdb_runtime_screening_memory_gb,
+        "duckdb_runtime_screening_threads": duckdb_runtime_screening_threads,
+        "duckdb_runtime_track_llm_memory_gb": duckdb_runtime_track_llm_memory_gb,
+        "duckdb_runtime_track_llm_threads": duckdb_runtime_track_llm_threads,
     }
     out = {k: v for k, v in payload.items() if v is not None}
     if chunk_cache_stats:
@@ -7252,6 +7297,12 @@ def run_pipeline(args) -> None:
             step8_screening_full_train_rows: Optional[int] = None
             step8_screening_candidate_cols: Optional[int] = None
             step8_screened_feature_count: Optional[int] = None
+            duckdb_runtime_step7_memory_gb: Optional[float] = None
+            duckdb_runtime_step7_threads: Optional[int] = None
+            duckdb_runtime_screening_memory_gb: Optional[float] = None
+            duckdb_runtime_screening_threads: Optional[int] = None
+            duckdb_runtime_track_llm_memory_gb: Optional[float] = None
+            duckdb_runtime_track_llm_threads: Optional[int] = None
             # Task 7 DoD: Step 6 chunk cache counters -> pipeline_diagnostics.json
             chunk_cache_stats: Dict[str, int] = {}
 
@@ -7683,7 +7734,10 @@ def run_pipeline(args) -> None:
                     return None
         
             def _compute_step7_duckdb_budget(available_bytes: Optional[int]) -> int:
-                """Compute DuckDB memory_limit (bytes) for Step 7 sort+split. DEC-027: uses config helper."""
+                """Compute DuckDB memory_limit (bytes) for Step 7 sort+split via shared policy."""
+                _resolve_runtime = getattr(_cfg, "resolve_duckdb_runtime_policy", None)
+                if callable(_resolve_runtime):
+                    return int(_resolve_runtime("step7", available_bytes)["memory_limit_bytes"])
                 get_limit = getattr(_cfg, "get_duckdb_memory_limit_bytes", None)
                 if get_limit is not None:
                     return get_limit("step7", available_bytes)
@@ -7695,52 +7749,61 @@ def run_pipeline(args) -> None:
                 return max(lo, min(hi, int(available_bytes * frac)))
         
             def _configure_step7_duckdb_runtime(con: Any, *, budget_bytes: int) -> None:
-                """Set memory_limit, threads, temp_directory, preserve_insertion_order on *con*. DEC-027: from get_duckdb_memory_config('step7')."""
-                get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
-                if get_cfg is not None:
-                    _tup = get_cfg("step7")
-                    threads = max(1, int(_tup[4]))
-                    preserve_order = _tup[5]
-                    temp_dir_raw = _tup[6] or str(DATA_DIR / "duckdb_tmp")
+                """Set Step 7 DuckDB runtime via shared policy helper when available."""
+                _resolve_runtime = getattr(_cfg, "resolve_duckdb_runtime_policy", None)
+                _apply_runtime = getattr(_cfg, "apply_duckdb_runtime", None)
+                if callable(_resolve_runtime) and callable(_apply_runtime):
+                    policy = _resolve_runtime("step7", _get_step7_available_ram_bytes())
+                    policy["memory_limit_bytes"] = int(budget_bytes)
+                    _apply_runtime(con, policy)
+                    threads = int(policy["threads"])
+                    temp_dir = str(policy["temp_directory"])
+                    budget_gb = float(policy["memory_limit_bytes"]) / 1024**3
                 else:
-                    threads = max(1, int(getattr(_cfg, "STEP7_DUCKDB_THREADS", 4)))
-                    preserve_order = False
-                    temp_dir_raw = getattr(_cfg, "STEP7_DUCKDB_TEMP_DIR", None) or str(DATA_DIR / "duckdb_tmp")
-                if "'" in temp_dir_raw:
-                    temp_dir = str(DATA_DIR / "duckdb_tmp")
-                    logger.warning("Step 7 DuckDB temp_directory contains single quote; using fallback %s", temp_dir)
-                else:
-                    # DEC-027 Review #7: only allow path under DATA_DIR or exactly DATA_DIR/duckdb_tmp
-                    try:
-                        effective_resolved = Path(temp_dir_raw).resolve()
-                        data_dir_resolved = DATA_DIR.resolve()
-                        allowed_duckdb_tmp = (DATA_DIR / "duckdb_tmp").resolve()
-                        if effective_resolved != allowed_duckdb_tmp:
-                            effective_resolved.relative_to(data_dir_resolved)
-                    except (ValueError, OSError):
-                        temp_dir = str(DATA_DIR / "duckdb_tmp")
-                        logger.warning(
-                            "Step 7 DuckDB temp_directory outside DATA_DIR; using fallback %s",
-                            temp_dir,
-                        )
+                    get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
+                    if get_cfg is not None:
+                        _tup = get_cfg("step7")
+                        threads = max(1, int(_tup[4]))
+                        preserve_order = _tup[5]
+                        temp_dir_raw = _tup[6] or str(DATA_DIR / "duckdb_tmp")
                     else:
-                        temp_dir = temp_dir_raw
-                budget_gb = budget_bytes / 1024**3
-                temp_dir_sql = temp_dir.replace("'", "''")
-                for _stmt, _label in [
-                    (f"SET memory_limit='{budget_gb:.2f}GB'", "memory_limit"),
-                    (f"SET threads={threads}", "threads"),
-                    (f"SET temp_directory='{temp_dir_sql}'", "temp_directory"),
-                ]:
-                    try:
-                        con.execute(_stmt)
-                    except Exception as exc:
-                        logger.warning("Step 7 DuckDB SET %s failed (non-fatal): %s", _label, exc)
-                if not preserve_order:
-                    try:
-                        con.execute("SET preserve_insertion_order=false")
-                    except Exception as exc:
-                        logger.warning("Step 7 DuckDB SET preserve_insertion_order failed (non-fatal): %s", exc)
+                        threads = max(1, int(getattr(_cfg, "STEP7_DUCKDB_THREADS", 4)))
+                        preserve_order = False
+                        temp_dir_raw = getattr(_cfg, "STEP7_DUCKDB_TEMP_DIR", None) or str(DATA_DIR / "duckdb_tmp")
+                    if "'" in temp_dir_raw:
+                        temp_dir = str(DATA_DIR / "duckdb_tmp")
+                        logger.warning("Step 7 DuckDB temp_directory contains single quote; using fallback %s", temp_dir)
+                    else:
+                        try:
+                            effective_resolved = Path(temp_dir_raw).resolve()
+                            data_dir_resolved = DATA_DIR.resolve()
+                            allowed_duckdb_tmp = (DATA_DIR / "duckdb_tmp").resolve()
+                            if effective_resolved != allowed_duckdb_tmp:
+                                effective_resolved.relative_to(data_dir_resolved)
+                        except (ValueError, OSError):
+                            temp_dir = str(DATA_DIR / "duckdb_tmp")
+                            logger.warning(
+                                "Step 7 DuckDB temp_directory outside DATA_DIR; using fallback %s",
+                                temp_dir,
+                            )
+                        else:
+                            temp_dir = temp_dir_raw
+                    budget_gb = budget_bytes / 1024**3
+                    temp_dir_sql = temp_dir.replace("'", "''")
+                    for _stmt, _label in [
+                        (f"SET memory_limit='{budget_gb:.2f}GB'", "memory_limit"),
+                        (f"SET threads={threads}", "threads"),
+                        (f"SET temp_directory='{temp_dir_sql}'", "temp_directory"),
+                    ]:
+                        try:
+                            con.execute(_stmt)
+                        except Exception as exc:
+                            logger.warning("Step 7 DuckDB SET %s failed (non-fatal): %s", _label, exc)
+                    if not preserve_order:
+                        try:
+                            con.execute("SET preserve_insertion_order=false")
+                        except Exception as exc:
+                            logger.warning("Step 7 DuckDB SET preserve_insertion_order failed (non-fatal): %s", exc)
                 logger.info(
                     "Step 7 DuckDB runtime: memory_limit=%.2fGB  threads=%d  temp_directory=%s",
                     budget_gb, threads, temp_dir,
@@ -7839,7 +7902,17 @@ def run_pipeline(args) -> None:
                 Path(effective_temp_dir).mkdir(parents=True, exist_ok=True)
                 con = duckdb.connect(":memory:")
                 try:
-                    budget = _compute_step7_duckdb_budget(_get_step7_available_ram_bytes())
+                    nonlocal duckdb_runtime_step7_memory_gb, duckdb_runtime_step7_threads
+                    _avail = _get_step7_available_ram_bytes()
+                    _input_bytes = int(sum(p.stat().st_size for p in chunk_paths if p.exists()))
+                    _resolve_runtime = getattr(_cfg, "resolve_duckdb_runtime_policy", None)
+                    if callable(_resolve_runtime):
+                        _step7_policy = _resolve_runtime("step7", _avail, input_bytes=_input_bytes)
+                        budget = int(_step7_policy["memory_limit_bytes"])
+                        duckdb_runtime_step7_memory_gb = budget / 1024**3
+                        duckdb_runtime_step7_threads = int(_step7_policy["threads"])
+                    else:
+                        budget = _compute_step7_duckdb_budget(_avail)
                     _configure_step7_duckdb_runtime(con, budget_bytes=budget)
                     # Avoid prepared statement with list (Binder Error in some DuckDB builds).
                     paths_escaped = [p.replace("'", "''") for p in path_list]
@@ -8489,6 +8562,24 @@ def run_pipeline(args) -> None:
                     len(train_df) if train_df is not None else _n_train_print
                 )
                 step8_screening_candidate_cols = len(_present_candidate_cols)
+                try:
+                    import psutil as _psutil
+
+                    _avail_screen = int(_psutil.virtual_memory().available)
+                except Exception:
+                    _avail_screen = None
+                _resolve_runtime = getattr(_cfg, "resolve_duckdb_runtime_policy", None)
+                if callable(_resolve_runtime):
+                    _screen_input = int(_matrix_for_screen.memory_usage(deep=True).sum())
+                    _screen_policy = _resolve_runtime(
+                        "screening",
+                        _avail_screen,
+                        input_bytes=_screen_input,
+                    )
+                    duckdb_runtime_screening_memory_gb = (
+                        float(_screen_policy["memory_limit_bytes"]) / 1024**3
+                    )
+                    duckdb_runtime_screening_threads = int(_screen_policy["threads"])
                 step8_screened_feature_count = None
                 print("[Step 8/10] Feature screening…", flush=True)
                 t0 = time.perf_counter()
@@ -8741,6 +8832,19 @@ def run_pipeline(args) -> None:
                     step7_rss_peak_gb / oom_precheck_est_peak_ram_gb
                 )
             try:
+                _resolve_runtime = getattr(_cfg, "resolve_duckdb_runtime_policy", None)
+                if callable(_resolve_runtime):
+                    try:
+                        import psutil as _psutil
+
+                        _avail_track = int(_psutil.virtual_memory().available)
+                    except Exception:
+                        _avail_track = None
+                    _track_policy = _resolve_runtime("track_llm", _avail_track, input_bytes=None)
+                    duckdb_runtime_track_llm_memory_gb = (
+                        float(_track_policy["memory_limit_bytes"]) / 1024**3
+                    )
+                    duckdb_runtime_track_llm_threads = int(_track_policy["threads"])
                 _write_pipeline_diagnostics_json(
                     model_version=model_version,
                     pipeline_started_at=pipeline_started_at_iso,
@@ -8771,6 +8875,12 @@ def run_pipeline(args) -> None:
                     step8_screening_full_train_rows=step8_screening_full_train_rows,
                     step8_screening_candidate_cols=step8_screening_candidate_cols,
                     step8_screened_feature_count=step8_screened_feature_count,
+                    duckdb_runtime_step7_memory_gb=duckdb_runtime_step7_memory_gb,
+                    duckdb_runtime_step7_threads=duckdb_runtime_step7_threads,
+                    duckdb_runtime_screening_memory_gb=duckdb_runtime_screening_memory_gb,
+                    duckdb_runtime_screening_threads=duckdb_runtime_screening_threads,
+                    duckdb_runtime_track_llm_memory_gb=duckdb_runtime_track_llm_memory_gb,
+                    duckdb_runtime_track_llm_threads=duckdb_runtime_track_llm_threads,
                     chunk_cache_stats=chunk_cache_stats,
                     output_dir=_bundle_dir,
                 )

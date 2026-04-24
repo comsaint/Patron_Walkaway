@@ -28,7 +28,11 @@ from trainer.core._config_duckdb_memory import (
     DUCKDB_RAM_FRACTION,
     DUCKDB_RAM_MAX_FRACTION,
     DUCKDB_THREADS,
+    LIBSVM_EXPORT_DUCKDB_MEMORY_LIMIT_MAX_GB,
+    LIBSVM_EXPORT_DUCKDB_THREADS,
     PROFILE_DUCKDB_MEMORY_LIMIT_MAX_GB,
+    SCREENING_DUCKDB_MEMORY_LIMIT_MAX_GB,
+    SCREENING_DUCKDB_THREADS,
     PROFILE_DUCKDB_MEMORY_LIMIT_MIN_GB,
     PROFILE_DUCKDB_PRESERVE_INSERTION_ORDER,
     PROFILE_DUCKDB_RAM_FRACTION,
@@ -40,6 +44,12 @@ from trainer.core._config_duckdb_memory import (
     STEP7_DUCKDB_RAM_MIN_GB,
     STEP7_DUCKDB_TEMP_DIR,
     STEP7_DUCKDB_THREADS,
+    TRACK_LLM_DUCKDB_MEMORY_LIMIT_MAX_GB,
+    TRACK_LLM_DUCKDB_THREADS,
+)
+from trainer.core._duckdb_runtime import (
+    apply_duckdb_runtime,
+    resolve_duckdb_runtime_policy,
 )
 from trainer.core._config_env_paths import (
     DEFAULT_BACKTEST_OUT,
@@ -190,15 +200,16 @@ def chunk_two_stage_cache_enabled() -> bool:
 # These wrappers intentionally stay on the public facade module so that tests and
 # callers which monkeypatch ``trainer.core.config.DUCKDB_*`` affect runtime logic.
 def get_duckdb_memory_config(
-    stage: Literal["profile", "step7", "canonical_map"],
+    stage: Literal["profile", "step7", "canonical_map", "track_llm", "screening", "libsvm_export"],
 ) -> Tuple[float, float, float, Optional[float], int, bool, Optional[str]]:
     """Return (frac, min_gb, max_gb, ram_max_frac, threads, preserve_order, temp_dir).
 
     Callers use this + available_ram to compute memory_limit and SET runtime.
     """
-    if stage not in ("profile", "step7", "canonical_map"):
+    if stage not in ("profile", "step7", "canonical_map", "track_llm", "screening", "libsvm_export"):
         raise ValueError(
-            "stage must be 'profile', 'step7', or 'canonical_map', got %r" % (stage,)
+            "stage must be 'profile', 'step7', 'canonical_map', 'track_llm', 'screening', or 'libsvm_export', got %r"
+            % (stage,)
         )
     frac = DUCKDB_RAM_FRACTION
     min_gb = DUCKDB_MEMORY_LIMIT_MIN_GB
@@ -214,11 +225,21 @@ def get_duckdb_memory_config(
         temp_dir = STEP7_DUCKDB_TEMP_DIR
     elif stage == "canonical_map":
         threads = CANONICAL_MAP_DUCKDB_THREADS
+        max_gb = CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB
+    elif stage == "track_llm":
+        threads = TRACK_LLM_DUCKDB_THREADS
+        max_gb = TRACK_LLM_DUCKDB_MEMORY_LIMIT_MAX_GB
+    elif stage == "screening":
+        threads = SCREENING_DUCKDB_THREADS
+        max_gb = SCREENING_DUCKDB_MEMORY_LIMIT_MAX_GB
+    elif stage == "libsvm_export":
+        threads = LIBSVM_EXPORT_DUCKDB_THREADS
+        max_gb = LIBSVM_EXPORT_DUCKDB_MEMORY_LIMIT_MAX_GB
     return (frac, min_gb, max_gb, ram_max_frac, threads, preserve_order, temp_dir)
 
 
 def get_duckdb_memory_limit_bytes(
-    stage: Literal["profile", "step7", "canonical_map"],
+    stage: Literal["profile", "step7", "canonical_map", "track_llm", "screening", "libsvm_export"],
     available_bytes: Optional[int],
 ) -> int:
     """Compute DuckDB memory_limit in bytes. Uses get_duckdb_memory_config(stage).

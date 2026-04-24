@@ -50,6 +50,8 @@ try:
         RUN_BREAK_MIN,
         SCREEN_FEATURES_TOP_K,
         TABLE_HC_WINDOW_MIN,
+        apply_duckdb_runtime,
+        resolve_duckdb_runtime_policy,
     )
 except ModuleNotFoundError:
     from trainer.config import (  # type: ignore[import]
@@ -59,6 +61,8 @@ except ModuleNotFoundError:
         RUN_BREAK_MIN,
         SCREEN_FEATURES_TOP_K,
         TABLE_HC_WINDOW_MIN,
+        apply_duckdb_runtime,
+        resolve_duckdb_runtime_policy,
     )
 
 logger = logging.getLogger(__name__)
@@ -968,25 +972,66 @@ def compute_column_std_duckdb(
         ]
     else:
         assert path is not None
-        path_escaped = str(path).replace("'", "''")
-        con_schema = duckdb.connect(":memory:")
+        numeric_cols = []
         try:
-            con_schema.execute(f"SELECT * FROM read_parquet('{path_escaped}') LIMIT 0")
-            empty = con_schema.fetchdf()
-            numeric_cols = [
-                c for c in columns
-                if c in empty.columns and pd.api.types.is_numeric_dtype(empty[c])
-            ]
-        finally:
-            con_schema.close()
+            import pyarrow.parquet as pq
+            import pyarrow.types as pat
+
+            schema = pq.read_schema(path)
+            numeric_names = {
+                field.name
+                for field in schema
+                if pat.is_integer(field.type)
+                or pat.is_floating(field.type)
+                or pat.is_decimal(field.type)
+                or pat.is_boolean(field.type)
+            }
+            numeric_cols = [c for c in columns if c in numeric_names]
+        except Exception as exc:
+            logger.warning(
+                "compute_column_std_duckdb: pyarrow schema read failed, fallback DuckDB LIMIT 0: %s",
+                exc,
+            )
+            path_escaped = str(path).replace("'", "''")
+            con_schema = duckdb.connect(":memory:")
+            try:
+                _schema_policy = resolve_duckdb_runtime_policy("screening", available_bytes=None)
+                apply_duckdb_runtime(con_schema, _schema_policy)
+                con_schema.execute(f"SELECT * FROM read_parquet('{path_escaped}') LIMIT 0")
+                empty = con_schema.fetchdf()
+                numeric_cols = [
+                    c for c in columns
+                    if c in empty.columns and pd.api.types.is_numeric_dtype(empty[c])
+                ]
+            finally:
+                con_schema.close()
 
     if not numeric_cols:
         return pd.Series(0.0, index=columns)
 
     quoted = [_duckdb_quote_identifier(c) for c in numeric_cols]
     select_list = ", ".join(f"stddev_pop({q}) AS {q}" for q in quoted)
+    available_bytes: Optional[int] = None
+    try:
+        import psutil
+
+        available_bytes = int(psutil.virtual_memory().available)
+    except Exception:
+        available_bytes = None
+    input_bytes: Optional[int]
+    if path is not None:
+        input_bytes = int(path.stat().st_size) if path.exists() else None
+    else:
+        assert df is not None
+        input_bytes = int(df[numeric_cols].memory_usage(deep=True).sum())
+    runtime_policy = resolve_duckdb_runtime_policy(
+        "screening",
+        available_bytes,
+        input_bytes=input_bytes,
+    )
     con = duckdb.connect(":memory:")
     try:
+        apply_duckdb_runtime(con, runtime_policy)
         if path is not None:
             path_escaped = str(path).replace("'", "''")
             con.execute(f"SELECT {select_list} FROM read_parquet('{path_escaped}')")
@@ -1039,17 +1084,39 @@ def compute_correlation_matrix_duckdb(
         ]
     else:
         assert path is not None
-        path_escaped = str(path).replace("'", "''")
-        con_schema = duckdb.connect(":memory:")
+        numeric_cols = []
         try:
-            con_schema.execute(f"SELECT * FROM read_parquet('{path_escaped}') LIMIT 0")
-            empty = con_schema.fetchdf()
-            numeric_cols = [
-                c for c in columns
-                if c in empty.columns and pd.api.types.is_numeric_dtype(empty[c])
-            ]
-        finally:
-            con_schema.close()
+            import pyarrow.parquet as pq
+            import pyarrow.types as pat
+
+            schema = pq.read_schema(path)
+            numeric_names = {
+                field.name
+                for field in schema
+                if pat.is_integer(field.type)
+                or pat.is_floating(field.type)
+                or pat.is_decimal(field.type)
+                or pat.is_boolean(field.type)
+            }
+            numeric_cols = [c for c in columns if c in numeric_names]
+        except Exception as exc:
+            logger.warning(
+                "compute_correlation_matrix_duckdb: pyarrow schema read failed, fallback DuckDB LIMIT 0: %s",
+                exc,
+            )
+            path_escaped = str(path).replace("'", "''")
+            con_schema = duckdb.connect(":memory:")
+            try:
+                _schema_policy = resolve_duckdb_runtime_policy("screening", available_bytes=None)
+                apply_duckdb_runtime(con_schema, _schema_policy)
+                con_schema.execute(f"SELECT * FROM read_parquet('{path_escaped}') LIMIT 0")
+                empty = con_schema.fetchdf()
+                numeric_cols = [
+                    c for c in columns
+                    if c in empty.columns and pd.api.types.is_numeric_dtype(empty[c])
+                ]
+            finally:
+                con_schema.close()
 
     if not numeric_cols:
         return pd.DataFrame(0.0, index=columns, columns=columns)
@@ -1066,8 +1133,27 @@ def compute_correlation_matrix_duckdb(
             alias = f"_c{i}_{j}"
             select_parts.append(f"corr({quoted[i]}, {quoted[j]}) AS {alias}")
     select_sql = ", ".join(select_parts)
+    available_bytes: Optional[int] = None
+    try:
+        import psutil
+
+        available_bytes = int(psutil.virtual_memory().available)
+    except Exception:
+        available_bytes = None
+    input_bytes: Optional[int]
+    if path is not None:
+        input_bytes = int(path.stat().st_size) if path.exists() else None
+    else:
+        assert df is not None
+        input_bytes = int(df[numeric_cols].memory_usage(deep=True).sum())
+    runtime_policy = resolve_duckdb_runtime_policy(
+        "screening",
+        available_bytes,
+        input_bytes=input_bytes,
+    )
     con = duckdb.connect(":memory:")
     try:
+        apply_duckdb_runtime(con, runtime_policy)
         if path is not None:
             path_escaped = str(path).replace("'", "''")
             con.execute(f"SELECT {select_sql} FROM read_parquet('{path_escaped}')")
@@ -1971,8 +2057,22 @@ def compute_track_llm_features(
                 dtype,
                 type_counts_str,
             )
+    available_bytes: Optional[int] = None
+    try:
+        import psutil
+
+        available_bytes = int(psutil.virtual_memory().available)
+    except Exception:
+        available_bytes = None
+    input_bytes = int(df_for_duckdb.memory_usage(deep=True).sum())
+    runtime_policy = resolve_duckdb_runtime_policy(
+        "track_llm",
+        available_bytes,
+        input_bytes=input_bytes,
+    )
     con = duckdb.connect(database=":memory:")
     try:
+        apply_duckdb_runtime(con, runtime_policy)
         con.register("bets", df_for_duckdb)
         result_df = con.execute(sql).df()
     except Exception as exc:  # pragma: no cover

@@ -44,6 +44,18 @@ STEP7_DUCKDB_PRESERVE_INSERTION_ORDER: bool = DUCKDB_PRESERVE_INSERTION_ORDER
 # --- Canonical mapping DuckDB runtime (pipeline mode defaults) ---
 CANONICAL_MAP_DUCKDB_THREADS: int = 1
 
+# --- Track LLM DuckDB runtime (pipeline mode defaults) ---
+TRACK_LLM_DUCKDB_THREADS: int = 2
+TRACK_LLM_DUCKDB_MEMORY_LIMIT_MAX_GB: float = 8.0
+
+# --- Step 8 screening DuckDB runtime (pipeline mode defaults) ---
+SCREENING_DUCKDB_THREADS: int = 1
+SCREENING_DUCKDB_MEMORY_LIMIT_MAX_GB: float = 4.0
+
+# --- LibSVM export DuckDB runtime (pipeline mode defaults) ---
+LIBSVM_EXPORT_DUCKDB_THREADS: int = 1
+LIBSVM_EXPORT_DUCKDB_MEMORY_LIMIT_MAX_GB: float = 8.0
+
 # Backward-compat aliases (DEC-027): tests may still expect these on config.
 CANONICAL_MAP_DUCKDB_RAM_FRACTION: float = DUCKDB_RAM_FRACTION
 CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MIN_GB: float = DUCKDB_MEMORY_LIMIT_MIN_GB
