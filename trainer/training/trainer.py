@@ -88,6 +88,7 @@ from trainer.training.ranking_recipe_weights import (
     build_final_ranking_weights_in_memory,
     invalidate_lgb_binary_cache_for_libsvm,
     read_libsvm_weight_file,
+    refine_weights_hnm_shallow_lgbm,
     write_libsvm_weight_file,
     resolve_ranking_recipe,
 )
@@ -5317,13 +5318,13 @@ def train_single_rated_model(
 
     ranking_meta_hnm: Dict[str, Any] = {}
     if recipe_use in (RANKING_RECIPE_HNM, RANKING_RECIPE_COMBINED) and not _get_train_rated().empty:
-        sw_rated, ranking_meta_hnm = build_final_ranking_weights_in_memory(
-            _get_train_rated(),
-            sw_base,
-            recipe_use,
-            avail_cols,
-            lgb_classifier_params={**_lgb_params_for_pipeline(), **hp},
+        sw_rated, ranking_meta_hnm = refine_weights_hnm_shallow_lgbm(
+            X_tr,
+            y_tr,
+            sw_rated,
+            {**_lgb_params_for_pipeline(), **hp},
         )
+        ranking_meta_hnm["ranking_hnm_mode"] = "in_memory_shallow_lgbm"
         logger.info(
             "R2 final weights built with HNM mode=%s boosted_negs=%s",
             ranking_meta_hnm.get("ranking_hnm_mode"),
