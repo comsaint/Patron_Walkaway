@@ -1264,3 +1264,30 @@ Full run（無 fast-mode、無 sample-rated）時，profile ETL（ensure_player_
 - `product` 融合較保守，可能壓低 recall。  
 - 若 candidate cutoff 設定不當，Stage-2 可能可訓練樣本不足，需自動 fallback。  
 - 兩階段推論增加一次模型呼叫；雖僅作用於候選池，仍需監控延遲。
+
+---
+
+## DEC-050：`training_metrics` v2 雙寫檔名與 deploy bundle 納管
+
+**日期**：2026-04-24  
+**相關**：`doc/training_metrics_v2_artifact_split_implementation_plan.md`；`.cursor/plans/EXECUTION PLAN - training_metrics_v2_artifact_split.md`  
+**影響範圍**：`trainer/training/trainer.py`（`save_artifact_bundle`）、`package/build_deploy_package.py`、`model_metadata.json` artifacts 指標
+
+**決策**：
+
+1. **Phase A/B 固定檔名**：在保留 legacy `training_metrics.json`（v1）前提下，新增 **`training_metrics.v2.json`** 作為 v2 主檔；**不**採「僅沿用 `training_metrics.json` + 檔內 `schema_version` 判斷世代」方案。  
+2. **大欄位外置**：`feature_importance` → **`feature_importance.json`**；`rated.gbm_bakeoff`（A3）→ **`comparison_metrics.json`** 之 `families.gbm_bakeoff`；v2 主檔不含上述長表／大塊。  
+3. **deploy bundle**：`package/build_deploy_package.py` 之 `BUNDLE_FILES` 將 **`training_metrics.v2.json`、`feature_importance.json`、`comparison_metrics.json`** 與 legacy 一併列為必帶檔案。  
+4. **metadata 指標**：`model_metadata.json` → `artifacts` 增加 `training_metrics_v2_path`、`feature_importance_path`、`comparison_metrics_path`（絕對路徑字串，與既有 `training_metrics_path` 並存）。  
+5. **對照表**：`trainer/core/training_metrics_v2_map.json` 作為 v1→v2 鍵位對照之 machine-readable SSOT（可逐步擴充）。
+
+**理由**：
+
+- 分檔可避免 grep／審計／部署時誤讀「同檔名不同 schema」。  
+- 與 precision uplift A3／欄位契約文件對齊，降低 consumer 靜默錯讀風險。  
+- deploy 端一次帶齊新契約，避免僅帶 legacy 造成雙軌除錯成本。
+
+**代價 / 影響**：
+
+- bundle 目錄檔案數增加；舊目錄需重訓或補檔才能滿足新 deploy 清單。  
+- reader（`bundle_run_contract` 等）仍可能暫讀 v1，待 Phase B 再切換優先順序。
