@@ -53,6 +53,13 @@ class TestConfigRequiredConstants(unittest.TestCase):
     def test_optuna_n_trials_exist(self):
         self.assertHasAttr("OPTUNA_N_TRIALS", int)
 
+    def test_optuna_total_timeout_budget_exists(self):
+        self.assertTrue(hasattr(self.config, "OPTUNA_TIMEOUT_SECONDS"))
+        v = getattr(self.config, "OPTUNA_TIMEOUT_SECONDS")
+        self.assertTrue(v is None or isinstance(v, int))
+        if v is not None:
+            self.assertGreater(v, 0)
+
     def test_g1_deprecated_constants_are_numeric_if_present(self):
         """DEC-009/010: G1 constants are deprecated rollback knobs."""
         for name in ("G1_PRECISION_MIN", "G1_ALERT_VOLUME_MIN_PER_HOUR", "G1_FBETA"):

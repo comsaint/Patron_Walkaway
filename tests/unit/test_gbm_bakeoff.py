@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from unittest.mock import patch
+import trainer.training.trainer as trainer_mod
 
 pytest.importorskip("catboost")
 pytest.importorskip("xgboost")
@@ -265,3 +266,25 @@ def test_train_and_select_rated_gbm_family_skips_backend_optuna_when_disabled() 
     assert per["catboost"]["optuna_hpo_objective_mode"] == "disabled"
     assert per["xgboost"]["optuna_hpo_enabled"] is False
     assert per["xgboost"]["optuna_hpo_objective_mode"] == "disabled"
+
+
+def test_resolve_backend_optuna_budget_splits_total_timeout_equally() -> None:
+    with patch.object(trainer_mod._cfg, "OPTUNA_TIMEOUT_SECONDS", 60 * 60):
+        budget_l = trainer_mod.resolve_backend_optuna_budget(
+            "lightgbm",
+            timeout_budget_divisor=3,
+        )
+        budget_c = trainer_mod.resolve_backend_optuna_budget(
+            "catboost",
+            timeout_budget_divisor=3,
+        )
+        budget_x = trainer_mod.resolve_backend_optuna_budget(
+            "xgboost",
+            timeout_budget_divisor=3,
+        )
+
+    assert budget_l["timeout_seconds"] == 20 * 60
+    assert budget_c["timeout_seconds"] == 20 * 60
+    assert budget_x["timeout_seconds"] == 20 * 60
+    assert budget_l["n_trials"] == trainer_mod.OPTUNA_N_TRIALS
+    assert budget_l["early_stop_patience"] == trainer_mod.OPTUNA_EARLY_STOP_PATIENCE

@@ -3291,9 +3291,10 @@ def _backend_hpo_defaults(backend: str) -> dict[str, Any]:
 def resolve_backend_optuna_budget(
     backend: str,
     *,
-    default_n_trials: int = OPTUNA_N_TRIALS,
-    default_timeout_seconds: Optional[int] = OPTUNA_TIMEOUT_SECONDS,
-    default_early_stop_patience: Optional[int] = OPTUNA_EARLY_STOP_PATIENCE,
+    default_n_trials: Optional[int] = None,
+    default_timeout_seconds: Optional[int] = None,
+    default_early_stop_patience: Optional[int] = None,
+    timeout_budget_divisor: Optional[int] = None,
 ) -> dict[str, Optional[int]]:
     backend_key = str(backend or "").strip().upper()
     if not backend_key:
@@ -3315,6 +3316,20 @@ def resolve_backend_optuna_budget(
     early_stop_patience = _as_positive_int_or_none(
         getattr(_cfg, f"OPTUNA_{backend_key}_EARLY_STOP_PATIENCE", None)
     )
+    if default_n_trials is None:
+        default_n_trials = (
+            OPTUNA_N_TRIALS if isinstance(OPTUNA_N_TRIALS, int) and OPTUNA_N_TRIALS > 0 else 1
+        )
+    if default_timeout_seconds is None:
+        default_timeout_seconds = (
+            _as_positive_int_or_none(getattr(_cfg, "OPTUNA_TIMEOUT_SECONDS", None))
+            or _as_positive_int_or_none(OPTUNA_TIMEOUT_SECONDS)
+        )
+    if default_early_stop_patience is None:
+        default_early_stop_patience = (
+            _as_positive_int_or_none(getattr(_cfg, "OPTUNA_EARLY_STOP_PATIENCE", None))
+            or _as_positive_int_or_none(OPTUNA_EARLY_STOP_PATIENCE)
+        )
     if n_trials is None:
         n_trials = default_n_trials if isinstance(default_n_trials, int) and default_n_trials > 0 else 1
     if timeout_seconds is None:
@@ -3323,6 +3338,12 @@ def resolve_backend_optuna_budget(
             if isinstance(default_timeout_seconds, int) and default_timeout_seconds > 0
             else None
         )
+    if (
+        timeout_seconds is not None
+        and isinstance(timeout_budget_divisor, int)
+        and timeout_budget_divisor > 1
+    ):
+        timeout_seconds = max(1, int(timeout_seconds // timeout_budget_divisor))
     if early_stop_patience is None:
         early_stop_patience = (
             default_early_stop_patience
