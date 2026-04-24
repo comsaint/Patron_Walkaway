@@ -1481,14 +1481,27 @@ def apply_dq(
     """
     # --- sessions (FND-01 / FND-02 / FND-04) — applied first so that the
     # bets.empty early-return path still yields clean session data.
-    sessions = sessions.copy()
+    session_dt_cols: Dict[str, pd.Series] = {}
     for dt_col in ("session_start_dtm", "session_end_dtm", "lud_dtm"):
         if dt_col in sessions.columns:
-            sessions[dt_col] = pd.to_datetime(sessions[dt_col], utc=False, errors="coerce")
+            session_dt_cols[dt_col] = pd.to_datetime(
+                sessions[dt_col], utc=False, errors="coerce"
+            )
 
-    for col in ("session_id", "player_id"):
-        sessions[col] = pd.to_numeric(sessions.get(col), errors="coerce")
-    sessions = sessions.dropna(subset=["session_id"]).copy()
+    session_id_num = pd.to_numeric(
+        sessions["session_id"] if "session_id" in sessions.columns else pd.Series(np.nan, index=sessions.index),
+        errors="coerce",
+    )
+    player_id_num = pd.to_numeric(
+        sessions["player_id"] if "player_id" in sessions.columns else pd.Series(np.nan, index=sessions.index),
+        errors="coerce",
+    )
+    _valid_session_id_mask = session_id_num.notna()
+    sessions = sessions.loc[_valid_session_id_mask].copy()
+    for dt_col, normalized in session_dt_cols.items():
+        sessions[dt_col] = normalized.loc[_valid_session_id_mask].to_numpy()
+    sessions["session_id"] = session_id_num.loc[_valid_session_id_mask].to_numpy()
+    sessions["player_id"] = player_id_num.loc[_valid_session_id_mask].to_numpy()
 
     # FND-01 dedup: keep latest record per session_id (lud_dtm DESC, then
     # __etl_insert_Dtm DESC as tiebreaker — mirrors identity._fnd01_dedup_pandas) (R39)
@@ -1518,7 +1531,7 @@ def apply_dq(
         ).fillna(0)
         _games = sessions["num_games_with_wager"].fillna(0)
         dq_mask = dq_mask & ((_turnover > 0) | (_games > 0))
-    sessions = sessions[dq_mask].copy()
+    sessions = sessions.loc[dq_mask].copy()
 
     if bets.empty:
         # Sessions-only path — return clean sessions, skip bets processing entirely.
@@ -3250,16 +3263,225 @@ def _write_optuna_hpo_manifest(
     sink.append(dict(payload))
 
 
-def run_optuna_search(
+def _backend_hpo_defaults(backend: str) -> dict[str, Any]:
+    backend_n = str(backend or "").strip().lower()
+    if backend_n == "lightgbm":
+        return {
+            "n_estimators": 400,
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "max_depth": 8,
+            "min_child_samples": 20,
+        }
+    if backend_n == "catboost":
+        return {
+            "iterations": 400,
+            "learning_rate": 0.05,
+            "depth": 8,
+            "l2_leaf_reg": 3.0,
+            "random_seed": 42,
+            "verbose": False,
+            "early_stopping_rounds": 50,
+            "allow_writing_files": False,
+            "loss_function": "Logloss",
+            "thread_count": -1,
+        }
+    if backend_n == "xgboost":
+        return {
+            "n_estimators": 400,
+            "learning_rate": 0.05,
+            "max_depth": 8,
+            "reg_lambda": 1.0,
+            "reg_alpha": 0.0,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "min_child_weight": 4.0,
+            "objective": "binary:logistic",
+            "tree_method": "hist",
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbosity": 0,
+        }
+    raise ValueError(f"Unsupported HPO backend: {backend}")
+
+
+def resolve_backend_optuna_budget(
+    backend: str,
+    *,
+    default_n_trials: int = OPTUNA_N_TRIALS,
+    default_timeout_seconds: Optional[int] = OPTUNA_TIMEOUT_SECONDS,
+    default_early_stop_patience: Optional[int] = OPTUNA_EARLY_STOP_PATIENCE,
+) -> dict[str, Optional[int]]:
+    backend_key = str(backend or "").strip().upper()
+    if not backend_key:
+        backend_key = "LIGHTGBM"
+
+    def _as_positive_int_or_none(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        return None
+
+    n_trials = _as_positive_int_or_none(
+        getattr(_cfg, f"OPTUNA_{backend_key}_N_TRIALS", None)
+    )
+    timeout_seconds = _as_positive_int_or_none(
+        getattr(_cfg, f"OPTUNA_{backend_key}_TIMEOUT_SECONDS", None)
+    )
+    early_stop_patience = _as_positive_int_or_none(
+        getattr(_cfg, f"OPTUNA_{backend_key}_EARLY_STOP_PATIENCE", None)
+    )
+    if n_trials is None:
+        n_trials = default_n_trials if isinstance(default_n_trials, int) and default_n_trials > 0 else 1
+    if timeout_seconds is None:
+        timeout_seconds = (
+            default_timeout_seconds
+            if isinstance(default_timeout_seconds, int) and default_timeout_seconds > 0
+            else None
+        )
+    if early_stop_patience is None:
+        early_stop_patience = (
+            default_early_stop_patience
+            if isinstance(default_early_stop_patience, int) and default_early_stop_patience > 0
+            else None
+        )
+    return {
+        "n_trials": int(n_trials),
+        "timeout_seconds": timeout_seconds,
+        "early_stop_patience": early_stop_patience,
+    }
+
+
+def _suggest_backend_optuna_params(
+    backend: str,
+    trial: optuna.Trial,
+) -> dict[str, Any]:
+    backend_n = str(backend or "").strip().lower()
+    if backend_n == "lightgbm":
+        return {
+            **_lgb_params_for_pipeline(),
+            "n_estimators": trial.suggest_int("n_estimators", 100, 800, step=50),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "num_leaves": trial.suggest_int("num_leaves", 15, 127),
+            "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "subsample_freq": 1,
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
+        }
+    if backend_n == "catboost":
+        return {
+            "iterations": trial.suggest_int("iterations", 100, 800, step=50),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "depth": trial.suggest_int("depth", 4, 10),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 20.0, log=True),
+            "random_seed": 42,
+            "verbose": False,
+            "early_stopping_rounds": 50,
+            "allow_writing_files": False,
+            "loss_function": "Logloss",
+            "thread_count": -1,
+        }
+    if backend_n == "xgboost":
+        return {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 800, step=50),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 20.0, log=True),
+            "objective": "binary:logistic",
+            "tree_method": "hist",
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbosity": 0,
+        }
+    raise ValueError(f"Unsupported HPO backend: {backend}")
+
+
+def _fit_backend_hpo_scores(
+    backend: str,
+    *,
+    params: dict[str, Any],
+    X_tr: pd.DataFrame,
+    y_tr: pd.Series,
+    X_vl: pd.DataFrame,
+    y_vl: pd.Series,
+    sw_tr: pd.Series,
+) -> np.ndarray:
+    backend_n = str(backend or "").strip().lower()
+    if backend_n == "lightgbm":
+        model = lgb.LGBMClassifier(**params)
+        if y_tr.nunique() < 2:
+            model.fit(X_tr, y_tr, sample_weight=sw_tr)
+        else:
+            model.fit(
+                X_tr,
+                y_tr,
+                sample_weight=sw_tr,
+                eval_set=[(X_vl, y_vl)],
+                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+            )
+        return np.asarray(model.predict_proba(X_vl)[:, 1], dtype=np.float64)
+
+    X_tr_fit = X_tr.astype(np.float32, copy=False)
+    X_vl_fit = X_vl.astype(np.float32, copy=False)
+    if backend_n == "catboost":
+        from catboost import CatBoostClassifier
+
+        model = CatBoostClassifier(**params)
+        if y_tr.nunique() < 2:
+            model.fit(X_tr_fit, y_tr.astype(np.int32), sample_weight=sw_tr, verbose=False)
+        else:
+            model.fit(
+                X_tr_fit,
+                y_tr.astype(np.int32),
+                sample_weight=sw_tr,
+                eval_set=(X_vl_fit, y_vl.astype(np.int32)),
+                early_stopping_rounds=int(params.get("early_stopping_rounds", 50)),
+                verbose=False,
+            )
+        return np.asarray(model.predict_proba(X_vl_fit)[:, 1], dtype=np.float64)
+
+    if backend_n == "xgboost":
+        import xgboost as xgb
+
+        model = xgb.XGBClassifier(**params)
+        if y_tr.nunique() < 2:
+            model.fit(X_tr_fit, y_tr, sample_weight=sw_tr, verbose=False)
+        else:
+            model.fit(
+                X_tr_fit,
+                y_tr,
+                sample_weight=sw_tr,
+                eval_set=[(X_vl_fit, y_vl)],
+                verbose=False,
+            )
+        return np.asarray(model.predict_proba(X_vl_fit)[:, 1], dtype=np.float64)
+
+    raise ValueError(f"Unsupported HPO backend: {backend}")
+
+
+def run_backend_optuna_search(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_val: pd.DataFrame,
     y_val: pd.Series,
     sw_train: pd.Series,
-    n_trials: int = OPTUNA_N_TRIALS,
+    *,
+    backend: str = "lightgbm",
+    n_trials: Optional[int] = None,
     label: str = "",
     field_test_constrained_optuna_objective_allowed: Optional[bool] = None,
     val_window_hours: Optional[float] = None,
+    timeout_seconds: Optional[int] = None,
+    early_stop_patience: Optional[int] = None,
+    hpo_sample_rows: Optional[int] = OPTUNA_HPO_SAMPLE_ROWS,
     hpo_objective_manifest: Optional[list[dict[str, Any]]] = None,
 ) -> dict:
     """TPE hyperparameter search on validation.
@@ -3278,16 +3500,33 @@ def run_optuna_search(
     When *hpo_objective_manifest* is a list, it is cleared and receives one dict of
     flat ``optuna_hpo_*`` keys for ``training_metrics.json`` (W2 provenance vs ``val_ap``).
     """
+    backend_n = str(backend or "").strip().lower() or "lightgbm"
+    budget = resolve_backend_optuna_budget(
+        backend_n,
+        default_n_trials=(n_trials if isinstance(n_trials, int) and n_trials > 0 else OPTUNA_N_TRIALS),
+        default_timeout_seconds=timeout_seconds,
+        default_early_stop_patience=early_stop_patience,
+    )
+    n_trials_eff = int(budget["n_trials"] or 1)
+    timeout_eff = budget["timeout_seconds"]
+    early_stop_patience_eff = budget["early_stop_patience"]
+
     # R705: guard against empty validation input — return empty dict (base params)
     # rather than crashing inside LightGBM or average_precision_score.
     if X_val.empty or len(y_val) == 0:
         logger.warning(
-            "%s: empty validation set — skipping Optuna search, returning base params.",
+            "%s[%s]: empty validation set - skipping Optuna search, returning base params.",
             label or "model",
+            backend_n,
         )
         _write_optuna_hpo_manifest(
             hpo_objective_manifest,
             {
+                "optuna_hpo_backend": backend_n,
+                "optuna_hpo_enabled": True,
+                "optuna_hpo_n_trials_requested": n_trials_eff,
+                "optuna_hpo_timeout_seconds": timeout_eff,
+                "optuna_hpo_early_stop_patience": early_stop_patience_eff,
                 "optuna_hpo_objective_mode": "skipped_empty_validation",
                 "optuna_hpo_study_best_trial_value": None,
             },
@@ -3302,6 +3541,11 @@ def run_optuna_search(
         _write_optuna_hpo_manifest(
             hpo_objective_manifest,
             {
+                "optuna_hpo_backend": backend_n,
+                "optuna_hpo_enabled": True,
+                "optuna_hpo_n_trials_requested": n_trials_eff,
+                "optuna_hpo_timeout_seconds": timeout_eff,
+                "optuna_hpo_early_stop_patience": early_stop_patience_eff,
                 "optuna_hpo_objective_mode": "gate_blocked",
                 "optuna_hpo_study_best_trial_value": None,
                 "optuna_hpo_gate_blocked": True,
@@ -3309,7 +3553,7 @@ def run_optuna_search(
                 "optuna_hpo_gate_blocked_details": details,
             },
         )
-        raise RuntimeError(f"{label or 'model'}: {details}")
+        raise RuntimeError(f"{label or 'model'}[{backend_n}]: {details}")
 
     if field_test_constrained_optuna_objective_allowed is False and str(label or "").strip().lower() == "rated":
         _raise_field_test_gate_blocked(
@@ -3364,8 +3608,8 @@ def run_optuna_search(
     _hpo_ratio: Optional[float] = None
 
     _sample_rows = (
-        OPTUNA_HPO_SAMPLE_ROWS
-        if isinstance(OPTUNA_HPO_SAMPLE_ROWS, int) and OPTUNA_HPO_SAMPLE_ROWS > 0
+        hpo_sample_rows
+        if isinstance(hpo_sample_rows, int) and hpo_sample_rows > 0
         else None
     )
     if _sample_rows is not None and len(X_train) > _sample_rows:
@@ -3404,7 +3648,8 @@ def run_optuna_search(
             X_vl = X_val.iloc[idx_vl]
             y_vl = y_val.iloc[idx_vl]
         logger.info(
-            "Optuna HPO: subsampled train %d -> %d, valid %d -> %d (ratio=%.4f)",
+            "Optuna HPO[%s]: subsampled train %d -> %d, valid %d -> %d (ratio=%.4f)",
+            backend_n,
             len(X_train),
             len(X_tr),
             len(X_val),
@@ -3421,10 +3666,11 @@ def run_optuna_search(
     if _use_ft_hpo:
         if _ft_hpo_uses_prod_adj:
             logger.info(
-                "%s: Optuna study maximises validation precision_prod_adjusted "
+                "%s[%s]: Optuna study maximises validation precision_prod_adjusted "
                 "(DEC-026 pick; val neg/pos=%.4g vs PRODUCTION_NEG_POS_RATIO=%s; "
                 "min_alerts_per_hour=%.4g; window_hours=%.4g).",
                 label or "model",
+                backend_n,
                 float(_val_np_ratio),
                 PRODUCTION_NEG_POS_RATIO,
                 _mah_ft_f,
@@ -3432,10 +3678,11 @@ def run_optuna_search(
             )
         else:
             logger.info(
-                "%s: Optuna study maximises validation precision (DEC-026 raw; "
+                "%s[%s]: Optuna study maximises validation precision (DEC-026 raw; "
                 "prod-adjust inactive — need positives + neg/pos ratio and "
                 "PRODUCTION_NEG_POS_RATIO) with min_alerts_per_hour=%.4g over window_hours=%.4g.",
                 label or "model",
+                backend_n,
                 _mah_ft_f,
                 float(_vwh),
             )
@@ -3447,33 +3694,16 @@ def run_optuna_search(
     )
 
     def objective(trial: optuna.Trial) -> float:
-        params = {
-            **_lgb_params_for_pipeline(),
-            "n_estimators": trial.suggest_int("n_estimators", 100, 800, step=50),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-            "max_depth": trial.suggest_int("max_depth", 3, 10),
-            "num_leaves": trial.suggest_int("num_leaves", 15, 127),
-            "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
-            "subsample_freq": 1,
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
-        }
-        model = lgb.LGBMClassifier(**params)
-        # R410 #5: single-class y_tr + two-class y_vl would make LightGBM LabelEncoder
-        # raise on eval_set (unseen label). Fit without eval_set when train has one class.
-        if y_tr.nunique() < 2:
-            model.fit(X_tr, y_tr, sample_weight=sw_tr)
-        else:
-            model.fit(
-                X_tr,
-                y_tr,
-                sample_weight=sw_tr,
-                eval_set=[(X_vl, y_vl)],
-                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
-            )
-        scores = model.predict_proba(X_vl)[:, 1]
+        params = _suggest_backend_optuna_params(backend_n, trial)
+        scores = _fit_backend_hpo_scores(
+            backend_n,
+            params=params,
+            X_tr=X_tr,
+            y_tr=y_tr,
+            X_vl=X_vl,
+            y_vl=y_vl,
+            sw_tr=sw_tr,
+        )
         if _use_ft_hpo:
             _pick = pick_threshold_dec026(
                 np.asarray(y_vl, dtype=float),
@@ -3501,22 +3731,25 @@ def run_optuna_search(
         sampler=optuna.samplers.TPESampler(seed=42),
     )
     _timeout = (
-        float(OPTUNA_TIMEOUT_SECONDS)
-        if OPTUNA_TIMEOUT_SECONDS is not None and OPTUNA_TIMEOUT_SECONDS > 0
+        float(timeout_eff)
+        if timeout_eff is not None and timeout_eff > 0
         else None
     )
     if _timeout is None:
         logger.info(
-            "Optuna search (%s): n_trials=%d, timeout=disabled (OPTUNA_TIMEOUT_SECONDS=%s)",
+            "Optuna search (%s[%s]): n_trials=%d, timeout=disabled (OPTUNA_%s_TIMEOUT_SECONDS=%s)",
             label or "model",
-            n_trials,
-            OPTUNA_TIMEOUT_SECONDS,
+            backend_n,
+            n_trials_eff,
+            backend_n.upper(),
+            timeout_eff,
         )
     else:
         logger.info(
-            "Optuna search (%s): n_trials=%d, timeout=%.0fs (~%.1f min)",
+            "Optuna search (%s[%s]): n_trials=%d, timeout=%.0fs (~%.1f min)",
             label or "model",
-            n_trials,
+            backend_n,
+            n_trials_eff,
             _timeout,
             _timeout / 60.0,
         )
@@ -3527,13 +3760,13 @@ def run_optuna_search(
     optuna_pbar = (
         _ProgressNoop()
         if _disable_bar
-        else _tqdm_bar(total=n_trials, desc="Step 9 Optuna", unit="trial")
+        else _tqdm_bar(total=n_trials_eff, desc=f"Step 9 Optuna {backend_n}", unit="trial")
     )
 
     def _progress_callback(study: optuna.Study, trial: FrozenTrial) -> None:
         optuna_pbar.update(1)
         n = len(study.trials)
-        if n == 1 or n % 20 == 0 or n == n_trials:
+        if n == 1 or n % 20 == 0 or n == n_trials_eff:
             elapsed = time.perf_counter() - _start
             try:
                 best_ap = study.best_value
@@ -3542,10 +3775,11 @@ def run_optuna_search(
                 best_ap = None
             best_str = "%.4f" % (best_ap if best_ap is not None else float("nan"))
             logger.info(
-                "[Step 9] Optuna (%s) trial %d/%d  %s=%s  elapsed %.0fs (%.1f min)",
+                "[Step 9] Optuna (%s[%s]) trial %d/%d  %s=%s  elapsed %.0fs (%.1f min)",
                 label or "rated",
+                backend_n,
                 n,
-                n_trials,
+                n_trials_eff,
                 _metric_label,
                 best_str,
                 elapsed,
@@ -3570,25 +3804,31 @@ def run_optuna_search(
             _early_stop_state["no_improve_count"] = 0
         else:
             _early_stop_state["no_improve_count"] += 1
-        patience = OPTUNA_EARLY_STOP_PATIENCE if isinstance(OPTUNA_EARLY_STOP_PATIENCE, int) else 0
+        patience = (
+            early_stop_patience_eff
+            if isinstance(early_stop_patience_eff, int) and early_stop_patience_eff > 0
+            else 0
+        )
         if patience > 0 and _early_stop_state["no_improve_count"] >= patience:
             study.stop()
             n = len(study.trials)
             logger.info(
-                "[Step 9] Optuna early stop: no improvement for %d trials (stopped at trial %d/%d)",
+                "[Step 9] Optuna early stop (%s[%s]): no improvement for %d trials (stopped at trial %d/%d)",
+                label or "rated",
+                backend_n,
                 patience,
                 n,
-                n_trials,
+                n_trials_eff,
             )
 
     callbacks: List[Callable[[optuna.Study, FrozenTrial], None]] = [_progress_callback]
-    if isinstance(OPTUNA_EARLY_STOP_PATIENCE, int) and OPTUNA_EARLY_STOP_PATIENCE > 0:
+    if isinstance(early_stop_patience_eff, int) and early_stop_patience_eff > 0:
         callbacks.append(_early_stop_callback)
 
     try:
         study.optimize(
             objective,
-            n_trials=n_trials,
+            n_trials=n_trials_eff,
             timeout=_timeout,
             show_progress_bar=False,
             callbacks=callbacks,
@@ -3601,8 +3841,9 @@ def run_optuna_search(
     except ValueError:
         final_best_ap = None
     logger.info(
-        "Optuna (%s) %s=%s, params=%s",
+        "Optuna (%s[%s]) %s=%s, params=%s",
         label or "model",
+        backend_n,
         _metric_label,
         "%.4f" % final_best_ap if final_best_ap is not None else "N/A",
         best,
@@ -3615,11 +3856,24 @@ def run_optuna_search(
             else "field_test_dec026_val_precision_raw"
         )
     _manifest_pay: dict[str, Any] = {
+        "optuna_hpo_backend": backend_n,
+        "optuna_hpo_enabled": True,
+        "optuna_hpo_n_trials_requested": n_trials_eff,
+        "optuna_hpo_timeout_seconds": timeout_eff,
+        "optuna_hpo_early_stop_patience": early_stop_patience_eff,
+        "optuna_hpo_study_trials_completed": int(len(study.trials)),
+        "optuna_hpo_study_stopped_early": bool(len(study.trials) < n_trials_eff),
         "optuna_hpo_objective_mode": _obj_mode,
         "optuna_hpo_study_best_trial_value": (
             float(final_best_ap) if final_best_ap is not None else None
         ),
     }
+    if _sample_rows is not None:
+        _manifest_pay["optuna_hpo_sample_rows_cap"] = int(_sample_rows)
+    if _hpo_ratio is not None:
+        _manifest_pay["optuna_hpo_sample_ratio"] = float(_hpo_ratio)
+        _manifest_pay["optuna_hpo_sampled_train_rows"] = int(len(X_tr))
+        _manifest_pay["optuna_hpo_sampled_valid_rows"] = int(len(X_vl))
     if _vwh is not None:
         _manifest_pay["optuna_hpo_val_window_hours_used"] = float(_vwh)
     if _use_ft_hpo:
@@ -3638,6 +3892,34 @@ def run_optuna_search(
                 pass
     _write_optuna_hpo_manifest(hpo_objective_manifest, _manifest_pay)
     return best
+
+
+def run_optuna_search(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    sw_train: pd.Series,
+    n_trials: int = OPTUNA_N_TRIALS,
+    label: str = "",
+    field_test_constrained_optuna_objective_allowed: Optional[bool] = None,
+    val_window_hours: Optional[float] = None,
+    hpo_objective_manifest: Optional[list[dict[str, Any]]] = None,
+) -> dict:
+    """Backward-compatible LightGBM Optuna wrapper."""
+    return run_backend_optuna_search(
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        sw_train,
+        backend="lightgbm",
+        n_trials=n_trials,
+        label=label,
+        field_test_constrained_optuna_objective_allowed=field_test_constrained_optuna_objective_allowed,
+        val_window_hours=val_window_hours,
+        hpo_objective_manifest=hpo_objective_manifest,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4720,36 +5002,142 @@ def train_single_rated_model(
                 train_path,
                 valid_path,
             )
-    train_rated = train_df[train_df["is_rated"]].copy() if not train_df.empty else train_df
-    val_rated = valid_df[valid_df["is_rated"]].copy() if not valid_df.empty else valid_df
-    test_rated: Optional[pd.DataFrame]
-    if test_df is not None and not test_df.empty:
-        test_rated = test_df[test_df["is_rated"]].copy()
-    else:
-        test_rated = test_df
 
-    if train_rated.empty and not use_from_libsvm:
+    if use_from_libsvm:
+        train_libsvm_p, valid_libsvm_p = train_libsvm_paths  # type: ignore[misc]
+        with open(train_libsvm_p, encoding="utf-8") as _f:
+            _n_lines = sum(1 for _ in _f)
+        if _n_lines < 1:
+            logger.warning(
+                "Plan B+: train LibSVM has 0 lines; falling back to in-memory training."
+            )
+            use_from_libsvm = False
+        if use_from_libsvm:
+            # R375 #6: single-class check (align with Plan B R188 #3 / R1509).
+            with open(train_libsvm_p, encoding="utf-8") as _f:
+                _labels = [line.split(None, 1)[0] for line in _f if line.strip()]
+            if len(set(_labels)) < 2:
+                logger.warning(
+                    "Plan B+: train LibSVM has only one class; falling back to in-memory training."
+                )
+                use_from_libsvm = False
+
+    train_rated: Optional[pd.DataFrame] = None
+    val_rated: Optional[pd.DataFrame] = None
+    test_rated: Optional[pd.DataFrame] = None
+    _train_views_ready = False
+    _train_rated_mutable = False
+    _val_rated_mutable = False
+    _test_rated_mutable = False
+    X_tr = pd.DataFrame()
+    y_tr: Union[pd.Series, np.ndarray] = pd.Series(dtype=float)
+    X_vl = pd.DataFrame()
+    y_vl: Union[pd.Series, np.ndarray] = pd.Series(dtype=float)
+
+    def _get_train_rated(*, mutable: bool = False) -> pd.DataFrame:
+        nonlocal train_rated, _train_rated_mutable
+        if train_rated is None:
+            if train_df.empty:
+                train_rated = train_df.copy() if mutable else train_df
+                _train_rated_mutable = mutable
+            elif bool(train_df["is_rated"].all()):
+                train_rated = train_df.copy() if mutable else train_df
+                _train_rated_mutable = mutable
+            else:
+                train_rated = (
+                    train_df.loc[train_df["is_rated"]].copy()
+                    if mutable
+                    else train_df.loc[train_df["is_rated"]]
+                )
+                _train_rated_mutable = mutable
+        elif mutable and not _train_rated_mutable:
+            train_rated = train_rated.copy()
+            _train_rated_mutable = True
+        return train_rated
+
+    def _get_val_rated(*, mutable: bool = False) -> pd.DataFrame:
+        nonlocal val_rated, _val_rated_mutable
+        if val_rated is None:
+            if valid_df.empty:
+                val_rated = valid_df.copy() if mutable else valid_df
+                _val_rated_mutable = mutable
+            elif bool(valid_df["is_rated"].all()):
+                val_rated = valid_df.copy() if mutable else valid_df
+                _val_rated_mutable = mutable
+            else:
+                val_rated = (
+                    valid_df.loc[valid_df["is_rated"]].copy()
+                    if mutable
+                    else valid_df.loc[valid_df["is_rated"]]
+                )
+                _val_rated_mutable = mutable
+        elif mutable and not _val_rated_mutable:
+            val_rated = val_rated.copy()
+            _val_rated_mutable = True
+        return val_rated
+
+    def _get_test_rated(*, mutable: bool = False) -> Optional[pd.DataFrame]:
+        nonlocal test_rated, _test_rated_mutable
+        if test_rated is None and test_df is not None:
+            if test_df.empty:
+                test_rated = test_df.copy() if mutable else test_df
+                _test_rated_mutable = mutable
+            elif bool(test_df["is_rated"].all()):
+                test_rated = test_df.copy() if mutable else test_df
+                _test_rated_mutable = mutable
+            else:
+                test_rated = (
+                    test_df.loc[test_df["is_rated"]].copy()
+                    if mutable
+                    else test_df.loc[test_df["is_rated"]]
+                )
+                _test_rated_mutable = mutable
+        elif mutable and test_rated is not None and not _test_rated_mutable:
+            test_rated = test_rated.copy()
+            _test_rated_mutable = True
+        return test_rated
+
+    def _ensure_inmemory_train_views(feature_names: List[str]) -> None:
+        nonlocal _train_views_ready, X_tr, y_tr, X_vl, y_vl
+        tr = _get_train_rated(mutable=True)
+        vr = _get_val_rated(mutable=True)
+        if _train_views_ready:
+            return
+        # Copy reduction for LibSVM path: only materialize rated pandas matrices when
+        # a downstream branch truly needs them (fallback, bakeoff, A4, or in-memory train).
+        coerce_feature_dtypes(tr, feature_names)
+        if not vr.empty:
+            coerce_feature_dtypes(vr, feature_names)
+        X_tr = tr[feature_names]
+        y_tr = tr["label"]
+        X_vl = vr[feature_names] if not vr.empty else X_tr.head(0)
+        if not isinstance(y_vl, np.ndarray):
+            y_vl = vr["label"] if not vr.empty else y_tr.head(0)
+        _train_views_ready = True
+
+    if not use_from_libsvm and _get_train_rated().empty:
         logger.warning("rated model: no training rows, skipping")
         return None, None, {"rated": None}
 
-    sw_base = compute_sample_weights(train_rated) if not train_rated.empty else pd.Series(dtype=float)
     recipe_use = resolve_ranking_recipe(ranking_recipe)
+    _valid_cols = valid_df.columns if not valid_df.empty else pd.Index([])
     if use_from_libsvm:
-        avail_cols = [c for c in feature_cols if c in val_rated.columns]
+        avail_cols = [c for c in feature_cols if c in _valid_cols]
         if not avail_cols:
             avail_cols = list(feature_cols)
     else:
-        avail_cols = [c for c in feature_cols if c in train_rated.columns]
-        if not val_rated.empty:
-            avail_cols = [c for c in avail_cols if c in val_rated.columns]
-    # R123-1: coerce object columns to numeric before building X_train so LightGBM
-    # never receives an object-dtype feature (which would crash fit()).
-    coerce_feature_dtypes(train_rated, avail_cols)
-    if not val_rated.empty:
-        coerce_feature_dtypes(val_rated, avail_cols)
-    X_tr, y_tr = train_rated[avail_cols], train_rated["label"]
-    X_vl = val_rated[avail_cols] if not val_rated.empty else X_tr.head(0)
-    y_vl = val_rated["label"] if not val_rated.empty else y_tr.head(0)
+        avail_cols = [c for c in feature_cols if c in _get_train_rated().columns]
+        if len(_valid_cols) > 0:
+            avail_cols = [c for c in avail_cols if c in _valid_cols]
+
+    if (not use_from_libsvm) or gbm_bakeoff or A4_TWO_STAGE_ENABLE_TRAINING:
+        _ensure_inmemory_train_views(avail_cols)
+
+    sw_base = (
+        compute_sample_weights(_get_train_rated())
+        if train_rated is not None and not train_rated.empty
+        else pd.Series(dtype=float)
+    )
     _dupe_cols = [c for c in set(avail_cols) if avail_cols.count(c) > 1]
     # #region agent log
     _agent_debug_log(
@@ -4783,12 +5171,12 @@ def train_single_rated_model(
             )
     else:
         sw_rated, ranking_meta_pre = apply_ranking_recipe_pre_optuna_weights(
-            train_rated,
+            _get_train_rated(),
             sw_base,
             recipe_use,
             avail_cols,
         )
-        if not train_rated.empty:
+        if not _get_train_rated().empty:
             logger.info(
                 "R2 ranking recipe=%s pre_optuna weight_mean=%.6f max=%.6f",
                 recipe_use,
@@ -4812,7 +5200,7 @@ def train_single_rated_model(
     _ft_thr_wh, _ft_thr_mah = _rated_field_test_val_pick_per_hour_kwargs(
         label="rated",
         field_test_constrained_optuna_objective_allowed=_ft_allowed,
-        val_df=val_rated,
+        val_df=_get_val_rated(),
     )
 
     # PLAN 方案 B §6: HPO on in-memory (train/valid) for both paths; from-file then uses best params for lgb.train.
@@ -4825,8 +5213,8 @@ def train_single_rated_model(
             "max_depth": 8,
             "min_child_samples": 20,
         }
-    elif run_optuna and not val_rated.empty and y_vl.sum() > 0:
-        _val_wh = _val_window_hours_from_payout_df(val_rated)
+    elif run_optuna and not _get_val_rated().empty and y_vl.sum() > 0:
+        _val_wh = _val_window_hours_from_payout_df(_get_val_rated())
         _ft_hpo_active = _ft_allowed and _val_wh is not None
         log_optuna_precondition_context(
             _ft_pre_doc, uses_field_test_hpo_objective=_ft_hpo_active
@@ -4856,7 +5244,7 @@ def train_single_rated_model(
         not use_from_libsvm
         and not use_from_file
         and recipe_use in (RANKING_RECIPE_HNM, RANKING_RECIPE_COMBINED)
-        and not train_rated.empty
+        and not _get_train_rated().empty
     ):
         sw_rated, ranking_meta_hnm = refine_weights_hnm_shallow_lgbm(
             X_tr,
@@ -4872,275 +5260,257 @@ def train_single_rated_model(
     if use_from_libsvm:
         # PLAN B+ §4.4: train from LibSVM file; LightGBM auto-loads .weight when beside .libsvm.
         train_libsvm_p, valid_libsvm_p = train_libsvm_paths  # type: ignore[misc]
-        with open(train_libsvm_p, encoding="utf-8") as _f:
-            _n_lines = sum(1 for _ in _f)
-        if _n_lines < 1:
-            logger.warning(
-                "Plan B+: train LibSVM has 0 lines; falling back to in-memory training."
-            )
-            use_from_libsvm = False
-            if train_rated.empty:
-                return None, None, {"rated": None}
-        if use_from_libsvm:
-            # R375 #6: single-class check (align with Plan B R188 #3 / R1509).
-            with open(train_libsvm_p, encoding="utf-8") as _f:
-                _labels = [line.split(None, 1)[0] for line in _f if line.strip()]
-            if len(set(_labels)) < 2:
+        # PLAN B+ 階段 6: validation labels from file when valid_df not in memory (R216 Review #6: path under DATA_DIR only)
+        _valid_path_under_data_dir = True
+        if valid_df is None or (valid_df is not None and valid_df.empty):
+            try:
+                valid_libsvm_p.resolve().relative_to(DATA_DIR.resolve())
+            except ValueError:
                 logger.warning(
-                    "Plan B+: train LibSVM has only one class; falling back to in-memory training."
+                    "Plan B+: valid LibSVM path %s is not under DATA_DIR; skipping validation from file.",
+                    valid_libsvm_p,
                 )
-                use_from_libsvm = False
-        if use_from_libsvm:
-            # PLAN B+ 階段 6: validation labels from file when valid_df not in memory (R216 Review #6: path under DATA_DIR only)
-            _valid_path_under_data_dir = True
-            if valid_df is None or (valid_df is not None and valid_df.empty):
-                try:
-                    valid_libsvm_p.resolve().relative_to(DATA_DIR.resolve())
-                except ValueError:
+                y_vl = np.array([], dtype=np.float64)
+                _valid_path_under_data_dir = False
+            else:
+                y_vl = _labels_from_libsvm(valid_libsvm_p)
+        _has_val_from_file = (
+            len(y_vl) >= MIN_VALID_TEST_ROWS
+            and (int(y_vl.isna().sum()) if hasattr(y_vl, "isna") else int(np.isnan(y_vl).sum())) == 0
+            and int(np.asarray(y_vl).sum()) >= 1
+            and int((np.asarray(y_vl) == 0).sum()) >= 1
+        )
+        _bin_path = train_libsvm_p.parent / (train_libsvm_p.stem + ".bin")
+        # R207 #2: use .bin only when _bin_path.is_file() (avoid using a directory as .bin).
+        # LibSVM export uses 0-based feature indices (0..49 for 50 features) so LightGBM infers num_feature=50 and matches feature_name.
+        # #region agent log
+        _agent_debug_log(
+            hypothesis_id="H4",
+            location="trainer/training/trainer.py:train_single_rated_model:libsvm-branch",
+            message="LibSVM training branch path status before Dataset construction",
+            data={
+                "train_libsvm_path": str(train_libsvm_p),
+                "valid_libsvm_path": str(valid_libsvm_p),
+                "bin_path": str(_bin_path),
+                "bin_exists": bool(_bin_path.is_file()),
+                "train_libsvm_lines": int(_n_lines),
+                "avail_cols_len": len(avail_cols),
+            },
+        )
+        # #endregion
+        _libsvm_temp_to_remove: Optional[Path] = None
+        if _bin_path.is_file():
+            dtrain = lgb.Dataset(str(_bin_path))
+            dvalid = lgb.Dataset(
+                str(valid_libsvm_p),
+                reference=dtrain,
+                feature_name=list(avail_cols),
+            )
+        else:
+            weight_path = Path(str(train_libsvm_p) + ".weight")
+            _train_path_for_lgb: Union[str, Path] = train_libsvm_p
+            if weight_path.exists():
+                with open(weight_path, encoding="utf-8") as _wf:
+                    _train_weights = [float(line.strip()) for line in _wf]
+                if len(_train_weights) != _n_lines:
                     logger.warning(
-                        "Plan B+: valid LibSVM path %s is not under DATA_DIR; skipping validation from file.",
-                        valid_libsvm_p,
+                        "Plan B+: .weight file line count (%s) does not match train LibSVM line count (%s); ignoring weights.",
+                        len(_train_weights),
+                        _n_lines,
                     )
-                    y_vl = np.array([], dtype=np.float64)
-                    _valid_path_under_data_dir = False
-                else:
-                    y_vl = _labels_from_libsvm(valid_libsvm_p)
-            _has_val_from_file = (
-                len(y_vl) >= MIN_VALID_TEST_ROWS
-                and (int(y_vl.isna().sum()) if hasattr(y_vl, "isna") else int(np.isnan(y_vl).sum())) == 0
-                and int(np.asarray(y_vl).sum()) >= 1
-                and int((np.asarray(y_vl) == 0).sum()) >= 1
-            )
-            _bin_path = train_libsvm_p.parent / (train_libsvm_p.stem + ".bin")
-            # R207 #2: use .bin only when _bin_path.is_file() (avoid using a directory as .bin).
-            # LibSVM export uses 0-based feature indices (0..49 for 50 features) so LightGBM infers num_feature=50 and matches feature_name.
-            # #region agent log
-            _agent_debug_log(
-                hypothesis_id="H4",
-                location="trainer/training/trainer.py:train_single_rated_model:libsvm-branch",
-                message="LibSVM training branch path status before Dataset construction",
-                data={
-                    "train_libsvm_path": str(train_libsvm_p),
-                    "valid_libsvm_path": str(valid_libsvm_p),
-                    "bin_path": str(_bin_path),
-                    "bin_exists": bool(_bin_path.is_file()),
-                    "train_libsvm_lines": int(_n_lines),
-                    "avail_cols_len": len(avail_cols),
-                },
-            )
-            # #endregion
-            _libsvm_temp_to_remove: Optional[Path] = None
-            if _bin_path.is_file():
-                dtrain = lgb.Dataset(str(_bin_path))
-                dvalid = lgb.Dataset(
-                    str(valid_libsvm_p),
-                    reference=dtrain,
-                    feature_name=list(avail_cols),
-                )
+                    _train_weights = [1.0] * _n_lines
+                    _fd, _tmp = tempfile.mkstemp(suffix=".libsvm")
+                    os.close(_fd)
+                    _libsvm_temp_to_remove = Path(_tmp)
+                    _libsvm_temp_to_remove.write_text(
+                        train_libsvm_p.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
+                    _train_path_for_lgb = _tmp
             else:
-                weight_path = Path(str(train_libsvm_p) + ".weight")
-                _train_path_for_lgb: Union[str, Path] = train_libsvm_p
-                if weight_path.exists():
-                    with open(weight_path, encoding="utf-8") as _wf:
-                        _train_weights = [float(line.strip()) for line in _wf]
-                    if len(_train_weights) != _n_lines:
-                        logger.warning(
-                            "Plan B+: .weight file line count (%s) does not match train LibSVM line count (%s); ignoring weights.",
-                            len(_train_weights),
-                            _n_lines,
-                        )
-                        _train_weights = [1.0] * _n_lines
-                        _fd, _tmp = tempfile.mkstemp(suffix=".libsvm")
-                        os.close(_fd)
-                        _libsvm_temp_to_remove = Path(_tmp)
-                        _libsvm_temp_to_remove.write_text(
-                            train_libsvm_p.read_text(encoding="utf-8"), encoding="utf-8"
-                        )
-                        _train_path_for_lgb = _tmp
-                else:
-                    _train_weights = None
-                dtrain = lgb.Dataset(
-                    str(_train_path_for_lgb),
-                    weight=_train_weights,
-                    feature_name=list(avail_cols),
-                )
-                dvalid = lgb.Dataset(
-                    str(valid_libsvm_p),
-                    reference=dtrain,
-                    feature_name=list(avail_cols),
-                )
-                if STEP9_SAVE_LGB_BINARY:
-                    try:
-                        _max_idx_train = -1
-                        _idx_51_cnt = 0
-                        _min_idx_train = 10**9
-                        with open(_train_path_for_lgb, encoding="utf-8") as _scanf:
-                            for _li, _line in enumerate(_scanf):
-                                if _li >= 100_000:
-                                    break
-                                _line = _line.strip()
-                                if not _line:
+                _train_weights = None
+            dtrain = lgb.Dataset(
+                str(_train_path_for_lgb),
+                weight=_train_weights,
+                feature_name=list(avail_cols),
+            )
+            dvalid = lgb.Dataset(
+                str(valid_libsvm_p),
+                reference=dtrain,
+                feature_name=list(avail_cols),
+            )
+            if STEP9_SAVE_LGB_BINARY:
+                try:
+                    _max_idx_train = -1
+                    _idx_51_cnt = 0
+                    _min_idx_train = 10**9
+                    with open(_train_path_for_lgb, encoding="utf-8") as _scanf:
+                        for _li, _line in enumerate(_scanf):
+                            if _li >= 100_000:
+                                break
+                            _line = _line.strip()
+                            if not _line:
+                                continue
+                            _parts = _line.split()
+                            for _tok in _parts[1:]:
+                                if ":" not in _tok:
                                     continue
-                                _parts = _line.split()
-                                for _tok in _parts[1:]:
-                                    if ":" not in _tok:
-                                        continue
-                                    try:
-                                        _idx = int(_tok.split(":", 1)[0])
-                                    except ValueError:
-                                        continue
-                                    if _idx > _max_idx_train:
-                                        _max_idx_train = _idx
-                                    if _idx < _min_idx_train:
-                                        _min_idx_train = _idx
-                                    if _idx == 51:
-                                        _idx_51_cnt += 1
-                        # #region agent log
-                        _agent_debug_log(
-                            hypothesis_id="H1",
-                            location="trainer/training/trainer.py:train_single_rated_model:pre-save-binary-scan",
-                            message="Pre-save_binary sampled index stats from train LibSVM",
-                            data={
-                                "train_path_for_lgb": str(_train_path_for_lgb),
-                                "sampled_lines": 100000,
-                                "min_feature_index": (None if _max_idx_train < 0 else _min_idx_train),
-                                "max_feature_index": (None if _max_idx_train < 0 else _max_idx_train),
-                                "index_51_count_in_sample": _idx_51_cnt,
-                                "avail_cols_len": len(avail_cols),
-                            },
-                        )
-                        # #endregion
-                        dtrain.save_binary(str(_bin_path))
-                        logger.info("Plan B+: saved train Dataset to %s", _bin_path)
-                    except OSError as _e:
-                        logger.warning(
-                            "Plan B+: failed to save train Dataset to %s (%s); continuing without .bin.",
-                            _bin_path,
-                            _e,
-                        )
-                    except Exception as _e:
-                        # #region agent log
-                        _agent_debug_log(
-                            hypothesis_id="H3",
-                            location="trainer/training/trainer.py:train_single_rated_model:save-binary-exception",
-                            message="save_binary raised exception",
-                            data={
-                                "error_type": type(_e).__name__,
-                                "error": str(_e),
-                                "bin_path": str(_bin_path),
-                                "avail_cols_len": len(avail_cols),
-                            },
-                        )
-                        # #endregion
-                        raise
-            _default_hp = {
-                "n_estimators": 400,
-                "learning_rate": 0.05,
-                "num_leaves": 31,
-                "max_depth": 8,
-                "min_child_samples": 20,
-            }
-            hp_resolved = {**_default_hp, **hp}
-            hp_lgb = {
-                **_lgb_params_for_pipeline(),
-                "learning_rate": hp_resolved["learning_rate"],
-                "num_leaves": hp_resolved["num_leaves"],
-                "max_depth": hp_resolved["max_depth"],
-                "min_child_samples": hp_resolved["min_child_samples"],
-            }
-            num_boost_round = max(1, int(hp_resolved.get("n_estimators", 400)))
-            if _has_val_from_file:
-                booster = lgb.train(
-                    hp_lgb,
-                    dtrain,
-                    num_boost_round=num_boost_round,
-                    valid_sets=[dvalid],
-                    callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
-                )
-            else:
-                booster = lgb.train(
-                    hp_lgb,
-                    dtrain,
-                    num_boost_round=num_boost_round,
-                )
-            avail_cols = list(booster.feature_name())
-            # PLAN B+ 階段 6: when valid_df not in memory, predict from file path; else in-memory (backward compat).
-            _missing_val_cols = (
-                [c for c in avail_cols if c not in val_rated.columns]
-                if not val_rated.empty
-                else []
+                                try:
+                                    _idx = int(_tok.split(":", 1)[0])
+                                except ValueError:
+                                    continue
+                                if _idx > _max_idx_train:
+                                    _max_idx_train = _idx
+                                if _idx < _min_idx_train:
+                                    _min_idx_train = _idx
+                                if _idx == 51:
+                                    _idx_51_cnt += 1
+                    # #region agent log
+                    _agent_debug_log(
+                        hypothesis_id="H1",
+                        location="trainer/training/trainer.py:train_single_rated_model:pre-save-binary-scan",
+                        message="Pre-save_binary sampled index stats from train LibSVM",
+                        data={
+                            "train_path_for_lgb": str(_train_path_for_lgb),
+                            "sampled_lines": 100000,
+                            "min_feature_index": (None if _max_idx_train < 0 else _min_idx_train),
+                            "max_feature_index": (None if _max_idx_train < 0 else _max_idx_train),
+                            "index_51_count_in_sample": _idx_51_cnt,
+                            "avail_cols_len": len(avail_cols),
+                        },
+                    )
+                    # #endregion
+                    dtrain.save_binary(str(_bin_path))
+                    logger.info("Plan B+: saved train Dataset to %s", _bin_path)
+                except OSError as _e:
+                    logger.warning(
+                        "Plan B+: failed to save train Dataset to %s (%s); continuing without .bin.",
+                        _bin_path,
+                        _e,
+                    )
+                except Exception as _e:
+                    # #region agent log
+                    _agent_debug_log(
+                        hypothesis_id="H3",
+                        location="trainer/training/trainer.py:train_single_rated_model:save-binary-exception",
+                        message="save_binary raised exception",
+                        data={
+                            "error_type": type(_e).__name__,
+                            "error": str(_e),
+                            "bin_path": str(_bin_path),
+                            "avail_cols_len": len(avail_cols),
+                        },
+                    )
+                    # #endregion
+                    raise
+        _default_hp = {
+            "n_estimators": 400,
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "max_depth": 8,
+            "min_child_samples": 20,
+        }
+        hp_resolved = {**_default_hp, **hp}
+        hp_lgb = {
+            **_lgb_params_for_pipeline(),
+            "learning_rate": hp_resolved["learning_rate"],
+            "num_leaves": hp_resolved["num_leaves"],
+            "max_depth": hp_resolved["max_depth"],
+            "min_child_samples": hp_resolved["min_child_samples"],
+        }
+        num_boost_round = max(1, int(hp_resolved.get("n_estimators", 400)))
+        if _has_val_from_file:
+            booster = lgb.train(
+                hp_lgb,
+                dtrain,
+                num_boost_round=num_boost_round,
+                valid_sets=[dvalid],
+                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
             )
-            if _missing_val_cols:
+        else:
+            booster = lgb.train(
+                hp_lgb,
+                dtrain,
+                num_boost_round=num_boost_round,
+            )
+        avail_cols = list(booster.feature_name())
+        # PLAN B+ 階段 6: when valid_df not in memory, predict from file path; else in-memory (backward compat).
+        _val_rated_eval = _get_val_rated()
+        _missing_val_cols = (
+            [c for c in avail_cols if c not in _val_rated_eval.columns]
+            if not _val_rated_eval.empty
+            else []
+        )
+        if _missing_val_cols:
+            val_scores = np.array([], dtype=np.float64)
+            _has_val = False
+        elif valid_df is None or (valid_df is not None and valid_df.empty):
+            # Validation from file: Booster.predict(path) only when path under DATA_DIR and len(y_vl) > 0 (R216 #4, #6)
+            if not _valid_path_under_data_dir or len(y_vl) == 0:
                 val_scores = np.array([], dtype=np.float64)
                 _has_val = False
-            elif valid_df is None or (valid_df is not None and valid_df.empty):
-                # Validation from file: Booster.predict(path) only when path under DATA_DIR and len(y_vl) > 0 (R216 #4, #6)
-                if not _valid_path_under_data_dir or len(y_vl) == 0:
-                    val_scores = np.array([], dtype=np.float64)
-                    _has_val = False
-                else:
-                    _raw = booster.predict(str(valid_libsvm_p))
-                    val_scores = np.asarray(_raw).reshape(-1) if np.ndim(_raw) else np.asarray([_raw]).reshape(-1)
-                    if len(val_scores) != len(y_vl):
-                        logger.warning(
-                            "Plan B+: valid LibSVM label count (%d) != predict count (%d); trimming to min.",
-                            len(y_vl),
-                            len(val_scores),
-                        )
-                        _n = min(len(val_scores), len(y_vl))
-                        val_scores = val_scores[:_n]
-                        y_vl = y_vl[:_n] if hasattr(y_vl, "__getitem__") else np.asarray(y_vl)[:_n]
-                    _has_val = _has_val_from_file
             else:
-                val_scores = np.asarray(booster.predict(val_rated[avail_cols])).reshape(-1)
+                _raw = booster.predict(str(valid_libsvm_p))
+                val_scores = np.asarray(_raw).reshape(-1) if np.ndim(_raw) else np.asarray([_raw]).reshape(-1)
+                if len(val_scores) != len(y_vl):
+                    logger.warning(
+                        "Plan B+: valid LibSVM label count (%d) != predict count (%d); trimming to min.",
+                        len(y_vl),
+                        len(val_scores),
+                    )
+                    _n = min(len(val_scores), len(y_vl))
+                    val_scores = val_scores[:_n]
+                    y_vl = y_vl[:_n] if hasattr(y_vl, "__getitem__") else np.asarray(y_vl)[:_n]
                 _has_val = _has_val_from_file
-            if _has_val and np.asarray(y_vl).sum() > 0:
-                prauc = float(average_precision_score(y_vl, val_scores))
-                _pick = pick_threshold_dec026(
-                    np.asarray(y_vl, dtype=float),
-                    np.asarray(val_scores, dtype=float),
-                    recall_floor=THRESHOLD_MIN_RECALL,
-                    min_alert_count=THRESHOLD_MIN_ALERT_COUNT,
-                    min_alerts_per_hour=_ft_thr_mah,
-                    window_hours=_ft_thr_wh,
-                    fbeta_beta=THRESHOLD_FBETA,
-                )
-                if _pick.is_fallback:
-                    best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
-                    best_fbeta = 0.0
-                else:
-                    best_t = _pick.threshold
-                    best_prec = _pick.precision
-                    best_rec = _pick.recall
-                    best_fbeta = _pick.fbeta
-                    best_f1 = _pick.f1
-            else:
-                prauc = 0.0
+        else:
+            val_scores = np.asarray(booster.predict(_val_rated_eval[avail_cols])).reshape(-1)
+            _has_val = _has_val_from_file
+        if _has_val and np.asarray(y_vl).sum() > 0:
+            prauc = float(average_precision_score(y_vl, val_scores))
+            _pick = pick_threshold_dec026(
+                np.asarray(y_vl, dtype=float),
+                np.asarray(val_scores, dtype=float),
+                recall_floor=THRESHOLD_MIN_RECALL,
+                min_alert_count=THRESHOLD_MIN_ALERT_COUNT,
+                min_alerts_per_hour=_ft_thr_mah,
+                window_hours=_ft_thr_wh,
+                fbeta_beta=THRESHOLD_FBETA,
+            )
+            if _pick.is_fallback:
                 best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
                 best_fbeta = 0.0
-            n_val = int(len(y_vl))
-            n_val_pos = int(y_vl.sum())
-            val_random_ap = (n_val_pos / n_val) if n_val > 0 else 0.0
-            metrics = {
-                "label": "rated",
-                "val_ap": prauc,
-                "val_precision": best_prec,
-                "val_recall": best_rec,
-                "val_f1": best_f1,
-                "val_fbeta_05": best_fbeta,
-                "threshold": best_t,
-                "val_samples": n_val,
-                "val_positives": n_val_pos,
-                "val_random_ap": val_random_ap,
-                "best_hyperparams": hp_resolved,
-                "_uncalibrated": not _has_val,
-            }
-            if _ft_thr_wh is not None and _ft_thr_mah is not None:
-                metrics["val_dec026_pick_window_hours"] = float(_ft_thr_wh)
-                metrics["val_dec026_pick_min_alerts_per_hour"] = float(_ft_thr_mah)
-            model = _BoosterWrapper(booster)
-            if _libsvm_temp_to_remove is not None and _libsvm_temp_to_remove.exists():
-                _libsvm_temp_to_remove.unlink()
+            else:
+                best_t = _pick.threshold
+                best_prec = _pick.precision
+                best_rec = _pick.recall
+                best_fbeta = _pick.fbeta
+                best_f1 = _pick.f1
+        else:
+            prauc = 0.0
+            best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
+            best_fbeta = 0.0
+        n_val = int(len(y_vl))
+        n_val_pos = int(y_vl.sum())
+        val_random_ap = (n_val_pos / n_val) if n_val > 0 else 0.0
+        metrics = {
+            "label": "rated",
+            "val_ap": prauc,
+            "val_precision": best_prec,
+            "val_recall": best_rec,
+            "val_f1": best_f1,
+            "val_fbeta_05": best_fbeta,
+            "threshold": best_t,
+            "val_samples": n_val,
+            "val_positives": n_val_pos,
+            "val_random_ap": val_random_ap,
+            "best_hyperparams": hp_resolved,
+            "_uncalibrated": not _has_val,
+        }
+        if _ft_thr_wh is not None and _ft_thr_mah is not None:
+            metrics["val_dec026_pick_window_hours"] = float(_ft_thr_wh)
+            metrics["val_dec026_pick_min_alerts_per_hour"] = float(_ft_thr_mah)
+        model = _BoosterWrapper(booster)
+        if _libsvm_temp_to_remove is not None and _libsvm_temp_to_remove.exists():
+            _libsvm_temp_to_remove.unlink()
 
     if use_from_file:
         # Plan B §4: train from CSV; §5: wrap Booster for scorer/artifact compatibility.
@@ -5190,25 +5560,27 @@ def train_single_rated_model(
             # R191 Review #3: ensure at least 1 round (guard 0/negative from Optuna).
             num_boost_round = max(1, int(hp_resolved.get("n_estimators", 400)))
             # R196: align with in-memory path — use in-memory val_rated for early_stopping so parity test passes.
+            _val_rated_eval = _get_val_rated()
             _has_val_from_file = (
-                not val_rated.empty
+                not _val_rated_eval.empty
                 and len(y_vl) >= MIN_VALID_TEST_ROWS
                 and int(y_vl.isna().sum()) == 0
                 and int(y_vl.sum()) >= 1
                 and int((y_vl == 0).sum()) >= 1
             )
             # R199 Review #1: val_rated must contain all _train_feature_cols (from CSV); else skip early_stopping to avoid KeyError.
-            _missing_val_cols = [c for c in _train_feature_cols if c not in val_rated.columns]
+            _missing_val_cols = [c for c in _train_feature_cols if c not in _val_rated_eval.columns]
             if _missing_val_cols:
                 logger.warning(
                     "Plan B: valid_df missing columns %s present in train CSV; skipping early_stopping for from-file training.",
                     _missing_val_cols,
                 )
                 _has_val_from_file = False
+            dvalid = None
             if _has_val_from_file:
                 dvalid = lgb.Dataset(
-                    val_rated[_train_feature_cols],
-                    label=val_rated["label"],
+                    _val_rated_eval[_train_feature_cols],
+                    label=_val_rated_eval["label"],
                     reference=dtrain,
                 )
                 booster = lgb.train(
@@ -5224,6 +5596,12 @@ def train_single_rated_model(
                     dtrain,
                     num_boost_round=num_boost_round,
                 )
+            # From-file peak-RAM cleanup: once LightGBM has built the Booster, the
+            # temporary CSV DataFrame / Dataset objects are no longer needed.
+            _train_csv = None
+            dtrain = None
+            dvalid = None
+            gc.collect()
             # R188 Review #1: artifact features must match Booster (common_cols from export).
             avail_cols = list(booster.feature_name())
             # R199 #1: if val_rated is missing any feature column, do not predict (would KeyError).
@@ -5231,9 +5609,9 @@ def train_single_rated_model(
                 val_scores = np.array([], dtype=np.float64)
                 _has_val = False
             else:
-                val_scores = np.asarray(booster.predict(val_rated[avail_cols])).reshape(-1)
+                val_scores = np.asarray(booster.predict(_val_rated_eval[avail_cols])).reshape(-1)
                 _has_val = (
-                    not val_rated.empty
+                    not _val_rated_eval.empty
                     and len(y_vl) >= MIN_VALID_TEST_ROWS
                     and int(y_vl.isna().sum()) == 0
                     and int(y_vl.sum()) >= 1
@@ -5298,7 +5676,6 @@ def train_single_rated_model(
             val_dec026_min_alerts_per_hour=_ft_thr_mah,
         )
 
-    X_tr_pred = _dataframe_for_lgb_predict(model, train_rated, avail_cols)
     train_thr = cast(float, metrics["threshold"])
     _train_booster = getattr(model, "booster_", None)
     used_libsvm_train_metrics = False
@@ -5339,6 +5716,8 @@ def train_single_rated_model(
                         exc,
                     )
     if not used_libsvm_train_metrics:
+        _ensure_inmemory_train_views(avail_cols)
+        X_tr_pred = _dataframe_for_lgb_predict(model, _get_train_rated(), avail_cols)
         train_m = _compute_train_metrics(
             model,
             train_thr,
@@ -5349,6 +5728,7 @@ def train_single_rated_model(
         )
     metrics.update(train_m)
 
+    test_rated = _get_test_rated()
     if test_rated is not None and not test_rated.empty:
         _missing_test_cols = [c for c in avail_cols if c not in test_rated.columns]
         if _missing_test_cols:
@@ -5416,11 +5796,17 @@ def train_single_rated_model(
         test_m = {}
 
     # A3 / R3: always compare LGBM / CatBoost / XGBoost on the same rated split matrices.
-    if gbm_bakeoff and not train_rated.empty:
+    if gbm_bakeoff and not _get_train_rated().empty:
+        _compare_valid = None
+        _compare_test = None
+        _x_vl_cmp = None
+        _y_vl_cmp = None
+        _x_te_cmp = None
+        _y_te_cmp = None
         try:
             from trainer.training.gbm_bakeoff import train_and_select_rated_gbm_family
 
-            _compare_valid = val_rated
+            _compare_valid = _get_val_rated()
             if (
                 (_compare_valid is None or _compare_valid.empty)
                 and valid_split_parquet_path is not None
@@ -5475,6 +5861,8 @@ def train_single_rated_model(
                     "features": avail_cols,
                     "metrics": metrics,
                 },
+                run_optuna=bool(run_optuna),
+                field_test_constrained_optuna_objective_allowed=_ft_allowed,
                 X_test=_x_te_cmp,
                 y_test=_y_te_cmp,
                 val_dec026_window_hours=_ft_thr_wh,
@@ -5518,6 +5906,17 @@ def train_single_rated_model(
             metrics["reason_codes_enabled"] = True
             metrics["selected_backend"] = "lightgbm"
             metrics["selected_backend_source"] = "primary_train_fallback"
+        finally:
+            # Peak-RAM cleanup: A3 may materialize rated valid/test splits from parquet
+            # and comparison matrices purely for bakeoff. Once the winner is chosen,
+            # these intermediate objects should not remain resident through A4/artifacts.
+            _compare_valid = None
+            _compare_test = None
+            _x_vl_cmp = None
+            _y_vl_cmp = None
+            _x_te_cmp = None
+            _y_te_cmp = None
+            gc.collect()
     else:
         metrics["model_backend"] = "lightgbm"
         metrics["model_kind"] = "lightgbm"
@@ -5528,14 +5927,14 @@ def train_single_rated_model(
     # A4 / R4 MVP: two-stage FP detector with product fusion on Stage-1 candidate pool.
     metrics["a4_enabled"] = False
     metrics["a4_fusion_mode"] = validate_fusion_mode(A4_TWO_STAGE_FUSION_MODE)
-    if A4_TWO_STAGE_ENABLE_TRAINING and not train_rated.empty:
+    if A4_TWO_STAGE_ENABLE_TRAINING and not _get_train_rated().empty:
         _fusion_mode = validate_fusion_mode(A4_TWO_STAGE_FUSION_MODE)
         _stage1_threshold = float(metrics.get("threshold", 0.5))
         _candidate_cutoff = candidate_cutoff_from_threshold(
             _stage1_threshold,
             A4_TWO_STAGE_CANDIDATE_MULTIPLIER,
         )
-        _x_tr_s1 = _dataframe_for_lgb_predict(model, train_rated, avail_cols)
+        _x_tr_s1 = _dataframe_for_lgb_predict(model, _get_train_rated(), avail_cols)
         _s1_tr = _batched_model_positive_class_scores(
             model,
             _x_tr_s1,
@@ -5555,114 +5954,159 @@ def train_single_rated_model(
         metrics["a4_candidate_rows_train"] = _n_cand_tr
         metrics["a4_stage2_train_positives"] = _pos2_tr
         metrics["a4_stage2_train_negatives"] = _neg2_tr
-        if _stage2_ready and _fusion_mode == A4_FUSION_MODE_PRODUCT:
-            _x2_tr = _x_tr_s1.loc[_cand_mask_tr, :].copy()
-            _sw2 = (
-                np.asarray(sw_rated, dtype=float).reshape(-1)[: len(_cand_mask_tr)][_cand_mask_tr]
-                if len(sw_rated) >= len(_cand_mask_tr)
-                else None
-            )
-            _stage2_hp = {
-                "n_estimators": 200,
-                "learning_rate": 0.05,
-                "num_leaves": 31,
-                "max_depth": 6,
-                "min_child_samples": 20,
-            }
-            _stage2 = lgb.LGBMClassifier(**_lgb_params_for_pipeline(), **_stage2_hp)
-            try:
-                _stage2.fit(
-                    _x2_tr,
-                    _y2_tr,
-                    sample_weight=_sw2 if _sw2 is not None else None,
+        _x2_tr = None
+        _x_vl_s1 = None
+        _x2_vl = None
+        _x_te_s1 = None
+        _x2_te = None
+        _s2_tr = None
+        _s2_vl = None
+        _s2_te = None
+        _fused_tr = None
+        _fused_vl = None
+        _fused_te = None
+        _a4_train = None
+        _a4_valid = None
+        _a4_test = None
+        _val_rated_eval = None
+        _cand_mask_vl = None
+        _cand_mask_te = None
+        try:
+            if _stage2_ready and _fusion_mode == A4_FUSION_MODE_PRODUCT:
+                _x2_tr = _x_tr_s1.loc[_cand_mask_tr, :].copy()
+                _sw2 = (
+                    np.asarray(sw_rated, dtype=float).reshape(-1)[: len(_cand_mask_tr)][_cand_mask_tr]
+                    if len(sw_rated) >= len(_cand_mask_tr)
+                    else None
                 )
-                _s2_tr = np.ones(len(_s1_tr), dtype=np.float64)
-                _s2_tr[_cand_mask_tr] = _batched_model_positive_class_scores(
-                    _stage2,
-                    _x2_tr,
-                    int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
-                )
-                _fused_tr = fuse_product_scores(_s1_tr, _s2_tr)
-                _a4_train = _train_metrics_dict_from_y_scores(
-                    y_tr,
-                    _fused_tr,
-                    _stage1_threshold,
-                    label="rated_a4_fused_train",
-                    log_results=False,
-                )
-                metrics.update({f"a4_{k}": v for k, v in _a4_train.items()})
-                if not val_rated.empty:
-                    _x_vl_s1 = _dataframe_for_lgb_predict(model, val_rated, avail_cols)
-                    _s1_vl = _batched_model_positive_class_scores(
-                        model,
-                        _x_vl_s1,
+                _stage2_hp = {
+                    "n_estimators": 200,
+                    "learning_rate": 0.05,
+                    "num_leaves": 31,
+                    "max_depth": 6,
+                    "min_child_samples": 20,
+                }
+                _stage2 = lgb.LGBMClassifier(**_lgb_params_for_pipeline(), **_stage2_hp)
+                try:
+                    _stage2.fit(
+                        _x2_tr,
+                        _y2_tr,
+                        sample_weight=_sw2 if _sw2 is not None else None,
+                    )
+                    _s2_tr = np.ones(len(_s1_tr), dtype=np.float64)
+                    _s2_tr[_cand_mask_tr] = _batched_model_positive_class_scores(
+                        _stage2,
+                        _x2_tr,
                         int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
                     )
-                    _cand_mask_vl = candidate_mask_from_scores(_s1_vl, cutoff=_candidate_cutoff)
-                    _s2_vl = np.ones(len(_s1_vl), dtype=np.float64)
-                    if int(np.sum(_cand_mask_vl)) > 0:
-                        _x2_vl = _x_vl_s1.loc[_cand_mask_vl, :]
-                        _s2_vl[_cand_mask_vl] = _batched_model_positive_class_scores(
-                            _stage2,
-                            _x2_vl,
-                            int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
-                        )
-                    _fused_vl = fuse_product_scores(_s1_vl, _s2_vl)
-                    _a4_valid = _compute_valid_metrics_from_scores(
-                        val_rated["label"].to_numpy(dtype=float),
-                        _fused_vl,
+                    _fused_tr = fuse_product_scores(_s1_tr, _s2_tr)
+                    _a4_train = _train_metrics_dict_from_y_scores(
+                        y_tr,
+                        _fused_tr,
                         _stage1_threshold,
-                    )
-                    metrics.update({f"a4_{k}": v for k, v in _a4_valid.items()})
-                    metrics["a4_candidate_rows_valid"] = int(np.sum(_cand_mask_vl))
-                else:
-                    metrics["a4_candidate_rows_valid"] = 0
-                if test_rated is not None and not test_rated.empty:
-                    _x_te_s1 = _dataframe_for_lgb_predict(model, test_rated, avail_cols)
-                    _s1_te = _batched_model_positive_class_scores(
-                        model,
-                        _x_te_s1,
-                        int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
-                    )
-                    _cand_mask_te = candidate_mask_from_scores(_s1_te, cutoff=_candidate_cutoff)
-                    _s2_te = np.ones(len(_s1_te), dtype=np.float64)
-                    if int(np.sum(_cand_mask_te)) > 0:
-                        _x2_te = _x_te_s1.loc[_cand_mask_te, :]
-                        _s2_te[_cand_mask_te] = _batched_model_positive_class_scores(
-                            _stage2,
-                            _x2_te,
-                            int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
-                        )
-                    _fused_te = fuse_product_scores(_s1_te, _s2_te)
-                    _a4_test = _compute_test_metrics_from_scores(
-                        test_rated["label"].to_numpy(dtype=float),
-                        _fused_te,
-                        _stage1_threshold,
-                        label="rated_a4_fused_test",
-                        _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+                        label="rated_a4_fused_train",
                         log_results=False,
-                        production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
                     )
-                    metrics.update({f"a4_{k}": v for k, v in _a4_test.items()})
-                    metrics["a4_candidate_rows_test"] = int(np.sum(_cand_mask_te))
-                else:
-                    metrics["a4_candidate_rows_test"] = 0
-                metrics["a4_enabled"] = True
-                metrics["a4_fusion_mode"] = _fusion_mode
-                metrics["a4_stage2_model_backend"] = "lightgbm"
-                metrics["a4_stage2_features"] = list(avail_cols)
-                metrics["_a4_stage2_model"] = _stage2
-            except Exception as _a4_exc:
-                logger.warning("A4 two-stage training failed (fallback to Stage-1 only): %s", _a4_exc)
+                    metrics.update({f"a4_{k}": v for k, v in _a4_train.items()})
+                    _val_rated_eval = _get_val_rated()
+                    if not _val_rated_eval.empty:
+                        _x_vl_s1 = _dataframe_for_lgb_predict(model, _val_rated_eval, avail_cols)
+                        _s1_vl = _batched_model_positive_class_scores(
+                            model,
+                            _x_vl_s1,
+                            int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
+                        )
+                        _cand_mask_vl = candidate_mask_from_scores(_s1_vl, cutoff=_candidate_cutoff)
+                        _s2_vl = np.ones(len(_s1_vl), dtype=np.float64)
+                        if int(np.sum(_cand_mask_vl)) > 0:
+                            _x2_vl = _x_vl_s1.loc[_cand_mask_vl, :]
+                            _s2_vl[_cand_mask_vl] = _batched_model_positive_class_scores(
+                                _stage2,
+                                _x2_vl,
+                                int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
+                            )
+                        _fused_vl = fuse_product_scores(_s1_vl, _s2_vl)
+                        _a4_valid = _compute_valid_metrics_from_scores(
+                            _val_rated_eval["label"].to_numpy(dtype=float),
+                            _fused_vl,
+                            _stage1_threshold,
+                        )
+                        metrics.update({f"a4_{k}": v for k, v in _a4_valid.items()})
+                        metrics["a4_candidate_rows_valid"] = int(np.sum(_cand_mask_vl))
+                    else:
+                        metrics["a4_candidate_rows_valid"] = 0
+                    if test_rated is not None and not test_rated.empty:
+                        _x_te_s1 = _dataframe_for_lgb_predict(model, test_rated, avail_cols)
+                        _s1_te = _batched_model_positive_class_scores(
+                            model,
+                            _x_te_s1,
+                            int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
+                        )
+                        _cand_mask_te = candidate_mask_from_scores(_s1_te, cutoff=_candidate_cutoff)
+                        _s2_te = np.ones(len(_s1_te), dtype=np.float64)
+                        if int(np.sum(_cand_mask_te)) > 0:
+                            _x2_te = _x_te_s1.loc[_cand_mask_te, :]
+                            _s2_te[_cand_mask_te] = _batched_model_positive_class_scores(
+                                _stage2,
+                                _x2_te,
+                                int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
+                            )
+                        _fused_te = fuse_product_scores(_s1_te, _s2_te)
+                        _a4_test = _compute_test_metrics_from_scores(
+                            test_rated["label"].to_numpy(dtype=float),
+                            _fused_te,
+                            _stage1_threshold,
+                            label="rated_a4_fused_test",
+                            _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+                            log_results=False,
+                            production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+                        )
+                        metrics.update({f"a4_{k}": v for k, v in _a4_test.items()})
+                        metrics["a4_candidate_rows_test"] = int(np.sum(_cand_mask_te))
+                    else:
+                        metrics["a4_candidate_rows_test"] = 0
+                    metrics["a4_enabled"] = True
+                    metrics["a4_fusion_mode"] = _fusion_mode
+                    metrics["a4_stage2_model_backend"] = "lightgbm"
+                    metrics["a4_stage2_features"] = list(avail_cols)
+                    metrics["_a4_stage2_model"] = _stage2
+                except Exception as _a4_exc:
+                    logger.warning("A4 two-stage training failed (fallback to Stage-1 only): %s", _a4_exc)
+                    metrics["a4_enabled"] = False
+                    metrics["a4_failure_reason"] = str(_a4_exc)
+            else:
                 metrics["a4_enabled"] = False
-                metrics["a4_failure_reason"] = str(_a4_exc)
-        else:
-            metrics["a4_enabled"] = False
-            metrics["a4_failure_reason"] = (
-                "insufficient_stage2_candidate_rows_or_class_balance"
-                if _fusion_mode == A4_FUSION_MODE_PRODUCT
-                else "unsupported_fusion_mode"
-            )
+                metrics["a4_failure_reason"] = (
+                    "insufficient_stage2_candidate_rows_or_class_balance"
+                    if _fusion_mode == A4_FUSION_MODE_PRODUCT
+                    else "unsupported_fusion_mode"
+                )
+        finally:
+            # Peak-RAM cleanup: A4 builds several large stage-1 / stage-2 matrices and
+            # score arrays; once the derived metrics are recorded, they are no longer
+            # needed and should not remain resident through artifact save / MLflow.
+            _x_tr_s1 = None
+            _s1_tr = None
+            _cand_mask_tr = None
+            _y2_tr = None
+            _x2_tr = None
+            _x_vl_s1 = None
+            _x2_vl = None
+            _x_te_s1 = None
+            _x2_te = None
+            _s2_tr = None
+            _s2_vl = None
+            _s2_te = None
+            _fused_tr = None
+            _fused_vl = None
+            _fused_te = None
+            _a4_train = None
+            _a4_valid = None
+            _a4_test = None
+            _val_rated_eval = None
+            _cand_mask_vl = None
+            _cand_mask_te = None
+            gc.collect()
 
     # Log in order: train → valid → test (clear labels; valid was previously unlabeled).
     logger.info(
@@ -7862,6 +8306,14 @@ def run_pipeline(args) -> None:
                 except Exception:
                     # If memory sampling fails, just keep metrics unset; never impact training.
                     pass
+
+            # Step 9 no longer needs the in-memory split frames after training returns.
+            # Release them before artifact / MLflow phases so large train/valid/test
+            # DataFrames do not stay resident through the rest of the pipeline.
+            train_df = None
+            valid_df = None
+            test_df = None
+            gc.collect()
         
             # 7. Save artifacts (versioned subdir under MODEL_DIR; see Priority 1 investigation plan).
             print("[Step 10/10] Save artifact bundle…", flush=True)

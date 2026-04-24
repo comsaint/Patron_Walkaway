@@ -74,6 +74,56 @@ python -m pytest tests/review_risks/test_review_risks_oom_phase1_phase2a.py test
 2. 若要更進一步處理真實 OOM，再補一輪 behavior-level / tiny synthetic evidence，紀錄 Step 6 / Step 7 before-after 的 row-count、chunk bytes、runtime 與記憶體訊號。  
 3. 若要整理治理面，下一份應補的是 **working / execution plan**，把 `Step 6 cleanup -> Step 7 fallback hardening -> Step 8 sample default -> Step 9 file-based tightening` 串成可執行波次。
 
+## OOM Step 6 Continue — identity canonical mapping pandas path（2026-04-24）
+
+**本輪完成**
+
+1. `build_canonical_mapping_from_df()` 不再先對整個 DQ-filtered sessions 做 `filtered = deduped[mask].copy()`。  
+   - 先以 `filtered = deduped.loc[mask]` 建立 filtered view。  
+   - `dummy_pids` 直接從這個 filtered view 計算。  
+   - `casino_player_id` 清理改成先產生 `cleaned_casino_player_id` Series。  
+   - 只有在 `casino_player_id` 清理後仍為 non-null 的 rated links rows，才做 `links_df = filtered.loc[rated_mask, ...].copy()` 真正 materialize。  
+   - 這樣可避免在 canonical pandas path 上同時常駐「整個 filtered sessions copy + 最終 links_df」兩份中間物件。
+
+2. `get_dummy_player_ids_from_df()` 同步移除 `deduped[mask].copy()`。  
+   - dummy-player 偵測只讀欄位，不需要先複製整個 filtered sessions frame。
+
+3. `_identify_dummy_player_ids()` 再縮成最小欄位 materialization。  
+   - 不再先複製整個 valid-session frame。  
+   - 先在 caller frame 上算 `games_num` / `turnover_num` 與 `keep_mask`。  
+   - 只有 surviving rows 才 materialize `["player_id", "session_id"]`，再把 `_games` 回填進 groupby。  
+   - 同步移除先前 object-dtype `fillna(0)` 造成的 pandas `FutureWarning`。
+
+4. `_fnd01_dedup_pandas()` 改成 narrow sort-helper + surviving-row copy。  
+   - 不再對整張 `sessions_df` 做 `sessions_df.copy()` 後再掛 `_lud_sort` / `_etl_sort` 暫存欄。  
+   - 改成建立只含 `session_id`、sort keys、`_row_pos` 的 helper frame。  
+   - 先在 helper 上做 `sort_values(...).drop_duplicates("session_id")`，算出保留 row positions。  
+   - 最後只對 surviving deduped rows 做 `sessions_df.iloc[keep_row_pos].copy()`。  
+   - 這可避免寬 sessions frame 在 FND-01 dedup 階段被完整複製一次。
+
+5. 補 identity review-risk / unit guard。  
+   - 鎖住 canonical pandas path 應延後 copy 到 rated links surviving rows。  
+   - 鎖住 dummy path 不應再對 whole filtered session set eager copy。  
+   - 鎖住 `_identify_dummy_player_ids()` 只對最小欄位集做顯式 copy。  
+   - 鎖住 `_fnd01_dedup_pandas()` 不應回到 full-frame eager copy。  
+   - 補 duplicate-index label 行為測試，確保 dedup 依 row position 取列、不因重複 index label 多撈資料。
+
+| 檔案 | 變更 |
+|------|------|
+| `trainer/identity.py` | `build_canonical_mapping_from_df()` 改為先保留 filtered view、先算 `cleaned_casino_player_id` / `rated_mask`，只對 rated links surviving rows `.copy()`；`get_dummy_player_ids_from_df()` 改為直接把 filtered view 傳入 `_identify_dummy_player_ids()`；`_identify_dummy_player_ids()` 改為先算 numeric Series/mask，再只 materialize `player_id/session_id` 最小欄位集；`_fnd01_dedup_pandas()` 改為 narrow sort-helper + surviving-row copy。 |
+| `tests/review_risks/test_review_risks_round270.py` | 新增 source-contract：禁止 `filtered = deduped[mask].copy()` 回歸，要求 canonical path 只在 rated-link extraction 時做顯式 copy，鎖住 `_identify_dummy_player_ids()` 的最小欄位 materialization，並要求 `_fnd01_dedup_pandas()` 走 sort-helper / surviving-row copy。 |
+| `tests/unit/test_identity.py` | 新增 duplicate-index label dedup 測試，確認 `_fnd01_dedup_pandas()` 依 row position 保留目標列，不因 index label 重複重複取列。 |
+
+**驗證**
+
+```bash
+python -m pytest tests/unit/test_identity.py tests/review_risks/test_review_risks_round270.py tests/review_risks/test_review_risks_round250_canonical_from_links.py tests/integration/test_canonical_mapping_duckdb_pandas_parity.py tests/review_risks/test_review_risks_late_rounds.py -q
+```
+
+- 結果：第一次 `85 passed, 1 skipped`；helper 最小欄位 hardening 後再跑 `86 passed, 1 skipped`；`_fnd01_dedup_pandas()` narrow-helper hardening 後再跑 `88 passed, 1 skipped`
+- `ReadLints`：本輪修改檔案無新增 lint 問題。
+- pandas warning：`_identify_dummy_player_ids()` 先前的 object-dtype `fillna(0)` `FutureWarning` 已一併消除。
+
 ## Rated-Only Early Prune — `/cycle_code` STEP 1（A1/A2，2026-04-23）
 
 對照計畫：`.cursor/plans/EXECUTION PLAN - Rated-Only Early Prune.md`（本輪 `PLAN.md`）。
@@ -8219,3 +8269,66 @@ python -m pytest tests/unit/test_precision_uplift_phase1_orchestrator.py -k "tes
 - `trainer/training/trainer.py`：在 `STEP7_KEEP_TRAIN_ON_DISK` 路徑，Step 8 screening 完成後、重新 `pd.read_parquet(step7_train_path)` 前，先清掉 `_train_for_screen` / `_matrix_for_screen` 並 `gc.collect()`，避免 screening sample 與 full `train_df` 在切換階段短暫共存，降低峰值 RAM。
 - `tests/review_risks/test_review_risks_round184_step8_sample.py`：新增 source-contract，鎖住 keep-on-disk 路徑必須先釋放 screening sample 再載 full train。
 - 驗證：`python -m pytest tests/review_risks/test_review_risks_round184_step8_sample.py tests/review_risks/test_review_risks_step8_duckdb_std.py tests/review_risks/test_review_risks_round220.py -q` → **37 passed, 1 skipped**；`ReadLints` 檢查變更檔案無新 lint。
+
+
+---
+
+## OOM follow-up：Step 9 split-frame release before artifacts（2026-04-24）
+
+- `trainer/training/trainer.py`：在 Step 9 training 與 RSS snapshot 完成後、進入 Step 10 artifact/MLflow 前，主動將 `train_df` / `valid_df` / `test_df` 設為 `None` 並 `gc.collect()`，避免大型 split frame 在保存 artifact 與後續 MLflow 日誌階段持續佔用 RAM。
+- `tests/review_risks/test_review_risks_pipeline_plan_section6_contract.py`：新增 source-contract，鎖住 split-frame release 必須發生在 Step 9 snapshot 之後、Step 10 開始之前，且包含 `gc.collect()`。
+- 驗證：`python -m pytest tests/review_risks/test_review_risks_pipeline_plan_section6_contract.py tests/review_risks/test_review_risks_round219_plan_b_plus_stage6_step2.py tests/review_risks/test_review_risks_round182_plan_b_config.py tests/review_risks/test_review_risks_round195_plan_b_parity.py -q` → **26 passed**；`ReadLints` 檢查變更檔案無新 lint。
+
+
+---
+
+## OOM follow-up：Step 9 LibSVM lazy rated-materialization（2026-04-24）
+
+- `trainer/training/trainer.py`：把 `train_single_rated_model()` 的 LibSVM preflight（空檔 / single-class）提前到 pandas rated split 之前；當 LibSVM 路徑可用且未啟用 A3/A4 時，不再提早 materialize `train_rated` / `test_rated`、不先做 `compute_sample_weights()`、也不先建立 in-memory `X_tr`/`y_tr` 矩陣，改成真正需要 fallback / A3 / A4 / train-metrics in-memory 路徑時才按需建立。
+- `tests/review_risks/test_review_risks_round216_plan_b_plus_stage6.py`：新增行為測試，鎖住 LibSVM 成功路徑不應呼叫 `compute_sample_weights()`，避免未來又回到 eager in-memory 準備。
+- 驗證：`python -m pytest tests/review_risks/test_review_risks_round216_plan_b_plus_stage6.py tests/review_risks/test_review_risks_round195_plan_b_parity.py tests/review_risks/test_review_risks_round182_plan_b_config.py tests/review_risks/test_review_risks_round199_plan_b_from_file.py tests/review_risks/test_review_risks_round207_plan_b_plus_stage5.py tests/review_risks/test_review_risks_round219_plan_b_plus_stage6_step2.py tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py -q` → **41 passed**；`ReadLints` 檢查變更檔案無新 lint。
+
+
+---
+
+## OOM follow-up：Step 9 from-file CSV/Dataset cleanup（2026-04-24）
+
+- `trainer/training/trainer.py`：在 from-file 路徑完成 `lgb.train(...)` 後，立刻釋放 `_train_csv`、`dtrain`、`dvalid` 並 `gc.collect()`，避免整份 train CSV DataFrame 與 LightGBM Dataset 物件在後續 validation/test/A3/A4 階段持續常駐記憶體。
+- `tests/review_risks/test_review_risks_round188_plan_b_train_from_file.py`：新增 source-contract，鎖住 from-file 路徑在 `booster.feature_name()` 與後續評估前，必須先清理 `_train_csv` / Dataset refs 並呼叫 `gc.collect()`。
+- 驗證：`python -m pytest tests/review_risks/test_review_risks_round188_plan_b_train_from_file.py tests/review_risks/test_review_risks_round195_plan_b_parity.py tests/review_risks/test_review_risks_round182_plan_b_config.py tests/review_risks/test_review_risks_round199_plan_b_from_file.py tests/review_risks/test_review_risks_round216_plan_b_plus_stage6.py tests/review_risks/test_review_risks_round207_plan_b_plus_stage5.py tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py -q` → **42 passed**；`ReadLints` 檢查變更檔案無新 lint。
+
+
+---
+
+## OOM follow-up：Step 9 all-rated fast path reuse（2026-04-24）
+
+- `trainer/training/trainer.py`：把 `train_single_rated_model()` 的 `train/valid/test` rated helper 改成帶 all-rated fast path。若 split 已經全部 `is_rated=True`，則直接重用原 frame；只有進入 mutable / in-memory 路徑（例如 dtype coercion）時才 copy。這可避免常見 rated-only split 再額外複製一份大型 DataFrame。
+- `tests/review_risks/test_review_risks_round216_plan_b_plus_stage6.py`：新增 source-contract，鎖住 `train_df` / `valid_df` / `test_df` 三個 helper 都保留 `is_rated.all()` 快路徑；同時既有行為測試也持續守住純 LibSVM 成功路徑不應重新觸發 `compute_sample_weights()`。
+- 驗證：`python -m pytest tests/review_risks/test_review_risks_round216_plan_b_plus_stage6.py tests/review_risks/test_review_risks_round188_plan_b_train_from_file.py tests/review_risks/test_review_risks_round195_plan_b_parity.py tests/review_risks/test_review_risks_round182_plan_b_config.py tests/review_risks/test_review_risks_round199_plan_b_from_file.py tests/review_risks/test_review_risks_round207_plan_b_plus_stage5.py tests/review_risks/test_review_risks_round219_plan_b_plus_stage6_step2.py tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py -q` → **48 passed**；`ReadLints` 檢查變更檔案無新 lint。
+
+
+---
+
+## OOM follow-up：Step 9 A4 temp-matrix cleanup（2026-04-24）
+
+- `trainer/training/trainer.py`：在 A4 two-stage training 分支加入 `finally` cleanup，於 derived metrics 記錄完後主動釋放 `_x_tr_s1`、`_x2_tr`、valid/test stage-1/stage-2 matrix、candidate mask、fused score array 等臨時大物件，並 `gc.collect()`，避免它們一路存活到 artifact save / MLflow 階段。
+- `tests/unit/test_two_stage_bundle_and_scorer.py`：新增靜態契約，鎖住 `train_single_rated_model()` 內 A4 cleanup 區塊必須存在，且涵蓋 train/valid/test 主要臨時矩陣與 `gc.collect()`。
+- 驗證：`python -m pytest tests/unit/test_two_stage_bundle_and_scorer.py tests/review_risks/test_review_risks_round216_plan_b_plus_stage6.py tests/review_risks/test_review_risks_round188_plan_b_train_from_file.py tests/review_risks/test_review_risks_round195_plan_b_parity.py tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py -q` → **35 passed**；`ReadLints` 檢查變更檔案無新 lint。
+
+
+---
+
+## OOM follow-up：Step 9 A3 bakeoff temp-matrix cleanup（2026-04-24）
+
+- `trainer/training/trainer.py`：在 A3 `gbm_bakeoff` 分支加入 `finally` cleanup，於 winner 選定後主動釋放 `_compare_valid` / `_compare_test`、`_x_vl_cmp` / `_x_te_cmp`、對應 labels 參照等 bakeoff 專用 comparison 物件，並 `gc.collect()`，避免從 parquet 補載的 rated eval split 與 comparison matrix 一路存活到 A4 / artifact / MLflow。
+- `tests/unit/test_gbm_bakeoff.py`：新增靜態契約，鎖住 `train_single_rated_model()` 內 A3 bakeoff cleanup 區塊必須存在，且包含 comparison split / matrix 與 `gc.collect()`。
+- 驗證：`python -m pytest tests/unit/test_gbm_bakeoff.py tests/unit/test_two_stage_bundle_and_scorer.py tests/review_risks/test_review_risks_round216_plan_b_plus_stage6.py tests/review_risks/test_review_risks_round188_plan_b_train_from_file.py tests/review_risks/test_review_risks_round195_plan_b_parity.py tests/review_risks/test_review_risks_r031_dec031_train_metrics_steps36.py -q` → **38 passed**；`ReadLints` 檢查變更檔案無新 lint。
+
+
+---
+
+## OOM follow-up：Step 6 apply_dq sessions copy reduction（2026-04-24）
+
+- `trainer/training/trainer.py`：把 `apply_dq()` 的 sessions branch 改成先在 caller frame 上計算 normalized datetime / numeric Series 與 `_valid_session_id_mask`，再只對 `session_id` 有效的 surviving rows 做 copy；避免一進函式就對整個 sessions frame eager `copy()`，並移除中間 `dropna(...).copy()` 這類早期全量複製。
+- `tests/review_risks/test_review_risks_round280.py`：新增 source-contract，鎖住 sessions branch 必須先建立 `session_id_num` 與 `_valid_session_id_mask`，之後才進行 `sessions = sessions.loc[_valid_session_id_mask].copy()`。
+- 驗證：`python -m pytest tests/review_risks/test_review_risks_round280.py tests/review_risks/test_review_risks_round40.py tests/review_risks/test_trainer_review_risks_round14.py tests/review_risks/test_review_risks_late_rounds.py -q` → **57 passed, 1 skipped**；`ReadLints` 檢查變更檔案無新 lint。

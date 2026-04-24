@@ -86,6 +86,18 @@ class TestR280ApplyDqRegressionGuards(unittest.TestCase):
         self.assertIsInstance(bets_out, pd.DataFrame)
         self.assertIsInstance(sessions_out, pd.DataFrame)
 
+    def test_apply_dq_sessions_numeric_and_dt_series_built_before_sessions_copy(self):
+        """Sessions branch should prepare normalized Series before copying surviving session rows."""
+        src = inspect.getsource(trainer_mod.apply_dq)
+        session_id_pos = src.find("session_id_num = pd.to_numeric(")
+        mask_pos = src.find("_valid_session_id_mask = session_id_num.notna()")
+        copy_pos = src.find("sessions = sessions.loc[_valid_session_id_mask].copy()")
+        self.assertNotEqual(session_id_pos, -1, "Missing session_id numeric normalization in apply_dq")
+        self.assertNotEqual(mask_pos, -1, "Missing valid-session-id mask in apply_dq")
+        self.assertNotEqual(copy_pos, -1, "Missing delayed sessions copy after valid-session-id mask")
+        self.assertLess(session_id_pos, mask_pos)
+        self.assertLess(mask_pos, copy_pos)
+
 
 class TestR280ResolvedRisks(unittest.TestCase):
     """Risks from Round-280 review — now resolved in production code."""

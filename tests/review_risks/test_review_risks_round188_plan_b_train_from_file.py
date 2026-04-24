@@ -7,6 +7,7 @@ Tests-only: no production code changes.
 
 from __future__ import annotations
 
+import inspect
 import tempfile
 import unittest
 import unittest.mock
@@ -201,6 +202,26 @@ class TestR188LgbDatasetFromCsvParams(unittest.TestCase):
             params = {"objective": "binary", "verbosity": -1, "num_leaves": 2}
             booster = lgb.train(params, dtrain, num_boost_round=3, valid_sets=[dvalid])
         self.assertEqual(list(booster.feature_name()), ["f1"], "Booster should have feature f1 (Round 188 Review #6).")
+
+
+class TestR188FromFilePeakRamCleanupContract(unittest.TestCase):
+    """Round 188 follow-up: from-file path should release temporary CSV/Dataset objects after training."""
+
+    def test_train_single_rated_model_releases_train_csv_after_lgb_train(self):
+        """After from-file lgb.train(...) completes, source should clear _train_csv and Dataset refs before later evaluation steps."""
+        src = inspect.getsource(trainer_mod.train_single_rated_model)
+        i_branch = src.find("if use_from_file:")
+        self.assertGreater(i_branch, -1, "from-file branch not found")
+        i_read = src.find("_train_csv = pd.read_csv(train_path)", i_branch)
+        i_release = src.find("_train_csv = None", i_branch)
+        i_avail = src.find("avail_cols = list(booster.feature_name())", i_branch)
+        self.assertGreater(i_read, -1, "expected _train_csv load in from-file branch")
+        self.assertGreater(i_release, i_read, "from-file branch should release _train_csv after training")
+        self.assertGreater(i_avail, i_release, "release should happen before downstream booster-based evaluation")
+        window = src[i_release : i_avail]
+        self.assertIn("dtrain = None", window)
+        self.assertIn("dvalid = None", window)
+        self.assertIn("gc.collect()", window)
 
 
 if __name__ == "__main__":

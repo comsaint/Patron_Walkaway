@@ -11,6 +11,7 @@ import ast
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -91,6 +92,38 @@ class TestR216_1_ValidDfNoneNoAttributeError(unittest.TestCase):
             )
             self.assertIsNotNone(metrics.get("rated"))
             self.assertIn("val_ap", metrics.get("rated") or {})
+
+    def test_valid_df_none_libsvm_path_skips_inmemory_sample_weight_prep(self):
+        """LibSVM success path should not call compute_sample_weights when no in-memory fallback/A3/A4 is needed."""
+        from trainer.trainer import train_single_rated_model, DATA_DIR
+
+        feature_cols = ["f1", "f2"]
+        train_df, _ = _minimal_train_valid_test(feature_cols)
+        with tempfile.TemporaryDirectory(dir=str(DATA_DIR)) as d:
+            root = Path(d)
+            train_p, valid_p = _write_libsvm_pair(
+                root,
+                train_lines=["0 0:0.0 1:0.0", "1 0:0.1 1:0.0"],
+                weight_lines=["1.0", "1.0"],
+                valid_lines=["0 0:0.0 1:0.0", "1 0:0.0 1:0.0"],
+            )
+            with patch("trainer.trainer.compute_sample_weights", side_effect=AssertionError("should stay on LibSVM path")):
+                art, _, metrics = train_single_rated_model(
+                    train_df,
+                    None,
+                    feature_cols,
+                    run_optuna=False,
+                    train_libsvm_paths=(train_p, valid_p),
+                )
+            self.assertIsNotNone(art)
+            self.assertIsNotNone(metrics.get("rated"))
+
+    def test_all_rated_fast_path_present_for_train_valid_test_helpers(self):
+        """When splits are already all rated, helper fast path should avoid unconditional extra rated copies."""
+        src = _get_func_src("train_single_rated_model")
+        self.assertIn('bool(train_df["is_rated"].all())', src)
+        self.assertIn('bool(valid_df["is_rated"].all())', src)
+        self.assertIn('bool(test_df["is_rated"].all())', src)
 
 
 # ---------------------------------------------------------------------------

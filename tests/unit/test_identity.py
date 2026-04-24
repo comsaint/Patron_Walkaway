@@ -161,6 +161,21 @@ class TestFnd01Dedup(unittest.TestCase):
         result = _fnd01(df)
         self.assertEqual(len(result), 2)
 
+    def test_duplicate_index_labels_do_not_duplicate_rows(self):
+        older = datetime(2025, 1, 1)
+        newer = datetime(2025, 3, 1)
+        df = _make_sessions([
+            {"session_id": "S1", "player_id": 1, "lud_dtm": older, "casino_player_id": "old"},
+            {"session_id": "S1", "player_id": 1, "lud_dtm": newer, "casino_player_id": "new"},
+            {"session_id": "S2", "player_id": 2, "lud_dtm": newer, "casino_player_id": "keep"},
+        ])
+        df.index = [0, 0, 1]
+
+        result = _fnd01(df)
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(list(result["casino_player_id"]), ["new", "keep"])
+
 
 # ---------------------------------------------------------------------------
 # _identify_dummy_player_ids (FND-12)

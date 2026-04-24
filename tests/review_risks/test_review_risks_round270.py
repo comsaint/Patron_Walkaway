@@ -108,6 +108,67 @@ class TestR1302DummyPathTimezoneGuard(unittest.TestCase):
         out = identity_mod.get_dummy_player_ids_from_df(df, cutoff_dtm=cutoff_aware)
         self.assertIsInstance(out, set)
 
+    def test_identity_pandas_paths_delay_copy_until_rated_links(self):
+        """Pandas canonical path should avoid full filtered-session copy before rated-link pruning."""
+        src = inspect.getsource(identity_mod.build_canonical_mapping_from_df)
+        self.assertNotIn(
+            "filtered = deduped[mask].copy()",
+            src,
+            "build_canonical_mapping_from_df should not eager-copy the whole DQ-filtered session set.",
+        )
+        self.assertIn(
+            "links_df = filtered.loc[",
+            src,
+            "build_canonical_mapping_from_df should materialize only rated-link rows.",
+        )
+        self.assertIn(
+            "].copy()",
+            src,
+            "rated-link extraction should still take an explicit copy before mutation.",
+        )
+
+    def test_fnd01_dedup_should_materialize_only_deduped_rows(self):
+        """FND-01 pandas dedup should avoid full sessions_df.copy before sort/drop_duplicates."""
+        src = inspect.getsource(identity_mod._fnd01_dedup_pandas)
+        self.assertNotIn(
+            "df = sessions_df.copy()",
+            src,
+            "_fnd01_dedup_pandas should not eager-copy the whole sessions frame before dedup.",
+        )
+        self.assertIn(
+            "sort_helper = pd.DataFrame(",
+            src,
+            "_fnd01_dedup_pandas should build a narrow sort helper instead of copying all columns.",
+        )
+        self.assertIn(
+            "return sessions_df.iloc[keep_row_pos].copy()",
+            src,
+            "_fnd01_dedup_pandas should copy only the surviving deduped rows.",
+        )
+
+    def test_dummy_path_should_not_eager_copy_filtered_sessions(self):
+        """Dummy-ID path should pass a filtered view to _identify_dummy_player_ids instead of full copy."""
+        src = inspect.getsource(identity_mod.get_dummy_player_ids_from_df)
+        self.assertNotIn(
+            "filtered = deduped[mask].copy()",
+            src,
+            "get_dummy_player_ids_from_df should not eager-copy the whole filtered session set.",
+        )
+
+    def test_identify_dummy_player_ids_should_materialize_minimal_columns_only(self):
+        """Dummy helper should copy only minimal columns after keep-mask filtering."""
+        src = inspect.getsource(identity_mod._identify_dummy_player_ids)
+        self.assertIn(
+            'deduped_df.loc[keep_mask, ["player_id", "session_id"]].copy()',
+            src,
+            "_identify_dummy_player_ids should materialize only player_id/session_id before groupby.",
+        )
+        self.assertNotIn(
+            "].copy()\n    valid[\"_games\"] = valid[\"num_games_with_wager\"].fillna(0)",
+            src,
+            "_identify_dummy_player_ids should not eager-copy the full valid-session frame.",
+        )
+
 
 class TestR1303GhostSessionCoverage(unittest.TestCase):
     """R1303: add explicit guards for ghost-session exclusion semantics."""

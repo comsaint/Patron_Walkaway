@@ -190,22 +190,27 @@ def _fnd01_dedup_pandas(sessions_df: pd.DataFrame) -> pd.DataFrame:
     ``__etl_insert_Dtm`` as tiebreaker) for each ``session_id``.
     NaT sorts as NULLS LAST (i.e. after non-null values in DESC order).
     """
-    df = sessions_df.copy()
-    # Convert to numeric timestamps for consistent NaT-last sort
-    df["_lud_sort"] = pd.to_datetime(df["lud_dtm"], errors="coerce")
-    df["_etl_sort"] = pd.to_datetime(
-        df.get("__etl_insert_Dtm", pd.NaT), errors="coerce"
+    sort_helper = pd.DataFrame(
+        {
+            "session_id": sessions_df["session_id"],
+            "_lud_sort": pd.to_datetime(sessions_df["lud_dtm"], errors="coerce"),
+            "_etl_sort": pd.to_datetime(
+                sessions_df.get("__etl_insert_Dtm", pd.NaT), errors="coerce"
+            ),
+            "_row_pos": range(len(sessions_df)),
+        },
+        index=sessions_df.index,
     )
-    df = (
-        df.sort_values(
+    keep_row_pos = (
+        sort_helper.sort_values(
             ["session_id", "_lud_sort", "_etl_sort"],
             ascending=[True, False, False],
             na_position="last",
         )
-        .drop_duplicates(subset=["session_id"], keep="first")
-        .drop(columns=["_lud_sort", "_etl_sort"])
+        .drop_duplicates(subset=["session_id"], keep="first")["_row_pos"]
+        .to_numpy()
     )
-    return df
+    return sessions_df.iloc[keep_row_pos].copy()
 
 
 def _identify_dummy_player_ids(deduped_df: pd.DataFrame) -> Set:
@@ -214,19 +219,24 @@ def _identify_dummy_player_ids(deduped_df: pd.DataFrame) -> Set:
     A player_id is considered a dummy if it has exactly 1 session and
     ≤1 game with a wager (COALESCE-safe for Nullable column).
     """
-    valid = deduped_df[
+    games_num = pd.to_numeric(
+        deduped_df.get("num_games_with_wager", pd.Series(0, index=deduped_df.index)),
+        errors="coerce",
+    ).fillna(0)
+    turnover_num = pd.to_numeric(
+        deduped_df.get("turnover", pd.Series(0, index=deduped_df.index)),
+        errors="coerce",
+    ).fillna(0)
+    keep_mask = (
         (deduped_df["is_manual"] == 0)
         & (deduped_df["is_deleted"] == 0)
         & (deduped_df["is_canceled"] == 0)
         & deduped_df["player_id"].notna()
         & (deduped_df["player_id"] != PLACEHOLDER_PLAYER_ID)
-    ].copy()
-    valid["_games"] = valid["num_games_with_wager"].fillna(0)
-    # FND-04: exclude ghost sessions (R1707).
-    valid = valid[
-        (pd.to_numeric(valid.get("turnover", 0), errors="coerce").fillna(0) > 0)
-        | (valid["_games"] > 0)
-    ]
+        & ((turnover_num > 0) | (games_num > 0))
+    )
+    valid = deduped_df.loc[keep_mask, ["player_id", "session_id"]].copy()
+    valid["_games"] = games_num.loc[keep_mask].to_numpy()
     agg = valid.groupby("player_id").agg(
         session_cnt=("session_id", "count"),
         total_games=("_games", "sum"),
@@ -406,22 +416,23 @@ def build_canonical_mapping_from_df(
         & (session_time <= cutoff_ts)
         & ((_turnover > 0) | (_games > 0))
     )
-    filtered = deduped[mask].copy()
+    filtered = deduped.loc[mask]
 
     # Step 3 — FND-12 fake-account exclusion
     dummy_pids = _identify_dummy_player_ids(filtered)
     logger.info("FND-12: identified %d dummy player_id(s)", len(dummy_pids))
 
     # Step 4 — FND-03 casino_player_id cleaning
-    filtered["casino_player_id"] = _clean_casino_player_id(
-        filtered["casino_player_id"]
-    )
+    cleaned_casino_player_id = _clean_casino_player_id(filtered["casino_player_id"])
 
-    # Step 5 — extract links (rated players only: casino_player_id not null)
+    # Step 5 — extract links (rated players only: casino_player_id not null).
+    # Copy only the surviving rated rows instead of the full DQ-filtered session set.
+    rated_mask = cleaned_casino_player_id.notna()
     links_df = filtered.loc[
-        filtered["casino_player_id"].notna(),
+        rated_mask,
         ["player_id", "casino_player_id", "lud_dtm"],
-    ]
+    ].copy()
+    links_df["casino_player_id"] = cleaned_casino_player_id.loc[rated_mask].to_numpy()
 
     # Step 6 — M:N resolution
     return _apply_mn_resolution(links_df, dummy_pids)
@@ -479,7 +490,7 @@ def get_dummy_player_ids_from_df(sessions_df: pd.DataFrame, cutoff_dtm: datetime
         & (session_time <= cutoff_ts)
         & ((_turnover > 0) | (_games > 0))
     )
-    filtered = deduped[mask].copy()
+    filtered = deduped.loc[mask]
     return _identify_dummy_player_ids(filtered)
 
 

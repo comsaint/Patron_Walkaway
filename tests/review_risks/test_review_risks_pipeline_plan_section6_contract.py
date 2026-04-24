@@ -182,6 +182,20 @@ class TestSection6RssSamplingInRunPipeline(unittest.TestCase):
             "expected max(start,end) peak assignment (formatter-tolerant)",
         )
 
+    def test_split_frames_released_after_step9_snapshot_before_step10(self):
+        """Step 9 OOM hardening: large split DataFrames should be cleared before artifact save/MLflow phases."""
+        src = _run_pipeline_src()
+        i_snapshot = src.find("# T12.2: capture RSS/sys RAM snapshot at Step 9 end")
+        i_release = src.find("train_df = None")
+        i_step10 = src.find('print("[Step 10/10] Save artifact bundle…", flush=True)')
+        self.assertGreater(i_snapshot, 0, "expected Step 9 snapshot anchor")
+        self.assertGreater(i_release, i_snapshot, "split-frame release should happen after Step 9 snapshot block")
+        self.assertGreater(i_step10, i_release, "split-frame release should happen before Step 10 artifact save")
+        window = src[i_release : i_step10]
+        self.assertIn("valid_df = None", window)
+        self.assertIn("test_df = None", window)
+        self.assertIn("gc.collect()", window)
+
 
 class TestSection6OomPrecheckRatioFormula(unittest.TestCase):
     """§6：oom_precheck_step7_rss_error_ratio 與 peak／precheck 估算一致（除法路徑）。"""

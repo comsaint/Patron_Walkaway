@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import joblib
@@ -7,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from trainer.serving import scorer
+from trainer.training import trainer as trainer_mod
 
 
 class _LinearModel:
@@ -76,4 +78,17 @@ def test_scorer_score_df_two_stage_fallback_to_stage1_on_stage2_error(tmp_path: 
         assert np.allclose(out["score"].to_numpy(dtype=float), np.asarray([0.1, 0.7], dtype=float))
     finally:
         scorer.config.A4_TWO_STAGE_ENABLE_INFERENCE = old_flag
+
+
+def test_train_single_rated_model_releases_a4_temp_matrices_after_metrics() -> None:
+    src = inspect.getsource(trainer_mod.train_single_rated_model)
+    anchor = "Peak-RAM cleanup: A4 builds several large stage-1 / stage-2 matrices"
+    i_anchor = src.find(anchor)
+    assert i_anchor > 0, "A4 cleanup anchor must exist in train_single_rated_model"
+    window = src[i_anchor : i_anchor + 900]
+    assert "_x_tr_s1 = None" in window
+    assert "_x2_tr = None" in window
+    assert "_x_vl_s1 = None" in window
+    assert "_x_te_s1 = None" in window
+    assert "gc.collect()" in window
 
