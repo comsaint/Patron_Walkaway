@@ -170,10 +170,15 @@ def _gbm_bakeoff_family(report: Mapping[str, Any]) -> Dict[str, Any]:
     if isinstance(per, dict):
         for cid, row in per.items():
             if isinstance(row, dict):
-                candidates[str(cid)] = {
+                candidate: Dict[str, Any] = {
                     "candidate_id": str(cid),
                     "datasets": _metrics_row_to_datasets(row),
                 }
+                if "error" in row:
+                    candidate["error"] = row.get("error")
+                if "bakeoff_disposition" in row:
+                    candidate["bakeoff_disposition"] = row.get("bakeoff_disposition")
+                candidates[str(cid)] = candidate
             else:
                 candidates[str(cid)] = {"candidate_id": str(cid), "error": repr(row)}
     winner = report.get("winner_id")

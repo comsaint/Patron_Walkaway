@@ -155,9 +155,41 @@ class TestModelMetadataPipelineWiring(unittest.TestCase):
         self.assertIn("split_row_metadata_from_parquet_paths", src)
         self.assertIn("split_row_metadata_from_dataframes", src)
         self.assertIn("_split_row_meta", src)
+        self.assertIn("_model_used_split_meta", src)
+        self.assertIn("rated_only=True", src)
         self.assertIn("build_model_metadata_document(", src)
+        self.assertIn("model_used_splits=_model_used_split_meta", src)
         self.assertIn("model_metadata=_model_meta_doc", src)
         self.assertIn("split_boundary_params=_split_mlflow_meta", src)
+
+    def test_metadata_builder_exposes_model_used_splits_and_optuna_effective_state(self):
+        src = _get_func_src("build_model_metadata_document")
+        self.assertIn('"model_used_splits"', src)
+        self.assertIn('"optuna_hpo_effective_enabled"', src)
+        self.assertIn('"optuna_hpo_objective_mode"', src)
+
+
+class TestLibsvmOptunaProvenanceWiring(unittest.TestCase):
+    """Source contracts for LibSVM path effective-HPO provenance."""
+
+    def test_helper_exists_for_libsvm_optuna_skip_manifest(self):
+        self.assertIn("def _write_skipped_optuna_manifest_for_libsvm", _TRAINER_SRC)
+
+    def test_train_single_rated_model_records_effective_hpo_skip_on_libsvm(self):
+        src = _get_func_src("train_single_rated_model")
+        self.assertIn("_write_skipped_optuna_manifest_for_libsvm", src)
+        self.assertIn("optuna_hpo_effective_enabled", _TRAINER_SRC)
+
+
+class TestA3ValWindowWiring(unittest.TestCase):
+    """Source contracts for A3 bakeoff validation span recomputation."""
+
+    def test_a3_recomputes_val_window_after_loading_compare_valid(self):
+        src = _get_func_src("train_single_rated_model")
+        self.assertIn("_compare_valid_for_span", src)
+        self.assertIn("_bake_val_wh, _bake_val_mah", src)
+        self.assertIn("val_dec026_window_hours=_bake_val_wh", src)
+        self.assertIn("val_dec026_min_alerts_per_hour=_bake_val_mah", src)
 
 
 # ---------------------------------------------------------------------------

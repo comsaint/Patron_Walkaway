@@ -78,6 +78,35 @@ def test_write_sidecars_writes_three_files_and_metadata_paths(tmp_path: Path) ->
     assert "comparison_metrics_path" in meta["artifacts"]
 
 
+def test_comparison_metrics_preserves_backend_error_and_disposition(tmp_path: Path) -> None:
+    rated = {
+        "gbm_bakeoff": {
+            "schema_version": "a3_v2",
+            "winner_backend": "lightgbm",
+            "selection_rule": "max_val_field_test_primary_score_then_val_ap_then_val_fbeta_05",
+            "per_backend": {
+                "lightgbm": {"val_precision": 0.7},
+                "catboost": {
+                    "error": "field-test constrained HPO allowed but val_window_hours missing/invalid",
+                    "bakeoff_disposition": "reject",
+                },
+            },
+        }
+    }
+    root = {"rated": rated, "selection_mode": "field_test"}
+    write_training_metrics_v2_sidecars(
+        tmp_path,
+        model_version="mv1",
+        metrics_root=root,
+        model_metadata=None,
+    )
+    cm = json.loads((tmp_path / "comparison_metrics.json").read_text(encoding="utf-8"))
+    cat = cm["families"]["gbm_bakeoff"]["candidates"]["catboost"]
+    assert cat["candidate_id"] == "catboost"
+    assert cat["bakeoff_disposition"] == "reject"
+    assert "val_window_hours missing/invalid" in cat["error"]
+
+
 def test_training_metrics_v2_map_json_is_valid() -> None:
     """Guardrail: map file stays parseable JSON (W1 deliverable)."""
     map_path = Path(__file__).resolve().parents[2] / "trainer" / "core" / "training_metrics_v2_map.json"

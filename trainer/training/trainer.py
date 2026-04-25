@@ -3576,6 +3576,50 @@ def _write_optuna_hpo_manifest(
     sink.append(dict(payload))
 
 
+def _write_skipped_optuna_manifest_for_libsvm(
+    sink: Optional[list[dict[str, Any]]],
+    *,
+    run_optuna: bool,
+) -> None:
+    """Record effective Optuna status for LibSVM default-hyperparams path."""
+    runtime_manifest = _backend_runtime_manifest("lightgbm")
+    _write_optuna_hpo_manifest(
+        sink,
+        {
+            "optuna_hpo_backend": "lightgbm",
+            "optuna_hpo_enabled": False,
+            "optuna_hpo_effective_enabled": False,
+            "optuna_hpo_backend_device_mode": runtime_manifest["backend_device_mode"],
+            "optuna_hpo_backend_gpu_id": runtime_manifest["backend_gpu_id"],
+            "optuna_hpo_n_trials_requested": (
+                int(OPTUNA_N_TRIALS) if isinstance(OPTUNA_N_TRIALS, int) else None
+            ),
+            "optuna_hpo_timeout_seconds": (
+                int(OPTUNA_HPO_TIMEOUT_SECONDS)
+                if isinstance(OPTUNA_HPO_TIMEOUT_SECONDS, int) and OPTUNA_HPO_TIMEOUT_SECONDS > 0
+                else None
+            ),
+            "optuna_hpo_early_stop_patience": (
+                int(OPTUNA_HPO_EARLY_STOP_PATIENCE)
+                if isinstance(OPTUNA_HPO_EARLY_STOP_PATIENCE, int)
+                and OPTUNA_HPO_EARLY_STOP_PATIENCE > 0
+                else None
+            ),
+            "optuna_hpo_study_best_trial_value": None,
+            "optuna_hpo_objective_mode": (
+                "skipped_libsvm_default_params"
+                if run_optuna
+                else "disabled_by_run_flag"
+            ),
+            "optuna_hpo_skipped_reason": (
+                "libsvm_path_uses_default_hyperparams"
+                if run_optuna
+                else "run_optuna_false"
+            ),
+        },
+    )
+
+
 def _backend_hpo_defaults(backend: str) -> dict[str, Any]:
     backend_n = str(backend or "").strip().lower()
     if backend_n == "lightgbm":
@@ -5599,6 +5643,9 @@ def train_single_rated_model(
     # PLAN 方案 B §6: HPO on in-memory (train/valid) for both paths; from-file then uses best params for lgb.train.
     # B+ §4.4: from LibSVM we use default hp (no in-memory HPO).
     if use_from_libsvm:
+        _write_skipped_optuna_manifest_for_libsvm(
+            _optuna_hpo_manifest, run_optuna=bool(run_optuna)
+        )
         hp = {
             "n_estimators": 400,
             "learning_rate": 0.05,
@@ -6247,6 +6294,17 @@ def train_single_rated_model(
                 else None
             )
 
+            _compare_valid_for_span = (
+                _compare_valid
+                if _compare_valid is not None
+                else pd.DataFrame()
+            )
+            _bake_val_wh, _bake_val_mah = _rated_field_test_val_pick_per_hour_kwargs(
+                label="rated",
+                field_test_constrained_optuna_objective_allowed=_ft_allowed,
+                val_df=_compare_valid_for_span,
+            )
+
             _winner_backend, _winner_art, _bake_report = train_and_select_rated_gbm_family(
                 X_tr,
                 y_tr,
@@ -6265,8 +6323,8 @@ def train_single_rated_model(
                 field_test_constrained_optuna_objective_allowed=_ft_allowed,
                 X_test=_x_te_cmp,
                 y_test=_y_te_cmp,
-                val_dec026_window_hours=_ft_thr_wh,
-                val_dec026_min_alerts_per_hour=_ft_thr_mah,
+                val_dec026_window_hours=_bake_val_wh,
+                val_dec026_min_alerts_per_hour=_bake_val_mah,
             )
             model = _winner_art["model"]
             metrics = dict(_winner_art["metrics"])
@@ -6685,8 +6743,19 @@ def split_row_metadata_from_dataframes(
     train_df: pd.DataFrame,
     valid_df: pd.DataFrame,
     test_df: pd.DataFrame,
+    *,
+    rated_only: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Row-level split summaries from in-memory train/valid/test frames."""
+    if rated_only:
+        def _rated_view(df: pd.DataFrame) -> pd.DataFrame:
+            if "is_rated" not in df.columns:
+                return df.head(0).copy()
+            return df.loc[df["is_rated"].astype(bool)].copy()
+
+        train_df = _rated_view(train_df)
+        valid_df = _rated_view(valid_df)
+        test_df = _rated_view(test_df)
     return {
         "train": _one_split_block_from_dataframe(train_df),
         "valid": _one_split_block_from_dataframe(valid_df),
@@ -6698,6 +6767,8 @@ def split_row_metadata_from_parquet_paths(
     train_path: Path,
     valid_path: Path,
     test_path: Path,
+    *,
+    rated_only: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Row-level split summaries via DuckDB aggregates (no full-frame load)."""
     import duckdb
@@ -6706,12 +6777,22 @@ def split_row_metadata_from_parquet_paths(
         s = str(p).replace("'", "''")
         con = duckdb.connect(":memory:")
         try:
+            cols_probe = con.execute(
+                f"SELECT * FROM read_parquet('{s}') LIMIT 0"
+            )
+            cols = {str(d[0]).strip().lower() for d in (cols_probe.description or [])}
+            where_sql = (
+                " WHERE coalesce(try_cast(is_rated AS BOOLEAN), FALSE)"
+                if rated_only and "is_rated" in cols
+                else ""
+            )
             row = con.execute(
                 f"SELECT count(*) AS n, "
                 f"coalesce(sum(cast(label AS INTEGER)), 0) AS pos, "
                 f"min(payout_complete_dtm) AS dt_min, "
                 f"max(payout_complete_dtm) AS dt_max "
                 f"FROM read_parquet('{s}')"
+                f"{where_sql}"
             ).fetchone()
         finally:
             con.close()
@@ -6787,6 +6868,7 @@ def build_model_metadata_document(
     neg_sample_frac_effective: float,
     bundle_dir: Path,
     combined_metrics: Optional[dict[str, Any]] = None,
+    model_used_splits: Optional[dict[str, dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Assemble ``model_metadata.json`` payload (versioned schema v1)."""
     def _iso_any(x: Any) -> Any:
@@ -6820,8 +6902,11 @@ def build_model_metadata_document(
             "test_frac": float(_test_frac),
         },
         "splits": splits,
+        "model_used_splits": model_used_splits,
         "training_params": {
             "skip_optuna": bool(skip_optuna),
+            "optuna_hpo_effective_enabled": _rated_d.get("optuna_hpo_effective_enabled"),
+            "optuna_hpo_objective_mode": _rated_d.get("optuna_hpo_objective_mode"),
             "sample_rated_n": sample_rated_n,
             "neg_sample_frac_effective": float(neg_sample_frac_effective),
             "threshold_min_recall": THRESHOLD_MIN_RECALL,
@@ -8506,11 +8591,23 @@ def run_pipeline(args) -> None:
                     step7_valid_path,
                     step7_test_path,
                 )
+                _model_used_split_meta = split_row_metadata_from_parquet_paths(
+                    step7_train_path,
+                    step7_valid_path,
+                    step7_test_path,
+                    rated_only=True,
+                )
             else:
                 _split_row_meta = split_row_metadata_from_dataframes(
                     cast(pd.DataFrame, train_df),
                     cast(pd.DataFrame, valid_df),
                     cast(pd.DataFrame, test_df),
+                )
+                _model_used_split_meta = split_row_metadata_from_dataframes(
+                    cast(pd.DataFrame, train_df),
+                    cast(pd.DataFrame, valid_df),
+                    cast(pd.DataFrame, test_df),
+                    rated_only=True,
                 )
             _train_cols = (
                 train_df.columns
@@ -8872,6 +8969,7 @@ def run_pipeline(args) -> None:
                 neg_sample_frac_effective=_effective_neg_sample_frac,
                 bundle_dir=_bundle_dir,
                 combined_metrics=combined_metrics,
+                model_used_splits=_model_used_split_meta,
             )
             save_artifact_bundle(
                 rated_art, active_feature_cols, combined_metrics, model_version,
