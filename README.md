@@ -14,7 +14,7 @@ Patron Walkaway 離場偵測專案。
 
 - **Phase 1** 實作：單一模型（僅評級客 Rated only）LightGBM 流程，含 Optuna 超參數搜尋、run-level 樣本權重、**三軌特徵工程**（Track Profile PIT/as-of join、Track LLM DuckDB + Feature Spec YAML、Track Human 向量化 `loss_streak`/`run_boundary`）、身分對應與告警驗證。
 - **資料**：ClickHouse（`GDP_GMWDS_Raw`）或開發用本地 Parquet（置於 `data/`）。
-- **產出**：訓練產物在 `trainer/models/`（`.pkl`、特徵清單、原因碼、模型版本）；即時 scorer 將告警寫入 SQLite；API 與前端儀表板供營運使用。
+- **產出**：訓練產物預設寫入 `out/models/<model_version>/`（可用 `MODEL_DIR` 覆寫），包含模型、特徵規格、原因碼、metrics 與診斷檔；即時 scorer 將告警寫入 SQLite；API 與前端儀表板供營運使用。
 
 ### 架構（高層）
 
@@ -40,11 +40,20 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 - **Scorer / API**：僅對評級客（`is_rated`）產生告警；訓練結束後會清理舊版 `nonrated_model.pkl` / `rated_model.pkl`。
 - **測試**：全量 `pytest` 約 519 passed；實作計畫與狀態詳見 `.cursor/plans/PLAN.md`、`.cursor/plans/STATUS.md`、`.cursor/plans/DECISION_LOG.md`。Phase 2 規劃草稿見 `doc/phase2_planning.md`。
 
+### 最新本機模型快照
+
+- **版本**：`20260425-155443-d211e46`（`out/models/20260425-155443-d211e46/training_metrics.v2.json`）。
+- **資料窗**：2026-01-01 至 2026-04-01；選模口徑為 `field_test_precision`。
+- **Test KPI**：AP 0.4521；field-test precision（prod-adjusted）0.4990；precision@recall 1% 為 0.7487（raw）/ 0.4906（prod-adjusted）。
+- **執行環境**：`TRAINER_DEVICE_MODE=auto`，本次有效後端為 GPU；完整指標以 bundle 內 `training_metrics.v2.json` 為準。
+
 ### 環境設定
 
 **需求**：Python 3.10+，執行 `pip install -r requirements.txt`。主要套件：`lightgbm`、`duckdb`、`optuna`、`shap`、`pandas`、`pyarrow`、`python-dotenv` 等。
 
 **環境變數**：將 `trainer/.env.example` 複製為 `trainer/.env`（或設定對應環境變數），用於 ClickHouse：`CH_HOST`、`CH_TEAMDB_HOST`、`CH_PORT`、`CH_USER`、`CH_PASS`、`CH_SECURE`、`SOURCE_DB`。
+
+**訓練裝置**：建議用 `TRAINER_DEVICE_MODE=auto|cpu|gpu` 統一控制 Step 9 LightGBM 與 A3 bakeoff 排程；舊參數 `--lgbm-device cpu|gpu` 仍可用但已視為 deprecated，只應作單次 LightGBM 覆寫。
 
 **資料（訓練/回測）**：預設為 ClickHouse，請確認 `SOURCE_DB` 與憑證正確。本地 Parquet（開發/測試）：在專案根目錄放置 `data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet`（可選 `data/player_profile.parquet`），執行 trainer 或 backtester 時加上 `--use-local-parquet`。
 
@@ -126,6 +135,10 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `--no-preload` | 關閉 profile backfill 時對 session Parquet 的「全表一次載入」，改為每 snapshot 日用 PyArrow pushdown 讀取。預設（不加此旗標）會完整載入整張 session 表格。適合 ≤8 GB RAM 機器，避免 OOM，代價是 backfill 速度較慢。 |
 | `--sample-rated N` | 僅使用 N 個評級客（canonical_id 字典序取前 N 個）。預設不抽樣（使用全部評級客）。 |
 | `--rebuild-canonical-mapping` | 強制從頭建 canonical mapping，不載入既有 `data/canonical_mapping.parquet`；建完後照常寫出。用於 mapping 損壞/過期或 schema 變更後重算。 |
+| `--lgbm-device cpu|gpu` | Deprecated：僅覆寫本次 LightGBM device；建議改用 `TRAINER_DEVICE_MODE=auto|cpu|gpu`。 |
+| `--ranking-recipe {baseline,r2_top_band_light,r2_hnm_light,r2_combined_light}` | Precision uplift A2/R2 的 rated-only sample-weight recipe；未指定時讀 `PRECISION_UPLIFT_RANKING_RECIPE`，再 fallback 到 `r2_top_band_light`。 |
+| `--no-gbm-bakeoff` | 關閉預設 A3/R3 LightGBM / CatBoost / XGBoost bakeoff，只保留主要 LightGBM 路徑。 |
+| `--disable-oof-stacking` | 關閉 A3 bakeoff 中的 OOF stacked logistic challenger。 |
 
 ### 測試
 
@@ -157,9 +170,9 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 > **路徑**：預設寫入 **`MODEL_DIR`**＝專案根下 **`out/models/`**（`trainer/core/config.py` 之 **`DEFAULT_MODEL_DIR`**）；可設環境變數 **`MODEL_DIR`** 覆寫。下文 **`trainer/models/`** 表同一 bundle 目錄（慣用簡稱）。
 
-`trainer/models/` 下：`model.pkl`（v10 單一評級客模型；**DEC-040**：scorer／backtester **僅**從此檔載入模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 凍結特徵規格，訓練時寫入 bundle，scorer 優先從此載入）、`reason_code_map.json`、`model_version`、`training_metrics.json`（僅 rated 指標）、**`pipeline_diagnostics.json`**（訓練成功後寫入：pipeline 總／步驟耗時、`step7_rss_*`、OOM 預檢與 `oom_precheck_step7_rss_error_ratio` 等資源診斷；與模型效能指標分檔）。訓練結束後若存在舊版 `nonrated_model.pkl`、`rated_model.pkl` 或 legacy `walkaway_model.pkl` 會自動刪除，避免目錄內殘留可誤解的檔案（載入端亦不再讀 rated／walkaway）。
+`trainer/models/` 下：`model.pkl`（v10 單一評級客模型；**DEC-040**：scorer／backtester **僅**從此檔載入模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 凍結特徵規格，訓練時寫入 bundle，scorer 優先從此載入）、`reason_code_map.json`、`model_version`、`training_metrics.json`（legacy v1）、**`training_metrics.v2.json`**（v2 主指標：datasets / selection / field-test precision）、**`feature_importance.json`**、**`comparison_metrics.json`**、**`pipeline_diagnostics.json`**（訓練成功後寫入：pipeline 總／步驟耗時、`step7_rss_*`、OOM 預檢與 `oom_precheck_step7_rss_error_ratio` 等資源診斷；與模型效能指標分檔）。訓練結束後若存在舊版 `nonrated_model.pkl`、`rated_model.pkl` 或 legacy `walkaway_model.pkl` 會自動刪除，避免目錄內殘留可誤解的檔案（載入端亦不再讀 rated／walkaway）。
 
-- **部署／MLflow**：`python -m package.build_deploy_package` 會將 `pipeline_diagnostics.json` 一併拷貝到產物 `models/`（來源目錄有該檔時；缺檔時建包僅 warning）。若已設定 tracking 且該次訓練有 active run，上述小檔另可以 **`bundle/`** 前綴出現在該 run 的 **Artifacts**（best-effort，與 `training_metrics.json` 等並列）。詳見 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`、`doc/phase2_provenance_schema.md`。
+- **部署／MLflow**：`python -m package.build_deploy_package` 會將 bundle 檔案拷貝到產物 `models/`，包含 `training_metrics.json`、`training_metrics.v2.json`、`feature_importance.json`、`comparison_metrics.json` 與 `pipeline_diagnostics.json`（缺檔時建包僅 warning）。若已設定 tracking 且該次訓練有 active run，上述小檔另可以 **`bundle/`** 前綴出現在該 run 的 **Artifacts**（best-effort）。詳見 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`、`doc/phase2_provenance_schema.md`。
 
 ### 注意事項
 
@@ -182,7 +195,7 @@ Patron Walkaway 离场检测项目。
 
 - **Phase 1** 实现：单模型（仅评级客 Rated only）LightGBM 流程，含 Optuna 超参搜索、run-level 样本权重、**三轨特征工程**（Track Profile PIT/as-of join、Track LLM DuckDB + Feature Spec YAML、Track Human 向量化 `loss_streak`/`run_boundary`）、身份映射与告警验证。
 - **数据**：ClickHouse（`GDP_GMWDS_Raw`）或开发用本地 Parquet（置于 `data/`）。
-- **产出**：训练产物在 `trainer/models/`（`.pkl`、特征列表、原因码、模型版本）；实时 scorer 将告警写入 SQLite；API 与前端仪表盘供运营使用。
+- **产出**：训练产物默认写入 `out/models/<model_version>/`（可用 `MODEL_DIR` 覆盖），包含模型、特征规格、原因码、metrics 与诊断档；实时 scorer 将告警写入 SQLite；API 与前端仪表盘供运营使用。
 
 ### 架构（高层）
 
@@ -207,11 +220,20 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 - **Scorer / API**：仅对评级客（`is_rated`）产生告警；训练结束后会清理旧版 `nonrated_model.pkl` / `rated_model.pkl`。
 - **测试**：全量 `pytest` 约 519 passed；实现计划与状态详见 `.cursor/plans/PLAN.md`、`.cursor/plans/STATUS.md`、`.cursor/plans/DECISION_LOG.md`。Phase 2 规划草稿见 `doc/phase2_planning.md`。
 
+### 最新本机模型快照
+
+- **版本**：`20260425-155443-d211e46`（`out/models/20260425-155443-d211e46/training_metrics.v2.json`）。
+- **数据窗**：2026-01-01 至 2026-04-01；选模口径为 `field_test_precision`。
+- **Test KPI**：AP 0.4521；field-test precision（prod-adjusted）0.4990；precision@recall 1% 为 0.7487（raw）/ 0.4906（prod-adjusted）。
+- **执行环境**：`TRAINER_DEVICE_MODE=auto`，本次有效后端为 GPU；完整指标以 bundle 内 `training_metrics.v2.json` 为准。
+
 ### 环境设置
 
 **需求**：Python 3.10+，执行 `pip install -r requirements.txt`。主要包：`lightgbm`、`duckdb`、`optuna`、`shap`、`pandas`、`pyarrow`、`python-dotenv` 等。
 
 **环境变量**：将 `trainer/.env.example` 复制为 `trainer/.env`（或设置对应环境变量），用于 ClickHouse：`CH_HOST`、`CH_TEAMDB_HOST`、`CH_PORT`、`CH_USER`、`CH_PASS`、`CH_SECURE`、`SOURCE_DB`。
+
+**训练装置**：建议用 `TRAINER_DEVICE_MODE=auto|cpu|gpu` 统一控制 Step 9 LightGBM 与 A3 bakeoff 调度；旧参数 `--lgbm-device cpu|gpu` 仍可用但已视为 deprecated，只应用于单次 LightGBM 覆盖。
 
 **数据（训练/回测）**：默认为 ClickHouse，请确认 `SOURCE_DB` 与凭证正确。本地 Parquet（开发/测试）：在项目根目录放置 `data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet`（可选 `data/player_profile.parquet`），运行 trainer 或 backtester 时加上 `--use-local-parquet`。
 
@@ -221,10 +243,10 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 
 **训练（完整流程）**（在项目根目录）：
 
+训练、评估与 serving 一律使用同一 lookback 窗口（config 中 `SCORER_LOOKBACK_HOURS`，默认 8 小时），以维持 train–serve parity。
+
 ```bash
-python -m trainer.trainer
-python -m trainer.trainer --use-local-parquet --recent-chunks 3
-python -m trainer.trainer --skip-optuna --use-local-parquet
+python -m trainer.trainer --use-local-parquet --days 365
 ```
 
 低内存（如 8 GB）：加上 `--no-preload` 可避免 profile backfill 时将整张 session Parquet 一次载入内存：
@@ -267,6 +289,10 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `--no-preload` | 关闭 profile backfill 时对 session Parquet 的「全表一次载入」，改为每 snapshot 日用 PyArrow pushdown 读取。默认（不加此旗标）会完整载入整张 session 表格。适合 ≤8 GB RAM 机器，避免 OOM，代价是 backfill 速度较慢。 |
 | `--sample-rated N` | 仅使用 N 个评级客（canonical_id 字典序取前 N 个）。默认不抽样（使用全部评级客）。 |
 | `--rebuild-canonical-mapping` | 强制从头建 canonical mapping，不载入既有 `data/canonical_mapping.parquet`；建完后照常写出。用于 mapping 损坏/过期或 schema 变更后重算。 |
+| `--lgbm-device cpu|gpu` | Deprecated：仅覆盖本次 LightGBM device；建议改用 `TRAINER_DEVICE_MODE=auto|cpu|gpu`。 |
+| `--ranking-recipe {baseline,r2_top_band_light,r2_hnm_light,r2_combined_light}` | Precision uplift A2/R2 的 rated-only sample-weight recipe；未指定时读 `PRECISION_UPLIFT_RANKING_RECIPE`，再 fallback 到 `r2_top_band_light`。 |
+| `--no-gbm-bakeoff` | 关闭默认 A3/R3 LightGBM / CatBoost / XGBoost bakeoff，只保留主要 LightGBM 路径。 |
+| `--disable-oof-stacking` | 关闭 A3 bakeoff 中的 OOF stacked logistic challenger。 |
 
 ### 测试
 
@@ -298,9 +324,9 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 > **路径**：默认写入 **`MODEL_DIR`**＝项目根下 **`out/models/`**（`trainer/core/config.py` 之 **`DEFAULT_MODEL_DIR`**）；可设环境变量 **`MODEL_DIR`** 覆盖。下文 **`trainer/models/`** 表同一 bundle 目录（惯用简称）。
 
-`trainer/models/` 下：`model.pkl`（v10 单一评级客模型；**DEC-040**：scorer／backtester **仅**从此文件加载模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 冻结特征规格，训练时写入 bundle，scorer 优先从此载入）、`reason_code_map.json`、`model_version`、`training_metrics.json`（仅 rated 指标）、**`pipeline_diagnostics.json`**（训练成功后写入：pipeline 总/步骤耗时、`step7_rss_*`、OOM 预检与 `oom_precheck_step7_rss_error_ratio` 等资源诊断；与模型效能指标分档）。训练结束后若存在旧版 `nonrated_model.pkl`、`rated_model.pkl` 或 legacy `walkaway_model.pkl` 会自动删除；加载端不再读取 rated／walkaway。
+`trainer/models/` 下：`model.pkl`（v10 单一评级客模型；**DEC-040**：scorer／backtester **仅**从此文件加载模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 冻结特征规格，训练时写入 bundle，scorer 优先从此载入）、`reason_code_map.json`、`model_version`、`training_metrics.json`（legacy v1）、**`training_metrics.v2.json`**（v2 主指标：datasets / selection / field-test precision）、**`feature_importance.json`**、**`comparison_metrics.json`**、**`pipeline_diagnostics.json`**（训练成功后写入：pipeline 总/步骤耗时、`step7_rss_*`、OOM 预检与 `oom_precheck_step7_rss_error_ratio` 等资源诊断；与模型效能指标分档）。训练结束后若存在旧版 `nonrated_model.pkl`、`rated_model.pkl` 或 legacy `walkaway_model.pkl` 会自动删除；加载端不再读取 rated／walkaway。
 
-- **部署／MLflow**：`python -m package.build_deploy_package` 会将 `pipeline_diagnostics.json` 一并拷贝到产物 `models/`（来源目录有该档时；缺档时建包仅 warning）。若已设定 tracking 且该次训练有 active run，上述小档另可以以 **`bundle/`** 前缀出现在该 run 的 **Artifacts**（best-effort）。详见 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`、`doc/phase2_provenance_schema.md`。
+- **部署／MLflow**：`python -m package.build_deploy_package` 会将 bundle 档案拷贝到产物 `models/`，包含 `training_metrics.json`、`training_metrics.v2.json`、`feature_importance.json`、`comparison_metrics.json` 与 `pipeline_diagnostics.json`（缺档时建包仅 warning）。若已设定 tracking 且该次训练有 active run，上述小档另可以 **`bundle/`** 前缀出现在该 run 的 **Artifacts**（best-effort）。详见 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`、`doc/phase2_provenance_schema.md`。
 
 ### 注意事项
 
@@ -321,7 +347,7 @@ Our mass gaming floor has deployed Smart Table technology through which we are a
 
 - **Phase 1** implementation: single-model (rated only) LightGBM pipeline with Optuna hyperparameter search, run-level sample weighting, **three-track feature engineering** (Track Profile PIT/as-of join, Track LLM DuckDB + Feature Spec YAML, Track Human vectorized `loss_streak`/`run_boundary`), identity mapping, and alert validation.
 - **Data**: ClickHouse (`GDP_GMWDS_Raw`) or local Parquet under `data/` for development.
-- **Output**: Trained artifacts in `trainer/models/` (`.pkl`, feature list, reason codes, model version); live scorer writes alerts to SQLite; API + frontend dashboard for operators.
+- **Output**: Trained artifacts default to `out/models/<model_version>/` (override with `MODEL_DIR`) and include model, feature spec, reason codes, metrics, and diagnostics; live scorer writes alerts to SQLite; API + frontend dashboard for operators.
 
 ---
 
@@ -348,6 +374,13 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 - **Scorer / API**: Alerts are emitted only for rated patrons (`is_rated`); stale `nonrated_model.pkl` / `rated_model.pkl` are cleaned up after training.
 - **Tests**: Full `pytest` ~519 passed; see `.cursor/plans/PLAN.md`, `.cursor/plans/STATUS.md`, `.cursor/plans/DECISION_LOG.md` for plan and status. Phase 2 planning draft: `doc/phase2_planning.md`.
 
+### Latest Local Model Snapshot
+
+- **Version**: `20260425-155443-d211e46` (`out/models/20260425-155443-d211e46/training_metrics.v2.json`).
+- **Data window**: 2026-01-01 to 2026-04-01; selected by `field_test_precision`.
+- **Test KPI**: AP 0.4521; field-test precision (prod-adjusted) 0.4990; precision@recall 1% is 0.7487 raw / 0.4906 prod-adjusted.
+- **Runtime**: `TRAINER_DEVICE_MODE=auto`, effective backend GPU for this run. Treat the bundle `training_metrics.v2.json` as the source of truth for complete metrics.
+
 ---
 
 ## Setup
@@ -368,6 +401,8 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 Copy `trainer/.env.example` to `trainer/.env` (or set env vars) for ClickHouse:
 
 - `CH_HOST`, `CH_TEAMDB_HOST`, `CH_PORT`, `CH_USER`, `CH_PASS`, `CH_SECURE`, `SOURCE_DB`
+
+**Training device**: Prefer `TRAINER_DEVICE_MODE=auto|cpu|gpu` to control Step 9 LightGBM and A3 bakeoff scheduling consistently. The legacy `--lgbm-device cpu|gpu` flag still works for one-off LightGBM overrides, but is deprecated.
 
 **MLflow (GCP Cloud Run) — Option A**  
 To log runs and artifacts to MLflow on GCP Cloud Run, create **`local_state/mlflow.env`** (or put the file under **`credential/mlflow.env`**; both directories are gitignored). Add two lines:
@@ -401,15 +436,10 @@ Step 3 writes `data/canonical_mapping.parquet` and `data/canonical_mapping.cutof
 From project root:
 
 ```bash
-# Default: ClickHouse, full window (configurable via --start / --end)
-python -m trainer.trainer
-
-# Local Parquet, last 3 months only (debug)
-python -m trainer.trainer --use-local-parquet --recent-chunks 3
-
-# Skip Optuna (use default hyperparameters)
-python -m trainer.trainer --skip-optuna --use-local-parquet
+python -m trainer.trainer --use-local-parquet --days 365
 ```
+
+Training, evaluation, and serving use the same lookback window (`SCORER_LOOKBACK_HOURS`, default 8h) to preserve train–serve parity.
 
 ### Low-RAM / subset training
 
@@ -497,6 +527,10 @@ Copy `deploy_dist/` (or the zip) to the target machine, then `pip install -r req
 | `--no-preload` | Disable full-table session Parquet preload during profile backfill; use per-snapshot PyArrow pushdown reads instead. Default (flag absent) is to preload the full session table once. Recommended for ≤8 GB RAM to avoid OOM at the cost of slower backfill. |
 | `--sample-rated N` | Use only N canonical_ids (first N by lexicographic order). Default: no sampling (all rated). |
 | `--rebuild-canonical-mapping` | Force rebuild canonical mapping from scratch; do not load existing `data/canonical_mapping.parquet`; write after build. Use when mapping is corrupted/expired or after schema changes. |
+| `--lgbm-device cpu|gpu` | Deprecated: override LightGBM device only for this run; prefer `TRAINER_DEVICE_MODE=auto|cpu|gpu`. |
+| `--ranking-recipe {baseline,r2_top_band_light,r2_hnm_light,r2_combined_light}` | Precision uplift A2/R2 rated-only sample-weight recipe; when omitted, reads `PRECISION_UPLIFT_RANKING_RECIPE`, then falls back to `r2_top_band_light`. |
+| `--no-gbm-bakeoff` | Disable the default A3/R3 LightGBM / CatBoost / XGBoost bakeoff and keep only the main LightGBM path. |
+| `--disable-oof-stacking` | Disable the OOF stacked logistic challenger inside A3 bakeoff. |
 
 ---
 
@@ -561,10 +595,13 @@ Under `trainer/models/`:
 - `feature_spec.yaml` — Frozen feature spec snapshot (DEC-024) written at training time; scorer loads this first for train–serve consistency
 - `reason_code_map.json` — Feature-to-reason-code mapping for SHAP
 - `model_version` — Version string (e.g. `20260228-153000-abc1234`)
-- `training_metrics.json` — Rated metrics only; flags such as `uncalibrated_threshold`, `sample_rated_n`
-- `pipeline_diagnostics.json` — Written on successful training: pipeline/step timings, `step7_rss_*`, OOM precheck vs observed (`oom_precheck_step7_rss_error_ratio`), etc.; **separate** from model metrics in `training_metrics.json`
+- `training_metrics.json` — Legacy v1 metrics for transitional consumers
+- `training_metrics.v2.json` — v2 primary metrics: datasets, selection summary, and field-test precision
+- `feature_importance.json` — Winner feature importance, split out of the v2 metrics file
+- `comparison_metrics.json` — GBM bakeoff / comparison-family details, split out of the v2 metrics file
+- `pipeline_diagnostics.json` — Written on successful training: pipeline/step timings, `step7_rss_*`, OOM precheck vs observed (`oom_precheck_step7_rss_error_ratio`), etc.; **separate** from model metrics files
 
-**Deploy / MLflow**: `python -m package.build_deploy_package` copies `pipeline_diagnostics.json` into the package `models/` when present (missing file → warning only). With tracking enabled and an active run, small files may also appear under the run’s **Artifacts** with the **`bundle/`** prefix (best-effort). See `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` and `doc/phase2_provenance_schema.md`.
+**Deploy / MLflow**: `python -m package.build_deploy_package` copies bundle files into the package `models/`, including `training_metrics.json`, `training_metrics.v2.json`, `feature_importance.json`, `comparison_metrics.json`, and `pipeline_diagnostics.json` (missing files → warning only). With tracking enabled and an active run, small files may also appear under the run’s **Artifacts** with the **`bundle/`** prefix (best-effort). See `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` and `doc/phase2_provenance_schema.md`.
 
 **DEC-040**: Serving and backtesting load **`model.pkl` only** (no `rated_model.pkl` or `walkaway_model.pkl` fallback). The trainer does not emit `walkaway_model.pkl`. After each successful run, stale `nonrated_model.pkl`, `rated_model.pkl`, and `walkaway_model.pkl` are removed from the bundle directory when present.
 
