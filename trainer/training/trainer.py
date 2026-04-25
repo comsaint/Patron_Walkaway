@@ -81,9 +81,9 @@ from trainer.training.field_test_objective_precondition import (
     try_load_precondition_json,
 )
 from trainer.training.ranking_recipe_weights import (
-    RANKING_RECIPE_BASELINE,
     RANKING_RECIPE_COMBINED,
     RANKING_RECIPE_HNM,
+    apply_ranking_recipe_pre_optuna_weights,
     build_final_ranking_weights_from_libsvm_proxy,
     build_final_ranking_weights_in_memory,
     invalidate_lgb_binary_cache_for_libsvm,
@@ -1777,6 +1777,7 @@ def _chunk_prefeatures_sidecar_path(chunk: dict) -> Path:
 
 # Sentinel in ``feature_spec_hash`` slot for R6 pre-LLM stage keys (not a real spec hash).
 _CHUNK_PREFEATURES_SPEC_PLACEHOLDER = "__pre_llm__"
+_CHUNK_FINAL_SCHEMA_VERSION = "llmmerge2"
 
 
 def _prefeatures_cache_components(components: dict) -> dict:
@@ -2067,13 +2068,16 @@ def _chunk_cache_components(
         "TRACK_HUMAN_LOOKBACK_HOURS": _effective_lookback,
     }, sort_keys=True)
     cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:6]
+    feature_spec_cache_hash = str(feature_spec_hash)
+    if feature_spec_cache_hash != _CHUNK_PREFEATURES_SPEC_PLACEHOLDER:
+        feature_spec_cache_hash = f"{feature_spec_cache_hash}:{_CHUNK_FINAL_SCHEMA_VERSION}"
     return {
         "window_start": ws,
         "window_end": we,
         "data_hash": data_hash,
         "cfg_hash": cfg_hash,
         "profile_hash": profile_hash,
-        "feature_spec_hash": feature_spec_hash,
+        "feature_spec_hash": feature_spec_cache_hash,
         "neg_sample_frac": float(neg_sample_frac),
     }
 
@@ -2614,7 +2618,7 @@ def process_chunk(
         ]
         _bets_llm_feature_cols = [
             fid for fid in _llm_cand_ids
-            if fid and fid in _bets_llm_result.columns
+            if fid and fid in _bets_llm_result.columns and fid not in bets.columns
         ]
         if _bets_llm_feature_cols and "bet_id" in _bets_llm_result.columns:
             bets = bets.merge(
@@ -7932,7 +7936,7 @@ def run_pipeline(args) -> None:
                     # Avoid prepared statement with list (Binder Error in some DuckDB builds).
                     paths_escaped = [p.replace("'", "''") for p in path_list]
                     paths_sql = ",".join(f"'{p}'" for p in paths_escaped)
-                    con.execute(f"SELECT count(*) AS n FROM read_parquet([{paths_sql}])")
+                    con.execute(f"SELECT count(*) AS n FROM read_parquet([{paths_sql}], union_by_name=true)")
                     _row = con.fetchone()
                     if _row is None:
                         raise ValueError("No rows in chunk Parquets")
@@ -7942,7 +7946,7 @@ def run_pipeline(args) -> None:
                     train_end_idx = int(n_rows * train_frac)
                     valid_end_idx = int(n_rows * (train_frac + valid_frac))
                     col_rows = con.execute(
-                        f"DESCRIBE SELECT * FROM read_parquet([{paths_sql}])"
+                        f"DESCRIBE SELECT * FROM read_parquet([{paths_sql}], union_by_name=true)"
                     ).fetchall()
                     available_cols = {str(r[0]) for r in col_rows}
                     order_cols: List[str] = ["payout_complete_dtm"]
@@ -7952,7 +7956,7 @@ def run_pipeline(args) -> None:
                         order_cols.append("bet_id")
                     order_sql = ", ".join(f"{c} NULLS LAST" for c in order_cols)
                     con.execute(
-                        f"CREATE TEMP VIEW sorted_bets AS SELECT *, ROW_NUMBER() OVER (ORDER BY {order_sql}) - 1 AS _rn FROM read_parquet([{paths_sql}])"
+                        f"CREATE TEMP VIEW sorted_bets AS SELECT *, ROW_NUMBER() OVER (ORDER BY {order_sql}) - 1 AS _rn FROM read_parquet([{paths_sql}], union_by_name=true)"
                     )
                     _tp = str(train_path).replace("'", "''")
                     _vp = str(valid_path).replace("'", "''")

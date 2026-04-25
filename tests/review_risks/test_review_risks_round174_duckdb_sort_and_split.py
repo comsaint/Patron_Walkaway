@@ -173,6 +173,7 @@ class TestR174ReadParquetListContract(unittest.TestCase):
         self.assertIn("path_list = [str(p) for p in chunk_paths]", body)
         # Contract: read_parquet receives list of paths (inline [paths_sql] or similar), not prepared (?) with [path_list].
         self.assertIn("read_parquet([", body)
+        self.assertIn("union_by_name=true", body)
 
 
 class TestR174DocstringTempDir(unittest.TestCase):

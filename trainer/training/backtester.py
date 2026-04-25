@@ -954,7 +954,7 @@ def backtest(
         _llm_cand_ids = [c.get("feature_id") for c in _candidates]
         _bets_llm_feature_cols = [
             fid for fid in _llm_cand_ids
-            if fid and fid in _bets_llm_result.columns
+            if fid and fid in _bets_llm_result.columns and fid not in bets.columns
         ]
         if _bets_llm_feature_cols and "bet_id" in _bets_llm_result.columns:
             bets = bets.merge(
