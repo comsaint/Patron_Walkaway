@@ -146,11 +146,12 @@ TABLE_HC_WINDOW_MIN = 30
 PLACEHOLDER_PLAYER_ID = -1
 UNRATED_VOLUME_LOG = True
 
+# A4 two-stage (R4): default on; set A4_TWO_STAGE_ENABLE_TRAINING=0 / A4_TWO_STAGE_ENABLE_INFERENCE=0 to disable.
 A4_TWO_STAGE_ENABLE_TRAINING = os.getenv(
-    "A4_TWO_STAGE_ENABLE_TRAINING", "0"
+    "A4_TWO_STAGE_ENABLE_TRAINING", "1"
 ).strip().lower() in ("1", "true", "t", "yes", "y")
 A4_TWO_STAGE_ENABLE_INFERENCE = os.getenv(
-    "A4_TWO_STAGE_ENABLE_INFERENCE", "0"
+    "A4_TWO_STAGE_ENABLE_INFERENCE", "1"
 ).strip().lower() in ("1", "true", "t", "yes", "y")
 _A4_TWO_STAGE_FUSION_MODE_RAW = (
     (os.getenv("A4_TWO_STAGE_FUSION_MODE") or "product").strip().lower() or "product"
