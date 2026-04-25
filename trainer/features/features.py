@@ -30,12 +30,14 @@ aggregations are not contaminated by NaN propagation.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -106,20 +108,45 @@ def _datetime_to_ns_int64(series: pd.Series) -> np.ndarray:
 #: Phase 2 additions (wager_mean_180d, wager_p50_180d from t_bet) are not
 #: included here.  See doc/player_profile_spec.md §14.
 
-# Deploy: prefer MODEL_DIR/feature_spec.yaml when present (frozen train–serve spec).
-# If MODEL_DIR is set but that file is missing (e.g. local .env + empty out/models),
-# fall back to repo SSOT with a warning. When MODEL_DIR is unset, load repo SSOT only.
-_repo_candidates_yaml = pathlib.Path(__file__).resolve().parent.parent / "feature_spec" / "features_candidates.yaml"
-_model_dir_env = os.environ.get("MODEL_DIR")
-_deploy_yaml = pathlib.Path(_model_dir_env) / "feature_spec.yaml" if _model_dir_env else None
+# Deploy: prefer frozen feature_spec.yaml next to the resolved model bundle (versioned
+# ``out/models/<model_version>/`` per save_artifact_bundle) or legacy flat
+# ``MODEL_DIR/feature_spec.yaml``. If MODEL_DIR is set but no frozen file is found,
+# fall back to repo SSOT with a warning. When MODEL_DIR is unset (or whitespace-only),
+# load repo SSOT only (align MODEL_DIR empties with trainer/serving/scorer.py).
 
-if _deploy_yaml is not None and _deploy_yaml.is_file():
+
+def _resolve_frozen_feature_spec_yaml(versions_root: pathlib.Path) -> Optional[pathlib.Path]:
+    """Resolve ``feature_spec.yaml``: legacy flat under *versions_root*, then bundled path."""
+    legacy = versions_root / "feature_spec.yaml"
+    if legacy.is_file():
+        return legacy
+    try:
+        from trainer.core.model_bundle_paths import resolve_model_bundle_dir
+
+        bundle = resolve_model_bundle_dir(versions_root)
+    except (FileNotFoundError, ValueError):
+        return None
+    cand = bundle / "feature_spec.yaml"
+    return cand if cand.is_file() else None
+
+
+_repo_candidates_yaml = pathlib.Path(__file__).resolve().parent.parent / "feature_spec" / "features_candidates.yaml"
+_raw_model_dir = os.environ.get("MODEL_DIR")
+_model_dir_stripped = _raw_model_dir.strip() if (_raw_model_dir and _raw_model_dir.strip()) else None
+
+_deploy_yaml: Optional[pathlib.Path] = None
+if _model_dir_stripped is not None:
+    _deploy_yaml = _resolve_frozen_feature_spec_yaml(pathlib.Path(_model_dir_stripped))
+
+if _deploy_yaml is not None:
     _yaml_path = _deploy_yaml
-elif _deploy_yaml is not None:
+elif _model_dir_stripped is not None:
     logger.warning(
-        "MODEL_DIR is set but feature spec not found at %s — loading repo candidates from %s. "
-        "For strict deploy, include feature_spec.yaml under MODEL_DIR.",
-        _deploy_yaml,
+        "MODEL_DIR is set but feature spec not found under %s (tried legacy %s and the "
+        "resolved versioned bundle). Loading repo candidates from %s. For strict deploy, "
+        "place feature_spec.yaml in the active bundle (e.g. out/models/<version>/).",
+        _model_dir_stripped,
+        pathlib.Path(_model_dir_stripped) / "feature_spec.yaml",
         _repo_candidates_yaml,
     )
     _yaml_path = _repo_candidates_yaml
@@ -2025,6 +2052,294 @@ def _topo_sort_candidates(candidates: list) -> list:
     return result
 
 
+# --- Track LLM DuckDB batching + OOM fallback (DEC: compute peak reduction) ---
+# Max window-ish features per DuckDB SELECT to cap materialized frame width.
+_TRACK_LLM_MAX_WINDOWISH_PER_BATCH = 8
+
+# Hash buckets for OOM fallback (partition by canonical_id only).
+_TRACK_LLM_HASH_BUCKETS_STAGES: Sequence[int] = (4, 8, 16)
+
+
+def _llm_is_windowish_candidate(cand: dict) -> bool:
+    """True if this candidate belongs in a window-style batched SELECT."""
+    ftype = cand.get("type", "window")
+    expr = cand.get("expression") or ""
+    if ftype in ("window", "transform", "lag", "passthrough"):
+        return True
+    if ftype == "derived" and re.search(r"\bOVER\s*\(", expr, re.IGNORECASE):
+        return True
+    return False
+
+
+def _llm_build_track_llm_batches(candidates: list) -> list[list[dict]]:
+    """Split topologically sorted candidates into DuckDB batches."""
+    out: list[list[dict]] = []
+    n = len(candidates)
+    i = 0
+    while i < n:
+        c0 = candidates[i]
+        if _llm_is_windowish_candidate(c0):
+            chunk = [c0]
+            i += 1
+            while (
+                i < n
+                and len(chunk) < _TRACK_LLM_MAX_WINDOWISH_PER_BATCH
+                and _llm_is_windowish_candidate(candidates[i])
+            ):
+                chunk.append(candidates[i])
+                i += 1
+            out.append(chunk)
+        else:
+            out.append([c0])
+            i += 1
+    return out
+
+
+def _llm_one_select_item(cand: dict, range_sort_col: str) -> str:
+    """Build one ``expr AS \"feature_id\"`` column for Track LLM DuckDB SQL."""
+    fid = cand["feature_id"]
+    expr = cand.get("expression", "")
+    ftype = cand.get("type", "window")
+    wf = cand.get("window_frame", "")
+
+    if ftype in ("window", "transform", "lag"):
+        if wf:
+            if wf.upper().startswith("RANGE"):
+                range_order = f'ORDER BY "{range_sort_col}" ASC'
+                return (
+                    f"{expr} OVER ("
+                    f"PARTITION BY canonical_id "
+                    f"{range_order} "
+                    f"{wf}"
+                    f') AS "{fid}"'
+                )
+            return (
+                f"{expr} OVER ("
+                f"PARTITION BY canonical_id "
+                f"ORDER BY payout_complete_dtm ASC, bet_id ASC "
+                f"{wf}"
+                f') AS "{fid}"'
+            )
+        return (
+            f"{expr} OVER ("
+            f"PARTITION BY canonical_id "
+            f"ORDER BY payout_complete_dtm ASC, bet_id ASC"
+            f') AS "{fid}"'
+        )
+    if ftype == "passthrough":
+        return f'"{fid}" AS "{fid}"'
+    # derived: may reference prior window columns or embed OVER (LAG, etc.)
+    return f'({expr}) AS "{fid}"'
+
+
+def _llm_build_sql_for_batch(batch: list[dict], range_sort_col: str) -> str:
+    select_exprs = ['"_orig_idx"', '"canonical_id"']
+    for cand in batch:
+        select_exprs.append(_llm_one_select_item(cand, range_sort_col))
+    select_clause = ",\n    ".join(select_exprs)
+    return (
+        f"SELECT\n    {select_clause}\n"
+        f"FROM bets\n"
+        f"ORDER BY canonical_id, payout_complete_dtm, bet_id"
+    )
+
+
+def _llm_is_duckdb_oom(exc: BaseException) -> bool:
+    try:
+        import duckdb
+
+        return isinstance(exc, duckdb.OutOfMemoryException)
+    except Exception:  # pragma: no cover
+        msg = str(exc).lower()
+        return "out of memory" in msg and "duckdb" in type(exc).__module__.lower()
+
+
+def _llm_apply_postprocess_to_result_df(
+    result_df: pd.DataFrame,
+    batch: list[dict],
+) -> None:
+    """Fill/clip postprocess for candidate columns (mutates result_df)."""
+    for cand in batch:
+        fid = cand["feature_id"]
+        if fid not in result_df.columns:
+            continue
+        pp = cand.get("postprocess", {}) or {}
+        fill_spec = pp.get("fill", {}) or {}
+        clip_spec = pp.get("clip", {}) or {}
+        fill_strategy = fill_spec.get("strategy", "none")
+        if fill_strategy == "zero":
+            result_df[fid] = result_df[fid].fillna(0)
+        elif fill_strategy == "ffill":
+            result_df[fid] = result_df.groupby("canonical_id", sort=False)[fid].ffill()
+        if clip_spec:
+            lo = clip_spec.get("min")
+            hi = clip_spec.get("max")
+            result_df[fid] = result_df[fid].clip(lower=lo, upper=hi)
+
+
+def _llm_float32_numeric_columns(result_df: pd.DataFrame, batch: list[dict]) -> None:
+    for cand in batch:
+        fid = cand["feature_id"]
+        if fid not in result_df.columns:
+            continue
+        ser = result_df[fid]
+        if pd.api.types.is_numeric_dtype(ser):
+            result_df[fid] = ser.astype(np.float32)
+
+
+def _llm_run_duckdb_batch_query(
+    df_for_duckdb: pd.DataFrame,
+    sql: str,
+    policy: dict[str, Any],
+) -> pd.DataFrame:
+    import duckdb
+
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime(con, policy)
+        con.register("bets", df_for_duckdb)
+        return con.execute(sql).df()
+    finally:
+        con.close()
+
+
+def _llm_merge_batch_output_to_working(
+    df_work: pd.DataFrame,
+    out_df: pd.DataFrame,
+    batch: list[dict],
+    range_sort_col: str,
+) -> None:
+    """Attach new feature columns to df_work by ``_orig_idx`` (sorted working frame)."""
+    out_df = out_df.drop(columns=[range_sort_col], errors="ignore")
+    fids = [c["feature_id"] for c in batch]
+    m_idx = out_df.set_index("_orig_idx")[fids]
+    for fid in fids:
+        df_work[fid] = m_idx.reindex(df_work["_orig_idx"])[fid].values
+
+
+def _llm_scatter_batch_to_result(
+    result: pd.DataFrame,
+    out_df: pd.DataFrame,
+    batch: list[dict],
+) -> None:
+    """Write feature values into *result* (unsorted, original row order) by ``_orig_idx``."""
+    fids = [c["feature_id"] for c in batch]
+    m_idx = out_df.set_index("_orig_idx")[fids]
+    for fid in fids:
+        result[fid] = m_idx.reindex(result.index)[fid].values
+
+
+def _llm_row_hash_fingerprint(canonical_id: str) -> int:
+    """32-bit int from md5 (stable) for fast bucket tests without re-hashing in inner loops."""
+    return int(hashlib.md5(str(canonical_id).encode("utf-8")).hexdigest()[:8], 16)
+
+
+def _llm_execute_batch_with_recovery(
+    df_work: pd.DataFrame,
+    batch: list[dict],
+    range_sort_col: str,
+    base_policy: dict[str, Any],
+    log_ctx: str,
+) -> pd.DataFrame:
+    """Run one batch: try normal policy, OOM->threads=1, OOM->split batch, OOM->hash buckets."""
+    sql = _llm_build_sql_for_batch(batch, range_sort_col)
+    last_oom: Optional[Exception] = None
+    try:
+        return _llm_run_duckdb_batch_query(df_work, sql, base_policy)
+    except Exception as exc:
+        if not _llm_is_duckdb_oom(exc):
+            logger.error(
+                "compute_track_llm_features: DuckDB query failed: %s\nSQL:\n%s",
+                exc,
+                sql,
+            )
+            raise
+        last_oom = exc
+        mem_gb = float(base_policy["memory_limit_bytes"]) / 1024**3
+        th = int(base_policy["threads"])
+        logger.warning(
+            "%s Track LLM DuckDB OOM — retry threads=1 (memory_limit=%.2fGB was threads=%d): %s",
+            log_ctx,
+            mem_gb,
+            th,
+            exc,
+        )
+    pol1 = {**base_policy, "threads": 1}
+    try:
+        return _llm_run_duckdb_batch_query(df_work, sql, pol1)
+    except Exception as exc2:
+        if not _llm_is_duckdb_oom(exc2):
+            logger.error(
+                "compute_track_llm_features: DuckDB query failed: %s\nSQL:\n%s",
+                exc2,
+                sql,
+            )
+            raise
+        last_oom = exc2
+
+    if len(batch) > 1:
+        mid = max(1, len(batch) // 2)
+        left, right = batch[:mid], batch[mid:]
+        logger.warning(
+            "%s Track LLM DuckDB OOM — splitting batch: %d -> %d + %d",
+            log_ctx,
+            len(batch),
+            len(left),
+            len(right),
+        )
+        out_l = _llm_execute_batch_with_recovery(
+            df_work, left, range_sort_col, base_policy, f"{log_ctx}[splitL]"
+        )
+        out_r = _llm_execute_batch_with_recovery(
+            df_work, right, range_sort_col, base_policy, f"{log_ctx}[splitR]"
+        )
+        return out_l.merge(out_r, on=["_orig_idx", "canonical_id"], how="outer")
+
+    cid = df_work["canonical_id"].astype(str)
+    n_total = len(df_work)
+    fp = np.fromiter(
+        (_llm_row_hash_fingerprint(c) for c in cid),
+        dtype=np.int64,
+        count=n_total,
+    )
+    sub_sql = _llm_build_sql_for_batch(batch, range_sort_col)
+    for n_b in _TRACK_LLM_HASH_BUCKETS_STAGES:
+        logger.warning(
+            "%s Track LLM DuckDB OOM — hash-bucket fallback (buckets=%d, rows=%d, features=1)",
+            log_ctx,
+            n_b,
+            n_total,
+        )
+        pol_b = {**base_policy, "threads": 1}
+        parts: list[pd.DataFrame] = []
+        ok = True
+        for b in range(n_b):
+            mask = (fp % np.int64(n_b)) == np.int64(b)
+            if not np.any(mask):
+                continue
+            sub = df_work.loc[mask].copy()
+            try:
+                parts.append(_llm_run_duckdb_batch_query(sub, sub_sql, pol_b))
+            except Exception as exc3:
+                if _llm_is_duckdb_oom(exc3):
+                    ok = False
+                    last_oom = exc3
+                    break
+                logger.error(
+                    "compute_track_llm_features: DuckDB query failed: %s\nSQL:\n%s",
+                    exc3,
+                    sub_sql,
+                )
+                raise
+        if ok and parts:
+            combined = pd.concat(parts, ignore_index=True)
+            want = ["_orig_idx", "canonical_id"] + [c["feature_id"] for c in batch]
+            return combined[want]
+    msg = f"{log_ctx} Track LLM DuckDB OOM: exhausted fallbacks (threads=1, split, hash buckets 4/8/16)"
+    logger.error("%s: %s", msg, last_oom)
+    raise RuntimeError(msg) from last_oom
+
+
 def compute_track_llm_features(
     bets_df: pd.DataFrame,
     feature_spec: dict,
@@ -2033,8 +2348,11 @@ def compute_track_llm_features(
     """Compute Track LLM features via DuckDB from a Feature Spec YAML definition.
 
     Only features listed under ``track_llm.candidates`` are computed.  Each
-    candidate is translated into a DuckDB window-function ``SELECT`` expression
-    and executed against an in-memory table built from ``bets_df``.
+    candidate is translated into DuckDB ``SELECT`` expressions (window, derived,
+    passthrough) and executed in **batches** against an in-memory table built
+    from ``bets_df`` to reduce peak memory.  On DuckDB OOM, the implementation
+    retries with ``threads=1``, optionally **splits** a large window batch, then
+    falls back to **hash buckets** on ``canonical_id`` (4, 8, 16).
 
     All window frames are strictly backward-looking (``PRECEDING`` / ``CURRENT
     ROW``); ``cutoff_time`` enforces an additional row-level leakage guard.
@@ -2068,8 +2386,6 @@ def compute_track_llm_features(
       postprocess to cut peak RAM on downstream ``merge`` / training paths.
     - DuckDB 1.x is required (``RANGE BETWEEN INTERVAL … PRECEDING`` syntax).
     """
-    import duckdb
-
     try:
         from trainer.duckdb_schema import prepare_bets_for_duckdb
     except ModuleNotFoundError:
@@ -2132,80 +2448,12 @@ def compute_track_llm_features(
         df.groupby("canonical_id", sort=False).cumcount(), unit="ns"
     )
 
-    # ── Build DuckDB window SELECT expressions ──────────────────────────────
-    # OOM reduction: DuckDB only materializes stable row positions and computed
-    # Track LLM outputs. Original passthrough columns are kept on ``result`` and
-    # never duplicated through ``con.execute(...).df()``.
-    select_exprs = [
-        '"_orig_idx"',
-        '"canonical_id"',
-    ]
-
-    for cand in candidates:
-        fid = cand["feature_id"]
-        expr = cand.get("expression", "")
-        ftype = cand.get("type", "window")
-        wf = cand.get("window_frame", "")
-
-        if ftype in ("window", "transform", "lag"):
-            if wf:
-                if wf.upper().startswith("RANGE"):
-                    # R2002: use synthetic G3 sort key; DuckDB requires single ORDER BY
-                    # for RANGE INTERVAL frames, but _RANGE_SORT_COL already encodes
-                    # the bet_id tie-breaker as a nanosecond offset.
-                    range_order = f'ORDER BY "{_RANGE_SORT_COL}" ASC'
-                    sql_expr = (
-                        f"{expr} OVER ("
-                        f"PARTITION BY canonical_id "
-                        f"{range_order} "
-                        f"{wf}"
-                        f') AS "{fid}"'
-                    )
-                else:
-                    sql_expr = (
-                        f"{expr} OVER ("
-                        f"PARTITION BY canonical_id "
-                        f"ORDER BY payout_complete_dtm ASC, bet_id ASC "
-                        f"{wf}"
-                        f') AS "{fid}"'
-                    )
-            else:
-                sql_expr = (
-                    f"{expr} OVER ("
-                    f"PARTITION BY canonical_id "
-                    f"ORDER BY payout_complete_dtm ASC, bet_id ASC"
-                    f') AS "{fid}"'
-                )
-        elif ftype == "passthrough":
-            # R112-1: raw column pass-through — select the column directly without
-            # any computation.  The column must already exist in bets_df so that
-            # DuckDB can resolve it from the registered "bets" table.
-            sql_expr = f'"{fid}" AS "{fid}"'
-        else:
-            # "derived": plain scalar expression; relies on lateral column
-            # references to window features already computed earlier in SELECT
-            # (topological order guaranteed by _topo_sort_candidates above).
-            sql_expr = f'({expr}) AS "{fid}"'
-
-        select_exprs.append(sql_expr)
-
-    select_clause = ",\n    ".join(select_exprs)
-    sql = (
-        f"SELECT\n    {select_clause}\n"
-        f"FROM bets\n"
-        f"ORDER BY canonical_id, payout_complete_dtm, bet_id"
-    )
-
-    # R2003: connection is always closed via finally, even when the query raises.
-    # Cast monetary columns to float64 so DuckDB sees DOUBLE and does not infer
-    # narrow DECIMAL(9,4)/(10,4), which fails for values like wager 100000 or
-    # casino_win -1900000 (schema/schema.txt uses Decimal(19,4)).
-    df_for_duckdb = prepare_bets_for_duckdb(df)
-    # Diagnostic: log dtype and type distribution for ORDER BY columns (str vs float).
+    # R2003 + batched queries: cast monetary columns for DuckDB; mutate sorted frame.
+    df_work = prepare_bets_for_duckdb(df)
     for col in ("canonical_id", "bet_id"):
-        if col in df_for_duckdb.columns:
-            dtype = df_for_duckdb[col].dtype
-            type_counts = df_for_duckdb[col].apply(type).value_counts().to_dict()
+        if col in df_work.columns:
+            dtype = df_work[col].dtype
+            type_counts = df_work[col].apply(type).value_counts().to_dict()
             type_counts_str = {k.__name__: int(v) for k, v in type_counts.items()}
             logger.debug(
                 "compute_track_llm_features: %s dtype=%s type_dist=%s",
@@ -2220,77 +2468,47 @@ def compute_track_llm_features(
         available_bytes = int(psutil.virtual_memory().available)
     except Exception:
         available_bytes = None
-    input_bytes = int(df_for_duckdb.memory_usage(deep=True).sum())
-    runtime_policy = resolve_duckdb_runtime_policy(
-        "track_llm",
-        available_bytes,
-        input_bytes=input_bytes,
-    )
-    con = duckdb.connect(database=":memory:")
-    try:
-        apply_duckdb_runtime(con, runtime_policy)
-        con.register("bets", df_for_duckdb)
-        result_df = con.execute(sql).df()
-    except Exception as exc:  # pragma: no cover
-        logger.error("compute_track_llm_features: DuckDB query failed: %s\nSQL:\n%s", exc, sql)
-        raise
-    finally:
-        con.close()
 
-    # Drop the internal synthetic sort key from the output.
-    result_df = result_df.drop(columns=[_RANGE_SORT_COL], errors="ignore")
-
-    # ── Postprocess: fill + clip ────────────────────────────────────────────
-    for cand in candidates:
-        fid = cand["feature_id"]
-        pp = cand.get("postprocess", {}) or {}
-        fill_spec = pp.get("fill", {}) or {}
-        clip_spec = pp.get("clip", {}) or {}
-
-        fill_strategy = fill_spec.get("strategy", "none")
-        if fid in result_df.columns:
-            if fill_strategy == "zero":
-                result_df[fid] = result_df[fid].fillna(0)
-            elif fill_strategy == "ffill":
-                # R2001: grouped ffill prevents cross-canonical_id data leakage.
-                result_df[fid] = (
-                    result_df.groupby("canonical_id", sort=False)[fid].ffill()
-                )
-
-            if clip_spec:
-                lo = clip_spec.get("min")
-                hi = clip_spec.get("max")
-                result_df[fid] = result_df[fid].clip(lower=lo, upper=hi)
-
-    # DEC-031: float32 for all candidate feature columns (numeric only).
-    for cand in candidates:
-        fid = cand["feature_id"]
-        if fid not in result_df.columns:
-            continue
-        ser = result_df[fid]
-        if pd.api.types.is_numeric_dtype(ser):
-            result_df[fid] = ser.astype(np.float32)
-
+    batches = _llm_build_track_llm_batches(candidates)
+    t_run = time.perf_counter()
+    for b_idx, batch in enumerate(batches):
+        t0 = time.perf_counter()
+        input_bytes = int(df_work.memory_usage(deep=True).sum())
+        runtime_policy = resolve_duckdb_runtime_policy(
+            "track_llm",
+            available_bytes,
+            input_bytes=input_bytes,
+        )
+        mem_lim_gb = float(runtime_policy["memory_limit_bytes"]) / 1024**3
+        n_threads = int(runtime_policy["threads"])
+        out_df = _llm_execute_batch_with_recovery(
+            df_work,
+            batch,
+            _RANGE_SORT_COL,
+            runtime_policy,
+            f"batch {b_idx + 1}/{len(batches)}",
+        )
+        out_df = out_df.drop(columns=[_RANGE_SORT_COL], errors="ignore")
+        _llm_apply_postprocess_to_result_df(out_df, batch)
+        _llm_float32_numeric_columns(out_df, batch)
+        _llm_merge_batch_output_to_working(df_work, out_df, batch, _RANGE_SORT_COL)
+        _llm_scatter_batch_to_result(result, out_df, batch)
+        logger.info(
+            "compute_track_llm_features: batch %d/%d  features=%d  rows=%d  "
+            "duckdb_mem_limit=%.2fGB threads=%d  (%.1fs)",
+            b_idx + 1,
+            len(batches),
+            len(batch),
+            len(df_work),
+            mem_lim_gb,
+            n_threads,
+            time.perf_counter() - t0,
+        )
     logger.debug(
-        "compute_track_llm_features: computed %d Track LLM features for %d bets",
+        "compute_track_llm_features: %d features in %d batches for %d bets (total %.1fs)",
         len(candidates),
+        len(batches),
         len(result),
+        time.perf_counter() - t_run,
     )
-
-    row_positions = result_df["_orig_idx"].to_numpy(dtype=np.int64, copy=False)
-    for cand in candidates:
-        fid = cand["feature_id"]
-        if fid not in result_df.columns:
-            continue
-        ser = result_df[fid]
-        if pd.api.types.is_numeric_dtype(ser):
-            fill_value = np.nan
-            dtype = ser.dtype
-            vals = np.full(len(result), fill_value, dtype=dtype)
-        else:
-            vals = np.empty(len(result), dtype=object)
-            vals[:] = None
-        vals[row_positions] = ser.to_numpy(copy=False)
-        result[fid] = vals
-
     return result

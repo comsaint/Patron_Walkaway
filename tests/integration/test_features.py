@@ -34,6 +34,7 @@ import pathlib
 import sys
 import unittest
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -557,6 +558,55 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
             np.float32,
             "DEC-031: empty-frame feature columns should use float32 dtype.",
         )
+
+    def test_windowish_candidates_split_into_batches_of_eight(self):
+        """Track LLM batches at most eight window-ish features per DuckDB SELECT."""
+        from trainer.features.features import _llm_build_track_llm_batches
+
+        cands = [
+            {
+                "feature_id": f"w{i}",
+                "type": "window",
+                "expression": "COUNT(bet_id)",
+                "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                "postprocess": {"fill": {"strategy": "zero"}},
+            }
+            for i in range(9)
+        ]
+        batches = _llm_build_track_llm_batches(cands)
+        self.assertEqual(len(batches), 2)
+        self.assertEqual(len(batches[0]), 8)
+        self.assertEqual(len(batches[1]), 1)
+
+    def test_duckdb_oom_first_call_retries_and_succeeds(self):
+        """First DuckDB OutOfMemory triggers threads=1 retry; second call succeeds."""
+        import duckdb
+
+        import trainer.features.features as fimpl
+
+        bets = self._make_bets([0, 10])
+        spec = self._minimal_spec([{
+            "feature_id": "cum_cnt",
+            "type": "window",
+            "expression": "COUNT(bet_id)",
+            "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+            "postprocess": {"fill": {"strategy": "zero"}},
+        }])
+        real_run = fimpl._llm_run_duckdb_batch_query
+        calls: list[int] = []
+
+        def _flaky(df: pd.DataFrame, sql: str, policy: dict) -> pd.DataFrame:
+            calls.append(1)
+            if len(calls) == 1:
+                raise duckdb.OutOfMemoryException("simulated OOM for test")
+            return real_run(df, sql, policy)
+
+        with patch.object(fimpl, "_llm_run_duckdb_batch_query", side_effect=_flaky):
+            result = compute_track_llm_features(bets, spec)
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("cum_cnt", result.columns)
+        self.assertEqual(int(result.iloc[1]["cum_cnt"]), 2)
 
 
 if __name__ == "__main__":

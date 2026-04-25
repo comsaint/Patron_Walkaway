@@ -24,17 +24,20 @@ if repo_root_str not in sys.path:
     sys.path.insert(0, repo_root_str)
 
 import trainer.features as features_mod  # noqa: E402
+import trainer.features.features as features_impl  # noqa: E402
 
 
 class TestRound112RiskGuards(unittest.TestCase):
     """Executable guards for R112-1 ~ R112-5."""
 
     def test_r112_1_passthrough_should_have_explicit_sql_branch(self):
-        """R112-1: compute_track_llm_features should explicitly handle passthrough."""
+        """R112-1: Track LLM SQL builder should explicitly handle passthrough."""
         src = inspect.getsource(features_mod.compute_track_llm_features)
+        src_one = inspect.getsource(features_impl._llm_one_select_item)
+        combined = src + src_one
         self.assertIn(
             'ftype == "passthrough"',
-            src,
+            combined,
             "Expected explicit passthrough branch instead of implicit derived fallback.",
         )
 
