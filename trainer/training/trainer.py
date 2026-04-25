@@ -368,11 +368,30 @@ except (TypeError, ValueError):
 if GBM_BAKEOFF_MAX_PARALLEL_BACKENDS < 0:
     GBM_BAKEOFF_MAX_PARALLEL_BACKENDS = 0
 
+_TRAINER_DEVICE_MODE_RAW = str(
+    getattr(
+        _cfg,
+        "TRAINER_DEVICE_MODE",
+        getattr(_core_trainer_config, "TRAINER_DEVICE_MODE", "auto"),
+    )
+).strip().lower()
+if _TRAINER_DEVICE_MODE_RAW not in ("auto", "cpu", "gpu"):
+    logger.warning(
+        "TRAINER_DEVICE_MODE=%r invalid (use auto, cpu, or gpu); using auto",
+        _TRAINER_DEVICE_MODE_RAW,
+    )
+    TRAINER_DEVICE_MODE: str = "auto"
+else:
+    TRAINER_DEVICE_MODE = _TRAINER_DEVICE_MODE_RAW
+
 # Effective device for this process: updated by configure_lightgbm_device_for_run() in run_pipeline.
 _EFFECTIVE_LIGHTGBM_DEVICE: str = LIGHTGBM_DEVICE_TYPE
 _LIGHTGBM_GPU_FALLBACK_USED: bool = False
 _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS: str = LIGHTGBM_DEVICE_TYPE
 _CLI_LIGHTGBM_DEVICE_OVERRIDE: Optional[str] = None
+_REQUESTED_TRAINER_DEVICE_MODE_FOR_METRICS: str = TRAINER_DEVICE_MODE
+_LAST_GBM_BACKEND_EFFECTIVE_DEVICE: str = "cpu"
+_GBM_BACKEND_GPU_FALLBACK_USED: bool = False
 
 try:
     _threshold_selection_mod = _import_module_threshold_selection(
@@ -3228,9 +3247,18 @@ def _lightgbm_gpu_probe_ok() -> bool:
 
 
 def configure_lightgbm_device_for_run(args: Any) -> None:
-    """Resolve CLI override, optional GPU probe, set effective device for this pipeline run."""
+    """Resolve ``TRAINER_DEVICE_MODE``, optional ``--lgbm-device`` override, and GPU probe."""
     global _EFFECTIVE_LIGHTGBM_DEVICE, _LIGHTGBM_GPU_FALLBACK_USED
     global _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS, _CLI_LIGHTGBM_DEVICE_OVERRIDE
+    global _REQUESTED_TRAINER_DEVICE_MODE_FOR_METRICS
+    global _LAST_GBM_BACKEND_EFFECTIVE_DEVICE, _GBM_BACKEND_GPU_FALLBACK_USED
+
+    unified_req = str(TRAINER_DEVICE_MODE).strip().lower()
+    if unified_req not in ("auto", "cpu", "gpu"):
+        unified_req = "auto"
+    _REQUESTED_TRAINER_DEVICE_MODE_FOR_METRICS = unified_req
+    _LAST_GBM_BACKEND_EFFECTIVE_DEVICE = "cpu"
+    _GBM_BACKEND_GPU_FALLBACK_USED = False
 
     raw = getattr(args, "lgbm_device", None)
     if raw is None or (isinstance(raw, str) and not str(raw).strip()):
@@ -3240,27 +3268,59 @@ def configure_lightgbm_device_for_run(args: Any) -> None:
         if s not in ("cpu", "gpu"):
             raise SystemExit("Invalid --lgbm-device %r; use cpu or gpu." % (raw,))
         _CLI_LIGHTGBM_DEVICE_OVERRIDE = s
+        logger.warning(
+            "--lgbm-device is deprecated and overrides LightGBM only for this run. "
+            "Prefer TRAINER_DEVICE_MODE=auto|cpu|gpu (unifies LightGBM + A3 CatBoost/XGBoost)."
+        )
 
-    req = _CLI_LIGHTGBM_DEVICE_OVERRIDE if _CLI_LIGHTGBM_DEVICE_OVERRIDE is not None else LIGHTGBM_DEVICE_TYPE
-    _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS = req
+    if _CLI_LIGHTGBM_DEVICE_OVERRIDE is not None:
+        lgb_intent = _CLI_LIGHTGBM_DEVICE_OVERRIDE
+    elif unified_req == "cpu":
+        lgb_intent = "cpu"
+    elif unified_req == "gpu":
+        lgb_intent = "gpu"
+    else:
+        lgb_intent = "gpu"
+
+    if _CLI_LIGHTGBM_DEVICE_OVERRIDE is not None:
+        _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS = _CLI_LIGHTGBM_DEVICE_OVERRIDE
+    elif unified_req == "auto":
+        _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS = "auto"
+    elif unified_req == "cpu":
+        _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS = "cpu"
+    else:
+        _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS = "gpu"
+
     _LIGHTGBM_GPU_FALLBACK_USED = False
 
-    if req == "cpu":
+    if lgb_intent == "cpu":
         _EFFECTIVE_LIGHTGBM_DEVICE = "cpu"
-        logger.info("LightGBM: effective device=cpu (requested)")
+        logger.info(
+            "Trainer device mode: requested=%s; LightGBM effective=cpu (CPU-only path).",
+            unified_req,
+        )
         return
 
     if _lightgbm_gpu_probe_ok():
         _EFFECTIVE_LIGHTGBM_DEVICE = "gpu"
-        logger.info("LightGBM: effective device=gpu (requested, probe ok)")
+        logger.info(
+            "Trainer device mode: requested=%s; LightGBM effective=gpu (OpenCL probe ok).",
+            unified_req,
+        )
         return
 
     _EFFECTIVE_LIGHTGBM_DEVICE = "cpu"
-    _LIGHTGBM_GPU_FALLBACK_USED = True
-    logger.warning(
-        "LightGBM: GPU requested but probe failed; using cpu for this run "
-        "(fix OpenCL/driver or pass --lgbm-device cpu / LIGHTGBM_DEVICE_TYPE=cpu)."
-    )
+    if unified_req == "gpu" or _CLI_LIGHTGBM_DEVICE_OVERRIDE == "gpu":
+        _LIGHTGBM_GPU_FALLBACK_USED = True
+        logger.warning(
+            "LightGBM: GPU requested but probe failed; using cpu for this run "
+            "(fix OpenCL/driver or set TRAINER_DEVICE_MODE=auto|cpu, or pass --lgbm-device cpu)."
+        )
+    else:
+        logger.info(
+            "Trainer device mode: requested=%s; LightGBM effective=cpu (GPU probe failed or unavailable).",
+            unified_req,
+        )
 
 
 def _lgb_params_for_pipeline() -> dict:
@@ -3385,16 +3445,24 @@ def _backend_runtime_manifest(
 
 def resolve_gbm_backend_runtime_plan() -> dict[str, Any]:
     """Plan bakeoff backend device allocation and safe parallelism."""
+    global _LAST_GBM_BACKEND_EFFECTIVE_DEVICE, _GBM_BACKEND_GPU_FALLBACK_USED
+
     visible_gpu_ids = discover_visible_gpu_ids()
-    requested_mode = GBM_BACKENDS_DEVICE_MODE
+    requested_mode = str(TRAINER_DEVICE_MODE).strip().lower()
+    if requested_mode not in ("auto", "cpu", "gpu"):
+        requested_mode = "auto"
+
     effective_mode = requested_mode
     if requested_mode == "auto":
         effective_mode = "gpu" if visible_gpu_ids else "cpu"
     elif requested_mode == "gpu" and not visible_gpu_ids:
         logger.warning(
-            "GBM backend GPU mode requested but no CUDA-visible GPUs were found; using cpu."
+            "TRAINER_DEVICE_MODE=gpu but no CUDA-visible GPUs were found for CatBoost/XGBoost; using cpu."
         )
         effective_mode = "cpu"
+
+    _GBM_BACKEND_GPU_FALLBACK_USED = bool(requested_mode == "gpu" and effective_mode == "cpu")
+    _LAST_GBM_BACKEND_EFFECTIVE_DEVICE = str(effective_mode)
 
     bakeoff_backends = ("catboost", "xgboost")
     backend_runtime_by_name: dict[str, dict[str, Any]] = {}
@@ -3416,8 +3484,10 @@ def resolve_gbm_backend_runtime_plan() -> dict[str, Any]:
     parallel_backend_workers = max_workers if effective_mode == "gpu" and max_workers > 1 else 1
     parallel_backend_execution = parallel_backend_workers > 1
     return {
+        "trainer_device_mode_requested": requested_mode,
         "requested_backend_device_mode": requested_mode,
         "effective_backend_device_mode": effective_mode,
+        "gbm_backend_gpu_fallback_used": bool(_GBM_BACKEND_GPU_FALLBACK_USED),
         "visible_gpu_ids": list(visible_gpu_ids),
         "gpu_assignments": dict(gpu_assignments),
         "backend_runtime_by_name": backend_runtime_by_name,
@@ -6479,6 +6549,17 @@ def train_single_rated_model(
     metrics["lightgbm_device_requested"] = _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS
     metrics["lightgbm_device_type"] = _EFFECTIVE_LIGHTGBM_DEVICE
     metrics["lightgbm_device_fallback"] = bool(_LIGHTGBM_GPU_FALLBACK_USED)
+    metrics["trainer_device_mode_requested"] = _REQUESTED_TRAINER_DEVICE_MODE_FOR_METRICS
+    _trainer_dev_eff = (
+        "gpu"
+        if (
+            str(_EFFECTIVE_LIGHTGBM_DEVICE).lower() == "gpu"
+            or str(_LAST_GBM_BACKEND_EFFECTIVE_DEVICE).lower() == "gpu"
+        )
+        else "cpu"
+    )
+    metrics["trainer_device_mode_effective"] = _trainer_dev_eff
+    metrics["gpu_fallback_used"] = bool(_LIGHTGBM_GPU_FALLBACK_USED or _GBM_BACKEND_GPU_FALLBACK_USED)
 
     if _optuna_hpo_manifest:
         metrics.update(_optuna_hpo_manifest[0])
@@ -6747,6 +6828,9 @@ def build_model_metadata_document(
             "threshold_min_alert_count": int(THRESHOLD_MIN_ALERT_COUNT),
             # A2 / DEC-044: echo rated training recipe (same key as training_metrics.json rated block).
             "ranking_recipe": _rated_d.get("ranking_recipe"),
+            "trainer_device_mode_requested": _rated_d.get("trainer_device_mode_requested"),
+            "trainer_device_mode_effective": _rated_d.get("trainer_device_mode_effective"),
+            "gpu_fallback_used": _rated_d.get("gpu_fallback_used"),
             "lightgbm_device_requested": _rated_d.get("lightgbm_device_requested"),
             "lightgbm_device_effective": _rated_d.get("lightgbm_device_type"),
             "lightgbm_device_fallback": _rated_d.get("lightgbm_device_fallback"),
@@ -8960,6 +9044,18 @@ def run_pipeline(args) -> None:
 
                 log_params_safe(
                     {
+                        "trainer_device_mode_requested": _REQUESTED_TRAINER_DEVICE_MODE_FOR_METRICS,
+                        "trainer_device_mode_effective": (
+                            "gpu"
+                            if (
+                                str(_EFFECTIVE_LIGHTGBM_DEVICE).lower() == "gpu"
+                                or str(_LAST_GBM_BACKEND_EFFECTIVE_DEVICE).lower() == "gpu"
+                            )
+                            else "cpu"
+                        ),
+                        "gpu_fallback_used": str(
+                            bool(_LIGHTGBM_GPU_FALLBACK_USED or _GBM_BACKEND_GPU_FALLBACK_USED)
+                        ),
                         "lightgbm_device_requested": _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS,
                         "lightgbm_device_effective": _EFFECTIVE_LIGHTGBM_DEVICE,
                         "lightgbm_device_fallback": str(bool(_LIGHTGBM_GPU_FALLBACK_USED)),

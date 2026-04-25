@@ -85,9 +85,9 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         default=None,
         metavar="cpu|gpu",
         help=(
-            "LightGBM training device for Step 9 (OpenCL GPU on Windows via device_type=gpu). "
-            "Overrides LIGHTGBM_DEVICE_TYPE env / config for this run only. "
-            "Default: use LIGHTGBM_DEVICE_TYPE (trainer.core.config, default cpu)."
+            "Deprecated: overrides LightGBM only for this run (logs a warning). "
+            "Prefer TRAINER_DEVICE_MODE=auto|cpu|gpu (trainer.core.config) to unify Step 9 LightGBM "
+            "and A3 CatBoost/XGBoost bakeoff scheduling. OpenCL GPU on Windows uses device_type=gpu."
         ),
     )
     parser.add_argument(

@@ -89,6 +89,28 @@ class TestLightgbmGpuPhaseAReviewRisksMRE(unittest.TestCase):
             "MRE: Linux CUDA users cannot select device_type=cuda via this env today.",
         )
 
+    def test_risk3b_env_lightgbm_cuda_infers_trainer_device_mode_auto_subprocess(self) -> None:
+        env = {**os.environ, "PYTHONPATH": str(_REPO_ROOT), "LIGHTGBM_DEVICE_TYPE": "cuda"}
+        cmd = [
+            sys.executable,
+            "-c",
+            "from trainer.core import config; print(config.TRAINER_DEVICE_MODE)",
+        ]
+        r = subprocess.run(
+            cmd,
+            cwd=str(_REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        self.assertEqual(
+            r.stdout.strip(),
+            "auto",
+            "MRE: invalid LIGHTGBM_DEVICE_TYPE does not force unified TRAINER_DEVICE_MODE to gpu.",
+        )
+
     # --- R4: hyperparams 可覆寫 pipeline 的 device_type ---
 
     def test_risk4_hyperparams_device_type_overrides_pipeline_effective_gpu(self) -> None:
@@ -140,6 +162,8 @@ class TestLightgbmGpuPhaseAReviewRisksMRE(unittest.TestCase):
         self.assertIn("_EFFECTIVE_LIGHTGBM_DEVICE", tr.__dict__)
         self.assertIn("_LIGHTGBM_GPU_FALLBACK_USED", tr.__dict__)
         self.assertIn("_REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS", tr.__dict__)
+        self.assertIn("_REQUESTED_TRAINER_DEVICE_MODE_FOR_METRICS", tr.__dict__)
+        self.assertIn("TRAINER_DEVICE_MODE", tr.__dict__)
 
     # --- R7: LIGHTGBM_GPU_N_JOBS 無上限 clamp ---
 

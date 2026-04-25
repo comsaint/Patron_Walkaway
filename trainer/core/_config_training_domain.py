@@ -62,6 +62,70 @@ else:
         Literal["auto", "cpu", "gpu"],
         _GBM_BACKENDS_DEVICE_MODE_RAW,
     )
+
+
+def _resolve_trainer_device_mode() -> Literal["auto", "cpu", "gpu"]:
+    """Unified trainer device intent: auto | cpu | gpu.
+
+    Precedence:
+    - ``TRAINER_DEVICE_MODE`` when set in the process environment (explicit user intent).
+    - Otherwise infer from legacy ``LIGHTGBM_DEVICE_TYPE`` / ``GBM_BACKENDS_DEVICE_MODE``
+      when those env vars are present (shim); default ``auto``.
+    """
+    explicit_raw = (os.getenv("TRAINER_DEVICE_MODE") or "").strip()
+    if explicit_raw:
+        ex = explicit_raw.lower()
+        if ex not in ("auto", "cpu", "gpu"):
+            _log.warning(
+                "TRAINER_DEVICE_MODE=%r invalid (use auto, cpu, or gpu); defaulting to auto",
+                explicit_raw,
+            )
+            resolved: Literal["auto", "cpu", "gpu"] = "auto"
+        else:
+            resolved = cast(Literal["auto", "cpu", "gpu"], ex)
+        if "LIGHTGBM_DEVICE_TYPE" in os.environ or "GBM_BACKENDS_DEVICE_MODE" in os.environ:
+            _log.warning(
+                "TRAINER_DEVICE_MODE is set; LIGHTGBM_DEVICE_TYPE and GBM_BACKENDS_DEVICE_MODE "
+                "are ignored for unified scheduling. Prefer TRAINER_DEVICE_MODE only."
+            )
+        return resolved
+
+    if "LIGHTGBM_DEVICE_TYPE" in os.environ:
+        raw_l = (os.getenv("LIGHTGBM_DEVICE_TYPE") or "").strip().lower()
+        if raw_l == "gpu":
+            _log.warning(
+                "TRAINER_DEVICE_MODE not set; inferred gpu from LIGHTGBM_DEVICE_TYPE=%r. "
+                "Prefer TRAINER_DEVICE_MODE=gpu.",
+                os.getenv("LIGHTGBM_DEVICE_TYPE"),
+            )
+            return "gpu"
+        if raw_l == "cpu":
+            _log.warning(
+                "TRAINER_DEVICE_MODE not set; inferred cpu from LIGHTGBM_DEVICE_TYPE=%r. "
+                "Prefer TRAINER_DEVICE_MODE=cpu.",
+                os.getenv("LIGHTGBM_DEVICE_TYPE"),
+            )
+            return "cpu"
+        if raw_l:
+            _log.warning(
+                "TRAINER_DEVICE_MODE not set; LIGHTGBM_DEVICE_TYPE=%r is not cpu/gpu; using auto",
+                os.getenv("LIGHTGBM_DEVICE_TYPE"),
+            )
+        return "auto"
+
+    if "GBM_BACKENDS_DEVICE_MODE" in os.environ:
+        _log.warning(
+            "TRAINER_DEVICE_MODE not set; inferred %r from GBM_BACKENDS_DEVICE_MODE. "
+            "Prefer TRAINER_DEVICE_MODE.",
+            GBM_BACKENDS_DEVICE_MODE,
+        )
+        return GBM_BACKENDS_DEVICE_MODE
+
+    return "auto"
+
+
+TRAINER_DEVICE_MODE: Literal["auto", "cpu", "gpu"] = _resolve_trainer_device_mode()
+
 _TRAINER_GPU_IDS_RAW = (os.getenv("TRAINER_GPU_IDS") or "").strip()
 TRAINER_GPU_IDS: Optional[str] = _TRAINER_GPU_IDS_RAW or None
 try:

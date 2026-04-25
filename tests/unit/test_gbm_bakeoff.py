@@ -438,7 +438,7 @@ def test_backend_optuna_params_include_fair_imbalance_and_catboost_search_dims()
 def test_resolve_gbm_backend_runtime_plan_cpu_only() -> None:
     with (
         patch.object(trainer_mod, "TRAINER_GPU_IDS", None),
-        patch.object(trainer_mod, "GBM_BACKENDS_DEVICE_MODE", "auto"),
+        patch.object(trainer_mod, "TRAINER_DEVICE_MODE", "auto"),
         patch.object(trainer_mod, "GBM_BAKEOFF_MAX_PARALLEL_BACKENDS", 0),
         patch("trainer.training.trainer.subprocess.run", side_effect=FileNotFoundError()),
     ):
@@ -453,10 +453,20 @@ def test_resolve_gbm_backend_runtime_plan_cpu_only() -> None:
     assert plan["backend_runtime_by_name"]["xgboost"]["device"] == "cpu"
 
 
+def test_resolve_gbm_backend_runtime_plan_gpu_fallback_when_no_visible_gpus() -> None:
+    with (
+        patch.object(trainer_mod, "TRAINER_DEVICE_MODE", "gpu"),
+        patch.object(trainer_mod, "discover_visible_gpu_ids", return_value=[]),
+    ):
+        plan = trainer_mod.resolve_gbm_backend_runtime_plan()
+    assert plan["effective_backend_device_mode"] == "cpu"
+    assert plan["gbm_backend_gpu_fallback_used"] is True
+
+
 def test_resolve_gbm_backend_runtime_plan_multi_gpu_parallelizes_backends() -> None:
     with (
         patch.object(trainer_mod, "TRAINER_GPU_IDS", "2,5"),
-        patch.object(trainer_mod, "GBM_BACKENDS_DEVICE_MODE", "auto"),
+        patch.object(trainer_mod, "TRAINER_DEVICE_MODE", "auto"),
         patch.object(trainer_mod, "GBM_BAKEOFF_MAX_PARALLEL_BACKENDS", 0),
     ):
         plan = trainer_mod.resolve_gbm_backend_runtime_plan()
