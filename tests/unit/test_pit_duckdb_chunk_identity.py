@@ -6,7 +6,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from trainer.training.trainer import attach_pit_identity_chunk_duckdb
+from trainer.training.trainer import (
+    _apply_cutoff_window_identity_fallback,
+    attach_pit_identity_chunk_duckdb,
+)
 
 
 def _write_session_parquet(path: Path) -> None:
@@ -77,3 +80,26 @@ def test_attach_pit_identity_chunk_duckdb_unrated_before_first_link(tmp_path: Pa
     )
     assert out.loc[0, "canonical_id"] == "10"
     assert bool(out.loc[0, "_pit_rated"]) is False
+
+
+def test_cutoff_fallback_drops_pit_columns_before_merge() -> None:
+    """Fallback merge should not create canonical_id_x/canonical_id_y columns."""
+    bets = pd.DataFrame(
+        {
+            "bet_id": [1, 2],
+            "player_id": [10, 99],
+            "canonical_id": ["cp_from_pit", "cp_from_pit_2"],
+            "_pit_rated": [True, False],
+        }
+    )
+    canonical_map = pd.DataFrame(
+        {
+            "player_id": [10],
+            "canonical_id": ["cp_cutoff"],
+        }
+    )
+    out = _apply_cutoff_window_identity_fallback(bets, canonical_map)
+    assert "canonical_id_x" not in out.columns
+    assert "canonical_id_y" not in out.columns
+    assert "_pit_rated" not in out.columns
+    assert out["canonical_id"].tolist() == ["cp_cutoff", "99"]

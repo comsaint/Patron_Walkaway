@@ -2696,6 +2696,25 @@ def _profile_hash_chunk_scoped(
     ).hexdigest()[:6]
 
 
+def _apply_cutoff_window_identity_fallback(
+    bets_df: pd.DataFrame,
+    canonical_map: pd.DataFrame,
+) -> pd.DataFrame:
+    """Apply cutoff-window identity mapping without ``canonical_id`` collisions."""
+    out = bets_df.drop(columns=["canonical_id", "_pit_rated"], errors="ignore").copy()
+    if not canonical_map.empty and "player_id" in canonical_map.columns:
+        out = out.merge(
+            canonical_map[["player_id", "canonical_id"]].drop_duplicates("player_id"),
+            on="player_id",
+            how="left",
+        )
+    else:
+        out["canonical_id"] = out["player_id"].astype(str)
+    out["canonical_id"] = out["canonical_id"].fillna(out["player_id"].astype(str))
+    out["canonical_id"] = out["canonical_id"].astype(str)
+    return out
+
+
 def process_chunk(
     chunk: dict,
     canonical_map: pd.DataFrame,
@@ -2892,21 +2911,12 @@ def process_chunk(
             )
             _use_pit = False
     if not _use_pit:
-        if not canonical_map.empty and "player_id" in canonical_map.columns:
-            bets = bets.merge(
-                canonical_map[["player_id", "canonical_id"]].drop_duplicates("player_id"),
-                on="player_id",
-                how="left",
-            )
-        else:
-            bets["canonical_id"] = bets["player_id"].astype(str)
-        bets["canonical_id"] = bets["canonical_id"].fillna(bets["player_id"].astype(str))
+        bets = _apply_cutoff_window_identity_fallback(bets, canonical_map)
         _rated_for_prune: set = (
             set(canonical_map["canonical_id"].astype(str).unique())
             if not canonical_map.empty and "canonical_id" in canonical_map.columns
             else set()
         )
-        bets["canonical_id"] = bets["canonical_id"].astype(str)
         if _rated_for_prune:
             _n_before_rated_prune = len(bets)
             bets = bets[bets["canonical_id"].isin(_rated_for_prune)].copy()
