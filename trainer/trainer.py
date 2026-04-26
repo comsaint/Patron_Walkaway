@@ -2,6 +2,16 @@
 import sys
 
 if __name__ == "__main__":
+    # Windows cp932 console can fail on MLflow emoji output at run termination.
+    # Use replacement on encode errors so training does not crash after success.
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(errors="replace")
+    except Exception:
+        pass
+
     from trainer.training.trainer_argparse import build_trainer_argparser
 
     _args = build_trainer_argparser().parse_args()

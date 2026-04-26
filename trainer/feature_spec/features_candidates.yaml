@@ -36,6 +36,7 @@ guardrails:
     - is_back_bet
     - position_idx
     - table_id
+    - game_id
 
 track_llm:
   name: "Track LLM"
@@ -553,6 +554,124 @@ track_human:
         fill: { strategy: "zero" }
         clip: { min: -1000000000.0, max: 1000000000.0 }
       reason_code_category: "LOSS_STREAK"
+
+    - feature_id: "table_hc"
+      type: "python_vectorized"
+      dtype: "int"
+      description: "同一 table_id 滾動視窗內不重複玩家數（head count；S1）"
+      function_name: "compute_table_hc_features"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "player_id"]
+      output_columns: ["table_hc"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 10000 }
+      screening_eligible: true
+      reason_code_category: "ENGAGEMENT"
+
+    # B2: ``t_game`` / table context (materialized in trainer/scorer when T_GAME_FEATURES_ENABLED=1).
+    - feature_id: "current_outcome_streak_len"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "同桌已結算局數中，上一局結果之連續長度（不含 VOID/UNRESOLVED；PIT 嚴格早於下注結算時間）"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["current_outcome_streak_len"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1000000.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "banker_rate_w20games"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "同桌最近 20 局已結算結果中 BANKER 比例（嚴格回看）"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["banker_rate_w20games"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "player_rate_w20games"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "同桌最近 20 局 PLAYER 比例"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["player_rate_w20games"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "tie_rate_w20games"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "同桌最近 20 局 TIE 比例"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["tie_rate_w20games"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "table_num_players"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "上一局已結算遊戲之 num_players（桌況壅擠度 proxy）"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["table_num_players"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 500.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "patron_is_sole_player"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "上一局 num_players 是否為 1（1/0）"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["patron_is_sole_player"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "table_turnover_w5m_over_w15m"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "同桌 total_turnover 於 (t-15m,t-5m] 與 (t-5m,t] 滾動和之比（winsorized）"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["table_turnover_w5m_over_w15m"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 10.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "table_net_outcome_w15m"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "同桌已結算 casino_win 於過去 15 分鐘滾動和（clip 極值）"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["table_net_outcome_w15m"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: -1e9, max: 1e9 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
 
     - feature_id: "run_duration_vs_personal_avg"
       type: "python_vectorized"

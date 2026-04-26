@@ -135,7 +135,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 | `--no-preload` | 關閉 profile backfill 時對 session Parquet 的「全表一次載入」，改為每 snapshot 日用 PyArrow pushdown 讀取。預設（不加此旗標）會完整載入整張 session 表格。適合 ≤8 GB RAM 機器，避免 OOM，代價是 backfill 速度較慢。 |
 | `--sample-rated N` | 僅使用 N 個評級客（canonical_id 字典序取前 N 個）。預設不抽樣（使用全部評級客）。 |
 | `--rebuild-canonical-mapping` | 強制從頭建 canonical mapping，不載入既有 `data/canonical_mapping.parquet`；建完後照常寫出。用於 mapping 損壞/過期或 schema 變更後重算。 |
-| `--lgbm-device cpu|gpu` | Deprecated：僅覆寫本次 LightGBM device；建議改用 `TRAINER_DEVICE_MODE=auto|cpu|gpu`。 |
+| `--lgbm-device cpu\|gpu` | Deprecated：僅覆寫本次 LightGBM device；建議改用 `TRAINER_DEVICE_MODE=auto|cpu|gpu`。 |
 | `--ranking-recipe {baseline,r2_top_band_light,r2_hnm_light,r2_combined_light}` | Precision uplift A2/R2 的 rated-only sample-weight recipe；未指定時讀 `PRECISION_UPLIFT_RANKING_RECIPE`，再 fallback 到 `r2_top_band_light`。 |
 | `--no-gbm-bakeoff` | 關閉預設 A3/R3 LightGBM / CatBoost / XGBoost bakeoff，只保留主要 LightGBM 路徑。 |
 | `--disable-oof-stacking` | 關閉 A3 bakeoff 中的 OOF stacked logistic challenger。 |

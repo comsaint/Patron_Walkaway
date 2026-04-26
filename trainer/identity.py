@@ -28,9 +28,9 @@ Design notes
   future identity links from leaking into training (B1).
 * FND-12 fake-account exclusion: player_ids with exactly 1 session and
   ≤1 game with wager are dropped from the mapping entirely.
-* D3 (known limitation): the mapping is built on the entire training window,
-  so early observations may "see" identity links that only arose later.
-  Phase 1 accepts this; Phase 2 should use PIT-correct mapping.
+* D3: ``cutoff_window`` mapping is built on the entire training window (legacy).
+  ``pit_asof`` uses :func:`merge_pit_canonical_to_bets` with per-bet
+  ``merge_asof`` on session link ``link_usable_time`` (Phase 2 / B3).
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ from datetime import datetime, timedelta
 from typing import Callable, Optional, Set
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 _HK_TZ = ZoneInfo("Asia/Hong_Kong")
@@ -183,6 +184,19 @@ def _clean_casino_player_id(series: pd.Series) -> pd.Series:
     return stripped.where(valid_mask, other=pd.NA)
 
 
+def _to_hk_naive_datetime64_ns(series: pd.Series) -> pd.Series:
+    """Normalize datetime-like values to HK-local tz-naive ``datetime64[ns]``.
+
+    Local Parquet and ClickHouse/DuckDB paths can disagree on both timezone
+    awareness and timestamp unit (``us`` vs ``ns``). ``merge_asof`` requires an
+    exact dtype match, while the pipeline interior expects HK tz-naive times.
+    """
+    ts = pd.to_datetime(series, errors="coerce")
+    if isinstance(ts.dtype, pd.DatetimeTZDtype):
+        ts = ts.dt.tz_convert(_HK_TZ).dt.tz_localize(None)
+    return ts.astype("datetime64[ns]")
+
+
 def _fnd01_dedup_pandas(sessions_df: pd.DataFrame) -> pd.DataFrame:
     """Replicate FND-01 ROW_NUMBER dedup in pandas.
 
@@ -304,6 +318,142 @@ def _apply_mn_resolution(
     # Exclude FND-12 dummy player_ids
     resolved = resolved[~resolved["player_id"].isin(dummy_player_ids)]
     return resolved.reset_index(drop=True)
+
+
+def build_pit_session_links_dataframe(
+    sessions_df: pd.DataFrame,
+    cutoff_dtm: datetime,
+    session_avail_delay_min: int,
+    placeholder_player_id: int,
+) -> pd.DataFrame:
+    """Build rated session edges with ``link_usable_time`` for PIT merge_asof (B3 / D3).
+
+    A session link becomes usable at
+    ``COALESCE(session_end_dtm, lud_dtm) + session_avail_delay_min``,
+    mirroring ``resolve_canonical_id`` H2 (session must have ended before the
+    observation minus ingest delay).
+
+    Parameters
+    ----------
+    sessions_df:
+        Raw ``t_session`` rows with columns required by ``build_canonical_mapping_from_df``.
+    cutoff_dtm:
+        Training window end; only sessions with business time ``<= cutoff_dtm`` are kept.
+    session_avail_delay_min:
+        Minutes after session business time before the link is observable.
+    placeholder_player_id:
+        Sentinel ``player_id`` excluded from links.
+
+    Returns
+    -------
+    DataFrame sorted by ``player_id``, ``link_usable_time``, ``lud_dtm`` with columns
+    ``player_id``, ``casino_player_id`` (cleaned str), ``lud_dtm``, ``link_usable_time``.
+    """
+    missing = _REQUIRED_SESSION_COLS - set(sessions_df.columns)
+    if missing:
+        raise ValueError(f"sessions_df is missing required columns: {sorted(missing)}")
+    deduped = _fnd01_dedup_pandas(sessions_df)
+    session_time = deduped["session_end_dtm"].fillna(deduped["lud_dtm"])
+    session_time = pd.to_datetime(session_time, errors="coerce")
+    cutoff_ts = pd.Timestamp(cutoff_dtm)
+    if hasattr(session_time, "dt"):
+        col_tz = session_time.dt.tz
+        if col_tz is not None and cutoff_ts.tz is None:
+            cutoff_ts = cutoff_ts.tz_localize(col_tz)
+        elif col_tz is None and cutoff_ts.tz is not None:
+            cutoff_ts = cutoff_ts.replace(tzinfo=None)
+    _turnover = pd.to_numeric(
+        deduped.get("turnover", pd.Series(0.0, index=deduped.index)),
+        errors="coerce",
+    ).fillna(0)
+    _games = deduped["num_games_with_wager"].fillna(0)
+    mask = (
+        (deduped["is_manual"] == 0)
+        & (deduped["is_deleted"] == 0)
+        & (deduped["is_canceled"] == 0)
+        & deduped["player_id"].notna()
+        & (deduped["player_id"] != placeholder_player_id)
+        & (session_time <= cutoff_ts)
+        & ((_turnover > 0) | (_games > 0))
+    )
+    filtered = deduped.loc[mask].copy()
+    cleaned_casino_player_id = _clean_casino_player_id(filtered["casino_player_id"])
+    rated_mask = cleaned_casino_player_id.notna()
+    out = filtered.loc[rated_mask, ["player_id", "lud_dtm"]].copy()
+    out["casino_player_id"] = cleaned_casino_player_id.loc[rated_mask].astype(str)
+    st = session_time.loc[rated_mask]
+    out["link_usable_time"] = st + pd.Timedelta(minutes=int(session_avail_delay_min))
+    out["lud_dtm"] = pd.to_datetime(out["lud_dtm"], errors="coerce")
+    out["link_usable_time"] = pd.to_datetime(out["link_usable_time"], errors="coerce")
+    return out.sort_values(
+        ["player_id", "link_usable_time", "lud_dtm"],
+        ascending=True,
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+def merge_pit_canonical_to_bets(
+    bets_df: pd.DataFrame,
+    links_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach ``canonical_id`` and ``_pit_rated`` via point-in-time ``merge_asof``.
+
+    Parameters
+    ----------
+    bets_df:
+        Must include ``player_id``, ``payout_complete_dtm``, ``bet_id``.
+    links_df:
+        Output of :func:`build_pit_session_links_dataframe` (non-empty).
+
+    Returns
+    -------
+    Copy of ``bets_df`` with ``canonical_id`` (str), ``_pit_rated`` (bool).
+    """
+    out = bets_df.copy()
+    if links_df is None or links_df.empty:
+        out["canonical_id"] = out["player_id"].astype(str)
+        out["_pit_rated"] = False
+        return out
+    req = {"player_id", "payout_complete_dtm", "bet_id"}
+    miss = req - set(out.columns)
+    if miss:
+        raise ValueError(f"bets_df missing columns for PIT merge: {sorted(miss)}")
+    # pandas merge_asof requires exact dtype match on time keys.
+    # DuckDB-derived links may be tz-aware and/or datetime64[us] while bets are ns.
+    out["payout_complete_dtm"] = _to_hk_naive_datetime64_ns(
+        out["payout_complete_dtm"]
+    )
+    lk = links_df[
+        ["player_id", "casino_player_id", "link_usable_time", "lud_dtm"]
+    ].rename(columns={"lud_dtm": "link_row_lud_dtm"})
+    lk["link_usable_time"] = _to_hk_naive_datetime64_ns(lk["link_usable_time"])
+    lk["link_row_lud_dtm"] = _to_hk_naive_datetime64_ns(lk["link_row_lud_dtm"])
+    work = out.assign(_pit_row=np.arange(len(out), dtype=np.int64))
+    work = work.sort_values(
+        ["payout_complete_dtm", "player_id", "bet_id"],
+        ascending=True,
+        kind="stable",
+    )
+    lk2 = lk.sort_values(
+        ["link_usable_time", "player_id", "link_row_lud_dtm"],
+        ascending=True,
+        kind="stable",
+    )
+    merged = pd.merge_asof(
+        work,
+        lk2,
+        left_on="payout_complete_dtm",
+        right_on="link_usable_time",
+        by="player_id",
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    merged = merged.sort_values("_pit_row", kind="stable")
+    cpid = merged["casino_player_id"]
+    canonical = cpid.where(cpid.notna(), merged["player_id"].astype(str)).astype(str)
+    out["canonical_id"] = canonical.to_numpy()
+    out["_pit_rated"] = cpid.notna().to_numpy()
+    return out
 
 
 # ---------------------------------------------------------------------------

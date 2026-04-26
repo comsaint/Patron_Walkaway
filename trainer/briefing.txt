@@ -1,7 +1,7 @@
 Copyright (2026) Eddy Dong
 ver 0.0.12
 
-Project: casino baccarat table game real-time walkaway (churn) risl predicton.
+Project: casino baccarat table game real-time walkaway (churn) risk predicton.
 
 Context:
 The casino gaming floor contains ~800 tables, each has 5 seats (id = 1,2,3,5,6). It opens 7x24. 

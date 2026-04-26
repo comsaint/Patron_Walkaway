@@ -191,3 +191,19 @@ try:
 except (TypeError, ValueError):
     OOF_STACKING_MAX_MONTHS = None
 
+# D3 Phase 2: pit_asof = merge_asof session→bet by link_usable_time; cutoff_window = legacy train_end map.
+_IDM_RAW = (os.getenv("IDENTITY_MAPPING_MODE") or "cutoff_window").strip().lower()
+if _IDM_RAW not in ("pit_asof", "cutoff_window"):
+    _log.warning(
+        "IDENTITY_MAPPING_MODE=%r invalid (use pit_asof or cutoff_window); using cutoff_window",
+        os.getenv("IDENTITY_MAPPING_MODE"),
+    )
+    IDENTITY_MAPPING_MODE: Literal["pit_asof", "cutoff_window"] = "cutoff_window"
+else:
+    IDENTITY_MAPPING_MODE = cast(Literal["pit_asof", "cutoff_window"], _IDM_RAW)
+
+# B2: join t_game Parquet features (DuckDB). Default off when Parquet absent (CI).
+T_GAME_FEATURES_ENABLED: bool = os.getenv(
+    "T_GAME_FEATURES_ENABLED", "1"
+).strip().lower() in ("1", "true", "t", "yes", "y")
+
