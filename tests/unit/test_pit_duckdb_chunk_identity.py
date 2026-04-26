@@ -82,6 +82,32 @@ def test_attach_pit_identity_chunk_duckdb_unrated_before_first_link(tmp_path: Pa
     assert bool(out.loc[0, "_pit_rated"]) is False
 
 
+def test_attach_pit_identity_chunk_duckdb_noncontiguous_index_writeback(tmp_path: Path) -> None:
+    """PIT writeback should use row positions, not index labels."""
+    sess_path = tmp_path / "t_session.parquet"
+    _write_session_parquet(sess_path)
+    bets = pd.DataFrame(
+        {
+            "bet_id": [3001, 3002],
+            "player_id": [10, 20],
+            "payout_complete_dtm": pd.to_datetime(
+                ["2026-01-01 11:50:00", "2026-01-01 10:00:00"]
+            ),
+        },
+        index=[100, 200],  # non-contiguous labels
+    )
+    out = attach_pit_identity_chunk_duckdb(
+        bets_df=bets,
+        session_parquet_path=sess_path,
+        observation_end=datetime(2026, 1, 1, 12, 0, 0),
+    )
+    # position 0 -> player 10 -> cp_new ; position 1 -> player 20 -> cp20
+    assert out.loc[100, "canonical_id"] == "cp_new"
+    assert out.loc[200, "canonical_id"] == "cp20"
+    assert out.loc[100, "_pit_rated"] is True or bool(out.loc[100, "_pit_rated"]) is True
+    assert out.loc[200, "_pit_rated"] is True or bool(out.loc[200, "_pit_rated"]) is True
+
+
 def test_cutoff_fallback_drops_pit_columns_before_merge() -> None:
     """Fallback merge should not create canonical_id_x/canonical_id_y columns."""
     bets = pd.DataFrame(

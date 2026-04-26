@@ -1020,8 +1020,23 @@ ORDER BY _pit_row
     _canon = _cpid.where(_cpid.notna(), _pid).astype(str).to_numpy()
     _rated = _cpid.notna().to_numpy()
     _row = out_df["_pit_row"].to_numpy(dtype=np.int64)
-    merged.loc[_row, "canonical_id"] = _canon
-    merged.loc[_row, "_pit_rated"] = _rated
+    # _pit_row is positional (0..N-1), so write back by position, not by index label.
+    _n = len(merged)
+    _ok = (_row >= 0) & (_row < _n)
+    if not np.all(_ok):
+        logger.warning(
+            "Chunk PIT identity DuckDB: dropped %d out-of-range _pit_row writebacks",
+            int((~_ok).sum()),
+        )
+    _row_pos = _row[_ok]
+    _canon_pos = _canon[_ok]
+    _rated_pos = _rated[_ok]
+    _canon_arr = merged["canonical_id"].to_numpy(copy=True)
+    _rated_arr = merged["_pit_rated"].to_numpy(copy=True)
+    _canon_arr[_row_pos] = _canon_pos
+    _rated_arr[_row_pos] = _rated_pos
+    merged["canonical_id"] = _canon_arr
+    merged["_pit_rated"] = _rated_arr
     return merged
 
 
