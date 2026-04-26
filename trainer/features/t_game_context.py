@@ -321,7 +321,7 @@ def join_t_game_features_for_bets(
             left_on="payout_complete_dtm",
             right_on="game_visible_dtm",
             direction="backward",
-            allow_exact_matches=True,
+            allow_exact_matches=False,
         )
         merged_parts.append(mg)
     merged = pd.concat(merged_parts, ignore_index=True).sort_values("_row", kind="stable")

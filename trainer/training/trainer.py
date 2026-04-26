@@ -981,6 +981,19 @@ ORDER BY _pit_row
         _apply_runtime = getattr(_cfg, "apply_duckdb_runtime", None)
         if callable(_apply_runtime):
             _apply_runtime(con, runtime_policy)
+        else:
+            _mem_bytes = int(runtime_policy.get("memory_limit_bytes", int(2 * 1024**3)))
+            _threads = int(runtime_policy.get("threads", 1))
+            _temp_dir = str(runtime_policy.get("temp_directory", str(DATA_DIR / "duckdb_tmp")))
+            _preserve = bool(runtime_policy.get("preserve_insertion_order", False))
+            _mem_gb = max(1.0, float(_mem_bytes) / (1024**3))
+            _temp_sql = _temp_dir.replace("'", "''")
+            con.execute(f"SET memory_limit = '{_mem_gb:.2f}GB'")
+            con.execute(f"SET threads = {max(1, _threads)}")
+            con.execute(f"SET temp_directory = '{_temp_sql}'")
+            con.execute(
+                f"SET preserve_insertion_order = {'true' if _preserve else 'false'}"
+            )
         con.register("bets_input", work)
         t0 = time.perf_counter()
         out_df = con.execute(sql).df()
@@ -3429,8 +3442,14 @@ def _export_parquet_to_libsvm(
                             x = 0.0
                         if x != 0.0:
                             parts.append(f"{i}:{x}")
-                    # Keep LibSVM dimensionality stable even when tail features are all-zero.
-                    parts.append(f"{nf - 1}:0")
+                    # Keep LibSVM dimensionality stable only when tail feature is effectively zero.
+                    _last = vals[-1] if nf > 0 else None
+                    try:
+                        _last_num = float(_last) if _last is not None else 0.0
+                    except (TypeError, ValueError):
+                        _last_num = 0.0
+                    if (not math.isfinite(_last_num)) or _last_num == 0.0:
+                        parts.append(f"{nf - 1}:0")
                     f_lib.write(" ".join(parts) + "\n")
                     f_w.write(f"{w}\n")
                     n_train += 1
@@ -3482,8 +3501,14 @@ def _export_parquet_to_libsvm(
                             x = 0.0
                         if x != 0.0:
                             parts.append(f"{i}:{x}")
-                    # Keep LibSVM dimensionality stable even when tail features are all-zero.
-                    parts.append(f"{nf - 1}:0")
+                    # Keep LibSVM dimensionality stable only when tail feature is effectively zero.
+                    _last = vals[-1] if nf > 0 else None
+                    try:
+                        _last_num = float(_last) if _last is not None else 0.0
+                    except (TypeError, ValueError):
+                        _last_num = 0.0
+                    if (not math.isfinite(_last_num)) or _last_num == 0.0:
+                        parts.append(f"{nf - 1}:0")
                     f_lib.write(" ".join(parts) + "\n")
                     n_valid += 1
         os.replace(valid_libsvm_tmp, valid_libsvm)
@@ -3525,8 +3550,14 @@ def _export_parquet_to_libsvm(
                                 x = 0.0
                             if x != 0.0:
                                 parts.append(f"{i}:{x}")
-                        # Keep LibSVM dimensionality stable even when tail features are all-zero.
-                        parts.append(f"{nf - 1}:0")
+                        # Keep LibSVM dimensionality stable only when tail feature is effectively zero.
+                        _last = vals[-1] if nf > 0 else None
+                        try:
+                            _last_num = float(_last) if _last is not None else 0.0
+                        except (TypeError, ValueError):
+                            _last_num = 0.0
+                        if (not math.isfinite(_last_num)) or _last_num == 0.0:
+                            parts.append(f"{nf - 1}:0")
                         f_lib.write(" ".join(parts) + "\n")
                         n_test += 1
             os.replace(test_libsvm_tmp, test_libsvm)
