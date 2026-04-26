@@ -4221,6 +4221,17 @@ def _backend_hpo_defaults(backend: str) -> dict[str, Any]:
     raise ValueError(f"Unsupported HPO backend: {backend}")
 
 
+def _sanitize_catboost_params_for_runtime(params: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop CatBoost options that are invalid for the selected runtime."""
+    out = dict(params)
+    task_type = str(out.get("task_type", "CPU")).strip().upper()
+    loss_function = str(out.get("loss_function", "")).strip().lower()
+    is_pairwise_loss = "pairwise" in loss_function
+    if task_type == "GPU" and not is_pairwise_loss:
+        out.pop("rsm", None)
+    return out
+
+
 def _balanced_binary_class_ratio(y: pd.Series) -> Optional[float]:
     """Return neg/pos ratio for strict binary labels; None when unavailable."""
     if y is None or len(y) == 0:
@@ -4406,6 +4417,7 @@ def _fit_backend_hpo_scores(
         from catboost import CatBoostClassifier
 
         fit_params = _apply_backend_imbalance_params(backend_n, params, y_tr)
+        fit_params = _sanitize_catboost_params_for_runtime(fit_params)
         model = CatBoostClassifier(**fit_params)
         if y_tr.nunique() < 2:
             model.fit(X_tr_fit, y_tr.astype(np.int32), sample_weight=sw_tr, verbose=False)
@@ -4819,7 +4831,17 @@ def run_backend_optuna_search(
         )
     finally:
         optuna_pbar.close()
-    best = study.best_params
+    best = _backend_hpo_defaults(backend_n)
+    best.update(dict(study.best_params))
+    if backend_n == "catboost" and runtime_manifest["backend_device_mode"] == "gpu":
+        best = _sanitize_catboost_params_for_runtime(
+            {
+                **best,
+                **dict(backend_runtime_params or {}),
+            }
+        )
+        for key in dict(backend_runtime_params or {}):
+            best.pop(key, None)
     try:
         final_best_ap = study.best_value
     except ValueError:

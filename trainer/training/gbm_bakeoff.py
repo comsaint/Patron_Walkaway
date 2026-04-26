@@ -214,6 +214,15 @@ def _to_float32_frame(X: pd.DataFrame) -> pd.DataFrame:
     return X.astype(np.float32, copy=False)
 
 
+def _preload_parallel_backend_imports(backends: Tuple[str, ...]) -> None:
+    """Import optional backends before worker threads start."""
+    for backend in backends:
+        try:
+            __import__(backend)
+        except ImportError as exc:
+            logger.warning("A3 gbm_bakeoff: %s preload failed (%s)", backend, exc)
+
+
 def _default_backend_hyperparams(backend: str) -> Dict[str, Any]:
     from trainer.training.trainer import _backend_hpo_defaults
 
@@ -233,7 +242,10 @@ def _train_catboost_backend(
     val_dec026_min_alerts_per_hour: Optional[float],
 ) -> Tuple[Any, Dict[str, Any]]:
     from catboost import CatBoostClassifier
-    from trainer.training.trainer import _apply_backend_imbalance_params
+    from trainer.training.trainer import (
+        _apply_backend_imbalance_params,
+        _sanitize_catboost_params_for_runtime,
+    )
 
     c_hp = dict(hp)
     if backend_runtime_params:
@@ -241,6 +253,7 @@ def _train_catboost_backend(
     iterations = int(c_hp.pop("iterations"))
     early = int(c_hp.pop("early_stopping_rounds"))
     c_hp = _apply_backend_imbalance_params("catboost", c_hp, y_train)
+    c_hp = _sanitize_catboost_params_for_runtime(c_hp)
     model = CatBoostClassifier(iterations=iterations, **c_hp)
     X_tr = _to_float32_frame(X_train)
     X_vl = _to_float32_frame(X_val)
@@ -730,6 +743,7 @@ def train_and_select_rated_gbm_family(
     )
     parallel_workers = int(backend_runtime_plan.get("parallel_backend_workers") or 1)
     if parallel_workers > 1:
+        _preload_parallel_backend_imports(("catboost", "xgboost"))
         with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
             futures = [
                 pool.submit(_run_backend_candidate, trainer_fn, backend)
