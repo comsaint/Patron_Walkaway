@@ -17,7 +17,9 @@
 | **🟡** | **部分**：有相關模組／註解／單點能力，但未達本節全文 DoD。 |
 | **⬜** | **未落地**：repo 內無對應實作，或僅存在於計畫／註解。 |
 
-**最後對照 repo 日期**：2026-04-23（以 `trainer/` 內 Python 與腳本為準；A2／A3 已再對照）。
+**最後對照 repo 日期**：2026-04-26（以 `trainer/` 內 Python 與腳本為準；本輪重核 B1／R7 與 §0 表內過時敘述）。
+
+**本輪修正**：B1 先前「`trainer.py` 無引用」已不符現況；`table_hc` 已在 Track Human 管線與 scorer 對稱計算，並見於 repo 候選 YAML（詳下表 B1）。
 
 | 區塊 | 代碼 | 工作項（摘要） | 狀態 | 已做摘要（本 repo 實際落地） | 主要程式依據 |
 | :--- | :--- | :--- | :---: | :--- | :--- |
@@ -25,7 +27,7 @@
 | A | **A2** | R2 排序導向 + HNM + top-band reweighting | **✅** | 四種 `--ranking-recipe`／環境變數 recipe；**預設**（CLI 與 env 皆未設）為 **`r2_top_band_light`**（DEC-044）；顯式 `--ranking-recipe baseline` 關閉 A2 風格加權；在 `compute_sample_weights` 之上對 rated 訓練列做 top-band／pseudo-HNM；`r2_hnm_light`／`combined` 於純 in-memory 路徑可多一次淺層 LGBM；`training_metrics` 與 **`model_metadata.json` → `training_params.ranking_recipe`** 寫入所用 recipe；Plan B CSV export 同步調權重；LibSVM 最終 on-disk 權重與 in-memory 可能不一致時 **WARNING**。 | `trainer/training/ranking_recipe_weights.py`；`--ranking-recipe`／`PRECISION_UPLIFT_RANKING_RECIPE`；`train_single_rated_model`／`train_dual_model`（rated）；shallow HNM 不適用 LibSVM／`train_from_file` 最終權重（見 log WARNING） |
 | A | **A3** | R3 LGBM / CatBoost / XGBoost / soft-vote bakeoff | **🟡** | **預設**於 `run_pipeline` 啟用 bakeoff（可用 `--no-gbm-bakeoff` 關閉）：LightGBM 主訓練仍可走 LibSVM / `train_from_file` 省 RAM 路徑，但 A3 會額外在**同一 rated feature matrix、同一時間切分、同一評估 helper** 下比較 **LightGBM / CatBoost / XGBoost**，並把三者 **equal-weight soft-vote** 視為**第 4 個候選**一起評估；`winner_backend` 以 **field-test objective** 為第一排序鍵。四個候選的 validation / test 指標已寫入 `training_metrics["rated"]["gbm_bakeoff"]` 與相關 metadata，供後續審閱；`model.pkl` 契約已升級可保存單模型或 soft-vote winner。**尚未**把多窗穩定性 guardrail 內建到 A3 自動選勝，因此狀態維持 🟡。 | `trainer/training/gbm_bakeoff.py`；`trainer/training/trainer.py`；`trainer/training/trainer_argparse.py`；`trainer/serving/scorer.py`；`trainer/training/backtester.py` |
 | A | **A4** | R4 二階段 Stage-1 + Stage-2 FP / reranker | **🟡** | 已落地 A4 MVP：Stage-1 先產生候選，Stage-2（LightGBM）僅在候選池訓練 FP detector，線上/離線以 **`product`** 融合（`p_final = p1 * p2`）；`model.pkl` 契約支援可選 `stage2_model` 與 `a4_*` metadata，並提供開關可回退 Stage-1 only。尚未完成進階 reranker 策略、多融合模式與大規模線上驗證。 | `trainer/training/trainer.py`（A4 訓練與 metrics）；`trainer/training/two_stage.py`；`trainer/serving/scorer.py`；`trainer/training/backtester.py`；`trainer/core/config.py` |
-| B | **B1** | R7 `table_hc` 訓練／serving 主路徑 | **🟡** | 已實作 `compute_table_hc` 函式；尚未併入 Step 9 特徵矩陣與 scorer 主路徑（文件仍註 deferred）。 | `trainer/features/features.py`：`compute_table_hc`；`trainer/training/trainer.py` 無引用；`trainer/serving/scorer.py` 註明 table_hc 延後 |
+| B | **B1** | R7 `table_hc` 訓練／serving 主路徑 | **🟡** | **`add_track_human_features`** 與 **`build_features_for_scoring`** 已對稱寫入 **`table_hc`**（同源 **`compute_table_hc`**，缺 `table_id`／`player_id` 等欄時為 0 並 WARNING）。**`trainer/feature_spec/features_candidates.yaml`** 已登記 **`table_hc`**（`screening_eligible: true`），可經 Step 5b screening 進 Step 9。**仍標 🟡**：模型是否實際吃到該欄取決於 screening／active 結果；**`package/deploy/models/feature_spec.yaml`** 範本之 `track_human.candidates` 尚未逐字含 `table_hc`，與「僅依 repo 候選預設訓練」路徑可能不一致，bundle 凍結 spec 時需留意。 | `trainer/training/trainer.py`：`add_track_human_features`；`trainer/serving/scorer.py`；`trainer/features/features.py`：`compute_table_hc`／`compute_table_hc_features`；`trainer/feature_spec/features_candidates.yaml` |
 | B | **B2** | R8 Track LLM／Human 候選擴張 | **🟡** | 候選 YAML + screening／訓練管線已存在；ROI 表所列「逐項擴張是否全完成」尚未在此檔逐欄核銷。 | `trainer/feature_spec/features_candidates.yaml` + screening 管線存在；本計畫所列「擴張清單是否全數入欄」未在此單次對照中逐欄核完 |
 | B | **B3** | R9 D3 PIT-correct identity mapping | **🟡** | 程式與註解已標示 D3／Phase 2 PIT 方向；預設仍為 cutoff／整窗 mapping，未切換為 PIT-correct 主路徑。 | `trainer/identity.py` 註明 Phase 2 PIT-correct；預設仍為整窗／cutoff mapping 路徑 |
 | B | **B4** | R11 Profile history-depth bundle | **⬜** | 尚未依 history depth／完整度分 bundle 並分流特徵或模型。 | 無依 history depth 分 bundle 之訓練／推論路由實作 |
@@ -180,11 +182,11 @@
 
 #### B1. R7 `table_hc` 與桌況特徵接線
 
-**Status（對照 repo）：🟡 部分**（函式存在；訓練主路徑與 scorer 尚未與 ROI #7 對齊）
+**Status（對照 repo）：🟡 部分**（Track Human／scorer 已對稱產出 `table_hc`；repo 候選 YAML 已註冊；**預設是否進最終欄位清單**與 **deploy 範本 spec 是否含候選** 仍待收斂）
 
 - 實作內容：
-  - 將 `compute_table_hc` 正式接入訓練與 serving 主路徑。
-  - 更新 feature spec 與必要的 screening。
+  - 將 `compute_table_hc` 正式接入訓練與 serving 主路徑（**已**：`add_track_human_features`／scorer 對稱路徑）。
+  - 更新 feature spec 與必要的 screening（**已**：`features_candidates.yaml`；**待**：deploy 範本與各 bundle 凍結 spec 與訓練預設一致化）。
 - DoD：
   - `trainer` / `scorer` 都能用同一欄位。
   - 無 train-serve parity 斷裂。
@@ -302,7 +304,7 @@
 ### T+0 ~ T+4 小時：主路徑先打通
 
 - A1 完成並確認 `trainer` 可直接跑 field-test objective。
-- B1 / B2 同時開工，把 `table_hc` 與第一批候選特徵接上。
+- B1 / B2 同時開工：`table_hc` 已進 Track Human／scorer 計算與 repo 候選 YAML；續追 screening 入選與 deploy／bundle spec 一致。
 - C1 建立多窗 orchestrator 骨架，先能吃 baseline。
 
 ### T+4 ~ T+12 小時：第一波高 ROI 全數進場
