@@ -86,6 +86,9 @@ try:
     SCORER_LOOKBACK_HOURS: int = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)
     A4_TWO_STAGE_ENABLE_INFERENCE: bool = bool(getattr(_cfg, "A4_TWO_STAGE_ENABLE_INFERENCE", False))
     A4_TWO_STAGE_CANDIDATE_MULTIPLIER: float = float(getattr(_cfg, "A4_TWO_STAGE_CANDIDATE_MULTIPLIER", 0.9))
+    FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR: float = float(
+        getattr(_cfg, "FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR", 50.0)
+    )
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
@@ -105,6 +108,7 @@ except ModuleNotFoundError:
     SCORER_LOOKBACK_HOURS = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)  # type: ignore[no-redef]
     A4_TWO_STAGE_ENABLE_INFERENCE = bool(getattr(_cfg, "A4_TWO_STAGE_ENABLE_INFERENCE", False))  # type: ignore[no-redef]
     A4_TWO_STAGE_CANDIDATE_MULTIPLIER = float(getattr(_cfg, "A4_TWO_STAGE_CANDIDATE_MULTIPLIER", 0.9))  # type: ignore[no-redef]
+    FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR = float(getattr(_cfg, "FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR", 50.0))  # type: ignore[no-redef]
 
 try:
     _threshold_selection_mod = _import_module_threshold_selection(
@@ -170,6 +174,15 @@ except ImportError:
 
 
 HK_TZ = ZoneInfo(HK_TZ_STR)
+
+
+def _field_test_min_alerts_per_hour_for_backtest_report() -> float:
+    """Sanitized field-test alert-density floor for JSON reporting (trainer Optuna alignment)."""
+    mf = float(FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR)
+    if not math.isfinite(mf) or mf <= 0.0:
+        return 50.0
+    return mf
+
 
 # Resolve to trainer/ so fallback feature_spec path is trainer/feature_spec/ (PLAN 2.2 move).
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -728,9 +741,21 @@ def _compute_section_metrics(
     nest; backtest_metrics.json model_default/optuna are flat).
     """
     rated_micro = compute_micro_metrics(rated_sub, threshold, window_hours)
+    _ft_mah = _field_test_min_alerts_per_hour_for_backtest_report()
+    _aph = rated_micro.get("alerts_per_hour")
+    _meets: Optional[bool] = None
+    if _aph is not None:
+        try:
+            _aph_f = float(_aph)
+        except (TypeError, ValueError):
+            _aph_f = float("nan")
+        if math.isfinite(_aph_f):
+            _meets = bool(_aph_f >= float(_ft_mah))
     out = {
         **rated_micro,
         "rated_threshold": threshold,
+        "min_alerts_per_hour_objective": float(_ft_mah),
+        "alerts_per_hour_meets_objective": _meets,
     }
     by_day = _build_pat_recall_1pct_series_from_gaming_day(rated_sub)
     if by_day is not None:
@@ -1083,6 +1108,7 @@ def backtest(
 
     results: dict = {
         **_run_contract,
+        "field_test_min_alerts_per_hour_objective": _field_test_min_alerts_per_hour_for_backtest_report(),
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
         "window_hours": window_hours,

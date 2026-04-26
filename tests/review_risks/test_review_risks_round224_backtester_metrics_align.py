@@ -59,8 +59,12 @@ _EXPECTED_FLAT_KEYS = frozenset({
     "alerts_per_minute_at_recall_0.1",
     "alerts_per_minute_at_recall_0.5",
 })
-# Section = flat metrics + rated_threshold (Round 226 Review #2: no extra keys).
-_EXPECTED_SECTION_KEYS = _EXPECTED_FLAT_KEYS | {"rated_threshold"}
+# Section = flat metrics + rated_threshold + field-test alert-density audit (alerts/h plan).
+_EXPECTED_SECTION_KEYS = _EXPECTED_FLAT_KEYS | {
+    "rated_threshold",
+    "min_alerts_per_hour_objective",
+    "alerts_per_hour_meets_objective",
+}
 
 
 class TestR224_1_EmptyRatedSubFlatKeys(unittest.TestCase):
@@ -248,6 +252,11 @@ class TestR224_5_SectionThresholdKeysContract(unittest.TestCase):
             out.get("alerts_per_hour"),
             "alerts_per_hour must be None when window_hours is None.",
         )
+        self.assertIsNone(
+            out.get("alerts_per_hour_meets_objective"),
+            "Cannot judge 50/h objective without alerts_per_hour.",
+        )
+        self.assertGreater(float(out["min_alerts_per_hour_objective"]), 0.0)
 
 
 if __name__ == "__main__":

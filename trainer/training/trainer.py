@@ -3967,8 +3967,8 @@ def _base_lgb_params() -> dict:
     return _lgb_params_for_pipeline()
 
 
-def _val_window_hours_from_payout_df(df: Optional[pd.DataFrame]) -> Optional[float]:
-    """Validation span in hours from ``payout_complete_dtm`` (for alerts/hour in HPO).
+def _split_window_hours_from_payout_df(df: Optional[pd.DataFrame]) -> Optional[float]:
+    """Time span in hours from ``payout_complete_dtm`` min/max on a split (train/val/test).
 
     Returns ``None`` when the column is missing, rows are insufficient, or span is non-positive.
     """
@@ -3986,6 +3986,89 @@ def _val_window_hours_from_payout_df(df: Optional[pd.DataFrame]) -> Optional[flo
     if not math.isfinite(span_sec) or span_sec <= 0.0:
         return None
     return span_sec / 3600.0
+
+
+def _val_window_hours_from_payout_df(df: Optional[pd.DataFrame]) -> Optional[float]:
+    """Backward-compatible alias for :func:`_split_window_hours_from_payout_df`."""
+    return _split_window_hours_from_payout_df(df)
+
+
+def _split_window_hours_from_parquet_payout(path: Path) -> Optional[float]:
+    """Min/max ``payout_complete_dtm`` span in hours via DuckDB (no full-parquet load)."""
+    if not path.exists():
+        return None
+    import duckdb
+
+    p = str(path.resolve()).replace("'", "''")
+    con = duckdb.connect(":memory:")
+    try:
+        row = con.execute(
+            f"SELECT min(payout_complete_dtm) AS mn, max(payout_complete_dtm) AS mx "
+            f"FROM read_parquet('{p}')"
+        ).fetchone()
+    except Exception:
+        return None
+    finally:
+        con.close()
+    if row is None or row[0] is None or row[1] is None:
+        return None
+    mn = pd.to_datetime(row[0], errors="coerce")
+    mx = pd.to_datetime(row[1], errors="coerce")
+    if pd.isna(mn) or pd.isna(mx):
+        return None
+    span_sec = float((mx - mn).total_seconds())
+    if not math.isfinite(span_sec) or span_sec <= 0.0:
+        return None
+    return span_sec / 3600.0
+
+
+def _field_test_hpo_min_alerts_per_hour_for_reports() -> float:
+    """Floor used for field-test alert-density reporting (aligns with Optuna DEC-026 guard)."""
+    raw = getattr(_cfg, "FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR", 50.0)
+    try:
+        mf = float(raw)
+    except (TypeError, ValueError):
+        mf = 50.0
+    if not math.isfinite(mf) or mf <= 0.0:
+        mf = 50.0
+    return mf
+
+
+def _split_alert_density_prefixed_dict(
+    split: str,
+    *,
+    scores: Optional[np.ndarray],
+    threshold: float,
+    window_hours: Optional[float],
+    objective_min: float,
+) -> dict[str, Any]:
+    """Flat keys ``{split}_window_hours``, ``{split}_alerts``, … for ``training_metrics`` v2 datasets."""
+    pfx = str(split or "").strip().lower()
+    if not pfx:
+        return {}
+    obj_out: Optional[float] = None
+    if math.isfinite(objective_min) and objective_min > 0.0:
+        obj_out = float(objective_min)
+    wh_out: Optional[float] = None
+    if window_hours is not None and math.isfinite(float(window_hours)) and float(window_hours) > 0.0:
+        wh_out = float(window_hours)
+    alerts: Optional[int] = None
+    aph: Optional[float] = None
+    meets: Optional[bool] = None
+    if scores is not None:
+        s = np.asarray(scores, dtype=np.float64).reshape(-1)
+        alerts = int(np.sum(np.isfinite(s) & (s >= float(threshold))))
+        if wh_out is not None:
+            aph = float(alerts) / float(wh_out)
+            if obj_out is not None:
+                meets = bool(aph >= float(obj_out))
+    return {
+        f"{pfx}_window_hours": wh_out,
+        f"{pfx}_alerts": alerts,
+        f"{pfx}_alerts_per_hour": aph,
+        f"{pfx}_min_alerts_per_hour_objective": obj_out,
+        f"{pfx}_alerts_per_hour_meets_objective": meets,
+    }
 
 
 def _neg_pos_ratio_from_binary_labels(y: Any) -> Optional[float]:
@@ -4018,7 +4101,7 @@ def _rated_field_test_val_pick_per_hour_kwargs(
         return None, None
     if field_test_constrained_optuna_objective_allowed is not True:
         return None, None
-    wh = _val_window_hours_from_payout_df(val_df)
+    wh = _split_window_hours_from_payout_df(val_df)
     if wh is None:
         return None, None
     _mah = getattr(_cfg, "FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR", 50.0)
@@ -5033,6 +5116,8 @@ def _compute_test_metrics(
     _uncalibrated: bool = False,
     log_results: bool = True,
     production_neg_pos_ratio: Optional[float] = None,
+    *,
+    test_window_hours: Optional[float] = None,
 ) -> dict:
     """Evaluate a trained model on the held-out test set at the val-derived threshold.
 
@@ -5063,6 +5148,14 @@ def _compute_test_metrics(
         _zeroed_recall_keys[f"n_alerts_at_recall_{r}"] = None
         _zeroed_recall_keys[f"alerts_per_minute_at_recall_{r}"] = None
         _zeroed_recall_keys[f"test_precision_at_recall_{r}_prod_adjusted"] = None
+    _obj_ft = _field_test_hpo_min_alerts_per_hour_for_reports()
+    _dens_none = _split_alert_density_prefixed_dict(
+        "test",
+        scores=None,
+        threshold=float(threshold),
+        window_hours=test_window_hours,
+        objective_min=_obj_ft,
+    )
 
     # R1100: guard against all-positive labels (average_precision_score = 1.0 trivially)
     _has_test = (
@@ -5097,6 +5190,7 @@ def _compute_test_metrics(
             "test_precision_prod_adjusted": None,
             "test_neg_pos_ratio": None,
             "production_neg_pos_ratio_assumed": production_neg_pos_ratio,
+            **_dens_none,
         }
 
     test_scores = model.predict_proba(X_test)[:, 1]
@@ -5120,6 +5214,7 @@ def _compute_test_metrics(
             "test_precision_prod_adjusted": None,
             "test_neg_pos_ratio": None,
             "production_neg_pos_ratio_assumed": production_neg_pos_ratio,
+            **_dens_none,
         }
 
     prauc = float(average_precision_score(y_test, test_scores))
@@ -5221,6 +5316,13 @@ def _compute_test_metrics(
         "test_precision_prod_adjusted": test_precision_prod_adjusted,
         "test_neg_pos_ratio": test_neg_pos_ratio,
         "production_neg_pos_ratio_assumed": production_neg_pos_ratio,
+        **_split_alert_density_prefixed_dict(
+            "test",
+            scores=np.asarray(test_scores, dtype=np.float64).reshape(-1),
+            threshold=float(threshold),
+            window_hours=test_window_hours,
+            objective_min=_obj_ft,
+        ),
     }
 
 
@@ -5232,6 +5334,8 @@ def _compute_test_metrics_from_scores(
     _uncalibrated: bool = False,
     log_results: bool = True,
     production_neg_pos_ratio: Optional[float] = None,
+    *,
+    test_window_hours: Optional[float] = None,
 ) -> dict:
     """Compute test-set metrics from precomputed scores (PLAN B+ 階段 6 第 3 步: test from file).
 
@@ -5245,6 +5349,14 @@ def _compute_test_metrics_from_scores(
         _zeroed_recall_keys[f"n_alerts_at_recall_{r}"] = None
         _zeroed_recall_keys[f"alerts_per_minute_at_recall_{r}"] = None
         _zeroed_recall_keys[f"test_precision_at_recall_{r}_prod_adjusted"] = None
+    _obj_ft_fs = _field_test_hpo_min_alerts_per_hour_for_reports()
+    _dens_none_fs = _split_alert_density_prefixed_dict(
+        "test",
+        scores=None,
+        threshold=float(threshold),
+        window_hours=test_window_hours,
+        objective_min=_obj_ft_fs,
+    )
     y_arr = np.asarray(y_test).reshape(-1)
     scores_arr = np.asarray(test_scores).reshape(-1)
     if len(y_arr) != len(scores_arr):
@@ -5279,6 +5391,7 @@ def _compute_test_metrics_from_scores(
             "test_precision_prod_adjusted": None,
             "test_neg_pos_ratio": None,
             "production_neg_pos_ratio_assumed": production_neg_pos_ratio,
+            **_dens_none_fs,
         }
     if not np.isfinite(scores_arr).all():
         logger.warning(
@@ -5298,6 +5411,7 @@ def _compute_test_metrics_from_scores(
             "test_precision_prod_adjusted": None,
             "test_neg_pos_ratio": None,
             "production_neg_pos_ratio_assumed": production_neg_pos_ratio,
+            **_dens_none_fs,
         }
     prauc = float(average_precision_score(y_arr, scores_arr))
     preds = (scores_arr >= threshold).astype(int)
@@ -5361,6 +5475,13 @@ def _compute_test_metrics_from_scores(
         "test_precision_prod_adjusted": test_precision_prod_adjusted,
         "test_neg_pos_ratio": test_neg_pos_ratio,
         "production_neg_pos_ratio_assumed": production_neg_pos_ratio,
+        **_split_alert_density_prefixed_dict(
+            "test",
+            scores=np.asarray(scores_arr, dtype=np.float64).reshape(-1),
+            threshold=float(threshold),
+            window_hours=test_window_hours,
+            objective_min=_obj_ft_fs,
+        ),
     }
 
 
@@ -5488,8 +5609,11 @@ def _train_metrics_dict_from_y_scores(
     threshold: float,
     label: str = "",
     log_results: bool = True,
+    *,
+    train_window_hours: Optional[float] = None,
 ) -> dict:
     """Build train_* metrics from parallel label/score arrays (same rules as legacy train metrics)."""
+    _obj_ft = _field_test_hpo_min_alerts_per_hour_for_reports()
     y_arr = np.asarray(y_train, dtype=float).reshape(-1)
     scores_arr = np.asarray(train_scores, dtype=float).reshape(-1)
     if len(y_arr) != len(scores_arr):
@@ -5506,6 +5630,13 @@ def _train_metrics_dict_from_y_scores(
             "train_samples": 0,
             "train_positives": 0,
             "train_random_ap": 0.0,
+            **_split_alert_density_prefixed_dict(
+                "train",
+                scores=None,
+                threshold=float(threshold),
+                window_hours=train_window_hours,
+                objective_min=_obj_ft,
+            ),
         }
     n_tr_pos = int(np.sum(y_arr == 1))
     train_random_ap = (n_tr_pos / n_tr) if n_tr > 0 else 0.0
@@ -5522,6 +5653,13 @@ def _train_metrics_dict_from_y_scores(
             "train_samples": n_tr,
             "train_positives": n_tr_pos,
             "train_random_ap": train_random_ap,
+            **_split_alert_density_prefixed_dict(
+                "train",
+                scores=None,
+                threshold=float(threshold),
+                window_hours=train_window_hours,
+                objective_min=_obj_ft,
+            ),
         }
     has_both = n_tr_pos >= 1 and (n_tr - n_tr_pos) >= 1
     # sklearn average_precision_score requires binary {0,1} y; use strict-positive mask only for AP.
@@ -5547,6 +5685,13 @@ def _train_metrics_dict_from_y_scores(
         "train_samples": n_tr,
         "train_positives": n_tr_pos,
         "train_random_ap": train_random_ap,
+        **_split_alert_density_prefixed_dict(
+            "train",
+            scores=scores_arr,
+            threshold=float(threshold),
+            window_hours=train_window_hours,
+            objective_min=_obj_ft,
+        ),
     }
 
 
@@ -5557,6 +5702,8 @@ def _compute_train_metrics(
     y_train: pd.Series,
     label: str = "",
     log_results: bool = True,
+    *,
+    train_window_hours: Optional[float] = None,
 ) -> dict:
     """Evaluate a trained model on the training set (for reporting overfit / fit quality).
 
@@ -5572,6 +5719,13 @@ def _compute_train_metrics(
             "train_samples": 0,
             "train_positives": 0,
             "train_random_ap": 0.0,
+            **_split_alert_density_prefixed_dict(
+                "train",
+                scores=None,
+                threshold=float(threshold),
+                window_hours=train_window_hours,
+                objective_min=_field_test_hpo_min_alerts_per_hour_for_reports(),
+            ),
         }
     try:
         batched = _batched_model_positive_class_scores(
@@ -5583,6 +5737,7 @@ def _compute_train_metrics(
             threshold,
             label=label,
             log_results=log_results,
+            train_window_hours=train_window_hours,
         )
     except Exception as exc:
         logger.warning(
@@ -5596,6 +5751,7 @@ def _compute_train_metrics(
         threshold,
         label=label,
         log_results=log_results,
+        train_window_hours=train_window_hours,
     )
 
 
@@ -5734,7 +5890,7 @@ def train_dual_model(
                 tr_df, sw, _recipe_dual, avail_cols
             )
 
-        _vw_h = _val_window_hours_from_payout_df(vl_df) if name == "rated" else None
+        _vw_h = _split_window_hours_from_payout_df(vl_df) if name == "rated" else None
         _ft_hpo_active = name == "rated" and _ft_optuna_allowed and _vw_h is not None
         _optuna_hpo_manifest_loop: list[dict[str, Any]] = []
         if run_optuna and not vl_df.empty and y_vl.sum() > 0:
@@ -5782,6 +5938,9 @@ def train_dual_model(
         if _optuna_hpo_manifest_loop:
             metrics.update(_optuna_hpo_manifest_loop[0])
 
+        _train_wh_dual = _split_window_hours_from_payout_df(tr_df)
+        _test_wh_dual = _split_window_hours_from_payout_df(te_df) if not te_df.empty else None
+
         # Training set performance (for overfit / fit quality reporting).
         metrics.update(
             _compute_train_metrics(
@@ -5790,6 +5949,7 @@ def train_dual_model(
                 X_tr,
                 y_tr,
                 label=name,
+                train_window_hours=_train_wh_dual,
             )
         )
 
@@ -5809,8 +5969,35 @@ def train_dual_model(
                     # R1101: propagate whether the threshold was a fallback
                     _uncalibrated=bool(metrics.get("_uncalibrated", False)),
                     production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+                    test_window_hours=_test_wh_dual,
                 )
             )
+
+        _obj_dual = _field_test_hpo_min_alerts_per_hour_for_reports()
+        metrics["field_test_min_alerts_per_hour_objective"] = float(_obj_dual)
+        _vwh_dual = _split_window_hours_from_payout_df(vl_df)
+        _vs_val_dual: Optional[np.ndarray] = None
+        if not vl_df.empty:
+            _miss_vd = [c for c in avail_cols if c not in vl_df.columns]
+            if not _miss_vd:
+                try:
+                    _x_vl_dual = _dataframe_for_lgb_predict(model, vl_df, avail_cols)
+                    _vs_val_dual = _batched_model_positive_class_scores(
+                        model,
+                        _x_vl_dual,
+                        TRAIN_METRICS_PREDICT_BATCH_ROWS,
+                    )
+                except Exception:
+                    _vs_val_dual = None
+        metrics.update(
+            _split_alert_density_prefixed_dict(
+                "val",
+                scores=_vs_val_dual,
+                threshold=float(metrics["threshold"]),
+                window_hours=_vwh_dual,
+                objective_min=_obj_dual,
+            )
+        )
 
         # Feature importance ranked by LightGBM gain.
         metrics["feature_importance"] = _compute_feature_importance(model, avail_cols)
@@ -5851,6 +6038,7 @@ def train_single_rated_model(
     gbm_bakeoff: bool = False,
     valid_split_parquet_path: Optional[Path] = None,
     test_split_parquet_path: Optional[Path] = None,
+    train_split_parquet_path: Optional[Path] = None,
 ) -> Tuple[Optional[dict], Optional[dict], dict]:
     """Train one rated artifact entry and return ``(rated_art, None, metrics)``.
 
@@ -5875,6 +6063,10 @@ def train_single_rated_model(
     always compare LightGBM / CatBoost / XGBoost on the same rated train/valid/test
     matrices and select the winner by field-test validation objective.  Main-path
     LibSVM / CSV optimizations remain valid for LightGBM, but no longer suppress A3.
+
+    *train_split_parquet_path* (Plan B+): optional Step-7 train split parquet used only
+    for ``payout_complete_dtm`` span when computing train alert-density without loading
+    the full train frame.
     """
     _ft_pre_doc: Optional[Dict[str, Any]] = None
     _ft_pre_path_raw = ""
@@ -6050,6 +6242,7 @@ def train_single_rated_model(
         return None, None, {"rated": None}
 
     recipe_use = resolve_ranking_recipe(ranking_recipe)
+    _snap_val_scores_holder: list[Optional[np.ndarray]] = [None]
     _valid_cols = valid_df.columns if not valid_df.empty else pd.Index([])
     if use_from_libsvm:
         avail_cols = [c for c in feature_cols if c in _valid_cols]
@@ -6462,6 +6655,10 @@ def train_single_rated_model(
                     val_scores = val_scores[:_n]
                     y_vl = y_vl[:_n] if hasattr(y_vl, "__getitem__") else np.asarray(y_vl)[:_n]
                 _has_val = _has_val_from_file
+                if valid_df is None or valid_df.empty:
+                    _snap_val_scores_holder[0] = np.asarray(
+                        val_scores, dtype=np.float64
+                    ).reshape(-1).copy()
         else:
             val_scores = np.asarray(booster.predict(_val_rated_eval[avail_cols])).reshape(-1)
             _has_val = _has_val_from_file
@@ -6679,6 +6876,15 @@ def train_single_rated_model(
         )
 
     train_thr = cast(float, metrics["threshold"])
+    _train_wh_rate = _split_window_hours_from_payout_df(_get_train_rated())
+    if _train_wh_rate is None and train_split_parquet_path is not None and train_split_parquet_path.exists():
+        _train_wh_rate = _split_window_hours_from_parquet_payout(train_split_parquet_path)
+    _test_df_for_wh = _get_test_rated()
+    _test_wh_rate: Optional[float] = None
+    if _test_df_for_wh is not None and not _test_df_for_wh.empty:
+        _test_wh_rate = _split_window_hours_from_payout_df(_test_df_for_wh)
+    if _test_wh_rate is None and test_split_parquet_path is not None and test_split_parquet_path.exists():
+        _test_wh_rate = _split_window_hours_from_parquet_payout(test_split_parquet_path)
     _train_booster = getattr(model, "booster_", None)
     used_libsvm_train_metrics = False
     if use_from_libsvm and train_libsvm_paths is not None and _train_booster is not None:
@@ -6709,6 +6915,7 @@ def train_single_rated_model(
                         train_thr,
                         label="rated",
                         log_results=False,
+                        train_window_hours=_train_wh_rate,
                     )
                     used_libsvm_train_metrics = True
                 except Exception as exc:
@@ -6727,6 +6934,7 @@ def train_single_rated_model(
             y_tr,
             label="rated",
             log_results=False,
+            train_window_hours=_train_wh_rate,
         )
     metrics.update(train_m)
 
@@ -6751,6 +6959,7 @@ def train_single_rated_model(
                 _uncalibrated=bool(metrics.get("_uncalibrated", False)),
                 log_results=False,
                 production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+                test_window_hours=_test_wh_rate,
             )
             metrics.update(test_m)
     elif (
@@ -6792,10 +7001,44 @@ def train_single_rated_model(
                         _uncalibrated=bool(metrics.get("_uncalibrated", False)),
                         log_results=False,
                         production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+                        test_window_hours=_test_wh_rate,
                     )
                     metrics.update(test_m)
     else:
         test_m = {}
+
+    _obj_rate = _field_test_hpo_min_alerts_per_hour_for_reports()
+    metrics["field_test_min_alerts_per_hour_objective"] = float(_obj_rate)
+    _vdf_rate = _get_val_rated()
+    _vwh_rate = _split_window_hours_from_payout_df(_vdf_rate)
+    if _vwh_rate is None and valid_split_parquet_path is not None and valid_split_parquet_path.exists():
+        _vwh_rate = _split_window_hours_from_parquet_payout(valid_split_parquet_path)
+    _vs_for_val_rate = _snap_val_scores_holder[0]
+    if _vs_for_val_rate is None and not _vdf_rate.empty:
+        _miss_vc = [c for c in avail_cols if c not in _vdf_rate.columns]
+        if not _miss_vc:
+            try:
+                _xv_rate = _dataframe_for_lgb_predict(model, _vdf_rate, avail_cols)
+                _vs_for_val_rate = _batched_model_positive_class_scores(
+                    model,
+                    _xv_rate,
+                    TRAIN_METRICS_PREDICT_BATCH_ROWS,
+                )
+            except Exception as _vscr_exc:
+                logger.warning(
+                    "rated: validation alert-density scores failed (non-fatal): %s",
+                    _vscr_exc,
+                )
+                _vs_for_val_rate = None
+    metrics.update(
+        _split_alert_density_prefixed_dict(
+            "val",
+            scores=_vs_for_val_rate,
+            threshold=float(metrics["threshold"]),
+            window_hours=_vwh_rate,
+            objective_min=_obj_rate,
+        )
+    )
 
     # A3 / R3: always compare LGBM / CatBoost / XGBoost on the same rated split matrices.
     if gbm_bakeoff and not _get_train_rated().empty:
@@ -7109,6 +7352,11 @@ def train_single_rated_model(
                                 int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
                             )
                         _fused_te = fuse_product_scores(_s1_te, _s2_te)
+                        _a4_test_wh = _split_window_hours_from_payout_df(_test_rated_a4)
+                        if _a4_test_wh is None and (
+                            test_split_parquet_path is not None and test_split_parquet_path.exists()
+                        ):
+                            _a4_test_wh = _split_window_hours_from_parquet_payout(test_split_parquet_path)
                         _a4_test = _compute_test_metrics_from_scores(
                             _test_rated_a4["label"].to_numpy(dtype=float),
                             _fused_te,
@@ -7117,6 +7365,7 @@ def train_single_rated_model(
                             _uncalibrated=bool(metrics.get("_uncalibrated", False)),
                             log_results=False,
                             production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+                            test_window_hours=_a4_test_wh,
                         )
                         metrics.update({f"a4_{k}": v for k, v in _a4_test.items()})
                         metrics["a4_candidate_rows_test"] = int(np.sum(_cand_mask_te))
@@ -9702,6 +9951,7 @@ def run_pipeline(args) -> None:
                 gbm_bakeoff=pipeline_gbm_bakeoff,
                 valid_split_parquet_path=step7_valid_path,
                 test_split_parquet_path=step7_test_path,
+                train_split_parquet_path=step7_train_path,
             )
             _el = time.perf_counter() - t0
             step9_duration_sec = _el

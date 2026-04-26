@@ -108,7 +108,10 @@ class TestR1104NoTestDfContract(unittest.TestCase):
         with patch.object(
             trainer_mod,
             "_train_one_model",
-            return_value=(object(), {"threshold": 0.5, "val_f1": 0.0, "_uncalibrated": True}),
+            return_value=(
+                _DummyProbModel(),
+                {"threshold": 0.5, "val_f1": 0.0, "_uncalibrated": True},
+            ),
         ), patch.object(
             trainer_mod,
             "_compute_train_metrics",

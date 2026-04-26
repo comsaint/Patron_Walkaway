@@ -113,3 +113,34 @@ def test_training_metrics_v2_map_json_is_valid() -> None:
     data = json.loads(map_path.read_text(encoding="utf-8"))
     assert data.get("schema_version")
     assert isinstance(data.get("mappings"), list)
+
+
+def test_v2_datasets_include_alert_density_columns_under_train_val_test() -> None:
+    """train_/val_/test_ prefixed alert-density metrics map into datasets.* (no prefix)."""
+    rated = {
+        "train_ap": 0.1,
+        "train_window_hours": 10.0,
+        "train_alerts": 600,
+        "train_alerts_per_hour": 60.0,
+        "train_min_alerts_per_hour_objective": 50.0,
+        "train_alerts_per_hour_meets_objective": True,
+        "val_precision": 0.5,
+        "val_window_hours": 2.0,
+        "val_alerts": 80,
+        "val_alerts_per_hour": 40.0,
+        "val_min_alerts_per_hour_objective": 50.0,
+        "val_alerts_per_hour_meets_objective": False,
+        "test_ap": 0.2,
+        "test_window_hours": 1.0,
+        "test_alerts": 60,
+        "test_alerts_per_hour": 60.0,
+        "test_min_alerts_per_hour_objective": 50.0,
+        "test_alerts_per_hour_meets_objective": True,
+    }
+    root = {"selection_mode": "field_test", "rated": rated}
+    v2 = build_training_metrics_v2_payload(model_version="mv1", metrics_root=root)
+    assert v2["datasets"]["train"]["window_hours"] == 10.0
+    assert v2["datasets"]["train"]["alerts_per_hour_meets_objective"] is True
+    assert v2["datasets"]["val"]["alerts_per_hour"] == 40.0
+    assert v2["datasets"]["val"]["alerts_per_hour_meets_objective"] is False
+    assert v2["datasets"]["test"]["min_alerts_per_hour_objective"] == 50.0

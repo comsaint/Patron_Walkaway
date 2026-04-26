@@ -46,6 +46,11 @@ _EXPECTED_TEST_METRICS_KEYS = frozenset({
     "test_precision_prod_adjusted",
     "test_neg_pos_ratio",
     "production_neg_pos_ratio_assumed",
+    "test_window_hours",
+    "test_alerts",
+    "test_alerts_per_hour",
+    "test_min_alerts_per_hour_objective",
+    "test_alerts_per_hour_meets_objective",
 })
 
 
