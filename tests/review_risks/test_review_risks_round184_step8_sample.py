@@ -42,7 +42,8 @@ class TestR184Step8LogIncludesCapWhenTrainSmallerThanCap(unittest.TestCase):
         self.assertGreater(step8_block_start, -1, "Step 8 sampling block not found")
         block = src[step8_block_start : step8_block_start + 2200]
         has_cap_in_log = (
-            "STEP8_SCREEN_SAMPLE_ROWS=%d" in block
+            "STEP8_SCREEN_SAMPLE_ROWS=%s" in block
+            or "requested_cap=%d" in block
             or ("cap" in block and "%d" in block and "rows" in block.lower())
         )
         self.assertTrue(
@@ -63,9 +64,9 @@ class TestR184Step8SampleRowsIntCoercionContract(unittest.TestCase):
         float (e.g. 5000.0) is safely handled (Round 184 Review §2).
         """
         src = inspect.getsource(trainer_mod.run_pipeline)
-        step8_block_start = src.find("_sample_n = STEP8_SCREEN_SAMPLE_ROWS")
-        self.assertGreater(step8_block_start, -1, "Step 8 _sample_n assignment not found")
-        block = src[step8_block_start : step8_block_start + 600]
+        step8_block_start = src.find("PLAN 方案 B 策略 A")
+        self.assertGreater(step8_block_start, -1, "Step 8 sampling block not found")
+        block = src[step8_block_start : step8_block_start + 3500]
         has_int_coercion = "int(_sample_n)" in block or "_sample_n = int(" in block
         self.assertTrue(
             has_int_coercion,

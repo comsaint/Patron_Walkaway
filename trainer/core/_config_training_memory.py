@@ -52,6 +52,8 @@ STEP9_SAVE_LGB_BINARY: bool = True
 TRAIN_METRICS_PREDICT_BATCH_ROWS: int = 500_000
 # None = no extra sampling cap; if set, the integer must be > 0.
 STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = None
+# Which rows of the train split feed Step 8 screening sample: head | tail | head_tail.
+STEP8_SCREEN_SAMPLE_STRATEGY: str = "head"
 
 # --- Canonical mapping fallback path ---
 CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS: bool = False

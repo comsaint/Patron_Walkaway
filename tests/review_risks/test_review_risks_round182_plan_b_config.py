@@ -53,7 +53,7 @@ class TestR182TrainFromFileReturnStructure(unittest.TestCase):
             trainer_mod,
             "_compute_test_metrics",
             return_value={"test_ap": 0.0},
-        ):
+        ), patch.object(trainer_mod, "A4_TWO_STAGE_ENABLE_TRAINING", False):
             out_false = trainer_mod.train_single_rated_model(
                 train_df=train_df,
                 valid_df=valid_df,
@@ -90,6 +90,13 @@ class TestR182PlanBConfigConstants(unittest.TestCase):
         self.assertTrue(hasattr(config_mod, "STEP8_SCREEN_SAMPLE_ROWS"))
         val = getattr(config_mod, "STEP8_SCREEN_SAMPLE_ROWS")
         self.assertTrue(val is None or isinstance(val, int))
+
+    def test_step8_screen_sample_strategy_exists_and_is_str(self):
+        """STEP8_SCREEN_SAMPLE_STRATEGY must exist and be a non-empty str."""
+        self.assertTrue(hasattr(config_mod, "STEP8_SCREEN_SAMPLE_STRATEGY"))
+        val = getattr(config_mod, "STEP8_SCREEN_SAMPLE_STRATEGY")
+        self.assertIsInstance(val, str)
+        self.assertGreater(len(val.strip()), 0)
 
 
 class TestR182Step8SampleRowsCommentContract(unittest.TestCase):

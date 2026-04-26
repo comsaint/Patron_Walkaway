@@ -245,6 +245,9 @@ try:
     A4_TWO_STAGE_MIN_VALID_ROWS: int = int(getattr(_cfg, "A4_TWO_STAGE_MIN_VALID_ROWS", 100))
     A4_TWO_STAGE_PREDICT_BATCH_ROWS: int = int(getattr(_cfg, "A4_TWO_STAGE_PREDICT_BATCH_ROWS", 250_000))
     STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
+    STEP8_SCREEN_SAMPLE_STRATEGY: str = str(
+        getattr(_cfg, "STEP8_SCREEN_SAMPLE_STRATEGY", "head") or "head"
+    )
     # Canonical mapping DuckDB from get_duckdb_memory_config("canonical_map") (DEC-027).
     CASINO_PLAYER_ID_CLEAN_SQL: str = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END")
 except ModuleNotFoundError:
@@ -306,6 +309,9 @@ except ModuleNotFoundError:
     A4_TWO_STAGE_MIN_VALID_ROWS = int(getattr(_cfg, "A4_TWO_STAGE_MIN_VALID_ROWS", 100))
     A4_TWO_STAGE_PREDICT_BATCH_ROWS = int(getattr(_cfg, "A4_TWO_STAGE_PREDICT_BATCH_ROWS", 250_000))
     STEP8_SCREEN_SAMPLE_ROWS = getattr(_cfg, "STEP8_SCREEN_SAMPLE_ROWS", None)
+    STEP8_SCREEN_SAMPLE_STRATEGY = str(
+        getattr(_cfg, "STEP8_SCREEN_SAMPLE_STRATEGY", "head") or "head"
+    )
     CASINO_PLAYER_ID_CLEAN_SQL = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') THEN NULL ELSE trim(casino_player_id) END")
 
 # LightGBM device: env + trainer.core.config default, optional override via root config.py (GPU plan Phase A).
@@ -4040,9 +4046,25 @@ def _write_skipped_optuna_manifest_for_libsvm(
     sink: Optional[list[dict[str, Any]]],
     *,
     run_optuna: bool,
+    skipped_reason: Optional[str] = None,
 ) -> None:
-    """Record effective Optuna status for LibSVM default-hyperparams path."""
+    """Record effective Optuna status when LibSVM path does not run in-memory HPO."""
     runtime_manifest = _backend_runtime_manifest("lightgbm")
+    if not run_optuna:
+        _reason = "run_optuna_false"
+        _objective_mode = "disabled_by_run_flag"
+    else:
+        _reason = skipped_reason or "libsvm_path_uses_default_hyperparams"
+        if _reason == "libsvm_no_validation_for_hpo":
+            _objective_mode = "skipped_libsvm_no_validation_for_hpo"
+        elif _reason == "libsvm_no_positives_in_validation":
+            _objective_mode = "skipped_libsvm_no_positives_in_validation"
+        elif _reason == "libsvm_optuna_gate_blocked":
+            _objective_mode = "skipped_libsvm_optuna_gate_blocked"
+        elif _reason == "libsvm_no_train_rows_for_hpo":
+            _objective_mode = "skipped_libsvm_no_train_rows_for_hpo"
+        else:
+            _objective_mode = "skipped_libsvm_default_params"
     _write_optuna_hpo_manifest(
         sink,
         {
@@ -4066,16 +4088,8 @@ def _write_skipped_optuna_manifest_for_libsvm(
                 else None
             ),
             "optuna_hpo_study_best_trial_value": None,
-            "optuna_hpo_objective_mode": (
-                "skipped_libsvm_default_params"
-                if run_optuna
-                else "disabled_by_run_flag"
-            ),
-            "optuna_hpo_skipped_reason": (
-                "libsvm_path_uses_default_hyperparams"
-                if run_optuna
-                else "run_optuna_false"
-            ),
+            "optuna_hpo_objective_mode": _objective_mode,
+            "optuna_hpo_skipped_reason": _reason,
         },
     )
 
@@ -5867,6 +5881,31 @@ def train_single_rated_model(
     _optuna_hpo_manifest: list[dict[str, Any]] = []
     if valid_df is None:
         valid_df = pd.DataFrame()
+    if test_df is None:
+        test_df = pd.DataFrame()
+    # B+: valid/test may be on disk only; load minimal rated validation early so
+    # DEC-026 val_window_hours, Optuna, and _rated_field_test_val_pick_per_hour_kwargs
+    # match the in-memory / A3 parquet path.
+    if (
+        valid_df.empty
+        and valid_split_parquet_path is not None
+        and valid_split_parquet_path.exists()
+        and feature_cols
+    ):
+        try:
+            valid_df = _load_rated_eval_split_from_parquet(
+                valid_split_parquet_path, list(feature_cols)
+            )
+            logger.info(
+                "Plan B+: loaded rated validation from parquet for metrics/HPO (%d rows): %s",
+                len(valid_df),
+                valid_split_parquet_path,
+            )
+        except Exception as exc_val_parq:
+            logger.warning(
+                "Plan B+: could not load validation parquet (non-fatal): %s",
+                exc_val_parq,
+            )
     use_from_libsvm = False
     if train_libsvm_paths is not None:
         _t, _v = train_libsvm_paths
@@ -5910,6 +5949,8 @@ def train_single_rated_model(
                     "Plan B+: train LibSVM has only one class; falling back to in-memory training."
                 )
                 use_from_libsvm = False
+
+    libsvm_optuna_search_ran = False
 
     train_rated: Optional[pd.DataFrame] = None
     val_rated: Optional[pd.DataFrame] = None
@@ -6019,7 +6060,12 @@ def train_single_rated_model(
         if len(_valid_cols) > 0:
             avail_cols = [c for c in avail_cols if c in _valid_cols]
 
-    if (not use_from_libsvm) or gbm_bakeoff or A4_TWO_STAGE_ENABLE_TRAINING:
+    if (
+        (not use_from_libsvm)
+        or gbm_bakeoff
+        or A4_TWO_STAGE_ENABLE_TRAINING
+        or (use_from_libsvm and run_optuna)
+    ):
         _ensure_inmemory_train_views(avail_cols)
 
     _train_rated_for_weights = _get_train_rated()
@@ -6101,18 +6147,67 @@ def train_single_rated_model(
     )
 
     # PLAN 方案 B §6: HPO on in-memory (train/valid) for both paths; from-file then uses best params for lgb.train.
-    # B+ §4.4: from LibSVM we use default hp (no in-memory HPO).
+    # B+ LibSVM: full train stays on disk for lgb.Dataset, but Optuna may run on an in-memory
+    # sample (see run_optuna_search hpo_sample_rows) when run_optuna is True.
+    _default_hp = {
+        "n_estimators": 400,
+        "learning_rate": 0.05,
+        "num_leaves": 31,
+        "max_depth": 8,
+        "min_child_samples": 20,
+    }
     if use_from_libsvm:
-        _write_skipped_optuna_manifest_for_libsvm(
-            _optuna_hpo_manifest, run_optuna=bool(run_optuna)
-        )
-        hp = {
-            "n_estimators": 400,
-            "learning_rate": 0.05,
-            "num_leaves": 31,
-            "max_depth": 8,
-            "min_child_samples": 20,
-        }
+        _vl_hpo = _get_val_rated()
+        _yvl_pos = 0.0
+        if not _vl_hpo.empty and "label" in _vl_hpo.columns:
+            _yvl_pos = float(pd.to_numeric(_vl_hpo["label"], errors="coerce").fillna(0).sum())
+        if run_optuna and not _get_train_rated().empty and not _vl_hpo.empty and _yvl_pos > 0:
+            _val_wh = _val_window_hours_from_payout_df(_vl_hpo)
+            _ft_hpo_active = _ft_allowed and _val_wh is not None
+            log_optuna_precondition_context(
+                _ft_pre_doc, uses_field_test_hpo_objective=_ft_hpo_active
+            )
+            try:
+                hp = run_optuna_search(
+                    X_tr,
+                    y_tr,
+                    X_vl,
+                    y_vl,
+                    sw_rated,
+                    label="rated",
+                    field_test_constrained_optuna_objective_allowed=_ft_allowed,
+                    val_window_hours=_val_wh,
+                    hpo_objective_manifest=_optuna_hpo_manifest,
+                )
+                libsvm_optuna_search_ran = True
+            except RuntimeError as _opt_exc:
+                logger.warning(
+                    "rated LibSVM path: Optuna aborted (%s); using default hyperparameters.",
+                    _opt_exc,
+                )
+                _write_skipped_optuna_manifest_for_libsvm(
+                    _optuna_hpo_manifest,
+                    run_optuna=True,
+                    skipped_reason="libsvm_optuna_gate_blocked",
+                )
+                hp = dict(_default_hp)
+            if not hp:
+                hp = dict(_default_hp)
+        else:
+            _skip_sr: Optional[str] = None
+            if run_optuna:
+                if _get_train_rated().empty:
+                    _skip_sr = "libsvm_no_train_rows_for_hpo"
+                elif _vl_hpo.empty:
+                    _skip_sr = "libsvm_no_validation_for_hpo"
+                elif _yvl_pos <= 0:
+                    _skip_sr = "libsvm_no_positives_in_validation"
+            _write_skipped_optuna_manifest_for_libsvm(
+                _optuna_hpo_manifest,
+                run_optuna=bool(run_optuna),
+                skipped_reason=_skip_sr,
+            )
+            hp = dict(_default_hp)
     elif run_optuna and not _get_val_rated().empty and y_vl.sum() > 0:
         _val_wh = _val_window_hours_from_payout_df(_get_val_rated())
         _ft_hpo_active = _ft_allowed and _val_wh is not None
@@ -6410,6 +6505,7 @@ def train_single_rated_model(
             "val_random_ap": val_random_ap,
             "best_hyperparams": hp_resolved,
             "_uncalibrated": not _has_val,
+            "diagnostic_libsvm_optuna_search_ran": bool(libsvm_optuna_search_ran),
         }
         if _ft_thr_wh is not None and _ft_thr_mah is not None:
             metrics["val_dec026_pick_window_hours"] = float(_ft_thr_wh)
@@ -6713,6 +6809,7 @@ def train_single_rated_model(
             from trainer.training.gbm_bakeoff import train_and_select_rated_gbm_family
 
             _compare_valid = _get_val_rated()
+            _a3_eval_valid_source = "memory"
             if (
                 (_compare_valid is None or _compare_valid.empty)
                 and valid_split_parquet_path is not None
@@ -6722,7 +6819,9 @@ def train_single_rated_model(
                     valid_split_parquet_path,
                     avail_cols,
                 )
+                _a3_eval_valid_source = "parquet"
             _compare_test = test_rated
+            _a3_eval_test_source = "memory"
             if (
                 (_compare_test is None or _compare_test.empty)
                 and test_split_parquet_path is not None
@@ -6732,6 +6831,7 @@ def train_single_rated_model(
                     test_split_parquet_path,
                     avail_cols,
                 )
+                _a3_eval_test_source = "parquet"
 
             _x_vl_cmp = (
                 _compare_valid[avail_cols]
@@ -6788,6 +6888,8 @@ def train_single_rated_model(
             )
             model = _winner_art["model"]
             metrics = dict(_winner_art["metrics"])
+            metrics["a3_eval_valid_source"] = _a3_eval_valid_source
+            metrics["a3_eval_test_source"] = _a3_eval_test_source
             metrics["gbm_bakeoff"] = _bake_report
             metrics["selected_backend"] = _winner_backend
             metrics["selected_backend_source"] = "a3_gbm_family_compare"
@@ -6927,7 +7029,25 @@ def train_single_rated_model(
                     )
                     metrics.update({f"a4_{k}": v for k, v in _a4_train.items()})
                     _val_rated_eval = _get_val_rated()
-                    if not _val_rated_eval.empty:
+                    metrics["a4_valid_eval_source"] = "memory"
+                    if (
+                        (_val_rated_eval is None or _val_rated_eval.empty)
+                        and valid_split_parquet_path is not None
+                        and valid_split_parquet_path.exists()
+                    ):
+                        try:
+                            _val_rated_eval = _load_rated_eval_split_from_parquet(
+                                valid_split_parquet_path,
+                                avail_cols,
+                            )
+                            metrics["a4_valid_eval_source"] = "parquet"
+                        except Exception as _a4_v_exc:
+                            logger.warning(
+                                "A4: could not load validation parquet for eval: %s",
+                                _a4_v_exc,
+                            )
+                            metrics["a4_valid_eval_source"] = "parquet_failed"
+                    if _val_rated_eval is not None and not _val_rated_eval.empty:
                         _x_vl_s1 = _dataframe_for_lgb_predict(model, _val_rated_eval, avail_cols)
                         _s1_vl = _batched_model_positive_class_scores(
                             model,
@@ -6953,8 +7073,27 @@ def train_single_rated_model(
                         metrics["a4_candidate_rows_valid"] = int(np.sum(_cand_mask_vl))
                     else:
                         metrics["a4_candidate_rows_valid"] = 0
-                    if test_rated is not None and not test_rated.empty:
-                        _x_te_s1 = _dataframe_for_lgb_predict(model, test_rated, avail_cols)
+                    _test_rated_a4 = test_rated
+                    metrics["a4_test_eval_source"] = "memory"
+                    if (
+                        (_test_rated_a4 is None or _test_rated_a4.empty)
+                        and test_split_parquet_path is not None
+                        and test_split_parquet_path.exists()
+                    ):
+                        try:
+                            _test_rated_a4 = _load_rated_eval_split_from_parquet(
+                                test_split_parquet_path,
+                                avail_cols,
+                            )
+                            metrics["a4_test_eval_source"] = "parquet"
+                        except Exception as _a4_te_exc:
+                            logger.warning(
+                                "A4: could not load test parquet for eval: %s",
+                                _a4_te_exc,
+                            )
+                            metrics["a4_test_eval_source"] = "parquet_failed"
+                    if _test_rated_a4 is not None and not _test_rated_a4.empty:
+                        _x_te_s1 = _dataframe_for_lgb_predict(model, _test_rated_a4, avail_cols)
                         _s1_te = _batched_model_positive_class_scores(
                             model,
                             _x_te_s1,
@@ -6971,7 +7110,7 @@ def train_single_rated_model(
                             )
                         _fused_te = fuse_product_scores(_s1_te, _s2_te)
                         _a4_test = _compute_test_metrics_from_scores(
-                            test_rated["label"].to_numpy(dtype=float),
+                            _test_rated_a4["label"].to_numpy(dtype=float),
                             _fused_te,
                             _stage1_threshold,
                             label="rated_a4_fused_test",
@@ -7144,13 +7283,16 @@ def _load_rated_eval_split_from_parquet(
     This keeps Plan B / B+ semantics for the main LightGBM training path, while still
     giving CatBoost / XGBoost the exact same time split and feature matrix for a fair
     comparison on the selected columns.
+
+    ``payout_complete_dtm`` is included when present so DEC-026 / field-test HPO can
+    compute ``val_window_hours`` on B+ paths where ``valid_df`` is not in memory.
     """
     import pyarrow.parquet as pq
 
     pf = pq.ParquetFile(split_path)
     available = set(pf.schema.names)
     cols = [c for c in feature_cols if c in available]
-    for extra in ("label", "is_rated"):
+    for extra in ("label", "is_rated", "payout_complete_dtm"):
         if extra in available and extra not in cols:
             cols.append(extra)
     if "label" not in cols:
@@ -7162,6 +7304,90 @@ def _load_rated_eval_split_from_parquet(
         if col not in df.columns:
             df[col] = np.nan
     return df
+
+
+def _step8_resolve_sample_strategy(raw: Any) -> str:
+    """Normalize Step 8 screening row-sample strategy (head | tail | head_tail)."""
+    s = str(raw or "head").strip().lower()
+    if s not in ("head", "tail", "head_tail"):
+        logger.warning("STEP8_SCREEN_SAMPLE_STRATEGY=%r invalid; using head", raw)
+        return "head"
+    return s
+
+
+def _step8_sample_in_memory_train(
+    train_df: pd.DataFrame,
+    *,
+    strategy: str,
+    sample_n: Optional[int],
+    default_cap: int,
+) -> pd.DataFrame:
+    """Return up to ``cap`` rows from *train_df* for screening (no full-train scan)."""
+    cap = int(sample_n) if sample_n is not None and int(sample_n) >= 1 else int(default_cap)
+    n = min(cap, len(train_df))
+    if n <= 0:
+        return train_df.head(0)
+    if strategy == "tail":
+        return train_df.tail(n)
+    if strategy == "head_tail":
+        nh = max(1, n // 2)
+        nt = n - nh
+        h = train_df.head(nh)
+        t = train_df.tail(nt)
+        out = pd.concat([h, t], ignore_index=True)
+        if "canonical_id" in out.columns and "bet_id" in out.columns:
+            out = out.drop_duplicates(subset=["canonical_id", "bet_id"], keep="first")
+        else:
+            out = out.drop_duplicates()
+        return out.iloc[:n].copy()
+    return train_df.head(n).copy()
+
+
+def _read_parquet_tail_step8(path: Path, n: int) -> pd.DataFrame:
+    """Last *n* train rows by ``payout_complete_dtm`` (B+ train parquet is time-sorted ascending)."""
+    if n <= 0:
+        return pd.DataFrame()
+    import duckdb
+
+    p = str(path).replace("'", "''")
+    con = duckdb.connect(":memory:")
+    try:
+        return con.execute(
+            f"SELECT * FROM read_parquet('{p}') "
+            f"ORDER BY payout_complete_dtm DESC NULLS LAST, "
+            f"bet_id DESC NULLS LAST LIMIT {int(n)}"
+        ).df()
+    finally:
+        con.close()
+
+
+def _read_parquet_head_tail_step8(
+    path: Path,
+    n: int,
+    *,
+    read_head: Callable[[Path, int], pd.DataFrame],
+) -> pd.DataFrame:
+    """Combine earliest and latest rows (deduped) for screening sample."""
+    if n <= 0:
+        return pd.DataFrame()
+    nh = max(1, n // 2)
+    nt = max(1, n - nh)
+    head_df = read_head(path, nh)
+    tail_df = _read_parquet_tail_step8(path, nt)
+    if head_df.empty and tail_df.empty:
+        return pd.DataFrame()
+    if head_df.empty:
+        return tail_df
+    if tail_df.empty:
+        return head_df
+    out = pd.concat([head_df, tail_df], ignore_index=True)
+    if "canonical_id" in out.columns and "bet_id" in out.columns:
+        out = out.drop_duplicates(subset=["canonical_id", "bet_id"], keep="first")
+    else:
+        out = out.drop_duplicates()
+    if len(out) > n:
+        out = out.iloc[:n].copy()
+    return out
 
 
 def _one_split_block_from_dataframe(df: Optional[pd.DataFrame]) -> dict[str, Any]:
@@ -7746,6 +7972,7 @@ def _write_pipeline_diagnostics_json(
     step8_screening_full_train_rows: Optional[int] = None,
     step8_screening_candidate_cols: Optional[int] = None,
     step8_screened_feature_count: Optional[int] = None,
+    step8_screen_sample_strategy: Optional[str] = None,
     duckdb_runtime_step7_memory_gb: Optional[float] = None,
     duckdb_runtime_step7_threads: Optional[int] = None,
     duckdb_runtime_screening_memory_gb: Optional[float] = None,
@@ -7795,6 +8022,7 @@ def _write_pipeline_diagnostics_json(
         "step8_screening_full_train_rows": step8_screening_full_train_rows,
         "step8_screening_candidate_cols": step8_screening_candidate_cols,
         "step8_screened_feature_count": step8_screened_feature_count,
+        "step8_screen_sample_strategy": step8_screen_sample_strategy,
         "duckdb_runtime_step7_memory_gb": duckdb_runtime_step7_memory_gb,
         "duckdb_runtime_step7_threads": duckdb_runtime_step7_threads,
         "duckdb_runtime_screening_memory_gb": duckdb_runtime_screening_memory_gb,
@@ -7951,6 +8179,7 @@ def run_pipeline(args) -> None:
             step8_screening_full_train_rows: Optional[int] = None
             step8_screening_candidate_cols: Optional[int] = None
             step8_screened_feature_count: Optional[int] = None
+            step8_screen_sample_strategy: Optional[str] = None
             duckdb_runtime_step7_memory_gb: Optional[float] = None
             duckdb_runtime_step7_threads: Optional[int] = None
             duckdb_runtime_screening_memory_gb: Optional[float] = None
@@ -9075,6 +9304,9 @@ def run_pipeline(args) -> None:
                 current_neg_frac=_effective_neg_sample_frac,
             )
             train_df, valid_df, test_df, step7_train_path, step7_valid_path, step7_test_path = _step7_result
+            step8_screen_sample_strategy = _step8_resolve_sample_strategy(
+                getattr(_cfg, "STEP8_SCREEN_SAMPLE_STRATEGY", STEP8_SCREEN_SAMPLE_STRATEGY)
+            )
             _train_libsvm: Optional[Path] = None
             _valid_libsvm: Optional[Path] = None
             _test_libsvm: Optional[Path] = None
@@ -9096,7 +9328,18 @@ def run_pipeline(args) -> None:
                     if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1)
                     else 2_000_000
                 )
-                _train_for_screen = _read_parquet_head(step7_train_path, _sample_n_disk)
+                if step8_screen_sample_strategy == "tail":
+                    _train_for_screen = _read_parquet_tail_step8(
+                        step7_train_path, _sample_n_disk
+                    )
+                elif step8_screen_sample_strategy == "head_tail":
+                    _train_for_screen = _read_parquet_head_tail_step8(
+                        step7_train_path,
+                        _sample_n_disk,
+                        read_head=_read_parquet_head,
+                    )
+                else:
+                    _train_for_screen = _read_parquet_head(step7_train_path, _sample_n_disk)
             else:
                 assert train_df is not None  # step7_train_path is None implies train was loaded in Step 7
                 assert valid_df is not None and test_df is not None  # pandas path always has both
@@ -9239,42 +9482,76 @@ def run_pipeline(args) -> None:
                 )
                 _screen_train_df: Optional[pd.DataFrame] = None
                 if train_df is not None:
-                    _sample_n = STEP8_SCREEN_SAMPLE_ROWS if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1) else None
+                    _sample_n = (
+                        STEP8_SCREEN_SAMPLE_ROWS
+                        if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1)
+                        else None
+                    )
                     if _sample_n is not None:
-                        _sample_n = int(_sample_n)  # Round 184 Review P2: coerce float to int before head()
-                        _matrix_for_screen = train_df.head(_sample_n)
-                        _screen_train_df = _matrix_for_screen
-                        if len(_matrix_for_screen) < _sample_n:
-                            logger.info(
-                                "Step 8 screening: using first %d rows (train smaller than cap STEP8_SCREEN_SAMPLE_ROWS=%d); full train has %d rows",
-                                len(_matrix_for_screen),
-                                _sample_n,
-                                len(train_df),
-                            )
-                        else:
-                            logger.info(
-                                "Step 8 screening: using first %d rows (cap STEP8_SCREEN_SAMPLE_ROWS); full train has %d rows",
-                                len(_matrix_for_screen),
-                                len(train_df),
-                            )
-                    else:
-                        _matrix_for_screen = train_df.head(_cap)
-                        _screen_train_df = _matrix_for_screen
-                        logger.info(
-                            "Step 8 screening: using first %d rows from in-memory train (full train has %d rows); "
-                            "screening no longer re-reads full train for DuckDB std/corr",
-                            len(_matrix_for_screen),
-                            len(train_df),
-                        )
+                        _sample_n = int(_sample_n)
+                    _matrix_for_screen = _step8_sample_in_memory_train(
+                        train_df,
+                        strategy=step8_screen_sample_strategy,
+                        sample_n=_sample_n,
+                        default_cap=_cap,
+                    )
+                    _screen_train_df = _matrix_for_screen
+                    _lbl_ratio = (
+                        float(_matrix_for_screen["label"].mean())
+                        if "label" in _matrix_for_screen.columns and len(_matrix_for_screen)
+                        else None
+                    )
+                    _pmin, _pmax = _payout_bounds_iso_from_series(
+                        _matrix_for_screen["payout_complete_dtm"]
+                        if "payout_complete_dtm" in _matrix_for_screen.columns
+                        else pd.Series(dtype="datetime64[ns]")
+                    )
+                    _req_cap_im = (
+                        int(_sample_n)
+                        if _sample_n is not None and int(_sample_n) >= 1
+                        else int(_cap)
+                    )
+                    logger.info(
+                        "Step 8 screening: strategy=%s sample_rows=%d full_train_rows=%d "
+                        "requested_cap=%d STEP8_SCREEN_SAMPLE_ROWS=%s label_mean=%s payout_span=[%s,%s]",
+                        step8_screen_sample_strategy,
+                        len(_matrix_for_screen),
+                        len(train_df),
+                        _req_cap_im,
+                        str(STEP8_SCREEN_SAMPLE_ROWS),
+                        f"{_lbl_ratio:.4f}" if _lbl_ratio is not None else "n/a",
+                        _pmin or "n/a",
+                        _pmax or "n/a",
+                    )
                 else:
                     _matrix_for_screen = _train_for_screen
+                    _lbl_ratio_disk = (
+                        float(_matrix_for_screen["label"].mean())
+                        if "label" in _matrix_for_screen.columns and len(_matrix_for_screen)
+                        else None
+                    )
+                    _pmin_d, _pmax_d = _payout_bounds_iso_from_series(
+                        _matrix_for_screen["payout_complete_dtm"]
+                        if "payout_complete_dtm" in _matrix_for_screen.columns
+                        else pd.Series(dtype="datetime64[ns]")
+                    )
                     logger.info(
-                        "Step 8 screening: using first %d rows from train file (STEP7_KEEP_TRAIN_ON_DISK); full train has %d rows",
+                        "Step 8 screening: strategy=%s from train file (STEP7_KEEP_TRAIN_ON_DISK) "
+                        "sample_rows=%d full_train_rows=%d requested_cap=%d STEP8_SCREEN_SAMPLE_ROWS=%s "
+                        "label_mean=%s payout_span=[%s,%s]",
+                        step8_screen_sample_strategy,
                         len(_matrix_for_screen),
                         _n_train_print,
+                        int(_sample_n_disk),
+                        str(STEP8_SCREEN_SAMPLE_ROWS),
+                        f"{_lbl_ratio_disk:.4f}" if _lbl_ratio_disk is not None else "n/a",
+                        _pmin_d or "n/a",
+                        _pmax_d or "n/a",
                     )
                 step8_screening_source = (
-                    "in_memory_head" if train_df is not None else "train_file_head"
+                    f"in_memory_{step8_screen_sample_strategy}"
+                    if train_df is not None
+                    else f"train_file_{step8_screen_sample_strategy}"
                 )
                 step8_screening_stats_source = (
                     "screening_sample_df" if train_df is not None else "train_path"
@@ -9603,6 +9880,7 @@ def run_pipeline(args) -> None:
                     step8_screening_full_train_rows=step8_screening_full_train_rows,
                     step8_screening_candidate_cols=step8_screening_candidate_cols,
                     step8_screened_feature_count=step8_screened_feature_count,
+                    step8_screen_sample_strategy=step8_screen_sample_strategy,
                     duckdb_runtime_step7_memory_gb=duckdb_runtime_step7_memory_gb,
                     duckdb_runtime_step7_threads=duckdb_runtime_step7_threads,
                     duckdb_runtime_screening_memory_gb=duckdb_runtime_screening_memory_gb,
