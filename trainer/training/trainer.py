@@ -1669,8 +1669,9 @@ def ensure_player_profile_ready(
     #
     # Rationale: join_player_profile uses merge_asof(direction="backward"), so a bet
     # on Feb 15 needs the Jan 31 snapshot.
+    requested_window_end = window_end.date()
     required_start = latest_month_end_on_or_before(window_start.date())
-    required_end = window_end.date()
+    required_end = requested_window_end
 
     session_rng = _parquet_date_range(
         session_path,
@@ -1688,7 +1689,16 @@ def ensure_player_profile_ready(
                 _pre_clamp_start,
                 window_start.date(),
             )
-        required_end = min(required_end, session_rng[1])
+        required_end = min(required_end, session_rng[1], requested_window_end)
+
+    if required_end > requested_window_end:
+        logger.warning(
+            "Profile required_end exceeded training window (%s > %s); clamping to avoid "
+            "building unused future player_profile snapshots.",
+            required_end,
+            requested_window_end,
+        )
+        required_end = requested_window_end
 
     if required_start > required_end:
         logger.warning(
@@ -1699,6 +1709,16 @@ def ensure_player_profile_ready(
         return
 
     profile_rng = _parquet_date_range(profile_path, ["snapshot_date", "snapshot_dtm"])
+    logger.info(
+        "player_profile required coverage: window=%s->%s required=%s->%s "
+        "session=%s profile=%s",
+        window_start.date(),
+        requested_window_end,
+        required_start,
+        required_end,
+        session_rng,
+        profile_rng,
+    )
     missing_ranges: List[Tuple[date, date]] = []
     if profile_rng is None:
         missing_ranges.append((required_start, required_end))
@@ -1718,6 +1738,8 @@ def ensure_player_profile_ready(
         return
 
     for miss_start, miss_end in missing_ranges:
+        miss_start = max(miss_start, required_start)
+        miss_end = min(miss_end, required_end)
         if miss_start > miss_end:
             continue
         logger.info(

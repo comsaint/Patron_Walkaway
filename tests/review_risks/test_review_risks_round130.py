@@ -71,6 +71,44 @@ class TestR120CanonicalMapInprocessGuardrail(unittest.TestCase):
             mock_backfill.assert_called_once()
             self.assertIs(mock_backfill.call_args.kwargs.get("canonical_map"), cmap)
 
+    def test_profile_backfill_does_not_extend_past_training_window(self):
+        """A short training window should only build the needed PIT anchor snapshots."""
+        with TemporaryDirectory() as td:
+            from pathlib import Path
+
+            local_dir = Path(td)
+            (local_dir / "gmwds_t_session.parquet").touch()
+            cmap = pd.DataFrame(
+                {
+                    "player_id": [1, 2],
+                    "canonical_id": ["A", "B"],
+                }
+            )
+
+            with patch("trainer.trainer.LOCAL_PARQUET_DIR", local_dir), patch(
+                "trainer.trainer._parquet_date_range",
+                side_effect=[
+                    (date(2024, 12, 1), date(2025, 12, 31)),  # session range
+                    None,  # existing profile range -> missing
+                    None,  # final profile range after build attempt
+                ],
+            ), patch("trainer.trainer._etl_backfill") as mock_backfill:
+                ensure_player_profile_ready(
+                    window_start=datetime(2025, 1, 1, tzinfo=HK_TZ),
+                    window_end=datetime(2025, 2, 2, tzinfo=HK_TZ),
+                    use_local_parquet=True,
+                    preload_sessions=True,
+                    canonical_map=cmap,
+                )
+
+            mock_backfill.assert_called_once()
+            self.assertEqual(mock_backfill.call_args.args[0], date(2024, 12, 31))
+            self.assertEqual(mock_backfill.call_args.args[1], date(2025, 2, 2))
+            self.assertEqual(
+                mock_backfill.call_args.kwargs.get("snapshot_dates"),
+                [date(2024, 12, 31), date(2025, 1, 31)],
+            )
+
 
 class TestR121WhitelistMutationGuardrail(unittest.TestCase):
     """R121: backfill whitelist filtering must not mutate caller canonical_map."""
