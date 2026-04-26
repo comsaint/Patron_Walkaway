@@ -24,7 +24,11 @@ from __future__ import annotations
 
 import logging
 import math
+import json
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -37,6 +41,7 @@ from trainer.training.oof_stacking import build_stacked_logistic_candidate
 from trainer.training.threshold_selection import pick_threshold_dec026
 
 logger = logging.getLogger("trainer")
+_AGENT_DEBUG_LOG_PATH = Path("debug-000243.log")
 
 MIN_VALID_TEST_ROWS: int = int(getattr(_cfg, "MIN_VALID_TEST_ROWS", 50))
 THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
@@ -53,6 +58,30 @@ BAKEOFF_BACKENDS: Tuple[str, ...] = (
     SOFT_VOTE_BACKEND,
     STACKED_LOGISTIC_BACKEND,
 )
+
+
+def _agent_debug_log(
+    *,
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: Mapping[str, Any],
+) -> None:
+    """Append one NDJSON debug entry for the current Cursor debug session."""
+    payload = {
+        "sessionId": "000243",
+        "runId": "xgb-bakeoff-debug",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": dict(data),
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with _AGENT_DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, default=str, ensure_ascii=True) + "\n")
+    except OSError:
+        logger.debug("agent debug log write failed", exc_info=True)
 
 
 def _has_strong_validation(X_val: pd.DataFrame, y_val: pd.Series) -> bool:
@@ -217,9 +246,44 @@ def _to_float32_frame(X: pd.DataFrame) -> pd.DataFrame:
 def _preload_parallel_backend_imports(backends: Tuple[str, ...]) -> None:
     """Import optional backends before worker threads start."""
     for backend in backends:
+        # region agent log
+        _agent_debug_log(
+            hypothesis_id="H1",
+            location="trainer/training/gbm_bakeoff.py:_preload_parallel_backend_imports",
+            message="preload optional backend before worker threads",
+            data={
+                "backend": backend,
+                "already_in_sys_modules": backend in sys.modules,
+            },
+        )
+        # endregion
         try:
-            __import__(backend)
+            module = __import__(backend)
+            # region agent log
+            _agent_debug_log(
+                hypothesis_id="H1",
+                location="trainer/training/gbm_bakeoff.py:_preload_parallel_backend_imports",
+                message="preload optional backend succeeded",
+                data={
+                    "backend": backend,
+                    "module_file": getattr(module, "__file__", None),
+                    "module_version": getattr(module, "__version__", None),
+                },
+            )
+            # endregion
         except ImportError as exc:
+            # region agent log
+            _agent_debug_log(
+                hypothesis_id="H1",
+                location="trainer/training/gbm_bakeoff.py:_preload_parallel_backend_imports",
+                message="preload optional backend failed",
+                data={
+                    "backend": backend,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            # endregion
             logger.warning("A3 gbm_bakeoff: %s preload failed (%s)", backend, exc)
 
 
@@ -580,6 +644,22 @@ def train_and_select_rated_gbm_family(
     _timeout_budget_divisor = _bakeoff_timeout_budget_divisor()
     backend_runtime_plan = resolve_gbm_backend_runtime_plan()
     backend_runtime_by_name = dict(backend_runtime_plan.get("backend_runtime_by_name") or {})
+    # region agent log
+    _agent_debug_log(
+        hypothesis_id="H1,H2,H3",
+        location="trainer/training/gbm_bakeoff.py:train_and_select_rated_gbm_family",
+        message="resolved A3 backend runtime plan",
+        data={
+            "effective_backend_device_mode": backend_runtime_plan.get("effective_backend_device_mode"),
+            "visible_gpu_ids": backend_runtime_plan.get("visible_gpu_ids"),
+            "gpu_assignments": backend_runtime_plan.get("gpu_assignments"),
+            "parallel_backend_workers": backend_runtime_plan.get("parallel_backend_workers"),
+            "parallel_backend_execution": backend_runtime_plan.get("parallel_backend_execution"),
+            "xgboost_in_sys_modules": "xgboost" in sys.modules,
+            "catboost_in_sys_modules": "catboost" in sys.modules,
+        },
+    )
+    # endregion
 
     def _run_backend_candidate(
         trainer_fn: Any,
@@ -588,6 +668,23 @@ def train_and_select_rated_gbm_family(
         try:
             backend_manifest: list[dict[str, Any]] = []
             backend_runtime_params = dict(backend_runtime_by_name.get(backend) or {})
+            # region agent log
+            _agent_debug_log(
+                hypothesis_id="H1,H2,H3",
+                location="trainer/training/gbm_bakeoff.py:_run_backend_candidate",
+                message="backend candidate started",
+                data={
+                    "backend": backend,
+                    "runtime_params": backend_runtime_params,
+                    "run_optuna": bool(run_optuna),
+                    "strong_validation": bool(_has_strong_validation(X_val, y_val)),
+                    "train_rows": int(len(X_train)),
+                    "val_rows": int(len(X_val)),
+                    "xgboost_in_sys_modules": "xgboost" in sys.modules,
+                    "xgboost_callback_in_sys_modules": "xgboost.callback" in sys.modules,
+                },
+            )
+            # endregion
             backend_runtime_manifest = _backend_runtime_manifest(
                 backend,
                 backend_runtime_params=backend_runtime_params,
@@ -618,6 +715,18 @@ def train_and_select_rated_gbm_family(
                     hpo_objective_manifest=backend_manifest,
                     backend_runtime_params=backend_runtime_params,
                 )
+                # region agent log
+                _agent_debug_log(
+                    hypothesis_id="H2,H3",
+                    location="trainer/training/gbm_bakeoff.py:_run_backend_candidate",
+                    message="backend optuna completed",
+                    data={
+                        "backend": backend,
+                        "best_param_keys": sorted(hp_backend.keys()),
+                        "manifest": backend_manifest,
+                    },
+                )
+                # endregion
             else:
                 budget = resolve_backend_optuna_budget(
                     backend,
@@ -645,6 +754,18 @@ def train_and_select_rated_gbm_family(
                 val_dec026_window_hours=val_dec026_window_hours,
                 val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
             )
+            # region agent log
+            _agent_debug_log(
+                hypothesis_id="H2,H3,H4",
+                location="trainer/training/gbm_bakeoff.py:_run_backend_candidate",
+                message="backend final train completed",
+                data={
+                    "backend": backend,
+                    "model_type": type(model).__name__,
+                    "metric_keys": sorted(metrics.keys()),
+                },
+            )
+            # endregion
             metrics = dict(metrics)
             metrics["best_hyperparams"] = dict(hp_backend)
             metrics.update(backend_runtime_manifest)
@@ -713,6 +834,21 @@ def train_and_select_rated_gbm_family(
             }
             return backend, artifact, row
         except ImportError as exc:
+            # region agent log
+            _agent_debug_log(
+                hypothesis_id="H1,H4",
+                location="trainer/training/gbm_bakeoff.py:_run_backend_candidate",
+                message="backend import error",
+                data={
+                    "backend": backend,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "xgboost_in_sys_modules": "xgboost" in sys.modules,
+                    "xgboost_callback_in_sys_modules": "xgboost.callback" in sys.modules,
+                    "xgboost_training_in_sys_modules": "xgboost.training" in sys.modules,
+                },
+            )
+            # endregion
             row = {
                 "backend": backend,
                 "error": f"import_error:{exc}",
@@ -725,6 +861,18 @@ def train_and_select_rated_gbm_family(
             logger.warning("A3 gbm_bakeoff: %s skipped (%s)", backend, exc)
             return backend, {}, row
         except Exception as exc:
+            # region agent log
+            _agent_debug_log(
+                hypothesis_id="H2,H3,H4",
+                location="trainer/training/gbm_bakeoff.py:_run_backend_candidate",
+                message="backend non-import error",
+                data={
+                    "backend": backend,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            # endregion
             row = {
                 "backend": backend,
                 "error": str(exc),

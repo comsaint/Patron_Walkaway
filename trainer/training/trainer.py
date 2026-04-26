@@ -4832,16 +4832,14 @@ def run_backend_optuna_search(
     finally:
         optuna_pbar.close()
     best = _backend_hpo_defaults(backend_n)
-    best.update(dict(study.best_params))
-    if backend_n == "catboost" and runtime_manifest["backend_device_mode"] == "gpu":
-        best = _sanitize_catboost_params_for_runtime(
-            {
-                **best,
-                **dict(backend_runtime_params or {}),
-            }
+    try:
+        best.update(dict(study.best_params))
+    except ValueError:
+        logger.warning(
+            "Optuna (%s[%s]) completed no successful trials; returning backend defaults.",
+            label or "model",
+            backend_n,
         )
-        for key in dict(backend_runtime_params or {}):
-            best.pop(key, None)
     try:
         final_best_ap = study.best_value
     except ValueError:
