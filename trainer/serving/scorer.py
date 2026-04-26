@@ -8,8 +8,8 @@ Key changes from pre-Phase-1 version
   model.pkl only — no rated_model.pkl or walkaway_model.pkl fallback). The
   stored model object may be a single estimator or an ensemble wrapper.
 * D2 identity resolution via identity.py build_canonical_mapping_from_df.
-* Track Human features via features.py (compute_loss_streak / compute_run_boundary)
-  — guarantees train-serve parity with trainer.py. (table_hc deferred to Phase 2.)
+* Track Human features via features.py (compute_loss_streak / compute_run_boundary
+  / compute_table_hc) — train-serve parity with trainer.py (B1 / R7).
 * player_profile PIT join (R79): rated bets enriched with player profile
   features via as-of merge (snapshot_dtm <= bet_time); profile features stay NaN
   for non-rated bets and bets with no prior snapshot.
@@ -99,6 +99,7 @@ try:
     from features import (  # type: ignore[import]
         compute_loss_streak,
         compute_run_boundary,
+        compute_table_hc,
         compute_track_llm_features,
         load_feature_spec,
     )
@@ -107,6 +108,7 @@ except ImportError:
         from .features import (  # type: ignore[import, attr-defined]
             compute_loss_streak,
             compute_run_boundary,
+            compute_table_hc,
             compute_track_llm_features,
             load_feature_spec,
         )
@@ -114,17 +116,30 @@ except ImportError:
         from trainer.features import (  # type: ignore[import, attr-defined]
             compute_loss_streak,
             compute_run_boundary,
+            compute_table_hc,
             compute_track_llm_features,
             load_feature_spec,
         )
 
 try:
-    from identity import build_canonical_mapping_from_df  # type: ignore[import]
+    from identity import (  # type: ignore[import]
+        build_canonical_mapping_from_df,
+        build_pit_session_links_dataframe,
+        merge_pit_canonical_to_bets,
+    )
 except ImportError:
     try:
-        from .identity import build_canonical_mapping_from_df  # type: ignore[import, attr-defined]
+        from .identity import (  # type: ignore[import, attr-defined]
+            build_canonical_mapping_from_df,
+            build_pit_session_links_dataframe,
+            merge_pit_canonical_to_bets,
+        )
     except ImportError:
-        from trainer.identity import build_canonical_mapping_from_df  # type: ignore[import, attr-defined]
+        from trainer.identity import (  # type: ignore[import, attr-defined]
+            build_canonical_mapping_from_df,
+            build_pit_session_links_dataframe,
+            merge_pit_canonical_to_bets,
+        )
 
 try:
     from schema_io import normalize_bets_sessions  # type: ignore[import]
@@ -1118,8 +1133,8 @@ def build_features_for_scoring(
     Steps
     -----
     1. D2 identity: attach canonical_id from canonical_map.
-    2. Track Human (features.py): loss_streak, run-boundary, run P&L
-       — same functions as trainer.py. (table_hc deferred to Phase 2.)
+    2. Track Human (features.py): loss_streak, run-boundary, run P&L, table_hc
+       — same functions as trainer.py.
     3. Session rolling stats: bets_last_5/15/30m, wager_last_10/30m,
        cum_bets, cum_wager, avg_wager_sofar, session_duration_min,
        bets_per_minute (legacy parity with trainer.add_legacy_features).
@@ -1165,18 +1180,52 @@ def build_features_for_scoring(
     else:
         cutoff_naive = ct.to_pydatetime()
 
-    # ── D2 identity ───────────────────────────────────────────────────────
-    if not canonical_map.empty and "player_id" in canonical_map.columns:
-        bets_df = bets_df.merge(
-            canonical_map[["player_id", "canonical_id"]].drop_duplicates("player_id"),
-            on="player_id",
-            how="left",
+    # ── D2 identity (cutoff-window merge vs PIT merge_asof, B3) ────────────
+    _id_mode = "cutoff_window"
+    try:
+        if CANONICAL_MAPPING_CUTOFF_JSON.exists():
+            with open(CANONICAL_MAPPING_CUTOFF_JSON, encoding="utf-8") as _imf:
+                _side = json.load(_imf)
+            if isinstance(_side, dict) and _side.get("identity_mapping_mode"):
+                _id_mode = str(_side["identity_mapping_mode"]).strip().lower()
+    except Exception:
+        _id_mode = str(getattr(config, "IDENTITY_MAPPING_MODE", "cutoff_window")).strip().lower()
+    if _id_mode not in ("pit_asof", "cutoff_window"):
+        _id_mode = "cutoff_window"
+
+    _pit_done = False
+    if _id_mode == "pit_asof" and not sessions.empty:
+        try:
+            _delay = int(getattr(config, "SESSION_AVAIL_DELAY_MIN", 7))
+            _ph = int(getattr(config, "PLACEHOLDER_PLAYER_ID", -1))
+            _links = build_pit_session_links_dataframe(
+                sessions, cutoff_naive, _delay, _ph
+            )
+            bets_df = merge_pit_canonical_to_bets(bets_df, _links)
+            if "_pit_rated" in bets_df.columns:
+                _n_pre = len(bets_df)
+                bets_df = bets_df.loc[bets_df["_pit_rated"]].drop(columns=["_pit_rated"])
+                _pit_done = True
+                if len(bets_df) < _n_pre:
+                    logger.debug(
+                        "[scorer] PIT identity pruned %d unrated-at-obs-time rows",
+                        _n_pre - len(bets_df),
+                    )
+        except Exception as exc:
+            logger.warning("[scorer] PIT identity failed (%s); using cutoff_window merge", exc)
+
+    if not _pit_done:
+        if not canonical_map.empty and "player_id" in canonical_map.columns:
+            bets_df = bets_df.merge(
+                canonical_map[["player_id", "canonical_id"]].drop_duplicates("player_id"),
+                on="player_id",
+                how="left",
+            )
+        else:
+            bets_df["canonical_id"] = bets_df["player_id"].astype(str)
+        bets_df["canonical_id"] = bets_df["canonical_id"].fillna(
+            bets_df["player_id"].astype(str)
         )
-    else:
-        bets_df["canonical_id"] = bets_df["player_id"].astype(str)
-    bets_df["canonical_id"] = bets_df["canonical_id"].fillna(
-        bets_df["player_id"].astype(str)
-    )
 
     # Stable sort (required by Track Human functions and labels.py)
     bets_df = bets_df.sort_values(
@@ -1216,6 +1265,21 @@ def build_features_for_scoring(
     bets_df["net_win_per_bet_in_run"] = (
         rb["net_win_per_bet_in_run"] if "net_win_per_bet_in_run" in rb.columns else 0.0
     )
+
+    _hc_missing = {"table_id", "bet_id", "payout_complete_dtm", "player_id"} - set(bets_df.columns)
+    if _hc_missing:
+        logger.warning(
+            "build_features_for_scoring: table_hc skipped — missing columns %s",
+            sorted(_hc_missing),
+        )
+        bets_df["table_hc"] = np.int32(0)
+    else:
+        bets_df["table_hc"] = (
+            compute_table_hc(bets_df, cutoff_time=cutoff_naive)
+            .reindex(bets_df.index, fill_value=0)
+            .astype("int32")
+            .to_numpy()
+        )
 
     # ── Session rolling stats (legacy parity) ─────────────────────────────
     sess_df = sessions.copy() if not sessions.empty else pd.DataFrame()
@@ -2198,7 +2262,18 @@ def score_once(
             try:
                 canonical_map.to_parquet(CANONICAL_MAPPING_PARQUET, index=False)
                 CANONICAL_MAPPING_CUTOFF_JSON.write_text(
-                    json.dumps({"cutoff_dtm": now_hk.isoformat()}, indent=0),
+                    json.dumps(
+                        {
+                            "cutoff_dtm": now_hk.isoformat(),
+                            "identity_mapping_mode": str(
+                                getattr(config, "IDENTITY_MAPPING_MODE", "cutoff_window")
+                            ),
+                            "t_game_features_enabled": bool(
+                                getattr(config, "T_GAME_FEATURES_ENABLED", False)
+                            ),
+                        },
+                        indent=0,
+                    ),
                     encoding="utf-8",
                 )
                 logger.debug("[scorer] Canonical mapping persisted to %s", CANONICAL_MAPPING_PARQUET)
@@ -2219,12 +2294,24 @@ def score_once(
         if not canonical_map.empty and "player_id" in canonical_map.columns
         else set()
     )
-    if rated_player_ids:
-        bets_for_features = bets_for_features[
-            bets_for_features["player_id"].astype(str).isin(rated_player_ids)
-        ].copy()
-    else:
-        bets_for_features = bets_for_features.iloc[0:0].copy()
+    _identity_mode_for_filter = "cutoff_window"
+    try:
+        if CANONICAL_MAPPING_CUTOFF_JSON.exists():
+            with open(CANONICAL_MAPPING_CUTOFF_JSON, encoding="utf-8") as _imf0:
+                _sj0 = json.load(_imf0)
+            if isinstance(_sj0, dict) and _sj0.get("identity_mapping_mode"):
+                _identity_mode_for_filter = str(_sj0["identity_mapping_mode"]).strip().lower()
+    except Exception:
+        _identity_mode_for_filter = str(
+            getattr(config, "IDENTITY_MAPPING_MODE", "cutoff_window")
+        ).strip().lower()
+    if _identity_mode_for_filter != "pit_asof":
+        if rated_player_ids:
+            bets_for_features = bets_for_features[
+                bets_for_features["player_id"].astype(str).isin(rated_player_ids)
+            ].copy()
+        else:
+            bets_for_features = bets_for_features.iloc[0:0].copy()
     features_all = build_features_for_scoring(bets_for_features, sessions, canonical_map, now_hk)
 
     # Unified Plan v2 (T1): non-rated telemetry should come from raw new_bets + identity
@@ -2303,6 +2390,32 @@ def score_once(
             logger.debug("[scorer] Track LLM computed for scoring window")
         except Exception as exc:
             logger.error("[scorer] Track LLM failed: %s", exc)
+
+    if bool(getattr(config, "T_GAME_FEATURES_ENABLED", False)):
+        _data_root = _DATA_DIR if _DATA_DIR is not None else (PROJECT_ROOT / "data")
+        _tgp = _data_root / "gmwds_t_game.parquet"
+        if _tgp.is_file():
+            try:
+                from trainer.features import t_game_context as _tgc_sc
+            except ImportError:
+                try:
+                    from features import t_game_context as _tgc_sc  # type: ignore[no-redef]
+                except ImportError:
+                    _tgc_sc = None  # type: ignore[assignment]
+            if _tgc_sc is not None and not features_all.empty:
+                try:
+                    _win_start = pd.to_datetime(features_all["payout_complete_dtm"]).min()
+                    _win_end = pd.to_datetime(features_all["payout_complete_dtm"]).max()
+                    if pd.notna(_win_start) and pd.notna(_win_end):
+                        _buf = timedelta(days=int(getattr(config, "HISTORY_BUFFER_DAYS", 2)))
+                        features_all = _tgc_sc.join_t_game_features_for_bets(
+                            features_all,
+                            t_game_parquet=_tgp,
+                            window_start=_win_start - _buf,
+                            window_end=now_hk + timedelta(hours=1),
+                        )
+                except Exception as exc:
+                    logger.warning("[scorer] t_game context join skipped: %s", exc)
 
     # ── player_profile PIT join (R79) ─────────────────────────────────
     # Attach rated-player profile features via as-of merge (snapshot_dtm <= bet_time).

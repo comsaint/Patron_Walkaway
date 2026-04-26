@@ -587,6 +587,28 @@ def compute_loss_streak(
     return streak
 
 
+def compute_table_hc_features(
+    bets_df: pd.DataFrame,
+    cutoff_time: Optional[datetime] = None,
+    lookback_hours: Optional[float] = None,
+) -> pd.DataFrame:
+    """Return DataFrame with ``table_hc`` for YAML Track Human contract (B1 / R7).
+
+    ``lookback_hours`` is accepted for signature parity with other Track Human
+    vectorized helpers; ``compute_table_hc`` already applies ``BET_AVAIL_DELAY_MIN``
+    and ``TABLE_HC_WINDOW_MIN`` window semantics on the full ``bets_df`` pool.
+    """
+    del lookback_hours  # pool is window-based; lookback is enforced upstream (scorer/trainer)
+    df = bets_df.copy()
+    missing = _REQUIRED_HC_COLS - set(df.columns)
+    if missing:
+        df["table_hc"] = np.int32(0)
+        return df
+    hc = compute_table_hc(df, cutoff_time=cutoff_time)
+    df["table_hc"] = hc.reindex(df.index, fill_value=0).astype("int32")
+    return df
+
+
 def compute_loss_streak_features(
     bets_df: pd.DataFrame,
     cutoff_time: Optional[datetime] = None,

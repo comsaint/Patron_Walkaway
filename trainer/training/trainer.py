@@ -418,6 +418,7 @@ try:
         compute_consecutive_non_win_streak,
         compute_loss_streak,
         compute_run_boundary,
+        compute_table_hc,
         compute_track_llm_features,
         load_feature_spec,
         join_player_profile,
@@ -451,6 +452,7 @@ except ModuleNotFoundError:
         compute_consecutive_non_win_streak,
         compute_loss_streak,
         compute_run_boundary,
+        compute_table_hc,
         compute_track_llm_features,
         load_feature_spec,
         join_player_profile,
@@ -500,6 +502,7 @@ _REQUIRED_BET_PARQUET_COLS: list = [
     "bet_id",
     "session_id",
     "player_id",
+    "game_id",
     "table_id",
     "payout_complete_dtm",
     "gaming_day",
@@ -725,6 +728,288 @@ HAVING COUNT(session_id) = 1
         return (links_df, dummy_pids)
     finally:
         con.close()
+
+
+def build_pit_session_links_from_duckdb(
+    session_parquet_path: Path,
+    train_end: datetime,
+) -> pd.DataFrame:
+    """Build PIT session link timeline for :func:`merge_pit_canonical_to_bets` (B3).
+
+    Same dedup/DQ/cutoff as canonical DuckDB links, plus ``link_usable_time`` column.
+    """
+    try:
+        import duckdb
+    except ImportError as e:
+        raise RuntimeError(
+            "build_pit_session_links_from_duckdb requires duckdb; install with: pip install duckdb"
+        ) from e
+
+    path = Path(session_parquet_path).resolve()
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"Session Parquet not found: {path}")
+
+    required = set(_CANONICAL_MAP_SESSION_COLS)
+    try:
+        import pyarrow.parquet as _pq_sess
+
+        schema_names = set(_pq_sess.read_schema(path).names)
+    except Exception as e:
+        raise ValueError(f"Session Parquet schema read failed: {e}") from e
+    missing = required - schema_names
+    if missing:
+        raise ValueError(f"Session Parquet missing required columns: {sorted(missing)}")
+
+    get_cfg = getattr(_cfg, "get_duckdb_memory_config", None)
+    if get_cfg is not None:
+        threads = get_cfg("canonical_map")[4]
+    else:
+        threads = getattr(_cfg, "CANONICAL_MAP_DUCKDB_THREADS", 1)
+    try:
+        threads = max(1, int(threads))
+    except (TypeError, ValueError):
+        raise ValueError("CANONICAL_MAP_DUCKDB_THREADS must be a positive integer")
+
+    clean_sql = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", None) or CASINO_PLAYER_ID_CLEAN_SQL
+    if ";" in (clean_sql or ""):
+        raise ValueError("CASINO_PLAYER_ID_CLEAN_SQL must not contain semicolon")
+
+    path_escaped = str(path).replace("'", "''")
+    _te = train_end
+    if hasattr(_te, "tzinfo") and _te.tzinfo is not None:
+        _te = pd.Timestamp(_te).tz_convert("Asia/Hong_Kong").replace(tzinfo=None)
+    cutoff_str = pd.Timestamp(_te).strftime("%Y-%m-%d %H:%M:%S")
+    placeholder = PLACEHOLDER_PLAYER_ID
+    delay_min = int(SESSION_AVAIL_DELAY_MIN)
+
+    cte = f"""WITH deduped AS (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY session_id
+            ORDER BY lud_dtm DESC NULLS LAST
+        ) AS rn
+    FROM read_parquet('{path_escaped}')
+)"""
+    pit_sql = f"""
+{cte}
+SELECT player_id,
+       ({clean_sql}) AS casino_player_id,
+       lud_dtm,
+       CAST(COALESCE(session_end_dtm, lud_dtm) AS TIMESTAMP)
+         + INTERVAL '{delay_min}' MINUTE AS link_usable_time
+FROM deduped
+WHERE rn = 1
+  AND is_manual = 0
+  AND is_deleted = 0 AND is_canceled = 0
+  AND player_id IS NOT NULL AND player_id != {placeholder}
+  AND COALESCE(session_end_dtm, lud_dtm) <= '{cutoff_str}'
+  AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0)
+  AND ({clean_sql}) IS NOT NULL"""
+
+    temp_dir_raw = str(DATA_DIR / "duckdb_tmp")
+    temp_dir = temp_dir_raw if "'" not in temp_dir_raw else str(DATA_DIR / "duckdb_tmp")
+    Path(temp_dir).mkdir(parents=True, exist_ok=True)
+    temp_dir_sql = temp_dir.replace("'", "''")
+
+    try:
+        import psutil as _psutil
+
+        _avail = int(_psutil.virtual_memory().available)
+    except Exception:
+        _avail = None
+    _resolve_runtime = getattr(_cfg, "resolve_duckdb_runtime_policy", None)
+    if callable(_resolve_runtime):
+        runtime_policy = _resolve_runtime(
+            "canonical_map",
+            _avail,
+            input_bytes=int(path.stat().st_size),
+        )
+    else:
+        budget_bytes = _compute_canonical_map_duckdb_budget(_avail)
+        runtime_policy = {
+            "stage": "canonical_map",
+            "memory_limit_bytes": budget_bytes,
+            "threads": int(threads),
+            "temp_directory": temp_dir,
+            "preserve_insertion_order": False,
+        }
+    mem_gb = float(runtime_policy["memory_limit_bytes"]) / 1024**3
+
+    con = duckdb.connect(":memory:")
+    try:
+        _apply_runtime = getattr(_cfg, "apply_duckdb_runtime", None)
+        if callable(_apply_runtime):
+            _apply_runtime(con, runtime_policy)
+        else:
+            con.execute(f"SET memory_limit = '{mem_gb}GB'")
+            con.execute(f"SET threads = {int(runtime_policy['threads'])}")
+            con.execute(f"SET temp_directory = '{temp_dir_sql}'")
+            con.execute("SET preserve_insertion_order = false")
+        out = con.execute(pit_sql).df()
+    finally:
+        con.close()
+    if out.empty:
+        return pd.DataFrame(columns=["player_id", "casino_player_id", "lud_dtm", "link_usable_time"])
+    out["casino_player_id"] = out["casino_player_id"].astype(str)
+    out["lud_dtm"] = pd.to_datetime(out["lud_dtm"], errors="coerce")
+    out["link_usable_time"] = pd.to_datetime(out["link_usable_time"], errors="coerce")
+    return out.sort_values(
+        ["player_id", "link_usable_time", "lud_dtm"],
+        ascending=True,
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+def attach_pit_identity_chunk_duckdb(
+    bets_df: pd.DataFrame,
+    session_parquet_path: Path,
+    observation_end: datetime,
+) -> pd.DataFrame:
+    """Attach ``canonical_id`` / ``_pit_rated`` using chunk-scoped DuckDB ASOF join.
+
+    Uses only distinct ``player_id`` observed in *bets_df* and session links with
+    business time <= ``observation_end`` so we avoid global 10M+ link materialization.
+    """
+    try:
+        import duckdb
+    except ImportError as exc:
+        raise RuntimeError(
+            "attach_pit_identity_chunk_duckdb requires duckdb; install with: pip install duckdb"
+        ) from exc
+
+    required = {"bet_id", "player_id", "payout_complete_dtm"}
+    missing = required - set(bets_df.columns)
+    if missing:
+        raise ValueError(f"attach_pit_identity_chunk_duckdb: missing columns {sorted(missing)}")
+    if bets_df.empty:
+        out = bets_df.copy()
+        out["canonical_id"] = out["player_id"].astype(str)
+        out["_pit_rated"] = False
+        return out
+    path = Path(session_parquet_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Session Parquet not found: {path}")
+
+    # Keep only identity columns and stable row index for write-back.
+    work = bets_df.loc[:, ["bet_id", "player_id", "payout_complete_dtm"]].copy()
+    work["payout_complete_dtm"] = pd.to_datetime(work["payout_complete_dtm"], errors="coerce")
+    if work["payout_complete_dtm"].dt.tz is not None:
+        work["payout_complete_dtm"] = work["payout_complete_dtm"].dt.tz_convert("Asia/Hong_Kong").dt.tz_localize(None)
+    work["_pit_row"] = np.arange(len(work), dtype=np.int64)
+    work = work[work["player_id"].notna() & work["payout_complete_dtm"].notna()].copy()
+    if work.empty:
+        out = bets_df.copy()
+        out["canonical_id"] = out["player_id"].astype(str)
+        out["_pit_rated"] = False
+        return out
+
+    _oe = pd.Timestamp(observation_end)
+    if _oe.tzinfo is not None:
+        _oe = _oe.tz_convert("Asia/Hong_Kong").tz_localize(None)
+    cutoff_str = _oe.strftime("%Y-%m-%d %H:%M:%S")
+    delay_min = int(SESSION_AVAIL_DELAY_MIN)
+    clean_sql = getattr(_cfg, "CASINO_PLAYER_ID_CLEAN_SQL", None) or CASINO_PLAYER_ID_CLEAN_SQL
+    if ";" in str(clean_sql):
+        raise ValueError("CASINO_PLAYER_ID_CLEAN_SQL must not contain semicolon")
+    path_sql = str(path).replace("'", "''")
+
+    sql = f"""
+WITH bets_identity AS (
+    SELECT _pit_row, bet_id, player_id, CAST(payout_complete_dtm AS TIMESTAMP) AS payout_complete_dtm
+    FROM bets_input
+),
+player_scope AS (
+    SELECT DISTINCT player_id
+    FROM bets_identity
+),
+deduped AS (
+    SELECT *,
+           ROW_NUMBER() OVER (
+               PARTITION BY session_id
+               ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC NULLS LAST
+           ) AS rn
+    FROM read_parquet('{path_sql}')
+),
+links AS (
+    SELECT d.player_id,
+           ({clean_sql}) AS casino_player_id,
+           CAST(d.lud_dtm AS TIMESTAMP) AS lud_dtm,
+           CAST(COALESCE(d.session_end_dtm, d.lud_dtm) AS TIMESTAMP)
+               + INTERVAL '{delay_min}' MINUTE AS link_usable_time
+    FROM deduped d
+    INNER JOIN player_scope p
+        ON d.player_id = p.player_id
+    WHERE d.rn = 1
+      AND d.is_manual = 0
+      AND d.is_deleted = 0 AND d.is_canceled = 0
+      AND d.player_id IS NOT NULL AND d.player_id != {PLACEHOLDER_PLAYER_ID}
+      AND COALESCE(d.session_end_dtm, d.lud_dtm) <= TIMESTAMP '{cutoff_str}'
+      AND (COALESCE(d.turnover, 0) > 0 OR COALESCE(d.num_games_with_wager, 0) > 0)
+      AND ({clean_sql}) IS NOT NULL
+),
+asof_joined AS (
+    SELECT b._pit_row,
+           b.player_id,
+           b.bet_id,
+           b.payout_complete_dtm,
+           l.casino_player_id
+    FROM bets_identity b
+    ASOF LEFT JOIN links l
+      ON b.player_id = l.player_id
+     AND b.payout_complete_dtm >= l.link_usable_time
+)
+SELECT _pit_row,
+       player_id,
+       casino_player_id
+FROM asof_joined
+ORDER BY _pit_row
+"""
+
+    try:
+        import psutil as _psutil
+        _avail = int(_psutil.virtual_memory().available)
+    except Exception:
+        _avail = None
+    _resolve_runtime = getattr(_cfg, "resolve_duckdb_runtime_policy", None)
+    if callable(_resolve_runtime):
+        runtime_policy = _resolve_runtime("canonical_map", _avail, input_bytes=int(path.stat().st_size))
+    else:
+        runtime_policy = {"memory_limit_bytes": int(2 * 1024**3), "threads": 1, "temp_directory": str(DATA_DIR / "duckdb_tmp"), "preserve_insertion_order": False}
+
+    con = duckdb.connect(":memory:")
+    try:
+        _apply_runtime = getattr(_cfg, "apply_duckdb_runtime", None)
+        if callable(_apply_runtime):
+            _apply_runtime(con, runtime_policy)
+        con.register("bets_input", work)
+        t0 = time.perf_counter()
+        out_df = con.execute(sql).df()
+        elapsed = time.perf_counter() - t0
+    finally:
+        con.close()
+
+    logger.info(
+        "Chunk PIT identity DuckDB: players=%d links_join_rows=%d elapsed=%.1fs mem_limit=%.2fGB threads=%d",
+        int(work["player_id"].nunique()),
+        len(out_df),
+        elapsed,
+        float(runtime_policy["memory_limit_bytes"]) / 1024**3,
+        int(runtime_policy["threads"]),
+    )
+    merged = bets_df.copy()
+    merged["canonical_id"] = merged["player_id"].astype(str)
+    merged["_pit_rated"] = False
+    if out_df.empty:
+        return merged
+    out_df = out_df.sort_values("_pit_row", kind="stable")
+    _cpid = out_df["casino_player_id"]
+    _pid = out_df["player_id"].astype(str)
+    _canon = _cpid.where(_cpid.notna(), _pid).astype(str).to_numpy()
+    _rated = _cpid.notna().to_numpy()
+    _row = out_df["_pit_row"].to_numpy(dtype=np.int64)
+    merged.loc[_row, "canonical_id"] = _canon
+    merged.loc[_row, "_pit_rated"] = _rated
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -1767,6 +2052,22 @@ def add_track_human_features(
     df["net_win_in_run_so_far"] = run_df["net_win_in_run_so_far"].reindex(df.index, fill_value=0.0).values
     df["net_win_per_bet_in_run"] = run_df["net_win_per_bet_in_run"].reindex(df.index, fill_value=0.0).values
 
+    # table_hc (R7): same compute_table_hc as scorer — unique players per table in S1 window
+    _hc_missing = {"table_id", "bet_id", "payout_complete_dtm", "player_id"} - set(df.columns)
+    if _hc_missing:
+        logger.warning(
+            "add_track_human_features: table_hc skipped — missing columns %s",
+            sorted(_hc_missing),
+        )
+        df["table_hc"] = np.int32(0)
+    else:
+        df["table_hc"] = (
+            compute_table_hc(df, cutoff_time=window_end)
+            .reindex(df.index, fill_value=0)
+            .astype("int32")
+            .to_numpy()
+        )
+
     return df
 
 
@@ -2061,6 +2362,9 @@ def _chunk_cache_components(
     neg_sample_frac: float = 1.0,
     *,
     data_hash: Optional[str] = None,
+    identity_mapping_mode: str = "cutoff_window",
+    pit_identity_engine: str = "cutoff_window_map",
+    t_game_visible_time_column: str = "none",
 ) -> dict:
     """Pipeline components that determine chunk cache validity (TRN-07 / Task 7 R3).
 
@@ -2083,8 +2387,14 @@ def _chunk_cache_components(
     cfg_str = json.dumps({
         "WALKAWAY_GAP_MIN": WALKAWAY_GAP_MIN,
         "SESSION_AVAIL_DELAY_MIN": SESSION_AVAIL_DELAY_MIN,
+        "BET_AVAIL_DELAY_MIN": BET_AVAIL_DELAY_MIN,
+        "TABLE_HC_WINDOW_MIN": int(getattr(_cfg, "TABLE_HC_WINDOW_MIN", 30)),
         "HISTORY_BUFFER_DAYS": HISTORY_BUFFER_DAYS,
         "TRACK_HUMAN_LOOKBACK_HOURS": _effective_lookback,
+        "identity_mapping_mode": str(identity_mapping_mode),
+        "pit_identity_engine": str(pit_identity_engine),
+        "t_game_features_enabled": bool(getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)),
+        "t_game_visible_time_column": str(t_game_visible_time_column),
     }, sort_keys=True)
     cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:6]
     feature_spec_cache_hash = str(feature_spec_hash)
@@ -2384,11 +2694,14 @@ def process_chunk(
     feature_spec_hash: str = "none",
     neg_sample_frac: float = NEG_SAMPLE_FRAC,
     chunk_cache_stats: Optional[Dict[str, int]] = None,
+    *,
+    identity_mapping_mode: str = "cutoff_window",
 ) -> Optional[Path]:
     """Process one monthly chunk; return path to written Parquet or None if empty.
 
-    The canonical_map is built once at the global level (cutoff = training end)
-    and passed in here.  Phase 2 should use per-chunk PIT mapping.
+    ``canonical_map`` is the legacy cutoff-window map (``identity_mapping_mode=cutoff_window``).
+    When ``identity_mapping_mode=pit_asof`` and local parquet is enabled,
+    chunk-scoped DuckDB ASOF join attaches ``canonical_id`` per bet time (B3).
     dummy_player_ids: FND-12 dummy/fake-account player_ids to drop from training (TRN-04).
     profile_df: player_profile snapshot table for PIT join (PLAN Step 4/DEC-011).
         Pass None to skip; profile feature columns will be 0 for all rows.
@@ -2428,6 +2741,14 @@ def process_chunk(
     chunk_path = _chunk_parquet_path(chunk)
     key_path = chunk_path.with_suffix(".cache_key")
     _source_mode = "local_parquet" if use_local_parquet else "clickhouse"
+    _pit_engine = (
+        "duckdb_chunk_asof"
+        if str(identity_mapping_mode or "").strip().lower() == "pit_asof" and use_local_parquet
+        else "cutoff_window_map"
+    )
+    _t_game_visible_col = (
+        "__etl_insert_Dtm" if bool(getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)) else "none"
+    )
 
     # R77 / Task 7 R4: profile snapshot fingerprint (chunk-scoped).
     _profile_hash = _profile_hash_chunk_scoped(profile_df, window_end)
@@ -2443,6 +2764,9 @@ def process_chunk(
             feature_spec_hash=feature_spec_hash,
             neg_sample_frac=neg_sample_frac,
             data_hash=_dh_local,
+            identity_mapping_mode=identity_mapping_mode,
+            pit_identity_engine=_pit_engine,
+            t_game_visible_time_column=_t_game_visible_col,
         )
         current_key = _fingerprint_from_chunk_cache_components(_cache_components)
         if not force_recompute and chunk_path.exists():
@@ -2480,6 +2804,9 @@ def process_chunk(
             profile_hash=_profile_hash,
             feature_spec_hash=feature_spec_hash,
             neg_sample_frac=neg_sample_frac,
+            identity_mapping_mode=identity_mapping_mode,
+            pit_identity_engine=_pit_engine,
+            t_game_visible_time_column=_t_game_visible_col,
         )
         current_key = _fingerprint_from_chunk_cache_components(_cache_components)
         if not force_recompute and chunk_path.exists():
@@ -2525,48 +2852,88 @@ def process_chunk(
             logger.warning("Chunk %s–%s: empty after FND-12 filter", window_start.date(), window_end.date())
             return None
 
-    # --- Identity: attach canonical_id ---
-    if not canonical_map.empty and "player_id" in canonical_map.columns:
-        bets = bets.merge(
-            canonical_map[["player_id", "canonical_id"]].drop_duplicates("player_id"),
-            on="player_id",
-            how="left",
+    # --- Identity: attach canonical_id (cutoff-window vs PIT as-of, B3) ---
+    _mode = str(identity_mapping_mode or "cutoff_window").strip().lower()
+    _use_pit = (_mode == "pit_asof" and use_local_parquet)
+    if _use_pit:
+        _sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+        try:
+            bets = attach_pit_identity_chunk_duckdb(
+                bets_df=bets,
+                session_parquet_path=_sess_path,
+                observation_end=extended_end,
+            )
+            if "_pit_rated" not in bets.columns:
+                logger.warning(
+                    "Chunk %s–%s: PIT DuckDB merge missing _pit_rated; fallback to cutoff_window",
+                    window_start.date(),
+                    window_end.date(),
+                )
+                _use_pit = False
+        except Exception as _pit_exc:
+            logger.warning(
+                "Chunk %s–%s: PIT DuckDB identity failed (%s); fallback to cutoff_window",
+                window_start.date(),
+                window_end.date(),
+                _pit_exc,
+            )
+            _use_pit = False
+    if not _use_pit:
+        if not canonical_map.empty and "player_id" in canonical_map.columns:
+            bets = bets.merge(
+                canonical_map[["player_id", "canonical_id"]].drop_duplicates("player_id"),
+                on="player_id",
+                how="left",
+            )
+        else:
+            bets["canonical_id"] = bets["player_id"].astype(str)
+        bets["canonical_id"] = bets["canonical_id"].fillna(bets["player_id"].astype(str))
+        _rated_for_prune: set = (
+            set(canonical_map["canonical_id"].astype(str).unique())
+            if not canonical_map.empty and "canonical_id" in canonical_map.columns
+            else set()
         )
+        bets["canonical_id"] = bets["canonical_id"].astype(str)
+        if _rated_for_prune:
+            _n_before_rated_prune = len(bets)
+            bets = bets[bets["canonical_id"].isin(_rated_for_prune)].copy()
+            _n_pruned = _n_before_rated_prune - len(bets)
+            if _n_pruned > 0:
+                logger.info(
+                    "Chunk %s–%s: early-pruned %d unrated rows before heavy FE (rated_rows=%d)",
+                    window_start.date(),
+                    window_end.date(),
+                    _n_pruned,
+                    len(bets),
+                )
+        else:
+            logger.warning(
+                "Chunk %s–%s: canonical_map empty -> no rated rows; skip heavy FE",
+                window_start.date(),
+                window_end.date(),
+            )
+            return None
     else:
-        bets["canonical_id"] = bets["player_id"].astype(str)
-
-    # R27: Fallback — rows absent from canonical mapping keep their player_id as canonical_id.
-    # Without this, left-merge NaNs would be dropped by labels.compute_labels, losing
-    # all anonymous (non-rated) players from training data.
-    bets["canonical_id"] = bets["canonical_id"].fillna(bets["player_id"].astype(str))
-
-    # H3 routing contract: every canonical_id in mapping is rated; unrated rows should
-    # not enter heavy FE path (Track Human / Track LLM / labels / profile join).
-    rated_ids: set = (
-        set(canonical_map["canonical_id"].astype(str).unique())
-        if not canonical_map.empty and "canonical_id" in canonical_map.columns
-        else set()
-    )
-    bets["canonical_id"] = bets["canonical_id"].astype(str)
-    if rated_ids:
-        _n_before_rated_prune = len(bets)
-        bets = bets[bets["canonical_id"].isin(rated_ids)].copy()
-        _n_pruned = _n_before_rated_prune - len(bets)
+        _n_before = len(bets)
+        bets = bets.loc[bets["_pit_rated"]].copy()
+        bets.drop(columns=["_pit_rated"], inplace=True)
+        bets["canonical_id"] = bets["canonical_id"].astype(str)
+        _n_pruned = _n_before - len(bets)
         if _n_pruned > 0:
             logger.info(
-                "Chunk %s–%s: early-pruned %d unrated rows before heavy FE (rated_rows=%d)",
+                "Chunk %s–%s: PIT early-pruned %d unrated-at-bet-time rows (rated_rows=%d)",
                 window_start.date(),
                 window_end.date(),
                 _n_pruned,
                 len(bets),
             )
-    else:
-        logger.warning(
-            "Chunk %s–%s: canonical_map empty -> no rated rows; skip heavy FE",
-            window_start.date(),
-            window_end.date(),
-        )
-        return None
+        if bets.empty:
+            logger.warning(
+                "Chunk %s–%s: empty after PIT rated-only prune",
+                window_start.date(),
+                window_end.date(),
+            )
+            return None
     if bets.empty:
         logger.warning(
             "Chunk %s–%s: empty after rated-only early prune",
@@ -2574,6 +2941,13 @@ def process_chunk(
             window_end.date(),
         )
         return None
+
+    # Global rated canonical_id universe (for is_rated flag; same cutoff map as Step 3).
+    rated_ids: set = (
+        set(canonical_map["canonical_id"].astype(str).unique())
+        if not canonical_map.empty and "canonical_id" in canonical_map.columns
+        else set()
+    )
 
     # --- Track Human features (on rated-only bets incl. history, cutoff=window_end) ---
     # Computing before label filtering ensures cross-chunk state (loss_streak,
@@ -2651,6 +3025,30 @@ def process_chunk(
             window_end.date(),
             time.perf_counter() - _t0_llm,
         )
+
+    # B2: optional ``t_game`` table context (DuckDB pushdown; default off in CI).
+    if bool(getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)) and use_local_parquet:
+        _tgp = LOCAL_PARQUET_DIR / "gmwds_t_game.parquet"
+        if _tgp.is_file():
+            try:
+                try:
+                    from trainer.features import t_game_context as _tgc
+                except ImportError:
+                    from features import t_game_context as _tgc  # type: ignore[no-redef]
+
+                bets = _tgc.join_t_game_features_for_bets(
+                    bets,
+                    t_game_parquet=_tgp,
+                    window_start=history_start,
+                    window_end=extended_end,
+                )
+            except Exception as _tgx:
+                logger.warning(
+                    "Chunk %s–%s: t_game context features skipped (%s)",
+                    window_start.date(),
+                    window_end.date(),
+                    _tgx,
+                )
 
     # --- Labels (C1 extended pull) ---
     labeled = compute_labels(
@@ -3031,6 +3429,8 @@ def _export_parquet_to_libsvm(
                             x = 0.0
                         if x != 0.0:
                             parts.append(f"{i}:{x}")
+                    # Keep LibSVM dimensionality stable even when tail features are all-zero.
+                    parts.append(f"{nf - 1}:0")
                     f_lib.write(" ".join(parts) + "\n")
                     f_w.write(f"{w}\n")
                     n_train += 1
@@ -3082,6 +3482,8 @@ def _export_parquet_to_libsvm(
                             x = 0.0
                         if x != 0.0:
                             parts.append(f"{i}:{x}")
+                    # Keep LibSVM dimensionality stable even when tail features are all-zero.
+                    parts.append(f"{nf - 1}:0")
                     f_lib.write(" ".join(parts) + "\n")
                     n_valid += 1
         os.replace(valid_libsvm_tmp, valid_libsvm)
@@ -3123,6 +3525,8 @@ def _export_parquet_to_libsvm(
                                 x = 0.0
                             if x != 0.0:
                                 parts.append(f"{i}:{x}")
+                        # Keep LibSVM dimensionality stable even when tail features are all-zero.
+                        parts.append(f"{nf - 1}:0")
                         f_lib.write(" ".join(parts) + "\n")
                         n_test += 1
             os.replace(test_libsvm_tmp, test_libsvm)
@@ -3595,14 +3999,14 @@ def _write_skipped_optuna_manifest_for_libsvm(
                 int(OPTUNA_N_TRIALS) if isinstance(OPTUNA_N_TRIALS, int) else None
             ),
             "optuna_hpo_timeout_seconds": (
-                int(OPTUNA_HPO_TIMEOUT_SECONDS)
-                if isinstance(OPTUNA_HPO_TIMEOUT_SECONDS, int) and OPTUNA_HPO_TIMEOUT_SECONDS > 0
+                int(OPTUNA_TIMEOUT_SECONDS)
+                if isinstance(OPTUNA_TIMEOUT_SECONDS, int) and OPTUNA_TIMEOUT_SECONDS > 0
                 else None
             ),
             "optuna_hpo_early_stop_patience": (
-                int(OPTUNA_HPO_EARLY_STOP_PATIENCE)
-                if isinstance(OPTUNA_HPO_EARLY_STOP_PATIENCE, int)
-                and OPTUNA_HPO_EARLY_STOP_PATIENCE > 0
+                int(OPTUNA_EARLY_STOP_PATIENCE)
+                if isinstance(OPTUNA_EARLY_STOP_PATIENCE, int)
+                and OPTUNA_EARLY_STOP_PATIENCE > 0
                 else None
             ),
             "optuna_hpo_study_best_trial_value": None,
@@ -6869,6 +7273,9 @@ def build_model_metadata_document(
     bundle_dir: Path,
     combined_metrics: Optional[dict[str, Any]] = None,
     model_used_splits: Optional[dict[str, dict[str, Any]]] = None,
+    identity_mapping_mode: str = "cutoff_window",
+    t_game_features_enabled: bool = False,
+    t_game_visible_time_column: str = "none",
 ) -> dict[str, Any]:
     """Assemble ``model_metadata.json`` payload (versioned schema v1)."""
     def _iso_any(x: Any) -> Any:
@@ -6942,6 +7349,9 @@ def build_model_metadata_document(
             "a4_candidate_rows_train": _rated_d.get("a4_candidate_rows_train"),
             "a4_candidate_rows_valid": _rated_d.get("a4_candidate_rows_valid"),
             "a4_candidate_rows_test": _rated_d.get("a4_candidate_rows_test"),
+            "identity_mapping_mode": str(identity_mapping_mode),
+            "t_game_features_enabled": bool(t_game_features_enabled),
+            "t_game_visible_time_column": str(t_game_visible_time_column),
         },
         "artifacts": {
             "bundle_dir": str(bundle_dir.resolve()),
@@ -7583,6 +7993,30 @@ def run_pipeline(args) -> None:
                 # DEC-018: tz_convert to HK first, then strip tz, matching labels.py semantics.
                 train_end = pd.Timestamp(train_end).tz_convert("Asia/Hong_Kong")
                 train_end = train_end.replace(tzinfo=None)
+
+            # B3: identity mapping mode (PIT path is now chunk-scoped in process_chunk).
+            _idm_raw = str(getattr(_cfg, "IDENTITY_MAPPING_MODE", "pit_asof")).strip().lower()
+            if _idm_raw not in ("pit_asof", "cutoff_window"):
+                logger.warning(
+                    "IDENTITY_MAPPING_MODE=%r invalid (use pit_asof or cutoff_window); using cutoff_window",
+                    getattr(_cfg, "IDENTITY_MAPPING_MODE", None),
+                )
+                _idm_raw = "cutoff_window"
+            effective_identity_mode = _idm_raw
+            if effective_identity_mode == "pit_asof" and not use_local:
+                logger.warning(
+                    "IDENTITY_MAPPING_MODE=pit_asof requires local Parquet; using cutoff_window for this run",
+                )
+                effective_identity_mode = "cutoff_window"
+            if effective_identity_mode == "pit_asof":
+                _sess_pit_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+                if not _sess_pit_path.is_file():
+                    logger.warning(
+                        "IDENTITY_MAPPING_MODE=pit_asof but session Parquet missing (%s); "
+                        "using cutoff_window",
+                        _sess_pit_path,
+                    )
+                    effective_identity_mode = "cutoff_window"
         
             # 3. Build canonical mapping with TRAINING window cutoff (B1 — prevents
             #    identity links that arose after training from leaking into training data).
@@ -7702,6 +8136,32 @@ def run_pipeline(args) -> None:
                 "Canonical mapping: %d rows; FND-12 dummy player_ids to exclude: %d  (%.1fs)",
                 len(canonical_map), len(dummy_player_ids), _el,
             )
+
+            # B3: enrich canonical sidecar with identity mode (merge with existing keys).
+            try:
+                _sidecar_path = CANONICAL_MAPPING_CUTOFF_JSON
+                _sidecar_data: dict = {}
+                if _sidecar_path.exists():
+                    with open(_sidecar_path, encoding="utf-8") as _sf:
+                        _sidecar_data = json.load(_sf)
+                if not isinstance(_sidecar_data, dict):
+                    _sidecar_data = {}
+                if "cutoff_dtm" not in _sidecar_data:
+                    _te_iso = train_end.isoformat() if hasattr(train_end, "isoformat") else str(train_end)
+                    _sidecar_data["cutoff_dtm"] = _te_iso
+                if "dummy_player_ids" not in _sidecar_data:
+                    _sidecar_data["dummy_player_ids"] = list(dummy_player_ids)
+                _sidecar_data["identity_mapping_mode"] = effective_identity_mode
+                _sidecar_data["t_game_features_enabled"] = bool(
+                    getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)
+                )
+                _sidecar_data["t_game_visible_time_column"] = (
+                    "__etl_insert_Dtm" if bool(getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)) else "none"
+                )
+                with open(_sidecar_path, "w", encoding="utf-8") as _sf:
+                    json.dump(_sidecar_data, _sf, indent=0)
+            except Exception as _side_exc:
+                logger.warning("Could not update canonical_mapping.cutoff.json sidecar (%s)", _side_exc)
         
             # Rated-patron sampling is an independent option controlled by --sample-rated N.
             rated_whitelist: Optional[set] = None
@@ -7814,6 +8274,7 @@ def run_pipeline(args) -> None:
                         feature_spec_hash=feature_spec_hash,
                         neg_sample_frac=1.0,
                         chunk_cache_stats=chunk_cache_stats,
+                        identity_mapping_mode=effective_identity_mode,
                     )
                     if path1 is not None:
                         _path1 = Path(path1) if isinstance(path1, str) else path1
@@ -7834,6 +8295,7 @@ def run_pipeline(args) -> None:
                                     feature_spec_hash=feature_spec_hash,
                                     neg_sample_frac=_effective_neg_sample_frac,
                                     chunk_cache_stats=chunk_cache_stats,
+                                    identity_mapping_mode=effective_identity_mode,
                                 )
                                 if path1_rerun is not None:
                                     chunk_paths.append(path1_rerun)
@@ -7861,6 +8323,7 @@ def run_pipeline(args) -> None:
                                 feature_spec_hash=feature_spec_hash,
                                 neg_sample_frac=_effective_neg_sample_frac,
                                 chunk_cache_stats=chunk_cache_stats,
+                                identity_mapping_mode=effective_identity_mode,
                             )
                             if path is not None:
                                 chunk_paths.append(path)
@@ -7880,6 +8343,7 @@ def run_pipeline(args) -> None:
                                 feature_spec_hash=feature_spec_hash,
                                 neg_sample_frac=_effective_neg_sample_frac,
                                 chunk_cache_stats=chunk_cache_stats,
+                                identity_mapping_mode=effective_identity_mode,
                             )
                             if path is not None:
                                 chunk_paths.append(path)
@@ -7898,6 +8362,7 @@ def run_pipeline(args) -> None:
                             feature_spec_hash=feature_spec_hash,
                             neg_sample_frac=_effective_neg_sample_frac,
                             chunk_cache_stats=chunk_cache_stats,
+                            identity_mapping_mode=effective_identity_mode,
                         )
                         if path is not None:
                             chunk_paths.append(path)
@@ -8539,6 +9004,7 @@ def run_pipeline(args) -> None:
                         feature_spec_hash=feature_spec_hash,
                         neg_sample_frac=neg_frac,
                         chunk_cache_stats=chunk_cache_stats,
+                        identity_mapping_mode=effective_identity_mode,
                     )
                     if _path is not None:
                         paths.append(_path)
@@ -8970,6 +9436,11 @@ def run_pipeline(args) -> None:
                 bundle_dir=_bundle_dir,
                 combined_metrics=combined_metrics,
                 model_used_splits=_model_used_split_meta,
+                identity_mapping_mode=effective_identity_mode,
+                t_game_features_enabled=bool(getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)),
+                t_game_visible_time_column=(
+                    "__etl_insert_Dtm" if bool(getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)) else "none"
+                ),
             )
             save_artifact_bundle(
                 rated_art, active_feature_cols, combined_metrics, model_version,
