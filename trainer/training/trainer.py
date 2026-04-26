@@ -4243,13 +4243,18 @@ def _backend_hpo_defaults(backend: str) -> dict[str, Any]:
     raise ValueError(f"Unsupported HPO backend: {backend}")
 
 
+def _catboost_gpu_supports_rsm(loss_function: str) -> bool:
+    """Return whether CatBoost GPU supports ``rsm`` for the loss."""
+    loss_name = str(loss_function).split(":", 1)[0].strip().lower()
+    return "pairwise" in loss_name or loss_name == "querycrossentropy"
+
+
 def _sanitize_catboost_params_for_runtime(params: Mapping[str, Any]) -> dict[str, Any]:
     """Drop CatBoost options that are invalid for the selected runtime."""
     out = dict(params)
     task_type = str(out.get("task_type", "CPU")).strip().upper()
-    loss_function = str(out.get("loss_function", "")).strip().lower()
-    is_pairwise_loss = "pairwise" in loss_function
-    if task_type == "GPU" and not is_pairwise_loss:
+    loss_function = str(out.get("loss_function", "")).strip()
+    if task_type == "GPU" and not _catboost_gpu_supports_rsm(loss_function):
         out.pop("rsm", None)
     return out
 

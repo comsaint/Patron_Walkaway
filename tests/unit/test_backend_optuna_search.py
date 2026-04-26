@@ -123,3 +123,29 @@ def test_run_backend_optuna_search_preserves_catboost_gpu_best_params(
     assert best["rsm"] == pytest.approx(0.73)
     assert "task_type" not in best
     assert "devices" not in best
+
+
+def test_sanitize_catboost_gpu_preserves_rsm_for_query_cross_entropy() -> None:
+    """QueryCrossEntropy is a GPU ranking loss where CatBoost supports rsm."""
+    params = {
+        "task_type": "GPU",
+        "loss_function": "QueryCrossEntropy",
+        "rsm": 0.73,
+    }
+
+    sanitized = trainer_mod._sanitize_catboost_params_for_runtime(params)
+
+    assert sanitized["rsm"] == pytest.approx(0.73)
+
+
+def test_sanitize_catboost_gpu_removes_rsm_for_logloss() -> None:
+    """GPU Logloss cannot use rsm, so runtime params must drop it."""
+    params = {
+        "task_type": "GPU",
+        "loss_function": "Logloss",
+        "rsm": 0.73,
+    }
+
+    sanitized = trainer_mod._sanitize_catboost_params_for_runtime(params)
+
+    assert "rsm" not in sanitized
