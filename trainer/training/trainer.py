@@ -3448,7 +3448,7 @@ def _export_parquet_to_libsvm(
                         _last_num = float(_last) if _last is not None else 0.0
                     except (TypeError, ValueError):
                         _last_num = 0.0
-                    if (not math.isfinite(_last_num)) or _last_num == 0.0:
+                    if nf > 0 and ((not math.isfinite(_last_num)) or _last_num == 0.0):
                         parts.append(f"{nf - 1}:0")
                     f_lib.write(" ".join(parts) + "\n")
                     f_w.write(f"{w}\n")
@@ -3507,7 +3507,7 @@ def _export_parquet_to_libsvm(
                         _last_num = float(_last) if _last is not None else 0.0
                     except (TypeError, ValueError):
                         _last_num = 0.0
-                    if (not math.isfinite(_last_num)) or _last_num == 0.0:
+                    if nf > 0 and ((not math.isfinite(_last_num)) or _last_num == 0.0):
                         parts.append(f"{nf - 1}:0")
                     f_lib.write(" ".join(parts) + "\n")
                     n_valid += 1
@@ -3556,7 +3556,7 @@ def _export_parquet_to_libsvm(
                             _last_num = float(_last) if _last is not None else 0.0
                         except (TypeError, ValueError):
                             _last_num = 0.0
-                        if (not math.isfinite(_last_num)) or _last_num == 0.0:
+                        if nf > 0 and ((not math.isfinite(_last_num)) or _last_num == 0.0):
                             parts.append(f"{nf - 1}:0")
                         f_lib.write(" ".join(parts) + "\n")
                         n_test += 1
