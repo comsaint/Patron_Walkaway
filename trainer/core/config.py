@@ -2,6 +2,12 @@ import logging
 from typing import Literal, Optional, Tuple
 
 from dotenv import load_dotenv
+
+from trainer.core._dotenv_bootstrap import bootstrap_dotenv
+
+_log = logging.getLogger(__name__)
+bootstrap_dotenv(load_dotenv, _log)
+
 from trainer.core._config_clickhouse_sources import (
     CASINO_PLAYER_ID_CLEAN_SQL,
     CH_HOST,
@@ -63,7 +69,6 @@ from trainer.core._config_env_paths import (
     PREDICTION_LOG_RETENTION_DELETE_BATCH,
     PREDICTION_LOG_SUMMARY_WINDOW_MINUTES,
     _REPO_ROOT,
-    bootstrap_dotenv,
 )
 from trainer.core._config_serving_runtime import (
     CHUNK_TWO_STAGE_CACHE_DEFAULT,
@@ -182,15 +187,12 @@ from trainer.core._config_validator import (
     VALIDATOR_NO_BET_RETRY_MAX_WINDOW_MINUTES,
 )
 
-_log = logging.getLogger(__name__)
-
 # Stable facade note:
 # - ``trainer.core.config`` remains the public SSOT import surface.
 # - ``trainer.config`` continues to re-export this module for backward compatibility.
 # - Internal shards are imported here so external callers do not need to change.
 # - Tests and callers may continue to monkeypatch names on this facade module.
-
-bootstrap_dotenv(load_dotenv, _log)
+# - Dotenv is loaded at module top (before shard imports) via ``bootstrap_dotenv``.
 
 
 def chunk_two_stage_cache_enabled() -> bool:

@@ -6,20 +6,7 @@ from typing import Tuple
 
 """Internal env / path / prediction-export config shard."""
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-
-
-def bootstrap_dotenv(load_dotenv_func: object, logger: object) -> None:
-    """Load dotenv files using the historical config import contract."""
-    try:
-        load_dotenv = load_dotenv_func  # local alias for readability
-        _env_credential = _REPO_ROOT / "credential" / ".env"
-        if _env_credential.is_file():
-            load_dotenv(str(_env_credential), override=False)
-        load_dotenv(_REPO_ROOT / ".env", override=False)
-        load_dotenv(override=False)
-    except Exception as e:  # pragma: no cover - behavior validated via config import tests
-        logger.warning("could not load .env (credential/repo/cwd): %s", type(e).__name__)
+from trainer.core._dotenv_bootstrap import _REPO_ROOT, bootstrap_dotenv
 
 
 NUMEXPR_MAX_THREADS = 12
