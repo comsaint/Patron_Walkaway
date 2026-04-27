@@ -146,42 +146,6 @@ MLFLOW_EXPERIMENT_TRAIN = (
     or "patron/patron_walkaway/prod/train"
 )
 
-
-def _agent_debug_log(
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict,
-    run_id: str = "pre-fix",
-) -> None:
-    """Append one NDJSON debug line for runtime investigation (debug mode session bc1669)."""
-    try:
-        payload = {
-            "sessionId": "bc1669",
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        candidates = [
-            Path.cwd() / "debug-bc1669.log",
-            Path(__file__).resolve().parents[2] / "debug-bc1669.log",
-        ]
-        _last_error: Optional[str] = None
-        for log_path in candidates:
-            try:
-                with open(log_path, "a", encoding="utf-8") as _f:
-                    _f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                return
-            except Exception as _e:  # pragma: no cover - debug-only fallback
-                _last_error = f"{type(_e).__name__}: {_e}"
-        logger.warning("agent debug log write failed for all candidates: %s", _last_error)
-    except Exception as _e:
-        # Debug logging must never interrupt training.
-        logger.warning("agent debug log payload/build failed: %s", _e)
-
 # ---------------------------------------------------------------------------
 # Config imports
 # ---------------------------------------------------------------------------
@@ -3647,31 +3611,12 @@ def _export_parquet_to_libsvm(
                     if _idx == 51:
                         _idx_51_count += 1
     except Exception as _scan_e:
-        # #region agent log
-        _agent_debug_log(
-            hypothesis_id="H1",
-            location="trainer/training/trainer.py:_export_parquet_to_libsvm:post-export-scan",
-            message="Failed to scan exported train LibSVM",
-            data={"path": str(train_libsvm), "error": str(_scan_e)},
+        logger.debug(
+            "Post-export train LibSVM scan failed for %s: %s",
+            train_libsvm,
+            _scan_e,
+            exc_info=True,
         )
-        # #endregion
-    else:
-        # #region agent log
-        _agent_debug_log(
-            hypothesis_id="H1",
-            location="trainer/training/trainer.py:_export_parquet_to_libsvm:post-export-scan",
-            message="Exported train LibSVM index statistics",
-            data={
-                "path": str(train_libsvm),
-                "feature_cols_len": len(feature_cols),
-                "line_count": _line_count,
-                "token_count": _token_count,
-                "min_feature_index": (None if _token_count == 0 else _min_idx),
-                "max_feature_index": (None if _token_count == 0 else _max_idx),
-                "index_51_count": _idx_51_count,
-            },
-        )
-        # #endregion
 
     if test_libsvm is not None:
         logger.info(
@@ -6390,24 +6335,6 @@ def train_single_rated_model(
         if not _train_rated_for_weights.empty
         else pd.Series(dtype=float)
     )
-    _dupe_cols = [c for c in set(avail_cols) if avail_cols.count(c) > 1]
-    # #region agent log
-    _agent_debug_log(
-        hypothesis_id="H2",
-        location="trainer/training/trainer.py:train_single_rated_model:avail-cols",
-        message="Prepared avail_cols for LightGBM Dataset",
-        data={
-            "use_from_libsvm": bool(use_from_libsvm),
-            "feature_cols_len": len(feature_cols),
-            "avail_cols_len": len(avail_cols),
-            "avail_cols_unique_len": len(set(avail_cols)),
-            "avail_cols_duplicates": _dupe_cols[:10],
-            "has_label_in_avail_cols": ("label" in avail_cols),
-            "avail_cols_head": avail_cols[:8],
-        },
-    )
-    # #endregion
-
     # A2 / R2 canonical stage-1 weights (shared source for all backends).
     if not _get_train_rated().empty:
         sw_rated, ranking_meta_pre = build_final_ranking_weights_in_memory(
@@ -6600,21 +6527,6 @@ def train_single_rated_model(
         _bin_path = train_libsvm_p.parent / (train_libsvm_p.stem + ".bin")
         # R207 #2: use .bin only when _bin_path.is_file() (avoid using a directory as .bin).
         # LibSVM export uses 0-based feature indices (0..49 for 50 features) so LightGBM infers num_feature=50 and matches feature_name.
-        # #region agent log
-        _agent_debug_log(
-            hypothesis_id="H4",
-            location="trainer/training/trainer.py:train_single_rated_model:libsvm-branch",
-            message="LibSVM training branch path status before Dataset construction",
-            data={
-                "train_libsvm_path": str(train_libsvm_p),
-                "valid_libsvm_path": str(valid_libsvm_p),
-                "bin_path": str(_bin_path),
-                "bin_exists": bool(_bin_path.is_file()),
-                "train_libsvm_lines": int(_n_lines),
-                "avail_cols_len": len(avail_cols),
-            },
-        )
-        # #endregion
         _libsvm_temp_to_remove: Optional[Path] = None
         if _bin_path.is_file():
             dtrain = lgb.Dataset(str(_bin_path))
@@ -6681,21 +6593,6 @@ def train_single_rated_model(
                                     _min_idx_train = _idx
                                 if _idx == 51:
                                     _idx_51_cnt += 1
-                    # #region agent log
-                    _agent_debug_log(
-                        hypothesis_id="H1",
-                        location="trainer/training/trainer.py:train_single_rated_model:pre-save-binary-scan",
-                        message="Pre-save_binary sampled index stats from train LibSVM",
-                        data={
-                            "train_path_for_lgb": str(_train_path_for_lgb),
-                            "sampled_lines": 100000,
-                            "min_feature_index": (None if _max_idx_train < 0 else _min_idx_train),
-                            "max_feature_index": (None if _max_idx_train < 0 else _max_idx_train),
-                            "index_51_count_in_sample": _idx_51_cnt,
-                            "avail_cols_len": len(avail_cols),
-                        },
-                    )
-                    # #endregion
                     dtrain.save_binary(str(_bin_path))
                     logger.info("Plan B+: saved train Dataset to %s", _bin_path)
                 except OSError as _e:
@@ -6704,21 +6601,6 @@ def train_single_rated_model(
                         _bin_path,
                         _e,
                     )
-                except Exception as _e:
-                    # #region agent log
-                    _agent_debug_log(
-                        hypothesis_id="H3",
-                        location="trainer/training/trainer.py:train_single_rated_model:save-binary-exception",
-                        message="save_binary raised exception",
-                        data={
-                            "error_type": type(_e).__name__,
-                            "error": str(_e),
-                            "bin_path": str(_bin_path),
-                            "avail_cols_len": len(avail_cols),
-                        },
-                    )
-                    # #endregion
-                    raise
         _default_hp = {
             "n_estimators": 400,
             "learning_rate": 0.05,
@@ -8525,25 +8407,6 @@ def _write_pipeline_diagnostics_json(
 
 def run_pipeline(args) -> None:
     """Phase-1 training pipeline entry point."""
-    logger.info(
-        "DBG bc1669: run_pipeline entry reached (pid=%s cwd=%s days=%s local=%s)",
-        os.getpid(),
-        os.getcwd(),
-        getattr(args, "days", None),
-        bool(getattr(args, "use_local_parquet", False)),
-    )
-    # #region agent log
-    _agent_debug_log(
-        hypothesis_id="H5",
-        location="trainer/training/trainer.py:run_pipeline:entry",
-        message="run_pipeline entry instrumentation reached",
-        data={
-            "days": getattr(args, "days", None),
-            "use_local_parquet": bool(getattr(args, "use_local_parquet", False)),
-            "pid": os.getpid(),
-        },
-    )
-    # #endregion
     pipeline_start = time.perf_counter()
     pipeline_started_at_iso = datetime.now(timezone.utc).isoformat()
     start, end = parse_window(args)
