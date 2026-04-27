@@ -139,7 +139,8 @@ def run_etl_chunk(
 ) -> CmdResult:
     cmd = [
         sys.executable,
-        str(ETL_SCRIPT),
+        "-m",
+        "trainer.etl_player_profile",
         "--start-date",
         start_d.isoformat(),
         "--end-date",
@@ -149,7 +150,7 @@ def run_etl_chunk(
         cmd.append("--local-parquet")
     if month_end:
         cmd.append("--month-end")
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=PROJECT_ROOT)
     return CmdResult(proc.returncode, proc.stdout, proc.stderr)
 
 
