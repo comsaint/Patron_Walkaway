@@ -2515,7 +2515,7 @@ def compute_track_llm_features(
         _llm_float32_numeric_columns(out_df, batch)
         _llm_merge_batch_output_to_working(df_work, out_df, batch, _RANGE_SORT_COL)
         _llm_scatter_batch_to_result(result, out_df, batch)
-        logger.info(
+        logger.debug(
             "compute_track_llm_features: batch %d/%d  features=%d  rows=%d  "
             "duckdb_mem_limit=%.2fGB threads=%d  (%.1fs)",
             b_idx + 1,
