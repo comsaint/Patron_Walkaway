@@ -94,7 +94,7 @@ def build_datasets_section(rated: Mapping[str, Any]) -> Dict[str, Any]:
 
 def _selection_remainder(rated: Mapping[str, Any]) -> Dict[str, Any]:
     skip_prefixes = ("train_", "val_", "test_")
-    blocked = {"feature_importance", "gbm_bakeoff"}
+    blocked = {"feature_importance", "gbm_bakeoff", "stage1_datasets"}
     out: Dict[str, Any] = {}
     for k, v in rated.items():
         if not isinstance(k, str):
@@ -116,6 +116,8 @@ def build_training_metrics_v2_payload(
     if not isinstance(rated, dict):
         rated = {}
 
+    _datasets = build_datasets_section(rated)
+    _stage1_ds = rated.get("stage1_datasets")
     payload: Dict[str, Any] = {
         "schema_version": SCHEMA_TRAINING_METRICS_V2,
         "model_version": model_version,
@@ -123,9 +125,11 @@ def build_training_metrics_v2_payload(
         "selection_mode": metrics_root.get("selection_mode"),
         "selection_mode_source": _SELECTION_MODE_SOURCE_V2,
         "production_neg_pos_ratio": metrics_root.get("production_neg_pos_ratio"),
-        "datasets": build_datasets_section(rated),
+        "datasets": _datasets,
         "selection": _selection_remainder(rated),
     }
+    if isinstance(_stage1_ds, dict) and _stage1_ds:
+        payload["stage1_datasets"] = _stage1_ds
 
     for k in (
         "sample_rated_n",

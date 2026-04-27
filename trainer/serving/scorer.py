@@ -373,6 +373,9 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
             "a4_enabled": bool(rb.get("a4_enabled", False)),
             "a4_fusion_mode": validate_fusion_mode(rb.get("a4_fusion_mode", A4_FUSION_MODE_PRODUCT)),
             "a4_candidate_cutoff": rb.get("a4_candidate_cutoff"),
+            "a4_stage1_threshold_before_final_calibration": rb.get(
+                "a4_stage1_threshold_before_final_calibration"
+            ),
             "stage2_model": rb.get("stage2_model"),
             "stage2_features": list(rb.get("stage2_features") or rb.get("features") or []),
         }
@@ -1978,8 +1981,11 @@ def _score_df(
             try:
                 cutoff = rated_art.get("a4_candidate_cutoff")
                 if cutoff is None:
+                    _s1_thr = rated_art.get("a4_stage1_threshold_before_final_calibration")
+                    if _s1_thr is None:
+                        _s1_thr = float((rated_art or {}).get("threshold", 0.5))
                     cutoff = candidate_cutoff_from_threshold(
-                        float((rated_art or {}).get("threshold", 0.5)),
+                        float(_s1_thr),
                         float(getattr(config, "A4_TWO_STAGE_CANDIDATE_MULTIPLIER", 0.9)),
                     )
                 stage2_features = rated_art.get("stage2_features") or model_features

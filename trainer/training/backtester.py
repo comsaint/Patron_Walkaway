@@ -356,8 +356,11 @@ def _score_df(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.DataFrame:
             ):
                 cutoff = bundle.get("a4_candidate_cutoff")
                 if cutoff is None:
+                    _s1_thr_bt = bundle.get("a4_stage1_threshold_before_final_calibration")
+                    if _s1_thr_bt is None:
+                        _s1_thr_bt = float(bundle.get("threshold", 0.5))
                     cutoff = candidate_cutoff_from_threshold(
-                        float(bundle.get("threshold", 0.5)),
+                        float(_s1_thr_bt),
                         A4_TWO_STAGE_CANDIDATE_MULTIPLIER,
                     )
                 rated_mask = df["is_rated"].to_numpy(dtype=bool) if "is_rated" in df.columns else np.zeros(len(df), dtype=bool)

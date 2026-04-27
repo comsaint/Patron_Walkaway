@@ -59,7 +59,7 @@ import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union, cast
+from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Set, Tuple, Union, cast
 
 import joblib
 import lightgbm as lgb
@@ -406,6 +406,7 @@ try:
 except ModuleNotFoundError:
     _threshold_selection_mod = _import_module_threshold_selection("training.threshold_selection")
 pick_threshold_dec026 = _threshold_selection_mod.pick_threshold_dec026
+Dec026ThresholdPick = _threshold_selection_mod.Dec026ThresholdPick
 
 # Module-level pipeline imports: try = run from trainer dir with modules on path (e.g. dev);
 # except = run as package (python -m trainer.trainer). Only the except path uses relative db_conn.
@@ -4056,6 +4057,81 @@ def _field_test_hpo_min_alerts_per_hour_for_reports() -> float:
     return mf
 
 
+def pick_dec026_threshold_from_binary_scores(
+    y_true: Union[np.ndarray, pd.Series],
+    y_score: np.ndarray,
+    *,
+    recall_floor: Optional[float],
+    min_alert_count: int,
+    min_alerts_per_hour: Optional[float],
+    window_hours: Optional[float],
+    fbeta_beta: float,
+) -> Dec026ThresholdPick:
+    """Run :func:`pick_threshold_dec026` on parallel binary labels and scores (any score surface).
+
+    Used for A4 fused-score calibration so the same DEC-026 / density guards apply as
+    for stage-1 validation picks.
+    """
+    y_arr = np.asarray(y_true, dtype=float).reshape(-1)
+    s_arr = np.asarray(y_score, dtype=np.float64).reshape(-1)
+    return pick_threshold_dec026(
+        y_arr,
+        s_arr,
+        recall_floor=recall_floor,
+        min_alert_count=min_alert_count,
+        min_alerts_per_hour=min_alerts_per_hour,
+        window_hours=window_hours,
+        fbeta_beta=fbeta_beta,
+    )
+
+
+def _snapshot_stage1_datasets_for_v2(metrics: Mapping[str, Any]) -> Dict[str, Any]:
+    """Copy train/val/test split fragments for ``training_metrics.v2`` stage1_datasets."""
+    train: Dict[str, Any] = {}
+    val: Dict[str, Any] = {}
+    test: Dict[str, Any] = {}
+    for k, v in metrics.items():
+        if not isinstance(k, str):
+            continue
+        if k.startswith("train_"):
+            train[k[len("train_") :]] = v
+        elif k.startswith("val_"):
+            val[k[len("val_") :]] = v
+        elif k.startswith("test_"):
+            test[k[len("test_") :]] = v
+    for noisy in ("field_test_primary_score", "field_test_primary_score_mode"):
+        val.pop(noisy, None)
+    out: Dict[str, Any] = {}
+    if train:
+        out["train"] = train
+    if val:
+        out["val"] = val
+    if test:
+        out["test"] = test
+    return out
+
+
+def _update_val_field_test_primary_keys_from_val_labels(
+    metrics: MutableMapping[str, Any],
+    y_val: Union[pd.Series, np.ndarray],
+) -> None:
+    """Set val_field_test_primary_score* from current val_precision and validation labels."""
+    val_precision = metrics.get("val_precision")
+    val_np_ratio = _neg_pos_ratio_from_binary_labels(y_val)
+    val_primary_adj = _precision_prod_adjusted(
+        float(val_precision) if val_precision is not None else None,
+        production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+        test_neg_pos_ratio=val_np_ratio,
+    )
+    metrics["val_neg_pos_ratio"] = val_np_ratio
+    metrics["val_field_test_primary_score"] = (
+        float(val_primary_adj) if val_primary_adj is not None else float(val_precision or 0.0)
+    )
+    metrics["val_field_test_primary_score_mode"] = (
+        "precision_prod_adjusted" if val_primary_adj is not None else "precision_raw"
+    )
+
+
 def _split_alert_density_prefixed_dict(
     split: str,
     *,
@@ -7310,14 +7386,6 @@ def train_single_rated_model(
                         int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
                     )
                     _fused_tr = fuse_product_scores(_s1_tr, _s2_tr)
-                    _a4_train = _train_metrics_dict_from_y_scores(
-                        y_tr,
-                        _fused_tr,
-                        _stage1_threshold,
-                        label="rated_a4_fused_train",
-                        log_results=False,
-                    )
-                    metrics.update({f"a4_{k}": v for k, v in _a4_train.items()})
                     _val_rated_eval = _get_val_rated()
                     metrics["a4_valid_eval_source"] = "memory"
                     if (
@@ -7337,6 +7405,7 @@ def train_single_rated_model(
                                 _a4_v_exc,
                             )
                             metrics["a4_valid_eval_source"] = "parquet_failed"
+                    _fused_vl: Optional[np.ndarray] = None
                     if _val_rated_eval is not None and not _val_rated_eval.empty:
                         _x_vl_s1 = _dataframe_for_lgb_predict(model, _val_rated_eval, avail_cols)
                         _s1_vl = _batched_model_positive_class_scores(
@@ -7354,12 +7423,6 @@ def train_single_rated_model(
                                 int(max(1, A4_TWO_STAGE_PREDICT_BATCH_ROWS)),
                             )
                         _fused_vl = fuse_product_scores(_s1_vl, _s2_vl)
-                        _a4_valid = _compute_valid_metrics_from_scores(
-                            _val_rated_eval["label"].to_numpy(dtype=float),
-                            _fused_vl,
-                            _stage1_threshold,
-                        )
-                        metrics.update({f"a4_{k}": v for k, v in _a4_valid.items()})
                         metrics["a4_candidate_rows_valid"] = int(np.sum(_cand_mask_vl))
                     else:
                         metrics["a4_candidate_rows_valid"] = 0
@@ -7382,6 +7445,8 @@ def train_single_rated_model(
                                 _a4_te_exc,
                             )
                             metrics["a4_test_eval_source"] = "parquet_failed"
+                    _fused_te: Optional[np.ndarray] = None
+                    _a4_test_wh: Optional[float] = None
                     if _test_rated_a4 is not None and not _test_rated_a4.empty:
                         _x_te_s1 = _dataframe_for_lgb_predict(model, _test_rated_a4, avail_cols)
                         _s1_te = _batched_model_positive_class_scores(
@@ -7404,10 +7469,77 @@ def train_single_rated_model(
                             test_split_parquet_path is not None and test_split_parquet_path.exists()
                         ):
                             _a4_test_wh = _split_window_hours_from_parquet_payout(test_split_parquet_path)
+                        metrics["a4_candidate_rows_test"] = int(np.sum(_cand_mask_te))
+                    else:
+                        metrics["a4_candidate_rows_test"] = 0
+
+                    metrics["stage1_datasets"] = _snapshot_stage1_datasets_for_v2(metrics)
+                    _field_test_mode = str(SELECTION_MODE or "").strip().lower() == "field_test"
+                    _a4_thr_calib = "validation_fused_scores"
+                    if _fused_vl is None:
+                        if _field_test_mode:
+                            raise ValueError(
+                                "rated A4: field_test mode requires non-empty validation rows "
+                                "with fused scores to calibrate a deployed threshold."
+                            )
+                        _a4_final_t = float(_stage1_threshold)
+                        _a4_thr_calib = "validation_missing_retained_stage1_threshold"
+                    else:
+                        _pick_a4 = pick_dec026_threshold_from_binary_scores(
+                            _val_rated_eval["label"].to_numpy(dtype=float),
+                            _fused_vl,
+                            recall_floor=THRESHOLD_MIN_RECALL,
+                            min_alert_count=THRESHOLD_MIN_ALERT_COUNT,
+                            min_alerts_per_hour=_ft_thr_mah,
+                            window_hours=_ft_thr_wh,
+                            fbeta_beta=THRESHOLD_FBETA,
+                        )
+                        if _field_test_mode and _pick_a4.is_fallback:
+                            raise ValueError(
+                                "rated A4: field_test mode requires a feasible DEC-026 pick on "
+                                "fused validation scores (recall / min_alerts / alerts-per-hour); "
+                                "pick returned fallback."
+                            )
+                        if _pick_a4.is_fallback:
+                            _a4_final_t = float(_stage1_threshold)
+                            _a4_thr_calib = "fused_pick_fallback_retained_stage1_threshold"
+                        else:
+                            _a4_final_t = float(_pick_a4.threshold)
+
+                    metrics["a4_stage1_threshold_before_final_calibration"] = float(_stage1_threshold)
+                    metrics["final_score_surface"] = "a4_product"
+                    metrics["a4_threshold_calibrated_on"] = _a4_thr_calib
+                    metrics["deployed_threshold"] = float(_a4_final_t)
+                    metrics["threshold"] = float(_a4_final_t)
+
+                    _a4_train = _train_metrics_dict_from_y_scores(
+                        y_tr,
+                        _fused_tr,
+                        _a4_final_t,
+                        label="rated_a4_fused_train",
+                        log_results=False,
+                        train_window_hours=_train_wh_rate,
+                    )
+                    metrics.update({f"a4_{k}": v for k, v in _a4_train.items()})
+                    metrics.update(_a4_train)
+
+                    if _fused_vl is not None and _val_rated_eval is not None:
+                        _a4_valid = _compute_valid_metrics_from_scores(
+                            _val_rated_eval["label"].to_numpy(dtype=float),
+                            _fused_vl,
+                            _a4_final_t,
+                        )
+                        metrics.update({f"a4_{k}": v for k, v in _a4_valid.items()})
+                        metrics.update(_a4_valid)
+                        _update_val_field_test_primary_keys_from_val_labels(
+                            metrics, _val_rated_eval["label"]
+                        )
+
+                    if _fused_te is not None and _test_rated_a4 is not None and not _test_rated_a4.empty:
                         _a4_test = _compute_test_metrics_from_scores(
                             _test_rated_a4["label"].to_numpy(dtype=float),
                             _fused_te,
-                            _stage1_threshold,
+                            _a4_final_t,
                             label="rated_a4_fused_test",
                             _uncalibrated=bool(metrics.get("_uncalibrated", False)),
                             log_results=False,
@@ -7415,14 +7547,35 @@ def train_single_rated_model(
                             test_window_hours=_a4_test_wh,
                         )
                         metrics.update({f"a4_{k}": v for k, v in _a4_test.items()})
-                        metrics["a4_candidate_rows_test"] = int(np.sum(_cand_mask_te))
-                    else:
-                        metrics["a4_candidate_rows_test"] = 0
+                        metrics.update(_a4_test)
+
+                    metrics.update(
+                        _split_alert_density_prefixed_dict(
+                            "val",
+                            scores=(
+                                np.asarray(_fused_vl, dtype=np.float64).reshape(-1)
+                                if _fused_vl is not None
+                                else None
+                            ),
+                            threshold=float(metrics["threshold"]),
+                            window_hours=_vwh_rate,
+                            objective_min=_obj_rate,
+                        )
+                    )
+
                     metrics["a4_enabled"] = True
                     metrics["a4_fusion_mode"] = _fusion_mode
                     metrics["a4_stage2_model_backend"] = "lightgbm"
                     metrics["a4_stage2_features"] = list(avail_cols)
                     metrics["_a4_stage2_model"] = _stage2
+                except ValueError as _a4_val_exc:
+                    if str(_a4_val_exc).startswith("rated A4:"):
+                        raise
+                    logger.warning(
+                        "A4 two-stage training failed (fallback to Stage-1 only): %s", _a4_val_exc
+                    )
+                    metrics["a4_enabled"] = False
+                    metrics["a4_failure_reason"] = str(_a4_val_exc)
                 except Exception as _a4_exc:
                     logger.warning("A4 two-stage training failed (fallback to Stage-1 only): %s", _a4_exc)
                     metrics["a4_enabled"] = False
@@ -7460,6 +7613,26 @@ def train_single_rated_model(
             _cand_mask_vl = None
             _cand_mask_te = None
             gc.collect()
+
+    if metrics.get("a4_enabled"):
+        train_m = {
+            k: metrics[k]
+            for k in (
+                "train_ap",
+                "train_precision",
+                "train_recall",
+                "train_f1",
+                "train_samples",
+                "train_positives",
+                "train_random_ap",
+            )
+            if k in metrics
+        }
+        test_m = {
+            k: v
+            for k, v in metrics.items()
+            if isinstance(k, str) and k.startswith("test_")
+        }
 
     # Log in order: train → valid → test (clear labels; valid was previously unlabeled).
     logger.info(
@@ -7544,6 +7717,9 @@ def train_single_rated_model(
         "a4_enabled": bool(metrics.get("a4_enabled", False)),
         "a4_fusion_mode": metrics.get("a4_fusion_mode", A4_FUSION_MODE_PRODUCT),
         "a4_candidate_cutoff": metrics.get("a4_candidate_cutoff"),
+        "a4_stage1_threshold_before_final_calibration": metrics.get(
+            "a4_stage1_threshold_before_final_calibration"
+        ),
         "stage2_model": _a4_stage2_model,
         "stage2_features": list(metrics.get("a4_stage2_features") or avail_cols),
     }
@@ -7927,6 +8103,11 @@ def build_model_metadata_document(
             "a4_candidate_rows_train": _rated_d.get("a4_candidate_rows_train"),
             "a4_candidate_rows_valid": _rated_d.get("a4_candidate_rows_valid"),
             "a4_candidate_rows_test": _rated_d.get("a4_candidate_rows_test"),
+            "final_score_surface": _rated_d.get("final_score_surface"),
+            "a4_threshold_calibrated_on": _rated_d.get("a4_threshold_calibrated_on"),
+            "a4_stage1_threshold_before_final_calibration": _rated_d.get(
+                "a4_stage1_threshold_before_final_calibration"
+            ),
             "identity_mapping_mode": str(identity_mapping_mode),
             "t_game_features_enabled": bool(t_game_features_enabled),
             "t_game_visible_time_column": str(t_game_visible_time_column),

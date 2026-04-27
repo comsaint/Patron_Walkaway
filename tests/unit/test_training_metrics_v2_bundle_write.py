@@ -115,6 +115,24 @@ def test_training_metrics_v2_map_json_is_valid() -> None:
     assert isinstance(data.get("mappings"), list)
 
 
+def test_v2_payload_includes_stage1_datasets_when_rated_carries_it() -> None:
+    rated = {
+        "train_ap": 0.11,
+        "val_ap": 0.22,
+        "test_ap": 0.33,
+        "stage1_datasets": {
+            "train": {"ap": 0.99},
+            "val": {"ap": 0.88},
+            "test": {"ap": 0.77},
+        },
+    }
+    root = {"selection_mode": "field_test", "rated": rated}
+    v2 = build_training_metrics_v2_payload(model_version="mv1", metrics_root=root)
+    assert v2["datasets"]["train"]["ap"] == 0.11
+    assert v2["stage1_datasets"]["train"]["ap"] == 0.99
+    assert "stage1_datasets" not in v2["selection"]
+
+
 def test_v2_datasets_include_alert_density_columns_under_train_val_test() -> None:
     """train_/val_/test_ prefixed alert-density metrics map into datasets.* (no prefix)."""
     rated = {
