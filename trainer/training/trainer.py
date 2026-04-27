@@ -4259,6 +4259,30 @@ def _sanitize_catboost_params_for_runtime(params: Mapping[str, Any]) -> dict[str
     return out
 
 
+def _agent_catboost_debug_log(
+    *,
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: Mapping[str, Any],
+) -> None:
+    """Append one NDJSON debug entry for the current Cursor debug session."""
+    payload = {
+        "sessionId": "000243",
+        "runId": "catboost-hpo-crash-debug",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": dict(data),
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with Path("debug-000243.log").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, default=str, ensure_ascii=True) + "\n")
+    except OSError:
+        logger.debug("agent catboost debug log write failed", exc_info=True)
+
+
 def _balanced_binary_class_ratio(y: pd.Series) -> Optional[float]:
     """Return neg/pos ratio for strict binary labels; None when unavailable."""
     if y is None or len(y) == 0:
@@ -4718,15 +4742,61 @@ def run_backend_optuna_search(
         params = _suggest_backend_optuna_params(backend_n, trial)
         if backend_runtime_params:
             params.update(dict(backend_runtime_params))
-        scores = _fit_backend_hpo_scores(
-            backend_n,
-            params=params,
-            X_tr=X_tr,
-            y_tr=y_tr,
-            X_vl=X_vl,
-            y_vl=y_vl,
-            sw_tr=sw_tr,
-        )
+        _catboost_trace_trials = {0, 1, 20, 40, 60, 80, 81, 82, 83, 84}
+        if backend_n == "catboost" and int(trial.number) in _catboost_trace_trials:
+            # region agent log
+            _agent_catboost_debug_log(
+                hypothesis_id="C1,C2,C3",
+                location="trainer/training/trainer.py:run_backend_optuna_search.objective",
+                message="catboost trial before fit",
+                data={
+                    "trial_number": int(trial.number),
+                    "param_keys": sorted(params.keys()),
+                    "params": params,
+                    "train_rows": int(len(X_tr)),
+                    "valid_rows": int(len(X_vl)),
+                },
+            )
+            # endregion
+        try:
+            scores = _fit_backend_hpo_scores(
+                backend_n,
+                params=params,
+                X_tr=X_tr,
+                y_tr=y_tr,
+                X_vl=X_vl,
+                y_vl=y_vl,
+                sw_tr=sw_tr,
+            )
+        except Exception as exc:
+            if backend_n == "catboost":
+                # region agent log
+                _agent_catboost_debug_log(
+                    hypothesis_id="C1,C2,C3",
+                    location="trainer/training/trainer.py:run_backend_optuna_search.objective",
+                    message="catboost trial python exception",
+                    data={
+                        "trial_number": int(trial.number),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
+                # endregion
+            raise
+        if backend_n == "catboost" and int(trial.number) in _catboost_trace_trials:
+            # region agent log
+            _agent_catboost_debug_log(
+                hypothesis_id="C1,C2,C3",
+                location="trainer/training/trainer.py:run_backend_optuna_search.objective",
+                message="catboost trial after fit",
+                data={
+                    "trial_number": int(trial.number),
+                    "score_rows": int(len(scores)),
+                    "score_min": float(np.nanmin(scores)) if len(scores) else None,
+                    "score_max": float(np.nanmax(scores)) if len(scores) else None,
+                },
+            )
+            # endregion
         if _use_ft_hpo:
             _pick = pick_threshold_dec026(
                 np.asarray(y_vl, dtype=float),
