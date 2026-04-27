@@ -13,7 +13,7 @@ Full design: **PLAN.md** in this folder.
 
 ### 1. Build the deploy package (ship to target)
 
-Deployment is **always** a single folder or archive that you copy to the target and run there. Build it from the **repository root**:
+Deployment is **always** a single folder or archive that you copy to the target and run there. Build it from the **repository root**. Step-by-step text for the bundle is edited in **`README_DEPLOY.md`** in this folder; the build copies it into each output as `README_DEPLOY.md`.
 
 ```bash
 # Default: model from out/models (or MODEL_DIR), output = deploy_dist/ (at repo root)
@@ -40,7 +40,7 @@ python -m package.build_deploy_package --archive --data-source path/to/serving_d
 | `--data-source` | `data` | Directory (under repo root if relative) containing **serving** data: `player_profile.parquet`, optional `canonical_mapping.parquet` + `canonical_mapping.cutoff.json`, optional `player_profile.schema_hash`. Raw `gmwds_t_*.parquet` mirrors are **not** copied; live bet/session/game come from ClickHouse on the target. |
 | `--strict-data` | Off | Exit non-zero if `player_profile.parquet` is missing or cannot be copied (recommended for production bundles when the model uses profile features). |
 
-**Result:** A folder `deploy_dist/` (and optionally `deploy_dist.zip`) at repo root, containing everything needed on the target: `main.py`, `requirements.txt` (includes **numba**, **pyarrow**, and other serving deps), `.env.example`, `ML_API_PROTOCOL.md`, `wheels/`, `models/`, **`data/`** (serving artifacts when present at build time), `README_DEPLOY.txt`, etc.
+**Result:** A folder `deploy_dist/` (and optionally `deploy_dist.zip`) at repo root, containing everything needed on the target: `main.py`, `requirements.txt` (includes **numba**, **pyarrow**, and other serving deps), `.env.example`, `ML_API_PROTOCOL.md`, `wheels/`, `models/`, **`data/`** (serving artifacts when present at build time), `README_DEPLOY.md`, etc.
 
 **Frontend:** The default build **does not include** the dashboard SPA (`trainer/frontend/`). The deploy package is API-only (GET `/alerts`, `/validation`). If you need the dashboard, serve it separately from the repo or add it to the build in a future step; static assets would then live under the deploy output (e.g. `deploy_dist/static/` or similar).
 
@@ -50,7 +50,7 @@ python -m package.build_deploy_package --archive --data-source path/to/serving_d
 2. Copy `.env.example` to `.env`, set **`CH_USER`** and **`CH_PASS`** (required), and uncomment any optional vars (log level, scorer windows, paths — see comments in the file).
 3. `python main.py`
 
-Endpoints: `http://0.0.0.0:8001/alerts`, `/validation`. See **README_DEPLOY.txt** inside the package for step-by-step and platform-specific commands.
+Endpoints: `http://0.0.0.0:8001/alerts`, `/validation`. See **README_DEPLOY.md** inside the package for step-by-step and platform-specific commands.
 
 ---
 
@@ -131,7 +131,7 @@ python -m trainer.scripts.auto_build_player_profile --local-parquet --month-end
 
 ### 1. 建置部署包（可搬至目標機）
 
-部署**一律**為單一資料夾或壓縮檔：複製到目標機後在該機執行。請在 **專案根目錄** 執行：
+部署**一律**為單一資料夾或壓縮檔：複製到目標機後在該機執行。包內步驟說明請編輯本資料夾的 **`README_DEPLOY.md`**；建置時會複製到輸出為 `README_DEPLOY.md`。請在 **專案根目錄** 執行：
 
 ```bash
 # 預設：模型來自 out/models（或 MODEL_DIR），輸出 = deploy_dist/（專案根目錄）
@@ -158,7 +158,7 @@ python -m package.build_deploy_package --archive --data-source path/to/serving_d
 | `--data-source` | `data` | 相對路徑則在專案根下解析；內含 **serving** 資料：`player_profile.parquet`、可選 `canonical_mapping.parquet` + `canonical_mapping.cutoff.json`、可選 `player_profile.schema_hash`。不會複製 `gmwds_t_*.parquet`；線上注單/session/game 仍由目標機 ClickHouse 提供。 |
 | `--strict-data` | 關閉 | 缺 `player_profile.parquet` 或複製失敗時建包非零結束（模型依賴 profile 時建議正式建包開啟）。 |
 
-**結果：** 在專案根目錄產生 `deploy_dist/`（及可選的 `deploy_dist.zip`），內含目標機所需一切：`main.py`、`requirements.txt`（含 **numba**、**pyarrow** 等 serving 相依）、`.env.example`、`ML_API_PROTOCOL.md`、`wheels/`、`models/`、**`data/`**（建包時若來源目錄有則帶出 serving artifacts）、`README_DEPLOY.txt` 等。
+**結果：** 在專案根目錄產生 `deploy_dist/`（及可選的 `deploy_dist.zip`），內含目標機所需一切：`main.py`、`requirements.txt`（含 **numba**、**pyarrow** 等 serving 相依）、`.env.example`、`ML_API_PROTOCOL.md`、`wheels/`、`models/`、**`data/`**（建包時若來源目錄有則帶出 serving artifacts）、`README_DEPLOY.md` 等。
 
 **前端：** 預設建包**不含**儀表板 SPA（`trainer/frontend/`），部署包僅含 API（GET `/alerts`、`/validation`）。若需儀表板，請自 repo 另行提供或於日後建包時一併帶出；若含前端，靜態檔將置於部署輸出目錄下（例如 `deploy_dist/static/`）。
 
@@ -168,7 +168,7 @@ python -m package.build_deploy_package --archive --data-source path/to/serving_d
 2. 將 `.env.example` 複製為 `.env`，填寫 **`CH_USER`**、**`CH_PASS`**（必填），其餘選項見檔內註解（日誌層級、scorer 視窗、路徑等）。
 3. `python main.py`
 
-端點：`http://0.0.0.0:8001/alerts`、`/validation`。詳見包內 **README_DEPLOY.txt** 的步驟與各平台指令。
+端點：`http://0.0.0.0:8001/alerts`、`/validation`。詳見包內 **README_DEPLOY.md** 的步驟與各平台指令。
 
 ---
 

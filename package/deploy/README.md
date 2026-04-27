@@ -13,7 +13,7 @@ Single process: continuously fetches from ClickHouse, runs scorer and validator,
 |---|---------------------------|----------------------------------------------------------------|
 | Purpose | Local dev / CI; editable install | Copy `deploy_dist/` or `.zip` to the target; **no repo** on the machine |
 | `walkaway_ml` | `package/deploy/requirements.txt` uses `-e .` from **repo root** | Built **wheel** under `wheels/`; generated `requirements.txt` lists `wheels/walkaway_ml-….whl` then PyPI deps |
-| Docs for the bundle | — | `README_DEPLOY.txt` and `ML_API_PROTOCOL.md` inside the built folder |
+| Docs for the bundle | — | `README_DEPLOY.md` and `ML_API_PROTOCOL.md` inside the built folder |
 
 ## Setup
 
@@ -101,7 +101,7 @@ No code changes required; the app loads the model from `MODEL_DIR` at startup.
 |---|----------------|--------------------------------------------------------|
 | 用途 | 本機開發／CI；可編輯安裝 | 將 `deploy_dist/` 或 `.zip` 複製到目標機；**不需**完整 repo |
 | `walkaway_ml` | 在 **repo 根目錄** 用 `package/deploy/requirements.txt` 的 `-e .` | 建好的 **wheel** 在 `wheels/`；產生的 `requirements.txt` 先列 `wheels/walkaway_ml-….whl`，再列 PyPI 依賴 |
-| 部署包說明 | — | 建置後資料夾內的 `README_DEPLOY.txt` 與 `ML_API_PROTOCOL.md` |
+| 部署包說明 | — | 建置後資料夾內的 `README_DEPLOY.md` 與 `ML_API_PROTOCOL.md` |
 
 ### 設定步驟
 

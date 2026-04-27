@@ -108,3 +108,47 @@ SCORER_ENABLE_SHAP_REASON_CODES = os.getenv(
     "SCORER_ENABLE_SHAP_REASON_CODES", "0"
 ).strip().lower() in ("1", "true", "t", "yes", "y")
 
+# Feature parity audit (serving): optional writes to PREDICTION_LOG_DB_PATH SQLite.
+SCORER_FEATURE_AUDIT_ENABLE = os.getenv(
+    "SCORER_FEATURE_AUDIT_ENABLE", "0"
+).strip().lower() in ("1", "true", "t", "yes", "y")
+
+_raw_audit_sample = os.getenv("SCORER_FEATURE_AUDIT_SAMPLE_ROWS", "1000")
+try:
+    _audit_sample_parsed = int(float(_raw_audit_sample))
+    SCORER_FEATURE_AUDIT_SAMPLE_ROWS = _audit_sample_parsed if _audit_sample_parsed >= 0 else 1000
+except (TypeError, ValueError, OverflowError):
+    _log.warning(
+        "SCORER_FEATURE_AUDIT_SAMPLE_ROWS invalid (%r); using 1000",
+        _raw_audit_sample,
+    )
+    SCORER_FEATURE_AUDIT_SAMPLE_ROWS = 1000
+
+_raw_audit_every = os.getenv("SCORER_FEATURE_AUDIT_EVERY_N_CYCLES", "1")
+try:
+    _audit_every_parsed = int(float(_raw_audit_every))
+    SCORER_FEATURE_AUDIT_EVERY_N_CYCLES = _audit_every_parsed if _audit_every_parsed > 0 else 1
+except (TypeError, ValueError, OverflowError):
+    _log.warning(
+        "SCORER_FEATURE_AUDIT_EVERY_N_CYCLES invalid (%r); using 1",
+        _raw_audit_every,
+    )
+    SCORER_FEATURE_AUDIT_EVERY_N_CYCLES = 1
+
+_raw_audit_ret = os.getenv("SCORER_FEATURE_AUDIT_RETENTION_HOURS", "24")
+try:
+    _audit_ret_parsed = float(_raw_audit_ret)
+    SCORER_FEATURE_AUDIT_RETENTION_HOURS = (
+        _audit_ret_parsed if math.isfinite(_audit_ret_parsed) and _audit_ret_parsed > 0 else 24.0
+    )
+except (TypeError, ValueError, OverflowError):
+    _log.warning(
+        "SCORER_FEATURE_AUDIT_RETENTION_HOURS invalid (%r); using 24",
+        _raw_audit_ret,
+    )
+    SCORER_FEATURE_AUDIT_RETENTION_HOURS = 24.0
+
+SCORER_FEATURE_AUDIT_STORE_VALUES = os.getenv(
+    "SCORER_FEATURE_AUDIT_STORE_VALUES", "1"
+).strip().lower() in ("1", "true", "t", "yes", "y")
+

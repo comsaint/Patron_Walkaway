@@ -165,7 +165,7 @@ class TestR412ScorerBehavior(unittest.TestCase):
             out["feat_b"] = 0.0
             return out
 
-        def _capture_score_df(df: pd.DataFrame, artifacts, feature_list, rated_threshold=None):
+        def _capture_score_df(df: pd.DataFrame, artifacts, feature_list, rated_threshold=None, **kwargs):
             seen["score_player_ids"] = set(df["player_id"].astype(str).tolist())
             out = df.copy()
             out["score"] = 0.2

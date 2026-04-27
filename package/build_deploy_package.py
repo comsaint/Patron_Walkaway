@@ -34,7 +34,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+PACKAGE_DIR = Path(__file__).resolve().parent
 DEPLOY_DIR = REPO_ROOT / "package" / "deploy"
+README_DEPLOY_SOURCE = PACKAGE_DIR / "README_DEPLOY.md"
 
 logger = logging.getLogger(__name__)
 
@@ -290,64 +292,14 @@ def write_requirements_txt(out_dir: Path, wheel_filename: str) -> None:
 
 
 def write_readme(out_dir: Path) -> None:
-    (out_dir / "README_DEPLOY.txt").write_text(
-        """ML API deploy package — GET /alerts, GET /validation
-
-Target machine can be Windows, Linux, or Mac. Steps below cover all.
-
-1. Get the folder on the target
-   - Copy this folder to the target, or
-   - If you have the .zip: unzip it.
-     Windows (PowerShell): Expand-Archive -Path deploy_dist.zip -DestinationPath .
-     Windows (GUI): Right-click the .zip → Extract All
-     Linux / Mac:     unzip deploy_dist.zip
-   Then open a terminal in the extracted folder (e.g. deploy_dist).
-
-2. Install Python dependencies (no repo needed)
-   All platforms:
-     pip install -r requirements.txt
-   (Use py -m pip or python3 -m pip if pip is not on PATH.)
-
-3. Configure environment
-   Create .env from the example and set ClickHouse: CH_USER, CH_PASS (required); CH_HOST, CH_PORT, SOURCE_DB, etc. as needed.
-   See .env.example in this folder for optional tuning: DEPLOY_LOG_LEVEL / LOGLEVEL, SCORER_LOOKBACK_HOURS,
-   SCORER_COLD_START_WINDOW_HOURS, PREDICTION_LOG_DB_PATH, SCORER_ENABLE_SHAP_REASON_CODES, and more.
-   Optional: PORT or ML_API_PORT (default 8001).
-
-   Windows (cmd):     copy .env.example .env
-   Windows (PowerShell): Copy-Item .env.example .env
-   Linux / Mac:       cp .env.example .env
-
-   Then edit .env in any text editor (Notepad, VS Code, nano, vim, etc.).
-
-   Serving data (next to main.py, under data/):
-   - player_profile.parquet — required for models that use profile features (should be present if the package was built with it, or copy from your training machine into data/).
-   - Optional: canonical_mapping.parquet + canonical_mapping.cutoff.json — faster cold start; scorer can rebuild from ClickHouse sessions if absent.
-   - gmwds_t_bet/session/game Parquet exports are NOT shipped in the deploy bundle; live bet/session/game come from ClickHouse at runtime.
-
-4. Start the service
-   All platforms:
-     python main.py
-   (Use py main.py on Windows or python3 main.py on Linux/Mac if needed.)
-
-   Scorer, validator, and Flask API run in one process.
-   Endpoints: http://0.0.0.0:8001/alerts  and  http://0.0.0.0:8001/validation
-   Query parameters and default time windows are documented in ML_API_PROTOCOL.md (included in this folder).
-
-5. To swap the model only (same code / same requirements as before):
-   Replace the files in the models/ folder with the new bundle, then restart (step 4).
-   No pip — the model is files on disk, not a Python package.
-
-6. To update after a new deploy package (new wheel and/or new dependencies):
-   Keep the same venv from step 2. Copy or merge the new folder over the old one so
-   wheels/ and requirements.txt match the new build. Then run again:
-     pip install -r requirements.txt
-   Pip usually only installs what changed (e.g. a new walkaway_ml wheel filename).
-   To reinstall only the application wheel and skip other packages:
-     pip install --upgrade --no-deps wheels/<wheel filename>
-   Use the exact .whl name from the first line of requirements.txt or under wheels/.
-   More detail: see package/deploy/README.md in the repository (section "Production bundle: updates").
-""",
+    if not README_DEPLOY_SOURCE.is_file():
+        raise FileNotFoundError(
+            f"Missing deploy readme source {README_DEPLOY_SOURCE!s}; "
+            "expected package/README_DEPLOY.md next to build_deploy_package.py."
+        )
+    dest = out_dir / "README_DEPLOY.md"
+    dest.write_text(
+        README_DEPLOY_SOURCE.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
 
@@ -443,10 +395,10 @@ def build_deploy_package(
     # 5. requirements.txt
     write_requirements_txt(output_dir, wheel_name)
     write_readme(output_dir)
-    print("  -> requirements.txt, README_DEPLOY.txt")
+    print("  -> requirements.txt, README_DEPLOY.md")
 
     print(f"\nDeploy package ready: {output_dir}")
-    print("  Copy this folder to the target machine, then follow README_DEPLOY.txt")
+    print("  Copy this folder to the target machine, then follow README_DEPLOY.md")
 
     if create_archive:
         archive_name = output_dir.name + ".zip"

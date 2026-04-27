@@ -151,10 +151,21 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+try:
+    from trainer.serving.feature_audit import write_serving_feature_audit
+except ImportError:
+    try:
+        from .feature_audit import write_serving_feature_audit
+    except ImportError:
+        write_serving_feature_audit = None  # type: ignore[assignment,misc]
+
 _PERF_WINDOW_SIZE = 200
 _SCORER_STAGE_TIMINGS: Dict[str, deque[float]] = {}
 _NUMBA_CHECK_DONE = False
 _SQLITE_IN_CHUNK_SIZE = 500
+
+# Increments once per ``score_once`` call (before ``_score_df``) for optional feature audit cadence.
+_FEATURE_AUDIT_SCORE_CYCLE = 0
 
 
 def _record_scorer_stage_timing(stage: str, seconds: float) -> None:
@@ -1902,6 +1913,7 @@ def _score_df(
     feature_list: List[str],
     *,
     rated_threshold: Optional[float] = None,
+    feature_audit_context: Optional[Dict[str, object]] = None,
 ) -> pd.DataFrame:
     """Score all observations with the rated model and compute margin.
 
@@ -1995,6 +2007,47 @@ def _score_df(
     if not math.isfinite(rated_t):
         rated_t = bundle_t
     df["margin"] = df["score"] - rated_t
+
+    if (
+        feature_audit_context
+        and getattr(config, "SCORER_FEATURE_AUDIT_ENABLE", False)
+        and write_serving_feature_audit is not None
+        and rated_art is not None
+        and len(df) > 0
+    ):
+        try:
+            mf = list(rated_art.get("features") or feature_list)
+            write_serving_feature_audit(
+                pred_log_path=str(feature_audit_context["pred_log_path"]),
+                df=df,
+                model_features=mf,
+                artifacts=artifacts,
+                feature_list=feature_list,
+                scored_at=str(feature_audit_context["scored_at"]),
+                model_version=str(feature_audit_context["model_version"]),
+                effective_threshold=float(feature_audit_context["effective_threshold"]),
+                bundle_threshold=float(feature_audit_context["bundle_threshold"]),
+                store_long_values=bool(
+                    feature_audit_context.get(
+                        "store_long_values",
+                        getattr(config, "SCORER_FEATURE_AUDIT_STORE_VALUES", True),
+                    )
+                ),
+                retention_hours=float(
+                    feature_audit_context.get(
+                        "retention_hours",
+                        getattr(config, "SCORER_FEATURE_AUDIT_RETENTION_HOURS", 24.0),
+                    )
+                ),
+                sample_rows=int(
+                    feature_audit_context.get(
+                        "sample_rows",
+                        getattr(config, "SCORER_FEATURE_AUDIT_SAMPLE_ROWS", 1000),
+                    )
+                ),
+            )
+        except Exception as exc:
+            logger.warning("[scorer] feature audit write failed: %s", exc)
 
     return df
 
@@ -2202,6 +2255,7 @@ def score_once(
     6. SHAP reason codes for rated alert candidates.
     7. Session stats, duplicate suppression, DB write.
     """
+    global _FEATURE_AUDIT_SCORE_CYCLE
     cycle_stage_seconds: Dict[str, float] = {}
     now_hk = datetime.now(HK_TZ)
     scored_at = now_hk.isoformat()
@@ -2483,9 +2537,36 @@ def score_once(
     # ── Score with H3 routing (rated only) ─────────────────────────────────
     bundle_thr = float((artifacts.get("rated") or {}).get("threshold", 0.5))
     effective_thr = read_effective_runtime_rated_threshold(conn, bundle_thr)
+    _FEATURE_AUDIT_SCORE_CYCLE += 1
+    feature_audit_ctx: Optional[Dict[str, object]] = None
+    if getattr(config, "SCORER_FEATURE_AUDIT_ENABLE", False):
+        _every = max(1, int(getattr(config, "SCORER_FEATURE_AUDIT_EVERY_N_CYCLES", 1)))
+        if _FEATURE_AUDIT_SCORE_CYCLE % _every == 0:
+            _plp = str(getattr(config, "PREDICTION_LOG_DB_PATH", "") or "").strip()
+            if _plp:
+                feature_audit_ctx = {
+                    "pred_log_path": _plp,
+                    "scored_at": scored_at,
+                    "model_version": model_version,
+                    "effective_threshold": float(effective_thr),
+                    "bundle_threshold": float(bundle_thr),
+                    "store_long_values": bool(
+                        getattr(config, "SCORER_FEATURE_AUDIT_STORE_VALUES", True)
+                    ),
+                    "retention_hours": float(
+                        getattr(config, "SCORER_FEATURE_AUDIT_RETENTION_HOURS", 24.0)
+                    ),
+                    "sample_rows": int(
+                        getattr(config, "SCORER_FEATURE_AUDIT_SAMPLE_ROWS", 1000)
+                    ),
+                }
     t_predict = time.perf_counter()
     features_df = _score_df(
-        features_df, artifacts, feature_list, rated_threshold=effective_thr
+        features_df,
+        artifacts,
+        feature_list,
+        rated_threshold=effective_thr,
+        feature_audit_context=feature_audit_ctx,
     )
     cycle_stage_seconds["predict"] = time.perf_counter() - t_predict
 
