@@ -176,20 +176,24 @@ class TestR028_5_ZeroByteProfileBuildBehavior(unittest.TestCase):
     """Review #5: Document current behavior when profile file is 0 bytes."""
 
     def test_build_source_does_not_check_profile_size(self):
-        """Source guard: build uses only .exists() for profile, not st_size > 0."""
+        """Source guard: serving copy uses is_file(), not st_size > 0."""
         self.assertIn(
-            "profile_src.exists()",
+            "SERVING_DATA_REQUIRED",
             _BUILD_SRC,
-            "Build uses profile_src.exists() to decide copy",
+            "Build defines explicit serving artifact list",
         )
-        # No requirement for st_size or stat() in profile block
-        idx_2b = _BUILD_SRC.find("2b. Player profile")
-        self.assertGreater(idx_2b, -1)
-        block = _BUILD_SRC[idx_2b : idx_2b + 800]
+        self.assertIn(
+            "player_profile.parquet",
+            _BUILD_SRC,
+            "Build references player_profile.parquet",
+        )
+        idx_2b = _BUILD_SRC.find("2b. Serving data artifacts")
+        self.assertGreater(idx_2b, -1, "Expected 2b serving-data section in build_deploy_package.py")
+        block = _BUILD_SRC[idx_2b : idx_2b + 1200]
         self.assertNotRegex(
             block,
             r"st_size|\.stat\(\)|size\s*>\s*0",
-            "Current build does not check profile file size; 0-byte file would be shipped (documented risk).",
+            "Serving-data copy does not check profile file size; 0-byte file would be shipped (documented risk).",
         )
 
 

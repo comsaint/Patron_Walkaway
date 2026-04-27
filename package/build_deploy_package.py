@@ -18,6 +18,7 @@ Usage (from repo root):
   python -m package.build_deploy_package
   python -m package.build_deploy_package --archive
   python -m package.build_deploy_package --model-source trainer/models --output-dir deploy_dist
+  python -m package.build_deploy_package --data-source data --strict-data   # fail if no player_profile.parquet
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -50,6 +52,159 @@ BUNDLE_FILES = [
     "pipeline_diagnostics.json",
 ]
 MODEL_PKL_NAMES = ["model.pkl"]
+
+# ---------------------------------------------------------------------------
+# Serving data artifacts (deploy_dist/data/) — not raw ClickHouse mirrors
+# ---------------------------------------------------------------------------
+# Required for production-quality scoring when the model uses profile features.
+SERVING_DATA_REQUIRED = ("player_profile.parquet",)
+# Optional: provenance hash; canonical pair reduces cold-start recompute on target.
+SERVING_DATA_RECOMMENDED = (
+    "player_profile.schema_hash",
+    "canonical_mapping.parquet",
+    "canonical_mapping.cutoff.json",
+)
+# Local dev/training mirrors of CH tables — never ship in deploy bundle (size + freshness).
+RAW_CH_MIRROR_FILES_EXCLUDED = (
+    "gmwds_t_bet.parquet",
+    "gmwds_t_session.parquet",
+    "gmwds_t_game.parquet",
+)
+
+
+@dataclass
+class ServingDataCopyResult:
+    """Summary of copy_serving_data_artifacts for logging and tests."""
+
+    shipped: list[str] = field(default_factory=list)
+    missing_required: list[str] = field(default_factory=list)
+    missing_recommended: list[str] = field(default_factory=list)
+    canonical_pair_skipped_incomplete_source: bool = False
+    excluded_raw_present: list[str] = field(default_factory=list)
+    profile_shipped: bool = False
+    copy_errors: list[str] = field(default_factory=list)
+
+
+def _resolve_data_source(data_source: Path) -> Path:
+    """Resolve data artifact directory; relative paths are under REPO_ROOT."""
+    if not data_source.is_absolute():
+        return (REPO_ROOT / data_source).resolve()
+    return data_source.resolve()
+
+
+def copy_serving_data_artifacts(
+    data_source: Path,
+    data_dest: Path,
+    *,
+    strict_data: bool,
+) -> ServingDataCopyResult:
+    """Copy serving-only parquet/json from *data_source* into deploy *data_dest*.
+
+    Canonical mapping is copied only when **both** parquet and cutoff sidecar exist,
+    to avoid shipping a half-pair that the scorer cannot load.
+
+    Raw ClickHouse mirror parquets (gmwds_t_*.parquet) are never copied; if present
+    under *data_source*, their basenames are recorded in *excluded_raw_present*.
+    """
+    data_source = _resolve_data_source(data_source)
+    data_dest.mkdir(parents=True, exist_ok=True)
+    out = ServingDataCopyResult()
+
+    for name in RAW_CH_MIRROR_FILES_EXCLUDED:
+        if (data_source / name).is_file():
+            out.excluded_raw_present.append(name)
+
+    for name in SERVING_DATA_REQUIRED:
+        src = data_source / name
+        if not src.is_file():
+            out.missing_required.append(name)
+            continue
+        dst = data_dest / name
+        try:
+            shutil.copy2(src, dst)
+            out.shipped.append(name)
+            if name == "player_profile.parquet":
+                out.profile_shipped = True
+        except OSError as e:
+            out.copy_errors.append(f"{name}: {e}")
+            out.missing_required.append(name)
+
+    cmap_parquet = data_source / "canonical_mapping.parquet"
+    cmap_json = data_source / "canonical_mapping.cutoff.json"
+    if cmap_parquet.is_file() and cmap_json.is_file():
+        try:
+            shutil.copy2(cmap_parquet, data_dest / "canonical_mapping.parquet")
+            shutil.copy2(cmap_json, data_dest / "canonical_mapping.cutoff.json")
+            out.shipped.append("canonical_mapping.parquet")
+            out.shipped.append("canonical_mapping.cutoff.json")
+        except OSError as e:
+            for n in ("canonical_mapping.parquet", "canonical_mapping.cutoff.json"):
+                p = data_dest / n
+                if p.is_file():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+            out.copy_errors.append(f"canonical_mapping: {e}")
+    elif cmap_parquet.is_file() or cmap_json.is_file():
+        out.canonical_pair_skipped_incomplete_source = True
+        out.missing_recommended.extend(
+            [n for n in ("canonical_mapping.parquet", "canonical_mapping.cutoff.json") if not (data_source / n).is_file()]
+        )
+    else:
+        out.missing_recommended.extend(["canonical_mapping.parquet", "canonical_mapping.cutoff.json"])
+
+    schema_hash = data_source / "player_profile.schema_hash"
+    if schema_hash.is_file():
+        try:
+            shutil.copy2(schema_hash, data_dest / "player_profile.schema_hash")
+            out.shipped.append("player_profile.schema_hash")
+        except OSError as e:
+            out.copy_errors.append(f"player_profile.schema_hash: {e}")
+            out.missing_recommended.append("player_profile.schema_hash")
+    else:
+        out.missing_recommended.append("player_profile.schema_hash")
+
+    if strict_data and out.missing_required:
+        missing = ", ".join(out.missing_required)
+        raise FileNotFoundError(
+            f"--strict-data: required serving data missing or failed to copy under {data_source}: {missing}"
+        )
+
+    return out
+
+
+def _print_serving_data_summary(result: ServingDataCopyResult, resolved_data_source: Path) -> None:
+    """Print shipped / missing / excluded summary to stdout and stderr as appropriate."""
+    print(f"  [data] source: {resolved_data_source}")
+    print("  [data] serving artifacts:")
+    if result.shipped:
+        for name in sorted(set(result.shipped)):
+            print(f"    -> data/{name}")
+    for name in SERVING_DATA_REQUIRED:
+        if name not in result.shipped:
+            print(f"    ! missing (required): {name}", file=sys.stderr)
+    if result.missing_recommended:
+        for name in sorted(set(result.missing_recommended)):
+            print(f"    . optional not shipped: {name}")
+    if result.canonical_pair_skipped_incomplete_source:
+        print(
+            "    . canonical_mapping: only one of parquet/cutoff.json present under source; "
+            "skipped both (scorer needs both to load artifact).",
+            file=sys.stderr,
+        )
+    if result.copy_errors:
+        for msg in result.copy_errors:
+            print(f"    ! copy error: {msg}", file=sys.stderr)
+    if result.excluded_raw_present:
+        print(
+            "    . raw CH mirror files present under data source (not shipped): "
+            + ", ".join(sorted(result.excluded_raw_present)),
+        )
+        print(
+            "      (Runtime bet/session/game come from ClickHouse on the target machine.)",
+        )
+
 
 # Phase 2 P0-P1: mlflow for export script when run on deploy (cron/scheduler on same or another machine).
 # Keep aligned with package/deploy/requirements.txt for serving: Parquet I/O (profile, canonical map)
@@ -165,6 +320,11 @@ Target machine can be Windows, Linux, or Mac. Steps below cover all.
 
    Then edit .env in any text editor (Notepad, VS Code, nano, vim, etc.).
 
+   Serving data (next to main.py, under data/):
+   - player_profile.parquet — required for models that use profile features (should be present if the package was built with it, or copy from your training machine into data/).
+   - Optional: canonical_mapping.parquet + canonical_mapping.cutoff.json — faster cold start; scorer can rebuild from ClickHouse sessions if absent.
+   - gmwds_t_bet/session/game Parquet exports are NOT shipped in the deploy bundle; live bet/session/game come from ClickHouse at runtime.
+
 4. Start the service
    All platforms:
      python main.py
@@ -196,10 +356,22 @@ def build_deploy_package(
     output_dir: Path,
     model_source: Path,
     create_archive: bool = False,
+    data_source: Path = Path("data"),
+    strict_data: bool = False,
 ) -> Path:
     """
     Build the deploy package into output_dir.
     Returns the path to the output directory.
+
+    Parameters
+    ----------
+    data_source:
+        Directory containing serving artifacts (``player_profile.parquet``, optional
+        ``canonical_mapping.*``, ``player_profile.schema_hash``). Relative paths
+        are resolved under ``REPO_ROOT``.
+    strict_data:
+        When True, missing required ``player_profile.parquet`` (or failed copy)
+        raises ``FileNotFoundError`` so the process can exit non-zero.
     """
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -209,6 +381,13 @@ def build_deploy_package(
         model_source = (REPO_ROOT / model_source).resolve()
     else:
         model_source = model_source.resolve()
+
+    resolved_data_source = _resolve_data_source(data_source)
+    profile_src = resolved_data_source / "player_profile.parquet"
+    if strict_data and not profile_src.is_file():
+        raise FileNotFoundError(
+            f"--strict-data: required player_profile.parquet not found at {profile_src}"
+        )
 
     wheels_dir = output_dir / "wheels"
     models_dir = output_dir / "models"
@@ -242,23 +421,15 @@ def build_deploy_package(
     else:
         logger.warning("Missing %s; deploy bundle will omit API protocol doc.", _protocol_src)
 
-    # 2b. Player profile: ship if exists (repo data/ = trainer LOCAL_PARQUET_DIR)
+    # 2b. Serving data artifacts (player profile, canonical map, schema hash)
     data_dir = output_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    profile_src = REPO_ROOT / "data" / "player_profile.parquet"
-    profile_shipped = False
-    if profile_src.exists():
-        try:
-            shutil.copy2(profile_src, data_dir / "player_profile.parquet")
-            profile_shipped = True
-            print("  -> data/player_profile.parquet")
-        except OSError as e:
-            print(
-                f"  Warning: failed to copy player_profile.parquet: {e}",
-                file=sys.stderr,
-            )
-            # profile_shipped stays False; error printed at end
-    # If not shipped, error is printed at the end (after archive).
+    serving_result = copy_serving_data_artifacts(
+        data_source,
+        data_dir,
+        strict_data=strict_data,
+    )
+    _print_serving_data_summary(serving_result, resolved_data_source)
 
     # 3. Model bundle (includes .pkl, feature_list.json, feature_spec.yaml, etc.)
     print(f"Copying model and config from {model_source}...")
@@ -291,9 +462,9 @@ def build_deploy_package(
             print(f"\nWarning: could not create archive {archive_path}: {e}", file=sys.stderr)
             print("  You can still copy the folder above.", file=sys.stderr)
 
-    if not profile_shipped:
+    if not serving_result.profile_shipped and not strict_data:
         print(
-            f"\nError: player_profile.parquet not found at {profile_src}; not shipped. "
+            f"\nError: player_profile.parquet not found or not copied from {profile_src}; not shipped. "
             "Scorer will run with profile features as NaN.",
             file=sys.stderr,
         )
@@ -330,6 +501,17 @@ def main() -> int:
         action="store_true",
         help="Also create deploy_dist.zip so you can move a single file (Windows-friendly)",
     )
+    parser.add_argument(
+        "--data-source",
+        type=Path,
+        default=Path("data"),
+        help="Directory with serving data artifacts (default: ./data under repo root)",
+    )
+    parser.add_argument(
+        "--strict-data",
+        action="store_true",
+        help="Fail the build if player_profile.parquet is missing or cannot be copied",
+    )
     args = parser.parse_args()
 
     try:
@@ -337,6 +519,8 @@ def main() -> int:
             output_dir=args.output_dir,
             model_source=args.model_source,
             create_archive=args.archive,
+            data_source=args.data_source,
+            strict_data=args.strict_data,
         )
         return 0
     except FileNotFoundError as e:
