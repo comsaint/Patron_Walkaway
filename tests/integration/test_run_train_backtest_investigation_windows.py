@@ -95,3 +95,9 @@ class TestInvestigationE2eScript(unittest.TestCase):
         """Script lives under trainer/scripts → repo root is two parents up."""
         root = e2e_mod._repo_root()
         self.assertTrue((root / "trainer" / "scripts" / "run_train_backtest_investigation_windows.py").is_file())
+
+    def test_c1_gate_train_anchor_differs_from_p1_2_default(self) -> None:
+        """C1 contract anchor must not silently equal P1.2 investigation defaults."""
+        self.assertEqual(e2e_mod.C1_GATE_GLOBAL_TRAIN_START, "2025-01-01")
+        self.assertEqual(e2e_mod._DEFAULT_TRAIN_START, "2024-01-01")
+        self.assertNotEqual(e2e_mod.C1_GATE_GLOBAL_TRAIN_START, e2e_mod._DEFAULT_TRAIN_START)

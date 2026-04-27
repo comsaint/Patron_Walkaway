@@ -17,11 +17,11 @@
 
 ## 2. 評估窗（Rolling-origin，6 窗）
 
-**Global train anchor**：自 `2025-01-01` 起累積歷史至各 test 月 purge 上界止。
+**Global train anchor**：自 `2025-01-01` 起累積歷史至各 test 月 purge 上界止（與 §8「P1.2 預設 train-start」**不同**；C1 跑矩陣時必須覆寫 orchestrator 的 `--train-start`）。
 
 | 窗 ID | Test 曆月（inclusive） | Train 上界（概念） | 說明 |
 |:-----:|------------------------|-------------------|------|
-| W1 | 2025-10 | test 月首日前 2 日 | 最早一窗；train 約 9+ 月 |
+| W1 | 2025-10 | test 月首日前 2 日 | 最早一窗；在 anchor=`2025-01-01` 時 train 約 9 個月（若誤用 `2024-01-01` 起則會多約 12 個月，**不**符合本契約） |
 | W2 | 2025-11 | 同上規則 | |
 | W3 | 2025-12 | 同上規則 | |
 | W4 | 2026-01 | 同上規則 | |
@@ -102,6 +102,8 @@
   "schema_version": "c1_gate_contract_v1",
   "purge_gap_days": 2,
   "global_train_start": "2025-01-01",
+  "investigation_p1_2_default_train_start": "2024-01-01",
+  "c1_orchestrator_note": "run_train_backtest_investigation_windows.py defaults encode P1.2 only; C1 runs must pass --train-start equal to global_train_start (see module constant C1_GATE_GLOBAL_TRAIN_START).",
   "evaluation_windows": [
     {"id": "W1", "test_month": "2025-10"},
     {"id": "W2", "test_month": "2025-11"},
@@ -128,7 +130,10 @@
 
 ## 8. 與 repo 腳本的關係
 
-- **多窗跑法**：仍以既有 `trainer/scripts/run_train_backtest_investigation_windows.py` 或自撰 orchestrator 依上表呼叫 `python -m trainer.trainer` / `python -m trainer.backtester`。
+- **Subprocess 包裝**：`trainer/scripts/run_train_backtest_investigation_windows.py` 只做「組出 `trainer` / `backtester` 的 `--start` `--end` 並執行」；**不**內建 C1 的 6 個曆月 test 迴圈，多窗須外層迴圈或另撰 orchestrator，每窗帶正確的 `train_end` / backtest 區間。
+- **日期預設不可混用**：
+  - 該腳本 **CLI 預設**對齊 `INVESTIGATION_PLAN_TEST_VS_PRODUCTION` **P1.2**：`--train-start` 預設為 `2024-01-01`、`--train-end` 預設 `2025-12-31`、回測窗 `2026-01-01`～`2026-03-31`（見腳本模組常數 `_DEFAULT_TRAIN_*`）。
+  - **C1** 的訓練錨點為 `global_train_start`（`2025-01-01`）；程式內對齊常數為 **`C1_GATE_GLOBAL_TRAIN_START`**（與 `_DEFAULT_TRAIN_START` 不同）。跑 C1 gate 矩陣時**必須**顯式傳入 `--train-start 2025-01-01`（及該窗對應的 `--train-end`、test 月之 `--backtest-start` / `--backtest-end`），不可沿用 P1.2 預設，否則訓練資料範圍與本契約 §1–§2 不一致。
 - **彙總**：`python -m trainer.scripts.report_w2_objective_parity --run-dir ... --output-csv ... --output-md ...`；gate 引擎讀 CSV + 本契約產出 `verdict`（後續實作）。
 
 ---
@@ -138,3 +143,4 @@
 | 版本 | 日期 | 變更 |
 |------|------|------|
 | v1 | 2026-04-27 | 初稿：purge 2 日、6 月評估窗、Hard/Soft 門檻、verdict 語意。 |
+| v1.1 | 2026-04-27 | 釐清 P1.2 腳本預設 `train-start=2024-01-01` 與 C1 `global_train_start` 差異；§2／§7／§8 與 `C1_GATE_GLOBAL_TRAIN_START`。 |

@@ -1,8 +1,13 @@
 """End-to-end train + backtest using INVESTIGATION_PLAN_TEST_VS_PRODUCTION P1.2 windows.
 
 Defaults (HK-aligned date strings, parsed by trainer/backtester as in CLI):
-  Training:   2024-01-01 .. 2025-12-31
+  Training:   2024-01-01 .. 2025-12-31  (P1.2 investigation plan)
   Backtest:   2026-01-01 .. 2026-03-31
+
+**C1 multi-window gate** (``trainer/precision_improvement_plan/gates/C1_multi_window_gate_contract_v1.md``)
+uses a *different* global train anchor: :data:`C1_GATE_GLOBAL_TRAIN_START` (``2025-01-01``). This script only
+forwards ``--start`` / ``--end`` to trainer and backtester; for C1 you must pass ``--train-start`` (and
+per-window ``--train-end`` / backtest bounds) explicitly—**do not** rely on P1.2 defaults for gate runs.
 
 Runs two subprocesses (same entrypoints as manual runs)::
 
@@ -37,11 +42,14 @@ from typing import List, Optional, Sequence
 
 _log = logging.getLogger(__name__)
 
-# INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md § P1.2
+# INVESTIGATION_PLAN_TEST_VS_PRODUCTION.md § P1.2 (fixed investigation windows)
 _DEFAULT_TRAIN_START = "2024-01-01"
 _DEFAULT_TRAIN_END = "2025-12-31"
 _DEFAULT_BACKTEST_START = "2026-01-01"
 _DEFAULT_BACKTEST_END = "2026-03-31"
+
+# C1_multi_window_gate_contract_v1.md — rolling-origin train anchor (not the P1.2 default above).
+C1_GATE_GLOBAL_TRAIN_START = "2025-01-01"
 
 
 def _repo_root() -> Path:
@@ -207,14 +215,19 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Train + backtest with INVESTIGATION_PLAN P1.2 default windows "
-            "(override with --train-start / --backtest-end, etc.). "
+            f"(train-start default {_DEFAULT_TRAIN_START}). "
+            "C1 gate matrices must override --train-start to match the contract anchor "
+            f"({C1_GATE_GLOBAL_TRAIN_START}); see trainer/precision_improvement_plan/gates/. "
             "Use --backtest-only or --eval-only to skip training and run backtest on an existing bundle."
         ),
     )
     p.add_argument(
         "--train-start",
         default=_DEFAULT_TRAIN_START,
-        help=f"Training window start (default: {_DEFAULT_TRAIN_START})",
+        help=(
+            f"Training window start (P1.2 default: {_DEFAULT_TRAIN_START}). "
+            f"For C1 gate runs use {C1_GATE_GLOBAL_TRAIN_START} (see C1_GATE_GLOBAL_TRAIN_START in this module)."
+        ),
     )
     p.add_argument(
         "--train-end",
