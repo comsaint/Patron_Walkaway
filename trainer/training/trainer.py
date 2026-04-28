@@ -8418,6 +8418,12 @@ def run_pipeline(args) -> None:
     pipeline_gbm_bakeoff = bool(getattr(_cfg, "STEP9_COMPARE_ALL_GBMS", True)) and not bool(
         getattr(args, "no_gbm_bakeoff", False)
     )
+    _cli_cat = getattr(args, "gbm_bakeoff_catboost", None)
+    if _cli_cat is not None:
+        os.environ["GBM_BAKEOFF_ENABLE_CATBOOST"] = "1" if _cli_cat else "0"
+    _cli_xgb = getattr(args, "gbm_bakeoff_xgboost", None)
+    if _cli_xgb is not None:
+        os.environ["GBM_BAKEOFF_ENABLE_XGBOOST"] = "1" if _cli_xgb else "0"
     if bool(getattr(args, "disable_oof_stacking", False)):
         setattr(_cfg, "OOF_STACKING_ENABLED", False)
     logger.info("Precision uplift A3 gbm_bakeoff_enabled=%s", pipeline_gbm_bakeoff)

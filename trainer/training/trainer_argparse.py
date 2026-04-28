@@ -119,6 +119,26 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--gbm-bakeoff-catboost",
+        dest="gbm_bakeoff_catboost",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "A3: include CatBoost in the GBM bakeoff for this process. When omitted, only the "
+            "environment variable GBM_BAKEOFF_ENABLE_CATBOOST applies (unset defaults to off)."
+        ),
+    )
+    parser.add_argument(
+        "--gbm-bakeoff-xgboost",
+        dest="gbm_bakeoff_xgboost",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "A3: include XGBoost in the GBM bakeoff for this process. When omitted, only the "
+            "environment variable GBM_BAKEOFF_ENABLE_XGBOOST applies (unset defaults to off)."
+        ),
+    )
+    parser.add_argument(
         "--disable-oof-stacking",
         action="store_true",
         help=(

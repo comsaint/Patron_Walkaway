@@ -17,6 +17,13 @@ from trainer.training.oof_stacking import build_expanding_monthly_folds
 from trainer.training import trainer as trainer_mod
 
 
+@pytest.fixture(autouse=True)
+def _enable_catboost_xgboost_for_gbm_bakeoff_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Full A3 tests expect both optional backends on; production default is off when unset."""
+    monkeypatch.setenv("GBM_BAKEOFF_ENABLE_CATBOOST", "1")
+    monkeypatch.setenv("GBM_BAKEOFF_ENABLE_XGBOOST", "1")
+
+
 def _synth_split(
     *,
     n_train: int = 220,
@@ -96,6 +103,31 @@ def _lightgbm_artifact(
             "test_ap": 0.41,
         },
     }
+
+
+def test_train_and_select_skips_catboost_xgboost_when_env_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GBM_BAKEOFF_ENABLE_CATBOOST", raising=False)
+    monkeypatch.delenv("GBM_BAKEOFF_ENABLE_XGBOOST", raising=False)
+    X_tr, y_tr, X_vl, y_vl, sw, hp = _synth_split(seed=7)
+    winner, winner_art, report = train_and_select_rated_gbm_family(
+        X_tr,
+        y_tr,
+        X_vl,
+        y_vl,
+        sw,
+        hp,
+        lightgbm_artifact=_lightgbm_artifact(X_tr, y_tr, X_vl, y_vl, sw, hp),
+        run_optuna=False,
+    )
+    per = report["per_backend"]
+    assert "disabled" in (per["catboost"].get("error") or "").lower()
+    assert "disabled" in (per["xgboost"].get("error") or "").lower()
+    assert winner == "lightgbm"
+    assert winner_art["model_kind"] == "lightgbm"
+    assert "missing_base_backends" in (report["stacking_oof"].get("reason") or "")
+    assert "error" in per["soft_vote_equal"]
 
 
 def test_train_and_select_rated_gbm_family_returns_schema_and_dispositions() -> None:

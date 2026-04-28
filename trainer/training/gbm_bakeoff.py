@@ -8,8 +8,10 @@ Contract
   prod-adjusted when the contract allows it), not AP.
 
 The caller passes the already-trained LightGBM artifact (which may have been trained
-through in-memory / CSV / LibSVM main paths). This module then trains CatBoost and
-XGBoost on the same in-memory matrices and returns:
+through in-memory / CSV / LibSVM main paths). This module then optionally trains
+CatBoost and/or XGBoost on the same in-memory matrices (see
+``GBM_BAKEOFF_ENABLE_CATBOOST`` / ``GBM_BAKEOFF_ENABLE_XGBOOST``; both default off when
+unset) and returns:
 
 1. A JSON-serialisable report for ``training_metrics["rated"]["gbm_bakeoff"]``.
 2. Candidate artifacts for all backends.
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -53,6 +56,22 @@ BAKEOFF_BACKENDS: Tuple[str, ...] = (
     SOFT_VOTE_BACKEND,
     STACKED_LOGISTIC_BACKEND,
 )
+
+
+def _optional_bakeoff_catboost_xgboost_enabled() -> tuple[bool, bool]:
+    """Read per-run env toggles for optional A3 backends (unset => disabled).
+
+    Truthy when the value is one of: 1, true, t, yes, y (case-insensitive).
+    """
+    out: list[bool] = []
+    for key in ("GBM_BAKEOFF_ENABLE_CATBOOST", "GBM_BAKEOFF_ENABLE_XGBOOST"):
+        raw = os.getenv(key)
+        if raw is None:
+            out.append(False)
+            continue
+        token = str(raw).strip().lower()
+        out.append(bool(token) and token in ("1", "true", "t", "yes", "y"))
+    return bool(out[0]), bool(out[1])
 
 
 def _has_strong_validation(X_val: pd.DataFrame, y_val: pd.Series) -> bool:
@@ -580,6 +599,19 @@ def train_and_select_rated_gbm_family(
     _timeout_budget_divisor = _bakeoff_timeout_budget_divisor()
     backend_runtime_plan = resolve_gbm_backend_runtime_plan()
     backend_runtime_by_name = dict(backend_runtime_plan.get("backend_runtime_by_name") or {})
+    enable_cat, enable_xgb = _optional_bakeoff_catboost_xgboost_enabled()
+    if enable_cat or enable_xgb:
+        logger.info(
+            "A3 gbm_bakeoff optional backends enabled: catboost=%s xgboost=%s",
+            enable_cat,
+            enable_xgb,
+        )
+    else:
+        logger.info(
+            "A3 gbm_bakeoff: CatBoost and XGBoost disabled for this run (unset "
+            "GBM_BAKEOFF_ENABLE_CATBOOST / GBM_BAKEOFF_ENABLE_XGBOOST default to off; "
+            "use --gbm-bakeoff-catboost / --gbm-bakeoff-xgboost or set env to 1/true to enable)."
+        )
 
     def _run_backend_candidate(
         trainer_fn: Any,
@@ -737,13 +769,15 @@ def train_and_select_rated_gbm_family(
             logger.warning("A3 gbm_bakeoff: %s training failed: %s", backend, exc)
             return backend, {}, row
 
-    backend_jobs = (
-        (_train_catboost_backend, "catboost"),
-        (_train_xgboost_backend, "xgboost"),
-    )
+    backend_jobs: list[tuple[Any, str]] = []
+    if enable_cat:
+        backend_jobs.append((_train_catboost_backend, "catboost"))
+    if enable_xgb:
+        backend_jobs.append((_train_xgboost_backend, "xgboost"))
+
     parallel_workers = int(backend_runtime_plan.get("parallel_backend_workers") or 1)
-    if parallel_workers > 1:
-        _preload_parallel_backend_imports(("catboost", "xgboost"))
+    if backend_jobs and parallel_workers > 1:
+        _preload_parallel_backend_imports(tuple(b for _, b in backend_jobs))
         with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
             futures = [
                 pool.submit(_run_backend_candidate, trainer_fn, backend)
@@ -754,12 +788,33 @@ def train_and_select_rated_gbm_family(
                 rows[backend] = row
                 if artifact:
                     candidate_artifacts[backend] = artifact
-    else:
+    elif backend_jobs:
         for trainer_fn, backend in backend_jobs:
             backend_name, artifact, row = _run_backend_candidate(trainer_fn, backend)
             rows[backend_name] = row
             if artifact:
                 candidate_artifacts[backend_name] = artifact
+
+    def _skipped_backend_row(backend: str, hint: str) -> Dict[str, Any]:
+        return {
+            "backend": backend,
+            "error": hint,
+            **_backend_runtime_manifest(
+                backend,
+                backend_runtime_params=backend_runtime_by_name.get(backend),
+            ),
+        }
+
+    if not enable_cat and "catboost" not in rows:
+        rows["catboost"] = _skipped_backend_row(
+            "catboost",
+            "disabled: set GBM_BAKEOFF_ENABLE_CATBOOST=1 or pass --gbm-bakeoff-catboost",
+        )
+    if not enable_xgb and "xgboost" not in rows:
+        rows["xgboost"] = _skipped_backend_row(
+            "xgboost",
+            "disabled: set GBM_BAKEOFF_ENABLE_XGBOOST=1 or pass --gbm-bakeoff-xgboost",
+        )
 
     try:
         soft_row, soft_artifact = _build_soft_vote_candidate(
