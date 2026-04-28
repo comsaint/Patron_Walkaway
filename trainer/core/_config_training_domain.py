@@ -29,7 +29,7 @@ OPTUNA_N_TRIALS = 150
 # Total HPO wall-clock budget for Step 9. When multiple GBM backends run HPO in
 # the same bakeoff, trainer splits this timeout evenly across this many model
 # candidates so each backend gets the same wall-clock allowance.
-OPTUNA_TIMEOUT_SECONDS: Optional[int] = 60 * 60 * 3
+OPTUNA_TIMEOUT_SECONDS: Optional[int] = 20 * 60 * 1
 OPTUNA_ACTIVE_MODEL_COUNT_FOR_TOTAL_TIMEOUT_SPLIT: int = 3
 OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = 40
 OPTUNA_HPO_SAMPLE_ROWS: Optional[int] = 1500000
@@ -202,8 +202,15 @@ if _IDM_RAW not in ("pit_asof", "cutoff_window"):
 else:
     IDENTITY_MAPPING_MODE = cast(Literal["pit_asof", "cutoff_window"], _IDM_RAW)
 
-# B2: join t_game Parquet features (DuckDB). Default off when Parquet absent (CI).
+# B2: join t_game Parquet features (DuckDB). Default off (known issues); set
+# T_GAME_FEATURES_ENABLED=1 to re-enable.
 T_GAME_FEATURES_ENABLED: bool = os.getenv(
-    "T_GAME_FEATURES_ENABLED", "1"
+    "T_GAME_FEATURES_ENABLED", "0"
+).strip().lower() in ("1", "true", "t", "yes", "y")
+
+# A3: include CatBoost in GBM bakeoff. Default off (known issues); set
+# GBM_BAKEOFF_ENABLE_CATBOOST=1 or pass --gbm-bakeoff-catboost to enable.
+GBM_BAKEOFF_ENABLE_CATBOOST: bool = os.getenv(
+    "GBM_BAKEOFF_ENABLE_CATBOOST", "0"
 ).strip().lower() in ("1", "true", "t", "yes", "y")
 

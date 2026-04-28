@@ -108,8 +108,8 @@ def _lightgbm_artifact(
 def test_train_and_select_skips_catboost_xgboost_when_env_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("GBM_BAKEOFF_ENABLE_CATBOOST", raising=False)
-    monkeypatch.delenv("GBM_BAKEOFF_ENABLE_XGBOOST", raising=False)
+    monkeypatch.setenv("GBM_BAKEOFF_ENABLE_CATBOOST", "0")
+    monkeypatch.setenv("GBM_BAKEOFF_ENABLE_XGBOOST", "0")
     X_tr, y_tr, X_vl, y_vl, sw, hp = _synth_split(seed=7)
     winner, winner_art, report = train_and_select_rated_gbm_family(
         X_tr,

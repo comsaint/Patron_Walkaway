@@ -10,7 +10,8 @@ Contract
 The caller passes the already-trained LightGBM artifact (which may have been trained
 through in-memory / CSV / LibSVM main paths). This module then optionally trains
 CatBoost and/or XGBoost on the same in-memory matrices (see
-``GBM_BAKEOFF_ENABLE_CATBOOST`` / ``GBM_BAKEOFF_ENABLE_XGBOOST``; both default off when
+``GBM_BAKEOFF_ENABLE_CATBOOST`` / ``GBM_BAKEOFF_ENABLE_XGBOOST``; CatBoost defaults from
+``trainer.core._config_training_domain`` when the env var is unset; XGBoost is off when
 unset) and returns:
 
 1. A JSON-serialisable report for ``training_metrics["rated"]["gbm_bakeoff"]``.
@@ -59,19 +60,26 @@ BAKEOFF_BACKENDS: Tuple[str, ...] = (
 
 
 def _optional_bakeoff_catboost_xgboost_enabled() -> tuple[bool, bool]:
-    """Read per-run env toggles for optional A3 backends (unset => disabled).
+    """Read per-run env toggles for optional A3 backends.
 
-    Truthy when the value is one of: 1, true, t, yes, y (case-insensitive).
+    CatBoost: when ``GBM_BAKEOFF_ENABLE_CATBOOST`` is unset, use
+    ``config.GBM_BAKEOFF_ENABLE_CATBOOST`` (domain default). XGBoost: unset => disabled.
+
+    Truthy env values: 1, true, t, yes, y (case-insensitive).
     """
-    out: list[bool] = []
-    for key in ("GBM_BAKEOFF_ENABLE_CATBOOST", "GBM_BAKEOFF_ENABLE_XGBOOST"):
-        raw = os.getenv(key)
-        if raw is None:
-            out.append(False)
-            continue
-        token = str(raw).strip().lower()
-        out.append(bool(token) and token in ("1", "true", "t", "yes", "y"))
-    return bool(out[0]), bool(out[1])
+    cat_raw = os.getenv("GBM_BAKEOFF_ENABLE_CATBOOST")
+    if cat_raw is None:
+        enable_cat = bool(getattr(_cfg, "GBM_BAKEOFF_ENABLE_CATBOOST", False))
+    else:
+        tok_c = str(cat_raw).strip().lower()
+        enable_cat = bool(tok_c) and tok_c in ("1", "true", "t", "yes", "y")
+    xgb_raw = os.getenv("GBM_BAKEOFF_ENABLE_XGBOOST")
+    if xgb_raw is None:
+        enable_xgb = False
+    else:
+        tok_x = str(xgb_raw).strip().lower()
+        enable_xgb = bool(tok_x) and tok_x in ("1", "true", "t", "yes", "y")
+    return enable_cat, enable_xgb
 
 
 def _has_strong_validation(X_val: pd.DataFrame, y_val: pd.Series) -> bool:
@@ -608,9 +616,10 @@ def train_and_select_rated_gbm_family(
         )
     else:
         logger.info(
-            "A3 gbm_bakeoff: CatBoost and XGBoost disabled for this run (unset "
-            "GBM_BAKEOFF_ENABLE_CATBOOST / GBM_BAKEOFF_ENABLE_XGBOOST default to off; "
-            "use --gbm-bakeoff-catboost / --gbm-bakeoff-xgboost or set env to 1/true to enable)."
+            "A3 gbm_bakeoff: CatBoost and XGBoost disabled for this run (CatBoost: "
+            "GBM_BAKEOFF_ENABLE_CATBOOST unset uses config default, usually off; XGBoost: "
+            "unset env => off; enable via --gbm-bakeoff-catboost / --gbm-bakeoff-xgboost or "
+            "set env to 1/true)."
         )
 
     def _run_backend_candidate(
