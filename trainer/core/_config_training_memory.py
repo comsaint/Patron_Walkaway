@@ -21,10 +21,10 @@ STEP7_PANDAS_FALLBACK_MAX_BYTES = 256 * 1024 * 1024
 
 # --- Negative sampling / OOM pre-check ---
 # User policy knob: keep all positives, optionally reduce negatives.
-NEG_SAMPLE_FRAC: float = 0.20
+NEG_SAMPLE_FRAC: float = 1.0
 
 # Internal guards for auto-reduction logic.
-NEG_SAMPLE_FRAC_AUTO: bool = False
+NEG_SAMPLE_FRAC_AUTO: bool = True
 NEG_SAMPLE_FRAC_MIN: float = 0.05
 NEG_SAMPLE_FRAC_ASSUMED_POS_RATE: float = 0.15
 NEG_SAMPLE_RAM_SAFETY: float = 0.75

@@ -29,7 +29,7 @@ OPTUNA_N_TRIALS = 150
 # Total HPO wall-clock budget for Step 9. When multiple GBM backends run HPO in
 # the same bakeoff, trainer splits this timeout evenly across this many model
 # candidates so each backend gets the same wall-clock allowance.
-OPTUNA_TIMEOUT_SECONDS: Optional[int] = 20 * 60 * 1
+OPTUNA_TIMEOUT_SECONDS: Optional[int] = 60 * 60 * 3
 OPTUNA_ACTIVE_MODEL_COUNT_FOR_TOTAL_TIMEOUT_SPLIT: int = 3
 OPTUNA_EARLY_STOP_PATIENCE: Optional[int] = 40
 OPTUNA_HPO_SAMPLE_ROWS: Optional[int] = 1500000
