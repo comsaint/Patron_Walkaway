@@ -145,6 +145,8 @@ MLFLOW_EXPERIMENT_TRAIN = (
     (os.environ.get("MLFLOW_EXPERIMENT_TRAIN") or "").strip()
     or "patron/patron_walkaway/prod/train"
 )
+# Full bundle (model.pkl, metrics, spec, …) is logged under this artifact prefix.
+MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH = "model_bundle"
 
 # ---------------------------------------------------------------------------
 # Config imports
@@ -3766,6 +3768,9 @@ def _lgb_params_for_pipeline() -> dict:
         "verbose": -1,
         "random_state": 42,
         "device_type": dev,
+        # Optuna may pick min_child_samples below Dataset construction defaults; with
+        # feature_pre_filter=true, lgb.train then raises (LibSVM / .bin reload path).
+        "feature_pre_filter": False,
     }
     if dev == "cpu":
         out["force_col_wise"] = True
@@ -8072,6 +8077,11 @@ def _log_training_provenance_to_mlflow(
         params["model_metadata_rel_path"] = model_metadata_rel_path
     if split_boundary_params:
         params.update(split_boundary_params)
+    _model_pkl = _artifact / "model.pkl"
+    if _model_pkl.is_file():
+        params["mlflow_trained_model_artifact"] = (
+            f"{MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH}/model.pkl"
+        )
     # T12: if pipeline already started a run (e.g. at pipeline entry), log to it; else start one.
     if has_active_run():
         log_params_safe(params)
@@ -10264,7 +10274,22 @@ def run_pipeline(args) -> None:
                     except Exception as _p_exc:
                         logger.warning("MLflow checksum params failed (training still succeeded): %s", _p_exc)
                 # P1.5: full bundle (includes model.pkl); transient retries in helper.
-                log_artifacts_safe(_bundle_dir, artifact_path="model_bundle")
+                log_artifacts_safe(
+                    _bundle_dir, artifact_path=MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH
+                )
+                if _mpath.is_file():
+                    _rel_model = f"{MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH}/model.pkl"
+                    log_tags_safe({"trained_model_artifact": _rel_model})
+                    logger.info(
+                        "MLflow: trained model uploaded with bundle at artifact %r "
+                        "(download model.pkl from this path in the run).",
+                        _rel_model,
+                    )
+                    print(
+                        f"[MLflow] Trained model artifact: {_rel_model} "
+                        f"(full bundle under {MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH}/)",
+                        flush=True,
+                    )
                 # Legacy UI path: small files under bundle/ (contract tests + existing dashboards).
                 _bundle_artifact_path = "bundle"
                 for _fname in (

@@ -124,8 +124,9 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "A3: include CatBoost in the GBM bakeoff for this process. When omitted, only the "
-            "environment variable GBM_BAKEOFF_ENABLE_CATBOOST applies (unset defaults to off)."
+            "A3: include CatBoost in the GBM bakeoff for this process. When omitted, "
+            "respect GBM_BAKEOFF_ENABLE_CATBOOST if set; otherwise use training-domain "
+            "config default (currently off)."
         ),
     )
     parser.add_argument(
