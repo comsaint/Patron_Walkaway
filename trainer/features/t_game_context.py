@@ -1,8 +1,15 @@
-"""B2: ``t_game`` Parquet-backed table context (PIT-safe, pushdown + small materialization).
+"""B2: ``t_game`` Parquet-backed table context (pushdown + small materialization).
 
 Reads only ``data/gmwds_t_game.parquet`` via DuckDB with ``table_id`` and time filters.
-No full-file pandas loads. Features use **strictly prior** resolved games vs each bet's
-``payout_complete_dtm`` (``merge_asof`` with ``allow_exact_matches=False``).
+No full-file pandas loads.
+
+When ``observation_time`` is set, only ``t_game`` rows with
+``__etl_insert_Dtm <= observation_time`` are materialized; ``merge_asof`` attaches
+the latest prior **game payout** row (``payout_complete_dtm``) so streak / rolling
+stay in real-world patron order while visibility follows warehouse ETL time.
+
+When ``observation_time`` is None, legacy behaviour is preserved (ETL cap uses
+``window_end`` only; as-of join uses ``game_visible_dtm`` on the right).
 """
 from __future__ import annotations
 
@@ -50,6 +57,8 @@ def materialize_resolved_t_games(
     table_ids: Sequence[Any],
     t_min: Union[pd.Timestamp, datetime],
     t_max: Union[pd.Timestamp, datetime],
+    *,
+    observation_max_etl: Optional[Union[pd.Timestamp, datetime]] = None,
 ) -> pd.DataFrame:
     """Load deduped RESOLVED ``t_game`` rows for given tables and payout time window.
 
@@ -61,6 +70,9 @@ def materialize_resolved_t_games(
         Distinct ``table_id`` values to push down (empty -> empty frame).
     t_min, t_max:
         Half-open filter ``t_min <= payout_complete_dtm < t_max`` (naive HK-local).
+    observation_max_etl:
+        When set, further require ``__etl_insert_Dtm <= min(t_max, observation_max_etl)``
+        (HK-naive). Use the scoring / chunk observation instant for strict visibility.
 
     Returns
     -------
@@ -95,6 +107,13 @@ def materialize_resolved_t_games(
     if getattr(t1, "tzinfo", None) is not None:
         t1 = t1.tz_convert("Asia/Hong_Kong").replace(tzinfo=None)
 
+    etl_cap = t1
+    if observation_max_etl is not None:
+        obs = pd.Timestamp(observation_max_etl)
+        if getattr(obs, "tzinfo", None) is not None:
+            obs = obs.tz_convert("Asia/Hong_Kong").replace(tzinfo=None)
+        etl_cap = min(t1, obs)
+
     if "__etl_insert_Dtm" not in names:
         raise ValueError(
             "t_game parquet missing required visibility column '__etl_insert_Dtm' while T_GAME features are enabled"
@@ -106,6 +125,7 @@ def materialize_resolved_t_games(
     path_sql = str(p).replace("'", "''")
     t0s = t0.strftime("%Y-%m-%d %H:%M:%S")
     t1s = t1.strftime("%Y-%m-%d %H:%M:%S")
+    etl_caps = etl_cap.strftime("%Y-%m-%d %H:%M:%S")
 
     con = duckdb.connect(database=":memory:")
     try:
@@ -117,7 +137,7 @@ def materialize_resolved_t_games(
           WHERE table_id IN (SELECT table_id FROM tid)
             AND payout_complete_dtm >= TIMESTAMP '{t0s}'
             AND payout_complete_dtm < TIMESTAMP '{t1s}'
-            AND CAST(__etl_insert_Dtm AS TIMESTAMP) <= TIMESTAMP '{t1s}'
+            AND CAST(__etl_insert_Dtm AS TIMESTAMP) <= TIMESTAMP '{etl_caps}'
         ),
         dedup AS (
           SELECT *,
@@ -251,6 +271,7 @@ def join_t_game_features_for_bets(
     t_game_parquet: Path,
     window_start: Union[pd.Timestamp, datetime],
     window_end: Union[pd.Timestamp, datetime],
+    observation_time: Optional[Union[pd.Timestamp, datetime]] = None,
 ) -> pd.DataFrame:
     """Attach B2 ``t_game`` features to *bets_df* (mutates copy only).
 
@@ -262,6 +283,14 @@ def join_t_game_features_for_bets(
         Path to ``gmwds_t_game.parquet``.
     window_start, window_end:
         Materialization bounds (typically chunk ``history_start`` .. ``extended_end``).
+    observation_time:
+        Warehouse visibility cutoff: only ``t_game`` rows with
+        ``__etl_insert_Dtm <= observation_time`` are loaded. ``merge_asof`` then
+        aligns on ``payout_complete_dtm`` (patron-real order). Use scorer ``now_hk``
+        in production and a chunk anchor (e.g. ``window_end``) in training.
+
+        When ``None``, preserves legacy join (as-of on ``game_visible_dtm`` vs bet
+        payout) and ETL cap ``<= window_end`` only.
 
     Returns
     -------
@@ -289,7 +318,12 @@ def join_t_game_features_for_bets(
             out[c] = 0.0
 
     tids = out["table_id"].tolist()
-    raw = materialize_resolved_t_games(t_game_parquet, tids, window_start, window_end)
+    _obs_kw = {}
+    if observation_time is not None:
+        _obs_kw["observation_max_etl"] = observation_time
+    raw = materialize_resolved_t_games(
+        t_game_parquet, tids, window_start, window_end, **_obs_kw
+    )
     if raw.empty:
         logger.info("t_game context: no resolved rows in window (tables=%d)", len(set(tids)))
         return out
@@ -314,15 +348,31 @@ def join_t_game_features_for_bets(
         lg = left_grp.drop(columns=feat_cols, errors="ignore").sort_values(
             "payout_complete_dtm", kind="stable"
         )
-        rg = right_grp.sort_values("game_visible_dtm", kind="stable")
-        mg = pd.merge_asof(
-            lg,
-            rg[right_cols],
-            left_on="payout_complete_dtm",
-            right_on="game_visible_dtm",
-            direction="backward",
-            allow_exact_matches=False,
-        )
+        if observation_time is not None:
+            rg = right_grp.sort_values("payout_complete_dtm", kind="stable")
+            _rc = [
+                c
+                for c in right_cols
+                if c not in ("game_visible_dtm", "payout_complete_dtm")
+            ]
+            mg = pd.merge_asof(
+                lg,
+                rg[["payout_complete_dtm"] + _rc],
+                left_on="payout_complete_dtm",
+                right_on="payout_complete_dtm",
+                direction="backward",
+                allow_exact_matches=False,
+            )
+        else:
+            rg = right_grp.sort_values("game_visible_dtm", kind="stable")
+            mg = pd.merge_asof(
+                lg,
+                rg[right_cols],
+                left_on="payout_complete_dtm",
+                right_on="game_visible_dtm",
+                direction="backward",
+                allow_exact_matches=False,
+            )
         merged_parts.append(mg)
     merged = pd.concat(merged_parts, ignore_index=True).sort_values("_row", kind="stable")
     for c in feat_cols:
