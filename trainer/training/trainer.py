@@ -3759,6 +3759,15 @@ def configure_lightgbm_device_for_run(args: Any) -> None:
         )
 
 
+def _lgb_dataset_params_for_pipeline() -> dict[str, Any]:
+    """Params for ``lgb.Dataset(..., params=...)`` that LightGBM locks at Dataset construction.
+
+    If these differ from values passed later to ``lgb.train``, LightGBM raises e.g.
+    "Cannot change feature_pre_filter after constructed Dataset handle."
+    """
+    return {"feature_pre_filter": False}
+
+
 def _lgb_params_for_pipeline() -> dict:
     """LightGBM params shared by Optuna, final fit, and lgb.train (device-aware)."""
     dev = _EFFECTIVE_LIGHTGBM_DEVICE
@@ -3770,7 +3779,7 @@ def _lgb_params_for_pipeline() -> dict:
         "device_type": dev,
         # Optuna may pick min_child_samples below Dataset construction defaults; with
         # feature_pre_filter=true, lgb.train then raises (LibSVM / .bin reload path).
-        "feature_pre_filter": False,
+        **_lgb_dataset_params_for_pipeline(),
     }
     if dev == "cpu":
         out["force_col_wise"] = True
@@ -6533,12 +6542,14 @@ def train_single_rated_model(
         # R207 #2: use .bin only when _bin_path.is_file() (avoid using a directory as .bin).
         # LibSVM export uses 0-based feature indices (0..49 for 50 features) so LightGBM infers num_feature=50 and matches feature_name.
         _libsvm_temp_to_remove: Optional[Path] = None
+        _lgb_ds_params = _lgb_dataset_params_for_pipeline()
         if _bin_path.is_file():
-            dtrain = lgb.Dataset(str(_bin_path))
+            dtrain = lgb.Dataset(str(_bin_path), params=_lgb_ds_params)
             dvalid = lgb.Dataset(
                 str(valid_libsvm_p),
                 reference=dtrain,
                 feature_name=list(avail_cols),
+                params=_lgb_ds_params,
             )
         else:
             weight_path = Path(str(train_libsvm_p) + ".weight")
@@ -6566,11 +6577,13 @@ def train_single_rated_model(
                 str(_train_path_for_lgb),
                 weight=_train_weights,
                 feature_name=list(avail_cols),
+                params=_lgb_ds_params,
             )
             dvalid = lgb.Dataset(
                 str(valid_libsvm_p),
                 reference=dtrain,
                 feature_name=list(avail_cols),
+                params=_lgb_ds_params,
             )
             if STEP9_SAVE_LGB_BINARY:
                 try:
@@ -6745,10 +6758,12 @@ def train_single_rated_model(
             # Load train from CSV so feature set is explicit (avoid weight column as feature in some LightGBM builds).
             _train_csv = pd.read_csv(train_path)
             _train_feature_cols = [c for c in _train_csv.columns if c not in ("label", "weight")]
+            _lgb_ds_params_csv = _lgb_dataset_params_for_pipeline()
             dtrain = lgb.Dataset(
                 _train_csv[_train_feature_cols],
                 label=_train_csv["label"],
                 weight=_train_csv["weight"] if "weight" in _train_csv.columns else None,
+                params=_lgb_ds_params_csv,
             )
             # R191 Review #1: run_optuna_search may return {} or partial keys; merge with defaults to avoid KeyError.
             _default_rated_hp = {
@@ -6791,6 +6806,7 @@ def train_single_rated_model(
                     _val_rated_eval[_train_feature_cols],
                     label=_val_rated_eval["label"],
                     reference=dtrain,
+                    params=_lgb_ds_params_csv,
                 )
                 booster = lgb.train(
                     hp_lgb,
