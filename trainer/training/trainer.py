@@ -3074,6 +3074,7 @@ def process_chunk(
                     t_game_parquet=_tgp,
                     window_start=history_start,
                     window_end=extended_end,
+                    observation_time=window_end,
                 )
             except Exception as _tgx:
                 logger.warning(

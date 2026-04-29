@@ -2468,12 +2468,43 @@ def score_once(
                     _win_end = pd.to_datetime(features_all["payout_complete_dtm"]).max()
                     if pd.notna(_win_start) and pd.notna(_win_end):
                         _buf = timedelta(days=int(getattr(config, "HISTORY_BUFFER_DAYS", 2)))
+                        _n_before_tg = len(features_all)
                         features_all = _tgc_sc.join_t_game_features_for_bets(
                             features_all,
                             t_game_parquet=_tgp,
                             window_start=_win_start - _buf,
                             window_end=now_hk + timedelta(hours=1),
+                            observation_time=now_hk,
                         )
+                        _b2_cols = [
+                            "current_outcome_streak_len",
+                            "banker_rate_w20games",
+                            "player_rate_w20games",
+                            "tie_rate_w20games",
+                            "table_num_players",
+                            "patron_is_sole_player",
+                            "table_turnover_w5m_over_w15m",
+                            "table_net_outcome_w15m",
+                        ]
+                        # Gray / smoke: share of rows with any B2 t_game feature non-zero (post-join).
+                        # Compare across deploys when toggling observation_time semantics.
+                        _present = [c for c in _b2_cols if c in features_all.columns]
+                        if _present and _n_before_tg > 0:
+                            _nz = pd.Series(False, index=features_all.index)
+                            for _c in _present:
+                                _nz = _nz | (
+                                    pd.to_numeric(features_all[_c], errors="coerce")
+                                    .fillna(0.0)
+                                    .ne(0.0)
+                                )
+                            _hit = int(_nz.sum())
+                            logger.info(
+                                "[scorer] t_game B2 any-nonzero: %d/%d (%.4f) observation_time=%s",
+                                _hit,
+                                _n_before_tg,
+                                _hit / float(_n_before_tg),
+                                now_hk.isoformat(),
+                            )
                 except Exception as exc:
                     logger.warning("[scorer] t_game context join skipped: %s", exc)
 
