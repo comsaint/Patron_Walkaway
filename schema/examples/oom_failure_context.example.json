@@ -1,0 +1,34 @@
+{
+  "attempts": [
+    {
+      "attempt": 0,
+      "error": "RuntimeError('Out of Memory Error: could not allocate block')",
+      "estimated_memory_limit_hint_mb": 256,
+      "input_total_bytes": 24000000000,
+      "job_name": "materialize_run_fact_v1",
+      "memory_limit_mb": null,
+      "rss_bytes_at_fail": 2147483648,
+      "success": false,
+      "threads": 4
+    },
+    {
+      "attempt": 1,
+      "error": "MemoryError()",
+      "estimated_memory_limit_hint_mb": 256,
+      "input_total_bytes": 24000000000,
+      "job_name": "materialize_run_fact_v1",
+      "memory_limit_mb": 512,
+      "rss_bytes_at_fail": 2147483648,
+      "success": false,
+      "threads": 2
+    }
+  ],
+  "input_paths": [
+    "/data/l1_layered/snap_example/t_bet/gaming_day=2026-01-01/cleaned.parquet"
+  ],
+  "input_total_bytes": 24000000000,
+  "job_name": "materialize_run_fact_v1",
+  "last_error": "MemoryError()",
+  "recommended_memory_limit_hint_mb": 256,
+  "virtual_memory_available_bytes": 17179869184
+}

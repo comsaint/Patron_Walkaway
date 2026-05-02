@@ -22,6 +22,7 @@ from layered_data_assets.ingestion_delay_summary_v1 import (  # noqa: E402
 )
 from layered_data_assets.l1_paths import l1_run_day_bridge_partition_dir  # noqa: E402
 from layered_data_assets.manifest_lineage_v1 import merge_source_hashes_into_manifest  # noqa: E402
+from layered_data_assets.oom_runner_v1 import add_duckdb_oom_cli_args, run_duckdb_job_with_oom_retries  # noqa: E402
 from layered_data_assets.run_day_bridge_v1 import (  # noqa: E402
     build_run_day_bridge_manifest,
     materialize_run_day_bridge_v1,
@@ -96,6 +97,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_LATE_THRESHOLD_SEC,
         help=f"Late threshold in seconds (default: {DEFAULT_LATE_THRESHOLD_SEC})",
     )
+    add_duckdb_oom_cli_args(p)
     return p.parse_args(argv)
 
 
@@ -116,11 +118,12 @@ def main(argv: list[str] | None = None) -> int:
     out_parquet = out_dir / "run_day_bridge.parquet"
     out_manifest = out_dir / "manifest.json"
 
-    con = duckdb.connect(database=":memory:")
-    try:
+    inputs = [p.resolve() for p in args.inputs]
+
+    def _work(con: object):
         stats = materialize_run_day_bridge_v1(
             con=con,
-            input_paths=[p.resolve() for p in args.inputs],
+            input_paths=inputs,
             output_parquet=out_parquet,
             bet_gaming_day=args.bet_gaming_day,
             run_break_min=args.run_break_min,
@@ -131,19 +134,29 @@ def main(argv: list[str] | None = None) -> int:
         id_summary = compute_ingestion_delay_summary_preview(
             con, delay_src.resolve(), late_threshold_sec=args.late_threshold_sec
         )
-        manifest = build_run_day_bridge_manifest(
-            source_snapshot_id=args.source_snapshot_id,
-            bet_gaming_day=args.bet_gaming_day,
-            l0_fingerprint_path=args.l0_fingerprint_json,
-            l1_preprocess_gaming_day=args.l1_preprocess_gaming_day,
-            output_parquet=out_parquet,
-            manifest_uri_anchor=_REPO_ROOT,
-            stats=stats,
-            ingestion_delay_summary=id_summary,
-        )
-        manifest = merge_source_hashes_into_manifest(manifest, args.l0_fingerprint_json)
-    finally:
-        con.close()
+        return stats, id_summary
+
+    stats, id_summary = run_duckdb_job_with_oom_retries(
+        connect=lambda: duckdb.connect(database=":memory:"),
+        work=_work,
+        input_paths=inputs,
+        job_name="materialize_run_day_bridge_v1",
+        run_log_path=args.duckdb_run_log,
+        failure_context_path=args.duckdb_oom_failure_context,
+        max_attempts=args.duckdb_oom_max_attempts,
+        initial_memory_limit_mb=args.duckdb_initial_memory_limit_mb,
+    )
+    manifest = build_run_day_bridge_manifest(
+        source_snapshot_id=args.source_snapshot_id,
+        bet_gaming_day=args.bet_gaming_day,
+        l0_fingerprint_path=args.l0_fingerprint_json,
+        l1_preprocess_gaming_day=args.l1_preprocess_gaming_day,
+        output_parquet=out_parquet,
+        manifest_uri_anchor=_REPO_ROOT,
+        stats=stats,
+        ingestion_delay_summary=id_summary,
+    )
+    manifest = merge_source_hashes_into_manifest(manifest, args.l0_fingerprint_json)
 
     out_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=True) + "\n", encoding="utf-8")
     print(f"OK wrote {out_parquet}")

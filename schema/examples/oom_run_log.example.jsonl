@@ -1,0 +1,3 @@
+{"attempt": 0, "estimated_memory_limit_hint_mb": 512, "input_total_bytes": 1714760, "job_name": "materialize_run_fact_v1", "memory_limit_mb": null, "rss_bytes_after": 134217728, "rss_bytes_before": 67108864, "success": true, "threads": 4}
+{"attempt": 0, "error": "RuntimeError('out of memory')", "estimated_memory_limit_hint_mb": 512, "input_total_bytes": 1714760, "job_name": "preprocess_bet_v1", "memory_limit_mb": null, "rss_bytes_at_fail": 1207959552, "success": false, "threads": 4}
+{"attempt": 1, "estimated_memory_limit_hint_mb": 512, "input_total_bytes": 1714760, "job_name": "preprocess_bet_v1", "memory_limit_mb": 512, "rss_bytes_after": 201326592, "rss_bytes_before": 100663296, "success": true, "threads": 2}
