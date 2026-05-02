@@ -13,6 +13,8 @@
 
 本輪執行目標為：建立與 `trainer` **並行**之分層資料產線（L0→preprocess→L1→L2→publish→可選 online delta），並以 **manifest、determinism、100% feature 覆蓋、correction log** 作為可驗收交付。Phase 1 **不**產出 trip 最終語義；trip v1 於 Phase 2 一次到位。
 
+**Phase 1 進度速記（2026-05-02）**：**LDA-E1-01** 已完成 L0 慣例文件、目錄樹範例、`layered_data_assets.l0_paths`（`source_snapshot_id` 驗證 + Hive-style 分區路徑）與單元測試；**尚缺** ingest 執行檔、`snapshot_fingerprint.json` 寫入與「同輸入重跑 → 同 id」之可重現規則落地，故 E1-01 仍標 **🟡**。
+
 ### 0.2 狀態圖例（本檔維護）
 
 | 符號 | 意義 |
@@ -103,7 +105,7 @@
 
 | 狀態 | Task ID | 任務 | Owner | 依賴 | 輸出 artifact | DoD |
 | :---: | :--- | :--- | :--- | :--- | :--- | :--- |
-| 🟡 | **LDA-E1-01** | L0 ingest：分區 raw、`source_snapshot_id`、分區 hash 規則 | Data Platform | Phase 0 | L0 目錄結構文件 + 範例批次 | 同一輸入重跑得相同 `source_snapshot_id` 規則文件可重現 |
+| 🟡 | **LDA-E1-01** | L0 ingest：分區 raw、`source_snapshot_id`、分區 hash 規則 | Data Platform | Phase 0 | `doc/l0_layered_data_assets_convention.md` + `schema/examples/l0_snapshot_layout.example.txt` + `layered_data_assets/l0_paths.py`；ingest CLI／`snapshot_fingerprint.json`／範例批次待補 | 同一輸入重跑得相同 `source_snapshot_id` 規則文件可重現；**目前**：id／路徑契約與 `tests/unit/test_layered_l0_paths.py` 已覆蓋 |
 | ⬜ | **LDA-E1-02** | Preprocess job：輸出清洗後 bet 流／表 + rule id 寫 manifest | Data Platform | E0-02, E1-01 | 清洗後 parquet 或表 + preprocess 版本 tag | manifest 可指涉 `preprocessing_rule_id`／version |
 | ⬜ | **LDA-E1-03** | `run_fact` 物化：`run_id` hash 依 implementation plan §4.1（含首筆 `bet_id`） | Data Platform | E1-02 | `run_fact` 分區產物 | Gate 1（§8.1）在 L1 子集通過 |
 | ⬜ | **LDA-E1-04** | `run_bet_map` membership | Data Platform | E1-03 | map 產物 | 可由 map 還原每 run 之 bet 集合；與 `run_fact` 一致 |

@@ -1,5 +1,48 @@
 **Archive**: Past rounds and older STATUS blocks are in [STATUS_archive.md](STATUS_archive.md). This file keeps the summary and the **latest rounds** only. (Rounds 57–60, 67 Review–75 moved 2026-03-05; Rounds 79–99 moved 2026-03-05; Round 96 onward moved 2026-03-12; **2026-03-22**: Phase 2 前結構整理起至 Train–Serve Parity 2026-03-16 等長段 → archive.)
 
+## 2026-05-02 — Layered data assets：Phase 0 狀態同步 + Phase1 E1-01 L0 規約（/cycle_code）
+
+> 計畫索引：`implementation plan/layered_data_assets_run_trip_execution_plan.md`；`DECISION_LOG.md`：[DECISION_LOG.md](DECISION_LOG.md)（本輪無新 DEC）。
+
+### STEP 1 — Builder
+
+- **`implementation plan/layered_data_assets_run_trip_execution_plan.md`**：Phase 0 **LDA-E0-01～E0-07** 標為 **✅**；**LDA-E1-01** 標 **🟡**（L0 規約與路徑 helper 已落地，ingest 執行檔／範例批次待續）。
+- **`doc/l0_layered_data_assets_convention.md`**：L0 根 `data/l0_layered/`、`source_snapshot_id` 格式、Hive-style 分區、與 manifest／sidecar 對齊說明。
+- **`schema/examples/l0_snapshot_layout.example.txt`**：目錄樹範例（無二進位）。
+- **`layered_data_assets/l0_paths.py`** + **`layered_data_assets/__init__.py`**：`validate_source_snapshot_id`、`l0_layered_root`、`l0_snapshot_root`、`l0_partition_dir`。
+
+#### 手動驗證
+
+```bash
+python -c "from pathlib import Path; from layered_data_assets.l0_paths import l0_partition_dir; print(l0_partition_dir(Path('data'), 'snap_testid12', 't_bet', 'gaming_day', '2026-04-01'))"
+```
+
+#### 下一步建議
+
+- **LDA-E1-01 收尾**：實際 ingest CLI（寫 `snapshot_fingerprint.json`、產第一個真實快照目錄）+ 單元測試外之整合 smoke。
+- **LDA-E1-02**：清洗後 bet 流 + manifest `preprocessing_rule_*` 預演。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| `partition_key` 驗證過鬆 | 惡意字串可組 odd 路徑 | 白名單 `gaming_day` 等於 Phase1 再收斂 | `test_l0_partition_dir_rejects_odd_partition_key`（可選） |
+| `snapshot_id` 長度 | 僅上限 120 body，極長仍可能 OS 限制 | ingest 實作再截斷或 hash-only body | 邊界長度 case |
+| 未裝套件時 import | `layered_data_assets` 不在 `setup.py` | 以 repo root 跑 pytest（預設 cwd） | `tests/unit/test_layered_l0_paths.py` |
+
+### STEP 3 — Tester（僅 tests）
+
+- 新增 **`tests/unit/test_layered_l0_paths.py`**（snapshot 合法／非法、`l0_partition_dir` 路徑）。
+
+```bash
+python -m pytest tests/unit/test_layered_l0_paths.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **`python -m pytest tests/unit/test_layered_l0_paths.py -q --tb=short`**：**7 passed**（無需改 production）。
+- **建議下一條**：**LDA-E1-01** 補 ingest CLI／`snapshot_fingerprint.json` 寫入與整合 smoke；接 **LDA-E1-02**（清洗後 bet 流 + manifest 預演）。
+
 ## OOM Config Refactor + Step 6/7 Memory Cleanup（2026-04-24）
 
 **對齊**：`doc/training_oom_and_runtime_audit.md` 的 OOM 策略；先完成 config / OOM shard refactor，再沿 `Step 6 -> Step 7` 熱路徑清理大 DataFrame copy / DuckDB→pandas materialization / 高風險 pandas fallback。
