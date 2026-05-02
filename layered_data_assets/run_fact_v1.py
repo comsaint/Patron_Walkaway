@@ -82,11 +82,11 @@ def _validate_run_break_min(run_break_min: float) -> None:
         raise ValueError(f"run_break_min must be in [0, 10000], got {run_break_min!r}")
 
 
-def _validate_gaming_day_partition_value(run_end_gaming_day: str) -> str:
-    """Return stripped ``YYYY-MM-DD`` partition value for path segments."""
-    s = run_end_gaming_day.strip()
+def _validate_gaming_day_partition_value(value: str, *, param_name: str = "run_end_gaming_day") -> str:
+    """Return stripped ``YYYY-MM-DD`` partition value for path segments (Hive / manifest keys)."""
+    s = value.strip()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-        raise ValueError(f"run_end_gaming_day must be YYYY-MM-DD, got {run_end_gaming_day!r}")
+        raise ValueError(f"{param_name} must be YYYY-MM-DD, got {value!r}")
     return s
 
 

@@ -13,6 +13,51 @@ except ImportError:
 from layered_data_assets.run_day_bridge_v1 import build_run_day_bridge_manifest, materialize_run_day_bridge_v1
 
 
+def test_bet_gaming_day_must_be_yyyy_mm_dd() -> None:
+    """``bet_gaming_day`` uses the same ISO date rule as ``run_end_gaming_day`` / preprocess."""
+    with pytest.raises(ValueError, match="bet_gaming_day must be YYYY-MM-DD"):
+        build_run_day_bridge_manifest(
+            source_snapshot_id="snap_abcdefgh",
+            bet_gaming_day="smoke-2026-05-02",
+            l0_fingerprint_path=None,
+            l1_preprocess_gaming_day="2026-01-01",
+            output_parquet=Path("x.parquet"),
+            manifest_uri_anchor=Path("."),
+            stats={"row_count": 0},
+        )
+
+
+def test_l1_preprocess_gaming_day_must_be_yyyy_mm_dd() -> None:
+    with pytest.raises(ValueError, match="l1_preprocess_gaming_day must be YYYY-MM-DD"):
+        build_run_day_bridge_manifest(
+            source_snapshot_id="snap_abcdefgh",
+            bet_gaming_day="2026-01-01",
+            l0_fingerprint_path=None,
+            l1_preprocess_gaming_day="not-a-date",
+            output_parquet=Path("x.parquet"),
+            manifest_uri_anchor=Path("."),
+            stats={"row_count": 0},
+        )
+
+
+@pytest.mark.skipif(duckdb is None, reason="duckdb not installed")
+def test_materialize_rejects_non_iso_bet_gaming_day(tmp_path: Path) -> None:
+    """Invalid ``bet_gaming_day`` fails before DuckDB reads ``input_paths``."""
+    con = duckdb.connect(database=":memory:")
+    try:
+        out = tmp_path / "out.parquet"
+        with pytest.raises(ValueError, match="bet_gaming_day must be YYYY-MM-DD"):
+            materialize_run_day_bridge_v1(
+                con=con,
+                input_paths=[tmp_path / "not_read_yet.parquet"],
+                output_parquet=out,
+                bet_gaming_day="2026/01/01",
+                run_break_min=30,
+            )
+    finally:
+        con.close()
+
+
 @pytest.mark.skipif(duckdb is None, reason="duckdb not installed")
 def test_run_day_bridge_cross_day_run_appears_under_each_bet_gaming_day(tmp_path: Path) -> None:
     """One run spanning two calendar days is listed in both ``bet_gaming_day`` partitions."""

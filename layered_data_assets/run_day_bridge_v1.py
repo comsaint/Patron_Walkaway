@@ -17,6 +17,7 @@ from layered_data_assets.run_fact_v1 import (
     _copy_select_to_parquet,
     _run_id_sql_expr,
     _stats_from_copied_parquet,
+    _validate_gaming_day_partition_value,
     materialize_run_boundary_temp_tables,
 )
 
@@ -28,16 +29,6 @@ SELECT
   CAST(MAX(run_end_ts) AS VARCHAR)
 FROM read_parquet(?)
 """
-
-
-def _validate_bet_gaming_day_partition_label(label: str) -> str:
-    """Return stripped ``bet_gaming_day`` for path/SQL (same path-segment rules as ``l1_bet``)."""
-    if not isinstance(label, str) or not label.strip():
-        raise ValueError(f"bet_gaming_day must be a non-empty string, got {label!r}")
-    s = label.strip()
-    if ".." in s or "/" in s or "\\" in s or "=" in s:
-        raise ValueError(f"invalid bet_gaming_day for path segment: {s!r}")
-    return s
 
 
 def _run_day_bridge_copy_inner_sql(*, bet_day_sql_escaped: str, run_id_expr: str) -> str:
@@ -74,7 +65,7 @@ def materialize_run_day_bridge_v1(
     """
     if not input_paths:
         raise ValueError("input_paths must be non-empty")
-    day = _validate_bet_gaming_day_partition_label(bet_gaming_day)
+    day = _validate_gaming_day_partition_value(bet_gaming_day, param_name="bet_gaming_day")
     materialize_run_boundary_temp_tables(
         con,
         input_paths=input_paths,
@@ -145,8 +136,8 @@ def build_run_day_bridge_manifest(
 ) -> dict[str, Any]:
     """Build manifest dict for ``run_day_bridge`` (partition ``bet_gaming_day``)."""
     validate_source_snapshot_id(source_snapshot_id)
-    day = _validate_bet_gaming_day_partition_label(bet_gaming_day)
-    pre = _validate_bet_gaming_day_partition_label(l1_preprocess_gaming_day)
+    day = _validate_gaming_day_partition_value(bet_gaming_day, param_name="bet_gaming_day")
+    pre = _validate_gaming_day_partition_value(l1_preprocess_gaming_day, param_name="l1_preprocess_gaming_day")
     part_preprocess = f"l1/t_bet/gaming_day={pre}"
     hashes = _manifest_hashes_for_output(l0_fingerprint_path)[:1]
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
