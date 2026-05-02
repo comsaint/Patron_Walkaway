@@ -36,7 +36,7 @@ def _validate_bet_gaming_day_partition_label(label: str) -> str:
         raise ValueError(f"bet_gaming_day must be a non-empty string, got {label!r}")
     s = label.strip()
     if ".." in s or "/" in s or "\\" in s or "=" in s:
-        raise ValueError(f"invalid bet_gaming_day for path segment: {label!r}")
+        raise ValueError(f"invalid bet_gaming_day for path segment: {s!r}")
     return s
 
 
