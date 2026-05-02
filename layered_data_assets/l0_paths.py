@@ -52,7 +52,14 @@ def l0_partition_dir(data_root: Path, snapshot_id: str, table: str, partition_ke
         raise ValueError(f"partition_value must be a non-empty string, got {partition_value!r}")
     if ".." in partition_key or "=" in partition_key:
         raise ValueError(f"invalid partition_key: {partition_key!r}")
-    if ".." in partition_value or "/" in partition_value or "\\" in partition_value:
-        raise ValueError(f"partition_value must not contain path separators, got {partition_value!r}")
+    if (
+        ".." in partition_value
+        or "/" in partition_value
+        or "\\" in partition_value
+        or "=" in partition_value
+    ):
+        raise ValueError(
+            f"partition_value must not contain '=', path separators, or '..', got {partition_value!r}"
+        )
     root = l0_snapshot_root(data_root, snapshot_id)
     return root / table.strip() / f"{partition_key.strip()}={partition_value.strip()}"

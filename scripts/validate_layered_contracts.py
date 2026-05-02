@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 try:
     import jsonschema
@@ -18,7 +19,8 @@ except ImportError as exc:  # pragma: no cover
 _REPO = Path(__file__).resolve().parent.parent
 
 
-def _load_enumerate_module():
+def _load_enumerate_module() -> ModuleType:
+    """Load ``enumerate_deploy_features`` as a module (no package import path)."""
     path = _REPO / "scripts" / "enumerate_deploy_features.py"
     spec = importlib.util.spec_from_file_location("_lda_enumerate", path)
     if spec is None or spec.loader is None:
@@ -29,21 +31,25 @@ def _load_enumerate_module():
 
 
 def _run(cmd: list[str]) -> None:
+    """Run ``cmd`` from repo root; raise ``RuntimeError`` if exit code is non-zero."""
     proc = subprocess.run(cmd, cwd=str(_REPO), check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
 
 
 def _load_json(p: Path) -> object:
+    """Parse JSON from ``p`` (UTF-8)."""
     return json.loads(p.read_text(encoding="utf-8"))
 
 
 def _validate_json_schema(instance: object, schema_path: Path) -> None:
+    """Validate ``instance`` against the JSON Schema at ``schema_path`` (Draft 7)."""
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     Draft7Validator(schema).validate(instance)
 
 
 def _validate_correction_file(path: Path, schema_path: Path) -> None:
+    """Validate each row of a JSON array correction log against ``schema_path``."""
     data = _load_json(path)
     if not isinstance(data, list):
         raise TypeError(f"{path}: expected JSON array")
@@ -54,6 +60,7 @@ def _validate_correction_file(path: Path, schema_path: Path) -> None:
 
 
 def _validate_enumeration_artifacts() -> None:
+    """Check enumerated features JSON and dependency CSV match live ``feature_spec``."""
     import csv
 
     import yaml
@@ -95,6 +102,7 @@ def _validate_enumeration_artifacts() -> None:
 
 
 def main() -> int:
+    """Run layered Phase-0 contract checks; return 0 on success, 1 on failure."""
     try:
         _run([sys.executable, str(_REPO / "scripts" / "validate_time_semantics_registry.py")])
         manifest_ex = _REPO / "schema" / "examples" / "manifest_l1_example.json"

@@ -1,8 +1,12 @@
 # Local Phase-0 contracts (LDA-E0-07). Requires: python, pyyaml, jsonschema.
-.PHONY: check-layered-contracts refresh-layered-contracts-artifacts
+.PHONY: check-layered-contracts refresh-layered-contracts-artifacts check-lda-l0
 
 check-layered-contracts:
 	python scripts/validate_layered_contracts.py
 
 refresh-layered-contracts-artifacts:
 	python scripts/enumerate_deploy_features.py
+
+# Phase-1 L0 ingest helpers + path/fingerprint unit tests (no large data required).
+check-lda-l0: check-layered-contracts
+	python -m pytest tests/unit/test_layered_l0_paths.py tests/unit/test_l0_fingerprint.py tests/unit/test_l0_ingest_cli.py -q --tb=short

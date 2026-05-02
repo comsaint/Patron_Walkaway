@@ -1,0 +1,23 @@
+# Layered data assets: Phase-0 contracts + L0 path/fingerprint/ingest CLI smoke (no large Parquet).
+name: layered-data-assets
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  contracts-and-l0:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install validators
+        run: pip install pyyaml jsonschema pytest
+      - name: Phase-0 layered contracts
+        run: make check-layered-contracts
+      - name: L0 paths, fingerprint, ingest CLI
+        run: make check-lda-l0

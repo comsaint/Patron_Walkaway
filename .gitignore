@@ -207,7 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 # Others
-data/
+# Large Parquet under data/ (keep dirs + non-parquet files e.g. fingerprint JSON / .gitkeep).
+data/**/*.parquet
 .env
 walkaway/
 trainer_backup/

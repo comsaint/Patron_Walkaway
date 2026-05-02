@@ -11,7 +11,9 @@
 
 `data/l0_layered/`
 
-（本 repo `.gitignore` 已忽略 `data/`，L0 實體不進版控；**規約與範例**以本檔與 `schema/examples/` 為準。）
+（**版控策略**：`.gitignore` 使用 `data/**/*.parquet`，大型 Parquet 不進 git，**目錄結構與非 parquet 檔**可保留於版控。正式大量資料仍以 artifact store／管線輸出為準。規約與已定案治理見本檔、`schema/examples/`、`doc/l0_ingest_governance_decisions.md`。）
+
+**Ingest**：`python scripts/l0_ingest.py --help`（寫入 `snapshot_fingerprint.json`、Hive-style 分區目錄；指紋格式見 `schema/examples/snapshot_fingerprint.example.json`）。
 
 ---
 

@@ -79,6 +79,7 @@ _FIELD_RE = re.compile(r"\|\s*`([^`]+)`\s*\|")
 
 
 def _parse_args() -> argparse.Namespace:
+    """Build CLI for registry path, dictionary path, and optional column-skip flag."""
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument(
         "--registry",
@@ -101,6 +102,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
+    """Load YAML from ``path``; require a mapping root."""
     if not path.is_file():
         raise FileNotFoundError(f"Registry file not found: {path}")
     raw = path.read_text(encoding="utf-8")
@@ -144,6 +146,7 @@ def _identifiers_in_sqlish(expr: str) -> list[str]:
 
 
 def _bool_or_tbd(value: Any, field: str, table: str) -> None:
+    """Require ``value`` to be bool or the literal string ``TBD`` for ``table.field``."""
     if isinstance(value, bool):
         return
     if value == "TBD":
@@ -228,6 +231,7 @@ def _validate_columns_against_dict(
     dict_cols: Mapping[str, set[str]],
     dictionary_path: Path,
 ) -> None:
+    """Ensure registry column refs for each table exist in the markdown schema dictionary."""
     for table, spec in tables.items():
         if table not in dict_cols:
             raise KeyError(
@@ -256,6 +260,7 @@ def validate_registry(
     *,
     check_dictionary_columns: bool,
 ) -> None:
+    """Validate ``time_semantics_registry`` shape, table entries, and optional dict columns."""
     data = _load_yaml(registry_path)
     missing_root = [k for k in _TOP_LEVEL_KEYS if k not in data]
     if missing_root:
@@ -276,6 +281,7 @@ def validate_registry(
 
 
 def main() -> int:
+    """CLI entry: validate registry; return 0 on success, 1 with stderr message on failure."""
     args = _parse_args()
     try:
         validate_registry(
