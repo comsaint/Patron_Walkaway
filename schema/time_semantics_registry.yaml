@@ -1,0 +1,103 @@
+# Time Semantics Registry
+#
+# Purpose:
+#   Defines table-specific event-time and observed-time semantics for source
+#   tables admitted into the layered data asset pipeline
+#   (see ssot/layered_data_assets_run_trip_ssot.md §4.4).
+#
+# Notes:
+#   - `event_time_col` is the business/event completion time.
+#   - `observed_at_col` is the best available proxy for when the row became
+#     observable to downstream systems. By default this is `__etl_insert_Dtm`.
+#   - `late_threshold` and production alerting thresholds are intentionally TBD;
+#     they belong to implementation / monitoring contracts.
+
+registry_version: "v1"
+owner: "data-assets"
+default_timezone: "UTC"
+default_observed_at_col: "__etl_insert_Dtm"
+
+tables:
+  t_bet:
+    description: "Player bet event table; primary source for bet/run/trip event sequences."
+    business_key:
+      - "bet_id"
+    event_time_col: "payout_complete_dtm"
+    observed_at_col: "__etl_insert_Dtm"
+    update_time_col: null
+    partition_cols:
+      - "gaming_day"
+    dedup_rule_id: "preprocess_bet_v1"
+    preprocessing_contract:
+      - "Require valid player_id before L1 materialization."
+      - "Require valid bet_id before L1 materialization."
+      - "Exclude or route invalid/canceled/deleted rows according to preprocessing plan."
+      - "Resolve duplicated bet_id versions before run/trip assignment."
+      - "Use stable ordering by event_time_col, then bet_id for sequence features."
+    correction_expected: false
+    late_arrival_expected: true
+    expected_delay_profile: "Usually near real-time; system backfills can create long observed_at - event_time tails. Quantiles and thresholds are defined by implementation / monitoring contracts."
+    late_threshold: "TBD"
+    notes:
+      - "For this asset layer, run/trip sequences use player_id, not canonical_id."
+      - "For bet/run ordering, payout_complete_dtm is the event-time anchor."
+
+  t_session:
+    description: "Player session table; may be used as auxiliary context and identity/profile input."
+    business_key:
+      - "session_id"
+    event_time_col: "COALESCE(session_end_dtm, lud_dtm)"
+    observed_at_col: "__etl_insert_Dtm"
+    update_time_col: "lud_dtm"
+    partition_cols:
+      - "gaming_day"
+    dedup_rule_id: "preprocess_session_v1"
+    preprocessing_contract:
+      - "Deduplicate session_id versions using the project DQ rule, preferring latest lud_dtm and ingestion metadata as tie-breakers."
+      - "Clean casino_player_id strings such as empty string and literal 'null' before any optional identity/profile usage."
+      - "Exclude or route manual/canceled/deleted rows according to the downstream use case."
+    correction_expected: true
+    late_arrival_expected: true
+    expected_delay_profile: "Session records are available after session conclusion and can have duplicate/corrected versions; thresholds are defined by implementation / monitoring contracts."
+    late_threshold: "TBD"
+    notes:
+      - "Not the primary event source for run/trip v1 boundaries."
+      - "Known duplicate session_id versions are documented in schema and findings."
+
+  t_game:
+    description: "Game/hand table; optional future context source, not required for run/trip v1."
+    business_key:
+      - "game_id"
+    event_time_col: "payout_complete_dtm"
+    observed_at_col: "__etl_insert_Dtm"
+    update_time_col: "__ts_ms"
+    partition_cols:
+      - "gaming_day"
+    dedup_rule_id: "preprocess_game_v1"
+    preprocessing_contract:
+      - "Deduplicate game_id versions before downstream use."
+      - "Do not admit into L1/L2 feature computation until a concrete feature dependency is approved."
+    correction_expected: true
+    late_arrival_expected: true
+    expected_delay_profile: "Optional context source; delay thresholds are TBD until admitted into asset layer."
+    late_threshold: "TBD"
+    notes:
+      - "Schema documents duplicated game_id versions; use only after preprocessing."
+
+  t_shoe:
+    description: "Shoe lifecycle table; optional future context source, not required for run/trip v1."
+    business_key:
+      - "shoe_id"
+    event_time_col: "shoe_end_dtm"
+    observed_at_col: "__etl_insert_Dtm"
+    update_time_col: "__ts_ms"
+    partition_cols: []
+    dedup_rule_id: "preprocess_shoe_v1"
+    preprocessing_contract:
+      - "Do not admit into L1/L2 feature computation until source availability and DQ rules are confirmed."
+    correction_expected: "TBD"
+    late_arrival_expected: "TBD"
+    expected_delay_profile: "TBD; source availability is incomplete in the current schema dictionary."
+    late_threshold: "TBD"
+    notes:
+      - "Current schema dictionary has incomplete t_shoe availability details."
