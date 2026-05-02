@@ -23,9 +23,8 @@ from layered_data_assets.preprocess_bet_v1 import (  # noqa: E402
 )
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse CLI for preprocess_bet_v1."""
-    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+def _add_preprocess_bet_required_args(p: argparse.ArgumentParser) -> None:
+    """Register required preprocess CLI arguments."""
     p.add_argument("--data-root", type=Path, default=Path("data"), help="Repo data root (default: ./data)")
     p.add_argument("--source-snapshot-id", required=True, help="L0 batch id, e.g. snap_...")
     p.add_argument("--gaming-day", required=True, help="Partition value YYYY-MM-DD")
@@ -37,6 +36,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Input Parquet (repeatable); must include columns for filters used",
     )
+
+
+def _add_preprocess_bet_optional_args(p: argparse.ArgumentParser) -> None:
+    """Register optional fingerprint, sidecar, and output overrides."""
     p.add_argument(
         "--l0-fingerprint-json",
         type=Path,
@@ -61,7 +64,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override output directory (default: data/l1_layered/<snap>/t_bet/gaming_day=...)",
     )
-    return p.parse_args(argv)
+
+
+def _build_preprocess_bet_arg_parser() -> argparse.ArgumentParser:
+    """Construct the preprocess_bet_v1 argument parser."""
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    _add_preprocess_bet_required_args(p)
+    _add_preprocess_bet_optional_args(p)
+    return p
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI for preprocess_bet_v1."""
+    return _build_preprocess_bet_arg_parser().parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:

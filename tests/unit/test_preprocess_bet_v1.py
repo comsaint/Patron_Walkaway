@@ -67,6 +67,39 @@ def test_preprocess_bet_v1_filters_and_dedup(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(duckdb is None, reason="duckdb not installed")
+def test_preprocess_bet_v1_empty_output_no_crash(tmp_path: Path) -> None:
+    """All rows filtered → 0 rows; time-range query must not raise on fetchone."""
+    inp = tmp_path / "in.parquet"
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute(
+            f"""
+            COPY (
+              SELECT * FROM (VALUES
+                (1::BIGINT, 100::BIGINT, DATE '2026-01-16',
+                 TIMESTAMP '2026-01-16 10:00:00',
+                 TIMESTAMP '2026-01-16 11:00:00',
+                 0::INTEGER, 0::INTEGER, 0::INTEGER)
+              ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm,
+                     is_deleted, is_canceled, is_manual)
+            ) TO '{inp.as_posix()}' (FORMAT PARQUET)
+            """
+        )
+        out = tmp_path / "empty_cleaned.parquet"
+        stats = run_preprocess_bet_v1(
+            con=con,
+            input_paths=[inp],
+            output_parquet=out,
+            gaming_day="2026-01-15",
+            dummy_player_ids_parquet=None,
+            eligible_player_ids_parquet=None,
+        )
+    finally:
+        con.close()
+    assert stats["row_count"] == 0
+
+
+@pytest.mark.skipif(duckdb is None, reason="duckdb not installed")
 def test_preprocess_bet_v1_eligible_filter(tmp_path: Path) -> None:
     inp = tmp_path / "in.parquet"
     elig = tmp_path / "elig.parquet"
