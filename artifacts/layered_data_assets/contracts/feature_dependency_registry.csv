@@ -1,0 +1,85 @@
+track_section,feature_id,spec_type,required_l1_fields,allow_bet_rescan,computation_source
+track_human,bets_in_run_so_far,python_vectorized,bet_id;canonical_id;payout_complete_dtm,TBD,python_vectorized:compute_run_boundary_features
+track_human,loss_streak,python_vectorized,bet_id;canonical_id;payout_complete_dtm;status,TBD,python_vectorized:compute_loss_streak
+track_human,minutes_since_run_start,python_vectorized,bet_id;canonical_id;payout_complete_dtm,TBD,python_vectorized:compute_run_boundary_features
+track_human,wager_sum_in_run_so_far,python_vectorized,bet_id;canonical_id;payout_complete_dtm,TBD,python_vectorized:compute_run_boundary_features
+track_llm,avg_payout_odds_w15m,window,TBD,TBD,window:AVG(payout_odds)
+track_llm,avg_wager_sofar,derived,TBD,TBD,"derived:CAST(cum_wager AS DOUBLE) / NULLIF(cum_bets, 0)"
+track_llm,back_bet_cnt_w20,window,TBD,TBD,window:SUM(is_back_bet)
+track_llm,back_bet_pct_w20,derived,TBD,TBD,"derived:100.0 * CAST(back_bet_cnt_w20 AS DOUBLE) / NULLIF(bets_cnt_w20, 0)"
+track_llm,base_ha,passthrough,TBD,TBD,passthrough
+track_llm,bets_cnt_w15m,window,TBD,TBD,window:COUNT(bet_id)
+track_llm,bets_cnt_w20,window,TBD,TBD,window:COUNT(*)
+track_llm,bets_cnt_w30m,window,TBD,TBD,window:COUNT(bet_id)
+track_llm,bets_cnt_w5m,window,TBD,TBD,window:COUNT(bet_id)
+track_llm,cum_bets,window,TBD,TBD,window:COUNT(*)
+track_llm,cum_wager,window,TBD,TBD,window:SUM(wager)
+track_llm,hour_of_day,derived,TBD,TBD,"derived:date_part('hour', payout_complete_dtm)"
+track_llm,is_back_bet,passthrough,TBD,TBD,passthrough
+track_llm,lose_cnt_w15m,window,TBD,TBD,window:SUM(CASE WHEN status = 'LOSE' THEN 1 ELSE 0 END)
+track_llm,pace_drop_ratio,derived,TBD,TBD,"derived:CAST(bets_cnt_w5m AS DOUBLE) / NULLIF(bets_cnt_w30m, 0)"
+track_llm,pace_drop_ratio_w15m_w30m,derived,TBD,TBD,"derived:CAST(bets_cnt_w15m AS DOUBLE) / NULLIF(bets_cnt_w30m, 0)"
+track_llm,payout_odds,passthrough,TBD,TBD,passthrough
+track_llm,position_idx,passthrough,TBD,TBD,passthrough
+track_llm,position_max_w30m,window,TBD,TBD,window:MAX(position_idx)
+track_llm,position_min_w30m,window,TBD,TBD,window:MIN(position_idx)
+track_llm,position_moved_w30m,derived,TBD,TBD,derived:CASE WHEN position_min_w30m = position_max_w30m THEN 0 ELSE 1 END
+track_llm,prev_bet_gap_min,derived,TBD,TBD,"derived:(epoch(payout_complete_dtm) - epoch(LAG(payout_complete_dtm, 1) OVER (PARTITION BY canonical_id ORDER BY payout_complete_dtm ASC, bet_id ASC))) / 60.0"
+track_llm,prev_bet_was_loss,derived,TBD,TBD,derived:CASE WHEN prev_status = 'LOSE' THEN 1 ELSE 0 END
+track_llm,prev_status,lag,TBD,TBD,"lag:LAG(status, 1)"
+track_llm,prev_wager,lag,TBD,TBD,"lag:LAG(wager, 1)"
+track_llm,time_of_day_cos,derived,TBD,TBD,"derived:cos(2 * pi() * (date_part('hour', payout_complete_dtm) * 60 + date_part('minute', payout_complete_dtm)) / 1440)"
+track_llm,time_of_day_sin,derived,TBD,TBD,"derived:sin(2 * pi() * (date_part('hour', payout_complete_dtm) * 60 + date_part('minute', payout_complete_dtm)) / 1440)"
+track_llm,wager,passthrough,TBD,TBD,passthrough
+track_llm,wager_avg_w15m,window,TBD,TBD,window:AVG(wager)
+track_llm,wager_max_w15m,window,TBD,TBD,window:MAX(wager)
+track_llm,wager_recent_vs_session_avg,derived,TBD,TBD,"derived:wager_avg_w15m / NULLIF(avg_wager_sofar, 0)"
+track_llm,wager_std_w15m,window,TBD,TBD,window:STDDEV_SAMP(wager)
+track_llm,wager_sum_w30m,window,TBD,TBD,window:SUM(wager)
+track_llm,win_cnt_w15m,window,TBD,TBD,window:SUM(CASE WHEN status = 'WIN' THEN 1 ELSE 0 END)
+track_llm,win_rate_w15m,derived,TBD,TBD,"derived:CAST(win_cnt_w15m AS DOUBLE) / NULLIF(bets_cnt_w15m, 0)"
+track_profile,active_days_30d,profile_column,player_profile.active_days_30d,no,profile_column:active_days_30d
+track_profile,active_days_365d,profile_column,player_profile.active_days_365d,no,profile_column:active_days_365d
+track_profile,active_days_90d,profile_column,player_profile.active_days_90d,no,profile_column:active_days_90d
+track_profile,active_days_per_session_30d,profile_column,player_profile.active_days_per_session_30d,no,profile_column:active_days_per_session_30d
+track_profile,actual_rtp_180d,profile_column,player_profile.actual_rtp_180d,no,profile_column:actual_rtp_180d
+track_profile,actual_rtp_30d,profile_column,player_profile.actual_rtp_30d,no,profile_column:actual_rtp_30d
+track_profile,actual_vs_theo_ratio_30d,profile_column,player_profile.actual_vs_theo_ratio_30d,no,profile_column:actual_vs_theo_ratio_30d
+track_profile,avg_session_duration_min_180d,profile_column,player_profile.avg_session_duration_min_180d,no,profile_column:avg_session_duration_min_180d
+track_profile,avg_session_duration_min_30d,profile_column,player_profile.avg_session_duration_min_30d,no,profile_column:avg_session_duration_min_30d
+track_profile,days_since_first_session,profile_column,player_profile.days_since_first_session,no,profile_column:days_since_first_session
+track_profile,days_since_last_session,profile_column,player_profile.days_since_last_session,no,profile_column:days_since_last_session
+track_profile,distinct_gaming_area_cnt_30d,profile_column,player_profile.distinct_gaming_area_cnt_30d,no,profile_column:distinct_gaming_area_cnt_30d
+track_profile,distinct_pit_cnt_30d,profile_column,player_profile.distinct_pit_cnt_30d,no,profile_column:distinct_pit_cnt_30d
+track_profile,distinct_table_cnt_30d,profile_column,player_profile.distinct_table_cnt_30d,no,profile_column:distinct_table_cnt_30d
+track_profile,distinct_table_cnt_90d,profile_column,player_profile.distinct_table_cnt_90d,no,profile_column:distinct_table_cnt_90d
+track_profile,num_bets_sum_180d,profile_column,player_profile.num_bets_sum_180d,no,profile_column:num_bets_sum_180d
+track_profile,num_bets_sum_30d,profile_column,player_profile.num_bets_sum_30d,no,profile_column:num_bets_sum_30d
+track_profile,num_games_with_wager_sum_180d,profile_column,player_profile.num_games_with_wager_sum_180d,no,profile_column:num_games_with_wager_sum_180d
+track_profile,num_games_with_wager_sum_30d,profile_column,player_profile.num_games_with_wager_sum_30d,no,profile_column:num_games_with_wager_sum_30d
+track_profile,player_win_sum_180d,profile_column,player_profile.player_win_sum_180d,no,profile_column:player_win_sum_180d
+track_profile,player_win_sum_30d,profile_column,player_profile.player_win_sum_30d,no,profile_column:player_win_sum_30d
+track_profile,player_win_sum_365d,profile_column,player_profile.player_win_sum_365d,no,profile_column:player_win_sum_365d
+track_profile,player_win_sum_90d,profile_column,player_profile.player_win_sum_90d,no,profile_column:player_win_sum_90d
+track_profile,sessions_180d,profile_column,player_profile.sessions_180d,no,profile_column:sessions_180d
+track_profile,sessions_30d,profile_column,player_profile.sessions_30d,no,profile_column:sessions_30d
+track_profile,sessions_30d_over_180d,profile_column,player_profile.sessions_30d_over_180d,no,profile_column:sessions_30d_over_180d
+track_profile,sessions_365d,profile_column,player_profile.sessions_365d,no,profile_column:sessions_365d
+track_profile,sessions_7d,profile_column,player_profile.sessions_7d,no,profile_column:sessions_7d
+track_profile,sessions_7d_over_30d,profile_column,player_profile.sessions_7d_over_30d,no,profile_column:sessions_7d_over_30d
+track_profile,sessions_90d,profile_column,player_profile.sessions_90d,no,profile_column:sessions_90d
+track_profile,theo_win_sum_180d,profile_column,player_profile.theo_win_sum_180d,no,profile_column:theo_win_sum_180d
+track_profile,theo_win_sum_30d,profile_column,player_profile.theo_win_sum_30d,no,profile_column:theo_win_sum_30d
+track_profile,top_table_share_30d,profile_column,player_profile.top_table_share_30d,no,profile_column:top_table_share_30d
+track_profile,top_table_share_90d,profile_column,player_profile.top_table_share_90d,no,profile_column:top_table_share_90d
+track_profile,turnover_30d_over_180d,profile_column,player_profile.turnover_30d_over_180d,no,profile_column:turnover_30d_over_180d
+track_profile,turnover_per_bet_30d_over_180d,profile_column,player_profile.turnover_per_bet_30d_over_180d,no,profile_column:turnover_per_bet_30d_over_180d
+track_profile,turnover_per_bet_mean_180d,profile_column,player_profile.turnover_per_bet_mean_180d,no,profile_column:turnover_per_bet_mean_180d
+track_profile,turnover_per_bet_mean_30d,profile_column,player_profile.turnover_per_bet_mean_30d,no,profile_column:turnover_per_bet_mean_30d
+track_profile,turnover_sum_180d,profile_column,player_profile.turnover_sum_180d,no,profile_column:turnover_sum_180d
+track_profile,turnover_sum_30d,profile_column,player_profile.turnover_sum_30d,no,profile_column:turnover_sum_30d
+track_profile,turnover_sum_365d,profile_column,player_profile.turnover_sum_365d,no,profile_column:turnover_sum_365d
+track_profile,turnover_sum_7d,profile_column,player_profile.turnover_sum_7d,no,profile_column:turnover_sum_7d
+track_profile,turnover_sum_90d,profile_column,player_profile.turnover_sum_90d,no,profile_column:turnover_sum_90d
+track_profile,win_session_rate_180d,profile_column,player_profile.win_session_rate_180d,no,profile_column:win_session_rate_180d
+track_profile,win_session_rate_30d,profile_column,player_profile.win_session_rate_30d,no,profile_column:win_session_rate_30d

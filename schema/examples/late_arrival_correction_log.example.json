@@ -1,0 +1,25 @@
+[
+  {
+    "correction_id": "550e8400-e29b-41d4-a716-446655440000",
+    "source_snapshot_id": "snap_example_001",
+    "published_snapshot_id_before": "pub_2026-05-01",
+    "published_snapshot_id_after": null,
+    "entity_type": "run",
+    "entity_id_before": "run_hash_before",
+    "entity_id_after": "run_hash_after",
+    "player_id": 172596,
+    "event_time_min": "2026-04-01T07:00:00Z",
+    "event_time_max": "2026-04-01T07:45:00Z",
+    "observed_at": "2026-04-01T09:00:00Z",
+    "correction_reason_code": "late_arrival",
+    "change_summary": "Late bet merged into existing run; run_id recomputed per §4.1.",
+    "upstream_keys": {
+      "bet_ids": [1001, 1002],
+      "manifest_partition": "run_end_gaming_day=2026-04-01"
+    },
+    "definition_version": "run_trip_v1",
+    "transform_version": "l1_assemble_v1",
+    "operator": "system",
+    "created_at": "2026-04-01T09:00:05Z"
+  }
+]

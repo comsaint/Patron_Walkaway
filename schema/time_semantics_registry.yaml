@@ -29,9 +29,12 @@ tables:
       - "gaming_day"
     dedup_rule_id: "preprocess_bet_v1"
     preprocessing_contract:
-      - "Require valid player_id before L1 materialization."
+      - "Require valid player_id before L1 materialization; exclude placeholder player_id = -1."
       - "Require valid bet_id before L1 materialization."
+      - "Exclude bets whose player_id is in the FND-12 dummy set produced by preprocess_session_v1 (align TRN-04)."
+      - "Exclude unrated/non-rated player_id values using the canonical mapping eligibility sidecar before L1 materialization."
       - "Exclude or route invalid/canceled/deleted rows according to preprocessing plan."
+      - "Analyze observed_at_col - event_time_col delay distribution; document major backfill episodes and table-specific threshold policy before production use."
       - "Resolve duplicated bet_id versions before run/trip assignment."
       - "Use stable ordering by event_time_col, then bet_id for sequence features."
     correction_expected: false
@@ -46,7 +49,7 @@ tables:
     description: "Player session table; may be used as auxiliary context and identity/profile input."
     business_key:
       - "session_id"
-    event_time_col: "COALESCE(session_end_dtm, lud_dtm)"
+    event_time_col: "session_end_dtm"
     observed_at_col: "__etl_insert_Dtm"
     update_time_col: "lud_dtm"
     partition_cols:
@@ -56,6 +59,9 @@ tables:
       - "Deduplicate session_id versions using the project DQ rule, preferring latest lud_dtm and ingestion metadata as tie-breakers."
       - "Clean casino_player_id strings such as empty string and literal 'null' before any optional identity/profile usage."
       - "Exclude or route manual/canceled/deleted rows according to the downstream use case."
+      - "Build canonical mapping eligibility sidecar; only rated player_ids whose canonical_id comes from casino_player_id are eligible for bet L1."
+      - "Apply FND-12 dummy player_id detection after FND-01/FND-04/placeholder filters; publish dummy set for bet L1 exclusion (see doc/preprocessing_layered_data_assets_v1.md)."
+      - "Analyze observed_at_col - event_time_col delay distribution; session_end_dtm is the asset-layer event-time anchor."
     correction_expected: true
     late_arrival_expected: true
     expected_delay_profile: "Session records are available after session conclusion and can have duplicate/corrected versions; thresholds are defined by implementation / monitoring contracts."
@@ -63,6 +69,7 @@ tables:
     notes:
       - "Not the primary event source for run/trip v1 boundaries."
       - "Known duplicate session_id versions are documented in schema and findings."
+      - "Rows with NULL session_end_dtm are excluded from asset-layer preprocessing (no lud_dtm fallback); see doc/preprocessing_layered_data_assets_v1.md §0 / SES-OBS-01."
 
   t_game:
     description: "Game/hand table; optional future context source, not required for run/trip v1."
@@ -76,6 +83,8 @@ tables:
     dedup_rule_id: "preprocess_game_v1"
     preprocessing_contract:
       - "Deduplicate game_id versions before downstream use."
+      - "Analyze observed_at_col - event_time_col delay distribution and document major backfill episodes."
+      - "Do not apply additional game-specific filtering until the game table DQ study is completed."
       - "Do not admit into L1/L2 feature computation until a concrete feature dependency is approved."
     correction_expected: true
     late_arrival_expected: true
@@ -85,7 +94,7 @@ tables:
       - "Schema documents duplicated game_id versions; use only after preprocessing."
 
   t_shoe:
-    description: "Shoe lifecycle table; optional future context source, not required for run/trip v1."
+    description: "Shoe lifecycle table; deferred — not used in current layered-asset phase (see doc/preprocessing_layered_data_assets_v1.md §0)."
     business_key:
       - "shoe_id"
     event_time_col: "shoe_end_dtm"
@@ -101,3 +110,4 @@ tables:
     late_threshold: "TBD"
     notes:
       - "Current schema dictionary has incomplete t_shoe availability details."
+      - "No L1 ingest in current phase; revisit when shoe Parquet and DQ are available."

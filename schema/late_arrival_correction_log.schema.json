@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://patron-walkaway.local/schema/late_arrival_correction_log.schema.json",
+  "title": "LateArrivalCorrectionLogRow",
+  "description": "Single correction event (implementation plan layered_data_assets_run_trip_implementation_plan.md §10.3).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "correction_id",
+    "source_snapshot_id",
+    "published_snapshot_id_before",
+    "published_snapshot_id_after",
+    "entity_type",
+    "entity_id_before",
+    "entity_id_after",
+    "player_id",
+    "event_time_min",
+    "event_time_max",
+    "observed_at",
+    "correction_reason_code",
+    "change_summary",
+    "upstream_keys",
+    "definition_version",
+    "transform_version",
+    "operator",
+    "created_at"
+  ],
+  "properties": {
+    "correction_id": { "type": "string", "minLength": 1 },
+    "source_snapshot_id": { "type": "string" },
+    "published_snapshot_id_before": { "type": ["string", "null"] },
+    "published_snapshot_id_after": { "type": ["string", "null"] },
+    "entity_type": { "type": "string", "enum": ["run", "trip", "feature_row"] },
+    "entity_id_before": { "type": ["string", "null"] },
+    "entity_id_after": { "type": ["string", "null"] },
+    "player_id": { "type": "integer" },
+    "event_time_min": { "type": "string" },
+    "event_time_max": { "type": "string" },
+    "observed_at": { "type": "string" },
+    "correction_reason_code": { "type": "string" },
+    "change_summary": { "type": "string" },
+    "upstream_keys": {
+      "description": "Join to manifest / bets, e.g. bet_id list or hash summary.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "definition_version": { "type": "string" },
+    "transform_version": { "type": "string" },
+    "operator": { "type": "string" },
+    "created_at": { "type": "string" }
+  }
+}

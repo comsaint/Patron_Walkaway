@@ -1,0 +1,343 @@
+{
+  "enumerator_version": "1",
+  "source_spec_path": "C:/Users/longp/Patron_Walkaway/package/deploy/models/feature_spec.yaml",
+  "feature_count": 84,
+  "features": [
+    {
+      "track_section": "track_human",
+      "feature_id": "bets_in_run_so_far"
+    },
+    {
+      "track_section": "track_human",
+      "feature_id": "loss_streak"
+    },
+    {
+      "track_section": "track_human",
+      "feature_id": "minutes_since_run_start"
+    },
+    {
+      "track_section": "track_human",
+      "feature_id": "wager_sum_in_run_so_far"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "avg_payout_odds_w15m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "avg_wager_sofar"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "back_bet_cnt_w20"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "back_bet_pct_w20"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "base_ha"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "bets_cnt_w15m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "bets_cnt_w20"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "bets_cnt_w30m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "bets_cnt_w5m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "cum_bets"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "cum_wager"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "hour_of_day"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "is_back_bet"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "lose_cnt_w15m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "pace_drop_ratio"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "pace_drop_ratio_w15m_w30m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "payout_odds"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "position_idx"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "position_max_w30m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "position_min_w30m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "position_moved_w30m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "prev_bet_gap_min"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "prev_bet_was_loss"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "prev_status"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "prev_wager"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "time_of_day_cos"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "time_of_day_sin"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "wager"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "wager_avg_w15m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "wager_max_w15m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "wager_recent_vs_session_avg"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "wager_std_w15m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "wager_sum_w30m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "win_cnt_w15m"
+    },
+    {
+      "track_section": "track_llm",
+      "feature_id": "win_rate_w15m"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "active_days_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "active_days_365d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "active_days_90d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "active_days_per_session_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "actual_rtp_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "actual_rtp_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "actual_vs_theo_ratio_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "avg_session_duration_min_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "avg_session_duration_min_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "days_since_first_session"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "days_since_last_session"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "distinct_gaming_area_cnt_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "distinct_pit_cnt_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "distinct_table_cnt_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "distinct_table_cnt_90d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "num_bets_sum_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "num_bets_sum_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "num_games_with_wager_sum_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "num_games_with_wager_sum_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "player_win_sum_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "player_win_sum_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "player_win_sum_365d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "player_win_sum_90d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "sessions_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "sessions_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "sessions_30d_over_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "sessions_365d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "sessions_7d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "sessions_7d_over_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "sessions_90d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "theo_win_sum_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "theo_win_sum_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "top_table_share_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "top_table_share_90d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "turnover_30d_over_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "turnover_per_bet_30d_over_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "turnover_per_bet_mean_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "turnover_per_bet_mean_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "turnover_sum_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "turnover_sum_30d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "turnover_sum_365d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "turnover_sum_7d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "turnover_sum_90d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "win_session_rate_180d"
+    },
+    {
+      "track_section": "track_profile",
+      "feature_id": "win_session_rate_30d"
+    }
+  ]
+}

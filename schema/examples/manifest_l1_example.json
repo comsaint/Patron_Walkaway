@@ -1,0 +1,39 @@
+{
+  "artifact_kind": "run_fact",
+  "partition_keys": {
+    "run_end_gaming_day": "2026-04-01"
+  },
+  "definition_version": "run_trip_v1",
+  "feature_version": "na_l1",
+  "transform_version": "na_l1",
+  "source_partitions": [
+    "l0/t_bet/gaming_day=2026-04-01",
+    "l0/t_bet/gaming_day=2026-03-31"
+  ],
+  "source_hashes": [
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  ],
+  "source_snapshot_id": "snap_example_001",
+  "preprocessing_rule_id": "preprocess_bet_v1",
+  "preprocessing_rule_version": "v1",
+  "published_snapshot_id": null,
+  "ingestion_fix_rule_id": null,
+  "ingestion_fix_rule_version": null,
+  "row_count": 42,
+  "time_range": {
+    "min_event_time": "2026-03-31T12:00:00Z",
+    "max_event_time": "2026-04-01T08:30:00Z"
+  },
+  "built_at": "2026-05-02T00:00:00Z",
+  "ingestion_delay_summary": {
+    "ingest_delay_p50_sec": 12.5,
+    "ingest_delay_p95_sec": 180.0,
+    "ingest_delay_p99_sec": 420.0,
+    "ingest_delay_max_sec": 900.0,
+    "late_row_count": 3,
+    "late_row_ratio": 0.0001,
+    "affected_run_count": 2,
+    "affected_trip_count": 0
+  }
+}

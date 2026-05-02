@@ -1,0 +1,4 @@
+# Example layout (no binary files committed)
+# data/l0_layered/snap_example_001/
+#   t_bet/gaming_day=2026-04-01/part-000.parquet
+#   t_session/gaming_day=2026-04-01/part-000.parquet

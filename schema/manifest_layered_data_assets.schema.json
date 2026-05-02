@@ -1,0 +1,88 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://patron-walkaway.local/schema/manifest_layered_data_assets.schema.json",
+  "title": "LayeredDataAssetsManifest",
+  "description": "L1/L2 batch lineage manifest (SSOT layered_data_assets_run_trip_ssot.md §8 + §4.4 ingestion_delay_summary).",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "artifact_kind",
+    "partition_keys",
+    "definition_version",
+    "feature_version",
+    "transform_version",
+    "source_partitions",
+    "source_hashes",
+    "source_snapshot_id",
+    "row_count",
+    "time_range",
+    "built_at",
+    "ingestion_delay_summary"
+  ],
+  "properties": {
+    "artifact_kind": {
+      "type": "string",
+      "description": "Logical artifact, e.g. run_fact, trip_fact, feature_run."
+    },
+    "partition_keys": {
+      "type": "object",
+      "description": "Partition dimensions for this batch (string keys and string values).",
+      "additionalProperties": { "type": "string" }
+    },
+    "definition_version": { "type": "string" },
+    "feature_version": { "type": "string" },
+    "transform_version": { "type": "string" },
+    "source_partitions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Upstream L0/L1 partition identifiers."
+    },
+    "source_hashes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Fingerprints aligned 1:1 with source_partitions or batch policy as documented."
+    },
+    "source_snapshot_id": { "type": "string" },
+    "preprocessing_rule_id": { "type": ["string", "null"] },
+    "preprocessing_rule_version": { "type": ["string", "null"] },
+    "published_snapshot_id": { "type": ["string", "null"] },
+    "ingestion_fix_rule_id": { "type": ["string", "null"] },
+    "ingestion_fix_rule_version": { "type": ["string", "null"] },
+    "row_count": { "type": "integer", "minimum": 0 },
+    "time_range": {
+      "type": "object",
+      "required": ["min_event_time", "max_event_time"],
+      "properties": {
+        "min_event_time": { "type": "string" },
+        "max_event_time": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "built_at": { "type": "string", "description": "ISO-8601 timestamp, UTC recommended." },
+    "ingestion_delay_summary": {
+      "type": "object",
+      "description": "SSOT §4.4 delay aggregates for monitoring / drift consumers.",
+      "required": [
+        "ingest_delay_p50_sec",
+        "ingest_delay_p95_sec",
+        "ingest_delay_p99_sec",
+        "ingest_delay_max_sec",
+        "late_row_count",
+        "late_row_ratio",
+        "affected_run_count",
+        "affected_trip_count"
+      ],
+      "properties": {
+        "ingest_delay_p50_sec": { "type": ["number", "null"] },
+        "ingest_delay_p95_sec": { "type": ["number", "null"] },
+        "ingest_delay_p99_sec": { "type": ["number", "null"] },
+        "ingest_delay_max_sec": { "type": ["number", "null"] },
+        "late_row_count": { "type": ["integer", "null"], "minimum": 0 },
+        "late_row_ratio": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "affected_run_count": { "type": ["integer", "null"], "minimum": 0 },
+        "affected_trip_count": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "additionalProperties": true
+    }
+  }
+}
