@@ -15,11 +15,38 @@ from layered_data_assets.preprocess_bet_v1 import (
 from layered_data_assets.run_fact_v1 import (
     RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT,
     SOURCE_NAMESPACE_DEFAULT,
-    materialize_run_boundary_temp_tables,
+    _copy_select_to_parquet,
     _run_id_sql_expr,
+    _stats_from_copied_parquet,
     _validate_gaming_day_partition_value,
+    materialize_run_boundary_temp_tables,
 )
 _RUN_BET_MAP_TRANSFORM_VERSION = "v1"
+
+_RUN_BET_MAP_TIME_RANGE_SQL = """
+SELECT
+  CAST(MIN(payout_complete_dtm) AS VARCHAR),
+  CAST(MAX(payout_complete_dtm) AS VARCHAR)
+FROM read_parquet(?)
+"""
+
+
+def _run_bet_map_copy_inner_sql(*, day_sql_escaped: str, run_id_expr: str) -> str:
+    """Build inner SELECT for one ``run_end_gaming_day`` ``run_bet_map`` partition."""
+    return f"""
+SELECT
+  {run_id_expr} AS run_id,
+  b.bet_id,
+  b.player_id,
+  b.payout_complete_dtm,
+  CAST(b.gaming_day AS VARCHAR) AS bet_gaming_day,
+  CAST(r.run_end_gaming_day AS VARCHAR) AS run_end_gaming_day
+FROM run_boundary_bets b
+INNER JOIN run_fact_staging r
+  ON b.player_id = r.player_id AND b.run_seq = r.run_seq
+WHERE CAST(r.run_end_gaming_day AS VARCHAR) = '{day_sql_escaped}'
+ORDER BY run_id, b.payout_complete_dtm ASC, b.bet_id ASC
+"""
 
 
 def materialize_run_bet_map_v1(
@@ -49,46 +76,17 @@ def materialize_run_bet_map_v1(
         run_definition_version=run_definition_version,
         source_namespace=source_namespace,
     )
-    day_sql = day.replace("'", "''")
-    rid = _run_id_sql_expr(table_prefix="r.")
-    inner = f"""
-SELECT
-  {rid} AS run_id,
-  b.bet_id,
-  b.player_id,
-  b.payout_complete_dtm,
-  CAST(b.gaming_day AS VARCHAR) AS bet_gaming_day,
-  CAST(r.run_end_gaming_day AS VARCHAR) AS run_end_gaming_day
-FROM run_boundary_bets b
-INNER JOIN run_fact_staging r
-  ON b.player_id = r.player_id AND b.run_seq = r.run_seq
-WHERE CAST(r.run_end_gaming_day AS VARCHAR) = '{day_sql}'
-ORDER BY run_id, b.payout_complete_dtm ASC, b.bet_id ASC
-"""
-    output_parquet.parent.mkdir(parents=True, exist_ok=True)
-    out = str(output_parquet.resolve()).replace("\\", "/").replace("'", "''")
-    con.execute(f"COPY ({inner.strip()}) TO '{out}' (FORMAT PARQUET);\n")
-    count_row = con.execute(
-        "SELECT COUNT(*) FROM read_parquet(?)", [str(output_parquet.resolve())]
-    ).fetchone()
-    if count_row is None:
-        raise RuntimeError("COUNT(*) on run_bet_map parquet returned no row")
-    n = int(count_row[0])
-    tr = con.execute(
-        """
-        SELECT
-          CAST(MIN(payout_complete_dtm) AS VARCHAR),
-          CAST(MAX(payout_complete_dtm) AS VARCHAR)
-        FROM read_parquet(?)
-        """,
-        [str(output_parquet.resolve())],
-    ).fetchone()
-    t0, t1 = (None, None) if tr is None else (tr[0], tr[1])
-    return {
-        "row_count": n,
-        "time_range_min": t0,
-        "time_range_max": t1,
-    }
+    inner = _run_bet_map_copy_inner_sql(
+        day_sql_escaped=day.replace("'", "''"),
+        run_id_expr=_run_id_sql_expr(table_prefix="r."),
+    )
+    _copy_select_to_parquet(con, inner, output_parquet)
+    return _stats_from_copied_parquet(
+        con,
+        output_parquet,
+        count_error_msg="COUNT(*) on run_bet_map parquet returned no row",
+        time_range_sql=_RUN_BET_MAP_TIME_RANGE_SQL,
+    )
 
 
 def build_run_bet_map_manifest(

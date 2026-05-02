@@ -162,6 +162,59 @@ def _run_id_sql_expr(*, table_prefix: str = "") -> str:
     return f"'run_' || substr(sha256({canon}), 1, 32)"
 
 
+_RUN_FACT_TIME_RANGE_SQL = """
+SELECT
+  CAST(MIN(run_start_ts) AS VARCHAR),
+  CAST(MAX(run_end_ts) AS VARCHAR)
+FROM read_parquet(?)
+"""
+
+
+def _run_fact_copy_inner_sql(*, day_sql_escaped: str, run_id_expr: str) -> str:
+    """Build inner SELECT for one ``run_end_gaming_day`` ``run_fact`` partition."""
+    return f"""
+SELECT
+  {run_id_expr} AS run_id,
+  player_id,
+  first_bet_id,
+  last_bet_id,
+  run_start_ts,
+  run_end_ts,
+  CAST(run_end_gaming_day AS VARCHAR) AS run_end_gaming_day,
+  bet_count,
+  run_definition_version,
+  source_namespace
+FROM run_fact_staging
+WHERE CAST(run_end_gaming_day AS VARCHAR) = '{day_sql_escaped}'
+ORDER BY run_id
+"""
+
+
+def _copy_select_to_parquet(con: Any, inner_sql: str, output_parquet: Path) -> None:
+    """COPY ``(inner_sql)`` to ``output_parquet``; create parent directories."""
+    output_parquet.parent.mkdir(parents=True, exist_ok=True)
+    out = str(output_parquet.resolve()).replace("\\", "/").replace("'", "''")
+    con.execute(f"COPY ({inner_sql.strip()}) TO '{out}' (FORMAT PARQUET);\n")
+
+
+def _stats_from_copied_parquet(
+    con: Any,
+    output_parquet: Path,
+    *,
+    count_error_msg: str,
+    time_range_sql: str,
+) -> dict[str, Any]:
+    """Row count and min/max time strings from a Parquet written by :func:`_copy_select_to_parquet`."""
+    path = str(output_parquet.resolve())
+    count_row = con.execute("SELECT COUNT(*) FROM read_parquet(?)", [path]).fetchone()
+    if count_row is None:
+        raise RuntimeError(count_error_msg)
+    n = int(count_row[0])
+    tr = con.execute(time_range_sql, [path]).fetchone()
+    t0, t1 = (None, None) if tr is None else (tr[0], tr[1])
+    return {"row_count": n, "time_range_min": t0, "time_range_max": t1}
+
+
 def materialize_run_fact_v1(
     *,
     con: Any,
@@ -186,48 +239,17 @@ def materialize_run_fact_v1(
         run_definition_version=run_definition_version,
         source_namespace=source_namespace,
     )
-    day_sql = day.replace("'", "''")
-    rid = _run_id_sql_expr()
-    inner = f"""
-SELECT
-  {rid} AS run_id,
-  player_id,
-  first_bet_id,
-  last_bet_id,
-  run_start_ts,
-  run_end_ts,
-  CAST(run_end_gaming_day AS VARCHAR) AS run_end_gaming_day,
-  bet_count,
-  run_definition_version,
-  source_namespace
-FROM run_fact_staging
-WHERE CAST(run_end_gaming_day AS VARCHAR) = '{day_sql}'
-ORDER BY run_id
-"""
-    output_parquet.parent.mkdir(parents=True, exist_ok=True)
-    out = str(output_parquet.resolve()).replace("\\", "/").replace("'", "''")
-    con.execute(f"COPY ({inner.strip()}) TO '{out}' (FORMAT PARQUET);\n")
-    count_row = con.execute(
-        "SELECT COUNT(*) FROM read_parquet(?)", [str(output_parquet.resolve())]
-    ).fetchone()
-    if count_row is None:
-        raise RuntimeError("COUNT(*) on run_fact parquet returned no row")
-    n = int(count_row[0])
-    tr = con.execute(
-        """
-        SELECT
-          CAST(MIN(run_start_ts) AS VARCHAR),
-          CAST(MAX(run_end_ts) AS VARCHAR)
-        FROM read_parquet(?)
-        """,
-        [str(output_parquet.resolve())],
-    ).fetchone()
-    t0, t1 = (None, None) if tr is None else (tr[0], tr[1])
-    return {
-        "row_count": n,
-        "time_range_min": t0,
-        "time_range_max": t1,
-    }
+    inner = _run_fact_copy_inner_sql(
+        day_sql_escaped=day.replace("'", "''"),
+        run_id_expr=_run_id_sql_expr(),
+    )
+    _copy_select_to_parquet(con, inner, output_parquet)
+    return _stats_from_copied_parquet(
+        con,
+        output_parquet,
+        count_error_msg="COUNT(*) on run_fact parquet returned no row",
+        time_range_sql=_RUN_FACT_TIME_RANGE_SQL,
+    )
 
 
 def build_run_fact_manifest(
