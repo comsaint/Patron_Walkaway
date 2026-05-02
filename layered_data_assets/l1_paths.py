@@ -29,6 +29,21 @@ def l1_bet_partition_dir(data_root: Path, snapshot_id: str, gaming_day: str) -> 
     return root / "t_bet" / f"gaming_day={gaming_day.strip()}"
 
 
+def l1_run_bet_map_partition_dir(data_root: Path, snapshot_id: str, run_end_gaming_day: str) -> Path:
+    """Return directory for ``run_bet_map`` Hive partition (``run_end_gaming_day=...``)."""
+    if not isinstance(run_end_gaming_day, str) or not run_end_gaming_day.strip():
+        raise ValueError(f"run_end_gaming_day must be a non-empty string, got {run_end_gaming_day!r}")
+    if (
+        ".." in run_end_gaming_day
+        or "/" in run_end_gaming_day
+        or "\\" in run_end_gaming_day
+        or "=" in run_end_gaming_day
+    ):
+        raise ValueError(f"invalid run_end_gaming_day for path segment: {run_end_gaming_day!r}")
+    root = l1_snapshot_root(data_root, snapshot_id)
+    return root / "run_bet_map" / f"run_end_gaming_day={run_end_gaming_day.strip()}"
+
+
 def l1_run_fact_partition_dir(data_root: Path, snapshot_id: str, run_end_gaming_day: str) -> Path:
     """Return directory for ``run_fact`` Hive partition (``run_end_gaming_day=...``)."""
     if not isinstance(run_end_gaming_day, str) or not run_end_gaming_day.strip():

@@ -1,0 +1,15 @@
+{
+  "ingest_recipe_version": "l0_ingest_v1",
+  "inputs": [
+    {
+      "relative_path": "data/baseline_for_baseline_models.parquet",
+      "sha256": "5d3cc4bb5209dd93f3306c285109a7575c455d7160cd9fc2a21509bca7294264",
+      "size_bytes": 1714760
+    }
+  ],
+  "layout": {
+    "partition_key": "gaming_day",
+    "partition_value": "smoke-2026-05-02",
+    "table": "t_bet"
+  }
+}
