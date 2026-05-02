@@ -107,7 +107,11 @@ def main(argv: list[str] | None = None) -> int:
         print("--bet-gaming-day is required for run_day_bridge.", file=sys.stderr)
         return 2
 
-    profiles = _profiles_from_json_arg(args.profiles_json) if args.profiles_json else GATE1_DEFAULT_DUCKDB_PROFILES
+    profiles = (
+        _profiles_from_json_arg(args.profiles_json)
+        if args.profiles_json is not None
+        else GATE1_DEFAULT_DUCKDB_PROFILES
+    )
 
     rep = gate1_l1_report_across_duckdb_profiles(
         duckdb_module=duckdb,
