@@ -11,6 +11,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -88,9 +89,10 @@ def _load_existing_fingerprint(snapshot_root: Path) -> str | None:
     return fingerprint_canonical_json(data)
 
 
-def materialize(argv: list[str] | None = None) -> int:
-    """Compute fingerprint, derive id, write ``snapshot_fingerprint.json``, copy sources."""
-    args = _parse_args(argv)
+def _build_ingest_fingerprint(
+    args: argparse.Namespace,
+) -> tuple[list[Path], dict[str, Any], str, str]:
+    """Normalize sources, build fingerprint document, return ``(sources, doc, canonical, derived_id)``."""
     sources = normalized_sorted_sources([Path(s) for s in args.sources])
     doc = build_fingerprint_document(
         source_paths=sources,
@@ -102,34 +104,54 @@ def materialize(argv: list[str] | None = None) -> int:
     )
     canonical = fingerprint_canonical_json(doc)
     derived_id = derive_source_snapshot_id(canonical)
-    snapshot_id = args.snapshot_id.strip() if args.snapshot_id else derived_id
-    if args.snapshot_id:
+    return sources, doc, canonical, derived_id
+
+
+def _validate_cli_snapshot_id(
+    snapshot_id_arg: str | None,
+    derived_id: str,
+    *,
+    allow_mismatch: bool,
+) -> tuple[str, int | None]:
+    """Resolve ``--snapshot-id`` vs derived id; return ``(snapshot_id, exit_code)`` with ``exit_code`` 2 on error."""
+    snapshot_id = snapshot_id_arg.strip() if snapshot_id_arg else derived_id
+    if snapshot_id_arg:
         validate_source_snapshot_id(snapshot_id)
-        if snapshot_id != derived_id and not args.allow_snapshot_id_mismatch:
+        if snapshot_id != derived_id and not allow_mismatch:
             print(
                 f"ERROR: --snapshot-id {snapshot_id!r} != derived {derived_id!r}. "
                 "Use default (omit --snapshot-id) or pass --allow-snapshot-id-mismatch.",
                 file=sys.stderr,
             )
-            return 2
+            return snapshot_id, 2
     else:
         validate_source_snapshot_id(snapshot_id)
+    return snapshot_id, None
 
-    data_root = args.data_root.resolve()
-    snapshot_root = data_root / "l0_layered" / snapshot_id
-    part_dir = l0_partition_dir(Path(data_root), snapshot_id, args.table, args.partition_key, args.partition_value)
 
-    if args.dry_run:
-        print("dry_run: true")
-        print(f"snapshot_id: {snapshot_id}")
-        print(f"snapshot_root: {snapshot_root}")
-        print(f"partition_dir: {part_dir}")
-        print("canonical_fingerprint_json:", canonical[:200] + ("..." if len(canonical) > 200 else ""))
-        return 0
+def _dry_run_report(snapshot_id: str, snapshot_root: Path, part_dir: Path, canonical: str) -> None:
+    """Print planned paths and truncated canonical fingerprint (stdout)."""
+    print("dry_run: true")
+    print(f"snapshot_id: {snapshot_id}")
+    print(f"snapshot_root: {snapshot_root}")
+    print(f"partition_dir: {part_dir}")
+    print("canonical_fingerprint_json:", canonical[:200] + ("..." if len(canonical) > 200 else ""))
 
+
+def _write_l0_materialization(
+    snapshot_root: Path,
+    part_dir: Path,
+    doc: dict[str, Any],
+    sources: list[Path],
+    *,
+    canonical: str,
+    snapshot_id: str,
+    force: bool,
+) -> int:
+    """Create dirs, write fingerprint JSON, copy sources; return 0 or 3 on fingerprint conflict."""
     existing = _load_existing_fingerprint(snapshot_root)
     if existing is not None and existing != canonical:
-        if not args.force:
+        if not force:
             print(
                 f"ERROR: snapshot {snapshot_id!r} exists with different fingerprint. "
                 "Refuse to overwrite (use new inputs or --force).",
@@ -151,6 +173,37 @@ def materialize(argv: list[str] | None = None) -> int:
     print(f"OK wrote {snapshot_root / 'snapshot_fingerprint.json'}")
     print(f"OK materialized {len(sources)} file(s) under {part_dir}")
     return 0
+
+
+def materialize(argv: list[str] | None = None) -> int:
+    """Compute fingerprint, derive id, write ``snapshot_fingerprint.json``, copy sources."""
+    args = _parse_args(argv)
+    sources, doc, canonical, derived_id = _build_ingest_fingerprint(args)
+    snapshot_id, err = _validate_cli_snapshot_id(
+        args.snapshot_id,
+        derived_id,
+        allow_mismatch=args.allow_snapshot_id_mismatch,
+    )
+    if err is not None:
+        return err
+
+    data_root = args.data_root.resolve()
+    snapshot_root = data_root / "l0_layered" / snapshot_id
+    part_dir = l0_partition_dir(data_root, snapshot_id, args.table, args.partition_key, args.partition_value)
+
+    if args.dry_run:
+        _dry_run_report(snapshot_id, snapshot_root, part_dir, canonical)
+        return 0
+
+    return _write_l0_materialization(
+        snapshot_root,
+        part_dir,
+        doc,
+        sources,
+        canonical=canonical,
+        snapshot_id=snapshot_id,
+        force=args.force,
+    )
 
 
 def main() -> int:
