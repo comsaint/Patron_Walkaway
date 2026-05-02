@@ -114,6 +114,8 @@ def main() -> int:
         _validate_json_schema(_load_json(manifest_run), manifest_sc)
         manifest_rbm = _REPO / "schema" / "examples" / "manifest_run_bet_map_l1_example.json"
         _validate_json_schema(_load_json(manifest_rbm), manifest_sc)
+        manifest_rdb = _REPO / "schema" / "examples" / "manifest_run_day_bridge_l1_example.json"
+        _validate_json_schema(_load_json(manifest_rdb), manifest_sc)
         corr_ex = _REPO / "schema" / "examples" / "late_arrival_correction_log.example.json"
         corr_sc = _REPO / "schema" / "late_arrival_correction_log.schema.json"
         _validate_correction_file(corr_ex, corr_sc)
