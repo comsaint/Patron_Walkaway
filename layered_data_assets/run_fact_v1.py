@@ -252,6 +252,41 @@ def materialize_run_fact_v1(
     )
 
 
+def _run_fact_manifest_dict(
+    *,
+    source_snapshot_id: str,
+    run_end_gaming_day: str,
+    part_preprocess: str,
+    source_hashes: list[str],
+    built_at: str,
+    min_event_time: str,
+    max_event_time: str,
+    stats: dict[str, Any],
+    output_relative_uri: str,
+) -> dict[str, Any]:
+    """Build the ``run_fact`` manifest object (``artifact_kind`` = ``run_fact``)."""
+    return {
+        "artifact_kind": "run_fact",
+        "partition_keys": {"run_end_gaming_day": run_end_gaming_day, "source_snapshot_id": source_snapshot_id.strip()},
+        "definition_version": RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT,
+        "feature_version": "na_l1_run_fact",
+        "transform_version": _RUN_FACT_TRANSFORM_VERSION,
+        "source_partitions": [part_preprocess],
+        "source_hashes": source_hashes,
+        "source_snapshot_id": source_snapshot_id.strip(),
+        "preprocessing_rule_id": "preprocess_bet_v1",
+        "preprocessing_rule_version": "v1",
+        "published_snapshot_id": None,
+        "ingestion_fix_rule_id": None,
+        "ingestion_fix_rule_version": None,
+        "row_count": int(stats["row_count"]),
+        "time_range": {"min_event_time": min_event_time, "max_event_time": max_event_time},
+        "built_at": built_at,
+        "ingestion_delay_summary": _manifest_ingestion_delay_placeholder(),
+        "output_relative_uri": output_relative_uri,
+    }
+
+
 def build_run_fact_manifest(
     *,
     source_snapshot_id: str,
@@ -274,23 +309,14 @@ def build_run_fact_manifest(
     min_ev = stats.get("time_range_min") or "1970-01-01T00:00:00Z"
     max_ev = stats.get("time_range_max") or min_ev
     out_uri = manifest_output_relative_uri(output_parquet, manifest_uri_anchor)
-    return {
-        "artifact_kind": "run_fact",
-        "partition_keys": {"run_end_gaming_day": day, "source_snapshot_id": source_snapshot_id.strip()},
-        "definition_version": RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT,
-        "feature_version": "na_l1_run_fact",
-        "transform_version": _RUN_FACT_TRANSFORM_VERSION,
-        "source_partitions": [part_preprocess],
-        "source_hashes": hashes,
-        "source_snapshot_id": source_snapshot_id.strip(),
-        "preprocessing_rule_id": "preprocess_bet_v1",
-        "preprocessing_rule_version": "v1",
-        "published_snapshot_id": None,
-        "ingestion_fix_rule_id": None,
-        "ingestion_fix_rule_version": None,
-        "row_count": int(stats["row_count"]),
-        "time_range": {"min_event_time": str(min_ev), "max_event_time": str(max_ev)},
-        "built_at": now,
-        "ingestion_delay_summary": _manifest_ingestion_delay_placeholder(),
-        "output_relative_uri": out_uri,
-    }
+    return _run_fact_manifest_dict(
+        source_snapshot_id=source_snapshot_id,
+        run_end_gaming_day=day,
+        part_preprocess=part_preprocess,
+        source_hashes=hashes,
+        built_at=now,
+        min_event_time=str(min_ev),
+        max_event_time=str(max_ev),
+        stats=stats,
+        output_relative_uri=out_uri,
+    )
