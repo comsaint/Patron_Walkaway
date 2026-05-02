@@ -44,3 +44,8 @@ def test_l0_layered_root() -> None:
 def test_l0_partition_dir_hive_style() -> None:
     p = l0_partition_dir(Path("data"), "snap_abcdefgh", "t_bet", "gaming_day", "2026-04-01")
     assert p == Path("data") / "l0_layered" / "snap_abcdefgh" / "t_bet" / "gaming_day=2026-04-01"
+
+
+def test_l0_partition_dir_rejects_partition_key_with_dotdot_substring() -> None:
+    with pytest.raises(ValueError, match="invalid partition_key"):
+        l0_partition_dir(Path("data"), "snap_abcdefgh", "t_bet", "gaming_.._day", "2026-04-01")

@@ -50,7 +50,7 @@ def l0_partition_dir(data_root: Path, snapshot_id: str, table: str, partition_ke
         raise ValueError(f"partition_key must be a non-empty string, got {partition_key!r}")
     if not isinstance(partition_value, str) or not partition_value.strip():
         raise ValueError(f"partition_value must be a non-empty string, got {partition_value!r}")
-    if partition_key in ("..",) or "=" in partition_key:
+    if ".." in partition_key or "=" in partition_key:
         raise ValueError(f"invalid partition_key: {partition_key!r}")
     if ".." in partition_value or "/" in partition_value or "\\" in partition_value:
         raise ValueError(f"partition_value must not contain path separators, got {partition_value!r}")
