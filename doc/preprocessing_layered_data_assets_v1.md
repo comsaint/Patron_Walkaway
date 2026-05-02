@@ -24,7 +24,7 @@
 
 | Rule ID | 來源表（registry） | 目的（摘要） |
 |---------|-------------------|-------------|
-| `preprocess_bet_v1` | `t_bet` | 下注列可進 L1：`player_id` / `bet_id` 有效（**含排除 `player_id = -1`、unrated、dummy**）、去重、排除作廢與非法列；事件序以 `payout_complete_dtm` 為準。 |
+| `preprocess_bet_v1` | `t_bet` | 下注列可進 L1：`player_id` / `bet_id` 有效（**含排除 `player_id = -1`、unrated、dummy**）、去重、排除作廢與非法列；事件序以 `payout_complete_dtm` 為準。 **實作（MVP）**：`scripts/preprocess_bet_v1.py`（DuckDB；可選 `--dummy-player-ids-parquet`／`--eligible-player-ids-parquet`）。 |
 | `preprocess_session_v1` | `t_session` | Session 輔助列：`session_id` 去重版本、身分欄位清洗、人工帳務／幽靈 session 路由、canonical eligibility、**rated eligible / FND-12 dummy `player_id` 集合**供下游剔除。 |
 | `preprocess_game_v1` | `t_game` | 牌局列去重與 observed delay 分析；尚未完成研究前不額外過濾、不進特徵引用。 |
 | `preprocess_shoe_v1` | `t_shoe` | **本輪不使用**：不實作進 L1；字典占位可保留。 |

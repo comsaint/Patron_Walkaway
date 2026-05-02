@@ -13,7 +13,7 @@
 
 本輪執行目標為：建立與 `trainer` **並行**之分層資料產線（L0→preprocess→L1→L2→publish→可選 online delta），並以 **manifest、determinism、100% feature 覆蓋、correction log** 作為可驗收交付。Phase 1 **不**產出 trip 最終語義；trip v1 於 Phase 2 一次到位。
 
-**Phase 1 進度速記（2026-05-02 更新）**：**LDA-E1-01** 已含 `scripts/l0_ingest.py`、`layered_data_assets/l0_fingerprint.py`、指紋範例與治理決策清單；預設由指紋推導 `source_snapshot_id`。若需宣告 E1-01 **✅**，仍須完成：至少一次**真資料** smoke（或文件化之管線等價步驟）；`source_snapshot_id`／相對路徑／Parquet 版控等已定案見 `doc/l0_ingest_governance_decisions.md`。目前仍標 **🟡**。
+**Phase 1 進度速記（2026-05-02 更新；2026-05-02 smoke）**：**LDA-E1-01** **✅**（見下段 smoke）。**LDA-E1-02** **✅（MVP）**：`scripts/preprocess_bet_v1.py` + `layered_data_assets/preprocess_bet_v1.py`／`l1_paths.py`；輸出 `data/l1_layered/<snap>/t_bet/gaming_day=.../cleaned.parquet` 與同目錄 `manifest.json`（`preprocessing_rule_id`／`preprocessing_rule_version`）；未餵 dummy／eligible sidecar 時 `preprocessing_gaps` 列明 **BET-DQ-02／03** 略過。本機 smoke：`python scripts/l0_ingest.py --data-root data --table t_bet --partition-key gaming_day --partition-value smoke-2026-05-02 --source data/baseline_for_baseline_models.parquet`（先 `--dry-run` 再實寫）；產物 `data/l0_layered/snap_187e491186316d9a24316f86e06dc6b2/snapshot_fingerprint.json` 與 `.../t_bet/gaming_day=smoke-2026-05-02/part-000.parquet`。**刻意**使用 repo 內較小之真實 Parquet（約 1.7MB）以驗證指紋／`source_snapshot_id`／複製路徑；**未**對 ~22GB 之 `gmwds_t_bet.parquet` 做全檔 ingest（避免 OOM／磁碟與時間風險）。治理見 `doc/l0_ingest_governance_decisions.md`。
 
 ### 0.2 狀態圖例（本檔維護）
 
@@ -105,8 +105,8 @@
 
 | 狀態 | Task ID | 任務 | Owner | 依賴 | 輸出 artifact | DoD |
 | :---: | :--- | :--- | :--- | :--- | :--- | :--- |
-| 🟡 | **LDA-E1-01** | L0 ingest：分區 raw、`source_snapshot_id`、分區 hash 規則 | Data Platform | Phase 0 | 同上 + `scripts/l0_ingest.py` + `layered_data_assets/l0_fingerprint.py` + `schema/examples/snapshot_fingerprint.example.json` + `doc/l0_ingest_governance_decisions.md`；CI：`/.github/workflows/layered_data_assets.yml` | 同一輸入重跑得相同 `source_snapshot_id`；**待**：真資料／管線 smoke 證據（治理已定案於 `doc/l0_ingest_governance_decisions.md`） |
-| ⬜ | **LDA-E1-02** | Preprocess job：輸出清洗後 bet 流／表 + rule id 寫 manifest | Data Platform | E0-02, E1-01 | 清洗後 parquet 或表 + preprocess 版本 tag | manifest 可指涉 `preprocessing_rule_id`／version |
+| ✅ | **LDA-E1-01** | L0 ingest：分區 raw、`source_snapshot_id`、分區 hash 規則 | Data Platform | Phase 0 | 同上 + `scripts/l0_ingest.py` + `layered_data_assets/l0_fingerprint.py` + `schema/examples/snapshot_fingerprint.example.json` + `doc/l0_ingest_governance_decisions.md`；CI：`/.github/workflows/layered_data_assets.yml` | 同一輸入重跑得相同 `source_snapshot_id`；**2026-05-02** 本機真檔 smoke（`baseline_for_baseline_models.parquet` → `snap_187e491186316d9a24316f86e06dc6b2`；見 §0.1 速記） |
+| ✅ | **LDA-E1-02** | Preprocess job：輸出清洗後 bet 流／表 + rule id 寫 manifest | Data Platform | E0-02, E1-01 | `scripts/preprocess_bet_v1.py`、`layered_data_assets/preprocess_bet_v1.py`、`layered_data_assets/l1_paths.py`、`schema/examples/manifest_preprocess_bet_l1_example.json` | `cleaned.parquet` + `manifest.json`；`preprocessing_rule_id`=`preprocess_bet_v1`；**MVP**：dummy／rated sidecar 可選；未提供時 manifest `preprocessing_gaps` 註記 **BET-DQ-02／03** |
 | ⬜ | **LDA-E1-03** | `run_fact` 物化：`run_id` hash 依 implementation plan §4.1（含首筆 `bet_id`） | Data Platform | E1-02 | `run_fact` 分區產物 | Gate 1（§8.1）在 L1 子集通過 |
 | ⬜ | **LDA-E1-04** | `run_bet_map` membership | Data Platform | E1-03 | map 產物 | 可由 map 還原每 run 之 bet 集合；與 `run_fact` 一致 |
 | ⬜ | **LDA-E1-05** | `run_day_bridge`：跨日 run 影響範圍 | Data Platform | E1-03 | bridge 產物 | 對任意 `gaming_day` 可列出可能受影響之 `run_id` |

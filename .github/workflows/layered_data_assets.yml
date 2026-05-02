@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install validators
-        run: pip install pyyaml jsonschema pytest
+        run: pip install pyyaml jsonschema pytest duckdb
       - name: Phase-0 layered contracts
         run: make check-layered-contracts
       - name: L0 paths, fingerprint, ingest CLI

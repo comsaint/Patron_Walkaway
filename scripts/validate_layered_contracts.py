@@ -108,6 +108,8 @@ def main() -> int:
         manifest_ex = _REPO / "schema" / "examples" / "manifest_l1_example.json"
         manifest_sc = _REPO / "schema" / "manifest_layered_data_assets.schema.json"
         _validate_json_schema(_load_json(manifest_ex), manifest_sc)
+        manifest_bet = _REPO / "schema" / "examples" / "manifest_preprocess_bet_l1_example.json"
+        _validate_json_schema(_load_json(manifest_bet), manifest_sc)
         corr_ex = _REPO / "schema" / "examples" / "late_arrival_correction_log.example.json"
         corr_sc = _REPO / "schema" / "late_arrival_correction_log.schema.json"
         _validate_correction_file(corr_ex, corr_sc)
