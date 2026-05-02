@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from layered_data_assets.ingestion_delay_summary_v1 import manifest_ingestion_delay_placeholder
 from layered_data_assets.l0_paths import validate_source_snapshot_id
 
 _PREPROCESS_RULE_ID = "preprocess_bet_v1"
@@ -288,20 +289,6 @@ def _manifest_hashes_for_output(l0_fingerprint_path: Path | None) -> list[str]:
     return hashes
 
 
-def _manifest_ingestion_delay_placeholder() -> dict[str, Any]:
-    """Null-filled ``ingestion_delay_summary`` for preprocess MVP manifests."""
-    return {
-        "ingest_delay_p50_sec": None,
-        "ingest_delay_p95_sec": None,
-        "ingest_delay_p99_sec": None,
-        "ingest_delay_max_sec": None,
-        "late_row_count": None,
-        "late_row_ratio": None,
-        "affected_run_count": None,
-        "affected_trip_count": None,
-    }
-
-
 def _l1_bet_clean_manifest_dict(
     *,
     source_snapshot_id: str,
@@ -313,8 +300,10 @@ def _l1_bet_clean_manifest_dict(
     max_event_time: str,
     stats: dict[str, Any],
     output_relative_uri: str,
+    ingestion_delay_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``l1_t_bet_clean`` manifest object."""
+    ids = ingestion_delay_summary if ingestion_delay_summary is not None else manifest_ingestion_delay_placeholder()
     return {
         "artifact_kind": "l1_t_bet_clean",
         "partition_keys": {"gaming_day": gaming_day.strip(), "source_snapshot_id": source_snapshot_id.strip()},
@@ -332,7 +321,7 @@ def _l1_bet_clean_manifest_dict(
         "row_count": int(stats["row_count"]),
         "time_range": {"min_event_time": min_event_time, "max_event_time": max_event_time},
         "built_at": built_at,
-        "ingestion_delay_summary": _manifest_ingestion_delay_placeholder(),
+        "ingestion_delay_summary": ids,
         "preprocess_subrules_applied": stats.get("preprocess_subrules_applied", []),
         "preprocessing_gaps": stats.get("preprocessing_gaps", []),
         "output_relative_uri": output_relative_uri,
@@ -347,6 +336,7 @@ def build_preprocess_manifest(
     output_parquet: Path,
     manifest_uri_anchor: Path,
     stats: dict[str, Any],
+    ingestion_delay_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble a manifest dict valid against ``manifest_layered_data_assets.schema.json`` (L1 bet clean).
 
@@ -370,4 +360,5 @@ def build_preprocess_manifest(
         max_event_time=str(max_ev),
         stats=stats,
         output_relative_uri=out_uri,
+        ingestion_delay_summary=ingestion_delay_summary,
     )

@@ -21,6 +21,11 @@
 - `.gitignore` 使用 **`data/**/*.parquet`**：忽略 `data/` 下所有 Parquet（含 L0 `part-*.parquet`、sidecar 等），**目錄與非 parquet 檔**（例如 `.gitkeep`、`snapshot_fingerprint.json`、小型 JSON）仍可納版控。
 - CI 仍**不**依賴大型真資料；僅跑契約與小檔單元測試。
 
+### Manifest `source_hashes` 與 fingerprint（LDA-E1-06）
+
+- **寫入時**：各 L1 批次腳本（preprocess、`run_fact`／`run_bet_map`／`run_day_bridge`）仍以既有 `source_partitions` 為準；若提供 `--l0-fingerprint-json`，於寫 manifest 前以 `layered_data_assets.manifest_lineage_v1.merge_source_hashes_into_manifest` 將 `snapshot_fingerprint.json` 之 `inputs[*].sha256` 轉成 `sha256:<hex>`，並**依 `len(source_partitions)` 截斷或重複第一個 hash 補齊長度**（MVP：多分區 lineage 仍為單一 L0 指紋時之穩定形狀）。
+- **後補／審計**：`scripts/manifest_lineage_preview_v1.py` 可對既有 `manifest.json` 僅刷新 `source_hashes` 與／或自指定 Parquet 重算 `ingestion_delay_summary`（預演，與批次寫入同一套計算）。
+
 ---
 
 ## `ingest_recipe_version` 是什麼？何時必須 bump？
@@ -61,10 +66,6 @@
 ### 排程與執行環境
 
 觸發頻率、是否允許自動 `--force`、大檔是否改 hardlink／artifact store——需要時再補一段運維備忘即可。
-
-### 與 manifest `source_hashes` 的銜接
-
-`manifest.json` 是否唯一由 `snapshot_fingerprint.json` 推導——待 **LDA-E1-06** 定線。
 
 ---
 

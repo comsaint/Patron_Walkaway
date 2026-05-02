@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from layered_data_assets.l0_paths import validate_source_snapshot_id
+from layered_data_assets.ingestion_delay_summary_v1 import manifest_ingestion_delay_placeholder
 from layered_data_assets.preprocess_bet_v1 import (
     _manifest_hashes_for_output,
-    _manifest_ingestion_delay_placeholder,
     manifest_output_relative_uri,
 )
 RUN_BREAK_MIN_DEFAULT = 30
@@ -263,8 +263,10 @@ def _run_fact_manifest_dict(
     max_event_time: str,
     stats: dict[str, Any],
     output_relative_uri: str,
+    ingestion_delay_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``run_fact`` manifest object (``artifact_kind`` = ``run_fact``)."""
+    ids = ingestion_delay_summary if ingestion_delay_summary is not None else manifest_ingestion_delay_placeholder()
     return {
         "artifact_kind": "run_fact",
         "partition_keys": {"run_end_gaming_day": run_end_gaming_day, "source_snapshot_id": source_snapshot_id.strip()},
@@ -282,7 +284,7 @@ def _run_fact_manifest_dict(
         "row_count": int(stats["row_count"]),
         "time_range": {"min_event_time": min_event_time, "max_event_time": max_event_time},
         "built_at": built_at,
-        "ingestion_delay_summary": _manifest_ingestion_delay_placeholder(),
+        "ingestion_delay_summary": ids,
         "output_relative_uri": output_relative_uri,
     }
 
@@ -296,6 +298,7 @@ def build_run_fact_manifest(
     output_parquet: Path,
     manifest_uri_anchor: Path,
     stats: dict[str, Any],
+    ingestion_delay_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build manifest dict for ``run_fact`` (``artifact_kind`` = ``run_fact``)."""
     validate_source_snapshot_id(source_snapshot_id)
@@ -319,4 +322,5 @@ def build_run_fact_manifest(
         max_event_time=str(max_ev),
         stats=stats,
         output_relative_uri=out_uri,
+        ingestion_delay_summary=ingestion_delay_summary,
     )

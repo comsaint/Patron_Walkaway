@@ -16,7 +16,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from layered_data_assets.ingestion_delay_summary_v1 import (  # noqa: E402
+    DEFAULT_LATE_THRESHOLD_SEC,
+    compute_ingestion_delay_summary_preview,
+)
 from layered_data_assets.l1_paths import l1_bet_partition_dir  # noqa: E402
+from layered_data_assets.manifest_lineage_v1 import merge_source_hashes_into_manifest  # noqa: E402
 from layered_data_assets.preprocess_bet_v1 import (  # noqa: E402
     build_preprocess_manifest,
     run_preprocess_bet_v1,
@@ -64,6 +69,12 @@ def _add_preprocess_bet_optional_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help="Override output directory (default: data/l1_layered/<snap>/t_bet/gaming_day=...)",
     )
+    p.add_argument(
+        "--late-threshold-sec",
+        type=float,
+        default=DEFAULT_LATE_THRESHOLD_SEC,
+        help=f"Late-arrival threshold on ingest delay seconds (default: {DEFAULT_LATE_THRESHOLD_SEC})",
+    )
 
 
 def _build_preprocess_bet_arg_parser() -> argparse.ArgumentParser:
@@ -104,6 +115,9 @@ def main(argv: list[str] | None = None) -> int:
             dummy_player_ids_parquet=args.dummy_player_ids_parquet,
             eligible_player_ids_parquet=args.eligible_player_ids_parquet,
         )
+        id_summary = compute_ingestion_delay_summary_preview(
+            con, out_parquet, late_threshold_sec=args.late_threshold_sec
+        )
         manifest = build_preprocess_manifest(
             source_snapshot_id=args.source_snapshot_id,
             gaming_day=args.gaming_day,
@@ -111,7 +125,9 @@ def main(argv: list[str] | None = None) -> int:
             output_parquet=out_parquet,
             manifest_uri_anchor=_REPO_ROOT,
             stats=stats,
+            ingestion_delay_summary=id_summary,
         )
+        manifest = merge_source_hashes_into_manifest(manifest, args.l0_fingerprint_json)
     finally:
         con.close()
 

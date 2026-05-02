@@ -16,7 +16,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from layered_data_assets.ingestion_delay_summary_v1 import (  # noqa: E402
+    DEFAULT_LATE_THRESHOLD_SEC,
+    compute_ingestion_delay_summary_preview,
+)
 from layered_data_assets.l1_paths import l1_run_bet_map_partition_dir  # noqa: E402
+from layered_data_assets.manifest_lineage_v1 import merge_source_hashes_into_manifest  # noqa: E402
 from layered_data_assets.run_bet_map_v1 import build_run_bet_map_manifest, materialize_run_bet_map_v1  # noqa: E402
 from layered_data_assets.run_fact_v1 import (  # noqa: E402
     RUN_BREAK_MIN_DEFAULT,
@@ -76,6 +81,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override output directory (default: data/l1_layered/<snap>/run_bet_map/run_end_gaming_day=...)",
     )
+    p.add_argument(
+        "--ingestion-delay-parquet",
+        type=Path,
+        default=None,
+        help="Parquet for ingest-delay preview (default: first --input)",
+    )
+    p.add_argument(
+        "--late-threshold-sec",
+        type=float,
+        default=DEFAULT_LATE_THRESHOLD_SEC,
+        help=f"Late threshold in seconds (default: {DEFAULT_LATE_THRESHOLD_SEC})",
+    )
     return p.parse_args(argv)
 
 
@@ -107,6 +124,10 @@ def main(argv: list[str] | None = None) -> int:
             run_definition_version=args.run_definition_version,
             source_namespace=args.source_namespace,
         )
+        delay_src = args.ingestion_delay_parquet or args.inputs[0]
+        id_summary = compute_ingestion_delay_summary_preview(
+            con, delay_src.resolve(), late_threshold_sec=args.late_threshold_sec
+        )
         manifest = build_run_bet_map_manifest(
             source_snapshot_id=args.source_snapshot_id,
             run_end_gaming_day=args.run_end_gaming_day,
@@ -115,7 +136,9 @@ def main(argv: list[str] | None = None) -> int:
             output_parquet=out_parquet,
             manifest_uri_anchor=_REPO_ROOT,
             stats=stats,
+            ingestion_delay_summary=id_summary,
         )
+        manifest = merge_source_hashes_into_manifest(manifest, args.l0_fingerprint_json)
     finally:
         con.close()
 
