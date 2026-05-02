@@ -13,6 +13,21 @@ _PREPROCESS_RULE_ID = "preprocess_bet_v1"
 _PREPROCESS_RULE_VERSION = "v1"
 
 
+def manifest_output_relative_uri(output_parquet: Path, uri_anchor: Path) -> str:
+    """Return ``output_parquet`` as a POSIX path relative to ``uri_anchor`` (e.g. repo root).
+
+    Manifest ``output_relative_uri`` must not be an absolute filesystem path.
+    """
+    out = output_parquet.resolve()
+    anchor = uri_anchor.resolve()
+    try:
+        return out.relative_to(anchor).as_posix()
+    except ValueError as exc:
+        raise ValueError(
+            f"output_parquet must resolve under uri_anchor; output={out}, anchor={anchor}"
+        ) from exc
+
+
 def parquet_columns(con: Any, parquet_path: Path) -> set[str]:
     """Return column names for a single Parquet file via DuckDB ``DESCRIBE``."""
     rows = con.execute(
@@ -297,7 +312,7 @@ def _l1_bet_clean_manifest_dict(
     min_event_time: str,
     max_event_time: str,
     stats: dict[str, Any],
-    output_parquet: Path,
+    output_relative_uri: str,
 ) -> dict[str, Any]:
     """Build the ``l1_t_bet_clean`` manifest object."""
     return {
@@ -320,7 +335,7 @@ def _l1_bet_clean_manifest_dict(
         "ingestion_delay_summary": _manifest_ingestion_delay_placeholder(),
         "preprocess_subrules_applied": stats.get("preprocess_subrules_applied", []),
         "preprocessing_gaps": stats.get("preprocessing_gaps", []),
-        "output_relative_uri": output_parquet.as_posix(),
+        "output_relative_uri": output_relative_uri,
     }
 
 
@@ -330,15 +345,21 @@ def build_preprocess_manifest(
     gaming_day: str,
     l0_fingerprint_path: Path | None,
     output_parquet: Path,
+    manifest_uri_anchor: Path,
     stats: dict[str, Any],
 ) -> dict[str, Any]:
-    """Assemble a manifest dict valid against ``manifest_layered_data_assets.schema.json`` (L1 bet clean)."""
+    """Assemble a manifest dict valid against ``manifest_layered_data_assets.schema.json`` (L1 bet clean).
+
+    ``manifest_uri_anchor`` is usually the repository root so ``output_relative_uri`` matches
+    ``data/l1_layered/...`` style paths.
+    """
     validate_source_snapshot_id(source_snapshot_id)
     part_id = f"l0/t_bet/gaming_day={gaming_day.strip()}"
     hashes = _manifest_hashes_for_output(l0_fingerprint_path)[:1]
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     min_ev = stats.get("time_range_min") or "1970-01-01T00:00:00Z"
     max_ev = stats.get("time_range_max") or min_ev
+    out_uri = manifest_output_relative_uri(output_parquet, manifest_uri_anchor)
     return _l1_bet_clean_manifest_dict(
         source_snapshot_id=source_snapshot_id,
         gaming_day=gaming_day,
@@ -348,5 +369,5 @@ def build_preprocess_manifest(
         min_event_time=str(min_ev),
         max_event_time=str(max_ev),
         stats=stats,
-        output_parquet=output_parquet,
+        output_relative_uri=out_uri,
     )

@@ -109,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
             gaming_day=args.gaming_day,
             l0_fingerprint_path=args.l0_fingerprint_json,
             output_parquet=out_parquet,
+            manifest_uri_anchor=_REPO_ROOT,
             stats=stats,
         )
     finally:

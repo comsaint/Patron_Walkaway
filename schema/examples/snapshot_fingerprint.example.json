@@ -1,0 +1,15 @@
+{
+  "ingest_recipe_version": "l0_ingest_v1",
+  "inputs": [
+    {
+      "relative_path": "data/gmwds_t_bet.parquet",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 0
+    }
+  ],
+  "layout": {
+    "partition_key": "gaming_day",
+    "partition_value": "2026-04-01",
+    "table": "t_bet"
+  }
+}

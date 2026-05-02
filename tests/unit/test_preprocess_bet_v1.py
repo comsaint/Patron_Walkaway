@@ -12,6 +12,7 @@ except ImportError:
 
 from layered_data_assets.preprocess_bet_v1 import (
     build_preprocess_manifest,
+    manifest_output_relative_uri,
     run_preprocess_bet_v1,
 )
 
@@ -134,6 +135,17 @@ def test_preprocess_bet_v1_eligible_filter(tmp_path: Path) -> None:
     assert "BET-DQ-03" not in gaps_join
 
 
+def test_manifest_output_relative_uri_under_anchor(tmp_path: Path) -> None:
+    """Paths in the manifest must be relative to the chosen anchor (e.g. repo root)."""
+    data = tmp_path / "data"
+    out = data / "l1_layered" / "snap_x" / "t_bet" / "gaming_day=2026-01-01" / "cleaned.parquet"
+    out.parent.mkdir(parents=True)
+    out.write_bytes(b"")
+    assert manifest_output_relative_uri(out, tmp_path) == (
+        "data/l1_layered/snap_x/t_bet/gaming_day=2026-01-01/cleaned.parquet"
+    )
+
+
 @pytest.mark.skipif(duckdb is None, reason="duckdb not installed")
 def test_build_preprocess_manifest_validates_schema(tmp_path: Path) -> None:
     from jsonschema import Draft7Validator
@@ -153,6 +165,9 @@ def test_build_preprocess_manifest_validates_schema(tmp_path: Path) -> None:
         gaming_day="2026-01-01",
         l0_fingerprint_path=None,
         output_parquet=tmp_path / "cleaned.parquet",
+        manifest_uri_anchor=tmp_path,
         stats=stats,
     )
     Draft7Validator(schema).validate(m)
+    assert m["output_relative_uri"] == "cleaned.parquet"
+    assert not Path(m["output_relative_uri"]).is_absolute()
