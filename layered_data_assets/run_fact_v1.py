@@ -1,0 +1,244 @@
+"""L1 ``run_fact`` materialization (gap-based runs, ``run_end_gaming_day`` partition).
+
+MVP 限制：僅依輸入 Parquet 內之列切 run；若需跨 ``gaming_day`` 之連續段，請餵入含前後日之列
+（與 preprocess 單日分區檔并用），否則日界會誤判為新 run。
+"""
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from layered_data_assets.l0_paths import validate_source_snapshot_id
+from layered_data_assets.preprocess_bet_v1 import (
+    _manifest_hashes_for_output,
+    _manifest_ingestion_delay_placeholder,
+    manifest_output_relative_uri,
+)
+RUN_BREAK_MIN_DEFAULT = 30
+RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT = "run_boundary_v1"
+SOURCE_NAMESPACE_DEFAULT = "layered_data_assets_l1"
+_RUN_FACT_TRANSFORM_VERSION = "v1"
+
+
+def _read_parquet_list_sql(paths: list[Path]) -> str:
+    """Build ``'path1', 'path2'`` list for ``read_parquet([...])`` (SQL-escaped)."""
+    parts: list[str] = []
+    for p in paths:
+        s = p.resolve().as_posix().replace("'", "''")
+        parts.append(f"'{s}'")
+    return ", ".join(parts)
+
+
+def _validate_run_break_min(run_break_min: float) -> None:
+    """Guardrail aligned with trainer lookback bounds (see ``trainer/features/features.py``)."""
+    if run_break_min < 0 or run_break_min > 10_000:
+        raise ValueError(f"run_break_min must be in [0, 10000], got {run_break_min!r}")
+
+
+def _validate_gaming_day_partition_value(run_end_gaming_day: str) -> str:
+    """Return stripped ``YYYY-MM-DD`` partition value for path segments."""
+    s = run_end_gaming_day.strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        raise ValueError(f"run_end_gaming_day must be YYYY-MM-DD, got {run_end_gaming_day!r}")
+    return s
+
+
+def build_run_fact_staging_sql(
+    *,
+    input_paths: list[Path],
+    run_break_min: float,
+    run_definition_version: str,
+    source_namespace: str,
+) -> str:
+    """Build DuckDB SQL that creates temp table ``run_fact_staging`` (no ``run_id`` yet)."""
+    _validate_run_break_min(run_break_min)
+    rp = _read_parquet_list_sql(input_paths)
+    rd = run_definition_version.replace("'", "''")
+    sn = source_namespace.replace("'", "''")
+    gap = float(run_break_min)
+    return f"""
+CREATE OR REPLACE TEMP TABLE run_fact_staging AS
+WITH src AS (
+  SELECT * FROM read_parquet([{rp}])
+),
+ord AS (
+  SELECT
+    *,
+    LAG(payout_complete_dtm) OVER (
+      PARTITION BY player_id
+      ORDER BY payout_complete_dtm ASC, bet_id ASC
+    ) AS prev_payout
+  FROM src
+),
+marked AS (
+  SELECT
+    *,
+    CASE
+      WHEN prev_payout IS NULL THEN 1
+      WHEN (EPOCH(payout_complete_dtm) - EPOCH(prev_payout)) / 60.0 >= {gap} THEN 1
+      ELSE 0
+    END AS is_new_run
+  FROM ord
+),
+grp AS (
+  SELECT
+    *,
+    SUM(is_new_run) OVER (
+      PARTITION BY player_id
+      ORDER BY payout_complete_dtm ASC, bet_id ASC
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS run_seq
+  FROM marked
+),
+ord2 AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      ORDER BY player_id, run_seq, payout_complete_dtm ASC, bet_id ASC
+    ) AS global_ord
+  FROM grp
+),
+run_agg AS (
+  SELECT
+    player_id,
+    run_seq,
+    ARG_MIN(bet_id, global_ord) AS first_bet_id,
+    MIN(payout_complete_dtm) AS run_start_ts,
+    MAX(payout_complete_dtm) AS run_end_ts,
+    ARG_MAX(bet_id, global_ord) AS last_bet_id,
+    ARG_MAX(CAST(gaming_day AS VARCHAR), global_ord) AS run_end_gaming_day,
+    COUNT(*)::BIGINT AS bet_count,
+    '{rd}' AS run_definition_version,
+    '{sn}' AS source_namespace
+  FROM ord2
+  GROUP BY player_id, run_seq
+)
+SELECT * FROM run_agg;
+"""
+
+
+def _run_id_sql_expr() -> str:
+    """SQL fragment for ``run_id`` matching :func:`derive_run_id` canonical JSON + SHA-256."""
+    # Columns from ``run_fact_staging``: player_id, run_start_ts, first_bet_id, run_definition_version, source_namespace
+    canon = (
+        "'{\"first_bet_id\":\"' || CAST(first_bet_id AS VARCHAR) || '\",\"player_id\":' || CAST(player_id AS VARCHAR) "
+        "|| ',\"run_definition_version\":\"' || run_definition_version || '\",\"run_start_ts\":\"' "
+        "|| strftime(run_start_ts, '%Y-%m-%dT%H:%M:%S.%f') || '\",\"source_namespace\":\"' || source_namespace || '\"}'"
+    )
+    return f"'run_' || substr(sha256({canon}), 1, 32)"
+
+
+def materialize_run_fact_v1(
+    *,
+    con: Any,
+    input_paths: list[Path],
+    output_parquet: Path,
+    run_end_gaming_day: str,
+    run_break_min: float = RUN_BREAK_MIN_DEFAULT,
+    run_definition_version: str = RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT,
+    source_namespace: str = SOURCE_NAMESPACE_DEFAULT,
+) -> dict[str, Any]:
+    """Stage runs, assign ``run_id``, COPY one ``run_end_gaming_day`` partition to Parquet.
+
+    Returns stats: ``row_count``, ``time_range_min``, ``time_range_max``.
+    """
+    if not input_paths:
+        raise ValueError("input_paths must be non-empty")
+    day = _validate_gaming_day_partition_value(run_end_gaming_day)
+    con.execute(
+        build_run_fact_staging_sql(
+            input_paths=input_paths,
+            run_break_min=run_break_min,
+            run_definition_version=run_definition_version,
+            source_namespace=source_namespace,
+        )
+    )
+    day_sql = day.replace("'", "''")
+    rid = _run_id_sql_expr()
+    inner = f"""
+SELECT
+  {rid} AS run_id,
+  player_id,
+  first_bet_id,
+  last_bet_id,
+  run_start_ts,
+  run_end_ts,
+  CAST(run_end_gaming_day AS VARCHAR) AS run_end_gaming_day,
+  bet_count,
+  run_definition_version,
+  source_namespace
+FROM run_fact_staging
+WHERE CAST(run_end_gaming_day AS VARCHAR) = '{day_sql}'
+ORDER BY run_id
+"""
+    output_parquet.parent.mkdir(parents=True, exist_ok=True)
+    out = str(output_parquet.resolve()).replace("\\", "/").replace("'", "''")
+    con.execute(f"COPY ({inner.strip()}) TO '{out}' (FORMAT PARQUET);\n")
+    count_row = con.execute(
+        "SELECT COUNT(*) FROM read_parquet(?)", [str(output_parquet.resolve())]
+    ).fetchone()
+    if count_row is None:
+        raise RuntimeError("COUNT(*) on run_fact parquet returned no row")
+    n = int(count_row[0])
+    tr = con.execute(
+        """
+        SELECT
+          CAST(MIN(run_start_ts) AS VARCHAR),
+          CAST(MAX(run_end_ts) AS VARCHAR)
+        FROM read_parquet(?)
+        """,
+        [str(output_parquet.resolve())],
+    ).fetchone()
+    t0, t1 = (None, None) if tr is None else (tr[0], tr[1])
+    return {
+        "row_count": n,
+        "time_range_min": t0,
+        "time_range_max": t1,
+    }
+
+
+def build_run_fact_manifest(
+    *,
+    source_snapshot_id: str,
+    run_end_gaming_day: str,
+    l0_fingerprint_path: Path | None,
+    l1_preprocess_gaming_day: str,
+    output_parquet: Path,
+    manifest_uri_anchor: Path,
+    stats: dict[str, Any],
+) -> dict[str, Any]:
+    """Build manifest dict for ``run_fact`` (``artifact_kind`` = ``run_fact``)."""
+    validate_source_snapshot_id(source_snapshot_id)
+    day = _validate_gaming_day_partition_value(run_end_gaming_day)
+    pre_gd = l1_preprocess_gaming_day.strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", pre_gd):
+        raise ValueError(f"l1_preprocess_gaming_day must be YYYY-MM-DD, got {l1_preprocess_gaming_day!r}")
+    part_preprocess = f"l1/t_bet/gaming_day={pre_gd}"
+    hashes = _manifest_hashes_for_output(l0_fingerprint_path)[:1]
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    min_ev = stats.get("time_range_min") or "1970-01-01T00:00:00Z"
+    max_ev = stats.get("time_range_max") or min_ev
+    out_uri = manifest_output_relative_uri(output_parquet, manifest_uri_anchor)
+    return {
+        "artifact_kind": "run_fact",
+        "partition_keys": {"run_end_gaming_day": day, "source_snapshot_id": source_snapshot_id.strip()},
+        "definition_version": RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT,
+        "feature_version": "na_l1_run_fact",
+        "transform_version": _RUN_FACT_TRANSFORM_VERSION,
+        "source_partitions": [part_preprocess],
+        "source_hashes": hashes,
+        "source_snapshot_id": source_snapshot_id.strip(),
+        "preprocessing_rule_id": "preprocess_bet_v1",
+        "preprocessing_rule_version": "v1",
+        "published_snapshot_id": None,
+        "ingestion_fix_rule_id": None,
+        "ingestion_fix_rule_version": None,
+        "row_count": int(stats["row_count"]),
+        "time_range": {"min_event_time": str(min_ev), "max_event_time": str(max_ev)},
+        "built_at": now,
+        "ingestion_delay_summary": _manifest_ingestion_delay_placeholder(),
+        "output_relative_uri": out_uri,
+    }

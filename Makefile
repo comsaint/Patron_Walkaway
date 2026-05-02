@@ -9,4 +9,4 @@ refresh-layered-contracts-artifacts:
 
 # Phase-1 L0 ingest helpers + path/fingerprint unit tests (no large data required).
 check-lda-l0: check-layered-contracts
-	python -m pytest tests/unit/test_layered_l0_paths.py tests/unit/test_l1_paths.py tests/unit/test_l0_fingerprint.py tests/unit/test_l0_ingest_cli.py tests/unit/test_preprocess_bet_v1.py -q --tb=short
+	python -m pytest tests/unit/test_layered_l0_paths.py tests/unit/test_l1_paths.py tests/unit/test_l0_fingerprint.py tests/unit/test_l0_ingest_cli.py tests/unit/test_preprocess_bet_v1.py tests/unit/test_run_id_v1.py tests/unit/test_run_fact_v1.py -q --tb=short
