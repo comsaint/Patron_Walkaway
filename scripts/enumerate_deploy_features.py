@@ -43,6 +43,7 @@ _SQL_TOKENS = frozenset(
 
 
 def _parse_args() -> argparse.Namespace:
+    """Parse CLI flags for spec path and artifact output locations."""
     p = argparse.ArgumentParser(description=__doc__ or "")
     p.add_argument("--spec", type=Path, default=_DEFAULT_SPEC)
     p.add_argument("--out-json", type=Path, default=_DEFAULT_JSON)
@@ -51,6 +52,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _allowed_bet_columns(spec: Mapping[str, Any]) -> set[str]:
+    """Return allowed L1 column names from ``track_llm.guardrails`` for expression heuristics."""
     tl = spec.get("track_llm")
     if not isinstance(tl, Mapping):
         return set()
@@ -64,6 +66,7 @@ def _allowed_bet_columns(spec: Mapping[str, Any]) -> set[str]:
 
 
 def enumerate_features(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Collect sorted ``track_*`` candidate rows with embedded spec mappings from YAML root."""
     rows: list[dict[str, Any]] = []
     for key, val in spec.items():
         if not isinstance(key, str) or not key.startswith("track_"):
@@ -86,6 +89,7 @@ def enumerate_features(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _required_l1_placeholder(item: Mapping[str, Any], allowed: set[str]) -> str:
+    """Derive ``required_l1_fields`` CSV cell from inputs, profile column, or expression tokens."""
     ic = item.get("input_columns")
     if isinstance(ic, list) and ic:
         return ";".join(sorted({str(x) for x in ic if isinstance(x, str) and x}))
@@ -102,6 +106,7 @@ def _required_l1_placeholder(item: Mapping[str, Any], allowed: set[str]) -> str:
 
 
 def _allow_bet_rescan(item: Mapping[str, Any]) -> str:
+    """Return CSV ``allow_bet_rescan`` cell: ``no`` for profile columns, else ``TBD``."""
     st = item.get("type")
     if st == "profile_column":
         return "no"
@@ -109,6 +114,7 @@ def _allow_bet_rescan(item: Mapping[str, Any]) -> str:
 
 
 def _computation_source(item: Mapping[str, Any]) -> str:
+    """Build a short human-readable ``computation_source`` string for the dependency CSV."""
     st = item.get("type", "")
     if st == "python_vectorized":
         fn = item.get("function_name")
@@ -149,6 +155,7 @@ def build_enumerated_payload(
 
 
 def write_registry_csv(path: Path, rows: list[dict[str, Any]], allowed: set[str]) -> None:
+    """Write feature dependency rows to ``path`` using placeholder L1-field heuristics."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
@@ -178,6 +185,7 @@ def write_registry_csv(path: Path, rows: list[dict[str, Any]], allowed: set[str]
 
 
 def main() -> int:
+    """Load feature spec, emit JSON enumeration and CSV registry; exit 0 on success."""
     args = _parse_args()
     spec_path = args.spec.resolve()
     raw = yaml.safe_load(spec_path.read_text(encoding="utf-8"))

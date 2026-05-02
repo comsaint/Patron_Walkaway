@@ -153,7 +153,8 @@ def _bool_or_tbd(value: Any, field: str, table: str) -> None:
     )
 
 
-def _validate_table_entry(table: str, spec: Any) -> None:
+def _validate_table_spec_shape(table: str, spec: Any) -> Mapping[str, Any]:
+    """Ensure ``tables.<table>`` is a mapping with exactly the expected keys."""
     if not isinstance(spec, Mapping):
         raise TypeError(f"tables.{table} must be a mapping, got {type(spec).__name__}")
     missing = [k for k in _TABLE_KEYS if k not in spec]
@@ -162,7 +163,11 @@ def _validate_table_entry(table: str, spec: Any) -> None:
     extra = [k for k in spec if k not in _TABLE_KEYS]
     if extra:
         raise KeyError(f"{table}: unknown keys (typo?): {extra}")
+    return spec
 
+
+def _validate_table_entry_core_fields(table: str, spec: Mapping[str, Any]) -> None:
+    """Validate description, keys, time columns, partition list, and dedup/preprocess fields."""
     desc = spec["description"]
     if not isinstance(desc, str) or not desc.strip():
         raise ValueError(f"{table}: description must be a non-empty string")
@@ -192,6 +197,9 @@ def _validate_table_entry(table: str, spec: Any) -> None:
     if not isinstance(pcon, list) or not pcon or not all(isinstance(x, str) and x.strip() for x in pcon):
         raise ValueError(f"{table}: preprocessing_contract must be a non-empty list of strings")
 
+
+def _validate_table_entry_flags_and_metadata(table: str, spec: Mapping[str, Any]) -> None:
+    """Validate bool/TBD flags, delay profile, late threshold string, and notes list."""
     _bool_or_tbd(spec["correction_expected"], "correction_expected", table)
     _bool_or_tbd(spec["late_arrival_expected"], "late_arrival_expected", table)
 
@@ -206,6 +214,13 @@ def _validate_table_entry(table: str, spec: Any) -> None:
     notes = spec["notes"]
     if not isinstance(notes, list) or not notes or not all(isinstance(x, str) and x.strip() for x in notes):
         raise ValueError(f"{table}: notes must be a non-empty list of non-empty strings")
+
+
+def _validate_table_entry(table: str, spec: Any) -> None:
+    """Validate structure and field types for one registry ``tables`` entry."""
+    m = _validate_table_spec_shape(table, spec)
+    _validate_table_entry_core_fields(table, m)
+    _validate_table_entry_flags_and_metadata(table, m)
 
 
 def _validate_columns_against_dict(

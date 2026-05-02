@@ -1,6 +1,6 @@
 {
   "enumerator_version": "1",
-  "source_spec_path": "C:/Users/longp/Patron_Walkaway/package/deploy/models/feature_spec.yaml",
+  "source_spec_path": "package/deploy/models/feature_spec.yaml",
   "feature_count": 84,
   "features": [
     {
