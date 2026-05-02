@@ -21,40 +21,7 @@ RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT = "run_boundary_v1"
 SOURCE_NAMESPACE_DEFAULT = "layered_data_assets_l1"
 _RUN_FACT_TRANSFORM_VERSION = "v1"
 
-
-def _read_parquet_list_sql(paths: list[Path]) -> str:
-    """Build ``'path1', 'path2'`` list for ``read_parquet([...])`` (SQL-escaped)."""
-    parts: list[str] = []
-    for p in paths:
-        s = p.resolve().as_posix().replace("'", "''")
-        parts.append(f"'{s}'")
-    return ", ".join(parts)
-
-
-def _validate_run_break_min(run_break_min: float) -> None:
-    """Guardrail aligned with trainer lookback bounds (see ``trainer/features/features.py``)."""
-    if run_break_min < 0 or run_break_min > 10_000:
-        raise ValueError(f"run_break_min must be in [0, 10000], got {run_break_min!r}")
-
-
-def _validate_gaming_day_partition_value(run_end_gaming_day: str) -> str:
-    """Return stripped ``YYYY-MM-DD`` partition value for path segments."""
-    s = run_end_gaming_day.strip()
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-        raise ValueError(f"run_end_gaming_day must be YYYY-MM-DD, got {run_end_gaming_day!r}")
-    return s
-
-
-def build_create_run_boundary_bets_sql(
-    *,
-    input_paths: list[Path],
-    run_break_min: float,
-) -> str:
-    """Create temp ``run_boundary_bets``: one row per bet with ``run_seq`` (no ``run_id`` yet)."""
-    _validate_run_break_min(run_break_min)
-    rp = _read_parquet_list_sql(input_paths)
-    gap = float(run_break_min)
-    return f"""
+_RUN_BOUNDARY_BETS_SQL = """
 CREATE OR REPLACE TEMP TABLE run_boundary_bets AS
 WITH src AS (
   SELECT * FROM read_parquet([{rp}])
@@ -98,6 +65,40 @@ ord2 AS (
 )
 SELECT * FROM ord2;
 """
+
+
+def _read_parquet_list_sql(paths: list[Path]) -> str:
+    """Build ``'path1', 'path2'`` list for ``read_parquet([...])`` (SQL-escaped)."""
+    parts: list[str] = []
+    for p in paths:
+        s = p.resolve().as_posix().replace("'", "''")
+        parts.append(f"'{s}'")
+    return ", ".join(parts)
+
+
+def _validate_run_break_min(run_break_min: float) -> None:
+    """Guardrail aligned with trainer lookback bounds (see ``trainer/features/features.py``)."""
+    if run_break_min < 0 or run_break_min > 10_000:
+        raise ValueError(f"run_break_min must be in [0, 10000], got {run_break_min!r}")
+
+
+def _validate_gaming_day_partition_value(run_end_gaming_day: str) -> str:
+    """Return stripped ``YYYY-MM-DD`` partition value for path segments."""
+    s = run_end_gaming_day.strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        raise ValueError(f"run_end_gaming_day must be YYYY-MM-DD, got {run_end_gaming_day!r}")
+    return s
+
+
+def build_create_run_boundary_bets_sql(
+    *,
+    input_paths: list[Path],
+    run_break_min: float,
+) -> str:
+    """Create temp ``run_boundary_bets``: one row per bet with ``run_seq`` (no ``run_id`` yet)."""
+    _validate_run_break_min(run_break_min)
+    rp = _read_parquet_list_sql(input_paths)
+    return _RUN_BOUNDARY_BETS_SQL.format(rp=rp, gap=float(run_break_min))
 
 
 def build_create_run_fact_staging_sql(
