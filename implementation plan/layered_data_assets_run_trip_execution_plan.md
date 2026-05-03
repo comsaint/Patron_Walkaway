@@ -176,9 +176,12 @@
 | ✅ | 10 | **E1-11**：DuckDB SQL 插入 `__etl_insert_Dtm_synthetic` + dedup `ORDER BY` 改為 synthetic | Data Platform | 1.0 | 9 | **2026-05-03**：`preprocess_bet_v1.py`；dedup 僅在傳入 registry 時使用 synthetic；`test_preprocess_bet_v1_ingestion_cap_changes_dedup_winner` |
 | ✅ | 11 | **E1-11**：manifest 欄位 + `ingestion_delay_summary` 改 observed 欄位 + 範例 manifest 更新 | Data Platform + ML Platform | 0.75 | 10, E1-06 | **2026-05-03**：manifest 寫入 `ingestion_fix_*`／`applied_fix_rules`；cap 啟用時 summary 用 `__etl_insert_Dtm_synthetic`；範例 JSON 已更新；`validate_layered_contracts` + `check-lda-l0` 通過 |
 | ⬜ | 12 | **E1-11**：Gate1 迴歸（含 OOM profiles）證明 run 產物不變或僅預期內變更 | ML Platform | 0.5 | 11, E1-08 | 待補：以 `--ingestion-fix-registry-yaml` 產出之 `cleaned` 餵後續物化 + Gate1；文件記錄「預期不變」之判準；CI 或本機指令可重跑 |
+| ⬜ | 13 | **E1-12**：`cleaned` 單一活躍資料集策略落地（按 `gaming_day` 覆寫，不保留大量歷史 parquet） | Data Platform + Ops | 0.75 | E1-09, E1-11 | 文件化並實作路徑慣例：固定 active root、分區 `*.tmp -> rename` 覆寫、同步更新 state；不得改變既有業務語義 |
+| ⬜ | 14 | **E1-13**：最小追溯與回滾保障（輕量變更索引 + 最近一次回滾點） | Data Platform + ML Platform | 1.0 | 13 | 每次分區覆寫都寫事件索引（含 `gaming_day`、`input_hash`、`row_count`、`updated_at`、operator）；可對單日執行一次回滾演練並附證據 |
 
 **Phase 1R（E1-09+10）合計（粗估）**：約 **5.5–6.5 person-days**（含測試）；若兩人並行 schema+state 與 CLI，wall-clock 約 **3–4 工作天**。  
-**E1-11 加計（粗估）**：約 **2.75–3.5 person-days**（列 9–12）；**列 9–11 已關**（2026-05-03）；**列 12** 待 Gate1+cap 證據。與 E1-09 並行時 wall-clock 取較長分支 + 合併驗收約 **0.5 天**。
+**E1-11 加計（粗估）**：約 **2.75–3.5 person-days**（列 9–12）；**列 9–11 已關**（2026-05-03）；**列 12** 待 Gate1+cap 證據。與 E1-09 並行時 wall-clock 取較長分支 + 合併驗收約 **0.5 天**。  
+**E1-12/E1-13 加計（粗估）**：約 **1.75–2.5 person-days**（列 13–14）；若與 E1-11 並行，建議先凍結 active root／索引 schema 再做回滾演練。
 
 **與既有腳本對齊（建議）**
 
@@ -287,6 +290,7 @@
 | **BL-02** | **L0 不可變儲存**實作選型（追加 vs object 不可變） | Data Platform + Ops |
 | **BL-03** | `late_arrival_correction_log` **保留天數／壓縮／GC** 與 L0／published 生命週期對齊 | Ops |
 | **BL-04** | **trainer Step 6/7** 與本產線合併／取代／雙軌之時程與回歸範圍 | Model Owner + ML Platform |
+| **BL-05** | `cleaned` 單一活躍資料集之保留策略（僅活躍版 + 最近一次回滾點）與分區 GC 週期 | Data Platform + Ops |
 
 ---
 

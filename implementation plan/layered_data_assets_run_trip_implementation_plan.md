@@ -1,6 +1,6 @@
 # 分層資料資產與 run/trip 特徵工程 — Implementation Plan
 
-> **版本**：Implementation plan **v0.5**（2026-05-03；同日補述：`preprocess_bet_v1` 去重／輸出序邊界與 execution plan 對齊）。對齊 SSOT v1.5；重大架構變更升 minor。  
+> **版本**：Implementation plan **v0.5**（2026-05-03；同日補述：`preprocess_bet_v1` 去重／輸出序邊界與 execution plan 對齊、`cleaned` 單一活躍資料集治理策略）。對齊 SSOT v1.5；重大架構變更升 minor。  
 > **依據**：`ssot/layered_data_assets_run_trip_ssot.md`（v1.5）、`schema/time_semantics_registry.yaml`。  
 > **本文層級**：架構、模組邊界、階段交付、驗證與治理；**不含**逐檔 Jira 式任務拆解。  
 > **與 trainer 關係**：本計畫先建立**與現行 `trainer` 管線並行**之資料資產產線；是否改為訓練主讀本層資產須另案決策（見 SSOT §0.1）。
@@ -121,6 +121,17 @@
 
 - 目標檔先寫 `*.tmp`，完成校驗（row_count/hash）後 rename 成正式檔。
 - 僅在 rename 成功後寫入 `status=succeeded`；任何中斷都不得留下「成功狀態 + 半成品檔」。
+
+### 2.4 `cleaned` 單一活躍資料集（single-live dataset）治理策略
+
+> 目標：在不保留大量歷史 Parquet 的前提下，仍維持可審計、可續跑、可最小回滾。
+
+- **活躍集合（Active set）**：`cleaned` 採單一活躍資料集，按 `gaming_day` 分區覆寫；日常增量與回補僅重算受影響分區，不重跑全量。
+- **最小追溯（MUST）**：每個 `gaming_day` 分區必須保留可機器讀取之 `manifest.json`，至少含 `row_count`、`input_hash`、`source_snapshot_id`、`preprocessing_rule_id/version`、`updated_at`、（可選）row fingerprint。
+- **變更事件索引（SHOULD）**：維護輕量變更索引（DuckDB/JSONL 皆可），以 `(gaming_day, updated_at)` 為主鍵語意，記錄覆寫前後摘要與操作者來源（system/job/manual）。
+- **最小回滾（MUST）**：即使主策略為「僅保留 1 版活躍分區」，仍需保留「最近一次可回滾點」：可為受影響分區的上一版備份或等價 checkpoint，不要求全量雙份儲存。
+- **原子覆寫（MUST）**：分區更新沿用 `*.tmp -> rename`；僅在新 `cleaned.parquet` 與 manifest 校驗完成後，才更新 state/索引，避免產生不可重現中間態。
+- **與上層契約一致（MUST）**：上述策略不得改變 SSOT/Implementation 既有業務語義（dedup、事件序、run/trip 邊界），僅是儲存與治理層策略。
 
 ---
 
