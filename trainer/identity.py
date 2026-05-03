@@ -588,6 +588,39 @@ def build_canonical_mapping_from_df(
     return _apply_mn_resolution(links_df, dummy_pids)
 
 
+def build_rated_eligible_player_ids_df(
+    sessions_df: pd.DataFrame,
+    cutoff_dtm: datetime,
+) -> pd.DataFrame:
+    """Return distinct rated ``player_id`` values for layered LDA preprocess (BET-DQ-03).
+
+    Single shared entry point for **rated-only** ``player_id`` allow-lists: delegates
+    to :func:`build_canonical_mapping_from_df` (same FND-01 / FND-03 / FND-04 /
+    FND-12 / D2 semantics as training). Use this when wiring
+    ``pipelines.layered_data_assets`` into ``trainer``; for standalone LDA runs,
+    write the returned frame to Parquet and pass
+    ``preprocess_bet_v1 --eligible-player-ids-parquet``.
+
+    Parameters
+    ----------
+    sessions_df
+        Same schema as required by :func:`build_canonical_mapping_from_df`.
+    cutoff_dtm
+        Mapping cutoff (B1); passed through unchanged.
+
+    Returns
+    -------
+    pd.DataFrame
+        One column ``player_id`` (``int64``), one row per distinct rated player.
+    """
+    mapping = build_canonical_mapping_from_df(sessions_df, cutoff_dtm)
+    if mapping.empty:
+        return pd.DataFrame({"player_id": pd.Series([], dtype="int64")})
+    out = mapping[["player_id"]].drop_duplicates().reset_index(drop=True)
+    out["player_id"] = pd.to_numeric(out["player_id"], errors="coerce").dropna().astype("int64")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Public API — ClickHouse path
 # ---------------------------------------------------------------------------

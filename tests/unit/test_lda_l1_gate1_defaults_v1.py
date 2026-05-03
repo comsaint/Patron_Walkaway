@@ -97,3 +97,109 @@ def test_apply_default_ingestion_registry_raises_when_canonical_missing(
     args = argparse.Namespace(ingestion_fix_registry_yaml=None)
     with pytest.raises(ValueError, match="Required ingestion fix registry is missing"):
         lda_mod.apply_default_ingestion_registry_args(args)
+
+
+def _args_for_validate(**overrides: object) -> argparse.Namespace:
+    base: dict[str, object] = {
+        "raw_t_bet_parquet": None,
+        "bet_parquet": None,
+        "l0_existing": False,
+        "source_snapshot_id": None,
+        "raw_t_session_parquet": None,
+        "eligible_player_ids_parquet": None,
+        "cutoff_dtm": None,
+        "eligible_build_max_session_rows": 5_000_000,
+        "eligible_build_duckdb_memory_limit_mb": None,
+        "eligible_build_duckdb_threads": 1,
+        "eligible_build_failure_context": None,
+        "eligible_build_run_log": None,
+        "resume": False,
+        "force": False,
+    }
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_validate_mode_raw_requires_eligible_or_session_cutoff() -> None:
+    args = _args_for_validate(raw_t_bet_parquet=Path("bet.parquet"))
+    assert lda_mod._validate_mode(args) == 2
+
+
+def test_validate_mode_raw_session_requires_cutoff() -> None:
+    args = _args_for_validate(
+        raw_t_bet_parquet=Path("bet.parquet"),
+        raw_t_session_parquet=Path("session.parquet"),
+    )
+    assert lda_mod._validate_mode(args) == 2
+
+
+def test_validate_mode_raw_with_session_and_cutoff_ok() -> None:
+    args = _args_for_validate(
+        raw_t_bet_parquet=Path("bet.parquet"),
+        raw_t_session_parquet=Path("session.parquet"),
+        cutoff_dtm="2026-01-31T23:59:59+08:00",
+    )
+    assert lda_mod._validate_mode(args) is None
+
+
+def test_validate_mode_raw_with_explicit_eligible_ok() -> None:
+    args = _args_for_validate(
+        raw_t_bet_parquet=Path("bet.parquet"),
+        eligible_player_ids_parquet=Path("eligible.parquet"),
+    )
+    assert lda_mod._validate_mode(args) is None
+
+
+def test_validate_mode_rejects_negative_eligible_build_max_rows() -> None:
+    args = _args_for_validate(
+        raw_t_bet_parquet=Path("bet.parquet"),
+        raw_t_session_parquet=Path("session.parquet"),
+        cutoff_dtm="2026-01-31T23:59:59+08:00",
+        eligible_build_max_session_rows=-1,
+    )
+    assert lda_mod._validate_mode(args) == 2
+
+
+def test_validate_mode_rejects_eligible_build_threads_zero() -> None:
+    args = _args_for_validate(
+        raw_t_bet_parquet=Path("bet.parquet"),
+        raw_t_session_parquet=Path("session.parquet"),
+        cutoff_dtm="2026-01-31T23:59:59+08:00",
+        eligible_build_duckdb_threads=0,
+    )
+    assert lda_mod._validate_mode(args) == 2
+
+
+def test_validate_mode_rejects_eligible_build_memory_below_64() -> None:
+    args = _args_for_validate(
+        raw_t_bet_parquet=Path("bet.parquet"),
+        raw_t_session_parquet=Path("session.parquet"),
+        cutoff_dtm="2026-01-31T23:59:59+08:00",
+        eligible_build_duckdb_memory_limit_mb=32,
+    )
+    assert lda_mod._validate_mode(args) == 2
+
+
+def test_assert_eligible_session_row_budget_noop_when_disabled() -> None:
+    lda_mod._assert_eligible_session_row_budget(10**9, max_rows=0)
+
+
+def test_assert_eligible_session_row_budget_raises_when_over() -> None:
+    with pytest.raises(RuntimeError, match="eligible-build-max-session-rows"):
+        lda_mod._assert_eligible_session_row_budget(100, max_rows=50)
+
+
+def test_parse_args_eligible_build_defaults(tmp_path: Path) -> None:
+    bet = tmp_path / "b.parquet"
+    bet.write_bytes(b"x")
+    ns = lda_mod._parse_args(
+        [
+            "--bet-parquet",
+            str(bet),
+            "--source-snapshot-id",
+            "snap_x",
+        ]
+    )
+    assert ns.eligible_build_max_session_rows == 5_000_000
+    assert ns.eligible_build_duckdb_threads == 1
+    assert ns.eligible_build_duckdb_memory_limit_mb is None

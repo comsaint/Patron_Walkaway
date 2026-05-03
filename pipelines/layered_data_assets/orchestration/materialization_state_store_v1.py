@@ -57,6 +57,7 @@ def hash_preprocess_inputs(
     gaming_day: str,
     preprocess_input_paths: list[Path],
     fingerprint_path: Path | None,
+    eligible_player_ids_parquet: Path | None = None,
     ingestion_fix_registry_path: Path | None = None,
     ingestion_fix_registry_version_expected: str | None = None,
 ) -> str:
@@ -81,6 +82,11 @@ def hash_preprocess_inputs(
         payload["ingestion_fix_registry_stats"] = _stat_triple(rp)
     if ingestion_fix_registry_version_expected is not None:
         payload["ingestion_fix_registry_version_expected"] = str(ingestion_fix_registry_version_expected).strip()
+    if eligible_player_ids_parquet is not None:
+        ep = eligible_player_ids_parquet.resolve()
+        if not ep.is_file():
+            raise FileNotFoundError(f"eligible_player_ids_parquet not found: {ep}")
+        payload["eligible_player_ids_stats"] = _stat_triple(ep)
     return compute_input_hash(payload)
 
 

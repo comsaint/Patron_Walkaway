@@ -1,6 +1,6 @@
 # 分層資料資產與 run/trip 特徵工程 — Implementation Plan
 
-> **版本**：Implementation plan **v0.5**（2026-05-03；同日補述：`preprocess_bet_v1` 去重／輸出序邊界與 execution plan 對齊、`cleaned` 單一活躍資料集治理策略、pipeline 程式/文件集中治理策略）。對齊 SSOT v1.5；重大架構變更升 minor。  
+> **版本**：Implementation plan **v0.6**（2026-05-03；新增：one-liner 編排契約、BET-DQ-03 rated fail-closed gate、trainer identity 單一來源、eligible 建構之資源約束）。對齊 SSOT v1.5；重大架構變更升 minor。  
 > **依據**：`ssot/layered_data_assets_run_trip_ssot.md`（v1.5）、`schema/time_semantics_registry.yaml`。  
 > **本文層級**：架構、模組邊界、階段交付、驗證與治理；**不含**逐檔 Jira 式任務拆解。  
 > **與 trainer 關係**：本計畫先建立**與現行 `trainer` 管線並行**之資料資產產線；是否改為訓練主讀本層資產須另案決策（見 SSOT §0.1）。
@@ -63,13 +63,13 @@
 
 | 階段 | 輸入 | 輸出 | 備註 |
 |------|------|------|------|
-| **L0 ingest** | ClickHouse / 既有 Parquet 匯出 | 分區 raw（immutable batch） | 每批有 `source_snapshot_id`、分區 hash |
-| **Preprocess** | L0 | 清洗後 bet 流（或中間表） | 與 `dedup_rule_id`、registry 對齊 |
+| **L0 ingest** | ClickHouse / 既有 Parquet 匯出（`t_bet` + `t_session`） | 分區 raw（immutable batch） | 每批有 `source_snapshot_id`、分區 hash |
+| **Preprocess** | L0 + rated eligible `player_id` allowlist | 清洗後 bet 流（或中間表） | 與 `dedup_rule_id`、registry 對齊；`BET-DQ-03` 在編排路徑為 **MUST / fail-closed** |
 | **L1 materialize** | 清洗後 bets | `run_fact`、`trip_fact`、`run_day_bridge`、membership maps | 依 `definition_version`；**不含**訓練抽樣參數 |
 | **L2 assemble** | L1 + 需求窗 | 訓練或分析用矩陣／索引 | 抽樣、權重僅在此層 |
 | **Publish（serving 基底）** | L1/L2 | `published_snapshot_id` + sidecar manifest | 週期與 SLO 於 Phase 2 固定 |
 | **Online delta（可選）** | 新 bet 流 + 上一版 published | bounded state + `late_arrival_correction_log` | 須可證明上界 |
-| **Resumable orchestration** | 日期區間 + 版本鍵 + 既有狀態 | 單日計算狀態（pending/running/succeeded/failed/skipped）+ 可續跑計畫 | 以 `gaming_day` 為最小單元，支援 stop/resume |
+| **Resumable orchestration** | 日期區間 + 版本鍵 + 既有狀態 | 單日計算狀態（pending/running/succeeded/failed/skipped）+ 可續跑計畫 | 以 `gaming_day` 為最小單元，支援 stop/resume；**單一入口 one-liner** 必須可完成 `raw(t_bet+t_session) -> eligible -> preprocess -> L1` |
 
 ### 2.2 儲存與編排（建議）
 
@@ -78,6 +78,7 @@
 - **Manifest**：每批次目錄 `manifest.json`（或集中 registry DB）；published 另寫 `published_snapshot.json`。
 - **編排**：初期以 **CLI + cron/Airflow（若已有）** 即可；不將編排器選型列為本計畫 gate。
 - **State store（新增）**：維護日粒度執行狀態（例如 SQLite/DuckDB/JSONL）；每筆至少含 `artifact_kind`、`gaming_day`、`source_snapshot_id`、`definition_version`、`transform_version`、`status`、`attempt`、`input_hash`、`output_uri`、`updated_at`、`error_summary`。
+- **Rated eligibility（新增，MUST）**：編排器在 raw 路徑需先由 `trainer.identity.build_rated_eligible_player_ids_df(sessions_df, cutoff_dtm)` 產生 `eligible_player_ids`，再餵給 `preprocess_bet_v1 --eligible-player-ids-parquet`；不得在 LDA 另行重寫 rated 規則。
 
 ### 2.3 Resumable 工程契約（草案）
 
@@ -163,15 +164,16 @@
 | 模組 | 職責 |
 |------|------|
 | **time_semantics_registry** | 維護每表 `event_time` / `observed_at` / `business_key` / `dedup_rule_id`；與 `GDP_GMWDS_Raw_Schema_Dictionary.md`、FND 對齊。 |
-| **preprocessing** | `player_id` / `bet_id` 有效性、重複版本、`manual/canceled/deleted` 等；輸出 rule id 與版本供 manifest。 |
+| **preprocessing** | `player_id` / `bet_id` 有效性、重複版本、`manual/canceled/deleted` 等；輸出 rule id 與版本供 manifest；在編排路徑強制消費 rated eligible 名單（BET-DQ-03）。 |
 | **run_trip_builder** | 依 SSOT run v2 切 run（30 分鐘 gap + `gaming_day` hard cutoff）、依 3 個完整 gaming_day 關 trip；產出 facts + membership + bridge。 |
 | **lineage_manifest_writer** | 寫 SSOT §8 欄位 + `ingestion_delay_summary`（published 強制）。 |
 | **feature_dependency_registry**（新建或併入 doc） | 依 **§6.1.1** 自 deploy `feature_spec.yaml` 枚舉 `(track_section, feature_id)` → 所需 L1 欄位／是否允許回掃 bet。 |
 | **parity_validator** | 抽樣或窗內比對：**依 deploy `feature_spec.yaml` 獨立重算之參考值** vs **asset-layer / L2 產出**（見 §6）；不依賴既有 trainer 快取產物作為唯一真相。 |
 | **publisher** | 產出 `published_snapshot_id`、刷新週期標識、可選 `online_delta_seq` 契約。 |
 | **resume_controller** | 依 state store + manifest 決定「可跳過／需重跑／可續跑」日期集合；提供 `--resume` / `--force` / `--date-from` / `--date-to` 契約。 |
+| **rated_eligibility_builder**（新增） | 單一來源為 `trainer.identity.build_rated_eligible_player_ids_df`；以 `t_session + cutoff_dtm` 產出 `eligible_player_ids` 給 preprocess；需有分批/串流策略避免 OOM。 |
 
-**與 `trainer` 邊界**：第一階段 **不重構** `trainer.py`；僅定義「可讀取 L1 產物」之介面契約，供後續合併決策。
+**與 `trainer` 邊界**：第一階段仍不重構 `trainer.py` 主流程，但 **BET-DQ-03 rated eligibility 必須直接復用 `trainer.identity.build_rated_eligible_player_ids_df`**，作為 preprocess 唯一 allowlist 來源；此項屬資料品質入口契約，非可延後之最佳化工作。
 
 ---
 
@@ -226,7 +228,9 @@
 **交付物**：
 
 - L0 分區寫入與 `source_snapshot_id` 產生規則。
+- one-liner 編排入口：單指令覆蓋 `raw t_bet + raw t_session -> rated eligible -> preprocess -> run_fact/run_bet_map/run_day_bridge`。
 - Preprocess → `run_fact`、`run_bet_map`、`run_day_bridge`（run 依 `gaming_day` hard cutoff 切分，`run_fact` 含 `is_hard_cutoff` 或等價欄位；Phase 1 不產出 trip 最終語義；trip 於 Phase 2 一次到位導入 v1 規則）。
+- BET-DQ-03 rated gate 在編排路徑為 fail-closed：無 `eligible_player_ids` 時不得以 `preprocessing_gaps` 降級放行。
 - 每批次 manifest + **ingestion 延遲摘要**（published 路徑預演）。
 - 日區間編排支援 **resumable**：每個 `gaming_day` 單獨落檔並寫入 state store；中斷後可從未完成日期續跑。
 
@@ -327,7 +331,7 @@
 | `player_id` 碎裂（FND-11） | trip/run 語意與業務直覺不一致 | SSOT 已接受；實作上在監控報告中追蹤「單人多段 trip」比例。 |
 | deploy spec 與 asset-layer spec 語義漂移 | 特徵一致性與可維護性下降 | 以 coverage matrix + mismatch ledger 持續稽核，任何新增/修改 feature 必須雙邊對映更新。 |
 | registry 與實際表漂移 | 錯誤 event_time | PR 必須更新 registry；CI 驗證欄位存在。 |
-| 過早合併進 trainer | 訓練迴歸風險 | Phase 4 前維持並行；合併需另案與回歸 gate。 |
+| 過早合併進 trainer | 訓練迴歸風險 | Phase 4 前維持並行；但 preprocess 的 BET-DQ-03 入口仍需直連 trainer identity 單一來源。 |
 
 ### 7.1 OOM 估算與重試機制（實作契約）
 
@@ -417,7 +421,7 @@
 ## 11) 文件維護
 
 - SSOT 變更時：本計畫須檢視 **Phase 範圍與驗收** 是否仍成立；必要時升版本計畫「階段」敘述，不修改 SSOT 業務定義。  
-- 本計畫版本以文首 **blockquote 版本列**為準（目前 v0.4）；重大架構變更升 minor。
+- 本計畫版本以文首 **blockquote 版本列**為準（目前 v0.6）；重大架構變更升 minor。
 
 ---
 

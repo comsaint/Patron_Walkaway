@@ -98,16 +98,22 @@ python scripts/manifest_lineage_preview_v1.py --help
 - **資料根目錄固定**為 `<repo>/data`（**不接受** `--data-root`，請在倉庫根執行）。
 - **輸入模式**（可全省略一項，見下）：
   - **（預設）** 若未帶下列三旗標，且存在 **`data/gmwds_t_bet.parquet`**（與 README／trainer 本機匯出同路徑）：等同 **`--bet-parquet`** 指該檔，並使用 **`--source-snapshot-id snap_gmwds_t_bet_local`**（可自帶 `--source-snapshot-id` 覆寫）。**不**做每日 L0 ingest，避免對同一巨大檔重複落地。
-  - **`--raw-t-bet-parquet <path>`**：每日先 `l0_ingest`（`t_bet`），再 preprocess → 三物化 → 三個 Gate1。可選 **`--raw-t-session-parquet`** 僅多寫 L0 `t_session`（本編排器無後續 L1 消費）。
+  - **`--raw-t-bet-parquet <path>`**：每日先 `l0_ingest`（`t_bet`），再 preprocess → 三物化 → 三個 Gate1。  
+    **BET-DQ-03 fail-closed（v0.6）**：raw 模式必須二擇一：
+    1) 提供 **`--eligible-player-ids-parquet`**；或  
+    2) 提供 **`--raw-t-session-parquet` + `--cutoff-dtm`**，由編排器自動呼叫 `trainer.identity.build_rated_eligible_player_ids_df` 產生 allowlist 並傳給 preprocess。  
+    未滿足上述條件會直接 exit 2（不再以 `preprocessing_gaps` 降級放行）。
   - **`--bet-parquet <path>`**：跳過 L0；**必須** **`--source-snapshot-id`**（若不用預設檔則必填）；preprocess 依 SQL 過濾各日 `gaming_day`。
   - **`--l0-existing`**：在 `data/l0_layered` 下依當日分區**自動尋找**既有 `snap_*`（多個時取字典序第一並 stderr 警告）。
   - 若未帶旗標且 **沒有** `data/gmwds_t_bet.parquet`，程式會 stderr 說明並 exit 2，請改用上述旗標之一。
 
-常用旗標：**`--date-from` / `--date-to`**（含首尾之曆日區間）、`--dry-run`、`--verbose`（轉給 Gate1）、`--no-progress`（關閉編排器日進度條）、`--profiles-json`（轉給 Gate1）、`--gate1-output-parent`、**`--state-store`** / **`--resume`** / **`--force`** / **`--stop-after-date`**（見下 §5.1）。編排器**一定**把 ingestion registry 轉給每日 `preprocess_bet_v1`：**預設**為 **`schema/preprocess_bet_ingestion_fix_registry.yaml`**；該檔（或你以 **`--ingestion-fix-registry-yaml`** 指定的路徑）**必須存在**，否則程式立刻以錯誤結束。可選 **`--ingestion-fix-registry-version-expected`**（fail-fast 鎖 `registry_version`）。`materialization_state` 之 preprocess **`input_hash`** 會納入 registry 檔 stat 與預期版本字串。
+常用旗標：**`--date-from` / `--date-to`**（含首尾之曆日區間）、`--dry-run`、`--verbose`（轉給 Gate1）、`--no-progress`（關閉編排器日進度條）、`--profiles-json`（轉給 Gate1）、`--gate1-output-parent`、**`--state-store`** / **`--resume`** / **`--force`** / **`--stop-after-date`**（見下 §5.1）、**`--eligible-player-ids-parquet`**、**`--cutoff-dtm`**。編排器**一定**把 ingestion registry 轉給每日 `preprocess_bet_v1`：**預設**為 **`schema/preprocess_bet_ingestion_fix_registry.yaml`**；該檔（或你以 **`--ingestion-fix-registry-yaml`** 指定的路徑）**必須存在**，否則程式立刻以錯誤結束。可選 **`--ingestion-fix-registry-version-expected`**（fail-fast 鎖 `registry_version`）。`materialization_state` 之 preprocess **`input_hash`** 會納入 registry 檔 stat、預期版本字串與（若使用）eligible Parquet 檔 stat。
 
 - **日期預設**：若**同時省略** `--date-from` 與 `--date-to`，編排器會只跑 **bet 來源裡實際出現的每個 `gaming_day`**（排序後逐日執行）：`--bet-parquet`／預設本機檔／`--raw-t-bet-parquet` 時以 DuckDB 對該 Parquet 做 `DISTINCT gaming_day`；`--l0-existing` 時掃描 `l0_layered/*/t_bet/gaming_day=*` 下有 `part-*.parquet` 的分區。大檔之 `DISTINCT` 可能較慢，屬一次性成本；需曆日連續區間時請顯式傳兩個日期旗標。
 - **日誌**：預設為精簡模式（stderr：短 banner、tqdm 後綴顯示目前 `gaming_day` 與階段、每個子程序一行 `[LDA]` 摘要；**不**把 Gate1 的 JSON 整段打到終端）。需要完整 argv 與子程序即時輸出時加 **`--echo-commands`**。
 - **歷史 backfill 與 E1-11**：編排器**強制**使用 ingestion registry（預設為倉庫內 **`schema/preprocess_bet_ingestion_fix_registry.yaml`**），與 SSOT **LDA-014**／synthetic observed cap 對齊；檔案缺失時**不會**靜默略過，會直接報錯退出。可選 **`--ingestion-fix-registry-version-expected`** 鎖定 YAML 頂層 `registry_version`。開跑時 stderr banner 會標示 registry 為預設路徑或自訂 YAML 檔名。
+- **rated / unrated 與 trainer 銜接（E1-14~E1-16）**：raw 模式若走 `--raw-t-session-parquet + --cutoff-dtm`，編排器會先從 `t_session` 建立 BET-DQ-03 rated allowlist（`player_id`），再把 `--eligible-player-ids-parquet` 傳給每日 preprocess；該步驟屬 fail-closed 契約。  
+  **資源防護（E1-16）**：可調 `--eligible-build-max-session-rows`（預設 5_000_000，`0` 關閉）、`--eligible-build-duckdb-memory-limit-mb`（可選，≥64）、`--eligible-build-duckdb-threads`（預設 1）、`--eligible-build-run-log`（JSONL）、`--eligible-build-failure-context`（失敗診斷 JSON；未指定則寫入 `data/tmp_lda_gate1_day_range/eligible/last_eligible_build_failure.json`）。
 
 ```bash
 python scripts/lda_l1_gate1_day_range_v1.py --help
@@ -119,6 +125,16 @@ python scripts/lda_l1_gate1_day_range_v1.py --help
 python scripts/lda_l1_gate1_day_range_v1.py --date-from 2026-01-01 --date-to 2026-01-01 \
   --bet-parquet data/gmwds_t_bet.parquet \
   --source-snapshot-id snap_abcdefgh --dry-run
+```
+
+**範例（raw 一行到底：含 unrated 過濾 + trainer identity）**：
+
+```bash
+python scripts/lda_l1_gate1_day_range_v1.py \
+  --date-from 2026-01-01 --date-to 2026-01-31 \
+  --raw-t-bet-parquet data/gmwds_t_bet.parquet \
+  --raw-t-session-parquet data/gmwds_t_session.parquet \
+  --cutoff-dtm 2026-01-31T23:59:59+08:00
 ```
 
 **範例（自動跑完 Parquet 內所有 `gaming_day`；僅列計畫）** — 需存在 `data/gmwds_t_bet.parquet`（或自行加上 `--bet-parquet`）：

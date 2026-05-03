@@ -97,3 +97,27 @@ def test_hash_preprocess_inputs_changes_when_registry_expected_version_changes(t
         ingestion_fix_registry_version_expected="v2",
     )
     assert h1 != h2
+
+
+def test_hash_preprocess_inputs_changes_when_eligible_file_changes(tmp_path: Path) -> None:
+    """Eligible parquet stats must participate in preprocess input_hash."""
+    inp = tmp_path / "a.parquet"
+    inp.write_bytes(b"x")
+    eligible = tmp_path / "eligible.parquet"
+    eligible.write_bytes(b"p1")
+    h1 = hash_preprocess_inputs(
+        source_snapshot_id="snap_x",
+        gaming_day="2026-01-01",
+        preprocess_input_paths=[inp],
+        fingerprint_path=None,
+        eligible_player_ids_parquet=eligible,
+    )
+    eligible.write_bytes(b"p12")
+    h2 = hash_preprocess_inputs(
+        source_snapshot_id="snap_x",
+        gaming_day="2026-01-01",
+        preprocess_input_paths=[inp],
+        fingerprint_path=None,
+        eligible_player_ids_parquet=eligible,
+    )
+    assert h1 != h2

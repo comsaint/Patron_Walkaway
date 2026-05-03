@@ -321,6 +321,26 @@ class TestBuildCanonicalMappingFromDf(unittest.TestCase):
         self.assertIn("canonical_id", result.columns)
         self.assertEqual(len(result), 2)
 
+    def test_build_rated_eligible_player_ids_df_matches_mapping_player_ids(self):
+        """LDA BET-DQ-03 helper must match ``build_canonical_mapping_from_df`` player set."""
+        df = _make_sessions([
+            self._base_session("S1", 1, "CARD_A"),
+            self._base_session("S2", 2, "CARD_B"),
+        ])
+        mapping = build_from_df(df, T1)
+        rated = IDENTITY.build_rated_eligible_player_ids_df(df, T1)
+        self.assertListEqual(list(rated.columns), ["player_id"])
+        self.assertEqual(
+            set(int(x) for x in rated["player_id"].tolist()),
+            set(int(x) for x in mapping["player_id"].tolist()),
+        )
+
+    def test_build_rated_eligible_player_ids_df_empty_sessions(self):
+        df = _make_sessions([])
+        rated = IDENTITY.build_rated_eligible_player_ids_df(df, T1)
+        self.assertEqual(len(rated), 0)
+        self.assertEqual(str(rated["player_id"].dtype), "int64")
+
     def test_b1_cutoff_excludes_future_sessions(self):
         # Session ends AFTER cutoff_dtm (T1) — must be excluded (B1)
         df = _make_sessions([

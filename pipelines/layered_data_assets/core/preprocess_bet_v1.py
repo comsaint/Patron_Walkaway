@@ -1,4 +1,12 @@
-"""DuckDB-driven ``preprocess_bet_v1`` filter + dedup + ordered COPY to Parquet."""
+"""DuckDB-driven ``preprocess_bet_v1`` filter + dedup + ordered COPY to Parquet.
+
+BET-DQ-03 (rated-only) uses an optional ``player_id`` allow-list Parquet
+(``--eligible-player-ids-parquet``). Build that list with
+``trainer.identity.build_rated_eligible_player_ids_df(sessions_df, cutoff_dtm)`` (same
+semantics as ``build_canonical_mapping_from_df``). Standalone LDA: write that
+frame to Parquet and pass the path; future in-trainer runs should call the same
+function instead of duplicating rules here.
+"""
 from __future__ import annotations
 
 import json

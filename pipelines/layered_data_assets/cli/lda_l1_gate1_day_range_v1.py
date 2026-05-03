@@ -3,8 +3,9 @@
 
 **End-to-end** here means: optional **raw** Parquet ingested with ``l0_ingest.py`` (``t_bet``; optional
 ``t_session``), then ``preprocess_bet_v1``, then ``run_fact`` / ``run_bet_map`` / ``run_day_bridge``,
-then **Gate1** on each of those three artifacts. ``t_session`` is only landed to L0 today (no L1
-consumer in this script).
+then **Gate1** on each of those three artifacts. In raw mode, this orchestrator can build the
+BET-DQ-03 rated allowlist from ``t_session`` via
+``trainer.identity.build_rated_eligible_player_ids_df`` and forward it to preprocess.
 
 **Input modes** (pick one, or omit for **default** — see below):
 
@@ -43,12 +44,15 @@ immediately with an error. Optional ``--ingestion-fix-registry-version-expected`
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
 import textwrap
 import time
+import traceback
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 from .repo_root import discover_repo_root
@@ -80,6 +84,11 @@ from ..orchestration.lda_day_range_v1 import (
     distinct_gaming_days_from_l0_t_bet_layout,
     distinct_gaming_days_from_t_bet_parquet,
     inclusive_iso_date_strings,
+)
+from ..orchestration.oom_runner_v1 import (
+    append_jsonl_record,
+    apply_duckdb_resource_pragmas,
+    write_failure_context,
 )
 from ..orchestration.materialization_state_store_v1 import (
     ARTIFACT_GATE1_RUN_BET_MAP,
@@ -219,6 +228,7 @@ def _print_run_banner(
     days: list[str],
     data_root: Path,
     gate_parent: Path,
+    eligible_player_ids_parquet: Path | None,
 ) -> None:
     """Print a short human-readable plan to stderr."""
     n = len(days)
@@ -242,6 +252,8 @@ def _print_run_banner(
         f"[LDA] per day: L0? -> preprocess -> L1(run_fact, run_bet_map, run_day_bridge) -> Gate1(x3) | gate1_out={gate_parent.resolve()}",
         f"[LDA] {reg_note}",
     ]
+    if eligible_player_ids_parquet is not None:
+        lines.append(f"[LDA] BET-DQ-03 eligible ids: {eligible_player_ids_parquet}")
     if _state_tracking_enabled(args):
         sp = _resolve_state_db_path(args, data_root=data_root)
         sfx = f"resume={bool(args.resume)} force={bool(args.force)}"
@@ -480,6 +492,220 @@ def _ingestion_registry_cli_args(args: argparse.Namespace) -> list[str]:
     return out
 
 
+def _assert_eligible_session_row_budget(count: int, *, max_rows: int) -> None:
+    """Fail fast when cutoff-filtered ``t_session`` row count exceeds the operator budget."""
+    if max_rows <= 0:
+        return
+    if count > max_rows:
+        raise RuntimeError(
+            f"cutoff-filtered t_session row count {count:,} exceeds "
+            f"--eligible-build-max-session-rows={max_rows:,}; "
+            "raise the limit, pre-slice the Parquet export, or run on a machine with enough RAM "
+            "only after explicit planning."
+        )
+
+
+def _parse_cutoff_dtm(raw_value: str) -> datetime:
+    """Parse ``--cutoff-dtm`` into a :class:`datetime` (ISO-8601; accepts trailing ``Z``)."""
+    text = str(raw_value).strip()
+    if not text:
+        raise ValueError("--cutoff-dtm must be a non-empty ISO datetime string")
+    norm = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        return datetime.fromisoformat(norm)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid --cutoff-dtm {raw_value!r}; expected ISO-8601 like 2026-01-31T23:59:59+08:00"
+        ) from exc
+
+
+def _build_rated_eligible_player_ids_parquet(
+    *,
+    raw_t_session_parquet: Path,
+    cutoff_dtm: datetime,
+    data_root: Path,
+    emit_stderr: Callable[[str], None] | None = None,
+    max_session_rows: int = 5_000_000,
+    duckdb_memory_limit_mb: int | None = None,
+    duckdb_threads: int = 1,
+    failure_context_path: Path | None = None,
+    run_log_path: Path | None = None,
+) -> Path:
+    """Build BET-DQ-03 rated eligible allowlist once per orchestrator run.
+
+    Uses a deterministic cache path under ``data/tmp_lda_gate1_day_range/eligible`` keyed by
+    ``raw_t_session_parquet`` file stats + ``cutoff_dtm``.
+
+    Resource guards (E1-16): optional DuckDB ``memory_limit`` / ``threads``, a fail-fast row budget
+    on cutoff-filtered ``t_session`` rows (``max_session_rows``; ``0`` disables), JSONL run log,
+    and a JSON failure context on any exception.
+    """
+    src = raw_t_session_parquet.resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"raw_t_session parquet not found: {src}")
+    st = src.stat()
+    key_raw = f"{src.as_posix()}|{int(st.st_size)}|{int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9)))}|{cutoff_dtm.isoformat()}"
+    key = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()[:16]
+    out_dir = (data_root / "tmp_lda_gate1_day_range" / "eligible").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"rated_eligible_{key}.parquet"
+    if out_path.is_file():
+        _stderr_line(f"[LDA] rated eligible cache hit: {out_path}", emit=emit_stderr)
+        return out_path
+
+    ctx_default = out_dir / "last_eligible_build_failure.json"
+    diag_base: dict[str, object] = {
+        "raw_t_session_parquet": str(src),
+        "cutoff_dtm": cutoff_dtm.isoformat(),
+        "max_session_rows": int(max_session_rows),
+        "duckdb_memory_limit_mb": duckdb_memory_limit_mb,
+        "duckdb_threads": int(duckdb_threads),
+        "cache_key_prefix": key,
+    }
+
+    try:
+        import duckdb
+    except ImportError as exc:
+        raise RuntimeError("duckdb is required to auto-build rated eligible ids from --raw-t-session-parquet.") from exc
+
+    from trainer.identity import _REQUIRED_SESSION_COLS, build_rated_eligible_player_ids_df
+
+    cols = sorted(_REQUIRED_SESSION_COLS)
+    cols_sql = ", ".join(f'"{c}"' for c in cols)
+    cutoff_sql = cutoff_dtm.isoformat(sep=" ")
+    filter_tail = (
+        "FROM read_parquet(?) "
+        "WHERE COALESCE(TRY_CAST(session_end_dtm AS TIMESTAMP), TRY_CAST(lud_dtm AS TIMESTAMP)) "
+        "<= TRY_CAST(? AS TIMESTAMP)"
+    )
+    count_sql = f"SELECT COUNT(*) AS n {filter_tail}"
+    select_sql = f"SELECT {cols_sql} {filter_tail}"
+    params = [str(src), cutoff_sql]
+
+    _stderr_line(
+        f"[LDA] build rated eligible from {src.name} (cutoff={cutoff_dtm.isoformat()}, "
+        f"max_session_rows={max_session_rows}, duckdb_threads={duckdb_threads}"
+        f"{f', memory_limit_mb={duckdb_memory_limit_mb}' if duckdb_memory_limit_mb is not None else ''})",
+        emit=emit_stderr,
+    )
+
+    t0 = time.monotonic()
+    try:
+        con = duckdb.connect()
+        try:
+            apply_duckdb_resource_pragmas(
+                con,
+                memory_limit_mb=duckdb_memory_limit_mb,
+                threads=int(duckdb_threads),
+            )
+            filtered_count: int | None = None
+            if int(max_session_rows) > 0:
+                row = con.execute(count_sql, params).fetchone()
+                filtered_count = int(row[0]) if row is not None else 0
+                _assert_eligible_session_row_budget(filtered_count, max_rows=int(max_session_rows))
+                if run_log_path is not None:
+                    append_jsonl_record(
+                        Path(run_log_path),
+                        {
+                            "event": "eligible_build_count",
+                            "filtered_session_rows": filtered_count,
+                            "max_session_rows": int(max_session_rows),
+                            "elapsed_sec": round(time.monotonic() - t0, 3),
+                            "source": str(src),
+                        },
+                    )
+            sessions_df = con.execute(select_sql, params).fetchdf()
+        finally:
+            con.close()
+        if int(max_session_rows) > 0:
+            _assert_eligible_session_row_budget(len(sessions_df), max_rows=int(max_session_rows))
+        eligible_df = build_rated_eligible_player_ids_df(sessions_df, cutoff_dtm)
+        eligible_df.to_parquet(out_path, index=False)
+        dt = time.monotonic() - t0
+        _stderr_line(
+            f"[LDA] rated eligible wrote {len(eligible_df):,} player_id(s) -> {out_path} ({dt:.1f}s)",
+            emit=emit_stderr,
+        )
+        if run_log_path is not None:
+            append_jsonl_record(
+                Path(run_log_path),
+                {
+                    "event": "eligible_build_done",
+                    "distinct_rated_player_ids": int(len(eligible_df)),
+                    "dataframe_rows_in": int(len(sessions_df)),
+                    "filtered_session_rows": filtered_count,
+                    "output_parquet": str(out_path),
+                    "elapsed_sec": round(dt, 3),
+                },
+            )
+        return out_path
+    except Exception as exc:
+        ctx = (failure_context_path or ctx_default).resolve()
+        payload = {
+            **diag_base,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "traceback": traceback.format_exc(),
+        }
+        write_failure_context(ctx, payload)
+        _stderr_line(f"[LDA] eligible build failure context -> {ctx}", emit=emit_stderr)
+        raise
+
+
+def _resolve_eligible_player_ids_parquet(
+    *,
+    args: argparse.Namespace,
+    data_root: Path,
+    dry_run: bool,
+    emit_stderr: Callable[[str], None] | None = None,
+) -> Path | None:
+    """Resolve BET-DQ-03 allowlist path for preprocess.
+
+    - If ``--eligible-player-ids-parquet`` is provided, requires that file to exist.
+    - In raw mode, auto-build from ``--raw-t-session-parquet`` + ``--cutoff-dtm`` when no explicit file.
+    """
+    explicit = getattr(args, "eligible_player_ids_parquet", None)
+    if explicit is not None:
+        ep = Path(explicit).resolve()
+        if not ep.is_file():
+            raise FileNotFoundError(f"eligible-player-ids parquet not found: {ep}")
+        return ep
+
+    if getattr(args, "raw_t_bet_parquet", None) is None:
+        return None
+    if getattr(args, "raw_t_session_parquet", None) is None:
+        return None
+    cutoff_raw = getattr(args, "cutoff_dtm", None)
+    if cutoff_raw is None or not str(cutoff_raw).strip():
+        return None
+    cutoff = _parse_cutoff_dtm(str(cutoff_raw))
+    if dry_run:
+        _stderr_line(
+            "[LDA] dry-run: would build BET-DQ-03 eligible-player-ids from --raw-t-session-parquet",
+            emit=emit_stderr,
+        )
+        return None
+    return _build_rated_eligible_player_ids_parquet(
+        raw_t_session_parquet=Path(args.raw_t_session_parquet),
+        cutoff_dtm=cutoff,
+        data_root=data_root,
+        emit_stderr=emit_stderr,
+        max_session_rows=int(getattr(args, "eligible_build_max_session_rows", 5_000_000)),
+        duckdb_memory_limit_mb=getattr(args, "eligible_build_duckdb_memory_limit_mb", None),
+        duckdb_threads=int(getattr(args, "eligible_build_duckdb_threads", 1)),
+        failure_context_path=(
+            Path(args.eligible_build_failure_context).resolve()
+            if getattr(args, "eligible_build_failure_context", None) is not None
+            else None
+        ),
+        run_log_path=(
+            Path(args.eligible_build_run_log).resolve()
+            if getattr(args, "eligible_build_run_log", None) is not None
+            else None
+        ),
+    )
+
+
 def _hash_preprocess_inputs_for_day(
     *,
     args: argparse.Namespace,
@@ -487,6 +713,7 @@ def _hash_preprocess_inputs_for_day(
     d: str,
     pre_paths: list[Path],
     fp_for_hash: Path | None,
+    eligible_player_ids_parquet: Path | None,
 ) -> str:
     """``input_hash`` for preprocess; includes registry file stats when enabled."""
     reg = getattr(args, "ingestion_fix_registry_yaml", None)
@@ -498,6 +725,7 @@ def _hash_preprocess_inputs_for_day(
         gaming_day=d,
         preprocess_input_paths=pre_paths,
         fingerprint_path=fp_for_hash,
+        eligible_player_ids_parquet=eligible_player_ids_parquet,
         ingestion_fix_registry_path=reg_p,
         ingestion_fix_registry_version_expected=ver_s,
     )
@@ -629,6 +857,7 @@ def _run_lda_pipeline_for_day(
     force: bool,
     echo_commands: bool,
     pbar: _DayRangeProgressBar,
+    eligible_player_ids_parquet: Path | None,
 ) -> bool:
     """Run L0 (optional), L1 preprocess + three run_* jobs, and three Gate1 invocations.
 
@@ -664,6 +893,7 @@ def _run_lda_pipeline_for_day(
         d=d,
         pre_paths=pre_paths,
         fp_for_hash=fp_for_hash,
+        eligible_player_ids_parquet=eligible_player_ids_parquet,
     )
 
     pre_cmd = [
@@ -680,6 +910,8 @@ def _run_lda_pipeline_for_day(
     ]
     for path in pre_inputs:
         pre_cmd.extend(["--input", path])
+    if eligible_player_ids_parquet is not None:
+        pre_cmd.extend(["--eligible-player-ids-parquet", str(eligible_player_ids_parquet)])
     cleaned = l1_bet_cleaned_parquet_path(data_root, sid, d)
     pbar.set_postfix_str(f"{d} preprocess")
     _run_tracked_subprocess(
@@ -881,10 +1113,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             usually differs each day). WARNING: repeating the same huge file per day duplicates L0
             storage under separate snap_* roots — prefer per-day raw files or --bet-parquet when L0
             is already materialized. Source Parquet must be L0 t_bet-shaped (player_id, bet_id,
-            gaming_day); not training/feature slices.
+            gaming_day); not training/feature slices. BET-DQ-03 is fail-closed: raw mode must
+            pass either --eligible-player-ids-parquet, or --raw-t-session-parquet with --cutoff-dtm.
 
               python scripts/lda_l1_gate1_day_range_v1.py \\
-                --date-from 2026-01-01 --date-to 2026-01-01 --raw-t-bet-parquet data/gmwds_t_bet.parquet
+                --date-from 2026-01-01 --date-to 2026-01-01 \\
+                --raw-t-bet-parquet data/gmwds_t_bet.parquet \\
+                --raw-t-session-parquet data/gmwds_t_session.parquet \\
+                --cutoff-dtm 2026-01-31T23:59:59+08:00
 
             Skip L0; fixed L1 snapshot (multi-day bet file filtered in preprocess):
 
@@ -943,7 +1179,64 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--raw-t-session-parquet",
         type=Path,
         default=None,
-        help="Optional raw t_session Parquet: l0_ingest per day after t_bet (same gaming_day partition)",
+        help=(
+            "Raw t_session Parquet for raw mode: l0_ingest per day after t_bet, and (with --cutoff-dtm) "
+            "auto-build BET-DQ-03 eligible-player-ids via trainer.identity"
+        ),
+    )
+    p.add_argument(
+        "--eligible-player-ids-parquet",
+        type=Path,
+        default=None,
+        help="Optional explicit BET-DQ-03 allowlist parquet (single player_id column) forwarded to preprocess",
+    )
+    p.add_argument(
+        "--cutoff-dtm",
+        type=str,
+        default=None,
+        metavar="ISO_DATETIME",
+        help=(
+            "Required for raw-mode auto-build from --raw-t-session-parquet. "
+            "ISO-8601, e.g. 2026-01-31T23:59:59+08:00"
+        ),
+    )
+    p.add_argument(
+        "--eligible-build-max-session-rows",
+        type=int,
+        default=5_000_000,
+        metavar="N",
+        help=(
+            "After cutoff filter on t_session, fail if row count exceeds N before loading into pandas "
+            "(0 disables; default 5_000_000 to reduce laptop OOM risk)"
+        ),
+    )
+    p.add_argument(
+        "--eligible-build-duckdb-memory-limit-mb",
+        type=int,
+        default=None,
+        metavar="MB",
+        help="Optional DuckDB SET memory_limit for eligible build scan (>= 64 if set; see oom_runner_v1)",
+    )
+    p.add_argument(
+        "--eligible-build-duckdb-threads",
+        type=int,
+        default=1,
+        metavar="N",
+        help="DuckDB threads for eligible build (default 1 to reduce peak RAM)",
+    )
+    p.add_argument(
+        "--eligible-build-failure-context",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="JSON diagnostics path on eligible auto-build failure (default: under data/tmp_lda_gate1_day_range/eligible/)",
+    )
+    p.add_argument(
+        "--eligible-build-run-log",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Append JSONL for eligible auto-build phases (count / done)",
     )
     p.add_argument(
         "--l0-fingerprint-json",
@@ -1069,6 +1362,38 @@ def _validate_mode(args: argparse.Namespace) -> int | None:
     if args.raw_t_session_parquet is not None and args.raw_t_bet_parquet is None:
         print("--raw-t-session-parquet requires --raw-t-bet-parquet", file=sys.stderr)
         return 2
+    if args.raw_t_bet_parquet is not None:
+        has_explicit_eligible = args.eligible_player_ids_parquet is not None
+        has_raw_session = args.raw_t_session_parquet is not None
+        has_cutoff = bool(getattr(args, "cutoff_dtm", None) and str(args.cutoff_dtm).strip())
+        if not has_explicit_eligible and not has_raw_session:
+            print(
+                "raw mode requires BET-DQ-03 allowlist: pass --eligible-player-ids-parquet "
+                "or --raw-t-session-parquet with --cutoff-dtm",
+                file=sys.stderr,
+            )
+            return 2
+        if has_raw_session and not has_explicit_eligible and not has_cutoff:
+            print("--cutoff-dtm is required with --raw-t-session-parquet in raw mode", file=sys.stderr)
+            return 2
+    if getattr(args, "cutoff_dtm", None) and str(args.cutoff_dtm).strip():
+        try:
+            _parse_cutoff_dtm(str(args.cutoff_dtm))
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    em = int(getattr(args, "eligible_build_max_session_rows", 0))
+    if em < 0:
+        print("--eligible-build-max-session-rows must be >= 0", file=sys.stderr)
+        return 2
+    et = int(getattr(args, "eligible_build_duckdb_threads", 1))
+    if et < 1:
+        print("--eligible-build-duckdb-threads must be >= 1", file=sys.stderr)
+        return 2
+    emem = getattr(args, "eligible_build_duckdb_memory_limit_mb", None)
+    if emem is not None and int(emem) < 64:
+        print("--eligible-build-duckdb-memory-limit-mb must be >= 64 when set", file=sys.stderr)
+        return 2
     if bool(args.resume) and bool(args.force):
         print("[LDA] NOTE: both --resume and --force; --force wins (no skips)", file=sys.stderr)
     return None
@@ -1110,8 +1435,23 @@ def main(argv: list[str] | None = None) -> int:
     py = sys.executable
     gate_parent = args.gate1_output_parent or (data_root / "tmp_lda_gate1_day_range")
     user_fp = args.l0_fingerprint_json.resolve() if args.l0_fingerprint_json else None
+    try:
+        eligible_player_ids_parquet = _resolve_eligible_player_ids_parquet(
+            args=args,
+            data_root=data_root,
+            dry_run=bool(args.dry_run),
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
-    _print_run_banner(args=args, days=days, data_root=data_root, gate_parent=gate_parent)
+    _print_run_banner(
+        args=args,
+        days=days,
+        data_root=data_root,
+        gate_parent=gate_parent,
+        eligible_player_ids_parquet=eligible_player_ids_parquet,
+    )
 
     state_con: object | None = None
     if _state_tracking_enabled(args) and not args.dry_run:
@@ -1147,6 +1487,7 @@ def main(argv: list[str] | None = None) -> int:
                     force=force,
                     echo_commands=echo_commands,
                     pbar=pbar,
+                    eligible_player_ids_parquet=eligible_player_ids_parquet,
                 )
             except RuntimeError as exc:
                 pbar.write_stderr_line(f"[LDA] ABORT day {d}: {exc}")
