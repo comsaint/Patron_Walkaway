@@ -129,15 +129,13 @@ class TestT12FailedRunErrorTagTruncation(unittest.TestCase):
 
 
 class TestT12MlflowRunNameFormat(unittest.TestCase):
-    """T12 Code Review §3: run_name format contract (train-<window>-<timestamp>)."""
+    """T12: MLflow run_name matches local bundle dir (get_model_version / pipeline_model_version)."""
 
-    def test_run_pipeline_mlflow_run_name_contains_train_and_time(self):
-        """Source must build run_name with train-, start.date(), end.date(), and time (e.g. time.time())."""
+    def test_run_pipeline_mlflow_run_name_matches_pipeline_model_version(self):
+        """Source must pass run_name=pipeline_model_version where pipeline_model_version=get_model_version()."""
         src = _run_pipeline_src()
-        self.assertIn("train-", src, "T12 run_name should start with train-")
-        self.assertIn("start.date()", src, "T12 run_name should include start.date()")
-        self.assertIn("end.date()", src, "T12 run_name should include end.date()")
-        self.assertIn("time.time()", src, "T12 run_name should include time.time() for uniqueness.")
+        self.assertIn("pipeline_model_version = get_model_version()", src)
+        self.assertIn("run_name=pipeline_model_version", src)
 
 
 class TestT12FailedPathReRaisesOriginalException(unittest.TestCase):

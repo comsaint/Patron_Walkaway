@@ -8509,11 +8509,13 @@ def run_pipeline(args) -> None:
 
     logger.info("Training window: %s -> %s  (local=%s)", start.date(), end.date(), use_local)
 
+    # Single model_version for this process: matches out/models/<model_version>/ and MLflow run_name.
+    pipeline_model_version = get_model_version()
+
     # T12: one MLflow run for the whole pipeline; on failure log status=FAILED and re-raise.
-    _mlflow_run_name = f"train-{start.date()}-{end.date()}-{int(time.time())}"
     with safe_start_run(
         experiment_name=MLFLOW_EXPERIMENT_TRAIN,
-        run_name=_mlflow_run_name,
+        run_name=pipeline_model_version,
     ):
         try:
             # T12.2 / T-PipelineStepDurations: best-effort per-step wall times (Step 1–10).
@@ -10060,7 +10062,7 @@ def run_pipeline(args) -> None:
             #    computed immediately after training and included in the artifact.
             print("[Step 9/10] Train rated GBM family (LGBM/CatBoost/XGBoost compare) + test-set eval…", flush=True)
             t0 = time.perf_counter()
-            model_version = get_model_version()
+            model_version = pipeline_model_version
             _libsvm_paths = (_train_libsvm, _valid_libsvm) if (_train_libsvm is not None and _valid_libsvm is not None) else None
             rated_art, _, combined_metrics = train_single_rated_model(
                 train_df,
