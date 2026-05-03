@@ -1,0 +1,11 @@
+{
+  "cache_key_prefix": "cd3cac0b4507017b",
+  "cutoff_dtm": "2026-03-01T00:00:00",
+  "duckdb_memory_limit_mb": null,
+  "duckdb_threads": 1,
+  "error": "cutoff-filtered t_session row count 76,434,983 exceeds --eligible-build-max-session-rows=5,000,000; raise the limit, pre-slice the Parquet export, or run on a machine with enough RAM only after explicit planning.",
+  "error_type": "RuntimeError",
+  "max_session_rows": 5000000,
+  "raw_t_session_parquet": "C:\\Users\\longp\\Patron_Walkaway\\data\\gmwds_t_session.parquet",
+  "traceback": "Traceback (most recent call last):\n  File \"C:\\Users\\longp\\Patron_Walkaway\\pipelines\\layered_data_assets\\cli\\lda_l1_gate1_day_range_v1.py\", line 677, in _build_rated_eligible_player_ids_parquet\n    _assert_eligible_session_row_budget(filtered_count, max_rows=int(max_session_rows))\n  File \"C:\\Users\\longp\\Patron_Walkaway\\pipelines\\layered_data_assets\\cli\\lda_l1_gate1_day_range_v1.py\", line 564, in _assert_eligible_session_row_budget\n    raise RuntimeError(\nRuntimeError: cutoff-filtered t_session row count 76,434,983 exceeds --eligible-build-max-session-rows=5,000,000; raise the limit, pre-slice the Parquet export, or run on a machine with enough RAM only after explicit planning.\n"
+}

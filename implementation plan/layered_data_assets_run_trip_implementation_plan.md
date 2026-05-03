@@ -1,7 +1,7 @@
 # 分層資料資產與 run/trip 特徵工程 — Implementation Plan
 
-> **版本**：Implementation plan **v0.6**（2026-05-03；新增：one-liner 編排契約、BET-DQ-03 rated fail-closed gate、trainer identity 單一來源、eligible 建構之資源約束）。對齊 SSOT v1.5；重大架構變更升 minor。  
-> **依據**：`ssot/layered_data_assets_run_trip_ssot.md`（v1.5）、`schema/time_semantics_registry.yaml`。  
+> **版本**：Implementation plan **v0.7**（2026-05-03；新增：Trip v1 工程契約定案：`trip_start_gaming_day` 分區、open/closed 同輸出、`trip_id` hash 補 `source_snapshot_id`、MVP 採 full snapshot 重算、single-writer merge 與 trip manifest lineage 列舉規則）。對齊 SSOT v1.6；重大架構變更升 minor。  
+> **依據**：`ssot/layered_data_assets_run_trip_ssot.md`（v1.6）、`schema/time_semantics_registry.yaml`。  
 > **本文層級**：架構、模組邊界、階段交付、驗證與治理；**不含**逐檔 Jira 式任務拆解。  
 > **與 trainer 關係**：本計畫先建立**與現行 `trainer` 管線並行**之資料資產產線；是否改為訓練主讀本層資產須另案決策（見 SSOT §0.1）。
 
@@ -183,7 +183,8 @@
 
 - 遵循 SSOT §6：**同一 `source_snapshot_id` + 相同輸入與版本**下重跑必得相同 ID。
 - **實作補強（建議寫入本計畫之工程契約）**：`run_id` 之 hash 輸入除 `(player_id, run_start_ts, run_definition_version, source_namespace)` 外，**納入該 run 之第一筆 `bet_id`（依 `payout_complete_dtm ASC, bet_id ASC`）**，以避免同 timestamp 精度下之邊界歧義與碰撞風險。
-- **`trip_id`（工程契約）**：hash 輸入至少包含 `(player_id, trip_start_gaming_day, trip_definition_version, source_namespace, first_run_id)`。其中 **`first_run_id`** 為該 trip 內依 **`run_start_ts ASC, run_id ASC`** 排序後之**第一個** `run_id`（`run_start_ts` 為 `run_fact` 與實作對齊之 run 起始事件時間欄位；`run_id` 本身已定義為 snapshot-scoped deterministic，見上條）。
+- **`trip_id`（工程契約）**：hash 輸入至少包含 `(player_id, trip_start_gaming_day, trip_definition_version, source_namespace, source_snapshot_id, first_run_id)`。其中 **`first_run_id`** 為該 trip 內依 **`run_start_ts ASC, run_id ASC`** 排序後之**第一個** `run_id`（`run_start_ts` 為 `run_fact` 與實作對齊之 run 起始事件時間欄位；`run_id` 本身已定義為 snapshot-scoped deterministic，見上條）。
+- **穩定性約束（MUST）**：trip 關閉後補寫 `trip_end_*` 或 `is_trip_closed` 等欄位時，`trip_id` 不得改變；`trip_end_*` 不得納入 hash 輸入。
 
 ### 4.2 事件序與 PIT
 
@@ -201,6 +202,7 @@
 - **計算替代（SHOULD）**：在 run hard cutoff 已啟用前提下，可用「**3 個完整 `gaming_day` 無 run**」作為實作判定，以降低計算成本。
 - **等價前提（MUST）**：同一資料範圍內，必須成立 `有 bet <=> 該日存在至少一個 run`（run 由 bet 壓縮而來，不允許空 run）。
 - **驗證要求（MUST）**：每次 `definition_version` 升版或邊界規則調整時，需以 fixture/抽樣驗證「無 bet」與「無 run」判定結果一致。
+- **無外部日曆（MUST）**：Trip v1 不引入外部賭場日曆表；以 `run_fact` 推導「有 run 之 `gaming_day`」及其缺口，缺資料日視為完整空日。
 
 ---
 
@@ -245,7 +247,11 @@
 
 **交付物**：
 
-- `trip_fact`、`trip_run_map`；與 `run_fact` 分區策略（`run_end_gaming_day`，以及可選 `run_day_bridge` 影響分析）對齊。
+- `trip_fact`、`trip_run_map`；`trip_fact` 分區鍵固定為 **`trip_start_gaming_day`**，並與 `run_fact`（`run_end_gaming_day`）及可選 `run_day_bridge` 影響分析對齊。
+- `trip_fact` 同時輸出**已關閉**與**進行中** trip；最小欄位需含對帳鍵（至少 `run_count`、`first_run_id`、`last_run_id` 或等價欄位）供 E2-02 membership 驗證。
+- Phase 2 MVP 計算模型採 **full snapshot 重算**（以 `player_id` 批次/分桶執行）；按日增量 trip 重算列為後續 phase（接 E1-09 state）。
+- 併發寫入採 **single-writer merge**：多 worker 先輸出暫存，單一 writer 依固定排序合併分區，確保 determinism。
+- `trip_fact` manifest 需列舉本批次觸及之所有 `run_end_gaming_day` 於 `source_partitions`（固定排序），`source_hashes` 與其一一對齊。
 - `published_snapshot_id` 發布流程與 **回滾策略**（保留上一版 snapshot 指標）。
 - **K/T/D** 線上有界緩衝之數值建議與負載評估（對應 SSOT §5.4）。
 - trip close 採「**語義維持無 bet**、實作可用無 run 等價判定」並輸出一致性驗證報告。
@@ -329,6 +335,7 @@
 | `GAMING_DAY_START_HOUR` 與來源 `gaming_day` 口徑漂移 | run 邊界錯切、特徵不穩定 | 將 cutoff 視為 `definition_version` 參數；變更需升版並重算；例行抽樣比對 `gaming_day` 與 `payout_complete_dtm@HK` 邊界一致性。 |
 | 續跑狀態不一致（state corruption） | 已完成分區被重複覆寫、或失敗分區被誤跳過 | 採原子寫入（tmp→rename）、state/manifest 雙重校驗、`--force` 僅允許顯式重算。 |
 | `player_id` 碎裂（FND-11） | trip/run 語意與業務直覺不一致 | SSOT 已接受；實作上在監控報告中追蹤「單人多段 trip」比例。 |
+| trip 併發寫入競態（多 worker 同分區） | 分區內容非決定性、重跑 hash 漂移 | 採 single-writer merge：worker 僅寫暫存 shard，單一 writer 依固定排序合併並原子落檔。 |
 | deploy spec 與 asset-layer spec 語義漂移 | 特徵一致性與可維護性下降 | 以 coverage matrix + mismatch ledger 持續稽核，任何新增/修改 feature 必須雙邊對映更新。 |
 | registry 與實際表漂移 | 錯誤 event_time | PR 必須更新 registry；CI 驗證欄位存在。 |
 | 過早合併進 trainer | 訓練迴歸風險 | Phase 4 前維持並行；但 preprocess 的 BET-DQ-03 入口仍需直連 trainer identity 單一來源。 |

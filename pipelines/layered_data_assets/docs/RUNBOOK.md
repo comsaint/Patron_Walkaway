@@ -97,7 +97,7 @@ python scripts/manifest_lineage_preview_v1.py --help
 
 - **資料根目錄固定**為 `<repo>/data`（**不接受** `--data-root`，請在倉庫根執行）。
 - **輸入模式**（可全省略一項，見下）：
-  - **（預設）** 若未帶下列三旗標，且存在 **`data/gmwds_t_bet.parquet`**（與 README／trainer 本機匯出同路徑）：等同 **`--bet-parquet`** 指該檔，並使用 **`--source-snapshot-id snap_gmwds_t_bet_local`**（可自帶 `--source-snapshot-id` 覆寫）。**不**做每日 L0 ingest，避免對同一巨大檔重複落地。
+  - **（預設）** 若未帶下列三旗標，且存在 **`data/gmwds_t_bet.parquet`**（與 README／trainer 本機匯出同路徑）：等同 **`--bet-parquet`** 指該檔，並使用 **`--source-snapshot-id snap_gmwds_t_bet_local`**（可自帶 `--source-snapshot-id` 覆寫）。**不**做每日 L0 ingest，避免對同一巨大檔重複落地。預設 **path B（BET-DQ-03）** 優先序：**若存在 `data/canonical_mapping.parquet`**，自動帶入 **`--canonical-mapping-parquet`**（由 mapping 物化 `player_id` allowlist，**不**掃整包 `t_session`，適合千萬級列數）。否則若存在 **`data/gmwds_t_session.parquet`**：自動帶入 **`--raw-t-session-parquet`**，並在未傳 **`--cutoff-dtm`** 時從 **`data/canonical_mapping.cutoff.json`** 讀取頂層 **`cutoff_dtm`**（僅讀檔首）。若僅有 session 而無 sidecar／未傳 cutoff，程式會 **ValueError** 退出。若不要 rated 過濾，請暫時移開／改名上述 companion 檔，或改傳 **`--eligible-player-ids-parquet`**。
   - **`--raw-t-bet-parquet <path>`**：每日先 `l0_ingest`（`t_bet`），再 preprocess → 三物化 → 三個 Gate1。  
     **BET-DQ-03 fail-closed（v0.6）**：raw 模式必須二擇一：
     1) 提供 **`--eligible-player-ids-parquet`**；或  
@@ -119,6 +119,12 @@ python scripts/manifest_lineage_preview_v1.py --help
 python scripts/lda_l1_gate1_day_range_v1.py --help
 ```
 
+**預設本機（path B，含 BET-DQ-03）**：倉庫根執行；需 `data/gmwds_t_bet.parquet`。優先使用 **`data/canonical_mapping.parquet`**（若存在）；否則需 `data/gmwds_t_session.parquet` 且需 **`data/canonical_mapping.cutoff.json`**（`cutoff_dtm`）或 **`--cutoff-dtm`**。大型 `t_session` 若觸發 `--eligible-build-max-session-rows`，請改以 **`canonical_mapping.parquet`** 或預先切片 session。
+
+```bash
+python scripts/lda_l1_gate1_day_range_v1.py --date-from 2026-01-01 --date-to 2026-01-07
+```
+
 **範例（先看計畫不寫檔）** — `--bet-parquet` 須為含 `player_id` / `bet_id` / `gaming_day` 的 `t_bet` 匯出（例如 `data/gmwds_t_bet.parquet`），**不可**用 baseline 特徵檔。
 
 ```bash
@@ -137,7 +143,7 @@ python scripts/lda_l1_gate1_day_range_v1.py \
   --cutoff-dtm 2026-01-31T23:59:59+08:00
 ```
 
-**範例（自動跑完 Parquet 內所有 `gaming_day`；僅列計畫）** — 需存在 `data/gmwds_t_bet.parquet`（或自行加上 `--bet-parquet`）：
+**範例（自動跑完 Parquet 內所有 `gaming_day`；僅列計畫）** — 需存在 `data/gmwds_t_bet.parquet`（或自行加上 `--bet-parquet`）。若另有 `data/gmwds_t_session.parquet` 與 `data/canonical_mapping.cutoff.json`，預設會走 path B（dry-run 仍會解析 eligible 計畫）：
 
 ```bash
 python scripts/lda_l1_gate1_day_range_v1.py --dry-run --no-progress
@@ -207,6 +213,7 @@ python scripts/gate1_l1_determinism_v1.py --artifact run_fact \
 | raw 模式磁碟暴長 | 同一巨大 raw 檔按日重複 ingest 會每日一個 `snap_*` 全檔複本；改用小檔、按日 raw，或改用 `--bet-parquet`／`--l0-existing` |
 | Gate1 極慢或 OOM | 縮小 `--profiles-json`；物化輸出列數極大時 fingerprint 的 `string_agg` 亦重 |
 | Gate1 exit **3221226505**（Windows） | 多為 DuckDB 在有限 `memory_limit` 下對大輸入物化時**整個程序被系統結束**（非可捕捉 OOM）。預設 Gate1 只改 **`threads`**、不設 `memory_limit`；若仍崩潰請 `--verbose`，並避免對巨型 cleaned 傳極小 `--profiles-json` memory 步階 |
+| eligible build：`cutoff-filtered … exceeds --eligible-build-max-session-rows` | 預設 path B 應優先放 **`data/canonical_mapping.parquet`**；或預先依 cutoff 切片 `t_session` 匯出；僅調高 `--eligible-build-max-session-rows` 仍會在後續把整批載入 **pandas**，筆電易 OOM |
 
 ---
 

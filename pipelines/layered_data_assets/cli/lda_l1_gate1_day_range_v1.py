@@ -11,7 +11,12 @@ BET-DQ-03 rated allowlist from ``t_session`` via
 
 * **Default (no flag)** — if ``<repo>/data/gmwds_t_bet.parquet`` exists: same as ``--bet-parquet`` on that
   file with ``--source-snapshot-id snap_gmwds_t_bet_local`` (skip L0; preprocess filters each day).
-  Matches README local Parquet layout. If the file is missing, exit with a message to pass an explicit mode.
+  If ``data/canonical_mapping.parquet`` exists, defaults **path B** (BET-DQ-03) via
+  ``--canonical-mapping-parquet`` (avoids loading the full ``t_session`` export). Else if
+  ``data/gmwds_t_session.parquet`` exists, sets ``--raw-t-session-parquet`` and ``--cutoff-dtm`` from
+  ``data/canonical_mapping.cutoff.json`` when ``--cutoff-dtm`` was not passed (only the file prefix is
+  read for ``cutoff_dtm``). To run without rated filtering, omit or rename those companion files, or pass
+  ``--eligible-player-ids-parquet``. If the default bet file is missing, exit with a message to pass an explicit mode.
 * ``--raw-t-bet-parquet`` — run L0 ingest per day (same file repeated is disk-heavy; see epilog).
 * ``--bet-parquet`` — skip L0; requires ``--source-snapshot-id`` for L1 paths (override default snap id).
 * ``--l0-existing`` — discover ``snap_*`` under ``l0_layered`` that already has ``t_bet`` parts for
@@ -29,9 +34,17 @@ All L0/L1 paths use **``<repo>/data``** (same as other LDA CLIs); this orchestra
 accept ``--data-root`` so runs stay tied to the repo layout.
 
 **Resumable state (LDA-E1-09)**: optional DuckDB **``materialization_state``** via ``--state-store``,
-``--resume`` (skip succeeded steps when ``input_hash`` unchanged), ``--force`` (rerun all steps),
+``--resume`` (skip succeeded steps when ``input_hash`` unchanged), ``--force`` (rerun all steps;
+also **bypasses rated-eligible Parquet cache** under ``data/tmp_lda_gate1_day_range/eligible/``),
 and ``--stop-after-date`` (exit after one successful day). Default DB path when ``--resume``/``--force``
 omit ``--state-store``: ``data/l1_layered/materialization_state.duckdb``. See ``pipelines/layered_data_assets/docs/RUNBOOK.md`` §5.1.
+
+**BET-DQ-03 (rated allowlist)**: ``preprocess_bet_v1`` accepts a single-column ``player_id`` Parquet.
+Supply ``--eligible-player-ids-parquet``, or ``--canonical-mapping-parquet`` (trainer-style
+``player_id``/``canonical_id`` mapping; distinct ``player_id`` is materialized to the same layout),
+or auto-build from ``--raw-t-session-parquet`` + ``--cutoff-dtm`` (same logic as
+``trainer.identity.build_rated_eligible_player_ids_df``, i.e. derived from
+``build_canonical_mapping_from_df``) in **raw** or **``--bet-parquet``** mode.
 
 **Logging**: by default stderr shows a short banner, tqdm postfix (current ``gaming_day`` + phase), and one ``[LDA]`` line per subprocess with timing and a brief result summary (Gate1 JSON is not printed). Use ``--echo-commands`` for the previous verbose argv / live worker streams.
 
@@ -46,6 +59,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import textwrap
@@ -120,7 +134,21 @@ _GATE1_STATE_KIND: dict[str, str] = {
 
 # Canonical local export (README / trainer --use-local-parquet); used when no source CLI flag is set.
 _DEFAULT_LOCAL_T_BET_NAME = "gmwds_t_bet.parquet"
+_DEFAULT_LOCAL_T_SESSION_NAME = "gmwds_t_session.parquet"
+_DEFAULT_LOCAL_CANONICAL_MAPPING_NAME = "canonical_mapping.parquet"
+_DEFAULT_CANONICAL_MAPPING_CUTOFF_JSON = "canonical_mapping.cutoff.json"
 _DEFAULT_BET_PARQUET_SOURCE_SNAPSHOT_ID = "snap_gmwds_t_bet_local"
+
+
+def _read_cutoff_dtm_prefix_from_canonical_sidecar(path: Path, *, max_bytes: int = 65_536) -> str | None:
+    """Return ``cutoff_dtm`` string from trainer sidecar JSON without loading huge trailing arrays."""
+    try:
+        chunk = path.read_bytes()[:max_bytes]
+    except OSError:
+        return None
+    text = chunk.decode("utf-8", errors="replace")
+    m = re.search(r'"cutoff_dtm"\s*:\s*"([^"]+)"', text)
+    return m.group(1).strip() if m else None
 
 
 def apply_default_ingestion_registry_args(args: argparse.Namespace) -> None:
@@ -176,6 +204,46 @@ def apply_default_lda_source_args(args: argparse.Namespace, *, data_root: Path) 
     if not args.source_snapshot_id or not str(args.source_snapshot_id).strip():
         args.source_snapshot_id = _DEFAULT_BET_PARQUET_SOURCE_SNAPSHOT_ID
     args._lda_defaulted_local_t_bet = True  # noqa: SLF001 — orchestrator-only marker
+    _apply_default_gmwds_path_b_rated(args, data_root=data_root)
+
+
+def _apply_default_gmwds_path_b_rated(args: argparse.Namespace, *, data_root: Path) -> None:
+    """Wire path B when canonical default ``gmwds_t_bet`` is used and companion files exist."""
+    if not getattr(args, "_lda_defaulted_local_t_bet", False):
+        return
+    if getattr(args, "eligible_player_ids_parquet", None) is not None or getattr(
+        args, "canonical_mapping_parquet", None
+    ) is not None:
+        return
+    canon = (data_root / _DEFAULT_LOCAL_CANONICAL_MAPPING_NAME).resolve()
+    if canon.is_file():
+        args.canonical_mapping_parquet = canon
+        args._lda_defaulted_canonical_for_rated = True  # noqa: SLF001
+        return
+    sess = (data_root / _DEFAULT_LOCAL_T_SESSION_NAME).resolve()
+    if not sess.is_file():
+        return
+    if getattr(args, "raw_t_session_parquet", None) is None:
+        args.raw_t_session_parquet = sess
+        args._lda_defaulted_gmwds_session = True  # noqa: SLF001
+    if getattr(args, "cutoff_dtm", None) and str(args.cutoff_dtm).strip():
+        return
+    sidecar = (data_root / _DEFAULT_CANONICAL_MAPPING_CUTOFF_JSON).resolve()
+    if not sidecar.is_file():
+        raise ValueError(
+            "Default local LDA uses data/gmwds_t_session.parquet for BET-DQ-03 (bet-parquet path B). "
+            "Pass --cutoff-dtm, or place data/canonical_mapping.cutoff.json with top-level cutoff_dtm "
+            "(trainer sidecar), or pass --eligible-player-ids-parquet / --canonical-mapping-parquet. "
+            "To skip rated filtering, omit or rename data/gmwds_t_session.parquet."
+        )
+    cutoff_s = _read_cutoff_dtm_prefix_from_canonical_sidecar(sidecar)
+    if not cutoff_s:
+        raise ValueError(
+            f"Could not read cutoff_dtm near the start of {sidecar} "
+            "(expected a top-level string field cutoff_dtm)."
+        )
+    args.cutoff_dtm = cutoff_s
+    args._lda_defaulted_cutoff_from_sidecar = True  # noqa: SLF001
 
 
 class _DayRangeProgressBar:
@@ -236,7 +304,12 @@ def _print_run_banner(
         tag = ""
         if getattr(args, "_lda_defaulted_local_t_bet", False):
             tag = " [default gmwds_t_bet + snap_gmwds_t_bet_local]"
-        src = f"bet-parquet={args.bet_parquet} snap={args.source_snapshot_id}{tag}"
+        b_tag = ""
+        if getattr(args, "_lda_defaulted_canonical_for_rated", False):
+            b_tag = " [default rated path B: canonical_mapping.parquet]"
+        elif getattr(args, "_lda_defaulted_gmwds_session", False):
+            b_tag = " [default rated path B: gmwds_t_session + cutoff]"
+        src = f"bet-parquet={args.bet_parquet} snap={args.source_snapshot_id}{tag}{b_tag}"
     elif args.raw_t_bet_parquet is not None:
         extra = f" session={args.raw_t_session_parquet}" if args.raw_t_session_parquet else ""
         src = f"raw-t-bet-parquet={args.raw_t_bet_parquet}{extra}"
@@ -501,7 +574,10 @@ def _assert_eligible_session_row_budget(count: int, *, max_rows: int) -> None:
             f"cutoff-filtered t_session row count {count:,} exceeds "
             f"--eligible-build-max-session-rows={max_rows:,}; "
             "raise the limit, pre-slice the Parquet export, or run on a machine with enough RAM "
-            "only after explicit planning."
+            "only after explicit planning. "
+            "Note: the next step loads this full row set into pandas; prefer "
+            "--canonical-mapping-parquet (trainer data/canonical_mapping.parquet) when available "
+            "so eligible ids are materialized without scanning all session rows."
         )
 
 
@@ -530,6 +606,7 @@ def _build_rated_eligible_player_ids_parquet(
     duckdb_threads: int = 1,
     failure_context_path: Path | None = None,
     run_log_path: Path | None = None,
+    ignore_cache: bool = False,
 ) -> Path:
     """Build BET-DQ-03 rated eligible allowlist once per orchestrator run.
 
@@ -550,8 +627,15 @@ def _build_rated_eligible_player_ids_parquet(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"rated_eligible_{key}.parquet"
     if out_path.is_file():
-        _stderr_line(f"[LDA] rated eligible cache hit: {out_path}", emit=emit_stderr)
-        return out_path
+        if ignore_cache:
+            out_path.unlink(missing_ok=True)
+            _stderr_line(
+                f"[LDA] rated eligible cache bypass (--force): removed {out_path.name}, rebuilding",
+                emit=emit_stderr,
+            )
+        else:
+            _stderr_line(f"[LDA] rated eligible cache hit: {out_path}", emit=emit_stderr)
+            return out_path
 
     ctx_default = out_dir / "last_eligible_build_failure.json"
     diag_base: dict[str, object] = {
@@ -652,17 +736,125 @@ def _build_rated_eligible_player_ids_parquet(
         raise
 
 
+def _materialize_eligible_from_canonical_mapping_parquet(
+    *,
+    canonical_mapping_parquet: Path,
+    data_root: Path,
+    emit_stderr: Callable[[str], None] | None = None,
+    ignore_cache: bool = False,
+) -> Path:
+    """Materialize single-column ``player_id`` allowlist from a trainer-style mapping Parquet.
+
+    ``build_rated_eligible_player_ids_df`` is defined as ``mapping['player_id'].drop_duplicates()`` after
+    ``build_canonical_mapping_from_df``; reusing an on-disk ``canonical_mapping.parquet`` with the same
+    cutoff baked in avoids a second full ``t_session`` scan when the artifact already exists.
+    """
+    src = canonical_mapping_parquet.resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"canonical-mapping parquet not found: {src}")
+    st = src.stat()
+    key_raw = (
+        f"{src.as_posix()}|{int(st.st_size)}|{int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9)))}"
+    )
+    key = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()[:16]
+    out_dir = (data_root / "tmp_lda_gate1_day_range" / "eligible").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"rated_eligible_from_canonical_{key}.parquet"
+    if out_path.is_file():
+        if ignore_cache:
+            out_path.unlink(missing_ok=True)
+            _stderr_line(
+                f"[LDA] canonical eligible cache bypass (--force): removed {out_path.name}, rebuilding",
+                emit=emit_stderr,
+            )
+        else:
+            _stderr_line(f"[LDA] canonical eligible cache hit: {out_path}", emit=emit_stderr)
+            return out_path
+
+    try:
+        import duckdb
+    except ImportError as exc:
+        raise RuntimeError(
+            "duckdb is required to materialize eligible ids from --canonical-mapping-parquet."
+        ) from exc
+
+    _stderr_line(f"[LDA] materialize BET-DQ-03 eligible from canonical mapping {src.name}", emit=emit_stderr)
+    t0 = time.monotonic()
+    src_sql = str(src.resolve().as_posix()).replace("'", "''")
+    out_sql = str(out_path.resolve().as_posix()).replace("'", "''")
+    con = duckdb.connect()
+    try:
+        # DuckDB COPY … TO does not reliably accept a bound parameter for the destination path on all
+        # platforms; paths are local operator-controlled Parquet files (not user SQL text).
+        con.execute(
+            f"""
+            COPY (
+                SELECT DISTINCT CAST(player_id AS BIGINT) AS player_id
+                FROM read_parquet('{src_sql}')
+                WHERE player_id IS NOT NULL
+            ) TO '{out_sql}' (FORMAT PARQUET)
+            """
+        )
+    finally:
+        con.close()
+    dt = time.monotonic() - t0
+    _stderr_line(
+        f"[LDA] canonical eligible wrote -> {out_path} ({dt:.1f}s)",
+        emit=emit_stderr,
+    )
+    return out_path
+
+
+def _build_canonical_mapping_parquet_via_trainer(
+    *,
+    raw_t_session_parquet: Path,
+    cutoff_dtm: datetime,
+    canonical_mapping_parquet: Path,
+    sidecar_json: Path,
+    emit_stderr: Callable[[str], None] | None = None,
+) -> Path:
+    """Build canonical mapping with trainer logic and persist mapping + cutoff sidecar."""
+    from trainer.identity import build_canonical_mapping_from_links
+    from trainer.training.trainer import build_canonical_links_and_dummy_from_duckdb
+
+    src = raw_t_session_parquet.resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"raw_t_session parquet not found: {src}")
+    out = canonical_mapping_parquet.resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    side = sidecar_json.resolve()
+    side.parent.mkdir(parents=True, exist_ok=True)
+    _stderr_line(
+        f"[LDA] canonical mapping missing; build via trainer from {src.name} (cutoff={cutoff_dtm.isoformat()})",
+        emit=emit_stderr,
+    )
+    t0 = time.monotonic()
+    links_df, dummy_pids = build_canonical_links_and_dummy_from_duckdb(src, cutoff_dtm)
+    mapping_df = build_canonical_mapping_from_links(links_df, dummy_pids)
+    mapping_df.to_parquet(out, index=False)
+    with open(side, "w", encoding="utf-8") as f:
+        json.dump({"cutoff_dtm": cutoff_dtm.isoformat(), "dummy_player_ids": list(dummy_pids)}, f, indent=0)
+    _stderr_line(
+        f"[LDA] canonical mapping wrote {len(mapping_df):,} row(s) -> {out} ({time.monotonic() - t0:.1f}s)",
+        emit=emit_stderr,
+    )
+    return out
+
+
 def _resolve_eligible_player_ids_parquet(
     *,
     args: argparse.Namespace,
     data_root: Path,
     dry_run: bool,
+    force: bool = False,
     emit_stderr: Callable[[str], None] | None = None,
 ) -> Path | None:
     """Resolve BET-DQ-03 allowlist path for preprocess.
 
-    - If ``--eligible-player-ids-parquet`` is provided, requires that file to exist.
-    - In raw mode, auto-build from ``--raw-t-session-parquet`` + ``--cutoff-dtm`` when no explicit file.
+    Precedence: explicit ``--eligible-player-ids-parquet``, then ``--canonical-mapping-parquet``,
+    then auto-build from ``--raw-t-session-parquet`` + ``--cutoff-dtm`` (``--raw-t-bet-parquet`` or
+    ``--bet-parquet`` mode). When ``force`` is True, disk cache under ``eligible/`` is bypassed for
+    auto-built paths.
     """
     explicit = getattr(args, "eligible_player_ids_parquet", None)
     if explicit is not None:
@@ -671,38 +863,69 @@ def _resolve_eligible_player_ids_parquet(
             raise FileNotFoundError(f"eligible-player-ids parquet not found: {ep}")
         return ep
 
-    if getattr(args, "raw_t_bet_parquet", None) is None:
-        return None
-    if getattr(args, "raw_t_session_parquet", None) is None:
-        return None
     cutoff_raw = getattr(args, "cutoff_dtm", None)
-    if cutoff_raw is None or not str(cutoff_raw).strip():
+    has_cutoff = bool(cutoff_raw is not None and str(cutoff_raw).strip())
+    cutoff = _parse_cutoff_dtm(str(cutoff_raw)) if has_cutoff else None
+    raw_sess = getattr(args, "raw_t_session_parquet", None)
+    has_sess = raw_sess is not None
+
+    cm = getattr(args, "canonical_mapping_parquet", None)
+    if cm is not None:
+        cm_p = Path(cm).resolve()
+        if not cm_p.is_file():
+            if dry_run:
+                _stderr_line(
+                    f"[LDA] dry-run: would build missing canonical mapping via trainer -> {cm_p}",
+                    emit=emit_stderr,
+                )
+                return None
+            if not has_sess or cutoff is None:
+                raise FileNotFoundError(f"canonical-mapping parquet not found: {cm_p}")
+            cm_p = _build_canonical_mapping_parquet_via_trainer(
+                raw_t_session_parquet=Path(raw_sess),
+                cutoff_dtm=cutoff,
+                canonical_mapping_parquet=cm_p,
+                sidecar_json=(data_root / _DEFAULT_CANONICAL_MAPPING_CUTOFF_JSON),
+                emit_stderr=emit_stderr,
+            )
+        if dry_run:
+            _stderr_line(
+                "[LDA] dry-run: would materialize BET-DQ-03 eligible from --canonical-mapping-parquet",
+                emit=emit_stderr,
+            )
+            return None
+        return _materialize_eligible_from_canonical_mapping_parquet(
+            canonical_mapping_parquet=cm_p,
+            data_root=data_root,
+            emit_stderr=emit_stderr,
+            ignore_cache=bool(force),
+        )
+
+    has_bet_source = getattr(args, "raw_t_bet_parquet", None) is not None or getattr(
+        args, "bet_parquet", None
+    ) is not None
+    if not has_bet_source or not has_sess or cutoff is None:
         return None
-    cutoff = _parse_cutoff_dtm(str(cutoff_raw))
+    default_cm = (data_root / _DEFAULT_LOCAL_CANONICAL_MAPPING_NAME).resolve()
     if dry_run:
         _stderr_line(
-            "[LDA] dry-run: would build BET-DQ-03 eligible-player-ids from --raw-t-session-parquet",
+            "[LDA] dry-run: would ensure canonical mapping via trainer then materialize BET-DQ-03 eligible",
             emit=emit_stderr,
         )
         return None
-    return _build_rated_eligible_player_ids_parquet(
-        raw_t_session_parquet=Path(args.raw_t_session_parquet),
-        cutoff_dtm=cutoff,
+    if not default_cm.is_file():
+        default_cm = _build_canonical_mapping_parquet_via_trainer(
+            raw_t_session_parquet=Path(raw_sess),
+            cutoff_dtm=cutoff,
+            canonical_mapping_parquet=default_cm,
+            sidecar_json=(data_root / _DEFAULT_CANONICAL_MAPPING_CUTOFF_JSON),
+            emit_stderr=emit_stderr,
+        )
+    return _materialize_eligible_from_canonical_mapping_parquet(
+        canonical_mapping_parquet=default_cm,
         data_root=data_root,
         emit_stderr=emit_stderr,
-        max_session_rows=int(getattr(args, "eligible_build_max_session_rows", 5_000_000)),
-        duckdb_memory_limit_mb=getattr(args, "eligible_build_duckdb_memory_limit_mb", None),
-        duckdb_threads=int(getattr(args, "eligible_build_duckdb_threads", 1)),
-        failure_context_path=(
-            Path(args.eligible_build_failure_context).resolve()
-            if getattr(args, "eligible_build_failure_context", None) is not None
-            else None
-        ),
-        run_log_path=(
-            Path(args.eligible_build_run_log).resolve()
-            if getattr(args, "eligible_build_run_log", None) is not None
-            else None
-        ),
+        ignore_cache=bool(force),
     )
 
 
@@ -1132,7 +1355,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
               python scripts/lda_l1_gate1_day_range_v1.py --date-from 2026-01-01 \\
                 --date-to 2026-01-01 --l0-existing --verbose
 
-            Dates only (requires data/gmwds_t_bet.parquet; same as trainer local export):
+            Dates only (requires data/gmwds_t_bet.parquet; same as trainer local export). Default
+            path B (BET-DQ-03) prefers data/canonical_mapping.parquet; else gmwds_t_session +
+            canonical_mapping.cutoff.json or --cutoff-dtm.
 
               python scripts/lda_l1_gate1_day_range_v1.py --date-from 2026-01-01 --date-to 2026-01-02
 
@@ -1180,8 +1405,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Raw t_session Parquet for raw mode: l0_ingest per day after t_bet, and (with --cutoff-dtm) "
-            "auto-build BET-DQ-03 eligible-player-ids via trainer.identity"
+            "t_session Parquet: in raw mode, l0_ingest per day after t_bet; with --cutoff-dtm (and "
+            "--raw-t-bet-parquet or --bet-parquet) auto-build BET-DQ-03 eligible-player-ids via "
+            "trainer.identity"
         ),
     )
     p.add_argument(
@@ -1191,12 +1417,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional explicit BET-DQ-03 allowlist parquet (single player_id column) forwarded to preprocess",
     )
     p.add_argument(
+        "--canonical-mapping-parquet",
+        type=Path,
+        default=None,
+        help=(
+            "Trainer-style canonical mapping Parquet (columns include player_id); distinct player_id "
+            "is materialized under data/tmp_lda_gate1_day_range/eligible/ for preprocess (same rated "
+            "set as build_rated_eligible_player_ids_df when mapping was built with the intended cutoff)"
+        ),
+    )
+    p.add_argument(
         "--cutoff-dtm",
         type=str,
         default=None,
         metavar="ISO_DATETIME",
         help=(
-            "Required for raw-mode auto-build from --raw-t-session-parquet. "
+            "Cutoff for auto-build from --raw-t-session-parquet (raw or --bet-parquet mode). "
             "ISO-8601, e.g. 2026-01-31T23:59:59+08:00"
         ),
     )
@@ -1300,7 +1536,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--force",
         action="store_true",
-        help="Ignore succeeded rows and rerun all steps in the date range (updates state DB)",
+        help=(
+            "Ignore succeeded rows and rerun all steps in the date range (updates state DB); "
+            "also bypasses rated-eligible Parquet cache under data/tmp_lda_gate1_day_range/eligible/"
+        ),
     )
     p.add_argument(
         "--stop-after-date",
@@ -1359,21 +1598,45 @@ def _validate_mode(args: argparse.Namespace) -> int | None:
             file=sys.stderr,
         )
         return 2
-    if args.raw_t_session_parquet is not None and args.raw_t_bet_parquet is None:
-        print("--raw-t-session-parquet requires --raw-t-bet-parquet", file=sys.stderr)
-        return 2
-    if args.raw_t_bet_parquet is not None:
-        has_explicit_eligible = args.eligible_player_ids_parquet is not None
-        has_raw_session = args.raw_t_session_parquet is not None
-        has_cutoff = bool(getattr(args, "cutoff_dtm", None) and str(args.cutoff_dtm).strip())
-        if not has_explicit_eligible and not has_raw_session:
+    if args.raw_t_session_parquet is not None:
+        if args.raw_t_bet_parquet is None and args.bet_parquet is None:
             print(
-                "raw mode requires BET-DQ-03 allowlist: pass --eligible-player-ids-parquet "
-                "or --raw-t-session-parquet with --cutoff-dtm",
+                "--raw-t-session-parquet requires --raw-t-bet-parquet or --bet-parquet",
                 file=sys.stderr,
             )
             return 2
-        if has_raw_session and not has_explicit_eligible and not has_cutoff:
+    if args.bet_parquet is not None and args.raw_t_session_parquet is not None:
+        has_explicit_eligible = args.eligible_player_ids_parquet is not None
+        has_canonical = getattr(args, "canonical_mapping_parquet", None) is not None
+        has_cutoff = bool(getattr(args, "cutoff_dtm", None) and str(args.cutoff_dtm).strip())
+        if not has_explicit_eligible and not has_canonical and not has_cutoff:
+            print(
+                "With --bet-parquet and --raw-t-session-parquet, pass --cutoff-dtm for rated eligible "
+                "auto-build, or --eligible-player-ids-parquet, or --canonical-mapping-parquet",
+                file=sys.stderr,
+            )
+            return 2
+    if (
+        getattr(args, "canonical_mapping_parquet", None) is not None
+        and args.eligible_player_ids_parquet is None
+    ):
+        cm = Path(args.canonical_mapping_parquet).resolve()
+        if not cm.is_file():
+            print(f"--canonical-mapping-parquet not found: {cm}", file=sys.stderr)
+            return 2
+    if args.raw_t_bet_parquet is not None:
+        has_explicit_eligible = args.eligible_player_ids_parquet is not None
+        has_canonical = getattr(args, "canonical_mapping_parquet", None) is not None
+        has_raw_session = args.raw_t_session_parquet is not None
+        has_cutoff = bool(getattr(args, "cutoff_dtm", None) and str(args.cutoff_dtm).strip())
+        if not has_explicit_eligible and not has_canonical and not has_raw_session:
+            print(
+                "raw mode requires BET-DQ-03 allowlist: pass --eligible-player-ids-parquet, "
+                "--canonical-mapping-parquet, or --raw-t-session-parquet with --cutoff-dtm",
+                file=sys.stderr,
+            )
+            return 2
+        if has_raw_session and not has_explicit_eligible and not has_canonical and not has_cutoff:
             print("--cutoff-dtm is required with --raw-t-session-parquet in raw mode", file=sys.stderr)
             return 2
     if getattr(args, "cutoff_dtm", None) and str(args.cutoff_dtm).strip():
@@ -1440,6 +1703,7 @@ def main(argv: list[str] | None = None) -> int:
             args=args,
             data_root=data_root,
             dry_run=bool(args.dry_run),
+            force=bool(args.force),
         )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
