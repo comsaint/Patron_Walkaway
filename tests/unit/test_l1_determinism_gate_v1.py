@@ -77,6 +77,44 @@ def test_gate1_run_bet_map_stable_across_duckdb_profiles(tmp_path: Path) -> None
     )
     assert rep["all_row_counts_match"] is True
     assert rep["all_row_fingerprints_match"] is True
+    assert rep["all_row_fingerprint_row_counts_match_stats"] is True
+
+
+@pytest.mark.skipif(duckdb is None, reason="duckdb not installed")
+def test_gate1_verbose_emit_lines(tmp_path: Path) -> None:
+    inp = tmp_path / "in.parquet"
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute(
+            f"""
+            COPY (SELECT * FROM (VALUES
+              (1::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:00:00',
+               TIMESTAMP '2026-01-15 11:00:00'),
+              (2::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:15:00',
+               TIMESTAMP '2026-01-15 11:05:00')
+            ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
+            ) TO '{inp.as_posix()}' (FORMAT PARQUET)
+            """
+        )
+    finally:
+        con.close()
+    lines: list[str] = []
+    rep = gate1_l1_report_across_duckdb_profiles(
+        duckdb_module=duckdb,
+        artifact="run_fact",
+        input_paths=[inp],
+        output_dir=tmp_path / "gate_emit",
+        profiles=[(None, 2), (256, 2)],
+        run_end_gaming_day="2026-01-15",
+        run_break_min=30,
+        emit=lines.append,
+        show_progress=False,
+    )
+    assert rep["all_row_counts_match"] is True
+    joined = "\n".join(lines)
+    assert "materialize run_fact start" in joined
+    assert "fingerprint done" in joined
+    assert "[gate1] summary" in joined
 
 
 @pytest.mark.skipif(duckdb is None, reason="duckdb not installed")

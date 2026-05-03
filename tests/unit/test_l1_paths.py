@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from layered_data_assets.l1_paths import (
+    l1_bet_cleaned_parquet_path,
     l1_bet_partition_dir,
     l1_layered_root,
     l1_run_bet_map_partition_dir,
@@ -26,6 +27,12 @@ def test_l1_snapshot_root() -> None:
 def test_l1_bet_partition_dir() -> None:
     p = l1_bet_partition_dir(Path("data"), "snap_abcdefgh", "2026-04-01")
     assert p == Path("data") / "l1_layered" / "snap_abcdefgh" / "t_bet" / "gaming_day=2026-04-01"
+
+
+def test_l1_bet_cleaned_parquet_path() -> None:
+    p = l1_bet_cleaned_parquet_path(Path("data"), "snap_abcdefgh", "2026-04-01")
+    assert p.name == "cleaned.parquet"
+    assert p.parent.name == "gaming_day=2026-04-01"
 
 
 def test_l1_bet_partition_dir_rejects_bad_gaming_day() -> None:

@@ -2,6 +2,9 @@
 """Gate 1 L1 determinism check (LDA-E1-08): same inputs under multiple DuckDB resource profiles.
 
 Exits 0 when row counts and row-level fingerprints match across profiles; prints JSON report to stdout.
+Use ``--verbose`` for stderr phase logs and a tqdm bar over profiles. For laptop testing, prefer
+``--data-root`` + ``--l1-source-snapshot-id`` + ``--l1-preprocess-gaming-day`` (single preprocess
+partition ``cleaned.parquet``) instead of pointing ``--input`` at a multi-day / huge raw file.
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ from layered_data_assets.l1_determinism_gate_v1 import (  # noqa: E402
     gate1_l1_report_across_duckdb_profiles,
     gate1_report_to_json,
 )
+from layered_data_assets.l1_paths import l1_bet_cleaned_parquet_path  # noqa: E402
 
 
 def _profiles_from_json_arg(raw: str) -> list[tuple[int | None, int]]:
@@ -64,8 +68,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="inputs",
         action="append",
         type=Path,
-        required=True,
-        help="Cleaned bet Parquet path (repeatable)",
+        default=None,
+        help="Cleaned bet Parquet path (repeatable). Mutually exclusive with L1 preprocess triplet.",
+    )
+    p.add_argument(
+        "--data-root",
+        type=Path,
+        default=None,
+        help="With --l1-source-snapshot-id and --l1-preprocess-gaming-day: resolve preprocess cleaned.parquet",
+    )
+    p.add_argument(
+        "--l1-source-snapshot-id",
+        default=None,
+        metavar="SNAP_ID",
+        help="L1 batch id under <data-root>/l1_layered/<id>/t_bet/gaming_day=.../cleaned.parquet",
+    )
+    p.add_argument(
+        "--l1-preprocess-gaming-day",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Hive partition value for preprocess ``t_bet`` (same as cleaned.parquet parent folder)",
     )
     p.add_argument("--output-dir", type=Path, required=True, help="Directory for per-profile Parquet outputs")
     p.add_argument(
@@ -88,7 +110,45 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Omit to use built-in Gate 1 defaults (includes low-memory steps)."
         ),
     )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="stderr phase logs; tqdm bar over profiles unless --no-progress",
+    )
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="With --verbose, skip tqdm (logs only)",
+    )
     return p.parse_args(argv)
+
+
+def _resolve_input_paths(args: argparse.Namespace) -> list[Path]:
+    """Return cleaned-bet input paths from ``--input`` or L1 single preprocess partition."""
+    ins = list(args.inputs) if args.inputs else []
+    l1_parts = (args.data_root, args.l1_source_snapshot_id, args.l1_preprocess_gaming_day)
+    any_l1 = any(x is not None for x in l1_parts)
+    if any_l1 and not all(x is not None for x in l1_parts):
+        raise ValueError(
+            "When using L1 preprocess mode, pass all of: --data-root, "
+            "--l1-source-snapshot-id, --l1-preprocess-gaming-day"
+        )
+    if any_l1 and ins:
+        raise ValueError("Do not combine --input with L1 preprocess triplet.")
+    if any_l1:
+        clean = l1_bet_cleaned_parquet_path(
+            args.data_root,
+            args.l1_source_snapshot_id.strip(),
+            args.l1_preprocess_gaming_day.strip(),
+        )
+        if not clean.is_file():
+            raise ValueError(f"L1 preprocess cleaned.parquet not found: {clean}")
+        return [clean.resolve()]
+    if not ins:
+        raise ValueError(
+            "Provide --input path(s) or (--data-root + --l1-source-snapshot-id + --l1-preprocess-gaming-day)."
+        )
+    return [p.resolve() for p in ins]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,21 +167,32 @@ def main(argv: list[str] | None = None) -> int:
         print("--bet-gaming-day is required for run_day_bridge.", file=sys.stderr)
         return 2
 
+    try:
+        input_paths = _resolve_input_paths(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     profiles = (
         _profiles_from_json_arg(args.profiles_json)
-        if args.profiles_json is not None
+        if args.profiles_json
         else GATE1_DEFAULT_DUCKDB_PROFILES
     )
+
+    emit = (lambda m: print(m, file=sys.stderr, flush=True)) if args.verbose else None
+    show_progress = bool(args.verbose) and not args.no_progress
 
     rep = gate1_l1_report_across_duckdb_profiles(
         duckdb_module=duckdb,
         artifact=args.artifact,
-        input_paths=[p.resolve() for p in args.inputs],
+        input_paths=input_paths,
         output_dir=args.output_dir.resolve(),
         profiles=profiles,
         run_end_gaming_day=args.run_end_gaming_day,
         bet_gaming_day=args.bet_gaming_day,
         run_break_min=args.run_break_min,
+        emit=emit,
+        show_progress=show_progress,
     )
     sys.stdout.write(gate1_report_to_json(rep))
     ok = bool(rep["all_row_counts_match"] and rep["all_row_fingerprints_match"] and rep["all_row_fingerprint_row_counts_match_stats"])

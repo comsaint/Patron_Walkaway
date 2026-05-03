@@ -29,6 +29,11 @@ def l1_bet_partition_dir(data_root: Path, snapshot_id: str, gaming_day: str) -> 
     return root / "t_bet" / f"gaming_day={gaming_day.strip()}"
 
 
+def l1_bet_cleaned_parquet_path(data_root: Path, snapshot_id: str, gaming_day: str) -> Path:
+    """Return ``cleaned.parquet`` for one L1 preprocess partition (``preprocess_bet_v1`` output)."""
+    return l1_bet_partition_dir(data_root, snapshot_id, gaming_day) / "cleaned.parquet"
+
+
 def l1_run_bet_map_partition_dir(data_root: Path, snapshot_id: str, run_end_gaming_day: str) -> Path:
     """Return directory for ``run_bet_map`` Hive partition (``run_end_gaming_day=...``)."""
     if not isinstance(run_end_gaming_day, str) or not run_end_gaming_day.strip():
