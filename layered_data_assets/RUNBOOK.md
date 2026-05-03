@@ -118,6 +118,7 @@ python scripts/lda_l1_gate1_day_range_v1.py --date-from 2026-01-01 --date-to 202
 - **`--force`**：忽略 `succeeded`，一律重跑日期區間內各步（仍寫回 state）。若同時傳 `--resume`，以 **`--force` 為準**。
 - **僅 `--resume` 或 `--force` 而未給 `--state-store`**：使用預設檔 **`data/l1_layered/materialization_state.duckdb`**（倉庫根下之 `data/`）。
 - **`--stop-after-date YYYY-MM-DD`**：必須落在 `--date-from`…`--date-to` 內；該曆日整條管線（含三個 Gate1）**成功結束後**即結束程式，後續日期不跑（方便中斷演練）。
+- **G7（LDA-E1-10）**：`python -m pytest tests/integration/test_lda_e1_10_resume_g7_v1.py -q`（一條龍 vs `stop-after-date`+`--resume` 產物指紋一致；已含於 **`make check-lda-l0`**）。
 - **原子寫**：各 `preprocess`／`materialize`／Gate1 子程序維持既有寫檔行為；編排層在子程序 **exit 0** 後才標 `succeeded`（中斷時不應出現「state 成功但檔案未寫完」之組合，除非子程序誤報成功——與 SSOT 契約一致時應由子程序修正）。
 
 **範例（記錄 state，翌日續跑 skip）**：

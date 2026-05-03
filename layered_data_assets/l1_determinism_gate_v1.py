@@ -72,6 +72,43 @@ def parquet_path_sql_literal(path: Path) -> str:
     return str(path.resolve()).replace("'", "''")
 
 
+def cleaned_bet_parquet_row_fingerprint(con: Any, parquet_path: Path) -> tuple[int, str]:
+    """Return ``(row_count, sha256_hex_varchar)`` for L1 ``cleaned.parquet`` (preprocess).
+
+    Rows are ordered by ``payout_complete_dtm ASC NULLS LAST, bet_id ASC`` (SSOT / ``preprocess_bet_v1`` output).
+    Uses common ``t_bet`` columns after preprocess; optional ``__etl_insert_Dtm_synthetic`` is included when
+    present (DESCRIBE-driven branch not used—callers must match column layout).
+    """
+    p = parquet_path_sql_literal(parquet_path)
+    sql = f"""
+SELECT
+  COUNT(*)::BIGINT,
+  CAST(sha256(COALESCE(string_agg(row_line, chr(2) ORDER BY payout_complete_dtm NULLS LAST, bet_id), '')) AS VARCHAR)
+FROM (
+  SELECT
+    concat_ws(
+      chr(1),
+      CAST(bet_id AS VARCHAR),
+      CAST(player_id AS VARCHAR),
+      CAST(gaming_day AS VARCHAR),
+      strftime(TRY_CAST(payout_complete_dtm AS TIMESTAMP), '%Y-%m-%dT%H:%M:%S.%f'),
+      strftime(TRY_CAST(__etl_insert_Dtm AS TIMESTAMP), '%Y-%m-%dT%H:%M:%S.%f'),
+      CAST(TRY_CAST(is_deleted AS INTEGER) AS VARCHAR),
+      CAST(TRY_CAST(is_canceled AS INTEGER) AS VARCHAR),
+      CAST(TRY_CAST(is_manual AS INTEGER) AS VARCHAR)
+    ) AS row_line,
+    TRY_CAST(payout_complete_dtm AS TIMESTAMP) AS payout_complete_dtm,
+    bet_id
+  FROM read_parquet('{p}')
+) t
+"""
+    row = con.execute(sql).fetchone()
+    if row is None:
+        raise RuntimeError("cleaned bet fingerprint query returned no row")
+    n, h = row
+    return int(n) if n is not None else 0, str(h) if h is not None else EMPTY_ROW_AGG_SHA256_HEX
+
+
 def run_fact_parquet_row_fingerprint(con: Any, parquet_path: Path) -> tuple[int, str]:
     """Return ``(row_count, hex(sha256(sorted_row_canonical_concat)))`` for ``run_fact`` Parquet."""
     p = parquet_path_sql_literal(parquet_path)
