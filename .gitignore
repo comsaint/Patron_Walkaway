@@ -240,3 +240,6 @@ data/l0_layered
 data/l1_layered
 data/l2_layered
 data/backup*
+# Generated / local-only under data/ (do not commit).
+data/player_profile.schema_hash
+data/tmp_lda_gate1_day_range/
