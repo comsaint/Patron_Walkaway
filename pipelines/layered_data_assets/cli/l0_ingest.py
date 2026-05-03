@@ -14,9 +14,6 @@ from pathlib import Path
 from typing import Any
 
 from .repo_root import discover_repo_root
-
-_REPO_ROOT = discover_repo_root()
-
 from ..io.l0_fingerprint import (
     INGEST_RECIPE_VERSION_DEFAULT,
     build_fingerprint_document,
@@ -27,8 +24,17 @@ from ..io.l0_fingerprint import (
 from ..io.l0_paths import l0_partition_dir, validate_source_snapshot_id
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse CLI arguments for ``materialize`` (L0 layout + fingerprint file)."""
+def _parse_args(
+    argv: list[str] | None = None,
+    *,
+    default_anchor_path: Path | None = None,
+) -> argparse.Namespace:
+    """Parse CLI arguments for ``materialize`` (L0 layout + fingerprint file).
+
+    If ``default_anchor_path`` is ``None``, the default for ``--anchor-path`` is
+    ``discover_repo_root()`` computed here (not at module import).
+    """
+    anchor_default = default_anchor_path if default_anchor_path is not None else discover_repo_root()
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument(
         "--data-root",
@@ -39,7 +45,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--anchor-path",
         type=Path,
-        default=_REPO_ROOT,
+        default=anchor_default,
         help="All --source files must resolve under this directory; fingerprint stores paths relative to it only (default: repo root)",
     )
     p.add_argument("--table", required=True, help="Table directory name, e.g. t_bet")
@@ -175,9 +181,15 @@ def _write_l0_materialization(
     return 0
 
 
-def materialize(argv: list[str] | None = None) -> int:
-    """Compute fingerprint, derive id, write ``snapshot_fingerprint.json``, copy sources."""
-    args = _parse_args(argv)
+def materialize(argv: list[str] | None = None, *, default_anchor_path: Path | None = None) -> int:
+    """Compute fingerprint, derive id, write ``snapshot_fingerprint.json``, copy sources.
+
+    Args:
+        argv: CLI tokens (``None`` → sys.argv).
+        default_anchor_path: When ``--anchor-path`` is omitted, use this path; if also ``None``,
+            resolve via ``discover_repo_root()`` at invocation time (not at import).
+    """
+    args = _parse_args(argv, default_anchor_path=default_anchor_path)
     sources, doc, canonical, derived_id = _build_ingest_fingerprint(args)
     snapshot_id, err = _validate_cli_snapshot_id(
         args.snapshot_id,
