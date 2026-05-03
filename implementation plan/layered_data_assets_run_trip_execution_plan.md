@@ -116,34 +116,49 @@
 | ✅ | **LDA-E1-06** | Manifest writer：每批次 `manifest.json` + ingestion 摘要（預演） | Data Platform + ML Platform | E0-03, E1-02 | `layered_data_assets/ingestion_delay_summary_v1.py`、`manifest_lineage_v1.py`；`scripts/preprocess_bet_v1.py` 與 `scripts/materialize_run_*_v1.py` 寫入／合併；`scripts/manifest_lineage_preview_v1.py` 後補 | `make check-lda-l0` 含新單元測試；manifest 仍通過 schema；`source_hashes` 與 fingerprint 銜接見 `doc/l0_ingest_governance_decisions.md` |
 | ✅ | **LDA-E1-07** | OOM runner：實作 §7.1（估算、監控、階梯重試、fail-fast、run log） | Data Platform | implementation plan §7.1 | `layered_data_assets/oom_runner_v1.py`；CLI 旗標見 preprocess／`materialize_run_*_v1`；`schema/examples/oom_run_log.example.jsonl`、`oom_failure_context.example.json` | `make check-lda-l0` 含 `test_oom_runner_v1`；mock OOM 重試成功、非 OOM fail-fast；執行參數僅影響資源路徑（G6） |
 | ✅ | **LDA-E1-08** | Gate 1 自動化：同 snapshot 多組執行參數 + row hash | ML Platform | E1-03–E1-07 | `layered_data_assets/l1_determinism_gate_v1.py`、`scripts/gate1_l1_determinism_v1.py`、`tests/unit/test_l1_determinism_gate_v1.py` | `make check-lda-l0`：三部 L1 產物在多組 DuckDB 資源設定下列數與 row fingerprint 一致；CLI 可寫 JSON 報告（exit 0/1） |
-| ⬜ | **LDA-E1-11** | Preprocess 升級：接入 `schema/preprocess_bet_ingestion_fix_registry.yaml`，實作 `observed_at_logical`（`t_bet` **`ingest_delay_cap_sec=122`**）、manifest `ingestion_fix_*`／`applied_fix_rules`；`ingestion_delay_summary` 改以 synthetic observed 計算（見 SSOT §4.4 **LDA-014**） | Data Platform | E1-02, E1-06, SSOT v1.5 | 更新 `layered_data_assets/preprocess_bet_v1.py`、`scripts/preprocess_bet_v1.py`、單元測試 | **不變**：`PARTITION BY bet_id`；輸出主序仍 `payout_complete_dtm, bet_id`；run 物化語義不因本項漂移；Gate 1 仍通過 |
-| ⬜ | **LDA-E1-09** | 日粒度 resumable 編排：state store + 原子寫入 + `--resume`/`--force` | Data Platform | E1-02–E1-06 | `materialization_state`（SQLite/DuckDB/JSONL）schema、runner/CLI、tmp→rename 原子寫入流程文件 | 中斷後重跑可從未完成 `gaming_day` 續跑；已成功分區預設跳過；`--force` 可顯式重算 |
-| ⬜ | **LDA-E1-10** | Resume Gate 自動化：中斷/續跑一致性測試 | ML Platform | E1-09 | 測試腳本與 CI job（kill-and-resume scenario） | 「一次跑完」與「中斷後續跑」輸出 hash/row_count 一致（G7） |
+| ⬜ | **LDA-E1-09** | 日粒度 resumable 編排：state store + 原子寫入 + `--resume`/`--force` | Data Platform | E1-02–E1-06 | `materialization_state`（SQLite/DuckDB/JSONL）schema、runner/CLI、tmp→rename 原子寫入流程文件 | 中斷後重跑可從未完成 `gaming_day` 續跑；已成功分區預設跳過；`--force` 可顯式重算；**與 E1-11 可並行**（不同檔案樹） |
+| ⬜ | **LDA-E1-10** | Resume Gate 自動化：中斷/續跑一致性測試 | ML Platform | E1-09 | 測試腳本與 CI job（kill-and-resume scenario） | 「一次跑完」與「中斷後續跑」輸出 hash/row_count 一致（G7）；覆蓋 preprocess + 三物化 +（可選）Gate1 |
+| ⬜ | **LDA-E1-11** | Preprocess 升級：接入 `schema/preprocess_bet_ingestion_fix_registry.yaml`，實作 `observed_at_logical`（`t_bet` **`ingest_delay_cap_sec=122`**）、manifest `ingestion_fix_*`／`applied_fix_rules`；`ingestion_delay_summary` 改以 synthetic observed 計算（見 SSOT §4.4 **LDA-014**） | Data Platform | E1-02, E1-06, SSOT v1.5 | 更新 `layered_data_assets/preprocess_bet_v1.py`、`scripts/preprocess_bet_v1.py`、單元測試、`schema/examples/manifest_preprocess_bet_l1_example.json`（若欄位擴充） | **不變**：`PARTITION BY bet_id`；輸出主序仍 `payout_complete_dtm, bet_id`；dedup `ORDER BY` 使用 `__etl_insert_Dtm_synthetic`（或等價）以反映 cap；run 物化語義不因本項漂移；**E1-08 Gate 1 仍通過**；**與 E1-09 可並行** |
 
 **Phase 1 完成條件**：E1-01–E1-08 皆 **✅**；**不**要求 `trip_fact` 最終語義。  
 **Phase 1 延伸（建議與下一版 preprocess 併行驗收）**：**LDA-E1-11** 完成後，將 ingest P95 cap 與 manifest 留痕納入例行 smoke／PR checklist（仍不阻塞 E1-01–E1-08 之已達標敘述）。  
-**Phase 1R（resumable 擴充）完成條件**：E1-09、E1-10 皆 **✅** 且 G7 通過。
+**Phase 1R（resumable 擴充）完成條件**：E1-09、E1-10 皆 **✅** 且 G7 通過。  
+**E1-11（ingest cap）驗收建議**：合併主線前與 **LDA-E1-08** 同跑至少一組 DuckDB profile；若 `cleaned` 因 dedup tie-break（改用 `__etl_insert_Dtm_synthetic`）導致下游列集合變化，須在 PR／實作說明中列明並以 fixture 或對照表覆蓋預期。
 
-### 5.2 `LDA-E1-09` / `LDA-E1-10` 交付細化
+### 5.2 `LDA-E1-09` / `LDA-E1-10` / `LDA-E1-11` 交付細化
 
-**`LDA-E1-09`（resumable 編排）最低交付**
+#### `LDA-E1-09`（resumable 編排）最低交付
 
 - state schema 檔：`schema/materialization_state.schema.sql`（或等價）
-- runner/CLI：`scripts/lda_l1_day_range_resume_v1.py`（或在既有 day-range CLI 擴充）
-- 支援旗標：`--date-from`、`--date-to`、`--resume`、`--force`、`--stop-after-date`、`--state-store`
-- 原子寫入：`*.tmp -> rename`；成功後才寫 `status=succeeded`
-- 狀態追蹤：至少可查某日某 artifact 的 `status/attempt/input_hash/output_uri`
+- runner/CLI：`scripts/lda_l1_day_range_resume_v1.py`（或在既有 `scripts/lda_l1_gate1_day_range_v1.py` 擴充 `--state-store`／`--resume`／`--force`）
+- 支援旗標（最低集合）：`--date-from`、`--date-to`、`--resume`、`--force`、`--stop-after-date`（或等價「僅跑 N 日後退出」）、`--state-store`
+- **狀態鍵**：至少 `(source_snapshot_id, artifact_kind, partition_day)`；`partition_day` 與各產物 Hive 分區一致（`gaming_day` / `run_end_gaming_day` / `bet_gaming_day` 依 artifact 對照表記錄於 RUNBOOK）
+- 原子寫入：`*.tmp` → `rename`；僅在產物與 manifest 皆寫成功後才標 `status=succeeded`
+- 狀態追蹤：可查 `status`、`attempt`、`input_hash`、`output_uri`、`error_summary`、`updated_at`（與 implementation plan §2.3 state store 敘述對齊）
+- **與編排器關係**：日迴圈內呼叫順序建議固定為 `preprocess_bet_v1` → `run_fact` → `run_bet_map` → `run_day_bridge` →（可選）`gate1`；state 須能標記**任一步**失敗而不誤標後續步為成功
 
-**`LDA-E1-10`（resume gate）最低測試集合**
+#### `LDA-E1-10`（Resume Gate）最低測試集合
 
-- 測試 A：一次跑完（baseline hash / row_count）
-- 測試 B：跑到中途 `--stop-after-date` 中斷，再 `--resume` 跑完
-- 驗證：A/B 的每個 `(artifact_kind, gaming_day)` 輸出 `row_count` 與 `row_hash` 一致
-- 驗證：已 `succeeded` 分區在 `--resume` 下被 `skipped`，在 `--force` 下可重算
+- 測試 A：一次跑完（baseline：`row_count` + 約定 **row_hash**／fingerprint 每 `(artifact_kind, partition_day)`）
+- 測試 B：跑到中途以 `--stop-after-date` 或人為 `SIGINT` 中斷，再 `--resume` 跑完
+- 驗證：A/B 的每個 `(artifact_kind, partition_day)` 輸出 `row_count` 與 `row_hash` **一致**（G7）
+- 驗證：已 `succeeded` 分區在 `--resume` 下為 **`skipped`**；`--force` 可重算且 state 顯示新 `attempt`／新 `input_hash` 觸發
+- **覆蓋面**：至少 2 個連續 `gaming_day`、每日常態路徑四產物；Gate1 若納入 resume 路徑，失敗時不得留下半套 `succeeded`
 
-### 5.3 Phase 1R — 子任務拆解與估時（execution checklist）
+#### `LDA-E1-11`（preprocess ingest P95 cap）最低交付
 
-以下為 **E1-09／E1-10** 落地用工作分解；**估時為單人 person-day 量級**（可並行時 wall-clock 會縮短）。實作可優先擴充既有 `scripts/lda_l1_gate1_day_range_v1.py`，或另開 `scripts/lda_l1_day_range_resume_v1.py`（見 §5.2）。
+- **Registry 接線**：`--ingestion-fix-registry-yaml`（預設可指向 `schema/preprocess_bet_ingestion_fix_registry.yaml`）+ `--ingestion-fix-registry-version-override`（可選，僅測試）；registry 解析失敗 **fail-fast**
+- **SQL 語意**（`t_bet`）：在 `filtered` 與 `ranked` 之間插入衍生欄  
+  `__etl_insert_Dtm_synthetic = LEAST(TRY_CAST(__etl_insert_Dtm AS TIMESTAMP), TRY_CAST(payout_complete_dtm AS TIMESTAMP) + INTERVAL 122 SECOND)`（秒數與 registry 中 `ingest_delay_cap_sec` 一致；實作以 registry 為準）
+- **dedup**：`ROW_NUMBER() … ORDER BY __etl_insert_Dtm_synthetic DESC NULLS LAST, bet_id DESC`（**仍** `PARTITION BY bet_id`）
+- **輸出排序**：`ORDER BY payout_complete_dtm ASC NULLS LAST, bet_id ASC`（**不**改為 observed 主序）
+- **Manifest**：寫入 `ingestion_fix_rule_id`／`ingestion_fix_rule_version`、`applied_fix_rules`（至少 `BET-INGEST-FIX-004:v1`）、可選 `fix_registry_sha256`；`preprocessing_gaps` 若 registry 缺欄則列明
+- **`ingestion_delay_summary`**：`compute_ingestion_delay_summary_preview` 之 `observed_at_col` 改為 `__etl_insert_Dtm_synthetic`（或等價參數化），使摘要反映 cap 後語意
+- **驗收**：單元測試覆蓋「delay 超過 cap → synthetic 觸頂」「未超過 → synthetic 等於 raw」；Gate1 在相同輸入下仍通過（run 邊界不依 observed 排序）
+
+### 5.3 Phase 1R + E1-11 — 子任務拆解與估時（execution checklist）
+
+以下為 **E1-09／E1-10** 與 **E1-11** 落地用工作分解；**估時為單人 person-day 量級**（E1-09 與 E1-11 可由不同開發者並行）。實作可優先擴充既有 `scripts/lda_l1_gate1_day_range_v1.py`，或另開 `scripts/lda_l1_day_range_resume_v1.py`（見 §5.2）。
 
 | 序 | 子任務 | Owner | 估時 | 依賴 | 完成定義（DoD） |
 | :---: | :--- | :--- | :---: | :--- | :--- |
@@ -155,8 +170,13 @@
 | 6 | `layered_data_assets/RUNBOOK.md`（或本檔 §5.2）補操作範例與故障排除 | Data Platform | 0.25 | 5 | 複製貼上可重現「中斷→續跑」 |
 | 7 | `LDA-E1-10`：fixture 資料 + kill/resume 測試 +（可選）CI workflow | ML Platform | 1.5 | 5 | G7：A/B 路徑 `row_count` + `row_hash` 全 artifact×日一致；`--force` 重算可觀察到新 hash |
 | 8 | Phase 2 預留：trip 物化日編排**應沿用**同一 state 契約（E2-01 起） | Data Platform | 0.25 | 5 | execution plan / implementation plan 已註記；實作 PR 可引用本列 |
+| 9 | **E1-11**：YAML registry 載入與驗證（path、版本、`ingest_delay_cap_sec`、active rule id） | Data Platform | 0.5 | E1-02 | 無效 registry 直接退出並 stderr 說明；單元測試覆蓋解析 |
+| 10 | **E1-11**：DuckDB SQL 插入 `__etl_insert_Dtm_synthetic` + dedup `ORDER BY` 改為 synthetic | Data Platform | 1.0 | 9 | 與 §5.2 E1-11 語意一致；現有 preprocess 單測更新通過 |
+| 11 | **E1-11**：manifest 欄位 + `ingestion_delay_summary` 改 observed 欄位 + 範例 manifest 更新 | Data Platform + ML Platform | 0.75 | 10, E1-06 | `schema/manifest_layered_data_assets.schema.json` 仍通過；`make check-lda-l0` 通過 |
+| 12 | **E1-11**：Gate1 迴歸（含 OOM profiles）證明 run 產物不變或僅預期內變更 | ML Platform | 0.5 | 11, E1-08 | 文件記錄「預期不變」之判準；CI 或本機指令可重跑 |
 
-**Phase 1R 合計（粗估）**：約 **5.5–6.5 person-days**（含測試）；若兩人並行 schema+state 與 CLI，wall-clock 約 **3–4 工作天**。
+**Phase 1R（E1-09+10）合計（粗估）**：約 **5.5–6.5 person-days**（含測試）；若兩人並行 schema+state 與 CLI，wall-clock 約 **3–4 工作天**。  
+**E1-11 加計（粗估）**：約 **2.75–3.5 person-days**（列 9–12）；與 E1-09 並行時 wall-clock 取較長分支 + 合併驗收約 **0.5 天**。
 
 **與既有腳本對齊（建議）**
 

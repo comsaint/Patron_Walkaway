@@ -24,9 +24,16 @@ def inclusive_iso_date_strings(date_from: str, date_to: str) -> list[str]:
 
 
 def _parse_iso_date(value: str, *, param: str) -> date:
-    """Parse ``YYYY-MM-DD`` into a :class:`datetime.date`."""
+    """Parse ``YYYY-MM-DD`` into a :class:`datetime.date`.
+
+    Raises:
+        ValueError: if the string is not ``YYYY-MM-DD`` or not a real calendar day.
+    """
     s = value.strip()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
         raise ValueError(f"{param} must be YYYY-MM-DD, got {value!r}")
     y, m, d = (int(s[0:4]), int(s[5:7]), int(s[8:10]))
-    return date(y, m, d)
+    try:
+        return date(y, m, d)
+    except ValueError as exc:
+        raise ValueError(f"{param} invalid calendar date {value!r}: {exc}") from exc
