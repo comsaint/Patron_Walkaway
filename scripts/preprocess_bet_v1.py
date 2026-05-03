@@ -77,6 +77,18 @@ def _add_preprocess_bet_optional_args(p: argparse.ArgumentParser) -> None:
         default=DEFAULT_LATE_THRESHOLD_SEC,
         help=f"Late-arrival threshold on ingest delay seconds (default: {DEFAULT_LATE_THRESHOLD_SEC})",
     )
+    p.add_argument(
+        "--ingestion-fix-registry-yaml",
+        type=Path,
+        default=None,
+        help="Optional YAML registry; when set, applies BET-INGEST-FIX-004 synthetic observed-at cap before dedup",
+    )
+    p.add_argument(
+        "--ingestion-fix-registry-version-expected",
+        type=str,
+        default=None,
+        help="Optional fail-fast check: registry top-level registry_version must match this string",
+    )
     add_duckdb_oom_cli_args(p)
 
 
@@ -110,6 +122,10 @@ def main(argv: list[str] | None = None) -> int:
 
     inputs = [p.resolve() for p in args.inputs]
 
+    reg_path = args.ingestion_fix_registry_yaml
+    if reg_path is not None:
+        reg_path = reg_path.resolve()
+
     def _work(con: object):
         stats = run_preprocess_bet_v1(
             con=con,
@@ -118,9 +134,19 @@ def main(argv: list[str] | None = None) -> int:
             gaming_day=args.gaming_day,
             dummy_player_ids_parquet=args.dummy_player_ids_parquet,
             eligible_player_ids_parquet=args.eligible_player_ids_parquet,
+            ingestion_fix_registry_path=reg_path,
+            ingestion_fix_registry_version_expected=args.ingestion_fix_registry_version_expected,
+        )
+        observed_col = (
+            "__etl_insert_Dtm_synthetic"
+            if stats.get("ingest_delay_cap_sec_applied") is not None
+            else "__etl_insert_Dtm"
         )
         id_summary = compute_ingestion_delay_summary_preview(
-            con, out_parquet, late_threshold_sec=args.late_threshold_sec
+            con,
+            out_parquet,
+            late_threshold_sec=args.late_threshold_sec,
+            observed_at_col=observed_col,
         )
         return stats, id_summary
 

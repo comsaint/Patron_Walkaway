@@ -17,6 +17,9 @@ from layered_data_assets.preprocess_bet_v1 import (
     validate_preprocess_bet_input_columns,
 )
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_INGEST_REGISTRY = _REPO_ROOT / "schema" / "preprocess_bet_ingestion_fix_registry.yaml"
+
 
 def test_validate_preprocess_bet_input_columns_rejects_feature_slice_names() -> None:
     cols = {"label", "pace_drop_ratio", "bet_time"}
@@ -41,6 +44,99 @@ def test_preprocess_bet_v1_rejects_wrong_schema(tmp_path: Path) -> None:
             )
     finally:
         con.close()
+
+
+@pytest.mark.skipif(duckdb is None, reason="duckdb not installed")
+def test_preprocess_bet_v1_registry_requires_etl_and_payout_columns(tmp_path: Path) -> None:
+    """Ingestion cap needs both timestamps; fail before DuckDB bind."""
+    inp = tmp_path / "in.parquet"
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute(
+            f"""
+            COPY (
+              SELECT * FROM (VALUES
+                (1::BIGINT, 100::BIGINT, DATE '2026-01-15',
+                 TIMESTAMP '2026-01-15 10:00:00',
+                 0::INTEGER, 0::INTEGER, 0::INTEGER)
+              ) AS t(bet_id, player_id, gaming_day, __etl_insert_Dtm,
+                     is_deleted, is_canceled, is_manual)
+            ) TO '{inp.as_posix()}' (FORMAT PARQUET)
+            """
+        )
+        with pytest.raises(ValueError, match="payout_complete_dtm"):
+            run_preprocess_bet_v1(
+                con=con,
+                input_paths=[inp],
+                output_parquet=tmp_path / "out.parquet",
+                gaming_day="2026-01-15",
+                dummy_player_ids_parquet=None,
+                eligible_player_ids_parquet=None,
+                ingestion_fix_registry_path=_DEFAULT_INGEST_REGISTRY,
+            )
+    finally:
+        con.close()
+
+
+@pytest.mark.skipif(duckdb is None, reason="duckdb not installed")
+def test_preprocess_bet_v1_ingestion_cap_changes_dedup_winner(tmp_path: Path) -> None:
+    """Raw latest ETL can lose after P95 cap synthetic ordering (same bet_id)."""
+    assert _DEFAULT_INGEST_REGISTRY.is_file()
+    inp = tmp_path / "in.parquet"
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute(
+            f"""
+            COPY (
+              SELECT * FROM (VALUES
+                (1::BIGINT, 100::BIGINT, DATE '2026-01-15',
+                 TIMESTAMP '2026-01-15 10:00:00', TIMESTAMP '2026-01-15 10:05:00',
+                 0::INTEGER, 0::INTEGER, 0::INTEGER),
+                (1::BIGINT, 200::BIGINT, DATE '2026-01-15',
+                 TIMESTAMP '2026-01-15 09:59:00', TIMESTAMP '2026-01-15 11:00:00',
+                 0::INTEGER, 0::INTEGER, 0::INTEGER)
+              ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm,
+                     is_deleted, is_canceled, is_manual)
+            ) TO '{inp.as_posix()}' (FORMAT PARQUET)
+            """
+        )
+        out_no = tmp_path / "cleaned_no_cap.parquet"
+        out_cap = tmp_path / "cleaned_cap.parquet"
+        run_preprocess_bet_v1(
+            con=con,
+            input_paths=[inp],
+            output_parquet=out_no,
+            gaming_day="2026-01-15",
+            dummy_player_ids_parquet=None,
+            eligible_player_ids_parquet=None,
+        )
+        run_preprocess_bet_v1(
+            con=con,
+            input_paths=[inp],
+            output_parquet=out_cap,
+            gaming_day="2026-01-15",
+            dummy_player_ids_parquet=None,
+            eligible_player_ids_parquet=None,
+            ingestion_fix_registry_path=_DEFAULT_INGEST_REGISTRY,
+        )
+    finally:
+        con.close()
+    con2 = duckdb.connect(database=":memory:")
+    try:
+        pid_no = con2.execute("SELECT player_id FROM read_parquet(?)", [str(out_no)]).fetchone()[0]
+        pid_cap = con2.execute("SELECT player_id FROM read_parquet(?)", [str(out_cap)]).fetchone()[0]
+        cols = {
+            r[0]
+            for r in con2.execute(
+                "SELECT column_name FROM (DESCRIBE SELECT * FROM read_parquet(?))",
+                [str(out_cap)],
+            ).fetchall()
+        }
+    finally:
+        con2.close()
+    assert pid_no == 200
+    assert pid_cap == 100
+    assert "__etl_insert_Dtm_synthetic" in cols
 
 
 @pytest.mark.skipif(duckdb is None, reason="duckdb not installed")

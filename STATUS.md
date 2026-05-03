@@ -4,6 +4,58 @@
 
 ---
 
+## 2026-05-03 CYCLE — LDA-E1-11：`preprocess_bet_v1` 接入 ingestion-fix registry（122s cap + manifest）（/cycle_code）
+
+> 計畫索引：`implementation plan/layered_data_assets_run_trip_execution_plan.md` **§5.2 E1-11**（repo 根目錄未找到 `.cursor/plans/PLAN.md`，本輪以 execution plan 為準）；`DECISION_LOG.md`：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md)。
+
+### STEP 1 — Builder
+
+- **`layered_data_assets/preprocess_bet_ingestion_fix_registry_v1.py`**（新）：`yaml.safe_load` 載入 registry；`resolve_bet_ingest_fix004_cap_binding` 讀取 contract `ingest_delay_cap_sec` 與啟用中的 **BET-INGEST-FIX-004**，數值不一致則 **fail-fast**。
+- **`layered_data_assets/preprocess_bet_v1.py`**：可選 **`ingest_delay_cap_sec`** 時在 `filtered` 與 `ranked` 之間插入 **`with_capped`**（`__etl_insert_Dtm_synthetic` = `LEAST(etl, payout + cap)`，`ELSE` 沿用 raw ETL cast）；dedup **`ORDER BY __etl_insert_Dtm_synthetic`**；輸出仍 **`ORDER BY payout_complete_dtm, bet_id`**。`run_preprocess_bet_v1` 新增 **`ingestion_fix_registry_path`**、**`ingestion_fix_registry_version_expected`**；stats 附 **`ingest_delay_cap_sec_applied`**／**`applied_fix_rules`** 等；manifest 寫入 **`ingestion_fix_rule_id`**／**`version`** 與可選 **`applied_fix_rules`**。
+- **`scripts/preprocess_bet_v1.py`**：**`--ingestion-fix-registry-yaml`**、**`--ingestion-fix-registry-version-expected`**；`ingestion_delay_summary` 在 cap 啟用時改以 **`__etl_insert_Dtm_synthetic`** 為 observed。
+- **`schema/examples/manifest_preprocess_bet_l1_example.json`**：範例補 **BET-INGEST-FIX-004**／**`applied_fix_rules`**。
+
+#### 手動驗證
+
+```bash
+python -m pytest tests/unit/test_preprocess_bet_v1.py -q --tb=short
+make check-lda-l0
+```
+
+（可選）對真實 L0 partition 跑一次 preprocess，帶 `--ingestion-fix-registry-yaml schema/preprocess_bet_ingestion_fix_registry.yaml`，確認輸出 parquet 含 **`__etl_insert_Dtm_synthetic`** 且 manifest **`ingestion_fix_rule_id`** 非 null。
+
+#### 下一步建議
+
+- Gate1／day-range 與 cap 同跑迴歸（execution plan §5.3）；CLI dry-run（若後續任務需要）。
+
+### STEP 2 — Reviewer
+
+| 風險 | 說明 | 建議 | 建議測試 |
+|------|------|------|----------|
+| 同 synthetic 時間 dedup 並列 | `ORDER BY synthetic DESC, bet_id DESC` 在完全相同 synthetic 時可能依引擎/讀取順序 | 測試案例避免並列，或接受 DuckDB 穩定行為 | cap 測試用明確不等 synthetic |
+| 缺 `payout`／`__etl_insert_Dtm` 仍傳 registry | 已於載入 cap 後 **`_validate_columns_for_ingest_cap`** | 維持 | **`test_preprocess_bet_v1_registry_requires_etl_and_payout_columns`** |
+| `ingestion_fix_registry_version_expected` 與 draft 版本 | `v0.4_draft` 變更會讓鎖版本 CI 失敗 | 文件註明需同步 bump | **`test_registry_version_expected_mismatch_raises`** |
+| 延遲摘要欄位缺失 | 若未來改寫欄名，`observed_at_col` 錯會靜默 placeholder | 日誌或 assert 輸出欄存在 | cap 啟用時斷言 DESCRIBE 含 synthetic |
+| 記憶體 | 多一層 CTE 與一欄，與原 pipeline 同量級 | 大分區仍建議 OOM runner | 沿用既有 gate |
+
+### STEP 3 — Tester（僅 tests）
+
+- **`tests/unit/test_preprocess_bet_ingestion_fix_registry_v1.py`**：repo registry resolve；contract／rule cap 不一致；FIX-004 停用；**`registry_version`** 與 CLI expected 不符。
+- **`tests/unit/test_preprocess_bet_v1.py`**：**`test_preprocess_bet_v1_ingestion_cap_changes_dedup_winner`**、**`test_preprocess_bet_v1_registry_requires_etl_and_payout_columns`**。
+- **`Makefile`**：`check-lda-l0` 目標納入 **`test_preprocess_bet_ingestion_fix_registry_v1.py`**（本環境無 `make` 時可手跑下方指令）。
+
+```bash
+python -m pytest tests/unit/test_preprocess_bet_ingestion_fix_registry_v1.py tests/unit/test_preprocess_bet_v1.py -q --tb=short
+```
+
+### STEP 4 — Tester（修實作）
+
+- **`python scripts/validate_layered_contracts.py`**：**OK**。
+- **pytest（LDA L0 清單 + 新 registry 測試）**：**80 passed**（約 2.8s）；本輪無需再改 production 以通過測試。
+- **建議下一條目**：execution plan **Gate1／day-range 與 E1-11 cap 同跑**；若需 CI 鎖定 registry，對 **`--ingestion-fix-registry-version-expected v0.4_draft`** 加整合測或 RUNBOOK 一節（另開任務以免膨脹本 PR）。
+
+---
+
 ## 2026-04-20 — DEC-040：僅載入 `model.pkl`；廢止 walkaway 產出與 legacy 備援
 
 **決策紀錄**：[`.cursor/plans/DECISION_LOG.md`](.cursor/plans/DECISION_LOG.md) **DEC-040**。

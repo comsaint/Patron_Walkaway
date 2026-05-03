@@ -9,6 +9,10 @@ from typing import Any
 
 from layered_data_assets.ingestion_delay_summary_v1 import manifest_ingestion_delay_placeholder
 from layered_data_assets.l0_paths import validate_source_snapshot_id
+from layered_data_assets.preprocess_bet_ingestion_fix_registry_v1 import (
+    load_preprocess_bet_ingestion_fix_registry,
+    resolve_bet_ingest_fix004_cap_binding,
+)
 
 _PREPROCESS_RULE_ID = "preprocess_bet_v1"
 _PREPROCESS_RULE_VERSION = "v1"
@@ -137,8 +141,33 @@ def _preprocess_pipeline_select_sql(
     where_sql: str,
     order_etl: str,
     order_payout: str,
+    ingest_delay_cap_sec: int | None,
 ) -> str:
     """Assemble dedupe pipeline SQL (no ``COPY`` wrapper)."""
+    if ingest_delay_cap_sec is None:
+        ranked_from = "filtered"
+        order_by_observed = f"{order_etl} DESC NULLS LAST, bet_id DESC"
+    else:
+        ranked_from = "with_capped"
+        order_by_observed = "__etl_insert_Dtm_synthetic DESC NULLS LAST, bet_id DESC"
+    capped_cte = ""
+    if ingest_delay_cap_sec is not None:
+        cap = int(ingest_delay_cap_sec)
+        capped_cte = f""",
+with_capped AS (
+  SELECT
+    filtered.*,
+    CASE
+      WHEN TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) IS NOT NULL
+       AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) IS NOT NULL
+      THEN LEAST(
+        TRY_CAST(__etl_insert_Dtm AS TIMESTAMP),
+        TRY_CAST(payout_complete_dtm AS TIMESTAMP) + INTERVAL {cap} SECOND
+      )
+      ELSE TRY_CAST(__etl_insert_Dtm AS TIMESTAMP)
+    END AS __etl_insert_Dtm_synthetic
+  FROM filtered
+)"""
     return f"""
 {with_prefix}src AS (
   SELECT * FROM read_parquet([{rp_list}])
@@ -146,15 +175,15 @@ def _preprocess_pipeline_select_sql(
 filtered AS (
   SELECT * FROM src
   WHERE {where_sql}
-),
+){capped_cte},
 ranked AS (
   SELECT
     *,
     ROW_NUMBER() OVER (
       PARTITION BY bet_id
-      ORDER BY {order_etl} DESC NULLS LAST, bet_id DESC
+      ORDER BY {order_by_observed}
     ) AS _rn
-  FROM filtered
+  FROM {ranked_from}
 ),
 deduped AS (
   SELECT * EXCLUDE (_rn) FROM ranked WHERE _rn = 1
@@ -172,6 +201,7 @@ def build_preprocess_sql(
     dummy_ids_table_sql: str | None,
     eligible_ids_table_sql: str | None,
     columns: set[str],
+    ingest_delay_cap_sec: int | None = None,
 ) -> str:
     """Build a single DuckDB ``COPY (SELECT ...) TO ...`` statement (no bind params)."""
     rp_list = _read_parquet_list_sql(input_paths)
@@ -186,6 +216,7 @@ def build_preprocess_sql(
         where_sql=where_sql,
         order_etl=order_etl,
         order_payout=order_payout,
+        ingest_delay_cap_sec=ingest_delay_cap_sec,
     )
     out = str(output_parquet.resolve()).replace("\\", "/").replace("'", "''")
     return f"COPY ({inner.strip()}) TO '{out}' (FORMAT PARQUET);\n"
@@ -239,14 +270,32 @@ def _eligible_ids_sql(eligible_player_ids_parquet: Path | None, gaps: list[str])
     return f"SELECT player_id FROM read_parquet('{ep}')"
 
 
-def _preprocess_subrules_applied(dummy_sql: str | None, elig_sql: str | None) -> list[str]:
+def _preprocess_subrules_applied(
+    dummy_sql: str | None,
+    elig_sql: str | None,
+    *,
+    ingestion_fix_rule_ids: list[str] | None = None,
+) -> list[str]:
     """List preprocess subrule ids applied for this run."""
     subrules = ["BET-PK-01", "BET-PK-02", "BET-DQ-01", "BET-ORD-01"]
     if dummy_sql:
         subrules.append("BET-DQ-02")
     if elig_sql:
         subrules.append("BET-DQ-03")
+    for rid in ingestion_fix_rule_ids or []:
+        subrules.append(rid)
     return subrules
+
+
+def _validate_columns_for_ingest_cap(columns: set[str]) -> None:
+    """Require ETL + payout columns when applying synthetic observed-at cap."""
+    need = frozenset({"__etl_insert_Dtm", "payout_complete_dtm"})
+    missing = sorted(need - columns)
+    if missing:
+        raise ValueError(
+            "ingestion fix registry cap requires L0 t_bet columns "
+            f"{sorted(need)}; missing: {missing}."
+        )
 
 
 def run_preprocess_bet_v1(
@@ -257,6 +306,8 @@ def run_preprocess_bet_v1(
     gaming_day: str,
     dummy_player_ids_parquet: Path | None,
     eligible_player_ids_parquet: Path | None,
+    ingestion_fix_registry_path: Path | None = None,
+    ingestion_fix_registry_version_expected: str | None = None,
 ) -> dict[str, Any]:
     """Execute preprocess SQL; return stats dict (row_count, subrules_applied, gaps)."""
     if not input_paths:
@@ -264,6 +315,23 @@ def run_preprocess_bet_v1(
     gaps: list[str] = []
     cols = _union_input_parquet_columns(con, input_paths)
     validate_preprocess_bet_input_columns(cols)
+    ingest_cap: int | None = None
+    fix_rule_id: str | None = None
+    fix_rule_version: str | None = None
+    applied_fix_rules: list[str] = []
+    ingestion_fix_ids: list[str] = []
+    if ingestion_fix_registry_path is not None:
+        reg = load_preprocess_bet_ingestion_fix_registry(ingestion_fix_registry_path.resolve())
+        if ingestion_fix_registry_version_expected is not None:
+            got_ver = reg.get("registry_version")
+            if got_ver != ingestion_fix_registry_version_expected:
+                raise ValueError(
+                    "ingestion fix registry_version mismatch: "
+                    f"expected {ingestion_fix_registry_version_expected!r}, got {got_ver!r}"
+                )
+        ingest_cap, fix_rule_id, fix_rule_version, applied_fix_rules = resolve_bet_ingest_fix004_cap_binding(reg)
+        _validate_columns_for_ingest_cap(cols)
+        ingestion_fix_ids.append(fix_rule_id)
     dummy_sql = _dummy_ids_sql(dummy_player_ids_parquet, gaps)
     elig_sql = _eligible_ids_sql(eligible_player_ids_parquet, gaps)
     output_parquet.parent.mkdir(parents=True, exist_ok=True)
@@ -274,6 +342,7 @@ def run_preprocess_bet_v1(
         dummy_ids_table_sql=dummy_sql,
         eligible_ids_table_sql=elig_sql,
         columns=cols,
+        ingest_delay_cap_sec=ingest_cap,
     )
     con.execute(stmt)
     count_row = con.execute(
@@ -284,14 +353,21 @@ def run_preprocess_bet_v1(
     n = count_row[0]
     out_cols = parquet_columns(con, output_parquet)
     tr = _time_range_from_output(con, output_parquet, out_cols)
-    subrules = _preprocess_subrules_applied(dummy_sql, elig_sql)
-    return {
+    subrules = _preprocess_subrules_applied(dummy_sql, elig_sql, ingestion_fix_rule_ids=ingestion_fix_ids)
+    out: dict[str, Any] = {
         "row_count": int(n),
         "time_range_min": tr[0],
         "time_range_max": tr[1],
         "preprocess_subrules_applied": subrules,
         "preprocessing_gaps": gaps,
     }
+    if ingest_cap is not None:
+        out["ingest_delay_cap_sec_applied"] = int(ingest_cap)
+        out["ingestion_fix_rule_id"] = fix_rule_id
+        out["ingestion_fix_rule_version"] = fix_rule_version
+        out["applied_fix_rules"] = applied_fix_rules
+        out["ingestion_fix_registry_path"] = str(ingestion_fix_registry_path.resolve().as_posix())
+    return out
 
 
 def _source_hashes_from_l0_fingerprint(l0_fingerprint_path: Path | None) -> list[str]:
@@ -329,10 +405,13 @@ def _l1_bet_clean_manifest_dict(
     stats: dict[str, Any],
     output_relative_uri: str,
     ingestion_delay_summary: dict[str, Any] | None = None,
+    ingestion_fix_rule_id: str | None = None,
+    ingestion_fix_rule_version: str | None = None,
+    applied_fix_rules: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the ``l1_t_bet_clean`` manifest object."""
     ids = ingestion_delay_summary if ingestion_delay_summary is not None else manifest_ingestion_delay_placeholder()
-    return {
+    body: dict[str, Any] = {
         "artifact_kind": "l1_t_bet_clean",
         "partition_keys": {"gaming_day": gaming_day.strip(), "source_snapshot_id": source_snapshot_id.strip()},
         "definition_version": "layered_data_assets_v1",
@@ -344,8 +423,8 @@ def _l1_bet_clean_manifest_dict(
         "preprocessing_rule_id": _PREPROCESS_RULE_ID,
         "preprocessing_rule_version": _PREPROCESS_RULE_VERSION,
         "published_snapshot_id": None,
-        "ingestion_fix_rule_id": None,
-        "ingestion_fix_rule_version": None,
+        "ingestion_fix_rule_id": ingestion_fix_rule_id,
+        "ingestion_fix_rule_version": ingestion_fix_rule_version,
         "row_count": int(stats["row_count"]),
         "time_range": {"min_event_time": min_event_time, "max_event_time": max_event_time},
         "built_at": built_at,
@@ -354,6 +433,9 @@ def _l1_bet_clean_manifest_dict(
         "preprocessing_gaps": stats.get("preprocessing_gaps", []),
         "output_relative_uri": output_relative_uri,
     }
+    if applied_fix_rules:
+        body["applied_fix_rules"] = list(applied_fix_rules)
+    return body
 
 
 def build_preprocess_manifest(
@@ -365,6 +447,9 @@ def build_preprocess_manifest(
     manifest_uri_anchor: Path,
     stats: dict[str, Any],
     ingestion_delay_summary: dict[str, Any] | None = None,
+    ingestion_fix_rule_id: str | None = None,
+    ingestion_fix_rule_version: str | None = None,
+    applied_fix_rules: list[str] | None = None,
 ) -> dict[str, Any]:
     """Assemble a manifest dict valid against ``manifest_layered_data_assets.schema.json`` (L1 bet clean).
 
@@ -378,6 +463,15 @@ def build_preprocess_manifest(
     min_ev = stats.get("time_range_min") or "1970-01-01T00:00:00Z"
     max_ev = stats.get("time_range_max") or min_ev
     out_uri = manifest_output_relative_uri(output_parquet, manifest_uri_anchor)
+    fid = ingestion_fix_rule_id
+    fver = ingestion_fix_rule_version
+    if fid is None and stats.get("ingestion_fix_rule_id") is not None:
+        fid = str(stats["ingestion_fix_rule_id"])
+    if fver is None and stats.get("ingestion_fix_rule_version") is not None:
+        fver = str(stats["ingestion_fix_rule_version"])
+    afr = applied_fix_rules
+    if afr is None and stats.get("applied_fix_rules") is not None:
+        afr = list(stats["applied_fix_rules"])
     return _l1_bet_clean_manifest_dict(
         source_snapshot_id=source_snapshot_id,
         gaming_day=gaming_day,
@@ -389,4 +483,7 @@ def build_preprocess_manifest(
         stats=stats,
         output_relative_uri=out_uri,
         ingestion_delay_summary=ingestion_delay_summary,
+        ingestion_fix_rule_id=fid,
+        ingestion_fix_rule_version=fver,
+        applied_fix_rules=afr,
     )

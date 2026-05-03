@@ -13,8 +13,11 @@
     "late_row_count": null,
     "late_row_ratio": null
   },
-  "ingestion_fix_rule_id": null,
-  "ingestion_fix_rule_version": null,
+  "applied_fix_rules": [
+    "BET-INGEST-FIX-004:v1"
+  ],
+  "ingestion_fix_rule_id": "BET-INGEST-FIX-004",
+  "ingestion_fix_rule_version": "v1",
   "output_relative_uri": "data/l1_layered/snap_example/t_bet/gaming_day=2026-04-01/cleaned.parquet",
   "partition_keys": {
     "gaming_day": "2026-04-01",
