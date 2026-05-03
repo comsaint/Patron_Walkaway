@@ -25,3 +25,13 @@ def test_inclusive_iso_date_strings_rejects_inverted_range() -> None:
 def test_inclusive_iso_date_strings_rejects_bad_format() -> None:
     with pytest.raises(ValueError, match="date_from"):
         inclusive_iso_date_strings("01-01-2026", "2026-01-02")
+
+
+def test_inclusive_iso_date_strings_rejects_impossible_date_from() -> None:
+    with pytest.raises(ValueError, match=r"date_from invalid calendar date"):
+        inclusive_iso_date_strings("2026-02-30", "2026-03-01")
+
+
+def test_inclusive_iso_date_strings_rejects_impossible_date_to() -> None:
+    with pytest.raises(ValueError, match=r"date_to invalid calendar date"):
+        inclusive_iso_date_strings("2026-01-01", "2026-02-30")
