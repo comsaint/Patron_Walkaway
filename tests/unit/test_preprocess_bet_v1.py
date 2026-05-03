@@ -1,5 +1,6 @@
 """Unit tests for preprocess_bet_v1 (DuckDB)."""
 
+import importlib.util
 import json
 from pathlib import Path
 
@@ -293,3 +294,45 @@ def test_build_preprocess_manifest_validates_schema(tmp_path: Path) -> None:
     Draft7Validator(schema).validate(m)
     assert m["output_relative_uri"] == "cleaned.parquet"
     assert not Path(m["output_relative_uri"]).is_absolute()
+
+
+@pytest.mark.skipif(duckdb is None, reason="duckdb not installed")
+def test_preprocess_bet_cli_missing_registry_yaml_exits_2(tmp_path: Path) -> None:
+    """CLI must catch FileNotFoundError from missing --ingestion-fix-registry-yaml (exit 2)."""
+    repo = Path(__file__).resolve().parents[2]
+    script_path = repo / "scripts" / "preprocess_bet_v1.py"
+    spec = importlib.util.spec_from_file_location("_preprocess_bet_cli_registry_test", script_path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+
+    inp = tmp_path / "in.parquet"
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute(
+            f"""
+            COPY (
+              SELECT * FROM (VALUES
+                (1::BIGINT, 100::BIGINT, DATE '2026-01-15',
+                 TIMESTAMP '2026-01-15 10:00:00', TIMESTAMP '2026-01-15 11:00:00',
+                 0::INTEGER, 0::INTEGER, 0::INTEGER)
+              ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm,
+                     is_deleted, is_canceled, is_manual)
+            ) TO '{inp.as_posix()}' (FORMAT PARQUET)
+            """
+        )
+    finally:
+        con.close()
+
+    missing_reg = tmp_path / "nonexistent_ingestion_fix_registry.yaml"
+    argv = [
+        "--source-snapshot-id",
+        "snap_cli_registry_test",
+        "--gaming-day",
+        "2026-01-15",
+        "--input",
+        str(inp),
+        "--ingestion-fix-registry-yaml",
+        str(missing_reg),
+    ]
+    assert mod.main(argv) == 2

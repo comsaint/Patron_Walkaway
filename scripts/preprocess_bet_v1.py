@@ -161,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             max_attempts=args.duckdb_oom_max_attempts,
             initial_memory_limit_mb=args.duckdb_initial_memory_limit_mb,
         )
-    except ValueError as exc:
+    except (ValueError, FileNotFoundError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     manifest = build_preprocess_manifest(

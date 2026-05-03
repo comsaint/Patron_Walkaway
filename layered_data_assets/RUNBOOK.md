@@ -19,6 +19,7 @@
 | `data/l1_layered/<id>/run_fact/run_end_gaming_day=.../` | `run_fact` 分區 |
 | `data/l1_layered/<id>/run_bet_map/run_end_gaming_day=.../` | `run_bet_map` 分區 |
 | `data/l1_layered/<id>/run_day_bridge/bet_gaming_day=.../` | `run_day_bridge` 分區（鍵為 **bet 日**） |
+| `data/l1_layered/materialization_state.duckdb`（預設） | **LDA-E1-09** 日編排 materialization state（DuckDB）；可用 `--state-store` 覆寫 |
 
 **`source_snapshot_id`（L1）**：通常與該批 L0 的 `snap_*` 對齊；若每日各做一次 L0 ingest（`partition_value` 不同），fingerprint 不同，**每日的 `snap_*` 可能不同** — 編排器在 raw 模式會自 ingest 輸出解析。
 
@@ -95,7 +96,7 @@ python scripts/manifest_lineage_preview_v1.py --help
   - **`--l0-existing`**：在 `data/l0_layered` 下依當日分區**自動尋找**既有 `snap_*`（多個時取字典序第一並 stderr 警告）。
   - 若未帶旗標且 **沒有** `data/gmwds_t_bet.parquet`，程式會 stderr 說明並 exit 2，請改用上述旗標之一。
 
-常用旗標：`--date-from` / `--date-to`（含首尾）、`--dry-run`、`--verbose`（轉給 Gate1）、`--no-progress`（關閉編排器日進度條）、`--profiles-json`（轉給 Gate1）、`--gate1-output-parent`。
+常用旗標：`--date-from` / `--date-to`（含首尾）、`--dry-run`、`--verbose`（轉給 Gate1）、`--no-progress`（關閉編排器日進度條）、`--profiles-json`（轉給 Gate1）、`--gate1-output-parent`、**`--state-store`** / **`--resume`** / **`--force`** / **`--stop-after-date`**（見下 §5.1）。
 
 ```bash
 python scripts/lda_l1_gate1_day_range_v1.py --help
@@ -107,6 +108,28 @@ python scripts/lda_l1_gate1_day_range_v1.py --help
 python scripts/lda_l1_gate1_day_range_v1.py --date-from 2026-01-01 --date-to 2026-01-01 \
   --bet-parquet data/gmwds_t_bet.parquet \
   --source-snapshot-id snap_abcdefgh --dry-run
+```
+
+### 5.1 Resumable state（LDA-E1-09）
+
+- **State DB**：DuckDB 表 `materialization_state`（DDL：`schema/materialization_state.schema.sql`）；程式模組：`layered_data_assets/materialization_state_store_v1.py`。
+- **`--state-store PATH`**：啟用寫入／讀取狀態；每步成功後記 `succeeded` + `input_hash`（由 L0 輸入檔 stat、fingerprint 原文、`cleaned` stat 等組成穩定 JSON 再 sha256）。
+- **`--resume`**（且未同時 **`--force`**）：若該步已是 `succeeded` 且 **`input_hash` 與本次計算相同**，則 **skip** 該 subprocess；若預期產物檔或 Gate1 輸出目錄已遺失，會 **WARN 並強制重跑** 該步。
+- **`--force`**：忽略 `succeeded`，一律重跑日期區間內各步（仍寫回 state）。若同時傳 `--resume`，以 **`--force` 為準**。
+- **僅 `--resume` 或 `--force` 而未給 `--state-store`**：使用預設檔 **`data/l1_layered/materialization_state.duckdb`**（倉庫根下之 `data/`）。
+- **`--stop-after-date YYYY-MM-DD`**：必須落在 `--date-from`…`--date-to` 內；該曆日整條管線（含三個 Gate1）**成功結束後**即結束程式，後續日期不跑（方便中斷演練）。
+- **原子寫**：各 `preprocess`／`materialize`／Gate1 子程序維持既有寫檔行為；編排層在子程序 **exit 0** 後才標 `succeeded`（中斷時不應出現「state 成功但檔案未寫完」之組合，除非子程序誤報成功——與 SSOT 契約一致時應由子程序修正）。
+
+**範例（記錄 state，翌日續跑 skip）**：
+
+```bash
+python scripts/lda_l1_gate1_day_range_v1.py --date-from 2026-01-01 --date-to 2026-01-02 \
+  --bet-parquet data/gmwds_t_bet.parquet --source-snapshot-id snap_local \
+  --state-store data/l1_layered/materialization_state.duckdb
+
+# 第二輪：僅 --resume（未指定 --state-store 時使用同上預設路徑）→ 已 succeeded 且 input_hash 相同則 SKIP
+python scripts/lda_l1_gate1_day_range_v1.py --date-from 2026-01-01 --date-to 2026-01-02 \
+  --bet-parquet data/gmwds_t_bet.parquet --source-snapshot-id snap_local --resume
 ```
 
 ## 6. Gate 1 單獨執行（LDA-E1-08）
