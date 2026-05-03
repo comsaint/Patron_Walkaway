@@ -1,0 +1,9 @@
+{
+  "created_at": "2026-05-03T12:00:00Z",
+  "l1_relative_root": "l1_layered/snap_example",
+  "notes": "example only",
+  "previous_published_snapshot_id": null,
+  "published_snapshot_id": "pub_example_001",
+  "schema_version": "published_snapshot_v1",
+  "source_snapshot_id": "snap_example"
+}

@@ -1,0 +1,39 @@
+{
+  "artifact_kind": "trip_run_map",
+  "built_at": "2026-05-03T12:00:00Z",
+  "definition_version": "trip_boundary_v1",
+  "feature_version": "na_l1_trip_run_map",
+  "ingestion_delay_summary": {
+    "affected_run_count": null,
+    "affected_trip_count": null,
+    "ingest_delay_max_sec": null,
+    "ingest_delay_p50_sec": null,
+    "ingest_delay_p95_sec": null,
+    "ingest_delay_p99_sec": null,
+    "late_row_count": null,
+    "late_row_ratio": null
+  },
+  "ingestion_fix_rule_id": null,
+  "ingestion_fix_rule_version": null,
+  "output_relative_uri": "data/l1_layered/snap_example/trip_run_map/trip_start_gaming_day=2026-04-01/trip_run_map.parquet",
+  "partition_keys": {
+    "source_snapshot_id": "snap_example",
+    "trip_start_gaming_day": "2026-04-01"
+  },
+  "preprocessing_rule_id": "preprocess_bet_v1",
+  "preprocessing_rule_version": "v1",
+  "published_snapshot_id": null,
+  "row_count": 0,
+  "source_hashes": [
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  ],
+  "source_partitions": [
+    "l1/run_fact/run_end_gaming_day=2026-04-01"
+  ],
+  "source_snapshot_id": "snap_example",
+  "time_range": {
+    "max_event_time": "2026-04-01T08:30:00Z",
+    "min_event_time": "2026-04-01T08:00:00Z"
+  },
+  "transform_version": "v1"
+}

@@ -12,6 +12,8 @@ from layered_data_assets.l1_paths import (
     l1_run_day_bridge_partition_dir,
     l1_run_fact_partition_dir,
     l1_snapshot_root,
+    l1_trip_fact_partition_dir,
+    l1_trip_run_map_partition_dir,
 )
 
 
@@ -63,3 +65,18 @@ def test_l1_run_day_bridge_partition_dir() -> None:
 def test_l1_run_day_bridge_partition_dir_rejects_bad_day() -> None:
     with pytest.raises(ValueError, match="invalid bet_gaming_day"):
         l1_run_day_bridge_partition_dir(Path("data"), "snap_abcdefgh", "2026/04/01")
+
+
+def test_l1_trip_fact_partition_dir() -> None:
+    p = l1_trip_fact_partition_dir(Path("data"), "snap_abcdefgh", "2026-04-01")
+    assert p == Path("data") / "l1_layered" / "snap_abcdefgh" / "trip_fact" / "trip_start_gaming_day=2026-04-01"
+
+
+def test_l1_trip_fact_partition_dir_rejects_bad_day() -> None:
+    with pytest.raises(ValueError, match="invalid trip_start_gaming_day"):
+        l1_trip_fact_partition_dir(Path("data"), "snap_abcdefgh", "2026/04/01")
+
+
+def test_l1_trip_run_map_partition_dir() -> None:
+    p = l1_trip_run_map_partition_dir(Path("data"), "snap_abcdefgh", "2026-04-01")
+    assert p == Path("data") / "l1_layered" / "snap_abcdefgh" / "trip_run_map" / "trip_start_gaming_day=2026-04-01"

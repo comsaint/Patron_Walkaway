@@ -3,8 +3,8 @@
 > **Canonical 位置**：`pipelines/layered_data_assets/docs/RUNBOOK.md`（implementation plan §2.5）。  
 > `layered_data_assets/RUNBOOK.md` 僅保留轉址，請更新書籤與 PR 連結。
 
-> **範圍**：L0 ingest、`t_bet` preprocess、L1 `run_fact`／`run_bet_map`／`run_day_bridge`、Gate 1 determinism、日區間編排器；**Phase 2（MVP）**：`trip_fact`／`trip_run_map` 由全量 `run_fact` 重算（見 §4.4）。  
-> **非範圍**：`published_snapshot`、correction log writer、編排器內建 trip 日迴圈（見 execution plan Phase 2 其餘項）、trainer Step 6/7 取代。
+> **範圍**：L0 ingest、`t_bet` preprocess、L1 `run_fact`／`run_bet_map`／`run_day_bridge`、Gate 1 determinism、日區間編排器；**Phase 2（MVP）**：`trip_fact`／`trip_run_map` 由全量 `run_fact` 重算（§4.4）、**離線 published 指針**（§4.5，非 Hive manifest）。  
+> **非範圍**：E2-05 起之 published 批次 ingestion 強制、correction log writer、編排器內建 trip 日迴圈（見 execution plan Phase 2 其餘項）、trainer Step 6/7 取代。
 
 ## 1. 前置條件
 
@@ -24,6 +24,8 @@
 | `data/l1_layered/<id>/run_day_bridge/bet_gaming_day=.../` | `run_day_bridge` 分區（鍵為 **bet 日**） |
 | `data/l1_layered/<id>/trip_fact/trip_start_gaming_day=.../` | **Phase 2**：`trip_fact.parquet` + `manifest.json` |
 | `data/l1_layered/<id>/trip_run_map/trip_start_gaming_day=.../` | **Phase 2**：`trip_run_map.parquet` + `manifest.json` |
+| `data/l1_layered/published/snapshots/<pub_id>/published_snapshot.json` | **Phase 2（E2-04 MVP）**：一次發布事件的 metadata；`pub_*` id |
+| `data/l1_layered/published/current.json` | 目前作用中之 `published_snapshot_id` 與其檔案相對路徑（rollback＝還原舊檔或改寫指針） |
 | `data/l1_layered/materialization_state.duckdb`（預設） | **LDA-E1-09** 日編排 materialization state（DuckDB）；可用 `--state-store` 覆寫 |
 
 **`source_snapshot_id`（L1）**：通常與該批 L0 的 `snap_*` 對齊；若每日各做一次 L0 ingest（`partition_value` 不同），fingerprint 不同，**每日的 `snap_*` 可能不同** — 編排器在 raw 模式會自 ingest 輸出解析。
@@ -100,7 +102,17 @@ python scripts/materialize_trip_fact_v1.py --data-root data \
 
 可選：`--coverage-end YYYY-MM-DD`（未傳則以輸入 run 之最大 `gaming_day` 為觀察上界，用於尾端「開放 trip」判定）、`--l0-fingerprint-json`。`run_fact` 須含 **`run_start_gaming_day`**（`materialize_run_fact_v1` 自本版起寫入）。
 
-### 4.5 Manifest 後補（可選）
+### 4.5 Published snapshot 指針（E2-04 MVP）
+
+離線寫入 **`published_snapshot_v1`** JSON 與 **`current.json`**（非 L1 Hive manifest）。第二次起若未傳 `--previous-published-snapshot-id`，會自既有 `current.json` 的 `active_published_snapshot_id` 填入鏈結之 `previous_*` 欄位；若要斷鏈請加 **`--no-inherit-previous`**。
+
+```bash
+python scripts/publish_layered_snapshot_v1.py --data-root data \
+  --published-snapshot-id pub_2026-05-03_smoke \
+  --source-snapshot-id snap_demo_jan2026usr
+```
+
+### 4.6 Manifest 後補（可選）
 
 ```bash
 python scripts/manifest_lineage_preview_v1.py --help

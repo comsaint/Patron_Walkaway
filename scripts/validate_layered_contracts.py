@@ -120,6 +120,12 @@ def main() -> int:
         _validate_json_schema(_load_json(manifest_tf), manifest_sc)
         manifest_trm = _REPO / "schema" / "examples" / "manifest_trip_run_map_l1_example.json"
         _validate_json_schema(_load_json(manifest_trm), manifest_sc)
+        pub_ex = _REPO / "schema" / "examples" / "published_snapshot.example.json"
+        pub_sc = _REPO / "schema" / "published_snapshot.schema.json"
+        _validate_json_schema(_load_json(pub_ex), pub_sc)
+        cur_ex = _REPO / "schema" / "examples" / "published_current_pointer.example.json"
+        cur_sc = _REPO / "schema" / "published_current_pointer.schema.json"
+        _validate_json_schema(_load_json(cur_ex), cur_sc)
         corr_ex = _REPO / "schema" / "examples" / "late_arrival_correction_log.example.json"
         corr_sc = _REPO / "schema" / "late_arrival_correction_log.schema.json"
         _validate_correction_file(corr_ex, corr_sc)

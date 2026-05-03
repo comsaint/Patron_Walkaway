@@ -1,0 +1,7 @@
+{
+  "active_published_snapshot_id": "pub_example_001",
+  "active_published_snapshot_relpath": "l1_layered/published/snapshots/pub_example_001/published_snapshot.json",
+  "previous_active_published_snapshot_id": null,
+  "schema_version": "published_current_pointer_v1",
+  "updated_at": "2026-05-03T12:00:05Z"
+}
