@@ -1,6 +1,6 @@
 # 分層資料資產與 run/trip 特徵工程 — Implementation Plan
 
-> **版本**：Implementation plan **v0.5**（2026-05-03；同日補述：`preprocess_bet_v1` 去重／輸出序邊界與 execution plan 對齊、`cleaned` 單一活躍資料集治理策略）。對齊 SSOT v1.5；重大架構變更升 minor。  
+> **版本**：Implementation plan **v0.5**（2026-05-03；同日補述：`preprocess_bet_v1` 去重／輸出序邊界與 execution plan 對齊、`cleaned` 單一活躍資料集治理策略、pipeline 程式/文件集中治理策略）。對齊 SSOT v1.5；重大架構變更升 minor。  
 > **依據**：`ssot/layered_data_assets_run_trip_ssot.md`（v1.5）、`schema/time_semantics_registry.yaml`。  
 > **本文層級**：架構、模組邊界、階段交付、驗證與治理；**不含**逐檔 Jira 式任務拆解。  
 > **與 trainer 關係**：本計畫先建立**與現行 `trainer` 管線並行**之資料資產產線；是否改為訓練主讀本層資產須另案決策（見 SSOT §0.1）。
@@ -132,6 +132,29 @@
 - **最小回滾（MUST）**：即使主策略為「僅保留 1 版活躍分區」，仍需保留「最近一次可回滾點」：可為受影響分區的上一版備份或等價 checkpoint，不要求全量雙份儲存。
 - **原子覆寫（MUST）**：分區更新沿用 `*.tmp -> rename`；僅在新 `cleaned.parquet` 與 manifest 校驗完成後，才更新 state/索引，避免產生不可重現中間態。
 - **與上層契約一致（MUST）**：上述策略不得改變 SSOT/Implementation 既有業務語義（dedup、事件序、run/trip 邊界），僅是儲存與治理層策略。
+
+### 2.5 Pipeline 程式與文件集中治理策略（repository organization）
+
+> 目標：降低分散維護成本，讓「功能邊界、入口、契約、文件」在 repo 內可預測，並支援後續 Phase 2+ 擴充。
+
+- **單一歸屬（MUST）**：run/trip pipeline 之核心程式碼應集中於單一路徑（例如 `pipelines/layered_data_assets/` 或等價目錄），避免同類邏輯長期散落 `scripts/`、`doc/`、`tests/` 多處且無明確主從。
+- **分層目錄（SHOULD）**：至少拆分為 `core`（業務邏輯）、`orchestration`（日區間與 state）、`io`（paths/manifest/atomic write）、`cli`（入口封裝）、`docs`（runbook/decision）；目錄名可調整，但責任邊界不可混用。
+- **入口治理（MUST）**：對外可執行入口維持固定少數（preprocess、三個 materialize、day-range orchestrator、gate1）。若遷移目錄，舊 `scripts/*.py` 先改為薄 wrapper（轉呼叫新模組）以維持向後相容。
+- **契約集中（MUST）**：schema/registry（如 `time_semantics_registry`、`preprocess_bet_ingestion_fix_registry`、manifest schema）維持單一真相來源；pipeline 僅透過明確 adapter 讀取，不在多處散寫解析邏輯。
+- **文件分流（MUST）**：  
+  - SSOT / Implementation / Execution 三層仍留在既有 planning 體系；  
+  - pipeline 操作與故障排除（runbook、command cookbook、incident notes）集中於 pipeline docs；  
+  - 跨領域說明文件僅保留索引與連結，避免重複敘述造成漂移。
+- **測試鏡射（SHOULD）**：測試目錄結構對齊實作模組邊界（unit 對 core/io、integration 對 orchestration/cli）；新增模組需同步對應測試群組，避免單一巨型測試檔持續膨脹。
+- **遷移原則（MUST）**：採漸進式搬遷（wrapper-first）而非一次性大搬家；每一遷移批次必須維持 `check-lda-l0`（或等價 gate）可綠燈，且不改變既有資料語義輸出。
+
+**落地現況（2026-05-03，第一批）**
+
+- **Canonical 套件**：`pipelines/layered_data_assets/`（`io/`、`core/`、`orchestration/`、`cli/`、`docs/`）。
+- **相容 shim**：repo 根下 `layered_data_assets/<module>.py` 仍保留，內容為 `from pipelines.layered_data_assets.<subpkg>.<module> import *`，既有 `from layered_data_assets...` 與 CI 無需一次改完。
+- **Runbook**：`pipelines/layered_data_assets/docs/RUNBOOK.md`；`layered_data_assets/RUNBOOK.md` 僅轉址。
+- **第二批（2026-05-03）**：以下 `scripts/*.py` 皆為薄 wrapper；實作在 `pipelines/layered_data_assets/cli/`（共用 `repo_root.discover_repo_root`，但無需 anchor 的 CLI 可不引用）：`lda_l1_gate1_day_range_v1`、`l0_ingest`、`preprocess_bet_v1`、`materialize_run_fact_v1`、`materialize_run_bet_map_v1`、`materialize_run_day_bridge_v1`、`gate1_l1_determinism_v1`、`manifest_lineage_preview_v1`。亦可 `python -m pipelines.layered_data_assets.cli.<模組名>`。
+- **後續批次（SHOULD）**：測試目錄鏡射與 `tests/integration` 依 orchestration 再切子目錄；其餘非 LDA 主線之 `scripts/*.py` 維持現狀至有需求再遷。
 
 ---
 
