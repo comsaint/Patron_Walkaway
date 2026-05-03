@@ -217,6 +217,7 @@ trainer/.data/
 trainer/out_backtest/
 trainer/models/
 trainer/models_90d_weak/
+investigations/
 investigations/test_vs_production/snapshots/*
 investigations/precision_uplift_recall_1pct/orchestrator/state/**
 # Per-run orchestrator reports + ad-hoc copies (sibling to orchestrator/, not under it)
@@ -235,3 +236,7 @@ credential/*.json
 !credential/mlflow.env.example
 local_state/*
 trainer/out_*/
+data/l0_layered
+data/l1_layered
+data/l2_layered
+data/backup*

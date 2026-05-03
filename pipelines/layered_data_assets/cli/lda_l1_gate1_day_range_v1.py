@@ -48,6 +48,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .repo_root import discover_repo_root
@@ -55,6 +56,15 @@ from .repo_root import discover_repo_root
 _REPO_ROOT = discover_repo_root()
 _SCRIPTS = _REPO_ROOT / "scripts"
 LDA_FIXED_DATA_ROOT = (_REPO_ROOT / "data").resolve()
+
+
+def _stderr_line(msg: str, *, emit: Callable[[str], None] | None = None) -> None:
+    """Print one stderr line; use ``emit`` when provided (e.g. :meth:`_DayRangeProgressBar.write_stderr_line`)."""
+    if emit is not None:
+        emit(msg)
+    else:
+        print(msg, file=sys.stderr, flush=True)
+
 
 from ..io.l0_paths import (
     discover_l0_snapshot_ids_for_partition,
@@ -175,9 +185,20 @@ class _DayRangeProgressBar:
                 unit="day",
                 leave=True,
                 file=sys.stderr,
+                dynamic_ncols=True,
+                mininterval=0.25,
             )
         except ImportError:
             self._inner = None
+
+    def write_stderr_line(self, msg: str) -> None:
+        """Print one status line without breaking the in-place tqdm bar."""
+        if self._inner is not None:
+            from tqdm import tqdm
+
+            tqdm.write(msg, file=sys.stderr)
+            return
+        print(msg, file=sys.stderr, flush=True)
 
     def set_postfix_str(self, text: str) -> None:
         if self._inner is not None and hasattr(self._inner, "set_postfix_str"):
@@ -288,13 +309,14 @@ def _run_step(
     step: str,
     capture_output: bool = False,
     echo_commands: bool = False,
+    emit_stderr: Callable[[str], None] | None = None,
 ) -> str | None:
     """Run one subprocess; raise :class:`RuntimeError` on failure. Optionally return merged stdout/stderr."""
     quiet = not echo_commands
     effective_capture = bool(capture_output) or quiet
     if echo_commands:
-        print(f"[orchestrator] >> {step} -- START {label}", file=sys.stderr, flush=True)
-        print(f"[orchestrator]   command: {' '.join(cmd)}", file=sys.stderr, flush=True)
+        _stderr_line(f"[orchestrator] >> {step} -- START {label}", emit=emit_stderr)
+        _stderr_line(f"[orchestrator]   command: {' '.join(cmd)}", emit=emit_stderr)
     t0 = time.monotonic()
     proc = subprocess.run(
         cmd,
@@ -307,16 +329,15 @@ def _run_step(
     err_s = proc.stderr or "" if effective_capture else ""
     blob = (out_s + "\n" + err_s) if effective_capture else None
     if proc.returncode != 0:
-        print(
+        _stderr_line(
             f"[LDA] FAIL {step} ({label}) exit={proc.returncode} after {dt:.1f}s",
-            file=sys.stderr,
-            flush=True,
+            emit=emit_stderr,
         )
         if effective_capture and blob:
-            print(blob.strip()[-8000:], file=sys.stderr, flush=True)
+            _stderr_line(blob.strip()[-8000:], emit=emit_stderr)
         raise RuntimeError(f"{label} failed with exit code {proc.returncode}")
     if echo_commands:
-        print(f"[orchestrator] OK {step} -- DONE {label} in {dt:.1f}s", file=sys.stderr, flush=True)
+        _stderr_line(f"[orchestrator] OK {step} -- DONE {label} in {dt:.1f}s", emit=emit_stderr)
     else:
         is_gate1 = "gate1-" in step
         if is_gate1:
@@ -331,7 +352,7 @@ def _run_step(
             phase = "preprocess"
         else:
             phase = "L1"
-        print(f"[LDA] {phase} | {step} | {dt:.1f}s | {summ}", file=sys.stderr, flush=True)
+        _stderr_line(f"[LDA] {phase} | {step} | {dt:.1f}s | {summ}", emit=emit_stderr)
     return blob
 
 
@@ -368,10 +389,11 @@ def _run_tracked_subprocess(
     output_uri: str | None,
     row_count_parquet: Path | None,
     echo_commands: bool,
+    emit_stderr: Callable[[str], None] | None = None,
 ) -> None:
     """Optionally honor materialization state (skip / mark running / succeeded / failed)."""
     if state_con is None:
-        _run_step(cmd, label=label, step=step, echo_commands=echo_commands)
+        _run_step(cmd, label=label, step=step, echo_commands=echo_commands, emit_stderr=emit_stderr)
         return
     prev = fetch_state_row(
         state_con,
@@ -381,23 +403,21 @@ def _run_tracked_subprocess(
     )
     do_skip = should_skip_step(resume=resume, force=force, row=prev, input_hash=input_hash)
     if do_skip and row_count_parquet is not None and not Path(row_count_parquet).is_file():
-        print(
+        _stderr_line(
             f"[LDA] WARN cannot skip {step}: expected output {row_count_parquet} missing",
-            file=sys.stderr,
-            flush=True,
+            emit=emit_stderr,
         )
         do_skip = False
     if do_skip and artifact_kind.startswith("gate1_") and output_uri:
         out_p = Path(output_uri)
         if not out_p.is_dir() or not any(out_p.iterdir()):
-            print(
+            _stderr_line(
                 f"[LDA] WARN cannot skip {step}: gate1 output dir missing or empty ({out_p})",
-                file=sys.stderr,
-                flush=True,
+                emit=emit_stderr,
             )
             do_skip = False
     if do_skip:
-        print(f"[LDA] SKIP {step} (resume, unchanged input_hash)", file=sys.stderr, flush=True)
+        _stderr_line(f"[LDA] SKIP {step} (resume, unchanged input_hash)", emit=emit_stderr)
         return
     attempt = mark_step_running(
         state_con,
@@ -407,7 +427,7 @@ def _run_tracked_subprocess(
         input_hash=input_hash,
     )
     try:
-        _run_step(cmd, label=label, step=step, echo_commands=echo_commands)
+        _run_step(cmd, label=label, step=step, echo_commands=echo_commands, emit_stderr=emit_stderr)
     except RuntimeError as exc:
         mark_step_failed(
             state_con,
@@ -491,6 +511,7 @@ def _resolve_snapshot_id_for_day(
     py: str,
     dry_run: bool,
     echo_commands: bool,
+    emit_stderr: Callable[[str], None] | None = None,
 ) -> tuple[str, Path | None, list[str], str]:
     """Return ``(snapshot_id, fingerprint_path_or_none, preprocess_input_paths, label)``."""
     if args.bet_parquet is not None:
@@ -537,9 +558,12 @@ def _resolve_snapshot_id_for_day(
 
         if dry_run:
             if echo_commands:
-                print(f"[orchestrator] dry-run would run: {' '.join(bet_cmd)}", file=sys.stderr, flush=True)
+                _stderr_line(f"[orchestrator] dry-run would run: {' '.join(bet_cmd)}", emit=emit_stderr)
                 if sess_cmd is not None:
-                    print(f"[orchestrator] dry-run would run: {' '.join(sess_cmd)}", file=sys.stderr, flush=True)
+                    _stderr_line(
+                        f"[orchestrator] dry-run would run: {' '.join(sess_cmd)}",
+                        emit=emit_stderr,
+                    )
             return "dry_run_snap", None, [str(args.raw_t_bet_parquet.resolve())], "raw(dry-run)"
 
         blob = _run_step(
@@ -548,6 +572,7 @@ def _resolve_snapshot_id_for_day(
             step=f"{d} L0-t_bet",
             capture_output=True,
             echo_commands=echo_commands,
+            emit_stderr=emit_stderr,
         )
         assert blob is not None
         sid = _parse_l0_snapshot_id_from_ingest_output(blob)
@@ -559,6 +584,7 @@ def _resolve_snapshot_id_for_day(
                 label=f"l0_ingest t_session {d}",
                 step=f"{d} L0-t_session",
                 echo_commands=echo_commands,
+                emit_stderr=emit_stderr,
             )
 
         parts = _l0_bet_parquet_paths_for_day(data_root, sid, d)
@@ -577,10 +603,9 @@ def _resolve_snapshot_id_for_day(
             f"No existing L0 t_bet partition for gaming_day={d} under {data_root / 'l0_layered'}"
         )
     if len(ids) > 1:
-        print(
+        _stderr_line(
             f"[LDA] WARN multiple L0 snapshots for {d}: {ids}; using {ids[0]}",
-            file=sys.stderr,
-            flush=True,
+            emit=emit_stderr,
         )
     sid = ids[0]
     fp_path = data_root / "l0_layered" / sid / "snapshot_fingerprint.json"
@@ -610,19 +635,22 @@ def _run_lda_pipeline_for_day(
     Returns:
         ``True`` if caller should stop iterating days (``--stop-after-date`` hit after success).
     """
+    emit = pbar.write_stderr_line
     if echo_commands:
-        print(
-            f"[orchestrator] === Day {day_index}/{day_total}: {d} ===",
-            file=sys.stderr,
-            flush=True,
-        )
+        emit(f"[orchestrator] === Day {day_index}/{day_total}: {d} ===")
     pbar.set_postfix_str(f"{d} discover")
     sid, fp_ingest, pre_inputs, label_in = _resolve_snapshot_id_for_day(
-        d, args=args, data_root=data_root, py=py, dry_run=dry_run, echo_commands=echo_commands
+        d,
+        args=args,
+        data_root=data_root,
+        py=py,
+        dry_run=dry_run,
+        echo_commands=echo_commands,
+        emit_stderr=emit,
     )
     if echo_commands:
-        print(f"[orchestrator]   snapshot_id={sid}  preprocess inputs ({label_in})", file=sys.stderr, flush=True)
-        print(f"[orchestrator]   paths: {pre_inputs}", file=sys.stderr, flush=True)
+        emit(f"[orchestrator]   snapshot_id={sid}  preprocess inputs ({label_in})")
+        emit(f"[orchestrator]   paths: {pre_inputs}")
 
     fp_args = _fp_args_for_materialize(fp_from_ingest=fp_ingest, user_fp=user_fp)
     if dry_run:
@@ -668,6 +696,7 @@ def _run_lda_pipeline_for_day(
         output_uri=cleaned.resolve().as_posix(),
         row_count_parquet=cleaned,
         echo_commands=echo_commands,
+        emit_stderr=emit,
     )
 
     common_mat = [
@@ -711,6 +740,7 @@ def _run_lda_pipeline_for_day(
         output_uri=rf_out.resolve().as_posix(),
         row_count_parquet=rf_out,
         echo_commands=echo_commands,
+        emit_stderr=emit,
     )
 
     bm_cmd = [
@@ -745,6 +775,7 @@ def _run_lda_pipeline_for_day(
         output_uri=bm_out.resolve().as_posix(),
         row_count_parquet=bm_out,
         echo_commands=echo_commands,
+        emit_stderr=emit,
     )
 
     br_cmd = [
@@ -779,6 +810,7 @@ def _run_lda_pipeline_for_day(
         output_uri=br_out.resolve().as_posix(),
         row_count_parquet=br_out,
         echo_commands=echo_commands,
+        emit_stderr=emit,
     )
 
     for art in _GATE1_ARTIFACTS:
@@ -828,15 +860,12 @@ def _run_lda_pipeline_for_day(
             output_uri=out_dir.resolve().as_posix(),
             row_count_parquet=None,
             echo_commands=echo_commands,
+            emit_stderr=emit,
         )
 
     stop_after = getattr(args, "stop_after_date", None)
     if stop_after and stop_after.strip() == d.strip():
-        print(
-            f"[LDA] stop-after-date {stop_after}: stopping after {d}",
-            file=sys.stderr,
-            flush=True,
-        )
+        emit(f"[LDA] stop-after-date {stop_after}: stopping after {d}")
         return True
     return False
 
@@ -1120,7 +1149,7 @@ def main(argv: list[str] | None = None) -> int:
                     pbar=pbar,
                 )
             except RuntimeError as exc:
-                print(f"[LDA] ABORT day {d}: {exc}", file=sys.stderr, flush=True)
+                pbar.write_stderr_line(f"[LDA] ABORT day {d}: {exc}")
                 raise
             pbar.update(1)
             if stop_early:
