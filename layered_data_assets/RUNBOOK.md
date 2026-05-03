@@ -57,6 +57,10 @@ python scripts/preprocess_bet_v1.py --data-root data \
 
 可選：`--l0-fingerprint-json data/l0_layered/<snap>/snapshot_fingerprint.json`
 
+可選：`--ingestion-fix-registry-yaml schema/preprocess_bet_ingestion_fix_registry.yaml`（及 `--ingestion-fix-registry-version-expected`，與 YAML 頂層 `registry_version` 對齊時 fail-fast）。啟用後 manifest 會帶 `ingestion_fix_*`／`applied_fix_rules`；dedup tie-break 使用 synthetic observed（見 SSOT LDA-014）。
+
+**寫檔**：`preprocess_bet_v1` 與三個 `materialize_run_*_v1` 對 **`*.parquet` + `manifest.json`** 採 **`*.tmp` → `os.replace`**，避免長寫入途中留下半套產物。
+
 ### 4.3 物化 `run_fact` / `run_bet_map` / `run_day_bridge`
 
 ```bash
@@ -96,7 +100,7 @@ python scripts/manifest_lineage_preview_v1.py --help
   - **`--l0-existing`**：在 `data/l0_layered` 下依當日分區**自動尋找**既有 `snap_*`（多個時取字典序第一並 stderr 警告）。
   - 若未帶旗標且 **沒有** `data/gmwds_t_bet.parquet`，程式會 stderr 說明並 exit 2，請改用上述旗標之一。
 
-常用旗標：`--date-from` / `--date-to`（含首尾）、`--dry-run`、`--verbose`（轉給 Gate1）、`--no-progress`（關閉編排器日進度條）、`--profiles-json`（轉給 Gate1）、`--gate1-output-parent`、**`--state-store`** / **`--resume`** / **`--force`** / **`--stop-after-date`**（見下 §5.1）。
+常用旗標：`--date-from` / `--date-to`（含首尾）、`--dry-run`、`--verbose`（轉給 Gate1）、`--no-progress`（關閉編排器日進度條）、`--profiles-json`（轉給 Gate1）、`--gate1-output-parent`、**`--state-store`** / **`--resume`** / **`--force`** / **`--stop-after-date`**（見下 §5.1）。可選 **`--ingestion-fix-registry-yaml`**／**`--ingestion-fix-registry-version-expected`**：轉給每日 `preprocess_bet_v1`；`materialization_state` 之 preprocess **`input_hash`** 會納入 registry 檔 stat 與預期版本字串。
 
 ```bash
 python scripts/lda_l1_gate1_day_range_v1.py --help
@@ -113,13 +117,14 @@ python scripts/lda_l1_gate1_day_range_v1.py --date-from 2026-01-01 --date-to 202
 ### 5.1 Resumable state（LDA-E1-09）
 
 - **State DB**：DuckDB 表 `materialization_state`（DDL：`schema/materialization_state.schema.sql`）；程式模組：`layered_data_assets/materialization_state_store_v1.py`。
-- **`--state-store PATH`**：啟用寫入／讀取狀態；每步成功後記 `succeeded` + `input_hash`（由 L0 輸入檔 stat、fingerprint 原文、`cleaned` stat 等組成穩定 JSON 再 sha256）。
+- **`--state-store PATH`**：啟用寫入／讀取狀態；每步成功後記 `succeeded` + `input_hash`（由 L0 輸入檔 stat、fingerprint 原文、（可選）ingestion registry 檔 stat／預期版本、`cleaned` stat 等組成穩定 JSON 再 sha256）。
 - **`--resume`**（且未同時 **`--force`**）：若該步已是 `succeeded` 且 **`input_hash` 與本次計算相同**，則 **skip** 該 subprocess；若預期產物檔或 Gate1 輸出目錄已遺失，會 **WARN 並強制重跑** 該步。
 - **`--force`**：忽略 `succeeded`，一律重跑日期區間內各步（仍寫回 state）。若同時傳 `--resume`，以 **`--force` 為準**。
 - **僅 `--resume` 或 `--force` 而未給 `--state-store`**：使用預設檔 **`data/l1_layered/materialization_state.duckdb`**（倉庫根下之 `data/`）。
 - **`--stop-after-date YYYY-MM-DD`**：必須落在 `--date-from`…`--date-to` 內；該曆日整條管線（含三個 Gate1）**成功結束後**即結束程式，後續日期不跑（方便中斷演練）。
 - **G7（LDA-E1-10）**：`python -m pytest tests/integration/test_lda_e1_10_resume_g7_v1.py -q`（一條龍 vs `stop-after-date`+`--resume` 產物指紋一致；已含於 **`make check-lda-l0`**）。
-- **原子寫**：各 `preprocess`／`materialize`／Gate1 子程序維持既有寫檔行為；編排層在子程序 **exit 0** 後才標 `succeeded`（中斷時不應出現「state 成功但檔案未寫完」之組合，除非子程序誤報成功——與 SSOT 契約一致時應由子程序修正）。
+- **原子寫**：`preprocess_bet_v1` 與三個 `materialize_run_*_v1` 對 **`*.parquet` + `manifest.json`** 採 **`*.tmp` → `os.replace`**；編排層在子程序 **exit 0** 後才標 `succeeded`（中斷時不應出現「state 成功但檔案未寫完」之組合，除非子程序誤報成功——與 SSOT 契約一致時應由子程序修正）。
+- **E1-11 + Gate1（execution §5.3 列 12）**：`python -m pytest tests/integration/test_lda_e1_11_gate1_with_registry_v1.py -q`（已含於 **`make check-lda-l0`**）：帶 registry 之 preprocess 與無 registry 基線在固定 fixture 上 **L1 四產物 row fingerprint 一致**，且 manifest 含 **BET-INGEST-FIX-004**。
 
 **範例（記錄 state，翌日續跑 skip）**：
 

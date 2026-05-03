@@ -72,3 +72,28 @@ def test_compute_input_hash_stable_ordering() -> None:
     a = compute_input_hash({"z": 1, "a": 2})
     b = compute_input_hash({"a": 2, "z": 1})
     assert a == b
+
+
+def test_hash_preprocess_inputs_changes_when_registry_expected_version_changes(tmp_path: Path) -> None:
+    """Optional registry + expected version participate in preprocess input_hash."""
+    inp = tmp_path / "a.parquet"
+    inp.write_bytes(b"x")
+    reg = tmp_path / "registry.yaml"
+    reg.write_text("registry_version: test\n", encoding="utf-8")
+    h1 = hash_preprocess_inputs(
+        source_snapshot_id="snap_x",
+        gaming_day="2026-01-01",
+        preprocess_input_paths=[inp],
+        fingerprint_path=None,
+        ingestion_fix_registry_path=reg,
+        ingestion_fix_registry_version_expected="v1",
+    )
+    h2 = hash_preprocess_inputs(
+        source_snapshot_id="snap_x",
+        gaming_day="2026-01-01",
+        preprocess_input_paths=[inp],
+        fingerprint_path=None,
+        ingestion_fix_registry_path=reg,
+        ingestion_fix_registry_version_expected="v2",
+    )
+    assert h1 != h2

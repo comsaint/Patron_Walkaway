@@ -20,6 +20,12 @@ from layered_data_assets.ingestion_delay_summary_v1 import (  # noqa: E402
     DEFAULT_LATE_THRESHOLD_SEC,
     compute_ingestion_delay_summary_preview,
 )
+from layered_data_assets.atomic_parquet_manifest_v1 import (  # noqa: E402
+    commit_parquet_and_manifest,
+    remove_staged_outputs,
+    staged_manifest_path,
+    staged_parquet_path,
+)
 from layered_data_assets.l1_paths import l1_run_bet_map_partition_dir  # noqa: E402
 from layered_data_assets.manifest_lineage_v1 import merge_source_hashes_into_manifest  # noqa: E402
 from layered_data_assets.oom_runner_v1 import add_duckdb_oom_cli_args, run_duckdb_job_with_oom_retries  # noqa: E402
@@ -114,6 +120,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     out_parquet = out_dir / "run_bet_map.parquet"
     out_manifest = out_dir / "manifest.json"
+    staged_parquet = staged_parquet_path(out_parquet)
+    staged_m = staged_manifest_path(out_manifest)
+    remove_staged_outputs(staged_parquet, staged_m)
 
     inputs = [p.resolve() for p in args.inputs]
 
@@ -121,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         stats = materialize_run_bet_map_v1(
             con=con,
             input_paths=inputs,
-            output_parquet=out_parquet,
+            output_parquet=staged_parquet,
             run_end_gaming_day=args.run_end_gaming_day,
             run_break_min=args.run_break_min,
             run_definition_version=args.run_definition_version,
@@ -155,7 +164,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     manifest = merge_source_hashes_into_manifest(manifest, args.l0_fingerprint_json)
 
-    out_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=True) + "\n", encoding="utf-8")
+    commit_parquet_and_manifest(
+        staged_parquet=staged_parquet,
+        final_parquet=out_parquet,
+        manifest_text=json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=True) + "\n",
+        final_manifest=out_manifest,
+    )
     print(f"OK wrote {out_parquet}")
     print(f"OK wrote {out_manifest}")
     print(f"OK row_count={stats['row_count']}")

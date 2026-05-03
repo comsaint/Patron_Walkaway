@@ -356,6 +356,41 @@ def _fp_args_for_materialize(
     return []
 
 
+def _ingestion_registry_cli_args(args: argparse.Namespace) -> list[str]:
+    """Build optional preprocess ``--ingestion-fix-registry-*`` argv fragment."""
+    out: list[str] = []
+    reg = getattr(args, "ingestion_fix_registry_yaml", None)
+    if reg is not None:
+        out.extend(["--ingestion-fix-registry-yaml", str(Path(reg).resolve())])
+    ver = getattr(args, "ingestion_fix_registry_version_expected", None)
+    if ver is not None and str(ver).strip():
+        out.extend(["--ingestion-fix-registry-version-expected", str(ver).strip()])
+    return out
+
+
+def _hash_preprocess_inputs_for_day(
+    *,
+    args: argparse.Namespace,
+    sid: str,
+    d: str,
+    pre_paths: list[Path],
+    fp_for_hash: Path | None,
+) -> str:
+    """``input_hash`` for preprocess; includes registry file stats when enabled."""
+    reg = getattr(args, "ingestion_fix_registry_yaml", None)
+    reg_p = reg.resolve() if reg is not None else None
+    ver = getattr(args, "ingestion_fix_registry_version_expected", None)
+    ver_s = str(ver).strip() if ver is not None and str(ver).strip() else None
+    return hash_preprocess_inputs(
+        source_snapshot_id=sid,
+        gaming_day=d,
+        preprocess_input_paths=pre_paths,
+        fingerprint_path=fp_for_hash,
+        ingestion_fix_registry_path=reg_p,
+        ingestion_fix_registry_version_expected=ver_s,
+    )
+
+
 def _resolve_snapshot_id_for_day(
     d: str,
     *,
@@ -485,11 +520,12 @@ def _run_lda_pipeline_for_day(
 
     fp_for_hash = _effective_fp_for_hash(fp_ingest, user_fp)
     pre_paths = [Path(p) for p in pre_inputs]
-    h_pre = hash_preprocess_inputs(
-        source_snapshot_id=sid,
-        gaming_day=d,
-        preprocess_input_paths=pre_paths,
-        fingerprint_path=fp_for_hash,
+    h_pre = _hash_preprocess_inputs_for_day(
+        args=args,
+        sid=sid,
+        d=d,
+        pre_paths=pre_paths,
+        fp_for_hash=fp_for_hash,
     )
 
     pre_cmd = [
@@ -502,6 +538,7 @@ def _run_lda_pipeline_for_day(
         "--gaming-day",
         d,
         *fp_args,
+        *_ingestion_registry_cli_args(args),
     ]
     for path in pre_inputs:
         pre_cmd.extend(["--input", path])
@@ -750,6 +787,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional fingerprint override for preprocess/materialize when not using ingest output",
+    )
+    p.add_argument(
+        "--ingestion-fix-registry-yaml",
+        type=Path,
+        default=None,
+        help="Optional: forwarded to preprocess_bet_v1 (BET-INGEST-FIX-004 cap + synthetic observed-at)",
+    )
+    p.add_argument(
+        "--ingestion-fix-registry-version-expected",
+        type=str,
+        default=None,
+        help="Optional fail-fast registry_version check (forwarded to preprocess_bet_v1)",
     )
     p.add_argument(
         "--profiles-json",

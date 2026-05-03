@@ -57,23 +57,31 @@ def hash_preprocess_inputs(
     gaming_day: str,
     preprocess_input_paths: list[Path],
     fingerprint_path: Path | None,
+    ingestion_fix_registry_path: Path | None = None,
+    ingestion_fix_registry_version_expected: str | None = None,
 ) -> str:
     """Build input_hash for preprocess (L0 parts or bet-parquet)."""
     if not preprocess_input_paths:
         raise ValueError("preprocess_input_paths must be non-empty")
     stats = [_stat_triple(p) for p in preprocess_input_paths]
     fp_raw = _read_text_fingerprint(fingerprint_path)
-    return compute_input_hash(
-        {
-            "artifact": ARTIFACT_PREPROCESS_BET,
-            "definition_version": MATERIALIZATION_DEFINITION_VERSION,
-            "transform_version": MATERIALIZATION_TRANSFORM_VERSION,
-            "gaming_day": gaming_day.strip(),
-            "source_snapshot_id": source_snapshot_id.strip(),
-            "preprocess_inputs_stats": stats,
-            "fingerprint_json_raw": fp_raw,
-        }
-    )
+    payload: dict[str, Any] = {
+        "artifact": ARTIFACT_PREPROCESS_BET,
+        "definition_version": MATERIALIZATION_DEFINITION_VERSION,
+        "transform_version": MATERIALIZATION_TRANSFORM_VERSION,
+        "gaming_day": gaming_day.strip(),
+        "source_snapshot_id": source_snapshot_id.strip(),
+        "preprocess_inputs_stats": stats,
+        "fingerprint_json_raw": fp_raw,
+    }
+    if ingestion_fix_registry_path is not None:
+        rp = ingestion_fix_registry_path.resolve()
+        if not rp.is_file():
+            raise FileNotFoundError(f"ingestion_fix_registry_path not found: {rp}")
+        payload["ingestion_fix_registry_stats"] = _stat_triple(rp)
+    if ingestion_fix_registry_version_expected is not None:
+        payload["ingestion_fix_registry_version_expected"] = str(ingestion_fix_registry_version_expected).strip()
+    return compute_input_hash(payload)
 
 
 def hash_run_materialize_inputs(
