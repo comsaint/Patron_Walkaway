@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from layered_data_assets.l0_paths import (
+    discover_l0_snapshot_ids_for_partition,
     l0_layered_root,
     l0_partition_dir,
     l0_snapshot_root,
@@ -54,3 +55,34 @@ def test_l0_partition_dir_rejects_partition_key_with_dotdot_substring() -> None:
 def test_l0_partition_dir_rejects_partition_value_with_equals() -> None:
     with pytest.raises(ValueError, match="partition_value"):
         l0_partition_dir(Path("data"), "snap_abcdefgh", "t_bet", "gaming_day", "2026=04=01")
+
+
+def test_discover_l0_snapshot_ids_for_partition_finds_snap(tmp_path: Path) -> None:
+    part = (
+        tmp_path
+        / "l0_layered"
+        / "snap_zzzzzzzz"
+        / "t_bet"
+        / "gaming_day=2026-02-01"
+    )
+    part.mkdir(parents=True)
+    (part / "part-000.parquet").write_bytes(b"")
+    ids = discover_l0_snapshot_ids_for_partition(
+        tmp_path,
+        table="t_bet",
+        partition_key="gaming_day",
+        partition_value="2026-02-01",
+    )
+    assert ids == ["snap_zzzzzzzz"]
+
+
+def test_discover_l0_snapshot_ids_for_partition_empty(tmp_path: Path) -> None:
+    assert (
+        discover_l0_snapshot_ids_for_partition(
+            tmp_path,
+            table="t_bet",
+            partition_key="gaming_day",
+            partition_value="2099-01-01",
+        )
+        == []
+    )

@@ -35,6 +35,7 @@ tables:
       - "Exclude unrated/non-rated player_id values using the canonical mapping eligibility sidecar before L1 materialization."
       - "Exclude or route invalid/canceled/deleted rows according to preprocessing plan."
       - "Analyze observed_at_col - event_time_col delay distribution; document major backfill episodes and table-specific threshold policy before production use."
+      - "Logical observed-at for ingest-delay / FND-13: apply ingest_delay_cap_sec from residual P95 after documented bulk-ingest exclusions (t_bet cap 122 sec; see ssot/layered_data_assets_run_trip_ssot.md §4.4 LDA-014 and schema/preprocess_bet_ingestion_fix_registry.yaml)."
       - "Resolve duplicated bet_id versions before run/trip assignment."
       - "Use stable ordering by event_time_col, then bet_id for sequence features."
     correction_expected: false
@@ -62,6 +63,7 @@ tables:
       - "Build canonical mapping eligibility sidecar; only rated player_ids whose canonical_id comes from casino_player_id are eligible for bet L1."
       - "Apply FND-12 dummy player_id detection after FND-01/FND-04/placeholder filters; publish dummy set for bet L1 exclusion (see doc/preprocessing_layered_data_assets_v1.md)."
       - "Analyze observed_at_col - event_time_col delay distribution; session_end_dtm is the asset-layer event-time anchor."
+      - "When admitted to L1 ingest-delay analytics, apply observed_at_logical per ssot/layered_data_assets_run_trip_ssot.md §4.4 (residual P95 cap after bulk exclusions); cap_sec TBD per table until measured."
     correction_expected: true
     late_arrival_expected: true
     expected_delay_profile: "Session records are available after session conclusion and can have duplicate/corrected versions; thresholds are defined by implementation / monitoring contracts."
@@ -84,6 +86,7 @@ tables:
     preprocessing_contract:
       - "Deduplicate game_id versions before downstream use."
       - "Analyze observed_at_col - event_time_col delay distribution and document major backfill episodes."
+      - "If admitted to L1 ingest-delay analytics, apply observed_at_logical per ssot/layered_data_assets_run_trip_ssot.md §4.4 (residual P95 cap); cap_sec TBD until measured."
       - "Do not apply additional game-specific filtering until the game table DQ study is completed."
       - "Do not admit into L1/L2 feature computation until a concrete feature dependency is approved."
     correction_expected: true

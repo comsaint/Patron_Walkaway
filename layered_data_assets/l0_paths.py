@@ -42,6 +42,54 @@ def l0_snapshot_root(data_root: Path, snapshot_id: str) -> Path:
     return l0_layered_root(data_root) / snapshot_id.strip()
 
 
+def discover_l0_snapshot_ids_for_partition(
+    data_root: Path,
+    *,
+    table: str,
+    partition_key: str,
+    partition_value: str,
+) -> list[str]:
+    """Return sorted ``snap_*`` ids under ``l0_layered`` that have ``part-*.parquet`` for this Hive partition.
+
+    Used when L0 was ingested per day: each ingest embeds ``partition_value`` in the fingerprint, so
+    ``source_snapshot_id`` often differs by calendar day even for the same logical batch.
+
+    ``partition_value`` must be safe for a path segment (same rules as :func:`l0_partition_dir`).
+    """
+    if not isinstance(table, str) or not table.strip():
+        raise ValueError(f"table must be a non-empty string, got {table!r}")
+    if not isinstance(partition_key, str) or not partition_key.strip():
+        raise ValueError(f"partition_key must be a non-empty string, got {partition_key!r}")
+    if not isinstance(partition_value, str) or not partition_value.strip():
+        raise ValueError(f"partition_value must be a non-empty string, got {partition_value!r}")
+    if ".." in partition_key or "=" in partition_key:
+        raise ValueError(f"invalid partition_key: {partition_key!r}")
+    if (
+        ".." in partition_value
+        or "/" in partition_value
+        or "\\" in partition_value
+        or "=" in partition_value
+    ):
+        raise ValueError(
+            f"partition_value must not contain '=', path separators, or '..', got {partition_value!r}"
+        )
+    root = l0_layered_root(data_root)
+    if not root.is_dir():
+        return []
+    out: list[str] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or not child.name.startswith(_SNAP_PREFIX):
+            continue
+        try:
+            validate_source_snapshot_id(child.name)
+        except ValueError:
+            continue
+        part = child / table.strip() / f"{partition_key.strip()}={partition_value.strip()}"
+        if part.is_dir() and any(part.glob("part-*.parquet")):
+            out.append(child.name)
+    return out
+
+
 def l0_partition_dir(data_root: Path, snapshot_id: str, table: str, partition_key: str, partition_value: str) -> Path:
     """Return directory for one Hive-style partition (e.g. gaming_day=2026-04-01)."""
     if not isinstance(table, str) or not table.strip():

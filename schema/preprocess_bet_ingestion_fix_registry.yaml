@@ -1,0 +1,373 @@
+registry_id: "preprocess_bet_ingestion_fix_registry"
+registry_version: "v0.4_draft"
+owner: "data-assets"
+table: "t_bet"
+preprocess_rule_id: "preprocess_bet_v1"
+description: "Machine-readable registry for ingestion fixes applied before ranked/deduped bet_id logic."
+
+semantics:
+  event_time_col: "payout_complete_dtm"
+  observed_at_col: "__etl_insert_Dtm"
+  apply_stage: "before_ranked_deduped"
+  timezone: "UTC"
+  notes:
+    - "Evaluate all active rules in filtered stage before ROW_NUMBER(PARTITION BY bet_id)."
+    - "Any semantics change must bump fix_rule_version."
+    - "Manifest should include ingestion_fix_rule_id/version and applied_fix_rules."
+
+naming_convention:
+  fix_rule_id_pattern: "^BET-INGEST-FIX-[0-9]{3}$"
+  fix_rule_version_pattern: "^v[0-9]+(\\.[0-9]+)?$"
+  source_snapshot_id_pattern: "^snap_[a-z0-9_]+$"
+  correction_reason_code_enum:
+    - "late_arrival"
+    - "upstream_correction"
+    - "dedup_fix"
+    - "status_fix"
+    - "manual_replay"
+
+default_policy:
+  enabled: true
+  mode: "allow_all_when_not_matched"
+  dry_run_supported: true
+  require_validation_query: true
+  require_ticket_or_doc_ref: true
+  stop_on_invalid_rule: true
+
+fields_contract:
+  required_per_template:
+    - "template_id"
+    - "reason_code"
+    - "default_action"
+    - "default_match_condition_sql"
+    - "default_validation_query_sql"
+  required_per_active_rule:
+    - "fix_rule_id"
+    - "fix_rule_version"
+    - "enabled"
+    - "priority"
+    - "reason_code"
+    - "template_ref"
+    - "scope"
+    - "match_condition_sql"
+    - "action"
+    - "validation_query_sql"
+    - "owner"
+    - "introduced_at"
+    - "doc_ref"
+  action_enum:
+    - "exclude_row"
+    - "tag_only"
+    - "normalize_observed_at"
+    - "route_to_correction_log"
+
+# 歷史注單整批入倉（依 __etl_insert_Dtm 曆日聚集辨識；見 2026-05-03 DuckDB 全檔掃描摘要）
+bulk_historical_ingest_episodes:
+  synthetic_observed_at_contract:
+    description: >
+      Keep registry event_time_col unchanged for business ordering.
+      Define logical observed-at for ingest-delay analytics and (when implemented) dedup tie-break
+      by capping excessive ingestion lag: if raw observed exceeds event_time by more than
+      ingest_delay_cap_sec, use event_time + ingest_delay_cap_sec as logical observed-at;
+      otherwise keep raw __etl_insert_Dtm. Cap value matches residual ingest_delay P95 on t_bet
+      after excluding the two bulk episodes below (122 seconds).
+    event_time_col: "payout_complete_dtm"
+    source_observed_at_col: "__etl_insert_Dtm"
+    ingest_delay_cap_sec: 122
+    residual_p95_reference:
+      artifact: "data/gmwds_t_bet.parquet"
+      methodology: "DuckDB quantile_cont on (epoch(__etl_insert_Dtm)-epoch(payout_complete_dtm)) excluding ETL calendar days 2025-05-27 and 2025-07-21"
+      measured_p95_sec: 122
+      measured_at: "2026-05-03T00:00:00Z"
+    logical_observed_at_expr: >
+      LEAST(TRY_CAST(__etl_insert_Dtm AS TIMESTAMP),
+            TRY_CAST(payout_complete_dtm AS TIMESTAMP) + INTERVAL 122 SECOND)
+    notes:
+      - "L0/raw Parquet must retain original __etl_insert_Dtm; materialize logical column (e.g. __etl_insert_Dtm_synthetic) in preprocess only."
+      - "Do not change payout_complete_dtm for run/trip ordering (BET-ORD-01)."
+  episodes:
+    - episode_id: "BET-BULK-INGEST-2025-05-27"
+      evidence: "DuckDB scan data/gmwds_t_bet.parquet (~497.5M rows); rows with ETL calendar day 2025-05-27"
+      match_rule_sql: >
+        CAST(date_trunc('day', TRY_CAST(__etl_insert_Dtm AS TIMESTAMP)) AS DATE) = DATE '2025-05-27'
+      row_count: 132341002
+      payout_complete_dtm_min: "2024-07-02 22:21:24"
+      payout_complete_dtm_max: "2025-05-27 23:56:58"
+      __etl_insert_Dtm_min: "2025-05-27 16:27:48"
+      __etl_insert_Dtm_max: "2025-05-27 23:59:13"
+      note: "Rows in this episode are handled by global ingest_delay_cap_sec=122 (same as all t_bet rows); episode retained for audit."
+    - episode_id: "BET-BULK-INGEST-2025-07-21"
+      evidence: "Same scan; ETL calendar day 2025-07-21"
+      match_rule_sql: >
+        CAST(date_trunc('day', TRY_CAST(__etl_insert_Dtm AS TIMESTAMP)) AS DATE) = DATE '2025-07-21'
+      row_count: 53257300
+      payout_complete_dtm_min: "2024-12-01 01:14:50"
+      payout_complete_dtm_max: "2025-07-21 23:59:34"
+      __etl_insert_Dtm_min: "2025-07-21 00:00:04"
+      __etl_insert_Dtm_max: "2025-07-21 23:59:46"
+      note: "Same as BET-BULK-INGEST-2025-05-27; global cap applies."
+
+integration_contract:
+  preprocess_bet_v1_inputs:
+    source_snapshot_id_field: "scope.source_snapshot_id_allowlist"
+    gaming_day_fields:
+      from: "scope.gaming_day_from"
+      to: "scope.gaming_day_to"
+  proposed_cli_flags:
+    - "--ingestion-fix-registry-yaml"
+    - "--ingestion-fix-registry-version-override"
+    - "--ingestion-fix-dry-run"
+  execution_order:
+    - "Sort active rules by priority ASC, then fix_rule_id ASC."
+    - "Apply action to matching rows before ranked/deduped."
+    - "Collect applied_fix_rules into manifest."
+
+templates:
+  - template_id: "TPL-LATE-ARRIVAL-TAIL-OUTLIER"
+    reason_code: "late_arrival"
+    default_action:
+      type: "route_to_correction_log"
+      params:
+        correction_reason_code: "late_arrival"
+        then_exclude_from_dedup: true
+    default_match_condition_sql: >
+      TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) IS NOT NULL
+      AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) IS NOT NULL
+      AND (
+        EXTRACT(EPOCH FROM TRY_CAST(__etl_insert_Dtm AS TIMESTAMP))
+        - EXTRACT(EPOCH FROM TRY_CAST(payout_complete_dtm AS TIMESTAMP))
+      ) > {{ delay_threshold_sec }}
+    default_validation_query_sql: >
+      SELECT
+        COUNT(*) AS matched_rows,
+        COUNT(DISTINCT bet_id) AS matched_bet_ids
+      FROM read_parquet(?)
+      WHERE TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) IS NOT NULL
+        AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) IS NOT NULL
+        AND (
+          EXTRACT(EPOCH FROM TRY_CAST(__etl_insert_Dtm AS TIMESTAMP))
+          - EXTRACT(EPOCH FROM TRY_CAST(payout_complete_dtm AS TIMESTAMP))
+        ) > {{ delay_threshold_sec }};
+
+  - template_id: "TPL-KNOWN-BACKFILL-WINDOW"
+    reason_code: "upstream_correction"
+    default_action:
+      type: "tag_only"
+      params:
+        tag_column_name: "_ingestion_fix_tag"
+        tag_value: "{{ fix_rule_id }}:{{ fix_rule_version }}"
+    default_match_condition_sql: >
+      TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) >= TIMESTAMP '{{ observed_at_from }}'
+      AND TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) < TIMESTAMP '{{ observed_at_to }}'
+      AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) >= TIMESTAMP '{{ event_time_from }}'
+      AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) < TIMESTAMP '{{ event_time_to }}'
+    default_validation_query_sql: >
+      SELECT
+        COUNT(*) AS matched_rows,
+        MIN(__etl_insert_Dtm) AS min_observed_at,
+        MAX(__etl_insert_Dtm) AS max_observed_at
+      FROM read_parquet(?)
+      WHERE TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) >= TIMESTAMP '{{ observed_at_from }}'
+        AND TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) < TIMESTAMP '{{ observed_at_to }}'
+        AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) >= TIMESTAMP '{{ event_time_from }}'
+        AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) < TIMESTAMP '{{ event_time_to }}';
+
+  - template_id: "TPL-OBSERVED-DELAY-P95-CAP"
+    reason_code: "upstream_correction"
+    default_action:
+      type: "normalize_observed_at"
+      params:
+        mode: "cap_observed_after_event"
+        output_observed_col: "__etl_insert_Dtm_synthetic"
+    default_match_condition_sql: >
+      TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) IS NOT NULL
+      AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) IS NOT NULL
+    default_validation_query_sql: >
+      SELECT
+        COUNT(*)::BIGINT AS n_rows,
+        COUNT(*) FILTER (WHERE
+          TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) >
+          TRY_CAST(payout_complete_dtm AS TIMESTAMP) + INTERVAL {{ cap_delay_sec }} SECOND
+        )::BIGINT AS n_capped
+      FROM read_parquet(?)
+      WHERE TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) IS NOT NULL
+        AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) IS NOT NULL;
+
+active_rules:
+  - fix_rule_id: "BET-INGEST-FIX-004"
+    fix_rule_version: "v1"
+    enabled: true
+    priority: 5
+    reason_code: "upstream_correction"
+    template_ref: "TPL-OBSERVED-DELAY-P95-CAP"
+    scope:
+      source_snapshot_id_allowlist: []
+      gaming_day_from: null
+      gaming_day_to: null
+      bet_id_allowlist: []
+      player_id_allowlist: []
+    match_condition_sql: >
+      TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) IS NOT NULL
+      AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) IS NOT NULL
+    action:
+      type: "normalize_observed_at"
+      params:
+        mode: "cap_observed_after_event"
+        event_time_col: "payout_complete_dtm"
+        source_observed_col: "__etl_insert_Dtm"
+        output_observed_col: "__etl_insert_Dtm_synthetic"
+        cap_delay_sec: 122
+    validation_query_sql: >
+      SELECT
+        COUNT(*)::BIGINT AS n_rows,
+        COUNT(*) FILTER (WHERE
+          TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) >
+          TRY_CAST(payout_complete_dtm AS TIMESTAMP) + INTERVAL 122 SECOND
+        )::BIGINT AS n_rows_where_raw_observed_exceeds_cap
+      FROM read_parquet(?)
+      WHERE TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) IS NOT NULL
+        AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) IS NOT NULL;
+    owner: "data-assets"
+    introduced_at: "2026-05-03T14:00:00Z"
+    doc_ref: "ssot/layered_data_assets_run_trip_ssot.md §4.4"
+    ticket_ref: "TBD"
+
+  - fix_rule_id: "BET-INGEST-FIX-001"
+    fix_rule_version: "v1"
+    enabled: false
+    priority: 10
+    reason_code: "late_arrival"
+    template_ref: "TPL-LATE-ARRIVAL-TAIL-OUTLIER"
+    scope:
+      source_snapshot_id_allowlist: []
+      gaming_day_from: "2025-01-01"
+      gaming_day_to: "2025-12-31"
+      bet_id_allowlist: []
+      player_id_allowlist: []
+    match_condition_sql: >
+      TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) IS NOT NULL
+      AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) IS NOT NULL
+      AND (
+        EXTRACT(EPOCH FROM TRY_CAST(__etl_insert_Dtm AS TIMESTAMP))
+        - EXTRACT(EPOCH FROM TRY_CAST(payout_complete_dtm AS TIMESTAMP))
+      ) > 1209600
+    action:
+      type: "route_to_correction_log"
+      params:
+        correction_reason_code: "late_arrival"
+        correction_summary: "Observed delay > 14 days before dedup."
+        then_exclude_from_dedup: true
+    validation_query_sql: >
+      SELECT
+        COUNT(*) AS matched_rows,
+        MIN(__etl_insert_Dtm) AS min_observed_at,
+        MAX(__etl_insert_Dtm) AS max_observed_at
+      FROM read_parquet(?)
+      WHERE TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) IS NOT NULL
+        AND TRY_CAST(payout_complete_dtm AS TIMESTAMP) IS NOT NULL
+        AND (
+          EXTRACT(EPOCH FROM TRY_CAST(__etl_insert_Dtm AS TIMESTAMP))
+          - EXTRACT(EPOCH FROM TRY_CAST(payout_complete_dtm AS TIMESTAMP))
+        ) > 1209600;
+    owner: "ml-platform"
+    introduced_at: "2026-05-03T00:00:00Z"
+    doc_ref: "doc/DELAY_DISTRIBUTION_MONTHLY_ANALYSIS_20260428.md"
+    ticket_ref: "TBD"
+    deprecation_note: "Superseded for t_bet by BET-INGEST-FIX-004 (P95 residual cap on logical observed-at). Re-enable only if row exclusion is explicitly required in addition to the cap."
+
+  - fix_rule_id: "BET-INGEST-FIX-002"
+    fix_rule_version: "v2"
+    enabled: false
+    priority: 20
+    reason_code: "upstream_correction"
+    template_ref: "TPL-KNOWN-BACKFILL-WINDOW"
+    episode_ref: "BET-BULK-INGEST-2025-05-27"
+    scope:
+      source_snapshot_id_allowlist: []
+      gaming_day_from: null
+      gaming_day_to: null
+      bet_id_allowlist: []
+      player_id_allowlist: []
+    match_condition_sql: >
+      CAST(date_trunc('day', TRY_CAST(__etl_insert_Dtm AS TIMESTAMP)) AS DATE) = DATE '2025-05-27'
+    action:
+      type: "normalize_observed_at"
+      params:
+        mode: "cap_observed_after_event"
+        event_time_col: "payout_complete_dtm"
+        source_observed_col: "__etl_insert_Dtm"
+        output_observed_col: "__etl_insert_Dtm_synthetic"
+        cap_delay_sec: 122
+    validation_query_sql: >
+      SELECT COUNT(*)::BIGINT AS matched_rows
+      FROM read_parquet(?)
+      WHERE CAST(date_trunc('day', TRY_CAST(__etl_insert_Dtm AS TIMESTAMP)) AS DATE) = DATE '2025-05-27';
+    owner: "data-platform"
+    introduced_at: "2026-05-03T00:00:00Z"
+    doc_ref: "schema/preprocess_bet_ingestion_fix_registry.yaml#bulk_historical_ingest_episodes"
+    ticket_ref: "TBD"
+
+  - fix_rule_id: "BET-INGEST-FIX-003"
+    fix_rule_version: "v1"
+    enabled: false
+    priority: 21
+    reason_code: "upstream_correction"
+    template_ref: "TPL-KNOWN-BACKFILL-WINDOW"
+    episode_ref: "BET-BULK-INGEST-2025-07-21"
+    scope:
+      source_snapshot_id_allowlist: []
+      gaming_day_from: null
+      gaming_day_to: null
+      bet_id_allowlist: []
+      player_id_allowlist: []
+    match_condition_sql: >
+      CAST(date_trunc('day', TRY_CAST(__etl_insert_Dtm AS TIMESTAMP)) AS DATE) = DATE '2025-07-21'
+    action:
+      type: "normalize_observed_at"
+      params:
+        mode: "cap_observed_after_event"
+        event_time_col: "payout_complete_dtm"
+        source_observed_col: "__etl_insert_Dtm"
+        output_observed_col: "__etl_insert_Dtm_synthetic"
+        cap_delay_sec: 122
+    validation_query_sql: >
+      SELECT COUNT(*)::BIGINT AS matched_rows
+      FROM read_parquet(?)
+      WHERE CAST(date_trunc('day', TRY_CAST(__etl_insert_Dtm AS TIMESTAMP)) AS DATE) = DATE '2025-07-21';
+    owner: "data-platform"
+    introduced_at: "2026-05-03T00:00:00Z"
+    doc_ref: "schema/preprocess_bet_ingestion_fix_registry.yaml#bulk_historical_ingest_episodes"
+    ticket_ref: "TBD"
+
+manifest_binding:
+  required_fields:
+    - "ingestion_fix_rule_id"
+    - "ingestion_fix_rule_version"
+    - "ingestion_delay_summary"
+  recommended_fields:
+    - "applied_fix_rules"
+    - "fix_registry_uri"
+    - "fix_registry_sha256"
+    - "fix_registry_active_rules_hash"
+  example:
+    ingestion_fix_rule_id: "preprocess_bet_ingestion_fix_registry"
+    ingestion_fix_rule_version: "v0.4_draft"
+    applied_fix_rules:
+      - "BET-INGEST-FIX-004:v1"
+      - "BET-INGEST-FIX-001:v1"
+      - "BET-INGEST-FIX-002:v2"
+      - "BET-INGEST-FIX-003:v1"
+
+change_log:
+  - at: "2026-05-03T00:00:00Z"
+    by: "cursor-agent"
+    change: "Initial draft."
+  - at: "2026-05-03T04:50:00Z"
+    by: "cursor-agent"
+    change: "Split into templates and active_rules; added naming and preprocess integration contract."
+  - at: "2026-05-03T13:10:00Z"
+    by: "cursor-agent"
+    change: "Logged two bulk historical ingest episodes (2025-05-27, 2025-07-21) and synthetic observed-at contract; BET-INGEST-FIX-002/003 normalize rules disabled until observe_delay_after_event_sec is set."
+  - at: "2026-05-03T14:00:00Z"
+    by: "cursor-agent"
+    change: "t_bet ingest_delay_cap_sec=122 from residual P95; BET-INGEST-FIX-004 cap rule enabled; BET-INGEST-FIX-001 disabled (superseded by cap). SSOT v1.5 documents cross-table P95 residual cap policy."

@@ -1,7 +1,7 @@
 # 分層資料資產與 run/trip 特徵工程 — Implementation Plan
 
-> **版本**：Implementation plan **v0.2**（2026-05-02）。對齊 SSOT v1.3；重大架構變更升 minor。  
-> **依據**：`ssot/layered_data_assets_run_trip_ssot.md`（v1.3）、`schema/time_semantics_registry.yaml`。  
+> **版本**：Implementation plan **v0.5**（2026-05-03；同日補述：`preprocess_bet_v1` 去重／輸出序邊界與 execution plan 對齊）。對齊 SSOT v1.5；重大架構變更升 minor。  
+> **依據**：`ssot/layered_data_assets_run_trip_ssot.md`（v1.5）、`schema/time_semantics_registry.yaml`。  
 > **本文層級**：架構、模組邊界、階段交付、驗證與治理；**不含**逐檔 Jira 式任務拆解。  
 > **與 trainer 關係**：本計畫先建立**與現行 `trainer` 管線並行**之資料資產產線；是否改為訓練主讀本層資產須另案決策（見 SSOT §0.1）。
 
@@ -36,6 +36,7 @@
 3. **可重現與可審計**：每一批次產物可指涉 `source_snapshot_id`、`definition_version` / `feature_version` / `transform_version`、manifest、必要時 **ingestion 延遲摘要**。
 4. **資源可控**：大表掃描以 **gaming_day（或約定分區）** 增量為主；單機路徑須支援 **串流／分批**（DuckDB 或等價），避免假設可一次載入全歷史。
 5. **與既有特徵契約對齊**：以 `package/deploy/models/feature_spec.yaml` 為覆蓋底線；採 **`player_id` + asset-layer `feature_spec`**；**全量枚舉、100% 重現與驗收**之操作定義見 **§6.1**（含 **§6.1.1**）。deploy 檔內之 `canonical_id`／`PARTITION BY canonical_id` 等僅為**現況描述**；本產線不採 `canonical_id` 作為特徵主分區鍵（見 §6.1）。
+6. **可中斷與可續跑（resumable）**：以 `gaming_day` 為最小計算單元；任何單日產物需可獨立重跑、跳過已完成分區、並在中斷後從未完成日期續跑。
 
 ---
 
@@ -68,6 +69,7 @@
 | **L2 assemble** | L1 + 需求窗 | 訓練或分析用矩陣／索引 | 抽樣、權重僅在此層 |
 | **Publish（serving 基底）** | L1/L2 | `published_snapshot_id` + sidecar manifest | 週期與 SLO 於 Phase 2 固定 |
 | **Online delta（可選）** | 新 bet 流 + 上一版 published | bounded state + `late_arrival_correction_log` | 須可證明上界 |
+| **Resumable orchestration** | 日期區間 + 版本鍵 + 既有狀態 | 單日計算狀態（pending/running/succeeded/failed/skipped）+ 可續跑計畫 | 以 `gaming_day` 為最小單元，支援 stop/resume |
 
 ### 2.2 儲存與編排（建議）
 
@@ -75,6 +77,50 @@
 - **Registry**：`schema/time_semantics_registry.yaml`（單一真相）；CI 或 PR checklist 驗證 schema 與欄位存在性。
 - **Manifest**：每批次目錄 `manifest.json`（或集中 registry DB）；published 另寫 `published_snapshot.json`。
 - **編排**：初期以 **CLI + cron/Airflow（若已有）** 即可；不將編排器選型列為本計畫 gate。
+- **State store（新增）**：維護日粒度執行狀態（例如 SQLite/DuckDB/JSONL）；每筆至少含 `artifact_kind`、`gaming_day`、`source_snapshot_id`、`definition_version`、`transform_version`、`status`、`attempt`、`input_hash`、`output_uri`、`updated_at`、`error_summary`。
+
+### 2.3 Resumable 工程契約（草案）
+
+**最小資料表（建議名：`materialization_state`）**
+
+| 欄位 | 型別（建議） | 說明 |
+|------|------|------|
+| `artifact_kind` | TEXT | `preprocess_bet` / `run_fact` / `run_bet_map` / `run_day_bridge` / `trip_fact` / `trip_run_map` |
+| `gaming_day` | DATE/TEXT | 單日單元鍵（`YYYY-MM-DD`） |
+| `source_snapshot_id` | TEXT | 輸入快照版本 |
+| `definition_version` | TEXT | run/trip 定義版本 |
+| `transform_version` | TEXT | 流程版本 |
+| `input_hash` | TEXT | 該日輸入內容指紋（用於 skip/stale 判定） |
+| `status` | TEXT | `pending` / `running` / `succeeded` / `failed` / `skipped` |
+| `attempt` | INTEGER | 該單元嘗試次數 |
+| `output_uri` | TEXT | 成功輸出檔 URI（可空） |
+| `row_count` | BIGINT | 成功輸出列數（可空） |
+| `row_hash` | TEXT | row-level hash/checksum（可空） |
+| `error_summary` | TEXT | 失敗摘要（可空） |
+| `updated_at` | TIMESTAMP | 最後更新時間 |
+
+**唯一鍵（建議）**
+
+- `UNIQUE (artifact_kind, gaming_day, source_snapshot_id, definition_version, transform_version)`
+
+**狀態轉移（MUST）**
+
+- `pending -> running -> succeeded|failed`
+- `succeeded -> skipped`（僅在 `--resume` 且輸入/版本未變時）
+- 任一狀態 `-> running`（僅在 `--force` 顯式重算）
+
+**CLI 契約（最小）**
+
+- `--date-from YYYY-MM-DD` / `--date-to YYYY-MM-DD`
+- `--resume`：僅跑 `pending|failed`，`succeeded` 預設 skip
+- `--force`：忽略既有 `succeeded`，強制重算指定日期
+- `--stop-after-date YYYY-MM-DD`：驗證可中斷點
+- `--state-store PATH`：指定 state DB（預設 `data/l1_layered/materialization_state.duckdb`）
+
+**原子寫入（MUST）**
+
+- 目標檔先寫 `*.tmp`，完成校驗（row_count/hash）後 rename 成正式檔。
+- 僅在 rename 成功後寫入 `status=succeeded`；任何中斷都不得留下「成功狀態 + 半成品檔」。
 
 ---
 
@@ -84,11 +130,12 @@
 |------|------|
 | **time_semantics_registry** | 維護每表 `event_time` / `observed_at` / `business_key` / `dedup_rule_id`；與 `GDP_GMWDS_Raw_Schema_Dictionary.md`、FND 對齊。 |
 | **preprocessing** | `player_id` / `bet_id` 有效性、重複版本、`manual/canceled/deleted` 等；輸出 rule id 與版本供 manifest。 |
-| **run_trip_builder** | 依 SSOT v1 切 run、依 3 個完整 gaming_day 關 trip；產出 facts + membership + bridge。 |
+| **run_trip_builder** | 依 SSOT run v2 切 run（30 分鐘 gap + `gaming_day` hard cutoff）、依 3 個完整 gaming_day 關 trip；產出 facts + membership + bridge。 |
 | **lineage_manifest_writer** | 寫 SSOT §8 欄位 + `ingestion_delay_summary`（published 強制）。 |
 | **feature_dependency_registry**（新建或併入 doc） | 依 **§6.1.1** 自 deploy `feature_spec.yaml` 枚舉 `(track_section, feature_id)` → 所需 L1 欄位／是否允許回掃 bet。 |
 | **parity_validator** | 抽樣或窗內比對：**依 deploy `feature_spec.yaml` 獨立重算之參考值** vs **asset-layer / L2 產出**（見 §6）；不依賴既有 trainer 快取產物作為唯一真相。 |
 | **publisher** | 產出 `published_snapshot_id`、刷新週期標識、可選 `online_delta_seq` 契約。 |
+| **resume_controller** | 依 state store + manifest 決定「可跳過／需重跑／可續跑」日期集合；提供 `--resume` / `--force` / `--date-from` / `--date-to` 契約。 |
 
 **與 `trainer` 邊界**：第一階段 **不重構** `trainer.py`；僅定義「可讀取 L1 產物」之介面契約，供後續合併決策。
 
@@ -105,7 +152,19 @@
 ### 4.2 事件序與 PIT
 
 - Bet 序：**`ORDER BY payout_complete_dtm ASC, bet_id ASC`**（與 trainer SSOT C1 精神一致）。
+- Run 邊界：同時套用 **`gap <= 30 分鐘`** 與 **`gaming_day` 變更硬切**；`gaming_day` 邊界由 **`GAMING_DAY_START_HOUR`** 決定（目前專案設定為 `3`，Asia/Hong_Kong）。
+- 邊界欄位：`run_fact` 應輸出 **`is_hard_cutoff`**（或等價 `boundary_reason`），供訓練排除與審計追溯。
+- 版本治理：`GAMING_DAY_START_HOUR` 或 hard cutoff 規則調整，必須升 `run_definition_version` 並觸發受影響分區重算。
 - 任何「以 observed_at 取代 event_time 排序」之行為 **禁止**（SSOT §4.4）。
+- **`observed_at_logical` 契約（SSOT v1.5 / LDA-014）**：對來源表先排除已文件化整批入倉 episode，量測 `observed_at_raw - event_time` 殘差 P95，登錄 `ingest_delay_cap_sec`；preprocess 階段以 `min(observed_at_raw, event_time + cap)` 產生邏輯可觀測時間（例如 `__etl_insert_Dtm_synthetic`）。`L0` raw 時戳不得覆寫。
+- **`preprocess_bet_v1` 實作邊界（2026-05-03 定案）**：`bet_id` 去重仍 **`PARTITION BY bet_id`**（**不**改為 `PARTITION BY gaming_day, bet_id`）；`cleaned` 輸出主序仍 **`ORDER BY payout_complete_dtm ASC, bet_id ASC`**（與本節 Bet 序、`run_fact_v1`、scorer 穩定排序一致）。`observed_at_logical` 僅用於 ingest-delay 分析／manifest 摘要與（若實作）dedup tie-break，**不得**取代 `payout_complete_dtm` 作為業務事件序主鍵。
+
+### 4.3 Trip close 計算等價式（實作契約）
+
+- **語義不變（MUST）**：trip 仍採 SSOT 定義「**3 個完整 `gaming_day` 無 bet 才關**」。
+- **計算替代（SHOULD）**：在 run hard cutoff 已啟用前提下，可用「**3 個完整 `gaming_day` 無 run**」作為實作判定，以降低計算成本。
+- **等價前提（MUST）**：同一資料範圍內，必須成立 `有 bet <=> 該日存在至少一個 run`（run 由 bet 壓縮而來，不允許空 run）。
+- **驗證要求（MUST）**：每次 `definition_version` 升版或邊界規則調整時，需以 fixture/抽樣驗證「無 bet」與「無 run」判定結果一致。
 
 ---
 
@@ -119,6 +178,7 @@
 
 - `schema/time_semantics_registry.yaml` 之 **審核流程**（對應 SSOT §11 議題 7）：PR template、必填欄位檢查。
 - **Preprocessing 規格書**（短文件即可）：對應 `preprocess_*_v1` 與 FND-01/03/11/13 之對照表。
+- **Ingestion fix registry**：`schema/preprocess_bet_ingestion_fix_registry.yaml`（及後續表別 registry）欄位契約、版本策略、與 `time_semantics_registry` 一致性檢查；需包含 bulk episode 證據與 `ingest_delay_cap_sec` 量測方法。
 - **Manifest schema**（JSON schema 或表格）：欄位含 SSOT §8 + `ingestion_delay_summary` 結構約定。
 - **`late_arrival_correction_log` schema**（JSON schema 或表格）：與 §10 最小欄位契約一致，與 manifest 可追溯 join 鍵一併鎖定。
 - **Feature dependency registry** 初稿：依 **§6.1.1** 自 `feature_spec.yaml` 列出每一 `(track_section, feature_id)` 所需欄位與 partition key。
@@ -132,8 +192,9 @@
 **交付物**：
 
 - L0 分區寫入與 `source_snapshot_id` 產生規則。
-- Preprocess → `run_fact`、`run_bet_map`、`run_day_bridge`（Phase 1 不產出 trip 最終語義；trip 於 Phase 2 一次到位導入 v1 規則）。
+- Preprocess → `run_fact`、`run_bet_map`、`run_day_bridge`（run 依 `gaming_day` hard cutoff 切分，`run_fact` 含 `is_hard_cutoff` 或等價欄位；Phase 1 不產出 trip 最終語義；trip 於 Phase 2 一次到位導入 v1 規則）。
 - 每批次 manifest + **ingestion 延遲摘要**（published 路徑預演）。
+- 日區間編排支援 **resumable**：每個 `gaming_day` 單獨落檔並寫入 state store；中斷後可從未完成日期續跑。
 
 **驗證**：
 
@@ -146,9 +207,10 @@
 
 **交付物**：
 
-- `trip_fact`、`trip_run_map`；與 `run_fact` 分區策略（`run_end_gaming_day` + bridge）對齊。
+- `trip_fact`、`trip_run_map`；與 `run_fact` 分區策略（`run_end_gaming_day`，以及可選 `run_day_bridge` 影響分析）對齊。
 - `published_snapshot_id` 發布流程與 **回滾策略**（保留上一版 snapshot 指標）。
 - **K/T/D** 線上有界緩衝之數值建議與負載評估（對應 SSOT §5.4）。
+- trip close 採「**語義維持無 bet**、實作可用無 run 等價判定」並輸出一致性驗證報告。
 
 **驗證**：
 
@@ -226,6 +288,8 @@
 | 風險 | 影響 | 緩解 |
 |------|------|------|
 | 單日分區仍過大導致 OOM | 物化失敗 | 採「估算→參數化執行→OOM 自動降載重試」：先估可用 RAM 與資料量，推導 batch/window；失敗時自動縮窗、提高 bucket 數、降低並行後重試（保留重試紀錄）。 |
+| `GAMING_DAY_START_HOUR` 與來源 `gaming_day` 口徑漂移 | run 邊界錯切、特徵不穩定 | 將 cutoff 視為 `definition_version` 參數；變更需升版並重算；例行抽樣比對 `gaming_day` 與 `payout_complete_dtm@HK` 邊界一致性。 |
+| 續跑狀態不一致（state corruption） | 已完成分區被重複覆寫、或失敗分區被誤跳過 | 採原子寫入（tmp→rename）、state/manifest 雙重校驗、`--force` 僅允許顯式重算。 |
 | `player_id` 碎裂（FND-11） | trip/run 語意與業務直覺不一致 | SSOT 已接受；實作上在監控報告中追蹤「單人多段 trip」比例。 |
 | deploy spec 與 asset-layer spec 語義漂移 | 特徵一致性與可維護性下降 | 以 coverage matrix + mismatch ledger 持續稽核，任何新增/修改 feature 必須雙邊對映更新。 |
 | registry 與實際表漂移 | 錯誤 event_time | PR 必須更新 registry；CI 驗證欄位存在。 |
@@ -251,6 +315,7 @@
 3. Membership：`trip_run_map` / `run_bet_map` 可完整重建 run/trip 邊界。  
 4. Ingestion：`published` 批次皆含 **ingestion_delay_summary**。  
 5. Feature：同 **§6.1**／**§6.1.1**（deploy spec 可枚舉特徵之 **100% 覆蓋**與 **deterministic 一致**）；未達成不得結案。
+6. Resume/Idempotency：同日期區間在「一次跑完」與「中斷後續跑」兩種路徑下，輸出列數與 row-level hash 一致；已成功分區可被安全跳過。
 
 ### 8.2 Rollout
 
@@ -318,7 +383,7 @@
 ## 11) 文件維護
 
 - SSOT 變更時：本計畫須檢視 **Phase 範圍與驗收** 是否仍成立；必要時升版本計畫「階段」敘述，不修改 SSOT 業務定義。  
-- 本計畫版本以文首 **blockquote 版本列**為準（目前 v0.2）；重大架構變更升 minor。
+- 本計畫版本以文首 **blockquote 版本列**為準（目前 v0.4）；重大架構變更升 minor。
 
 ---
 

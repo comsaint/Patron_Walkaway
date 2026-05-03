@@ -107,7 +107,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="JSON",
         help=(
             "Override DuckDB profiles as JSON, e.g. '[[null,2],[2048,2]]' (null = default memory_limit). "
-            "Omit to use built-in Gate 1 defaults (includes low-memory steps)."
+            "Omit to use built-in Gate 1 defaults (threads=2 vs 1; no memory_limit cap)."
         ),
     )
     p.add_argument(

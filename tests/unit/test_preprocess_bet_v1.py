@@ -14,7 +14,33 @@ from layered_data_assets.preprocess_bet_v1 import (
     build_preprocess_manifest,
     manifest_output_relative_uri,
     run_preprocess_bet_v1,
+    validate_preprocess_bet_input_columns,
 )
+
+
+def test_validate_preprocess_bet_input_columns_rejects_feature_slice_names() -> None:
+    cols = {"label", "pace_drop_ratio", "bet_time"}
+    with pytest.raises(ValueError, match="player_id"):
+        validate_preprocess_bet_input_columns(cols)
+
+
+@pytest.mark.skipif(duckdb is None, reason="duckdb not installed")
+def test_preprocess_bet_v1_rejects_wrong_schema(tmp_path: Path) -> None:
+    inp = tmp_path / "features.parquet"
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute("COPY (SELECT 1::INTEGER AS label, 0.5::DOUBLE AS pace_drop_ratio) TO ? (FORMAT PARQUET)", [str(inp)])
+        with pytest.raises(ValueError, match="preprocess_bet_v1 requires"):
+            run_preprocess_bet_v1(
+                con=con,
+                input_paths=[inp],
+                output_parquet=tmp_path / "out.parquet",
+                gaming_day="2026-01-01",
+                dummy_player_ids_parquet=None,
+                eligible_player_ids_parquet=None,
+            )
+    finally:
+        con.close()
 
 
 @pytest.mark.skipif(duckdb is None, reason="duckdb not installed")

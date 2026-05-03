@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """L1 preprocess for ``t_bet``: ``preprocess_bet_v1`` via DuckDB + manifest (LDA-E1-02).
 
-Reads one or more Parquet files (L0 ``part-*.parquet`` or raw export), applies BET-PK / BET-DQ-01
+Reads one or more Parquet files (L0 ``part-*.parquet`` or raw ``t_bet`` export with at least
+``player_id``, ``bet_id``, ``gaming_day``), applies BET-PK / BET-DQ-01
 filters, ``bet_id`` dedup (latest ``__etl_insert_Dtm``), optional dummy / eligible anti-joins,
 writes ``cleaned.parquet`` and ``manifest.json`` under ``data/l1_layered/<source_snapshot_id>/t_bet/gaming_day=.../``.
 """
@@ -40,7 +41,7 @@ def _add_preprocess_bet_required_args(p: argparse.ArgumentParser) -> None:
         action="append",
         type=Path,
         required=True,
-        help="Input Parquet (repeatable); must include columns for filters used",
+        help="Input Parquet (repeatable); must include player_id, bet_id, gaming_day (L0 t_bet shape)",
     )
 
 
@@ -123,16 +124,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         return stats, id_summary
 
-    stats, id_summary = run_duckdb_job_with_oom_retries(
-        connect=lambda: duckdb.connect(database=":memory:"),
-        work=_work,
-        input_paths=inputs,
-        job_name="preprocess_bet_v1",
-        run_log_path=args.duckdb_run_log,
-        failure_context_path=args.duckdb_oom_failure_context,
-        max_attempts=args.duckdb_oom_max_attempts,
-        initial_memory_limit_mb=args.duckdb_initial_memory_limit_mb,
-    )
+    try:
+        stats, id_summary = run_duckdb_job_with_oom_retries(
+            connect=lambda: duckdb.connect(database=":memory:"),
+            work=_work,
+            input_paths=inputs,
+            job_name="preprocess_bet_v1",
+            run_log_path=args.duckdb_run_log,
+            failure_context_path=args.duckdb_oom_failure_context,
+            max_attempts=args.duckdb_oom_max_attempts,
+            initial_memory_limit_mb=args.duckdb_initial_memory_limit_mb,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     manifest = build_preprocess_manifest(
         source_snapshot_id=args.source_snapshot_id,
         gaming_day=args.gaming_day,

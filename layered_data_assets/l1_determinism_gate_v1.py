@@ -19,11 +19,15 @@ ArtifactKind = Literal["run_fact", "run_bet_map", "run_day_bridge"]
 
 EMPTY_ROW_AGG_SHA256_HEX = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
+# Default determinism sweep (implementation plan §8.1): vary ``threads`` only, keep
+# ``memory_limit`` unset (DuckDB default).  Capping ``memory_limit`` to a few GiB on
+# million-row ``run_fact`` / ``run_bet_map`` inputs still triggers DuckDB **process exit**
+# on Windows (e.g. exit ``3221226505`` / ``0xC0000409``) instead of a catchable error.
+# For explicit memory-pressure checks, pass ``--profiles-json`` to gate1 (Linux CI or
+# small fixtures), e.g. ``'[[4096,2],[2048,2]]'``.
 GATE1_DEFAULT_DUCKDB_PROFILES: list[tuple[int | None, int]] = [
     (None, 2),
-    (512, 2),
-    (256, 2),
-    (128, 2),
+    (None, 1),
 ]
 
 

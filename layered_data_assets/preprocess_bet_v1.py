@@ -13,6 +13,33 @@ from layered_data_assets.l0_paths import validate_source_snapshot_id
 _PREPROCESS_RULE_ID = "preprocess_bet_v1"
 _PREPROCESS_RULE_VERSION = "v1"
 
+# Columns referenced unconditionally by preprocess SQL (WHERE / PARTITION BY / ORDER BY).
+_PREPROCESS_T_BET_REQUIRED_COLUMNS: frozenset[str] = frozenset({"player_id", "bet_id", "gaming_day"})
+
+
+def validate_preprocess_bet_input_columns(columns: set[str]) -> None:
+    """Reject non-``t_bet`` inputs before DuckDB bind (clearer than BinderException).
+
+    Args:
+        columns: Union of column names from all input Parquet files.
+
+    Raises:
+        ValueError: If a required L0 ``t_bet`` column is missing.
+    """
+    missing = sorted(_PREPROCESS_T_BET_REQUIRED_COLUMNS - columns)
+    if not missing:
+        return
+    sample_n = 25
+    sorted_cols = sorted(columns)
+    head = ", ".join(sorted_cols[:sample_n])
+    tail = f" (+{len(sorted_cols) - sample_n} more)" if len(sorted_cols) > sample_n else ""
+    raise ValueError(
+        "preprocess_bet_v1 requires L0-style t_bet columns "
+        f"{sorted(_PREPROCESS_T_BET_REQUIRED_COLUMNS)}; missing: {missing}. "
+        f"Input columns (sample): {head}{tail}. "
+        "Training/feature slices (e.g. baseline_for_baseline_models.parquet) are not valid sources."
+    )
+
 
 def manifest_output_relative_uri(output_parquet: Path, uri_anchor: Path) -> str:
     """Return ``output_parquet`` as a POSIX path relative to ``uri_anchor`` (e.g. repo root).
@@ -236,6 +263,7 @@ def run_preprocess_bet_v1(
         raise ValueError("input_paths must be non-empty")
     gaps: list[str] = []
     cols = _union_input_parquet_columns(con, input_paths)
+    validate_preprocess_bet_input_columns(cols)
     dummy_sql = _dummy_ids_sql(dummy_player_ids_parquet, gaps)
     elig_sql = _eligible_ids_sql(eligible_player_ids_parquet, gaps)
     output_parquet.parent.mkdir(parents=True, exist_ok=True)
