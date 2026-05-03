@@ -3,8 +3,8 @@
 > **Canonical 位置**：`pipelines/layered_data_assets/docs/RUNBOOK.md`（implementation plan §2.5）。  
 > `layered_data_assets/RUNBOOK.md` 僅保留轉址，請更新書籤與 PR 連結。
 
-> **範圍**：L0 ingest、`t_bet` preprocess、L1 `run_fact`／`run_bet_map`／`run_day_bridge`、Gate 1 determinism、日區間編排器。  
-> **非範圍**：`trip_*`、published、trainer Step 6/7 取代（見 `implementation plan/layered_data_assets_run_trip_execution_plan.md`）。
+> **範圍**：L0 ingest、`t_bet` preprocess、L1 `run_fact`／`run_bet_map`／`run_day_bridge`、Gate 1 determinism、日區間編排器；**Phase 2（MVP）**：`trip_fact`／`trip_run_map` 由全量 `run_fact` 重算（見 §4.4）。  
+> **非範圍**：`published_snapshot`、correction log writer、編排器內建 trip 日迴圈（見 execution plan Phase 2 其餘項）、trainer Step 6/7 取代。
 
 ## 1. 前置條件
 
@@ -22,6 +22,8 @@
 | `data/l1_layered/<id>/run_fact/run_end_gaming_day=.../` | `run_fact` 分區 |
 | `data/l1_layered/<id>/run_bet_map/run_end_gaming_day=.../` | `run_bet_map` 分區 |
 | `data/l1_layered/<id>/run_day_bridge/bet_gaming_day=.../` | `run_day_bridge` 分區（鍵為 **bet 日**） |
+| `data/l1_layered/<id>/trip_fact/trip_start_gaming_day=.../` | **Phase 2**：`trip_fact.parquet` + `manifest.json` |
+| `data/l1_layered/<id>/trip_run_map/trip_start_gaming_day=.../` | **Phase 2**：`trip_run_map.parquet` + `manifest.json` |
 | `data/l1_layered/materialization_state.duckdb`（預設） | **LDA-E1-09** 日編排 materialization state（DuckDB）；可用 `--state-store` 覆寫 |
 
 **`source_snapshot_id`（L1）**：通常與該批 L0 的 `snap_*` 對齊；若每日各做一次 L0 ingest（`partition_value` 不同），fingerprint 不同，**每日的 `snap_*` 可能不同** — 編排器在 raw 模式會自 ingest 輸出解析。
@@ -85,7 +87,20 @@ python scripts/materialize_run_day_bridge_v1.py --data-root data \
 
 `run_end_gaming_day`：該 run **最後一筆 bet** 的 `gaming_day`。測單日常與 preprocess 分區同日。跨日 run 需餵足夠多日資料（見 `pipelines/layered_data_assets/core/run_fact_v1.py` 模組說明）。
 
-### 4.4 Manifest 後補（可選）
+### 4.4 Trip（`trip_fact` + `trip_run_map`，Phase 2 MVP）
+
+每次執行需傳入**同一快照下所有**欲納入邊界推導的 `run_fact.parquet`（`--input-run-fact` 可重複）。MVP 為 **full snapshot 重算**：記憶體會載入全部列；大快照請分批策略或後續接編排器。
+
+```bash
+python scripts/materialize_trip_fact_v1.py --data-root data \
+  --source-snapshot-id <snap> --trip-start-gaming-day YYYY-MM-DD \
+  --input-run-fact data/l1_layered/<snap>/run_fact/run_end_gaming_day=2026-01-01/run_fact.parquet \
+  --input-run-fact data/l1_layered/<snap>/run_fact/run_end_gaming_day=2026-01-02/run_fact.parquet
+```
+
+可選：`--coverage-end YYYY-MM-DD`（未傳則以輸入 run 之最大 `gaming_day` 為觀察上界，用於尾端「開放 trip」判定）、`--l0-fingerprint-json`。`run_fact` 須含 **`run_start_gaming_day`**（`materialize_run_fact_v1` 自本版起寫入）。
+
+### 4.5 Manifest 後補（可選）
 
 ```bash
 python scripts/manifest_lineage_preview_v1.py --help

@@ -64,6 +64,36 @@ def l1_run_fact_partition_dir(data_root: Path, snapshot_id: str, run_end_gaming_
     return root / "run_fact" / f"run_end_gaming_day={run_end_gaming_day.strip()}"
 
 
+def l1_trip_fact_partition_dir(data_root: Path, snapshot_id: str, trip_start_gaming_day: str) -> Path:
+    """Return directory for ``trip_fact`` Hive partition (``trip_start_gaming_day=...``)."""
+    if not isinstance(trip_start_gaming_day, str) or not trip_start_gaming_day.strip():
+        raise ValueError(f"trip_start_gaming_day must be a non-empty string, got {trip_start_gaming_day!r}")
+    if (
+        ".." in trip_start_gaming_day
+        or "/" in trip_start_gaming_day
+        or "\\" in trip_start_gaming_day
+        or "=" in trip_start_gaming_day
+    ):
+        raise ValueError(f"invalid trip_start_gaming_day for path segment: {trip_start_gaming_day!r}")
+    root = l1_snapshot_root(data_root, snapshot_id)
+    return root / "trip_fact" / f"trip_start_gaming_day={trip_start_gaming_day.strip()}"
+
+
+def l1_trip_run_map_partition_dir(data_root: Path, snapshot_id: str, trip_start_gaming_day: str) -> Path:
+    """Return directory for ``trip_run_map`` Hive partition (``trip_start_gaming_day=...``)."""
+    if not isinstance(trip_start_gaming_day, str) or not trip_start_gaming_day.strip():
+        raise ValueError(f"trip_start_gaming_day must be a non-empty string, got {trip_start_gaming_day!r}")
+    if (
+        ".." in trip_start_gaming_day
+        or "/" in trip_start_gaming_day
+        or "\\" in trip_start_gaming_day
+        or "=" in trip_start_gaming_day
+    ):
+        raise ValueError(f"invalid trip_start_gaming_day for path segment: {trip_start_gaming_day!r}")
+    root = l1_snapshot_root(data_root, snapshot_id)
+    return root / "trip_run_map" / f"trip_start_gaming_day={trip_start_gaming_day.strip()}"
+
+
 def l1_run_day_bridge_partition_dir(data_root: Path, snapshot_id: str, bet_gaming_day: str) -> Path:
     """Return directory for ``run_day_bridge`` Hive partition (``bet_gaming_day=...``)."""
     if not isinstance(bet_gaming_day, str) or not bet_gaming_day.strip():
