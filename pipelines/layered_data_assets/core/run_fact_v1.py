@@ -16,6 +16,7 @@ from pipelines.layered_data_assets.core.preprocess_bet_v1 import (
     _manifest_hashes_for_output,
     manifest_output_relative_uri,
 )
+from trainer.core._config_training_domain import GAMING_DAY_START_HOUR
 RUN_BREAK_MIN_DEFAULT = 30
 RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT = "run_boundary_v1"
 SOURCE_NAMESPACE_DEFAULT = "layered_data_assets_l1"
@@ -272,6 +273,7 @@ def _run_fact_manifest_dict(
     ids = ingestion_delay_summary if ingestion_delay_summary is not None else manifest_ingestion_delay_placeholder()
     return {
         "artifact_kind": "run_fact",
+        "gaming_day_start_hour_used": int(GAMING_DAY_START_HOUR),
         "partition_keys": {"run_end_gaming_day": run_end_gaming_day, "source_snapshot_id": source_snapshot_id.strip()},
         "definition_version": RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT,
         "feature_version": "na_l1_run_fact",

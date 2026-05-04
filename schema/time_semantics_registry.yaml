@@ -11,6 +11,9 @@
 #     observable to downstream systems. By default this is `__etl_insert_Dtm`.
 #   - `late_threshold` and production alerting thresholds are intentionally TBD;
 #     they belong to implementation / monitoring contracts.
+#   - `contributes_to_trip_close_horizon`: machine-readable flag for SSOT §5.1 /
+#     implementation plan §4.3 (T_max from observed_at_logical). CI enforces
+#     exactly `t_bet: true` and all other registered tables `false` for v1.
 
 registry_version: "v1"
 owner: "data-assets"
@@ -42,9 +45,11 @@ tables:
     late_arrival_expected: true
     expected_delay_profile: "Usually near real-time; system backfills can create long observed_at - event_time tails. Quantiles and thresholds are defined by implementation / monitoring contracts."
     late_threshold: "TBD"
+    contributes_to_trip_close_horizon: true
     notes:
       - "For this asset layer, run/trip sequences use player_id, not canonical_id."
       - "For bet/run ordering, payout_complete_dtm is the event-time anchor."
+      - "Trip close observation horizon (v1): L0.5 cleaned_bet from this source participates in coverage_end_gaming_day (see SSOT §5.1)."
 
   t_session:
     description: "Player session table; may be used as auxiliary context and identity/profile input."
@@ -68,6 +73,7 @@ tables:
     late_arrival_expected: true
     expected_delay_profile: "Session records are available after session conclusion and can have duplicate/corrected versions; thresholds are defined by implementation / monitoring contracts."
     late_threshold: "TBD"
+    contributes_to_trip_close_horizon: false
     notes:
       - "Not the primary event source for run/trip v1 boundaries."
       - "Known duplicate session_id versions are documented in schema and findings."
@@ -93,6 +99,7 @@ tables:
     late_arrival_expected: true
     expected_delay_profile: "Optional context source; delay thresholds are TBD until admitted into asset layer."
     late_threshold: "TBD"
+    contributes_to_trip_close_horizon: false
     notes:
       - "Schema documents duplicated game_id versions; use only after preprocessing."
 
@@ -111,6 +118,7 @@ tables:
     late_arrival_expected: "TBD"
     expected_delay_profile: "TBD; source availability is incomplete in the current schema dictionary."
     late_threshold: "TBD"
+    contributes_to_trip_close_horizon: false
     notes:
       - "Current schema dictionary has incomplete t_shoe availability details."
       - "No L1 ingest in current phase; revisit when shoe Parquet and DQ are available."

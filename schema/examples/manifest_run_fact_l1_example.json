@@ -35,5 +35,6 @@
     "max_event_time": "2026-04-01T08:30:00Z",
     "min_event_time": "2026-04-01T08:00:00Z"
   },
-  "transform_version": "v1"
+  "transform_version": "v1",
+  "gaming_day_start_hour_used": 3
 }

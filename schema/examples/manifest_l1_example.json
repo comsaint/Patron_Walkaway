@@ -35,5 +35,6 @@
     "late_row_ratio": 0.0001,
     "affected_run_count": 2,
     "affected_trip_count": 0
-  }
+  },
+  "gaming_day_start_hour_used": 3
 }

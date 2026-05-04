@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import importlib.util
+import json
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from layered_data_assets.trip_fact_v1 import (
     TRIP_DEFINITION_VERSION_DEFAULT,
     SOURCE_NAMESPACE_DEFAULT,
     build_trip_fact_and_run_map_frames,
+    build_trip_fact_manifest,
     materialize_trip_partition_parquets,
     source_partitions_from_runs,
 )
@@ -157,6 +161,42 @@ def test_source_partitions_from_runs_sorted() -> None:
     ]
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("jsonschema") is None,
+    reason="jsonschema not installed",
+)
+def test_build_trip_fact_manifest_validates_schema(tmp_path: Path) -> None:
+    from jsonschema import Draft7Validator
+
+    repo = Path(__file__).resolve().parents[2]
+    schema_path = repo / "schema" / "manifest_layered_data_assets.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    out = tmp_path / "trip_fact.parquet"
+    out.write_bytes(b"duck")
+    stats = {
+        "row_count_trip_fact": 0,
+        "time_range_min": "2026-02-01T00:00:00Z",
+        "time_range_max": "2026-02-01T01:00:00Z",
+        "source_partitions": ["l1/run_fact/run_end_gaming_day=2026-02-01"],
+        "coverage_end_gaming_day": "2026-02-01",
+        "G_max": "2026-02-02",
+    }
+    m = build_trip_fact_manifest(
+        source_snapshot_id="snap_abcdefgh",
+        trip_start_gaming_day="2026-02-01",
+        l0_fingerprint_path=None,
+        output_parquet=out,
+        manifest_uri_anchor=tmp_path,
+        stats=stats,
+        source_partitions=stats["source_partitions"],
+    )
+    Draft7Validator(schema).validate(m)
+    assert m["artifact_kind"] == "trip_fact"
+    assert m["coverage_input_tables"] == ["t_bet"]
+    assert m["coverage_end_gaming_day"] == "2026-02-01"
+    assert m["G_max"] == "2026-02-02"
+
+
 def test_materialize_trip_partition_writes_parquet(tmp_path: Path) -> None:
     import duckdb
 
@@ -196,6 +236,8 @@ def test_materialize_trip_partition_writes_parquet(tmp_path: Path) -> None:
     )
     assert stats["row_count_trip_fact"] == 1
     assert stats["row_count_trip_run_map"] == 1
+    assert stats["coverage_end_gaming_day"] == "2026-02-01"
+    assert stats["G_max"] == "2026-02-02"
     assert out_t.is_file() and out_m.is_file()
     con2.close()
 
@@ -239,4 +281,46 @@ def test_materialize_empty_partition_no_rows(tmp_path: Path) -> None:
     )
     assert stats["row_count_trip_fact"] == 0
     assert stats["row_count_trip_run_map"] == 0
+    assert stats["coverage_end_gaming_day"] == "2026-02-01"
+    assert stats["G_max"] == "2026-02-02"
+    con2.close()
+
+
+def test_materialize_trip_empty_run_fact_requires_coverage_end(tmp_path: Path) -> None:
+    import duckdb
+
+    rf = tmp_path / "empty_run_fact.parquet"
+    con = duckdb.connect(database=":memory:")
+    rp = rf.as_posix().replace("'", "''")
+    con.execute(
+        f"""
+        COPY (
+          SELECT
+            CAST(NULL AS BIGINT) AS player_id,
+            CAST(NULL AS VARCHAR) AS run_id,
+            CAST(NULL AS BIGINT) AS first_bet_id,
+            CAST(NULL AS BIGINT) AS last_bet_id,
+            CAST(NULL AS TIMESTAMP) AS run_start_ts,
+            CAST(NULL AS TIMESTAMP) AS run_end_ts,
+            CAST(NULL AS VARCHAR) AS run_start_gaming_day,
+            CAST(NULL AS VARCHAR) AS run_end_gaming_day,
+            CAST(NULL AS BIGINT) AS bet_count,
+            CAST(NULL AS VARCHAR) AS run_definition_version,
+            CAST(NULL AS VARCHAR) AS source_namespace
+          WHERE FALSE
+        ) TO '{rp}' (FORMAT PARQUET)
+        """
+    )
+    con.close()
+    con2 = duckdb.connect(database=":memory:")
+    with pytest.raises(ValueError, match="coverage_end"):
+        materialize_trip_partition_parquets(
+            con=con2,
+            run_fact_paths=[rf],
+            trip_start_gaming_day="2026-02-01",
+            trip_fact_out=tmp_path / "t.parquet",
+            trip_run_map_out=tmp_path / "m.parquet",
+            source_snapshot_id="snap_unit_test_empty",
+            coverage_end=None,
+        )
     con2.close()
