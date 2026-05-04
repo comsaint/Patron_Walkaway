@@ -243,3 +243,7 @@ data/backup*
 # Generated / local-only under data/ (do not commit).
 data/player_profile.schema_hash
 data/tmp_lda_gate1_day_range/
+
+# large files
+data/**/*.parquet
+*.db
