@@ -176,8 +176,8 @@ try:
     CHUNK_CONCAT_MEMORY_WARN_BYTES: int = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 1 * (1024**3))
     CHUNK_CONCAT_RAM_FACTOR: float = getattr(_cfg, "CHUNK_CONCAT_RAM_FACTOR", 3)
     STEP7_PANDAS_FALLBACK_MAX_BYTES: int = getattr(_cfg, "STEP7_PANDAS_FALLBACK_MAX_BYTES", 256 * 1024 * 1024)
-    TRAIN_SPLIT_FRAC: float = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
-    VALID_SPLIT_FRAC: float = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
+    TRAIN_SPLIT_FRAC: float = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.65)
+    VALID_SPLIT_FRAC: float = getattr(_cfg, "VALID_SPLIT_FRAC", 0.20)
     MIN_VALID_TEST_ROWS: int = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
     THRESHOLD_MIN_ALERT_COUNT: int = getattr(_cfg, "THRESHOLD_MIN_ALERT_COUNT", 5)
     THRESHOLD_MIN_RECALL: Optional[float] = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
@@ -241,8 +241,8 @@ except ModuleNotFoundError:
     CHUNK_CONCAT_MEMORY_WARN_BYTES = getattr(_cfg, "CHUNK_CONCAT_MEMORY_WARN_BYTES", 1 * (1024**3))
     CHUNK_CONCAT_RAM_FACTOR = getattr(_cfg, "CHUNK_CONCAT_RAM_FACTOR", 3)
     STEP7_PANDAS_FALLBACK_MAX_BYTES = getattr(_cfg, "STEP7_PANDAS_FALLBACK_MAX_BYTES", 256 * 1024 * 1024)
-    TRAIN_SPLIT_FRAC = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.70)
-    VALID_SPLIT_FRAC = getattr(_cfg, "VALID_SPLIT_FRAC", 0.15)
+    TRAIN_SPLIT_FRAC = getattr(_cfg, "TRAIN_SPLIT_FRAC", 0.65)
+    VALID_SPLIT_FRAC = getattr(_cfg, "VALID_SPLIT_FRAC", 0.20)
     MIN_VALID_TEST_ROWS = getattr(_cfg, "MIN_VALID_TEST_ROWS", 50)
     THRESHOLD_MIN_ALERT_COUNT = getattr(_cfg, "THRESHOLD_MIN_ALERT_COUNT", 5)
     THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
@@ -9694,10 +9694,18 @@ def run_pipeline(args) -> None:
                     _est_ram_gb,
                 )
             # R803: validate fractions at runtime so misconfiguration is caught early (-O safe).
-            if not (TRAIN_SPLIT_FRAC + VALID_SPLIT_FRAC < 1.0):
+            # Match _duckdb_sort_and_split / _step7_pandas_fallback: train and valid strictly
+            # positive and TRAIN_SPLIT_FRAC + VALID_SPLIT_FRAC < 1.0 so implicit test_frac > 0.
+            # Row-count adequacy (vs MIN_VALID_TEST_ROWS) is logged after the split, not here.
+            if not (
+                0 < float(TRAIN_SPLIT_FRAC)
+                and 0 < float(VALID_SPLIT_FRAC)
+                and TRAIN_SPLIT_FRAC + VALID_SPLIT_FRAC < 1.0
+            ):
+                _implicit_test_frac = 1.0 - float(TRAIN_SPLIT_FRAC) - float(VALID_SPLIT_FRAC)
                 raise ValueError(
-                    f"TRAIN_SPLIT_FRAC ({TRAIN_SPLIT_FRAC}) + VALID_SPLIT_FRAC ({VALID_SPLIT_FRAC}) "
-                    "must be < 1.0 to leave room for the test set"
+                    f"TRAIN_SPLIT_FRAC ({TRAIN_SPLIT_FRAC}) and VALID_SPLIT_FRAC ({VALID_SPLIT_FRAC}) "
+                    f"must each be in (0, 1) with sum < 1.0; implicit test_frac would be {_implicit_test_frac}"
                 )
         
             def _run_step6(neg_frac: float) -> List[Path]:

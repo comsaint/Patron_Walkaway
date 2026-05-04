@@ -282,7 +282,7 @@ def estimate_per_step(
 
     # Step 7 (A19/A20): concat + split
     factor = getattr(_config, "CHUNK_CONCAT_RAM_FACTOR", 15.0)
-    train_frac = getattr(_config, "TRAIN_SPLIT_FRAC", 0.7)
+    train_frac = getattr(_config, "TRAIN_SPLIT_FRAC", 0.65)
     step7_peak = (total_chunk / (1024 ** 3)) * factor * (1 + train_frac)
     estimates["step7_peak_ram_gb"] = min(avail_gb * 1.5, step7_peak)
     estimates["step7_time_min"] = max(1.0, total_chunk / (1024 ** 3) * 0.5)

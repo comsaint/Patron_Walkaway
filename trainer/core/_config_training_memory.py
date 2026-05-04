@@ -38,6 +38,9 @@ NEG_SAMPLE_RAM_SAFETY: float = 0.75
 NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT: int = 200 * 1024 * 1024
 
 # --- Row-level split contract ---
+# Test share is implicit: 1 - TRAIN_SPLIT_FRAC - VALID_SPLIT_FRAC (0.15 with 0.65/0.20).
+# For large N, 15% temporal holdout is a common default; adequacy of *row counts* for
+# metrics is warned in trainer Step 7 when valid or test falls below MIN_VALID_TEST_ROWS.
 TRAIN_SPLIT_FRAC = 0.65
 VALID_SPLIT_FRAC = 0.20
 MIN_VALID_TEST_ROWS = 50
