@@ -94,7 +94,7 @@
 
 | 狀態 | Task ID | 任務 | Owner | 依賴 | 輸出 artifact | DoD |
 | :---: | :--- | :--- | :--- | :--- | :--- | :--- |
-| ✅ | **LDA-E0-01** | `time_semantics_registry` PR 流程：template、必填欄位、與 schema dict／FND 對照檢查表 | ML Platform + Data Platform | §1.1 | `.github/` 或 `doc/` 下 PR checklist +（可選）`scripts/validate_time_semantics_registry.py` | 本機：`python scripts/validate_time_semantics_registry.py`；合併前仍建議設 required check |
+| 🟡 | **LDA-E0-01** | `time_semantics_registry` PR 流程：template、必填欄位、與 schema dict／FND 對照檢查表 | ML Platform + Data Platform | §1.1 | `.github/` 或 `doc/` 下 PR checklist +（可選）`scripts/validate_time_semantics_registry.py` | 本機：`python scripts/validate_time_semantics_registry.py`；合併前仍建議設 required check。**v0.13 補強待辦**：新增 machine-readable 欄位（例如 `contributes_to_trip_close_horizon`）並納入 CI 驗證；未聲明者不得參與 `coverage_end_gaming_day` 計算。 |
 | ✅ | **LDA-E0-02** | Preprocessing 規格書：`preprocess_*_v1` 與 FND-01/03/11/13 對照 | DS / Feature Owner + Data Platform | E0-01 | `doc/preprocessing_layered_data_assets_v1.md`（路徑可調，須寫入 repo） | 每條規則有 rule id；與 manifest 可引用欄位對齊 |
 | ✅ | **LDA-E0-03** | Manifest schema：SSOT §8 + `ingestion_delay_summary` | ML Platform | SSOT | `schema/manifest_layered_data_assets.schema.json`（或等價） | JSON Schema 或表格可機器驗證；範例 `manifest.json` 通過驗證。**後續 schema 升級（對齊 SSOT v1.12／impl v0.13）**：`run_fact` manifest **MUST** 含 **`gaming_day_start_hour_used`**；`trip_fact` manifest/sidecar **MUST** 含 **`gaming_day_start_hour_used`**、**`coverage_end_gaming_day`**、**`G_max`**（或等價）與 `coverage_input_tables`（或等價來源清單）；`ingestion_delay_summary` **MUST** 含 **`late_threshold_status` ∈ {`defined`, `undefined`}`**；僅 `defined` 時 **`late_row_*` 必填**，`undefined` 時須缺省或 `null`（見 SSOT §4.4）。另需在 schema/文件明示：`late_threshold` 與 `ingest_delay_cap_sec` 不得隱式互綁。 |
 | ✅ | **LDA-E0-04** | `late_arrival_correction_log` schema：對齊 implementation plan §10 + manifest join 鍵 | ML Platform | E0-03 | `schema/late_arrival_correction_log.schema.json` + 範例列 | PK／索引欄位與 §10.1 一致；範例通過驗證 |
@@ -102,7 +102,7 @@
 | ✅ | **LDA-E0-06** | Feature dependency registry 初稿：每 `(track_section, feature_id)` 一列 | DS / Feature Owner | E0-05 | `artifacts/.../feature_dependency_registry.csv`（或 yaml） | 欄位含：所需 L1 欄位、是否允許回掃 bet、計算來源占位；無缺列（細部 `TBD` 由 DS 後續收斂） |
 | ✅ | **LDA-E0-07** | Phase 0 CI gate：registry + manifest + correction_log schema + enumerator | ML Platform | E0-01–E0-06 | CI workflow 或 `make check-layered-contracts` | 本機：`make check-layered-contracts`；遠端 CI 由團隊自設 |
 
-**Phase 0 完成條件**：E0-01–E0-07 皆 **✅**。
+**Phase 0 完成條件**：E0-02–E0-07 皆 **✅**，且 **E0-01（trip horizon 來源表旗標補強）** 轉為 **✅**。
 
 ---
 
@@ -190,15 +190,15 @@
 | ✅ | 10 | **E1-11**：DuckDB SQL 插入 `__etl_insert_Dtm_synthetic` + dedup `ORDER BY` 改為 synthetic | Data Platform | 1.0 | 9 | **2026-05-03**：`preprocess_bet_v1.py`；dedup 僅在傳入 registry 時使用 synthetic；`test_preprocess_bet_v1_ingestion_cap_changes_dedup_winner` |
 | ✅ | 11 | **E1-11**：manifest 欄位 + `ingestion_delay_summary` 改 observed 欄位 + 範例 manifest 更新 | Data Platform + ML Platform | 0.75 | 10, E1-06 | **2026-05-03**：manifest 寫入 `ingestion_fix_*`／`applied_fix_rules`；cap 啟用時 summary 用 `__etl_insert_Dtm_synthetic`；範例 JSON 已更新；`validate_layered_contracts` + `check-lda-l0` 通過 |
 | ✅ | 12 | **E1-11**：Gate1 迴歸（含 OOM profiles）證明 run 產物不變或僅預期內變更 | ML Platform | 0.5 | 11, E1-08 | **2026-05-03**：**`tests/integration/test_lda_e1_11_gate1_with_registry_v1.py`** — 編排器帶／不帶 registry 在 E1-10 fixture 上 **L1 四產物 row fingerprint 一致**（判準：synthetic observed 不影響 dedup 勝者）；manifest 含 **BET-INGEST-FIX-004**；已納入 **`make check-lda-l0`**（Gate1 仍為編排器內建兩 profile，與 E1-10 一致）。 |
-| ⬜ | 13 | **E1-12**：`cleaned` 單一活躍資料集策略落地（按 `gaming_day` 覆寫，不保留大量歷史 parquet） | Data Platform + Ops | 0.75 | E1-09, E1-11 | 文件化並實作路徑慣例：固定 active root、分區 `*.tmp -> rename` 覆寫、同步更新 state；不得改變既有業務語義 |
-| ⬜ | 14 | **E1-13**：最小追溯與回滾保障（輕量變更索引 + 最近一次回滾點） | Data Platform + ML Platform | 1.0 | 13 | 每次分區覆寫都寫事件索引（含 `gaming_day`、`input_hash`、`row_count`、`updated_at`、operator）；可對單日執行一次回滾演練並附證據 |
+| ⬜ | 13 | **E1-12**：`cleaned` 單一活躍資料集 + rolling 保留策略落地（`gaming_day` 分區 active + 最近 **7** 個成功版本） | Data Platform + Ops | 1.25 | E1-09, E1-11 | 文件化並實作路徑慣例：固定 active root、分區 `*.tmp -> rename` 覆寫、同步更新 state；每分區保留最近 **7** 版且每版具 manifest / `semantic_signature`；不得改變既有業務語義 |
+| ⬜ | 14 | **E1-13**：最小追溯與回滾保障（輕量變更索引 + rolling 7 版 GC 與回滾演練） | Data Platform + ML Platform | 1.25 | 13 | 每次分區覆寫都寫事件索引（含 `gaming_day`、`input_hash`、`row_count`、`updated_at`、operator）；完成「第 8 舊版可 GC（審計凍結除外）」與單日回滾演練證據 |
 | ✅ | 15 | **E1-14**：編排器 one-liner 接入 trainer rated builder（raw 模式自動建 eligible） | Data Platform | 1.0 | E1-02, E1-09 | **`tests/integration/test_lda_e1_14_raw_rated_eligible_gate_v1.py`**（2026-05-04）：`--raw-t-bet-parquet` + `--raw-t-session-parquet` + `--cutoff-dtm` + `--canonical-mapping-parquet`（repo 下 **`.tmp/lda_e114_*`**，滿足 L0 anchor）；`--echo-commands` 斷言 `preprocess_bet_v1.py` argv 含 `--eligible-player-ids-parquet`；banner 含 `BET-DQ-03 eligible ids`；備份／還原 `data/canonical_mapping.cutoff.json`；`_validate_mode` 允許「缺檔 canonical + 有 session+cutoff」交由 resolve 建檔；已納入 `make check-lda-l0`。 |
 | ✅ | 16 | **E1-15**：BET-DQ-03 fail-closed 與 cutoff 旗標契約 | Data Platform + ML Platform | 0.75 | 15 | **`tests/integration/test_lda_e1_15_fail_closed_cutoff_v1.py`**（2026-05-04）：多情境 **exit 2** 與 stderr 關鍵字；**`lda_l1_gate1_day_range_v1.main`** 在 **raw 且非 dry-run** 且 resolve 後 **eligible=None** 時 **exit 2**（補強不得進 preprocess）；已納入 `make check-lda-l0`。 |
 | ✅ | 17 | **E1-16**：eligible／canonical trainer 路徑的 session 列數預檢 + run log + 失敗上下文 | Data Platform | 1.0 | 15 | **`tests/integration/test_lda_e1_16_eligible_canonical_row_budget_v1.py`**（2026-05-04）：`--eligible-build-max-session-rows` 在 **補建 canonical** 前以 DuckDB `COUNT(*)` fail-fast（**exit 2**）；`_build_canonical_mapping_parquet_via_trainer` 與 rated-eligible 建檔共用 `--eligible-build-*` 資源／log／failure JSON；已納入 `make check-lda-l0` |
 
 **Phase 1R（E1-09+10）合計（粗估）**：約 **5.5–6.5 person-days**（含測試）；若兩人並行 schema+state 與 CLI，wall-clock 約 **3–4 工作天**。  
 **E1-11 加計（粗估）**：約 **2.75–3.5 person-days**（列 9–12）；**列 9–12 已關**（2026-05-03；列 12 見 **`test_lda_e1_11_gate1_with_registry_v1`**）。與 E1-09 並行時 wall-clock 取較長分支 + 合併驗收約 **0.5 天**。  
-**E1-12/E1-13 加計（粗估）**：約 **1.75–2.5 person-days**（列 13–14）；若與 E1-11 並行，建議先凍結 active root／索引 schema 再做回滾演練。
+**E1-12/E1-13 加計（粗估）**：約 **2.25–3.25 person-days**（列 13–14；含 rolling **7** 版保留與 GC/回滾驗證）；若與 E1-11 並行，建議先凍結 active root／索引 schema 再做回滾演練。
 **E1-14~E1-16 加計（粗估）**：約 **2.5–3.25 person-days**（列 15–17）；屬 one-liner 可用性與資料品質入口契約，優先序高於 E1-12/E1-13。
 
 **與既有腳本對齊（建議）**
@@ -319,7 +319,8 @@
 | **BL-02** | **L0 不可變儲存**實作選型（追加 vs object 不可變） | Data Platform + Ops |
 | **BL-03** | `late_arrival_correction_log` **保留天數／壓縮／GC** 與 L0／published 生命週期對齊 | Ops |
 | **BL-04** | **trainer Step 6/7** 與本產線合併／取代／雙軌之時程與回歸範圍 | Model Owner + ML Platform |
-| **BL-05** | `cleaned` 單一活躍資料集之保留策略（僅活躍版 + 最近一次回滾點）與分區 GC 週期 | Data Platform + Ops |
+| **BL-05** | `cleaned` 單一活躍資料集之保留策略（active + 每分區 rolling 最近 **7** 版 + 回滾點）與分區 GC 週期 | Data Platform + Ops |
+| **BL-09** | `time_semantics_registry` 新增並治理 **trip horizon 來源表旗標**（例如 `contributes_to_trip_close_horizon`）：未聲明表預設不得參與 `coverage_end_gaming_day` | ML Platform + Data Platform |
 | **BL-06** | **Future entity onboarding template**（`cleaned_<entity>` 接入前最小契約：`entity_name`、`business_key`、`partition_key_semantics`、`event_time_col`、`observed_at_col`；impact scope 與 fallback policy；可先 `TBD` 但 production 前需定版） | Data Platform + ML Platform + DS |
 | **BL-07** | **`t_session` → `cleaned_session`（L0.5）** 與 **canonical／rated mapping** 由 trainer 遷入本產線：與 `cleaned_bet` 同等 manifest／state／impact；過渡期文件與 CI 標註 trainer 為單一來源 | Data Platform + ML Platform |
 | **BL-08** | **`GAMING_DAY_START_HOUR` / `HK_TZ` 契約鎖定**：LDA 物化必須直接讀取 `trainer/core/_config_training_domain.py`，並在 CI 檢查 manifest `gaming_day_start_hour_used` 與 runtime import 值一致 | ML Platform + Data Platform |
@@ -344,7 +345,8 @@
 |----------------------|-------------------|
 | §5 Phase 0–4 | §4–§8 任務表 |
 | §2.2.1 統一失效模型（含 bet 路徑 `impact_day_ratio`／`changed_player_ratio` 與 full recompute 備援；**LDA-016 數值僅在本層**） | E4-01（KPI／觀測）、§10.2；implementation plan §8.1（invalidation gate）；SSOT **LDA-016** 僅原則 |
-| §2.4／§2.4.1 L0.5 `cleaned_bet` 與多實體掛載預留；§2.1 `t_session`／遷移 | BL-05、BL-06、**BL-07**、§11.1；E1-12／E1-13 backlog |
+| §2.4／§2.4.1 L0.5 `cleaned_bet`（rolling **7**）與多實體掛載預留；§2.1 `t_session`／遷移 | BL-05、BL-06、**BL-07**、§11.1；E1-12／E1-13 backlog |
+| §2.2 Trip horizon 來源表旗標（`contributes_to_trip_close_horizon`） | E0-01（v0.13 補強）、**BL-09** |
 | §4.2 / §4.3 `GAMING_DAY_START_HOUR` / `HK_TZ` 單一來源與 trip 上界時區契約 | §10.2 風險列、**BL-08**、E2-01 DoD（時區正規化 + 單點凍結上界） |
 | §2.3 Resumable 契約 | §5.2–§5.3、E1-09–E1-10、G7 |
 | one-liner + BET-DQ-03 fail-closed（自 implementation plan v0.6 起） | §5.2（E1-14~E1-16）、§5.3 列 15–17、G8 |
