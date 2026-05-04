@@ -105,6 +105,40 @@ def _lightgbm_artifact(
     }
 
 
+def test_soft_vote_equal_trains_with_lightgbm_and_xgboost_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CatBoost off + XGB on: equal-weight soft vote averages LGBM + XGB (doc #3 minus CatBoost)."""
+    monkeypatch.setenv("GBM_BAKEOFF_ENABLE_CATBOOST", "0")
+    monkeypatch.setenv("GBM_BAKEOFF_ENABLE_XGBOOST", "1")
+    X_tr, y_tr, X_vl, y_vl, sw, hp = _synth_split(seed=9)
+    winner, winner_art, report = train_and_select_rated_gbm_family(
+        X_tr,
+        y_tr,
+        X_vl,
+        y_vl,
+        sw,
+        hp,
+        lightgbm_artifact=_lightgbm_artifact(X_tr, y_tr, X_vl, y_vl, sw, hp),
+        run_optuna=False,
+        X_test=X_vl,
+        y_test=y_vl,
+        val_dec026_window_hours=72.0,
+        val_dec026_min_alerts_per_hour=50.0,
+        rated_train_df=pd.DataFrame(
+            {
+                "payout_complete_dtm": pd.date_range("2026-01-05", periods=len(X_tr), freq="h"),
+                "label": y_tr.to_numpy(),
+            },
+            index=X_tr.index,
+        ),
+    )
+    per = report["per_backend"]
+    assert "error" not in per["soft_vote_equal"]
+    assert per["soft_vote_equal"]["component_backends"] == ["lightgbm", "xgboost"]
+    assert winner in BAKEOFF_BACKENDS
+
+
 def test_train_and_select_skips_catboost_xgboost_when_env_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -126,7 +160,9 @@ def test_train_and_select_skips_catboost_xgboost_when_env_disabled(
     assert "disabled" in (per["xgboost"].get("error") or "").lower()
     assert winner == "lightgbm"
     assert winner_art["model_kind"] == "lightgbm"
-    assert "missing_base_backends" in (report["stacking_oof"].get("reason") or "")
+    assert "insufficient_base_backends_for_stacking" in (
+        report["stacking_oof"].get("reason") or ""
+    )
     assert "error" in per["soft_vote_equal"]
 
 

@@ -5,7 +5,7 @@ weights remain the base).  Intended for exploratory / comparative runs; keep
 multipliers conservative to avoid silent loss blow-ups on laptop-scale data.
 
 Environment fallback: ``PRECISION_UPLIFT_RANKING_RECIPE`` when CLI does not pass
-``--ranking-recipe``. When both are unset, the default recipe is ``r2_top_band_light``
+``--ranking-recipe``. When both are unset, the default recipe is ``r2_combined_light``
 (DEC-044); use ``baseline`` explicitly to disable A2-style reweighting.
 """
 
@@ -27,7 +27,8 @@ RANKING_RECIPE_HNM = "r2_hnm_light"
 RANKING_RECIPE_COMBINED = "r2_combined_light"
 
 # When CLI and PRECISION_UPLIFT_RANKING_RECIPE are both unset / empty (DEC-044).
-RANKING_RECIPE_DEFAULT: str = RANKING_RECIPE_TOP_BAND
+# Default combined recipe: top-band reweighting plus light pseudo-HNM (field-test #2).
+RANKING_RECIPE_DEFAULT: str = RANKING_RECIPE_COMBINED
 
 VALID_RANKING_RECIPES: frozenset[str] = frozenset(
     {

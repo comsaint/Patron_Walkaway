@@ -214,3 +214,9 @@ GBM_BAKEOFF_ENABLE_CATBOOST: bool = os.getenv(
     "GBM_BAKEOFF_ENABLE_CATBOOST", "0"
 ).strip().lower() in ("1", "true", "t", "yes", "y")
 
+# A3: include XGBoost in GBM bakeoff. Default on (precision uplift bakeoff minus CatBoost);
+# set GBM_BAKEOFF_ENABLE_XGBOOST=0 or --no-gbm-bakeoff-xgboost to disable.
+GBM_BAKEOFF_ENABLE_XGBOOST: bool = os.getenv(
+    "GBM_BAKEOFF_ENABLE_XGBOOST", "1"
+).strip().lower() in ("1", "true", "t", "yes", "y")
+

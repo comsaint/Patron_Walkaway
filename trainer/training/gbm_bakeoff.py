@@ -63,7 +63,8 @@ def _optional_bakeoff_catboost_xgboost_enabled() -> tuple[bool, bool]:
     """Read per-run env toggles for optional A3 backends.
 
     CatBoost: when ``GBM_BAKEOFF_ENABLE_CATBOOST`` is unset, use
-    ``config.GBM_BAKEOFF_ENABLE_CATBOOST`` (domain default). XGBoost: unset => disabled.
+    ``config.GBM_BAKEOFF_ENABLE_CATBOOST`` (domain default). XGBoost: when unset, use
+    ``config.GBM_BAKEOFF_ENABLE_XGBOOST`` (domain default on).
 
     Truthy env values: 1, true, t, yes, y (case-insensitive).
     """
@@ -75,7 +76,7 @@ def _optional_bakeoff_catboost_xgboost_enabled() -> tuple[bool, bool]:
         enable_cat = bool(tok_c) and tok_c in ("1", "true", "t", "yes", "y")
     xgb_raw = os.getenv("GBM_BAKEOFF_ENABLE_XGBOOST")
     if xgb_raw is None:
-        enable_xgb = False
+        enable_xgb = bool(getattr(_cfg, "GBM_BAKEOFF_ENABLE_XGBOOST", True))
     else:
         tok_x = str(xgb_raw).strip().lower()
         enable_xgb = bool(tok_x) and tok_x in ("1", "true", "t", "yes", "y")
@@ -391,6 +392,19 @@ def _assign_dispositions(rows: Dict[str, Dict[str, Any]], winner: str) -> None:
             row["bakeoff_disposition"] = "hold"
 
 
+def _soft_vote_component_backends(
+    candidate_artifacts: Mapping[str, Dict[str, Any]],
+) -> Tuple[str, ...]:
+    """Ordered lightgbm → catboost → xgboost subset present in *candidate_artifacts*."""
+    order = ("lightgbm", "catboost", "xgboost")
+    out: list[str] = []
+    for backend in order:
+        art = candidate_artifacts.get(backend)
+        if isinstance(art, dict) and art.get("model") is not None:
+            out.append(backend)
+    return tuple(out)
+
+
 def _build_soft_vote_candidate(
     candidate_artifacts: Mapping[str, Dict[str, Any]],
     *,
@@ -403,29 +417,28 @@ def _build_soft_vote_candidate(
     val_dec026_window_hours: Optional[float],
     val_dec026_min_alerts_per_hour: Optional[float],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Create the equal-weight soft-vote candidate from the 3 base models."""
+    """Create the equal-weight soft-vote from every trained base GBM in the bakeoff."""
     from trainer.training.trainer import (
         _compute_feature_importance,
         _compute_test_metrics_from_scores,
         _train_metrics_dict_from_y_scores,
     )
 
-    required = ("lightgbm", "catboost", "xgboost")
-    missing = [backend for backend in required if backend not in candidate_artifacts]
-    if missing:
+    required = _soft_vote_component_backends(candidate_artifacts)
+    if len(required) < 2:
         raise ValueError(
-            "soft_vote_equal requires all 3 base backends; missing %s"
-            % ",".join(missing)
+            "soft_vote_equal requires at least 2 trained base backends among "
+            "lightgbm/catboost/xgboost; have %s"
+            % (",".join(required) if required else "(none)")
         )
 
     comp_models = [candidate_artifacts[backend]["model"] for backend in required]
     comp_thresholds = [
-        float(candidate_artifacts[backend]["metrics"].get("threshold", 0.5))
-        for backend in required
+        float(candidate_artifacts[b]["metrics"].get("threshold", 0.5)) for b in required
     ]
     comp_val_scores = [
-        np.asarray(candidate_artifacts[backend]["metrics"]["_val_scores"], dtype=np.float64)
-        for backend in required
+        np.asarray(candidate_artifacts[b]["metrics"]["_val_scores"], dtype=np.float64)
+        for b in required
     ]
     val_scores = np.mean(np.column_stack(comp_val_scores), axis=1, dtype=np.float64)
     metrics = _val_block_from_scores(
@@ -439,8 +452,8 @@ def _build_soft_vote_candidate(
     train_scores = np.mean(
         np.column_stack(
             [
-                np.asarray(candidate_artifacts[backend]["metrics"]["_train_scores"], dtype=np.float64)
-                for backend in required
+                np.asarray(candidate_artifacts[b]["metrics"]["_train_scores"], dtype=np.float64)
+                for b in required
             ]
         ),
         axis=1,
@@ -459,8 +472,8 @@ def _build_soft_vote_candidate(
         test_scores = np.mean(
             np.column_stack(
                 [
-                    np.asarray(candidate_artifacts[backend]["metrics"]["_test_scores"], dtype=np.float64)
-                    for backend in required
+                    np.asarray(candidate_artifacts[b]["metrics"]["_test_scores"], dtype=np.float64)
+                    for b in required
                 ]
             ),
             axis=1,
@@ -616,10 +629,8 @@ def train_and_select_rated_gbm_family(
         )
     else:
         logger.info(
-            "A3 gbm_bakeoff: CatBoost and XGBoost disabled for this run (CatBoost: "
-            "GBM_BAKEOFF_ENABLE_CATBOOST unset uses config default, usually off; XGBoost: "
-            "unset env => off; enable via --gbm-bakeoff-catboost / --gbm-bakeoff-xgboost or "
-            "set env to 1/true)."
+            "A3 gbm_bakeoff: CatBoost and XGBoost disabled for this run (enable via "
+            "--gbm-bakeoff-catboost / --gbm-bakeoff-xgboost or GBM_BAKEOFF_ENABLE_*=1)."
         )
 
     def _run_backend_candidate(

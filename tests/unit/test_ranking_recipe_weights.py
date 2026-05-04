@@ -33,11 +33,11 @@ def test_resolve_ranking_recipe_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resolve_ranking_recipe(None) == RANKING_RECIPE_TOP_BAND
 
 
-def test_resolve_ranking_recipe_defaults_to_top_band_when_cli_and_env_unset(
+def test_resolve_ranking_recipe_defaults_to_combined_when_cli_and_env_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("PRECISION_UPLIFT_RANKING_RECIPE", raising=False)
-    assert resolve_ranking_recipe(None) == RANKING_RECIPE_TOP_BAND
+    assert resolve_ranking_recipe(None) == RANKING_RECIPE_COMBINED
 
 
 def test_resolve_ranking_recipe_explicit_baseline(monkeypatch: pytest.MonkeyPatch) -> None:

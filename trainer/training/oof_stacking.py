@@ -21,7 +21,19 @@ from trainer.training.threshold_selection import pick_threshold_dec026
 
 logger = logging.getLogger("trainer")
 
-_BASE_BACKENDS: Tuple[str, ...] = ("lightgbm", "catboost", "xgboost")
+_ORDERED_GBM_BACKENDS: Tuple[str, ...] = ("lightgbm", "catboost", "xgboost")
+
+
+def _stacking_base_backends(
+    base_artifacts: Mapping[str, Dict[str, Any]],
+) -> Tuple[str, ...]:
+    """Subset of GBM bakeoff backends that have a trained ``model`` (order preserved)."""
+    out: list[str] = []
+    for name in _ORDERED_GBM_BACKENDS:
+        art = base_artifacts.get(name)
+        if isinstance(art, dict) and art.get("model") is not None:
+            out.append(name)
+    return tuple(out)
 
 
 def _cfg_oof_enabled() -> bool:
@@ -257,6 +269,7 @@ def _val_block_from_scores(
 def _stacking_candidate_from_scores(
     *,
     base_artifacts: Mapping[str, Dict[str, Any]],
+    stack_bases: Tuple[str, ...],
     feature_cols: Sequence[str],
     y_val: pd.Series,
     val_scores: np.ndarray,
@@ -275,12 +288,12 @@ def _stacking_candidate_from_scores(
         _train_metrics_dict_from_y_scores,
     )
 
-    base_models = [base_artifacts[k]["model"] for k in _BASE_BACKENDS]
+    base_models = [base_artifacts[k]["model"] for k in stack_bases]
     meta_model = oof_report["meta_model"]
     wrapper = LogisticStackedModel(
         base_models=base_models,
         feature_names=list(feature_cols),
-        component_backends=list(_BASE_BACKENDS),
+        component_backends=list(stack_bases),
         meta_model=meta_model,
     )
     metrics = _val_block_from_scores(
@@ -317,7 +330,7 @@ def _stacking_candidate_from_scores(
     metrics["reason_codes_enabled"] = False
     metrics["stacking"] = {
         "meta_learner": "logistic_regression",
-        "component_backends": list(_BASE_BACKENDS),
+        "component_backends": list(stack_bases),
         "oof_fold_report": {k: v for k, v in oof_report.items() if k != "meta_model"},
     }
     artifact = {
@@ -327,7 +340,7 @@ def _stacking_candidate_from_scores(
         "metrics": metrics,
         "model_kind": "stacked_logistic_oof",
         "reason_codes_enabled": False,
-        "component_backends": list(_BASE_BACKENDS),
+        "component_backends": list(stack_bases),
     }
     row = {
         "backend": "stacked_logistic_oof",
@@ -371,9 +384,11 @@ def build_stacked_logistic_candidate(
     if not _cfg_oof_enabled():
         report["reason"] = "disabled_by_config"
         return None, None, report
-    missing = [k for k in _BASE_BACKENDS if k not in base_artifacts]
-    if missing:
-        report["reason"] = f"missing_base_backends:{','.join(missing)}"
+    stack_bases = _stacking_base_backends(base_artifacts)
+    if len(stack_bases) < 2:
+        report["reason"] = (
+            f"insufficient_base_backends_for_stacking:have={','.join(stack_bases) or '(none)'}"
+        )
         return None, None, report
     if rated_train_df is None or rated_train_df.empty:
         report["reason"] = "rated_train_df_missing"
@@ -396,7 +411,7 @@ def build_stacked_logistic_candidate(
         report["effective_folds"] = int(len(folds))
         return None, None, report
     n = len(rated_train_df)
-    z_oof = np.full((n, len(_BASE_BACKENDS)), np.nan, dtype=np.float64)
+    z_oof = np.full((n, len(stack_bases)), np.nan, dtype=np.float64)
     y_oof = np.full(n, np.nan, dtype=np.float64)
     fold_summaries: List[Dict[str, Any]] = []
     for fold_id, fold in enumerate(folds, start=1):
@@ -404,7 +419,7 @@ def build_stacked_logistic_candidate(
         x_vl = X_train.iloc[fold.valid_idx]
         y_vl = pd.to_numeric(y_train.iloc[fold.valid_idx], errors="coerce").fillna(0).to_numpy(dtype=np.float64)
         y_oof[fold.valid_idx] = y_vl
-        for b_idx, backend in enumerate(_BASE_BACKENDS):
+        for b_idx, backend in enumerate(stack_bases):
             mdl = base_artifacts[backend]["model"]
             z_oof[fold.valid_idx, b_idx] = _predict_scores(mdl, x_vl)
         fold_summaries.append(
@@ -435,13 +450,17 @@ def build_stacked_logistic_candidate(
     )
     meta.fit(z_fit, y_fit.astype(int))
     # Final stacked scores across standard evaluated splits.
-    z_train_all = np.column_stack([_predict_scores(base_artifacts[b]["model"], X_train) for b in _BASE_BACKENDS])
+    z_train_all = np.column_stack(
+        [_predict_scores(base_artifacts[b]["model"], X_train) for b in stack_bases]
+    )
     train_scores = np.asarray(meta.predict_proba(z_train_all)[:, 1], dtype=np.float64)
-    z_val = np.column_stack([_predict_scores(base_artifacts[b]["model"], X_val) for b in _BASE_BACKENDS])
+    z_val = np.column_stack([_predict_scores(base_artifacts[b]["model"], X_val) for b in stack_bases])
     val_scores = np.asarray(meta.predict_proba(z_val)[:, 1], dtype=np.float64)
     test_scores: Optional[np.ndarray] = None
     if X_test is not None and y_test is not None and not X_test.empty:
-        z_test = np.column_stack([_predict_scores(base_artifacts[b]["model"], X_test) for b in _BASE_BACKENDS])
+        z_test = np.column_stack(
+            [_predict_scores(base_artifacts[b]["model"], X_test) for b in stack_bases]
+        )
         test_scores = np.asarray(meta.predict_proba(z_test)[:, 1], dtype=np.float64)
     report.update(
         {
@@ -460,6 +479,7 @@ def build_stacked_logistic_candidate(
     oof_report_for_metrics["meta_model"] = meta
     row, artifact = _stacking_candidate_from_scores(
         base_artifacts=base_artifacts,
+        stack_bases=stack_bases,
         feature_cols=feature_cols,
         y_val=y_val,
         val_scores=val_scores,

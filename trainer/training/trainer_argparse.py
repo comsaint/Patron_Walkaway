@@ -103,7 +103,7 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         help=(
             "Precision uplift A2/R2: optional rated-only sample_weight recipe before Optuna "
             "(top-band / pseudo-HNM / shallow-HNM refine). When omitted, use env "
-            "PRECISION_UPLIFT_RANKING_RECIPE if set, else r2_top_band_light (DEC-044). "
+            "PRECISION_UPLIFT_RANKING_RECIPE if set, else r2_combined_light (DEC-044). "
             "Pass baseline to disable A2-style reweighting. Ignored for Plan B+ LibSVM "
             "final fit (on-disk weights); CSV export path applies recipe when set."
         ),
@@ -135,8 +135,8 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "A3: include XGBoost in the GBM bakeoff for this process. When omitted, only the "
-            "environment variable GBM_BAKEOFF_ENABLE_XGBOOST applies (unset defaults to off)."
+            "A3: include XGBoost in the GBM bakeoff for this process. When omitted, "
+            "GBM_BAKEOFF_ENABLE_XGBOOST applies (unset defaults to on in training-domain config)."
         ),
     )
     parser.add_argument(

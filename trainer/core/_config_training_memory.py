@@ -21,18 +21,18 @@ STEP7_PANDAS_FALLBACK_MAX_BYTES = 256 * 1024 * 1024
 
 # --- Negative sampling / OOM pre-check ---
 # User policy knob: keep all positives, optionally reduce negatives.
-NEG_SAMPLE_FRAC: float = 0.3
+NEG_SAMPLE_FRAC: float = 1.0
 
 # Internal guards for auto-reduction logic.
-NEG_SAMPLE_FRAC_AUTO: bool = False
+NEG_SAMPLE_FRAC_AUTO: bool = True
 NEG_SAMPLE_FRAC_MIN: float = 0.05
 NEG_SAMPLE_FRAC_ASSUMED_POS_RATE: float = 0.15
 NEG_SAMPLE_RAM_SAFETY: float = 0.75
 NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT: int = 200 * 1024 * 1024
 
 # --- Row-level split contract ---
-TRAIN_SPLIT_FRAC = 0.70
-VALID_SPLIT_FRAC = 0.15
+TRAIN_SPLIT_FRAC = 0.65
+VALID_SPLIT_FRAC = 0.20
 MIN_VALID_TEST_ROWS = 50
 
 # --- Profile ETL memory path ---
