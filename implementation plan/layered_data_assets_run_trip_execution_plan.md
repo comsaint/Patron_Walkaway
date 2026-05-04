@@ -94,7 +94,7 @@
 
 | 狀態 | Task ID | 任務 | Owner | 依賴 | 輸出 artifact | DoD |
 | :---: | :--- | :--- | :--- | :--- | :--- | :--- |
-| 🟡 | **LDA-E0-01** | `time_semantics_registry` PR 流程：template、必填欄位、與 schema dict／FND 對照檢查表 | ML Platform + Data Platform | §1.1 | `.github/` 或 `doc/` 下 PR checklist +（可選）`scripts/validate_time_semantics_registry.py` | 本機：`python scripts/validate_time_semantics_registry.py`；合併前仍建議設 required check。**v0.13 補強待辦**：新增 machine-readable 欄位（例如 `contributes_to_trip_close_horizon`）並納入 CI 驗證；未聲明者不得參與 `coverage_end_gaming_day` 計算。 |
+| ✅ | **LDA-E0-01** | `time_semantics_registry` PR 流程：template、必填欄位、與 schema dict／FND 對照檢查表 | ML Platform + Data Platform | §1.1 | `.github/` 或 `doc/` 下 PR checklist + `scripts/validate_time_semantics_registry.py` | **DoD（已達）**：`doc/time_semantics_registry_pr_checklist.md`、PR template、`schema/time_semantics_registry.yaml` 含 **`contributes_to_trip_close_horizon`**（v1 僅 `t_bet: true`）；驗證器強制 bool + 貢獻表政策；`python scripts/validate_layered_contracts.py`（等同 `make check-layered-contracts`）會執行該腳本；`.github/workflows/layered_data_assets.yml` 有 workflow。**治理後續**：GitHub branch protection **尚未**將該 CI job 設為 required（團隊已確認）；建議後續補上。 |
 | ✅ | **LDA-E0-02** | Preprocessing 規格書：`preprocess_*_v1` 與 FND-01/03/11/13 對照 | DS / Feature Owner + Data Platform | E0-01 | `doc/preprocessing_layered_data_assets_v1.md`（路徑可調，須寫入 repo） | 每條規則有 rule id；與 manifest 可引用欄位對齊 |
 | ✅ | **LDA-E0-03** | Manifest schema：SSOT §8 + `ingestion_delay_summary` | ML Platform | SSOT | `schema/manifest_layered_data_assets.schema.json`（或等價） | JSON Schema 或表格可機器驗證；範例 `manifest.json` 通過驗證。**後續 schema 升級（對齊 SSOT v1.12／impl v0.13）**：`run_fact` manifest **MUST** 含 **`gaming_day_start_hour_used`**；`trip_fact` manifest/sidecar **MUST** 含 **`gaming_day_start_hour_used`**、**`coverage_end_gaming_day`**、**`G_max`**（或等價）與 `coverage_input_tables`（或等價來源清單）；`ingestion_delay_summary` **MUST** 含 **`late_threshold_status` ∈ {`defined`, `undefined`}`**；僅 `defined` 時 **`late_row_*` 必填**，`undefined` 時須缺省或 `null`（見 SSOT §4.4）。另需在 schema/文件明示：`late_threshold` 與 `ingest_delay_cap_sec` 不得隱式互綁。 |
 | ✅ | **LDA-E0-04** | `late_arrival_correction_log` schema：對齊 implementation plan §10 + manifest join 鍵 | ML Platform | E0-03 | `schema/late_arrival_correction_log.schema.json` + 範例列 | PK／索引欄位與 §10.1 一致；範例通過驗證 |
@@ -102,7 +102,7 @@
 | ✅ | **LDA-E0-06** | Feature dependency registry 初稿：每 `(track_section, feature_id)` 一列 | DS / Feature Owner | E0-05 | `artifacts/.../feature_dependency_registry.csv`（或 yaml） | 欄位含：所需 L1 欄位、是否允許回掃 bet、計算來源占位；無缺列（細部 `TBD` 由 DS 後續收斂） |
 | ✅ | **LDA-E0-07** | Phase 0 CI gate：registry + manifest + correction_log schema + enumerator | ML Platform | E0-01–E0-06 | CI workflow 或 `make check-layered-contracts` | 本機：`make check-layered-contracts`；遠端 CI 由團隊自設 |
 
-**Phase 0 完成條件**：E0-02–E0-07 皆 **✅**，且 **E0-01（trip horizon 來源表旗標補強）** 轉為 **✅**。
+**Phase 0 完成條件**：§4.1 任務表之 **LDA-E0-01–E0-07** 皆 **✅**（含 trip horizon 來源表旗標與驗證器；E0-01 見上列「治理後續」關於 required check）。
 
 ---
 
@@ -346,7 +346,7 @@
 | §5 Phase 0–4 | §4–§8 任務表 |
 | §2.2.1 統一失效模型（含 bet 路徑 `impact_day_ratio`／`changed_player_ratio` 與 full recompute 備援；**LDA-016 數值僅在本層**） | E4-01（KPI／觀測）、§10.2；implementation plan §8.1（invalidation gate）；SSOT **LDA-016** 僅原則 |
 | §2.4／§2.4.1 L0.5 `cleaned_bet`（rolling **7**）與多實體掛載預留；§2.1 `t_session`／遷移 | BL-05、BL-06、**BL-07**、§11.1；E1-12／E1-13 backlog |
-| §2.2 Trip horizon 來源表旗標（`contributes_to_trip_close_horizon`） | E0-01（v0.13 補強）、**BL-09** |
+| §2.2 Trip horizon 來源表旗標（`contributes_to_trip_close_horizon`） | **LDA-E0-01** ✅、**BL-09** |
 | §4.2 / §4.3 `GAMING_DAY_START_HOUR` / `HK_TZ` 單一來源與 trip 上界時區契約 | §10.2 風險列、**BL-08**、E2-01 DoD（時區正規化 + 單點凍結上界） |
 | §2.3 Resumable 契約 | §5.2–§5.3、E1-09–E1-10、G7 |
 | one-liner + BET-DQ-03 fail-closed（自 implementation plan v0.6 起） | §5.2（E1-14~E1-16）、§5.3 列 15–17、G8 |
