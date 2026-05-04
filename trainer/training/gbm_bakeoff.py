@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -876,7 +877,16 @@ def train_and_select_rated_gbm_family(
     if enable_xgb:
         backend_jobs.append((_train_xgboost_backend, "xgboost"))
 
+    # Plan may request parallel_backend_workers>1 when multiple GPUs exist, but if only
+    # one optional backend is enabled we still had len(backend_jobs)==1 and used
+    # ThreadPoolExecutor — running XGBoost/CatBoost fit on a worker thread triggers
+    # native faults on some Windows builds (e.g. STATUS_STACK_BUFFER_OVERRUN 0xC0000409).
     parallel_workers = int(backend_runtime_plan.get("parallel_backend_workers") or 1)
+    parallel_workers = min(parallel_workers, len(backend_jobs))
+    if sys.platform == "win32":
+        # Two native backends concurrently on worker threads also faults (0xC0000409);
+        # keep CPU/GPU bakes sequential on Windows. Linux servers retain parallel GPUs.
+        parallel_workers = 1
     if backend_jobs and parallel_workers > 1:
         _preload_parallel_backend_imports(tuple(b for _, b in backend_jobs))
         with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
