@@ -124,7 +124,7 @@
 
 **Phase 1 完成條件**：E1-01–E1-08 皆 **✅**；**不**要求 `trip_fact` 最終語義。  
 **Phase 1 延伸（例行 smoke／PR）**：**LDA-E1-11** 已 **✅（MVP）**；合併前跑 **`make check-lda-l0`**（已含 **`test_lda_e1_11_gate1_with_registry_v1`**：編排器帶 registry 之一條龍 vs 無 registry 基線）；仍不阻塞 E1-01–E1-08 之已達標敘述。  
-**Phase 1R（resumable 擴充）完成條件**：**E1-09**、**E1-10**、**E1-14**、**E1-15**、**E1-16** 皆達標；G7 由 **`tests/integration/test_lda_e1_10_resume_g7_v1.py`** 覆蓋（`make check-lda-l0`），G8 由 one-liner rated gate 測試覆蓋。可選加強：專用 **SIGINT**／多 worker 併發 CI job。  
+**Phase 1R（resumable 擴充）完成條件**：**E1-09**、**E1-10**；**E1-14** **✅（2026-05-04）** 見 **`tests/integration/test_lda_e1_14_raw_rated_eligible_gate_v1.py`**；**E1-15**、**E1-16** 仍⬜。G7 由 **`tests/integration/test_lda_e1_10_resume_g7_v1.py`** 覆蓋（`make check-lda-l0`）；G8 之 argv／banner 段由 E1-14 整合測覆蓋，fail-closed 與 eligible OOM 仍以 E1-15／E1-16 為準。可選加強：專用 **SIGINT**／多 worker 併發 CI job。  
 **E1-11（ingest cap）驗收建議**：合併主線前跑 **`make check-lda-l0`**（已含 **`test_lda_e1_11_gate1_with_registry_v1`**）；若 `cleaned` 因 dedup tie-break（`__etl_insert_Dtm_synthetic`）導致下游列集合變化，須在 PR／實作說明中列明並以 fixture 或對照表覆蓋預期（列 12 測試假設「synthetic 不影響 dedup 勝者」之 baseline）。
 
 ### 5.2 `LDA-E1-09` / `LDA-E1-10` / `LDA-E1-11` / `LDA-E1-14~16` 交付細化
@@ -166,6 +166,7 @@
   `t_session -> trainer.identity.build_rated_eligible_player_ids_df -> preprocess --eligible-player-ids-parquet`。
 - **fail-closed（MUST）**：raw 模式若缺 `raw_t_session` 且未提供可用 eligible 來源，應直接 exit 2；不得用 `preprocessing_gaps` 降級放行 BET-DQ-03。
 - **cutoff 契約（MUST）**：需顯式旗標（例如 `--cutoff-dtm` 或等價設定來源）傳給 `build_rated_eligible_player_ids_df`；不得隱式漂移。
+- **整合測（E1-14，2026-05-04）**：**`tests/integration/test_lda_e1_14_raw_rated_eligible_gate_v1.py`** — raw + session + cutoff；`--echo-commands` 斷言 preprocess argv 含 **`--eligible-player-ids-parquet`**；fixture 置於 **`.tmp/lda_e114_*`**（L0 ingest anchor）；**`--canonical-mapping-parquet`** 可指向尚不存在之路徑（resolve 會建）；備份／還原 **`data/canonical_mapping.cutoff.json`**。
 - **記憶體/時間約束（MUST）**：eligible 建構需支援欄位裁切與分批/串流，避免全量載入大型 `t_session` 導致 OOM；失敗需輸出可重現錯誤上下文。
 - **Trainer 單一來源（MUST）**：LDA 不得重寫 rated 判定 SQL；只能復用 `trainer.identity` 的公共函式語意。
 
@@ -189,7 +190,7 @@
 | ✅ | 12 | **E1-11**：Gate1 迴歸（含 OOM profiles）證明 run 產物不變或僅預期內變更 | ML Platform | 0.5 | 11, E1-08 | **2026-05-03**：**`tests/integration/test_lda_e1_11_gate1_with_registry_v1.py`** — 編排器帶／不帶 registry 在 E1-10 fixture 上 **L1 四產物 row fingerprint 一致**（判準：synthetic observed 不影響 dedup 勝者）；manifest 含 **BET-INGEST-FIX-004**；已納入 **`make check-lda-l0`**（Gate1 仍為編排器內建兩 profile，與 E1-10 一致）。 |
 | ⬜ | 13 | **E1-12**：`cleaned` 單一活躍資料集策略落地（按 `gaming_day` 覆寫，不保留大量歷史 parquet） | Data Platform + Ops | 0.75 | E1-09, E1-11 | 文件化並實作路徑慣例：固定 active root、分區 `*.tmp -> rename` 覆寫、同步更新 state；不得改變既有業務語義 |
 | ⬜ | 14 | **E1-13**：最小追溯與回滾保障（輕量變更索引 + 最近一次回滾點） | Data Platform + ML Platform | 1.0 | 13 | 每次分區覆寫都寫事件索引（含 `gaming_day`、`input_hash`、`row_count`、`updated_at`、operator）；可對單日執行一次回滾演練並附證據 |
-| ⬜ | 15 | **E1-14**：編排器 one-liner 接入 trainer rated builder（raw 模式自動建 eligible） | Data Platform | 1.0 | E1-02, E1-09 | `lda_l1_gate1_day_range_v1.py` 在 `--raw-t-bet-parquet` + `--raw-t-session-parquet` 下，會產生並傳遞 `--eligible-player-ids-parquet`；新增整合測試覆蓋 |
+| ✅ | 15 | **E1-14**：編排器 one-liner 接入 trainer rated builder（raw 模式自動建 eligible） | Data Platform | 1.0 | E1-02, E1-09 | **`tests/integration/test_lda_e1_14_raw_rated_eligible_gate_v1.py`**（2026-05-04）：`--raw-t-bet-parquet` + `--raw-t-session-parquet` + `--cutoff-dtm` + `--canonical-mapping-parquet`（repo 下 **`.tmp/lda_e114_*`**，滿足 L0 anchor）；`--echo-commands` 斷言 `preprocess_bet_v1.py` argv 含 `--eligible-player-ids-parquet`；banner 含 `BET-DQ-03 eligible ids`；備份／還原 `data/canonical_mapping.cutoff.json`；`_validate_mode` 允許「缺檔 canonical + 有 session+cutoff」交由 resolve 建檔；已納入 `make check-lda-l0`。 |
 | ⬜ | 16 | **E1-15**：BET-DQ-03 fail-closed 與 cutoff 旗標契約 | Data Platform + ML Platform | 0.75 | 15 | 缺 `t_session` 或 eligible 來源時直接失敗；新增 `--cutoff-dtm`（或等價）並驗證傳遞到 `build_rated_eligible_player_ids_df`；不得 silent fallback |
 | ⬜ | 17 | **E1-16**：eligible 建構的 OOM 防護（欄位裁切/分批）+ run log | Data Platform | 1.0 | 15 | 大檔 `t_session` 路徑不做全量 in-memory；新增資源壓力測試與失敗上下文輸出（沿用 §7.1 log 契約） |
 

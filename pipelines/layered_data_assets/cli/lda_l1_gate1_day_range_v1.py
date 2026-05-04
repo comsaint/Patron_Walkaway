@@ -1622,8 +1622,11 @@ def _validate_mode(args: argparse.Namespace) -> int | None:
     ):
         cm = Path(args.canonical_mapping_parquet).resolve()
         if not cm.is_file():
-            print(f"--canonical-mapping-parquet not found: {cm}", file=sys.stderr)
-            return 2
+            raw_sess = getattr(args, "raw_t_session_parquet", None)
+            has_cut = bool(getattr(args, "cutoff_dtm", None) and str(args.cutoff_dtm).strip())
+            if raw_sess is None or not has_cut:
+                print(f"--canonical-mapping-parquet not found: {cm}", file=sys.stderr)
+                return 2
     if args.raw_t_bet_parquet is not None:
         has_explicit_eligible = args.eligible_player_ids_parquet is not None
         has_canonical = getattr(args, "canonical_mapping_parquet", None) is not None
