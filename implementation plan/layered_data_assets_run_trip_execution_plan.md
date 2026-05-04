@@ -2,7 +2,7 @@
 
 > **文件層級**：Working / Execution Plan（執行層）。  
 > **目的**：把 SSOT 與 Implementation Plan 落成**可執行任務**（順序、owner 角色、依賴、產物、DoD、gate、升級規則）。  
-> **依據**：[`ssot/layered_data_assets_run_trip_ssot.md`](ssot/layered_data_assets_run_trip_ssot.md)（v1.9）、[`implementation plan/layered_data_assets_run_trip_implementation_plan.md`](implementation%20plan/layered_data_assets_run_trip_implementation_plan.md)（v0.10）、[`schema/time_semantics_registry.yaml`](schema/time_semantics_registry.yaml)、[`package/deploy/models/feature_spec.yaml`](package/deploy/models/feature_spec.yaml)。  
+> **依據**：[`ssot/layered_data_assets_run_trip_ssot.md`](ssot/layered_data_assets_run_trip_ssot.md)（**v1.12**）、[`implementation plan/layered_data_assets_run_trip_implementation_plan.md`](implementation%20plan/layered_data_assets_run_trip_implementation_plan.md)（**v0.13**）、[`schema/time_semantics_registry.yaml`](schema/time_semantics_registry.yaml)、[`package/deploy/models/feature_spec.yaml`](package/deploy/models/feature_spec.yaml)、[`trainer/core/_config_training_domain.py`](../trainer/core/_config_training_domain.py)（`GAMING_DAY_START_HOUR`、`HK_TZ`）。  
 > **邊界**：本檔**不重寫**業務定義與架構決策；若與上層文件衝突，以上層為準並回寫本檔。
 
 ---
@@ -13,11 +13,12 @@
 
 本輪執行目標為：建立與 `trainer` **並行**之分層資料產線（L0→preprocess→L1→L2→publish→可選 online delta），並以 **manifest、determinism、100% feature 覆蓋、correction log** 作為可驗收交付。Phase 1 **不**產出 trip 最終語義；trip v1 於 Phase 2 一次到位。
 
-**Phase 1 進度速記（2026-05-03 更新；含 2026-05-02 smoke）**：**LDA-E1-01** **✅**（見下段 smoke）。**LDA-E1-02** **✅（MVP）**：`scripts/preprocess_bet_v1.py` + `layered_data_assets/preprocess_bet_v1.py`／`l1_paths.py`；輸出 `data/l1_layered/<snap>/t_bet/gaming_day=.../cleaned.parquet` 與同目錄 `manifest.json`（`preprocessing_rule_id`／`preprocessing_rule_version`）；未餵 dummy／eligible sidecar 時 `preprocessing_gaps` 列明 **BET-DQ-02／03** 略過。**LDA-E1-03** **✅（MVP）**：`scripts/materialize_run_fact_v1.py` + `run_id_v1`／`run_fact_v1`；輸出 `data/l1_layered/<snap>/run_fact/run_end_gaming_day=.../run_fact.parquet` + `manifest.json`；`run_id` 與 `ORDER BY payout_complete_dtm ASC, bet_id ASC` 切 run 及 §4.1 canonical JSON 一致（見單元測試）。**LDA-E1-04** **✅（MVP）**：`scripts/materialize_run_bet_map_v1.py` + `run_bet_map_v1`；`run_bet_map.parquet` 與 `run_fact` 共用邊界暫存表語意；單元測試驗證 membership 與 `bet_count`／首尾 bet 序一致。**LDA-E1-05** **✅（MVP）**：`scripts/materialize_run_day_bridge_v1.py` + `run_day_bridge_v1`；以 **`bet_gaming_day`** 分區之 `run_day_bridge.parquet`（distinct `run_id` 等）；可支援日粒度影響分析與重算範圍掃描（單元測試）。**LDA-E1-06** **✅（MVP）**：`ingestion_delay_summary_v1`（DuckDB 預演：`payout_complete_dtm` vs `__etl_insert_Dtm`）+ `manifest_lineage_v1`（fingerprint → `source_hashes`）；已接到 preprocess 與三個 run 物化 CLI；可選 `scripts/manifest_lineage_preview_v1.py` 後補既有 manifest。**LDA-E1-07** **✅（MVP）**：`layered_data_assets/oom_runner_v1.py`（§7.1：輸入位元組／可用 RAM 提示、`memory_limit`／`threads` 階梯、RSS 觀測、JSONL run log、耗盡時 fail-fast + 失敗上下文 JSON）；`scripts/preprocess_bet_v1.py` 與三個 `materialize_run_*_v1.py` 共用 CLI（`--duckdb-run-log`、`--duckdb-oom-failure-context`、`--duckdb-oom-max-attempts`、`--duckdb-initial-memory-limit-mb`）；範例 `schema/examples/oom_run_log.example.jsonl`、`schema/examples/oom_failure_context.example.json`；單元測試 mock OOM 驗證重試與非 OOM fail-fast。**LDA-E1-08** **✅（MVP）**：`layered_data_assets/l1_determinism_gate_v1.py`（§8.1 Gate 1：多部 DuckDB `memory_limit`／`threads` 下重跑物化，比對列數與 row-level `sha256(string_agg…))` fingerprint）；`scripts/gate1_l1_determinism_v1.py` 輸出 JSON 報告、exit code 反映是否一致；`make check-lda-l0` 含 `test_l1_determinism_gate_v1`（`run_fact`／`run_bet_map`／`run_day_bridge`）。**LDA-E1-09** **✅（MVP，2026-05-03）**：`materialization_state` DuckDB + `lda_l1_gate1_day_range_v1.py` 的 **`--state-store`**／**`--resume`**／**`--force`**／**`--stop-after-date`**（預設 state：`data/l1_layered/materialization_state.duckdb`）；詳見 RUNBOOK §5.1；**子程序** `preprocess_bet_v1` 與三 `materialize_run_*_v1` 對 **`*.parquet`+`manifest.json`** 採 **`*.tmp`→`os.replace`**（`layered_data_assets/atomic_parquet_manifest_v1.py`）；編排器可選 **`--ingestion-fix-registry-yaml`**／**`--ingestion-fix-registry-version-expected`**（轉 preprocess；preprocess 之 `input_hash` 含 registry）。**LDA-E1-10** **✅（MVP，2026-05-03）**：G7 整合測 **`tests/integration/test_lda_e1_10_resume_g7_v1.py`**（一次跑完 vs `stop-after-date`+`--resume`；比對 preprocess+三物化之 row fingerprint）。**LDA-E1-11** **✅（MVP，2026-05-03）**：`preprocess_bet_ingestion_fix_registry_v1.py` + preprocess／CLI 選用 `--ingestion-fix-registry-yaml`（122s **`BET-INGEST-FIX-004`** cap、`__etl_insert_Dtm_synthetic`、manifest `ingestion_fix_*`／`applied_fix_rules`）；`check-lda-l0` 已含 `test_preprocess_bet_ingestion_fix_registry_v1`。**§5.3 列 12（2026-05-03）**：`tests/integration/test_lda_e1_11_gate1_with_registry_v1.py` 驗收編排器帶 `--ingestion-fix-registry-yaml` 之一條龍與無 registry 基線在 E1-10 fixture 上 L1 四產物 fingerprint 一致；已納入 `make check-lda-l0`。本機 smoke：`python scripts/l0_ingest.py --data-root data --table t_bet --partition-key gaming_day --partition-value smoke-2026-05-02 --source data/baseline_for_baseline_models.parquet`（先 `--dry-run` 再實寫）；產物 `data/l0_layered/snap_187e491186316d9a24316f86e06dc6b2/snapshot_fingerprint.json` 與 `.../t_bet/gaming_day=smoke-2026-05-02/part-000.parquet`。**刻意**使用 repo 內較小之真實 Parquet（約 1.7MB）以驗證指紋／`source_snapshot_id`／複製路徑；**未**對 ~22GB 之 `gmwds_t_bet.parquet` 做全檔 ingest（避免 OOM／磁碟與時間風險）。治理見 `doc/l0_ingest_governance_decisions.md`。  
-**語義同步註記（2026-05-04）**：上層治理文件以本檔文首「依據」為準：**SSOT v1.9**／**Implementation Plan v0.10**。與執行層最直接相關之收斂包含：**L0.5**（SSOT §4.1.1；現況 bet 語義為 `cleaned_bet`）、**LDA-016**（rolling **7** 版與 bet 路徑 full recompute 備援；分母與比值定義見 implementation plan **§2.2.1**）、**LDA-017**（多實體 L0.5 擴充預留）、implementation plan **§2.4**／**§2.4.1**（`cleaned_bet` 治理與未來實體掛載）、本檔 **§11.1**／**BL-06**（Future entity onboarding 模板）。**仍維持**：v1.4 起 run 定義（30 分鐘 gap + `GAMING_DAY_START_HOUR` 硬切）、**LDA-014** `observed_at_logical`（`t_bet` **122 sec** 等）、`preprocess_bet_v1` 之 **`PARTITION BY bet_id`** 與 **`ORDER BY payout_complete_dtm, bet_id`**、Trip v1（`trip_start_gaming_day`、open/closed、`trip_id` 納入 `source_snapshot_id` 等）—細節以 SSOT／implementation plan 原文為準。  
-**歷史註記（2026-05-03）**：當時速記曾對齊 **SSOT v1.6**／**Implementation Plan v0.7**；自 **v1.9**／**v0.10** 起已補 L0.5、LDA-016／017、§2.2.1 失效模型與多實體預留；下段 Phase 1／2 速記仍作交付時間線參考。  
-**Phase 2 進度速記（2026-05-03）**：**LDA-E2-01～E2-03** **🟡（MVP 程式已落地）**—`pipelines/layered_data_assets/core/trip_fact_v1.py`、`trip_id_v1.py`、`scripts/materialize_trip_fact_v1.py`；`run_fact` 增 **`run_start_gaming_day`**；`make check-lda-l0` 含 `test_trip_fact_v1`；RUNBOOK §4.4。**尚需完成方可滿足表格 DoD「✅」**：「無 bet／無 run」等價之**獨立一致性報告**與 fixture、**E1-09 編排器**內建 trip 步驟、**大表 player_id 分桶／multi-worker + single-writer merge** 產線級路徑。**LDA-E2-04** **🟡（MVP，2026-05-03）**：`schema/published_snapshot*.schema.json`、範例、`pipelines/.../io/published_snapshot_v1.py`、`scripts/publish_layered_snapshot_v1.py`、`validate_layered_contracts`、`test_published_snapshot_v1`、RUNBOOK §4.5；完整 sidecar manifest／Ops 回滾 runbook 仍屬 **🟡** 收斂項。**LDA-E2-05～E2-06** 仍 **⬜**（見 §6.1）。**LDA-E2-07** **🟡（提案稿，2026-05-03）**：`doc/ktd_proposal_layered_data_assets.md`（K/T/D 候選、負載上界公式、簽核欄；**未滿「✅」**：Model Owner／Ops 書面簽核與觀測校準後再改狀態）。
-**落差補強（v0.6 新增）**：one-liner 編排在 raw 模式必須強制走 `t_session -> trainer.identity.build_rated_eligible_player_ids_df -> --eligible-player-ids-parquet`，且對 BET-DQ-03 採 fail-closed（缺 eligible 即失敗，不得以 `preprocessing_gaps` 降級放行）；對應任務見 **E1-14 ~ E1-16**。
+**Phase 1 狀態（精簡；細節見 §5 任務表與 RUNBOOK）**：**LDA-E1-01～E1-11**、**E1-14～E1-16** 均 **✅（MVP）**；合併前跑 **`make check-lda-l0`**。其中 **E1-09／E1-10／E1-11／E1-14～E1-16** 屬 **Phase 1R** 範疇；§5「Phase 1 完成條件」仍以 **E1-01～E1-08** 為門檻敘述。L0 smoke 與 `snap_187e491186316d9a24316f86e06dc6b2` 範例見 `doc/l0_ingest_governance_decisions.md`。
+
+**語義同步註記（2026-05-04 更新）**：治理上層已升版為 **SSOT v1.12**／**Implementation Plan v0.13**。重點收斂：**LDA-016 數值**（7 版／10% 等）**僅**見 implementation plan **§2.2.1**／**§2.4**；SSOT 只保留原則。**Trip close 觀測上界**：以 **`observed_at_logical`** 全域 max（先按 `HK_TZ` 時區正規化）映射 **`G_max`**，再令 **`coverage_end_gaming_day = G_max - 1`**（SSOT §5.1；impl **§4.3**）；現有 `trip_fact_v1.py` 若仍用「全體 `run_end_gaming_day` max」或未做 **`-1`**，**與上層不一致**，待程式對齊。參與上界計算之來源表必須先完成 `observed_at_logical` 量測與 cap 定版。**`GAMING_DAY_START_HOUR`** 以 **`trainer/core/_config_training_domain.py`** 為單一來源；**`run_fact`／`trip_fact` manifest 必須（MUST）**含 **`gaming_day_start_hour_used`**（trip 另含 **`coverage_end_gaming_day`**、`G_max` 與來源表清單）。**`input_hash`**：**內容**指紋（impl **§2.3**）；**應優先**重用上游 manifest **`source_hashes`**，避免重複全檔 `sha256`；編排器若仍混用 file stat 須跟進。**`late_threshold` 與 `ingest_delay_cap_sec`**：可同值但不可隱式綁定；須顯式留痕。**Parity／FND-11** 見 impl **§6.1**（含 canonical 對照提示）。**`late_threshold_status` ∈ {`defined`, `undefined`}`**；僅 `defined` 時輸出 **`late_row_*`**（SSOT §4.4）。**`t_session`**：資產層來源；過渡期暫借 trainer；目標 **`cleaned_session`** 與 mapping 遷入本產線（impl **§2.1**、**§2.4.1**、本檔 **BL-07**）。
+
+**Phase 2 狀態（精簡）**：**LDA-E2-01～E2-04** **🟡（MVP）**；**E2-05～E2-06** **⬜**；**E2-07** **🟡（提案）**。除上表外，尚須：**trip 與 §4.3 上界一致**、**E1-09 編排器接 trip**、**分桶 + single-writer merge**、**無 bet／無 run 等價報告**。
+**落差補強（歷史沿用，持續有效）**：one-liner 編排在 raw 模式必須強制走 `t_session -> trainer.identity.build_rated_eligible_player_ids_df -> --eligible-player-ids-parquet`，且對 BET-DQ-03 採 fail-closed（缺 eligible 即失敗，不得以 `preprocessing_gaps` 降級放行）；對應任務見 **E1-14 ~ E1-16**。
 
 ### 0.2 狀態圖例（本檔維護）
 
@@ -44,8 +45,8 @@
 
 ### 1.1 必備輸入（凍結前不得宣稱 Phase 0 完成）
 
-- SSOT v1.9 可取得且為爭議解方之最高優先序（見 SSOT §0.1）。
-- Implementation plan v0.10 可取得（含 Executive Summary、§6.1.1 枚舉規則、§7.1 OOM、§8.1 gate、§10 correction log、§4 `observed_at_logical`／ingestion fix registry 契約、one-liner + BET-DQ-03 fail-closed 契約、L0.5 多實體擴充預留）。
+- SSOT **v1.12** 可取得且為爭議解方之最高優先序（見 SSOT §0.1）。
+- Implementation plan **v0.13** 可取得（含 §2.1 `t_session`／遷移、§2.4.1 session 候選、§4.3 trip 上界 **`G_max-1`** 與 **`observed_at_logical`**（含 HK 時區正規化）、§6.1 parity／FND-11 識別提示、§2.3 內容 `input_hash` 與 **I/O 重用**、`GAMING_DAY_START_HOUR` 單一來源、manifest **MUST** 欄位、`late_threshold_status` 枚舉、`late_threshold` vs `ingest_delay_cap_sec` 分工、§6.1.1 枚舉、§7.1 OOM、§8.1 gate、§10 correction log、L0.5 與 **LDA-016** 數值層）。
 - `package/deploy/models/feature_spec.yaml` 可解析（YAML AST）。
 - `schema/time_semantics_registry.yaml` 存在且可被 CI 讀取。
 
@@ -64,7 +65,7 @@
 2. **Lineage**：任一批次可自 manifest 追溯到 L0 分區與 preprocessing 版本。
 3. **Membership**：`trip_run_map`／`run_bet_map` 可完整重建 run／trip 邊界（Phase 2 起為 gate）。
 4. **Ingestion**：`published` 批次皆含 **ingestion_delay_summary**；published 缺失率為 0。
-5. **Feature**：deploy `feature_spec.yaml` 依 **§6.1.1** 枚舉之全部 **`(track_section, feature_id)`** 皆覆蓋且與 asset-layer／L2 **deterministic 一致**。
+5. **Feature**：deploy `feature_spec.yaml` 依 **§6.1.1** 枚舉之全部 **`(track_section, feature_id)`** 皆覆蓋且與 asset-layer／L2 在 **implementation plan §6.1** 所定義之 **`player_id` 參考語義**下 **deterministic 一致**（**FND-11** 依 §6.1 排除）。
 6. **Resume/Idempotency**：同日期區間在「一次跑完」與「中斷後續跑」兩種路徑下，輸出列數與 row-level hash 一致；已成功分區可安全跳過。
 
 ### 2.2 非目標（本輪不強制）
@@ -95,7 +96,7 @@
 | :---: | :--- | :--- | :--- | :--- | :--- | :--- |
 | ✅ | **LDA-E0-01** | `time_semantics_registry` PR 流程：template、必填欄位、與 schema dict／FND 對照檢查表 | ML Platform + Data Platform | §1.1 | `.github/` 或 `doc/` 下 PR checklist +（可選）`scripts/validate_time_semantics_registry.py` | 本機：`python scripts/validate_time_semantics_registry.py`；合併前仍建議設 required check |
 | ✅ | **LDA-E0-02** | Preprocessing 規格書：`preprocess_*_v1` 與 FND-01/03/11/13 對照 | DS / Feature Owner + Data Platform | E0-01 | `doc/preprocessing_layered_data_assets_v1.md`（路徑可調，須寫入 repo） | 每條規則有 rule id；與 manifest 可引用欄位對齊 |
-| ✅ | **LDA-E0-03** | Manifest schema：SSOT §8 + `ingestion_delay_summary` | ML Platform | SSOT | `schema/manifest_layered_data_assets.schema.json`（或等價） | JSON Schema 或表格可機器驗證；範例 `manifest.json` 通過驗證 |
+| ✅ | **LDA-E0-03** | Manifest schema：SSOT §8 + `ingestion_delay_summary` | ML Platform | SSOT | `schema/manifest_layered_data_assets.schema.json`（或等價） | JSON Schema 或表格可機器驗證；範例 `manifest.json` 通過驗證。**後續 schema 升級（對齊 SSOT v1.12／impl v0.13）**：`run_fact` manifest **MUST** 含 **`gaming_day_start_hour_used`**；`trip_fact` manifest/sidecar **MUST** 含 **`gaming_day_start_hour_used`**、**`coverage_end_gaming_day`**、**`G_max`**（或等價）與 `coverage_input_tables`（或等價來源清單）；`ingestion_delay_summary` **MUST** 含 **`late_threshold_status` ∈ {`defined`, `undefined`}`**；僅 `defined` 時 **`late_row_*` 必填**，`undefined` 時須缺省或 `null`（見 SSOT §4.4）。另需在 schema/文件明示：`late_threshold` 與 `ingest_delay_cap_sec` 不得隱式互綁。 |
 | ✅ | **LDA-E0-04** | `late_arrival_correction_log` schema：對齊 implementation plan §10 + manifest join 鍵 | ML Platform | E0-03 | `schema/late_arrival_correction_log.schema.json` + 範例列 | PK／索引欄位與 §10.1 一致；範例通過驗證 |
 | ✅ | **LDA-E0-05** | Feature enumerator：依 §6.1.1 產出 `features_enumerated.json`（穩定排序） | ML Platform + DS | `feature_spec.yaml` | `artifacts/.../features_enumerated.json` + `scripts/enumerate_deploy_features.py`（或等價） | `make check-layered-contracts` 內含枚舉與 artifact 一致性 |
 | ✅ | **LDA-E0-06** | Feature dependency registry 初稿：每 `(track_section, feature_id)` 一列 | DS / Feature Owner | E0-05 | `artifacts/.../feature_dependency_registry.csv`（或 yaml） | 欄位含：所需 L1 欄位、是否允許回掃 bet、計算來源占位；無缺列（細部 `TBD` 由 DS 後續收斂） |
@@ -113,7 +114,7 @@
 | :---: | :--- | :--- | :--- | :--- | :--- | :--- |
 | ✅ | **LDA-E1-01** | L0 ingest：分區 raw、`source_snapshot_id`、分區 hash 規則 | Data Platform | Phase 0 | 同上 + `scripts/l0_ingest.py` + `layered_data_assets/l0_fingerprint.py` + `schema/examples/snapshot_fingerprint.example.json` + `doc/l0_ingest_governance_decisions.md`；CI：`/.github/workflows/layered_data_assets.yml` | 同一輸入重跑得相同 `source_snapshot_id`；**2026-05-02** 本機真檔 smoke（`baseline_for_baseline_models.parquet` → `snap_187e491186316d9a24316f86e06dc6b2`；見 §0.1 速記） |
 | ✅ | **LDA-E1-02** | Preprocess job：輸出清洗後 bet 流／表 + rule id 寫 manifest | Data Platform | E0-02, E1-01 | `scripts/preprocess_bet_v1.py`、`layered_data_assets/preprocess_bet_v1.py`、`layered_data_assets/l1_paths.py`、`schema/examples/manifest_preprocess_bet_l1_example.json` | `cleaned.parquet` + `manifest.json`；`preprocessing_rule_id`=`preprocess_bet_v1`；**歷史 MVP**：dummy／rated sidecar 可選。**v0.6 起編排器路徑由 E1-14~E1-16 升級為 BET-DQ-03 fail-closed**。 |
-| ✅ | **LDA-E1-03** | `run_fact` 物化：`run_id` hash 依 implementation plan §4.1（含首筆 `bet_id`） | Data Platform | E1-02 | `layered_data_assets/run_id_v1.py`、`run_fact_v1.py`、`scripts/materialize_run_fact_v1.py`、`l1_paths.l1_run_fact_partition_dir`、`schema/examples/manifest_run_fact_l1_example.json`；主分區 **`run_end_gaming_day`**（SSOT §5.2）；切 run 採 **30 分鐘 gap + `GAMING_DAY_START_HOUR` 硬切**（目前 03:00）並輸出 `is_hard_cutoff`（或等價欄位） | Gate 1 自動化見 **LDA-E1-08**；本任務 DoD：同輸入 DuckDB `sha256` 與 Python `derive_run_id` 一致（單元測試）、hard cutoff 邊界 fixture 通過、manifest 通過 schema |
+| ✅ | **LDA-E1-03** | `run_fact` 物化：`run_id` hash 依 implementation plan §4.1（含首筆 `bet_id`） | Data Platform | E1-02 | `layered_data_assets/run_id_v1.py`、`run_fact_v1.py`、`scripts/materialize_run_fact_v1.py`、`l1_paths.l1_run_fact_partition_dir`、`schema/examples/manifest_run_fact_l1_example.json`；主分區 **`run_end_gaming_day`**（SSOT §5.2）；切 run 採 **30 分鐘 gap + `GAMING_DAY_START_HOUR` 硬切**（值來自 `trainer/core/_config_training_domain.py`，非寫死；manifest **必須（MUST）**寫入 `gaming_day_start_hour_used`，對齊 SSOT §8／v1.12）並輸出 `is_hard_cutoff`（或等價欄位） | Gate 1 自動化見 **LDA-E1-08**；本任務 DoD：同輸入 DuckDB `sha256` 與 Python `derive_run_id` 一致（單元測試）、hard cutoff 邊界 fixture 通過、manifest 通過 schema |
 | ✅ | **LDA-E1-04** | `run_bet_map` membership | Data Platform | E1-03 | `layered_data_assets/run_bet_map_v1.py`、`scripts/materialize_run_bet_map_v1.py`、`l1_paths.l1_run_bet_map_partition_dir`、`schema/examples/manifest_run_bet_map_l1_example.json`；輸出 `run_bet_map.parquet`（`run_id`, `bet_id`, `player_id`, …）與 manifest | 可由 map 還原每 run 之 bet 集合；與 `run_fact` 之 `bet_count`／首尾 `bet_id` 一致（單元測試） |
 | ✅ | **LDA-E1-05** | `run_day_bridge`：日粒度影響分析 | Data Platform | E1-03 | `layered_data_assets/run_day_bridge_v1.py`、`scripts/materialize_run_day_bridge_v1.py`、`l1_paths.l1_run_day_bridge_partition_dir`、`schema/examples/manifest_run_day_bridge_l1_example.json`；輸出 `run_day_bridge.parquet`（`bet_gaming_day` 分區鍵，SSOT §5.2） | 對任意 `bet_gaming_day` 分區可列出該日受影響 `run_id` 集合，供重算範圍掃描（單元測試） |
 | ✅ | **LDA-E1-06** | Manifest writer：每批次 `manifest.json` + ingestion 摘要（預演） | Data Platform + ML Platform | E0-03, E1-02 | `layered_data_assets/ingestion_delay_summary_v1.py`、`manifest_lineage_v1.py`；`scripts/preprocess_bet_v1.py` 與 `scripts/materialize_run_*_v1.py` 寫入／合併；`scripts/manifest_lineage_preview_v1.py` 後補 | `make check-lda-l0` 含新單元測試；manifest 仍通過 schema；`source_hashes` 與 fingerprint 銜接見 `doc/l0_ingest_governance_decisions.md` |
@@ -121,7 +122,7 @@
 | ✅ | **LDA-E1-08** | Gate 1 自動化：同 snapshot 多組執行參數 + row hash | ML Platform | E1-03–E1-07 | `layered_data_assets/l1_determinism_gate_v1.py`、`scripts/gate1_l1_determinism_v1.py`、`tests/unit/test_l1_determinism_gate_v1.py` | `make check-lda-l0`：三部 L1 產物在多組 DuckDB 資源設定下列數與 row fingerprint 一致；CLI 可寫 JSON 報告（exit 0/1） |
 | ✅ | **LDA-E1-09** | 日粒度 resumable 編排：state store + 原子寫入 + `--resume`/`--force` | Data Platform | E1-02–E1-06 | **`schema/materialization_state.schema.sql`**、**`pipelines/layered_data_assets/orchestration/materialization_state_store_v1.py`**（根目錄 `layered_data_assets/materialization_state_store_v1.py` 為 shim）、**`scripts/lda_l1_gate1_day_range_v1.py`**（`--state-store`／`--resume`／`--force`／`--stop-after-date`；可選 **`--ingestion-fix-registry-yaml`**）、**`pipelines/layered_data_assets/docs/RUNBOOK.md` §5.1**、**`tests/unit/test_materialization_state_store_v1.py`** | **MVP（2026-05-03）**：DuckDB state；`--resume` 同 `input_hash` 則 skip 各步 subprocess；`--force` 重跑；預設 state 路徑見 RUNBOOK；**`--stop-after-date`** 可日中斷演練。**2026-05-03**：`preprocess_bet_v1` 與三 `materialize_run_*_v1` 已對 **`*.parquet`+`manifest.json`** 採 **tmp→`os.replace`**；**LDA-E1-10** G7 見整合測。**v0.6 補強**：one-liner rated gate 見 **E1-14~E1-16**。 |
 | ✅ | **LDA-E1-10** | Resume Gate 自動化：中斷/續跑一致性測試 | ML Platform | E1-09 | **`tests/integration/test_lda_e1_10_resume_g7_v1.py`**（G7：`lda_l1_gate1_day_range_v1` 一條龍 vs `--stop-after-date` + `--resume`）；**`cleaned_bet_parquet_row_fingerprint`** in **`pipelines/layered_data_assets/core/l1_determinism_gate_v1.py`**（根 shim：`layered_data_assets/l1_determinism_gate_v1.py`）；`make check-lda-l0` 納入該 integration | **MVP（2026-05-03）**：兩連續日、四 L1 Parquet（preprocess + 三物化）**row_count + row fingerprint** 與 Gate1 既有函式一致；**未**加獨立 kill/SIGINT CI job（可選後補） |
-| ✅ | **LDA-E1-11** | Preprocess 升級：接入 `schema/preprocess_bet_ingestion_fix_registry.yaml`，實作 `observed_at_logical`（`t_bet` **`ingest_delay_cap_sec=122`**）、manifest `ingestion_fix_*`／`applied_fix_rules`；`ingestion_delay_summary` 改以 synthetic observed 計算（見 SSOT §4.4 **LDA-014**） | Data Platform | E1-02, E1-06, SSOT v1.5 | **`layered_data_assets/preprocess_bet_ingestion_fix_registry_v1.py`** + 更新 `preprocess_bet_v1.py`、`scripts/preprocess_bet_v1.py`、`tests/unit/test_preprocess_bet_ingestion_fix_registry_v1.py`、`schema/examples/manifest_preprocess_bet_l1_example.json`、`Makefile`（`check-lda-l0` 納入 registry 測試）、**`tests/integration/test_lda_e1_11_gate1_with_registry_v1.py`**（§5.3 列 12） | **不變**：`PARTITION BY bet_id`；輸出主序仍 `payout_complete_dtm, bet_id`；dedup 在傳入 registry 時 `ORDER BY __etl_insert_Dtm_synthetic`；**選用** `--ingestion-fix-registry-yaml`（及可選 `--ingestion-fix-registry-version-expected`）。**MVP 落地 2026-05-03**：`validate_layered_contracts` + `check-lda-l0`；§5.3 **列 12** 由 **`test_lda_e1_11_gate1_with_registry_v1`** 覆蓋（fixture 上帶／不帶 registry 之 L1 四產物 fingerprint 一致 + manifest 含 FIX-004）。 |
+| ✅ | **LDA-E1-11** | Preprocess 升級：接入 `schema/preprocess_bet_ingestion_fix_registry.yaml`，實作 `observed_at_logical`（`t_bet` **`ingest_delay_cap_sec=122`**）、manifest `ingestion_fix_*`／`applied_fix_rules`；`ingestion_delay_summary` 改以 synthetic observed 計算（見 SSOT §4.4 **LDA-014**） | Data Platform | E1-02, E1-06, SSOT v1.12 §4.4 **LDA-014** | **`layered_data_assets/preprocess_bet_ingestion_fix_registry_v1.py`** + 更新 `preprocess_bet_v1.py`、`scripts/preprocess_bet_v1.py`、`tests/unit/test_preprocess_bet_ingestion_fix_registry_v1.py`、`schema/examples/manifest_preprocess_bet_l1_example.json`、`Makefile`（`check-lda-l0` 納入 registry 測試）、**`tests/integration/test_lda_e1_11_gate1_with_registry_v1.py`**（§5.3 列 12） | **不變**：`PARTITION BY bet_id`；輸出主序仍 `payout_complete_dtm, bet_id`；dedup 在傳入 registry 時 `ORDER BY __etl_insert_Dtm_synthetic`；**選用** `--ingestion-fix-registry-yaml`（及可選 `--ingestion-fix-registry-version-expected`）。**MVP 落地 2026-05-03**：`validate_layered_contracts` + `check-lda-l0`；§5.3 **列 12** 由 **`test_lda_e1_11_gate1_with_registry_v1`** 覆蓋（fixture 上帶／不帶 registry 之 L1 四產物 fingerprint 一致 + manifest 含 FIX-004）。 |
 
 **Phase 1 完成條件**：E1-01–E1-08 皆 **✅**；**不**要求 `trip_fact` 最終語義。  
 **Phase 1 延伸（例行 smoke／PR）**：**LDA-E1-11** 已 **✅（MVP）**；合併前跑 **`make check-lda-l0`**（已含 **`test_lda_e1_11_gate1_with_registry_v1`**：編排器帶 registry 之一條龍 vs 無 registry 基線）；仍不阻塞 E1-01–E1-08 之已達標敘述。  
@@ -153,8 +154,7 @@
 **狀態（本檔維護）**：**✅ MVP（2026-05-03）**—下列 bullets 與主程式對齊；**§5.3 列 12（Gate1+cap）**仍建議補本機／CI 紀錄。
 
 - **Registry 接線**：`--ingestion-fix-registry-yaml`（選用；未傳則維持舊行為）+ `--ingestion-fix-registry-version-expected`（可選 fail-fast 鎖 `registry_version`）；registry 解析／契約不一致時 **fail-fast**（實作名稱以 `scripts/preprocess_bet_v1.py --help` 為準）
-- **SQL 語意**（`t_bet`）：在 `filtered` 與 `ranked` 之間插入衍生欄  
-  `__etl_insert_Dtm_synthetic = LEAST(TRY_CAST(__etl_insert_Dtm AS TIMESTAMP), TRY_CAST(payout_complete_dtm AS TIMESTAMP) + INTERVAL 122 SECOND)`（秒數與 registry 中 `ingest_delay_cap_sec` 一致；實作以 registry 為準）
+- **Synthetic observed-at（`t_bet`）**：依 `schema/preprocess_bet_ingestion_fix_registry.yaml` 啟用之規則（例如 **`BET-INGEST-FIX-004`**）產出 `__etl_insert_Dtm_synthetic`；SQL 表達式以 registry／`logical_observed_at_expr` 為準（**不在**本 execution plan 重複貼 SQL，避免漂移）。
 - **dedup**：`ROW_NUMBER() … ORDER BY __etl_insert_Dtm_synthetic DESC NULLS LAST, bet_id DESC`（**仍** `PARTITION BY bet_id`）
 - **輸出排序**：`ORDER BY payout_complete_dtm ASC NULLS LAST, bet_id ASC`（**不**改為 observed 主序）
 - **Manifest**：寫入 `ingestion_fix_rule_id`／`ingestion_fix_rule_version`、`applied_fix_rules`（至少 `BET-INGEST-FIX-004:v1`）、可選 `fix_registry_sha256`；`preprocessing_gaps` 若 registry 缺欄則列明
@@ -180,7 +180,7 @@
 | :---: | :---: | :--- | :--- | :---: | :--- | :--- |
 | ✅ | 1 | `schema/materialization_state.schema.sql`（或 DuckDB init SQL）落地 + 文件化欄位語意 | ML Platform + Data Platform | 0.5 | E0-03 | **2026-05-03**：`schema/materialization_state.schema.sql`；`ensure_materialization_state_schema` 於編排器啟動時執行 |
 | ✅ | 2 | state store 讀寫模組（`pending→running→succeeded|failed`、attempt 遞增） | Data Platform | 1.0 | 1 | **2026-05-03**：`materialization_state_store_v1.py`（`running`／`succeeded`／`failed`、`attempt`）；併發鎖 **未**做（後續可選） |
-| ✅ | 3 | `input_hash` 計算規則固定化（例：`sha256` 串接 `source_snapshot_id`、該日 L0/preprocess 路徑、`definition_version`、`transform_version`、相關 manifest `source_hashes`） | Data Platform | 0.5 | E1-02 | **2026-05-03**：穩定 JSON + sha256（輸入檔 stat、fingerprint 原文、`cleaned` stat）；hash 變更則不 skip（隱式 stale） |
+| 🟡 | 3 | `input_hash` 計算規則固定化：**內容** hash + `source_snapshot_id` + `definition_version` + `transform_version` + 相關 manifest `source_hashes`／registry 版本（**禁止**僅 mtime/size）；**應優先**重用上游已驗證之內容指紋（impl v0.13 §2.3） | Data Platform | 0.5 | E1-02 | **2026-05-03**：曾落地「JSON + sha256（含 stat）」；**2026-05-04**：上層契約改為**內容**為主；**2026-05-04**：補 **I/O 重用**指引（impl v0.13 §2.3）。**待程式對齊**後改回 **✅**；過渡期 PR 須註明是否仍含 stat。 |
 | ✅ | 4 | 產物原子寫入包裝（`*.tmp` → rename；失敗不落 `succeeded`） | Data Platform | 0.5 | 2 | **2026-05-03**：`preprocess_bet_v1` 與三 `materialize_run_*_v1` 採 **`pipelines/layered_data_assets/io/atomic_parquet_manifest_v1.py`**（根 shim 仍為 `layered_data_assets/atomic_parquet_manifest_v1.py`）；**編排層**仍為子程序 exit 0 後方標 `succeeded`。Gate1 輸出目錄仍非原子替換（可選後補）。 |
 | ✅ | 5 | 編排器／CLI 接上 `--resume` / `--force` / `--stop-after-date` / `--state-store` | Data Platform | 1.5 | 2–4 | **2026-05-03**：`lda_l1_gate1_day_range_v1.py` |
 | ✅ | 6 | `pipelines/layered_data_assets/docs/RUNBOOK.md`（或本檔 §5.2）補操作範例與故障排除 | Data Platform | 0.25 | 5 | **2026-05-03**：RUNBOOK §5.1（canonical 路徑；`layered_data_assets/RUNBOOK.md` 為轉址） |
@@ -214,7 +214,7 @@
 
 | 狀態 | Task ID | 任務 | Owner | 依賴 | 輸出 artifact | DoD |
 | :---: | :--- | :--- | :--- | :--- | :--- | :--- |
-| 🟡 | **LDA-E2-01** | `trip_fact`：3 個完整 `gaming_day` 關閉語義（實作可用「無 run」等價判定） | Data Platform | Phase 1 + **Phase 1R** | `trip_fact` | **MVP（2026-05-03）**：`materialize_trip_fact_v1` + 分區／manifest／`tests/unit/test_trip_fact_v1.py`；**未滿**：等價一致性報告、編排器接軌、分桶+merge 產線級 |
+| 🟡 | **LDA-E2-01** | `trip_fact`：3 個完整 `gaming_day` 關閉語義（實作可用「無 run」等價判定）+ **觀測上界**（SSOT §5.1／impl §4.3：**`observed_at_logical` 全域 max（HK 時區正規化）→ `G_max` → `coverage_end_gaming_day = G_max - 1`**） | Data Platform | Phase 1 + **Phase 1R** | `trip_fact` | **MVP（2026-05-03）**：`materialize_trip_fact_v1` + 分區／manifest／`tests/unit/test_trip_fact_v1.py`；**未滿**：上界（含 **`-1`**、**logical**、HK 時區正規化）與現行程式對齊、空快照 `observed_at_logical` 缺失時 fail-fast、分桶前由單一 coordinator 凍結全域上界並寫 sidecar、等價一致性報告、編排器接軌、分桶+merge 產線級 |
 | 🟡 | **LDA-E2-02** | `trip_run_map` membership | Data Platform | E2-01 | `trip_run_map` | **MVP**：同上 CLI 一併產出；**未滿**：獨立 G3 整合測對 published 路徑 |
 | 🟡 | **LDA-E2-03** | `trip_id` hash：§4.1 `first_run_id` + `source_snapshot_id` 錨定 | Data Platform | E2-01 | ID 規則單元／整合測試 | **MVP**：`derive_trip_id` + 單元測試；`trip_end_*` 不參與 hash（關閉欄位由邏輯寫入，非事後補寫變更 id 之流程） |
 | 🟡 | **LDA-E2-04** | Publisher：`published_snapshot_id`、sidecar manifest、回滾策略 | Data Platform + Ops | E0-03, E2-01 | `published_snapshot.json` + 目錄慣例文件 | **MVP（2026-05-03）**：JSON Schema、範例、`publish_layered_snapshot_v1` CLI、`l1_layered/published/snapshots/<pub>/` + `current.json`、`make check-lda-l0` 單測；**未滿「✅」**：與 L1 manifest 併行之 sidecar、正式回滾／審計流程文件化 |
@@ -228,7 +228,7 @@
 
 - **分區鍵**：`trip_fact` 固定以 `trip_start_gaming_day` 分區。
 - **輸出粒度**：`trip_fact` 必須同時包含已關閉與進行中 trip。
-- **計算邊界**：Trip close 判定 v1 不引入外部賭場日曆表；以 `run_fact` 有 run 日與缺口推導（缺資料日視為完整空日）。
+- **計算邊界**：Trip close 判定 v1 不引入外部賭場日曆表；以 `run_fact` 有 run 日與缺口推導（缺資料日視為完整空日）；**並**須先凍結全域 **`coverage_end_gaming_day`**（**`observed_at_logical` max（HK 時區正規化）→ `G_max` → `G_max - 1`**；見 impl §4.3），**禁止**以其他玩家之最後活動日替代上界。
 - **執行模式（MVP）**：先做 full snapshot 重算；按日增量 trip 重算列為 Phase 2 後續（接 E1-09 state）。
 - **寫入策略**：多 worker 僅寫暫存，最終由 single writer 固定排序合併分區（determinism）。
 - **Lineage**：`trip_fact` manifest `source_partitions` 必須列舉觸及之所有 `run_end_gaming_day` 分區，`source_hashes` 與其對齊。
@@ -276,7 +276,7 @@
 | **G2 Lineage** | manifest → L0／preprocess／版本鍵 | Phase 1 起 |
 | **G3 Membership** | `run_bet_map`、`trip_run_map` 可重建邊界 | Phase 1（run）、Phase 2（trip） |
 | **G4 Ingestion** | published 批次 `ingestion_delay_summary` 完整 | Phase 2 起 |
-| **G5 Feature** | §6.1.1 全量 `(track_section, feature_id)` 覆蓋 + deterministic 一致 | Phase 3 |
+| **G5 Feature** | §6.1.1 全量 `(track_section, feature_id)` 覆蓋 + 於 **§6.1 `player_id` 參考語義**下 deterministic 一致（FND-11 排除） | Phase 3 |
 | **G6 OOM Invariant** | 執行參數僅影響資源／時間，不影響語義輸出 | Phase 1 起與每次大表變更 |
 | **G7 Resume Invariant** | 一次跑完 vs 中斷續跑結果一致；成功分區可安全 skip | Phase 1 起（E1-09 完成後） |
 | **G8 Rated Gate Invariant** | raw one-liner 必須包含 BET-DQ-03（trainer identity 來源）且 fail-closed；缺 eligible 不得放行 | Phase 1R（E1-14~E1-16） |
@@ -299,12 +299,13 @@
 | 風險 | 徵兆 | 升級動作 |
 |------|------|----------|
 | OOM 頻發 | 重試耗盡、單日分區失敗 | Data Platform 降窗／加分桶；記錄峰值；必要時凍結更大窗需求至 Phase 4 |
-| `GAMING_DAY_START_HOUR` 與來源 `gaming_day` 口徑漂移 | run 邊界異常抖動、`is_hard_cutoff` 比例異常 | 視為 `definition_version` 變更事件；凍結發布、開升版重算任務，並回寫 SSOT/implementation plan |
+| `GAMING_DAY_START_HOUR` 與來源 `gaming_day` 口徑漂移 | run 邊界異常抖動、`is_hard_cutoff` 比例異常 | 單一來源為 `trainer/core/_config_training_domain.py`；manifest 記錄實際值；CI 鎖定「物化值 = trainer import 值」；變更視為 `definition_version` 事件並回寫上層文件 |
 | resumable state 損毀或不一致 | 成功分區被覆寫、失敗分區被誤跳過 | 啟用 state/manifest 雙重校驗；原子寫入；`--force` 僅允許顯式重算 |
 | trip「無 bet」與「無 run」判定漂移 | 關閉時點偏移，影響 trip_id 與特徵 | 維持語義以「無 bet」為準；每版執行一致性測試，失敗即阻擋發布 |
 | registry／表漂移 | CI 欄位檢查失敗 | 阻擋 merge；開 hotfix PR 更新 registry |
 | feature mismatch 無法收斂 | ledger open 數不下降 | DS 召集 Model Owner；必要時凍結 deploy spec 變更 |
 | trip 關閉語意爭議 | fixture 與業務預期不符 | 回 SSOT 澄清；**不得**在 execution plan 內改定義 |
+| 下游誤用 `trip_id`／`run_id` 跨 snapshot | 報表 join 靜默錯位 | 消費端 checklist：併 `source_snapshot_id`；見 SSOT §6、impl plan §7 |
 
 ---
 
@@ -320,6 +321,8 @@
 | **BL-04** | **trainer Step 6/7** 與本產線合併／取代／雙軌之時程與回歸範圍 | Model Owner + ML Platform |
 | **BL-05** | `cleaned` 單一活躍資料集之保留策略（僅活躍版 + 最近一次回滾點）與分區 GC 週期 | Data Platform + Ops |
 | **BL-06** | **Future entity onboarding template**（`cleaned_<entity>` 接入前最小契約：`entity_name`、`business_key`、`partition_key_semantics`、`event_time_col`、`observed_at_col`；impact scope 與 fallback policy；可先 `TBD` 但 production 前需定版） | Data Platform + ML Platform + DS |
+| **BL-07** | **`t_session` → `cleaned_session`（L0.5）** 與 **canonical／rated mapping** 由 trainer 遷入本產線：與 `cleaned_bet` 同等 manifest／state／impact；過渡期文件與 CI 標註 trainer 為單一來源 | Data Platform + ML Platform |
+| **BL-08** | **`GAMING_DAY_START_HOUR` / `HK_TZ` 契約鎖定**：LDA 物化必須直接讀取 `trainer/core/_config_training_domain.py`，並在 CI 檢查 manifest `gaming_day_start_hour_used` 與 runtime import 值一致 | ML Platform + Data Platform |
 
 ### 11.1 Future entity onboarding（best-effort 模板，不排期）
 
@@ -328,7 +331,7 @@
 | 檢核項 | 要求 | 備註 |
 |------|------|------|
 | 最小契約欄位 | 必填五欄：`entity_name`、`business_key`、`partition_key_semantics`、`event_time_col`、`observed_at_col` | 前期可 `TBD`，production 前必須定版 |
-| 分區鍵策略 | entity-specific；不得預設一律 `gaming_day` | 與 SSOT v1.9 / impl v0.10 對齊 |
+| 分區鍵策略 | entity-specific；不得預設一律 `gaming_day` | 與 SSOT v1.12 / impl v0.13 對齊 |
 | 影響分析 | 需在 `impact_analyzer` 註冊 `entity_name` 與 `impact_scope` | 無 machine-readable scope 時不得走增量發布 |
 | Fallback policy | 需有實體級規則（比例／絕對量／扇出成本） | bet 的 10% 只能當暫時參考，不可直接複製 |
 | Lineage / state | 必須接入 manifest、`semantic_signature`、state store | 未接入者視為實驗管線，不得宣稱 production-ready |
@@ -340,8 +343,9 @@
 | Implementation Plan | 本 Execution Plan |
 |----------------------|-------------------|
 | §5 Phase 0–4 | §4–§8 任務表 |
-| §2.2.1 統一失效模型（含 bet 路徑 `impact_day_ratio`／`changed_player_ratio` 與 full recompute 備援） | E4-01（KPI／觀測）、§10.2；implementation plan §8.1（invalidation gate）；與 SSOT **LDA-016**（引用 §2.2.1）對齊 |
-| §2.4／§2.4.1 L0.5 `cleaned_bet` 與多實體掛載預留 | BL-05、BL-06、§11.1；E1-12／E1-13 backlog |
+| §2.2.1 統一失效模型（含 bet 路徑 `impact_day_ratio`／`changed_player_ratio` 與 full recompute 備援；**LDA-016 數值僅在本層**） | E4-01（KPI／觀測）、§10.2；implementation plan §8.1（invalidation gate）；SSOT **LDA-016** 僅原則 |
+| §2.4／§2.4.1 L0.5 `cleaned_bet` 與多實體掛載預留；§2.1 `t_session`／遷移 | BL-05、BL-06、**BL-07**、§11.1；E1-12／E1-13 backlog |
+| §4.2 / §4.3 `GAMING_DAY_START_HOUR` / `HK_TZ` 單一來源與 trip 上界時區契約 | §10.2 風險列、**BL-08**、E2-01 DoD（時區正規化 + 單點凍結上界） |
 | §2.3 Resumable 契約 | §5.2–§5.3、E1-09–E1-10、G7 |
 | one-liner + BET-DQ-03 fail-closed（自 implementation plan v0.6 起） | §5.2（E1-14~E1-16）、§5.3 列 15–17、G8 |
 | §6.1 / §6.1.1 | E0-05–E0-06、E3-01、E3-06–E3-07 |

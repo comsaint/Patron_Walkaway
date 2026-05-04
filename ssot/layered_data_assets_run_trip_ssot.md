@@ -1,17 +1,20 @@
 # 分層資料資產與 run/trip 特徵工程 — SSOT
 
-> **版本**：v1.9  
+> **版本**：v1.12  
 > **目的**：定義「可重用、可增量、可追溯」之資料資產組織與特徵工程邊界（單一事實來源，SSOT）。  
 > **適用範圍**：`bet → run → trip` 階層化物化、分區策略、主鍵與版本治理、lineage；**不含** train/val/test 切分、閾值與線上評估口徑。  
 > **v1.1 變更摘要**：廢除「固定 N 日回補窗口」為核心語義；改為**訓練端版本化完整快照 + 專用清洗規則**，以及**服務端每日離線刷新 + 有界線上狀態修正**（見 §5.3–§5.4）。  
 > **v1.2 變更摘要**：新增 **§4.4 事件時間與可觀測時間（`event_time` / `observed_at`）** 契約；離線清洗與 manifest 留痕；**ingestion 延遲摘要 metadata** 供下游監控（本文件不定義 drift 告警規則與閾值）。  
 > **v1.3 變更摘要**：固定 **time semantics registry** 路徑為 `schema/time_semantics_registry.yaml`；補充 preprocessing 前置、snapshot-scoped deterministic ID、trip close 語義、membership lineage、以及 current feature spec coverage 契約。  
-> **v1.4 變更摘要**：run 定義加入 **gaming day 硬切規則**：除 30 分鐘 gap 外，當事件序跨越 `GAMING_DAY_START_HOUR`（目前專案設定 03:00，Asia/Hong_Kong）亦強制開新 run；同步修訂 §3.1、§4.2、§5.2 與決策紀錄。  
+> **v1.4 變更摘要**：run 定義加入 **gaming day 硬切規則**：除 30 分鐘 gap 外，當事件序跨越 `GAMING_DAY_START_HOUR`（與 `trainer/core/_config_training_domain.py` 單一來源對齊；數值可變，非本文件常數）亦強制開新 run；同步修訂 §3.1、§4.2、§5.2 與決策紀錄。  
 > **v1.5 變更摘要**：§4.4 新增 **邏輯可觀測時間之「殘差 P95 cap」**（`ingest_delay_cap_sec`）：在已文件化之整批入倉／回填時窗排除後，對 `(observed_at_raw - event_time)` 取 **P95** 作為該表 cap 常數；凡延遲超過 cap 之列，**邏輯** `observed_at` 取 `event_time + cap`（**不得**改寫 L0 raw）；`t_bet` 定值 **122 秒**（見 `schema/preprocess_bet_ingestion_fix_registry.yaml` 與決策 **LDA-014**）。  
 > **v1.6 變更摘要**：Trip v1 契約補強：`trip_fact` 分區鍵語意固定為 **`trip_start_gaming_day`**；`trip_fact` 必須同時輸出**已關閉**與**進行中** trip（`trip_end_*` 可為 null）；`trip_id` hash 納入 `source_snapshot_id` 與 `first_run_id` 且不受 `trip_end_*` 補值影響；trip close 在不引入外部日曆表前提下，允許僅由 `run_fact` 之有 run 日與缺口推導（缺資料日視為完整一日）；`trip_fact` manifest 需列舉本批次觸及之 `run_end_gaming_day` 分區。  
-> **v1.7 變更摘要**：補充離線增量路線之**初版可操作治理參數**（不變更 §5.3「影響驅動」原則）：`cleaned`（L0.5）每分區保留最近 **7** 個成功版本以利根因分離與回滾；當 `impact_day_ratio` 或 `changed_player_ratio` **≥ 10%** 時允許升級 **full recompute** 備援（分母與作業定義見 `implementation plan/layered_data_assets_run_trip_implementation_plan.md` v0.10 §2.2.1）；上線後以監控調整。見決策 **LDA-016**。  
-> **v1.8 變更摘要**：於 **§4.1.1** 正式定義 **L0.5（`cleaned`）** 為 L0 與 L1 之間之**語義層**；明定 L1 物化**必須**以 L0.5 為唯一 bet 輸入，並與 §4.4、**LDA-016** 對齊。  
+> **v1.7 變更摘要**：補充離線增量路線之**治理原則**（不變更 §5.3「影響驅動」原則）：`cleaned`（L0.5）允許有限歷史版本與 full recompute 備援；**可操作數值**見 implementation plan（對齊 **LDA-016**）。  
+> **v1.8 變更摘要**：於 **§4.1.1** 正式定義 **L0.5（`cleaned`）** 為 L0 與 L1 之間之**語義層**；明定 L1 物化**必須**以 L0.5 為唯一 bet 輸入，並與 §4.4、**LDA-016** 原則對齊。  
 > **v1.9 變更摘要**：在 **§4.1.1** 增補 **L0.5 多實體擴充預留**：目前落地為 `cleaned_bet`，未來可擴為 `cleaned_<entity>`（如 player / table_config / game）；明定各實體可採不同分區鍵與重算策略，但上線前必須先補齊最小契約欄位，且 L1 不得直讀 raw。  
+> **v1.10 變更摘要**：**分層**：**LDA-016** 僅保留治理原則，rolling 版數與 full-recompute 比例等**數值**遷至 implementation plan；**LDA-017** 收斂為原則敘述，實體列舉與閾值見 implementation plan。**Trip close**：增訂以 snapshot 內**最大可觀測時間**（各納入表之 `observed_at` 依 registry）換算 **`coverage_end_gaming_day`** 為上界，不得依其他玩家活動外推個別玩家之日曆。**Parity**：與 `player_id` 粒度及 **FND-11** 之對齊規則見 implementation plan §6.1。**`GAMING_DAY_START_HOUR`** 改為引用 `trainer/core/_config_training_domain.py`（可為 3、6 等，**非**本文件常數）。**`late_row_*`**：僅於 registry 已定量化 `late_threshold`（或等價）後納入 manifest 摘要；否則省略或 null 並標註未定義。  
+> **v1.11 變更摘要**：**Trip 觀測上界**：`coverage_end_gaming_day` 改為「將 snapshot 內 trip close 所依賴各表之 **`observed_at_logical` 全域最大值**映射為 `gaming_day` 得 `G_max` 後，再取 **`G_max` 之前一個完整 `gaming_day`**」（即賭場日曆上 `-1`），以避免 snapshot 末日尚未走完之賭場日遭誤計為完整空日。**觀測欄位**：上界計算**必須**使用 **`observed_at_logical`**（§4.4 **LDA-014**），**不得**改用 raw `observed_at` 作為上界單一來源。**Manifest**：`gaming_day_start_hour_used` 與（適用時）`coverage_end_gaming_day` 自 §8「建議」收斂為 **MUST**（與 §5.2 一致）。**`late_threshold`／`late_row_*`**：以機讀枚舉 **`late_threshold_status` ∈ {`defined`, `undefined`}`** 統一「是否已量化門檻」；僅 `defined` 時得輸出可比較之 `late_row_*`（見 §4.4）。**§11 議題 8**：改為「已決議」敘述，不再使用刪除線排版。  
+> **v1.12 變更摘要**：補強 **Trip 觀測上界時區契約**：`T_max -> G_max` 映射前，必須先以 `trainer/core/_config_training_domain.py::HK_TZ`（`Asia/Hong_Kong`）進行與 run 邊界一致之時區正規化，再套用 `GAMING_DAY_START_HOUR`。補強 **上界來源表前置條件**：僅允許納入已完成 `observed_at_logical` 量測與 cap 定版（非 `TBD`）之來源表；未達條件者不得參與 trip close horizon。釐清 **`ingest_delay_cap_sec` vs `late_threshold`**：兩者語義不同，不得自動視為同一欄位/門檻；若業務上暫定同值，需顯式宣告並留痕。§8 manifest 契約改為按 artifact 明確列出 MUST 欄位（`run_fact` 與 `trip_fact` 分別規範），避免「適用時」歧義。  
 > **玩家鍵（v1）**：**僅使用 `player_id`**（Smart Table 桌台辨識 ID）作為本資產層之玩家主鍵；**本文件不採用 `canonical_id`** 作為設計依據。
 
 ---
@@ -80,13 +83,13 @@
 | **`player_id`** | Smart Table 桌台辨識系統指派之玩家識別碼。**本 SSOT 下所有 run/trip 邊界與聚合均以 `player_id` 為唯一玩家鍵。** |
 | **`bet`（事件）** | 單筆下注觀測；至少需具備 `player_id`、事件時間（與實作對齊之欄位，如 `payout_complete_dtm`）、`gaming_day`、`bet_id` 等契約欄位（完整欄位表由 implementation plan / schema 補齊）。 |
 | **`gaming_day`** | 賭場帳務日；與日曆午夜不對齊。**trip 之分區與「連續 N 個 gaming_day 無下注」之語義以此為準。** |
-| **Run（連續下注段）v2** | 同一 `player_id` 之下注序列中，僅當 **(a) 相鄰兩筆 bet 事件時間間隔 ≤ 30 分鐘** 且 **(b) 兩筆 bet 屬同一 `gaming_day`** 時，才屬同一 run。若跨越 `GAMING_DAY_START_HOUR` 造成 `gaming_day` 變更，須**硬切（hard cutoff）**開新 run。 |
+| **Run（連續下注段）v2** | 同一 `player_id` 之下注序列中，僅當 **(a) 相鄰兩筆 bet 事件時間間隔 ≤ 30 分鐘** 且 **(b) 兩筆 bet 屬同一 `gaming_day`** 時，才屬同一 run。若跨越 **`GAMING_DAY_START_HOUR`**（與 `trainer/core/_config_training_domain.py` 單一來源對齊；整數小時，Asia/Hong_Kong，數值可變如 3 或 6）造成 `gaming_day` 變更，須**硬切（hard cutoff）**開新 run。 |
 | **Trip（行程段）v1** | 同一 `player_id`，若上一筆 bet/run 結束後出現 **3 個完整 `gaming_day` 皆無任何 bet**，則該 trip 才可關閉，下一次 bet 視為**新 trip** 之起點。例：最後 bet/run 結束於 Jan 1，必須 Jan 2、Jan 3、Jan 4 三個完整 gaming day 皆無 bet，該 trip 才在 Jan 4 後可定版關閉。`trip_fact` 必須同時涵蓋已關閉與進行中 trip。 |
 | **階層關係** | **`trip` 為 `run` 之聚合；`run` 為 `bet` 之壓縮層。** Trip 級特徵應優先由 run 級可聚合統計得出；僅在契約明列時才允許回掃 bet。 |
 
 ### 3.1 設計意圖（非規範細節）
 
-- Run 邊界除 30 分鐘 gap 外，另受 `gaming_day` 邊界硬切；`GAMING_DAY_START_HOUR` 變更視同 run 定義變更，必須升 `definition_version`（見 §5.2、§7）。
+- Run 邊界除 30 分鐘 gap 外，另受 `gaming_day` 邊界硬切；**`GAMING_DAY_START_HOUR`** 讀取 **`trainer/core/_config_training_domain.py::GAMING_DAY_START_HOUR`**（非本文件常數）；其變更視同 run 定義變更，必須升 `definition_version`（見 §5.2、§7）。manifest 中 `gaming_day_start_hour_used` 之 MUST 規範條文見 **§5.2** 與 **§8**。
 - Trip close 是**離線定版語義**；線上服務可維護 provisional trip extension，但不得把未觀測完整 3 個 gaming day 之 trip 當成已最終關閉（見 §5.5）。
 
 ---
@@ -108,7 +111,7 @@
 - **Preprocessing 前置契約（MUST）**：preprocess 至少處理 `player_id` 有效性、placeholder/dummy ID 排除、duplicated `bet_id` / 多版本列去重、canceled/deleted/manual 等 DQ 規則；**BET-DQ-03 rated allowlist** 在編排路徑為 fail-closed（見 implementation plan 與既有編排契約）。具體規則與 rule id 由 implementation plan 與 `schema/time_semantics_registry.yaml` 的 `dedup_rule_id` / `preprocessing_contract` 對齊。
 - **Lineage 與可審計（MUST）**：每一 L0.5 分區必須可機器讀取 lineage（至少 `manifest.json` + 語義簽章／`input_hash` 契約，欄位細節見 implementation plan §2.3 / §2.4），並納入 **影響驅動**之重算判定（§5.3）；**不得**僅因「排程日曆到點」而無條件重算未變更分區。
 - **與 §4.4 之一致性（MUST）**：L0 raw 之 `__etl_insert_Dtm`（或 registry 所指 `observed_at_col`）**不得**被覆寫；`observed_at_logical` 等衍生欄僅允許出現在 **preprocess／L0.5 衍生輸出**，並須在 manifest 或 registry **註冊欄位名與 cap**（對齊 **LDA-014**）。
-- **有限歷史與回滾（SHOULD）**：允許保留有限個歷史成功版本以支援根因分離與最小回滾；**初版可操作數值**見 **LDA-016** 與 implementation plan v0.10。
+- **有限歷史與回滾（SHOULD）**：允許保留有限個歷史成功版本以支援根因分離與最小回滾；**可操作數值（每分區保留幾版、何時升級 full recompute 等）**僅於 **implementation plan** 約定（對齊 **LDA-016** 原則），不得在本 SSOT 膨脹為營運常數。
 
 **多實體擴充預留（MUST；future-proof）**
 
@@ -181,7 +184,13 @@
 
 - 定義 **`ingest_delay_sec = observed_at - event_time`**（或等價時間型相減；時區須全專案一致，見 §11）。
 - 每一批次 L1/L2 產物之 manifest **建議（SHOULD）** 附帶至少下列**可聚合摘要**（供監控與 drift 偵測消費；**本文件不定義**閾值與告警）：  
-  `ingest_delay_p50_sec`、`ingest_delay_p95_sec`、`ingest_delay_p99_sec`、`ingest_delay_max_sec`、`late_row_count`（依專案約定之「晚於預期延遲帶」定義，由 implementation plan 量化）、`late_row_ratio`、`affected_run_count` / `affected_trip_count`（若該批次曾重算 run/trip）。
+  `ingest_delay_p50_sec`、`ingest_delay_p95_sec`、`ingest_delay_p99_sec`、`ingest_delay_max_sec`、`affected_run_count` / `affected_trip_count`（若該批次曾重算 run/trip）。  
+  - **`late_threshold_status`（MUST；枚舉）**：每一來源表（或摘要區塊）**必須**附帶 **`late_threshold_status` ∈ {`defined`, `undefined`}`**（JSON 字串值須與此二值完全一致）。**語義**：`defined` 表示 `time_semantics_registry` 中該表之 **`late_threshold` 已為可機器解析之量化門檻**（非占位字串如 `TBD`、非空值）；`undefined` 表示尚未定版或未量化。**`late_row_count` / `late_row_ratio`（條件式 SHOULD）**：僅當 **`late_threshold_status = defined`** 時，摘要中**應**附帶兩者並與該門檻定義一致；當 **`undefined`** 時，**應**省略兩者或填 `null`，**不得**以未定義口徑寫入可比較數值。
+
+**`ingest_delay_cap_sec` 與 `late_threshold`（術語分工；MUST）**
+
+- **兩者不可混同**：`ingest_delay_cap_sec` 用於構造 `observed_at_logical`（技術性長尾抑制）；`late_threshold` 用於 `late_row_*` 監控摘要（業務/監控門檻）。兩者**不得**被視為同一欄位或自動鏡像。
+- **可顯式同值，但不得隱式綁定**：若特定表在特定版本決議「先採同一數值」，必須在 registry/fix-registry/manifest 明確標註依據與版本（例如 `late_threshold_basis`），並仍保留可獨立調整之治理路徑。
 
 **邏輯可觀測時間之殘差 P95 cap（MUST；跨表通則）**
 
@@ -213,14 +222,18 @@
 - **`trip_fact`（及 trip 衍生特徵）以 `gaming_day` 為標準分區鍵**（與 trip 定義一致）。
 - **分區鍵語意（MUST）**：`trip_fact` 分區鍵固定為 **`trip_start_gaming_day`**（trip 第一個 run 所屬 `gaming_day`）。
 - **輸出粒度（MUST）**：`trip_fact` 必須同時輸出「已關閉 trip」與「進行中 trip」；進行中 trip 允許 `trip_end_*` 為 null，並須有可機器讀取之閉合狀態欄（例如 `is_trip_closed` 或等價欄位）。
-- **計算依賴（MUST）**：v1 不引入外部賭場日曆表；trip close 判定可由 `run_fact` 推導之「有 run 之 `gaming_day`」與其間缺口完成。對於賭場日曆上存在但資料缺席之日，視為一個完整 `gaming_day` 空日。
+- **計算依賴（MUST）**：v1 不引入外部賭場日曆表；trip close 判定可由 `run_fact` 推導之「有 run 之 `gaming_day`」與其間缺口完成。對於賭場日曆上存在但資料缺席之日，視為一個完整 `gaming_day` 空日。  
+- **觀測上界（MUST；trip close horizon）**：「三個完整無 bet `gaming_day`」之計數**僅得**計入 **`coverage_end_gaming_day`**（或等價邏輯名）**之前（含）**之日；**不得**以其他 `player_id` 之最後活動日作為本玩家之日曆上界。**`coverage_end_gaming_day` 之定義（v1.12）**：在該次 **`source_snapshot_id`** 範圍內，對 trip close 所依賴之各來源表（現況以 L0.5 **`cleaned_bet`** 為 bet 真值；多表時以 registry 列舉為準），取各列之 **`observed_at_logical`**（§4.4 **LDA-014**；與 preprocess 產出欄位對齊，例如 `__etl_insert_Dtm_synthetic`）在該快照內之**全域最大值** `T_max`。`T_max` 映射為 `G_max` 前，**必須**先在與 trainer 一致之時區框架（`trainer/core/_config_training_domain.py::HK_TZ`，目前 `Asia/Hong_Kong`）下正規化，再套用 **`GAMING_DAY_START_HOUR`**（見 §5.2）映射為賭場日 **`G_max`**；再令  
+  **`coverage_end_gaming_day` := `G_max` 在賭場日曆上之前一個完整 `gaming_day`**（口徑：**`G_max - 1`**）。  
+  **來源表前置條件（MUST）**：僅允許納入已完成 `observed_at_logical` 量測並定版 cap（`ingest_delay_cap_sec` 非 `TBD`）之來源表；未達條件者不得參與 trip close horizon 計算（避免混入 raw `observed_at` 造成上界漂移）。  
+  **理由（設計說明）**：snapshot 凍結時刻常落在某一 `gaming_day` 尚未走完之區間；若直接以 `G_max` 為可計入之「最後完整空日」上界，易將**仍在累積觀測**之末日誤當完整空日，導致 trip **過早關閉**；**`-1`** 為保守折衷。上界**之後**之日**不得**計入「三個完整空日」。多 worker／分桶物化時，**必須**先確立**同一**全域 `coverage_end_gaming_day`（或等價單一參數）再分區計算，以保 determinism（空快照與邊界例見 implementation plan）。
 
 ### 5.2 Run `gaming_day` 硬切與分區（強制設計）
 
 run 定義採 `gaming_day` 硬切後，需滿足：
 
 1. **`run_fact` 主分區**：建議以 **`run_end_gaming_day`**（run 內最後一筆 bet 所屬 `gaming_day`）作為每列分區鍵，與 trip 日分區語義對齊。
-2. **硬切判定規則（MUST）**：run 切分須同時套用「30 分鐘 gap」與「`gaming_day` 變更強制開新 run」；其中 `gaming_day` 邊界由 `GAMING_DAY_START_HOUR`（目前專案設定 03:00，Asia/Hong_Kong）決定。
+2. **硬切判定規則（MUST）**：run 切分須同時套用「30 分鐘 gap」與「`gaming_day` 變更強制開新 run」；其中 `gaming_day` 邊界由 **`GAMING_DAY_START_HOUR`** 決定；該常數之**唯一來源**為 **`trainer/core/_config_training_domain.py::GAMING_DAY_START_HOUR`**（整數小時，Asia/Hong_Kong；數值可隨分析調整，例如 3 或 6，**非**本文件寫死值）。物化輸出 manifest **必須**記錄本次使用之數值。
 3. **`run_day_bridge`（SHOULD）**：可保留作為日粒度影響分析與審計輔助；不得取代 run/trip membership lineage。
 
 > **禁止**：在同一 `definition_version` 內任意切換 `GAMING_DAY_START_HOUR` 或關閉 hard cutoff。任何此類變更皆須升 `definition_version` 並於 manifest 明載。
@@ -276,6 +289,7 @@ Serving 或線上消費本資產時，**不得假設**可對全歷史做無界�
 - `trip_id` 一旦生成，不得因後續補寫 `trip_end_*`（例如 trip 關閉後回填結束欄位）而改變；`trip_end_*` 不得作為 `trip_id` hash 輸入。
 - 產物附帶 **稽核欄位**：至少含來源分區清單、列數、`built_at`、可選 **content hash**（由 implementation plan 指定演算法）。
 - 跨 snapshot 比對不得假設 `run_id` / `trip_id` 永久穩定；若需要追蹤舊新快照之 run/trip 對應，必須透過 membership lineage（run-bet / trip-run）、`source_snapshot_id`、或 implementation plan 定義之 `previous_*_id` mapping。
+- **下游消費（MUST）**：不得以 `run_id` / `trip_id` **單獨**跨 `source_snapshot_id` join 而假設為同一邏輯實體之延續；比對或 join **必須**併用 `source_snapshot_id`（及必要時 membership／mapping）。
 
 ---
 
@@ -317,6 +331,11 @@ Serving 或線上消費本資產時，**不得假設**可對全歷史做無界�
 
 **建議（SHOULD）**：若該批次曾套用 §4.4 之 ingestion 清洗，另載 **`ingestion_fix_rule_id`**、**`ingestion_fix_rule_version`**、**`ingestion_delay_summary`**（結構化 JSON 或等價，含 §4.4 所列摘要欄位）。
 
+**必須（MUST）**：
+
+- 產出 **`run_fact`**（及等價 run 邊界物化）之 manifest 或 sidecar，**必須**載入 **`gaming_day_start_hour_used`**（整數；與 §5.2／`trainer/core/_config_training_domain.py::GAMING_DAY_START_HOUR` 本次實際取值一致）。
+- 產出 **`trip_fact`**（及等價 trip 邊界物化）之 manifest 或 snapshot sidecar，**必須**載入 **`gaming_day_start_hour_used`**、**`coverage_end_gaming_day`**（§5.1）、**`G_max`**（或等價可審計欄位）與 **`coverage_input_tables`**（參與上界計算之來源表清單），以利審計與跨系統對帳。
+
 **`trip_fact` lineage（MUST）**：`trip_fact` 每批次 manifest 之 `source_partitions` 必須列舉本批次實際觸及之所有 `run_end_gaming_day` 分區（建議固定排序），`source_hashes` 與該清單對齊。
 
 ---
@@ -332,7 +351,7 @@ Serving 或線上消費本資產時，**不得假設**可對全歷史做無界�
 | **Time-to-ready (p95)** | 從「提出資料/特徵需求」到「可用快照就緒」之 p95 延遲。 |
 | **Ingestion observability coverage** | 每一 published L1/L2 批次是否皆附帶 §4.4 / §8 所要求之 **`ingestion_delay` 摘要**（供監控與事後根因分析）；缺失率應趨近零。 |
 
-**可接受標準（v1 敘述性）**：相較「每次全量重算同等邏輯」之基線，上述效率類指標在穩定運行後應可量化改善；**Ingestion observability coverage** 之缺失率應趨近零。具體數字門檻由 implementation plan 或營運 OKR 另定；**離線增量**之 full recompute 備援與 `cleaned` 歷史版數之初版數值見 **LDA-016** 與 implementation plan v0.10。
+**可接受標準（v1 敘述性）**：相較「每次全量重算同等邏輯」之基線，上述效率類指標在穩定運行後應可量化改善；**Ingestion observability coverage** 之缺失率應趨近零。具體數字門檻由 implementation plan 或營運 OKR 另定；**離線增量**之 full recompute 備援與 `cleaned` 歷史版數等**可操作數值**僅於 **implementation plan** 約定（對齊 **LDA-016**）。
 
 ---
 
@@ -361,15 +380,16 @@ Serving 或線上消費本資產時，**不得假設**可對全歷史做無界�
 ## 11) 開放議題（供下一輪決策）
 
 1. **`source_namespace`** 之枚舉與環境（prod/stage/dev）是否納入 hash 組成。  
-2. **`run_start_ts` 時區**：全專案固定為 HK 或 UTC 之單一 SSOT（避免跨系統偏移）。  
+2. **`GAMING_DAY_START_HOUR` 與 `run_start_ts` / `gaming_day` 邊界之跨系統一致性（部分已決議）**：已採 **`trainer/core/_config_training_domain.py` 單一來源**；待完成項為（a）盤點其他系統（若有）是否仍假設舊常數或不同時區，（b）加上 CI 鎖定「物化所用值 = trainer import 值」。
 3. **L0 批次不可變**之實際儲存策略（僅追加 vs 不可變 object key）。  
 4. **與現有 chunk cache / Step 6** 之整合邊界（另案 implementation plan）。  
 5. **Serving 有界緩衝之量化**：K/T/D（最近筆數、時間窗、`gaming_day` 數）與活躍玩家定義，須與延遲 SLO 一併驗收。  
 6. **`late_arrival_correction_log`** 之最低欄位、保留天數、與離線刷新之合併規則。  
 7. **`schema/time_semantics_registry.yaml` 審核流程**：新增來源表、修改 `event_time_col` / `observed_at_col` / `dedup_rule_id` 時，需由何角色核准。  
-8. **`late_row_*` 之量化定義**（「預期延遲帶」與表別閾值）是否由監控 SSOT 統一發包或由本層 manifest 固定欄位承載。
+8. **`late_row_*` 與 `late_threshold`（已決議；v1.11）**：以 **`late_threshold_status` ∈ {`defined`, `undefined`}`**（§4.4）表徵 registry 是否已定量化門檻；僅 `defined` 時得輸出可比較之 `late_row_*`。監控告警規則仍屬監控域 out of scope。
 9. **Feature dependency registry**：如何從 `package/deploy/models/feature_spec.yaml` 追蹤到 run/trip/bet 所需最低統計量與 membership artifact。
 10. **多實體 L0.5 onboarding**：新來源（如 player/table_config/game）在未有完整業務語義前，如何以最小契約（`entity_name`、`business_key`、`partition_key_semantics`、`event_time_col`、`observed_at_col`）先行掛入治理與 impact 評估。
+11. **trip close horizon 來源表旗標**：`time_semantics_registry` 是否增設 machine-readable 欄位（例如 `contributes_to_trip_close_horizon`）以明確列舉可參與 `coverage_end_gaming_day` 計算之來源表。
 
 ---
 
@@ -391,9 +411,9 @@ Serving 或線上消費本資產時，**不得假設**可對全歷史做無界�
 | **LDA-012** | Trip 必須知道所有 runs，run 必須知道所有 bets；`run_day_bridge` 不得取代 membership lineage（§4.2）。 |
 | **LDA-013** | L1/L2 最小統計量由 implementation plan 定，但必須足以重建目前 `package/deploy/models/feature_spec.yaml` 所需全部特徵（§4.2）。 |
 | **LDA-014** | 對納入本資產層之各來源表，採 **殘差 P95 cap** 定義 **`observed_at_logical`**（§4.4）：排除已文件化整批入倉後量測 P95，超過 cap 之列令 `observed_at_logical = event_time + cap`；**L0 raw 不改寫**；`t_bet` 之 **`ingest_delay_cap_sec = 122`** 見 `schema/preprocess_bet_ingestion_fix_registry.yaml`（`BET-INGEST-FIX-004`）。 |
-| **LDA-015** | Trip v1 落地契約：分區鍵採 `trip_start_gaming_day`、`trip_fact` 同時含已關閉與進行中 trip、`trip_id` 納入 `source_snapshot_id` 與 `first_run_id` 且不受 `trip_end_*` 回填影響、trip close 在不引入外部日曆表下可由 `run_fact` 缺口推導，且 `trip_fact` manifest 必須列舉觸及之 `run_end_gaming_day` 分區（§5.1、§6、§8）。 |
-| **LDA-016** | **離線增量初版運作參數（可觀測調整）**：`cleaned`（**L0.5**，§4.1.1）每 `gaming_day` 分區保留最近 **7** 個成功版本；當 `impact_day_ratio` **或** `changed_player_ratio` **≥ 10%** 時，允許將該次作業升級為 **full recompute** 備援（須記錄原因；分母定義見 implementation plan v0.10 §2.2.1）。**不得**與 §5.3「影響驅動、非固定日曆窗口」之原則衝突；數值可於上線後依監控修訂。 |
-| **LDA-017** | L0.5 採多實體可擴充治理：現況 `cleaned_bet` 為唯一定義完整之實體；未來可新增 `cleaned_<entity>`，且允許 entity-specific 分區鍵與重算策略；但新實體進 production 前必須先補齊最小契約欄位與 impact/fallback 規則，L1 不得直讀 raw（§4.1.1）。 |
+| **LDA-015** | Trip v1 落地契約：分區鍵採 `trip_start_gaming_day`、`trip_fact` 同時含已關閉與進行中 trip、`trip_id` 納入 `source_snapshot_id` 與 `first_run_id` 且不受 `trip_end_*` 回填影響、trip close 在不引入外部日曆表下可由 `run_fact` 缺口推導，且須遵守 §5.1 **觀測上界**（**`observed_at_logical` 全域 max →（HK 時區正規化）→ `G_max` → `coverage_end_gaming_day = G_max - 1`**；僅納入 cap 已定版之來源表）；`trip_fact` manifest 必須列舉觸及之 `run_end_gaming_day` 分區（§5.1、§6、§8）。 |
+| **LDA-016** | **離線增量治理原則（不含營運數值）**：`cleaned`（**L0.5**）在影響驅動前提下，允許**有限歷史版本**以利根因分離與回滾，並在影響範圍過大或無法可靠 closure 時允許升級 **full recompute** 備援（須審計原因）。**具體**「每分區保留幾版」「比例閾值與分母」等**僅**於 **implementation plan** 約定與調整；**不得**與 §5.3「影響驅動、非固定日曆窗口」衝突。 |
+| **LDA-017** | **L0.5 多實體治理原則**：L0.5 可擴充為多實體 `cleaned_<entity>`；各實體進 production 前須補齊最小契約（見 implementation plan §2.4.1），且 **L1 不得直讀 raw**（§4.1.1）。實體清單、分區鍵、entity-specific 重算閾值等**實作細節**由 implementation plan 維護。 |
 
 ---
 

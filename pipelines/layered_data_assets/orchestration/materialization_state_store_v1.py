@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from pipelines.layered_data_assets.io.l0_fingerprint import sha256_file
+
 MATERIALIZATION_DEFINITION_VERSION = "layered_data_assets_v1"
 MATERIALIZATION_TRANSFORM_VERSION = "v1"
 
