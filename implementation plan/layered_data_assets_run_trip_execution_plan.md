@@ -2,7 +2,7 @@
 
 > **文件層級**：Working / Execution Plan（執行層）。  
 > **目的**：把 SSOT 與 Implementation Plan 落成**可執行任務**（順序、owner 角色、依賴、產物、DoD、gate、升級規則）。  
-> **依據**：[`ssot/layered_data_assets_run_trip_ssot.md`](ssot/layered_data_assets_run_trip_ssot.md)（v1.6）、[`implementation plan/layered_data_assets_run_trip_implementation_plan.md`](implementation%20plan/layered_data_assets_run_trip_implementation_plan.md)（v0.7）、[`schema/time_semantics_registry.yaml`](schema/time_semantics_registry.yaml)、[`package/deploy/models/feature_spec.yaml`](package/deploy/models/feature_spec.yaml)。  
+> **依據**：[`ssot/layered_data_assets_run_trip_ssot.md`](ssot/layered_data_assets_run_trip_ssot.md)（v1.9）、[`implementation plan/layered_data_assets_run_trip_implementation_plan.md`](implementation%20plan/layered_data_assets_run_trip_implementation_plan.md)（v0.10）、[`schema/time_semantics_registry.yaml`](schema/time_semantics_registry.yaml)、[`package/deploy/models/feature_spec.yaml`](package/deploy/models/feature_spec.yaml)。  
 > **邊界**：本檔**不重寫**業務定義與架構決策；若與上層文件衝突，以上層為準並回寫本檔。
 
 ---
@@ -43,8 +43,8 @@
 
 ### 1.1 必備輸入（凍結前不得宣稱 Phase 0 完成）
 
-- SSOT v1.5 可取得且為爭議解方之最高優先序（見 SSOT §0.1）。
-- Implementation plan v0.6 可取得（含 Executive Summary、§6.1.1 枚舉規則、§7.1 OOM、§8.1 gate、§10 correction log、§4 `observed_at_logical`／ingestion fix registry 契約、one-liner + BET-DQ-03 fail-closed 契約）。
+- SSOT v1.9 可取得且為爭議解方之最高優先序（見 SSOT §0.1）。
+- Implementation plan v0.10 可取得（含 Executive Summary、§6.1.1 枚舉規則、§7.1 OOM、§8.1 gate、§10 correction log、§4 `observed_at_logical`／ingestion fix registry 契約、one-liner + BET-DQ-03 fail-closed 契約、L0.5 多實體擴充預留）。
 - `package/deploy/models/feature_spec.yaml` 可解析（YAML AST）。
 - `schema/time_semantics_registry.yaml` 存在且可被 CI 讀取。
 
@@ -318,6 +318,19 @@
 | **BL-03** | `late_arrival_correction_log` **保留天數／壓縮／GC** 與 L0／published 生命週期對齊 | Ops |
 | **BL-04** | **trainer Step 6/7** 與本產線合併／取代／雙軌之時程與回歸範圍 | Model Owner + ML Platform |
 | **BL-05** | `cleaned` 單一活躍資料集之保留策略（僅活躍版 + 最近一次回滾點）與分區 GC 週期 | Data Platform + Ops |
+| **BL-06** | **Future entity onboarding template**（`cleaned_<entity>` 接入前最小契約：`entity_name`、`business_key`、`partition_key_semantics`、`event_time_col`、`observed_at_col`；impact scope 與 fallback policy；可先 `TBD` 但 production 前需定版） | Data Platform + ML Platform + DS |
+
+### 11.1 Future entity onboarding（best-effort 模板，不排期）
+
+> 目的：在未知未來表清單下，先固定接入 gate，避免新實體繞過治理。
+
+| 檢核項 | 要求 | 備註 |
+|------|------|------|
+| 最小契約欄位 | 必填五欄：`entity_name`、`business_key`、`partition_key_semantics`、`event_time_col`、`observed_at_col` | 前期可 `TBD`，production 前必須定版 |
+| 分區鍵策略 | entity-specific；不得預設一律 `gaming_day` | 與 SSOT v1.9 / impl v0.10 對齊 |
+| 影響分析 | 需在 `impact_analyzer` 註冊 `entity_name` 與 `impact_scope` | 無 machine-readable scope 時不得走增量發布 |
+| Fallback policy | 需有實體級規則（比例／絕對量／扇出成本） | bet 的 10% 只能當暫時參考，不可直接複製 |
+| Lineage / state | 必須接入 manifest、`semantic_signature`、state store | 未接入者視為實驗管線，不得宣稱 production-ready |
 
 ---
 

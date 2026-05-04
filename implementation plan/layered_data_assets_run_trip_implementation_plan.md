@@ -1,7 +1,7 @@
 # 分層資料資產與 run/trip 特徵工程 — Implementation Plan
 
-> **版本**：Implementation plan **v0.7**（2026-05-03；新增：Trip v1 工程契約定案：`trip_start_gaming_day` 分區、open/closed 同輸出、`trip_id` hash 補 `source_snapshot_id`、MVP 採 full snapshot 重算、single-writer merge 與 trip manifest lineage 列舉規則）。對齊 SSOT v1.6；重大架構變更升 minor。  
-> **依據**：`ssot/layered_data_assets_run_trip_ssot.md`（v1.6）、`schema/time_semantics_registry.yaml`。  
+> **版本**：Implementation plan **v0.10**（2026-05-04；延續 v0.9：新增 L0.5 多實體擴充預留，將初版閾值明確限定於 bet 路徑。**初版運作參數（bet 路徑）**：`cleaned_bet` 每分區保留最近 **7** 個成功版本；增量路徑之 full recompute 備援觸發採 `impact_day_ratio` **或** `changed_player_ratio` **≥ 10%**（相對本次作業有效集合；上線後觀測調整）。對齊 SSOT v1.9。重大架構變更升 minor。  
+> **依據**：`ssot/layered_data_assets_run_trip_ssot.md`（v1.9）、`schema/time_semantics_registry.yaml`。  
 > **本文層級**：架構、模組邊界、階段交付、驗證與治理；**不含**逐檔 Jira 式任務拆解。  
 > **與 trainer 關係**：本計畫先建立**與現行 `trainer` 管線並行**之資料資產產線；是否改為訓練主讀本層資產須另案決策（見 SSOT §0.1）。
 
@@ -22,7 +22,7 @@
 
 **預期成果**  
 完成本計畫後，專案將具備：
-1. **可重用、可增量的離線特徵庫**（支援每日 published snapshot）。
+1. **可重用、可增量的離線特徵庫**（支援每日 published snapshot；預設以「只重算被證明受影響之分區」為原則）。
 2. **資源可控的計算管線**（具備 OOM 估算與自動降載重試機制）。
 3. **嚴格的審計與驗收標準**（Lineage manifest、100% Feature Parity、以及處理遲到資料的 Correction Log）。
 4. 大幅降低未來模型迭代與特徵開發的 Time-to-Ready。
@@ -37,6 +37,9 @@
 4. **資源可控**：大表掃描以 **gaming_day（或約定分區）** 增量為主；單機路徑須支援 **串流／分批**（DuckDB 或等價），避免假設可一次載入全歷史。
 5. **與既有特徵契約對齊**：以 `package/deploy/models/feature_spec.yaml` 為覆蓋底線；採 **`player_id` + asset-layer `feature_spec`**；**全量枚舉、100% 重現與驗收**之操作定義見 **§6.1**（含 **§6.1.1**）。deploy 檔內之 `canonical_id`／`PARTITION BY canonical_id` 等僅為**現況描述**；本產線不採 `canonical_id` 作為特徵主分區鍵（見 §6.1）。
 6. **可中斷與可續跑（resumable）**：以 `gaming_day` 為最小計算單元；任何單日產物需可獨立重跑、跳過已完成分區、並在中斷後從未完成日期續跑。
+7. **失效必須可解釋（invalidation-first）**：是否重算不得僅依排程頻率或固定日曆窗口決定；必須由「資料變更、參考產物變更、邏輯/規則變更、契約/Schema 變更」所組成之**語義失效模型**決定。
+8. **未知影響寧可升級全量**：凡規則變更之影響範圍無法被 machine-readable 地判定，或 impact set 擴散接近全域時，必須升級為 full recompute；不得以「猜測大概沒影響」放行增量。
+9. **多實體可擴充（future-proof）**：目前僅 `bet` 路徑落地；未來新增 `player` / `table_config` / `game` 等實體時，允許 entity-specific 分區鍵與 fallback 規則，但需先補齊最小契約欄位並接入同一 impact/lineage 治理框架。
 
 ---
 
@@ -64,8 +67,10 @@
 | 階段 | 輸入 | 輸出 | 備註 |
 |------|------|------|------|
 | **L0 ingest** | ClickHouse / 既有 Parquet 匯出（`t_bet` + `t_session`） | 分區 raw（immutable batch） | 每批有 `source_snapshot_id`、分區 hash |
-| **Preprocess** | L0 + rated eligible `player_id` allowlist | 清洗後 bet 流（或中間表） | 與 `dedup_rule_id`、registry 對齊；`BET-DQ-03` 在編排路徑為 **MUST / fail-closed** |
-| **L1 materialize** | 清洗後 bets | `run_fact`、`trip_fact`、`run_day_bridge`、membership maps | 依 `definition_version`；**不含**訓練抽樣參數 |
+| **Change index** | L0 / 參考產物 / 規則版本 | `changed_days`、`changed_player_ids`、`rule_delta` | 只記錄「什麼變了」，不直接做重算決策 |
+| **Impact analysis** | change index + lineage / membership | `impact_set_preprocess`、`impact_set_run`、`impact_set_trip` | 以 `run_day_bridge`、membership、規則 impact scope 做 closure；未知影響可升級 full |
+| **Preprocess** | L0 + rated eligible `player_id` allowlist | 清洗後 bet 流（現況：`cleaned_bet`；未來可擴 `cleaned_<entity>`） | 與 `dedup_rule_id`、registry 對齊；`BET-DQ-03` 在編排路徑為 **MUST / fail-closed** |
+| **L1 materialize** | 清洗後 bets（未來可併入其他 `cleaned_<entity>`） | `run_fact`、`trip_fact`、`run_day_bridge`、membership maps（未來可擴 `dim_<entity>`） | 依 `definition_version`；**不含**訓練抽樣參數 |
 | **L2 assemble** | L1 + 需求窗 | 訓練或分析用矩陣／索引 | 抽樣、權重僅在此層 |
 | **Publish（serving 基底）** | L1/L2 | `published_snapshot_id` + sidecar manifest | 週期與 SLO 於 Phase 2 固定 |
 | **Online delta（可選）** | 新 bet 流 + 上一版 published | bounded state + `late_arrival_correction_log` | 須可證明上界 |
@@ -79,6 +84,47 @@
 - **編排**：初期以 **CLI + cron/Airflow（若已有）** 即可；不將編排器選型列為本計畫 gate。
 - **State store（新增）**：維護日粒度執行狀態（例如 SQLite/DuckDB/JSONL）；每筆至少含 `artifact_kind`、`gaming_day`、`source_snapshot_id`、`definition_version`、`transform_version`、`status`、`attempt`、`input_hash`、`output_uri`、`updated_at`、`error_summary`。
 - **Rated eligibility（新增，MUST）**：編排器在 raw 路徑需先由 `trainer.identity.build_rated_eligible_player_ids_df(sessions_df, cutoff_dtm)` 產生 `eligible_player_ids`，再餵給 `preprocess_bet_v1 --eligible-player-ids-parquet`；不得在 LDA 另行重寫 rated 規則。
+- **語義簽章（新增，MUST）**：每個 artifact / 分區皆需有 `semantic_signature`（或等價 `input_hash` payload）表達「會改變輸出語義的輸入集合」；不得以純執行參數（threads / memory_limit / bucket_count）作為失效鍵。
+- **Rule impact registry（新增，SHOULD）**：規則、registry、definition version 變更須能宣告 `impact_scope`（例如 `player` / `day` / `global`）與 `fallback_policy`；無法機器判定者預設 `FULL_RECOMPUTE`。
+
+### 2.2.1 統一失效模型（Unified Invalidation Model）
+
+> 目標：把「哪些分區必須重算」從排程層抽離，收斂為可審計、可測試、可擴充的單一機制。
+
+**失效來源（四大類）**
+
+1. **資料變更（Data delta）**：來源表 `t_bet` / `t_session` / 其他納入本層之表新增、回補、修正、刪除；輸出 `changed_days`、`changed_players`。
+2. **參考產物變更（Reference artifact delta）**：`canonical_mapping`、`eligible_player_ids`、`dummy_player_ids`、cutoff / sidecar 等變更；輸出 `changed_player_ids`、`changed_validity_window`。
+3. **邏輯與規則變更（Logic delta）**：preprocess SQL、dedup / rated gate、run/trip definition、ingestion fix registry、`time_semantics_registry` 等；輸出 `rule_delta` 與宣告之 `impact_scope`。
+4. **契約與 schema 變更（Contract delta）**：欄位型別、必填欄位、feature dependency registry / spec 變更；若無法局部判定影響，預設升級 full recompute。
+
+**語義簽章（semantic signature）**
+
+- 每一分區之重算判定應基於「語義簽章」而非單純排程頻率。建議至少區分：
+  - `sig_preprocess(gaming_day)` = 該日 bet 內容指紋 + 受影響 rated/canonical 參考物指紋 + preprocess 規則版本 + ingestion fix registry 版本 + cutoff/sidecar 契約。
+  - `sig_run(gaming_day)` = upstream `cleaned` 簽章 + `run_definition_version` + hard cutoff 規則。
+  - `sig_trip(trip_start_gaming_day or impacted run set)` = 受影響 `run_fact` 簽章集合 + `trip_definition_version` + trip close 規則。
+- **語義無關之執行參數**（例：DuckDB threads、memory limit、bucket count）**不得**納入語義簽章；其變動僅觸發 determinism gate，不觸發業務重算。
+
+**Impact propagation**
+
+- 失效來源先形成 seed set，再透過 lineage / membership 做 closure：
+  - `changed_player_ids -> affected gaming_day`（經 `run_bet_map`、必要時 `cleaned` / preprocess 索引）
+  - `changed_days -> affected run_end_gaming_day`（經 `run_day_bridge`）
+  - `affected runs -> affected trips`（經 `trip_run_map`）
+- `run_day_bridge` 僅作為 impact analysis 輔助；不得取代 run/trip membership lineage（對齊 SSOT）。
+- 多實體擴充時，impact analyzer 應支援 `artifact_kind + entity_name` 維度；未知實體若未提供 machine-readable impact scope，預設升級 full recompute。
+
+**升級全量（FULL_RECOMPUTE）條件**
+
+- 規則 / schema 變更之 `impact_scope` 無法 machine-readable 判定。
+- **初版成本閾值（2026-05-04，上線後觀測調整；僅適用 bet 路徑）**：令 `D` 為本次作業之**有效 `gaming_day` 集合**（例如 `--date-from`/`--date-to` 與資料可得日之交集；或 orchestrator 當次計畫日清單）。令 `I` 為 impact analyzer 產出、落在 `D` 內之分區日集合。定義  
+  - `impact_day_ratio := |I| / max(|D|, 1)`。  
+  另令 `P_changed` 為本次變更索引中標記為「映射或 rated 資格受影響」之 `player_id` 集合；令 `P_scope` 為本次作業在 `D` 範圍內、於上游 `t_bet`（或等價 cleaned 輸入）曾出現之 `player_id` 集合。定義  
+  - `changed_player_ratio := |P_changed ∩ P_scope| / max(|P_scope|, 1)`。  
+  若 **`impact_day_ratio ≥ 0.10` 或 `changed_player_ratio ≥ 0.10`**，則本次作業對**受影響之 pipeline 階段**升級為 **FULL_RECOMPUTE**（須寫入 run log / 變更索引之 `fallback_reason` 與實際比值）。  
+  若 closure 無法可靠估 `P_scope`（例如首次全量、或缺少 membership 索引），**不得以猜測分母硬算比例**；應直接走 full 或先補索引，並記錄原因。
+- canonical / rated 參考產物之變動量過大，以致局部重算收益不再成立（可由上列比例閾值涵蓋；若實務仍不足，再升版閾值或改採絕對列數上限）。
 
 ### 2.3 Resumable 工程契約（草案）
 
@@ -91,7 +137,7 @@
 | `source_snapshot_id` | TEXT | 輸入快照版本 |
 | `definition_version` | TEXT | run/trip 定義版本 |
 | `transform_version` | TEXT | 流程版本 |
-| `input_hash` | TEXT | 該日輸入內容指紋（用於 skip/stale 判定） |
+| `input_hash` | TEXT | 該日輸入之**語義簽章**（semantic signature；用於 skip/stale 判定） |
 | `status` | TEXT | `pending` / `running` / `succeeded` / `failed` / `skipped` |
 | `attempt` | INTEGER | 該單元嘗試次數 |
 | `output_uri` | TEXT | 成功輸出檔 URI（可空） |
@@ -118,21 +164,40 @@
 - `--stop-after-date YYYY-MM-DD`：驗證可中斷點
 - `--state-store PATH`：指定 state DB（預設 `data/l1_layered/materialization_state.duckdb`）
 
+**`input_hash` / `semantic_signature` 契約（MUST）**
+
+- `input_hash` 應只涵蓋**語義相關**輸入：來源分區內容、參考產物內容、definition / transform version、registry / rule version、必要 sidecar。
+- `input_hash` 不得把純執行參數（threads / memory limit / retry 次數）混入，避免造成無意義重算。
+- 同一 `semantic_signature` 下之 `--resume` skip，等價於「此分區在目前規則與來源下可重用」；若任一語義相關因素變更，必須重新進入 impact analysis。
+
 **原子寫入（MUST）**
 
 - 目標檔先寫 `*.tmp`，完成校驗（row_count/hash）後 rename 成正式檔。
 - 僅在 rename 成功後寫入 `status=succeeded`；任何中斷都不得留下「成功狀態 + 半成品檔」。
 
-### 2.4 `cleaned` 單一活躍資料集（single-live dataset）治理策略
+### 2.4 `cleaned_bet` 單一活躍資料集（single-live dataset）治理策略
 
-> 目標：在不保留大量歷史 Parquet 的前提下，仍維持可審計、可續跑、可最小回滾。
+> 目標：在**有限歷史版本**（可根因分離 preprocess vs L1）前提下，仍維持可審計、可續跑、可最小重算；**無語義變更之分區不重算**。
+
+> **SSOT**：L0.5（`cleaned`）語義邊界與「L1 只消費 L0.5」之約束見 `ssot/layered_data_assets_run_trip_ssot.md` §4.1.1；本節為 **bet 實體**之落地策略。
 
 - **活躍集合（Active set）**：`cleaned` 採單一活躍資料集，按 `gaming_day` 分區覆寫；日常增量與回補僅重算受影響分區，不重跑全量。
+- **L0.5 實體層（SHOULD；與現況相容之演進方向）**：`cleaned` + `manifest` 可獨立於 L1 facts 目錄治理（例如專用 `l0_5_cleaned/` 或等價命名）；**L1 只讀 L0.5**，以便 incident 時快速判斷問題在 preprocess 或 L1。遷移期允許沿用 `l1_layered/<snap>/t_bet/gaming_day=.../cleaned.parquet` 路徑，但契約上仍視為「L0.5 產物」。
+- **歷史版本保留（初版 MUST）**：每個 `gaming_day` 分區在成功 commit 後，除 active 外保留最近 **7** 個成功版本（rolling；**第 8 舊版可 GC**，除非審計凍結）。每版須含對應 `manifest.json` 與相同之 `semantic_signature` 記錄，供 diff 與回滾。
+- **單一對外入口（SHOULD）**：對日常使用者應暴露單一 canonical / current 入口；`source_snapshot_id`、內部 checkpoint 與最近 **7** 版保留用於 lineage / rollback，而非日常人工選檔依據。
 - **最小追溯（MUST）**：每個 `gaming_day` 分區必須保留可機器讀取之 `manifest.json`，至少含 `row_count`、`input_hash`、`source_snapshot_id`、`preprocessing_rule_id/version`、`updated_at`、（可選）row fingerprint。
 - **變更事件索引（SHOULD）**：維護輕量變更索引（DuckDB/JSONL 皆可），以 `(gaming_day, updated_at)` 為主鍵語意，記錄覆寫前後摘要與操作者來源（system/job/manual）。
 - **最小回滾（MUST）**：即使主策略為「僅保留 1 版活躍分區」，仍需保留「最近一次可回滾點」：可為受影響分區的上一版備份或等價 checkpoint，不要求全量雙份儲存。
 - **原子覆寫（MUST）**：分區更新沿用 `*.tmp -> rename`；僅在新 `cleaned.parquet` 與 manifest 校驗完成後，才更新 state/索引，避免產生不可重現中間態。
 - **與上層契約一致（MUST）**：上述策略不得改變 SSOT/Implementation 既有業務語義（dedup、事件序、run/trip 邊界），僅是儲存與治理層策略。
+- **與 impact analysis 一致（MUST）**：是否覆寫某日 `cleaned` 分區，應由 impact analysis + `semantic_signature` 共同決定；不得因「每日排程已到」而無條件重算所有日期。
+
+### 2.4.1 未來實體掛載預留（player / table_config / game 等）
+
+- **命名與資產邊界（SHOULD）**：新實體沿用 `cleaned_<entity>`（L0.5）、`dim_<entity>` 或 `fact_<domain>`（L1）命名；是否採 `dim` 或 `fact` 以語義為準，不強制單一名稱。
+- **最小契約（MUST）**：每個新實體接入前至少補齊 `entity_name`、`business_key`、`partition_key_semantics`、`event_time_col`、`observed_at_col`；可先 `TBD`，但 production 前必須定版。
+- **分區與閾值（MUST）**：新實體可採 entity-specific 分區鍵與 fallback policy；不得直接套用 bet 的 `gaming_day` 與 10% 閾值而不經驗證。
+- **治理一致性（MUST）**：新實體必須接入既有 `semantic_signature`、manifest lineage、state store、impact analyzer；未接入者不得宣稱為可增量治理之正式產線。
 
 ### 2.5 Pipeline 程式與文件集中治理策略（repository organization）
 
@@ -172,6 +237,9 @@
 | **publisher** | 產出 `published_snapshot_id`、刷新週期標識、可選 `online_delta_seq` 契約。 |
 | **resume_controller** | 依 state store + manifest 決定「可跳過／需重跑／可續跑」日期集合；提供 `--resume` / `--force` / `--date-from` / `--date-to` 契約。 |
 | **rated_eligibility_builder**（新增） | 單一來源為 `trainer.identity.build_rated_eligible_player_ids_df`；以 `t_session + cutoff_dtm` 產出 `eligible_player_ids` 給 preprocess；需有分批/串流策略避免 OOM。 |
+| **change_index**（新增） | 對來源表、參考產物、registry / rule 版本產出變更索引：`changed_days`、`changed_player_ids`、`rule_delta`。 |
+| **impact_analyzer**（新增） | 將 change index 轉成各層 `impact_set_*`；使用 `run_day_bridge`、membership、已發布 metadata 做 closure 與 full-recompute 判定。 |
+| **rule_impact_registry**（新增） | 定義規則/registry 變更之 `impact_scope`（`player` / `day` / `global`）與 `fallback_policy`；供 impact analyzer 消費。 |
 
 **與 `trainer` 邊界**：第一階段仍不重構 `trainer.py` 主流程，但 **BET-DQ-03 rated eligibility 必須直接復用 `trainer.identity.build_rated_eligible_player_ids_df`**，作為 preprocess 唯一 allowlist 來源；此項屬資料品質入口契約，非可延後之最佳化工作。
 
@@ -235,6 +303,7 @@
 - BET-DQ-03 rated gate 在編排路徑為 fail-closed：無 `eligible_player_ids` 時不得以 `preprocessing_gaps` 降級放行。
 - 每批次 manifest + **ingestion 延遲摘要**（published 路徑預演）。
 - 日區間編排支援 **resumable**：每個 `gaming_day` 單獨落檔並寫入 state store；中斷後可從未完成日期續跑。
+- `change_index` + `impact_analyzer` 最小可用：對 bet / session / canonical / eligible / registry 變更能產出 `impact_set_preprocess` 與 `impact_set_run`；未受影響日期必須可 skip。
 
 **驗證**：
 
@@ -249,7 +318,7 @@
 
 - `trip_fact`、`trip_run_map`；`trip_fact` 分區鍵固定為 **`trip_start_gaming_day`**，並與 `run_fact`（`run_end_gaming_day`）及可選 `run_day_bridge` 影響分析對齊。
 - `trip_fact` 同時輸出**已關閉**與**進行中** trip；最小欄位需含對帳鍵（至少 `run_count`、`first_run_id`、`last_run_id` 或等價欄位）供 E2-02 membership 驗證。
-- Phase 2 MVP 計算模型採 **full snapshot 重算**（以 `player_id` 批次/分桶執行）；按日增量 trip 重算列為後續 phase（接 E1-09 state）。
+- Phase 2 MVP 計算模型採 **full snapshot 重算**（以 `player_id` 批次/分桶執行）；此為 Trip v1 正確性基線。按日 / impact-driven trip 重算列為後續 phase，須建立在已驗證之 `change_index` / `impact_analyzer` / `semantic_signature` 契約之上。
 - 併發寫入採 **single-writer merge**：多 worker 先輸出暫存，單一 writer 依固定排序合併分區，確保 determinism。
 - `trip_fact` manifest 需列舉本批次觸及之所有 `run_end_gaming_day` 於 `source_partitions`（固定排序），`source_hashes` 與其一一對齊。
 - `published_snapshot_id` 發布流程與 **回滾策略**（保留上一版 snapshot 指標）。
@@ -282,6 +351,7 @@
 **交付物**：
 
 - 儀表或週報：Reuse rate、Recompute ratio、Time-to-ready(p95)、ingestion coverage。
+- impact / invalidation 觀測：`changed_player_ratio`、`impact_day_ratio`、full-recompute fallback rate、rule-scope-unknown 次數。
 - **與 chunk cache / Step 6** 之整合決策文件（對應 SSOT §11 議題 4）：合併、取代或雙軌並行。
 
 ---
@@ -339,6 +409,8 @@
 | deploy spec 與 asset-layer spec 語義漂移 | 特徵一致性與可維護性下降 | 以 coverage matrix + mismatch ledger 持續稽核，任何新增/修改 feature 必須雙邊對映更新。 |
 | registry 與實際表漂移 | 錯誤 event_time | PR 必須更新 registry；CI 驗證欄位存在。 |
 | 過早合併進 trainer | 訓練迴歸風險 | Phase 4 前維持並行；但 preprocess 的 BET-DQ-03 入口仍需直連 trainer identity 單一來源。 |
+| 規則或 canonical 變動被低估 | 漏重算、舊分區語義過期 | 建立 `rule_impact_registry`；影響範圍無法 machine-readable 判定時，一律升級 full recompute。 |
+| 大量 player/canonical 變動使增量失效 | impact set 接近全域，增量反而更慢 | 初版：`impact_day_ratio` 或 `changed_player_ratio` **≥ 10%**（見 §2.2.1）即切 full 並記錄 `fallback_reason`；上線後依觀測調整。 |
 
 ### 7.1 OOM 估算與重試機制（實作契約）
 
@@ -361,6 +433,7 @@
 4. Ingestion：`published` 批次皆含 **ingestion_delay_summary**。  
 5. Feature：同 **§6.1**／**§6.1.1**（deploy spec 可枚舉特徵之 **100% 覆蓋**與 **deterministic 一致**）；未達成不得結案。
 6. Resume/Idempotency：同日期區間在「一次跑完」與「中斷後續跑」兩種路徑下，輸出列數與 row-level hash 一致；已成功分區可被安全跳過。
+7. Invalidation correctness：資料 / 參考產物 / 規則變更能正確映射到 impact set；未受影響分區不得被無意義重算，受影響分區不得被漏算。
 
 ### 8.2 Rollout
 
@@ -391,8 +464,8 @@
 
 - **主要讀者**：**離線重算** job（依 `published_snapshot_id` / 時間窗 / `player_id` 載入 correction 事件，決定需重算的 run/trip／特徵範圍）。
 - **非目標讀者**：本契約**不**要求線上 scorer 即時讀取該 log；線上路徑仍以 published snapshot 與有界增量契約為準（見 SSOT §5.4）。
-- **保留與 GC**：保留天數、是否可壓縮歸檔、與 L0 不可變策略之對齊，列為 **working plan／運維** 約定（本計畫不定具體天數）。
-- **Working plan 待辦**：上述保留天數、壓縮歸檔週期、與 **L0／published snapshot** 生命週期之對齊，須在 **Working plan** 中列為**明確任務與 owner**（本 implementation plan 僅標示缺口）。
+- **保留與 GC**：`cleaned`（L0.5）每分區 rolling **7** 版（見 §2.4）；**L0 raw** 與 **published** 之保留天數／壓縮歸檔仍列 **working plan／運維**（本計畫不定死日曆天數，以免與環境儲存策略綁死）。
+- **Working plan 待辦**：L0／published 之保留與壓縮週期、與 **L0.5 七版**策略之對齊、以及 GC 審計凍結規則，須在 **Working plan** 中列為**明確任務與 owner**。
 
 ### 10.3 最小欄位（語義）
 
@@ -428,7 +501,7 @@
 ## 11) 文件維護
 
 - SSOT 變更時：本計畫須檢視 **Phase 範圍與驗收** 是否仍成立；必要時升版本計畫「階段」敘述，不修改 SSOT 業務定義。  
-- 本計畫版本以文首 **blockquote 版本列**為準（目前 v0.6）；重大架構變更升 minor。
+- 本計畫版本以文首 **blockquote 版本列**為準（目前 v0.10）；重大架構變更升 minor。
 
 ---
 
