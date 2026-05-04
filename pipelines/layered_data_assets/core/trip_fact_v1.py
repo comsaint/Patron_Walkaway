@@ -19,6 +19,9 @@ from pipelines.layered_data_assets.core.preprocess_bet_v1 import (
 from pipelines.layered_data_assets.core.trip_id_v1 import derive_trip_id
 from pipelines.layered_data_assets.io.ingestion_delay_summary_v1 import manifest_ingestion_delay_placeholder
 from pipelines.layered_data_assets.io.l0_paths import validate_source_snapshot_id
+from trainer.core._config_training_domain import GAMING_DAY_START_HOUR
+
+TRIP_CLOSE_COVERAGE_INPUT_TABLES_V1: tuple[str, ...] = ("t_bet",)
 
 TRIP_DEFINITION_VERSION_DEFAULT = "trip_boundary_v1"
 SOURCE_NAMESPACE_DEFAULT = "layered_data_assets_l1"
@@ -249,12 +252,20 @@ def materialize_trip_partition_parquets(
     """
     day = _validate_gaming_day(trip_start_gaming_day, param_name="trip_start_gaming_day")
     runs = load_run_fact_dataframe(con, run_fact_paths)
+    if runs.empty:
+        if coverage_end is None:
+            raise ValueError(
+                "coverage_end (YYYY-MM-DD) is required when run_fact inputs contain no rows"
+            )
+        effective_cov = coverage_end
+    else:
+        effective_cov = coverage_end if coverage_end is not None else _coverage_end_date(runs)
     trip_all, map_all = build_trip_fact_and_run_map_frames(
         runs,
         source_snapshot_id=source_snapshot_id,
         trip_definition_version=trip_definition_version,
         source_namespace=source_namespace,
-        coverage_end=coverage_end,
+        coverage_end=effective_cov,
     )
     trip_part = trip_all[trip_all["trip_start_gaming_day"] == day].copy()
     map_part = map_all[map_all["trip_start_gaming_day"] == day].copy()
@@ -269,12 +280,15 @@ def materialize_trip_partition_parquets(
     con.unregister("_trip_fact_part")
     con.unregister("_trip_run_map_part")
     t0, t1 = _time_range_from_trips(trip_part)
+    g_max = effective_cov + timedelta(days=1)
     return {
         "row_count_trip_fact": int(len(trip_part)),
         "row_count_trip_run_map": int(len(map_part)),
         "time_range_min": t0,
         "time_range_max": t1,
         "source_partitions": source_partitions_from_runs(runs),
+        "coverage_end_gaming_day": effective_cov.isoformat(),
+        "G_max": g_max.isoformat(),
     }
 
 
@@ -304,8 +318,14 @@ def build_trip_fact_manifest(
     t0, t1 = _manifest_time_range(stats)
     out_uri = manifest_output_relative_uri(output_parquet, manifest_uri_anchor)
     ids = ingestion_delay_summary if ingestion_delay_summary is not None else manifest_ingestion_delay_placeholder()
+    cov_day = stats["coverage_end_gaming_day"]
+    g_max = stats["G_max"]
     return {
         "artifact_kind": "trip_fact",
+        "gaming_day_start_hour_used": int(GAMING_DAY_START_HOUR),
+        "coverage_end_gaming_day": str(cov_day),
+        "G_max": str(g_max),
+        "coverage_input_tables": list(TRIP_CLOSE_COVERAGE_INPUT_TABLES_V1),
         "partition_keys": {"source_snapshot_id": source_snapshot_id.strip(), "trip_start_gaming_day": day},
         "definition_version": TRIP_DEFINITION_VERSION_DEFAULT,
         "feature_version": "na_l1_trip_fact",

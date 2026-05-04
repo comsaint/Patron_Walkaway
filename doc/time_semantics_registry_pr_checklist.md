@@ -33,6 +33,7 @@
 | `late_arrival_expected` | 同上 |
 | `expected_delay_profile` | 延遲輪廓文字說明（可述明待監控合約補數值） |
 | `late_threshold` | 數值閾值或 **`TBD`** |
+| `contributes_to_trip_close_horizon` | **`bool`**：是否納入 trip close **觀測上界**（`observed_at_logical` → `T_max`；SSOT §5.1）。CI 固定 **v1 僅 `t_bet: true`**，其餘已登錄表必須 **`false`**；若要改多表須先升版 SSOT／implementation plan 並放寬驗證器 |
 | `notes` | 非空列表；至少一條（設計取捨、與 trainer／FND 對齊說明等） |
 
 ## Schema 字典對照（`schema/GDP_GMWDS_Raw_Schema_Dictionary.md`）

@@ -46,6 +46,7 @@ _TABLE_KEYS = (
     "late_arrival_expected",
     "expected_delay_profile",
     "late_threshold",
+    "contributes_to_trip_close_horizon",
     "notes",
 )
 
@@ -206,6 +207,12 @@ def _validate_table_entry_flags_and_metadata(table: str, spec: Mapping[str, Any]
     _bool_or_tbd(spec["correction_expected"], "correction_expected", table)
     _bool_or_tbd(spec["late_arrival_expected"], "late_arrival_expected", table)
 
+    h = spec["contributes_to_trip_close_horizon"]
+    if not isinstance(h, bool):
+        raise TypeError(
+            f"{table}: contributes_to_trip_close_horizon must be bool, got {h!r} ({type(h).__name__})"
+        )
+
     edp = spec["expected_delay_profile"]
     if not isinstance(edp, str) or not edp.strip():
         raise ValueError(f"{table}: expected_delay_profile must be a non-empty string")
@@ -254,6 +261,18 @@ def _validate_columns_against_dict(
             )
 
 
+def _validate_trip_close_horizon_policy(tables: Mapping[str, Any]) -> None:
+    """Enforce v1 policy: only ``t_bet`` may contribute to trip close horizon (SSOT §5.1 / impl §4.3)."""
+    contributors = [
+        name for name, spec in tables.items() if spec["contributes_to_trip_close_horizon"] is True
+    ]
+    if contributors != ["t_bet"]:
+        raise ValueError(
+            "Trip close horizon (v1): contributes_to_trip_close_horizon must be true only for "
+            f"t_bet and false for all other registry tables; got true on {contributors!r}"
+        )
+
+
 def validate_registry(
     registry_path: Path,
     dictionary_path: Path,
@@ -274,6 +293,8 @@ def validate_registry(
         if not isinstance(name, str) or not name.startswith("t_"):
             raise ValueError(f"Invalid table key: {name!r} (expected t_*)")
         _validate_table_entry(name, spec)
+
+    _validate_trip_close_horizon_policy(tables)
 
     if check_dictionary_columns:
         dict_cols = _parse_dictionary_columns(dictionary_path)

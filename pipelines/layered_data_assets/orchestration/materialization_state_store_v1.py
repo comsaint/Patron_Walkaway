@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from pipelines.layered_data_assets.io.l0_fingerprint import sha256_file
+
 MATERIALIZATION_DEFINITION_VERSION = "layered_data_assets_v1"
 MATERIALIZATION_TRANSFORM_VERSION = "v1"
 
@@ -45,10 +47,18 @@ def _read_text_fingerprint(fp: Path | None) -> str | None:
     return fp.read_text(encoding="utf-8")
 
 
-def _stat_triple(path: Path) -> list[Any]:
-    """Return ``[posix_path, size, mtime_ns]`` for ``path`` (must exist)."""
-    st = path.stat()
-    return [path.resolve().as_posix(), int(st.st_size), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))]
+def _file_content_sha256_uri(path: Path) -> str:
+    """Return ``sha256:<hex>`` for full file contents (streaming ``sha256_file``)."""
+    return f"sha256:{sha256_file(path.resolve())}"
+
+
+def _normalized_preprocess_paths(paths: list[Path]) -> list[Path]:
+    """Deduplicate by resolved path and sort for stable ``input_hash``."""
+    uniq: dict[str, Path] = {}
+    for p in paths:
+        rp = p.resolve()
+        uniq[rp.as_posix()] = rp
+    return sorted(uniq.values(), key=lambda x: x.as_posix())
 
 
 def hash_preprocess_inputs(
@@ -61,32 +71,46 @@ def hash_preprocess_inputs(
     ingestion_fix_registry_path: Path | None = None,
     ingestion_fix_registry_version_expected: str | None = None,
 ) -> str:
-    """Build input_hash for preprocess (L0 parts or bet-parquet)."""
+    """Build content-based ``input_hash`` for preprocess (L0 parts or bet-parquet).
+
+    Each input file contributes a ``sha256:<hex>`` over full file bytes (streaming reads via
+    :func:`sha256_file`). Large Parquet inputs therefore cost one sequential pass per path per
+    hash computation; prefer smaller day partitions over scanning multi-GB monoliths when possible.
+    """
     if not preprocess_input_paths:
         raise ValueError("preprocess_input_paths must be non-empty")
-    stats = [_stat_triple(p) for p in preprocess_input_paths]
     fp_raw = _read_text_fingerprint(fingerprint_path)
+    rows: list[dict[str, str]] = []
+    for p in _normalized_preprocess_paths(preprocess_input_paths):
+        if not p.is_file():
+            raise FileNotFoundError(f"preprocess input not found: {p}")
+        rows.append(
+            {
+                "path": p.resolve().as_posix(),
+                "content_sha256": _file_content_sha256_uri(p),
+            }
+        )
     payload: dict[str, Any] = {
         "artifact": ARTIFACT_PREPROCESS_BET,
         "definition_version": MATERIALIZATION_DEFINITION_VERSION,
         "transform_version": MATERIALIZATION_TRANSFORM_VERSION,
         "gaming_day": gaming_day.strip(),
         "source_snapshot_id": source_snapshot_id.strip(),
-        "preprocess_inputs_stats": stats,
+        "preprocess_inputs": rows,
         "fingerprint_json_raw": fp_raw,
     }
     if ingestion_fix_registry_path is not None:
         rp = ingestion_fix_registry_path.resolve()
         if not rp.is_file():
             raise FileNotFoundError(f"ingestion_fix_registry_path not found: {rp}")
-        payload["ingestion_fix_registry_stats"] = _stat_triple(rp)
+        payload["ingestion_fix_registry_sha256"] = _file_content_sha256_uri(rp)
     if ingestion_fix_registry_version_expected is not None:
         payload["ingestion_fix_registry_version_expected"] = str(ingestion_fix_registry_version_expected).strip()
     if eligible_player_ids_parquet is not None:
         ep = eligible_player_ids_parquet.resolve()
         if not ep.is_file():
             raise FileNotFoundError(f"eligible_player_ids_parquet not found: {ep}")
-        payload["eligible_player_ids_stats"] = _stat_triple(ep)
+        payload["eligible_player_ids_sha256"] = _file_content_sha256_uri(ep)
     return compute_input_hash(payload)
 
 
@@ -98,12 +122,13 @@ def hash_run_materialize_inputs(
     cleaned_parquet: Path,
     fingerprint_path: Path | None,
 ) -> str:
-    """Build input_hash for ``run_fact`` / ``run_bet_map`` / ``run_day_bridge``."""
+    """Build content-based ``input_hash`` for ``run_fact`` / ``run_bet_map`` / ``run_day_bridge``."""
     if artifact_kind not in (ARTIFACT_RUN_FACT, ARTIFACT_RUN_BET_MAP, ARTIFACT_RUN_DAY_BRIDGE):
         raise ValueError(f"unexpected artifact_kind for run materialize: {artifact_kind!r}")
     if not cleaned_parquet.is_file():
         raise FileNotFoundError(f"cleaned parquet not found: {cleaned_parquet}")
     fp_raw = _read_text_fingerprint(fingerprint_path)
+    cleaned_uri = _file_content_sha256_uri(cleaned_parquet)
     return compute_input_hash(
         {
             "artifact": artifact_kind,
@@ -111,7 +136,7 @@ def hash_run_materialize_inputs(
             "transform_version": MATERIALIZATION_TRANSFORM_VERSION,
             "gaming_day": gaming_day.strip(),
             "source_snapshot_id": source_snapshot_id.strip(),
-            "cleaned_parquet_stats": _stat_triple(cleaned_parquet),
+            "cleaned_parquet_sha256": cleaned_uri,
             "fingerprint_json_raw": fp_raw,
         }
     )

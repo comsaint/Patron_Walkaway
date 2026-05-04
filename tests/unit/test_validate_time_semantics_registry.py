@@ -25,6 +25,27 @@ def test_validate_time_semantics_registry_exits_zero() -> None:
     assert proc.returncode == 0, proc.stderr
 
 
+def test_validate_time_semantics_registry_rejects_second_horizon_contributor(
+    tmp_path: Path,
+) -> None:
+    """v1 policy: only t_bet may have contributes_to_trip_close_horizon true."""
+    text = _REGISTRY.read_text(encoding="utf-8")
+    injected = text.replace(
+        '    contributes_to_trip_close_horizon: false\n'
+        '    notes:\n'
+        '      - "Not the primary event source for run/trip v1 boundaries."',
+        '    contributes_to_trip_close_horizon: true\n'
+        '    notes:\n'
+        '      - "Not the primary event source for run/trip v1 boundaries."',
+        1,
+    )
+    bad = tmp_path / "bad_horizon_registry.yaml"
+    bad.write_text(injected, encoding="utf-8")
+    proc = _run_validator("--registry", str(bad))
+    assert proc.returncode == 1
+    assert "Trip close horizon" in proc.stderr
+
+
 def test_validate_time_semantics_registry_rejects_unknown_column(
     tmp_path: Path,
 ) -> None:

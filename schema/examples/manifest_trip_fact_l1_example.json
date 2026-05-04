@@ -35,5 +35,11 @@
     "max_event_time": "2026-04-01T08:30:00Z",
     "min_event_time": "2026-04-01T08:00:00Z"
   },
-  "transform_version": "v1"
+  "transform_version": "v1",
+  "gaming_day_start_hour_used": 3,
+  "coverage_end_gaming_day": "2026-03-31",
+  "G_max": "2026-04-01",
+  "coverage_input_tables": [
+    "t_bet"
+  ]
 }
