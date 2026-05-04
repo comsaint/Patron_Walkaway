@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -303,6 +304,8 @@ def test_train_and_select_rated_gbm_family_runs_per_backend_optuna_and_emits_met
         early_stop_patience: int | None = None,
         hpo_sample_rows: int | None = None,
         hpo_objective_manifest: list[dict[str, object]] | None = None,
+        backend_runtime_params: dict[str, Any] | None = None,
+        **_: Any,
     ) -> dict:
         seen_backends.append(backend)
         payload = {

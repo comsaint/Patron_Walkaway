@@ -250,6 +250,7 @@ python scripts/gate1_l1_determinism_v1.py --artifact run_fact \
 - **關閉磁碟路徑**：環境變數 `GBM_BAKEOFF_FROM_FILE=0`，或 CLI `--no-gbm-bakeoff-from-file`（於 `run_pipeline` 內覆寫 `_cfg`）。
 - **XGBoost external memory**（可選，預設關）：`GBM_BAKEOFF_XGBOOST_EXTERNAL_MEMORY=1` 或 `--gbm-bakeoff-xgboost-external-memory`；**不建議**在 `device=cuda` 時開啟。
 - **CatBoost quantize**（可選）：`GBM_BAKEOFF_CATBOOST_QUANTIZE=1` 或 `--gbm-bakeoff-catboost-quantize`。
+- **Windows 與 A3 平行後端**：在 **win32** 上 A3 會強制 **序列**訓練 CatBoost／XGBoost（避免 `ThreadPoolExecutor` 上跑原生庫觸發程序異常結束，例如 `0xC0000409`）；Linux 上若偵測到多 GPU 仍可平行。
 - **CatBoost 與匯出索引**：匯出 LibSVM 為 **0-based**（LightGBM）；CatBoost 讀檔需 **1-based**，訓練時會在快取目錄內 stream 產生 `*_cb_idx1.libsvm` 並以 **`Pool.set_weight`** 套用 train 的 float32 memmap 權重（不可在 `Pool(..., weight=)` 與檔案 URI 並用）。
 - **快取目錄**：`data/export/.gbm_bakeoff_cache/<md5 前綴>/`，內含 XGBoost external-memory 之 cache 檔，以及上述 CatBoost 1-based 轉檔；若懷疑汙染可刪除該子目錄後重跑。
 
