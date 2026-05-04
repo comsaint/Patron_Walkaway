@@ -68,6 +68,7 @@ import traceback
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 from .repo_root import discover_repo_root
 
@@ -581,6 +582,54 @@ def _assert_eligible_session_row_budget(count: int, *, max_rows: int) -> None:
         )
 
 
+def _count_session_rows_after_cutoff_for_identity_session(
+    session_parquet: Path,
+    cutoff_dtm: datetime,
+    *,
+    memory_limit_mb: int | None = None,
+    threads: int = 1,
+) -> int:
+    """Count ``t_session`` rows under the same cutoff filter used for identity session scans.
+
+    Uses the same cutoff predicate as :func:`_build_rated_eligible_player_ids_parquet` (cheap
+    ``COUNT(*)``; no wide ``fetchdf``). Intended as a fail-fast guard before
+    ``build_canonical_links_and_dummy_from_duckdb`` loads links into pandas.
+    """
+    import duckdb
+
+    src = session_parquet.resolve()
+    cutoff_sql = cutoff_dtm.isoformat(sep=" ")
+    count_sql = (
+        "SELECT COUNT(*) AS n FROM read_parquet(?) "
+        "WHERE COALESCE(TRY_CAST(session_end_dtm AS TIMESTAMP), TRY_CAST(lud_dtm AS TIMESTAMP)) "
+        "<= TRY_CAST(? AS TIMESTAMP)"
+    )
+    con = duckdb.connect()
+    try:
+        apply_duckdb_resource_pragmas(
+            con,
+            memory_limit_mb=memory_limit_mb,
+            threads=int(threads),
+        )
+        row = con.execute(count_sql, [str(src), cutoff_sql]).fetchone()
+        return int(row[0]) if row is not None else 0
+    finally:
+        con.close()
+
+
+def _eligible_build_options_from_args(args: argparse.Namespace) -> dict[str, object]:
+    """Map orchestrator CLI flags into kwargs for session-heavy eligible / mapping build paths."""
+    fc = getattr(args, "eligible_build_failure_context", None)
+    rl = getattr(args, "eligible_build_run_log", None)
+    return {
+        "max_session_rows": int(getattr(args, "eligible_build_max_session_rows", 5_000_000)),
+        "duckdb_memory_limit_mb": getattr(args, "eligible_build_duckdb_memory_limit_mb", None),
+        "duckdb_threads": int(getattr(args, "eligible_build_duckdb_threads", 1)),
+        "failure_context_path": Path(fc).resolve() if fc is not None else None,
+        "run_log_path": Path(rl).resolve() if rl is not None else None,
+    }
+
+
 def _parse_cutoff_dtm(raw_value: str) -> datetime:
     """Parse ``--cutoff-dtm`` into a :class:`datetime` (ISO-8601; accepts trailing ``Z``)."""
     text = str(raw_value).strip()
@@ -662,7 +711,6 @@ def _build_rated_eligible_player_ids_parquet(
         "WHERE COALESCE(TRY_CAST(session_end_dtm AS TIMESTAMP), TRY_CAST(lud_dtm AS TIMESTAMP)) "
         "<= TRY_CAST(? AS TIMESTAMP)"
     )
-    count_sql = f"SELECT COUNT(*) AS n {filter_tail}"
     select_sql = f"SELECT {cols_sql} {filter_tail}"
     params = [str(src), cutoff_sql]
 
@@ -675,6 +723,26 @@ def _build_rated_eligible_player_ids_parquet(
 
     t0 = time.monotonic()
     try:
+        filtered_count: int | None = None
+        if int(max_session_rows) > 0:
+            filtered_count = _count_session_rows_after_cutoff_for_identity_session(
+                src,
+                cutoff_dtm,
+                memory_limit_mb=duckdb_memory_limit_mb,
+                threads=int(duckdb_threads),
+            )
+            _assert_eligible_session_row_budget(filtered_count, max_rows=int(max_session_rows))
+            if run_log_path is not None:
+                append_jsonl_record(
+                    Path(run_log_path),
+                    {
+                        "event": "eligible_build_count",
+                        "filtered_session_rows": filtered_count,
+                        "max_session_rows": int(max_session_rows),
+                        "elapsed_sec": round(time.monotonic() - t0, 3),
+                        "source": str(src),
+                    },
+                )
         con = duckdb.connect()
         try:
             apply_duckdb_resource_pragmas(
@@ -682,22 +750,6 @@ def _build_rated_eligible_player_ids_parquet(
                 memory_limit_mb=duckdb_memory_limit_mb,
                 threads=int(duckdb_threads),
             )
-            filtered_count: int | None = None
-            if int(max_session_rows) > 0:
-                row = con.execute(count_sql, params).fetchone()
-                filtered_count = int(row[0]) if row is not None else 0
-                _assert_eligible_session_row_budget(filtered_count, max_rows=int(max_session_rows))
-                if run_log_path is not None:
-                    append_jsonl_record(
-                        Path(run_log_path),
-                        {
-                            "event": "eligible_build_count",
-                            "filtered_session_rows": filtered_count,
-                            "max_session_rows": int(max_session_rows),
-                            "elapsed_sec": round(time.monotonic() - t0, 3),
-                            "source": str(src),
-                        },
-                    )
             sessions_df = con.execute(select_sql, params).fetchdf()
         finally:
             con.close()
@@ -811,9 +863,19 @@ def _build_canonical_mapping_parquet_via_trainer(
     cutoff_dtm: datetime,
     canonical_mapping_parquet: Path,
     sidecar_json: Path,
+    data_root: Path,
     emit_stderr: Callable[[str], None] | None = None,
+    max_session_rows: int = 5_000_000,
+    duckdb_memory_limit_mb: int | None = None,
+    duckdb_threads: int = 1,
+    failure_context_path: Path | None = None,
+    run_log_path: Path | None = None,
 ) -> Path:
-    """Build canonical mapping with trainer logic and persist mapping + cutoff sidecar."""
+    """Build canonical mapping with trainer logic and persist mapping + cutoff sidecar.
+
+    Applies the same cutoff row-budget pre-check as rated-eligible auto-build (E1-16) before
+    ``build_canonical_links_and_dummy_from_duckdb`` materializes links in pandas.
+    """
     from trainer.identity import build_canonical_mapping_from_links
     from trainer.training.trainer import build_canonical_links_and_dummy_from_duckdb
 
@@ -824,21 +886,78 @@ def _build_canonical_mapping_parquet_via_trainer(
     out.parent.mkdir(parents=True, exist_ok=True)
     side = sidecar_json.resolve()
     side.parent.mkdir(parents=True, exist_ok=True)
+    fail_default = (data_root / "tmp_lda_gate1_day_range" / "eligible").resolve() / (
+        "last_canonical_mapping_build_failure.json"
+    )
+    fail_default.parent.mkdir(parents=True, exist_ok=True)
+    diag_base: dict[str, object] = {
+        "phase": "canonical_mapping_via_trainer",
+        "raw_t_session_parquet": str(src),
+        "canonical_mapping_parquet": str(out),
+        "cutoff_dtm": cutoff_dtm.isoformat(),
+        "max_session_rows": int(max_session_rows),
+        "duckdb_memory_limit_mb": duckdb_memory_limit_mb,
+        "duckdb_threads": int(duckdb_threads),
+    }
     _stderr_line(
         f"[LDA] canonical mapping missing; build via trainer from {src.name} (cutoff={cutoff_dtm.isoformat()})",
         emit=emit_stderr,
     )
     t0 = time.monotonic()
-    links_df, dummy_pids = build_canonical_links_and_dummy_from_duckdb(src, cutoff_dtm)
-    mapping_df = build_canonical_mapping_from_links(links_df, dummy_pids)
-    mapping_df.to_parquet(out, index=False)
-    with open(side, "w", encoding="utf-8") as f:
-        json.dump({"cutoff_dtm": cutoff_dtm.isoformat(), "dummy_player_ids": list(dummy_pids)}, f, indent=0)
-    _stderr_line(
-        f"[LDA] canonical mapping wrote {len(mapping_df):,} row(s) -> {out} ({time.monotonic() - t0:.1f}s)",
-        emit=emit_stderr,
-    )
-    return out
+    filtered_count: int | None = None
+    try:
+        if int(max_session_rows) > 0:
+            filtered_count = _count_session_rows_after_cutoff_for_identity_session(
+                src,
+                cutoff_dtm,
+                memory_limit_mb=duckdb_memory_limit_mb,
+                threads=int(duckdb_threads),
+            )
+            _assert_eligible_session_row_budget(filtered_count, max_rows=int(max_session_rows))
+            if run_log_path is not None:
+                append_jsonl_record(
+                    Path(run_log_path),
+                    {
+                        "event": "canonical_mapping_precount",
+                        "filtered_session_rows": filtered_count,
+                        "max_session_rows": int(max_session_rows),
+                        "elapsed_sec": round(time.monotonic() - t0, 3),
+                        "source": str(src),
+                    },
+                )
+        links_df, dummy_pids = build_canonical_links_and_dummy_from_duckdb(src, cutoff_dtm)
+        mapping_df = build_canonical_mapping_from_links(links_df, dummy_pids)
+        mapping_df.to_parquet(out, index=False)
+        with open(side, "w", encoding="utf-8") as f:
+            json.dump({"cutoff_dtm": cutoff_dtm.isoformat(), "dummy_player_ids": list(dummy_pids)}, f, indent=0)
+        dt = time.monotonic() - t0
+        _stderr_line(
+            f"[LDA] canonical mapping wrote {len(mapping_df):,} row(s) -> {out} ({dt:.1f}s)",
+            emit=emit_stderr,
+        )
+        if run_log_path is not None:
+            append_jsonl_record(
+                Path(run_log_path),
+                {
+                    "event": "canonical_mapping_build_done",
+                    "mapping_rows": int(len(mapping_df)),
+                    "filtered_session_rows": filtered_count,
+                    "elapsed_sec": round(dt, 3),
+                    "output_parquet": str(out),
+                },
+            )
+        return out
+    except Exception as exc:
+        ctx = (failure_context_path or fail_default).resolve()
+        payload = {
+            **diag_base,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "traceback": traceback.format_exc(),
+        }
+        write_failure_context(ctx, payload)
+        _stderr_line(f"[LDA] canonical mapping build failure context -> {ctx}", emit=emit_stderr)
+        raise
 
 
 def _resolve_eligible_player_ids_parquet(
@@ -868,6 +987,7 @@ def _resolve_eligible_player_ids_parquet(
     cutoff = _parse_cutoff_dtm(str(cutoff_raw)) if has_cutoff else None
     raw_sess = getattr(args, "raw_t_session_parquet", None)
     has_sess = raw_sess is not None
+    eb = _eligible_build_options_from_args(args)
 
     cm = getattr(args, "canonical_mapping_parquet", None)
     if cm is not None:
@@ -886,7 +1006,13 @@ def _resolve_eligible_player_ids_parquet(
                 cutoff_dtm=cutoff,
                 canonical_mapping_parquet=cm_p,
                 sidecar_json=(data_root / _DEFAULT_CANONICAL_MAPPING_CUTOFF_JSON),
+                data_root=data_root,
                 emit_stderr=emit_stderr,
+                max_session_rows=int(eb["max_session_rows"]),
+                duckdb_memory_limit_mb=cast(int | None, eb["duckdb_memory_limit_mb"]),
+                duckdb_threads=int(eb["duckdb_threads"]),
+                failure_context_path=cast(Path | None, eb["failure_context_path"]),
+                run_log_path=cast(Path | None, eb["run_log_path"]),
             )
         if dry_run:
             _stderr_line(
@@ -919,7 +1045,13 @@ def _resolve_eligible_player_ids_parquet(
             cutoff_dtm=cutoff,
             canonical_mapping_parquet=default_cm,
             sidecar_json=(data_root / _DEFAULT_CANONICAL_MAPPING_CUTOFF_JSON),
+            data_root=data_root,
             emit_stderr=emit_stderr,
+            max_session_rows=int(eb["max_session_rows"]),
+            duckdb_memory_limit_mb=cast(int | None, eb["duckdb_memory_limit_mb"]),
+            duckdb_threads=int(eb["duckdb_threads"]),
+            failure_context_path=cast(Path | None, eb["failure_context_path"]),
+            run_log_path=cast(Path | None, eb["run_log_path"]),
         )
     return _materialize_eligible_from_canonical_mapping_parquet(
         canonical_mapping_parquet=default_cm,

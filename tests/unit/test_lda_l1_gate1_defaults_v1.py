@@ -403,8 +403,29 @@ def test_resolve_eligible_builds_missing_canonical_via_trainer(
     expected_elig = tmp_path / "eligible.parquet"
     calls: dict[str, object] = {}
 
-    def _fake_build(*, raw_t_session_parquet: Path, cutoff_dtm, canonical_mapping_parquet: Path, sidecar_json: Path, emit_stderr=None) -> Path:
-        calls["build"] = (raw_t_session_parquet, cutoff_dtm, canonical_mapping_parquet, sidecar_json)
+    def _fake_build(
+        *,
+        raw_t_session_parquet: Path,
+        cutoff_dtm,
+        canonical_mapping_parquet: Path,
+        sidecar_json: Path,
+        data_root: Path,
+        emit_stderr=None,
+        max_session_rows: int = 5_000_000,
+        duckdb_memory_limit_mb: int | None = None,
+        duckdb_threads: int = 1,
+        failure_context_path: Path | None = None,
+        run_log_path: Path | None = None,
+    ) -> Path:
+        calls["build"] = (
+            raw_t_session_parquet,
+            cutoff_dtm,
+            canonical_mapping_parquet,
+            sidecar_json,
+            data_root,
+            max_session_rows,
+            duckdb_threads,
+        )
         pd.DataFrame({"player_id": [1], "canonical_id": ["x"]}).to_parquet(canonical_mapping_parquet, index=False)
         return canonical_mapping_parquet
 
