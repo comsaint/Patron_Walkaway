@@ -27,6 +27,7 @@
 | **TRN-12** | `trainer.py`<br>L509–512 | 🔵 P2 | — | **`train_and_select_model` 實際上沒有多模型比較**：`default_lgb_grid` 中第二組參數被完整註解掉，Grid search 只跑一組 LightGBM 超參數，函式名稱與實際行為不符。 | 不影響模型功能，但誤導後人以為此函式做了模型選擇，實際上是直接訓練唯一一組參數。 | 恢復 Grid 中的多組參數，或將函式更名為 `train_model` 以如實反映其行為。 |
 | **TRN-13** | `trainer.py`<br>L89–92 | 🔵 P2 | — | **模組 Docstring 位置錯誤**：檔案開頭說明字串被放在 `save_rolling_cache()` 函式定義之後、`load_clickhouse_data()` 之前，在 Python 中不構成模組 docstring，僅為一個被直譯器忽略的字串表達式。 | 不影響功能，但 `trainer.__doc__` 為 None，IDE 工具提示無法顯示模組說明。 | 將 docstring 移至檔案第一行（所有 import 之前）。 |
 | **TRN-14** | `trainer.py`<br>L649–658 | 🟡 P1 | — | **`main()` 中 `start`/`end` 變數語義依路徑而不一致**：使用 ClickHouse 路徑時，`start`/`end` 為 `parse_window()` 回傳的 tz-aware datetime；使用本機 CSV 路徑時，`start`/`end` 被賦值為 pandas Timestamp（可能 tz-naive）。若同時走本機資料 + Feature Cache 路徑，bets/sessions 資料被載入後完全未被使用，造成不必要的記憶體消耗。 | tz-aware/naive 不一致可能在比較或序列化時拋出例外，且資料載入後被靜默丟棄是潛在的效能浪費與邏輯混淆。 | 統一 `start`/`end` 的時區處理（一律 tz-aware 或 tz-naive）；若走 Feature Cache 路徑則跳過 bets/sessions 的資料庫查詢。 |
+| **TRN-15** | `trainer/training/gbm_bakeoff.py`<br>A3 後端 `ThreadPoolExecutor` 區塊；`trainer.py` `resolve_gbm_backend_runtime_plan()` | 🔴 P0 | — | **Windows 上 A3 在 `ThreadPoolExecutor` worker thread 跑 CatBoost／XGBoost 導致程序原生崩潰**：`resolve_gbm_backend_runtime_plan()` 在多 GPU 時給 `parallel_backend_workers>1`；僅啟用單一選用後端時 `backend_jobs` 仍只有一筆，卻仍用 thread pool，使 XGBoost 等在**非主執行緒**上訓練。雙後端全開時兩個 thread 同時跑兩套原生庫，在 **win32** 上同樣觸發 **`STATUS_STACK_BUFFER_OVERRUN`（`0xC0000409`，子程序 exit code 常見為 3221226505）**。Git Bash 下外層 `$?` 有時顯示 **127**，易誤判為 shell/pytest 問題。 | A3 bakeoff 或單元測試在 Windows + 多 GPU／只開 XGB 等組合下**無預警程序結束**，訓練無法跑完；production 筆電亦同。 | （已實作）`parallel_workers = min(parallel_workers, len(backend_jobs))`，避免單後端仍進 pool；`sys.platform == "win32"` 時強制 `parallel_workers = 1` 序列訓練。Linux 多 GPU 仍可比平行。見 `pipelines/layered_data_assets/docs/RUNBOOK.md` §10。 |
 
 ---
 
@@ -50,8 +51,9 @@
 | **TRN-12** | ✅ 已修復（N/A） | Phase 1 已移除 `train_and_select_model` / grid；改為 `train_dual_model` + `run_optuna_search`（Optuna TPE 超參搜尋）。 |
 | **TRN-13** | ✅ 已修復 | 模組 docstring 已置於檔案第一行（`"""trainer/trainer.py — Phase 1 Refactor..."""`）。 |
 | **TRN-14** | ✅ 已修復 | 僅剩 `parse_window(args)` → `run_pipeline(args)`；無本機 CSV 路徑改寫 `start`/`end`，時區由 `parse_window` 統一。 |
+| **TRN-15** | ✅ 已修復 | `gbm_bakeoff.py`：`min(parallel_workers, len(backend_jobs))` + win32 強制序列；`tests/unit/test_gbm_bakeoff.py` 的 Optuna mock 補上 `backend_runtime_params`／`**_`** 與呼叫端一致。`python -m pytest tests/unit/test_gbm_bakeoff.py` 於 Windows 可全綠。 |
 
-**結論**：總表 14 項中，13 項已修復、1 項（TRN-11）為部分緩解（backtester 已用 F-beta；trainer 內閾值仍以 precision 為主，可選改為 F-beta 或沿用 backtester 閾值）。
+**結論**：總表 15 項中，14 項已修復、1 項（TRN-11）為部分緩解（backtester 已用 F-beta；trainer 內閾值仍以 precision 為主，可選改為 F-beta 或沿用 backtester 閾值）。
 
 ---
 
@@ -221,4 +223,47 @@ GROUP BY 1
 ORDER BY cnt DESC
 LIMIT 20
 """)
+```
+
+### [TRN-15] Windows：確認 A3 是否因 thread pool 以非 0 結束（已修復後可作迴歸檢查）
+
+```python
+import subprocess
+import sys
+
+code = r"""
+import os
+os.environ["GBM_BAKEOFF_ENABLE_CATBOOST"] = "0"
+os.environ["GBM_BAKEOFF_ENABLE_XGBOOST"] = "1"
+import numpy as np
+import pandas as pd
+from tests.unit.test_gbm_bakeoff import _synth_split, _lightgbm_artifact
+from trainer.training.gbm_bakeoff import train_and_select_rated_gbm_family
+
+X_tr, y_tr, X_vl, y_vl, sw, hp = _synth_split(seed=9)
+art = _lightgbm_artifact(X_tr, y_tr, X_vl, y_vl, sw, hp)
+train_and_select_rated_gbm_family(
+    X_tr, y_tr, X_vl, y_vl, sw, hp,
+    lightgbm_artifact=art,
+    run_optuna=False,
+    X_test=X_vl,
+    y_test=y_vl,
+    val_dec026_window_hours=72.0,
+    val_dec026_min_alerts_per_hour=50.0,
+    rated_train_df=pd.DataFrame(
+        {
+            "payout_complete_dtm": pd.date_range(
+                "2026-01-05", periods=len(X_tr), freq="h"
+            ),
+            "label": y_tr.to_numpy(),
+        },
+        index=X_tr.index,
+    ),
+)
+print("ok")
+"""
+p = subprocess.run([sys.executable, "-c", code], cwd=".")
+# 修復前：win32 上常見 p.returncode == 3221226505（0xC0000409）
+# 修復後：應為 0
+assert p.returncode == 0, p.returncode
 ```
