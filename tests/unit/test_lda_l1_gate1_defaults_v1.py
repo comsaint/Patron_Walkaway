@@ -279,6 +279,19 @@ def test_validate_mode_raw_with_canonical_mapping_only_ok(tmp_path: Path) -> Non
     assert lda_mod._validate_mode(args) is None
 
 
+def test_validate_mode_missing_canonical_ok_when_session_and_cutoff(tmp_path: Path) -> None:
+    """E1-14: explicit canonical path may be absent on disk if trainer can rebuild from session+cutoff."""
+    missing_cm = tmp_path / "will_be_built_canonical.parquet"
+    assert not missing_cm.is_file()
+    args = _args_for_validate(
+        raw_t_bet_parquet=Path("bet.parquet"),
+        raw_t_session_parquet=tmp_path / "session.parquet",
+        cutoff_dtm="2026-01-31T23:59:59+08:00",
+        canonical_mapping_parquet=missing_cm,
+    )
+    assert lda_mod._validate_mode(args) is None
+
+
 def test_validate_mode_bet_with_session_requires_cutoff_or_allowlist(tmp_path: Path) -> None:
     bet = tmp_path / "t_bet.parquet"
     sess = tmp_path / "t_session.parquet"

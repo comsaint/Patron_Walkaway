@@ -1622,9 +1622,13 @@ def _validate_mode(args: argparse.Namespace) -> int | None:
     ):
         cm = Path(args.canonical_mapping_parquet).resolve()
         if not cm.is_file():
-            raw_sess = getattr(args, "raw_t_session_parquet", None)
-            has_cut = bool(getattr(args, "cutoff_dtm", None) and str(args.cutoff_dtm).strip())
-            if raw_sess is None or not has_cut:
+            # Match ``_resolve_eligible_player_ids_parquet``: missing on-disk mapping may be
+            # materialized only when both session export and cutoff are present.
+            has_raw_session = getattr(args, "raw_t_session_parquet", None) is not None
+            cutoff_raw = getattr(args, "cutoff_dtm", None)
+            has_cutoff = bool(cutoff_raw is not None and str(cutoff_raw).strip())
+            can_build_missing_canonical = has_raw_session and has_cutoff
+            if not can_build_missing_canonical:
                 print(f"--canonical-mapping-parquet not found: {cm}", file=sys.stderr)
                 return 2
     if args.raw_t_bet_parquet is not None:
@@ -1710,6 +1714,19 @@ def main(argv: list[str] | None = None) -> int:
         )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
+        return 2
+
+    if (
+        getattr(args, "raw_t_bet_parquet", None) is not None
+        and not bool(args.dry_run)
+        and eligible_player_ids_parquet is None
+    ):
+        print(
+            "[LDA] BET-DQ-03 fail-closed: raw mode requires a rated eligible parquet after resolve. "
+            "Use --raw-t-session-parquet with --cutoff-dtm, or --canonical-mapping-parquet, or "
+            "--eligible-player-ids-parquet (see RUNBOOK path B).",
+            file=sys.stderr,
+        )
         return 2
 
     _print_run_banner(
