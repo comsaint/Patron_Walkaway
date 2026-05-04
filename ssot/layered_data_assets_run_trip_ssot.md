@@ -9,7 +9,7 @@
 > **v1.4 變更摘要**：run 定義加入 **gaming day 硬切規則**：除 30 分鐘 gap 外，當事件序跨越 `GAMING_DAY_START_HOUR`（目前專案設定 03:00，Asia/Hong_Kong）亦強制開新 run；同步修訂 §3.1、§4.2、§5.2 與決策紀錄。  
 > **v1.5 變更摘要**：§4.4 新增 **邏輯可觀測時間之「殘差 P95 cap」**（`ingest_delay_cap_sec`）：在已文件化之整批入倉／回填時窗排除後，對 `(observed_at_raw - event_time)` 取 **P95** 作為該表 cap 常數；凡延遲超過 cap 之列，**邏輯** `observed_at` 取 `event_time + cap`（**不得**改寫 L0 raw）；`t_bet` 定值 **122 秒**（見 `schema/preprocess_bet_ingestion_fix_registry.yaml` 與決策 **LDA-014**）。  
 > **v1.6 變更摘要**：Trip v1 契約補強：`trip_fact` 分區鍵語意固定為 **`trip_start_gaming_day`**；`trip_fact` 必須同時輸出**已關閉**與**進行中** trip（`trip_end_*` 可為 null）；`trip_id` hash 納入 `source_snapshot_id` 與 `first_run_id` 且不受 `trip_end_*` 補值影響；trip close 在不引入外部日曆表前提下，允許僅由 `run_fact` 之有 run 日與缺口推導（缺資料日視為完整一日）；`trip_fact` manifest 需列舉本批次觸及之 `run_end_gaming_day` 分區。  
-> **v1.7 變更摘要**：補充離線增量路線之**初版可操作治理參數**（不變更 §5.3「影響驅動」原則）：`cleaned`（L0.5）每分區保留最近 **7** 個成功版本以利根因分離與回滾；當 `impact_day_ratio` 或 `changed_player_ratio` **≥ 10%** 時允許升級 **full recompute** 備援（分母與作業定義見 `implementation plan/layered_data_assets_run_trip_implementation_plan.md` v0.9 §2.2.1）；上線後以監控調整。見決策 **LDA-016**。  
+> **v1.7 變更摘要**：補充離線增量路線之**初版可操作治理參數**（不變更 §5.3「影響驅動」原則）：`cleaned`（L0.5）每分區保留最近 **7** 個成功版本以利根因分離與回滾；當 `impact_day_ratio` 或 `changed_player_ratio` **≥ 10%** 時允許升級 **full recompute** 備援（分母與作業定義見 `implementation plan/layered_data_assets_run_trip_implementation_plan.md` v0.10 §2.2.1）；上線後以監控調整。見決策 **LDA-016**。  
 > **v1.8 變更摘要**：於 **§4.1.1** 正式定義 **L0.5（`cleaned`）** 為 L0 與 L1 之間之**語義層**；明定 L1 物化**必須**以 L0.5 為唯一 bet 輸入，並與 §4.4、**LDA-016** 對齊。  
 > **v1.9 變更摘要**：在 **§4.1.1** 增補 **L0.5 多實體擴充預留**：目前落地為 `cleaned_bet`，未來可擴為 `cleaned_<entity>`（如 player / table_config / game）；明定各實體可採不同分區鍵與重算策略，但上線前必須先補齊最小契約欄位，且 L1 不得直讀 raw。  
 > **玩家鍵（v1）**：**僅使用 `player_id`**（Smart Table 桌台辨識 ID）作為本資產層之玩家主鍵；**本文件不採用 `canonical_id`** 作為設計依據。
@@ -108,7 +108,7 @@
 - **Preprocessing 前置契約（MUST）**：preprocess 至少處理 `player_id` 有效性、placeholder/dummy ID 排除、duplicated `bet_id` / 多版本列去重、canceled/deleted/manual 等 DQ 規則；**BET-DQ-03 rated allowlist** 在編排路徑為 fail-closed（見 implementation plan 與既有編排契約）。具體規則與 rule id 由 implementation plan 與 `schema/time_semantics_registry.yaml` 的 `dedup_rule_id` / `preprocessing_contract` 對齊。
 - **Lineage 與可審計（MUST）**：每一 L0.5 分區必須可機器讀取 lineage（至少 `manifest.json` + 語義簽章／`input_hash` 契約，欄位細節見 implementation plan §2.3 / §2.4），並納入 **影響驅動**之重算判定（§5.3）；**不得**僅因「排程日曆到點」而無條件重算未變更分區。
 - **與 §4.4 之一致性（MUST）**：L0 raw 之 `__etl_insert_Dtm`（或 registry 所指 `observed_at_col`）**不得**被覆寫；`observed_at_logical` 等衍生欄僅允許出現在 **preprocess／L0.5 衍生輸出**，並須在 manifest 或 registry **註冊欄位名與 cap**（對齊 **LDA-014**）。
-- **有限歷史與回滾（SHOULD）**：允許保留有限個歷史成功版本以支援根因分離與最小回滾；**初版可操作數值**見 **LDA-016** 與 implementation plan v0.9。
+- **有限歷史與回滾（SHOULD）**：允許保留有限個歷史成功版本以支援根因分離與最小回滾；**初版可操作數值**見 **LDA-016** 與 implementation plan v0.10。
 
 **多實體擴充預留（MUST；future-proof）**
 
@@ -332,7 +332,7 @@ Serving 或線上消費本資產時，**不得假設**可對全歷史做無界�
 | **Time-to-ready (p95)** | 從「提出資料/特徵需求」到「可用快照就緒」之 p95 延遲。 |
 | **Ingestion observability coverage** | 每一 published L1/L2 批次是否皆附帶 §4.4 / §8 所要求之 **`ingestion_delay` 摘要**（供監控與事後根因分析）；缺失率應趨近零。 |
 
-**可接受標準（v1 敘述性）**：相較「每次全量重算同等邏輯」之基線，上述效率類指標在穩定運行後應可量化改善；**Ingestion observability coverage** 之缺失率應趨近零。具體數字門檻由 implementation plan 或營運 OKR 另定；**離線增量**之 full recompute 備援與 `cleaned` 歷史版數之初版數值見 **LDA-016** 與 implementation plan v0.9。
+**可接受標準（v1 敘述性）**：相較「每次全量重算同等邏輯」之基線，上述效率類指標在穩定運行後應可量化改善；**Ingestion observability coverage** 之缺失率應趨近零。具體數字門檻由 implementation plan 或營運 OKR 另定；**離線增量**之 full recompute 備援與 `cleaned` 歷史版數之初版數值見 **LDA-016** 與 implementation plan v0.10。
 
 ---
 
@@ -392,7 +392,7 @@ Serving 或線上消費本資產時，**不得假設**可對全歷史做無界�
 | **LDA-013** | L1/L2 最小統計量由 implementation plan 定，但必須足以重建目前 `package/deploy/models/feature_spec.yaml` 所需全部特徵（§4.2）。 |
 | **LDA-014** | 對納入本資產層之各來源表，採 **殘差 P95 cap** 定義 **`observed_at_logical`**（§4.4）：排除已文件化整批入倉後量測 P95，超過 cap 之列令 `observed_at_logical = event_time + cap`；**L0 raw 不改寫**；`t_bet` 之 **`ingest_delay_cap_sec = 122`** 見 `schema/preprocess_bet_ingestion_fix_registry.yaml`（`BET-INGEST-FIX-004`）。 |
 | **LDA-015** | Trip v1 落地契約：分區鍵採 `trip_start_gaming_day`、`trip_fact` 同時含已關閉與進行中 trip、`trip_id` 納入 `source_snapshot_id` 與 `first_run_id` 且不受 `trip_end_*` 回填影響、trip close 在不引入外部日曆表下可由 `run_fact` 缺口推導，且 `trip_fact` manifest 必須列舉觸及之 `run_end_gaming_day` 分區（§5.1、§6、§8）。 |
-| **LDA-016** | **離線增量初版運作參數（可觀測調整）**：`cleaned`（**L0.5**，§4.1.1）每 `gaming_day` 分區保留最近 **7** 個成功版本；當 `impact_day_ratio` **或** `changed_player_ratio` **≥ 10%** 時，允許將該次作業升級為 **full recompute** 備援（須記錄原因；分母定義見 implementation plan v0.9 §2.2.1）。**不得**與 §5.3「影響驅動、非固定日曆窗口」之原則衝突；數值可於上線後依監控修訂。 |
+| **LDA-016** | **離線增量初版運作參數（可觀測調整）**：`cleaned`（**L0.5**，§4.1.1）每 `gaming_day` 分區保留最近 **7** 個成功版本；當 `impact_day_ratio` **或** `changed_player_ratio` **≥ 10%** 時，允許將該次作業升級為 **full recompute** 備援（須記錄原因；分母定義見 implementation plan v0.10 §2.2.1）。**不得**與 §5.3「影響驅動、非固定日曆窗口」之原則衝突；數值可於上線後依監控修訂。 |
 | **LDA-017** | L0.5 採多實體可擴充治理：現況 `cleaned_bet` 為唯一定義完整之實體；未來可新增 `cleaned_<entity>`，且允許 entity-specific 分區鍵與重算策略；但新實體進 production 前必須先補齊最小契約欄位與 impact/fallback 規則，L1 不得直讀 raw（§4.1.1）。 |
 
 ---
