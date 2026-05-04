@@ -1,7 +1,3 @@
-from __future__ import annotations
-
-from typing import Optional
-
 """Internal training-memory / OOM config shard.
 
 This file groups the knobs most directly tied to training-path memory pressure.
@@ -12,6 +8,17 @@ Exposure classes in this shard:
 - pipeline mode defaults: file-based / on-disk paths that should normally stay fixed
 - internal guards: heuristics and RAM safety constants
 """
+
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+
+def _truthy_env(name: str, default: str) -> bool:
+    """Return True for common truthy env strings (1/true/t/yes/y, case-insensitive)."""
+    raw = (os.getenv(name) or default).strip().lower()
+    return raw in ("1", "true", "t", "yes", "y")
 
 # --- Step 7 on-disk footprint estimate (internal guards) ---
 CHUNK_CONCAT_MEMORY_WARN_BYTES = int(1 * (1024**3))  # 1 GB on-disk total
@@ -50,6 +57,15 @@ STEP9_SAVE_LGB_BINARY: bool = True
 # --- Step 8 / Step 9 memory-sensitive knobs ---
 # Keep this as a plain assignment for now; no getenv override contract yet.
 TRAIN_METRICS_PREDICT_BATCH_ROWS: int = 500_000
+
+# --- A3 optional backends (CatBoost / XGBoost): LibSVM-disk final fit (OOM mitigation) ---
+# When True and Plan B+ LibSVM paths exist, final full-data fits use on-disk data instead
+# of dense in-memory frames. Set GBM_BAKEOFF_FROM_FILE=0 to force legacy in-memory path.
+GBM_BAKEOFF_FROM_FILE: bool = _truthy_env("GBM_BAKEOFF_FROM_FILE", "1")
+# XGBoost external-memory URI (hist only); off by default on mixed Windows paths / GPU.
+GBM_BAKEOFF_XGBOOST_EXTERNAL_MEMORY: bool = _truthy_env("GBM_BAKEOFF_XGBOOST_EXTERNAL_MEMORY", "0")
+# CatBoost quantize() before fit (large-data path); optional RAM trade-off.
+GBM_BAKEOFF_CATBOOST_QUANTIZE: bool = _truthy_env("GBM_BAKEOFF_CATBOOST_QUANTIZE", "0")
 # None = no extra sampling cap; if set, the integer must be > 0.
 STEP8_SCREEN_SAMPLE_ROWS: Optional[int] = None
 # Which rows of the train split feed Step 8 screening sample: head | tail | head_tail.

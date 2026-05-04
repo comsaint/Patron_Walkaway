@@ -37,6 +37,7 @@ from sklearn.metrics import average_precision_score
 
 from trainer.core import config as _cfg
 from trainer.core.model_wrappers import EqualWeightSoftVoteModel
+from trainer.training.gbm_bakeoff_disk import GbmBakeoffLibSvmBundle
 from trainer.training.oof_stacking import build_stacked_logistic_candidate
 from trainer.training.threshold_selection import pick_threshold_dec026
 
@@ -268,12 +269,32 @@ def _train_catboost_backend(
     backend_runtime_params: Optional[Mapping[str, Any]] = None,
     val_dec026_window_hours: Optional[float],
     val_dec026_min_alerts_per_hour: Optional[float],
+    libsvm_bundle: Optional[GbmBakeoffLibSvmBundle] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     from catboost import CatBoostClassifier
     from trainer.training.trainer import (
         _apply_backend_imbalance_params,
         _sanitize_catboost_params_for_runtime,
     )
+
+    if libsvm_bundle is not None and bool(getattr(_cfg, "GBM_BAKEOFF_FROM_FILE", True)):
+        try:
+            from trainer.training.gbm_bakeoff_disk import train_catboost_from_libsvm_disk
+
+            return train_catboost_from_libsvm_disk(
+                libsvm_bundle,
+                hp,
+                y_val=y_val,
+                backend_runtime_params=backend_runtime_params,
+                val_dec026_window_hours=val_dec026_window_hours,
+                val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
+                quantize_first=bool(getattr(_cfg, "GBM_BAKEOFF_CATBOOST_QUANTIZE", False)),
+            )
+        except Exception as exc:
+            logger.warning(
+                "A3 CatBoost LibSVM-disk train failed; falling back to in-memory fit: %s",
+                exc,
+            )
 
     c_hp = dict(hp)
     if backend_runtime_params:
@@ -321,9 +342,31 @@ def _train_xgboost_backend(
     backend_runtime_params: Optional[Mapping[str, Any]] = None,
     val_dec026_window_hours: Optional[float],
     val_dec026_min_alerts_per_hour: Optional[float],
+    libsvm_bundle: Optional[GbmBakeoffLibSvmBundle] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     import xgboost as xgb
     from trainer.training.trainer import _apply_backend_imbalance_params
+
+    if libsvm_bundle is not None and bool(getattr(_cfg, "GBM_BAKEOFF_FROM_FILE", True)):
+        try:
+            from trainer.training.gbm_bakeoff_disk import train_xgboost_from_libsvm_disk
+
+            return train_xgboost_from_libsvm_disk(
+                libsvm_bundle,
+                hp,
+                y_val=y_val,
+                backend_runtime_params=backend_runtime_params,
+                val_dec026_window_hours=val_dec026_window_hours,
+                val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
+                use_external_memory=bool(
+                    getattr(_cfg, "GBM_BAKEOFF_XGBOOST_EXTERNAL_MEMORY", False)
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "A3 XGBoost LibSVM-disk train failed; falling back to in-memory fit: %s",
+                exc,
+            )
 
     x_hp = dict(hp)
     if backend_runtime_params:
@@ -536,6 +579,7 @@ def train_and_select_rated_gbm_family(
     field_test_constrained_optuna_objective_allowed: Optional[bool] = None,
     per_backend_hyperparams: Optional[Mapping[str, Mapping[str, Any]]] = None,
     rated_train_df: Optional[pd.DataFrame] = None,
+    libsvm_bundle: Optional[GbmBakeoffLibSvmBundle] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Train base backends + ensemble candidates on aligned splits and return winner + report."""
     from trainer.training.trainer import (
@@ -543,6 +587,7 @@ def train_and_select_rated_gbm_family(
         _backend_runtime_manifest,
         _compute_feature_importance,
         _compute_test_metrics,
+        _compute_test_metrics_from_scores,
         _compute_train_metrics,
         resolve_gbm_backend_runtime_plan,
         resolve_backend_optuna_budget,
@@ -696,20 +741,32 @@ def train_and_select_rated_gbm_family(
                 backend_runtime_params=backend_runtime_params,
                 val_dec026_window_hours=val_dec026_window_hours,
                 val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
+                libsvm_bundle=libsvm_bundle,
             )
             metrics = dict(metrics)
             metrics["best_hyperparams"] = dict(hp_backend)
             metrics.update(backend_runtime_manifest)
             if backend_manifest:
                 metrics.update(backend_manifest[0])
-            metrics["_val_scores"] = (
-                np.asarray(
-                    model.predict_proba(_to_float32_frame(X_val))[:, 1],
+            if hasattr(model, "predict_val_scores_from_libsvm"):
+                metrics["_val_scores"] = model.predict_val_scores_from_libsvm()
+            elif getattr(model, "_gbm_bakeoff_valid_libsvm_uri", None):
+                from catboost import Pool
+
+                _vuri = str(getattr(model, "_gbm_bakeoff_valid_libsvm_uri"))
+                metrics["_val_scores"] = np.asarray(
+                    model.predict_proba(Pool(_vuri))[:, 1],
                     dtype=np.float64,
                 )
-                if _has_strong_validation(X_val, y_val)
-                else np.zeros(len(y_val), dtype=np.float64)
-            )
+            else:
+                metrics["_val_scores"] = (
+                    np.asarray(
+                        model.predict_proba(_to_float32_frame(X_val))[:, 1],
+                        dtype=np.float64,
+                    )
+                    if _has_strong_validation(X_val, y_val)
+                    else np.zeros(len(y_val), dtype=np.float64)
+                )
             metrics.update(
                 _compute_train_metrics(
                     model,
@@ -726,21 +783,45 @@ def train_and_select_rated_gbm_family(
                 int(getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)),
             )
             if X_test is not None and y_test is not None and not X_test.empty:
-                test_metrics = _compute_test_metrics(
-                    model,
-                    float(metrics["threshold"]),
-                    _to_float32_frame(X_test),
-                    y_test,
-                    label=f"rated_{backend}",
-                    _uncalibrated=bool(metrics.get("_uncalibrated", False)),
-                    log_results=False,
-                    production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
-                )
-                metrics.update(test_metrics)
-                metrics["_test_scores"] = np.asarray(
-                    model.predict_proba(_to_float32_frame(X_test))[:, 1],
-                    dtype=np.float64,
-                )
+                _ts_disk: Optional[np.ndarray] = None
+                if hasattr(model, "predict_test_scores_from_libsvm"):
+                    _ts_disk = model.predict_test_scores_from_libsvm()
+                elif getattr(model, "_gbm_bakeoff_test_libsvm_uri", None):
+                    from catboost import Pool
+
+                    _turi = str(getattr(model, "_gbm_bakeoff_test_libsvm_uri"))
+                    _ts_disk = np.asarray(
+                        model.predict_proba(Pool(_turi))[:, 1],
+                        dtype=np.float64,
+                    )
+                if _ts_disk is not None:
+                    test_metrics = _compute_test_metrics_from_scores(
+                        np.asarray(y_test, dtype=float).reshape(-1),
+                        np.asarray(_ts_disk, dtype=np.float64).reshape(-1),
+                        float(metrics["threshold"]),
+                        label=f"rated_{backend}",
+                        _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+                        log_results=False,
+                        production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+                    )
+                    metrics.update(test_metrics)
+                    metrics["_test_scores"] = np.asarray(_ts_disk, dtype=np.float64).reshape(-1)
+                else:
+                    test_metrics = _compute_test_metrics(
+                        model,
+                        float(metrics["threshold"]),
+                        _to_float32_frame(X_test),
+                        y_test,
+                        label=f"rated_{backend}",
+                        _uncalibrated=bool(metrics.get("_uncalibrated", False)),
+                        log_results=False,
+                        production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
+                    )
+                    metrics.update(test_metrics)
+                    metrics["_test_scores"] = np.asarray(
+                        model.predict_proba(_to_float32_frame(X_test))[:, 1],
+                        dtype=np.float64,
+                    )
             metrics["feature_importance"] = _compute_feature_importance(model, feature_cols)
             metrics["importance_method"] = "gain"
             metrics["model_backend"] = backend
@@ -926,6 +1007,17 @@ def train_and_select_rated_gbm_family(
             "valid_rows": int(len(X_val)),
             "test_rows": int(len(y_test)) if y_test is not None else 0,
             "feature_columns": feature_cols,
+            "libsvm_disk": {
+                "from_file_enabled": bool(getattr(_cfg, "GBM_BAKEOFF_FROM_FILE", True)),
+                "bundle_passed": libsvm_bundle is not None,
+                "cache_dir": (
+                    str(libsvm_bundle.cache_dir.resolve()) if libsvm_bundle is not None else None
+                ),
+                "xgboost_external_memory": bool(
+                    getattr(_cfg, "GBM_BAKEOFF_XGBOOST_EXTERNAL_MEMORY", False)
+                ),
+                "catboost_quantize": bool(getattr(_cfg, "GBM_BAKEOFF_CATBOOST_QUANTIZE", False)),
+            },
             "note": (
                 "C3 stacking/blending: OOF exports and meta-learner training are not in A3 scope; "
                 "this block records aligned backends and metrics for a future ensemble step."

@@ -7135,6 +7135,47 @@ def train_single_rated_model(
                 val_df=_compare_valid_for_span,
             )
 
+            _bake_libsvm_bundle = None
+            if (
+                use_from_libsvm
+                and train_libsvm_paths is not None
+                and bool(getattr(_cfg, "GBM_BAKEOFF_FROM_FILE", True))
+            ):
+                try:
+                    from trainer.training.gbm_bakeoff_disk import (
+                        GbmBakeoffLibSvmBundle,
+                        bakeoff_cache_dir,
+                    )
+
+                    _tp, _vp = train_libsvm_paths
+                    _test_p = (
+                        test_libsvm_path
+                        if test_libsvm_path is not None and test_libsvm_path.exists()
+                        else None
+                    )
+                    _tmp_bundle = GbmBakeoffLibSvmBundle(
+                        train_libsvm=Path(_tp),
+                        valid_libsvm=Path(_vp),
+                        test_libsvm=Path(_test_p) if _test_p is not None else None,
+                        feature_names=tuple(str(c) for c in avail_cols),
+                        train_row_count=int(_n_lines),
+                        cache_dir=Path(_tp).parent,
+                    )
+                    _bake_libsvm_bundle = GbmBakeoffLibSvmBundle(
+                        train_libsvm=_tmp_bundle.train_libsvm,
+                        valid_libsvm=_tmp_bundle.valid_libsvm,
+                        test_libsvm=_tmp_bundle.test_libsvm,
+                        feature_names=_tmp_bundle.feature_names,
+                        train_row_count=_tmp_bundle.train_row_count,
+                        cache_dir=bakeoff_cache_dir(Path(_tp).parent, _tmp_bundle),
+                    )
+                except Exception as _bundle_exc:
+                    logger.warning(
+                        "A3 LibSVM-disk bundle not used (falling back to in-memory optional backends): %s",
+                        _bundle_exc,
+                    )
+                    _bake_libsvm_bundle = None
+
             _winner_backend, _winner_art, _bake_report = train_and_select_rated_gbm_family(
                 X_tr,
                 y_tr,
@@ -7155,6 +7196,7 @@ def train_single_rated_model(
                 y_test=_y_te_cmp,
                 val_dec026_window_hours=_bake_val_wh,
                 val_dec026_min_alerts_per_hour=_bake_val_mah,
+                libsvm_bundle=_bake_libsvm_bundle,
             )
             model = _winner_art["model"]
             metrics = dict(_winner_art["metrics"])
@@ -8451,6 +8493,15 @@ def run_pipeline(args) -> None:
     _cli_xgb = getattr(args, "gbm_bakeoff_xgboost", None)
     if _cli_xgb is not None:
         os.environ["GBM_BAKEOFF_ENABLE_XGBOOST"] = "1" if _cli_xgb else "0"
+    _cli_bff = getattr(args, "gbm_bakeoff_from_file", None)
+    if _cli_bff is not None:
+        setattr(_cfg, "GBM_BAKEOFF_FROM_FILE", bool(_cli_bff))
+    _cli_xem = getattr(args, "gbm_bakeoff_xgboost_external_memory", None)
+    if _cli_xem is not None:
+        setattr(_cfg, "GBM_BAKEOFF_XGBOOST_EXTERNAL_MEMORY", bool(_cli_xem))
+    _cli_cbq = getattr(args, "gbm_bakeoff_catboost_quantize", None)
+    if _cli_cbq is not None:
+        setattr(_cfg, "GBM_BAKEOFF_CATBOOST_QUANTIZE", bool(_cli_cbq))
     if bool(getattr(args, "disable_oof_stacking", False)):
         setattr(_cfg, "OOF_STACKING_ENABLED", False)
     logger.info("Precision uplift A3 gbm_bakeoff_enabled=%s", pipeline_gbm_bakeoff)

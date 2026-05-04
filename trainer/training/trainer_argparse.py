@@ -140,6 +140,36 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--gbm-bakeoff-from-file",
+        dest="gbm_bakeoff_from_file",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "A3: when Plan B+ LibSVM exists, train CatBoost/XGBoost final fits from disk "
+            "(lower peak RAM). When omitted, use GBM_BAKEOFF_FROM_FILE env or config default (on)."
+        ),
+    )
+    parser.add_argument(
+        "--gbm-bakeoff-xgboost-external-memory",
+        dest="gbm_bakeoff_xgboost_external_memory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "A3: enable XGBoost external-memory LibSVM URI (CPU hist only). "
+            "When omitted, use GBM_BAKEOFF_XGBOOST_EXTERNAL_MEMORY env or default (off)."
+        ),
+    )
+    parser.add_argument(
+        "--gbm-bakeoff-catboost-quantize",
+        dest="gbm_bakeoff_catboost_quantize",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "A3: run CatBoost quantize() on LibSVM Pools before fit. "
+            "When omitted, use GBM_BAKEOFF_CATBOOST_QUANTIZE env or default (off)."
+        ),
+    )
+    parser.add_argument(
         "--disable-oof-stacking",
         action="store_true",
         help=(

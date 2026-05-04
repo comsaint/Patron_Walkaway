@@ -588,3 +588,50 @@ def test_train_and_select_rated_gbm_family_emits_backend_runtime_metadata() -> N
     assert report["per_backend"]["catboost"]["backend_gpu_id"] == "0"
     assert report["per_backend"]["xgboost"]["backend_device_mode"] == "gpu"
     assert report["per_backend"]["xgboost"]["backend_gpu_id"] == "1"
+
+
+def test_train_catboost_from_libsvm_disk_smoke(tmp_path) -> None:
+    """LibSVM-disk CatBoost fit with weight memmap; score test Pool from URI."""
+    from catboost import Pool
+
+    from trainer.training.gbm_bakeoff_disk import (
+        GbmBakeoffLibSvmBundle,
+        train_catboost_from_libsvm_disk,
+    )
+
+    d = tmp_path
+    tr = d / "train_for_lgb.libsvm"
+    va = d / "valid_for_lgb.libsvm"
+    te = d / "test_for_lgb.libsvm"
+    tr.write_text("0 0:1\n1 1:1\n0 0:0.5 1:0.5\n")
+    tr.with_name(tr.name + ".weight").write_text("1.0\n1.0\n1.0\n")
+    va.write_text("0 0:1\n1 1:1\n0 0:0.5 1:0.5\n")
+    te.write_text("1 1:1\n0 0:1\n")
+    y_val = pd.Series([0, 1, 0], dtype=int)
+    hp = dict(trainer_mod._backend_hpo_defaults("catboost"))
+    hp["iterations"] = 24
+    hp["early_stopping_rounds"] = 12
+    hp["thread_count"] = 1
+    hp["allow_writing_files"] = False
+    bundle = GbmBakeoffLibSvmBundle(
+        train_libsvm=tr,
+        valid_libsvm=va,
+        test_libsvm=te,
+        feature_names=("f0", "f1"),
+        train_row_count=3,
+        cache_dir=d / "c",
+    )
+    model, _metrics = train_catboost_from_libsvm_disk(
+        bundle,
+        hp,
+        y_val=y_val,
+        backend_runtime_params={"task_type": "CPU"},
+        val_dec026_window_hours=100.0,
+        val_dec026_min_alerts_per_hour=1.0,
+        quantize_first=False,
+    )
+    assert getattr(model, "a3_final_fit_mode", None) == "libsvm_disk"
+    test_uri = getattr(model, "_gbm_bakeoff_test_libsvm_uri", None)
+    assert test_uri is not None
+    scores = np.asarray(model.predict_proba(Pool(data=test_uri))[:, 1], dtype=float)
+    assert scores.shape == (2,)

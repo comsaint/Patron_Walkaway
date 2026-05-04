@@ -242,6 +242,17 @@ python scripts/gate1_l1_determinism_v1.py --artifact run_fact \
 | Gate1 exit **3221226505**（Windows） | 多為 DuckDB 在有限 `memory_limit` 下對大輸入物化時**整個程序被系統結束**（非可捕捉 OOM）。預設 Gate1 只改 **`threads`**、不設 `memory_limit`；若仍崩潰請 `--verbose`，並避免對巨型 cleaned 傳極小 `--profiles-json` memory 步階 |
 | eligible build：`cutoff-filtered … exceeds --eligible-build-max-session-rows` | 預設 path B 應優先放 **`data/canonical_mapping.parquet`**；或預先依 cutoff 切片 `t_session` 匯出；僅調高 `--eligible-build-max-session-rows` 仍會在後續把整批載入 **pandas**，筆電易 OOM |
 
+## 10. Trainer：A3 GBM bakeoff 與 LibSVM 磁碟路徑（選讀）
+
+與 LDA 主線無直接耦合；本節供 **Plan B+** 下 `python -m trainer.trainer` 記憶體疑難時查閱。
+
+- **預設**：若 Step 9 已匯出 `data/export/train_for_lgb.libsvm`（及 valid／test、train 的 `.weight`），A3 的 **CatBoost／XGBoost 最終全量 fit** 會改走 **LibSVM 磁碟路徑**，降低稠密 `DataFrame.fit` 的峰值 RAM；失敗時會 **log 警告並回退** 到既有 in-memory 路徑（不中止整次訓練）。
+- **關閉磁碟路徑**：環境變數 `GBM_BAKEOFF_FROM_FILE=0`，或 CLI `--no-gbm-bakeoff-from-file`（於 `run_pipeline` 內覆寫 `_cfg`）。
+- **XGBoost external memory**（可選，預設關）：`GBM_BAKEOFF_XGBOOST_EXTERNAL_MEMORY=1` 或 `--gbm-bakeoff-xgboost-external-memory`；**不建議**在 `device=cuda` 時開啟。
+- **CatBoost quantize**（可選）：`GBM_BAKEOFF_CATBOOST_QUANTIZE=1` 或 `--gbm-bakeoff-catboost-quantize`。
+- **CatBoost 與匯出索引**：匯出 LibSVM 為 **0-based**（LightGBM）；CatBoost 讀檔需 **1-based**，訓練時會在快取目錄內 stream 產生 `*_cb_idx1.libsvm` 並以 **`Pool.set_weight`** 套用 train 的 float32 memmap 權重（不可在 `Pool(..., weight=)` 與檔案 URI 並用）。
+- **快取目錄**：`data/export/.gbm_bakeoff_cache/<md5 前綴>/`，內含 XGBoost external-memory 之 cache 檔，以及上述 CatBoost 1-based 轉檔；若懷疑汙染可刪除該子目錄後重跑。
+
 ---
 
 *本 runbook 與程式行為以倉庫內腳本為準；若與上層 SSOT／implementation plan 衝突，以上層文件為準並應回寫本檔。*
