@@ -1,11 +1,24 @@
 """MVP orchestrator: preprocess (rated-only) -> run_fact -> trip_fact under ``gaming_ym`` layout.
 
+Optional CLI flags are documented below and in ``parallel_lda_mvp/README.md``.
+
 Preprocess 仍透過既有 CLI；``run_fact`` / ``trip_fact`` 於行程內呼叫
 ``pipelines.layered_data_assets``（單月 staging 一次、span 一次 trip 框架）。
 
-**No CLI arguments.** Run from repo root:
+Run from repo root:
 
     python -m parallel_lda_mvp.run_mvp
+
+Optional flags:
+
+- ``--emit-trainer-local-parquet`` — after MVP, write ``data/gmwds_t_{bet,session}.parquet``
+  (Phase C L1 join when snapshot has ``run_fact`` parts).
+- ``--trainer-bridge-emit-only`` — only run the bridge (no preprocess/run/trip). Requires
+  ``--snapshot-id <snap>`` **or** ``PARALLEL_LDA_MVP_SNAPSHOT_ID`` pointing at an existing
+  ``data/parallel_lda_mvp/<snap>/`` tree with ``mvp_summary.json``.
+
+Idempotency / RAM (bridge): ``PARALLEL_LDA_BRIDGE_SKIP_IF_UNCHANGED=1``,
+``PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT`` (e.g. ``4GB``).
 
 Defaults (first match wins for paths):
 
@@ -29,7 +42,7 @@ Per-day ``run_fact`` / ``trip`` concurrency is set in code: ``DAY_MATERIALIZE_MA
 Trip materialization runs **after** all months have ``run_fact`` outputs, using **full-span**
 ``run_fact`` inputs plus ``--coverage-end`` on the last span calendar day (see README).
 
-Optional: ``python -m parallel_lda_mvp.run_mvp -h`` / ``--help`` prints this text.
+``python -m parallel_lda_mvp.run_mvp -h`` / ``--help`` prints this text.
 """
 
 from __future__ import annotations
@@ -1586,19 +1599,80 @@ def _trip_argv(
     return cmd
 
 
+def _parse_run_mvp_argv(argv: list[str]) -> tuple[dict[str, Any], list[str]]:
+    """Parse optional CLI flags; return options dict and unknown tokens (should be empty)."""
+    opts: dict[str, Any] = {
+        "emit_trainer_local_parquet": False,
+        "trainer_bridge_emit_only": False,
+        "snapshot_id": None,
+        "help": False,
+    }
+    unknown: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            opts["help"] = True
+        elif a == "--emit-trainer-local-parquet":
+            opts["emit_trainer_local_parquet"] = True
+        elif a == "--trainer-bridge-emit-only":
+            opts["trainer_bridge_emit_only"] = True
+        elif a == "--snapshot-id":
+            i += 1
+            if i >= len(argv):
+                raise ValueError("--snapshot-id requires a value")
+            opts["snapshot_id"] = str(argv[i]).strip()
+        else:
+            unknown.append(a)
+        i += 1
+    return opts, unknown
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry: resolve defaults, then preprocess / run_fact / trip_fact."""
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] in ("-h", "--help"):
+    try:
+        opts, unknown = _parse_run_mvp_argv(argv)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if opts.get("help"):
         print(__doc__, end="")
         return 0
-    if argv:
-        print("This runner accepts no arguments (only -h / --help).", file=sys.stderr)
-        print("Override paths or ids with environment variables listed in the module docstring.", file=sys.stderr)
+    if unknown:
+        print(f"Unknown arguments: {unknown!r}", file=sys.stderr)
+        print("Use -h / --help.", file=sys.stderr)
         return 2
 
     root = repo_root()
     data_root = (root / "data").resolve()
+
+    if opts.get("trainer_bridge_emit_only"):
+        sid = (opts.get("snapshot_id") or os.environ.get(_ENV_SNAPSHOT_ID, "").strip()).strip()
+        if not sid:
+            print(
+                "bridge-emit-only requires --snapshot-id or PARALLEL_LDA_MVP_SNAPSHOT_ID.",
+                file=sys.stderr,
+            )
+            return 2
+        snap_root = data_root / "parallel_lda_mvp" / sid
+        if not snap_root.is_dir():
+            print(f"snapshot root not found: {snap_root}", file=sys.stderr)
+            return 2
+        from parallel_lda_mvp.trainer_bridge_mvp import emit_trainer_local_parquet
+
+        print(
+            f"[parallel_lda_mvp] trainer bridge emit-only -> {data_root / 'gmwds_t_bet.parquet'} "
+            f"(snap={sid})",
+            flush=True,
+        )
+        emit_trainer_local_parquet(
+            snap_root=snap_root,
+            data_dir=data_root,
+            phase_c=True,
+        )
+        return 0
+
     t_bet_paths = resolve_t_bet_paths(data_root)
     t_session = resolve_t_session(data_root)
     gaming_yms = resolve_gaming_ym_list(t_bet_paths)
@@ -1835,6 +1909,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[parallel_lda_mvp] OK gaming_ym={ym} -> {out_root / 'mvp_summary.json'}")
 
     print(f"OK MVP finished span under {snap_root}")
+    if opts.get("emit_trainer_local_parquet"):
+        from parallel_lda_mvp.trainer_bridge_mvp import emit_trainer_local_parquet
+
+        print(
+            f"[parallel_lda_mvp] trainer bridge after MVP -> {data_root / 'gmwds_t_bet.parquet'} "
+            f"(snap={snap})",
+            flush=True,
+        )
+        emit_trainer_local_parquet(
+            snap_root=snap_root,
+            data_dir=data_root,
+            phase_c=True,
+        )
     return 0
 
 

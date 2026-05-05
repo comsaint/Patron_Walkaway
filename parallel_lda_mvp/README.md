@@ -2,7 +2,7 @@
 
 以 subprocess 呼叫 `scripts/preprocess_bet_v1.py`、`scripts/materialize_run_fact_v1.py`、`scripts/materialize_trip_fact_v1.py`（底層為 `pipelines/layered_data_assets` CLI）。為支援「每月固定少數目錄」的輸出，CLI 已增加可選的 `--output-parquet` / `--output-manifest`（及 trip 的對應參數），**不改** preprocess／run／trip 的核心 SQL。
 
-## 執行方式（零參數）
+## 執行方式
 
 在 **repo 根目錄**：
 
@@ -10,12 +10,30 @@
 python -m parallel_lda_mvp.run_mvp
 ```
 
-不帶任何參數。啟動時會印出 `gaming_ym_span`、`source_snapshot_id`、`cutoff`、`t_session`、bet 檔列表。
+預設不帶參數即跑完整 MVP。啟動時會印出 `gaming_ym_span`、`source_snapshot_id`、`cutoff`、`t_session`、bet 檔列表。
+
+可選：
+
+- `--emit-trainer-local-parquet`：MVP 結束後寫入 `data/gmwds_t_bet.parquet` / `data/gmwds_t_session.parquet`（含 Phase C：`run_fact`／`trip_*` 併回下注列，見 `trainer_bridge_mvp.py`）。
+- `--trainer-bridge-emit-only --snapshot-id <snap>`：只跑橋接（需已存在 `data/parallel_lda_mvp/<snap>/` 與 `mvp_summary.json`）。亦可只設 `PARALLEL_LDA_MVP_SNAPSHOT_ID`。
+- 橋接 idempotency：`PARALLEL_LDA_BRIDGE_SKIP_IF_UNCHANGED=1`（指紋相同則跳過寫檔）；`PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT=4GB` 等。
 
 說明文件：
 
 ```bash
 python -m parallel_lda_mvp.run_mvp -h
+```
+
+驗證 trainer 特徵 YAML 可載入：
+
+```bash
+python -m parallel_lda_mvp.trainer_bridge_mvp
+```
+
+本機 smoke（需先有橋接產物與小視窗資料）：
+
+```bash
+python -m trainer.trainer --use-local-parquet --recent-chunks 1 --skip-optuna --no-gbm-bakeoff --no-preload
 ```
 
 ## 預設怎麼找資料

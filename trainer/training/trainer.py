@@ -470,6 +470,15 @@ _CANONICAL_MAP_SESSION_COLS: list = [
 #   - Output chunk:     run_id, canonical_id, is_rated, label added downstream
 #
 # If a future feature spec references additional source columns, add them here.
+# Optional L1 Phase C columns (present when materialized by parallel_lda_mvp bridge):
+_OPTIONAL_BET_LDA_PHASE_C_COLS: tuple[str, ...] = (
+    "lda_l1_run_bet_count",
+    "lda_trip_run_count",
+    "lda_run_ord_in_trip",
+    "lda_trip_is_closed",
+    "lda_l1_run_duration_min",
+)
+
 _REQUIRED_BET_PARQUET_COLS: list = [
     # Keys & timestamps
     "bet_id",
@@ -1243,6 +1252,9 @@ def load_local_parquet(
         import pyarrow.parquet as _pq_bets
         _bet_schema_cols = set(_pq_bets.read_schema(bets_path).names)
         _bet_cols = [c for c in _REQUIRED_BET_PARQUET_COLS if c in _bet_schema_cols]
+        for _c in _OPTIONAL_BET_LDA_PHASE_C_COLS:
+            if _c in _bet_schema_cols and _c not in _bet_cols:
+                _bet_cols.append(_c)
         bets = pd.read_parquet(
             bets_path,
             columns=_bet_cols,
