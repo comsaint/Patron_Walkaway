@@ -19,7 +19,10 @@ Defaults (first match wins for paths):
 - ``cutoff_dtm``: ``PARALLEL_LDA_MVP_CUTOFF_DTM`` if set (ISO), else last microsecond of the
   **last** ``gaming_ym`` in the resolved span in ``Asia/Hong_Kong`` (one cutoff for eligible).
 - ``PARALLEL_LDA_MVP_FORCE_RECOMPUTE``: if ``1`` / ``true``, bypass **month-level** skip (re-run preprocess,
-  split, run_fact, trip for each ``gaming_ym``).
+  split, run_fact, trip for each ``gaming_ym``). Also forces **full-span** month-bet fingerprint
+  recompute (not only tail months). Ad-hoc or scheduled full rerun when upstream or cache policy
+  changed; see ``force_recompute_used`` and ``month_bet_sha_fingerprint_algo`` / ``month_bet_sha_strategy``
+  in ``mvp_summary`` (``rolling_keys_plus_core_v1`` vs ``legacy_extract_sha_v1``).
 
 Per-day ``run_fact`` / ``trip`` concurrency is set in code: ``DAY_MATERIALIZE_MAX_WORKERS`` in this module.
 
@@ -55,7 +58,7 @@ _ENV_FORCE_RECOMPUTE = "PARALLEL_LDA_MVP_FORCE_RECOMPUTE"
 
 # Max concurrent subprocesses for each per-day phase (run_fact, then trip) within one gaming_ym.
 # Effective workers = min(days in month, this cap, cpu_count). Tune here (not via env).
-DAY_MATERIALIZE_MAX_WORKERS = 4
+DAY_MATERIALIZE_MAX_WORKERS = 1
 
 
 def repo_root() -> Path:
@@ -213,9 +216,23 @@ def _ingest_yaml_content_sha256(ingest_yaml: Path | None) -> str:
     return streaming_sha256_hex_file(ingest_yaml.resolve())
 
 
-_MONTH_BET_SHA_CACHE_SCHEMA_VERSION = 1
-_T_BET_MONTH_SHA_ALGO_VERSION = "t_bet_month_extract_sha_v1"
+_MONTH_BET_SHA_CACHE_SCHEMA_VERSION = 2
+_T_BET_MONTH_SHA_ALGO_VERSION = "t_bet_month_fp_v2"
 _MONTH_BET_SHA_CACHE_FILENAME = "month_bet_sha_cache.v1.json"
+_MONTH_BET_SHA_TAIL_MONTHS_DEFAULT = 2
+_LATE_ARRIVAL_WINDOW_DAYS_DEFAULT = 45
+_MONTH_BET_SHA_POLICY_VERSION = "tail2_late45_v1"
+_FINGERPRINT_ALGO_ROLLING = "rolling_keys_plus_core_v1"
+_FINGERPRINT_ALGO_LEGACY = "legacy_extract_sha_v1"
+# Bump when canonical row-hash inputs change (see ``schema/GDP_GMWDS_Raw_Schema_Dictionary.md`` §4 t_bet).
+_ROLLING_FP_ROW_VERSION = "rolling_row_v2"
+
+# Keys + money slots for rolling row hash. GMWDS raw ``t_bet`` uses ``wager`` / ``casino_win`` (no
+# ``turnover`` / ``valid_stake`` / ``net_win`` on that export); layered/cleaned Parquet may use the
+# latter three names—see ``_rolling_fp_hash_concat_sql``.
+_ROLLING_FP_KEY_COLS: frozenset[str] = frozenset(
+    {"bet_id", "gaming_day", "player_id", "payout_complete_dtm"}
+)
 
 
 def _t_bet_paths_input_fingerprint(t_bet_paths: list[Path]) -> str:
@@ -229,8 +246,174 @@ def _t_bet_paths_input_fingerprint(t_bet_paths: list[Path]) -> str:
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
-def _read_month_bet_sha_cache(scratch_dir: Path) -> tuple[str, dict[str, str]] | None:
-    """Load validated month SHA cache; return ``(t_bet_inputs_fingerprint, by_ym)`` or ``None``."""
+def _t_bet_read_parquet_rp_list(t_bet_paths: list[Path]) -> str:
+    """SQL-safe ``read_parquet([...])`` path list fragment."""
+    return ", ".join(f"'{p.resolve().as_posix().replace(chr(39), chr(39) + chr(39))}'" for p in t_bet_paths)
+
+
+def _parquet_union_column_names(con: object, *, rp_list: str) -> set[str]:
+    """Return column names from ``read_parquet([...]) LIMIT 0`` (union schema)."""
+    desc = con.execute(f"SELECT * FROM read_parquet([{rp_list}]) LIMIT 0").description
+    if not desc:
+        return set()
+    return {str(d[0]) for d in desc}
+
+
+def _rolling_fp_hash_concat_sql(cols: set[str]) -> str | None:
+    """Build ``concat_ws(...)`` body for row hash, or ``None`` if schema cannot be fingerprinted."""
+    if not _ROLLING_FP_KEY_COLS <= cols:
+        return None
+    if "turnover" in cols:
+        t_expr = "turnover"
+    elif "wager" in cols:
+        t_expr = "wager"
+    else:
+        return None
+    if "valid_stake" in cols:
+        v_expr = "valid_stake"
+    elif "wager" in cols:
+        v_expr = "wager"
+    elif "turnover" in cols:
+        v_expr = "turnover"
+    else:
+        return None
+    if "net_win" in cols:
+        n_expr = "net_win"
+    elif "casino_win" in cols:
+        n_expr = "(-1 * casino_win)"
+    else:
+        return None
+    return (
+        "concat_ws(\n"
+        "                chr(1),\n"
+        "                coalesce(strftime('%Y-%m-%d', TRY_CAST(gaming_day AS DATE)), ''),\n"
+        "                coalesce(CAST(bet_id AS VARCHAR), ''),\n"
+        "                coalesce(CAST(player_id AS VARCHAR), ''),\n"
+        "                coalesce(strftime('%Y-%m-%d %H:%M:%S', "
+        "TRY_CAST(payout_complete_dtm AS TIMESTAMP)), ''),\n"
+        f"                coalesce(CAST({t_expr} AS VARCHAR), ''),\n"
+        f"                coalesce(CAST({v_expr} AS VARCHAR), ''),\n"
+        f"                coalesce(CAST({n_expr} AS VARCHAR), '')\n"
+        "              )"
+    )
+
+
+def _rolling_parquet_columns_ok(con: object, *, rp_list: str) -> bool:
+    """True when Parquet exposes enough columns to build the rolling row-hash (keys + money slots)."""
+    cols = _parquet_union_column_names(con, rp_list=rp_list)
+    return _rolling_fp_hash_concat_sql(cols) is not None
+
+
+def _target_month_bet_fingerprint_algo(t_bet_paths: list[Path]) -> str:
+    """Prefer rolling row-hash aggregate when schema allows; else legacy extract path."""
+    import duckdb
+
+    try:
+        con = duckdb.connect()
+        try:
+            rp_list = _t_bet_read_parquet_rp_list(t_bet_paths)
+            if _rolling_parquet_columns_ok(con, rp_list=rp_list):
+                return _FINGERPRINT_ALGO_ROLLING
+        finally:
+            con.close()
+    except Exception:
+        pass
+    return _FINGERPRINT_ALGO_LEGACY
+
+
+def _rolling_month_digest_from_components(
+    *,
+    ym: str,
+    row_count: int,
+    xor_u64: int,
+    sum_u64: int,
+) -> str:
+    """SHA-256 hex over canonical monthly aggregate components (downstream expects 64 hex)."""
+    s = (
+        f"{_ROLLING_FP_ROW_VERSION}|{ym}|{int(row_count)}|"
+        f"{int(xor_u64) % (2**64):016x}|{int(sum_u64) % (2**64):016x}"
+    )
+    return hashlib.sha256(s.encode("ascii")).hexdigest()
+
+
+def _rolling_month_fingerprints_for_yms(
+    con: object,
+    *,
+    rp_list: str,
+    yms: Sequence[str],
+) -> dict[str, str]:
+    """One DuckDB scan: per-``ym`` rolling fingerprint (keys + core) for ``yms`` only."""
+    for ym in yms:
+        if not re.fullmatch(r"\d{4}-\d{2}", str(ym).strip()):
+            raise ValueError(f"ym must be YYYY-MM, got {ym!r}")
+    if not yms:
+        return {}
+    cols = _parquet_union_column_names(con, rp_list=rp_list)
+    hash_inner = _rolling_fp_hash_concat_sql(cols)
+    if hash_inner is None:
+        raise RuntimeError("rolling fingerprint: unsupported t_bet schema (missing keys/core slots)")
+    vals_sql = ", ".join(f"('{str(ym).strip()}')" for ym in yms)
+    rows = con.execute(
+        f"""
+        WITH wanted(ym) AS (VALUES {vals_sql}),
+        base AS (
+          SELECT
+            strftime('%Y-%m', TRY_CAST(gaming_day AS DATE)) AS ym,
+            hash(
+              {hash_inner}
+            )::UBIGINT AS rh
+          FROM read_parquet([{rp_list}])
+          WHERE strftime('%Y-%m', TRY_CAST(gaming_day AS DATE)) IN (SELECT ym FROM wanted)
+        ),
+        agg AS (
+          SELECT
+            ym,
+            COUNT(*)::BIGINT AS n,
+            bit_xor(rh)::UBIGINT AS xorh,
+            sum(CAST(rh AS HUGEINT)) AS sumh
+          FROM base
+          GROUP BY ym
+        )
+        SELECT
+          w.ym,
+          COALESCE(a.n, 0::BIGINT),
+          COALESCE(a.xorh, 0::UBIGINT),
+          COALESCE(a.sumh, 0::HUGEINT)
+        FROM wanted w
+        LEFT JOIN agg a USING (ym)
+        ORDER BY w.ym
+        """
+    ).fetchall()
+    out: dict[str, str] = {}
+    for row in rows:
+        ym_cell, n_cell, xor_cell, sum_cell = row
+        ym_s = str(ym_cell).strip()
+        n_i = int(n_cell)
+        xor_u = int(xor_cell) % (2**64) if xor_cell is not None else 0
+        sum_raw = 0 if sum_cell is None else int(sum_cell)
+        sum_u = sum_raw % (2**64)
+        out[ym_s] = _rolling_month_digest_from_components(
+            ym=ym_s, row_count=n_i, xor_u64=xor_u, sum_u64=sum_u
+        )
+    if set(out.keys()) != {str(x).strip() for x in yms}:
+        raise RuntimeError(f"rolling fingerprint ym keys mismatch: want={yms!r} got={sorted(out)!r}")
+    return out
+
+
+def _month_bet_sha_policy_payload(*, fingerprint_algo: str) -> dict[str, int | str]:
+    """Embedded policy for month SHA cache (must match reader validation)."""
+    return {
+        "fingerprint_algo": fingerprint_algo,
+        "late_arrival_window_days": int(_LATE_ARRIVAL_WINDOW_DAYS_DEFAULT),
+        "policy_version": _MONTH_BET_SHA_POLICY_VERSION,
+        "tail_months": int(_MONTH_BET_SHA_TAIL_MONTHS_DEFAULT),
+    }
+
+
+def _read_month_bet_sha_cache(
+    scratch_dir: Path,
+) -> tuple[str, dict[str, str], str] | None:
+    """Load validated month SHA cache; return ``(inputs_fp, by_ym, fingerprint_algo)`` or ``None``."""
     path = scratch_dir / _MONTH_BET_SHA_CACHE_FILENAME
     if not path.is_file():
         return None
@@ -244,6 +427,18 @@ def _read_month_bet_sha_cache(scratch_dir: Path) -> tuple[str, dict[str, str]] |
         return None
     if raw.get("algo_version") != _T_BET_MONTH_SHA_ALGO_VERSION:
         return None
+    pol = raw.get("policy")
+    if not isinstance(pol, dict):
+        return None
+    if pol.get("policy_version") != _MONTH_BET_SHA_POLICY_VERSION:
+        return None
+    if int(pol.get("tail_months", -1)) != _MONTH_BET_SHA_TAIL_MONTHS_DEFAULT:
+        return None
+    if int(pol.get("late_arrival_window_days", -1)) != _LATE_ARRIVAL_WINDOW_DAYS_DEFAULT:
+        return None
+    fa = pol.get("fingerprint_algo")
+    if fa not in (_FINGERPRINT_ALGO_ROLLING, _FINGERPRINT_ALGO_LEGACY):
+        return None
     fp = raw.get("t_bet_inputs_fingerprint")
     if not isinstance(fp, str) or len(fp) != 64:
         return None
@@ -254,7 +449,7 @@ def _read_month_bet_sha_cache(scratch_dir: Path) -> tuple[str, dict[str, str]] |
     for k, v in by.items():
         if isinstance(k, str) and re.fullmatch(r"\d{4}-\d{2}", k) and isinstance(v, str) and len(v) == 64:
             out[k] = v
-    return fp, out
+    return fp, out, str(fa)
 
 
 def _write_month_bet_sha_cache(
@@ -262,19 +457,21 @@ def _write_month_bet_sha_cache(
     *,
     t_bet_inputs_fingerprint: str,
     span_by_ym: dict[str, str],
+    fingerprint_algo: str,
 ) -> None:
     """Merge ``span_by_ym`` into on-disk cache (same fingerprint rows preserved)."""
     scratch_dir.mkdir(parents=True, exist_ok=True)
     path = scratch_dir / _MONTH_BET_SHA_CACHE_FILENAME
     prev_by: dict[str, str] = {}
     prev = _read_month_bet_sha_cache(scratch_dir)
-    if prev is not None and prev[0] == t_bet_inputs_fingerprint:
+    if prev is not None and prev[0] == t_bet_inputs_fingerprint and prev[2] == fingerprint_algo:
         prev_by = dict(prev[1])
     merged = {**prev_by, **span_by_ym}
     payload = {
         "algo_version": _T_BET_MONTH_SHA_ALGO_VERSION,
         "by_ym": merged,
         "cache_schema_version": _MONTH_BET_SHA_CACHE_SCHEMA_VERSION,
+        "policy": _month_bet_sha_policy_payload(fingerprint_algo=fingerprint_algo),
         "t_bet_inputs_fingerprint": t_bet_inputs_fingerprint,
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -338,12 +535,37 @@ def _recompute_month_bet_shas_one_connection(
 
     out: dict[str, str] = {}
     con = duckdb.connect()
+    n = len(months)
     try:
-        for ym in months:
+        for i, ym in enumerate(months, start=1):
+            print(
+                f"[parallel_lda_mvp] month_bet_sha DuckDB ym={ym} ({i}/{n}) …",
+                flush=True,
+            )
+            t0 = time.perf_counter()
             out[ym] = _t_bet_month_content_sha256_with_con(ym, t_bet_paths, scratch_dir, con)
+            print(
+                f"[parallel_lda_mvp] month_bet_sha DuckDB ym={ym} ({i}/{n}) ok "
+                f"{time.perf_counter() - t0:.1f}s",
+                flush=True,
+            )
     finally:
         con.close()
     return out
+
+
+def _tail_and_frozen_month_lists(
+    gaming_yms: Sequence[str],
+    tail_months: int,
+) -> tuple[list[str], list[str]]:
+    """Return ``(tail_yms, frozen_yms)`` for tail recompute policy (sorted span preserved)."""
+    g = list(gaming_yms)
+    n = int(tail_months)
+    if n < 1:
+        raise ValueError(f"tail_months must be >= 1, got {tail_months!r}")
+    if len(g) <= n:
+        return g, []
+    return g[-n:], g[:-n]
 
 
 def _compute_month_bet_shas_for_span(
@@ -352,56 +574,171 @@ def _compute_month_bet_shas_for_span(
     scratch_dir: Path,
     *,
     force: bool,
-) -> tuple[dict[str, str], dict[str, int]]:
-    """Resolve ``month_bet_sha`` for span with disk cache and one-connection recompute.
+    coverage_end_gaming_day: str,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Resolve ``month_bet_sha`` with tail-month recompute + disk cache for frozen months.
 
-    Returns ``(by_ym, stats)`` where ``stats`` contains ``cache_hits``, ``recomputed``,
-    ``fallback_separate_connects`` (0 or 1).
+    Returns ``(by_ym, stats)``. ``stats`` includes recompute/cache counters, policy metadata,
+    and ``escalated_full_span`` (1 when full span DuckDB was required).
     """
-    stats = {"cache_hits": 0, "fallback_separate_connects": 0, "recomputed": 0}
+    tail_n = _MONTH_BET_SHA_TAIL_MONTHS_DEFAULT
+    stats: dict[str, Any] = {
+        "cache_hits": 0,
+        "coverage_end_gaming_day": coverage_end_gaming_day.strip(),
+        "escalated_full_span": 0,
+        "fallback_separate_connects": 0,
+        "force_recompute_used": bool(force),
+        "frozen_months_this_run": [],
+        "late_arrival_window_days": _LATE_ARRIVAL_WINDOW_DAYS_DEFAULT,
+        "mode": "unset",
+        "month_bet_sha_fingerprint_algo": "unset",
+        "month_bet_sha_policy_version": _MONTH_BET_SHA_POLICY_VERSION,
+        "month_bet_sha_strategy": "unset",
+        "recomputed": 0,
+        "tail_months_default": tail_n,
+        "tail_months_this_run": [],
+    }
     fp = _t_bet_paths_input_fingerprint(t_bet_paths)
+    target_fp_algo = _target_month_bet_fingerprint_algo(t_bet_paths)
+    cached = _read_month_bet_sha_cache(scratch_dir)
+    cache_ok = cached is not None and cached[0] == fp
+    disk_algo = str(cached[2]) if cache_ok else None
+    by_disk: dict[str, str] = dict(cached[1]) if cache_ok else {}
+    cache_effective = bool(cache_ok and disk_algo == target_fp_algo)
+    if cache_ok and not cache_effective:
+        print(
+            "[parallel_lda_mvp] month_bet_sha cache ignored: fingerprint_algo "
+            f"disk={disk_algo!r} target={target_fp_algo!r} (rebuild span months)",
+            flush=True,
+        )
+        by_disk = {}
+
     result: dict[str, str] = {}
     to_compute: list[str] = []
+    gys = list(gaming_yms)
 
-    if not force:
-        cached = _read_month_bet_sha_cache(scratch_dir)
-        if cached is not None and cached[0] == fp:
-            by_disk = cached[1]
-            for ym in gaming_yms:
-                if ym in by_disk:
+    if force:
+        to_compute = list(gys)
+        stats["escalated_full_span"] = 1
+        stats["mode"] = "force_full"
+    elif len(gys) <= tail_n:
+        if cache_effective and all(ym in by_disk for ym in gys):
+            for ym in gys:
+                result[ym] = by_disk[ym]
+                stats["cache_hits"] += 1
+            stats["mode"] = "small_span_cache_all"
+        else:
+            to_compute = list(gys)
+            stats["mode"] = "small_span_cold_or_incomplete"
+            if (not cache_effective) or (not all(ym in by_disk for ym in gys)):
+                stats["escalated_full_span"] = 1
+    else:
+        tail, frozen = _tail_and_frozen_month_lists(gys, tail_n)
+        stats["tail_months_this_run"] = tail
+        stats["frozen_months_this_run"] = frozen
+        if not cache_effective:
+            to_compute = list(gys)
+            stats["mode"] = "cold_no_cache_or_fp_mismatch"
+            stats["escalated_full_span"] = 1
+        else:
+            missing_frozen = [ym for ym in frozen if ym not in by_disk]
+            if missing_frozen:
+                to_compute = list(gys)
+                stats["mode"] = "escalate_missing_frozen_in_cache"
+                stats["escalated_full_span"] = 1
+            else:
+                for ym in frozen:
                     result[ym] = by_disk[ym]
                     stats["cache_hits"] += 1
-                else:
-                    to_compute.append(ym)
-        else:
-            to_compute = list(gaming_yms)
+                to_compute = list(tail)
+                stats["mode"] = "tail_only_recompute"
+
+    if not to_compute:
+        stats["month_bet_sha_fingerprint_algo"] = disk_algo if cache_effective else target_fp_algo
+        stats["month_bet_sha_strategy"] = stats["month_bet_sha_fingerprint_algo"]
     else:
-        to_compute = list(gaming_yms)
+        stats["month_bet_sha_fingerprint_algo"] = target_fp_algo
+        stats["month_bet_sha_strategy"] = target_fp_algo
+
+    print(
+        f"[parallel_lda_mvp] month_bet_sha policy={stats['month_bet_sha_policy_version']} "
+        f"mode={stats['mode']} inputs_fp={fp[:12]}… "
+        f"from_cache={stats['cache_hits']} recompute_queue={len(to_compute)} "
+        f"late_arrival_days={stats['late_arrival_window_days']} "
+        f"force_recompute={stats['force_recompute_used']} "
+        f"target_fp_algo={target_fp_algo} fp_algo={stats['month_bet_sha_fingerprint_algo']}",
+        flush=True,
+    )
 
     if to_compute:
         stats["recomputed"] = len(to_compute)
-        try:
-            batch = _recompute_month_bet_shas_one_connection(to_compute, t_bet_paths, scratch_dir)
-            result.update(batch)
-        except Exception as exc:
-            print(
-                f"[parallel_lda_mvp] month_bet_sha batch DuckDB failed ({exc!r}); "
-                f"fallback per-month connect",
-                flush=True,
-            )
-            stats["fallback_separate_connects"] = 1
-            for ym in to_compute:
+        recompute_algo = target_fp_algo
+        batch: dict[str, str] = {}
+        if recompute_algo == _FINGERPRINT_ALGO_ROLLING:
+            try:
+                import duckdb
+
+                con_roll = duckdb.connect()
                 try:
-                    result[ym] = _t_bet_month_content_sha256(ym, t_bet_paths, scratch_dir)
-                except Exception as inner_exc:
-                    done_here = sorted(k for k in to_compute if k in result)
-                    pending_here = sorted(k for k in to_compute if k not in result)
-                    raise RuntimeError(
-                        "[parallel_lda_mvp] month_bet_sha per-month fallback failed "
-                        f"at ym={ym!r} ({inner_exc!r}); "
-                        f"months completed in this fallback batch: {done_here}; "
-                        f"not yet computed in this batch: {pending_here}"
-                    ) from inner_exc
+                    rp_list = _t_bet_read_parquet_rp_list(t_bet_paths)
+                    if not _rolling_parquet_columns_ok(con_roll, rp_list=rp_list):
+                        raise RuntimeError("rolling fingerprint: required columns missing on t_bet")
+                    batch = _rolling_month_fingerprints_for_yms(
+                        con_roll, rp_list=rp_list, yms=to_compute
+                    )
+                finally:
+                    con_roll.close()
+            except Exception as exc:
+                print(
+                    f"[parallel_lda_mvp] month_bet_sha rolling fingerprint failed ({exc!r}); "
+                    "fallback legacy extract+hash",
+                    flush=True,
+                )
+                recompute_algo = _FINGERPRINT_ALGO_LEGACY
+                batch = {}
+
+        if recompute_algo == _FINGERPRINT_ALGO_LEGACY:
+            try:
+                batch = _recompute_month_bet_shas_one_connection(to_compute, t_bet_paths, scratch_dir)
+            except Exception as exc:
+                print(
+                    f"[parallel_lda_mvp] month_bet_sha batch DuckDB failed ({exc!r}); "
+                    f"fallback per-month connect",
+                    flush=True,
+                )
+                stats["fallback_separate_connects"] = 1
+                nf = len(to_compute)
+                for j, ym in enumerate(to_compute, start=1):
+                    print(
+                        f"[parallel_lda_mvp] month_bet_sha fallback ym={ym} ({j}/{nf}) …",
+                        flush=True,
+                    )
+                    t_fb = time.perf_counter()
+                    try:
+                        batch[ym] = _t_bet_month_content_sha256(ym, t_bet_paths, scratch_dir)
+                        print(
+                            f"[parallel_lda_mvp] month_bet_sha fallback ym={ym} ({j}/{nf}) ok "
+                            f"{time.perf_counter() - t_fb:.1f}s",
+                            flush=True,
+                        )
+                    except Exception as inner_exc:
+                        done_here = sorted(k for k in to_compute if k in batch)
+                        pending_here = sorted(k for k in to_compute if k not in batch)
+                        raise RuntimeError(
+                            "[parallel_lda_mvp] month_bet_sha per-month fallback failed "
+                            f"at ym={ym!r} ({inner_exc!r}); "
+                            f"months completed in this fallback batch: {done_here}; "
+                            f"not yet computed in this batch: {pending_here}"
+                        ) from inner_exc
+
+        result.update(batch)
+        stats["month_bet_sha_fingerprint_algo"] = recompute_algo
+        stats["month_bet_sha_strategy"] = recompute_algo
+        print(
+            f"[parallel_lda_mvp] month_bet_sha recompute finished algo={recompute_algo} "
+            f"n={len(to_compute)}",
+            flush=True,
+        )
 
     missing = [ym for ym in gaming_yms if ym not in result]
     if missing:
@@ -410,9 +747,15 @@ def _compute_month_bet_shas_for_span(
             f"missing keys: {missing}"
         )
     subset = {ym: result[ym] for ym in gaming_yms}
+    cache_write_algo = str(stats.get("month_bet_sha_fingerprint_algo") or target_fp_algo)
     if stats["recomputed"] > 0 or force:
         try:
-            _write_month_bet_sha_cache(scratch_dir, t_bet_inputs_fingerprint=fp, span_by_ym=subset)
+            _write_month_bet_sha_cache(
+                scratch_dir,
+                t_bet_inputs_fingerprint=fp,
+                span_by_ym=subset,
+                fingerprint_algo=cache_write_algo,
+            )
         except OSError as exc:
             print(f"[parallel_lda_mvp] month_bet_sha cache write skipped: {exc!r}", flush=True)
     return subset, stats
@@ -690,6 +1033,11 @@ def _run_runfact_for_month(
             source_namespace=SOURCE_NAMESPACE_DEFAULT,
         )
         print(f"[parallel_lda_mvp] run_fact staging ym={ym} {time.perf_counter() - t_stage:.1f}s")
+        id_summary_once: dict[str, Any] | None = None
+        if delay_src is not None and delay_src.is_file():
+            id_summary_once = compute_ingestion_delay_summary_preview(
+                con, delay_src, late_threshold_sec=DEFAULT_LATE_THRESHOLD_SEC
+            )
         try:
             rf_prog.start()
             for gd in days:
@@ -703,11 +1051,6 @@ def _run_runfact_for_month(
                     output_parquet=st_pq,
                     run_end_gaming_day=gd,
                 )
-                id_summary = None
-                if delay_src is not None and delay_src.is_file():
-                    id_summary = compute_ingestion_delay_summary_preview(
-                        con, delay_src, late_threshold_sec=DEFAULT_LATE_THRESHOLD_SEC
-                    )
                 manifest = build_run_fact_manifest(
                     source_snapshot_id=snap,
                     run_end_gaming_day=gd,
@@ -716,7 +1059,7 @@ def _run_runfact_for_month(
                     output_parquet=out_pq,
                     manifest_uri_anchor=anchor,
                     stats=stats,
-                    ingestion_delay_summary=id_summary,
+                    ingestion_delay_summary=id_summary_once,
                 )
                 manifest = merge_source_hashes_into_manifest(manifest, None)
                 commit_parquet_and_manifest(
@@ -1260,6 +1603,7 @@ def main(argv: list[str] | None = None) -> int:
     t_session = resolve_t_session(data_root)
     gaming_yms = resolve_gaming_ym_list(t_bet_paths)
     ym_last = gaming_yms[-1]
+    coverage_end_day = gaming_days_in_month(ym_last)[-1]
     snap = infer_snapshot_id(t_bet_paths)
     cutoff = resolve_cutoff(ym_last)
 
@@ -1318,11 +1662,16 @@ def main(argv: list[str] | None = None) -> int:
 
     py = sys.executable
     force = _force_recompute_months()
+    print(
+        f"[parallel_lda_mvp] {_ENV_FORCE_RECOMPUTE}={os.environ.get(_ENV_FORCE_RECOMPUTE, '')!r} "
+        f"-> force_recompute_months={force}",
+        flush=True,
+    )
     preprocess_dirty_by_ym: dict[str, bool] = {}
     n_ym = len(gaming_yms)
     print(
         f"[parallel_lda_mvp] month_bet_sha start n_months={n_ym} "
-        f"(cache + single DuckDB connection batch) …",
+        f"(tail={_MONTH_BET_SHA_TAIL_MONTHS_DEFAULT}m + cache + single DuckDB conn) …",
         flush=True,
     )
     t_mb = time.perf_counter()
@@ -1331,11 +1680,15 @@ def main(argv: list[str] | None = None) -> int:
         t_bet_paths,
         scratch_dir,
         force=force,
+        coverage_end_gaming_day=coverage_end_day,
     )
     print(
         f"[parallel_lda_mvp] month_bet_sha done n={len(month_bet_sha_by_ym)} "
+        f"mode={sha_stats.get('mode')} esc_full={sha_stats.get('escalated_full_span')} "
         f"cache_hits={sha_stats['cache_hits']} recomputed={sha_stats['recomputed']} "
         f"fallback_conn={sha_stats['fallback_separate_connects']} "
+        f"fp_algo={sha_stats.get('month_bet_sha_fingerprint_algo')} "
+        f"force={sha_stats.get('force_recompute_used')} "
         f"total={time.perf_counter() - t_mb:.1f}s",
         flush=True,
     )
@@ -1404,7 +1757,6 @@ def main(argv: list[str] | None = None) -> int:
     t_sp = time.perf_counter()
     span_paths = _expected_span_run_fact_paths(snap_root=snap_root, gaming_yms=gaming_yms)
     span_fp = _span_run_fact_input_fingerprint(span_paths)
-    coverage_end_day = gaming_days_in_month(ym_last)[-1]
     print(
         f"[parallel_lda_mvp] span_fp={span_fp[:10]}… run_fact_parts={len(span_paths)} "
         f"coverage_end={coverage_end_day} {time.perf_counter() - t_sp:.2f}s",
@@ -1455,7 +1807,15 @@ def main(argv: list[str] | None = None) -> int:
             "ingest_yaml_content_sha256": ingest_sha,
             "ingestion_fix_registry_yaml": str(ingest_yaml.as_posix()) if ingest_yaml else None,
             "l1_partition_layout": "flat_month_v1",
+            "late_arrival_window_days": sha_stats["late_arrival_window_days"],
             "mapping_cache_fingerprint": map_fp,
+            "month_bet_sha_escalated_full_span": bool(sha_stats.get("escalated_full_span")),
+            "month_bet_sha_fingerprint_algo": sha_stats.get("month_bet_sha_fingerprint_algo"),
+            "month_bet_sha_mode": sha_stats.get("mode"),
+            "month_bet_sha_policy_version": sha_stats.get("month_bet_sha_policy_version"),
+            "month_bet_sha_strategy": sha_stats.get("month_bet_sha_strategy"),
+            "month_bet_sha_tail_months_default": sha_stats.get("tail_months_default"),
+            "force_recompute_used": bool(sha_stats.get("force_recompute_used")),
             "output_root": str(out_root.as_posix()),
             "preprocess_dirty_any": preprocess_dirty_by_ym.get(ym, False),
             "preprocess_month_batch_stamp": PREPROCESS_MONTH_BATCH_STAMP,

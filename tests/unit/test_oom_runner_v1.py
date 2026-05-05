@@ -43,6 +43,30 @@ def test_is_likely_oom_exception() -> None:
     assert not is_likely_oom_exception(ValueError("bad sql"))
 
 
+def test_run_duckdb_job_success_when_work_returns_none(tmp_path: Path) -> None:
+    """Void ``work`` that returns ``None`` must not be treated as OOM exhaustion."""
+
+    def connect() -> MagicMock:
+        return MagicMock()
+
+    def work(_con: MagicMock) -> None:
+        return None
+
+    pq = tmp_path / "in.parquet"
+    pq.write_bytes(b"x")
+    out = run_duckdb_job_with_oom_retries(
+        connect=connect,
+        work=work,
+        input_paths=[pq],
+        job_name="unit_void_ok",
+        run_log_path=None,
+        failure_context_path=None,
+        max_attempts=3,
+        initial_memory_limit_mb=None,
+    )
+    assert out is None
+
+
 def test_run_duckdb_job_retries_then_succeeds(tmp_path: Path) -> None:
     """Second attempt succeeds: determinism of returned value; both attempts logged."""
     log = tmp_path / "run.jsonl"

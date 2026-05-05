@@ -22,10 +22,22 @@ RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT = "run_boundary_v1"
 SOURCE_NAMESPACE_DEFAULT = "layered_data_assets_l1"
 _RUN_FACT_TRANSFORM_VERSION = "v1"
 
+# Columns required for gap-based run boundaries and downstream ``run_fact_staging`` /
+# ``run_bet_map`` / ``run_day_bridge`` joins (avoid ``SELECT *`` to cut Parquet I/O + memory).
+_RUN_BOUNDARY_BET_INPUT_COLS: tuple[str, ...] = (
+    "gaming_day",
+    "bet_id",
+    "player_id",
+    "payout_complete_dtm",
+)
+_RUN_BOUNDARY_BET_SELECT_LIST = ",\n    ".join(_RUN_BOUNDARY_BET_INPUT_COLS)
+
 _RUN_BOUNDARY_BETS_SQL = """
 CREATE OR REPLACE TEMP TABLE run_boundary_bets AS
 WITH src AS (
-  SELECT * FROM read_parquet([{rp}])
+  SELECT
+    {_cols}
+  FROM read_parquet([{rp}])
 ),
 ord AS (
   SELECT
@@ -99,7 +111,11 @@ def build_create_run_boundary_bets_sql(
     """Create temp ``run_boundary_bets``: one row per bet with ``run_seq`` (no ``run_id`` yet)."""
     _validate_run_break_min(run_break_min)
     rp = _read_parquet_list_sql(input_paths)
-    return _RUN_BOUNDARY_BETS_SQL.format(rp=rp, gap=float(run_break_min))
+    return _RUN_BOUNDARY_BETS_SQL.format(
+        rp=rp,
+        gap=float(run_break_min),
+        _cols=_RUN_BOUNDARY_BET_SELECT_LIST,
+    )
 
 
 def build_create_run_fact_staging_sql(
@@ -192,6 +208,8 @@ FROM run_fact_staging
 WHERE CAST(run_end_gaming_day AS VARCHAR) = '{day_sql_escaped}'
 ORDER BY run_id
 """
+# NOTE (perf / P2 deferred): Dropping ``ORDER BY run_id`` on the COPY inner query could reduce
+# sort work for large partitions; only do so after proving no consumer relies on on-disk row order.
 
 
 def _copy_select_to_parquet(con: Any, inner_sql: str, output_parquet: Path) -> None:

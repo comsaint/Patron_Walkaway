@@ -349,7 +349,11 @@ def _raise_after_oom_exhausted(
     }
     if failure_context_path is not None:
         write_failure_context(failure_context_path, payload)
-    assert last_exc is not None
+    if last_exc is None:
+        raise RuntimeError(
+            f"{job_name}: OOM retry loop ended without success but last_exc is None "
+            f"(attempts={len(attempt_records)})"
+        )
     raise last_exc
 
 
@@ -364,7 +368,11 @@ def run_duckdb_job_with_oom_retries(
     max_attempts: int,
     initial_memory_limit_mb: int | None = None,
 ) -> T:
-    """Run ``work(con)`` with §7.1 tiered retries on likely OOM; fail-fast on other errors."""
+    """Run ``work(con)`` with §7.1 tiered retries on likely OOM; fail-fast on other errors.
+
+    Successful ``work`` may return ``None`` (void jobs). Success vs OOM exhaustion is
+    distinguished by ``last_exc``: ``None`` means the loop exited after a successful attempt.
+    """
     if max_attempts < 1:
         raise ValueError(f"max_attempts must be >= 1, got {max_attempts!r}")
     plan, hint_mb, total_b, avail, resolved = _prepare_oom_run(
@@ -381,7 +389,7 @@ def run_duckdb_job_with_oom_retries(
         job_name=job_name,
         run_log_path=run_log_path,
     )
-    if out is not None:
+    if last_exc is None:
         return out
     _raise_after_oom_exhausted(
         attempt_records=attempt_records,

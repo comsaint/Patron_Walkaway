@@ -28,4 +28,9 @@ dependencies = [
 [project.optional-dependencies]
 mlflow-system-metrics = ["psutil"]
 
+[tool.pytest.ini_options]
+markers = [
+    "slow: full end-to-end pipeline (deselect with -m \"not slow\")",
+]
+
 # Package mapping: install trainer/ as walkaway_ml (see setup.py)
