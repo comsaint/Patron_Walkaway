@@ -391,8 +391,24 @@ def _compute_month_bet_shas_for_span(
             )
             stats["fallback_separate_connects"] = 1
             for ym in to_compute:
-                result[ym] = _t_bet_month_content_sha256(ym, t_bet_paths, scratch_dir)
+                try:
+                    result[ym] = _t_bet_month_content_sha256(ym, t_bet_paths, scratch_dir)
+                except Exception as inner_exc:
+                    done_here = sorted(k for k in to_compute if k in result)
+                    pending_here = sorted(k for k in to_compute if k not in result)
+                    raise RuntimeError(
+                        "[parallel_lda_mvp] month_bet_sha per-month fallback failed "
+                        f"at ym={ym!r} ({inner_exc!r}); "
+                        f"months completed in this fallback batch: {done_here}; "
+                        f"not yet computed in this batch: {pending_here}"
+                    ) from inner_exc
 
+    missing = [ym for ym in gaming_yms if ym not in result]
+    if missing:
+        raise RuntimeError(
+            "[parallel_lda_mvp] month_bet_sha span incomplete; "
+            f"missing keys: {missing}"
+        )
     subset = {ym: result[ym] for ym in gaming_yms}
     if stats["recomputed"] > 0 or force:
         try:

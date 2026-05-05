@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from unittest.mock import patch
 
 import duckdb
 
@@ -98,3 +99,45 @@ def test_compute_month_bet_shas_matches_legacy(tmp_path: Path) -> None:
     assert by2[ym] == legacy
     assert st2["cache_hits"] == 1
     assert st2["recomputed"] == 0
+
+
+def test_compute_month_bet_shas_fallback_mid_loop_raises_runtimeerror_not_keyerror(
+    tmp_path: Path,
+) -> None:
+    """Batch failure then partial per-month fallback must not surface as KeyError on subset."""
+    pq = tmp_path / "t_bet.parquet"
+    pq.write_bytes(b"x")
+    scratch = tmp_path / "scratch"
+    yms = ["2024-07", "2024-08"]
+
+    def _batch_fail(
+        months: object,
+        paths: object,
+        sd: object,
+    ) -> dict[str, str]:
+        raise RuntimeError("simulated batch duckdb failure")
+
+    def _per_month(ym: str, paths: object, sd: object) -> str:
+        if ym == "2024-07":
+            return "a" * 64
+        raise ValueError("simulated second month failure")
+
+    with (
+        patch(
+            "parallel_lda_mvp.run_mvp._recompute_month_bet_shas_one_connection",
+            side_effect=_batch_fail,
+        ),
+        patch(
+            "parallel_lda_mvp.run_mvp._t_bet_month_content_sha256",
+            side_effect=_per_month,
+        ),
+    ):
+        try:
+            _compute_month_bet_shas_for_span(yms, [pq], scratch, force=True)
+        except KeyError as exc:
+            raise AssertionError(f"unexpected KeyError: {exc}") from exc
+        except RuntimeError as exc:
+            assert "per-month fallback" in str(exc)
+            assert exc.__cause__ is not None
+        else:
+            raise AssertionError("expected RuntimeError")
