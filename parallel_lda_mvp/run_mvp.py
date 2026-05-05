@@ -213,10 +213,82 @@ def _ingest_yaml_content_sha256(ingest_yaml: Path | None) -> str:
     return streaming_sha256_hex_file(ingest_yaml.resolve())
 
 
-def _t_bet_month_content_sha256(ym: str, t_bet_paths: list[Path], scratch_dir: Path) -> str:
-    """Hash Parquet bytes of all ``t_bet`` rows whose ``gaming_day`` falls in ``ym``."""
-    import duckdb
+_MONTH_BET_SHA_CACHE_SCHEMA_VERSION = 1
+_T_BET_MONTH_SHA_ALGO_VERSION = "t_bet_month_extract_sha_v1"
+_MONTH_BET_SHA_CACHE_FILENAME = "month_bet_sha_cache.v1.json"
 
+
+def _t_bet_paths_input_fingerprint(t_bet_paths: list[Path]) -> str:
+    """Return SHA-256 hex over stable ``path\\tsize\\tmtime_ns`` lines for all ``t_bet`` inputs."""
+    lines: list[str] = []
+    for p in sorted((x.resolve() for x in t_bet_paths), key=str):
+        if not p.is_file():
+            raise FileNotFoundError(f"t_bet input not found: {p}")
+        st = p.stat()
+        lines.append(f"{p.as_posix()}\t{st.st_size}\t{int(st.st_mtime_ns)}")
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def _read_month_bet_sha_cache(scratch_dir: Path) -> tuple[str, dict[str, str]] | None:
+    """Load validated month SHA cache; return ``(t_bet_inputs_fingerprint, by_ym)`` or ``None``."""
+    path = scratch_dir / _MONTH_BET_SHA_CACHE_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("cache_schema_version") != _MONTH_BET_SHA_CACHE_SCHEMA_VERSION:
+        return None
+    if raw.get("algo_version") != _T_BET_MONTH_SHA_ALGO_VERSION:
+        return None
+    fp = raw.get("t_bet_inputs_fingerprint")
+    if not isinstance(fp, str) or len(fp) != 64:
+        return None
+    by = raw.get("by_ym")
+    if not isinstance(by, dict):
+        return None
+    out: dict[str, str] = {}
+    for k, v in by.items():
+        if isinstance(k, str) and re.fullmatch(r"\d{4}-\d{2}", k) and isinstance(v, str) and len(v) == 64:
+            out[k] = v
+    return fp, out
+
+
+def _write_month_bet_sha_cache(
+    scratch_dir: Path,
+    *,
+    t_bet_inputs_fingerprint: str,
+    span_by_ym: dict[str, str],
+) -> None:
+    """Merge ``span_by_ym`` into on-disk cache (same fingerprint rows preserved)."""
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    path = scratch_dir / _MONTH_BET_SHA_CACHE_FILENAME
+    prev_by: dict[str, str] = {}
+    prev = _read_month_bet_sha_cache(scratch_dir)
+    if prev is not None and prev[0] == t_bet_inputs_fingerprint:
+        prev_by = dict(prev[1])
+    merged = {**prev_by, **span_by_ym}
+    payload = {
+        "algo_version": _T_BET_MONTH_SHA_ALGO_VERSION,
+        "by_ym": merged,
+        "cache_schema_version": _MONTH_BET_SHA_CACHE_SCHEMA_VERSION,
+        "t_bet_inputs_fingerprint": t_bet_inputs_fingerprint,
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _t_bet_month_content_sha256_with_con(
+    ym: str,
+    t_bet_paths: list[Path],
+    scratch_dir: Path,
+    con: object,
+) -> str:
+    """Hash month slice using existing DuckDB connection (same semantics as legacy path)."""
     from parallel_lda_mvp.eligible_builder import streaming_sha256_hex_file
 
     if not re.fullmatch(r"\d{4}-\d{2}", ym.strip()):
@@ -225,28 +297,109 @@ def _t_bet_month_content_sha256(ym: str, t_bet_paths: list[Path], scratch_dir: P
     scratch_dir.mkdir(parents=True, exist_ok=True)
     tmp = scratch_dir / f"bet_month_{ym.replace('-', '_')}_extract.parquet.tmp"
     esc_path = str(tmp.resolve().as_posix()).replace("'", "''")
-    con = duckdb.connect()
-    try:
-        con.execute(
-            f"""
-            COPY (
-              SELECT * FROM read_parquet([{rp_list}])
-              WHERE strftime('%Y-%m', TRY_CAST(gaming_day AS DATE)) = '{ym.strip()}'
-              ORDER BY
-                TRY_CAST(gaming_day AS DATE) NULLS LAST,
-                coalesce(cast(bet_id AS VARCHAR), ''),
-                coalesce(cast(player_id AS VARCHAR), '')
-            ) TO '{esc_path}' (FORMAT PARQUET)
-            """
-        )
-    finally:
-        con.close()
+    con.execute(
+        f"""
+        COPY (
+          SELECT * FROM read_parquet([{rp_list}])
+          WHERE strftime('%Y-%m', TRY_CAST(gaming_day AS DATE)) = '{ym.strip()}'
+          ORDER BY
+            TRY_CAST(gaming_day AS DATE) NULLS LAST,
+            coalesce(cast(bet_id AS VARCHAR), ''),
+            coalesce(cast(player_id AS VARCHAR), '')
+        ) TO '{esc_path}' (FORMAT PARQUET)
+        """
+    )
     if not tmp.is_file():
         raise RuntimeError(f"DuckDB did not write month extract: {tmp}")
     try:
         return streaming_sha256_hex_file(tmp)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _t_bet_month_content_sha256(ym: str, t_bet_paths: list[Path], scratch_dir: Path) -> str:
+    """Hash Parquet bytes of all ``t_bet`` rows whose ``gaming_day`` falls in ``ym``."""
+    import duckdb
+
+    con = duckdb.connect()
+    try:
+        return _t_bet_month_content_sha256_with_con(ym, t_bet_paths, scratch_dir, con)
+    finally:
+        con.close()
+
+
+def _recompute_month_bet_shas_one_connection(
+    months: Sequence[str],
+    t_bet_paths: list[Path],
+    scratch_dir: Path,
+) -> dict[str, str]:
+    """Recompute month SHAs using one DuckDB connection (still one scan per month; saves connect overhead)."""
+    import duckdb
+
+    out: dict[str, str] = {}
+    con = duckdb.connect()
+    try:
+        for ym in months:
+            out[ym] = _t_bet_month_content_sha256_with_con(ym, t_bet_paths, scratch_dir, con)
+    finally:
+        con.close()
+    return out
+
+
+def _compute_month_bet_shas_for_span(
+    gaming_yms: Sequence[str],
+    t_bet_paths: list[Path],
+    scratch_dir: Path,
+    *,
+    force: bool,
+) -> tuple[dict[str, str], dict[str, int]]:
+    """Resolve ``month_bet_sha`` for span with disk cache and one-connection recompute.
+
+    Returns ``(by_ym, stats)`` where ``stats`` contains ``cache_hits``, ``recomputed``,
+    ``fallback_separate_connects`` (0 or 1).
+    """
+    stats = {"cache_hits": 0, "fallback_separate_connects": 0, "recomputed": 0}
+    fp = _t_bet_paths_input_fingerprint(t_bet_paths)
+    result: dict[str, str] = {}
+    to_compute: list[str] = []
+
+    if not force:
+        cached = _read_month_bet_sha_cache(scratch_dir)
+        if cached is not None and cached[0] == fp:
+            by_disk = cached[1]
+            for ym in gaming_yms:
+                if ym in by_disk:
+                    result[ym] = by_disk[ym]
+                    stats["cache_hits"] += 1
+                else:
+                    to_compute.append(ym)
+        else:
+            to_compute = list(gaming_yms)
+    else:
+        to_compute = list(gaming_yms)
+
+    if to_compute:
+        stats["recomputed"] = len(to_compute)
+        try:
+            batch = _recompute_month_bet_shas_one_connection(to_compute, t_bet_paths, scratch_dir)
+            result.update(batch)
+        except Exception as exc:
+            print(
+                f"[parallel_lda_mvp] month_bet_sha batch DuckDB failed ({exc!r}); "
+                f"fallback per-month connect",
+                flush=True,
+            )
+            stats["fallback_separate_connects"] = 1
+            for ym in to_compute:
+                result[ym] = _t_bet_month_content_sha256(ym, t_bet_paths, scratch_dir)
+
+    subset = {ym: result[ym] for ym in gaming_yms}
+    if stats["recomputed"] > 0 or force:
+        try:
+            _write_month_bet_sha_cache(scratch_dir, t_bet_inputs_fingerprint=fp, span_by_ym=subset)
+        except OSError as exc:
+            print(f"[parallel_lda_mvp] month_bet_sha cache write skipped: {exc!r}", flush=True)
+    return subset, stats
 
 
 def _month_skip_keys_cached(out_root: Path) -> tuple[str, str, str, str] | None:
@@ -1151,18 +1304,22 @@ def main(argv: list[str] | None = None) -> int:
     force = _force_recompute_months()
     preprocess_dirty_by_ym: dict[str, bool] = {}
     n_ym = len(gaming_yms)
-    print(f"[parallel_lda_mvp] month_bet_sha start n_months={n_ym} (DuckDB extract+hash each) …", flush=True)
-    t_mb = time.perf_counter()
-    month_bet_sha_by_ym: dict[str, str] = {}
-    for i, ym in enumerate(gaming_yms, start=1):
-        t1 = time.perf_counter()
-        month_bet_sha_by_ym[ym] = _t_bet_month_content_sha256(ym, t_bet_paths, scratch_dir)
-        print(
-            f"[parallel_lda_mvp] month_bet_sha {i}/{n_ym} ym={ym} {time.perf_counter() - t1:.1f}s",
-            flush=True,
-        )
     print(
-        f"[parallel_lda_mvp] month_bet_sha cached n={len(month_bet_sha_by_ym)} "
+        f"[parallel_lda_mvp] month_bet_sha start n_months={n_ym} "
+        f"(cache + single DuckDB connection batch) …",
+        flush=True,
+    )
+    t_mb = time.perf_counter()
+    month_bet_sha_by_ym, sha_stats = _compute_month_bet_shas_for_span(
+        gaming_yms,
+        t_bet_paths,
+        scratch_dir,
+        force=force,
+    )
+    print(
+        f"[parallel_lda_mvp] month_bet_sha done n={len(month_bet_sha_by_ym)} "
+        f"cache_hits={sha_stats['cache_hits']} recomputed={sha_stats['recomputed']} "
+        f"fallback_conn={sha_stats['fallback_separate_connects']} "
         f"total={time.perf_counter() - t_mb:.1f}s",
         flush=True,
     )
