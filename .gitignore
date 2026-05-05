@@ -246,4 +246,7 @@ data/tmp_lda_gate1_day_range/
 
 # large files
 data/**/*.parquet
+data/parallel_lda_mvp/*
+# parallel_lda_mvp mapping cache (eligible_builder; .meta.json has absolute paths)
+parallel_lda_mvp/canonical_cache/
 *.db
