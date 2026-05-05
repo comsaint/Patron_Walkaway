@@ -4,12 +4,15 @@
 Reads one or more Parquet files (L0 ``part-*.parquet`` or raw ``t_bet`` export with at least
 ``player_id``, ``bet_id``, ``gaming_day``), applies BET-PK / BET-DQ-01
 filters, ``bet_id`` dedup (latest ``__etl_insert_Dtm``), optional dummy / eligible anti-joins,
-writes ``cleaned.parquet`` and ``manifest.json`` under ``data/l1_layered/<source_snapshot_id>/t_bet/gaming_day=.../``.
+writes ``cleaned.parquet`` + ``manifest.json`` under ``--output-dir`` (default:
+``data/l1_layered/<source_snapshot_id>/t_bet/gaming_day=.../``), or under ``--output-parquet`` /
+``--output-manifest`` when overridden.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -40,7 +43,18 @@ def _add_preprocess_bet_required_args(p: argparse.ArgumentParser) -> None:
     """Register required preprocess CLI arguments."""
     p.add_argument("--data-root", type=Path, default=Path("data"), help="Repo data root (default: ./data)")
     p.add_argument("--source-snapshot-id", required=True, help="L0 batch id, e.g. snap_...")
-    p.add_argument("--gaming-day", required=True, help="Partition value YYYY-MM-DD")
+    p.add_argument(
+        "--gaming-day",
+        type=str,
+        default=None,
+        help="Single-day partition YYYY-MM-DD (mutually exclusive with --gaming-ym)",
+    )
+    p.add_argument(
+        "--gaming-ym",
+        type=str,
+        default=None,
+        help="Calendar month YYYY-MM: preprocess entire month in one pass (mutually exclusive with --gaming-day)",
+    )
     p.add_argument(
         "--input",
         dest="inputs",
@@ -76,6 +90,18 @@ def _add_preprocess_bet_optional_args(p: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help="Override output directory (default: data/l1_layered/<snap>/t_bet/gaming_day=...)",
+    )
+    p.add_argument(
+        "--output-parquet",
+        type=Path,
+        default=None,
+        help="Override output Parquet path (parent dirs created). Default: <output-dir>/cleaned.parquet",
+    )
+    p.add_argument(
+        "--output-manifest",
+        type=Path,
+        default=None,
+        help="Override manifest JSON path. Default: <output-parquet stem>.manifest.json beside parquet",
     )
     p.add_argument(
         "--late-threshold-sec",
@@ -120,11 +146,35 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     args = _parse_args(argv)
-    out_dir = args.output_dir
-    if out_dir is None:
-        out_dir = l1_bet_partition_dir(args.data_root.resolve(), args.source_snapshot_id, args.gaming_day)
-    out_parquet = out_dir / "cleaned.parquet"
-    out_manifest = out_dir / "manifest.json"
+    gday = (args.gaming_day or "").strip() or None
+    gym = (args.gaming_ym or "").strip() or None
+    if (gday is None) == (gym is None):
+        print("Specify exactly one of --gaming-day or --gaming-ym.", file=sys.stderr)
+        return 2
+    if gym is not None and not re.fullmatch(r"\d{4}-\d{2}", gym):
+        print(f"--gaming-ym must be YYYY-MM, got {gym!r}", file=sys.stderr)
+        return 2
+
+    if args.output_parquet is not None:
+        out_parquet = args.output_parquet.resolve()
+        out_manifest = (
+            args.output_manifest.resolve()
+            if args.output_manifest is not None
+            else out_parquet.with_name(out_parquet.stem + ".manifest.json")
+        )
+    else:
+        out_dir = args.output_dir
+        if out_dir is None:
+            if gym is not None:
+                print(
+                    "With --gaming-ym you must set --output-parquet (or --output-dir); "
+                    "there is no default Hive path for a month batch.",
+                    file=sys.stderr,
+                )
+                return 2
+            out_dir = l1_bet_partition_dir(args.data_root.resolve(), args.source_snapshot_id, gday)
+        out_parquet = out_dir / "cleaned.parquet"
+        out_manifest = out_dir / "manifest.json"
     staged_parquet = staged_parquet_path(out_parquet)
     staged_m = staged_manifest_path(out_manifest)
     remove_staged_outputs(staged_parquet, staged_m)
@@ -140,7 +190,8 @@ def main(argv: list[str] | None = None) -> int:
             con=con,
             input_paths=inputs,
             output_parquet=staged_parquet,
-            gaming_day=args.gaming_day,
+            gaming_day=gday,
+            gaming_ym=gym,
             dummy_player_ids_parquet=args.dummy_player_ids_parquet,
             eligible_player_ids_parquet=args.eligible_player_ids_parquet,
             ingestion_fix_registry_path=reg_path,
@@ -175,7 +226,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     manifest = build_preprocess_manifest(
         source_snapshot_id=args.source_snapshot_id,
-        gaming_day=args.gaming_day,
+        gaming_day=gday,
+        gaming_ym=gym,
         l0_fingerprint_path=args.l0_fingerprint_json,
         output_parquet=out_parquet,
         manifest_uri_anchor=_REPO_ROOT,

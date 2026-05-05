@@ -234,23 +234,16 @@ def _time_range_from_trips(trip_df: pd.DataFrame) -> tuple[str, str]:
     return str(mn), str(mx)
 
 
-def materialize_trip_partition_parquets(
+def load_runs_build_trip_frames(
     *,
     con: Any,
     run_fact_paths: list[Path],
-    trip_start_gaming_day: str,
-    trip_fact_out: Path,
-    trip_run_map_out: Path,
     source_snapshot_id: str,
     trip_definition_version: str = TRIP_DEFINITION_VERSION_DEFAULT,
     source_namespace: str = SOURCE_NAMESPACE_DEFAULT,
     coverage_end: date | None = None,
-) -> dict[str, Any]:
-    """Compute trips from all ``run_fact`` inputs; write one ``trip_start_gaming_day`` partition.
-
-    Returns ``row_count_trip_fact``, ``row_count_trip_run_map``, ``time_range_min``, ``time_range_max``.
-    """
-    day = _validate_gaming_day(trip_start_gaming_day, param_name="trip_start_gaming_day")
+) -> tuple[pd.DataFrame, pd.DataFrame, date, pd.DataFrame]:
+    """Load ``run_fact`` inputs once and build full-span ``trip_fact`` / ``trip_run_map`` frames."""
     runs = load_run_fact_dataframe(con, run_fact_paths)
     if runs.empty:
         if coverage_end is None:
@@ -267,6 +260,22 @@ def materialize_trip_partition_parquets(
         source_namespace=source_namespace,
         coverage_end=effective_cov,
     )
+    return trip_all, map_all, effective_cov, runs
+
+
+def materialize_trip_partition_from_frames(
+    *,
+    con: Any,
+    trip_start_gaming_day: str,
+    trip_fact_out: Path,
+    trip_run_map_out: Path,
+    trip_all: pd.DataFrame,
+    map_all: pd.DataFrame,
+    effective_cov: date,
+    runs: pd.DataFrame,
+) -> dict[str, Any]:
+    """Write one ``trip_start_gaming_day`` partition from pre-built ``trip_all`` / ``map_all``."""
+    day = _validate_gaming_day(trip_start_gaming_day, param_name="trip_start_gaming_day")
     trip_part = trip_all[trip_all["trip_start_gaming_day"] == day].copy()
     map_part = map_all[map_all["trip_start_gaming_day"] == day].copy()
     trip_fact_out.parent.mkdir(parents=True, exist_ok=True)
@@ -290,6 +299,42 @@ def materialize_trip_partition_parquets(
         "coverage_end_gaming_day": effective_cov.isoformat(),
         "G_max": g_max.isoformat(),
     }
+
+
+def materialize_trip_partition_parquets(
+    *,
+    con: Any,
+    run_fact_paths: list[Path],
+    trip_start_gaming_day: str,
+    trip_fact_out: Path,
+    trip_run_map_out: Path,
+    source_snapshot_id: str,
+    trip_definition_version: str = TRIP_DEFINITION_VERSION_DEFAULT,
+    source_namespace: str = SOURCE_NAMESPACE_DEFAULT,
+    coverage_end: date | None = None,
+) -> dict[str, Any]:
+    """Compute trips from all ``run_fact`` inputs; write one ``trip_start_gaming_day`` partition.
+
+    Returns ``row_count_trip_fact``, ``row_count_trip_run_map``, ``time_range_min``, ``time_range_max``.
+    """
+    trip_all, map_all, effective_cov, runs = load_runs_build_trip_frames(
+        con=con,
+        run_fact_paths=run_fact_paths,
+        source_snapshot_id=source_snapshot_id,
+        trip_definition_version=trip_definition_version,
+        source_namespace=source_namespace,
+        coverage_end=coverage_end,
+    )
+    return materialize_trip_partition_from_frames(
+        con=con,
+        trip_start_gaming_day=trip_start_gaming_day,
+        trip_fact_out=trip_fact_out,
+        trip_run_map_out=trip_run_map_out,
+        trip_all=trip_all,
+        map_all=map_all,
+        effective_cov=effective_cov,
+        runs=runs,
+    )
 
 
 def _manifest_time_range(stats: dict[str, Any]) -> tuple[str, str]:

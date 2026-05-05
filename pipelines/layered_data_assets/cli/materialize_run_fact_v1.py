@@ -91,6 +91,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override output directory (default: data/l1_layered/<snap>/run_fact/run_end_gaming_day=...)",
     )
     p.add_argument(
+        "--output-parquet",
+        type=Path,
+        default=None,
+        help="Override output Parquet path. Default: <output-dir>/run_fact.parquet",
+    )
+    p.add_argument(
+        "--output-manifest",
+        type=Path,
+        default=None,
+        help="Override manifest JSON path. Default: <output-parquet stem>.manifest.json beside parquet",
+    )
+    p.add_argument(
         "--ingestion-delay-parquet",
         type=Path,
         default=None,
@@ -115,13 +127,21 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     args = _parse_args(argv)
-    out_dir = args.output_dir
-    if out_dir is None:
-        out_dir = l1_run_fact_partition_dir(
-            args.data_root.resolve(), args.source_snapshot_id, args.run_end_gaming_day
+    if args.output_parquet is not None:
+        out_parquet = args.output_parquet.resolve()
+        out_manifest = (
+            args.output_manifest.resolve()
+            if args.output_manifest is not None
+            else out_parquet.with_name(out_parquet.stem + ".manifest.json")
         )
-    out_parquet = out_dir / "run_fact.parquet"
-    out_manifest = out_dir / "manifest.json"
+    else:
+        out_dir = args.output_dir
+        if out_dir is None:
+            out_dir = l1_run_fact_partition_dir(
+                args.data_root.resolve(), args.source_snapshot_id, args.run_end_gaming_day
+            )
+        out_parquet = out_dir / "run_fact.parquet"
+        out_manifest = out_dir / "manifest.json"
     staged_parquet = staged_parquet_path(out_parquet)
     staged_m = staged_manifest_path(out_manifest)
     remove_staged_outputs(staged_parquet, staged_m)

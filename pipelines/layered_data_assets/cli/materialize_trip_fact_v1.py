@@ -100,6 +100,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override trip_run_map directory (default: .../trip_run_map/trip_start_gaming_day=...)",
     )
+    p.add_argument(
+        "--trip-fact-output-parquet",
+        type=Path,
+        default=None,
+        help="Override trip_fact Parquet path (default: <trip-fact-output-dir>/trip_fact.parquet)",
+    )
+    p.add_argument(
+        "--trip-fact-manifest",
+        type=Path,
+        default=None,
+        help="Override trip_fact manifest path (default: <trip-fact-parquet stem>.manifest.json)",
+    )
+    p.add_argument(
+        "--trip-run-map-output-parquet",
+        type=Path,
+        default=None,
+        help="Override trip_run_map Parquet path (default: <trip-run-map-output-dir>/trip_run_map.parquet)",
+    )
+    p.add_argument(
+        "--trip-run-map-manifest",
+        type=Path,
+        default=None,
+        help="Override trip_run_map manifest path (default: <trip-run-map-parquet stem>.manifest.json)",
+    )
     add_duckdb_oom_cli_args(p)
     return p.parse_args(argv)
 
@@ -120,20 +144,44 @@ def main(argv: list[str] | None = None) -> int:
 
     args = _parse_args(argv)
     repo_root = discover_repo_root()
-    trip_dir = args.trip_fact_output_dir
-    if trip_dir is None:
-        trip_dir = l1_trip_fact_partition_dir(
-            args.data_root.resolve(), args.source_snapshot_id, args.trip_start_gaming_day
+    explicit_trip_pq = args.trip_fact_output_parquet is not None
+    explicit_map_pq = args.trip_run_map_output_parquet is not None
+    if explicit_trip_pq ^ explicit_map_pq:
+        print(
+            "trip-fact-output-parquet and trip-run-map-output-parquet must both be set or both omitted.",
+            file=sys.stderr,
         )
-    map_dir = args.trip_run_map_output_dir
-    if map_dir is None:
-        map_dir = l1_trip_run_map_partition_dir(
-            args.data_root.resolve(), args.source_snapshot_id, args.trip_start_gaming_day
+        return 2
+    if args.trip_fact_output_parquet is not None:
+        trip_parquet = args.trip_fact_output_parquet.resolve()
+        trip_manifest = (
+            args.trip_fact_manifest.resolve()
+            if args.trip_fact_manifest is not None
+            else trip_parquet.with_name(trip_parquet.stem + ".manifest.json")
         )
-    trip_parquet = trip_dir / "trip_fact.parquet"
-    trip_manifest = trip_dir / "manifest.json"
-    map_parquet = map_dir / "trip_run_map.parquet"
-    map_manifest = map_dir / "manifest.json"
+    else:
+        trip_dir = args.trip_fact_output_dir
+        if trip_dir is None:
+            trip_dir = l1_trip_fact_partition_dir(
+                args.data_root.resolve(), args.source_snapshot_id, args.trip_start_gaming_day
+            )
+        trip_parquet = trip_dir / "trip_fact.parquet"
+        trip_manifest = trip_dir / "manifest.json"
+    if args.trip_run_map_output_parquet is not None:
+        map_parquet = args.trip_run_map_output_parquet.resolve()
+        map_manifest = (
+            args.trip_run_map_manifest.resolve()
+            if args.trip_run_map_manifest is not None
+            else map_parquet.with_name(map_parquet.stem + ".manifest.json")
+        )
+    else:
+        map_dir = args.trip_run_map_output_dir
+        if map_dir is None:
+            map_dir = l1_trip_run_map_partition_dir(
+                args.data_root.resolve(), args.source_snapshot_id, args.trip_start_gaming_day
+            )
+        map_parquet = map_dir / "trip_run_map.parquet"
+        map_manifest = map_dir / "manifest.json"
     st_trip_pq = staged_parquet_path(trip_parquet)
     st_trip_m = staged_manifest_path(trip_manifest)
     st_map_pq = staged_parquet_path(map_parquet)

@@ -25,6 +25,9 @@ from pipelines.layered_data_assets.core.preprocess_bet_ingestion_fix_registry_v1
 _PREPROCESS_RULE_ID = "preprocess_bet_v1"
 _PREPROCESS_RULE_VERSION = "v1"
 
+# Bump when month-scope batch semantics (WHERE / dedup over a calendar month) change; used by MVP cache keys.
+PREPROCESS_MONTH_BATCH_STAMP = "preprocess_month_batch_v1"
+
 # Columns referenced unconditionally by preprocess SQL (WHERE / PARTITION BY / ORDER BY).
 _PREPROCESS_T_BET_REQUIRED_COLUMNS: frozenset[str] = frozenset({"player_id", "bet_id", "gaming_day"})
 
@@ -93,6 +96,14 @@ def _gaming_day_literal(gaming_day: str) -> str:
     return f"DATE '{s}'"
 
 
+def _gaming_ym_sql_literal(gaming_ym: str) -> str:
+    """Validate ``YYYY-MM`` and return a single-quoted literal for SQL ``WHERE``."""
+    s = gaming_ym.strip()
+    if not re.fullmatch(r"\d{4}-\d{2}", s):
+        raise ValueError(f"gaming_ym must be YYYY-MM, got {gaming_ym!r}")
+    return f"'{s.replace(chr(39), chr(39) + chr(39))}'"
+
+
 def _preprocess_where_fragments(
     gaming_day: str,
     columns: set[str],
@@ -106,6 +117,33 @@ def _preprocess_where_fragments(
         "player_id <> -1",
         "bet_id IS NOT NULL",
         f"gaming_day = {gd}",
+    ]
+    if "is_deleted" in columns:
+        parts.append("(TRY_CAST(is_deleted AS INTEGER) IS NULL OR TRY_CAST(is_deleted AS INTEGER) = 0)")
+    if "is_canceled" in columns:
+        parts.append("(TRY_CAST(is_canceled AS INTEGER) IS NULL OR TRY_CAST(is_canceled AS INTEGER) = 0)")
+    if "is_manual" in columns:
+        parts.append("(TRY_CAST(is_manual AS INTEGER) IS NULL OR TRY_CAST(is_manual AS INTEGER) = 0)")
+    if dummy_ids_table_sql:
+        parts.append("player_id NOT IN (SELECT player_id FROM dummy_ids)")
+    if eligible_ids_table_sql:
+        parts.append("player_id IN (SELECT player_id FROM eligible_ids)")
+    return parts
+
+
+def _preprocess_where_fragments_month(
+    gaming_ym: str,
+    columns: set[str],
+    dummy_ids_table_sql: str | None,
+    eligible_ids_table_sql: str | None,
+) -> list[str]:
+    """SQL fragments for one calendar month (``YYYY-MM``) of ``gaming_day`` rows."""
+    ym_lit = _gaming_ym_sql_literal(gaming_ym)
+    parts = [
+        "player_id IS NOT NULL",
+        "player_id <> -1",
+        "bet_id IS NOT NULL",
+        f"strftime('%Y-%m', TRY_CAST(gaming_day AS DATE)) = {ym_lit}",
     ]
     if "is_deleted" in columns:
         parts.append("(TRY_CAST(is_deleted AS INTEGER) IS NULL OR TRY_CAST(is_deleted AS INTEGER) = 0)")
@@ -205,17 +243,26 @@ def build_preprocess_sql(
     *,
     input_paths: list[Path],
     output_parquet: Path,
-    gaming_day: str,
+    gaming_day: str | None = None,
+    gaming_ym: str | None = None,
     dummy_ids_table_sql: str | None,
     eligible_ids_table_sql: str | None,
     columns: set[str],
     ingest_delay_cap_sec: int | None = None,
 ) -> str:
     """Build a single DuckDB ``COPY (SELECT ...) TO ...`` statement (no bind params)."""
+    if (gaming_day is None) == (gaming_ym is None):
+        raise ValueError("build_preprocess_sql requires exactly one of gaming_day or gaming_ym")
     rp_list = _read_parquet_list_sql(input_paths)
-    where_sql = " AND ".join(
-        _preprocess_where_fragments(gaming_day, columns, dummy_ids_table_sql, eligible_ids_table_sql)
-    )
+    if gaming_ym is not None:
+        where_sql = " AND ".join(
+            _preprocess_where_fragments_month(gaming_ym, columns, dummy_ids_table_sql, eligible_ids_table_sql)
+        )
+    else:
+        assert gaming_day is not None
+        where_sql = " AND ".join(
+            _preprocess_where_fragments(gaming_day, columns, dummy_ids_table_sql, eligible_ids_table_sql)
+        )
     order_etl, order_payout = _preprocess_order_columns(columns)
     with_prefix = _preprocess_with_clause_prefix(dummy_ids_table_sql, eligible_ids_table_sql)
     inner = _preprocess_pipeline_select_sql(
@@ -311,13 +358,20 @@ def run_preprocess_bet_v1(
     con: Any,
     input_paths: list[Path],
     output_parquet: Path,
-    gaming_day: str,
+    gaming_day: str | None = None,
+    gaming_ym: str | None = None,
     dummy_player_ids_parquet: Path | None,
     eligible_player_ids_parquet: Path | None,
     ingestion_fix_registry_path: Path | None = None,
     ingestion_fix_registry_version_expected: str | None = None,
 ) -> dict[str, Any]:
-    """Execute preprocess SQL; return stats dict (row_count, subrules_applied, gaps)."""
+    """Execute preprocess SQL; return stats dict (row_count, subrules_applied, gaps).
+
+    Pass exactly one of ``gaming_day`` (single partition) or ``gaming_ym`` (``YYYY-MM``,
+    full-month dedup/backfill over all rows in that calendar month).
+    """
+    if (gaming_day is None) == (gaming_ym is None):
+        raise ValueError("run_preprocess_bet_v1 requires exactly one of gaming_day or gaming_ym")
     if not input_paths:
         raise ValueError("input_paths must be non-empty")
     gaps: list[str] = []
@@ -347,6 +401,7 @@ def run_preprocess_bet_v1(
         input_paths=input_paths,
         output_parquet=output_parquet,
         gaming_day=gaming_day,
+        gaming_ym=gaming_ym,
         dummy_ids_table_sql=dummy_sql,
         eligible_ids_table_sql=elig_sql,
         columns=cols,
@@ -375,6 +430,12 @@ def run_preprocess_bet_v1(
         out["ingestion_fix_rule_version"] = fix_rule_version
         out["applied_fix_rules"] = applied_fix_rules
         out["ingestion_fix_registry_path"] = str(ingestion_fix_registry_path.resolve().as_posix())
+    if gaming_ym is not None:
+        out["preprocess_scope"] = "gaming_ym_month"
+        out["gaming_ym"] = gaming_ym.strip()
+        out["preprocess_month_batch_stamp"] = PREPROCESS_MONTH_BATCH_STAMP
+    else:
+        out["preprocess_scope"] = "gaming_day"
     return out
 
 
@@ -404,7 +465,7 @@ def _manifest_hashes_for_output(l0_fingerprint_path: Path | None) -> list[str]:
 def _l1_bet_clean_manifest_dict(
     *,
     source_snapshot_id: str,
-    gaming_day: str,
+    partition_keys: dict[str, str],
     part_id: str,
     source_hashes: list[str],
     built_at: str,
@@ -421,7 +482,7 @@ def _l1_bet_clean_manifest_dict(
     ids = ingestion_delay_summary if ingestion_delay_summary is not None else manifest_ingestion_delay_placeholder()
     body: dict[str, Any] = {
         "artifact_kind": "l1_t_bet_clean",
-        "partition_keys": {"gaming_day": gaming_day.strip(), "source_snapshot_id": source_snapshot_id.strip()},
+        "partition_keys": dict(partition_keys),
         "definition_version": "layered_data_assets_v1",
         "feature_version": "na_l1_preprocess",
         "transform_version": _PREPROCESS_RULE_VERSION,
@@ -449,7 +510,8 @@ def _l1_bet_clean_manifest_dict(
 def build_preprocess_manifest(
     *,
     source_snapshot_id: str,
-    gaming_day: str,
+    gaming_day: str | None = None,
+    gaming_ym: str | None = None,
     l0_fingerprint_path: Path | None,
     output_parquet: Path,
     manifest_uri_anchor: Path,
@@ -463,9 +525,21 @@ def build_preprocess_manifest(
 
     ``manifest_uri_anchor`` is usually the repository root so ``output_relative_uri`` matches
     ``data/l1_layered/...`` style paths.
+
+    Exactly one of ``gaming_day`` or ``gaming_ym`` must be set (partition labels).
     """
     validate_source_snapshot_id(source_snapshot_id)
-    part_id = f"l0/t_bet/gaming_day={gaming_day.strip()}"
+    if (gaming_day is None) == (gaming_ym is None):
+        raise ValueError("build_preprocess_manifest requires exactly one of gaming_day or gaming_ym")
+    if gaming_ym is not None:
+        ym = gaming_ym.strip()
+        part_id = f"l0/t_bet/gaming_ym={ym}"
+        partition_keys = {"gaming_ym": ym, "source_snapshot_id": source_snapshot_id.strip()}
+    else:
+        assert gaming_day is not None
+        gd = gaming_day.strip()
+        part_id = f"l0/t_bet/gaming_day={gd}"
+        partition_keys = {"gaming_day": gd, "source_snapshot_id": source_snapshot_id.strip()}
     hashes = _manifest_hashes_for_output(l0_fingerprint_path)[:1]
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     min_ev = stats.get("time_range_min") or "1970-01-01T00:00:00Z"
@@ -482,7 +556,7 @@ def build_preprocess_manifest(
         afr = list(stats["applied_fix_rules"])
     return _l1_bet_clean_manifest_dict(
         source_snapshot_id=source_snapshot_id,
-        gaming_day=gaming_day,
+        partition_keys=partition_keys,
         part_id=part_id,
         source_hashes=hashes,
         built_at=now,

@@ -243,6 +243,24 @@ def materialize_run_fact_v1(
         run_definition_version=run_definition_version,
         source_namespace=source_namespace,
     )
+    return materialize_run_fact_partition_from_staging(
+        con=con,
+        output_parquet=output_parquet,
+        run_end_gaming_day=day,
+    )
+
+
+def materialize_run_fact_partition_from_staging(
+    *,
+    con: Any,
+    output_parquet: Path,
+    run_end_gaming_day: str,
+) -> dict[str, Any]:
+    """COPY one ``run_end_gaming_day`` partition from existing ``run_fact_staging`` temp table.
+
+    Call :func:`materialize_run_boundary_temp_tables` first on the same ``con``.
+    """
+    day = _validate_gaming_day_partition_value(run_end_gaming_day)
     inner = _run_fact_copy_inner_sql(
         day_sql_escaped=day.replace("'", "''"),
         run_id_expr=_run_id_sql_expr(),

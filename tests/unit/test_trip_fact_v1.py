@@ -123,6 +123,91 @@ def test_tail_open_trip_when_insufficient_empty_days() -> None:
     assert trip_df.iloc[0]["trip_end_gaming_day"] is None or pd.isna(trip_df.iloc[0]["trip_end_gaming_day"])
 
 
+def test_cross_month_two_runs_same_trip_under_three_empty_rule() -> None:
+    """Two runs straddling month boundary with <3 empty gaming_days stay one trip."""
+    runs = _sample_runs(
+        [
+            {
+                "player_id": 42,
+                "run_id": "run_oct",
+                "first_bet_id": 1,
+                "last_bet_id": 1,
+                "run_start_ts": "2026-10-30 10:00:00",
+                "run_end_ts": "2026-10-30 11:00:00",
+                "run_start_gaming_day": "2026-10-30",
+                "run_end_gaming_day": "2026-10-30",
+                "bet_count": 1,
+                "run_definition_version": "run_boundary_v1",
+                "source_namespace": "ns",
+            },
+            {
+                "player_id": 42,
+                "run_id": "run_nov",
+                "first_bet_id": 2,
+                "last_bet_id": 2,
+                "run_start_ts": "2026-11-02 10:00:00",
+                "run_end_ts": "2026-11-02 11:00:00",
+                "run_start_gaming_day": "2026-11-02",
+                "run_end_gaming_day": "2026-11-02",
+                "bet_count": 1,
+                "run_definition_version": "run_boundary_v1",
+                "source_namespace": "ns",
+            },
+        ]
+    )
+    trip_df, map_df = build_trip_fact_and_run_map_frames(
+        runs,
+        source_snapshot_id="snap_cross_month_01",
+        trip_definition_version=TRIP_DEFINITION_VERSION_DEFAULT,
+        source_namespace=SOURCE_NAMESPACE_DEFAULT,
+        coverage_end=date(2026, 11, 30),
+    )
+    assert len(trip_df) == 1
+    assert trip_df.iloc[0]["trip_start_gaming_day"] == "2026-10-30"
+    assert len(map_df) == 2
+
+
+def test_cross_month_split_when_three_empty_days_across_boundary() -> None:
+    """Three strict empty gaming_days between runs starts a new trip even across months."""
+    runs = _sample_runs(
+        [
+            {
+                "player_id": 43,
+                "run_id": "run_a",
+                "first_bet_id": 1,
+                "last_bet_id": 1,
+                "run_start_ts": "2026-10-27 10:00:00",
+                "run_end_ts": "2026-10-28 11:00:00",
+                "run_start_gaming_day": "2026-10-27",
+                "run_end_gaming_day": "2026-10-28",
+                "bet_count": 1,
+                "run_definition_version": "run_boundary_v1",
+                "source_namespace": "ns",
+            },
+            {
+                "player_id": 43,
+                "run_id": "run_b",
+                "first_bet_id": 2,
+                "last_bet_id": 2,
+                "run_start_ts": "2026-11-01 10:00:00",
+                "run_end_ts": "2026-11-01 11:00:00",
+                "run_start_gaming_day": "2026-11-01",
+                "run_end_gaming_day": "2026-11-01",
+                "bet_count": 1,
+                "run_definition_version": "run_boundary_v1",
+                "source_namespace": "ns",
+            },
+        ]
+    )
+    trip_df, _ = build_trip_fact_and_run_map_frames(
+        runs,
+        source_snapshot_id="snap_cross_month_02",
+        coverage_end=date(2026, 11, 30),
+    )
+    assert len(trip_df) == 2
+    assert set(trip_df["trip_start_gaming_day"]) == {"2026-10-27", "2026-11-01"}
+
+
 def test_source_partitions_from_runs_sorted() -> None:
     runs = _sample_runs(
         [
