@@ -84,7 +84,7 @@ python -m trainer.trainer --use-local-parquet --recent-chunks 1 --skip-optuna --
 **不**讀寫 trainer 的 `data/canonical_mapping.*`（避免踩別人資料）。
 
 - 計算方式與 **trainer Step 3** 相同：`build_canonical_links_and_dummy_from_duckdb` → `build_canonical_mapping_from_links`（DuckDB links + pandas M:N）。
-- **Mapping 輸入**：一律經 `parallel_lda_mvp/session_for_mapping.py` 的 `prepare_session_parquet_for_canonical_mapping`；目前 **cleaned = raw**（無列級清洗），未來在此實作 backfill／去重等並改回傳 cleaned Parquet 路徑即可。邏輯版本常數 `SESSION_MAPPING_CLEAN_LOGIC_VERSION`：變更清洗規則時遞增，即使 L0 檔未變也會讓指紋變、強迫重算（驗證「來源不變、程式變」）。
+- **Mapping 輸入**：一律經 `parallel_lda_mvp/session_for_mapping.py` 的 `prepare_session_parquet_for_canonical_mapping`。預設若 repo 內存在 `schema/preprocess_ingestion_fix_registry.yaml`（`tables.t_session`），會物化一份含 `__etl_insert_Dtm_synthetic`（636s cap）的 Parquet 至 `canonical_cache/session_mapping_input/`；`PARALLEL_LDA_MVP_SESSION_INGEST_DISABLE=1` 則仍回傳 raw。邏輯版本常數 `SESSION_MAPPING_CLEAN_LOGIC_VERSION`：變更清洗規則時遞增，即使 L0 檔未變也會讓指紋變、強迫重算。
 - **快取只寫在** `parallel_lda_mvp/canonical_cache/`：`mapping_<sha256>.parquet` + `mapping_<sha256>.meta.json`。
 - **失效條件**：對 **mapping 輸入** Parquet 做**整檔串流 SHA-256**，再與 naive-HK 的 cutoff、`SESSION_MAPPING_CLEAN_LOGIC_VERSION` 合併成最終指紋。輸入檔位元組、cutoff、清洗邏輯版本任一變更 → 重跑 DuckDB。
 

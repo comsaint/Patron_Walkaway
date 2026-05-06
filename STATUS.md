@@ -22,7 +22,7 @@ python -m pytest tests/unit/test_preprocess_bet_v1.py -q --tb=short
 make check-lda-l0
 ```
 
-（可選）對真實 L0 partition 跑一次 preprocess，帶 `--ingestion-fix-registry-yaml schema/preprocess_bet_ingestion_fix_registry.yaml`，確認輸出 parquet 含 **`__etl_insert_Dtm_synthetic`** 且 manifest **`ingestion_fix_rule_id`** 非 null。
+（可選）對真實 L0 partition 跑一次 preprocess，帶 `--ingestion-fix-registry-yaml schema/preprocess_ingestion_fix_registry.yaml`，確認輸出 parquet 含 **`__etl_insert_Dtm_synthetic`** 且 manifest **`ingestion_fix_rule_id`** 非 null。
 
 #### 下一步建議
 
@@ -34,7 +34,7 @@ make check-lda-l0
 |------|------|------|----------|
 | 同 synthetic 時間 dedup 並列 | `ORDER BY synthetic DESC, bet_id DESC` 在完全相同 synthetic 時可能依引擎/讀取順序 | 測試案例避免並列，或接受 DuckDB 穩定行為 | cap 測試用明確不等 synthetic |
 | 缺 `payout`／`__etl_insert_Dtm` 仍傳 registry | 已於載入 cap 後 **`_validate_columns_for_ingest_cap`** | 維持 | **`test_preprocess_bet_v1_registry_requires_etl_and_payout_columns`** |
-| `ingestion_fix_registry_version_expected` 與 draft 版本 | `v0.4_draft` 變更會讓鎖版本 CI 失敗 | 文件註明需同步 bump | **`test_registry_version_expected_mismatch_raises`** |
+| `ingestion_fix_registry_version_expected` 與 draft 版本 | `v0.5_draft` 變更會讓鎖版本 CI 失敗 | 文件註明需同步 bump | **`test_registry_version_expected_mismatch_raises`** |
 | 延遲摘要欄位缺失 | 若未來改寫欄名，`observed_at_col` 錯會靜默 placeholder | 日誌或 assert 輸出欄存在 | cap 啟用時斷言 DESCRIBE 含 synthetic |
 | 記憶體 | 多一層 CTE 與一欄，與原 pipeline 同量級 | 大分區仍建議 OOM runner | 沿用既有 gate |
 
@@ -52,7 +52,7 @@ python -m pytest tests/unit/test_preprocess_bet_ingestion_fix_registry_v1.py tes
 
 - **`python scripts/validate_layered_contracts.py`**：**OK**。
 - **pytest（LDA L0 清單 + 新 registry 測試）**：**80 passed**（約 2.8s）；本輪無需再改 production 以通過測試。
-- **建議下一條目**：execution plan **Gate1／day-range 與 E1-11 cap 同跑**；若需 CI 鎖定 registry，對 **`--ingestion-fix-registry-version-expected v0.4_draft`** 加整合測或 RUNBOOK 一節（另開任務以免膨脹本 PR）。
+- **建議下一條目**：execution plan **Gate1／day-range 與 E1-11 cap 同跑**；若需 CI 鎖定 registry，對 **`--ingestion-fix-registry-version-expected v0.5_draft`** 加整合測或 RUNBOOK 一節（另開任務以免膨脹本 PR）。
 
 ---
 

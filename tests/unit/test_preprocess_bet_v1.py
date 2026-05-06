@@ -19,7 +19,7 @@ from layered_data_assets.preprocess_bet_v1 import (
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_INGEST_REGISTRY = _REPO_ROOT / "schema" / "preprocess_bet_ingestion_fix_registry.yaml"
+_DEFAULT_INGEST_REGISTRY = _REPO_ROOT / "schema" / "preprocess_ingestion_fix_registry.yaml"
 
 
 def test_validate_preprocess_bet_input_columns_rejects_feature_slice_names() -> None:

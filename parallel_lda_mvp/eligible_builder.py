@@ -4,8 +4,8 @@ Caches **only under** ``parallel_lda_mvp/canonical_cache/`` (never writes traine
 ``data/canonical_mapping.*``).
 
 Canonical mapping 讀入的是 **供 mapping 用的 session Parquet**（見
-``session_for_mapping.prepare_session_parquet_for_canonical_mapping``）；目前與 L0 raw
-相同，未來為 cleaned 產物。
+``session_for_mapping.prepare_session_parquet_for_canonical_mapping``）；預設可能為
+ingestion-cap 物化檔（含 ``__etl_insert_Dtm_synthetic``），見該模組說明。
 
 **Fingerprint** = SHA-256 of ( **SHA-256 over entire mapping-input file bytes** + ``|`` +
 cutoff (naive-HK ISO) + ``|`` + ``SESSION_MAPPING_CLEAN_LOGIC_VERSION`` ). 來源檔位元組、

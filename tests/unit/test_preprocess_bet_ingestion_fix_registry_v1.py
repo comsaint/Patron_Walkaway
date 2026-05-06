@@ -9,11 +9,28 @@ from layered_data_assets.preprocess_bet_ingestion_fix_registry_v1 import (
     resolve_bet_ingest_fix004_cap_binding,
 )
 from layered_data_assets.preprocess_bet_v1 import run_preprocess_bet_v1
+from pipelines.layered_data_assets.core.preprocess_ingestion_fix_registry_v1 import (
+    load_preprocess_ingestion_fix_registry,
+    table_ingestion_section,
+)
+
+
+def test_consolidated_registry_exposes_t_bet_and_t_session() -> None:
+    repo = Path(__file__).resolve().parents[2]
+    path = repo / "schema" / "preprocess_ingestion_fix_registry.yaml"
+    root = load_preprocess_ingestion_fix_registry(path)
+    assert {"t_bet", "t_session"}.issubset(set(root.get("tables", {})))
+    bet_flat = table_ingestion_section(root, "t_bet")
+    assert bet_flat.get("registry_version") == root.get("registry_version")
+    cap, _, _, _ = resolve_bet_ingest_fix004_cap_binding(bet_flat)
+    assert cap == 122
+    sess_flat = table_ingestion_section(root, "t_session")
+    assert sess_flat["bulk_historical_ingest_episodes"]["synthetic_observed_at_contract"]["ingest_delay_cap_sec"] == 636
 
 
 def test_resolve_bet_ingest_fix004_from_repo_registry() -> None:
     repo = Path(__file__).resolve().parents[2]
-    path = repo / "schema" / "preprocess_bet_ingestion_fix_registry.yaml"
+    path = repo / "schema" / "preprocess_ingestion_fix_registry.yaml"
     doc = load_preprocess_bet_ingestion_fix_registry(path)
     cap, fix_id, fix_ver, applied = resolve_bet_ingest_fix004_cap_binding(doc)
     assert cap == 122
@@ -68,17 +85,20 @@ def test_registry_version_expected_mismatch_raises(tmp_path: Path) -> None:
     p = tmp_path / "reg.yaml"
     p.write_text(
         "registry_version: wrong\n"
-        "bulk_historical_ingest_episodes:\n"
-        "  synthetic_observed_at_contract:\n"
-        "    ingest_delay_cap_sec: 122\n"
-        "active_rules:\n"
-        "  - fix_rule_id: BET-INGEST-FIX-004\n"
-        "    fix_rule_version: v1\n"
-        "    enabled: true\n"
-        "    action:\n"
-        "      type: normalize_observed_at\n"
-        "      params:\n"
-        "        cap_delay_sec: 122\n",
+        "registry_id: preprocess_ingestion_fix_registry\n"
+        "tables:\n"
+        "  t_bet:\n"
+        "    bulk_historical_ingest_episodes:\n"
+        "      synthetic_observed_at_contract:\n"
+        "        ingest_delay_cap_sec: 122\n"
+        "    active_rules:\n"
+        "      - fix_rule_id: BET-INGEST-FIX-004\n"
+        "        fix_rule_version: v1\n"
+        "        enabled: true\n"
+        "        action:\n"
+        "          type: normalize_observed_at\n"
+        "          params:\n"
+        "            cap_delay_sec: 122\n",
         encoding="utf-8",
     )
     try:
@@ -110,7 +130,7 @@ def test_registry_version_expected_mismatch_raises(tmp_path: Path) -> None:
                 dummy_player_ids_parquet=None,
                 eligible_player_ids_parquet=None,
                 ingestion_fix_registry_path=p,
-                ingestion_fix_registry_version_expected="v0.4_draft",
+                ingestion_fix_registry_version_expected="v0.5_draft",
             )
     finally:
         con.close()

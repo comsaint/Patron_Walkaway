@@ -1,7 +1,7 @@
 # 分層資料資產與 run/trip 特徵工程 — Implementation Plan
 
-> **版本**：Implementation plan **v0.13**（2026-05-04；延續 v0.12：**初版運作參數（bet 路徑）**仍為 `cleaned_bet` 每分區保留最近 **7** 個成功版本；full recompute 備援觸發為 `impact_day_ratio` **或** `changed_player_ratio` **≥ 10%**（見 §2.2.1）。v0.13 對齊 **SSOT v1.12**：補強 trip 上界時區契約（`T_max` 先於 `HK_TZ` 正規化再映射 `G_max`）、上界來源表需完成 `observed_at_logical` 量測與 cap 定版、manifest 欄位按 artifact 明確 MUST（`run_fact` vs `trip_fact`）、以及 `late_threshold` 與 `ingest_delay_cap_sec` 的語義分工（可同值但不得隱式綁定）。重大架構變更升 minor。  
-> **依據**：`ssot/layered_data_assets_run_trip_ssot.md`（v1.12）、`schema/time_semantics_registry.yaml`、`trainer/core/_config_training_domain.py`（`GAMING_DAY_START_HOUR`、`HK_TZ`）。  
+> **版本**：Implementation plan **v0.14**（2026-05-06；延續 v0.13：**初版運作參數（bet 路徑）**仍為 `cleaned_bet` 每分區保留最近 **7** 個成功版本；full recompute 備援觸發為 `impact_day_ratio` **或** `changed_player_ratio` **≥ 10%**（見 §2.2.1）。v0.14 對齊 **SSOT v1.13**：玩家鍵改為 **`pit_asof canonical_id`**，新增 identity 前置層與 sidecar 契約（`identity_mapping_mode=pit_asof`、`identity_source_snapshot_id`、`session_avail_delay_min_used`、`identity_coverage`），並將 run/trip/L2 與 parity 驗證全面由 `player_id` 語義切換至 canonical 語義。重大架構變更升 minor。  
+> **依據**：`ssot/layered_data_assets_run_trip_ssot.md`（v1.13）、`schema/time_semantics_registry.yaml`、`trainer/core/_config_training_domain.py`（`GAMING_DAY_START_HOUR`、`HK_TZ`、`IDENTITY_MAPPING_MODE`、`SESSION_AVAIL_DELAY_MIN`）。  
 > **本文層級**：架構、模組邊界、階段交付、驗證與治理；**不含**逐檔 Jira 式任務拆解。  
 > **與 trainer 關係**：本計畫先建立**與現行 `trainer` 管線並行**之資料資產產線；是否改為訓練主讀本層資產須另案決策（見 SSOT §0.1）。
 
@@ -18,7 +18,7 @@
 依據 SSOT 規範，建立一條**獨立於現有 trainer** 的「分層資料資產產線」：
 - **L0 (Raw)** → **L1 (Reusable Facts)**：將最昂貴的序列彙總，物化為穩定的 `run_fact` 與 `trip_fact`，並確保 100% Determinism。
 - **L2 (Assembly)**：在輕量組裝層才套用訓練所需的抽樣與權重。
-- **解耦特徵定義**：建立 asset-layer `feature_spec`，以 `player_id` 為唯一玩家鍵，並強制要求 100% 覆蓋現有 deploy spec 的所有特徵。
+- **解耦特徵定義**：建立 asset-layer `feature_spec`，以 **`pit_asof canonical_id`** 為唯一玩家鍵，並強制要求 100% 覆蓋現有 deploy spec 的所有特徵。
 
 **預期成果**  
 完成本計畫後，專案將具備：
@@ -35,7 +35,7 @@
 2. **分層分責**：L0（raw 快照）→ 專用 preprocessing → L1（run/trip facts + membership + bridge）→ L2（組裝／訓練消費）；**訓練策略參數不進 L1 失效鍵**。
 3. **可重現與可審計**：每一批次產物可指涉 `source_snapshot_id`、`definition_version` / `feature_version` / `transform_version`、manifest、必要時 **ingestion 延遲摘要**。
 4. **資源可控**：大表掃描以 **gaming_day（或約定分區）** 增量為主；單機路徑須支援 **串流／分批**（DuckDB 或等價），避免假設可一次載入全歷史。
-5. **與既有特徵契約對齊**：以 `package/deploy/models/feature_spec.yaml` 為覆蓋底線；採 **`player_id` + asset-layer `feature_spec`**；**全量枚舉、100% 重現與驗收**之操作定義見 **§6.1**（含 **§6.1.1**）。deploy 檔內之 `canonical_id`／`PARTITION BY canonical_id` 等僅為**現況描述**；本產線不採 `canonical_id` 作為特徵主分區鍵（見 §6.1）。
+5. **與既有特徵契約對齊**：以 `package/deploy/models/feature_spec.yaml` 為覆蓋底線；採 **`pit_asof canonical_id` + asset-layer `feature_spec`**；**全量枚舉、100% 重現與驗收**之操作定義見 **§6.1**（含 **§6.1.1**）。
 6. **可中斷與可續跑（resumable）**：以 `gaming_day` 為最小計算單元；任何單日產物需可獨立重跑、跳過已完成分區、並在中斷後從未完成日期續跑。
 7. **失效必須可解釋（invalidation-first）**：是否重算不得僅依排程頻率或固定日曆窗口決定；必須由「資料變更、參考產物變更、邏輯/規則變更、契約/Schema 變更」所組成之**語義失效模型**決定。
 8. **未知影響寧可升級全量**：凡規則變更之影響範圍無法被 machine-readable 地判定，或 impact set 擴散接近全域時，必須升級為 full recompute；不得以「猜測大概沒影響」放行增量。
@@ -67,10 +67,11 @@
 | 階段 | 輸入 | 輸出 | 備註 |
 |------|------|------|------|
 | **L0 ingest** | ClickHouse / 既有 Parquet 匯出（**`t_bet`**；**`t_session`** 同為資產層納管之來源表，見下段） | 分區 raw（immutable batch） | 每批有 `source_snapshot_id`、分區 hash |
+| **Identity normalize（新增）** | `cleaned_session`（或等價 session 輸入）+ `cleaned_bet` | `bet_identity_resolved`（每筆 bet 含 `canonical_id`、`_pit_rated`） | **MUST: `pit_asof`**；輸出 identity sidecar 與 coverage |
 | **Change index** | L0 / 參考產物 / 規則版本 | `changed_days`、`changed_player_ids`、`rule_delta` | 只記錄「什麼變了」，不直接做重算決策 |
 | **Impact analysis** | change index + lineage / membership | `impact_set_preprocess`、`impact_set_run`、`impact_set_trip` | 以 `run_day_bridge`、membership、規則 impact scope 做 closure；未知影響可升級 full |
 | **Preprocess** | L0 + rated eligible `player_id` allowlist | 清洗後 bet 流（現況：`cleaned_bet`；未來可擴 `cleaned_<entity>`） | 與 `dedup_rule_id`、registry 對齊；`BET-DQ-03` 在編排路徑為 **MUST / fail-closed** |
-| **L1 materialize** | 清洗後 bets（未來可併入其他 `cleaned_<entity>`） | `run_fact`、`trip_fact`、`run_day_bridge`、membership maps（未來可擴 `dim_<entity>`） | 依 `definition_version`；**不含**訓練抽樣參數 |
+| **L1 materialize** | identity-resolved bets（未來可併入其他 `cleaned_<entity>`） | `run_fact`、`trip_fact`、`run_day_bridge`、membership maps（未來可擴 `dim_<entity>`） | 依 `definition_version`；**不含**訓練抽樣參數 |
 | **L2 assemble** | L1 + 需求窗 | 訓練或分析用矩陣／索引 | 抽樣、權重僅在此層 |
 | **Publish（serving 基底）** | L1/L2 | `published_snapshot_id` + sidecar manifest | 週期與 SLO 於 Phase 2 固定 |
 | **Online delta（可選）** | 新 bet 流 + 上一版 published | bounded state + `late_arrival_correction_log` | 須可證明上界 |
@@ -79,7 +80,7 @@
 **`t_session` 與 L0.5（補充契約）**
 
 - **`t_session` 為本資產層來源資產**：已登錄於 `time_semantics_registry`；未來可自 **L0 raw `t_session`** 產出 **`cleaned_session`（L0.5）**，供 session 型特徵與**正規化之 canonical／rated 映射**等下游使用。
-- **現況（過渡）**：rated eligible 與 canonical 映射相關邏輯**暫借** `trainer.identity.build_rated_eligible_player_ids_df` 等既有實作，由編排器餵入 preprocess；**不得**在 LDA 另行重寫 rated 規則（見 §3 `rated_eligibility_builder`）。
+- **現況（過渡）**：rated eligible 與 canonical 映射相關邏輯**暫借** `trainer.identity.build_rated_eligible_player_ids_df` / `merge_pit_canonical_to_bets` 等既有實作，由編排器餵入 preprocess 與 identity normalize；**不得**在 LDA 另行重寫 rated 或 PIT 規則（見 §3 `rated_eligibility_builder`）。
 - **遷移目標（SHOULD）**：將 session 預處理與 ID mapping 產線**逐步遷入**本產線（同一 manifest／state／impact 框架），使 `cleaned_session` 與 mapping 產物與 `cleaned_bet` 同等治理；遷移完成前，文件與 CI 須標註「過渡期：trainer 為 session／mapping 單一來源」。
 
 ### 2.2 儲存與編排（建議）
@@ -215,7 +216,7 @@
 - **單一歸屬（MUST）**：run/trip pipeline 之核心程式碼應集中於單一路徑（例如 `pipelines/layered_data_assets/` 或等價目錄），避免同類邏輯長期散落 `scripts/`、`doc/`、`tests/` 多處且無明確主從。
 - **分層目錄（SHOULD）**：至少拆分為 `core`（業務邏輯）、`orchestration`（日區間與 state）、`io`（paths/manifest/atomic write）、`cli`（入口封裝）、`docs`（runbook/decision）；目錄名可調整，但責任邊界不可混用。
 - **入口治理（MUST）**：對外可執行入口維持固定少數（preprocess、三個 materialize、day-range orchestrator、gate1）。若遷移目錄，舊 `scripts/*.py` 先改為薄 wrapper（轉呼叫新模組）以維持向後相容。
-- **契約集中（MUST）**：schema/registry（如 `time_semantics_registry`、`preprocess_bet_ingestion_fix_registry`、manifest schema）維持單一真相來源；pipeline 僅透過明確 adapter 讀取，不在多處散寫解析邏輯。
+- **契約集中（MUST）**：schema/registry（如 `time_semantics_registry`、`preprocess_ingestion_fix_registry`、manifest schema）維持單一真相來源；pipeline 僅透過明確 adapter 讀取，不在多處散寫解析邏輯。
 - **文件分流（MUST）**：  
   - SSOT / Implementation / Execution 三層仍留在既有 planning 體系；  
   - pipeline 操作與故障排除（runbook、command cookbook、incident notes）集中於 pipeline docs；  
@@ -239,18 +240,19 @@
 |------|------|
 | **time_semantics_registry** | 維護每表 `event_time` / `observed_at` / `business_key` / `dedup_rule_id`；與 `GDP_GMWDS_Raw_Schema_Dictionary.md`、FND 對齊。 |
 | **preprocessing** | `player_id` / `bet_id` 有效性、重複版本、`manual/canceled/deleted` 等；輸出 rule id 與版本供 manifest；在編排路徑強制消費 rated eligible 名單（BET-DQ-03）。 |
-| **run_trip_builder** | 依 SSOT run v2 切 run（30 分鐘 gap + `gaming_day` hard cutoff）、依 3 個完整 gaming_day 關 trip；產出 facts + membership + bridge。 |
+| **run_trip_builder** | 依 SSOT run v2 切 run（30 分鐘 gap + `gaming_day` hard cutoff）、依 3 個完整 gaming_day 關 trip；**聚合鍵為 `canonical_id`**；產出 facts + membership + bridge。 |
 | **lineage_manifest_writer** | 寫 SSOT §8 欄位 + `ingestion_delay_summary`（published 強制）。 |
 | **feature_dependency_registry**（新建或併入 doc） | 依 **§6.1.1** 自 deploy `feature_spec.yaml` 枚舉 `(track_section, feature_id)` → 所需 L1 欄位／是否允許回掃 bet。 |
-| **parity_validator** | 抽樣或窗內比對：**依 deploy `feature_spec.yaml` 在 §6.1 所定義之 `player_id` 參考語義下獨立重算之參考值** vs **asset-layer / L2 產出**（見 §6）；**FND-11** 列除外；不依賴既有 trainer 快取產物作為唯一真相。 |
+| **parity_validator** | 抽樣或窗內比對：**依 deploy `feature_spec.yaml` 在 §6.1 所定義之 `pit_asof canonical_id` 參考語義下獨立重算之參考值** vs **asset-layer / L2 產出**（見 §6）；不依賴既有 trainer 快取產物作為唯一真相。 |
 | **publisher** | 產出 `published_snapshot_id`、刷新週期標識、可選 `online_delta_seq` 契約。 |
 | **resume_controller** | 依 state store + manifest 決定「可跳過／需重跑／可續跑」日期集合；提供 `--resume` / `--force` / `--date-from` / `--date-to` 契約。 |
 | **rated_eligibility_builder**（新增） | 單一來源為 `trainer.identity.build_rated_eligible_player_ids_df`；以 `t_session + cutoff_dtm` 產出 `eligible_player_ids` 給 preprocess；需有分批/串流策略避免 OOM。 |
+| **identity_pit_builder**（新增） | 單一來源為 `trainer.identity.build_pit_session_links_dataframe` / `merge_pit_canonical_to_bets`；輸出 bet 級 `canonical_id`（pit_asof）與 identity coverage 指標。 |
 | **change_index**（新增） | 對來源表、參考產物、registry / rule 版本產出變更索引：`changed_days`、`changed_player_ids`、`rule_delta`。 |
 | **impact_analyzer**（新增） | 將 change index 轉成各層 `impact_set_*`；使用 `run_day_bridge`、membership、已發布 metadata 做 closure 與 full-recompute 判定。 |
 | **rule_impact_registry**（新增） | 定義規則/registry 變更之 `impact_scope`（`player` / `day` / `global`）與 `fallback_policy`；供 impact analyzer 消費。 |
 
-**與 `trainer` 邊界**：第一階段仍不重構 `trainer.py` 主流程，但 **BET-DQ-03 rated eligibility 必須直接復用 `trainer.identity.build_rated_eligible_player_ids_df`**，作為 preprocess 唯一 allowlist 來源；此項屬資料品質入口契約，非可延後之最佳化工作。
+**與 `trainer` 邊界**：第一階段仍不重構 `trainer.py` 主流程，但 **BET-DQ-03 rated eligibility** 與 **pit_asof identity 解析** 必須直接復用 `trainer.identity` 單一來源實作，避免雙軌規則漂移。
 
 ---
 
@@ -259,8 +261,8 @@
 ### 4.1 `run_id` / `trip_id`（snapshot-scoped deterministic）
 
 - 遵循 SSOT §6：**同一 `source_snapshot_id` + 相同輸入與版本**下重跑必得相同 ID。
-- **實作補強（建議寫入本計畫之工程契約）**：`run_id` 之 hash 輸入除 `(player_id, run_start_ts, run_definition_version, source_namespace)` 外，**納入該 run 之第一筆 `bet_id`（依 `payout_complete_dtm ASC, bet_id ASC`）**，以避免同 timestamp 精度下之邊界歧義與碰撞風險。
-- **`trip_id`（工程契約）**：hash 輸入至少包含 `(player_id, trip_start_gaming_day, trip_definition_version, source_namespace, source_snapshot_id, first_run_id)`。其中 **`first_run_id`** 為該 trip 內依 **`run_start_ts ASC, run_id ASC`** 排序後之**第一個** `run_id`（`run_start_ts` 為 `run_fact` 與實作對齊之 run 起始事件時間欄位；`run_id` 本身已定義為 snapshot-scoped deterministic，見上條）。
+- **實作補強（建議寫入本計畫之工程契約）**：`run_id` 之 hash 輸入除 `(canonical_id, run_start_ts, run_definition_version, source_namespace)` 外，**納入該 run 之第一筆 `bet_id`（依 `payout_complete_dtm ASC, bet_id ASC`）**，以避免同 timestamp 精度下之邊界歧義與碰撞風險。
+- **`trip_id`（工程契約）**：hash 輸入至少包含 `(canonical_id, trip_start_gaming_day, trip_definition_version, source_namespace, source_snapshot_id, first_run_id)`。其中 **`first_run_id`** 為該 trip 內依 **`run_start_ts ASC, run_id ASC`** 排序後之**第一個** `run_id`（`run_start_ts` 為 `run_fact` 與實作對齊之 run 起始事件時間欄位；`run_id` 本身已定義為 snapshot-scoped deterministic，見上條）。
 - **穩定性約束（MUST）**：trip 關閉後補寫 `trip_end_*` 或 `is_trip_closed` 等欄位時，`trip_id` 不得改變；`trip_end_*` 不得納入 hash 輸入。
 
 ### 4.2 事件序與 PIT
@@ -285,7 +287,7 @@
 - **等價前提（MUST）**：同一資料範圍內，必須成立 `有 bet <=> 該日存在至少一個 run`（run 由 bet 壓縮而來，不允許空 run）。
 - **驗證要求（MUST）**：每次 `definition_version` 升版或邊界規則調整時，需以 fixture/抽樣驗證「無 bet」與「無 run」判定結果一致。
 - **無外部日曆（MUST）**：Trip v1 不引入外部賭場日曆表；以 `run_fact` 推導「有 run 之 `gaming_day`」及其缺口，缺資料日視為完整空日（在上界之前）。
-- **Phase 2 分桶／多 worker（MUST）**：採 `player_id` 分桶並行時，須先計算並凍結**單一**全域 `coverage_end_gaming_day`（寫入 snapshot sidecar 或等價），再交各 worker；**single-writer merge** 階段不得各自推導不同上界，以免 nondeterminism。
+- **Phase 2 分桶／多 worker（MUST）**：採 `canonical_id` 分桶並行時，須先計算並凍結**單一**全域 `coverage_end_gaming_day`（寫入 snapshot sidecar 或等價），再交各 worker；**single-writer merge** 階段不得各自推導不同上界，以免 nondeterminism。
 
 ---
 
@@ -299,7 +301,7 @@
 
 - `schema/time_semantics_registry.yaml` 之 **審核流程**（對應 SSOT §11 議題 7）：PR template、必填欄位檢查。
 - **Preprocessing 規格書**（短文件即可）：對應 `preprocess_*_v1` 與 FND-01/03/11/13 之對照表。
-- **Ingestion fix registry**：`schema/preprocess_bet_ingestion_fix_registry.yaml`（及後續表別 registry）欄位契約、版本策略、與 `time_semantics_registry` 一致性檢查；需包含 bulk episode 證據與 `ingest_delay_cap_sec` 量測方法。
+- **Ingestion fix registry**：`schema/preprocess_ingestion_fix_registry.yaml`（及後續表別 registry）欄位契約、版本策略、與 `time_semantics_registry` 一致性檢查；需包含 bulk episode 證據與 `ingest_delay_cap_sec` 量測方法。
 - **Manifest schema**（JSON schema 或表格）：欄位含 SSOT §8 + `ingestion_delay_summary` 結構約定；`run_fact`（及等價 run 邊界物化）manifest **必須（MUST）**納入 **`gaming_day_start_hour_used`**（整數，與 `trainer/core/_config_training_domain.py::GAMING_DAY_START_HOUR` 一致）。`trip_fact`（及等價 trip 邊界物化）manifest 或 snapshot sidecar **必須（MUST）**納入 **`gaming_day_start_hour_used`**、**`coverage_end_gaming_day`**、**`G_max`**（或等價審計欄位）與參與上界計算之來源表清單（例如 `coverage_input_tables`）。`ingestion_delay_summary`（或等價區塊）**必須**含每表（或每區塊）**`late_threshold_status` ∈ {`defined`, `undefined`}`**（JSON 字串須與此二值完全一致）；僅當 **`defined`** 時 **`late_row_count`／`late_row_ratio` 必填**；**`undefined`** 時兩者須缺省或 `null`（對齊 SSOT §4.4）。CI 驗證：`late_threshold` 占位字串（如 `TBD`）**必須**映射為 **`undefined`**。
 - **`late_arrival_correction_log` schema**（JSON schema 或表格）：與 §10 最小欄位契約一致，與 manifest 可追溯 join 鍵一併鎖定。
 - **Feature dependency registry** 初稿：依 **§6.1.1** 自 `feature_spec.yaml` 列出每一 `(track_section, feature_id)` 所需欄位與 partition key。
@@ -333,7 +335,7 @@
 
 - `trip_fact`、`trip_run_map`；`trip_fact` 分區鍵固定為 **`trip_start_gaming_day`**，並與 `run_fact`（`run_end_gaming_day`）及可選 `run_day_bridge` 影響分析對齊。
 - `trip_fact` 同時輸出**已關閉**與**進行中** trip；最小欄位需含對帳鍵（至少 `run_count`、`first_run_id`、`last_run_id` 或等價欄位）供 E2-02 membership 驗證。
-- Phase 2 MVP 計算模型採 **full snapshot 重算**（以 `player_id` 批次/分桶執行）；此為 Trip v1 正確性基線。按日 / impact-driven trip 重算列為後續 phase，須建立在已驗證之 `change_index` / `impact_analyzer` / `semantic_signature` 契約之上。
+- Phase 2 MVP 計算模型採 **full snapshot 重算**（以 `canonical_id` 批次/分桶執行）；此為 Trip v1 正確性基線。按日 / impact-driven trip 重算列為後續 phase，須建立在已驗證之 `change_index` / `impact_analyzer` / `semantic_signature` 契約之上。
 - **Trip 上界**：實作須符合 §4.3（**`observed_at_logical` 全域 max（HK 時區正規化）→ `G_max` → `coverage_end_gaming_day = G_max - 1`**；先於分桶凍結）；manifest 或 snapshot sidecar **必須**記錄 **`coverage_end_gaming_day`**、**`G_max`**（或等價審計欄位）及所掃描之來源表清單。
 - 併發寫入採 **single-writer merge**：多 worker 先輸出暫存，單一 writer 依固定排序合併分區，確保 determinism。
 - `trip_fact` manifest 需列舉本批次觸及之所有 `run_end_gaming_day` 於 `source_partitions`（固定排序），`source_hashes` 與其一一對齊。
@@ -348,7 +350,7 @@
 
 ### Phase 3 — Feature coverage 與 L2（約 3–6 週，與特徵複雜度綁定）
 
-**目標**：L2 可組裝出與 `feature_spec.yaml` 對齊之特徵集（在 `player_id` 契約下）。
+**目標**：L2 可組裝出與 `feature_spec.yaml` 對齊之特徵集（在 `pit_asof canonical_id` 契約下）。
 
 **交付物**：
 
@@ -378,9 +380,9 @@
 
 - **底線**：`package/deploy/models/feature_spec.yaml` 所列特徵須可由本產線重建（SSOT LDA-013）；**可枚舉集合與覆蓋率**以 **§6.1.1** 為準。
 - **覆蓋與重現（硬性）**：§6.1.1 所定義之**每一條**可枚舉特徵皆須納入 registry／coverage／驗證；**不論** track 或條目層級之 `enabled` / `disabled` 等狀態，**皆須可重現**（asset-layer 可標註「僅供審計／不進線上模型」但不得缺項）。**覆蓋率必須 100%**，不允許「先部分覆蓋」作為最終驗收。
-- **粒度決策（定版）**：採 **B**。維持 `player_id`，並建立/維護 **asset-layer `feature_spec`**（與 deploy 包解耦）；不得在本計畫內引入 `canonical_id` 作為特徵主分區鍵。
-- **Parity 參考語義（MUST；與 deploy `PARTITION BY canonical_id` 解耦）**：`parity_validator` 之「參考重算」與 asset-layer／L2 產出比對時，**雙方均須在 `player_id` 粒度下**解讀 deploy spec 之公式與窗語意（即以 asset-layer 已文件化之替換規則重寫 `PARTITION BY`／join 鍵，而非假設 deploy 在 production 仍以 `canonical_id` 執行）。**不得**要求數值與「未重寫之 canonical 路徑」逐格相等。
-- **FND-11（MUST）**：對 `doc/FINDINGS.md` **[FND-11]** 所描述之 `player_id` 碎裂／換卡情境，**不**視為 parity mismatch；ledger 應以專用類別（例如 `FND-11_expected_player_id_split`）記錄並附證據列，**不**計入需修復之 open mismatch 計數。非 FND-11 之數值差異仍須收斂至零。**識別提示（SHOULD）**：以 **canonical／trainer mapping** 產物（例如同一 **`casino_player_id`** 對應多 **`player_id`**）產出候選清單，供 parity job 自動標記 `FND-11_expected_player_id_split`；具體 SQL／欄位以 working plan 或 `parity_validator` 實作為準。
+- **粒度決策（定版）**：採 **A**。全面採用 **`pit_asof canonical_id`**，並建立/維護 **asset-layer `feature_spec`**（與 deploy 包解耦）。
+- **Parity 參考語義（MUST）**：`parity_validator` 之「參考重算」與 asset-layer／L2 產出比對時，**雙方均須在 `pit_asof canonical_id` 粒度下**解讀 deploy spec 之公式與窗語意；同一批次需固定 `identity_mapping_mode=pit_asof` 與 `SESSION_AVAIL_DELAY_MIN`。  
+- **Identity coverage（MUST）**：parity 與正式物化都需輸出 `pit_identity_coverage_ratio`、`pit_fallback_to_player_id_ratio`、`_pit_rated_ratio`；若 fallback 比例超過 working plan 門檻，該批次不得發布。
 - **一致性標準（硬性）**：在上一段所定義之參考語義下，採 deterministic from-scratch 計算，預設不設 `abs_diff`/`rel_diff` 容忍門檻。若遇到浮點非結合律導致差異，必須先修正計算序與聚合順序（例如固定 reduce order），而非放寬驗收門檻。
 
 #### 6.1.1 可枚舉特徵條目（操作定義）
@@ -396,7 +398,7 @@
 
 ### 6.2 Parity 方法（建議）
 
-- **序特徵**：同一 `player_id`、同一時間窗內，比對 `prev_bet_gap_min`、`loss_streak`、run boundary 類等之排序一致性。
+- **序特徵**：同一 `canonical_id`、同一時間窗內，比對 `prev_bet_gap_min`、`loss_streak`、run boundary 類等之排序一致性。
 - **聚合窗特徵**：比對 `bets_cnt_w*`、`wager_*` 等，要求 deterministic 一致（含固定排序、固定聚合順序與固定空值/型別處理）。
 - **大窗／長歷史**：分批比對 + 極端 tail 人工抽檢。
 
@@ -422,7 +424,7 @@
 | 單日分區仍過大導致 OOM | 物化失敗 | 採「估算→參數化執行→OOM 自動降載重試」：先估可用 RAM 與資料量，推導 batch/window；失敗時自動縮窗、提高 bucket 數、降低並行後重試（保留重試紀錄）。 |
 | `GAMING_DAY_START_HOUR` 與來源 `gaming_day` 口徑漂移 | run 邊界錯切、特徵不穩定 | **單一來源**為 `trainer/core/_config_training_domain.py::GAMING_DAY_START_HOUR`；manifest **必須**寫入 `gaming_day_start_hour_used`；變更視為 `definition_version` 事件並升版重算；例行抽樣比對 `gaming_day` 與 `payout_complete_dtm@HK` 邊界一致性；CI 鎖定「物化值 = trainer import 值」。 |
 | 續跑狀態不一致（state corruption） | 已完成分區被重複覆寫、或失敗分區被誤跳過 | 採原子寫入（tmp→rename）、state/manifest 雙重校驗、`--force` 僅允許顯式重算。 |
-| `player_id` 碎裂（FND-11） | trip/run 語意與業務直覺不一致 | SSOT 已接受；實作上在監控報告中追蹤「單人多段 trip」比例。 |
+| `pit_asof` identity 覆蓋不足或 fallback 過高 | run/trip 邊界退化為來源鍵，語義不穩 | 監控 `pit_identity_coverage_ratio` 與 fallback 比例；超門檻禁止發布並觸發 session 品質檢查。 |
 | trip 併發寫入競態（多 worker 同分區） | 分區內容非決定性、重跑 hash 漂移 | 採 single-writer merge：worker 僅寫暫存 shard，單一 writer 依固定排序合併並原子落檔。 |
 | deploy spec 與 asset-layer spec 語義漂移 | 特徵一致性與可維護性下降 | 以 coverage matrix + mismatch ledger 持續稽核，任何新增/修改 feature 必須雙邊對映更新。 |
 | registry 與實際表漂移 | 錯誤 event_time | PR 必須更新 registry；CI 驗證欄位存在。 |
@@ -450,7 +452,7 @@
 2. Lineage：任一批次可從 manifest 追溯到 L0 分區與 preprocessing 版本。  
 3. Membership：`trip_run_map` / `run_bet_map` 可完整重建 run/trip 邊界。  
 4. Ingestion：`published` 批次皆含 **ingestion_delay_summary**。  
-5. Feature：同 **§6.1**／**§6.1.1**（deploy spec 可枚舉特徵之 **100% 覆蓋**與在 **§6.1 所定義之 `player_id` 參考語義**下 **deterministic 一致**；**FND-11** 依 §6.1 排除）；未達成不得結案。
+5. Feature：同 **§6.1**／**§6.1.1**（deploy spec 可枚舉特徵之 **100% 覆蓋**與在 **§6.1 所定義之 `pit_asof canonical_id` 參考語義**下 **deterministic 一致**）；未達成不得結案。
 6. Resume/Idempotency：同日期區間在「一次跑完」與「中斷後續跑」兩種路徑下，輸出列數與 row-level hash 一致；已成功分區可被安全跳過。
 7. Invalidation correctness：資料 / 參考產物 / 規則變更能正確映射到 impact set；未受影響分區不得被無意義重算，受影響分區不得被漏算。
 
@@ -477,11 +479,11 @@
 ### 10.1 儲存與索引
 
 - **主鍵（PK）**：`correction_id`（UUID 或等價，全域唯一）。
-- **建議次要索引**：`(player_id, event_time_min)`（時間窗查詢、離線重算掃描）；`(published_snapshot_id_after)`（依已發布版本回溯）；可視查詢模式再加 `(source_snapshot_id)`。
+- **建議次要索引**：`(canonical_id, event_time_min)`（時間窗查詢、離線重算掃描）；`(published_snapshot_id_after)`（依已發布版本回溯）；可視查詢模式再加 `(source_snapshot_id)`。
 
 ### 10.2 消費契約
 
-- **主要讀者**：**離線重算** job（依 `published_snapshot_id` / 時間窗 / `player_id` 載入 correction 事件，決定需重算的 run/trip／特徵範圍）。
+- **主要讀者**：**離線重算** job（依 `published_snapshot_id` / 時間窗 / `canonical_id` 載入 correction 事件，決定需重算的 run/trip／特徵範圍）。
 - **非目標讀者**：本契約**不**要求線上 scorer 即時讀取該 log；線上路徑仍以 published snapshot 與有界增量契約為準（見 SSOT §5.4）。
 - **保留與 GC**：`cleaned`（L0.5）每分區 rolling **7** 版（見 §2.4）；**L0 raw** 與 **published** 之保留天數／壓縮歸檔仍列 **working plan／運維**（本計畫不定死日曆天數，以免與環境儲存策略綁死）。
 - **Working plan 待辦**：L0／published 之保留與壓縮週期、與 **L0.5 七版**策略之對齊、以及 GC 審計凍結規則，須在 **Working plan** 中列為**明確任務與 owner**。
@@ -499,7 +501,8 @@
 | `entity_type` | 受影響實體：`run` / `trip` / `feature_row`。 |
 | `entity_id_before` | 修正前實體 ID（若為新建可為 null）。 |
 | `entity_id_after` | 修正後實體 ID（若為刪除可為 null）。 |
-| `player_id` | 受影響玩家鍵。 |
+| `canonical_id` | 受影響玩家主鍵（`pit_asof`）。 |
+| `player_id` | 來源追溯鍵（可空；僅審計用途）。 |
 | `event_time_min` / `event_time_max` | 受影響事件時間範圍（event-time）。 |
 | `observed_at` | 該修正被系統觀測到的時間。 |
 | `correction_reason_code` | 修正原因代碼（late_arrival / dedup_fix / status_fix / replay 等）。 |
@@ -512,7 +515,7 @@
 最低驗收：
 
 - correction log 可追到對應 manifest 與 published snapshot。
-- 可按 `player_id` 與時間窗重建「修正前/後」差異。
+- 可按 `canonical_id` 與時間窗重建「修正前/後」差異。
 - correction log 欄位缺失率為 0（nullable-by-design 欄位除外）。
 
 ---

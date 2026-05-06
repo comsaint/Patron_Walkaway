@@ -2075,6 +2075,19 @@ def _topo_sort_candidates(candidates: list) -> list:
 
 
 # --- Track LLM DuckDB batching + OOM fallback (DEC: compute peak reduction) ---
+# Optional L1 Phase C passthrough source columns (parallel_lda_mvp bridge).  When
+# missing from ``bets_df``, :func:`compute_track_llm_features` zero-fills so CH
+# exports keep the same feature spec contract.
+_LDA_OPTIONAL_PASSTHROUGH: frozenset[str] = frozenset(
+    {
+        "lda_l1_run_bet_count",
+        "lda_trip_run_count",
+        "lda_run_ord_in_trip",
+        "lda_trip_is_closed",
+        "lda_l1_run_duration_min",
+    }
+)
+
 # Max window-ish features per DuckDB SELECT to cap materialized frame width.
 _TRACK_LLM_MAX_WINDOWISH_PER_BATCH = 8
 
@@ -2439,6 +2452,13 @@ def compute_track_llm_features(
         df = bets_df.loc[ts_for_mask <= ct + pd.Timedelta(seconds=30)].reset_index(drop=True)
     else:
         df = bets_df.copy()
+
+    for _cand in candidates:
+        if _cand.get("type") != "passthrough":
+            continue
+        _fid = str(_cand.get("feature_id") or "")
+        if _fid in _LDA_OPTIONAL_PASSTHROUGH and _fid not in df.columns:
+            df[_fid] = 0.0
 
     if df.empty:
         for cand in candidates:

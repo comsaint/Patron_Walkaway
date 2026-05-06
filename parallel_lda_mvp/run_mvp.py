@@ -25,6 +25,8 @@ Defaults (first match wins for paths):
 - ``t_bet``: ``PARALLEL_LDA_MVP_T_BET`` if set, else ``data/gmwds_t_bet.parquet``, else all
   ``data/l0_layered/*/t_bet/**/*.parquet`` (sorted).
 - ``t_session``: ``PARALLEL_LDA_MVP_T_SESSION`` if set, else ``data/gmwds_t_session.parquet``.
+- ``t_session`` mapping ingest cap: ``PARALLEL_LDA_MVP_SESSION_INGEST_DISABLE`` (passthrough raw),
+  ``PARALLEL_LDA_MVP_SESSION_INGEST_REGISTRY`` (override YAML path); see ``session_for_mapping``.
 - ``gaming_ym``: ``PARALLEL_LDA_MVP_GAMING_YM`` if set (single month only), else **every
   distinct calendar month** present in ``gaming_day`` across resolved ``t_bet`` (sorted).
 - ``source_snapshot_id``: ``PARALLEL_LDA_MVP_SNAPSHOT_ID`` if set, else parent folder after
@@ -1692,7 +1694,7 @@ def main(argv: list[str] | None = None) -> int:
     snap_root.mkdir(parents=True, exist_ok=True)
     eligible_path = snap_root / "eligible_player_ids.parquet"
 
-    ingest_default = root / "schema" / "preprocess_bet_ingestion_fix_registry.yaml"
+    ingest_default = root / "schema" / "preprocess_ingestion_fix_registry.yaml"
     ingest_yaml = ingest_default if ingest_default.is_file() else None
 
     from parallel_lda_mvp.eligible_builder import (
