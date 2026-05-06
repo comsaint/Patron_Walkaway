@@ -12,6 +12,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import trainer.trainer as trainer_mod
+# Issue #12 PR-12.2: _local_parquet_source_data_hash now lives in
+# trainer.training.data_sources; tests that monkey-patch LOCAL_PARQUET_DIR
+# must redirect that module's binding (Python's globals lookup is
+# module-scoped). trainer.LOCAL_PARQUET_DIR is still available for read.
+from trainer.training import data_sources as _data_sources_mod
 from trainer.core import config as core_config
 
 
@@ -222,8 +227,8 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
             root = Path(td)
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_bet.parquet")
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_session.parquet")
-            old_root = trainer_mod.LOCAL_PARQUET_DIR
-            trainer_mod.LOCAL_PARQUET_DIR = root
+            old_root = _data_sources_mod.LOCAL_PARQUET_DIR
+            _data_sources_mod.LOCAL_PARQUET_DIR = root
             try:
                 h1 = trainer_mod._local_parquet_source_data_hash(ws.to_pydatetime(), ee.to_pydatetime())
                 h2 = trainer_mod._local_parquet_source_data_hash(
@@ -234,7 +239,7 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
                 h3 = trainer_mod._local_parquet_source_data_hash(ws.to_pydatetime(), ee.to_pydatetime())
                 self.assertNotEqual(h1, h3)
             finally:
-                trainer_mod.LOCAL_PARQUET_DIR = old_root
+                _data_sources_mod.LOCAL_PARQUET_DIR = old_root
 
     def test_parquet_stable_rowgroups_schema_digest_succeeds_on_minimal_file(self) -> None:
         """Guard: digest must not depend on ParquetSchema.num_columns (removed in some pyarrow)."""
@@ -256,8 +261,8 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
             sess = root / "gmwds_t_session.parquet"
             pq.write_table(pa.table({"k": [1]}), bet)
             pq.write_table(pa.table({"s": [1]}), sess)
-            old_root = trainer_mod.LOCAL_PARQUET_DIR
-            trainer_mod.LOCAL_PARQUET_DIR = root
+            old_root = _data_sources_mod.LOCAL_PARQUET_DIR
+            _data_sources_mod.LOCAL_PARQUET_DIR = root
             try:
                 h0 = trainer_mod._local_parquet_source_data_hash(ws.to_pydatetime(), ee.to_pydatetime())
                 t_future = os.path.getmtime(bet) + 86400.0
@@ -265,7 +270,7 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
                 os.utime(sess, (t_future + 1.0, t_future + 1.0))
                 h1 = trainer_mod._local_parquet_source_data_hash(ws.to_pydatetime(), ee.to_pydatetime())
             finally:
-                trainer_mod.LOCAL_PARQUET_DIR = old_root
+                _data_sources_mod.LOCAL_PARQUET_DIR = old_root
         self.assertEqual(h0, h1)
 
     def test_chunk_two_stage_env_empty_uses_default_true(self) -> None:

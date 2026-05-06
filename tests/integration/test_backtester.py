@@ -116,5 +116,75 @@ class TestDualMetrics(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Issue #12 PR-12.5 — backtester rerouted to stable module surfaces.
+#
+# After PR-12.5, backtester pulls data ingress, feature pipeline, and pure
+# metric helpers from their owning modules instead of cross-importing from
+# trainer.py. These tests freeze that boundary so future refactors don't
+# regress backtester back to "import everything from trainer".
+# ---------------------------------------------------------------------------
+
+
+class TestBacktesterStableImports(unittest.TestCase):
+    """PR-12.5: backtester imports come from the new modules."""
+
+    def test_backtester_uses_data_sources_for_ingress(self):
+        self.assertIn(
+            "from trainer.training.data_sources import",
+            _SRC,
+            "backtester should import data ingress from data_sources",
+        )
+        for name in ("load_clickhouse_data", "load_local_parquet"):
+            self.assertIn(name, _SRC)
+
+    def test_backtester_uses_feature_pipeline_for_dq_and_track_human(self):
+        self.assertIn(
+            "from trainer.training.feature_pipeline import",
+            _SRC,
+            "backtester should import DQ + Track Human attach from feature_pipeline",
+        )
+        for name in ("apply_dq", "add_track_human_features"):
+            self.assertIn(name, _SRC)
+
+    def test_backtester_uses_metrics_eval_for_precision_helper(self):
+        self.assertIn(
+            "from trainer.training.metrics_eval import",
+            _SRC,
+            "backtester should pull pure metric helpers from metrics_eval",
+        )
+        # Either alias is acceptable; backtester keeps the underscore name in
+        # local scope for backwards compatibility with existing callers.
+        self.assertTrue(
+            "precision_prod_adjusted" in _SRC,
+            "backtester should import precision_prod_adjusted (or its alias) from metrics_eval",
+        )
+
+    def test_backtester_does_not_re_pull_moved_symbols_from_trainer(self):
+        """Sanity: symbols already moved must not still come via trainer.py."""
+        moved = (
+            "load_clickhouse_data",
+            "load_local_parquet",
+            "apply_dq",
+            "add_track_human_features",
+            "_precision_prod_adjusted",
+        )
+        # We grep the trainer-import block and ensure the moved names are
+        # absent from the import list specifically. A negative match against
+        # the full file would be too strict because comments and helper logic
+        # may still reference these names by string.
+        for chunk in _SRC.split("from trainer.training.trainer import"):
+            # First chunk is everything before the trainer import; skip.
+            if chunk is _SRC.split("from trainer.training.trainer import")[0]:
+                continue
+            head = chunk.split(")", 1)[0]
+            for name in moved:
+                self.assertNotIn(
+                    name, head,
+                    f"backtester should not re-pull {name} from trainer.py "
+                    "after PR-12.5; import from the owning module instead.",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

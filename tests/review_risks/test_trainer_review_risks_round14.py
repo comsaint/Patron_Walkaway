@@ -16,22 +16,58 @@ import unittest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
+# Issue #12 PR-12.2 / PR-12.3 / PR-12.5: data ingress + feature pipeline
+# coordinators were extracted out of trainer.py. Tests that AST-walk for those
+# functions must also walk the new owning modules.
+_DATA_SOURCES_PATH = _REPO_ROOT / "trainer" / "training" / "data_sources.py"
+_FEATURE_PIPELINE_PATH = _REPO_ROOT / "trainer" / "training" / "feature_pipeline.py"
+
 _SRC = _TRAINER_PATH.read_text(encoding="utf-8")
 _TREE = ast.parse(_SRC)
 
+_DATA_SOURCES_SRC = (
+    _DATA_SOURCES_PATH.read_text(encoding="utf-8") if _DATA_SOURCES_PATH.exists() else ""
+)
+_FEATURE_PIPELINE_SRC = (
+    _FEATURE_PIPELINE_PATH.read_text(encoding="utf-8")
+    if _FEATURE_PIPELINE_PATH.exists()
+    else ""
+)
+_DATA_SOURCES_TREE = ast.parse(_DATA_SOURCES_SRC) if _DATA_SOURCES_SRC else ast.parse("")
+_FEATURE_PIPELINE_TREE = (
+    ast.parse(_FEATURE_PIPELINE_SRC) if _FEATURE_PIPELINE_SRC else ast.parse("")
+)
+
+
+def _get_func_node_with_src(name: str) -> tuple[ast.FunctionDef, str]:
+    """Locate ``name`` across trainer.py and the new extracted modules.
+
+    Returns (node, owning_source) so callers can pass it to
+    ``ast.get_source_segment``.
+    """
+    for tree, src in (
+        (_TREE, _SRC),
+        (_DATA_SOURCES_TREE, _DATA_SOURCES_SRC),
+        (_FEATURE_PIPELINE_TREE, _FEATURE_PIPELINE_SRC),
+    ):
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node, src
+    raise AssertionError(
+        f"function {name!r} not found in trainer.py / data_sources.py / feature_pipeline.py"
+    )
+
 
 def _get_func_node(name: str) -> ast.FunctionDef:
-    for node in _TREE.body:
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            return node
-    raise AssertionError(f"function {name!r} not found in trainer.py")
+    node, _ = _get_func_node_with_src(name)
+    return node
 
 
 class TestTrainerReviewRisksRound14(unittest.TestCase):
     def test_r22_clickhouse_pull_includes_history_buffer_for_track_human(self):
         """R22: bets pull should include pre-window history buffer for Track-B states."""
-        load_func = _get_func_node("load_clickhouse_data")
-        load_src = ast.get_source_segment(_SRC, load_func) or ""
+        load_func, owning_src = _get_func_node_with_src("load_clickhouse_data")
+        load_src = ast.get_source_segment(owning_src, load_func) or ""
 
         # Guardrail rule: bets query should not start exactly from %(start)s.
         # We expect something like %(start)s - INTERVAL ... for history context.
@@ -43,8 +79,8 @@ class TestTrainerReviewRisksRound14(unittest.TestCase):
 
     def test_r23_apply_dq_localizes_or_converts_payout_timezone(self):
         """R23: apply_dq must handle tz-aware boundaries without naive/aware TypeError."""
-        dq_func = _get_func_node("apply_dq")
-        dq_src = ast.get_source_segment(_SRC, dq_func) or ""
+        dq_func, owning_src = _get_func_node_with_src("apply_dq")
+        dq_src = ast.get_source_segment(owning_src, dq_func) or ""
 
         # Minimal lint-like rule: payout_complete_dtm handling should include
         # timezone normalization via tz_localize or tz_convert.

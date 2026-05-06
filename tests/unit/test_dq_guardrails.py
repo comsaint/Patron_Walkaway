@@ -35,6 +35,8 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SCORER_PATH = _REPO_ROOT / "trainer" / "serving" / "scorer.py"
 _VALIDATOR_PATH = _REPO_ROOT / "trainer" / "serving" / "validator.py"
 _TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
+# Issue #12 PR-12.2: data ingress queries moved to data_sources.py.
+_DATA_SOURCES_PATH = _REPO_ROOT / "trainer" / "training" / "data_sources.py"
 _SCORER_POLL_SQL = (
     _REPO_ROOT / "trainer" / "scripts" / "scorer_poll_queries.sql"
 ).read_text(encoding="utf-8")
@@ -43,17 +45,33 @@ _SCORER_POLL_SQL = (
 _SCORER_SRC = _SCORER_PATH.read_text(encoding="utf-8")
 _VALIDATOR_SRC = _VALIDATOR_PATH.read_text(encoding="utf-8")
 _TRAINER_SRC = _TRAINER_PATH.read_text(encoding="utf-8")
+_DATA_SOURCES_SRC = (
+    _DATA_SOURCES_PATH.read_text(encoding="utf-8")
+    if _DATA_SOURCES_PATH.exists() else ""
+)
 
 _SCORER_TREE = ast.parse(_SCORER_SRC)
 _VALIDATOR_TREE = ast.parse(_VALIDATOR_SRC)
 _TRAINER_TREE = ast.parse(_TRAINER_SRC)
+_DATA_SOURCES_TREE = (
+    ast.parse(_DATA_SOURCES_SRC) if _DATA_SOURCES_SRC else ast.parse("")
+)
 
 
 def _func_src(tree: ast.Module, src: str, name: str) -> str:
-    """Return source of the top-level function *name*, or '' if not found."""
+    """Return source of the top-level function *name*, or '' if not found.
+
+    Issue #12 PR-12.2: when the function originates in trainer.py but has
+    been re-homed under trainer.training.data_sources, fall back to that
+    module so source-contract tests keep validating the moved code.
+    """
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return ast.get_source_segment(src, node) or ""
+    if tree is _TRAINER_TREE and _DATA_SOURCES_SRC:
+        for node in _DATA_SOURCES_TREE.body:
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return ast.get_source_segment(_DATA_SOURCES_SRC, node) or ""
     return ""
 
 

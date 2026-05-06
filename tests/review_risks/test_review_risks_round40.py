@@ -19,12 +19,24 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _FEATURE_SPEC_PATH = _REPO_ROOT / "trainer" / "feature_spec" / "features_candidates.yaml"
 _TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 _BACKTESTER_PATH = _REPO_ROOT / "trainer" / "backtester.py"
+# Issue #12 PR-12.3 / PR-12.5: feature pipeline coordinators (apply_dq,
+# add_track_human_features) now live in feature_pipeline.py. Tests that AST-walk
+# trainer.py for those names must also walk this module.
+_FEATURE_PIPELINE_PATH = _REPO_ROOT / "trainer" / "training" / "feature_pipeline.py"
 
 _TRAINER_SRC = _TRAINER_PATH.read_text(encoding="utf-8")
 _BACKTESTER_SRC = _BACKTESTER_PATH.read_text(encoding="utf-8")
+_FEATURE_PIPELINE_SRC = (
+    _FEATURE_PIPELINE_PATH.read_text(encoding="utf-8")
+    if _FEATURE_PIPELINE_PATH.exists()
+    else ""
+)
 
 _TRAINER_TREE = ast.parse(_TRAINER_SRC)
 _BACKTESTER_TREE = ast.parse(_BACKTESTER_SRC)
+_FEATURE_PIPELINE_TREE = (
+    ast.parse(_FEATURE_PIPELINE_SRC) if _FEATURE_PIPELINE_SRC else ast.parse("")
+)
 
 
 def _features_mod():
@@ -65,7 +77,10 @@ class TestReviewRisksRound40(unittest.TestCase):
 
     def test_r64_apply_dq_has_sessions_only_guard_for_empty_bets(self):
         """R64: apply_dq should guard `bets.empty` to avoid KeyError in local parquet path."""
-        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "apply_dq")
+        # Issue #12 PR-12.3: apply_dq lives in trainer.training.feature_pipeline.
+        src = _get_func_src(_TRAINER_TREE, _TRAINER_SRC, "apply_dq") or _get_func_src(
+            _FEATURE_PIPELINE_TREE, _FEATURE_PIPELINE_SRC, "apply_dq"
+        )
         self.assertIn("if bets.empty", src)
 
     def test_r65_train_threshold_selection_uses_precision_recall_curve(self):

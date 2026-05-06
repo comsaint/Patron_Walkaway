@@ -121,23 +121,36 @@ dec026_pr_alert_arrays = _threshold_selection_mod.dec026_pr_alert_arrays
 pick_threshold_dec026_from_pr_arrays = _threshold_selection_mod.pick_threshold_dec026_from_pr_arrays
 dec026_sanitize_per_hour_params = _threshold_selection_mod.dec026_sanitize_per_hour_params
 
+# Issue #12 PR-12.5: pull stable symbols directly from their owning modules
+# instead of going through ``trainer.training.trainer``. Anything that has
+# *not* yet moved out of trainer.py keeps importing from there and is the
+# explicit follow-up surface (load_player_profile, _to_hk, MODEL_DIR,
+# HISTORY_BUFFER_DAYS, _neg_pos_ratio_from_binary_labels).
 try:
     from labels import compute_labels  # type: ignore[import]
     from identity import build_canonical_mapping_from_df  # type: ignore[import]
     from schema_io import normalize_bets_sessions  # type: ignore[import]
-    from features import coerce_feature_dtypes  # type: ignore[import]
-    from trainer.training.trainer import (
-        MODEL_DIR,
+    from features import (  # type: ignore[import]
+        coerce_feature_dtypes,
+        compute_track_llm_features,
+        join_player_profile,
+        load_feature_spec,
+    )
+    from trainer.training.data_sources import (
         load_clickhouse_data,
         load_local_parquet,
-        apply_dq,
+    )
+    from trainer.training.feature_pipeline import (
         add_track_human_features,
-        compute_track_llm_features,
-        load_feature_spec,
+        apply_dq,
+    )
+    from trainer.training.metrics_eval import (
+        precision_prod_adjusted as _precision_prod_adjusted,
+    )
+    from trainer.training.trainer import (
+        MODEL_DIR,
         load_player_profile,
-        join_player_profile,
         _neg_pos_ratio_from_binary_labels,
-        _precision_prod_adjusted,
         _to_hk,
         HISTORY_BUFFER_DAYS,
     )
@@ -150,19 +163,27 @@ except ModuleNotFoundError:
     from trainer.labels import compute_labels  # type: ignore[import]
     from trainer.identity import build_canonical_mapping_from_df  # type: ignore[import]
     from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
-    from trainer.features import coerce_feature_dtypes  # type: ignore[import]
-    from trainer.training.trainer import (
-        MODEL_DIR,
+    from trainer.features import (  # type: ignore[import]
+        coerce_feature_dtypes,
+        compute_track_llm_features,
+        join_player_profile,
+        load_feature_spec,
+    )
+    from trainer.training.data_sources import (
         load_clickhouse_data,
         load_local_parquet,
-        apply_dq,
+    )
+    from trainer.training.feature_pipeline import (
         add_track_human_features,
-        compute_track_llm_features,
-        load_feature_spec,
+        apply_dq,
+    )
+    from trainer.training.metrics_eval import (
+        precision_prod_adjusted as _precision_prod_adjusted,
+    )
+    from trainer.training.trainer import (
+        MODEL_DIR,
         load_player_profile,
-        join_player_profile,
         _neg_pos_ratio_from_binary_labels,
-        _precision_prod_adjusted,
         _to_hk,
         HISTORY_BUFFER_DAYS,
     )

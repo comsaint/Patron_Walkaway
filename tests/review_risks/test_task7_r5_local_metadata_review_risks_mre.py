@@ -19,6 +19,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import trainer.trainer as trainer_mod
+# Issue #12 PR-12.2: _local_parquet_source_data_hash now resolves
+# LOCAL_PARQUET_DIR from trainer.training.data_sources globals; tests that
+# rebind the path must do so on that module.
+from trainer.training import data_sources as _data_sources_mod
 
 
 class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
@@ -78,15 +82,15 @@ class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
             root = Path(td)
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_bet.parquet")
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_session.parquet")
-            old = trainer_mod.LOCAL_PARQUET_DIR
-            trainer_mod.LOCAL_PARQUET_DIR = root
+            old = _data_sources_mod.LOCAL_PARQUET_DIR
+            _data_sources_mod.LOCAL_PARQUET_DIR = root
             try:
                 with patch.object(pq, "read_metadata", side_effect=OSError("boom")):
                     h = trainer_mod._local_parquet_source_data_hash(
                         ws.to_pydatetime(), ee.to_pydatetime()
                     )
             finally:
-                trainer_mod.LOCAL_PARQUET_DIR = old
+                _data_sources_mod.LOCAL_PARQUET_DIR = old
         self.assertEqual(len(h), 8)
         # Both files hit except -> two |-1| fragments in payload before md5
         src = inspect.getsource(trainer_mod._local_parquet_source_data_hash)
@@ -100,8 +104,8 @@ class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
             root = Path(td)
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_bet.parquet")
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_session.parquet")
-            old = trainer_mod.LOCAL_PARQUET_DIR
-            trainer_mod.LOCAL_PARQUET_DIR = root
+            old = _data_sources_mod.LOCAL_PARQUET_DIR
+            _data_sources_mod.LOCAL_PARQUET_DIR = root
             try:
                 with patch.object(pq, "read_metadata", side_effect=RuntimeError("x")):
                     with self.assertLogs("trainer", level="WARNING") as cm:
@@ -109,7 +113,7 @@ class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
                             ws.to_pydatetime(), ee.to_pydatetime()
                         )
             finally:
-                trainer_mod.LOCAL_PARQUET_DIR = old
+                _data_sources_mod.LOCAL_PARQUET_DIR = old
         self.assertTrue(
             any("read_metadata failed" in r for r in cm.output),
             cm.output,
@@ -155,14 +159,14 @@ class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
             ee = pd.Timestamp("2026-02-01 00:00:00")
 
             def _h(root: Path) -> str:
-                old = trainer_mod.LOCAL_PARQUET_DIR
-                trainer_mod.LOCAL_PARQUET_DIR = root
+                old = _data_sources_mod.LOCAL_PARQUET_DIR
+                _data_sources_mod.LOCAL_PARQUET_DIR = root
                 try:
                     return trainer_mod._local_parquet_source_data_hash(
                         ws.to_pydatetime(), ee.to_pydatetime()
                     )
                 finally:
-                    trainer_mod.LOCAL_PARQUET_DIR = old
+                    _data_sources_mod.LOCAL_PARQUET_DIR = old
 
             ha, hb = _h(root_a), _h(root_b)
         self.assertNotEqual(ha, hb, f"expected different data_hash for different bet schemas: {ha!r} vs {hb!r}")
