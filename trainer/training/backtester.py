@@ -141,6 +141,11 @@ try:
         _to_hk,
         HISTORY_BUFFER_DAYS,
     )
+    # Phase C PR-C4: unified admission helper (module-level for Gate-C1 visibility).
+    from trainer.features.layered import (
+        evaluate_pit_admission,
+        SKIP_REASON_IDENTITY_UNMATCHED,
+    )
 except ModuleNotFoundError:
     from trainer.labels import compute_labels  # type: ignore[import]
     from trainer.identity import build_canonical_mapping_from_df  # type: ignore[import]
@@ -160,6 +165,10 @@ except ModuleNotFoundError:
         _precision_prod_adjusted,
         _to_hk,
         HISTORY_BUFFER_DAYS,
+    )
+    from trainer.features.layered import (
+        evaluate_pit_admission,
+        SKIP_REASON_IDENTITY_UNMATCHED,
     )
 
 try:
@@ -947,14 +956,26 @@ def backtest(
     bets["canonical_id"] = bets["canonical_id"].fillna(bets["player_id"].astype(str))
     bets["canonical_id"] = bets["canonical_id"].astype(str)
 
-    # Early rated-only prune for train-backtest parity with trainer heavy FE path.
+    # Phase C PR-C4: route through the unified admission helper so trainer,
+    # scorer and backtester emit comparable skip_reason_code stats.
     rated_canonical_ids: set = (
         set(canonical_map["canonical_id"].astype(str).unique())
         if not canonical_map.empty and "canonical_id" in canonical_map.columns
         else set()
     )
-    is_rated_mask = bets["canonical_id"].isin(rated_canonical_ids)
-    bets = bets[is_rated_mask].copy()
+    _adm = evaluate_pit_admission(
+        bets,
+        rated_canonical_ids=rated_canonical_ids,
+    )
+    bets = _adm.admitted
+    _bt_skip_id = int(_adm.skip_counts.get(SKIP_REASON_IDENTITY_UNMATCHED, 0))
+    if _adm.skipped_rows > 0:
+        logger.info(
+            "[backtester] prediction_skip total=%d IDENTITY_UNMATCHED=%d (admitted=%d)",
+            _adm.skipped_rows,
+            _bt_skip_id,
+            _adm.admitted_rows,
+        )
     if bets.empty:
         return {"error": "No rated rows after early prune", **_run_contract}
 

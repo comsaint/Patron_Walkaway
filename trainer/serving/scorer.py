@@ -121,29 +121,41 @@ except ImportError:
             load_feature_spec,
         )
 
-# Phase B PR-B4: layered (bet/player) entrypoints. Thin wrappers over the legacy
-# functions imported above; serving uses these to share the same orchestration
-# path as trainer.py while underlying compute is unchanged (train-serve parity).
+# Phase B PR-B4 / Phase C PR-C3: layered (bet/player) entrypoints + the unified
+# prediction_skip admission helper. Both live in trainer.features.layered so
+# scorer can route through the same contract as trainer.py / backtester.py.
 try:
     from layered import (  # type: ignore[import]
         compute_bet_layer_features,
         compute_player_layer_features,
+        evaluate_pit_admission,
+        SKIP_REASON_IDENTITY_UNMATCHED,
+        SKIP_REASON_PIT_UNAVAILABLE_SOURCE,
     )
 except ImportError:
     try:
         from .layered import (  # type: ignore[import, attr-defined]
             compute_bet_layer_features,
             compute_player_layer_features,
+            evaluate_pit_admission,
+            SKIP_REASON_IDENTITY_UNMATCHED,
+            SKIP_REASON_PIT_UNAVAILABLE_SOURCE,
         )
     except ImportError:
         try:
             from trainer.features.layered import (  # type: ignore[import, attr-defined]
                 compute_bet_layer_features,
                 compute_player_layer_features,
+                evaluate_pit_admission,
+                SKIP_REASON_IDENTITY_UNMATCHED,
+                SKIP_REASON_PIT_UNAVAILABLE_SOURCE,
             )
         except ImportError:
             compute_bet_layer_features = None  # type: ignore[assignment]
             compute_player_layer_features = None  # type: ignore[assignment]
+            evaluate_pit_admission = None  # type: ignore[assignment]
+            SKIP_REASON_IDENTITY_UNMATCHED = "IDENTITY_UNMATCHED"  # type: ignore[assignment]
+            SKIP_REASON_PIT_UNAVAILABLE_SOURCE = "PIT_UNAVAILABLE_SOURCE"  # type: ignore[assignment]
 
 try:
     from identity import (  # type: ignore[import]
@@ -1231,7 +1243,12 @@ def build_features_for_scoring(
     if _id_mode not in ("pit_asof", "cutoff_window"):
         _id_mode = "cutoff_window"
 
+    # Phase C PR-C3: route the PIT identity prune through the unified admission
+    # helper so scorer reports the same skip_reason_code set as trainer/backtester.
+    # ``skip_reason_code`` (singular) is the admission contract; ``reason_codes``
+    # (plural, JSON list) emitted later in this file is for SHAP — distinct columns.
     _pit_done = False
+    _admission_pit_skip = 0
     if _id_mode == "pit_asof" and not sessions.empty:
         try:
             _delay = int(getattr(config, "SESSION_AVAIL_DELAY_MIN", 7))
@@ -1241,13 +1258,22 @@ def build_features_for_scoring(
             )
             bets_df = merge_pit_canonical_to_bets(bets_df, _links)
             if "_pit_rated" in bets_df.columns:
-                _n_pre = len(bets_df)
-                bets_df = bets_df.loc[bets_df["_pit_rated"]].drop(columns=["_pit_rated"])
+                if evaluate_pit_admission is not None:
+                    _adm = evaluate_pit_admission(bets_df)
+                    bets_df = _adm.admitted
+                    _admission_pit_skip = int(
+                        _adm.skip_counts.get(SKIP_REASON_PIT_UNAVAILABLE_SOURCE, 0)
+                    )
+                else:
+                    _n_pre = len(bets_df)
+                    bets_df = bets_df.loc[bets_df["_pit_rated"]].drop(columns=["_pit_rated"])
+                    _admission_pit_skip = _n_pre - len(bets_df)
                 _pit_done = True
-                if len(bets_df) < _n_pre:
-                    logger.debug(
-                        "[scorer] PIT identity pruned %d unrated-at-obs-time rows",
-                        _n_pre - len(bets_df),
+                if _admission_pit_skip > 0:
+                    logger.info(
+                        "[scorer] prediction_skip PIT_UNAVAILABLE_SOURCE=%d (admitted=%d)",
+                        _admission_pit_skip,
+                        len(bets_df),
                     )
         except Exception as exc:
             logger.warning("[scorer] PIT identity failed (%s); using cutoff_window merge", exc)

@@ -147,10 +147,7 @@ observed_norm AS (
     t.*,
     CASE
       WHEN observed_raw_ts IS NOT NULL AND session_end_ts IS NOT NULL
-      THEN GREATEST(
-        session_end_ts,
-        LEAST(observed_raw_ts, session_end_ts + INTERVAL {cap} SECOND)
-      )
+      THEN LEAST(observed_raw_ts, session_end_ts + INTERVAL {cap} SECOND)
       ELSE observed_raw_ts
     END AS __etl_insert_Dtm_synthetic
   FROM typed AS t

@@ -15,6 +15,7 @@ from parallel_lda_mvp.run_mvp import (
     _FINGERPRINT_ALGO_LEGACY,
     _FINGERPRINT_ALGO_ROLLING,
     _compute_month_bet_shas_for_span,
+    _materialize_cleaned_bets_with_canonical_id,
     _read_month_bet_sha_cache,
     _rolling_month_fingerprints_for_yms,
     _t_bet_month_content_sha256,
@@ -458,6 +459,32 @@ def test_force_recompute_used_in_stats(tmp_path: Path) -> None:
     )
     assert stats["force_recompute_used"] is True
     assert stats["mode"] == "force_full"
+
+
+def test_materialize_cleaned_bets_with_canonical_id_is_deterministic(tmp_path: Path) -> None:
+    """For duplicate mapping rows per player, canonical_id selection must be deterministic."""
+    cleaned = tmp_path / "cleaned.parquet"
+    mapping = tmp_path / "mapping.parquet"
+    pd.DataFrame(
+        {
+            "bet_id": [11, 12],
+            "player_id": [1001, 1002],
+        }
+    ).to_parquet(cleaned, index=False)
+    pd.DataFrame(
+        {
+            "player_id": [1001, 1001, 1002],
+            "canonical_id": ["canon_z", "canon_a", "canon_k"],
+        }
+    ).to_parquet(mapping, index=False)
+
+    out_paths = _materialize_cleaned_bets_with_canonical_id(
+        cleaned_paths=[cleaned],
+        mapping_parquet=mapping,
+    )
+    out = pd.read_parquet(out_paths[0]).sort_values("player_id").reset_index(drop=True)
+    assert list(out["player_id"]) == [1001, 1002]
+    assert list(out["canonical_id"]) == ["canon_a", "canon_k"]
 
 
 def test_canonical_parquet_digest_row_order_invariant(tmp_path: Path) -> None:

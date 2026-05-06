@@ -102,3 +102,52 @@ def test_prepare_session_materializes_synthetic_observed(
         con.close()
     assert delta is not None
     assert float(delta[0]) == pytest.approx(636.0, abs=0.01)
+
+
+def test_prepare_session_preserves_early_observed_before_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("duckdb")
+    import duckdb
+
+    from parallel_lda_mvp import session_for_mapping as sfm
+
+    staging = tmp_path / "staging"
+
+    def _staging() -> Path:
+        staging.mkdir(parents=True, exist_ok=True)
+        return staging
+
+    monkeypatch.setattr(sfm, "_session_mapping_staging_dir", _staging)
+    monkeypatch.setenv("PARALLEL_LDA_MVP_SESSION_INGEST_REGISTRY", str(_SESSION_REG.resolve()))
+    monkeypatch.delenv("PARALLEL_LDA_MVP_SESSION_INGEST_DISABLE", raising=False)
+
+    p = tmp_path / "l0_session_early.parquet"
+    pd.DataFrame(
+        {
+            "session_id": [1],
+            "session_end_dtm": pd.Timestamp("2025-06-01 12:00:00+00:00"),
+            "session_start_dtm": pd.Timestamp("2025-06-01 11:00:00+00:00"),
+            "player_id": [1],
+            "is_manual": [0],
+            "lud_dtm": pd.Timestamp("2025-06-01 12:05:00+00:00"),
+            "__etl_insert_Dtm": pd.Timestamp("2025-06-01 11:55:00+00:00"),
+        }
+    ).to_parquet(p, index=False)
+
+    out = sfm.prepare_session_parquet_for_canonical_mapping(p)
+    con = duckdb.connect()
+    try:
+        row = con.execute(
+            """
+            SELECT
+              EXTRACT(EPOCH FROM TRY_CAST(__etl_insert_Dtm_synthetic AS TIMESTAMP))
+              - EXTRACT(EPOCH FROM TRY_CAST(__etl_insert_Dtm AS TIMESTAMP)) AS synthetic_minus_raw_sec
+            FROM read_parquet(?)
+            """,
+            [str(out.resolve())],
+        ).fetchone()
+    finally:
+        con.close()
+    assert row is not None
+    assert float(row[0]) == pytest.approx(0.0, abs=0.01)

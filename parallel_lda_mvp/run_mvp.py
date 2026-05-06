@@ -959,7 +959,10 @@ def _materialize_cleaned_bets_with_canonical_id(
                       CAST(player_id AS BIGINT) AS player_id,
                       CAST(canonical_id AS VARCHAR) AS canonical_id
                     FROM read_parquet('{mp_sql}')
-                    QUALIFY ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY player_id) = 1
+                    QUALIFY ROW_NUMBER() OVER (
+                      PARTITION BY player_id
+                      ORDER BY canonical_id ASC NULLS LAST
+                    ) = 1
                   ) m USING (player_id)
                 ) TO '{dp}' (FORMAT PARQUET)
                 """

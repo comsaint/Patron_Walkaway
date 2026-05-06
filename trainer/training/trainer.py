@@ -409,6 +409,9 @@ try:
     from layered import (  # type: ignore[import]
         compute_bet_layer_features,
         compute_player_layer_features,
+        evaluate_pit_admission,
+        SKIP_REASON_IDENTITY_UNMATCHED,
+        SKIP_REASON_PIT_UNAVAILABLE_SOURCE,
     )
     # except path uses relative .db_conn (python -m trainer.trainer)
     from db_conn import get_clickhouse_client  # type: ignore[import]
@@ -450,6 +453,9 @@ except ModuleNotFoundError:
     from trainer.features.layered import (  # type: ignore[import]
         compute_bet_layer_features,
         compute_player_layer_features,
+        evaluate_pit_admission,
+        SKIP_REASON_IDENTITY_UNMATCHED,
+        SKIP_REASON_PIT_UNAVAILABLE_SOURCE,
     )
     from trainer.db_conn import get_clickhouse_client  # type: ignore[import]
     from trainer.etl_player_profile import (  # type: ignore[import]
@@ -3026,6 +3032,10 @@ def process_chunk(
                 _pit_exc,
             )
             _use_pit = False
+    # Phase C PR-C2: unify identity / PIT prune behind evaluate_pit_admission.
+    # Both pit_asof and cutoff_window paths now produce the same skip_reason_code
+    # set (PIT_UNAVAILABLE_SOURCE / IDENTITY_UNMATCHED) instead of scattered
+    # log lines, so trainer skip stats are directly comparable to scorer/backtester.
     if not _use_pit:
         bets = _apply_cutoff_window_identity_fallback(bets, canonical_map)
         _rated_for_prune: set = (
@@ -3033,51 +3043,42 @@ def process_chunk(
             if not canonical_map.empty and "canonical_id" in canonical_map.columns
             else set()
         )
-        if _rated_for_prune:
-            _n_before_rated_prune = len(bets)
-            bets = bets[bets["canonical_id"].isin(_rated_for_prune)].copy()
-            _n_pruned = _n_before_rated_prune - len(bets)
-            if _n_pruned > 0:
-                logger.info(
-                    "Chunk %s–%s: early-pruned %d unrated rows before heavy FE (rated_rows=%d)",
-                    window_start.date(),
-                    window_end.date(),
-                    _n_pruned,
-                    len(bets),
-                )
-        else:
+        if not _rated_for_prune:
             logger.warning(
                 "Chunk %s–%s: canonical_map empty -> no rated rows; skip heavy FE",
                 window_start.date(),
                 window_end.date(),
             )
             return None
-    else:
-        _n_before = len(bets)
-        bets = bets.loc[bets["_pit_rated"]].copy()
-        bets.drop(columns=["_pit_rated"], inplace=True)
         bets["canonical_id"] = bets["canonical_id"].astype(str)
-        _n_pruned = _n_before - len(bets)
-        if _n_pruned > 0:
-            logger.info(
-                "Chunk %s–%s: PIT early-pruned %d unrated-at-bet-time rows (rated_rows=%d)",
-                window_start.date(),
-                window_end.date(),
-                _n_pruned,
-                len(bets),
-            )
-        if bets.empty:
-            logger.warning(
-                "Chunk %s–%s: empty after PIT rated-only prune",
-                window_start.date(),
-                window_end.date(),
-            )
-            return None
-    if bets.empty:
-        logger.warning(
-            "Chunk %s–%s: empty after rated-only early prune",
+        _adm = evaluate_pit_admission(
+            bets,
+            rated_canonical_ids=_rated_for_prune,
+        )
+    else:
+        bets["canonical_id"] = bets["canonical_id"].astype(str)
+        _adm = evaluate_pit_admission(bets)
+    bets = _adm.admitted
+    _n_pit = int(_adm.skip_counts.get(SKIP_REASON_PIT_UNAVAILABLE_SOURCE, 0))
+    _n_id = int(_adm.skip_counts.get(SKIP_REASON_IDENTITY_UNMATCHED, 0))
+    if _adm.skipped_rows > 0:
+        logger.info(
+            "Chunk %s–%s: prediction_skip (mode=%s) total=%d "
+            "PIT_UNAVAILABLE_SOURCE=%d IDENTITY_UNMATCHED=%d (admitted=%d)",
             window_start.date(),
             window_end.date(),
+            "pit_asof" if _use_pit else "cutoff_window",
+            _adm.skipped_rows,
+            _n_pit,
+            _n_id,
+            _adm.admitted_rows,
+        )
+    if bets.empty:
+        logger.warning(
+            "Chunk %s–%s: empty after admission (mode=%s)",
+            window_start.date(),
+            window_end.date(),
+            "pit_asof" if _use_pit else "cutoff_window",
         )
         return None
 
