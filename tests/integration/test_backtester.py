@@ -173,10 +173,10 @@ class TestBacktesterStableImports(unittest.TestCase):
         # absent from the import list specifically. A negative match against
         # the full file would be too strict because comments and helper logic
         # may still reference these names by string.
-        for chunk in _SRC.split("from trainer.training.trainer import"):
-            # First chunk is everything before the trainer import; skip.
-            if chunk is _SRC.split("from trainer.training.trainer import")[0]:
-                continue
+        marker = "from trainer.training.trainer import"
+        chunks = _SRC.split(marker)
+        # First chunk is everything before the first trainer import; skip it.
+        for chunk in chunks[1:]:
             head = chunk.split(")", 1)[0]
             for name in moved:
                 self.assertNotIn(
