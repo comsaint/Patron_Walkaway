@@ -14,7 +14,7 @@ python -m parallel_lda_mvp.run_mvp
 
 可選：
 
-- `--emit-trainer-local-parquet`：MVP 結束後寫入 `data/gmwds_t_bet.parquet` / `data/gmwds_t_session.parquet`（含 Phase C：`run_fact`／`trip_*` 併回下注列，見 `trainer_bridge_mvp.py`）。
+- `--emit-trainer-local-parquet`：MVP 結束後寫入 `data/mvp_trainer_bridge/`（`gmwds_t_bet.parquet`／`gmwds_t_session.parquet` 與 manifest；**不覆寫** L0 的 `data/gmwds_t_*.parquet`）。含 Phase C：`run_fact`／`trip_*` 併回下注列（見 `trainer_bridge_mvp.py`）。本機訓練請改指該目錄下檔案或複製到 trainer 預期路徑。
 - `--trainer-bridge-emit-only --snapshot-id <snap>`：只跑橋接（需已存在 `data/parallel_lda_mvp/<snap>/` 與 `mvp_summary.json`）。亦可只設 `PARALLEL_LDA_MVP_SNAPSHOT_ID`。
 - 橋接 idempotency：`PARALLEL_LDA_BRIDGE_SKIP_IF_UNCHANGED=1`（指紋相同則跳過寫檔）；`PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT=4GB` 等。
 
@@ -47,7 +47,7 @@ python -m trainer.trainer --use-local-parquet --recent-chunks 1 --skip-optuna --
 | **cutoff** | `PARALLEL_LDA_MVP_CUTOFF_DTM`（ISO）→ 否則 **span 中最後一個月** 最後一刻 **Asia/Hong_Kong** 23:59:59.999999（整段共用一個 cutoff 建 eligible） |
 | **強制重算** | `PARALLEL_LDA_MVP_FORCE_RECOMPUTE` 設為 `1` / `true` / `yes` 時，略過**月級**快取跳過（強制重跑該月 preprocess／split／run_fact／trip） |
 
-與 trainer 本機慣例對齊：`data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet`。
+MVP 預設輸入與 trainer 本機慣例對齊：`data/gmwds_t_bet.parquet`、`data/gmwds_t_session.parquet`（L0，僅讀）。Trainer bridge 產物在 `data/mvp_trainer_bridge/`。
 
 ## 產出
 

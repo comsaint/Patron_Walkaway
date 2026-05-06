@@ -1,10 +1,10 @@
-"""Bridge ``parallel_lda_mvp`` snapshot outputs to trainer local Parquet contract.
+"""Bridge ``parallel_lda_mvp`` snapshot outputs to trainer-shaped Parquet files.
 
-Writes ``data/gmwds_t_bet.parquet`` + ``data/gmwds_t_session.parquet`` with
-atomic replace. Optional Phase C: left-join L1 ``run_fact`` + ``trip_run_map`` +
-``trip_fact`` onto each bet (``player_id`` + ``payout_complete_dtm`` in
-``[run_start_ts, run_end_ts]``), emitting fixed ``lda_*`` DOUBLE columns for
-Track LLM passthrough features.
+Writes under ``<data_dir>/mvp_trainer_bridge/`` (never overwrites L0
+``data/gmwds_t_bet.parquet`` / ``data/gmwds_t_session.parquet``). Optional Phase C:
+left-join L1 ``run_fact`` + ``trip_run_map`` + ``trip_fact`` onto each bet
+(``player_id`` + ``payout_complete_dtm`` in ``[run_start_ts, run_end_ts]``),
+emitting fixed ``lda_*`` DOUBLE columns for Track LLM passthrough features.
 
 See ``parallel_lda_mvp/run_mvp.py`` CLI flags ``--emit-trainer-local-parquet``
 and ``--trainer-bridge-emit-only``.
@@ -35,6 +35,14 @@ LDA_PHASE_C_BET_COLUMNS: tuple[str, ...] = (
 
 _ENV_BRIDGE_SKIP = "PARALLEL_LDA_BRIDGE_SKIP_IF_UNCHANGED"
 _ENV_DUCKDB_MEM = "PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT"
+
+# Subdir under ``data/`` for bridge outputs only (L0 stays at repo ``data/gmwds_t_*.parquet``).
+MVP_TRAINER_BRIDGE_SUBDIR = "mvp_trainer_bridge"
+
+
+def trainer_bridge_output_dir(data_dir: Path) -> Path:
+    """Return ``<data_dir>/mvp_trainer_bridge`` (resolved)."""
+    return (Path(data_dir).resolve() / MVP_TRAINER_BRIDGE_SUBDIR)
 
 
 def _utc_now_iso() -> str:
@@ -128,7 +136,9 @@ def emit_trainer_local_parquet(
     skip_if_unchanged: bool | None = None,
     duckdb_memory_limit: str | None = None,
 ) -> Path:
-    """Materialize ``gmwds_t_bet.parquet`` / ``gmwds_t_session`` under ``data_dir``.
+    """Materialize trainer-shaped bet/session Parquet under ``mvp_trainer_bridge/``.
+
+    Never writes to L0 ``data/gmwds_t_bet.parquet`` or ``data/gmwds_t_session.parquet``.
 
     Parameters
     ----------
@@ -147,7 +157,8 @@ def emit_trainer_local_parquet(
     Returns
     -------
     Path
-        Path to the bridge manifest JSON written beside outputs.
+        Path to ``trainer_local_parquet_bridge.manifest.json`` under
+        ``trainer_bridge_output_dir(data_dir)``.
 
     Raises
     ------
@@ -162,6 +173,7 @@ def emit_trainer_local_parquet(
 
     snap_root = snap_root.resolve()
     data_dir = data_dir.resolve()
+    bridge_dir = trainer_bridge_output_dir(data_dir)
     if skip_if_unchanged is None:
         skip_if_unchanged = os.environ.get(_ENV_BRIDGE_SKIP, "").strip().lower() in (
             "1",
@@ -221,14 +233,14 @@ def emit_trainer_local_parquet(
         phase_c=phase_c and bool(run_paths),
     )
 
-    manifest_path = data_dir / "trainer_local_parquet_bridge.manifest.json"
+    manifest_path = bridge_dir / "trainer_local_parquet_bridge.manifest.json"
     if skip_if_unchanged:
         old = _read_manifest(manifest_path)
         if (
             old
             and old.get("input_fingerprint") == fp
-            and (data_dir / "gmwds_t_bet.parquet").is_file()
-            and (data_dir / "gmwds_t_session.parquet").is_file()
+            and (bridge_dir / "gmwds_t_bet.parquet").is_file()
+            and (bridge_dir / "gmwds_t_session.parquet").is_file()
         ):
             print(
                 f"[trainer_bridge_mvp] skip unchanged fingerprint={fp[:16]}… "
@@ -261,9 +273,10 @@ def emit_trainer_local_parquet(
     )
 
     bet_list_sql = ", ".join(f"'{_escape_sql_path(p)}'" for p in raw_bet_paths)
-    out_bet = data_dir / "gmwds_t_bet.parquet"
-    out_sess = data_dir / "gmwds_t_session.parquet"
-    tmp_dir = data_dir / ".trainer_bridge_tmp"
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    out_bet = bridge_dir / "gmwds_t_bet.parquet"
+    out_sess = bridge_dir / "gmwds_t_session.parquet"
+    tmp_dir = bridge_dir / ".trainer_bridge_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     bet_tmp = tmp_dir / f"gmwds_t_bet.parquet.tmp.{os.getpid()}"
     sess_tmp = tmp_dir / f"gmwds_t_session.parquet.tmp.{os.getpid()}"
@@ -428,6 +441,7 @@ def emit_trainer_local_parquet(
 
         manifest: dict[str, Any] = {
             "artifact_kind": "trainer_local_parquet_bridge_v1",
+            "bridge_output_dir": str(bridge_dir.as_posix()),
             "built_at": _utc_now_iso(),
             "input_fingerprint": fp,
             "source_snapshot_id": summary.get("source_snapshot_id"),

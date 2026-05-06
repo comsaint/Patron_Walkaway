@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS materialization_state (
   row_hash VARCHAR,
   error_summary VARCHAR,
   updated_at TIMESTAMP NOT NULL,
+  impacted_entity_count BIGINT,
+  impacted_day_count BIGINT,
+  recompute_rounds INTEGER,
+  recompute_stop_reason VARCHAR,
   PRIMARY KEY (
     artifact_kind,
     gaming_day,

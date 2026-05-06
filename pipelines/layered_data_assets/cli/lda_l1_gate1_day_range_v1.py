@@ -68,7 +68,7 @@ import traceback
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, Mapping, cast
 
 from .repo_root import discover_repo_root
 
@@ -113,9 +113,16 @@ from ..orchestration.materialization_state_store_v1 import (
     ARTIFACT_RUN_BET_MAP,
     ARTIFACT_RUN_DAY_BRIDGE,
     ARTIFACT_RUN_FACT,
+    RECOMPUTE_STOP_FALLBACK_FULL,
+    RECOMPUTE_STOP_FIXED_POINT,
+    RECOMPUTE_STOP_MAX_ROUNDS,
+    RECOMPUTE_STOP_SINGLE_PASS,
+    compute_output_row_fingerprint_pair,
     default_state_store_path,
     ensure_materialization_state_schema,
     fetch_state_row,
+    format_impact_metrics_json,
+    format_row_fingerprint_tag,
     hash_gate1_inputs,
     hash_preprocess_inputs,
     hash_run_materialize_inputs,
@@ -123,7 +130,9 @@ from ..orchestration.materialization_state_store_v1 import (
     mark_step_running,
     mark_step_succeeded,
     parquet_row_count,
+    patch_run_day_bridge_recompute_metrics,
     should_skip_step,
+    verify_stored_row_fingerprint_matches_output,
 )
 
 _GATE1_ARTIFACTS: tuple[str, ...] = ("run_fact", "run_bet_map", "run_day_bridge")
@@ -321,8 +330,9 @@ def _print_run_banner(
         reg_note = "preprocess registry ON (default schema/preprocess_l0_data_contract_registry.yaml)"
     else:
         reg_note = f"preprocess registry ON ({Path(reg).name})"
+    span = f"{days[0]} .. {days[-1]}" if n else "(no days)"
     lines = [
-        f"[LDA] plan {n} day(s) {days[0]} .. {days[-1]} | data={data_root} | {src}",
+        f"[LDA] plan {n} day(s) {span} | data={data_root} | {src}",
         f"[LDA] per day: L0? -> preprocess -> L1(run_fact, run_bet_map, run_day_bridge) -> Gate1(x3) | gate1_out={gate_parent.resolve()}",
         f"[LDA] {reg_note}",
     ]
@@ -460,6 +470,88 @@ def _effective_fp_for_hash(fp_ingest: Path | None, user_fp: Path | None) -> Path
     return None
 
 
+def _parse_impacted_set_payload(raw: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    """Parse ``impacted_entities`` and ``candidate_days`` from an impacted-set JSON object."""
+    ents_raw = raw.get("impacted_entities")
+    out_ids: list[str] = []
+    if isinstance(ents_raw, list):
+        for item in ents_raw:
+            if isinstance(item, str) and item.strip():
+                out_ids.append(item.strip())
+            elif isinstance(item, dict):
+                cid = item.get("canonical_id")
+                if cid is None:
+                    cid = item.get("canonicalId")
+                if cid is not None and str(cid).strip():
+                    out_ids.append(str(cid).strip())
+    elif ents_raw is not None:
+        raise ValueError("impacted_entities must be a list when present")
+    days_raw = raw.get("candidate_days")
+    if days_raw is None:
+        days_raw = raw.get("candidate_gaming_days")
+    out_days: list[str] = []
+    if isinstance(days_raw, list):
+        out_days = [str(x).strip() for x in days_raw if str(x).strip()]
+    elif days_raw is not None:
+        raise ValueError("candidate_days must be a list when present")
+    return out_ids, out_days
+
+
+def _filter_days_with_impacted_set(
+    resolved_days: list[str],
+    *,
+    impacted_canonical_ids: list[str],
+    candidate_days: list[str],
+    max_impacted_entities: int,
+    emit_stderr: Callable[[str], None] | None,
+) -> tuple[list[str], int, int, str | None]:
+    """Return ``(filtered_days, entity_count, impacted_day_count, fallback_stop_or_none)``."""
+    uniq = sorted(set(impacted_canonical_ids))
+    n_ent = len(uniq)
+    if max_impacted_entities >= 0 and n_ent > max_impacted_entities:
+        if emit_stderr is not None:
+            emit_stderr(
+                f"[LDA] impacted entity count {n_ent} exceeds cap {max_impacted_entities}; "
+                "using full resolved day list (recompute_stop_reason=fallback_full)"
+            )
+        return resolved_days, n_ent, len(resolved_days), RECOMPUTE_STOP_FALLBACK_FULL
+    if candidate_days:
+        cd = set(candidate_days)
+        filt = [d for d in resolved_days if d in cd]
+        if not filt:
+            if emit_stderr is not None:
+                emit_stderr(
+                    "[LDA] WARN impacted-set candidate_days disjoint from orchestrator day list; "
+                    "falling back to full resolved days"
+                )
+            filt = list(resolved_days)
+    else:
+        filt = list(resolved_days)
+        if uniq and emit_stderr is not None:
+            emit_stderr(
+                "[LDA] impacted-set: entity list present but no candidate_days; "
+                "using full resolved day list (dates auxiliary only)"
+            )
+    return filt, n_ent, len(filt), None
+
+
+def _collect_run_day_bridge_signatures(con: Any, gaming_days: list[str]) -> tuple[tuple[str, str, str | None], ...]:
+    """Stable tuple of ``(gaming_day, source_snapshot_id, row_hash)`` for convergence checks."""
+    if not gaming_days:
+        return ()
+    ph = ",".join(["?"] * len(gaming_days))
+    rows = con.execute(
+        f"""
+        SELECT gaming_day, source_snapshot_id, row_hash
+        FROM materialization_state
+        WHERE artifact_kind = ? AND gaming_day IN ({ph})
+        ORDER BY gaming_day, source_snapshot_id
+        """,
+        [ARTIFACT_RUN_DAY_BRIDGE, *gaming_days],
+    ).fetchall()
+    return tuple((str(a), str(b), str(c) if c is not None else None) for a, b, c in rows)
+
+
 def _run_tracked_subprocess(
     *,
     state_con: object | None,
@@ -476,6 +568,12 @@ def _run_tracked_subprocess(
     row_count_parquet: Path | None,
     echo_commands: bool,
     emit_stderr: Callable[[str], None] | None = None,
+    fingerprint_artifact_kind: str | None = None,
+    verify_row_fingerprint_on_resume: bool = False,
+    impacted_entity_count: int | None = None,
+    impacted_day_count: int | None = None,
+    recompute_rounds: int | None = None,
+    recompute_stop_reason: str | None = None,
 ) -> None:
     """Optionally honor materialization state (skip / mark running / succeeded / failed)."""
     if state_con is None:
@@ -488,6 +586,32 @@ def _run_tracked_subprocess(
         source_snapshot_id=sid,
     )
     do_skip = should_skip_step(resume=resume, force=force, row=prev, input_hash=input_hash)
+    if (
+        do_skip
+        and verify_row_fingerprint_on_resume
+        and fingerprint_artifact_kind is not None
+        and row_count_parquet is not None
+    ):
+        try:
+            if not verify_stored_row_fingerprint_matches_output(
+                state_con,
+                artifact_kind=artifact_kind,
+                gaming_day=gaming_day,
+                source_snapshot_id=sid,
+                fingerprint_artifact_kind=fingerprint_artifact_kind,
+                parquet_path=Path(row_count_parquet),
+            ):
+                _stderr_line(
+                    f"[LDA] resume fingerprint drift: rerunning {step} (stored row_hash != fresh parquet fp)",
+                    emit=emit_stderr,
+                )
+                do_skip = False
+        except Exception as exc:
+            _stderr_line(
+                f"[LDA] WARN resume fingerprint verify failed for {step}: {exc}; running step",
+                emit=emit_stderr,
+            )
+            do_skip = False
     if do_skip and row_count_parquet is not None and not Path(row_count_parquet).is_file():
         _stderr_line(
             f"[LDA] WARN cannot skip {step}: expected output {row_count_parquet} missing",
@@ -526,8 +650,25 @@ def _run_tracked_subprocess(
         )
         raise
     rc: int | None = None
+    row_tag: str | None = None
     if row_count_parquet is not None and Path(row_count_parquet).is_file():
         rc = parquet_row_count(state_con, Path(row_count_parquet))
+        if fingerprint_artifact_kind is not None:
+            try:
+                _n_fp, fp_frag = compute_output_row_fingerprint_pair(
+                    state_con,
+                    parquet_path=Path(row_count_parquet),
+                    fingerprint_artifact_kind=fingerprint_artifact_kind,
+                )
+                row_tag = format_row_fingerprint_tag(
+                    artifact_kind=fingerprint_artifact_kind,
+                    fp_value=str(fp_frag),
+                )
+            except Exception as exc:
+                _stderr_line(
+                    f"[LDA] WARN row_fingerprint failed for {step}: {exc}",
+                    emit=emit_stderr,
+                )
     mark_step_succeeded(
         state_con,
         artifact_kind=artifact_kind,
@@ -537,7 +678,11 @@ def _run_tracked_subprocess(
         attempt=attempt,
         output_uri=output_uri,
         row_count=rc,
-        row_hash=None,
+        row_hash=row_tag,
+        impacted_entity_count=impacted_entity_count,
+        impacted_day_count=impacted_day_count,
+        recompute_rounds=recompute_rounds,
+        recompute_stop_reason=recompute_stop_reason,
     )
 
 
@@ -1213,6 +1358,12 @@ def _run_lda_pipeline_for_day(
     echo_commands: bool,
     pbar: _DayRangeProgressBar,
     eligible_player_ids_parquet: Path | None,
+    verify_row_fingerprint_on_resume: bool = False,
+    phase_d_impacted_entity_count: int | None = None,
+    phase_d_impacted_day_count: int | None = None,
+    phase_d_recompute_rounds: int | None = None,
+    phase_d_recompute_stop_reason: str | None = None,
+    day_sid_cache: dict[str, str] | None = None,
 ) -> bool:
     """Run L0 (optional), L1 preprocess + three run_* jobs, and three Gate1 invocations.
 
@@ -1235,6 +1386,9 @@ def _run_lda_pipeline_for_day(
     if echo_commands:
         emit(f"[orchestrator]   snapshot_id={sid}  preprocess inputs ({label_in})")
         emit(f"[orchestrator]   paths: {pre_inputs}")
+
+    if day_sid_cache is not None:
+        day_sid_cache[d] = sid
 
     fp_args = _fp_args_for_materialize(fp_from_ingest=fp_ingest, user_fp=user_fp)
     if dry_run:
@@ -1284,6 +1438,8 @@ def _run_lda_pipeline_for_day(
         row_count_parquet=cleaned,
         echo_commands=echo_commands,
         emit_stderr=emit,
+        fingerprint_artifact_kind=ARTIFACT_PREPROCESS_BET,
+        verify_row_fingerprint_on_resume=verify_row_fingerprint_on_resume,
     )
 
     common_mat = [
@@ -1328,6 +1484,8 @@ def _run_lda_pipeline_for_day(
         row_count_parquet=rf_out,
         echo_commands=echo_commands,
         emit_stderr=emit,
+        fingerprint_artifact_kind=ARTIFACT_RUN_FACT,
+        verify_row_fingerprint_on_resume=verify_row_fingerprint_on_resume,
     )
 
     bm_cmd = [
@@ -1363,6 +1521,8 @@ def _run_lda_pipeline_for_day(
         row_count_parquet=bm_out,
         echo_commands=echo_commands,
         emit_stderr=emit,
+        fingerprint_artifact_kind=ARTIFACT_RUN_BET_MAP,
+        verify_row_fingerprint_on_resume=verify_row_fingerprint_on_resume,
     )
 
     br_cmd = [
@@ -1398,6 +1558,12 @@ def _run_lda_pipeline_for_day(
         row_count_parquet=br_out,
         echo_commands=echo_commands,
         emit_stderr=emit,
+        fingerprint_artifact_kind=ARTIFACT_RUN_DAY_BRIDGE,
+        verify_row_fingerprint_on_resume=verify_row_fingerprint_on_resume,
+        impacted_entity_count=phase_d_impacted_entity_count,
+        impacted_day_count=phase_d_impacted_day_count,
+        recompute_rounds=phase_d_recompute_rounds,
+        recompute_stop_reason=phase_d_recompute_stop_reason,
     )
 
     for art in _GATE1_ARTIFACTS:
@@ -1695,6 +1861,44 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="YYYY-MM-DD",
         help="After successfully finishing this calendar day (including Gate1), exit without later days",
     )
+    p.add_argument(
+        "--impacted-set-json",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Phase D: JSON with impacted_entities (canonical_id list/objects) and optional "
+            "candidate_days / candidate_gaming_days to intersect with resolved orchestrator days"
+        ),
+    )
+    p.add_argument(
+        "--max-impacted-entities-per-round",
+        type=int,
+        default=500_000,
+        metavar="N",
+        help=(
+            "Phase D: if impacted_entities exceeds N, fall back to full resolved day list "
+            "(recompute_stop_reason=fallback_full). Use -1 to disable the cap (not recommended on laptops)"
+        ),
+    )
+    p.add_argument(
+        "--impact-reconcile-max-rounds",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Phase D: run up to N reconcile rounds (requires --state-store). Round >0 forces reruns "
+            "to detect fixed-point via run_day_bridge row_hash bundle; default 1 (legacy single pass)"
+        ),
+    )
+    p.add_argument(
+        "--verify-row-fingerprint-on-resume",
+        action="store_true",
+        help=(
+            "Phase D: when resuming, recompute Parquet row fingerprint and compare to stored row_hash; "
+            "mismatch forces rerun (extra DuckDB scan per skipped step)"
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -1814,6 +2018,20 @@ def _validate_mode(args: argparse.Namespace) -> int | None:
         return 2
     if bool(args.resume) and bool(args.force):
         print("[LDA] NOTE: both --resume and --force; --force wins (no skips)", file=sys.stderr)
+    imp_path = getattr(args, "impacted_set_json", None)
+    if imp_path is not None:
+        ip = Path(imp_path).resolve()
+        if not ip.is_file():
+            print(f"--impacted-set-json not found: {ip}", file=sys.stderr)
+            return 2
+    mxr = int(getattr(args, "impact_reconcile_max_rounds", 1) or 1)
+    if mxr < 1 or mxr > 50:
+        print("--impact-reconcile-max-rounds must be between 1 and 50", file=sys.stderr)
+        return 2
+    mic = int(getattr(args, "max_impacted_entities_per_round", 500_000))
+    if mic < -1:
+        print("--max-impacted-entities-per-round must be >= -1 (-1 disables cap)", file=sys.stderr)
+        return 2
     return None
 
 
@@ -1840,6 +2058,29 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, FileNotFoundError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+    impacted_entity_count = 0
+    impacted_day_count = len(days)
+    stop_reason = RECOMPUTE_STOP_SINGLE_PASS
+    row_fingerprint_changed: bool | None = None
+    imp_json = getattr(args, "impacted_set_json", None)
+    if imp_json is not None:
+        try:
+            raw_imp = json.loads(Path(imp_json).read_text(encoding="utf-8"))
+            ent_ids, cand_days = _parse_impacted_set_payload(raw_imp)
+            max_ent = int(getattr(args, "max_impacted_entities_per_round", 500_000))
+            days, impacted_entity_count, impacted_day_count, fb = _filter_days_with_impacted_set(
+                days,
+                impacted_canonical_ids=ent_ids,
+                candidate_days=cand_days,
+                max_impacted_entities=max_ent,
+                emit_stderr=None,
+            )
+            if fb is not None:
+                stop_reason = fb
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            print(f"--impacted-set-json invalid: {exc}", file=sys.stderr)
+            return 2
 
     if getattr(args, "stop_after_date", None):
         stop_d = str(args.stop_after_date).strip()
@@ -1900,35 +2141,92 @@ def main(argv: list[str] | None = None) -> int:
     resume = bool(args.resume) and not bool(args.force)
     force = bool(args.force)
     echo_commands = bool(getattr(args, "echo_commands", False))
-    pbar = _DayRangeProgressBar(len(days), disable=args.no_progress)
+    verify_fp = bool(getattr(args, "verify_row_fingerprint_on_resume", False))
+    max_rounds = int(getattr(args, "impact_reconcile_max_rounds", 1) or 1)
+    if max_rounds > 1 and state_con is None and not args.dry_run:
+        print(
+            "[LDA] WARN --impact-reconcile-max-rounds>1 needs --state-store (or default state DB); "
+            "using a single round",
+            file=sys.stderr,
+            flush=True,
+        )
+        max_rounds = 1
+
+    pbar_total = len(days) * max_rounds if max_rounds > 1 else len(days)
+    pbar = _DayRangeProgressBar(pbar_total, disable=args.no_progress)
+    day_sid_cache: dict[str, str] = {}
+    prev_sig: tuple[tuple[str, str, str | None], ...] | None = None
+    rounds_executed = 1
     try:
-        for i, d in enumerate(days, start=1):
-            try:
-                stop_early = _run_lda_pipeline_for_day(
-                    d,
-                    args=args,
-                    data_root=data_root,
-                    py=py,
-                    user_fp=user_fp,
-                    gate_parent=gate_parent,
-                    day_index=i,
-                    day_total=len(days),
-                    dry_run=args.dry_run,
-                    state_con=state_con,
-                    resume=resume,
-                    force=force,
-                    echo_commands=echo_commands,
-                    pbar=pbar,
-                    eligible_player_ids_parquet=eligible_player_ids_parquet,
+        stop_after_hit = False
+        for r in range(max_rounds):
+            rounds_executed = r + 1
+            force_loop = force or (r > 0)
+            resume_loop = bool(args.resume) and not force_loop
+            if max_rounds > 1 and r > 0:
+                pbar.write_stderr_line(
+                    f"[LDA] Phase D reconcile round {r + 1}/{max_rounds} (force materialization for convergence check)"
                 )
-            except RuntimeError as exc:
-                pbar.write_stderr_line(f"[LDA] ABORT day {d}: {exc}")
-                raise
-            pbar.update(1)
-            if stop_early:
+            for i, d in enumerate(days, start=1):
+                try:
+                    stop_early = _run_lda_pipeline_for_day(
+                        d,
+                        args=args,
+                        data_root=data_root,
+                        py=py,
+                        user_fp=user_fp,
+                        gate_parent=gate_parent,
+                        day_index=i,
+                        day_total=len(days),
+                        dry_run=args.dry_run,
+                        state_con=state_con,
+                        resume=resume_loop,
+                        force=force_loop,
+                        echo_commands=echo_commands,
+                        pbar=pbar,
+                        eligible_player_ids_parquet=eligible_player_ids_parquet,
+                        verify_row_fingerprint_on_resume=verify_fp,
+                        phase_d_impacted_entity_count=impacted_entity_count,
+                        phase_d_impacted_day_count=impacted_day_count,
+                        phase_d_recompute_rounds=r + 1,
+                        phase_d_recompute_stop_reason=None,
+                        day_sid_cache=day_sid_cache,
+                    )
+                except RuntimeError as exc:
+                    pbar.write_stderr_line(f"[LDA] ABORT day {d}: {exc}")
+                    raise
+                pbar.update(1)
+                if stop_early:
+                    stop_after_hit = True
+                    break
+            if stop_after_hit:
+                break
+            if max_rounds <= 1 or state_con is None or args.dry_run:
+                break
+            sig = _collect_run_day_bridge_signatures(state_con, days)
+            if prev_sig is not None and sig == prev_sig:
+                stop_reason = RECOMPUTE_STOP_FIXED_POINT
+                row_fingerprint_changed = False
+                break
+            if prev_sig is not None:
+                row_fingerprint_changed = True
+            prev_sig = sig
+            if r == max_rounds - 1:
+                stop_reason = RECOMPUTE_STOP_MAX_ROUNDS
                 break
     finally:
         pbar.close()
+        if state_con is not None and not args.dry_run and days:
+            for d in days:
+                sid = day_sid_cache.get(d)
+                if sid:
+                    patch_run_day_bridge_recompute_metrics(
+                        state_con,
+                        gaming_day=d,
+                        source_snapshot_id=sid,
+                        recompute_rounds=rounds_executed,
+                        recompute_stop_reason=stop_reason,
+                    )
         if state_con is not None:
             state_con.close()
 
@@ -1936,6 +2234,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[LDA] dry-run done ({len(days)} day(s))", file=sys.stderr, flush=True)
         return 0
 
+    print(
+        format_impact_metrics_json(
+            recompute_rounds=rounds_executed,
+            recompute_stop_reason=stop_reason,
+            row_fingerprint_changed=row_fingerprint_changed,
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
     print(f"[LDA] OK completed {len(days)} day(s)", file=sys.stderr, flush=True)
     return 0
 

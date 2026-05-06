@@ -13,6 +13,16 @@ from pipelines.layered_data_assets.io.l0_fingerprint import sha256_file
 MATERIALIZATION_DEFINITION_VERSION = "layered_data_assets_v1"
 MATERIALIZATION_TRANSFORM_VERSION = "v1"
 
+# Phase D: fixed-point / observability (shared by lda_l1_gate1_day_range_v1 and run_mvp)
+RECOMPUTE_STOP_SINGLE_PASS = "single_pass"
+RECOMPUTE_STOP_FIXED_POINT = "fixed_point"
+RECOMPUTE_STOP_MAX_ROUNDS = "max_rounds"
+RECOMPUTE_STOP_FALLBACK_FULL = "fallback_full"
+
+METRIC_KEY_RECOMPUTE_ROUNDS = "recompute_rounds"
+METRIC_KEY_RECOMPUTE_STOP_REASON = "recompute_stop_reason"
+METRIC_KEY_ROW_FINGERPRINT_CHANGED = "row_fingerprint_changed"
+
 ARTIFACT_PREPROCESS_BET = "preprocess_bet"
 ARTIFACT_RUN_FACT = "run_fact"
 ARTIFACT_RUN_BET_MAP = "run_bet_map"
@@ -166,6 +176,64 @@ def hash_gate1_inputs(
     )
 
 
+def format_row_fingerprint_tag(*, artifact_kind: str, fp_value: str) -> str:
+    """Stable string stored in ``row_hash`` for output row-fingerprint (Phase D).
+
+    ``fp_value`` is the hex / varchar fingerprint fragment from DuckDB (see
+    :mod:`pipelines.layered_data_assets.core.l1_determinism_gate_v1`).
+    """
+    return f"v1|{artifact_kind}|{fp_value}"
+
+
+def compute_output_row_fingerprint_pair(
+    con: Any,
+    *,
+    parquet_path: Path,
+    fingerprint_artifact_kind: str,
+) -> tuple[int, str]:
+    """Return ``(row_count, raw_fp_fragment)`` for one materialized Parquet output.
+
+    ``fingerprint_artifact_kind`` must be one of the preprocess / run_* artifact
+    kinds that have a dedicated fingerprint SQL in ``l1_determinism_gate_v1``.
+    """
+    from pipelines.layered_data_assets.core.l1_determinism_gate_v1 import (
+        cleaned_bet_parquet_row_fingerprint,
+        run_bet_map_parquet_row_fingerprint,
+        run_day_bridge_parquet_row_fingerprint,
+        run_fact_parquet_row_fingerprint,
+    )
+
+    p = Path(parquet_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"parquet not found for fingerprint: {p}")
+    if fingerprint_artifact_kind == ARTIFACT_PREPROCESS_BET:
+        return cleaned_bet_parquet_row_fingerprint(con, p)
+    if fingerprint_artifact_kind == ARTIFACT_RUN_FACT:
+        return run_fact_parquet_row_fingerprint(con, p)
+    if fingerprint_artifact_kind == ARTIFACT_RUN_BET_MAP:
+        return run_bet_map_parquet_row_fingerprint(con, p)
+    if fingerprint_artifact_kind == ARTIFACT_RUN_DAY_BRIDGE:
+        return run_day_bridge_parquet_row_fingerprint(con, p)
+    raise ValueError(
+        f"unsupported fingerprint_artifact_kind for row fingerprint: {fingerprint_artifact_kind!r}"
+    )
+
+
+def format_impact_metrics_json(
+    *,
+    recompute_rounds: int,
+    recompute_stop_reason: str,
+    row_fingerprint_changed: bool | None = None,
+) -> str:
+    """One-line JSON for stderr logs / MVP summaries (Phase D PR-D4)."""
+    payload = {
+        METRIC_KEY_RECOMPUTE_ROUNDS: int(recompute_rounds),
+        METRIC_KEY_RECOMPUTE_STOP_REASON: str(recompute_stop_reason),
+        METRIC_KEY_ROW_FINGERPRINT_CHANGED: row_fingerprint_changed,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
 def _materialization_state_schema_path() -> Path:
     """Walk ancestors of this file until ``schema/materialization_state.schema.sql`` exists.
 
@@ -186,10 +254,23 @@ def _materialization_state_schema_path() -> Path:
     )
 
 
+def _migrate_materialization_state_extra_columns(con: Any) -> None:
+    """Add Phase D columns to existing DuckDB tables (CREATE IF NOT EXISTS is not enough)."""
+    stmts = (
+        "ALTER TABLE materialization_state ADD COLUMN IF NOT EXISTS impacted_entity_count BIGINT;",
+        "ALTER TABLE materialization_state ADD COLUMN IF NOT EXISTS impacted_day_count BIGINT;",
+        "ALTER TABLE materialization_state ADD COLUMN IF NOT EXISTS recompute_rounds INTEGER;",
+        "ALTER TABLE materialization_state ADD COLUMN IF NOT EXISTS recompute_stop_reason VARCHAR;",
+    )
+    for stmt in stmts:
+        con.execute(stmt)
+
+
 def ensure_materialization_state_schema(con: Any) -> None:
     """Create ``materialization_state`` table if missing (idempotent)."""
     sql = _materialization_state_schema_path().read_text(encoding="utf-8")
     con.execute(sql)
+    _migrate_materialization_state_extra_columns(con)
 
 
 def fetch_state_row(
@@ -203,7 +284,8 @@ def fetch_state_row(
     row = con.execute(
         """
         SELECT artifact_kind, gaming_day, source_snapshot_id, definition_version, transform_version,
-               input_hash, status, attempt, output_uri, row_count, row_hash, error_summary, updated_at
+               input_hash, status, attempt, output_uri, row_count, row_hash, error_summary, updated_at,
+               impacted_entity_count, impacted_day_count, recompute_rounds, recompute_stop_reason
         FROM materialization_state
         WHERE artifact_kind = ? AND gaming_day = ? AND source_snapshot_id = ?
           AND definition_version = ? AND transform_version = ?
@@ -232,6 +314,10 @@ def fetch_state_row(
         "row_hash",
         "error_summary",
         "updated_at",
+        "impacted_entity_count",
+        "impacted_day_count",
+        "recompute_rounds",
+        "recompute_stop_reason",
     ]
     return dict(zip(cols, row))
 
@@ -253,6 +339,42 @@ def should_skip_step(
     return str(row.get("input_hash")) == input_hash
 
 
+def verify_stored_row_fingerprint_matches_output(
+    con: Any,
+    *,
+    artifact_kind: str,
+    gaming_day: str,
+    source_snapshot_id: str,
+    fingerprint_artifact_kind: str,
+    parquet_path: Path,
+) -> bool:
+    """Return ``True`` if stored ``row_hash`` matches a fresh fingerprint (or legacy empty).
+
+    Used when ``--verify-row-fingerprint-on-resume`` is enabled: drift between
+    stored tag and recomputed Parquet fingerprint forces a rerun even if
+    ``input_hash`` matches.
+    """
+    row = fetch_state_row(
+        con,
+        artifact_kind=artifact_kind,
+        gaming_day=gaming_day,
+        source_snapshot_id=source_snapshot_id,
+    )
+    if row is None:
+        return True
+    stored = row.get("row_hash")
+    if stored is None or str(stored).strip() == "":
+        return True
+    n, fp_frag = compute_output_row_fingerprint_pair(
+        con,
+        parquet_path=parquet_path,
+        fingerprint_artifact_kind=fingerprint_artifact_kind,
+    )
+    _ = n
+    tag = format_row_fingerprint_tag(artifact_kind=fingerprint_artifact_kind, fp_value=str(fp_frag))
+    return str(stored) == tag
+
+
 def mark_step_running(con: Any, *, artifact_kind: str, gaming_day: str, source_snapshot_id: str, input_hash: str) -> int:
     """Insert or update row to ``running``; return new ``attempt`` (>=1)."""
     now = datetime.now(timezone.utc)
@@ -265,7 +387,11 @@ def mark_step_running(con: Any, *, artifact_kind: str, gaming_day: str, source_s
     attempt = 1 if prev is None else int(prev["attempt"]) + 1
     con.execute(
         """
-        INSERT INTO materialization_state VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO materialization_state (
+          artifact_kind, gaming_day, source_snapshot_id, definition_version, transform_version,
+          input_hash, status, attempt, output_uri, row_count, row_hash, error_summary, updated_at,
+          impacted_entity_count, impacted_day_count, recompute_rounds, recompute_stop_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (artifact_kind, gaming_day, source_snapshot_id, definition_version, transform_version)
         DO UPDATE SET
           input_hash = excluded.input_hash,
@@ -275,6 +401,10 @@ def mark_step_running(con: Any, *, artifact_kind: str, gaming_day: str, source_s
           row_count = NULL,
           row_hash = NULL,
           error_summary = NULL,
+          impacted_entity_count = excluded.impacted_entity_count,
+          impacted_day_count = excluded.impacted_day_count,
+          recompute_rounds = excluded.recompute_rounds,
+          recompute_stop_reason = excluded.recompute_stop_reason,
           updated_at = excluded.updated_at
         """,
         [
@@ -291,6 +421,10 @@ def mark_step_running(con: Any, *, artifact_kind: str, gaming_day: str, source_s
             None,
             None,
             now,
+            None,
+            None,
+            None,
+            None,
         ],
     )
     return attempt
@@ -307,12 +441,20 @@ def mark_step_succeeded(
     output_uri: str | None,
     row_count: int | None,
     row_hash: str | None = None,
+    impacted_entity_count: int | None = None,
+    impacted_day_count: int | None = None,
+    recompute_rounds: int | None = None,
+    recompute_stop_reason: str | None = None,
 ) -> None:
-    """Persist ``succeeded`` with optional output stats."""
+    """Persist ``succeeded`` with optional output stats and Phase D observability."""
     now = datetime.now(timezone.utc)
     con.execute(
         """
-        INSERT INTO materialization_state VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO materialization_state (
+          artifact_kind, gaming_day, source_snapshot_id, definition_version, transform_version,
+          input_hash, status, attempt, output_uri, row_count, row_hash, error_summary, updated_at,
+          impacted_entity_count, impacted_day_count, recompute_rounds, recompute_stop_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (artifact_kind, gaming_day, source_snapshot_id, definition_version, transform_version)
         DO UPDATE SET
           input_hash = excluded.input_hash,
@@ -322,6 +464,10 @@ def mark_step_succeeded(
           row_count = excluded.row_count,
           row_hash = excluded.row_hash,
           error_summary = NULL,
+          impacted_entity_count = excluded.impacted_entity_count,
+          impacted_day_count = excluded.impacted_day_count,
+          recompute_rounds = excluded.recompute_rounds,
+          recompute_stop_reason = excluded.recompute_stop_reason,
           updated_at = excluded.updated_at
         """,
         [
@@ -338,6 +484,10 @@ def mark_step_succeeded(
             row_hash,
             None,
             now,
+            impacted_entity_count,
+            impacted_day_count,
+            recompute_rounds,
+            recompute_stop_reason,
         ],
     )
 
@@ -351,13 +501,21 @@ def mark_step_failed(
     input_hash: str,
     attempt: int,
     error_summary: str,
+    impacted_entity_count: int | None = None,
+    impacted_day_count: int | None = None,
+    recompute_rounds: int | None = None,
+    recompute_stop_reason: str | None = None,
 ) -> None:
     """Persist ``failed`` with a short error string."""
     now = datetime.now(timezone.utc)
     msg = error_summary[:4000]
     con.execute(
         """
-        INSERT INTO materialization_state VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO materialization_state (
+          artifact_kind, gaming_day, source_snapshot_id, definition_version, transform_version,
+          input_hash, status, attempt, output_uri, row_count, row_hash, error_summary, updated_at,
+          impacted_entity_count, impacted_day_count, recompute_rounds, recompute_stop_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (artifact_kind, gaming_day, source_snapshot_id, definition_version, transform_version)
         DO UPDATE SET
           input_hash = excluded.input_hash,
@@ -367,6 +525,10 @@ def mark_step_failed(
           row_count = NULL,
           row_hash = NULL,
           error_summary = excluded.error_summary,
+          impacted_entity_count = excluded.impacted_entity_count,
+          impacted_day_count = excluded.impacted_day_count,
+          recompute_rounds = excluded.recompute_rounds,
+          recompute_stop_reason = excluded.recompute_stop_reason,
           updated_at = excluded.updated_at
         """,
         [
@@ -383,6 +545,46 @@ def mark_step_failed(
             None,
             msg,
             now,
+            impacted_entity_count,
+            impacted_day_count,
+            recompute_rounds,
+            recompute_stop_reason,
+        ],
+    )
+
+
+def patch_run_day_bridge_recompute_metrics(
+    con: Any,
+    *,
+    gaming_day: str,
+    source_snapshot_id: str,
+    recompute_rounds: int,
+    recompute_stop_reason: str,
+) -> None:
+    """Update Phase D reconcile fields on the latest ``run_day_bridge`` row for one day."""
+    now = datetime.now(timezone.utc)
+    con.execute(
+        """
+        UPDATE materialization_state
+        SET recompute_rounds = ?,
+            recompute_stop_reason = ?,
+            updated_at = ?
+        WHERE artifact_kind = ?
+          AND gaming_day = ?
+          AND source_snapshot_id = ?
+          AND definition_version = ?
+          AND transform_version = ?
+          AND status = 'succeeded'
+        """,
+        [
+            int(recompute_rounds),
+            str(recompute_stop_reason),
+            now,
+            ARTIFACT_RUN_DAY_BRIDGE,
+            gaming_day.strip(),
+            source_snapshot_id.strip(),
+            MATERIALIZATION_DEFINITION_VERSION,
+            MATERIALIZATION_TRANSFORM_VERSION,
         ],
     )
 
