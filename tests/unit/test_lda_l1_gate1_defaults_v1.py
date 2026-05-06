@@ -192,7 +192,7 @@ def test_apply_default_ingestion_registry_respects_explicit_yaml(tmp_path: Path)
 
 
 def test_apply_default_ingestion_registry_sets_canonical_when_missing(tmp_path: Path) -> None:
-    canonical = Path(lda_mod._REPO_ROOT) / "schema" / "preprocess_ingestion_fix_registry.yaml"
+    canonical = Path(lda_mod._REPO_ROOT) / "schema" / "preprocess_l0_data_contract_registry.yaml"
     if not canonical.is_file():
         pytest.skip("canonical ingestion registry not present in checkout")
     args = argparse.Namespace(ingestion_fix_registry_yaml=None)

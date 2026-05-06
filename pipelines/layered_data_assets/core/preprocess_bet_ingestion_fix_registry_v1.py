@@ -1,4 +1,4 @@
-"""Load ``tables.t_bet`` from consolidated ``preprocess_ingestion_fix_registry.yaml`` (LDA-E1-11)."""
+"""Load ``tables.t_bet`` from consolidated ``preprocess_l0_data_contract_registry.yaml`` (LDA-E1-11)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,7 +14,7 @@ def load_preprocess_bet_ingestion_fix_registry(path: Path) -> dict[str, Any]:
     """Parse registry YAML and return the ``t_bet`` table section (legacy flat shape).
 
     Args:
-        path: Path to ``preprocess_ingestion_fix_registry.yaml`` (or a symlink to it).
+        path: Path to ``preprocess_l0_data_contract_registry.yaml`` (or a symlink to it).
 
     Raises:
         FileNotFoundError: If ``path`` is not a file.

@@ -1,4 +1,4 @@
-"""Load consolidated ``preprocess_ingestion_fix_registry.yaml`` (multi-table)."""
+"""Load consolidated ``preprocess_l0_data_contract_registry.yaml`` (multi-table)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,23 +8,23 @@ import yaml
 
 
 def load_preprocess_ingestion_fix_registry(path: Path) -> dict[str, Any]:
-    """Parse the top-level ingestion-fix registry YAML.
+    """Parse the top-level L0 preprocess data contract registry YAML.
 
     Args:
-        path: Path to ``preprocess_ingestion_fix_registry.yaml``.
+        path: Path to ``preprocess_l0_data_contract_registry.yaml``.
 
     Raises:
         FileNotFoundError: If ``path`` is not a file.
         ValueError: If YAML is not a mapping or missing ``tables``.
     """
     if not path.is_file():
-        raise FileNotFoundError(f"preprocess ingestion fix registry not found: {path}")
+        raise FileNotFoundError(f"L0 data contract registry not found: {path}")
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
-        raise ValueError(f"ingestion fix registry root must be a mapping, got {type(raw).__name__}")
+        raise ValueError(f"L0 data contract registry root must be a mapping, got {type(raw).__name__}")
     tables = raw.get("tables")
     if not isinstance(tables, dict):
-        raise ValueError("preprocess_ingestion_fix_registry must contain a top-level tables: mapping")
+        raise ValueError("L0 data contract registry root must contain a top-level tables: mapping")
     return raw
 
 

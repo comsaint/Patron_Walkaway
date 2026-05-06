@@ -7,7 +7,7 @@
 > **v1.2 變更摘要**：新增 **§4.4 事件時間與可觀測時間（`event_time` / `observed_at`）** 契約；離線清洗與 manifest 留痕；**ingestion 延遲摘要 metadata** 供下游監控（本文件不定義 drift 告警規則與閾值）。  
 > **v1.3 變更摘要**：固定 **time semantics registry** 路徑為 `schema/time_semantics_registry.yaml`；補充 preprocessing 前置、snapshot-scoped deterministic ID、trip close 語義、membership lineage、以及 current feature spec coverage 契約。  
 > **v1.4 變更摘要**：run 定義加入 **gaming day 硬切規則**：除 30 分鐘 gap 外，當事件序跨越 `GAMING_DAY_START_HOUR`（與 `trainer/core/_config_training_domain.py` 單一來源對齊；數值可變，非本文件常數）亦強制開新 run；同步修訂 §3.1、§4.2、§5.2 與決策紀錄。  
-> **v1.5 變更摘要**：§4.4 新增 **邏輯可觀測時間之「殘差 P95 cap」**（`ingest_delay_cap_sec`）：在已文件化之整批入倉／回填時窗排除後，對 `(observed_at_raw - event_time)` 取 **P95** 作為該表 cap 常數；凡延遲超過 cap 之列，**邏輯** `observed_at` 取 `event_time + cap`（**不得**改寫 L0 raw）；`t_bet` 定值 **122 秒**（見 `schema/preprocess_ingestion_fix_registry.yaml` 與決策 **LDA-014**）。  
+> **v1.5 變更摘要**：§4.4 新增 **邏輯可觀測時間之「殘差 P95 cap」**（`ingest_delay_cap_sec`）：在已文件化之整批入倉／回填時窗排除後，對 `(observed_at_raw - event_time)` 取 **P95** 作為該表 cap 常數；凡延遲超過 cap 之列，**邏輯** `observed_at` 取 `event_time + cap`（**不得**改寫 L0 raw）；`t_bet` 定值 **122 秒**（見 `schema/preprocess_l0_data_contract_registry.yaml` 與決策 **LDA-014**）。  
 > **v1.6 變更摘要**：Trip v1 契約補強：`trip_fact` 分區鍵語意固定為 **`trip_start_gaming_day`**；`trip_fact` 必須同時輸出**已關閉**與**進行中** trip（`trip_end_*` 可為 null）；`trip_id` hash 納入 `source_snapshot_id` 與 `first_run_id` 且不受 `trip_end_*` 補值影響；trip close 在不引入外部日曆表前提下，允許僅由 `run_fact` 之有 run 日與缺口推導（缺資料日視為完整一日）；`trip_fact` manifest 需列舉本批次觸及之 `run_end_gaming_day` 分區。  
 > **v1.7 變更摘要**：補充離線增量路線之**治理原則**（不變更 §5.3「影響驅動」原則）：`cleaned`（L0.5）允許有限歷史版本與 full recompute 備援；**可操作數值**見 implementation plan（對齊 **LDA-016**）。  
 > **v1.8 變更摘要**：於 **§4.1.1** 正式定義 **L0.5（`cleaned`）** 為 L0 與 L1 之間之**語義層**；明定 L1 物化**必須**以 L0.5 為唯一 bet 輸入，並與 §4.4、**LDA-016** 原則對齊。  
@@ -202,7 +202,7 @@
   2. 在**排除上述時窗內之列**（或專案核准之等價母體）上，對  
      `ingest_delay_residual_sec = observed_at_raw - event_time`  
      計算 **`ingest_delay_residual_p95_sec`**（與既有 manifest 摘要使用相同時區與型別語義）。  
-  3. 將該值登錄為該表之 **`ingest_delay_cap_sec`**（**無條件取整**：與 measured P95 一致之整數秒；`t_bet` 目前為 **122**，見 `schema/preprocess_ingestion_fix_registry.yaml`）。  
+  3. 將該值登錄為該表之 **`ingest_delay_cap_sec`**（**無條件取整**：與 measured P95 一致之整數秒；`t_bet` 目前為 **122**，見 `schema/preprocess_l0_data_contract_registry.yaml`）。  
   4. 對**所有**具非空 `event_time` 與 `observed_at_raw` 之列，定義**邏輯**可觀測時間：  
      **`observed_at_logical = min(observed_at_raw, event_time + ingest_delay_cap_sec)`**（時間型語意上等價之 `LEAST` 亦可）。  
      即：若 `ingest_delay_raw_sec > ingest_delay_cap_sec`，則 **`observed_at_logical = event_time + ingest_delay_cap_sec`**；否則 **`observed_at_logical = observed_at_raw`**。  
@@ -416,7 +416,7 @@ Serving 或線上消費本資產時，**不得假設**可對全歷史做無界�
 | **LDA-011** | Trip close 採 **3 個完整 gaming_day 無 bet** 語義；最後 bet/run 在 Jan 1 時，Jan 2–4 必須完整無 bet 才能關閉該 trip（§3）。 |
 | **LDA-012** | Trip 必須知道所有 runs，run 必須知道所有 bets；`run_day_bridge` 不得取代 membership lineage（§4.2）。 |
 | **LDA-013** | L1/L2 最小統計量由 implementation plan 定，但必須足以重建目前 `package/deploy/models/feature_spec.yaml` 所需全部特徵（§4.2）。 |
-| **LDA-014** | 對納入本資產層之各來源表，採 **殘差 P95 cap** 定義 **`observed_at_logical`**（§4.4）：排除已文件化整批入倉後量測 P95，超過 cap 之列令 `observed_at_logical = event_time + cap`；**L0 raw 不改寫**；`t_bet` 之 **`ingest_delay_cap_sec = 122`** 見 `schema/preprocess_ingestion_fix_registry.yaml`（`BET-INGEST-FIX-004`）。 |
+| **LDA-014** | 對納入本資產層之各來源表，採 **殘差 P95 cap** 定義 **`observed_at_logical`**（§4.4）：排除已文件化整批入倉後量測 P95，超過 cap 之列令 `observed_at_logical = event_time + cap`；**L0 raw 不改寫**；`t_bet` 之 **`ingest_delay_cap_sec = 122`** 見 `schema/preprocess_l0_data_contract_registry.yaml`（`BET-INGEST-FIX-004`）。 |
 | **LDA-015** | Trip v1 落地契約：分區鍵採 `trip_start_gaming_day`、`trip_fact` 同時含已關閉與進行中 trip、`trip_id` 納入 `source_snapshot_id` 與 `first_run_id` 且不受 `trip_end_*` 回填影響、trip close 在不引入外部日曆表下可由 `run_fact` 缺口推導，且須遵守 §5.1 **觀測上界**（**`observed_at_logical` 全域 max →（HK 時區正規化）→ `G_max` → `coverage_end_gaming_day = G_max - 1`**；僅納入 cap 已定版之來源表）；`trip_fact` manifest 必須列舉觸及之 `run_end_gaming_day` 分區（§5.1、§6、§8）。 |
 | **LDA-016** | **離線增量治理原則（不含營運數值）**：`cleaned`（**L0.5**）在影響驅動前提下，允許**有限歷史版本**以利根因分離與回滾，並在影響範圍過大或無法可靠 closure 時允許升級 **full recompute** 備援（須審計原因）。**具體**「每分區保留幾版」「比例閾值與分母」等**僅**於 **implementation plan** 約定與調整；**不得**與 §5.3「影響驅動、非固定日曆窗口」衝突。 |
 | **LDA-017** | **L0.5 多實體治理原則**：L0.5 可擴充為多實體 `cleaned_<entity>`；各實體進 production 前須補齊最小契約（見 implementation plan §2.4.1），且 **L1 不得直讀 raw**（§4.1.1）。實體清單、分區鍵、entity-specific 重算閾值等**實作細節**由 implementation plan 維護。 |

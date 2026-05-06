@@ -1694,7 +1694,7 @@ def main(argv: list[str] | None = None) -> int:
     snap_root.mkdir(parents=True, exist_ok=True)
     eligible_path = snap_root / "eligible_player_ids.parquet"
 
-    ingest_default = root / "schema" / "preprocess_ingestion_fix_registry.yaml"
+    ingest_default = root / "schema" / "preprocess_l0_data_contract_registry.yaml"
     ingest_yaml = ingest_default if ingest_default.is_file() else None
 
     from parallel_lda_mvp.eligible_builder import (

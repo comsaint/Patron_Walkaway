@@ -216,7 +216,7 @@
 - **單一歸屬（MUST）**：run/trip pipeline 之核心程式碼應集中於單一路徑（例如 `pipelines/layered_data_assets/` 或等價目錄），避免同類邏輯長期散落 `scripts/`、`doc/`、`tests/` 多處且無明確主從。
 - **分層目錄（SHOULD）**：至少拆分為 `core`（業務邏輯）、`orchestration`（日區間與 state）、`io`（paths/manifest/atomic write）、`cli`（入口封裝）、`docs`（runbook/decision）；目錄名可調整，但責任邊界不可混用。
 - **入口治理（MUST）**：對外可執行入口維持固定少數（preprocess、三個 materialize、day-range orchestrator、gate1）。若遷移目錄，舊 `scripts/*.py` 先改為薄 wrapper（轉呼叫新模組）以維持向後相容。
-- **契約集中（MUST）**：schema/registry（如 `time_semantics_registry`、`preprocess_ingestion_fix_registry`、manifest schema）維持單一真相來源；pipeline 僅透過明確 adapter 讀取，不在多處散寫解析邏輯。
+- **契約集中（MUST）**：schema/registry（如 `time_semantics_registry`、`preprocess_l0_data_contract_registry`、manifest schema）維持單一真相來源；pipeline 僅透過明確 adapter 讀取，不在多處散寫解析邏輯。
 - **文件分流（MUST）**：  
   - SSOT / Implementation / Execution 三層仍留在既有 planning 體系；  
   - pipeline 操作與故障排除（runbook、command cookbook、incident notes）集中於 pipeline docs；  
@@ -301,7 +301,7 @@
 
 - `schema/time_semantics_registry.yaml` 之 **審核流程**（對應 SSOT §11 議題 7）：PR template、必填欄位檢查。
 - **Preprocessing 規格書**（短文件即可）：對應 `preprocess_*_v1` 與 FND-01/03/11/13 之對照表。
-- **Ingestion fix registry**：`schema/preprocess_ingestion_fix_registry.yaml`（及後續表別 registry）欄位契約、版本策略、與 `time_semantics_registry` 一致性檢查；需包含 bulk episode 證據與 `ingest_delay_cap_sec` 量測方法。
+- **Ingestion fix registry**：`schema/preprocess_l0_data_contract_registry.yaml`（及後續表別 registry）欄位契約、版本策略、與 `time_semantics_registry` 一致性檢查；需包含 bulk episode 證據與 `ingest_delay_cap_sec` 量測方法。
 - **Manifest schema**（JSON schema 或表格）：欄位含 SSOT §8 + `ingestion_delay_summary` 結構約定；`run_fact`（及等價 run 邊界物化）manifest **必須（MUST）**納入 **`gaming_day_start_hour_used`**（整數，與 `trainer/core/_config_training_domain.py::GAMING_DAY_START_HOUR` 一致）。`trip_fact`（及等價 trip 邊界物化）manifest 或 snapshot sidecar **必須（MUST）**納入 **`gaming_day_start_hour_used`**、**`coverage_end_gaming_day`**、**`G_max`**（或等價審計欄位）與參與上界計算之來源表清單（例如 `coverage_input_tables`）。`ingestion_delay_summary`（或等價區塊）**必須**含每表（或每區塊）**`late_threshold_status` ∈ {`defined`, `undefined`}`**（JSON 字串須與此二值完全一致）；僅當 **`defined`** 時 **`late_row_count`／`late_row_ratio` 必填**；**`undefined`** 時兩者須缺省或 `null`（對齊 SSOT §4.4）。CI 驗證：`late_threshold` 占位字串（如 `TBD`）**必須**映射為 **`undefined`**。
 - **`late_arrival_correction_log` schema**（JSON schema 或表格）：與 §10 最小欄位契約一致，與 manifest 可追溯 join 鍵一併鎖定。
 - **Feature dependency registry** 初稿：依 **§6.1.1** 自 `feature_spec.yaml` 列出每一 `(track_section, feature_id)` 所需欄位與 partition key。

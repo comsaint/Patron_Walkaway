@@ -12,9 +12,9 @@ except ImportError:
 from layered_data_assets.preprocess_bet_v1 import run_preprocess_bet_v1
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_INGEST_REGISTRY = _REPO_ROOT / "schema" / "preprocess_ingestion_fix_registry.yaml"
+_DEFAULT_INGEST_REGISTRY = _REPO_ROOT / "schema" / "preprocess_l0_data_contract_registry.yaml"
 
-# Mirrors schema/preprocess_ingestion_fix_registry.yaml tables.t_bet bulk_historical_ingest_episodes.
+# Mirrors schema/preprocess_l0_data_contract_registry.yaml tables.t_bet bulk_historical_ingest_episodes.
 _MATCH_ETL_DAY_2025_05_27 = (
     "CAST(date_trunc('day', TRY_CAST(__etl_insert_Dtm AS TIMESTAMP)) AS DATE) = DATE '2025-05-27'"
 )

@@ -9,11 +9,12 @@ import pytest
 
 from pipelines.layered_data_assets.core.preprocess_session_ingestion_fix_registry_v1 import (
     load_preprocess_session_ingestion_fix_registry,
+    resolve_session_for_mapping_materialization_contract,
     resolve_session_ingest_fix001_cap_binding,
 )
 
 _REPO = Path(__file__).resolve().parents[2]
-_SESSION_REG = _REPO / "schema" / "preprocess_ingestion_fix_registry.yaml"
+_SESSION_REG = _REPO / "schema" / "preprocess_l0_data_contract_registry.yaml"
 
 
 def test_load_session_registry_and_resolve_cap() -> None:
@@ -23,6 +24,16 @@ def test_load_session_registry_and_resolve_cap() -> None:
     assert fix_id == "SESSION-INGEST-FIX-001"
     assert fix_ver == "v1"
     assert applied == ["SESSION-INGEST-FIX-001:v1"]
+
+
+def test_resolve_session_materialization_contract() -> None:
+    doc = load_preprocess_session_ingestion_fix_registry(_SESSION_REG)
+    c = resolve_session_for_mapping_materialization_contract(doc)
+    assert c.clean_logic_version == "v3-registry-driven-session-clean"
+    assert "session_id" in c.required_l0_columns
+    assert len(c.episode_calendar_tags) == 3
+    assert c.correction_pairing_enabled is True
+    assert "is_manual_i64" in c.correction_winner_order_sql
 
 
 def test_prepare_session_passthrough_when_ingest_disabled(
@@ -66,6 +77,10 @@ def test_prepare_session_materializes_synthetic_observed(
         {
             "session_id": [1],
             "session_end_dtm": pd.Timestamp("2025-06-01 12:00:00+00:00"),
+            "session_start_dtm": pd.Timestamp("2025-06-01 11:00:00+00:00"),
+            "player_id": [1],
+            "is_manual": [0],
+            "lud_dtm": pd.Timestamp("2025-06-01 20:00:00+00:00"),
             "__etl_insert_Dtm": pd.Timestamp("2025-06-01 20:00:00+00:00"),
         }
     ).to_parquet(p, index=False)

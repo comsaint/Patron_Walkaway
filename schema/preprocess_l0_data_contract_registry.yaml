@@ -1,12 +1,21 @@
-# Preprocess ingestion fix registry (multi-table).
+# L0 preprocess data contract registry (multi-table).
 # Structure mirrors schema/time_semantics_registry.yaml: shared top-level policy, then `tables.<name>`
-# for per-source semantics, bulk episodes, templates, and active_rules.
-registry_id: preprocess_ingestion_fix_registry
-registry_version: v0.5_draft
+# for per-source semantics, bulk episodes, templates, active_rules, and session materialization contracts.
+registry_id: preprocess_l0_data_contract_registry
+registry_version: v0.7_draft
 owner: data-assets
-description: Multi-table ingestion fixes for L0 preprocess and MVP session mapping. Per-table bodies live under tables.<logical_table_name>
-  (same idea as time_semantics_registry.yaml).
+description: Multi-table L0 preprocess contracts (ingestion caps, bulk episodes, fix rules, session_for_mapping
+  materialization). Per-table bodies live under tables.<logical_table_name> (same idea as time_semantics_registry.yaml).
 change_log:
+- at: '2026-05-06T07:30:00Z'
+  by: cursor-agent
+  change: Renamed file from schema/preprocess_l0_data_contract_registry.yaml to schema/preprocess_l0_data_contract_registry.yaml;
+    registry_id -> preprocess_l0_data_contract_registry; registry_version v0.7_draft.
+- at: '2026-05-06T06:50:00Z'
+  by: cursor-agent
+  change: Added tables.t_session.session_for_mapping_materialization_contract (clean logic version, required L0 columns,
+    event_time_effective policy, correction_pairing winner order, ingestion episode tagging via observed_at_calendar_day on
+    bulk episodes); bumped registry_version to v0.6_draft.
 - at: '2026-05-06T12:00:00Z'
   by: cursor-agent
   change: Consolidated former schema/preprocess_bet_ingestion_fix_registry.yaml and schema/preprocess_session_ingestion_fix_registry.yaml
@@ -271,7 +280,7 @@ tables:
         '
       owner: data-platform
       introduced_at: '2026-05-03T00:00:00Z'
-      doc_ref: schema/preprocess_ingestion_fix_registry.yaml#tables.t_bet.bulk_historical_ingest_episodes
+      doc_ref: schema/preprocess_l0_data_contract_registry.yaml#tables.t_bet.bulk_historical_ingest_episodes
       ticket_ref: TBD
     - fix_rule_id: BET-INGEST-FIX-003
       fix_rule_version: v1
@@ -303,7 +312,7 @@ tables:
         '
       owner: data-platform
       introduced_at: '2026-05-03T00:00:00Z'
-      doc_ref: schema/preprocess_ingestion_fix_registry.yaml#tables.t_bet.bulk_historical_ingest_episodes
+      doc_ref: schema/preprocess_l0_data_contract_registry.yaml#tables.t_bet.bulk_historical_ingest_episodes
       ticket_ref: TBD
     manifest_binding:
       required_fields:
@@ -316,8 +325,8 @@ tables:
       - fix_registry_sha256
       - fix_registry_active_rules_hash
       example:
-        ingestion_fix_rule_id: preprocess_ingestion_fix_registry
-        ingestion_fix_rule_version: v0.5_draft
+        ingestion_fix_rule_id: preprocess_l0_data_contract_registry
+        ingestion_fix_rule_version: v0.7_draft
         applied_fix_rules:
         - BET-INGEST-FIX-004:v1
         - BET-INGEST-FIX-001:v1
@@ -352,6 +361,44 @@ tables:
       - Rows with NULL session_end_dtm are excluded from asset-layer preprocessing (SES-OBS-01).
       - parallel_lda_mvp.session_for_mapping materializes __etl_insert_Dtm_synthetic from this registry; full L1 manifests
         should mirror bet once preprocess_session_v1 CLI exists.
+    session_for_mapping_materialization_contract:
+      clean_logic_version: v3-registry-driven-session-clean
+      required_l0_columns:
+      - __etl_insert_Dtm
+      - session_end_dtm
+      - session_start_dtm
+      - player_id
+      - is_manual
+      - session_id
+      - lud_dtm
+      event_time_effective:
+        true_source_col: session_end_dtm
+        fallback_chain:
+        - session_end_dtm
+        - session_start_dtm
+        - __etl_insert_Dtm_synthetic
+        clamp_to_observed_logical: true
+      correction_pairing:
+        enabled: true
+        partition_keys:
+        - player_id
+        - session_start_dtm
+        winner_order:
+        - col: is_manual
+          order: desc
+        - col: lud_dtm
+          order: desc
+          nulls: last
+        - col: __etl_insert_Dtm
+          order: desc
+          nulls: last
+        - col: session_id
+          order: desc
+          nulls: last
+      ingestion_episode_tagging:
+        enabled: true
+        observed_day_source: bulk_historical_ingest_episodes.episodes.observed_at_calendar_day
+        observed_timestamp_for_day: __etl_insert_Dtm_synthetic
     bulk_historical_ingest_episodes:
       synthetic_observed_at_contract:
         description: 'Define logical observed-at for ingest-delay analytics by capping excessive ingestion lag. If raw observed-at
@@ -375,6 +422,7 @@ tables:
         - Do not change session_end_dtm for event-time ordering.
       episodes:
       - episode_id: SESSION-BULK-INGEST-2025-05-27
+        observed_at_calendar_day: '2025-05-27'
         evidence: DuckDB scan data/gmwds_t_session.parquet; rows with observed-at calendar day 2025-05-27.
         match_rule_sql: 'CAST(date_trunc(''day'', TRY_CAST(__etl_insert_Dtm AS TIMESTAMP)) AS DATE) = DATE ''2025-05-27''
 
@@ -386,6 +434,7 @@ tables:
         __etl_insert_Dtm_max: '2025-05-27 23:59:11'
         note: Major historical backfill; dominated by >7-day ingest delay rows.
       - episode_id: SESSION-BACKFILL-2025-07-22
+        observed_at_calendar_day: '2025-07-22'
         evidence: DuckDB scan; 33% rows on observed-at day 2025-07-22 have >7-day delay, concentrated around event-time from
           2025-05-27.
         match_rule_sql: 'CAST(date_trunc(''day'', TRY_CAST(__etl_insert_Dtm AS TIMESTAMP)) AS DATE) = DATE ''2025-07-22''
@@ -398,6 +447,7 @@ tables:
         __etl_insert_Dtm_max: '2025-07-22 23:59:35'
         note: Targeted replay/correction day with large delayed tail.
       - episode_id: SESSION-CORRECTION-2025-10-16
+        observed_at_calendar_day: '2025-10-16'
         evidence: DuckDB scan; observed-at day 2025-10-16 has abnormal delayed tail (p95 ~5.8 days) and 7,694 rows >7-day
           lag.
         match_rule_sql: 'CAST(date_trunc(''day'', TRY_CAST(__etl_insert_Dtm AS TIMESTAMP)) AS DATE) = DATE ''2025-10-16''

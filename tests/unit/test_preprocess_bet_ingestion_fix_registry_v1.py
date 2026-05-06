@@ -17,7 +17,7 @@ from pipelines.layered_data_assets.core.preprocess_ingestion_fix_registry_v1 imp
 
 def test_consolidated_registry_exposes_t_bet_and_t_session() -> None:
     repo = Path(__file__).resolve().parents[2]
-    path = repo / "schema" / "preprocess_ingestion_fix_registry.yaml"
+    path = repo / "schema" / "preprocess_l0_data_contract_registry.yaml"
     root = load_preprocess_ingestion_fix_registry(path)
     assert {"t_bet", "t_session"}.issubset(set(root.get("tables", {})))
     bet_flat = table_ingestion_section(root, "t_bet")
@@ -30,7 +30,7 @@ def test_consolidated_registry_exposes_t_bet_and_t_session() -> None:
 
 def test_resolve_bet_ingest_fix004_from_repo_registry() -> None:
     repo = Path(__file__).resolve().parents[2]
-    path = repo / "schema" / "preprocess_ingestion_fix_registry.yaml"
+    path = repo / "schema" / "preprocess_l0_data_contract_registry.yaml"
     doc = load_preprocess_bet_ingestion_fix_registry(path)
     cap, fix_id, fix_ver, applied = resolve_bet_ingest_fix004_cap_binding(doc)
     assert cap == 122
@@ -85,7 +85,7 @@ def test_registry_version_expected_mismatch_raises(tmp_path: Path) -> None:
     p = tmp_path / "reg.yaml"
     p.write_text(
         "registry_version: wrong\n"
-        "registry_id: preprocess_ingestion_fix_registry\n"
+        "registry_id: preprocess_l0_data_contract_registry\n"
         "tables:\n"
         "  t_bet:\n"
         "    bulk_historical_ingest_episodes:\n"

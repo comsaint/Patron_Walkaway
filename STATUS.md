@@ -22,7 +22,7 @@ python -m pytest tests/unit/test_preprocess_bet_v1.py -q --tb=short
 make check-lda-l0
 ```
 
-（可選）對真實 L0 partition 跑一次 preprocess，帶 `--ingestion-fix-registry-yaml schema/preprocess_ingestion_fix_registry.yaml`，確認輸出 parquet 含 **`__etl_insert_Dtm_synthetic`** 且 manifest **`ingestion_fix_rule_id`** 非 null。
+（可選）對真實 L0 partition 跑一次 preprocess，帶 `--ingestion-fix-registry-yaml schema/preprocess_l0_data_contract_registry.yaml`，確認輸出 parquet 含 **`__etl_insert_Dtm_synthetic`** 且 manifest **`ingestion_fix_rule_id`** 非 null。
 
 #### 下一步建議
 

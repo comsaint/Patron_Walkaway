@@ -49,7 +49,7 @@ or auto-build from ``--raw-t-session-parquet`` + ``--cutoff-dtm`` (same logic as
 **Logging**: by default stderr shows a short banner, tqdm postfix (current ``gaming_day`` + phase), and one ``[LDA]`` line per subprocess with timing and a brief result summary (Gate1 JSON is not printed). Use ``--echo-commands`` for the previous verbose argv / live worker streams.
 
 **Ingestion / E1-11 fixes**: the orchestrator **always** passes an ingestion registry to ``preprocess_bet_v1``:
-the canonical ``schema/preprocess_ingestion_fix_registry.yaml`` unless you override with
+the canonical ``schema/preprocess_l0_data_contract_registry.yaml`` unless you override with
 ``--ingestion-fix-registry-yaml``. If that file (or the override path) is missing, the program exits
 immediately with an error. Optional ``--ingestion-fix-registry-version-expected`` fail-fast locks
 ``registry_version``.
@@ -156,7 +156,7 @@ def apply_default_ingestion_registry_args(args: argparse.Namespace) -> None:
     """Resolve preprocess ingestion registry path (mandatory for this orchestrator).
 
     If ``args.ingestion_fix_registry_yaml`` is set, it must be an existing file (resolved path).
-    Otherwise sets the canonical ``<repo>/schema/preprocess_ingestion_fix_registry.yaml``,
+    Otherwise sets the canonical ``<repo>/schema/preprocess_l0_data_contract_registry.yaml``,
     which **must** exist or :class:`ValueError` is raised.
 
     Sets ``args._lda_defaulted_ingestion_registry`` when the canonical default is used (banner only).
@@ -172,7 +172,7 @@ def apply_default_ingestion_registry_args(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"ingestion fix registry not found: {p}")
         args.ingestion_fix_registry_yaml = p
         return
-    p = (_REPO_ROOT / "schema" / "preprocess_ingestion_fix_registry.yaml").resolve()
+    p = (_REPO_ROOT / "schema" / "preprocess_l0_data_contract_registry.yaml").resolve()
     if not p.is_file():
         raise ValueError(
             f"Required ingestion fix registry is missing: {p}. "
@@ -318,7 +318,7 @@ def _print_run_banner(
         src = "l0-existing (snap_* per day)"
     reg = args.ingestion_fix_registry_yaml
     if getattr(args, "_lda_defaulted_ingestion_registry", False):
-        reg_note = "preprocess registry ON (default schema/preprocess_ingestion_fix_registry.yaml)"
+        reg_note = "preprocess registry ON (default schema/preprocess_l0_data_contract_registry.yaml)"
     else:
         reg_note = f"preprocess registry ON ({Path(reg).name})"
     lines = [
@@ -1618,7 +1618,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Ingestion registry YAML for preprocess_bet_v1 (BET-INGEST-FIX-004 + synthetic observed-at). "
-            "Default: repo schema/preprocess_ingestion_fix_registry.yaml (required; must exist)."
+            "Default: repo schema/preprocess_l0_data_contract_registry.yaml (required; must exist)."
         ),
     )
     p.add_argument(
