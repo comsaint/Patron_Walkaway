@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -344,6 +345,13 @@ def _materialize_session_with_synthetic_observed(
         )
     rp = str(raw_parquet.resolve()).replace("'", "''")
     inner = _session_materialization_inner_sql(rp_escaped=rp, cap_sec=cap_sec, contract=contract)
+    raw_sz = raw_parquet.stat().st_size
+    print(
+        "[parallel_lda_mvp] session_for_mapping: L0 column check OK; "
+        f"materializing cleaned parquet (raw_bytes={raw_sz:,}, cap_sec={cap_sec}, "
+        f"out={output_parquet.name}) …",
+        flush=True,
+    )
 
     con2 = duckdb.connect()
     try:
@@ -352,7 +360,19 @@ def _materialize_session_with_synthetic_observed(
         if tmp.is_file():
             tmp.unlink()
         to_sql = str(tmp.resolve()).replace("\\", "/").replace("'", "''")
+        print(
+            "[parallel_lda_mvp] session_for_mapping: DuckDB COPY (full scan + rewrite) "
+            f"-> {tmp.name} — can take minutes on large t_session; started at "
+            f"{time.strftime('%H:%M:%S')} …",
+            flush=True,
+        )
+        t_copy = time.perf_counter()
         con2.execute(f"COPY ({inner}) TO '{to_sql}' (FORMAT PARQUET);")
+        print(
+            "[parallel_lda_mvp] session_for_mapping: DuckDB COPY finished "
+            f"in {time.perf_counter() - t_copy:.1f}s",
+            flush=True,
+        )
         if output_parquet.is_file():
             output_parquet.unlink()
         tmp.replace(output_parquet)
@@ -383,8 +403,17 @@ def _ensure_session_materialized_with_registry(p: Path, reg_path: Path) -> Path:
         and meta_ok.get("fix_rule_version") == fix_ver
         and meta_ok.get("session_mapping_clean_logic_version") == clean_ver
     ):
+        print(
+            f"[parallel_lda_mvp] session_for_mapping: cache hit, using {out_p.name}",
+            flush=True,
+        )
         return out_p
 
+    print(
+        "[parallel_lda_mvp] session_for_mapping: cache miss — "
+        f"materializing {out_name} (registry + raw changed or first run)",
+        flush=True,
+    )
     _materialize_session_with_synthetic_observed(
         raw_parquet=p, output_parquet=out_p, cap_sec=cap_sec, contract=contract
     )

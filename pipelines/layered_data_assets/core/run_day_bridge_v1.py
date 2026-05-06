@@ -36,6 +36,7 @@ def _run_day_bridge_copy_inner_sql(*, bet_day_sql_escaped: str, run_id_expr: str
     return f"""
 SELECT DISTINCT
   {run_id_expr} AS run_id,
+  CAST(b.canonical_id AS VARCHAR) AS canonical_id,
   b.player_id,
   CAST(b.gaming_day AS VARCHAR) AS bet_gaming_day,
   CAST(r.run_end_gaming_day AS VARCHAR) AS run_end_gaming_day,
@@ -43,9 +44,9 @@ SELECT DISTINCT
   r.run_end_ts
 FROM run_boundary_bets b
 INNER JOIN run_fact_staging r
-  ON b.player_id = r.player_id AND b.run_seq = r.run_seq
+  ON b.canonical_id = r.canonical_id AND b.run_seq = r.run_seq
 WHERE CAST(b.gaming_day AS VARCHAR) = '{bet_day_sql_escaped}'
-ORDER BY run_id, b.player_id
+ORDER BY run_id, b.canonical_id
 """
 
 

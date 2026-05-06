@@ -2,6 +2,89 @@ version: "2.0"
 spec_id: "walkaway_features_v2_template"
 description: "Template feature spec for Patron Walkaway Predictor (Track Profile / Track LLM / Track Human)."
 
+# ---------------------------------------------------------------------------
+# Layered framework (Phase A skeleton; legacy 3-track sections below remain
+# authoritative for runtime until later phases switch over).
+# ---------------------------------------------------------------------------
+layered_framework:
+  status: "phase_a_skeleton"
+  authoritative: false
+  notes: >
+    Phase A introduces the contract; the legacy track_llm / track_human / track_profile
+    sections still drive runtime. PR-A2 fills the old<->new mapping; PR-A3 lands chunk-
+    dependent replacements; PR-A4 mirrors the contract into the deploy spec.
+
+  layers:
+    bet:
+      grain: "one row per bet"
+      key: "bet_id"
+      foreign_keys: ["canonical_id"]
+      cutoff_rule: "cutoff_time = bet event time"
+      pit_rule: "observed_time <= cutoff_time"
+    run:
+      grain: "one row per closed run; last-style features look at runs strictly before cutoff"
+      key: "run_id"
+      foreign_keys: ["canonical_id"]
+      cutoff_rule: "cutoff_time inherited from bet"
+      pit_rule: "observed_time <= cutoff_time"
+    trip:
+      grain: "one row per closed trip; aggregated from runs"
+      key: "trip_id"
+      foreign_keys: ["canonical_id"]
+      cutoff_rule: "cutoff_time inherited from bet"
+      pit_rule: "observed_time <= cutoff_time"
+    player:
+      grain: "as-of snapshot per canonical_id"
+      key: "canonical_id"
+      cutoff_rule: "snapshot_time <= cutoff_time"
+      pit_rule: "no future leakage allowed"
+
+  naming_convention:
+    pattern: "<layer>__<semantic>__<scope>"
+    layer_values: ["bet", "run", "trip", "player"]
+    scope_examples:
+      time_window: ["w5m", "w15m", "w30m", "w7d", "w30d"]
+      event_window:
+        last_closed_only: ["last1run", "last3runs", "last3trips", "last20bets"]
+        current_open_only: ["currentrun", "currenttrip"]
+    semantic_rules:
+      - "Use 'last*' only for closed entities (no leakage)."
+      - "Use 'current*' only for the open / in-progress entity."
+      - "Do not combine sofar/so_far with currentrun/currenttrip in one feature_id (redundant)."
+      - "Display alias may use hyphens; feature_id uses [a-z0-9_] only."
+
+  cutoff_contract:
+    mode: "single_global_cutoff"
+    bet_level_cutoff: "bet event time (payout_complete_dtm in current schema)"
+    rationale: "bet-level prediction; trainer/scorer/backtester/validator share the same cutoff_time."
+
+  admission_rule:
+    on_pit_unavailable: "prediction_skip"
+    skip_reason_codes:
+      - "PIT_UNAVAILABLE_SOURCE"
+      - "IDENTITY_UNMATCHED"
+      - "MISSING_REQUIRED_INPUT"
+
+  reason_code_policy:
+    direction: "remove"
+    notes: >
+      Phase A only flags the direction. Existing reason_code_category fields remain
+      so the current loader is not broken; downstream removal happens in later phases.
+
+  legacy_tracks:
+    status: "reference_only_after_cutover"
+    track_llm: "to be split across bet / run / trip layers"
+    track_human: "to be split across run / trip / player layers"
+    track_profile: "maps to player layer"
+
+  mapping_artifact:
+    path: "trainer/feature_spec/track_to_layer_mapping.yaml"
+    description: >
+      Authoritative legacy 3-track -> new layered feature_id mapping plus
+      chunk-dependent replacement decisions (PR-A2 and PR-A3). Phase A keeps
+      the legacy track sections below authoritative for the loader; the mapping
+      drives downstream phases.
+
 tracks_enabled:
   track_profile: true
   track_llm: true

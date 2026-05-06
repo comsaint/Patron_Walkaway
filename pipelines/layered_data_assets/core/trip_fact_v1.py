@@ -23,7 +23,7 @@ from trainer.core._config_training_domain import GAMING_DAY_START_HOUR
 
 TRIP_CLOSE_COVERAGE_INPUT_TABLES_V1: tuple[str, ...] = ("t_bet",)
 
-TRIP_DEFINITION_VERSION_DEFAULT = "trip_boundary_v1"
+TRIP_DEFINITION_VERSION_DEFAULT = "trip_boundary_v2_canonical"
 SOURCE_NAMESPACE_DEFAULT = "layered_data_assets_l1"
 _TRIP_FACT_TRANSFORM_VERSION = "v1"
 _TRIP_RUN_MAP_TRANSFORM_VERSION = "v1"
@@ -55,10 +55,11 @@ def _empty_days_after_last_run(last_end: date, coverage_end: date) -> int:
 
 
 def _tag_runs_with_trip_seq(runs: pd.DataFrame) -> pd.DataFrame:
-    """Return ``runs`` with ``trip_seq`` per ``player_id`` (0-based trip index within player)."""
+    """Return ``runs`` with ``trip_seq`` per ``canonical_id`` (0-based trip index within identity)."""
     if runs.empty:
         return runs.assign(trip_seq=pd.Series(dtype="int64"))
     need = {
+        "canonical_id",
         "player_id",
         "run_id",
         "run_start_ts",
@@ -69,7 +70,7 @@ def _tag_runs_with_trip_seq(runs: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"runs frame missing columns {sorted(missing)}")
     out_parts: list[pd.DataFrame] = []
-    for pid, grp in runs.groupby("player_id", sort=False):
+    for cid, grp in runs.groupby("canonical_id", sort=False):
         g = grp.sort_values(["run_start_ts", "run_id"], kind="mergesort").copy()
         trip_seq = 0
         last_end: date | None = None
@@ -118,7 +119,7 @@ def _align_hashes_to_partitions(hashes: list[str], n: int) -> list[str]:
 def _one_trip_and_maps(
     g: pd.DataFrame,
     *,
-    pid: int,
+    canonical_id: str,
     cov: date,
     mseq: int,
     tsq: int,
@@ -136,8 +137,9 @@ def _one_trip_and_maps(
     is_closed = (not is_last_trip) or (is_last_trip and tail_empty >= 3)
     tsg = str(first["run_start_gaming_day"])
     first_run_id = str(first["run_id"])
+    lineage_pid = int(pd.to_numeric(first["player_id"], errors="raise"))
     trip_id = derive_trip_id(
-        player_id=pid,
+        canonical_id=canonical_id,
         trip_start_gaming_day=tsg,
         first_run_id=first_run_id,
         trip_definition_version=trip_definition_version,
@@ -147,7 +149,8 @@ def _one_trip_and_maps(
     trip_end_gd = (last_end + timedelta(days=3)).isoformat() if is_closed else None
     trip_row = {
         "trip_id": trip_id,
-        "player_id": int(pid),
+        "canonical_id": str(canonical_id),
+        "player_id": lineage_pid,
         "trip_start_gaming_day": tsg,
         "trip_start_ts": first["run_start_ts"],
         "trip_end_ts": None,
@@ -161,11 +164,13 @@ def _one_trip_and_maps(
     }
     maps: list[dict[str, Any]] = []
     for o, (_, row) in enumerate(g.iterrows()):
+        row_pid = int(row["player_id"])
         maps.append(
             {
                 "trip_id": trip_id,
                 "run_id": str(row["run_id"]),
-                "player_id": int(pid),
+                "canonical_id": str(canonical_id),
+                "player_id": row_pid,
                 "run_ord_in_trip": int(o),
                 "trip_start_gaming_day": tsg,
             }
@@ -189,14 +194,16 @@ def build_trip_fact_and_run_map_frames(
     cov = coverage_end if coverage_end is not None else _coverage_end_date(r)
     tagged = _tag_runs_with_trip_seq(r)
     tagged["player_id"] = tagged["player_id"].astype("int64")
+    tagged["canonical_id"] = tagged["canonical_id"].astype(str)
     trip_rows: list[dict[str, Any]] = []
     map_rows: list[dict[str, Any]] = []
-    max_seq = tagged.groupby("player_id", sort=False)["trip_seq"].max()
-    for (pid, tsq), g in tagged.groupby(["player_id", "trip_seq"], sort=False):
-        mseq = int(max_seq.loc[int(pid)])
+    max_seq = tagged.groupby("canonical_id", sort=False)["trip_seq"].max()
+    for (cid, tsq), g in tagged.groupby(["canonical_id", "trip_seq"], sort=False):
+        cid_s = str(cid)
+        mseq = int(max_seq.loc[cid_s])
         tr, mp = _one_trip_and_maps(
             g,
-            pid=int(pid),
+            canonical_id=cid_s,
             cov=cov,
             mseq=mseq,
             tsq=int(tsq),
@@ -220,7 +227,7 @@ def load_run_fact_dataframe(con: Any, paths: list[Path]) -> pd.DataFrame:
     lst = ", ".join(parts)
     q = f"""
     SELECT * FROM read_parquet([{lst}])
-    ORDER BY player_id, run_start_ts, run_id
+    ORDER BY canonical_id, run_start_ts, run_id
     """
     return con.execute(q).df()
 

@@ -18,7 +18,7 @@ from pipelines.layered_data_assets.core.preprocess_bet_v1 import (
 )
 from trainer.core._config_training_domain import GAMING_DAY_START_HOUR
 RUN_BREAK_MIN_DEFAULT = 30
-RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT = "run_boundary_v1"
+RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT = "run_boundary_v2_canonical"
 SOURCE_NAMESPACE_DEFAULT = "layered_data_assets_l1"
 _RUN_FACT_TRANSFORM_VERSION = "v1"
 
@@ -28,6 +28,7 @@ _RUN_BOUNDARY_BET_INPUT_COLS: tuple[str, ...] = (
     "gaming_day",
     "bet_id",
     "player_id",
+    "canonical_id",
     "payout_complete_dtm",
 )
 _RUN_BOUNDARY_BET_SELECT_LIST = ",\n    ".join(_RUN_BOUNDARY_BET_INPUT_COLS)
@@ -43,7 +44,7 @@ ord AS (
   SELECT
     *,
     LAG(payout_complete_dtm) OVER (
-      PARTITION BY player_id
+      PARTITION BY canonical_id
       ORDER BY payout_complete_dtm ASC, bet_id ASC
     ) AS prev_payout
   FROM src
@@ -62,7 +63,7 @@ grp AS (
   SELECT
     *,
     SUM(is_new_run) OVER (
-      PARTITION BY player_id
+      PARTITION BY canonical_id
       ORDER BY payout_complete_dtm ASC, bet_id ASC
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS run_seq
@@ -72,7 +73,7 @@ ord2 AS (
   SELECT
     *,
     ROW_NUMBER() OVER (
-      ORDER BY player_id, run_seq, payout_complete_dtm ASC, bet_id ASC
+      ORDER BY canonical_id, run_seq, payout_complete_dtm ASC, bet_id ASC
     ) AS global_ord
   FROM grp
 )
@@ -129,7 +130,8 @@ def build_create_run_fact_staging_sql(
     return f"""
 CREATE OR REPLACE TEMP TABLE run_fact_staging AS
 SELECT
-  player_id,
+  canonical_id,
+  ARG_MIN(player_id, global_ord)::BIGINT AS player_id,
   run_seq,
   ARG_MIN(bet_id, global_ord) AS first_bet_id,
   MIN(payout_complete_dtm) AS run_start_ts,
@@ -141,7 +143,7 @@ SELECT
   '{rd}' AS run_definition_version,
   '{sn}' AS source_namespace
 FROM run_boundary_bets
-GROUP BY player_id, run_seq;
+GROUP BY canonical_id, run_seq;
 """
 
 
@@ -173,10 +175,15 @@ def _run_id_sql_expr(*, table_prefix: str = "") -> str:
     ``table_prefix`` example: ``'r.'`` when joining ``run_fact_staging r``.
     """
     p = table_prefix
+    cid_esc = (
+        f"replace(replace(CAST({p}canonical_id AS VARCHAR), chr(92), chr(92)||chr(92)), "
+        f"chr(34), chr(92)||chr(34))"
+    )
     canon = (
-        f"'{{\"first_bet_id\":\"' || CAST({p}first_bet_id AS VARCHAR) || '\",\"player_id\":' || CAST({p}player_id AS VARCHAR) "
-        f"|| ',\"run_definition_version\":\"' || {p}run_definition_version || '\",\"run_start_ts\":\"' "
-        f"|| strftime({p}run_start_ts, '%Y-%m-%dT%H:%M:%S.%f') || '\",\"source_namespace\":\"' || {p}source_namespace || '\"}}'"
+        f"'{{\"canonical_id\":\"' || {cid_esc} || '\",\"first_bet_id\":\"' || CAST({p}first_bet_id AS VARCHAR) "
+        f"|| '\",\"run_definition_version\":\"' || CAST({p}run_definition_version AS VARCHAR) "
+        f"|| '\",\"run_start_ts\":\"' || strftime({p}run_start_ts, '%Y-%m-%dT%H:%M:%S.%f') "
+        f"|| '\",\"source_namespace\":\"' || CAST({p}source_namespace AS VARCHAR) || '\"}}'"
     )
     return f"'run_' || substr(sha256({canon}), 1, 32)"
 
@@ -194,6 +201,7 @@ def _run_fact_copy_inner_sql(*, day_sql_escaped: str, run_id_expr: str) -> str:
     return f"""
 SELECT
   {run_id_expr} AS run_id,
+  CAST(canonical_id AS VARCHAR) AS canonical_id,
   player_id,
   first_bet_id,
   last_bet_id,

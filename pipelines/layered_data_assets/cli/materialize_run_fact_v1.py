@@ -77,7 +77,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--run-definition-version",
         default=RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT,
-        help="Version string embedded in run_id hash (default: run_boundary_v1)",
+        help="Version string embedded in run_id hash (default: run_boundary_v2_canonical)",
     )
     p.add_argument(
         "--source-namespace",

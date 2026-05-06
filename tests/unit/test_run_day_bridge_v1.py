@@ -69,11 +69,11 @@ def test_run_day_bridge_cross_day_run_appears_under_each_bet_gaming_day(tmp_path
         con.execute(
             f"""
             COPY (SELECT * FROM (VALUES
-              (1::BIGINT, 1::BIGINT, DATE '2026-01-14', TIMESTAMP '2026-01-14 23:50:00',
+              (1::BIGINT, 1::BIGINT, '1'::VARCHAR, DATE '2026-01-14', TIMESTAMP '2026-01-14 23:50:00',
                TIMESTAMP '2026-01-14 23:50:00'),
-              (2::BIGINT, 1::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 00:10:00',
+              (2::BIGINT, 1::BIGINT, '1'::VARCHAR, DATE '2026-01-15', TIMESTAMP '2026-01-15 00:10:00',
                TIMESTAMP '2026-01-15 00:10:00')
-            ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
+            ) AS t(bet_id, player_id, canonical_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
             ) TO '{inp.as_posix()}' (FORMAT PARQUET)
             """
         )
@@ -114,9 +114,9 @@ def test_run_day_bridge_empty_partition_when_no_bets_on_day(tmp_path: Path) -> N
         con.execute(
             f"""
             COPY (SELECT * FROM (VALUES
-              (1::BIGINT, 1::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:00:00',
+              (1::BIGINT, 1::BIGINT, '1'::VARCHAR, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:00:00',
                TIMESTAMP '2026-01-15 10:00:00')
-            ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
+            ) AS t(bet_id, player_id, canonical_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
             ) TO '{inp.as_posix()}' (FORMAT PARQUET)
             """
         )

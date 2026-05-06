@@ -1459,10 +1459,7 @@ def _run_lda_pipeline_for_day(
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """CLI for day-range orchestration."""
-    p = argparse.ArgumentParser(
-        description=__doc__.strip(),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent(
+    _epilog_core = textwrap.dedent(
             """
             Raw t_bet (runs l0_ingest per day; fingerprint includes partition_value so snapshot_id
             usually differs each day). WARNING: repeating the same huge file per day duplicates L0
@@ -1497,7 +1494,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
               python scripts/lda_l1_gate1_day_range_v1.py --dry-run --no-progress
             """
-        ).strip(),
+    ).strip()
+    try:
+        from parallel_lda_mvp.canonical_mapping_runtime_config import (
+            LATE_ARRIVAL_RECOMPUTE_HOURS,
+            MAPPING_MAX_STALENESS_MIN,
+            MAPPING_REFRESH_INTERVAL_MIN,
+        )
+
+        _mvp_epilog = (
+            "\n\nparallel_lda_mvp timing defaults (env override: PARALLEL_LDA_MVP_*): "
+            f"mapping_refresh_interval_min={MAPPING_REFRESH_INTERVAL_MIN}, "
+            f"mapping_max_staleness_min={MAPPING_MAX_STALENESS_MIN}, "
+            f"late_arrival_recompute_hours={LATE_ARRIVAL_RECOMPUTE_HOURS}"
+        )
+    except ImportError:
+        _mvp_epilog = ""
+    p = argparse.ArgumentParser(
+        description=__doc__.strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_epilog_core + _mvp_epilog,
     )
     p.add_argument(
         "--source-snapshot-id",

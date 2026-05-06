@@ -27,13 +27,13 @@ def test_materialize_run_fact_gap_and_run_id_parity(tmp_path: Path) -> None:
         con.execute(
             f"""
             COPY (SELECT * FROM (VALUES
-              (1::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:00:00',
+              (1::BIGINT, 100::BIGINT, '100'::VARCHAR, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:00:00',
                TIMESTAMP '2026-01-15 11:00:00'),
-              (2::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:15:00',
+              (2::BIGINT, 100::BIGINT, '100'::VARCHAR, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:15:00',
                TIMESTAMP '2026-01-15 11:05:00'),
-              (3::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 11:00:00',
+              (3::BIGINT, 100::BIGINT, '100'::VARCHAR, DATE '2026-01-15', TIMESTAMP '2026-01-15 11:00:00',
                TIMESTAMP '2026-01-15 12:00:00')
-            ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
+            ) AS t(bet_id, player_id, canonical_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
             ) TO '{inp.as_posix()}' (FORMAT PARQUET)
             """
         )
@@ -50,15 +50,15 @@ def test_materialize_run_fact_gap_and_run_id_parity(tmp_path: Path) -> None:
     con2 = duckdb.connect(database=":memory:")
     try:
         rows = con2.execute(
-            "SELECT run_id, player_id, first_bet_id, run_start_ts FROM read_parquet(?)",
+            "SELECT run_id, canonical_id, player_id, first_bet_id, run_start_ts FROM read_parquet(?)",
             [str(out)],
         ).fetchall()
-        for run_id, player_id, first_bet_id, run_start_ts in rows:
+        for run_id, canonical_id, player_id, first_bet_id, run_start_ts in rows:
             py = derive_run_id(
-                player_id=player_id,
+                canonical_id=canonical_id,
                 run_start_ts=run_start_ts,
                 first_bet_id=first_bet_id,
-                run_definition_version="run_boundary_v1",
+                run_definition_version="run_boundary_v2_canonical",
                 source_namespace="layered_data_assets_l1",
             )
             assert run_id == py

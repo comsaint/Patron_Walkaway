@@ -47,16 +47,23 @@ def run_start_ts_canonical(value: Any) -> str:
 
 def derive_run_id(
     *,
-    player_id: Any,
+    canonical_id: Any,
     run_start_ts: Any,
     first_bet_id: Any,
     run_definition_version: str,
     source_namespace: str,
 ) -> str:
-    """Return ``run_<32hex>`` from SHA-256 of canonical JSON (§4.1 includes ``first_bet_id``)."""
+    """Return ``run_<32hex>`` from SHA-256 of canonical JSON (§4.1 includes ``first_bet_id``).
+
+    Args:
+        canonical_id: PIT-resolved identity key (string); must not be empty after strip.
+    """
+    cid = str(canonical_id).strip()
+    if not cid:
+        raise ValueError("canonical_id must be non-empty")
     payload = {
+        "canonical_id": cid,
         "first_bet_id": str(_coerce_int_player_or_bet(first_bet_id)),
-        "player_id": _coerce_int_player_or_bet(player_id),
         "run_definition_version": str(run_definition_version).strip(),
         "run_start_ts": run_start_ts_canonical(run_start_ts),
         "source_namespace": str(source_namespace).strip(),

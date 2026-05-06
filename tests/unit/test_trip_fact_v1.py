@@ -22,12 +22,18 @@ from layered_data_assets.trip_id_v1 import derive_trip_id
 
 
 def _sample_runs(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame(rows)
+    enriched: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        if "canonical_id" not in d:
+            d["canonical_id"] = str(d.get("player_id", ""))
+        enriched.append(d)
+    return pd.DataFrame(enriched)
 
 
 def test_derive_trip_id_stable() -> None:
     tid = derive_trip_id(
-        player_id=100,
+        canonical_id="100",
         trip_start_gaming_day="2026-01-01",
         first_run_id="run_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         trip_definition_version=TRIP_DEFINITION_VERSION_DEFAULT,
@@ -35,7 +41,7 @@ def test_derive_trip_id_stable() -> None:
         source_snapshot_id="snap_unit_test_01",
     )
     tid2 = derive_trip_id(
-        player_id=100,
+        canonical_id="100",
         trip_start_gaming_day="2026-01-01",
         first_run_id="run_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         trip_definition_version=TRIP_DEFINITION_VERSION_DEFAULT,
@@ -60,7 +66,7 @@ def test_three_empty_days_splits_trip() -> None:
                 "run_start_gaming_day": "2026-01-01",
                 "run_end_gaming_day": "2026-01-01",
                 "bet_count": 2,
-                "run_definition_version": "run_boundary_v1",
+                "run_definition_version": "run_boundary_v2_canonical",
                 "source_namespace": "ns",
             },
             {
@@ -73,7 +79,7 @@ def test_three_empty_days_splits_trip() -> None:
                 "run_start_gaming_day": "2026-01-05",
                 "run_end_gaming_day": "2026-01-05",
                 "bet_count": 2,
-                "run_definition_version": "run_boundary_v1",
+                "run_definition_version": "run_boundary_v2_canonical",
                 "source_namespace": "ns",
             },
         ]
@@ -108,7 +114,7 @@ def test_tail_open_trip_when_insufficient_empty_days() -> None:
                 "run_start_gaming_day": "2026-01-01",
                 "run_end_gaming_day": "2026-01-01",
                 "bet_count": 1,
-                "run_definition_version": "run_boundary_v1",
+                "run_definition_version": "run_boundary_v2_canonical",
                 "source_namespace": "ns",
             },
         ]
@@ -137,7 +143,7 @@ def test_cross_month_two_runs_same_trip_under_three_empty_rule() -> None:
                 "run_start_gaming_day": "2026-10-30",
                 "run_end_gaming_day": "2026-10-30",
                 "bet_count": 1,
-                "run_definition_version": "run_boundary_v1",
+                "run_definition_version": "run_boundary_v2_canonical",
                 "source_namespace": "ns",
             },
             {
@@ -150,7 +156,7 @@ def test_cross_month_two_runs_same_trip_under_three_empty_rule() -> None:
                 "run_start_gaming_day": "2026-11-02",
                 "run_end_gaming_day": "2026-11-02",
                 "bet_count": 1,
-                "run_definition_version": "run_boundary_v1",
+                "run_definition_version": "run_boundary_v2_canonical",
                 "source_namespace": "ns",
             },
         ]
@@ -181,7 +187,7 @@ def test_cross_month_split_when_three_empty_days_across_boundary() -> None:
                 "run_start_gaming_day": "2026-10-27",
                 "run_end_gaming_day": "2026-10-28",
                 "bet_count": 1,
-                "run_definition_version": "run_boundary_v1",
+                "run_definition_version": "run_boundary_v2_canonical",
                 "source_namespace": "ns",
             },
             {
@@ -194,7 +200,7 @@ def test_cross_month_split_when_three_empty_days_across_boundary() -> None:
                 "run_start_gaming_day": "2026-11-01",
                 "run_end_gaming_day": "2026-11-01",
                 "bet_count": 1,
-                "run_definition_version": "run_boundary_v1",
+                "run_definition_version": "run_boundary_v2_canonical",
                 "source_namespace": "ns",
             },
         ]
@@ -221,7 +227,7 @@ def test_source_partitions_from_runs_sorted() -> None:
                 "run_start_gaming_day": "2026-01-02",
                 "run_end_gaming_day": "2026-01-03",
                 "bet_count": 1,
-                "run_definition_version": "run_boundary_v1",
+                "run_definition_version": "run_boundary_v2_canonical",
                 "source_namespace": "ns",
             },
             {
@@ -234,7 +240,7 @@ def test_source_partitions_from_runs_sorted() -> None:
                 "run_start_gaming_day": "2026-01-01",
                 "run_end_gaming_day": "2026-01-01",
                 "bet_count": 1,
-                "run_definition_version": "run_boundary_v1",
+                "run_definition_version": "run_boundary_v2_canonical",
                 "source_namespace": "ns",
             },
         ]
@@ -297,7 +303,7 @@ def test_materialize_trip_partition_writes_parquet(tmp_path: Path) -> None:
                 "run_start_gaming_day": "2026-02-01",
                 "run_end_gaming_day": "2026-02-01",
                 "bet_count": 1,
-                "run_definition_version": "run_boundary_v1",
+                "run_definition_version": "run_boundary_v2_canonical",
                 "source_namespace": "ns",
             },
         ]
@@ -342,7 +348,7 @@ def test_materialize_empty_partition_no_rows(tmp_path: Path) -> None:
                 "run_start_gaming_day": "2026-02-01",
                 "run_end_gaming_day": "2026-02-01",
                 "bet_count": 1,
-                "run_definition_version": "run_boundary_v1",
+                "run_definition_version": "run_boundary_v2_canonical",
                 "source_namespace": "ns",
             },
         ]
@@ -381,6 +387,7 @@ def test_materialize_trip_empty_run_fact_requires_coverage_end(tmp_path: Path) -
         f"""
         COPY (
           SELECT
+            CAST(NULL AS VARCHAR) AS canonical_id,
             CAST(NULL AS BIGINT) AS player_id,
             CAST(NULL AS VARCHAR) AS run_id,
             CAST(NULL AS BIGINT) AS first_bet_id,

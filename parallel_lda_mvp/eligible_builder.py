@@ -11,6 +11,10 @@ ingestion-cap 物化檔（含 ``__etl_insert_Dtm_synthetic``），見該模組�
 cutoff (naive-HK ISO) + ``|`` + ``SESSION_MAPPING_CLEAN_LOGIC_VERSION`` ). 來源檔位元組、
 cutoff、或 session→mapping 清洗邏輯版本任一變更都會失效快取（含「raw 不變僅改清洗
 程式」的情況）。仍須對 mapping 輸入檔做 **整檔串流** hash（成本見 README）。
+
+**Staleness**：on-disk mapping 在 fingerprint 相符時 **一律載入**（服務 fail-open）。
+``MAPPING_MAX_STALENESS_MIN`` / ``MAPPING_HARD_STALE_LIMIT_MIN`` 僅用於
+``mapping_identity_health_from_meta`` 的稽核欄位（L0/L1/L2）；L2 保守降級行為尚未實作。
 """
 
 from __future__ import annotations
@@ -19,9 +23,14 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
+from parallel_lda_mvp.canonical_mapping_runtime_config import (
+    MAPPING_HARD_STALE_LIMIT_MIN,
+    MAPPING_MAX_STALENESS_MIN,
+)
 from parallel_lda_mvp.session_for_mapping import (
     SESSION_MAPPING_CLEAN_LOGIC_VERSION,
     prepare_session_parquet_for_canonical_mapping,
@@ -106,21 +115,76 @@ def _cache_paths(fp: str) -> tuple[Path, Path]:
     return base / f"mapping_{fp}.parquet", base / f"mapping_{fp}.meta.json"
 
 
-def _load_cached_mapping(fp: str) -> pd.DataFrame | None:
-    """Load mapping from MVP cache if both files exist and meta matches ``fp``."""
+def _parse_meta_built_at_utc(meta: dict[str, object]) -> datetime | None:
+    """Parse ``built_at`` from mapping sidecar meta as timezone-aware UTC, or ``None``."""
+    raw = meta.get("built_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        built = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if built.tzinfo is None:
+        built = built.replace(tzinfo=timezone.utc)
+    return built.astimezone(timezone.utc)
+
+
+def mapping_identity_health_from_meta(
+    meta: dict[str, object] | None,
+    *,
+    fingerprint: str,
+) -> dict[str, Any]:
+    """Audit fields for a mapping cache hit (stale snapshot still allowed for serving).
+
+    ``degrade_level``: 0=fresh, 1=stale beyond ``MAPPING_MAX_STALENESS_MIN``,
+    2=beyond hard limit (conservative degrade **not implemented**; same data as L1 for now).
+    """
+    hard_limit = max(int(MAPPING_HARD_STALE_LIMIT_MIN), int(MAPPING_MAX_STALENESS_MIN))
+    base: dict[str, Any] = {
+        "hard_stale_limit_min": hard_limit,
+        "identity_mode": "unknown",
+        "l2_conservative_degrade": "not_implemented",
+        "mapping_age_min": None,
+        "mapping_max_staleness_min": int(MAPPING_MAX_STALENESS_MIN),
+        "mapping_snapshot_id": fingerprint,
+        "degrade_level": 0,
+    }
+    if meta is None:
+        base["identity_mode"] = "unknown"
+        return base
+    built = _parse_meta_built_at_utc(meta)
+    if built is None:
+        base["identity_mode"] = "unknown"
+        return base
+    age_min = (datetime.now(timezone.utc) - built).total_seconds() / 60.0
+    base["mapping_age_min"] = round(age_min, 3)
+    if age_min <= float(MAPPING_MAX_STALENESS_MIN):
+        base["identity_mode"] = "fresh"
+        base["degrade_level"] = 0
+        return base
+    base["identity_mode"] = "stale_snapshot"
+    if age_min <= float(hard_limit):
+        base["degrade_level"] = 1
+    else:
+        base["degrade_level"] = 2
+    return base
+
+
+def _try_load_mapping_cache(fp: str) -> tuple[pd.DataFrame | None, dict[str, object] | None]:
+    """Return cached ``(mapping_df, meta)`` when fingerprint matches; never drops on staleness."""
     pq_path, meta_path = _cache_paths(fp)
     if not pq_path.is_file() or not meta_path.is_file():
-        return None
+        return None, None
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
+        return None, None
     if meta.get("fingerprint") != fp:
-        return None
+        return None, None
     mapping = pd.read_parquet(pq_path)
     if not {"player_id", "canonical_id"}.issubset(set(mapping.columns)):
-        return None
-    return mapping
+        return None, None
+    return mapping, meta
 
 
 def _write_cached_mapping(
@@ -160,14 +224,31 @@ def _write_cached_mapping(
     tmp_meta.replace(meta_path)
 
 
-def get_or_build_cached_canonical_mapping(
+def resolve_canonical_mapping_parquet_path(
     session_parquet: Path,
     cutoff_dtm: datetime,
-) -> pd.DataFrame:
-    """Return canonical mapping DataFrame; rebuild when mapping input, cutoff, or clean version change.
+) -> Path:
+    """Return on-disk canonical mapping Parquet path for the resolved fingerprint (may not exist yet)."""
+    raw = session_parquet.resolve()
+    if not raw.is_file():
+        raise FileNotFoundError(f"t_session parquet not found: {raw}")
+    mapping_input = prepare_session_parquet_for_canonical_mapping(raw)
+    fp, _ = mapping_input_fingerprint(
+        mapping_input,
+        cutoff_dtm,
+        cleaning_logic_version=SESSION_MAPPING_CLEAN_LOGIC_VERSION,
+    )
+    return _cache_paths(fp)[0]
 
-    Args:
-        session_parquet: L0 raw ``t_session`` Parquet path; cleaned input 由此模組解析。
+
+def get_or_build_cached_canonical_mapping_with_health(
+    session_parquet: Path,
+    cutoff_dtm: datetime,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Return ``(mapping_df, identity_health)``; stale cache rows remain usable (serving fail-open).
+
+    ``identity_health`` includes ``mapping_snapshot_id``, ``mapping_age_min``, ``identity_mode``,
+    ``degrade_level`` (0/1/2; level 2 conservative degrade is not implemented yet).
     """
     raw = session_parquet.resolve()
     if not raw.is_file():
@@ -178,9 +259,10 @@ def get_or_build_cached_canonical_mapping(
         cutoff_dtm,
         cleaning_logic_version=SESSION_MAPPING_CLEAN_LOGIC_VERSION,
     )
-    hit = _load_cached_mapping(fp)
+    hit, meta = _try_load_mapping_cache(fp)
     if hit is not None:
-        return hit
+        health = mapping_identity_health_from_meta(meta, fingerprint=fp)
+        return hit, health
     mapping = _build_mapping_via_trainer_duckdb(mapping_input, cutoff_dtm)
     _write_cached_mapping(
         fp,
@@ -191,7 +273,26 @@ def get_or_build_cached_canonical_mapping(
         mapping_input_content_sha256_hex=content_hex,
         cleaning_logic_version=SESSION_MAPPING_CLEAN_LOGIC_VERSION,
     )
-    return mapping
+    _, meta_after = _try_load_mapping_cache(fp)
+    if meta_after is None:
+        return mapping, mapping_identity_health_from_meta(
+            {"built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")},
+            fingerprint=fp,
+        )
+    health = mapping_identity_health_from_meta(meta_after, fingerprint=fp)
+    return mapping, health
+
+
+def get_or_build_cached_canonical_mapping(
+    session_parquet: Path,
+    cutoff_dtm: datetime,
+) -> pd.DataFrame:
+    """Return canonical mapping DataFrame; rebuild when mapping input, cutoff, or clean version change.
+
+    Args:
+        session_parquet: L0 raw ``t_session`` Parquet path; cleaned input 由此模組解析。
+    """
+    return get_or_build_cached_canonical_mapping_with_health(session_parquet, cutoff_dtm)[0]
 
 
 def build_eligible_player_ids_parquet(
@@ -199,11 +300,11 @@ def build_eligible_player_ids_parquet(
     session_parquet: Path,
     cutoff_dtm: datetime,
     output_parquet: Path,
-) -> Path:
+) -> tuple[Path, dict[str, Any]]:
     """Write single-column ``player_id`` Parquet (BET-DQ-03).
 
-    Uses ``get_or_build_cached_canonical_mapping``; cache invalidation 依 mapping 輸入檔
-    內容 hash、cutoff、與 ``SESSION_MAPPING_CLEAN_LOGIC_VERSION``（見 module docstring）。
+    Uses ``get_or_build_cached_canonical_mapping_with_health``; fingerprint 變更才重建，
+    **不因** ``MAPPING_MAX_STALENESS_MIN`` 丟棄 on-disk mapping（服務可繼續用舊 snapshot）。
 
     Args:
         session_parquet: L0 ``gmwds_t_session.parquet``（或 env 覆寫）；mapping 實際讀入
@@ -212,17 +313,17 @@ def build_eligible_player_ids_parquet(
         output_parquet: Destination path (per-run eligible list).
 
     Returns:
-        Resolved ``output_parquet`` path.
+        ``(resolved output_parquet path, identity_health dict)``.
 
     Raises:
         RuntimeError: If eligible list is empty after build.
     """
     output_parquet.parent.mkdir(parents=True, exist_ok=True)
-    mapping = get_or_build_cached_canonical_mapping(session_parquet, cutoff_dtm)
+    mapping, health = get_or_build_cached_canonical_mapping_with_health(session_parquet, cutoff_dtm)
     eligible = _mapping_to_eligible_player_ids(mapping)
     if eligible.empty:
         raise RuntimeError(
             "rated eligible player_id list is empty; check t_session export and cutoff."
         )
     eligible.to_parquet(output_parquet, index=False)
-    return output_parquet.resolve()
+    return output_parquet.resolve(), health

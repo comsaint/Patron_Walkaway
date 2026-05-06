@@ -400,6 +400,15 @@ try:
         PROFILE_FEATURE_COLS,
         get_all_candidate_feature_ids,
         get_candidate_feature_ids,
+        get_legacy_to_layered_map,
+        get_layer_for_feature,
+    )
+    # Phase B PR-B3: layered (bet/run/trip/player) entrypoints. Thin wrappers
+    # over the legacy compute_track_llm_features / join_player_profile above;
+    # imports kept side-by-side so fallback paths still resolve.
+    from layered import (  # type: ignore[import]
+        compute_bet_layer_features,
+        compute_player_layer_features,
     )
     # except path uses relative .db_conn (python -m trainer.trainer)
     from db_conn import get_clickhouse_client  # type: ignore[import]
@@ -434,6 +443,13 @@ except ModuleNotFoundError:
         PROFILE_FEATURE_COLS,
         get_all_candidate_feature_ids,
         get_candidate_feature_ids,
+        get_legacy_to_layered_map,
+        get_layer_for_feature,
+    )
+    # Phase B PR-B3: layered entrypoints (bet/player thin wrappers over legacy).
+    from trainer.features.layered import (  # type: ignore[import]
+        compute_bet_layer_features,
+        compute_player_layer_features,
     )
     from trainer.db_conn import get_clickhouse_client  # type: ignore[import]
     from trainer.etl_player_profile import (  # type: ignore[import]
@@ -540,9 +556,43 @@ def _compute_canonical_map_duckdb_budget(available_bytes: Optional[int]) -> int:
     return max(lo, min(hi, int(available_bytes * frac)))
 
 
+def _session_row_cutoff_sql(
+    *,
+    cutoff_str: str,
+    legacy_coalesce_cutoff: bool,
+    table_alias: str = "",
+) -> str:
+    """SQL predicate: which session rows are admitted at ``train_end`` (asset-layer contract)."""
+    p = f"{table_alias}." if table_alias else ""
+    if legacy_coalesce_cutoff:
+        return f"COALESCE({p}session_end_dtm, {p}lud_dtm) <= TIMESTAMP '{cutoff_str}'"
+    return (
+        f"{p}session_end_dtm IS NOT NULL "
+        f"AND CAST({p}session_end_dtm AS TIMESTAMP) <= TIMESTAMP '{cutoff_str}'"
+    )
+
+
+def _pit_link_usable_time_sql(
+    *,
+    delay_min: int,
+    legacy_coalesce_cutoff: bool,
+    table_alias: str = "",
+) -> str:
+    """Expression for ``link_usable_time`` in PIT link tables."""
+    p = f"{table_alias}." if table_alias else ""
+    if legacy_coalesce_cutoff:
+        return (
+            f"CAST(COALESCE({p}session_end_dtm, {p}lud_dtm) AS TIMESTAMP) "
+            f"+ INTERVAL '{delay_min}' MINUTE"
+        )
+    return f"CAST({p}session_end_dtm AS TIMESTAMP) + INTERVAL '{delay_min}' MINUTE"
+
+
 def build_canonical_links_and_dummy_from_duckdb(
     session_parquet_path: Path,
     train_end: datetime,
+    *,
+    legacy_coalesce_cutoff: bool = False,
 ) -> Tuple[pd.DataFrame, Set[int]]:
     """Build links (player_id, casino_player_id, lud_dtm) and FND-12 dummy set from session Parquet via DuckDB.
 
@@ -550,17 +600,9 @@ def build_canonical_links_and_dummy_from_duckdb(
     FND-03 (CASINO_PLAYER_ID_CLEAN_SQL), FND-12 dummy detection. train_end should be
     timezone-consistent with the Parquet session timestamps (naive with naive data).
 
-    Parameters
-    ----------
-    session_parquet_path : Path
-        Path to gmwds_t_session.parquet (or equivalent).
-    train_end : datetime
-        Cutoff: only sessions with COALESCE(session_end_dtm, lud_dtm) <= train_end are used.
-
-    Returns
-    -------
-    links_df : DataFrame with columns [player_id, casino_player_id, lud_dtm]
-    dummy_pids : set of player_id (FND-12 dummy/fake-account IDs to exclude)
+    Default cutoff uses ``session_end_dtm`` only (NULL ends excluded), aligned with
+    ``schema/time_semantics_registry.yaml``. Set ``legacy_coalesce_cutoff=True`` only
+    for historical parity (COALESCE(session_end_dtm, lud_dtm) cutoff).
     """
     try:
         import duckdb
@@ -618,6 +660,9 @@ def build_canonical_links_and_dummy_from_duckdb(
         ) AS rn
     FROM read_parquet('{path_escaped}')
 )"""
+    row_cut = _session_row_cutoff_sql(
+        cutoff_str=cutoff_str, legacy_coalesce_cutoff=legacy_coalesce_cutoff
+    )
     links_sql = f"""
 {cte}
 SELECT player_id,
@@ -628,7 +673,7 @@ WHERE rn = 1
   AND is_manual = 0
   AND is_deleted = 0 AND is_canceled = 0
   AND player_id IS NOT NULL AND player_id != {placeholder}
-  AND COALESCE(session_end_dtm, lud_dtm) <= '{cutoff_str}'
+  AND {row_cut}
   AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0)
   AND ({clean_sql}) IS NOT NULL"""
     dummy_sql = f"""
@@ -639,7 +684,7 @@ WHERE rn = 1
   AND is_manual = 0
   AND is_deleted = 0 AND is_canceled = 0
   AND player_id IS NOT NULL AND player_id != {placeholder}
-  AND COALESCE(session_end_dtm, lud_dtm) <= '{cutoff_str}'
+  AND {row_cut}
   AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0)
 GROUP BY player_id
 HAVING COUNT(session_id) = 1
@@ -712,9 +757,21 @@ HAVING COUNT(session_id) = 1
         con.close()
 
 
+def build_canonical_links_and_dummy_from_duckdb_legacy(
+    session_parquet_path: Path,
+    train_end: datetime,
+) -> Tuple[pd.DataFrame, Set[int]]:
+    """Legacy reference: COALESCE(session_end_dtm, lud_dtm) <= cutoff. Do not use in new pipelines."""
+    return build_canonical_links_and_dummy_from_duckdb(
+        session_parquet_path, train_end, legacy_coalesce_cutoff=True
+    )
+
+
 def build_pit_session_links_from_duckdb(
     session_parquet_path: Path,
     train_end: datetime,
+    *,
+    legacy_coalesce_cutoff: bool = False,
 ) -> pd.DataFrame:
     """Build PIT session link timeline for :func:`merge_pit_canonical_to_bets` (B3).
 
@@ -772,19 +829,24 @@ def build_pit_session_links_from_duckdb(
         ) AS rn
     FROM read_parquet('{path_escaped}')
 )"""
+    row_cut = _session_row_cutoff_sql(
+        cutoff_str=cutoff_str, legacy_coalesce_cutoff=legacy_coalesce_cutoff
+    )
+    link_usable = _pit_link_usable_time_sql(
+        delay_min=delay_min, legacy_coalesce_cutoff=legacy_coalesce_cutoff
+    )
     pit_sql = f"""
 {cte}
 SELECT player_id,
        ({clean_sql}) AS casino_player_id,
        lud_dtm,
-       CAST(COALESCE(session_end_dtm, lud_dtm) AS TIMESTAMP)
-         + INTERVAL '{delay_min}' MINUTE AS link_usable_time
+       {link_usable} AS link_usable_time
 FROM deduped
 WHERE rn = 1
   AND is_manual = 0
   AND is_deleted = 0 AND is_canceled = 0
   AND player_id IS NOT NULL AND player_id != {placeholder}
-  AND COALESCE(session_end_dtm, lud_dtm) <= '{cutoff_str}'
+  AND {row_cut}
   AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0)
   AND ({clean_sql}) IS NOT NULL"""
 
@@ -842,10 +904,22 @@ WHERE rn = 1
     ).reset_index(drop=True)
 
 
+def build_pit_session_links_from_duckdb_legacy(
+    session_parquet_path: Path,
+    train_end: datetime,
+) -> pd.DataFrame:
+    """Legacy PIT links using COALESCE(session_end_dtm, lud_dtm); reference only."""
+    return build_pit_session_links_from_duckdb(
+        session_parquet_path, train_end, legacy_coalesce_cutoff=True
+    )
+
+
 def attach_pit_identity_chunk_duckdb(
     bets_df: pd.DataFrame,
     session_parquet_path: Path,
     observation_end: datetime,
+    *,
+    legacy_coalesce_cutoff: bool = False,
 ) -> pd.DataFrame:
     """Attach ``canonical_id`` / ``_pit_rated`` using chunk-scoped DuckDB ASOF join.
 
@@ -894,6 +968,16 @@ def attach_pit_identity_chunk_duckdb(
     if ";" in str(clean_sql):
         raise ValueError("CASINO_PLAYER_ID_CLEAN_SQL must not contain semicolon")
     path_sql = str(path).replace("'", "''")
+    row_cut = _session_row_cutoff_sql(
+        cutoff_str=cutoff_str,
+        legacy_coalesce_cutoff=legacy_coalesce_cutoff,
+        table_alias="d",
+    )
+    link_usable = _pit_link_usable_time_sql(
+        delay_min=delay_min,
+        legacy_coalesce_cutoff=legacy_coalesce_cutoff,
+        table_alias="d",
+    )
 
     sql = f"""
 WITH bets_identity AS (
@@ -916,8 +1000,7 @@ links AS (
     SELECT d.player_id,
            ({clean_sql}) AS casino_player_id,
            CAST(d.lud_dtm AS TIMESTAMP) AS lud_dtm,
-           CAST(COALESCE(d.session_end_dtm, d.lud_dtm) AS TIMESTAMP)
-               + INTERVAL '{delay_min}' MINUTE AS link_usable_time
+           {link_usable} AS link_usable_time
     FROM deduped d
     INNER JOIN player_scope p
         ON d.player_id = p.player_id
@@ -925,7 +1008,7 @@ links AS (
       AND d.is_manual = 0
       AND d.is_deleted = 0 AND d.is_canceled = 0
       AND d.player_id IS NOT NULL AND d.player_id != {PLACEHOLDER_PLAYER_ID}
-      AND COALESCE(d.session_end_dtm, d.lud_dtm) <= TIMESTAMP '{cutoff_str}'
+      AND {row_cut}
       AND (COALESCE(d.turnover, 0) > 0 OR COALESCE(d.num_games_with_wager, 0) > 0)
       AND ({clean_sql}) IS NOT NULL
 ),
@@ -1020,6 +1103,17 @@ ORDER BY _pit_row
     merged["canonical_id"] = _canon_arr
     merged["_pit_rated"] = _rated_arr
     return merged
+
+
+def attach_pit_identity_chunk_duckdb_legacy(
+    bets_df: pd.DataFrame,
+    session_parquet_path: Path,
+    observation_end: datetime,
+) -> pd.DataFrame:
+    """Legacy COALESCE(session_end_dtm, lud_dtm) PIT attach; reference only."""
+    return attach_pit_identity_chunk_duckdb(
+        bets_df, session_parquet_path, observation_end, legacy_coalesce_cutoff=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3045,7 +3139,9 @@ def process_chunk(
     _bets_llm_feature_cols: list = []
     if feature_spec is not None:
         _t0_llm = time.perf_counter()
-        _bets_llm_result = compute_track_llm_features(
+        # Phase B PR-B3: route through layered bet entrypoint (thin wrapper over
+        # compute_track_llm_features). Output identical; legacy column names retained.
+        _bets_llm_result = compute_bet_layer_features(
             bets,
             feature_spec=feature_spec,
             cutoff_time=window_end,
@@ -3119,7 +3215,8 @@ def process_chunk(
     # --- player_profile PIT join (PLAN Step 4 / DEC-011) ---
     # Attaches Rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
     # Non-rated bets and bets without a prior snapshot receive 0 for all profile columns.
-    labeled = join_player_profile(labeled, profile_df)
+    # Phase B PR-B3: route through layered player entrypoint (thin wrapper).
+    labeled = compute_player_layer_features(labeled, profile_df)
     labeled = add_wave2_personalized_baselines(labeled)
 
     # Ensure all non-profile feature columns exist with numeric defaults.
@@ -8229,7 +8326,7 @@ def save_artifact_bundle(
     v10 single-entry format
     ----------------------
     models/model.pkl               {"model", "threshold", "features", "model_kind", ...}
-    models/feature_list.json       [{name, track}]
+    models/feature_list.json       [{name, track, layered_feature_id?, target_layer?}]
     models/reason_code_map.json   {feature_name: reason_code} for scorer SHAP lookup
     models/model_version          <version string>
     models/training_metrics.json  legacy v1 per-model metrics (rated only)
@@ -8277,6 +8374,11 @@ def save_artifact_bundle(
     _llm_set = set(get_candidate_feature_ids(feature_spec, "track_llm", screening_only=False)) if feature_spec else set()
     _human_set = set(get_candidate_feature_ids(feature_spec, "track_human", screening_only=False)) if feature_spec else set()
 
+    # Phase B Gate-B2: carry layered naming alongside legacy column names so bundles
+    # stay model-compatible (``name`` == training DataFrame column) while audit
+    # tooling can read ``layered_feature_id`` / ``target_layer`` from track_to_layer_mapping.
+    _legacy_to_layered = get_legacy_to_layered_map()
+
     feature_list = [
         {
             "name": c,
@@ -8285,6 +8387,8 @@ def save_artifact_bundle(
                 else "track_human" if c in _human_set
                 else "track_llm"
             ),
+            "layered_feature_id": _legacy_to_layered.get(c),
+            "target_layer": get_layer_for_feature(c),
         }
         for c in feature_cols
     ]

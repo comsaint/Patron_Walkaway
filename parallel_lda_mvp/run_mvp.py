@@ -235,8 +235,14 @@ _MONTH_BET_SHA_CACHE_SCHEMA_VERSION = 2
 _T_BET_MONTH_SHA_ALGO_VERSION = "t_bet_month_fp_v2"
 _MONTH_BET_SHA_CACHE_FILENAME = "month_bet_sha_cache.v1.json"
 _MONTH_BET_SHA_TAIL_MONTHS_DEFAULT = 2
-_LATE_ARRIVAL_WINDOW_DAYS_DEFAULT = 45
-_MONTH_BET_SHA_POLICY_VERSION = "tail2_late45_v1"
+_MONTH_BET_SHA_POLICY_VERSION = "tail2_late_runtime_v1"
+
+
+def _mvp_late_arrival_window_days() -> int:
+    """Late-arrival window in whole days (from ``canonical_mapping_runtime_config``)."""
+    from parallel_lda_mvp.canonical_mapping_runtime_config import late_arrival_window_days
+
+    return int(late_arrival_window_days())
 _FINGERPRINT_ALGO_ROLLING = "rolling_keys_plus_core_v1"
 _FINGERPRINT_ALGO_LEGACY = "legacy_extract_sha_v1"
 # Bump when canonical row-hash inputs change (see ``schema/GDP_GMWDS_Raw_Schema_Dictionary.md`` §4 t_bet).
@@ -419,7 +425,7 @@ def _month_bet_sha_policy_payload(*, fingerprint_algo: str) -> dict[str, int | s
     """Embedded policy for month SHA cache (must match reader validation)."""
     return {
         "fingerprint_algo": fingerprint_algo,
-        "late_arrival_window_days": int(_LATE_ARRIVAL_WINDOW_DAYS_DEFAULT),
+        "late_arrival_window_days": int(_mvp_late_arrival_window_days()),
         "policy_version": _MONTH_BET_SHA_POLICY_VERSION,
         "tail_months": int(_MONTH_BET_SHA_TAIL_MONTHS_DEFAULT),
     }
@@ -449,7 +455,7 @@ def _read_month_bet_sha_cache(
         return None
     if int(pol.get("tail_months", -1)) != _MONTH_BET_SHA_TAIL_MONTHS_DEFAULT:
         return None
-    if int(pol.get("late_arrival_window_days", -1)) != _LATE_ARRIVAL_WINDOW_DAYS_DEFAULT:
+    if int(pol.get("late_arrival_window_days", -1)) != _mvp_late_arrival_window_days():
         return None
     fa = pol.get("fingerprint_algo")
     if fa not in (_FINGERPRINT_ALGO_ROLLING, _FINGERPRINT_ALGO_LEGACY):
@@ -604,7 +610,7 @@ def _compute_month_bet_shas_for_span(
         "fallback_separate_connects": 0,
         "force_recompute_used": bool(force),
         "frozen_months_this_run": [],
-        "late_arrival_window_days": _LATE_ARRIVAL_WINDOW_DAYS_DEFAULT,
+        "late_arrival_window_days": _mvp_late_arrival_window_days(),
         "mode": "unset",
         "month_bet_sha_fingerprint_algo": "unset",
         "month_bet_sha_policy_version": _MONTH_BET_SHA_POLICY_VERSION,
@@ -922,6 +928,48 @@ def _split_month_cleaned_to_days(
         con.close()
 
 
+def _materialize_cleaned_bets_with_canonical_id(
+    *,
+    cleaned_paths: list[Path],
+    mapping_parquet: Path,
+) -> list[Path]:
+    """INNER JOIN rated canonical mapping onto each per-day cleaned bet Parquet (drops unmapped rows)."""
+    import duckdb
+
+    mp = mapping_parquet.resolve()
+    if not mp.is_file():
+        raise FileNotFoundError(f"canonical mapping parquet missing: {mp}")
+    mp_sql = str(mp.as_posix()).replace("'", "''")
+    out_paths: list[Path] = []
+    con = duckdb.connect()
+    try:
+        for src in cleaned_paths:
+            if not src.is_file():
+                raise FileNotFoundError(f"cleaned bet parquet missing: {src}")
+            dst = src.with_name(src.stem + "__canonical.parquet")
+            sp = str(src.resolve().as_posix()).replace("'", "''")
+            dp = str(dst.resolve().as_posix()).replace("'", "''")
+            con.execute(
+                f"""
+                COPY (
+                  SELECT b.*, CAST(m.canonical_id AS VARCHAR) AS canonical_id
+                  FROM read_parquet('{sp}') b
+                  INNER JOIN (
+                    SELECT
+                      CAST(player_id AS BIGINT) AS player_id,
+                      CAST(canonical_id AS VARCHAR) AS canonical_id
+                    FROM read_parquet('{mp_sql}')
+                    QUALIFY ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY player_id) = 1
+                  ) m USING (player_id)
+                ) TO '{dp}' (FORMAT PARQUET)
+                """
+            )
+            out_paths.append(dst)
+        return out_paths
+    finally:
+        con.close()
+
+
 def _run_fact_parquet_flat(out_root: Path, gd: str) -> Path:
     """L1 ``run_fact`` path (flat ``run_fact/`` layout)."""
     return out_root / "run_fact" / f"run_fact__{gd}.parquet"
@@ -991,6 +1039,7 @@ def _run_runfact_for_month(
     data_root: Path,
     root: Path,
     cleaned_paths: list[Path],
+    mapping_parquet: Path,
     py: str,
     dirty_preprocess: bool,
 ) -> None:
@@ -1007,6 +1056,11 @@ def _run_runfact_for_month(
         return
 
     import duckdb
+
+    bet_inputs = _materialize_cleaned_bets_with_canonical_id(
+        cleaned_paths=cleaned_paths,
+        mapping_parquet=mapping_parquet,
+    )
 
     from pipelines.layered_data_assets.core.run_fact_v1 import (
         RUN_BOUNDARY_DEFINITION_VERSION_DEFAULT,
@@ -1030,7 +1084,7 @@ def _run_runfact_for_month(
     from pipelines.layered_data_assets.orchestration.oom_runner_v1 import run_duckdb_job_with_oom_retries
 
     anchor = repo_root()
-    inputs_resolved = [p.resolve() for p in cleaned_paths]
+    inputs_resolved = [p.resolve() for p in bet_inputs]
     delay_src = inputs_resolved[0] if inputs_resolved else None
     print(
         f"[parallel_lda_mvp] run_fact batch ym={ym} days={len(days)} "
@@ -1700,6 +1754,7 @@ def main(argv: list[str] | None = None) -> int:
     from parallel_lda_mvp.eligible_builder import (
         build_eligible_player_ids_parquet,
         mapping_input_fingerprint,
+        resolve_canonical_mapping_parquet_path,
     )
     from parallel_lda_mvp.session_for_mapping import (
         SESSION_MAPPING_CLEAN_LOGIC_VERSION,
@@ -1729,12 +1784,15 @@ def main(argv: list[str] | None = None) -> int:
 
     print("[parallel_lda_mvp] eligible_player_ids (mapping cache / trainer) …", flush=True)
     t0 = time.perf_counter()
-    build_eligible_player_ids_parquet(
+    _, mapping_identity_health = build_eligible_player_ids_parquet(
         session_parquet=t_session,
         cutoff_dtm=cutoff,
         output_parquet=eligible_path,
     )
     print(f"[parallel_lda_mvp] eligible_player_ids ok {time.perf_counter() - t0:.1f}s -> {eligible_path.name}", flush=True)
+
+    mapping_parquet_path = resolve_canonical_mapping_parquet_path(t_session, cutoff)
+    print(f"[parallel_lda_mvp] canonical_mapping_parquet={mapping_parquet_path}", flush=True)
 
     py = sys.executable
     force = _force_recompute_months()
@@ -1825,6 +1883,7 @@ def main(argv: list[str] | None = None) -> int:
             data_root=data_root,
             root=root,
             cleaned_paths=cleaned_paths,
+            mapping_parquet=mapping_parquet_path,
             py=py,
             dirty_preprocess=dirty_preprocess,
         )
@@ -1868,6 +1927,12 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(f"[parallel_lda_mvp] phase mvp_summary months={len(gaming_yms)}")
+    from parallel_lda_mvp.canonical_mapping_runtime_config import (
+        LATE_ARRIVAL_RECOMPUTE_HOURS,
+        MAPPING_HARD_STALE_LIMIT_MIN,
+        MAPPING_MAX_STALENESS_MIN,
+        MAPPING_REFRESH_INTERVAL_MIN,
+    )
     for ym in gaming_yms:
         out_root = snap_root / f"gaming_ym={ym}"
         out_root.mkdir(parents=True, exist_ok=True)
@@ -1883,8 +1948,13 @@ def main(argv: list[str] | None = None) -> int:
             "ingest_yaml_content_sha256": ingest_sha,
             "ingestion_fix_registry_yaml": str(ingest_yaml.as_posix()) if ingest_yaml else None,
             "l1_partition_layout": "flat_month_v1",
+            "late_arrival_recompute_hours": int(LATE_ARRIVAL_RECOMPUTE_HOURS),
             "late_arrival_window_days": sha_stats["late_arrival_window_days"],
             "mapping_cache_fingerprint": map_fp,
+            "mapping_hard_stale_limit_min": int(MAPPING_HARD_STALE_LIMIT_MIN),
+            "mapping_identity_health": dict(mapping_identity_health),
+            "mapping_max_staleness_min": int(MAPPING_MAX_STALENESS_MIN),
+            "mapping_refresh_interval_min": int(MAPPING_REFRESH_INTERVAL_MIN),
             "month_bet_sha_escalated_full_span": bool(sha_stats.get("escalated_full_span")),
             "month_bet_sha_fingerprint_algo": sha_stats.get("month_bet_sha_fingerprint_algo"),
             "month_bet_sha_mode": sha_stats.get("mode"),

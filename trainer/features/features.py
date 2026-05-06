@@ -299,6 +299,161 @@ def get_profile_min_lookback(spec: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase B PR-B1: layered (bet/run/trip/player) mapping helpers
+# ---------------------------------------------------------------------------
+# Loads `trainer/feature_spec/track_to_layer_mapping.yaml` (Phase A artifact)
+# and exposes lookup APIs from legacy 3-track feature_id -> new layered
+# feature_id, plus per-layer feature lists. These are read-only, additive
+# helpers; they do not change existing legacy loaders or compute paths.
+
+LAYER_NAMES: tuple = ("bet", "run", "trip", "player")
+
+_TRACK_TO_LAYER_MAPPING_PATH = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "feature_spec"
+    / "track_to_layer_mapping.yaml"
+)
+
+_TRACK_TO_LAYER_MAPPING_CACHE: Optional[dict] = None
+
+
+def load_track_to_layer_mapping(path: Optional[pathlib.Path] = None) -> dict:
+    """Load and cache the legacy<->layered feature_id mapping YAML.
+
+    Returns the parsed YAML as a dict. If the file is missing, returns an
+    empty dict and logs a warning (callers should treat missing mapping as
+    a no-op rather than fail, so legacy paths keep working).
+
+    Parameters
+    ----------
+    path:
+        Optional override for the mapping YAML path. When omitted, loads from
+        ``trainer/feature_spec/track_to_layer_mapping.yaml`` and caches the
+        result. Passing a custom path bypasses the cache.
+    """
+    global _TRACK_TO_LAYER_MAPPING_CACHE
+    if path is None:
+        if _TRACK_TO_LAYER_MAPPING_CACHE is not None:
+            return _TRACK_TO_LAYER_MAPPING_CACHE
+        path = _TRACK_TO_LAYER_MAPPING_PATH
+
+    try:
+        with open(path, "r", encoding="utf-8") as _f:
+            data = _yaml.safe_load(_f) or {}
+    except FileNotFoundError:
+        logger.warning(
+            "track_to_layer_mapping.yaml not found at %s — layered helpers "
+            "will return empty results. Legacy 3-track loaders are unaffected.",
+            path,
+        )
+        data = {}
+
+    if path == _TRACK_TO_LAYER_MAPPING_PATH:
+        _TRACK_TO_LAYER_MAPPING_CACHE = data
+    return data
+
+
+def _iter_legacy_entries(mapping: Optional[dict]) -> List[dict]:
+    """Yield well-formed entries from ``legacy_features``."""
+    m = mapping if mapping is not None else load_track_to_layer_mapping()
+    raw = m.get("legacy_features") or []
+    return [e for e in raw if isinstance(e, dict) and e.get("old_feature_id")]
+
+
+def _iter_chunk_entries(mapping: Optional[dict]) -> List[dict]:
+    """Yield well-formed entries from ``chunk_dependent_replacements``."""
+    m = mapping if mapping is not None else load_track_to_layer_mapping()
+    raw = m.get("chunk_dependent_replacements") or []
+    return [e for e in raw if isinstance(e, dict) and e.get("old_feature_id")]
+
+
+def get_legacy_to_layered_map(mapping: Optional[dict] = None) -> dict:
+    """Return ``{old_feature_id: new_feature_id_or_None}``.
+
+    ``None`` means the legacy feature is ``deprecated``/``removed`` without
+    a direct replacement in ``legacy_features`` (some have replacements in
+    ``chunk_dependent_replacements`` — see :func:`get_chunk_replacements`).
+    """
+    out: dict = {}
+    for e in _iter_legacy_entries(mapping):
+        new_fid = e.get("new_feature_id") or None
+        out[e["old_feature_id"]] = new_fid if new_fid else None
+    return out
+
+
+def get_layered_to_legacy_map(mapping: Optional[dict] = None) -> dict:
+    """Return ``{new_feature_id: [old_feature_id, ...]}``.
+
+    Multiple legacy ids may collapse onto the same layered id (e.g. several
+    ``track_human`` features that became ``run__bets_cnt__currentrun``).
+    """
+    out: dict = {}
+    for e in _iter_legacy_entries(mapping):
+        new_fid = e.get("new_feature_id") or None
+        if not new_fid:
+            continue
+        out.setdefault(new_fid, []).append(e["old_feature_id"])
+    return out
+
+
+def get_feature_ids_by_layer(mapping: Optional[dict] = None) -> dict:
+    """Return ``{layer: [new_feature_id, ...]}`` (deduped, order preserved).
+
+    Layers without any mapped feature are still present with an empty list,
+    so callers can iterate ``LAYER_NAMES`` safely.
+    """
+    out: dict = {layer: [] for layer in LAYER_NAMES}
+    seen: dict = {layer: set() for layer in LAYER_NAMES}
+    for e in _iter_legacy_entries(mapping):
+        layer = e.get("target_layer")
+        new_fid = e.get("new_feature_id") or None
+        if not new_fid or layer not in out:
+            continue
+        if new_fid in seen[layer]:
+            continue
+        out[layer].append(new_fid)
+        seen[layer].add(new_fid)
+    return out
+
+
+def get_chunk_replacements(mapping: Optional[dict] = None) -> dict:
+    """Return ``{old_feature_id: replacement_feature_id}`` for chunk-A/B/D risks.
+
+    Replacement feature_ids are PIT-safe near-equivalents (Phase A PR-A3).
+    Empty dict if mapping yaml is missing.
+    """
+    return {
+        e["old_feature_id"]: e.get("replacement_feature_id")
+        for e in _iter_chunk_entries(mapping)
+        if e.get("replacement_feature_id")
+    }
+
+
+def get_layer_for_feature(
+    feature_id: str,
+    mapping: Optional[dict] = None,
+) -> Optional[str]:
+    """Resolve the layer for either a legacy or a layered feature_id.
+
+    Lookup order:
+    1. legacy ``old_feature_id`` -> ``target_layer``
+    2. layered ``new_feature_id`` -> ``target_layer``
+    3. None if the id is unknown to the mapping
+    """
+    if not feature_id:
+        return None
+    for e in _iter_legacy_entries(mapping):
+        if e.get("old_feature_id") == feature_id:
+            layer = e.get("target_layer")
+            return layer if layer in LAYER_NAMES else None
+    for e in _iter_legacy_entries(mapping):
+        if e.get("new_feature_id") == feature_id:
+            layer = e.get("target_layer")
+            return layer if layer in LAYER_NAMES else None
+    return None
+
+
 def coerce_feature_dtypes(
     df: pd.DataFrame,
     feature_cols: List[str],

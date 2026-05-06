@@ -37,13 +37,14 @@ def _run_bet_map_copy_inner_sql(*, day_sql_escaped: str, run_id_expr: str) -> st
 SELECT
   {run_id_expr} AS run_id,
   b.bet_id,
+  CAST(b.canonical_id AS VARCHAR) AS canonical_id,
   b.player_id,
   b.payout_complete_dtm,
   CAST(b.gaming_day AS VARCHAR) AS bet_gaming_day,
   CAST(r.run_end_gaming_day AS VARCHAR) AS run_end_gaming_day
 FROM run_boundary_bets b
 INNER JOIN run_fact_staging r
-  ON b.player_id = r.player_id AND b.run_seq = r.run_seq
+  ON b.canonical_id = r.canonical_id AND b.run_seq = r.run_seq
 WHERE CAST(r.run_end_gaming_day AS VARCHAR) = '{day_sql_escaped}'
 ORDER BY run_id, b.payout_complete_dtm ASC, b.bet_id ASC
 """

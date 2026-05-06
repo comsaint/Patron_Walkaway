@@ -121,6 +121,30 @@ except ImportError:
             load_feature_spec,
         )
 
+# Phase B PR-B4: layered (bet/player) entrypoints. Thin wrappers over the legacy
+# functions imported above; serving uses these to share the same orchestration
+# path as trainer.py while underlying compute is unchanged (train-serve parity).
+try:
+    from layered import (  # type: ignore[import]
+        compute_bet_layer_features,
+        compute_player_layer_features,
+    )
+except ImportError:
+    try:
+        from .layered import (  # type: ignore[import, attr-defined]
+            compute_bet_layer_features,
+            compute_player_layer_features,
+        )
+    except ImportError:
+        try:
+            from trainer.features.layered import (  # type: ignore[import, attr-defined]
+                compute_bet_layer_features,
+                compute_player_layer_features,
+            )
+        except ImportError:
+            compute_bet_layer_features = None  # type: ignore[assignment]
+            compute_player_layer_features = None  # type: ignore[assignment]
+
 try:
     from identity import (  # type: ignore[import]
         build_canonical_mapping_from_df,
@@ -2432,11 +2456,19 @@ def score_once(
     features_all = features_all[features_all["canonical_id"].isin(rated_canonical_ids)].copy()
 
     # Track LLM: compute DuckDB features from feature spec when available.
+    # Phase B PR-B4: route through layered bet entrypoint when available
+    # (thin wrapper over compute_track_llm_features). Fallback preserves the
+    # original call when the layered module fails to import.
     _feature_spec = artifacts.get("feature_spec")
     if _feature_spec is not None:
         _n_before_llm = len(features_all)
+        _bet_compute = (
+            compute_bet_layer_features
+            if compute_bet_layer_features is not None
+            else compute_track_llm_features
+        )
         try:
-            features_all = compute_track_llm_features(
+            features_all = _bet_compute(
                 features_all,
                 feature_spec=_feature_spec,
                 cutoff_time=now_hk,
@@ -2530,7 +2562,13 @@ def score_once(
             features_all = _fa.merge(_t, on="bet_id", how="left")
         _profile_df = _load_profile_for_scoring(rated_canonical_ids, now_hk)
         if _profile_df is not None:
-            features_all = _join_profile(features_all, _profile_df)
+            # Phase B PR-B4: layered player entrypoint when available.
+            _player_compute = (
+                compute_player_layer_features
+                if compute_player_layer_features is not None
+                else _join_profile
+            )
+            features_all = _player_compute(features_all, _profile_df)
             logger.debug("[scorer] player_profile PIT join applied")
         else:
             logger.debug(
