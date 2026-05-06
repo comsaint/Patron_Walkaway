@@ -136,7 +136,9 @@ def test_phase_e_no_reason_codes_column_on_cleaned_sample(mvp_snap: Path) -> Non
     for sum_path in sorted(mvp_snap.glob("gaming_ym=*/mvp_summary.json")):
         month_dir = sum_path.parent
         s = _load_summary(sum_path)
-        first_day = str(s["days"][0])
+        days = s.get("days")
+        assert isinstance(days, list) and days, sum_path
+        first_day = str(days[0])
         p = month_dir / "t_bet" / f"cleaned__{first_day}.parquet"
         df = pd.read_parquet(p, columns=None)
         assert "reason_codes" not in df.columns, p
