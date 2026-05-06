@@ -53,6 +53,12 @@ BUNDLE_FILES = [
     "comparison_metrics.json",
     "pipeline_diagnostics.json",
 ]
+# Phase E: bundle files that may legitimately be missing without breaking deploy.
+# When absent, ``copy_model_bundle`` logs a warning instead of failing silently.
+# - ``reason_code_map.json``: only emitted when the trainer bundle has SHAP reason
+#   codes enabled (see ``trainer.training.trainer.save_artifact_bundle``).
+# - ``pipeline_diagnostics.json``: optional ops blob.
+OPTIONAL_BUNDLE_FILES = frozenset({"reason_code_map.json", "pipeline_diagnostics.json"})
 MODEL_PKL_NAMES = ["model.pkl"]
 
 # ---------------------------------------------------------------------------
@@ -272,7 +278,7 @@ def copy_model_bundle(source_dir: Path, dest_models: Path) -> None:
         src = source_dir / name
         if src.exists():
             shutil.copy2(src, dest_models / name)
-        elif name == "pipeline_diagnostics.json":
+        elif name in OPTIONAL_BUNDLE_FILES:
             logger.warning(
                 "Model source missing optional %s; deploy bundle will omit it.",
                 name,

@@ -929,6 +929,41 @@ def _split_month_cleaned_to_days(
         con.close()
 
 
+def _validate_canonical_mapping_unique_per_player(
+    con: Any,
+    *,
+    mapping_parquet_sql_literal: str,
+) -> None:
+    """Raise ``ValueError`` if any ``player_id`` maps to more than one distinct ``canonical_id``.
+
+    Duplicate rows with the same ``(player_id, canonical_id)`` are allowed.
+
+    Args:
+        con: Open DuckDB connection.
+        mapping_parquet_sql_literal: Path to mapping Parquet, escaped for use inside ``'...'``.
+    """
+    rows = con.execute(
+        f"""
+        SELECT
+          CAST(player_id AS BIGINT) AS player_id,
+          COUNT(DISTINCT CAST(canonical_id AS VARCHAR)) AS n_canonical
+        FROM read_parquet('{mapping_parquet_sql_literal}')
+        GROUP BY 1
+        HAVING n_canonical > 1
+        ORDER BY player_id
+        LIMIT 30
+        """
+    ).fetchall()
+    if not rows:
+        return
+    sample = ", ".join(f"{int(r[0])}({int(r[1])} distinct)" for r in rows[:10])
+    raise ValueError(
+        "canonical mapping violates 1:1 player_id→canonical_id: "
+        f"{len(rows)} player_id(s) with multiple distinct canonical_id values "
+        f"(sample: {sample}). Rebuild mapping or fix upstream data."
+    )
+
+
 def _materialize_cleaned_bets_with_canonical_id(
     *,
     cleaned_paths: list[Path],
@@ -944,6 +979,7 @@ def _materialize_cleaned_bets_with_canonical_id(
     out_paths: list[Path] = []
     con = duckdb.connect()
     try:
+        _validate_canonical_mapping_unique_per_player(con, mapping_parquet_sql_literal=mp_sql)
         for src in cleaned_paths:
             if not src.is_file():
                 raise FileNotFoundError(f"cleaned bet parquet missing: {src}")

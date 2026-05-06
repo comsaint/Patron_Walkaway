@@ -8398,23 +8398,26 @@ def save_artifact_bundle(
     )
 
     # reason_code_map.json: feature name -> short reason code for SHAP output.
-    # Generated from feature_spec (DEC-024 / TRN-XX).
+    # Phase E (reason-code removal + compat): only emit a populated map when the
+    # bundle actually supports SHAP reason codes; otherwise write an empty map so
+    # legacy scorer load paths keep working without the PROFILE_/FEAT_ fallback
+    # noise (which never reaches downstream when SCORER_ENABLE_SHAP_REASON_CODES
+    # is off, see ``trainer.core._config_serving_runtime``).
+    _reason_codes_enabled_for_bundle = bool(rated.get("reason_codes_enabled", True)) if rated else False
     reason_code_map: dict[str, str] = {}
-    if feature_spec is not None:
+    if _reason_codes_enabled_for_bundle and feature_spec is not None:
         for track in ["track_llm", "track_human", "track_profile"]:
             for c in feature_spec.get(track, {}).get("candidates", []):
                 fid = c.get("feature_id")
                 rcode = c.get("reason_code_category")
                 if fid and rcode:
                     reason_code_map[fid] = rcode
-
-    # Fallback for any missing code
-    for feat in feature_cols:
-        if feat not in reason_code_map:
-            if feat in PROFILE_FEATURE_COLS:
-                reason_code_map[feat] = f"PROFILE_{feat[:28].upper()}"
-            else:
-                reason_code_map[feat] = f"FEAT_{feat[:30].upper()}"
+        for feat in feature_cols:
+            if feat not in reason_code_map:
+                if feat in PROFILE_FEATURE_COLS:
+                    reason_code_map[feat] = f"PROFILE_{feat[:28].upper()}"
+                else:
+                    reason_code_map[feat] = f"FEAT_{feat[:30].upper()}"
 
     (_out / "reason_code_map.json").write_text(
         json.dumps(reason_code_map, indent=2, ensure_ascii=False), encoding="utf-8"

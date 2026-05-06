@@ -108,6 +108,23 @@ SCORER_ENABLE_SHAP_REASON_CODES = os.getenv(
     "SCORER_ENABLE_SHAP_REASON_CODES", "0"
 ).strip().lower() in ("1", "true", "t", "yes", "y")
 
+SCORER_REASON_CODES_DEFAULT_EMPTY: str = "[]"
+"""Phase E canonical empty value for the alert ``reason_codes`` column.
+
+Phase E policy (single canonical switch):
+- ``SCORER_ENABLE_SHAP_REASON_CODES`` (this module, env override) is the sole
+  gate for SHAP-based reason-code computation in serving.
+- When the gate is off, ``reason_codes`` MUST be the JSON-encoded empty list
+  (``"[]"``) for every persisted alert; downstream parsers can rely on a
+  non-null, valid JSON list at all times.
+- Computation is additionally suppressed when the bundle reports
+  ``reason_codes_enabled=False`` or when ``model.supports_shap_reason_codes``
+  is False (e.g. equal-weight ensemble wrappers).
+
+This constant exists so trainer / scorer / deploy code share one value and
+tests can assert the exact contract without re-deriving it.
+"""
+
 # Feature parity audit (serving): optional writes to PREDICTION_LOG_DB_PATH SQLite.
 SCORER_FEATURE_AUDIT_ENABLE = os.getenv(
     "SCORER_FEATURE_AUDIT_ENABLE", "0"

@@ -390,6 +390,12 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
     if reason_map_path.exists():
         with reason_map_path.open(encoding="utf-8") as fh:
             artifacts["reason_code_map"] = json.load(fh)
+    else:
+        logger.info(
+            "[scorer] reason_code_map.json not present at %s; SHAP reason-code "
+            "lookup will use feature-id fallback (Phase E: file is optional).",
+            reason_map_path,
+        )
 
     if model_path.exists():
         rb = joblib.load(model_path)
@@ -1473,12 +1479,21 @@ def _compute_reason_codes(
 ) -> List[str]:
     """Return JSON-encoded reason-code lists (one per row in X).
 
-    Uses SHAP TreeExplainer for single-tree models; returns empty lists when SHAP is
-    disabled for the bundle model (e.g. equal-weight ensemble wrapper) or on any error.
+    Phase E: this helper now treats two flags as **fast-fail short-circuits** so
+    callers never pay SHAP / numpy-argsort cost when the canonical switch is off:
+
+    * ``trainer.core.config.SCORER_ENABLE_SHAP_REASON_CODES`` (env-driven gate).
+    * ``model.supports_shap_reason_codes`` (per-bundle capability).
+
+    Returns ``["[]", "[]", ...]`` (length == ``len(X)``) when either flag is False
+    or on any unexpected exception.
     """
+    empty = config.SCORER_REASON_CODES_DEFAULT_EMPTY
+    if not bool(getattr(config, "SCORER_ENABLE_SHAP_REASON_CODES", False)):
+        return [empty for _ in range(len(X))]
     try:
         if not bool(getattr(model, "supports_shap_reason_codes", True)):
-            return ["[]" for _ in range(len(X))]
+            return [empty for _ in range(len(X))]
         import shap  # type: ignore[import]
 
         explainer = shap.TreeExplainer(model)
@@ -1496,7 +1511,7 @@ def _compute_reason_codes(
         return result
     except Exception as exc:
         logger.debug("[scorer] SHAP reason codes skipped: %s", exc)
-        return ["[]" for _ in range(len(X))]
+        return [empty for _ in range(len(X))]
 
 
 # ── player_profile loading for real-time scoring (R79) ─────────────────
@@ -2707,7 +2722,10 @@ def score_once(
 
     # ── SHAP reason codes for rated alert candidates ──────────────────────
     # Guarded by config flag to avoid per-cycle SHAP overhead in production.
-    alert_candidates["reason_codes"] = "[]"
+    # Phase E canonical empty value (config.SCORER_REASON_CODES_DEFAULT_EMPTY)
+    # ensures every persisted alert has a parseable JSON list, even when SHAP
+    # is disabled for the whole pipeline.
+    alert_candidates["reason_codes"] = config.SCORER_REASON_CODES_DEFAULT_EMPTY
     rated_art = artifacts.get("rated")
     rated_mask_ac = alert_candidates["is_rated_obs"].astype(bool)
 

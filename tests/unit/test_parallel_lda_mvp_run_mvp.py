@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import duckdb
 import pandas as pd
+import pytest
 
 from parallel_lda_mvp.run_mvp import (
     _FINGERPRINT_ALGO_LEGACY,
@@ -461,8 +462,8 @@ def test_force_recompute_used_in_stats(tmp_path: Path) -> None:
     assert stats["mode"] == "force_full"
 
 
-def test_materialize_cleaned_bets_with_canonical_id_is_deterministic(tmp_path: Path) -> None:
-    """For duplicate mapping rows per player, canonical_id selection must be deterministic."""
+def test_materialize_cleaned_bets_allows_duplicate_mapping_rows_same_canonical(tmp_path: Path) -> None:
+    """Duplicate ``(player_id, canonical_id)`` rows in mapping are allowed after uniqueness check."""
     cleaned = tmp_path / "cleaned.parquet"
     mapping = tmp_path / "mapping.parquet"
     pd.DataFrame(
@@ -474,7 +475,7 @@ def test_materialize_cleaned_bets_with_canonical_id_is_deterministic(tmp_path: P
     pd.DataFrame(
         {
             "player_id": [1001, 1001, 1002],
-            "canonical_id": ["canon_z", "canon_a", "canon_k"],
+            "canonical_id": ["canon_a", "canon_a", "canon_k"],
         }
     ).to_parquet(mapping, index=False)
 
@@ -485,6 +486,30 @@ def test_materialize_cleaned_bets_with_canonical_id_is_deterministic(tmp_path: P
     out = pd.read_parquet(out_paths[0]).sort_values("player_id").reset_index(drop=True)
     assert list(out["player_id"]) == [1001, 1002]
     assert list(out["canonical_id"]) == ["canon_a", "canon_k"]
+
+
+def test_materialize_cleaned_bets_raises_on_conflicting_canonical_ids(tmp_path: Path) -> None:
+    """Mapping must not assign one ``player_id`` to multiple distinct ``canonical_id`` values."""
+    cleaned = tmp_path / "cleaned.parquet"
+    mapping = tmp_path / "mapping_conflict.parquet"
+    pd.DataFrame(
+        {
+            "bet_id": [11],
+            "player_id": [1001],
+        }
+    ).to_parquet(cleaned, index=False)
+    pd.DataFrame(
+        {
+            "player_id": [1001, 1001],
+            "canonical_id": ["canon_z", "canon_a"],
+        }
+    ).to_parquet(mapping, index=False)
+
+    with pytest.raises(ValueError, match=r"1:1 player_id"):
+        _materialize_cleaned_bets_with_canonical_id(
+            cleaned_paths=[cleaned],
+            mapping_parquet=mapping,
+        )
 
 
 def test_canonical_parquet_digest_row_order_invariant(tmp_path: Path) -> None:
