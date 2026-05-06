@@ -188,6 +188,7 @@ def _preprocess_pipeline_select_sql(
     order_etl: str,
     order_payout: str,
     ingest_delay_cap_sec: int | None,
+    lud_dtm_as_etl_insert_proxy: bool,
 ) -> str:
     """Assemble dedupe pipeline SQL (no ``COPY`` wrapper)."""
     if ingest_delay_cap_sec is None:
@@ -214,10 +215,9 @@ with_capped AS (
     END AS __etl_insert_Dtm_synthetic
   FROM filtered
 )"""
+    src_cte = _src_cte_sql(rp_list, lud_dtm_as_etl_insert_proxy=lud_dtm_as_etl_insert_proxy)
     return f"""
-{with_prefix}src AS (
-  SELECT * FROM read_parquet([{rp_list}])
-),
+{with_prefix}{src_cte},
 filtered AS (
   SELECT * FROM src
   WHERE {where_sql}
@@ -249,6 +249,7 @@ def build_preprocess_sql(
     eligible_ids_table_sql: str | None,
     columns: set[str],
     ingest_delay_cap_sec: int | None = None,
+    lud_dtm_as_etl_insert_proxy: bool = False,
 ) -> str:
     """Build a single DuckDB ``COPY (SELECT ...) TO ...`` statement (no bind params)."""
     if (gaming_day is None) == (gaming_ym is None):
@@ -272,6 +273,7 @@ def build_preprocess_sql(
         order_etl=order_etl,
         order_payout=order_payout,
         ingest_delay_cap_sec=ingest_delay_cap_sec,
+        lud_dtm_as_etl_insert_proxy=lud_dtm_as_etl_insert_proxy,
     )
     out = str(output_parquet.resolve()).replace("\\", "/").replace("'", "''")
     return f"COPY ({inner.strip()}) TO '{out}' (FORMAT PARQUET);\n"
@@ -342,15 +344,45 @@ def _preprocess_subrules_applied(
     return subrules
 
 
-def _validate_columns_for_ingest_cap(columns: set[str]) -> None:
-    """Require ETL + payout columns when applying synthetic observed-at cap."""
-    need = frozenset({"__etl_insert_Dtm", "payout_complete_dtm"})
-    missing = sorted(need - columns)
-    if missing:
+def _validate_columns_for_ingest_cap(columns: set[str]) -> bool:
+    """Validate columns for synthetic observed-at cap.
+
+    Returns:
+        True if ``__etl_insert_Dtm`` is absent but ``lud_dtm`` will be aliased
+        into ``__etl_insert_Dtm`` in the DuckDB ``src`` CTE (MVP / stripped L0).
+
+    Raises:
+        ValueError: If ``payout_complete_dtm`` is missing, or neither
+            ``__etl_insert_Dtm`` nor ``lud_dtm`` is available for observed-at.
+    """
+    if "payout_complete_dtm" not in columns:
         raise ValueError(
-            "ingestion fix registry cap requires L0 t_bet columns "
-            f"{sorted(need)}; missing: {missing}."
+            "ingestion fix registry cap requires L0 t_bet column payout_complete_dtm; "
+            f"missing. Have columns (sample): {sorted(columns)[:40]}"
+            + (" …" if len(columns) > 40 else "")
         )
+    if "__etl_insert_Dtm" in columns:
+        return False
+    if "lud_dtm" in columns:
+        return True
+    raise ValueError(
+        "ingestion fix registry cap requires L0 t_bet observed-at: __etl_insert_Dtm "
+        "or lud_dtm (lud_dtm is used as a proxy when __etl_insert_Dtm is absent). "
+        f"Neither present. Have columns (sample): {sorted(columns)[:40]}"
+        + (" …" if len(columns) > 40 else "")
+    )
+
+
+def _src_cte_sql(rp_list: str, *, lud_dtm_as_etl_insert_proxy: bool) -> str:
+    """DuckDB ``src`` CTE: optional ``__etl_insert_Dtm`` from ``lud_dtm`` for ingest cap."""
+    if not lud_dtm_as_etl_insert_proxy:
+        return f"""src AS (
+  SELECT * FROM read_parquet([{rp_list}])
+)"""
+    return f"""src AS (
+  SELECT *, TRY_CAST(lud_dtm AS TIMESTAMP) AS __etl_insert_Dtm
+  FROM read_parquet([{rp_list}])
+)"""
 
 
 def run_preprocess_bet_v1(
@@ -392,7 +424,12 @@ def run_preprocess_bet_v1(
                     f"expected {ingestion_fix_registry_version_expected!r}, got {got_ver!r}"
                 )
         ingest_cap, fix_rule_id, fix_rule_version, applied_fix_rules = resolve_bet_ingest_fix004_cap_binding(reg)
-        _validate_columns_for_ingest_cap(cols)
+        lud_proxy = _validate_columns_for_ingest_cap(cols)
+        if lud_proxy:
+            gaps.append(
+                "BET-INGEST-CAP: __etl_insert_Dtm missing; using lud_dtm cast as "
+                "__etl_insert_Dtm for registry ingest-delay cap (not production ETL semantics)."
+            )
         ingestion_fix_ids.append(fix_rule_id)
     dummy_sql = _dummy_ids_sql(dummy_player_ids_parquet, gaps)
     elig_sql = _eligible_ids_sql(eligible_player_ids_parquet, gaps)
@@ -406,6 +443,7 @@ def run_preprocess_bet_v1(
         eligible_ids_table_sql=elig_sql,
         columns=cols,
         ingest_delay_cap_sec=ingest_cap,
+        lud_dtm_as_etl_insert_proxy=bool(locals().get("lud_proxy", False)),
     )
     con.execute(stmt)
     count_row = con.execute(
