@@ -75,5 +75,19 @@ class TestReasonCodeOutput(unittest.TestCase):
         self.assertIn("_compute_reason_codes", _SRC)
 
 
+class TestPhaseEReasonCodeCompat(unittest.TestCase):
+    """Phase E: SHAP reason-code compat (AST contract; no scorer import)."""
+
+    def test_alert_path_uses_canonical_empty_constant(self):
+        """Persisted ``reason_codes`` must use shared config constant (JSON ``[]``)."""
+        self.assertIn("SCORER_REASON_CODES_DEFAULT_EMPTY", _SRC)
+
+    def test_compute_reason_codes_short_circuits_on_env_gate(self):
+        """When ``SCORER_ENABLE_SHAP_REASON_CODES`` is off, scorer must not enter SHAP path."""
+        src = _get_func_src("_compute_reason_codes")
+        self.assertIn("SCORER_ENABLE_SHAP_REASON_CODES", src)
+        self.assertIn("SCORER_REASON_CODES_DEFAULT_EMPTY", src)
+
+
 if __name__ == "__main__":
     unittest.main()
