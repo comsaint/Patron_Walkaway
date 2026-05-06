@@ -111,7 +111,9 @@ def test_phase_c_run_trip_artifacts_per_day(mvp_snap: Path) -> None:
         trm = month_dir / "trip_run_map"
         tf = month_dir / "trip_fact"
         s = _load_summary(sum_path)
-        for d in s["days"]:
+        days = s.get("days")
+        assert isinstance(days, list) and days, sum_path
+        for d in days:
             assert (rf / f"run_fact__{d}.parquet").is_file(), d
             assert (trm / f"trip_run_map__{d}.parquet").is_file(), d
             assert (tf / f"trip_fact__{d}.parquet").is_file(), d
