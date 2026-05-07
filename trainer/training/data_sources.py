@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -231,6 +232,67 @@ def _validate_bet_parquet_phase_c_schema(bet_path: Path, manifest: Dict[str, Any
             "Workstream A: manifest has phase_c=true but bet Parquet is missing columns "
             f"{missing!r} (path={bet_path})"
         )
+
+
+@dataclass(frozen=True)
+class BridgeLocalParquetReadiness:
+    """Result of :func:`probe_trainer_local_parquet_bridge_readiness` (WS1, no side effects)."""
+
+    ready: bool
+    reasons: Tuple[str, ...]
+    manifest_path: Optional[Path] = None
+
+
+def probe_trainer_local_parquet_bridge_readiness() -> BridgeLocalParquetReadiness:
+    """Check whether local Parquet bridge ingress is ready (manifest + paths + phase_c schema).
+
+    Pure probe: does not materialize files or mutate disk. Used by AutoBuild orchestrator
+    before calling ``load_local_parquet``.
+    """
+    reasons: List[str] = []
+    p = trainer_local_parquet_bridge_manifest_path()
+    if not p.is_file():
+        return BridgeLocalParquetReadiness(
+            ready=False,
+            reasons=(f"manifest_missing:{p}",),
+            manifest_path=p,
+        )
+    try:
+        manifest = dict(json.loads(p.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError) as exc:
+        return BridgeLocalParquetReadiness(
+            ready=False,
+            reasons=(f"manifest_unreadable:{p}:{exc}",),
+            manifest_path=p,
+        )
+    try:
+        bet_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(manifest)
+    except KeyError as exc:
+        return BridgeLocalParquetReadiness(
+            ready=False,
+            reasons=(f"manifest_keys:{exc}",),
+            manifest_path=p,
+        )
+    if not sess_path.is_file():
+        reasons.append(f"session_parquet_missing:{sess_path}")
+    if not bet_path.is_file():
+        reasons.append(f"bet_parquet_missing:{bet_path}")
+    if reasons:
+        return BridgeLocalParquetReadiness(
+            ready=False,
+            reasons=tuple(reasons),
+            manifest_path=p,
+        )
+    if bool(manifest.get("phase_c")):
+        try:
+            _validate_bet_parquet_phase_c_schema(bet_path, manifest)
+        except ValueError as exc:
+            return BridgeLocalParquetReadiness(
+                ready=False,
+                reasons=(str(exc),),
+                manifest_path=p,
+            )
+    return BridgeLocalParquetReadiness(ready=True, reasons=(), manifest_path=p)
 
 
 # ---------------------------------------------------------------------------

@@ -1297,6 +1297,9 @@ def main() -> None:
     logger.info("Backtest window: %s -> %s", start, end)
 
     if args.use_local_parquet:
+        from trainer.training.local_bridge_preflight import ensure_local_bridge_ready_for_training
+
+        ensure_local_bridge_ready_for_training(logger=logger)
         bets_raw, sessions_raw = load_local_parquet(start, end + timedelta(days=1))
     else:
         bets_raw, sessions_raw = load_clickhouse_data(start, end + timedelta(days=1))

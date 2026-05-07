@@ -7959,6 +7959,13 @@ def run_pipeline(args) -> None:
     else:
         logger.info("NEG_SAMPLE_FRAC=1.0 (config): negative downsampling disabled (all rows kept)")
 
+    # Issue #14 WS1: ensure bridge manifest + trainer ingress paths before any
+    # local metadata probes (e.g. _detect_local_data_end).
+    if use_local:
+        from trainer.training.local_bridge_preflight import ensure_local_bridge_ready_for_training
+
+        ensure_local_bridge_ready_for_training(logger=logger)
+
     # Auto-adjust window to actual data end when using local Parquet without
     # explicit --start/--end, so --recent-chunks is relative to data, not today.
     if use_local and not (getattr(args, "start", None) or getattr(args, "end", None)):
