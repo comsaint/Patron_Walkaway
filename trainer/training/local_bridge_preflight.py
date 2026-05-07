@@ -1,4 +1,4 @@
-"""WS1/WS2: Auto-build preflight for local Parquet bridge ingress (Issue #14).
+"""WS1/WS2/WS3: Auto-build preflight for local Parquet bridge ingress (Issue #14).
 
 WS1: When an MVP snapshot exists under ``data/parallel_lda_mvp/``, call
 ``emit_trainer_local_parquet`` and copy ``data/mvp_trainer_bridge/`` manifest to
@@ -9,6 +9,22 @@ WS2: When **no** snapshot exists, optionally run a **subprocess**
 (full MVP + bridge emit in one pass per ``run_mvp``). Then copy the bridge manifest
 only (no second emit). Disabled when env ``TRAINER_AUTOBUILD_FULL_MVP`` is
 ``0``/``false``/``no``/``off``.
+
+WS3 (log contract): Every user-facing line uses ``AutoBuild[<phase>]: <message>``.
+Phases (stable ids for grep / dashboards):
+
+- ``orchestrate`` — not-ready banner, final probe failure, and end **summary**.
+- ``bridge_emit`` — in-process ``emit_trainer_local_parquet`` + ingress install (snap path).
+- ``mvp_full`` — L0 guard, subprocess ``run_mvp``, copy from bridge dir (no-snap path).
+
+Example::
+
+    AutoBuild[orchestrate]: local bridge not ready (...). Materializing ...
+    AutoBuild[bridge_emit]: emit_trainer_local_parquet snap_root=...
+    AutoBuild[summary]: total_s=12.345 bridge_emit_s=12.300
+
+Subprocess stdout/stderr are **not** captured (no ``capture_output``); timing uses
+``time.perf_counter`` deltas only.
 
 L0 contract (``run_mvp`` defaults): ``resolve_t_bet_paths`` / ``resolve_t_session`` —
 see ``parallel_lda_mvp/run_mvp.py`` (``PARALLEL_LDA_MVP_T_BET``, ``gmwds_t_bet.parquet``, etc.).
@@ -31,6 +47,42 @@ from trainer.training import data_sources
 PROJECT_ROOT = data_sources.PROJECT_ROOT
 
 _TRAINER_AUTOBUILD_FULL_MVP_ENV = "TRAINER_AUTOBUILD_FULL_MVP"
+
+
+def _autobuild_log(
+    phase: str,
+    message: str,
+    logger: logging.Logger,
+    *,
+    level: int = logging.INFO,
+    also_print: bool = True,
+) -> str:
+    """Emit one ``AutoBuild[<phase>]:`` line to logger and optionally stdout."""
+    full = f"AutoBuild[{phase}]: {message}"
+    logger.log(level, full)
+    if also_print:
+        print(full, flush=True)
+    return full
+
+
+def _format_timing_suffix(timings: dict[str, float]) -> str:
+    """Human-readable timing fragment for errors (ASCII-safe keys)."""
+    parts: list[str] = []
+    for key in ("bridge_emit", "mvp_full", "manifest_copy", "total"):
+        if key in timings:
+            parts.append(f"{key}_s={timings[key]:.3f}")
+    return ("; " + " ".join(parts)) if parts else ""
+
+
+def _format_summary_line(timings: dict[str, float]) -> str:
+    """Single-line summary for successful materialization."""
+    parts: list[str] = []
+    if "total" in timings:
+        parts.append(f"total_s={timings['total']:.3f}")
+    for key in ("bridge_emit", "mvp_full", "manifest_copy"):
+        if key in timings:
+            parts.append(f"{key}_s={timings[key]:.3f}")
+    return " ".join(parts) if parts else "total_s=0.000"
 
 
 def _autobuild_full_mvp_enabled() -> bool:
@@ -92,16 +144,21 @@ def _bridge_manifest_path_under_mvp_trainer_bridge() -> Path:
     return trainer_bridge_output_dir(data_sources.LOCAL_PARQUET_DIR) / "trainer_local_parquet_bridge.manifest.json"
 
 
-def _run_full_mvp_with_bridge_emit_subprocess(*, repo_root: Path, logger: logging.Logger) -> None:
+def _run_full_mvp_with_bridge_emit_subprocess(
+    *,
+    repo_root: Path,
+    logger: logging.Logger,
+    timings: Optional[dict[str, float]] = None,
+) -> None:
     """Run ``run_mvp`` with ``--emit-trainer-local-parquet`` in a subprocess (cwd=repo root)."""
     cmd = [sys.executable, "-m", "parallel_lda_mvp.run_mvp", "--emit-trainer-local-parquet"]
     cmd_s = " ".join(cmd)
-    warn = (
-        f"AutoBuild[mvp_full]: starting subprocess (high RAM / long runtime possible): {cmd_s} "
-        f"cwd={repo_root}"
+    _autobuild_log(
+        "mvp_full",
+        f"starting subprocess (high RAM / long runtime possible): {cmd_s} cwd={repo_root}",
+        logger,
+        level=logging.WARNING,
     )
-    logger.warning(warn)
-    print(warn, flush=True)
     t0 = time.perf_counter()
     proc = subprocess.run(
         cmd,
@@ -109,14 +166,20 @@ def _run_full_mvp_with_bridge_emit_subprocess(*, repo_root: Path, logger: loggin
         env=os.environ.copy(),
     )
     elapsed = time.perf_counter() - t0
+    if timings is not None:
+        timings["mvp_full"] = elapsed
     if proc.returncode != 0:
+        suf = _format_timing_suffix(timings) if timings else ""
         raise RuntimeError(
             f"AutoBuild[mvp_full]: subprocess exit code={proc.returncode} after {elapsed:.1f}s. "
-            f"Command: {cmd_s}. Inspect [parallel_lda_mvp] lines above."
+            f"Command: {cmd_s}. Inspect [parallel_lda_mvp] lines above.{suf}"
         )
-    ok = f"AutoBuild[mvp_full]: subprocess finished OK elapsed_s={elapsed:.1f}"
-    logger.info(ok)
-    print(ok, flush=True)
+    _autobuild_log(
+        "mvp_full",
+        f"subprocess finished OK elapsed_s={elapsed:.1f}",
+        logger,
+        level=logging.INFO,
+    )
 
 
 def _run_bridge_emit_only(
@@ -124,6 +187,7 @@ def _run_bridge_emit_only(
     *,
     logger: logging.Logger,
     ingress: Path,
+    timings: Optional[dict[str, float]] = None,
 ) -> None:
     """Call ``emit_trainer_local_parquet`` for *snap* and install manifest at *ingress*."""
     t0 = time.perf_counter()
@@ -135,9 +199,11 @@ def _run_bridge_emit_only(
             "Install repo dependencies or run from repo root."
         ) from exc
 
-    print(
-        f"AutoBuild[bridge_emit]: emit_trainer_local_parquet snap_root={snap} data_dir={data_sources.LOCAL_PARQUET_DIR}",
-        flush=True,
+    _autobuild_log(
+        "bridge_emit",
+        f"emit_trainer_local_parquet snap_root={snap} data_dir={data_sources.LOCAL_PARQUET_DIR}",
+        logger,
+        level=logging.INFO,
     )
     try:
         written = emit_trainer_local_parquet(
@@ -158,11 +224,14 @@ def _run_bridge_emit_only(
         )
     _install_manifest_for_trainer_ingress(src_mf, ingress)
     elapsed = time.perf_counter() - t0
-    done_msg = (
-        f"AutoBuild[bridge_emit]: manifest installed at {ingress} (elapsed_s={elapsed:.1f})."
+    if timings is not None:
+        timings["bridge_emit"] = elapsed
+    _autobuild_log(
+        "bridge_emit",
+        f"manifest installed at {ingress} elapsed_s={elapsed:.1f}",
+        logger,
+        level=logging.INFO,
     )
-    logger.info(done_msg)
-    print(done_msg, flush=True)
 
 
 def ensure_local_bridge_ready_for_training(*, logger: logging.Logger) -> None:
@@ -180,19 +249,23 @@ def ensure_local_bridge_ready_for_training(*, logger: logging.Logger) -> None:
     if r0.ready:
         return
 
+    t_total0 = time.perf_counter()
+    timings: dict[str, float] = {}
+
     reason_txt = "; ".join(r0.reasons) if r0.reasons else "unknown"
-    msg_start = (
-        f"AutoBuild: local bridge not ready ({reason_txt}). "
-        "Materializing (may take several minutes on large data) …"
+    _autobuild_log(
+        "orchestrate",
+        f"local bridge not ready ({reason_txt}). "
+        "Materializing (may take several minutes on large data) …",
+        logger,
+        level=logging.WARNING,
     )
-    logger.warning(msg_start)
-    print(msg_start, flush=True)
 
     ingress = data_sources.trainer_local_parquet_bridge_manifest_path()
     snap = _resolve_default_snap_root(data_sources.LOCAL_PARQUET_DIR)
 
     if snap is not None:
-        _run_bridge_emit_only(snap, logger=logger, ingress=ingress)
+        _run_bridge_emit_only(snap, logger=logger, ingress=ingress, timings=timings)
     else:
         if not _autobuild_full_mvp_enabled():
             raise RuntimeError(
@@ -203,21 +276,38 @@ def ensure_local_bridge_ready_for_training(*, logger: logging.Logger) -> None:
                 "or set PARALLEL_LDA_MVP_SNAPSHOT_ID to an existing snap_* folder."
             )
         _assert_l0_inputs_for_full_mvp(data_sources.LOCAL_PARQUET_DIR)
-        _run_full_mvp_with_bridge_emit_subprocess(repo_root=PROJECT_ROOT, logger=logger)
+        _run_full_mvp_with_bridge_emit_subprocess(
+            repo_root=PROJECT_ROOT, logger=logger, timings=timings
+        )
         src_mf = _bridge_manifest_path_under_mvp_trainer_bridge()
         if not src_mf.is_file():
             raise RuntimeError(
                 f"AutoBuild[mvp_full]: run_mvp finished but bridge manifest missing at {src_mf}. "
                 "Check MVP logs for failures before the bridge emit step."
             )
+        t_copy0 = time.perf_counter()
         _install_manifest_for_trainer_ingress(src_mf, ingress)
-        copy_msg = f"AutoBuild[mvp_full]: copied bridge manifest to {ingress}"
-        logger.info(copy_msg)
-        print(copy_msg, flush=True)
+        timings["manifest_copy"] = time.perf_counter() - t_copy0
+        _autobuild_log(
+            "mvp_full",
+            f"copied bridge manifest to {ingress} manifest_copy_s={timings['manifest_copy']:.3f}",
+            logger,
+            level=logging.INFO,
+        )
 
     r1 = data_sources.probe_trainer_local_parquet_bridge_readiness()
+    timings["total"] = time.perf_counter() - t_total0
+
     if not r1.ready:
         r1_txt = "; ".join(r1.reasons) if r1.reasons else "unknown"
         raise RuntimeError(
-            f"AutoBuild: readiness still false after materialization: {r1_txt}"
+            f"AutoBuild[orchestrate]: readiness still false after materialization: {r1_txt}"
+            f"{_format_timing_suffix(timings)}"
         )
+
+    _autobuild_log(
+        "summary",
+        _format_summary_line(timings),
+        logger,
+        level=logging.INFO,
+    )

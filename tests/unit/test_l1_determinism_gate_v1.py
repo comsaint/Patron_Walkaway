@@ -22,13 +22,13 @@ def test_gate1_run_fact_stable_across_duckdb_profiles(tmp_path: Path) -> None:
         con.execute(
             f"""
             COPY (SELECT * FROM (VALUES
-              (1::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:00:00',
+              (1::BIGINT, 100::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:00:00',
                TIMESTAMP '2026-01-15 11:00:00'),
-              (2::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:15:00',
+              (2::BIGINT, 100::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:15:00',
                TIMESTAMP '2026-01-15 11:05:00'),
-              (3::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 11:00:00',
+              (3::BIGINT, 100::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 11:00:00',
                TIMESTAMP '2026-01-15 12:00:00')
-            ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
+            ) AS t(bet_id, player_id, canonical_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
             ) TO '{inp.as_posix()}' (FORMAT PARQUET)
             """
         )
@@ -56,11 +56,11 @@ def test_gate1_run_bet_map_stable_across_duckdb_profiles(tmp_path: Path) -> None
         con.execute(
             f"""
             COPY (SELECT * FROM (VALUES
-              (1::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:00:00',
+              (1::BIGINT, 100::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:00:00',
                TIMESTAMP '2026-01-15 11:00:00'),
-              (2::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:15:00',
+              (2::BIGINT, 100::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:15:00',
                TIMESTAMP '2026-01-15 11:05:00')
-            ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
+            ) AS t(bet_id, player_id, canonical_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
             ) TO '{inp.as_posix()}' (FORMAT PARQUET)
             """
         )
@@ -88,11 +88,11 @@ def test_gate1_verbose_emit_lines(tmp_path: Path) -> None:
         con.execute(
             f"""
             COPY (SELECT * FROM (VALUES
-              (1::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:00:00',
+              (1::BIGINT, 100::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:00:00',
                TIMESTAMP '2026-01-15 11:00:00'),
-              (2::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:15:00',
+              (2::BIGINT, 100::BIGINT, 100::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 10:15:00',
                TIMESTAMP '2026-01-15 11:05:00')
-            ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
+            ) AS t(bet_id, player_id, canonical_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
             ) TO '{inp.as_posix()}' (FORMAT PARQUET)
             """
         )
@@ -125,11 +125,11 @@ def test_gate1_run_day_bridge_stable_across_duckdb_profiles(tmp_path: Path) -> N
         con.execute(
             f"""
             COPY (SELECT * FROM (VALUES
-              (1::BIGINT, 1::BIGINT, DATE '2026-01-14', TIMESTAMP '2026-01-14 23:50:00',
+              (1::BIGINT, 1::BIGINT, 1::BIGINT, DATE '2026-01-14', TIMESTAMP '2026-01-14 23:50:00',
                TIMESTAMP '2026-01-14 23:50:00'),
-              (2::BIGINT, 1::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 00:10:00',
+              (2::BIGINT, 1::BIGINT, 1::BIGINT, DATE '2026-01-15', TIMESTAMP '2026-01-15 00:10:00',
                TIMESTAMP '2026-01-15 00:10:00')
-            ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
+            ) AS t(bet_id, player_id, canonical_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm)
             ) TO '{inp.as_posix()}' (FORMAT PARQUET)
             """
         )

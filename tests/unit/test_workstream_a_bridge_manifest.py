@@ -147,6 +147,7 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             old = ds.LOCAL_PARQUET_DIR
             ds.LOCAL_PARQUET_DIR = root
             try:
+                log = logging.getLogger("test_ws1")
                 with patch(
                     "trainer.training.local_bridge_preflight._resolve_default_snap_root",
                     return_value=root / "snap_dummy",
@@ -155,9 +156,12 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
                         "parallel_lda_mvp.trainer_bridge_mvp.emit_trainer_local_parquet",
                         side_effect=_fake_emit,
                     ):
-                        ensure_local_bridge_ready_for_training(
-                            logger=logging.getLogger("test_ws1"),
-                        )
+                        with self.assertLogs(log, level="INFO") as log_cm:
+                            ensure_local_bridge_ready_for_training(logger=log)
+                self.assertTrue(
+                    any("AutoBuild[summary]" in r and "total_s=" in r for r in log_cm.output),
+                    log_cm.output,
+                )
                 ingress = root / "trainer_local_parquet_bridge.manifest.json"
                 self.assertTrue(ingress.is_file())
                 self.assertTrue(ds.probe_trainer_local_parquet_bridge_readiness().ready)
@@ -214,6 +218,7 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             old = ds.LOCAL_PARQUET_DIR
             ds.LOCAL_PARQUET_DIR = root
             try:
+                log = logging.getLogger("test_ws2b")
                 with patch.dict(os.environ, {"TRAINER_AUTOBUILD_FULL_MVP": "1"}, clear=False):
                     with patch.object(lbp, "_resolve_default_snap_root", return_value=None):
                         with patch.object(lbp, "_assert_l0_inputs_for_full_mvp"):
@@ -221,9 +226,17 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
                                 "trainer.training.local_bridge_preflight.subprocess.run",
                                 side_effect=_fake_subprocess_run,
                             ):
-                                ensure_local_bridge_ready_for_training(
-                                    logger=logging.getLogger("test_ws2b"),
-                                )
+                                with self.assertLogs(log, level="INFO") as log_cm:
+                                    ensure_local_bridge_ready_for_training(logger=log)
+                self.assertTrue(
+                    any(
+                        "AutoBuild[summary]" in r
+                        and "mvp_full_s=" in r
+                        and "manifest_copy_s=" in r
+                        for r in log_cm.output
+                    ),
+                    log_cm.output,
+                )
                 ing = root / "trainer_local_parquet_bridge.manifest.json"
                 self.assertTrue(ing.is_file())
                 self.assertTrue(ds.probe_trainer_local_parquet_bridge_readiness().ready)
