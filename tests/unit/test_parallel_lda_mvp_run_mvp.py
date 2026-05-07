@@ -12,6 +12,7 @@ import duckdb
 import pandas as pd
 import pytest
 
+from parallel_lda_mvp.canonical_mapping_runtime_config import late_arrival_window_days
 from parallel_lda_mvp.run_mvp import (
     _FINGERPRINT_ALGO_LEGACY,
     _FINGERPRINT_ALGO_ROLLING,
@@ -163,7 +164,7 @@ def test_compute_month_bet_shas_matches_legacy(tmp_path: Path) -> None:
     )
     assert by_ym[ym] == legacy
     assert stats["recomputed"] == 1
-    assert stats["late_arrival_window_days"] == 45
+    assert stats["late_arrival_window_days"] == late_arrival_window_days()
     by2, st2 = _compute_month_bet_shas_for_span(
         [ym], [pq], scratch, force=False, coverage_end_gaming_day=cov
     )
