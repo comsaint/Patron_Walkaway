@@ -20,6 +20,21 @@ from trainer.training import data_sources as _data_sources_mod
 from trainer.core import config as core_config
 
 
+def _write_min_bridge_manifest(root: Path) -> None:
+    bet = (root / "gmwds_t_bet.parquet").resolve()
+    sess = (root / "gmwds_t_session.parquet").resolve()
+    (root / "trainer_local_parquet_bridge.manifest.json").write_text(
+        json.dumps({
+            "artifact_kind": "trainer_local_parquet_bridge_v1",
+            "t_bet_paths": [str(bet)],
+            "gmwds_t_session": str(sess),
+            "phase_c": False,
+            "input_fingerprint": "testfp",
+        }),
+        encoding="utf-8",
+    )
+
+
 class TestTask7ChunkCacheKey(unittest.TestCase):
     def test_order_insensitive_bets_hash_same_rows_different_order(self) -> None:
         bets_a = pd.DataFrame(
@@ -227,6 +242,7 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
             root = Path(td)
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_bet.parquet")
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_session.parquet")
+            _write_min_bridge_manifest(root)
             old_root = _data_sources_mod.LOCAL_PARQUET_DIR
             _data_sources_mod.LOCAL_PARQUET_DIR = root
             try:
@@ -261,6 +277,7 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
             sess = root / "gmwds_t_session.parquet"
             pq.write_table(pa.table({"k": [1]}), bet)
             pq.write_table(pa.table({"s": [1]}), sess)
+            _write_min_bridge_manifest(root)
             old_root = _data_sources_mod.LOCAL_PARQUET_DIR
             _data_sources_mod.LOCAL_PARQUET_DIR = root
             try:

@@ -482,6 +482,8 @@ from trainer.training.data_sources import (  # noqa: E402  (post-config import b
     _REQUIRED_BET_PARQUET_COLS,
     _SESSION_SELECT_COLS,
     LOCAL_PARQUET_DIR,
+    local_parquet_session_path_for_trainer,
+    trainer_local_parquet_bridge_manifest_path,
 )
 
 # Resolve to trainer/ so feature_spec, .data, models remain under trainer/ (PLAN 2.2 move).
@@ -1353,7 +1355,7 @@ def ensure_player_profile_ready(
         return
 
     profile_path = LOCAL_PARQUET_DIR / "player_profile.parquet"
-    session_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+    session_path = local_parquet_session_path_for_trainer()
     auto_script = BASE_DIR / "scripts" / "auto_build_player_profile.py"
     # Force a single scheduling policy across all execution modes/options:
     # player_profile snapshots are always month-end.
@@ -2374,7 +2376,7 @@ def process_chunk(
     _mode = str(identity_mapping_mode or "cutoff_window").strip().lower()
     _use_pit = (_mode == "pit_asof" and use_local_parquet)
     if _use_pit:
-        _sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+        _sess_path = local_parquet_session_path_for_trainer()
         try:
             bets = attach_pit_identity_chunk_duckdb(
                 bets_df=bets,
@@ -8142,7 +8144,7 @@ def run_pipeline(args) -> None:
                 )
                 effective_identity_mode = "cutoff_window"
             if effective_identity_mode == "pit_asof":
-                _sess_pit_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+                _sess_pit_path = local_parquet_session_path_for_trainer()
                 if not _sess_pit_path.is_file():
                     logger.warning(
                         "IDENTITY_MAPPING_MODE=pit_asof but session Parquet missing (%s); "
@@ -8216,7 +8218,7 @@ def run_pipeline(args) -> None:
                         logger.warning("get_dummy_player_ids_from_df failed (%s); not filtering dummies", exc)
                     sessions_all = None
                 else:
-                    sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+                    sess_path = local_parquet_session_path_for_trainer()
                     links_df, dummy_pids = build_canonical_links_and_dummy_from_duckdb(sess_path, train_end)
                     canonical_map = build_canonical_mapping_from_links(links_df, dummy_pids)
                     dummy_player_ids = dummy_pids

@@ -368,6 +368,7 @@ class TestRefactorGuardrailsInputSources(unittest.TestCase):
             "_OPTIONAL_BET_LDA_PHASE_C_COLS",
             "_CANONICAL_MAP_SESSION_COLS",
             "LOCAL_PARQUET_DIR",
+            "trainer_local_parquet_bridge_manifest_path",
         ):
             self.assertIs(
                 getattr(_trainer_module, name),

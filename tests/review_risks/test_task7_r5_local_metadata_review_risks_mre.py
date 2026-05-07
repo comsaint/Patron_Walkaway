@@ -25,6 +25,21 @@ import trainer.trainer as trainer_mod
 from trainer.training import data_sources as _data_sources_mod
 
 
+def _write_min_bridge_manifest(root: Path, *, phase_c: bool = False) -> None:
+    bet = (root / "gmwds_t_bet.parquet").resolve()
+    sess = (root / "gmwds_t_session.parquet").resolve()
+    (root / "trainer_local_parquet_bridge.manifest.json").write_text(
+        json.dumps({
+            "artifact_kind": "trainer_local_parquet_bridge_v1",
+            "t_bet_paths": [str(bet)],
+            "gmwds_t_session": str(sess),
+            "phase_c": phase_c,
+            "input_fingerprint": "testfp",
+        }),
+        encoding="utf-8",
+    )
+
+
 class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
     # --- 1) isoformat vs _filter_ts single source of truth ---
 
@@ -82,6 +97,7 @@ class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
             root = Path(td)
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_bet.parquet")
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_session.parquet")
+            _write_min_bridge_manifest(root)
             old = _data_sources_mod.LOCAL_PARQUET_DIR
             _data_sources_mod.LOCAL_PARQUET_DIR = root
             try:
@@ -104,6 +120,7 @@ class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
             root = Path(td)
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_bet.parquet")
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_session.parquet")
+            _write_min_bridge_manifest(root)
             old = _data_sources_mod.LOCAL_PARQUET_DIR
             _data_sources_mod.LOCAL_PARQUET_DIR = root
             try:
@@ -154,6 +171,8 @@ class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
             )
             pq.write_table(pa.table({"s": [1]}), root_a / "gmwds_t_session.parquet")
             pq.write_table(pa.table({"s": [1]}), root_b / "gmwds_t_session.parquet")
+            _write_min_bridge_manifest(root_a)
+            _write_min_bridge_manifest(root_b)
 
             ws = pd.Timestamp("2026-01-01 00:00:00")
             ee = pd.Timestamp("2026-02-01 00:00:00")

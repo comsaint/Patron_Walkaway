@@ -62,7 +62,7 @@ class TestR115PartialMetadataFallback(unittest.TestCase):
 
     def test_detect_local_data_end_handles_partial_metadata(self):
         with patch(
-            "trainer.trainer._parquet_date_range",
+            "trainer.training.data_sources._parquet_date_range",
             side_effect=[None, (date(2026, 1, 1), date(2026, 1, 31))],
         ):
             got = trainer_mod._detect_local_data_end()

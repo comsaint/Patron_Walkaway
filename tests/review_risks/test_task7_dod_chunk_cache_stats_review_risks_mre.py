@@ -18,6 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import trainer.trainer as trainer_mod
+from trainer.training import data_sources as _data_sources_mod
 
 
 class TestTask7DodChunkCacheStatsReviewRisksMRE(unittest.TestCase):
@@ -70,8 +71,19 @@ class TestTask7DodChunkCacheStatsReviewRisksMRE(unittest.TestCase):
             root = Path(td)
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_bet.parquet")
             pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_session.parquet")
-            old = trainer_mod.LOCAL_PARQUET_DIR
-            trainer_mod.LOCAL_PARQUET_DIR = root
+            bet = (root / "gmwds_t_bet.parquet").resolve()
+            sess = (root / "gmwds_t_session.parquet").resolve()
+            (root / "trainer_local_parquet_bridge.manifest.json").write_text(
+                json.dumps({
+                    "artifact_kind": "trainer_local_parquet_bridge_v1",
+                    "t_bet_paths": [str(bet)],
+                    "gmwds_t_session": str(sess),
+                    "phase_c": False,
+                }),
+                encoding="utf-8",
+            )
+            old = _data_sources_mod.LOCAL_PARQUET_DIR
+            _data_sources_mod.LOCAL_PARQUET_DIR = root
             try:
                 with patch.object(pq, "read_metadata", side_effect=OSError("bad")):
                     with self.assertLogs("trainer", level="WARNING") as cm:
@@ -79,7 +91,7 @@ class TestTask7DodChunkCacheStatsReviewRisksMRE(unittest.TestCase):
                             ws.to_pydatetime(), ee.to_pydatetime()
                         )
             finally:
-                trainer_mod.LOCAL_PARQUET_DIR = old
+                _data_sources_mod.LOCAL_PARQUET_DIR = old
         self.assertGreaterEqual(len(cm.output), 2, cm.output)
 
     # --- 4) chunk_cache_stats merge can overwrite payload keys (no validation today) ---

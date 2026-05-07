@@ -4,12 +4,12 @@ Data ingress helpers extracted from ``trainer/training/trainer.py`` (Issue #12 P
 
 Scope
 -----
-This module owns *where data comes from* for the training pipeline. It is a
-pure refactor extraction with **zero behavior change**:
+This module owns *where data comes from* for the training pipeline.
 
-* ClickHouse session/bet pull (``load_clickhouse_data``).
-* Local Parquet session/bet load with column pushdown + DQ pre-filter
-  (``load_local_parquet``).
+* ClickHouse session/bet pull (``load_clickhouse_data``) — unchanged.
+* Local Parquet session/bet load (``load_local_parquet``): Issue #14 Workstream A
+  resolves bet/session paths via ``trainer_local_parquet_bridge.manifest.json``;
+  legacy bare ``data/gmwds_t_*.parquet`` discovery without that manifest is removed.
 * Local Parquet metadata helpers used to date-range the run window and
   hash chunk-cache invalidation tokens
   (``_parquet_date_range``, ``_detect_local_data_end``,
@@ -36,7 +36,7 @@ import json
 import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -64,6 +64,15 @@ LOCAL_PARQUET_DIR = PROJECT_ROOT / "data"
 LOCAL_PARQUET_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def trainer_local_parquet_bridge_manifest_path() -> Path:
+    """Path to ``trainer_local_parquet_bridge.manifest.json`` under ``LOCAL_PARQUET_DIR``.
+
+    Resolved from ``LOCAL_PARQUET_DIR`` at call time so tests can monkeypatch
+    ``LOCAL_PARQUET_DIR`` and still pick up the manifest in the temp root.
+    """
+    return LOCAL_PARQUET_DIR / "trainer_local_parquet_bridge.manifest.json"
+
+
 # Minimal session columns needed for canonical-map + dummy-player detection.
 # Defined at module level so tests can validate coverage against
 # ``identity._REQUIRED_SESSION_COLS``. Reading only these columns (instead of
@@ -75,7 +84,8 @@ _CANONICAL_MAP_SESSION_COLS: list = [
     "turnover",
 ]
 
-# Optional L1 Phase C columns (present when materialized by parallel_lda_mvp bridge).
+# L1 Phase C passthrough columns (must match ``parallel_lda_mvp.trainer_bridge_mvp.LDA_PHASE_C_BET_COLUMNS``).
+# When the bridge manifest has ``phase_c: true``, all of these must exist on the bet Parquet schema (fail-fast).
 _OPTIONAL_BET_LDA_PHASE_C_COLS: tuple[str, ...] = (
     "lda_l1_run_bet_count",
     "lda_trip_run_count",
@@ -143,6 +153,84 @@ _SESSION_SELECT_COLS = """
     COALESCE(turnover, 0) AS turnover,
     COALESCE(num_games_with_wager, 0) AS num_games_with_wager
 """.strip()
+
+
+# ---------------------------------------------------------------------------
+# Local bridge manifest (Issue #14 Workstream A)
+# ---------------------------------------------------------------------------
+
+def load_trainer_local_parquet_bridge_manifest() -> Dict[str, Any]:
+    """Load ``trainer_local_parquet_bridge.manifest.json`` from ``LOCAL_PARQUET_DIR``.
+
+    Local-parquet training ingress requires this file; legacy bare
+    ``gmwds_t_*.parquet`` discovery without a manifest is no longer supported.
+
+    Returns
+    -------
+    dict
+        Parsed manifest JSON.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the manifest file is missing.
+    json.JSONDecodeError
+        If the file is not valid JSON.
+    """
+    p = trainer_local_parquet_bridge_manifest_path()
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"Workstream A: local Parquet bridge manifest missing: {p}. "
+            "Materialize the trainer bridge (parallel_lda_mvp trainer_bridge_mvp / "
+            "run_mvp --emit-trainer-local-parquet) so this JSON exists; "
+            "training no longer auto-discovers data/gmwds_t_bet.parquet without it."
+        )
+    return dict(json.loads(p.read_text(encoding="utf-8")))
+
+
+def resolve_local_parquet_bet_session_paths_from_manifest(
+    manifest: Dict[str, Any],
+) -> Tuple[Path, Path]:
+    """Resolve bet and session Parquet paths from a bridge manifest dict."""
+    raw_bet: Optional[str] = None
+    t_bet_paths = manifest.get("t_bet_paths")
+    if isinstance(t_bet_paths, list) and t_bet_paths:
+        raw_bet = str(t_bet_paths[0])
+    if raw_bet is None and manifest.get("gmwds_t_bet"):
+        raw_bet = str(manifest["gmwds_t_bet"])
+    if not raw_bet:
+        raise KeyError(
+            "manifest must contain non-empty 't_bet_paths' or 'gmwds_t_bet' "
+            f"(got keys={sorted(manifest.keys())!r})"
+        )
+    sess_raw = manifest.get("gmwds_t_session") or manifest.get("t_session_source")
+    if not sess_raw:
+        raise KeyError(
+            "manifest must contain 'gmwds_t_session' or 't_session_source' "
+            f"(got keys={sorted(manifest.keys())!r})"
+        )
+    return Path(raw_bet).resolve(), Path(str(sess_raw)).resolve()
+
+
+def local_parquet_session_path_for_trainer() -> Path:
+    """Return session Parquet path from the bridge manifest (single source of truth)."""
+    m = load_trainer_local_parquet_bridge_manifest()
+    _, sess = resolve_local_parquet_bet_session_paths_from_manifest(m)
+    return sess
+
+
+def _validate_bet_parquet_phase_c_schema(bet_path: Path, manifest: Dict[str, Any]) -> None:
+    """If manifest declares ``phase_c``, require all LDA Phase C columns on bet schema."""
+    if not bool(manifest.get("phase_c")):
+        return
+    import pyarrow.parquet as _pq_bet
+    names = set(_pq_bet.read_schema(bet_path).names)
+    missing = [c for c in _OPTIONAL_BET_LDA_PHASE_C_COLS if c not in names]
+    if missing:
+        raise ValueError(
+            "Workstream A: manifest has phase_c=true but bet Parquet is missing columns "
+            f"{missing!r} (path={bet_path})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -215,9 +303,10 @@ def load_local_parquet(
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Load bets + sessions from local Parquet files, filtered to the window.
 
-    Expects:
-      data/gmwds_t_bet.parquet     — full t_bet export with the same columns
-      data/gmwds_t_session.parquet — full t_session export with the same columns
+    Issue #14 Workstream A: paths come from ``trainer_local_parquet_bridge.manifest.json``
+    under ``LOCAL_PARQUET_DIR`` (see ``trainer_local_parquet_bridge_manifest_path``).
+    Legacy discovery of
+    fixed ``data/gmwds_t_*.parquet`` filenames without that manifest is not supported.
 
     Applies the same DQ filters (wager > 0, payout_complete_dtm IS NOT NULL)
     and time window restriction as the ClickHouse path.
@@ -234,21 +323,33 @@ def load_local_parquet(
         "FND-04 contract violated: _CANONICAL_MAP_SESSION_COLS must include 'turnover'"
     )
 
-    bets_path = LOCAL_PARQUET_DIR / "gmwds_t_bet.parquet"
-    sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+    manifest = load_trainer_local_parquet_bridge_manifest()
+    bets_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(manifest)
+
+    logger.info(
+        "Workstream A ingress: manifest=%s artifact_kind=%s phase_c=%s bet=%s session=%s%s",
+        trainer_local_parquet_bridge_manifest_path(),
+        manifest.get("artifact_kind"),
+        manifest.get("phase_c"),
+        bets_path,
+        sess_path,
+        " (sessions only)" if sessions_only else "",
+    )
 
     if not sess_path.exists():
         raise FileNotFoundError(
-            f"Session Parquet missing: {sess_path}. "
-            "Export ClickHouse t_session to data/ (gmwds_t_session.parquet) or run without --use-local-parquet."
+            f"Session Parquet missing (manifest): {sess_path}. "
+            "Fix paths in trainer_local_parquet_bridge.manifest.json or re-run the MVP bridge."
         )
-    if not sessions_only and not bets_path.exists():
-        raise FileNotFoundError(
-            f"Bet Parquet missing: {bets_path}. "
-            "Export ClickHouse t_bet to data/ (gmwds_t_bet.parquet) or run without --use-local-parquet."
-        )
+    if not sessions_only:
+        if not bets_path.exists():
+            raise FileNotFoundError(
+                f"Bet Parquet missing (manifest): {bets_path}. "
+                "Fix paths in trainer_local_parquet_bridge.manifest.json or re-run the MVP bridge."
+            )
+        _validate_bet_parquet_phase_c_schema(bets_path, manifest)
 
-    logger.info("Reading local Parquet: %s%s", LOCAL_PARQUET_DIR, " (sessions only)" if sessions_only else "")
+    logger.info("Reading local Parquet via manifest: %s%s", bets_path.parent, " (sessions only)" if sessions_only else "")
 
     def _filter_ts(dt, parquet_path: Path, col: str) -> pd.Timestamp:
         """Return a Timestamp compatible with the Parquet column's tz schema.
@@ -396,8 +497,12 @@ def _detect_local_data_end() -> Optional[date]:
     (min) of the two max dates so both tables have data up to the returned
     date. Returns None if metadata is unavailable for both.
     """
-    bet_path = LOCAL_PARQUET_DIR / "gmwds_t_bet.parquet"
-    sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+    try:
+        _m = load_trainer_local_parquet_bridge_manifest()
+        bet_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(_m)
+    except (FileNotFoundError, OSError, KeyError, json.JSONDecodeError) as exc:
+        logger.warning("Workstream A: could not resolve manifest for _detect_local_data_end: %s", exc)
+        return None
 
     bet_rng = _parquet_date_range(bet_path, ["payout_complete_dtm", "gaming_day"])
     sess_rng = _parquet_date_range(
@@ -463,11 +568,14 @@ def _local_parquet_source_data_hash(
     excludes ``st_mtime`` and file ``created_by``), and the same logical filter bounds as
     ``load_local_parquet`` so chunk keys update when exports or window bounds change.
 
+    Workstream A: bet/session paths and optional ``input_fingerprint`` come from the
+    bridge manifest so re-materialization busts chunk cache keys.
+
     **Trade-off**: extreme in-place edits keeping identical Parquet metadata could
     theoretically false-hit; prefer false miss for content changes that alter metadata.
     """
-    bets_path = LOCAL_PARQUET_DIR / "gmwds_t_bet.parquet"
-    sess_path = LOCAL_PARQUET_DIR / "gmwds_t_session.parquet"
+    manifest = load_trainer_local_parquet_bridge_manifest()
+    bets_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(manifest)
     bets_lo = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
     sess_lo = window_start - timedelta(days=1)
     sess_hi = extended_end + timedelta(days=1)
@@ -490,12 +598,18 @@ def _local_parquet_source_data_hash(
             )
         return f"{label}|{p.name}|{st.st_size}|{nrows}|{digest}"
 
+    _mf_fp = manifest.get("input_fingerprint")
+    _mf_fp_s = str(_mf_fp) if _mf_fp is not None else ""
+
     payload = json.dumps({
+        "artifact_kind": str(manifest.get("artifact_kind", "")),
         "bet_filter_lo": bets_lo.isoformat(),
         "bet_filter_hi": extended_end.isoformat(),
+        "bet_file": _file_token("bet", bets_path),
+        "manifest_input_fingerprint": _mf_fp_s,
+        "manifest_path": str(trainer_local_parquet_bridge_manifest_path().resolve()),
         "sess_filter_lo": sess_lo.isoformat(),
         "sess_filter_hi": sess_hi.isoformat(),
-        "bet_file": _file_token("bet", bets_path),
         "sess_file": _file_token("sess", sess_path),
     }, sort_keys=True)
     return hashlib.md5(payload.encode()).hexdigest()[:8]
