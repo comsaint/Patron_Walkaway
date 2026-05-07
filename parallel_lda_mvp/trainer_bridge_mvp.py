@@ -1,7 +1,7 @@
 """Bridge ``parallel_lda_mvp`` snapshot outputs to trainer-shaped Parquet files.
 
 Writes under ``<data_dir>/mvp_trainer_bridge/`` (never overwrites L0
-``data/gmwds_t_bet.parquet`` / ``data/gmwds_t_session.parquet``). Optional Phase C:
+``data/gmwds_t_bet.parquet`` / ``data/gmwds_t_session.parquet``). Optional run/trip LDA:
 left-join L1 ``run_fact`` + ``trip_run_map`` + ``trip_fact`` onto each bet
 (``player_id`` + ``payout_complete_dtm`` in ``[run_start_ts, run_end_ts]``),
 emitting fixed ``lda_*`` DOUBLE columns for Track LLM passthrough features.
@@ -20,12 +20,13 @@ import sys
 import time
 import tempfile
 from datetime import datetime, timezone
+import threading
 from pathlib import Path
 from typing import Any, Sequence
 
-# Bet-level Phase C source columns (must match trainer ``_REQUIRED_BET_PARQUET_COLS`` suffix
+# Bet-level run/trip LDA pass-through columns (must match trainer ``_REQUIRED_BET_PARQUET_COLS`` suffix
 # and ``features_candidates.yaml`` passthrough ``feature_id`` values).
-LDA_PHASE_C_BET_COLUMNS: tuple[str, ...] = (
+LDA_RUN_TRIP_BET_COLUMNS: tuple[str, ...] = (
     "lda_l1_run_bet_count",
     "lda_trip_run_count",
     "lda_run_ord_in_trip",
@@ -84,11 +85,11 @@ def _fingerprint_inputs(
     map_paths: Sequence[Path],
     session_path: Path,
     *,
-    phase_c: bool,
+    join_run_trip_lda_to_bet: bool,
 ) -> str:
     """Return sha256 hex of sorted input paths + sizes (cheap reproducibility token)."""
     h = hashlib.sha256()
-    h.update(f"phase_c={int(phase_c)}".encode("ascii"))
+    h.update(f"join_run_trip_lda_to_bet={int(join_run_trip_lda_to_bet)}".encode("ascii"))
     for label, seq in (
         ("bet", bet_paths),
         ("run", run_paths),
@@ -128,11 +129,121 @@ def _atomic_replace(src: Path, dst: Path) -> None:
     os.replace(str(src), str(dst))
 
 
+def _bridge_echo(msg: str) -> None:
+    """User-facing line for bridge materialization (stdout)."""
+    print(f"[Trainer bridge] {msg}", flush=True)
+
+
+def _progress_bar_disabled() -> bool:
+    """Match trainer: env or ``trainer.config.DISABLE_PROGRESS_BAR``."""
+    v = os.environ.get("DISABLE_PROGRESS_BAR", "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    try:
+        import trainer.config as _tc  # type: ignore[import-not-found]
+
+        return bool(getattr(_tc, "DISABLE_PROGRESS_BAR", False))
+    except Exception:
+        return False
+
+
+def _safe_unlink_tmp(path: Path) -> None:
+    """Best-effort delete of temp Parquet (Windows may keep a lock briefly after DuckDB closes)."""
+    for attempt in range(5):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            if attempt < 4:
+                time.sleep(0.4)
+            else:
+                _bridge_echo(f"Warning: could not delete temp file (close other tools using it): {path}")
+
+
+def _layman_join_spinner_caption(
+    *,
+    join_run_trip_lda_to_bet: bool,
+    run_paths: list[Path],
+    trip_paths: list[Path],
+    map_paths: list[Path],
+) -> str:
+    """Short single-line caption for the live status line (fits narrow terminals)."""
+    if not (join_run_trip_lda_to_bet and run_paths):
+        return "DuckDB: reshaping bet columns -> temp Parquet"
+    if trip_paths and map_paths:
+        return "DuckDB: join bets to runs+trips, write temp Parquet (long step)"
+    return "DuckDB: join bets to runs, write temp Parquet (long step)"
+
+
+def _duckdb_run_with_activity(con: Any, sql: str, long_explanation: str, spinner_caption: str) -> None:
+    """Run DuckDB on the **main thread** (required); show a live spinner + elapsed seconds.
+
+    DuckDB connections are not safe to share across threads; a background thread
+    must never call ``con.execute``.
+    """
+    _bridge_echo(long_explanation)
+    if _progress_bar_disabled():
+        t0 = time.perf_counter()
+        con.execute(sql)
+        _bridge_echo(f"DuckDB finished in {time.perf_counter() - t0:.1f}s.")
+        return
+
+    stop = threading.Event()
+    t0 = time.perf_counter()
+
+    def _spin() -> None:
+        chars = "|/-\\"
+        n = 0
+        cap = spinner_caption[:52] + ("..." if len(spinner_caption) > 52 else "")
+        width = 20
+        while not stop.wait(0.2):
+            elapsed = time.perf_counter() - t0
+            c = chars[n % len(chars)]
+            n += 1
+            # Indeterminate bar (elapsed only, not % done - DuckDB has no progress API).
+            phase = int(elapsed * 3) % (width + 4)
+            bar = "".join("=" if abs(i - phase) <= 2 else "." for i in range(width))
+            sys.stdout.write(f"\r[Trainer bridge] {c} [{bar}] {cap}  {elapsed:5.0f}s ")
+            sys.stdout.flush()
+
+    th = threading.Thread(target=_spin, name="trainer-bridge-heartbeat", daemon=True)
+    th.start()
+    try:
+        con.execute(sql)
+    finally:
+        stop.set()
+        th.join(timeout=3.0)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    _bridge_echo(f"DuckDB finished in {time.perf_counter() - t0:.1f}s.")
+
+
+def _layman_join_headline(
+    *,
+    join_run_trip_lda_to_bet: bool,
+    run_paths: list[Path],
+    trip_paths: list[Path],
+    map_paths: list[Path],
+) -> str:
+    """One-line human description of the heavy bet-table build (not internal mode names)."""
+    if not (join_run_trip_lda_to_bet and run_paths):
+        return "Building trainer bet file (copying required columns only; no run/trip add-ons)"
+    if trip_paths and map_paths:
+        return (
+            "Building trainer bet file: matching each bet to its betting run and trip, "
+            "then adding five small numeric summary columns (for model features)"
+        )
+    return (
+        "Building trainer bet file: matching each bet to its betting run only "
+        "(trip summaries set to zero - trip tables missing in this snapshot)"
+    )
+
+
 def emit_trainer_local_parquet(
     *,
     snap_root: Path,
     data_dir: Path,
-    phase_c: bool = True,
+    enrich_bet_with_run_trip_lda: bool = True,
     skip_if_unchanged: bool | None = None,
     duckdb_memory_limit: str | None = None,
 ) -> Path:
@@ -146,8 +257,8 @@ def emit_trainer_local_parquet(
         Snapshot root, e.g. ``data/parallel_lda_mvp/snap_mvp_…``.
     data_dir : Path
         Project ``data/`` directory (parent of ``parallel_lda_mvp/``).
-    phase_c : bool
-        When True and L1 parquet exist, append ``LDA_PHASE_C_BET_COLUMNS`` via joins.
+    enrich_bet_with_run_trip_lda : bool
+        When True and L1 ``run_fact`` parquet exist, append ``LDA_RUN_TRIP_BET_COLUMNS`` via joins.
     skip_if_unchanged : bool | None
         If None, read env ``PARALLEL_LDA_BRIDGE_SKIP_IF_UNCHANGED`` (``1`` = true).
     duckdb_memory_limit : str | None
@@ -183,12 +294,20 @@ def emit_trainer_local_parquet(
     if duckdb_memory_limit is None:
         duckdb_memory_limit = os.environ.get(_ENV_DUCKDB_MEM, "").strip() or "4GB"
 
-    print(
-        f"[trainer_bridge_mvp] start snap_root={snap_root} "
-        f"phase_c={phase_c} duckdb_memory_limit={duckdb_memory_limit!r} "
-        f"skip_if_unchanged={skip_if_unchanged}",
-        flush=True,
+    try:
+        _bridge_rel = str(bridge_dir.relative_to(data_dir))
+    except ValueError:
+        _bridge_rel = str(bridge_dir)
+    _bridge_echo(
+        f"Preparing trainer-ready copies under {_bridge_rel} "
+        f"(reads snapshot at {snap_root.name}; does NOT modify your original L0 "
+        f"{data_dir.name}/gmwds_t_bet.parquet)."
     )
+    if os.environ.get("TRAINER_BRIDGE_VERBOSE", "").strip().lower() in ("1", "true", "yes"):
+        _bridge_echo(
+            f"(verbose) DuckDB memory_limit={duckdb_memory_limit!r} skip_if_unchanged={skip_if_unchanged} "
+            f"enrich_bet_with_run_trip_lda_requested={enrich_bet_with_run_trip_lda}"
+        )
 
     summary, summary_path = _first_mvp_summary(snap_root)
     raw_bet_paths = [Path(x) for x in (summary.get("t_bet_paths") or [])]
@@ -203,34 +322,32 @@ def emit_trainer_local_parquet(
         raise FileNotFoundError(f"t_session from mvp_summary not a file: {session_src!r}")
 
     sid = str(summary.get("source_snapshot_id") or "")
-    print(
-        f"[trainer_bridge_mvp] mvp_summary={summary_path.name} "
-        f"source_snapshot_id={sid!r} gaming_ym={summary.get('gaming_ym')!r}",
-        flush=True,
-    )
     fb = raw_bet_paths[0].name if raw_bet_paths else ""
-    print(
-        f"[trainer_bridge_mvp] t_bet inputs n={len(raw_bet_paths)} first={fb!r} "
-        f"session={session_src.name}",
-        flush=True,
+    _bridge_echo(
+        f"Using snapshot summary {summary_path.parent.name}/{summary_path.name} "
+        f"(id={sid or 'unknown'}, month={summary.get('gaming_ym')!r})."
+    )
+    _bridge_echo(
+        f"Reading {len(raw_bet_paths)} bet Parquet part(s), first file {fb!r}; "
+        f"session file {session_src.name!r}."
     )
 
     run_paths = _parquet_glob_under(snap_root, "run_fact", "run_fact__")
     trip_paths = _parquet_glob_under(snap_root, "trip_fact", "trip_fact__")
     map_paths = _parquet_glob_under(snap_root, "trip_run_map", "trip_run_map__")
-    print(
-        f"[trainer_bridge_mvp] L1 parquet parts run_fact={len(run_paths)} "
-        f"trip_fact={len(trip_paths)} trip_run_map={len(map_paths)}",
-        flush=True,
+    _bridge_echo(
+        f"Found helper tables in snapshot: {len(run_paths)} run chunks, "
+        f"{len(trip_paths)} trip chunks, {len(map_paths)} run<->trip link chunks."
     )
 
+    join_lda_columns = enrich_bet_with_run_trip_lda and bool(run_paths)
     fp = _fingerprint_inputs(
         raw_bet_paths,
         run_paths,
         trip_paths,
         map_paths,
         session_src,
-        phase_c=phase_c and bool(run_paths),
+        join_run_trip_lda_to_bet=join_lda_columns,
     )
 
     manifest_path = bridge_dir / "trainer_local_parquet_bridge.manifest.json"
@@ -242,14 +359,13 @@ def emit_trainer_local_parquet(
             and (bridge_dir / "gmwds_t_bet.parquet").is_file()
             and (bridge_dir / "gmwds_t_session.parquet").is_file()
         ):
-            print(
-                f"[trainer_bridge_mvp] skip unchanged fingerprint={fp[:16]}… "
-                f"(set {_ENV_BRIDGE_SKIP}=0 to force)",
-                flush=True,
+            _bridge_echo(
+                "Output already matches current inputs (fingerprint unchanged) - skipping rebuild. "
+                f"Unset {_ENV_BRIDGE_SKIP} or set it to 0/false to force a full rebuild."
             )
             return manifest_path
 
-    print(f"[trainer_bridge_mvp] input_fingerprint prefix={fp[:16]}…", flush=True)
+    _bridge_echo("Inputs changed or first build - will rebuild bridge Parquet files.")
 
     required = list(_REQUIRED_BET_PARQUET_COLS)
 
@@ -263,13 +379,11 @@ def emit_trainer_local_parquet(
             f"t_bet missing required columns for trainer load_local_parquet: missing={missing!r} "
             f"have_sample={sorted(have)[:40]!r} … (n={len(have)})"
         )
-    n_lda_in_src = sum(1 for c in LDA_PHASE_C_BET_COLUMNS if c in have)
+    n_lda_in_src = sum(1 for c in LDA_RUN_TRIP_BET_COLUMNS if c in have)
     n_req_hit = sum(1 for c in required if c in have)
-    print(
-        f"[trainer_bridge_mvp] schema OK first_bet_file columns={len(have)} "
-        f"trainer_required_hit={n_req_hit}/{len(required)} "
-        f"lda_cols_already_in_source={n_lda_in_src}",
-        flush=True,
+    _bridge_echo(
+        f"Source bet file looks valid: {n_req_hit}/{len(required)} trainer-required columns present, "
+        f"{len(have)} columns total; {n_lda_in_src}/5 optional run/trip summary columns already in file."
     )
 
     bet_list_sql = ", ".join(f"'{_escape_sql_path(p)}'" for p in raw_bet_paths)
@@ -280,10 +394,9 @@ def emit_trainer_local_parquet(
     tmp_dir.mkdir(parents=True, exist_ok=True)
     bet_tmp = tmp_dir / f"gmwds_t_bet.parquet.tmp.{os.getpid()}"
     sess_tmp = tmp_dir / f"gmwds_t_session.parquet.tmp.{os.getpid()}"
-    print(
-        f"[trainer_bridge_mvp] tmp bet={bet_tmp.name} session={sess_tmp.name} "
-        f"-> {out_bet.name} + {out_sess.name}",
-        flush=True,
+    _bridge_echo(
+        f"Writing to a temp file, then installing as {out_bet} and {out_sess} "
+        f"(your original bet Parquet paths are never overwritten)."
     )
 
     try:
@@ -293,17 +406,20 @@ def emit_trainer_local_parquet(
                 # memory_limit is a pragma value, not a path — use as literal with simple guard
                 lim = str(duckdb_memory_limit).replace("'", "")
                 con.execute(f"PRAGMA memory_limit='{lim}'")
+                _bridge_echo(
+                    f"DuckDB engine memory cap set to {lim!r} (raise via env {_ENV_DUCKDB_MEM} if you have RAM)."
+                )
 
             cols_sql = ", ".join(f'"{c}"' for c in required)
-            if not (phase_c and run_paths):
+            if not join_lda_columns:
                 inner = f"SELECT {cols_sql} FROM read_parquet([{bet_list_sql}], union_by_name=true)"
-                sql_mode = "bet_columns_only_no_L1_join"
+                sql_mode = "bet_columns_only_no_run_join"
             else:
                 run_sql = ", ".join(f"'{_escape_sql_path(p)}'" for p in run_paths)
                 trip_sql_list = ", ".join(f"'{_escape_sql_path(p)}'" for p in trip_paths)
                 map_sql_list = ", ".join(f"'{_escape_sql_path(p)}'" for p in map_paths)
                 has_trip_layer = bool(trip_paths and map_paths)
-                sql_mode = "phase_c_run_plus_trip" if has_trip_layer else "phase_c_run_only_trip_zeroed"
+                sql_mode = "join_run_and_trip" if has_trip_layer else "join_run_trip_columns_zeroed"
                 if has_trip_layer:
                     inner = f"""
                     WITH b AS (
@@ -409,19 +525,37 @@ def emit_trainer_local_parquet(
                     """.strip()
 
             out_esc = _escape_sql_path(bet_tmp)
-            print(f"[trainer_bridge_mvp] DuckDB COPY bet parquet mode={sql_mode} …", flush=True)
+            _join_long = _layman_join_headline(
+                join_run_trip_lda_to_bet=enrich_bet_with_run_trip_lda,
+                run_paths=run_paths,
+                trip_paths=trip_paths,
+                map_paths=map_paths,
+            )
+            _join_spin = _layman_join_spinner_caption(
+                join_run_trip_lda_to_bet=enrich_bet_with_run_trip_lda,
+                run_paths=run_paths,
+                trip_paths=trip_paths,
+                map_paths=map_paths,
+            )
             t_copy = time.perf_counter()
-            con.execute(f"COPY ({inner}) TO '{out_esc}' (FORMAT PARQUET)")
+            _duckdb_run_with_activity(
+                con,
+                f"COPY ({inner}) TO '{out_esc}' (FORMAT PARQUET)",
+                long_explanation=_join_long,
+                spinner_caption=_join_spin,
+            )
+            _copy_elapsed = time.perf_counter() - t_copy
+            if os.environ.get("TRAINER_BRIDGE_VERBOSE", "").strip().lower() in ("1", "true", "yes"):
+                _bridge_echo(f"(verbose) internal build mode: {sql_mode}")
             row_count = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{out_esc}')").fetchone()[0])
-            print(
-                f"[trainer_bridge_mvp] DuckDB COPY done rows={row_count} "
-                f"elapsed_s={time.perf_counter() - t_copy:.1f}",
-                flush=True,
+            _bridge_echo(
+                f"Main bet export finished: {row_count:,} rows in {_copy_elapsed:.1f}s "
+                "(row count is read from the new file)."
             )
         finally:
             con.close()
 
-        print(f"[trainer_bridge_mvp] copying session {session_src.name} -> {sess_tmp.name} …", flush=True)
+        _bridge_echo(f"Copying session table to bridge folder (same bytes as {session_src.name}) ...")
         shutil.copy2(session_src, sess_tmp)
         sess_rows = None
         try:
@@ -433,9 +567,9 @@ def emit_trainer_local_parquet(
         except Exception:
             sess_rows = None
         if sess_rows is not None:
-            print(f"[trainer_bridge_mvp] session row_count={sess_rows}", flush=True)
+            _bridge_echo(f"Session copy OK: {sess_rows:,} rows.")
 
-        print(f"[trainer_bridge_mvp] atomic install -> {out_bet} , {out_sess}", flush=True)
+        _bridge_echo("Installing bet + session files into the bridge folder (atomic replace) ...")
         _atomic_replace(bet_tmp, out_bet)
         _atomic_replace(sess_tmp, out_sess)
 
@@ -446,15 +580,15 @@ def emit_trainer_local_parquet(
             "input_fingerprint": fp,
             "source_snapshot_id": summary.get("source_snapshot_id"),
             "snap_root": str(snap_root.as_posix()),
-            "phase_c": bool(phase_c and bool(run_paths)),
+            "bet_includes_run_trip_lda_columns": join_lda_columns,
             "t_bet_paths": [str(p.as_posix()) for p in raw_bet_paths],
             "t_session_source": str(session_src.as_posix()),
             "gmwds_t_bet": str(out_bet.as_posix()),
             "gmwds_t_session": str(out_sess.as_posix()),
             "bet_row_count": row_count,
             "session_row_count": sess_rows,
-            "lda_phase_c_columns": list(LDA_PHASE_C_BET_COLUMNS)
-            if (phase_c and run_paths)
+            "lda_run_trip_bet_column_names": list(LDA_RUN_TRIP_BET_COLUMNS)
+            if join_lda_columns
             else [],
             "run_fact_parts": len(run_paths),
             "trip_fact_parts": len(trip_paths),
@@ -470,26 +604,26 @@ def emit_trainer_local_parquet(
         try:
             mf_tmp.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
             mf_tmp.close()
-            print(f"[trainer_bridge_mvp] writing manifest {manifest_path.name}", flush=True)
+            _bridge_echo(f"Writing bridge manifest {manifest_path.name} (trainer reads this next) ...")
             _atomic_replace(Path(mf_tmp.name), manifest_path)
         except Exception:
             Path(mf_tmp.name).unlink(missing_ok=True)
             raise
 
-        print(
-            f"[trainer_bridge_mvp] wrote {out_bet.name} rows={row_count} "
-            f"phase_c={manifest['phase_c']} manifest={manifest_path.name}",
-            flush=True,
+        _bridge_echo(
+            "All set: bridge bet/session ready; run/trip add-on columns active="
+            f"{bool(manifest['bet_includes_run_trip_lda_columns'])}. "
+            f"Manifest: {manifest_path.name}"
         )
-        print(
-            "[trainer_bridge_mvp] hint: if trainer chunk cache masks new bet columns, "
-            "re-run with --force-recompute (or clear trainer/.data/chunks).",
-            flush=True,
+        _bridge_echo(
+            "Tip: if an old training run still ignores new columns, use --force-recompute "
+            "or delete trainer/.data/chunks cache."
         )
         return manifest_path
     finally:
-        bet_tmp.unlink(missing_ok=True)
-        sess_tmp.unlink(missing_ok=True)
+        time.sleep(0.1)
+        _safe_unlink_tmp(bet_tmp)
+        _safe_unlink_tmp(sess_tmp)
 
 
 def validate_feature_spec_cli() -> int:
@@ -498,11 +632,11 @@ def validate_feature_spec_cli() -> int:
         from trainer.features.features import load_feature_spec
         from trainer.training.trainer import FEATURE_SPEC_PATH
     except ImportError as e:
-        print(f"[trainer_bridge_mvp] import error: {e}", file=sys.stderr)
+        print(f"[Trainer bridge] import error: {e}", file=sys.stderr)
         return 1
-    print(f"[trainer_bridge_mvp] validating feature spec: {FEATURE_SPEC_PATH}", flush=True)
+    _bridge_echo(f"Validating feature spec YAML: {FEATURE_SPEC_PATH}")
     load_feature_spec(FEATURE_SPEC_PATH)
-    print(f"[trainer_bridge_mvp] feature spec OK: {FEATURE_SPEC_PATH}", flush=True)
+    _bridge_echo(f"Feature spec OK: {FEATURE_SPEC_PATH}")
     return 0
 
 

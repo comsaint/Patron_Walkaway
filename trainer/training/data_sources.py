@@ -85,9 +85,13 @@ _CANONICAL_MAP_SESSION_COLS: list = [
     "turnover",
 ]
 
-# L1 Phase C passthrough columns (must match ``parallel_lda_mvp.trainer_bridge_mvp.LDA_PHASE_C_BET_COLUMNS``).
-# When the bridge manifest has ``phase_c: true``, all of these must exist on the bet Parquet schema (fail-fast).
-_OPTIONAL_BET_LDA_PHASE_C_COLS: tuple[str, ...] = (
+# Run/trip LDA pass-through columns on bet (must match ``parallel_lda_mvp.trainer_bridge_mvp.LDA_RUN_TRIP_BET_COLUMNS``).
+# When the bridge manifest sets ``bet_includes_run_trip_lda_columns: true`` (or legacy ``phase_c: true``),
+# all of these must exist on the bet Parquet schema (fail-fast).
+_MANIFEST_KEY_BET_INCLUDES_RUN_TRIP_LDA = "bet_includes_run_trip_lda_columns"
+_LEGACY_MANIFEST_KEY_PHASE_C = "phase_c"
+
+_OPTIONAL_BET_LDA_RUN_TRIP_COLS: tuple[str, ...] = (
     "lda_l1_run_bet_count",
     "lda_trip_run_count",
     "lda_run_ord_in_trip",
@@ -213,6 +217,17 @@ def resolve_local_parquet_bet_session_paths_from_manifest(
     return Path(raw_bet).resolve(), Path(str(sess_raw)).resolve()
 
 
+def manifest_bet_includes_run_trip_lda_columns(manifest: Dict[str, Any]) -> bool:
+    """Return True if the manifest requires the five ``lda_*`` run/trip columns on bet Parquet.
+
+    Reads the canonical key ``bet_includes_run_trip_lda_columns`` first, then the legacy
+    ``phase_c`` key for manifests emitted by older bridge builds.
+    """
+    if bool(manifest.get(_MANIFEST_KEY_BET_INCLUDES_RUN_TRIP_LDA)):
+        return True
+    return bool(manifest.get(_LEGACY_MANIFEST_KEY_PHASE_C, False))
+
+
 def local_parquet_session_path_for_trainer() -> Path:
     """Return session Parquet path from the bridge manifest (single source of truth)."""
     m = load_trainer_local_parquet_bridge_manifest()
@@ -220,17 +235,17 @@ def local_parquet_session_path_for_trainer() -> Path:
     return sess
 
 
-def _validate_bet_parquet_phase_c_schema(bet_path: Path, manifest: Dict[str, Any]) -> None:
-    """If manifest declares ``phase_c``, require all LDA Phase C columns on bet schema."""
-    if not bool(manifest.get("phase_c")):
+def _validate_bet_parquet_run_trip_lda_schema(bet_path: Path, manifest: Dict[str, Any]) -> None:
+    """If manifest requires run/trip LDA columns on bet, require all five on schema."""
+    if not manifest_bet_includes_run_trip_lda_columns(manifest):
         return
     import pyarrow.parquet as _pq_bet
     names = set(_pq_bet.read_schema(bet_path).names)
-    missing = [c for c in _OPTIONAL_BET_LDA_PHASE_C_COLS if c not in names]
+    missing = [c for c in _OPTIONAL_BET_LDA_RUN_TRIP_COLS if c not in names]
     if missing:
         raise ValueError(
-            "Workstream A: manifest has phase_c=true but bet Parquet is missing columns "
-            f"{missing!r} (path={bet_path})"
+            "Workstream A: manifest requires bet_includes_run_trip_lda_columns but bet Parquet "
+            f"is missing columns {missing!r} (path={bet_path})"
         )
 
 
@@ -244,7 +259,7 @@ class BridgeLocalParquetReadiness:
 
 
 def probe_trainer_local_parquet_bridge_readiness() -> BridgeLocalParquetReadiness:
-    """Check whether local Parquet bridge ingress is ready (manifest + paths + phase_c schema).
+    """Check whether local Parquet bridge ingress is ready (manifest + paths + run/trip LDA schema).
 
     Pure probe: does not materialize files or mutate disk. Used by AutoBuild orchestrator
     before calling ``load_local_parquet``.
@@ -283,9 +298,9 @@ def probe_trainer_local_parquet_bridge_readiness() -> BridgeLocalParquetReadines
             reasons=tuple(reasons),
             manifest_path=p,
         )
-    if bool(manifest.get("phase_c")):
+    if manifest_bet_includes_run_trip_lda_columns(manifest):
         try:
-            _validate_bet_parquet_phase_c_schema(bet_path, manifest)
+            _validate_bet_parquet_run_trip_lda_schema(bet_path, manifest)
         except ValueError as exc:
             return BridgeLocalParquetReadiness(
                 ready=False,
@@ -389,10 +404,10 @@ def load_local_parquet(
     bets_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(manifest)
 
     logger.info(
-        "Workstream A ingress: manifest=%s artifact_kind=%s phase_c=%s bet=%s session=%s%s",
+        "Workstream A ingress: manifest=%s artifact_kind=%s bet_includes_run_trip_lda=%s bet=%s session=%s%s",
         trainer_local_parquet_bridge_manifest_path(),
         manifest.get("artifact_kind"),
-        manifest.get("phase_c"),
+        manifest_bet_includes_run_trip_lda_columns(manifest),
         bets_path,
         sess_path,
         " (sessions only)" if sessions_only else "",
@@ -409,7 +424,7 @@ def load_local_parquet(
                 f"Bet Parquet missing (manifest): {bets_path}. "
                 "Fix paths in trainer_local_parquet_bridge.manifest.json or re-run the MVP bridge."
             )
-        _validate_bet_parquet_phase_c_schema(bets_path, manifest)
+        _validate_bet_parquet_run_trip_lda_schema(bets_path, manifest)
 
     logger.info("Reading local Parquet via manifest: %s%s", bets_path.parent, " (sessions only)" if sessions_only else "")
 
@@ -455,7 +470,7 @@ def load_local_parquet(
         import pyarrow.parquet as _pq_bets
         _bet_schema_cols = set(_pq_bets.read_schema(bets_path).names)
         _bet_cols = [c for c in _REQUIRED_BET_PARQUET_COLS if c in _bet_schema_cols]
-        for _c in _OPTIONAL_BET_LDA_PHASE_C_COLS:
+        for _c in _OPTIONAL_BET_LDA_RUN_TRIP_COLS:
             if _c in _bet_schema_cols and _c not in _bet_cols:
                 _bet_cols.append(_c)
         bets = pd.read_parquet(

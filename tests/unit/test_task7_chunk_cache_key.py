@@ -28,7 +28,7 @@ def _write_min_bridge_manifest(root: Path) -> None:
             "artifact_kind": "trainer_local_parquet_bridge_v1",
             "t_bet_paths": [str(bet)],
             "gmwds_t_session": str(sess),
-            "phase_c": False,
+            "bet_includes_run_trip_lda_columns": False,
             "input_fingerprint": "testfp",
         }),
         encoding="utf-8",

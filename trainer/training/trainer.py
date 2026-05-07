@@ -485,7 +485,7 @@ HK_TZ = ZoneInfo(HK_TZ_STR)
 from trainer.training.data_sources import (  # noqa: E402  (post-config import by design)
     _BET_SELECT_COLS,
     _CANONICAL_MAP_SESSION_COLS,
-    _OPTIONAL_BET_LDA_PHASE_C_COLS,
+    _OPTIONAL_BET_LDA_RUN_TRIP_COLS,
     _REQUIRED_BET_PARQUET_COLS,
     _SESSION_SELECT_COLS,
     LOCAL_PARQUET_DIR,

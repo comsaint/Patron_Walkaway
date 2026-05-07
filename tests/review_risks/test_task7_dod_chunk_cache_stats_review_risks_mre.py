@@ -78,7 +78,7 @@ class TestTask7DodChunkCacheStatsReviewRisksMRE(unittest.TestCase):
                     "artifact_kind": "trainer_local_parquet_bridge_v1",
                     "t_bet_paths": [str(bet)],
                     "gmwds_t_session": str(sess),
-                    "phase_c": False,
+                    "bet_includes_run_trip_lda_columns": False,
                 }),
                 encoding="utf-8",
             )

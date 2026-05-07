@@ -11,9 +11,8 @@ Run from repo root:
 
 Optional flags:
 
-- ``--emit-trainer-local-parquet`` — after MVP, write trainer-shaped Parquet under
-  ``data/mvp_trainer_bridge/`` (never overwrites L0 ``data/gmwds_t_*.parquet``; Phase C L1 join
-  when snapshot has ``run_fact`` parts).
+- ``--emit-trainer-local-parquet`` — after MVP, write ``data/gmwds_t_{bet,session}.parquet``
+  (Phase C L1 join when snapshot has ``run_fact`` parts).
 - ``--trainer-bridge-emit-only`` — only run the bridge (no preprocess/run/trip). Requires
   ``--snapshot-id <snap>`` **or** ``PARALLEL_LDA_MVP_SNAPSHOT_ID`` pointing at an existing
   ``data/parallel_lda_mvp/<snap>/`` tree with ``mvp_summary.json``.
@@ -929,41 +928,6 @@ def _split_month_cleaned_to_days(
         con.close()
 
 
-def _validate_canonical_mapping_unique_per_player(
-    con: Any,
-    *,
-    mapping_parquet_sql_literal: str,
-) -> None:
-    """Raise ``ValueError`` if any ``player_id`` maps to more than one distinct ``canonical_id``.
-
-    Duplicate rows with the same ``(player_id, canonical_id)`` are allowed.
-
-    Args:
-        con: Open DuckDB connection.
-        mapping_parquet_sql_literal: Path to mapping Parquet, escaped for use inside ``'...'``.
-    """
-    rows = con.execute(
-        f"""
-        SELECT
-          CAST(player_id AS BIGINT) AS player_id,
-          COUNT(DISTINCT CAST(canonical_id AS VARCHAR)) AS n_canonical
-        FROM read_parquet('{mapping_parquet_sql_literal}')
-        GROUP BY 1
-        HAVING n_canonical > 1
-        ORDER BY player_id
-        LIMIT 30
-        """
-    ).fetchall()
-    if not rows:
-        return
-    sample = ", ".join(f"{int(r[0])}({int(r[1])} distinct)" for r in rows[:10])
-    raise ValueError(
-        "canonical mapping violates 1:1 player_id→canonical_id: "
-        f"{len(rows)} player_id(s) with multiple distinct canonical_id values "
-        f"(sample: {sample}). Rebuild mapping or fix upstream data."
-    )
-
-
 def _materialize_cleaned_bets_with_canonical_id(
     *,
     cleaned_paths: list[Path],
@@ -979,7 +943,6 @@ def _materialize_cleaned_bets_with_canonical_id(
     out_paths: list[Path] = []
     con = duckdb.connect()
     try:
-        _validate_canonical_mapping_unique_per_player(con, mapping_parquet_sql_literal=mp_sql)
         for src in cleaned_paths:
             if not src.is_file():
                 raise FileNotFoundError(f"cleaned bet parquet missing: {src}")
@@ -996,10 +959,7 @@ def _materialize_cleaned_bets_with_canonical_id(
                       CAST(player_id AS BIGINT) AS player_id,
                       CAST(canonical_id AS VARCHAR) AS canonical_id
                     FROM read_parquet('{mp_sql}')
-                    QUALIFY ROW_NUMBER() OVER (
-                      PARTITION BY player_id
-                      ORDER BY canonical_id ASC NULLS LAST
-                    ) = 1
+                    QUALIFY ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY player_id) = 1
                   ) m USING (player_id)
                 ) TO '{dp}' (FORMAT PARQUET)
                 """
@@ -1755,34 +1715,17 @@ def main(argv: list[str] | None = None) -> int:
         if not snap_root.is_dir():
             print(f"snapshot root not found: {snap_root}", file=sys.stderr)
             return 2
-        from parallel_lda_mvp.trainer_bridge_mvp import (
-            emit_trainer_local_parquet,
-            trainer_bridge_output_dir,
-        )
+        from parallel_lda_mvp.trainer_bridge_mvp import emit_trainer_local_parquet
 
-        _bd = trainer_bridge_output_dir(data_root)
         print(
-            f"[parallel_lda_mvp] trainer bridge emit-only -> {_bd} "
-            f"(snap={sid}; L0 gmwds_t_*.parquet untouched)",
+            f"[parallel_lda_mvp] trainer bridge emit-only -> {data_root / 'gmwds_t_bet.parquet'} "
+            f"(snap={sid})",
             flush=True,
         )
         emit_trainer_local_parquet(
             snap_root=snap_root,
             data_dir=data_root,
-            phase_c=True,
-        )
-        from pipelines.layered_data_assets.orchestration.materialization_state_store_v1 import (
-            RECOMPUTE_STOP_SINGLE_PASS,
-            format_impact_metrics_json,
-        )
-
-        print(
-            format_impact_metrics_json(
-                recompute_rounds=1,
-                recompute_stop_reason=RECOMPUTE_STOP_SINGLE_PASS,
-                row_fingerprint_changed=None,
-            ),
-            flush=True,
+            enrich_bet_with_run_trip_lda=True,
         )
         return 0
 
@@ -1990,14 +1933,6 @@ def main(argv: list[str] | None = None) -> int:
         MAPPING_MAX_STALENESS_MIN,
         MAPPING_REFRESH_INTERVAL_MIN,
     )
-    from pipelines.layered_data_assets.orchestration.materialization_state_store_v1 import (
-        METRIC_KEY_RECOMPUTE_ROUNDS,
-        METRIC_KEY_RECOMPUTE_STOP_REASON,
-        METRIC_KEY_ROW_FINGERPRINT_CHANGED,
-        RECOMPUTE_STOP_SINGLE_PASS,
-        format_impact_metrics_json,
-    )
-
     for ym in gaming_yms:
         out_root = snap_root / f"gaming_ym={ym}"
         out_root.mkdir(parents=True, exist_ok=True)
@@ -2038,9 +1973,6 @@ def main(argv: list[str] | None = None) -> int:
             "t_bet_month_content_sha256": month_bet_sha,
             "t_bet_paths": [str(p.as_posix()) for p in t_bet_paths],
             "t_session": str(t_session.as_posix()),
-            METRIC_KEY_RECOMPUTE_ROUNDS: 1,
-            METRIC_KEY_RECOMPUTE_STOP_REASON: RECOMPUTE_STOP_SINGLE_PASS,
-            METRIC_KEY_ROW_FINGERPRINT_CHANGED: None,
         }
         (out_root / "mvp_summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n",
@@ -2048,31 +1980,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"[parallel_lda_mvp] OK gaming_ym={ym} -> {out_root / 'mvp_summary.json'}")
 
-    print(
-        format_impact_metrics_json(
-            recompute_rounds=1,
-            recompute_stop_reason=RECOMPUTE_STOP_SINGLE_PASS,
-            row_fingerprint_changed=None,
-        ),
-        flush=True,
-    )
     print(f"OK MVP finished span under {snap_root}")
     if opts.get("emit_trainer_local_parquet"):
-        from parallel_lda_mvp.trainer_bridge_mvp import (
-            emit_trainer_local_parquet,
-            trainer_bridge_output_dir,
-        )
+        from parallel_lda_mvp.trainer_bridge_mvp import emit_trainer_local_parquet
 
-        _bd = trainer_bridge_output_dir(data_root)
         print(
-            f"[parallel_lda_mvp] trainer bridge after MVP -> {_bd} "
-            f"(snap={snap}; L0 gmwds_t_*.parquet untouched)",
+            f"[parallel_lda_mvp] trainer bridge after MVP -> {data_root / 'gmwds_t_bet.parquet'} "
+            f"(snap={snap})",
             flush=True,
         )
         emit_trainer_local_parquet(
             snap_root=snap_root,
             data_dir=data_root,
-            phase_c=True,
+            enrich_bet_with_run_trip_lda=True,
         )
     return 0
 

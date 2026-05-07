@@ -365,7 +365,7 @@ class TestRefactorGuardrailsInputSources(unittest.TestCase):
             "_BET_SELECT_COLS",
             "_SESSION_SELECT_COLS",
             "_REQUIRED_BET_PARQUET_COLS",
-            "_OPTIONAL_BET_LDA_PHASE_C_COLS",
+            "_OPTIONAL_BET_LDA_RUN_TRIP_COLS",
             "_CANONICAL_MAP_SESSION_COLS",
             "LOCAL_PARQUET_DIR",
             "trainer_local_parquet_bridge_manifest_path",
@@ -423,11 +423,11 @@ class TestRefactorGuardrailsInputSources(unittest.TestCase):
         ):
             self.assertIn(needed, cols, f"missing required bet col: {needed}")
 
-    def test_optional_lda_phase_c_cols_present(self):
-        """LDA Phase-C bridge columns are loaded when present."""
+    def test_optional_lda_run_trip_cols_present(self):
+        """Run/trip LDA bridge columns are loaded when present."""
         if not _TRAINER_IMPORTED:
             self.skipTest("trainer module not importable in this env")
-        cols = set(_trainer_module._OPTIONAL_BET_LDA_PHASE_C_COLS)
+        cols = set(_trainer_module._OPTIONAL_BET_LDA_RUN_TRIP_COLS)
         for needed in (
             "lda_l1_run_bet_count",
             "lda_trip_run_count",

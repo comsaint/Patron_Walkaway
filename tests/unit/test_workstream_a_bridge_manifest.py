@@ -33,7 +33,35 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             finally:
                 ds.LOCAL_PARQUET_DIR = old
 
-    def test_phase_c_true_missing_lda_raises(self) -> None:
+    def test_run_trip_lda_required_missing_columns_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bet = root / "gmwds_t_bet.parquet"
+            sess = root / "gmwds_t_session.parquet"
+            pq.write_table(pa.table({"bet_id": [1], "session_id": [1]}), bet)
+            pq.write_table(pa.table({"session_id": [1]}), sess)
+            (root / "trainer_local_parquet_bridge.manifest.json").write_text(
+                json.dumps({
+                    "artifact_kind": "trainer_local_parquet_bridge_v1",
+                    "t_bet_paths": [str(bet.resolve())],
+                    "gmwds_t_session": str(sess.resolve()),
+                    "bet_includes_run_trip_lda_columns": True,
+                }),
+                encoding="utf-8",
+            )
+            old = ds.LOCAL_PARQUET_DIR
+            ds.LOCAL_PARQUET_DIR = root
+            try:
+                ws = datetime(2026, 1, 1)
+                ee = datetime(2026, 2, 1)
+                with self.assertRaises(ValueError) as ctx:
+                    ds.load_local_parquet(ws, ee)
+                self.assertIn("lda_l1_run_bet_count", str(ctx.exception))
+            finally:
+                ds.LOCAL_PARQUET_DIR = old
+
+    def test_legacy_phase_c_manifest_missing_lda_still_raises(self) -> None:
+        """Old bridge manifests used ``phase_c``; trainer must still enforce the five lda_* columns."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             bet = root / "gmwds_t_bet.parquet"
@@ -90,13 +118,13 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             finally:
                 ds.LOCAL_PARQUET_DIR = old
 
-    def test_probe_ready_with_phase_c_columns(self) -> None:
+    def test_probe_ready_with_run_trip_lda_columns(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             bet = root / "b.parquet"
             sess = root / "s.parquet"
             cols: dict = {"bet_id": [1], "session_id": [1]}
-            for c in ds._OPTIONAL_BET_LDA_PHASE_C_COLS:
+            for c in ds._OPTIONAL_BET_LDA_RUN_TRIP_COLS:
                 cols[c] = [1.0]
             pq.write_table(pa.table(cols), bet)
             pq.write_table(pa.table({"session_id": [1]}), sess)
@@ -104,7 +132,7 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
                 json.dumps({
                     "t_bet_paths": [str(bet.resolve())],
                     "gmwds_t_session": str(sess.resolve()),
-                    "phase_c": True,
+                    "bet_includes_run_trip_lda_columns": True,
                 }),
                 encoding="utf-8",
             )
@@ -126,7 +154,7 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             bet = data_dir / "bridge_bet.parquet"
             sess = data_dir / "bridge_sess.parquet"
             cols: dict = {"bet_id": [1], "session_id": [1]}
-            for c in ds._OPTIONAL_BET_LDA_PHASE_C_COLS:
+            for c in ds._OPTIONAL_BET_LDA_RUN_TRIP_COLS:
                 cols[c] = [1.0]
             pq.write_table(pa.table(cols), bet)
             pq.write_table(pa.table({"session_id": [1]}), sess)
@@ -134,7 +162,7 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             mf.write_text(
                 json.dumps({
                     "artifact_kind": "trainer_local_parquet_bridge_v1",
-                    "phase_c": True,
+                    "bet_includes_run_trip_lda_columns": True,
                     "t_bet_paths": [str(bet.resolve())],
                     "gmwds_t_session": str(sess.resolve()),
                 }),
@@ -196,7 +224,7 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             bet = dr / "bridge_bet.parquet"
             sess = dr / "bridge_sess.parquet"
             cols: dict = {"bet_id": [1], "session_id": [1]}
-            for c in ds._OPTIONAL_BET_LDA_PHASE_C_COLS:
+            for c in ds._OPTIONAL_BET_LDA_RUN_TRIP_COLS:
                 cols[c] = [1.0]
             pq.write_table(pa.table(cols), bet)
             pq.write_table(pa.table({"session_id": [1]}), sess)
@@ -204,7 +232,7 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             mf.write_text(
                 json.dumps({
                     "artifact_kind": "trainer_local_parquet_bridge_v1",
-                    "phase_c": True,
+                    "bet_includes_run_trip_lda_columns": True,
                     "t_bet_paths": [str(bet.resolve())],
                     "gmwds_t_session": str(sess.resolve()),
                 }),

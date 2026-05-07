@@ -126,7 +126,7 @@ def test_admission_to_log_dict_keys() -> None:
     "trainer.serving.scorer",
     "trainer.training.backtester",
 ])
-def test_phase_c_entrypoints_use_admission(mod_name: str) -> None:
+def test_pit_admission_entrypoints_use_layered_helper(mod_name: str) -> None:
     """Gate-C1: trainer/scorer/backtester all import the unified admission helper."""
     mod = __import__(mod_name, fromlist=["evaluate_pit_admission"])
     fn = getattr(mod, "evaluate_pit_admission", None)

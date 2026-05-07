@@ -13,7 +13,7 @@
   - `AutoBuild[<phase>]:` / `AutoBuild[summary]:`（WS3，`local_bridge_preflight.py`）。  
   - MVP 子行程前有 **high RAM / long runtime** 提示（單測：`tests/unit/test_cross_entry_preflight.py` → `TestWS5ResourceGuardMessages`）。
 
-- [x] **Workstream A 契約（manifest SSOT、`phase_c` 欄位檢查、cache 語意）保持成立，沒有回退到舊猜測式路徑**  
+- [x] **Workstream A 契約（manifest SSOT、`bet_includes_run_trip_lda_columns` 欄位檢查、cache 語意）保持成立，沒有回退到舊猜測式路徑**  
   - `trainer/training/data_sources.py`：`load_local_parquet` 經 manifest、`probe_trainer_local_parquet_bridge_readiness` fail-fast。  
   - 守門測試：`tests/unit/test_workstream_a_bridge_manifest.py`。
 

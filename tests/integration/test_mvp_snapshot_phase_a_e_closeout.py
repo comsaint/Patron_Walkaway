@@ -15,7 +15,7 @@ Phase mapping (this test file):
 - **B** — L1 preprocess: ``t_bet/cleaned__<day>.parquet`` exists for every
   ``days`` entry in each month summary.
 - **C** — L1 span outputs: ``run_fact``, ``trip_run_map``, ``trip_fact`` Parquet
-  exist per day (Phase C trip materialization complete).
+  exist per day (run/trip materialization for trainer LDA pass-through).
 - **D** — Phase D observability keys aligned with
   ``materialization_state_store_v1`` (``recompute_rounds``, etc.).
 - **E** — Trainer Phase E compat: canonical empty ``reason_codes`` constant
@@ -103,8 +103,8 @@ def test_phase_b_preprocess_cleaned_per_day(mvp_snap: Path) -> None:
             assert cleaned.is_file(), f"missing {cleaned}"
 
 
-def test_phase_c_run_trip_artifacts_per_day(mvp_snap: Path) -> None:
-    """Phase C: run_fact, trip_run_map, trip_fact present for each day."""
+def test_run_trip_lda_snapshot_artifacts_per_day(mvp_snap: Path) -> None:
+    """Run/trip LDA layer: run_fact, trip_run_map, trip_fact present for each day."""
     for sum_path in sorted(mvp_snap.glob("gaming_ym=*/mvp_summary.json")):
         month_dir = sum_path.parent
         rf = month_dir / "run_fact"
