@@ -1242,7 +1242,8 @@ def _parse_window(args) -> Tuple[datetime, datetime]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Patron Walkaway — Phase 1 Backtester")
+    # ASCII hyphen: Windows cp932 consoles cannot print U+2014 in argparse help.
+    parser = argparse.ArgumentParser(description="Patron Walkaway - Phase 1 Backtester")
     parser.add_argument("--start", default=None, help="Window start (YYYY-MM-DD HH:MM or ISO)")
     parser.add_argument("--end",   default=None, help="Window end")
     parser.add_argument(
