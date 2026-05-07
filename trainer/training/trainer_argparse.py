@@ -178,4 +178,52 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
             "when PIT-safe monthly folds can be built."
         ),
     )
+    parser.add_argument(
+        "--l2-training-bundle",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "GitHub #16 / TRN-16-03: train from pre-assembled L2 split parquets under DIR "
+            "using l2_training_bundle.json (skips chunk Steps 1–7). Incompatible with "
+            "--recent-chunks. Loads train/valid/test fully into memory (RAM risk on large data)."
+        ),
+    )
+    parser.add_argument(
+        "--l2-auto-from-local",
+        action="store_true",
+        dest="l2_auto_from_local",
+        help=(
+            "GitHub #17: with --use-local-parquet, auto-build/cache l2_training_bundle.json and "
+            "train via the L2 path (Step 3 cache hit skips Steps 4–10; else Step 7 materializes "
+            "then L2 Steps 8–10). Omit this flag to keep the legacy chunk Steps 4–10 unless "
+            "--l2-training-bundle is set. Large tables: peak RAM similar to in-memory L2 training."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-chunk-mode",
+        action="store_true",
+        help=(
+            "GitHub #17: keep legacy chunk pipeline Steps 1–10 (process_chunk + row split). "
+            "Overrides --l2-auto-from-local for local parquet runs."
+        ),
+    )
+    parser.add_argument(
+        "--no-l2-auto-bundle",
+        action="store_true",
+        help=(
+            "When --l2-auto-from-local is set, disable automatic L2 bundle materialization "
+            "(use full chunk Steps 4–10 unless --l2-training-bundle is set)."
+        ),
+    )
+    parser.add_argument(
+        "--l2-auto-bundle-dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Override directory for auto-built L2 bundle (default: <repo>/data/l2_training_bundle). "
+            "Used with --use-local-parquet when --legacy-chunk-mode is not set."
+        ),
+    )
     return parser
