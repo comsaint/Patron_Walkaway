@@ -1,5 +1,5 @@
 # Re-export: make trainer.scorer resolve to the implementation (PLAN 項目 2.2 serving).
-# WS4 v2: data-source preflight (ClickHouse) runs inside trainer.serving.scorer.main once at startup.
+# WS4 v2: data-source preflight (ClickHouse) runs in main() and run_scorer_loop() once at process start.
 # When run as __main__ (e.g. python -m trainer.scorer), forward to the implementation's main().
 import sys
 from trainer.serving import scorer as _impl  # noqa: F401

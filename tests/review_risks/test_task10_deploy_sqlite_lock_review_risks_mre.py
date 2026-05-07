@@ -172,6 +172,7 @@ class TestRisk1FirstCycleEventNotSetIfLoadFailsBeforeLoop(unittest.TestCase):
     def test_load_dual_artifacts_raises_before_while(self) -> None:
         ev = threading.Event()
         with (
+            patch("trainer.training.cross_entry_preflight.run_cross_entry_data_preflight"),
             patch.object(sc, "_check_numba_runtime_once"),
             patch.object(sc, "load_dual_artifacts", side_effect=RuntimeError("pre-loop")),
             patch.object(sc, "score_once"),
@@ -201,6 +202,7 @@ def test_risk1_regression_when_load_succeeds_event_still_set(tmp_state_db):
         "feature_spec": None,
     }
     with (
+        patch("trainer.training.cross_entry_preflight.run_cross_entry_data_preflight"),
         patch.object(sc, "_check_numba_runtime_once"),
         patch.object(sc, "load_dual_artifacts", return_value=fake_art),
         patch.object(sc, "score_once"),

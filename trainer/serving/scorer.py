@@ -2854,11 +2854,20 @@ def run_scorer_loop(
     If ``first_cycle_done`` is set, it is signaled exactly once after the first
     ``score_once`` call returns (success or exception), so deploy can defer
     validator startup and avoid SQLite startup lock races.
+
+    Runs ClickHouse data preflight once before loading artifacts (same contract as CLI ``main()``).
     """
     interval = interval_seconds if interval_seconds is not None else getattr(config, "SCORER_POLL_INTERVAL_SECONDS", 45)
     lookback = lookback_hours if lookback_hours is not None else getattr(config, "SCORER_LOOKBACK_HOURS", 8)
     if interval <= 0 or lookback <= 0:
         raise ValueError("interval_seconds and lookback_hours must be positive")
+    from trainer.training.cross_entry_preflight import run_cross_entry_data_preflight
+
+    run_cross_entry_data_preflight(
+        entry="scorer",
+        use_local_parquet=False,
+        logger=logger,
+    )
     _check_numba_runtime_once()
     artifacts = load_dual_artifacts(model_dir)
     logger.info(

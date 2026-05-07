@@ -28,6 +28,7 @@ def test_first_cycle_done_set_after_once_with_mocked_score_once(tmp_state_db):
         "feature_spec": None,
     }
     with (
+        patch("trainer.training.cross_entry_preflight.run_cross_entry_data_preflight"),
         patch.object(sc, "_check_numba_runtime_once"),
         patch.object(sc, "load_dual_artifacts", return_value=fake_art),
         patch.object(sc, "score_once") as m_score,
@@ -53,6 +54,7 @@ def test_first_cycle_done_set_even_when_score_once_raises(tmp_state_db):
         "feature_spec": None,
     }
     with (
+        patch("trainer.training.cross_entry_preflight.run_cross_entry_data_preflight"),
         patch.object(sc, "_check_numba_runtime_once"),
         patch.object(sc, "load_dual_artifacts", return_value=fake_art),
         patch.object(sc, "score_once", side_effect=RuntimeError("boom")),
@@ -76,6 +78,7 @@ def test_first_cycle_done_none_no_crash(tmp_state_db):
         "feature_spec": None,
     }
     with (
+        patch("trainer.training.cross_entry_preflight.run_cross_entry_data_preflight"),
         patch.object(sc, "_check_numba_runtime_once"),
         patch.object(sc, "load_dual_artifacts", return_value=fake_art),
         patch.object(sc, "score_once"),

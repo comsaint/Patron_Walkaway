@@ -1934,7 +1934,15 @@ def run_validator_loop(
 ) -> None:
     """Run the validator loop (no argparse). Used by package/deploy/main.py.
     Uses STATE_DB_PATH from env if set.
+    Runs ClickHouse data preflight once before the first poll (same contract as CLI ``main()``).
     """
+    from trainer.training.cross_entry_preflight import run_cross_entry_data_preflight
+
+    run_cross_entry_data_preflight(
+        entry="validator",
+        use_local_parquet=False,
+        logger=logger,
+    )
     conn = get_db_conn()
     existing_results_cache: Dict[str, Dict[str, Any]] = {}
     while True:
