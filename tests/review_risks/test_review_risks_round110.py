@@ -61,7 +61,16 @@ class TestR115PartialMetadataFallback(unittest.TestCase):
     """R115: _detect_local_data_end should gracefully handle one-side metadata miss."""
 
     def test_detect_local_data_end_handles_partial_metadata(self):
+        # _detect_local_data_end loads the bridge manifest first; without mocking it,
+        # a missing manifest makes the function return None before _parquet_date_range runs.
+        fake_manifest = {
+            "t_bet_paths": [str(_REPO_ROOT / "nonexistent_r115_bet.parquet")],
+            "gmwds_t_session": str(_REPO_ROOT / "nonexistent_r115_sess.parquet"),
+        }
         with patch(
+            "trainer.training.data_sources.load_trainer_local_parquet_bridge_manifest",
+            return_value=fake_manifest,
+        ), patch(
             "trainer.training.data_sources._parquet_date_range",
             side_effect=[None, (date(2026, 1, 1), date(2026, 1, 31))],
         ):
