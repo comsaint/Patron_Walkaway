@@ -7959,12 +7959,12 @@ def run_pipeline(args) -> None:
     else:
         logger.info("NEG_SAMPLE_FRAC=1.0 (config): negative downsampling disabled (all rows kept)")
 
-    # Issue #14 WS1: ensure bridge manifest + trainer ingress paths before any
-    # local metadata probes (e.g. _detect_local_data_end).
-    if use_local:
-        from trainer.training.local_bridge_preflight import ensure_local_bridge_ready_for_training
+    # Issue #14 / WS4 v2: bridge manifest + ClickHouse preflight via shared hook.
+    from trainer.training.cross_entry_preflight import run_cross_entry_data_preflight
 
-        ensure_local_bridge_ready_for_training(logger=logger)
+    run_cross_entry_data_preflight(
+        entry="trainer", use_local_parquet=bool(use_local), logger=logger
+    )
 
     # Auto-adjust window to actual data end when using local Parquet without
     # explicit --start/--end, so --recent-chunks is relative to data, not today.

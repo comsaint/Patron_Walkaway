@@ -1968,6 +1968,15 @@ def main():
     parser.add_argument("--force-finalize", action="store_true", help="Force-finalize PENDING candidates immediately (for manual runs)")
     args = parser.parse_args()
 
+    # WS4 v2: ClickHouse preflight once at startup (local Parquet validator path not enabled yet).
+    from trainer.training.cross_entry_preflight import run_cross_entry_data_preflight
+
+    run_cross_entry_data_preflight(
+        entry="validator",
+        use_local_parquet=False,
+        logger=logger,
+    )
+
     conn = get_db_conn()
     interval = args.interval
     existing_results_cache: Dict[str, Dict[str, Any]] = {}

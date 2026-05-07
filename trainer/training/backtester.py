@@ -1296,10 +1296,15 @@ def main() -> None:
 
     logger.info("Backtest window: %s -> %s", start, end)
 
-    if args.use_local_parquet:
-        from trainer.training.local_bridge_preflight import ensure_local_bridge_ready_for_training
+    # Issue #14 / WS4 v2: same preflight contract as trainer.run_pipeline local branch.
+    from trainer.training.cross_entry_preflight import run_cross_entry_data_preflight
 
-        ensure_local_bridge_ready_for_training(logger=logger)
+    run_cross_entry_data_preflight(
+        entry="backtester",
+        use_local_parquet=bool(args.use_local_parquet),
+        logger=logger,
+    )
+    if args.use_local_parquet:
         bets_raw, sessions_raw = load_local_parquet(start, end + timedelta(days=1))
     else:
         bets_raw, sessions_raw = load_clickhouse_data(start, end + timedelta(days=1))

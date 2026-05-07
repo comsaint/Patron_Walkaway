@@ -2943,6 +2943,15 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    # WS4 v2: ClickHouse preflight once at startup (local Parquet scorer path not enabled yet).
+    from trainer.training.cross_entry_preflight import run_cross_entry_data_preflight
+
+    run_cross_entry_data_preflight(
+        entry="scorer",
+        use_local_parquet=False,
+        logger=logging.getLogger("trainer.serving.scorer"),
+    )
+
     _check_numba_runtime_once()
     artifacts = load_dual_artifacts(args.model_dir)
     logger.info(

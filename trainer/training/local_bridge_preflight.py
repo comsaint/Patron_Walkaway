@@ -1,5 +1,9 @@
 """WS1/WS2/WS3: Auto-build preflight for local Parquet bridge ingress (Issue #14).
 
+WS4 v2: ClickHouse vs local branching for trainer/backtester/scorer/validator is centralized
+in ``trainer.training.cross_entry_preflight.run_cross_entry_data_preflight``; local mode
+still calls ``ensure_local_bridge_ready_for_training`` from there.
+
 WS1: When an MVP snapshot exists under ``data/parallel_lda_mvp/``, call
 ``emit_trainer_local_parquet`` and copy ``data/mvp_trainer_bridge/`` manifest to
 ``data/trainer_local_parquet_bridge.manifest.json`` (trainer ingress).
