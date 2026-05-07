@@ -307,6 +307,18 @@
 | trip 關閉語意爭議 | fixture 與業務預期不符 | 回 SSOT 澄清；**不得**在 execution plan 內改定義 |
 | 下游誤用 `trip_id`／`run_id` 跨 snapshot | 報表 join 靜默錯位 | 消費端 checklist：併 `source_snapshot_id`；見 SSOT §6、impl plan §7 |
 
+### 10.3 GitHub #16／#17 執行切片（Trainer L2 主路徑）
+
+> 對齊 Implementation Plan **v0.15** §11 與 GitHub **#16**／**#17**。程式錨點：`trainer/training/l2_trainer_contracts.py`、`trainer/training/issue16_gates.py`；嚴格 gate 設 ``TRAINER_ISSUE16_STRICT_GATES=1``（預設關閉以免中斷既有 chunk 管線）。
+
+| 狀態 | Task ID | 任務 | Owner | 依賴 | 輸出／證據 | DoD |
+| :---: | :--- | :--- | :--- | :--- | :--- | :--- |
+| ✅ | **TRN-16-01** | 凍結 L2→trainer 契約欄位與 label_asset 最小 schema | ML Platform + DS | SSOT、impl §11 | `l2_trainer_contracts.py` | import 可單測；欄位名與 #16 issue 對齊 |
+| ✅ | **TRN-16-02** | #16 gates（valid/test 抽樣、指標語義、label freshness）+ diagnostics | ML Platform | TRN-16-01 | `issue16_gates.py`、`pipeline_diagnostics.json` 內 `issue16_audit` | 嚴格模式可阻擋；預設僅審計 |
+| ⬜ | **TRN-16-03** | Step 1/2/6/7/9 去 chunk 化與 L2 讀取主路徑 | DS + ML Platform | E3-03、#17 read-path | trainer PR + parity 報告 | 預設不走 `process_chunk+compute_labels` |
+| ⬜ | **TRN-16-04** | OOM 預估改 split parquet bytes 模型（取代 chunk 啟發式） | ML Platform | TRN-16-03 | 文件 + 程式 | impl §11.5 效能門檻可量測 |
+| ⬜ | **TRN-17-01** | snapshot／manifest 發版與 trainer 解耦（#17） | Data Platform + Ops | TRN-16-01 | manifest CI + RUNBOOK | trainer 僅依 `snapshot_id` 消費 |
+
 ---
 
 ## 11) Working Plan Backlog（上層刻意未決）

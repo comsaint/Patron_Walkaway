@@ -145,6 +145,9 @@ class TestR109RunPipelinePassesCanonicalIdsToProfileLoad(unittest.TestCase):
              patch("trainer.trainer.get_train_valid_test_split") as mock_split, \
              patch("trainer.trainer.load_local_parquet") as mock_load, \
              patch("trainer.trainer.apply_dq") as mock_dq, \
+             patch("trainer.training.cross_entry_preflight.run_cross_entry_data_preflight"), \
+             patch("trainer.trainer.STEP7_USE_DUCKDB", False), \
+             patch("trainer.trainer.STEP7_KEEP_TRAIN_ON_DISK", False), \
              patch("trainer.trainer.CANONICAL_MAPPING_PARQUET", new=mock_parquet_path), \
              patch("trainer.trainer.CANONICAL_MAPPING_CUTOFF_JSON", new=mock_cutoff_path), \
              patch("trainer.trainer.build_canonical_links_and_dummy_from_duckdb",
@@ -185,27 +188,26 @@ class TestR109RunPipelinePassesCanonicalIdsToProfileLoad(unittest.TestCase):
                     "payout_complete_dtm": [datetime(2025, 5, 15, tzinfo=HK)],
                     "label": [1], "is_rated": [True],
                 })
+                try:
+                    args = argparse.Namespace(
+                        start="2025-01-01", end="2025-06-01", days=None,
+                        use_local_parquet=True, force_recompute=False, skip_optuna=False,
+                        recent_chunks=None,
+                        # sample_rated intentionally omitted (no --sample-rated flag)
+                    )
+                    run_pipeline(args)
 
-            try:
-                args = argparse.Namespace(
-                    start="2025-01-01", end="2025-06-01", days=None,
-                    use_local_parquet=True, force_recompute=False, skip_optuna=False,
-                    recent_chunks=None,
-                    # sample_rated intentionally omitted (no --sample-rated flag)
-                )
-                run_pipeline(args)
-
-                self.assertTrue(mock_load_profile.called)
-                kwargs = mock_load_profile.call_args[1]
-                cids_arg = kwargs.get("canonical_ids")
-                self.assertIsNotNone(cids_arg, "canonical_ids should not be None when canonical_map is non-empty")
-                self.assertEqual(
-                    len(cids_arg),
-                    5000,
-                    "Without --sample-rated, run_pipeline should pass ALL canonical_ids to load_player_profile.",
-                )
-            finally:
-                pathlib.Path(_tmp_chunk).unlink(missing_ok=True)
+                    self.assertTrue(mock_load_profile.called)
+                    kwargs = mock_load_profile.call_args[1]
+                    cids_arg = kwargs.get("canonical_ids")
+                    self.assertIsNotNone(cids_arg, "canonical_ids should not be None when canonical_map is non-empty")
+                    self.assertEqual(
+                        len(cids_arg),
+                        5000,
+                        "Without --sample-rated, run_pipeline should pass ALL canonical_ids to load_player_profile.",
+                    )
+                finally:
+                    pathlib.Path(_tmp_chunk).unlink(missing_ok=True)
 
 
 class TestR111FastModeCoverageCheckNoFalseWarning(unittest.TestCase):

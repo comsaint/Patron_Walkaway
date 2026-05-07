@@ -21,6 +21,8 @@ Covered scenarios
 """
 
 import argparse
+import os
+import tempfile
 from datetime import datetime, timedelta
 import unittest
 from unittest.mock import patch
@@ -87,12 +89,30 @@ class _PipelineMixin:
         cmap = self._canonical_map_df if self._canonical_map_df is not None else _canonical_map()
         fake_df = _fake_chunk_df(chunks[-1]["window_start"])
 
+        _fd, _tmp_parquet = tempfile.mkstemp(suffix=".parquet")
+        os.close(_fd)
+        try:
+            return self._run_pipeline_with_mocks_inner(chunks, cmap, fake_df, _tmp_parquet)
+        finally:
+            try:
+                os.unlink(_tmp_parquet)
+            except OSError:
+                pass
+
+    def _run_pipeline_with_mocks_inner(
+        self, chunks: list, cmap: pd.DataFrame, fake_df: pd.DataFrame, tmp_parquet: str
+    ) -> dict:
         from unittest.mock import MagicMock
         _mock_canonical_parquet = MagicMock()
         _mock_canonical_parquet.exists.return_value = False
         _mock_canonical_cutoff = MagicMock()
         _mock_canonical_cutoff.exists.return_value = False
         patches = {
+            "cross_entry_preflight": patch(
+                "trainer.training.cross_entry_preflight.run_cross_entry_data_preflight"
+            ),
+            "step7_duckdb": patch("trainer.trainer.STEP7_USE_DUCKDB", False),
+            "step7_keep_disk": patch("trainer.trainer.STEP7_KEEP_TRAIN_ON_DISK", False),
             "get_monthly_chunks": patch("trainer.trainer.get_monthly_chunks", return_value=chunks),
             "load_local_parquet": patch("trainer.trainer.load_local_parquet", return_value=(pd.DataFrame(), pd.DataFrame())),
             "apply_dq": patch("trainer.trainer.apply_dq", return_value=(pd.DataFrame(), pd.DataFrame())),
@@ -105,23 +125,18 @@ class _PipelineMixin:
             "get_dummy_player_ids_from_df": patch("trainer.trainer.get_dummy_player_ids_from_df", return_value=set()),
             "ensure_profile": patch("trainer.trainer.ensure_player_profile_ready"),
             "load_profile": patch("trainer.trainer.load_player_profile", return_value=None),
-            "process_chunk": patch("trainer.trainer.process_chunk", return_value="fake.parquet"),
+            "process_chunk": patch("trainer.trainer.process_chunk", return_value=tmp_parquet),
             "read_parquet": patch("trainer.trainer.pd.read_parquet", return_value=fake_df),
             "train_dual_model": patch("trainer.trainer.train_single_rated_model",
                                      return_value=({"model": None, "threshold": 0.5, "features": []}, None, {})),
             "save_bundle": patch("trainer.trainer.save_artifact_bundle"),
-            "path_stat": patch(
-                "trainer.trainer.Path",
-                **{
-                    "return_value.stat.return_value.st_size": 500,
-                    "return_value.exists.return_value": True,
-                    "return_value.is_file.return_value": True,
-                },
-            ),
             "oom_check_after_chunk1": patch("trainer.trainer._oom_check_after_chunk1", return_value=0.5),
         }
 
         with (
+            patches["cross_entry_preflight"],
+            patches["step7_duckdb"],
+            patches["step7_keep_disk"],
             patches["get_monthly_chunks"],
             patches["load_local_parquet"],
             patches["apply_dq"],
@@ -137,7 +152,6 @@ class _PipelineMixin:
             patches["read_parquet"],
             patches["train_dual_model"],
             patches["save_bundle"],
-            patches["path_stat"],
             patches["oom_check_after_chunk1"],
         ):
             start_date = chunks[0]["window_start"].strftime("%Y-%m-%d")
@@ -201,10 +215,9 @@ class TestRecentChunksPropagation(_PipelineMixin, unittest.TestCase):
 
     def test_process_chunk_called_once_for_one_chunk(self):
         result = self._run_pipeline_with_mocks()
-        # With NEG_SAMPLE_FRAC_AUTO, pipeline runs OOM probe (chunk 1 with frac=1.0) then processes
-        # chunk 1 again with effective frac → 2 process_chunk calls for recent_chunks=1.
-        self.assertEqual(result["mock_proc_call_count"], 2,
-                         "With recent_chunks=1, expect 2 calls (OOM probe + actual chunk) when NEG_SAMPLE_FRAC_AUTO.")
+        # NEG_SAMPLE_FRAC_AUTO defaults False (OOM policy GitHub #10): no chunk-1 OOM probe.
+        self.assertEqual(result["mock_proc_call_count"], 1,
+                         "With recent_chunks=1 and NEG_SAMPLE_FRAC_AUTO=False, expect one process_chunk per chunk.")
 
 
 # ---------------------------------------------------------------------------

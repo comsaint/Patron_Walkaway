@@ -139,6 +139,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("trainer")
 
+_PIPELINE_ECHO_PREFIX = "[Pipeline]"
+
+
+def pipeline_echo(msg: str) -> None:
+    """Single-line stdout milestone for operators (keep detailed logs on ``logger``)."""
+    print(f"{_PIPELINE_ECHO_PREFIX} {msg}", flush=True)
+
 # MLflow namespace: keep this project isolated on shared tracking server.
 # Override via credential/mlflow.env (MLFLOW_EXPERIMENT_TRAIN).
 MLFLOW_EXPERIMENT_TRAIN = (
@@ -183,7 +190,7 @@ try:
     THRESHOLD_MIN_RECALL: Optional[float] = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_FBETA: float = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
     NEG_SAMPLE_FRAC: float = getattr(_cfg, "NEG_SAMPLE_FRAC", 1.0)
-    NEG_SAMPLE_FRAC_AUTO: bool = getattr(_cfg, "NEG_SAMPLE_FRAC_AUTO", True)
+    NEG_SAMPLE_FRAC_AUTO: bool = getattr(_cfg, "NEG_SAMPLE_FRAC_AUTO", False)
     NEG_SAMPLE_FRAC_MIN: float = getattr(_cfg, "NEG_SAMPLE_FRAC_MIN", 0.05)
     NEG_SAMPLE_FRAC_ASSUMED_POS_RATE: float = getattr(_cfg, "NEG_SAMPLE_FRAC_ASSUMED_POS_RATE", 0.15)
     NEG_SAMPLE_RAM_SAFETY: float = getattr(_cfg, "NEG_SAMPLE_RAM_SAFETY", 0.75)
@@ -248,7 +255,7 @@ except ModuleNotFoundError:
     THRESHOLD_MIN_RECALL = getattr(_cfg, "THRESHOLD_MIN_RECALL", 0.01)
     THRESHOLD_FBETA = getattr(_cfg, "THRESHOLD_FBETA", 0.5)
     NEG_SAMPLE_FRAC = getattr(_cfg, "NEG_SAMPLE_FRAC", 1.0)
-    NEG_SAMPLE_FRAC_AUTO = getattr(_cfg, "NEG_SAMPLE_FRAC_AUTO", True)
+    NEG_SAMPLE_FRAC_AUTO = getattr(_cfg, "NEG_SAMPLE_FRAC_AUTO", False)
     NEG_SAMPLE_FRAC_MIN = getattr(_cfg, "NEG_SAMPLE_FRAC_MIN", 0.05)
     NEG_SAMPLE_FRAC_ASSUMED_POS_RATE = getattr(_cfg, "NEG_SAMPLE_FRAC_ASSUMED_POS_RATE", 0.15)
     NEG_SAMPLE_RAM_SAFETY = getattr(_cfg, "NEG_SAMPLE_RAM_SAFETY", 0.75)
@@ -1712,7 +1719,7 @@ def _oom_check_and_adjust_neg_sample_frac(
     begins.
 
     Logic:
-    1. Skip if NEG_SAMPLE_FRAC_AUTO is False.
+    1. Skip if NEG_SAMPLE_FRAC_AUTO is False (default; GitHub #10 owns chunk-path OOM policy).
     2. Try psutil for available RAM; skip gracefully if not installed.
     3. Estimate per-chunk on-disk size from cached chunk Parquets (if any),
        otherwise fall back to NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT.
@@ -1740,7 +1747,6 @@ def _oom_check_and_adjust_neg_sample_frac(
         total_ram = _vmem.total
     except Exception as _e:
         logger.warning("OOM-check: psutil unavailable (%s); skipping RAM pre-check.", _e)
-        print("[OOM-check] psutil unavailable; skipping RAM pre-check.", flush=True)
         return current_frac
 
     # R-NEG-4: validate ASSUMED_POS_RATE is in (0, 1) before using in formula.
@@ -1785,15 +1791,6 @@ def _oom_check_and_adjust_neg_sample_frac(
 
     # R-NEG-3/5: include total RAM alongside available so operators can judge
     # whether "available" is temporarily low (e.g. OS cache) vs genuinely tight.
-    print(
-        f"[OOM-check] {n_chunks} chunk(s) × {per_chunk_bytes / (1024**2):.0f} MB"
-        f" × {CHUNK_CONCAT_RAM_FACTOR}x factor"
-        f" → est. Step 7 peak RAM {estimated_peak_ram / (1024**3):.1f} GB"
-        f" | total {total_ram / (1024**3):.1f} GB | available {available_ram / (1024**3):.1f} GB"
-        f" | budget ({NEG_SAMPLE_RAM_SAFETY:.0%}) {ram_budget / (1024**3):.1f} GB"
-        f"  [{size_source}]",
-        flush=True,
-    )
     logger.info(
         "OOM-check: %d chunks est. peak %.1f GB  total %.1f GB  available %.1f GB  budget %.1f GB  (%s)",
         n_chunks,
@@ -1805,18 +1802,11 @@ def _oom_check_and_adjust_neg_sample_frac(
     )
 
     if estimated_peak_ram <= ram_budget:
-        print("[OOM-check] RAM looks OK - no adjustment to NEG_SAMPLE_FRAC.", flush=True)
         logger.info("OOM-check: peak %.1f GB <= budget %.1f GB -- no adjustment", estimated_peak_ram / (1024**3), ram_budget / (1024**3))
         return current_frac
 
     # OOM is likely.
     if current_frac < 1.0:
-        print(
-            f"[OOM-check] WARNING: estimated peak {estimated_peak_ram / (1024**3):.1f} GB"
-            f" > budget {ram_budget / (1024**3):.1f} GB, but NEG_SAMPLE_FRAC={current_frac:.2f}"
-            f" is already user-configured — not overriding. Consider lowering it further.",
-            flush=True,
-        )
         logger.warning(
             "OOM-check: est. peak %.1f GB > budget %.1f GB but NEG_SAMPLE_FRAC=%.2f is user-set — not overriding",
             estimated_peak_ram / (1024**3), ram_budget / (1024**3), current_frac,
@@ -1832,19 +1822,16 @@ def _oom_check_and_adjust_neg_sample_frac(
     auto_frac = max(NEG_SAMPLE_FRAC_MIN, min(1.0, raw_frac))
 
     _warn_floor = raw_frac < NEG_SAMPLE_FRAC_MIN
-    print(
-        f"[OOM-check] *** OOM RISK: est. peak {estimated_peak_ram / (1024**3):.1f} GB"
-        f" > budget {ram_budget / (1024**3):.1f} GB ***\n"
-        f"  Auto-adjusting NEG_SAMPLE_FRAC: 1.0 → {auto_frac:.2f}"
-        f"  (assumed pos_rate={p:.0%}, floor={NEG_SAMPLE_FRAC_MIN})"
-        + (f"\n  *** Floor hit: even frac={NEG_SAMPLE_FRAC_MIN} may not be enough —"
-           f" consider reducing --days / --recent-chunks ***" if _warn_floor else "")
-        + "\n  To disable: set NEG_SAMPLE_FRAC_AUTO=False in config.py",
-        flush=True,
-    )
     logger.warning(
-        "OOM-check: auto-adjusting NEG_SAMPLE_FRAC 1.0 -> %.2f  (peak %.1f GB > budget %.1f GB)",
-        auto_frac, estimated_peak_ram / (1024**3), ram_budget / (1024**3),
+        "OOM-check: auto-adjusting NEG_SAMPLE_FRAC 1.0 -> %.2f  (peak %.1f GB > budget %.1f GB)%s",
+        auto_frac,
+        estimated_peak_ram / (1024**3),
+        ram_budget / (1024**3),
+        (
+            f"; floor hit at NEG_SAMPLE_FRAC_MIN={NEG_SAMPLE_FRAC_MIN} — consider fewer --days/--recent-chunks"
+            if _warn_floor
+            else ""
+        ),
     )
     return auto_frac
 
@@ -1884,29 +1871,16 @@ def _oom_check_after_chunk1(
         estimated_peak_ram = estimated_on_disk * CHUNK_CONCAT_RAM_FACTOR * (1.0 + TRAIN_SPLIT_FRAC)
     ram_budget = available_ram * NEG_SAMPLE_RAM_SAFETY
 
-    print(
-        f"[OOM-check (chunk 1 size)] {n_chunks} chunk(s) x {per_chunk_bytes / (1024**2):.0f} MB"
-        f" -> est. Step 7 peak RAM {estimated_peak_ram / (1024**3):.1f} GB"
-        f" | budget {ram_budget / (1024**3):.1f} GB",
-        flush=True,
-    )
     logger.info(
         "OOM-check (chunk 1 size): %d chunks x %.0f MB -> est. peak %.1f GB  budget %.1f GB",
         n_chunks, per_chunk_bytes / (1024**2), estimated_peak_ram / (1024**3), ram_budget / (1024**3),
     )
 
     if estimated_peak_ram <= ram_budget:
-        print("[OOM-check (chunk 1 size)] RAM looks OK - no adjustment.", flush=True)
         logger.info("OOM-check (chunk 1 size): peak <= budget — no adjustment")
         return current_frac
 
     if current_frac < 1.0:
-        print(
-            f"[OOM-check (chunk 1 size)] WARNING: est. peak {estimated_peak_ram / (1024**3):.1f} GB"
-            f" > budget {ram_budget / (1024**3):.1f} GB, but NEG_SAMPLE_FRAC={current_frac:.2f}"
-            " is user-configured — not overriding.",
-            flush=True,
-        )
         logger.warning(
             "OOM-check (chunk 1 size): est. peak > budget but NEG_SAMPLE_FRAC=%.2f is user-set — not overriding",
             current_frac,
@@ -1917,15 +1891,12 @@ def _oom_check_after_chunk1(
     raw_frac = (needed_factor - p) / (1.0 - p)
     auto_frac = max(NEG_SAMPLE_FRAC_MIN, min(1.0, raw_frac))
     _warn_floor = raw_frac < NEG_SAMPLE_FRAC_MIN
-    print(
-        f"[OOM-check (chunk 1 size)] *** OOM RISK *** Auto-adjusting NEG_SAMPLE_FRAC: 1.0 -> {auto_frac:.2f}"
-        f"  (assumed pos_rate={p:.0%}, floor={NEG_SAMPLE_FRAC_MIN})"
-        + (f"\n  *** Floor hit: frac={NEG_SAMPLE_FRAC_MIN} may not be enough ***" if _warn_floor else ""),
-        flush=True,
-    )
     logger.warning(
-        "OOM-check (chunk 1 size): auto-adjusting NEG_SAMPLE_FRAC 1.0 -> %.2f  (peak %.1f GB > budget %.1f GB)",
-        auto_frac, estimated_peak_ram / (1024**3), ram_budget / (1024**3),
+        "OOM-check (chunk 1 size): auto-adjusting NEG_SAMPLE_FRAC 1.0 -> %.2f  (peak %.1f GB > budget %.1f GB)%s",
+        auto_frac,
+        estimated_peak_ram / (1024**3),
+        ram_budget / (1024**3),
+        "; floor hit — consider fewer chunks" if _warn_floor else "",
     )
     return auto_frac
 
@@ -2635,12 +2606,6 @@ def process_chunk(
             window_start.date(), window_end.date(),
             neg_sample_frac, _n_total_before_sample, len(labeled),
             _n_pos_before_sample, _n_neg_before, len(_neg_keep),
-        )
-        print(
-            "  [neg-sample] chunk %s–%s: %d -> %d rows (neg %.0f%%, pos all kept)"
-            % (window_start.date(), window_end.date(),
-               _n_total_before_sample, len(labeled), neg_sample_frac * 100),
-            flush=True,
         )
         # R-NEG-7: guard against extreme frac values that remove all negatives.
         if int((labeled["label"] == 0).sum()) == 0:
@@ -7390,6 +7355,9 @@ def build_model_metadata_document(
     identity_mapping_mode: str = "cutoff_window",
     t_game_features_enabled: bool = False,
     t_game_visible_time_column: str = "none",
+    l2_snapshot_id: Optional[str] = None,
+    source_snapshot_id: Optional[str] = None,
+    l2_training_bundle_dir: Optional[str] = None,
 ) -> dict[str, Any]:
     """Assemble ``model_metadata.json`` payload (versioned schema v1)."""
     def _iso_any(x: Any) -> Any:
@@ -7402,7 +7370,14 @@ def build_model_metadata_document(
     _test_frac = max(0.0, 1.0 - float(TRAIN_SPLIT_FRAC) - float(VALID_SPLIT_FRAC))
     _rated = (combined_metrics or {}).get("rated") if isinstance(combined_metrics, dict) else None
     _rated_d = _rated if isinstance(_rated, dict) else {}
-    return {
+    _lineage: dict[str, Any] = {}
+    if l2_snapshot_id:
+        _lineage["l2_snapshot_id"] = str(l2_snapshot_id)
+    if source_snapshot_id:
+        _lineage["source_snapshot_id"] = str(source_snapshot_id)
+    if l2_training_bundle_dir:
+        _lineage["l2_training_bundle_dir"] = str(l2_training_bundle_dir)
+    _out: dict[str, Any] = {
         "schema_version": "v1",
         "model_version": model_version,
         "git_commit": _git_commit_short_or_nogit(),
@@ -7479,6 +7454,9 @@ def build_model_metadata_document(
             "model_metadata_path": str((bundle_dir / "model_metadata.json").resolve()),
         },
     }
+    if _lineage:
+        _out["lineage"] = _lineage
+    return _out
 
 
 # ---------------------------------------------------------------------------
@@ -7832,6 +7810,9 @@ def _write_pipeline_diagnostics_json(
     duckdb_runtime_track_llm_memory_gb: Optional[float] = None,
     duckdb_runtime_track_llm_threads: Optional[int] = None,
     chunk_cache_stats: Optional[Dict[str, int]] = None,
+    issue16_audit: Optional[Mapping[str, Any]] = None,
+    oom_estimate_strategy: Optional[str] = None,
+    l2_split_parquet_total_bytes: Optional[int] = None,
     output_dir: Optional[Path] = None,
 ) -> None:
     """Write resource/timing diagnostics to ``output_dir/pipeline_diagnostics.json`` (omit None keys).
@@ -7843,6 +7824,13 @@ def _write_pipeline_diagnostics_json(
 
     ``chunk_cache_stats``: optional Step 6 cache counters from :func:`process_chunk`
     (keys ``step6_chunk_cache_*``) for Task 7 DoD / hit-ratio analysis.
+
+    ``issue16_audit``: optional GitHub #16 gate bundle (split / label / metric semantics).
+
+    ``oom_estimate_strategy``: when using L2 split-bytes OOM model (TRN-16-04), set to
+    ``l2_train_valid_test_parquet_bytes`` (see ``l2_trainer_contracts``).
+
+    ``l2_split_parquet_total_bytes``: total on-disk bytes for train/valid/test split parquets.
     """
     payload: dict[str, Any] = {
         "model_version": model_version,
@@ -7887,6 +7875,12 @@ def _write_pipeline_diagnostics_json(
         for _ck, _cv in chunk_cache_stats.items():
             if _cv is not None:
                 out[_ck] = _cv
+    if issue16_audit is not None:
+        out["issue16_audit"] = dict(issue16_audit)
+    if oom_estimate_strategy is not None:
+        out["oom_estimate_strategy"] = oom_estimate_strategy
+    if l2_split_parquet_total_bytes is not None:
+        out["l2_split_parquet_total_bytes"] = int(l2_split_parquet_total_bytes)
     _dir = output_dir if output_dir is not None else MODEL_DIR
     (_dir / "pipeline_diagnostics.json").write_text(
         json.dumps(out, indent=2, default=str),
@@ -7946,12 +7940,6 @@ def run_pipeline(args) -> None:
     # Log the config-file NEG_SAMPLE_FRAC at startup.  The OOM pre-check (run
     # after Step 1) may further lower this to _effective_neg_sample_frac.
     if NEG_SAMPLE_FRAC < 1.0:
-        print(
-            f"[Config] NEG_SAMPLE_FRAC={NEG_SAMPLE_FRAC:.2f}: "
-            f"negatives will be downsampled to {NEG_SAMPLE_FRAC * 100:.0f}% per chunk "
-            f"(OOM mitigation — positives always kept in full)",
-            flush=True,
-        )
         logger.info(
             "NEG_SAMPLE_FRAC=%.2f (config): negatives downsampled per chunk (OOM mitigation)",
             NEG_SAMPLE_FRAC,
@@ -7962,9 +7950,14 @@ def run_pipeline(args) -> None:
     # Issue #14 / WS4 v2: bridge manifest + ClickHouse preflight via shared hook.
     from trainer.training.cross_entry_preflight import run_cross_entry_data_preflight
 
+    _pf0 = time.perf_counter()
+    pipeline_echo(
+        "Preflight — data source (local Parquet bridge readiness or ClickHouse connectivity) …"
+    )
     run_cross_entry_data_preflight(
         entry="trainer", use_local_parquet=bool(use_local), logger=logger
     )
+    pipeline_echo(f"Preflight — done in {time.perf_counter() - _pf0:.1f}s")
 
     # Auto-adjust window to actual data end when using local Parquet without
     # explicit --start/--end, so --recent-chunks is relative to data, not today.
@@ -7990,6 +7983,7 @@ def run_pipeline(args) -> None:
             )
 
     logger.info("Training window: %s -> %s  (local=%s)", start.date(), end.date(), use_local)
+    pipeline_echo(f"Training window — {start.date()} → {end.date()} (local_parquet={use_local})")
 
     # Single model_version for this process: matches out/models/<model_version>/ and MLflow run_name.
     pipeline_model_version = get_model_version()
@@ -8045,14 +8039,34 @@ def run_pipeline(args) -> None:
             duckdb_runtime_track_llm_threads: Optional[int] = None
             # Task 7 DoD: Step 6 chunk cache counters -> pipeline_diagnostics.json
             chunk_cache_stats: Dict[str, int] = {}
+            issue16_gate_report: Optional[Dict[str, Any]] = None
+
+            _l2_bundle_arg = getattr(args, "l2_training_bundle", None)
+            if _l2_bundle_arg:
+                from trainer.training.pipeline_l2_bundle import execute_l2_training_bundle
+
+                pipeline_echo("L2 bundle path — Steps 1–7 skipped; loading bundle then Steps 8–10 …")
+                execute_l2_training_bundle(
+                    args=args,
+                    bundle_dir=Path(_l2_bundle_arg),
+                    pipeline_model_version=pipeline_model_version,
+                    pipeline_started_at_iso=pipeline_started_at_iso,
+                    pipeline_start=pipeline_start,
+                    use_local=use_local,
+                    skip_optuna=skip_optuna,
+                    sample_rated_n=sample_rated_n,
+                    pipeline_ranking_recipe=pipeline_ranking_recipe,
+                    pipeline_gbm_bakeoff=pipeline_gbm_bakeoff,
+                )
+                return
 
             # 1. Monthly chunks (DEC-008 / SSOT §4.3)
-            print("[Step 1/10] Training window and monthly chunks…", flush=True)
+            pipeline_echo("Step 1/10 — Training window and monthly chunks …")
             t0 = time.perf_counter()
             chunks = get_monthly_chunks(start, end)
             _el = time.perf_counter() - t0
             step1_duration_sec = _el
-            print("[Step 1/10] Training window and monthly chunks done in %.1fs" % _el, flush=True)
+            pipeline_echo(f"Step 1/10 — done in {_el:.1f}s ({len(chunks)} monthly chunks)")
             logger.info("Chunks: %d  (%.1fs)", len(chunks), _el)
         
             # Debug/test mode: limit to most recent N chunks so data loading from both
@@ -8120,12 +8134,12 @@ def run_pipeline(args) -> None:
             # 2. Chunk-level split — used ONLY to derive train_end for the canonical
             #    mapping cutoff (B1 / R25 identity-leakage guard).  The actual row
             #    assignment to train/valid/test happens later at row level (SSOT §9.2).
-            print("[Step 2/10] Chunk-level split (train_end derivation)…", flush=True)
+            pipeline_echo("Step 2/10 — Chunk-level split (train_end derivation) …")
             t0 = time.perf_counter()
             split = get_train_valid_test_split(chunks)
             _el = time.perf_counter() - t0
             step2_duration_sec = _el
-            print("[Step 2/10] Chunk-level split done in %.1fs" % _el, flush=True)
+            pipeline_echo(f"Step 2/10 — done in {_el:.1f}s")
             logger.info("Chunk-level split (train_end derivation): %.1fs", _el)
             train_end = (
                 max(c["window_end"] for c in split["train_chunks"])
@@ -8164,7 +8178,7 @@ def run_pipeline(args) -> None:
             #    identity links that arose after training from leaking into training data).
             #    Also get FND-12 dummy player_ids so we drop them from training (TRN-04).
             #    PLAN steps 4/7/8: local path may load from artifact; else DuckDB or pandas build; write after build.
-            print("[Step 3/10] Build canonical identity mapping…", flush=True)
+            pipeline_echo("Step 3/10 — Build canonical identity mapping …")
             t0 = time.perf_counter()
             logger.info("Building canonical identity mapping (cutoff=%s)…", train_end)
             dummy_player_ids: set = set()
@@ -8273,7 +8287,7 @@ def run_pipeline(args) -> None:
         
             _el = time.perf_counter() - t0
             step3_duration_sec = _el
-            print("[Step 3/10] Build canonical identity mapping done in %.1fs" % _el, flush=True)
+            pipeline_echo(f"Step 3/10 — done in {_el:.1f}s (canonical_map rows={len(canonical_map)})")
             logger.info(
                 "Canonical mapping: %d rows; FND-12 dummy player_ids to exclude: %d  (%.1fs)",
                 len(canonical_map), len(dummy_player_ids), _el,
@@ -8304,6 +8318,71 @@ def run_pipeline(args) -> None:
                     json.dump(_sidecar_data, _sf, indent=0)
             except Exception as _side_exc:
                 logger.warning("Could not update canonical_mapping.cutoff.json sidecar (%s)", _side_exc)
+
+            # GitHub #17: auto L2 bundle cache — skip Steps 4–10 chunk path when bundle matches inputs.
+            _auto_l2 = (
+                use_local
+                and getattr(args, "l2_auto_from_local", False)
+                and not getattr(args, "legacy_chunk_mode", False)
+                and not getattr(args, "l2_training_bundle", None)
+                and not getattr(args, "no_l2_auto_bundle", False)
+            )
+            if _auto_l2:
+                from trainer.training.l2_bundle_materialize import (
+                    auto_bundle_cache_is_current,
+                    bridge_manifest_stat_token,
+                    build_auto_l2_cache_key,
+                    default_auto_bundle_dir,
+                    fingerprint_feature_spec,
+                    read_bridge_source_snapshot_id,
+                )
+                from trainer.training.pipeline_l2_bundle import execute_l2_training_bundle
+
+                _snap_early = read_bridge_source_snapshot_id()
+                if _snap_early:
+                    _raw_dir = getattr(args, "l2_auto_bundle_dir", None)
+                    _bundle_dir_early = Path(_raw_dir) if _raw_dir else default_auto_bundle_dir()
+                    _ws_e = (
+                        effective_start.isoformat()
+                        if hasattr(effective_start, "isoformat")
+                        else str(effective_start)
+                    )
+                    _we_e = (
+                        effective_end.isoformat()
+                        if hasattr(effective_end, "isoformat")
+                        else str(effective_end)
+                    )
+                    _expected_key = build_auto_l2_cache_key(
+                        bridge_manifest_stat=bridge_manifest_stat_token(),
+                        window_start_iso=_ws_e,
+                        window_end_iso=_we_e,
+                        recent_chunks=recent_chunks,
+                        train_split_frac=float(TRAIN_SPLIT_FRAC),
+                        valid_split_frac=float(VALID_SPLIT_FRAC),
+                        neg_sample_frac_config=float(NEG_SAMPLE_FRAC),
+                        feature_spec_fingerprint=fingerprint_feature_spec(FEATURE_SPEC_PATH),
+                        rebuild_canonical_mapping=bool(getattr(args, "rebuild_canonical_mapping", False)),
+                        identity_mapping_mode=str(effective_identity_mode),
+                        force_recompute=bool(force),
+                    )
+                    if auto_bundle_cache_is_current(bundle_dir=_bundle_dir_early, expected_key=_expected_key):
+                        pipeline_echo(
+                            f"Step L2-cache — hit at {_bundle_dir_early}; skipping Steps 4–10 (chunk path), "
+                            "running L2 Steps 8–10 …"
+                        )
+                        execute_l2_training_bundle(
+                            args=args,
+                            bundle_dir=_bundle_dir_early,
+                            pipeline_model_version=pipeline_model_version,
+                            pipeline_started_at_iso=pipeline_started_at_iso,
+                            pipeline_start=pipeline_start,
+                            use_local=use_local,
+                            skip_optuna=skip_optuna,
+                            sample_rated_n=sample_rated_n,
+                            pipeline_ranking_recipe=pipeline_ranking_recipe,
+                            pipeline_gbm_bakeoff=pipeline_gbm_bakeoff,
+                        )
+                        return
         
             # Rated-patron sampling is an independent option controlled by --sample-rated N.
             rated_whitelist: Optional[set] = None
@@ -8323,7 +8402,7 @@ def run_pipeline(args) -> None:
         
             # 3b. Auto-check local player_profile freshness and backfill missing
             #     ranges before training starts (one-command flow, OOM-safe helper).
-            print("[Step 4/10] Ensure player_profile ready (backfill if needed)…", flush=True)
+            pipeline_echo("Step 4/10 — Ensure player_profile ready (backfill if needed) …")
             t0 = time.perf_counter()
             ensure_player_profile_ready(
                 effective_start,
@@ -8337,7 +8416,7 @@ def run_pipeline(args) -> None:
             )
             _el = time.perf_counter() - t0
             step4_duration_sec = _el
-            print("[Step 4/10] Ensure player_profile ready done in %.1fs" % _el, flush=True)
+            pipeline_echo(f"Step 4/10 — done in {_el:.1f}s")
             logger.info("ensure_player_profile_ready: %.1fs", _el)
         
             # 3c. Load player_profile once for the entire training window (PLAN Step 4).
@@ -8354,7 +8433,7 @@ def run_pipeline(args) -> None:
                     else []
                 )
             )
-            print("[Step 5/10] Load player_profile for PIT join…", flush=True)
+            pipeline_echo("Step 5/10 — Load player_profile for PIT join …")
             t0 = time.perf_counter()
             profile_df = load_player_profile(
                 effective_start,
@@ -8365,10 +8444,10 @@ def run_pipeline(args) -> None:
             _el = time.perf_counter() - t0
             step5_duration_sec = _el
             if profile_df is not None:
-                print("[Step 5/10] Load player_profile done in %.1fs (%d rows)" % (_el, len(profile_df)), flush=True)
+                pipeline_echo(f"Step 5/10 — done in {_el:.1f}s ({len(profile_df)} profile rows)")
                 logger.info("player_profile: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), _el)
             else:
-                print("[Step 5/10] Load player_profile done in %.1fs (not available)" % _el, flush=True)
+                pipeline_echo(f"Step 5/10 — done in {_el:.1f}s (profile not available)")
                 logger.info("player_profile: not available — profile features will be NaN (%.1fs)", _el)
         
             feature_spec = load_feature_spec(FEATURE_SPEC_PATH)
@@ -8388,9 +8467,8 @@ def run_pipeline(args) -> None:
             _neg_sample_note = (
                 f"  neg-sample={_effective_neg_sample_frac:.2f}" if _effective_neg_sample_frac < 1.0 else ""
             )
-            print(
-                f"[Step 6/10] Process chunks (DQ, labels, Track Human, Track LLM){_neg_sample_note}…",
-                flush=True,
+            pipeline_echo(
+                f"Step 6/10 — Process chunks (DQ, labels, Track Human, Track LLM){_neg_sample_note} …"
             )
             t0 = time.perf_counter()
             chunk_paths: List[Path] = []
@@ -8403,7 +8481,7 @@ def run_pipeline(args) -> None:
             try:
                 if NEG_SAMPLE_FRAC_AUTO and len(chunks) > 0:
                     # OOM probe: process chunk 1 with frac=1.0, then decide effective frac.
-                    print("[Step 6/10] OOM probe: chunk 1 with neg_sample_frac=1.0…", flush=True)
+                    pipeline_echo("Step 6/10 — OOM probe: processing chunk 1 with neg_sample_frac=1.0 …")
                     logger.info("OOM probe: processing chunk 1 with neg_sample_frac=1.0")
                     path1 = process_chunk(
                         chunks[0],
@@ -8515,7 +8593,7 @@ def run_pipeline(args) -> None:
         
             _el = time.perf_counter() - t0
             step6_duration_sec = _el
-            print("[Step 6/10] Process chunks done in %.1fs (%d chunks)" % (_el, len(chunk_paths)), flush=True)
+            pipeline_echo(f"Step 6/10 — done in {_el:.1f}s ({len(chunk_paths)} chunk parquet files)")
             logger.info("Process chunks: %d produced  (%.1fs)", len(chunk_paths), _el)
             if not chunk_paths:
                 raise SystemExit("No chunks produced any usable data — check data source / time window")
@@ -9111,7 +9189,7 @@ def run_pipeline(args) -> None:
                 # If psutil is unavailable, still tag so MLflow run can be diagnosed.
                 log_tags_safe({"memory_sampling": "disabled_no_psutil"})
 
-            print("[Step 7/10] Load all chunks, concat, row-level train/valid/test split…", flush=True)
+            pipeline_echo("Step 7/10 — Load chunks, concat, row-level train/valid/test split …")
             t0 = time.perf_counter()
             _chunk_total_bytes = sum(Path(p).stat().st_size for p in chunk_paths)
             _est_ram_gb = (_chunk_total_bytes * CHUNK_CONCAT_RAM_FACTOR) / (1024**3)
@@ -9239,6 +9317,28 @@ def run_pipeline(args) -> None:
                     cast(pd.DataFrame, test_df),
                     rated_only=True,
                 )
+            try:
+                from trainer.training.issue16_gates import (
+                    evaluate_issue16_gate_bundle,
+                    raise_if_strict_issue16_gates_failed,
+                )
+                from trainer.training.l2_trainer_contracts import TRAIN_END_SOURCE_CHUNK_SPLIT
+
+                issue16_gate_report = evaluate_issue16_gate_bundle(
+                    effective_neg_sample_frac=float(_effective_neg_sample_frac),
+                    chunk_train_end_naive=train_end,
+                    row_level_train_end_max=_actual_train_end,
+                    train_end_source=TRAIN_END_SOURCE_CHUNK_SPLIT,
+                    l2_snapshot_id=None,
+                    label_asset_meta=None,
+                    training_source_snapshot_id=None,
+                    split_flags=None,
+                )
+                raise_if_strict_issue16_gates_failed(issue16_gate_report)
+            except RuntimeError:
+                raise
+            except Exception as _i16_exc:
+                logger.warning("Issue #16 gate evaluation failed (non-fatal): %s", _i16_exc)
             _train_cols = (
                 train_df.columns
                 if train_df is not None
@@ -9283,7 +9383,9 @@ def run_pipeline(args) -> None:
             _n_test_print = _n_test if test_df is None else len(test_df)
             _el = time.perf_counter() - t0
             step7_duration_sec = _el
-            print("[Step 7/10] Load all chunks, concat, row-level split done in %.1fs (train=%d valid=%d test=%d)" % (_el, _n_train_print, _n_valid_print, _n_test_print), flush=True)
+            pipeline_echo(
+                f"Step 7/10 — done in {_el:.1f}s (train={_n_train_print} valid={_n_valid_print} test={_n_test_print})"
+            )
             logger.info(
                 "Row-level split (%.0f/%.0f/%.0f) — train: %d  valid: %d  test: %d  (load+sort+split: %.1fs)",
                 TRAIN_SPLIT_FRAC * 100,
@@ -9305,6 +9407,86 @@ def run_pipeline(args) -> None:
                     "backtester metrics will be unreliable.",
                     _n_test_print, MIN_VALID_TEST_ROWS,
                 )
+
+            # GitHub #17: materialize L2 bundle from Step 7 outputs, then train via L2 path (skip chunk 8–10).
+            _auto_l2_post7 = (
+                use_local
+                and getattr(args, "l2_auto_from_local", False)
+                and not getattr(args, "legacy_chunk_mode", False)
+                and not getattr(args, "l2_training_bundle", None)
+                and not getattr(args, "no_l2_auto_bundle", False)
+            )
+            if _auto_l2_post7:
+                from trainer.training.l2_bundle_materialize import (
+                    build_auto_l2_cache_key,
+                    bridge_manifest_stat_token,
+                    default_auto_bundle_dir,
+                    fingerprint_feature_spec,
+                    materialize_l2_training_bundle_dir,
+                    read_bridge_source_snapshot_id,
+                    touch_bundle_built_at,
+                )
+                from trainer.training.pipeline_l2_bundle import execute_l2_training_bundle
+
+                _src_snap = read_bridge_source_snapshot_id() or "local_parquet_no_bridge_manifest"
+                _raw_out = getattr(args, "l2_auto_bundle_dir", None)
+                _bundle_out = Path(_raw_out) if _raw_out else default_auto_bundle_dir()
+                _ws_m = (
+                    effective_start.isoformat()
+                    if hasattr(effective_start, "isoformat")
+                    else str(effective_start)
+                )
+                _we_m = (
+                    effective_end.isoformat()
+                    if hasattr(effective_end, "isoformat")
+                    else str(effective_end)
+                )
+                _cache_key = build_auto_l2_cache_key(
+                    bridge_manifest_stat=bridge_manifest_stat_token(),
+                    window_start_iso=_ws_m,
+                    window_end_iso=_we_m,
+                    recent_chunks=recent_chunks,
+                    train_split_frac=float(TRAIN_SPLIT_FRAC),
+                    valid_split_frac=float(VALID_SPLIT_FRAC),
+                    neg_sample_frac_config=float(NEG_SAMPLE_FRAC),
+                    feature_spec_fingerprint=fingerprint_feature_spec(FEATURE_SPEC_PATH),
+                    rebuild_canonical_mapping=bool(getattr(args, "rebuild_canonical_mapping", False)),
+                    identity_mapping_mode=str(effective_identity_mode),
+                    force_recompute=bool(force),
+                )
+                materialize_l2_training_bundle_dir(
+                    _bundle_out,
+                    train_df=train_df,
+                    valid_df=valid_df,
+                    test_df=test_df,
+                    train_path=step7_train_path,
+                    valid_path=step7_valid_path,
+                    test_path=step7_test_path,
+                    source_snapshot_id=_src_snap,
+                    train_end=train_end,
+                    window_start=effective_start,
+                    window_end=effective_end,
+                    identity_mapping_mode=str(effective_identity_mode),
+                    train_sampling_applied=float(_effective_neg_sample_frac) < 1.0,
+                    cache_key=_cache_key,
+                )
+                touch_bundle_built_at(_bundle_out)
+                pipeline_echo(
+                    f"Step L2-materialize — bundle written to {_bundle_out}; running L2 Steps 8–10 …"
+                )
+                execute_l2_training_bundle(
+                    args=args,
+                    bundle_dir=_bundle_out,
+                    pipeline_model_version=pipeline_model_version,
+                    pipeline_started_at_iso=pipeline_started_at_iso,
+                    pipeline_start=pipeline_start,
+                    use_local=use_local,
+                    skip_optuna=skip_optuna,
+                    sample_rated_n=sample_rated_n,
+                    pipeline_ranking_recipe=pipeline_ranking_recipe,
+                    pipeline_gbm_bakeoff=pipeline_gbm_bakeoff,
+                )
+                return
         
             active_feature_cols = get_all_candidate_feature_ids(feature_spec, screening_only=True)
         
@@ -9336,7 +9518,7 @@ def run_pipeline(args) -> None:
                 )
                 # R1004: restrict active_feature_cols to columns actually present in train.
                 active_feature_cols = [c for c in active_feature_cols if c in _train_cols]
-                print("[Step 8/10] Feature screening skipped (no candidates)", flush=True)
+                pipeline_echo("Step 8/10 — Feature screening skipped (no candidates in train)")
             else:
                 # PLAN 方案 B 策略 A / B+ Stage 2: use sample from memory or from file (_train_for_screen from _read_parquet_head when on disk).
                 # Step 8 DuckDB std (PLAN): pass train_path or train_df so zv is computed on full data via DuckDB; keep _matrix_for_screen as sample to avoid OOM in corr/MI/LGBM.
@@ -9445,7 +9627,7 @@ def run_pipeline(args) -> None:
                     )
                     duckdb_runtime_screening_threads = int(_screen_policy["threads"])
                 step8_screened_feature_count = None
-                print("[Step 8/10] Feature screening…", flush=True)
+                pipeline_echo("Step 8/10 — Feature screening …")
                 t0 = time.perf_counter()
                 screened_cols = screen_features(
                     feature_matrix=_matrix_for_screen,
@@ -9458,7 +9640,9 @@ def run_pipeline(args) -> None:
                 _el = time.perf_counter() - t0
                 step8_duration_sec = _el
                 step8_screened_feature_count = len(screened_cols)
-                print("[Step 8/10] Feature screening done in %.1fs (%d -> %d features)" % (_el, len(_present_candidate_cols), len(screened_cols)), flush=True)
+                pipeline_echo(
+                    f"Step 8/10 — done in {_el:.1f}s ({len(_present_candidate_cols)} → {len(screened_cols)} features)"
+                )
                 logger.info(
                     "screen_features: %d -> %d features retained  (%.1fs)",
                     len(_present_candidate_cols), len(screened_cols), _el,
@@ -9520,7 +9704,9 @@ def run_pipeline(args) -> None:
                     "Cannot train any model. Check data quality and feature definitions."
                 )
                 logger.warning(msg)
-                print(msg, flush=True)
+                pipeline_echo(
+                    "Step 8/10 — warning: no usable features after screening; using placeholder 'bias' (see logs)."
+                )
                 _placeholder_col = "bias"  # constant feature for integration/debug runs (R1605: named via explicit variable)
                 if train_df is not None and _placeholder_col not in train_df.columns:
                     train_df[_placeholder_col] = 0.0
@@ -9541,16 +9727,12 @@ def run_pipeline(args) -> None:
                     _export_dir,
                     ranking_recipe=pipeline_ranking_recipe,
                 )
-                print(
-                    "[Plan B] Exported train/valid to %s and %s"
-                    % (_train_csv, _valid_csv),
-                    flush=True,
-                )
+                pipeline_echo(f"Step 9/10 — Plan B: exported train/valid CSV to {_train_csv} and {_valid_csv}")
         
             # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
             #    test_df is passed so test-set metrics and feature importance are
             #    computed immediately after training and included in the artifact.
-            print("[Step 9/10] Train rated GBM family (LGBM/CatBoost/XGBoost compare) + test-set eval…", flush=True)
+            pipeline_echo("Step 9/10 — Train rated GBM family + test-set eval …")
             t0 = time.perf_counter()
             model_version = pipeline_model_version
             _libsvm_paths = (_train_libsvm, _valid_libsvm) if (_train_libsvm is not None and _valid_libsvm is not None) else None
@@ -9571,7 +9753,7 @@ def run_pipeline(args) -> None:
             )
             _el = time.perf_counter() - t0
             step9_duration_sec = _el
-            print("[Step 9/10] Train rated GBM family + test-set eval done in %.1fs" % _el, flush=True)
+            pipeline_echo(f"Step 9/10 — done in {_el:.1f}s")
             logger.info("train_single_rated_model + A3 family compare + test eval: %.1fs", _el)
 
             # T12.2: capture RSS/sys RAM snapshot at Step 9 end (checkpoint scope Step 7-9).
@@ -9605,7 +9787,7 @@ def run_pipeline(args) -> None:
             gc.collect()
         
             # 7. Save artifacts (versioned subdir under MODEL_DIR; see Priority 1 investigation plan).
-            print("[Step 10/10] Save artifact bundle…", flush=True)
+            pipeline_echo("Step 10/10 — Save artifact bundle …")
             t0 = time.perf_counter()
             _versions_root = MODEL_DIR
             _bundle_dir = safe_version_subdirectory(_versions_root, model_version)
@@ -9659,7 +9841,7 @@ def run_pipeline(args) -> None:
                 )
             _el = time.perf_counter() - t0
             step10_duration_sec = _el
-            print("[Step 10/10] Save artifact bundle done in %.1fs" % _el, flush=True)
+            pipeline_echo(f"Step 10/10 — done in {_el:.1f}s")
             logger.info("save_artifact_bundle: %.1fs", _el)
 
             # T13: Warm up MLflow (e.g. Cloud Run) before first log to reduce 503 on cold start.
@@ -9754,6 +9936,7 @@ def run_pipeline(args) -> None:
                     duckdb_runtime_track_llm_memory_gb=duckdb_runtime_track_llm_memory_gb,
                     duckdb_runtime_track_llm_threads=duckdb_runtime_track_llm_threads,
                     chunk_cache_stats=chunk_cache_stats,
+                    issue16_audit=issue16_gate_report,
                     output_dir=_bundle_dir,
                 )
             except Exception as _diag_exc:
@@ -9794,10 +9977,8 @@ def run_pipeline(args) -> None:
                         "(download model.pkl from this path in the run).",
                         _rel_model,
                     )
-                    print(
-                        f"[MLflow] Trained model artifact: {_rel_model} "
-                        f"(full bundle under {MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH}/)",
-                        flush=True,
+                    pipeline_echo(
+                        f"MLflow — model artifact {_rel_model} (bundle under {MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH}/)"
                     )
                 # Legacy UI path: small files under bundle/ (contract tests + existing dashboards).
                 _bundle_artifact_path = "bundle"
@@ -9812,7 +9993,7 @@ def run_pipeline(args) -> None:
                     if _ap.is_file():
                         log_artifact_safe(_ap, artifact_path=_bundle_artifact_path)
 
-            print("All steps completed. Pipeline total: %.1fs (%.1f min)" % (total_sec, total_sec / 60.0), flush=True)
+            pipeline_echo(f"Complete — chunk pipeline finished in {total_sec:.1f}s ({total_sec / 60.0:.1f} min)")
             logger.info("Pipeline total: %.1fs (%.1f min)", total_sec, total_sec / 60.0)
 
             # T12.2: Log training success metrics + per-step durations + Step 7–9 memory/OOM diagnostics to MLflow.
@@ -9888,7 +10069,17 @@ def run_pipeline(args) -> None:
                 "total_rows": n_rows,
                 "metrics": combined_metrics,
             }
-            print(json.dumps(summary, indent=2, default=str))
+            logger.debug("Training summary JSON: %s", json.dumps(summary, default=str))
+            pipeline_echo(
+                f"Summary — model_version={model_version} total_rows={n_rows} "
+                "(full JSON: logger DEBUG or TRAINER_SUMMARY_JSON_STDOUT=1)"
+            )
+            if os.environ.get("TRAINER_SUMMARY_JSON_STDOUT", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                print(json.dumps(summary, indent=2, default=str), flush=True)
         except Exception as e:
             log_tags_safe({"status": "FAILED", "error": str(e)[:500]})
             # T12 failure diagnostics (optional follow-on): log best-effort params for post-mortem.

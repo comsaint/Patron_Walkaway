@@ -21,6 +21,16 @@ Both functions are zero-side-effect pure (other than the warn helper's log
 emission). The legacy underscore aliases ``_precision_prod_adjusted`` and
 ``_warn_if_invalid_production_neg_pos_ratio`` are exported as re-bindings so
 older call sites in ``trainer.training.trainer`` keep working.
+
+GitHub #16 / raw valid–test metrics (2026-05)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+**Primary** validation / test reporting for PR-AUC, ROC-AUC, logloss, etc. must
+use the **empirical label distribution** of the full (unsampled) split rows.
+
+``precision_prod_adjusted`` is **not** a correction for train-time negative
+downsampling; it only maps precision under one neg/pos ratio to another
+(DEC-026).  Do not treat ``*_prod_adjusted`` as a substitute for fixing invalid
+valid/test sampling.  See ``trainer.training.issue16_gates`` and impl plan §11.
 """
 
 from __future__ import annotations

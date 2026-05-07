@@ -1,0 +1,385 @@
+"""End-to-end training from L2 pre-assembled split parquets (GitHub #16 TRN-16-03).
+
+Invoked from ``run_pipeline`` when ``--l2-training-bundle DIR`` is set.  Lazy-imports
+``trainer.training.trainer`` at call time to avoid import cycles.
+
+**RAM**: train/valid/test are loaded fully into memory (MVP).  Do not point at
+multi-GB parquets on laptops without sufficient RAM.
+"""
+
+from __future__ import annotations
+
+import gc
+import hashlib
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+
+def _t_game_enabled() -> bool:
+    """Read T_GAME_FEATURES_ENABLED from trainer config module (no trainer import cycles)."""
+    try:
+        import config as cfg_mod  # type: ignore[import]
+    except ModuleNotFoundError:
+        import trainer.config as cfg_mod  # type: ignore[import]
+    return bool(getattr(cfg_mod, "T_GAME_FEATURES_ENABLED", False))
+
+
+def execute_l2_training_bundle(
+    *,
+    args: Any,
+    bundle_dir: Path,
+    pipeline_model_version: str,
+    pipeline_started_at_iso: str,
+    pipeline_start: float,
+    use_local: bool,
+    skip_optuna: bool,
+    sample_rated_n: Optional[int],
+    pipeline_ranking_recipe: Any,
+    pipeline_gbm_bakeoff: bool,
+) -> None:
+    """Run Steps 8–10 from an L2 bundle (skip chunk Steps 1–6 and Step 7 merge)."""
+    import trainer.training.trainer as tr
+
+    from trainer.training.issue16_gates import (
+        evaluate_issue16_gate_bundle,
+        raise_if_strict_issue16_gates_failed,
+    )
+    from trainer.training.l2_trainer_contracts import (
+        KEY_L2_SNAPSHOT_ID,
+        KEY_TEST_FULL_UNSAMPLED,
+        KEY_TRAIN_SAMPLING_APPLIED,
+        KEY_VALID_FULL_UNSAMPLED,
+        TRAIN_END_SOURCE_L2_MANIFEST,
+    )
+    from trainer.training.l2_training_manifest import (
+        L2_TRAINING_BUNDLE_MANIFEST_FILE,
+        OOM_ESTIMATE_STRATEGY_L2_SPLIT_FILES,
+        estimate_step7_peak_ram_gb_from_split_bytes,
+        load_and_validate_bundle,
+        split_parquet_total_bytes,
+    )
+
+    if sample_rated_n is not None:
+        logger.warning(
+            "--sample-rated is ignored for --l2-training-bundle (pre-assembled splits)."
+        )
+    if getattr(args, "recent_chunks", None) is not None:
+        raise SystemExit("--recent-chunks is incompatible with --l2-training-bundle")
+
+    t_load = time.perf_counter()
+    manifest = load_and_validate_bundle(bundle_dir)
+    tr.pipeline_echo(
+        f"L2 bundle — manifest OK; loading splits from {bundle_dir} …"
+    )
+    train_df = pd.read_parquet(manifest.train_path)
+    valid_df = pd.read_parquet(manifest.valid_path)
+    test_df = pd.read_parquet(manifest.test_path)
+    step7_duration_sec = time.perf_counter() - t_load
+    tr.pipeline_echo(
+        f"Step 7/10 — L2 splits loaded in {step7_duration_sec:.1f}s "
+        f"(train={len(train_df)} valid={len(valid_df)} test={len(test_df)} rows)"
+    )
+
+    for name, df in ("train", train_df), ("valid", valid_df), ("test", test_df):
+        if "label" not in df.columns:
+            raise SystemExit(f"L2 bundle {name} parquet missing required column 'label'")
+        if "is_rated" not in df.columns:
+            logger.warning(
+                "L2 bundle %s: missing is_rated — defaulting all rows to True (rated-only training)",
+                name,
+            )
+            df["is_rated"] = True
+
+    effective_start = pd.Timestamp(manifest.window_start).to_pydatetime()
+    effective_end = pd.Timestamp(manifest.window_end).to_pydatetime()
+    train_end = pd.Timestamp(manifest.train_end)
+    if train_end.tzinfo is not None:
+        train_end = train_end.tz_convert("Asia/Hong_Kong").replace(tzinfo=None)
+    else:
+        train_end = train_end.to_pydatetime()
+
+    _actual_train_end = (
+        train_df["payout_complete_dtm"].max()
+        if "payout_complete_dtm" in train_df.columns and len(train_df)
+        else train_end
+    )
+
+    split_flags = {
+        KEY_VALID_FULL_UNSAMPLED: manifest.valid_full_unsampled,
+        KEY_TEST_FULL_UNSAMPLED: manifest.test_full_unsampled,
+        KEY_TRAIN_SAMPLING_APPLIED: manifest.train_sampling_applied,
+        KEY_L2_SNAPSHOT_ID: manifest.l2_snapshot_id,
+    }
+
+    issue16_gate_report = evaluate_issue16_gate_bundle(
+        effective_neg_sample_frac=1.0,
+        chunk_train_end_naive=train_end,
+        row_level_train_end_max=_actual_train_end,
+        train_end_source=TRAIN_END_SOURCE_L2_MANIFEST,
+        l2_snapshot_id=manifest.l2_snapshot_id,
+        label_asset_meta=manifest.label_asset_meta,
+        training_source_snapshot_id=manifest.source_snapshot_id,
+        split_flags=split_flags,
+    )
+    raise_if_strict_issue16_gates_failed(issue16_gate_report)
+    issue16_gate_report = {
+        **issue16_gate_report,
+        "l2_bundle_manifest_file": L2_TRAINING_BUNDLE_MANIFEST_FILE,
+        "l2_bundle_dir": str(manifest.bundle_dir),
+    }
+
+    _split_row_meta = tr.split_row_metadata_from_dataframes(train_df, valid_df, test_df)
+    _model_used_split_meta = tr.split_row_metadata_from_dataframes(
+        train_df, valid_df, test_df, rated_only=True
+    )
+    n_rows = len(train_df) + len(valid_df) + len(test_df)
+    _label1 = int(train_df["label"].sum()) + int(valid_df["label"].sum()) + int(test_df["label"].sum())
+
+    step7_train_path = None
+    step7_valid_path = None
+    step7_test_path = None
+    _train_libsvm = None
+    _valid_libsvm = None
+    _test_libsvm = None
+
+    split_total_bytes = split_parquet_total_bytes(manifest)
+    oom_precheck_est_peak_ram_gb = estimate_step7_peak_ram_gb_from_split_bytes(
+        split_total_bytes,
+        train_split_frac=float(tr.TRAIN_SPLIT_FRAC),
+        use_duckdb=bool(tr.STEP7_USE_DUCKDB),
+        chunk_concat_ram_factor=float(tr.CHUNK_CONCAT_RAM_FACTOR),
+    )
+
+    feature_spec = tr.load_feature_spec(tr.FEATURE_SPEC_PATH)
+    try:
+        feature_spec_hash = hashlib.md5(Path(tr.FEATURE_SPEC_PATH).read_bytes()).hexdigest()[:12]
+    except Exception:
+        feature_spec_hash = "unknown"
+
+    step8_screen_sample_strategy = tr._step8_resolve_sample_strategy(tr.STEP8_SCREEN_SAMPLE_STRATEGY)
+    _train_cols = train_df.columns
+    active_feature_cols = tr.get_all_candidate_feature_ids(feature_spec, screening_only=True)
+    if feature_spec is not None:
+        _track_llm_cols = [
+            cand.get("feature_id")
+            for cand in (feature_spec.get("track_llm", {}) or {}).get("candidates", [])
+            if cand.get("feature_id") in _train_cols
+        ]
+        _all_candidate_cols = list(dict.fromkeys(active_feature_cols + _track_llm_cols))
+    else:
+        _all_candidate_cols = active_feature_cols
+    _present_candidate_cols = [c for c in _all_candidate_cols if c in _train_cols]
+    step8_screening_source = None
+    step8_screening_stats_source = None
+    step8_screening_sample_rows = None
+    step8_screening_full_train_rows = None
+    step8_screening_candidate_cols = None
+    step8_screened_feature_count = None
+    step8_duration_sec: Optional[float] = None
+
+    if not _present_candidate_cols:
+        logger.warning("L2 bundle: no screening candidates — using columns present in train only")
+        active_feature_cols = [c for c in active_feature_cols if c in _train_cols]
+    else:
+        _cap = (
+            int(tr.STEP8_SCREEN_SAMPLE_ROWS)
+            if (tr.STEP8_SCREEN_SAMPLE_ROWS is not None and tr.STEP8_SCREEN_SAMPLE_ROWS >= 1)
+            else 2_000_000
+        )
+        _sample_n = (
+            int(tr.STEP8_SCREEN_SAMPLE_ROWS)
+            if (tr.STEP8_SCREEN_SAMPLE_ROWS is not None and tr.STEP8_SCREEN_SAMPLE_ROWS >= 1)
+            else None
+        )
+        _matrix_for_screen = tr._step8_sample_in_memory_train(
+            train_df,
+            strategy=step8_screen_sample_strategy,
+            sample_n=_sample_n,
+            default_cap=_cap,
+        )
+        step8_screening_source = f"in_memory_{step8_screen_sample_strategy}"
+        step8_screening_stats_source = "screening_sample_df"
+        step8_screening_sample_rows = len(_matrix_for_screen)
+        step8_screening_full_train_rows = len(train_df)
+        step8_screening_candidate_cols = len(_present_candidate_cols)
+        t0 = time.perf_counter()
+        screened_cols = tr.screen_features(
+            feature_matrix=_matrix_for_screen,
+            labels=_matrix_for_screen["label"],
+            feature_names=_present_candidate_cols,
+            screen_method=tr.SCREEN_FEATURES_METHOD,
+            train_path=None,
+            train_df=train_df,
+        )
+        step8_duration_sec = time.perf_counter() - t0
+        step8_screened_feature_count = len(screened_cols)
+        active_feature_cols = screened_cols
+
+    if not active_feature_cols:
+        raise SystemExit("L2 bundle: no features remain after screening — cannot train")
+
+    if step8_duration_sec is not None and step8_screening_candidate_cols is not None:
+        tr.pipeline_echo(
+            f"Step 8/10 — done in {step8_duration_sec:.1f}s "
+            f"({step8_screening_candidate_cols} → {step8_screened_feature_count} features)"
+        )
+    else:
+        tr.pipeline_echo("Step 8/10 — Feature screening skipped or not applicable")
+
+    tr.pipeline_echo("Step 9/10 — Train rated GBM (L2 bundle path) …")
+    t0 = time.perf_counter()
+    model_version = pipeline_model_version
+    rated_art, _, combined_metrics = tr.train_single_rated_model(
+        train_df,
+        valid_df,
+        active_feature_cols,
+        run_optuna=not skip_optuna,
+        test_df=test_df,
+        train_from_file=bool(tr.STEP9_TRAIN_FROM_FILE),
+        train_libsvm_paths=None,
+        test_libsvm_path=None,
+        ranking_recipe=pipeline_ranking_recipe,
+        gbm_bakeoff=pipeline_gbm_bakeoff,
+        valid_split_parquet_path=None,
+        test_split_parquet_path=None,
+        train_split_parquet_path=None,
+    )
+    step9_duration_sec = time.perf_counter() - t0
+    tr.pipeline_echo(f"Step 9/10 — done in {step9_duration_sec:.1f}s")
+    train_df = None
+    valid_df = None
+    test_df = None
+    gc.collect()
+
+    tr.pipeline_echo("Step 10/10 — Save artifact bundle (L2 bundle path) …")
+    t0 = time.perf_counter()
+    _versions_root = tr.MODEL_DIR
+    _bundle_dir = tr.safe_version_subdirectory(_versions_root, model_version)
+    if _bundle_dir.exists() and (_bundle_dir / "model.pkl").exists():
+        raise FileExistsError(
+            f"Refusing to overwrite existing model bundle: {_bundle_dir}. "
+            "Remove the directory or wait for a new model_version timestamp."
+        )
+    _bundle_dir.mkdir(parents=True, exist_ok=True)
+    _baseline_align = tr._make_baseline_training_alignment_payload(
+        effective_start,
+        effective_end,
+        float(tr.TRAIN_SPLIT_FRAC),
+        float(tr.VALID_SPLIT_FRAC),
+    )
+    _split_mlflow_meta = tr.split_row_metadata_to_mlflow_string_params(_split_row_meta)
+    _model_meta_doc = tr.build_model_metadata_document(
+        model_version=model_version,
+        effective_start=effective_start,
+        effective_end=effective_end,
+        splits=_split_row_meta,
+        use_local_parquet=use_local,
+        recent_chunks=None,
+        sample_rated_n=None,
+        skip_optuna=skip_optuna,
+        neg_sample_frac_effective=1.0,
+        bundle_dir=_bundle_dir,
+        combined_metrics=combined_metrics,
+        model_used_splits=_model_used_split_meta,
+        identity_mapping_mode=manifest.identity_mapping_mode,
+        t_game_features_enabled=_t_game_enabled(),
+        t_game_visible_time_column=(
+            "__etl_insert_Dtm" if _t_game_enabled() else "none"
+        ),
+        l2_snapshot_id=manifest.l2_snapshot_id,
+        source_snapshot_id=manifest.source_snapshot_id,
+        l2_training_bundle_dir=str(bundle_dir.resolve()),
+    )
+    tr.save_artifact_bundle(
+        rated_art,
+        active_feature_cols,
+        combined_metrics,
+        model_version,
+        sample_rated_n=None,
+        feature_spec_path=tr.FEATURE_SPEC_PATH,
+        neg_sample_frac=1.0,
+        bundle_dir=_bundle_dir,
+        baseline_training_alignment=_baseline_align,
+        model_metadata=_model_meta_doc,
+    )
+    try:
+        tr.write_latest_model_manifest(_versions_root, model_version, _bundle_dir)
+    except Exception as _man_exc:
+        logger.warning("Failed to write latest model manifest (artifacts saved): %s", _man_exc)
+    step10_duration_sec = time.perf_counter() - t0
+    tr.pipeline_echo(f"Step 10/10 — done in {step10_duration_sec:.1f}s")
+
+    total_sec = time.perf_counter() - pipeline_start
+    _pipeline_finished_at_iso = datetime.now(timezone.utc).isoformat()
+
+    try:
+        tr._write_pipeline_diagnostics_json(
+            model_version=model_version,
+            pipeline_started_at=pipeline_started_at_iso,
+            pipeline_finished_at=_pipeline_finished_at_iso,
+            total_duration_sec=total_sec,
+            step1_duration_sec=None,
+            step2_duration_sec=None,
+            step3_duration_sec=None,
+            step4_duration_sec=None,
+            step5_duration_sec=None,
+            step6_duration_sec=None,
+            step7_duration_sec=step7_duration_sec,
+            step8_duration_sec=step8_duration_sec,
+            step9_duration_sec=step9_duration_sec,
+            step10_duration_sec=step10_duration_sec,
+            oom_precheck_est_peak_ram_gb=oom_precheck_est_peak_ram_gb,
+            oom_precheck_step7_rss_error_ratio=None,
+            step7_chunk_parquet_total_bytes=split_total_bytes,
+            step7_chunk_parquet_est_ram_gb=oom_precheck_est_peak_ram_gb,
+            chunk_cache_stats={},
+            issue16_audit=issue16_gate_report,
+            output_dir=_bundle_dir,
+            oom_estimate_strategy=OOM_ESTIMATE_STRATEGY_L2_SPLIT_FILES,
+            l2_split_parquet_total_bytes=split_total_bytes,
+        )
+    except Exception as _diag_exc:
+        logger.warning("pipeline_diagnostics.json write failed (training still succeeded): %s", _diag_exc)
+
+    try:
+        from trainer.core.mlflow_utils import has_active_run, log_params_safe
+
+        if has_active_run():
+            _lineage_params = {
+                "l2_snapshot_id": manifest.l2_snapshot_id,
+                "source_snapshot_id": manifest.source_snapshot_id,
+                "l2_training_bundle_dir": str(bundle_dir.resolve()),
+                "l2_oom_estimate_strategy": OOM_ESTIMATE_STRATEGY_L2_SPLIT_FILES,
+            }
+            log_params_safe({k: v for k, v in _lineage_params.items() if v})
+    except Exception as _ml_exc:
+        logger.warning("MLflow L2 lineage params skipped: %s", _ml_exc)
+
+    summary = {
+        "model_version": model_version,
+        "l2_training_bundle": str(bundle_dir),
+        "source_snapshot_id": manifest.source_snapshot_id,
+        "total_rows": n_rows,
+        "metrics": combined_metrics,
+    }
+    logger.debug("L2 training summary JSON: %s", json.dumps(summary, default=str))
+    tr.pipeline_echo(
+        f"Complete — L2 bundle pipeline finished in {total_sec:.1f}s "
+        f"(model_version={model_version} rows={n_rows}; "
+        "full JSON: logger DEBUG or TRAINER_SUMMARY_JSON_STDOUT=1)"
+    )
+    if os.environ.get("TRAINER_SUMMARY_JSON_STDOUT", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        print(json.dumps(summary, indent=2, default=str), flush=True)

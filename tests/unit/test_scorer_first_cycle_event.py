@@ -44,6 +44,26 @@ def test_first_cycle_done_set_after_once_with_mocked_score_once(tmp_state_db):
     assert m_score.call_count == 1
 
 
+def test_first_cycle_done_set_when_preflight_raises(tmp_state_db):
+    ev = threading.Event()
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("ch unavailable")
+
+    with patch(
+        "trainer.training.cross_entry_preflight.run_cross_entry_data_preflight",
+        side_effect=_boom,
+    ):
+        with pytest.raises(RuntimeError, match="ch unavailable"):
+            sc.run_scorer_loop(
+                interval_seconds=1,
+                lookback_hours=1,
+                once=True,
+                first_cycle_done=ev,
+            )
+    assert ev.is_set()
+
+
 def test_first_cycle_done_set_even_when_score_once_raises(tmp_state_db):
     ev = threading.Event()
     fake_art = {

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://patron-walkaway.local/schema/l2_training_bundle.schema.json",
+  "title": "L2 training bundle manifest (trainer consumer, GitHub #17)",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "source_snapshot_id",
+    "l2_snapshot_id",
+    "train_end",
+    "window_start",
+    "window_end",
+    "paths",
+    "split_semantics",
+    "identity_mapping_mode"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1" },
+    "source_snapshot_id": { "type": "string", "minLength": 1 },
+    "snapshot_id": { "type": "string", "minLength": 1 },
+    "l2_snapshot_id": { "type": "string", "minLength": 1 },
+    "train_end": { "type": "string", "minLength": 1 },
+    "window_start": { "type": "string", "minLength": 1 },
+    "window_end": { "type": "string", "minLength": 1 },
+    "identity_mapping_mode": { "type": "string", "enum": ["pit_asof", "cutoff_window"] },
+    "paths": {
+      "type": "object",
+      "required": ["train", "valid", "test"],
+      "properties": {
+        "train": { "type": "string", "minLength": 1 },
+        "valid": { "type": "string", "minLength": 1 },
+        "test": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "split_semantics": {
+      "type": "object",
+      "required": [
+        "valid_full_unsampled",
+        "test_full_unsampled",
+        "train_sampling_applied"
+      ],
+      "properties": {
+        "valid_full_unsampled": { "type": "boolean", "const": true },
+        "test_full_unsampled": { "type": "boolean", "const": true },
+        "train_sampling_applied": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "label_asset": { "type": "object" }
+  }
+}

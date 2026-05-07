@@ -166,8 +166,8 @@ def tmp_state_db(tmp_path, monkeypatch):
     return db
 
 
-class TestRisk1FirstCycleEventNotSetIfLoadFailsBeforeLoop(unittest.TestCase):
-    """#1: Event is only set inside the loop; pre-loop failure leaves it unset."""
+class TestRisk1FirstCycleEventSetIfStartupFailsBeforeLoop(unittest.TestCase):
+    """#1: Pre-loop failure must still set the event so deploy validator wait cannot hang."""
 
     def test_load_dual_artifacts_raises_before_while(self) -> None:
         ev = threading.Event()
@@ -185,9 +185,9 @@ class TestRisk1FirstCycleEventNotSetIfLoadFailsBeforeLoop(unittest.TestCase):
                     once=True,
                     first_cycle_done=ev,
                 )
-        self.assertFalse(
+        self.assertTrue(
             ev.is_set(),
-            "MRE: first_cycle_done must stay clear when failing before first score_once",
+            "deploy: first_cycle_done must unblock validator wait if scorer exits before first score_once",
         )
 
 

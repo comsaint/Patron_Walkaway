@@ -31,7 +31,9 @@ STEP7_PANDAS_FALLBACK_MAX_BYTES = 256 * 1024 * 1024
 NEG_SAMPLE_FRAC: float = 1.0
 
 # Internal guards for auto-reduction logic.
-NEG_SAMPLE_FRAC_AUTO: bool = True
+# Default off: chunk-path RAM heuristics / auto-neg-frac live under GitHub #10 (#16 defers OOM).
+# Set True locally if you still want pre-Step-6 OOM pre-check + chunk-1 probe + auto frac.
+NEG_SAMPLE_FRAC_AUTO: bool = False
 NEG_SAMPLE_FRAC_MIN: float = 0.05
 NEG_SAMPLE_FRAC_ASSUMED_POS_RATE: float = 0.15
 NEG_SAMPLE_RAM_SAFETY: float = 0.75

@@ -17,6 +17,12 @@ Boundary contract
       Pull this extra data from ClickHouse (or Parquet) solely to
       observe future bets for C1 label computation.
       ** Never include these observations in the training set. **
+
+GitHub #16 (L2 主路徑)
+----------------------
+``get_monthly_chunks`` / ``get_train_valid_test_split`` 仍為現行 chunk 管線之
+邊界來源；遷移後改由 L2 manifest 視窗與列級切分契約取代（見
+``l2_trainer_contracts``、execution plan **TRN-16-03**）。
 """
 
 from __future__ import annotations

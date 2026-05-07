@@ -14,8 +14,9 @@ WS2: When **no** snapshot exists, optionally run a **subprocess**
 only (no second emit). Disabled when env ``TRAINER_AUTOBUILD_FULL_MVP`` is
 ``0``/``false``/``no``/``off``.
 
-WS3 (log contract): Every user-facing line uses ``AutoBuild[<phase>]: <message>``.
-Phases (stable ids for grep / dashboards):
+WS3 (log contract): ``AutoBuild[<phase>]:`` lines go to the trainer **logger** by default
+(stdout only for orchestrate-not-ready + final summary, or set env ``TRAINER_AUTOBUILD_STDOUT=1``
+to mirror all phases to the console). Phases (stable ids for grep / dashboards):
 
 - ``orchestrate`` — not-ready banner, final probe failure, and end **summary**.
 - ``bridge_emit`` — in-process ``emit_trainer_local_parquet`` + ingress install (snap path).
@@ -59,12 +60,13 @@ def _autobuild_log(
     logger: logging.Logger,
     *,
     level: int = logging.INFO,
-    also_print: bool = True,
+    also_print: bool = False,
 ) -> str:
     """Emit one ``AutoBuild[<phase>]:`` line to logger and optionally stdout."""
     full = f"AutoBuild[{phase}]: {message}"
     logger.log(level, full)
-    if also_print:
+    _stdout = os.environ.get("TRAINER_AUTOBUILD_STDOUT", "").strip().lower()
+    if also_print or _stdout in ("1", "true", "yes"):
         print(full, flush=True)
     return full
 
@@ -263,6 +265,7 @@ def ensure_local_bridge_ready_for_training(*, logger: logging.Logger) -> None:
         "Materializing (may take several minutes on large data) …",
         logger,
         level=logging.WARNING,
+        also_print=True,
     )
 
     ingress = data_sources.trainer_local_parquet_bridge_manifest_path()
@@ -314,4 +317,5 @@ def ensure_local_bridge_ready_for_training(*, logger: logging.Logger) -> None:
         _format_summary_line(timings),
         logger,
         level=logging.INFO,
+        also_print=True,
     )

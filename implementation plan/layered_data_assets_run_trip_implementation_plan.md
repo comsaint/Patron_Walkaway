@@ -1,6 +1,6 @@
 # 分層資料資產與 run/trip 特徵工程 — Implementation Plan
 
-> **版本**：Implementation plan **v0.14**（2026-05-06；延續 v0.13：**初版運作參數（bet 路徑）**仍為 `cleaned_bet` 每分區保留最近 **7** 個成功版本；full recompute 備援觸發為 `impact_day_ratio` **或** `changed_player_ratio` **≥ 10%**（見 §2.2.1）。v0.14 對齊 **SSOT v1.13**：玩家鍵改為 **`pit_asof canonical_id`**，新增 identity 前置層與 sidecar 契約（`identity_mapping_mode=pit_asof`、`identity_source_snapshot_id`、`session_avail_delay_min_used`、`identity_coverage`），並將 run/trip/L2 與 parity 驗證全面由 `player_id` 語義切換至 canonical 語義。重大架構變更升 minor。  
+> **版本**：Implementation plan **v0.15**（2026-05-07；延續 v0.14：v0.15 新增 **#16 訓練核心遷移** 之實作策略：`trainer` 主路徑改讀 L2、chunk 退場範圍擴及 Step 1/2/6/7/9、**valid/test 禁止抽樣且僅 train 可抽樣**、以及 **label 預物化資產（L2）+ 增量失效重算** 契約；同時補齊 raw 指標口徑與 split/sampling 審計欄位）。重大架構變更升 minor。  
 > **依據**：`ssot/layered_data_assets_run_trip_ssot.md`（v1.13）、`schema/time_semantics_registry.yaml`、`trainer/core/_config_training_domain.py`（`GAMING_DAY_START_HOUR`、`HK_TZ`、`IDENTITY_MAPPING_MODE`、`SESSION_AVAIL_DELAY_MIN`）。  
 > **本文層級**：架構、模組邊界、階段交付、驗證與治理；**不含**逐檔 Jira 式任務拆解。  
 > **與 trainer 關係**：本計畫先建立**與現行 `trainer` 管線並行**之資料資產產線；是否改為訓練主讀本層資產須另案決策（見 SSOT §0.1）。
@@ -520,10 +520,63 @@
 
 ---
 
-## 11) 文件維護
+## 11) #16 訓練核心遷移（L2 主路徑）實作策略
+
+> 範圍來源：GitHub issue #16（2026-05-07 擴版）  
+> 目標：將 `trainer.training.trainer` 自 chunk 主路徑遷移為 L2 主路徑，並確保 correctness、資源效率與審計一致性。
+
+### 11.1 目標與邊界
+
+- **目標（MUST）**：預設訓練路徑不再依賴 `process_chunk` + `compute_labels`；改為消費 L2 組裝產物（含 label）。
+- **抽樣語義（MUST）**：`valid` / `test` 維持全量且禁止抽樣；僅 `train` 允許抽樣（train-only sampling）。
+- **層級歸屬（MUST）**：抽樣、權重、訓練切分與 label 預物化均屬 L2／訓練組裝層；不得下沉進 L1 run/trip facts。
+- **非範圍（維持）**：不在本條直接重寫 scorer/validator 線上完整行為。
+
+### 11.2 Pipeline 遷移設計（Step 1/2/6/7/9）
+
+- **Step 1/2（去 chunk）**：以 L2 manifest/視窗契約取代 `get_monthly_chunks` 與 chunk-level split；`train_end`（identity cutoff）需由與 row-level split 一致之單一邊界來源提供。
+- **Step 6（退役主路徑）**：舊有 chunk 級 DQ/identity/label/feature 預設路徑退場，改由 L2 輸入承接。
+- **Step 7（full split）**：產出 `train_full`、`valid_full`、`test_full` 三份全量切分；預設 on-disk（DuckDB/parquet）以避免全量入 RAM。
+- **Step 7.5（新增/等價）**：僅對 `train_full` 生成可重現 `train_sampled`；`valid_full`、`test_full` 嚴禁抽樣。
+- **Step 9（多模型）**：統一輸入契約為 `train_sampled_or_full + valid_full + test_full`；共用中間格式，避免重複 IO 與記憶體放大。
+
+### 11.3 Label 預物化資產（新增，L2）
+
+- **策略（MUST）**：新增 `label_asset`（或等價命名）作為 L2 可重用資產，供訓練重複消費，避免每次重訓重算 labels。
+- **最小欄位（MUST）**：至少含 `bet_id`（或等價事件主鍵）、`canonical_id`、`label`、`is_censored`、`label_definition_version`、`source_snapshot_id`、`computed_at`、`coverage_end`（或等價上界）。
+- **一致性（MUST）**：label 參考語義與 parity 驗證需與 `trainer_plan_ssot` 防漏語義一致；不得以 cache 命中替代 correctness 檢查。
+- **分佈口徑（MUST）**：`valid/test` 指標必須使用 full labels（raw distribution）；不得再使用舊有「valid/test 抽樣後校正」邏輯。
+
+### 11.4 Label 增量失效與重算策略
+
+- **失效觸發（MUST）**：沿用 §2.2.1 統一失效模型，並新增 label 專屬來源：  
+  1) bet/session/identity 變更、  
+  2) `label_definition_version` 變更、  
+  3) censoring/時間語義參數變更、  
+  4) correction/late-arrival 導致觀測窗改變。
+- **重算範圍（MUST）**：不可僅重算 changed day；需包含 label horizon 影響窗（right-censoring 前後影響區）。
+- **回退策略（SHOULD）**：當 impact 無法可靠界定或影響擴散時，升級 full recompute（遵循 §2.2.1）。
+
+### 11.5 可觀測性、驗收與 Gate（#16 專屬）
+
+- **診斷欄位遷移（MUST）**：`pipeline_diagnostics` / `model_metadata` / MLflow 由 chunk 語彙遷移至 split/sampling 語彙（例如 `*_split_path`、`train_sampling_applied`、`l2_snapshot_id`）。
+- **新 gate（MUST）**：  
+  - `valid_test_sampling_guard`：偵測 valid/test 任一抽樣即 fail-closed。  
+  - `label_asset_freshness_guard`：檢查 label asset 與 `source_snapshot_id` / `label_definition_version` 一致。  
+  - `metric_semantics_guard`：驗證 valid/test 指標來源為 full split 且為 raw 口徑。
+- **效能門檻（MUST）**：相對 baseline 的訓練 wall-clock 與 Peak RSS 達專案約定值（數值於 execution plan/owner 決議）。
+
+### 11.6 與既有章節對齊
+
+- 本節屬 **Implementation 層策略**；工作拆解、owner、PR 切片與日程，須由 execution plan 承接，不得回流污染本節。
+- 若與 §6（parity）或 §8（技術驗收）產生衝突，以 correctness/防漏優先，再回寫本計畫版本欄。
+
+---
+
+## 12) 文件維護
 
 - SSOT 變更時：本計畫須檢視 **Phase 範圍與驗收** 是否仍成立；必要時升版本計畫「階段」敘述，不修改 SSOT 業務定義。  
-- 本計畫版本以文首 **blockquote 版本列**為準（目前 **v0.13**）；重大架構變更升 minor。
+- 本計畫版本以文首 **blockquote 版本列**為準（目前 **v0.15**）；重大架構變更升 minor。
 
 ---
 

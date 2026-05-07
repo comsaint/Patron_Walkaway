@@ -2855,56 +2855,65 @@ def run_scorer_loop(
     ``score_once`` call returns (success or exception), so deploy can defer
     validator startup and avoid SQLite startup lock races.
 
+    If startup fails before the first ``score_once`` completes (for example
+    ClickHouse preflight, artifact load, or SQLite init), the event is still
+    set when this function exits so deferred validator startup cannot block
+    indefinitely on ``Event.wait()`` when the scorer thread has already failed.
+
     Runs ClickHouse data preflight once before loading artifacts (same contract as CLI ``main()``).
     """
     interval = interval_seconds if interval_seconds is not None else getattr(config, "SCORER_POLL_INTERVAL_SECONDS", 45)
     lookback = lookback_hours if lookback_hours is not None else getattr(config, "SCORER_LOOKBACK_HOURS", 8)
-    if interval <= 0 or lookback <= 0:
-        raise ValueError("interval_seconds and lookback_hours must be positive")
-    from trainer.training.cross_entry_preflight import run_cross_entry_data_preflight
+    try:
+        if interval <= 0 or lookback <= 0:
+            raise ValueError("interval_seconds and lookback_hours must be positive")
+        from trainer.training.cross_entry_preflight import run_cross_entry_data_preflight
 
-    run_cross_entry_data_preflight(
-        entry="scorer",
-        use_local_parquet=False,
-        logger=logger,
-    )
-    _check_numba_runtime_once()
-    artifacts = load_dual_artifacts(model_dir)
-    logger.info(
-        "[scorer] Loaded model v=%s, rated=%s, %d features",
-        artifacts["model_version"],
-        "yes" if artifacts["rated"] else "no",
-        len(artifacts["feature_list"]),
-    )
-    conn = sqlite3.connect(STATE_DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    init_state_db()
-    alert_history = load_alert_history(conn)
-    first_iteration = True
-    while True:
-        t_start = time.time()
-        try:
-            score_once(
-                artifacts,
-                lookback,
-                alert_history,
-                conn,
-                RETENTION_HOURS,
-                rebuild_canonical_mapping=False,
-            )
-        except Exception as exc:
-            logger.error("[scorer] ERROR: %s", exc, exc_info=True)
-        finally:
-            if first_iteration:
-                first_iteration = False
-                if first_cycle_done is not None:
-                    first_cycle_done.set()
-        elapsed = time.time() - t_start
-        sleep_for = max(0, interval - elapsed)
-        if once:
-            break
-        time.sleep(sleep_for)
+        run_cross_entry_data_preflight(
+            entry="scorer",
+            use_local_parquet=False,
+            logger=logger,
+        )
+        _check_numba_runtime_once()
+        artifacts = load_dual_artifacts(model_dir)
+        logger.info(
+            "[scorer] Loaded model v=%s, rated=%s, %d features",
+            artifacts["model_version"],
+            "yes" if artifacts["rated"] else "no",
+            len(artifacts["feature_list"]),
+        )
+        conn = sqlite3.connect(STATE_DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        init_state_db()
+        alert_history = load_alert_history(conn)
+        first_iteration = True
+        while True:
+            t_start = time.time()
+            try:
+                score_once(
+                    artifacts,
+                    lookback,
+                    alert_history,
+                    conn,
+                    RETENTION_HOURS,
+                    rebuild_canonical_mapping=False,
+                )
+            except Exception as exc:
+                logger.error("[scorer] ERROR: %s", exc, exc_info=True)
+            finally:
+                if first_iteration:
+                    first_iteration = False
+                    if first_cycle_done is not None:
+                        first_cycle_done.set()
+            elapsed = time.time() - t_start
+            sleep_for = max(0, interval - elapsed)
+            if once:
+                break
+            time.sleep(sleep_for)
+    finally:
+        if first_cycle_done is not None and not first_cycle_done.is_set():
+            first_cycle_done.set()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

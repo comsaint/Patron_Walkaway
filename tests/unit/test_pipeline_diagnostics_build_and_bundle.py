@@ -215,3 +215,55 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
             data = json.loads((model_dir / "pipeline_diagnostics.json").read_text(encoding="utf-8"))
         self.assertEqual(data["step6_chunk_cache_final_hit_total"], 2)
         self.assertEqual(data["step6_chunk_cache_prefeatures_hit_total"], 1)
+
+    def test_issue16_audit_merged_when_provided(self) -> None:
+        """GitHub #16: optional issue16_audit nested under pipeline_diagnostics."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td)
+            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+                trainer_mod._write_pipeline_diagnostics_json(
+                    model_version="mv",
+                    pipeline_started_at="2026-05-07T00:00:00+00:00",
+                    pipeline_finished_at="2026-05-07T01:00:00+00:00",
+                    total_duration_sec=1.0,
+                    issue16_audit={"all_ok": True, "gates": {}},
+                )
+            data = json.loads((model_dir / "pipeline_diagnostics.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["issue16_audit"]["all_ok"], True)
+
+
+class TestIssue16Gates(unittest.TestCase):
+    """trainer.training.issue16_gates — pure semantics for #16."""
+
+    def test_neg_sample_frac_below_one_fails_sampling_gate(self) -> None:
+        from trainer.training.issue16_gates import evaluate_issue16_gate_bundle
+
+        r = evaluate_issue16_gate_bundle(
+            effective_neg_sample_frac=0.5,
+            chunk_train_end_naive="2024-01-01",
+            row_level_train_end_max="2024-01-01",
+            train_end_source="chunk_level_train_end",
+        )
+        self.assertFalse(r["gates"]["valid_test_sampling_guard"]["ok"])
+        self.assertTrue(r["gates"]["split_contract_guard"]["ok"])
+
+    def test_strict_mode_raises_on_failed_gate(self) -> None:
+        import os
+        from unittest.mock import patch
+
+        from trainer.training.issue16_gates import (
+            evaluate_issue16_gate_bundle,
+            raise_if_strict_issue16_gates_failed,
+        )
+
+        r = evaluate_issue16_gate_bundle(
+            effective_neg_sample_frac=0.5,
+            chunk_train_end_naive="2024-01-01",
+            row_level_train_end_max="2024-01-01",
+            train_end_source="chunk_level_train_end",
+        )
+        with patch.dict(os.environ, {"TRAINER_ISSUE16_STRICT_GATES": "1"}):
+            with self.assertRaises(RuntimeError):
+                raise_if_strict_issue16_gates_failed(r)

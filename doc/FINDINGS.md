@@ -33,6 +33,7 @@
 | **FND-14** | `t_game`<br>`game_id` | 🔴 P0 | **存在重複版本**：全表約 2.11 億列中，有約 3.4 萬個 `game_id` 發生重複（總列數大於 unique IDs）。 | 若不去重，牌局的財務結算與狀態會被重複計算。 | 任何建模或分析前，必須先做去重：依賴 `MAX(__ts_ms)` 或 `MAX(__etl_insert_Dtm)` 取得最新狀態。 |
 | **FND-15** | `t_game`<br>財務欄位 | 🟡 P1 | **財務欄位非零且包含極端值**：`total_turnover`, `casino_win` 等並非全為 0。`casino_win` 包含極端值（如單局虧損 1.1 億），與 `t_bet` 的極端派彩現象一致。 | 若誤以為 `t_game` 財務欄位全為 0 而忽略，會遺失局級別的財務特徵。 | 這是真實的業務數據彙總，可作為特徵使用，但需注意極端值對模型的影響。 |
 | **FND-16** | `t_session`<br>`session_id`, `casino_player_id`, `player_id` | 🟡 P1 | **同一 `session_id` 的多版本中，`casino_player_id` 可能「晚到補齊」(NULL → 非 NULL)，少數情況連 `player_id` 也會被更正**。同時 `t_bet` 本身不含 `casino_player_id` 欄位。 | 線上推論若只看「當下可得的 t_session」可能把實際有卡客暫時當作無卡；若未做 FND-01 去重與 available_time gate，會導致 D2 身份判定與 rated/non-rated 路由不穩定（且可能引入未來資訊）。 | 線上：有卡判定必須加 available_time gate（見 FND-13），並允許身份隨 `t_session` 更新而「升級」。離線/訓練：D2 mapping 必須先做 FND-01 去重再建表；同時保留 mapping cache（`player_id`→`casino_player_id`）作為兜底。 |
+| **FND-17** | `t_bet`（及 `t_session`）<br>`theo_win`, `adjusted_theo_win` | 🟡 P1 | **`theo_win` 與 `adjusted_theo_win` 非同義**：前者為系統依玩法／賠率等計算的「精算向」預期利潤；後者為評級／報表向的「調整後」理論贏。於 repo 內 `trainer/sample data/SmartTableData_tbet_sample.csv`（1000 筆）可重現：`bet_type='PLAYER'` 時 **`adjusted_theo_win = wager * 0.0124` 恆成立**（浮點誤差內），`theo_win` 則略低（約 **wager × 0.01235**）；在常見百家樂閒注定義下 **~1.235% 較貼近文獻精算期望**，**1.24% 多為表定／評級取捨**（實桌規則不同時須重算）。`BANKER` / `SMALL_TIGER` / `BIG_TIGER` / `TIE` 樣本中兩欄相等；部分邊注（如 `LUCKY_SIX`、`*_PAIR`）僅極小差異或四捨五入感。**上游 GDP／Smart Table 未在本 repo 提供完整公式**，其餘注種需以全量 Parquet 再驗或向來源單位確認。 | 與場方 ADT／評級報表對帳時若誤用欄位會系統性偏差；本專案 `trainer/etl/etl_player_profile.py` 彙總 profile 使用 **`SUM(theo_win)`**，與「僅認 `adjusted_theo_win`」的口徑可能不一致。 | 對外報表／評級對齊：優先釐清業務採 **`adjusted_theo_win`** 或 **`theo_win`**；建模特徵若需與 profile 一致，沿用 `theo_win` 鏈路前先確認產品定義。全量驗證見附錄 **[FND-17]**。 |
 
 ---
 
@@ -628,4 +629,58 @@ per_patron AS (
     GROUP BY canonical_id
 )
 SELECT * FROM per_patron;
+```
+
+### [FND-17] `t_bet.theo_win` vs `t_bet.adjusted_theo_win`（及 `t_session` 同欄名）
+
+> **資料來源（可離線重現）**：`trainer/sample data/SmartTableData_tbet_sample.csv`（1000 列，無需 Parquet）。  
+> **全量驗證（可選）**：若本機存在 `data/gmwds_t_bet.parquet`，可用附錄 DuckDB 片段依 `bet_type` 抽樣比對。
+
+**結論摘要**
+
+1. **`theo_win`**：系統計算的理論贏（預期利潤），較貼近玩法／引擎精算。
+2. **`adjusted_theo_win`**：評級或報表向的「調整後」理論贏；與 `t_session` 的 `adjusted_turnover` 一樣屬 **adjusted** 家族，但 **GDP 官方未在本 repo 寫明逐欄公式**。
+3. **樣本實證（CSV）**：`bet_type = 'PLAYER'` 時 `abs(adjusted_theo_win - wager * 0.0124)` 全為 0（浮點誤差內）；`theo_win / wager` 均值約 **0.01235**。`BANKER`、`SMALL_TIGER`、`BIG_TIGER`、`TIE` 子樣本內兩欄完全相同。`LUCKY_SIX`、`PLAYER_PAIR`、`BANKER_PAIR` 有時相等、有時差極小（可正可負）。
+4. **閒注與標準百家樂（數學 vs 表定）**：在常見規則下，**約 1.235%（`theo_win/wager` 量級）較貼近文獻精算的 house edge**；**1.24%（`adjusted_theo_win/wager`）多為評級／表定取捨**，與真實期望可差數個基點；實桌規則不同時兩者皆需以該桌規則重算。
+
+**Python（pandas；自 repo 根目錄執行）**
+
+```python
+import pandas as pd
+
+path = "trainer/sample data/SmartTableData_tbet_sample.csv"
+df = pd.read_csv(path)
+
+pl = df.loc[df["bet_type"] == "PLAYER"]
+err_player = (pl["adjusted_theo_win"] - 0.0124 * pl["wager"]).abs().max()
+ratio_theo = (pl["theo_win"] / pl["wager"]).mean()
+ratio_adj = (pl["adjusted_theo_win"] / pl["wager"]).mean()
+
+print("PLAYER max |adj - 0.0124*wager|:", err_player)
+print("PLAYER mean theo_win/wager:", ratio_theo)
+print("PLAYER mean adjusted/wager:", ratio_adj)
+
+diff_b = (
+    df.loc[df["bet_type"] == "BANKER", "theo_win"]
+    - df.loc[df["bet_type"] == "BANKER", "adjusted_theo_win"]
+).abs().max()
+print("BANKER max |theo_win - adjusted_theo_win|:", diff_b)
+```
+
+**DuckDB（全量；需 `data/gmwds_t_bet.parquet`）**
+
+```sql
+-- PLAYER：檢查 adjusted 是否等於 1.24% * wager（全表；可能較慢）
+SELECT
+  COUNT(*) AS n_player,
+  SUM(CASE
+        WHEN ABS(COALESCE(adjusted_theo_win, 0) - COALESCE(wager, 0) * 0.0124) < 1e-6
+        THEN 1 ELSE 0
+      END) AS n_match_0124,
+  SUM(CASE
+        WHEN ABS(COALESCE(theo_win, 0) - COALESCE(adjusted_theo_win, 0)) > 1e-6
+        THEN 1 ELSE 0
+      END) AS n_theo_ne_adj
+FROM read_parquet('data/gmwds_t_bet.parquet')
+WHERE bet_type = 'PLAYER';
 ```

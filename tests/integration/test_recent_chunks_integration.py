@@ -1,4 +1,6 @@
 import argparse
+import os
+import tempfile
 from datetime import datetime, timedelta
 import unittest
 from unittest.mock import patch, ANY
@@ -67,37 +69,40 @@ class TestRecentChunksIntegration(unittest.TestCase):
         mock_build_from_links.return_value = pd.DataFrame(columns=["player_id", "canonical_id"])
         mock_load_profile.return_value = pd.DataFrame()
 
-        # process_chunk should return a fake path so concat doesn't fail immediately
-        # Actually, let's mock pd.read_parquet and Path so we don't hit disk
-        with patch("trainer.trainer.pd.read_parquet") as mock_read_parquet, \
-             patch("trainer.trainer.Path") as mock_path:
-             
-            # Setup fake parquet read
-            mock_read_parquet.return_value = pd.DataFrame({
-                "payout_complete_dtm": [datetime(2025, 5, 15, tzinfo=HK_TZ)],
-                "label": [1],
-                "is_rated": [True]
-            })
-            # Setup fake path: exists + is_file so OOM probe branch runs; patch
-            # _oom_check_after_chunk1 so effective_frac < 1.0 and trainer reruns chunk 1.
-            mock_path.return_value.stat.return_value.st_size = 1000
-            mock_path.return_value.exists.return_value = True
-            mock_path.return_value.is_file.return_value = True
+        _fd, _tmp_parquet = tempfile.mkstemp(suffix=".parquet")
+        os.close(_fd)
+        try:
+            with patch(
+                "trainer.training.cross_entry_preflight.run_cross_entry_data_preflight"
+            ), patch("trainer.trainer.STEP7_USE_DUCKDB", False), patch(
+                "trainer.trainer.STEP7_KEEP_TRAIN_ON_DISK", False
+            ), patch("trainer.trainer.pd.read_parquet") as mock_read_parquet:
+                mock_read_parquet.return_value = pd.DataFrame({
+                    "payout_complete_dtm": [datetime(2025, 5, 15, tzinfo=HK_TZ)],
+                    "label": [1],
+                    "is_rated": [True],
+                    "canonical_id": ["C0"],
+                    "bet_id": [1],
+                })
 
-            mock_process_chunk.return_value = "fake_path.parquet"
-            mock_train.return_value = ({"model": None, "threshold": 0.5, "features": []}, None, {})
+                mock_process_chunk.return_value = _tmp_parquet
+                mock_train.return_value = ({"model": None, "threshold": 0.5, "features": []}, None, {})
 
-            args = argparse.Namespace(
-                start="2025-01-01",
-                end="2025-06-01",
-                days=None,
-                use_local_parquet=True,
-                force_recompute=False,
-                skip_optuna=True,
-                recent_chunks=2
-            )
-            with patch("trainer.trainer._oom_check_after_chunk1", return_value=0.5):
+                args = argparse.Namespace(
+                    start="2025-01-01",
+                    end="2025-06-01",
+                    days=None,
+                    use_local_parquet=True,
+                    force_recompute=False,
+                    skip_optuna=True,
+                    recent_chunks=2,
+                )
                 run_pipeline(args)
+        finally:
+            try:
+                os.unlink(_tmp_parquet)
+            except OSError:
+                pass
 
         # 1. Assert canonical mapping used train_end from chunk split (DuckDB path).
         mock_links_and_dummy.assert_called_once()
@@ -133,15 +138,13 @@ class TestRecentChunksIntegration(unittest.TestCase):
         self.assertEqual(call_args[1], expected_effective_end)
         self.assertEqual(kwargs.get("use_local_parquet"), True)
 
-        # 4. Assert process_chunk was called: OOM probe (chunk 1) + rerun chunk 1 + chunk 2 when NEG_SAMPLE_FRAC_AUTO
-        self.assertEqual(mock_process_chunk.call_count, 3,
-                         "With recent_chunks=2 and OOM probe: probe(chunk[-2]) + rerun(chunk[-2]) + chunk[-1]")
+        # 4. Assert process_chunk: one pass per chunk (NEG_SAMPLE_FRAC_AUTO default False — no OOM probe).
+        self.assertEqual(mock_process_chunk.call_count, 2,
+                         "With recent_chunks=2 and NEG_SAMPLE_FRAC_AUTO=False: chunk[-2] then chunk[-1]")
         chunk_args_1 = mock_process_chunk.call_args_list[0][0][0]
         chunk_args_2 = mock_process_chunk.call_args_list[1][0][0]
-        chunk_args_3 = mock_process_chunk.call_args_list[2][0][0]
         self.assertEqual(chunk_args_1, fake_chunks[-2])
-        self.assertEqual(chunk_args_2, fake_chunks[-2])
-        self.assertEqual(chunk_args_3, fake_chunks[-1])
+        self.assertEqual(chunk_args_2, fake_chunks[-1])
 
 if __name__ == "__main__":
     unittest.main()

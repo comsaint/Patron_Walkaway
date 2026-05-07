@@ -42,7 +42,6 @@ def _preflight_clickhouse(*, entry: str, logger: logging.Logger) -> None:
     """Verify ClickHouse connectivity with a trivial query."""
     start = f"DataPreflight[{entry}]: verifying ClickHouse connectivity …"
     logger.info(start)
-    print(start, flush=True)
     try:
         from trainer.core.db_conn import query_df
 
@@ -54,4 +53,3 @@ def _preflight_clickhouse(*, entry: str, logger: logging.Logger) -> None:
         ) from exc
     ok = f"DataPreflight[{entry}]: ClickHouse OK"
     logger.info(ok)
-    print(ok, flush=True)
