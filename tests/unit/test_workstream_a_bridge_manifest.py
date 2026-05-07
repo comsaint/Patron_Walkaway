@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from subprocess import CompletedProcess
 from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from trainer.training import data_sources as ds
+from trainer.training import local_bridge_preflight as lbp
 from trainer.training.local_bridge_preflight import ensure_local_bridge_ready_for_training
 
 
@@ -158,6 +161,94 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
                 ingress = root / "trainer_local_parquet_bridge.manifest.json"
                 self.assertTrue(ingress.is_file())
                 self.assertTrue(ds.probe_trainer_local_parquet_bridge_readiness().ready)
+            finally:
+                ds.LOCAL_PARQUET_DIR = old
+
+    def test_autobuild_full_mvp_disabled_raises(self) -> None:
+        """WS2: TRAINER_AUTOBUILD_FULL_MVP=0 and no snap -> clear RuntimeError."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "parallel_lda_mvp").mkdir(parents=True, exist_ok=True)
+            old = ds.LOCAL_PARQUET_DIR
+            ds.LOCAL_PARQUET_DIR = root
+            try:
+                with patch.dict(os.environ, {"TRAINER_AUTOBUILD_FULL_MVP": "0"}, clear=False):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        ensure_local_bridge_ready_for_training(
+                            logger=logging.getLogger("test_ws2"),
+                        )
+                self.assertIn("AutoBuild[mvp_full]", str(ctx.exception))
+                self.assertIn("disables", str(ctx.exception))
+            finally:
+                ds.LOCAL_PARQUET_DIR = old
+
+    def test_autobuild_full_mvp_subprocess_then_copy(self) -> None:
+        """WS2: no snap -> subprocess run_mvp; manifest copied to ingress."""
+
+        def _fake_subprocess_run(cmd: list, **kwargs: object) -> CompletedProcess:
+            dr = ds.LOCAL_PARQUET_DIR
+            bridge = dr / "mvp_trainer_bridge"
+            bridge.mkdir(parents=True, exist_ok=True)
+            bet = dr / "bridge_bet.parquet"
+            sess = dr / "bridge_sess.parquet"
+            cols: dict = {"bet_id": [1], "session_id": [1]}
+            for c in ds._OPTIONAL_BET_LDA_PHASE_C_COLS:
+                cols[c] = [1.0]
+            pq.write_table(pa.table(cols), bet)
+            pq.write_table(pa.table({"session_id": [1]}), sess)
+            mf = bridge / "trainer_local_parquet_bridge.manifest.json"
+            mf.write_text(
+                json.dumps({
+                    "artifact_kind": "trainer_local_parquet_bridge_v1",
+                    "phase_c": True,
+                    "t_bet_paths": [str(bet.resolve())],
+                    "gmwds_t_session": str(sess.resolve()),
+                }),
+                encoding="utf-8",
+            )
+            return CompletedProcess(cmd, 0)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "parallel_lda_mvp").mkdir(parents=True, exist_ok=True)
+            old = ds.LOCAL_PARQUET_DIR
+            ds.LOCAL_PARQUET_DIR = root
+            try:
+                with patch.dict(os.environ, {"TRAINER_AUTOBUILD_FULL_MVP": "1"}, clear=False):
+                    with patch.object(lbp, "_resolve_default_snap_root", return_value=None):
+                        with patch.object(lbp, "_assert_l0_inputs_for_full_mvp"):
+                            with patch(
+                                "trainer.training.local_bridge_preflight.subprocess.run",
+                                side_effect=_fake_subprocess_run,
+                            ):
+                                ensure_local_bridge_ready_for_training(
+                                    logger=logging.getLogger("test_ws2b"),
+                                )
+                ing = root / "trainer_local_parquet_bridge.manifest.json"
+                self.assertTrue(ing.is_file())
+                self.assertTrue(ds.probe_trainer_local_parquet_bridge_readiness().ready)
+            finally:
+                ds.LOCAL_PARQUET_DIR = old
+
+    def test_autobuild_full_mvp_subprocess_nonzero_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "parallel_lda_mvp").mkdir(parents=True, exist_ok=True)
+            old = ds.LOCAL_PARQUET_DIR
+            ds.LOCAL_PARQUET_DIR = root
+            try:
+                with patch.object(lbp, "_resolve_default_snap_root", return_value=None):
+                    with patch.object(lbp, "_assert_l0_inputs_for_full_mvp"):
+                        with patch(
+                            "trainer.training.local_bridge_preflight.subprocess.run",
+                            return_value=CompletedProcess(["x"], 1),
+                        ):
+                            with self.assertRaises(RuntimeError) as ctx:
+                                ensure_local_bridge_ready_for_training(
+                                    logger=logging.getLogger("test_ws2c"),
+                                )
+                self.assertIn("AutoBuild[mvp_full]", str(ctx.exception))
+                self.assertIn("exit code=1", str(ctx.exception))
             finally:
                 ds.LOCAL_PARQUET_DIR = old
 
