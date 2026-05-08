@@ -45,29 +45,19 @@ import pathlib
 import yaml as _yaml  # type: ignore[import-untyped]
 
 try:
-    from config import (  # type: ignore[import]
-        BET_AVAIL_DELAY_MIN,
-        LOSS_STREAK_PUSH_RESETS,
-        MIGRATION_STRICT_MODE,
-        PLACEHOLDER_PLAYER_ID,
-        RUN_BREAK_MIN,
-        SCREEN_FEATURES_TOP_K,
-        TABLE_HC_WINDOW_MIN,
-        apply_duckdb_runtime,
-        resolve_duckdb_runtime_policy,
-    )
+    import config as _cfg  # type: ignore[import]
 except ModuleNotFoundError:
-    from trainer.config import (  # type: ignore[import]
-        BET_AVAIL_DELAY_MIN,
-        LOSS_STREAK_PUSH_RESETS,
-        MIGRATION_STRICT_MODE,
-        PLACEHOLDER_PLAYER_ID,
-        RUN_BREAK_MIN,
-        SCREEN_FEATURES_TOP_K,
-        TABLE_HC_WINDOW_MIN,
-        apply_duckdb_runtime,
-        resolve_duckdb_runtime_policy,
-    )
+    import trainer.config as _cfg  # type: ignore[import]
+
+BET_AVAIL_DELAY_MIN = _cfg.BET_AVAIL_DELAY_MIN
+LOSS_STREAK_PUSH_RESETS = _cfg.LOSS_STREAK_PUSH_RESETS
+PLACEHOLDER_PLAYER_ID = _cfg.PLACEHOLDER_PLAYER_ID
+RUN_BREAK_MIN = _cfg.RUN_BREAK_MIN
+SCREEN_FEATURES_TOP_K = _cfg.SCREEN_FEATURES_TOP_K
+TABLE_HC_WINDOW_MIN = _cfg.TABLE_HC_WINDOW_MIN
+apply_duckdb_runtime = _cfg.apply_duckdb_runtime
+resolve_duckdb_runtime_policy = _cfg.resolve_duckdb_runtime_policy
+MIGRATION_STRICT_MODE = str(getattr(_cfg, "MIGRATION_STRICT_MODE", "warn")).strip().lower() or "warn"
 
 logger = logging.getLogger(__name__)
 
@@ -2061,8 +2051,16 @@ def build_runtime_feature_spec_subset(full_spec: dict, feature_cols: Sequence[st
             deepcopy(c)
             for c in cands
             if isinstance(c, dict)
-            and c.get("feature_id")
-            and str(c["feature_id"]) in needed
+            and (
+                (
+                    c.get("feature_id")
+                    and str(c["feature_id"]) in needed
+                )
+                # Keep anonymous/non-feature_id nodes: some specs encode
+                # intermediate compute steps here and they are not addressable
+                # via depends_on closure.
+                or not c.get("feature_id")
+            )
         ]
     out["runtime_subset"] = {
         "model_feature_ids": [str(x) for x in feature_cols if x],

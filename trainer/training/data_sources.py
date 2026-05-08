@@ -193,17 +193,29 @@ def load_trainer_local_parquet_bridge_manifest() -> Dict[str, Any]:
     return dict(json.loads(p.read_text(encoding="utf-8")))
 
 
-def _resolve_manifest_path_str(raw: str, *, manifest_path: Path) -> Path:
-    """Resolve a manifest path entry to an absolute Path (portable: prefers repo-relative)."""
+def _resolve_manifest_path_str(
+    raw: str,
+    *,
+    manifest_path: Path,
+    prefer_project_root: bool = False,
+) -> Path:
+    """Resolve a manifest path entry to an absolute Path.
+
+    ``prefer_project_root`` pins the intended anchor for relative paths.
+    This avoids ambiguous resolution when manifests contain mixed anchors
+    (some paths relative to ``PROJECT_ROOT``, others to ``manifest_path.parent``).
+    """
     p = Path(str(raw)).expanduser()
     if not p.is_absolute():
-        cand = (manifest_path.parent / p).resolve()
-        if cand.is_file():
-            return cand
-        pr = (PROJECT_ROOT / p).resolve()
-        if pr.is_file():
-            return pr
-        return cand
+        anchor_primary = PROJECT_ROOT if prefer_project_root else manifest_path.parent
+        anchor_secondary = manifest_path.parent if prefer_project_root else PROJECT_ROOT
+        primary = (anchor_primary / p).resolve()
+        secondary = (anchor_secondary / p).resolve()
+        if primary.is_file():
+            return primary
+        if secondary.is_file():
+            return secondary
+        return primary
     pr_abs = p.resolve()
     try:
         rel = pr_abs.relative_to(PROJECT_ROOT.resolve())
@@ -223,25 +235,43 @@ def resolve_local_parquet_bet_session_paths_from_manifest(
     """Resolve bet and session Parquet paths from a bridge manifest dict."""
     mp = manifest_path if manifest_path is not None else trainer_local_parquet_bridge_manifest_path()
     raw_bet: Optional[str] = None
+    bet_prefer_project_root = False
     t_bet_paths = manifest.get("t_bet_paths")
     if isinstance(t_bet_paths, list) and t_bet_paths:
         raw_bet = str(t_bet_paths[0])
+        bet_prefer_project_root = True
     if raw_bet is None and manifest.get("gmwds_t_bet"):
         raw_bet = str(manifest["gmwds_t_bet"])
+        bet_prefer_project_root = False
     if not raw_bet:
         raise KeyError(
             "manifest must contain non-empty 't_bet_paths' or 'gmwds_t_bet' "
             f"(got keys={sorted(manifest.keys())!r})"
         )
-    sess_raw = manifest.get("gmwds_t_session") or manifest.get("t_session_source")
+    sess_raw: Optional[Any] = None
+    sess_prefer_project_root = False
+    if manifest.get("gmwds_t_session"):
+        sess_raw = manifest.get("gmwds_t_session")
+        sess_prefer_project_root = False
+    elif manifest.get("t_session_source"):
+        sess_raw = manifest.get("t_session_source")
+        sess_prefer_project_root = True
     if not sess_raw:
         raise KeyError(
             "manifest must contain 'gmwds_t_session' or 't_session_source' "
             f"(got keys={sorted(manifest.keys())!r})"
         )
     return (
-        _resolve_manifest_path_str(raw_bet, manifest_path=mp),
-        _resolve_manifest_path_str(str(sess_raw), manifest_path=mp),
+        _resolve_manifest_path_str(
+            raw_bet,
+            manifest_path=mp,
+            prefer_project_root=bet_prefer_project_root,
+        ),
+        _resolve_manifest_path_str(
+            str(sess_raw),
+            manifest_path=mp,
+            prefer_project_root=sess_prefer_project_root,
+        ),
     )
 
 
