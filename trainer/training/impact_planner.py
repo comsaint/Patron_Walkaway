@@ -8,13 +8,13 @@ when unknown, ``partition_id`` is ``*`` and ``impact_scope`` is ``full_matrix``.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from trainer.features.features import get_cross_layer_compose_contract, get_layer_for_feature
 from trainer.training.data_sources import _OPTIONAL_BET_LDA_RUN_TRIP_COLS
 
 
-IMPACT_PLANNER_VERSION: str = "impact_planner_v1"
+IMPACT_PLANNER_VERSION: str = "impact_planner_v2"
 
 
 def _infer_spec_track_layer(feature_id: str, spec: dict) -> Optional[str]:
@@ -41,6 +41,25 @@ def resolve_materialization_layer(feature_id: str, spec: dict) -> str:
     if mapped is not None:
         return str(mapped)
     return "bet"
+
+
+def _expand_work_units_to_partitions(
+    work: List[Dict[str, Any]],
+    partition_ids: Optional[Sequence[str]],
+) -> List[Dict[str, Any]]:
+    """Replace ``partition_id`` ``*`` with concrete chunk partition ids when provided."""
+    if not partition_ids:
+        return work
+    out: List[Dict[str, Any]] = []
+    for w in work:
+        if w.get("partition_id") != "*":
+            out.append(dict(w))
+            continue
+        for pid in partition_ids:
+            ww = dict(w)
+            ww["partition_id"] = str(pid)
+            out.append(ww)
+    return out
 
 
 def _compose_downstream_closure(
@@ -74,6 +93,7 @@ def plan_impacted_materialization_work(
     prev_source_snapshot_id: Optional[str],
     curr_source_snapshot_id: Optional[str],
     lookback_partition_count: Optional[int] = None,
+    chunk_partition_ids: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Return impacted work units and observability flags.
 
@@ -92,6 +112,10 @@ def plan_impacted_materialization_work(
         Optional hint for operators; when snapshot changes and this is None,
         ``impact_scope`` is ``full_matrix`` (plan: upgrade to full recompute when
         partition boundary unknown).
+    chunk_partition_ids:
+        When set (e.g. from Step 1 ``get_single_window_chunk``), work units with
+        ``partition_id='*'`` are expanded to one row per chunk partition so
+        ``(layer, feature_id, partition_id)`` is concrete for orchestration.
     """
     if not isinstance(curr_spec, dict):
         raise TypeError(f"curr_spec must be dict, got {type(curr_spec).__name__}")
@@ -151,11 +175,18 @@ def plan_impacted_materialization_work(
     curr_s = (curr_source_snapshot_id or "").strip()
     if prev_s and curr_s and prev_s != curr_s:
         reasons.append("DATA_SNAPSHOT_ID_CHANGED")
-        full_matrix = True
-        miss_reason = (
-            "partition-level impact unknown after source_snapshot_id change; "
-            "treat as full_matrix (see lookback_partition_count)"
-        )
+        if chunk_partition_ids:
+            full_matrix = False
+            miss_reason = (
+                "source_snapshot_id changed; impacts scoped to known chunk "
+                f"partitions (n={len(chunk_partition_ids)}) — verify lookback vs late-arrival"
+            )
+        else:
+            full_matrix = True
+            miss_reason = (
+                "partition-level impact unknown after source_snapshot_id change "
+                "(no chunk_partition_ids); treat as full_matrix (see lookback_partition_count)"
+            )
         declared: Set[str] = set()
         for track in ("track_llm", "track_human", "track_profile"):
             for cand in (curr_spec.get(track) or {}).get("candidates") or []:
@@ -180,6 +211,8 @@ def plan_impacted_materialization_work(
                 }
             )
 
+    work = _expand_work_units_to_partitions(work, chunk_partition_ids)
+
     # De-duplicate work units (same key may appear from spec + compose)
     seen: Set[Tuple[str, str, str, str]] = set()
     deduped: List[Dict[str, Any]] = []
@@ -193,12 +226,15 @@ def plan_impacted_materialization_work(
     impact_scope = "full_matrix" if full_matrix else ("none" if not deduped else "spec_or_lineage_delta")
     if lookback_partition_count is not None:
         impact_scope = f"{impact_scope};lookback_partitions={int(lookback_partition_count)}"
+    if chunk_partition_ids:
+        impact_scope = f"{impact_scope};chunk_partitions={len(chunk_partition_ids)}"
 
     return {
         "impact_planner_version": IMPACT_PLANNER_VERSION,
         "impact_reasons": sorted(set(reasons)),
         "impact_scope": impact_scope,
         "full_matrix_recommended": bool(full_matrix),
+        "chunk_partition_ids": list(chunk_partition_ids) if chunk_partition_ids else None,
         "miss_reason": miss_reason,
         "impacted_work_unit_count": len(deduped),
         "impacted_work_units": deduped[:5000],

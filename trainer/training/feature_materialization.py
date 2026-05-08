@@ -206,6 +206,7 @@ def build_pipeline_feature_materialization_audit(
     curr_source_snapshot_id: Optional[str] = None,
     lookback_partition_count: Optional[int] = None,
     pit_policy_id: str = "cutoff_window",
+    chunk_partition_ids: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """JSON-serialisable audit block for ``pipeline_diagnostics.json``."""
     fps = per_feature_fingerprints(feature_spec)
@@ -227,6 +228,7 @@ def build_pipeline_feature_materialization_audit(
             "asset_path_set": bool(pap),
             "status": "asset_parquet" if pap else "inline_join_default",
         },
+        "chunk_partition_ids": list(chunk_partition_ids) if chunk_partition_ids else None,
     }
     if isinstance(feature_spec, dict):
         from trainer.training.impact_planner import plan_impacted_materialization_work, resolve_materialization_layer
@@ -239,8 +241,10 @@ def build_pipeline_feature_materialization_audit(
             prev_source_snapshot_id=prev_source_snapshot_id,
             curr_source_snapshot_id=curr_source_snapshot_id,
             lookback_partition_count=lookback_partition_count,
+            chunk_partition_ids=chunk_partition_ids,
         )
         # WS2: sample cache-key lexicon for compose + a few declared ids (bounded size).
+        _pid_sample = (chunk_partition_ids[0] if chunk_partition_ids else "*")
         _sample: List[Dict[str, Any]] = []
         for fid in sorted(cross.keys())[:12]:
             uhash = upstream_fingerprint_closure_hash(feature_spec, fid, fps)
@@ -252,7 +256,7 @@ def build_pipeline_feature_materialization_audit(
                     "cache_key_parts": build_feature_cache_key_parts(
                         layer="compose",
                         feature_id=fid,
-                        partition_id="*",
+                        partition_id=_pid_sample,
                         source_snapshot_id=str(curr_source_snapshot_id or "unknown"),
                         pit_policy_id=pit_policy_id,
                         feature_fingerprint=own_fp,
@@ -272,7 +276,7 @@ def build_pipeline_feature_materialization_audit(
                     "cache_key_parts": build_feature_cache_key_parts(
                         layer=lyr,
                         feature_id=fid,
-                        partition_id="*",
+                        partition_id=_pid_sample,
                         source_snapshot_id=str(curr_source_snapshot_id or "unknown"),
                         pit_policy_id=pit_policy_id,
                         feature_fingerprint=fps[fid],

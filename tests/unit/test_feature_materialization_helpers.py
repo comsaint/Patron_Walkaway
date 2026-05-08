@@ -78,7 +78,7 @@ class TestFeatureMaterializationHelpers(unittest.TestCase):
             curr_source_snapshot_id="snap_x",
         )
         self.assertIn("impact_plan", audit)
-        self.assertEqual(audit["impact_plan"]["impact_planner_version"], "impact_planner_v1")
+        self.assertEqual(audit["impact_plan"]["impact_planner_version"], "impact_planner_v2")
         self.assertIn("cache_key_lexicon_sample", audit)
         self.assertIn("materialization_gates", audit)
 
@@ -137,6 +137,55 @@ class TestImpactPlanner(unittest.TestCase):
         self.assertTrue(plan["full_matrix_recommended"])
         self.assertIn("DATA_SNAPSHOT_ID_CHANGED", plan["impact_reasons"])
         self.assertGreater(plan["impacted_work_unit_count"], 0)
+
+    def test_snapshot_change_expands_to_chunk_partitions(self) -> None:
+        from trainer.training.impact_planner import plan_impacted_materialization_work
+
+        spec = {"track_llm": {"candidates": [{"feature_id": "f1", "expression": "x"}]}}
+        pids = ["time_chunk:20250101:20250131", "time_chunk:20250201:20250228"]
+        plan = plan_impacted_materialization_work(
+            curr_spec=spec,
+            prev_spec=None,
+            prev_per_feature_fp=None,
+            prev_source_snapshot_id="snap_a",
+            curr_source_snapshot_id="snap_b",
+            chunk_partition_ids=pids,
+        )
+        self.assertFalse(plan["full_matrix_recommended"])
+        self.assertGreater(plan["impacted_work_unit_count"], 0)
+        parts = {u["partition_id"] for u in plan["impacted_work_units"]}
+        self.assertEqual(parts, set(pids))
+        self.assertTrue(all(u["partition_id"] in pids for u in plan["impacted_work_units"]))
+
+
+class TestLayerAssetStore(unittest.TestCase):
+    """trainer.training.layer_asset_store — partition id + manifest."""
+
+    def test_chunk_partition_id_stable(self) -> None:
+        from trainer.training.layer_asset_store import chunk_partition_id, write_chunk_layer_asset_manifest
+        import tempfile
+        from pathlib import Path
+        import pandas as pd
+
+        ws = pd.Timestamp("2025-03-01")
+        we = pd.Timestamp("2025-03-31")
+        self.assertEqual(chunk_partition_id(ws, we), "time_chunk:20250301:20250331")
+        spec = {"track_llm": {"candidates": [{"feature_id": "f1", "expression": "1"}]}}
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "chunk_20250301_20250331.parquet"
+            p.write_bytes(b"")
+            write_chunk_layer_asset_manifest(
+                chunk_parquet_path=p,
+                chunk={"window_start": ws, "window_end": we},
+                labeled_columns=pd.Index(["f1", "label", "bet_id"]),
+                feature_spec=spec,
+                source_snapshot_id="snap_z",
+                pit_policy_id="cutoff_window",
+                pit_identity_engine="cutoff_window_map",
+                row_count=3,
+            )
+            side = p.with_suffix(".layer_assets.json")
+            self.assertTrue(side.is_file())
 
 
 class TestTripMaterializer(unittest.TestCase):

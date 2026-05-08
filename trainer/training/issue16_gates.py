@@ -160,7 +160,10 @@ def spec_first_column_guard(
     """
     if train_column_names is None:
         return True, "skip: train column names unavailable"
-    ok, detail = validate_spec_first_training_columns(train_column_names, dict(feature_spec) if feature_spec else None)
+    ok, detail = validate_spec_first_training_columns(
+        train_column_names,
+        dict(feature_spec) if feature_spec is not None else None,
+    )
     if strict_spec_first_enabled():
         return ok, detail
     if not ok:

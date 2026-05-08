@@ -2807,6 +2807,26 @@ def process_chunk(
         _write_chunk_cache_sidecar(current_key, _cache_components, source_mode=_source_mode),
         encoding="utf-8",
     )
+    try:
+        from trainer.training.layer_asset_store import write_chunk_layer_asset_manifest
+
+        write_chunk_layer_asset_manifest(
+            chunk_parquet_path=chunk_path,
+            chunk=chunk,
+            labeled_columns=labeled.columns,
+            feature_spec=feature_spec,
+            source_snapshot_id=read_bridge_source_snapshot_id(),
+            pit_policy_id=str(identity_mapping_mode),
+            pit_identity_engine=str(_pit_engine),
+            row_count=len(labeled),
+        )
+    except Exception as _lam_exc:
+        logger.warning(
+            "Chunk %s–%s: layer asset manifest write failed (non-fatal): %s",
+            window_start.date(),
+            window_end.date(),
+            _lam_exc,
+        )
     return chunk_path
 
 
@@ -8623,16 +8643,31 @@ def run_pipeline(args) -> None:
             if _player_asset_raw:
                 pipeline_echo("Step 5/10 — Load player layer asset (TRAINER_PLAYER_LAYER_ASSET_PATH) …")
                 t0 = time.perf_counter()
-                profile_df = load_player_layer_asset_parquet(Path(_player_asset_raw))
-                _el = time.perf_counter() - t0
-                step5_duration_sec = _el
-                pipeline_echo(f"Step 5/10 — done in {_el:.1f}s ({len(profile_df)} asset rows)")
-                logger.info(
-                    "player layer asset: loaded %d rows from %s (%.1fs)",
-                    len(profile_df),
-                    _player_asset_raw,
-                    _el,
-                )
+                try:
+                    profile_df = load_player_layer_asset_parquet(Path(_player_asset_raw))
+                    _el = time.perf_counter() - t0
+                    step5_duration_sec = _el
+                    pipeline_echo(f"Step 5/10 — done in {_el:.1f}s ({len(profile_df)} asset rows)")
+                    logger.info(
+                        "player layer asset: loaded %d rows from %s (%.1fs)",
+                        len(profile_df),
+                        _player_asset_raw,
+                        _el,
+                    )
+                except Exception as exc:
+                    profile_df = None
+                    _el = time.perf_counter() - t0
+                    step5_duration_sec = _el
+                    pipeline_echo(
+                        f"Step 5/10 — done in {_el:.1f}s "
+                        "(asset load failed; profile features will be NaN)"
+                    )
+                    logger.warning(
+                        "player layer asset load failed from %s: %s; "
+                        "profile features will be NaN for this run.",
+                        _player_asset_raw,
+                        exc,
+                    )
             else:
                 pipeline_echo("Step 5/10 — Load player_profile for PIT join …")
                 t0 = time.perf_counter()
@@ -9538,12 +9573,20 @@ def run_pipeline(args) -> None:
                     _fm_audit.maybe_raise_spec_first_columns(_train_schema_col_list, feature_spec)
                     _curr_src_snap = read_bridge_source_snapshot_id() if use_local else None
                     _prev_src_snap = (os.environ.get("TRAINER_PREV_SOURCE_SNAPSHOT_ID") or "").strip() or None
+                    _chunk_partition_ids_for_audit: Optional[List[str]] = None
+                    try:
+                        from trainer.training.layer_asset_store import chunk_partition_ids_for_windows
+
+                        _chunk_partition_ids_for_audit = chunk_partition_ids_for_windows(chunks)
+                    except Exception as _cpid_exc:
+                        logger.debug("chunk_partition_ids_for audit skipped: %s", _cpid_exc)
                     feature_materialization_audit = _fm_audit.build_pipeline_feature_materialization_audit(
                         feature_spec=feature_spec,
                         train_columns=_train_schema_col_list,
                         curr_source_snapshot_id=_curr_src_snap,
                         prev_source_snapshot_id=_prev_src_snap,
                         pit_policy_id=str(effective_identity_mode),
+                        chunk_partition_ids=_chunk_partition_ids_for_audit,
                     )
                     _fm_audit.raise_if_strict_materialization_gates_failed(
                         feature_materialization_audit["materialization_gates"],
