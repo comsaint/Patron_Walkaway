@@ -126,6 +126,7 @@ except ImportError:
 # scorer can route through the same contract as trainer.py / backtester.py.
 try:
     from layered import (  # type: ignore[import]
+        compute_bet_duckdb_window_features,
         compute_bet_layer_features,
         compute_player_layer_features,
         evaluate_pit_admission,
@@ -135,6 +136,7 @@ try:
 except ImportError:
     try:
         from .layered import (  # type: ignore[import, attr-defined]
+            compute_bet_duckdb_window_features,
             compute_bet_layer_features,
             compute_player_layer_features,
             evaluate_pit_admission,
@@ -144,6 +146,7 @@ except ImportError:
     except ImportError:
         try:
             from trainer.features.layered import (  # type: ignore[import, attr-defined]
+                compute_bet_duckdb_window_features,
                 compute_bet_layer_features,
                 compute_player_layer_features,
                 evaluate_pit_admission,
@@ -151,6 +154,7 @@ except ImportError:
                 SKIP_REASON_PIT_UNAVAILABLE_SOURCE,
             )
         except ImportError:
+            compute_bet_duckdb_window_features = None  # type: ignore[assignment]
             compute_bet_layer_features = None  # type: ignore[assignment]
             compute_player_layer_features = None  # type: ignore[assignment]
             evaluate_pit_admission = None  # type: ignore[assignment]
@@ -2488,21 +2492,23 @@ def score_once(
         else 0
     )
 
-    # Rated-only slice before Track LLM + profile join (heavy steps); session rolling above unchanged.
+    # Rated-only slice before bet_duckdb_window + profile join (heavy steps); session rolling above unchanged.
     features_all = features_all[features_all["canonical_id"].isin(rated_canonical_ids)].copy()
 
-    # Track LLM: compute DuckDB features from feature spec when available.
+    # bet_duckdb_window: compute DuckDB window features from feature spec when available.
     # Phase B PR-B4: route through layered bet entrypoint when available
     # (thin wrapper over compute_track_llm_features). Fallback preserves the
     # original call when the layered module fails to import.
     _feature_spec = artifacts.get("feature_spec")
     if _feature_spec is not None:
         _n_before_llm = len(features_all)
-        _bet_compute = (
-            compute_bet_layer_features
-            if compute_bet_layer_features is not None
-            else compute_track_llm_features
-        )
+        _bet_compute = compute_bet_duckdb_window_features
+        if _bet_compute is None:
+            _bet_compute = (
+                compute_bet_layer_features
+                if compute_bet_layer_features is not None
+                else compute_track_llm_features
+            )
         try:
             features_all = _bet_compute(
                 features_all,
@@ -2512,12 +2518,12 @@ def score_once(
             # R3503: log if cutoff filtering silently reduced the scoring window.
             if len(features_all) < _n_before_llm:
                 logger.warning(
-                    "[scorer] Track LLM dropped %d rows (cutoff filter)",
+                    "[scorer] bet_duckdb_window dropped %d rows (cutoff filter)",
                     _n_before_llm - len(features_all),
                 )
-            logger.debug("[scorer] Track LLM computed for scoring window")
+            logger.debug("[scorer] bet_duckdb_window computed for scoring window")
         except Exception as exc:
-            logger.error("[scorer] Track LLM failed: %s", exc)
+            logger.error("[scorer] bet_duckdb_window failed: %s", exc)
 
     if bool(getattr(config, "T_GAME_FEATURES_ENABLED", False)):
         _data_root = _DATA_DIR if _DATA_DIR is not None else (PROJECT_ROOT / "data")

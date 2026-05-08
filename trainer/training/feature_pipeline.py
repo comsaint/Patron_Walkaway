@@ -300,3 +300,7 @@ def add_track_human_features(
         )
 
     return df
+
+
+# Layer+method public alias (run-level state machine; legacy "Track Human").
+add_run_state_machine_features = add_track_human_features

@@ -81,9 +81,27 @@ C. Run/trip entities that can be open vs closed MUST carry explicit state in ass
 D. Datasets can be huge — default to DuckDB / Parquet pushdown and staged outputs.
    OOM hardening is tracked separately (issue #10).
 
+E. **Local L2 bundle reuse** (avoid recomputation): with ``--use-local-parquet``, the trainer
+   may write or reuse a materialized split bundle under ``<LOCAL_PARQUET_DIR>/l2_training_bundle``
+   (override with ``--l2-auto-bundle-dir``) when ``.l2_bundle_cache_key.json`` matches the
+   current window, spec fingerprint, and bridge manifest stat token. Pass ``--no-l2-auto-bundle``
+   to force the full in-process Steps 4–10 path. Explicit ``--l2-training-bundle DIR`` still
+   skips Steps 1–7 regardless of cache.
+
 Layered framework
 -----------------
 - ``layered_framework`` in the **dev** catalog is the **contract authority** for
   layer semantics (bet / run / trip / player). Legacy ``track_*`` blocks may remain
   as the **implementation partition** inside the same YAML until compute paths are
   fully migrated; new work MUST target layered semantics first.
+
+- **Layer+method YAML aliases** (optional; mirrored to legacy keys at load time):
+  ``bet_duckdb_window`` ↔ ``track_llm``, ``run_state_machine`` ↔ ``track_human``,
+  ``player_profile_snapshot`` ↔ ``track_profile``. Author either vocabulary; do not
+  duplicate conflicting candidate lists under both names in the same file.
+
+- **Label intermediate disk cache** (Step 6, ``CHUNK_DIR``): full
+  ``compute_labels`` output may be cached as ``chunk_<ws>_<we>.label_intermediate.parquet``
+  with a JSON sidecar so reruns skip label CPU when label semantics + bet inputs are
+  unchanged. Disable with ``DISABLE_LABEL_ASSET_CACHE=1``; bump semantics with
+  ``LABEL_DEFINITION_VERSION``.

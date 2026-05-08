@@ -12,7 +12,7 @@ import json
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Union
 
 import pandas as pd
 
@@ -149,6 +149,8 @@ def materialize_l2_training_bundle_dir(
     identity_mapping_mode: str,
     train_sampling_applied: bool,
     cache_key: Mapping[str, Any],
+    label_asset_parquet: Optional[Union[str, Path]] = None,
+    label_asset_meta: Optional[Mapping[str, Any]] = None,
 ) -> Path:
     """Write train/valid/test parquets + ``l2_training_bundle.json`` + cache sidecar.
 
@@ -199,6 +201,15 @@ def materialize_l2_training_bundle_dir(
         },
         "identity_mapping_mode": str(identity_mapping_mode),
     }
+    if label_asset_parquet is not None:
+        src = Path(label_asset_parquet)
+        if src.is_file():
+            dest = bundle_dir / "label_asset.parquet"
+            shutil.copy2(src, dest)
+            lam: Dict[str, Any] = {"path": "label_asset.parquet"}
+            if label_asset_meta:
+                lam.update(dict(label_asset_meta))
+            manifest["label_asset"] = lam
     (bundle_dir / "l2_training_bundle.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

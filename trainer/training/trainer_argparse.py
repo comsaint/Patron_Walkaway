@@ -174,7 +174,10 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         help=(
             "GitHub #16 / TRN-16-03: train from pre-assembled L2 split parquets under DIR "
             "using l2_training_bundle.json (skips chunk Steps 1–7). "
-            "Loads train/valid/test fully into memory (RAM risk on large data)."
+            "Loads train/valid/test fully into memory (RAM risk on large data). "
+            "When omitted with --use-local-parquet, the trainer auto-reuses a bundle under "
+            "<repo>/data/l2_training_bundle (override with --l2-auto-bundle-dir) when "
+            ".l2_bundle_cache_key.json matches the current window/spec/manifest fingerprint."
         ),
     )
     parser.add_argument(
@@ -191,8 +194,9 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         "--no-l2-auto-bundle",
         action="store_true",
         help=(
-            "When --l2-auto-from-local is set, disable automatic L2 bundle materialization "
-            "(use full chunk Steps 4–10 unless --l2-training-bundle is set)."
+            "With --use-local-parquet: disable automatic L2 bundle cache hit (after Step 3) "
+            "and post–Step-7 materialize+train-via-L2 path; run full Steps 4–10 in-process "
+            "unless --l2-training-bundle is set."
         ),
     )
     parser.add_argument(
@@ -201,8 +205,9 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         default=None,
         metavar="DIR",
         help=(
-            "Override directory for auto-built L2 bundle (default: <repo>/data/l2_training_bundle). "
-            "Used with --use-local-parquet when --legacy-chunk-mode is not set."
+            "Override directory for auto-built / auto-reused L2 bundle (default: "
+            "<repo>/data/l2_training_bundle). Used with --use-local-parquet when "
+            "--no-l2-auto-bundle is not set."
         ),
     )
     return parser

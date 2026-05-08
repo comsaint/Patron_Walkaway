@@ -2,6 +2,10 @@
 
 本文件說明 **Feature Spec YAML** 的角色、結構與使用方式，並提供一段「給未來 LLM 看的 Prompt」範例，方便之後自動產生 Track LLM 候選特徵。
 
+> **命名演進（layer + method）**：除 legacy 的 ``track_llm`` / ``track_human`` / ``track_profile`` 區塊外，載入器亦接受
+> ``bet_duckdb_window``、``run_state_machine``、``player_profile_snapshot``（與 legacy 互為鏡像，二擇一填寫候選即可）。
+> 執行時仍會正規化到 ``track_*`` 鍵供既有 DuckDB / state-machine 程式路徑使用。
+
 > 關鍵原則：  
 > - **人類決定語義與護欄**（哪些欄位可以用、允許哪些函數、視窗長度上限）。  
 > - **LLM 協助發想 expression + window_frame**，但不寫整段 SQL。  

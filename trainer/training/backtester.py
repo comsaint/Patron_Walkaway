@@ -141,6 +141,7 @@ try:
         load_local_parquet,
     )
     from trainer.training.feature_pipeline import (
+        add_run_state_machine_features,
         add_track_human_features,
         apply_dq,
     )
@@ -156,6 +157,7 @@ try:
     )
     # Phase C PR-C4: unified admission helper (module-level for Gate-C1 visibility).
     from trainer.features.layered import (
+        compute_bet_duckdb_window_features,
         evaluate_pit_admission,
         SKIP_REASON_IDENTITY_UNMATCHED,
     )
@@ -174,6 +176,7 @@ except ModuleNotFoundError:
         load_local_parquet,
     )
     from trainer.training.feature_pipeline import (
+        add_run_state_machine_features,
         add_track_human_features,
         apply_dq,
     )
@@ -188,6 +191,7 @@ except ModuleNotFoundError:
         HISTORY_BUFFER_DAYS,
     )
     from trainer.features.layered import (
+        compute_bet_duckdb_window_features,
         evaluate_pit_admission,
         SKIP_REASON_IDENTITY_UNMATCHED,
     )
@@ -998,12 +1002,17 @@ def backtest(
             _adm.admitted_rows,
         )
     if bets.empty:
-        return {"error": "No rated rows after early prune", **_run_contract}
+        return {
+            "error": "No rated rows after early prune",
+            "track_llm_degraded": False,
+            "bet_duckdb_window_degraded": False,
+            **_run_contract,
+        }
 
-    # --- Track-B features (same lookback as trainer/scorer for parity) ---
-    bets = add_track_human_features(bets, canonical_map, window_end, lookback_hours=SCORER_LOOKBACK_HOURS)
+    # --- run_state_machine features (same lookback as trainer/scorer for parity) ---
+    bets = add_run_state_machine_features(bets, canonical_map, window_end, lookback_hours=SCORER_LOOKBACK_HOURS)
 
-    # --- Track LLM on FULL bets (PLAN § Train–Serve Parity) ---
+    # --- bet_duckdb_window features on FULL bets (PLAN § Train–Serve Parity) ---
     # Compute before label filtering so window features see same history as trainer/scorer.
     _track_llm_degraded = False
     _bundle_root = model_bundle_dir if model_bundle_dir is not None else _default_model_bundle_root()
@@ -1016,7 +1025,7 @@ def backtest(
         )
     feature_spec = load_feature_spec(_spec_path)
     try:
-        _bets_llm_result = compute_track_llm_features(
+        _bets_llm_result = compute_bet_duckdb_window_features(
             bets,
             feature_spec=feature_spec,
             cutoff_time=window_end,
@@ -1036,9 +1045,9 @@ def backtest(
                 how="left",
             )
     except Exception as exc:
-        logger.error("Track LLM failed in backtester: %s", exc)
+        logger.error("bet_duckdb_window features failed in backtester: %s", exc)
         logger.warning(
-            "Track LLM failed; artifact LLM features will be zero-filled. Backtest scores may be unreliable."
+            "bet_duckdb_window failed; artifact bet-layer features will be zero-filled. Backtest scores may be unreliable."
         )
         _track_llm_degraded = True
 
@@ -1053,6 +1062,7 @@ def backtest(
         return {
             "error": "No rows after label filtering",
             "track_llm_degraded": _track_llm_degraded,
+            "bet_duckdb_window_degraded": _track_llm_degraded,
             **_run_contract,
         }
 
@@ -1139,6 +1149,7 @@ def backtest(
             "unrated_obs": n_unrated_orig,
             "observations": n_unrated_orig,
             "track_llm_degraded": _track_llm_degraded,
+            "bet_duckdb_window_degraded": _track_llm_degraded,
             **_run_contract,
         }
 
@@ -1164,6 +1175,7 @@ def backtest(
         "rated_obs": n_rated_orig,
         "unrated_obs": n_unrated_orig,
         "track_llm_degraded": _track_llm_degraded,
+        "bet_duckdb_window_degraded": _track_llm_degraded,
         "model_default": _compute_section_metrics(
             labeled, rated_sub,
             rated_t_default, window_hours,

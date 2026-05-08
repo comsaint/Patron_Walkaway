@@ -8,11 +8,19 @@ from __future__ import annotations
 
 import datetime as dt
 import inspect
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+
+
+def _minimal_bundle_dir_with_feature_spec_yaml() -> Path:
+    d = Path(tempfile.mkdtemp())
+    (d / "feature_spec.yaml").write_text("track_llm:\n  candidates: []\n", encoding="utf-8")
+    return d
 
 try:
     import trainer.backtester as backtester_mod
@@ -31,15 +39,15 @@ class TestR222TrackLlmFailureSilentDegradation(unittest.TestCase):
         """Contract: backtest() except block logs 'Track LLM failed' (current). When production adds warning about zero-fill/unreliable, add assert for it."""
         source = inspect.getsource(backtester_mod.backtest)
         self.assertIn(
-            "Track LLM failed",
+            "bet_duckdb_window failed",
             source,
-            "R222 #1: backtest() except block must log 'Track LLM failed'.",
+            "R222 #1: backtest() except block must log bet_duckdb_window failure.",
         )
-        # Production now logs warning that scores may be unreliable when Track LLM fails.
+        # Production now logs warning that scores may be unreliable when bet-layer features fail.
         self.assertIn(
             "zero-filled",
             source,
-            "R222 #1: backtest() except block must log warning containing 'zero-filled' (artifact LLM features zero-filled).",
+            "R222 #1: backtest() except block must log warning containing 'zero-filled' (artifact bet-layer features zero-filled).",
         )
 
     def test_backtest_returns_dict_when_track_llm_raises(self):
@@ -70,12 +78,12 @@ class TestR222TrackLlmFailureSilentDegradation(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=_canonical_map_rated),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
             patch.object(
                 backtester_mod,
-                "compute_track_llm_features",
-                side_effect=RuntimeError("mock Track LLM failure"),
+                "compute_bet_duckdb_window_features",
+                side_effect=RuntimeError("mock bet_duckdb_window failure"),
             ),
             patch.object(backtester_mod, "compute_labels", side_effect=_minimal_compute_labels),
             patch.object(backtester_mod, "load_player_profile", return_value=None),
@@ -88,6 +96,7 @@ class TestR222TrackLlmFailureSilentDegradation(unittest.TestCase):
                 window_start=window_start,
                 window_end=window_end,
                 run_optuna=False,
+                model_bundle_dir=_minimal_bundle_dir_with_feature_spec_yaml(),
             )
         self.assertIsInstance(result, dict, "R222 #1: backtest must return dict when Track LLM raises.")
         self.assertNotIn("error", result, "R222 #1: backtest should complete without error key when mocks provide valid path.")
@@ -214,9 +223,9 @@ class TestR222FeatureSpecCandidatesNonList(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=_canonical_map_rated),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value=bad_spec),
-            patch.object(backtester_mod, "compute_track_llm_features", return_value=pd.DataFrame({"bet_id": [1]})),
+            patch.object(backtester_mod, "compute_bet_duckdb_window_features", return_value=pd.DataFrame({"bet_id": [1]})),
             patch.object(backtester_mod, "compute_labels", side_effect=_minimal_compute_labels),
             patch.object(backtester_mod, "load_player_profile", return_value=None),
             patch.object(backtester_mod, "join_player_profile", side_effect=_minimal_join_profile),
@@ -228,6 +237,7 @@ class TestR222FeatureSpecCandidatesNonList(unittest.TestCase):
                 window_start=window_start,
                 window_end=window_end,
                 run_optuna=False,
+                model_bundle_dir=_minimal_bundle_dir_with_feature_spec_yaml(),
             )
         self.assertIsInstance(result, dict)
         self.assertNotIn("error", result)

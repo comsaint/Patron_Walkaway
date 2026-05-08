@@ -129,6 +129,6 @@ def test_phase_b_gate_entrypoint_map() -> None:
     assert set(desc) == {"bet", "run", "trip", "player"}
     assert desc["bet"]["phase_b_status"] == "wrapped"
     assert desc["player"]["phase_b_status"] == "wrapped"
-    assert desc["run"]["phase_b_status"] == "in_place"
+    assert desc["run"]["phase_b_status"] == "wrapped"
     assert desc["trip"]["phase_b_status"] == "in_place"
-    assert "trainer.training.trainer" in desc["run"]["module"]
+    assert "trainer.training.feature_pipeline" in desc["run"]["module"]

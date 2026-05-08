@@ -180,36 +180,37 @@ def get_single_window_chunk(start: datetime, end: datetime) -> List[Dict]:
     ]
 
 
-def get_train_valid_test_split(
-    chunks: List[Dict],
+def partition_windows_for_train_end_cutoff(
+    windows: List[Dict],
     train_frac: float = TRAIN_SPLIT_FRAC,
     valid_frac: float = VALID_SPLIT_FRAC,
 ) -> Dict[str, List[Dict]]:
-    """Split an ordered chunk list into train / valid / test by time order.
+    """Partition an ordered list of time-window dicts for **train_end cutoff** only.
 
-    Fractions are applied to chunk **count**, not row count.
-    The test allocation is whatever remains after train + valid.
+    Used after ``get_single_window_chunk`` / ``get_monthly_chunks``: assigns each
+    window dict to a bucket by **count** (not row volume). The trainer uses the
+    ``train`` bucket's latest ``window_end`` as ``train_end`` for canonical mapping
+    (B1); **row-level** train/valid/test is computed later in Step 7.
 
-    When there are too few chunks to honour the requested fractions while
-    keeping at least one chunk per non-empty split, the function degrades
-    gracefully:
+    When there are too few windows to honour the requested fractions while
+    keeping at least one window per non-empty bucket, the function degrades:
 
-    * n >= 3  → each split gets at least 1 chunk (R3)
+    * n >= 3  → each bucket gets at least 1 window (R3)
     * n == 2  → train 1, valid 1, test 0
     * n == 1  → train 1, valid 0, test 0
 
     Parameters
     ----------
-    chunks     : list returned by :func:`get_monthly_chunks`
-    train_frac : fraction of chunks allocated to training.  If ``None``,
-                 defaults to :data:`config.TRAIN_SPLIT_FRAC`.
-    valid_frac : fraction of chunks allocated to validation.  If ``None``,
-                 defaults to :data:`config.VALID_SPLIT_FRAC`.
+    windows
+        Ordered list of ``{window_start, window_end, extended_end}`` dicts.
+    train_frac, valid_frac
+        Fraction of **windows** for train / valid buckets (defaults from config).
 
     Returns
     -------
-    dict with keys ``'train_chunks'``, ``'valid_chunks'``, ``'test_chunks'``,
-    each containing a (possibly empty) list of chunk dicts.
+    dict
+        Keys ``train_windows``, ``valid_windows``, ``test_windows`` — each a list
+        of the same dict objects passed in *windows*.
 
     Raises
     ------
@@ -225,35 +226,31 @@ def get_train_valid_test_split(
         )
 
     empty: Dict[str, List[Dict]] = {
-        "train_chunks": [],
-        "valid_chunks": [],
-        "test_chunks": [],
+        "train_windows": [],
+        "valid_windows": [],
+        "test_windows": [],
     }
-    n = len(chunks)
+    n = len(windows)
     if n == 0:
         return empty
 
     if n == 1:
-        return {"train_chunks": chunks[:1], "valid_chunks": [], "test_chunks": []}
+        return {"train_windows": windows[:1], "valid_windows": [], "test_windows": []}
 
     if n == 2:
-        return {"train_chunks": chunks[:1], "valid_chunks": chunks[1:], "test_chunks": []}
+        return {"train_windows": windows[:1], "valid_windows": windows[1:], "test_windows": []}
 
-    # n >= 3: honour fractions while guaranteeing >=1 chunk per split (R3).
+    # n >= 3: honour fractions while guaranteeing >=1 window per bucket (R3).
     n_train = max(1, round(n * train_frac))
     n_valid = max(1, round(n * valid_frac))
     n_test = n - n_train - n_valid
 
-    # If rounding pushed test below 1, shave from train until test >= 1.
-    # We keep n_train >= 1 as a hard floor; n_test may remain 0 only in the
-    # degenerate case where n_valid already consumes all non-train chunks
-    # (which cannot happen with valid fractions summing < 1 and n >= 3).
     while n_test < 1 and n_train > 1:
         n_train -= 1
         n_test += 1
 
     return {
-        "train_chunks": chunks[:n_train],
-        "valid_chunks": chunks[n_train : n_train + n_valid],
-        "test_chunks": chunks[n_train + n_valid :],
+        "train_windows": windows[:n_train],
+        "valid_windows": windows[n_train : n_train + n_valid],
+        "test_windows": windows[n_train + n_valid :],
     }

@@ -386,7 +386,7 @@ Dec026ThresholdPick = _threshold_selection_mod.Dec026ThresholdPick
 try:
     from time_fold import (  # type: ignore[import]
         get_single_window_chunk,
-        get_train_valid_test_split,
+        partition_windows_for_train_end_cutoff,
     )
     from identity import (  # type: ignore[import]
         build_canonical_mapping_from_df,
@@ -417,6 +417,7 @@ try:
     # over the legacy compute_track_llm_features / join_player_profile above;
     # imports kept side-by-side so fallback paths still resolve.
     from layered import (  # type: ignore[import]
+        compute_bet_duckdb_window_features,
         compute_bet_layer_features,
         compute_player_layer_features,
         evaluate_pit_admission,
@@ -435,7 +436,7 @@ try:
 except ModuleNotFoundError:
     from trainer.time_fold import (  # type: ignore[import]
         get_single_window_chunk,
-        get_train_valid_test_split,
+        partition_windows_for_train_end_cutoff,
     )
     from trainer.identity import (  # type: ignore[import]
         build_canonical_mapping_from_df,
@@ -464,6 +465,7 @@ except ModuleNotFoundError:
     )
     # Phase B PR-B3: layered entrypoints (bet/player thin wrappers over legacy).
     from trainer.features.layered import (  # type: ignore[import]
+        compute_bet_duckdb_window_features,
         compute_bet_layer_features,
         compute_player_layer_features,
         evaluate_pit_admission,
@@ -1661,9 +1663,20 @@ def ensure_player_profile_ready(
 # names ``apply_dq`` / ``add_track_human_features`` keep resolving on
 # trainer.training.trainer for all historic call sites.
 from trainer.training.feature_pipeline import (  # noqa: E402
+    add_run_state_machine_features,
     add_track_human_features,
     apply_dq,
 )
+from trainer.training.label_asset_cache import (  # noqa: E402
+    build_label_disk_cache_components,
+    label_asset_cache_disabled,
+    label_disk_cache_fingerprint,
+    label_intermediate_parquet_path,
+    label_intermediate_sidecar_path,
+    try_load_label_intermediate_cache,
+    write_label_intermediate_cache,
+)
+from trainer.training.l2_bundle_materialize import read_bridge_source_snapshot_id  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -1677,7 +1690,7 @@ def _chunk_parquet_path(chunk: dict) -> Path:
 
 
 def _chunk_prefeatures_parquet_path(chunk: dict) -> Path:
-    """Task 7 R6: Parquet of bets after Track Human, before Track LLM."""
+    """Task 7 R6: Parquet of bets after run_state_machine, before bet_duckdb_window."""
     ws = chunk["window_start"].strftime("%Y%m%d")
     we = chunk["window_end"].strftime("%Y%m%d")
     return CHUNK_DIR / f"chunk_{ws}_{we}.prefeatures.parquet"
@@ -1945,11 +1958,14 @@ def _chunk_cache_components(
     _effective_lookback = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)
     cfg_str = json.dumps({
         "WALKAWAY_GAP_MIN": WALKAWAY_GAP_MIN,
+        "ALERT_HORIZON_MIN": int(ALERT_HORIZON_MIN),
+        "LABEL_LOOKAHEAD_MIN": int(LABEL_LOOKAHEAD_MIN),
         "SESSION_AVAIL_DELAY_MIN": SESSION_AVAIL_DELAY_MIN,
         "BET_AVAIL_DELAY_MIN": BET_AVAIL_DELAY_MIN,
         "TABLE_HC_WINDOW_MIN": int(getattr(_cfg, "TABLE_HC_WINDOW_MIN", 30)),
         "HISTORY_BUFFER_DAYS": HISTORY_BUFFER_DAYS,
         "TRACK_HUMAN_LOOKBACK_HOURS": _effective_lookback,
+        "RUN_STATE_MACHINE_LOOKBACK_HOURS": _effective_lookback,
         "identity_mapping_mode": str(identity_mapping_mode),
         "pit_identity_engine": str(pit_identity_engine),
         "t_game_features_enabled": bool(getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)),
@@ -2204,15 +2220,15 @@ def process_chunk(
     dummy_player_ids: FND-12 dummy/fake-account player_ids to drop from training (TRN-04).
     profile_df: player_profile snapshot table for PIT join (PLAN Step 4/DEC-011).
         Pass None to skip; profile feature columns will be 0 for all rows.
-    feature_spec: parsed Track LLM feature spec loaded by run_pipeline.
-    feature_spec_hash: short hash of the feature spec used to compute Track LLM
+    feature_spec: parsed feature spec (bet_duckdb_window / legacy track_llm) loaded by run_pipeline.
+    feature_spec_hash: short hash of the feature spec used to compute bet-layer DuckDB window
         columns; included in the chunk cache key so spec changes bust cache.
     neg_sample_frac: fraction of label=0 rows to keep (1.0 = keep all).  Overrides
         the module-level NEG_SAMPLE_FRAC; normally supplied by run_pipeline after the
         OOM pre-check (_oom_check_and_adjust_neg_sample_frac).
 
     Task 7 R6: pre-LLM Parquet cache (``*.prefeatures.parquet``) is **on by default**
-    (``trainer.core.config.CHUNK_TWO_STAGE_CACHE_DEFAULT``) so Track Human can be skipped
+    (``trainer.core.config.CHUNK_TWO_STAGE_CACHE_DEFAULT``) so run_state_machine can be skipped
     when only spec/neg_sample (downstream) changes. Disable with env
     ``CHUNK_TWO_STAGE_CACHE=0`` / ``false`` / ``no`` / ``off`` if RAM or disk is tight
     (see ``doc/training_oom_and_runtime_audit.md``).
@@ -2445,30 +2461,33 @@ def process_chunk(
     _pref_key_path = _chunk_prefeatures_sidecar_path(chunk)
     _pref_comps = _prefeatures_cache_components(_cache_components)
     _pref_key = _fingerprint_from_chunk_cache_components(_pref_comps)
-    _skip_track_human = False
+    _skip_run_state_machine = False
     if _two_stage and not force_recompute and _pref_path.exists():
         stored_pref = _pref_key_path.read_text(encoding="utf-8") if _pref_key_path.exists() else ""
         sk, sc = _read_chunk_cache_sidecar(stored_pref)
         if sk == _pref_key:
             logger.info(
-                "Chunk %s–%s: prefeatures cache hit (key=%s), skipping Track Human",
+                "Chunk %s–%s: prefeatures cache hit (key=%s), skipping run_state_machine",
                 window_start.date(), window_end.date(), _pref_key,
             )
             bets = pd.read_parquet(_pref_path)
-            _skip_track_human = True
+            _skip_run_state_machine = True
             _bump_chunk_cache_stat(chunk_cache_stats, "step6_chunk_cache_prefeatures_hit_total")
         else:
             miss_reasons = _chunk_cache_miss_reasons(sk, sc, _pref_comps)
             logger.info(
-                "Chunk %s–%s: prefeatures cache stale (miss_reason=%s), recomputing Track Human",
+                "Chunk %s–%s: prefeatures cache stale (miss_reason=%s), recomputing run_state_machine",
                 window_start.date(), window_end.date(), miss_reasons,
             )
 
-    if not _skip_track_human:
-        bets = add_track_human_features(bets, canonical_map, window_end, lookback_hours=_lookback_hours)
+    if not _skip_run_state_machine:
+        bets = add_run_state_machine_features(bets, canonical_map, window_end, lookback_hours=_lookback_hours)
         if _two_stage:
             _bump_chunk_cache_stat(
                 chunk_cache_stats, "step6_chunk_cache_prefeatures_track_human_recompute_total",
+            )
+            _bump_chunk_cache_stat(
+                chunk_cache_stats, "step6_chunk_cache_prefeatures_run_state_machine_recompute_total",
             )
             bets.to_parquet(_pref_path, index=False)
             _pref_key_path.write_text(
@@ -2487,7 +2506,7 @@ def process_chunk(
         _t0_llm = time.perf_counter()
         # Phase B PR-B3: route through layered bet entrypoint (thin wrapper over
         # compute_track_llm_features). Output identical; legacy column names retained.
-        _bets_llm_result = compute_bet_layer_features(
+        _bets_llm_result = compute_bet_duckdb_window_features(
             bets,
             feature_spec=feature_spec,
             cutoff_time=window_end,
@@ -2507,7 +2526,7 @@ def process_chunk(
                 how="left",
             )
         logger.info(
-            "Chunk %s–%s: Track LLM computed (%.1fs)",
+            "Chunk %s–%s: bet_duckdb_window features computed (%.1fs)",
             window_start.date(),
             window_end.date(),
             time.perf_counter() - _t0_llm,
@@ -2538,12 +2557,55 @@ def process_chunk(
                     _tgx,
                 )
 
-    # --- Labels (C1 extended pull) ---
-    labeled = compute_labels(
-        bets_df=bets,
-        window_end=window_end,
-        extended_end=extended_end,
+    # --- Labels (C1 extended pull) + optional label_intermediate disk cache (L2-aligned) ---
+    _label_disk_components = build_label_disk_cache_components(
+        window_start_iso=window_start.isoformat(),
+        window_end_iso=window_end.isoformat(),
+        extended_end_iso=extended_end.isoformat(),
+        data_hash=str(_cache_components["data_hash"]),
+        walkaway_gap_min=int(WALKAWAY_GAP_MIN),
+        alert_horizon_min=int(ALERT_HORIZON_MIN),
+        label_lookahead_min=int(LABEL_LOOKAHEAD_MIN),
+        identity_mapping_mode=str(identity_mapping_mode),
+        pit_identity_engine=str(_pit_engine),
+        source_snapshot_id=str(read_bridge_source_snapshot_id() or "unknown"),
     )
+    _label_disk_components["bets_label_input_hash"] = _order_insensitive_bets_hash(bets)
+    _label_disk_fp = label_disk_cache_fingerprint(_label_disk_components)
+    _label_pq = label_intermediate_parquet_path(chunk, CHUNK_DIR)
+    _label_key = label_intermediate_sidecar_path(chunk, CHUNK_DIR)
+    labeled: Optional[pd.DataFrame] = None
+    if not label_asset_cache_disabled() and not force_recompute:
+        labeled = try_load_label_intermediate_cache(
+            parquet_path=_label_pq,
+            sidecar_path=_label_key,
+            expected_fingerprint=_label_disk_fp,
+            expected_components=_label_disk_components,
+            expected_n_rows=len(bets),
+        )
+    if labeled is not None:
+        logger.info(
+            "Chunk %s–%s: label_intermediate cache hit (fp=%s)",
+            window_start.date(),
+            window_end.date(),
+            _label_disk_fp,
+        )
+        _bump_chunk_cache_stat(chunk_cache_stats, "step6_label_asset_cache_hit_total")
+        _bump_chunk_cache_stat(chunk_cache_stats, "step6_label_intermediate_cache_hit_total")
+    else:
+        _bump_chunk_cache_stat(chunk_cache_stats, "step6_label_asset_cache_miss_total")
+        labeled = compute_labels(
+            bets_df=bets,
+            window_end=window_end,
+            extended_end=extended_end,
+        )
+        if not label_asset_cache_disabled():
+            write_label_intermediate_cache(
+                labeled=labeled,
+                parquet_path=_label_pq,
+                sidecar_path=_label_key,
+                components=_label_disk_components,
+            )
     # H1: drop censored terminal bets + filter to training window in a single pass.
     # Combining the two filters into one mask avoids an intermediate ~32M-row .copy()
     # that was the direct OOM trigger (17 object cols × 32M rows ≈ 4 GiB allocation).
@@ -8133,19 +8195,19 @@ def run_pipeline(args) -> None:
             except Exception:
                 oom_precheck_est_peak_ram_gb = None
         
-            # 2. Chunk-level split — used ONLY to derive train_end for the canonical
+            # 2. Window-count partition — used ONLY to derive train_end for the canonical
             #    mapping cutoff (B1 / R25 identity-leakage guard).  The actual row
             #    assignment to train/valid/test happens later at row level (SSOT §9.2).
-            pipeline_echo("Step 2/10 — Chunk-level split (train_end derivation) …")
+            pipeline_echo("Step 2/10 — Partition windows for train_end cutoff (B1) …")
             t0 = time.perf_counter()
-            split = get_train_valid_test_split(chunks)
+            _window_partition = partition_windows_for_train_end_cutoff(chunks)
             _el = time.perf_counter() - t0
             step2_duration_sec = _el
             pipeline_echo(f"Step 2/10 — done in {_el:.1f}s")
-            logger.info("Chunk-level split (train_end derivation): %.1fs", _el)
+            logger.info("Window partition for train_end cutoff: %.1fs", _el)
             train_end = (
-                max(c["window_end"] for c in split["train_chunks"])
-                if split["train_chunks"] else end
+                max(c["window_end"] for c in _window_partition["train_windows"])
+                if _window_partition["train_windows"] else end
             )
             if hasattr(train_end, "tzinfo") and train_end.tzinfo:
                 # DEC-018: tz_convert to HK first, then strip tz, matching labels.py semantics.
@@ -8334,55 +8396,54 @@ def run_pipeline(args) -> None:
                     build_auto_l2_cache_key,
                     default_auto_bundle_dir,
                     fingerprint_feature_spec,
-                    read_bridge_source_snapshot_id,
                 )
                 from trainer.training.pipeline_l2_bundle import execute_l2_training_bundle
 
-                _snap_early = read_bridge_source_snapshot_id()
-                if _snap_early:
-                    _raw_dir = getattr(args, "l2_auto_bundle_dir", None)
-                    _bundle_dir_early = Path(_raw_dir) if _raw_dir else default_auto_bundle_dir()
-                    _ws_e = (
-                        effective_start.isoformat()
-                        if hasattr(effective_start, "isoformat")
-                        else str(effective_start)
+                # Cache hit must not require source_snapshot_id on the bridge manifest;
+                # cache key already includes bridge_manifest_stat_token() when present.
+                _raw_dir = getattr(args, "l2_auto_bundle_dir", None)
+                _bundle_dir_early = Path(_raw_dir) if _raw_dir else default_auto_bundle_dir()
+                _ws_e = (
+                    effective_start.isoformat()
+                    if hasattr(effective_start, "isoformat")
+                    else str(effective_start)
+                )
+                _we_e = (
+                    effective_end.isoformat()
+                    if hasattr(effective_end, "isoformat")
+                    else str(effective_end)
+                )
+                _expected_key = build_auto_l2_cache_key(
+                    bridge_manifest_stat=bridge_manifest_stat_token(),
+                    window_start_iso=_ws_e,
+                    window_end_iso=_we_e,
+                    recent_chunks=recent_chunks,
+                    train_split_frac=float(TRAIN_SPLIT_FRAC),
+                    valid_split_frac=float(VALID_SPLIT_FRAC),
+                    neg_sample_frac_config=float(NEG_SAMPLE_FRAC),
+                    feature_spec_fingerprint=fingerprint_feature_spec(FEATURE_SPEC_PATH),
+                    rebuild_canonical_mapping=bool(getattr(args, "rebuild_canonical_mapping", False)),
+                    identity_mapping_mode=str(effective_identity_mode),
+                    force_recompute=bool(force),
+                )
+                if auto_bundle_cache_is_current(bundle_dir=_bundle_dir_early, expected_key=_expected_key):
+                    pipeline_echo(
+                        f"Step L2-cache — hit at {_bundle_dir_early}; skipping Steps 4–10 (chunk path), "
+                        "running L2 Steps 8–10 …"
                     )
-                    _we_e = (
-                        effective_end.isoformat()
-                        if hasattr(effective_end, "isoformat")
-                        else str(effective_end)
+                    execute_l2_training_bundle(
+                        args=args,
+                        bundle_dir=_bundle_dir_early,
+                        pipeline_model_version=pipeline_model_version,
+                        pipeline_started_at_iso=pipeline_started_at_iso,
+                        pipeline_start=pipeline_start,
+                        use_local=use_local,
+                        skip_optuna=skip_optuna,
+                        sample_rated_n=sample_rated_n,
+                        pipeline_ranking_recipe=pipeline_ranking_recipe,
+                        pipeline_gbm_bakeoff=pipeline_gbm_bakeoff,
                     )
-                    _expected_key = build_auto_l2_cache_key(
-                        bridge_manifest_stat=bridge_manifest_stat_token(),
-                        window_start_iso=_ws_e,
-                        window_end_iso=_we_e,
-                        recent_chunks=recent_chunks,
-                        train_split_frac=float(TRAIN_SPLIT_FRAC),
-                        valid_split_frac=float(VALID_SPLIT_FRAC),
-                        neg_sample_frac_config=float(NEG_SAMPLE_FRAC),
-                        feature_spec_fingerprint=fingerprint_feature_spec(FEATURE_SPEC_PATH),
-                        rebuild_canonical_mapping=bool(getattr(args, "rebuild_canonical_mapping", False)),
-                        identity_mapping_mode=str(effective_identity_mode),
-                        force_recompute=bool(force),
-                    )
-                    if auto_bundle_cache_is_current(bundle_dir=_bundle_dir_early, expected_key=_expected_key):
-                        pipeline_echo(
-                            f"Step L2-cache — hit at {_bundle_dir_early}; skipping Steps 4–10 (chunk path), "
-                            "running L2 Steps 8–10 …"
-                        )
-                        execute_l2_training_bundle(
-                            args=args,
-                            bundle_dir=_bundle_dir_early,
-                            pipeline_model_version=pipeline_model_version,
-                            pipeline_started_at_iso=pipeline_started_at_iso,
-                            pipeline_start=pipeline_start,
-                            use_local=use_local,
-                            skip_optuna=skip_optuna,
-                            sample_rated_n=sample_rated_n,
-                            pipeline_ranking_recipe=pipeline_ranking_recipe,
-                            pipeline_gbm_bakeoff=pipeline_gbm_bakeoff,
-                        )
-                        return
+                    return
         
             # Rated-patron sampling is an independent option controlled by --sample-rated N.
             rated_whitelist: Optional[set] = None

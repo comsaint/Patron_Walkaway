@@ -105,7 +105,9 @@ __all__ = [
     "VALID_SKIP_REASON_CODES",
     "AdmissionResult",
     "compute_bet_layer_features",
+    "compute_bet_duckdb_window_features",
     "compute_player_layer_features",
+    "add_run_state_machine_features",
     "describe_layered_entrypoints",
     "evaluate_pit_admission",
     "get_admission_rule_from_spec",
@@ -329,6 +331,36 @@ def compute_bet_layer_features(
     )
 
 
+def compute_bet_duckdb_window_features(
+    bets_df: pd.DataFrame,
+    feature_spec: dict,
+    cutoff_time: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Bet-layer DuckDB window features (layer+method name; legacy Track LLM).
+
+    Thin alias of :func:`compute_bet_layer_features` — same columns and math.
+    """
+    return compute_bet_layer_features(bets_df, feature_spec, cutoff_time=cutoff_time)
+
+
+def add_run_state_machine_features(
+    bets: pd.DataFrame,
+    canonical_map: pd.DataFrame,
+    window_end: datetime,
+    lookback_hours: Optional[float] = None,
+) -> pd.DataFrame:
+    """Run-level state-machine features (layer+method name; legacy Track Human).
+
+    Delegates to :func:`trainer.training.feature_pipeline.add_track_human_features`.
+    """
+    try:
+        from trainer.training.feature_pipeline import add_track_human_features as _impl
+    except ModuleNotFoundError:  # pragma: no cover — bare trainer/ on sys.path
+        from training.feature_pipeline import add_track_human_features as _impl  # type: ignore[import-not-found,no-redef]
+
+    return _impl(bets, canonical_map, window_end, lookback_hours=lookback_hours)
+
+
 # ---------------------------------------------------------------------------
 # Player layer (legacy: track_profile)
 # ---------------------------------------------------------------------------
@@ -372,18 +404,19 @@ def describe_layered_entrypoints() -> dict:
         LAYER_BET: {
             "module": "trainer.features.features",
             "function": "compute_track_llm_features",
-            "wrapper": "trainer.features.layered.compute_bet_layer_features",
+            "wrapper": "trainer.features.layered.compute_bet_duckdb_window_features",
             "phase_b_status": "wrapped",
+            "layer_method_name": "bet_duckdb_window",
         },
         LAYER_RUN: {
-            "module": "trainer.training.trainer",
+            "module": "trainer.training.feature_pipeline",
             "function": "add_track_human_features",
-            "wrapper": None,
-            "phase_b_status": "in_place",
+            "wrapper": "trainer.features.layered.add_run_state_machine_features",
+            "phase_b_status": "wrapped",
+            "layer_method_name": "run_state_machine",
             "notes": (
-                "Run-level state-machine features remain inside trainer.py "
-                "and are mirrored into scorer.build_features_for_scoring. "
-                "Lifted out in a later phase."
+                "Run-level state-machine features live in feature_pipeline.py; "
+                "trainer/scorer call layered entrypoints for train–serve parity."
             ),
         },
         LAYER_TRIP: {

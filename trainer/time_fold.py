@@ -5,4 +5,5 @@ from trainer.training import time_fold as _impl  # noqa: F401
 
 sys.modules["trainer.time_fold"] = _impl
 get_monthly_chunks = _impl.get_monthly_chunks
-get_train_valid_test_split = _impl.get_train_valid_test_split
+get_single_window_chunk = _impl.get_single_window_chunk
+partition_windows_for_train_end_cutoff = _impl.partition_windows_for_train_end_cutoff

@@ -257,10 +257,14 @@ def get_candidate_feature_ids(
 ) -> List[str]:
     """從 YAML spec 讀取某一軌的 candidate feature_id 列表。
 
-    track 為 "track_llm" | "track_human" | "track_profile"。
+    track 接受 legacy 名稱 ``track_llm`` / ``track_human`` / ``track_profile``，
+    或 layer+method 別名 ``bet_duckdb_window`` / ``run_state_machine`` /
+    ``player_profile_snapshot``（與 legacy 區塊互為鏡像，見
+    ``feature_spec_layer_aliases.mirror_layer_method_track_keys_inplace``）。
     screening_only=True 時排除 dtype='str' 或 screening_eligible 為 false/0/"false"
     的候選（中間變數不參與篩選）。
     """
+    track = FEATURE_SPEC_TRACK_PARAM_ALIASES.get(track, track)
     # R404 Review #4: candidates may be non-list (e.g. dict); treat as no candidates.
     _raw = ((spec.get(track) or {}).get("candidates"))
     candidates = _raw if isinstance(_raw, list) else []
@@ -313,6 +317,13 @@ def get_profile_min_lookback(spec: dict) -> dict:
 # helpers; they do not change existing legacy loaders or compute paths.
 
 LAYER_NAMES: tuple = ("bet", "run", "trip", "player")
+
+# Layer+method YAML / API aliases ↔ legacy ``track_*`` keys (see feature_spec_layer_aliases).
+FEATURE_SPEC_TRACK_PARAM_ALIASES: dict[str, str] = {
+    "bet_duckdb_window": "track_llm",
+    "run_state_machine": "track_human",
+    "player_profile_snapshot": "track_profile",
+}
 
 _TRACK_TO_LAYER_MAPPING_PATH = (
     pathlib.Path(__file__).resolve().parent.parent
@@ -2122,6 +2133,9 @@ def load_feature_spec(yaml_path) -> dict:
     with path.open(encoding="utf-8") as fh:
         spec = _yaml.safe_load(fh)
 
+    from trainer.features.feature_spec_layer_aliases import mirror_layer_method_track_keys_inplace
+
+    mirror_layer_method_track_keys_inplace(spec)
     _validate_feature_spec(spec)
     return spec
 
@@ -2798,3 +2812,7 @@ def compute_track_llm_features(
         time.perf_counter() - t_run,
     )
     return result
+
+
+# Public layer+method alias (same implementation as ``compute_track_llm_features``).
+compute_bet_duckdb_window_features = compute_track_llm_features

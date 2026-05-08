@@ -36,12 +36,15 @@ def _read_top_level_function(rel_path: str, func_name: str) -> str:
 
 
 def _process_chunk_source_llm_to_labels() -> str:
-    """Return process_chunk source from Track LLM call through label section marker."""
+    """Return process_chunk source from bet_duckdb_window call through label section marker."""
     src = _read_top_level_function("trainer/training/trainer.py", "process_chunk")
-    start = src.find("_bets_llm_result = compute_track_llm_features")
-    assert start != -1, "process_chunk must assign compute_track_llm_features result"
-    end = src.find("# --- Labels (C1 extended pull)", start)
-    assert end != -1, "process_chunk must retain Labels section marker after Track LLM"
+    start = src.find("_bets_llm_result = compute_bet_duckdb_window_features")
+    assert start != -1, "process_chunk must assign compute_bet_duckdb_window_features result"
+    # Stop before optional ``t_game`` block (it legitimately uses try/except) — DEC-031 scope is LLM→pre-t_game.
+    end = src.find("    # B2: optional ``t_game``", start)
+    if end == -1:
+        end = src.find("# --- Labels (C1 extended pull)", start)
+    assert end != -1, "process_chunk must retain B2 t_game or Labels marker after bet_duckdb_window"
     return src[start:end]
 
 
@@ -76,9 +79,11 @@ class TestDec031Risk03ObjectDtypeSkippedByNumericGuard(unittest.TestCase):
     """
 
     def test_compute_track_llm_cast_guards_with_is_numeric_dtype(self):
-        src = _read_top_level_function("trainer/features/features.py", "compute_track_llm_features")
-        self.assertIn("is_numeric_dtype", src)
-        self.assertIn("astype(np.float32)", src)
+        # Guards may live in helpers (e.g. postprocess) rather than the top-level def body alone.
+        path = _REPO_ROOT / "trainer/features/features.py"
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("is_numeric_dtype", text)
+        self.assertIn("astype(np.float32)", text)
 
 
 class TestDec031Risk04NoSwallowBetweenLlmAndLabels(unittest.TestCase):
@@ -88,7 +93,7 @@ class TestDec031Risk04NoSwallowBetweenLlmAndLabels(unittest.TestCase):
         seg = _process_chunk_source_llm_to_labels()
         self.assertIsNone(
             re.search(r"\bexcept\b", seg),
-            "DEC-031: no `except` between compute_track_llm_features and compute_labels",
+            "DEC-031: no `except` between compute_bet_duckdb_window_features and compute_labels",
         )
 
 
@@ -105,7 +110,7 @@ class TestDec031Risk06ScorerBacktesterDegradePaths(unittest.TestCase):
 
     def test_scorer_wraps_track_llm_in_try_except(self):
         src = _read_top_level_function("trainer/serving/scorer.py", "score_once")
-        idx = src.find("compute_track_llm_features(")
+        idx = src.find("_bet_compute(")
         self.assertNotEqual(idx, -1)
         # 區塊含多行 log，窗口需涵蓋至 `except Exception as exc:`
         window = src[max(0, idx - 400) : idx + 900]
@@ -123,9 +128,9 @@ class TestDec031Risk07LoggingWhenFeatureSpecNonNull(unittest.TestCase):
 
     def test_success_log_after_merge_block_not_nested_in_feature_cols_if(self):
         seg = _process_chunk_source_llm_to_labels()
-        self.assertIn("Track LLM computed", seg)
+        self.assertIn("bet_duckdb_window features computed", seg)
         merge_if = seg.find('if _bets_llm_feature_cols and "bet_id"')
-        log_pos = seg.find("Track LLM computed")
+        log_pos = seg.find("bet_duckdb_window features computed")
         self.assertNotEqual(merge_if, -1)
         self.assertGreater(log_pos, merge_if, "success log should follow merge-if block")
 

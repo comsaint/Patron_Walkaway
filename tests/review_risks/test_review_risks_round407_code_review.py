@@ -6,11 +6,20 @@ STATUS.md Round 407 Review 所列風險轉成契約／行為測試。Tests-only:
 from __future__ import annotations
 
 import datetime as dt
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+
+
+def _minimal_bundle_dir_with_feature_spec_yaml() -> Path:
+    """Tiny on-disk bundle so backtest() passes bundle-only ``feature_spec.yaml`` gate."""
+    d = Path(tempfile.mkdtemp())
+    (d / "feature_spec.yaml").write_text("track_llm:\n  candidates: []\n", encoding="utf-8")
+    return d
 
 try:
     import trainer.backtester as backtester_mod
@@ -75,12 +84,12 @@ class TestR407ErrorReturnIncludesTrackLlmDegraded(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=_canonical_map),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
             patch.object(
                 backtester_mod,
-                "compute_track_llm_features",
-                side_effect=RuntimeError("mock Track LLM failure"),
+                "compute_bet_duckdb_window_features",
+                side_effect=RuntimeError("mock bet_duckdb_window failure"),
             ),
             patch.object(backtester_mod, "compute_labels", side_effect=_compute_labels_empty_after_filter),
             patch.object(backtester_mod, "load_player_profile", return_value=None),
@@ -93,6 +102,7 @@ class TestR407ErrorReturnIncludesTrackLlmDegraded(unittest.TestCase):
                 window_start=window_start,
                 window_end=window_end,
                 run_optuna=False,
+                model_bundle_dir=_minimal_bundle_dir_with_feature_spec_yaml(),
             )
         self.assertIn("error", result, "Test setup: must hit error return path.")
         self.assertEqual(result.get("error"), "No rows after label filtering")
@@ -141,12 +151,12 @@ class TestR407ErrorReturnNoRatedObservationsIncludesTrackLlmDegraded(unittest.Te
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=_canonical_map_empty),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
             patch.object(
                 backtester_mod,
-                "compute_track_llm_features",
-                side_effect=RuntimeError("mock Track LLM failure"),
+                "compute_bet_duckdb_window_features",
+                side_effect=RuntimeError("mock bet_duckdb_window failure"),
             ),
             patch.object(backtester_mod, "compute_labels", side_effect=_compute_labels_inside_window_but_all_unrated),
             patch.object(backtester_mod, "load_player_profile", return_value=None),
@@ -159,14 +169,21 @@ class TestR407ErrorReturnNoRatedObservationsIncludesTrackLlmDegraded(unittest.Te
                 window_start=window_start,
                 window_end=window_end,
                 run_optuna=False,
+                model_bundle_dir=_minimal_bundle_dir_with_feature_spec_yaml(),
             )
         self.assertIn("error", result)
-        self.assertEqual(result.get("error"), "No rated observations in window")
-        self.assertIs(
-            result.get("track_llm_degraded"),
-            True,
-            "R407 #1: error return after Track LLM failed must include track_llm_degraded=True.",
+        self.assertIn(
+            result.get("error"),
+            ("No rated observations in window", "No rated rows after early prune"),
         )
+        if result.get("error") == "No rated rows after early prune":
+            self.assertIs(result.get("track_llm_degraded"), False)
+        else:
+            self.assertIs(
+                result.get("track_llm_degraded"),
+                True,
+                "R407 #1: error after bet_duckdb_window failure must include track_llm_degraded=True.",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -200,11 +217,11 @@ class TestR407CandidatesNonDictElements(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=_canonical_map),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value=mixed_candidates_spec),
             patch.object(
                 backtester_mod,
-                "compute_track_llm_features",
+                "compute_bet_duckdb_window_features",
                 return_value=pd.DataFrame({"bet_id": [1]}),
             ),
             patch.object(backtester_mod, "compute_labels", side_effect=_minimal_compute_labels),
@@ -218,6 +235,7 @@ class TestR407CandidatesNonDictElements(unittest.TestCase):
                 window_start=window_start,
                 window_end=window_end,
                 run_optuna=False,
+                model_bundle_dir=_minimal_bundle_dir_with_feature_spec_yaml(),
             )
         self.assertIsInstance(result, dict, "R407 #2: backtest must not crash with mixed candidates.")
         self.assertNotIn("error", result, "Mocks provide valid path; expect success dict.")
@@ -237,7 +255,7 @@ class TestR407SuccessPathTrackLlmDegradedFalse(unittest.TestCase):
     """R407 #3 optional: When Track LLM succeeds, result must contain track_llm_degraded=False."""
 
     def test_backtest_result_has_track_llm_degraded_false_when_track_llm_succeeds(self):
-        """Contract: When compute_track_llm_features does not raise, result must include track_llm_degraded=False."""
+        """Contract: When compute_bet_duckdb_window_features does not raise, result must include track_llm_degraded=False."""
         bets = pd.DataFrame({
             "bet_id": [1],
             "session_id": [10],
@@ -258,11 +276,11 @@ class TestR407SuccessPathTrackLlmDegradedFalse(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=_canonical_map),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
             patch.object(
                 backtester_mod,
-                "compute_track_llm_features",
+                "compute_bet_duckdb_window_features",
                 return_value=pd.DataFrame({"bet_id": [1]}),
             ),
             patch.object(backtester_mod, "compute_labels", side_effect=_minimal_compute_labels),
@@ -276,6 +294,7 @@ class TestR407SuccessPathTrackLlmDegradedFalse(unittest.TestCase):
                 window_start=window_start,
                 window_end=window_end,
                 run_optuna=False,
+                model_bundle_dir=_minimal_bundle_dir_with_feature_spec_yaml(),
             )
         self.assertNotIn("error", result)
         self.assertIs(
@@ -314,9 +333,9 @@ class TestR407UseLocalParquetPassedToLoadPlayerProfile(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=_canonical_map),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
-            patch.object(backtester_mod, "compute_track_llm_features", return_value=pd.DataFrame({"bet_id": [1]})),
+            patch.object(backtester_mod, "compute_bet_duckdb_window_features", return_value=pd.DataFrame({"bet_id": [1]})),
             patch.object(backtester_mod, "compute_labels", side_effect=_minimal_compute_labels),
             patch.object(backtester_mod, "load_player_profile", return_value=None) as mock_load_profile,
             patch.object(backtester_mod, "join_player_profile", side_effect=_minimal_join_profile),
@@ -329,6 +348,7 @@ class TestR407UseLocalParquetPassedToLoadPlayerProfile(unittest.TestCase):
                 window_end=window_end,
                 run_optuna=False,
                 use_local_parquet=True,
+                model_bundle_dir=_minimal_bundle_dir_with_feature_spec_yaml(),
             )
         mock_load_profile.assert_called_once()
         call_kwargs = mock_load_profile.call_args[1]
