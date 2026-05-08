@@ -410,6 +410,7 @@ try:
         PROFILE_FEATURE_COLS,
         get_all_candidate_feature_ids,
         get_candidate_feature_ids,
+        get_cross_layer_compose_contract,
         get_legacy_to_layered_map,
         get_layer_for_feature,
     )
@@ -420,6 +421,7 @@ try:
         compute_bet_duckdb_window_features,
         compute_bet_layer_features,
         compute_player_layer_features,
+        compute_trip_layer_features,
         evaluate_pit_admission,
         SKIP_REASON_IDENTITY_UNMATCHED,
         SKIP_REASON_PIT_UNAVAILABLE_SOURCE,
@@ -460,6 +462,7 @@ except ModuleNotFoundError:
         PROFILE_FEATURE_COLS,
         get_all_candidate_feature_ids,
         get_candidate_feature_ids,
+        get_cross_layer_compose_contract,
         get_legacy_to_layered_map,
         get_layer_for_feature,
     )
@@ -468,6 +471,7 @@ except ModuleNotFoundError:
         compute_bet_duckdb_window_features,
         compute_bet_layer_features,
         compute_player_layer_features,
+        compute_trip_layer_features,
         evaluate_pit_admission,
         SKIP_REASON_IDENTITY_UNMATCHED,
         SKIP_REASON_PIT_UNAVAILABLE_SOURCE,
@@ -1164,6 +1168,22 @@ from trainer.training.data_sources import (  # noqa: E402
 # player_profile loading (PLAN Step 4 / DEC-011)
 # ---------------------------------------------------------------------------
 
+
+def load_player_layer_asset_parquet(asset_path: Path) -> pd.DataFrame:
+    """Load a pre-built player-layer Parquet for PIT join (WS5 asset path).
+
+    Contract: must include ``snapshot_dtm`` (same as ``load_player_profile``).
+    """
+    if not asset_path.is_file():
+        raise FileNotFoundError(f"TRAINER_PLAYER_LAYER_ASSET_PATH: not a file: {asset_path}")
+    df = pd.read_parquet(asset_path)
+    if "snapshot_dtm" not in df.columns:
+        raise ValueError(
+            f"TRAINER_PLAYER_LAYER_ASSET_PATH: missing required column 'snapshot_dtm' ({asset_path})"
+        )
+    return df
+
+
 def load_player_profile(
     window_start: datetime,
     window_end: datetime,
@@ -1717,6 +1737,70 @@ def _prefeatures_cache_components(components: dict) -> dict:
     }
 
 
+def _cross_layer_compose_closure_hash(
+    feature_spec: Optional[dict],
+    *,
+    data_hash: str,
+    profile_hash: str,
+    cfg_hash: str,
+) -> str:
+    """Build closure hash for cross-layer compose nodes.
+
+    Uses compose contract from the spec plus upstream layer hashes so changes in
+    either dependencies or their source fingerprints invalidate chunk cache.
+    """
+    contract = get_cross_layer_compose_contract(feature_spec)
+    if not contract:
+        return "none"
+    payload = {
+        "contract": contract,
+        "upstream": {
+            "bet": str(data_hash),
+            "run": hashlib.md5(f"{data_hash}|{cfg_hash}".encode()).hexdigest()[:8],
+            "player": str(profile_hash),
+            "trip": "none",
+        },
+    }
+    return hashlib.md5(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:8]
+
+
+def _validate_cross_layer_compose_inputs(
+    df: pd.DataFrame,
+    feature_spec: Optional[dict],
+) -> None:
+    """Fail-closed guard: all compose input columns must exist before compose."""
+    contract = get_cross_layer_compose_contract(feature_spec)
+    if not contract:
+        return
+    for fid, meta in contract.items():
+        required = [str(c) for c in (meta.get("input_columns") or []) if str(c)]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"cross-layer compose '{fid}' missing input columns: {sorted(missing)}"
+            )
+
+
+def _validate_cross_layer_compose_outputs(
+    df: pd.DataFrame,
+    feature_spec: Optional[dict],
+) -> None:
+    """Fail-closed guard: compose outputs declared in spec must be materialized."""
+    contract = get_cross_layer_compose_contract(feature_spec)
+    if not contract:
+        return
+    for fid, meta in contract.items():
+        outputs = [str(c) for c in (meta.get("output_columns") or []) if str(c)]
+        targets = outputs or [fid]
+        missing = [c for c in targets if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"cross-layer compose '{fid}' missing output columns: {sorted(missing)}"
+            )
+
+
 def _chunk_two_stage_cache_enabled() -> bool:
     """R6 prefeatures cache: default from ``trainer.core.config`` (on); env overrides."""
     return bool(_core_trainer_config.chunk_two_stage_cache_enabled())
@@ -1937,6 +2021,8 @@ def _chunk_cache_components(
     identity_mapping_mode: str = "cutoff_window",
     pit_identity_engine: str = "cutoff_window_map",
     t_game_visible_time_column: str = "none",
+    cross_layer_compose_hash: str = "none",
+    feature_spec_for_cross_layer: Optional[dict] = None,
 ) -> dict:
     """Pipeline components that determine chunk cache validity (TRN-07 / Task 7 R3).
 
@@ -1975,6 +2061,16 @@ def _chunk_cache_components(
     feature_spec_cache_hash = str(feature_spec_hash)
     if feature_spec_cache_hash != _CHUNK_PREFEATURES_SPEC_PLACEHOLDER:
         feature_spec_cache_hash = f"{feature_spec_cache_hash}:{_CHUNK_FINAL_SCHEMA_VERSION}"
+    _xlayer = str(cross_layer_compose_hash or "none").strip()
+    if _xlayer == "auto":
+        _xlayer = _cross_layer_compose_closure_hash(
+            feature_spec_for_cross_layer,
+            data_hash=str(data_hash),
+            profile_hash=str(profile_hash),
+            cfg_hash=str(cfg_hash),
+        )
+    if _xlayer and _xlayer != "none" and feature_spec_cache_hash != _CHUNK_PREFEATURES_SPEC_PLACEHOLDER:
+        feature_spec_cache_hash = f"{feature_spec_cache_hash}:xcl{_xlayer}"
     return {
         "window_start": ws,
         "window_end": we,
@@ -2282,6 +2378,8 @@ def process_chunk(
             identity_mapping_mode=identity_mapping_mode,
             pit_identity_engine=_pit_engine,
             t_game_visible_time_column=_t_game_visible_col,
+            cross_layer_compose_hash="auto",
+            feature_spec_for_cross_layer=feature_spec,
         )
         current_key = _fingerprint_from_chunk_cache_components(_cache_components)
         if not force_recompute and chunk_path.exists():
@@ -2313,15 +2411,19 @@ def process_chunk(
 
     # --- TRN-07: ClickHouse path — cache key from raw bets content hash ---
     if not use_local_parquet:
+        _dh_clickhouse = _order_insensitive_bets_hash(bets_raw)
         _cache_components = _chunk_cache_components(
             chunk,
-            bets_raw,
+            None,
             profile_hash=_profile_hash,
             feature_spec_hash=feature_spec_hash,
             neg_sample_frac=neg_sample_frac,
+            data_hash=_dh_clickhouse,
             identity_mapping_mode=identity_mapping_mode,
             pit_identity_engine=_pit_engine,
             t_game_visible_time_column=_t_game_visible_col,
+            cross_layer_compose_hash="auto",
+            feature_spec_for_cross_layer=feature_spec,
         )
         current_key = _fingerprint_from_chunk_cache_components(_cache_components)
         if not force_recompute and chunk_path.exists():
@@ -2557,6 +2659,10 @@ def process_chunk(
                     _tgx,
                 )
 
+    # Trip layer (v0): optional ``lda_*`` passthrough contract; fail-closed when configured.
+    _trip_fail_closed = bool(getattr(_cfg, "TRIP_LAYER_FAIL_CLOSED", False))
+    bets = compute_trip_layer_features(bets, fail_closed=_trip_fail_closed)
+
     # --- Labels (C1 extended pull) + optional label_intermediate disk cache (L2-aligned) ---
     _label_disk_components = build_label_disk_cache_components(
         window_start_iso=window_start.isoformat(),
@@ -2625,7 +2731,9 @@ def process_chunk(
     # Non-rated bets and bets without a prior snapshot receive 0 for all profile columns.
     # Phase B PR-B3: route through layered player entrypoint (thin wrapper).
     labeled = compute_player_layer_features(labeled, profile_df)
+    _validate_cross_layer_compose_inputs(labeled, feature_spec)
     labeled = add_wave2_personalized_baselines(labeled)
+    _validate_cross_layer_compose_outputs(labeled, feature_spec)
 
     # Ensure all non-profile feature columns exist with numeric defaults.
     # R74: profile columns are intentionally left as NaN when a player has no
@@ -7896,6 +8004,7 @@ def _write_pipeline_diagnostics_json(
     oom_estimate_strategy: Optional[str] = None,
     l2_split_parquet_total_bytes: Optional[int] = None,
     output_dir: Optional[Path] = None,
+    feature_materialization_audit: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Write resource/timing diagnostics to ``output_dir/pipeline_diagnostics.json`` (omit None keys).
 
@@ -7913,6 +8022,8 @@ def _write_pipeline_diagnostics_json(
     ``l2_train_valid_test_parquet_bytes`` (see ``l2_trainer_contracts``).
 
     ``l2_split_parquet_total_bytes``: total on-disk bytes for train/valid/test split parquets.
+
+    ``feature_materialization_audit``: optional unified feature lineage / spec-first audit blob.
     """
     payload: dict[str, Any] = {
         "model_version": model_version,
@@ -7963,6 +8074,8 @@ def _write_pipeline_diagnostics_json(
         out["oom_estimate_strategy"] = oom_estimate_strategy
     if l2_split_parquet_total_bytes is not None:
         out["l2_split_parquet_total_bytes"] = int(l2_split_parquet_total_bytes)
+    if feature_materialization_audit is not None:
+        out["feature_materialization_audit"] = dict(feature_materialization_audit)
     _dir = output_dir if output_dir is not None else MODEL_DIR
     (_dir / "pipeline_diagnostics.json").write_text(
         json.dumps(out, indent=2, default=str),
@@ -8122,6 +8235,7 @@ def run_pipeline(args) -> None:
             # Task 7 DoD: Step 6 chunk cache counters -> pipeline_diagnostics.json
             chunk_cache_stats: Dict[str, int] = {}
             issue16_gate_report: Optional[Dict[str, Any]] = None
+            feature_materialization_audit: Optional[Dict[str, Any]] = None
 
             _l2_bundle_arg = getattr(args, "l2_training_bundle", None)
             if _l2_bundle_arg:
@@ -8463,23 +8577,35 @@ def run_pipeline(args) -> None:
         
             # 3b. Auto-check local player_profile freshness and backfill missing
             #     ranges before training starts (one-command flow, OOM-safe helper).
-            pipeline_echo("Step 4/10 — Ensure player_profile ready (backfill if needed) …")
-            t0 = time.perf_counter()
-            ensure_player_profile_ready(
-                effective_start,
-                effective_end,
-                use_local_parquet=use_local,
-                canonical_id_whitelist=rated_whitelist,
-                snapshot_interval_days=1,
-                preload_sessions=not no_preload,
-                canonical_map=canonical_map,
-                max_lookback_days=365,
-            )
-            _el = time.perf_counter() - t0
-            step4_duration_sec = _el
-            pipeline_echo(f"Step 4/10 — done in {_el:.1f}s")
-            logger.info("ensure_player_profile_ready: %.1fs", _el)
-        
+            _player_asset_raw = (os.environ.get("TRAINER_PLAYER_LAYER_ASSET_PATH") or "").strip()
+            if _player_asset_raw:
+                pipeline_echo(
+                    "Step 4/10 — Skip ensure_player_profile_ready (TRAINER_PLAYER_LAYER_ASSET_PATH set) …"
+                )
+                step4_duration_sec = 0.0
+                pipeline_echo("Step 4/10 — skipped (player layer asset mode)")
+                logger.info(
+                    "player_profile ensure skipped: using TRAINER_PLAYER_LAYER_ASSET_PATH=%s",
+                    _player_asset_raw,
+                )
+            else:
+                pipeline_echo("Step 4/10 — Ensure player_profile ready (backfill if needed) …")
+                t0 = time.perf_counter()
+                ensure_player_profile_ready(
+                    effective_start,
+                    effective_end,
+                    use_local_parquet=use_local,
+                    canonical_id_whitelist=rated_whitelist,
+                    snapshot_interval_days=1,
+                    preload_sessions=not no_preload,
+                    canonical_map=canonical_map,
+                    max_lookback_days=365,
+                )
+                _el = time.perf_counter() - t0
+                step4_duration_sec = _el
+                pipeline_echo(f"Step 4/10 — done in {_el:.1f}s")
+                logger.info("ensure_player_profile_ready: %.1fs", _el)
+
             # 3c. Load player_profile once for the entire training window (PLAN Step 4).
             #     Pass the resulting DataFrame to every process_chunk call so each chunk
             #     can do the PIT/as-of join without re-querying.  If load fails, profile
@@ -8494,22 +8620,36 @@ def run_pipeline(args) -> None:
                     else []
                 )
             )
-            pipeline_echo("Step 5/10 — Load player_profile for PIT join …")
-            t0 = time.perf_counter()
-            profile_df = load_player_profile(
-                effective_start,
-                effective_end,
-                use_local_parquet=use_local,
-                canonical_ids=_rated_cids,
-            )
-            _el = time.perf_counter() - t0
-            step5_duration_sec = _el
-            if profile_df is not None:
-                pipeline_echo(f"Step 5/10 — done in {_el:.1f}s ({len(profile_df)} profile rows)")
-                logger.info("player_profile: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), _el)
+            if _player_asset_raw:
+                pipeline_echo("Step 5/10 — Load player layer asset (TRAINER_PLAYER_LAYER_ASSET_PATH) …")
+                t0 = time.perf_counter()
+                profile_df = load_player_layer_asset_parquet(Path(_player_asset_raw))
+                _el = time.perf_counter() - t0
+                step5_duration_sec = _el
+                pipeline_echo(f"Step 5/10 — done in {_el:.1f}s ({len(profile_df)} asset rows)")
+                logger.info(
+                    "player layer asset: loaded %d rows from %s (%.1fs)",
+                    len(profile_df),
+                    _player_asset_raw,
+                    _el,
+                )
             else:
-                pipeline_echo(f"Step 5/10 — done in {_el:.1f}s (profile not available)")
-                logger.info("player_profile: not available — profile features will be NaN (%.1fs)", _el)
+                pipeline_echo("Step 5/10 — Load player_profile for PIT join …")
+                t0 = time.perf_counter()
+                profile_df = load_player_profile(
+                    effective_start,
+                    effective_end,
+                    use_local_parquet=use_local,
+                    canonical_ids=_rated_cids,
+                )
+                _el = time.perf_counter() - t0
+                step5_duration_sec = _el
+                if profile_df is not None:
+                    pipeline_echo(f"Step 5/10 — done in {_el:.1f}s ({len(profile_df)} profile rows)")
+                    logger.info("player_profile: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), _el)
+                else:
+                    pipeline_echo(f"Step 5/10 — done in {_el:.1f}s (profile not available)")
+                    logger.info("player_profile: not available — profile features will be NaN (%.1fs)", _el)
         
             feature_spec = load_feature_spec(FEATURE_SPEC_PATH)
             try:
@@ -9378,6 +9518,40 @@ def run_pipeline(args) -> None:
                     cast(pd.DataFrame, test_df),
                     rated_only=True,
                 )
+            _train_schema_col_list: Optional[List[str]] = None
+            if train_df is not None:
+                _train_schema_col_list = list(train_df.columns)
+            elif step7_train_path is not None:
+                try:
+                    import pyarrow.parquet as pq
+
+                    _train_schema_col_list = list(pq.ParquetFile(step7_train_path).schema_arrow.names)
+                except Exception as _schema_exc:
+                    logger.warning(
+                        "Could not read train parquet schema for spec-first audit: %s",
+                        _schema_exc,
+                    )
+            if _train_schema_col_list is not None:
+                try:
+                    from trainer.training import feature_materialization as _fm_audit
+
+                    _fm_audit.maybe_raise_spec_first_columns(_train_schema_col_list, feature_spec)
+                    _curr_src_snap = read_bridge_source_snapshot_id() if use_local else None
+                    _prev_src_snap = (os.environ.get("TRAINER_PREV_SOURCE_SNAPSHOT_ID") or "").strip() or None
+                    feature_materialization_audit = _fm_audit.build_pipeline_feature_materialization_audit(
+                        feature_spec=feature_spec,
+                        train_columns=_train_schema_col_list,
+                        curr_source_snapshot_id=_curr_src_snap,
+                        prev_source_snapshot_id=_prev_src_snap,
+                        pit_policy_id=str(effective_identity_mode),
+                    )
+                    _fm_audit.raise_if_strict_materialization_gates_failed(
+                        feature_materialization_audit["materialization_gates"],
+                    )
+                except RuntimeError:
+                    raise
+                except Exception as _fma_exc:
+                    logger.warning("feature_materialization audit build failed (non-fatal): %s", _fma_exc)
             try:
                 from trainer.training.issue16_gates import (
                     evaluate_issue16_gate_bundle,
@@ -9394,6 +9568,8 @@ def run_pipeline(args) -> None:
                     label_asset_meta=None,
                     training_source_snapshot_id=None,
                     split_flags=None,
+                    train_column_names=_train_schema_col_list,
+                    feature_spec=feature_spec,
                 )
                 raise_if_strict_issue16_gates_failed(issue16_gate_report)
             except RuntimeError:
@@ -9513,6 +9689,13 @@ def run_pipeline(args) -> None:
                     identity_mapping_mode=str(effective_identity_mode),
                     force_recompute=bool(force),
                 )
+                _bundle_per_fp = None
+                if isinstance(feature_spec, dict):
+                    from trainer.training.feature_materialization import (
+                        per_feature_fingerprints as _bundle_pfp_fn,
+                    )
+
+                    _bundle_per_fp = _bundle_pfp_fn(feature_spec)
                 materialize_l2_training_bundle_dir(
                     _bundle_out,
                     train_df=train_df,
@@ -9528,6 +9711,7 @@ def run_pipeline(args) -> None:
                     identity_mapping_mode=str(effective_identity_mode),
                     train_sampling_applied=float(_effective_neg_sample_frac) < 1.0,
                     cache_key=_cache_key,
+                    per_feature_fingerprints=_bundle_per_fp,
                 )
                 touch_bundle_built_at(_bundle_out)
                 pipeline_echo(
@@ -9997,6 +10181,7 @@ def run_pipeline(args) -> None:
                     chunk_cache_stats=chunk_cache_stats,
                     issue16_audit=issue16_gate_report,
                     output_dir=_bundle_dir,
+                    feature_materialization_audit=feature_materialization_audit,
                 )
             except Exception as _diag_exc:
                 logger.warning(

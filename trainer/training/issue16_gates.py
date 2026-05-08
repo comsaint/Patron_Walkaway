@@ -11,7 +11,7 @@ only so existing chunk pipelines keep working until L2 migration completes.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from trainer.training.l2_trainer_contracts import (
     KEY_TEST_FULL_UNSAMPLED,
@@ -20,6 +20,10 @@ from trainer.training.l2_trainer_contracts import (
     SPLIT_SAMPLING_CONTRACT_VERSION,
     TRAIN_END_SOURCE_CHUNK_SPLIT,
     TRAIN_END_SOURCE_L2_MANIFEST,
+)
+from trainer.training.feature_materialization import (
+    strict_spec_first_enabled,
+    validate_spec_first_training_columns,
 )
 
 # Minimum keys to compare training lineage vs label sidecar (subset of full label_asset schema).
@@ -144,6 +148,26 @@ def l2_manifest_train_end_guard(*, train_end_source: str, l2_snapshot_id: Option
     return False, "train_end_source=l2_manifest but l2_snapshot_id empty"
 
 
+def spec_first_column_guard(
+    *,
+    train_column_names: Optional[Sequence[str]],
+    feature_spec: Optional[Mapping[str, Any]],
+) -> Tuple[bool, str]:
+    """Check training matrix columns against declared ``feature_id`` set (WS1).
+
+    When ``TRAINER_SPEC_FIRST_STRICT=1``, undeclared feature-like columns fail this
+    gate. Otherwise failures are logged as advisory (gate still ok=True).
+    """
+    if train_column_names is None:
+        return True, "skip: train column names unavailable"
+    ok, detail = validate_spec_first_training_columns(train_column_names, dict(feature_spec) if feature_spec else None)
+    if strict_spec_first_enabled():
+        return ok, detail
+    if not ok:
+        return True, f"advisory (set TRAINER_SPEC_FIRST_STRICT=1 to fail-closed): {detail}"
+    return True, detail
+
+
 def evaluate_issue16_gate_bundle(
     *,
     effective_neg_sample_frac: float,
@@ -154,6 +178,8 @@ def evaluate_issue16_gate_bundle(
     label_asset_meta: Optional[Mapping[str, Any]] = None,
     training_source_snapshot_id: Optional[str] = None,
     split_flags: Optional[Mapping[str, Any]] = None,
+    train_column_names: Optional[Sequence[str]] = None,
+    feature_spec: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run all #16 gates and return a JSON-serialisable report."""
     gates: Dict[str, Dict[str, Any]] = {}
@@ -185,6 +211,11 @@ def evaluate_issue16_gate_bundle(
             "ok": vf and tf,
             "detail": f"{KEY_VALID_FULL_UNSAMPLED}={vf} {KEY_TEST_FULL_UNSAMPLED}={tf}",
         }
+    ok_sf, msg_sf = spec_first_column_guard(
+        train_column_names=train_column_names,
+        feature_spec=feature_spec,
+    )
+    gates["spec_first_column_guard"] = {"ok": ok_sf, "detail": msg_sf}
     all_ok = all(v.get("ok") for v in gates.values())
     return {
         "issue16_gate_contract_version": "2026-05-07",

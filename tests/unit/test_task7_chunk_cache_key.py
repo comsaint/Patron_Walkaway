@@ -235,6 +235,87 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
         self.assertEqual(pc["neg_sample_frac"], 1.0)
         self.assertEqual(pc["data_hash"], comp["data_hash"])
 
+    def test_cross_layer_compose_closure_hash_changes_with_profile(self) -> None:
+        spec = {
+            "track_human": {
+                "candidates": [
+                    {
+                        "feature_id": "pace_vs_personal_baseline",
+                        "input_columns": [
+                            "minutes_since_run_start",
+                            "avg_session_duration_min_30d",
+                        ],
+                        "output_columns": ["pace_vs_personal_baseline"],
+                        "function_name": "compute_wave2_personalized_features",
+                    }
+                ]
+            },
+            "track_profile": {
+                "candidates": [
+                    {"feature_id": "avg_session_duration_min_30d"},
+                ]
+            },
+        }
+        h1 = trainer_mod._cross_layer_compose_closure_hash(
+            spec, data_hash="dataA", profile_hash="profA", cfg_hash="cfgA",
+        )
+        h2 = trainer_mod._cross_layer_compose_closure_hash(
+            spec, data_hash="dataA", profile_hash="profB", cfg_hash="cfgA",
+        )
+        self.assertRegex(h1, r"^[0-9a-f]{8}$")
+        self.assertNotEqual(h1, h2)
+
+    def test_chunk_cache_components_embed_cross_layer_hash_in_spec_slot(self) -> None:
+        chunk = {
+            "window_start": pd.Timestamp("2026-01-01 00:00:00"),
+            "window_end": pd.Timestamp("2026-02-01 00:00:00"),
+        }
+        bets = pd.DataFrame({"bet_id": [1], "amount": [1.0]})
+        spec = {
+            "track_human": {
+                "candidates": [
+                    {
+                        "feature_id": "pace_vs_personal_baseline",
+                        "input_columns": [
+                            "minutes_since_run_start",
+                            "avg_session_duration_min_30d",
+                        ],
+                    }
+                ]
+            },
+            "track_profile": {"candidates": [{"feature_id": "avg_session_duration_min_30d"}]},
+        }
+        comp = trainer_mod._chunk_cache_components(
+            chunk,
+            bets,
+            profile_hash="profile1",
+            feature_spec_hash="spec1",
+            cross_layer_compose_hash="auto",
+            feature_spec_for_cross_layer=spec,
+        )
+        self.assertIn(":xcl", comp["feature_spec_hash"])
+
+    def test_cross_layer_compose_validation_raises_when_input_missing(self) -> None:
+        spec = {
+            "track_human": {
+                "candidates": [
+                    {
+                        "feature_id": "pace_vs_personal_baseline",
+                        "input_columns": [
+                            "minutes_since_run_start",
+                            "avg_session_duration_min_30d",
+                        ],
+                    }
+                ]
+            },
+            "track_profile": {"candidates": [{"feature_id": "avg_session_duration_min_30d"}]},
+        }
+        with self.assertRaisesRegex(ValueError, "cross-layer compose"):
+            trainer_mod._validate_cross_layer_compose_inputs(
+                pd.DataFrame({"minutes_since_run_start": [1.0]}),
+                spec,
+            )
+
     def test_local_parquet_source_data_hash_changes_with_bounds_or_file_stats(self) -> None:
         ws = pd.Timestamp("2026-01-01 00:00:00")
         ee = pd.Timestamp("2026-02-01 00:00:00")

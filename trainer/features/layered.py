@@ -15,9 +15,7 @@ around the existing legacy implementation in :mod:`trainer.features.features`
     run      | trainer.add_track_human_features (state machine) | declared here,
              |                                                  | computation
              |                                                  | stays in trainer
-    trip     | L1 passthrough joins (no compute_* yet)          | declared here,
-             |                                                  | computation
-             |                                                  | stays in trainer
+    trip     | trip_materializer on ``bets_df`` (LDA passthrough) | wrapped here
     player   | features.join_player_profile                     | wrapped here
 
 Rationale
@@ -62,6 +60,7 @@ from trainer.features.features import (
     join_player_profile as _join_player_profile,
     load_track_to_layer_mapping,
 )
+from trainer.features.trip_materializer import materialize_trip_layer_features as _materialize_trip_layer_features
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +117,7 @@ __all__ = [
     "get_legacy_to_layered_map",
     "load_track_to_layer_mapping",
     "validate_admission_rule_against_spec",
+    "compute_trip_layer_features",
 ]
 
 
@@ -385,6 +385,18 @@ def compute_player_layer_features(
     )
 
 
+def compute_trip_layer_features(
+    bets_df: pd.DataFrame,
+    *,
+    fail_closed: bool = False,
+) -> pd.DataFrame:
+    """Trip-layer passthrough / contract check (v0 materializer).
+
+    Thin wrapper around :func:`trainer.features.trip_materializer.materialize_trip_layer_features`.
+    """
+    return _materialize_trip_layer_features(bets_df, fail_closed=fail_closed)
+
+
 # ---------------------------------------------------------------------------
 # Run / trip layers — Phase B declares ownership only
 # ---------------------------------------------------------------------------
@@ -420,13 +432,14 @@ def describe_layered_entrypoints() -> dict:
             ),
         },
         LAYER_TRIP: {
-            "module": "pipelines.layered_data_assets",
-            "function": "L1 passthrough joins",
-            "wrapper": None,
-            "phase_b_status": "in_place",
+            "module": "trainer.features.trip_materializer",
+            "function": "materialize_trip_layer_features",
+            "wrapper": "trainer.features.layered.compute_trip_layer_features",
+            "phase_b_status": "wrapped",
+            "layer_method_name": "trip_lda_materialized",
             "notes": (
-                "Trip-level features come from passthrough joins on L1 trip_fact. "
-                "No compute_* exists yet; deferred to a later phase."
+                "Trip-level v1: optional ``lda_*`` bridge columns coerced to float32; "
+                "full trip_fact kernel deferred."
             ),
         },
         LAYER_PLAYER: {

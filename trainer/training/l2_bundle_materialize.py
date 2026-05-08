@@ -151,6 +151,7 @@ def materialize_l2_training_bundle_dir(
     cache_key: Mapping[str, Any],
     label_asset_parquet: Optional[Union[str, Path]] = None,
     label_asset_meta: Optional[Mapping[str, Any]] = None,
+    per_feature_fingerprints: Optional[Mapping[str, str]] = None,
 ) -> Path:
     """Write train/valid/test parquets + ``l2_training_bundle.json`` + cache sidecar.
 
@@ -210,6 +211,11 @@ def materialize_l2_training_bundle_dir(
             if label_asset_meta:
                 lam.update(dict(label_asset_meta))
             manifest["label_asset"] = lam
+    if per_feature_fingerprints:
+        manifest["feature_lineage"] = {
+            "manifest_version": "feature_lineage_v1",
+            "per_feature_fingerprints": dict(per_feature_fingerprints),
+        }
     (bundle_dir / "l2_training_bundle.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

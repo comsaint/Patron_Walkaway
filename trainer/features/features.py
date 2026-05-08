@@ -37,7 +37,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -293,6 +293,67 @@ def get_all_candidate_feature_ids(
     ids_human = get_candidate_feature_ids(spec, "track_human", screening_only)
     ids_profile = get_candidate_feature_ids(spec, "track_profile", screening_only)
     return list(dict.fromkeys(ids_llm + ids_human + ids_profile))
+
+
+def _feature_layer_index_from_spec(spec: dict) -> Dict[str, str]:
+    """Build ``feature_id -> layer`` index from spec tracks."""
+    track_to_layer = {
+        "track_llm": "bet",
+        "track_human": "run",
+        "track_profile": "player",
+    }
+    out: Dict[str, str] = {}
+    for track, layer in track_to_layer.items():
+        for fid in get_candidate_feature_ids(spec, track, screening_only=False):
+            out[str(fid)] = layer
+    return out
+
+
+def get_cross_layer_compose_contract(spec: Optional[dict]) -> Dict[str, dict]:
+    """Return cross-layer compose contract inferred from ``depends_on``/``input_columns``.
+
+    A candidate is treated as cross-layer when its declared dependencies touch
+    two or more layers among bet/run/player (trip can be added once trip
+    candidates are fully spec-driven).
+    """
+    if not isinstance(spec, dict):
+        return {}
+    feature_layer = _feature_layer_index_from_spec(spec)
+    out: Dict[str, dict] = {}
+    for track in ("track_llm", "track_human", "track_profile"):
+        cands = ((spec.get(track) or {}).get("candidates") or [])
+        owning_layer = {
+            "track_llm": "bet",
+            "track_human": "run",
+            "track_profile": "player",
+        }.get(track, "")
+        for cand in cands:
+            if not isinstance(cand, dict):
+                continue
+            fid = str(cand.get("feature_id") or "").strip()
+            if not fid:
+                continue
+            deps = [str(x) for x in (cand.get("depends_on") or []) if str(x)]
+            inputs = [str(x) for x in (cand.get("input_columns") or []) if str(x)]
+            dep_layer_set = {
+                feature_layer[name]
+                for name in (deps + inputs)
+                if name in feature_layer
+            }
+            if owning_layer and (deps or inputs):
+                dep_layer_set.add(owning_layer)
+            dep_layers = sorted(dep_layer_set)
+            if len(dep_layers) < 2:
+                continue
+            out[fid] = {
+                "declared_track": track,
+                "dependency_layers": dep_layers,
+                "depends_on": deps,
+                "input_columns": inputs,
+                "output_columns": [str(x) for x in (cand.get("output_columns") or []) if str(x)],
+                "function_name": str(cand.get("function_name") or ""),
+            }
+    return out
 
 
 def get_profile_min_lookback(spec: dict) -> dict:

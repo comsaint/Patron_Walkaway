@@ -46,12 +46,16 @@ class TestReviewerWritePipelineDiagnosticsSourceContracts(unittest.TestCase):
 
 
 class TestReviewerCopyModelBundleWarnBranchContract(unittest.TestCase):
-    """STATUS Code Review §4: only pipeline_diagnostics.json triggers missing-file warning in loop."""
+    """§4: optional bundle files (see OPTIONAL_BUNDLE_FILES) log a warning when absent."""
 
-    def test_elif_warns_only_pipeline_diagnostics_json_literal(self):
+    def test_elif_warns_for_optional_bundle_files_via_frozenset(self):
         src = _copy_model_bundle_src()
-        self.assertIn('elif name == "pipeline_diagnostics.json":', src)
+        self.assertIn("elif name in OPTIONAL_BUNDLE_FILES:", src)
         self.assertIn("logger.warning", src)
+        self.assertIn(
+            "pipeline_diagnostics.json",
+            build_deploy_package.OPTIONAL_BUNDLE_FILES,
+        )
 
 
 class TestReviewerPipelineDiagnosticsStep78Evidence(unittest.TestCase):

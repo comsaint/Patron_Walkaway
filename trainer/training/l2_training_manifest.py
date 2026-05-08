@@ -40,6 +40,7 @@ class L2TrainingBundleManifest:
     train_sampling_applied: bool
     identity_mapping_mode: str
     label_asset_meta: Optional[Dict[str, Any]]
+    per_feature_fingerprints: Optional[Dict[str, str]]
 
 
 def _require_str(obj: Mapping[str, Any], key: str) -> str:
@@ -143,6 +144,21 @@ def load_and_validate_bundle(bundle_dir: Path) -> L2TrainingBundleManifest:
             raise ValueError("l2_training_bundle.json: 'label_asset' must be an object or omitted")
         label_asset_meta = dict(label_meta)
 
+    per_feature_fingerprints: Optional[Dict[str, str]] = None
+    fl = raw.get("feature_lineage")
+    if fl is not None:
+        if not isinstance(fl, dict):
+            raise ValueError("l2_training_bundle.json: 'feature_lineage' must be an object or omitted")
+        raw_fp = fl.get("per_feature_fingerprints")
+        if raw_fp is not None:
+            if not isinstance(raw_fp, dict):
+                raise ValueError(
+                    "l2_training_bundle.json: feature_lineage.per_feature_fingerprints must be an object"
+                )
+            per_feature_fingerprints = {
+                str(k): str(v) for k, v in raw_fp.items() if str(k).strip() and str(v).strip()
+            }
+
     return L2TrainingBundleManifest(
         bundle_dir=bundle_dir.resolve(),
         train_path=train_path,
@@ -158,6 +174,7 @@ def load_and_validate_bundle(bundle_dir: Path) -> L2TrainingBundleManifest:
         train_sampling_applied=train_samp,
         identity_mapping_mode=idm,
         label_asset_meta=label_asset_meta,
+        per_feature_fingerprints=per_feature_fingerprints,
     )
 
 

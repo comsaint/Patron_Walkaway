@@ -17,7 +17,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -117,6 +117,34 @@ def execute_l2_training_bundle(
         KEY_L2_SNAPSHOT_ID: manifest.l2_snapshot_id,
     }
 
+    _l2_feature_spec: Optional[dict] = None
+    try:
+        if tr.FEATURE_SPEC_PATH.is_file():
+            _l2_feature_spec = tr.load_feature_spec(tr.FEATURE_SPEC_PATH)
+    except Exception as _l2_spec_exc:
+        logger.warning("L2 bundle: could not load feature spec for spec-first gate: %s", _l2_spec_exc)
+
+    _l2_train_cols: List[str] = list(train_df.columns)
+    feature_materialization_audit: Optional[Dict[str, Any]] = None
+    try:
+        from trainer.training import feature_materialization as _fm_l2
+
+        _fm_l2.maybe_raise_spec_first_columns(_l2_train_cols, _l2_feature_spec)
+        feature_materialization_audit = _fm_l2.build_pipeline_feature_materialization_audit(
+            feature_spec=_l2_feature_spec,
+            train_columns=_l2_train_cols,
+            prev_per_feature_fp=manifest.per_feature_fingerprints,
+            curr_source_snapshot_id=manifest.source_snapshot_id,
+            pit_policy_id=str(manifest.identity_mapping_mode),
+        )
+        _fm_l2.raise_if_strict_materialization_gates_failed(
+            feature_materialization_audit["materialization_gates"],
+        )
+    except RuntimeError:
+        raise
+    except Exception as _l2fma_exc:
+        logger.warning("L2 bundle: feature_materialization audit failed: %s", _l2fma_exc)
+
     issue16_gate_report = evaluate_issue16_gate_bundle(
         effective_neg_sample_frac=1.0,
         chunk_train_end_naive=train_end,
@@ -126,6 +154,8 @@ def execute_l2_training_bundle(
         label_asset_meta=manifest.label_asset_meta,
         training_source_snapshot_id=manifest.source_snapshot_id,
         split_flags=split_flags,
+        train_column_names=_l2_train_cols,
+        feature_spec=_l2_feature_spec,
     )
     raise_if_strict_issue16_gates_failed(issue16_gate_report)
     issue16_gate_report = {
@@ -343,6 +373,7 @@ def execute_l2_training_bundle(
             output_dir=_bundle_dir,
             oom_estimate_strategy=OOM_ESTIMATE_STRATEGY_L2_SPLIT_FILES,
             l2_split_parquet_total_bytes=split_total_bytes,
+            feature_materialization_audit=feature_materialization_audit,
         )
     except Exception as _diag_exc:
         logger.warning("pipeline_diagnostics.json write failed (training still succeeded): %s", _diag_exc)

@@ -71,6 +71,56 @@ class TestL2BundleMaterialize(unittest.TestCase):
             m = load_and_validate_bundle(d)
             self.assertEqual(m.source_snapshot_id, "snap_unit_test")
             self.assertTrue(m.valid_full_unsampled and m.test_full_unsampled)
+            self.assertIsNone(m.per_feature_fingerprints)
+
+    def test_materialize_persists_feature_lineage_fingerprints(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            train = pd.DataFrame(
+                {
+                    "bet_id": [1],
+                    "payout_complete_dtm": pd.to_datetime(["2025-01-01"]),
+                    "label": [0],
+                    "is_rated": [True],
+                }
+            )
+            key = build_auto_l2_cache_key(
+                bridge_manifest_stat=None,
+                window_start_iso="2025-01-01",
+                window_end_iso="2025-02-01",
+                recent_chunks=None,
+                train_split_frac=0.65,
+                valid_split_frac=0.2,
+                neg_sample_frac_config=1.0,
+                feature_spec_fingerprint="fp",
+                rebuild_canonical_mapping=False,
+                identity_mapping_mode="cutoff_window",
+                force_recompute=False,
+            )
+            materialize_l2_training_bundle_dir(
+                d,
+                train_df=train,
+                valid_df=train,
+                test_df=train,
+                train_path=None,
+                valid_path=None,
+                test_path=None,
+                source_snapshot_id="snap_lineage",
+                train_end="2025-01-15T00:00:00",
+                window_start="2025-01-01T00:00:00",
+                window_end="2025-02-01T00:00:00",
+                identity_mapping_mode="cutoff_window",
+                train_sampling_applied=False,
+                cache_key=key,
+                per_feature_fingerprints={"feat_a": "deadbeef01", "feat_b": "cafebabe02"},
+            )
+            mf = json.loads((d / "l2_training_bundle.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                mf["feature_lineage"]["per_feature_fingerprints"]["feat_a"],
+                "deadbeef01",
+            )
+            m = load_and_validate_bundle(d)
+            self.assertEqual(m.per_feature_fingerprints, {"feat_a": "deadbeef01", "feat_b": "cafebabe02"})
 
     def test_cache_key_stable_fingerprint(self) -> None:
         k1 = build_auto_l2_cache_key(

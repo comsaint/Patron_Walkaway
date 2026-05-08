@@ -48,6 +48,17 @@
       },
       "additionalProperties": true
     },
-    "label_asset": { "type": "object" }
+    "label_asset": { "type": "object" },
+    "feature_lineage": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "manifest_version": { "type": "string" },
+        "per_feature_fingerprints": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    }
   }
 }

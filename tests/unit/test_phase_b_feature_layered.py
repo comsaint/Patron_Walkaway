@@ -121,7 +121,7 @@ def test_bet_player_wrappers_match_legacy_byte_identical() -> None:
 
 
 def test_phase_b_gate_entrypoint_map() -> None:
-    """Gate-B1 static check: describe_layered documents trainer-owned run/trip."""
+    """Gate-B1 static check: describe_layered documents run/trip entrypoints."""
     os.environ.pop("MODEL_DIR", None)
     from trainer.features import layered as L
 
@@ -130,5 +130,6 @@ def test_phase_b_gate_entrypoint_map() -> None:
     assert desc["bet"]["phase_b_status"] == "wrapped"
     assert desc["player"]["phase_b_status"] == "wrapped"
     assert desc["run"]["phase_b_status"] == "wrapped"
-    assert desc["trip"]["phase_b_status"] == "in_place"
+    assert desc["trip"]["phase_b_status"] == "wrapped"
+    assert "trainer.features.trip_materializer" in desc["trip"]["module"]
     assert "trainer.training.feature_pipeline" in desc["run"]["module"]

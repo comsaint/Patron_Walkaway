@@ -233,6 +233,24 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
             data = json.loads((model_dir / "pipeline_diagnostics.json").read_text(encoding="utf-8"))
         self.assertEqual(data["issue16_audit"]["all_ok"], True)
 
+    def test_feature_materialization_audit_merged_when_provided(self) -> None:
+        """Unified plan: optional feature_materialization_audit blob in diagnostics."""
+        import tempfile
+
+        audit = {"manifest_version": "feature_materialization_audit_v1", "declared_feature_count": 3}
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td)
+            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+                trainer_mod._write_pipeline_diagnostics_json(
+                    model_version="mv",
+                    pipeline_started_at="2026-05-08T00:00:00+00:00",
+                    pipeline_finished_at="2026-05-08T01:00:00+00:00",
+                    total_duration_sec=1.0,
+                    feature_materialization_audit=audit,
+                )
+            data = json.loads((model_dir / "pipeline_diagnostics.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["feature_materialization_audit"]["declared_feature_count"], 3)
+
 
 class TestIssue16Gates(unittest.TestCase):
     """trainer.training.issue16_gates — pure semantics for #16."""

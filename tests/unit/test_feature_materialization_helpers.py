@@ -1,0 +1,162 @@
+"""Unit tests for trainer.training.feature_materialization and trip_materializer."""
+
+from __future__ import annotations
+
+import os
+import unittest
+from unittest.mock import patch
+
+import pandas as pd
+
+from trainer.features.trip_materializer import materialize_trip_layer_features
+from trainer.training import feature_materialization as fm
+
+
+class TestFeatureMaterializationHelpers(unittest.TestCase):
+    """Spec-first helpers, fingerprints, and impact hints."""
+
+    def test_find_undeclared_skips_reserved_and_declared(self) -> None:
+        spec = {
+            "track_llm": {
+                "candidates": [{"feature_id": "my_feat", "type": "passthrough"}],
+            }
+        }
+        cols = ["my_feat", "label", "player_id", "_internal", "lda_trip_run_count", "ghost_col"]
+        bad = fm.find_undeclared_feature_columns(cols, spec)
+        self.assertEqual(bad, ["ghost_col"])
+
+    def test_impacted_propagates_via_depends_on(self) -> None:
+        spec = {
+            "track_llm": {
+                "candidates": [
+                    {"feature_id": "base_a", "type": "x"},
+                    {"feature_id": "derived_c", "type": "y", "depends_on": ["base_a"]},
+                    {"feature_id": "other_b", "type": "z"},
+                ],
+            }
+        }
+        prev = fm.per_feature_fingerprints(spec)
+        spec2 = {
+            "track_llm": {
+                "candidates": [
+                    {"feature_id": "base_a", "type": "x_changed"},
+                    {"feature_id": "derived_c", "type": "y", "depends_on": ["base_a"]},
+                    {"feature_id": "other_b", "type": "z"},
+                ],
+            }
+        }
+        curr = fm.per_feature_fingerprints(spec2)
+        hint = fm.impacted_feature_ids_on_fingerprint_change(prev, curr, spec2)
+        self.assertIn("base_a", hint["changed_feature_ids"])
+        self.assertIn("derived_c", hint["impacted_feature_ids"])
+        self.assertNotIn("other_b", hint["changed_feature_ids"])
+
+    def test_maybe_raise_spec_first_strict(self) -> None:
+        spec = {"track_llm": {"candidates": [{"feature_id": "f1"}]}}
+        with patch.dict(os.environ, {"TRAINER_SPEC_FIRST_STRICT": "1"}):
+            with self.assertRaises(RuntimeError) as ctx:
+                fm.maybe_raise_spec_first_columns(["f1", "undeclared_xyz"], spec)
+        self.assertIn("undeclared_xyz", str(ctx.exception))
+
+    def test_build_audit_includes_impact_hint_when_prev_fps(self) -> None:
+        spec = {"track_llm": {"candidates": [{"feature_id": "only_one", "expression": "1"}]}}
+        prev = {"only_one": "aaa"}
+        spec2 = {"track_llm": {"candidates": [{"feature_id": "only_one", "expression": "2"}]}}
+        audit = fm.build_pipeline_feature_materialization_audit(
+            feature_spec=spec2,
+            train_columns=["only_one", "label"],
+            prev_per_feature_fp=prev,
+        )
+        self.assertIn("impact_hint_vs_previous_run", audit)
+        self.assertIn("only_one", audit["impact_hint_vs_previous_run"]["changed_feature_ids"])
+
+    def test_build_audit_includes_impact_plan_and_cache_lexicon(self) -> None:
+        spec = {"track_llm": {"candidates": [{"feature_id": "f1", "expression": "1"}]}}
+        audit = fm.build_pipeline_feature_materialization_audit(
+            feature_spec=spec,
+            train_columns=["f1", "label"],
+            curr_source_snapshot_id="snap_x",
+        )
+        self.assertIn("impact_plan", audit)
+        self.assertEqual(audit["impact_plan"]["impact_planner_version"], "impact_planner_v1")
+        self.assertIn("cache_key_lexicon_sample", audit)
+        self.assertIn("materialization_gates", audit)
+
+    def test_upstream_closure_hash_stable(self) -> None:
+        spec = {
+            "track_llm": {
+                "candidates": [
+                    {"feature_id": "bet_f", "expression": "1"},
+                    {"feature_id": "compose_x", "expression": "2", "depends_on": ["run_f"]},
+                ],
+            },
+            "track_human": {"candidates": [{"feature_id": "run_f", "expression": "x"}]},
+        }
+        fps = fm.per_feature_fingerprints(spec)
+        h1 = fm.upstream_fingerprint_closure_hash(spec, "compose_x", fps)
+        h2 = fm.upstream_fingerprint_closure_hash(spec, "compose_x", fps)
+        self.assertEqual(h1, h2)
+        self.assertTrue(len(h1) >= 8)
+
+    def test_strict_materialization_gate_raises_on_bad_asset_path(self) -> None:
+        with patch.dict(os.environ, {"TRAINER_PLAYER_LAYER_ASSET_PATH": ""}):
+            rep = fm.evaluate_materialization_gate_bundle()
+        self.assertTrue(rep["gates"]["player_layer_asset_path_guard"]["ok"])
+        with patch.dict(
+            os.environ,
+            {"TRAINER_PLAYER_LAYER_ASSET_PATH": "/nonexistent/player_layer.parquet"},
+        ):
+            rep_bad = fm.evaluate_materialization_gate_bundle()
+        self.assertFalse(rep_bad["gates"]["player_layer_asset_path_guard"]["ok"])
+        with patch.dict(
+            os.environ,
+            {
+                "TRAINER_PLAYER_LAYER_ASSET_PATH": "/nonexistent/player_layer.parquet",
+                "TRAINER_MATERIALIZATION_STRICT_GATES": "1",
+            },
+        ):
+            rep_bad2 = fm.evaluate_materialization_gate_bundle()
+            with self.assertRaises(RuntimeError):
+                fm.raise_if_strict_materialization_gates_failed(rep_bad2)
+
+
+class TestImpactPlanner(unittest.TestCase):
+    """trainer.training.impact_planner — spec + snapshot delta."""
+
+    def test_snapshot_change_marks_full_matrix(self) -> None:
+        from trainer.training.impact_planner import plan_impacted_materialization_work
+
+        spec = {"track_llm": {"candidates": [{"feature_id": "f1", "expression": "x"}]}}
+        plan = plan_impacted_materialization_work(
+            curr_spec=spec,
+            prev_spec=None,
+            prev_per_feature_fp=None,
+            prev_source_snapshot_id="snap_a",
+            curr_source_snapshot_id="snap_b",
+        )
+        self.assertTrue(plan["full_matrix_recommended"])
+        self.assertIn("DATA_SNAPSHOT_ID_CHANGED", plan["impact_reasons"])
+        self.assertGreater(plan["impacted_work_unit_count"], 0)
+
+
+class TestTripMaterializer(unittest.TestCase):
+    """Trip-layer materializer contract."""
+
+    def test_fail_closed_raises_when_lda_missing(self) -> None:
+        df = pd.DataFrame({"bet_id": [1]})
+        with self.assertRaises(ValueError) as ctx:
+            materialize_trip_layer_features(df, fail_closed=True)
+        self.assertIn("lda", str(ctx.exception).lower())
+
+    def test_lenient_returns_same_frame(self) -> None:
+        df = pd.DataFrame({"bet_id": [1], "lda_trip_run_count": [0.0]})
+        out = materialize_trip_layer_features(df, fail_closed=False)
+        self.assertIs(out, df)
+        self.assertEqual(str(out["lda_trip_run_count"].dtype), "float32")
+
+    def test_lenient_zero_fills_missing_lda_columns(self) -> None:
+        df = pd.DataFrame({"bet_id": [1]})
+        out = materialize_trip_layer_features(df, fail_closed=False)
+        self.assertIs(out, df)
+        self.assertIn("lda_trip_run_count", out.columns)
+        self.assertEqual(str(out["lda_trip_run_count"].dtype), "float32")
