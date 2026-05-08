@@ -33,7 +33,7 @@
 | 5 | **9** | **離線序列嵌入（SSL）→ 向量作為 GBDT 特徵** | 特徵／表示學習 | `ssot/trainer_plan_ssot.md` 已規劃 Phase 2「離線預訓練嵌入 + 日更／批次特徵」路線；屬「開上限」型投入 |
 | 6 | **8** | **分群建模 + learned gating**（2–4 experts + 輕量 gate） | 模型／路由 | `PLAN_precision_uplift_sprint.md` Phase 2/3 已列；比「純規則切桶」更可能吃到非線性路由紅利 |
 | 7 | **7** | **接軌 `compute_table_hc` 與桌台／擁擠情境特徵**（在 S1 護欄下） | 特徵 | `trainer/features/features.py` 已實作 `compute_table_hc`；但 `trainer/training/trainer.py` / `trainer/serving/scorer.py` 尚未主路徑接線——屬 near-ready，而非免費特徵 |
-| 8 | **6** | **擴張 Track LLM／Track Human 候選特徵**（節奏變化率、regime shift、短中長窗對照、跨桌行為等） | 特徵 | `trainer/feature_spec/features_candidates.yaml` 已有良好骨架；屬低耦合擴張 |
+| 8 | **6** | **擴張 Track LLM／Track Human 候選特徵**（節奏變化率、regime shift、短中長窗對照、跨桌行為等） | 特徵 | `trainer/feature_spec/feature_spec.yaml` 已有良好骨架；屬低耦合擴張 |
 | 9 | **5** | **修正 canonical mapping 的 D3（PIT-correct mapping）** | 身分／資料語意 | `trainer/identity.py` 明載 D3：整窗 mapping 可能讓早期觀測「看到」較晚才形成的連結；若影響高分段，屬高槓桿但偏「基礎修復」 |
 | 10 | **5** | **真多窗 Phase 2 矩陣 + gate**（拒絕單窗幻覺 uplift） | 評估／治理 | 既有 implementation plan 的 W2-C 仍待「非 bridge」多窗；屬加速淘汰假 winner |
 | 11 | **4** | **Profile 依 history depth／完整度分 bundle**（與 `min_lookback_days`、DEC-017 精神一致） | 特徵／資料 | Feature spec 已支援 `min_lookback_days`；可再上升到「分段模型或分段特徵子集」 |
@@ -100,7 +100,7 @@
 
 **#8 擴張 Track LLM／Track Human 候選特徵**
 
-- **做什麼**：在 `trainer/feature_spec/features_candidates.yaml` 增加候選特徵（例如：節奏一階／二階差分、win/loss 轉折標記、短窗對長窗比值、連續 PUSH 後首個 LOSE 的間隔等），跑既有 **screen_features** 管線篩進 `feature_list.json`。  
+- **做什麼**：在 `trainer/feature_spec/feature_spec.yaml` 增加候選特徵（例如：節奏一階／二階差分、win/loss 轉折標記、短窗對長窗比值、連續 PUSH 後首個 LOSE 的間隔等），跑既有 **screen_features** 管線篩進 `feature_list.json`。  
 - **為何有用**：在不改架構下擴大 **假設空間**；許多 uplift 來自「特徵沒覆蓋到的行為模式」而非單純加深樹深。  
 - **典型改動面**：YAML、`compute_track_llm_features` 產 SQL、spec hash、訓練與 scorer 共用 DuckDB SQL。  
 - **注意**：候選爆量時篩選與冗餘剔除要控管；避免無效高相關欄位占滿 `SCREEN_FEATURES_TOP_K`。

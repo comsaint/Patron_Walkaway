@@ -1,9 +1,9 @@
 # Feature Engineering Suggestions — Patron Walkaway Predictor
 
 > 文件層級：特徵工程建議（Feature Engineering Suggestions）
-> 來源：基於 `trainer/feature_spec/features_candidates.yaml`、現有 `trainer/` 管線與 `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` 的補充建議。
+> 來源：基於 `trainer/feature_spec/feature_spec.yaml`、現有 `trainer/` 管線與 `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` 的補充建議。
 > 術語說明：本文件使用 **run** 或 **visit** 描述「玩家連續下注流程（前後間隔 < 30 分鐘）」，不使用 session（session 在 smart table 資料中以玩家 × 桌台為邊界，換桌即產生新 session，語意不同）。
-> 非目標：不取代 `features_candidates.yaml` 的 SSOT 地位；實際納入需經 feature screening、train-serve parity 與資料契約驗證。
+> 非目標：不取代 `feature_spec.yaml` 的 SSOT 地位；實際納入需經 feature screening、train-serve parity 與資料契約驗證。
 > 文件語意：未來可將 `track_human` + `track_llm` 在文件層合併理解為 **short_term_dynamics**，但目前 repo 仍保留既有 track 命名以維持 trainer / scorer / backtester / artifact 相容。`compute_backend`、`materialization_stage` 等 metadata 方向可接受，但在尚無 consumer 前**不建議**先寫死進 YAML spec。
 
 **Metadata**
@@ -14,7 +14,7 @@
 
 本文件的目的，是把「值得考慮但尚未納入 SSOT」的特徵工程想法，整理成一份可討論、可篩選、可追溯的候選清單，供後續 feature screening、implementation planning 與 execution planning 參考。它不直接定義最終要上線的特徵，而是幫助團隊辨識哪些訊號已可由現有 schema 支撐、哪些想法需要額外資料表、以及哪些候選雖然有價值，但在落地上仍需補齊 parity、DQ 或 pipeline 契約。
 
-內容上，本文件分成三類：A 類是可由現有 bet / profile 資料直接延伸的候選；B 類是已由現有 schema 支撐、但偏向桌況 / context 的 first-wave 候選；C 類則是需要額外資料表或事件資料才能成立的後續方向。每一類除了列出 feature 想法，也會註記其資料來源、主要風險、落地阻力與目前建議優先序，避免把概念清單誤讀成可以直接搬進 `features_candidates.yaml` 的最終規格。
+內容上，本文件分成三類：A 類是可由現有 bet / profile 資料直接延伸的候選；B 類是已由現有 schema 支撐、但偏向桌況 / context 的 first-wave 候選；C 類則是需要額外資料表或事件資料才能成立的後續方向。每一類除了列出 feature 想法，也會註記其資料來源、主要風險、落地阻力與目前建議優先序，避免把概念清單誤讀成可以直接搬進 `feature_spec.yaml` 的最終規格。
 
 ---
 
@@ -221,7 +221,7 @@
 
 *建立日期：2026-04-22*  
 *術語：run / visit = 玩家連續下注流程（間隔 < 30 分鐘）；session = 玩家 × 桌台邊界（smart table 原始定義，本文件不使用）*  
-*範圍：補充建議，不取代 `features_candidates.yaml` SSOT*
+*範圍：補充建議，不取代 `feature_spec.yaml` SSOT*
 
 ---
 

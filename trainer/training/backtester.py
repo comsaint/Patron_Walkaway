@@ -1011,7 +1011,7 @@ def backtest(
     if _spec_path.exists():
         feature_spec = load_feature_spec(_spec_path)
     else:
-        feature_spec = load_feature_spec(BASE_DIR / "feature_spec" / "features_candidates.yaml")
+        feature_spec = load_feature_spec(BASE_DIR / "feature_spec" / "feature_spec.yaml")
     try:
         _bets_llm_result = compute_track_llm_features(
             bets,

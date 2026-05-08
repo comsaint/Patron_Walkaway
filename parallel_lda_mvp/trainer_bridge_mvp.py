@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 # Bet-level run/trip LDA pass-through columns (must match trainer ``_REQUIRED_BET_PARQUET_COLS`` suffix
-# and ``features_candidates.yaml`` passthrough ``feature_id`` values).
+# and ``feature_spec.yaml`` passthrough ``feature_id`` values).
 LDA_RUN_TRIP_BET_COLUMNS: tuple[str, ...] = (
     "lda_l1_run_bet_count",
     "lda_trip_run_count",

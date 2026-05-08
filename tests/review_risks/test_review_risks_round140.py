@@ -49,6 +49,10 @@ class TestR200SchemaHashHorizonGuardrail(unittest.TestCase):
                 patch("trainer.trainer.LOCAL_PROFILE_SCHEMA_HASH", sidecar_path),
                 patch("trainer.trainer.compute_profile_schema_hash", return_value=base_hash),
                 patch(
+                    "trainer.trainer.local_parquet_session_path_for_trainer",
+                    return_value=session_path,
+                ),
+                patch(
                     "trainer.trainer._parquet_date_range",
                     side_effect=[
                         # session range
@@ -106,7 +110,7 @@ class TestR144SaveArtifactBundleWhenFeatureSpecNone(unittest.TestCase):
     def test_feature_list_non_profile_track_llm_when_spec_path_missing(self):
         """When feature_spec_path points to nonexistent file, feature_spec is None; non-profile cols get track 'track_llm'."""
         feature_cols = ["loss_streak", "days_since_last_session"]
-        nonexistent_spec = Path("/nonexistent/features_candidates.yaml")
+        nonexistent_spec = Path("/nonexistent/feature_spec.yaml")
 
         with TemporaryDirectory() as td:
             model_dir = Path(td)

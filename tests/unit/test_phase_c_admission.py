@@ -11,7 +11,7 @@ import pytest
 import yaml
 
 _REPO = Path(__file__).resolve().parents[2]
-_CANDIDATES = _REPO / "trainer" / "feature_spec" / "features_candidates.yaml"
+_CANDIDATES = _REPO / "trainer" / "feature_spec" / "feature_spec.yaml"
 _DEPLOY = _REPO / "package" / "deploy" / "models" / "feature_spec.yaml"
 
 

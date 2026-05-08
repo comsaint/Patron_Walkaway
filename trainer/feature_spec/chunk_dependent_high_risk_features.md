@@ -1,5 +1,5 @@
 # Track LLM：chunk / slice 敏感特徵（高風險清單）
-本文件由 `scripts/check_cum_bets_chunk_position_corr.py --emit-risk-doc` 產生；依 `trainer/feature_spec/features_candidates.yaml` 靜態掃描。
+本文件由 `scripts/check_cum_bets_chunk_position_corr.py --emit-risk-doc` 產生；依 `trainer/feature_spec/feature_spec.yaml` 靜態掃描。
 ## 分級說明
 - **A（嚴重）**：`ROWS … UNBOUNDED PRECEDING` — 值域強烈依賴「本 chunk 載入表內從第一筆算起」，易與「距離 chunk 起點多久」共線。
 - **B（中高）**：`ROWS BETWEEN k PRECEDING` — 只看本表內最近 k **列**；在 chunk 開頭可用歷史不足，語意隨切片變形。
@@ -44,4 +44,4 @@
 
 ## 備註
 - `track_human`（例如 run boundary）也可能有 lookback/chunk 語意；本清單**僅掃 track_llm**。
-- 實際訓練仍以 `trainer.training.process_chunk` 載入邊界 + DQ + identity 為準；本檔用於設計/物化前的風險盤點。
+- 實際訓練仍以單一時間窗內之 `trainer.training.process_chunk`（run/trip 管線之 materialize 步）載入邊界 + DQ + identity 為準；本檔用於設計/物化前的風險盤點。

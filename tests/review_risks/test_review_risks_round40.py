@@ -16,7 +16,7 @@ import unittest
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_FEATURE_SPEC_PATH = _REPO_ROOT / "trainer" / "feature_spec" / "features_candidates.yaml"
+_FEATURE_SPEC_PATH = _REPO_ROOT / "trainer" / "feature_spec" / "feature_spec.yaml"
 _TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 _BACKTESTER_PATH = _REPO_ROOT / "trainer" / "backtester.py"
 # Issue #12 PR-12.3 / PR-12.5: feature pipeline coordinators (apply_dq,

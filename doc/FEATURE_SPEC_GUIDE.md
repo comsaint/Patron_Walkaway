@@ -12,13 +12,13 @@
 ## 1. 檔案位置與角色
 
 - 候選特徵定義（spec 原始檔）：  
-  - **`trainer/feature_spec/features_candidates.yaml`**（repo 內唯一 spec SSOT；訓練時會整份複製到 artifact 的 `feature_spec.yaml`）  
+  - **`trainer/feature_spec/feature_spec.yaml`**（repo 內唯一 spec SSOT；訓練時會整份複製到 artifact 的 `feature_spec.yaml`）  
 - 生產特徵清單（active features）：  
   - **`trainer/feature_spec/feature_list.json`**（由訓練流程產生，為 canonical 來源；template 內各 track 的 `active.feature_ids: []` 可視為同一定義的 YAML 表示）
 
 兩者關係：
 
-1. **features_candidates.yaml**：Track Profile / Track LLM / Track Human 的「特徵全集」，包含所有候選。  
+1. **feature_spec.yaml**：Track Profile / Track LLM / Track Human 的「特徵全集」，包含所有候選。  
 2. 訓練流程（`trainer.py`）讀取 candidates，計算特徵並做 Feature Screening。  
 3. Screening 結果寫入 **feature_list.json**（只留需要真的計算與送入模型的 feature_id）。  
 4. `scorer.py` 只依據 feature_list.json 與 **凍結在 model artifact 內的 feature_spec.yaml**（訓練時寫入）來計算線上特徵；若 artifact 內無 feature_spec.yaml 則 fallback 至全域 spec 路徑。
@@ -30,7 +30,7 @@
 完整 spec 見：
 
 ```text
-trainer/feature_spec/features_candidates.yaml
+trainer/feature_spec/feature_spec.yaml
 ```
 
 ### 2.1 全域區塊
@@ -107,7 +107,7 @@ trainer/feature_spec/features_candidates.yaml
 
 **Artifact 凍結與版本追蹤**（與 STATUS Round 105 / R3501 對齊）：
 
-- 訓練時會將當時使用的 **features_candidates.yaml 整份複製**到 model 目錄下的 **feature_spec.yaml**（凍結版本），scorer 載入時優先使用此檔，確保 train–serve 一致。  
+- 訓練時會將當時使用的 **feature_spec.yaml 整份複製**到 model 目錄下的 **feature_spec.yaml**（凍結版本），scorer 載入時優先使用此檔，確保 train–serve 一致。  
 - **spec_hash**（例如 MD5 前 12 字元）寫入 **training_metrics.json**。  
 - 建議另記錄 **active_feature_hash**（feature_list.json 的 hash）於 artifact metadata，以便在 `/model_info` 或線上監控中追蹤模型與特徵定義版本。
 
@@ -115,7 +115,7 @@ trainer/feature_spec/features_candidates.yaml
 
 ## 4. 給未來 LLM 看的 Prompt 範本
 
-> 下列 Prompt 範本假設你在對話中直接貼上 `features_candidates.yaml` 裡的 Track LLM 結構，並要求 LLM 產生多個新特徵。請務必保留「只寫 expression + window_frame，不寫 SELECT」這個約束。
+> 下列 Prompt 範本假設你在對話中直接貼上 `feature_spec.yaml` 裡的 Track LLM 結構，並要求 LLM 產生多個新特徵。請務必保留「只寫 expression + window_frame，不寫 SELECT」這個約束。
 
 **英文版本（推薦）**：
 
@@ -187,7 +187,7 @@ Task:
 
 ## 5. 推薦使用流程（給未來的自己）
 
-1. 在 repo 內直接編輯 **`features_candidates.yaml`**（唯一 spec 來源）。  
+1. 在 repo 內直接編輯 **`feature_spec.yaml`**（唯一 spec 來源）。  
 2. 依照當前資料理解，手動調整：  
    - `track_llm.guardrails.max_window_minutes`  
    - `inference_state.history_window_min` 與 `history_buffer_min`  

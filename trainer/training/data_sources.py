@@ -198,11 +198,12 @@ def resolve_local_parquet_bet_session_paths_from_manifest(
 ) -> Tuple[Path, Path]:
     """Resolve bet and session Parquet paths from a bridge manifest dict."""
     raw_bet: Optional[str] = None
-    t_bet_paths = manifest.get("t_bet_paths")
-    if isinstance(t_bet_paths, list) and t_bet_paths:
-        raw_bet = str(t_bet_paths[0])
-    if raw_bet is None and manifest.get("gmwds_t_bet"):
+    if manifest.get("gmwds_t_bet"):
         raw_bet = str(manifest["gmwds_t_bet"])
+    if raw_bet is None:
+        t_bet_paths = manifest.get("t_bet_paths")
+        if isinstance(t_bet_paths, list) and t_bet_paths:
+            raw_bet = str(t_bet_paths[0])
     if not raw_bet:
         raise KeyError(
             "manifest must contain non-empty 't_bet_paths' or 'gmwds_t_bet' "

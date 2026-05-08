@@ -4,13 +4,13 @@ Patron Walkaway Prediction — Training Pipeline
 
 Pipeline (SSOT §4.3 / §9)
 --------------------------
-1. time_fold.get_monthly_chunks(start, end)  -> month boundaries
-2. Per chunk: load bets + sessions -> DQ -> identity -> labels -> Track Human features
+1. time_fold.get_single_window_chunk(start, end)  -> one training window (default; no month chunks)
+2. Per window: load bets + sessions -> DQ -> identity -> labels -> Track Human features
    - Data source: ClickHouse (production) OR local Parquet (dev iteration)
    - Labels use C1 extended pull; bets in (window_end, extended_end] are
      used only for label computation, NOT added to training rows.
-3. Write each processed chunk to .data/chunks/ as Parquet.
-4. Concatenate all chunks; split train / valid / test at ROW level (time-ordered
+3. Write processed window rows to .data/chunks/ as Parquet (legacy compat path).
+4. Concatenate window part(s); split train / valid / test at ROW level (time-ordered
    70/15/15 — SSOT §9.2).  Chunks control ETL/cache volume only, not split semantics.
 5. sample_weight = 1 / N_run  (canonical_id × run_id from compute_run_boundary), train set only.
 6. Optuna TPE hyperparameter search on validation set (per model type).
@@ -384,7 +384,11 @@ Dec026ThresholdPick = _threshold_selection_mod.Dec026ThresholdPick
 # Module-level pipeline imports: try = run from trainer dir with modules on path (e.g. dev);
 # except = run as package (python -m trainer.trainer). Only the except path uses relative db_conn.
 try:
-    from time_fold import get_monthly_chunks, get_train_valid_test_split  # type: ignore[import]
+    from time_fold import (  # type: ignore[import]
+        get_monthly_chunks,
+        get_single_window_chunk,
+        get_train_valid_test_split,
+    )
     from identity import (  # type: ignore[import]
         build_canonical_mapping_from_df,
         build_canonical_mapping,
@@ -430,7 +434,11 @@ try:
     from config import SCREEN_FEATURES_METHOD  # type: ignore[import]
     from schema_io import normalize_bets_sessions  # type: ignore[import]
 except ModuleNotFoundError:
-    from trainer.time_fold import get_monthly_chunks, get_train_valid_test_split  # type: ignore[import]
+    from trainer.time_fold import (  # type: ignore[import]
+        get_monthly_chunks,
+        get_single_window_chunk,
+        get_train_valid_test_split,
+    )
     from trainer.identity import (  # type: ignore[import]
         build_canonical_mapping_from_df,
         build_canonical_mapping,
@@ -500,7 +508,7 @@ DATA_DIR = BASE_DIR / ".data"
 CHUNK_DIR = DATA_DIR / "chunks"
 CANONICAL_MAPPING_PARQUET = LOCAL_PARQUET_DIR / "canonical_mapping.parquet"
 CANONICAL_MAPPING_CUTOFF_JSON = LOCAL_PARQUET_DIR / "canonical_mapping.cutoff.json"
-FEATURE_SPEC_PATH = BASE_DIR / "feature_spec" / "features_candidates.yaml"
+FEATURE_SPEC_PATH = BASE_DIR / "feature_spec" / "feature_spec.yaml"
 MODEL_DIR: Path = cast(Path, getattr(_cfg, "DEFAULT_MODEL_DIR", BASE_DIR / "models"))
 OUT_DIR = BASE_DIR / "out_trainer"
 
@@ -8060,20 +8068,30 @@ def run_pipeline(args) -> None:
                 )
                 return
 
-            # 1. Monthly chunks (DEC-008 / SSOT §4.3)
-            pipeline_echo("Step 1/10 — Training window and monthly chunks …")
+            # 1. Training window chunks: default single-window (run/trip pipeline); optional legacy monthly.
+            _legacy_monthly_chunks = bool(getattr(args, "legacy_chunk_mode", False))
+            _chunk_mode_label = "monthly (legacy)" if _legacy_monthly_chunks else "single-window"
+            pipeline_echo(f"Step 1/10 — Training window and {_chunk_mode_label} …")
             t0 = time.perf_counter()
-            chunks = get_monthly_chunks(start, end)
+            chunks = (
+                get_monthly_chunks(start, end)
+                if _legacy_monthly_chunks
+                else get_single_window_chunk(start, end)
+            )
             _el = time.perf_counter() - t0
             step1_duration_sec = _el
-            pipeline_echo(f"Step 1/10 — done in {_el:.1f}s ({len(chunks)} monthly chunks)")
-            logger.info("Chunks: %d  (%.1fs)", len(chunks), _el)
-        
-            # Debug/test mode: limit to most recent N chunks so data loading from both
-            # ClickHouse and local Parquet is proportionally restricted.
+            pipeline_echo(f"Step 1/10 — done in {_el:.1f}s ({len(chunks)} chunk(s), {_chunk_mode_label})")
+            logger.info("Chunks: %d mode=%s (%.1fs)", len(chunks), _chunk_mode_label, _el)
+
+            # Debug/test mode: last N monthly chunks only when legacy mode is on.
             recent_chunks = getattr(args, "recent_chunks", None)
             if recent_chunks is not None and recent_chunks > 0:
-                if recent_chunks < len(chunks):
+                if not _legacy_monthly_chunks:
+                    logger.info(
+                        "--recent-chunks=%d ignored in single-window mode; use --legacy-chunk-mode for last-N months.",
+                        recent_chunks,
+                    )
+                elif recent_chunks < len(chunks):
                     chunks = chunks[-recent_chunks:]
                     logger.info(
                         "DEBUG MODE (--recent-chunks %d): trimmed to %s -> %s",
@@ -8319,11 +8337,10 @@ def run_pipeline(args) -> None:
             except Exception as _side_exc:
                 logger.warning("Could not update canonical_mapping.cutoff.json sidecar (%s)", _side_exc)
 
-            # GitHub #17: auto L2 bundle cache — skip Steps 4–10 chunk path when bundle matches inputs.
+            # GitHub #17: auto L2 bundle cache — default for --use-local-parquet (single run/trip path).
             _auto_l2 = (
                 use_local
-                and getattr(args, "l2_auto_from_local", False)
-                and not getattr(args, "legacy_chunk_mode", False)
+                and not _legacy_monthly_chunks
                 and not getattr(args, "l2_training_bundle", None)
                 and not getattr(args, "no_l2_auto_bundle", False)
             )
@@ -9411,8 +9428,7 @@ def run_pipeline(args) -> None:
             # GitHub #17: materialize L2 bundle from Step 7 outputs, then train via L2 path (skip chunk 8–10).
             _auto_l2_post7 = (
                 use_local
-                and getattr(args, "l2_auto_from_local", False)
-                and not getattr(args, "legacy_chunk_mode", False)
+                and not _legacy_monthly_chunks
                 and not getattr(args, "l2_training_bundle", None)
                 and not getattr(args, "no_l2_auto_bundle", False)
             )

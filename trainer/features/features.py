@@ -48,6 +48,7 @@ try:
     from config import (  # type: ignore[import]
         BET_AVAIL_DELAY_MIN,
         LOSS_STREAK_PUSH_RESETS,
+        MIGRATION_STRICT_MODE,
         PLACEHOLDER_PLAYER_ID,
         RUN_BREAK_MIN,
         SCREEN_FEATURES_TOP_K,
@@ -59,6 +60,7 @@ except ModuleNotFoundError:
     from trainer.config import (  # type: ignore[import]
         BET_AVAIL_DELAY_MIN,
         LOSS_STREAK_PUSH_RESETS,
+        MIGRATION_STRICT_MODE,
         PLACEHOLDER_PLAYER_ID,
         RUN_BREAK_MIN,
         SCREEN_FEATURES_TOP_K,
@@ -130,7 +132,7 @@ def _resolve_frozen_feature_spec_yaml(versions_root: pathlib.Path) -> Optional[p
     return cand if cand.is_file() else None
 
 
-_repo_candidates_yaml = pathlib.Path(__file__).resolve().parent.parent / "feature_spec" / "features_candidates.yaml"
+_repo_feature_spec_yaml = pathlib.Path(__file__).resolve().parent.parent / "feature_spec" / "feature_spec.yaml"
 _raw_model_dir = os.environ.get("MODEL_DIR")
 _model_dir_stripped = _raw_model_dir.strip() if (_raw_model_dir and _raw_model_dir.strip()) else None
 
@@ -141,17 +143,28 @@ if _model_dir_stripped is not None:
 if _deploy_yaml is not None:
     _yaml_path = _deploy_yaml
 elif _model_dir_stripped is not None:
+    if MIGRATION_STRICT_MODE == "strict":
+        raise FileNotFoundError(
+            "MODEL_DIR is set but no frozen feature_spec.yaml under %r (tried legacy %s "
+            "and the resolved versioned bundle). Place feature_spec.yaml in the active "
+            "bundle, unset MODEL_DIR for local dev, or set MIGRATION_STRICT_MODE=warn."
+            % (
+                _model_dir_stripped,
+                pathlib.Path(_model_dir_stripped) / "feature_spec.yaml",
+            )
+        )
     logger.warning(
         "MODEL_DIR is set but feature spec not found under %s (tried legacy %s and the "
-        "resolved versioned bundle). Loading repo candidates from %s. For strict deploy, "
-        "place feature_spec.yaml in the active bundle (e.g. out/models/<version>/).",
+        "resolved versioned bundle). Loading repo spec from %s. For strict deploy, "
+        "place feature_spec.yaml in the active bundle (e.g. out/models/<version>/). "
+        "Set MIGRATION_STRICT_MODE=strict to fail closed instead.",
         _model_dir_stripped,
         pathlib.Path(_model_dir_stripped) / "feature_spec.yaml",
-        _repo_candidates_yaml,
+        _repo_feature_spec_yaml,
     )
-    _yaml_path = _repo_candidates_yaml
+    _yaml_path = _repo_feature_spec_yaml
 else:
-    _yaml_path = _repo_candidates_yaml
+    _yaml_path = _repo_feature_spec_yaml
 
 try:
     with open(_yaml_path, "r", encoding="utf-8") as _f:
@@ -161,7 +174,7 @@ except FileNotFoundError:
 
     _logging.getLogger(__name__).warning(
         "Feature Spec YAML not found at %s — PROFILE_FEATURE_COLS will be empty. "
-        "Ensure features_candidates.yaml (repo spec) exists before training.",
+        "Ensure trainer/feature_spec/feature_spec.yaml exists before training.",
         _yaml_path,
     )
     _TEMPLATE_SPEC = {}

@@ -60,6 +60,7 @@ from trainer.core._duckdb_runtime import (
 from trainer.core._config_env_paths import (
     DEFAULT_BACKTEST_OUT,
     DEFAULT_MODEL_DIR,
+    MIGRATION_STRICT_MODE,
     NUMEXPR_MAX_THREADS,
     PREDICTION_EXPORT_BATCH_ROWS,
     PREDICTION_EXPORT_SAFETY_LAG_MINUTES,

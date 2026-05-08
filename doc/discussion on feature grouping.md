@@ -308,7 +308,7 @@ Can you check what are the differences between the data set they used and how it
 **相同（可視為同一資料契約／來源設定）**
 
 - **訓練時間窗**：`training_window_start` / `training_window_end` 都是 `2026-01-01`～`2026-04-02`（params 一致）。
-- **特徵規格**：`feature_spec_path` 與 **`feature_spec_sha256` 相同**（兩 run 的 `features_candidates.yaml` 指紋一致）。
+- **特徵規格**：`feature_spec_path` 與 **`feature_spec_sha256` 相同**（兩 run 的 repo `feature_spec.yaml` / 凍結 artifact 指紋一致）。
 - **Test 區間上界**：`split_test_end` 都是 `2026-04-01T23:59:59`。
 
 **不同（實際進模型的「樣本集合」已變）**

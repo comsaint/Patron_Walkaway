@@ -2,7 +2,7 @@
 #
 # Authoritative mapping from legacy 3-track feature_id to the new
 # bet / run / trip / player layered framework introduced by `layered_framework`
-# in features_candidates.yaml and package/deploy/models/feature_spec.yaml.
+# in trainer/feature_spec/feature_spec.yaml and package/deploy/models/feature_spec.yaml.
 #
 # Status values:
 #   mapped     - new_feature_id replaces old_feature_id at the same semantic level
@@ -27,7 +27,7 @@ mapping_version: "0.1"
 phase: "phase_a"
 status: "draft"
 related_specs:
-  - trainer/feature_spec/features_candidates.yaml
+  - trainer/feature_spec/feature_spec.yaml
   - package/deploy/models/feature_spec.yaml
 related_docs:
   - trainer/feature_spec/chunk_dependent_high_risk_features.md

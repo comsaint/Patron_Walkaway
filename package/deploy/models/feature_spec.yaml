@@ -3,17 +3,16 @@ spec_id: "walkaway_features_v2_template"
 description: "Template feature spec for Patron Walkaway Predictor (Track Profile / Track LLM / Track Human)."
 
 # ---------------------------------------------------------------------------
-# Layered framework (Phase A skeleton; deploy spec mirrors candidates spec).
-# Runtime behavior unchanged in Phase A — legacy 3-track blocks remain
-# authoritative for the loader. Real cutover happens in later phases.
+# Layered framework (Phase A skeleton; legacy 3-track sections below remain
+# authoritative for runtime until later phases switch over).
 # ---------------------------------------------------------------------------
 layered_framework:
   status: "phase_a_skeleton"
   authoritative: false
   notes: >
-    Deploy-side mirror of the candidates spec layered contract. Runtime is still
-    driven by the legacy track_llm / track_human / track_profile sections; this
-    block exists so deploy artifacts carry the same layered contract for audit.
+    Phase A introduces the contract; the legacy track_llm / track_human / track_profile
+    sections still drive runtime. PR-A2 fills the old<->new mapping; PR-A3 lands chunk-
+    dependent replacements; PR-A4 mirrors the contract into the deploy spec.
 
   layers:
     bet:
@@ -70,8 +69,7 @@ layered_framework:
     direction: "remove"
     notes: >
       Phase A only flags the direction. Existing reason_code_category fields remain
-      in this deploy spec so frozen artifacts continue to load; full removal lands
-      in a later phase together with downstream consumers.
+      so the current loader is not broken; downstream removal happens in later phases.
 
   legacy_tracks:
     status: "reference_only_after_cutover"
@@ -82,9 +80,10 @@ layered_framework:
   mapping_artifact:
     path: "trainer/feature_spec/track_to_layer_mapping.yaml"
     description: >
-      Audit-only reference. Deploy spec mirrors the candidates contract; runtime
-      behavior is unchanged in Phase A. The mapping file is the SSOT for the
-      legacy 3-track -> new layered feature_id translation.
+      Authoritative legacy 3-track -> new layered feature_id mapping plus
+      chunk-dependent replacement decisions (PR-A2 and PR-A3). Phase A keeps
+      the legacy track sections below authoritative for the loader; the mapping
+      drives downstream phases.
 
 tracks_enabled:
   track_profile: true
@@ -120,6 +119,12 @@ guardrails:
     - is_back_bet
     - position_idx
     - table_id
+    - game_id
+    - lda_l1_run_bet_count
+    - lda_trip_run_count
+    - lda_run_ord_in_trip
+    - lda_trip_is_closed
+    - lda_l1_run_duration_min
 
 track_llm:
   name: "Track LLM"
@@ -228,6 +233,41 @@ track_llm:
         clip: { min: 0.0, max: 500000000.0 }
       reason_code_category: "LOW_ACTIVITY_RECENTLY"
 
+    - feature_id: "wager_avg_w5m"
+      type: "window"
+      dtype: "float"
+      description: "過去 5 分鐘平均注碼"
+      rationale: "短窗平均注碼，供短中窗比值與注碼收縮偵測。"
+      expression: "AVG(wager)"
+      window_frame: "RANGE BETWEEN INTERVAL 5 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 500000000.0 }
+      reason_code_category: "LOW_ACTIVITY_RECENTLY"
+
+    - feature_id: "wager_w5m_over_w15m"
+      type: "derived"
+      dtype: "float"
+      description: "最近 5 分鐘 vs 15 分鐘平均注碼比（<1 代表注碼收縮）"
+      rationale: "捕捉注碼由中期基準向短期快速收縮的趨勢。"
+      depends_on: ["wager_avg_w5m", "wager_avg_w15m"]
+      expression: "CAST(wager_avg_w5m AS DOUBLE) / NULLIF(wager_avg_w15m, 0)"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 10.0 }
+      reason_code_category: "LOW_ACTIVITY_RECENTLY"
+
+    - feature_id: "wager_slope_w10bets"
+      type: "derived"
+      dtype: "float"
+      description: "最近 10 筆注碼趨勢斜率（負值代表減碼）"
+      rationale: "以近 10 筆 wager 變化率近似注碼方向性，補齊僅有水位/波動的限制。"
+      expression: "(CAST(wager AS DOUBLE) - CAST(LAG(wager, 10) OVER (PARTITION BY canonical_id ORDER BY payout_complete_dtm ASC, bet_id ASC) AS DOUBLE)) / 10.0"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: -500000000.0, max: 500000000.0 }
+      reason_code_category: "LOW_ACTIVITY_RECENTLY"
+
     - feature_id: "wager_std_w15m"
       type: "window"
       dtype: "float"
@@ -308,6 +348,30 @@ track_llm:
         fill: { strategy: "zero" }
         clip: { min: 0.0, max: 1.0 }
       reason_code_category: "WIN_RATE"
+
+    - feature_id: "push_cnt_w15m"
+      type: "window"
+      dtype: "int"
+      description: "過去 15 分鐘 PUSH（和局）次數"
+      rationale: "補齊 WIN/LOSE 之外的局態，捕捉卡住不前的心理狀態。"
+      expression: "SUM(CASE WHEN status = 'PUSH' THEN 1 ELSE 0 END)"
+      window_frame: "RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 10000 }
+      reason_code_category: "LOSS_STREAK"
+
+    - feature_id: "non_win_rate_w15m"
+      type: "derived"
+      dtype: "float"
+      description: "過去 15 分鐘非 WIN 率（LOSE+PUSH）"
+      rationale: "把 PUSH 顯式納入，補強僅看 lose/win 的盲點。"
+      depends_on: ["lose_cnt_w15m", "push_cnt_w15m", "bets_cnt_w15m"]
+      expression: "CAST((lose_cnt_w15m + push_cnt_w15m) AS DOUBLE) / NULLIF(bets_cnt_w15m, 0)"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+      reason_code_category: "LOSS_STREAK"
 
     - feature_id: "prev_status"
       type: "lag"
@@ -448,6 +512,41 @@ track_llm:
       type: "passthrough"
       dtype: "float"
       description: "桌位序號（raw）"
+    - feature_id: "lda_l1_run_bet_count"
+      type: "passthrough"
+      dtype: "float"
+      description: "L1 run_fact 內該 run 的 bet_count（parallel_lda_mvp Phase C join）"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 10000000.0 }
+    - feature_id: "lda_trip_run_count"
+      type: "passthrough"
+      dtype: "float"
+      description: "L1 trip_fact 的 run_count（經 trip_run_map）"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 10000000.0 }
+    - feature_id: "lda_run_ord_in_trip"
+      type: "passthrough"
+      dtype: "float"
+      description: "該 run 在 trip 內的序（trip_run_map.run_ord_in_trip）"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 10000000.0 }
+    - feature_id: "lda_trip_is_closed"
+      type: "passthrough"
+      dtype: "float"
+      description: "trip 是否已關閉（is_trip_closed → 0/1）"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+    - feature_id: "lda_l1_run_duration_min"
+      type: "passthrough"
+      dtype: "float"
+      description: "L1 run 持續時間（分鐘，run_end_ts − run_start_ts）"
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 100080.0 }
     - feature_id: "cum_bets"
       type: "window"
       dtype: "int"
@@ -502,9 +601,21 @@ track_human:
       type: "python_vectorized"
       dtype: "int"
       description: "連輸計數（WIN 重置；PUSH 是否重置由 config 決定）"
-      function_name: "compute_loss_streak"
+      function_name: "compute_loss_streak_features"
       input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "status"]
       output_columns: ["loss_streak"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 999 }
+      reason_code_category: "LOSS_STREAK"
+
+    - feature_id: "consecutive_non_win_cnt"
+      type: "python_vectorized"
+      dtype: "int"
+      description: "從最近一次 WIN 到現在，連續非 WIN（LOSE+PUSH）筆數"
+      function_name: "compute_consecutive_non_win_features"
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "status"]
+      output_columns: ["consecutive_non_win_cnt"]
       postprocess:
         fill: { strategy: "zero" }
         clip: { min: 0, max: 999 }
@@ -515,8 +626,8 @@ track_human:
       dtype: "float"
       description: "距離 run 起點的分鐘數（run 以 gap>=RUN_BREAK_MIN 切分）"
       function_name: "compute_run_boundary_features"
-      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id"]
-      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far"]
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "wager", "casino_win"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
       postprocess:
         fill: { strategy: "zero" }
         clip: { min: 0.0, max: 1000000.0 }
@@ -526,8 +637,8 @@ track_human:
       dtype: "int"
       description: "當筆為止同一 run 內下注筆數（1-based）"
       function_name: "compute_run_boundary_features"
-      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id"]
-      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far"]
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "wager", "casino_win"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
       postprocess:
         fill: { strategy: "zero" }
         clip: { min: 0, max: 10000000 }
@@ -537,11 +648,183 @@ track_human:
       dtype: "float"
       description: "當筆為止同一 run 內下注金額累計"
       function_name: "compute_run_boundary_features"
-      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id"]
-      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far"]
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "wager", "casino_win"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
       postprocess:
         fill: { strategy: "zero" }
         clip: { min: 0.0, max: 1000000000000.0 }
+
+    - feature_id: "net_win_in_run_so_far"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "當筆為止同一 run 內玩家淨損益累計（player_net_win=-casino_win）"
+      function_name: "compute_run_boundary_features"
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "wager", "casino_win"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: -1000000000000.0, max: 1000000000000.0 }
+      reason_code_category: "LOSS_STREAK"
+
+    - feature_id: "net_win_per_bet_in_run"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "當前 run 每注平均淨損益（run 內累計淨損益/下注筆數）"
+      function_name: "compute_run_boundary_features"
+      input_columns: ["canonical_id", "payout_complete_dtm", "bet_id", "wager", "casino_win"]
+      output_columns: ["run_id", "minutes_since_run_start", "bets_in_run_so_far", "wager_sum_in_run_so_far", "net_win_in_run_so_far", "net_win_per_bet_in_run"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: -1000000000.0, max: 1000000000.0 }
+      reason_code_category: "LOSS_STREAK"
+
+    - feature_id: "table_hc"
+      type: "python_vectorized"
+      dtype: "int"
+      description: "同一 table_id 滾動視窗內不重複玩家數（head count；S1）"
+      function_name: "compute_table_hc_features"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "player_id"]
+      output_columns: ["table_hc"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0, max: 10000 }
+      screening_eligible: true
+      reason_code_category: "ENGAGEMENT"
+
+    # B2: ``t_game`` / table context (materialized in trainer/scorer when T_GAME_FEATURES_ENABLED=1).
+    - feature_id: "current_outcome_streak_len"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "同桌已結算局數中，上一局結果之連續長度（不含 VOID/UNRESOLVED；PIT 嚴格早於下注結算時間）"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["current_outcome_streak_len"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1000000.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "banker_rate_w20games"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "同桌最近 20 局已結算結果中 BANKER 比例（嚴格回看）"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["banker_rate_w20games"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "player_rate_w20games"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "同桌最近 20 局 PLAYER 比例"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["player_rate_w20games"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "tie_rate_w20games"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "同桌最近 20 局 TIE 比例"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["tie_rate_w20games"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "table_num_players"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "上一局已結算遊戲之 num_players（桌況壅擠度 proxy）"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["table_num_players"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 500.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "patron_is_sole_player"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "上一局 num_players 是否為 1（1/0）"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["patron_is_sole_player"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 1.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "table_turnover_w5m_over_w15m"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "同桌 total_turnover 於 (t-15m,t-5m] 與 (t-5m,t] 滾動和之比（winsorized）"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["table_turnover_w5m_over_w15m"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: 0.0, max: 10.0 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "table_net_outcome_w15m"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "同桌已結算 casino_win 於過去 15 分鐘滾動和（clip 極值）"
+      function_name: "join_t_game_features_for_bets"
+      input_columns: ["table_id", "bet_id", "payout_complete_dtm", "game_id"]
+      output_columns: ["table_net_outcome_w15m"]
+      postprocess:
+        fill: { strategy: "zero" }
+        clip: { min: -1e9, max: 1e9 }
+      screening_eligible: true
+      reason_code_category: "TABLE_CONTEXT"
+
+    - feature_id: "run_duration_vs_personal_avg"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "當前 run 時長相對個人 30 天平均 session 時長"
+      function_name: "compute_wave2_personalized_features"
+      input_columns: ["minutes_since_run_start", "avg_session_duration_min_30d", "bets_in_run_so_far", "num_bets_sum_30d", "sessions_30d", "bets_cnt_w15m"]
+      output_columns: ["run_duration_vs_personal_avg", "bets_in_run_vs_personal_avg", "pace_vs_personal_baseline"]
+      screening_eligible: true
+      reason_code_category: "BETTING_PACE_DROPPING"
+
+    - feature_id: "bets_in_run_vs_personal_avg"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "當前 run 下注筆數相對個人 30 天平均每次 session 筆數"
+      function_name: "compute_wave2_personalized_features"
+      input_columns: ["minutes_since_run_start", "avg_session_duration_min_30d", "bets_in_run_so_far", "num_bets_sum_30d", "sessions_30d", "bets_cnt_w15m"]
+      output_columns: ["run_duration_vs_personal_avg", "bets_in_run_vs_personal_avg", "pace_vs_personal_baseline"]
+      screening_eligible: true
+      reason_code_category: "BETTING_PACE_DROPPING"
+
+    - feature_id: "pace_vs_personal_baseline"
+      type: "python_vectorized"
+      dtype: "float"
+      description: "當前 15 分鐘下注頻率相對個人 30 天基準頻率"
+      function_name: "compute_wave2_personalized_features"
+      input_columns: ["minutes_since_run_start", "avg_session_duration_min_30d", "bets_in_run_so_far", "num_bets_sum_30d", "sessions_30d", "bets_cnt_w15m"]
+      output_columns: ["run_duration_vs_personal_avg", "bets_in_run_vs_personal_avg", "pace_vs_personal_baseline"]
+      screening_eligible: true
+      reason_code_category: "BETTING_PACE_DROPPING"
 
   active:
     feature_ids: []

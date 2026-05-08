@@ -41,3 +41,10 @@ PREDICTION_LOG_BET_SIZE_EDGES_HKD: Tuple[float, ...] = (
     10000.0,
 )
 
+# RunTrip / spec unification: when MODEL_DIR has no frozen feature_spec.yaml,
+# ``warn`` loads repo SSOT with a warning (dev-friendly); ``strict`` fails closed.
+_MIGRATION_STRICT_RAW = os.getenv("MIGRATION_STRICT_MODE", "warn").strip().lower()
+MIGRATION_STRICT_MODE: str = (
+    _MIGRATION_STRICT_RAW if _MIGRATION_STRICT_RAW in ("warn", "strict") else "warn"
+)
+

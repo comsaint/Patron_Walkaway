@@ -25,25 +25,25 @@ def _scorer_mod():
     return importlib.import_module("trainer.scorer")
 
 
-# ── Risk #1: features.py FileNotFoundError 警告應使用 features_candidates.yaml / repo spec 用語 ──
+# ── Risk #1: features.py FileNotFoundError 警告應使用 feature_spec.yaml / repo spec 用語 ──
 
 
 class TestR395FeaturesWarningMessage(unittest.TestCase):
-    """R395 Review #1: features.py 的 FileNotFoundError 警告應含 features_candidates.yaml 或 repo spec."""
+    """R395 Review #1: features.py 的 FileNotFoundError 警告應含 feature_spec.yaml 或 trainer/feature_spec 路徑。"""
 
     def test_features_yaml_missing_warning_uses_new_naming(self):
-        """當 YAML 不存在時，warning 訊息應使用 features_candidates.yaml 或 repo spec，不再用 template YAML."""
+        """當 YAML 不存在時，warning 訊息應指向 trainer/feature_spec/feature_spec.yaml，不再用 template YAML。"""
         src = _FEATURES_PY.read_text(encoding="utf-8")
         # 定位 except FileNotFoundError 區塊中的 logger.warning 字串
         idx_except = src.find("except FileNotFoundError:")
         self.assertNotEqual(idx_except, -1, "features.py should have except FileNotFoundError block")
         block = src[idx_except : idx_except + 800]
         # 該區塊內應包含新用語之一（修補後會通過）
-        has_new = "features_candidates.yaml" in block or "repo spec" in block
+        has_new = "feature_spec.yaml" in block or "trainer/feature_spec" in block
         self.assertTrue(
             has_new,
             "In except FileNotFoundError block, warning message should contain "
-            "'features_candidates.yaml' or 'repo spec' (R395 Review #1).",
+            "'feature_spec.yaml' or 'trainer/feature_spec' (R395 Review #1).",
         )
         # 修補後不應再僅依賴「template YAML」作為唯一說明
         self.assertNotIn(
@@ -68,7 +68,7 @@ class TestR395ScorerNoSpecReturnsNone(unittest.TestCase):
             minimal_bundle = {"model": None, "threshold": 0.5, "features": []}
             joblib.dump(minimal_bundle, tmp_path / "model.pkl")
             # 不建立 feature_spec.yaml；fallback 路徑改為不存在
-            fake_path = pathlib.Path("/nonexistent/features_candidates.yaml")
+            fake_path = pathlib.Path("/nonexistent/feature_spec.yaml")
             with patch.object(scorer, "FEATURE_SPEC_PATH", fake_path):
                 artifacts = scorer.load_dual_artifacts(tmp_path)
             self.assertIsNone(
@@ -85,7 +85,7 @@ class TestR395ScorerFallbackComment(unittest.TestCase):
     """R395 Review #3: scorer 的 fallback 註解應與檔名重構一致，不含「global template」."""
 
     def test_scorer_fallback_comment_does_not_say_global_template(self):
-        """Fall back 註解應改為 repo feature spec / features_candidates.yaml，不含 global template."""
+        """Fall back 註解應改為 repo feature spec / feature_spec.yaml，不含 global template。"""
         src = _SCORER_PY.read_text(encoding="utf-8")
         idx = src.find("Fall back to the")
         self.assertNotEqual(idx, -1, "scorer.py should have fallback comment")
@@ -94,7 +94,7 @@ class TestR395ScorerFallbackComment(unittest.TestCase):
             "global template",
             comment_block,
             "Fallback comment should not say 'global template' (R395 Review #3); "
-            "use 'repo feature spec' or 'features_candidates.yaml'.",
+            "use 'repo feature spec' or 'feature_spec.yaml'.",
         )
 
 
@@ -106,7 +106,7 @@ class TestR395ScriptsOneTimeSpecPath(unittest.TestCase):
 
     def test_script_resolved_spec_path_does_not_exist(self):
         """以 doc/one_time_scripts 為基準解析的 feature_spec 路徑不存在（pre-existing 問題）."""
-        script_spec = _REPO_ROOT / "doc" / "one_time_scripts" / "feature_spec" / "features_candidates.yaml"
+        script_spec = _REPO_ROOT / "doc" / "one_time_scripts" / "feature_spec" / "feature_spec.yaml"
         self.assertFalse(
             script_spec.exists(),
             "Path as resolved from doc/one_time_scripts (__file__.parent) does not exist; "
@@ -114,9 +114,9 @@ class TestR395ScriptsOneTimeSpecPath(unittest.TestCase):
         )
 
     def test_trainer_spec_path_exists(self):
-        """Repo 內唯一 spec 位於 trainer/feature_spec/features_candidates.yaml."""
-        trainer_spec = _REPO_ROOT / "trainer" / "feature_spec" / "features_candidates.yaml"
+        """Repo 內唯一 spec 位於 trainer/feature_spec/feature_spec.yaml."""
+        trainer_spec = _REPO_ROOT / "trainer" / "feature_spec" / "feature_spec.yaml"
         self.assertTrue(
             trainer_spec.exists(),
-            "Canonical feature spec must exist at trainer/feature_spec/features_candidates.yaml.",
+            "Canonical feature spec must exist at trainer/feature_spec/feature_spec.yaml.",
         )

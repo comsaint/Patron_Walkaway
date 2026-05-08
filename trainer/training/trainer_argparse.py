@@ -50,10 +50,8 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help=(
-            "Debug/test mode: use only the last N monthly chunks from the training "
-            "window. Limits data loaded from both ClickHouse and local Parquet. "
-            "Recommended N>=3 to keep train/valid/test all non-empty. "
-            "E.g. --recent-chunks 3 uses roughly the last 3 months of data."
+            "Legacy only (--legacy-chunk-mode): use only the last N monthly chunks. "
+            "Ignored in the default single-window run/trip pipeline."
         ),
     )
     parser.add_argument(
@@ -194,18 +192,17 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         action="store_true",
         dest="l2_auto_from_local",
         help=(
-            "GitHub #17: with --use-local-parquet, auto-build/cache l2_training_bundle.json and "
-            "train via the L2 path (Step 3 cache hit skips Steps 4–10; else Step 7 materializes "
-            "then L2 Steps 8–10). Omit this flag to keep the legacy chunk Steps 4–10 unless "
-            "--l2-training-bundle is set. Large tables: peak RAM similar to in-memory L2 training."
+            "Optional no-op: --use-local-parquet already defaults to the L2 run/trip path "
+            "(auto bundle + Steps 8–10). Use --no-l2-auto-bundle to force legacy Steps 8–10 "
+            "after Step 7, or --legacy-chunk-mode for monthly chunks."
         ),
     )
     parser.add_argument(
         "--legacy-chunk-mode",
         action="store_true",
         help=(
-            "GitHub #17: keep legacy chunk pipeline Steps 1–10 (process_chunk + row split). "
-            "Overrides --l2-auto-from-local for local parquet runs."
+            "Use monthly chunk partitioning (legacy). Default is a single-window run/trip "
+            "pipeline with row-level split in Step 7."
         ),
     )
     parser.add_argument(

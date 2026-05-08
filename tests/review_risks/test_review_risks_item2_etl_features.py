@@ -2,7 +2,7 @@
 
 對應 STATUS.md « Code Review：步驟 4（項目 2）2.2 etl / features 子包搬移 » §1、§2、§3、§4。
 §1：python -m trainer.etl_player_profile --help 應有 usage/help 輸出且 exit 0（契約：薄層 __main__ 轉發）。
-§2：候選 spec 僅 **`trainer/feature_spec/features_candidates.yaml`**（SSOT）；**不得**再存在 `trainer/features/feature_spec/features_candidates.yaml`（已移除冗餘拷貝）。
+§2：候選 spec 僅 **`trainer/feature_spec/feature_spec.yaml`**（SSOT）；**不得**再存在 `trainer/features/feature_spec/feature_spec.yaml`（已移除冗餘拷貝）。
 §3：import trainer.etl_player_profile 後 sys.modules["trainer.etl_player_profile"] 為實作模組。
 §4：trainer.features 顯式 re-export 之底線名稱存在（_validate_feature_spec、_streak_lookback_numba、_run_boundary_lookback_numba 等）。
 
@@ -64,20 +64,20 @@ class TestEtlPlayerProfileCliHelpContract(unittest.TestCase):
 class TestFeatureSpecSingleSourceContract(unittest.TestCase):
     """Review §2 (2026-04-18): Canonical candidates YAML only under trainer/feature_spec/."""
 
-    def test_canonical_features_candidates_yaml_exists(self):
-        """trainer/feature_spec/features_candidates.yaml must exist (SSOT)."""
-        p1 = REPO_ROOT / "trainer" / "feature_spec" / "features_candidates.yaml"
+    def test_canonical_feature_spec_yaml_exists(self):
+        """trainer/feature_spec/feature_spec.yaml must exist (SSOT)."""
+        p1 = REPO_ROOT / "trainer" / "feature_spec" / "feature_spec.yaml"
         self.assertTrue(
             p1.is_file(),
-            "Canonical spec must exist at trainer/feature_spec/features_candidates.yaml (STATUS Code Review 2.2 etl/features §2).",
+            "Canonical spec must exist at trainer/feature_spec/feature_spec.yaml (STATUS Code Review 2.2 etl/features §2).",
         )
 
     def test_redundant_features_subpackage_yaml_absent(self):
-        """Duplicate trainer/features/feature_spec/features_candidates.yaml must not exist."""
-        p2 = REPO_ROOT / "trainer" / "features" / "feature_spec" / "features_candidates.yaml"
+        """Duplicate trainer/features/feature_spec/feature_spec.yaml must not exist."""
+        p2 = REPO_ROOT / "trainer" / "features" / "feature_spec" / "feature_spec.yaml"
         self.assertFalse(
             p2.exists(),
-            "Redundant trainer/features/feature_spec/features_candidates.yaml must not exist; edit trainer/feature_spec/features_candidates.yaml only (STATUS Code Review 2.2 etl/features §2).",
+            "Redundant trainer/features/feature_spec/feature_spec.yaml must not exist; edit trainer/feature_spec/feature_spec.yaml only (STATUS Code Review 2.2 etl/features §2).",
         )
 
 

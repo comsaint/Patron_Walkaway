@@ -20,9 +20,9 @@ Boundary contract
 
 GitHub #16 (L2 主路徑)
 ----------------------
-``get_monthly_chunks`` / ``get_train_valid_test_split`` 仍為現行 chunk 管線之
-邊界來源；遷移後改由 L2 manifest 視窗與列級切分契約取代（見
-``l2_trainer_contracts``、execution plan **TRN-16-03**）。
+預設訓練邊界使用 ``get_single_window_chunk``（單一 run/trip 視窗，無月切）。
+``get_monthly_chunks`` 僅在 ``--legacy-chunk-mode`` 啟用時作為除錯／相容路徑。
+列級 train/valid/test 仍由 Step 7 完成；L2 manifest 契約見 ``l2_trainer_contracts``。
 """
 
 from __future__ import annotations
@@ -143,6 +143,41 @@ def get_monthly_chunks(start: datetime, end: datetime) -> List[Dict]:
         current_month = next_ms
 
     return chunks
+
+
+def get_single_window_chunk(start: datetime, end: datetime) -> List[Dict]:
+    """Return a single chunk covering ``[start, end)`` (no month partitioning).
+
+    Uses the same ``extended_end`` rule as :func:`get_monthly_chunks` for C1
+    label lookahead. When ``start >= end``, returns an empty list.
+
+    Parameters
+    ----------
+    start, end
+        Same contract as :func:`get_monthly_chunks`.
+
+    Returns
+    -------
+    list
+        Either one dict ``{window_start, window_end, extended_end}`` or ``[]``.
+    """
+    if (start.tzinfo is None) != (end.tzinfo is None):
+        raise ValueError(
+            "start and end must both be tz-aware or both be tz-naive; "
+            f"got start.tzinfo={start.tzinfo!r}, end.tzinfo={end.tzinfo!r}"
+        )
+    if start >= end:
+        return []
+    label_lookahead = timedelta(minutes=LABEL_LOOKAHEAD_MIN)
+    one_day = timedelta(days=1)
+    extended_end = end + max(label_lookahead, one_day)
+    return [
+        {
+            "window_start": start,
+            "window_end": end,
+            "extended_end": extended_end,
+        }
+    ]
 
 
 def get_train_valid_test_split(

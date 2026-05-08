@@ -92,13 +92,13 @@ def _spearman(x: list[float], y: list[float]) -> tuple[float, float]:
 
 
 def _emit_chunk_dependent_doc(path: Path) -> None:
-    """Parse ``features_candidates.yaml`` and write a static risk note + auto table."""
+    """Parse ``feature_spec.yaml`` and write a static risk note + auto table."""
     try:
         import yaml  # type: ignore[import-untyped]
     except ImportError as e:
         raise SystemExit(f"PyYAML required for --emit-risk-doc: {e}") from e
 
-    spec_path = _repo_root() / "trainer" / "feature_spec" / "features_candidates.yaml"
+    spec_path = _repo_root() / "trainer" / "feature_spec" / "feature_spec.yaml"
     spec: dict[str, Any] = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
     llm = (spec.get("track_llm") or {}).get("candidates") or []
 
@@ -139,7 +139,7 @@ def _emit_chunk_dependent_doc(path: Path) -> None:
     lines.append("# Track LLM：chunk / slice 敏感特徵（高風險清單）\n")
     lines.append(
         "本文件由 `scripts/check_cum_bets_chunk_position_corr.py --emit-risk-doc` 產生；"
-        "依 `trainer/feature_spec/features_candidates.yaml` 靜態掃描。\n"
+            "依 `trainer/feature_spec/feature_spec.yaml` 靜態掃描。\n"
     )
     lines.append("## 分級說明\n")
     lines.append(
