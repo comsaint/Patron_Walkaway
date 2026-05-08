@@ -8,9 +8,9 @@ inside those helpers.
 
 Covered scenarios
 -----------------
-1. RecentChunksPropagation — recent_chunks=N:
-   - ensure called with the trimmed effective window, not the original window
-   - process_chunk called only for the recent chunks
+1. SingleWindowPropagation — ``get_single_window_chunk`` 回傳的視窗列表：
+   - ensure 使用 effective_start / effective_end（由 chunks 導出）
+   - ``NEG_SAMPLE_FRAC_AUTO=False`` 時每個 chunk 呼叫一次 ``process_chunk``
 
 2. NoPreloadWiring — no_preload=True:
    - preload_sessions=False forwarded to ensure_player_profile_ready
@@ -24,6 +24,7 @@ import argparse
 import os
 import tempfile
 from datetime import datetime, timedelta
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -80,7 +81,6 @@ class _PipelineMixin:
     _canonical_map_df: pd.DataFrame | None = None
     _sample_rated: int | None = None
     _no_preload: bool = False
-    _recent_chunks: int | None = None
     _extra_args: dict | None = None
 
     def _run_pipeline_with_mocks(self) -> dict:
@@ -113,7 +113,13 @@ class _PipelineMixin:
             ),
             "step7_duckdb": patch("trainer.trainer.STEP7_USE_DUCKDB", False),
             "step7_keep_disk": patch("trainer.trainer.STEP7_KEEP_TRAIN_ON_DISK", False),
-            "get_monthly_chunks": patch("trainer.trainer.get_monthly_chunks", return_value=chunks),
+            "get_single_window_chunk": patch(
+                "trainer.trainer.get_single_window_chunk", return_value=chunks
+            ),
+            "local_parquet_session_path": patch(
+                "trainer.trainer.local_parquet_session_path_for_trainer",
+                return_value=Path(tmp_parquet),
+            ),
             "load_local_parquet": patch("trainer.trainer.load_local_parquet", return_value=(pd.DataFrame(), pd.DataFrame())),
             "apply_dq": patch("trainer.trainer.apply_dq", return_value=(pd.DataFrame(), pd.DataFrame())),
             "canonical_parquet": patch("trainer.trainer.CANONICAL_MAPPING_PARQUET", new=_mock_canonical_parquet),
@@ -137,7 +143,8 @@ class _PipelineMixin:
             patches["cross_entry_preflight"],
             patches["step7_duckdb"],
             patches["step7_keep_disk"],
-            patches["get_monthly_chunks"],
+            patches["get_single_window_chunk"],
+            patches["local_parquet_session_path"],
             patches["load_local_parquet"],
             patches["apply_dq"],
             patches["canonical_parquet"],
@@ -163,9 +170,11 @@ class _PipelineMixin:
                 "use_local_parquet": True,
                 "force_recompute": False,
                 "skip_optuna": True,
-                "recent_chunks": self._recent_chunks,
                 "no_preload": self._no_preload,
                 "sample_rated": self._sample_rated,
+                # Keep mocked runs on the classic Steps 4–10 path (skip L2 auto-materialize).
+                "no_l2_auto_bundle": True,
+                "l2_training_bundle": None,
             }
             if self._extra_args:
                 ns.update(self._extra_args)
@@ -182,42 +191,33 @@ class _PipelineMixin:
 
 
 # ---------------------------------------------------------------------------
-# Test 1: recent_chunks uses trimmed effective window
+# Test 1: single-window chunk list drives effective profile window
 # ---------------------------------------------------------------------------
 
-class TestRecentChunksPropagation(_PipelineMixin, unittest.TestCase):
+class TestSingleWindowPropagation(_PipelineMixin, unittest.TestCase):
 
     def setUp(self):
-        # 3 chunks — ask for most recent 1 only
-        self._fake_chunks = _make_chunks(3)
-        self._recent_chunks = 1
+        # Mock 回傳單一視窗（對齊 get_single_window_chunk 主路徑）
+        self._fake_chunks = _make_chunks(1)
 
-    def test_effective_window_uses_trimmed_chunk(self):
-        """ensure_player_profile_ready should receive the trimmed window (1 chunk).
-
-        DEC-018 strips tz from effective_start/effective_end before passing them
-        to downstream helpers.  Compare as tz-naive to stay robust to that normalization
-        while still verifying the correct chunk window is used.
-        """
+    def test_effective_window_matches_mocked_chunk(self):
+        """ensure_player_profile_ready 應收到 chunks[0] 導出的 effective 視窗。"""
         result = self._run_pipeline_with_mocks()
         chunks = result["chunks"]
         ensure_args = result["ensure_args"]
-        # positional args: window_start, window_end
         eff_start, eff_end = ensure_args[0], ensure_args[1]
-        # DEC-018: effective_start/end are tz-normalised to naive inside run_pipeline;
-        # strip tz from the reference chunk datetimes to compare values only.
-        exp_start = chunks[-1]["window_start"].replace(tzinfo=None)
-        exp_end   = chunks[-1]["window_end"].replace(tzinfo=None)
-        self.assertEqual(eff_start, exp_start,
-                         "effective_start should match last chunk start (recent_chunks=1)")
-        self.assertEqual(eff_end, exp_end,
-                         "effective_end should match last chunk end")
+        exp_start = chunks[0]["window_start"].replace(tzinfo=None)
+        exp_end = chunks[0]["window_end"].replace(tzinfo=None)
+        self.assertEqual(eff_start, exp_start)
+        self.assertEqual(eff_end, exp_end)
 
     def test_process_chunk_called_once_for_one_chunk(self):
         result = self._run_pipeline_with_mocks()
-        # NEG_SAMPLE_FRAC_AUTO defaults False (OOM policy GitHub #10): no chunk-1 OOM probe.
-        self.assertEqual(result["mock_proc_call_count"], 1,
-                         "With recent_chunks=1 and NEG_SAMPLE_FRAC_AUTO=False, expect one process_chunk per chunk.")
+        self.assertEqual(
+            result["mock_proc_call_count"],
+            1,
+            "NEG_SAMPLE_FRAC_AUTO=False: one process_chunk per returned window",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +229,6 @@ class TestNoPreloadWiring(_PipelineMixin, unittest.TestCase):
     def setUp(self):
         self._fake_chunks = _make_chunks(2)
         self._no_preload = True
-        self._recent_chunks = None
 
     def test_preload_sessions_is_false(self):
         result = self._run_pipeline_with_mocks()
@@ -258,7 +257,6 @@ class TestSampleRatedWhitelist(_PipelineMixin, unittest.TestCase):
         # canonical_map has 10 IDs; sample 3
         self._canonical_map_df = _canonical_map(10)
         self._sample_rated = 3
-        self._recent_chunks = None
 
     def test_whitelist_size_is_n(self):
         result = self._run_pipeline_with_mocks()

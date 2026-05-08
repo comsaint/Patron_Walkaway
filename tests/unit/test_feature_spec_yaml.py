@@ -7,7 +7,7 @@ Covers:
 - derived 的 depends_on 無循環依賴
 - load_feature_spec 對非法 YAML 拋出 ValueError
 
-All tests use the shipped trainer/feature_spec/feature_spec.yaml as the canonical
+All tests use the shipped trainer/feature_spec/feature_candidates.yaml as the canonical
 reference so that any future edits to the spec are automatically validated.
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ def _import_features():
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-SPEC_YAML = REPO_ROOT / "trainer" / "feature_spec" / "feature_spec.yaml"
+SPEC_YAML = REPO_ROOT / "trainer" / "feature_spec" / "feature_candidates.yaml"
 
 features_mod = _import_features()
 

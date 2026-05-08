@@ -193,10 +193,35 @@ def load_trainer_local_parquet_bridge_manifest() -> Dict[str, Any]:
     return dict(json.loads(p.read_text(encoding="utf-8")))
 
 
+def _resolve_manifest_path_str(raw: str, *, manifest_path: Path) -> Path:
+    """Resolve a manifest path entry to an absolute Path (portable: prefers repo-relative)."""
+    p = Path(str(raw)).expanduser()
+    if not p.is_absolute():
+        cand = (manifest_path.parent / p).resolve()
+        if cand.is_file():
+            return cand
+        pr = (PROJECT_ROOT / p).resolve()
+        if pr.is_file():
+            return pr
+        return cand
+    pr_abs = p.resolve()
+    try:
+        rel = pr_abs.relative_to(PROJECT_ROOT.resolve())
+        return (PROJECT_ROOT / rel).resolve()
+    except ValueError:
+        logger.warning(
+            "Manifest path %r is absolute and outside PROJECT_ROOT — using as-is (portability risk).",
+            raw,
+        )
+        return pr_abs
+
+
 def resolve_local_parquet_bet_session_paths_from_manifest(
     manifest: Dict[str, Any],
+    manifest_path: Optional[Path] = None,
 ) -> Tuple[Path, Path]:
     """Resolve bet and session Parquet paths from a bridge manifest dict."""
+    mp = manifest_path if manifest_path is not None else trainer_local_parquet_bridge_manifest_path()
     raw_bet: Optional[str] = None
     t_bet_paths = manifest.get("t_bet_paths")
     if isinstance(t_bet_paths, list) and t_bet_paths:
@@ -214,7 +239,10 @@ def resolve_local_parquet_bet_session_paths_from_manifest(
             "manifest must contain 'gmwds_t_session' or 't_session_source' "
             f"(got keys={sorted(manifest.keys())!r})"
         )
-    return Path(raw_bet).resolve(), Path(str(sess_raw)).resolve()
+    return (
+        _resolve_manifest_path_str(raw_bet, manifest_path=mp),
+        _resolve_manifest_path_str(str(sess_raw), manifest_path=mp),
+    )
 
 
 def manifest_bet_includes_run_trip_lda_columns(manifest: Dict[str, Any]) -> bool:
@@ -230,8 +258,9 @@ def manifest_bet_includes_run_trip_lda_columns(manifest: Dict[str, Any]) -> bool
 
 def local_parquet_session_path_for_trainer() -> Path:
     """Return session Parquet path from the bridge manifest (single source of truth)."""
+    mp = trainer_local_parquet_bridge_manifest_path()
     m = load_trainer_local_parquet_bridge_manifest()
-    _, sess = resolve_local_parquet_bet_session_paths_from_manifest(m)
+    _, sess = resolve_local_parquet_bet_session_paths_from_manifest(m, manifest_path=mp)
     return sess
 
 
@@ -281,7 +310,7 @@ def probe_trainer_local_parquet_bridge_readiness() -> BridgeLocalParquetReadines
             manifest_path=p,
         )
     try:
-        bet_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(manifest)
+        bet_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(manifest, manifest_path=p)
     except KeyError as exc:
         return BridgeLocalParquetReadiness(
             ready=False,
@@ -400,12 +429,15 @@ def load_local_parquet(
         "FND-04 contract violated: _CANONICAL_MAP_SESSION_COLS must include 'turnover'"
     )
 
+    _mf = trainer_local_parquet_bridge_manifest_path()
     manifest = load_trainer_local_parquet_bridge_manifest()
-    bets_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(manifest)
+    bets_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(
+        manifest, manifest_path=_mf
+    )
 
     logger.info(
         "Workstream A ingress: manifest=%s artifact_kind=%s bet_includes_run_trip_lda=%s bet=%s session=%s%s",
-        trainer_local_parquet_bridge_manifest_path(),
+        _mf,
         manifest.get("artifact_kind"),
         manifest_bet_includes_run_trip_lda_columns(manifest),
         bets_path,
@@ -575,8 +607,11 @@ def _detect_local_data_end() -> Optional[date]:
     date. Returns None if metadata is unavailable for both.
     """
     try:
+        _mp = trainer_local_parquet_bridge_manifest_path()
         _m = load_trainer_local_parquet_bridge_manifest()
-        bet_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(_m)
+        bet_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(
+            _m, manifest_path=_mp
+        )
     except (FileNotFoundError, OSError, KeyError, json.JSONDecodeError) as exc:
         logger.warning("Workstream A: could not resolve manifest for _detect_local_data_end: %s", exc)
         return None
@@ -651,8 +686,11 @@ def _local_parquet_source_data_hash(
     **Trade-off**: extreme in-place edits keeping identical Parquet metadata could
     theoretically false-hit; prefer false miss for content changes that alter metadata.
     """
+    _mf = trainer_local_parquet_bridge_manifest_path()
     manifest = load_trainer_local_parquet_bridge_manifest()
-    bets_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(manifest)
+    bets_path, sess_path = resolve_local_parquet_bet_session_paths_from_manifest(
+        manifest, manifest_path=_mf
+    )
     bets_lo = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
     sess_lo = window_start - timedelta(days=1)
     sess_hi = extended_end + timedelta(days=1)

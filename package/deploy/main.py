@@ -57,7 +57,8 @@ _model_dir = Path(os.environ["MODEL_DIR"])
 _feature_spec_path = _model_dir / "feature_spec.yaml"
 if not _feature_spec_path.exists():
     sys.exit(
-        f"[deploy] feature_spec.yaml not found at {_feature_spec_path}. Ensure the deploy package includes models/feature_spec.yaml."
+        f"[deploy] feature_spec.yaml not found at {_feature_spec_path}. "
+        "Bundle must include the frozen feature_spec.yaml next to model.pkl (trainer output)."
     )
 
 # DATA_DIR: profile + canonical mapping (scorer reads/writes here in deploy)

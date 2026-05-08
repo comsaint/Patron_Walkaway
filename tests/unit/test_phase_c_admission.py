@@ -11,8 +11,7 @@ import pytest
 import yaml
 
 _REPO = Path(__file__).resolve().parents[2]
-_CANDIDATES = _REPO / "trainer" / "feature_spec" / "feature_spec.yaml"
-_DEPLOY = _REPO / "package" / "deploy" / "models" / "feature_spec.yaml"
+_CANDIDATES = _REPO / "trainer" / "feature_spec" / "feature_candidates.yaml"
 
 
 @pytest.fixture(autouse=True)
@@ -37,7 +36,7 @@ def test_admission_constants_match_specs() -> None:
     """Gate-C2: helper reason codes are a superset of both specs' admission_rule."""
     from trainer.features import layered as L
 
-    for p in (_CANDIDATES, _DEPLOY):
+    for p in (_CANDIDATES,):
         spec = yaml.safe_load(p.read_text(encoding="utf-8"))
         rule = L.get_admission_rule_from_spec(spec)
         assert rule.get("on_pit_unavailable") == "prediction_skip", p

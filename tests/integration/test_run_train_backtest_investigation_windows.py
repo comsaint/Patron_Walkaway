@@ -24,7 +24,6 @@ class TestInvestigationE2eScript(unittest.TestCase):
             use_local_parquet=False,
             skip_train_optuna=False,
             skip_backtest_optuna=False,
-            recent_chunks=None,
             sample_rated=None,
             no_preload=False,
             model_version=None,
@@ -42,15 +41,13 @@ class TestInvestigationE2eScript(unittest.TestCase):
             train_end="2025-12-31",
             use_local_parquet=True,
             skip_optuna=True,
-            recent_chunks=3,
             sample_rated=100,
             no_preload=True,
         )
         self.assertEqual(cmd[0:5], [e2e_mod.sys.executable, "-m", "trainer.trainer", "--start", "2024-01-01"])
         self.assertIn("--use-local-parquet", cmd)
         self.assertIn("--skip-optuna", cmd)
-        self.assertIn("--recent-chunks", cmd)
-        self.assertIn("3", cmd)
+        self.assertNotIn("--recent-chunks", cmd)
         self.assertIn("--sample-rated", cmd)
         self.assertIn("100", cmd)
         self.assertIn("--no-preload", cmd)

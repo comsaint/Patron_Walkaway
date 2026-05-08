@@ -285,24 +285,24 @@ class TestReviewRiskGuards(unittest.TestCase):
             "apply_dq must keep sessions where turnover>0 OR num_games_with_wager>0 (FND-04)",
         )
 
-    def test_recent_chunks_effective_window_is_used_for_profile_flows(self):
-        """--recent-chunks must drive profile freshness-check and profile table load window."""
+    def test_effective_window_is_used_for_profile_flows(self):
+        """Profile freshness-check 與 profile 載入須使用 effective_start / effective_end。"""
         src = _get_func_src("run_pipeline")
         self.assertIn("effective_start", src)
         self.assertIn("effective_end", src)
         self.assertRegex(
             src,
             r"ensure_player_profile_ready\(\s*effective_start,\s*effective_end",
-            "Profile freshness check must use effective window after chunk trim",
+            "Profile freshness check must use effective window derived from Step 1 chunks",
         )
         self.assertRegex(
             src,
             r"load_player_profile\(\s*effective_start,\s*effective_end",
-            "Profile table load must use effective window after chunk trim",
+            "Profile table load must use effective window derived from Step 1 chunks",
         )
 
-    def test_recent_chunks_effective_window_is_used_for_local_identity_sessions(self):
-        """--recent-chunks must also constrain local sessions pull for identity mapping."""
+    def test_effective_window_is_used_for_local_identity_sessions(self):
+        """Local sessions pull for identity mapping 須使用 effective 視窗。"""
         src = _get_func_src("run_pipeline")
         self.assertRegex(
             src,

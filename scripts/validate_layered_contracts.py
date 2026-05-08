@@ -66,7 +66,7 @@ def _validate_enumeration_artifacts() -> None:
     import yaml
 
     mod = _load_enumerate_module()
-    spec_path = _REPO / "package" / "deploy" / "models" / "feature_spec.yaml"
+    spec_path = _REPO / "trainer" / "feature_spec" / "feature_candidates.yaml"
     spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
     if not isinstance(spec, dict):
         raise TypeError("feature_spec root must be a mapping")

@@ -72,9 +72,6 @@ def execute_l2_training_bundle(
         logger.warning(
             "--sample-rated is ignored for --l2-training-bundle (pre-assembled splits)."
         )
-    if getattr(args, "recent_chunks", None) is not None:
-        raise SystemExit("--recent-chunks is incompatible with --l2-training-bundle")
-
     t_load = time.perf_counter()
     manifest = load_and_validate_bundle(bundle_dir)
     tr.pipeline_echo(

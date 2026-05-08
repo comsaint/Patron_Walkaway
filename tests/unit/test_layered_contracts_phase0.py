@@ -21,7 +21,7 @@ def _enumerate_mod():
 
 
 def test_enumerate_features_sorted_and_stable() -> None:
-    spec_path = _REPO / "package" / "deploy" / "models" / "feature_spec.yaml"
+    spec_path = _REPO / "trainer" / "feature_spec" / "feature_candidates.yaml"
     spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
     assert isinstance(spec, dict)
     mod = _enumerate_mod()

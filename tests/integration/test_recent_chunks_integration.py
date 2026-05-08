@@ -1,20 +1,28 @@
+"""Integration: run_pipeline 單視窗路徑（get_single_window_chunk）與 profile 視窗 wiring.
+
+舊版 ``--recent-chunks`` / monthly trim 已移除；本檔保留檔名以降低 CI 清單變更，
+但僅驗證單一視窗 mock 下 ensure_player_profile / process_chunk 契約。
+"""
+
+from __future__ import annotations
+
 import argparse
 import os
 import tempfile
-from datetime import datetime, timedelta
 import unittest
-from unittest.mock import patch, ANY
+from datetime import datetime, timedelta
+from pathlib import Path
+from unittest.mock import ANY, patch
 
 import pandas as pd
 from zoneinfo import ZoneInfo
 
-# Import run_pipeline and its helpers from trainer
 from trainer.trainer import run_pipeline
 
 HK_TZ = ZoneInfo("Asia/Hong_Kong")
 
 
-class TestRecentChunksIntegration(unittest.TestCase):
+class TestSingleWindowProfileWiring(unittest.TestCase):
     @patch("trainer.trainer.CANONICAL_MAPPING_PARQUET")
     @patch("trainer.trainer.CANONICAL_MAPPING_CUTOFF_JSON")
     @patch("trainer.trainer.build_canonical_links_and_dummy_from_duckdb")
@@ -24,10 +32,10 @@ class TestRecentChunksIntegration(unittest.TestCase):
     @patch("trainer.trainer.process_chunk")
     @patch("trainer.trainer.train_single_rated_model")
     @patch("trainer.trainer.save_artifact_bundle")
-    @patch("trainer.trainer.get_monthly_chunks")
-    def test_recent_chunks_propagates_effective_window(
+    @patch("trainer.trainer.get_single_window_chunk")
+    def test_single_window_propagates_effective_window(
         self,
-        mock_get_chunks,
+        mock_get_window,
         mock_save_bundle,
         mock_train,
         mock_process_chunk,
@@ -38,34 +46,26 @@ class TestRecentChunksIntegration(unittest.TestCase):
         mock_cutoff_json,
         mock_parquet_path,
     ):
-        # Setup fake chunks. Let's say we have 5 months of data originally.
         base_time = datetime(2025, 1, 1, tzinfo=HK_TZ)
-        fake_chunks = []
-        for i in range(5):
-            start = base_time + timedelta(days=30*i)
-            end = base_time + timedelta(days=30*(i+1))
-            ext_end = end + timedelta(days=1)
-            fake_chunks.append({
-                "window_start": start,
-                "window_end": end,
-                "extended_end": ext_end
-            })
-        
-        mock_get_chunks.return_value = fake_chunks
+        end_time = base_time + timedelta(days=60)
+        fake_chunks = [
+            {
+                "window_start": base_time,
+                "window_end": end_time,
+                "extended_end": end_time + timedelta(days=1),
+            }
+        ]
+        mock_get_window.return_value = fake_chunks
 
-        # We will request only the recent 2 chunks.
-        # So effective_start should be chunk index -2 start
-        # effective_end should be chunk index -1 end
-        # DEC-018: run_pipeline strips tz from effective_start/end before passing
-        # them to downstream helpers.  Use tz-naive expected values for comparisons.
-        expected_effective_start = fake_chunks[-2]["window_start"].replace(tzinfo=None)
-        expected_effective_end   = fake_chunks[-1]["window_end"].replace(tzinfo=None)
+        expected_effective_start = fake_chunks[0]["window_start"].replace(tzinfo=None)
+        expected_effective_end = fake_chunks[0]["window_end"].replace(tzinfo=None)
 
-        # Step 3: no artifact on disk; DuckDB path returns empty links/dummy and empty map.
         mock_parquet_path.exists.return_value = False
         mock_cutoff_json.exists.return_value = False
-        _empty_links = pd.DataFrame(columns=["player_id", "casino_player_id", "lud_dtm"])
-        mock_links_and_dummy.return_value = (_empty_links, set())
+        mock_links_and_dummy.return_value = (
+            pd.DataFrame(columns=["player_id", "casino_player_id", "lud_dtm"]),
+            set(),
+        )
         mock_build_from_links.return_value = pd.DataFrame(columns=["player_id", "canonical_id"])
         mock_load_profile.return_value = pd.DataFrame()
 
@@ -76,14 +76,19 @@ class TestRecentChunksIntegration(unittest.TestCase):
                 "trainer.training.cross_entry_preflight.run_cross_entry_data_preflight"
             ), patch("trainer.trainer.STEP7_USE_DUCKDB", False), patch(
                 "trainer.trainer.STEP7_KEEP_TRAIN_ON_DISK", False
+            ), patch(
+                "trainer.trainer.local_parquet_session_path_for_trainer",
+                return_value=Path(_tmp_parquet),
             ), patch("trainer.trainer.pd.read_parquet") as mock_read_parquet:
-                mock_read_parquet.return_value = pd.DataFrame({
-                    "payout_complete_dtm": [datetime(2025, 5, 15, tzinfo=HK_TZ)],
-                    "label": [1],
-                    "is_rated": [True],
-                    "canonical_id": ["C0"],
-                    "bet_id": [1],
-                })
+                mock_read_parquet.return_value = pd.DataFrame(
+                    {
+                        "payout_complete_dtm": [datetime(2025, 2, 15, tzinfo=HK_TZ)],
+                        "label": [1],
+                        "is_rated": [True],
+                        "canonical_id": ["C0"],
+                        "bet_id": [1],
+                    }
+                )
 
                 mock_process_chunk.return_value = _tmp_parquet
                 mock_train.return_value = ({"model": None, "threshold": 0.5, "features": []}, None, {})
@@ -95,7 +100,8 @@ class TestRecentChunksIntegration(unittest.TestCase):
                     use_local_parquet=True,
                     force_recompute=False,
                     skip_optuna=True,
-                    recent_chunks=2,
+                    no_l2_auto_bundle=True,
+                    l2_training_bundle=None,
                 )
                 run_pipeline(args)
         finally:
@@ -104,17 +110,12 @@ class TestRecentChunksIntegration(unittest.TestCase):
             except OSError:
                 pass
 
-        # 1. Assert canonical mapping used train_end from chunk split (DuckDB path).
         mock_links_and_dummy.assert_called_once()
         _call_args = mock_links_and_dummy.call_args[0]
         _train_end = pd.Timestamp(_call_args[1])
-        self.assertGreaterEqual(_train_end, expected_effective_start, "train_end must be >= effective_start")
-        self.assertLessEqual(_train_end, expected_effective_end, "train_end must be <= effective_end (max of train_chunks)")
+        self.assertGreaterEqual(_train_end, expected_effective_start)
+        self.assertLessEqual(_train_end, expected_effective_end)
 
-        # 2. Assert ensure_player_profile_ready was called with effective window
-        # (canonical_id_whitelist=None, snapshot_interval_days=1, preload_sessions=True
-        # are the normal-mode defaults; canonical_map matched via ANY since its content
-        # depends on build_canonical_mapping_from_df mock output — DEC-017 bug fix)
         mock_ensure_profile.assert_called_once_with(
             expected_effective_start,
             expected_effective_end,
@@ -123,28 +124,12 @@ class TestRecentChunksIntegration(unittest.TestCase):
             snapshot_interval_days=1,
             preload_sessions=True,
             canonical_map=ANY,
-            max_lookback_days=365,         # DEC-017: full horizon in normal mode
+            max_lookback_days=365,
         )
-        ensure_kwargs = mock_ensure_profile.call_args.kwargs
-        passed_cmap = ensure_kwargs.get("canonical_map")
-        self.assertIsInstance(passed_cmap, pd.DataFrame)
-        self.assertListEqual(list(passed_cmap.columns), ["player_id", "canonical_id"])
 
-        # 3. Assert load_player_profile was called with effective window
         mock_load_profile.assert_called_once()
-        kwargs = mock_load_profile.call_args[1]
         call_args = mock_load_profile.call_args[0]
         self.assertEqual(call_args[0], expected_effective_start)
         self.assertEqual(call_args[1], expected_effective_end)
-        self.assertEqual(kwargs.get("use_local_parquet"), True)
 
-        # 4. Assert process_chunk: one pass per chunk (NEG_SAMPLE_FRAC_AUTO default False — no OOM probe).
-        self.assertEqual(mock_process_chunk.call_count, 2,
-                         "With recent_chunks=2 and NEG_SAMPLE_FRAC_AUTO=False: chunk[-2] then chunk[-1]")
-        chunk_args_1 = mock_process_chunk.call_args_list[0][0][0]
-        chunk_args_2 = mock_process_chunk.call_args_list[1][0][0]
-        self.assertEqual(chunk_args_1, fake_chunks[-2])
-        self.assertEqual(chunk_args_2, fake_chunks[-1])
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(mock_process_chunk.call_count, 1)

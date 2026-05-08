@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 _REPO = Path(__file__).resolve().parents[2]
-_CANDIDATES = _REPO / "trainer" / "feature_spec" / "feature_spec.yaml"
+_CANDIDATES = _REPO / "trainer" / "feature_spec" / "feature_candidates.yaml"
 _MAPPING = _REPO / "trainer" / "feature_spec" / "track_to_layer_mapping.yaml"
 
 

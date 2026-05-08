@@ -3,16 +3,15 @@ spec_id: "walkaway_features_v2_template"
 description: "Template feature spec for Patron Walkaway Predictor (Track Profile / Track LLM / Track Human)."
 
 # ---------------------------------------------------------------------------
-# Layered framework (Phase A skeleton; legacy 3-track sections below remain
-# authoritative for runtime until later phases switch over).
+# Layered framework — contract authority (implementation still uses track_* blocks).
 # ---------------------------------------------------------------------------
 layered_framework:
   status: "phase_a_skeleton"
-  authoritative: false
+  authoritative: true
   notes: >
-    Phase A introduces the contract; the legacy track_llm / track_human / track_profile
-    sections still drive runtime. PR-A2 fills the old<->new mapping; PR-A3 lands chunk-
-    dependent replacements; PR-A4 mirrors the contract into the deploy spec.
+    Layered semantics are authoritative for naming, PIT, and layer ownership.
+    track_llm / track_human / track_profile sections remain the implementation partition
+    inside this dev catalog until compute paths are fully migrated to layered-only YAML.
 
   layers:
     bet:

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 # Bet-level run/trip LDA pass-through columns (must match trainer ``_REQUIRED_BET_PARQUET_COLS`` suffix
-# and ``feature_spec.yaml`` passthrough ``feature_id`` values).
+# and dev ``feature_candidates.yaml`` passthrough ``feature_id`` values).
 LDA_RUN_TRIP_BET_COLUMNS: tuple[str, ...] = (
     "lda_l1_run_bet_count",
     "lda_trip_run_count",
@@ -49,6 +49,14 @@ def trainer_bridge_output_dir(data_dir: Path) -> Path:
 def _utc_now_iso() -> str:
     """Return current UTC time as ISO-8601 string."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _manifest_rel_path(target: Path, anchor: Path) -> str:
+    """Return a POSIX path relative to *anchor* when possible (portable manifests)."""
+    try:
+        return target.resolve().relative_to(anchor.resolve()).as_posix()
+    except ValueError:
+        return target.resolve().as_posix()
 
 
 def _escape_sql_path(p: Path) -> str:
@@ -573,18 +581,19 @@ def emit_trainer_local_parquet(
         _atomic_replace(bet_tmp, out_bet)
         _atomic_replace(sess_tmp, out_sess)
 
+        repo_root = data_dir.resolve().parent
         manifest: dict[str, Any] = {
             "artifact_kind": "trainer_local_parquet_bridge_v1",
-            "bridge_output_dir": str(bridge_dir.as_posix()),
+            "bridge_output_dir": _manifest_rel_path(bridge_dir, data_dir),
             "built_at": _utc_now_iso(),
             "input_fingerprint": fp,
             "source_snapshot_id": summary.get("source_snapshot_id"),
-            "snap_root": str(snap_root.as_posix()),
+            "snap_root": _manifest_rel_path(snap_root, repo_root),
             "bet_includes_run_trip_lda_columns": join_lda_columns,
-            "t_bet_paths": [str(p.as_posix()) for p in raw_bet_paths],
-            "t_session_source": str(session_src.as_posix()),
-            "gmwds_t_bet": str(out_bet.as_posix()),
-            "gmwds_t_session": str(out_sess.as_posix()),
+            "t_bet_paths": [_manifest_rel_path(p, repo_root) for p in raw_bet_paths],
+            "t_session_source": _manifest_rel_path(session_src, repo_root),
+            "gmwds_t_bet": _manifest_rel_path(out_bet, data_dir),
+            "gmwds_t_session": _manifest_rel_path(out_sess, data_dir),
             "bet_row_count": row_count,
             "session_row_count": sess_rows,
             "lda_run_trip_bet_column_names": list(LDA_RUN_TRIP_BET_COLUMNS)

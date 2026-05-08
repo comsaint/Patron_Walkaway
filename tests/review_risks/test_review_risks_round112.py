@@ -124,7 +124,7 @@ class TestRound112RiskGuards(unittest.TestCase):
             Path(__file__).resolve().parents[2]
             / "trainer"
             / "feature_spec"
-            / "feature_spec.yaml"
+            / "feature_candidates.yaml"
         )
         spec = features_mod.load_feature_spec(tpl)
         self.assertIn("track_llm", spec)
@@ -178,7 +178,7 @@ class TestRound112LintLikeRules(unittest.TestCase):
             Path(__file__).resolve().parents[2]
             / "trainer"
             / "feature_spec"
-            / "feature_spec.yaml"
+            / "feature_candidates.yaml"
         )
         with tpl.open(encoding="utf-8") as fh:
             spec = yaml.safe_load(fh)

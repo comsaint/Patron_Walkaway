@@ -11,17 +11,17 @@
 
 ## 1. 檔案位置與角色
 
-- 候選特徵定義（spec 原始檔）：  
-  - **`trainer/feature_spec/feature_spec.yaml`**（repo 內唯一 spec SSOT；訓練時會整份複製到 artifact 的 `feature_spec.yaml`）  
+- 候選特徵定義（dev catalog，原始檔）：  
+  - **`trainer/feature_spec/feature_candidates.yaml`**（repo 內候選全集 SSOT；訓練結束時寫入 **bundle 凍結** `feature_spec.yaml`，僅含模型實際使用特徵與依賴閉包）  
 - 生產特徵清單（active features）：  
   - **`trainer/feature_spec/feature_list.json`**（由訓練流程產生，為 canonical 來源；template 內各 track 的 `active.feature_ids: []` 可視為同一定義的 YAML 表示）
 
 兩者關係：
 
-1. **feature_spec.yaml**：Track Profile / Track LLM / Track Human 的「特徵全集」，包含所有候選。  
+1. **feature_candidates.yaml**：Track Profile / Track LLM / Track Human 的「候選全集」。  
 2. 訓練流程（`trainer.py`）讀取 candidates，計算特徵並做 Feature Screening。  
 3. Screening 結果寫入 **feature_list.json**（只留需要真的計算與送入模型的 feature_id）。  
-4. `scorer.py` 只依據 feature_list.json 與 **凍結在 model artifact 內的 feature_spec.yaml**（訓練時寫入）來計算線上特徵；若 artifact 內無 feature_spec.yaml 則 fallback 至全域 spec 路徑。
+4. `scorer.py` / backtester **bundle-only**：只讀 model bundle 目錄內的 **凍結 `feature_spec.yaml`**（訓練產出）與 `feature_list.json`；**不再** fallback 至 repo 路徑。
 
 ---
 
@@ -30,7 +30,7 @@
 完整 spec 見：
 
 ```text
-trainer/feature_spec/feature_spec.yaml
+trainer/feature_spec/feature_candidates.yaml
 ```
 
 ### 2.1 全域區塊

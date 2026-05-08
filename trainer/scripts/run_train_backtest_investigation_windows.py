@@ -63,7 +63,6 @@ def _build_train_cmd(
     train_end: str,
     use_local_parquet: bool,
     skip_optuna: bool,
-    recent_chunks: Optional[int],
     sample_rated: Optional[int],
     no_preload: bool,
 ) -> List[str]:
@@ -81,8 +80,6 @@ def _build_train_cmd(
         cmd.append("--use-local-parquet")
     if skip_optuna:
         cmd.append("--skip-optuna")
-    if recent_chunks is not None:
-        cmd.extend(["--recent-chunks", str(recent_chunks)])
     if sample_rated is not None:
         cmd.extend(["--sample-rated", str(sample_rated)])
     if no_preload:
@@ -136,7 +133,6 @@ def run_pipeline(
     use_local_parquet: bool,
     skip_train_optuna: bool,
     skip_backtest_optuna: bool,
-    recent_chunks: Optional[int],
     sample_rated: Optional[int],
     no_preload: bool,
     model_version: Optional[str],
@@ -163,7 +159,6 @@ def run_pipeline(
                 train_end=train_end,
                 use_local_parquet=use_local_parquet,
                 skip_optuna=skip_train_optuna,
-                recent_chunks=recent_chunks,
                 sample_rated=sample_rated,
                 no_preload=no_preload,
             )))
@@ -184,7 +179,6 @@ def run_pipeline(
             train_end=train_end,
             use_local_parquet=use_local_parquet,
             skip_optuna=skip_train_optuna,
-            recent_chunks=recent_chunks,
             sample_rated=sample_rated,
             no_preload=no_preload,
         )
@@ -265,13 +259,6 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Pass --skip-optuna to both trainer and backtester.",
     )
     p.add_argument(
-        "--recent-chunks",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Forward --recent-chunks N to trainer (debug / low-RAM).",
-    )
-    p.add_argument(
         "--sample-rated",
         type=int,
         default=None,
@@ -334,7 +321,6 @@ def main() -> int:
         use_local_parquet=bool(args.use_local_parquet),
         skip_train_optuna=skip_tr,
         skip_backtest_optuna=skip_bt,
-        recent_chunks=args.recent_chunks,
         sample_rated=args.sample_rated,
         no_preload=bool(args.no_preload),
         model_version=(args.model_version or "").strip() or None,

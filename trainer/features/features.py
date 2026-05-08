@@ -132,7 +132,9 @@ def _resolve_frozen_feature_spec_yaml(versions_root: pathlib.Path) -> Optional[p
     return cand if cand.is_file() else None
 
 
-_repo_feature_spec_yaml = pathlib.Path(__file__).resolve().parent.parent / "feature_spec" / "feature_spec.yaml"
+_repo_feature_spec_yaml = (
+    pathlib.Path(__file__).resolve().parent.parent / "feature_spec" / "feature_candidates.yaml"
+)
 _raw_model_dir = os.environ.get("MODEL_DIR")
 _model_dir_stripped = _raw_model_dir.strip() if (_raw_model_dir and _raw_model_dir.strip()) else None
 
@@ -173,8 +175,8 @@ except FileNotFoundError:
     import logging as _logging
 
     _logging.getLogger(__name__).warning(
-        "Feature Spec YAML not found at %s — PROFILE_FEATURE_COLS will be empty. "
-        "Ensure trainer/feature_spec/feature_spec.yaml exists before training.",
+        "Feature candidates YAML not found at %s — PROFILE_FEATURE_COLS will be empty. "
+        "Ensure trainer/feature_spec/feature_candidates.yaml exists before training.",
         _yaml_path,
     )
     _TEMPLATE_SPEC = {}
@@ -2006,6 +2008,82 @@ _FEATURE_ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 #: nanosecond offset so the single-column ORDER BY required by DuckDB RANGE INTERVAL
 #: semantics still produces deterministic, stable results.
 _RANGE_SORT_COL = "_range_sort_key"
+
+
+def build_runtime_feature_spec_subset(full_spec: dict, feature_cols: Sequence[str]) -> dict:
+    """Return a frozen runtime spec: model columns plus ``depends_on`` closure.
+
+    The dev catalog (``feature_candidates.yaml``) may list many candidates; the
+    bundle ``feature_spec.yaml`` must only carry what serving needs to compute the
+    model's active columns, including intermediate derived inputs.
+    """
+    from copy import deepcopy
+
+    if not isinstance(full_spec, dict):
+        return {}
+    tracks = ("track_llm", "track_human", "track_profile")
+    by_fid: dict[str, tuple[str, dict]] = {}
+    for t in tracks:
+        blob = full_spec.get(t) or {}
+        raw_cands = blob.get("candidates")
+        cands = raw_cands if isinstance(raw_cands, list) else []
+        for c in cands:
+            if isinstance(c, dict) and c.get("feature_id"):
+                by_fid[str(c["feature_id"])] = (t, c)
+    needed: set[str] = {str(x) for x in feature_cols if x}
+    changed = True
+    while changed:
+        changed = False
+        for fid in list(needed):
+            pair = by_fid.get(fid)
+            if not pair:
+                continue
+            _, cand = pair
+            deps = cand.get("depends_on") or []
+            if not isinstance(deps, (list, tuple)):
+                continue
+            for dep in deps:
+                ds = str(dep)
+                if ds and ds not in needed:
+                    needed.add(ds)
+                    changed = True
+    out = deepcopy(full_spec)
+    lf = out.get("layered_framework")
+    if isinstance(lf, dict):
+        lf["authoritative"] = True
+    for t in tracks:
+        src = out.get(t)
+        if not isinstance(src, dict):
+            continue
+        raw_cands = src.get("candidates")
+        cands = raw_cands if isinstance(raw_cands, list) else []
+        src["candidates"] = [
+            deepcopy(c)
+            for c in cands
+            if isinstance(c, dict)
+            and c.get("feature_id")
+            and str(c["feature_id"]) in needed
+        ]
+    out["runtime_subset"] = {
+        "model_feature_ids": [str(x) for x in feature_cols if x],
+        "closure_feature_count": len(needed),
+    }
+    return out
+
+
+def write_feature_spec_yaml(path: pathlib.Path, spec: dict) -> None:
+    """Write *spec* to *path* as UTF-8 YAML (atomic replace via temp file)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        _yaml.safe_dump(
+            spec,
+            fh,
+            sort_keys=False,
+            allow_unicode=True,
+            default_flow_style=False,
+        )
+    tmp.replace(path)
 
 
 def load_feature_spec(yaml_path) -> dict:

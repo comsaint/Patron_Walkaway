@@ -58,20 +58,20 @@ class TestReview1MlflowMetricsRatedMergeCollisionMre(unittest.TestCase):
 
 
 class TestReview2Step1DurationScopeContract(unittest.TestCase):
-    """#2：`step1_duration_sec` 不包含 `--recent-chunks` 裁剪（原始碼順序契約）。"""
+    """#2：`step1_duration_sec` 在 effective_start 由 chunks 導出之前記錄（單視窗路徑）。"""
 
-    def test_step1_duration_assignment_before_recent_chunks_slice(self):
+    def test_step1_duration_assignment_before_effective_start_from_chunks(self):
         src = _trainer_text()
         needle_step1 = "step1_duration_sec = _el"
-        needle_trim = "chunks = chunks[-recent_chunks:]"
+        needle_eff = "effective_start = chunks[0]"
         i1 = src.find(needle_step1)
-        i2 = src.find(needle_trim)
+        i2 = src.find(needle_eff)
         self.assertGreater(i1, 0, f"missing {needle_step1!r} in trainer.py")
-        self.assertGreater(i2, 0, f"missing {needle_trim!r} in trainer.py")
+        self.assertGreater(i2, 0, f"missing {needle_eff!r} in trainer.py")
         self.assertLess(
             i1,
             i2,
-            "contract: Step 1 wall time must be recorded before recent-chunks trim",
+            "contract: Step 1 wall time must be recorded before effective_start derivation",
         )
 
 

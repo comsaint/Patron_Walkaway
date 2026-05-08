@@ -1,8 +1,23 @@
 track_section,feature_id,spec_type,required_l1_fields,allow_bet_rescan,computation_source
-track_human,bets_in_run_so_far,python_vectorized,bet_id;canonical_id;payout_complete_dtm,TBD,python_vectorized:compute_run_boundary_features
-track_human,loss_streak,python_vectorized,bet_id;canonical_id;payout_complete_dtm;status,TBD,python_vectorized:compute_loss_streak
-track_human,minutes_since_run_start,python_vectorized,bet_id;canonical_id;payout_complete_dtm,TBD,python_vectorized:compute_run_boundary_features
-track_human,wager_sum_in_run_so_far,python_vectorized,bet_id;canonical_id;payout_complete_dtm,TBD,python_vectorized:compute_run_boundary_features
+track_human,banker_rate_w20games,python_vectorized,bet_id;game_id;payout_complete_dtm;table_id,TBD,python_vectorized:join_t_game_features_for_bets
+track_human,bets_in_run_so_far,python_vectorized,bet_id;canonical_id;casino_win;payout_complete_dtm;wager,TBD,python_vectorized:compute_run_boundary_features
+track_human,bets_in_run_vs_personal_avg,python_vectorized,avg_session_duration_min_30d;bets_cnt_w15m;bets_in_run_so_far;minutes_since_run_start;num_bets_sum_30d;sessions_30d,TBD,python_vectorized:compute_wave2_personalized_features
+track_human,consecutive_non_win_cnt,python_vectorized,bet_id;canonical_id;payout_complete_dtm;status,TBD,python_vectorized:compute_consecutive_non_win_features
+track_human,current_outcome_streak_len,python_vectorized,bet_id;game_id;payout_complete_dtm;table_id,TBD,python_vectorized:join_t_game_features_for_bets
+track_human,loss_streak,python_vectorized,bet_id;canonical_id;payout_complete_dtm;status,TBD,python_vectorized:compute_loss_streak_features
+track_human,minutes_since_run_start,python_vectorized,bet_id;canonical_id;casino_win;payout_complete_dtm;wager,TBD,python_vectorized:compute_run_boundary_features
+track_human,net_win_in_run_so_far,python_vectorized,bet_id;canonical_id;casino_win;payout_complete_dtm;wager,TBD,python_vectorized:compute_run_boundary_features
+track_human,net_win_per_bet_in_run,python_vectorized,bet_id;canonical_id;casino_win;payout_complete_dtm;wager,TBD,python_vectorized:compute_run_boundary_features
+track_human,pace_vs_personal_baseline,python_vectorized,avg_session_duration_min_30d;bets_cnt_w15m;bets_in_run_so_far;minutes_since_run_start;num_bets_sum_30d;sessions_30d,TBD,python_vectorized:compute_wave2_personalized_features
+track_human,patron_is_sole_player,python_vectorized,bet_id;game_id;payout_complete_dtm;table_id,TBD,python_vectorized:join_t_game_features_for_bets
+track_human,player_rate_w20games,python_vectorized,bet_id;game_id;payout_complete_dtm;table_id,TBD,python_vectorized:join_t_game_features_for_bets
+track_human,run_duration_vs_personal_avg,python_vectorized,avg_session_duration_min_30d;bets_cnt_w15m;bets_in_run_so_far;minutes_since_run_start;num_bets_sum_30d;sessions_30d,TBD,python_vectorized:compute_wave2_personalized_features
+track_human,table_hc,python_vectorized,bet_id;payout_complete_dtm;player_id;table_id,TBD,python_vectorized:compute_table_hc_features
+track_human,table_net_outcome_w15m,python_vectorized,bet_id;game_id;payout_complete_dtm;table_id,TBD,python_vectorized:join_t_game_features_for_bets
+track_human,table_num_players,python_vectorized,bet_id;game_id;payout_complete_dtm;table_id,TBD,python_vectorized:join_t_game_features_for_bets
+track_human,table_turnover_w5m_over_w15m,python_vectorized,bet_id;game_id;payout_complete_dtm;table_id,TBD,python_vectorized:join_t_game_features_for_bets
+track_human,tie_rate_w20games,python_vectorized,bet_id;game_id;payout_complete_dtm;table_id,TBD,python_vectorized:join_t_game_features_for_bets
+track_human,wager_sum_in_run_so_far,python_vectorized,bet_id;canonical_id;casino_win;payout_complete_dtm;wager,TBD,python_vectorized:compute_run_boundary_features
 track_llm,avg_payout_odds_w15m,window,TBD,TBD,window:AVG(payout_odds)
 track_llm,avg_wager_sofar,derived,TBD,TBD,"derived:CAST(cum_wager AS DOUBLE) / NULLIF(cum_bets, 0)"
 track_llm,back_bet_cnt_w20,window,TBD,TBD,window:SUM(is_back_bet)
@@ -16,7 +31,13 @@ track_llm,cum_bets,window,TBD,TBD,window:COUNT(*)
 track_llm,cum_wager,window,TBD,TBD,window:SUM(wager)
 track_llm,hour_of_day,derived,TBD,TBD,"derived:date_part('hour', payout_complete_dtm)"
 track_llm,is_back_bet,passthrough,TBD,TBD,passthrough
+track_llm,lda_l1_run_bet_count,passthrough,TBD,TBD,passthrough
+track_llm,lda_l1_run_duration_min,passthrough,TBD,TBD,passthrough
+track_llm,lda_run_ord_in_trip,passthrough,TBD,TBD,passthrough
+track_llm,lda_trip_is_closed,passthrough,TBD,TBD,passthrough
+track_llm,lda_trip_run_count,passthrough,TBD,TBD,passthrough
 track_llm,lose_cnt_w15m,window,TBD,TBD,window:SUM(CASE WHEN status = 'LOSE' THEN 1 ELSE 0 END)
+track_llm,non_win_rate_w15m,derived,TBD,TBD,"derived:CAST((lose_cnt_w15m + push_cnt_w15m) AS DOUBLE) / NULLIF(bets_cnt_w15m, 0)"
 track_llm,pace_drop_ratio,derived,TBD,TBD,"derived:CAST(bets_cnt_w5m AS DOUBLE) / NULLIF(bets_cnt_w30m, 0)"
 track_llm,pace_drop_ratio_w15m_w30m,derived,TBD,TBD,"derived:CAST(bets_cnt_w15m AS DOUBLE) / NULLIF(bets_cnt_w30m, 0)"
 track_llm,payout_odds,passthrough,TBD,TBD,passthrough
@@ -28,14 +49,18 @@ track_llm,prev_bet_gap_min,derived,TBD,TBD,"derived:(epoch(payout_complete_dtm) 
 track_llm,prev_bet_was_loss,derived,TBD,TBD,derived:CASE WHEN prev_status = 'LOSE' THEN 1 ELSE 0 END
 track_llm,prev_status,lag,TBD,TBD,"lag:LAG(status, 1)"
 track_llm,prev_wager,lag,TBD,TBD,"lag:LAG(wager, 1)"
+track_llm,push_cnt_w15m,window,TBD,TBD,window:SUM(CASE WHEN status = 'PUSH' THEN 1 ELSE 0 END)
 track_llm,time_of_day_cos,derived,TBD,TBD,"derived:cos(2 * pi() * (date_part('hour', payout_complete_dtm) * 60 + date_part('minute', payout_complete_dtm)) / 1440)"
 track_llm,time_of_day_sin,derived,TBD,TBD,"derived:sin(2 * pi() * (date_part('hour', payout_complete_dtm) * 60 + date_part('minute', payout_complete_dtm)) / 1440)"
 track_llm,wager,passthrough,TBD,TBD,passthrough
 track_llm,wager_avg_w15m,window,TBD,TBD,window:AVG(wager)
+track_llm,wager_avg_w5m,window,TBD,TBD,window:AVG(wager)
 track_llm,wager_max_w15m,window,TBD,TBD,window:MAX(wager)
 track_llm,wager_recent_vs_session_avg,derived,TBD,TBD,"derived:wager_avg_w15m / NULLIF(avg_wager_sofar, 0)"
+track_llm,wager_slope_w10bets,derived,TBD,TBD,"derived:(CAST(wager AS DOUBLE) - CAST(LAG(wager, 10) OVER (PARTITION BY canonical_id ORDER BY payout_complete_dtm ASC, bet_id ASC) AS DOUBLE)) / 10.0"
 track_llm,wager_std_w15m,window,TBD,TBD,window:STDDEV_SAMP(wager)
 track_llm,wager_sum_w30m,window,TBD,TBD,window:SUM(wager)
+track_llm,wager_w5m_over_w15m,derived,TBD,TBD,"derived:CAST(wager_avg_w5m AS DOUBLE) / NULLIF(wager_avg_w15m, 0)"
 track_llm,win_cnt_w15m,window,TBD,TBD,window:SUM(CASE WHEN status = 'WIN' THEN 1 ELSE 0 END)
 track_llm,win_rate_w15m,derived,TBD,TBD,"derived:CAST(win_cnt_w15m AS DOUBLE) / NULLIF(bets_cnt_w15m, 0)"
 track_profile,active_days_30d,profile_column,player_profile.active_days_30d,no,profile_column:active_days_30d

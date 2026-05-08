@@ -45,16 +45,6 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         help="Skip Optuna search and use default LightGBM hyperparameters",
     )
     parser.add_argument(
-        "--recent-chunks",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "Legacy only (--legacy-chunk-mode): use only the last N monthly chunks. "
-            "Ignored in the default single-window run/trip pipeline."
-        ),
-    )
-    parser.add_argument(
         "--no-preload",
         action="store_true",
         help=(
@@ -183,8 +173,8 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         metavar="DIR",
         help=(
             "GitHub #16 / TRN-16-03: train from pre-assembled L2 split parquets under DIR "
-            "using l2_training_bundle.json (skips chunk Steps 1–7). Incompatible with "
-            "--recent-chunks. Loads train/valid/test fully into memory (RAM risk on large data)."
+            "using l2_training_bundle.json (skips chunk Steps 1–7). "
+            "Loads train/valid/test fully into memory (RAM risk on large data)."
         ),
     )
     parser.add_argument(
@@ -194,15 +184,7 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         help=(
             "Optional no-op: --use-local-parquet already defaults to the L2 run/trip path "
             "(auto bundle + Steps 8–10). Use --no-l2-auto-bundle to force legacy Steps 8–10 "
-            "after Step 7, or --legacy-chunk-mode for monthly chunks."
-        ),
-    )
-    parser.add_argument(
-        "--legacy-chunk-mode",
-        action="store_true",
-        help=(
-            "Use monthly chunk partitioning (legacy). Default is a single-window run/trip "
-            "pipeline with row-level split in Step 7."
+            "after Step 7."
         ),
     )
     parser.add_argument(

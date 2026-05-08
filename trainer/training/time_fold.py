@@ -20,8 +20,8 @@ Boundary contract
 
 GitHub #16 (L2 主路徑)
 ----------------------
-預設訓練邊界使用 ``get_single_window_chunk``（單一 run/trip 視窗，無月切）。
-``get_monthly_chunks`` 僅在 ``--legacy-chunk-mode`` 啟用時作為除錯／相容路徑。
+訓練主路徑僅使用 ``get_single_window_chunk``（單一 run/trip 視窗；無 monthly chunk 入口）。
+``get_monthly_chunks`` 仍保留於本模組供舊測試／輔助腳本使用，**不再**由 trainer CLI 觸發。
 列級 train/valid/test 仍由 Step 7 完成；L2 manifest 契約見 ``l2_trainer_contracts``。
 """
 

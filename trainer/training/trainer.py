@@ -4,7 +4,7 @@ Patron Walkaway Prediction — Training Pipeline
 
 Pipeline (SSOT §4.3 / §9)
 --------------------------
-1. time_fold.get_single_window_chunk(start, end)  -> one training window (default; no month chunks)
+1. time_fold.get_single_window_chunk(start, end)  -> one training window (single-path; no monthly partition)
 2. Per window: load bets + sessions -> DQ -> identity -> labels -> Track Human features
    - Data source: ClickHouse (production) OR local Parquet (dev iteration)
    - Labels use C1 extended pull; bets in (window_end, extended_end] are
@@ -385,7 +385,6 @@ Dec026ThresholdPick = _threshold_selection_mod.Dec026ThresholdPick
 # except = run as package (python -m trainer.trainer). Only the except path uses relative db_conn.
 try:
     from time_fold import (  # type: ignore[import]
-        get_monthly_chunks,
         get_single_window_chunk,
         get_train_valid_test_split,
     )
@@ -435,7 +434,6 @@ try:
     from schema_io import normalize_bets_sessions  # type: ignore[import]
 except ModuleNotFoundError:
     from trainer.time_fold import (  # type: ignore[import]
-        get_monthly_chunks,
         get_single_window_chunk,
         get_train_valid_test_split,
     )
@@ -508,7 +506,9 @@ DATA_DIR = BASE_DIR / ".data"
 CHUNK_DIR = DATA_DIR / "chunks"
 CANONICAL_MAPPING_PARQUET = LOCAL_PARQUET_DIR / "canonical_mapping.parquet"
 CANONICAL_MAPPING_CUTOFF_JSON = LOCAL_PARQUET_DIR / "canonical_mapping.cutoff.json"
-FEATURE_SPEC_PATH = BASE_DIR / "feature_spec" / "feature_spec.yaml"
+# Dev-only candidate universe (not shipped as runtime spec; bundle writes frozen feature_spec.yaml).
+FEATURE_CANDIDATES_PATH = BASE_DIR / "feature_spec" / "feature_candidates.yaml"
+FEATURE_SPEC_PATH = FEATURE_CANDIDATES_PATH  # backward-compatible alias for imports
 MODEL_DIR: Path = cast(Path, getattr(_cfg, "DEFAULT_MODEL_DIR", BASE_DIR / "models"))
 OUT_DIR = BASE_DIR / "out_trainer"
 
@@ -1836,7 +1836,7 @@ def _oom_check_and_adjust_neg_sample_frac(
         estimated_peak_ram / (1024**3),
         ram_budget / (1024**3),
         (
-            f"; floor hit at NEG_SAMPLE_FRAC_MIN={NEG_SAMPLE_FRAC_MIN} — consider fewer --days/--recent-chunks"
+            f"; floor hit at NEG_SAMPLE_FRAC_MIN={NEG_SAMPLE_FRAC_MIN} — consider fewer --days or a narrower --start/--end window"
             if _warn_floor
             else ""
         ),
@@ -2196,7 +2196,7 @@ def process_chunk(
     *,
     identity_mapping_mode: str = "cutoff_window",
 ) -> Optional[Path]:
-    """Process one monthly chunk; return path to written Parquet or None if empty.
+    """Materialize one training-window slice; return path to written Parquet or None if empty.
 
     ``canonical_map`` is the legacy cutoff-window map (``identity_mapping_mode=cutoff_window``).
     When ``identity_mapping_mode=pit_asof`` and local parquet is enabled,
@@ -7635,10 +7635,22 @@ def save_artifact_bundle(
     feature_spec: Optional[dict] = None
     _fsp = Path(feature_spec_path) if feature_spec_path is not None else FEATURE_SPEC_PATH
     if _fsp.exists():
-        import shutil as _shutil
-        _shutil.copy2(_fsp, _out / "feature_spec.yaml")
-        spec_hash = hashlib.md5(_fsp.read_bytes()).hexdigest()[:12]
-        feature_spec = load_feature_spec(_fsp)
+        from trainer.features.features import (
+            build_runtime_feature_spec_subset,
+            write_feature_spec_yaml,
+        )
+
+        _full = load_feature_spec(_fsp)
+        if feature_cols:
+            _frozen = build_runtime_feature_spec_subset(_full, feature_cols)
+            write_feature_spec_yaml(_out / "feature_spec.yaml", _frozen)
+        else:
+            import shutil as _shutil
+
+            _shutil.copy2(_fsp, _out / "feature_spec.yaml")
+        _written = _out / "feature_spec.yaml"
+        spec_hash = hashlib.md5(_written.read_bytes()).hexdigest()[:12]
+        feature_spec = load_feature_spec(_written)
     # v10 single-entry format (DEC-021 / ensemble-capable): one model.pkl only
     if rated:
         _pkl_path = _out / "model.pkl"
@@ -7949,7 +7961,7 @@ def run_pipeline(args) -> None:
     # after Step 1) may further lower this to _effective_neg_sample_frac.
     if NEG_SAMPLE_FRAC < 1.0:
         logger.info(
-            "NEG_SAMPLE_FRAC=%.2f (config): negatives downsampled per chunk (OOM mitigation)",
+            "NEG_SAMPLE_FRAC=%.2f (config): negatives downsampled per window materialize (OOM mitigation)",
             NEG_SAMPLE_FRAC,
         )
     else:
@@ -7968,7 +7980,7 @@ def run_pipeline(args) -> None:
     pipeline_echo(f"Preflight — done in {time.perf_counter() - _pf0:.1f}s")
 
     # Auto-adjust window to actual data end when using local Parquet without
-    # explicit --start/--end, so --recent-chunks is relative to data, not today.
+    # explicit --start/--end (anchored to observed data end, not "today").
     if use_local and not (getattr(args, "start", None) or getattr(args, "end", None)):
         data_end = _detect_local_data_end()
         if data_end is not None:
@@ -8005,7 +8017,7 @@ def run_pipeline(args) -> None:
             # T12.2 / T-PipelineStepDurations: best-effort per-step wall times (Step 1–10).
             # Note: all values are optional; log_*_safe helpers will skip None.
             chunks: list = []
-            recent_chunks: Optional[int] = getattr(args, "recent_chunks", None)
+            recent_chunks: Optional[int] = None  # legacy monthly trim removed (single-window pipeline)
             effective_start = start
             effective_end = end
             _effective_neg_sample_frac: float = NEG_SAMPLE_FRAC
@@ -8068,47 +8080,19 @@ def run_pipeline(args) -> None:
                 )
                 return
 
-            # 1. Training window chunks: default single-window (run/trip pipeline); optional legacy monthly.
-            _legacy_monthly_chunks = bool(getattr(args, "legacy_chunk_mode", False))
-            _chunk_mode_label = "monthly (legacy)" if _legacy_monthly_chunks else "single-window"
+            # 1. Training window: single run/trip-level slice (no monthly partition).
+            _chunk_mode_label = "single-window"
             pipeline_echo(f"Step 1/10 — Training window and {_chunk_mode_label} …")
             t0 = time.perf_counter()
-            chunks = (
-                get_monthly_chunks(start, end)
-                if _legacy_monthly_chunks
-                else get_single_window_chunk(start, end)
-            )
+            chunks = get_single_window_chunk(start, end)
             _el = time.perf_counter() - t0
             step1_duration_sec = _el
-            pipeline_echo(f"Step 1/10 — done in {_el:.1f}s ({len(chunks)} chunk(s), {_chunk_mode_label})")
+            pipeline_echo(f"Step 1/10 — done in {_el:.1f}s ({len(chunks)} window(s), {_chunk_mode_label})")
             logger.info("Chunks: %d mode=%s (%.1fs)", len(chunks), _chunk_mode_label, _el)
 
-            # Debug/test mode: last N monthly chunks only when legacy mode is on.
-            recent_chunks = getattr(args, "recent_chunks", None)
-            if recent_chunks is not None and recent_chunks > 0:
-                if not _legacy_monthly_chunks:
-                    logger.info(
-                        "--recent-chunks=%d ignored in single-window mode; use --legacy-chunk-mode for last-N months.",
-                        recent_chunks,
-                    )
-                elif recent_chunks < len(chunks):
-                    chunks = chunks[-recent_chunks:]
-                    logger.info(
-                        "DEBUG MODE (--recent-chunks %d): trimmed to %s -> %s",
-                        recent_chunks,
-                        chunks[0]["window_start"].date(),
-                        chunks[-1]["window_end"].date(),
-                    )
-                else:
-                    logger.info(
-                        "DEBUG MODE (--recent-chunks %d): requested >= total chunks (%d), using all",
-                        recent_chunks,
-                        len(chunks),
-                    )
-        
-            # Effective window is derived from the chunk list after optional trimming.
+            # Effective window is derived from the window list.
             # All subsequent data loading (identity/profile checks/profile load) must
-            # use this window so --recent-chunks applies consistently to all tables.
+            # use this window consistently for all tables.
             effective_start = chunks[0]["window_start"] if chunks else start
             effective_end = chunks[-1]["window_end"] if chunks else end
             # DEC-018: normalize effective window to tz-naive so all downstream helpers
@@ -8340,7 +8324,6 @@ def run_pipeline(args) -> None:
             # GitHub #17: auto L2 bundle cache — default for --use-local-parquet (single run/trip path).
             _auto_l2 = (
                 use_local
-                and not _legacy_monthly_chunks
                 and not getattr(args, "l2_training_bundle", None)
                 and not getattr(args, "no_l2_auto_bundle", False)
             )
@@ -9415,7 +9398,7 @@ def run_pipeline(args) -> None:
                 logger.warning(
                     "Validation set has only %d rows (MIN_VALID_TEST_ROWS=%d); "
                     "AP and Optuna results will be unreliable. "
-                    "Consider adding more --recent-chunks.",
+                    "Consider widening the training window (--days or explicit --start/--end).",
                     _n_valid_print, MIN_VALID_TEST_ROWS,
                 )
             if _n_test_print < MIN_VALID_TEST_ROWS:
@@ -9428,7 +9411,6 @@ def run_pipeline(args) -> None:
             # GitHub #17: materialize L2 bundle from Step 7 outputs, then train via L2 path (skip chunk 8–10).
             _auto_l2_post7 = (
                 use_local
-                and not _legacy_monthly_chunks
                 and not getattr(args, "l2_training_bundle", None)
                 and not getattr(args, "no_l2_auto_bundle", False)
             )
@@ -9826,7 +9808,7 @@ def run_pipeline(args) -> None:
                 effective_end=effective_end,
                 splits=_split_row_meta,
                 use_local_parquet=use_local,
-                recent_chunks=getattr(args, "recent_chunks", None),
+                recent_chunks=None,
                 sample_rated_n=sample_rated_n,
                 skip_optuna=skip_optuna,
                 neg_sample_frac_effective=_effective_neg_sample_frac,

@@ -1008,10 +1008,13 @@ def backtest(
     _track_llm_degraded = False
     _bundle_root = model_bundle_dir if model_bundle_dir is not None else _default_model_bundle_root()
     _spec_path = _bundle_root / "feature_spec.yaml"
-    if _spec_path.exists():
-        feature_spec = load_feature_spec(_spec_path)
-    else:
-        feature_spec = load_feature_spec(BASE_DIR / "feature_spec" / "feature_spec.yaml")
+    if not _spec_path.is_file():
+        raise FileNotFoundError(
+            "Bundle-only contract: feature_spec.yaml missing at %s. "
+            "Point model_bundle_dir to a trainer output directory that includes "
+            "the frozen feature_spec.yaml next to model.pkl." % (_spec_path,)
+        )
+    feature_spec = load_feature_spec(_spec_path)
     try:
         _bets_llm_result = compute_track_llm_features(
             bets,

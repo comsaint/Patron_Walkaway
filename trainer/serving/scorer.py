@@ -278,7 +278,9 @@ MODEL_DIR = (
     else (getattr(config, "DEFAULT_MODEL_DIR", None) or (BASE_DIR / "models"))
 )
 STATE_DIR.mkdir(parents=True, exist_ok=True)
-FEATURE_SPEC_PATH = BASE_DIR / "feature_spec" / "feature_spec.yaml"
+# Dev catalog only (not used at runtime; serving loads bundle ``feature_spec.yaml``).
+FEATURE_CANDIDATES_PATH = BASE_DIR / "feature_spec" / "feature_candidates.yaml"
+FEATURE_SPEC_PATH = FEATURE_CANDIDATES_PATH  # legacy alias for tooling/tests
 
 RETENTION_HOURS: int = getattr(config, "SCORER_STATE_RETENTION_HOURS", 48)
 SESSION_AVAIL_DELAY_MIN: int = getattr(config, "SESSION_AVAIL_DELAY_MIN", 15)
@@ -353,27 +355,20 @@ def load_dual_artifacts(model_dir: Optional[Path] = None) -> dict:
     if version_path.exists():
         artifacts["model_version"] = version_path.read_text(encoding="utf-8").strip()
 
-    # Track LLM: prefer the frozen feature_spec.yaml inside the model artifact
-    # directory (DEC-024 / R3507) for exact train-serve reproducibility.
-    # In deploy (d == MODEL_DIR from env), feature_spec.yaml is required; no fallback.
-    # Fall back to the repo feature spec (trainer/feature_spec/feature_spec.yaml) when frozen load fails.
+    # Bundle-only runtime contract: load frozen ``feature_spec.yaml`` next to model.pkl.
     _frozen_spec = d / "feature_spec.yaml"
-    if _frozen_spec.exists():
-        try:
-            artifacts["feature_spec"] = load_feature_spec(_frozen_spec)
-        except Exception as exc:
-            logger.warning("[scorer] frozen feature spec not loaded: %s; falling back to repo spec", exc)
-    if artifacts["feature_spec"] is None:
-        if d.resolve() == MODEL_DIR.resolve():
-            raise FileNotFoundError(
-                "feature_spec.yaml required in deploy but not found at %s. "
-                "Ensure the deploy package includes models/feature_spec.yaml." % _frozen_spec
-            )
-        if FEATURE_SPEC_PATH.exists():
-            try:
-                artifacts["feature_spec"] = load_feature_spec(FEATURE_SPEC_PATH)
-            except Exception as exc:
-                logger.warning("[scorer] feature spec not loaded: %s", exc)
+    if not _frozen_spec.is_file():
+        raise FileNotFoundError(
+            "Bundle-only contract: feature_spec.yaml missing at %s. "
+            "Deploy a model bundle produced by trainer (writes frozen spec + closure)."
+            % (_frozen_spec,)
+        )
+    try:
+        artifacts["feature_spec"] = load_feature_spec(_frozen_spec)
+    except Exception as exc:
+        raise RuntimeError(
+            "feature_spec.yaml exists but failed to load at %s: %s" % (_frozen_spec, exc)
+        ) from exc
 
     if feature_list_path.exists():
         with feature_list_path.open(encoding="utf-8") as fh:

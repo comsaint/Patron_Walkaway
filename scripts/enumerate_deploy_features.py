@@ -17,7 +17,7 @@ except ImportError as exc:  # pragma: no cover
     raise SystemExit(2) from exc
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_DEFAULT_SPEC = _REPO_ROOT / "package" / "deploy" / "models" / "feature_spec.yaml"
+_DEFAULT_SPEC = _REPO_ROOT / "trainer" / "feature_spec" / "feature_candidates.yaml"
 _DEFAULT_JSON = (
     _REPO_ROOT
     / "artifacts"

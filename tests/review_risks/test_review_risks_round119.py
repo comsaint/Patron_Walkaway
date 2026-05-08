@@ -13,7 +13,7 @@ class TestRound119Risks(unittest.TestCase):
         import trainer.features as features_mod
 
         yaml_path = (
-            Path(features_mod.__file__).parent.parent / "feature_spec" / "feature_spec.yaml"
+            Path(features_mod.__file__).parent.parent / "feature_spec" / "feature_candidates.yaml"
         )
         backup_path = yaml_path.with_suffix(".yaml.bak")
 
