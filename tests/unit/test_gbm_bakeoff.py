@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from typing import Any
 import lightgbm as lgb
 import numpy as np
@@ -13,7 +14,11 @@ from unittest.mock import patch
 pytest.importorskip("catboost")
 pytest.importorskip("xgboost")
 
-from trainer.training.gbm_bakeoff import BAKEOFF_BACKENDS, train_and_select_rated_gbm_family
+from trainer.training.gbm_bakeoff import (
+    BAKEOFF_BACKENDS,
+    _symmetric_bakeoff_hpo_enabled,
+    train_and_select_rated_gbm_family,
+)
 from trainer.training.oof_stacking import build_expanding_monthly_folds
 from trainer.training import trainer as trainer_mod
 
@@ -272,10 +277,14 @@ def test_train_and_select_rated_gbm_family_reports_stacking_skip_without_time_co
 
 
 def test_train_single_rated_model_releases_a3_bakeoff_temp_matrices() -> None:
-    src = inspect.getsource(trainer_mod.train_single_rated_model)
     anchor = "Peak-RAM cleanup: A3 may materialize rated valid/test splits from parquet"
+    src = inspect.getsource(trainer_mod.train_single_rated_model)
     i_anchor = src.find(anchor)
-    assert i_anchor > 0, "A3 bakeoff cleanup anchor must exist in train_single_rated_model"
+    if i_anchor < 0:
+        # Long test sessions: getsource can occasionally omit body; fall back to module file.
+        src = Path(trainer_mod.__file__).read_text(encoding="utf-8")
+        i_anchor = src.find(anchor)
+    assert i_anchor >= 0, "A3 bakeoff cleanup anchor must exist in train_single_rated_model"
     window = src[i_anchor : i_anchor + 700]
     assert "_compare_valid = None" in window
     assert "_compare_test = None" in window
@@ -638,3 +647,96 @@ def test_train_catboost_from_libsvm_disk_smoke(tmp_path) -> None:
     assert test_uri is not None
     scores = np.asarray(model.predict_proba(Pool(data=test_uri))[:, 1], dtype=float)
     assert scores.shape == (2,)
+    train_uri = getattr(model, "_gbm_bakeoff_train_libsvm_uri", None)
+    assert train_uri is not None
+
+
+def test_catboost_libsvm_one_based_cache_reports_hit_on_second_call(tmp_path: Path) -> None:
+    """Second call with same mtime should report cache_hit=True (Phase B observability)."""
+    from trainer.training.gbm_bakeoff_disk import catboost_libsvm_path_one_based_cached
+
+    src = tmp_path / "src.libsvm"
+    src.write_text("0 0:1\n")
+    cache_dir = tmp_path / "cb_cache"
+    p1, hit1 = catboost_libsvm_path_one_based_cached(src, cache_dir)
+    assert p1.is_file()
+    assert hit1 is False
+    p2, hit2 = catboost_libsvm_path_one_based_cached(src, cache_dir)
+    assert p2 == p1
+    assert hit2 is True
+
+
+def test_symmetric_bakeoff_hpo_env_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GBM_BAKEOFF_SYMMETRIC_HPO", raising=False)
+    assert _symmetric_bakeoff_hpo_enabled() is False
+    monkeypatch.setenv("GBM_BAKEOFF_SYMMETRIC_HPO", "1")
+    assert _symmetric_bakeoff_hpo_enabled() is True
+
+
+def test_iter_libsvm_nonempty_line_batches_sums_to_line_count(tmp_path: Path) -> None:
+    from trainer.training.gbm_bakeoff_disk import count_nonempty_lines, iter_libsvm_nonempty_line_batches
+
+    p = tmp_path / "t.libsvm"
+    p.write_text("0 0:1\n1 1:0.5\n\n0 1:2\n")
+    assert count_nonempty_lines(p) == 3
+    total = 0
+    for batch in iter_libsvm_nonempty_line_batches(p, 2):
+        total += len(batch)
+    assert total == 3
+
+
+def test_phase_e_train_metrics_ap_modes() -> None:
+    from trainer.training import trainer as tmod
+
+    y = pd.Series([0, 0, 1, 1, 0, 1], dtype=int)
+    s = np.array([0.1, 0.2, 0.9, 0.8, 0.15, 0.95], dtype=np.float64)
+    legacy = tmod._train_metrics_dict_from_y_scores(y, s, 0.5, log_results=False, ap_mode="legacy")
+    approx = tmod._train_metrics_dict_from_y_scores(y, s, 0.5, log_results=False, ap_mode="approx_histogram")
+    assert legacy["a3_ap_mode"] == "legacy"
+    assert approx["a3_ap_mode"] == "approx_histogram"
+    assert legacy["train_samples"] == 6
+    assert abs(float(legacy["train_ap"]) - float(approx["train_ap"])) < 0.35
+
+
+def test_predict_positive_scores_phase_e_xgboost_matches_full_uri(tmp_path: Path) -> None:
+    pytest.importorskip("xgboost")
+    import xgboost as xgb
+
+    from trainer.training.gbm_bakeoff_disk import (
+        predict_positive_scores_phase_e_libsvm,
+        xgboost_libsvm_uri,
+    )
+
+    train_p = tmp_path / "tr.libsvm"
+    train_p.write_text("0 0:1\n1 0:0.9\n0 0:0.4\n1 0:0.95\n")
+    cache_d = tmp_path / "cache"
+    uri = xgboost_libsvm_uri(train_p, external_memory=False, cache_dir=cache_d)
+    dtrain = xgb.DMatrix(uri, feature_names=["f0"])
+    booster = xgb.train(
+        {"objective": "binary:logistic", "max_depth": 2, "eta": 0.5, "eval_metric": "logloss"},
+        dtrain,
+        num_boost_round=8,
+        verbose_eval=False,
+    )
+    full = np.asarray(booster.predict(dtrain), dtype=np.float64).reshape(-1)
+
+    class _M:
+        booster_ = booster
+
+    scores, meta = predict_positive_scores_phase_e_libsvm(
+        backend="xgboost",
+        model=_M(),
+        libsvm_path=train_p,
+        feature_names=["f0"],
+        cache_dir=cache_d,
+        batch_rows=2,
+        use_memmap=False,
+        role="unit",
+    )
+    assert meta.get("a3_score_compute_mode") == "libsvm_streaming"
+    np.testing.assert_allclose(
+        np.asarray(scores, dtype=np.float64).reshape(-1),
+        full,
+        rtol=1e-5,
+        atol=1e-5,
+    )

@@ -228,6 +228,8 @@ deploy_dist/
 deploy_dist.zip
 model_*/
 .tmp/
+*.pkl
+
 # credential/ (PLAN: Credential folder consolidation). Ignore secrets; keep examples.
 credential/.env
 credential/mlflow.env

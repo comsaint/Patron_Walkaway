@@ -82,6 +82,21 @@ Notes
   LibSVM (and weight lines) before a second ``lgb.train`` with ``num_boost_round=best_iteration``.
   A3 CatBoost/XGBoost disk training **does not** fall back to in-memory fit in strict mode
   (disk failure is fatal). Set ``TRAINER_DISABLE_FINAL_REFIT_TRAIN_VALID=1`` to skip refit for debugging only.
+  In strict mode, missing train/valid LibSVM, empty train LibSVM, or single-class train LibSVM
+  **must not** silently fall back to in-memory training when LibSVM paths were requested.
+- **A3 bakeoff observability / fair HPO**: ``GBM_BAKEOFF_SYMMETRIC_HPO=1`` disables dividing the
+  global Optuna timeout by ``OPTUNA_ACTIVE_MODEL_COUNT_FOR_TOTAL_TIMEOUT_SPLIT`` so each optional
+  backend (CatBoost/XGBoost) gets the full configured wall budget. Training metrics and
+  ``gbm_bakeoff`` report may include ``lgb_train_dataset_bin_cache_hit``,
+  ``a3_catboost_libsvm_cache_hit_{train,valid,test}``, ``a3_xgboost_external_memory_train``,
+  ``a3_val_scores_data_source``, ``a3_train_metrics_data_source``, and ``optuna_hpo_data_source``
+  (e.g. ``libsvm_disk`` vs ``in_memory_dense``).
+- **A3 Phase E（#31）— 分批 LibSVM predict / memmap 分數**：可選降低 bakeoff 評估峰值 RAM。
+  - ``GBM_BAKEOFF_PREDICT_STREAMING=1``：對 A3 disk 路徑的 val/train/test 以 **分批 LibSVM 行** 推論（取代整檔單次 ``DMatrix``/``Pool``）。
+  - ``GBM_BAKEOFF_SCORE_MEMMAP=1``：串流分數寫入 bakeoff ``cache_dir`` 下 **float32 memmap**（路徑見 metrics ``a3_score_memmap_path``）。
+  - ``GBM_BAKEOFF_PREDICT_BATCH_ROWS``：每批行數（有上下限）；CLI 對應 ``--gbm-bakeoff-predict-batch-rows N``。
+  - ``GBM_BAKEOFF_AP_MODE``：``legacy``（sklearn AP）、``approx_histogram``（分箱近似 AP）、``exact_external_sort``（與 legacy 同 sklearn AP，名稱保留供對照）；CLI ``--gbm-bakeoff-ap-mode``。
+  - ``TRAINER_FILE_BACKED_STRICT=1`` 且啟用 Phase E 串流時，串流 predict **失敗則 fail-fast**（不 silent 回退）。
 
 A. Tables and the **dev** feature catalog change often; incremental rebuilds should
    touch only invalidated partitions / fingerprints (bridge + materialization cache keys).

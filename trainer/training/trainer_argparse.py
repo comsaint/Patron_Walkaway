@@ -158,6 +158,49 @@ def build_trainer_argparser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--gbm-bakeoff-predict-streaming",
+        dest="gbm_bakeoff_predict_streaming",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "A3 Phase E: batch LibSVM lines for val/train/test predict (XGB/CAT disk bakeoff). "
+            "When omitted, use GBM_BAKEOFF_PREDICT_STREAMING env or default (off)."
+        ),
+    )
+    parser.add_argument(
+        "--gbm-bakeoff-score-memmap",
+        dest="gbm_bakeoff_score_memmap",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "A3 Phase E: stream scores to float32 memmap under bakeoff cache_dir. "
+            "When omitted, use GBM_BAKEOFF_SCORE_MEMMAP env or default (off)."
+        ),
+    )
+    parser.add_argument(
+        "--gbm-bakeoff-predict-batch-rows",
+        dest="gbm_bakeoff_predict_batch_rows",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "A3 Phase E: LibSVM lines per predict batch (bounded). "
+            "When omitted, use GBM_BAKEOFF_PREDICT_BATCH_ROWS env or config default."
+        ),
+    )
+    parser.add_argument(
+        "--gbm-bakeoff-ap-mode",
+        dest="gbm_bakeoff_ap_mode",
+        type=str,
+        default=None,
+        choices=("legacy", "approx_histogram", "exact_external_sort"),
+        help=(
+            "A3 Phase E: train AP aggregation (legacy=sklearn AP; approx_histogram=binned estimate; "
+            "exact_external_sort=sklearn AP on materialised scores). "
+            "When omitted, use GBM_BAKEOFF_AP_MODE env or default legacy."
+        ),
+    )
+    parser.add_argument(
         "--disable-oof-stacking",
         action="store_true",
         help=(

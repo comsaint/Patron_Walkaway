@@ -1,7 +1,8 @@
 """Bridge ``parallel_lda_mvp`` snapshot outputs to trainer-shaped Parquet files.
 
-Writes under ``<data_dir>/mvp_trainer_bridge/`` (never overwrites L0
-``data/gmwds_t_bet.parquet`` / ``data/gmwds_t_session.parquet``). Optional run/trip LDA:
+Writes under ``<data_dir>/mvp_trainer_bridge/`` as ``trainer_bridge_bet.parquet`` /
+``trainer_bridge_session.parquet`` (never overwrites L0 ``data/gmwds_t_bet.parquet`` /
+``data/gmwds_t_session.parquet``). Optional run/trip LDA:
 left-join L1 ``run_fact`` + ``trip_run_map`` + ``trip_fact`` onto each bet
 (``player_id`` + ``payout_complete_dtm`` in ``[run_start_ts, run_end_ts]``),
 emitting fixed ``lda_*`` DOUBLE columns for Track LLM passthrough features.
@@ -34,11 +35,26 @@ LDA_RUN_TRIP_BET_COLUMNS: tuple[str, ...] = (
     "lda_l1_run_duration_min",
 )
 
-_ENV_BRIDGE_SKIP = "PARALLEL_LDA_BRIDGE_SKIP_IF_UNCHANGED"
 _ENV_DUCKDB_MEM = "PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT"
 
 # Subdir under ``data/`` for bridge outputs only (L0 stays at repo ``data/gmwds_t_*.parquet``).
 MVP_TRAINER_BRIDGE_SUBDIR = "mvp_trainer_bridge"
+# Bridge artifact filenames (distinct from L0 ``gmwds_t_*.parquet``).
+TRAINER_BRIDGE_BET_PARQUET_FILENAME = "trainer_bridge_bet.parquet"
+TRAINER_BRIDGE_SESSION_PARQUET_FILENAME = "trainer_bridge_session.parquet"
+# Pre-rename bridge outputs (skip-if-unchanged still accepts these for one upgrade cycle).
+_LEGACY_BRIDGE_BET_PARQUET = "gmwds_t_bet.parquet"
+_LEGACY_BRIDGE_SESSION_PARQUET = "gmwds_t_session.parquet"
+
+
+def _default_skip_if_unchanged() -> bool:
+    """Return whether emit should skip rebuild when fingerprint is unchanged."""
+    try:
+        import trainer.config as _tc  # type: ignore[import-not-found]
+
+        return bool(getattr(_tc, "TRAINER_BRIDGE_SKIP_IF_UNCHANGED", True))
+    except Exception:
+        return True
 
 
 def trainer_bridge_output_dir(data_dir: Path) -> Path:
@@ -51,24 +67,39 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _trainer_manifest_path_strict_enabled() -> bool:
+    """True when manifest emit/ingress should reject non-portable paths (default).
+
+    Mirrors ``trainer.training.data_sources._manifest_path_strict_enabled`` and
+    ``doc/pipeline requirements.md`` (``TRAINER_MANIFEST_PATH_STRICT``).
+    """
+    v = (os.environ.get("TRAINER_MANIFEST_PATH_STRICT") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 def _manifest_rel_path(target: Path, anchor: Path) -> str:
-    """Return a POSIX path relative to *anchor* (portable manifests; doc/pipeline requirements.md).
+    """Return a manifest path string: repo-relative to *anchor* when possible.
+
+    When ``TRAINER_MANIFEST_PATH_STRICT`` is unset or truthy (default ``1``), *target*
+    must lie under *anchor* so the manifest stays portable. Legacy hosts may set
+    ``TRAINER_MANIFEST_PATH_STRICT=0`` to emit an absolute resolved POSIX path instead.
 
     Raises
     ------
     ValueError
-        If *target* cannot be expressed relative to *anchor* (would require a machine-bound
-        absolute path in the manifest). Move inputs under the anchor or widen *anchor*.
+        If strict mode is on and *target* cannot be expressed relative to *anchor*.
     """
     t_r = target.resolve()
     a_r = anchor.resolve()
     try:
         return t_r.relative_to(a_r).as_posix()
     except ValueError as exc:
-        raise ValueError(
-            f"Cannot emit portable manifest path: {t_r} is not under anchor {a_r}. "
-            "Place trainer ingress artifacts under the repo (or adjust anchor) so paths stay relative."
-        ) from exc
+        if _trainer_manifest_path_strict_enabled():
+            raise ValueError(
+                f"Cannot emit portable manifest path: {t_r} is not under anchor {a_r}. "
+                "Place trainer ingress artifacts under the repo (or adjust anchor) so paths stay relative."
+            ) from exc
+        return t_r.as_posix()
 
 
 def _escape_sql_path(p: Path) -> str:
@@ -263,7 +294,7 @@ def emit_trainer_local_parquet(
     *,
     snap_root: Path,
     data_dir: Path,
-    enrich_bet_with_run_trip_lda: bool = True,
+    enrich_bet_with_run_trip_lda: bool = False,
     skip_if_unchanged: bool | None = None,
     duckdb_memory_limit: str | None = None,
 ) -> Path:
@@ -279,8 +310,9 @@ def emit_trainer_local_parquet(
         Project ``data/`` directory (parent of ``parallel_lda_mvp/``).
     enrich_bet_with_run_trip_lda : bool
         When True and L1 ``run_fact`` parquet exist, append ``LDA_RUN_TRIP_BET_COLUMNS`` via joins.
+        Default False (skip bet-level run/trip LDA columns; manifest ``bet_includes_run_trip_lda_columns`` false).
     skip_if_unchanged : bool | None
-        If None, read env ``PARALLEL_LDA_BRIDGE_SKIP_IF_UNCHANGED`` (``1`` = true).
+        If None, use ``trainer.config.TRAINER_BRIDGE_SKIP_IF_UNCHANGED`` (default True).
     duckdb_memory_limit : str | None
         DuckDB ``SET memory_limit`` value, e.g. ``'4GB'``. Env
         ``PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT`` when unset here.
@@ -306,11 +338,7 @@ def emit_trainer_local_parquet(
     data_dir = data_dir.resolve()
     bridge_dir = trainer_bridge_output_dir(data_dir)
     if skip_if_unchanged is None:
-        skip_if_unchanged = os.environ.get(_ENV_BRIDGE_SKIP, "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        skip_if_unchanged = _default_skip_if_unchanged()
     if duckdb_memory_limit is None:
         duckdb_memory_limit = os.environ.get(_ENV_DUCKDB_MEM, "").strip() or "4GB"
 
@@ -373,15 +401,14 @@ def emit_trainer_local_parquet(
     manifest_path = bridge_dir / "trainer_local_parquet_bridge.manifest.json"
     if skip_if_unchanged:
         old = _read_manifest(manifest_path)
-        if (
-            old
-            and old.get("input_fingerprint") == fp
-            and (bridge_dir / "gmwds_t_bet.parquet").is_file()
-            and (bridge_dir / "gmwds_t_session.parquet").is_file()
-        ):
+        bet_out = bridge_dir / TRAINER_BRIDGE_BET_PARQUET_FILENAME
+        sess_out = bridge_dir / TRAINER_BRIDGE_SESSION_PARQUET_FILENAME
+        bet_ok = bet_out.is_file() or (bridge_dir / _LEGACY_BRIDGE_BET_PARQUET).is_file()
+        sess_ok = sess_out.is_file() or (bridge_dir / _LEGACY_BRIDGE_SESSION_PARQUET).is_file()
+        if old and old.get("input_fingerprint") == fp and bet_ok and sess_ok:
             _bridge_echo(
                 "Output already matches current inputs (fingerprint unchanged) - skipping rebuild. "
-                f"Unset {_ENV_BRIDGE_SKIP} or set it to 0/false to force a full rebuild."
+                "Pass skip_if_unchanged=False to ``emit_trainer_local_parquet`` to force a full rebuild."
             )
             return manifest_path
 
@@ -408,12 +435,12 @@ def emit_trainer_local_parquet(
 
     bet_list_sql = ", ".join(f"'{_escape_sql_path(p)}'" for p in raw_bet_paths)
     bridge_dir.mkdir(parents=True, exist_ok=True)
-    out_bet = bridge_dir / "gmwds_t_bet.parquet"
-    out_sess = bridge_dir / "gmwds_t_session.parquet"
+    out_bet = bridge_dir / TRAINER_BRIDGE_BET_PARQUET_FILENAME
+    out_sess = bridge_dir / TRAINER_BRIDGE_SESSION_PARQUET_FILENAME
     tmp_dir = bridge_dir / ".trainer_bridge_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    bet_tmp = tmp_dir / f"gmwds_t_bet.parquet.tmp.{os.getpid()}"
-    sess_tmp = tmp_dir / f"gmwds_t_session.parquet.tmp.{os.getpid()}"
+    bet_tmp = tmp_dir / f"{TRAINER_BRIDGE_BET_PARQUET_FILENAME}.tmp.{os.getpid()}"
+    sess_tmp = tmp_dir / f"{TRAINER_BRIDGE_SESSION_PARQUET_FILENAME}.tmp.{os.getpid()}"
     _bridge_echo(
         f"Writing to a temp file, then installing as {out_bet} and {out_sess} "
         f"(your original bet Parquet paths are never overwritten)."

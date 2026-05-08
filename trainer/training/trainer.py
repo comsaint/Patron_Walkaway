@@ -99,6 +99,12 @@ from trainer.training.split_file_bundle import (
     validate_libsvm_paths_exist,
     write_split_manifest,
 )
+from trainer.training.pipeline_step_context import (
+    ensure_pipeline_step_log_filter_installed,
+    get_pipeline_step_label,
+    message_already_has_pipeline_step_prefix,
+    pipeline_step_set,
+)
 from trainer.training.two_stage import (
     A4_FUSION_MODE_PRODUCT,
     candidate_cutoff_from_threshold,
@@ -154,8 +160,31 @@ def pipeline_echo(msg: str) -> None:
 
     Prefer messages prefixed with ``Step N/11 —`` (``N`` in 0–10; optional ``7b``; 11 steps total) so
     terminal progress aligns with pipeline diagnostics step keys.
+
+    When :func:`pipeline_step_set` has bound a label and *msg* does not already start with
+    a canonical ``Step N/11`` marker, the label is prepended so every line matches logger output.
     """
-    print(f"{_PIPELINE_ECHO_PREFIX} {msg}", flush=True)
+    label = get_pipeline_step_label()
+    out = msg
+    if label and not message_already_has_pipeline_step_prefix(msg):
+        out = f"{label} — {msg}"
+    print(f"{_PIPELINE_ECHO_PREFIX} {out}", flush=True)
+
+
+def _run_pipeline_with_step_cleanup(fn: Callable[..., None]) -> Callable[..., None]:
+    """Install step log filter once and clear the step label after ``run_pipeline`` exits."""
+
+    from functools import wraps
+
+    @wraps(fn)
+    def _wrapped(args: Any) -> None:
+        ensure_pipeline_step_log_filter_installed()
+        try:
+            fn(args)
+        finally:
+            pipeline_step_set(None)
+
+    return _wrapped
 
 # MLflow namespace: keep this project isolated on shared tracking server.
 # Override via credential/mlflow.env (MLFLOW_EXPERIMENT_TRAIN).
@@ -3819,8 +3848,18 @@ def _split_alert_density_prefixed_dict(
     aph: Optional[float] = None
     meets: Optional[bool] = None
     if scores is not None:
-        s = np.asarray(scores, dtype=np.float64).reshape(-1)
-        alerts = int(np.sum(np.isfinite(s) & (s >= float(threshold))))
+        if isinstance(scores, np.memmap):
+            thr = float(threshold)
+            br = 500_000
+            n_tot = int(len(scores))
+            c_alerts = 0
+            for st in range(0, n_tot, br):
+                sc = np.asarray(scores[st : st + br], dtype=np.float64)
+                c_alerts += int(np.sum(np.isfinite(sc) & (sc >= thr)))
+            alerts = int(c_alerts)
+        else:
+            s = np.asarray(scores, dtype=np.float64).reshape(-1)
+            alerts = int(np.sum(np.isfinite(s) & (s >= float(threshold))))
         if wh_out is not None:
             aph = float(alerts) / float(wh_out)
             if obj_out is not None:
@@ -4737,6 +4776,8 @@ def run_backend_optuna_search(
         _manifest_pay["optuna_hpo_train_libsvm"] = str(_disk_tr_p.resolve())
         _manifest_pay["optuna_hpo_valid_libsvm"] = str(_disk_va_p.resolve())
         _manifest_pay["optuna_hpo_train_row_count"] = int(_disk_tr_rows)
+    else:
+        _manifest_pay["optuna_hpo_data_source"] = "in_memory_dense"
     if _sample_rows is not None:
         _manifest_pay["optuna_hpo_sample_rows_cap"] = int(_sample_rows)
     if _hpo_ratio is not None:
@@ -5487,24 +5528,100 @@ def _batched_model_positive_class_scores(
     return np.concatenate(parts, axis=0)
 
 
+def _histogram_average_precision_streaming(
+    y_arr: np.ndarray,
+    scores: Union[np.ndarray, np.memmap],
+    *,
+    n_bins: int = 256,
+    chunk_rows: int = 500_000,
+) -> float:
+    """Binned AP estimate for large / memmap-backed scores (Phase E ``approx_histogram``)."""
+    n = int(len(y_arr))
+    pos_total = int(np.sum(y_arr == 1.0))
+    neg_total = int(np.sum(y_arr == 0.0))
+    if pos_total < 1 or neg_total < 1:
+        return 0.0
+    smin = math.inf
+    smax = -math.inf
+    for st in range(0, n, chunk_rows):
+        sc = np.asarray(scores[st : st + chunk_rows], dtype=np.float64)
+        if sc.size == 0:
+            continue
+        smin = min(smin, float(np.min(sc)))
+        smax = max(smax, float(np.max(sc)))
+    if not math.isfinite(smin) or not math.isfinite(smax) or smax <= smin:
+        smax = smin + 1e-9
+    edges = np.linspace(smin, smax, num=n_bins + 1, dtype=np.float64)
+    pos_hist = np.zeros(n_bins, dtype=np.float64)
+    neg_hist = np.zeros(n_bins, dtype=np.float64)
+    for st in range(0, n, chunk_rows):
+        yc = np.asarray(y_arr[st : st + chunk_rows], dtype=np.float64)
+        sc = np.asarray(scores[st : st + chunk_rows], dtype=np.float64)
+        m1 = yc == 1.0
+        m0 = yc == 0.0
+        if bool(np.any(m1)):
+            pos_hist += np.histogram(sc[m1], bins=edges)[0].astype(np.float64)
+        if bool(np.any(m0)):
+            neg_hist += np.histogram(sc[m0], bins=edges)[0].astype(np.float64)
+    ap = 0.0
+    r_prev = 0.0
+    cum_pos = 0.0
+    cum_neg = 0.0
+    for b in range(n_bins - 1, -1, -1):
+        cum_pos += float(pos_hist[b])
+        cum_neg += float(neg_hist[b])
+        den = cum_pos + cum_neg
+        prec = float(cum_pos / den) if den > 0.0 else 0.0
+        rec = float(cum_pos / pos_total) if pos_total > 0 else 0.0
+        ap += max(0.0, rec - r_prev) * prec
+        r_prev = rec
+    return float(ap)
+
+
+def _tp_fp_fn_at_threshold_streaming(
+    y_arr: np.ndarray,
+    scores: Union[np.ndarray, np.memmap],
+    threshold: float,
+    *,
+    chunk_rows: int = 500_000,
+) -> tuple[int, int, int]:
+    """Threshold confusion counts without full dense score materialisation."""
+    n = int(len(y_arr))
+    tp = fp = fn = 0
+    thr = float(threshold)
+    for st in range(0, n, chunk_rows):
+        yc = np.asarray(y_arr[st : st + chunk_rows], dtype=float)
+        sc = np.asarray(scores[st : st + chunk_rows], dtype=np.float64)
+        pr = sc >= thr
+        tp += int(np.sum(pr & (yc == 1.0)))
+        fp += int(np.sum(pr & (yc == 0.0)))
+        fn += int(np.sum((~pr) & (yc == 1.0)))
+    return tp, fp, fn
+
+
 def _train_metrics_dict_from_y_scores(
     y_train: Union[np.ndarray, pd.Series],
-    train_scores: np.ndarray,
+    train_scores: Union[np.ndarray, np.memmap],
     threshold: float,
     label: str = "",
     log_results: bool = True,
     *,
     train_window_hours: Optional[float] = None,
+    ap_mode: Optional[str] = None,
 ) -> dict:
     """Build train_* metrics from parallel label/score arrays (same rules as legacy train metrics)."""
     _obj_ft = _field_test_hpo_min_alerts_per_hour_for_reports()
     y_arr = np.asarray(y_train, dtype=float).reshape(-1)
-    scores_arr = np.asarray(train_scores, dtype=float).reshape(-1)
+    scores_arr = train_scores  # may be memmap float32 (Phase E)
     if len(y_arr) != len(scores_arr):
         n_fix = min(len(y_arr), len(scores_arr))
         y_arr = y_arr[:n_fix]
         scores_arr = scores_arr[:n_fix]
     n_tr = int(len(y_arr))
+    mode_raw = ap_mode if ap_mode is not None else (os.getenv("GBM_BAKEOFF_AP_MODE") or "legacy")
+    ap_mode_eff = str(mode_raw).strip().lower()
+    if ap_mode_eff not in ("legacy", "approx_histogram", "exact_external_sort"):
+        ap_mode_eff = "legacy"
     if n_tr == 0:
         return {
             "train_ap": 0.0,
@@ -5514,6 +5631,7 @@ def _train_metrics_dict_from_y_scores(
             "train_samples": 0,
             "train_positives": 0,
             "train_random_ap": 0.0,
+            "a3_ap_mode": ap_mode_eff,
             **_split_alert_density_prefixed_dict(
                 "train",
                 scores=None,
@@ -5524,7 +5642,17 @@ def _train_metrics_dict_from_y_scores(
         }
     n_tr_pos = int(np.sum(y_arr == 1))
     train_random_ap = (n_tr_pos / n_tr) if n_tr > 0 else 0.0
-    if not np.isfinite(scores_arr).all():
+    _fin_ok = True
+    _chk = 500_000
+    if isinstance(scores_arr, np.memmap) or n_tr > _chk:
+        for st in range(0, n_tr, _chk):
+            sc = np.asarray(scores_arr[st : st + _chk], dtype=np.float64)
+            if sc.size and not np.isfinite(sc).all():
+                _fin_ok = False
+                break
+    else:
+        _fin_ok = bool(np.isfinite(np.asarray(scores_arr, dtype=np.float64).reshape(-1)).all())
+    if not _fin_ok:
         logger.warning(
             "%s train: scores contain non-finite values — train metrics set to zero.",
             label or "model",
@@ -5537,6 +5665,7 @@ def _train_metrics_dict_from_y_scores(
             "train_samples": n_tr,
             "train_positives": n_tr_pos,
             "train_random_ap": train_random_ap,
+            "a3_ap_mode": ap_mode_eff,
             **_split_alert_density_prefixed_dict(
                 "train",
                 scores=None,
@@ -5548,11 +5677,25 @@ def _train_metrics_dict_from_y_scores(
     has_both = n_tr_pos >= 1 and (n_tr - n_tr_pos) >= 1
     # sklearn average_precision_score requires binary {0,1} y; use strict-positive mask only for AP.
     y_ap = np.asarray(y_arr == 1, dtype=np.float64).reshape(-1)
-    train_prauc = float(average_precision_score(y_ap, scores_arr)) if has_both else 0.0
-    preds = (scores_arr >= threshold).astype(int)
-    tp = int(((preds == 1) & (y_arr == 1)).sum())
-    fp = int(((preds == 1) & (y_arr == 0)).sum())
-    fn = int(((preds == 0) & (y_arr == 1)).sum())
+    if has_both:
+        if ap_mode_eff == "approx_histogram":
+            train_prauc = float(
+                _histogram_average_precision_streaming(y_arr, scores_arr, n_bins=256, chunk_rows=500_000)
+            )
+        else:
+            train_prauc = float(
+                average_precision_score(y_ap, np.asarray(scores_arr, dtype=np.float64).reshape(-1))
+            )
+    else:
+        train_prauc = 0.0
+    if isinstance(scores_arr, np.memmap) or n_tr > 1_000_000:
+        tp, fp, fn = _tp_fp_fn_at_threshold_streaming(y_arr, scores_arr, float(threshold))
+    else:
+        scores_dense = np.asarray(scores_arr, dtype=np.float64).reshape(-1)
+        preds = (scores_dense >= float(threshold)).astype(int)
+        tp = int(((preds == 1) & (y_arr == 1)).sum())
+        fp = int(((preds == 1) & (y_arr == 0)).sum())
+        fn = int(((preds == 0) & (y_arr == 1)).sum())
     prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
@@ -5569,6 +5712,7 @@ def _train_metrics_dict_from_y_scores(
         "train_samples": n_tr,
         "train_positives": n_tr_pos,
         "train_random_ap": train_random_ap,
+        "a3_ap_mode": ap_mode_eff,
         **_split_alert_density_prefixed_dict(
             "train",
             scores=scores_arr,
@@ -6006,6 +6150,11 @@ def train_single_rated_model(
         _t, _v = train_libsvm_paths
         if _t.exists() and _v.exists():
             use_from_libsvm = True
+        elif trainer_file_backed_strict_enabled():
+            raise FileNotFoundError(
+                "TRAINER_FILE_BACKED_STRICT: train_libsvm_paths set but train or valid "
+                f"LibSVM is missing ({_t} / {_v})."
+            )
         else:
             logger.warning(
                 "train_libsvm_paths set but files missing (%s / %s); using in-memory training.",
@@ -6031,6 +6180,11 @@ def train_single_rated_model(
         with open(train_libsvm_p, encoding="utf-8") as _f:
             _n_lines = sum(1 for _ in _f)
         if _n_lines < 1:
+            if trainer_file_backed_strict_enabled():
+                raise RuntimeError(
+                    "TRAINER_FILE_BACKED_STRICT: train LibSVM has 0 lines; "
+                    "cannot fall back to in-memory training."
+                )
             logger.warning(
                 "Plan B+: train LibSVM has 0 lines; falling back to in-memory training."
             )
@@ -6040,6 +6194,11 @@ def train_single_rated_model(
             with open(train_libsvm_p, encoding="utf-8") as _f:
                 _labels = [line.split(None, 1)[0] for line in _f if line.strip()]
             if len(set(_labels)) < 2:
+                if trainer_file_backed_strict_enabled():
+                    raise RuntimeError(
+                        "TRAINER_FILE_BACKED_STRICT: train LibSVM has only one class; "
+                        "cannot fall back to in-memory training."
+                    )
                 logger.warning(
                     "Plan B+: train LibSVM has only one class; falling back to in-memory training."
                 )
@@ -6425,6 +6584,7 @@ def train_single_rated_model(
         # LibSVM export uses 0-based feature indices (0..49 for 50 features) so LightGBM infers num_feature=50 and matches feature_name.
         _libsvm_temp_to_remove: Optional[Path] = None
         _lgb_ds_params = _lgb_dataset_params_for_pipeline()
+        _lgb_train_bin_cache_hit = bool(_bin_path.is_file())
         if _bin_path.is_file():
             dtrain = lgb.Dataset(str(_bin_path), params=_lgb_ds_params)
             dvalid = lgb.Dataset(
@@ -6674,6 +6834,7 @@ def train_single_rated_model(
                 if trainer_file_backed_strict_enabled()
                 else "file_backed_libsvm"
             ),
+            "lgb_train_dataset_bin_cache_hit": bool(_lgb_train_bin_cache_hit),
         }
         if _optuna_hpo_manifest:
             _h0 = _optuna_hpo_manifest[0]
@@ -7186,6 +7347,11 @@ def train_single_rated_model(
                         cache_dir=bakeoff_cache_dir(Path(_tp).parent, _tmp_bundle),
                     )
                 except Exception as _bundle_exc:
+                    if trainer_file_backed_strict_enabled():
+                        raise RuntimeError(
+                            "TRAINER_FILE_BACKED_STRICT: A3 LibSVM-disk bundle build failed "
+                            f"({_bundle_exc})"
+                        ) from _bundle_exc
                     logger.warning(
                         "A3 LibSVM-disk bundle not used (falling back to in-memory optional backends): %s",
                         _bundle_exc,
@@ -7219,6 +7385,8 @@ def train_single_rated_model(
             metrics["a3_eval_valid_source"] = _a3_eval_valid_source
             metrics["a3_eval_test_source"] = _a3_eval_test_source
             metrics["gbm_bakeoff"] = _bake_report
+            metrics["trainer_file_backed_strict"] = bool(trainer_file_backed_strict_enabled())
+            metrics["a3_libsvm_disk_bundle_used"] = bool(_bake_libsvm_bundle is not None)
             metrics["selected_backend"] = _winner_backend
             metrics["selected_backend_source"] = "a3_gbm_family_compare"
             metrics["model_kind"] = _winner_art.get("model_kind", _winner_backend)
@@ -8426,6 +8594,7 @@ def _write_pipeline_diagnostics_json(
     pipeline_started_at: str,
     pipeline_finished_at: str,
     total_duration_sec: float,
+    step0_duration_sec: Optional[float] = None,
     step1_duration_sec: Optional[float] = None,
     step2_duration_sec: Optional[float] = None,
     step3_duration_sec: Optional[float] = None,
@@ -8433,6 +8602,7 @@ def _write_pipeline_diagnostics_json(
     step5_duration_sec: Optional[float] = None,
     step6_duration_sec: Optional[float] = None,
     step7_duration_sec: Optional[float] = None,
+    step7b_duration_sec: Optional[float] = None,
     step8_duration_sec: Optional[float] = None,
     step9_duration_sec: Optional[float] = None,
     step10_duration_sec: Optional[float] = None,
@@ -8489,6 +8659,7 @@ def _write_pipeline_diagnostics_json(
         "pipeline_started_at": pipeline_started_at,
         "pipeline_finished_at": pipeline_finished_at,
         "total_duration_sec": total_duration_sec,
+        "step0_duration_sec": step0_duration_sec,
         "step1_duration_sec": step1_duration_sec,
         "step2_duration_sec": step2_duration_sec,
         "step3_duration_sec": step3_duration_sec,
@@ -8496,6 +8667,7 @@ def _write_pipeline_diagnostics_json(
         "step5_duration_sec": step5_duration_sec,
         "step6_duration_sec": step6_duration_sec,
         "step7_duration_sec": step7_duration_sec,
+        "step7b_duration_sec": step7b_duration_sec,
         "step8_duration_sec": step8_duration_sec,
         "step9_duration_sec": step9_duration_sec,
         "step10_duration_sec": step10_duration_sec,
@@ -8546,8 +8718,11 @@ def _write_pipeline_diagnostics_json(
 # Main training pipeline
 # ---------------------------------------------------------------------------
 
+@_run_pipeline_with_step_cleanup
 def run_pipeline(args) -> None:
     """Phase-1 training pipeline entry point."""
+    pipeline_step_set("Step 0/11")
+    step0_duration_sec: Optional[float] = None
     pipeline_start = time.perf_counter()
     pipeline_started_at_iso = datetime.now(timezone.utc).isoformat()
     start, end = parse_window(args)
@@ -8574,6 +8749,22 @@ def run_pipeline(args) -> None:
     _cli_cbq = getattr(args, "gbm_bakeoff_catboost_quantize", None)
     if _cli_cbq is not None:
         setattr(_cfg, "GBM_BAKEOFF_CATBOOST_QUANTIZE", bool(_cli_cbq))
+    _cli_pstr = getattr(args, "gbm_bakeoff_predict_streaming", None)
+    if _cli_pstr is not None:
+        setattr(_cfg, "GBM_BAKEOFF_PREDICT_STREAMING", bool(_cli_pstr))
+        os.environ["GBM_BAKEOFF_PREDICT_STREAMING"] = "1" if _cli_pstr else "0"
+    _cli_smm = getattr(args, "gbm_bakeoff_score_memmap", None)
+    if _cli_smm is not None:
+        setattr(_cfg, "GBM_BAKEOFF_SCORE_MEMMAP", bool(_cli_smm))
+        os.environ["GBM_BAKEOFF_SCORE_MEMMAP"] = "1" if _cli_smm else "0"
+    _cli_pbr = getattr(args, "gbm_bakeoff_predict_batch_rows", None)
+    if _cli_pbr is not None:
+        setattr(_cfg, "GBM_BAKEOFF_PREDICT_BATCH_ROWS", int(_cli_pbr))
+        os.environ["GBM_BAKEOFF_PREDICT_BATCH_ROWS"] = str(int(_cli_pbr))
+    _cli_apm = getattr(args, "gbm_bakeoff_ap_mode", None)
+    if _cli_apm is not None:
+        setattr(_cfg, "GBM_BAKEOFF_AP_MODE", str(_cli_apm).strip().lower())
+        os.environ["GBM_BAKEOFF_AP_MODE"] = str(_cli_apm).strip().lower()
     if bool(getattr(args, "disable_oof_stacking", False)):
         setattr(_cfg, "OOF_STACKING_ENABLED", False)
     logger.info("Precision uplift A3 gbm_bakeoff_enabled=%s", pipeline_gbm_bakeoff)
@@ -8611,7 +8802,8 @@ def run_pipeline(args) -> None:
     run_cross_entry_data_preflight(
         entry="trainer", use_local_parquet=bool(use_local), logger=logger
     )
-    pipeline_echo(f"Step 0/11 — Preflight — done in {time.perf_counter() - _pf0:.1f}s")
+    step0_duration_sec = time.perf_counter() - _pf0
+    pipeline_echo(f"Step 0/11 — Preflight — done in {step0_duration_sec:.1f}s")
 
     # Auto-adjust window to actual data end when using local Parquet without
     # explicit --start/--end (anchored to observed data end, not "today").
@@ -8661,6 +8853,7 @@ def run_pipeline(args) -> None:
             step5_duration_sec: Optional[float] = None
             step6_duration_sec: Optional[float] = None
             step7_duration_sec: Optional[float] = None
+            step7b_duration_sec: Optional[float] = None
             step8_duration_sec: Optional[float] = None
             step9_duration_sec: Optional[float] = None
             step10_duration_sec: Optional[float] = None
@@ -8699,6 +8892,7 @@ def run_pipeline(args) -> None:
             if _l2_bundle_arg:
                 from trainer.training.pipeline_l2_bundle import execute_l2_training_bundle
 
+                pipeline_step_set("Step 8/11")
                 pipeline_echo(
                     "Step 8/11 — L2 bundle (CLI) — Steps 1–7/11 skipped; "
                     "loading bundle then Steps 8–10/11 …"
@@ -8718,6 +8912,7 @@ def run_pipeline(args) -> None:
                 return
 
             # 1. Training window: single run/trip-level slice (no monthly partition).
+            pipeline_step_set("Step 1/11")
             _chunk_mode_label = "single-window"
             pipeline_echo(
                 f"Step 1/11 — Training window {start.date()} → {end.date()} "
@@ -8796,6 +8991,7 @@ def run_pipeline(args) -> None:
             # 2. Window-count partition — used ONLY to derive train_end for the canonical
             #    mapping cutoff (B1 / R25 identity-leakage guard).  The actual row
             #    assignment to train/valid/test happens later at row level (SSOT §9.2).
+            pipeline_step_set("Step 2/11")
             pipeline_echo("Step 2/11 — Partition windows for train_end cutoff (B1) …")
             t0 = time.perf_counter()
             _window_partition = partition_windows_for_train_end_cutoff(chunks)
@@ -8840,6 +9036,7 @@ def run_pipeline(args) -> None:
             #    identity links that arose after training from leaking into training data).
             #    Also get FND-12 dummy player_ids so we drop them from training (TRN-04).
             #    PLAN steps 4/7/8: local path may load from artifact; else DuckDB or pandas build; write after build.
+            pipeline_step_set("Step 3/11")
             pipeline_echo("Step 3/11 — Build canonical identity mapping …")
             t0 = time.perf_counter()
             logger.info("Building canonical identity mapping (cutoff=%s)…", train_end)
@@ -8988,6 +9185,7 @@ def run_pipeline(args) -> None:
                 and not getattr(args, "no_l2_auto_bundle", False)
             )
             if _auto_l2:
+                pipeline_step_set("Step 8/11")
                 from trainer.training.l2_bundle_materialize import (
                     auto_bundle_cache_is_current,
                     bridge_manifest_stat_token,
@@ -9042,7 +9240,8 @@ def run_pipeline(args) -> None:
                         pipeline_gbm_bakeoff=pipeline_gbm_bakeoff,
                     )
                     return
-        
+
+            pipeline_step_set("Step 3/11")
             # Rated-patron sampling is an independent option controlled by --sample-rated N.
             rated_whitelist: Optional[set] = None
             if sample_rated_n is not None and not canonical_map.empty:
@@ -9058,7 +9257,8 @@ def run_pipeline(args) -> None:
                     "--sample-rated: sampled %d / %d rated canonical_ids (deterministic sort+head)",
                     len(rated_whitelist), canonical_map["canonical_id"].nunique(),
                 )
-        
+
+            pipeline_step_set("Step 4/11")
             # 3b. Auto-check local player_profile freshness and backfill missing
             #     ranges before training starts (one-command flow, OOM-safe helper).
             _player_asset_raw = (os.environ.get("TRAINER_PLAYER_LAYER_ASSET_PATH") or "").strip()
@@ -9090,6 +9290,7 @@ def run_pipeline(args) -> None:
                 pipeline_echo(f"Step 4/11 — done in {_el:.1f}s")
                 logger.info("ensure_player_profile_ready: %.1fs", _el)
 
+            pipeline_step_set("Step 5/11")
             # 3c. Load player_profile once for the entire training window (PLAN Step 4).
             #     Pass the resulting DataFrame to every process_chunk call so each chunk
             #     can do the PIT/as-of join without re-querying.  If load fails, profile
@@ -9149,7 +9350,8 @@ def run_pipeline(args) -> None:
                 else:
                     pipeline_echo(f"Step 5/11 — done in {_el:.1f}s (profile not available)")
                     logger.info("player_profile: not available — profile features will be NaN (%.1fs)", _el)
-        
+
+            pipeline_step_set("Step 6/11")
             feature_spec = load_feature_spec(FEATURE_SPEC_PATH)
             try:
                 feature_spec_hash = hashlib.md5(Path(FEATURE_SPEC_PATH).read_bytes()).hexdigest()[:12]
@@ -9814,6 +10016,7 @@ def run_pipeline(args) -> None:
                 # If psutil is unavailable, still tag so MLflow run can be diagnosed.
                 log_tags_safe({"memory_sampling": "disabled_no_psutil"})
 
+            pipeline_step_set("Step 7/11")
             pipeline_echo("Step 7/11 — Load chunks, concat, row-level train/valid/test split …")
             t0 = time.perf_counter()
             _chunk_total_bytes = sum(Path(p).stat().st_size for p in chunk_paths)
@@ -9874,6 +10077,8 @@ def run_pipeline(args) -> None:
             train_df, valid_df, test_df, step7_train_path, step7_valid_path, step7_test_path = _step7_result
             # GitHub #19: apply negative downsampling on train split only (valid/test stay full).
             if _effective_neg_sample_frac < 1.0 - 1e-12:
+                pipeline_step_set("Step 7b/11")
+                _t7b0 = time.perf_counter()
                 _train_rs = int(
                     hashlib.md5(
                         f"{effective_start.isoformat()}|{effective_end.isoformat()}".encode()
@@ -9896,9 +10101,12 @@ def run_pipeline(args) -> None:
                         neg_sample_frac=_effective_neg_sample_frac,
                         random_state=_train_rs,
                     )
+                step7b_duration_sec = time.perf_counter() - _t7b0
                 pipeline_echo(
-                    f"Step 7b/11 — done (train-only neg-sample frac={_effective_neg_sample_frac:.4f})"
+                    f"Step 7b/11 — done in {step7b_duration_sec:.1f}s "
+                    f"(train-only neg-sample frac={_effective_neg_sample_frac:.4f})"
                 )
+            pipeline_step_set("Step 7/11")
             step8_screen_sample_strategy = _step8_resolve_sample_strategy(
                 getattr(_cfg, "STEP8_SCREEN_SAMPLE_STRATEGY", STEP8_SCREEN_SAMPLE_STRATEGY)
             )
@@ -10112,6 +10320,7 @@ def run_pipeline(args) -> None:
                     _n_test_print, MIN_VALID_TEST_ROWS,
                 )
 
+            pipeline_step_set("Step 8/11")
             # GitHub #17: materialize L2 bundle from Step 7 outputs, then train via L2 path (skip chunk 8–10).
             _auto_l2_post7 = (
                 use_local
@@ -10224,12 +10433,17 @@ def run_pipeline(args) -> None:
             # Only screen columns that actually exist in train (or train sample when B+ on disk).
             _present_candidate_cols = [c for c in _all_candidate_cols if c in _train_cols]
             if not _present_candidate_cols:
+                _t8_skip = time.perf_counter()
                 logger.warning(
                     "screen_features: no candidate columns found in train_df — skipping screening"
                 )
                 # R1004: restrict active_feature_cols to columns actually present in train.
                 active_feature_cols = [c for c in active_feature_cols if c in _train_cols]
-                pipeline_echo("Step 8/11 — Feature screening skipped (no candidates in train)")
+                step8_duration_sec = time.perf_counter() - _t8_skip
+                pipeline_echo(
+                    f"Step 8/11 — Feature screening skipped (no candidates in train) — "
+                    f"done in {step8_duration_sec:.1f}s"
+                )
             else:
                 # PLAN 方案 B 策略 A / B+ Stage 2: use sample from memory or from file (_train_for_screen from _read_parquet_head when on disk).
                 # Step 8 DuckDB std (PLAN): pass train_path or train_df so zv is computed on full data via DuckDB; keep _matrix_for_screen as sample to avoid OOM in corr/MI/LGBM.
@@ -10427,6 +10641,7 @@ def run_pipeline(args) -> None:
                     test_df[_placeholder_col] = 0.0
                 active_feature_cols = [_placeholder_col]
         
+            pipeline_step_set("Step 9/11")
             # Plan B: export train/valid to CSV when training from file (PLAN 方案 B §3).
             # Skip when B+ LibSVM path (valid_df not loaded) — validation uses LibSVM from file.
             if STEP9_TRAIN_FROM_FILE and train_df is not None and valid_df is not None:
@@ -10496,7 +10711,8 @@ def run_pipeline(args) -> None:
             valid_df = None
             test_df = None
             gc.collect()
-        
+
+            pipeline_step_set("Step 10/11")
             # 7. Save artifacts (versioned subdir under MODEL_DIR; see Priority 1 investigation plan).
             pipeline_echo("Step 10/11 — Save artifact bundle …")
             t0 = time.perf_counter()
@@ -10614,6 +10830,7 @@ def run_pipeline(args) -> None:
                     pipeline_started_at=pipeline_started_at_iso,
                     pipeline_finished_at=_pipeline_finished_at_iso,
                     total_duration_sec=total_sec,
+                    step0_duration_sec=step0_duration_sec,
                     step1_duration_sec=step1_duration_sec,
                     step2_duration_sec=step2_duration_sec,
                     step3_duration_sec=step3_duration_sec,
@@ -10621,6 +10838,7 @@ def run_pipeline(args) -> None:
                     step5_duration_sec=step5_duration_sec,
                     step6_duration_sec=step6_duration_sec,
                     step7_duration_sec=step7_duration_sec,
+                    step7b_duration_sec=step7b_duration_sec,
                     step8_duration_sec=step8_duration_sec,
                     step9_duration_sec=step9_duration_sec,
                     step10_duration_sec=step10_duration_sec,
@@ -10752,6 +10970,7 @@ def run_pipeline(args) -> None:
                 mlflow_metrics.update(
                     {
                         "total_duration_sec": total_sec,
+                        "step0_duration_sec": step0_duration_sec,
                         "step1_duration_sec": step1_duration_sec,
                         "step2_duration_sec": step2_duration_sec,
                         "step3_duration_sec": step3_duration_sec,
@@ -10759,6 +10978,7 @@ def run_pipeline(args) -> None:
                         "step5_duration_sec": step5_duration_sec,
                         "step6_duration_sec": step6_duration_sec,
                         "step7_duration_sec": step7_duration_sec,
+                        "step7b_duration_sec": step7b_duration_sec,
                         "step8_duration_sec": step8_duration_sec,
                         "step9_duration_sec": step9_duration_sec,
                         "step10_duration_sec": step10_duration_sec,

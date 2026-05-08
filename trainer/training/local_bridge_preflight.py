@@ -215,7 +215,7 @@ def _run_bridge_emit_only(
         written = emit_trainer_local_parquet(
             snap_root=snap,
             data_dir=data_sources.LOCAL_PARQUET_DIR.resolve(),
-            enrich_bet_with_run_trip_lda=True,
+            enrich_bet_with_run_trip_lda=False,
         )
     except Exception as exc:
         raise RuntimeError(

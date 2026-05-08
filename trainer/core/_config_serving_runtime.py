@@ -99,6 +99,11 @@ else:
 
 DISABLE_PROGRESS_BAR = False
 
+# MVP trainer local Parquet bridge (``parallel_lda_mvp.trainer_bridge_mvp``): when True,
+# skip DuckDB rebuild if bridge manifest ``input_fingerprint`` matches current inputs and
+# bridge Parquet outputs already exist. Tunable via ``trainer.core.config`` (not env).
+TRAINER_BRIDGE_SKIP_IF_UNCHANGED: bool = True
+
 TABLE_STATUS_REFRESH_SECONDS = 45
 TABLE_STATUS_LOOKBACK_HOURS = 12
 TABLE_STATUS_RETENTION_HOURS = 24

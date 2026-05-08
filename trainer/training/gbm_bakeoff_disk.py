@@ -18,11 +18,281 @@ import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
 from trainer.core import config as _cfg
+
+_PHASE_E_BATCH_CAP = 2_000_000
+_PHASE_E_BATCH_FLOOR = 100
+_PHASE_E_DEFAULT_BATCH = 50_000
+
+
+def phase_e_predict_streaming_enabled() -> bool:
+    """Phase E: batch LibSVM lines for predict (lower peak RAM than full-file DMatrix/Pool)."""
+    cfg_v = getattr(_cfg, "GBM_BAKEOFF_PREDICT_STREAMING", None)
+    if cfg_v is not None:
+        return bool(cfg_v)
+    raw = (os.getenv("GBM_BAKEOFF_PREDICT_STREAMING") or "").strip().lower()
+    return bool(raw) and raw in ("1", "true", "t", "yes", "y")
+
+
+def phase_e_score_memmap_enabled() -> bool:
+    """Phase E: write streamed positive-class scores to float32 memmap under bakeoff cache_dir."""
+    cfg_v = getattr(_cfg, "GBM_BAKEOFF_SCORE_MEMMAP", None)
+    if cfg_v is not None:
+        return bool(cfg_v)
+    raw = (os.getenv("GBM_BAKEOFF_SCORE_MEMMAP") or "").strip().lower()
+    return bool(raw) and raw in ("1", "true", "t", "yes", "y")
+
+
+def phase_e_ap_mode() -> str:
+    """Train AP aggregation mode for Phase E metrics: ``legacy|approx_histogram|exact_external_sort``."""
+    cfg_v = getattr(_cfg, "GBM_BAKEOFF_AP_MODE", None)
+    if isinstance(cfg_v, str) and cfg_v.strip():
+        s = cfg_v.strip().lower()
+        if s in ("approx_histogram", "exact_external_sort", "legacy"):
+            return s
+    v = (os.getenv("GBM_BAKEOFF_AP_MODE") or "").strip().lower()
+    if v in ("approx_histogram", "exact_external_sort", "legacy"):
+        return v
+    return "legacy"
+
+
+def phase_e_predict_batch_rows() -> int:
+    """Rows per LibSVM batch for Phase E streaming predict (bounded)."""
+    cfg_n = getattr(_cfg, "GBM_BAKEOFF_PREDICT_BATCH_ROWS", None)
+    if cfg_n is not None:
+        try:
+            n = int(cfg_n)
+        except (TypeError, ValueError):
+            n = _PHASE_E_DEFAULT_BATCH
+    else:
+        raw = os.getenv("GBM_BAKEOFF_PREDICT_BATCH_ROWS")
+        if raw is None or not str(raw).strip():
+            n = _PHASE_E_DEFAULT_BATCH
+        else:
+            try:
+                n = int(str(raw).strip())
+            except ValueError:
+                n = _PHASE_E_DEFAULT_BATCH
+    return max(_PHASE_E_BATCH_FLOOR, min(int(n), _PHASE_E_BATCH_CAP))
+
+
+def iter_libsvm_nonempty_line_batches(path: Path, batch_rows: int) -> Iterator[List[str]]:
+    """Yield batches of non-empty LibSVM text lines (no trailing newlines in each line string)."""
+    br = max(_PHASE_E_BATCH_FLOOR, min(int(batch_rows), _PHASE_E_BATCH_CAP))
+    batch: List[str] = []
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            batch.append(line)
+            if len(batch) >= br:
+                yield batch
+                batch = []
+    if batch:
+        yield batch
+
+
+def _xgb_booster_predict_libsvm_line_batches(
+    booster: Any,
+    feature_names: Sequence[str],
+    line_batches: Iterator[List[str]],
+    cache_dir: Path,
+) -> np.ndarray:
+    """Concatenate positive-class predictions for each LibSVM line batch (0-based indices)."""
+    import xgboost as xgb
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    chunk_path = cache_dir / f"_phase_e_xgb_chunk_{os.getpid()}.libsvm"
+    parts: list[np.ndarray] = []
+    for lines in line_batches:
+        if not lines:
+            continue
+        blob = "\n".join(lines) + "\n"
+        chunk_path.write_text(blob, encoding="utf-8")
+        uri = str(chunk_path.resolve()) + "?format=libsvm"
+        dm = xgb.DMatrix(uri, feature_names=list(feature_names))
+        parts.append(np.asarray(booster.predict(dm), dtype=np.float32).reshape(-1))
+    try:
+        chunk_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if not parts:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(parts, axis=0)
+
+
+def _catboost_predict_libsvm_line_batches(
+    model: Any,
+    line_batches: Iterator[List[str]],
+    tmp_dir: Path,
+) -> np.ndarray:
+    """CatBoost: materialise each 1-based LibSVM batch to a temp file and predict_proba."""
+    from catboost import Pool
+
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    parts: list[np.ndarray] = []
+    for idx, lines in enumerate(line_batches):
+        if not lines:
+            continue
+        chunk_path = tmp_dir / f"_phase_e_cb_{os.getpid()}_{idx}.libsvm"
+        try:
+            chunk_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            uri = catboost_libsvm_uri(chunk_path)
+            parts.append(np.asarray(model.predict_proba(Pool(uri))[:, 1], dtype=np.float32).reshape(-1))
+        finally:
+            chunk_path.unlink(missing_ok=True)
+    if not parts:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(parts, axis=0)
+
+
+def predict_positive_scores_phase_e_libsvm(
+    *,
+    backend: str,
+    model: Any,
+    libsvm_path: Path,
+    feature_names: Sequence[str],
+    cache_dir: Path,
+    batch_rows: int,
+    use_memmap: bool,
+    role: str,
+) -> Tuple[Union[np.ndarray, np.memmap], dict[str, Any]]:
+    """Stream-predict positive-class scores from LibSVM; optional float32 memmap sink.
+
+    Returns ``(scores, metadata)``. ``scores`` is ``float32`` ndarray or read-only memmap
+    of length = non-empty LibSVM lines in ``libsvm_path``.
+    """
+    if not libsvm_path.is_file():
+        raise FileNotFoundError(f"Phase E LibSVM missing: {libsvm_path}")
+    br = max(_PHASE_E_BATCH_FLOOR, min(int(batch_rows), _PHASE_E_BATCH_CAP))
+    meta: dict[str, Any] = {
+        "a3_score_compute_mode": "libsvm_streaming",
+        "a3_predict_batch_rows": int(br),
+        "a3_score_dtype": "float32",
+        "a3_phase_e_role": str(role),
+        "a3_phase_e_backend": str(backend).lower(),
+    }
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    backend_n = str(backend or "").strip().lower()
+
+    if backend_n == "xgboost":
+        booster = getattr(model, "booster_", None) or getattr(model, "_Booster", None)
+        if booster is None:
+            raise RuntimeError("Phase E xgboost: model has no booster_")
+        n_rows = int(count_nonempty_lines(libsvm_path))
+
+        if use_memmap:
+            out_path = cache_dir / f".phase_e_scores_{libsvm_path.stem}_{role}_{os.getpid()}.f32"
+            meta["a3_score_sink"] = "memmap"
+            meta["a3_score_memmap_path"] = str(out_path.resolve())
+            mm = np.memmap(str(out_path), dtype=np.float32, mode="w+", shape=(n_rows,))
+            offset = 0
+            _chunk_p = cache_dir / f"_phase_e_xgb_chunk_{os.getpid()}.libsvm"
+            for lines in iter_libsvm_nonempty_line_batches(libsvm_path, br):
+                if not lines:
+                    continue
+                blob = "\n".join(lines) + "\n"
+                import xgboost as xgb
+
+                _chunk_p.write_text(blob, encoding="utf-8")
+                uri = str(_chunk_p.resolve()) + "?format=libsvm"
+                dm = xgb.DMatrix(uri, feature_names=list(feature_names))
+                chunk = np.asarray(booster.predict(dm), dtype=np.float32).reshape(-1)
+                n = len(chunk)
+                mm[offset : offset + n] = chunk
+                offset += n
+            mm.flush()
+            ro = np.memmap(str(out_path), dtype=np.float32, mode="r", shape=(n_rows,))
+            meta["a3_score_memmap_used"] = True
+            try:
+                _chunk_p.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return ro, meta
+
+        meta["a3_score_sink"] = "memory"
+        meta["a3_score_memmap_used"] = False
+        arr = _xgb_booster_predict_libsvm_line_batches(
+            booster,
+            feature_names,
+            iter_libsvm_nonempty_line_batches(libsvm_path, br),
+            cache_dir,
+        )
+        if int(arr.shape[0]) != int(n_rows):
+            raise ValueError(
+                f"Phase E xgboost score row count {arr.shape[0]} != LibSVM lines {n_rows} ({libsvm_path})"
+            )
+        return arr, meta
+
+    if backend_n == "catboost":
+        cb_path, _hit = catboost_libsvm_path_one_based_cached(libsvm_path, cache_dir)
+        n_rows = int(count_nonempty_lines(cb_path))
+        tmp_dir = cache_dir / f"_phase_e_cb_tmp_{os.getpid()}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if use_memmap:
+                out_path = cache_dir / f".phase_e_scores_{libsvm_path.stem}_{role}_{os.getpid()}.f32"
+                meta["a3_score_sink"] = "memmap"
+                meta["a3_score_memmap_path"] = str(out_path.resolve())
+                mm = np.memmap(str(out_path), dtype=np.float32, mode="w+", shape=(n_rows,))
+                offset = 0
+                for idx, lines in enumerate(iter_libsvm_nonempty_line_batches(cb_path, br)):
+                    if not lines:
+                        continue
+                    chunk_path = tmp_dir / f"chunk_{idx}.libsvm"
+                    chunk_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    try:
+                        from catboost import Pool
+
+                        uri = catboost_libsvm_uri(chunk_path)
+                        chunk = np.asarray(
+                            model.predict_proba(Pool(uri))[:, 1], dtype=np.float32
+                        ).reshape(-1)
+                    finally:
+                        chunk_path.unlink(missing_ok=True)
+                    n = len(chunk)
+                    mm[offset : offset + n] = chunk
+                    offset += n
+                mm.flush()
+                try:
+                    tmp_dir.rmdir()
+                except OSError:
+                    pass
+                ro = np.memmap(str(out_path), dtype=np.float32, mode="r", shape=(n_rows,))
+                meta["a3_score_memmap_used"] = True
+                return ro, meta
+
+            meta["a3_score_sink"] = "memory"
+            meta["a3_score_memmap_used"] = False
+            arr = _catboost_predict_libsvm_line_batches(
+                model, iter_libsvm_nonempty_line_batches(cb_path, br), tmp_dir
+            )
+            try:
+                tmp_dir.rmdir()
+            except OSError:
+                pass
+            if int(arr.shape[0]) != int(n_rows):
+                raise ValueError(
+                    f"Phase E catboost score row count {arr.shape[0]} != LibSVM lines {n_rows} ({cb_path})"
+                )
+            return arr, meta
+        finally:
+            if tmp_dir.is_dir():
+                for p in tmp_dir.glob("*"):
+                    p.unlink(missing_ok=True)
+                try:
+                    tmp_dir.rmdir()
+                except OSError:
+                    pass
+
+    raise ValueError(f"Phase E streaming not supported for backend={backend!r}")
 
 
 @dataclass(frozen=True)
@@ -173,8 +443,11 @@ def _stream_libsvm_shift_feature_indices_plus_one(src: Path, dst: Path) -> None:
     os.replace(tmp, dst)
 
 
-def catboost_libsvm_path_one_based_cached(src: Path, cache_dir: Path) -> Path:
-    """Return path to a 1-based LibSVM copy under ``cache_dir``, rebuilt when ``src`` is newer."""
+def catboost_libsvm_path_one_based_cached(src: Path, cache_dir: Path) -> Tuple[Path, bool]:
+    """Return ``(path, cache_hit)`` for a 1-based LibSVM copy under ``cache_dir``.
+
+    ``cache_hit`` is True when an on-disk cached copy was reused without rewrite.
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
     dst = cache_dir / f"{src.stem}_cb_idx1{src.suffix}"
     need = True
@@ -185,7 +458,8 @@ def catboost_libsvm_path_one_based_cached(src: Path, cache_dir: Path) -> Path:
             need = True
     if need:
         _stream_libsvm_shift_feature_indices_plus_one(src, dst)
-    return dst
+        return dst, False
+    return dst, True
 
 
 def validate_bundle_paths(bundle: GbmBakeoffLibSvmBundle) -> None:
@@ -228,6 +502,7 @@ class XGBoostBoosterDiskClassifier:
         feature_names: Sequence[str],
         valid_libsvm_uri: str,
         test_libsvm_uri: Optional[str],
+        train_libsvm_uri: Optional[str] = None,
     ) -> None:
         self._Booster = booster
         self.n_features_in_ = int(len(feature_names))
@@ -235,6 +510,7 @@ class XGBoostBoosterDiskClassifier:
         self.classes_ = np.array([0, 1], dtype=np.int64)
         self._valid_libsvm_uri = valid_libsvm_uri
         self._test_libsvm_uri = test_libsvm_uri
+        self._train_libsvm_uri = train_libsvm_uri
 
     @property
     def booster_(self) -> Any:
@@ -273,6 +549,15 @@ class XGBoostBoosterDiskClassifier:
         import xgboost as xgb
 
         dm = xgb.DMatrix(self._valid_libsvm_uri, feature_names=self._feature_names)
+        return np.asarray(self._Booster.predict(dm), dtype=np.float64).reshape(-1)
+
+    def predict_train_scores_from_libsvm(self) -> np.ndarray:
+        """Train positive-class scores from on-disk LibSVM (same URI used for ``DMatrix`` training)."""
+        import xgboost as xgb
+
+        if not self._train_libsvm_uri:
+            raise RuntimeError("predict_train_scores_from_libsvm: train_libsvm_uri not set")
+        dm = xgb.DMatrix(self._train_libsvm_uri, feature_names=self._feature_names)
         return np.asarray(self._Booster.predict(dm), dtype=np.float64).reshape(-1)
 
     def predict_test_scores_from_libsvm(self) -> Optional[np.ndarray]:
@@ -389,8 +674,11 @@ def train_xgboost_from_libsvm_disk(
         feature_names=bundle.feature_names,
         valid_libsvm_uri=valid_uri,
         test_libsvm_uri=test_uri,
+        train_libsvm_uri=train_uri,
     )
     setattr(model, "a3_final_fit_mode", "libsvm_disk")
+    metrics["a3_xgboost_external_memory_train"] = bool(ext_ok)
+    metrics["a3_xgboost_libsvm_train_uri_has_ext_cache"] = bool("#" in train_uri)
     return model, metrics
 
 
@@ -417,13 +705,14 @@ def train_catboost_from_libsvm_disk(
     )
     cache_dir = Path(bundle.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    train_1 = catboost_libsvm_path_one_based_cached(bundle.train_libsvm, cache_dir)
-    valid_1 = catboost_libsvm_path_one_based_cached(bundle.valid_libsvm, cache_dir)
-    test_1 = (
-        catboost_libsvm_path_one_based_cached(bundle.test_libsvm, cache_dir)
-        if bundle.test_libsvm is not None
-        else None
-    )
+    train_1, hit_train = catboost_libsvm_path_one_based_cached(bundle.train_libsvm, cache_dir)
+    valid_1, hit_valid = catboost_libsvm_path_one_based_cached(bundle.valid_libsvm, cache_dir)
+    test_1: Optional[Path]
+    hit_test: Optional[bool]
+    if bundle.test_libsvm is not None:
+        test_1, hit_test = catboost_libsvm_path_one_based_cached(bundle.test_libsvm, cache_dir)
+    else:
+        test_1, hit_test = None, None
     train_uri = catboost_libsvm_uri(train_1)
     valid_uri = catboost_libsvm_uri(valid_1)
     c_hp = dict(hp)
@@ -467,10 +756,16 @@ def train_catboost_from_libsvm_disk(
         val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
     )
     setattr(model, "_gbm_bakeoff_valid_libsvm_uri", valid_uri)
+    setattr(model, "_gbm_bakeoff_train_libsvm_uri", train_uri)
     setattr(
         model,
         "_gbm_bakeoff_test_libsvm_uri",
         catboost_libsvm_uri(test_1) if test_1 is not None else None,
     )
     setattr(model, "a3_final_fit_mode", "libsvm_disk")
+    metrics["a3_catboost_libsvm_cache_hit_train"] = bool(hit_train)
+    metrics["a3_catboost_libsvm_cache_hit_valid"] = bool(hit_valid)
+    if hit_test is not None:
+        metrics["a3_catboost_libsvm_cache_hit_test"] = bool(hit_test)
+    metrics["a3_catboost_quantize_first"] = bool(quantize_first)
     return model, metrics

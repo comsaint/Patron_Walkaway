@@ -119,11 +119,6 @@ guardrails:
     - position_idx
     - table_id
     - game_id
-    - lda_l1_run_bet_count
-    - lda_trip_run_count
-    - lda_run_ord_in_trip
-    - lda_trip_is_closed
-    - lda_l1_run_duration_min
 
 track_llm:
   name: "Track LLM"
@@ -511,41 +506,6 @@ track_llm:
       type: "passthrough"
       dtype: "float"
       description: "桌位序號（raw）"
-    - feature_id: "lda_l1_run_bet_count"
-      type: "passthrough"
-      dtype: "float"
-      description: "L1 run_fact 內該 run 的 bet_count（parallel_lda_mvp Phase C join）"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 10000000.0 }
-    - feature_id: "lda_trip_run_count"
-      type: "passthrough"
-      dtype: "float"
-      description: "L1 trip_fact 的 run_count（經 trip_run_map）"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 10000000.0 }
-    - feature_id: "lda_run_ord_in_trip"
-      type: "passthrough"
-      dtype: "float"
-      description: "該 run 在 trip 內的序（trip_run_map.run_ord_in_trip）"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 10000000.0 }
-    - feature_id: "lda_trip_is_closed"
-      type: "passthrough"
-      dtype: "float"
-      description: "trip 是否已關閉（is_trip_closed → 0/1）"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1.0 }
-    - feature_id: "lda_l1_run_duration_min"
-      type: "passthrough"
-      dtype: "float"
-      description: "L1 run 持續時間（分鐘，run_end_ts − run_start_ts）"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 100080.0 }
     - feature_id: "cum_bets"
       type: "window"
       dtype: "int"

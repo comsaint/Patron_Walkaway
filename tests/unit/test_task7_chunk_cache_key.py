@@ -24,8 +24,8 @@ def _write_min_bridge_manifest(root: Path) -> None:
     (root / "trainer_local_parquet_bridge.manifest.json").write_text(
         json.dumps({
             "artifact_kind": "trainer_local_parquet_bridge_v1",
-            "gmwds_t_bet": "gmwds_t_bet.parquet",
-            "gmwds_t_session": "gmwds_t_session.parquet",
+            "gmwds_t_bet": "trainer_bridge_bet.parquet",
+            "gmwds_t_session": "trainer_bridge_session.parquet",
             "bet_includes_run_trip_lda_columns": False,
             "input_fingerprint": "testfp",
         }),
@@ -319,8 +319,8 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
         ee = pd.Timestamp("2026-02-01 00:00:00")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_bet.parquet")
-            pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_session.parquet")
+            pq.write_table(pa.table({"k": [1]}), root / "trainer_bridge_bet.parquet")
+            pq.write_table(pa.table({"k": [1]}), root / "trainer_bridge_session.parquet")
             _write_min_bridge_manifest(root)
             old_root = _data_sources_mod.LOCAL_PARQUET_DIR
             _data_sources_mod.LOCAL_PARQUET_DIR = root
@@ -330,7 +330,7 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
                     ws.to_pydatetime(), pd.Timestamp("2026-03-01").to_pydatetime()
                 )
                 self.assertNotEqual(h1, h2)
-                pq.write_table(pa.table({"k": [1, 2]}), root / "gmwds_t_bet.parquet")
+                pq.write_table(pa.table({"k": [1, 2]}), root / "trainer_bridge_bet.parquet")
                 h3 = trainer_mod._local_parquet_source_data_hash(ws.to_pydatetime(), ee.to_pydatetime())
                 self.assertNotEqual(h1, h3)
             finally:
@@ -352,8 +352,8 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
         ee = pd.Timestamp("2026-02-01 00:00:00")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            bet = root / "gmwds_t_bet.parquet"
-            sess = root / "gmwds_t_session.parquet"
+            bet = root / "trainer_bridge_bet.parquet"
+            sess = root / "trainer_bridge_session.parquet"
             pq.write_table(pa.table({"k": [1]}), bet)
             pq.write_table(pa.table({"s": [1]}), sess)
             _write_min_bridge_manifest(root)

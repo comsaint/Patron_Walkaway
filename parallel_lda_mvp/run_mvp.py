@@ -11,13 +11,15 @@ Run from repo root:
 
 Optional flags:
 
-- ``--emit-trainer-local-parquet`` — after MVP, write ``data/gmwds_t_{bet,session}.parquet``
-  (Phase C L1 join when snapshot has ``run_fact`` parts).
+- ``--emit-trainer-local-parquet`` — after MVP, write ``data/mvp_trainer_bridge/`` Parquet
+  (``trainer_bridge_{bet,session}.parquet``; Phase C L1 join when snapshot has ``run_fact`` parts)
+  plus ``trainer_local_parquet_bridge.manifest.json`` (does not overwrite L0 ``data/gmwds_t_*.parquet``).
 - ``--trainer-bridge-emit-only`` — only run the bridge (no preprocess/run/trip). Requires
   ``--snapshot-id <snap>`` **or** ``PARALLEL_LDA_MVP_SNAPSHOT_ID`` pointing at an existing
   ``data/parallel_lda_mvp/<snap>/`` tree with ``mvp_summary.json``.
 
-Idempotency / RAM (bridge): ``PARALLEL_LDA_BRIDGE_SKIP_IF_UNCHANGED=1``,
+Idempotency / RAM (bridge): skip unchanged rebuilds when
+``trainer.config.TRAINER_BRIDGE_SKIP_IF_UNCHANGED`` is True (default); DuckDB cap via
 ``PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT`` (e.g. ``4GB``).
 
 Defaults (first match wins for paths):
@@ -1718,14 +1720,13 @@ def main(argv: list[str] | None = None) -> int:
         from parallel_lda_mvp.trainer_bridge_mvp import emit_trainer_local_parquet
 
         print(
-            f"[parallel_lda_mvp] trainer bridge emit-only -> {data_root / 'gmwds_t_bet.parquet'} "
+            f"[parallel_lda_mvp] trainer bridge emit-only -> {data_root / 'mvp_trainer_bridge'} "
             f"(snap={sid})",
             flush=True,
         )
         emit_trainer_local_parquet(
             snap_root=snap_root,
             data_dir=data_root,
-            enrich_bet_with_run_trip_lda=True,
         )
         return 0
 
@@ -1985,14 +1986,13 @@ def main(argv: list[str] | None = None) -> int:
         from parallel_lda_mvp.trainer_bridge_mvp import emit_trainer_local_parquet
 
         print(
-            f"[parallel_lda_mvp] trainer bridge after MVP -> {data_root / 'gmwds_t_bet.parquet'} "
+            f"[parallel_lda_mvp] trainer bridge after MVP -> {data_root / 'mvp_trainer_bridge'} "
             f"(snap={snap})",
             flush=True,
         )
         emit_trainer_local_parquet(
             snap_root=snap_root,
             data_dir=data_root,
-            enrich_bet_with_run_trip_lda=True,
         )
     return 0
 

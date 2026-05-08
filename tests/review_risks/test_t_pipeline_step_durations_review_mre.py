@@ -9,7 +9,6 @@ STATUS.md — Code Review：T-PipelineStepDurations（2026-03-22）
 
 from __future__ import annotations
 
-import re
 import unittest
 from pathlib import Path
 
@@ -123,13 +122,14 @@ class TestReview4FailurePathNoStepDurationParams(unittest.TestCase):
 
 
 class TestReview5DiagnosticsWriterBoundedStepKeys(unittest.TestCase):
-    """#5：診斷 writer 僅固定十個 step 鍵，無無界擴張。"""
+    """#5：診斷 writer 使用固定 step 耗時鍵（step0、step1–10、step7b），無無界擴張。"""
 
     def test_write_payload_lists_step1_through_step10_once_each(self):
         src = _trainer_text()
         i0 = src.find("def _write_pipeline_diagnostics_json(")
         self.assertGreater(i0, 0, "expected _write_pipeline_diagnostics_json in trainer.py")
-        chunk = src[i0 : i0 + 8000]
+        chunk = src[i0 : i0 + 10000]
+        self.assertEqual(chunk.count('"step0_duration_sec": step0_duration_sec'), 1)
         for n in range(1, 11):
             pat = f'"step{n}_duration_sec": step{n}_duration_sec'
             self.assertEqual(
@@ -137,6 +137,7 @@ class TestReview5DiagnosticsWriterBoundedStepKeys(unittest.TestCase):
                 1,
                 f"expected exactly one payload mapping for step{n}_duration_sec in writer body",
             )
+        self.assertEqual(chunk.count('"step7b_duration_sec": step7b_duration_sec'), 1)
 
 
 class TestReview6StepDurationKeysNoPathOrSecretPattern(unittest.TestCase):
@@ -146,8 +147,16 @@ class TestReview6StepDurationKeysNoPathOrSecretPattern(unittest.TestCase):
         src = _trainer_text()
         i0 = src.find("def _write_pipeline_diagnostics_json(")
         self.assertGreater(i0, 0)
-        chunk = src[i0 : i0 + 8000]
-        m = re.findall(r'"((?:step\d+_duration_sec))":', chunk)
-        self.assertEqual(len(m), 10)
-        for n, key in enumerate(m, start=1):
-            self.assertEqual(key, f"step{n}_duration_sec")
+        chunk = src[i0 : i0 + 10000]
+        expected = (
+            ["step0_duration_sec"]
+            + [f"step{n}_duration_sec" for n in range(1, 8)]
+            + ["step7b_duration_sec"]
+            + [f"step{n}_duration_sec" for n in range(8, 11)]
+        )
+        for key in expected:
+            self.assertEqual(
+                chunk.count(f'"{key}": {key}'),
+                1,
+                f"expected one payload mapping for {key}",
+            )

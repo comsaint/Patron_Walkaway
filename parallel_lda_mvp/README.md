@@ -14,9 +14,9 @@ python -m parallel_lda_mvp.run_mvp
 
 可選：
 
-- `--emit-trainer-local-parquet`：MVP 結束後寫入 `data/mvp_trainer_bridge/`（`gmwds_t_bet.parquet`／`gmwds_t_session.parquet` 與 manifest；**不覆寫** L0 的 `data/gmwds_t_*.parquet`）。含 Phase C：`run_fact`／`trip_*` 併回下注列（見 `trainer_bridge_mvp.py`）。本機訓練請改指該目錄下檔案或複製到 trainer 預期路徑。
+- `--emit-trainer-local-parquet`：MVP 結束後寫入 `data/mvp_trainer_bridge/`（`trainer_bridge_bet.parquet`／`trainer_bridge_session.parquet` 與 `trainer_local_parquet_bridge.manifest.json`；**不覆寫** L0 的 `data/gmwds_t_*.parquet`）。含 Phase C：`run_fact`／`trip_*` 併回下注列（見 `trainer_bridge_mvp.py`）。Trainer 由 ingress manifest 解析路徑。
 - `--trainer-bridge-emit-only --snapshot-id <snap>`：只跑橋接（需已存在 `data/parallel_lda_mvp/<snap>/` 與 `mvp_summary.json`）。亦可只設 `PARALLEL_LDA_MVP_SNAPSHOT_ID`。
-- 橋接 idempotency：`PARALLEL_LDA_BRIDGE_SKIP_IF_UNCHANGED=1`（指紋相同則跳過寫檔）；`PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT=4GB` 等。
+- 橋接 idempotency：預設在 `trainer.core._config_serving_runtime` 的 `TRAINER_BRIDGE_SKIP_IF_UNCHANGED=True`（指紋相同則跳過寫檔）；DuckDB 上限仍可用 `PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT=4GB` 等。
 
 說明文件：
 

@@ -69,13 +69,13 @@ class TestTask7DodChunkCacheStatsReviewRisksMRE(unittest.TestCase):
         ee = pd.Timestamp("2026-02-01 00:00:00")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_bet.parquet")
-            pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_session.parquet")
+            pq.write_table(pa.table({"k": [1]}), root / "trainer_bridge_bet.parquet")
+            pq.write_table(pa.table({"k": [1]}), root / "trainer_bridge_session.parquet")
             (root / "trainer_local_parquet_bridge.manifest.json").write_text(
                 json.dumps({
                     "artifact_kind": "trainer_local_parquet_bridge_v1",
-                    "gmwds_t_bet": "gmwds_t_bet.parquet",
-                    "gmwds_t_session": "gmwds_t_session.parquet",
+                    "gmwds_t_bet": "trainer_bridge_bet.parquet",
+                    "gmwds_t_session": "trainer_bridge_session.parquet",
                     "bet_includes_run_trip_lda_columns": False,
                 }),
                 encoding="utf-8",

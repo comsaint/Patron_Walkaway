@@ -47,6 +47,14 @@ def execute_l2_training_bundle(
     pipeline_gbm_bakeoff: bool,
 ) -> None:
     """Run Steps 8–10/11 from an L2 bundle (skip chunk Steps 1–6/11 and Step 7 merge)."""
+    from trainer.training.pipeline_step_context import (
+        ensure_pipeline_step_log_filter_installed,
+        pipeline_step_set,
+    )
+
+    ensure_pipeline_step_log_filter_installed()
+    pipeline_step_set("Step 8/11")
+
     import trainer.training.trainer as tr
 
     from trainer.training.issue16_gates import (
@@ -262,6 +270,7 @@ def execute_l2_training_bundle(
     else:
         tr.pipeline_echo("Step 8/11 — Feature screening skipped or not applicable")
 
+    pipeline_step_set("Step 9/11")
     tr.pipeline_echo("Step 9/11 — Train rated GBM (L2 bundle path) …")
     t0 = time.perf_counter()
     model_version = pipeline_model_version
@@ -287,6 +296,7 @@ def execute_l2_training_bundle(
     test_df = None
     gc.collect()
 
+    pipeline_step_set("Step 10/11")
     tr.pipeline_echo("Step 10/11 — Save artifact bundle (L2 bundle path) …")
     t0 = time.perf_counter()
     _versions_root = tr.MODEL_DIR
@@ -354,6 +364,7 @@ def execute_l2_training_bundle(
             pipeline_started_at=pipeline_started_at_iso,
             pipeline_finished_at=_pipeline_finished_at_iso,
             total_duration_sec=total_sec,
+            step0_duration_sec=None,
             step1_duration_sec=None,
             step2_duration_sec=None,
             step3_duration_sec=None,
@@ -361,6 +372,7 @@ def execute_l2_training_bundle(
             step5_duration_sec=None,
             step6_duration_sec=None,
             step7_duration_sec=step7_duration_sec,
+            step7b_duration_sec=None,
             step8_duration_sec=step8_duration_sec,
             step9_duration_sec=step9_duration_sec,
             step10_duration_sec=step10_duration_sec,

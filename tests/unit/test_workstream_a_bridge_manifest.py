@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from parallel_lda_mvp.trainer_bridge_mvp import _manifest_rel_path
 from trainer.training import data_sources as ds
 from trainer.training import local_bridge_preflight as lbp
 from trainer.training.local_bridge_preflight import ensure_local_bridge_ready_for_training
@@ -88,20 +89,38 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             finally:
                 ds.LOCAL_PARQUET_DIR = old
 
-    def test_resolve_prefers_t_bet_paths(self) -> None:
+    def test_resolve_prefers_gmwds_t_bet_over_t_bet_paths(self) -> None:
+        """Trainer ingress must read bridge output, not L0 provenance in ``t_bet_paths``."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            bp = root / "custom_bet.parquet"
+            bridge_bet = root / "trainer_bridge_bet.parquet"
+            l0_bet = root / "custom_bet.parquet"
             sp = root / "sess.parquet"
-            ignored = root / "ignored_bet.parquet"
-            bp.write_bytes(b"")
+            bridge_bet.write_bytes(b"")
+            l0_bet.write_bytes(b"")
             sp.write_bytes(b"")
-            ignored.write_bytes(b"")
             mf = root / "trainer_local_parquet_bridge.manifest.json"
             mf.write_text("{}", encoding="utf-8")
             m = {
                 "t_bet_paths": ["custom_bet.parquet"],
-                "gmwds_t_bet": "ignored_bet.parquet",
+                "gmwds_t_bet": "trainer_bridge_bet.parquet",
+                "gmwds_t_session": "sess.parquet",
+            }
+            b, s = ds.resolve_local_parquet_bet_session_paths_from_manifest(m, manifest_path=mf)
+            self.assertEqual(b.resolve(), bridge_bet.resolve())
+            self.assertEqual(s.resolve(), sp.resolve())
+
+    def test_resolve_falls_back_to_t_bet_paths_when_no_gmwds_t_bet(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bp = root / "custom_bet.parquet"
+            sp = root / "sess.parquet"
+            bp.write_bytes(b"")
+            sp.write_bytes(b"")
+            mf = root / "trainer_local_parquet_bridge.manifest.json"
+            mf.write_text("{}", encoding="utf-8")
+            m = {
+                "t_bet_paths": ["custom_bet.parquet"],
                 "gmwds_t_session": "sess.parquet",
             }
             b, s = ds.resolve_local_parquet_bet_session_paths_from_manifest(m, manifest_path=mf)
@@ -284,6 +303,26 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
                 self.assertTrue(ds.probe_trainer_local_parquet_bridge_readiness().ready)
             finally:
                 ds.LOCAL_PARQUET_DIR = old
+
+    def test_manifest_rel_path_strict_raises_when_not_under_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as td_a, tempfile.TemporaryDirectory() as td_b:
+            anchor = Path(td_a).resolve()
+            outside = (Path(td_b) / "f.parquet").resolve()
+            outside.write_bytes(b"")
+            with patch.dict(os.environ, {"TRAINER_MANIFEST_PATH_STRICT": "1"}, clear=False):
+                with self.assertRaises(ValueError) as ctx:
+                    _manifest_rel_path(outside, anchor)
+                self.assertIn("not under anchor", str(ctx.exception))
+
+    def test_manifest_rel_path_lenient_returns_absolute_posix(self) -> None:
+        with tempfile.TemporaryDirectory() as td_a, tempfile.TemporaryDirectory() as td_b:
+            anchor = Path(td_a).resolve()
+            outside = (Path(td_b) / "f.parquet").resolve()
+            outside.write_bytes(b"")
+            with patch.dict(os.environ, {"TRAINER_MANIFEST_PATH_STRICT": "0"}, clear=False):
+                s = _manifest_rel_path(outside, anchor)
+            self.assertTrue(Path(s).is_absolute())
+            self.assertEqual(s, outside.resolve().as_posix())
 
     def test_autobuild_full_mvp_subprocess_nonzero_raises(self) -> None:
         with tempfile.TemporaryDirectory() as td:

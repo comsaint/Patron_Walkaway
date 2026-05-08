@@ -30,6 +30,7 @@ import math
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -59,6 +60,12 @@ BAKEOFF_BACKENDS: Tuple[str, ...] = (
     SOFT_VOTE_BACKEND,
     STACKED_LOGISTIC_BACKEND,
 )
+
+
+def _symmetric_bakeoff_hpo_enabled() -> bool:
+    """When true, optional-backend Optuna uses full per-backend timeout (no global divisor)."""
+    raw = (os.getenv("GBM_BAKEOFF_SYMMETRIC_HPO") or "").strip().lower()
+    return bool(raw) and raw in ("1", "true", "t", "yes", "y")
 
 
 def _optional_bakeoff_catboost_xgboost_enabled() -> tuple[bool, bool]:
@@ -598,6 +605,7 @@ def train_and_select_rated_gbm_family(
         _compute_test_metrics,
         _compute_test_metrics_from_scores,
         _compute_train_metrics,
+        _train_metrics_dict_from_y_scores,
         resolve_gbm_backend_runtime_plan,
         resolve_backend_optuna_budget,
         run_backend_optuna_search,
@@ -649,6 +657,8 @@ def train_and_select_rated_gbm_family(
     # Only CatBoost/XGBoost branches may call run_backend_optuna_search here.
     if "optuna_hpo_enabled" not in rows["lightgbm"]:
         rows["lightgbm"]["optuna_hpo_enabled"] = False
+    if "optuna_hpo_data_source" in lightgbm_metrics:
+        rows["lightgbm"]["a3_primary_optuna_hpo_data_source"] = lightgbm_metrics["optuna_hpo_data_source"]
     rows["lightgbm"].update(_backend_runtime_manifest("lightgbm"))
     candidate_artifacts: Dict[str, Dict[str, Any]] = {
         "lightgbm": {
@@ -662,6 +672,8 @@ def train_and_select_rated_gbm_family(
     }
 
     def _bakeoff_timeout_budget_divisor() -> Optional[int]:
+        if _symmetric_bakeoff_hpo_enabled():
+            return None
         if not (run_optuna and _has_strong_validation(X_val, y_val)):
             return None
         raw = getattr(_cfg, "OPTUNA_ACTIVE_MODEL_COUNT_FOR_TOTAL_TIMEOUT_SPLIT", 3)
@@ -724,6 +736,10 @@ def train_and_select_rated_gbm_family(
                     hpo_objective_manifest=backend_manifest,
                     backend_runtime_params=backend_runtime_params,
                 )
+                if backend_manifest:
+                    backend_manifest[0]["a3_bakeoff_symmetric_hpo"] = bool(
+                        _symmetric_bakeoff_hpo_enabled()
+                    )
             else:
                 budget = resolve_backend_optuna_budget(
                     backend,
@@ -738,6 +754,8 @@ def train_and_select_rated_gbm_family(
                         "optuna_hpo_early_stop_patience": budget.get("early_stop_patience"),
                         "optuna_hpo_objective_mode": "disabled",
                         "optuna_hpo_study_best_trial_value": None,
+                        "optuna_hpo_data_source": "n_a_hpo_disabled",
+                        "a3_bakeoff_symmetric_hpo": bool(_symmetric_bakeoff_hpo_enabled()),
                     }
                 )
             model, metrics = trainer_fn(
@@ -757,45 +775,171 @@ def train_and_select_rated_gbm_family(
             metrics.update(backend_runtime_manifest)
             if backend_manifest:
                 metrics.update(backend_manifest[0])
-            if hasattr(model, "predict_val_scores_from_libsvm"):
-                metrics["_val_scores"] = model.predict_val_scores_from_libsvm()
-            elif getattr(model, "_gbm_bakeoff_valid_libsvm_uri", None):
-                from catboost import Pool
+            from trainer.training.split_file_bundle import trainer_file_backed_strict_enabled
+            from trainer.training.gbm_bakeoff_disk import (
+                phase_e_ap_mode,
+                phase_e_predict_batch_rows,
+                phase_e_predict_streaming_enabled,
+                phase_e_score_memmap_enabled,
+                predict_positive_scores_phase_e_libsvm,
+            )
 
-                _vuri = str(getattr(model, "_gbm_bakeoff_valid_libsvm_uri"))
-                metrics["_val_scores"] = np.asarray(
-                    model.predict_proba(Pool(_vuri))[:, 1],
-                    dtype=np.float64,
-                )
-            else:
-                metrics["_val_scores"] = (
-                    np.asarray(
-                        model.predict_proba(_to_float32_frame(X_val))[:, 1],
+            _pe_val_ok = False
+            if libsvm_bundle is not None and phase_e_predict_streaming_enabled():
+                try:
+                    _sv, _mv = predict_positive_scores_phase_e_libsvm(
+                        backend=backend,
+                        model=model,
+                        libsvm_path=Path(libsvm_bundle.valid_libsvm),
+                        feature_names=feature_cols,
+                        cache_dir=libsvm_bundle.cache_dir,
+                        batch_rows=phase_e_predict_batch_rows(),
+                        use_memmap=phase_e_score_memmap_enabled(),
+                        role="valid",
+                    )
+                    metrics["_val_scores"] = np.asarray(_sv, dtype=np.float64).reshape(-1)
+                    metrics["a3_val_scores_data_source"] = "libsvm_streaming"
+                    metrics.update({k: v for k, v in _mv.items() if str(k).startswith("a3_")})
+                    _pe_val_ok = True
+                except Exception as _pev_exc:
+                    if trainer_file_backed_strict_enabled():
+                        raise RuntimeError(
+                            "TRAINER_FILE_BACKED_STRICT: Phase E validation LibSVM streaming "
+                            f"predict failed ({_pev_exc})"
+                        ) from _pev_exc
+                    logger.warning("Phase E: validation streaming scores skipped: %s", _pev_exc)
+            if not _pe_val_ok:
+                if hasattr(model, "predict_val_scores_from_libsvm"):
+                    metrics["_val_scores"] = model.predict_val_scores_from_libsvm()
+                    metrics["a3_val_scores_data_source"] = "xgboost_libsvm_uri"
+                elif getattr(model, "_gbm_bakeoff_valid_libsvm_uri", None):
+                    from catboost import Pool
+
+                    _vuri = str(getattr(model, "_gbm_bakeoff_valid_libsvm_uri"))
+                    metrics["_val_scores"] = np.asarray(
+                        model.predict_proba(Pool(_vuri))[:, 1],
                         dtype=np.float64,
                     )
-                    if _has_strong_validation(X_val, y_val)
-                    else np.zeros(len(y_val), dtype=np.float64)
+                    metrics["a3_val_scores_data_source"] = "catboost_libsvm_pool_uri"
+                else:
+                    metrics["_val_scores"] = (
+                        np.asarray(
+                            model.predict_proba(_to_float32_frame(X_val))[:, 1],
+                            dtype=np.float64,
+                        )
+                        if _has_strong_validation(X_val, y_val)
+                        else np.zeros(len(y_val), dtype=np.float64)
+                    )
+                    metrics["a3_val_scores_data_source"] = "in_memory_dense"
+            train_thr = float(metrics["threshold"])
+            train_scores_disk: Optional[np.ndarray] = None
+            _pe_tr_ok = False
+            if libsvm_bundle is not None and phase_e_predict_streaming_enabled():
+                try:
+                    train_scores_disk, _mt = predict_positive_scores_phase_e_libsvm(
+                        backend=backend,
+                        model=model,
+                        libsvm_path=Path(libsvm_bundle.train_libsvm),
+                        feature_names=feature_cols,
+                        cache_dir=libsvm_bundle.cache_dir,
+                        batch_rows=phase_e_predict_batch_rows(),
+                        use_memmap=phase_e_score_memmap_enabled(),
+                        role="train",
+                    )
+                    _pe_tr_ok = True
+                except Exception as _pet_exc:
+                    if trainer_file_backed_strict_enabled():
+                        raise RuntimeError(
+                            "TRAINER_FILE_BACKED_STRICT: Phase E train LibSVM streaming predict "
+                            f"failed ({_pet_exc})"
+                        ) from _pet_exc
+                    logger.warning("Phase E: train streaming scores skipped: %s", _pet_exc)
+                    train_scores_disk = None
+            if not _pe_tr_ok:
+                if hasattr(model, "predict_train_scores_from_libsvm"):
+                    train_scores_disk = np.asarray(
+                        model.predict_train_scores_from_libsvm(), dtype=np.float64
+                    ).reshape(-1)
+                elif getattr(model, "_gbm_bakeoff_train_libsvm_uri", None):
+                    from catboost import Pool
+
+                    _tr_uri = str(getattr(model, "_gbm_bakeoff_train_libsvm_uri"))
+                    train_scores_disk = np.asarray(
+                        model.predict_proba(Pool(_tr_uri))[:, 1],
+                        dtype=np.float64,
+                    ).reshape(-1)
+            if train_scores_disk is not None:
+                metrics.update(
+                    _train_metrics_dict_from_y_scores(
+                        y_train,
+                        train_scores_disk,
+                        train_thr,
+                        label=f"rated_{backend}",
+                        log_results=False,
+                        ap_mode=phase_e_ap_mode(),
+                    )
                 )
-            metrics.update(
-                _compute_train_metrics(
+                if _pe_tr_ok:
+                    metrics["a3_train_metrics_data_source"] = "libsvm_streaming"
+                else:
+                    metrics["a3_train_metrics_data_source"] = (
+                        "xgboost_libsvm_uri"
+                        if hasattr(model, "predict_train_scores_from_libsvm")
+                        else "catboost_libsvm_pool_uri"
+                    )
+                metrics["_train_scores"] = np.asarray(train_scores_disk, dtype=np.float32)
+            else:
+                metrics.update(
+                    _compute_train_metrics(
+                        model,
+                        train_thr,
+                        _to_float32_frame(X_train),
+                        y_train,
+                        label=f"rated_{backend}",
+                        log_results=False,
+                    )
+                )
+                metrics["_train_scores"] = _batched_model_positive_class_scores(
                     model,
-                    float(metrics["threshold"]),
                     _to_float32_frame(X_train),
-                    y_train,
-                    label=f"rated_{backend}",
-                    log_results=False,
+                    int(getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)),
                 )
-            )
-            metrics["_train_scores"] = _batched_model_positive_class_scores(
-                model,
-                _to_float32_frame(X_train),
-                int(getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)),
-            )
+                metrics["a3_train_metrics_data_source"] = "in_memory_dense_batched"
             if X_test is not None and y_test is not None and not X_test.empty:
                 _ts_disk: Optional[np.ndarray] = None
-                if hasattr(model, "predict_test_scores_from_libsvm"):
+                _pe_te_ok = False
+                if (
+                    libsvm_bundle is not None
+                    and libsvm_bundle.test_libsvm is not None
+                    and phase_e_predict_streaming_enabled()
+                ):
+                    try:
+                        _ts_raw, _mte = predict_positive_scores_phase_e_libsvm(
+                            backend=backend,
+                            model=model,
+                            libsvm_path=Path(libsvm_bundle.test_libsvm),
+                            feature_names=feature_cols,
+                            cache_dir=libsvm_bundle.cache_dir,
+                            batch_rows=phase_e_predict_batch_rows(),
+                            use_memmap=phase_e_score_memmap_enabled(),
+                            role="test",
+                        )
+                        _ts_disk = np.asarray(_ts_raw, dtype=np.float64).reshape(-1)
+                        metrics.update({k: v for k, v in _mte.items() if str(k).startswith("a3_")})
+                        metrics["a3_test_scores_data_source"] = "libsvm_streaming"
+                        _pe_te_ok = True
+                    except Exception as _pee_exc:
+                        if trainer_file_backed_strict_enabled():
+                            raise RuntimeError(
+                                "TRAINER_FILE_BACKED_STRICT: Phase E test LibSVM streaming predict "
+                                f"failed ({_pee_exc})"
+                            ) from _pee_exc
+                        logger.warning("Phase E: test streaming scores skipped: %s", _pee_exc)
+                if not _pe_te_ok and hasattr(model, "predict_test_scores_from_libsvm"):
                     _ts_disk = model.predict_test_scores_from_libsvm()
-                elif getattr(model, "_gbm_bakeoff_test_libsvm_uri", None):
+                    if _ts_disk is not None:
+                        metrics["a3_test_scores_data_source"] = "xgboost_libsvm_uri"
+                elif not _pe_te_ok and getattr(model, "_gbm_bakeoff_test_libsvm_uri", None):
                     from catboost import Pool
 
                     _turi = str(getattr(model, "_gbm_bakeoff_test_libsvm_uri"))
@@ -803,6 +947,7 @@ def train_and_select_rated_gbm_family(
                         model.predict_proba(Pool(_turi))[:, 1],
                         dtype=np.float64,
                     )
+                    metrics["a3_test_scores_data_source"] = "catboost_libsvm_pool_uri"
                 if _ts_disk is not None:
                     test_metrics = _compute_test_metrics_from_scores(
                         np.asarray(y_test, dtype=float).reshape(-1),
@@ -999,11 +1144,21 @@ def train_and_select_rated_gbm_family(
             candidate_artifacts[backend]["metrics"]["bakeoff_disposition"] = row.get("bakeoff_disposition")
             candidate_artifacts[backend]["metrics"]["model_backend"] = backend
 
+    from trainer.training.split_file_bundle import trainer_file_backed_strict_enabled
+    from trainer.training.gbm_bakeoff_disk import (
+        phase_e_ap_mode,
+        phase_e_predict_batch_rows,
+        phase_e_predict_streaming_enabled,
+        phase_e_score_memmap_enabled,
+    )
+
     report: Dict[str, Any] = {
         "schema_version": "a3_v2",
         "winner_backend": winner,
         "selection_rule": rule,
         "selection_mode": "field_test",
+        "a3_symmetric_hpo_profile": bool(_symmetric_bakeoff_hpo_enabled()),
+        "a3_optuna_timeout_budget_divisor": _timeout_budget_divisor,
         "per_backend": rows,
         "stacking_oof": stacking_report,
         "backend_runtime_plan": {
@@ -1035,6 +1190,11 @@ def train_and_select_rated_gbm_family(
                     getattr(_cfg, "GBM_BAKEOFF_XGBOOST_EXTERNAL_MEMORY", False)
                 ),
                 "catboost_quantize": bool(getattr(_cfg, "GBM_BAKEOFF_CATBOOST_QUANTIZE", False)),
+                "trainer_file_backed_strict": bool(trainer_file_backed_strict_enabled()),
+                "phase_e_predict_streaming": bool(phase_e_predict_streaming_enabled()),
+                "phase_e_score_memmap": bool(phase_e_score_memmap_enabled()),
+                "phase_e_predict_batch_rows": int(phase_e_predict_batch_rows()),
+                "phase_e_ap_mode": phase_e_ap_mode(),
             },
             "note": (
                 "C3 stacking/blending: OOF exports and meta-learner training are not in A3 scope; "

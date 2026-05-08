@@ -251,16 +251,18 @@ def resolve_local_parquet_bet_session_paths_from_manifest(
     mp = manifest_path if manifest_path is not None else trainer_local_parquet_bridge_manifest_path()
     raw_bet: Optional[str] = None
     bet_prefer_project_root = False
-    t_bet_paths = manifest.get("t_bet_paths")
-    if isinstance(t_bet_paths, list) and t_bet_paths:
-        raw_bet = str(t_bet_paths[0])
-        bet_prefer_project_root = True
-    if raw_bet is None and manifest.get("gmwds_t_bet"):
+    # Prefer trainer-ready bridge output (L1-enriched) over L0 provenance in ``t_bet_paths``.
+    if manifest.get("gmwds_t_bet"):
         raw_bet = str(manifest["gmwds_t_bet"])
         bet_prefer_project_root = False
+    if raw_bet is None:
+        t_bet_paths = manifest.get("t_bet_paths")
+        if isinstance(t_bet_paths, list) and t_bet_paths:
+            raw_bet = str(t_bet_paths[0])
+            bet_prefer_project_root = True
     if not raw_bet:
         raise KeyError(
-            "manifest must contain non-empty 't_bet_paths' or 'gmwds_t_bet' "
+            "manifest must contain 'gmwds_t_bet' or non-empty 't_bet_paths' "
             f"(got keys={sorted(manifest.keys())!r})"
         )
     sess_raw: Optional[Any] = None

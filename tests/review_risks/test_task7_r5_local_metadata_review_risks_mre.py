@@ -29,8 +29,8 @@ def _write_min_bridge_manifest(root: Path, *, bet_includes_run_trip_lda_columns:
     (root / "trainer_local_parquet_bridge.manifest.json").write_text(
         json.dumps({
             "artifact_kind": "trainer_local_parquet_bridge_v1",
-            "gmwds_t_bet": "gmwds_t_bet.parquet",
-            "gmwds_t_session": "gmwds_t_session.parquet",
+            "gmwds_t_bet": "trainer_bridge_bet.parquet",
+            "gmwds_t_session": "trainer_bridge_session.parquet",
             "bet_includes_run_trip_lda_columns": bet_includes_run_trip_lda_columns,
             "input_fingerprint": "testfp",
         }),
@@ -93,8 +93,8 @@ class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
         ee = pd.Timestamp("2026-02-01 00:00:00")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_bet.parquet")
-            pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_session.parquet")
+            pq.write_table(pa.table({"k": [1]}), root / "trainer_bridge_bet.parquet")
+            pq.write_table(pa.table({"k": [1]}), root / "trainer_bridge_session.parquet")
             _write_min_bridge_manifest(root)
             old = _data_sources_mod.LOCAL_PARQUET_DIR
             _data_sources_mod.LOCAL_PARQUET_DIR = root
@@ -116,8 +116,8 @@ class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
         ee = pd.Timestamp("2026-02-01 00:00:00")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_bet.parquet")
-            pq.write_table(pa.table({"k": [1]}), root / "gmwds_t_session.parquet")
+            pq.write_table(pa.table({"k": [1]}), root / "trainer_bridge_bet.parquet")
+            pq.write_table(pa.table({"k": [1]}), root / "trainer_bridge_session.parquet")
             _write_min_bridge_manifest(root)
             old = _data_sources_mod.LOCAL_PARQUET_DIR
             _data_sources_mod.LOCAL_PARQUET_DIR = root
@@ -162,13 +162,13 @@ class TestTask7R5LocalMetadataReviewRisksMRE(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td_a, tempfile.TemporaryDirectory() as td_b:
             root_a = Path(td_a)
             root_b = Path(td_b)
-            pq.write_table(pa.table({"x": [1]}), root_a / "gmwds_t_bet.parquet")
+            pq.write_table(pa.table({"x": [1]}), root_a / "trainer_bridge_bet.parquet")
             pq.write_table(
                 pa.table({"x": [1], "y": pa.array([None], type=pa.int64())}),
-                root_b / "gmwds_t_bet.parquet",
+                root_b / "trainer_bridge_bet.parquet",
             )
-            pq.write_table(pa.table({"s": [1]}), root_a / "gmwds_t_session.parquet")
-            pq.write_table(pa.table({"s": [1]}), root_b / "gmwds_t_session.parquet")
+            pq.write_table(pa.table({"s": [1]}), root_a / "trainer_bridge_session.parquet")
+            pq.write_table(pa.table({"s": [1]}), root_b / "trainer_bridge_session.parquet")
             _write_min_bridge_manifest(root_a)
             _write_min_bridge_manifest(root_b)
 

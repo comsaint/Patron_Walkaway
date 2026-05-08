@@ -74,6 +74,7 @@ from trainer.core._config_env_paths import (
 from trainer.core._config_serving_runtime import (
     CHUNK_TWO_STAGE_CACHE_DEFAULT,
     DISABLE_PROGRESS_BAR,
+    TRAINER_BRIDGE_SKIP_IF_UNCHANGED,
     RUNTIME_THRESHOLD_MAX_AGE_HOURS,
     SCORER_ALERT_RETENTION_DAYS,
     SCORER_COLD_START_WINDOW_HOURS,
