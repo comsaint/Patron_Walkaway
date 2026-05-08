@@ -57,6 +57,8 @@ Production flow (Scorer)
 4. Poll and refresh scoring windows continuously.
 
 5. Score bets; log predictions. Scorer loads **only** the bundle ``feature_spec.yaml``.
+   If this file is missing in the bundle directory, runtime must **fail fast**
+   (do not fallback to repo/deploy template specs).
 
 6. Emit alerts when prediction == 1.
 
@@ -68,10 +70,10 @@ Validator (production ground truth)
 Notes
 =====
 A. Tables and the **dev** feature catalog change often; incremental rebuilds should
-   touch only invalidated partitions / fingerprints (bridge + chunk-cache keys).
+   touch only invalidated partitions / fingerprints (bridge + materialization cache keys).
 
-B. Prefer incremental materialization; any cache key MUST include spec fingerprint,
-   window, and ingress manifest fingerprint.
+B. Prefer incremental materialization; any materialization cache key MUST include
+   spec fingerprint, window, and ingress manifest fingerprint.
 
 C. Run/trip entities that can be open vs closed MUST carry explicit state in assets
    and be consistent train/serve.
