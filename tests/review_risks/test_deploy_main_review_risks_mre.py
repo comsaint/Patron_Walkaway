@@ -41,6 +41,7 @@ def _write_sandbox_deploy(deploy_dir: Path, *, with_env: bool) -> Path:
     shutil.copy(_DEPLOY_MAIN, deploy_dir / "main.py")
     (deploy_dir / "models").mkdir(parents=True, exist_ok=True)
     (deploy_dir / "models" / "feature_spec.yaml").write_text("{}\n", encoding="utf-8")
+    (deploy_dir / "models" / "model.pkl").write_bytes(b"")
     (deploy_dir / "local_state").mkdir(parents=True, exist_ok=True)
     env_body = (
         "CH_USER=u\n"
@@ -52,6 +53,12 @@ def _write_sandbox_deploy(deploy_dir: Path, *, with_env: bool) -> Path:
     if with_env:
         (deploy_dir / ".env").write_text(env_body, encoding="utf-8")
     return deploy_dir / "main.py"
+
+
+def _deploy_subprocess_env() -> dict[str, str]:
+    """Child env: drop MODEL_DIR so sandbox ``.env`` wins over parent shell (dotenv default)."""
+    env = {k: v for k, v in os.environ.items() if k != "MODEL_DIR"}
+    return env
 
 
 def _run_deploy_main_subprocess(
@@ -82,6 +89,7 @@ def _run_deploy_main_subprocess(
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=_deploy_subprocess_env(),
     )
 
 
@@ -180,7 +188,7 @@ class TestReview2SubprocessTypoFlushFlagStillStarts(unittest.TestCase):
                 runpy.run_path(r"{main_copy.as_posix()}", run_name="__main__")
                 """
             )
-            env = os.environ.copy()
+            env = _deploy_subprocess_env()
             env["PYTHONUNBUFFERED"] = "1"
             combined = ""
             try:

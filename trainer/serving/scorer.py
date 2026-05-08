@@ -1281,6 +1281,18 @@ def build_features_for_scoring(
                         len(bets_df),
                     )
         except Exception as exc:
+            _pit_strict = (os.environ.get("SCORER_PIT_IDENTITY_STRICT") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            )
+            if _pit_strict:
+                raise RuntimeError(
+                    "SCORER_PIT_IDENTITY_STRICT: PIT identity merge failed; "
+                    "refusing cutoff_window fallback. See prior exception."
+                ) from exc
             logger.warning("[scorer] PIT identity failed (%s); using cutoff_window merge", exc)
 
     if not _pit_done:

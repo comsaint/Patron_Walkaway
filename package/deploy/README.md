@@ -18,7 +18,7 @@ Single process: continuously fetches from ClickHouse, runs scorer and validator,
 ## Setup
 
 1. **Copy env file**  
-   Copy `.env.example` to `.env` in this directory (e.g. `cp .env.example .env`) and fill in at least **`CH_USER`** and **`CH_PASS`**. Optional settings are documented inline in `.env.example` (e.g. `CH_HOST`, `CH_PORT`, `SOURCE_DB`, **`DEPLOY_LOG_LEVEL`** / **`LOGLEVEL`**, **`SCORER_COLD_START_WINDOW_HOURS`**, **`SCORER_LOOKBACK_HOURS`**, paths, SHAP, prediction-log retention).  
+   Copy `.env.example` to `.env` in this directory (e.g. `cp .env.example .env`) and fill in at least **`CH_USER`**, **`CH_PASS`**, and **`MODEL_DIR`** (directory containing **trainer output**: `model.pkl` + frozen `feature_spec.yaml`; see `doc/pipeline requirements.md` Production flow — there is no code default that assumes `package/deploy/models` is authoritative). Optional settings are documented inline in `.env.example` (e.g. `CH_HOST`, `CH_PORT`, `SOURCE_DB`, **`DEPLOY_LOG_LEVEL`** / **`LOGLEVEL`**, **`SCORER_COLD_START_WINDOW_HOURS`**, **`SCORER_LOOKBACK_HOURS`**, paths, SHAP, prediction-log retention).  
    - `PORT` or `ML_API_PORT` (default 8001)
 
 2. **Install dependencies** (repo development only)  

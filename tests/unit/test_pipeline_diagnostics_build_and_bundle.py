@@ -255,7 +255,7 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
 class TestIssue16Gates(unittest.TestCase):
     """trainer.training.issue16_gates — pure semantics for #16."""
 
-    def test_neg_sample_frac_below_one_fails_sampling_gate(self) -> None:
+    def test_neg_sample_frac_below_one_passes_post_step7_mode(self) -> None:
         from trainer.training.issue16_gates import evaluate_issue16_gate_bundle
 
         r = evaluate_issue16_gate_bundle(
@@ -263,6 +263,20 @@ class TestIssue16Gates(unittest.TestCase):
             chunk_train_end_naive="2024-01-01",
             row_level_train_end_max="2024-01-01",
             train_end_source="chunk_level_train_end",
+            train_neg_sampling_mode="post_step7",
+        )
+        self.assertTrue(r["gates"]["valid_test_sampling_guard"]["ok"])
+        self.assertTrue(r["gates"]["split_contract_guard"]["ok"])
+
+    def test_neg_sample_frac_below_one_fails_legacy_chunk_mode(self) -> None:
+        from trainer.training.issue16_gates import evaluate_issue16_gate_bundle
+
+        r = evaluate_issue16_gate_bundle(
+            effective_neg_sample_frac=0.5,
+            chunk_train_end_naive="2024-01-01",
+            row_level_train_end_max="2024-01-01",
+            train_end_source="chunk_level_train_end",
+            train_neg_sampling_mode="legacy_chunk",
         )
         self.assertFalse(r["gates"]["valid_test_sampling_guard"]["ok"])
         self.assertTrue(r["gates"]["split_contract_guard"]["ok"])
@@ -281,6 +295,7 @@ class TestIssue16Gates(unittest.TestCase):
             chunk_train_end_naive="2024-01-01",
             row_level_train_end_max="2024-01-01",
             train_end_source="chunk_level_train_end",
+            train_neg_sampling_mode="legacy_chunk",
         )
         with patch.dict(os.environ, {"TRAINER_ISSUE16_STRICT_GATES": "1"}):
             with self.assertRaises(RuntimeError):

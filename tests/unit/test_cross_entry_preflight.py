@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import MagicMock, patch
+
+import pandas as pd
 
 from trainer.training.cross_entry_preflight import run_cross_entry_data_preflight
 
@@ -38,7 +43,8 @@ class TestCrossEntryPreflight(unittest.TestCase):
                 use_local_parquet=False,
                 logger=log,
             )
-        m_core.assert_called_once_with("SELECT 1 AS _ok")
+        self.assertGreaterEqual(m_core.call_count, 1)
+        m_core.assert_any_call("SELECT 1 AS _ok")
 
     def test_clickhouse_failure_wraps_runtimeerror(self) -> None:
         log = logging.getLogger("test_ws4c")
@@ -55,6 +61,89 @@ class TestCrossEntryPreflight(unittest.TestCase):
         self.assertIn("DataPreflight[validator]", str(ctx.exception))
         self.assertIn("ClickHouse check failed", str(ctx.exception))
         self.assertIn("CH_HOST", str(ctx.exception))
+
+
+class TestProductionFreshnessPreflight(unittest.TestCase):
+    """Issue #19: bundle global_window.end vs warehouse max(__etl_insert_Dtm)."""
+
+    def test_strict_requires_model_dir(self) -> None:
+        log = logging.getLogger("test_fresh_strict")
+        prev_md = os.environ.pop("MODEL_DIR", None)
+        try:
+            with patch.dict(os.environ, {"PRODUCTION_FRESHNESS_STRICT": "1"}, clear=False):
+                with patch("trainer.core.db_conn.query_df", return_value=MagicMock()):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        run_cross_entry_data_preflight(
+                            entry="scorer",
+                            use_local_parquet=False,
+                            logger=log,
+                        )
+            self.assertIn("MODEL_DIR", str(ctx.exception))
+        finally:
+            if prev_md is not None:
+                os.environ["MODEL_DIR"] = prev_md
+
+    def test_freshness_ok_when_etl_after_train_end(self) -> None:
+        log = logging.getLogger("test_fresh_ok")
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            (bundle / "model.pkl").write_bytes(b"x")
+            meta = {"global_window": {"end": "2025-06-01T00:00:00"}}
+            (bundle / "model_metadata.json").write_text(
+                json.dumps(meta),
+                encoding="utf-8",
+            )
+
+            def _side_effect(sql: str) -> object:
+                if "SELECT 1" in sql:
+                    return MagicMock()
+                if "max(__etl_insert_Dtm)" in sql:
+                    return pd.DataFrame({"mx": [pd.Timestamp("2099-01-01")]})
+                raise AssertionError(sql)
+
+            with patch.dict(
+                os.environ,
+                {"MODEL_DIR": str(bundle), "PRODUCTION_FRESHNESS_STRICT": "0"},
+                clear=False,
+            ):
+                with patch("trainer.core.db_conn.query_df", side_effect=_side_effect):
+                    run_cross_entry_data_preflight(
+                        entry="scorer",
+                        use_local_parquet=False,
+                        logger=log,
+                    )
+
+    def test_freshness_strict_raises_when_etl_before_train_end(self) -> None:
+        log = logging.getLogger("test_fresh_bad")
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            (bundle / "model.pkl").write_bytes(b"x")
+            meta = {"global_window": {"end": "2025-06-01T00:00:00"}}
+            (bundle / "model_metadata.json").write_text(
+                json.dumps(meta),
+                encoding="utf-8",
+            )
+
+            def _side_effect(sql: str) -> object:
+                if "SELECT 1" in sql:
+                    return MagicMock()
+                if "max(__etl_insert_Dtm)" in sql:
+                    return pd.DataFrame({"mx": [pd.Timestamp("2020-01-01")]})
+                raise AssertionError(sql)
+
+            with patch.dict(
+                os.environ,
+                {"MODEL_DIR": str(bundle), "PRODUCTION_FRESHNESS_STRICT": "1"},
+                clear=False,
+            ):
+                with patch("trainer.core.db_conn.query_df", side_effect=_side_effect):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        run_cross_entry_data_preflight(
+                            entry="scorer",
+                            use_local_parquet=False,
+                            logger=log,
+                        )
+        self.assertIn("PRODUCTION_FRESHNESS_STRICT", str(ctx.exception))
 
 
 class TestWS5EntrypointPreflightContract(unittest.TestCase):

@@ -21,13 +21,11 @@ from trainer.core import config as core_config
 
 
 def _write_min_bridge_manifest(root: Path) -> None:
-    bet = (root / "gmwds_t_bet.parquet").resolve()
-    sess = (root / "gmwds_t_session.parquet").resolve()
     (root / "trainer_local_parquet_bridge.manifest.json").write_text(
         json.dumps({
             "artifact_kind": "trainer_local_parquet_bridge_v1",
-            "t_bet_paths": [str(bet)],
-            "gmwds_t_session": str(sess),
+            "gmwds_t_bet": "gmwds_t_bet.parquet",
+            "gmwds_t_session": "gmwds_t_session.parquet",
             "bet_includes_run_trip_lda_columns": False,
             "input_fingerprint": "testfp",
         }),

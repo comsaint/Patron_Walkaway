@@ -44,13 +44,41 @@ def strict_issue16_gates_enabled() -> bool:
     return _truthy_env("TRAINER_ISSUE16_STRICT_GATES")
 
 
-def valid_test_sampling_guard(*, effective_neg_sample_frac: float) -> Tuple[bool, str]:
-    """Check that valid/test rows were not subject to per-chunk negative downsampling.
+def issue19_rollout_env_flags() -> Dict[str, bool]:
+    """JSON-serialisable snapshot of Issue #19-related strict toggles (staging diagnostics)."""
+    return {
+        "TRAINER_ISSUE16_STRICT_GATES": _truthy_env("TRAINER_ISSUE16_STRICT_GATES"),
+        "TRAINER_PIT_IDENTITY_STRICT": _truthy_env("TRAINER_PIT_IDENTITY_STRICT"),
+        "SCORER_PIT_IDENTITY_STRICT": _truthy_env("SCORER_PIT_IDENTITY_STRICT"),
+        "PRODUCTION_FRESHNESS_STRICT": _truthy_env("PRODUCTION_FRESHNESS_STRICT"),
+        "DISABLE_PRODUCTION_FRESHNESS_PREFLIGHT": _truthy_env(
+            "DISABLE_PRODUCTION_FRESHNESS_PREFLIGHT"
+        ),
+        "TRAINER_MATERIALIZATION_STRICT_GATES": _truthy_env(
+            "TRAINER_MATERIALIZATION_STRICT_GATES"
+        ),
+    }
 
-    Today negatives are downsampled inside ``process_chunk`` **before** row-level
-    split, so any ``effective_neg_sample_frac < 1.0`` violates #16 full valid/test
-    label distribution semantics.
+
+def valid_test_sampling_guard(
+    *,
+    effective_neg_sample_frac: float,
+    train_neg_sampling_mode: str = "post_step7",
+) -> Tuple[bool, str]:
+    """Check valid/test were not subject to chunk-level negative downsampling.
+
+    ``post_step7`` (Issue #19): negatives may be downsampled **only** on the train
+    split after Step 7; ``effective_neg_sample_frac`` applies to train only.
+
+    ``legacy_chunk``: old semantics — downsampling inside ``process_chunk`` before
+    split poisoned all splits when frac < 1.0.
     """
+    if train_neg_sampling_mode == "post_step7":
+        return (
+            True,
+            f"train-only post-split neg sampling (Issue #19); "
+            f"train_neg_sample_frac={effective_neg_sample_frac:.6f} does not affect valid/test",
+        )
     if effective_neg_sample_frac >= 1.0 - 1e-12:
         return True, "effective_neg_sample_frac>=1.0 (no per-chunk neg downsample)"
     return (
@@ -102,13 +130,19 @@ def split_contract_guard(
     return False, f"train_end mismatch: chunk={a!s} row_max={b!s}"
 
 
-def metric_semantics_guard(*, effective_neg_sample_frac: float) -> Tuple[bool, str]:
+def metric_semantics_guard(
+    *,
+    effective_neg_sample_frac: float,
+    train_neg_sampling_mode: str = "post_step7",
+) -> Tuple[bool, str]:
     """Ensure PR-AUC / ROC / logloss on valid/test reflect raw row populations.
 
-    For the legacy pipeline this collapses to the same check as
-    ``valid_test_sampling_guard`` (neg downsample poisons all splits).
+    Aligns with ``valid_test_sampling_guard`` for the active ``train_neg_sampling_mode``.
     """
-    return valid_test_sampling_guard(effective_neg_sample_frac=effective_neg_sample_frac)
+    return valid_test_sampling_guard(
+        effective_neg_sample_frac=effective_neg_sample_frac,
+        train_neg_sampling_mode=train_neg_sampling_mode,
+    )
 
 
 def label_asset_freshness_guard(
@@ -183,10 +217,14 @@ def evaluate_issue16_gate_bundle(
     split_flags: Optional[Mapping[str, Any]] = None,
     train_column_names: Optional[Sequence[str]] = None,
     feature_spec: Optional[Mapping[str, Any]] = None,
+    train_neg_sampling_mode: str = "post_step7",
 ) -> Dict[str, Any]:
     """Run all #16 gates and return a JSON-serialisable report."""
     gates: Dict[str, Dict[str, Any]] = {}
-    ok_v, msg_v = valid_test_sampling_guard(effective_neg_sample_frac=effective_neg_sample_frac)
+    ok_v, msg_v = valid_test_sampling_guard(
+        effective_neg_sample_frac=effective_neg_sample_frac,
+        train_neg_sampling_mode=train_neg_sampling_mode,
+    )
     gates["valid_test_sampling_guard"] = {"ok": ok_v, "detail": msg_v}
     ok_s, msg_s = split_contract_guard(
         chunk_train_end_naive=chunk_train_end_naive,
@@ -194,7 +232,10 @@ def evaluate_issue16_gate_bundle(
         train_end_source=train_end_source,
     )
     gates["split_contract_guard"] = {"ok": ok_s, "detail": msg_s}
-    ok_m, msg_m = metric_semantics_guard(effective_neg_sample_frac=effective_neg_sample_frac)
+    ok_m, msg_m = metric_semantics_guard(
+        effective_neg_sample_frac=effective_neg_sample_frac,
+        train_neg_sampling_mode=train_neg_sampling_mode,
+    )
     gates["metric_semantics_guard"] = {"ok": ok_m, "detail": msg_m}
     ok_l, msg_l = label_asset_freshness_guard(
         training_source_snapshot_id=training_source_snapshot_id,
@@ -221,9 +262,12 @@ def evaluate_issue16_gate_bundle(
     gates["spec_first_column_guard"] = {"ok": ok_sf, "detail": msg_sf}
     all_ok = all(v.get("ok") for v in gates.values())
     return {
-        "issue16_gate_contract_version": "2026-05-07",
+        "issue16_gate_contract_version": "2026-05-08",
+        "issue19_contract_version": "2026-05-08",
         "split_sampling_contract_version": SPLIT_SAMPLING_CONTRACT_VERSION,
         "strict_gates_enabled": strict_issue16_gates_enabled(),
+        "train_neg_sampling_mode": train_neg_sampling_mode,
+        "issue19_rollout_env_flags": issue19_rollout_env_flags(),
         "all_ok": all_ok,
         "gates": gates,
     }

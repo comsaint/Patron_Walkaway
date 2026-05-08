@@ -149,3 +149,19 @@ def test_sanitize_catboost_gpu_removes_rsm_for_logloss() -> None:
     sanitized = trainer_mod._sanitize_catboost_params_for_runtime(params)
 
     assert "rsm" not in sanitized
+
+
+def test_run_backend_optuna_search_libsvm_disk_hpo_requires_lightgbm() -> None:
+    """libsvm_disk_hpo is implemented only for the LightGBM native path."""
+    with pytest.raises(ValueError, match="lightgbm"):
+        trainer_mod.run_backend_optuna_search(
+            pd.DataFrame(),
+            pd.Series(dtype=int),
+            pd.DataFrame(),
+            pd.Series(dtype=int),
+            pd.Series(dtype=float),
+            backend="catboost",
+            n_trials=1,
+            label="unit",
+            libsvm_disk_hpo=(Path("a.libsvm"), Path("b.libsvm"), 1, ("f0",)),
+        )

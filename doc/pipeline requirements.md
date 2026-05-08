@@ -69,6 +69,20 @@ Validator (production ground truth)
 
 Notes
 =====
+- **Portable manifests**: trainer ingress rejects absolute paths outside ``PROJECT_ROOT``
+  when ``TRAINER_MANIFEST_PATH_STRICT`` is unset or ``1`` (default). Emit-time
+  ``parallel_lda_mvp`` bridge paths must be expressible relative to the chosen anchor
+  (otherwise emit raises). Legacy hosts may set ``TRAINER_MANIFEST_PATH_STRICT=0``.
+- **Final train+valid refit (§12)**: in-memory / Plan-B-CSV LightGBM paths refit on
+  ``train ∪ valid`` after selection using the same tree budget as early stopping.
+  LibSVM-on-disk **without** ``TRAINER_FILE_BACKED_STRICT`` skips refit (see
+  ``training_metrics`` → ``final_refit_train_valid``).
+  When ``TRAINER_FILE_BACKED_STRICT`` is ``1``/``true``/``yes``/``on`` (issue #25),
+  the rated LibSVM path performs a **file-backed** refit by merging train and valid
+  LibSVM (and weight lines) before a second ``lgb.train`` with ``num_boost_round=best_iteration``.
+  A3 CatBoost/XGBoost disk training **does not** fall back to in-memory fit in strict mode
+  (disk failure is fatal). Set ``TRAINER_DISABLE_FINAL_REFIT_TRAIN_VALID=1`` to skip refit for debugging only.
+
 A. Tables and the **dev** feature catalog change often; incremental rebuilds should
    touch only invalidated partitions / fingerprints (bridge + materialization cache keys).
 

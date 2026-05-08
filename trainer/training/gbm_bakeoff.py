@@ -292,6 +292,10 @@ def _train_catboost_backend(
                 quantize_first=bool(getattr(_cfg, "GBM_BAKEOFF_CATBOOST_QUANTIZE", False)),
             )
         except Exception as exc:
+            from trainer.training.split_file_bundle import trainer_file_backed_strict_enabled
+
+            if trainer_file_backed_strict_enabled():
+                raise
             logger.warning(
                 "A3 CatBoost LibSVM-disk train failed; falling back to in-memory fit: %s",
                 exc,
@@ -364,6 +368,10 @@ def _train_xgboost_backend(
                 ),
             )
         except Exception as exc:
+            from trainer.training.split_file_bundle import trainer_file_backed_strict_enabled
+
+            if trainer_file_backed_strict_enabled():
+                raise
             logger.warning(
                 "A3 XGBoost LibSVM-disk train failed; falling back to in-memory fit: %s",
                 exc,

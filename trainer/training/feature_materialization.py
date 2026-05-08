@@ -449,6 +449,7 @@ def evaluate_materialization_gate_bundle() -> Dict[str, Any]:
     all_ok = all(bool(g.get("ok")) for g in gates.values())
     return {
         "materialization_gate_contract_version": "2026-05-08",
+        "issue19_contract_version": "2026-05-08",
         "strict_materialization_gates_enabled": _truthy_env("TRAINER_MATERIALIZATION_STRICT_GATES"),
         "all_ok": all_ok,
         "gates": gates,

@@ -92,6 +92,13 @@ from trainer.training.ranking_recipe_weights import (
     write_libsvm_weight_file,
     resolve_ranking_recipe,
 )
+from trainer.training.split_file_bundle import (
+    merge_libsvm_files,
+    merge_train_valid_weight_files,
+    trainer_file_backed_strict_enabled,
+    validate_libsvm_paths_exist,
+    write_split_manifest,
+)
 from trainer.training.two_stage import (
     A4_FUSION_MODE_PRODUCT,
     candidate_cutoff_from_threshold,
@@ -143,7 +150,11 @@ _PIPELINE_ECHO_PREFIX = "[Pipeline]"
 
 
 def pipeline_echo(msg: str) -> None:
-    """Single-line stdout milestone for operators (keep detailed logs on ``logger``)."""
+    """Single-line stdout milestone for operators (keep detailed logs on ``logger``).
+
+    Prefer messages prefixed with ``Step N/11 —`` (``N`` in 0–10; optional ``7b``; 11 steps total) so
+    terminal progress aligns with pipeline diagnostics step keys.
+    """
     print(f"{_PIPELINE_ECHO_PREFIX} {msg}", flush=True)
 
 # MLflow namespace: keep this project isolated on shared tracking server.
@@ -1709,6 +1720,59 @@ def _chunk_parquet_path(chunk: dict) -> Path:
     return CHUNK_DIR / f"chunk_{ws}_{we}.parquet"
 
 
+def apply_train_only_negative_downsampling(
+    train_df: pd.DataFrame,
+    *,
+    neg_sample_frac: float,
+    random_state: int,
+) -> pd.DataFrame:
+    """Downsample label=0 rows on the train split only (GitHub #19).
+
+    Valid/test splits must remain full populations; chunk-level downsampling was removed.
+    """
+    if neg_sample_frac >= 1.0 - 1e-12 or train_df.empty or "label" not in train_df.columns:
+        return train_df
+    _pos_mask = train_df["label"] == 1
+    _n_neg_before = int((~_pos_mask).sum())
+    if _n_neg_before == 0:
+        return train_df
+    _neg_keep = train_df.loc[~_pos_mask].sample(
+        frac=neg_sample_frac, random_state=random_state
+    )
+    out = pd.concat([train_df.loc[_pos_mask], _neg_keep], ignore_index=True)
+    logger.info(
+        "Step 7b train-only neg downsample: frac=%.4f rows %d->%d (neg %d->%d)",
+        neg_sample_frac,
+        len(train_df),
+        len(out),
+        _n_neg_before,
+        len(_neg_keep),
+    )
+    if int((out["label"] == 0).sum()) == 0:
+        logger.error(
+            "train-only neg_sample_frac=%.4f removed ALL train negatives — "
+            "increase NEG_SAMPLE_FRAC or NEG_SAMPLE_FRAC_MIN.",
+            neg_sample_frac,
+        )
+    return out
+
+
+def _apply_train_neg_downsample_to_parquet(
+    train_path: Path,
+    *,
+    neg_sample_frac: float,
+    random_state: int,
+) -> None:
+    """Rewrite on-disk train split Parquet after train-only negative downsampling."""
+    df = pd.read_parquet(train_path)
+    out = apply_train_only_negative_downsampling(
+        df, neg_sample_frac=neg_sample_frac, random_state=random_state
+    )
+    tmp = train_path.with_suffix(".parquet.tmp")
+    out.to_parquet(tmp, index=False)
+    tmp.replace(train_path)
+
+
 def _chunk_prefeatures_parquet_path(chunk: dict) -> Path:
     """Task 7 R6: Parquet of bets after run_state_machine, before bet_duckdb_window."""
     ws = chunk["window_start"].strftime("%Y%m%d")
@@ -2319,9 +2383,9 @@ def process_chunk(
     feature_spec: parsed feature spec (bet_duckdb_window / legacy track_llm) loaded by run_pipeline.
     feature_spec_hash: short hash of the feature spec used to compute bet-layer DuckDB window
         columns; included in the chunk cache key so spec changes bust cache.
-    neg_sample_frac: fraction of label=0 rows to keep (1.0 = keep all).  Overrides
-        the module-level NEG_SAMPLE_FRAC; normally supplied by run_pipeline after the
-        OOM pre-check (_oom_check_and_adjust_neg_sample_frac).
+    neg_sample_frac: ignored for chunk output (GitHub #19). Chunk Parquets are full;
+        train-only negative downsampling runs after Step 7. Kept on the signature for
+        OOM-probe call compatibility.
 
     Task 7 R6: pre-LLM Parquet cache (``*.prefeatures.parquet``) is **on by default**
     (``trainer.core.config.CHUNK_TWO_STAGE_CACHE_DEFAULT``) so run_state_machine can be skipped
@@ -2373,7 +2437,7 @@ def process_chunk(
             None,
             profile_hash=_profile_hash,
             feature_spec_hash=feature_spec_hash,
-            neg_sample_frac=neg_sample_frac,
+            neg_sample_frac=1.0,
             data_hash=_dh_local,
             identity_mapping_mode=identity_mapping_mode,
             pit_identity_engine=_pit_engine,
@@ -2417,7 +2481,7 @@ def process_chunk(
             None,
             profile_hash=_profile_hash,
             feature_spec_hash=feature_spec_hash,
-            neg_sample_frac=neg_sample_frac,
+            neg_sample_frac=1.0,
             data_hash=_dh_clickhouse,
             identity_mapping_mode=identity_mapping_mode,
             pit_identity_engine=_pit_engine,
@@ -2472,6 +2536,13 @@ def process_chunk(
     # --- Identity: attach canonical_id (cutoff-window vs PIT as-of, B3) ---
     _mode = str(identity_mapping_mode or "cutoff_window").strip().lower()
     _use_pit = (_mode == "pit_asof" and use_local_parquet)
+    _pit_strict = (os.environ.get("TRAINER_PIT_IDENTITY_STRICT") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
     if _use_pit:
         _sess_path = local_parquet_session_path_for_trainer()
         try:
@@ -2481,13 +2552,21 @@ def process_chunk(
                 observation_end=extended_end,
             )
             if "_pit_rated" not in bets.columns:
-                logger.warning(
-                    "Chunk %s–%s: PIT DuckDB merge missing _pit_rated; fallback to cutoff_window",
-                    window_start.date(),
-                    window_end.date(),
+                _msg = (
+                    f"Chunk {window_start.date()}–{window_end.date()}: PIT DuckDB merge missing _pit_rated"
                 )
+                if _pit_strict:
+                    raise RuntimeError(
+                        f"{_msg}; TRAINER_PIT_IDENTITY_STRICT=1 forbids cutoff_window fallback."
+                    )
+                logger.warning("%s; fallback to cutoff_window", _msg)
                 _use_pit = False
         except Exception as _pit_exc:
+            if _pit_strict:
+                raise RuntimeError(
+                    f"Chunk {window_start.date()}–{window_end.date()}: PIT DuckDB identity failed "
+                    f"({_pit_exc!r}); TRAINER_PIT_IDENTITY_STRICT=1 forbids cutoff_window fallback."
+                ) from _pit_exc
             logger.warning(
                 "Chunk %s–%s: PIT DuckDB identity failed (%s); fallback to cutoff_window",
                 window_start.date(),
@@ -2761,37 +2840,8 @@ def process_chunk(
     _n_pos_before_sample = int(labeled["label"].sum())
     _n_rated_before_sample = int(labeled["is_rated"].sum())
 
-    # --- Per-chunk negative downsampling (OOM mitigation, config.NEG_SAMPLE_FRAC) ---
-    # Keep ALL positives; downsample negatives to neg_sample_frac fraction.
-    # class_weight='balanced' + per-run sample_weight compensate automatically.
-    if neg_sample_frac < 1.0 and "label" in labeled.columns:
-        _pos_mask = labeled["label"] == 1
-        _n_neg_before = int((~_pos_mask).sum())
-        # R-NEG-6: chunk-specific seed avoids systematic same-index bias across chunks.
-        # R-371-5: use hashlib instead of built-in hash() which is randomised per
-        # process by PYTHONHASHSEED (Python 3.3+), making seeds non-reproducible.
-        _chunk_seed = int(
-            hashlib.md5(
-                f"{window_start.isoformat()}|{window_end.isoformat()}".encode()
-            ).hexdigest()[:8],
-            16,
-        ) % (2**31)
-        _neg_keep = labeled[~_pos_mask].sample(frac=neg_sample_frac, random_state=_chunk_seed)
-        labeled = pd.concat([labeled[_pos_mask], _neg_keep], ignore_index=True)
-        logger.info(
-            "Chunk %s–%s: neg downsample frac=%.2f  rows %d->%d  "
-            "(pos kept: %d, neg: %d->%d)",
-            window_start.date(), window_end.date(),
-            neg_sample_frac, _n_total_before_sample, len(labeled),
-            _n_pos_before_sample, _n_neg_before, len(_neg_keep),
-        )
-        # R-NEG-7: guard against extreme frac values that remove all negatives.
-        if int((labeled["label"] == 0).sum()) == 0:
-            logger.error(
-                "Chunk %s–%s: neg_sample_frac=%.4f removed ALL negatives — "
-                "model training will fail. Increase NEG_SAMPLE_FRAC or NEG_SAMPLE_FRAC_MIN.",
-                window_start.date(), window_end.date(), neg_sample_frac,
-            )
+    # GitHub #19: negative downsampling is applied only to the train split after Step 7,
+    # not here (chunk Parquets stay full valid/test populations).
 
     logger.info(
         "Chunk %s–%s: %d rows (label=1: %d, rated: %d)",
@@ -3173,7 +3223,7 @@ def _export_parquet_to_libsvm(
                     n_valid += 1
         os.replace(valid_libsvm_tmp, valid_libsvm)
 
-        n_test = 0
+        n_test_rows = 0
         if test_path is not None and test_path.exists():
             test_libsvm = export_dir / "test_for_lgb.libsvm"
             test_libsvm_tmp = export_dir / "test_for_lgb.libsvm.tmp"
@@ -3219,7 +3269,7 @@ def _export_parquet_to_libsvm(
                         if nf > 0 and ((not math.isfinite(_last_num)) or _last_num == 0.0):
                             parts.append(f"{nf - 1}:0")
                         f_lib.write(" ".join(parts) + "\n")
-                        n_test += 1
+                        n_test_rows += 1
             os.replace(test_libsvm_tmp, test_libsvm)
     finally:
         con.close()
@@ -3263,7 +3313,7 @@ def _export_parquet_to_libsvm(
     if test_libsvm is not None:
         logger.info(
             "Exported LibSVM for Plan B+: train %s (%d rows + weight), valid %s (%d rows), test %s (%d rows)",
-            train_libsvm, n_train, valid_libsvm, n_valid, test_libsvm, n_test,
+            train_libsvm, n_train, valid_libsvm, n_valid, test_libsvm, n_test_rows,
         )
     else:
         logger.info(
@@ -3275,6 +3325,22 @@ def _export_parquet_to_libsvm(
     if _bin_in_export.is_file():
         _bin_in_export.unlink(missing_ok=True)
         logger.info("LibSVM export: removed stale %s so training uses current feature set.", _bin_in_export.name)
+    try:
+        write_split_manifest(
+            export_dir,
+            train_libsvm=train_libsvm,
+            valid_libsvm=valid_libsvm,
+            test_libsvm=test_libsvm,
+            feature_columns=list(feature_cols),
+            train_row_count=int(n_train),
+            valid_row_count=int(n_valid),
+            test_row_count=int(n_test_rows) if test_libsvm is not None else None,
+        )
+    except OSError as _manifest_exc:
+        logger.warning(
+            "LibSVM export: could not write split manifest (%s); continuing without manifest.",
+            _manifest_exc,
+        )
     return (train_libsvm, valid_libsvm, test_libsvm)
 
 
@@ -4088,6 +4154,51 @@ def _suggest_backend_optuna_params(
     raise ValueError(f"Unsupported HPO backend: {backend}")
 
 
+def _fit_lightgbm_hpo_scores_from_libsvm(
+    params: dict[str, Any],
+    *,
+    train_libsvm: Path,
+    valid_libsvm: Path,
+    train_row_count: int,
+    feature_names: Sequence[str],
+) -> np.ndarray:
+    """One Optuna trial: train LightGBM from LibSVM paths only (no dense train matrix)."""
+    from trainer.training.gbm_bakeoff_disk import ensure_train_weight_f32_memmap
+
+    w_mm, _n = ensure_train_weight_f32_memmap(
+        Path(train_libsvm), expected_rows=int(train_row_count)
+    )
+    ds_params = _lgb_dataset_params_for_pipeline()
+    hp_lgb: dict[str, Any] = {**_lgb_params_for_pipeline()}
+    for k, v in params.items():
+        if k == "n_estimators":
+            continue
+        hp_lgb[k] = v
+    num_boost = max(1, int(params.get("n_estimators", 400)))
+    fn = [str(x) for x in feature_names]
+    dtrain = lgb.Dataset(
+        str(train_libsvm),
+        weight=w_mm,
+        feature_name=fn,
+        params=ds_params,
+    )
+    dvalid = lgb.Dataset(
+        str(valid_libsvm),
+        reference=dtrain,
+        feature_name=fn,
+        params=ds_params,
+    )
+    booster = lgb.train(
+        hp_lgb,
+        dtrain,
+        num_boost_round=num_boost,
+        valid_sets=[dvalid],
+        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+    )
+    pred = booster.predict(dvalid)
+    return np.asarray(pred, dtype=np.float64).reshape(-1)
+
+
 def _fit_backend_hpo_scores(
     backend: str,
     *,
@@ -4171,6 +4282,7 @@ def run_backend_optuna_search(
     hpo_sample_rows: Optional[int] = OPTUNA_HPO_SAMPLE_ROWS,
     hpo_objective_manifest: Optional[list[dict[str, Any]]] = None,
     backend_runtime_params: Optional[Mapping[str, Any]] = None,
+    libsvm_disk_hpo: Optional[Tuple[Path, Path, int, Tuple[str, ...]]] = None,
 ) -> dict:
     """TPE hyperparameter search on validation.
 
@@ -4203,9 +4315,32 @@ def run_backend_optuna_search(
     timeout_eff = budget["timeout_seconds"]
     early_stop_patience_eff = budget["early_stop_patience"]
 
+    _libsvm_disk_hpo = libsvm_disk_hpo is not None
+    _disk_tr_p: Optional[Path] = None
+    _disk_va_p: Optional[Path] = None
+    _disk_tr_rows = 0
+    _disk_feats: Tuple[str, ...] = ()
+    if _libsvm_disk_hpo:
+        if backend_n != "lightgbm":
+            raise ValueError("libsvm_disk_hpo is only supported for backend='lightgbm'")
+        _dt0, _dv0, _dn0, _df0 = libsvm_disk_hpo
+        _disk_tr_p = Path(_dt0)
+        _disk_va_p = Path(_dv0)
+        _disk_tr_rows = int(_dn0)
+        _disk_feats = tuple(str(x) for x in _df0)
+
     # R705: guard against empty validation input — return empty dict (base params)
     # rather than crashing inside LightGBM or average_precision_score.
-    if X_val.empty or len(y_val) == 0:
+    # LibSVM disk HPO: labels come from the valid LibSVM file (X_val may be empty).
+    _y_val_ref = (
+        _labels_from_libsvm(_disk_va_p)
+        if _libsvm_disk_hpo and _disk_va_p is not None
+        else y_val
+    )
+    _val_empty = (not _libsvm_disk_hpo and (X_val.empty or len(y_val) == 0)) or (
+        _libsvm_disk_hpo and len(_y_val_ref) == 0
+    )
+    if _val_empty:
         logger.warning(
             "%s[%s]: empty validation set - skipping Optuna search, returning base params.",
             label or "model",
@@ -4308,7 +4443,11 @@ def run_backend_optuna_search(
         if isinstance(hpo_sample_rows, int) and hpo_sample_rows > 0
         else None
     )
-    if _sample_rows is not None and len(X_train) > _sample_rows:
+    if (
+        not _libsvm_disk_hpo
+        and _sample_rows is not None
+        and len(X_train) > _sample_rows
+    ):
         # Stratified sample train to _sample_rows; fallback to random if single class.
         idx = np.arange(len(X_train))
         try:
@@ -4353,6 +4492,14 @@ def run_backend_optuna_search(
             _hpo_ratio,
         )
 
+    if _libsvm_disk_hpo:
+        y_vl = _y_val_ref
+        logger.info(
+            "Optuna HPO[%s]: disk LibSVM validation rows=%d (no in-memory HPO subsampling).",
+            backend_n,
+            len(y_vl),
+        )
+
     _val_np_ratio: Optional[float] = _neg_pos_ratio_from_binary_labels(y_vl)
     _ft_hpo_uses_prod_adj = (
         _use_ft_hpo
@@ -4393,15 +4540,24 @@ def run_backend_optuna_search(
         params = _suggest_backend_optuna_params(backend_n, trial)
         if backend_runtime_params:
             params.update(dict(backend_runtime_params))
-        scores = _fit_backend_hpo_scores(
-            backend_n,
-            params=params,
-            X_tr=X_tr,
-            y_tr=y_tr,
-            X_vl=X_vl,
-            y_vl=y_vl,
-            sw_tr=sw_tr,
-        )
+        if _libsvm_disk_hpo and _disk_tr_p is not None and _disk_va_p is not None:
+            scores = _fit_lightgbm_hpo_scores_from_libsvm(
+                params,
+                train_libsvm=_disk_tr_p,
+                valid_libsvm=_disk_va_p,
+                train_row_count=_disk_tr_rows,
+                feature_names=_disk_feats,
+            )
+        else:
+            scores = _fit_backend_hpo_scores(
+                backend_n,
+                params=params,
+                X_tr=X_tr,
+                y_tr=y_tr,
+                X_vl=X_vl,
+                y_vl=y_vl,
+                sw_tr=sw_tr,
+            )
         if _use_ft_hpo:
             _pick = pick_threshold_dec026(
                 np.asarray(y_vl, dtype=float),
@@ -4458,7 +4614,7 @@ def run_backend_optuna_search(
     optuna_pbar = (
         _ProgressNoop()
         if _disable_bar
-        else _tqdm_bar(total=n_trials_eff, desc=f"Step 9 Optuna {backend_n}", unit="trial")
+        else _tqdm_bar(total=n_trials_eff, desc=f"Step 9/11 Optuna {backend_n}", unit="trial")
     )
 
     def _progress_callback(study: optuna.Study, trial: FrozenTrial) -> None:
@@ -4473,7 +4629,7 @@ def run_backend_optuna_search(
                 best_ap = None
             best_str = "%.4f" % (best_ap if best_ap is not None else float("nan"))
             logger.info(
-                "[Step 9] Optuna (%s[%s]) trial %d/%d  %s=%s  elapsed %.0fs (%.1f min)",
+                "[Step 9/11] Optuna (%s[%s]) trial %d/%d  %s=%s  elapsed %.0fs (%.1f min)",
                 label or "rated",
                 backend_n,
                 n,
@@ -4511,7 +4667,7 @@ def run_backend_optuna_search(
             study.stop()
             n = len(study.trials)
             logger.info(
-                "[Step 9] Optuna early stop (%s[%s]): no improvement for %d trials (stopped at trial %d/%d)",
+                "[Step 9/11] Optuna early stop (%s[%s]): no improvement for %d trials (stopped at trial %d/%d)",
                 label or "rated",
                 backend_n,
                 patience,
@@ -4576,6 +4732,11 @@ def run_backend_optuna_search(
             float(final_best_ap) if final_best_ap is not None else None
         ),
     }
+    if _libsvm_disk_hpo and _disk_tr_p is not None and _disk_va_p is not None:
+        _manifest_pay["optuna_hpo_data_source"] = "libsvm_disk"
+        _manifest_pay["optuna_hpo_train_libsvm"] = str(_disk_tr_p.resolve())
+        _manifest_pay["optuna_hpo_valid_libsvm"] = str(_disk_va_p.resolve())
+        _manifest_pay["optuna_hpo_train_row_count"] = int(_disk_tr_rows)
     if _sample_rows is not None:
         _manifest_pay["optuna_hpo_sample_rows_cap"] = int(_sample_rows)
     if _hpo_ratio is not None:
@@ -4613,6 +4774,7 @@ def run_optuna_search(
     field_test_constrained_optuna_objective_allowed: Optional[bool] = None,
     val_window_hours: Optional[float] = None,
     hpo_objective_manifest: Optional[list[dict[str, Any]]] = None,
+    libsvm_disk_hpo: Optional[Tuple[Path, Path, int, Tuple[str, ...]]] = None,
 ) -> dict:
     """Backward-compatible LightGBM Optuna wrapper."""
     return run_backend_optuna_search(
@@ -4627,12 +4789,74 @@ def run_optuna_search(
         field_test_constrained_optuna_objective_allowed=field_test_constrained_optuna_objective_allowed,
         val_window_hours=val_window_hours,
         hpo_objective_manifest=hpo_objective_manifest,
+        libsvm_disk_hpo=libsvm_disk_hpo,
     )
 
 
 # ---------------------------------------------------------------------------
 # Dual-model training
 # ---------------------------------------------------------------------------
+
+_ENV_DISABLE_FINAL_REFIT = "TRAINER_DISABLE_FINAL_REFIT_TRAIN_VALID"
+
+
+def _lgb_refit_tree_count(model: lgb.LGBMClassifier) -> int:
+    """Return boosting rounds to use when refitting on train+valid (post early stopping)."""
+    bi = getattr(model, "best_iteration_", None)
+    if bi is not None and int(bi) > 0:
+        return int(bi)
+    booster = getattr(model, "booster_", None)
+    if booster is not None:
+        try:
+            nt = int(booster.num_trees())
+            if nt > 0:
+                return nt
+        except Exception:
+            pass
+    return max(1, int(model.get_params().get("n_estimators", 100)))
+
+
+def _final_refit_lgbm_sklearn_on_train_valid(
+    model: lgb.LGBMClassifier,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    sw_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    hyperparams: dict,
+    *,
+    label: str = "",
+) -> lgb.LGBMClassifier:
+    """Refit LightGBM on train ∪ valid using the same tree budget as *model* (pipeline §12).
+
+    Threshold / val metrics remain from the train/valid selection phase; test is
+    evaluated only afterward. Skipped when validation is empty, when disabled via
+    ``TRAINER_DISABLE_FINAL_REFIT_TRAIN_VALID``, or when *model* is not an
+    ``LGBMClassifier`` (caller should skip for wrappers / other backends).
+    """
+    if os.environ.get(_ENV_DISABLE_FINAL_REFIT, "").strip().lower() in ("1", "true", "yes"):
+        return model
+    if X_val.empty or len(y_val) == 0:
+        return model
+    n_trees = _lgb_refit_tree_count(model)
+    merged_hp = {**dict(hyperparams), "n_estimators": n_trees}
+    params = {**_lgb_params_for_pipeline(), **merged_hp}
+    final = lgb.LGBMClassifier(**params)
+    X_tv = pd.concat([X_train, X_val], axis=0, ignore_index=True)
+    y_tv = pd.concat([y_train, y_val], axis=0, ignore_index=True)
+    sw_tr = sw_train.astype(float).reset_index(drop=True)
+    sw_v = pd.Series(np.ones(len(X_val), dtype=np.float64))
+    sw_tv = pd.concat([sw_tr, sw_v], axis=0, ignore_index=True)
+    final.fit(X_tv, y_tv, sample_weight=sw_tv)
+    if label:
+        logger.info(
+            "%s: final refit on train+valid rows=%d n_estimators=%d (pipeline §12)",
+            label,
+            int(len(X_tv)),
+            n_trees,
+        )
+    return final
+
 
 def _train_one_model(
     X_train: pd.DataFrame,
@@ -5594,6 +5818,25 @@ def train_dual_model(
             val_dec026_window_hours=_dec026_wh,
             val_dec026_min_alerts_per_hour=_dec026_mah,
         )
+        if not X_vl.empty and len(y_vl) > 0:
+            model = _final_refit_lgbm_sklearn_on_train_valid(
+                model,
+                X_tr,
+                y_tr,
+                sw,
+                X_vl,
+                y_vl,
+                hp,
+                label=name,
+            )
+            _fr_off = os.environ.get(_ENV_DISABLE_FINAL_REFIT, "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            metrics["final_refit_train_valid"] = not _fr_off
+        else:
+            metrics["final_refit_train_valid"] = False
 
         if _optuna_hpo_manifest_loop:
             metrics.update(_optuna_hpo_manifest_loop[0])
@@ -5802,6 +6045,22 @@ def train_single_rated_model(
                 )
                 use_from_libsvm = False
 
+    if use_from_libsvm and trainer_file_backed_strict_enabled():
+        if train_libsvm_paths is None:
+            raise RuntimeError("internal: use_from_libsvm without train_libsvm_paths")
+        _st_chk, _sv_chk = train_libsvm_paths
+        validate_libsvm_paths_exist(
+            Path(_st_chk),
+            Path(_sv_chk),
+            test_libsvm=Path(test_libsvm_path) if test_libsvm_path else None,
+        )
+        if test_df is not None and not test_df.empty:
+            if test_libsvm_path is None or not Path(test_libsvm_path).is_file():
+                raise FileNotFoundError(
+                    "TRAINER_FILE_BACKED_STRICT: test_df is non-empty but test_libsvm_path "
+                    "is missing or not a file; export test LibSVM or omit test_df."
+                )
+
     libsvm_optuna_search_ran = False
 
     train_rated: Optional[pd.DataFrame] = None
@@ -5913,11 +6172,17 @@ def train_single_rated_model(
         if len(_valid_cols) > 0:
             avail_cols = [c for c in avail_cols if c in _valid_cols]
 
+    _skip_views_for_strict_disk_hpo = (
+        trainer_file_backed_strict_enabled()
+        and use_from_libsvm
+        and run_optuna
+        and _get_train_rated().empty
+    )
     if (
         (not use_from_libsvm)
         or gbm_bakeoff
         or A4_TWO_STAGE_ENABLE_TRAINING
-        or (use_from_libsvm and run_optuna)
+        or (use_from_libsvm and run_optuna and not _skip_views_for_strict_disk_hpo)
     ):
         _ensure_inmemory_train_views(avail_cols)
 
@@ -5993,10 +6258,40 @@ def train_single_rated_model(
     }
     if use_from_libsvm:
         _vl_hpo = _get_val_rated()
+        _strict_libsvm_optuna = trainer_file_backed_strict_enabled() and run_optuna
+        _tls_o, _vls_o = train_libsvm_paths  # type: ignore[misc]
+        _libsvm_disk_hpo_arg: Optional[Tuple[Path, Path, int, Tuple[str, ...]]] = None
         _yvl_pos = 0.0
-        if not _vl_hpo.empty and "label" in _vl_hpo.columns:
-            _yvl_pos = float(pd.to_numeric(_vl_hpo["label"], errors="coerce").fillna(0).sum())
-        if run_optuna and not _get_train_rated().empty and not _vl_hpo.empty and _yvl_pos > 0:
+        if _strict_libsvm_optuna:
+            _y_file = np.asarray(_labels_from_libsvm(Path(_vls_o)), dtype=float)
+            _yvl_pos = float(np.sum(_y_file == 1.0))
+            _neg_ct = int(np.sum(_y_file == 0.0))
+            _pos_ct = int(np.sum(_y_file == 1.0))
+            _can_run_optuna_here = (
+                len(_y_file) >= int(MIN_VALID_TEST_ROWS)
+                and _pos_ct >= 1
+                and _neg_ct >= 1
+            )
+            if _can_run_optuna_here:
+                _libsvm_disk_hpo_arg = (
+                    Path(_tls_o),
+                    Path(_vls_o),
+                    int(_n_lines),
+                    tuple(str(c) for c in avail_cols),
+                )
+        else:
+            if not _vl_hpo.empty and "label" in _vl_hpo.columns:
+                _yvl_pos = float(
+                    pd.to_numeric(_vl_hpo["label"], errors="coerce").fillna(0).sum()
+                )
+            _can_run_optuna_here = (
+                run_optuna
+                and not _get_train_rated().empty
+                and not _vl_hpo.empty
+                and _yvl_pos > 0
+            )
+
+        if run_optuna and _can_run_optuna_here:
             _val_wh = _val_window_hours_from_payout_df(_vl_hpo)
             _ft_hpo_active = _ft_allowed and _val_wh is not None
             log_optuna_precondition_context(
@@ -6013,6 +6308,7 @@ def train_single_rated_model(
                     field_test_constrained_optuna_objective_allowed=_ft_allowed,
                     val_window_hours=_val_wh,
                     hpo_objective_manifest=_optuna_hpo_manifest,
+                    libsvm_disk_hpo=_libsvm_disk_hpo_arg,
                 )
                 libsvm_optuna_search_ran = True
             except RuntimeError as _opt_exc:
@@ -6031,7 +6327,15 @@ def train_single_rated_model(
         else:
             _skip_sr: Optional[str] = None
             if run_optuna:
-                if _get_train_rated().empty:
+                if _strict_libsvm_optuna:
+                    _yf = np.asarray(_labels_from_libsvm(Path(_vls_o)), dtype=float)
+                    if len(_yf) < int(MIN_VALID_TEST_ROWS):
+                        _skip_sr = "libsvm_strict_valid_too_small"
+                    elif int(np.sum(_yf == 1.0)) < 1:
+                        _skip_sr = "libsvm_strict_valid_no_positives"
+                    elif int(np.sum(_yf == 0.0)) < 1:
+                        _skip_sr = "libsvm_strict_valid_no_negatives"
+                elif _get_train_rated().empty:
                     _skip_sr = "libsvm_no_train_rows_for_hpo"
                 elif _vl_hpo.empty:
                     _skip_sr = "libsvm_no_validation_for_hpo"
@@ -6228,6 +6532,62 @@ def train_single_rated_model(
                 num_boost_round=num_boost_round,
             )
         avail_cols = list(booster.feature_name())
+        _did_strict_libsvm_refit = False
+        _strict_tv_paths: list[Path] = []
+        if (
+            trainer_file_backed_strict_enabled()
+            and _has_val_from_file
+            and os.environ.get(_ENV_DISABLE_FINAL_REFIT, "").strip().lower()
+            not in ("1", "true", "yes")
+        ):
+            from trainer.training.gbm_bakeoff_disk import ensure_train_weight_f32_memmap as _ensure_tv_w
+
+            _tv_dir = train_libsvm_p.parent
+            _fd_m, _p_m = tempfile.mkstemp(prefix=".tv_merge_", suffix=".libsvm", dir=str(_tv_dir))
+            os.close(_fd_m)
+            _merged_tv = Path(_p_m)
+            _merged_tv_w = Path(str(_merged_tv) + ".weight")
+            try:
+                _n_merged = merge_libsvm_files(_merged_tv, [Path(train_libsvm_p), Path(valid_libsvm_p)])
+                merge_train_valid_weight_files(
+                    _merged_tv_w,
+                    train_weight_txt=Path(str(train_libsvm_p) + ".weight"),
+                    valid_libsvm=Path(valid_libsvm_p),
+                )
+                _w_tv, _ = _ensure_tv_w(_merged_tv, expected_rows=int(_n_merged))
+                _strict_tv_paths.extend(
+                    [
+                        _merged_tv,
+                        _merged_tv_w,
+                        Path(str(_merged_tv) + ".weight.f32"),
+                    ]
+                )
+                _n_round_tv = max(1, int(booster.best_iteration))
+                _d_tv = lgb.Dataset(
+                    str(_merged_tv),
+                    weight=_w_tv,
+                    feature_name=list(avail_cols),
+                    params=_lgb_ds_params,
+                )
+                booster = lgb.train(hp_lgb, _d_tv, num_boost_round=_n_round_tv)
+                _did_strict_libsvm_refit = True
+                avail_cols = list(booster.feature_name())
+                logger.info(
+                    "rated Plan B+ LibSVM strict: file-backed final refit train∪valid rows=%d num_boost_round=%d",
+                    int(_n_merged),
+                    int(_n_round_tv),
+                )
+            except Exception as _tv_exc:
+                raise RuntimeError(
+                    "TRAINER_FILE_BACKED_STRICT: LibSVM train∪valid file-backed final refit failed "
+                    f"({_tv_exc})"
+                ) from _tv_exc
+            finally:
+                for _p in _strict_tv_paths:
+                    try:
+                        _p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         # PLAN B+ 階段 6: when valid_df not in memory, predict from file path; else in-memory (backward compat).
         _val_rated_eval = _get_val_rated()
         _missing_val_cols = (
@@ -6304,7 +6664,26 @@ def train_single_rated_model(
             "best_hyperparams": hp_resolved,
             "_uncalibrated": not _has_val,
             "diagnostic_libsvm_optuna_search_ran": bool(libsvm_optuna_search_ran),
+            "final_refit_train_valid": (
+                bool(_did_strict_libsvm_refit)
+                if trainer_file_backed_strict_enabled()
+                else "skipped_libsvm_on_disk"
+            ),
+            "training_data_contract": (
+                "file_backed_libsvm_strict"
+                if trainer_file_backed_strict_enabled()
+                else "file_backed_libsvm"
+            ),
         }
+        if _optuna_hpo_manifest:
+            _h0 = _optuna_hpo_manifest[0]
+            for _hk in (
+                "optuna_hpo_data_source",
+                "optuna_hpo_train_libsvm",
+                "optuna_hpo_valid_libsvm",
+            ):
+                if _hk in _h0:
+                    metrics[_hk] = _h0[_hk]
         if _ft_thr_wh is not None and _ft_thr_mah is not None:
             metrics["val_dec026_pick_window_hours"] = float(_ft_thr_wh)
             metrics["val_dec026_pick_min_alerts_per_hour"] = float(_ft_thr_mah)
@@ -6399,6 +6778,36 @@ def train_single_rated_model(
                     dtrain,
                     num_boost_round=num_boost_round,
                 )
+            _did_final_refit_csv = False
+            if (
+                _has_val_from_file
+                and not _missing_val_cols
+                and os.environ.get(_ENV_DISABLE_FINAL_REFIT, "").strip().lower()
+                not in ("1", "true", "yes")
+            ):
+                _n_round_refit = max(1, int(booster.best_iteration))
+                _tr_cols = list(_train_feature_cols) + ["label"]
+                _tr_part = _train_csv[_tr_cols].copy()
+                if "weight" in _train_csv.columns:
+                    _tr_part["weight"] = _train_csv["weight"].astype(float)
+                else:
+                    _tr_part["weight"] = 1.0
+                _vl_part = _val_rated_eval[list(_train_feature_cols) + ["label"]].copy()
+                _vl_part["weight"] = 1.0
+                _tv_df = pd.concat([_tr_part, _vl_part], axis=0, ignore_index=True)
+                _d_tv = lgb.Dataset(
+                    _tv_df[_train_feature_cols],
+                    label=_tv_df["label"],
+                    weight=_tv_df["weight"],
+                    params=_lgb_ds_params_csv,
+                )
+                booster = lgb.train(hp_lgb, _d_tv, num_boost_round=_n_round_refit)
+                _did_final_refit_csv = True
+                logger.info(
+                    "rated Plan B CSV: final refit on train+valid rows=%d num_boost_round=%d (pipeline §12)",
+                    int(len(_tv_df)),
+                    _n_round_refit,
+                )
             # From-file peak-RAM cleanup: once LightGBM has built the Booster, the
             # temporary CSV DataFrame / Dataset objects are no longer needed.
             _train_csv = None
@@ -6460,6 +6869,7 @@ def train_single_rated_model(
                 "val_random_ap": val_random_ap,
                 "best_hyperparams": hp_resolved,
                 "_uncalibrated": not _has_val,
+                "final_refit_train_valid": bool(_did_final_refit_csv),
             }
             if _ft_thr_wh is not None and _ft_thr_mah is not None:
                 metrics["val_dec026_pick_window_hours"] = float(_ft_thr_wh)
@@ -6478,6 +6888,25 @@ def train_single_rated_model(
             val_dec026_window_hours=_ft_thr_wh,
             val_dec026_min_alerts_per_hour=_ft_thr_mah,
         )
+        if not X_vl.empty and len(y_vl) > 0:
+            model = _final_refit_lgbm_sklearn_on_train_valid(
+                model,
+                X_tr,
+                y_tr,
+                sw_rated,
+                X_vl,
+                y_vl,
+                hp,
+                label="rated",
+            )
+            _fr_off_r = os.environ.get(_ENV_DISABLE_FINAL_REFIT, "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            metrics["final_refit_train_valid"] = not _fr_off_r
+        else:
+            metrics["final_refit_train_valid"] = False
 
     train_thr = cast(float, metrics["threshold"])
     _train_wh_rate = _split_window_hours_from_payout_df(_get_train_rated())
@@ -6523,12 +6952,22 @@ def train_single_rated_model(
                     )
                     used_libsvm_train_metrics = True
                 except Exception as exc:
+                    if trainer_file_backed_strict_enabled():
+                        raise RuntimeError(
+                            "TRAINER_FILE_BACKED_STRICT: train metrics via LibSVM file failed "
+                            f"({exc})"
+                        ) from exc
                     logger.warning(
                         "Plan B+: train metrics via LibSVM file failed (%s); "
                         "falling back to batched in-memory predict.",
                         exc,
                     )
     if not used_libsvm_train_metrics:
+        if trainer_file_backed_strict_enabled() and use_from_libsvm:
+            raise RuntimeError(
+                "TRAINER_FILE_BACKED_STRICT: train metrics require LibSVM file predict "
+                "(train path under DATA_DIR and non-empty labels)."
+            )
         _ensure_inmemory_train_views(avail_cols)
         X_tr_pred = _dataframe_for_lgb_predict(model, _get_train_rated(), avail_cols)
         train_m = _compute_train_metrics(
@@ -8167,12 +8606,12 @@ def run_pipeline(args) -> None:
 
     _pf0 = time.perf_counter()
     pipeline_echo(
-        "Preflight — data source (local Parquet bridge readiness or ClickHouse connectivity) …"
+        "Step 0/11 — Preflight — data source (local Parquet bridge readiness or ClickHouse connectivity) …"
     )
     run_cross_entry_data_preflight(
         entry="trainer", use_local_parquet=bool(use_local), logger=logger
     )
-    pipeline_echo(f"Preflight — done in {time.perf_counter() - _pf0:.1f}s")
+    pipeline_echo(f"Step 0/11 — Preflight — done in {time.perf_counter() - _pf0:.1f}s")
 
     # Auto-adjust window to actual data end when using local Parquet without
     # explicit --start/--end (anchored to observed data end, not "today").
@@ -8198,7 +8637,6 @@ def run_pipeline(args) -> None:
             )
 
     logger.info("Training window: %s -> %s  (local=%s)", start.date(), end.date(), use_local)
-    pipeline_echo(f"Training window — {start.date()} → {end.date()} (local_parquet={use_local})")
 
     # Single model_version for this process: matches out/models/<model_version>/ and MLflow run_name.
     pipeline_model_version = get_model_version()
@@ -8209,7 +8647,7 @@ def run_pipeline(args) -> None:
         run_name=pipeline_model_version,
     ):
         try:
-            # T12.2 / T-PipelineStepDurations: best-effort per-step wall times (Step 1–10).
+            # T12.2 / T-PipelineStepDurations: best-effort per-step wall times (steps 0–10 / 11 total).
             # Note: all values are optional; log_*_safe helpers will skip None.
             chunks: list = []
             recent_chunks: Optional[int] = None  # legacy monthly trim removed (single-window pipeline)
@@ -8261,7 +8699,10 @@ def run_pipeline(args) -> None:
             if _l2_bundle_arg:
                 from trainer.training.pipeline_l2_bundle import execute_l2_training_bundle
 
-                pipeline_echo("L2 bundle path — Steps 1–7 skipped; loading bundle then Steps 8–10 …")
+                pipeline_echo(
+                    "Step 8/11 — L2 bundle (CLI) — Steps 1–7/11 skipped; "
+                    "loading bundle then Steps 8–10/11 …"
+                )
                 execute_l2_training_bundle(
                     args=args,
                     bundle_dir=Path(_l2_bundle_arg),
@@ -8278,12 +8719,15 @@ def run_pipeline(args) -> None:
 
             # 1. Training window: single run/trip-level slice (no monthly partition).
             _chunk_mode_label = "single-window"
-            pipeline_echo(f"Step 1/10 — Training window and {_chunk_mode_label} …")
+            pipeline_echo(
+                f"Step 1/11 — Training window {start.date()} → {end.date()} "
+                f"(local_parquet={use_local}); chunk list ({_chunk_mode_label}) …"
+            )
             t0 = time.perf_counter()
             chunks = get_single_window_chunk(start, end)
             _el = time.perf_counter() - t0
             step1_duration_sec = _el
-            pipeline_echo(f"Step 1/10 — done in {_el:.1f}s ({len(chunks)} window(s), {_chunk_mode_label})")
+            pipeline_echo(f"Step 1/11 — done in {_el:.1f}s ({len(chunks)} window(s), {_chunk_mode_label})")
             logger.info("Chunks: %d mode=%s (%.1fs)", len(chunks), _chunk_mode_label, _el)
             _bundle_dir_raw = (os.environ.get("TRAINER_LAYER_ASSET_BUNDLE_DIR") or "").strip()
             if _bundle_dir_raw:
@@ -8352,12 +8796,12 @@ def run_pipeline(args) -> None:
             # 2. Window-count partition — used ONLY to derive train_end for the canonical
             #    mapping cutoff (B1 / R25 identity-leakage guard).  The actual row
             #    assignment to train/valid/test happens later at row level (SSOT §9.2).
-            pipeline_echo("Step 2/10 — Partition windows for train_end cutoff (B1) …")
+            pipeline_echo("Step 2/11 — Partition windows for train_end cutoff (B1) …")
             t0 = time.perf_counter()
             _window_partition = partition_windows_for_train_end_cutoff(chunks)
             _el = time.perf_counter() - t0
             step2_duration_sec = _el
-            pipeline_echo(f"Step 2/10 — done in {_el:.1f}s")
+            pipeline_echo(f"Step 2/11 — done in {_el:.1f}s")
             logger.info("Window partition for train_end cutoff: %.1fs", _el)
             train_end = (
                 max(c["window_end"] for c in _window_partition["train_windows"])
@@ -8396,7 +8840,7 @@ def run_pipeline(args) -> None:
             #    identity links that arose after training from leaking into training data).
             #    Also get FND-12 dummy player_ids so we drop them from training (TRN-04).
             #    PLAN steps 4/7/8: local path may load from artifact; else DuckDB or pandas build; write after build.
-            pipeline_echo("Step 3/10 — Build canonical identity mapping …")
+            pipeline_echo("Step 3/11 — Build canonical identity mapping …")
             t0 = time.perf_counter()
             logger.info("Building canonical identity mapping (cutoff=%s)…", train_end)
             dummy_player_ids: set = set()
@@ -8505,7 +8949,7 @@ def run_pipeline(args) -> None:
         
             _el = time.perf_counter() - t0
             step3_duration_sec = _el
-            pipeline_echo(f"Step 3/10 — done in {_el:.1f}s (canonical_map rows={len(canonical_map)})")
+            pipeline_echo(f"Step 3/11 — done in {_el:.1f}s (canonical_map rows={len(canonical_map)})")
             logger.info(
                 "Canonical mapping: %d rows; FND-12 dummy player_ids to exclude: %d  (%.1fs)",
                 len(canonical_map), len(dummy_player_ids), _el,
@@ -8582,8 +9026,8 @@ def run_pipeline(args) -> None:
                 )
                 if auto_bundle_cache_is_current(bundle_dir=_bundle_dir_early, expected_key=_expected_key):
                     pipeline_echo(
-                        f"Step L2-cache — hit at {_bundle_dir_early}; skipping Steps 4–10 (chunk path), "
-                        "running L2 Steps 8–10 …"
+                        f"Step 8/11 — L2 auto-cache — hit at {_bundle_dir_early}; "
+                        "skipping Steps 4–10/11 (chunk path), running Steps 8–10/11 from bundle …"
                     )
                     execute_l2_training_bundle(
                         args=args,
@@ -8620,16 +9064,16 @@ def run_pipeline(args) -> None:
             _player_asset_raw = (os.environ.get("TRAINER_PLAYER_LAYER_ASSET_PATH") or "").strip()
             if _player_asset_raw:
                 pipeline_echo(
-                    "Step 4/10 — Skip ensure_player_profile_ready (TRAINER_PLAYER_LAYER_ASSET_PATH set) …"
+                    "Step 4/11 — Skip ensure_player_profile_ready (TRAINER_PLAYER_LAYER_ASSET_PATH set) …"
                 )
                 step4_duration_sec = 0.0
-                pipeline_echo("Step 4/10 — skipped (player layer asset mode)")
+                pipeline_echo("Step 4/11 — skipped (player layer asset mode)")
                 logger.info(
                     "player_profile ensure skipped: using TRAINER_PLAYER_LAYER_ASSET_PATH=%s",
                     _player_asset_raw,
                 )
             else:
-                pipeline_echo("Step 4/10 — Ensure player_profile ready (backfill if needed) …")
+                pipeline_echo("Step 4/11 — Ensure player_profile ready (backfill if needed) …")
                 t0 = time.perf_counter()
                 ensure_player_profile_ready(
                     effective_start,
@@ -8643,7 +9087,7 @@ def run_pipeline(args) -> None:
                 )
                 _el = time.perf_counter() - t0
                 step4_duration_sec = _el
-                pipeline_echo(f"Step 4/10 — done in {_el:.1f}s")
+                pipeline_echo(f"Step 4/11 — done in {_el:.1f}s")
                 logger.info("ensure_player_profile_ready: %.1fs", _el)
 
             # 3c. Load player_profile once for the entire training window (PLAN Step 4).
@@ -8661,13 +9105,13 @@ def run_pipeline(args) -> None:
                 )
             )
             if _player_asset_raw:
-                pipeline_echo("Step 5/10 — Load player layer asset (TRAINER_PLAYER_LAYER_ASSET_PATH) …")
+                pipeline_echo("Step 5/11 — Load player layer asset (TRAINER_PLAYER_LAYER_ASSET_PATH) …")
                 t0 = time.perf_counter()
                 try:
                     profile_df = load_player_layer_asset_parquet(Path(_player_asset_raw))
                     _el = time.perf_counter() - t0
                     step5_duration_sec = _el
-                    pipeline_echo(f"Step 5/10 — done in {_el:.1f}s ({len(profile_df)} asset rows)")
+                    pipeline_echo(f"Step 5/11 — done in {_el:.1f}s ({len(profile_df)} asset rows)")
                     logger.info(
                         "player layer asset: loaded %d rows from %s (%.1fs)",
                         len(profile_df),
@@ -8679,7 +9123,7 @@ def run_pipeline(args) -> None:
                     _el = time.perf_counter() - t0
                     step5_duration_sec = _el
                     pipeline_echo(
-                        f"Step 5/10 — done in {_el:.1f}s "
+                        f"Step 5/11 — done in {_el:.1f}s "
                         "(asset load failed; profile features will be NaN)"
                     )
                     logger.warning(
@@ -8689,7 +9133,7 @@ def run_pipeline(args) -> None:
                         exc,
                     )
             else:
-                pipeline_echo("Step 5/10 — Load player_profile for PIT join …")
+                pipeline_echo("Step 5/11 — Load player_profile for PIT join …")
                 t0 = time.perf_counter()
                 profile_df = load_player_profile(
                     effective_start,
@@ -8700,10 +9144,10 @@ def run_pipeline(args) -> None:
                 _el = time.perf_counter() - t0
                 step5_duration_sec = _el
                 if profile_df is not None:
-                    pipeline_echo(f"Step 5/10 — done in {_el:.1f}s ({len(profile_df)} profile rows)")
+                    pipeline_echo(f"Step 5/11 — done in {_el:.1f}s ({len(profile_df)} profile rows)")
                     logger.info("player_profile: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), _el)
                 else:
-                    pipeline_echo(f"Step 5/10 — done in {_el:.1f}s (profile not available)")
+                    pipeline_echo(f"Step 5/11 — done in {_el:.1f}s (profile not available)")
                     logger.info("player_profile: not available — profile features will be NaN (%.1fs)", _el)
         
             feature_spec = load_feature_spec(FEATURE_SPEC_PATH)
@@ -8724,7 +9168,7 @@ def run_pipeline(args) -> None:
                 f"  neg-sample={_effective_neg_sample_frac:.2f}" if _effective_neg_sample_frac < 1.0 else ""
             )
             pipeline_echo(
-                f"Step 6/10 — Process chunks (DQ, labels, Track Human, Track LLM){_neg_sample_note} …"
+                f"Step 6/11 — Process chunks (DQ, labels, Track Human, Track LLM){_neg_sample_note} …"
             )
             t0 = time.perf_counter()
             chunk_paths: List[Path] = []
@@ -8732,12 +9176,12 @@ def run_pipeline(args) -> None:
             pbar = (
                 _ProgressNoop()
                 if _step6_disable_bar
-                else _tqdm_bar(total=len(chunks), desc="Step 6 chunks", unit="chunk")
+                else _tqdm_bar(total=len(chunks), desc="Step 6/11 chunks", unit="chunk")
             )
             try:
                 if NEG_SAMPLE_FRAC_AUTO and len(chunks) > 0:
                     # OOM probe: process chunk 1 with frac=1.0, then decide effective frac.
-                    pipeline_echo("Step 6/10 — OOM probe: processing chunk 1 with neg_sample_frac=1.0 …")
+                    pipeline_echo("Step 6/11 — OOM probe: processing chunk 1 with neg_sample_frac=1.0 …")
                     logger.info("OOM probe: processing chunk 1 with neg_sample_frac=1.0")
                     path1 = process_chunk(
                         chunks[0],
@@ -8849,7 +9293,7 @@ def run_pipeline(args) -> None:
         
             _el = time.perf_counter() - t0
             step6_duration_sec = _el
-            pipeline_echo(f"Step 6/10 — done in {_el:.1f}s ({len(chunk_paths)} chunk parquet files)")
+            pipeline_echo(f"Step 6/11 — done in {_el:.1f}s ({len(chunk_paths)} chunk parquet files)")
             logger.info("Process chunks: %d produced  (%.1fs)", len(chunk_paths), _el)
             if not chunk_paths:
                 raise SystemExit("No chunks produced any usable data — check data source / time window")
@@ -9316,86 +9760,11 @@ def run_pipeline(args) -> None:
                         and step6_runner is not None
                         and current_neg_frac is not None
                     ):
-                        current = current_neg_frac
-                        if not (0.0 < current_neg_frac <= 1.0):
-                            if STEP7_KEEP_TRAIN_ON_DISK:
-                                raise RuntimeError(
-                                    "Step 7 STEP7_KEEP_TRAIN_ON_DISK is True and DuckDB failed; "
-                                    "no pandas fallback. Reduce --days or add RAM."
-                                )
-                            logger.warning(
-                                "Step 7 Layer 2 skipped: current_neg_frac=%.2f not in (0, 1]; falling back to pandas.",
-                                current_neg_frac,
-                            )
-                            return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
-                        new_frac = None
-                        retries_left = 3
-                        while True:
-                            step6_completed = False
-                            train_path: Optional[Path] = None  # type: ignore[no-redef]
-                            valid_path: Optional[Path] = None  # type: ignore[no-redef]
-                            test_path: Optional[Path] = None  # type: ignore[no-redef]
-                            try:
-                                new_frac, _ = _step7_oom_failsafe_next_frac(current)
-                                chunk_paths = step6_runner(new_frac)
-                                if not chunk_paths:
-                                    raise ValueError("step6_runner returned no chunk paths")
-                                step6_completed = True
-                                train_path, valid_path, test_path = _duckdb_sort_and_split(
-                                    chunk_paths, train_frac, valid_frac
-                                )
-                                if STEP7_KEEP_TRAIN_ON_DISK:
-                                    if STEP9_EXPORT_LIBSVM:
-                                        _step7_clean_duckdb_temp_dir()
-                                        return (None, None, None, train_path, valid_path, test_path)
-                                    valid_df = pd.read_parquet(valid_path)
-                                    test_df = pd.read_parquet(test_path)
-                                    _step7_clean_duckdb_temp_dir()
-                                    return (None, valid_df, test_df, train_path, valid_path, test_path)
-                                train_df = pd.read_parquet(train_path)
-                                valid_df = pd.read_parquet(valid_path)
-                                test_df = pd.read_parquet(test_path)
-                                for p in (train_path, valid_path, test_path):
-                                    if p is not None and p.exists():
-                                        p.unlink(missing_ok=True)
-                                _step7_clean_duckdb_temp_dir()
-                                return (train_df, valid_df, test_df, None, None, None)
-                            except RuntimeError:
-                                raise
-                            except Exception as retry_exc:
-                                for p in (train_path, valid_path, test_path):
-                                    if p is not None and p.exists():
-                                        p.unlink(missing_ok=True)
-                                if (
-                                    _is_duckdb_oom(retry_exc)
-                                    and new_frac is not None
-                                    and step6_completed
-                                    and retries_left > 0
-                                ):
-                                    logger.warning(
-                                        "Step 7 DuckDB OOM retry with NEG_SAMPLE_FRAC=%.4f; re-ran Step 6.",
-                                        new_frac,
-                                    )
-                                    current = new_frac
-                                    retries_left -= 1
-                                    continue
-                                if STEP7_KEEP_TRAIN_ON_DISK:
-                                    if _is_parquet_io_problem(retry_exc):
-                                        logger.warning(
-                                            "Step 7 DuckDB parquet IO issue under keep-on-disk; "
-                                            "falling back to pandas for test/dev robustness: %s",
-                                            retry_exc,
-                                        )
-                                        return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
-                                    raise RuntimeError(
-                                        "Step 7 STEP7_KEEP_TRAIN_ON_DISK: DuckDB failed after retries; "
-                                        "no pandas fallback. Reduce --days or add RAM."
-                                    ) from retry_exc
-                                logger.warning(
-                                    "Step 7 DuckDB failed (non-OOM) on retry; falling back to pandas: %s",
-                                    retry_exc,
-                                )
-                                return _step7_pandas_fallback(chunk_paths, train_frac, valid_frac)
+                        logger.warning(
+                            "Step 7 DuckDB OOM: Issue #19 removed chunk-level negative downsampling; "
+                            "re-running Step 6 with lower NEG_SAMPLE_FRAC does not shrink chunk Parquets. "
+                            "Use pandas fallback or reduce --days / add RAM."
+                        )
                     if STEP7_KEEP_TRAIN_ON_DISK:
                         if _is_parquet_io_problem(exc):
                             logger.warning(
@@ -9445,7 +9814,7 @@ def run_pipeline(args) -> None:
                 # If psutil is unavailable, still tag so MLflow run can be diagnosed.
                 log_tags_safe({"memory_sampling": "disabled_no_psutil"})
 
-            pipeline_echo("Step 7/10 — Load chunks, concat, row-level train/valid/test split …")
+            pipeline_echo("Step 7/11 — Load chunks, concat, row-level train/valid/test split …")
             t0 = time.perf_counter()
             _chunk_total_bytes = sum(Path(p).stat().st_size for p in chunk_paths)
             _est_ram_gb = (_chunk_total_bytes * CHUNK_CONCAT_RAM_FACTOR) / (1024**3)
@@ -9503,6 +9872,33 @@ def run_pipeline(args) -> None:
                 current_neg_frac=_effective_neg_sample_frac,
             )
             train_df, valid_df, test_df, step7_train_path, step7_valid_path, step7_test_path = _step7_result
+            # GitHub #19: apply negative downsampling on train split only (valid/test stay full).
+            if _effective_neg_sample_frac < 1.0 - 1e-12:
+                _train_rs = int(
+                    hashlib.md5(
+                        f"{effective_start.isoformat()}|{effective_end.isoformat()}".encode()
+                    ).hexdigest()[:8],
+                    16,
+                ) % (2**31)
+                pipeline_echo(
+                    f"Step 7b/11 — train-only negative downsampling "
+                    f"(frac={_effective_neg_sample_frac:.4f}) …"
+                )
+                if step7_train_path is not None:
+                    _apply_train_neg_downsample_to_parquet(
+                        step7_train_path,
+                        neg_sample_frac=_effective_neg_sample_frac,
+                        random_state=_train_rs,
+                    )
+                elif train_df is not None:
+                    train_df = apply_train_only_negative_downsampling(
+                        train_df,
+                        neg_sample_frac=_effective_neg_sample_frac,
+                        random_state=_train_rs,
+                    )
+                pipeline_echo(
+                    f"Step 7b/11 — done (train-only neg-sample frac={_effective_neg_sample_frac:.4f})"
+                )
             step8_screen_sample_strategy = _step8_resolve_sample_strategy(
                 getattr(_cfg, "STEP8_SCREEN_SAMPLE_STRATEGY", STEP8_SCREEN_SAMPLE_STRATEGY)
             )
@@ -9622,6 +10018,13 @@ def run_pipeline(args) -> None:
                 )
                 from trainer.training.l2_trainer_contracts import TRAIN_END_SOURCE_CHUNK_SPLIT
 
+                _neg_mode = (
+                    (os.environ.get("TRAINER_TRAIN_NEG_SAMPLING_MODE") or "post_step7")
+                    .strip()
+                    .lower()
+                )
+                if _neg_mode not in ("post_step7", "legacy_chunk"):
+                    _neg_mode = "post_step7"
                 issue16_gate_report = evaluate_issue16_gate_bundle(
                     effective_neg_sample_frac=float(_effective_neg_sample_frac),
                     chunk_train_end_naive=train_end,
@@ -9633,6 +10036,7 @@ def run_pipeline(args) -> None:
                     split_flags=None,
                     train_column_names=_train_schema_col_list,
                     feature_spec=feature_spec,
+                    train_neg_sampling_mode=_neg_mode,
                 )
                 raise_if_strict_issue16_gates_failed(issue16_gate_report)
             except RuntimeError:
@@ -9684,7 +10088,7 @@ def run_pipeline(args) -> None:
             _el = time.perf_counter() - t0
             step7_duration_sec = _el
             pipeline_echo(
-                f"Step 7/10 — done in {_el:.1f}s (train={_n_train_print} valid={_n_valid_print} test={_n_test_print})"
+                f"Step 7/11 — done in {_el:.1f}s (train={_n_train_print} valid={_n_valid_print} test={_n_test_print})"
             )
             logger.info(
                 "Row-level split (%.0f/%.0f/%.0f) — train: %d  valid: %d  test: %d  (load+sort+split: %.1fs)",
@@ -9778,7 +10182,8 @@ def run_pipeline(args) -> None:
                 )
                 touch_bundle_built_at(_bundle_out)
                 pipeline_echo(
-                    f"Step L2-materialize — bundle written to {_bundle_out}; running L2 Steps 8–10 …"
+                    f"Step 8/11 — L2 bundle — materialized to {_bundle_out}; "
+                    "running Steps 8–10/11 from bundle …"
                 )
                 execute_l2_training_bundle(
                     args=args,
@@ -9824,7 +10229,7 @@ def run_pipeline(args) -> None:
                 )
                 # R1004: restrict active_feature_cols to columns actually present in train.
                 active_feature_cols = [c for c in active_feature_cols if c in _train_cols]
-                pipeline_echo("Step 8/10 — Feature screening skipped (no candidates in train)")
+                pipeline_echo("Step 8/11 — Feature screening skipped (no candidates in train)")
             else:
                 # PLAN 方案 B 策略 A / B+ Stage 2: use sample from memory or from file (_train_for_screen from _read_parquet_head when on disk).
                 # Step 8 DuckDB std (PLAN): pass train_path or train_df so zv is computed on full data via DuckDB; keep _matrix_for_screen as sample to avoid OOM in corr/MI/LGBM.
@@ -9933,7 +10338,7 @@ def run_pipeline(args) -> None:
                     )
                     duckdb_runtime_screening_threads = int(_screen_policy["threads"])
                 step8_screened_feature_count = None
-                pipeline_echo("Step 8/10 — Feature screening …")
+                pipeline_echo("Step 8/11 — Feature screening …")
                 t0 = time.perf_counter()
                 screened_cols = screen_features(
                     feature_matrix=_matrix_for_screen,
@@ -9947,7 +10352,7 @@ def run_pipeline(args) -> None:
                 step8_duration_sec = _el
                 step8_screened_feature_count = len(screened_cols)
                 pipeline_echo(
-                    f"Step 8/10 — done in {_el:.1f}s ({len(_present_candidate_cols)} → {len(screened_cols)} features)"
+                    f"Step 8/11 — done in {_el:.1f}s ({len(_present_candidate_cols)} → {len(screened_cols)} features)"
                 )
                 logger.info(
                     "screen_features: %d -> %d features retained  (%.1fs)",
@@ -10011,7 +10416,7 @@ def run_pipeline(args) -> None:
                 )
                 logger.warning(msg)
                 pipeline_echo(
-                    "Step 8/10 — warning: no usable features after screening; using placeholder 'bias' (see logs)."
+                    "Step 8/11 — warning: no usable features after screening; using placeholder 'bias' (see logs)."
                 )
                 _placeholder_col = "bias"  # constant feature for integration/debug runs (R1605: named via explicit variable)
                 if train_df is not None and _placeholder_col not in train_df.columns:
@@ -10033,12 +10438,12 @@ def run_pipeline(args) -> None:
                     _export_dir,
                     ranking_recipe=pipeline_ranking_recipe,
                 )
-                pipeline_echo(f"Step 9/10 — Plan B: exported train/valid CSV to {_train_csv} and {_valid_csv}")
+                pipeline_echo(f"Step 9/11 — Plan B: exported train/valid CSV to {_train_csv} and {_valid_csv}")
         
             # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
             #    test_df is passed so test-set metrics and feature importance are
             #    computed immediately after training and included in the artifact.
-            pipeline_echo("Step 9/10 — Train rated GBM family + test-set eval …")
+            pipeline_echo("Step 9/11 — Train rated GBM family + test-set eval …")
             t0 = time.perf_counter()
             model_version = pipeline_model_version
             _libsvm_paths = (_train_libsvm, _valid_libsvm) if (_train_libsvm is not None and _valid_libsvm is not None) else None
@@ -10059,7 +10464,7 @@ def run_pipeline(args) -> None:
             )
             _el = time.perf_counter() - t0
             step9_duration_sec = _el
-            pipeline_echo(f"Step 9/10 — done in {_el:.1f}s")
+            pipeline_echo(f"Step 9/11 — done in {_el:.1f}s")
             logger.info("train_single_rated_model + A3 family compare + test eval: %.1fs", _el)
 
             # T12.2: capture RSS/sys RAM snapshot at Step 9 end (checkpoint scope Step 7-9).
@@ -10093,7 +10498,7 @@ def run_pipeline(args) -> None:
             gc.collect()
         
             # 7. Save artifacts (versioned subdir under MODEL_DIR; see Priority 1 investigation plan).
-            pipeline_echo("Step 10/10 — Save artifact bundle …")
+            pipeline_echo("Step 10/11 — Save artifact bundle …")
             t0 = time.perf_counter()
             _versions_root = MODEL_DIR
             _bundle_dir = safe_version_subdirectory(_versions_root, model_version)
@@ -10147,7 +10552,7 @@ def run_pipeline(args) -> None:
                 )
             _el = time.perf_counter() - t0
             step10_duration_sec = _el
-            pipeline_echo(f"Step 10/10 — done in {_el:.1f}s")
+            pipeline_echo(f"Step 10/11 — done in {_el:.1f}s")
             logger.info("save_artifact_bundle: %.1fs", _el)
 
             # T13: Warm up MLflow (e.g. Cloud Run) before first log to reduce 503 on cold start.
@@ -10285,7 +10690,8 @@ def run_pipeline(args) -> None:
                         _rel_model,
                     )
                     pipeline_echo(
-                        f"MLflow — model artifact {_rel_model} (bundle under {MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH}/)"
+                        f"Step 10/11 — MLflow — model artifact {_rel_model} "
+                        f"(bundle under {MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH}/)"
                     )
                 # Legacy UI path: small files under bundle/ (contract tests + existing dashboards).
                 _bundle_artifact_path = "bundle"
@@ -10300,7 +10706,9 @@ def run_pipeline(args) -> None:
                     if _ap.is_file():
                         log_artifact_safe(_ap, artifact_path=_bundle_artifact_path)
 
-            pipeline_echo(f"Complete — chunk pipeline finished in {total_sec:.1f}s ({total_sec / 60.0:.1f} min)")
+            pipeline_echo(
+                f"Complete — 11 steps (0–10) finished in {total_sec:.1f}s ({total_sec / 60.0:.1f} min)"
+            )
             logger.info("Pipeline total: %.1fs (%.1f min)", total_sec, total_sec / 60.0)
 
             # T12.2: Log training success metrics + per-step durations + Step 7–9 memory/OOM diagnostics to MLflow.
@@ -10378,7 +10786,7 @@ def run_pipeline(args) -> None:
             }
             logger.debug("Training summary JSON: %s", json.dumps(summary, default=str))
             pipeline_echo(
-                f"Summary — model_version={model_version} total_rows={n_rows} "
+                f"Pipeline — Summary — model_version={model_version} total_rows={n_rows} "
                 "(full JSON: logger DEBUG or TRAINER_SUMMARY_JSON_STDOUT=1)"
             )
             if os.environ.get("TRAINER_SUMMARY_JSON_STDOUT", "").strip().lower() in (

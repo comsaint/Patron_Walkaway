@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -193,6 +194,12 @@ def load_trainer_local_parquet_bridge_manifest() -> Dict[str, Any]:
     return dict(json.loads(p.read_text(encoding="utf-8")))
 
 
+def _manifest_path_strict_enabled() -> bool:
+    """When True (default), absolute paths outside ``PROJECT_ROOT`` fail fast (portable manifest contract)."""
+    v = (os.environ.get("TRAINER_MANIFEST_PATH_STRICT") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 def _resolve_manifest_path_str(
     raw: str,
     *,
@@ -221,6 +228,14 @@ def _resolve_manifest_path_str(
         rel = pr_abs.relative_to(PROJECT_ROOT.resolve())
         return (PROJECT_ROOT / rel).resolve()
     except ValueError:
+        if _manifest_path_strict_enabled():
+            raise ValueError(
+                f"Manifest path {raw!r} resolves to {pr_abs} which is outside "
+                f"PROJECT_ROOT={PROJECT_ROOT.resolve()!s}. "
+                "Ship manifests with repo-relative paths or paths relative to the manifest "
+                "directory only (see doc/pipeline requirements.md Inputs). "
+                "Set TRAINER_MANIFEST_PATH_STRICT=0 to allow legacy absolute paths (not for CI/production)."
+            ) from None
         logger.warning(
             "Manifest path %r is absolute and outside PROJECT_ROOT — using as-is (portability risk).",
             raw,

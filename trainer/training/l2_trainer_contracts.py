@@ -57,7 +57,7 @@ TRAIN_END_SOURCE_CHUNK_SPLIT: Final[str] = "chunk_level_train_end"
 TRAIN_END_SOURCE_ROW_LEVEL: Final[str] = "row_level_train_max_payout_complete_dtm"
 TRAIN_END_SOURCE_L2_MANIFEST: Final[str] = "l2_manifest_train_end"
 
-SPLIT_SAMPLING_CONTRACT_VERSION: Final[str] = "issue16-2026-05-07"
+SPLIT_SAMPLING_CONTRACT_VERSION: Final[str] = "issue16-2026-05-08-post-step7"
 
 # Flags written by trainer when split semantics are asserted (L2 path sets these).
 KEY_VALID_FULL_UNSAMPLED: Final[str] = "valid_full_unsampled"

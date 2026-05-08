@@ -46,7 +46,7 @@ def execute_l2_training_bundle(
     pipeline_ranking_recipe: Any,
     pipeline_gbm_bakeoff: bool,
 ) -> None:
-    """Run Steps 8–10 from an L2 bundle (skip chunk Steps 1–6 and Step 7 merge)."""
+    """Run Steps 8–10/11 from an L2 bundle (skip chunk Steps 1–6/11 and Step 7 merge)."""
     import trainer.training.trainer as tr
 
     from trainer.training.issue16_gates import (
@@ -74,15 +74,13 @@ def execute_l2_training_bundle(
         )
     t_load = time.perf_counter()
     manifest = load_and_validate_bundle(bundle_dir)
-    tr.pipeline_echo(
-        f"L2 bundle — manifest OK; loading splits from {bundle_dir} …"
-    )
     train_df = pd.read_parquet(manifest.train_path)
     valid_df = pd.read_parquet(manifest.valid_path)
     test_df = pd.read_parquet(manifest.test_path)
     step7_duration_sec = time.perf_counter() - t_load
     tr.pipeline_echo(
-        f"Step 7/10 — L2 splits loaded in {step7_duration_sec:.1f}s "
+        f"Step 8/11 — L2 bundle — manifest OK; loaded splits from {bundle_dir} in "
+        f"{step7_duration_sec:.1f}s "
         f"(train={len(train_df)} valid={len(valid_df)} test={len(test_df)} rows)"
     )
 
@@ -156,6 +154,7 @@ def execute_l2_training_bundle(
         split_flags=split_flags,
         train_column_names=_l2_train_cols,
         feature_spec=_l2_feature_spec,
+        train_neg_sampling_mode="post_step7",
     )
     raise_if_strict_issue16_gates_failed(issue16_gate_report)
     issue16_gate_report = {
@@ -238,6 +237,7 @@ def execute_l2_training_bundle(
         step8_screening_sample_rows = len(_matrix_for_screen)
         step8_screening_full_train_rows = len(train_df)
         step8_screening_candidate_cols = len(_present_candidate_cols)
+        tr.pipeline_echo("Step 8/11 — Feature screening …")
         t0 = time.perf_counter()
         screened_cols = tr.screen_features(
             feature_matrix=_matrix_for_screen,
@@ -256,13 +256,13 @@ def execute_l2_training_bundle(
 
     if step8_duration_sec is not None and step8_screening_candidate_cols is not None:
         tr.pipeline_echo(
-            f"Step 8/10 — done in {step8_duration_sec:.1f}s "
+            f"Step 8/11 — done in {step8_duration_sec:.1f}s "
             f"({step8_screening_candidate_cols} → {step8_screened_feature_count} features)"
         )
     else:
-        tr.pipeline_echo("Step 8/10 — Feature screening skipped or not applicable")
+        tr.pipeline_echo("Step 8/11 — Feature screening skipped or not applicable")
 
-    tr.pipeline_echo("Step 9/10 — Train rated GBM (L2 bundle path) …")
+    tr.pipeline_echo("Step 9/11 — Train rated GBM (L2 bundle path) …")
     t0 = time.perf_counter()
     model_version = pipeline_model_version
     rated_art, _, combined_metrics = tr.train_single_rated_model(
@@ -281,13 +281,13 @@ def execute_l2_training_bundle(
         train_split_parquet_path=None,
     )
     step9_duration_sec = time.perf_counter() - t0
-    tr.pipeline_echo(f"Step 9/10 — done in {step9_duration_sec:.1f}s")
+    tr.pipeline_echo(f"Step 9/11 — done in {step9_duration_sec:.1f}s")
     train_df = None
     valid_df = None
     test_df = None
     gc.collect()
 
-    tr.pipeline_echo("Step 10/10 — Save artifact bundle (L2 bundle path) …")
+    tr.pipeline_echo("Step 10/11 — Save artifact bundle (L2 bundle path) …")
     t0 = time.perf_counter()
     _versions_root = tr.MODEL_DIR
     _bundle_dir = tr.safe_version_subdirectory(_versions_root, model_version)
@@ -343,7 +343,7 @@ def execute_l2_training_bundle(
     except Exception as _man_exc:
         logger.warning("Failed to write latest model manifest (artifacts saved): %s", _man_exc)
     step10_duration_sec = time.perf_counter() - t0
-    tr.pipeline_echo(f"Step 10/10 — done in {step10_duration_sec:.1f}s")
+    tr.pipeline_echo(f"Step 10/11 — done in {step10_duration_sec:.1f}s")
 
     total_sec = time.perf_counter() - pipeline_start
     _pipeline_finished_at_iso = datetime.now(timezone.utc).isoformat()
@@ -401,7 +401,7 @@ def execute_l2_training_bundle(
     }
     logger.debug("L2 training summary JSON: %s", json.dumps(summary, default=str))
     tr.pipeline_echo(
-        f"Complete — L2 bundle pipeline finished in {total_sec:.1f}s "
+        f"Complete — 11 steps (0–10, L2 bundle path) finished in {total_sec:.1f}s "
         f"(model_version={model_version} rows={n_rows}; "
         "full JSON: logger DEBUG or TRAINER_SUMMARY_JSON_STDOUT=1)"
     )

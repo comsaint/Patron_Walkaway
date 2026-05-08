@@ -43,8 +43,8 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             (root / "trainer_local_parquet_bridge.manifest.json").write_text(
                 json.dumps({
                     "artifact_kind": "trainer_local_parquet_bridge_v1",
-                    "t_bet_paths": [str(bet.resolve())],
-                    "gmwds_t_session": str(sess.resolve()),
+                    "gmwds_t_bet": "gmwds_t_bet.parquet",
+                    "gmwds_t_session": "gmwds_t_session.parquet",
                     "bet_includes_run_trip_lda_columns": True,
                 }),
                 encoding="utf-8",
@@ -71,8 +71,8 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             (root / "trainer_local_parquet_bridge.manifest.json").write_text(
                 json.dumps({
                     "artifact_kind": "trainer_local_parquet_bridge_v1",
-                    "t_bet_paths": [str(bet.resolve())],
-                    "gmwds_t_session": str(sess.resolve()),
+                    "gmwds_t_bet": "gmwds_t_bet.parquet",
+                    "gmwds_t_session": "gmwds_t_session.parquet",
                     "phase_c": True,
                 }),
                 encoding="utf-8",
@@ -97,14 +97,28 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             bp.write_bytes(b"")
             sp.write_bytes(b"")
             ignored.write_bytes(b"")
+            mf = root / "trainer_local_parquet_bridge.manifest.json"
+            mf.write_text("{}", encoding="utf-8")
             m = {
-                "t_bet_paths": [str(bp.resolve())],
-                "gmwds_t_bet": str(ignored.resolve()),
-                "gmwds_t_session": str(sp.resolve()),
+                "t_bet_paths": ["custom_bet.parquet"],
+                "gmwds_t_bet": "ignored_bet.parquet",
+                "gmwds_t_session": "sess.parquet",
             }
-            b, s = ds.resolve_local_parquet_bet_session_paths_from_manifest(m)
+            b, s = ds.resolve_local_parquet_bet_session_paths_from_manifest(m, manifest_path=mf)
             self.assertEqual(b.resolve(), bp.resolve())
             self.assertEqual(s.resolve(), sp.resolve())
+
+    def test_resolve_absolute_outside_project_strict_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outside = Path(td) / "outside.parquet"
+            outside.write_bytes(b"")
+            mf = Path(td) / "trainer_local_parquet_bridge.manifest.json"
+            mf.write_text("{}", encoding="utf-8")
+            m = {"gmwds_t_bet": str(outside), "gmwds_t_session": str(outside)}
+            with patch.dict(os.environ, {"TRAINER_MANIFEST_PATH_STRICT": "1"}, clear=False):
+                with self.assertRaises(ValueError) as ctx:
+                    ds.resolve_local_parquet_bet_session_paths_from_manifest(m, manifest_path=mf)
+                self.assertIn("outside PROJECT_ROOT", str(ctx.exception))
 
     def test_probe_not_ready_when_manifest_missing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -130,8 +144,8 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
             pq.write_table(pa.table({"session_id": [1]}), sess)
             (root / "trainer_local_parquet_bridge.manifest.json").write_text(
                 json.dumps({
-                    "t_bet_paths": [str(bet.resolve())],
-                    "gmwds_t_session": str(sess.resolve()),
+                    "gmwds_t_bet": "b.parquet",
+                    "gmwds_t_session": "s.parquet",
                     "bet_includes_run_trip_lda_columns": True,
                 }),
                 encoding="utf-8",
@@ -163,8 +177,8 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
                 json.dumps({
                     "artifact_kind": "trainer_local_parquet_bridge_v1",
                     "bet_includes_run_trip_lda_columns": True,
-                    "t_bet_paths": [str(bet.resolve())],
-                    "gmwds_t_session": str(sess.resolve()),
+                    "gmwds_t_bet": "bridge_bet.parquet",
+                    "gmwds_t_session": "bridge_sess.parquet",
                 }),
                 encoding="utf-8",
             )
@@ -233,8 +247,8 @@ class TestWorkstreamABridgeManifest(unittest.TestCase):
                 json.dumps({
                     "artifact_kind": "trainer_local_parquet_bridge_v1",
                     "bet_includes_run_trip_lda_columns": True,
-                    "t_bet_paths": [str(bet.resolve())],
-                    "gmwds_t_session": str(sess.resolve()),
+                    "gmwds_t_bet": "bridge_bet.parquet",
+                    "gmwds_t_session": "bridge_sess.parquet",
                 }),
                 encoding="utf-8",
             )

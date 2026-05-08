@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 DEPLOY_ROOT = Path(__file__).resolve().parent
 
 # Load .env from deploy root so CH_* etc. are set before any walkaway_ml import
-from dotenv import load_dotenv  # noqa: E402
+from dotenv import dotenv_values, load_dotenv  # noqa: E402
 _env_path = DEPLOY_ROOT / ".env"
 if not _env_path.exists():
     _env_no_dot = DEPLOY_ROOT / "env"
@@ -38,8 +38,15 @@ if not _env_path.exists():
         "The filename must be exactly .env (including the leading dot)."
     )
 load_dotenv(_env_path)
+# ``load_dotenv`` does not override an existing ``MODEL_DIR`` in the process environment;
+# for deploy, values from ``.env`` win when the key is set there (explicit bundle path).
+_env_parsed = dotenv_values(_env_path)
+_model_dir_from_file = str(_env_parsed.get("MODEL_DIR") or "").strip()
+if _model_dir_from_file:
+    os.environ["MODEL_DIR"] = _model_dir_from_file
 os.environ.setdefault("STATE_DB_PATH", str(DEPLOY_ROOT / "local_state" / "state.db"))
-os.environ.setdefault("MODEL_DIR", str(DEPLOY_ROOT / "models"))
+# MODEL_DIR: no setdefault — operators must point at a **trainer-produced model bundle**
+# (model.pkl + frozen feature_spec.yaml). See .env.example (pipeline requirements.md Production).
 # Before importing walkaway_ml.config: default prediction log next to state (avoids wheel site-packages path).
 os.environ.setdefault(
     "PREDICTION_LOG_DB_PATH",
@@ -52,10 +59,25 @@ if not os.environ.get("CH_USER") or not os.environ.get("CH_PASS"):
         "[deploy] CH_USER and CH_PASS must be set in .env. Edit .env and set your ClickHouse username and password."
     )
 
-# Require feature_spec.yaml in model dir (fail fast)
-_model_dir = Path(os.environ["MODEL_DIR"])
+# Require MODEL_DIR and a real bundle (fail fast; do not treat repo templates as SSOT)
+_model_dir_raw = (os.environ.get("MODEL_DIR") or "").strip()
+if not _model_dir_raw:
+    sys.exit(
+        "[deploy] MODEL_DIR is not set. Set it in .env to the directory containing your **shipped** "
+        "trainer bundle: model.pkl and frozen feature_spec.yaml (copy from trainer out/models/...). "
+        "Example after copying bundle under this deploy folder: MODEL_DIR=models"
+    )
+_model_path = Path(_model_dir_raw)
+_model_dir = (_model_path if _model_path.is_absolute() else (DEPLOY_ROOT / _model_path)).resolve()
+os.environ["MODEL_DIR"] = str(_model_dir)
+_pkl = _model_dir / "model.pkl"
 _feature_spec_path = _model_dir / "feature_spec.yaml"
-if not _feature_spec_path.exists():
+if not _pkl.is_file():
+    sys.exit(
+        f"[deploy] model.pkl not found at {_pkl}. MODEL_DIR must be a trainer output bundle directory, "
+        "not an empty template (see doc/pipeline requirements.md Production flow)."
+    )
+if not _feature_spec_path.is_file():
     sys.exit(
         f"[deploy] feature_spec.yaml not found at {_feature_spec_path}. "
         "Bundle must include the frozen feature_spec.yaml next to model.pkl (trainer output)."

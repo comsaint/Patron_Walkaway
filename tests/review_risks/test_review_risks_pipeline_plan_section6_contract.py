@@ -187,7 +187,7 @@ class TestSection6RssSamplingInRunPipeline(unittest.TestCase):
         src = _run_pipeline_src()
         i_snapshot = src.find("# T12.2: capture RSS/sys RAM snapshot at Step 9 end")
         i_release = src.find("train_df = None")
-        i_step10 = src.find('print("[Step 10/10] Save artifact bundle…", flush=True)')
+        i_step10 = src.find('pipeline_echo("Step 10/11 — Save artifact bundle …")')
         self.assertGreater(i_snapshot, 0, "expected Step 9 snapshot anchor")
         self.assertGreater(i_release, i_snapshot, "split-frame release should happen after Step 9 snapshot block")
         self.assertGreater(i_step10, i_release, "split-frame release should happen before Step 10 artifact save")

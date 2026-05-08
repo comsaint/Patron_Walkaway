@@ -52,11 +52,23 @@ def _utc_now_iso() -> str:
 
 
 def _manifest_rel_path(target: Path, anchor: Path) -> str:
-    """Return a POSIX path relative to *anchor* when possible (portable manifests)."""
+    """Return a POSIX path relative to *anchor* (portable manifests; doc/pipeline requirements.md).
+
+    Raises
+    ------
+    ValueError
+        If *target* cannot be expressed relative to *anchor* (would require a machine-bound
+        absolute path in the manifest). Move inputs under the anchor or widen *anchor*.
+    """
+    t_r = target.resolve()
+    a_r = anchor.resolve()
     try:
-        return target.resolve().relative_to(anchor.resolve()).as_posix()
-    except ValueError:
-        return target.resolve().as_posix()
+        return t_r.relative_to(a_r).as_posix()
+    except ValueError as exc:
+        raise ValueError(
+            f"Cannot emit portable manifest path: {t_r} is not under anchor {a_r}. "
+            "Place trainer ingress artifacts under the repo (or adjust anchor) so paths stay relative."
+        ) from exc
 
 
 def _escape_sql_path(p: Path) -> str:
