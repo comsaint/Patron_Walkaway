@@ -78,7 +78,7 @@ class TestFeatureMaterializationHelpers(unittest.TestCase):
             curr_source_snapshot_id="snap_x",
         )
         self.assertIn("impact_plan", audit)
-        self.assertEqual(audit["impact_plan"]["impact_planner_version"], "impact_planner_v2")
+        self.assertEqual(audit["impact_plan"]["impact_planner_version"], "impact_planner_v3")
         self.assertIn("cache_key_lexicon_sample", audit)
         self.assertIn("materialization_gates", audit)
 
@@ -99,12 +99,18 @@ class TestFeatureMaterializationHelpers(unittest.TestCase):
         self.assertTrue(len(h1) >= 8)
 
     def test_strict_materialization_gate_raises_on_bad_asset_path(self) -> None:
-        with patch.dict(os.environ, {"TRAINER_PLAYER_LAYER_ASSET_PATH": ""}):
+        with patch.dict(
+            os.environ,
+            {"TRAINER_PLAYER_LAYER_ASSET_PATH": "", "TRAINER_LAYER_ASSET_BUNDLE_DIR": ""},
+        ):
             rep = fm.evaluate_materialization_gate_bundle()
         self.assertTrue(rep["gates"]["player_layer_asset_path_guard"]["ok"])
         with patch.dict(
             os.environ,
-            {"TRAINER_PLAYER_LAYER_ASSET_PATH": "/nonexistent/player_layer.parquet"},
+            {
+                "TRAINER_PLAYER_LAYER_ASSET_PATH": "/nonexistent/player_layer.parquet",
+                "TRAINER_LAYER_ASSET_BUNDLE_DIR": "",
+            },
         ):
             rep_bad = fm.evaluate_materialization_gate_bundle()
         self.assertFalse(rep_bad["gates"]["player_layer_asset_path_guard"]["ok"])
@@ -112,6 +118,7 @@ class TestFeatureMaterializationHelpers(unittest.TestCase):
             os.environ,
             {
                 "TRAINER_PLAYER_LAYER_ASSET_PATH": "/nonexistent/player_layer.parquet",
+                "TRAINER_LAYER_ASSET_BUNDLE_DIR": "",
                 "TRAINER_MATERIALIZATION_STRICT_GATES": "1",
             },
         ):
@@ -156,6 +163,7 @@ class TestImpactPlanner(unittest.TestCase):
         parts = {u["partition_id"] for u in plan["impacted_work_units"]}
         self.assertEqual(parts, set(pids))
         self.assertTrue(all(u["partition_id"] in pids for u in plan["impacted_work_units"]))
+        self.assertTrue(all("asset_id" in u and len(u["asset_id"]) == 64 for u in plan["impacted_work_units"]))
 
 
 class TestLayerAssetStore(unittest.TestCase):
@@ -186,6 +194,44 @@ class TestLayerAssetStore(unittest.TestCase):
             )
             side = p.with_suffix(".layer_assets.json")
             self.assertTrue(side.is_file())
+            from trainer.training.layer_asset_store import read_chunk_layer_asset_manifest
+
+            mf = read_chunk_layer_asset_manifest(p)
+            self.assertIsNotNone(mf)
+            assert mf is not None
+            self.assertEqual(mf.get("manifest_version"), "layer_asset_manifest_v2")
+            self.assertIn("asset_id", mf)
+            self.assertEqual(len(str(mf["asset_id"])), 64)
+
+    def test_bundle_index_write_and_validate(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from trainer.training.layer_asset_store import (
+            validate_layer_asset_bundle_index,
+            write_layer_asset_bundle_index,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "a.bin").write_bytes(b"hello")
+            write_layer_asset_bundle_index(
+                d,
+                [{"relative_path": "a.bin", "role": "test"}],
+                aggregate_coverage_start="2025-01-01",
+                aggregate_coverage_end="2025-03-31",
+            )
+            ok, msg = validate_layer_asset_bundle_index(d)
+            self.assertTrue(ok, msg)
+
+    def test_online_increment_partition_id_shape(self) -> None:
+        from trainer.training.layer_asset_store import online_increment_partition_id
+        import pandas as pd
+
+        s = pd.Timestamp("2025-01-01T00:00:00", tz="UTC")
+        e = pd.Timestamp("2025-01-01T00:00:45", tz="UTC")
+        pid = online_increment_partition_id(s, e)
+        self.assertTrue(pid.startswith("inc:"))
 
 
 class TestTripMaterializer(unittest.TestCase):

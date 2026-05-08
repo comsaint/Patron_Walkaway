@@ -8,13 +8,15 @@ when unknown, ``partition_id`` is ``*`` and ``impact_scope`` is ``full_matrix``.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from trainer.features.features import get_cross_layer_compose_contract, get_layer_for_feature
 from trainer.training.data_sources import _OPTIONAL_BET_LDA_RUN_TRIP_COLS
 
 
-IMPACT_PLANNER_VERSION: str = "impact_planner_v2"
+IMPACT_PLANNER_VERSION: str = "impact_planner_v3"
 
 
 def _infer_spec_track_layer(feature_id: str, spec: dict) -> Optional[str]:
@@ -41,6 +43,32 @@ def resolve_materialization_layer(feature_id: str, spec: dict) -> str:
     if mapped is not None:
         return str(mapped)
     return "bet"
+
+
+def work_unit_asset_id(
+    *,
+    layer: str,
+    feature_id: str,
+    partition_id: str,
+    feature_fingerprint: str,
+    source_snapshot_id: str,
+    pit_policy_id: str,
+    compute_policy_version: str,
+) -> str:
+    """Deterministic portable id for one impacted work unit (plan partition contract)."""
+    payload = {
+        "kind": "materialization_work_unit",
+        "layer": str(layer),
+        "feature_id": str(feature_id),
+        "partition_id": str(partition_id),
+        "feature_fingerprint": str(feature_fingerprint),
+        "source_snapshot_id": str(source_snapshot_id),
+        "pit_policy_id": str(pit_policy_id),
+        "compute_policy_version": str(compute_policy_version),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _expand_work_units_to_partitions(
@@ -94,6 +122,7 @@ def plan_impacted_materialization_work(
     curr_source_snapshot_id: Optional[str],
     lookback_partition_count: Optional[int] = None,
     chunk_partition_ids: Optional[Sequence[str]] = None,
+    pit_policy_id: str = "cutoff_window",
 ) -> Dict[str, Any]:
     """Return impacted work units and observability flags.
 
@@ -116,12 +145,16 @@ def plan_impacted_materialization_work(
         When set (e.g. from Step 1 ``get_single_window_chunk``), work units with
         ``partition_id='*'`` are expanded to one row per chunk partition so
         ``(layer, feature_id, partition_id)`` is concrete for orchestration.
+    pit_policy_id:
+        PIT / identity policy label for ``asset_id`` hashing (aligns with trainer).
     """
     if not isinstance(curr_spec, dict):
         raise TypeError(f"curr_spec must be dict, got {type(curr_spec).__name__}")
     from trainer.training import feature_materialization as _fm
 
     curr_fp = dict(curr_per_feature_fp or _fm.per_feature_fingerprints(curr_spec))
+    _cpv = _fm.compute_policy_version()
+    _snap = str(curr_source_snapshot_id or "unknown").strip() or "unknown"
     reasons: List[str] = []
     work: List[Dict[str, Any]] = []
     full_matrix = False
@@ -135,9 +168,10 @@ def plan_impacted_materialization_work(
         if impacted_ids:
             reasons.append("SPEC_FINGERPRINT_OR_DEPENDS_CLOSURE")
             for fid in sorted(impacted_ids):
+                lyr = resolve_materialization_layer(fid, curr_spec)
                 work.append(
                     {
-                        "layer": resolve_materialization_layer(fid, curr_spec),
+                        "layer": lyr,
                         "feature_id": fid,
                         "partition_id": "*",
                         "impact_reason": "SPEC_FINGERPRINT_OR_DEPENDS_CLOSURE",
@@ -161,9 +195,10 @@ def plan_impacted_materialization_work(
         removed = sorted(prev_ids - curr_ids)
         for fid in removed:
             reasons.append("FEATURE_REMOVED_FROM_SPEC")
+            lyr = resolve_materialization_layer(fid, prev_spec)
             work.append(
                 {
-                    "layer": resolve_materialization_layer(fid, prev_spec),
+                    "layer": lyr,
                     "feature_id": fid,
                     "partition_id": "*",
                     "impact_reason": "FEATURE_REMOVED_FROM_SPEC",
@@ -193,9 +228,10 @@ def plan_impacted_materialization_work(
                 if isinstance(cand, dict) and cand.get("feature_id"):
                     declared.add(str(cand["feature_id"]))
         for fid in sorted(declared):
+            lyr = resolve_materialization_layer(fid, curr_spec)
             work.append(
                 {
-                    "layer": resolve_materialization_layer(fid, curr_spec),
+                    "layer": lyr,
                     "feature_id": fid,
                     "partition_id": "*",
                     "impact_reason": "DATA_SNAPSHOT_ID_CHANGED",
@@ -221,7 +257,28 @@ def plan_impacted_materialization_work(
         if key in seen:
             continue
         seen.add(key)
-        deduped.append(w)
+        ww = dict(w)
+        fid = str(ww.get("feature_id") or "")
+        lyr = str(ww.get("layer") or "bet")
+        pid = str(ww.get("partition_id") or "*")
+        if fid in curr_fp:
+            _fp = str(curr_fp[fid])
+        elif lyr == "trip" and fid.startswith("lda_"):
+            _fp = "lda_bridge"
+        elif ww.get("impact_reason") == "FEATURE_REMOVED_FROM_SPEC":
+            _fp = "removed"
+        else:
+            _fp = ""
+        ww["asset_id"] = work_unit_asset_id(
+            layer=lyr,
+            feature_id=fid,
+            partition_id=pid,
+            feature_fingerprint=_fp,
+            source_snapshot_id=_snap,
+            pit_policy_id=str(pit_policy_id),
+            compute_policy_version=_cpv,
+        )
+        deduped.append(ww)
 
     impact_scope = "full_matrix" if full_matrix else ("none" if not deduped else "spec_or_lineage_delta")
     if lookback_partition_count is not None:

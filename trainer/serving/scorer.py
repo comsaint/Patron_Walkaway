@@ -2980,6 +2980,29 @@ def main() -> None:
         len(artifacts["feature_list"]),
     )
 
+    _bundle_dir_raw = (os.environ.get("TRAINER_LAYER_ASSET_BUNDLE_DIR") or "").strip()
+    if _bundle_dir_raw:
+        try:
+            from pathlib import Path
+
+            from trainer.training.layer_asset_store import (
+                load_layer_asset_bundle_index,
+                read_watermark_cursor,
+            )
+
+            _bd = Path(_bundle_dir_raw)
+            _idx, _idx_err = load_layer_asset_bundle_index(_bd)
+            _wm = read_watermark_cursor(_bd)
+            logger.info(
+                "[scorer] layer asset bundle_dir=%s index_ok=%s watermark=%s detail=%s",
+                _bundle_dir_raw,
+                _idx_err is None,
+                _wm is not None,
+                _idx_err or "ok",
+            )
+        except Exception as _b_exc:
+            logger.warning("[scorer] layer asset bundle ingest skipped: %s", _b_exc)
+
     conn = sqlite3.connect(STATE_DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")

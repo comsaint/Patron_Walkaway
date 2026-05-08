@@ -242,6 +242,7 @@ def build_pipeline_feature_materialization_audit(
             curr_source_snapshot_id=curr_source_snapshot_id,
             lookback_partition_count=lookback_partition_count,
             chunk_partition_ids=chunk_partition_ids,
+            pit_policy_id=str(pit_policy_id),
         )
         # WS2: sample cache-key lexicon for compose + a few declared ids (bounded size).
         _pid_sample = (chunk_partition_ids[0] if chunk_partition_ids else "*")
@@ -284,6 +285,29 @@ def build_pipeline_feature_materialization_audit(
                 }
             )
         audit["cache_key_lexicon_sample"] = _sample
+        audit["partition_contract_observability"] = {
+            "impact_planner_version": audit["impact_plan"].get("impact_planner_version"),
+            "impacted_work_unit_count": audit["impact_plan"].get("impacted_work_unit_count"),
+            "full_matrix_recommended": audit["impact_plan"].get("full_matrix_recommended"),
+            "miss_reason": audit["impact_plan"].get("miss_reason"),
+        }
+    audit.setdefault("partition_contract_observability", {})
+    _bdir = (os.environ.get("TRAINER_LAYER_ASSET_BUNDLE_DIR") or "").strip()
+    if _bdir:
+        try:
+            from pathlib import Path
+
+            from trainer.training.layer_asset_store import summarize_bundle_for_audit
+
+            audit["partition_contract_observability"] = {
+                **audit["partition_contract_observability"],
+                "layer_asset_bundle": summarize_bundle_for_audit(Path(_bdir)),
+            }
+        except Exception as _obs_exc:
+            audit["partition_contract_observability"] = {
+                **audit["partition_contract_observability"],
+                "layer_asset_bundle_error": str(_obs_exc),
+            }
     if train_columns is not None:
         ok, detail = validate_spec_first_training_columns(train_columns, feature_spec)
         audit["spec_first_column_check"] = {"ok": ok, "detail": detail}
@@ -345,8 +369,9 @@ def build_feature_cache_key_parts(
     feature_fingerprint: str,
     node_kind: str = "layer",
     upstream_fingerprint_closure_hash: str = "",
+    asset_id: str = "",
 ) -> Dict[str, str]:
-    """Canonical key fields for feature-level materialization cache (WS2)."""
+    """Canonical key fields for feature-level materialization cache (WS2/WS5)."""
     out: Dict[str, str] = {
         "node_kind": str(node_kind),
         "layer": str(layer),
@@ -359,6 +384,8 @@ def build_feature_cache_key_parts(
     }
     if upstream_fingerprint_closure_hash:
         out["upstream_fingerprint_closure_hash"] = str(upstream_fingerprint_closure_hash)
+    if str(asset_id).strip():
+        out["asset_id"] = str(asset_id).strip()
     return out
 
 
@@ -369,6 +396,10 @@ def format_feature_cache_key(parts: Mapping[str, str]) -> str:
 
 def _player_layer_asset_path() -> str:
     return (os.environ.get("TRAINER_PLAYER_LAYER_ASSET_PATH") or "").strip()
+
+
+def _layer_asset_bundle_dir() -> str:
+    return (os.environ.get("TRAINER_LAYER_ASSET_BUNDLE_DIR") or "").strip()
 
 
 def evaluate_materialization_gate_bundle() -> Dict[str, Any]:
@@ -393,6 +424,25 @@ def evaluate_materialization_gate_bundle() -> Dict[str, Any]:
         gates["player_layer_asset_path_guard"] = {
             "ok": True,
             "detail": "TRAINER_PLAYER_LAYER_ASSET_PATH unset (inline profile path)",
+            "miss_reason": None,
+        }
+
+    _bdir = _layer_asset_bundle_dir()
+    if _bdir:
+        from pathlib import Path
+
+        from trainer.training.layer_asset_store import validate_layer_asset_bundle_index
+
+        ok_b, msg_b = validate_layer_asset_bundle_index(Path(_bdir))
+        gates["layer_asset_bundle_index_guard"] = {
+            "ok": ok_b,
+            "detail": msg_b,
+            "miss_reason": None if ok_b else "LAYER_ASSET_BUNDLE_INDEX_INVALID",
+        }
+    else:
+        gates["layer_asset_bundle_index_guard"] = {
+            "ok": True,
+            "detail": "TRAINER_LAYER_ASSET_BUNDLE_DIR unset",
             "miss_reason": None,
         }
 

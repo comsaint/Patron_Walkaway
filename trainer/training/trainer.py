@@ -8285,6 +8285,26 @@ def run_pipeline(args) -> None:
             step1_duration_sec = _el
             pipeline_echo(f"Step 1/10 — done in {_el:.1f}s ({len(chunks)} window(s), {_chunk_mode_label})")
             logger.info("Chunks: %d mode=%s (%.1fs)", len(chunks), _chunk_mode_label, _el)
+            _bundle_dir_raw = (os.environ.get("TRAINER_LAYER_ASSET_BUNDLE_DIR") or "").strip()
+            if _bundle_dir_raw:
+                try:
+                    from trainer.training.layer_asset_store import (
+                        load_layer_asset_bundle_index,
+                        read_watermark_cursor,
+                    )
+
+                    _bd = Path(_bundle_dir_raw)
+                    _idx, _idx_err = load_layer_asset_bundle_index(_bd)
+                    _wm = read_watermark_cursor(_bd)
+                    logger.info(
+                        "TRAINER_LAYER_ASSET_BUNDLE_DIR=%s index_ok=%s watermark=%s detail=%s",
+                        _bundle_dir_raw,
+                        _idx_err is None,
+                        _wm is not None,
+                        _idx_err or "ok",
+                    )
+                except Exception as _b_exc:
+                    logger.warning("layer asset bundle ingest skipped: %s", _b_exc)
 
             # Effective window is derived from the window list.
             # All subsequent data loading (identity/profile checks/profile load) must
