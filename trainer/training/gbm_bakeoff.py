@@ -41,6 +41,7 @@ from sklearn.metrics import average_precision_score
 from trainer.core import config as _cfg
 from trainer.core.model_wrappers import EqualWeightSoftVoteModel
 from trainer.training.gbm_bakeoff_disk import GbmBakeoffLibSvmBundle
+from trainer.training.phase_e_process_snapshot import log_phase_e_memory
 from trainer.training.oof_stacking import build_stacked_logistic_candidate
 from trainer.training.threshold_selection import pick_threshold_dec026
 
@@ -122,6 +123,11 @@ def _phase_e_dense_positive_scores(
     t0 = time.perf_counter()
     n = int(len(X))
     br = max(1, int(batch_rows))
+    # XGBoost sklearn inference may allocate large transient buffers per call
+    # (DMatrix + prediction workspace). Keep Phase E validation/test chunks
+    # conservative to reduce silent OOM-kill risk on Windows.
+    if str(backend).strip().lower() == "xgboost":
+        br = min(br, 100_000)
     ncols = int(X.shape[1]) if getattr(X, "ndim", 2) >= 2 else 0
     batched = n > br
     mode = "in_memory_dense_batched" if batched else "in_memory_dense_single"
@@ -134,6 +140,7 @@ def _phase_e_dense_positive_scores(
         mode,
         br,
     )
+    log_phase_e_memory(logger, "predict_begin_after_log", cfg=_cfg, extra={"role": role})
     if n == 0:
         elapsed = time.perf_counter() - t0
         logger.info(
@@ -147,8 +154,20 @@ def _phase_e_dense_positive_scores(
         0,
         int(getattr(_cfg, "A3_PHASE_E_PREDICT_HEARTBEAT_EVERY_N_BATCHES", 10)),
     )
+    # XGBoost: default heartbeat interval is too sparse for few-batch val runs; log every batch.
+    if str(backend).strip().lower() == "xgboost" and hb_every > 0:
+        hb_every = 1
     booster = getattr(model, "booster_", None)
     if booster is not None:
+        logger.info(
+            "A3 PhaseE booster_predict_begin role=%s backend=%s rows=%d batch_rows=%d",
+            role,
+            backend,
+            n,
+            br,
+        )
+        log_phase_e_memory(logger, "booster_predict_begin", cfg=_cfg, extra={"role": role})
+        _t_booster = time.perf_counter()
         out = np.asarray(
             _batched_model_positive_class_scores(model, X, br),
             dtype=np.float64,
@@ -157,22 +176,85 @@ def _phase_e_dense_positive_scores(
         ds = "in_memory_dense_batched" if batched else "in_memory_dense"
         logger.info(
             "A3 PhaseE predict_end role=%s backend=%s len=%d data_source=%s "
-            "engine=lightgbm_booster elapsed_s=%.3f",
+            "engine=lightgbm_booster inner_wall_s=%.3f elapsed_s=%.3f",
             role,
             backend,
             int(len(out)),
             ds,
+            time.perf_counter() - _t_booster,
             elapsed,
         )
+        log_phase_e_memory(logger, "booster_predict_end", cfg=_cfg, extra={"role": role})
         return out, ds
     parts: list[np.ndarray] = []
     batch_count = 0
     for start in range(0, n, br):
-        chunk = X.iloc[start : start + br]
-        raw = model.predict_proba(chunk)[:, 1]
-        parts.append(np.asarray(raw, dtype=np.float64).reshape(-1))
         batch_count += 1
-        processed = min(start + br, n)
+        end_excl = min(start + br, n)
+        rows_in_batch = end_excl - start
+        _t_batch = time.perf_counter()
+        logger.info(
+            "A3 PhaseE batch_begin role=%s backend=%s batch_idx=%d start_row=%d end_row=%d "
+            "rows_in_batch=%d total_rows=%d",
+            role,
+            backend,
+            batch_count,
+            start,
+            end_excl,
+            rows_in_batch,
+            n,
+        )
+        log_phase_e_memory(
+            logger,
+            "batch_begin",
+            cfg=_cfg,
+            extra={"role": role, "batch_idx": batch_count},
+        )
+        chunk = X.iloc[start:end_excl]
+        if bool(getattr(_cfg, "A3_PHASE_E_DIAG_MEMORY_SNAPSHOT", False)) and batch_count == 1:
+            _cn = int(chunk.shape[1]) if getattr(chunk, "ndim", 2) >= 2 else 0
+            _flat = np.asarray(chunk.to_numpy(dtype=np.float64, copy=False)).ravel()
+            _nf = int(np.size(_flat) - int(np.count_nonzero(np.isfinite(_flat))))
+            logger.info(
+                "A3 PhaseE_diag tag=chunk_numeric_batch1 role=%s cols=%d nonfinite_count=%d",
+                role,
+                _cn,
+                _nf,
+            )
+        # Avoid up-front full-frame casting; coerce per chunk to keep peak RAM bounded.
+        chunk_for_predict = chunk.astype(np.float32, copy=False)
+        log_phase_e_memory(
+            logger,
+            "before_predict_proba",
+            cfg=_cfg,
+            extra={"role": role, "batch_idx": batch_count},
+        )
+        raw = model.predict_proba(chunk_for_predict)[:, 1]
+        log_phase_e_memory(
+            logger,
+            "after_predict_proba",
+            cfg=_cfg,
+            extra={"role": role, "batch_idx": batch_count},
+        )
+        parts.append(np.asarray(raw, dtype=np.float64).reshape(-1))
+        _batch_wall = time.perf_counter() - _t_batch
+        logger.info(
+            "A3 PhaseE batch_end role=%s backend=%s batch_idx=%d rows_in_batch=%d "
+            "batch_wall_s=%.3f cumulative_elapsed_s=%.3f",
+            role,
+            backend,
+            batch_count,
+            rows_in_batch,
+            _batch_wall,
+            time.perf_counter() - t0,
+        )
+        log_phase_e_memory(
+            logger,
+            "batch_end",
+            cfg=_cfg,
+            extra={"role": role, "batch_idx": batch_count},
+        )
+        processed = end_excl
         if hb_every > 0 and batch_count % hb_every == 0:
             logger.info(
                 "A3 PhaseE predict_heartbeat role=%s backend=%s batch_idx=%d "
@@ -197,6 +279,7 @@ def _phase_e_dense_positive_scores(
         batch_count,
         elapsed,
     )
+    log_phase_e_memory(logger, "predict_end", cfg=_cfg, extra={"role": role})
     return out, ds
 
 
@@ -385,9 +468,13 @@ def _train_catboost_backend(
 
     if libsvm_bundle is not None and bool(getattr(_cfg, "GBM_BAKEOFF_FROM_FILE", True)):
         try:
-            from trainer.training.gbm_bakeoff_disk import train_catboost_from_libsvm_disk
+            from trainer.training.gbm_bakeoff_disk import (
+                catboost_disk_strict_refit_on_train_union_valid,
+                train_catboost_from_libsvm_disk,
+            )
+            from trainer.training.split_file_bundle import trainer_file_backed_strict_enabled
 
-            return train_catboost_from_libsvm_disk(
+            model_cb, metrics_cb = train_catboost_from_libsvm_disk(
                 libsvm_bundle,
                 hp,
                 y_val=y_val,
@@ -396,6 +483,22 @@ def _train_catboost_backend(
                 val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
                 quantize_first=bool(getattr(_cfg, "GBM_BAKEOFF_CATBOOST_QUANTIZE", False)),
             )
+            if trainer_file_backed_strict_enabled() and _has_strong_validation(X_val, y_val):
+                model_cb = catboost_disk_strict_refit_on_train_union_valid(
+                    model_cb,
+                    libsvm_bundle,
+                    hp,
+                    backend_runtime_params=backend_runtime_params,
+                    quantize_first=bool(getattr(_cfg, "GBM_BAKEOFF_CATBOOST_QUANTIZE", False)),
+                )
+                metrics_cb["final_refit_train_valid"] = True
+                metrics_cb["final_refit_data_source"] = "libsvm_disk_train_union_valid"
+                metrics_cb["final_refit_backend"] = "catboost"
+            else:
+                metrics_cb["final_refit_train_valid"] = False
+                metrics_cb["final_refit_data_source"] = "skipped_non_strict_or_weak_val"
+                metrics_cb["final_refit_backend"] = "catboost"
+            return model_cb, metrics_cb
         except Exception as exc:
             from trainer.training.split_file_bundle import trainer_file_backed_strict_enabled
 
@@ -438,6 +541,9 @@ def _train_catboost_backend(
         val_dec026_window_hours=val_dec026_window_hours,
         val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
     )
+    metrics["final_refit_train_valid"] = False
+    metrics["final_refit_data_source"] = "in_memory_dense"
+    metrics["final_refit_backend"] = "catboost"
     return model, metrics
 
 
@@ -459,19 +565,38 @@ def _train_xgboost_backend(
 
     if libsvm_bundle is not None and bool(getattr(_cfg, "GBM_BAKEOFF_FROM_FILE", True)):
         try:
-            from trainer.training.gbm_bakeoff_disk import train_xgboost_from_libsvm_disk
+            from trainer.training.gbm_bakeoff_disk import (
+                train_xgboost_from_libsvm_disk,
+                xgboost_disk_strict_refit_on_train_union_valid,
+            )
+            from trainer.training.split_file_bundle import trainer_file_backed_strict_enabled
 
-            return train_xgboost_from_libsvm_disk(
+            _x_use_ext = bool(getattr(_cfg, "GBM_BAKEOFF_XGBOOST_EXTERNAL_MEMORY", False))
+            model_x, metrics_x = train_xgboost_from_libsvm_disk(
                 libsvm_bundle,
                 hp,
                 y_val=y_val,
                 backend_runtime_params=backend_runtime_params,
                 val_dec026_window_hours=val_dec026_window_hours,
                 val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
-                use_external_memory=bool(
-                    getattr(_cfg, "GBM_BAKEOFF_XGBOOST_EXTERNAL_MEMORY", False)
-                ),
+                use_external_memory=_x_use_ext,
             )
+            if trainer_file_backed_strict_enabled() and _has_strong_validation(X_val, y_val):
+                model_x = xgboost_disk_strict_refit_on_train_union_valid(
+                    model_x,
+                    libsvm_bundle,
+                    hp,
+                    backend_runtime_params=backend_runtime_params,
+                    use_external_memory=_x_use_ext,
+                )
+                metrics_x["final_refit_train_valid"] = True
+                metrics_x["final_refit_data_source"] = "libsvm_disk_train_union_valid"
+                metrics_x["final_refit_backend"] = "xgboost"
+            else:
+                metrics_x["final_refit_train_valid"] = False
+                metrics_x["final_refit_data_source"] = "skipped_non_strict_or_weak_val"
+                metrics_x["final_refit_backend"] = "xgboost"
+            return model_x, metrics_x
         except Exception as exc:
             from trainer.training.split_file_bundle import trainer_file_backed_strict_enabled
 
@@ -522,6 +647,9 @@ def _train_xgboost_backend(
         val_dec026_window_hours=val_dec026_window_hours,
         val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
     )
+    metrics["final_refit_train_valid"] = False
+    metrics["final_refit_data_source"] = "in_memory_dense"
+    metrics["final_refit_backend"] = "xgboost"
     return model, metrics
 
 
@@ -829,6 +957,14 @@ def train_and_select_rated_gbm_family(
                     backend,
                     timeout_budget_divisor=_timeout_budget_divisor,
                 )
+                _disk_hpo: Optional[Tuple[Path, Path, int, Tuple[str, ...]]] = None
+                if libsvm_bundle is not None:
+                    _disk_hpo = (
+                        Path(libsvm_bundle.train_libsvm),
+                        Path(libsvm_bundle.valid_libsvm),
+                        int(libsvm_bundle.train_row_count),
+                        tuple(str(x) for x in libsvm_bundle.feature_names),
+                    )
                 hp_backend = run_backend_optuna_search(
                     X_train,
                     y_train,
@@ -844,6 +980,7 @@ def train_and_select_rated_gbm_family(
                     early_stop_patience=budget.get("early_stop_patience"),
                     hpo_objective_manifest=backend_manifest,
                     backend_runtime_params=backend_runtime_params,
+                    libsvm_disk_hpo=_disk_hpo,
                 )
                 logger.info(
                     "A3 investigate: backend=%s Optuna returned; starting trainer_fn final fit "
@@ -902,7 +1039,10 @@ def train_and_select_rated_gbm_family(
             metrics.update(backend_runtime_manifest)
             if backend_manifest:
                 metrics.update(backend_manifest[0])
-            from trainer.training.split_file_bundle import trainer_file_backed_strict_enabled
+            from trainer.training.split_file_bundle import (
+                forbid_file_backed_strict_dense_predict,
+                trainer_file_backed_strict_enabled,
+            )
             from trainer.training.gbm_bakeoff_disk import (
                 phase_e_ap_mode,
                 phase_e_predict_batch_rows,
@@ -911,15 +1051,19 @@ def train_and_select_rated_gbm_family(
                 predict_positive_scores_phase_e_libsvm,
             )
 
+            _pe_stream_gate = phase_e_predict_streaming_enabled() or (
+                libsvm_bundle is not None and trainer_file_backed_strict_enabled()
+            )
             logger.info(
                 "A3 investigate: backend=%s Phase E gate libsvm_bundle=%s "
-                "phase_e_predict_streaming_enabled=%s",
+                "phase_e_predict_streaming_enabled=%s strict_stream_gate=%s",
                 backend,
                 libsvm_bundle is not None,
                 phase_e_predict_streaming_enabled(),
+                _pe_stream_gate,
             )
             _pe_val_ok = False
-            if libsvm_bundle is not None and phase_e_predict_streaming_enabled():
+            if libsvm_bundle is not None and _pe_stream_gate:
                 _t_val_stream = time.perf_counter()
                 logger.info(
                     "A3 PhaseE predict_begin role=val backend=%s mode=libsvm_streaming "
@@ -1000,11 +1144,20 @@ def train_and_select_rated_gbm_family(
                         time.perf_counter() - _t_vc,
                     )
                 else:
+                    if (
+                        libsvm_bundle is not None
+                        and trainer_file_backed_strict_enabled()
+                        and _has_strong_validation(X_val, y_val)
+                    ):
+                        forbid_file_backed_strict_dense_predict(
+                            role="validation",
+                            detail=f"backend={backend}",
+                        )
                     if _has_strong_validation(X_val, y_val):
                         _val_batch = int(getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000))
                         _vs_arr, _vs_src = _phase_e_dense_positive_scores(
                             model,
-                            _to_float32_frame(X_val),
+                            X_val,
                             _val_batch,
                             backend=backend,
                             role="val",
@@ -1039,7 +1192,7 @@ def train_and_select_rated_gbm_family(
             train_thr = float(metrics["threshold"])
             train_scores_disk: Optional[np.ndarray] = None
             _pe_tr_ok = False
-            if libsvm_bundle is not None and phase_e_predict_streaming_enabled():
+            if libsvm_bundle is not None and _pe_stream_gate:
                 _t_tr_stream = time.perf_counter()
                 logger.info(
                     "A3 PhaseE predict_begin role=train backend=%s mode=libsvm_streaming "
@@ -1093,6 +1246,16 @@ def train_and_select_rated_gbm_family(
                         model.predict_proba(Pool(_tr_uri))[:, 1],
                         dtype=np.float64,
                     ).reshape(-1)
+            if (
+                train_scores_disk is None
+                and libsvm_bundle is not None
+                and trainer_file_backed_strict_enabled()
+                and len(X_train) > 0
+            ):
+                forbid_file_backed_strict_dense_predict(
+                    role="train",
+                    detail=f"backend={backend}",
+                )
             if train_scores_disk is not None:
                 metrics.update(
                     _train_metrics_dict_from_y_scores(
@@ -1154,7 +1317,7 @@ def train_and_select_rated_gbm_family(
                 if (
                     libsvm_bundle is not None
                     and libsvm_bundle.test_libsvm is not None
-                    and phase_e_predict_streaming_enabled()
+                    and _pe_stream_gate
                 ):
                     _t_te_stream = time.perf_counter()
                     logger.info(
@@ -1223,12 +1386,20 @@ def train_and_select_rated_gbm_family(
                     )
                     metrics.update(test_metrics)
                     metrics["_test_scores"] = np.asarray(_ts_disk, dtype=np.float64).reshape(-1)
+                elif (
+                    libsvm_bundle is not None
+                    and libsvm_bundle.test_libsvm is not None
+                    and trainer_file_backed_strict_enabled()
+                ):
+                    forbid_file_backed_strict_dense_predict(
+                        role="test",
+                        detail=f"backend={backend}",
+                    )
                 else:
                     _te_batch = int(getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000))
-                    _x_test_f = _to_float32_frame(X_test)
                     _test_scores_arr, _test_src = _phase_e_dense_positive_scores(
                         model,
-                        _x_test_f,
+                        X_test,
                         _te_batch,
                         backend=backend,
                         role="test",

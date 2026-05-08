@@ -73,13 +73,21 @@ Notes
   when ``TRAINER_MANIFEST_PATH_STRICT`` is unset or ``1`` (default). Emit-time
   ``parallel_lda_mvp`` bridge paths must be expressible relative to the chosen anchor
   (otherwise emit raises). Legacy hosts may set ``TRAINER_MANIFEST_PATH_STRICT=0``.
-- **Final train+valid refit (§12)**: in-memory / Plan-B-CSV LightGBM paths refit on
-  ``train ∪ valid`` after selection using the same tree budget as early stopping.
+- **Final train+valid refit (§12)**: the main pipeline trains Rated LightGBM from **LibSVM files**
+  under ``DATA_DIR/export`` (``STEP9_EXPORT_LIBSVM`` must be ``True``); legacy Plan B CSV exports
+  are removed on each run. In-memory LightGBM (unit tests / callers without LibSVM paths) still
+  refits on ``train ∪ valid`` after selection when applicable.
   LibSVM-on-disk **without** ``TRAINER_FILE_BACKED_STRICT`` skips refit (see
   ``training_metrics`` → ``final_refit_train_valid``).
   When ``TRAINER_FILE_BACKED_STRICT`` is ``1``/``true``/``yes``/``on`` (issue #25),
   the rated LibSVM path performs a **file-backed** refit by merging train and valid
   LibSVM (and weight lines) before a second ``lgb.train`` with ``num_boost_round=best_iteration``.
+  Under the same strict flag, **A3** optional backends (CatBoost / XGBoost) use **LibSVM-disk Optuna**
+  when a bakeoff LibSVM bundle is present, then a **train∪valid disk refit** (metrics:
+  ``final_refit_train_valid``, ``final_refit_data_source``, ``final_refit_backend``).
+  With strict + LibSVM bundle, **Phase E** treats streaming as **on** for val/train/test scores
+  even if ``GBM_BAKEOFF_PREDICT_STREAMING`` is unset, and dense-matrix fallbacks for those scores
+  are **rejected** (fail-fast).
   A3 CatBoost/XGBoost disk training **does not** fall back to in-memory fit in strict mode
   (disk failure is fatal). Set ``TRAINER_DISABLE_FINAL_REFIT_TRAIN_VALID=1`` to skip refit for debugging only.
   In strict mode, missing train/valid LibSVM, empty train LibSVM, or single-class train LibSVM
@@ -96,7 +104,7 @@ Notes
   - ``GBM_BAKEOFF_SCORE_MEMMAP=1``：串流分數寫入 bakeoff ``cache_dir`` 下 **float32 memmap**（路徑見 metrics ``a3_score_memmap_path``）。
   - ``GBM_BAKEOFF_PREDICT_BATCH_ROWS``：每批行數（有上下限）；CLI 對應 ``--gbm-bakeoff-predict-batch-rows N``。
   - ``GBM_BAKEOFF_AP_MODE``：``legacy``（sklearn AP）、``approx_histogram``（分箱近似 AP）、``exact_external_sort``（與 legacy 同 sklearn AP，名稱保留供對照）；CLI ``--gbm-bakeoff-ap-mode``。
-  - ``TRAINER_FILE_BACKED_STRICT=1`` 且啟用 Phase E 串流時，串流 predict **失敗則 fail-fast**（不 silent 回退）。
+  - ``TRAINER_FILE_BACKED_STRICT=1`` 且（啟用 Phase E 串流 **或** 已具 LibSVM bundle）時，串流 predict **失敗則 fail-fast**（不 silent 回退）。
 
 A. Tables and the **dev** feature catalog change often; incremental rebuilds should
    touch only invalidated partitions / fingerprints (bridge + materialization cache keys).

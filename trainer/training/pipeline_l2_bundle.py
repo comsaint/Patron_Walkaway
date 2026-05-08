@@ -274,6 +274,19 @@ def execute_l2_training_bundle(
     tr.pipeline_echo("Step 9/11 — Train rated GBM (L2 bundle path) …")
     t0 = time.perf_counter()
     model_version = pipeline_model_version
+    if not tr.STEP9_EXPORT_LIBSVM:
+        raise RuntimeError(
+            "STEP9_EXPORT_LIBSVM=False is incompatible with LibSVM-only training."
+        )
+    _export_dir = tr.DATA_DIR / "export"
+    tr.remove_legacy_plan_b_csv_exports(_export_dir)
+    _l2_train_libsvm, _l2_valid_libsvm, _l2_test_libsvm = tr._export_parquet_to_libsvm(
+        manifest.train_path,
+        manifest.valid_path,
+        active_feature_cols,
+        _export_dir,
+        test_path=manifest.test_path,
+    )
     logger.info(
         "L2 bundle investigate: entering train_single_rated_model "
         "(gbm_bakeoff=%s skip_optuna=%s train_rows=%d)",
@@ -287,9 +300,8 @@ def execute_l2_training_bundle(
         active_feature_cols,
         run_optuna=not skip_optuna,
         test_df=test_df,
-        train_from_file=bool(tr.STEP9_TRAIN_FROM_FILE),
-        train_libsvm_paths=None,
-        test_libsvm_path=None,
+        train_libsvm_paths=(_l2_train_libsvm, _l2_valid_libsvm),
+        test_libsvm_path=_l2_test_libsvm,
         ranking_recipe=pipeline_ranking_recipe,
         gbm_bakeoff=pipeline_gbm_bakeoff,
         valid_split_parquet_path=None,

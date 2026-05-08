@@ -1,12 +1,8 @@
-"""Minimal reproducible tests for Round 199 Review — 方案 B 從檔案分支邊界條件.
-
-Round 199 Review risk points (STATUS.md) are turned into contract/behavior tests.
-Tests that assert desired behaviour not yet in production use @unittest.expectedFailure.
-Tests-only: no production code changes.
-"""
+"""Round 199 Review — LibSVM path edge cases (from-file / CSV retired)."""
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 import unittest
 import unittest.mock
@@ -16,11 +12,10 @@ import numpy as np
 import pandas as pd
 
 import trainer.trainer as trainer_mod
-from trainer.trainer import _export_train_valid_to_csv, train_single_rated_model
+from trainer.trainer import train_single_rated_model
 
 
 def _make_train_rated(n: int, feature_cols: list[str], seed: int = 42) -> pd.DataFrame:
-    """Train DataFrame with label 0/1 mix, is_rated, canonical_id, run_id."""
     rng = np.random.default_rng(seed)
     df = pd.DataFrame(
         {c: rng.random(n).astype(np.float64) for c in feature_cols},
@@ -35,59 +30,99 @@ def _make_train_rated(n: int, feature_cols: list[str], seed: int = 42) -> pd.Dat
     return df
 
 
-# ---------------------------------------------------------------------------
-# R199 Review #1 — 邊界：val_rated 缺 _train_feature_cols 時不應 KeyError（中）
-# ---------------------------------------------------------------------------
+def _libsvm_train_valid(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    feature_cols: list[str],
+    root: Path,
+) -> tuple[Path, Path]:
+    export_dir = root / "export"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    tmp = root / "_pq"
+    tmp.mkdir(exist_ok=True)
+    trp, vlp = tmp / "train.parquet", tmp / "valid.parquet"
+    train_df.to_parquet(trp, index=False)
+    valid_df.to_parquet(vlp, index=False)
+    tr_l, va_l, _ = trainer_mod._export_parquet_to_libsvm(
+        trp, vlp, feature_cols, export_dir, test_path=None
+    )
+    shutil.rmtree(tmp, ignore_errors=True)
+    return tr_l, va_l
 
-class TestR199FromFileValidMissingFeatureColsNoKeyError(unittest.TestCase):
-    """Round 199 #1: When CSV has f1,f2 but valid_df only has f1, from-file path must not raise KeyError."""
 
-    def test_from_file_when_valid_has_fewer_columns_than_csv_completes_without_key_error(self):
-        """CSV exported with f1,f2; call with valid_df that has only f1 → train_single_rated_model(..., train_from_file=True) must not raise KeyError."""
+class TestR199LibSvmValidMissingFeatureColsNoKeyError(unittest.TestCase):
+    """Round 199 #1: LibSVM has full features; valid_df subset must not KeyError."""
+
+    def test_libsvm_when_valid_has_fewer_columns_completes(self):
         train_df = _make_train_rated(60, ["f1", "f2"], seed=42)
         valid_full = pd.DataFrame(
-            {"f1": np.random.default_rng(43).random(30), "f2": np.random.default_rng(44).random(30)}
+            {
+                "f1": np.random.default_rng(43).random(30),
+                "f2": np.random.default_rng(44).random(30),
+            }
         )
         valid_full["label"] = (np.random.default_rng(45).random(30) > 0.5).astype(int)
         valid_full.loc[0, "label"] = 0
         valid_full.loc[1, "label"] = 1
         valid_full["is_rated"] = True
+        valid_full["canonical_id"] = "C0"
+        valid_full["run_id"] = range(30)
 
         with tempfile.TemporaryDirectory() as d:
-            export_dir = Path(d) / "export"
-            export_dir.mkdir(parents=True)
-            _export_train_valid_to_csv(train_df, valid_full, ["f1", "f2"], export_dir)
+            root = Path(d)
+            tr_l, va_l = _libsvm_train_valid(train_df, valid_full, ["f1", "f2"], root)
             valid_one_col = valid_full[["f1", "label", "is_rated"]].copy()
 
-            with unittest.mock.patch.object(trainer_mod, "DATA_DIR", Path(d)):
+            with unittest.mock.patch.object(trainer_mod, "DATA_DIR", root), unittest.mock.patch.object(
+                trainer_mod, "A4_TWO_STAGE_ENABLE_TRAINING", False
+            ):
                 rated_art, _, _ = train_single_rated_model(
                     train_df,
                     valid_one_col,
                     ["f1", "f2"],
                     run_optuna=False,
                     test_df=None,
-                    train_from_file=True,
+                    train_libsvm_paths=(tr_l, va_l),
                 )
-        self.assertIsNotNone(rated_art, "R199 #1: from-file with valid missing cols should complete without KeyError.")
+        self.assertIsNotNone(rated_art, "R199 #1: LibSVM with valid missing cols should complete.")
 
 
-# ---------------------------------------------------------------------------
-# R199 Review #2 — 邊界：common_cols 為空時 export 應拋出或明確拒絕（低）
-# ---------------------------------------------------------------------------
+class TestR199ExportNoCommonParquetColumnsRaises(unittest.TestCase):
+    """Round 199 #2: Valid Parquet missing a selected feature column → DuckDB/export failure."""
 
-class TestR199ExportEmptyCommonColsRaisesOrRejects(unittest.TestCase):
-    """Round 199 #2: When train/valid have no common feature columns, export should raise or not produce invalid CSV."""
-
-    def test_export_with_empty_common_cols_raises_value_error(self):
-        """Train has only f1, valid has only f2 → _export_train_valid_to_csv should raise ValueError (no invalid CSV)."""
-        train_df = pd.DataFrame({"f1": [0.1, 0.2], "label": [0, 1], "is_rated": [True, True]})
-        train_df["canonical_id"] = ["C0", "C0"]
-        train_df["run_id"] = [0, 1]
-        valid_df = pd.DataFrame({"f2": [0.3, 0.4], "label": [0, 1], "is_rated": [True, True]})
+    def test_export_when_valid_missing_feature_raises(self):
+        train_df = pd.DataFrame(
+            {
+                "f1": [0.1, 0.2],
+                "label": [0, 1],
+                "is_rated": [True, True],
+                "canonical_id": ["C0", "C0"],
+                "run_id": [0, 1],
+            }
+        )
+        valid_df = pd.DataFrame(
+            {
+                "f2": [0.3, 0.4],
+                "label": [0, 1],
+                "is_rated": [True, True],
+                "canonical_id": ["C0", "C0"],
+                "run_id": [0, 1],
+            }
+        )
         with tempfile.TemporaryDirectory() as d:
-            export_dir = Path(d) / "export"
-            with self.assertRaises(ValueError):
-                _export_train_valid_to_csv(train_df, valid_df, ["f1", "f2"], export_dir)
+            root = Path(d)
+            export_dir = root / "export"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            tmp = root / "_pq"
+            tmp.mkdir(exist_ok=True)
+            trp, vlp = tmp / "train.parquet", tmp / "valid.parquet"
+            train_df.to_parquet(trp, index=False)
+            valid_df.to_parquet(vlp, index=False)
+            with self.assertRaises(Exception):
+                trainer_mod._export_parquet_to_libsvm(
+                    trp, vlp, ["f1", "f2"], export_dir, test_path=None
+                )
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ Tests-only: no production code changes.
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -24,57 +26,63 @@ def _minimal_train_valid_dfs():
             "is_rated": [True, True, True, True],
             "label": [1, 0, 0, 1],
             "f0": [0.1, 0.2, 0.3, 0.4],
+            "f1": [0.5, 0.4, 0.3, 0.2],
+            "canonical_id": ["C0", "C0", "C0", "C0"],
+            "run_id": [0, 1, 2, 3],
         }
     )
     valid_df = train_df.copy()
     return train_df, valid_df
 
 
-class TestR182TrainFromFileReturnStructure(unittest.TestCase):
-    """Round 182 Review P1: train_from_file=True must return same structure as False."""
+def _libsvm_paths(train_df: pd.DataFrame, valid_df: pd.DataFrame, feature_cols: list[str], root: Path):
+    export_dir = root / "export"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    tmp = root / "_pq"
+    tmp.mkdir(exist_ok=True)
+    trp, vlp = tmp / "train.parquet", tmp / "valid.parquet"
+    train_df.to_parquet(trp, index=False)
+    valid_df.to_parquet(vlp, index=False)
+    tr_l, va_l, _ = trainer_mod._export_parquet_to_libsvm(
+        trp, vlp, feature_cols, export_dir, test_path=None
+    )
+    shutil.rmtree(tmp, ignore_errors=True)
+    return tr_l, va_l
 
-    def test_train_from_file_true_returns_same_structure_as_false(self):
-        """train_single_rated_model(..., train_from_file=True) returns (rated_art, None, metrics) with same keys as train_from_file=False."""
+
+class TestR182LibSvmVsInmemoryReturnStructure(unittest.TestCase):
+    """Round 182 Review P1: LibSVM path returns same top-level shape as in-memory."""
+
+    def test_libsvm_returns_same_tuple_keys_as_inmemory(self):
         train_df, valid_df = _minimal_train_valid_dfs()
-        feature_cols = ["f0"]
-        with patch.object(
-            trainer_mod,
-            "_train_one_model",
-            return_value=(object(), {"threshold": 0.5, "val_f1": 0.0, "_uncalibrated": True}),
-        ), patch.object(
-            trainer_mod,
-            "_compute_train_metrics",
-            return_value={"train_ap": 0.0, "train_random_ap": 0.0},
-        ), patch.object(
-            trainer_mod,
-            "_compute_feature_importance",
-            return_value=[{"rank": 1, "feature": "f0", "importance_gain_pct": 100.0}],
-        ), patch.object(
-            trainer_mod,
-            "_compute_test_metrics",
-            return_value={"test_ap": 0.0},
-        ), patch.object(trainer_mod, "A4_TWO_STAGE_ENABLE_TRAINING", False):
-            out_false = trainer_mod.train_single_rated_model(
-                train_df=train_df,
-                valid_df=valid_df,
-                feature_cols=feature_cols,
-                run_optuna=False,
-                test_df=None,
-                train_from_file=False,
-            )
-            out_true = trainer_mod.train_single_rated_model(
-                train_df=train_df,
-                valid_df=valid_df,
-                feature_cols=feature_cols,
-                run_optuna=False,
-                test_df=None,
-                train_from_file=True,
-            )
-        self.assertIsNone(out_false[1])
-        self.assertIsNone(out_true[1])
-        self.assertEqual(set(out_false[2].keys()), set(out_true[2].keys()))
-        if out_false[0] is not None and out_true[0] is not None:
-            self.assertEqual(set(out_false[0].keys()), set(out_true[0].keys()))
+        feature_cols = ["f0", "f1"]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            tr_l, va_l = _libsvm_paths(train_df, valid_df, feature_cols, root)
+            with patch.object(trainer_mod, "DATA_DIR", root), patch.object(
+                trainer_mod, "A4_TWO_STAGE_ENABLE_TRAINING", False
+            ):
+                out_mem = trainer_mod.train_single_rated_model(
+                    train_df=train_df,
+                    valid_df=valid_df,
+                    feature_cols=feature_cols,
+                    run_optuna=False,
+                    test_df=None,
+                    train_libsvm_paths=None,
+                )
+                out_lib = trainer_mod.train_single_rated_model(
+                    train_df=train_df,
+                    valid_df=valid_df,
+                    feature_cols=feature_cols,
+                    run_optuna=False,
+                    test_df=None,
+                    train_libsvm_paths=(tr_l, va_l),
+                )
+        self.assertIsNone(out_mem[1])
+        self.assertIsNone(out_lib[1])
+        self.assertEqual(set(out_mem[2].keys()), set(out_lib[2].keys()))
+        if out_mem[0] is not None and out_lib[0] is not None:
+            self.assertEqual(set(out_mem[0].keys()), set(out_lib[0].keys()))
 
 
 class TestR182PlanBConfigConstants(unittest.TestCase):

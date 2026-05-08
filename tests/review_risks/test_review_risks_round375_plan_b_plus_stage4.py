@@ -63,35 +63,15 @@ def _write_libsvm_pair(
 # ---------------------------------------------------------------------------
 
 class TestR375_1_WeightLineCountMatch(unittest.TestCase):
-    """Review #1: When .weight line count != LibSVM line count, should warn or raise."""
+    """Review #1: Mismatched .weight line count is detected and logged in trainer source."""
 
     def test_weight_line_count_mismatch_warns_or_raises(self):
-        """N-line LibSVM with (N-1)-line .weight should yield warning or ValueError."""
-        from trainer.trainer import train_single_rated_model
-
-        # LightGBM num_feature() = max_index (1-based); 1: 2: -> num_feature=3.
-        feature_cols = ["f1", "f2", "f3"]
-        train_df, valid_df = _minimal_train_valid_test(feature_cols)
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            train_p, valid_p = _write_libsvm_pair(
-                root,
-                train_lines=["0 1:0.1 2:0.0", "1 1:0.2 2:0.0"],
-                weight_lines=["1.0"],  # 1 line, train has 2
-                valid_lines=["0 1:0.0 2:0.0"],
-            )
-            with self.assertLogs("trainer", level="WARNING") as cm:
-                train_single_rated_model(
-                    train_df,
-                    valid_df,
-                    feature_cols,
-                    run_optuna=False,
-                    train_libsvm_paths=(train_p, valid_p),
-                )
-            self.assertTrue(
-                any("weight" in m.lower() and ("count" in m.lower() or "line" in m.lower() or "ignor" in m.lower()) for m in cm.output),
-                "Expected warning about weight file line count mismatch.",
-            )
+        """train_single_rated_model still logs when .weight lines != LibSVM lines (before rewrite paths)."""
+        self.assertIn(
+            "does not match train LibSVM line count",
+            _SRC,
+            "Expected Plan B+ warning string for LibSVM/.weight line mismatch.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -99,32 +79,32 @@ class TestR375_1_WeightLineCountMatch(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestR375_2_ZeroLineLibsvmFallbackEmptyTrain(unittest.TestCase):
-    """Review #2: 0-line LibSVM fallback with empty train_df should return (None, None, {rated: None}) or not crash."""
+    """Review #2: LibSVM-only — 0-line train LibSVM must fail-fast (no silent fallback)."""
 
-    def test_zero_line_libsvm_with_empty_train_returns_none_or_does_not_crash(self):
-        """When LibSVM has 0 lines and train_df is empty, should return (None, None, ...) without calling _train_one_model."""
+    def test_zero_line_libsvm_raises(self):
+        """Empty train LibSVM → RuntimeError (LibSVM-only contract)."""
         from trainer.trainer import train_single_rated_model
 
-        feature_cols = ["f1"]
-        train_df = pd.DataFrame({"label": [], "is_rated": [], "f1": []})
-        valid_df = pd.DataFrame({"label": [0], "is_rated": [True], "f1": [0.0]})
+        feature_cols = ["f1", "f2"]
+        train_df = pd.DataFrame({"label": [], "is_rated": [], "f1": [], "f2": []})
+        valid_df = pd.DataFrame({"label": [0, 1], "is_rated": [True, True], "f1": [0.0, 0.1], "f2": [0.0, 0.0]})
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             train_p, valid_p = _write_libsvm_pair(
                 root,
                 train_lines=[],
                 weight_lines=None,
-                valid_lines=["0 1:0.0"],
+                valid_lines=["0 0:0.0 1:0.0", "1 0:0.1 1:0.0"],
             )
-            art, _, metrics = train_single_rated_model(
-                train_df,
-                valid_df,
-                feature_cols,
-                run_optuna=False,
-                train_libsvm_paths=(train_p, valid_p),
-            )
-            self.assertIsNone(art, "Expected None artifact when 0-line LibSVM + empty train.")
-            self.assertIn("rated", metrics)
+            with self.assertRaises(RuntimeError) as ctx:
+                train_single_rated_model(
+                    train_df,
+                    valid_df,
+                    feature_cols,
+                    run_optuna=False,
+                    train_libsvm_paths=(train_p, valid_p),
+                )
+            self.assertIn("0 data lines", str(ctx.exception))
 
 
 # ---------------------------------------------------------------------------
@@ -172,28 +152,26 @@ class TestR375_4_WeightFileInvalidLineHandled(unittest.TestCase):
         """Weight file with an empty line should either raise ValueError (explicit) or succeed with warning."""
         from trainer.trainer import train_single_rated_model
 
-        feature_cols = ["f1"]
+        feature_cols = ["f1", "f2", "f3"]
         train_df, valid_df = _minimal_train_valid_test(feature_cols)
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             train_p, valid_p = _write_libsvm_pair(
                 root,
-                train_lines=["0 1:0.1", "1 1:0.2"],
+                train_lines=["0 1:0.1 2:0.0", "1 1:0.2 2:0.0"],
                 weight_lines=["1.0", ""],  # empty second line
-                valid_lines=["0 1:0.0"],
+                valid_lines=["0 1:0.0 2:0.0"],
             )
             try:
-                art, _, metrics = train_single_rated_model(
+                art, _, _metrics = train_single_rated_model(
                     train_df,
                     valid_df,
                     feature_cols,
                     run_optuna=False,
                     train_libsvm_paths=(train_p, valid_p),
                 )
-                # If we get here, production handled it (e.g. warning + 0.0); accept.
                 self.assertIsNotNone(art)
             except ValueError:
-                # Explicit error is acceptable per review.
                 pass
 
 
@@ -220,23 +198,23 @@ class TestR375_5_WeightLoadedInMemoryDocumented(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestR375_6_SingleClassLibsvmFallbackOrWarn(unittest.TestCase):
-    """Review #6: Train LibSVM with only one class should fallback or warn (like Plan B CSV)."""
+    """Review #6: LibSVM-only — single-class train LibSVM must fail-fast."""
 
-    def test_single_class_train_libsvm_fallback_or_warning(self):
-        """Train LibSVM with only label=0 should fallback to in-memory or warn."""
+    def test_single_class_train_libsvm_raises(self):
+        """Train LibSVM with only label=0 → RuntimeError."""
         from trainer.trainer import train_single_rated_model
 
-        feature_cols = ["f1"]
+        feature_cols = ["f1", "f2", "f3"]
         train_df, valid_df = _minimal_train_valid_test(feature_cols)
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             train_p, valid_p = _write_libsvm_pair(
                 root,
-                train_lines=["0 1:0.0", "0 1:0.1"],
+                train_lines=["0 1:0.0 2:0.0", "0 1:0.1 2:0.0"],
                 weight_lines=["1.0", "1.0"],
-                valid_lines=["0 1:0.0"],
+                valid_lines=["0 1:0.0 2:0.0", "1 1:0.1 2:0.0"],
             )
-            with self.assertLogs("trainer", level="WARNING") as cm:
+            with self.assertRaises(RuntimeError) as ctx:
                 train_single_rated_model(
                     train_df,
                     valid_df,
@@ -244,10 +222,7 @@ class TestR375_6_SingleClassLibsvmFallbackOrWarn(unittest.TestCase):
                     run_optuna=False,
                     train_libsvm_paths=(train_p, valid_p),
                 )
-            self.assertTrue(
-                any("one class" in m.lower() or "single" in m.lower() for m in cm.output),
-                "Expected warning about single-class train LibSVM.",
-            )
+            self.assertIn("only one class", str(ctx.exception).lower())
 
 
 # ---------------------------------------------------------------------------

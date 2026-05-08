@@ -770,3 +770,30 @@ def test_phase_e_dense_positive_scores_sklearn_batched_contract() -> None:
     )
     assert len(scores2) == 3
     assert ds2 == "in_memory_dense"
+
+
+def test_phase_e_dense_positive_scores_xgboost_caps_batch_size() -> None:
+    """XGBoost backend should cap Phase E dense batch size to 100k."""
+    from trainer.training.gbm_bakeoff import _phase_e_dense_positive_scores
+
+    class _SkModel:
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+            n = int(len(X))
+            self.batch_sizes.append(n)
+            return np.column_stack([np.zeros(n), np.ones(n)])
+
+    model = _SkModel()
+    X = pd.DataFrame(np.zeros((250_001, 2)), columns=["a", "b"])
+    scores, ds = _phase_e_dense_positive_scores(
+        model,
+        X,
+        500_000,
+        backend="xgboost",
+        role="unit_role",
+    )
+    assert len(scores) == 250_001
+    assert ds == "in_memory_dense_batched"
+    assert model.batch_sizes == [100_000, 100_000, 50_001]

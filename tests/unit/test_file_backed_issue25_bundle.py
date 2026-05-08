@@ -12,10 +12,13 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from trainer.training.split_file_bundle import (
+    forbid_file_backed_strict_dense_predict,
     merge_libsvm_files,
     merge_train_valid_weight_files,
+    read_split_manifest,
     trainer_file_backed_strict_enabled,
     validate_libsvm_paths_exist,
+    write_split_manifest,
 )
 
 
@@ -35,6 +38,39 @@ def test_validate_libsvm_paths_exist_requires_weight(tmp_path: Path) -> None:
     va.write_text("0 0:1\n", encoding="utf-8")
     with pytest.raises(FileNotFoundError, match=r"\.weight"):
         validate_libsvm_paths_exist(tr, va)
+
+
+def test_forbid_file_backed_strict_dense_predict_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRAINER_FILE_BACKED_STRICT", "1")
+    with pytest.raises(RuntimeError, match="TRAINER_FILE_BACKED_STRICT"):
+        forbid_file_backed_strict_dense_predict(role="validation", detail="unit")
+
+
+def test_write_split_manifest_schema_v2_fields(tmp_path: Path) -> None:
+    tr = tmp_path / "t.libsvm"
+    va = tmp_path / "v.libsvm"
+    tr.write_text("1 0:1\n", encoding="utf-8")
+    va.write_text("0 0:1\n", encoding="utf-8")
+    (tmp_path / "t.libsvm.weight").write_text("1.0\n", encoding="utf-8")
+    p = write_split_manifest(
+        tmp_path,
+        train_libsvm=tr,
+        valid_libsvm=va,
+        test_libsvm=None,
+        feature_columns=["f0"],
+        train_row_count=1,
+        valid_row_count=1,
+        test_row_count=None,
+        feature_index_base="zero",
+        trainer_file_backed_strict_effective=True,
+        backends_contract=["lightgbm", "catboost", "xgboost"],
+    )
+    doc = read_split_manifest(tmp_path)
+    assert doc["schema_version"] == 2
+    assert doc["feature_index_base"] == "zero"
+    assert doc["trainer_file_backed_strict_effective"] is True
+    assert doc["backends_contract"] == ["lightgbm", "catboost", "xgboost"]
+    assert p.is_file()
 
 
 def test_merge_libsvm_and_weights(tmp_path: Path) -> None:

@@ -72,6 +72,18 @@ class TestR1102FeatureImportanceLengthMismatch(unittest.TestCase):
             trainer_mod._compute_feature_importance(_MockModel(), ["f0", "f1", "f2"])
 
 
+class TestFeatureImportanceFallbackPlainList(unittest.TestCase):
+    """``feature_importances_`` may be a list (e.g. XGBoostBoosterDiskClassifier), not ndarray."""
+
+    def test_compute_feature_importance_accepts_plain_list(self) -> None:
+        class _MockModel:
+            feature_importances_ = [1.0, 3.0, 0.5]
+
+        out = trainer_mod._compute_feature_importance(_MockModel(), ["f0", "f1", "f2"])
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[0]["feature"], "f1")
+
+
 class TestR1103FeatureImportanceExceptionScope(unittest.TestCase):
     """R1103: unexpected runtime errors should not be swallowed by broad exception handling."""
 

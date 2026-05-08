@@ -769,3 +769,240 @@ def train_catboost_from_libsvm_disk(
         metrics["a3_catboost_libsvm_cache_hit_test"] = bool(hit_test)
     metrics["a3_catboost_quantize_first"] = bool(quantize_first)
     return model, metrics
+
+
+def libsvm_bundle_for_a3_hpo(
+    train_libsvm: Path,
+    valid_libsvm: Path,
+    *,
+    train_row_count: int,
+    feature_names: Sequence[str],
+    test_libsvm: Optional[Path] = None,
+) -> GbmBakeoffLibSvmBundle:
+    """Build :class:`GbmBakeoffLibSvmBundle` for A3 / Optuna disk trials (same layout as Step 9)."""
+    _tmp = GbmBakeoffLibSvmBundle(
+        train_libsvm=Path(train_libsvm),
+        valid_libsvm=Path(valid_libsvm),
+        test_libsvm=Path(test_libsvm) if test_libsvm is not None else None,
+        feature_names=tuple(str(x) for x in feature_names),
+        train_row_count=int(train_row_count),
+        cache_dir=Path(train_libsvm).parent,
+    )
+    return GbmBakeoffLibSvmBundle(
+        train_libsvm=_tmp.train_libsvm,
+        valid_libsvm=_tmp.valid_libsvm,
+        test_libsvm=_tmp.test_libsvm,
+        feature_names=_tmp.feature_names,
+        train_row_count=_tmp.train_row_count,
+        cache_dir=bakeoff_cache_dir(Path(train_libsvm).parent, _tmp),
+    )
+
+
+def hpo_trial_val_scores_xgboost_from_libsvm(
+    params: Mapping[str, Any],
+    bundle: GbmBakeoffLibSvmBundle,
+    y_val: Any,
+    *,
+    backend_runtime_params: Optional[Mapping[str, Any]] = None,
+    use_external_memory: bool = False,
+) -> np.ndarray:
+    """One Optuna trial: train XGBoost from LibSVM only; return validation positive scores."""
+    model, _metrics = train_xgboost_from_libsvm_disk(
+        bundle,
+        params,
+        y_val=y_val,
+        backend_runtime_params=backend_runtime_params,
+        val_dec026_window_hours=None,
+        val_dec026_min_alerts_per_hour=None,
+        use_external_memory=use_external_memory,
+    )
+    return np.asarray(model.predict_val_scores_from_libsvm(), dtype=np.float64).reshape(-1)
+
+
+def hpo_trial_val_scores_catboost_from_libsvm(
+    params: Mapping[str, Any],
+    bundle: GbmBakeoffLibSvmBundle,
+    y_val: Any,
+    *,
+    backend_runtime_params: Optional[Mapping[str, Any]] = None,
+    quantize_first: bool = False,
+) -> np.ndarray:
+    """One Optuna trial: train CatBoost from LibSVM only; return validation positive scores."""
+    from catboost import Pool
+
+    model, _metrics = train_catboost_from_libsvm_disk(
+        bundle,
+        params,
+        y_val=y_val,
+        backend_runtime_params=backend_runtime_params,
+        val_dec026_window_hours=None,
+        val_dec026_min_alerts_per_hour=None,
+        quantize_first=quantize_first,
+    )
+    vuri = getattr(model, "_gbm_bakeoff_valid_libsvm_uri", None)
+    if not vuri:
+        raise RuntimeError("hpo_trial_val_scores_catboost_from_libsvm: missing valid LibSVM URI on model")
+    return np.asarray(model.predict_proba(Pool(str(vuri)))[:, 1], dtype=np.float64).reshape(-1)
+
+
+def xgboost_disk_strict_refit_on_train_union_valid(
+    model: Any,
+    bundle: GbmBakeoffLibSvmBundle,
+    hp: Mapping[str, Any],
+    *,
+    backend_runtime_params: Optional[Mapping[str, Any]] = None,
+    use_external_memory: bool = False,
+) -> Any:
+    """File-backed final refit on train∪valid LibSVM (Issue #25), ``num_boost_round=best_iteration+1``."""
+    import tempfile
+    import xgboost as xgb
+
+    from trainer.training.split_file_bundle import merge_libsvm_files, merge_train_valid_weight_files
+
+    booster = getattr(model, "booster_", None) or getattr(model, "_Booster", None)
+    if booster is None:
+        raise RuntimeError("xgboost_disk_strict_refit_on_train_union_valid: model has no booster")
+    best_it = int(getattr(booster, "best_iteration", -1))
+    n_rounds = max(1, best_it + 1) if best_it >= 0 else max(1, int(hp.get("n_estimators", 100)))
+    cache_dir = Path(bundle.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fd, p_merged = tempfile.mkstemp(prefix=".a3_tv_xgb_", suffix=".libsvm", dir=str(cache_dir))
+    os.close(fd)
+    merged = Path(p_merged)
+    merged_w_txt = Path(str(merged) + ".weight")
+    try:
+        n_merged = merge_libsvm_files(merged, [bundle.train_libsvm, bundle.valid_libsvm])
+        merge_train_valid_weight_files(
+            merged_w_txt,
+            train_weight_txt=Path(str(bundle.train_libsvm) + ".weight"),
+            valid_libsvm=bundle.valid_libsvm,
+        )
+        w_mm, _nr = ensure_train_weight_f32_memmap(merged, expected_rows=int(n_merged))
+        device = str((backend_runtime_params or {}).get("device", "cpu")).lower()
+        ext_ok = bool(use_external_memory) and not device.startswith("cuda")
+        train_uri = xgboost_libsvm_uri(merged, external_memory=ext_ok, cache_dir=cache_dir)
+        x_hp = dict(hp)
+        if backend_runtime_params:
+            x_hp.update(dict(backend_runtime_params))
+        x_hp.pop("n_estimators", None)
+        params = _xgb_hp_to_train_params(x_hp)
+        dtrain = xgb.DMatrix(
+            train_uri,
+            weight=w_mm,
+            feature_names=list(bundle.feature_names),
+        )
+        new_booster = xgb.train(params, dtrain, num_boost_round=int(n_rounds), verbose_eval=False)
+        valid_uri = xgboost_libsvm_uri(
+            bundle.valid_libsvm, external_memory=False, cache_dir=cache_dir
+        )
+        test_uri = (
+            xgboost_libsvm_uri(bundle.test_libsvm, external_memory=False, cache_dir=cache_dir)
+            if bundle.test_libsvm is not None
+            else None
+        )
+        orig_train_uri = xgboost_libsvm_uri(
+            bundle.train_libsvm,
+            external_memory=ext_ok,
+            cache_dir=cache_dir,
+        )
+        return XGBoostBoosterDiskClassifier(
+            new_booster,
+            feature_names=bundle.feature_names,
+            valid_libsvm_uri=valid_uri,
+            test_libsvm_uri=test_uri,
+            train_libsvm_uri=orig_train_uri,
+        )
+    finally:
+        try:
+            merged.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            merged_w_txt.unlink(missing_ok=True)
+        except OSError:
+            pass
+        Path(str(merged) + ".weight.f32").unlink(missing_ok=True)
+
+
+def catboost_disk_strict_refit_on_train_union_valid(
+    model: Any,
+    bundle: GbmBakeoffLibSvmBundle,
+    hp: Mapping[str, Any],
+    *,
+    backend_runtime_params: Optional[Mapping[str, Any]] = None,
+    quantize_first: bool = False,
+) -> Any:
+    """File-backed final refit on train∪valid LibSVM for CatBoost (Issue #25)."""
+    import tempfile
+    from catboost import CatBoostClassifier, Pool
+
+    from trainer.training.split_file_bundle import merge_libsvm_files, merge_train_valid_weight_files
+    from trainer.training.trainer import _sanitize_catboost_params_for_runtime
+
+    cache_dir = Path(bundle.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fd, p_merged = tempfile.mkstemp(prefix=".a3_tv_cb_", suffix=".libsvm", dir=str(cache_dir))
+    os.close(fd)
+    merged = Path(p_merged)
+    merged_w_txt = Path(str(merged) + ".weight")
+    try:
+        n_merged = merge_libsvm_files(merged, [bundle.train_libsvm, bundle.valid_libsvm])
+        merge_train_valid_weight_files(
+            merged_w_txt,
+            train_weight_txt=Path(str(bundle.train_libsvm) + ".weight"),
+            valid_libsvm=bundle.valid_libsvm,
+        )
+        w_mm, _nr = ensure_train_weight_f32_memmap(merged, expected_rows=int(n_merged))
+        merged_1, _hit_m = catboost_libsvm_path_one_based_cached(merged, cache_dir)
+        train_uri = catboost_libsvm_uri(merged_1)
+        c_hp = dict(hp)
+        if backend_runtime_params:
+            c_hp.update(dict(backend_runtime_params))
+        c_hp.pop("class_weights", None)
+        c_hp.pop("early_stopping_rounds", None)
+        base_iters = int(c_hp.pop("iterations"))
+        try:
+            bi = int(model.get_best_iteration())
+        except Exception:
+            bi = -1
+        new_iters = max(1, bi + 1) if bi >= 0 else max(1, min(base_iters, int(n_merged)))
+        c_hp = _sanitize_catboost_params_for_runtime(c_hp)
+        train_pool = Pool(data=train_uri)
+        train_pool.set_weight(w_mm)
+        if quantize_first:
+            try:
+                from catboost import quantize as cb_quantize
+
+                train_pool = cb_quantize(train_pool)
+            except Exception as exc:
+                raise RuntimeError(f"CatBoost quantize() failed on refit pool: {exc}") from exc
+        refit_model = CatBoostClassifier(iterations=int(new_iters), **c_hp)
+        refit_model.fit(train_pool, verbose=False)
+        valid_1, _hv = catboost_libsvm_path_one_based_cached(bundle.valid_libsvm, cache_dir)
+        valid_uri = catboost_libsvm_uri(valid_1)
+        test_1: Optional[Path]
+        if bundle.test_libsvm is not None:
+            test_1, _ht = catboost_libsvm_path_one_based_cached(bundle.test_libsvm, cache_dir)
+        else:
+            test_1 = None
+        train_1, _htr = catboost_libsvm_path_one_based_cached(bundle.train_libsvm, cache_dir)
+        train_orig_uri = catboost_libsvm_uri(train_1)
+        setattr(refit_model, "_gbm_bakeoff_valid_libsvm_uri", valid_uri)
+        setattr(refit_model, "_gbm_bakeoff_train_libsvm_uri", train_orig_uri)
+        setattr(
+            refit_model,
+            "_gbm_bakeoff_test_libsvm_uri",
+            catboost_libsvm_uri(test_1) if test_1 is not None else None,
+        )
+        setattr(refit_model, "a3_final_fit_mode", "libsvm_disk")
+        return refit_model
+    finally:
+        try:
+            merged.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            merged_w_txt.unlink(missing_ok=True)
+        except OSError:
+            pass
+        Path(str(merged) + ".weight.f32").unlink(missing_ok=True)

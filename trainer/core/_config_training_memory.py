@@ -55,7 +55,8 @@ PROFILE_PRELOAD_MAX_BYTES: int = int(1.5 * 1024**3)
 STEP7_USE_DUCKDB: bool = True
 STEP7_KEEP_TRAIN_ON_DISK: bool = True
 STEP9_EXPORT_LIBSVM: bool = True
-STEP9_TRAIN_FROM_FILE: bool = True
+# Retired: Plan B CSV training removed; pipeline is LibSVM-only. Kept as False for import/facade tests.
+STEP9_TRAIN_FROM_FILE: bool = False
 STEP9_COMPARE_ALL_GBMS: bool = True
 STEP9_SAVE_LGB_BINARY: bool = True
 
@@ -64,6 +65,8 @@ STEP9_SAVE_LGB_BINARY: bool = True
 TRAIN_METRICS_PREDICT_BATCH_ROWS: int = 500_000
 # A3 Phase E dense predict: emit a progress log every N batch iterations (0 disables).
 A3_PHASE_E_PREDICT_HEARTBEAT_EVERY_N_BATCHES: int = 10
+# When True, Phase E dense predict logs RSS / available RAM at key points (investigation).
+A3_PHASE_E_DIAG_MEMORY_SNAPSHOT: bool = False
 
 # --- A3 optional backends (CatBoost / XGBoost): LibSVM-disk final fit (OOM mitigation) ---
 # When True and Plan B+ LibSVM paths exist, final full-data fits use on-disk data instead

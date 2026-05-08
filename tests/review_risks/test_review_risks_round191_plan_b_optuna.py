@@ -1,12 +1,8 @@
-"""Minimal reproducible tests for Round 191 Review — 方案 B Step 6 Optuna（從檔案分支 hp 與 num_boost_round）.
-
-Round 191 Review risk points (STATUS.md) are turned into contract/behavior tests.
-Tests that assert desired behaviour not yet in production use @unittest.expectedFailure.
-Tests-only: no production code changes.
-"""
+"""Minimal reproducible tests for Round 191 Review — LibSVM path Optuna hp defaults."""
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 import unittest
 import unittest.mock
@@ -16,14 +12,32 @@ import numpy as np
 import pandas as pd
 
 import trainer.trainer as trainer_mod
-from trainer.trainer import _export_train_valid_to_csv, train_single_rated_model
+from trainer.trainer import train_single_rated_model
 
-# Five hyperparams used by from-file path for lgb.train (Round 191 Review #2).
 FROM_FILE_HP_KEYS = ("learning_rate", "num_leaves", "max_depth", "min_child_samples", "n_estimators")
 
 
+def _libsvm_train_valid(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    feature_cols: list[str],
+    root: Path,
+) -> tuple[Path, Path]:
+    export_dir = root / "export"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    tmp = root / "_pq"
+    tmp.mkdir(exist_ok=True)
+    trp, vlp = tmp / "train.parquet", tmp / "valid.parquet"
+    train_df.to_parquet(trp, index=False)
+    valid_df.to_parquet(vlp, index=False)
+    tr_l, va_l, _ = trainer_mod._export_parquet_to_libsvm(
+        trp, vlp, feature_cols, export_dir, test_path=None
+    )
+    shutil.rmtree(tmp, ignore_errors=True)
+    return tr_l, va_l
+
+
 def _make_rated_dfs(n_train: int, n_valid: int, train_cols: list[str], valid_cols: list[str], seed: int = 42):
-    """Minimal train/valid DataFrames with label 0/1 mix and is_rated=True."""
     rng = np.random.default_rng(seed)
     train_df = pd.DataFrame(
         {c: rng.random(n_train).astype(np.float64) for c in train_cols},
@@ -44,7 +58,6 @@ def _make_rated_dfs(n_train: int, n_valid: int, train_cols: list[str], valid_col
 
 
 def _default_hp():
-    """Default hp dict consistent with trainer when run_optuna is skipped (Round 191 Review #1)."""
     return {
         "n_estimators": 400,
         "learning_rate": 0.05,
@@ -54,50 +67,35 @@ def _default_hp():
     }
 
 
-# ---------------------------------------------------------------------------
-# R191 Review #1 — 正確性：hp 為空或缺鍵時從檔案分支不應 KeyError（高）
-# ---------------------------------------------------------------------------
+class TestR191LibSvmEmptyHpNoKeyError(unittest.TestCase):
+    """Round 191 #1: When run_optuna_search returns {}, LibSVM path must not raise."""
 
-class TestR191FromFileEmptyHpNoKeyError(unittest.TestCase):
-    """Round 191 Review #1: When run_optuna_search returns {} or partial keys, from-file training must not raise."""
-
-    def test_from_file_with_empty_hp_completes_without_key_error(self):
-        """run_optuna_search returns {} → train_single_rated_model(..., train_from_file=True) must not raise; use defaults."""
+    def test_libsvm_with_empty_hp_completes_without_key_error(self):
         n = 80
         train_df, valid_df = _make_rated_dfs(n, n, ["f1", "f2"], ["f1", "f2"])
         with tempfile.TemporaryDirectory() as d:
-            export_dir = Path(d) / "export"
-            export_dir.mkdir(parents=True)
-            _export_train_valid_to_csv(train_df, valid_df, ["f1", "f2"], export_dir)
-            with unittest.mock.patch.object(trainer_mod, "DATA_DIR", Path(d)):
-                with unittest.mock.patch.object(
-                    trainer_mod,
-                    "run_optuna_search",
-                    return_value={},
-                ):
+            root = Path(d)
+            tr_l, va_l = _libsvm_train_valid(train_df, valid_df, ["f1", "f2"], root)
+            with unittest.mock.patch.object(trainer_mod, "DATA_DIR", root):
+                with unittest.mock.patch.object(trainer_mod, "run_optuna_search", return_value={}):
                     rated_art, _, _ = train_single_rated_model(
                         train_df,
                         valid_df,
                         ["f1", "f2"],
                         run_optuna=True,
                         test_df=None,
-                        train_from_file=True,
+                        train_libsvm_paths=(tr_l, va_l),
                     )
-        self.assertIsNotNone(rated_art, "expected a model when hp is empty but defaults should be used (Round 191 #1).")
+        self.assertIsNotNone(rated_art)
         hp = rated_art["metrics"]["best_hyperparams"]
         for key in FROM_FILE_HP_KEYS:
-            self.assertIn(key, hp, f"best_hyperparams should contain {key} (default or filled) (Round 191 #1).")
+            self.assertIn(key, hp, f"best_hyperparams should contain {key} (Round 191 #1).")
 
 
-# ---------------------------------------------------------------------------
-# R191 Review #2 — 一致性：從檔案訓練之 best_hyperparams 至少含 5 鍵且與 Optuna 一致
-# ---------------------------------------------------------------------------
+class TestR191LibSvmBestHyperparamsFiveKeys(unittest.TestCase):
+    """Round 191 #2: LibSVM path best_hyperparams includes five keys from Optuna."""
 
-class TestR191FromFileBestHyperparamsFiveKeys(unittest.TestCase):
-    """Round 191 Review #2: From-file path stores best_hyperparams; assert the 5 lgb.train keys are present and match Optuna."""
-
-    def test_from_file_best_hyperparams_contains_five_keys_from_optuna(self):
-        """When run_optuna_search returns full hp (incl. colsample_bytree etc.), best_hyperparams has the 5 keys with same values."""
+    def test_libsvm_best_hyperparams_contains_five_keys_from_optuna(self):
         full_hp = {
             **_default_hp(),
             "colsample_bytree": 0.8,
@@ -108,14 +106,11 @@ class TestR191FromFileBestHyperparamsFiveKeys(unittest.TestCase):
         n = 80
         train_df, valid_df = _make_rated_dfs(n, n, ["f1", "f2"], ["f1", "f2"])
         with tempfile.TemporaryDirectory() as d:
-            export_dir = Path(d) / "export"
-            export_dir.mkdir(parents=True)
-            _export_train_valid_to_csv(train_df, valid_df, ["f1", "f2"], export_dir)
-            with unittest.mock.patch.object(trainer_mod, "DATA_DIR", Path(d)):
+            root = Path(d)
+            tr_l, va_l = _libsvm_train_valid(train_df, valid_df, ["f1", "f2"], root)
+            with unittest.mock.patch.object(trainer_mod, "DATA_DIR", root):
                 with unittest.mock.patch.object(
-                    trainer_mod,
-                    "run_optuna_search",
-                    return_value=full_hp.copy(),
+                    trainer_mod, "run_optuna_search", return_value=full_hp.copy()
                 ):
                     rated_art, _, _ = train_single_rated_model(
                         train_df,
@@ -123,40 +118,28 @@ class TestR191FromFileBestHyperparamsFiveKeys(unittest.TestCase):
                         ["f1", "f2"],
                         run_optuna=True,
                         test_df=None,
-                        train_from_file=True,
+                        train_libsvm_paths=(tr_l, va_l),
                     )
         self.assertIsNotNone(rated_art)
         best = rated_art["metrics"]["best_hyperparams"]
         for key in FROM_FILE_HP_KEYS:
-            self.assertIn(key, best, f"from-file best_hyperparams must include {key} (Round 191 #2).")
-            self.assertEqual(
-                best[key],
-                full_hp[key],
-                f"best_hyperparams[{key}] should match Optuna result (Round 191 #2).",
-            )
+            self.assertIn(key, best, f"LibSVM best_hyperparams must include {key} (Round 191 #2).")
+            self.assertEqual(best[key], full_hp[key], f"best_hyperparams[{key}] should match Optuna (Round 191 #2).")
 
 
-# ---------------------------------------------------------------------------
-# R191 Review #3 — 邊界條件：num_boost_round 應至少為 1（低）
-# ---------------------------------------------------------------------------
+class TestR191LibSvmNumBoostRoundAtLeastOne(unittest.TestCase):
+    """Round 191 #3: n_estimators 0 must not crash LibSVM path."""
 
-class TestR191FromFileNumBoostRoundAtLeastOne(unittest.TestCase):
-    """Round 191 Review #3: When hp has n_estimators 0 or negative, training must not crash; num_boost_round >= 1."""
-
-    def test_from_file_with_n_estimators_zero_completes_without_error(self):
-        """hp['n_estimators'] == 0 → from-file training must not raise (production should use max(1, ...))."""
+    def test_libsvm_with_n_estimators_zero_completes_without_error(self):
         hp_zero = {**_default_hp(), "n_estimators": 0}
         n = 80
         train_df, valid_df = _make_rated_dfs(n, n, ["f1", "f2"], ["f1", "f2"])
         with tempfile.TemporaryDirectory() as d:
-            export_dir = Path(d) / "export"
-            export_dir.mkdir(parents=True)
-            _export_train_valid_to_csv(train_df, valid_df, ["f1", "f2"], export_dir)
-            with unittest.mock.patch.object(trainer_mod, "DATA_DIR", Path(d)):
+            root = Path(d)
+            tr_l, va_l = _libsvm_train_valid(train_df, valid_df, ["f1", "f2"], root)
+            with unittest.mock.patch.object(trainer_mod, "DATA_DIR", root):
                 with unittest.mock.patch.object(
-                    trainer_mod,
-                    "run_optuna_search",
-                    return_value=hp_zero.copy(),
+                    trainer_mod, "run_optuna_search", return_value=hp_zero.copy()
                 ):
                     rated_art, _, _ = train_single_rated_model(
                         train_df,
@@ -164,9 +147,9 @@ class TestR191FromFileNumBoostRoundAtLeastOne(unittest.TestCase):
                         ["f1", "f2"],
                         run_optuna=True,
                         test_df=None,
-                        train_from_file=True,
+                        train_libsvm_paths=(tr_l, va_l),
                     )
-        self.assertIsNotNone(rated_art, "Round 191 #3: n_estimators=0 should still produce a model (num_boost_round >= 1).")
+        self.assertIsNotNone(rated_art, "Round 191 #3: n_estimators=0 should still produce a model.")
 
 
 if __name__ == "__main__":

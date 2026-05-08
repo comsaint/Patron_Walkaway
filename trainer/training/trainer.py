@@ -249,7 +249,6 @@ try:
     STEP7_DUCKDB_TEMP_DIR: Optional[str] = getattr(_cfg, "STEP7_DUCKDB_TEMP_DIR", None)
     STEP7_KEEP_TRAIN_ON_DISK: bool = getattr(_cfg, "STEP7_KEEP_TRAIN_ON_DISK", False)
     STEP9_EXPORT_LIBSVM: bool = getattr(_cfg, "STEP9_EXPORT_LIBSVM", False)
-    STEP9_TRAIN_FROM_FILE: bool = getattr(_cfg, "STEP9_TRAIN_FROM_FILE", False)
     STEP9_SAVE_LGB_BINARY: bool = getattr(_cfg, "STEP9_SAVE_LGB_BINARY", False)
     TRAIN_METRICS_PREDICT_BATCH_ROWS: int = getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)
     A4_TWO_STAGE_ENABLE_TRAINING: bool = bool(getattr(_cfg, "A4_TWO_STAGE_ENABLE_TRAINING", False))
@@ -313,7 +312,6 @@ except ModuleNotFoundError:
     STEP7_DUCKDB_TEMP_DIR = getattr(_cfg, "STEP7_DUCKDB_TEMP_DIR", None)
     STEP7_KEEP_TRAIN_ON_DISK = getattr(_cfg, "STEP7_KEEP_TRAIN_ON_DISK", False)
     STEP9_EXPORT_LIBSVM = getattr(_cfg, "STEP9_EXPORT_LIBSVM", False)
-    STEP9_TRAIN_FROM_FILE = getattr(_cfg, "STEP9_TRAIN_FROM_FILE", False)
     STEP9_SAVE_LGB_BINARY = getattr(_cfg, "STEP9_SAVE_LGB_BINARY", False)
     TRAIN_METRICS_PREDICT_BATCH_ROWS = getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)
     A4_TWO_STAGE_ENABLE_TRAINING = bool(getattr(_cfg, "A4_TWO_STAGE_ENABLE_TRAINING", False))
@@ -2936,100 +2934,21 @@ def compute_sample_weights(df: pd.DataFrame) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
-# Plan B: export train/valid to CSV for LightGBM from-file training (PLAN §3)
+# Legacy Plan B CSV cleanup (retired — LibSVM-only training)
 # ---------------------------------------------------------------------------
 
-def _export_train_valid_to_csv(
-    train_df: pd.DataFrame,
-    valid_df: pd.DataFrame,
-    feature_cols: List[str],
-    export_dir: Path,
-    *,
-    ranking_recipe: Optional[str] = None,
-) -> Tuple[Path, Path]:
-    """Export rated rows to CSV for LightGBM lgb.Dataset(path) (PLAN 方案 B 匯出).
 
-    Train: screened_cols + label + weight (weight = 1/N_run per canonical_id, run_id).
-    Valid: screened_cols + label (no weight).
-    Only rows with is_rated == True are exported.
-    Returns (train_csv_path, valid_csv_path).
-    """
+def remove_legacy_plan_b_csv_exports(export_dir: Path) -> None:
+    """Delete retired Plan B CSV artifacts so they cannot shadow LibSVM training."""
     export_dir = Path(export_dir)
-    export_dir.mkdir(parents=True, exist_ok=True)
-    if "label" not in train_df.columns or "label" not in valid_df.columns:
-        raise ValueError("train_df and valid_df must contain 'label' for export")
-    # Round 186 Review P3: dedupe feature_cols so CSV header has no duplicate column names.
-    feature_cols_unique = list(dict.fromkeys(feature_cols))
-    # Round 186 Review P1: use only columns present in BOTH train and valid (Step 9 alignment).
-    common_cols = [
-        c for c in feature_cols_unique
-        if c in train_df.columns and c in valid_df.columns
-    ]
-    # R199 Review #2: refuse no-common-columns in normal runs.
-    # For tiny/synthetic debug splits (empty train/valid), keep pipeline alive with label-only export.
-    if len(common_cols) == 0:
-        if train_df.empty or valid_df.empty:
-            logger.warning(
-                "Plan B export: no common feature columns with empty split (train=%d, valid=%d); "
-                "exporting label-only CSVs for debug/test flow.",
-                len(train_df),
-                len(valid_df),
-            )
-        else:
-            raise ValueError(
-                "Plan B export: no common feature columns between train_df and valid_df; cannot export valid CSV for LightGBM."
-            )
-    only_in_train = [c for c in feature_cols_unique if c in train_df.columns and c not in valid_df.columns]
-    only_in_valid = [c for c in feature_cols_unique if c in valid_df.columns and c not in train_df.columns]
-    if only_in_train or only_in_valid:
-        logger.warning(
-            "Plan B export: using common features only (skipped: only in train=%s, only in valid=%s)",
-            only_in_train or None,
-            only_in_valid or None,
-        )
-    cols_train_plus_label = common_cols + ["label"]
-    # Rated only (PLAN: 僅匯出 is_rated == true 的列)
-    train_rated = (
-        train_df[train_df["is_rated"]]
-        if "is_rated" in train_df.columns
-        else train_df
-    )
-    valid_rated = (
-        valid_df[valid_df["is_rated"]]
-        if "is_rated" in valid_df.columns
-        else valid_df
-    )
-    # Weight for train (same semantics as compute_sample_weights)
-    weight_series = compute_sample_weights(train_rated)
-    _recipe_csv = resolve_ranking_recipe(ranking_recipe)
-    weight_series, _ = build_final_ranking_weights_in_memory(
-        train_rated,
-        weight_series,
-        _recipe_csv,
-        common_cols,
-        lgb_classifier_params=None,
-    )
-    train_export = train_rated[cols_train_plus_label].copy()
-    train_export.insert(len(cols_train_plus_label), "weight", weight_series.values)
-    train_path = export_dir / "train_for_lgb.csv"
-    train_export.to_csv(train_path, index=False)
-    logger.info(
-        "Exported train for Plan B: %s (%d rows, %d features + label + weight)",
-        train_path,
-        len(train_export),
-        len(common_cols),
-    )
-    valid_cols = common_cols + ["label"]
-    valid_export = valid_rated[valid_cols]
-    valid_path = export_dir / "valid_for_lgb.csv"
-    valid_export.to_csv(valid_path, index=False)
-    logger.info(
-        "Exported valid for Plan B: %s (%d rows, %d features + label)",
-        valid_path,
-        len(valid_export),
-        len(valid_cols) - 1,
-    )
-    return (train_path, valid_path)
+    for name in ("train_for_lgb.csv", "valid_for_lgb.csv"):
+        p = export_dir / name
+        if p.is_file():
+            try:
+                p.unlink()
+                logger.info("Removed legacy Plan B CSV: %s", p)
+            except OSError as exc:
+                logger.warning("Could not remove legacy CSV %s: %s", p, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -3197,8 +3116,13 @@ def _export_parquet_to_libsvm(
                     f_w.write(f"{w}\n")
                     n_train += 1
         if n_train == 0:
-            logger.warning(
-                "LibSVM export produced 0 train rows (no is_rated rows); cannot train from file.",
+            for _p in (train_libsvm_tmp, train_weight_tmp):
+                try:
+                    Path(_p).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise RuntimeError(
+                "LibSVM export produced 0 rated train rows (check is_rated / Parquet split)."
             )
         os.replace(train_libsvm_tmp, train_libsvm)
         os.replace(train_weight_tmp, train_weight)
@@ -4364,13 +4288,15 @@ def run_backend_optuna_search(
     _disk_tr_rows = 0
     _disk_feats: Tuple[str, ...] = ()
     if _libsvm_disk_hpo:
-        if backend_n != "lightgbm":
-            raise ValueError("libsvm_disk_hpo is only supported for backend='lightgbm'")
         _dt0, _dv0, _dn0, _df0 = libsvm_disk_hpo
         _disk_tr_p = Path(_dt0)
         _disk_va_p = Path(_dv0)
         _disk_tr_rows = int(_dn0)
         _disk_feats = tuple(str(x) for x in _df0)
+        if backend_n not in ("lightgbm", "catboost", "xgboost"):
+            raise ValueError(
+                f"libsvm_disk_hpo is only supported for lightgbm/catboost/xgboost, not {backend_n!r}"
+            )
 
     # R705: guard against empty validation input — return empty dict (base params)
     # rather than crashing inside LightGBM or average_precision_score.
@@ -4584,13 +4510,47 @@ def run_backend_optuna_search(
         if backend_runtime_params:
             params.update(dict(backend_runtime_params))
         if _libsvm_disk_hpo and _disk_tr_p is not None and _disk_va_p is not None:
-            scores = _fit_lightgbm_hpo_scores_from_libsvm(
-                params,
-                train_libsvm=_disk_tr_p,
-                valid_libsvm=_disk_va_p,
-                train_row_count=_disk_tr_rows,
-                feature_names=_disk_feats,
-            )
+            if backend_n == "lightgbm":
+                scores = _fit_lightgbm_hpo_scores_from_libsvm(
+                    params,
+                    train_libsvm=_disk_tr_p,
+                    valid_libsvm=_disk_va_p,
+                    train_row_count=_disk_tr_rows,
+                    feature_names=_disk_feats,
+                )
+            else:
+                from trainer.training.gbm_bakeoff_disk import (
+                    hpo_trial_val_scores_catboost_from_libsvm,
+                    hpo_trial_val_scores_xgboost_from_libsvm,
+                    libsvm_bundle_for_a3_hpo,
+                )
+
+                _hpo_b = libsvm_bundle_for_a3_hpo(
+                    _disk_tr_p,
+                    _disk_va_p,
+                    train_row_count=int(_disk_tr_rows),
+                    feature_names=_disk_feats,
+                )
+                if backend_n == "xgboost":
+                    scores = hpo_trial_val_scores_xgboost_from_libsvm(
+                        params,
+                        _hpo_b,
+                        y_val,
+                        backend_runtime_params=backend_runtime_params,
+                        use_external_memory=bool(
+                            getattr(_cfg, "GBM_BAKEOFF_XGBOOST_EXTERNAL_MEMORY", False)
+                        ),
+                    )
+                elif backend_n == "catboost":
+                    scores = hpo_trial_val_scores_catboost_from_libsvm(
+                        params,
+                        _hpo_b,
+                        y_val,
+                        backend_runtime_params=backend_runtime_params,
+                        quantize_first=bool(getattr(_cfg, "GBM_BAKEOFF_CATBOOST_QUANTIZE", False)),
+                    )
+                else:
+                    raise ValueError(f"Unexpected backend for libsvm_disk_hpo: {backend_n!r}")
         else:
             scores = _fit_backend_hpo_scores(
                 backend_n,
@@ -5814,7 +5774,9 @@ def _compute_feature_importance(
     except AttributeError:
         # Fallback for mock / non-LightGBM models (no booster_ attribute).
         names = list(feature_cols)
-        gains = model.feature_importances_.tolist()  # type: ignore[union-attr]
+        # sklearn uses ndarray .tolist(); XGBoostBoosterDiskClassifier returns a plain list.
+        raw = model.feature_importances_  # type: ignore[union-attr]
+        gains = np.asarray(raw, dtype=np.float64).reshape(-1).tolist()
         # R1102: guard against silent truncation by zip when lengths differ
         if len(gains) != len(names):
             raise ValueError(
@@ -6088,7 +6050,6 @@ def train_single_rated_model(
     feature_cols: List[str],
     run_optuna: bool = True,
     test_df: Optional[pd.DataFrame] = None,
-    train_from_file: bool = False,
     train_libsvm_paths: Optional[Tuple[Path, Path]] = None,
     test_libsvm_path: Optional[Path] = None,
     ranking_recipe: Optional[str] = None,
@@ -6101,10 +6062,6 @@ def train_single_rated_model(
 
     Only rows where is_rated==True are used for training, validation, and test
     evaluation.  Non-rated observations are intentionally excluded (DEC-009/010).
-
-    When train_from_file is True (PLAN 方案 B §4), training uses on-disk CSV from
-    DATA_DIR/export (train_for_lgb.csv, valid_for_lgb.csv). A thin Booster wrapper
-    (§5) is returned so scorer and artifact save work unchanged.
 
     When train_libsvm_paths is (train_path, valid_path) and both files exist (PLAN B+ §4.4),
     training uses lgb.Dataset(path) so train data is not loaded into memory; .weight
@@ -6119,7 +6076,7 @@ def train_single_rated_model(
     When *gbm_bakeoff* is True (A3 / R3), after the primary LightGBM path completes we
     always compare LightGBM / CatBoost / XGBoost on the same rated train/valid/test
     matrices and select the winner by field-test validation objective.  Main-path
-    LibSVM / CSV optimizations remain valid for LightGBM, but no longer suppress A3.
+    LibSVM disk training remains valid for LightGBM, but no longer suppress A3.
 
     *train_split_parquet_path* (Plan B+): optional Step-7 train split parquet used only
     for ``payout_complete_dtm`` span when computing train alert-density without loading
@@ -6158,61 +6115,25 @@ def train_single_rated_model(
     use_from_libsvm = False
     if train_libsvm_paths is not None:
         _t, _v = train_libsvm_paths
-        if _t.exists() and _v.exists():
-            use_from_libsvm = True
-        elif trainer_file_backed_strict_enabled():
+        if not _t.is_file() or not _v.is_file():
             raise FileNotFoundError(
-                "TRAINER_FILE_BACKED_STRICT: train_libsvm_paths set but train or valid "
-                f"LibSVM is missing ({_t} / {_v})."
+                "LibSVM-only: train or valid LibSVM missing "
+                f"(train={_t}, valid={_v})."
             )
-        else:
-            logger.warning(
-                "train_libsvm_paths set but files missing (%s / %s); using in-memory training.",
-                _t,
-                _v,
-            )
-
-    use_from_file = False
-    if train_from_file and not use_from_libsvm:
-        train_path = DATA_DIR / "export" / "train_for_lgb.csv"
-        valid_path = DATA_DIR / "export" / "valid_for_lgb.csv"
-        if train_path.exists() and valid_path.exists():
-            use_from_file = True
-        else:
-            logger.warning(
-                "STEP9_TRAIN_FROM_FILE is True but export CSVs missing (%s / %s); using in-memory training.",
-                train_path,
-                valid_path,
-            )
-
-    if use_from_libsvm:
+        use_from_libsvm = True
         train_libsvm_p, valid_libsvm_p = train_libsvm_paths  # type: ignore[misc]
         with open(train_libsvm_p, encoding="utf-8") as _f:
             _n_lines = sum(1 for _ in _f)
         if _n_lines < 1:
-            if trainer_file_backed_strict_enabled():
-                raise RuntimeError(
-                    "TRAINER_FILE_BACKED_STRICT: train LibSVM has 0 lines; "
-                    "cannot fall back to in-memory training."
-                )
-            logger.warning(
-                "Plan B+: train LibSVM has 0 lines; falling back to in-memory training."
+            raise RuntimeError(
+                f"LibSVM-only: train LibSVM has 0 data lines (path={train_libsvm_p})."
             )
-            use_from_libsvm = False
-        if use_from_libsvm:
-            # R375 #6: single-class check (align with Plan B R188 #3 / R1509).
-            with open(train_libsvm_p, encoding="utf-8") as _f:
-                _labels = [line.split(None, 1)[0] for line in _f if line.strip()]
-            if len(set(_labels)) < 2:
-                if trainer_file_backed_strict_enabled():
-                    raise RuntimeError(
-                        "TRAINER_FILE_BACKED_STRICT: train LibSVM has only one class; "
-                        "cannot fall back to in-memory training."
-                    )
-                logger.warning(
-                    "Plan B+: train LibSVM has only one class; falling back to in-memory training."
-                )
-                use_from_libsvm = False
+        with open(train_libsvm_p, encoding="utf-8") as _f:
+            _labels = [line.split(None, 1)[0] for line in _f if line.strip()]
+        if len(set(_labels)) < 2:
+            raise RuntimeError(
+                f"LibSVM-only: train LibSVM has only one class (path={train_libsvm_p})."
+            )
 
     if use_from_libsvm and trainer_file_backed_strict_enabled():
         if train_libsvm_paths is None:
@@ -6333,9 +6254,9 @@ def train_single_rated_model(
     _snap_val_scores_holder: list[Optional[np.ndarray]] = [None]
     _valid_cols = valid_df.columns if not valid_df.empty else pd.Index([])
     if use_from_libsvm:
-        avail_cols = [c for c in feature_cols if c in _valid_cols]
-        if not avail_cols:
-            avail_cols = list(feature_cols)
+        # LibSVM was built for ``feature_cols``; LightGBM ``feature_name`` / num_feature
+        # must match sparse indices even when in-memory ``valid_df`` omits columns.
+        avail_cols = list(feature_cols)
     else:
         avail_cols = [c for c in feature_cols if c in _get_train_rated().columns]
         if len(_valid_cols) > 0:
@@ -6862,191 +6783,7 @@ def train_single_rated_model(
         if _libsvm_temp_to_remove is not None and _libsvm_temp_to_remove.exists():
             _libsvm_temp_to_remove.unlink()
 
-    if use_from_file:
-        # Plan B §4: train from CSV; §5: wrap Booster for scorer/artifact compatibility.
-        train_path = DATA_DIR / "export" / "train_for_lgb.csv"
-        valid_path = DATA_DIR / "export" / "valid_for_lgb.csv"
-        # R188 Review #2: 0-row train CSV => fallback to in-memory (avoid LightGBM "at least one line" error).
-        with open(train_path, encoding="utf-8") as _f:
-            _n_lines = sum(1 for _ in _f)
-        if _n_lines < 2:
-            use_from_file = False
-            logger.warning(
-                "Plan B: train CSV has < 2 lines (header-only or empty); using in-memory training."
-            )
-        if use_from_file:
-            # R188 Review #3: single-class train CSV => fallback (align with R1509 semantics).
-            _train_labels = pd.read_csv(train_path, usecols=["label"])
-            if _train_labels["label"].nunique() < 2:
-                use_from_file = False
-                logger.warning(
-                    "Plan B: train CSV has only one class; using in-memory training."
-                )
-        if use_from_file:
-            # Load train from CSV so feature set is explicit (avoid weight column as feature in some LightGBM builds).
-            _train_csv = pd.read_csv(train_path)
-            _train_feature_cols = [c for c in _train_csv.columns if c not in ("label", "weight")]
-            _lgb_ds_params_csv = _lgb_dataset_params_for_pipeline()
-            dtrain = lgb.Dataset(
-                _train_csv[_train_feature_cols],
-                label=_train_csv["label"],
-                weight=_train_csv["weight"] if "weight" in _train_csv.columns else None,
-                params=_lgb_ds_params_csv,
-            )
-            # R191 Review #1: run_optuna_search may return {} or partial keys; merge with defaults to avoid KeyError.
-            _default_rated_hp = {
-                "n_estimators": 400,
-                "learning_rate": 0.05,
-                "num_leaves": 31,
-                "max_depth": 8,
-                "min_child_samples": 20,
-            }
-            hp_resolved = {**_default_rated_hp, **hp}
-            hp_lgb = {
-                **_lgb_params_for_pipeline(),
-                "learning_rate": hp_resolved["learning_rate"],
-                "num_leaves": hp_resolved["num_leaves"],
-                "max_depth": hp_resolved["max_depth"],
-                "min_child_samples": hp_resolved["min_child_samples"],
-            }
-            # R191 Review #3: ensure at least 1 round (guard 0/negative from Optuna).
-            num_boost_round = max(1, int(hp_resolved.get("n_estimators", 400)))
-            # R196: align with in-memory path — use in-memory val_rated for early_stopping so parity test passes.
-            _val_rated_eval = _get_val_rated()
-            _has_val_from_file = (
-                not _val_rated_eval.empty
-                and len(y_vl) >= MIN_VALID_TEST_ROWS
-                and int(y_vl.isna().sum()) == 0
-                and int(y_vl.sum()) >= 1
-                and int((y_vl == 0).sum()) >= 1
-            )
-            # R199 Review #1: val_rated must contain all _train_feature_cols (from CSV); else skip early_stopping to avoid KeyError.
-            _missing_val_cols = [c for c in _train_feature_cols if c not in _val_rated_eval.columns]
-            if _missing_val_cols:
-                logger.warning(
-                    "Plan B: valid_df missing columns %s present in train CSV; skipping early_stopping for from-file training.",
-                    _missing_val_cols,
-                )
-                _has_val_from_file = False
-            dvalid = None
-            if _has_val_from_file:
-                dvalid = lgb.Dataset(
-                    _val_rated_eval[_train_feature_cols],
-                    label=_val_rated_eval["label"],
-                    reference=dtrain,
-                    params=_lgb_ds_params_csv,
-                )
-                booster = lgb.train(
-                    hp_lgb,
-                    dtrain,
-                    num_boost_round=num_boost_round,
-                    valid_sets=[dvalid],
-                    callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
-                )
-            else:
-                booster = lgb.train(
-                    hp_lgb,
-                    dtrain,
-                    num_boost_round=num_boost_round,
-                )
-            _did_final_refit_csv = False
-            if (
-                _has_val_from_file
-                and not _missing_val_cols
-                and os.environ.get(_ENV_DISABLE_FINAL_REFIT, "").strip().lower()
-                not in ("1", "true", "yes")
-            ):
-                _n_round_refit = max(1, int(booster.best_iteration))
-                _tr_cols = list(_train_feature_cols) + ["label"]
-                _tr_part = _train_csv[_tr_cols].copy()
-                if "weight" in _train_csv.columns:
-                    _tr_part["weight"] = _train_csv["weight"].astype(float)
-                else:
-                    _tr_part["weight"] = 1.0
-                _vl_part = _val_rated_eval[list(_train_feature_cols) + ["label"]].copy()
-                _vl_part["weight"] = 1.0
-                _tv_df = pd.concat([_tr_part, _vl_part], axis=0, ignore_index=True)
-                _d_tv = lgb.Dataset(
-                    _tv_df[_train_feature_cols],
-                    label=_tv_df["label"],
-                    weight=_tv_df["weight"],
-                    params=_lgb_ds_params_csv,
-                )
-                booster = lgb.train(hp_lgb, _d_tv, num_boost_round=_n_round_refit)
-                _did_final_refit_csv = True
-                logger.info(
-                    "rated Plan B CSV: final refit on train+valid rows=%d num_boost_round=%d (pipeline §12)",
-                    int(len(_tv_df)),
-                    _n_round_refit,
-                )
-            # From-file peak-RAM cleanup: once LightGBM has built the Booster, the
-            # temporary CSV DataFrame / Dataset objects are no longer needed.
-            _train_csv = None
-            dtrain = None
-            dvalid = None
-            gc.collect()
-            # R188 Review #1: artifact features must match Booster (common_cols from export).
-            avail_cols = list(booster.feature_name())
-            # R199 #1: if val_rated is missing any feature column, do not predict (would KeyError).
-            if _missing_val_cols:
-                val_scores = np.array([], dtype=np.float64)
-                _has_val = False
-            else:
-                val_scores = np.asarray(booster.predict(_val_rated_eval[avail_cols])).reshape(-1)
-                _has_val = (
-                    not _val_rated_eval.empty
-                    and len(y_vl) >= MIN_VALID_TEST_ROWS
-                    and int(y_vl.isna().sum()) == 0
-                    and int(y_vl.sum()) >= 1
-                    and int((y_vl == 0).sum()) >= 1
-                )
-            if _has_val and y_vl.sum() > 0:
-                prauc = float(average_precision_score(y_vl, val_scores))
-                _pick = pick_threshold_dec026(
-                    np.asarray(y_vl, dtype=float),
-                    np.asarray(val_scores, dtype=float),
-                    recall_floor=THRESHOLD_MIN_RECALL,
-                    min_alert_count=THRESHOLD_MIN_ALERT_COUNT,
-                    min_alerts_per_hour=_ft_thr_mah,
-                    window_hours=_ft_thr_wh,
-                    fbeta_beta=THRESHOLD_FBETA,
-                )
-                if _pick.is_fallback:
-                    best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
-                    best_fbeta = 0.0
-                else:
-                    best_t = _pick.threshold
-                    best_prec = _pick.precision
-                    best_rec = _pick.recall
-                    best_fbeta = _pick.fbeta
-                    best_f1 = _pick.f1
-            else:
-                prauc = 0.0
-                best_t, best_f1, best_prec, best_rec = 0.5, 0.0, 0.0, 0.0
-                best_fbeta = 0.0
-            n_val = int(len(y_vl))
-            n_val_pos = int(y_vl.sum())
-            val_random_ap = (n_val_pos / n_val) if n_val > 0 else 0.0
-            metrics = {
-                "label": "rated",
-                "val_ap": prauc,
-                "val_precision": best_prec,
-                "val_recall": best_rec,
-                "val_f1": best_f1,
-                "val_fbeta_05": best_fbeta,
-                "threshold": best_t,
-                "val_samples": n_val,
-                "val_positives": n_val_pos,
-                "val_random_ap": val_random_ap,
-                "best_hyperparams": hp_resolved,
-                "_uncalibrated": not _has_val,
-                "final_refit_train_valid": bool(_did_final_refit_csv),
-            }
-            if _ft_thr_wh is not None and _ft_thr_mah is not None:
-                metrics["val_dec026_pick_window_hours"] = float(_ft_thr_wh)
-                metrics["val_dec026_pick_min_alerts_per_hour"] = float(_ft_thr_mah)
-            model = _BoosterWrapper(booster)
-    if not use_from_file and not use_from_libsvm:
+    if not use_from_libsvm:
         model, metrics = _train_one_model(
             X_tr,
             y_tr,
@@ -10632,15 +10369,18 @@ def run_pipeline(args) -> None:
                     if "_matrix_for_screen" in locals():
                         del _matrix_for_screen
                     gc.collect()
-                if STEP9_EXPORT_LIBSVM and active_feature_cols:
-                    assert step7_valid_path is not None and step7_test_path is not None  # R202 guard
-                    _train_libsvm, _valid_libsvm, _test_libsvm = _export_parquet_to_libsvm(
-                        step7_train_path,
-                        step7_valid_path,
-                        active_feature_cols,
-                        DATA_DIR / "export",
-                        test_path=step7_test_path,
+                if not STEP9_EXPORT_LIBSVM:
+                    raise RuntimeError(
+                        "STEP9_EXPORT_LIBSVM=False is incompatible with LibSVM-only training."
                     )
+                assert step7_valid_path is not None and step7_test_path is not None  # R202 guard
+                _train_libsvm, _valid_libsvm, _test_libsvm = _export_parquet_to_libsvm(
+                    step7_train_path,
+                    step7_valid_path,
+                    active_feature_cols,
+                    DATA_DIR / "export",
+                    test_path=step7_test_path,
+                )
                 train_df = pd.read_parquet(step7_train_path)
                 if step7_train_path.exists():
                     step7_train_path.unlink(missing_ok=True)
@@ -10674,33 +10414,52 @@ def run_pipeline(args) -> None:
                 active_feature_cols = [_placeholder_col]
         
             pipeline_step_set("Step 9/11")
-            # Plan B: export train/valid to CSV when training from file (PLAN 方案 B §3).
-            # Skip when B+ LibSVM path (valid_df not loaded) — validation uses LibSVM from file.
-            if STEP9_TRAIN_FROM_FILE and train_df is not None and valid_df is not None:
-                _export_dir = DATA_DIR / "export"
-                _train_csv, _valid_csv = _export_train_valid_to_csv(
-                    train_df,
-                    valid_df,
-                    active_feature_cols,
-                    _export_dir,
-                    ranking_recipe=pipeline_ranking_recipe,
+            if not STEP9_EXPORT_LIBSVM:
+                raise RuntimeError(
+                    "STEP9_EXPORT_LIBSVM=False is incompatible with LibSVM-only training."
                 )
-                pipeline_echo(f"Step 9/11 — Plan B: exported train/valid CSV to {_train_csv} and {_valid_csv}")
-        
+            remove_legacy_plan_b_csv_exports(DATA_DIR / "export")
+            if _train_libsvm is None or _valid_libsvm is None:
+                if train_df is None or valid_df is None or test_df is None:
+                    raise RuntimeError(
+                        "LibSVM-only: missing in-memory splits for export "
+                        "(train_df/valid_df/test_df required when step7 parquet paths unset)."
+                    )
+                _export_root = DATA_DIR / "export"
+                _tmp_sp = _export_root / "_tmp_splits_for_libsvm"
+                if _tmp_sp.exists():
+                    shutil.rmtree(_tmp_sp, ignore_errors=True)
+                _tmp_sp.mkdir(parents=True, exist_ok=True)
+                _tp = _tmp_sp / "train.parquet"
+                _vp = _tmp_sp / "valid.parquet"
+                _tsp = _tmp_sp / "test.parquet"
+                train_df.to_parquet(_tp, index=False)
+                valid_df.to_parquet(_vp, index=False)
+                test_df.to_parquet(_tsp, index=False)
+                _train_libsvm, _valid_libsvm, _test_libsvm = _export_parquet_to_libsvm(
+                    _tp,
+                    _vp,
+                    active_feature_cols,
+                    _export_root,
+                    test_path=_tsp,
+                )
+                shutil.rmtree(_tmp_sp, ignore_errors=True)
+            if _train_libsvm is None or _valid_libsvm is None:
+                raise RuntimeError("LibSVM-only: export did not produce train/valid LibSVM paths.")
+
             # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
             #    test_df is passed so test-set metrics and feature importance are
             #    computed immediately after training and included in the artifact.
             pipeline_echo("Step 9/11 — Train rated GBM family + test-set eval …")
             t0 = time.perf_counter()
             model_version = pipeline_model_version
-            _libsvm_paths = (_train_libsvm, _valid_libsvm) if (_train_libsvm is not None and _valid_libsvm is not None) else None
+            _libsvm_paths = (_train_libsvm, _valid_libsvm)
             rated_art, _, combined_metrics = train_single_rated_model(
                 train_df,
                 valid_df,
                 active_feature_cols,
                 run_optuna=not skip_optuna,
                 test_df=test_df,
-                train_from_file=STEP9_TRAIN_FROM_FILE,
                 train_libsvm_paths=_libsvm_paths,
                 test_libsvm_path=_test_libsvm,
                 ranking_recipe=pipeline_ranking_recipe,

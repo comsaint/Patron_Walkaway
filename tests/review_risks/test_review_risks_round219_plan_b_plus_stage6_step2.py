@@ -50,13 +50,13 @@ class TestR219BPlusValidTestNoneGuarded(unittest.TestCase):
             "R219 #1: Step 7 must use _n_test_print (from _n_test when test_df is None) for log/print.",
         )
 
-    def test_plan_b_csv_export_guarded_by_valid_df_not_none(self):
-        """Plan B CSV export must be skipped when valid_df is None (B+ LibSVM path)."""
+    def test_step9_libsvm_only_cleans_legacy_csv(self):
+        """Step 9 must remove legacy Plan B CSV before LibSVM export (B+ / full pipeline)."""
         src = _get_run_pipeline_source()
         self.assertIn(
-            "STEP9_TRAIN_FROM_FILE and train_df is not None and valid_df is not None",
+            "remove_legacy_plan_b_csv_exports",
             src,
-            "R219 #1: Plan B CSV export must run only when train_df and valid_df are not None.",
+            "R219 #1: run_pipeline Step 9 must call remove_legacy_plan_b_csv_exports.",
         )
 
 
