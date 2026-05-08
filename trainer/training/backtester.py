@@ -135,6 +135,7 @@ try:
         compute_track_llm_features,
         join_player_profile,
         load_feature_spec,
+        resolve_spec_track_section,
     )
     from trainer.training.data_sources import (
         load_clickhouse_data,
@@ -170,6 +171,7 @@ except ModuleNotFoundError:
         compute_track_llm_features,
         join_player_profile,
         load_feature_spec,
+        resolve_spec_track_section,
     )
     from trainer.training.data_sources import (
         load_clickhouse_data,
@@ -1031,7 +1033,9 @@ def backtest(
             cutoff_time=window_end,
         )
         # R222 Review #4: candidates may be non-list (e.g. dict) in YAML; treat as no candidates.
-        _raw_candidates = (feature_spec.get("track_llm") or {}).get("candidates")
+        _raw_candidates = resolve_spec_track_section(feature_spec, "bet_duckdb_window").get(
+            "candidates"
+        )
         _candidates = _raw_candidates if isinstance(_raw_candidates, list) else []
         _llm_cand_ids = [c.get("feature_id") for c in _candidates]
         _bets_llm_feature_cols = [
@@ -1088,7 +1092,8 @@ def backtest(
     _artifact_meta: List[Any] = list(artifacts.get("feature_list_meta") or [])
     _profile_in_artifact: set = {
         e["name"] for e in _artifact_meta
-        if isinstance(e, dict) and e.get("track") in ("track_profile", "profile")
+        if isinstance(e, dict)
+        and e.get("track") in ("player_profile_snapshot", "track_profile", "profile")
     }
     # R131-2: when meta empty (missing/old-format JSON), fallback so profile cols keep NaN.
     if not _profile_in_artifact and _artifact_features:

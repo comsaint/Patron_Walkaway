@@ -22,7 +22,9 @@ Artifact format (version-tagged, v10 single-entry)
 --------------------------------------------------
 models/
   model.pkl                 Rated artifact model object (single model or ensemble wrapper)
-  feature_list.json         [{name, track}]  track ∈ {"track_llm", "track_human", "track_profile"} (PLAN Step 7)
+  feature_list.json         [{name, track}]  track ∈ canonical layer+method keys
+                              (``bet_duckdb_window``, ``run_state_machine``, ``player_profile_snapshot``);
+                              legacy ``track_*`` strings remain readable for old bundles.
   model_version             YYYYMMDD-HHMMSS-<git7>  (plain text)
   training_metrics.json     legacy v1: validation + test metrics, feature importance (gain), Optuna best params
   training_metrics.v2.json  v2: nested datasets + selection summary (no long importance / no gbm_bakeoff blob)
@@ -453,6 +455,7 @@ try:
         get_cross_layer_compose_contract,
         get_legacy_to_layered_map,
         get_layer_for_feature,
+        resolve_spec_track_section,
     )
     # Phase B PR-B3: layered (bet/run/trip/player) entrypoints. Thin wrappers
     # over the legacy compute_track_llm_features / join_player_profile above;
@@ -505,6 +508,7 @@ except ModuleNotFoundError:
         get_cross_layer_compose_contract,
         get_legacy_to_layered_map,
         get_layer_for_feature,
+        resolve_spec_track_section,
     )
     # Phase B PR-B3: layered entrypoints (bet/player thin wrappers over legacy).
     from trainer.features.layered import (  # type: ignore[import]
@@ -2723,7 +2727,7 @@ def process_chunk(
         )
         _llm_cand_ids = [
             c.get("feature_id")
-            for c in (feature_spec.get("track_llm") or {}).get("candidates", [])
+            for c in resolve_spec_track_section(feature_spec, "bet_duckdb_window").get("candidates", [])
         ]
         _bets_llm_feature_cols = [
             fid for fid in _llm_cand_ids
@@ -4748,6 +4752,12 @@ def run_backend_optuna_search(
         _metric_label,
         "%.4f" % final_best_ap if final_best_ap is not None else "N/A",
         best,
+    )
+    logger.info(
+        "[Step 9/11] A3 investigate: Optuna HPO finished backend=%s label=%s; "
+        "returning hyperparams to caller for final model fit.",
+        backend_n,
+        label or "rated",
     )
     _obj_mode = "validation_ap"
     if _use_ft_hpo:
@@ -7358,6 +7368,13 @@ def train_single_rated_model(
                     )
                     _bake_libsvm_bundle = None
 
+            logger.info(
+                "[Step 9/11] A3 investigate: calling train_and_select_rated_gbm_family "
+                "(train_rated_rows=%d n_features=%d libsvm_bundle=%s)",
+                len(_get_train_rated()),
+                len(avail_cols),
+                _bake_libsvm_bundle is not None,
+            )
             _winner_backend, _winner_art, _bake_report = train_and_select_rated_gbm_family(
                 X_tr,
                 y_tr,
@@ -7379,6 +7396,11 @@ def train_single_rated_model(
                 val_dec026_window_hours=_bake_val_wh,
                 val_dec026_min_alerts_per_hour=_bake_val_mah,
                 libsvm_bundle=_bake_libsvm_bundle,
+            )
+            logger.info(
+                "[Step 9/11] A3 investigate: train_and_select_rated_gbm_family returned "
+                "winner_backend=%s (merging metrics, then A4 if enabled).",
+                _winner_backend,
             )
             model = _winner_art["model"]
             metrics = dict(_winner_art["metrics"])
@@ -7440,6 +7462,12 @@ def train_single_rated_model(
         metrics["selected_backend"] = "lightgbm"
         metrics["selected_backend_source"] = "primary_train_only"
 
+    logger.info(
+        "[Step 9/11] A3 investigate: post A3/bakeoff path checkpoint "
+        "selected_backend=%s selected_backend_source=%s; entering A4 / rest of Step 9.",
+        metrics.get("selected_backend"),
+        metrics.get("selected_backend_source"),
+    )
     # A4 / R4 MVP: two-stage FP detector with product fusion on Stage-1 candidate pool.
     metrics["a4_enabled"] = False
     metrics["a4_fusion_mode"] = validate_fusion_mode(A4_TWO_STAGE_FUSION_MODE)
@@ -8483,9 +8511,9 @@ def save_artifact_bundle(
         {
             "name": c,
             "track": (
-                "track_profile" if c in _profile_set
-                else "track_human" if c in _human_set
-                else "track_llm"
+                "player_profile_snapshot" if c in _profile_set
+                else "run_state_machine" if c in _human_set
+                else "bet_duckdb_window"
             ),
             "layered_feature_id": _legacy_to_layered.get(c),
             "target_layer": get_layer_for_feature(c),
@@ -8505,8 +8533,8 @@ def save_artifact_bundle(
     _reason_codes_enabled_for_bundle = bool(rated.get("reason_codes_enabled", True)) if rated else False
     reason_code_map: dict[str, str] = {}
     if _reason_codes_enabled_for_bundle and feature_spec is not None:
-        for track in ["track_llm", "track_human", "track_profile"]:
-            for c in feature_spec.get(track, {}).get("candidates", []):
+        for track in ("bet_duckdb_window", "run_state_machine", "player_profile_snapshot"):
+            for c in resolve_spec_track_section(feature_spec, track).get("candidates", []):
                 fid = c.get("feature_id")
                 rcode = c.get("reason_code_category")
                 if fid and rcode:
@@ -8693,6 +8721,9 @@ def _write_pipeline_diagnostics_json(
         "duckdb_runtime_screening_threads": duckdb_runtime_screening_threads,
         "duckdb_runtime_track_llm_memory_gb": duckdb_runtime_track_llm_memory_gb,
         "duckdb_runtime_track_llm_threads": duckdb_runtime_track_llm_threads,
+        # Canonical naming (dual-emit; legacy keys above retained for dashboards).
+        "duckdb_runtime_bet_duckdb_window_memory_gb": duckdb_runtime_track_llm_memory_gb,
+        "duckdb_runtime_bet_duckdb_window_threads": duckdb_runtime_track_llm_threads,
     }
     out = {k: v for k, v in payload.items() if v is not None}
     if chunk_cache_stats:
@@ -10334,7 +10365,6 @@ def run_pipeline(args) -> None:
                     default_auto_bundle_dir,
                     fingerprint_feature_spec,
                     materialize_l2_training_bundle_dir,
-                    read_bridge_source_snapshot_id,
                     touch_bundle_built_at,
                 )
                 from trainer.training.pipeline_l2_bundle import execute_l2_training_bundle
@@ -10418,12 +10448,14 @@ def run_pipeline(args) -> None:
             if feature_spec is not None:
                 _track_llm_cols = [
                     cand.get("feature_id")
-                    for cand in (feature_spec.get("track_llm", {}) or {}).get("candidates", [])
+                    for cand in resolve_spec_track_section(feature_spec, "bet_duckdb_window").get(
+                        "candidates", []
+                    )
                     if cand.get("feature_id") in _train_cols
                 ]
                 if _track_llm_cols:
                     logger.info(
-                        "screen_features: loaded %d Track LLM candidate columns from feature spec",
+                        "screen_features: loaded %d bet_duckdb_window candidate columns from feature spec",
                         len(_track_llm_cols),
                     )
                 _all_candidate_cols: List[str] = list(dict.fromkeys(active_feature_cols + _track_llm_cols))
@@ -10820,7 +10852,9 @@ def run_pipeline(args) -> None:
                         _avail_track = int(_psutil.virtual_memory().available)
                     except Exception:
                         _avail_track = None
-                    _track_policy = _resolve_runtime("track_llm", _avail_track, input_bytes=None)
+                    _track_policy = _resolve_runtime(
+                        "bet_duckdb_window", _avail_track, input_bytes=None
+                    )
                     duckdb_runtime_track_llm_memory_gb = (
                         float(_track_policy["memory_limit_bytes"]) / 1024**3
                     )

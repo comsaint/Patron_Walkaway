@@ -274,6 +274,13 @@ def execute_l2_training_bundle(
     tr.pipeline_echo("Step 9/11 — Train rated GBM (L2 bundle path) …")
     t0 = time.perf_counter()
     model_version = pipeline_model_version
+    logger.info(
+        "L2 bundle investigate: entering train_single_rated_model "
+        "(gbm_bakeoff=%s skip_optuna=%s train_rows=%d)",
+        pipeline_gbm_bakeoff,
+        skip_optuna,
+        len(train_df) if train_df is not None else -1,
+    )
     rated_art, _, combined_metrics = tr.train_single_rated_model(
         train_df,
         valid_df,
@@ -288,6 +295,17 @@ def execute_l2_training_bundle(
         valid_split_parquet_path=None,
         test_split_parquet_path=None,
         train_split_parquet_path=None,
+    )
+    _cm_keys = (
+        list(combined_metrics.keys())[:8]
+        if isinstance(combined_metrics, dict) and combined_metrics
+        else []
+    )
+    logger.info(
+        "L2 bundle investigate: train_single_rated_model returned "
+        "(rated_art is None=%s combined_metrics_key_sample=%s)",
+        rated_art is None,
+        _cm_keys,
     )
     step9_duration_sec = time.perf_counter() - t0
     tr.pipeline_echo(f"Step 9/11 — done in {step9_duration_sec:.1f}s")

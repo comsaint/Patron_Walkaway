@@ -320,13 +320,19 @@ def get_cross_layer_compose_contract(spec: Optional[dict]) -> Dict[str, dict]:
         return {}
     feature_layer = _feature_layer_index_from_spec(spec)
     out: Dict[str, dict] = {}
-    for track in ("track_llm", "track_human", "track_profile"):
-        cands = ((spec.get(track) or {}).get("candidates") or [])
-        owning_layer = {
-            "track_llm": "bet",
-            "track_human": "run",
-            "track_profile": "player",
-        }.get(track, "")
+    _canon_tracks = (
+        "bet_duckdb_window",
+        "run_state_machine",
+        "player_profile_snapshot",
+    )
+    _canon_to_layer = {
+        "bet_duckdb_window": "bet",
+        "run_state_machine": "run",
+        "player_profile_snapshot": "player",
+    }
+    for track in _canon_tracks:
+        cands = (resolve_spec_track_section(spec, track).get("candidates") or [])
+        owning_layer = _canon_to_layer.get(track, "")
         for cand in cands:
             if not isinstance(cand, dict):
                 continue
@@ -361,7 +367,7 @@ def get_profile_min_lookback(spec: dict) -> dict:
 
     若候選無 min_lookback_days 則預設 365。
     """
-    candidates = ((spec.get("track_profile") or {}).get("candidates") or [])
+    candidates = (resolve_spec_track_section(spec, "player_profile_snapshot").get("candidates") or [])
     return {
         c["feature_id"]: c.get("min_lookback_days", 365)
         for c in candidates
@@ -385,6 +391,21 @@ FEATURE_SPEC_TRACK_PARAM_ALIASES: dict[str, str] = {
     "run_state_machine": "track_human",
     "player_profile_snapshot": "track_profile",
 }
+
+
+def resolve_spec_track_section(spec: dict, canonical_key: str) -> dict:
+    """Return a track YAML section, preferring the canonical layer+method key.
+
+    Frozen bundles may omit legacy ``track_*`` keys; specs from
+    :func:`load_feature_spec` mirror both sides in memory.
+    """
+    _legacy = FEATURE_SPEC_TRACK_PARAM_ALIASES.get(canonical_key, canonical_key)
+    for _k in (canonical_key, _legacy):
+        _blob = spec.get(_k)
+        if isinstance(_blob, dict):
+            return _blob
+    return {}
+
 
 _TRACK_TO_LAYER_MAPPING_PATH = (
     pathlib.Path(__file__).resolve().parent.parent
@@ -2071,6 +2092,13 @@ _FEATURE_ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 #: semantics still produces deterministic, stable results.
 _RANGE_SORT_COL = "_range_sort_key"
 
+# Legacy YAML track sections ↔ canonical layer+method keys (Issue #16 / DEC-024 bundle).
+_TRACK_SECTION_PAIRS_LEGACY_CANON: tuple[tuple[str, str], ...] = (
+    ("track_llm", "bet_duckdb_window"),
+    ("track_human", "run_state_machine"),
+    ("track_profile", "player_profile_snapshot"),
+)
+
 
 def build_runtime_feature_spec_subset(full_spec: dict, feature_cols: Sequence[str]) -> dict:
     """Return a frozen runtime spec: model columns plus ``depends_on`` closure.
@@ -2083,15 +2111,18 @@ def build_runtime_feature_spec_subset(full_spec: dict, feature_cols: Sequence[st
 
     if not isinstance(full_spec, dict):
         return {}
-    tracks = ("track_llm", "track_human", "track_profile")
     by_fid: dict[str, tuple[str, dict]] = {}
-    for t in tracks:
-        blob = full_spec.get(t) or {}
-        raw_cands = blob.get("candidates")
-        cands = raw_cands if isinstance(raw_cands, list) else []
-        for c in cands:
-            if isinstance(c, dict) and c.get("feature_id"):
-                by_fid[str(c["feature_id"])] = (t, c)
+    for _leg, _neu in _TRACK_SECTION_PAIRS_LEGACY_CANON:
+        # Prefer canonical-side candidates when both exist (order stable for duplicates).
+        for _key in (_neu, _leg):
+            _blob = full_spec.get(_key) or {}
+            if not isinstance(_blob, dict):
+                continue
+            _raw_cands = _blob.get("candidates")
+            _cands = _raw_cands if isinstance(_raw_cands, list) else []
+            for _c in _cands:
+                if isinstance(_c, dict) and _c.get("feature_id"):
+                    by_fid[str(_c["feature_id"])] = (_key, _c)
     needed: set[str] = {str(x) for x in feature_cols if x}
     changed = True
     while changed:
@@ -2113,27 +2144,52 @@ def build_runtime_feature_spec_subset(full_spec: dict, feature_cols: Sequence[st
     lf = out.get("layered_framework")
     if isinstance(lf, dict):
         lf["authoritative"] = True
-    for t in tracks:
-        src = out.get(t)
-        if not isinstance(src, dict):
+    # Emit **canonical** track sections only (bet_duckdb_window / run_state_machine /
+    # player_profile_snapshot).  Dropping legacy + duplicate alias blocks avoids
+    # ``mirror_layer_method_track_keys_inplace`` detecting mismatched candidate sets
+    # when reloading the frozen bundle (Step 10 save_artifact_bundle).
+    for _leg, _neu in _TRACK_SECTION_PAIRS_LEGACY_CANON:
+        _src_key = (
+            _neu
+            if (out.get(_neu) or {}).get("candidates")
+            else _leg
+        )
+        _src = out.get(_src_key)
+        if not isinstance(_src, dict):
             continue
-        raw_cands = src.get("candidates")
-        cands = raw_cands if isinstance(raw_cands, list) else []
-        src["candidates"] = [
-            deepcopy(c)
-            for c in cands
-            if isinstance(c, dict)
+        _raw_cands = _src.get("candidates")
+        _cands = _raw_cands if isinstance(_raw_cands, list) else []
+        _trimmed = [
+            deepcopy(_c)
+            for _c in _cands
+            if isinstance(_c, dict)
             and (
                 (
-                    c.get("feature_id")
-                    and str(c["feature_id"]) in needed
+                    _c.get("feature_id")
+                    and str(_c["feature_id"]) in needed
                 )
                 # Keep anonymous/non-feature_id nodes: some specs encode
                 # intermediate compute steps here and they are not addressable
                 # via depends_on closure.
-                or not c.get("feature_id")
+                or not _c.get("feature_id")
             )
         ]
+        out[_neu] = {**_src, "candidates": _trimmed}
+        out.pop(_leg, None)
+    _known_te = {k for pair in _TRACK_SECTION_PAIRS_LEGACY_CANON for k in pair}
+    _te_raw = out.get("tracks_enabled")
+    if isinstance(_te_raw, dict):
+        _te_new: dict = {}
+        for _leg, _neu in _TRACK_SECTION_PAIRS_LEGACY_CANON:
+            if _neu in _te_raw:
+                _te_new[_neu] = _te_raw[_neu]
+            elif _leg in _te_raw:
+                _te_new[_neu] = _te_raw[_leg]
+        for _k, _v in _te_raw.items():
+            if _k in _known_te:
+                continue
+            _te_new[_k] = _v
+        out["tracks_enabled"] = _te_new
     out["runtime_subset"] = {
         "model_feature_ids": [str(x) for x in feature_cols if x],
         "closure_feature_count": len(needed),
@@ -2745,11 +2801,13 @@ def compute_track_llm_features(
     except ModuleNotFoundError:
         from duckdb_schema import prepare_bets_for_duckdb  # type: ignore[import-not-found,no-redef]
 
-    # R2006: use ``or {}`` so a null track_llm section doesn't raise AttributeError.
-    llm_track = feature_spec.get("track_llm") or {}
+    # R2006: prefer canonical ``bet_duckdb_window`` (frozen bundles) then legacy ``track_llm``.
+    llm_track = resolve_spec_track_section(feature_spec, "bet_duckdb_window")
     candidates = llm_track.get("candidates", [])
     if not candidates:
-        logger.warning("compute_track_llm_features: track_llm has no candidates — returning bets_df unchanged.")
+        logger.warning(
+            "compute_track_llm_features: bet_duckdb_window/track_llm has no candidates — returning bets_df unchanged."
+        )
         return bets_df.copy()
 
     # R2005: topological sort — derived features must follow their dependencies.
@@ -2836,7 +2894,7 @@ def compute_track_llm_features(
         t0 = time.perf_counter()
         input_bytes = int(df_work.memory_usage(deep=True).sum())
         runtime_policy = resolve_duckdb_runtime_policy(
-            "track_llm",
+            "bet_duckdb_window",
             available_bytes,
             input_bytes=input_bytes,
         )

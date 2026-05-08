@@ -2012,7 +2012,9 @@ def _score_df(
     if _meta and isinstance(_meta, list):
         _profile_in_list = {
             e["name"] for e in _meta
-            if isinstance(e, dict) and e.get("track") in ("track_profile", "profile")
+            if isinstance(e, dict)
+            and e.get("track")
+            in ("player_profile_snapshot", "track_profile", "profile")
         }
     else:
         _profile_in_list = set(PROFILE_FEATURE_COLS) & set(feature_list)

@@ -29,6 +29,7 @@ import logging
 import math
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -100,6 +101,103 @@ def _has_strong_validation(X_val: pd.DataFrame, y_val: pd.Series) -> bool:
         and int(y_val.sum()) >= 1
         and int((y_val == 0).sum()) >= 1
     )
+
+
+def _phase_e_dense_positive_scores(
+    model: Any,
+    X: pd.DataFrame,
+    batch_rows: int,
+    *,
+    backend: str,
+    role: str,
+) -> tuple[np.ndarray, str]:
+    """Chunked positive-class ``predict_proba`` scores with paired begin/end + batch heartbeats.
+
+    Uses :func:`trainer.training.trainer._batched_model_positive_class_scores` for the
+    LightGBM booster fast path; otherwise chunks ``predict_proba`` to reduce peak RAM
+    during Step 9 Phase E on laptop-scale runs.
+    """
+    from trainer.training.trainer import _batched_model_positive_class_scores
+
+    t0 = time.perf_counter()
+    n = int(len(X))
+    br = max(1, int(batch_rows))
+    ncols = int(X.shape[1]) if getattr(X, "ndim", 2) >= 2 else 0
+    batched = n > br
+    mode = "in_memory_dense_batched" if batched else "in_memory_dense_single"
+    logger.info(
+        "A3 PhaseE predict_begin role=%s backend=%s rows=%d cols=%d mode=%s batch_rows=%d",
+        role,
+        backend,
+        n,
+        ncols,
+        mode,
+        br,
+    )
+    if n == 0:
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "A3 PhaseE predict_end role=%s backend=%s len=0 mode=empty elapsed_s=%.3f",
+            role,
+            backend,
+            elapsed,
+        )
+        return np.asarray([], dtype=np.float64), "in_memory_dense"
+    hb_every = max(
+        0,
+        int(getattr(_cfg, "A3_PHASE_E_PREDICT_HEARTBEAT_EVERY_N_BATCHES", 10)),
+    )
+    booster = getattr(model, "booster_", None)
+    if booster is not None:
+        out = np.asarray(
+            _batched_model_positive_class_scores(model, X, br),
+            dtype=np.float64,
+        ).reshape(-1)
+        elapsed = time.perf_counter() - t0
+        ds = "in_memory_dense_batched" if batched else "in_memory_dense"
+        logger.info(
+            "A3 PhaseE predict_end role=%s backend=%s len=%d data_source=%s "
+            "engine=lightgbm_booster elapsed_s=%.3f",
+            role,
+            backend,
+            int(len(out)),
+            ds,
+            elapsed,
+        )
+        return out, ds
+    parts: list[np.ndarray] = []
+    batch_count = 0
+    for start in range(0, n, br):
+        chunk = X.iloc[start : start + br]
+        raw = model.predict_proba(chunk)[:, 1]
+        parts.append(np.asarray(raw, dtype=np.float64).reshape(-1))
+        batch_count += 1
+        processed = min(start + br, n)
+        if hb_every > 0 and batch_count % hb_every == 0:
+            logger.info(
+                "A3 PhaseE predict_heartbeat role=%s backend=%s batch_idx=%d "
+                "processed_rows=%d/%d elapsed_s=%.3f",
+                role,
+                backend,
+                batch_count,
+                processed,
+                n,
+                time.perf_counter() - t0,
+            )
+    out = np.concatenate(parts, axis=0)
+    elapsed = time.perf_counter() - t0
+    ds = "in_memory_dense_batched" if batched else "in_memory_dense"
+    logger.info(
+        "A3 PhaseE predict_end role=%s backend=%s len=%d data_source=%s "
+        "engine=sklearn_chunks batches=%d elapsed_s=%.3f",
+        role,
+        backend,
+        int(len(out)),
+        ds,
+        batch_count,
+        elapsed,
+    )
+    return out, ds
 
 
 def _neg_pos_ratio_from_binary_labels(y: pd.Series) -> Optional[float]:
@@ -393,6 +491,13 @@ def _train_xgboost_backend(
     X_tr = _to_float32_frame(X_train)
     X_vl = _to_float32_frame(X_val)
     _has_val = _has_strong_validation(X_val, y_val)
+    logger.info(
+        "A3 investigate: xgboost in-memory path n_estimators=%d train_rows=%d "
+        "eval_set=%s (starting model.fit).",
+        int(n_est),
+        int(len(X_tr)),
+        _has_val,
+    )
     if _has_val:
         model.fit(
             X_tr,
@@ -405,6 +510,10 @@ def _train_xgboost_backend(
     else:
         model.fit(X_tr, y_train, sample_weight=sw_train, verbose=False)
         val_scores = np.zeros(len(y_val), dtype=float)
+    logger.info(
+        "A3 investigate: xgboost model.fit finished (eval_set was %s); computing val metrics block.",
+        _has_val,
+    )
     metrics = _val_block_from_scores(
         y_val,
         val_scores,
@@ -736,6 +845,13 @@ def train_and_select_rated_gbm_family(
                     hpo_objective_manifest=backend_manifest,
                     backend_runtime_params=backend_runtime_params,
                 )
+                logger.info(
+                    "A3 investigate: backend=%s Optuna returned; starting trainer_fn final fit "
+                    "(train_rows=%d val_rows=%d).",
+                    backend,
+                    int(len(X_train)),
+                    int(len(X_val)),
+                )
                 if backend_manifest:
                     backend_manifest[0]["a3_bakeoff_symmetric_hpo"] = bool(
                         _symmetric_bakeoff_hpo_enabled()
@@ -758,6 +874,13 @@ def train_and_select_rated_gbm_family(
                         "a3_bakeoff_symmetric_hpo": bool(_symmetric_bakeoff_hpo_enabled()),
                     }
                 )
+                logger.info(
+                    "A3 investigate: backend=%s HPO disabled or weak val; starting trainer_fn final fit "
+                    "(train_rows=%d val_rows=%d).",
+                    backend,
+                    int(len(X_train)),
+                    int(len(X_val)),
+                )
             model, metrics = trainer_fn(
                 X_train,
                 y_train,
@@ -769,6 +892,10 @@ def train_and_select_rated_gbm_family(
                 val_dec026_window_hours=val_dec026_window_hours,
                 val_dec026_min_alerts_per_hour=val_dec026_min_alerts_per_hour,
                 libsvm_bundle=libsvm_bundle,
+            )
+            logger.info(
+                "A3 investigate: backend=%s trainer_fn returned; attaching metrics / Phase E.",
+                backend,
             )
             metrics = dict(metrics)
             metrics["best_hyperparams"] = dict(hp_backend)
@@ -784,8 +911,22 @@ def train_and_select_rated_gbm_family(
                 predict_positive_scores_phase_e_libsvm,
             )
 
+            logger.info(
+                "A3 investigate: backend=%s Phase E gate libsvm_bundle=%s "
+                "phase_e_predict_streaming_enabled=%s",
+                backend,
+                libsvm_bundle is not None,
+                phase_e_predict_streaming_enabled(),
+            )
             _pe_val_ok = False
             if libsvm_bundle is not None and phase_e_predict_streaming_enabled():
+                _t_val_stream = time.perf_counter()
+                logger.info(
+                    "A3 PhaseE predict_begin role=val backend=%s mode=libsvm_streaming "
+                    "batch_rows=%d",
+                    backend,
+                    int(phase_e_predict_batch_rows()),
+                )
                 try:
                     _sv, _mv = predict_positive_scores_phase_e_libsvm(
                         backend=backend,
@@ -801,6 +942,13 @@ def train_and_select_rated_gbm_family(
                     metrics["a3_val_scores_data_source"] = "libsvm_streaming"
                     metrics.update({k: v for k, v in _mv.items() if str(k).startswith("a3_")})
                     _pe_val_ok = True
+                    logger.info(
+                        "A3 PhaseE predict_end role=val backend=%s len=%d mode=libsvm_streaming "
+                        "elapsed_s=%.3f",
+                        backend,
+                        int(len(metrics["_val_scores"])),
+                        time.perf_counter() - _t_val_stream,
+                    )
                 except Exception as _pev_exc:
                     if trainer_file_backed_strict_enabled():
                         raise RuntimeError(
@@ -808,33 +956,97 @@ def train_and_select_rated_gbm_family(
                             f"predict failed ({_pev_exc})"
                         ) from _pev_exc
                     logger.warning("Phase E: validation streaming scores skipped: %s", _pev_exc)
+                    logger.info(
+                        "A3 PhaseE predict_end role=val backend=%s mode=libsvm_streaming "
+                        "status=skipped elapsed_s=%.3f",
+                        backend,
+                        time.perf_counter() - _t_val_stream,
+                    )
             if not _pe_val_ok:
                 if hasattr(model, "predict_val_scores_from_libsvm"):
+                    _t_vx = time.perf_counter()
+                    logger.info(
+                        "A3 PhaseE predict_begin role=val backend=%s mode=xgboost_libsvm_uri",
+                        backend,
+                    )
                     metrics["_val_scores"] = model.predict_val_scores_from_libsvm()
                     metrics["a3_val_scores_data_source"] = "xgboost_libsvm_uri"
+                    logger.info(
+                        "A3 PhaseE predict_end role=val backend=%s len=%d mode=xgboost_libsvm_uri "
+                        "elapsed_s=%.3f",
+                        backend,
+                        int(len(metrics["_val_scores"])),
+                        time.perf_counter() - _t_vx,
+                    )
                 elif getattr(model, "_gbm_bakeoff_valid_libsvm_uri", None):
                     from catboost import Pool
 
+                    _t_vc = time.perf_counter()
+                    logger.info(
+                        "A3 PhaseE predict_begin role=val backend=%s mode=catboost_libsvm_pool_uri",
+                        backend,
+                    )
                     _vuri = str(getattr(model, "_gbm_bakeoff_valid_libsvm_uri"))
                     metrics["_val_scores"] = np.asarray(
                         model.predict_proba(Pool(_vuri))[:, 1],
                         dtype=np.float64,
                     )
                     metrics["a3_val_scores_data_source"] = "catboost_libsvm_pool_uri"
-                else:
-                    metrics["_val_scores"] = (
-                        np.asarray(
-                            model.predict_proba(_to_float32_frame(X_val))[:, 1],
-                            dtype=np.float64,
-                        )
-                        if _has_strong_validation(X_val, y_val)
-                        else np.zeros(len(y_val), dtype=np.float64)
+                    logger.info(
+                        "A3 PhaseE predict_end role=val backend=%s len=%d mode=catboost_libsvm_pool_uri "
+                        "elapsed_s=%.3f",
+                        backend,
+                        int(len(metrics["_val_scores"])),
+                        time.perf_counter() - _t_vc,
                     )
-                    metrics["a3_val_scores_data_source"] = "in_memory_dense"
+                else:
+                    if _has_strong_validation(X_val, y_val):
+                        _val_batch = int(getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000))
+                        _vs_arr, _vs_src = _phase_e_dense_positive_scores(
+                            model,
+                            _to_float32_frame(X_val),
+                            _val_batch,
+                            backend=backend,
+                            role="val",
+                        )
+                        metrics["_val_scores"] = _vs_arr
+                        metrics["a3_val_scores_data_source"] = _vs_src
+                    else:
+                        _t_vz = time.perf_counter()
+                        logger.info(
+                            "A3 PhaseE predict_begin role=val backend=%s rows=%d "
+                            "mode=zeros_weak_validation",
+                            backend,
+                            int(len(y_val)),
+                        )
+                        metrics["_val_scores"] = np.zeros(len(y_val), dtype=np.float64)
+                        metrics["a3_val_scores_data_source"] = "in_memory_dense"
+                        logger.info(
+                            "A3 PhaseE predict_end role=val backend=%s len=%d mode=zeros_weak_validation "
+                            "elapsed_s=%.3f",
+                            backend,
+                            int(len(y_val)),
+                            time.perf_counter() - _t_vz,
+                        )
+            _vs_arr = metrics.get("_val_scores")
+            _vs_len = int(len(_vs_arr)) if _vs_arr is not None else -1
+            logger.info(
+                "A3 investigate: backend=%s val_scores_done a3_val_scores_data_source=%s n=%d",
+                backend,
+                metrics.get("a3_val_scores_data_source"),
+                _vs_len,
+            )
             train_thr = float(metrics["threshold"])
             train_scores_disk: Optional[np.ndarray] = None
             _pe_tr_ok = False
             if libsvm_bundle is not None and phase_e_predict_streaming_enabled():
+                _t_tr_stream = time.perf_counter()
+                logger.info(
+                    "A3 PhaseE predict_begin role=train backend=%s mode=libsvm_streaming "
+                    "batch_rows=%d",
+                    backend,
+                    int(phase_e_predict_batch_rows()),
+                )
                 try:
                     train_scores_disk, _mt = predict_positive_scores_phase_e_libsvm(
                         backend=backend,
@@ -847,6 +1059,13 @@ def train_and_select_rated_gbm_family(
                         role="train",
                     )
                     _pe_tr_ok = True
+                    logger.info(
+                        "A3 PhaseE predict_end role=train backend=%s len=%d mode=libsvm_streaming "
+                        "elapsed_s=%.3f",
+                        backend,
+                        int(len(train_scores_disk)),
+                        time.perf_counter() - _t_tr_stream,
+                    )
                 except Exception as _pet_exc:
                     if trainer_file_backed_strict_enabled():
                         raise RuntimeError(
@@ -855,6 +1074,12 @@ def train_and_select_rated_gbm_family(
                         ) from _pet_exc
                     logger.warning("Phase E: train streaming scores skipped: %s", _pet_exc)
                     train_scores_disk = None
+                    logger.info(
+                        "A3 PhaseE predict_end role=train backend=%s mode=libsvm_streaming "
+                        "status=skipped elapsed_s=%.3f",
+                        backend,
+                        time.perf_counter() - _t_tr_stream,
+                    )
             if not _pe_tr_ok:
                 if hasattr(model, "predict_train_scores_from_libsvm"):
                     train_scores_disk = np.asarray(
@@ -889,6 +1114,14 @@ def train_and_select_rated_gbm_family(
                     )
                 metrics["_train_scores"] = np.asarray(train_scores_disk, dtype=np.float32)
             else:
+                _tr_batch = int(getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000))
+                logger.info(
+                    "A3 investigate: backend=%s train_scores in_memory_dense_batched "
+                    "train_rows=%d predict_batch_rows=%d (before _compute_train_metrics).",
+                    backend,
+                    int(len(X_train)),
+                    _tr_batch,
+                )
                 metrics.update(
                     _compute_train_metrics(
                         model,
@@ -899,12 +1132,22 @@ def train_and_select_rated_gbm_family(
                         log_results=False,
                     )
                 )
+                logger.info(
+                    "A3 investigate: backend=%s _compute_train_metrics done; "
+                    "starting _batched_model_positive_class_scores on train.",
+                    backend,
+                )
                 metrics["_train_scores"] = _batched_model_positive_class_scores(
                     model,
                     _to_float32_frame(X_train),
-                    int(getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000)),
+                    _tr_batch,
                 )
                 metrics["a3_train_metrics_data_source"] = "in_memory_dense_batched"
+                logger.info(
+                    "A3 investigate: backend=%s batched train scores done len=%d",
+                    backend,
+                    int(len(metrics["_train_scores"])),
+                )
             if X_test is not None and y_test is not None and not X_test.empty:
                 _ts_disk: Optional[np.ndarray] = None
                 _pe_te_ok = False
@@ -913,6 +1156,13 @@ def train_and_select_rated_gbm_family(
                     and libsvm_bundle.test_libsvm is not None
                     and phase_e_predict_streaming_enabled()
                 ):
+                    _t_te_stream = time.perf_counter()
+                    logger.info(
+                        "A3 PhaseE predict_begin role=test backend=%s mode=libsvm_streaming "
+                        "batch_rows=%d",
+                        backend,
+                        int(phase_e_predict_batch_rows()),
+                    )
                     try:
                         _ts_raw, _mte = predict_positive_scores_phase_e_libsvm(
                             backend=backend,
@@ -928,6 +1178,13 @@ def train_and_select_rated_gbm_family(
                         metrics.update({k: v for k, v in _mte.items() if str(k).startswith("a3_")})
                         metrics["a3_test_scores_data_source"] = "libsvm_streaming"
                         _pe_te_ok = True
+                        logger.info(
+                            "A3 PhaseE predict_end role=test backend=%s len=%d mode=libsvm_streaming "
+                            "elapsed_s=%.3f",
+                            backend,
+                            int(len(_ts_disk)),
+                            time.perf_counter() - _t_te_stream,
+                        )
                     except Exception as _pee_exc:
                         if trainer_file_backed_strict_enabled():
                             raise RuntimeError(
@@ -935,6 +1192,12 @@ def train_and_select_rated_gbm_family(
                                 f"failed ({_pee_exc})"
                             ) from _pee_exc
                         logger.warning("Phase E: test streaming scores skipped: %s", _pee_exc)
+                        logger.info(
+                            "A3 PhaseE predict_end role=test backend=%s mode=libsvm_streaming "
+                            "status=skipped elapsed_s=%.3f",
+                            backend,
+                            time.perf_counter() - _t_te_stream,
+                        )
                 if not _pe_te_ok and hasattr(model, "predict_test_scores_from_libsvm"):
                     _ts_disk = model.predict_test_scores_from_libsvm()
                     if _ts_disk is not None:
@@ -961,11 +1224,19 @@ def train_and_select_rated_gbm_family(
                     metrics.update(test_metrics)
                     metrics["_test_scores"] = np.asarray(_ts_disk, dtype=np.float64).reshape(-1)
                 else:
-                    test_metrics = _compute_test_metrics(
+                    _te_batch = int(getattr(_cfg, "TRAIN_METRICS_PREDICT_BATCH_ROWS", 500_000))
+                    _x_test_f = _to_float32_frame(X_test)
+                    _test_scores_arr, _test_src = _phase_e_dense_positive_scores(
                         model,
+                        _x_test_f,
+                        _te_batch,
+                        backend=backend,
+                        role="test",
+                    )
+                    test_metrics = _compute_test_metrics_from_scores(
+                        np.asarray(y_test, dtype=float).reshape(-1),
+                        np.asarray(_test_scores_arr, dtype=np.float64).reshape(-1),
                         float(metrics["threshold"]),
-                        _to_float32_frame(X_test),
-                        y_test,
                         label=f"rated_{backend}",
                         _uncalibrated=bool(metrics.get("_uncalibrated", False)),
                         log_results=False,
@@ -973,9 +1244,19 @@ def train_and_select_rated_gbm_family(
                     )
                     metrics.update(test_metrics)
                     metrics["_test_scores"] = np.asarray(
-                        model.predict_proba(_to_float32_frame(X_test))[:, 1],
+                        _test_scores_arr,
                         dtype=np.float64,
-                    )
+                    ).reshape(-1)
+                    metrics["a3_test_scores_data_source"] = _test_src
+                logger.info(
+                    "A3 investigate: backend=%s test scores / metrics branch finished.",
+                    backend,
+                )
+            logger.info(
+                "A3 investigate: backend=%s computing feature_importance (n_features=%d).",
+                backend,
+                len(feature_cols),
+            )
             metrics["feature_importance"] = _compute_feature_importance(model, feature_cols)
             metrics["importance_method"] = "gain"
             metrics["model_backend"] = backend
@@ -1059,6 +1340,14 @@ def train_and_select_rated_gbm_family(
             if artifact:
                 candidate_artifacts[backend_name] = artifact
 
+    if backend_jobs:
+        logger.info(
+            "A3 investigate: optional backend job loop finished "
+            "(parallel_workers=%s n_jobs=%d); next soft_vote / stacking.",
+            parallel_workers,
+            len(backend_jobs),
+        )
+
     def _skipped_backend_row(backend: str, hint: str) -> Dict[str, Any]:
         return {
             "backend": backend,
@@ -1137,6 +1426,10 @@ def train_and_select_rated_gbm_family(
         }
         logger.warning("A3 gbm_bakeoff: %s build failed: %s", STACKED_LOGISTIC_BACKEND, exc)
 
+    logger.info(
+        "A3 investigate: ensemble candidates built row_keys=%s; entering _pick_winner.",
+        sorted(rows.keys()),
+    )
     winner, rule = _pick_winner(rows)
     _assign_dispositions(rows, winner)
     for backend, row in rows.items():

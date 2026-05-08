@@ -62,6 +62,8 @@ STEP9_SAVE_LGB_BINARY: bool = True
 # --- Step 8 / Step 9 memory-sensitive knobs ---
 # Keep this as a plain assignment for now; no getenv override contract yet.
 TRAIN_METRICS_PREDICT_BATCH_ROWS: int = 500_000
+# A3 Phase E dense predict: emit a progress log every N batch iterations (0 disables).
+A3_PHASE_E_PREDICT_HEARTBEAT_EVERY_N_BATCHES: int = 10
 
 # --- A3 optional backends (CatBoost / XGBoost): LibSVM-disk final fit (OOM mitigation) ---
 # When True and Plan B+ LibSVM paths exist, final full-data fits use on-disk data instead

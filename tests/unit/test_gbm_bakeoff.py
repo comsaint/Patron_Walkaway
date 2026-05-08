@@ -740,3 +740,33 @@ def test_predict_positive_scores_phase_e_xgboost_matches_full_uri(tmp_path: Path
         rtol=1e-5,
         atol=1e-5,
     )
+
+
+def test_phase_e_dense_positive_scores_sklearn_batched_contract() -> None:
+    """Dense Phase E helper returns full-length scores and correct data_source labels."""
+    from trainer.training.gbm_bakeoff import _phase_e_dense_positive_scores
+
+    class _SkModel:
+        def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+            n = int(len(X))
+            return np.column_stack([np.zeros(n), np.ones(n)])
+
+    X = pd.DataFrame(np.zeros((11, 2)), columns=["a", "b"])
+    scores, ds = _phase_e_dense_positive_scores(
+        _SkModel(),
+        X,
+        4,
+        backend="unit_backend",
+        role="unit_role",
+    )
+    assert len(scores) == 11
+    assert ds == "in_memory_dense_batched"
+    scores2, ds2 = _phase_e_dense_positive_scores(
+        _SkModel(),
+        X.iloc[:3],
+        10,
+        backend="unit_backend",
+        role="unit_role_small",
+    )
+    assert len(scores2) == 3
+    assert ds2 == "in_memory_dense"

@@ -3,8 +3,15 @@
 本文件說明 **Feature Spec YAML** 的角色、結構與使用方式，並提供一段「給未來 LLM 看的 Prompt」範例，方便之後自動產生 Track LLM 候選特徵。
 
 > **命名演進（layer + method）**：除 legacy 的 ``track_llm`` / ``track_human`` / ``track_profile`` 區塊外，載入器亦接受
-> ``bet_duckdb_window``、``run_state_machine``、``player_profile_snapshot``（與 legacy 互為鏡像，二擇一填寫候選即可）。
-> 執行時仍會正規化到 ``track_*`` 鍵供既有 DuckDB / state-machine 程式路徑使用。
+> ``bet_duckdb_window``、``run_state_machine``、``player_profile_snapshot``（與 legacy 互為鏡像；**同一軌請只保留一側候選**，否則靜態載入會 ``ValueError``）。
+> ``load_feature_spec`` 會在驗證前鏡像補齊缺側，記憶體內仍會同時存在 ``track_*`` 與 canonical 鍵，供驗證與舊程式路徑讀取。
+>
+> **凍結 bundle（訓練產出）**：``feature_spec.yaml`` 子集僅寫出 **canonical** 三軌區塊，避免 YAML 同時帶兩套候選導致 Step 10 重載衝突（#14）。``feature_list.json`` 的 ``track`` 欄位以 canonical 字串為主；scorer 仍接受舊 ``track_*`` / ``profile`` 標記。
+>
+> **Deprecation / migration gate（摘要）**：
+> - **Phase 1（目前）**：dual-read（legacy + canonical）、bundle canonical-write、diagnostics **dual-emit** DuckDB 指標（``duckdb_runtime_track_llm_*`` 與 ``duckdb_runtime_bet_duckdb_window_*`` 同值）。
+> - **Phase 2**：對外文件與新程式僅使用 canonical 名；legacy 鍵僅由載入鏡像產生。
+> - **Phase 3（移除條件）**：無外部工具依賴舊 metric / 舊 ``track`` 字串後，可刪除 legacy 欄位與 ``compute_track_llm_features`` 等薄包裝（須 bump schema 版本並跑全鏈路 smoke）。
 
 > 關鍵原則：  
 > - **人類決定語義與護欄**（哪些欄位可以用、允許哪些函數、視窗長度上限）。  

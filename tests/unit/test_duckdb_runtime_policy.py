@@ -26,6 +26,13 @@ class TestDuckDbRuntimePolicy(unittest.TestCase):
         self.assertEqual(policy["stage"], "screening")
         self.assertEqual(policy["threads"], max(1, int(config.SCREENING_DUCKDB_THREADS)))
 
+    def test_bet_duckdb_window_stage_matches_track_llm_policy(self):
+        avail = 8 * 1024**3
+        p_llm = config.resolve_duckdb_runtime_policy("track_llm", avail, input_bytes=1)
+        p_canon = config.resolve_duckdb_runtime_policy("bet_duckdb_window", avail, input_bytes=1)
+        self.assertEqual(p_llm["threads"], p_canon["threads"])
+        self.assertEqual(p_llm["memory_limit_bytes"], p_canon["memory_limit_bytes"])
+
     def test_apply_runtime_executes_required_statements(self):
         class _FakeCon:
             def __init__(self) -> None:
