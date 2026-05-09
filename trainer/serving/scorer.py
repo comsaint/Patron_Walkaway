@@ -100,7 +100,7 @@ try:
         compute_loss_streak,
         compute_run_boundary,
         compute_table_hc,
-        compute_track_llm_features,
+        compute_bet_duckdb_window_features,
         load_feature_spec,
     )
 except ImportError:
@@ -109,7 +109,7 @@ except ImportError:
             compute_loss_streak,
             compute_run_boundary,
             compute_table_hc,
-            compute_track_llm_features,
+            compute_bet_duckdb_window_features,
             load_feature_spec,
         )
     except ImportError:
@@ -117,7 +117,7 @@ except ImportError:
             compute_loss_streak,
             compute_run_boundary,
             compute_table_hc,
-            compute_track_llm_features,
+            compute_bet_duckdb_window_features,
             load_feature_spec,
         )
 
@@ -2007,14 +2007,12 @@ def _score_df(
     # R74/R79: profile features stay NaN when no prior snapshot exists —
     # LightGBM routes them via its trained default-child (NaN-aware split).
     # Step 6: profile vs non-profile from artifact track (YAML-driven); fallback to PROFILE_FEATURE_COLS.
-    # Step 8 backward compat: accept legacy "profile" as track_profile so old feature_list.json works.
     _meta = artifacts.get("feature_list_meta")
     if _meta and isinstance(_meta, list):
         _profile_in_list = {
             e["name"] for e in _meta
             if isinstance(e, dict)
-            and e.get("track")
-            in ("player_profile_snapshot", "track_profile", "profile")
+            and e.get("track") == "player_run_asset"
         }
     else:
         _profile_in_list = set(PROFILE_FEATURE_COLS) & set(feature_list)
@@ -2510,9 +2508,7 @@ def score_once(
     features_all = features_all[features_all["canonical_id"].isin(rated_canonical_ids)].copy()
 
     # bet_duckdb_window: compute DuckDB window features from feature spec when available.
-    # Phase B PR-B4: route through layered bet entrypoint when available
-    # (thin wrapper over compute_track_llm_features). Fallback preserves the
-    # original call when the layered module fails to import.
+    # Phase B PR-B4: route through layered bet entrypoint when available.
     _feature_spec = artifacts.get("feature_spec")
     if _feature_spec is not None:
         _n_before_llm = len(features_all)
@@ -2521,7 +2517,7 @@ def score_once(
             _bet_compute = (
                 compute_bet_layer_features
                 if compute_bet_layer_features is not None
-                else compute_track_llm_features
+                else compute_bet_duckdb_window_features
             )
         try:
             features_all = _bet_compute(
@@ -2541,13 +2537,10 @@ def score_once(
 
     # B2 ``t_game`` join removed (issue #34): catalog no longer ships game-level features.
 
-    # ── player_profile PIT join (R79) ─────────────────────────────────
-    # Attach rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
-    # Non-rated bets and bets without a prior snapshot keep NaN — LightGBM handles
-    # this natively via the default-child path trained in trainer.py (R74/R79).
-    # join_player_profile requires payout_complete_dtm; backfill from bets if missing
-    # (e.g. tests mock build_features_for_scoring, or partial feature frames).
-    if _join_profile is not None and PROFILE_FEATURE_COLS and rated_canonical_ids:
+    # ── Player layer (run primitives or legacy snapshot join) ──────────────────
+    # player_run_asset: materialize from L1 run_fact/run_bet_map (requires local bridge manifest).
+    # Legacy path: player_profile snapshot via join_player_profile when player_run_asset is off.
+    if PROFILE_FEATURE_COLS and rated_canonical_ids:
         if (
             "payout_complete_dtm" not in features_all.columns
             and "bet_id" in features_all.columns
@@ -2561,20 +2554,51 @@ def score_once(
                 _t = _t.copy()
                 _t["bet_id"] = _t["bet_id"].astype(_fa["bet_id"].dtype)
             features_all = _fa.merge(_t, on="bet_id", how="left")
-        _profile_df = _load_profile_for_scoring(rated_canonical_ids, now_hk)
-        if _profile_df is not None:
-            # Phase B PR-B4: layered player entrypoint when available.
-            _player_compute = (
-                compute_player_layer_features
-                if compute_player_layer_features is not None
-                else _join_profile
-            )
-            features_all = _player_compute(features_all, _profile_df)
-            logger.debug("[scorer] player_profile PIT join applied")
+
+        _feature_spec_player = artifacts.get("feature_spec")
+        _player_compute = (
+            compute_player_layer_features
+            if compute_player_layer_features is not None
+            else _join_profile
+        )
+        if _player_compute is None:
+            logger.debug("[scorer] player layer skipped (no compute_player_layer_features / join)")
         else:
-            logger.debug(
-                "[scorer] player_profile unavailable — profile features will be NaN"
+            from trainer.features.player_run_layer import player_run_asset_requested
+            from trainer.training.data_sources import trainer_local_parquet_bridge_manifest_path
+
+            _pr_gate = isinstance(_feature_spec_player, dict) and player_run_asset_requested(
+                _feature_spec_player
             )
+            if _pr_gate:
+                if not trainer_local_parquet_bridge_manifest_path().is_file():
+                    raise RuntimeError(
+                        "[scorer] player_run_asset is enabled but "
+                        "trainer_local_parquet_bridge.manifest.json is missing under LOCAL_PARQUET_DIR."
+                    )
+                features_all = _player_compute(
+                    features_all,
+                    None,
+                    feature_spec=_feature_spec_player,
+                    use_local_parquet=True,
+                )
+                logger.debug("[scorer] player_run_asset attached (layered compute)")
+            elif _join_profile is not None:
+                _profile_df = _load_profile_for_scoring(rated_canonical_ids, now_hk)
+                if _profile_df is not None:
+                    features_all = _player_compute(
+                        features_all,
+                        _profile_df,
+                        feature_spec=_feature_spec_player if isinstance(_feature_spec_player, dict) else None,
+                        use_local_parquet=False,
+                    )
+                    logger.debug("[scorer] legacy player_profile PIT join applied")
+                else:
+                    logger.debug(
+                        "[scorer] player_profile unavailable — legacy profile features will be NaN"
+                    )
+            else:
+                logger.debug("[scorer] no legacy join_player_profile and player_run_asset off — skip player layer")
     if add_wave2_personalized_baselines is not None:
         features_all = add_wave2_personalized_baselines(features_all)
 

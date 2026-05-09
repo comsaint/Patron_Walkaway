@@ -33,7 +33,7 @@ That distinction matters when simplifying `trainer/core/config.py`: we should av
 
 | Step | Class | Current confidence | Note |
 |------|-------|--------------------|------|
-| 6 | DuckDB Track LLM materialization | Medium | The current user reported Step 6 failures of the form "DuckDB query fails: Unable to allocate x.xxGB for an array ...". That exact transcript is not preserved in the docs I reviewed, but it is consistent with hotspot **A14** (`compute_track_llm_features()` registers a large chunk in DuckDB and materializes the result back to pandas). |
+| 6 | DuckDB Track LLM materialization | Medium | The current user reported Step 6 failures of the form "DuckDB query fails: Unable to allocate x.xxGB for an array ...". That exact transcript is not preserved in the docs I reviewed, but it is consistent with hotspot **A14** (`compute_bet_duckdb_window_features()` registers a large chunk in DuckDB and materializes the result back to pandas). |
 
 ### Practical implication
 
@@ -112,7 +112,7 @@ If we want to simplify the OOM mechanism, the target is **not** "fewer protectio
 | A08 | 6 | trainer.py:742–776 | OOM | `load_local_parquet` loads one chunk (bets + sessions with filters and column projection); single chunk = one month + 2 days, can be large for long windows. | High | Already uses column and time pushdown; reduce `--days` or `--recent-chunks` if needed. |
 | A09 | 6 | schema_io.py:44–45 | OOM | `normalize_bets_sessions` copies both bets and sessions; coexists with raw inputs. | Medium | Necessary copy; scales with chunk size. |
 | A10 | 6 | trainer.py:1401–1445 | OOM | `apply_dq` performs multiple `sessions.copy()` and `bets.copy()` plus filtered copies. | Medium | Single mask used for bets (1482) to reduce copies; sessions still have multiple. |
-| A11 | 6 | trainer.py:1557, 1995 | OOM | `add_track_human_features` copies bets; merges with canonical_map and Track LLM result. | Medium | Once per chunk; adds up with chunk size. |
+| A11 | 6 | trainer.py:1557, 1995 | OOM | `add_run_state_machine_features` copies bets; merges with canonical_map and Track LLM result. | Medium | Once per chunk; adds up with chunk size. |
 | A12 | 6 | **features.py:359–377, 409–425, 543–570** | **Long** | **Track Human lookback:** When `TRAINER_USE_LOOKBACK=True`, `compute_loss_streak` and `compute_run_boundary` use **per-row Python double loop**; ~25M rows can take **7h+**. | **Critical** | Keep `TRAINER_USE_LOOKBACK=False` by default; enable only after Phase 2 numba vectorization. |
 | A13 | 6 | features.py:680–716 | Long | `compute_table_hc`: outer loop over table_id, inner `np.unique` per bet window; large chunk can be tens of seconds to minutes. | Medium | Noticeable when table_hc feature is enabled on large chunks. |
 | A14 | 6 | features.py:1338–1362, 1459 | OOM, Long | Track LLM: full chunk copy/slice, register in DuckDB, run window exprs, `.df()` materialize; large chunk uses significant memory and time. | High | Dominated by DuckDB + materialize for large chunks. |
@@ -208,7 +208,7 @@ If we want to simplify the OOM mechanism, the target is **not** "fewer protectio
 | A08 | 6 | trainer.py:742–776 | OOM | `load_local_parquet` 每 chunk 載入 bet/session（有 filters 與欄位投影）；單 chunk = 一個月 + 2 天，長窗時單次就很大。 | High | 已做欄位與時間 pushdown；必要時減 `--days` 或 `--recent-chunks`。 |
 | A09 | 6 | schema_io.py:44–45 | OOM | `normalize_bets_sessions` 對 bets/sessions 各做 copy；與 raw 同時存在。 | Medium | 必要複製；隨 chunk 大小同增。 |
 | A10 | 6 | trainer.py:1401–1445 | OOM | `apply_dq` 內多次 `sessions.copy()`、`bets.copy()` 及篩選後 copy。 | Medium | bets 已用單一 mask 減少 copy（1482）；sessions 仍多份。 |
-| A11 | 6 | trainer.py:1557, 1995 | OOM | `add_track_human_features` 複製 bets；與 canonical_map、Track LLM 結果 merge。 | Medium | 每 chunk 一次；隨 chunk 大小疊加。 |
+| A11 | 6 | trainer.py:1557, 1995 | OOM | `add_run_state_machine_features` 複製 bets；與 canonical_map、Track LLM 結果 merge。 | Medium | 每 chunk 一次；隨 chunk 大小疊加。 |
 | A12 | 6 | **features.py:359–377, 409–425, 543–570** | **Long** | **Track Human lookback：** `TRAINER_USE_LOOKBACK=True` 時 `compute_loss_streak`、`compute_run_boundary` 使用 **per-row Python 雙層迴圈**；約 25M 列可 **7h+**。 | **Critical** | 預設保持 `TRAINER_USE_LOOKBACK=False`；Phase 2 numba 向量化後再啟用。 |
 | A13 | 6 | features.py:680–716 | Long | `compute_table_hc`：外層依 table_id 迴圈，內層每 bet 一次 `np.unique`；大 chunk 可達數十秒～數分。 | Medium | 啟用 table_hc 特徵且 chunk 大時可感。 |
 | A14 | 6 | features.py:1338–1362, 1459 | OOM, Long | Track LLM：整 chunk 複製/切片、註冊 DuckDB、執行 window 運算、`.df()` materialize；大 chunk 時記憶體與時間皆高。 | High | 大 chunk 時以 DuckDB + materialize 為主。 |
@@ -296,7 +296,7 @@ If we want to simplify the OOM mechanism, the target is **not** "fewer protectio
 
 | 步驟 | 類型 | 目前信心 | 備註 |
 |------|------|----------|------|
-| 6 | DuckDB Track LLM materialization | 中 | 使用者目前回報 Step 6 曾出現「DuckDB query fails: Unable to allocate x.xxGB for an array ...」。我在本輪閱讀的文件中沒找到完整原始 transcript，但它與 **A14**（`compute_track_llm_features()` 註冊大 chunk 進 DuckDB、再 `.df()` materialize 回 pandas）高度一致。 |
+| 6 | DuckDB Track LLM materialization | 中 | 使用者目前回報 Step 6 曾出現「DuckDB query fails: Unable to allocate x.xxGB for an array ...」。我在本輪閱讀的文件中沒找到完整原始 transcript，但它與 **A14**（`compute_bet_duckdb_window_features()` 註冊大 chunk 進 DuckDB、再 `.df()` materialize 回 pandas）高度一致。 |
 
 ### 實務含意
 
@@ -406,7 +406,7 @@ If we want to simplify the OOM mechanism, the target is **not** "fewer protectio
 | 18 | A07 | **Phase 2a 已確認**：呼叫端（trainer run_pipeline、backtester）皆傳入 `canonical_ids`（rated 玩家 ID）；`load_player_profile` 在 `canonical_ids=[]` 時直接 return None 不讀表。文件註明大窗或大 canonical 集時風險。 | 可省 **與 profile 結果集大小成比例**，約 **數十～數百 MB**（視窗與玩家數）。 | 略減讀取與 merge 時間。 | trainer 與 backtester 已傳 _rated_cids；R222 已處理空表不載入。 |
 | 19 | A09 | `normalize_bets_sessions` 為必要 copy（型別轉換）；若未來改為 in-place 型別轉換（pandas 允許且無共用風險），可省 1 份 bets + 1 份 sessions。 | 若改為 in-place：可省 **約 1× (bets + sessions)**，約 **數百 MB～1+ GB**/chunk。 | 可略。 | 需確認後續是否仍需要原始型別；改動範圍較大。 |
 | 20 | A10 | 在 `apply_dq` 內合併 sessions 的多次 filter：用單一 mask 或鏈式布林索引，最後一次 `.copy()`，避免 1401/1408/1429/1438 各一次 copy。 | 可省 **約 1–2 份 sessions**（每份約 chunk 內 sessions 大小），約 **數十～數百 MB**/chunk。 | 可略。 | 與現有 bets 單一 mask 做法對齊。 |
-| 21 | A11 | 評估 `add_track_human_features` 是否可在 bets 上 in-place 加欄位或只複製必要欄位；或與前一步共用一份 bets 避免重複 copy。 | 可省 **約 1× bets**/chunk，約 **數百 MB**/chunk（視欄位數）。 | 可略。 | 需理清與 canonical_map、Track LLM merge 的介面。 |
+| 21 | A11 | 評估 `add_run_state_machine_features` 是否可在 bets 上 in-place 加欄位或只複製必要欄位；或與前一步共用一份 bets 避免重複 copy。 | 可省 **約 1× bets**/chunk，約 **數百 MB**/chunk（視欄位數）。 | 可略。 | 需理清與 canonical_map、Track LLM merge 的介面。 |
 | 22 | A13 | `compute_table_hc`：改為向量化或先 groupby table_id 再對每組做一次 `np.unique`（避免 per-bet 重複），或用 numba 做視窗內 unique count。 | 不直接省記憶體。 | 大 chunk 時可從 **數十秒～數分鐘** 降到 **數秒～數十秒**（數量級）。 | 需看 table_id 基數與呼叫頻率。 |
 | 23 | A15 | 註解已註明省約 10 GiB；維持現狀，僅確認無多餘 sort。若未來改為 DuckDB 做 as-of join 可再評估。 | 已優化；**無額外可量化節省**（先前已省 ~10 GiB）。 | 已優化。 | 維持現狀即可。 |
 | 24 | A16 | `compute_labels`：合併 null 檢查為單一 mask，再一次 `df = df[~mask].copy()`，避免 137/144/154 多次 copy。 | 可省 **約 1 份 bets**（chunk 尺度），約 **數十～數百 MB**/chunk。 | 可略。 | 邏輯簡單，可與 A10 同風格處理。 |

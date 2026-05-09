@@ -1,17 +1,16 @@
 version: "2.0"
 spec_id: "walkaway_features_v2_template"
-description: "Template feature spec for Patron Walkaway Predictor (Track Profile / Track LLM / Track Human)."
+description: "Template feature spec for Patron Walkaway Predictor (bet/run/trip/player layered methods)."
 
 # ---------------------------------------------------------------------------
-# Layered framework — contract authority (implementation still uses track_* blocks).
+# Layered framework — contract authority (layer-only sections).
 # ---------------------------------------------------------------------------
 layered_framework:
   status: "phase_a_skeleton"
   authoritative: true
   notes: >
     Layered semantics are authoritative for naming, PIT, and layer ownership.
-    track_llm / track_human / track_profile sections remain the implementation partition
-    inside this dev catalog until compute paths are fully migrated to layered-only YAML.
+    Legacy track_* sections are removed; this spec is layer/method only.
 
   layers:
     bet:
@@ -72,10 +71,7 @@ layered_framework:
       so the current loader is not broken; downstream removal happens in later phases.
 
   legacy_tracks:
-    status: "reference_only_after_cutover"
-    track_llm: "to be split across bet / run / trip layers"
-    track_human: "to be split across run / trip / player layers"
-    track_profile: "maps to player layer"
+    status: "removed"
 
   # PR-A3 chunk-risk near-equivalents (was standalone mapping YAML). Loader: get_chunk_replacements().
   chunk_dependent_replacements:
@@ -158,9 +154,10 @@ layered_framework:
 
 tracks_enabled:
   # Unified pipeline: wave2 / bridge columns on bets + sessions; no legacy player_profile ETL.
-  track_profile: false
-  track_llm: true
-  track_human: true
+  player_snapshot_asset: false
+  bet_duckdb_window: true
+  run_state_machine: true
+  trip_asset_materialized: true
 
 execution:
   engine: "duckdb"
@@ -170,7 +167,7 @@ execution:
   timezone_policy: "hk_local_tz_naive"
 
 inference_state:
-  history_window_min: 20          # >= track_llm.guardrails.max_window_minutes + buffer (no minute RANGE windows)
+  history_window_min: 20          # >= bet_duckdb_window.guardrails.max_window_minutes + buffer (no minute RANGE windows)
   history_buffer_min: 15
   cold_start_backfill: true
   cold_start_suspend_alerts: true
@@ -180,7 +177,7 @@ guardrails:
   allowed_aggregate_functions: ["COUNT", "SUM", "AVG", "MIN", "MAX", "STDDEV_SAMP"]
   allowed_window_functions: ["LAG"]
   allowed_scalar_functions: ["EPOCH", "OVER", "LEAST", "GREATEST"]
-  track_llm_allowed_columns:
+  bet_duckdb_window_allowed_columns:
     - bet_id
     - canonical_id
     - payout_complete_dtm
@@ -193,7 +190,7 @@ guardrails:
     - table_id
     - game_id
 
-track_llm:
+bet_duckdb_window:
   name: "Track LLM"
   source_table: "t_bet"
   data_scope: "bet_only"
@@ -566,7 +563,7 @@ track_llm:
   active:
     feature_ids: []   # 由訓練流程產生的生產特徵清單寫入
 
-track_human:
+run_state_machine:
   name: "Track Human"
   enabled: true
 
@@ -709,7 +706,7 @@ track_human:
   active:
     feature_ids: []
 
-track_profile:
+player_snapshot_asset:
   name: "Track Profile"
   enabled: false
 

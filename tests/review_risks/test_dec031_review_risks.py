@@ -119,9 +119,9 @@ class TestDec031Risk06ScorerBacktesterDegradePaths(unittest.TestCase):
         self.assertIn("try:", window)
         self.assertRegex(window, r"except\s+Exception")
 
-    def test_backtester_sets_track_llm_degraded_on_failure(self):
+    def test_backtester_sets_bet_duckdb_window_degraded_on_failure(self):
         src = _read_top_level_function("trainer/training/backtester.py", "backtest")
-        self.assertIn("_track_llm_degraded = True", src)
+        self.assertIn("_bet_duckdb_window_degraded = True", src)
         self.assertIn("except Exception as exc:", src)
 
 
@@ -141,7 +141,7 @@ class TestDec031Risk08ComputeEarlyExitNoCandidates(unittest.TestCase):
     """與 Review #7 相關：spec 無 candidates 時 compute 早退仍會被 process_chunk 呼叫。"""
 
     def test_compute_warns_when_track_llm_has_no_candidates(self):
-        src = _read_top_level_function("trainer/features/features.py", "compute_track_llm_features")
+        src = _read_top_level_function("trainer/features/features.py", "compute_bet_duckdb_window_features")
         self.assertIn(
             "track_llm has no candidates",
             src,

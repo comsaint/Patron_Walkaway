@@ -53,7 +53,7 @@ FEATURES = _import_features()
 compute_loss_streak = FEATURES.compute_loss_streak
 compute_run_boundary = FEATURES.compute_run_boundary
 compute_table_hc = FEATURES.compute_table_hc
-compute_track_llm_features = FEATURES.compute_track_llm_features
+compute_bet_duckdb_window_features = FEATURES.compute_bet_duckdb_window_features
 
 try:
     from trainer.config import (
@@ -371,7 +371,7 @@ class TestComputeTableHc(unittest.TestCase):
 
 
 class TestComputeTrackLlmFeatures(unittest.TestCase):
-    """compute_track_llm_features — DuckDB-based Track LLM feature computation."""
+    """compute_bet_duckdb_window_features — DuckDB-based bet feature computation."""
 
     _BASE = datetime(2026, 3, 1)
 
@@ -394,7 +394,7 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
         return {
             "version": "2.0",
             "spec_id": "test",
-            "track_llm": {"candidates": candidates},
+            "bet_duckdb_window": {"candidates": candidates},
         }
 
     def test_run_partition_cumulative_window_basic(self):
@@ -425,7 +425,7 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
                 "postprocess": {"fill": {"strategy": "zero"}},
             },
         ])
-        result = compute_track_llm_features(bets, spec)
+        result = compute_bet_duckdb_window_features(bets, spec)
         self.assertIn("win_rate_currentrun", result.columns)
         self.assertEqual(
             result["win_rate_currentrun"].dtype,
@@ -444,7 +444,7 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
             "expression": "LAG(wager, 1)",
             "postprocess": {"fill": {"strategy": "zero"}},
         }])
-        result = compute_track_llm_features(bets, spec)
+        result = compute_bet_duckdb_window_features(bets, spec)
         self.assertIn("prev_wager", result.columns)
         # First bet: LAG = NULL → filled to 0
         self.assertEqual(float(result.iloc[0]["prev_wager"]), 0.0)
@@ -462,14 +462,14 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
             "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
             "postprocess": {"fill": {"strategy": "zero"}},
         }])
-        result = compute_track_llm_features(bets, spec, cutoff_time=cutoff)
+        result = compute_bet_duckdb_window_features(bets, spec, cutoff_time=cutoff)
         # Only bets at t=0 and t=10 should appear (t=20 dropped)
         self.assertEqual(len(result), 2)
 
     def test_empty_candidates_returns_copy(self):
         bets = self._make_bets([0, 5])
         spec = self._minimal_spec([])
-        result = compute_track_llm_features(bets, spec)
+        result = compute_bet_duckdb_window_features(bets, spec)
         # Should return a copy of the original bets unchanged
         self.assertEqual(len(result), len(bets))
 
@@ -486,7 +486,7 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
                 "clip": {"min": 0.0, "max": 500.0},
             },
         }])
-        result = compute_track_llm_features(bets, spec)
+        result = compute_bet_duckdb_window_features(bets, spec)
         self.assertLessEqual(float(result.iloc[0]["wager_clipped"]), 500.0)
 
     def test_original_columns_preserved(self):
@@ -499,7 +499,7 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
             "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
             "postprocess": {"fill": {"strategy": "zero"}},
         }])
-        result = compute_track_llm_features(bets, spec)
+        result = compute_bet_duckdb_window_features(bets, spec)
         for col in ["canonical_id", "bet_id", "payout_complete_dtm", "wager", "status"]:
             self.assertIn(col, result.columns, f"Missing original column: {col}")
 
@@ -524,7 +524,7 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
             "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
             "postprocess": {"fill": {"strategy": "zero"}},
         }])
-        result = compute_track_llm_features(bets, spec)
+        result = compute_bet_duckdb_window_features(bets, spec)
         c1_counts = [int(x) for x in result.loc[result["canonical_id"] == "c1", "cum_cnt"]]
         c2_counts = [int(x) for x in result.loc[result["canonical_id"] == "c2", "cum_cnt"]]
         self.assertEqual(c1_counts, [1, 2], "c1 cumulative counts should be [1, 2]")
@@ -548,7 +548,7 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
                 "depends_on": ["base_cnt"],
             },
         ])
-        result = compute_track_llm_features(bets, spec)
+        result = compute_bet_duckdb_window_features(bets, spec)
         self.assertIn("derived_a", result.columns)
         # Second bet: base_cnt=2, derived_a=0.2
         self.assertAlmostEqual(float(result.iloc[1]["derived_a"]), 0.2)
@@ -568,7 +568,7 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
             "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
             "postprocess": {"fill": {"strategy": "zero"}},
         }])
-        result = compute_track_llm_features(bets, spec)
+        result = compute_bet_duckdb_window_features(bets, spec)
         self.assertEqual(len(result), 0)
         self.assertIn("cnt", result.columns)
         self.assertEqual(
@@ -579,7 +579,7 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
 
     def test_windowish_candidates_split_into_batches_of_eight(self):
         """Track LLM batches at most eight window-ish features per DuckDB SELECT."""
-        from trainer.features.features import _llm_build_track_llm_batches
+        from trainer.features.features import _llm_build_bet_duckdb_window_batches
 
         cands = [
             {
@@ -591,7 +591,7 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
             }
             for i in range(9)
         ]
-        batches = _llm_build_track_llm_batches(cands)
+        batches = _llm_build_bet_duckdb_window_batches(cands)
         self.assertEqual(len(batches), 2)
         self.assertEqual(len(batches[0]), 8)
         self.assertEqual(len(batches[1]), 1)
@@ -620,7 +620,7 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
             return real_run(df, sql, policy)
 
         with patch.object(fimpl, "_llm_run_duckdb_batch_query", side_effect=_flaky):
-            result = compute_track_llm_features(bets, spec)
+            result = compute_bet_duckdb_window_features(bets, spec)
 
         self.assertEqual(len(calls), 2)
         self.assertIn("cum_cnt", result.columns)

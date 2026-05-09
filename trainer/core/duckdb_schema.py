@@ -44,7 +44,7 @@ def prepare_bets_for_duckdb(bets_df):
     """Cast monetary columns of *bets_df* to float64 in-place and return it.
 
     Mutates the caller's DataFrame directly to avoid an extra full copy; the
-    caller in ``compute_track_llm_features`` already works on a local view so
+    caller in ``compute_bet_duckdb_window_features`` already works on a local view so
     mutation is safe.
 
     Use this before duckdb.register("bets", df) so that window expressions

@@ -88,6 +88,7 @@ def test_load_dual_artifacts_handles_missing_reason_code_map(
 
     (tmp_path / "feature_list.json").write_text("[]", encoding="utf-8")
     (tmp_path / "model_version").write_text("v_phase_e_test", encoding="utf-8")
+    (tmp_path / "feature_spec.yaml").write_text("bet_duckdb_window: {}\n", encoding="utf-8")
 
     joblib.dump(
         {
@@ -131,7 +132,7 @@ def test_copy_model_bundle_succeeds_without_reason_code_map(
     src.mkdir()
     (src / "model.pkl").write_bytes(b"\x80\x04N.")  # minimal bytes; not loaded here
     (src / "feature_list.json").write_text("[]", encoding="utf-8")
-    (src / "feature_spec.yaml").write_text("track_llm: {}\n", encoding="utf-8")
+    (src / "feature_spec.yaml").write_text("bet_duckdb_window: {}\n", encoding="utf-8")
     (src / "model_version").write_text("v", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING, logger=bdp.logger.name):

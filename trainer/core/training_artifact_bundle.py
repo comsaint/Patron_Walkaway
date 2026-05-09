@@ -198,9 +198,9 @@ def save_artifact_bundle(
         )
         os.replace(_tmp, _pkl_path)
 
-    _profile_set = set(get_candidate_feature_ids(feature_spec, "track_profile", screening_only=False)) if feature_spec else set(PROFILE_FEATURE_COLS)
-    _llm_set = set(get_candidate_feature_ids(feature_spec, "track_llm", screening_only=False)) if feature_spec else set()
-    _human_set = set(get_candidate_feature_ids(feature_spec, "track_human", screening_only=False)) if feature_spec else set()
+    _profile_set = set(get_candidate_feature_ids(feature_spec, "player_run_asset", screening_only=False)) if feature_spec else set(PROFILE_FEATURE_COLS)
+    _llm_set = set(get_candidate_feature_ids(feature_spec, "bet_duckdb_window", screening_only=False)) if feature_spec else set()
+    _human_set = set(get_candidate_feature_ids(feature_spec, "run_state_machine", screening_only=False)) if feature_spec else set()
 
     # ``name`` == training DataFrame column; layered metadata lives on candidates
     # in ``feature_candidates.yaml`` (``target_layer``) — not duplicated in bundle.
@@ -208,7 +208,7 @@ def save_artifact_bundle(
         {
             "name": c,
             "track": (
-                "player_profile_snapshot" if c in _profile_set
+                "player_run_asset" if c in _profile_set
                 else "run_state_machine" if c in _human_set
                 else "bet_duckdb_window"
             ),
@@ -228,7 +228,7 @@ def save_artifact_bundle(
     _reason_codes_enabled_for_bundle = bool(rated.get("reason_codes_enabled", True)) if rated else False
     reason_code_map: dict[str, str] = {}
     if _reason_codes_enabled_for_bundle and feature_spec is not None:
-        for track in ("bet_duckdb_window", "run_state_machine", "player_profile_snapshot"):
+        for track in ("bet_duckdb_window", "run_state_machine", "player_run_asset"):
             for c in resolve_spec_track_section(feature_spec, track).get("candidates", []):
                 fid = c.get("feature_id")
                 rcode = c.get("reason_code_category")
@@ -349,8 +349,8 @@ def _write_pipeline_diagnostics_json(
     duckdb_runtime_step7_threads: Optional[int] = None,
     duckdb_runtime_screening_memory_gb: Optional[float] = None,
     duckdb_runtime_screening_threads: Optional[int] = None,
-    duckdb_runtime_track_llm_memory_gb: Optional[float] = None,
-    duckdb_runtime_track_llm_threads: Optional[int] = None,
+    duckdb_runtime_bet_duckdb_window_memory_gb: Optional[float] = None,
+    duckdb_runtime_bet_duckdb_window_threads: Optional[int] = None,
     chunk_cache_stats: Optional[Dict[str, int]] = None,
     issue16_audit: Optional[Mapping[str, Any]] = None,
     oom_estimate_strategy: Optional[str] = None,
@@ -414,11 +414,8 @@ def _write_pipeline_diagnostics_json(
         "duckdb_runtime_step7_threads": duckdb_runtime_step7_threads,
         "duckdb_runtime_screening_memory_gb": duckdb_runtime_screening_memory_gb,
         "duckdb_runtime_screening_threads": duckdb_runtime_screening_threads,
-        "duckdb_runtime_track_llm_memory_gb": duckdb_runtime_track_llm_memory_gb,
-        "duckdb_runtime_track_llm_threads": duckdb_runtime_track_llm_threads,
-        # Canonical naming (dual-emit; legacy keys above retained for dashboards).
-        "duckdb_runtime_bet_duckdb_window_memory_gb": duckdb_runtime_track_llm_memory_gb,
-        "duckdb_runtime_bet_duckdb_window_threads": duckdb_runtime_track_llm_threads,
+        "duckdb_runtime_bet_duckdb_window_memory_gb": duckdb_runtime_bet_duckdb_window_memory_gb,
+        "duckdb_runtime_bet_duckdb_window_threads": duckdb_runtime_bet_duckdb_window_threads,
     }
     out = {k: v for k, v in payload.items() if v is not None}
     if chunk_cache_stats:

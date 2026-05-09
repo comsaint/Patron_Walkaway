@@ -35,9 +35,9 @@ class TestR3500TrackLlmHistoryParity(unittest.TestCase):
 
     def test_process_chunk_should_compute_track_llm_before_compute_labels(self):
         src = inspect.getsource(trainer_mod.process_chunk)
-        idx_llm = src.find("compute_track_llm_features(")
+        idx_llm = src.find("compute_bet_duckdb_window_features(")
         idx_labels = src.find("compute_labels(")
-        self.assertNotEqual(idx_llm, -1, "process_chunk should call compute_track_llm_features.")
+        self.assertNotEqual(idx_llm, -1, "process_chunk should call compute_bet_duckdb_window_features.")
         self.assertNotEqual(idx_labels, -1, "process_chunk should call compute_labels.")
         self.assertLess(
             idx_llm,
@@ -182,7 +182,7 @@ class TestR3507ScorerLoadsFrozenArtifactSpec(unittest.TestCase):
 class TestR3508TrackLlmCutoffBehaviorMre(unittest.TestCase):
     """R3508: minimal repro that current cutoff can drop rows near scorer now_hk."""
 
-    def test_compute_track_llm_features_should_not_drop_rows_just_after_cutoff(self):
+    def test_compute_bet_duckdb_window_features_should_not_drop_rows_just_after_cutoff(self):
         now_utc = datetime.now(timezone.utc).replace(microsecond=0)
         bets_df = pd.DataFrame(
             {
@@ -205,7 +205,7 @@ class TestR3508TrackLlmCutoffBehaviorMre(unittest.TestCase):
                 ]
             }
         }
-        out = features_mod.compute_track_llm_features(
+        out = features_mod.compute_bet_duckdb_window_features(
             bets_df,
             feature_spec=feature_spec,
             cutoff_time=now_utc,

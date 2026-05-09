@@ -31,19 +31,19 @@ def _write_two_day_t_bet_fixture(path: Path) -> None:
             f"""
             COPY (
               SELECT * FROM (VALUES
-                (1::BIGINT, 100::BIGINT, DATE '{_D1}',
+                (1::BIGINT, 100::BIGINT, 'canon_100'::VARCHAR, DATE '{_D1}',
                  TIMESTAMP '{_D1} 10:00:00', TIMESTAMP '{_D1} 11:00:00',
                  0::INTEGER, 0::INTEGER, 0::INTEGER),
-                (2::BIGINT, 100::BIGINT, DATE '{_D1}',
+                (2::BIGINT, 100::BIGINT, 'canon_100'::VARCHAR, DATE '{_D1}',
                  TIMESTAMP '{_D1} 10:15:00', TIMESTAMP '{_D1} 11:15:00',
                  0::INTEGER, 0::INTEGER, 0::INTEGER),
-                (3::BIGINT, 100::BIGINT, DATE '{_D2}',
+                (3::BIGINT, 100::BIGINT, 'canon_100'::VARCHAR, DATE '{_D2}',
                  TIMESTAMP '{_D2} 09:00:00', TIMESTAMP '{_D2} 10:00:00',
                  0::INTEGER, 0::INTEGER, 0::INTEGER),
-                (4::BIGINT, 100::BIGINT, DATE '{_D2}',
+                (4::BIGINT, 100::BIGINT, 'canon_100'::VARCHAR, DATE '{_D2}',
                  TIMESTAMP '{_D2} 09:30:00', TIMESTAMP '{_D2} 10:30:00',
                  0::INTEGER, 0::INTEGER, 0::INTEGER)
-              ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm,
+              ) AS t(bet_id, player_id, canonical_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm,
                      is_deleted, is_canceled, is_manual)
             ) TO '{path.as_posix()}' (FORMAT PARQUET)
             """

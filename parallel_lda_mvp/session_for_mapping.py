@@ -346,7 +346,7 @@ def _materialize_session_with_synthetic_observed(
     print(
         "[parallel_lda_mvp] session_for_mapping: L0 column check OK; "
         f"materializing cleaned parquet (raw_bytes={raw_sz:,}, cap_sec={cap_sec}, "
-        f"out={output_parquet.name}) …",
+        f"out={output_parquet.name}) ...",
         flush=True,
     )
 
@@ -359,8 +359,8 @@ def _materialize_session_with_synthetic_observed(
         to_sql = str(tmp.resolve()).replace("\\", "/").replace("'", "''")
         print(
             "[parallel_lda_mvp] session_for_mapping: DuckDB COPY (full scan + rewrite) "
-            f"-> {tmp.name} — can take minutes on large t_session; started at "
-            f"{time.strftime('%H:%M:%S')} …",
+            f"-> {tmp.name} - can take minutes on large t_session; started at "
+            f"{time.strftime('%H:%M:%S')} ...",
             flush=True,
         )
         t_copy = time.perf_counter()
@@ -407,7 +407,7 @@ def _ensure_session_materialized_with_registry(p: Path, reg_path: Path) -> Path:
         return out_p
 
     print(
-        "[parallel_lda_mvp] session_for_mapping: cache miss — "
+        "[parallel_lda_mvp] session_for_mapping: cache miss - "
         f"materializing {out_name} (registry + raw changed or first run)",
         flush=True,
     )

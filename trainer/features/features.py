@@ -173,14 +173,14 @@ except FileNotFoundError:
 
 PROFILE_FEATURE_COLS: List[str] = [
     c["feature_id"]
-    for c in _TEMPLATE_SPEC.get("track_profile", {}).get("candidates", [])
+    for c in _TEMPLATE_SPEC.get("player_run_asset", {}).get("candidates", [])
     if c.get("feature_id")
 ]
 
 # Minimum lookback (days) required to compute each profile feature.
 _PROFILE_FEATURE_MIN_DAYS: dict = {
     c["feature_id"]: c.get("min_lookback_days", 365)
-    for c in _TEMPLATE_SPEC.get("track_profile", {}).get("candidates", [])
+    for c in _TEMPLATE_SPEC.get("player_run_asset", {}).get("candidates", [])
     if c.get("feature_id")
 }
 
@@ -252,7 +252,10 @@ def _is_screening_ineligible(val) -> bool:
 
 def _track_section_enabled_in_spec(spec: dict, track: str) -> bool:
     """Return False when YAML disables this track (``enabled`` or ``tracks_enabled``)."""
-    track = FEATURE_SPEC_TRACK_PARAM_ALIASES.get(track, track)
+    if track not in _CANONICAL_FEATURE_METHOD_KEYS:
+        raise ValueError(
+            f"Unknown feature method section {track!r}. Allowed: {_CANONICAL_FEATURE_METHOD_KEYS}."
+        )
     sec = spec.get(track)
     if isinstance(sec, dict):
         ev = sec.get("enabled", True)
@@ -263,17 +266,8 @@ def _track_section_enabled_in_spec(spec: dict, track: str) -> bool:
     te = spec.get("tracks_enabled")
     if not isinstance(te, dict):
         return True
-    off_pairs = {
-        "track_llm": ("track_llm", "bet_duckdb_window"),
-        "track_human": ("track_human", "run_state_machine"),
-        "track_profile": ("track_profile", "player_profile_snapshot"),
-    }
-    keys = off_pairs.get(track)
-    if keys is None:
-        return True
-    for k in keys:
-        if te.get(k) is False:
-            return False
+    if te.get(track) is False:
+        return False
     return True
 
 
@@ -284,17 +278,18 @@ def get_candidate_feature_ids(
 ) -> List[str]:
     """從 YAML spec 讀取某一軌的 candidate feature_id 列表。
 
-    track 接受 legacy 名稱 ``track_llm`` / ``track_human`` / ``track_profile``，
-    或 layer+method 別名 ``bet_duckdb_window`` / ``run_state_machine`` /
-    ``player_profile_snapshot``（與 legacy 區塊互為鏡像，見
-    ``feature_spec_layer_aliases.mirror_layer_method_track_keys_inplace``）。
+    ``track`` 只接受 layer+method section 名稱（例如
+    ``bet_duckdb_window`` / ``run_state_machine`` / ``player_run_asset``）。
     screening_only=True 時排除 dtype='str' 或 screening_eligible 為 false/0/"false"
     的候選（中間變數不參與篩選）。
 
-    當 ``tracks_enabled`` 或該軌 ``enabled: false`` 關閉此軌時，回傳空列表（unified
-    管線可不依賴 legacy ``player_profile`` parquet）。
+    當 ``tracks_enabled`` 或該 section ``enabled: false`` 關閉時，回傳空列表。
     """
-    track = FEATURE_SPEC_TRACK_PARAM_ALIASES.get(track, track)
+    if track not in _CANONICAL_FEATURE_METHOD_KEYS:
+        raise ValueError(
+            f"Unsupported feature method section {track!r}. "
+            f"Allowed: {_CANONICAL_FEATURE_METHOD_KEYS}."
+        )
     if not _track_section_enabled_in_spec(spec, track):
         return []
     # R404 Review #4: candidates may be non-list (e.g. dict); treat as no candidates.
@@ -320,19 +315,21 @@ def get_all_candidate_feature_ids(
     spec: dict,
     screening_only: bool = False,
 ) -> List[str]:
-    """三軌候選 feature_id 合併去重（order: track_llm, track_human, track_profile）。"""
-    ids_llm = get_candidate_feature_ids(spec, "track_llm", screening_only)
-    ids_human = get_candidate_feature_ids(spec, "track_human", screening_only)
-    ids_profile = get_candidate_feature_ids(spec, "track_profile", screening_only)
-    return list(dict.fromkeys(ids_llm + ids_human + ids_profile))
+    """候選 feature_id 合併去重（order: bet/run/player/trip method sections）。"""
+    ids_bet = get_candidate_feature_ids(spec, "bet_duckdb_window", screening_only)
+    ids_run = get_candidate_feature_ids(spec, "run_state_machine", screening_only)
+    ids_player = get_candidate_feature_ids(spec, "player_run_asset", screening_only)
+    ids_trip = get_candidate_feature_ids(spec, "trip_asset_materialized", screening_only)
+    return list(dict.fromkeys(ids_bet + ids_run + ids_player + ids_trip))
 
 
 def _feature_layer_index_from_spec(spec: dict) -> Dict[str, str]:
-    """Build ``feature_id -> layer`` index from spec tracks."""
+    """Build ``feature_id -> layer`` index from canonical method sections."""
     track_to_layer = {
-        "track_llm": "bet",
-        "track_human": "run",
-        "track_profile": "player",
+        "bet_duckdb_window": "bet",
+        "run_state_machine": "run",
+        "player_run_asset": "player",
+        "trip_asset_materialized": "trip",
     }
     out: Dict[str, str] = {}
     for track, layer in track_to_layer.items():
@@ -355,12 +352,12 @@ def get_cross_layer_compose_contract(spec: Optional[dict]) -> Dict[str, dict]:
     _canon_tracks = (
         "bet_duckdb_window",
         "run_state_machine",
-        "player_profile_snapshot",
+        "player_run_asset",
     )
     _canon_to_layer = {
         "bet_duckdb_window": "bet",
         "run_state_machine": "run",
-        "player_profile_snapshot": "player",
+        "player_run_asset": "player",
     }
     for track in _canon_tracks:
         cands = (resolve_spec_track_section(spec, track).get("candidates") or [])
@@ -395,11 +392,11 @@ def get_cross_layer_compose_contract(spec: Optional[dict]) -> Dict[str, dict]:
 
 
 def get_profile_min_lookback(spec: dict) -> dict:
-    """從 track_profile.candidates 讀取 { feature_id: min_lookback_days }。
+    """從 player_run_asset.candidates 讀取 { feature_id: min_lookback_days }。
 
     若候選無 min_lookback_days 則預設 365。
     """
-    candidates = (resolve_spec_track_section(spec, "player_profile_snapshot").get("candidates") or [])
+    candidates = (resolve_spec_track_section(spec, "player_run_asset").get("candidates") or [])
     return {
         c["feature_id"]: c.get("min_lookback_days", 365)
         for c in candidates
@@ -416,25 +413,30 @@ def get_profile_min_lookback(spec: dict) -> dict:
 
 LAYER_NAMES: tuple = ("bet", "run", "trip", "player")
 
-# Layer+method YAML / API aliases ↔ legacy ``track_*`` keys (see feature_spec_layer_aliases).
-FEATURE_SPEC_TRACK_PARAM_ALIASES: dict[str, str] = {
-    "bet_duckdb_window": "track_llm",
-    "run_state_machine": "track_human",
-    "player_profile_snapshot": "track_profile",
-}
+_CANONICAL_FEATURE_METHOD_KEYS: tuple[str, ...] = (
+    "bet_duckdb_window",
+    "run_state_machine",
+    "player_run_asset",
+    "trip_asset_materialized",
+)
+
+_LEGACY_TRACK_KEYS: tuple[str, ...] = (
+    "track_llm",
+    "track_human",
+    "track_profile",
+)
 
 
 def resolve_spec_track_section(spec: dict, canonical_key: str) -> dict:
-    """Return a track YAML section, preferring the canonical layer+method key.
-
-    Frozen bundles may omit legacy ``track_*`` keys; specs from
-    :func:`load_feature_spec` mirror both sides in memory.
-    """
-    _legacy = FEATURE_SPEC_TRACK_PARAM_ALIASES.get(canonical_key, canonical_key)
-    for _k in (canonical_key, _legacy):
-        _blob = spec.get(_k)
-        if isinstance(_blob, dict):
-            return _blob
+    """Return one canonical feature-method section from the loaded spec."""
+    if canonical_key not in _CANONICAL_FEATURE_METHOD_KEYS:
+        raise ValueError(
+            f"Unsupported feature method section {canonical_key!r}. "
+            f"Allowed: {_CANONICAL_FEATURE_METHOD_KEYS}."
+        )
+    _blob = spec.get(canonical_key)
+    if isinstance(_blob, dict):
+        return _blob
     return {}
 
 
@@ -450,7 +452,7 @@ _TRACK_TO_LAYER_MAPPING_CACHE: Optional[dict] = None
 def mapping_dict_from_layering_spec(spec: dict) -> dict:
     """Build mapping-shaped dict from a loaded feature spec (single-file SSOT)."""
     legacy_features: List[dict] = []
-    for track in ("track_llm", "track_human", "track_profile"):
+    for track in ("bet_duckdb_window", "run_state_machine", "player_run_asset", "trip_asset_materialized"):
         track_blob = spec.get(track) if isinstance(spec.get(track), dict) else {}
         for c in track_blob.get("candidates") or []:
             if not isinstance(c, dict):
@@ -560,8 +562,7 @@ def get_legacy_to_layered_map(mapping: Optional[dict] = None) -> dict:
 def get_layered_to_legacy_map(mapping: Optional[dict] = None) -> dict:
     """Return ``{new_feature_id: [old_feature_id, ...]}``.
 
-    Multiple legacy ids may collapse onto the same layered id (e.g. several
-    ``track_human`` features that became ``run__bets_cnt__currentrun``).
+    Multiple legacy ids may collapse onto the same layered id.
     """
     out: dict = {}
     for e in _iter_legacy_entries(mapping):
@@ -1047,7 +1048,7 @@ def add_wave2_personalized_baselines(
         return pd.Series(default, index=out.index, dtype="float64")
 
     minutes_since = _num_series("minutes_since_run_start", 0.0).fillna(0.0)
-    avg_session_duration = _num_series("avg_session_duration_min_30d", np.nan)
+    avg_session_duration = _num_series("player_run_avg_duration_min_30d", np.nan)
     out["run_duration_vs_personal_avg"] = np.where(
         avg_session_duration > 0,
         minutes_since / avg_session_duration,
@@ -1055,8 +1056,8 @@ def add_wave2_personalized_baselines(
     )
 
     bets_in_run = _num_series("bets_in_run_so_far", 0.0).fillna(0.0)
-    num_bets_30d = _num_series("num_bets_sum_30d", np.nan)
-    sessions_30d = _num_series("sessions_30d", np.nan)
+    num_bets_30d = _num_series("player_run_num_bets_sum_30d", np.nan)
+    sessions_30d = _num_series("player_run_count_30d", np.nan)
     personal_bets_per_session = np.where(
         sessions_30d > 0,
         num_bets_30d / sessions_30d,
@@ -2177,9 +2178,10 @@ _RANGE_SORT_COL = "_range_sort_key"
 
 # Legacy YAML track sections ↔ canonical layer+method keys (Issue #16 / DEC-024 bundle).
 _TRACK_SECTION_PAIRS_LEGACY_CANON: tuple[tuple[str, str], ...] = (
-    ("track_llm", "bet_duckdb_window"),
-    ("track_human", "run_state_machine"),
-    ("track_profile", "player_profile_snapshot"),
+    ("bet_duckdb_window", "bet_duckdb_window"),
+    ("run_state_machine", "run_state_machine"),
+    ("player_run_asset", "player_run_asset"),
+    ("trip_asset_materialized", "trip_asset_materialized"),
 )
 
 
@@ -2195,17 +2197,15 @@ def build_runtime_feature_spec_subset(full_spec: dict, feature_cols: Sequence[st
     if not isinstance(full_spec, dict):
         return {}
     by_fid: dict[str, tuple[str, dict]] = {}
-    for _leg, _neu in _TRACK_SECTION_PAIRS_LEGACY_CANON:
-        # Prefer canonical-side candidates when both exist (order stable for duplicates).
-        for _key in (_neu, _leg):
-            _blob = full_spec.get(_key) or {}
-            if not isinstance(_blob, dict):
-                continue
-            _raw_cands = _blob.get("candidates")
-            _cands = _raw_cands if isinstance(_raw_cands, list) else []
-            for _c in _cands:
-                if isinstance(_c, dict) and _c.get("feature_id"):
-                    by_fid[str(_c["feature_id"])] = (_key, _c)
+    for _key in _CANONICAL_FEATURE_METHOD_KEYS:
+        _blob = full_spec.get(_key) or {}
+        if not isinstance(_blob, dict):
+            continue
+        _raw_cands = _blob.get("candidates")
+        _cands = _raw_cands if isinstance(_raw_cands, list) else []
+        for _c in _cands:
+            if isinstance(_c, dict) and _c.get("feature_id"):
+                by_fid[str(_c["feature_id"])] = (_key, _c)
     needed: set[str] = {str(x) for x in feature_cols if x}
     changed = True
     while changed:
@@ -2227,17 +2227,9 @@ def build_runtime_feature_spec_subset(full_spec: dict, feature_cols: Sequence[st
     lf = out.get("layered_framework")
     if isinstance(lf, dict):
         lf["authoritative"] = True
-    # Emit **canonical** track sections only (bet_duckdb_window / run_state_machine /
-    # player_profile_snapshot).  Dropping legacy + duplicate alias blocks avoids
-    # ``mirror_layer_method_track_keys_inplace`` detecting mismatched candidate sets
-    # when reloading the frozen bundle (Step 10 save_artifact_bundle).
-    for _leg, _neu in _TRACK_SECTION_PAIRS_LEGACY_CANON:
-        _src_key = (
-            _neu
-            if (out.get(_neu) or {}).get("candidates")
-            else _leg
-        )
-        _src = out.get(_src_key)
+    # Emit canonical method sections only.
+    for _key in _CANONICAL_FEATURE_METHOD_KEYS:
+        _src = out.get(_key)
         if not isinstance(_src, dict):
             continue
         _raw_cands = _src.get("candidates")
@@ -2257,17 +2249,14 @@ def build_runtime_feature_spec_subset(full_spec: dict, feature_cols: Sequence[st
                 or not _c.get("feature_id")
             )
         ]
-        out[_neu] = {**_src, "candidates": _trimmed}
-        out.pop(_leg, None)
-    _known_te = {k for pair in _TRACK_SECTION_PAIRS_LEGACY_CANON for k in pair}
+        out[_key] = {**_src, "candidates": _trimmed}
+    _known_te = set(_CANONICAL_FEATURE_METHOD_KEYS)
     _te_raw = out.get("tracks_enabled")
     if isinstance(_te_raw, dict):
         _te_new: dict = {}
-        for _leg, _neu in _TRACK_SECTION_PAIRS_LEGACY_CANON:
-            if _neu in _te_raw:
-                _te_new[_neu] = _te_raw[_neu]
-            elif _leg in _te_raw:
-                _te_new[_neu] = _te_raw[_leg]
+        for _k in _CANONICAL_FEATURE_METHOD_KEYS:
+            if _k in _te_raw:
+                _te_new[_k] = _te_raw[_k]
         for _k, _v in _te_raw.items():
             if _k in _known_te:
                 continue
@@ -2333,9 +2322,17 @@ def load_feature_spec(yaml_path) -> dict:
     with path.open(encoding="utf-8") as fh:
         spec = _yaml.safe_load(fh)
 
-    from trainer.features.feature_spec_layer_aliases import mirror_layer_method_track_keys_inplace
-
-    mirror_layer_method_track_keys_inplace(spec)
+    _legacy_keys = [k for k in _LEGACY_TRACK_KEYS if k in (spec or {})]
+    _te = (spec or {}).get("tracks_enabled")
+    if isinstance(_te, dict):
+        _legacy_keys.extend(k for k in _LEGACY_TRACK_KEYS if k in _te)
+    if _legacy_keys:
+        unique_keys = sorted(set(_legacy_keys))
+        raise ValueError(
+            "Feature spec uses removed legacy track keys "
+            f"{unique_keys}. Use canonical method sections only: "
+            f"{_CANONICAL_FEATURE_METHOD_KEYS}."
+        )
     _validate_feature_spec(spec)
     return spec
 
@@ -2382,7 +2379,7 @@ def _validate_feature_spec(spec: dict) -> None:
     allowed_funcs: set = _DEFAULT_ALLOWED_AGG | _DEFAULT_ALLOWED_WIN | yaml_agg | yaml_win | yaml_scalar
     _FUNC_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
-    for track_key in ("track_llm", "track_human", "track_profile"):
+    for track_key in ("bet_duckdb_window", "run_state_machine", "player_run_asset", "trip_asset_materialized"):
         # R2006: handle ``track_key: null`` in YAML without AttributeError
         track = spec.get(track_key) or {}
         for cand in track.get("candidates", []):
@@ -2398,8 +2395,8 @@ def _validate_feature_spec(spec: dict) -> None:
                     )
                 all_ids.append(fid)
 
-            # Track LLM–specific checks
-            if track_key == "track_llm":
+            # Bet duckdb window–specific checks
+            if track_key == "bet_duckdb_window":
                 expr = cand.get("expression", "")
                 wf = cand.get("window_frame", "")
                 ftype = cand.get("type", "window")
@@ -2407,21 +2404,21 @@ def _validate_feature_spec(spec: dict) -> None:
                 # No FOLLOWING in window_frame
                 if "FOLLOWING" in wf.upper():
                     errors.append(
-                        f"[track_llm] '{fid}': window_frame contains FOLLOWING "
+                        f"[bet_duckdb_window] '{fid}': window_frame contains FOLLOWING "
                         f"(look-ahead leakage risk): {wf!r}"
                     )
 
                 # R2111: no semicolons in window_frame (multi-statement injection vector)
                 if ";" in wf:
                     errors.append(
-                        f"[track_llm] '{fid}': window_frame contains semicolon "
+                        f"[bet_duckdb_window] '{fid}': window_frame contains semicolon "
                         f"(potential SQL injection): {wf!r}"
                     )
 
                 # R2000: no semicolons in expression (multi-statement injection vector)
                 if ";" in expr:
                     errors.append(
-                        f"[track_llm] '{fid}': expression contains semicolon "
+                        f"[bet_duckdb_window] '{fid}': expression contains semicolon "
                         f"(potential SQL injection): {expr!r}"
                     )
 
@@ -2434,7 +2431,7 @@ def _validate_feature_spec(spec: dict) -> None:
                 ]
                 if forbidden:
                     errors.append(
-                        f"[track_llm] '{fid}': expression contains disallowed SQL keyword(s) "
+                        f"[bet_duckdb_window] '{fid}': expression contains disallowed SQL keyword(s) "
                         f"{forbidden}: {expr!r}"
                     )
 
@@ -2450,7 +2447,7 @@ def _validate_feature_spec(spec: dict) -> None:
                     unknown = found_funcs - allowed_funcs
                     if unknown:
                         errors.append(
-                            f"[track_llm] '{fid}': expression uses function(s) not in "
+                            f"[bet_duckdb_window] '{fid}': expression uses function(s) not in "
                             f"allowed_aggregate_functions / allowed_window_functions: "
                             f"{sorted(unknown)} in {expr!r}"
                         )
@@ -2466,7 +2463,7 @@ def _validate_feature_spec(spec: dict) -> None:
                         continue
                     if not isinstance(val, (int, float)):
                         errors.append(
-                            f"[track_llm] '{fid}': postprocess.clip.{bound_key} must be "
+                            f"[bet_duckdb_window] '{fid}': postprocess.clip.{bound_key} must be "
                             f"int or float, got {type(val).__name__}: {val!r}"
                         )
 
@@ -2477,9 +2474,8 @@ def _validate_feature_spec(spec: dict) -> None:
             errors.append(f"Duplicate feature_id: '{fid}'")
         seen.add(fid)
 
-    # ── Circular depends_on check (Track LLM derived features) ─────────────
-    # R2006: use ``or {}`` so a null track_llm section doesn't crash here either.
-    llm_track = spec.get("track_llm") or {}
+    # ── Circular depends_on check (bet_duckdb_window derived features) ─────
+    llm_track = spec.get("bet_duckdb_window") or {}
     dep_map: dict = {}
     for cand in llm_track.get("candidates", []):
         if cand.get("type") == "derived":
@@ -2489,7 +2485,9 @@ def _validate_feature_spec(spec: dict) -> None:
 
     for start in dep_map:
         if _has_cycle(start, dep_map, set()):
-            errors.append(f"[track_llm] Circular depends_on detected starting from '{start}'.")
+            errors.append(
+                f"[bet_duckdb_window] Circular depends_on detected starting from '{start}'."
+            )
 
     if errors:
         raise ValueError("Feature Spec validation failed:\n" + "\n".join(f"  • {e}" for e in errors))
@@ -2534,7 +2532,7 @@ def _topo_sort_candidates(candidates: list) -> list:
 
 # --- Track LLM DuckDB batching + OOM fallback (DEC: compute peak reduction) ---
 # Optional L1 Phase C passthrough source columns (parallel_lda_mvp bridge).  When
-# missing from ``bets_df``, :func:`compute_track_llm_features` zero-fills so CH
+# missing from ``bets_df``, :func:`compute_bet_duckdb_window_features` zero-fills so CH
 # exports keep the same feature spec contract.
 _LDA_OPTIONAL_PASSTHROUGH: frozenset[str] = frozenset(
     {
@@ -2564,7 +2562,7 @@ def _llm_is_windowish_candidate(cand: dict) -> bool:
     return False
 
 
-def _llm_build_track_llm_batches(candidates: list) -> list[list[dict]]:
+def _llm_build_bet_duckdb_window_batches(candidates: list) -> list[list[dict]]:
     """Split topologically sorted candidates into DuckDB batches."""
     out: list[list[dict]] = []
     n = len(candidates)
@@ -2753,7 +2751,7 @@ def _llm_execute_batch_with_recovery(
     except Exception as exc:
         if not _llm_is_duckdb_oom(exc):
             logger.error(
-                "compute_track_llm_features: DuckDB query failed: %s\nSQL:\n%s",
+                "compute_bet_duckdb_window_features: DuckDB query failed: %s\nSQL:\n%s",
                 exc,
                 sql,
             )
@@ -2774,7 +2772,7 @@ def _llm_execute_batch_with_recovery(
     except Exception as exc2:
         if not _llm_is_duckdb_oom(exc2):
             logger.error(
-                "compute_track_llm_features: DuckDB query failed: %s\nSQL:\n%s",
+                "compute_bet_duckdb_window_features: DuckDB query failed: %s\nSQL:\n%s",
                 exc2,
                 sql,
             )
@@ -2830,7 +2828,7 @@ def _llm_execute_batch_with_recovery(
                     last_oom = exc3
                     break
                 logger.error(
-                    "compute_track_llm_features: DuckDB query failed: %s\nSQL:\n%s",
+                    "compute_bet_duckdb_window_features: DuckDB query failed: %s\nSQL:\n%s",
                     exc3,
                     sub_sql,
                 )
@@ -2844,14 +2842,14 @@ def _llm_execute_batch_with_recovery(
     raise RuntimeError(msg) from last_oom
 
 
-def compute_track_llm_features(
+def compute_bet_duckdb_window_features(
     bets_df: pd.DataFrame,
     feature_spec: dict,
     cutoff_time: Optional[datetime] = None,
 ) -> pd.DataFrame:
-    """Compute Track LLM features via DuckDB from a Feature Spec YAML definition.
+    """Compute bet_duckdb_window features via DuckDB from a Feature Spec YAML definition.
 
-    Only features listed under ``track_llm.candidates`` are computed.  Each
+    Only features listed under ``bet_duckdb_window.candidates`` are computed.  Each
     candidate is translated into DuckDB ``SELECT`` expressions (window, derived,
     passthrough) and executed in **batches** against an in-memory table built
     from ``bets_df`` to reduce peak memory.  On DuckDB OOM, the implementation
@@ -2878,7 +2876,7 @@ def compute_track_llm_features(
     -------
     pd.DataFrame
         ``bets_df`` (filtered to ``<= cutoff_time`` if specified) with one new
-        column per Track LLM candidate appended.  The original row count and
+        column per bet_duckdb_window candidate appended.  The original row count and
         order are preserved.
 
     Notes
@@ -2895,12 +2893,11 @@ def compute_track_llm_features(
     except ModuleNotFoundError:
         from duckdb_schema import prepare_bets_for_duckdb  # type: ignore[import-not-found,no-redef]
 
-    # R2006: prefer canonical ``bet_duckdb_window`` (frozen bundles) then legacy ``track_llm``.
     llm_track = resolve_spec_track_section(feature_spec, "bet_duckdb_window")
     candidates = llm_track.get("candidates", [])
     if not candidates:
         logger.warning(
-            "compute_track_llm_features: bet_duckdb_window/track_llm has no candidates — returning bets_df unchanged."
+            "compute_bet_duckdb_window_features: bet_duckdb_window has no candidates — returning bets_df unchanged."
         )
         return bets_df.copy()
 
@@ -2969,7 +2966,7 @@ def compute_track_llm_features(
             type_counts = df_work[col].apply(type).value_counts().to_dict()
             type_counts_str = {k.__name__: int(v) for k, v in type_counts.items()}
             logger.debug(
-                "compute_track_llm_features: %s dtype=%s type_dist=%s",
+                "compute_bet_duckdb_window_features: %s dtype=%s type_dist=%s",
                 col,
                 dtype,
                 type_counts_str,
@@ -2982,7 +2979,7 @@ def compute_track_llm_features(
     except Exception:
         available_bytes = None
 
-    batches = _llm_build_track_llm_batches(candidates)
+    batches = _llm_build_bet_duckdb_window_batches(candidates)
     t_run = time.perf_counter()
     for b_idx, batch in enumerate(batches):
         t0 = time.perf_counter()
@@ -3007,7 +3004,7 @@ def compute_track_llm_features(
         _llm_merge_batch_output_to_working(df_work, out_df, batch, _RANGE_SORT_COL)
         _llm_scatter_batch_to_result(result, out_df, batch)
         logger.debug(
-            "compute_track_llm_features: batch %d/%d  features=%d  rows=%d  "
+            "compute_bet_duckdb_window_features: batch %d/%d  features=%d  rows=%d  "
             "duckdb_mem_limit=%.2fGB threads=%d  (%.1fs)",
             b_idx + 1,
             len(batches),
@@ -3018,14 +3015,10 @@ def compute_track_llm_features(
             time.perf_counter() - t0,
         )
     logger.debug(
-        "compute_track_llm_features: %d features in %d batches for %d bets (total %.1fs)",
+        "compute_bet_duckdb_window_features: %d features in %d batches for %d bets (total %.1fs)",
         len(candidates),
         len(batches),
         len(result),
         time.perf_counter() - t_run,
     )
     return result
-
-
-# Public layer+method alias (same implementation as ``compute_track_llm_features``).
-compute_bet_duckdb_window_features = compute_track_llm_features

@@ -69,7 +69,7 @@ class TestR413TinyRuntimeEvidence(unittest.TestCase):
                 patch.object(trainer_mod, "load_clickhouse_data", return_value=(bets, sessions)),
                 patch.object(trainer_mod, "normalize_bets_sessions", return_value=(bets, sessions)),
                 patch.object(trainer_mod, "apply_dq", return_value=(bets, sessions)),
-                patch.object(trainer_mod, "add_track_human_features", side_effect=_capture_track_human),
+                patch.object(trainer_mod, "add_run_state_machine_features", side_effect=_capture_track_human),
                 patch.object(trainer_mod, "compute_labels", side_effect=_labels_stub),
                 patch.object(trainer_mod, "join_player_profile", side_effect=lambda x, y: x),
             ):

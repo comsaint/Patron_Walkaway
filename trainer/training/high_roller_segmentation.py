@@ -44,6 +44,10 @@ def compute_high_roller_cutoff_from_train_parquet(
     """Return (cutoff, audit) where high segment is rows with COALESCE(theo,0) >= cutoff.
 
     Cutoff is ``quantile_cont(q)`` over rated train rows only (``is_rated`` true).
+
+    The audit dict includes rated-only segment row counts at this cutoff (same
+    definition as downstream ``count_rated_rows_parquet`` on segment Parquets)
+    so callers can detect degenerate quantiles **before** materialising splits.
     """
     import duckdb
 
@@ -56,15 +60,49 @@ def compute_high_roller_cutoff_from_train_parquet(
     col = _duckdb_quote_ident(tc)
     con = duckdb.connect(":memory:")
     try:
-        # DuckDB list aggregate: quantile_cont(q)(expr)
+        # One scan over rated rows: threshold + counts (detect constant / heavy
+        # left-tail skew where q sits on the minimum and the low segment is empty).
         row = con.execute(
             f"""
-            SELECT quantile_cont({q:.12f})(COALESCE(t.{col}, 0.0)) AS thr
-            FROM read_parquet('{tp}') AS t
-            WHERE COALESCE(t.is_rated, false) = true
+            WITH rated AS (
+              SELECT COALESCE(t.{col}, 0.0) AS x
+              FROM read_parquet('{tp}') AS t
+              WHERE COALESCE(t.is_rated, false) = true
+            ),
+            thr_val AS (
+              SELECT quantile_cont(x, {q:.12f}) AS thr FROM rated
+            ),
+            counts AS (
+              SELECT
+                COUNT(*) AS n_rated,
+                COUNT(*) FILTER (WHERE x < (SELECT thr FROM thr_val)) AS n_low,
+                COUNT(*) FILTER (WHERE x >= (SELECT thr FROM thr_val)) AS n_high
+              FROM rated
+            )
+            SELECT thr_val.thr, counts.n_rated, counts.n_low, counts.n_high
+            FROM thr_val CROSS JOIN counts
             """
         ).fetchone()
-        thr = float(row[0]) if row and row[0] is not None else 0.0
+        if not row:
+            raise RuntimeError(
+                "Issue #8 cutoff query returned no row (unexpected); "
+                f"train_parquet={train_parquet_path!s}"
+            )
+        thr_raw, n_rated, n_low, n_high = row[0], int(row[1] or 0), int(row[2] or 0), int(
+            row[3] or 0
+        )
+        if n_rated <= 0:
+            raise RuntimeError(
+                "Issue #8 segmentation cannot proceed: no rated train rows "
+                f"(is_rated=true) in {train_parquet_path!s}."
+            )
+        if thr_raw is None or not math.isfinite(float(thr_raw)):
+            raise RuntimeError(
+                "Issue #8 segmentation cannot proceed: non-finite theo quantile "
+                f"(thr={thr_raw!r}) over {n_rated} rated train rows in "
+                f"{train_parquet_path!s}."
+            )
+        thr = float(thr_raw)
     finally:
         con.close()
 
@@ -73,6 +111,9 @@ def compute_high_roller_cutoff_from_train_parquet(
         "high_roller_theo_feature": tc,
         "high_roller_quantile": q,
         "high_roller_train_parquet": str(train_parquet_path),
+        "high_roller_rated_train_row_count": n_rated,
+        "high_roller_segment_train_rated_rows_low": n_low,
+        "high_roller_segment_train_rated_rows_high": n_high,
     }
     return thr, meta
 
@@ -151,6 +192,38 @@ def parquet_has_column(path: Path, col: str) -> bool:
         return str(col) in pq.read_schema(path).names
     except Exception:
         return False
+
+
+def validate_high_roller_theo_nonempty_on_rated_train(train_parquet_path: Path, theo_col: str) -> None:
+    """Fail-fast when no rated train row carries a non-null theo proxy.
+
+    Issue #8 uses ``HIGH_ROLLER_THEO_FEATURE`` as segmentation proxy; silent NULL-only
+    columns degenerate segmentation downstream — abort early with an actionable error.
+    """
+    tc = validate_theo_feature_name(theo_col)
+    import duckdb
+
+    tp = _duckdb_quote_path(Path(train_parquet_path))
+    col = _duckdb_quote_ident(tc)
+    con = duckdb.connect(":memory:")
+    try:
+        row = con.execute(
+            f"""
+            SELECT COUNT(*) FILTER (
+              WHERE COALESCE(is_rated, false) = true AND {col} IS NOT NULL
+            )
+            FROM read_parquet('{tp}') AS t
+            """
+        ).fetchone()
+        nn = int(row[0] or 0) if row else 0
+        if nn <= 0:
+            raise RuntimeError(
+                f"Issue #8 segmentation requires rated train rows with non-null {tc!r}. "
+                f"(Ensure ``player_run_asset`` materializes this column when HIGH_ROLLER_SEGMENT_ENABLE "
+                f"is True.) Got nn_non_null_rated={nn} in {train_parquet_path}."
+            )
+    finally:
+        con.close()
 
 
 def count_rated_rows_parquet(path: Path) -> int:

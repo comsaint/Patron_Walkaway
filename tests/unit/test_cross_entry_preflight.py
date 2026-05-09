@@ -150,7 +150,7 @@ class TestWS5EntrypointPreflightContract(unittest.TestCase):
     """WS5: source-level guard so trainer/backtester/serving keep calling cross_entry hook."""
 
     def test_trainer_run_pipeline_includes_trainer_entry_preflight(self) -> None:
-        src = _read_repo_text("trainer/training/trainer.py")
+        src = _read_repo_text("trainer/training/pipeline_run_core.py")
         self.assertIn("run_cross_entry_data_preflight", src)
         self.assertIn('entry="trainer"', src)
 

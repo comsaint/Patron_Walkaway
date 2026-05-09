@@ -66,11 +66,11 @@ class TestR402_1_CanonicalIdTypeStringRated(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=canonical_map_str),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
             patch.object(
                 backtester_mod,
-                "compute_track_llm_features",
+                "compute_bet_duckdb_window_features",
                 side_effect=RuntimeError("mock Track LLM failure"),
             ),
             patch.object(backtester_mod, "compute_labels", side_effect=_minimal_compute_labels),
@@ -122,11 +122,11 @@ class TestR402_2_ExcludedLogOnlyWhenUnratedPresent(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=canonical_map_rated),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
             patch.object(
                 backtester_mod,
-                "compute_track_llm_features",
+                "compute_bet_duckdb_window_features",
                 side_effect=RuntimeError("mock Track LLM failure"),
             ),
             patch.object(backtester_mod, "compute_labels", side_effect=_minimal_compute_labels),
@@ -174,11 +174,11 @@ class TestR402_3_NoRatedReturnContract(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=pd.DataFrame()),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
             patch.object(
                 backtester_mod,
-                "compute_track_llm_features",
+                "compute_bet_duckdb_window_features",
                 side_effect=RuntimeError("mock"),
             ),
             patch.object(backtester_mod, "compute_labels", side_effect=_minimal_compute_labels),
@@ -218,9 +218,9 @@ class TestR402_3_NoRatedReturnContract(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=pd.DataFrame()),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
-            patch.object(backtester_mod, "compute_track_llm_features", side_effect=RuntimeError("mock")),
+            patch.object(backtester_mod, "compute_bet_duckdb_window_features", side_effect=RuntimeError("mock")),
             patch.object(backtester_mod, "compute_labels", side_effect=_minimal_compute_labels),
             patch.object(backtester_mod, "load_player_profile", return_value=None),
             patch.object(backtester_mod, "join_player_profile", side_effect=_minimal_join_profile),
@@ -257,9 +257,9 @@ class TestR402_4_UnratedPlayersCountSemantics(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=pd.DataFrame()),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
-            patch.object(backtester_mod, "compute_track_llm_features", side_effect=RuntimeError("mock")),
+            patch.object(backtester_mod, "compute_bet_duckdb_window_features", side_effect=RuntimeError("mock")),
             patch.object(backtester_mod, "compute_labels", side_effect=_minimal_compute_labels),
             patch.object(backtester_mod, "load_player_profile", return_value=None),
             patch.object(backtester_mod, "join_player_profile", side_effect=_minimal_join_profile),

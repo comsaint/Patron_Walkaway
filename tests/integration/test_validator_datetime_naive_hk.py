@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -69,7 +70,8 @@ class TestParseAlertsNaiveBetTsInterpretedAsHK(unittest.TestCase):
         )
         conn.commit()
 
-        df = validator_mod.parse_alerts(conn)
+        with patch.object(config, "VALIDATOR_ALERT_RETENTION_DAYS", None):
+            df = validator_mod.parse_alerts(conn)
         self.assertFalse(df.empty, "parse_alerts should return one row")
         self.assertIn("bet_ts", df.columns)
 
@@ -92,7 +94,8 @@ class TestParseAlertsNaiveBetTsInterpretedAsHK(unittest.TestCase):
         )
         conn.commit()
 
-        df = validator_mod.parse_alerts(conn)
+        with patch.object(config, "VALIDATOR_ALERT_RETENTION_DAYS", None):
+            df = validator_mod.parse_alerts(conn)
         self.assertFalse(df.empty)
         ts = df["ts"].iloc[0]
         ts_hk = ts.astimezone(HK_TZ) if getattr(ts, "tzinfo", None) else pd.Timestamp(ts).tz_localize(HK_TZ)

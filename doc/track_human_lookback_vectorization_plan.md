@@ -51,10 +51,10 @@
 
 | 要點       | 內容                                                                                                                                                                 |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **作法**   | Trainer 呼叫 `add_track_human_features` 時傳 `**lookback_hours=None`**（或透過 config 如 `TRAINER_USE_LOOKBACK=False`），使 Step 6 走現有 **無 lookback** 的向量化路徑。                  |
+| **作法**   | Trainer 呼叫 `add_run_state_machine_features` 時傳 `**lookback_hours=None`**（或透過 config 如 `TRAINER_USE_LOOKBACK=False`），使 Step 6 走現有 **無 lookback** 的向量化路徑。                  |
 | **效果**   | Step 6 可在合理時間內完成；無需改動 `features.py` 的 lookback 迴圈。                                                                                                                 |
 | **代價**   | Scorer 仍使用 `SCORER_LOOKBACK_HOURS`；train 與 serve 對「8h 視窗」的完全一致延至 Phase 2。                                                                                          |
-| **建議改動** | `trainer/config.py`：新增 `TRAINER_USE_LOOKBACK`（預設 `False`）；`trainer.py` 呼叫 `add_track_human_features` 時依該 config 傳 `lookback_hours=SCORER_LOOKBACK_HOURS` 或 `None`。 |
+| **建議改動** | `trainer/config.py`：新增 `TRAINER_USE_LOOKBACK`（預設 `False`）；`trainer.py` 呼叫 `add_run_state_machine_features` 時依該 config 傳 `lookback_hours=SCORER_LOOKBACK_HOURS` 或 `None`。 |
 
 
 ---
@@ -97,7 +97,7 @@
 | 階段         | 檔案                                    | 改動摘要                                                                 |
 | ---------- | ------------------------------------- | -------------------------------------------------------------------- |
 | Phase 1    | `trainer/config.py`                   | 新增 `TRAINER_USE_LOOKBACK`（可選）。                                       |
-| Phase 1    | `trainer/trainer.py`                  | 呼叫 `add_track_human_features` 時依 config 傳 `lookback_hours` 或 `None`。 |
+| Phase 1    | `trainer/trainer.py`                  | 呼叫 `add_run_state_machine_features` 時依 config 傳 `lookback_hours` 或 `None`。 |
 | Phase 2    | `trainer/features.py`                 | lookback 分支改為 numba two-pointer 單 pass（或 Cython）；可選 fallback 慢路徑。    |
 | Step 6 進度條 | `trainer/trainer.py`                  | Step 6 建立 tqdm、各分支 update(1)、finally close。                          |
 | Step 6 進度條 | `requirements.txt` 或 `pyproject.toml` | 加入 `tqdm`。                                                           |

@@ -11,12 +11,12 @@ around the existing legacy implementation in :mod:`trainer.features.features`
 
     Layer    | Source of truth                                  | Phase B status
     ---------|--------------------------------------------------|----------------
-    bet      | features.compute_track_llm_features              | wrapped here
-    run      | trainer.add_track_human_features (state machine) | declared here,
+    bet      | features.compute_bet_duckdb_window_features      | wrapped here
+    run      | trainer.add_run_state_machine_features           | declared here,
              |                                                  | computation
              |                                                  | stays in trainer
     trip     | trip_materializer on ``bets_df`` (LDA passthrough) | wrapped here
-    player   | features.join_player_profile                     | wrapped here
+    player   | features.compute_player_layer_features            | run primitives or snapshot join
 
 Rationale
 ---------
@@ -25,14 +25,13 @@ Rationale
   computations are unchanged. This keeps train-serve parity intact while we
   prepare for Phase C (PIT skip unification) and later phases.
 - Run-level state-machine features and trip-level passthroughs currently live
-  inside ``trainer.training.trainer`` (``add_track_human_features``) and
+  inside ``trainer.training.trainer`` (``add_run_state_machine_features``) and
   pipeline joins. Lifting them into ``features`` would be a behavior-changing
   refactor; we keep them in place and just expose layer metadata here.
 
 Backward compatibility
 ----------------------
-- All existing callers of the legacy functions (``compute_track_llm_features``,
-  ``join_player_profile``) continue to work.
+- All existing callers of canonical functions continue to work.
 - The wrappers return DataFrames *byte-identical* to the underlying function
   (no column rename, no extra metadata column). Phase B does NOT rename
   DataFrame columns from legacy to layered ids — that is deferred until the
@@ -51,7 +50,7 @@ import pandas as pd
 
 from trainer.features.features import (
     LAYER_NAMES,
-    compute_track_llm_features as _compute_track_llm_features,
+    compute_bet_duckdb_window_features as _compute_bet_duckdb_window_features,
     get_chunk_replacements,
     get_feature_ids_by_layer,
     get_layer_for_feature,
@@ -60,6 +59,7 @@ from trainer.features.features import (
     join_player_profile as _join_player_profile,
     load_track_to_layer_mapping,
 )
+from trainer.features.player_run_layer import attach_player_run_features, player_run_asset_requested
 from trainer.features.trip_materializer import materialize_trip_layer_features as _materialize_trip_layer_features
 
 logger = logging.getLogger(__name__)
@@ -296,7 +296,7 @@ def evaluate_pit_admission(
 
 
 # ---------------------------------------------------------------------------
-# Bet layer (legacy: track_llm)
+# Bet layer
 # ---------------------------------------------------------------------------
 
 def compute_bet_layer_features(
@@ -307,8 +307,8 @@ def compute_bet_layer_features(
     """Compute bet-layer features for *bets_df*.
 
     Phase B implementation: thin wrapper around
-    :func:`trainer.features.features.compute_track_llm_features`. The output
-    columns use ``track_llm`` ``feature_id`` values; per-candidate ``target_layer``
+    :func:`trainer.features.features.compute_bet_duckdb_window_features`. The output
+    columns use spec ``feature_id`` values; per-candidate ``target_layer``
     in ``feature_candidates.yaml`` records layered ownership.
 
     Parameters
@@ -322,7 +322,7 @@ def compute_bet_layer_features(
         Optional row-level leakage guard; rows with
         ``payout_complete_dtm > cutoff_time`` are dropped before computation.
     """
-    return _compute_track_llm_features(
+    return _compute_bet_duckdb_window_features(
         bets_df,
         feature_spec=feature_spec,
         cutoff_time=cutoff_time,
@@ -349,38 +349,42 @@ def add_run_state_machine_features(
 ) -> pd.DataFrame:
     """Run-level state-machine features (layer+method name; legacy Track Human).
 
-    Delegates to :func:`trainer.training.feature_pipeline.add_track_human_features`.
+    Delegates to :func:`trainer.training.feature_pipeline.add_run_state_machine_features`.
     """
     try:
-        from trainer.training.feature_pipeline import add_track_human_features as _impl
+        from trainer.training.feature_pipeline import add_run_state_machine_features as _impl
     except ModuleNotFoundError:  # pragma: no cover — bare trainer/ on sys.path
-        from training.feature_pipeline import add_track_human_features as _impl  # type: ignore[import-not-found,no-redef]
+        from training.feature_pipeline import add_run_state_machine_features as _impl  # type: ignore[import-not-found,no-redef]
 
     return _impl(bets, canonical_map, window_end, lookback_hours=lookback_hours)
 
 
 # ---------------------------------------------------------------------------
-# Player layer (legacy: track_profile)
+# Player layer
 # ---------------------------------------------------------------------------
 
 def compute_player_layer_features(
     bets_df: pd.DataFrame,
     profile_df: Optional[pd.DataFrame],
     feature_cols: Optional[List[str]] = None,
+    *,
+    feature_spec: Optional[dict] = None,
+    use_local_parquet: bool = False,
 ) -> pd.DataFrame:
-    """Attach player-layer features (player_profile snapshots, PIT-safe).
+    """Attach player-layer features (run primitives or legacy snapshot join).
 
-    Phase B implementation: thin wrapper around
-    :func:`trainer.features.features.join_player_profile`. Non-rated bets and
-    bets without a prior snapshot keep the legacy behavior (zero-fill / NaN
-    per the underlying function) — Phase B does not change identity admission
-    rules; that lands in Phase C.
+    When ``player_run_asset`` is enabled in *feature_spec*, features are
+    materialized from L1 ``run_fact`` / ``run_bet_map`` (requires local Parquet).
+    Otherwise delegates to :func:`trainer.features.features.join_player_profile`.
     """
-    return _join_player_profile(
-        bets_df,
-        profile_df,
-        feature_cols=feature_cols,
-    )
+    if player_run_asset_requested(feature_spec):
+        return attach_player_run_features(
+            bets_df,
+            feature_spec,
+            use_local_parquet=bool(use_local_parquet),
+            feature_cols=feature_cols,
+        )
+    return _join_player_profile(bets_df, profile_df, feature_cols=feature_cols)
 
 
 def compute_trip_layer_features(
@@ -413,14 +417,14 @@ def describe_layered_entrypoints() -> dict:
     return {
         LAYER_BET: {
             "module": "trainer.features.features",
-            "function": "compute_track_llm_features",
+            "function": "compute_bet_duckdb_window_features",
             "wrapper": "trainer.features.layered.compute_bet_duckdb_window_features",
             "phase_b_status": "wrapped",
             "layer_method_name": "bet_duckdb_window",
         },
         LAYER_RUN: {
             "module": "trainer.training.feature_pipeline",
-            "function": "add_track_human_features",
+            "function": "add_run_state_machine_features",
             "wrapper": "trainer.features.layered.add_run_state_machine_features",
             "phase_b_status": "wrapped",
             "layer_method_name": "run_state_machine",
@@ -441,9 +445,13 @@ def describe_layered_entrypoints() -> dict:
             ),
         },
         LAYER_PLAYER: {
-            "module": "trainer.features.features",
-            "function": "join_player_profile",
+            "module": "trainer.features.player_run_layer",
+            "function": "attach_player_run_features",
             "wrapper": "trainer.features.layered.compute_player_layer_features",
             "phase_b_status": "wrapped",
+            "notes": (
+                "When YAML enables player_run_asset, uses run primitives; "
+                "else join_player_profile (legacy snapshot)."
+            ),
         },
     }

@@ -129,7 +129,7 @@ class TestUnifiedV2ScoreOnceBetIdMismatchIntegration(unittest.TestCase):
                 return_value=pd.DataFrame({"player_id": [1001], "canonical_id": ["c1"]}),
             ),
             patch.object(scorer_mod, "build_features_for_scoring", return_value=features_row),
-            patch.object(scorer_mod, "compute_track_llm_features", side_effect=lambda df, **_: df),
+            patch.object(scorer_mod, "compute_bet_duckdb_window_features", side_effect=lambda df, **_: df),
             patch.object(scorer_mod, "_compute_reason_codes", return_value=["[]"]),
             patch.object(scorer_mod, "get_session_totals", return_value=(0, 0.0, None, None)),
             patch.object(scorer_mod, "get_session_count", return_value=0),
@@ -191,7 +191,7 @@ class TestUnifiedV2TrackLlmRowDropObservability(unittest.TestCase):
                 return_value=pd.DataFrame({"player_id": [1001], "canonical_id": ["c1"]}),
             ),
             patch.object(scorer_mod, "build_features_for_scoring", return_value=features_row),
-            patch.object(scorer_mod, "compute_track_llm_features", side_effect=_shrink_llm),
+            patch.object(scorer_mod, "compute_bet_duckdb_window_features", side_effect=_shrink_llm),
             patch.object(scorer_mod, "_compute_reason_codes", return_value=["[]"]),
             patch.object(scorer_mod, "get_session_totals", return_value=(0, 0.0, None, None)),
             patch.object(scorer_mod, "get_session_count", return_value=0),
@@ -365,15 +365,15 @@ class TestUnifiedV8TrainServeLlmOrderingContract(unittest.TestCase):
     def test_scorer_rated_slice_line_before_compute_track_llm_in_score_once(self):
         src = SCORER_SRC.read_text(encoding="utf-8")
         marker_slice = '.isin(rated_canonical_ids)].copy()'
-        marker_llm = "compute_track_llm_features("
+        marker_llm = "compute_bet_duckdb_window_features("
         pos_slice = src.find(marker_slice)
         pos_llm = src.find(marker_llm, pos_slice)
         self.assertGreater(pos_slice, 0, "rated-only slice pattern not found")
-        self.assertGreater(pos_llm, pos_slice, "compute_track_llm_features should follow rated slice")
+        self.assertGreater(pos_llm, pos_slice, "compute_bet_duckdb_window_features should follow rated slice")
 
     def test_backtester_calls_track_llm_on_bets_variable(self):
         text = BACKTESTER_SRC.read_text(encoding="utf-8")
-        self.assertIn("compute_track_llm_features(", text)
+        self.assertIn("compute_bet_duckdb_window_features(", text)
         self.assertIn("Track LLM on FULL bets", text)
 
 

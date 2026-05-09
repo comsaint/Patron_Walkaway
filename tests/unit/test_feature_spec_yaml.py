@@ -43,7 +43,7 @@ class TestLoadFeatureSpecTemplateLoads(unittest.TestCase):
 
     def test_spec_has_required_top_level_keys(self):
         spec = features_mod.load_feature_spec(SPEC_YAML)
-        for key in ("version", "spec_id", "track_llm", "track_human", "track_profile"):
+        for key in ("version", "spec_id", "bet_duckdb_window", "run_state_machine", "player_run_asset"):
             self.assertIn(key, spec, f"Missing top-level key: {key}")
 
     def test_template_yaml_file_exists(self):
@@ -56,7 +56,7 @@ class TestFeatureIdUniqueness(unittest.TestCase):
     def test_all_feature_ids_unique_in_template(self):
         spec = features_mod.load_feature_spec(SPEC_YAML)
         all_ids = []
-        for track_key in ("track_llm", "track_human", "track_profile"):
+        for track_key in ("bet_duckdb_window", "run_state_machine", "player_run_asset", "trip_asset_materialized"):
             track = spec.get(track_key, {})
             for cand in track.get("candidates", []):
                 all_ids.append(cand.get("feature_id", ""))
@@ -68,7 +68,7 @@ class TestFeatureIdUniqueness(unittest.TestCase):
 
     def test_duplicate_feature_id_raises_value_error(self):
         spec = {
-            "track_llm": {
+            "bet_duckdb_window": {
                 "candidates": [
                     {"feature_id": "dup_feat", "type": "window", "expression": "COUNT(bet_id)",
                      "window_frame": "ROWS BETWEEN 5 PRECEDING AND CURRENT ROW"},
@@ -83,11 +83,11 @@ class TestFeatureIdUniqueness(unittest.TestCase):
 
 
 class TestNoClockMinuteWindowsInTemplate(unittest.TestCase):
-    """GitHub #34: Track LLM must not use RANGE INTERVAL … MINUTE windows."""
+    """GitHub #34: bet_duckdb_window must not use RANGE INTERVAL … MINUTE windows."""
 
-    def test_track_llm_window_frames_have_no_interval_minute(self):
+    def test_bet_duckdb_window_window_frames_have_no_interval_minute(self):
         spec = features_mod.load_feature_spec(SPEC_YAML)
-        for cand in spec.get("track_llm", {}).get("candidates", []):
+        for cand in spec.get("bet_duckdb_window", {}).get("candidates", []):
             wf_u = (cand.get("window_frame") or "").upper()
             self.assertNotIn(
                 "INTERVAL",
@@ -99,9 +99,9 @@ class TestNoClockMinuteWindowsInTemplate(unittest.TestCase):
 class TestNoTGameCandidatesInTemplate(unittest.TestCase):
     """GitHub #34: dev catalog must not list join_t_game_features_for_bets."""
 
-    def test_track_human_has_no_t_game_join(self):
+    def test_run_state_machine_has_no_t_game_join(self):
         spec = features_mod.load_feature_spec(SPEC_YAML)
-        for cand in spec.get("track_human", {}).get("candidates", []):
+        for cand in spec.get("run_state_machine", {}).get("candidates", []):
             fn = (cand.get("function_name") or "").lower()
             self.assertNotEqual(
                 fn,
@@ -111,11 +111,11 @@ class TestNoTGameCandidatesInTemplate(unittest.TestCase):
 
 
 class TestNoFollowingInWindowFrame(unittest.TestCase):
-    """Track LLM window_frame must not contain FOLLOWING."""
+    """bet_duckdb_window window_frame must not contain FOLLOWING."""
 
     def test_template_has_no_following_in_any_window_frame(self):
         spec = features_mod.load_feature_spec(SPEC_YAML)
-        for cand in spec.get("track_llm", {}).get("candidates", []):
+        for cand in spec.get("bet_duckdb_window", {}).get("candidates", []):
             wf = cand.get("window_frame", "") or ""
             self.assertNotIn(
                 "FOLLOWING",
@@ -125,7 +125,7 @@ class TestNoFollowingInWindowFrame(unittest.TestCase):
 
     def test_following_in_window_frame_raises_value_error(self):
         spec = {
-            "track_llm": {
+            "bet_duckdb_window": {
                 "candidates": [
                     {
                         "feature_id": "bad_feat",
@@ -143,13 +143,13 @@ class TestNoFollowingInWindowFrame(unittest.TestCase):
 
 
 class TestNoSQLKeywordsInExpressions(unittest.TestCase):
-    """Track LLM expressions must not contain SQL structural keywords."""
+    """bet_duckdb_window expressions must not contain SQL structural keywords."""
 
     FORBIDDEN_KEYWORDS = ["SELECT", "FROM", "JOIN", "UNION", "WITH"]
 
     def test_template_expressions_contain_no_sql_keywords(self):
         spec = features_mod.load_feature_spec(SPEC_YAML)
-        for cand in spec.get("track_llm", {}).get("candidates", []):
+        for cand in spec.get("bet_duckdb_window", {}).get("candidates", []):
             expr = cand.get("expression", "") or ""
             for kw in self.FORBIDDEN_KEYWORDS:
                 self.assertNotIn(
@@ -160,7 +160,7 @@ class TestNoSQLKeywordsInExpressions(unittest.TestCase):
 
     def test_select_in_expression_raises_value_error(self):
         spec = {
-            "track_llm": {
+            "bet_duckdb_window": {
                 "candidates": [
                     {
                         "feature_id": "inject_feat",
@@ -177,7 +177,7 @@ class TestNoSQLKeywordsInExpressions(unittest.TestCase):
 
     def test_join_in_expression_raises_value_error(self):
         spec = {
-            "track_llm": {
+            "bet_duckdb_window": {
                 "candidates": [
                     {
                         "feature_id": "join_feat",
@@ -198,7 +198,7 @@ class TestNoCyclicDependsOn(unittest.TestCase):
 
     def test_no_circular_depends_on_raises_for_self_loop(self):
         spec = {
-            "track_llm": {
+            "bet_duckdb_window": {
                 "candidates": [
                     {
                         "feature_id": "self_loop",
@@ -215,7 +215,7 @@ class TestNoCyclicDependsOn(unittest.TestCase):
 
     def test_no_circular_depends_on_raises_for_two_node_cycle(self):
         spec = {
-            "track_llm": {
+            "bet_duckdb_window": {
                 "candidates": [
                     {
                         "feature_id": "feat_a",
@@ -238,7 +238,7 @@ class TestNoCyclicDependsOn(unittest.TestCase):
 
     def test_valid_linear_depends_on_does_not_raise(self):
         spec = {
-            "track_llm": {
+            "bet_duckdb_window": {
                 "candidates": [
                     {
                         "feature_id": "feat_base",
@@ -272,7 +272,7 @@ class TestTemplateDtypeIntegrity(unittest.TestCase):
 
     def test_template_candidates_have_allowed_dtype_or_none(self):
         spec = features_mod.load_feature_spec(SPEC_YAML)
-        for track_key in ("track_llm", "track_human", "track_profile"):
+        for track_key in ("bet_duckdb_window", "run_state_machine", "player_run_asset", "trip_asset_materialized"):
             track = spec.get(track_key) or {}
             for cand in track.get("candidates", []):
                 fid = cand.get("feature_id", "")
@@ -298,7 +298,7 @@ class TestTrackHumanRunBoundaryInputContract(unittest.TestCase):
 
     def test_run_boundary_features_require_wager_input(self):
         spec = features_mod.load_feature_spec(SPEC_YAML)
-        track_human = (spec.get("track_human") or {}).get("candidates", [])
+        track_human = (spec.get("run_state_machine") or {}).get("candidates", [])
         by_id = {
             c.get("feature_id"): c
             for c in track_human
@@ -308,7 +308,7 @@ class TestTrackHumanRunBoundaryInputContract(unittest.TestCase):
         missing = sorted(fid for fid in self._RUN_BOUNDARY_FIDS if fid not in by_id)
         self.assertFalse(
             missing,
-            f"Missing expected run-boundary candidates in track_human: {missing}",
+            f"Missing expected run-boundary candidates in run_state_machine: {missing}",
         )
 
         for fid in sorted(self._RUN_BOUNDARY_FIDS):
@@ -331,7 +331,7 @@ class TestTrackHumanWave2PersonalizedContract(unittest.TestCase):
 
     def test_wave2_personalized_features_require_python_vectorized_contract(self):
         spec = features_mod.load_feature_spec(SPEC_YAML)
-        track_human = (spec.get("track_human") or {}).get("candidates", [])
+        track_human = (spec.get("run_state_machine") or {}).get("candidates", [])
         by_id = {
             c.get("feature_id"): c
             for c in track_human
@@ -355,7 +355,7 @@ class TestTrackHumanConsecutiveNonWinContract(unittest.TestCase):
 
     def test_consecutive_non_win_uses_wrapper_function(self):
         spec = features_mod.load_feature_spec(SPEC_YAML)
-        track_human = (spec.get("track_human") or {}).get("candidates", [])
+        track_human = (spec.get("run_state_machine") or {}).get("candidates", [])
         by_id = {
             c.get("feature_id"): c
             for c in track_human
@@ -376,7 +376,7 @@ class TestTrackHumanLossStreakContract(unittest.TestCase):
 
     def test_loss_streak_uses_wrapper_function(self):
         spec = features_mod.load_feature_spec(SPEC_YAML)
-        track_human = (spec.get("track_human") or {}).get("candidates", [])
+        track_human = (spec.get("run_state_machine") or {}).get("candidates", [])
         by_id = {
             c.get("feature_id"): c
             for c in track_human
@@ -418,7 +418,7 @@ class TestLoadFeatureSpecViaYAMLFile(unittest.TestCase):
         spec = {
             "version": "2.0",
             "spec_id": "test_spec",
-            "track_llm": {
+            "bet_duckdb_window": {
                 "candidates": [
                     {
                         "feature_id": "cnt_w15m",

@@ -134,7 +134,7 @@ Layered framework
 
 - **Layer+method YAML aliases** (optional; mirrored to legacy keys at load time):
   ``bet_duckdb_window`` ↔ ``track_llm``, ``run_state_machine`` ↔ ``track_human``,
-  ``player_profile_snapshot`` ↔ ``track_profile``. Author either vocabulary; do not
+  ``player_snapshot_asset`` ↔ ``track_profile``. Author either vocabulary; do not
   duplicate conflicting candidate lists under both names in the same file.
 
 - **Label intermediate disk cache** (Step 6, ``CHUNK_DIR``): full

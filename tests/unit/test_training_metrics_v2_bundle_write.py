@@ -214,7 +214,8 @@ def test_v3_field_test_optional_prod_adjusted_and_segmentation() -> None:
     ft = v3["datasets"]["test"]["field_test"]
     assert ft["precision_prod_adjusted"] is None
     assert ft["precision_raw"] == 0.75
-    assert v3["objective_contract"]["ratio_assumption"]["source"] == "config"
+    assert "production_neg_pos_ratio" not in v3
+    assert "ratio_assumption" not in v3["objective_contract"]
     assert v3["segmentation"]["enabled"] is True
     assert v3["segmentation"]["high_roller_segmentation"]["primary_segment"] == "high"
 

@@ -44,7 +44,7 @@ class _MockPredictProba:
 
 
 # ---------------------------------------------------------------------------
-# R407 Review #1 — 錯誤回傳應含 track_llm_degraded（可觀測性）
+# R407 Review #1 — 錯誤回傳應含 bet_duckdb_window_degraded（可觀測性）
 # ---------------------------------------------------------------------------
 
 def _compute_labels_empty_after_filter(bets_df, window_end, extended_end):
@@ -59,11 +59,11 @@ def _compute_labels_empty_after_filter(bets_df, window_end, extended_end):
 
 class TestR407ErrorReturnIncludesTrackLlmDegraded(unittest.TestCase):
     """R407 #1: When Track LLM failed and backtest returns error (e.g. No rows after label filtering),
-    result should include track_llm_degraded=True for observability."""
+    result should include bet_duckdb_window_degraded=True for observability."""
 
-    def test_error_no_rows_after_label_filtering_includes_track_llm_degraded(self):
+    def test_error_no_rows_after_label_filtering_includes_bet_duckdb_window_degraded(self):
         """Contract: If Track LLM raises and backtest returns error 'No rows after label filtering',
-        result must contain track_llm_degraded=True."""
+        result must contain bet_duckdb_window_degraded=True."""
         bets = pd.DataFrame({
             "bet_id": [1],
             "session_id": [10],
@@ -107,9 +107,9 @@ class TestR407ErrorReturnIncludesTrackLlmDegraded(unittest.TestCase):
         self.assertIn("error", result, "Test setup: must hit error return path.")
         self.assertEqual(result.get("error"), "No rows after label filtering")
         self.assertIs(
-            result.get("track_llm_degraded"),
+            result.get("bet_duckdb_window_degraded"),
             True,
-            "R407 #1: error return after Track LLM failed must include track_llm_degraded=True.",
+            "R407 #1: error return after Track LLM failed must include bet_duckdb_window_degraded=True.",
         )
 
 
@@ -125,11 +125,11 @@ def _compute_labels_inside_window_but_all_unrated(bets_df, window_end, extended_
 
 class TestR407ErrorReturnNoRatedObservationsIncludesTrackLlmDegraded(unittest.TestCase):
     """R407 #1: When Track LLM failed and backtest returns 'No rated observations in window',
-    result should include track_llm_degraded=True."""
+    result should include bet_duckdb_window_degraded=True."""
 
-    def test_error_no_rated_observations_includes_track_llm_degraded(self):
+    def test_error_no_rated_observations_includes_bet_duckdb_window_degraded(self):
         """Contract: If Track LLM raises and backtest returns error 'No rated observations in window',
-        result must contain track_llm_degraded=True."""
+        result must contain bet_duckdb_window_degraded=True."""
         bets = pd.DataFrame({
             "bet_id": [1],
             "session_id": [10],
@@ -177,12 +177,12 @@ class TestR407ErrorReturnNoRatedObservationsIncludesTrackLlmDegraded(unittest.Te
             ("No rated observations in window", "No rated rows after early prune"),
         )
         if result.get("error") == "No rated rows after early prune":
-            self.assertIs(result.get("track_llm_degraded"), False)
+            self.assertIs(result.get("bet_duckdb_window_degraded"), False)
         else:
             self.assertIs(
-                result.get("track_llm_degraded"),
+                result.get("bet_duckdb_window_degraded"),
                 True,
-                "R407 #1: error after bet_duckdb_window failure must include track_llm_degraded=True.",
+                "R407 #1: error after bet_duckdb_window failure must include bet_duckdb_window_degraded=True.",
             )
 
 
@@ -195,7 +195,7 @@ class TestR407CandidatesNonDictElements(unittest.TestCase):
 
     def test_backtest_does_not_crash_when_candidates_has_non_dict_elements(self):
         """Behavioral: feature_spec.track_llm.candidates = [{"feature_id": "f1"}, 123, "x"] does not raise;
-        current production catches AttributeError and sets track_llm_degraded=True."""
+        current production catches AttributeError and sets bet_duckdb_window_degraded=True."""
         bets = pd.DataFrame({
             "bet_id": [1],
             "session_id": [10],
@@ -239,8 +239,8 @@ class TestR407CandidatesNonDictElements(unittest.TestCase):
             )
         self.assertIsInstance(result, dict, "R407 #2: backtest must not crash with mixed candidates.")
         self.assertNotIn("error", result, "Mocks provide valid path; expect success dict.")
-        # Current production catches AttributeError in try → track_llm_degraded=True.
-        self.assertIn("track_llm_degraded", result)
+        # Current production catches AttributeError in try → bet_duckdb_window_degraded=True.
+        self.assertIn("bet_duckdb_window_degraded", result)
 
 
 # ---------------------------------------------------------------------------
@@ -248,14 +248,14 @@ class TestR407CandidatesNonDictElements(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# R407 Review #3 補充 — 成功路徑 track_llm_degraded=False（契約）
+# R407 Review #3 補充 — 成功路徑 bet_duckdb_window_degraded=False（契約）
 # ---------------------------------------------------------------------------
 
 class TestR407SuccessPathTrackLlmDegradedFalse(unittest.TestCase):
-    """R407 #3 optional: When Track LLM succeeds, result must contain track_llm_degraded=False."""
+    """R407 #3 optional: When Track LLM succeeds, result must contain bet_duckdb_window_degraded=False."""
 
-    def test_backtest_result_has_track_llm_degraded_false_when_track_llm_succeeds(self):
-        """Contract: When compute_bet_duckdb_window_features does not raise, result must include track_llm_degraded=False."""
+    def test_backtest_result_has_bet_duckdb_window_degraded_false_when_track_llm_succeeds(self):
+        """Contract: When compute_bet_duckdb_window_features does not raise, result must include bet_duckdb_window_degraded=False."""
         bets = pd.DataFrame({
             "bet_id": [1],
             "session_id": [10],
@@ -298,9 +298,9 @@ class TestR407SuccessPathTrackLlmDegradedFalse(unittest.TestCase):
             )
         self.assertNotIn("error", result)
         self.assertIs(
-            result.get("track_llm_degraded"),
+            result.get("bet_duckdb_window_degraded"),
             False,
-            "R407 #3: when Track LLM succeeds, result must include track_llm_degraded=False.",
+            "R407 #3: when Track LLM succeeds, result must include bet_duckdb_window_degraded=False.",
         )
 
 

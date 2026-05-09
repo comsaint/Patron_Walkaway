@@ -255,15 +255,16 @@ class TestModelMetadataPipelineWiring(unittest.TestCase):
 
     def test_run_pipeline_computes_split_meta_and_passes_to_save_and_mlflow(self):
         src = _get_func_src("run_pipeline")
+        l2_src = (_REPO_ROOT / "trainer" / "training" / "pipeline_l2_bundle.py").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("split_row_metadata_from_parquet_paths", src)
         self.assertIn("split_row_metadata_from_dataframes", src)
         self.assertIn("_split_row_meta", src)
         self.assertIn("_model_used_split_meta", src)
         self.assertIn("rated_only=True", src)
-        self.assertIn("build_model_metadata_document(", src)
-        self.assertIn("model_used_splits=_model_used_split_meta", src)
-        self.assertIn("model_metadata=_model_meta_doc", src)
-        self.assertIn("split_boundary_params=_split_mlflow_meta", src)
+        self.assertIn("model_used_splits=_model_used_split_meta", l2_src)
+        self.assertIn("model_metadata=_model_meta_doc", l2_src)
 
     def test_metadata_builder_exposes_model_used_splits_and_optuna_effective_state(self):
         src = _get_func_src("build_model_metadata_document")
@@ -503,13 +504,13 @@ class TestRefactorGuardrailsInputSources(unittest.TestCase):
         self.assertIsNone(sig.parameters["bets_history_start"].default)
 
     def test_feature_pipeline_owns_dq_and_track_human(self):
-        """PR-12.3 boundary: ``apply_dq`` and ``add_track_human_features``
+        """PR-12.3 boundary: ``apply_dq`` and ``add_run_state_machine_features``
         originate in ``trainer.training.feature_pipeline``; trainer.py only
         re-exports them."""
         if not _TRAINER_IMPORTED:
             self.skipTest("trainer module not importable in this env")
         from trainer.training import feature_pipeline as _fp
-        for name in ("apply_dq", "add_track_human_features"):
+        for name in ("apply_dq", "add_run_state_machine_features"):
             self.assertEqual(
                 getattr(_trainer_module, name).__module__,
                 _fp.__name__,

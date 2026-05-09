@@ -94,14 +94,14 @@ class TestReviewRisksRound30(unittest.TestCase):
     def test_r45_pipeline_must_integrate_track_llm_duckdb_calls(self):
         """R45: trainer/scorer pipelines should include Track LLM DuckDB execution."""
         self.assertIn(
-            "compute_track_llm_features",
+            "compute_bet_duckdb_window_features",
             _TRAINER_SRC,
-            msg="trainer.py should invoke compute_track_llm_features for production pipeline.",
+            msg="trainer.py should invoke compute_bet_duckdb_window_features for production pipeline.",
         )
         self.assertIn(
-            "compute_track_llm_features",
+            "compute_bet_duckdb_window_features",
             _SCORER_SRC,
-            msg="scorer.py should invoke compute_track_llm_features for online parity.",
+            msg="scorer.py should invoke compute_bet_duckdb_window_features for online parity.",
         )
 
 

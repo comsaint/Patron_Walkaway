@@ -21,7 +21,7 @@
 
 ## 明確非範圍（第一波不碰）
 
-- `trainer/features/features.py::compute_track_llm_features`
+- `trainer/features/features.py::compute_bet_duckdb_window_features`
 - `trainer/features/features.py::compute_column_std_duckdb`
 - `trainer/features/features.py::compute_correlation_matrix_duckdb`
 - `trainer/training/trainer.py` Step 7 / canonical mapping DuckDB 路徑

@@ -22,11 +22,17 @@ IMPACT_PLANNER_VERSION: str = "impact_planner_v3"
 def _infer_spec_track_layer(feature_id: str, spec: dict) -> Optional[str]:
     """Return ``bet`` / ``run`` / ``trip`` / ``player`` for a candidate in *spec*."""
     track_default = {
-        "track_llm": "bet",
-        "track_human": "run",
-        "track_profile": "player",
+        "bet_duckdb_window": "bet",
+        "run_state_machine": "run",
+        "player_run_asset": "player",
+        "trip_asset_materialized": "trip",
     }
-    for track in ("track_llm", "track_human", "track_profile"):
+    for track in (
+        "bet_duckdb_window",
+        "run_state_machine",
+        "player_run_asset",
+        "trip_asset_materialized",
+    ):
         for cand in (spec.get(track) or {}).get("candidates") or []:
             if isinstance(cand, dict) and str(cand.get("feature_id") or "") == feature_id:
                 tl = cand.get("target_layer")
@@ -161,7 +167,7 @@ def plan_impacted_materialization_work(
     full_matrix = False
     miss_reason: Optional[str] = None
 
-    # --- Spec fingerprint propagation (track_llm depends_on + compose closure) ---
+    # --- Spec fingerprint propagation (bet_duckdb_window depends_on + compose closure) ---
     if prev_per_feature_fp is not None:
         hint = _fm.impacted_feature_ids_on_fingerprint_change(prev_per_feature_fp, curr_fp, curr_spec)
         impacted_ids = set(hint.get("impacted_feature_ids") or [])
@@ -183,13 +189,23 @@ def plan_impacted_materialization_work(
     if isinstance(prev_spec, dict):
         prev_ids = {
             str(c.get("feature_id"))
-            for track in ("track_llm", "track_human", "track_profile")
+            for track in (
+                "bet_duckdb_window",
+                "run_state_machine",
+                "player_run_asset",
+                "trip_asset_materialized",
+            )
             for c in ((prev_spec.get(track) or {}).get("candidates") or [])
             if isinstance(c, dict) and c.get("feature_id")
         }
         curr_ids = {
             str(c.get("feature_id"))
-            for track in ("track_llm", "track_human", "track_profile")
+            for track in (
+                "bet_duckdb_window",
+                "run_state_machine",
+                "player_run_asset",
+                "trip_asset_materialized",
+            )
             for c in ((curr_spec.get(track) or {}).get("candidates") or [])
             if isinstance(c, dict) and c.get("feature_id")
         }
@@ -224,7 +240,12 @@ def plan_impacted_materialization_work(
                 "(no chunk_partition_ids); treat as full_matrix (see lookback_partition_count)"
             )
         declared: Set[str] = set()
-        for track in ("track_llm", "track_human", "track_profile"):
+        for track in (
+            "bet_duckdb_window",
+            "run_state_machine",
+            "player_run_asset",
+            "trip_asset_materialized",
+        ):
             for cand in (curr_spec.get(track) or {}).get("candidates") or []:
                 if isinstance(cand, dict) and cand.get("feature_id"):
                     declared.add(str(cand["feature_id"]))

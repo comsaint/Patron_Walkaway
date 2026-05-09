@@ -138,13 +138,13 @@ class TestBacktesterStableImports(unittest.TestCase):
         for name in ("load_clickhouse_data", "load_local_parquet"):
             self.assertIn(name, _SRC)
 
-    def test_backtester_uses_feature_pipeline_for_dq_and_track_human(self):
+    def test_backtester_uses_feature_pipeline_for_dq_and_run_state_machine(self):
         self.assertIn(
             "from trainer.training.feature_pipeline import",
             _SRC,
             "backtester should import DQ + Track Human attach from feature_pipeline",
         )
-        for name in ("apply_dq", "add_track_human_features"):
+        for name in ("apply_dq", "add_run_state_machine_features"):
             self.assertIn(name, _SRC)
 
     def test_backtester_uses_metrics_eval_for_precision_helper(self):
@@ -166,7 +166,7 @@ class TestBacktesterStableImports(unittest.TestCase):
             "load_clickhouse_data",
             "load_local_parquet",
             "apply_dq",
-            "add_track_human_features",
+            "add_run_state_machine_features",
             "_precision_prod_adjusted",
         )
         # We grep the trainer-import block and ensure the moved names are

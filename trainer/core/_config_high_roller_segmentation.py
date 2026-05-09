@@ -1,7 +1,8 @@
 """Issue #8: high-roller segmented training parameters (train-side only).
 
-All values are module-level constants (no environment variables). Toggle
-``HIGH_ROLLER_SEGMENT_ENABLE`` for experiments; serving routing is out of scope
+All values are module-level constants (no environment variables). Set
+``HIGH_ROLLER_SEGMENT_ENABLE`` to False only to opt into legacy single-model L2
+training; when True, segmentation failures raise. Serving routing is out of scope
 for this iteration.
 """
 
@@ -9,11 +10,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-# Master switch: when False, pipeline uses legacy single rated model training.
-HIGH_ROLLER_SEGMENT_ENABLE: bool = False
+# Master switch: when False, L2 bundle uses legacy single rated model training only.
+# Default True: segmented train is required; failures raise (no silent fallback).
+HIGH_ROLLER_SEGMENT_ENABLE: bool = True
 
 # Profile / matrix column used as total theo proxy (must exist on rated train rows).
-HIGH_ROLLER_THEO_FEATURE: str = "theo_win_sum_30d"
+HIGH_ROLLER_THEO_FEATURE: str = "player_run_theo_sum_180d"
 
 # Top (1 - q) fraction by theo is "high" (e.g. 0.90 → top ~10%).
 HIGH_ROLLER_QUANTILE: float = 0.90
@@ -22,7 +24,7 @@ HIGH_ROLLER_QUANTILE: float = 0.90
 HIGH_ROLLER_MIN_ROWS_HIGH: int = 500
 HIGH_ROLLER_MIN_ROWS_LOW: int = 500
 
-# When fallback triggers: train one model on full rated data (same as legacy).
+# Legacy name only (min-rows / empty-artifact paths now raise instead of falling back).
 HIGH_ROLLER_FALLBACK_MODE: Literal["single_model"] = "single_model"
 
 # Primary segment keys written to model.pkl for backward-compatible scorer fields.

@@ -2041,8 +2041,8 @@ def test_build_phase2_experiment_matrix_merges_harvest_and_per_job(tmp_path: Pat
 
 def test_trainer_artifacts_saved_log_line_contract_for_orchestrator() -> None:
     """Trainer save_artifact_bundle must keep logger.info shape expected by runner regex."""
-    trainer_py = _REPO_ROOT / "trainer" / "training" / "trainer.py"
-    src = trainer_py.read_text(encoding="utf-8")
+    artifact_writer_py = _REPO_ROOT / "trainer" / "core" / "training_artifact_bundle.py"
+    src = artifact_writer_py.read_text(encoding="utf-8")
     assert runner.TRAINER_ARTIFACTS_SAVED_LOGGER_INFO_FORMAT in src
 
 

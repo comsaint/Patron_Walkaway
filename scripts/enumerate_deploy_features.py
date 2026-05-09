@@ -52,25 +52,30 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _allowed_bet_columns(spec: Mapping[str, Any]) -> set[str]:
-    """Return allowed L1 column names from ``track_llm.guardrails`` for expression heuristics."""
-    tl = spec.get("track_llm")
+    """Return allowed L1 column names from ``bet_duckdb_window.guardrails`` for expression heuristics."""
+    tl = spec.get("bet_duckdb_window")
     if not isinstance(tl, Mapping):
         return set()
     gr = tl.get("guardrails")
     if not isinstance(gr, Mapping):
         return set()
-    raw = gr.get("track_llm_allowed_columns")
+    raw = gr.get("bet_duckdb_window_allowed_columns")
     if not isinstance(raw, list):
         return set()
     return {str(x) for x in raw if isinstance(x, str)}
 
 
 def enumerate_features(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Collect sorted ``track_*`` candidate rows with embedded spec mappings from YAML root."""
+    """Collect sorted canonical method-section candidates with embedded spec mappings."""
     rows: list[dict[str, Any]] = []
-    for key, val in spec.items():
-        if not isinstance(key, str) or not key.startswith("track_"):
-            continue
+    method_sections = (
+        "bet_duckdb_window",
+        "run_state_machine",
+        "trip_asset_materialized",
+        "player_run_asset",
+    )
+    for key in method_sections:
+        val = spec.get(key)
         if not isinstance(val, Mapping):
             continue
         cands = val.get("candidates")
@@ -95,6 +100,8 @@ def _required_l1_placeholder(item: Mapping[str, Any], allowed: set[str]) -> str:
         return ";".join(sorted({str(x) for x in ic if isinstance(x, str) and x}))
     sc = item.get("source_column")
     if isinstance(sc, str) and sc.strip():
+        if item.get("type") == "player_run_materialized":
+            return f"player_run.{sc.strip()}"
         return f"player_profile.{sc.strip()}"
     expr = item.get("expression")
     if isinstance(expr, str) and expr.strip() and allowed:
@@ -108,7 +115,7 @@ def _required_l1_placeholder(item: Mapping[str, Any], allowed: set[str]) -> str:
 def _allow_bet_rescan(item: Mapping[str, Any]) -> str:
     """Return CSV ``allow_bet_rescan`` cell: ``no`` for profile columns, else ``TBD``."""
     st = item.get("type")
-    if st == "profile_column":
+    if st in ("profile_column", "player_run_materialized"):
         return "no"
     return "TBD"
 
@@ -124,6 +131,9 @@ def _computation_source(item: Mapping[str, Any]) -> str:
     if st == "profile_column":
         sc = item.get("source_column", "")
         return f"profile_column:{sc}"
+    if st == "player_run_materialized":
+        sc = item.get("source_column", "")
+        return f"player_run_materialized:{sc}"
     expr = item.get("expression", "")
     if isinstance(expr, str) and expr:
         one = expr.replace("\n", " ").strip()

@@ -31,7 +31,6 @@ DuckDBRuntimeStage = Literal[
     "profile",
     "step7",
     "canonical_map",
-    "track_llm",
     "bet_duckdb_window",
     "screening",
     "libsvm_export",
@@ -66,7 +65,7 @@ def _stage_defaults(stage: DuckDBRuntimeStage) -> tuple[int, float, Optional[str
     elif stage == "canonical_map":
         threads = CANONICAL_MAP_DUCKDB_THREADS
         max_gb = CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB
-    elif stage in ("track_llm", "bet_duckdb_window"):
+    elif stage == "bet_duckdb_window":
         threads = TRACK_LLM_DUCKDB_THREADS
         max_gb = TRACK_LLM_DUCKDB_MEMORY_LIMIT_MAX_GB
     elif stage == "screening":
@@ -87,7 +86,6 @@ def resolve_duckdb_runtime_policy(
         "profile",
         "step7",
         "canonical_map",
-        "track_llm",
         "bet_duckdb_window",
         "screening",
         "libsvm_export",

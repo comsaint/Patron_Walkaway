@@ -33,7 +33,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 class TestR222TrackLlmFailureSilentDegradation(unittest.TestCase):
-    """R222 #1: When compute_track_llm_features raises, backtest only logs error; no warning about zero-fill/unreliable."""
+    """R222 #1: When compute_bet_duckdb_window_features raises, backtest only logs error; no warning about zero-fill/unreliable."""
 
     def test_backtest_except_block_contains_track_llm_failed_log(self):
         """Contract: backtest() except block logs 'Track LLM failed' (current). When production adds warning about zero-fill/unreliable, add assert for it."""
@@ -51,7 +51,7 @@ class TestR222TrackLlmFailureSilentDegradation(unittest.TestCase):
         )
 
     def test_backtest_returns_dict_when_track_llm_raises(self):
-        """Behavioral: When compute_track_llm_features raises, backtest still returns a dict (no crash); LLM cols zero-filled."""
+        """Behavioral: When compute_bet_duckdb_window_features raises, backtest still returns a dict (no crash); LLM cols zero-filled."""
         bets = pd.DataFrame({
             "bet_id": [1],
             "session_id": [10],
@@ -101,9 +101,9 @@ class TestR222TrackLlmFailureSilentDegradation(unittest.TestCase):
         self.assertIsInstance(result, dict, "R222 #1: backtest must return dict when Track LLM raises.")
         self.assertNotIn("error", result, "R222 #1: backtest should complete without error key when mocks provide valid path.")
         self.assertIs(
-            result.get("track_llm_degraded"),
+            result.get("bet_duckdb_window_degraded"),
             True,
-            "R222 #1 (PLAN): when Track LLM raises, result must include track_llm_degraded=True.",
+            "R222 #1 (PLAN): when Track LLM raises, result must include bet_duckdb_window_degraded=True.",
         )
 
 

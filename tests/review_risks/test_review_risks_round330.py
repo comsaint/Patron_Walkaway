@@ -102,7 +102,7 @@ class TestR2001FfillLeakageAcrossPlayers(unittest.TestCase):
                 }
             ]
         )
-        out = features_mod.compute_track_llm_features(bets, spec)
+        out = features_mod.compute_bet_duckdb_window_features(bets, spec)
         c2 = out.loc[out["canonical_id"] == "c2", "lag_wager_ffill"].tolist()
         self.assertTrue(pd.isna(c2[0]), "first row of c2 should remain NaN after grouped ffill")
 
@@ -111,7 +111,7 @@ class TestR2002RangeOrderTieBreaker(unittest.TestCase):
     """R2002: RANGE windows should keep deterministic tie behavior for same timestamp."""
 
     def test_range_window_should_keep_bet_id_tie_breaker_contract(self):
-        src = inspect.getsource(features_mod.compute_track_llm_features)
+        src = inspect.getsource(features_mod.compute_bet_duckdb_window_features)
         self.assertNotIn(
             'order_by = "ORDER BY payout_complete_dtm ASC"',
             src,
@@ -122,8 +122,8 @@ class TestR2002RangeOrderTieBreaker(unittest.TestCase):
 class TestR2003ConnectionCloseOnError(unittest.TestCase):
     """R2003: DuckDB connection should close via finally on execution errors."""
 
-    def test_compute_track_llm_features_should_close_connection_in_finally(self):
-        src = inspect.getsource(features_mod.compute_track_llm_features)
+    def test_compute_bet_duckdb_window_features_should_close_connection_in_finally(self):
+        src = inspect.getsource(features_mod.compute_bet_duckdb_window_features)
         self.assertIn("finally", src)
         self.assertIn("con.close()", src)
 
@@ -177,7 +177,7 @@ class TestR2005DerivedDependsOnOrdering(unittest.TestCase):
                 },
             ]
         )
-        out = features_mod.compute_track_llm_features(bets, spec)
+        out = features_mod.compute_bet_duckdb_window_features(bets, spec)
         self.assertIn("derived_a", out.columns)
 
 
@@ -230,15 +230,15 @@ class TestR2008PassthroughIdentifierQuoting(unittest.TestCase):
                 }
             ]
         )
-        out = features_mod.compute_track_llm_features(bets, spec)
+        out = features_mod.compute_bet_duckdb_window_features(bets, spec)
         self.assertIn("my column", out.columns)
 
 
 class TestR2009RedundantCopyPath(unittest.TestCase):
-    """R2009: remove redundant DataFrame copy calls in compute_track_llm_features."""
+    """R2009: remove redundant DataFrame copy calls in compute_bet_duckdb_window_features."""
 
-    def test_compute_track_llm_features_should_not_have_redundant_copy(self):
-        src = inspect.getsource(features_mod.compute_track_llm_features)
+    def test_compute_bet_duckdb_window_features_should_not_have_redundant_copy(self):
+        src = inspect.getsource(features_mod.compute_bet_duckdb_window_features)
         self.assertNotIn('df = df.copy()', src)
 
 

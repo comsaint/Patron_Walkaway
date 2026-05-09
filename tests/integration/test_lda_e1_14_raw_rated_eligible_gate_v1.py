@@ -34,13 +34,13 @@ def _write_one_day_t_bet_fixture(path: Path) -> None:
             f"""
             COPY (
               SELECT * FROM (VALUES
-                (1::BIGINT, 100::BIGINT, DATE '{_D}',
+                (1::BIGINT, 100::BIGINT, 'canon_100'::VARCHAR, DATE '{_D}',
                  TIMESTAMP '{_D} 10:00:00', TIMESTAMP '{_D} 11:00:00',
                  0::INTEGER, 0::INTEGER, 0::INTEGER),
-                (2::BIGINT, 100::BIGINT, DATE '{_D}',
+                (2::BIGINT, 100::BIGINT, 'canon_100'::VARCHAR, DATE '{_D}',
                  TIMESTAMP '{_D} 10:15:00', TIMESTAMP '{_D} 11:15:00',
                  0::INTEGER, 0::INTEGER, 0::INTEGER)
-              ) AS t(bet_id, player_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm,
+              ) AS t(bet_id, player_id, canonical_id, gaming_day, payout_complete_dtm, __etl_insert_Dtm,
                      is_deleted, is_canceled, is_manual)
             ) TO '{path.as_posix()}' (FORMAT PARQUET)
             """

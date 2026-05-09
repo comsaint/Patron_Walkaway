@@ -136,7 +136,12 @@ def per_feature_fingerprints(spec: Optional[dict]) -> Dict[str, str]:
     if not isinstance(spec, dict):
         return {}
     out: Dict[str, str] = {}
-    for track in ("track_llm", "track_human", "track_profile"):
+    for track in (
+        "bet_duckdb_window",
+        "run_state_machine",
+        "player_run_asset",
+        "trip_asset_materialized",
+    ):
         cands = ((spec.get(track) or {}).get("candidates") or [])
         for raw in cands:
             if not isinstance(raw, dict):
@@ -148,10 +153,10 @@ def per_feature_fingerprints(spec: Optional[dict]) -> Dict[str, str]:
     return dict(sorted(out.items()))
 
 
-def _depends_closure_for_track_llm(spec: dict) -> Dict[str, Set[str]]:
-    """Adjacency for track_llm ``depends_on`` edges (derived only)."""
+def _depends_closure_for_bet_duckdb_window(spec: dict) -> Dict[str, Set[str]]:
+    """Adjacency for bet_duckdb_window ``depends_on`` edges (derived only)."""
     adj: Dict[str, Set[str]] = {}
-    for cand in (spec.get("track_llm") or {}).get("candidates", []) or []:
+    for cand in (spec.get("bet_duckdb_window") or {}).get("candidates", []) or []:
         if not isinstance(cand, dict):
             continue
         fid = str(cand.get("feature_id") or "")
@@ -170,12 +175,12 @@ def impacted_feature_ids_on_fingerprint_change(
 ) -> Dict[str, Any]:
     """Heuristic impacted set when per-feature fingerprints change (spec or semantics).
 
-    Uses track_llm ``depends_on`` reverse reachability: if feature *dep*'s fingerprint
+    Uses bet_duckdb_window ``depends_on`` reverse reachability: if feature *dep*'s fingerprint
     changes, every derived feature that (transitively) lists *dep* in ``depends_on``
     is treated as impacted for recomputation planning.
     """
     changed = {k for k, v in curr_fps.items() if prev_fps.get(k) != v}
-    adj = _depends_closure_for_track_llm(spec)
+    adj = _depends_closure_for_bet_duckdb_window(spec)
     # Reverse graph: dependency feature_id -> consumers that list it in depends_on.
     rev: Dict[str, Set[str]] = {}
     for parent, deps in adj.items():

@@ -175,9 +175,10 @@ def build_chunk_layer_asset_manifest(
     layers: Dict[str, Any] = {}
     if isinstance(feature_spec, dict):
         for track, layer_key in (
-            ("track_llm", "bet"),
-            ("track_human", "run"),
-            ("track_profile", "player"),
+            ("bet_duckdb_window", "bet"),
+            ("run_state_machine", "run"),
+            ("player_run_asset", "player"),
+            ("trip_asset_materialized", "trip"),
         ):
             fids = [
                 str(x)

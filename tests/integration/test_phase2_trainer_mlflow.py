@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from trainer.core import training_artifact_bundle as artifact_bundle_mod
 from trainer.core import mlflow_utils
 from trainer.training import trainer as trainer_mod
 
@@ -56,8 +57,8 @@ class TestTrainerProvenanceParamsPayload(unittest.TestCase):
 
     def test_provenance_params_contain_required_keys(self):
         """Params passed to log_params_safe contain schema keys (model_version, etc.)."""
-        with patch.object(trainer_mod, "safe_start_run") as mock_start:
-            with patch.object(trainer_mod, "log_params_safe") as mock_log:
+        with patch.object(artifact_bundle_mod, "safe_start_run") as mock_start:
+            with patch.object(artifact_bundle_mod, "log_params_safe") as mock_log:
                 from contextlib import nullcontext
                 mock_start.return_value = nullcontext()
                 trainer_mod._log_training_provenance_to_mlflow(
@@ -92,8 +93,8 @@ class TestTrainerProvenanceParamsPayload(unittest.TestCase):
 
     def test_safe_start_run_called_with_run_name_model_version(self):
         """Code Review §3: safe_start_run must be called with run_name=model_version."""
-        with patch.object(trainer_mod, "safe_start_run") as mock_start:
-            with patch.object(trainer_mod, "log_params_safe"):
+        with patch.object(artifact_bundle_mod, "safe_start_run") as mock_start:
+            with patch.object(artifact_bundle_mod, "log_params_safe"):
                 from contextlib import nullcontext
                 mock_start.return_value = nullcontext()
                 trainer_mod._log_training_provenance_to_mlflow(
@@ -113,9 +114,9 @@ class TestLogProvenanceGitFallback(unittest.TestCase):
     """Code Review §1: When git fails (e.g. subprocess raises), git_commit becomes 'nogit' and no raise."""
 
     def test_git_failure_sets_git_commit_nogit_and_does_not_raise(self):
-        with patch.object(trainer_mod, "safe_start_run") as mock_start:
-            with patch.object(trainer_mod, "log_params_safe") as mock_log:
-                with patch.object(trainer_mod.subprocess, "check_output", side_effect=FileNotFoundError("git not found")):
+        with patch.object(artifact_bundle_mod, "safe_start_run") as mock_start:
+            with patch.object(artifact_bundle_mod, "log_params_safe") as mock_log:
+                with patch.object(artifact_bundle_mod.subprocess, "check_output", side_effect=FileNotFoundError("git not found")):
                     from contextlib import nullcontext
                     mock_start.return_value = nullcontext()
                     _call_log_provenance(git_commit=None)
@@ -129,8 +130,8 @@ class TestLogProvenanceLongArtifactDir(unittest.TestCase):
 
     def test_long_artifact_dir_log_params_safe_called_once(self):
         long_path = "C:\\" + "x" * 600
-        with patch.object(trainer_mod, "safe_start_run") as mock_start:
-            with patch.object(trainer_mod, "log_params_safe") as mock_log:
+        with patch.object(artifact_bundle_mod, "safe_start_run") as mock_start:
+            with patch.object(artifact_bundle_mod, "log_params_safe") as mock_log:
                 from contextlib import nullcontext
                 mock_start.return_value = nullcontext()
                 _call_log_provenance(artifact_dir=long_path, git_commit="abc")
@@ -144,8 +145,8 @@ class TestLogProvenanceLongArtifactDir(unittest.TestCase):
         """STATUS Code Review §3: extra long path keys still one log_params_safe (no crash)."""
         long_path = "C:\\" + "y" * 600
         long_pd = long_path + "\\pipeline_diagnostics.json"
-        with patch.object(trainer_mod, "safe_start_run") as mock_start:
-            with patch.object(trainer_mod, "log_params_safe") as mock_log:
+        with patch.object(artifact_bundle_mod, "safe_start_run") as mock_start:
+            with patch.object(artifact_bundle_mod, "log_params_safe") as mock_log:
                 from contextlib import nullcontext
                 mock_start.return_value = nullcontext()
                 _call_log_provenance(

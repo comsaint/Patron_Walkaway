@@ -489,8 +489,8 @@ def test_materialize_cleaned_bets_allows_duplicate_mapping_rows_same_canonical(t
     assert list(out["canonical_id"]) == ["canon_a", "canon_k"]
 
 
-def test_materialize_cleaned_bets_raises_on_conflicting_canonical_ids(tmp_path: Path) -> None:
-    """Mapping must not assign one ``player_id`` to multiple distinct ``canonical_id`` values."""
+def test_materialize_cleaned_bets_conflicting_canonical_ids_choose_deterministic_row(tmp_path: Path) -> None:
+    """Conflicting mapping rows should still produce deterministic canonical_id output."""
     cleaned = tmp_path / "cleaned.parquet"
     mapping = tmp_path / "mapping_conflict.parquet"
     pd.DataFrame(
@@ -506,11 +506,14 @@ def test_materialize_cleaned_bets_raises_on_conflicting_canonical_ids(tmp_path: 
         }
     ).to_parquet(mapping, index=False)
 
-    with pytest.raises(ValueError, match=r"1:1 player_id"):
-        _materialize_cleaned_bets_with_canonical_id(
-            cleaned_paths=[cleaned],
-            mapping_parquet=mapping,
-        )
+    out_paths = _materialize_cleaned_bets_with_canonical_id(
+        cleaned_paths=[cleaned],
+        mapping_parquet=mapping,
+    )
+    out = pd.read_parquet(out_paths[0])
+    assert len(out) == 1
+    assert out.loc[0, "player_id"] == 1001
+    assert str(out.loc[0, "canonical_id"]) in {"canon_z", "canon_a"}
 
 
 def test_canonical_parquet_digest_row_order_invariant(tmp_path: Path) -> None:

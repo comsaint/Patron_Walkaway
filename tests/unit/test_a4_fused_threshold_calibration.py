@@ -72,6 +72,7 @@ def _write_a4_bundle(tmp_path: Path, *, threshold: float) -> None:
     (tmp_path / "model_version").write_text("test-a4-cal", encoding="utf-8")
     (tmp_path / "reason_code_map.json").write_text("{}", encoding="utf-8")
     (tmp_path / "feature_list.json").write_text('["f1"]', encoding="utf-8")
+    (tmp_path / "feature_spec.yaml").write_text("bet_duckdb_window: {}\n", encoding="utf-8")
 
 
 def test_scorer_a4_uses_bundle_threshold_on_fused_scores(tmp_path: Path) -> None:
@@ -108,6 +109,7 @@ def test_scorer_a4_candidate_cutoff_uses_stage1_threshold_not_deployed(tmp_path:
     (tmp_path / "model_version").write_text("test-cutoff", encoding="utf-8")
     (tmp_path / "reason_code_map.json").write_text("{}", encoding="utf-8")
     (tmp_path / "feature_list.json").write_text('["f1"]', encoding="utf-8")
+    (tmp_path / "feature_spec.yaml").write_text("bet_duckdb_window: {}\n", encoding="utf-8")
     art = scorer.load_dual_artifacts(tmp_path)
     old_flag = getattr(scorer.config, "A4_TWO_STAGE_ENABLE_INFERENCE", False)
     scorer.config.A4_TWO_STAGE_ENABLE_INFERENCE = True

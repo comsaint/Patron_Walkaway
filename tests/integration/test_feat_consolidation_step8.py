@@ -1,7 +1,6 @@
 """feat-consolidation Step 8 — 向後相容與 YAML 完整性測試.
 
-- 向後相容：載入舊版 feature_list（含 "B"/"legacy"/"profile"）時 scorer 不報錯，
-  且 profile 欄位（track "profile" 或 "track_profile"）維持 NaN 語義。
+- Canonical 契約：feature_list 僅使用 method track；profile 欄位維持 NaN 語義。
 - Train-serve parity：同一批資料、同一套函式（features.compute_*），特徵值一致。
 """
 
@@ -212,11 +211,11 @@ class TestScorerTrainServeParityTrackHuman(unittest.TestCase):
         self.assertIn("minutes_since_run_start", out.columns)
 
 
-class TestScorerBackwardCompatFeatureList(unittest.TestCase):
-    """Step 8: Scorer accepts legacy feature_list.json (track B/legacy/profile)."""
+class TestScorerFeatureListContract(unittest.TestCase):
+    """Step 8: Scorer enforces canonical feature_list track metadata."""
 
-    def test_score_df_with_legacy_track_profile_does_not_crash(self):
-        """feature_list_meta with track 'profile' (legacy) or 'track_profile' treats those as profile."""
+    def test_score_df_with_player_run_asset_does_not_crash(self):
+        """feature_list_meta with track 'player_run_asset' keeps profile NaN semantics."""
         import numpy as np
         import pandas as pd
 
@@ -229,12 +228,11 @@ class TestScorerBackwardCompatFeatureList(unittest.TestCase):
             "is_rated": [True, True],
         })
         feature_list = ["wager", "days_since_last_session"]
-        # Old format: track "B" and legacy "profile" (not "track_profile")
         artifacts = {
             "rated": None,
             "feature_list_meta": [
-                {"name": "wager", "track": "B"},
-                {"name": "days_since_last_session", "track": "profile"},
+                {"name": "wager", "track": "bet_duckdb_window"},
+                {"name": "days_since_last_session", "track": "player_run_asset"},
             ],
         }
         out = _score_df(df, artifacts, feature_list)
@@ -243,8 +241,8 @@ class TestScorerBackwardCompatFeatureList(unittest.TestCase):
         # Profile column should still have NaN where it was NaN (not zero-filled)
         self.assertTrue(pd.isna(out["days_since_last_session"].iloc[0]))
 
-    def test_score_df_with_track_human_and_legacy_does_not_crash(self):
-        """feature_list_meta with only track 'B' and 'legacy' runs without error."""
+    def test_score_df_with_canonical_non_profile_tracks_does_not_crash(self):
+        """feature_list_meta with canonical non-profile tracks runs without error."""
         import pandas as pd
 
         from trainer.scorer import _score_df
@@ -258,17 +256,16 @@ class TestScorerBackwardCompatFeatureList(unittest.TestCase):
         artifacts = {
             "rated": None,
             "feature_list_meta": [
-                {"name": "wager", "track": "B"},
-                {"name": "base_ha", "track": "legacy"},
+                {"name": "wager", "track": "bet_duckdb_window"},
+                {"name": "base_ha", "track": "bet_duckdb_window"},
             ],
         }
         out = _score_df(df, artifacts, feature_list)
         self.assertIn("score", out)
         self.assertEqual(out["score"].iloc[0], 0.0)
 
-    def test_r144_scorer_accepts_legacy_track_and_distinguishes_profile_vs_non_profile(self):
-        """Round 144 Review P2: feature_list with track 'B'/'legacy' → non-profile (zero-filled);
-        track 'profile'/'track_profile' → profile (NaN preserved). Scorer must load and apply correctly."""
+    def test_scorer_distinguishes_profile_vs_non_profile_by_canonical_track(self):
+        """Canonical track metadata: non-profile zero-filled; profile keeps NaN."""
         import numpy as np
         import pandas as pd
 
@@ -284,17 +281,17 @@ class TestScorerBackwardCompatFeatureList(unittest.TestCase):
         artifacts = {
             "rated": None,
             "feature_list_meta": [
-                {"name": "wager", "track": "B"},
-                {"name": "base_ha", "track": "legacy"},
-                {"name": "days_since_last_session", "track": "profile"},
+                {"name": "wager", "track": "bet_duckdb_window"},
+                {"name": "base_ha", "track": "bet_duckdb_window"},
+                {"name": "days_since_last_session", "track": "player_run_asset"},
             ],
         }
         out = _score_df(df, artifacts, feature_list)
         self.assertIn("score", out)
-        # Non-profile (B/legacy): absent values get 0; present stay as-is (no NaN in these cols here).
+        # Non-profile (bet_duckdb_window): absent values get 0; present stay as-is.
         self.assertIn("wager", out.columns)
         self.assertIn("base_ha", out.columns)
-        # Profile (track "profile"): must preserve NaN where input was NaN (R74/R79).
+        # Profile (player_run_asset): must preserve NaN where input was NaN (R74/R79).
         self.assertTrue(pd.isna(out["days_since_last_session"].iloc[0]))
         self.assertEqual(out["days_since_last_session"].iloc[1], 5.0)
 
@@ -312,7 +309,7 @@ class TestScorerNoSessionComputesFeatureList(unittest.TestCase):
 
         HK_TZ = ZoneInfo("Asia/Hong_Kong")
         cutoff = datetime(2026, 3, 1, 12, 0, 0, tzinfo=HK_TZ)
-        # Minimal bets: no session data needed for Track Human + legacy raw columns
+        # Minimal bets: no session data needed for run_state_machine + passthrough columns
         bets = pd.DataFrame({
             "bet_id": [1, 2],
             "session_id": ["s1", "s1"],
@@ -331,7 +328,7 @@ class TestScorerNoSessionComputesFeatureList(unittest.TestCase):
 
         out = build_features_for_scoring(bets, sessions, canonical_map, cutoff)
         self.assertFalse(out.empty, "build_features_for_scoring should return non-empty DataFrame")
-        # feature_list that does not depend on session (Track Human + legacy passthrough)
+        # feature_list that does not depend on session (run_state_machine + passthrough)
         feature_list = ["wager", "loss_streak", "minutes_since_run_start"]
         for col in feature_list:
             self.assertIn(col, out.columns, f"feature_list column {col} should be present when session is empty")
@@ -367,9 +364,9 @@ class TestScorerNoSessionComputesFeatureList(unittest.TestCase):
         artifacts = {
             "rated": None,
             "feature_list_meta": [
-                {"name": "wager", "track": "legacy"},
-                {"name": "loss_streak", "track": "track_human"},
-                {"name": "minutes_since_run_start", "track": "track_human"},
+                {"name": "wager", "track": "bet_duckdb_window"},
+                {"name": "loss_streak", "track": "run_state_machine"},
+                {"name": "minutes_since_run_start", "track": "run_state_machine"},
             ],
         }
         out = _score_df(features_df, artifacts, feature_list)
@@ -430,9 +427,9 @@ class TestScorerRound135ReviewRisks(unittest.TestCase):
         artifacts = {
             "rated": None,
             "feature_list_meta": [
-                {"name": "wager", "track": "legacy"},
-                {"name": "loss_streak", "track": "track_human"},
-                {"name": "minutes_since_run_start", "track": "track_human"},
+                {"name": "wager", "track": "bet_duckdb_window"},
+                {"name": "loss_streak", "track": "run_state_machine"},
+                {"name": "minutes_since_run_start", "track": "run_state_machine"},
             ],
         }
         scored = _score_df(out, artifacts, feature_list)
@@ -449,8 +446,8 @@ class TestScorerRound135ReviewRisks(unittest.TestCase):
         artifacts = {
             "rated": None,
             "feature_list_meta": [
-                {"name": "wager", "track": "legacy"},
-                {"name": "days_since_last_session", "track": "profile"},
+                {"name": "wager", "track": "bet_duckdb_window"},
+                {"name": "days_since_last_session", "track": "player_run_asset"},
             ],
         }
         out = _score_df(df, artifacts, feature_list)

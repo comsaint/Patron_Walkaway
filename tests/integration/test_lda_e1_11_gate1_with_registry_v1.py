@@ -40,7 +40,7 @@ def test_orchestrator_always_applies_registry_manifest_has_fix_ids(tmp_path: Pat
         _run_orchestrator(
             [
                 "--ingestion-fix-registry-version-expected",
-                "v0.5_draft",
+                "v0.7_draft",
                 "--gate1-output-parent",
                 str(gate_out),
             ],

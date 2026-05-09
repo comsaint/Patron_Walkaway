@@ -17,7 +17,7 @@ LAYER_NAMES = frozenset({"bet", "run", "trip", "player"})
 
 def _candidate_rows(spec: dict) -> list[dict]:
     rows: list[dict] = []
-    for track in ("track_llm", "track_human", "track_profile"):
+    for track in ("bet_duckdb_window", "run_state_machine", "player_run_asset", "trip_asset_materialized"):
         for c in ((spec.get(track) or {}).get("candidates") or []):
             if isinstance(c, dict) and c.get("feature_id"):
                 rows.append({"track": track, **c})
@@ -85,16 +85,12 @@ def test_phase_b_entrypoints_importable(mod_name: str) -> None:
 
 
 def test_bet_player_wrappers_match_legacy_byte_identical() -> None:
-    """Gate-B3 smoke: layered wrappers == underlying legacy (no DuckDB path).
-
-    Uses empty ``track_llm.candidates`` and ``feature_cols=[]`` so the legacy
-    functions return early without requiring the full bet schema / wager alias.
-    """
+    """Gate-B3 smoke: layered wrappers == underlying canonical functions."""
     os.environ.pop("MODEL_DIR", None)
     from trainer.features import features as F
     from trainer.features import layered as L
 
-    spec: dict = {"track_llm": {"candidates": []}}
+    spec: dict = {"bet_duckdb_window": {"candidates": []}}
     now = pd.Timestamp("2024-01-15 12:00:00")
     bets = pd.DataFrame(
         {
@@ -103,7 +99,7 @@ def test_bet_player_wrappers_match_legacy_byte_identical() -> None:
             "payout_complete_dtm": [now - pd.Timedelta(minutes=10), now - pd.Timedelta(minutes=5)],
         }
     )
-    out_legacy = F.compute_track_llm_features(bets, feature_spec=spec, cutoff_time=now)
+    out_legacy = F.compute_bet_duckdb_window_features(bets, feature_spec=spec, cutoff_time=now)
     out_layered = L.compute_bet_layer_features(bets, feature_spec=spec, cutoff_time=now)
     pd.testing.assert_frame_equal(out_legacy, out_layered)
 

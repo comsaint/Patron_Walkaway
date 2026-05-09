@@ -20,7 +20,7 @@ _FEATURE_SPEC_PATH = _REPO_ROOT / "trainer" / "feature_spec" / "feature_candidat
 _TRAINER_PATH = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 _BACKTESTER_PATH = _REPO_ROOT / "trainer" / "backtester.py"
 # Issue #12 PR-12.3 / PR-12.5: feature pipeline coordinators (apply_dq,
-# add_track_human_features) now live in feature_pipeline.py. Tests that AST-walk
+# add_run_state_machine_features) now live in feature_pipeline.py. Tests that AST-walk
 # trainer.py for those names must also walk this module.
 _FEATURE_PIPELINE_PATH = _REPO_ROOT / "trainer" / "training" / "feature_pipeline.py"
 

@@ -156,3 +156,125 @@ class TestSingleWindowProfileWiring(unittest.TestCase):
         self.assertEqual(call_args[1], expected_effective_end)
 
         self.assertEqual(mock_proc.call_count, 1)
+
+    def test_canonical_artifact_source_guard_mismatch_forces_rebuild(self) -> None:
+        base_time = datetime(2025, 1, 1, tzinfo=HK_TZ)
+        end_time = base_time + timedelta(days=60)
+        fake_chunks = [
+            {
+                "window_start": base_time,
+                "window_end": end_time,
+                "extended_end": end_time + timedelta(days=1),
+            }
+        ]
+        cmap = pd.DataFrame({"player_id": [1001], "canonical_id": ["canon_1001"]})
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            canonical_parquet = tmp_path / "canonical_mapping.parquet"
+            canonical_sidecar = tmp_path / "canonical_mapping.cutoff.json"
+            cmap.to_parquet(canonical_parquet, index=False)
+            canonical_sidecar.write_text(
+                '{"cutoff_dtm":"2030-01-01T00:00:00","dummy_player_ids":[],"source_snapshot_id":"snap_old","bridge_manifest_stat":"old_stat"}',
+                encoding="utf-8",
+            )
+            seed_path = tmp_path / "seed.parquet"
+            seed_df = pd.DataFrame(
+                {
+                    "payout_complete_dtm": [datetime(2025, 2, 15, tzinfo=HK_TZ)],
+                    "label": [1],
+                    "is_rated": [True],
+                    "canonical_id": ["C0"],
+                    "bet_id": [1],
+                    "run_id": [1],
+                }
+            )
+            seed_df.to_parquet(seed_path, index=False)
+            read_calls: list[Path] = []
+            mock_links = MagicMock(
+                return_value=(
+                    pd.DataFrame(columns=["player_id", "casino_player_id", "lud_dtm"]),
+                    set(),
+                )
+            )
+            patches = (
+                patch("trainer.training.cross_entry_preflight.run_cross_entry_data_preflight"),
+                patch("trainer.features.features._track_section_enabled_in_spec", return_value=True),
+                patch(
+                    "trainer.training.pipeline_run_core.l2_bundle_materialize.materialize_l2_training_bundle_dir",
+                    return_value=Path(tempfile.mkdtemp(prefix="l2bundle_")),
+                ),
+                patch(
+                    "trainer.training.pipeline_run_core.pipeline_l2_bundle.execute_l2_training_bundle",
+                    MagicMock(return_value=None),
+                ),
+                patch(
+                    "trainer.training.pipeline_run_core.l2_bundle_materialize.auto_bundle_cache_is_current",
+                    return_value=False,
+                ),
+                patch("trainer.training.pipeline_run_core.STEP7_USE_DUCKDB", False),
+                patch("trainer.training.pipeline_run_core.STEP7_KEEP_TRAIN_ON_DISK", False),
+                patch(
+                    "trainer.training.pipeline_run_core.read_bridge_source_snapshot_id",
+                    return_value="snap_current",
+                ),
+                patch(
+                    "trainer.training.pipeline_run_core.l2_bundle_materialize.bridge_manifest_stat_token",
+                    return_value="cur_stat",
+                ),
+                patch(
+                    "trainer.training.pipeline_run_core.local_parquet_session_path_for_trainer",
+                    return_value=seed_path,
+                ),
+                patch("trainer.training.pipeline_run_core.CANONICAL_MAPPING_PARQUET", new=canonical_parquet),
+                patch("trainer.training.pipeline_run_core.CANONICAL_MAPPING_CUTOFF_JSON", new=canonical_sidecar),
+                patch(
+                    "trainer.training.pipeline_run_core.build_canonical_links_and_dummy_from_duckdb",
+                    new=mock_links,
+                ),
+                patch(
+                    "trainer.training.pipeline_run_core.build_canonical_mapping_from_links",
+                    return_value=cmap,
+                ),
+                patch("trainer.training.pipeline_run_core.ensure_player_profile_ready"),
+                patch("trainer.training.pipeline_run_core.load_player_profile", return_value=pd.DataFrame()),
+                patch("trainer.training.pipeline_run_core.process_chunk", return_value=seed_path),
+                patch("trainer.training.pipeline_run_core.get_single_window_chunk", return_value=fake_chunks),
+                patch(
+                    "trainer.training.pipeline_run_core.train_single_rated_model",
+                    return_value=({"model": None, "threshold": 0.5, "features": []}, None, {}),
+                ),
+                patch("trainer.training.pipeline_run_core.save_artifact_bundle"),
+                patch("trainer.training.pipeline_run_core._oom_check_after_chunk1", return_value=1.0),
+            )
+            with ExitStack() as stack:
+                for p in patches:
+                    stack.enter_context(p)
+
+                def _read_parquet(path, *args, **kwargs):
+                    p = Path(path).resolve()
+                    read_calls.append(p)
+                    if p == canonical_parquet.resolve():
+                        return cmap
+                    return seed_df
+
+                stack.enter_context(
+                    patch("trainer.training.pipeline_run_core.pd.read_parquet", side_effect=_read_parquet)
+                )
+                args = argparse.Namespace(
+                    start="2025-01-01",
+                    end="2025-06-01",
+                    days=None,
+                    use_local_parquet=True,
+                    force_recompute=False,
+                    skip_optuna=True,
+                    l2_training_bundle=None,
+                )
+                run_pipeline(args)
+
+            canonical_reads = [p for p in read_calls if p == canonical_parquet.resolve()]
+            self.assertEqual(
+                len(canonical_reads),
+                0,
+                "source guard mismatch must skip canonical artifact read and force rebuild",
+            )
+            self.assertGreater(mock_links.call_count, 0, "source guard mismatch should trigger rebuild path")

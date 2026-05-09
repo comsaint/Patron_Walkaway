@@ -9,7 +9,7 @@ This module owns the *coordination layer* between raw bet/session input and
 the per-row feature columns expected by the trainer/backtester/scorer:
 
 * ``apply_dq`` — FND-01 / FND-02 / FND-04 + R23 / DEC-018 timezone & DQ guards.
-* ``add_track_human_features`` — Track Human state machines (loss streak,
+* ``add_run_state_machine_features`` — run_state_machine features (loss streak,
   run boundary, table HC) wired onto the bets DataFrame using the canonical
   feature primitives in ``trainer.features``.
 
@@ -236,13 +236,13 @@ def apply_dq(
     return bets, sessions
 
 
-def add_track_human_features(
+def add_run_state_machine_features(
     bets: pd.DataFrame,
     canonical_map: pd.DataFrame,
     window_end: datetime,
     lookback_hours: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Return a copy of *bets* with Track Human feature columns attached.
+    """Return a copy of *bets* with run_state_machine feature columns attached.
 
     A copy is taken so the caller's DataFrame is not mutated.  After column
     pushdown, ``bets`` is already narrow (~20 cols), so the copy cost is low.
@@ -287,7 +287,7 @@ def add_track_human_features(
     _hc_missing = {"table_id", "bet_id", "payout_complete_dtm", "player_id"} - set(df.columns)
     if _hc_missing:
         logger.warning(
-            "add_track_human_features: table_hc skipped — missing columns %s",
+            "add_run_state_machine_features: table_hc skipped — missing columns %s",
             sorted(_hc_missing),
         )
         df["table_hc"] = np.int32(0)
@@ -302,5 +302,3 @@ def add_track_human_features(
     return df
 
 
-# Layer+method public alias (run-level state machine; legacy "Track Human").
-add_run_state_machine_features = add_track_human_features

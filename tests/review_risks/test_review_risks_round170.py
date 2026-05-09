@@ -53,7 +53,7 @@ class TestR500BacktesterTzAwareBoundary(unittest.TestCase):
 
         with patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)), patch.object(
             backtester_mod, "build_canonical_mapping_from_df", return_value=pd.DataFrame()
-        ), patch.object(backtester_mod, "add_track_human_features", side_effect=lambda df, *_, **__: df), patch.object(
+        ), patch.object(backtester_mod, "add_run_state_machine_features", side_effect=lambda df, *_, **__: df), patch.object(
             backtester_mod, "load_player_profile", return_value=None
         ), patch.object(backtester_mod, "join_player_profile", side_effect=_minimal_join_profile):
             # R500: should not raise TypeError (tz-aware window); no ClickHouse required (mocked).

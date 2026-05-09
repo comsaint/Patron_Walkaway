@@ -9,7 +9,9 @@
 ``training_metrics.v2.json``, then ``training_metrics.json``; otherwise
 :data:`trainer.core.config.SELECTION_MODE`.
 
-``production_neg_pos_ratio`` defaults to :data:`trainer.core.config.PRODUCTION_NEG_POS_RATIO`.
+``production_neg_pos_ratio`` defaults to :data:`trainer.core.config.PRODUCTION_NEG_POS_RATIO`
+(``training_metrics.v3.json`` does not repeat this config assumption; legacy
+``training_metrics.json`` / v2 may still carry it for audits).
 Callers that load config via a different module (e.g. backtester ``_cfg``) may pass
 ``production_neg_pos_ratio=...`` so the contract matches ``compute_micro_metrics``.
 """

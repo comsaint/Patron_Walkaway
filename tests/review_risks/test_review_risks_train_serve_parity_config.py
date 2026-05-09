@@ -70,9 +70,9 @@ class TestScorerLookbackHoursTypeContract(unittest.TestCase):
 class TestTrackHumanParitySameLookback(unittest.TestCase):
     """PLAN § Train–Serve Parity 步驟 3：同一批 bets、相同 lookback_hours 時，Track Human 產出一致。"""
 
-    def test_add_track_human_features_deterministic_for_same_lookback(self):
+    def test_add_run_state_machine_features_deterministic_for_same_lookback(self):
         """相同 (bets, canonical_map, window_end, lookback_hours=8) 呼叫兩次，Track Human 欄位數值一致。"""
-        from trainer.trainer import add_track_human_features
+        from trainer.trainer import add_run_state_machine_features
 
         rows = [(0, 1, "LOSE"), (10, 2, "LOSE"), (20, 3, "WIN"), (30, 4, "LOSE")]
         bets = _bets(rows)
@@ -81,8 +81,8 @@ class TestTrackHumanParitySameLookback(unittest.TestCase):
         window_end = _BASE + timedelta(minutes=25)
         lookback_hours = 8.0
 
-        out1 = add_track_human_features(bets, canonical_map, window_end, lookback_hours=lookback_hours)
-        out2 = add_track_human_features(bets, canonical_map, window_end, lookback_hours=lookback_hours)
+        out1 = add_run_state_machine_features(bets, canonical_map, window_end, lookback_hours=lookback_hours)
+        out2 = add_run_state_machine_features(bets, canonical_map, window_end, lookback_hours=lookback_hours)
 
         for col in TRACK_HUMAN_COLS:
             self.assertIn(col, out1.columns, f"missing col {col} in out1")
@@ -94,16 +94,16 @@ class TestTrackHumanParitySameLookback(unittest.TestCase):
                 obj=f"Track Human parity: {col}",
             )
 
-    def test_add_track_human_features_missing_canonical_id_returns_zeros(self):
+    def test_add_run_state_machine_features_missing_canonical_id_returns_zeros(self):
         """缺 canonical_id 時五個 Track Human 欄位皆為 0（STATUS Code Review §3）。"""
-        from trainer.trainer import add_track_human_features
+        from trainer.trainer import add_run_state_machine_features
 
         bets = _bets([(0, 1, "LOSE")])
         bets = bets.drop(columns=["canonical_id"])
         canonical_map = pd.DataFrame({"player_id": [1], "canonical_id": ["P1"]})
         window_end = _BASE + timedelta(minutes=10)
 
-        out = add_track_human_features(bets, canonical_map, window_end)
+        out = add_run_state_machine_features(bets, canonical_map, window_end)
 
         for col in TRACK_HUMAN_COLS:
             self.assertIn(col, out.columns, f"missing col {col}")

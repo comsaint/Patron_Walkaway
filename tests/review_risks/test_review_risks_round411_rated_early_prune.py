@@ -21,15 +21,15 @@ class TestR411TrainerEarlyPruneContract(unittest.TestCase):
     def test_process_chunk_should_define_rated_subset_before_track_human(self):
         source = inspect.getsource(trainer_mod.process_chunk)
         idx_identity = source.find('bets["canonical_id"] = bets["canonical_id"].fillna')
-        idx_track_human = source.find("add_track_human_features(", idx_identity)
+        idx_track_human = source.find("add_run_state_machine_features(", idx_identity)
         idx_rated_marker = source.find("rated_ids", idx_identity, idx_track_human)
 
         self.assertGreater(idx_identity, -1, "process_chunk should attach canonical_id before FE.")
-        self.assertGreater(idx_track_human, -1, "process_chunk should call add_track_human_features.")
+        self.assertGreater(idx_track_human, -1, "process_chunk should call add_run_state_machine_features.")
         self.assertGreater(
             idx_rated_marker,
             -1,
-            "R411 #1: process_chunk should build rated-only routing before add_track_human_features.",
+            "R411 #1: process_chunk should build rated-only routing before add_run_state_machine_features.",
         )
 
 
@@ -39,15 +39,15 @@ class TestR411BacktesterEarlyPruneContract(unittest.TestCase):
     def test_backtest_should_prune_before_track_human(self):
         source = inspect.getsource(backtester_mod.backtest)
         idx_identity = source.find('bets["canonical_id"] = bets["canonical_id"].fillna')
-        idx_track_human = source.find("add_track_human_features(", idx_identity)
+        idx_track_human = source.find("add_run_state_machine_features(", idx_identity)
         idx_rated_hint = source.find("is_rated", idx_identity, idx_track_human)
 
         self.assertGreater(idx_identity, -1, "backtest should attach canonical_id before FE.")
-        self.assertGreater(idx_track_human, -1, "backtest should call add_track_human_features.")
+        self.assertGreater(idx_track_human, -1, "backtest should call add_run_state_machine_features.")
         self.assertGreater(
             idx_rated_hint,
             -1,
-            "R411 #2: backtest should apply rated-only pruning before add_track_human_features.",
+            "R411 #2: backtest should apply rated-only pruning before add_run_state_machine_features.",
         )
 
 

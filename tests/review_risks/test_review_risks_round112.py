@@ -32,7 +32,7 @@ class TestRound112RiskGuards(unittest.TestCase):
 
     def test_r112_1_passthrough_should_have_explicit_sql_branch(self):
         """R112-1: Track LLM SQL builder should explicitly handle passthrough."""
-        src = inspect.getsource(features_mod.compute_track_llm_features)
+        src = inspect.getsource(features_mod.compute_bet_duckdb_window_features)
         src_one = inspect.getsource(features_impl._llm_one_select_item)
         combined = src + src_one
         self.assertIn(
@@ -164,7 +164,7 @@ class TestRound112RiskGuards(unittest.TestCase):
                 ]
             }
         }
-        out = features_mod.compute_track_llm_features(bets, spec)
+        out = features_mod.compute_bet_duckdb_window_features(bets, spec)
         self.assertTrue(((out["time_of_day_sin"] >= -1.0) & (out["time_of_day_sin"] <= 1.0)).all())
         self.assertTrue(((out["time_of_day_cos"] >= -1.0) & (out["time_of_day_cos"] <= 1.0)).all())
 

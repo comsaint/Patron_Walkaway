@@ -235,7 +235,7 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
 
     def test_cross_layer_compose_closure_hash_changes_with_profile(self) -> None:
         spec = {
-            "track_human": {
+            "run_state_machine": {
                 "candidates": [
                     {
                         "feature_id": "pace_vs_personal_baseline",
@@ -248,7 +248,7 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
                     }
                 ]
             },
-            "track_profile": {
+            "player_run_asset": {
                 "candidates": [
                     {"feature_id": "avg_session_duration_min_30d"},
                 ]
@@ -270,7 +270,7 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
         }
         bets = pd.DataFrame({"bet_id": [1], "amount": [1.0]})
         spec = {
-            "track_human": {
+            "run_state_machine": {
                 "candidates": [
                     {
                         "feature_id": "pace_vs_personal_baseline",
@@ -281,7 +281,7 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
                     }
                 ]
             },
-            "track_profile": {"candidates": [{"feature_id": "avg_session_duration_min_30d"}]},
+            "player_run_asset": {"candidates": [{"feature_id": "avg_session_duration_min_30d"}]},
         }
         comp = trainer_mod._chunk_cache_components(
             chunk,
@@ -295,7 +295,7 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
 
     def test_cross_layer_compose_validation_raises_when_input_missing(self) -> None:
         spec = {
-            "track_human": {
+            "run_state_machine": {
                 "candidates": [
                     {
                         "feature_id": "pace_vs_personal_baseline",
@@ -306,7 +306,7 @@ class TestTask7ChunkCacheKey(unittest.TestCase):
                     }
                 ]
             },
-            "track_profile": {"candidates": [{"feature_id": "avg_session_duration_min_30d"}]},
+            "player_run_asset": {"candidates": [{"feature_id": "avg_session_duration_min_30d"}]},
         }
         with self.assertRaisesRegex(ValueError, "cross-layer compose"):
             trainer_mod._validate_cross_layer_compose_inputs(

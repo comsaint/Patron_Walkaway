@@ -12,7 +12,7 @@ import trainer.trainer as trainer_mod
 
 class TestDuckDbRuntimeHardeningM1SourceContracts(unittest.TestCase):
     def test_track_llm_uses_shared_runtime_policy(self):
-        src = inspect.getsource(features_mod.compute_track_llm_features)
+        src = inspect.getsource(features_mod.compute_bet_duckdb_window_features)
         src_batch = inspect.getsource(features_impl._llm_run_duckdb_batch_query)
         combined = src + src_batch
         self.assertIn("resolve_duckdb_runtime_policy(", combined)

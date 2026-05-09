@@ -32,6 +32,7 @@ def _write_bundle(tmp_path: Path, payload: dict) -> None:
     (tmp_path / "model_version").write_text("test-version", encoding="utf-8")
     (tmp_path / "reason_code_map.json").write_text("{}", encoding="utf-8")
     (tmp_path / "feature_list.json").write_text('["f1"]', encoding="utf-8")
+    (tmp_path / "feature_spec.yaml").write_text("bet_duckdb_window: {}\n", encoding="utf-8")
 
 
 def test_load_dual_artifacts_backward_compatible_defaults(tmp_path: Path) -> None:

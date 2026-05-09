@@ -72,7 +72,7 @@ class TestR412TrainerBacktesterBehavior(unittest.TestCase):
                 patch.object(trainer_mod, "load_clickhouse_data", return_value=(bets, sessions)),
                 patch.object(trainer_mod, "normalize_bets_sessions", return_value=(bets, sessions)),
                 patch.object(trainer_mod, "apply_dq", return_value=(bets, sessions)),
-                patch.object(trainer_mod, "add_track_human_features", side_effect=_capture_track_human),
+                patch.object(trainer_mod, "add_run_state_machine_features", side_effect=_capture_track_human),
                 patch.object(trainer_mod, "compute_labels", side_effect=_minimal_labels),
                 patch.object(trainer_mod, "join_player_profile", side_effect=lambda x, y: x),
             ):
@@ -115,9 +115,9 @@ class TestR412TrainerBacktesterBehavior(unittest.TestCase):
         with (
             patch.object(backtester_mod, "apply_dq", return_value=(bets, sessions)),
             patch.object(backtester_mod, "build_canonical_mapping_from_df", return_value=canonical_map),
-            patch.object(backtester_mod, "add_track_human_features", side_effect=_capture_track_human),
+            patch.object(backtester_mod, "add_run_state_machine_features", side_effect=_capture_track_human),
             patch.object(backtester_mod, "load_feature_spec", return_value={"track_llm": {"candidates": []}}),
-            patch.object(backtester_mod, "compute_track_llm_features", return_value=pd.DataFrame({"bet_id": [1]})),
+            patch.object(backtester_mod, "compute_bet_duckdb_window_features", return_value=pd.DataFrame({"bet_id": [1]})),
             patch.object(backtester_mod, "compute_labels", side_effect=_minimal_labels),
             patch.object(backtester_mod, "load_player_profile", return_value=None),
             patch.object(backtester_mod, "join_player_profile", side_effect=lambda x, y: x),

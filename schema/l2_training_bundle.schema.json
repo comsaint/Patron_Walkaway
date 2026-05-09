@@ -16,7 +16,7 @@
     "identity_mapping_mode"
   ],
   "properties": {
-    "schema_version": { "type": "string", "const": "1" },
+    "schema_version": { "type": "string", "enum": ["1", "2"] },
     "source_snapshot_id": { "type": "string", "minLength": 1 },
     "snapshot_id": { "type": "string", "minLength": 1 },
     "l2_snapshot_id": { "type": "string", "minLength": 1 },
@@ -59,6 +59,46 @@
           "additionalProperties": { "type": "string" }
         }
       }
-    }
+    },
+    "split_day_manifest": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "train": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["day", "path"],
+            "properties": {
+              "day": { "type": "string", "minLength": 1 },
+              "path": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "valid": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["day", "path"],
+            "properties": {
+              "day": { "type": "string", "minLength": 1 },
+              "path": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "test": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["day", "path"],
+            "properties": {
+              "day": { "type": "string", "minLength": 1 },
+              "path": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "split_calendar": { "type": "object", "additionalProperties": true }
   }
 }

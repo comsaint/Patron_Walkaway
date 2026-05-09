@@ -235,15 +235,15 @@ def chunk_two_stage_cache_enabled() -> bool:
 # These wrappers intentionally stay on the public facade module so that tests and
 # callers which monkeypatch ``trainer.core.config.DUCKDB_*`` affect runtime logic.
 def get_duckdb_memory_config(
-    stage: Literal["profile", "step7", "canonical_map", "track_llm", "screening", "libsvm_export"],
+    stage: Literal["profile", "step7", "canonical_map", "bet_duckdb_window", "screening", "libsvm_export"],
 ) -> Tuple[float, float, float, Optional[float], int, bool, Optional[str]]:
     """Return (frac, min_gb, max_gb, ram_max_frac, threads, preserve_order, temp_dir).
 
     Callers use this + available_ram to compute memory_limit and SET runtime.
     """
-    if stage not in ("profile", "step7", "canonical_map", "track_llm", "screening", "libsvm_export"):
+    if stage not in ("profile", "step7", "canonical_map", "bet_duckdb_window", "screening", "libsvm_export"):
         raise ValueError(
-            "stage must be 'profile', 'step7', 'canonical_map', 'track_llm', 'screening', or 'libsvm_export', got %r"
+            "stage must be 'profile', 'step7', 'canonical_map', 'bet_duckdb_window', 'screening', or 'libsvm_export', got %r"
             % (stage,)
         )
     frac = DUCKDB_RAM_FRACTION
@@ -261,7 +261,7 @@ def get_duckdb_memory_config(
     elif stage == "canonical_map":
         threads = CANONICAL_MAP_DUCKDB_THREADS
         max_gb = CANONICAL_MAP_DUCKDB_MEMORY_LIMIT_MAX_GB
-    elif stage == "track_llm":
+    elif stage == "bet_duckdb_window":
         threads = TRACK_LLM_DUCKDB_THREADS
         max_gb = TRACK_LLM_DUCKDB_MEMORY_LIMIT_MAX_GB
     elif stage == "screening":
@@ -274,7 +274,7 @@ def get_duckdb_memory_config(
 
 
 def get_duckdb_memory_limit_bytes(
-    stage: Literal["profile", "step7", "canonical_map", "track_llm", "screening", "libsvm_export"],
+    stage: Literal["profile", "step7", "canonical_map", "bet_duckdb_window", "screening", "libsvm_export"],
     available_bytes: Optional[int],
 ) -> int:
     """Compute DuckDB memory_limit in bytes. Uses get_duckdb_memory_config(stage).

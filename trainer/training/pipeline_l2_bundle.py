@@ -59,6 +59,8 @@ def execute_l2_training_bundle(
 
     import trainer.training.trainer as tr
 
+    from trainer.core import config as _core_cfg
+
     from trainer.training.issue16_gates import (
         evaluate_issue16_gate_bundle,
         raise_if_strict_issue16_gates_failed,
@@ -222,12 +224,12 @@ def execute_l2_training_bundle(
     _train_cols = pd.Index(_l2_train_cols)
     active_feature_cols = tr.get_all_candidate_feature_ids(feature_spec, screening_only=True)
     if feature_spec is not None:
-        _track_llm_cols = [
+        _bet_method_cols = [
             cand.get("feature_id")
-            for cand in (feature_spec.get("track_llm", {}) or {}).get("candidates", [])
+            for cand in (feature_spec.get("bet_duckdb_window", {}) or {}).get("candidates", [])
             if cand.get("feature_id") in _train_cols
         ]
-        _all_candidate_cols = list(dict.fromkeys(active_feature_cols + _track_llm_cols))
+        _all_candidate_cols = list(dict.fromkeys(active_feature_cols + _bet_method_cols))
     else:
         _all_candidate_cols = active_feature_cols
     _present_candidate_cols = [c for c in _all_candidate_cols if c in _train_cols]
@@ -329,6 +331,12 @@ def execute_l2_training_bundle(
             skip_optuna,
         )
     else:
+        if bool(getattr(_core_cfg, "HIGH_ROLLER_SEGMENT_ENABLE", False)):
+            raise RuntimeError(
+                "L2 bundle: HIGH_ROLLER_SEGMENT_ENABLE is True but "
+                "train_issue8_high_roller_segmented_bundle returned None "
+                "(expected a raised error from Issue #8 instead)."
+            )
         _l2_train_libsvm, _l2_valid_libsvm, _l2_test_libsvm = tr._export_parquet_to_libsvm(
             manifest.train_export_paths,
             manifest.valid_export_paths,

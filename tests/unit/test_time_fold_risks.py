@@ -54,31 +54,31 @@ class TestTimeFoldRisks(unittest.TestCase):
         # R3 is now fixed: for n=3..5, test_chunks must be >= 1.
         # The test name is kept for historical traceability.
         time_fold = _import_time_fold_top_level()
-        get_train_valid_test_split = time_fold.get_train_valid_test_split
+        partition_windows_for_train_end_cutoff = time_fold.partition_windows_for_train_end_cutoff
 
         for n in (3, 4, 5):
             chunks = [{"i": i} for i in range(n)]
-            split = get_train_valid_test_split(chunks)
+            split = partition_windows_for_train_end_cutoff(chunks)
             total = sum(len(split[k]) for k in split)
             self.assertEqual(total, n)
             self.assertGreaterEqual(
-                len(split["test_chunks"]), 1,
-                f"n={n}: test_chunks should be >= 1 after R3 fix",
+                len(split["test_windows"]), 1,
+                f"n={n}: test_windows should be >= 1 after R3 fix",
             )
 
     def test_split_n_ge_3_should_have_non_empty_train_valid_test(self):
         # Guardrail for the docstring promise: n>=3 → all three splits non-empty.
         time_fold = _import_time_fold_top_level()
-        get_train_valid_test_split = time_fold.get_train_valid_test_split
+        partition_windows_for_train_end_cutoff = time_fold.partition_windows_for_train_end_cutoff
 
         for n in range(3, 10):
             chunks = [{"i": i} for i in range(n)]
-            split = get_train_valid_test_split(chunks)
-            self.assertGreaterEqual(len(split["train_chunks"]), 1)
-            self.assertGreaterEqual(len(split["valid_chunks"]), 1)
+            split = partition_windows_for_train_end_cutoff(chunks)
+            self.assertGreaterEqual(len(split["train_windows"]), 1)
+            self.assertGreaterEqual(len(split["valid_windows"]), 1)
             self.assertGreaterEqual(
-                len(split["test_chunks"]), 1,
-                f"n={n} should allocate >=1 test chunk",
+                len(split["test_windows"]), 1,
+                f"n={n} should allocate >=1 test window",
             )
 
     def test_mixed_tzinfo_currently_raises_typeerror(self):
@@ -106,17 +106,17 @@ class TestTimeFoldRisks(unittest.TestCase):
         # R5 is now fixed: invalid fractions raise ValueError immediately.
         # The test name is kept for historical traceability.
         time_fold = _import_time_fold_top_level()
-        get_train_valid_test_split = time_fold.get_train_valid_test_split
+        partition_windows_for_train_end_cutoff = time_fold.partition_windows_for_train_end_cutoff
 
         chunks = [{"i": i} for i in range(10)]
         with self.assertRaises(ValueError):
-            get_train_valid_test_split(chunks, train_frac=1.2, valid_frac=0.1)
+            partition_windows_for_train_end_cutoff(chunks, train_frac=1.2, valid_frac=0.1)
 
     def test_invalid_fractions_should_raise_valueerror(self):
         # Guardrail: bad fractions must raise ValueError with a clear message.
         time_fold = _import_time_fold_top_level()
-        get_train_valid_test_split = time_fold.get_train_valid_test_split
+        partition_windows_for_train_end_cutoff = time_fold.partition_windows_for_train_end_cutoff
 
         chunks = [{"i": i} for i in range(10)]
         with self.assertRaises(ValueError):
-            get_train_valid_test_split(chunks, train_frac=1.2, valid_frac=0.1)
+            partition_windows_for_train_end_cutoff(chunks, train_frac=1.2, valid_frac=0.1)

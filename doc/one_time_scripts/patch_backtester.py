@@ -6,7 +6,7 @@ with open("trainer/backtester.py", "r", encoding="utf-8") as f:
 # Replace imports
 text = re.sub(
     r'        add_legacy_features,\n        ALL_FEATURE_COLS,',
-    r'        compute_track_llm_features,\n        load_feature_spec,\n        get_all_candidate_feature_ids,',
+    r'        compute_bet_duckdb_window_features,\n        load_feature_spec,\n        get_all_candidate_feature_ids,',
     text
 )
 
@@ -20,7 +20,7 @@ text = re.sub(
         feature_spec = load_feature_spec(Path(__file__).parent / "feature_spec" / "feature_spec.yaml")
 
     try:
-        _bets_llm_result = compute_track_llm_features(
+        _bets_llm_result = compute_bet_duckdb_window_features(
             labeled,
             feature_spec=feature_spec,
             cutoff_time=window_end,

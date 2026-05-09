@@ -151,16 +151,16 @@ def test_sanitize_catboost_gpu_removes_rsm_for_logloss() -> None:
     assert "rsm" not in sanitized
 
 
-def test_run_backend_optuna_search_libsvm_disk_hpo_requires_lightgbm() -> None:
-    """libsvm_disk_hpo is implemented only for the LightGBM native path."""
-    with pytest.raises(ValueError, match="lightgbm"):
+def test_run_backend_optuna_search_libsvm_disk_hpo_rejects_unknown_backend() -> None:
+    """libsvm_disk_hpo should reject unsupported backend names with ValueError."""
+    with pytest.raises(ValueError, match="only supported"):
         trainer_mod.run_backend_optuna_search(
             pd.DataFrame(),
             pd.Series(dtype=int),
             pd.DataFrame(),
             pd.Series(dtype=int),
             pd.Series(dtype=float),
-            backend="catboost",
+            backend="rf",
             n_trials=1,
             label="unit",
             libsvm_disk_hpo=(Path("a.libsvm"), Path("b.libsvm"), 1, ("f0",)),

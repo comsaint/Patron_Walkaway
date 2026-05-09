@@ -91,7 +91,7 @@ class TestR3600ScorerUnratedAlertLeak(unittest.TestCase):
                 ),
             ),
             patch.object(scorer_mod, "build_features_for_scoring", return_value=features_df),
-            patch.object(scorer_mod, "compute_track_llm_features", side_effect=lambda df, **_: df),
+            patch.object(scorer_mod, "compute_bet_duckdb_window_features", side_effect=lambda df, **_: df),
             patch.object(scorer_mod, "_compute_reason_codes", return_value=["[]"]),
             patch.object(scorer_mod, "prune_old_state"),
             patch.object(scorer_mod, "refresh_alert_history"),

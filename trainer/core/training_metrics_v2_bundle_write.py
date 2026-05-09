@@ -309,8 +309,7 @@ def build_datasets_section_v3(rated: Mapping[str, Any]) -> Dict[str, Any]:
 def _objective_contract_block(
     metrics_root: Mapping[str, Any], rated: Mapping[str, Any]
 ) -> Dict[str, Any]:
-    """DEC-026 / field-test objective provenance (config ratio vs observed split ratios)."""
-    pn = metrics_root.get("production_neg_pos_ratio")
+    """DEC-026 / field-test objective provenance (observed split ratios live in ``neg_pos_ratio_overview``)."""
     gate_blocked = bool(rated.get("optuna_hpo_gate_blocked") is True)
     _tri = _neg_pos_ratio_three_splits(rated)
     return {
@@ -337,11 +336,6 @@ def _objective_contract_block(
             "optuna_gate_blocked": gate_blocked,
             "optuna_gate_blocked_reason_code": rated.get("optuna_hpo_gate_blocked_reason_code"),
             "optuna_gate_blocked_details": rated.get("optuna_hpo_gate_blocked_details"),
-        },
-        "ratio_assumption": {
-            "production_neg_pos_ratio": _finite_float(pn) if pn is not None else None,
-            "source": "config" if pn is not None else None,
-            "required_for_selection": False,
         },
         "observed_split_ratios": {
             "train_neg_pos_ratio": _tri["train"]["neg_pos_ratio"],
@@ -401,7 +395,6 @@ def build_training_metrics_v3_payload(
         "model_version": model_version,
         "selection_mode": metrics_root.get("selection_mode"),
         "selection_mode_source": _SELECTION_MODE_SOURCE_V3,
-        "production_neg_pos_ratio": metrics_root.get("production_neg_pos_ratio"),
         "neg_pos_ratio_overview": build_neg_pos_ratio_overview(metrics_root, rated),
         "objective_contract": _objective_contract_block(metrics_root, rated),
         "datasets": _datasets,

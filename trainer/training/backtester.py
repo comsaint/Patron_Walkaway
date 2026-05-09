@@ -129,7 +129,7 @@ try:
     from schema_io import normalize_bets_sessions  # type: ignore[import]
     from features import (  # type: ignore[import]
         coerce_feature_dtypes,
-        compute_track_llm_features,
+        compute_bet_duckdb_window_features,
         join_player_profile,
         load_feature_spec,
         resolve_spec_track_section,
@@ -140,7 +140,6 @@ try:
     )
     from trainer.training.feature_pipeline import (
         add_run_state_machine_features,
-        add_track_human_features,
         apply_dq,
     )
     from trainer.training.metrics_eval import (
@@ -167,7 +166,7 @@ except ModuleNotFoundError:
     from trainer.schema_io import normalize_bets_sessions  # type: ignore[import]
     from trainer.features import (  # type: ignore[import]
         coerce_feature_dtypes,
-        compute_track_llm_features,
+        compute_bet_duckdb_window_features,
         join_player_profile,
         load_feature_spec,
         resolve_spec_track_section,
@@ -178,7 +177,6 @@ except ModuleNotFoundError:
     )
     from trainer.training.feature_pipeline import (
         add_run_state_machine_features,
-        add_track_human_features,
         apply_dq,
     )
     from trainer.training.metrics_eval import (
@@ -1007,7 +1005,6 @@ def backtest(
     if bets.empty:
         return {
             "error": "No rated rows after early prune",
-            "track_llm_degraded": False,
             "bet_duckdb_window_degraded": False,
             **_run_contract,
         }
@@ -1017,7 +1014,7 @@ def backtest(
 
     # --- bet_duckdb_window features on FULL bets (PLAN § Train–Serve Parity) ---
     # Compute before label filtering so window features see same history as trainer/scorer.
-    _track_llm_degraded = False
+    _bet_duckdb_window_degraded = False
     _bundle_root = model_bundle_dir if model_bundle_dir is not None else _default_model_bundle_root()
     _spec_path = _bundle_root / "feature_spec.yaml"
     if not _spec_path.is_file():
@@ -1054,7 +1051,7 @@ def backtest(
         logger.warning(
             "bet_duckdb_window failed; artifact bet-layer features will be zero-filled. Backtest scores may be unreliable."
         )
-        _track_llm_degraded = True
+        _bet_duckdb_window_degraded = True
 
     # --- Labels ---
     labeled = compute_labels(bets_df=bets, window_end=window_end, extended_end=extended_end)
@@ -1066,8 +1063,7 @@ def backtest(
     if labeled.empty:
         return {
             "error": "No rows after label filtering",
-            "track_llm_degraded": _track_llm_degraded,
-            "bet_duckdb_window_degraded": _track_llm_degraded,
+            "bet_duckdb_window_degraded": _bet_duckdb_window_degraded,
             **_run_contract,
         }
 
@@ -1094,7 +1090,7 @@ def backtest(
     _profile_in_artifact: set = {
         e["name"] for e in _artifact_meta
         if isinstance(e, dict)
-        and e.get("track") in ("player_profile_snapshot", "track_profile", "profile")
+        and e.get("track") == "player_run_asset"
     }
     # R131-2: when meta empty (missing/old-format JSON), fallback so profile cols keep NaN.
     if not _profile_in_artifact and _artifact_features:
@@ -1154,8 +1150,7 @@ def backtest(
             "rated_obs": 0,
             "unrated_obs": n_unrated_orig,
             "observations": n_unrated_orig,
-            "track_llm_degraded": _track_llm_degraded,
-            "bet_duckdb_window_degraded": _track_llm_degraded,
+            "bet_duckdb_window_degraded": _bet_duckdb_window_degraded,
             **_run_contract,
         }
 
@@ -1180,8 +1175,7 @@ def backtest(
         "observations": n_rated_orig + n_unrated_orig,
         "rated_obs": n_rated_orig,
         "unrated_obs": n_unrated_orig,
-        "track_llm_degraded": _track_llm_degraded,
-        "bet_duckdb_window_degraded": _track_llm_degraded,
+        "bet_duckdb_window_degraded": _bet_duckdb_window_degraded,
         "model_default": _compute_section_metrics(
             labeled, rated_sub,
             rated_t_default, window_hours,

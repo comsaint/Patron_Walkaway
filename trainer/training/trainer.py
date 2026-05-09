@@ -34,7 +34,7 @@ Artifact format (version-tagged, v10 single-entry)
 models/
   model.pkl                 Rated artifact model object (single model or ensemble wrapper)
   feature_list.json         [{name, track}]  track ∈ canonical layer+method keys
-                              (``bet_duckdb_window``, ``run_state_machine``, ``player_profile_snapshot``);
+                              (``bet_duckdb_window``, ``run_state_machine``, ``player_run_asset``);
                               legacy ``track_*`` strings remain readable for old bundles.
   model_version             YYYYMMDD-HHMMSS-<git7>  (plain text)
   training_metrics.json     legacy v1: validation + test metrics, feature importance (gain), Optuna best params
@@ -495,7 +495,7 @@ try:
         compute_loss_streak,
         compute_run_boundary,
         compute_table_hc,
-        compute_track_llm_features,
+        compute_bet_duckdb_window_features,
         load_feature_spec,
         join_player_profile,
         screen_features,
@@ -506,9 +506,7 @@ try:
         get_cross_layer_compose_contract,
         resolve_spec_track_section,
     )
-    # Phase B PR-B3: layered (bet/run/trip/player) entrypoints. Thin wrappers
-    # over the legacy compute_track_llm_features / join_player_profile above;
-    # imports kept side-by-side so fallback paths still resolve.
+    # Phase B PR-B3: layered (bet/run/trip/player) entrypoints.
     from layered import (  # type: ignore[import]
         compute_bet_duckdb_window_features,
         compute_bet_layer_features,
@@ -546,7 +544,7 @@ except ModuleNotFoundError:
         compute_loss_streak,
         compute_run_boundary,
         compute_table_hc,
-        compute_track_llm_features,
+        compute_bet_duckdb_window_features,
         load_feature_spec,
         join_player_profile,
         screen_features,
@@ -1148,11 +1146,10 @@ def ensure_player_profile_ready(
 
 # Issue #12 PR-12.3: feature-pipeline coordination (DQ + Track Human attach)
 # now lives in trainer.training.feature_pipeline. Re-exported below so the
-# names ``apply_dq`` / ``add_track_human_features`` keep resolving on
+# names ``apply_dq`` / ``add_run_state_machine_features`` keep resolving on
 # trainer.training.trainer for all historic call sites.
 from trainer.training.feature_pipeline import (  # noqa: E402
     add_run_state_machine_features,
-    add_track_human_features,
     apply_dq,
 )
 from trainer.training.label_asset_cache import (  # noqa: E402
@@ -1818,7 +1815,7 @@ def process_chunk(
     dummy_player_ids: FND-12 dummy/fake-account player_ids to drop from training (TRN-04).
     profile_df: player_profile snapshot table for PIT join (PLAN Step 4/DEC-011).
         Pass None to skip; profile feature columns will be 0 for all rows.
-    feature_spec: parsed feature spec (bet_duckdb_window / legacy track_llm) loaded by run_pipeline.
+    feature_spec: parsed feature spec (bet_duckdb_window) loaded by run_pipeline.
     feature_spec_hash: short hash of the feature spec used to compute bet-layer DuckDB window
         columns; included in the chunk cache key so spec changes bust cache.
     neg_sample_frac: ignored for chunk output (GitHub #19). Chunk Parquets are full;
@@ -1841,7 +1838,7 @@ def process_chunk(
 
     # DEC-018: pipeline interior is uniformly tz-naive HK local time.
     # time_fold produces tz-aware bounds; strip here so all downstream callers
-    # (apply_dq, compute_labels, add_track_human_features, label filter) receive
+    # (apply_dq, compute_labels, add_run_state_machine_features, label filter) receive
     # tz-naive datetimes matching the tz-naive data columns from apply_dq R23.
     window_start = window_start.replace(tzinfo=None) if window_start.tzinfo else window_start
     window_end   = window_end.replace(tzinfo=None)   if window_end.tzinfo   else window_end
@@ -2103,7 +2100,7 @@ def process_chunk(
         bets = add_run_state_machine_features(bets, canonical_map, window_end, lookback_hours=_lookback_hours)
         if _two_stage:
             _bump_chunk_cache_stat(
-                chunk_cache_stats, "step6_chunk_cache_prefeatures_track_human_recompute_total",
+                chunk_cache_stats, "step6_chunk_cache_prefeatures_run_state_machine_recompute_total",
             )
             _bump_chunk_cache_stat(
                 chunk_cache_stats, "step6_chunk_cache_prefeatures_run_state_machine_recompute_total",
@@ -2124,7 +2121,7 @@ def process_chunk(
     if feature_spec is not None:
         _t0_llm = time.perf_counter()
         # Phase B PR-B3: route through layered bet entrypoint (thin wrapper over
-        # compute_track_llm_features). Output identical; legacy column names retained.
+        # compute_bet_duckdb_window_features). Output identical.
         _bets_llm_result = compute_bet_duckdb_window_features(
             bets,
             feature_spec=feature_spec,
@@ -2225,7 +2222,12 @@ def process_chunk(
     # Attaches Rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
     # Non-rated bets and bets without a prior snapshot receive 0 for all profile columns.
     # Phase B PR-B3: route through layered player entrypoint (thin wrapper).
-    labeled = compute_player_layer_features(labeled, profile_df)
+    labeled = compute_player_layer_features(
+        labeled,
+        profile_df,
+        feature_spec=feature_spec,
+        use_local_parquet=use_local_parquet,
+    )
     _validate_cross_layer_compose_inputs(labeled, feature_spec)
     labeled = add_wave2_personalized_baselines(labeled)
     _validate_cross_layer_compose_outputs(labeled, feature_spec)
@@ -2239,7 +2241,7 @@ def process_chunk(
     # PLAN Step 3 may move this to load default YAML or reject run (Round 141 Review P1).
     _all_candidate_cols = get_all_candidate_feature_ids(feature_spec, screening_only=True) if feature_spec else list(PROFILE_FEATURE_COLS)
     _yaml_profile_set = (
-        set(get_candidate_feature_ids(feature_spec, "track_profile", screening_only=False))
+        set(get_candidate_feature_ids(feature_spec, "player_run_asset", screening_only=False))
         if feature_spec
         else set(PROFILE_FEATURE_COLS)
     )
@@ -4525,9 +4527,11 @@ def train_issue8_high_roller_segmented_bundle(
     ``gbm_bakeoff`` is ignored for the two segment fits to save time and RAM.
     Min-rows fallback still respects the caller's ``gbm_bakeoff``.
 
-    Returns ``(rated_art, combined_metrics)`` when segmentation runs (including
-    single-model fallback). Returns ``None`` when Issue #8 is disabled in config
-    so the caller should use the legacy single-path export + ``train_single_rated_model``.
+    Returns ``(rated_art, combined_metrics)`` when segmentation completes.
+
+    Returns ``None`` only when Issue #8 is disabled in config (caller uses legacy
+    single-path ``train_single_rated_model``). When enabled, any prerequisite or
+    segment train failure raises ``RuntimeError`` (no silent fallback).
     """
     from trainer.training.high_roller_segmentation import (
         compute_high_roller_cutoff_from_train_parquet,
@@ -4535,6 +4539,7 @@ def train_issue8_high_roller_segmented_bundle(
         materialize_segment_parquet_splits,
         parquet_has_column,
         routed_test_metrics_payload,
+        validate_high_roller_theo_nonempty_on_rated_train,
     )
 
     if not bool(getattr(_core_trainer_config, "HIGH_ROLLER_SEGMENT_ENABLE", False)):
@@ -4551,16 +4556,39 @@ def train_issue8_high_roller_segmented_bundle(
         primary_seg = "low"
 
     if not parquet_has_column(step7_train_path, theo_col):
-        logger.warning(
-            "Issue #8 high-roller segmentation: column %r missing on %s — skipping segmented train",
-            theo_col,
-            step7_train_path,
+        raise RuntimeError(
+            f"Issue #8 high-roller segmentation requires column {theo_col!r} on "
+            f"{step7_train_path} (missing or unreadable)."
         )
-        return None
+    validate_high_roller_theo_nonempty_on_rated_train(step7_train_path, theo_col)
 
     cutoff, cut_meta = compute_high_roller_cutoff_from_train_parquet(
         step7_train_path, theo_col, q
     )
+    n_rated_train = int(cut_meta.get("high_roller_rated_train_row_count", 0))
+    n_low_prev = int(cut_meta.get("high_roller_segment_train_rated_rows_low", 0))
+    n_high_prev = int(cut_meta.get("high_roller_segment_train_rated_rows_high", 0))
+    if n_low_prev == 0 or n_high_prev == 0:
+        raise RuntimeError(
+            "Issue #8 segmentation is degenerate at the configured quantile: "
+            f"rated train splits as high={n_high_prev}, low={n_low_prev} "
+            f"(cutoff={cutoff!r} on COALESCE({theo_col}, 0.0) at quantile={q}). "
+            "This usually means the theo feature is constant on rated rows, or so "
+            "left-skewed that the quantile equals the minimum so the low segment is "
+            "empty. Fix or replace HIGH_ROLLER_THEO_FEATURE data, lower "
+            "HIGH_ROLLER_QUANTILE, or set HIGH_ROLLER_SEGMENT_ENABLE=False in "
+            "trainer/core/_config_high_roller_segmentation.py for legacy single-model "
+            "training."
+        )
+    if n_low_prev < min_l or n_high_prev < min_h:
+        raise RuntimeError(
+            "Issue #8 segmentation cannot proceed: rated train rows per segment "
+            "below minimum **before** writing segment Parquets "
+            f"(high={n_high_prev}, required>={min_h}; low={n_low_prev}, required>={min_l}; "
+            f"rated_train_total={n_rated_train}). Adjust splits, quantile, "
+            "HIGH_ROLLER_MIN_ROWS_*, or disable HIGH_ROLLER_SEGMENT_ENABLE."
+        )
+
     hr_root = Path(export_base) / "hr_segment"
     if hr_root.exists():
         shutil.rmtree(hr_root, ignore_errors=True)
@@ -4609,49 +4637,12 @@ def train_issue8_high_roller_segmented_bundle(
         "high_roller_min_rows_low": min_l,
     }
 
-    def _fallback_single() -> Tuple[dict, dict]:
-        _libsvm = _export_parquet_to_libsvm(
-            step7_train_path,
-            step7_valid_path,
-            active_feature_cols,
-            Path(export_base),
-            test_path=step7_test_path,
-        )
-        _tr = pd.read_parquet(step7_train_path)
-        _rated_art, _, _cm = train_single_rated_model(
-            _tr,
-            None,
-            active_feature_cols,
-            run_optuna=run_optuna,
-            test_df=None,
-            train_libsvm_paths=(_libsvm[0], _libsvm[1]),
-            test_libsvm_path=_libsvm[2],
-            ranking_recipe=ranking_recipe,
-            gbm_bakeoff=gbm_bakeoff,
-            valid_split_parquet_path=step7_valid_path,
-            test_split_parquet_path=step7_test_path,
-            train_split_parquet_path=step7_train_path,
-        )
-        _rated = _cm.get("rated") if isinstance(_cm, dict) else None
-        if isinstance(_rated, dict):
-            _rated = dict(_rated)
-            _rated["high_roller_segmentation"] = {
-                **seg_audit,
-                "fallback": "single_model_min_rows",
-            }
-            _cm = {**_cm, "rated": _rated}
-        return _rated_art, _cm
-
     if n_h < min_h or n_l < min_l:
-        logger.warning(
-            "Issue #8: segment row counts below minimum (high=%d<%d or low=%d<%d) — %s",
-            n_h,
-            min_h,
-            n_l,
-            min_l,
-            getattr(_core_trainer_config, "HIGH_ROLLER_FALLBACK_MODE", "single_model"),
+        raise RuntimeError(
+            "Issue #8 segmentation cannot proceed: rated train rows per segment below "
+            f"minimum (high={n_h}, required>={min_h}; low={n_l}, required>={min_l}). "
+            "Adjust splits, quantile, or HIGH_ROLLER_MIN_ROWS_* in config."
         )
-        return _fallback_single()
 
     if gbm_bakeoff:
         logger.info(
@@ -4713,8 +4704,10 @@ def train_issue8_high_roller_segmented_bundle(
     )
 
     if high_art is None or low_art is None:
-        logger.warning("Issue #8: segment training returned empty artifact — fallback single model")
-        return _fallback_single()
+        raise RuntimeError(
+            "Issue #8 segmentation cannot proceed: train_single_rated_model returned empty "
+            f"artifact (high_art is None={high_art is None}, low_art is None={low_art is None})."
+        )
 
     m_h = cm_high.get("rated") if isinstance(cm_high, dict) else {}
     m_l = cm_low.get("rated") if isinstance(cm_low, dict) else {}
@@ -4747,8 +4740,10 @@ def train_issue8_high_roller_segmented_bundle(
                 thr_low=float(low_art["threshold"]),
             )
         except Exception as _rte:
-            logger.warning("Issue #8: routed test metrics skipped: %s", _rte)
-            routed = {"high_roller_routed_test_skipped": str(_rte)}
+            raise RuntimeError(
+                f"Issue #8 segmentation cannot proceed: routed test metrics failed "
+                f"({step7_test_path}): {_rte}"
+            ) from _rte
 
     primary_art, secondary_art = (low_art, high_art) if primary_seg == "low" else (high_art, low_art)
     primary_metrics = primary_art["metrics"]

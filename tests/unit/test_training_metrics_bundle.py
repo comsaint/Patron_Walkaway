@@ -78,13 +78,20 @@ def test_load_training_metrics_merged_v3_first_merges_and_overrides_v2(tmp_path:
             "schema_version": "training-metrics.v3",
             "model_version": "mv3",
             "selection_mode": "field_test",
-            "production_neg_pos_ratio": 10.0,
+            "neg_pos_ratio_overview": {
+                "neg_pos_ratio_contract": "n_neg / n_pos",
+                "primary_model": {
+                    "train": {"neg_pos_ratio": None, "source": "unavailable"},
+                    "val": {"neg_pos_ratio": None, "source": "unavailable"},
+                    "test": {"neg_pos_ratio": None, "source": "unavailable"},
+                },
+                "segments": [],
+            },
             "objective_contract": {
                 "selection_metric_id": "x",
                 "threshold": {"selected": 0.4, "recall_floor": 0.01},
                 "constraints": {},
                 "gate": {},
-                "ratio_assumption": {},
                 "observed_split_ratios": {},
             },
             "datasets": {

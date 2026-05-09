@@ -131,7 +131,7 @@ class TestScorerTrainerConsecutiveNonWinParity(unittest.TestCase):
     """Parity guard: consecutive_non_win_cnt must match trainer Track Human path."""
 
     def test_consecutive_non_win_cnt_matches_trainer_with_same_lookback(self):
-        from trainer.training.trainer import add_track_human_features
+        from trainer.training.trainer import add_run_state_machine_features
 
         bets = pd.DataFrame({
             "bet_id": [1, 2, 3, 4],
@@ -169,7 +169,7 @@ class TestScorerTrainerConsecutiveNonWinParity(unittest.TestCase):
 
         trainer_bets = bets.copy()
         trainer_bets["canonical_id"] = "c100"
-        trainer_out = add_track_human_features(
+        trainer_out = add_run_state_machine_features(
             bets=trainer_bets,
             canonical_map=canonical_map,
             window_end=cutoff.replace(tzinfo=None),

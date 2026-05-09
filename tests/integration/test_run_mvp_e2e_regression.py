@@ -27,6 +27,8 @@ _MVP_SUMMARY_IGNORE_KEYS: frozenset[str] = frozenset(
         "eligible_parquet",
         "ingestion_fix_registry_yaml",
         "output_root",
+        # Contains freshness timestamps that can drift across reruns.
+        "mapping_identity_health",
         "session_parquet_for_mapping",
         "snap_root",
         # Includes per-file mtime_ns; changes when outputs are rewritten on rerun.

@@ -17,7 +17,7 @@ class TestFeatureMaterializationHelpers(unittest.TestCase):
 
     def test_find_undeclared_skips_reserved_and_declared(self) -> None:
         spec = {
-            "track_llm": {
+            "bet_duckdb_window": {
                 "candidates": [{"feature_id": "my_feat", "type": "passthrough"}],
             }
         }
@@ -27,7 +27,7 @@ class TestFeatureMaterializationHelpers(unittest.TestCase):
 
     def test_impacted_propagates_via_depends_on(self) -> None:
         spec = {
-            "track_llm": {
+            "bet_duckdb_window": {
                 "candidates": [
                     {"feature_id": "base_a", "type": "x"},
                     {"feature_id": "derived_c", "type": "y", "depends_on": ["base_a"]},
@@ -37,7 +37,7 @@ class TestFeatureMaterializationHelpers(unittest.TestCase):
         }
         prev = fm.per_feature_fingerprints(spec)
         spec2 = {
-            "track_llm": {
+            "bet_duckdb_window": {
                 "candidates": [
                     {"feature_id": "base_a", "type": "x_changed"},
                     {"feature_id": "derived_c", "type": "y", "depends_on": ["base_a"]},
@@ -52,16 +52,16 @@ class TestFeatureMaterializationHelpers(unittest.TestCase):
         self.assertNotIn("other_b", hint["changed_feature_ids"])
 
     def test_maybe_raise_spec_first_strict(self) -> None:
-        spec = {"track_llm": {"candidates": [{"feature_id": "f1"}]}}
+        spec = {"bet_duckdb_window": {"candidates": [{"feature_id": "f1"}]}}
         with patch.dict(os.environ, {"TRAINER_SPEC_FIRST_STRICT": "1"}):
             with self.assertRaises(RuntimeError) as ctx:
                 fm.maybe_raise_spec_first_columns(["f1", "undeclared_xyz"], spec)
         self.assertIn("undeclared_xyz", str(ctx.exception))
 
     def test_build_audit_includes_impact_hint_when_prev_fps(self) -> None:
-        spec = {"track_llm": {"candidates": [{"feature_id": "only_one", "expression": "1"}]}}
+        spec = {"bet_duckdb_window": {"candidates": [{"feature_id": "only_one", "expression": "1"}]}}
         prev = {"only_one": "aaa"}
-        spec2 = {"track_llm": {"candidates": [{"feature_id": "only_one", "expression": "2"}]}}
+        spec2 = {"bet_duckdb_window": {"candidates": [{"feature_id": "only_one", "expression": "2"}]}}
         audit = fm.build_pipeline_feature_materialization_audit(
             feature_spec=spec2,
             train_columns=["only_one", "label"],
@@ -71,7 +71,7 @@ class TestFeatureMaterializationHelpers(unittest.TestCase):
         self.assertIn("only_one", audit["impact_hint_vs_previous_run"]["changed_feature_ids"])
 
     def test_build_audit_includes_impact_plan_and_cache_lexicon(self) -> None:
-        spec = {"track_llm": {"candidates": [{"feature_id": "f1", "expression": "1"}]}}
+        spec = {"bet_duckdb_window": {"candidates": [{"feature_id": "f1", "expression": "1"}]}}
         audit = fm.build_pipeline_feature_materialization_audit(
             feature_spec=spec,
             train_columns=["f1", "label"],
@@ -84,13 +84,13 @@ class TestFeatureMaterializationHelpers(unittest.TestCase):
 
     def test_upstream_closure_hash_stable(self) -> None:
         spec = {
-            "track_llm": {
+            "bet_duckdb_window": {
                 "candidates": [
                     {"feature_id": "bet_f", "expression": "1"},
                     {"feature_id": "compose_x", "expression": "2", "depends_on": ["run_f"]},
                 ],
             },
-            "track_human": {"candidates": [{"feature_id": "run_f", "expression": "x"}]},
+            "run_state_machine": {"candidates": [{"feature_id": "run_f", "expression": "x"}]},
         }
         fps = fm.per_feature_fingerprints(spec)
         h1 = fm.upstream_fingerprint_closure_hash(spec, "compose_x", fps)
@@ -133,7 +133,7 @@ class TestImpactPlanner(unittest.TestCase):
     def test_snapshot_change_marks_full_matrix(self) -> None:
         from trainer.training.impact_planner import plan_impacted_materialization_work
 
-        spec = {"track_llm": {"candidates": [{"feature_id": "f1", "expression": "x"}]}}
+        spec = {"bet_duckdb_window": {"candidates": [{"feature_id": "f1", "expression": "x"}]}}
         plan = plan_impacted_materialization_work(
             curr_spec=spec,
             prev_spec=None,
@@ -148,7 +148,7 @@ class TestImpactPlanner(unittest.TestCase):
     def test_snapshot_change_expands_to_chunk_partitions(self) -> None:
         from trainer.training.impact_planner import plan_impacted_materialization_work
 
-        spec = {"track_llm": {"candidates": [{"feature_id": "f1", "expression": "x"}]}}
+        spec = {"bet_duckdb_window": {"candidates": [{"feature_id": "f1", "expression": "x"}]}}
         pids = ["time_chunk:20250101:20250131", "time_chunk:20250201:20250228"]
         plan = plan_impacted_materialization_work(
             curr_spec=spec,
@@ -178,7 +178,7 @@ class TestLayerAssetStore(unittest.TestCase):
         ws = pd.Timestamp("2025-03-01")
         we = pd.Timestamp("2025-03-31")
         self.assertEqual(chunk_partition_id(ws, we), "time_chunk:20250301:20250331")
-        spec = {"track_llm": {"candidates": [{"feature_id": "f1", "expression": "1"}]}}
+        spec = {"bet_duckdb_window": {"candidates": [{"feature_id": "f1", "expression": "1"}]}}
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "chunk_20250301_20250331.parquet"
             p.write_bytes(b"")
