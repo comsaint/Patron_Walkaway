@@ -72,7 +72,7 @@ import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Set, Tuple, Union, cast
+from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple, Union, cast
 
 import joblib
 import lightgbm as lgb
@@ -358,6 +358,7 @@ from trainer.training.model_eval_runtime import (
     _dataframe_for_lgb_predict,
     _field_test_hpo_min_alerts_per_hour_for_reports,
     _histogram_average_precision_streaming,
+    _lgb_booster_feature_name_list,
     _split_alert_density_prefixed_dict,
     _train_metrics_dict_from_y_scores,
     _tp_fp_fn_at_threshold_streaming,
@@ -2224,17 +2225,7 @@ def process_chunk(
     # Attaches Rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
     # Non-rated bets and bets without a prior snapshot receive 0 for all profile columns.
     # Phase B PR-B3: route through layered player entrypoint (thin wrapper).
-    # When track_profile is disabled in YAML (unified pipeline), skip join and do not
-    # materialize legacy PROFILE_FEATURE_COLS placeholders.
-    _profile_fids = (
-        get_candidate_feature_ids(feature_spec, "track_profile", screening_only=False)
-        if feature_spec
-        else []
-    )
-    if _profile_fids:
-        labeled = compute_player_layer_features(labeled, profile_df, feature_cols=_profile_fids)
-    else:
-        labeled = compute_player_layer_features(labeled, None, feature_cols=[])
+    labeled = compute_player_layer_features(labeled, profile_df)
     _validate_cross_layer_compose_inputs(labeled, feature_spec)
     labeled = add_wave2_personalized_baselines(labeled)
     _validate_cross_layer_compose_outputs(labeled, feature_spec)
@@ -2369,12 +2360,35 @@ def _labels_from_libsvm(path: Path) -> np.ndarray:
     return np.asarray(labels, dtype=np.float64)
 
 
+def _libsvm_normalize_parquet_sources(src: Union[Path, Sequence[Path]]) -> List[Path]:
+    """Normalize LibSVM export sources to a non-empty path list."""
+    if isinstance(src, Path):
+        return [src]
+    out = [Path(p) for p in src]
+    if not out:
+        raise ValueError("LibSVM export: parquet path list is empty")
+    return out
+
+
+def _libsvm_duckdb_read_parquet_expr(paths: Sequence[Path]) -> str:
+    """Build DuckDB ``read_parquet`` expression for one or many files."""
+
+    def _esc_path(s: str) -> str:
+        return s.replace("'", "''")
+
+    esc = [_esc_path(str(p.resolve())) for p in paths]
+    if len(esc) == 1:
+        return f"read_parquet('{esc[0]}')"
+    inner = ", ".join(f"'{e}'" for e in esc)
+    return f"read_parquet([{inner}])"
+
+
 def _export_parquet_to_libsvm(
-    train_path: Path,
-    valid_path: Path,
+    train_path: Union[Path, Sequence[Path]],
+    valid_path: Union[Path, Sequence[Path]],
     feature_cols: List[str],
     export_dir: Path,
-    test_path: Optional[Path] = None,
+    test_path: Optional[Union[Path, Sequence[Path]]] = None,
 ) -> Tuple[Path, Path, Optional[Path]]:
     """Stream export from split Parquets to LibSVM + .weight (PLAN B+ §4.3, 階段 6 第 3 步).
 
@@ -2382,6 +2396,8 @@ def _export_parquet_to_libsvm(
     Valid: rated rows only; no weight file.
     Test (optional): rated rows only; no weight file. When test_path is provided, writes test_for_lgb.libsvm.
     Does not load full train/valid/test into memory.
+    *train_path* / *valid_path* / *test_path* may each be a single ``Path`` or a non-empty sequence
+    of Parquet files (unioned by DuckDB) for day-sharded L2 bundles.
     Returns (train_libsvm_path, valid_libsvm_path, test_libsvm_path or None).
     """
     import duckdb
@@ -2401,10 +2417,14 @@ def _export_parquet_to_libsvm(
     if not export_cols:
         raise ValueError("feature_cols must contain at least one column other than 'label' for LibSVM export")
     feature_cols = export_cols
-    if not train_path.exists():
-        raise FileNotFoundError(f"Train Parquet not found: {train_path}")
-    if not valid_path.exists():
-        raise FileNotFoundError(f"Valid Parquet not found: {valid_path}")
+    train_paths = _libsvm_normalize_parquet_sources(train_path)
+    valid_paths = _libsvm_normalize_parquet_sources(valid_path)
+    for p in train_paths:
+        if not p.exists():
+            raise FileNotFoundError(f"Train Parquet not found: {p}")
+    for p in valid_paths:
+        if not p.exists():
+            raise FileNotFoundError(f"Valid Parquet not found: {p}")
 
     def _esc_path(s: str) -> str:
         return s.replace("'", "''")
@@ -2431,7 +2451,7 @@ def _export_parquet_to_libsvm(
             _available_bytes = int(_psutil.virtual_memory().available)
         except Exception:
             _available_bytes = None
-        _input_bytes = int(train_path.stat().st_size + valid_path.stat().st_size)
+        _input_bytes = int(sum(p.stat().st_size for p in train_paths) + sum(p.stat().st_size for p in valid_paths))
         if callable(_resolve_runtime) and callable(_apply_runtime):
             _policy = _resolve_runtime(
                 "libsvm_export",
@@ -2439,18 +2459,18 @@ def _export_parquet_to_libsvm(
                 input_bytes=_input_bytes,
             )
             _apply_runtime(con, _policy)
-        train_s = _esc_path(str(train_path))
-        valid_s = _esc_path(str(valid_path))
+        train_from = _libsvm_duckdb_read_parquet_expr(train_paths)
+        valid_from = _libsvm_duckdb_read_parquet_expr(valid_paths)
         cols = ", ".join(_esc_col(c) for c in feature_cols)
         # Rated only; weight = 1/N_run per (canonical_id, run_id)
         train_sql = (
             f"SELECT label, {cols}, "
             "1.0 / COUNT(*) OVER (PARTITION BY canonical_id, run_id) AS _w "
-            f"FROM read_parquet('{train_s}') WHERE COALESCE(is_rated, false) = true"
+            f"FROM {train_from} WHERE COALESCE(is_rated, false) = true"
         )
         valid_sql = (
             f"SELECT label, {cols} "
-            f"FROM read_parquet('{valid_s}') WHERE COALESCE(is_rated, false) = true"
+            f"FROM {valid_from} WHERE COALESCE(is_rated, false) = true"
         )
         batch_size = 50_000
         n_train = 0
@@ -2575,13 +2595,16 @@ def _export_parquet_to_libsvm(
         os.replace(valid_libsvm_tmp, valid_libsvm)
 
         n_test_rows = 0
-        if test_path is not None and test_path.exists():
+        test_paths_list: Optional[List[Path]] = None
+        if test_path is not None:
+            test_paths_list = [p for p in _libsvm_normalize_parquet_sources(test_path) if p.is_file()]
+        if test_paths_list:
             test_libsvm = export_dir / "test_for_lgb.libsvm"
             test_libsvm_tmp = export_dir / "test_for_lgb.libsvm.tmp"
-            test_s = _esc_path(str(test_path))
+            test_from = _libsvm_duckdb_read_parquet_expr(test_paths_list)
             test_sql = (
                 f"SELECT label, {cols} "
-                f"FROM read_parquet('{test_s}') WHERE COALESCE(is_rated, false) = true"
+                f"FROM {test_from} WHERE COALESCE(is_rated, false) = true"
             )
             with open(test_libsvm_tmp, "w", encoding="utf-8") as f_lib:
                 result = con.execute(test_sql)
@@ -4967,12 +4990,28 @@ def train_single_rated_model(
             return
         # Copy reduction for LibSVM path: only materialize rated pandas matrices when
         # a downstream branch truly needs them (fallback, bakeoff, A4, or in-memory train).
-        coerce_feature_dtypes(tr, feature_names)
+        if not tr.empty:
+            coerce_feature_dtypes(tr, feature_names)
         if not vr.empty:
             coerce_feature_dtypes(vr, feature_names)
-        X_tr = tr[feature_names]
-        y_tr = tr["label"]
-        X_vl = vr[feature_names] if not vr.empty else X_tr.head(0)
+        if tr.empty:
+            # L2 bundle + LibSVM: train rows stay on disk (empty placeholder frame) but
+            # A3/bakeoff still need X_tr/y_tr schema aligned with screened feature names.
+            X_tr = pd.DataFrame(columns=list(feature_names))
+            y_tr = pd.Series(dtype=float)
+        else:
+            X_tr = tr[feature_names]
+            y_tr = tr["label"]
+        if not vr.empty:
+            _missing_v = [c for c in feature_names if c not in vr.columns]
+            if _missing_v:
+                raise KeyError(
+                    "validation frame missing feature columns for train views: "
+                    f"missing={_missing_v[:20]}{'...' if len(_missing_v) > 20 else ''}"
+                )
+            X_vl = vr[feature_names]
+        else:
+            X_vl = pd.DataFrame(columns=list(feature_names))
         if not isinstance(y_vl, np.ndarray):
             y_vl = vr["label"] if not vr.empty else y_tr.head(0)
         _train_views_ready = True
@@ -5353,7 +5392,7 @@ def train_single_rated_model(
                 dtrain,
                 num_boost_round=num_boost_round,
             )
-        avail_cols = list(booster.feature_name())
+        avail_cols = _lgb_booster_feature_name_list(booster)
         _did_strict_libsvm_refit = False
         _strict_tv_paths: list[Path] = []
         if (
@@ -5393,7 +5432,7 @@ def train_single_rated_model(
                 )
                 booster = lgb.train(hp_lgb, _d_tv, num_boost_round=_n_round_tv)
                 _did_strict_libsvm_refit = True
-                avail_cols = list(booster.feature_name())
+                avail_cols = _lgb_booster_feature_name_list(booster)
                 logger.info(
                     "rated Plan B+ LibSVM strict: file-backed final refit train∪valid rows=%d num_boost_round=%d",
                     int(_n_merged),
@@ -6602,6 +6641,64 @@ def split_row_metadata_from_parquet_paths(
         "train": _q_one(train_path),
         "valid": _q_one(valid_path),
         "test": _q_one(test_path),
+    }
+
+
+def split_row_metadata_from_parquet_path_sequences(
+    train_paths: Sequence[Path],
+    valid_paths: Sequence[Path],
+    test_paths: Sequence[Path],
+    *,
+    rated_only: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Row-level split summaries via DuckDB over one or many Parquet files per split."""
+    import duckdb
+
+    def _q_many(paths: Sequence[Path]) -> dict[str, Any]:
+        if not paths:
+            return {"start": None, "end": None, "rows": 0, "positives": 0, "negatives": 0}
+        from_sql = _libsvm_duckdb_read_parquet_expr(paths)
+        con = duckdb.connect(":memory:")
+        try:
+            cols_probe = con.execute(f"SELECT * FROM {from_sql} LIMIT 0")
+            cols = {str(d[0]).strip().lower() for d in (cols_probe.description or [])}
+            where_sql = (
+                " WHERE coalesce(try_cast(is_rated AS BOOLEAN), FALSE)"
+                if rated_only and "is_rated" in cols
+                else ""
+            )
+            row = con.execute(
+                f"SELECT count(*) AS n, "
+                f"coalesce(sum(cast(label AS INTEGER)), 0) AS pos, "
+                f"min(payout_complete_dtm) AS dt_min, "
+                f"max(payout_complete_dtm) AS dt_max "
+                f"FROM {from_sql}"
+                f"{where_sql}"
+            ).fetchone()
+        finally:
+            con.close()
+        if row is None:
+            return {"start": None, "end": None, "rows": 0, "positives": 0, "negatives": 0}
+        n = int(row[0]) if row[0] is not None else 0
+        pos = int(row[1]) if row[1] is not None else 0
+        pos = max(0, min(n, pos))
+        neg = n - pos
+        dt_min = row[2]
+        dt_max = row[3]
+        start_iso = str(pd.Timestamp(dt_min).isoformat()) if dt_min is not None else None
+        end_iso = str(pd.Timestamp(dt_max).isoformat()) if dt_max is not None else None
+        return {
+            "start": start_iso,
+            "end": end_iso,
+            "rows": n,
+            "positives": pos,
+            "negatives": neg,
+        }
+
+    return {
+        "train": _q_many(train_paths),
+        "valid": _q_many(valid_paths),
+        "test": _q_many(test_paths),
     }
 
 

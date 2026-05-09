@@ -5,8 +5,9 @@
 ``selection_mode``, ``selection_mode_source``, ``production_neg_pos_ratio``.
 
 ``selection_mode`` prefers a non-empty ``selection_mode`` in the bundle's
-``training_metrics.v2.json`` (when present and readable), else
-``training_metrics.json``; otherwise :data:`trainer.core.config.SELECTION_MODE`.
+``training_metrics.v3.json`` (when present and readable), then
+``training_metrics.v2.json``, then ``training_metrics.json``; otherwise
+:data:`trainer.core.config.SELECTION_MODE`.
 
 ``production_neg_pos_ratio`` defaults to :data:`trainer.core.config.PRODUCTION_NEG_POS_RATIO`.
 Callers that load config via a different module (e.g. backtester ``_cfg``) may pass

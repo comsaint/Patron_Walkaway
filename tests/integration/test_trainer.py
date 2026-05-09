@@ -719,6 +719,14 @@ class TestRefactorGuardrailsArtifactBundle(unittest.TestCase):
         # training_provenance.json is written when alignment payload provided.
         self.assertIn("training_provenance.json", src)
 
+    def test_pipeline_l2_bundle_logs_training_metrics_v3_to_mlflow(self) -> None:
+        """L2 path must upload contract metrics JSON under the model_bundle artifact prefix."""
+        pl2 = _REPO_ROOT / "trainer" / "training" / "pipeline_l2_bundle.py"
+        src = pl2.read_text(encoding="utf-8")
+        self.assertIn("training_metrics.v3.json", src)
+        self.assertIn("log_artifact_safe", src)
+        self.assertIn("MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH", src)
+
     def test_save_artifact_bundle_does_not_revive_legacy_dual_pkl(self):
         """DEC-040: walkaway_model.pkl must not return."""
         src = _get_func_src("save_artifact_bundle")

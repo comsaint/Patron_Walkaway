@@ -426,6 +426,53 @@ def execute_l2_training_bundle(
         model_metadata=_model_meta_doc,
     )
     try:
+        from trainer.core.mlflow_utils import has_active_run, log_artifact_safe, log_params_safe
+        from trainer.core.training_artifact_bundle import MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH
+
+        _v3_metrics = _bundle_dir / "training_metrics.v3.json"
+        if not _v3_metrics.is_file():
+            logger.warning(
+                "training_metrics.v3.json missing after save_artifact_bundle (expected at %s); "
+                "MLflow metrics artifact upload skipped.",
+                _v3_metrics,
+            )
+        elif has_active_run():
+            log_artifact_safe(
+                _v3_metrics,
+                artifact_path=MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH,
+            )
+            _v2_metrics = _bundle_dir / "training_metrics.v2.json"
+            if _v2_metrics.is_file():
+                log_artifact_safe(
+                    _v2_metrics,
+                    artifact_path=MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH,
+                )
+            log_params_safe(
+                {
+                    "training_metrics_v3_rel_path": (
+                        f"{_bundle_dir.name}/training_metrics.v3.json"
+                    ),
+                    "training_metrics_v2_rel_path": (
+                        f"{_bundle_dir.name}/training_metrics.v2.json"
+                    ),
+                }
+            )
+    except Exception as _art_exc:
+        logger.warning("MLflow training_metrics v3/v2 artifact upload skipped: %s", _art_exc)
+    try:
+        from trainer.core.mlflow_utils import has_active_run, log_params_safe
+
+        if has_active_run():
+            _lineage_params = {
+                "l2_snapshot_id": manifest.l2_snapshot_id,
+                "source_snapshot_id": manifest.source_snapshot_id,
+                "l2_training_bundle_dir": str(bundle_dir.resolve()),
+                "l2_oom_estimate_strategy": OOM_ESTIMATE_STRATEGY_L2_SPLIT_FILES,
+            }
+            log_params_safe({k: v for k, v in _lineage_params.items() if v})
+    except Exception as _ml_exc:
+        logger.warning("MLflow L2 lineage params skipped: %s", _ml_exc)
+    try:
         tr.write_latest_model_manifest(_versions_root, model_version, _bundle_dir)
     except Exception as _man_exc:
         logger.warning("Failed to write latest model manifest (artifacts saved): %s", _man_exc)
@@ -466,20 +513,6 @@ def execute_l2_training_bundle(
         )
     except Exception as _diag_exc:
         logger.warning("pipeline_diagnostics.json write failed (training still succeeded): %s", _diag_exc)
-
-    try:
-        from trainer.core.mlflow_utils import has_active_run, log_params_safe
-
-        if has_active_run():
-            _lineage_params = {
-                "l2_snapshot_id": manifest.l2_snapshot_id,
-                "source_snapshot_id": manifest.source_snapshot_id,
-                "l2_training_bundle_dir": str(bundle_dir.resolve()),
-                "l2_oom_estimate_strategy": OOM_ESTIMATE_STRATEGY_L2_SPLIT_FILES,
-            }
-            log_params_safe({k: v for k, v in _lineage_params.items() if v})
-    except Exception as _ml_exc:
-        logger.warning("MLflow L2 lineage params skipped: %s", _ml_exc)
 
     summary = {
         "model_version": model_version,
