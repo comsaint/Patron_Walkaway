@@ -250,6 +250,33 @@ def _is_screening_ineligible(val) -> bool:
     return False
 
 
+def _track_section_enabled_in_spec(spec: dict, track: str) -> bool:
+    """Return False when YAML disables this track (``enabled`` or ``tracks_enabled``)."""
+    track = FEATURE_SPEC_TRACK_PARAM_ALIASES.get(track, track)
+    sec = spec.get(track)
+    if isinstance(sec, dict):
+        ev = sec.get("enabled", True)
+        if isinstance(ev, str) and ev.strip().lower() in ("false", "0", "no", "off"):
+            return False
+        if ev is False:
+            return False
+    te = spec.get("tracks_enabled")
+    if not isinstance(te, dict):
+        return True
+    off_pairs = {
+        "track_llm": ("track_llm", "bet_duckdb_window"),
+        "track_human": ("track_human", "run_state_machine"),
+        "track_profile": ("track_profile", "player_profile_snapshot"),
+    }
+    keys = off_pairs.get(track)
+    if keys is None:
+        return True
+    for k in keys:
+        if te.get(k) is False:
+            return False
+    return True
+
+
 def get_candidate_feature_ids(
     spec: dict,
     track: str,
@@ -263,8 +290,13 @@ def get_candidate_feature_ids(
     ``feature_spec_layer_aliases.mirror_layer_method_track_keys_inplace``）。
     screening_only=True 時排除 dtype='str' 或 screening_eligible 為 false/0/"false"
     的候選（中間變數不參與篩選）。
+
+    當 ``tracks_enabled`` 或該軌 ``enabled: false`` 關閉此軌時，回傳空列表（unified
+    管線可不依賴 legacy ``player_profile`` parquet）。
     """
     track = FEATURE_SPEC_TRACK_PARAM_ALIASES.get(track, track)
+    if not _track_section_enabled_in_spec(spec, track):
+        return []
     # R404 Review #4: candidates may be non-list (e.g. dict); treat as no candidates.
     _raw = ((spec.get(track) or {}).get("candidates"))
     candidates = _raw if isinstance(_raw, list) else []

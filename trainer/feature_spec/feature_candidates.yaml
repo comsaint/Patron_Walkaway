@@ -157,7 +157,8 @@ layered_framework:
         Resets each run; more local than lifetime session average.
 
 tracks_enabled:
-  track_profile: true
+  # Unified pipeline: wave2 / bridge columns on bets + sessions; no legacy player_profile ETL.
+  track_profile: false
   track_llm: true
   track_human: true
 
@@ -710,7 +711,7 @@ track_human:
 
 track_profile:
   name: "Track Profile"
-  enabled: true
+  enabled: false
 
   source_table: "player_profile"
   join:

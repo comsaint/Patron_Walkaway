@@ -7,6 +7,18 @@ from __future__ import annotations
 
 from trainer.training.trainer import *  # noqa: F401,F403
 
+# ``from trainer.training.trainer import *`` omits names starting with ``_`` (Python default).
+# This module calls many ``trainer`` helpers (``_detect_local_data_end``, ``_cfg``, …); mirror
+# them onto this module so ``run_pipeline_core`` matches the historical monolithic scope.
+import trainer.training.trainer as _trainer_private_src
+
+for _priv in dir(_trainer_private_src):
+    if _priv.startswith("__"):
+        continue
+    if _priv.startswith("_"):
+        globals()[_priv] = getattr(_trainer_private_src, _priv)
+
+
 def run_pipeline_core(args) -> None:
     """Phase-1 training pipeline implementation (see ``run_pipeline`` wrapper)."""
     pipeline_step_set("Step 0/11")
@@ -549,7 +561,27 @@ def run_pipeline_core(args) -> None:
             pipeline_step_set("Step 4/11")
             # 3b. Auto-check local player_profile freshness and backfill missing
             #     ranges before training starts (one-command flow, OOM-safe helper).
+            # Unified pipeline: when track_profile is off in YAML, skip legacy ETL entirely.
             _player_asset_raw = (os.environ.get("TRAINER_PLAYER_LAYER_ASSET_PATH") or "").strip()
+            profile_df = None
+            step4_duration_sec = 0.0
+            step5_duration_sec = 0.0
+            _skip_legacy_player_profile_etl = False
+            try:
+                import yaml as _yaml_gate
+                from pathlib import Path as _Path_gate
+
+                from trainer.features.features import _track_section_enabled_in_spec
+
+                _raw_gate = _yaml_gate.safe_load(
+                    _Path_gate(FEATURE_SPEC_PATH).read_text(encoding="utf-8")
+                ) or {}
+                _skip_legacy_player_profile_etl = not _track_section_enabled_in_spec(
+                    _raw_gate, "track_profile"
+                )
+            except Exception as _gate_exc:
+                logger.debug("player_profile ETL gate: spec read failed (%s)", _gate_exc)
+
             if _player_asset_raw:
                 pipeline_echo(
                     "Step 4/11 — Skip ensure_player_profile_ready (TRAINER_PLAYER_LAYER_ASSET_PATH set) …"
@@ -559,6 +591,15 @@ def run_pipeline_core(args) -> None:
                 logger.info(
                     "player_profile ensure skipped: using TRAINER_PLAYER_LAYER_ASSET_PATH=%s",
                     _player_asset_raw,
+                )
+            elif _skip_legacy_player_profile_etl:
+                pipeline_echo(
+                    "Step 4/11 — Skip player_profile ETL (track_profile disabled in feature spec) …"
+                )
+                pipeline_echo("Step 4/11 — skipped (unified pipeline; no legacy player_profile parquet)")
+                logger.info(
+                    "player_profile ensure skipped: track_profile disabled — "
+                    "unified features on bets/sessions only"
                 )
             else:
                 pipeline_echo("Step 4/11 — Ensure player_profile ready (backfill if needed) …")
@@ -621,6 +662,11 @@ def run_pipeline_core(args) -> None:
                         _player_asset_raw,
                         exc,
                     )
+            elif _skip_legacy_player_profile_etl:
+                pipeline_echo("Step 5/11 — Skip load player_profile (track_profile disabled) …")
+                pipeline_echo("Step 5/11 — skipped")
+                step5_duration_sec = 0.0
+                logger.info("player_profile load skipped: track_profile disabled in feature spec")
             else:
                 pipeline_echo("Step 5/11 — Load player_profile for PIT join …")
                 t0 = time.perf_counter()
@@ -780,7 +826,19 @@ def run_pipeline_core(args) -> None:
                         gc.collect()
             finally:
                 pbar.close()
-        
+
+            if not chunk_paths:
+                _cm_rows = len(canonical_map) if canonical_map is not None else 0
+                raise RuntimeError(
+                    "Step 6 produced no chunk Parquet outputs (empty chunk_paths). "
+                    "Usually every row failed identity/PIT admission — see Step 6 logs for "
+                    "IDENTITY_UNMATCHED / admitted=0. Check that canonical_mapping aligns with "
+                    "the bet/session Parquet bridge (player_id keys), rebuild with "
+                    "--rebuild-canonical-mapping if needed, or adjust IDENTITY_MAPPING_MODE. "
+                    f"Current canonical_map rows={_cm_rows}. "
+                    "This is not an OOM/days-window issue despite later Step 7 wording."
+                )
+
             # 5. Load all chunks, sort, row-level train/valid/test split (PLAN Step 7 Out-of-Core).
             #    Orchestrator: DuckDB first (Layer 1), on failure pandas fallback (Layer 3).
             # T12.2: checkpoint memory sampling across Step 7-9.
@@ -914,6 +972,8 @@ def run_pipeline_core(args) -> None:
             _train_libsvm: Optional[Path] = None
             _valid_libsvm: Optional[Path] = None
             _test_libsvm: Optional[Path] = None
+            _step9_issue8_pretrained = False
+            _step9_issue8_elapsed_sec = 0.0
             if step7_train_path is not None:
                 # R202 Review #3: guard so _step7_metadata_from_paths never receives None (B+ path contract).
                 if step7_valid_path is None or step7_test_path is None:
@@ -943,7 +1003,7 @@ def run_pipeline_core(args) -> None:
                         read_head=read_parquet_head,
                     )
                 else:
-                    _train_for_screen = _read_parquet_head(step7_train_path, _sample_n_disk)
+                    _train_for_screen = read_parquet_head(step7_train_path, _sample_n_disk)
             else:
                 assert train_df is not None  # step7_train_path is None implies train was loaded in Step 7
                 assert valid_df is not None and test_df is not None  # pandas path always has both
@@ -1407,21 +1467,49 @@ def run_pipeline_core(args) -> None:
                         "STEP9_EXPORT_LIBSVM=False is incompatible with LibSVM-only training."
                     )
                 assert step7_valid_path is not None and step7_test_path is not None  # R202 guard
-                _train_libsvm, _valid_libsvm, _test_libsvm = _export_parquet_to_libsvm(
-                    step7_train_path,
-                    step7_valid_path,
-                    active_feature_cols,
-                    DATA_DIR / "export",
-                    test_path=step7_test_path,
+                _t_hr0 = time.perf_counter()
+                _hr_bundle = train_issue8_high_roller_segmented_bundle(
+                    step7_train_path=step7_train_path,
+                    step7_valid_path=step7_valid_path,
+                    step7_test_path=step7_test_path,
+                    active_feature_cols=active_feature_cols,
+                    export_base=DATA_DIR / "export",
+                    run_optuna=not skip_optuna,
+                    ranking_recipe=pipeline_ranking_recipe,
+                    gbm_bakeoff=pipeline_gbm_bakeoff,
                 )
-                train_df = pd.read_parquet(step7_train_path)
-                if step7_train_path.exists():
-                    step7_train_path.unlink(missing_ok=True)
-                logger.info(
-                    "Step 7 B+: loaded train from file after screening (%d rows)%s",
-                    len(train_df),
-                    "; valid/test left on disk (B+ 階段 6 第 2 步)" if (valid_df is None and test_df is None) else "",
-                )
+                if _hr_bundle is not None:
+                    _rated_hr, _cm_hr = _hr_bundle
+                    rated_art = _rated_hr
+                    combined_metrics = _cm_hr
+                    _step9_issue8_pretrained = True
+                    _step9_issue8_elapsed_sec = time.perf_counter() - _t_hr0
+                    _train_libsvm = None
+                    _valid_libsvm = None
+                    _test_libsvm = None
+                    if step7_train_path.exists():
+                        step7_train_path.unlink(missing_ok=True)
+                    train_df = None
+                    logger.info(
+                        "Step 7 B+: Issue #8 segmented train complete; train parquet released "
+                        "(valid/test on disk for split metadata)"
+                    )
+                else:
+                    _train_libsvm, _valid_libsvm, _test_libsvm = _export_parquet_to_libsvm(
+                        step7_train_path,
+                        step7_valid_path,
+                        active_feature_cols,
+                        DATA_DIR / "export",
+                        test_path=step7_test_path,
+                    )
+                    train_df = pd.read_parquet(step7_train_path)
+                    if step7_train_path.exists():
+                        step7_train_path.unlink(missing_ok=True)
+                    logger.info(
+                        "Step 7 B+: loaded train from file after screening (%d rows)%s",
+                        len(train_df),
+                        "; valid/test left on disk (B+ 階段 6 第 2 步)" if (valid_df is None and test_df is None) else "",
+                    )
         
             if not active_feature_cols:
                 # R1613: explicit guardrail message for zero-feature situations.  In
@@ -1452,7 +1540,7 @@ def run_pipeline_core(args) -> None:
                     "STEP9_EXPORT_LIBSVM=False is incompatible with LibSVM-only training."
                 )
             remove_legacy_plan_b_csv_exports(DATA_DIR / "export")
-            if _train_libsvm is None or _valid_libsvm is None:
+            if not _step9_issue8_pretrained and (_train_libsvm is None or _valid_libsvm is None):
                 if train_df is None or valid_df is None or test_df is None:
                     raise RuntimeError(
                         "LibSVM-only: missing in-memory splits for export "
@@ -1477,7 +1565,7 @@ def run_pipeline_core(args) -> None:
                     test_path=_tsp,
                 )
                 shutil.rmtree(_tmp_sp, ignore_errors=True)
-            if _train_libsvm is None or _valid_libsvm is None:
+            if not _step9_issue8_pretrained and (_train_libsvm is None or _valid_libsvm is None):
                 raise RuntimeError("LibSVM-only: export did not produce train/valid LibSVM paths.")
 
             # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
@@ -1486,25 +1574,32 @@ def run_pipeline_core(args) -> None:
             pipeline_echo("Step 9/11 — Train rated GBM family + test-set eval …")
             t0 = time.perf_counter()
             model_version = pipeline_model_version
-            _libsvm_paths = (_train_libsvm, _valid_libsvm)
-            rated_art, _, combined_metrics = train_single_rated_model(
-                train_df,
-                valid_df,
-                active_feature_cols,
-                run_optuna=not skip_optuna,
-                test_df=test_df,
-                train_libsvm_paths=_libsvm_paths,
-                test_libsvm_path=_test_libsvm,
-                ranking_recipe=pipeline_ranking_recipe,
-                gbm_bakeoff=pipeline_gbm_bakeoff,
-                valid_split_parquet_path=step7_valid_path,
-                test_split_parquet_path=step7_test_path,
-                train_split_parquet_path=step7_train_path,
-            )
-            _el = time.perf_counter() - t0
+            if not _step9_issue8_pretrained:
+                _libsvm_paths = (_train_libsvm, _valid_libsvm)
+                rated_art, _, combined_metrics = train_single_rated_model(
+                    train_df,
+                    valid_df,
+                    active_feature_cols,
+                    run_optuna=not skip_optuna,
+                    test_df=test_df,
+                    train_libsvm_paths=_libsvm_paths,
+                    test_libsvm_path=_test_libsvm,
+                    ranking_recipe=pipeline_ranking_recipe,
+                    gbm_bakeoff=pipeline_gbm_bakeoff,
+                    valid_split_parquet_path=step7_valid_path,
+                    test_split_parquet_path=step7_test_path,
+                    train_split_parquet_path=step7_train_path,
+                )
+            _el = time.perf_counter() - t0 + float(_step9_issue8_elapsed_sec)
             step9_duration_sec = _el
             pipeline_echo(f"Step 9/11 — done in {_el:.1f}s")
-            logger.info("train_single_rated_model + A3 family compare + test eval: %.1fs", _el)
+            if _step9_issue8_pretrained:
+                logger.info(
+                    "Issue #8 segmented rated training + legacy path skip: %.1fs",
+                    _el,
+                )
+            else:
+                logger.info("train_single_rated_model + A3 family compare + test eval: %.1fs", _el)
 
             # T12.2: capture RSS/sys RAM snapshot at Step 9 end (checkpoint scope Step 7-9).
             # Peak := max(start, end) to avoid heavy sampling/polling overhead.

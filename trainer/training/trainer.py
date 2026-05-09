@@ -2224,7 +2224,17 @@ def process_chunk(
     # Attaches Rated-player profile features via as-of merge (snapshot_dtm <= bet_time).
     # Non-rated bets and bets without a prior snapshot receive 0 for all profile columns.
     # Phase B PR-B3: route through layered player entrypoint (thin wrapper).
-    labeled = compute_player_layer_features(labeled, profile_df)
+    # When track_profile is disabled in YAML (unified pipeline), skip join and do not
+    # materialize legacy PROFILE_FEATURE_COLS placeholders.
+    _profile_fids = (
+        get_candidate_feature_ids(feature_spec, "track_profile", screening_only=False)
+        if feature_spec
+        else []
+    )
+    if _profile_fids:
+        labeled = compute_player_layer_features(labeled, profile_df, feature_cols=_profile_fids)
+    else:
+        labeled = compute_player_layer_features(labeled, None, feature_cols=[])
     _validate_cross_layer_compose_inputs(labeled, feature_spec)
     labeled = add_wave2_personalized_baselines(labeled)
     _validate_cross_layer_compose_outputs(labeled, feature_spec)
@@ -4473,6 +4483,296 @@ def train_dual_model(
         k: (v["metrics"] if v else None) for k, v in results.items()
     }
     return results.get("rated"), results.get("nonrated"), combined_metrics
+
+
+def train_issue8_high_roller_segmented_bundle(
+    *,
+    step7_train_path: Path,
+    step7_valid_path: Path,
+    step7_test_path: Optional[Path],
+    active_feature_cols: List[str],
+    export_base: Path,
+    run_optuna: bool,
+    ranking_recipe: Optional[str],
+    gbm_bakeoff: bool,
+) -> Optional[Tuple[dict, dict]]:
+    """Issue #8: train separate rated models for high/low theo segments (train-only).
+
+    Each segment uses **LightGBM only** (``gbm_bakeoff=False``); pipeline
+    ``gbm_bakeoff`` is ignored for the two segment fits to save time and RAM.
+    Min-rows fallback still respects the caller's ``gbm_bakeoff``.
+
+    Returns ``(rated_art, combined_metrics)`` when segmentation runs (including
+    single-model fallback). Returns ``None`` when Issue #8 is disabled in config
+    so the caller should use the legacy single-path export + ``train_single_rated_model``.
+    """
+    from trainer.training.high_roller_segmentation import (
+        compute_high_roller_cutoff_from_train_parquet,
+        count_rated_rows_parquet,
+        materialize_segment_parquet_splits,
+        parquet_has_column,
+        routed_test_metrics_payload,
+    )
+
+    if not bool(getattr(_core_trainer_config, "HIGH_ROLLER_SEGMENT_ENABLE", False)):
+        return None
+
+    theo_col = str(getattr(_core_trainer_config, "HIGH_ROLLER_THEO_FEATURE", "theo_win_sum_30d"))
+    q = float(getattr(_core_trainer_config, "HIGH_ROLLER_QUANTILE", 0.90))
+    min_h = int(getattr(_core_trainer_config, "HIGH_ROLLER_MIN_ROWS_HIGH", 500))
+    min_l = int(getattr(_core_trainer_config, "HIGH_ROLLER_MIN_ROWS_LOW", 500))
+    primary_seg = str(
+        getattr(_core_trainer_config, "HIGH_ROLLER_PRIMARY_SEGMENT_FOR_SERVING", "low")
+    ).strip().lower()
+    if primary_seg not in ("low", "high"):
+        primary_seg = "low"
+
+    if not parquet_has_column(step7_train_path, theo_col):
+        logger.warning(
+            "Issue #8 high-roller segmentation: column %r missing on %s — skipping segmented train",
+            theo_col,
+            step7_train_path,
+        )
+        return None
+
+    cutoff, cut_meta = compute_high_roller_cutoff_from_train_parquet(
+        step7_train_path, theo_col, q
+    )
+    hr_root = Path(export_base) / "hr_segment"
+    if hr_root.exists():
+        shutil.rmtree(hr_root, ignore_errors=True)
+    hr_root.mkdir(parents=True, exist_ok=True)
+
+    high_parq_dir = hr_root / "parquet_high"
+    low_parq_dir = hr_root / "parquet_low"
+    materialize_segment_parquet_splits(
+        step7_train_path,
+        step7_valid_path,
+        step7_test_path,
+        theo_col,
+        cutoff,
+        "high",
+        high_parq_dir,
+    )
+    materialize_segment_parquet_splits(
+        step7_train_path,
+        step7_valid_path,
+        step7_test_path,
+        theo_col,
+        cutoff,
+        "low",
+        low_parq_dir,
+    )
+
+    high_train_p, high_valid_p, high_test_p = (
+        high_parq_dir / "train_segment.parquet",
+        high_parq_dir / "valid_segment.parquet",
+        high_parq_dir / "test_segment.parquet",
+    )
+    low_train_p, low_valid_p, low_test_p = (
+        low_parq_dir / "train_segment.parquet",
+        low_parq_dir / "valid_segment.parquet",
+        low_parq_dir / "test_segment.parquet",
+    )
+
+    n_h = count_rated_rows_parquet(high_train_p)
+    n_l = count_rated_rows_parquet(low_train_p)
+    seg_audit: Dict[str, Any] = {
+        **cut_meta,
+        "high_roller_segment_enable": True,
+        "high_roller_train_rated_rows_high": n_h,
+        "high_roller_train_rated_rows_low": n_l,
+        "high_roller_min_rows_high": min_h,
+        "high_roller_min_rows_low": min_l,
+    }
+
+    def _fallback_single() -> Tuple[dict, dict]:
+        _libsvm = _export_parquet_to_libsvm(
+            step7_train_path,
+            step7_valid_path,
+            active_feature_cols,
+            Path(export_base),
+            test_path=step7_test_path,
+        )
+        _tr = pd.read_parquet(step7_train_path)
+        _rated_art, _, _cm = train_single_rated_model(
+            _tr,
+            None,
+            active_feature_cols,
+            run_optuna=run_optuna,
+            test_df=None,
+            train_libsvm_paths=(_libsvm[0], _libsvm[1]),
+            test_libsvm_path=_libsvm[2],
+            ranking_recipe=ranking_recipe,
+            gbm_bakeoff=gbm_bakeoff,
+            valid_split_parquet_path=step7_valid_path,
+            test_split_parquet_path=step7_test_path,
+            train_split_parquet_path=step7_train_path,
+        )
+        _rated = _cm.get("rated") if isinstance(_cm, dict) else None
+        if isinstance(_rated, dict):
+            _rated = dict(_rated)
+            _rated["high_roller_segmentation"] = {
+                **seg_audit,
+                "fallback": "single_model_min_rows",
+            }
+            _cm = {**_cm, "rated": _rated}
+        return _rated_art, _cm
+
+    if n_h < min_h or n_l < min_l:
+        logger.warning(
+            "Issue #8: segment row counts below minimum (high=%d<%d or low=%d<%d) — %s",
+            n_h,
+            min_h,
+            n_l,
+            min_l,
+            getattr(_core_trainer_config, "HIGH_ROLLER_FALLBACK_MODE", "single_model"),
+        )
+        return _fallback_single()
+
+    if gbm_bakeoff:
+        logger.info(
+            "Issue #8 segmented training: disabling A3 gbm_bakeoff for high/low segments "
+            "(LightGBM only); pipeline had gbm_bakeoff=%s",
+            gbm_bakeoff,
+        )
+
+    high_export = hr_root / "libsvm_high"
+    low_export = hr_root / "libsvm_low"
+    high_export.mkdir(parents=True, exist_ok=True)
+    low_export.mkdir(parents=True, exist_ok=True)
+
+    _htrain, _hvalid, _htest = _export_parquet_to_libsvm(
+        high_train_p,
+        high_valid_p,
+        active_feature_cols,
+        high_export,
+        test_path=high_test_p if high_test_p.is_file() else None,
+    )
+    _ltrain, _lvalid, _ltest = _export_parquet_to_libsvm(
+        low_train_p,
+        low_valid_p,
+        active_feature_cols,
+        low_export,
+        test_path=low_test_p if low_test_p.is_file() else None,
+    )
+
+    train_high_df = pd.read_parquet(high_train_p)
+    train_low_df = pd.read_parquet(low_train_p)
+
+    high_art, _, cm_high = train_single_rated_model(
+        train_high_df,
+        None,
+        active_feature_cols,
+        run_optuna=run_optuna,
+        test_df=None,
+        train_libsvm_paths=(_htrain, _hvalid),
+        test_libsvm_path=_htest,
+        ranking_recipe=ranking_recipe,
+        gbm_bakeoff=False,
+        valid_split_parquet_path=high_valid_p,
+        test_split_parquet_path=high_test_p if high_test_p.is_file() else None,
+        train_split_parquet_path=high_train_p,
+    )
+    low_art, _, cm_low = train_single_rated_model(
+        train_low_df,
+        None,
+        active_feature_cols,
+        run_optuna=run_optuna,
+        test_df=None,
+        train_libsvm_paths=(_ltrain, _lvalid),
+        test_libsvm_path=_ltest,
+        ranking_recipe=ranking_recipe,
+        gbm_bakeoff=False,
+        valid_split_parquet_path=low_valid_p,
+        test_split_parquet_path=low_test_p if low_test_p.is_file() else None,
+        train_split_parquet_path=low_train_p,
+    )
+
+    if high_art is None or low_art is None:
+        logger.warning("Issue #8: segment training returned empty artifact — fallback single model")
+        return _fallback_single()
+
+    m_h = cm_high.get("rated") if isinstance(cm_high, dict) else {}
+    m_l = cm_low.get("rated") if isinstance(cm_low, dict) else {}
+    if not isinstance(m_h, dict):
+        m_h = {}
+    if not isinstance(m_l, dict):
+        m_l = {}
+
+    routed: Dict[str, Any] = {}
+    if step7_test_path is not None and Path(step7_test_path).is_file():
+        try:
+            import pyarrow.parquet as pq
+
+            _cols_use = [c for c in active_feature_cols if c not in ("label",)]
+            _read_cols = ["label", "is_rated", theo_col] + [c for c in _cols_use if c != theo_col]
+            _read_cols = list(dict.fromkeys(_read_cols))
+            _avail = set(pq.read_schema(step7_test_path).names)
+            _cols_ok = [c for c in _read_cols if c in _avail]
+            if "label" not in _cols_ok or "is_rated" not in _cols_ok:
+                raise ValueError("test parquet missing label or is_rated")
+            _test_mini = pd.read_parquet(step7_test_path, columns=_cols_ok)
+            routed = routed_test_metrics_payload(
+                test_df=_test_mini,
+                theo_col=theo_col,
+                cutoff=cutoff,
+                feature_cols=active_feature_cols,
+                model_high=high_art["model"],
+                model_low=low_art["model"],
+                thr_high=float(high_art["threshold"]),
+                thr_low=float(low_art["threshold"]),
+            )
+        except Exception as _rte:
+            logger.warning("Issue #8: routed test metrics skipped: %s", _rte)
+            routed = {"high_roller_routed_test_skipped": str(_rte)}
+
+    primary_art, secondary_art = (low_art, high_art) if primary_seg == "low" else (high_art, low_art)
+    primary_metrics = primary_art["metrics"]
+    secondary_metrics = secondary_art["metrics"]
+
+    rated_art = {
+        "model": primary_art["model"],
+        "threshold": primary_art["threshold"],
+        "features": primary_art["features"],
+        "metrics": primary_metrics,
+        "model_kind": primary_art.get("model_kind", primary_metrics.get("model_kind")),
+        "reason_codes_enabled": bool(primary_art.get("reason_codes_enabled", True)),
+        "component_backends": list(primary_art.get("component_backends") or []),
+        "a4_enabled": bool(primary_metrics.get("a4_enabled", False)),
+        "a4_fusion_mode": primary_art.get("a4_fusion_mode", A4_FUSION_MODE_PRODUCT),
+        "a4_candidate_cutoff": primary_art.get("a4_candidate_cutoff"),
+        "a4_stage1_threshold_before_final_calibration": primary_art.get(
+            "a4_stage1_threshold_before_final_calibration"
+        ),
+        "stage2_model": primary_art.get("stage2_model"),
+        "stage2_features": list(primary_art.get("stage2_features") or primary_art.get("features") or []),
+        "high_roller_segmentation": {
+            "schema_version": "issue8_v1",
+            **seg_audit,
+            "primary_segment": primary_seg,
+            "secondary_segment": "high" if primary_seg == "low" else "low",
+            "high_model_threshold": float(high_art["threshold"]),
+            "low_model_threshold": float(low_art["threshold"]),
+            "high_segment_metrics": m_h,
+            "low_segment_metrics": m_l,
+            "secondary_artifact": {
+                "model": secondary_art["model"],
+                "threshold": secondary_art["threshold"],
+                "features": secondary_art["features"],
+                "metrics": secondary_metrics,
+            },
+            "overall_weighted": routed,
+        },
+    }
+
+    combined_metrics: Dict[str, Any] = {
+        "rated": primary_metrics,
+        "segment_high": m_h,
+        "segment_low": m_l,
+        "high_roller_segmentation": rated_art["high_roller_segmentation"],
+    }
+    return rated_art, combined_metrics
 
 
 def train_single_rated_model(
