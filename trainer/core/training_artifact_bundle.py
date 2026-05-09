@@ -177,20 +177,23 @@ def save_artifact_bundle(
     if rated:
         _pkl_path = _out / "model.pkl"
         _tmp = _pkl_path.with_suffix(".pkl.tmp")
+        _pkl_payload: Dict[str, Any] = {
+            "model": rated["model"],
+            "threshold": rated["threshold"],
+            "features": rated["features"],
+            "model_kind": rated.get("model_kind", "lightgbm"),
+            "reason_codes_enabled": bool(rated.get("reason_codes_enabled", True)),
+            "component_backends": list(rated.get("component_backends") or []),
+            "a4_enabled": bool(rated.get("a4_enabled", False)),
+            "a4_fusion_mode": rated.get("a4_fusion_mode", A4_FUSION_MODE_PRODUCT),
+            "a4_candidate_cutoff": rated.get("a4_candidate_cutoff"),
+            "stage2_model": rated.get("stage2_model"),
+            "stage2_features": list(rated.get("stage2_features") or rated.get("features") or []),
+        }
+        if rated.get("high_roller_segmentation") is not None:
+            _pkl_payload["high_roller_segmentation"] = rated["high_roller_segmentation"]
         joblib.dump(
-            {
-                "model": rated["model"],
-                "threshold": rated["threshold"],
-                "features": rated["features"],
-                "model_kind": rated.get("model_kind", "lightgbm"),
-                "reason_codes_enabled": bool(rated.get("reason_codes_enabled", True)),
-                "component_backends": list(rated.get("component_backends") or []),
-                "a4_enabled": bool(rated.get("a4_enabled", False)),
-                "a4_fusion_mode": rated.get("a4_fusion_mode", A4_FUSION_MODE_PRODUCT),
-                "a4_candidate_cutoff": rated.get("a4_candidate_cutoff"),
-                "stage2_model": rated.get("stage2_model"),
-                "stage2_features": list(rated.get("stage2_features") or rated.get("features") or []),
-            },
+            _pkl_payload,
             _tmp,
         )
         os.replace(_tmp, _pkl_path)

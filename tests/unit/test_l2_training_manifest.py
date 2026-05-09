@@ -74,6 +74,9 @@ class TestL2TrainingManifest(unittest.TestCase):
             )
             m = load_and_validate_bundle(d)
             self.assertEqual(m.source_snapshot_id, "snap-one")
+            self.assertEqual(m.schema_version, "1")
+            self.assertEqual(m.train_export_paths, (m.train_path,))
+            self.assertIsNone(m.split_day_manifest)
             tb = split_parquet_total_bytes(m)
             self.assertEqual(tb, 1 + 2 + 3)
             peak = estimate_step7_peak_ram_gb_from_split_bytes(
@@ -83,3 +86,44 @@ class TestL2TrainingManifest(unittest.TestCase):
                 chunk_concat_ram_factor=3.0,
             )
             self.assertGreater(peak, 0.0)
+
+    def test_schema_v2_resolves_export_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            shard_train = d / "day_shards" / "train" / "day=2025-01-01"
+            shard_train.mkdir(parents=True)
+            (shard_train / "part.parquet").write_bytes(b"x")
+            for name in ("tr.parquet", "va.parquet", "te.parquet"):
+                (d / name).write_bytes(b"y")
+            manifest_obj = {
+                "schema_version": "2",
+                "source_snapshot_id": "snap-v2",
+                "l2_snapshot_id": "l2-v2",
+                "train_end": "2025-01-10T00:00:00",
+                "window_start": "2025-01-01T00:00:00",
+                "window_end": "2025-01-15T00:00:00",
+                "paths": {"train": "tr.parquet", "valid": "va.parquet", "test": "te.parquet"},
+                "split_day_manifest": {
+                    "train": [{"day": "2025-01-01", "path": "day_shards/train/day=2025-01-01/part.parquet"}],
+                    "valid": [{"day": "2025-01-01", "path": "va.parquet"}],
+                    "test": [{"day": "2025-01-01", "path": "te.parquet"}],
+                },
+                "split_calendar": {
+                    "train": {"gaming_day_min": "2025-01-01", "gaming_day_max": "2025-01-01"},
+                },
+                "split_semantics": {
+                    "valid_full_unsampled": True,
+                    "test_full_unsampled": True,
+                    "train_sampling_applied": False,
+                },
+                "identity_mapping_mode": "cutoff_window",
+            }
+            (d / L2_TRAINING_BUNDLE_MANIFEST_FILE).write_text(
+                json.dumps(manifest_obj, indent=2),
+                encoding="utf-8",
+            )
+            m = load_and_validate_bundle(d)
+            self.assertEqual(m.schema_version, "2")
+            self.assertEqual(len(m.train_export_paths), 1)
+            self.assertTrue(m.train_export_paths[0].is_file())
+            self.assertEqual(m.valid_export_paths, (m.valid_path,))

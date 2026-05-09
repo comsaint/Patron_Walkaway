@@ -140,6 +140,22 @@ class TestConfigRequiredConstants(unittest.TestCase):
         else:
             self.assertIsInstance(val, expected_type, f"{name} must be {expected_type}")
 
+    def test_issue8_high_roller_config_exposed(self):
+        """GitHub #8: segmented-training knobs live on trainer.config facade."""
+        self.assertHasAttr("HIGH_ROLLER_SEGMENT_ENABLE", bool)
+        self.assertHasAttr("HIGH_ROLLER_THEO_FEATURE", str)
+        self.assertHasAttr("HIGH_ROLLER_QUANTILE", float)
+        q = float(getattr(self.config, "HIGH_ROLLER_QUANTILE"))
+        self.assertGreater(q, 0.0)
+        self.assertLess(q, 1.0)
+
+    def test_issue8_theo_feature_name_validation(self):
+        from trainer.training.high_roller_segmentation import validate_theo_feature_name
+
+        self.assertEqual(validate_theo_feature_name("theo_win_sum_30d"), "theo_win_sum_30d")
+        with self.assertRaises(ValueError):
+            validate_theo_feature_name("bad-col")
+
 
 if __name__ == "__main__":
     unittest.main()

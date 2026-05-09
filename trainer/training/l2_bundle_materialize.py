@@ -17,6 +17,7 @@ from typing import Any, Dict, Mapping, Optional, Union
 import pandas as pd
 
 from trainer.training import data_sources
+from trainer.training.l2_day_shard import min_max_day_from_manifest_rows, shard_split_parquet_by_day
 
 L2_BUNDLE_CACHE_KEY_FILE: str = ".l2_bundle_cache_key.json"
 TRAIN_SPLIT_NAME: str = "train.parquet"
@@ -72,6 +73,27 @@ def auto_bundle_cache_is_current(*, bundle_dir: Path, expected_key: Mapping[str,
     te = bundle_dir / TEST_SPLIT_NAME
     if not (mf.is_file() and tr.is_file() and va.is_file() and te.is_file()):
         return False
+    try:
+        raw_mf = json.loads(mf.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw_mf, dict):
+        return False
+    ver = str(raw_mf.get("schema_version") or "1")
+    if ver == "2":
+        sdm = raw_mf.get("split_day_manifest")
+        if not isinstance(sdm, dict):
+            return False
+        for k in ("train", "valid", "test"):
+            rows = sdm.get(k)
+            if not isinstance(rows, list) or not rows:
+                return False
+            for row in rows:
+                if not isinstance(row, dict):
+                    return False
+                rel = row.get("path")
+                if not rel or not (bundle_dir / str(rel)).is_file():
+                    return False
     cached = read_cached_bundle_key(bundle_dir)
     if cached is None:
         return False
@@ -96,7 +118,7 @@ def build_auto_l2_cache_key(
 ) -> dict[str, Any]:
     """Inputs that must invalidate an auto-built L2 bundle when they change."""
     return {
-        "kind": "trainer_auto_l2_bundle_v1",
+        "kind": "trainer_auto_l2_bundle_v2",
         "bridge_manifest_stat": bridge_manifest_stat,
         "window_start_iso": window_start_iso,
         "window_end_iso": window_end_iso,
@@ -183,8 +205,24 @@ def materialize_l2_training_bundle_dir(
             return str(x.isoformat())
         return str(x)
 
+    dm_train = shard_split_parquet_by_day(bundle_dir, "train", out_train)
+    dm_valid = shard_split_parquet_by_day(bundle_dir, "valid", out_valid)
+    dm_test = shard_split_parquet_by_day(bundle_dir, "test", out_test)
+    tr_lo, tr_hi = min_max_day_from_manifest_rows(dm_train)
+    va_lo, va_hi = min_max_day_from_manifest_rows(dm_valid)
+    te_lo, te_hi = min_max_day_from_manifest_rows(dm_test)
+    split_calendar = {
+        "train": {
+            "gaming_day_min": tr_lo,
+            "gaming_day_max": tr_hi,
+            "policy": "row_fraction_step7_then_day_shard",
+        },
+        "valid": {"gaming_day_min": va_lo, "gaming_day_max": va_hi, "policy": "row_fraction_step7_then_day_shard"},
+        "test": {"gaming_day_min": te_lo, "gaming_day_max": te_hi, "policy": "row_fraction_step7_then_day_shard"},
+    }
+
     manifest: dict[str, Any] = {
-        "schema_version": "1",
+        "schema_version": "2",
         "source_snapshot_id": str(source_snapshot_id),
         "l2_snapshot_id": l2_snapshot_id,
         "train_end": _iso(train_end),
@@ -195,6 +233,12 @@ def materialize_l2_training_bundle_dir(
             "valid": VALID_SPLIT_NAME,
             "test": TEST_SPLIT_NAME,
         },
+        "split_day_manifest": {
+            "train": dm_train,
+            "valid": dm_valid,
+            "test": dm_test,
+        },
+        "split_calendar": split_calendar,
         "split_semantics": {
             "valid_full_unsampled": True,
             "test_full_unsampled": True,

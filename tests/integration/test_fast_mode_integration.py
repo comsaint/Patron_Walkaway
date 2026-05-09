@@ -23,10 +23,11 @@ Covered scenarios
 import argparse
 import os
 import tempfile
+from contextlib import ExitStack
 from datetime import datetime, timedelta
 from pathlib import Path
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 from zoneinfo import ZoneInfo
@@ -69,6 +70,7 @@ def _fake_chunk_df(ts: datetime) -> pd.DataFrame:
             "is_rated": [True],
             "canonical_id": ["C000"],
             "run_id": [1],
+            "bet_id": [1],
         }
     )
 
@@ -92,6 +94,7 @@ class _PipelineMixin:
         _fd, _tmp_parquet = tempfile.mkstemp(suffix=".parquet")
         os.close(_fd)
         try:
+            fake_df.to_parquet(_tmp_parquet, index=False)
             return self._run_pipeline_with_mocks_inner(chunks, cmap, fake_df, _tmp_parquet)
         finally:
             try:
@@ -102,65 +105,113 @@ class _PipelineMixin:
     def _run_pipeline_with_mocks_inner(
         self, chunks: list, cmap: pd.DataFrame, fake_df: pd.DataFrame, tmp_parquet: str
     ) -> dict:
-        from unittest.mock import MagicMock
         _mock_canonical_parquet = MagicMock()
         _mock_canonical_parquet.exists.return_value = False
         _mock_canonical_cutoff = MagicMock()
         _mock_canonical_cutoff.exists.return_value = False
         patches = {
+            "l2_materialize": patch(
+                "trainer.training.pipeline_run_core.l2_bundle_materialize.materialize_l2_training_bundle_dir",
+                return_value=Path(tempfile.mkdtemp(prefix="l2bundle_")),
+            ),
+            "l2_execute": patch(
+                "trainer.training.pipeline_run_core.pipeline_l2_bundle.execute_l2_training_bundle",
+                MagicMock(return_value=None),
+            ),
+            "l2_cache_miss": patch(
+                "trainer.training.pipeline_run_core.l2_bundle_materialize.auto_bundle_cache_is_current",
+                return_value=False,
+            ),
             "cross_entry_preflight": patch(
                 "trainer.training.cross_entry_preflight.run_cross_entry_data_preflight"
             ),
-            "step7_duckdb": patch("trainer.trainer.STEP7_USE_DUCKDB", False),
-            "step7_keep_disk": patch("trainer.trainer.STEP7_KEEP_TRAIN_ON_DISK", False),
+            "track_profile_gate": patch(
+                "trainer.features.features._track_section_enabled_in_spec",
+                return_value=True,
+            ),
+            "step7_duckdb": patch("trainer.training.pipeline_run_core.STEP7_USE_DUCKDB", False),
+            "step7_keep_disk": patch("trainer.training.pipeline_run_core.STEP7_KEEP_TRAIN_ON_DISK", False),
             "get_single_window_chunk": patch(
-                "trainer.trainer.get_single_window_chunk", return_value=chunks
+                "trainer.training.pipeline_run_core.get_single_window_chunk", return_value=chunks
             ),
             "local_parquet_session_path": patch(
-                "trainer.trainer.local_parquet_session_path_for_trainer",
+                "trainer.training.pipeline_run_core.local_parquet_session_path_for_trainer",
                 return_value=Path(tmp_parquet),
             ),
-            "load_local_parquet": patch("trainer.trainer.load_local_parquet", return_value=(pd.DataFrame(), pd.DataFrame())),
-            "apply_dq": patch("trainer.trainer.apply_dq", return_value=(pd.DataFrame(), pd.DataFrame())),
-            "canonical_parquet": patch("trainer.trainer.CANONICAL_MAPPING_PARQUET", new=_mock_canonical_parquet),
-            "canonical_cutoff_json": patch("trainer.trainer.CANONICAL_MAPPING_CUTOFF_JSON", new=_mock_canonical_cutoff),
-            "build_links_dummy": patch("trainer.trainer.build_canonical_links_and_dummy_from_duckdb",
-                                       return_value=(pd.DataFrame(columns=["player_id", "casino_player_id", "lud_dtm"]), set())),
-            "build_canonical_mapping_from_links": patch("trainer.trainer.build_canonical_mapping_from_links", return_value=cmap),
-            "build_canonical_mapping_from_df": patch("trainer.trainer.build_canonical_mapping_from_df", return_value=cmap),
-            "get_dummy_player_ids_from_df": patch("trainer.trainer.get_dummy_player_ids_from_df", return_value=set()),
-            "ensure_profile": patch("trainer.trainer.ensure_player_profile_ready"),
-            "load_profile": patch("trainer.trainer.load_player_profile", return_value=None),
-            "process_chunk": patch("trainer.trainer.process_chunk", return_value=tmp_parquet),
-            "read_parquet": patch("trainer.trainer.pd.read_parquet", return_value=fake_df),
-            "train_dual_model": patch("trainer.trainer.train_single_rated_model",
-                                     return_value=({"model": None, "threshold": 0.5, "features": []}, None, {})),
-            "save_bundle": patch("trainer.trainer.save_artifact_bundle"),
-            "oom_check_after_chunk1": patch("trainer.trainer._oom_check_after_chunk1", return_value=0.5),
+            "load_local_parquet": patch(
+                "trainer.training.pipeline_run_core.load_local_parquet",
+                return_value=(pd.DataFrame(), pd.DataFrame()),
+            ),
+            "apply_dq": patch("trainer.training.pipeline_run_core.apply_dq", return_value=(pd.DataFrame(), pd.DataFrame())),
+            "canonical_parquet": patch(
+                "trainer.training.pipeline_run_core.CANONICAL_MAPPING_PARQUET", new=_mock_canonical_parquet
+            ),
+            "canonical_cutoff_json": patch(
+                "trainer.training.pipeline_run_core.CANONICAL_MAPPING_CUTOFF_JSON", new=_mock_canonical_cutoff
+            ),
+            "build_links_dummy": patch(
+                "trainer.training.pipeline_run_core.build_canonical_links_and_dummy_from_duckdb",
+                return_value=(pd.DataFrame(columns=["player_id", "casino_player_id", "lud_dtm"]), set()),
+            ),
+            "build_canonical_mapping_from_links": patch(
+                "trainer.training.pipeline_run_core.build_canonical_mapping_from_links", return_value=cmap
+            ),
+            "build_canonical_mapping_from_df": patch(
+                "trainer.training.pipeline_run_core.build_canonical_mapping_from_df", return_value=cmap
+            ),
+            "get_dummy_player_ids_from_df": patch(
+                "trainer.training.pipeline_run_core.get_dummy_player_ids_from_df", return_value=set()
+            ),
+            "ensure_profile": patch("trainer.training.pipeline_run_core.ensure_player_profile_ready"),
+            "load_profile": patch("trainer.training.pipeline_run_core.load_player_profile", return_value=None),
+            "process_chunk": patch("trainer.training.pipeline_run_core.process_chunk", return_value=tmp_parquet),
+            "read_parquet": patch("trainer.training.pipeline_run_core.pd.read_parquet", return_value=fake_df),
+            "train_dual_model": patch(
+                "trainer.training.pipeline_run_core.train_single_rated_model",
+                return_value=({"model": None, "threshold": 0.5, "features": []}, None, {}),
+            ),
+            "save_bundle": patch("trainer.training.pipeline_run_core.save_artifact_bundle"),
+            "oom_check_after_chunk1": patch("trainer.training.pipeline_run_core._oom_check_after_chunk1", return_value=0.5),
         }
 
-        with (
-            patches["cross_entry_preflight"],
-            patches["step7_duckdb"],
-            patches["step7_keep_disk"],
-            patches["get_single_window_chunk"],
-            patches["local_parquet_session_path"],
-            patches["load_local_parquet"],
-            patches["apply_dq"],
-            patches["canonical_parquet"],
-            patches["canonical_cutoff_json"],
-            patches["build_links_dummy"],
-            patches["build_canonical_mapping_from_links"],
-            patches["build_canonical_mapping_from_df"],
-            patches["get_dummy_player_ids_from_df"],
-            patches["ensure_profile"] as mock_ensure,
-            patches["load_profile"] as mock_load_profile,
-            patches["process_chunk"] as mock_proc,
-            patches["read_parquet"],
-            patches["train_dual_model"],
-            patches["save_bundle"],
-            patches["oom_check_after_chunk1"],
-        ):
+        _patch_order = (
+            "l2_materialize",
+            "l2_execute",
+            "l2_cache_miss",
+            "cross_entry_preflight",
+            "track_profile_gate",
+            "step7_duckdb",
+            "step7_keep_disk",
+            "get_single_window_chunk",
+            "local_parquet_session_path",
+            "load_local_parquet",
+            "apply_dq",
+            "canonical_parquet",
+            "canonical_cutoff_json",
+            "build_links_dummy",
+            "build_canonical_mapping_from_links",
+            "build_canonical_mapping_from_df",
+            "get_dummy_player_ids_from_df",
+            "ensure_profile",
+            "load_profile",
+            "process_chunk",
+            "read_parquet",
+            "train_dual_model",
+            "save_bundle",
+            "oom_check_after_chunk1",
+        )
+        with ExitStack() as stack:
+            mock_ensure = None
+            mock_load_profile = None
+            mock_proc = None
+            for _k in _patch_order:
+                ctx = stack.enter_context(patches[_k])
+                if _k == "ensure_profile":
+                    mock_ensure = ctx
+                elif _k == "load_profile":
+                    mock_load_profile = ctx
+                elif _k == "process_chunk":
+                    mock_proc = ctx
             start_date = chunks[0]["window_start"].strftime("%Y-%m-%d")
             end_date = chunks[-1]["window_end"].strftime("%Y-%m-%d")
             ns = {
@@ -172,8 +223,6 @@ class _PipelineMixin:
                 "skip_optuna": True,
                 "no_preload": self._no_preload,
                 "sample_rated": self._sample_rated,
-                # Keep mocked runs on the classic Steps 4–10 path (skip L2 auto-materialize).
-                "no_l2_auto_bundle": True,
                 "l2_training_bundle": None,
             }
             if self._extra_args:

@@ -26,6 +26,68 @@ from trainer.training.metrics_eval import (
 
 logger = logging.getLogger("trainer")
 
+
+def _is_lightgbm_booster(booster: Any) -> bool:
+    """Return True only for LightGBM core Booster (ndarray batch ``predict``).
+
+    Do not use substring heuristics on ``__module__``: A3 disk path may expose an
+    ``xgboost.core.Booster`` via ``model.booster_`` (e.g. ``XGBoostBoosterDiskClassifier``),
+    which must use ``predict_proba`` / DMatrix instead of ndarray ``predict``.
+    """
+    return isinstance(booster, lgb.Booster)
+
+
+def _is_xgboost_booster(booster: Any) -> bool:
+    """Return True for ``xgboost`` core Booster without importing ``xgboost`` at import time."""
+    if booster is None:
+        return False
+    mod = str(getattr(type(booster), "__module__", "") or "")
+    return mod.startswith("xgboost.") and type(booster).__name__ == "Booster"
+
+
+def _xgboost_booster_from_model(model: Any) -> Any:
+    """Resolve ``xgboost.core.Booster`` from ``booster_`` or ``get_booster()``."""
+    b = getattr(model, "booster_", None)
+    if _is_xgboost_booster(b):
+        return b
+    getter = getattr(model, "get_booster", None)
+    if callable(getter):
+        try:
+            out = getter()
+        except Exception:
+            return None
+        return out if _is_xgboost_booster(out) else None
+    return None
+
+
+def _xgboost_dmatrix_feature_names(model: Any, booster: Any) -> Optional[List[str]]:
+    """Feature name list for ``DMatrix``; ``None`` lets XGBoost infer from data only."""
+    raw = getattr(model, "_feature_names", None)
+    if isinstance(raw, (list, tuple)) and raw:
+        return [str(x) for x in raw]
+    fin = getattr(model, "feature_names_in_", None)
+    if fin is not None:
+        return [str(x) for x in list(fin)]
+    bfn = getattr(booster, "feature_names", None)
+    if isinstance(bfn, (list, tuple)) and bfn:
+        return [str(x) for x in bfn]
+    return None
+
+
+def _lgb_booster_feature_name_list(booster: Any) -> List[str]:
+    """Return LightGBM Booster feature names across versions.
+
+    Newer wheels expose ``feature_names()``; older builds used ``feature_name()``.
+    """
+    fn = getattr(booster, "feature_names", None)
+    if callable(fn):
+        return list(fn())
+    fn_legacy = getattr(booster, "feature_name", None)
+    if callable(fn_legacy):
+        return list(fn_legacy())
+    return []
+
+
 MIN_VALID_TEST_ROWS: int = int(getattr(_cfg, "MIN_VALID_TEST_ROWS", 50))
 THRESHOLD_FBETA: float = float(getattr(_cfg, "THRESHOLD_FBETA", 0.5))
 TRAIN_METRICS_PREDICT_BATCH_ROWS: int = int(
@@ -528,7 +590,7 @@ def _dataframe_for_lgb_predict(
     booster = getattr(model, "booster_", None)
     if booster is None or not avail_cols:
         return X
-    fnames = booster.feature_name()
+    fnames = _lgb_booster_feature_name_list(booster)
     if not fnames or fnames[0] != "f0" or len(fnames) != len(avail_cols):
         return X
     X = X.copy()
@@ -560,6 +622,37 @@ def _batched_booster_predict_scores(
     return np.concatenate(parts, axis=0)
 
 
+def _batched_xgboost_booster_predict_scores(
+    booster: Any,
+    X: pd.DataFrame,
+    batch_rows: int,
+    feature_names: Optional[List[str]],
+) -> np.ndarray:
+    """Chunked ``Booster.predict`` via ``DMatrix`` (positive class, binary logistic)."""
+    import xgboost as xgb
+
+    n = int(len(X))
+    if n == 0:
+        return np.asarray([], dtype=np.float64)
+    n_feat = int(X.shape[1])
+    if feature_names is not None and len(feature_names) != n_feat:
+        raise ValueError(
+            "XGBoost DMatrix batch: feature_names length mismatch "
+            f"(got {len(feature_names)} names vs {n_feat} columns)."
+        )
+    br = max(1, int(batch_rows))
+    fn_arg: Optional[List[str]] = feature_names if feature_names else None
+    parts: list[np.ndarray] = []
+    for start in range(0, n, br):
+        chunk = X.iloc[start : start + br]
+        arr = np.ascontiguousarray(chunk.to_numpy(dtype=np.float32, copy=True))
+        dm = xgb.DMatrix(arr, feature_names=fn_arg)
+        raw = booster.predict(dm)
+        pa = np.asarray(raw, dtype=np.float64).reshape(-1)
+        parts.append(pa)
+    return np.concatenate(parts, axis=0)
+
+
 def _batched_model_positive_class_scores(
     model: Any,
     X: pd.DataFrame,
@@ -567,13 +660,25 @@ def _batched_model_positive_class_scores(
 ) -> np.ndarray:
     """Chunked positive-class scores for any sklearn-like classifier.
 
-    LightGBM ``booster_`` keeps the dedicated fast path.  Other backends (CatBoost /
-    XGBoost sklearn wrappers) fall back to chunked ``predict_proba`` to avoid one giant
-    dense probability matrix on laptop-scale runs.
+    LightGBM ``booster_``: ndarray batch ``predict``. XGBoost core ``Booster``:
+    chunked ``DMatrix`` ``predict`` (avoids sklearn allocating one huge proba matrix).
+    Other backends: chunked ``predict_proba``.
     """
     booster = getattr(model, "booster_", None)
-    if booster is not None:
+    if booster is not None and _is_lightgbm_booster(booster):
         return _batched_booster_predict_scores(booster, X, batch_rows)
+    xgb_booster = booster if _is_xgboost_booster(booster) else _xgboost_booster_from_model(model)
+    if _is_xgboost_booster(xgb_booster):
+        names = _xgboost_dmatrix_feature_names(model, xgb_booster)
+        try:
+            return _batched_xgboost_booster_predict_scores(
+                xgb_booster, X, batch_rows, names
+            )
+        except Exception as exc:
+            logger.warning(
+                "XGBoost batched DMatrix predict failed; falling back to predict_proba: %s",
+                exc,
+            )
     n = int(len(X))
     if n == 0:
         return np.asarray([], dtype=np.float64)
@@ -857,7 +962,7 @@ def _compute_feature_importance(
     """
     try:
         booster = model.booster_
-        names: List[str] = booster.feature_name()
+        names: List[str] = _lgb_booster_feature_name_list(booster)
         gains = booster.feature_importance(importance_type="gain").tolist()
     except AttributeError:
         # Fallback for mock / non-LightGBM models (no booster_ attribute).

@@ -68,8 +68,12 @@ class TestL2BundleMaterialize(unittest.TestCase):
             )
             mf = json.loads((d / "l2_training_bundle.json").read_text(encoding="utf-8"))
             validate(instance=mf, schema=schema)
+            self.assertEqual(mf.get("schema_version"), "2")
+            self.assertIsInstance(mf.get("split_day_manifest"), dict)
             m = load_and_validate_bundle(d)
             self.assertEqual(m.source_snapshot_id, "snap_unit_test")
+            self.assertEqual(m.schema_version, "2")
+            self.assertGreater(len(m.train_export_paths), 0)
             self.assertTrue(m.valid_full_unsampled and m.test_full_unsampled)
             self.assertIsNone(m.per_feature_fingerprints)
 

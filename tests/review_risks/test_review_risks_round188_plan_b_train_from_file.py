@@ -13,6 +13,7 @@ import pandas as pd
 
 import trainer.trainer as trainer_mod
 from trainer.trainer import _BoosterWrapper, train_single_rated_model
+from trainer.training.model_eval_runtime import _lgb_booster_feature_name_list
 
 
 def _make_rated_dfs(n_train: int, n_valid: int, train_cols: list[str], valid_cols: list[str], seed: int = 42):
@@ -77,7 +78,7 @@ class TestR188LibSvmFeaturesMatchBooster(unittest.TestCase):
                 )
         self.assertIsNotNone(rated_art)
         booster = rated_art["model"].booster_
-        expected_features = list(booster.feature_name())
+        expected_features = _lgb_booster_feature_name_list(booster)
         self.assertEqual(rated_art["features"], expected_features)
 
 
@@ -160,7 +161,7 @@ class TestR188LgbDatasetFromMinimalCsv(unittest.TestCase):
             dvalid = lgb.Dataset(str(valid_path), reference=dtrain, params=ds_params)
             params = {"objective": "binary", "verbosity": -1, "num_leaves": 2}
             booster = lgb.train(params, dtrain, num_boost_round=3, valid_sets=[dvalid])
-        self.assertEqual(list(booster.feature_name()), ["f1"])
+        self.assertEqual(_lgb_booster_feature_name_list(booster), ["f1"])
 
 
 class TestR188TrainSingleLibSvmFailFastInSource(unittest.TestCase):

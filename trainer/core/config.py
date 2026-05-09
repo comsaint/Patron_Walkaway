@@ -186,6 +186,15 @@ from trainer.core._config_training_memory import (
     TRAIN_SPLIT_FRAC,
     VALID_SPLIT_FRAC,
 )
+from trainer.core._config_high_roller_segmentation import (
+    HIGH_ROLLER_FALLBACK_MODE,
+    HIGH_ROLLER_MIN_ROWS_HIGH,
+    HIGH_ROLLER_MIN_ROWS_LOW,
+    HIGH_ROLLER_PRIMARY_SEGMENT_FOR_SERVING,
+    HIGH_ROLLER_QUANTILE,
+    HIGH_ROLLER_SEGMENT_ENABLE,
+    HIGH_ROLLER_THEO_FEATURE,
+)
 from trainer.core._config_validator import (
     VALIDATOR_ALERT_RETENTION_DAYS,
     VALIDATOR_EXTENDED_WAIT_MINUTES,

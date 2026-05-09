@@ -9,6 +9,7 @@ import trainer.core.config as core_config
 from trainer.core import (
     _config_clickhouse_sources as clickhouse_shard,
     _config_env_paths as env_paths_shard,
+    _config_high_roller_segmentation as high_roller_shard,
     _config_serving_runtime as serving_shard,
     _config_training_domain as domain_shard,
     _config_training_memory as memory_shard,
@@ -27,6 +28,9 @@ class TestConfigFacadeShardReexportContract(unittest.TestCase):
             ("VALIDATOR_FINALIZE_ON_HORIZON", validator_shard.VALIDATOR_FINALIZE_ON_HORIZON),
             ("WALKAWAY_GAP_MIN", domain_shard.WALKAWAY_GAP_MIN),
             ("STEP9_TRAIN_FROM_FILE", memory_shard.STEP9_TRAIN_FROM_FILE),
+            ("HIGH_ROLLER_SEGMENT_ENABLE", high_roller_shard.HIGH_ROLLER_SEGMENT_ENABLE),
+            ("HIGH_ROLLER_THEO_FEATURE", high_roller_shard.HIGH_ROLLER_THEO_FEATURE),
+            ("HIGH_ROLLER_QUANTILE", high_roller_shard.HIGH_ROLLER_QUANTILE),
         ]
         for name, shard_value in cases:
             self.assertTrue(hasattr(core_config, name), f"core facade must expose {name}")
@@ -40,6 +44,9 @@ class TestConfigFacadeShardReexportContract(unittest.TestCase):
             "VALIDATOR_FINALIZE_ON_HORIZON",
             "WALKAWAY_GAP_MIN",
             "STEP9_TRAIN_FROM_FILE",
+            "HIGH_ROLLER_SEGMENT_ENABLE",
+            "HIGH_ROLLER_THEO_FEATURE",
+            "HIGH_ROLLER_QUANTILE",
         ):
             self.assertTrue(hasattr(top_config, name), f"trainer.config must expose {name}")
             self.assertEqual(

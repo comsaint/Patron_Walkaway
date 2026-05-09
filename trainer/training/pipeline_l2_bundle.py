@@ -3,8 +3,10 @@
 Invoked from ``run_pipeline`` when ``--l2-training-bundle DIR`` is set.  Lazy-imports
 ``trainer.training.trainer`` at call time to avoid import cycles.
 
-**RAM**: train/valid/test are loaded fully into memory (MVP).  Do not point at
-multi-GB parquets on laptops without sufficient RAM.
+**RAM**: row counts, Issue #16 gates, and Step 8 screening use DuckDB / bounded
+Parquet head reads on the monolithic train split; LibSVM export streams from
+``manifest.*_export_paths`` (day shards when schema v2) without concatenating
+splits into a single in-memory frame.
 """
 
 from __future__ import annotations
@@ -66,15 +68,16 @@ def execute_l2_training_bundle(
         KEY_TEST_FULL_UNSAMPLED,
         KEY_TRAIN_SAMPLING_APPLIED,
         KEY_VALID_FULL_UNSAMPLED,
+        OOM_ESTIMATE_STRATEGY_L2_SPLIT_FILES,
         TRAIN_END_SOURCE_L2_MANIFEST,
     )
     from trainer.training.l2_training_manifest import (
         L2_TRAINING_BUNDLE_MANIFEST_FILE,
-        OOM_ESTIMATE_STRATEGY_L2_SPLIT_FILES,
         estimate_step7_peak_ram_gb_from_split_bytes,
         load_and_validate_bundle,
         split_parquet_total_bytes,
     )
+    from trainer.training.training_objective import primary_rated_gbm_bakeoff_enabled
 
     if sample_rated_n is not None:
         logger.warning(
@@ -82,25 +85,39 @@ def execute_l2_training_bundle(
         )
     t_load = time.perf_counter()
     manifest = load_and_validate_bundle(bundle_dir)
-    train_df = pd.read_parquet(manifest.train_path)
-    valid_df = pd.read_parquet(manifest.valid_path)
-    test_df = pd.read_parquet(manifest.test_path)
+    import duckdb
+
+    train_expr = tr._libsvm_duckdb_read_parquet_expr(manifest.train_export_paths)
+    valid_expr = tr._libsvm_duckdb_read_parquet_expr(manifest.valid_export_paths)
+    test_expr = tr._libsvm_duckdb_read_parquet_expr(manifest.test_export_paths)
+
+    def _l2_scalar(sql: str) -> Any:
+        con = duckdb.connect(":memory:")
+        try:
+            row = con.execute(sql).fetchone()
+            return row[0] if row else None
+        finally:
+            con.close()
+
+    n_train = int(_l2_scalar(f"SELECT count(*) FROM {train_expr}") or 0)
+    n_valid = int(_l2_scalar(f"SELECT count(*) FROM {valid_expr}") or 0)
+    n_test = int(_l2_scalar(f"SELECT count(*) FROM {test_expr}") or 0)
     step7_duration_sec = time.perf_counter() - t_load
     tr.pipeline_echo(
-        f"Step 8/11 — L2 bundle — manifest OK; loaded splits from {bundle_dir} in "
+        f"Step 8/11 — L2 bundle — manifest OK; probed splits from {bundle_dir} in "
         f"{step7_duration_sec:.1f}s "
-        f"(train={len(train_df)} valid={len(valid_df)} test={len(test_df)} rows)"
+        f"(train={n_train} valid={n_valid} test={n_test} rows; schema={manifest.schema_version})"
     )
 
-    for name, df in ("train", train_df), ("valid", valid_df), ("test", test_df):
-        if "label" not in df.columns:
-            raise SystemExit(f"L2 bundle {name} parquet missing required column 'label'")
-        if "is_rated" not in df.columns:
-            logger.warning(
-                "L2 bundle %s: missing is_rated — defaulting all rows to True (rated-only training)",
-                name,
-            )
-            df["is_rated"] = True
+    _probe_con = duckdb.connect(":memory:")
+    try:
+        _desc = _probe_con.execute(f"SELECT * FROM {train_expr} LIMIT 0").description
+        _l2_train_cols: List[str] = [d[0] for d in (_desc or [])]
+    finally:
+        _probe_con.close()
+
+    if "label" not in _l2_train_cols:
+        raise SystemExit("L2 bundle train parquet missing required column 'label'")
 
     effective_start = pd.Timestamp(manifest.window_start).to_pydatetime()
     effective_end = pd.Timestamp(manifest.window_end).to_pydatetime()
@@ -110,11 +127,11 @@ def execute_l2_training_bundle(
     else:
         train_end = train_end.to_pydatetime()
 
-    _actual_train_end = (
-        train_df["payout_complete_dtm"].max()
-        if "payout_complete_dtm" in train_df.columns and len(train_df)
-        else train_end
-    )
+    if "payout_complete_dtm" in _l2_train_cols and n_train > 0:
+        _row_max = _l2_scalar(f"SELECT max(payout_complete_dtm) FROM {train_expr}")
+        _actual_train_end = pd.Timestamp(_row_max).to_pydatetime() if _row_max is not None else train_end
+    else:
+        _actual_train_end = train_end
 
     split_flags = {
         KEY_VALID_FULL_UNSAMPLED: manifest.valid_full_unsampled,
@@ -130,7 +147,6 @@ def execute_l2_training_bundle(
     except Exception as _l2_spec_exc:
         logger.warning("L2 bundle: could not load feature spec for spec-first gate: %s", _l2_spec_exc)
 
-    _l2_train_cols: List[str] = list(train_df.columns)
     feature_materialization_audit: Optional[Dict[str, Any]] = None
     try:
         from trainer.training import feature_materialization as _fm_l2
@@ -171,19 +187,22 @@ def execute_l2_training_bundle(
         "l2_bundle_dir": str(manifest.bundle_dir),
     }
 
-    _split_row_meta = tr.split_row_metadata_from_dataframes(train_df, valid_df, test_df)
-    _model_used_split_meta = tr.split_row_metadata_from_dataframes(
-        train_df, valid_df, test_df, rated_only=True
+    _split_row_meta = tr.split_row_metadata_from_parquet_path_sequences(
+        manifest.train_export_paths,
+        manifest.valid_export_paths,
+        manifest.test_export_paths,
     )
-    n_rows = len(train_df) + len(valid_df) + len(test_df)
-    _label1 = int(train_df["label"].sum()) + int(valid_df["label"].sum()) + int(test_df["label"].sum())
-
-    step7_train_path = None
-    step7_valid_path = None
-    step7_test_path = None
-    _train_libsvm = None
-    _valid_libsvm = None
-    _test_libsvm = None
+    _model_used_split_meta = tr.split_row_metadata_from_parquet_path_sequences(
+        manifest.train_export_paths,
+        manifest.valid_export_paths,
+        manifest.test_export_paths,
+        rated_only=True,
+    )
+    n_rows = n_train + n_valid + n_test
+    _lt = int(_l2_scalar(f"SELECT coalesce(sum(cast(label AS INTEGER)), 0) FROM {train_expr}") or 0)
+    _lv = int(_l2_scalar(f"SELECT coalesce(sum(cast(label AS INTEGER)), 0) FROM {valid_expr}") or 0)
+    _ltest = int(_l2_scalar(f"SELECT coalesce(sum(cast(label AS INTEGER)), 0) FROM {test_expr}") or 0)
+    _label1 = _lt + _lv + _ltest
 
     split_total_bytes = split_parquet_total_bytes(manifest)
     oom_precheck_est_peak_ram_gb = estimate_step7_peak_ram_gb_from_split_bytes(
@@ -200,7 +219,7 @@ def execute_l2_training_bundle(
         feature_spec_hash = "unknown"
 
     step8_screen_sample_strategy = tr._step8_resolve_sample_strategy(tr.STEP8_SCREEN_SAMPLE_STRATEGY)
-    _train_cols = train_df.columns
+    _train_cols = pd.Index(_l2_train_cols)
     active_feature_cols = tr.get_all_candidate_feature_ids(feature_spec, screening_only=True)
     if feature_spec is not None:
         _track_llm_cols = [
@@ -229,21 +248,31 @@ def execute_l2_training_bundle(
             if (tr.STEP8_SCREEN_SAMPLE_ROWS is not None and tr.STEP8_SCREEN_SAMPLE_ROWS >= 1)
             else 2_000_000
         )
-        _sample_n = (
+        _sample_n_disk = (
             int(tr.STEP8_SCREEN_SAMPLE_ROWS)
             if (tr.STEP8_SCREEN_SAMPLE_ROWS is not None and tr.STEP8_SCREEN_SAMPLE_ROWS >= 1)
-            else None
+            else _cap
         )
-        _matrix_for_screen = tr._step8_sample_in_memory_train(
-            train_df,
-            strategy=step8_screen_sample_strategy,
-            sample_n=_sample_n,
-            default_cap=_cap,
-        )
-        step8_screening_source = f"in_memory_{step8_screen_sample_strategy}"
-        step8_screening_stats_source = "screening_sample_df"
+        if step8_screen_sample_strategy == "tail":
+            _matrix_for_screen = tr._read_parquet_tail_step8(manifest.train_path, _sample_n_disk)
+        elif step8_screen_sample_strategy == "head_tail":
+            _matrix_for_screen = tr._read_parquet_head_tail_step8(
+                manifest.train_path,
+                _sample_n_disk,
+                read_head=tr.read_parquet_head,
+            )
+        else:
+            _matrix_for_screen = tr.read_parquet_head(manifest.train_path, _sample_n_disk)
+        if "is_rated" not in _matrix_for_screen.columns:
+            logger.warning(
+                "L2 bundle train sample: missing is_rated — defaulting all rows to True for screening"
+            )
+            _matrix_for_screen = _matrix_for_screen.copy()
+            _matrix_for_screen["is_rated"] = True
+        step8_screening_source = f"parquet_{step8_screen_sample_strategy}"
+        step8_screening_stats_source = "screening_sample_parquet"
         step8_screening_sample_rows = len(_matrix_for_screen)
-        step8_screening_full_train_rows = len(train_df)
+        step8_screening_full_train_rows = n_train
         step8_screening_candidate_cols = len(_present_candidate_cols)
         tr.pipeline_echo("Step 8/11 — Feature screening …")
         t0 = time.perf_counter()
@@ -252,8 +281,8 @@ def execute_l2_training_bundle(
             labels=_matrix_for_screen["label"],
             feature_names=_present_candidate_cols,
             screen_method=tr.SCREEN_FEATURES_METHOD,
-            train_path=None,
-            train_df=train_df,
+            train_path=manifest.train_path,
+            train_df=None,
         )
         step8_duration_sec = time.perf_counter() - t0
         step8_screened_feature_count = len(screened_cols)
@@ -280,34 +309,55 @@ def execute_l2_training_bundle(
         )
     _export_dir = tr.DATA_DIR / "export"
     tr.remove_legacy_plan_b_csv_exports(_export_dir)
-    _l2_train_libsvm, _l2_valid_libsvm, _l2_test_libsvm = tr._export_parquet_to_libsvm(
-        manifest.train_path,
-        manifest.valid_path,
-        active_feature_cols,
-        _export_dir,
-        test_path=manifest.test_path,
-    )
-    logger.info(
-        "L2 bundle investigate: entering train_single_rated_model "
-        "(gbm_bakeoff=%s skip_optuna=%s train_rows=%d)",
-        pipeline_gbm_bakeoff,
-        skip_optuna,
-        len(train_df) if train_df is not None else -1,
-    )
-    rated_art, _, combined_metrics = tr.train_single_rated_model(
-        train_df,
-        valid_df,
-        active_feature_cols,
+    _primary_bakeoff = primary_rated_gbm_bakeoff_enabled(pipeline_gbm_bakeoff)
+    _hr_l2 = tr.train_issue8_high_roller_segmented_bundle(
+        step7_train_path=manifest.train_path,
+        step7_valid_path=manifest.valid_path,
+        step7_test_path=manifest.test_path,
+        active_feature_cols=active_feature_cols,
+        export_base=_export_dir,
         run_optuna=not skip_optuna,
-        test_df=test_df,
-        train_libsvm_paths=(_l2_train_libsvm, _l2_valid_libsvm),
-        test_libsvm_path=_l2_test_libsvm,
         ranking_recipe=pipeline_ranking_recipe,
-        gbm_bakeoff=pipeline_gbm_bakeoff,
-        valid_split_parquet_path=None,
-        test_split_parquet_path=None,
-        train_split_parquet_path=None,
+        gbm_bakeoff=_primary_bakeoff,
     )
+    if _hr_l2 is not None:
+        rated_art, combined_metrics = _hr_l2
+        logger.info(
+            "L2 bundle investigate: Issue #8 segmented training complete "
+            "(gbm_bakeoff=%s skip_optuna=%s)",
+            pipeline_gbm_bakeoff,
+            skip_optuna,
+        )
+    else:
+        _l2_train_libsvm, _l2_valid_libsvm, _l2_test_libsvm = tr._export_parquet_to_libsvm(
+            manifest.train_export_paths,
+            manifest.valid_export_paths,
+            active_feature_cols,
+            _export_dir,
+            test_path=manifest.test_export_paths,
+        )
+        logger.info(
+            "L2 bundle investigate: entering train_single_rated_model "
+            "(gbm_bakeoff=%s skip_optuna=%s train_rows=%d)",
+            _primary_bakeoff,
+            skip_optuna,
+            n_train,
+        )
+        _empty = pd.DataFrame()
+        rated_art, _, combined_metrics = tr.train_single_rated_model(
+            _empty,
+            _empty,
+            active_feature_cols,
+            run_optuna=not skip_optuna,
+            test_df=_empty,
+            train_libsvm_paths=(_l2_train_libsvm, _l2_valid_libsvm),
+            test_libsvm_path=_l2_test_libsvm,
+            ranking_recipe=pipeline_ranking_recipe,
+            gbm_bakeoff=_primary_bakeoff,
+            valid_split_parquet_path=manifest.valid_path,
+            test_split_parquet_path=manifest.test_path,
+            train_split_parquet_path=manifest.train_path,
+        )
     _cm_keys = (
         list(combined_metrics.keys())[:8]
         if isinstance(combined_metrics, dict) and combined_metrics
@@ -321,9 +371,6 @@ def execute_l2_training_bundle(
     )
     step9_duration_sec = time.perf_counter() - t0
     tr.pipeline_echo(f"Step 9/11 — done in {step9_duration_sec:.1f}s")
-    train_df = None
-    valid_df = None
-    test_df = None
     gc.collect()
 
     pipeline_step_set("Step 10/11")

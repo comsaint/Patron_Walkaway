@@ -742,6 +742,62 @@ def test_predict_positive_scores_phase_e_xgboost_matches_full_uri(tmp_path: Path
     )
 
 
+def test_batched_model_positive_class_scores_xgboost_booster_wrapper_matches_predict_proba(
+    tmp_path: Path,
+) -> None:
+    """Disk bakeoff wraps xgboost.core.Booster as ``booster_``; ndarray ``predict`` is invalid."""
+    import xgboost as xgb
+
+    from trainer.training.gbm_bakeoff_disk import XGBoostBoosterDiskClassifier
+    from trainer.training.model_eval_runtime import _batched_model_positive_class_scores
+
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame(rng.normal(size=(200, 3)), columns=["a", "b", "c"])
+    y = rng.integers(0, 2, size=200)
+    dm = xgb.DMatrix(X, label=y, feature_names=["a", "b", "c"])
+    booster = xgb.train(
+        {"objective": "binary:logistic", "max_depth": 3, "eta": 0.3},
+        dm,
+        num_boost_round=8,
+        verbose_eval=False,
+    )
+    vlibsvm = tmp_path / "v.libsvm"
+    vlibsvm.write_text("0 0:1\n1 1:0\n", encoding="utf-8")
+    model = XGBoostBoosterDiskClassifier(
+        booster,
+        feature_names=["a", "b", "c"],
+        valid_libsvm_uri=str(vlibsvm),
+        test_libsvm_uri=None,
+    )
+    assert model.booster_ is not None
+    scores = _batched_model_positive_class_scores(model, X, batch_rows=50)
+    assert scores.shape == (200,)
+    ref = model.predict_proba(X)[:, 1].astype(np.float64)
+    np.testing.assert_allclose(scores, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_batched_model_positive_class_scores_sklearn_xgboost_matches_predict_proba() -> None:
+    """Sklearn ``XGBClassifier`` uses ``get_booster()`` + chunked ``DMatrix`` path."""
+    import xgboost as xgb
+
+    from trainer.training.model_eval_runtime import _batched_model_positive_class_scores
+
+    rng = np.random.default_rng(1)
+    X = pd.DataFrame(rng.normal(size=(120, 4)), columns=["c0", "c1", "c2", "c3"])
+    y = rng.integers(0, 2, size=120)
+    model = xgb.XGBClassifier(
+        n_estimators=12,
+        max_depth=3,
+        learning_rate=0.2,
+        verbosity=0,
+        random_state=0,
+    )
+    model.fit(X, y)
+    scores = _batched_model_positive_class_scores(model, X, batch_rows=37)
+    ref = model.predict_proba(X)[:, 1].astype(np.float64)
+    np.testing.assert_allclose(scores, ref, rtol=1e-5, atol=1e-5)
+
+
 def test_phase_e_dense_positive_scores_sklearn_batched_contract() -> None:
     """Dense Phase E helper returns full-length scores and correct data_source labels."""
     from trainer.training.gbm_bakeoff import _phase_e_dense_positive_scores

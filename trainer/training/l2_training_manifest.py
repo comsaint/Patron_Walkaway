@@ -2,6 +2,10 @@
 
 Reads ``l2_training_bundle.json`` under a bundle directory, validates snapshot lineage,
 resolves parquet paths, and provides split-bytes OOM estimates (TRN-16-04).
+
+``schema_version`` **1** keeps three monolithic split paths.  **2** adds
+``split_day_manifest`` (per-day shard files) while retaining monolithic paths for
+compatibility; export paths prefer day shards when present.
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from trainer.training.l2_trainer_contracts import (
     OOM_ESTIMATE_STRATEGY_L2_SPLIT_FILES,
@@ -27,9 +31,13 @@ class L2TrainingBundleManifest:
     """Validated training bundle contract."""
 
     bundle_dir: Path
+    schema_version: str
     train_path: Path
     valid_path: Path
     test_path: Path
+    train_export_paths: Tuple[Path, ...]
+    valid_export_paths: Tuple[Path, ...]
+    test_export_paths: Tuple[Path, ...]
     source_snapshot_id: str
     l2_snapshot_id: str
     train_end: str
@@ -41,6 +49,8 @@ class L2TrainingBundleManifest:
     identity_mapping_mode: str
     label_asset_meta: Optional[Dict[str, Any]]
     per_feature_fingerprints: Optional[Dict[str, str]]
+    split_calendar: Optional[Dict[str, Any]]
+    split_day_manifest: Optional[Dict[str, Any]]
 
 
 def _require_str(obj: Mapping[str, Any], key: str) -> str:
@@ -58,6 +68,30 @@ def _optional_str(obj: Mapping[str, Any], key: str) -> Optional[str]:
     return s or None
 
 
+def _resolve_day_manifest_rows(
+    bundle_dir: Path,
+    rows: Any,
+    *,
+    split_label: str,
+) -> Tuple[Path, ...]:
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(
+            f"l2_training_bundle.json: split_day_manifest[{split_label!r}] must be a non-empty list"
+        )
+    out: list[Path] = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"l2_training_bundle.json: split_day_manifest row {i} must be an object")
+        rel = row.get("path")
+        if rel is None or not str(rel).strip():
+            raise ValueError(f"l2_training_bundle.json: split_day_manifest row {i} missing path")
+        p = (bundle_dir / str(rel).strip()).resolve()
+        if not p.is_file():
+            raise ValueError(f"l2 training bundle: shard parquet not found for {split_label}: {p}")
+        out.append(p)
+    return tuple(out)
+
+
 def load_and_validate_bundle(bundle_dir: Path) -> L2TrainingBundleManifest:
     """Load and validate ``l2_training_bundle.json`` under *bundle_dir*.
 
@@ -72,7 +106,8 @@ def load_and_validate_bundle(bundle_dir: Path) -> L2TrainingBundleManifest:
     """
     if not bundle_dir.is_dir():
         raise ValueError(f"l2 training bundle: not a directory: {bundle_dir}")
-    mf_path = bundle_dir / L2_TRAINING_BUNDLE_MANIFEST_FILE
+    bd = bundle_dir.resolve()
+    mf_path = bd / L2_TRAINING_BUNDLE_MANIFEST_FILE
     if not mf_path.is_file():
         raise ValueError(
             f"l2 training bundle: missing {L2_TRAINING_BUNDLE_MANIFEST_FILE} under {bundle_dir}"
@@ -80,9 +115,9 @@ def load_and_validate_bundle(bundle_dir: Path) -> L2TrainingBundleManifest:
     raw = json.loads(mf_path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("l2_training_bundle.json: root must be an object")
-    ver = raw.get("schema_version")
-    if str(ver) != "1":
-        raise ValueError(f"l2_training_bundle.json: unsupported schema_version={ver!r} (expected '1')")
+    ver = str(raw.get("schema_version") or "1")
+    if ver not in ("1", "2"):
+        raise ValueError(f"l2_training_bundle.json: unsupported schema_version={ver!r} (expected '1' or '2')")
 
     paths = raw.get("paths")
     if not isinstance(paths, dict):
@@ -90,12 +125,29 @@ def load_and_validate_bundle(bundle_dir: Path) -> L2TrainingBundleManifest:
     train_rel = _require_str(paths, "train")
     valid_rel = _require_str(paths, "valid")
     test_rel = _require_str(paths, "test")
-    train_path = (bundle_dir / train_rel).resolve()
-    valid_path = (bundle_dir / valid_rel).resolve()
-    test_path = (bundle_dir / test_rel).resolve()
+    train_path = (bd / train_rel).resolve()
+    valid_path = (bd / valid_rel).resolve()
+    test_path = (bd / test_rel).resolve()
     for p, name in ((train_path, "train"), (valid_path, "valid"), (test_path, "test")):
         if not p.is_file():
             raise ValueError(f"l2 training bundle: {name} parquet not found: {p}")
+
+    train_export_paths: Tuple[Path, ...] = (train_path,)
+    valid_export_paths: Tuple[Path, ...] = (valid_path,)
+    test_export_paths: Tuple[Path, ...] = (test_path,)
+    split_calendar: Optional[Dict[str, Any]] = None
+    split_day_manifest: Optional[Dict[str, Any]] = None
+
+    if ver == "2":
+        sdm = raw.get("split_day_manifest")
+        if not isinstance(sdm, dict):
+            raise ValueError("l2_training_bundle.json: schema_version 2 requires split_day_manifest object")
+        split_day_manifest = dict(sdm)
+        train_export_paths = _resolve_day_manifest_rows(bd, sdm.get("train"), split_label="train")
+        valid_export_paths = _resolve_day_manifest_rows(bd, sdm.get("valid"), split_label="valid")
+        test_export_paths = _resolve_day_manifest_rows(bd, sdm.get("test"), split_label="test")
+        sc = raw.get("split_calendar")
+        split_calendar = dict(sc) if isinstance(sc, dict) else None
 
     snap_vals: Dict[str, str] = {}
     for k in SNAPSHOT_ID_ALIASES:
@@ -160,10 +212,14 @@ def load_and_validate_bundle(bundle_dir: Path) -> L2TrainingBundleManifest:
             }
 
     return L2TrainingBundleManifest(
-        bundle_dir=bundle_dir.resolve(),
+        bundle_dir=bd,
+        schema_version=ver,
         train_path=train_path,
         valid_path=valid_path,
         test_path=test_path,
+        train_export_paths=train_export_paths,
+        valid_export_paths=valid_export_paths,
+        test_export_paths=test_export_paths,
         source_snapshot_id=source_snapshot_id,
         l2_snapshot_id=l2_snapshot_id,
         train_end=train_end,
@@ -175,11 +231,13 @@ def load_and_validate_bundle(bundle_dir: Path) -> L2TrainingBundleManifest:
         identity_mapping_mode=idm,
         label_asset_meta=label_asset_meta,
         per_feature_fingerprints=per_feature_fingerprints,
+        split_calendar=split_calendar,
+        split_day_manifest=split_day_manifest,
     )
 
 
 def split_parquet_total_bytes(manifest: L2TrainingBundleManifest) -> int:
-    """Return total on-disk bytes for train/valid/test split parquets."""
+    """Return total on-disk bytes for train/valid/test monolithic split parquets."""
     total = 0
     for p in (manifest.train_path, manifest.valid_path, manifest.test_path):
         total += p.stat().st_size
@@ -215,5 +273,3 @@ def estimate_step7_peak_ram_gb_from_split_bytes(
     else:
         peak = total_bytes * fac * (1.0 + tf)
     return peak / (1024.0**3)
-
-

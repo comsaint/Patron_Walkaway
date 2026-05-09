@@ -18,6 +18,9 @@ for _priv in dir(_trainer_private_src):
     if _priv.startswith("_"):
         globals()[_priv] = getattr(_trainer_private_src, _priv)
 
+import trainer.training.l2_bundle_materialize as l2_bundle_materialize  # noqa: E402
+import trainer.training.pipeline_l2_bundle as pipeline_l2_bundle  # noqa: E402
+
 
 def run_pipeline_core(args) -> None:
     """Phase-1 training pipeline implementation (see ``run_pipeline`` wrapper)."""
@@ -190,14 +193,12 @@ def run_pipeline_core(args) -> None:
 
             _l2_bundle_arg = getattr(args, "l2_training_bundle", None)
             if _l2_bundle_arg:
-                from trainer.training.pipeline_l2_bundle import execute_l2_training_bundle
-
                 pipeline_step_set("Step 8/11")
                 pipeline_echo(
                     "Step 8/11 — L2 bundle (CLI) — Steps 1–7/11 skipped; "
                     "loading bundle then Steps 8–10/11 …"
                 )
-                execute_l2_training_bundle(
+                pipeline_l2_bundle.execute_l2_training_bundle(
                     args=args,
                     bundle_dir=Path(_l2_bundle_arg),
                     pipeline_model_version=pipeline_model_version,
@@ -479,26 +480,13 @@ def run_pipeline_core(args) -> None:
                 logger.warning("Could not update canonical_mapping.cutoff.json sidecar (%s)", _side_exc)
 
             # GitHub #17: auto L2 bundle cache — default for --use-local-parquet (single run/trip path).
-            _auto_l2 = (
-                use_local
-                and not getattr(args, "l2_training_bundle", None)
-                and not getattr(args, "no_l2_auto_bundle", False)
-            )
+            _auto_l2 = not getattr(args, "l2_training_bundle", None)
             if _auto_l2:
                 pipeline_step_set("Step 8/11")
-                from trainer.training.l2_bundle_materialize import (
-                    auto_bundle_cache_is_current,
-                    bridge_manifest_stat_token,
-                    build_auto_l2_cache_key,
-                    default_auto_bundle_dir,
-                    fingerprint_feature_spec,
-                )
-                from trainer.training.pipeline_l2_bundle import execute_l2_training_bundle
-
                 # Cache hit must not require source_snapshot_id on the bridge manifest;
                 # cache key already includes bridge_manifest_stat_token() when present.
                 _raw_dir = getattr(args, "l2_auto_bundle_dir", None)
-                _bundle_dir_early = Path(_raw_dir) if _raw_dir else default_auto_bundle_dir()
+                _bundle_dir_early = Path(_raw_dir) if _raw_dir else l2_bundle_materialize.default_auto_bundle_dir()
                 _ws_e = (
                     effective_start.isoformat()
                     if hasattr(effective_start, "isoformat")
@@ -509,25 +497,27 @@ def run_pipeline_core(args) -> None:
                     if hasattr(effective_end, "isoformat")
                     else str(effective_end)
                 )
-                _expected_key = build_auto_l2_cache_key(
-                    bridge_manifest_stat=bridge_manifest_stat_token(),
+                _expected_key = l2_bundle_materialize.build_auto_l2_cache_key(
+                    bridge_manifest_stat=l2_bundle_materialize.bridge_manifest_stat_token(),
                     window_start_iso=_ws_e,
                     window_end_iso=_we_e,
                     recent_chunks=recent_chunks,
                     train_split_frac=float(TRAIN_SPLIT_FRAC),
                     valid_split_frac=float(VALID_SPLIT_FRAC),
                     neg_sample_frac_config=float(NEG_SAMPLE_FRAC),
-                    feature_spec_fingerprint=fingerprint_feature_spec(FEATURE_SPEC_PATH),
+                    feature_spec_fingerprint=l2_bundle_materialize.fingerprint_feature_spec(FEATURE_SPEC_PATH),
                     rebuild_canonical_mapping=bool(getattr(args, "rebuild_canonical_mapping", False)),
                     identity_mapping_mode=str(effective_identity_mode),
                     force_recompute=bool(force),
                 )
-                if auto_bundle_cache_is_current(bundle_dir=_bundle_dir_early, expected_key=_expected_key):
+                if l2_bundle_materialize.auto_bundle_cache_is_current(
+                    bundle_dir=_bundle_dir_early, expected_key=_expected_key
+                ):
                     pipeline_echo(
                         f"Step 8/11 — L2 auto-cache — hit at {_bundle_dir_early}; "
                         "skipping Steps 4–10/11 (chunk path), running Steps 8–10/11 from bundle …"
                     )
-                    execute_l2_training_bundle(
+                    pipeline_l2_bundle.execute_l2_training_bundle(
                         args=args,
                         bundle_dir=_bundle_dir_early,
                         pipeline_model_version=pipeline_model_version,
@@ -1182,760 +1172,76 @@ def run_pipeline_core(args) -> None:
                 )
 
             pipeline_step_set("Step 8/11")
-            # GitHub #17: materialize L2 bundle from Step 7 outputs, then train via L2 path (skip chunk 8–10).
-            _auto_l2_post7 = (
-                use_local
-                and not getattr(args, "l2_training_bundle", None)
-                and not getattr(args, "no_l2_auto_bundle", False)
+            # GitHub #17 / #16: after Step 7 row splits, always materialize L2 bundle then disk-backed Steps 8–10.
+            _src_snap = read_bridge_source_snapshot_id() or "local_parquet_no_bridge_manifest"
+            _raw_out = getattr(args, "l2_auto_bundle_dir", None)
+            _bundle_out = Path(_raw_out) if _raw_out else l2_bundle_materialize.default_auto_bundle_dir()
+            _ws_m = (
+                effective_start.isoformat()
+                if hasattr(effective_start, "isoformat")
+                else str(effective_start)
             )
-            if _auto_l2_post7:
-                from trainer.training.l2_bundle_materialize import (
-                    build_auto_l2_cache_key,
-                    bridge_manifest_stat_token,
-                    default_auto_bundle_dir,
-                    fingerprint_feature_spec,
-                    materialize_l2_training_bundle_dir,
-                    touch_bundle_built_at,
-                )
-                from trainer.training.pipeline_l2_bundle import execute_l2_training_bundle
-
-                _src_snap = read_bridge_source_snapshot_id() or "local_parquet_no_bridge_manifest"
-                _raw_out = getattr(args, "l2_auto_bundle_dir", None)
-                _bundle_out = Path(_raw_out) if _raw_out else default_auto_bundle_dir()
-                _ws_m = (
-                    effective_start.isoformat()
-                    if hasattr(effective_start, "isoformat")
-                    else str(effective_start)
-                )
-                _we_m = (
-                    effective_end.isoformat()
-                    if hasattr(effective_end, "isoformat")
-                    else str(effective_end)
-                )
-                _cache_key = build_auto_l2_cache_key(
-                    bridge_manifest_stat=bridge_manifest_stat_token(),
-                    window_start_iso=_ws_m,
-                    window_end_iso=_we_m,
-                    recent_chunks=recent_chunks,
-                    train_split_frac=float(TRAIN_SPLIT_FRAC),
-                    valid_split_frac=float(VALID_SPLIT_FRAC),
-                    neg_sample_frac_config=float(NEG_SAMPLE_FRAC),
-                    feature_spec_fingerprint=fingerprint_feature_spec(FEATURE_SPEC_PATH),
-                    rebuild_canonical_mapping=bool(getattr(args, "rebuild_canonical_mapping", False)),
-                    identity_mapping_mode=str(effective_identity_mode),
-                    force_recompute=bool(force),
-                )
-                _bundle_per_fp = None
-                if isinstance(feature_spec, dict):
-                    from trainer.training.feature_materialization import (
-                        per_feature_fingerprints as _bundle_pfp_fn,
-                    )
-
-                    _bundle_per_fp = _bundle_pfp_fn(feature_spec)
-                materialize_l2_training_bundle_dir(
-                    _bundle_out,
-                    train_df=train_df,
-                    valid_df=valid_df,
-                    test_df=test_df,
-                    train_path=step7_train_path,
-                    valid_path=step7_valid_path,
-                    test_path=step7_test_path,
-                    source_snapshot_id=_src_snap,
-                    train_end=train_end,
-                    window_start=effective_start,
-                    window_end=effective_end,
-                    identity_mapping_mode=str(effective_identity_mode),
-                    train_sampling_applied=float(_effective_neg_sample_frac) < 1.0,
-                    cache_key=_cache_key,
-                    per_feature_fingerprints=_bundle_per_fp,
-                )
-                touch_bundle_built_at(_bundle_out)
-                pipeline_echo(
-                    f"Step 8/11 — L2 bundle — materialized to {_bundle_out}; "
-                    "running Steps 8–10/11 from bundle …"
-                )
-                execute_l2_training_bundle(
-                    args=args,
-                    bundle_dir=_bundle_out,
-                    pipeline_model_version=pipeline_model_version,
-                    pipeline_started_at_iso=pipeline_started_at_iso,
-                    pipeline_start=pipeline_start,
-                    use_local=use_local,
-                    skip_optuna=skip_optuna,
-                    sample_rated_n=sample_rated_n,
-                    pipeline_ranking_recipe=pipeline_ranking_recipe,
-                    pipeline_gbm_bakeoff=pipeline_gbm_bakeoff,
-                )
-                return
-        
-            active_feature_cols = get_all_candidate_feature_ids(feature_spec, screening_only=True)
-        
-            # 5b. Full-feature screening (DEC-020).
-            # Runs on the TRAINING SET ONLY to comply with TRN-09 anti-leakage rules.
-            #
-            # Candidate set = active_feature_cols (Track Human + Legacy + Profile) PLUS
-            # Track LLM candidate columns declared in feature spec and present in train_df.
-            if feature_spec is not None:
-                _track_llm_cols = [
-                    cand.get("feature_id")
-                    for cand in resolve_spec_track_section(feature_spec, "bet_duckdb_window").get(
-                        "candidates", []
-                    )
-                    if cand.get("feature_id") in _train_cols
-                ]
-                if _track_llm_cols:
-                    logger.info(
-                        "screen_features: loaded %d bet_duckdb_window candidate columns from feature spec",
-                        len(_track_llm_cols),
-                    )
-                _all_candidate_cols: List[str] = list(dict.fromkeys(active_feature_cols + _track_llm_cols))
-            else:
-                _all_candidate_cols = active_feature_cols
-        
-            # Only screen columns that actually exist in train (or train sample when B+ on disk).
-            _present_candidate_cols = [c for c in _all_candidate_cols if c in _train_cols]
-            if not _present_candidate_cols:
-                _t8_skip = time.perf_counter()
-                logger.warning(
-                    "screen_features: no candidate columns found in train_df — skipping screening"
-                )
-                # R1004: restrict active_feature_cols to columns actually present in train.
-                active_feature_cols = [c for c in active_feature_cols if c in _train_cols]
-                step8_duration_sec = time.perf_counter() - _t8_skip
-                pipeline_echo(
-                    f"Step 8/11 — Feature screening skipped (no candidates in train) — "
-                    f"done in {step8_duration_sec:.1f}s"
-                )
-            else:
-                # PLAN 方案 B 策略 A / B+ Stage 2: use sample from memory or from file (_train_for_screen from _read_parquet_head when on disk).
-                # Step 8 DuckDB std (PLAN): pass train_path or train_df so zv is computed on full data via DuckDB; keep _matrix_for_screen as sample to avoid OOM in corr/MI/LGBM.
-                _cap = (
-                    int(STEP8_SCREEN_SAMPLE_ROWS)
-                    if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1)
-                    else 2_000_000
-                )
-                _screen_train_df: Optional[pd.DataFrame] = None
-                if train_df is not None:
-                    _sample_n = (
-                        STEP8_SCREEN_SAMPLE_ROWS
-                        if (STEP8_SCREEN_SAMPLE_ROWS is not None and STEP8_SCREEN_SAMPLE_ROWS >= 1)
-                        else None
-                    )
-                    if _sample_n is not None:
-                        _sample_n = int(_sample_n)
-                    _matrix_for_screen = _step8_sample_in_memory_train(
-                        train_df,
-                        strategy=step8_screen_sample_strategy,
-                        sample_n=_sample_n,
-                        default_cap=_cap,
-                    )
-                    _screen_train_df = _matrix_for_screen
-                    _lbl_ratio = (
-                        float(_matrix_for_screen["label"].mean())
-                        if "label" in _matrix_for_screen.columns and len(_matrix_for_screen)
-                        else None
-                    )
-                    _pmin, _pmax = _payout_bounds_iso_from_series(
-                        _matrix_for_screen["payout_complete_dtm"]
-                        if "payout_complete_dtm" in _matrix_for_screen.columns
-                        else pd.Series(dtype="datetime64[ns]")
-                    )
-                    _req_cap_im = (
-                        int(_sample_n)
-                        if _sample_n is not None and int(_sample_n) >= 1
-                        else int(_cap)
-                    )
-                    logger.info(
-                        "Step 8 screening: strategy=%s sample_rows=%d full_train_rows=%d "
-                        "requested_cap=%d STEP8_SCREEN_SAMPLE_ROWS=%s label_mean=%s payout_span=[%s,%s]",
-                        step8_screen_sample_strategy,
-                        len(_matrix_for_screen),
-                        len(train_df),
-                        _req_cap_im,
-                        str(STEP8_SCREEN_SAMPLE_ROWS),
-                        f"{_lbl_ratio:.4f}" if _lbl_ratio is not None else "n/a",
-                        _pmin or "n/a",
-                        _pmax or "n/a",
-                    )
-                else:
-                    _matrix_for_screen = _train_for_screen
-                    _lbl_ratio_disk = (
-                        float(_matrix_for_screen["label"].mean())
-                        if "label" in _matrix_for_screen.columns and len(_matrix_for_screen)
-                        else None
-                    )
-                    _pmin_d, _pmax_d = _payout_bounds_iso_from_series(
-                        _matrix_for_screen["payout_complete_dtm"]
-                        if "payout_complete_dtm" in _matrix_for_screen.columns
-                        else pd.Series(dtype="datetime64[ns]")
-                    )
-                    logger.info(
-                        "Step 8 screening: strategy=%s from train file (STEP7_KEEP_TRAIN_ON_DISK) "
-                        "sample_rows=%d full_train_rows=%d requested_cap=%d STEP8_SCREEN_SAMPLE_ROWS=%s "
-                        "label_mean=%s payout_span=[%s,%s]",
-                        step8_screen_sample_strategy,
-                        len(_matrix_for_screen),
-                        _n_train_print,
-                        int(_sample_n_disk),
-                        str(STEP8_SCREEN_SAMPLE_ROWS),
-                        f"{_lbl_ratio_disk:.4f}" if _lbl_ratio_disk is not None else "n/a",
-                        _pmin_d or "n/a",
-                        _pmax_d or "n/a",
-                    )
-                step8_screening_source = (
-                    f"in_memory_{step8_screen_sample_strategy}"
-                    if train_df is not None
-                    else f"train_file_{step8_screen_sample_strategy}"
-                )
-                step8_screening_stats_source = (
-                    "screening_sample_df" if train_df is not None else "train_path"
-                )
-                step8_screening_sample_rows = len(_matrix_for_screen)
-                step8_screening_full_train_rows = (
-                    len(train_df) if train_df is not None else _n_train_print
-                )
-                step8_screening_candidate_cols = len(_present_candidate_cols)
-                try:
-                    import psutil as _psutil
-
-                    _avail_screen = int(_psutil.virtual_memory().available)
-                except Exception:
-                    _avail_screen = None
-                _resolve_runtime = getattr(_cfg, "resolve_duckdb_runtime_policy", None)
-                if callable(_resolve_runtime):
-                    _screen_input = int(_matrix_for_screen.memory_usage(deep=True).sum())
-                    _screen_policy = _resolve_runtime(
-                        "screening",
-                        _avail_screen,
-                        input_bytes=_screen_input,
-                    )
-                    duckdb_runtime_screening_memory_gb = (
-                        float(_screen_policy["memory_limit_bytes"]) / 1024**3
-                    )
-                    duckdb_runtime_screening_threads = int(_screen_policy["threads"])
-                step8_screened_feature_count = None
-                pipeline_echo("Step 8/11 — Feature screening …")
-                t0 = time.perf_counter()
-                screened_cols = screen_features(
-                    feature_matrix=_matrix_for_screen,
-                    labels=_matrix_for_screen["label"],
-                    feature_names=_present_candidate_cols,
-                    screen_method=SCREEN_FEATURES_METHOD,
-                    train_path=step7_train_path if step7_train_path is not None else None,
-                    train_df=_screen_train_df,
-                )
-                _el = time.perf_counter() - t0
-                step8_duration_sec = _el
-                step8_screened_feature_count = len(screened_cols)
-                pipeline_echo(
-                    f"Step 8/11 — done in {_el:.1f}s ({len(_present_candidate_cols)} → {len(screened_cols)} features)"
-                )
-                logger.info(
-                    "screen_features: %d -> %d features retained  (%.1fs)",
-                    len(_present_candidate_cols), len(screened_cols), _el,
-                )
-                # R1001: post-screening sanity — ensure at least one Track Human feature survives.
-                # Use YAML feature_spec (SSOT) instead of hardcoded list (feat-consolidation R123-2).
-                _screened_set = set(screened_cols)
-                _yaml_track_human = (
-                    set(get_candidate_feature_ids(feature_spec, "track_human", screening_only=True))
-                    if feature_spec is not None
-                    else set()
-                )
-                if _yaml_track_human and not _screened_set.intersection(_yaml_track_human):
-                    _missing_track_human = [c for c in _yaml_track_human if c in _train_cols]
-                    if _missing_track_human:
-                        logger.warning(
-                            "screen_features: no track_human features survived screening — "
-                            "re-appending %d track_human features as fallback (R1001)",
-                            len(_missing_track_human),
-                        )
-                        screened_cols = screened_cols + [
-                            c for c in _missing_track_human if c not in _screened_set
-                        ]
-                active_feature_cols = screened_cols
-        
-            # PLAN B+ Stage 2: load train from file after screening so export/Step 9 have train_df.
-            if step7_train_path is not None:
-                if _train_for_screen is not None:
-                    _train_for_screen = None
-                    if "_matrix_for_screen" in locals():
-                        del _matrix_for_screen
-                    gc.collect()
-                if not STEP9_EXPORT_LIBSVM:
-                    raise RuntimeError(
-                        "STEP9_EXPORT_LIBSVM=False is incompatible with LibSVM-only training."
-                    )
-                assert step7_valid_path is not None and step7_test_path is not None  # R202 guard
-                _t_hr0 = time.perf_counter()
-                _hr_bundle = train_issue8_high_roller_segmented_bundle(
-                    step7_train_path=step7_train_path,
-                    step7_valid_path=step7_valid_path,
-                    step7_test_path=step7_test_path,
-                    active_feature_cols=active_feature_cols,
-                    export_base=DATA_DIR / "export",
-                    run_optuna=not skip_optuna,
-                    ranking_recipe=pipeline_ranking_recipe,
-                    gbm_bakeoff=pipeline_gbm_bakeoff,
-                )
-                if _hr_bundle is not None:
-                    _rated_hr, _cm_hr = _hr_bundle
-                    rated_art = _rated_hr
-                    combined_metrics = _cm_hr
-                    _step9_issue8_pretrained = True
-                    _step9_issue8_elapsed_sec = time.perf_counter() - _t_hr0
-                    _train_libsvm = None
-                    _valid_libsvm = None
-                    _test_libsvm = None
-                    if step7_train_path.exists():
-                        step7_train_path.unlink(missing_ok=True)
-                    train_df = None
-                    logger.info(
-                        "Step 7 B+: Issue #8 segmented train complete; train parquet released "
-                        "(valid/test on disk for split metadata)"
-                    )
-                else:
-                    _train_libsvm, _valid_libsvm, _test_libsvm = _export_parquet_to_libsvm(
-                        step7_train_path,
-                        step7_valid_path,
-                        active_feature_cols,
-                        DATA_DIR / "export",
-                        test_path=step7_test_path,
-                    )
-                    train_df = pd.read_parquet(step7_train_path)
-                    if step7_train_path.exists():
-                        step7_train_path.unlink(missing_ok=True)
-                    logger.info(
-                        "Step 7 B+: loaded train from file after screening (%d rows)%s",
-                        len(train_df),
-                        "; valid/test left on disk (B+ 階段 6 第 2 步)" if (valid_df is None and test_df is None) else "",
-                    )
-        
-            if not active_feature_cols:
-                # R1613: explicit guardrail message for zero-feature situations.  In
-                # integration / debug contexts (e.g. heavily mocked tests) we still
-                # want the pipeline to run so that wiring between stages can be
-                # exercised, so we fall back to a single constant "bias" feature
-                # instead of terminating the process.
-                msg = (
-                    "screen_features + Track Human fallback both returned empty feature list. "
-                    "Cannot train any model. Check data quality and feature definitions."
-                )
-                logger.warning(msg)
-                pipeline_echo(
-                    "Step 8/11 — warning: no usable features after screening; using placeholder 'bias' (see logs)."
-                )
-                _placeholder_col = "bias"  # constant feature for integration/debug runs (R1605: named via explicit variable)
-                if train_df is not None and _placeholder_col not in train_df.columns:
-                    train_df[_placeholder_col] = 0.0
-                if valid_df is not None and not valid_df.empty and _placeholder_col not in valid_df.columns:
-                    valid_df[_placeholder_col] = 0.0
-                if test_df is not None and not test_df.empty and _placeholder_col not in test_df.columns:
-                    test_df[_placeholder_col] = 0.0
-                active_feature_cols = [_placeholder_col]
-        
-            pipeline_step_set("Step 9/11")
-            if not STEP9_EXPORT_LIBSVM:
-                raise RuntimeError(
-                    "STEP9_EXPORT_LIBSVM=False is incompatible with LibSVM-only training."
-                )
-            remove_legacy_plan_b_csv_exports(DATA_DIR / "export")
-            if not _step9_issue8_pretrained and (_train_libsvm is None or _valid_libsvm is None):
-                if train_df is None or valid_df is None or test_df is None:
-                    raise RuntimeError(
-                        "LibSVM-only: missing in-memory splits for export "
-                        "(train_df/valid_df/test_df required when step7 parquet paths unset)."
-                    )
-                _export_root = DATA_DIR / "export"
-                _tmp_sp = _export_root / "_tmp_splits_for_libsvm"
-                if _tmp_sp.exists():
-                    shutil.rmtree(_tmp_sp, ignore_errors=True)
-                _tmp_sp.mkdir(parents=True, exist_ok=True)
-                _tp = _tmp_sp / "train.parquet"
-                _vp = _tmp_sp / "valid.parquet"
-                _tsp = _tmp_sp / "test.parquet"
-                train_df.to_parquet(_tp, index=False)
-                valid_df.to_parquet(_vp, index=False)
-                test_df.to_parquet(_tsp, index=False)
-                _train_libsvm, _valid_libsvm, _test_libsvm = _export_parquet_to_libsvm(
-                    _tp,
-                    _vp,
-                    active_feature_cols,
-                    _export_root,
-                    test_path=_tsp,
-                )
-                shutil.rmtree(_tmp_sp, ignore_errors=True)
-            if not _step9_issue8_pretrained and (_train_libsvm is None or _valid_libsvm is None):
-                raise RuntimeError("LibSVM-only: export did not produce train/valid LibSVM paths.")
-
-            # 6. Train dual model (Optuna + run-level sample_weight, DEC-013)
-            #    test_df is passed so test-set metrics and feature importance are
-            #    computed immediately after training and included in the artifact.
-            pipeline_echo("Step 9/11 — Train rated GBM family + test-set eval …")
-            t0 = time.perf_counter()
-            model_version = pipeline_model_version
-            if not _step9_issue8_pretrained:
-                _libsvm_paths = (_train_libsvm, _valid_libsvm)
-                rated_art, _, combined_metrics = train_single_rated_model(
-                    train_df,
-                    valid_df,
-                    active_feature_cols,
-                    run_optuna=not skip_optuna,
-                    test_df=test_df,
-                    train_libsvm_paths=_libsvm_paths,
-                    test_libsvm_path=_test_libsvm,
-                    ranking_recipe=pipeline_ranking_recipe,
-                    gbm_bakeoff=pipeline_gbm_bakeoff,
-                    valid_split_parquet_path=step7_valid_path,
-                    test_split_parquet_path=step7_test_path,
-                    train_split_parquet_path=step7_train_path,
-                )
-            _el = time.perf_counter() - t0 + float(_step9_issue8_elapsed_sec)
-            step9_duration_sec = _el
-            pipeline_echo(f"Step 9/11 — done in {_el:.1f}s")
-            if _step9_issue8_pretrained:
-                logger.info(
-                    "Issue #8 segmented rated training + legacy path skip: %.1fs",
-                    _el,
-                )
-            else:
-                logger.info("train_single_rated_model + A3 family compare + test eval: %.1fs", _el)
-
-            # T12.2: capture RSS/sys RAM snapshot at Step 9 end (checkpoint scope Step 7-9).
-            # Peak := max(start, end) to avoid heavy sampling/polling overhead.
-            if step7_rss_start_gb is not None:
-                try:
-                    import psutil as _psutil
-
-                    _proc_end = _psutil.Process()
-                    step7_rss_end_gb = _proc_end.memory_info().rss / (1024**3)
-                    if step7_rss_end_gb is not None:
-                        step7_rss_peak_gb = max(step7_rss_start_gb, step7_rss_end_gb)
-
-                    _vm_end = _psutil.virtual_memory()
-                    if _step7_sys_available_start_gb is not None:
-                        _vm_end_avail_gb = _vm_end.available / (1024**3)
-                        step7_sys_available_min_gb = min(_step7_sys_available_start_gb, _vm_end_avail_gb)
-                    if _step7_sys_used_percent_start is not None:
-                        _vm_end_used_percent = float(_vm_end.percent)
-                        step7_sys_used_percent_peak = max(_step7_sys_used_percent_start, _vm_end_used_percent)
-                except Exception:
-                    # If memory sampling fails, just keep metrics unset; never impact training.
-                    pass
-
-            # Step 9 no longer needs the in-memory split frames after training returns.
-            # Release them before artifact / MLflow phases so large train/valid/test
-            # DataFrames do not stay resident through the rest of the pipeline.
-            train_df = None
-            valid_df = None
-            test_df = None
-            gc.collect()
-
-            pipeline_step_set("Step 10/11")
-            # 7. Save artifacts (versioned subdir under MODEL_DIR; see Priority 1 investigation plan).
-            pipeline_echo("Step 10/11 — Save artifact bundle …")
-            t0 = time.perf_counter()
-            _versions_root = MODEL_DIR
-            _bundle_dir = safe_version_subdirectory(_versions_root, model_version)
-            if _bundle_dir.exists() and (_bundle_dir / "model.pkl").exists():
-                raise FileExistsError(
-                    f"Refusing to overwrite existing model bundle: {_bundle_dir}. "
-                    "Remove the directory or wait for a new model_version timestamp."
-                )
-            _bundle_dir.mkdir(parents=True, exist_ok=True)
-            _baseline_align = _make_baseline_training_alignment_payload(
-                effective_start,
-                effective_end,
-                float(TRAIN_SPLIT_FRAC),
-                float(VALID_SPLIT_FRAC),
+            _we_m = (
+                effective_end.isoformat()
+                if hasattr(effective_end, "isoformat")
+                else str(effective_end)
             )
-            _split_mlflow_meta = split_row_metadata_to_mlflow_string_params(_split_row_meta)
-            _model_meta_doc = build_model_metadata_document(
-                model_version=model_version,
-                effective_start=effective_start,
-                effective_end=effective_end,
-                splits=_split_row_meta,
-                use_local_parquet=use_local,
-                recent_chunks=None,
-                sample_rated_n=sample_rated_n,
+            _cache_key = l2_bundle_materialize.build_auto_l2_cache_key(
+                bridge_manifest_stat=l2_bundle_materialize.bridge_manifest_stat_token(),
+                window_start_iso=_ws_m,
+                window_end_iso=_we_m,
+                recent_chunks=recent_chunks,
+                train_split_frac=float(TRAIN_SPLIT_FRAC),
+                valid_split_frac=float(VALID_SPLIT_FRAC),
+                neg_sample_frac_config=float(NEG_SAMPLE_FRAC),
+                feature_spec_fingerprint=l2_bundle_materialize.fingerprint_feature_spec(FEATURE_SPEC_PATH),
+                rebuild_canonical_mapping=bool(getattr(args, "rebuild_canonical_mapping", False)),
+                identity_mapping_mode=str(effective_identity_mode),
+                force_recompute=bool(force),
+            )
+            _bundle_per_fp = None
+            if isinstance(feature_spec, dict):
+                from trainer.training.feature_materialization import (
+                    per_feature_fingerprints as _bundle_pfp_fn,
+                )
+
+                _bundle_per_fp = _bundle_pfp_fn(feature_spec)
+            l2_bundle_materialize.materialize_l2_training_bundle_dir(
+                _bundle_out,
+                train_df=train_df,
+                valid_df=valid_df,
+                test_df=test_df,
+                train_path=step7_train_path,
+                valid_path=step7_valid_path,
+                test_path=step7_test_path,
+                source_snapshot_id=_src_snap,
+                train_end=train_end,
+                window_start=effective_start,
+                window_end=effective_end,
+                identity_mapping_mode=str(effective_identity_mode),
+                train_sampling_applied=float(_effective_neg_sample_frac) < 1.0,
+                cache_key=_cache_key,
+                per_feature_fingerprints=_bundle_per_fp,
+            )
+            l2_bundle_materialize.touch_bundle_built_at(_bundle_out)
+            pipeline_echo(
+                f"Step 8/11 — L2 bundle — materialized to {_bundle_out}; "
+                "running Steps 8–10/11 from bundle …"
+            )
+            pipeline_l2_bundle.execute_l2_training_bundle(
+                args=args,
+                bundle_dir=_bundle_out,
+                pipeline_model_version=pipeline_model_version,
+                pipeline_started_at_iso=pipeline_started_at_iso,
+                pipeline_start=pipeline_start,
+                use_local=use_local,
                 skip_optuna=skip_optuna,
-                neg_sample_frac_effective=_effective_neg_sample_frac,
-                bundle_dir=_bundle_dir,
-                combined_metrics=combined_metrics,
-                model_used_splits=_model_used_split_meta,
-                identity_mapping_mode=effective_identity_mode,
-                t_game_features_enabled=bool(getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)),
-                t_game_visible_time_column=(
-                    "__etl_insert_Dtm" if bool(getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)) else "none"
-                ),
-            )
-            save_artifact_bundle(
-                rated_art, active_feature_cols, combined_metrics, model_version,
                 sample_rated_n=sample_rated_n,
-                feature_spec_path=FEATURE_SPEC_PATH,
-                neg_sample_frac=_effective_neg_sample_frac,
-                bundle_dir=_bundle_dir,
-                baseline_training_alignment=_baseline_align,
-                model_metadata=_model_meta_doc,
+                pipeline_ranking_recipe=pipeline_ranking_recipe,
+                pipeline_gbm_bakeoff=pipeline_gbm_bakeoff,
             )
-            try:
-                write_latest_model_manifest(_versions_root, model_version, _bundle_dir)
-            except Exception as _man_exc:
-                logger.warning(
-                    "Failed to write latest model manifest (artifacts saved): %s",
-                    _man_exc,
-                )
-            _el = time.perf_counter() - t0
-            step10_duration_sec = _el
-            pipeline_echo(f"Step 10/11 — done in {_el:.1f}s")
-            logger.info("save_artifact_bundle: %.1fs", _el)
-
-            # T13: Warm up MLflow (e.g. Cloud Run) before first log to reduce 503 on cold start.
-            if has_active_run():
-                warm_up_mlflow_run_safe()
-
-            # Phase 2 T2: Log provenance to MLflow (no-op when URI unset/unreachable).
-            try:
-                _log_training_provenance_to_mlflow(
-                    model_version=model_version,
-                    artifact_dir=str(_bundle_dir),
-                    training_window_start=effective_start,
-                    training_window_end=effective_end,
-                    feature_spec_path=str(FEATURE_SPEC_PATH),
-                    training_metrics_path=str(_bundle_dir / "training_metrics.json"),
-                    pipeline_diagnostics_path=str(_bundle_dir / "pipeline_diagnostics.json"),
-                    pipeline_diagnostics_rel_path=f"{_bundle_dir.name}/pipeline_diagnostics.json",
-                    model_metadata_path=str(_bundle_dir / "model_metadata.json"),
-                    model_metadata_rel_path=f"{_bundle_dir.name}/model_metadata.json",
-                    split_boundary_params=_split_mlflow_meta,
-                )
-            except Exception as e:
-                logger.warning("MLflow provenance logging failed (training still succeeded): %s", e)
+            return
         
-            # Remove stale dual-model and legacy pickles so operators do not assume
-            # they are loadable (DEC-040: only model.pkl is read).
-            for _stale in ["nonrated_model.pkl", "rated_model.pkl", "walkaway_model.pkl"]:
-                _stale_path = _versions_root / _stale
-                if _stale_path.exists():
-                    _stale_path.unlink()
-                    logger.info("Removed stale artifact: %s", _stale)
-        
-            total_sec = time.perf_counter() - pipeline_start
-            _pipeline_finished_at_iso = datetime.now(timezone.utc).isoformat()
-            if (
-                oom_precheck_est_peak_ram_gb is not None
-                and oom_precheck_est_peak_ram_gb > 0
-                and step7_rss_peak_gb is not None
-            ):
-                oom_precheck_step7_rss_error_ratio = (
-                    step7_rss_peak_gb / oom_precheck_est_peak_ram_gb
-                )
-            try:
-                _resolve_runtime = getattr(_cfg, "resolve_duckdb_runtime_policy", None)
-                if callable(_resolve_runtime):
-                    try:
-                        import psutil as _psutil
-
-                        _avail_track = int(_psutil.virtual_memory().available)
-                    except Exception:
-                        _avail_track = None
-                    _track_policy = _resolve_runtime(
-                        "bet_duckdb_window", _avail_track, input_bytes=None
-                    )
-                    duckdb_runtime_track_llm_memory_gb = (
-                        float(_track_policy["memory_limit_bytes"]) / 1024**3
-                    )
-                    duckdb_runtime_track_llm_threads = int(_track_policy["threads"])
-                _write_pipeline_diagnostics_json(
-                    model_version=model_version,
-                    pipeline_started_at=pipeline_started_at_iso,
-                    pipeline_finished_at=_pipeline_finished_at_iso,
-                    total_duration_sec=total_sec,
-                    step0_duration_sec=step0_duration_sec,
-                    step1_duration_sec=step1_duration_sec,
-                    step2_duration_sec=step2_duration_sec,
-                    step3_duration_sec=step3_duration_sec,
-                    step4_duration_sec=step4_duration_sec,
-                    step5_duration_sec=step5_duration_sec,
-                    step6_duration_sec=step6_duration_sec,
-                    step7_duration_sec=step7_duration_sec,
-                    step7b_duration_sec=step7b_duration_sec,
-                    step8_duration_sec=step8_duration_sec,
-                    step9_duration_sec=step9_duration_sec,
-                    step10_duration_sec=step10_duration_sec,
-                    oom_precheck_est_peak_ram_gb=oom_precheck_est_peak_ram_gb,
-                    oom_precheck_step7_rss_error_ratio=oom_precheck_step7_rss_error_ratio,
-                    step7_rss_start_gb=step7_rss_start_gb,
-                    step7_rss_peak_gb=step7_rss_peak_gb,
-                    step7_rss_end_gb=step7_rss_end_gb,
-                    step7_sys_available_min_gb=step7_sys_available_min_gb,
-                    step7_sys_used_percent_peak=step7_sys_used_percent_peak,
-                    step7_chunk_parquet_total_bytes=step7_chunk_parquet_total_bytes,
-                    step7_chunk_parquet_est_ram_gb=step7_chunk_parquet_est_ram_gb,
-                    step8_screening_source=step8_screening_source,
-                    step8_screening_stats_source=step8_screening_stats_source,
-                    step8_screening_sample_rows=step8_screening_sample_rows,
-                    step8_screening_full_train_rows=step8_screening_full_train_rows,
-                    step8_screening_candidate_cols=step8_screening_candidate_cols,
-                    step8_screened_feature_count=step8_screened_feature_count,
-                    step8_screen_sample_strategy=step8_screen_sample_strategy,
-                    duckdb_runtime_step7_memory_gb=duckdb_runtime_step7_memory_gb,
-                    duckdb_runtime_step7_threads=duckdb_runtime_step7_threads,
-                    duckdb_runtime_screening_memory_gb=duckdb_runtime_screening_memory_gb,
-                    duckdb_runtime_screening_threads=duckdb_runtime_screening_threads,
-                    duckdb_runtime_track_llm_memory_gb=duckdb_runtime_track_llm_memory_gb,
-                    duckdb_runtime_track_llm_threads=duckdb_runtime_track_llm_threads,
-                    chunk_cache_stats=chunk_cache_stats,
-                    issue16_audit=issue16_gate_report,
-                    output_dir=_bundle_dir,
-                    feature_materialization_audit=feature_materialization_audit,
-                )
-            except Exception as _diag_exc:
-                logger.warning(
-                    "pipeline_diagnostics.json write failed (training still succeeded): %s",
-                    _diag_exc,
-                )
-
-            # Phase 2 / pipeline plan: small-file artifacts for MLflow UI (best-effort; no active run → no-op).
-            # P1.5: full bundle under model_bundle/ (log_artifacts_safe) + SHA-256 params; keeps bundle/ copies below.
-            if has_active_run():
-                _checksum_params: Dict[str, str] = {}
-                _mpath = _bundle_dir / "model.pkl"
-                if _mpath.is_file():
-                    try:
-                        _checksum_params["model_pkl_sha256"] = _sha256_file_hex(_mpath)
-                    except Exception as _h_exc:
-                        logger.warning("model.pkl checksum failed (MLflow param skipped): %s", _h_exc)
-                if FEATURE_SPEC_PATH.is_file():
-                    try:
-                        _checksum_params["feature_spec_sha256"] = _sha256_file_hex(FEATURE_SPEC_PATH)
-                    except Exception as _h_exc:
-                        logger.warning("feature_spec checksum failed (MLflow param skipped): %s", _h_exc)
-                if _checksum_params:
-                    try:
-                        log_params_safe(_checksum_params)
-                    except Exception as _p_exc:
-                        logger.warning("MLflow checksum params failed (training still succeeded): %s", _p_exc)
-                # P1.5: full bundle (includes model.pkl); transient retries in helper.
-                log_artifacts_safe(
-                    _bundle_dir, artifact_path=MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH
-                )
-                if _mpath.is_file():
-                    _rel_model = f"{MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH}/model.pkl"
-                    log_tags_safe({"trained_model_artifact": _rel_model})
-                    logger.info(
-                        "MLflow: trained model uploaded with bundle at artifact %r "
-                        "(download model.pkl from this path in the run).",
-                        _rel_model,
-                    )
-                    pipeline_echo(
-                        f"Step 10/11 — MLflow — model artifact {_rel_model} "
-                        f"(bundle under {MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH}/)"
-                    )
-                # Legacy UI path: small files under bundle/ (contract tests + existing dashboards).
-                _bundle_artifact_path = "bundle"
-                for _fname in (
-                    "training_metrics.json",
-                    "pipeline_diagnostics.json",
-                    "model_metadata.json",
-                    "feature_spec.yaml",
-                    "model_version",
-                ):
-                    _ap = _bundle_dir / _fname
-                    if _ap.is_file():
-                        log_artifact_safe(_ap, artifact_path=_bundle_artifact_path)
-
-            pipeline_echo(
-                f"Complete — 11 steps (0–10) finished in {total_sec:.1f}s ({total_sec / 60.0:.1f} min)"
-            )
-            logger.info("Pipeline total: %.1fs (%.1f min)", total_sec, total_sec / 60.0)
-
-            # T12.2: Log training success metrics + per-step durations + Step 7–9 memory/OOM diagnostics to MLflow.
-            try:
-                oom_params = {
-                    "oom_precheck_est_peak_ram_gb": oom_precheck_est_peak_ram_gb,
-                    "oom_precheck_step7_rss_error_ratio": oom_precheck_step7_rss_error_ratio,
-                }
-                # Avoid logging None values (MLflow params do not accept nulls well).
-                oom_params_clean = {k: v for k, v in oom_params.items() if v is not None}
-                if oom_params_clean:
-                    log_params_safe(oom_params_clean)
-
-                log_params_safe(
-                    {
-                        "trainer_device_mode_requested": _REQUESTED_TRAINER_DEVICE_MODE_FOR_METRICS,
-                        "trainer_device_mode_effective": (
-                            "gpu"
-                            if (
-                                str(_EFFECTIVE_LIGHTGBM_DEVICE).lower() == "gpu"
-                                or str(_LAST_GBM_BACKEND_EFFECTIVE_DEVICE).lower() == "gpu"
-                            )
-                            else "cpu"
-                        ),
-                        "gpu_fallback_used": str(
-                            bool(_LIGHTGBM_GPU_FALLBACK_USED or _GBM_BACKEND_GPU_FALLBACK_USED)
-                        ),
-                        "lightgbm_device_requested": _REQUESTED_LIGHTGBM_DEVICE_FOR_METRICS,
-                        "lightgbm_device_effective": _EFFECTIVE_LIGHTGBM_DEVICE,
-                        "lightgbm_device_fallback": str(bool(_LIGHTGBM_GPU_FALLBACK_USED)),
-                    }
-                )
-
-                # Training metrics from artifact, then pipeline timing + memory/OOM last so
-                # combined_metrics["rated"] cannot overwrite reserved keys (vs pipeline_diagnostics.json).
-                mlflow_metrics: dict[str, Any] = {}
-                _rated = (combined_metrics or {}).get("rated", {})
-                if isinstance(_rated, dict):
-                    mlflow_metrics.update(_rated)
-
-                mlflow_metrics.update(
-                    {
-                        "total_duration_sec": total_sec,
-                        "step0_duration_sec": step0_duration_sec,
-                        "step1_duration_sec": step1_duration_sec,
-                        "step2_duration_sec": step2_duration_sec,
-                        "step3_duration_sec": step3_duration_sec,
-                        "step4_duration_sec": step4_duration_sec,
-                        "step5_duration_sec": step5_duration_sec,
-                        "step6_duration_sec": step6_duration_sec,
-                        "step7_duration_sec": step7_duration_sec,
-                        "step7b_duration_sec": step7b_duration_sec,
-                        "step8_duration_sec": step8_duration_sec,
-                        "step9_duration_sec": step9_duration_sec,
-                        "step10_duration_sec": step10_duration_sec,
-                        # Step 7-9 checkpoint memory metrics (names align with plan).
-                        "step7_rss_start_gb": step7_rss_start_gb,
-                        "step7_rss_peak_gb": step7_rss_peak_gb,
-                        "step7_rss_end_gb": step7_rss_end_gb,
-                        "step7_sys_available_min_gb": step7_sys_available_min_gb,
-                        "step7_sys_used_percent_peak": step7_sys_used_percent_peak,
-                        # Keep this also as a metric for easier plotting.
-                        "oom_precheck_step7_rss_error_ratio": oom_precheck_step7_rss_error_ratio,
-                    }
-                )
-
-                log_metrics_safe(mlflow_metrics)
-            except Exception as _mlflow_exc:
-                logger.warning("MLflow success diagnostics logging failed: %s", _mlflow_exc)
-        
-            summary = {
-                "model_version": model_version,
-                "window_start": start.isoformat(),
-                "window_end": end.isoformat(),
-                "total_rows": n_rows,
-                "metrics": combined_metrics,
-            }
-            logger.debug("Training summary JSON: %s", json.dumps(summary, default=str))
-            pipeline_echo(
-                f"Pipeline — Summary — model_version={model_version} total_rows={n_rows} "
-                "(full JSON: logger DEBUG or TRAINER_SUMMARY_JSON_STDOUT=1)"
-            )
-            if os.environ.get("TRAINER_SUMMARY_JSON_STDOUT", "").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-            ):
-                print(json.dumps(summary, indent=2, default=str), flush=True)
         except Exception as e:
             log_tags_safe({"status": "FAILED", "error": str(e)[:500]})
             # T12 failure diagnostics (optional follow-on): log best-effort params for post-mortem.
