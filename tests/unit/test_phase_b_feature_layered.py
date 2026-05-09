@@ -1,4 +1,4 @@
-"""Phase B: layered mapping helpers + train-serve entrypoint parity (smoke)."""
+"""Phase B: per-candidate target_layer + chunk replacements (single spec SSOT)."""
 
 from __future__ import annotations
 
@@ -11,78 +11,71 @@ import yaml
 
 _REPO = Path(__file__).resolve().parents[2]
 _CANDIDATES = _REPO / "trainer" / "feature_spec" / "feature_candidates.yaml"
-_MAPPING = _REPO / "trainer" / "feature_spec" / "track_to_layer_mapping.yaml"
+
+LAYER_NAMES = frozenset({"bet", "run", "trip", "player"})
 
 
-def _candidate_feature_ids_from_spec(spec: dict) -> set[str]:
-    out: set[str] = set()
+def _candidate_rows(spec: dict) -> list[dict]:
+    rows: list[dict] = []
     for track in ("track_llm", "track_human", "track_profile"):
-        raw = ((spec.get(track) or {}).get("candidates"))
-        cands = raw if isinstance(raw, list) else []
-        for c in cands:
+        for c in ((spec.get(track) or {}).get("candidates") or []):
             if isinstance(c, dict) and c.get("feature_id"):
-                out.add(c["feature_id"])
-    return out
+                rows.append({"track": track, **c})
+    return rows
 
 
-def test_mapping_covers_all_legacy_candidates() -> None:
+def test_every_candidate_has_valid_target_layer() -> None:
     spec = yaml.safe_load(_CANDIDATES.read_text(encoding="utf-8"))
-    mapping = yaml.safe_load(_MAPPING.read_text(encoding="utf-8"))
-    legacy_yaml = mapping.get("legacy_features") or []
-    entries = [e for e in legacy_yaml if isinstance(e, dict) and e.get("old_feature_id")]
-    mapped_old = {e["old_feature_id"] for e in entries}
-    expected = _candidate_feature_ids_from_spec(spec)
-    assert mapped_old == expected, (
-            f"mapping legacy_features must match candidates exactly; "
-            f"missing={sorted(expected - mapped_old)}, extra={sorted(mapped_old - expected)}"
-        )
+    missing: list[str] = []
+    bad: list[str] = []
+    for row in _candidate_rows(spec):
+        fid = row["feature_id"]
+        tl = row.get("target_layer")
+        if tl is None or tl == "":
+            missing.append(f"{row['track']}:{fid}")
+        elif str(tl) not in LAYER_NAMES:
+            bad.append(f"{row['track']}:{fid}={tl!r}")
+    assert not missing, f"missing target_layer: {missing[:20]}"
+    assert not bad, f"invalid target_layer: {bad[:20]}"
 
 
-def test_mapping_old_ids_unique_and_new_id_naming_rules() -> None:
-    mapping = yaml.safe_load(_MAPPING.read_text(encoding="utf-8"))
-    entries = [
-        e for e in (mapping.get("legacy_features") or [])
-        if isinstance(e, dict) and e.get("old_feature_id")
-    ]
-    old_ids = [e["old_feature_id"] for e in entries]
-    assert len(old_ids) == len(set(old_ids)), "duplicate old_feature_id in mapping"
-    # Multiple legacy rows may intentionally map to the same new_feature_id
-    # (e.g. track_human vs track_llm naming convergence).
-    for e in entries:
-        n = e.get("new_feature_id") or ""
-        if not n:
-            continue
-        assert n == n.lower(), f"new_feature_id must be lowercase: {n!r}"
-        assert "-" not in n, f"hyphen disallowed in new_feature_id: {n!r}"
-        parts = n.split("__")
-        assert 2 <= len(parts) <= 3, f"expected 2-3 __ segments, got {n!r}"
-        assert parts[0] in {"bet", "run", "trip", "player"}, f"bad layer prefix: {n!r}"
-        bad = ("sofar", "so_far")
-        for b in bad:
-            assert b not in n, f"redundant {b} in feature_id: {n!r}"
+def test_feature_ids_unique_across_tracks() -> None:
+    spec = yaml.safe_load(_CANDIDATES.read_text(encoding="utf-8"))
+    seen: set[str] = set()
+    dups: list[str] = []
+    for row in _candidate_rows(spec):
+        fid = str(row["feature_id"])
+        if fid in seen:
+            dups.append(fid)
+        seen.add(fid)
+    assert not dups, f"duplicate feature_id: {dups}"
 
 
-def test_chunk_replacements_subset_of_deprecated() -> None:
-    mapping = yaml.safe_load(_MAPPING.read_text(encoding="utf-8"))
-    legacy = [
-        e for e in (mapping.get("legacy_features") or [])
-        if isinstance(e, dict) and e.get("old_feature_id")
-    ]
-    deprecated_old = {
-        e["old_feature_id"] for e in legacy
-        if (e.get("status") or "").lower() == "deprecated"
-    }
-    chunk = [
-        e for e in (mapping.get("chunk_dependent_replacements") or [])
-        if isinstance(e, dict) and e.get("old_feature_id")
-    ]
+def test_chunk_replacements_well_formed() -> None:
+    spec = yaml.safe_load(_CANDIDATES.read_text(encoding="utf-8"))
+    lf = spec.get("layered_framework") or {}
+    chunk = lf.get("chunk_dependent_replacements") or []
+    assert isinstance(chunk, list) and chunk, "chunk_dependent_replacements must be non-empty list"
     for e in chunk:
-        oid = e["old_feature_id"]
-        assert oid in deprecated_old, (
-            f"chunk_dependent_replacements entry {oid!r} must be deprecated in legacy_features"
-        )
+        assert isinstance(e, dict), chunk
+        oid = e.get("old_feature_id")
         rep = e.get("replacement_feature_id") or ""
-        assert rep and "__" in rep, f"invalid replacement_feature_id for {oid!r}"
+        assert oid, f"chunk entry missing old_feature_id: {e!r}"
+        assert rep, f"missing replacement_feature_id for {oid!r}"
+        rc = (e.get("risk_class") or "").upper()
+        assert rc in {"A", "B", "D"}, f"bad risk_class for {oid!r}: {rc!r}"
+
+
+def test_load_track_to_layer_mapping_matches_spec_shape() -> None:
+    from trainer.features import features as F
+
+    F._TRACK_TO_LAYER_MAPPING_CACHE = None  # type: ignore[attr-defined]
+    m = F.load_track_to_layer_mapping()
+    legacy = m.get("legacy_features") or []
+    assert len(legacy) >= 10
+    assert all(isinstance(x, dict) and x.get("old_feature_id") for x in legacy)
+    chunk = m.get("chunk_dependent_replacements") or []
+    assert len(chunk) >= 1
 
 
 @pytest.mark.parametrize("mod_name", ["trainer.training.trainer", "trainer.serving.scorer"])

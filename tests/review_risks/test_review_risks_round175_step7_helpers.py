@@ -7,28 +7,22 @@ helpers are defined inside trainer.run_pipeline() so we test via replicated logi
 
 from __future__ import annotations
 
-import re
 import tempfile
 import unittest
 from pathlib import Path
 
 import pandas as pd
 
+from tests.support.trainer_source_contracts import (
+    module_level_def_body,
+    step7_split_runtime_source,
+)
 
-def _get_trainer_source() -> str:
-    path = Path(__file__).resolve().parents[2] / "trainer" / "training" / "trainer.py"
-    return path.read_text(encoding="utf-8")
 
-
-def _find_step7_pandas_fallback_body(source: str) -> str | None:
-    """Return the body of _step7_pandas_fallback (from def to next top-level def)."""
-    start = source.find("def _step7_pandas_fallback(")
-    if start == -1:
-        return None
-    rest = source[start:]
-    end_match = re.search(r"\n    def [a-z_]+\(|\n    # [0-9]+\. ", rest)
-    end = end_match.start() if end_match else len(rest)
-    return rest[:end]
+def _find_step7_pandas_fallback_body(source: str | None = None) -> str | None:
+    """Return the body of ``_step7_pandas_fallback`` in ``step7_split_runtime``."""
+    src = source if source is not None else step7_split_runtime_source()
+    return module_level_def_body(src, "_step7_pandas_fallback")
 
 
 # --- Replica: _step7_oom_failsafe_next_frac with desired contract (validate 0 < current_frac <= 1). ---
@@ -165,8 +159,7 @@ class TestR175ProductionSourceAssertReplaced(unittest.TestCase):
 
     def test_r175_fallback_body_should_use_value_error_not_assert(self):
         """Production _step7_pandas_fallback should validate fractions with if/raise, not assert (Round 175 Review P1 #2)."""
-        source = _get_trainer_source()
-        body = _find_step7_pandas_fallback_body(source)
+        body = _find_step7_pandas_fallback_body()
         self.assertIsNotNone(body)
         for line in body.splitlines():
             if "assert" in line and ("train_frac" in line or "valid_frac" in line):
@@ -176,16 +169,15 @@ class TestR175ProductionSourceAssertReplaced(unittest.TestCase):
 
     def test_r175_fallback_body_should_enforce_small_data_limit_before_concat(self):
         """Pandas fallback should be reserved for tiny chunk sets, not medium/large production windows."""
-        source = _get_trainer_source()
-        body = _find_step7_pandas_fallback_body(source)
+        body = _find_step7_pandas_fallback_body()
         self.assertIsNotNone(body)
         self.assertIn(
-            "STEP7_PANDAS_FALLBACK_MAX_BYTES",
+            "step7_pandas_fallback_max_bytes",
             body,
             "_step7_pandas_fallback should consult an explicit small-data byte limit.",
         )
         self.assertIn(
-            "_chunk_total_bytes_local > STEP7_PANDAS_FALLBACK_MAX_BYTES",
+            "_chunk_total_bytes_local > step7_pandas_fallback_max_bytes",
             body,
             "_step7_pandas_fallback should block medium/large chunk sets before pandas concat.",
         )

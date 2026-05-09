@@ -45,6 +45,42 @@ _FEATURE_PIPELINE_SRC = (
 _FEATURE_PIPELINE_TREE = (
     ast.parse(_FEATURE_PIPELINE_SRC) if _FEATURE_PIPELINE_SRC else ast.parse("")
 )
+_ARTIFACT_BUNDLE_PATH = _REPO_ROOT / "trainer" / "core" / "training_artifact_bundle.py"
+_ARTIFACT_BUNDLE_SRC = (
+    _ARTIFACT_BUNDLE_PATH.read_text(encoding="utf-8")
+    if _ARTIFACT_BUNDLE_PATH.exists()
+    else ""
+)
+_ARTIFACT_BUNDLE_TREE = (
+    ast.parse(_ARTIFACT_BUNDLE_SRC) if _ARTIFACT_BUNDLE_SRC else ast.parse("")
+)
+_PIPELINE_RUN_CORE_PATH = _REPO_ROOT / "trainer" / "training" / "pipeline_run_core.py"
+_PIPELINE_RUN_CORE_SRC = (
+    _PIPELINE_RUN_CORE_PATH.read_text(encoding="utf-8")
+    if _PIPELINE_RUN_CORE_PATH.exists()
+    else ""
+)
+_PIPELINE_RUN_CORE_TREE = (
+    ast.parse(_PIPELINE_RUN_CORE_SRC) if _PIPELINE_RUN_CORE_SRC else ast.parse("")
+)
+_COMMON_RUNTIME_PATH = _REPO_ROOT / "trainer" / "training" / "common_runtime.py"
+_COMMON_RUNTIME_SRC = (
+    _COMMON_RUNTIME_PATH.read_text(encoding="utf-8")
+    if _COMMON_RUNTIME_PATH.exists()
+    else ""
+)
+_COMMON_RUNTIME_TREE = (
+    ast.parse(_COMMON_RUNTIME_SRC) if _COMMON_RUNTIME_SRC else ast.parse("")
+)
+_MODEL_EVAL_RUNTIME_PATH = _REPO_ROOT / "trainer" / "training" / "model_eval_runtime.py"
+_MODEL_EVAL_RUNTIME_SRC = (
+    _MODEL_EVAL_RUNTIME_PATH.read_text(encoding="utf-8")
+    if _MODEL_EVAL_RUNTIME_PATH.exists()
+    else ""
+)
+_MODEL_EVAL_RUNTIME_TREE = (
+    ast.parse(_MODEL_EVAL_RUNTIME_SRC) if _MODEL_EVAL_RUNTIME_SRC else ast.parse("")
+)
 
 # Issue #12 PR-12.1: optional functional import for chunk-cache round-trip
 # checks. The module imports ClickHouse helpers at top level; if the
@@ -58,6 +94,13 @@ except Exception:  # noqa: BLE001
 
 
 def _get_func_src(name: str) -> str:
+    if name == "run_pipeline":
+        for tree, src in ((_PIPELINE_RUN_CORE_TREE, _PIPELINE_RUN_CORE_SRC),):
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef) and node.name == "run_pipeline_core":
+                    seg = ast.get_source_segment(src, node) or ""
+                    if seg:
+                        return seg
     for node in _TRAINER_TREE.body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return ast.get_source_segment(_TRAINER_SRC, node) or ""
@@ -66,6 +109,10 @@ def _get_func_src(name: str) -> str:
     for tree, src in (
         (_DATA_SOURCES_TREE, _DATA_SOURCES_SRC),
         (_FEATURE_PIPELINE_TREE, _FEATURE_PIPELINE_SRC),
+        (_ARTIFACT_BUNDLE_TREE, _ARTIFACT_BUNDLE_SRC),
+        (_COMMON_RUNTIME_TREE, _COMMON_RUNTIME_SRC),
+        (_MODEL_EVAL_RUNTIME_TREE, _MODEL_EVAL_RUNTIME_SRC),
+        (_PIPELINE_RUN_CORE_TREE, _PIPELINE_RUN_CORE_SRC),
     ):
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name == name:
@@ -79,8 +126,14 @@ def _get_assign_src(name: str) -> str:
     Searches trainer.py first then falls back to data_sources.py so contracts
     that locked specific constants still apply after PR-12.2's symbol move.
     """
-    for tree, src in ((_TRAINER_TREE, _TRAINER_SRC),
-                      (_DATA_SOURCES_TREE, _DATA_SOURCES_SRC)):
+    for tree, src in (
+        (_TRAINER_TREE, _TRAINER_SRC),
+        (_DATA_SOURCES_TREE, _DATA_SOURCES_SRC),
+        (_ARTIFACT_BUNDLE_TREE, _ARTIFACT_BUNDLE_SRC),
+        (_COMMON_RUNTIME_TREE, _COMMON_RUNTIME_SRC),
+        (_MODEL_EVAL_RUNTIME_TREE, _MODEL_EVAL_RUNTIME_SRC),
+        (_PIPELINE_RUN_CORE_TREE, _PIPELINE_RUN_CORE_SRC),
+    ):
         for node in tree.body:
             if isinstance(node, ast.Assign):
                 for t in node.targets:

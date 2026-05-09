@@ -308,10 +308,8 @@ def compute_bet_layer_features(
 
     Phase B implementation: thin wrapper around
     :func:`trainer.features.features.compute_track_llm_features`. The output
-    columns continue to use legacy ``track_llm`` ids; the layered
-    ``bet__<semantic>__<scope>`` ids are exposed via the mapping helpers
-    (see :func:`get_layered_to_legacy_map`) until the YAML spec runtime is
-    layered.
+    columns use ``track_llm`` ``feature_id`` values; per-candidate ``target_layer``
+    in ``feature_candidates.yaml`` records layered ownership.
 
     Parameters
     ----------

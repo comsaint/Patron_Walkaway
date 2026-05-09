@@ -7,6 +7,8 @@ Tests-only: no production code changes.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import unittest
 import trainer.trainer as trainer_mod
@@ -24,7 +26,7 @@ class TestR210OomProbeChunk0NotLostWhenRerunReturnsNone(unittest.TestCase):
 
         Require an inner 'else:' (same indentation as 'if path1_rerun is not None') that appends path1.
         """
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         idx_if_rerun = src.find("if path1_rerun is not None:")
         self.assertGreater(idx_if_rerun, -1, "if path1_rerun is not None block not found")
         # Indentation of "if path1_rerun" line (inner block)

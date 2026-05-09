@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import importlib
 import inspect
 import pathlib
@@ -37,7 +39,7 @@ class TestR1500SingleModelOnly(unittest.TestCase):
     """R1500: trainer should no longer use dual-model training."""
 
     def test_run_pipeline_should_not_call_train_dual_model(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertNotIn(
             "train_dual_model(",
             src,
@@ -180,7 +182,7 @@ class TestR1611TrainEndTzNaive(unittest.TestCase):
     """R1611: train_end should be normalized to tz-naive in run_pipeline."""
 
     def test_run_pipeline_should_strip_tz_for_train_end(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn(
             "train_end = train_end.replace(tzinfo=None)",
             src,
@@ -204,7 +206,7 @@ class TestR1613ZeroFeatureEarlyExit(unittest.TestCase):
     """R1613: pipeline should fail fast with explicit message on zero features."""
 
     def test_run_pipeline_has_explicit_zero_feature_guard(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn(
             "screen_features + Track Human fallback both returned empty feature list",
             src,
@@ -516,7 +518,7 @@ class TestR1601TrainEndTimezoneStrip(unittest.TestCase):
     """R1601: tz-aware train_end should be converted to HK before stripping tz."""
 
     def test_run_pipeline_should_convert_before_tz_strip(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         # Minimum source-level contract: conversion step exists in train_end handling.
         self.assertIn(
             "tz_convert",
@@ -575,7 +577,7 @@ class TestR1605BiasFallbackArtifactRisk(unittest.TestCase):
     """R1605: bias-only fallback should not silently create production artifacts."""
 
     def test_run_pipeline_should_not_use_bias_constant_fallback(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertNotIn(
             'bias_col = "bias"',
             src,

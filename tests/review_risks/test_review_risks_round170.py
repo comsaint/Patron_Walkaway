@@ -7,6 +7,8 @@ without breaking the full suite.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import datetime as dt
 import inspect
 import unittest
@@ -69,7 +71,7 @@ class TestR501RunPipelineEffectiveWindowNormalization(unittest.TestCase):
     """R501: run_pipeline should normalize effective_start/effective_end to tz-naive."""
 
     def test_run_pipeline_should_strip_tz_on_effective_window(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertRegex(
             src,
             r"effective_start\s*=\s*effective_start\.replace\(tzinfo=None\)",
@@ -120,7 +122,7 @@ class TestR503R504DesignGuardrails(unittest.TestCase):
         )
 
     def test_concat_split_keeps_defensive_tz_strip(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn(
             "if _payout_ts.dt.tz is not None:",
             src,

@@ -6,6 +6,8 @@ removed so these tests now run as standard assertions.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 # ruff: noqa: E402
 
 import pytest
@@ -191,7 +193,7 @@ class TestR3603ArtifactCleanupGuard(unittest.TestCase):
     """
 
     def test_run_pipeline_should_cleanup_legacy_nonrated_model_file(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn(
             "nonrated_model.pkl",
             src,

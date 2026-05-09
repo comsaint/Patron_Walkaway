@@ -282,7 +282,7 @@ def _stacking_candidate_from_scores(
     val_dec026_min_alerts_per_hour: Optional[float],
     oof_report: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    from trainer.training.trainer import (
+    from trainer.training.model_eval_runtime import (
         _compute_feature_importance,
         _compute_test_metrics_from_scores,
         _train_metrics_dict_from_y_scores,

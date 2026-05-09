@@ -378,10 +378,9 @@ def get_profile_min_lookback(spec: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Phase B PR-B1: layered (bet/run/trip/player) mapping helpers
 # ---------------------------------------------------------------------------
-# Loads `trainer/feature_spec/track_to_layer_mapping.yaml` (Phase A artifact)
-# and exposes lookup APIs from legacy 3-track feature_id -> new layered
-# feature_id, plus per-layer feature lists. These are read-only, additive
-# helpers; they do not change existing legacy loaders or compute paths.
+# Default SSOT: ``trainer/feature_spec/feature_candidates.yaml`` (per-candidate
+# ``target_layer`` + ``layered_framework.chunk_dependent_replacements``).
+# Optional *path* override still loads a standalone YAML for tests.
 
 LAYER_NAMES: tuple = ("bet", "run", "trip", "player")
 
@@ -407,48 +406,94 @@ def resolve_spec_track_section(spec: dict, canonical_key: str) -> dict:
     return {}
 
 
-_TRACK_TO_LAYER_MAPPING_PATH = (
+_FEATURE_SPEC_FOR_LAYERING_PATH = (
     pathlib.Path(__file__).resolve().parent.parent
     / "feature_spec"
-    / "track_to_layer_mapping.yaml"
+    / "feature_candidates.yaml"
 )
 
 _TRACK_TO_LAYER_MAPPING_CACHE: Optional[dict] = None
 
 
+def mapping_dict_from_layering_spec(spec: dict) -> dict:
+    """Build mapping-shaped dict from a loaded feature spec (single-file SSOT)."""
+    legacy_features: List[dict] = []
+    for track in ("track_llm", "track_human", "track_profile"):
+        track_blob = spec.get(track) if isinstance(spec.get(track), dict) else {}
+        for c in track_blob.get("candidates") or []:
+            if not isinstance(c, dict):
+                continue
+            fid = c.get("feature_id")
+            if not fid:
+                continue
+            fid_s = str(fid)
+            tl = c.get("target_layer")
+            legacy_features.append(
+                {
+                    "old_feature_id": fid_s,
+                    "legacy_track": track,
+                    "target_layer": tl if tl in LAYER_NAMES else None,
+                    "new_feature_id": fid_s,
+                    "status": "mapped",
+                }
+            )
+    lf = spec.get("layered_framework") if isinstance(spec.get("layered_framework"), dict) else {}
+    raw_chunk = lf.get("chunk_dependent_replacements") or []
+    chunk_list = raw_chunk if isinstance(raw_chunk, list) else []
+    return {
+        "legacy_features": legacy_features,
+        "chunk_dependent_replacements": chunk_list,
+    }
+
+
 def load_track_to_layer_mapping(path: Optional[pathlib.Path] = None) -> dict:
-    """Load and cache the legacy<->layered feature_id mapping YAML.
+    """Load layered lookup dict. Default: ``feature_candidates.yaml`` (cached).
 
-    Returns the parsed YAML as a dict. If the file is missing, returns an
-    empty dict and logs a warning (callers should treat missing mapping as
-    a no-op rather than fail, so legacy paths keep working).
+    When *path* is set, read that YAML file directly (no cache), for tests or
+    legacy standalone mapping documents.
 
-    Parameters
-    ----------
-    path:
-        Optional override for the mapping YAML path. When omitted, loads from
-        ``trainer/feature_spec/track_to_layer_mapping.yaml`` and caches the
-        result. Passing a custom path bypasses the cache.
+    Returns
+    -------
+    dict
+        ``legacy_features`` and ``chunk_dependent_replacements`` lists, or empty
+        dict if the default spec is missing or invalid.
     """
     global _TRACK_TO_LAYER_MAPPING_CACHE
-    if path is None:
-        if _TRACK_TO_LAYER_MAPPING_CACHE is not None:
-            return _TRACK_TO_LAYER_MAPPING_CACHE
-        path = _TRACK_TO_LAYER_MAPPING_PATH
+    if path is not None:
+        try:
+            with open(path, "r", encoding="utf-8") as _f:
+                return _yaml.safe_load(_f) or {}
+        except FileNotFoundError:
+            logger.warning(
+                "Layer mapping YAML not found at %s — layered helpers return empty.",
+                path,
+            )
+            return {}
 
+    if _TRACK_TO_LAYER_MAPPING_CACHE is not None:
+        return _TRACK_TO_LAYER_MAPPING_CACHE
+
+    spec_path = _FEATURE_SPEC_FOR_LAYERING_PATH
     try:
-        with open(path, "r", encoding="utf-8") as _f:
-            data = _yaml.safe_load(_f) or {}
+        spec = load_feature_spec(spec_path)
     except FileNotFoundError:
         logger.warning(
-            "track_to_layer_mapping.yaml not found at %s — layered helpers "
-            "will return empty results. Legacy 3-track loaders are unaffected.",
-            path,
+            "feature_candidates.yaml not found at %s — layered helpers "
+            "will return empty results. trainer/feature_spec path expected.",
+            spec_path,
+        )
+        data: dict = {}
+    except Exception as exc:
+        logger.warning(
+            "Failed to load layering spec %s: %s — layered helpers empty.",
+            spec_path,
+            exc,
         )
         data = {}
+    else:
+        data = mapping_dict_from_layering_spec(spec)
 
-    if path == _TRACK_TO_LAYER_MAPPING_PATH:
-        _TRACK_TO_LAYER_MAPPING_CACHE = data
+    _TRACK_TO_LAYER_MAPPING_CACHE = data
     return data
 
 
@@ -519,7 +564,7 @@ def get_chunk_replacements(mapping: Optional[dict] = None) -> dict:
     """Return ``{old_feature_id: replacement_feature_id}`` for chunk-A/B/D risks.
 
     Replacement feature_ids are PIT-safe near-equivalents (Phase A PR-A3).
-    Empty dict if mapping yaml is missing.
+    Empty dict if the default spec is missing or has no chunk list.
     """
     return {
         e["old_feature_id"]: e.get("replacement_feature_id")
@@ -950,6 +995,10 @@ def add_wave2_personalized_baselines(
     - bets_in_run_vs_personal_avg
     - pace_vs_personal_baseline
 
+    ``pace_vs_personal_baseline`` uses **run-local** bets-per-minute
+    (``bets_in_run_so_far / max(minutes_since_run_start, 1/60)``) versus the
+    player 30d baseline — GitHub #34 (no ``bets_cnt_w15m``).
+
     Parameters
     ----------
     df : DataFrame
@@ -987,8 +1036,10 @@ def add_wave2_personalized_baselines(
         0.0,
     )
 
-    bets_cnt_w15m = _num_series("bets_cnt_w15m", 0.0).fillna(0.0)
-    current_bets_per_min = bets_cnt_w15m / 15.0
+    # Run-local pace (bets per minute) replaces legacy 15-minute rolling count (#34).
+    minutes_for_pace = minutes_since.copy()
+    minutes_for_pace = minutes_for_pace.where(minutes_for_pace >= (1.0 / 60.0), (1.0 / 60.0))
+    current_bets_per_min = bets_in_run / minutes_for_pace
     personal_bets_per_min = np.where(
         (sessions_30d > 0) & (avg_session_duration > 0),
         num_bets_30d / (sessions_30d * avg_session_duration),
@@ -2505,12 +2556,23 @@ def _llm_build_track_llm_batches(candidates: list) -> list[list[dict]]:
     return out
 
 
+def _llm_partition_clause(cand: dict) -> str:
+    """Build PARTITION BY list; default single-partition per canonical_id."""
+    raw = cand.get("window_partition_by")
+    if isinstance(raw, list) and raw:
+        cols = [str(c).strip() for c in raw if str(c).strip()]
+        if cols:
+            return "PARTITION BY " + ", ".join(f'"{c}"' for c in cols)
+    return 'PARTITION BY "canonical_id"'
+
+
 def _llm_one_select_item(cand: dict, range_sort_col: str) -> str:
     """Build one ``expr AS \"feature_id\"`` column for Track LLM DuckDB SQL."""
     fid = cand["feature_id"]
     expr = cand.get("expression", "")
     ftype = cand.get("type", "window")
     wf = cand.get("window_frame", "")
+    _part = _llm_partition_clause(cand)
 
     if ftype in ("window", "transform", "lag"):
         if wf:
@@ -2518,21 +2580,21 @@ def _llm_one_select_item(cand: dict, range_sort_col: str) -> str:
                 range_order = f'ORDER BY "{range_sort_col}" ASC'
                 return (
                     f"{expr} OVER ("
-                    f"PARTITION BY canonical_id "
+                    f"{_part} "
                     f"{range_order} "
                     f"{wf}"
                     f') AS "{fid}"'
                 )
             return (
                 f"{expr} OVER ("
-                f"PARTITION BY canonical_id "
+                f"{_part} "
                 f"ORDER BY payout_complete_dtm ASC, bet_id ASC "
                 f"{wf}"
                 f') AS "{fid}"'
             )
         return (
             f"{expr} OVER ("
-            f"PARTITION BY canonical_id "
+            f"{_part} "
             f"ORDER BY payout_complete_dtm ASC, bet_id ASC"
             f') AS "{fid}"'
         )

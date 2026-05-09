@@ -6,27 +6,25 @@ Tests-only: no production code changes.
 
 from __future__ import annotations
 
-import inspect
-import re
+
+from tests.support.trainer_source_contracts import (
+    module_level_def_body,
+    pipeline_implementation_source,
+    step7_split_runtime_source,
+)
 import unittest
 
 import trainer.trainer as trainer_mod
 
 
 def _get_run_pipeline_source() -> str:
-    return inspect.getsource(trainer_mod.run_pipeline)
+    return pipeline_implementation_source()
 
 
-def _find_step7_sort_and_split_body(source: str) -> str | None:
-    """Return the body of _step7_sort_and_split (nested inside run_pipeline)."""
-    start = source.find("def _step7_sort_and_split(")
-    if start == -1:
-        return None
-    rest = source[start:]
-    # End at next top-level section comment or next def at same indent
-    end_m = re.search(r"\n    # [0-9]+\. Load all chunks|\n    def _step7_pandas_fallback\(", rest)
-    end = end_m.start() if end_m else len(rest)
-    return rest[:end]
+def _find_step7_sort_and_split_body(source: str | None = None) -> str | None:
+    """Return the body of ``_step7_sort_and_split`` in ``step7_split_runtime``."""
+    src = source if source is not None else step7_split_runtime_source()
+    return module_level_def_body(src, "_step7_sort_and_split")
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +120,7 @@ class TestR219SkipLoadValidTestOnlyWhenBothFlags(unittest.TestCase):
 
     def test_step7_returns_none_none_none_only_when_keep_disk_and_libsvm(self):
         """_step7_sort_and_split return (None, None, None, paths) must be guarded by both STEP7_KEEP_TRAIN_ON_DISK and STEP9_EXPORT_LIBSVM."""
-        src = _get_run_pipeline_source()
-        body = _find_step7_sort_and_split_body(src)
+        body = _find_step7_sort_and_split_body()
         self.assertIsNotNone(body, "_step7_sort_and_split body not found")
         self.assertIn(
             "return (None, None, None, train_path, valid_path, test_path)",
@@ -134,14 +131,14 @@ class TestR219SkipLoadValidTestOnlyWhenBothFlags(unittest.TestCase):
         idx_return = body.find("return (None, None, None, train_path, valid_path, test_path)")
         block_before = body[: idx_return + 1]
         self.assertIn(
-            "STEP7_KEEP_TRAIN_ON_DISK",
+            "step7_keep_train_on_disk",
             block_before,
-            "R219 #4: Skip-load valid/test must be under STEP7_KEEP_TRAIN_ON_DISK.",
+            "R219 #4: Skip-load valid/test must be under step7_keep_train_on_disk.",
         )
         self.assertIn(
-            "STEP9_EXPORT_LIBSVM",
+            "step9_export_libsvm",
             block_before,
-            "R219 #4: Skip-load valid/test must be under STEP9_EXPORT_LIBSVM (same decision source).",
+            "R219 #4: Skip-load valid/test must be under step9_export_libsvm (same decision source).",
         )
 
 

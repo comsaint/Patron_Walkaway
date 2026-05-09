@@ -121,11 +121,8 @@ dec026_pr_alert_arrays = _threshold_selection_mod.dec026_pr_alert_arrays
 pick_threshold_dec026_from_pr_arrays = _threshold_selection_mod.pick_threshold_dec026_from_pr_arrays
 dec026_sanitize_per_hour_params = _threshold_selection_mod.dec026_sanitize_per_hour_params
 
-# Issue #12 PR-12.5: pull stable symbols directly from their owning modules
-# instead of going through ``trainer.training.trainer``. Anything that has
-# *not* yet moved out of trainer.py keeps importing from there and is the
-# explicit follow-up surface (load_player_profile, _to_hk, MODEL_DIR,
-# HISTORY_BUFFER_DAYS, _neg_pos_ratio_from_binary_labels).
+# Issue #12 PR-12.5: path/time symbols from ``trainer.training.common_runtime``;
+# profile helpers from ``trainer.training.trainer``.
 try:
     from labels import compute_labels  # type: ignore[import]
     from identity import build_canonical_mapping_from_df  # type: ignore[import]
@@ -149,12 +146,14 @@ try:
     from trainer.training.metrics_eval import (
         precision_prod_adjusted as _precision_prod_adjusted,
     )
-    from trainer.training.trainer import (
+    from trainer.training.common_runtime import (
+        HISTORY_BUFFER_DAYS,
         MODEL_DIR,
+        _to_hk,
+    )
+    from trainer.training.trainer import (
         load_player_profile,
         _neg_pos_ratio_from_binary_labels,
-        _to_hk,
-        HISTORY_BUFFER_DAYS,
     )
     # Phase C PR-C4: unified admission helper (module-level for Gate-C1 visibility).
     from trainer.features.layered import (
@@ -185,12 +184,14 @@ except ModuleNotFoundError:
     from trainer.training.metrics_eval import (
         precision_prod_adjusted as _precision_prod_adjusted,
     )
-    from trainer.training.trainer import (
+    from trainer.training.common_runtime import (
+        HISTORY_BUFFER_DAYS,
         MODEL_DIR,
+        _to_hk,
+    )
+    from trainer.training.trainer import (
         load_player_profile,
         _neg_pos_ratio_from_binary_labels,
-        _to_hk,
-        HISTORY_BUFFER_DAYS,
     )
     from trainer.features.layered import (
         compute_bet_duckdb_window_features,

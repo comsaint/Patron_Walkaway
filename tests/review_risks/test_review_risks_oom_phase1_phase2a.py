@@ -11,28 +11,27 @@ import re
 import unittest
 from pathlib import Path
 
+from tests.support.trainer_source_contracts import (
+    module_level_def_body,
+    pipeline_implementation_source,
+    step7_split_runtime_source,
+)
+
 
 def _get_trainer_source() -> str:
     path = Path(__file__).resolve().parents[2] / "trainer" / "training" / "trainer.py"
     return path.read_text(encoding="utf-8")
 
 
-def _find_step7_sort_and_split_body(source: str) -> str | None:
-    """Return the body of _step7_sort_and_split (from def to next section/def)."""
-    start = source.find("def _step7_sort_and_split(")
-    if start == -1:
-        return None
-    rest = source[start:]
-    end_match = re.search(
-        r"\n    # [0-9]+\. Load all chunks|\n    def [a-z_]+\(|\n    # [0-9]+\. ", rest
-    )
-    end = end_match.start() if end_match else len(rest)
-    return rest[:end]
+def _find_step7_sort_and_split_body(source: str | None = None) -> str | None:
+    """Return the body of ``_step7_sort_and_split`` in ``step7_split_runtime``."""
+    src = source if source is not None else step7_split_runtime_source()
+    return module_level_def_body(src, "_step7_sort_and_split")
 
 
 def _find_step7_use_duckdb_false_block(body: str) -> str | None:
-    """Return the block under 'if not STEP7_USE_DUCKDB:' up to (but not including) 'try:'."""
-    start = body.find("if not STEP7_USE_DUCKDB:")
+    """Return the block under ``if not step7_use_duckdb:`` up to (but not including) ``try:``."""
+    start = body.find("if not step7_use_duckdb:")
     if start == -1:
         return None
     rest = body[start:]
@@ -42,12 +41,13 @@ def _find_step7_use_duckdb_false_block(body: str) -> str | None:
     return rest[:end]
 
 
-def _find_canonical_pandas_branch(source: str) -> str | None:
+def _find_canonical_pandas_branch(source: str | None = None) -> str | None:
     """Return the block under 'if use_full_sessions_pandas:' in run_pipeline (canonical build)."""
-    start = source.find("if use_full_sessions_pandas:")
+    src = source if source is not None else pipeline_implementation_source()
+    start = src.find("if use_full_sessions_pandas:")
     if start == -1:
         return None
-    rest = source[start : start + 2500]
+    rest = src[start : start + 2500]
     # End at next 'else:' at same indent (DuckDB path) or next major block
     end_match = re.search(r"\n        else:\s*\n\s+sess_path", rest)
     end = end_match.start() if end_match else min(800, len(rest))
@@ -64,18 +64,17 @@ class TestOomReview1Step7KeepTrainRequiresUseDuckdb(unittest.TestCase):
 
     def test_step7_invalid_combo_should_raise_value_error_in_source(self):
         """Production _step7_sort_and_split: when 'if not STEP7_USE_DUCKDB' block must check STEP7_KEEP_TRAIN_ON_DISK and raise ValueError before fallback."""
-        source = _get_trainer_source()
-        body = _find_step7_sort_and_split_body(source)
+        body = _find_step7_sort_and_split_body()
         self.assertIsNotNone(body, "_step7_sort_and_split not found")
         block = _find_step7_use_duckdb_false_block(body)
-        self.assertIsNotNone(block, "'if not STEP7_USE_DUCKDB' block not found")
-        # Desired contract: before _step7_pandas_fallback we must have a check that raises ValueError when STEP7_KEEP_TRAIN_ON_DISK
-        has_keep_check = "STEP7_KEEP_TRAIN_ON_DISK" in block
+        self.assertIsNotNone(block, "'if not step7_use_duckdb' block not found")
+        # Desired contract: before _step7_pandas_fallback we must have a check that raises ValueError when keep-on-disk
+        has_keep_check = "step7_keep_train_on_disk" in block
         has_value_error = "ValueError" in block
         has_raise = "raise " in block
         self.assertTrue(
             has_keep_check and has_value_error and has_raise,
-            "When STEP7_USE_DUCKDB=False, production should check STEP7_KEEP_TRAIN_ON_DISK and raise ValueError "
+            "When step7_use_duckdb is False, production should check step7_keep_train_on_disk and raise ValueError "
             "before calling _step7_pandas_fallback (STATUS.md Code Review #1).",
         )
 
@@ -86,15 +85,14 @@ class TestOomReview2Step7UseDuckdbFalseLogsOomWarning(unittest.TestCase):
 
     def test_step7_use_duckdb_false_block_logs_oom_warning(self):
         """Production 'if not STEP7_USE_DUCKDB' block must contain logger.warning with STEP7_USE_DUCKDB=False and high OOM risk."""
-        source = _get_trainer_source()
-        body = _find_step7_sort_and_split_body(source)
+        body = _find_step7_sort_and_split_body()
         self.assertIsNotNone(body)
         block = _find_step7_use_duckdb_false_block(body)
         self.assertIsNotNone(block)
         self.assertIn(
             "logger.warning",
             block,
-            "A19: when STEP7_USE_DUCKDB=False must log warning",
+            "A19: when step7_use_duckdb is False must log warning",
         )
         self.assertIn(
             "STEP7_USE_DUCKDB=False",
@@ -128,8 +126,7 @@ class TestOomReview4CanonicalFullSessionsPandasLogsWarning(unittest.TestCase):
 
     def test_canonical_map_full_sessions_pandas_branch_logs_warning(self):
         """Production 'if use_full_sessions_pandas' block must contain logger.warning with CANONICAL_MAP_USE_FULL_SESSIONS_PANDAS and A03/high OOM risk."""
-        source = _get_trainer_source()
-        block = _find_canonical_pandas_branch(source)
+        block = _find_canonical_pandas_branch()
         self.assertIsNotNone(block, "'if use_full_sessions_pandas' block not found")
         self.assertIn(
             "logger.warning",

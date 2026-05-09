@@ -7,6 +7,12 @@ Tests-only: no production code changes.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import (
+    combined_contract_text,
+    pipeline_implementation_source,
+    step7_split_runtime_source,
+)
 import inspect
 import unittest
 
@@ -25,9 +31,9 @@ class TestR213Step7CleanupRestrictsPathToDataDir(unittest.TestCase):
 
         Prevents accidental deletion of system or user dirs when STEP7_DUCKDB_TEMP_DIR is misconfigured.
         """
-        src = inspect.getsource(trainer_mod.run_pipeline)
-        idx_def = src.find("def _step7_clean_duckdb_temp_dir()")
-        self.assertGreater(idx_def, -1, "_step7_clean_duckdb_temp_dir not found")
+        src = step7_split_runtime_source()
+        idx_def = src.find("def step7_clean_duckdb_temp_dir()")
+        self.assertGreater(idx_def, -1, "step7_clean_duckdb_temp_dir not found")
         idx_rmtree = src.find("shutil.rmtree(effective)", idx_def)
         self.assertGreater(idx_rmtree, -1, "shutil.rmtree(effective) not found in cleanup")
         # Function body from def up to and including the rmtree line
@@ -36,7 +42,7 @@ class TestR213Step7CleanupRestrictsPathToDataDir(unittest.TestCase):
         has_data_dir_guard = "DATA_DIR" in segment and "resolve" in segment
         self.assertTrue(
             has_data_dir_guard,
-            "R213 Review #1: _step7_clean_duckdb_temp_dir must guard rmtree with DATA_DIR (e.g. resolve and check under DATA_DIR).",
+            "R213 Review #1: step7_clean_duckdb_temp_dir must guard rmtree with DATA_DIR (e.g. resolve and check under DATA_DIR).",
         )
 
 
@@ -73,15 +79,14 @@ class TestR213Step7CleanupCalledOnlyOnDuckDBSuccessPaths(unittest.TestCase):
 
     def test_step7_clean_duckdb_temp_dir_called_in_run_pipeline(self):
         """run_pipeline source must call _step7_clean_duckdb_temp_dir in Step 7 DuckDB success paths."""
-        src = inspect.getsource(trainer_mod.run_pipeline)
-        # One occurrence is the def; the rest are calls
-        total = src.count("_step7_clean_duckdb_temp_dir()")
+        src = combined_contract_text()
+        # One occurrence is the def in step7_split_runtime; the rest are calls from orchestrator paths.
+        total = src.count("step7_clean_duckdb_temp_dir()")
         call_count = total - 1
         self.assertEqual(
             call_count,
-            6,
-            "R213: _step7_clean_duckdb_temp_dir() must be called in every DuckDB success path "
-            "(try: KEEP+LIBSVM, try: KEEP+no LIBSVM, try: not KEEP; retry: same three = 6).",
+            3,
+            "R213: step7_clean_duckdb_temp_dir() must be called on each DuckDB success return path in Step 7.",
         )
 
 

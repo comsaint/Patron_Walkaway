@@ -10,8 +10,9 @@ strict Optuna on-disk (LightGBM), file-backed train∪valid refit, training-metr
 provenance fields, and fail-fast train metrics when LibSVM predict is required;
 ``gbm_bakeoff.py`` re-raises on CatBoost/XGBoost disk-train failure under strict
 (no silent in-memory fallback). Rollout remains env-driven (set
-``TRAINER_FILE_BACKED_STRICT`` in CI/prod when ready); full primary-path parity for
-all three backends beyond rated/LightGBM + bakeoff is still tracked on #25.
+``TRAINER_FILE_BACKED_STRICT`` in CI/prod when ready). With strict + LibSVM bundle,
+A3 optional backends use disk Optuna trials, disk train∪valid refit (CatBoost/XGBoost),
+and Phase E streaming is forced on when LibSVM paths are present.
 """
 
 from __future__ import annotations
@@ -23,6 +24,25 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 MANIFEST_FILENAME = "trainer_split_manifest.v1.json"
 MANIFEST_KIND = "trainer_rated_split_file_bundle_v1"
+
+
+def forbid_file_backed_strict_dense_predict(
+    *,
+    role: str,
+    detail: str = "",
+) -> None:
+    """Fail fast when strict file-backed mode would otherwise use dense-matrix predict."""
+    if not trainer_file_backed_strict_enabled():
+        return
+    msg = (
+        "TRAINER_FILE_BACKED_STRICT: LibSVM bundle is active but "
+        f"{role} scores would use in-memory dense predict (forbidden). "
+        "Enable Phase E streaming (GBM_BAKEOFF_PREDICT_STREAMING) or ensure "
+        "on-disk predict (e.g. xgboost_libsvm_uri / catboost_libsvm_pool_uri) works."
+    )
+    if detail:
+        msg = f"{msg} Detail: {detail}"
+    raise RuntimeError(msg)
 
 
 def trainer_file_backed_strict_enabled() -> bool:
@@ -68,8 +88,14 @@ def write_split_manifest(
     train_row_count: int,
     valid_row_count: int,
     test_row_count: Optional[int] = None,
+    feature_index_base: str = "zero",
+    trainer_file_backed_strict_effective: Optional[bool] = None,
+    backends_contract: Optional[Sequence[str]] = None,
 ) -> Path:
     """Write a JSON manifest next to LibSVM exports for reproducibility / CI checks.
+
+    ``schema_version`` 2 adds optional #25 contract fields; readers should use
+    :func:`dict.get` for backward compatibility with older manifests.
 
     Returns
     -------
@@ -78,9 +104,14 @@ def write_split_manifest(
     """
     export_dir = Path(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
+    _strict = (
+        bool(trainer_file_backed_strict_effective)
+        if trainer_file_backed_strict_effective is not None
+        else trainer_file_backed_strict_enabled()
+    )
     payload: Dict[str, Any] = {
         "artifact_kind": MANIFEST_KIND,
-        "schema_version": 1,
+        "schema_version": 2,
         "train_libsvm": str(Path(train_libsvm).resolve()),
         "valid_libsvm": str(Path(valid_libsvm).resolve()),
         "test_libsvm": str(Path(test_libsvm).resolve()) if test_libsvm else None,
@@ -88,6 +119,11 @@ def write_split_manifest(
         "train_row_count": int(train_row_count),
         "valid_row_count": int(valid_row_count),
         "test_row_count": int(test_row_count) if test_row_count is not None else None,
+        "feature_index_base": str(feature_index_base),
+        "trainer_file_backed_strict_effective": bool(_strict),
+        "backends_contract": [str(b) for b in backends_contract]
+        if backends_contract
+        else ["lightgbm", "catboost", "xgboost"],
     }
     out = export_dir / MANIFEST_FILENAME
     out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

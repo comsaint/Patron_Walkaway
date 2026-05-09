@@ -118,7 +118,7 @@ def _phase_e_dense_positive_scores(
     LightGBM booster fast path; otherwise chunks ``predict_proba`` to reduce peak RAM
     during Step 9 Phase E on laptop-scale runs.
     """
-    from trainer.training.trainer import _batched_model_positive_class_scores
+    from trainer.training.model_eval_runtime import _batched_model_positive_class_scores
 
     t0 = time.perf_counter()
     n = int(len(X))
@@ -442,7 +442,7 @@ def _preload_parallel_backend_imports(backends: Tuple[str, ...]) -> None:
 
 
 def _default_backend_hyperparams(backend: str) -> Dict[str, Any]:
-    from trainer.training.trainer import _backend_hpo_defaults
+    from trainer.training.hpo_runtime import _backend_hpo_defaults
 
     return dict(_backend_hpo_defaults(backend))
 
@@ -461,7 +461,7 @@ def _train_catboost_backend(
     libsvm_bundle: Optional[GbmBakeoffLibSvmBundle] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     from catboost import CatBoostClassifier
-    from trainer.training.trainer import (
+    from trainer.training.hpo_runtime import (
         _apply_backend_imbalance_params,
         _sanitize_catboost_params_for_runtime,
     )
@@ -561,7 +561,7 @@ def _train_xgboost_backend(
     libsvm_bundle: Optional[GbmBakeoffLibSvmBundle] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     import xgboost as xgb
-    from trainer.training.trainer import _apply_backend_imbalance_params
+    from trainer.training.hpo_runtime import _apply_backend_imbalance_params
 
     if libsvm_bundle is not None and bool(getattr(_cfg, "GBM_BAKEOFF_FROM_FILE", True)):
         try:
@@ -714,7 +714,7 @@ def _build_soft_vote_candidate(
     val_dec026_min_alerts_per_hour: Optional[float],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Create the equal-weight soft-vote from every trained base GBM in the bakeoff."""
-    from trainer.training.trainer import (
+    from trainer.training.model_eval_runtime import (
         _compute_feature_importance,
         _compute_test_metrics_from_scores,
         _train_metrics_dict_from_y_scores,
@@ -835,14 +835,16 @@ def train_and_select_rated_gbm_family(
     libsvm_bundle: Optional[GbmBakeoffLibSvmBundle] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Train base backends + ensemble candidates on aligned splits and return winner + report."""
-    from trainer.training.trainer import (
+    from trainer.training.model_eval_runtime import (
         _batched_model_positive_class_scores,
-        _backend_runtime_manifest,
         _compute_feature_importance,
         _compute_test_metrics,
         _compute_test_metrics_from_scores,
         _compute_train_metrics,
         _train_metrics_dict_from_y_scores,
+    )
+    from trainer.training.trainer import (
+        _backend_runtime_manifest,
         resolve_gbm_backend_runtime_plan,
         resolve_backend_optuna_budget,
         run_backend_optuna_search,

@@ -6,6 +6,8 @@ Scope: tests only; no production code edits.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import json
 import tempfile
@@ -26,7 +28,7 @@ class TestTask7DodChunkCacheStatsReviewRisksMRE(unittest.TestCase):
 
     def test_risk1_run_pipeline_passes_same_chunk_cache_stats_to_step7_rerun(self) -> None:
         """MRE: one dict is shared; Step 7 _run_step6 also passes chunk_cache_stats (cumulative risk)."""
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn("chunk_cache_stats: Dict[str, int] = {}", src)
         self.assertRegex(
             src,
@@ -38,7 +40,7 @@ class TestTask7DodChunkCacheStatsReviewRisksMRE(unittest.TestCase):
 
     def test_risk1_neg_sample_auto_path_calls_process_chunk_multiple_times_documented(self) -> None:
         """MRE: NEG_SAMPLE_FRAC_AUTO branch can invoke process_chunk twice for chunk 0."""
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         if "NEG_SAMPLE_FRAC_AUTO" not in src:
             self.fail("expected NEG_SAMPLE_FRAC_AUTO in run_pipeline")
         self.assertIn("path1 = process_chunk", src)

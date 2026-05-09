@@ -7,6 +7,8 @@ without blocking the full suite.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import unittest
 
@@ -20,7 +22,7 @@ class TestR700TrainEndSemanticDrift(unittest.TestCase):
     """R700: chunk-level train_end may drift from row-level split boundary."""
 
     def test_run_pipeline_should_compare_chunk_vs_row_train_end(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn(
             "_actual_train_end",
             src,
@@ -32,7 +34,7 @@ class TestR701RunBoundarySplitLeakage(unittest.TestCase):
     """R701: row-level split may cut a single run across train/valid/test."""
 
     def test_split_logic_should_include_run_boundary_guard(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertTrue(
             ("run_id" in src and "group" in src.lower()) or ("same run" in src.lower()),
             "row-level split should include a run-boundary guard to avoid splitting the same run.",
@@ -82,7 +84,7 @@ class TestR704SplitSortMemoryPattern(unittest.TestCase):
     """R704: split sort currently creates multiple intermediate DataFrame copies."""
 
     def test_run_pipeline_split_sort_should_prefer_inplace_operations(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         # Desired future pattern: inplace sort/drop/reset to reduce memory peaks.
         self.assertIn("inplace=True", src)
 
@@ -113,7 +115,7 @@ class TestR706DefensiveTzStripGuardrail(unittest.TestCase):
     """R706: keep defensive tz strip in run_pipeline split path."""
 
     def test_run_pipeline_keeps_defensive_tz_strip(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn(
             "if _payout_ts.dt.tz is not None:",
             src,

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from trainer.training.trainer import (
+from trainer.training.identity_runtime import (
     _apply_cutoff_window_identity_fallback,
     attach_pit_identity_chunk_duckdb,
 )

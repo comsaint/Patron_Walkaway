@@ -10,6 +10,8 @@ STATUS.md「Code Review — Config 集中化（DEC-027）變更（2026-03-11）�
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import tempfile
 import unittest
@@ -223,7 +225,7 @@ class TestDEC027_R7_Step7TempDirGuardedUnderDataDir(unittest.TestCase):
         Prevents DuckDB writing spill files to arbitrary paths. R213 already guards cleanup;
         configure path must also restrict (e.g. relative_to(DATA_DIR) or resolve under DATA_DIR).
         """
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         idx_def = src.find("def _configure_step7_duckdb_runtime")
         self.assertGreater(idx_def, -1, "_configure_step7_duckdb_runtime not found")
         # Extract function body up to next top-level "def " (same indent as "def _configure")

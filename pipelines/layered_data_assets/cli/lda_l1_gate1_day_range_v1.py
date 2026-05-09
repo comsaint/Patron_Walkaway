@@ -1022,7 +1022,7 @@ def _build_canonical_mapping_parquet_via_trainer(
     ``build_canonical_links_and_dummy_from_duckdb`` materializes links in pandas.
     """
     from trainer.identity import build_canonical_mapping_from_links
-    from trainer.training.trainer import build_canonical_links_and_dummy_from_duckdb
+    from trainer.training.identity_runtime import build_canonical_links_and_dummy_from_duckdb
 
     src = raw_t_session_parquet.resolve()
     if not src.is_file():

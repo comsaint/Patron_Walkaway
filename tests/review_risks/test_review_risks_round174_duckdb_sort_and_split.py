@@ -12,9 +12,12 @@ fallback mkdir, COPY cleanup, docstring (xfail where production is wrong).
 
 from __future__ import annotations
 
-import re
 import unittest
-from pathlib import Path
+
+from tests.support.trainer_source_contracts import (
+    module_level_def_body,
+    step7_split_runtime_source,
+)
 
 # Replicate effective temp dir logic from _configure_step7_duckdb_runtime:
 # when temp_dir_raw contains single quote, effective = DATA_DIR/duckdb_tmp.
@@ -32,21 +35,10 @@ def _split_indices_replica(n_rows: int, train_frac: float, valid_frac: float) ->
     return train_end_idx, valid_end_idx
 
 
-def _get_trainer_source() -> str:
-    path = Path(__file__).resolve().parents[2] / "trainer" / "training" / "trainer.py"
-    return path.read_text(encoding="utf-8")
-
-
-def _find_duckdb_sort_and_split_body(source: str) -> str | None:
-    """Return the body of _duckdb_sort_and_split (from def to next top-level def or end)."""
-    start = source.find("def _duckdb_sort_and_split(")
-    if start == -1:
-        return None
-    # Find next line that starts with "    def " (same indent as _duckdb_sort_and_split)
-    rest = source[start:]
-    end_match = re.search(r"\n    def [a-z_]+\(|\n    # [0-9]+\. ", rest)
-    end = end_match.start() if end_match else len(rest)
-    return rest[:end]
+def _find_duckdb_sort_and_split_body(source: str | None = None) -> str | None:
+    """Return the body of ``_duckdb_sort_and_split`` in ``step7_split_runtime``."""
+    src = source if source is not None else step7_split_runtime_source()
+    return module_level_def_body(src, "_duckdb_sort_and_split")
 
 
 class TestR174EffectiveTempDirContract(unittest.TestCase):
@@ -74,8 +66,7 @@ class TestR174FallbackDirMustBeCreated(unittest.TestCase):
         """Production should create fallback dir when STEP7_DUCKDB_TEMP_DIR contains quote.
         Either: else branch that mkdirs duckdb_tmp, or effective_temp_dir set to fallback when quote then mkdir(effective_temp_dir).
         """
-        source = _get_trainer_source()
-        body = _find_duckdb_sort_and_split_body(source)
+        body = _find_duckdb_sort_and_split_body()
         self.assertIsNotNone(body)
         # Contract: when quote in path, effective dir = fallback and that dir is created (mkdir).
         # Accept: effective_temp_dir set from temp_dir_raw/duckdb_tmp and then mkdir(effective_temp_dir).
@@ -94,8 +85,7 @@ class TestR174OrderByNullsLast(unittest.TestCase):
 
     def test_r174_order_by_should_use_nulls_last(self):
         """CREATE TEMP VIEW sorted_bets ... ORDER BY ... must include NULLS LAST."""
-        source = _get_trainer_source()
-        body = _find_duckdb_sort_and_split_body(source)
+        body = _find_duckdb_sort_and_split_body()
         self.assertIsNotNone(body)
         # ORDER BY payout_complete_dtm, canonical_id, bet_id -> should be NULLS LAST each.
         self.assertIn("ORDER BY", body)
@@ -129,8 +119,7 @@ class TestR174EmptyChunkPaths(unittest.TestCase):
 
     def test_r174_empty_chunk_paths_should_be_checked(self):
         """_duckdb_sort_and_split should check chunk_paths and raise if empty."""
-        source = _get_trainer_source()
-        body = _find_duckdb_sort_and_split_body(source)
+        body = _find_duckdb_sort_and_split_body()
         self.assertIsNotNone(body)
         # Require explicit early check for empty chunk_paths (not just any use of chunk_paths + raise).
         has_early_empty_check = (
@@ -147,8 +136,7 @@ class TestR174CopyFailureCleanup(unittest.TestCase):
 
     def test_r174_copy_failure_should_remove_partial_files(self):
         """On exception, production should delete any already-written split files."""
-        source = _get_trainer_source()
-        body = _find_duckdb_sort_and_split_body(source)
+        body = _find_duckdb_sort_and_split_body()
         self.assertIsNotNone(body)
         # Expect in except/finally: unlink train_path/valid_path/test_path if exist.
         has_cleanup = (
@@ -167,8 +155,7 @@ class TestR174ReadParquetListContract(unittest.TestCase):
 
     def test_r174_path_list_is_list_of_str(self):
         """Production builds path_list = [str(p) for p in chunk_paths]; uses read_parquet with list (inline SQL, not prepared)."""
-        source = _get_trainer_source()
-        body = _find_duckdb_sort_and_split_body(source)
+        body = _find_duckdb_sort_and_split_body()
         self.assertIsNotNone(body)
         self.assertIn("path_list = [str(p) for p in chunk_paths]", body)
         # Contract: read_parquet receives list of paths (inline [paths_sql] or similar), not prepared (?) with [path_list].
@@ -181,8 +168,7 @@ class TestR174DocstringTempDir(unittest.TestCase):
 
     def test_r174_docstring_says_function_creates_temp_dir(self):
         """Docstring should not say 'Caller must create temp dir' (function does mkdir)."""
-        source = _get_trainer_source()
-        body = _find_duckdb_sort_and_split_body(source)
+        body = _find_duckdb_sort_and_split_body()
         self.assertIsNotNone(body)
         # Extract docstring: first """ ... """
         start = body.find('"""')

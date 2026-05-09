@@ -5,6 +5,8 @@ Tests-only: no production code changes.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import ast
 import inspect
 import re
@@ -61,7 +63,7 @@ class TestR401IdentityImportFallbackGuardrail(unittest.TestCase):
     def test_run_pipeline_should_not_use_bare_identity_inline_imports(self):
         import trainer.trainer as trainer_mod
 
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertNotRegex(
             src,
             r"from\s+identity\s+import\s+get_dummy_player_ids_from_df",
@@ -95,7 +97,7 @@ class TestR403SessionsAllReleaseGuardrail(unittest.TestCase):
     def test_use_local_branch_releases_sessions_all(self):
         import trainer.trainer as trainer_mod
 
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         m = re.search(r"if use_local:(?P<body>.*?)\n\s*else:", src, flags=re.S)
         self.assertIsNotNone(m, "Could not find use_local branch in run_pipeline source.")
         local_branch = m.group("body") if m else ""

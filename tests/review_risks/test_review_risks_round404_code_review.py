@@ -6,6 +6,8 @@ Reference: PLAN.md § Round 222 Review production 補強、DECISION_LOG DEC-011 
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import datetime as dt
 import inspect
 import unittest
@@ -27,7 +29,7 @@ class TestR404_1_TrainerRatedCidsEmptyMap(unittest.TestCase):
 
     def test_run_pipeline_uses_else_list_when_canonical_map_empty(self):
         """Contract: run_pipeline _rated_cids block uses else [] when canonical_map empty (train-serve parity with backtester)."""
-        source = inspect.getsource(trainer_mod.run_pipeline)
+        source = pipeline_implementation_source()
         idx = source.find("_rated_cids")
         load_idx = source.find("load_player_profile", idx)
         self.assertGreater(load_idx, idx, "run_pipeline must contain load_player_profile after _rated_cids")

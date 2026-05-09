@@ -6,6 +6,8 @@ The tests encode desired guardrails for current review findings.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -117,7 +119,7 @@ class TestR3504CandidateDedup(unittest.TestCase):
     """R3504: run_pipeline should deduplicate merged candidate columns."""
 
     def test_run_pipeline_should_deduplicate_all_candidate_cols(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn(
             "dict.fromkeys(active_feature_cols + _track_llm_cols)",
             src,

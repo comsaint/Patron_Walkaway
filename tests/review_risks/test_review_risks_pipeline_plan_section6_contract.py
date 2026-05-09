@@ -7,18 +7,18 @@ oom_precheck_step7_rss_error_ratio 與 peak／precheck 的除法關係（對齊 
 
 from __future__ import annotations
 
-import ast
-import inspect
 import re
-import textwrap
 import unittest
 
 from package.build_deploy_package import BUNDLE_FILES
-from trainer.training import trainer as trainer_mod
+from tests.support.trainer_source_contracts import (
+    count_name_calls_in_pipeline_impl,
+    pipeline_implementation_source,
+)
 
 
 def _run_pipeline_src() -> str:
-    return inspect.getsource(trainer_mod.run_pipeline)
+    return pipeline_implementation_source()
 
 
 def _bundle_artifact_section(src: str) -> str:
@@ -34,25 +34,7 @@ def _bundle_artifact_section(src: str) -> str:
 
 def _count_log_artifact_safe_calls_in_run_pipeline_ast() -> int:
     """STATUS Code Review #2 MRE: count Name(...) calls, survives comment/string false positives on substring count."""
-    src = textwrap.dedent(inspect.getsource(trainer_mod.run_pipeline))
-    mod = ast.parse(src)
-    fn = mod.body[0]
-    if not isinstance(fn, ast.FunctionDef) or fn.name != "run_pipeline":
-        raise AssertionError("expected ast body[0] to be def run_pipeline")
-
-    class _Visitor(ast.NodeVisitor):
-        def __init__(self) -> None:
-            self.n = 0
-
-        def visit_Call(self, node: ast.Call) -> None:
-            f = node.func
-            if isinstance(f, ast.Name) and f.id == "log_artifact_safe":
-                self.n += 1
-            self.generic_visit(node)
-
-    v = _Visitor()
-    v.visit(fn)
-    return v.n
+    return count_name_calls_in_pipeline_impl(callee_id="log_artifact_safe")
 
 
 class TestSection6BundleFiles(unittest.TestCase):

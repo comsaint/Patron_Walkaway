@@ -8,6 +8,8 @@ Tests-only: no production code changes.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import tempfile
 import unittest
@@ -19,7 +21,7 @@ import trainer.trainer as trainer_mod
 
 
 def _get_run_pipeline_source() -> str:
-    return inspect.getsource(trainer_mod.run_pipeline)
+    return pipeline_implementation_source()
 
 
 # ---------------------------------------------------------------------------

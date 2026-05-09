@@ -103,7 +103,7 @@ def _mapping_to_eligible_player_ids(mapping: pd.DataFrame) -> pd.DataFrame:
 def _build_mapping_via_trainer_duckdb(session_parquet: Path, cutoff_dtm: datetime) -> pd.DataFrame:
     """Trainer Step-3 DuckDB path: links in DuckDB, M:N in ``identity``."""
     from trainer.identity import build_canonical_mapping_from_links
-    from trainer.training.trainer import build_canonical_links_and_dummy_from_duckdb
+    from trainer.training.identity_runtime import build_canonical_links_and_dummy_from_duckdb
 
     links_df, dummy_pids = build_canonical_links_and_dummy_from_duckdb(session_parquet, cutoff_dtm)
     return build_canonical_mapping_from_links(links_df, dummy_pids)

@@ -697,7 +697,7 @@ def train_catboost_from_libsvm_disk(
     from catboost import CatBoostClassifier, Pool
 
     from trainer.training.gbm_bakeoff import _val_block_from_scores
-    from trainer.training.trainer import _sanitize_catboost_params_for_runtime
+    from trainer.training.hpo_runtime import _sanitize_catboost_params_for_runtime
 
     validate_bundle_paths(bundle)
     w_mm, _n = ensure_train_weight_f32_memmap(
@@ -937,7 +937,7 @@ def catboost_disk_strict_refit_on_train_union_valid(
     from catboost import CatBoostClassifier, Pool
 
     from trainer.training.split_file_bundle import merge_libsvm_files, merge_train_valid_weight_files
-    from trainer.training.trainer import _sanitize_catboost_params_for_runtime
+    from trainer.training.hpo_runtime import _sanitize_catboost_params_for_runtime
 
     cache_dir = Path(bundle.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)

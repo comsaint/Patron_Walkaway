@@ -397,25 +397,43 @@ class TestComputeTrackLlmFeatures(unittest.TestCase):
             "track_llm": {"candidates": candidates},
         }
 
-    def test_count_window_basic(self):
-        """bets_cnt should count bets within the window frame."""
+    def test_run_partition_cumulative_window_basic(self):
+        """Run-scoped cumulative windows use canonical_id + run_id partition."""
         bets = self._make_bets([0, 5, 10, 20])
-        spec = self._minimal_spec([{
-            "feature_id": "bets_cnt_w15m",
-            "type": "window",
-            "expression": "COUNT(bet_id)",
-            "window_frame": "RANGE BETWEEN INTERVAL 15 MINUTE PRECEDING AND CURRENT ROW",
-            "postprocess": {"fill": {"strategy": "zero"}},
-        }])
+        bets["run_id"] = np.int32(0)
+        bets["minutes_since_run_start"] = np.float64([0.0, 5.0, 10.0, 20.0])
+        bets["bets_in_run_so_far"] = np.int32([1, 2, 3, 4])
+        bets["wager_sum_in_run_so_far"] = bets["wager"].cumsum()
+        spec = self._minimal_spec([
+            {
+                "feature_id": "win_cnt_currentrun",
+                "type": "window",
+                "expression": "SUM(CASE WHEN status = 'WIN' THEN 1 ELSE 0 END)",
+                "window_partition_by": ["canonical_id", "run_id"],
+                "window_frame": "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                "postprocess": {"fill": {"strategy": "zero"}},
+            },
+            {
+                "feature_id": "win_rate_currentrun",
+                "type": "derived",
+                "dtype": "float",
+                "depends_on": ["win_cnt_currentrun"],
+                "expression": (
+                    "CAST(win_cnt_currentrun AS DOUBLE) / "
+                    "NULLIF(CAST(bets_in_run_so_far AS DOUBLE), 0)"
+                ),
+                "postprocess": {"fill": {"strategy": "zero"}},
+            },
+        ])
         result = compute_track_llm_features(bets, spec)
-        self.assertIn("bets_cnt_w15m", result.columns)
+        self.assertIn("win_rate_currentrun", result.columns)
         self.assertEqual(
-            result["bets_cnt_w15m"].dtype,
+            result["win_rate_currentrun"].dtype,
             np.float32,
             "DEC-031: Track LLM candidate columns must be float32 after compute.",
         )
-        # All four bets at minutes 0,5,10,20 — bet at t=20 window covers [5,20] → 3 bets
-        self.assertEqual(int(result.iloc[3]["bets_cnt_w15m"]), 3)
+        # All WIN → last row win_rate = 4/4
+        self.assertAlmostEqual(float(result.iloc[3]["win_rate_currentrun"]), 1.0, places=5)
 
     def test_lag_feature(self):
         """LAG window should return the previous bet's value."""

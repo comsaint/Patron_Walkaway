@@ -4,7 +4,8 @@ STATUS.md — Code Review：T-PipelineStepDurations（2026-03-22）
 將 reviewer 風險點轉成最小可重現／契約測試；**不修改 production**。
 對應 STATUS 小節各編號（#1–#6）。
 
-所有測試僅讀取 `trainer/training/trainer.py` 文字或純 Python 模擬，**不依賴匯入 trainer 模組**（避免冷啟動過慢）。
+契約讀取：優先串接 ``pipeline_run_core.py`` + ``trainer.py``（與可選 ``training_artifact_bundle.py``），
+避免 B/D 搬家後子字串只在舊單檔出現而誤判。**不依賴匯入 trainer 模組**（避免冷啟動過慢）。
 """
 
 from __future__ import annotations
@@ -12,12 +13,28 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+from tests.support.trainer_source_contracts import (
+    combined_contract_text,
+    find_def_source,
+)
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TRAINER_PY = _REPO_ROOT / "trainer" / "training" / "trainer.py"
 
 
 def _trainer_text() -> str:
-    return _TRAINER_PY.read_text(encoding="utf-8")
+    """Pipeline + trainer sources (no artifact bundle — diagnostics 另用 find_def_source)."""
+    return combined_contract_text(include_artifact_bundle=False)
+
+
+def _diagnostics_writer_body() -> str:
+    body = find_def_source("_write_pipeline_diagnostics_json")
+    if body:
+        return body
+    src = combined_contract_text(include_artifact_bundle=True)
+    i0 = src.find("def _write_pipeline_diagnostics_json(")
+    assert i0 > 0, "expected def _write_pipeline_diagnostics_json in contract sources"
+    return src[i0 : i0 + 12000]
 
 
 class TestReview1MlflowMetricsRatedMergeCollisionMre(unittest.TestCase):
@@ -78,10 +95,7 @@ class TestReview3Step8OptionalInDiagnosticsJson(unittest.TestCase):
     """#3：Step 8 可為 None；writer 以 `if v is not None` 省略鍵（靜態契約 + 行為 MRE）。"""
 
     def test_writer_uses_none_omission_filter(self):
-        src = _trainer_text()
-        i0 = src.find("def _write_pipeline_diagnostics_json(")
-        self.assertGreater(i0, 0)
-        chunk = src[i0 : i0 + 6000]
+        chunk = _diagnostics_writer_body()[:6000]
         self.assertIn(
             "out = {k: v for k, v in payload.items() if v is not None}",
             chunk,
@@ -125,10 +139,7 @@ class TestReview5DiagnosticsWriterBoundedStepKeys(unittest.TestCase):
     """#5：診斷 writer 使用固定 step 耗時鍵（step0、step1–10、step7b），無無界擴張。"""
 
     def test_write_payload_lists_step1_through_step10_once_each(self):
-        src = _trainer_text()
-        i0 = src.find("def _write_pipeline_diagnostics_json(")
-        self.assertGreater(i0, 0, "expected _write_pipeline_diagnostics_json in trainer.py")
-        chunk = src[i0 : i0 + 10000]
+        chunk = _diagnostics_writer_body()[:10000]
         self.assertEqual(chunk.count('"step0_duration_sec": step0_duration_sec'), 1)
         for n in range(1, 11):
             pat = f'"step{n}_duration_sec": step{n}_duration_sec'
@@ -144,10 +155,7 @@ class TestReview6StepDurationKeysNoPathOrSecretPattern(unittest.TestCase):
     """#6：step 耗時鍵為數值語意；契約上 payload 鍵名符合固定 pattern（非任意字串）。"""
 
     def test_step_duration_keys_match_snake_case_pattern(self):
-        src = _trainer_text()
-        i0 = src.find("def _write_pipeline_diagnostics_json(")
-        self.assertGreater(i0, 0)
-        chunk = src[i0 : i0 + 10000]
+        chunk = _diagnostics_writer_body()[:10000]
         expected = (
             ["step0_duration_sec"]
             + [f"step{n}_duration_sec" for n in range(1, 8)]

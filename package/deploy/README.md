@@ -37,7 +37,8 @@ Single process: continuously fetches from ClickHouse, runs scorer and validator,
    **Deploy bundle** (folder produced by `build_deploy_package`): on the target, use **that folder’s** `requirements.txt` (not `package/deploy/requirements.txt`). First install: `pip install -r requirements.txt` from inside the extracted folder.
 
 3. **Model bundle**  
-   When building the deploy package, `build_deploy_package.py` copies the model from `--model-source` (e.g. `trainer/models`) into `models/`. Required in that source: **`model.pkl`** and `feature_list.json` (DEC-040: legacy `rated_model.pkl` / `walkaway_model.pkl` are not used). If you run the deploy app from this folder only (no full deploy package), put those files in `models/` yourself.
+   When building the deploy package, `build_deploy_package.py` copies the model from `--model-source` (e.g. `trainer/models`) into `models/`. Required in that source: **`model.pkl`** and `feature_list.json` (DEC-040: legacy `rated_model.pkl` / `walkaway_model.pkl` are not used). If you run the deploy app from this folder only (no full deploy package), put those files in `models/` yourself.  
+   **Catalog mirror:** `package/deploy/models/feature_spec.yaml` is kept identical to [`trainer/feature_spec/feature_candidates.yaml`](../../trainer/feature_spec/feature_candidates.yaml) (dev SSOT). After changing the catalog, copy again: `cp trainer/feature_spec/feature_candidates.yaml package/deploy/models/feature_spec.yaml` from repo root. Production still loads the **frozen** `feature_spec.yaml` next to `model.pkl`; this repo copy is only a reference so deploy docs and package layout do not drift.
 
 ### Production bundle: updates without reinstalling everything
 

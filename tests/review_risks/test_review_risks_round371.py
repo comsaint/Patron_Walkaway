@@ -8,6 +8,8 @@ Scope:
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import pathlib
 import unittest
@@ -55,7 +57,7 @@ class TestR371RiskGuards(unittest.TestCase):
 
     def test_r371_4_step7_should_avoid_split_copy_spike(self):
         """R-371-4 resolved: Step 7 split uses reset_index instead of .copy()."""
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertNotRegex(
             src,
             r"train_df\s*=\s*full_df\[.*\]\.copy\(\)",

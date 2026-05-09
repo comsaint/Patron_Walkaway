@@ -6,6 +6,8 @@ Unfixed risks are encoded as expected failures so they stay visible.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import unittest
 
@@ -16,7 +18,7 @@ class TestR1000TrackLlmDetection(unittest.TestCase):
     """R1000: Track LLM detection should come from feature spec, not heuristics."""
 
     def test_track_llm_detection_should_use_feature_spec_not_numeric_heuristic(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertTrue(
             ("load_feature_spec(" in src) or ("feature_spec.get(\"track_llm\"" in src),
             "Track LLM candidate columns should come from feature spec, not numeric heuristics.",
@@ -27,7 +29,7 @@ class TestR1001ScreeningSanity(unittest.TestCase):
     """R1001: screening should preserve minimum Track-B coverage."""
 
     def test_screening_should_keep_at_least_one_track_human_feature(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         # R123-2 (feat-consolidation): hardcoded TRACK_B_FEATURE_COLS was replaced with
         # YAML-driven track_human lookup. Assert the new implementation still enforces
         # a post-screening track_human sanity check.
@@ -64,7 +66,7 @@ class TestR1004ScreeningSkipFallback(unittest.TestCase):
     """R1004: screening-skip path should filter active_feature_cols to present columns."""
 
     def test_screening_skip_should_filter_active_feature_cols(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         # R1004: restrict to columns present in train (or _train_cols when B+ keep-on-disk).
         self.assertIn(
             "active_feature_cols = [c for c in active_feature_cols if c in _train_cols]",

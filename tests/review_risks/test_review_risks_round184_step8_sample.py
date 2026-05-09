@@ -7,6 +7,8 @@ Tests-only: no production code changes.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import argparse
 import inspect
 import tempfile
@@ -35,7 +37,7 @@ class TestR184Step8LogIncludesCapWhenTrainSmallerThanCap(unittest.TestCase):
         the logger.info message must include the cap (STEP8_SCREEN_SAMPLE_ROWS) value so operators
         can distinguish 'used 5000' from 'cap 5000 but train had only 100'.
         """
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         # Must have a format that exposes the cap when actual < cap (Round 184 Review §1).
         # e.g. "STEP8_SCREEN_SAMPLE_ROWS=%d" or "cap ... %d" in the sampling branch.
         step8_block_start = src.find("PLAN 方案 B 策略 A")
@@ -63,7 +65,7 @@ class TestR184Step8SampleRowsIntCoercionContract(unittest.TestCase):
         """run_pipeline Step 8 block must use int(_sample_n) before calling head() so that
         float (e.g. 5000.0) is safely handled (Round 184 Review §2).
         """
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         step8_block_start = src.find("PLAN 方案 B 策略 A")
         self.assertGreater(step8_block_start, -1, "Step 8 sampling block not found")
         block = src[step8_block_start : step8_block_start + 3500]
@@ -116,7 +118,7 @@ class TestR184Step8ZeroFeatureBiasFallbackContract(unittest.TestCase):
 
     def test_run_pipeline_has_zero_feature_bias_fallback(self):
         """run_pipeline source must contain the bias fallback when active_feature_cols is empty."""
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn("if not active_feature_cols:", src)
         self.assertIn("bias", src)
         self.assertIn("_placeholder_col", src)
@@ -131,7 +133,7 @@ class TestR184Step8KeepOnDiskSampleReleasedBeforeFullTrainLoad(unittest.TestCase
 
     def test_step8_keep_on_disk_releases_sample_before_read_parquet_train(self):
         """When step7_train_path is used, source should clear _train_for_screen/_matrix_for_screen before pd.read_parquet(step7_train_path)."""
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         load_idx = src.find("train_df = pd.read_parquet(step7_train_path)")
         self.assertGreater(load_idx, -1, "Expected keep-on-disk train load in run_pipeline")
         window = src[max(0, load_idx - 1800): load_idx + 120]

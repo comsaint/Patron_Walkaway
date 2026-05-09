@@ -9,6 +9,8 @@ T12 Code Review (§2–§4): failed-run logging contract and behavior (tests onl
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import argparse
 import ast
 import inspect
@@ -24,7 +26,7 @@ from trainer.training import trainer as trainer_mod
 
 
 def _run_pipeline_src() -> str:
-    return inspect.getsource(trainer_mod.run_pipeline)
+    return pipeline_implementation_source()
 
 
 def _log_provenance_src() -> str:

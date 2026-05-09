@@ -11,32 +11,28 @@ import re
 import unittest
 from pathlib import Path
 
+from tests.support.trainer_source_contracts import (
+    module_level_def_body,
+    pipeline_implementation_source,
+    step7_split_runtime_source,
+)
+
 
 def _get_trainer_source() -> str:
     path = Path(__file__).resolve().parents[2] / "trainer" / "training" / "trainer.py"
     return path.read_text(encoding="utf-8")
 
 
-def _find_step7_sort_and_split_body(source: str) -> str | None:
-    """Return the body of _step7_sort_and_split (from def to next section/def)."""
-    start = source.find("def _step7_sort_and_split(")
-    if start == -1:
-        return None
-    rest = source[start:]
-    end_match = re.search(r"\n    # [0-9]+\. Load all chunks|\n    def [a-z_]+\(|\n    # [0-9]+\. ", rest)
-    end = end_match.start() if end_match else len(rest)
-    return rest[:end]
+def _find_step7_sort_and_split_body(source: str | None = None) -> str | None:
+    """Return the body of ``_step7_sort_and_split`` in ``step7_split_runtime``."""
+    src = source if source is not None else step7_split_runtime_source()
+    return module_level_def_body(src, "_step7_sort_and_split")
 
 
-def _find_duckdb_sort_and_split_body(source: str) -> str | None:
-    """Return the body of _duckdb_sort_and_split."""
-    start = source.find("def _duckdb_sort_and_split(")
-    if start == -1:
-        return None
-    rest = source[start:]
-    end_match = re.search(r"\n    def [a-z_]+\(|\n    # [0-9]+\. ", rest)
-    end = end_match.start() if end_match else len(rest)
-    return rest[:end]
+def _find_duckdb_sort_and_split_body(source: str | None = None) -> str | None:
+    """Return the body of ``_duckdb_sort_and_split`` in ``step7_split_runtime``."""
+    src = source if source is not None else step7_split_runtime_source()
+    return module_level_def_body(src, "_duckdb_sort_and_split")
 
 
 def _find_oom_check_body(source: str) -> str | None:
@@ -51,13 +47,14 @@ def _find_oom_check_body(source: str) -> str | None:
     return rest[:end]
 
 
-def _find_step7_main_block(source: str) -> str | None:
+def _find_step7_main_block(source: str | None = None) -> str | None:
     """Return the Step 7 main block (R803 + _step7_sort_and_split call)."""
+    src = source if source is not None else pipeline_implementation_source()
     marker = "# 5. Load all chunks, sort, row-level train/valid/test split"
-    start = source.find(marker)
+    start = src.find(marker)
     if start == -1:
         return None
-    rest = source[start : start + 3500]
+    rest = src[start : start + 3500]
     # Up to next step (Step 8 or active_feature_cols)
     end_m = re.search(r"active_feature_cols = get_all_candidate_feature_ids|# 5b\. Full-feature screening", rest)
     end = end_m.start() if end_m else len(rest)
@@ -80,8 +77,7 @@ class TestR177Step7SplitsCleanedAfterSuccess(unittest.TestCase):
 
     def test_r177_orchestrator_cleans_split_parquets_after_read(self):
         """Production _step7_sort_and_split should unlink train/valid/test parquets after successful read (PLAN Step 7)."""
-        source = _get_trainer_source()
-        body = _find_step7_sort_and_split_body(source)
+        body = _find_step7_sort_and_split_body()
         self.assertIsNotNone(body)
         # Contract: after read_parquet, should unlink/delete the three paths before return.
         has_unlink = "unlink" in body or "missing_ok" in body
@@ -97,8 +93,7 @@ class TestR177Step7UniqueOutputPath(unittest.TestCase):
 
     def test_r177_duckdb_uses_unique_step7_dir(self):
         """Production _duckdb_sort_and_split should use a unique subdir (pid/mkdtemp) under step7_splits."""
-        source = _get_trainer_source()
-        body = _find_duckdb_sort_and_split_body(source)
+        body = _find_duckdb_sort_and_split_body()
         self.assertIsNotNone(body)
         # Contract: step7_dir (or equivalent) should not be a single fixed path; should include pid or mkdtemp.
         uses_pid = "getpid" in body or "pid" in body
@@ -114,8 +109,7 @@ class TestR177DuckDBReadParquetNotPreparedList(unittest.TestCase):
 
     def test_r177_duckdb_read_parquet_avoids_prepared_list(self):
         """Production should not use con.execute('... read_parquet(?)', [path_list]) (Binder Error in some envs)."""
-        source = _get_trainer_source()
-        body = _find_duckdb_sort_and_split_body(source)
+        body = _find_duckdb_sort_and_split_body()
         self.assertIsNotNone(body)
         # Problematic pattern: read_parquet(?) with list argument (path_list).
         has_read_parquet_placeholder = "read_parquet(?" in body or 'read_parquet(?)' in body
@@ -155,8 +149,7 @@ class TestR177R803UsesValueErrorNotAssert(unittest.TestCase):
 
     def test_r177_step7_main_block_r803_value_error_not_assert(self):
         """Step 7 main block should validate TRAIN/VALID fractions with ValueError, not assert."""
-        source = _get_trainer_source()
-        block = _find_step7_main_block(source)
+        block = _find_step7_main_block()
         self.assertIsNotNone(block)
         for line in block.splitlines():
             if "assert" in line and ("TRAIN_SPLIT_FRAC" in line or "VALID_SPLIT_FRAC" in line):
@@ -170,7 +163,7 @@ class TestR177OrchestratorDocstringReadFallback(unittest.TestCase):
 
     def test_r177_step7_sort_and_split_docstring_mentions_read_fallback(self):
         """_step7_sort_and_split docstring should mention fallback on read failure using chunk_paths."""
-        source = _get_trainer_source()
+        source = step7_split_runtime_source()
         start = source.find("def _step7_sort_and_split(")
         if start == -1:
             self.fail("_step7_sort_and_split not found")

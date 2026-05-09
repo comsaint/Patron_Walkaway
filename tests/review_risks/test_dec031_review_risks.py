@@ -40,11 +40,13 @@ def _process_chunk_source_llm_to_labels() -> str:
     src = _read_top_level_function("trainer/training/trainer.py", "process_chunk")
     start = src.find("_bets_llm_result = compute_bet_duckdb_window_features")
     assert start != -1, "process_chunk must assign compute_bet_duckdb_window_features result"
-    # Stop before optional ``t_game`` block (it legitimately uses try/except) — DEC-031 scope is LLM→pre-t_game.
-    end = src.find("    # B2: optional ``t_game``", start)
+    # Stop before post-LLM section (formerly optional ``t_game``; removed under #34).
+    end = src.find("    # B2 ``t_game`` join removed", start)
+    if end == -1:
+        end = src.find("    # Trip layer (v0):", start)
     if end == -1:
         end = src.find("# --- Labels (C1 extended pull)", start)
-    assert end != -1, "process_chunk must retain B2 t_game or Labels marker after bet_duckdb_window"
+    assert end != -1, "process_chunk must retain Trip/Labels marker after bet_duckdb_window"
     return src[start:end]
 
 

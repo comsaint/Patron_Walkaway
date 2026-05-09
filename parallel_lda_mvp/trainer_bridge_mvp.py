@@ -332,7 +332,7 @@ def emit_trainer_local_parquet(
     """
     import duckdb
 
-    from trainer.training.trainer import _REQUIRED_BET_PARQUET_COLS
+    from trainer.training.common_runtime import _REQUIRED_BET_PARQUET_COLS
 
     snap_root = snap_root.resolve()
     data_dir = data_dir.resolve()
@@ -678,7 +678,7 @@ def validate_feature_spec_cli() -> int:
     """Load trainer feature spec; return 0 on success."""
     try:
         from trainer.features.features import load_feature_spec
-        from trainer.training.trainer import FEATURE_SPEC_PATH
+        from trainer.training.common_runtime import FEATURE_SPEC_PATH
     except ImportError as e:
         print(f"[Trainer bridge] import error: {e}", file=sys.stderr)
         return 1

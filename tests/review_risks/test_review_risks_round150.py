@@ -1,3 +1,5 @@
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import json
 import re
@@ -64,7 +66,7 @@ class TestR302SampleRatedValidationGuardrail(unittest.TestCase):
     def test_run_pipeline_has_positive_integer_guard_for_sample_rated(self):
         import trainer.trainer as trainer_mod
 
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         has_guard = bool(
             re.search(r"sample_rated_n\s*(<=\s*0|<\s*1)", src)
             and "--sample-rated" in src
@@ -82,7 +84,7 @@ class TestR303NoPreloadOrthogonalityGuardrail(unittest.TestCase):
     def test_r118_warning_condition_accounts_for_sample_rated(self):
         import trainer.trainer as trainer_mod
 
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn('no_preload = getattr(args, "no_preload", False)', src)
         self.assertNotIn("fast_mode", src, "run_pipeline should not reference removed fast_mode")
 

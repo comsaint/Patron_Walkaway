@@ -82,6 +82,34 @@ class TestFeatureIdUniqueness(unittest.TestCase):
         self.assertIn("dup_feat", str(ctx.exception))
 
 
+class TestNoClockMinuteWindowsInTemplate(unittest.TestCase):
+    """GitHub #34: Track LLM must not use RANGE INTERVAL … MINUTE windows."""
+
+    def test_track_llm_window_frames_have_no_interval_minute(self):
+        spec = features_mod.load_feature_spec(SPEC_YAML)
+        for cand in spec.get("track_llm", {}).get("candidates", []):
+            wf_u = (cand.get("window_frame") or "").upper()
+            self.assertNotIn(
+                "INTERVAL",
+                wf_u,
+                f"{cand.get('feature_id')}: window_frame must not use clock INTERVAL ({wf_u!r})",
+            )
+
+
+class TestNoTGameCandidatesInTemplate(unittest.TestCase):
+    """GitHub #34: dev catalog must not list join_t_game_features_for_bets."""
+
+    def test_track_human_has_no_t_game_join(self):
+        spec = features_mod.load_feature_spec(SPEC_YAML)
+        for cand in spec.get("track_human", {}).get("candidates", []):
+            fn = (cand.get("function_name") or "").lower()
+            self.assertNotEqual(
+                fn,
+                "join_t_game_features_for_bets",
+                f"Unexpected t_game candidate: {cand.get('feature_id')}",
+            )
+
+
 class TestNoFollowingInWindowFrame(unittest.TestCase):
     """Track LLM window_frame must not contain FOLLOWING."""
 

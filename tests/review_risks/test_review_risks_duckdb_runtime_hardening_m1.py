@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import unittest
 
@@ -25,7 +27,7 @@ class TestDuckDbRuntimeHardeningM1SourceContracts(unittest.TestCase):
         self.assertIn("apply_duckdb_runtime(", src_corr)
 
     def test_step7_and_canonical_use_shared_runtime_hooks(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn("resolve_duckdb_runtime_policy", src)
         self.assertIn("apply_duckdb_runtime", src)
         src_canonical = inspect.getsource(trainer_mod.build_canonical_links_and_dummy_from_duckdb)

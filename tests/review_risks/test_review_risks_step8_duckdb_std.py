@@ -6,6 +6,8 @@ contract/behavior tests. Tests-only: no production code changes.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import decimal
 import inspect
 import tempfile
@@ -211,7 +213,7 @@ class TestStep8TrainerCapAndPassThroughContract(unittest.TestCase):
 
     def test_step8_block_uses_cap_and_passes_train_path_or_train_df(self):
         """Step 8 block must define _cap (or equivalent), use head(_cap)/head(_sample_n), and pass train_path/train_df to screen_features."""
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         step8_marker = "Step 8 DuckDB std (PLAN)"
         self.assertIn(step8_marker, src, "Step 8 DuckDB cap/pass block must exist")
         # Must have cap (2_000_000 or STEP8_SCREEN_SAMPLE_ROWS)
@@ -240,7 +242,7 @@ class TestStep8TrainerCapAndPassThroughContract(unittest.TestCase):
     def test_step8_cap_equals_default_when_config_none(self):
         """When STEP8_SCREEN_SAMPLE_ROWS is None, effective cap should be 2_000_000 (source contract)."""
         import inspect
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         # Logic: _cap = int(STEP8...) if set else 2_000_000
         self.assertIn("2_000_000", src)
         idx = src.find("_cap = ")

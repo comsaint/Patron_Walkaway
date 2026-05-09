@@ -6,6 +6,8 @@ decorators have been removed and these tests now run as active guardrails.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import unittest
 
@@ -73,7 +75,7 @@ class TestR802FullDfReleaseGuard(unittest.TestCase):
     """R802: split path should release full_df to reduce RAM peak."""
 
     def test_run_pipeline_should_release_full_df_after_split(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn(
             "del full_df",
             src,
@@ -85,7 +87,7 @@ class TestR803SplitFracValidation(unittest.TestCase):
     """R803: split fractions should be validated (< 1.0 total)."""
 
     def test_run_pipeline_should_validate_split_fraction_sum(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn(
             "TRAIN_SPLIT_FRAC + VALID_SPLIT_FRAC < 1.0",
             src,
@@ -109,7 +111,7 @@ class TestR805SplitTimerLabeling(unittest.TestCase):
     """R805: timing label should reflect load/sort/split scope."""
 
     def test_run_pipeline_split_log_should_label_load_sort_split(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn(
             "load+sort+split",
             src,
@@ -121,7 +123,7 @@ class TestR806R700TimestampConstruction(unittest.TestCase):
     """R806: avoid string round-trip when constructing Timestamp from train_end."""
 
     def test_run_pipeline_should_avoid_timestamp_string_roundtrip(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertNotIn(
             "pd.Timestamp(str(train_end))",
             src,

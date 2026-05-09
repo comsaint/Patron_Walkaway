@@ -7,6 +7,8 @@ Pipeline diagnostics §3–§4 MLflow — Code Review 風險點 → 最小可重
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import pathlib
 import re
@@ -24,7 +26,7 @@ _PYPROJECT = _REPO_ROOT / "pyproject.toml"
 
 
 def _run_pipeline_src() -> str:
-    return inspect.getsource(trainer_mod.run_pipeline)
+    return pipeline_implementation_source()
 
 
 def _log_artifact_safe_src() -> str:

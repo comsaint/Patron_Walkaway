@@ -12,7 +12,7 @@ import hashlib
 import json
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from trainer.features.features import get_cross_layer_compose_contract, get_layer_for_feature
+from trainer.features.features import get_cross_layer_compose_contract
 from trainer.training.data_sources import _OPTIONAL_BET_LDA_RUN_TRIP_COLS
 
 
@@ -20,15 +20,19 @@ IMPACT_PLANNER_VERSION: str = "impact_planner_v3"
 
 
 def _infer_spec_track_layer(feature_id: str, spec: dict) -> Optional[str]:
-    """Return ``bet`` / ``run`` / ``player`` for a candidate declared in *spec*."""
-    for track, layer in (
-        ("track_llm", "bet"),
-        ("track_human", "run"),
-        ("track_profile", "player"),
-    ):
+    """Return ``bet`` / ``run`` / ``trip`` / ``player`` for a candidate in *spec*."""
+    track_default = {
+        "track_llm": "bet",
+        "track_human": "run",
+        "track_profile": "player",
+    }
+    for track in ("track_llm", "track_human", "track_profile"):
         for cand in (spec.get(track) or {}).get("candidates") or []:
             if isinstance(cand, dict) and str(cand.get("feature_id") or "") == feature_id:
-                return layer
+                tl = cand.get("target_layer")
+                if tl in ("bet", "run", "trip", "player"):
+                    return str(tl)
+                return str(track_default[track])
     return None
 
 
@@ -39,9 +43,6 @@ def resolve_materialization_layer(feature_id: str, spec: dict) -> str:
     lyr = _infer_spec_track_layer(feature_id, spec)
     if lyr is not None:
         return lyr
-    mapped = get_layer_for_feature(feature_id)
-    if mapped is not None:
-        return str(mapped)
     return "bet"
 
 

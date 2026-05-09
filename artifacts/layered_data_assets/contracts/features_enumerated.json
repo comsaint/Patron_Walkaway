@@ -1,12 +1,8 @@
 {
   "enumerator_version": "1",
   "source_spec_path": "trainer/feature_spec/feature_candidates.yaml",
-  "feature_count": 109,
+  "feature_count": 88,
   "features": [
-    {
-      "track_section": "track_human",
-      "feature_id": "banker_rate_w20games"
-    },
     {
       "track_section": "track_human",
       "feature_id": "bets_in_run_so_far"
@@ -18,10 +14,6 @@
     {
       "track_section": "track_human",
       "feature_id": "consecutive_non_win_cnt"
-    },
-    {
-      "track_section": "track_human",
-      "feature_id": "current_outcome_streak_len"
     },
     {
       "track_section": "track_human",
@@ -45,14 +37,6 @@
     },
     {
       "track_section": "track_human",
-      "feature_id": "patron_is_sole_player"
-    },
-    {
-      "track_section": "track_human",
-      "feature_id": "player_rate_w20games"
-    },
-    {
-      "track_section": "track_human",
       "feature_id": "run_duration_vs_personal_avg"
     },
     {
@@ -61,31 +45,11 @@
     },
     {
       "track_section": "track_human",
-      "feature_id": "table_net_outcome_w15m"
-    },
-    {
-      "track_section": "track_human",
-      "feature_id": "table_num_players"
-    },
-    {
-      "track_section": "track_human",
-      "feature_id": "table_turnover_w5m_over_w15m"
-    },
-    {
-      "track_section": "track_human",
-      "feature_id": "tie_rate_w20games"
-    },
-    {
-      "track_section": "track_human",
       "feature_id": "wager_sum_in_run_so_far"
     },
     {
       "track_section": "track_llm",
-      "feature_id": "avg_payout_odds_w15m"
-    },
-    {
-      "track_section": "track_llm",
-      "feature_id": "avg_wager_sofar"
+      "feature_id": "avg_payout_odds_currentrun"
     },
     {
       "track_section": "track_llm",
@@ -101,27 +65,7 @@
     },
     {
       "track_section": "track_llm",
-      "feature_id": "bets_cnt_w15m"
-    },
-    {
-      "track_section": "track_llm",
       "feature_id": "bets_cnt_w20"
-    },
-    {
-      "track_section": "track_llm",
-      "feature_id": "bets_cnt_w30m"
-    },
-    {
-      "track_section": "track_llm",
-      "feature_id": "bets_cnt_w5m"
-    },
-    {
-      "track_section": "track_llm",
-      "feature_id": "cum_bets"
-    },
-    {
-      "track_section": "track_llm",
-      "feature_id": "cum_wager"
     },
     {
       "track_section": "track_llm",
@@ -133,39 +77,15 @@
     },
     {
       "track_section": "track_llm",
-      "feature_id": "lda_l1_run_bet_count"
+      "feature_id": "lose_cnt_currentrun"
     },
     {
       "track_section": "track_llm",
-      "feature_id": "lda_l1_run_duration_min"
-    },
-    {
-      "track_section": "track_llm",
-      "feature_id": "lda_run_ord_in_trip"
-    },
-    {
-      "track_section": "track_llm",
-      "feature_id": "lda_trip_is_closed"
-    },
-    {
-      "track_section": "track_llm",
-      "feature_id": "lda_trip_run_count"
-    },
-    {
-      "track_section": "track_llm",
-      "feature_id": "lose_cnt_w15m"
-    },
-    {
-      "track_section": "track_llm",
-      "feature_id": "non_win_rate_w15m"
+      "feature_id": "non_win_rate_currentrun"
     },
     {
       "track_section": "track_llm",
       "feature_id": "pace_drop_ratio"
-    },
-    {
-      "track_section": "track_llm",
-      "feature_id": "pace_drop_ratio_w15m_w30m"
     },
     {
       "track_section": "track_llm",
@@ -177,15 +97,15 @@
     },
     {
       "track_section": "track_llm",
-      "feature_id": "position_max_w30m"
+      "feature_id": "position_max_currentrun"
     },
     {
       "track_section": "track_llm",
-      "feature_id": "position_min_w30m"
+      "feature_id": "position_min_currentrun"
     },
     {
       "track_section": "track_llm",
-      "feature_id": "position_moved_w30m"
+      "feature_id": "position_moved_currentrun"
     },
     {
       "track_section": "track_llm",
@@ -205,7 +125,7 @@
     },
     {
       "track_section": "track_llm",
-      "feature_id": "push_cnt_w15m"
+      "feature_id": "push_cnt_currentrun"
     },
     {
       "track_section": "track_llm",
@@ -221,19 +141,15 @@
     },
     {
       "track_section": "track_llm",
-      "feature_id": "wager_avg_w15m"
+      "feature_id": "wager_avg_currentrun"
     },
     {
       "track_section": "track_llm",
-      "feature_id": "wager_avg_w5m"
+      "feature_id": "wager_avg_tail5_in_run"
     },
     {
       "track_section": "track_llm",
-      "feature_id": "wager_max_w15m"
-    },
-    {
-      "track_section": "track_llm",
-      "feature_id": "wager_recent_vs_session_avg"
+      "feature_id": "wager_max_currentrun"
     },
     {
       "track_section": "track_llm",
@@ -241,23 +157,23 @@
     },
     {
       "track_section": "track_llm",
-      "feature_id": "wager_std_w15m"
+      "feature_id": "wager_std_currentrun"
     },
     {
       "track_section": "track_llm",
-      "feature_id": "wager_sum_w30m"
+      "feature_id": "wager_tail5_over_run_avg"
     },
     {
       "track_section": "track_llm",
-      "feature_id": "wager_w5m_over_w15m"
+      "feature_id": "wager_vs_run_avg_ratio"
     },
     {
       "track_section": "track_llm",
-      "feature_id": "win_cnt_w15m"
+      "feature_id": "win_cnt_currentrun"
     },
     {
       "track_section": "track_llm",
-      "feature_id": "win_rate_w15m"
+      "feature_id": "win_rate_currentrun"
     },
     {
       "track_section": "track_profile",

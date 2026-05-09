@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from package.build_deploy_package import copy_model_bundle
+from trainer.core import training_artifact_bundle as training_artifact_bundle_mod
 from trainer.training import trainer as trainer_mod
 
 
@@ -53,7 +54,7 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             model_dir = Path(td)
-            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+            with patch.object(training_artifact_bundle_mod, "MODEL_DIR", model_dir):
                 trainer_mod._write_pipeline_diagnostics_json(
                     model_version="test-mv-1",
                     pipeline_started_at="2026-03-21T00:00:00+00:00",
@@ -84,7 +85,7 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             model_dir = Path(td)
-            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+            with patch.object(training_artifact_bundle_mod, "MODEL_DIR", model_dir):
                 trainer_mod._write_pipeline_diagnostics_json(
                     model_version="mv",
                     pipeline_started_at="2026-03-21T10:00:00+00:00",
@@ -118,7 +119,7 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             model_dir = Path(td)
-            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+            with patch.object(training_artifact_bundle_mod, "MODEL_DIR", model_dir):
                 trainer_mod._write_pipeline_diagnostics_json(
                     model_version="mv",
                     pipeline_started_at="2026-03-21T10:00:00+00:00",
@@ -141,7 +142,7 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             model_dir = Path(td)
-            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+            with patch.object(training_artifact_bundle_mod, "MODEL_DIR", model_dir):
                 trainer_mod._write_pipeline_diagnostics_json(
                     model_version="z",
                     pipeline_started_at="2026-01-01T00:00:00+00:00",
@@ -159,7 +160,7 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             model_dir = Path(td)
-            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+            with patch.object(training_artifact_bundle_mod, "MODEL_DIR", model_dir):
                 trainer_mod._write_pipeline_diagnostics_json(
                     model_version="mv",
                     pipeline_started_at="2026-03-22T00:00:00+00:00",
@@ -184,7 +185,7 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             model_dir = Path(td)
-            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+            with patch.object(training_artifact_bundle_mod, "MODEL_DIR", model_dir):
                 trainer_mod._write_pipeline_diagnostics_json(
                     model_version="z",
                     pipeline_started_at="a",
@@ -201,7 +202,7 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             model_dir = Path(td)
-            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+            with patch.object(training_artifact_bundle_mod, "MODEL_DIR", model_dir):
                 trainer_mod._write_pipeline_diagnostics_json(
                     model_version="mv",
                     pipeline_started_at="2026-03-24T00:00:00+00:00",
@@ -222,7 +223,7 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             model_dir = Path(td)
-            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+            with patch.object(training_artifact_bundle_mod, "MODEL_DIR", model_dir):
                 trainer_mod._write_pipeline_diagnostics_json(
                     model_version="mv",
                     pipeline_started_at="2026-05-07T00:00:00+00:00",
@@ -240,7 +241,7 @@ class TestWritePipelineDiagnosticsJsonShape(unittest.TestCase):
         audit = {"manifest_version": "feature_materialization_audit_v1", "declared_feature_count": 3}
         with tempfile.TemporaryDirectory() as td:
             model_dir = Path(td)
-            with patch.object(trainer_mod, "MODEL_DIR", model_dir):
+            with patch.object(training_artifact_bundle_mod, "MODEL_DIR", model_dir):
                 trainer_mod._write_pipeline_diagnostics_json(
                     model_version="mv",
                     pipeline_started_at="2026-05-08T00:00:00+00:00",

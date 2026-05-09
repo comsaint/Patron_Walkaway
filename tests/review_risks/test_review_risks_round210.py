@@ -6,6 +6,8 @@ Unfixed risks are encoded as expected failures so they stay visible.
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import unittest
 
@@ -74,7 +76,7 @@ class TestR903StaleFeatureDefsCleanup(unittest.TestCase):
     """R903: run_pipeline should load Track LLM feature spec before chunk loop."""
 
     def test_run_pipeline_should_load_feature_spec(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertIn(
             "load_feature_spec(",
             src,
@@ -115,7 +117,7 @@ class TestR906FirstChunkDoubleLoad(unittest.TestCase):
     """R906: no legacy run_afg plumbing should remain after Track LLM migration."""
 
     def test_run_pipeline_should_not_pass_run_afg(self):
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertNotIn(
             "run_afg=",
             src,

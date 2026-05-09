@@ -6,6 +6,8 @@ STATUS.md「Code Review：§5 Provenance」風險點 → 最小可重現／契�
 
 from __future__ import annotations
 
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 import inspect
 import pathlib
 import re
@@ -21,7 +23,7 @@ _PLAN_PIPELINE = _REPO_ROOT / "doc" / "plan_pipeline_diagnostics_and_mlflow_arti
 
 
 def _run_pipeline_src() -> str:
-    return inspect.getsource(trainer_mod.run_pipeline)
+    return pipeline_implementation_source()
 
 
 def _artifact_dir_with_empty_path_name() -> str | None:

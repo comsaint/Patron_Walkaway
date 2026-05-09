@@ -1,3 +1,5 @@
+
+from tests.support.trainer_source_contracts import pipeline_implementation_source
 """Minimal reproducible tests for Round 123 Review risks (tests-only, no production changes).
 
 R123-1: Trainer should coerce dtypes before training to prevent LightGBM crash on object columns.
@@ -24,7 +26,7 @@ class TestRound123Risks(unittest.TestCase):
         """R123-2: R1001 fallback must not use hardcoded TRACK_B_FEATURE_COLS; should use
         get_candidate_feature_ids(feature_spec, 'track_human', ...) from YAML (SSOT)."""
         import trainer.trainer as trainer_mod
-        src = inspect.getsource(trainer_mod.run_pipeline)
+        src = pipeline_implementation_source()
         self.assertNotIn(
             "TRACK_B_FEATURE_COLS",
             src,

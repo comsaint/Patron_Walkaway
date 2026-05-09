@@ -96,13 +96,13 @@ class TestWave2PersonalizedBaselines(unittest.TestCase):
                 "bets_in_run_so_far": [5],
                 "num_bets_sum_30d": [120.0],
                 "sessions_30d": [10.0],
-                "bets_cnt_w15m": [6.0],
             }
         )
         out = features_mod.add_wave2_personalized_baselines(df)
         self.assertAlmostEqual(float(out.loc[0, "run_duration_vs_personal_avg"]), 0.5)
         self.assertAlmostEqual(float(out.loc[0, "bets_in_run_vs_personal_avg"]), 5.0 / 12.0)
-        self.assertAlmostEqual(float(out.loc[0, "pace_vs_personal_baseline"]), 2.0)
+        # Run pace (bets/min) vs player 30d baseline: (5/30) / (120/(10*60)).
+        self.assertAlmostEqual(float(out.loc[0, "pace_vs_personal_baseline"]), (5.0 / 30.0) / 0.2)
 
     def test_add_wave2_personalized_baselines_default_mutates_in_place(self) -> None:
         df = pd.DataFrame({"minutes_since_run_start": [10.0]})
