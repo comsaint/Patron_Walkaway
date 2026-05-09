@@ -184,8 +184,8 @@ def run_pipeline_core(args) -> None:
             duckdb_runtime_step7_threads: Optional[int] = None
             duckdb_runtime_screening_memory_gb: Optional[float] = None
             duckdb_runtime_screening_threads: Optional[int] = None
-            duckdb_runtime_track_llm_memory_gb: Optional[float] = None
-            duckdb_runtime_track_llm_threads: Optional[int] = None
+            duckdb_runtime_bet_duckdb_window_memory_gb: Optional[float] = None
+            duckdb_runtime_bet_duckdb_window_threads: Optional[int] = None
             # Task 7 DoD: Step 6 chunk cache counters -> pipeline_diagnostics.json
             chunk_cache_stats: Dict[str, int] = {}
             issue16_gate_report: Optional[Dict[str, Any]] = None
@@ -344,6 +344,10 @@ def run_pipeline_core(args) -> None:
             dummy_player_ids: set = set()
             rebuild_canonical = getattr(args, "rebuild_canonical_mapping", False)
             _canonical_built = False
+            _canonical_source_snapshot_id = read_bridge_source_snapshot_id() if use_local else None
+            _canonical_bridge_manifest_stat = (
+                l2_bundle_materialize.bridge_manifest_stat_token() if use_local else None
+            )
             # PLAN step 8: try load existing artifact once (use_local and ClickHouse paths both skip build if ok)
             loaded_from_artifact = False
             if not rebuild_canonical and CANONICAL_MAPPING_PARQUET.exists() and CANONICAL_MAPPING_CUTOFF_JSON.exists():
@@ -354,7 +358,27 @@ def run_pipeline_core(args) -> None:
                     _cutoff_ts = pd.Timestamp(_cutoff_str) if _cutoff_str else None
                     if _cutoff_ts is not None:
                         _cutoff_naive = _cutoff_ts.replace(tzinfo=None) if _cutoff_ts.tz else _cutoff_ts
-                        if _cutoff_naive >= train_end:
+                        _source_guard_reasons: List[str] = []
+                        if use_local:
+                            _sidecar_source_snapshot_id = (
+                                str(_sidecar.get("source_snapshot_id") or "").strip() or None
+                            )
+                            _sidecar_bridge_manifest_stat = (
+                                str(_sidecar.get("bridge_manifest_stat") or "").strip() or None
+                            )
+                            if _canonical_source_snapshot_id != _sidecar_source_snapshot_id:
+                                _source_guard_reasons.append(
+                                    "source_snapshot_id mismatch "
+                                    f"(sidecar={_sidecar_source_snapshot_id!r}, "
+                                    f"current={_canonical_source_snapshot_id!r})"
+                                )
+                            if _canonical_bridge_manifest_stat != _sidecar_bridge_manifest_stat:
+                                _source_guard_reasons.append(
+                                    "bridge_manifest_stat mismatch "
+                                    f"(sidecar={_sidecar_bridge_manifest_stat!r}, "
+                                    f"current={_canonical_bridge_manifest_stat!r})"
+                                )
+                        if _cutoff_naive >= train_end and not _source_guard_reasons:
                             canonical_map = pd.read_parquet(CANONICAL_MAPPING_PARQUET)
                             if set(canonical_map.columns) >= {"player_id", "canonical_id"}:
                                 dummy_player_ids = set(_sidecar.get("dummy_player_ids") or [])
@@ -368,6 +392,11 @@ def run_pipeline_core(args) -> None:
                                 logger.warning(
                                     "Canonical mapping artifact missing required columns; will rebuild"
                                 )
+                        elif _source_guard_reasons:
+                            logger.warning(
+                                "Canonical mapping artifact source guard failed (%s); will rebuild",
+                                "; ".join(_source_guard_reasons),
+                            )
                 except Exception as exc:
                     logger.warning("Load canonical mapping artifact failed (%s); will rebuild", exc)
         
@@ -412,7 +441,12 @@ def run_pipeline_core(args) -> None:
                         _cutoff_iso = train_end.isoformat() if hasattr(train_end, "isoformat") else str(train_end)
                         with open(CANONICAL_MAPPING_CUTOFF_JSON, "w", encoding="utf-8") as _f:
                             json.dump(
-                                {"cutoff_dtm": _cutoff_iso, "dummy_player_ids": list(dummy_player_ids)},
+                                {
+                                    "cutoff_dtm": _cutoff_iso,
+                                    "dummy_player_ids": list(dummy_player_ids),
+                                    "source_snapshot_id": _canonical_source_snapshot_id,
+                                    "bridge_manifest_stat": _canonical_bridge_manifest_stat,
+                                },
                                 _f,
                                 indent=0,
                             )
@@ -437,7 +471,12 @@ def run_pipeline_core(args) -> None:
                         _cutoff_iso = train_end.isoformat() if hasattr(train_end, "isoformat") else str(train_end)
                         with open(CANONICAL_MAPPING_CUTOFF_JSON, "w", encoding="utf-8") as _f:
                             json.dump(
-                                {"cutoff_dtm": _cutoff_iso, "dummy_player_ids": list(dummy_player_ids)},
+                                {
+                                    "cutoff_dtm": _cutoff_iso,
+                                    "dummy_player_ids": list(dummy_player_ids),
+                                    "source_snapshot_id": _canonical_source_snapshot_id,
+                                    "bridge_manifest_stat": _canonical_bridge_manifest_stat,
+                                },
                                 _f,
                                 indent=0,
                             )
@@ -467,6 +506,9 @@ def run_pipeline_core(args) -> None:
                     _sidecar_data["cutoff_dtm"] = _te_iso
                 if "dummy_player_ids" not in _sidecar_data:
                     _sidecar_data["dummy_player_ids"] = list(dummy_player_ids)
+                if use_local:
+                    _sidecar_data["source_snapshot_id"] = _canonical_source_snapshot_id
+                    _sidecar_data["bridge_manifest_stat"] = _canonical_bridge_manifest_stat
                 _sidecar_data["identity_mapping_mode"] = effective_identity_mode
                 _sidecar_data["t_game_features_enabled"] = bool(
                     getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)
@@ -549,14 +591,10 @@ def run_pipeline_core(args) -> None:
                 )
 
             pipeline_step_set("Step 4/11")
-            # 3b. Auto-check local player_profile freshness and backfill missing
-            #     ranges before training starts (one-command flow, OOM-safe helper).
-            # Unified pipeline: when track_profile is off in YAML, skip legacy ETL entirely.
-            _player_asset_raw = (os.environ.get("TRAINER_PLAYER_LAYER_ASSET_PATH") or "").strip()
             profile_df = None
             step4_duration_sec = 0.0
             step5_duration_sec = 0.0
-            _skip_legacy_player_profile_etl = False
+            _player_run_gate = False
             try:
                 import yaml as _yaml_gate
                 from pathlib import Path as _Path_gate
@@ -566,114 +604,51 @@ def run_pipeline_core(args) -> None:
                 _raw_gate = _yaml_gate.safe_load(
                     _Path_gate(FEATURE_SPEC_PATH).read_text(encoding="utf-8")
                 ) or {}
-                _skip_legacy_player_profile_etl = not _track_section_enabled_in_spec(
-                    _raw_gate, "track_profile"
-                )
+                _player_run_gate = _track_section_enabled_in_spec(_raw_gate, "player_run_asset")
             except Exception as _gate_exc:
-                logger.debug("player_profile ETL gate: spec read failed (%s)", _gate_exc)
+                logger.debug("player_run_asset gate: spec read failed (%s)", _gate_exc)
 
-            if _player_asset_raw:
+            if _player_run_gate and use_local:
                 pipeline_echo(
-                    "Step 4/11 — Skip ensure_player_profile_ready (TRAINER_PLAYER_LAYER_ASSET_PATH set) …"
+                    "Step 4/11 — Ensure layered player/run assets ready "
+                    "(L1 run_fact / run_bet_map for bridge snapshot) …"
+                )
+                t0 = time.perf_counter()
+                from trainer.features.player_run_layer import ensure_player_run_layer_assets_ready
+
+                ensure_player_run_layer_assets_ready()
+                step4_duration_sec = time.perf_counter() - t0
+                pipeline_echo(f"Step 4/11 — done in {step4_duration_sec:.1f}s")
+                logger.info("ensure_player_run_layer_assets_ready: %.1fs", step4_duration_sec)
+            elif _player_run_gate and not use_local:
+                raise RuntimeError(
+                    "feature spec enables player_run_asset but --use-local-parquet was not set. "
+                    "Run-primitive player features require local Parquet + data/l1_layered assets."
+                )
+            else:
+                pipeline_echo(
+                    "Step 4/11 — Skip layered player/run asset check "
+                    "(player_run_asset disabled in feature spec) …"
                 )
                 step4_duration_sec = 0.0
-                pipeline_echo("Step 4/11 — skipped (player layer asset mode)")
-                logger.info(
-                    "player_profile ensure skipped: using TRAINER_PLAYER_LAYER_ASSET_PATH=%s",
-                    _player_asset_raw,
-                )
-            elif _skip_legacy_player_profile_etl:
-                pipeline_echo(
-                    "Step 4/11 — Skip player_profile ETL (track_profile disabled in feature spec) …"
-                )
-                pipeline_echo("Step 4/11 — skipped (unified pipeline; no legacy player_profile parquet)")
-                logger.info(
-                    "player_profile ensure skipped: track_profile disabled — "
-                    "unified features on bets/sessions only"
-                )
-            else:
-                pipeline_echo("Step 4/11 — Ensure player_profile ready (backfill if needed) …")
-                t0 = time.perf_counter()
-                ensure_player_profile_ready(
-                    effective_start,
-                    effective_end,
-                    use_local_parquet=use_local,
-                    canonical_id_whitelist=rated_whitelist,
-                    snapshot_interval_days=1,
-                    preload_sessions=not no_preload,
-                    canonical_map=canonical_map,
-                    max_lookback_days=365,
-                )
-                _el = time.perf_counter() - t0
-                step4_duration_sec = _el
-                pipeline_echo(f"Step 4/11 — done in {_el:.1f}s")
-                logger.info("ensure_player_profile_ready: %.1fs", _el)
 
             pipeline_step_set("Step 5/11")
-            # 3c. Load player_profile once for the entire training window (PLAN Step 4).
-            #     Pass the resulting DataFrame to every process_chunk call so each chunk
-            #     can do the PIT/as-of join without re-querying.  If load fails, profile
-            #     features are 0 for all rows (graceful degradation).
-            # R404 Review #1: empty map → [] so load_player_profile does not load full table (train-serve parity with backtester).
-            _rated_cids: Optional[List[str]] = (
-                list(rated_whitelist)
-                if rated_whitelist
-                else (
-                    canonical_map["canonical_id"].astype(str).tolist()
-                    if not canonical_map.empty
-                    else []
+            if _player_run_gate:
+                pipeline_echo(
+                    "Step 5/11 — Load layered player assets for PIT materialization "
+                    "(inline per chunk via run_fact/run_bet_map; no player_profile parquet) …"
                 )
-            )
-            if _player_asset_raw:
-                pipeline_echo("Step 5/11 — Load player layer asset (TRAINER_PLAYER_LAYER_ASSET_PATH) …")
-                t0 = time.perf_counter()
-                try:
-                    profile_df = load_player_layer_asset_parquet(Path(_player_asset_raw))
-                    _el = time.perf_counter() - t0
-                    step5_duration_sec = _el
-                    pipeline_echo(f"Step 5/11 — done in {_el:.1f}s ({len(profile_df)} asset rows)")
-                    logger.info(
-                        "player layer asset: loaded %d rows from %s (%.1fs)",
-                        len(profile_df),
-                        _player_asset_raw,
-                        _el,
-                    )
-                except Exception as exc:
-                    profile_df = None
-                    _el = time.perf_counter() - t0
-                    step5_duration_sec = _el
-                    pipeline_echo(
-                        f"Step 5/11 — done in {_el:.1f}s "
-                        "(asset load failed; profile features will be NaN)"
-                    )
-                    logger.warning(
-                        "player layer asset load failed from %s: %s; "
-                        "profile features will be NaN for this run.",
-                        _player_asset_raw,
-                        exc,
-                    )
-            elif _skip_legacy_player_profile_etl:
-                pipeline_echo("Step 5/11 — Skip load player_profile (track_profile disabled) …")
-                pipeline_echo("Step 5/11 — skipped")
                 step5_duration_sec = 0.0
-                logger.info("player_profile load skipped: track_profile disabled in feature spec")
-            else:
-                pipeline_echo("Step 5/11 — Load player_profile for PIT join …")
-                t0 = time.perf_counter()
-                profile_df = load_player_profile(
-                    effective_start,
-                    effective_end,
-                    use_local_parquet=use_local,
-                    canonical_ids=_rated_cids,
+                logger.info(
+                    "Step 5: skipping player_profile load — compute_player_layer_features "
+                    "materializes player_run_asset per chunk"
                 )
-                _el = time.perf_counter() - t0
-                step5_duration_sec = _el
-                if profile_df is not None:
-                    pipeline_echo(f"Step 5/11 — done in {_el:.1f}s ({len(profile_df)} profile rows)")
-                    logger.info("player_profile: loaded %d snapshot rows for PIT join (%.1fs)", len(profile_df), _el)
-                else:
-                    pipeline_echo(f"Step 5/11 — done in {_el:.1f}s (profile not available)")
-                    logger.info("player_profile: not available — profile features will be NaN (%.1fs)", _el)
+            else:
+                pipeline_echo(
+                    "Step 5/11 — Skip player-layer preload (player_run_asset disabled) …"
+                )
+                step5_duration_sec = 0.0
+                logger.info("Step 5: player_run_asset disabled — no player-layer preload")
 
             pipeline_step_set("Step 6/11")
             feature_spec = load_feature_spec(FEATURE_SPEC_PATH)
