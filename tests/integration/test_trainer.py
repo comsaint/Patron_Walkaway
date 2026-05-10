@@ -726,6 +726,7 @@ class TestRefactorGuardrailsArtifactBundle(unittest.TestCase):
         src = pl2.read_text(encoding="utf-8")
         self.assertIn("training_metrics.v3.json", src)
         self.assertIn("log_artifact_safe", src)
+        self.assertIn("log_metrics_safe", src)
         self.assertIn("MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH", src)
 
     def test_save_artifact_bundle_does_not_revive_legacy_dual_pkl(self):

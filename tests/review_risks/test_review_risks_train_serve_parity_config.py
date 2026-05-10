@@ -30,10 +30,12 @@ def _bets(rows, canonical_id="P1", table_id="T1", player_id=1):
         else:
             offset_min, bid = item
             status = "LOSE"
+        pcd = _BASE + timedelta(minutes=offset_min)
         records.append({
             "canonical_id": canonical_id,
             "bet_id": bid,
-            "payout_complete_dtm": _BASE + timedelta(minutes=offset_min),
+            "payout_complete_dtm": pcd,
+            "gaming_day": pcd.date(),
             "status": status,
             "table_id": table_id,
             "player_id": player_id,
@@ -68,10 +70,10 @@ class TestScorerLookbackHoursTypeContract(unittest.TestCase):
 
 
 class TestTrackHumanParitySameLookback(unittest.TestCase):
-    """PLAN § Train–Serve Parity 步驟 3：同一批 bets、相同 lookback_hours 時，Track Human 產出一致。"""
+    """Train–serve parity：同一批 bets、同一 window_end（無 lookback 視窗）時 Track Human 產出一致。"""
 
     def test_add_run_state_machine_features_deterministic_for_same_lookback(self):
-        """相同 (bets, canonical_map, window_end, lookback_hours=8) 呼叫兩次，Track Human 欄位數值一致。"""
+        """相同 (bets, canonical_map, window_end) 呼叫兩次，Track Human 欄位數值一致。"""
         from trainer.trainer import add_run_state_machine_features
 
         rows = [(0, 1, "LOSE"), (10, 2, "LOSE"), (20, 3, "WIN"), (30, 4, "LOSE")]
@@ -79,10 +81,9 @@ class TestTrackHumanParitySameLookback(unittest.TestCase):
         bets["wager"] = 1.0
         canonical_map = pd.DataFrame({"player_id": [1], "canonical_id": ["P1"]})
         window_end = _BASE + timedelta(minutes=25)
-        lookback_hours = 8.0
 
-        out1 = add_run_state_machine_features(bets, canonical_map, window_end, lookback_hours=lookback_hours)
-        out2 = add_run_state_machine_features(bets, canonical_map, window_end, lookback_hours=lookback_hours)
+        out1 = add_run_state_machine_features(bets, canonical_map, window_end, lookback_hours=None)
+        out2 = add_run_state_machine_features(bets, canonical_map, window_end, lookback_hours=None)
 
         for col in TRACK_HUMAN_COLS:
             self.assertIn(col, out1.columns, f"missing col {col} in out1")

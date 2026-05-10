@@ -32,32 +32,23 @@ def _json_dump(payload: Any) -> str:
     return json.dumps(payload, indent=2, default=str) + "\n"
 
 
-def _mode_to_precision_type(mode: Any) -> str:
-    if mode == "precision_prod_adjusted":
-        return "prod_adjusted"
-    if mode == "precision_raw":
-        return "raw"
-    return "raw"
-
-
 def _val_field_test_block(rated: Mapping[str, Any]) -> Dict[str, Any]:
-    mode = rated.get("val_field_test_primary_score_mode")
-    ptype = _mode_to_precision_type(mode)
-    prec = rated.get("val_field_test_primary_score")
+    """Field-test slice reports empirical val precision only (raw)."""
+    prec = rated.get("val_precision")
     if prec is None or (isinstance(prec, float) and not math.isfinite(prec)):
-        prec = rated.get("val_precision")
-    if prec is not None and isinstance(prec, float) and not math.isfinite(prec):
         prec = None
-    return {"precision": prec, "precision_type": ptype}
+    elif isinstance(prec, (int, float)):
+        prec = float(prec)
+    return {"precision": prec, "precision_type": "raw"}
 
 
 def _test_field_test_block(rated: Mapping[str, Any]) -> Dict[str, Any]:
-    adj = rated.get("test_precision_prod_adjusted")
-    if adj is not None and isinstance(adj, float) and math.isfinite(adj):
-        return {"precision": float(adj), "precision_type": "prod_adjusted"}
+    """Field-test slice reports empirical test precision only (raw)."""
     raw = rated.get("test_precision")
-    if raw is not None and isinstance(raw, float) and not math.isfinite(raw):
+    if raw is None or (isinstance(raw, float) and not math.isfinite(raw)):
         raw = None
+    elif isinstance(raw, (int, float)):
+        raw = float(raw)
     return {"precision": raw, "precision_type": "raw"}
 
 
@@ -76,7 +67,6 @@ def _strip_val_test_noise(d: MutableMapping[str, Any], *, prefix: str) -> None:
     if prefix == "val_":
         for noisy in ("field_test_primary_score", "field_test_primary_score_mode"):
             d.pop(noisy, None)
-    # test side uses prod_adjusted keys only for field_test block; keep flat test_precision* for convenience.
 
 
 def build_datasets_section(rated: Mapping[str, Any]) -> Dict[str, Any]:
@@ -210,35 +200,59 @@ def _neg_pos_ratio_three_splits(row: Mapping[str, Any]) -> Dict[str, Dict[str, A
     }
 
 
+def _unique_canonical_rated_splits_from_hr(
+    hr: Mapping[str, Any], segment: str
+) -> Optional[Dict[str, Any]]:
+    """Map Issue #8 audit keys to train/val/test distinct canonical_id (rated rows)."""
+    side = str(segment).strip().lower()
+    if side not in ("high", "low"):
+        return None
+    keys = (
+        (f"high_roller_segment_train_rated_unique_canonical_{side}", "train"),
+        (f"high_roller_segment_valid_rated_unique_canonical_{side}", "val"),
+        (f"high_roller_segment_test_rated_unique_canonical_{side}", "test"),
+    )
+    out: Dict[str, Any] = {}
+    any_set = False
+    for hk, split in keys:
+        v = _int_nonneg(hr.get(hk))
+        out[split] = v
+        if v is not None:
+            any_set = True
+    return out if any_set else None
+
+
 def build_neg_pos_ratio_overview(
     metrics_root: Mapping[str, Any], rated: Mapping[str, Any]
 ) -> Dict[str, Any]:
     """V3 one-page table: primary rated model + Issue #8 segment rows (same three splits each)."""
+    hr_raw = metrics_root.get("high_roller_segmentation")
+    hr: Dict[str, Any] = hr_raw if isinstance(hr_raw, dict) else {}
+
+    def _segment_entry(seg_label: str, splits_blob: Mapping[str, Any]) -> Dict[str, Any]:
+        entry: Dict[str, Any] = {
+            "segment": seg_label,
+            "splits": _neg_pos_ratio_three_splits(splits_blob),
+        }
+        uc = _unique_canonical_rated_splits_from_hr(hr, seg_label)
+        if uc is not None:
+            entry["unique_canonical_rated"] = uc
+        return entry
+
     segments: list[Dict[str, Any]] = []
     for seg_label, root_key in (("high", "segment_high"), ("low", "segment_low")):
         blob = metrics_root.get(root_key)
         if isinstance(blob, dict) and blob:
-            segments.append(
-                {
-                    "segment": seg_label,
-                    "splits": _neg_pos_ratio_three_splits(blob),
-                }
-            )
+            segments.append(_segment_entry(seg_label, blob))
     if not segments:
-        hr = metrics_root.get("high_roller_segmentation")
-        if isinstance(hr, dict):
+        if hr:
             for seg_label, mk in (
                 ("high", "high_segment_metrics"),
                 ("low", "low_segment_metrics"),
             ):
                 blob = hr.get(mk)
                 if isinstance(blob, dict) and blob:
-                    segments.append(
-                        {
-                            "segment": seg_label,
-                            "splits": _neg_pos_ratio_three_splits(blob),
-                        }
-                    )
+                    segments.append(_segment_entry(seg_label, blob))
     return {
         "neg_pos_ratio_contract": "n_neg / n_pos",
         "primary_model": _neg_pos_ratio_three_splits(rated),
@@ -260,36 +274,25 @@ def _derive_selection_metric_id(rated: Mapping[str, Any]) -> str:
 
 
 def _val_field_test_block_v3(rated: Mapping[str, Any]) -> Dict[str, Any]:
+    """V3 field_test: actual (empirical) val precision only."""
     raw_p = _finite_float(rated.get("val_precision"))
-    primary = _finite_float(rated.get("val_field_test_primary_score"))
-    mode = rated.get("val_field_test_primary_score_mode")
-    prod_adj: Optional[float] = None
-    if mode == "precision_prod_adjusted" and primary is not None:
-        prod_adj = primary
-    used = primary if primary is not None else raw_p
     return {
         "precision_raw": raw_p,
-        "precision_used_for_selection": used,
-        "precision_prod_adjusted": prod_adj,
-        "precision_type": _mode_to_precision_type(mode),
+        "precision_type": "raw",
     }
 
 
 def _test_field_test_block_v3(rated: Mapping[str, Any]) -> Dict[str, Any]:
+    """V3 field_test: actual (empirical) test precision only."""
     raw_p = _finite_float(rated.get("test_precision"))
-    adj = _finite_float(rated.get("test_precision_prod_adjusted"))
-    used = adj if adj is not None else raw_p
-    ptype = "prod_adjusted" if adj is not None else "raw"
     return {
         "precision_raw": raw_p,
-        "precision_used_for_selection": used,
-        "precision_prod_adjusted": adj,
-        "precision_type": ptype,
+        "precision_type": "raw",
     }
 
 
 def build_datasets_section_v3(rated: Mapping[str, Any]) -> Dict[str, Any]:
-    """Same split prefixes as v2, with v3 ``field_test`` diagnostics (prod-adjust optional)."""
+    """Same split prefixes as v2, with v3 ``field_test`` reporting raw precision only."""
     train = _split_prefixed_metrics(rated, "train_")
     val = _split_prefixed_metrics(rated, "val_")
     test = _split_prefixed_metrics(rated, "test_")

@@ -19,7 +19,7 @@ def test_row_from_run_dir_reads_training_and_backtest(tmp_path: Path) -> None:
         {
             "model_version": "m1",
             "selection_mode": "field_test",
-            "optuna_hpo_objective_mode": "field_test_dec026_val_precision_prod_adj",
+            "optuna_hpo_objective_mode": "field_test_dec026_val_precision_raw",
             "optuna_hpo_study_best_trial_value": 0.44,
             "test_precision": 0.31,
             "test_precision_prod_adjusted": 0.28,
@@ -77,7 +77,7 @@ def test_main_writes_csv_and_md(tmp_path: Path, monkeypatch) -> None:
         {
             "model_version": "r2",
             "selection_mode": "field_test",
-            "optuna_hpo_objective_mode": "field_test_dec026_val_precision_prod_adj",
+            "optuna_hpo_objective_mode": "field_test_dec026_val_precision_raw",
             "test_precision": 0.3,
         },
     )

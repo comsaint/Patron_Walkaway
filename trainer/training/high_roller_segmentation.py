@@ -47,7 +47,9 @@ def compute_high_roller_cutoff_from_train_parquet(
 
     The audit dict includes rated-only segment row counts at this cutoff (same
     definition as downstream ``count_rated_rows_parquet`` on segment Parquets)
-    so callers can detect degenerate quantiles **before** materialising splits.
+    so callers can detect degenerate quantiles **before** materialising splits,
+    plus **distinct** ``canonical_id`` counts per segment on rated train (NULL
+    ``canonical_id`` excluded).
     """
     import duckdb
 
@@ -65,7 +67,9 @@ def compute_high_roller_cutoff_from_train_parquet(
         row = con.execute(
             f"""
             WITH rated AS (
-              SELECT COALESCE(t.{col}, 0.0) AS x
+              SELECT
+                COALESCE(t.{col}, 0.0) AS x,
+                CAST(t.canonical_id AS VARCHAR) AS cid
               FROM read_parquet('{tp}') AS t
               WHERE COALESCE(t.is_rated, false) = true
             ),
@@ -79,8 +83,25 @@ def compute_high_roller_cutoff_from_train_parquet(
                 COUNT(*) FILTER (WHERE x >= (SELECT thr FROM thr_val)) AS n_high
               FROM rated
             )
-            SELECT thr_val.thr, counts.n_rated, counts.n_low, counts.n_high
-            FROM thr_val CROSS JOIN counts
+            SELECT
+              thr_val.thr,
+              counts.n_rated,
+              counts.n_low,
+              counts.n_high,
+              (
+                SELECT COUNT(DISTINCT r.cid)
+                FROM rated AS r
+                CROSS JOIN thr_val AS t
+                WHERE r.x < t.thr
+              ) AS nuniq_low,
+              (
+                SELECT COUNT(DISTINCT r.cid)
+                FROM rated AS r
+                CROSS JOIN thr_val AS t
+                WHERE r.x >= t.thr
+              ) AS nuniq_high
+            FROM thr_val
+            CROSS JOIN counts
             """
         ).fetchone()
         if not row:
@@ -91,6 +112,8 @@ def compute_high_roller_cutoff_from_train_parquet(
         thr_raw, n_rated, n_low, n_high = row[0], int(row[1] or 0), int(row[2] or 0), int(
             row[3] or 0
         )
+        nuniq_low = int(row[4] or 0)
+        nuniq_high = int(row[5] or 0)
         if n_rated <= 0:
             raise RuntimeError(
                 "Issue #8 segmentation cannot proceed: no rated train rows "
@@ -114,6 +137,8 @@ def compute_high_roller_cutoff_from_train_parquet(
         "high_roller_rated_train_row_count": n_rated,
         "high_roller_segment_train_rated_rows_low": n_low,
         "high_roller_segment_train_rated_rows_high": n_high,
+        "high_roller_segment_train_rated_unique_canonical_low": nuniq_low,
+        "high_roller_segment_train_rated_unique_canonical_high": nuniq_high,
     }
     return thr, meta
 
@@ -237,6 +262,26 @@ def count_rated_rows_parquet(path: Path) -> int:
             f"SELECT COUNT(*) FROM read_parquet('{pp}') WHERE COALESCE(is_rated, false) = true"
         ).fetchone()[0]
         return int(n)
+    finally:
+        con.close()
+
+
+def count_distinct_canonical_rated_parquet(path: Path) -> int:
+    """Return COUNT(DISTINCT canonical_id) for rated rows (string cast; NULLs excluded)."""
+    import duckdb
+
+    pp = _duckdb_quote_path(Path(path))
+    con = duckdb.connect(":memory:")
+    try:
+        n = con.execute(
+            f"""
+            SELECT COUNT(DISTINCT CAST(canonical_id AS VARCHAR))
+            FROM read_parquet('{pp}')
+            WHERE COALESCE(is_rated, false) = true
+              AND canonical_id IS NOT NULL
+            """
+        ).fetchone()[0]
+        return int(n or 0)
     finally:
         con.close()
 

@@ -31,22 +31,22 @@
     {
       "v1": "rated.val_field_test_primary_score",
       "v2": "datasets.val.field_test.precision",
-      "note": "Canonical field-test precision on validation when selection uses prod-adjusted path; see precision_type."
+      "note": "Aligned with empirical val_precision; field_test block is raw-only."
     },
     {
       "v1": "rated.val_field_test_primary_score_mode",
       "v2": "datasets.val.field_test.precision_type",
-      "note": "Maps precision_prod_adjusted to prod_adjusted; precision_raw to raw."
+      "note": "Always raw in current writer; legacy artifacts may still carry prod_adjusted modes in v1."
     },
     {
       "v1": "rated.test_precision",
       "v2": "datasets.test.precision",
-      "note": "Held-out test precision at training threshold; v2 also nests canonical field_test block."
+      "note": "Held-out test precision at training threshold; v2 field_test echoes raw precision only."
     },
     {
       "v1": "rated.test_precision_prod_adjusted",
-      "v2": "datasets.test.field_test.precision",
-      "note": "When present, canonical field-test test reporting prefers prod_adjusted pair; see writer logic."
+      "v2": "datasets.test.precision (headline) + optional legacy flat keys",
+      "note": "Prod-adjusted headline lives in v1 rated metrics and execution flat keys when computed; v2/v3 field_test no longer duplicates it."
     },
     {
       "v1": "rated.feature_importance",

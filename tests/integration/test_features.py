@@ -87,10 +87,12 @@ def _bets(rows, canonical_id="P1", table_id="T1", player_id=1):
         else:
             offset_min, bid = item
             status = "LOSE"
+        pcd = _BASE + timedelta(minutes=offset_min)
         records.append({
             "canonical_id": canonical_id,
             "bet_id": bid,
-            "payout_complete_dtm": _BASE + timedelta(minutes=offset_min),
+            "payout_complete_dtm": pcd,
+            "gaming_day": pcd.date(),
             "status": status,
             "table_id": table_id,
             "player_id": player_id,
@@ -251,7 +253,7 @@ class TestComputeRunBoundary(unittest.TestCase):
 
     def test_empty_input_has_expected_columns(self):
         df = pd.DataFrame(
-            columns=["canonical_id", "bet_id", "payout_complete_dtm"]
+            columns=["canonical_id", "bet_id", "payout_complete_dtm", "gaming_day"]
         )
         result = compute_run_boundary(df)
         self.assertIn("run_id", result.columns)

@@ -12,7 +12,22 @@ Exposure classes in this shard:
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Literal, Optional
+
+# --- Step 6 / run_state_machine: compute engine (Phase 1 pandas vs Phase 2 DuckDB) ---
+# SSOT: switch here (avoid env-var toggles for training semantics).
+# Rollout gate (suggested):
+# - On a fixed training window, ``run_state_machine_compute`` wall time improves vs pandas baseline.
+# - Peak RSS unchanged or lower on the same machine.
+# - Spot-check with RUN_BOUNDARY_PARITY_CHECK=True while len(bets) <= RUN_BOUNDARY_PARITY_MAX_ROWS.
+# Then set RUN_BOUNDARY_ENGINE = "duckdb".
+RUN_BOUNDARY_ENGINE: Literal["pandas", "duckdb"] = "pandas"
+# When True and engine is duckdb, diff against pandas if len(bets) <= RUN_BOUNDARY_PARITY_MAX_ROWS.
+RUN_BOUNDARY_PARITY_CHECK: bool = False
+RUN_BOUNDARY_PARITY_MAX_ROWS: int = 500_000
+
+# --- Step 6 diagnostics (process_chunk hot path) ---
+STEP6_PROFILE_ENABLED: bool = True
 
 
 def _truthy_env(name: str, default: str) -> bool:
@@ -28,7 +43,7 @@ STEP7_PANDAS_FALLBACK_MAX_BYTES = 256 * 1024 * 1024
 
 # --- Negative sampling / OOM pre-check ---
 # User policy knob: keep all positives, optionally reduce negatives.
-NEG_SAMPLE_FRAC: float = 1.0
+NEG_SAMPLE_FRAC: float = 0.3
 
 # Internal guards for auto-reduction logic.
 # Default off: chunk-path RAM heuristics / auto-neg-frac live under GitHub #10 (#16 defers OOM).

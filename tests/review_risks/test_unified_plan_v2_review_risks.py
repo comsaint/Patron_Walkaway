@@ -35,6 +35,7 @@ def _minimal_bets_int_bet_id():
             "player_id": [1001],
             "table_id": [1005],
             "payout_complete_dtm": [now],
+            "gaming_day": [pd.Timestamp("2026-03-01").date()],
             "wager": [100.0],
             "status": ["LOSE"],
             "payout_odds": [1.9],
@@ -119,6 +120,11 @@ class TestUnifiedV2ScoreOnceBetIdMismatchIntegration(unittest.TestCase):
             patch.object(scorer_mod, "CANONICAL_MAPPING_PARQUET", _FAKE_CANONICAL_PARQUET),
             patch.object(scorer_mod, "CANONICAL_MAPPING_CUTOFF_JSON", _FAKE_CANONICAL_JSON),
             patch.object(scorer_mod, "fetch_recent_data", return_value=(bets, sessions)),
+            patch.object(
+                scorer_mod,
+                "fetch_bets_run_context_pool",
+                side_effect=lambda *_a, **_k: bets.copy(),
+            ),
             patch.object(scorer_mod, "normalize_bets_sessions", side_effect=lambda b, s: (b, s)),
             patch.object(scorer_mod, "prune_old_state"),
             patch.object(scorer_mod, "refresh_alert_history"),
@@ -181,6 +187,11 @@ class TestUnifiedV2TrackLlmRowDropObservability(unittest.TestCase):
             patch.object(scorer_mod, "CANONICAL_MAPPING_PARQUET", _FAKE_CANONICAL_PARQUET),
             patch.object(scorer_mod, "CANONICAL_MAPPING_CUTOFF_JSON", _FAKE_CANONICAL_JSON),
             patch.object(scorer_mod, "fetch_recent_data", return_value=(bets, sessions)),
+            patch.object(
+                scorer_mod,
+                "fetch_bets_run_context_pool",
+                side_effect=lambda *_a, **_k: bets.copy(),
+            ),
             patch.object(scorer_mod, "normalize_bets_sessions", side_effect=lambda b, s: (b, s)),
             patch.object(scorer_mod, "prune_old_state"),
             patch.object(scorer_mod, "refresh_alert_history"),
@@ -209,7 +220,10 @@ class TestUnifiedV2TrackLlmRowDropObservability(unittest.TestCase):
                     retention_hours=1,
                 )
         joined = " ".join(cm.output)
-        self.assertIn("Track LLM dropped", joined)
+        self.assertTrue(
+            "bet_duckdb_window dropped" in joined or "Track LLM dropped" in joined,
+            msg=joined,
+        )
         self.assertNotIn(
             "rated new-bet",
             joined.lower(),
@@ -223,9 +237,9 @@ class TestUnifiedV2TrackLlmRowDropObservability(unittest.TestCase):
 
 
 class TestUnifiedV2TelemetryMissingPlayerId(unittest.TestCase):
-    """Risk #3: telemetry uses player_id for unrated branch — missing column raises."""
+    """Risk #3: unrated-only feature rows after rated slice should exit cleanly (no crash)."""
 
-    def test_score_once_keyerror_when_unrated_new_rows_without_player_id(self):
+    def test_score_once_exits_cleanly_when_features_only_unrated_canonical(self) -> None:
         bets = _minimal_bets_int_bet_id()
         sessions = _minimal_sessions()
         artifacts = {
@@ -233,7 +247,6 @@ class TestUnifiedV2TelemetryMissingPlayerId(unittest.TestCase):
             "model_version": "test-v0",
             "feature_spec": None,
         }
-        # canonical_id not in rated set → unrated; no player_id column
         features_row = pd.DataFrame(
             {
                 "bet_id": [1],
@@ -245,6 +258,11 @@ class TestUnifiedV2TelemetryMissingPlayerId(unittest.TestCase):
             patch.object(scorer_mod, "CANONICAL_MAPPING_PARQUET", _FAKE_CANONICAL_PARQUET),
             patch.object(scorer_mod, "CANONICAL_MAPPING_CUTOFF_JSON", _FAKE_CANONICAL_JSON),
             patch.object(scorer_mod, "fetch_recent_data", return_value=(bets, sessions)),
+            patch.object(
+                scorer_mod,
+                "fetch_bets_run_context_pool",
+                side_effect=lambda *_a, **_k: bets.copy(),
+            ),
             patch.object(scorer_mod, "normalize_bets_sessions", side_effect=lambda b, s: (b, s)),
             patch.object(scorer_mod, "prune_old_state"),
             patch.object(scorer_mod, "refresh_alert_history"),
@@ -255,9 +273,10 @@ class TestUnifiedV2TelemetryMissingPlayerId(unittest.TestCase):
                 return_value=pd.DataFrame({"player_id": [1001], "canonical_id": ["c1"]}),
             ),
             patch.object(scorer_mod, "build_features_for_scoring", return_value=features_row),
+            patch.object(scorer_mod, "append_alerts"),
         ):
             conn = sqlite3.connect(":memory:")
-            with self.assertRaises(KeyError):
+            with self.assertLogs("trainer.serving.scorer", level="INFO") as cm:
                 scorer_mod.score_once(
                     artifacts,
                     lookback_hours=1,
@@ -265,6 +284,8 @@ class TestUnifiedV2TelemetryMissingPlayerId(unittest.TestCase):
                     conn=conn,
                     retention_hours=1,
                 )
+        joined = " ".join(cm.output)
+        self.assertIn("No usable rows after feature engineering", joined)
 
 
 # ---------------------------------------------------------------------------
@@ -360,21 +381,21 @@ class TestUnifiedV2FlatMetricsNonNumeric(unittest.TestCase):
 
 
 class TestUnifiedV8TrainServeLlmOrderingContract(unittest.TestCase):
-    """Risk #8: contract that scorer slices before LLM; backtester runs LLM on full bets DataFrame."""
+    """Risk #8: scorer rates-slice then bet_duckdb_window; backtester runs window features on full bets."""
 
     def test_scorer_rated_slice_line_before_compute_track_llm_in_score_once(self):
         src = SCORER_SRC.read_text(encoding="utf-8")
-        marker_slice = '.isin(rated_canonical_ids)].copy()'
-        marker_llm = "compute_bet_duckdb_window_features("
+        marker_slice = 'features_all = features_all[features_all["canonical_id"].isin(rated_canonical_ids)]'
+        marker_llm = "_bet_compute("
         pos_slice = src.find(marker_slice)
         pos_llm = src.find(marker_llm, pos_slice)
         self.assertGreater(pos_slice, 0, "rated-only slice pattern not found")
-        self.assertGreater(pos_llm, pos_slice, "compute_bet_duckdb_window_features should follow rated slice")
+        self.assertGreater(pos_llm, pos_slice, "_bet_compute (bet_duckdb_window) should follow rated slice")
 
     def test_backtester_calls_track_llm_on_bets_variable(self):
         text = BACKTESTER_SRC.read_text(encoding="utf-8")
         self.assertIn("compute_bet_duckdb_window_features(", text)
-        self.assertIn("Track LLM on FULL bets", text)
+        self.assertIn("bet_duckdb_window features on FULL bets", text)
 
 
 if __name__ == "__main__":

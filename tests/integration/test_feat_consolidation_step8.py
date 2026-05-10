@@ -12,13 +12,13 @@ import unittest
 class TestScorerTrainServeParityTrackHuman(unittest.TestCase):
     """Step 8: Same batch of data + same Track Human functions (features.py) -> same feature values (scorer path)."""
 
-    def test_track_human_loss_streak_minutes_since_run_match_shared_functions(self):
+    def test_track_human_loss_streak_minutes_since_run_match_shared_functions(self) -> None:
         """Scorer build_features_for_scoring Track Human columns match direct features.compute_* on same prepared bets."""
         import pandas as pd
         from datetime import datetime
         from zoneinfo import ZoneInfo
 
-        from trainer.features import compute_loss_streak, compute_run_boundary
+        from trainer.features import compute_run_boundary
         from trainer.scorer import build_features_for_scoring
 
         HK_TZ = ZoneInfo("Asia/Hong_Kong")
@@ -40,6 +40,7 @@ class TestScorerTrainServeParityTrackHuman(unittest.TestCase):
             "base_ha": [0.02, 0.02, 0.02],
             "is_back_bet": [1, 1, 1],
             "position_idx": [0, 1, 2],
+            "gaming_day": [pd.Timestamp("2026-03-01").date()] * 3,
         })
         sessions = pd.DataFrame()
         canonical_map = pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]})
@@ -71,11 +72,15 @@ class TestScorerTrainServeParityTrackHuman(unittest.TestCase):
             ["canonical_id", "payout_complete_dtm", "bet_id"], kind="stable"
         ).reset_index(drop=True)
 
-        direct_streak = compute_loss_streak(bets_df, cutoff_time=cutoff_naive).fillna(0)
         rb = compute_run_boundary(bets_df, cutoff_time=cutoff_naive)
         direct_minutes = rb["minutes_since_run_start"] if "minutes_since_run_start" in rb.columns else pd.Series(0.0, index=bets_df.index)
 
-        pd.testing.assert_series_equal(out["loss_streak"].reset_index(drop=True), direct_streak.reset_index(drop=True), check_names=False)
+        # Bet-level streak disabled on scorer path; run-boundary primitives still match.
+        pd.testing.assert_series_equal(
+            out["loss_streak"].reset_index(drop=True),
+            pd.Series([0, 0, 0]).astype(out["loss_streak"].dtype),
+            check_names=False,
+        )
         pd.testing.assert_series_equal(out["minutes_since_run_start"].reset_index(drop=True), direct_minutes.reset_index(drop=True), check_names=False)
 
     def test_build_features_for_scoring_prep_contract(self):
@@ -100,6 +105,7 @@ class TestScorerTrainServeParityTrackHuman(unittest.TestCase):
             "base_ha": [0.02, 0.02, 0.02],
             "is_back_bet": [1, 1, 1],
             "position_idx": [0, 1, 2],
+            "gaming_day": [pd.Timestamp("2026-03-01").date()] * 3,
         })
         sessions = pd.DataFrame()
         canonical_map = pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]})
@@ -120,7 +126,7 @@ class TestScorerTrainServeParityTrackHuman(unittest.TestCase):
         from datetime import datetime
         from zoneinfo import ZoneInfo
 
-        from trainer.features import compute_loss_streak, compute_run_boundary
+        from trainer.features import compute_run_boundary
         from trainer.scorer import build_features_for_scoring
 
         HK_TZ = ZoneInfo("Asia/Hong_Kong")
@@ -141,6 +147,7 @@ class TestScorerTrainServeParityTrackHuman(unittest.TestCase):
             "base_ha": [0.02] * 4,
             "is_back_bet": [1] * 4,
             "position_idx": [0, 0, 1, 1],
+            "gaming_day": [pd.Timestamp("2026-03-01").date()] * 4,
         })
         sessions = pd.DataFrame()
         canonical_map = pd.DataFrame({"player_id": [100, 200], "canonical_id": ["c100", "c200"]})
@@ -171,11 +178,14 @@ class TestScorerTrainServeParityTrackHuman(unittest.TestCase):
             ["canonical_id", "payout_complete_dtm", "bet_id"], kind="stable"
         ).reset_index(drop=True)
 
-        direct_streak = compute_loss_streak(bets_df, cutoff_time=cutoff_naive).fillna(0)
         rb = compute_run_boundary(bets_df, cutoff_time=cutoff_naive)
         direct_minutes = rb["minutes_since_run_start"] if "minutes_since_run_start" in rb.columns else pd.Series(0.0, index=bets_df.index)
 
-        pd.testing.assert_series_equal(out["loss_streak"].reset_index(drop=True), direct_streak.reset_index(drop=True), check_names=False)
+        pd.testing.assert_series_equal(
+            out["loss_streak"].reset_index(drop=True),
+            pd.Series([0, 0, 0, 0]).astype(out["loss_streak"].dtype),
+            check_names=False,
+        )
         pd.testing.assert_series_equal(out["minutes_since_run_start"].reset_index(drop=True), direct_minutes.reset_index(drop=True), check_names=False)
 
     def test_track_human_parity_tz_aware_inputs(self):
@@ -201,6 +211,7 @@ class TestScorerTrainServeParityTrackHuman(unittest.TestCase):
             "base_ha": [0.02, 0.02, 0.02],
             "is_back_bet": [1, 1, 1],
             "position_idx": [0, 1, 2],
+            "gaming_day": [pd.Timestamp("2026-03-01").date()] * 3,
         })
         sessions = pd.DataFrame()
         canonical_map = pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]})
@@ -322,6 +333,7 @@ class TestScorerNoSessionComputesFeatureList(unittest.TestCase):
             "base_ha": [0.02, 0.02],
             "is_back_bet": [1, 1],
             "position_idx": [0, 1],
+            "gaming_day": [pd.Timestamp("2026-03-01").date()] * 2,
         })
         sessions = pd.DataFrame()
         canonical_map = pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]})
@@ -356,6 +368,7 @@ class TestScorerNoSessionComputesFeatureList(unittest.TestCase):
             "base_ha": [0.02],
             "is_back_bet": [1],
             "position_idx": [0],
+            "gaming_day": [pd.Timestamp("2026-03-01").date()],
         })
         sessions = pd.DataFrame()
         canonical_map = pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]})
@@ -416,6 +429,7 @@ class TestScorerRound135ReviewRisks(unittest.TestCase):
             "base_ha": [0.02],
             "is_back_bet": [1],
             "position_idx": [0],
+            "gaming_day": [pd.Timestamp("2026-03-01").date()],
         })
         sessions = pd.DataFrame()
         canonical_map = pd.DataFrame(columns=["player_id", "canonical_id"])
@@ -477,6 +491,7 @@ class TestScorerRound135ReviewRisks(unittest.TestCase):
             "base_ha": [0.02],
             "is_back_bet": [1],
             "position_idx": [0],
+            "gaming_day": [pd.Timestamp("2026-03-01").date()],
         })
         sessions = pd.DataFrame()
         canonical_map = pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]})

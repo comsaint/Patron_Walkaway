@@ -239,8 +239,8 @@ def test_run_optuna_search_field_test_dec026_path_runs_small_study(
     assert isinstance(hp_ft, dict)
     assert "n_estimators" in hp_ft
     assert len(manifest) == 1
-    assert manifest[0]["optuna_hpo_objective_mode"] == "field_test_dec026_val_precision_prod_adj"
-    assert manifest[0].get("optuna_hpo_val_precision_prod_adjusted_active") is True
+    assert manifest[0]["optuna_hpo_objective_mode"] == "field_test_dec026_val_precision_raw"
+    assert manifest[0].get("optuna_hpo_val_precision_prod_adjusted_active") is False
     assert manifest[0].get("optuna_hpo_study_best_trial_value") is not None
 
 

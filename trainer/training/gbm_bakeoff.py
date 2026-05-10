@@ -344,21 +344,12 @@ def _precision_prod_adjusted(
 
 
 def _add_field_test_primary_keys(metrics: Dict[str, Any], y_val: pd.Series) -> None:
-    """Augment metrics with comparable field-test primary score keys."""
+    """Augment metrics with field-test primary score keys (raw val precision only)."""
     val_precision = metrics.get("val_precision")
     val_np_ratio = _neg_pos_ratio_from_binary_labels(y_val)
-    val_primary_adj = _precision_prod_adjusted(
-        float(val_precision) if val_precision is not None else None,
-        production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
-        test_neg_pos_ratio=val_np_ratio,
-    )
     metrics["val_neg_pos_ratio"] = val_np_ratio
-    metrics["val_field_test_primary_score"] = (
-        float(val_primary_adj) if val_primary_adj is not None else float(val_precision or 0.0)
-    )
-    metrics["val_field_test_primary_score_mode"] = (
-        "precision_prod_adjusted" if val_primary_adj is not None else "precision_raw"
-    )
+    metrics["val_field_test_primary_score"] = float(val_precision or 0.0)
+    metrics["val_field_test_primary_score_mode"] = "precision_raw"
 
 
 def _val_block_from_scores(

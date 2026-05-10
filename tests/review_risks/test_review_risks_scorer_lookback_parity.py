@@ -1,12 +1,8 @@
-"""Guardrail tests for Code Review — Scorer Track Human lookback parity (STATUS.md).
+"""Guardrail tests for Code Review — Scorer Track Human parity (STATUS.md).
 
-Maps each Reviewer risk (§1–§2) to a minimal reproducible test.
-Production code is not modified; tests document desired behavior.
-
-§1: config source contract — scorer must use config from trainer (not cwd).
-§2: boundary — when SCORER_LOOKBACK_HOURS is 0 or negative, build_features_for_scoring
-    currently raises ValueError (from features.compute_loss_streak); test locks current
-    behavior. When production adds fallback, update test to expect success.
+``build_features_for_scoring`` uses gap + ``gaming_day`` run boundaries only; Track Human
+run primitives do not read ``SCORER_LOOKBACK_HOURS``. Fetch/session windows elsewhere
+(e.g. ``score_once``) may still use lookback for **data retrieval**, not run-boundary math.
 """
 
 from __future__ import annotations
@@ -31,6 +27,7 @@ HK_TZ = ZoneInfo("Asia/Hong_Kong")
 
 def _minimal_bets_fixture():
     """Minimal bets DataFrame for build_features_for_scoring to reach Track Human block."""
+    gday = pd.Timestamp("2026-03-01").date()
     return pd.DataFrame({
         "bet_id": [1, 2],
         "session_id": ["s1", "s1"],
@@ -43,6 +40,7 @@ def _minimal_bets_fixture():
         "base_ha": [0.02, 0.02],
         "is_back_bet": [1, 1],
         "position_idx": [0, 1],
+        "gaming_day": [gday, gday],
     })
 
 
@@ -74,65 +72,48 @@ class TestScorerLookbackConfigSourceContract(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# §2 lookback_hours <= 0 or non-numeric boundary (current: features raise)
+# §2 SCORER_LOOKBACK_HOURS does not gate build_features_for_scoring Track Human
 # ---------------------------------------------------------------------------
 
-class TestScorerLookbackHoursBoundary(unittest.TestCase):
-    """§2: When SCORER_LOOKBACK_HOURS is 0 or negative, build_features_for_scoring behavior.
+class TestScorerLookbackHoursIgnoredByBuildFeatures(unittest.TestCase):
+    """Track Human run-boundary path ignores SCORER_LOOKBACK_HOURS (run-day contract)."""
 
-    Current production has no fallback; features.compute_loss_streak raises ValueError.
-    If production adds fallback (e.g. warn + use 8), update tests to expect no raise.
-    """
-
-    def test_lookback_hours_zero_raises_value_error(self):
-        """When SCORER_LOOKBACK_HOURS=0, build_features_for_scoring raises ValueError (from features)."""
+    def test_lookback_hours_zero_still_builds_features(self) -> None:
         bets = _minimal_bets_fixture()
         sessions = pd.DataFrame()
         canonical_map = pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]})
         cutoff = datetime(2026, 3, 1, 12, 0, 0, tzinfo=HK_TZ)
-
         with patch.object(scorer_impl.config, "SCORER_LOOKBACK_HOURS", 0):
-            with self.assertRaises(ValueError) as ctx:
-                scorer_impl.build_features_for_scoring(bets, sessions, canonical_map, cutoff)
-            self.assertIn("lookback", str(ctx.exception).lower(), "error should mention lookback")
+            out = scorer_impl.build_features_for_scoring(bets, sessions, canonical_map, cutoff)
+        self.assertIn("loss_streak", out.columns)
+        self.assertTrue((out["loss_streak"] == 0).all())
 
-    def test_lookback_hours_negative_raises_value_error(self):
-        """When SCORER_LOOKBACK_HOURS=-1, build_features_for_scoring raises ValueError (from features)."""
+    def test_lookback_hours_negative_still_builds_features(self) -> None:
         bets = _minimal_bets_fixture()
         sessions = pd.DataFrame()
         canonical_map = pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]})
         cutoff = datetime(2026, 3, 1, 12, 0, 0, tzinfo=HK_TZ)
-
         with patch.object(scorer_impl.config, "SCORER_LOOKBACK_HOURS", -1):
-            with self.assertRaises(ValueError) as ctx:
-                scorer_impl.build_features_for_scoring(bets, sessions, canonical_map, cutoff)
-            self.assertIn("lookback", str(ctx.exception).lower(), "error should mention lookback")
+            out = scorer_impl.build_features_for_scoring(bets, sessions, canonical_map, cutoff)
+        self.assertIn("minutes_since_run_start", out.columns)
 
-    def test_lookback_hours_string_raises_or_completes(self):
-        """When SCORER_LOOKBACK_HOURS is string '8', current code may raise TypeError (no coercion).
-
-        Documents current behavior; if production adds type coercion, change to expect success.
-        """
+    def test_lookback_hours_string_still_builds_features(self) -> None:
         bets = _minimal_bets_fixture()
         sessions = pd.DataFrame()
         canonical_map = pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]})
         cutoff = datetime(2026, 3, 1, 12, 0, 0, tzinfo=HK_TZ)
-
         with patch.object(scorer_impl.config, "SCORER_LOOKBACK_HOURS", "8"):
-            try:
-                out = scorer_impl.build_features_for_scoring(bets, sessions, canonical_map, cutoff)
-                self.assertIn("loss_streak", out.columns, "if no raise, output must have Track Human cols")
-            except (TypeError, ValueError):
-                # Current: features may raise when comparing "8" <= 0
-                pass
+            out = scorer_impl.build_features_for_scoring(bets, sessions, canonical_map, cutoff)
+            self.assertIn("loss_streak", out.columns)
 
 
 class TestScorerTrainerConsecutiveNonWinParity(unittest.TestCase):
-    """Parity guard: consecutive_non_win_cnt must match trainer Track Human path."""
+    """Bet-level consecutive_non_win_cnt disabled; scorer and trainer both zero-fill."""
 
-    def test_consecutive_non_win_cnt_matches_trainer_with_same_lookback(self):
+    def test_consecutive_non_win_cnt_matches_trainer_zeros(self) -> None:
         from trainer.training.trainer import add_run_state_machine_features
 
+        gday = pd.Timestamp("2026-03-01").date()
         bets = pd.DataFrame({
             "bet_id": [1, 2, 3, 4],
             "session_id": ["s1", "s1", "s1", "s1"],
@@ -153,19 +134,18 @@ class TestScorerTrainerConsecutiveNonWinParity(unittest.TestCase):
             "base_ha": [0.02, 0.02, 0.02, 0.02],
             "is_back_bet": [1, 1, 1, 1],
             "position_idx": [0, 1, 0, 1],
+            "gaming_day": [gday, gday, gday, gday],
         })
         sessions = pd.DataFrame()
         canonical_map = pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]})
         cutoff = datetime(2026, 3, 1, 12, 0, 0, tzinfo=HK_TZ)
-        lookback_hours = 0.2
 
-        with patch.object(scorer_impl.config, "SCORER_LOOKBACK_HOURS", lookback_hours):
-            scorer_out = scorer_impl.build_features_for_scoring(
-                bets.copy(),
-                sessions,
-                canonical_map,
-                cutoff,
-            )
+        scorer_out = scorer_impl.build_features_for_scoring(
+            bets.copy(),
+            sessions,
+            canonical_map,
+            cutoff,
+        )
 
         trainer_bets = bets.copy()
         trainer_bets["canonical_id"] = "c100"
@@ -173,7 +153,7 @@ class TestScorerTrainerConsecutiveNonWinParity(unittest.TestCase):
             bets=trainer_bets,
             canonical_map=canonical_map,
             window_end=cutoff.replace(tzinfo=None),
-            lookback_hours=lookback_hours,
+            lookback_hours=None,
         )
 
         scorer_series = (

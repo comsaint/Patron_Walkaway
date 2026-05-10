@@ -86,7 +86,7 @@ def test_run_tolerates_missing_optional_artifacts(tmp_path: Path) -> None:
         {
             "model_version": "m1",
             "selection_mode": "field_test",
-            "optuna_hpo_objective_mode": "field_test_dec026_val_precision_prod_adj",
+            "optuna_hpo_objective_mode": "field_test_dec026_val_precision_raw",
         },
     )
     rc = mod.run(

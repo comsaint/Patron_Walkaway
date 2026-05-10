@@ -245,6 +245,11 @@ data/backup*
 # Generated / local-only under data/ (do not commit).
 data/player_profile.schema_hash
 data/tmp_lda_gate1_day_range/
+# CatBoost default cwd output (logs, TensorBoard, timing); not reproducible artifacts.
+catboost_info/
+# Trainer auto L2 bundle cache (parquet shards + manifests); machine-local / cache-keyed.
+data/l2_training_bundle/
+data/l2_training_bundle_recompute_*/
 
 # large files
 data/**/*.parquet

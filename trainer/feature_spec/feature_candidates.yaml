@@ -178,7 +178,7 @@ layered_framework:
 
       '
 tracks_enabled:
-  bet_duckdb_window: true
+  bet_duckdb_window: false
   run_state_machine: true
   trip_asset_materialized: true
   player_run_asset: true
@@ -230,7 +230,7 @@ bet_duckdb_window:
   name: Track LLM
   source_table: t_bet
   data_scope: bet_only
-  enabled: true
+  enabled: false
   guardrails:
     max_window_minutes: 0
     disallow_following: true
@@ -678,6 +678,7 @@ run_state_machine:
   enabled: true
   candidates:
   - feature_id: loss_streak
+    enabled: false
     target_layer: bet
     type: python_vectorized
     dtype: int
@@ -698,6 +699,7 @@ run_state_machine:
         max: 999
     reason_code_category: LOSS_STREAK
   - feature_id: consecutive_non_win_cnt
+    enabled: false
     target_layer: bet
     type: python_vectorized
     dtype: int
@@ -845,6 +847,7 @@ run_state_machine:
         max: 1000000000.0
     reason_code_category: LOSS_STREAK
   - feature_id: table_hc
+    enabled: false
     target_layer: bet
     type: python_vectorized
     dtype: int

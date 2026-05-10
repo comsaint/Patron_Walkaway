@@ -136,13 +136,27 @@ _BET_SELECT_COLS = """
     wager,
     casino_win,
     status,
-    COALESCE(gaming_day, toDate(payout_complete_dtm)) AS gaming_day,
+    gaming_day,
     is_back_bet,
     base_ha,
     bet_type,
     payout_odds,
     position_idx
 """.strip()
+
+
+def assert_bets_gaming_day_contract(bets: pd.DataFrame, context: str) -> None:
+    """Fail fast when ``gaming_day`` is missing or null on bets (t_bet contract)."""
+    if "gaming_day" not in bets.columns:
+        raise ValueError(f"{context}: missing required column 'gaming_day' (no fallback)")
+    if bets.empty:
+        return
+    if bets["gaming_day"].isna().any():
+        n = int(bets["gaming_day"].isna().sum())
+        raise ValueError(
+            f"{context}: gaming_day must be non-null on all bet rows (found {n} nulls)"
+        )
+
 
 _SESSION_SELECT_COLS = """
     session_id,
@@ -411,6 +425,7 @@ def load_clickhouse_data(
           AND payout_complete_dtm < %(end)s
           AND wager > 0
           AND payout_complete_dtm IS NOT NULL
+          AND gaming_day IS NOT NULL
           AND player_id IS NOT NULL
           AND player_id != {PLACEHOLDER_PLAYER_ID}
     """
@@ -440,6 +455,7 @@ def load_clickhouse_data(
     """
 
     bets = client.query_df(bets_query, parameters=params)
+    assert_bets_gaming_day_contract(bets, "load_clickhouse_data")
     sessions = client.query_df(session_query, parameters=params)
     logger.info("Loaded %d bets, %d sessions", len(bets), len(sessions))
     return bets, sessions
@@ -568,6 +584,7 @@ def load_local_parquet(
         if "player_id" in bets.columns:
             _mask &= bets["player_id"].notna() & (bets["player_id"] != PLACEHOLDER_PLAYER_ID)
         bets = bets[_mask].copy()
+        assert_bets_gaming_day_contract(bets, "load_local_parquet")
         _sess_cols = None  # read all columns for normal chunk processing
 
     sessions = pd.read_parquet(

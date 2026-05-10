@@ -86,6 +86,7 @@ from trainer.training.two_stage import (
     validate_fusion_mode,
 )
 from trainer.db_conn import get_clickhouse_client  # serving lives under trainer; db_conn at package root
+from trainer.training.data_sources import assert_bets_gaming_day_contract
 
 try:
     import config  # type: ignore[import]
@@ -289,6 +290,8 @@ FEATURE_SPEC_PATH = FEATURE_CANDIDATES_PATH  # legacy alias for tooling/tests
 RETENTION_HOURS: int = getattr(config, "SCORER_STATE_RETENTION_HOURS", 48)
 SESSION_AVAIL_DELAY_MIN: int = getattr(config, "SESSION_AVAIL_DELAY_MIN", 15)
 BET_AVAIL_DELAY_MIN: int = getattr(config, "BET_AVAIL_DELAY_MIN", 1)
+# Plan A: chunk player_id list for ClickHouse IN (avoids oversized single queries).
+SCORER_RUN_CONTEXT_PLAYER_CHUNK: int = 512
 UNRATED_VOLUME_LOG: bool = bool(getattr(config, "UNRATED_VOLUME_LOG", True))
 SHAP_TOP_K = 3
 
@@ -505,7 +508,7 @@ def fetch_recent_data(
             bet_type,
             __etl_insert_Dtm,
             payout_complete_dtm,
-            COALESCE(gaming_day, toDate(payout_complete_dtm)) AS gaming_day,
+            gaming_day,
             session_id,
             player_id,
             table_id,
@@ -518,6 +521,7 @@ def fetch_recent_data(
         WHERE payout_complete_dtm >= %(start)s
           AND payout_complete_dtm <= %(bet_avail)s
           AND payout_complete_dtm IS NOT NULL
+          AND gaming_day IS NOT NULL
           AND wager > 0
           AND player_id IS NOT NULL
           AND player_id != {placeholder}
@@ -578,7 +582,191 @@ def fetch_recent_data(
 
     sessions = client.query_df(session_query, parameters=params)
     logger.debug("[scorer] Fetched %d bets, %d sessions", len(bets), len(sessions))
+    if not bets.empty:
+        assert_bets_gaming_day_contract(bets, "fetch_recent_data")
     return bets, sessions
+
+
+def fetch_sessions_for_scoring(start: datetime, end: datetime) -> pd.DataFrame:
+    """Sessions only (FND-01 + H2), same contract as ``fetch_recent_data``."""
+    if get_clickhouse_client is None:
+        raise RuntimeError("clickhouse_connect not available; cannot fetch live data")
+    client = get_clickhouse_client()
+    sess_avail = end - timedelta(minutes=SESSION_AVAIL_DELAY_MIN)
+    params: dict = {"start": start, "end": end, "sess_avail": sess_avail}
+    _default_cid_sql = (
+        "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "
+        "THEN NULL ELSE trim(casino_player_id) END"
+    )
+    cid_sql = getattr(config, "CASINO_PLAYER_ID_CLEAN_SQL", _default_cid_sql)
+    session_query = f"""
+        WITH deduped AS (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY session_id
+                       ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC
+                   ) AS rn
+            FROM {config.SOURCE_DB}.{config.TSESSION}
+            WHERE session_start_dtm >= %(start)s - INTERVAL 2 DAY
+              AND session_start_dtm <= %(end)s + INTERVAL 1 DAY
+              AND is_deleted = 0
+              AND is_canceled = 0
+              AND is_manual = 0
+        )
+        SELECT
+            session_id,
+            table_id,
+            player_id,
+            {cid_sql} AS casino_player_id,
+            session_start_dtm,
+            session_end_dtm,
+            lud_dtm,
+            COALESCE(session_end_dtm, lud_dtm) AS session_avail_dtm,
+            is_manual,
+            is_deleted,
+            is_canceled,
+            COALESCE(turnover, 0) AS turnover,
+            COALESCE(num_games_with_wager, 0) AS num_games_with_wager
+        FROM deduped
+        WHERE rn = 1
+          AND COALESCE(session_end_dtm, lud_dtm) <= %(sess_avail)s
+          AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0)
+    """
+    sessions = client.query_df(session_query, parameters=params)
+    return sessions
+
+
+def fetch_bets_incremental_since_etl(
+    last_etl: datetime,
+    end: datetime,
+    payout_lower_bound: datetime,
+) -> pd.DataFrame:
+    """Newly-arrived bets by ``__etl_insert_Dtm`` cursor (Plan A discovery path)."""
+    if get_clickhouse_client is None:
+        raise RuntimeError("clickhouse_connect not available; cannot fetch live data")
+    client = get_clickhouse_client()
+    bet_avail = end - timedelta(minutes=BET_AVAIL_DELAY_MIN)
+    placeholder = getattr(config, "PLACEHOLDER_PLAYER_ID", -1)
+    params = {
+        "last_etl": last_etl,
+        "bet_avail": bet_avail,
+        "plo": payout_lower_bound,
+    }
+    bets_query = f"""
+        SELECT
+            bet_id,
+            is_back_bet,
+            base_ha,
+            bet_type,
+            __etl_insert_Dtm,
+            payout_complete_dtm,
+            gaming_day,
+            session_id,
+            player_id,
+            table_id,
+            position_idx,
+            wager,
+            casino_win,
+            payout_odds,
+            status
+        FROM {config.SOURCE_DB}.{config.TBET} FINAL
+        WHERE __etl_insert_Dtm > %(last_etl)s
+          AND payout_complete_dtm >= %(plo)s
+          AND payout_complete_dtm <= %(bet_avail)s
+          AND payout_complete_dtm IS NOT NULL
+          AND gaming_day IS NOT NULL
+          AND wager > 0
+          AND player_id IS NOT NULL
+          AND player_id != {placeholder}
+    """
+    bets = client.query_df(bets_query, parameters=params)
+    before = len(bets)
+    bets = bets[bets["wager"].fillna(0) > 0].copy()
+    if len(bets) != before:
+        logger.debug("[scorer] incremental fetch filtered zero-wager: %d->%d", before, len(bets))
+    if not bets.empty and "payout_complete_dtm" in bets.columns:
+        _pc = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce")
+        if getattr(_pc.dt, "tz", None) is None:
+            _pc = _pc.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        bets["payout_complete_dtm"] = _pc.dt.tz_convert(HK_TZ)
+    if not bets.empty and "__etl_insert_Dtm" in bets.columns:
+        _etl = pd.to_datetime(bets["__etl_insert_Dtm"], errors="coerce")
+        if getattr(_etl.dt, "tz", None) is None:
+            _etl = _etl.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        bets["__etl_insert_Dtm"] = _etl.dt.tz_convert(HK_TZ)
+    if not bets.empty:
+        assert_bets_gaming_day_contract(bets, "fetch_bets_incremental_since_etl")
+    return bets
+
+
+def fetch_bets_run_context_pool(
+    player_ids: List[str],
+    gaming_days: List[object],
+    end: datetime,
+) -> pd.DataFrame:
+    """All bets for (player_id × gaming_day) slices needed for run-boundary features (Plan A)."""
+    if not player_ids or not gaming_days:
+        return pd.DataFrame()
+    if get_clickhouse_client is None:
+        raise RuntimeError("clickhouse_connect not available; cannot fetch live data")
+    client = get_clickhouse_client()
+    bet_avail = end - timedelta(minutes=BET_AVAIL_DELAY_MIN)
+    placeholder = getattr(config, "PLACEHOLDER_PLAYER_ID", -1)
+    gdays_t = tuple(gaming_days)
+    frames: List[pd.DataFrame] = []
+    for i in range(0, len(player_ids), SCORER_RUN_CONTEXT_PLAYER_CHUNK):
+        chunk = tuple(player_ids[i : i + SCORER_RUN_CONTEXT_PLAYER_CHUNK])
+        params = {"bet_avail": bet_avail, "pids": chunk, "gdays": gdays_t}
+        bets_query = f"""
+            SELECT
+                bet_id,
+                is_back_bet,
+                base_ha,
+                bet_type,
+                __etl_insert_Dtm,
+                payout_complete_dtm,
+                gaming_day,
+                session_id,
+                player_id,
+                table_id,
+                position_idx,
+                wager,
+                casino_win,
+                payout_odds,
+                status
+            FROM {config.SOURCE_DB}.{config.TBET} FINAL
+            WHERE player_id IN %(pids)s
+              AND gaming_day IN %(gdays)s
+              AND payout_complete_dtm <= %(bet_avail)s
+              AND payout_complete_dtm IS NOT NULL
+              AND gaming_day IS NOT NULL
+              AND wager > 0
+              AND player_id IS NOT NULL
+              AND player_id != {placeholder}
+        """
+        part = client.query_df(bets_query, parameters=params)
+        if not part.empty:
+            frames.append(part)
+    if not frames:
+        return pd.DataFrame()
+    bets = pd.concat(frames, ignore_index=True)
+    before = len(bets)
+    bets = bets[bets["wager"].fillna(0) > 0].copy()
+    if len(bets) != before:
+        logger.debug("[scorer] run-context pool filtered zero-wager: %d->%d", before, len(bets))
+    if not bets.empty and "payout_complete_dtm" in bets.columns:
+        _pc = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce")
+        if getattr(_pc.dt, "tz", None) is None:
+            _pc = _pc.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        bets["payout_complete_dtm"] = _pc.dt.tz_convert(HK_TZ)
+    if not bets.empty and "__etl_insert_Dtm" in bets.columns:
+        _etl = pd.to_datetime(bets["__etl_insert_Dtm"], errors="coerce")
+        if getattr(_etl.dt, "tz", None) is None:
+            _etl = _etl.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        bets["__etl_insert_Dtm"] = _etl.dt.tz_convert(HK_TZ)
+    assert_bets_gaming_day_contract(bets, "fetch_bets_run_context_pool")
+    logger.debug("[scorer] run-context pool rows=%d (players=%d, days=%d)", len(bets), len(player_ids), len(gaming_days))
+    return bets
 
 
 # ── SQLite state helpers ──────────────────────────────────────────────────────
@@ -848,16 +1036,22 @@ def read_effective_runtime_rated_threshold(
 
 
 def _get_last_processed_end(conn: sqlite3.Connection) -> Optional[pd.Timestamp]:
-    row = conn.execute(
-        "SELECT value FROM meta WHERE key='last_processed_end'"
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='last_processed_end'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
     return _meta_iso_to_hk(row[0]) if row else None
 
 
 def _get_last_processed_etl_insert(conn: sqlite3.Connection) -> Optional[pd.Timestamp]:
-    row = conn.execute(
-        "SELECT value FROM meta WHERE key='last_processed_etl_insert'"
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='last_processed_etl_insert'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
     if row:
         # Watermark max(__etl_insert_Dtm) is written from HK-zoned Timestamps.
         return _meta_iso_to_hk(row[0])
@@ -1126,6 +1320,39 @@ def _check_numba_runtime_once() -> None:
         logger.warning("[scorer] numba runtime check failed: %s", exc)
 
 
+def _plan_a_run_context_targets(
+    new_bets: pd.DataFrame,
+    canonical_map: pd.DataFrame,
+) -> Tuple[List[str], List[object]]:
+    """Player ids (expanded by canonical_id) and distinct gaming_days from new bets."""
+    if new_bets.empty or "player_id" not in new_bets.columns:
+        return [], []
+    new_pids = sorted(
+        {str(x) for x in new_bets["player_id"].dropna().astype(str).tolist()}
+    )
+    if not new_pids:
+        return [], []
+    if "gaming_day" not in new_bets.columns:
+        raise ValueError("Plan A: new_bets must include gaming_day")
+    gdays = [x for x in pd.unique(new_bets["gaming_day"].dropna())]
+    if not gdays:
+        raise ValueError("Plan A: new_bets must have non-null gaming_day values")
+    if canonical_map is None or canonical_map.empty:
+        return new_pids, gdays
+    if not {"player_id", "canonical_id"}.issubset(canonical_map.columns):
+        return new_pids, gdays
+    cm = canonical_map[["player_id", "canonical_id"]].dropna().copy()
+    cm["player_id"] = cm["player_id"].astype(str)
+    cm["canonical_id"] = cm["canonical_id"].astype(str)
+    target_cids = set(cm.loc[cm["player_id"].isin(new_pids), "canonical_id"].tolist())
+    if not target_cids:
+        return new_pids, gdays
+    expanded = sorted(
+        cm.loc[cm["canonical_id"].isin(target_cids), "player_id"].astype(str).unique().tolist()
+    )
+    return (expanded if expanded else new_pids), gdays
+
+
 def _select_incremental_bets_window(
     bets: pd.DataFrame,
     new_bets: pd.DataFrame,
@@ -1228,6 +1455,8 @@ def build_features_for_scoring(
         pcd = pcd.dt.tz_convert(HK_TZ).dt.tz_localize(None)
     bets_df["payout_complete_dtm"] = pcd
 
+    assert_bets_gaming_day_contract(bets_df, "build_features_for_scoring")
+
     # Normalise cutoff_time to tz-naive HK (R3505: convert before strip; use HK_TZ for SSOT)
     ct = _ct
     if ct.tz is not None:
@@ -1313,23 +1542,11 @@ def build_features_for_scoring(
         ["canonical_id", "payout_complete_dtm", "bet_id"], kind="stable"
     ).reset_index(drop=True)
 
-    # ── Track Human (same lookback as trainer for train–serve parity) ────────
-    _lookback_hours = getattr(config, "SCORER_LOOKBACK_HOURS", 8)
-    bets_df["loss_streak"] = compute_loss_streak(
-        bets_df, cutoff_time=cutoff_naive, lookback_hours=_lookback_hours
-    ).fillna(0)
-    if compute_consecutive_non_win_streak is not None:
-        bets_df["consecutive_non_win_cnt"] = compute_consecutive_non_win_streak(
-            bets_df,
-            cutoff_time=cutoff_naive,
-            lookback_hours=_lookback_hours,
-        ).reindex(bets_df.index, fill_value=0)
-    else:
-        bets_df["consecutive_non_win_cnt"] = 0
+    # ── Track Human: run-boundary only (bet-level streak / table_hc disabled in spec) ─
+    bets_df["loss_streak"] = np.int32(0)
+    bets_df["consecutive_non_win_cnt"] = np.int32(0)
 
-    rb = compute_run_boundary(
-        bets_df, cutoff_time=cutoff_naive, lookback_hours=_lookback_hours
-    )
+    rb = compute_run_boundary(bets_df, cutoff_time=cutoff_naive, lookback_hours=None)
     bets_df["run_id"] = rb["run_id"] if "run_id" in rb.columns else 0
     bets_df["minutes_since_run_start"] = (
         rb["minutes_since_run_start"] if "minutes_since_run_start" in rb.columns else 0.0
@@ -1347,20 +1564,7 @@ def build_features_for_scoring(
         rb["net_win_per_bet_in_run"] if "net_win_per_bet_in_run" in rb.columns else 0.0
     )
 
-    _hc_missing = {"table_id", "bet_id", "payout_complete_dtm", "player_id"} - set(bets_df.columns)
-    if _hc_missing:
-        logger.warning(
-            "build_features_for_scoring: table_hc skipped — missing columns %s",
-            sorted(_hc_missing),
-        )
-        bets_df["table_hc"] = np.int32(0)
-    else:
-        bets_df["table_hc"] = (
-            compute_table_hc(bets_df, cutoff_time=cutoff_naive)
-            .reindex(bets_df.index, fill_value=0)
-            .astype("int32")
-            .to_numpy()
-        )
+    bets_df["table_hc"] = np.int32(0)
 
     # ── Session rolling stats (legacy parity) ─────────────────────────────
     sess_df = sessions.copy() if not sessions.empty else pd.DataFrame()
@@ -2345,21 +2549,30 @@ def score_once(
     model_version: str = artifacts["model_version"]
 
     refresh_alert_history(alert_history, now_hk, conn)
+    last_etl_wm = _get_last_processed_etl_insert(conn)
     start = now_hk - timedelta(hours=lookback_hours)
-    logger.debug("[scorer] Window: %s -> %s", start.isoformat(), now_hk.isoformat())
+    logger.debug(
+        "[scorer] Window: %s -> %s (last_etl=%s)",
+        start.isoformat(),
+        now_hk.isoformat(),
+        last_etl_wm.isoformat() if last_etl_wm is not None else None,
+    )
 
     t_clickhouse = time.perf_counter()
-    bets, sessions = fetch_recent_data(start, now_hk)
-    # Post-Load Normalizer (PLAN § Post-Load Normalizer Phase 4)
-    bets, sessions = normalize_bets_sessions(bets, sessions)
+    if last_etl_wm is None:
+        bets_discover, sessions = fetch_recent_data(start, now_hk)
+    else:
+        sessions = fetch_sessions_for_scoring(start, now_hk)
+        bets_discover = fetch_bets_incremental_since_etl(last_etl_wm, now_hk, start)
+    bets_discover, sessions = normalize_bets_sessions(bets_discover, sessions)
     cycle_stage_seconds["clickhouse"] = time.perf_counter() - t_clickhouse
-    if bets.empty:
-        logger.debug("[scorer] No bets in window; sleeping")
+    if bets_discover.empty:
+        logger.debug("[scorer] No bets in discovery window; sleeping")
         _emit_scorer_perf_summary(cycle_stage_seconds)
         return
 
     prune_old_state(conn, now_hk, retention_hours)
-    new_bets = update_state_with_new_bets(conn, bets, now_hk)
+    new_bets = update_state_with_new_bets(conn, bets_discover, now_hk)
     logger.debug("[scorer] New bets since last tick: %d", len(new_bets))
     if new_bets.empty:
         logger.debug("[scorer] No new bets to score; sleeping")
@@ -2422,8 +2635,27 @@ def score_once(
         set(canonical_map["canonical_id"].unique()) if not canonical_map.empty else set()
     )
 
-    # ── Features on narrowed incremental window (Phase 3) ──────────────────
-    bets_for_features = _select_incremental_bets_window(bets, new_bets, canonical_map)
+    # ── Plan A: fetch minimal run-context pool (active players × gaming_days) ───
+    try:
+        ctx_pids, ctx_days = _plan_a_run_context_targets(new_bets, canonical_map)
+    except ValueError as exc:
+        logger.warning("[scorer] Plan A run-context targets invalid (%s); skipping cycle", exc)
+        _emit_scorer_perf_summary(cycle_stage_seconds)
+        return
+    if not ctx_pids or not ctx_days:
+        logger.debug("[scorer] Plan A: empty run-context target set; skipping features")
+        _emit_scorer_perf_summary(cycle_stage_seconds)
+        return
+    t_ctx = time.perf_counter()
+    bets_for_features = fetch_bets_run_context_pool(ctx_pids, ctx_days, now_hk)
+    cycle_stage_seconds["clickhouse_run_context"] = time.perf_counter() - t_ctx
+    if bets_for_features.empty:
+        logger.warning("[scorer] Plan A: run-context pool empty after fetch")
+        _emit_scorer_perf_summary(cycle_stage_seconds)
+        return
+    bets_for_features, _ = normalize_bets_sessions(bets_for_features, pd.DataFrame())
+    bets = bets_for_features
+
     # C2: formal FE path should process rated observations only.
     rated_player_ids: set = (
         set(canonical_map["player_id"].dropna().astype(str).tolist())

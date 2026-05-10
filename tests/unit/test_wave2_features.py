@@ -55,7 +55,7 @@ class TestConsecutiveNonWinStreak(unittest.TestCase):
         self.assertIn("consecutive_non_win_cnt", out.columns)
         self.assertListEqual(out["consecutive_non_win_cnt"].tolist(), [1, 2])
 
-    def test_consecutive_non_win_streak_respects_lookback_hours(self) -> None:
+    def test_consecutive_non_win_streak_rejects_lookback_hours(self) -> None:
         df = pd.DataFrame(
             {
                 "canonical_id": ["A", "A", "A"],
@@ -66,11 +66,35 @@ class TestConsecutiveNonWinStreak(unittest.TestCase):
                 "status": ["LOSE", "PUSH", "LOSE"],
             }
         )
-        got = features_mod.compute_consecutive_non_win_streak(df, lookback_hours=0.1)
-        self.assertListEqual(got.tolist(), [1, 2, 2])
+        with self.assertRaises(ValueError):
+            features_mod.compute_consecutive_non_win_streak(df, lookback_hours=0.1)
 
 
-class TestLossStreakWrapper(unittest.TestCase):
+class TestRunBoundaryGamingDay(unittest.TestCase):
+    """Run must break on gaming_day change (parity contract)."""
+
+    def test_new_run_when_gaming_day_changes_even_if_gap_small(self) -> None:
+        df = pd.DataFrame(
+            {
+                "canonical_id": ["A", "A"],
+                "bet_id": [1, 2],
+                "payout_complete_dtm": pd.to_datetime(
+                    ["2026-01-01 23:59:00", "2026-01-02 00:01:00"]
+                ),
+                "gaming_day": [
+                    pd.Timestamp("2026-01-01").date(),
+                    pd.Timestamp("2026-01-02").date(),
+                ],
+                "wager": [10.0, 10.0],
+                "casino_win": [0.0, 0.0],
+            }
+        )
+        out = features_mod.compute_run_boundary(df)
+        self.assertEqual(out["run_id"].iloc[0], 0)
+        self.assertEqual(out["run_id"].iloc[1], 1)
+
+
+class TestLossStreakFeatures(unittest.TestCase):
     def test_loss_streak_wrapper_returns_dataframe_column(self) -> None:
         df = pd.DataFrame(
             {

@@ -9,23 +9,20 @@ This module owns the *coordination layer* between raw bet/session input and
 the per-row feature columns expected by the trainer/backtester/scorer:
 
 * ``apply_dq`` — FND-01 / FND-02 / FND-04 + R23 / DEC-018 timezone & DQ guards.
-* ``add_run_state_machine_features`` — run_state_machine features (loss streak,
-  run boundary, table HC) wired onto the bets DataFrame using the canonical
-  feature primitives in ``trainer.features``.
+* ``add_run_state_machine_features`` — run_state_machine run-boundary features
+  wired onto the bets DataFrame (bet-level streak / table HC are spec-disabled).
 
-This is a pure refactor extraction with **zero behavior change**:
-``trainer.training.trainer`` continues to re-export both functions so all
-historic call sites (backtester, tests, parallel_lda_mvp helpers) keep
-working unchanged.
+This was originally a pure refactor extraction with **zero behavior change**;
+engine selection for run boundaries (pandas vs optional DuckDB) and Phase 1
+performance tweaks are controlled from ``trainer.core._config_training_memory``.
 
 Notes on configuration
 ----------------------
 ``PLACEHOLDER_PLAYER_ID`` and the HK timezone (``HK_TZ``) are resolved from
 ``trainer.config`` (with the legacy top-level ``config`` fallback used by
-``trainer.py``). Feature primitives (``compute_loss_streak``,
-``compute_consecutive_non_win_streak``, ``compute_run_boundary``,
-``compute_table_hc``) are imported from ``trainer.features`` so this module
-remains a thin coordinator with no duplicated state-machine logic.
+``trainer.py``). Feature primitive ``compute_run_boundary`` is imported from
+``trainer.features`` so this module remains a thin coordinator with no
+duplicated state-machine logic.
 """
 
 from __future__ import annotations
@@ -40,19 +37,20 @@ import pandas as pd
 
 try:
     import config as _cfg  # type: ignore[import]
-    from features import (  # type: ignore[import]
-        compute_consecutive_non_win_streak,
-        compute_loss_streak,
-        compute_run_boundary,
-        compute_table_hc,
-    )
 except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
+
+try:
     from trainer.features import (  # type: ignore[import]
-        compute_consecutive_non_win_streak,
-        compute_loss_streak,
         compute_run_boundary,
-        compute_table_hc,
+        compute_run_boundary_duckdb,
+        run_boundary_frames_close,
+    )
+except ModuleNotFoundError:
+    from features import (  # type: ignore[import]
+        compute_run_boundary,
+        compute_run_boundary_duckdb,
+        run_boundary_frames_close,
     )
 
 logger = logging.getLogger(__name__)
@@ -212,9 +210,16 @@ def apply_dq(
             & (bets["player_id"] != PLACEHOLDER_PLAYER_ID)
         ].reset_index(drop=True)
 
-    # Ensure gaming_day exists (fallback: date of payout)
+    # gaming_day: t_bet contract — must come from source; no derivation/fallback.
     if "gaming_day" not in bets.columns:
-        bets["gaming_day"] = pd.to_datetime(bets["payout_complete_dtm"]).dt.date
+        raise ValueError(
+            "apply_dq: missing required column 'gaming_day' (expected from t_bet; no fallback)"
+        )
+    if not bets.empty and bets["gaming_day"].isna().any():
+        raise ValueError(
+            f"apply_dq: gaming_day must be non-null on all bets "
+            f"(found {int(bets['gaming_day'].isna().sum())} null rows)"
+        )
 
     # Ensure status column exists (for loss_streak)
     if "status" not in bets.columns:
@@ -236,6 +241,74 @@ def apply_dq(
     return bets, sessions
 
 
+def _run_index_assignable(df: pd.DataFrame) -> bool:
+    """Return True when each row is uniquely addressed by RangeIndex(0..n-1)."""
+    if not isinstance(df.index, pd.RangeIndex):
+        return False
+    if df.index.step != 1 or int(df.index.start) != 0:
+        return False
+    if df.index.has_duplicates:
+        return False
+    return int(df.index.stop) == len(df)
+
+
+def _assign_run_feature_columns(df: pd.DataFrame, run_df: pd.DataFrame) -> None:
+    """Project *run_df* run-boundary columns back onto *df* row order.
+
+    Uses numpy scatter when both frames use the default RangeIndex layout after DQ;
+    falls back to pandas ``reindex`` for exotic indices.
+    """
+    layout = (
+        ("run_id", np.int32, 0),
+        ("minutes_since_run_start", np.float64, 0.0),
+        ("bets_in_run_so_far", np.int32, 0),
+        ("wager_sum_in_run_so_far", np.float64, 0.0),
+        ("net_win_in_run_so_far", np.float64, 0.0),
+        ("net_win_per_bet_in_run", np.float64, 0.0),
+    )
+    idx = run_df.index.to_numpy()
+    if (
+        _run_index_assignable(df)
+        and idx.size > 0
+        and int(idx.min()) >= 0
+        and int(idx.max()) < len(df)
+    ):
+        for name, np_dt, fill in layout:
+            base = np.full(len(df), fill, dtype=np_dt)
+            raw = run_df[name].to_numpy(copy=False)
+            base[idx] = raw.astype(np_dt, copy=False)
+            df[name] = base
+        return
+    for name, _, fill in layout:
+        df[name] = run_df[name].reindex(df.index, fill_value=fill).to_numpy()
+
+
+def _dispatch_compute_run_boundary(bets: pd.DataFrame, window_end: datetime) -> pd.DataFrame:
+    """Resolve RUN_BOUNDARY_ENGINE (pandas vs duckdb) with optional parity + pandas fallback."""
+    eng = str(getattr(_cfg, "RUN_BOUNDARY_ENGINE", "pandas")).strip().lower()
+    parity = bool(getattr(_cfg, "RUN_BOUNDARY_PARITY_CHECK", False))
+    max_rows = int(getattr(_cfg, "RUN_BOUNDARY_PARITY_MAX_ROWS", 500_000))
+
+    if eng == "duckdb":
+        try:
+            duck = compute_run_boundary_duckdb(bets, cutoff_time=window_end, lookback_hours=None)
+            if parity and len(bets) <= max_rows:
+                pan = compute_run_boundary(bets, cutoff_time=window_end, lookback_hours=None)
+                if not run_boundary_frames_close(duck, pan):
+                    logger.error(
+                        "RUN_BOUNDARY duckdb parity mismatch vs pandas (rows=%d); using pandas",
+                        len(bets),
+                    )
+                    return pan
+            return duck
+        except Exception as exc:
+            logger.warning("RUN_BOUNDARY duckdb failed (%s); using pandas fallback", exc)
+            return compute_run_boundary(bets, cutoff_time=window_end, lookback_hours=None)
+    if eng != "pandas":
+        logger.warning("RUN_BOUNDARY_ENGINE=%r invalid; using pandas", eng)
+    return compute_run_boundary(bets, cutoff_time=window_end, lookback_hours=None)
+
+
 def add_run_state_machine_features(
     bets: pd.DataFrame,
     canonical_map: pd.DataFrame,
@@ -244,12 +317,19 @@ def add_run_state_machine_features(
 ) -> pd.DataFrame:
     """Return a copy of *bets* with run_state_machine feature columns attached.
 
-    A copy is taken so the caller's DataFrame is not mutated.  After column
-    pushdown, ``bets`` is already narrow (~20 cols), so the copy cost is low.
-    When ``lookback_hours`` is set (e.g. SCORER_LOOKBACK_HOURS), Track Human
-    features use only bets in (row_time - lookback_hours, row_time] for
-    train–serve parity with scorer.
+    A copy is taken so the caller's DataFrame is not mutated.
+
+    Bet-level streak / ``table_hc`` are no longer computed here (feature-spec
+    disabled); columns are zero-filled for backward compatibility.  Run-boundary
+    primitives use :func:`compute_run_boundary` (gap + ``gaming_day``; no
+    lookback window). Engine selection is controlled by ``RUN_BOUNDARY_ENGINE``
+    in ``trainer.core._config_training_memory`` (pandas default, duckdb optional).
     """
+    del canonical_map
+    if lookback_hours is not None:
+        raise ValueError(
+            "add_run_state_machine_features: lookback_hours is no longer supported (must be None)"
+        )
     df = bets.copy()
 
     if "canonical_id" not in df.columns:
@@ -262,42 +342,15 @@ def add_run_state_machine_features(
         df["wager_sum_in_run_so_far"] = 0.0
         df["net_win_in_run_so_far"] = 0.0
         df["net_win_per_bet_in_run"] = 0.0
+        df["table_hc"] = np.int32(0)
         return df
 
-    # loss_streak (cutoff = window_end so future bets don't influence streak)
-    streak = compute_loss_streak(df, cutoff_time=window_end, lookback_hours=lookback_hours)
-    df["loss_streak"] = streak.reindex(df.index, fill_value=0)
-    non_win_streak = compute_consecutive_non_win_streak(
-        df,
-        cutoff_time=window_end,
-        lookback_hours=lookback_hours,
-    )
-    df["consecutive_non_win_cnt"] = non_win_streak.reindex(df.index, fill_value=0)
+    df["loss_streak"] = np.int32(0)
+    df["consecutive_non_win_cnt"] = np.int32(0)
+    df["table_hc"] = np.int32(0)
 
-    # run_boundary (cutoff = window_end); reindex so rows beyond cutoff get 0 not NaN (Review #2)
-    run_df = compute_run_boundary(df, cutoff_time=window_end, lookback_hours=lookback_hours)
-    df["run_id"] = run_df["run_id"].reindex(df.index, fill_value=0).values
-    df["minutes_since_run_start"] = run_df["minutes_since_run_start"].reindex(df.index, fill_value=0.0).values
-    df["bets_in_run_so_far"] = run_df["bets_in_run_so_far"].reindex(df.index, fill_value=0).values
-    df["wager_sum_in_run_so_far"] = run_df["wager_sum_in_run_so_far"].reindex(df.index, fill_value=0.0).values
-    df["net_win_in_run_so_far"] = run_df["net_win_in_run_so_far"].reindex(df.index, fill_value=0.0).values
-    df["net_win_per_bet_in_run"] = run_df["net_win_per_bet_in_run"].reindex(df.index, fill_value=0.0).values
-
-    # table_hc (R7): same compute_table_hc as scorer — unique players per table in S1 window
-    _hc_missing = {"table_id", "bet_id", "payout_complete_dtm", "player_id"} - set(df.columns)
-    if _hc_missing:
-        logger.warning(
-            "add_run_state_machine_features: table_hc skipped — missing columns %s",
-            sorted(_hc_missing),
-        )
-        df["table_hc"] = np.int32(0)
-    else:
-        df["table_hc"] = (
-            compute_table_hc(df, cutoff_time=window_end)
-            .reindex(df.index, fill_value=0)
-            .astype("int32")
-            .to_numpy()
-        )
+    run_df = _dispatch_compute_run_boundary(df, window_end)
+    _assign_run_feature_columns(df, run_df)
 
     return df
 

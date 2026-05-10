@@ -9,6 +9,7 @@ import pytest
 
 from trainer.training.high_roller_segmentation import (
     compute_high_roller_cutoff_from_train_parquet,
+    count_distinct_canonical_rated_parquet,
     validate_high_roller_theo_nonempty_on_rated_train,
 )
 
@@ -21,6 +22,7 @@ def test_compute_high_roller_cutoff_from_train_parquet_duckdb_quantile_signature
     df = pd.DataFrame(
         {
             "is_rated": [True, True, True, True, False],
+            "canonical_id": ["a", "b", "c", "d", "z"],
             "theo_win_sum_30d": [10.0, 20.0, 30.0, 40.0, 1000.0],
         }
     )
@@ -38,6 +40,8 @@ def test_compute_high_roller_cutoff_from_train_parquet_duckdb_quantile_signature
     assert meta["high_roller_rated_train_row_count"] == 4
     assert meta["high_roller_segment_train_rated_rows_low"] == 3
     assert meta["high_roller_segment_train_rated_rows_high"] == 1
+    assert meta["high_roller_segment_train_rated_unique_canonical_low"] == 3
+    assert meta["high_roller_segment_train_rated_unique_canonical_high"] == 1
 
 
 def test_compute_high_roller_cutoff_constant_theo_yields_empty_low_segment(
@@ -48,6 +52,7 @@ def test_compute_high_roller_cutoff_constant_theo_yields_empty_low_segment(
     df = pd.DataFrame(
         {
             "is_rated": [True] * 100,
+            "canonical_id": [str(i) for i in range(100)],
             "theo_win_sum_30d": [0.0] * 100,
         }
     )
@@ -60,13 +65,17 @@ def test_compute_high_roller_cutoff_constant_theo_yields_empty_low_segment(
     assert cutoff == pytest.approx(0.0)
     assert meta["high_roller_segment_train_rated_rows_low"] == 0
     assert meta["high_roller_segment_train_rated_rows_high"] == 100
+    assert meta["high_roller_segment_train_rated_unique_canonical_low"] == 0
+    assert meta["high_roller_segment_train_rated_unique_canonical_high"] == 100
 
 
 def test_compute_high_roller_cutoff_raises_when_no_rated_train_rows(
     tmp_path: Path,
 ) -> None:
     p = tmp_path / "train.parquet"
-    pd.DataFrame({"is_rated": [False], "theo_win_sum_30d": [1.0]}).to_parquet(
+    pd.DataFrame(
+        {"is_rated": [False], "canonical_id": ["x"], "theo_win_sum_30d": [1.0]}
+    ).to_parquet(
         p, index=False
     )
 
@@ -82,6 +91,7 @@ def test_validate_high_roller_theo_nonempty_raises_when_all_null_on_rated(
     df = pd.DataFrame(
         {
             "is_rated": [True, True],
+            "canonical_id": ["p1", "p2"],
             "player_run_theo_sum_180d": [float("nan"), float("nan")],
         }
     )
@@ -94,6 +104,19 @@ def test_validate_high_roller_theo_nonempty_raises_when_all_null_on_rated(
 def test_validate_high_roller_theo_nonempty_passes_with_non_null(tmp_path: Path) -> None:
     p = tmp_path / "train.parquet"
     pd.DataFrame(
-        {"is_rated": [True], "player_run_theo_sum_180d": [1.0]}
+        {"is_rated": [True], "canonical_id": ["p1"], "player_run_theo_sum_180d": [1.0]}
     ).to_parquet(p, index=False)
     validate_high_roller_theo_nonempty_on_rated_train(p, "player_run_theo_sum_180d")
+
+
+def test_count_distinct_canonical_rated_parquet_ignores_unrated_and_null_cid(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "seg.parquet"
+    pd.DataFrame(
+        {
+            "is_rated": [True, True, True, False],
+            "canonical_id": ["a", "a", None, "b"],
+        }
+    ).to_parquet(p, index=False)
+    assert count_distinct_canonical_rated_parquet(p) == 1

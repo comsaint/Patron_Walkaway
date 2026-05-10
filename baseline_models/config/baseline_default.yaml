@@ -39,7 +39,7 @@ notes_contract:
 # Phase D：可選同窗 LightGBM（trainer training_metrics.json；路徑相對倉庫根）
 reference_model:
   enabled: true
-  training_metrics_path: out/models/20260408-173809-e472fd0/training_metrics.json
+  training_metrics_path: package/deploy/models/training_metrics.json
   metrics_section: rated
 
 # Tier-0 R1（pace）：與 SSOT §4.1 一致；合成資料已含下列欄位

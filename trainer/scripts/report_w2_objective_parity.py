@@ -150,10 +150,10 @@ def build_markdown(rows: list[RunRow]) -> str:
 
     lines.append("## Objective Group Summary")
     lines.append("")
-    lines.append("| objective_mode | rows | mean_bt_optuna_precision_prod_adjusted | mean_bt_optuna_recall |")
+    lines.append("| objective_mode | rows | mean_bt_optuna_test_precision | mean_bt_optuna_recall |")
     lines.append("| :--- | ---: | ---: | ---: |")
     for mode, rs in sorted(modes.items(), key=lambda x: x[0]):
-        m_prec = _mean_or_none([x.bt_optuna_test_precision_prod_adjusted for x in rs])
+        m_prec = _mean_or_none([x.bt_optuna_test_precision for x in rs])
         m_rec = _mean_or_none([x.bt_optuna_test_recall for x in rs])
         lines.append(
             f"| `{mode}` | {len(rs)} | "
@@ -167,10 +167,12 @@ def build_markdown(rows: list[RunRow]) -> str:
     lines.append("| :--- | :--- | :--- |")
     lines.append("| selection_mode | `selection_mode` | top-level `selection_mode` |")
     lines.append("| objective mode | `optuna_hpo_objective_mode` | N/A |")
-    lines.append("| precision_raw | `test_precision` | `model_default.test_precision` / `optuna.test_precision` |")
     lines.append(
-        "| precision_prod_adjusted | `test_precision_prod_adjusted` | "
-        "`model_default.test_precision_prod_adjusted` / `optuna.test_precision_prod_adjusted` |"
+        "| training headline precision | `test_precision` (raw) | N/A when absent from merged flat metrics |"
+    )
+    lines.append(
+        "| precision_prod_adjusted (legacy / execution) | `test_precision_prod_adjusted` if present | "
+        "`model_default.*` / `optuna.*` prod_adjusted columns |"
     )
     lines.append("| recall | `test_recall` | `model_default.test_recall` / `optuna.test_recall` |")
     lines.append("| alerts_per_hour | N/A | `model_default.alerts_per_hour` / `optuna.alerts_per_hour` |")

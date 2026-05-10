@@ -111,15 +111,22 @@ def _flatten_v3_training_metrics(tm: dict[str, Any]) -> dict[str, Any]:
         ft = blob.get("field_test")
         if isinstance(ft, dict):
             if split == "test":
+                # Legacy v3 field_test only: prod_adjusted could differ from raw.
                 ppa = ft.get("precision_prod_adjusted")
                 if ppa is not None:
                     out.setdefault("test_precision_prod_adjusted", ppa)
+                pr = ft.get("precision_raw")
                 pus = ft.get("precision_used_for_selection")
-                if pus is not None:
+                if pr is not None:
+                    out.setdefault("test_precision", pr)
+                elif pus is not None:
                     out.setdefault("test_precision", pus)
             elif split == "val":
+                pr = ft.get("precision_raw")
                 vus = ft.get("precision_used_for_selection")
-                if vus is not None:
+                if pr is not None:
+                    out.setdefault("val_precision", pr)
+                elif vus is not None:
                     out.setdefault("val_precision", vus)
     return out
 

@@ -100,8 +100,6 @@ def test_load_training_metrics_merged_v3_first_merges_and_overrides_v2(tmp_path:
                     "recall": 0.2,
                     "field_test": {
                         "precision_raw": 0.88,
-                        "precision_used_for_selection": 0.88,
-                        "precision_prod_adjusted": None,
                         "precision_type": "raw",
                     },
                 }
@@ -224,3 +222,50 @@ def test_report_w2_row_from_run_dir_v2_only(tmp_path: Path) -> None:
     assert row.selection_mode_train == "field_test"
     assert row.train_test_precision == 0.31
     assert row.train_test_precision_prod_adjusted == 0.28
+
+
+def test_load_training_metrics_merged_v3_legacy_field_test_prod_adjusted(tmp_path: Path) -> None:
+    """Backward compat: old v3 ``field_test`` may still carry precision_prod_adjusted."""
+    _write(
+        tmp_path / "training_metrics.v3.json",
+        {
+            "schema_version": "training-metrics.v3",
+            "model_version": "mv3",
+            "selection_mode": "field_test",
+            "neg_pos_ratio_overview": {
+                "neg_pos_ratio_contract": "n_neg / n_pos",
+                "primary_model": {
+                    "train": {"neg_pos_ratio": None, "source": "unavailable"},
+                    "val": {"neg_pos_ratio": None, "source": "unavailable"},
+                    "test": {"neg_pos_ratio": None, "source": "unavailable"},
+                },
+                "segments": [],
+            },
+            "objective_contract": {
+                "selection_metric_id": "x",
+                "threshold": {"selected": 0.4, "recall_floor": 0.01},
+                "constraints": {},
+                "gate": {},
+                "observed_split_ratios": {},
+            },
+            "datasets": {
+                "test": {
+                    "precision": 0.88,
+                    "recall": 0.2,
+                    "field_test": {
+                        "precision_raw": 0.88,
+                        "precision_used_for_selection": 0.45,
+                        "precision_prod_adjusted": 0.45,
+                        "precision_type": "prod_adjusted",
+                    },
+                }
+            },
+            "segmentation": {"enabled": False},
+            "selection": {},
+            "execution": {},
+        },
+    )
+    src, flat = load_training_metrics_merged(tmp_path)
+    assert src == "training_metrics.v3.json"
+    assert flat["test_precision"] == 0.88
+    assert flat["test_precision_prod_adjusted"] == 0.45

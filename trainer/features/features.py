@@ -37,7 +37,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -229,6 +229,19 @@ def get_profile_feature_cols(max_lookback_days: int = 365) -> List[str]:
 # Feature Spec YAML helpers (PLAN: 特徵整合 Step 2)
 # ---------------------------------------------------------------------------
 
+def _candidate_is_disabled(val: object) -> bool:
+    """True when YAML marks ``enabled: false`` / 0 / \"false\" on a candidate."""
+    if val is False:
+        return True
+    if val is True or val is None:
+        return False
+    if isinstance(val, int) and val == 0:
+        return True
+    if isinstance(val, str) and val.strip().lower() in ("false", "no", "off"):
+        return True
+    return False
+
+
 def _is_screening_ineligible(val) -> bool:
     """Return True if *val* explicitly marks a candidate as not screening-eligible.
 
@@ -298,6 +311,8 @@ def get_candidate_feature_ids(
     out: List[str] = []
     for c in candidates:
         if not isinstance(c, dict):
+            continue
+        if _candidate_is_disabled(c.get("enabled", True)):
             continue
         fid = c.get("feature_id")
         if not fid:
@@ -649,89 +664,12 @@ _REQUIRED_STREAK_COLS: frozenset[str] = frozenset(
     {"canonical_id", "bet_id", "payout_complete_dtm", "status"}
 )
 _REQUIRED_RUN_COLS: frozenset[str] = frozenset(
-    {"canonical_id", "bet_id", "payout_complete_dtm"}
+    {"canonical_id", "bet_id", "payout_complete_dtm", "gaming_day"}
 )
 
-# Optional numba kernel for lookback streak (PLAN § Phase 2 Track Human Lookback 向量化)
-try:
-    from numba import jit as numba_jit
-
-    @numba_jit(nopython=True, cache=True)
-    def _streak_lookback_numba(times, status, push_resets, delta_ns, out):
-        # times: int64 array (nanoseconds), status: int8 (1=LOSE,2=WIN,3=PUSH), out: int32
-        n = times.shape[0]
-        lo = 0
-        for i in range(n):
-            t_i = times[i]
-            lo_bound = t_i - delta_ns
-            while lo < i and times[lo] <= lo_bound:
-                lo += 1
-            streak = 0
-            for j in range(lo, i + 1):
-                s = status[j]
-                if s == 2:  # WIN
-                    streak = 0
-                elif s == 3:  # PUSH
-                    if push_resets:
-                        streak = 0
-                elif s == 1:  # LOSE
-                    streak += 1
-            out[i] = streak
-except Exception:
-    _streak_lookback_numba = None
-
-# Optional numba kernel for run_boundary lookback (PLAN § Phase 2 Track Human Lookback 向量化)
-try:
-    from numba import jit as _numba_jit_run
-
-    @_numba_jit_run(nopython=True, cache=True)
-    def _run_boundary_lookback_numba(
-        times_ns,
-        wager,
-        casino_win,
-        run_break_min_ns,
-        delta_ns,
-        out_run_id,
-        out_min_since,
-        out_bets_in_run,
-        out_wager_sum,
-        out_net_win,
-    ):
-        # times_ns: int64 (nanoseconds), wager: float64, run_break_min_ns/delta_ns: int64
-        # outputs: int32, float64, int32, float64
-        n = times_ns.shape[0]
-        lo = 0
-        for i in range(n):
-            t_i = times_ns[i]
-            lo_bound = t_i - delta_ns
-            while lo < i and times_ns[lo] <= lo_bound:
-                lo += 1
-            run_id = 0
-            run_start_ns = times_ns[lo]
-            bets_in_run_cur = 0
-            wager_sum_cur = 0.0
-            net_win_cur = 0.0
-            for j in range(lo, i + 1):
-                gap_ns = times_ns[j] - times_ns[j - 1] if j > lo else 0
-                is_new_run = (j == lo) or (gap_ns >= run_break_min_ns)
-                if is_new_run:
-                    if j > lo:
-                        run_id += 1
-                    run_start_ns = times_ns[j]
-                    bets_in_run_cur = 1
-                    wager_sum_cur = wager[j]
-                    net_win_cur = -casino_win[j]
-                else:
-                    bets_in_run_cur += 1
-                    wager_sum_cur += wager[j]
-                    net_win_cur += -casino_win[j]
-            out_run_id[i] = run_id
-            out_min_since[i] = (times_ns[i] - run_start_ns) / (60.0 * 1e9)
-            out_bets_in_run[i] = bets_in_run_cur
-            out_wager_sum[i] = wager_sum_cur
-            out_net_win[i] = net_win_cur
-except Exception:
-    _run_boundary_lookback_numba = None
+# Legacy test hooks: lookback kernels removed with lookback_hours path; keep names as None.
+_streak_lookback_numba = None
+_run_boundary_lookback_numba = None
 
 _REQUIRED_HC_COLS: frozenset[str] = frozenset(
     {"table_id", "bet_id", "payout_complete_dtm", "player_id"}
@@ -756,8 +694,8 @@ def compute_loss_streak(
     G3: sorted by (canonical_id, payout_complete_dtm, bet_id) before computing.
     TRN-09 / E2: only bets with ``payout_complete_dtm <= cutoff_time`` are
     considered; if ``cutoff_time`` is None all bets in ``bets_df`` are used.
-    When ``lookback_hours`` is set (e.g. SCORER_LOOKBACK_HOURS for train–serve
-    parity), streak at row i uses only bets in (t_i - lookback_hours, t_i].
+    ``lookback_hours`` is rejected — time-window streaks were removed in favor
+    of full-sequence semantics within the provided frame.
 
     Parameters
     ----------
@@ -771,9 +709,7 @@ def compute_loss_streak(
         cutoff receive NaN (use them for context if needed, but not for
         training labels).
     lookback_hours : float | None
-        If set, for each row only bets with payout_complete_dtm in
-        (row_time - lookback_hours, row_time] are used (train–serve parity
-        with scorer's fetch window). None = use all bets (current behavior).
+        Must be ``None``. Non-None values raise ``ValueError``.
 
     Returns
     -------
@@ -784,8 +720,10 @@ def compute_loss_streak(
     missing = _REQUIRED_STREAK_COLS - set(bets_df.columns)
     if missing:
         raise ValueError(f"compute_loss_streak: missing columns {sorted(missing)}")
-    if lookback_hours is not None and lookback_hours <= 0:
-        raise ValueError("lookback_hours must be positive when set")
+    if lookback_hours is not None:
+        raise ValueError(
+            "compute_loss_streak: lookback_hours is no longer supported (must be None)"
+        )
 
     df = bets_df.copy()
 
@@ -803,91 +741,6 @@ def compute_loss_streak(
         ascending=True,
         kind="stable",
     )
-
-    if lookback_hours is not None and lookback_hours > 0:
-        # Per-row context: for each row only use bets in (t - lookback_hours, t].
-        # Phase 2 (PLAN § Track Human Lookback 向量化): numba two-pointer when available.
-        delta_ns = int(float(lookback_hours) * 1e9 * 3600)
-        if delta_ns <= 0 or delta_ns > _LOOKBACK_MAX_DELTA_NS:
-            raise ValueError(_LOOKBACK_BOUNDS_MSG)
-        delta = pd.Timedelta(hours=float(lookback_hours))
-        push_resets_int = 1 if LOSS_STREAK_PUSH_RESETS else 0
-        out_list: List[tuple] = []
-        use_numba = _streak_lookback_numba is not None
-        if use_numba:
-            try:
-                for _cid, grp in df.groupby("canonical_id", sort=False):
-                    # Review #1: groups with NaT use Python path to match fallback semantics (STATUS.md).
-                    if grp["payout_complete_dtm"].isna().any():
-                        times = pd.to_datetime(grp["payout_complete_dtm"], utc=False)
-                        for idx, t in zip(grp.index, times):
-                            lo = t - delta
-                            sub = grp.loc[(times > lo) & (times <= t)]
-                            if sub.empty:
-                                out_list.append((idx, 0))
-                                continue
-                            sub = sub.sort_values(["payout_complete_dtm", "bet_id"], kind="stable")
-                            _is_lose = (sub["status"] == "LOSE").astype("int8")
-                            _is_reset = (
-                                (sub["status"] == "WIN")
-                                | ((sub["status"] == "PUSH") & LOSS_STREAK_PUSH_RESETS)
-                            ).astype("int8")
-                            _reset_grp = _is_reset.cumsum()
-                            streak_sub = _is_lose.groupby(_reset_grp.values, sort=False).cumsum().astype("int32")
-                            out_list.append((idx, int(streak_sub.iloc[-1])))
-                        continue
-                    times_ns = _datetime_to_ns_int64(grp["payout_complete_dtm"])
-                    status_arr = (
-                        grp["status"]
-                        .map({"LOSE": 1, "WIN": 2, "PUSH": 3})
-                        .fillna(0)
-                        .astype(np.int8)
-                    )
-                    out_arr = np.zeros(len(grp), dtype=np.int32)
-                    _streak_lookback_numba(
-                        times_ns,
-                        status_arr.values,
-                        np.int8(push_resets_int),
-                        np.int64(delta_ns),
-                        out_arr,
-                    )
-                    for idx, val in zip(grp.index, out_arr):
-                        out_list.append((idx, int(val)))
-            except Exception as e:
-                logger.warning(
-                    "compute_loss_streak: numba lookback failed (%s), falling back to Python path",
-                    e,
-                )
-                use_numba = False
-        if not use_numba:
-            if len(df) > 100_000:
-                logger.warning(
-                    "compute_loss_streak: lookback without numba on %d rows may be slow (7h+ at 25M)",
-                    len(df),
-                )
-            out_list = []
-            for cid, grp in df.groupby("canonical_id", sort=False):
-                times = pd.to_datetime(grp["payout_complete_dtm"], utc=False)
-                for idx, t in zip(grp.index, times):
-                    lo = t - delta
-                    sub = grp.loc[(times > lo) & (times <= t)]
-                    if sub.empty:
-                        out_list.append((idx, 0))
-                        continue
-                    sub = sub.sort_values(["payout_complete_dtm", "bet_id"], kind="stable")
-                    _is_lose = (sub["status"] == "LOSE").astype("int8")
-                    _is_reset = (
-                        (sub["status"] == "WIN")
-                        | ((sub["status"] == "PUSH") & LOSS_STREAK_PUSH_RESETS)
-                    ).astype("int8")
-                    _reset_grp = _is_reset.cumsum()
-                    streak_sub = _is_lose.groupby(_reset_grp.values, sort=False).cumsum().astype("int32")
-                    out_list.append((idx, int(streak_sub.iloc[-1])))
-        streak = pd.Series(
-            {idx: v for idx, v in out_list},
-            dtype="int32",
-        ).reindex(df.index, fill_value=0)
-        return streak
 
     # Vectorized streak using cumsum-of-resets approach (no lookback):
     #   - A "reset" event starts a new group (WIN, or PUSH if LOSS_STREAK_PUSH_RESETS)
@@ -975,6 +828,10 @@ def compute_consecutive_non_win_streak(
     if missing:
         raise ValueError(
             f"compute_consecutive_non_win_streak: missing columns {sorted(missing)}"
+        )
+    if lookback_hours is not None:
+        raise ValueError(
+            "compute_consecutive_non_win_streak: lookback_hours is no longer supported (must be None)"
         )
 
     # Reuse compute_loss_streak's optimized lookback implementation:
@@ -1109,18 +966,18 @@ def compute_run_boundary(
 ) -> pd.DataFrame:
     """Assign run_id and minutes_since_run_start for each bet.
 
-    A new run starts at the first bet of each canonical_id, and again
-    whenever the gap to the previous bet (within the same canonical_id)
-    is >= ``RUN_BREAK_MIN`` minutes (B2 correction).
+    A new run starts at the first bet of each canonical_id, and again when
+    the gap to the previous bet is >= ``RUN_BREAK_MIN`` minutes (B2) or when
+    ``gaming_day`` changes versus the previous bet (run cannot span gaming days).
+
+    ``gaming_day`` must be present and non-null on every row (t_bet contract).
 
     G3: sorted by (canonical_id, payout_complete_dtm, bet_id) internally.
-    When ``lookback_hours`` is set (e.g. SCORER_LOOKBACK_HOURS for train–serve
-    parity), run at row i is computed only from bets in (t_i - lookback_hours, t_i].
 
     Parameters
     ----------
     bets_df : DataFrame
-        Required columns: canonical_id, bet_id, payout_complete_dtm.
+        Required columns: canonical_id, bet_id, payout_complete_dtm, gaming_day.
     cutoff_time : datetime | None
         If set, bets with ``payout_complete_dtm > cutoff_time`` are excluded
         from the result (mirrors the API of ``compute_loss_streak`` —
@@ -1130,9 +987,7 @@ def compute_run_boundary(
         Must be **tz-naive** (DEC-018 contract); ``payout_complete_dtm`` is
         expected to be tz-naive after ``apply_dq`` normalisation.
     lookback_hours : float | None
-        If set, for each row only bets with payout_complete_dtm in
-        (row_time - lookback_hours, row_time] are used (train–serve parity).
-        None = use all bets (current behavior).
+        Must be ``None`` (lookback-based run boundaries were removed).
 
     Returns
     -------
@@ -1149,8 +1004,10 @@ def compute_run_boundary(
     missing = _REQUIRED_RUN_COLS - set(bets_df.columns)
     if missing:
         raise ValueError(f"compute_run_boundary: missing columns {sorted(missing)}")
-    if lookback_hours is not None and lookback_hours <= 0:
-        raise ValueError("lookback_hours must be positive when set")
+    if lookback_hours is not None:
+        raise ValueError(
+            "compute_run_boundary: lookback_hours is no longer supported (must be None)"
+        )
 
     if bets_df.empty:
         result = bets_df.copy()
@@ -1167,180 +1024,77 @@ def compute_run_boundary(
     # even when the caller only wants observations within a window).
     cutoff_ts = pd.Timestamp(cutoff_time) if cutoff_time is not None else None
 
-    # G3 sort
+    # G3 sort (returns a new frame; avoid an extra full copy right after sort).
     df = bets_df.sort_values(
         ["canonical_id", "payout_complete_dtm", "bet_id"],
         ascending=True,
         kind="stable",
-    ).copy()
+    )
+    # Compress high-cardinality groupby key to int codes for cheaper groupby/cumsum.
+    _cid, _ = pd.factorize(df["canonical_id"], sort=False)
+    df["_cid"] = _cid.astype("int32", copy=False)
 
-    if lookback_hours is not None and lookback_hours > 0:
-        # Per-row context: for each row only use bets in (t - lookback_hours, t].
-        # Phase 2 (PLAN § Track Human Lookback 向量化): numba two-pointer when available.
-        delta_ns = int(float(lookback_hours) * 1e9 * 3600)
-        if delta_ns <= 0 or delta_ns > _LOOKBACK_MAX_DELTA_NS:
-            raise ValueError(_LOOKBACK_BOUNDS_MSG)
-        run_break_min_ns = int(float(RUN_BREAK_MIN) * 60 * 1e9)
-        if run_break_min_ns < 0 or run_break_min_ns > _RUN_BREAK_MAX_NS:
-            raise ValueError(_RUN_BREAK_BOUNDS_MSG)
-        delta = pd.Timedelta(hours=float(lookback_hours))
-        run_id_list: List[tuple] = []
-        min_since_list: List[tuple] = []
-        bets_in_run_list: List[tuple] = []
-        wager_sum_list: List[tuple] = []
-        net_win_list: List[tuple] = []
-        use_numba = _run_boundary_lookback_numba is not None
+    if df["gaming_day"].isna().any():
+        n = int(df["gaming_day"].isna().sum())
+        raise ValueError(
+            f"compute_run_boundary: gaming_day must be non-null (found {n} null rows)"
+        )
 
-        def _run_boundary_python_loop(grp: pd.DataFrame, times: pd.Series) -> None:
-            # Review #1 (STATUS Code Review 2026-03-11): when group has NaT, 0 for NaT rows.
-            has_nat = times.isna().any()
-            for idx, t in zip(grp.index, times):
-                if has_nat and pd.isna(t):
-                    run_id_list.append((idx, 0))
-                    min_since_list.append((idx, 0.0))
-                    bets_in_run_list.append((idx, 0))
-                    wager_sum_list.append((idx, 0.0))
-                    net_win_list.append((idx, 0.0))
-                    continue
-                lo = t - delta
-                mask = (times.notna()) & (times > lo) & (times <= t) if has_nat else (times > lo) & (times <= t)
-                sub = grp.loc[mask]
-                if sub.empty:
-                    run_id_list.append((idx, 0))
-                    min_since_list.append((idx, 0.0))
-                    bets_in_run_list.append((idx, 0))
-                    wager_sum_list.append((idx, 0.0))
-                    net_win_list.append((idx, 0.0))
-                    continue
-                sub = sub.sort_values(["payout_complete_dtm", "bet_id"], kind="stable")
-                prev = sub["payout_complete_dtm"].shift(1)
-                gap_min = (sub["payout_complete_dtm"] - prev).dt.total_seconds().div(60)
-                is_new = prev.isna() | (gap_min >= RUN_BREAK_MIN)
-                run_id_sub = is_new.astype("int8").cumsum().sub(1).astype("int32")
-                run_start = sub["payout_complete_dtm"].where(is_new).ffill()
-                min_since = (sub["payout_complete_dtm"] - run_start).dt.total_seconds().div(60)
-                bets_in_run = run_id_sub.groupby(run_id_sub).cumcount() + 1
-                wager_sub = (
-                    sub["wager"].fillna(0.0).groupby(run_id_sub, sort=False).cumsum()
-                    if "wager" in sub.columns
-                    else pd.Series(0.0, index=sub.index)
-                )
-                net_win_sub = (
-                    (-sub["casino_win"].fillna(0.0)).groupby(run_id_sub, sort=False).cumsum()
-                    if "casino_win" in sub.columns
-                    else pd.Series(0.0, index=sub.index)
-                )
-                run_id_list.append((idx, int(run_id_sub.iloc[-1])))
-                min_since_list.append((idx, float(min_since.iloc[-1])))
-                bets_in_run_list.append((idx, int(bets_in_run.iloc[-1])))
-                wager_sum_list.append((idx, float(wager_sub.iloc[-1])))
-                net_win_list.append((idx, float(net_win_sub.iloc[-1])))
+    # Gap to previous bet within canonical_id (NaT for the first bet)
+    prev_payout = df.groupby("_cid", sort=False)["payout_complete_dtm"].shift(1)
+    gap_min = (df["payout_complete_dtm"] - prev_payout).dt.total_seconds().div(60)
 
-        for cid, grp in df.groupby("canonical_id", sort=False):
-            times = pd.to_datetime(grp["payout_complete_dtm"], utc=False)
-            if use_numba:
-                try:
-                    if times.isna().any():
-                        _run_boundary_python_loop(grp, times)
-                        continue
-                    times_ns = _datetime_to_ns_int64(grp["payout_complete_dtm"])
-                    wager_arr = (
-                        grp["wager"].fillna(0.0).to_numpy(dtype=np.float64, copy=True)
-                        if "wager" in grp.columns
-                        else np.zeros(len(grp), dtype=np.float64)
-                    )
-                    casino_win_arr = (
-                        grp["casino_win"].fillna(0.0).to_numpy(dtype=np.float64, copy=True)
-                        if "casino_win" in grp.columns
-                        else np.zeros(len(grp), dtype=np.float64)
-                    )
-                    out_run_id = np.zeros(len(grp), dtype=np.int32)
-                    out_min_since = np.zeros(len(grp), dtype=np.float64)
-                    out_bets_in_run = np.zeros(len(grp), dtype=np.int32)
-                    out_wager_sum = np.zeros(len(grp), dtype=np.float64)
-                    out_net_win = np.zeros(len(grp), dtype=np.float64)
-                    _run_boundary_lookback_numba(
-                        times_ns,
-                        wager_arr,
-                        casino_win_arr,
-                        np.int64(run_break_min_ns),
-                        np.int64(delta_ns),
-                        out_run_id,
-                        out_min_since,
-                        out_bets_in_run,
-                        out_wager_sum,
-                        out_net_win,
-                    )
-                    for k, idx in enumerate(grp.index):
-                        run_id_list.append((idx, int(out_run_id[k])))
-                        min_since_list.append((idx, float(out_min_since[k])))
-                        bets_in_run_list.append((idx, int(out_bets_in_run[k])))
-                        wager_sum_list.append((idx, float(out_wager_sum[k])))
-                        net_win_list.append((idx, float(out_net_win[k])))
-                except Exception as e:
-                    logger.warning(
-                        "compute_run_boundary: numba lookback failed (%s), falling back to Python path",
-                        e,
-                    )
-                    use_numba = False
-                    _run_boundary_python_loop(grp, times)
-            else:
-                _run_boundary_python_loop(grp, times)
-        if not use_numba and len(df) > 100_000:
-            logger.warning(
-                "compute_run_boundary: lookback without numba on %d rows may be slow (7h+ at 25M)",
-                len(df),
-            )
-        df["run_id"] = pd.Series({i: v for i, v in run_id_list}, dtype="int32").reindex(df.index, fill_value=0).values
-        df["minutes_since_run_start"] = pd.Series({i: v for i, v in min_since_list}, dtype="float64").reindex(df.index, fill_value=0.0).values
-        df["bets_in_run_so_far"] = pd.Series({i: v for i, v in bets_in_run_list}, dtype="int32").reindex(df.index, fill_value=0).values
-        df["wager_sum_in_run_so_far"] = pd.Series({i: v for i, v in wager_sum_list}, dtype="float64").reindex(df.index, fill_value=0.0).values
-        df["net_win_in_run_so_far"] = pd.Series({i: v for i, v in net_win_list}, dtype="float64").reindex(df.index, fill_value=0.0).values
+    df["_gd_norm"] = pd.to_datetime(df["gaming_day"], errors="coerce").dt.normalize()
+    if df["_gd_norm"].isna().any():
+        n = int(df["_gd_norm"].isna().sum())
+        raise ValueError(
+            f"compute_run_boundary: gaming_day must parse as datetime/date (found {n} invalid rows)"
+        )
+    prev_gd = df.groupby("_cid", sort=False)["_gd_norm"].shift(1)
+    day_changed = prev_gd.notna() & (df["_gd_norm"] != prev_gd)
+    df = df.drop(columns=["_gd_norm"])
+
+    # New run: first bet of cid, long gap between payouts, or gaming_day boundary
+    is_new_run = prev_payout.isna() | (gap_min >= RUN_BREAK_MIN) | day_changed
+
+    # run_id = cumsum of is_new_run, minus 1 so it starts at 0.
+    df["_is_new_run"] = is_new_run.astype("int8")
+    df["run_id"] = (
+        df.groupby("_cid", sort=False)["_is_new_run"]
+        .cumsum()
+        .sub(1)
+        .astype("int32")
+    )
+
+    # Run start time: payout_complete_dtm at the first bet of each run,
+    # forward-filled within canonical_id so all bets in a run share the same start.
+    df["_run_start"] = df["payout_complete_dtm"].where(df["_is_new_run"].astype(bool))
+    df["_run_start"] = df.groupby("_cid", sort=False)["_run_start"].ffill()
+
+    df["minutes_since_run_start"] = (
+        (df["payout_complete_dtm"] - df["_run_start"]).dt.total_seconds().div(60)
+    )
+
+    # Run-level cumulative features (bets in run so far, wager sum in run so far)
+    df["bets_in_run_so_far"] = (
+        df.groupby(["_cid", "run_id"], sort=False).cumcount() + 1
+    ).astype("int32")
+    if "wager" in df.columns:
+        _w = pd.to_numeric(df["wager"], errors="coerce").fillna(0.0)
+        df["wager_sum_in_run_so_far"] = (
+            df.assign(_w=_w).groupby(["_cid", "run_id"], sort=False)["_w"].cumsum()
+        )
     else:
-        # Gap to previous bet within canonical_id (NaT for the first bet)
-        prev_payout = df.groupby("canonical_id", sort=False)["payout_complete_dtm"].shift(1)
-        gap_min = (df["payout_complete_dtm"] - prev_payout).dt.total_seconds().div(60)
-
-        # New run: first bet of cid (prev_payout is NaT) OR gap >= RUN_BREAK_MIN
-        is_new_run = prev_payout.isna() | (gap_min >= RUN_BREAK_MIN)
-
-        # run_id = cumsum of is_new_run, minus 1 so it starts at 0.
-        df["_is_new_run"] = is_new_run.astype("int8")
-        df["run_id"] = (
-            df.groupby("canonical_id", sort=False)["_is_new_run"]
-            .cumsum()
-            .sub(1)
-            .astype("int32")
+        df["wager_sum_in_run_so_far"] = 0.0
+    if "casino_win" in df.columns:
+        _nw = -pd.to_numeric(df["casino_win"], errors="coerce").fillna(0.0)
+        df["net_win_in_run_so_far"] = (
+            df.assign(_nw=_nw).groupby(["_cid", "run_id"], sort=False)["_nw"].cumsum()
         )
+    else:
+        df["net_win_in_run_so_far"] = 0.0
 
-        # Run start time: payout_complete_dtm at the first bet of each run,
-        # forward-filled within canonical_id so all bets in a run share the same start.
-        df["_run_start"] = df["payout_complete_dtm"].where(df["_is_new_run"].astype(bool))
-        df["_run_start"] = df.groupby("canonical_id", sort=False)["_run_start"].ffill()
-
-        df["minutes_since_run_start"] = (
-            (df["payout_complete_dtm"] - df["_run_start"]).dt.total_seconds().div(60)
-        )
-
-        # Run-level cumulative features (bets in run so far, wager sum in run so far)
-        df["bets_in_run_so_far"] = (
-            df.groupby(["canonical_id", "run_id"], sort=False).cumcount() + 1
-        ).astype("int32")
-        if "wager" in df.columns:
-            df["wager_sum_in_run_so_far"] = (
-                df.groupby(["canonical_id", "run_id"], sort=False)["wager"].cumsum()
-            )
-        else:
-            df["wager_sum_in_run_so_far"] = 0.0
-        if "casino_win" in df.columns:
-            df["net_win_in_run_so_far"] = (
-                df.groupby(["canonical_id", "run_id"], sort=False)["casino_win"]
-                .transform(lambda s: (-s.fillna(0.0)).cumsum())
-            )
-        else:
-            df["net_win_in_run_so_far"] = 0.0
-
-        df = df.drop(columns=["_is_new_run", "_run_start"])
+    df = df.drop(columns=["_is_new_run", "_run_start", "_cid"])
 
     # Run-level per-bet net win (contract: denominator 0 -> 0.0).
     # bets_in_run_so_far is 1-based by construction, so zero should only occur on defensive paths.
@@ -1356,6 +1110,228 @@ def compute_run_boundary(
         df = df[df["payout_complete_dtm"] <= cutoff_ts].copy()
 
     return df
+
+
+def run_boundary_frames_close(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    *,
+    rtol: float = 1e-9,
+    atol: float = 1e-6,
+) -> bool:
+    """Return True when *left* and *right* match on the run-boundary row contract.
+
+    Rows are aligned by stable sort on ``(canonical_id, payout_complete_dtm, bet_id)``.
+    """
+    keys = ("canonical_id", "payout_complete_dtm", "bet_id")
+    for k in keys:
+        if k not in left.columns or k not in right.columns:
+            return False
+    l = left.sort_values(list(keys), ascending=True, kind="stable").reset_index(drop=True)
+    r = right.sort_values(list(keys), ascending=True, kind="stable").reset_index(drop=True)
+    if len(l) != len(r):
+        return False
+    if not (l["canonical_id"].astype(str).to_numpy() == r["canonical_id"].astype(str).to_numpy()).all():
+        return False
+    if not (l["payout_complete_dtm"].to_numpy() == r["payout_complete_dtm"].to_numpy()).all():
+        return False
+    if not (l["bet_id"].to_numpy() == r["bet_id"].to_numpy()).all():
+        return False
+
+    int_cols = ("run_id", "bets_in_run_so_far")
+    float_cols = (
+        "minutes_since_run_start",
+        "wager_sum_in_run_so_far",
+        "net_win_in_run_so_far",
+        "net_win_per_bet_in_run",
+    )
+    for c in int_cols:
+        if c not in l.columns or c not in r.columns:
+            return False
+        if not (l[c].to_numpy(dtype="int64") == r[c].to_numpy(dtype="int64")).all():
+            return False
+    for c in float_cols:
+        if c not in l.columns or c not in r.columns:
+            return False
+        if not np.allclose(
+            l[c].to_numpy(dtype="float64"),
+            r[c].to_numpy(dtype="float64"),
+            rtol=rtol,
+            atol=atol,
+            equal_nan=True,
+        ):
+            return False
+    return True
+
+
+def compute_run_boundary_duckdb(
+    bets_df: pd.DataFrame,
+    cutoff_time: Optional[datetime] = None,
+    lookback_hours: Optional[float] = None,
+) -> pd.DataFrame:
+    """DuckDB window-engine implementation of :func:`compute_run_boundary` (PoC path).
+
+    Returns the same sorted-frame contract; on failure callers should fall back to pandas.
+    """
+    import duckdb  # type: ignore[import-untyped]
+
+    missing = _REQUIRED_RUN_COLS - set(bets_df.columns)
+    if missing:
+        raise ValueError(f"compute_run_boundary_duckdb: missing columns {sorted(missing)}")
+    if lookback_hours is not None:
+        raise ValueError(
+            "compute_run_boundary_duckdb: lookback_hours is no longer supported (must be None)"
+        )
+
+    if bets_df.empty:
+        result = bets_df.copy()
+        result["run_id"] = pd.array([], dtype="int32")
+        result["minutes_since_run_start"] = pd.array([], dtype="float64")
+        result["bets_in_run_so_far"] = pd.array([], dtype="int32")
+        result["wager_sum_in_run_so_far"] = pd.array([], dtype="float64")
+        result["net_win_in_run_so_far"] = pd.array([], dtype="float64")
+        result["net_win_per_bet_in_run"] = pd.array([], dtype="float64")
+        return result
+
+    cutoff_ts = pd.Timestamp(cutoff_time) if cutoff_time is not None else None
+    rb = float(RUN_BREAK_MIN)
+
+    has_wager = "wager" in bets_df.columns
+    has_casino = "casino_win" in bets_df.columns
+    wager_expr = "coalesce(try_cast(wager AS DOUBLE), 0.0)" if has_wager else "CAST(0.0 AS DOUBLE)"
+    casino_expr = "coalesce(try_cast(casino_win AS DOUBLE), 0.0)" if has_casino else "CAST(0.0 AS DOUBLE)"
+    wager_agg = (
+        f"sum({wager_expr}) OVER (PARTITION BY canonical_id, _run_grp "
+        f"ORDER BY payout_complete_dtm, bet_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+    )
+    net_agg = (
+        f"sum(-({casino_expr})) OVER (PARTITION BY canonical_id, _run_grp "
+        f"ORDER BY payout_complete_dtm, bet_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+    )
+
+    if bets_df["gaming_day"].isna().any():
+        n = int(bets_df["gaming_day"].isna().sum())
+        raise ValueError(
+            f"compute_run_boundary_duckdb: gaming_day must be non-null (found {n} null rows)"
+        )
+
+    where_clause = ""
+    params: Tuple[object, ...] = ()
+    if cutoff_ts is not None:
+        where_clause = "WHERE payout_complete_dtm <= ?"
+        params = (cutoff_ts.to_pydatetime(),)
+
+    sql = f"""
+WITH ordered AS (
+  SELECT
+    br.*,
+    date_trunc('day', CAST(gaming_day AS TIMESTAMP)) AS _gd_norm,
+    lag(payout_complete_dtm) OVER (
+      PARTITION BY canonical_id
+      ORDER BY payout_complete_dtm, bet_id
+    ) AS prev_payout,
+    lag(date_trunc('day', CAST(gaming_day AS TIMESTAMP))) OVER (
+      PARTITION BY canonical_id
+      ORDER BY payout_complete_dtm, bet_id
+    ) AS prev_gd
+  FROM bets_raw AS br
+),
+marked AS (
+  SELECT
+    *,
+    CASE
+      WHEN prev_payout IS NULL THEN TRUE
+      WHEN (epoch_ns(payout_complete_dtm) - epoch_ns(prev_payout)) / 60000000000.0 >= {rb}
+      THEN TRUE
+      WHEN prev_gd IS NOT NULL AND _gd_norm <> prev_gd THEN TRUE
+      ELSE FALSE
+    END AS is_new_run
+  FROM ordered
+),
+numbered AS (
+  SELECT
+    *,
+    sum(CASE WHEN is_new_run THEN 1 ELSE 0 END) OVER (
+      PARTITION BY canonical_id
+      ORDER BY payout_complete_dtm, bet_id
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS _run_grp
+  FROM marked
+),
+with_start AS (
+  SELECT
+    *,
+    first_value(payout_complete_dtm) OVER (
+      PARTITION BY canonical_id, _run_grp
+      ORDER BY payout_complete_dtm, bet_id
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS _run_start
+  FROM numbered
+),
+enriched AS (
+  SELECT
+    *,
+    CAST(_run_grp AS INTEGER) - 1 AS run_id,
+    (epoch_ns(payout_complete_dtm) - epoch_ns(_run_start)) / 60000000000.0 AS minutes_since_run_start,
+    row_number() OVER (
+      PARTITION BY canonical_id, _run_grp
+      ORDER BY payout_complete_dtm, bet_id
+    ) AS bets_in_run_so_far,
+    {wager_agg} AS wager_sum_in_run_so_far,
+    {net_agg} AS net_win_in_run_so_far
+  FROM with_start
+)
+SELECT * FROM enriched
+{where_clause}
+ORDER BY canonical_id, payout_complete_dtm, bet_id
+"""
+
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.register("bets_raw", bets_df)
+        if params:
+            out = con.execute(sql, list(params)).df()
+        else:
+            out = con.execute(sql).df()
+    finally:
+        con.close()
+
+    _junk = (
+        "_gd_norm",
+        "prev_payout",
+        "prev_gd",
+        "is_new_run",
+        "_run_grp",
+        "_run_start",
+    )
+    out = out.drop(columns=[c for c in _junk if c in out.columns], errors="ignore")
+
+    _den = pd.to_numeric(out["bets_in_run_so_far"], errors="coerce").fillna(0)
+    out["net_win_per_bet_in_run"] = np.where(
+        _den.to_numpy() > 0,
+        pd.to_numeric(out["net_win_in_run_so_far"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        / _den.to_numpy(dtype=float),
+        0.0,
+    )
+
+    out["run_id"] = pd.to_numeric(out["run_id"], errors="coerce").fillna(0).astype("int32")
+    out["bets_in_run_so_far"] = pd.to_numeric(out["bets_in_run_so_far"], errors="coerce").fillna(0).astype(
+        "int32"
+    )
+    out["minutes_since_run_start"] = pd.to_numeric(out["minutes_since_run_start"], errors="coerce").astype(
+        "float64"
+    )
+    out["wager_sum_in_run_so_far"] = pd.to_numeric(out["wager_sum_in_run_so_far"], errors="coerce").fillna(
+        0.0
+    ).astype("float64")
+    out["net_win_in_run_so_far"] = pd.to_numeric(out["net_win_in_run_so_far"], errors="coerce").fillna(
+        0.0
+    ).astype("float64")
+    out["net_win_per_bet_in_run"] = pd.to_numeric(out["net_win_per_bet_in_run"], errors="coerce").fillna(
+        0.0
+    ).astype("float64")
+
+    return out
 
 
 def compute_run_boundary_features(
@@ -2895,6 +2871,13 @@ def compute_bet_duckdb_window_features(
 
     llm_track = resolve_spec_track_section(feature_spec, "bet_duckdb_window")
     candidates = llm_track.get("candidates", [])
+    if not _track_section_enabled_in_spec(feature_spec, "bet_duckdb_window"):
+        return bets_df.copy()
+    candidates = [
+        c
+        for c in (candidates if isinstance(candidates, list) else [])
+        if isinstance(c, dict) and not _candidate_is_disabled(c.get("enabled", True))
+    ]
     if not candidates:
         logger.warning(
             "compute_bet_duckdb_window_features: bet_duckdb_window has no candidates — returning bets_df unchanged."

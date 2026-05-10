@@ -1568,8 +1568,9 @@ def _chunk_cache_components(
         "BET_AVAIL_DELAY_MIN": BET_AVAIL_DELAY_MIN,
         "TABLE_HC_WINDOW_MIN": int(getattr(_cfg, "TABLE_HC_WINDOW_MIN", 30)),
         "HISTORY_BUFFER_DAYS": HISTORY_BUFFER_DAYS,
-        "TRACK_HUMAN_LOOKBACK_HOURS": _effective_lookback,
-        "RUN_STATE_MACHINE_LOOKBACK_HOURS": _effective_lookback,
+        "RUN_BOUNDARY_CONTRACT": "gaming_day_gap_v1",
+        "TRACK_HUMAN_LOOKBACK_HOURS": "removed_use_none",
+        "SCORER_LOOKBACK_HOURS_BOOTSTRAP_ONLY": _effective_lookback,
         "identity_mapping_mode": str(identity_mapping_mode),
         "pit_identity_engine": str(pit_identity_engine),
         "t_game_features_enabled": bool(getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)),
@@ -1793,6 +1794,38 @@ def _profile_hash_chunk_scoped(
     ).hexdigest()[:6]
 
 
+def _step6_rss_mb() -> Optional[float]:
+    """Best-effort process RSS in MiB for Step 6 coarse memory baselines."""
+    try:
+        import psutil
+
+        return float(psutil.Process().memory_info().rss) / (1024.0 * 1024.0)
+    except Exception:
+        return None
+
+
+def _log_step6_profile(*, chunk_label: str, phase: str, elapsed_s: float, enabled: bool) -> None:
+    """Emit one Step 6 sub-phase timing line (optional RSS)."""
+    if not enabled:
+        return
+    rss = _step6_rss_mb()
+    if rss is None:
+        logger.info(
+            "Step6 profile %s: %s elapsed=%.2fs",
+            chunk_label,
+            phase,
+            elapsed_s,
+        )
+    else:
+        logger.info(
+            "Step6 profile %s: %s elapsed=%.2fs rss_mb=%.1f",
+            chunk_label,
+            phase,
+            elapsed_s,
+            rss,
+        )
+
+
 def process_chunk(
     chunk: dict,
     canonical_map: pd.DataFrame,
@@ -1860,6 +1893,10 @@ def process_chunk(
         "__etl_insert_Dtm" if bool(getattr(_cfg, "T_GAME_FEATURES_ENABLED", False)) else "none"
     )
 
+    _step6_prof = bool(getattr(_cfg, "STEP6_PROFILE_ENABLED", True))
+    _chunk_lbl = f"{window_start.date()}–{window_end.date()}"
+    _t_step6 = time.perf_counter()
+
     # R77 / Task 7 R4: profile snapshot fingerprint (chunk-scoped).
     _profile_hash = _profile_hash_chunk_scoped(profile_df, window_end)
 
@@ -1903,6 +1940,15 @@ def process_chunk(
         bets_raw, sessions_raw = load_local_parquet(window_start, extended_end)
     else:
         bets_raw, sessions_raw = load_clickhouse_data(window_start, extended_end)
+
+    if _step6_prof:
+        _log_step6_profile(
+            chunk_label=_chunk_lbl,
+            phase="load_raw",
+            elapsed_s=time.perf_counter() - _t_step6,
+            enabled=True,
+        )
+        _t_step6 = time.perf_counter()
 
     if bets_raw.empty:
         logger.warning("Chunk %s–%s: no bets, skipping", window_start.date(), window_end.date())
@@ -1957,6 +2003,15 @@ def process_chunk(
     if bets.empty:
         logger.warning("Chunk %s–%s: empty after DQ", window_start.date(), window_end.date())
         return None
+
+    if _step6_prof:
+        _log_step6_profile(
+            chunk_label=_chunk_lbl,
+            phase="normalize_dq",
+            elapsed_s=time.perf_counter() - _t_step6,
+            enabled=True,
+        )
+        _t_step6 = time.perf_counter()
 
     # --- TRN-04: drop FND-12 dummy/fake-account rows before feature engineering ---
     if dummy_player_ids and "player_id" in bets.columns:
@@ -2059,6 +2114,15 @@ def process_chunk(
         )
         return None
 
+    if _step6_prof:
+        _log_step6_profile(
+            chunk_label=_chunk_lbl,
+            phase="identity_admission",
+            elapsed_s=time.perf_counter() - _t_step6,
+            enabled=True,
+        )
+        _t_step6 = time.perf_counter()
+
     # Global rated canonical_id universe (for is_rated flag; same cutoff map as Step 3).
     rated_ids: set = (
         set(canonical_map["canonical_id"].astype(str).unique())
@@ -2067,11 +2131,9 @@ def process_chunk(
     )
 
     # --- Track Human features (on rated-only bets incl. history, cutoff=window_end) ---
-    # Computing before label filtering ensures cross-chunk state (loss_streak,
-    # run_boundary) uses historical context from HISTORY_BUFFER_DAYS before window_start.
-    # Always use SCORER_LOOKBACK_HOURS for train–serve parity (same window as scorer, default 8h).
+    # Computing before label filtering ensures cross-chunk run_boundary state using
+    # historical context from HISTORY_BUFFER_DAYS before window_start (gap + gaming_day).
     # Task 7 R6: optional pre-LLM Parquet cache (skip Track Human when key matches).
-    _lookback_hours = getattr(_cfg, "SCORER_LOOKBACK_HOURS", 8)
     _two_stage = _chunk_two_stage_cache_enabled()
     _pref_path = _chunk_prefeatures_parquet_path(chunk)
     _pref_key_path = _chunk_prefeatures_sidecar_path(chunk)
@@ -2097,7 +2159,15 @@ def process_chunk(
             )
 
     if not _skip_run_state_machine:
-        bets = add_run_state_machine_features(bets, canonical_map, window_end, lookback_hours=_lookback_hours)
+        _t_rsm = time.perf_counter()
+        bets = add_run_state_machine_features(bets, canonical_map, window_end)
+        if _step6_prof:
+            _log_step6_profile(
+                chunk_label=_chunk_lbl,
+                phase="run_state_machine_compute",
+                elapsed_s=time.perf_counter() - _t_rsm,
+                enabled=True,
+            )
         if _two_stage:
             _bump_chunk_cache_stat(
                 chunk_cache_stats, "step6_chunk_cache_prefeatures_run_state_machine_recompute_total",
@@ -2105,11 +2175,19 @@ def process_chunk(
             _bump_chunk_cache_stat(
                 chunk_cache_stats, "step6_chunk_cache_prefeatures_run_state_machine_recompute_total",
             )
+            _t_pref = time.perf_counter()
             bets.to_parquet(_pref_path, index=False)
             _pref_key_path.write_text(
                 _write_chunk_cache_sidecar(_pref_key, _pref_comps, source_mode=_source_mode),
                 encoding="utf-8",
             )
+            if _step6_prof:
+                _log_step6_profile(
+                    chunk_label=_chunk_lbl,
+                    phase="prefeatures_parquet_write",
+                    elapsed_s=time.perf_counter() - _t_pref,
+                    enabled=True,
+                )
 
     # --- Track LLM: DuckDB + Feature Spec YAML (DEC-022/023/024) ---
     # R3500: compute on the FULL bets DataFrame (with HISTORY_BUFFER_DAYS context)
@@ -3146,21 +3224,13 @@ def _update_val_field_test_primary_keys_from_val_labels(
     metrics: MutableMapping[str, Any],
     y_val: Union[pd.Series, np.ndarray],
 ) -> None:
-    """Set val_field_test_primary_score* from current val_precision and validation labels."""
+    """Set val_field_test_primary_score* from empirical val_precision (raw only)."""
     val_precision = metrics.get("val_precision")
     val_np_ratio = _neg_pos_ratio_from_binary_labels(y_val)
-    val_primary_adj = _precision_prod_adjusted(
-        float(val_precision) if val_precision is not None else None,
-        production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
-        test_neg_pos_ratio=val_np_ratio,
-    )
     metrics["val_neg_pos_ratio"] = val_np_ratio
-    metrics["val_field_test_primary_score"] = (
-        float(val_primary_adj) if val_primary_adj is not None else float(val_precision or 0.0)
-    )
-    metrics["val_field_test_primary_score_mode"] = (
-        "precision_prod_adjusted" if val_primary_adj is not None else "precision_raw"
-    )
+    vp = float(val_precision) if val_precision is not None else 0.0
+    metrics["val_field_test_primary_score"] = vp
+    metrics["val_field_test_primary_score_mode"] = "precision_raw"
 
 
 
@@ -3524,13 +3594,9 @@ def run_backend_optuna_search(
     Default: maximise average precision (AP).  When W1 allows a field-test path
     (``field_test_constrained_optuna_objective_allowed is True``), ``label`` is
     ``rated``, and ``val_window_hours`` is a finite positive span, the study
-    instead maximises DEC-026 validation **precision** at the best threshold
+    instead maximises DEC-026 validation **raw precision** at the best threshold
     subject to ``FIELD_TEST_HPO_MIN_ALERTS_PER_HOUR`` (default 50) and the usual
     recall / min-alert-count guards — matching :func:`pick_threshold_dec026` semantics.
-    When ``PRODUCTION_NEG_POS_RATIO`` is set and validation has positives with
-    strictly positive neg/pos ratio, the trial score uses
-    :func:`_precision_prod_adjusted` on that raw precision (Implementation Plan R1);
-    otherwise the raw DEC-026 precision is maximised.
 
     When *hpo_objective_manifest* is a list, it is cleared and receives one dict of
     flat ``optuna_hpo_*`` keys for ``training_metrics.json`` (W2 provenance vs ``val_ap``).
@@ -3738,40 +3804,19 @@ def run_backend_optuna_search(
         )
 
     _val_np_ratio: Optional[float] = _neg_pos_ratio_from_binary_labels(y_vl)
-    _ft_hpo_uses_prod_adj = (
-        _use_ft_hpo
-        and _val_np_ratio is not None
-        and PRODUCTION_NEG_POS_RATIO is not None
-    )
+    # Field-test HPO maximises raw validation precision at the DEC-026 operating point only.
     if _use_ft_hpo:
-        if _ft_hpo_uses_prod_adj:
-            logger.info(
-                "%s[%s]: Optuna study maximises validation precision_prod_adjusted "
-                "(DEC-026 pick; val neg/pos=%.4g vs PRODUCTION_NEG_POS_RATIO=%s; "
-                "min_alerts_per_hour=%.4g; window_hours=%.4g).",
-                label or "model",
-                backend_n,
-                float(_val_np_ratio),
-                PRODUCTION_NEG_POS_RATIO,
-                _mah_ft_f,
-                float(_vwh),
-            )
-        else:
-            logger.info(
-                "%s[%s]: Optuna study maximises validation precision (DEC-026 raw; "
-                "prod-adjust inactive — need positives + neg/pos ratio and "
-                "PRODUCTION_NEG_POS_RATIO) with min_alerts_per_hour=%.4g over window_hours=%.4g.",
-                label or "model",
-                backend_n,
-                _mah_ft_f,
-                float(_vwh),
-            )
+        logger.info(
+            "%s[%s]: Optuna study maximises validation precision (DEC-026 raw; "
+            "val neg/pos=%.4g; min_alerts_per_hour=%.4g; window_hours=%.4g).",
+            label or "model",
+            backend_n,
+            float(_val_np_ratio) if _val_np_ratio is not None else float("nan"),
+            _mah_ft_f,
+            float(_vwh),
+        )
 
-    _metric_label = (
-        "best_val_prec_dec026_prod_adj"
-        if _ft_hpo_uses_prod_adj
-        else ("best_val_prec_dec026" if _use_ft_hpo else "best_AP")
-    )
+    _metric_label = "best_val_prec_dec026" if _use_ft_hpo else "best_AP"
 
     def objective(trial: optuna.Trial) -> float:
         params = _suggest_backend_optuna_params(backend_n, trial)
@@ -3839,16 +3884,7 @@ def run_backend_optuna_search(
                 window_hours=float(_vwh),
                 fbeta_beta=THRESHOLD_FBETA,
             )
-            raw_p = float(_pick.precision)
-            if _ft_hpo_uses_prod_adj:
-                adj = _precision_prod_adjusted(
-                    raw_p,
-                    production_neg_pos_ratio=PRODUCTION_NEG_POS_RATIO,
-                    test_neg_pos_ratio=_val_np_ratio,
-                )
-                if adj is not None:
-                    return float(adj)
-            return raw_p
+            return float(_pick.precision)
         return average_precision_score(y_vl, scores)
 
     study = optuna.create_study(
@@ -3989,11 +4025,7 @@ def run_backend_optuna_search(
     )
     _obj_mode = "validation_ap"
     if _use_ft_hpo:
-        _obj_mode = (
-            "field_test_dec026_val_precision_prod_adj"
-            if _ft_hpo_uses_prod_adj
-            else "field_test_dec026_val_precision_raw"
-        )
+        _obj_mode = "field_test_dec026_val_precision_raw"
     _manifest_pay: dict[str, Any] = {
         "optuna_hpo_backend": backend_n,
         "optuna_hpo_enabled": True,
@@ -4028,9 +4060,7 @@ def run_backend_optuna_search(
         _manifest_pay["optuna_hpo_field_test_min_alerts_per_hour"] = float(_mah_ft_f)
         if _val_np_ratio is not None:
             _manifest_pay["optuna_hpo_val_neg_pos_ratio"] = float(_val_np_ratio)
-        _manifest_pay["optuna_hpo_val_precision_prod_adjusted_active"] = bool(
-            _ft_hpo_uses_prod_adj
-        )
+        _manifest_pay["optuna_hpo_val_precision_prod_adjusted_active"] = False
         if PRODUCTION_NEG_POS_RATIO is not None:
             try:
                 _manifest_pay["optuna_hpo_production_neg_pos_ratio_assumed"] = float(
@@ -4535,6 +4565,7 @@ def train_issue8_high_roller_segmented_bundle(
     """
     from trainer.training.high_roller_segmentation import (
         compute_high_roller_cutoff_from_train_parquet,
+        count_distinct_canonical_rated_parquet,
         count_rated_rows_parquet,
         materialize_segment_parquet_splits,
         parquet_has_column,
@@ -4558,6 +4589,11 @@ def train_issue8_high_roller_segmented_bundle(
     if not parquet_has_column(step7_train_path, theo_col):
         raise RuntimeError(
             f"Issue #8 high-roller segmentation requires column {theo_col!r} on "
+            f"{step7_train_path} (missing or unreadable)."
+        )
+    if not parquet_has_column(step7_train_path, "canonical_id"):
+        raise RuntimeError(
+            "Issue #8 high-roller segmentation requires column 'canonical_id' on "
             f"{step7_train_path} (missing or unreadable)."
         )
     validate_high_roller_theo_nonempty_on_rated_train(step7_train_path, theo_col)
@@ -4635,7 +4671,21 @@ def train_issue8_high_roller_segmented_bundle(
         "high_roller_train_rated_rows_low": n_l,
         "high_roller_min_rows_high": min_h,
         "high_roller_min_rows_low": min_l,
+        "high_roller_segment_valid_rated_unique_canonical_high": count_distinct_canonical_rated_parquet(
+            high_valid_p
+        ),
+        "high_roller_segment_valid_rated_unique_canonical_low": count_distinct_canonical_rated_parquet(
+            low_valid_p
+        ),
     }
+    if high_test_p.is_file():
+        seg_audit["high_roller_segment_test_rated_unique_canonical_high"] = (
+            count_distinct_canonical_rated_parquet(high_test_p)
+        )
+    if low_test_p.is_file():
+        seg_audit["high_roller_segment_test_rated_unique_canonical_low"] = (
+            count_distinct_canonical_rated_parquet(low_test_p)
+        )
 
     if n_h < min_h or n_l < min_l:
         raise RuntimeError(

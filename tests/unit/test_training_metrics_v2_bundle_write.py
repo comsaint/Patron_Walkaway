@@ -29,10 +29,10 @@ def test_build_v2_field_test_blocks() -> None:
         "rated": rated,
     }
     v2 = build_training_metrics_v2_payload(model_version="mv1", metrics_root=root)
-    assert v2["datasets"]["val"]["field_test"]["precision_type"] == "prod_adjusted"
-    assert abs(v2["datasets"]["val"]["field_test"]["precision"] - 0.77) < 1e-9
-    assert v2["datasets"]["test"]["field_test"]["precision_type"] == "prod_adjusted"
-    assert abs(v2["datasets"]["test"]["field_test"]["precision"] - 0.46) < 1e-9
+    assert v2["datasets"]["val"]["field_test"]["precision_type"] == "raw"
+    assert abs(v2["datasets"]["val"]["field_test"]["precision"] - 0.8) < 1e-9
+    assert v2["datasets"]["test"]["field_test"]["precision_type"] == "raw"
+    assert abs(v2["datasets"]["test"]["field_test"]["precision"] - 0.75) < 1e-9
 
 
 def test_write_sidecars_writes_v3_v2_and_sidecars_and_metadata_paths(tmp_path: Path) -> None:
@@ -170,6 +170,14 @@ def test_v3_neg_pos_ratio_overview_three_splits_and_segments() -> None:
         "rated": rated,
         "segment_high": seg_h,
         "segment_low": seg_l,
+        "high_roller_segmentation": {
+            "high_roller_segment_train_rated_unique_canonical_high": 9,
+            "high_roller_segment_valid_rated_unique_canonical_high": 4,
+            "high_roller_segment_test_rated_unique_canonical_high": 2,
+            "high_roller_segment_train_rated_unique_canonical_low": 40,
+            "high_roller_segment_valid_rated_unique_canonical_low": 12,
+            "high_roller_segment_test_rated_unique_canonical_low": 3,
+        },
     }
     v3 = build_training_metrics_v3_payload(model_version="mv", metrics_root=root)
     ov = v3["neg_pos_ratio_overview"]
@@ -185,9 +193,15 @@ def test_v3_neg_pos_ratio_overview_three_splits_and_segments() -> None:
     assert hi["splits"]["train"]["neg_pos_ratio"] == 4.0
     assert hi["splits"]["val"]["neg_pos_ratio"] == 4.0
     assert abs(hi["splits"]["test"]["neg_pos_ratio"] - 3.0) < 1e-9
+    assert hi["unique_canonical_rated"]["train"] == 9
+    assert hi["unique_canonical_rated"]["val"] == 4
+    assert hi["unique_canonical_rated"]["test"] == 2
     lo = next(s for s in ov["segments"] if s["segment"] == "low")
     assert lo["splits"]["train"]["neg_pos_ratio"] == 1.0
     assert abs(lo["splits"]["val"]["neg_pos_ratio"] - 2.0) < 1e-9
+    assert lo["unique_canonical_rated"]["train"] == 40
+    assert lo["unique_canonical_rated"]["val"] == 12
+    assert lo["unique_canonical_rated"]["test"] == 3
     obs = v3["objective_contract"]["observed_split_ratios"]
     assert obs["train_neg_pos_ratio"] == pm["train"]["neg_pos_ratio"]
     assert obs["val_neg_pos_ratio"] == 2.5
@@ -195,7 +209,7 @@ def test_v3_neg_pos_ratio_overview_three_splits_and_segments() -> None:
     assert build_neg_pos_ratio_overview({"rated": rated}, rated)["segments"] == []
 
 
-def test_v3_field_test_optional_prod_adjusted_and_segmentation() -> None:
+def test_v3_field_test_raw_only_and_segmentation() -> None:
     rated = {
         "val_precision": 0.8,
         "val_field_test_primary_score": 0.77,
@@ -211,9 +225,14 @@ def test_v3_field_test_optional_prod_adjusted_and_segmentation() -> None:
     }
     v3 = build_training_metrics_v3_payload(model_version="mv1", metrics_root=root)
     assert v3["schema_version"] == SCHEMA_TRAINING_METRICS_V3
-    ft = v3["datasets"]["test"]["field_test"]
-    assert ft["precision_prod_adjusted"] is None
-    assert ft["precision_raw"] == 0.75
+    ft_val = v3["datasets"]["val"]["field_test"]
+    ft_test = v3["datasets"]["test"]["field_test"]
+    assert ft_val["precision_raw"] == 0.8
+    assert ft_val["precision_type"] == "raw"
+    assert "precision_prod_adjusted" not in ft_val
+    assert ft_test["precision_raw"] == 0.75
+    assert ft_test["precision_type"] == "raw"
+    assert "precision_prod_adjusted" not in ft_test
     assert "production_neg_pos_ratio" not in v3
     assert "ratio_assumption" not in v3["objective_contract"]
     assert v3["segmentation"]["enabled"] is True

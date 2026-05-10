@@ -1010,7 +1010,7 @@ def backtest(
         }
 
     # --- run_state_machine features (same lookback as trainer/scorer for parity) ---
-    bets = add_run_state_machine_features(bets, canonical_map, window_end, lookback_hours=SCORER_LOOKBACK_HOURS)
+    bets = add_run_state_machine_features(bets, canonical_map, window_end)
 
     # --- bet_duckdb_window features on FULL bets (PLAN § Train–Serve Parity) ---
     # Compute before label filtering so window features see same history as trainer/scorer.

@@ -181,28 +181,9 @@ def _add_field_test_primary_keys(metrics: Dict[str, Any], y_val: pd.Series) -> N
     pos = int(np.sum(ya == 1.0))
     neg = int(np.sum(ya == 0.0))
     val_np_ratio = float(neg / pos) if pos > 0 and neg > 0 else None
-    prod_ratio = getattr(_cfg, "PRODUCTION_NEG_POS_RATIO", None)
-    val_primary_adj: Optional[float] = None
-    if (
-        prod_ratio is not None
-        and val_np_ratio is not None
-        and val_precision > 0.0
-        and np.isfinite(val_precision)
-        and np.isfinite(float(prod_ratio))
-        and float(prod_ratio) > 0.0
-    ):
-        p = min(1.0, val_precision)
-        scaling = float(prod_ratio) / float(val_np_ratio)
-        denom = 1.0 + ((1.0 / p) - 1.0) * scaling
-        if np.isfinite(denom) and denom > 0:
-            val_primary_adj = float(np.clip(1.0 / denom, 0.0, 1.0))
     metrics["val_neg_pos_ratio"] = val_np_ratio
-    metrics["val_field_test_primary_score"] = (
-        float(val_primary_adj) if val_primary_adj is not None else float(val_precision)
-    )
-    metrics["val_field_test_primary_score_mode"] = (
-        "precision_prod_adjusted" if val_primary_adj is not None else "precision_raw"
-    )
+    metrics["val_field_test_primary_score"] = float(val_precision)
+    metrics["val_field_test_primary_score_mode"] = "precision_raw"
 
 
 def _val_block_from_scores(
