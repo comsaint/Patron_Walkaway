@@ -25,9 +25,12 @@ text = re.sub(
             feature_spec=feature_spec,
             cutoff_time=window_end,
         )
+        # Canonical layered spec uses bet_duckdb_window (legacy bundles may still use track_llm).
+        _bet_window_spec = feature_spec.get("bet_duckdb_window") or feature_spec.get("track_llm") or {}
         _llm_cand_ids = [
             c.get("feature_id")
-            for c in (feature_spec.get("track_llm") or {}).get("candidates", [])
+            for c in (_bet_window_spec.get("candidates") or [])
+            if isinstance(c, dict)
         ]
         _bets_llm_feature_cols = [
             fid for fid in _llm_cand_ids

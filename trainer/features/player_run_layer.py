@@ -56,6 +56,9 @@ SECTION_A_PLAYER_RUN_FEATURE_IDS: Tuple[str, ...] = (
     "player_run_days_since_first_run",
     "player_run_count_7d",
     "player_run_count_30d",
+    # Wave2 personalized baselines (add_wave2_personalized_baselines)
+    "player_run_num_bets_sum_30d",
+    "player_run_avg_duration_min_30d",
     "player_run_count_90d",
     "player_run_count_180d",
     "player_run_count_365d",

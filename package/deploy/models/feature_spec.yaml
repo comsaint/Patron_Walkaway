@@ -676,7 +676,14 @@ run_state_machine:
       dtype: "float"
       description: "當前 run 時長相對個人 30 天平均 session 時長"
       function_name: "compute_wave2_personalized_features"
-      input_columns: ["minutes_since_run_start", "bets_in_run_so_far"]
+      input_columns:
+        [
+          "minutes_since_run_start",
+          "bets_in_run_so_far",
+          "player_run_avg_duration_min_30d",
+          "player_run_num_bets_sum_30d",
+          "player_run_count_30d",
+        ]
       output_columns: ["run_duration_vs_personal_avg", "bets_in_run_vs_personal_avg", "pace_vs_personal_baseline"]
       screening_eligible: true
       reason_code_category: "BETTING_PACE_DROPPING"
@@ -687,7 +694,14 @@ run_state_machine:
       dtype: "float"
       description: "當前 run 下注筆數相對個人 30 天平均每次 session 筆數"
       function_name: "compute_wave2_personalized_features"
-      input_columns: ["minutes_since_run_start", "bets_in_run_so_far"]
+      input_columns:
+        [
+          "minutes_since_run_start",
+          "bets_in_run_so_far",
+          "player_run_avg_duration_min_30d",
+          "player_run_num_bets_sum_30d",
+          "player_run_count_30d",
+        ]
       output_columns: ["run_duration_vs_personal_avg", "bets_in_run_vs_personal_avg", "pace_vs_personal_baseline"]
       screening_eligible: true
       reason_code_category: "BETTING_PACE_DROPPING"
@@ -698,7 +712,14 @@ run_state_machine:
       dtype: "float"
       description: "當前 run 下注頻率（bets/min）相對個人 30 天基準頻率"
       function_name: "compute_wave2_personalized_features"
-      input_columns: ["minutes_since_run_start", "bets_in_run_so_far"]
+      input_columns:
+        [
+          "minutes_since_run_start",
+          "bets_in_run_so_far",
+          "player_run_avg_duration_min_30d",
+          "player_run_num_bets_sum_30d",
+          "player_run_count_30d",
+        ]
       output_columns: ["run_duration_vs_personal_avg", "bets_in_run_vs_personal_avg", "pace_vs_personal_baseline"]
       screening_eligible: true
       reason_code_category: "BETTING_PACE_DROPPING"
@@ -762,6 +783,30 @@ player_run_asset:
       description: "過去 30 日封閉 run 次數（月快照）"
       postprocess:
         fill: { strategy: zero }
+
+    - feature_id: "player_run_num_bets_sum_30d"
+      target_layer: player
+      type: player_run_materialized
+      dtype: float
+      screening_eligible: false
+      source_column: player_run_num_bets_sum_30d
+      min_lookback_days: 30
+      description: "過去 30 日封閉 run 內總下注筆數（月快照；Wave2 個人化基準）"
+      postprocess:
+        fill: { strategy: zero }
+        clip: { min: 0.0, max: 1000000000.0 }
+
+    - feature_id: "player_run_avg_duration_min_30d"
+      target_layer: player
+      type: player_run_materialized
+      dtype: float
+      screening_eligible: false
+      source_column: player_run_avg_duration_min_30d
+      min_lookback_days: 30
+      description: "過去 30 日封閉 run 平均時長（分鐘；月快照；Wave2 個人化基準）"
+      postprocess:
+        fill: { strategy: zero }
+        clip: { min: 0.0, max: 1000000.0 }
 
     - feature_id: "player_run_count_90d"
       target_layer: player
