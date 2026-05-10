@@ -17,12 +17,86 @@ from typing import Any, Dict, Mapping, Optional, Union
 import pandas as pd
 
 from trainer.training import data_sources
-from trainer.training.l2_day_shard import min_max_day_from_manifest_rows, shard_split_parquet_by_day
+from trainer.training.l2_day_shard import (
+    copy_parquet_with_canonical_l2_columns,
+    l2_bundle_column_rename_map,
+    min_max_day_from_manifest_rows,
+    shard_split_parquet_by_day,
+)
 
 L2_BUNDLE_CACHE_KEY_FILE: str = ".l2_bundle_cache_key.json"
+TRAINER_IMPACT_CHECKPOINT_FILE: str = "last_impact_checkpoint.json"
 TRAIN_SPLIT_NAME: str = "train.parquet"
+
+
+def trainer_impact_checkpoint_path() -> Path:
+    """Path under ``trainer/.data`` for persisted per-feature fingerprints (impact planner)."""
+    root = Path(__file__).resolve().parent.parent
+    out = root / ".data"
+    out.mkdir(parents=True, exist_ok=True)
+    return out / TRAINER_IMPACT_CHECKPOINT_FILE
+
+
+def read_trainer_impact_checkpoint() -> Optional[dict[str, Any]]:
+    """Load last Step-7 checkpoint for ``plan_impacted_materialization_work``."""
+    p = trainer_impact_checkpoint_path()
+    if not p.is_file():
+        return None
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def write_trainer_impact_checkpoint(
+    *,
+    per_feature_fingerprints: Mapping[str, str],
+    source_snapshot_id: str,
+) -> None:
+    """Persist fingerprints + snapshot after a successful auto L2 bundle materialization."""
+    p = trainer_impact_checkpoint_path()
+    payload = {
+        "per_feature_fingerprints": dict(per_feature_fingerprints),
+        "source_snapshot_id": str(source_snapshot_id or "unknown").strip() or "unknown",
+    }
+    p.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 VALID_SPLIT_NAME: str = "valid.parquet"
 TEST_SPLIT_NAME: str = "test.parquet"
+
+
+def l2_bundle_split_files_present(bundle_dir: Path) -> bool:
+    """Return True when bundle manifest and split parquet files exist and schema2 day refs are valid."""
+    mf = bundle_dir / "l2_training_bundle.json"
+    tr = bundle_dir / TRAIN_SPLIT_NAME
+    va = bundle_dir / VALID_SPLIT_NAME
+    te = bundle_dir / TEST_SPLIT_NAME
+    if not (mf.is_file() and tr.is_file() and va.is_file() and te.is_file()):
+        return False
+    try:
+        raw_mf = json.loads(mf.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw_mf, dict):
+        return False
+    ver = str(raw_mf.get("schema_version") or "1")
+    if ver == "2":
+        sdm = raw_mf.get("split_day_manifest")
+        if not isinstance(sdm, dict):
+            return False
+        for k in ("train", "valid", "test"):
+            rows = sdm.get(k)
+            if not isinstance(rows, list) or not rows:
+                return False
+            for row in rows:
+                if not isinstance(row, dict):
+                    return False
+                rel = row.get("path")
+                if not rel or not (bundle_dir / str(rel)).is_file():
+                    return False
+    return True
 
 
 def default_auto_bundle_dir() -> Path:
@@ -67,39 +141,35 @@ def read_cached_bundle_key(bundle_dir: Path) -> Optional[dict[str, Any]]:
 
 def auto_bundle_cache_is_current(*, bundle_dir: Path, expected_key: Mapping[str, Any]) -> bool:
     """Return True when *bundle_dir* contains a valid bundle whose cache key matches *expected_key*."""
-    mf = bundle_dir / "l2_training_bundle.json"
-    tr = bundle_dir / TRAIN_SPLIT_NAME
-    va = bundle_dir / VALID_SPLIT_NAME
-    te = bundle_dir / TEST_SPLIT_NAME
-    if not (mf.is_file() and tr.is_file() and va.is_file() and te.is_file()):
+    from trainer.core import _config_training_domain as _tdom
+    from trainer.training.l2_reuse_keys import (
+        normalize_auto_l2_cache_key,
+        source_invariant_match,
+        window_view_match,
+    )
+
+    if not l2_bundle_split_files_present(bundle_dir):
         return False
-    try:
-        raw_mf = json.loads(mf.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(raw_mf, dict):
-        return False
-    ver = str(raw_mf.get("schema_version") or "1")
-    if ver == "2":
-        sdm = raw_mf.get("split_day_manifest")
-        if not isinstance(sdm, dict):
-            return False
-        for k in ("train", "valid", "test"):
-            rows = sdm.get(k)
-            if not isinstance(rows, list) or not rows:
-                return False
-            for row in rows:
-                if not isinstance(row, dict):
-                    return False
-                rel = row.get("path")
-                if not rel or not (bundle_dir / str(rel)).is_file():
-                    return False
     cached = read_cached_bundle_key(bundle_dir)
     if cached is None:
         return False
-    return json.dumps(cached, sort_keys=True, separators=(",", ":"), default=str) == json.dumps(
-        dict(expected_key), sort_keys=True, separators=(",", ":"), default=str
-    )
+    if not bool(getattr(_tdom, "L2_REUSE_V3_CACHE_KEYS", True)):
+        return json.dumps(cached, sort_keys=True, separators=(",", ":"), default=str) == json.dumps(
+            dict(expected_key), sort_keys=True, separators=(",", ":"), default=str
+        )
+    exp_n = normalize_auto_l2_cache_key(expected_key)
+    cache_n = normalize_auto_l2_cache_key(cached)
+    if not (source_invariant_match(cache_n, exp_n) and window_view_match(cache_n, exp_n)):
+        return False
+    return True
+
+
+def resolve_l2_auto_bundle_cache(bundle_dir: Path, expected_key: Mapping[str, Any]) -> dict[str, Any]:
+    """Diagnostics for L2 auto-cache (source vs window layer)."""
+    from trainer.training.l2_reuse_keys import resolve_l2_auto_cache
+
+    files_ok = l2_bundle_split_files_present(bundle_dir)
+    return resolve_l2_auto_cache(bundle_dir=bundle_dir, expected_key=expected_key, bundle_files_ok=files_ok)
 
 
 def build_auto_l2_cache_key(
@@ -115,22 +185,66 @@ def build_auto_l2_cache_key(
     rebuild_canonical_mapping: bool,
     identity_mapping_mode: str,
     force_recompute: bool,
+    pit_identity_engine: str = "cutoff_window_map",
+    source_snapshot_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Inputs that must invalidate an auto-built L2 bundle when they change."""
-    return {
-        "kind": "trainer_auto_l2_bundle_v2",
-        "bridge_manifest_stat": bridge_manifest_stat,
-        "window_start_iso": window_start_iso,
-        "window_end_iso": window_end_iso,
-        "recent_chunks": recent_chunks,
-        "train_split_frac": float(train_split_frac),
-        "valid_split_frac": float(valid_split_frac),
-        "neg_sample_frac_config": float(neg_sample_frac_config),
-        "feature_spec_fingerprint": str(feature_spec_fingerprint),
-        "rebuild_canonical_mapping": bool(rebuild_canonical_mapping),
-        "identity_mapping_mode": str(identity_mapping_mode),
-        "force_recompute": bool(force_recompute),
-    }
+    from trainer.core import _config_training_domain as _tdom
+    from trainer.core._config_training_domain import (
+        ALERT_HORIZON_MIN,
+        LABEL_LOOKAHEAD_MIN,
+        WALKAWAY_GAP_MIN,
+    )
+    from trainer.training.feature_materialization import compute_policy_version
+    from trainer.training.label_asset_cache import label_definition_version
+    from trainer.training.l2_reuse_keys import (
+        AUTO_L2_KIND_V2,
+        build_auto_l2_cache_key_v3,
+        censoring_policy_id_from_semantics,
+    )
+
+    if not bool(getattr(_tdom, "L2_REUSE_V3_CACHE_KEYS", True)):
+        return {
+            "kind": AUTO_L2_KIND_V2,
+            "bridge_manifest_stat": bridge_manifest_stat,
+            "window_start_iso": window_start_iso,
+            "window_end_iso": window_end_iso,
+            "recent_chunks": recent_chunks,
+            "train_split_frac": float(train_split_frac),
+            "valid_split_frac": float(valid_split_frac),
+            "neg_sample_frac_config": float(neg_sample_frac_config),
+            "feature_spec_fingerprint": str(feature_spec_fingerprint),
+            "rebuild_canonical_mapping": bool(rebuild_canonical_mapping),
+            "identity_mapping_mode": str(identity_mapping_mode),
+            "force_recompute": bool(force_recompute),
+        }
+    _snap = source_snapshot_id if source_snapshot_id is not None else read_bridge_source_snapshot_id()
+    _snap = str(_snap).strip() if _snap is not None else "unknown"
+    if not _snap:
+        _snap = "unknown"
+    _censor = censoring_policy_id_from_semantics(
+        walkaway_gap_min=int(WALKAWAY_GAP_MIN),
+        alert_horizon_min=int(ALERT_HORIZON_MIN),
+        label_lookahead_min=int(LABEL_LOOKAHEAD_MIN),
+    )
+    return build_auto_l2_cache_key_v3(
+        bridge_manifest_stat=bridge_manifest_stat,
+        window_start_iso=window_start_iso,
+        window_end_iso=window_end_iso,
+        recent_chunks=recent_chunks,
+        train_split_frac=float(train_split_frac),
+        valid_split_frac=float(valid_split_frac),
+        neg_sample_frac_config=float(neg_sample_frac_config),
+        feature_spec_fingerprint=str(feature_spec_fingerprint),
+        rebuild_canonical_mapping=bool(rebuild_canonical_mapping),
+        identity_mapping_mode=str(identity_mapping_mode),
+        pit_identity_engine=str(pit_identity_engine),
+        source_snapshot_id=_snap,
+        label_definition_version=label_definition_version(),
+        censoring_policy_id=_censor,
+        compute_policy_version=compute_policy_version(),
+        force_recompute=bool(force_recompute),
+    )
 
 
 def bridge_manifest_stat_token() -> Optional[str]:
@@ -153,6 +267,14 @@ def fingerprint_feature_spec(path: Path) -> str:
         return f"{st.st_mtime_ns}|{st.st_size}"
     except OSError:
         return "unreadable"
+
+
+def _canonicalize_bundle_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of *df* with canonical lower-case L2 bundle column names."""
+    rename_map = l2_bundle_column_rename_map(list(df.columns))
+    if all(src == dst for src, dst in rename_map.items()):
+        return df.copy()
+    return df.rename(columns=rename_map).copy()
 
 
 def materialize_l2_training_bundle_dir(
@@ -184,16 +306,19 @@ def materialize_l2_training_bundle_dir(
     out_valid = bundle_dir / VALID_SPLIT_NAME
     out_test = bundle_dir / TEST_SPLIT_NAME
 
+    # Canonical writer contract: every L2 bundle Parquet written here uses
+    # explicit lower-case column names so downstream pandas/pyarrow/DuckDB reads
+    # observe the same schema without case-dependent drift.
     if train_path is not None:
         if valid_path is None or test_path is None:
             raise ValueError("train_path set but valid_path or test_path is None")
-        shutil.copy2(train_path, out_train)
-        shutil.copy2(valid_path, out_valid)
-        shutil.copy2(test_path, out_test)
+        copy_parquet_with_canonical_l2_columns(train_path, out_train)
+        copy_parquet_with_canonical_l2_columns(valid_path, out_valid)
+        copy_parquet_with_canonical_l2_columns(test_path, out_test)
     elif train_df is not None and valid_df is not None and test_df is not None:
-        train_df.to_parquet(out_train, index=False)
-        valid_df.to_parquet(out_valid, index=False)
-        test_df.to_parquet(out_test, index=False)
+        _canonicalize_bundle_dataframe_columns(train_df).to_parquet(out_train, index=False)
+        _canonicalize_bundle_dataframe_columns(valid_df).to_parquet(out_valid, index=False)
+        _canonicalize_bundle_dataframe_columns(test_df).to_parquet(out_test, index=False)
     else:
         raise ValueError("materialize_l2_training_bundle_dir: need either paths or dataframes")
 
@@ -246,6 +371,11 @@ def materialize_l2_training_bundle_dir(
         },
         "identity_mapping_mode": str(identity_mapping_mode),
     }
+    _src_inv = cache_key.get("source_invariant") if isinstance(cache_key, dict) else None
+    if isinstance(_src_inv, dict):
+        _im_rev = _src_inv.get("identity_mapping_revision")
+        if _im_rev:
+            manifest["identity_mapping_revision"] = str(_im_rev)
     if label_asset_parquet is not None:
         src = Path(label_asset_parquet)
         if src.is_file():

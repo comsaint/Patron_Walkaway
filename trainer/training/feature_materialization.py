@@ -295,6 +295,11 @@ def build_pipeline_feature_materialization_audit(
             "impacted_work_unit_count": audit["impact_plan"].get("impacted_work_unit_count"),
             "full_matrix_recommended": audit["impact_plan"].get("full_matrix_recommended"),
             "miss_reason": audit["impact_plan"].get("miss_reason"),
+            "materialization_orchestrator": {
+                "note": "impacted_work_units in impact_plan drive incremental recomputation when enabled",
+                "impacted_work_unit_count": audit["impact_plan"].get("impacted_work_unit_count"),
+                "full_matrix_recommended": audit["impact_plan"].get("full_matrix_recommended"),
+            },
         }
     audit.setdefault("partition_contract_observability", {})
     _bdir = (os.environ.get("TRAINER_LAYER_ASSET_BUNDLE_DIR") or "").strip()

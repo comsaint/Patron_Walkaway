@@ -22,6 +22,21 @@ SESSION_AVAIL_DELAY_MIN = 7
 RUN_BREAK_MIN = WALKAWAY_GAP_MIN
 GAMING_DAY_START_HOUR = 3
 
+# Unified L2 reuse: v3 cache sidecar splits source-invariant vs window-view keys.
+L2_REUSE_V3_CACHE_KEYS: bool = True
+# Fail-closed validation for v3 expected keys (avoids ambiguous cache hits).
+L2_REUSE_STRICT_KEY_SCHEMA: bool = True
+# Subset-window projection when source_invariant matches and only window_view differs.
+L2_WINDOW_PROJECTION_ENABLED: bool = True
+# Step 6 materialization: off | observe (log only) | enforce (explicit execution_mode + diagnostics).
+L2_IMPACT_ORCHESTRATOR_MODE: Literal["off", "observe", "enforce"] = "enforce"
+# When False with enforce+impacted_only, a stale Step-6 chunk final-cache key raises (fail-closed B).
+L2_IMPACT_ALLOW_CHUNK_FULL_FALLBACK: bool = True
+# When True, Step 6 tries a snapshot/definition-keyed label store before window-bound label_intermediate.
+L2_LABEL_ASSET_CROSS_WINDOW_STORE: bool = True
+# Max Parquet size (bytes) for read-modify-write upsert on label store; avoids OOM on huge stores.
+L2_LABEL_ASSET_STORE_MAX_UPSERT_BYTES: int = 512 * 1024 * 1024
+
 G1_PRECISION_MIN = 0.70
 G1_ALERT_VOLUME_MIN_PER_HOUR = 5
 G1_FBETA = 0.5

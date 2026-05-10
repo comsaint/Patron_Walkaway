@@ -252,3 +252,104 @@ def build_label_asset_contract_dataframe(
     )
     assert_label_asset_columns_present(frozenset(out.columns))
     return out[list(LABEL_ASSET_REQUIRED_COLUMNS)]  # stable column order
+
+
+def build_label_asset_store_lookup_components(
+    *,
+    identity_mapping_mode: str,
+    pit_identity_engine: str,
+    source_snapshot_id: str,
+) -> Dict[str, Any]:
+    """Snapshot-keyed components (no training window) for cross-window label reuse."""
+    from trainer.core._config_training_domain import ALERT_HORIZON_MIN, LABEL_LOOKAHEAD_MIN, WALKAWAY_GAP_MIN
+    from trainer.training.l2_reuse_keys import censoring_policy_id_from_semantics, identity_mapping_revision
+
+    return {
+        "kind": "trainer_label_asset_store_v1",
+        "label_definition_version": label_definition_version(),
+        "censoring_policy_id": censoring_policy_id_from_semantics(
+            walkaway_gap_min=int(WALKAWAY_GAP_MIN),
+            alert_horizon_min=int(ALERT_HORIZON_MIN),
+            label_lookahead_min=int(LABEL_LOOKAHEAD_MIN),
+        ),
+        "identity_mapping_revision": identity_mapping_revision(
+            identity_mapping_mode=str(identity_mapping_mode),
+            pit_identity_engine=str(pit_identity_engine),
+        ),
+        "source_snapshot_id": str(source_snapshot_id or "unknown").strip() or "unknown",
+    }
+
+
+def label_asset_store_parquet_path(components: Dict[str, Any]) -> Path:
+    """Parquet path for reuse store rows (full ``compute_labels`` schema)."""
+    from trainer.training import data_sources
+
+    blob = json.dumps(components, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    short = hashlib.sha256(blob).hexdigest()[:24]
+    return data_sources.LOCAL_PARQUET_DIR / "label_asset_store" / short / "labels.parquet"
+
+
+def try_load_label_rows_from_asset_store(*, bets: pd.DataFrame, components: Dict[str, Any]) -> Optional[pd.DataFrame]:
+    """Return label frame when store covers all ``bets.bet_id`` (aligned to ``bets`` order)."""
+    if "bet_id" not in bets.columns:
+        return None
+    path = label_asset_store_parquet_path(components)
+    if not path.is_file():
+        return None
+    bids = bets["bet_id"]
+    if bids.duplicated().any():
+        return None
+    try:
+        store = pd.read_parquet(path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("label asset store read failed (%s); recomputing labels", exc)
+        return None
+    if "bet_id" not in store.columns:
+        return None
+    need = int(len(bids))
+    sub = store.loc[store["bet_id"].isin(bids)].copy()
+    if len(sub) != need or int(sub["bet_id"].nunique()) != need:
+        return None
+    sub = sub.drop_duplicates(subset=["bet_id"], keep="last").set_index("bet_id").reindex(bids).reset_index(drop=True)
+    if len(sub) != need or sub["bet_id"].isna().any():
+        return None
+    if not sub["bet_id"].tolist() == bids.tolist():
+        return None
+    return sub
+
+
+def upsert_label_asset_store(labeled: pd.DataFrame, components: Dict[str, Any]) -> None:
+    """Read-modify-write store with row-cap guard (may be expensive for huge stores)."""
+    from trainer.core import _config_training_domain as _tdom
+
+    if "bet_id" not in labeled.columns:
+        return
+    path = label_asset_store_parquet_path(components)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_df = labeled.reset_index(drop=True)
+    cap = int(getattr(_tdom, "L2_LABEL_ASSET_STORE_MAX_UPSERT_BYTES", 0))
+    if path.is_file():
+        try:
+            sz = path.stat().st_size
+        except OSError:
+            sz = 0
+        if sz > cap:
+            logger.warning(
+                "label asset store upsert skipped (file %d bytes > cap %d)",
+                sz,
+                cap,
+            )
+            return
+        try:
+            old = pd.read_parquet(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("label asset store upsert read failed (%s)", exc)
+            old = None
+        if old is not None:
+            merged = pd.concat([old, new_df], ignore_index=True)
+            merged = merged.drop_duplicates(subset=["bet_id"], keep="last")
+            merged.to_parquet(path, index=False)
+            logger.info("Label asset store upsert (%s rows)", len(merged))
+            return
+    new_df.to_parquet(path, index=False)
+    logger.info("Label asset store created (%s rows)", len(new_df))

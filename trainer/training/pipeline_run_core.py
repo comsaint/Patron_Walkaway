@@ -190,6 +190,9 @@ def run_pipeline_core(args) -> None:
             chunk_cache_stats: Dict[str, int] = {}
             issue16_gate_report: Optional[Dict[str, Any]] = None
             feature_materialization_audit: Optional[Dict[str, Any]] = None
+            _step6_impact_plan: Optional[Dict[str, Any]] = None
+            _orchestrator_execution_mode: str = "off"
+            _impact_orchestrator_mode: str = "observe"
 
             _l2_bundle_arg = getattr(args, "l2_training_bundle", None)
             if _l2_bundle_arg:
@@ -552,6 +555,42 @@ def run_pipeline_core(args) -> None:
                     identity_mapping_mode=str(effective_identity_mode),
                     force_recompute=bool(force),
                 )
+                _early_l2_audit = l2_bundle_materialize.resolve_l2_auto_bundle_cache(
+                    _bundle_dir_early, _expected_key
+                )
+                _early_l2_audit.setdefault(
+                    "impact_scope", "l2_early_auto_cache_audit",
+                )
+                _early_l2_audit.setdefault("impacted_work_unit_count", 0)
+                if _early_l2_audit.get("l2_cache_source_invariant_match") and not _early_l2_audit.get(
+                    "l2_cache_window_view_match",
+                ):
+                    logger.info(
+                        "L2 auto-cache: source_invariant_hit window_view_miss reason=%s bundle=%s",
+                        _early_l2_audit.get("l2_cache_miss_reason"),
+                        _bundle_dir_early,
+                    )
+                    try:
+                        from trainer.core import _config_training_domain as _tdom_proj
+
+                        if bool(getattr(_tdom_proj, "L2_WINDOW_PROJECTION_ENABLED", True)):
+                            from trainer.training import l2_window_projection as _l2proj
+
+                            _proj_r = _l2proj.try_project_l2_bundle_window(
+                                _bundle_dir_early, _expected_key,
+                            )
+                            _diag = dict(_proj_r.get("diagnostics") or {})
+                            if _proj_r.get("ok"):
+                                _early_l2_audit = l2_bundle_materialize.resolve_l2_auto_bundle_cache(
+                                    _bundle_dir_early, _expected_key,
+                                )
+                            _early_l2_audit = {**_early_l2_audit, **_diag}
+                            _early_l2_audit.setdefault(
+                                "impact_scope", "l2_early_auto_cache_audit",
+                            )
+                            _early_l2_audit.setdefault("impacted_work_unit_count", 0)
+                    except Exception as _proj_exc:
+                        logger.warning("L2 window projection skipped: %s", _proj_exc)
                 if l2_bundle_materialize.auto_bundle_cache_is_current(
                     bundle_dir=_bundle_dir_early, expected_key=_expected_key
                 ):
@@ -570,6 +609,7 @@ def run_pipeline_core(args) -> None:
                         sample_rated_n=sample_rated_n,
                         pipeline_ranking_recipe=pipeline_ranking_recipe,
                         pipeline_gbm_bakeoff=pipeline_gbm_bakeoff,
+                        l2_reuse_audit=_early_l2_audit,
                     )
                     return
 
@@ -661,6 +701,71 @@ def run_pipeline_core(args) -> None:
                 FEATURE_SPEC_PATH,
                 feature_spec_hash,
             )
+
+            from trainer.core import _config_training_domain as _tdom_orc
+
+            _raw_orch = str(getattr(_tdom_orc, "L2_IMPACT_ORCHESTRATOR_MODE", "observe")).strip().lower()
+            if _raw_orch not in ("off", "observe", "enforce"):
+                _raw_orch = "observe"
+            _impact_orchestrator_mode = _raw_orch
+            if _impact_orchestrator_mode == "off":
+                _orchestrator_execution_mode = "off"
+            if _impact_orchestrator_mode != "off":
+                try:
+                    from trainer.training.impact_planner import plan_impacted_materialization_work
+                    from trainer.training.layer_asset_store import chunk_partition_ids_for_windows
+
+                    _chk_orc = l2_bundle_materialize.read_trainer_impact_checkpoint()
+                    _prev_fp_orc = _chk_orc.get("per_feature_fingerprints") if isinstance(_chk_orc, dict) else None
+                    _prev_sid_orc = _chk_orc.get("source_snapshot_id") if isinstance(_chk_orc, dict) else None
+                    _curr_sid_orc = read_bridge_source_snapshot_id() if use_local else None
+                    _step6_impact_plan = plan_impacted_materialization_work(
+                        curr_spec=feature_spec,
+                        prev_spec=None,
+                        prev_per_feature_fp=_prev_fp_orc if isinstance(_prev_fp_orc, dict) else None,
+                        prev_source_snapshot_id=str(_prev_sid_orc).strip() if _prev_sid_orc else None,
+                        curr_source_snapshot_id=_curr_sid_orc,
+                        chunk_partition_ids=chunk_partition_ids_for_windows(chunks),
+                        pit_policy_id=str(effective_identity_mode),
+                    )
+                    _orchestrator_execution_mode = "observe"
+                    if _impact_orchestrator_mode == "enforce":
+                        if _step6_impact_plan.get("full_matrix_recommended"):
+                            _orchestrator_execution_mode = "full_matrix"
+                        elif int(_step6_impact_plan.get("impacted_work_unit_count") or 0) > 0:
+                            _orchestrator_execution_mode = "impacted_only"
+                            logger.warning(
+                                "L2_IMPACT_ORCHESTRATOR_MODE=enforce: impacted-only scheduling is active; "
+                                "Step 6 may still run full per-chunk pipelines on stale chunk-cache miss "
+                                "(bet-layer window features require extended history). "
+                                "Counters: step6_orchestrator_impacted_only_stale_miss_full_recompute_total; "
+                                "strict fail: set L2_IMPACT_ALLOW_CHUNK_FULL_FALLBACK=false in "
+                                "trainer/core/_config_training_domain.py."
+                            )
+                        else:
+                            _orchestrator_execution_mode = "none"
+                    logger.info(
+                        "Step 6 impact orchestrator mode=%s execution=%s impacted=%s full_matrix=%s",
+                        _impact_orchestrator_mode,
+                        _orchestrator_execution_mode,
+                        _step6_impact_plan.get("impacted_work_unit_count"),
+                        _step6_impact_plan.get("full_matrix_recommended"),
+                    )
+                except Exception as _orc_exc:
+                    logger.warning("Step 6 impact orchestrator plan failed: %s", _orc_exc)
+            from trainer.training.l2_impact_orchestrator import impacted_partition_ids_from_plan
+
+            _impacted_pids = (
+                impacted_partition_ids_from_plan(_step6_impact_plan)
+                if isinstance(_step6_impact_plan, dict)
+                else frozenset()
+            )
+            _orch_chunk_kwargs = {
+                "impact_plan": _step6_impact_plan if _impact_orchestrator_mode != "off" else None,
+                "impact_orchestrator_mode": _impact_orchestrator_mode,
+                "orchestrator_execution_mode": _orchestrator_execution_mode,
+                "impacted_partition_ids": _impacted_pids if _impacted_pids else None,
+            }
         
             # 4. Process chunks -> write parquet
             # When NEG_SAMPLE_FRAC_AUTO and there are chunks, run chunk 1 with frac=1.0 (OOM probe),
@@ -695,7 +800,7 @@ def run_pipeline_core(args) -> None:
                         feature_spec_hash=feature_spec_hash,
                         neg_sample_frac=1.0,
                         chunk_cache_stats=chunk_cache_stats,
-                        identity_mapping_mode=effective_identity_mode,
+                        identity_mapping_mode=effective_identity_mode, **_orch_chunk_kwargs,
                     )
                     if path1 is not None:
                         _path1 = Path(path1) if isinstance(path1, str) else path1
@@ -716,7 +821,7 @@ def run_pipeline_core(args) -> None:
                                     feature_spec_hash=feature_spec_hash,
                                     neg_sample_frac=_effective_neg_sample_frac,
                                     chunk_cache_stats=chunk_cache_stats,
-                                    identity_mapping_mode=effective_identity_mode,
+                                    identity_mapping_mode=effective_identity_mode, **_orch_chunk_kwargs,
                                 )
                                 if path1_rerun is not None:
                                     chunk_paths.append(path1_rerun)
@@ -744,7 +849,7 @@ def run_pipeline_core(args) -> None:
                                 feature_spec_hash=feature_spec_hash,
                                 neg_sample_frac=_effective_neg_sample_frac,
                                 chunk_cache_stats=chunk_cache_stats,
-                                identity_mapping_mode=effective_identity_mode,
+                                identity_mapping_mode=effective_identity_mode, **_orch_chunk_kwargs,
                             )
                             if path is not None:
                                 chunk_paths.append(path)
@@ -764,7 +869,7 @@ def run_pipeline_core(args) -> None:
                                 feature_spec_hash=feature_spec_hash,
                                 neg_sample_frac=_effective_neg_sample_frac,
                                 chunk_cache_stats=chunk_cache_stats,
-                                identity_mapping_mode=effective_identity_mode,
+                                identity_mapping_mode=effective_identity_mode, **_orch_chunk_kwargs,
                             )
                             if path is not None:
                                 chunk_paths.append(path)
@@ -783,7 +888,7 @@ def run_pipeline_core(args) -> None:
                             feature_spec_hash=feature_spec_hash,
                             neg_sample_frac=_effective_neg_sample_frac,
                             chunk_cache_stats=chunk_cache_stats,
-                            identity_mapping_mode=effective_identity_mode,
+                            identity_mapping_mode=effective_identity_mode, **_orch_chunk_kwargs,
                         )
                         if path is not None:
                             chunk_paths.append(path)
@@ -873,7 +978,7 @@ def run_pipeline_core(args) -> None:
                         feature_spec_hash=feature_spec_hash,
                         neg_sample_frac=neg_frac,
                         chunk_cache_stats=chunk_cache_stats,
-                        identity_mapping_mode=effective_identity_mode,
+                        identity_mapping_mode=effective_identity_mode, **_orch_chunk_kwargs,
                     )
                     if _path is not None:
                         paths.append(_path)
@@ -1038,6 +1143,23 @@ def run_pipeline_core(args) -> None:
                         pit_policy_id=str(effective_identity_mode),
                         chunk_partition_ids=_chunk_partition_ids_for_audit,
                     )
+                    if _step6_impact_plan is not None:
+                        feature_materialization_audit["orchestrator_pre_step6"] = dict(_step6_impact_plan)
+                        feature_materialization_audit["orchestrator_execution_mode_resolved"] = (
+                            str(_orchestrator_execution_mode)
+                        )
+                        feature_materialization_audit["impact_orchestrator_mode"] = str(_impact_orchestrator_mode)
+                        feature_materialization_audit["impacted_partition_ids"] = sorted(_impacted_pids)
+                        feature_materialization_audit["chunk_cache_step6_partition_counters"] = {
+                            "reused_partitions": int(chunk_cache_stats.get("reused_partitions", 0)),
+                            "recomputed_partitions": int(chunk_cache_stats.get("recomputed_partitions", 0)),
+                            "step6_orchestrator_impacted_only_stale_miss_full_recompute_total": int(
+                                chunk_cache_stats.get(
+                                    "step6_orchestrator_impacted_only_stale_miss_full_recompute_total",
+                                    0,
+                                )
+                            ),
+                        }
                     _fm_audit.raise_if_strict_materialization_gates_failed(
                         feature_materialization_audit["materialization_gates"],
                     )
@@ -1198,11 +1320,17 @@ def run_pipeline_core(args) -> None:
                 cache_key=_cache_key,
                 per_feature_fingerprints=_bundle_per_fp,
             )
+            if _bundle_per_fp is not None:
+                l2_bundle_materialize.write_trainer_impact_checkpoint(
+                    per_feature_fingerprints=_bundle_per_fp,
+                    source_snapshot_id=_src_snap,
+                )
             l2_bundle_materialize.touch_bundle_built_at(_bundle_out)
             pipeline_echo(
                 f"Step 8/11 — L2 bundle — materialized to {_bundle_out}; "
                 "running Steps 8–10/11 from bundle …"
             )
+            _fresh_l2_audit = l2_bundle_materialize.resolve_l2_auto_bundle_cache(_bundle_out, _cache_key)
             pipeline_l2_bundle.execute_l2_training_bundle(
                 args=args,
                 bundle_dir=_bundle_out,
@@ -1214,6 +1342,7 @@ def run_pipeline_core(args) -> None:
                 sample_rated_n=sample_rated_n,
                 pipeline_ranking_recipe=pipeline_ranking_recipe,
                 pipeline_gbm_bakeoff=pipeline_gbm_bakeoff,
+                l2_reuse_audit=_fresh_l2_audit,
             )
             return
         

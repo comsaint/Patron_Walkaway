@@ -47,6 +47,7 @@ def execute_l2_training_bundle(
     sample_rated_n: Optional[int],
     pipeline_ranking_recipe: Any,
     pipeline_gbm_bakeoff: bool,
+    l2_reuse_audit: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Run Steps 8–10/11 from an L2 bundle (skip chunk Steps 1–6/11 and Step 7 merge)."""
     from trainer.training.pipeline_step_context import (
@@ -65,6 +66,7 @@ def execute_l2_training_bundle(
         evaluate_issue16_gate_bundle,
         raise_if_strict_issue16_gates_failed,
     )
+    from trainer.training.l2_day_shard import canonical_l2_bundle_read_parquet_expr
     from trainer.training.l2_trainer_contracts import (
         KEY_L2_SNAPSHOT_ID,
         KEY_TEST_FULL_UNSAMPLED,
@@ -89,9 +91,9 @@ def execute_l2_training_bundle(
     manifest = load_and_validate_bundle(bundle_dir)
     import duckdb
 
-    train_expr = tr._libsvm_duckdb_read_parquet_expr(manifest.train_export_paths)
-    valid_expr = tr._libsvm_duckdb_read_parquet_expr(manifest.valid_export_paths)
-    test_expr = tr._libsvm_duckdb_read_parquet_expr(manifest.test_export_paths)
+    train_expr = canonical_l2_bundle_read_parquet_expr(manifest.train_export_paths)
+    valid_expr = canonical_l2_bundle_read_parquet_expr(manifest.valid_export_paths)
+    test_expr = canonical_l2_bundle_read_parquet_expr(manifest.test_export_paths)
 
     def _l2_scalar(sql: str) -> Any:
         con = duckdb.connect(":memory:")
@@ -120,6 +122,52 @@ def execute_l2_training_bundle(
 
     if "label" not in _l2_train_cols:
         raise SystemExit("L2 bundle train parquet missing required column 'label'")
+
+    def _read_l2_screen_sample(from_sql: str, n: int, strategy: str) -> pd.DataFrame:
+        """Read a bounded Step 8 sample via canonicalized DuckDB bundle expression."""
+        if n <= 0:
+            return pd.DataFrame()
+
+        def _query_df(sql: str) -> pd.DataFrame:
+            con = duckdb.connect(":memory:")
+            try:
+                return con.execute(sql).df()
+            finally:
+                con.close()
+
+        def _head(limit: int) -> pd.DataFrame:
+            return _query_df(f"SELECT * FROM {from_sql} LIMIT {limit}")
+
+        def _tail(limit: int) -> pd.DataFrame:
+            return _query_df(
+                f"SELECT * FROM {from_sql} "
+                "ORDER BY payout_complete_dtm DESC NULLS LAST, bet_id DESC NULLS LAST "
+                f"LIMIT {limit}"
+            )
+
+        if strategy == "tail":
+            out = _tail(int(n))
+        elif strategy == "head_tail":
+            nh = max(1, int(n) // 2)
+            nt = max(1, int(n) - nh)
+            head_df = _head(nh)
+            tail_df = _tail(nt)
+            if head_df.empty:
+                out = tail_df
+            elif tail_df.empty:
+                out = head_df
+            else:
+                out = pd.concat([head_df, tail_df], ignore_index=True)
+                if "canonical_id" in out.columns and "bet_id" in out.columns:
+                    out = out.drop_duplicates(subset=["canonical_id", "bet_id"], keep="first")
+                else:
+                    out = out.drop_duplicates()
+                if len(out) > int(n):
+                    out = out.iloc[: int(n)].copy()
+        else:
+            out = _head(int(n))
+        out.columns = [str(col).strip().lower() for col in out.columns]
+        return out
 
     effective_start = pd.Timestamp(manifest.window_start).to_pydatetime()
     effective_end = pd.Timestamp(manifest.window_end).to_pydatetime()
@@ -168,6 +216,12 @@ def execute_l2_training_bundle(
         raise
     except Exception as _l2fma_exc:
         logger.warning("L2 bundle: feature_materialization audit failed: %s", _l2fma_exc)
+
+    if l2_reuse_audit:
+        if isinstance(feature_materialization_audit, dict):
+            feature_materialization_audit = {**feature_materialization_audit, "l2_reuse_cache": dict(l2_reuse_audit)}
+        else:
+            feature_materialization_audit = {"l2_reuse_cache": dict(l2_reuse_audit)}
 
     issue16_gate_report = evaluate_issue16_gate_bundle(
         effective_neg_sample_frac=1.0,
@@ -255,16 +309,11 @@ def execute_l2_training_bundle(
             if (tr.STEP8_SCREEN_SAMPLE_ROWS is not None and tr.STEP8_SCREEN_SAMPLE_ROWS >= 1)
             else _cap
         )
-        if step8_screen_sample_strategy == "tail":
-            _matrix_for_screen = tr._read_parquet_tail_step8(manifest.train_path, _sample_n_disk)
-        elif step8_screen_sample_strategy == "head_tail":
-            _matrix_for_screen = tr._read_parquet_head_tail_step8(
-                manifest.train_path,
-                _sample_n_disk,
-                read_head=tr.read_parquet_head,
-            )
-        else:
-            _matrix_for_screen = tr.read_parquet_head(manifest.train_path, _sample_n_disk)
+        _matrix_for_screen = _read_l2_screen_sample(
+            train_expr,
+            _sample_n_disk,
+            step8_screen_sample_strategy,
+        )
         if "is_rated" not in _matrix_for_screen.columns:
             logger.warning(
                 "L2 bundle train sample: missing is_rated — defaulting all rows to True for screening"

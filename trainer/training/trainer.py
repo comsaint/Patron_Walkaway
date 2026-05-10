@@ -72,7 +72,21 @@ import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple, Union, cast
+from typing import (
+    AbstractSet,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
 
 import joblib
 import lightgbm as lgb
@@ -1839,6 +1853,10 @@ def process_chunk(
     chunk_cache_stats: Optional[Dict[str, int]] = None,
     *,
     identity_mapping_mode: str = "cutoff_window",
+    impact_plan: Optional[Mapping[str, Any]] = None,
+    impact_orchestrator_mode: str = "off",
+    orchestrator_execution_mode: str = "off",
+    impacted_partition_ids: Optional[AbstractSet[str]] = None,
 ) -> Optional[Path]:
     """Materialize one training-window slice; return path to written Parquet or None if empty.
 
@@ -1896,6 +1914,19 @@ def process_chunk(
     _step6_prof = bool(getattr(_cfg, "STEP6_PROFILE_ENABLED", True))
     _chunk_lbl = f"{window_start.date()}–{window_end.date()}"
     _t_step6 = time.perf_counter()
+    if impacted_partition_ids and str(impact_orchestrator_mode).lower() == "enforce":
+        try:
+            from trainer.training.layer_asset_store import chunk_partition_id as _orch_pid_fn
+
+            _orch_pid = _orch_pid_fn(window_start, window_end)
+            if _orch_pid not in impacted_partition_ids:
+                logger.debug(
+                    "Step6 orchestrator: partition %s not in impacted_partition_ids (n=%d)",
+                    _orch_pid,
+                    len(impacted_partition_ids),
+                )
+        except Exception as _pid_exc:
+            logger.debug("Step6 orchestrator partition id log skipped: %s", _pid_exc)
 
     # R77 / Task 7 R4: profile snapshot fingerprint (chunk-scoped).
     _profile_hash = _profile_hash_chunk_scoped(profile_df, window_end)
@@ -1918,6 +1949,7 @@ def process_chunk(
             feature_spec_for_cross_layer=feature_spec,
         )
         current_key = _fingerprint_from_chunk_cache_components(_cache_components)
+        _local_stale_miss_reasons: Optional[List[str]] = None
         if not force_recompute and chunk_path.exists():
             stored_raw = key_path.read_text(encoding="utf-8") if key_path.exists() else ""
             stored_key, stored_comp = _read_chunk_cache_sidecar(stored_raw)
@@ -1930,12 +1962,38 @@ def process_chunk(
                 _bump_chunk_cache_stat(
                     chunk_cache_stats, "step6_chunk_cache_final_hit_local_metadata_total",
                 )
+                _bump_chunk_cache_stat(chunk_cache_stats, "reused_partitions")
                 return chunk_path
             else:
-                miss_reasons = _chunk_cache_miss_reasons(stored_key, stored_comp, _cache_components)
+                _local_stale_miss_reasons = _chunk_cache_miss_reasons(
+                    stored_key, stored_comp, _cache_components,
+                )
                 logger.info(
                     "Chunk %s–%s: cache stale (key mismatch, miss_reason=%s), recomputing",
-                    window_start.date(), window_end.date(), miss_reasons,
+                    window_start.date(), window_end.date(), _local_stale_miss_reasons,
+                )
+        if _local_stale_miss_reasons is not None:
+            from trainer.core import _config_training_domain as _tdom_gate
+            from trainer.training.l2_impact_orchestrator import (
+                raise_if_impacted_only_chunk_miss_forbidden,
+            )
+
+            raise_if_impacted_only_chunk_miss_forbidden(
+                impact_orchestrator_mode=str(impact_orchestrator_mode),
+                orchestrator_execution_mode=str(orchestrator_execution_mode),
+                allow_chunk_full_fallback=bool(
+                    getattr(_tdom_gate, "L2_IMPACT_ALLOW_CHUNK_FULL_FALLBACK", True),
+                ),
+                chunk_label=_chunk_lbl,
+                miss_reasons=_local_stale_miss_reasons,
+            )
+            if (
+                str(impact_orchestrator_mode).lower() == "enforce"
+                and str(orchestrator_execution_mode).lower() == "impacted_only"
+            ):
+                _bump_chunk_cache_stat(
+                    chunk_cache_stats,
+                    "step6_orchestrator_impacted_only_stale_miss_full_recompute_total",
                 )
         bets_raw, sessions_raw = load_local_parquet(window_start, extended_end)
     else:
@@ -1971,6 +2029,7 @@ def process_chunk(
             feature_spec_for_cross_layer=feature_spec,
         )
         current_key = _fingerprint_from_chunk_cache_components(_cache_components)
+        _ch_stale_miss_reasons: Optional[List[str]] = None
         if not force_recompute and chunk_path.exists():
             stored_raw = key_path.read_text(encoding="utf-8") if key_path.exists() else ""
             stored_key, stored_comp = _read_chunk_cache_sidecar(stored_raw)
@@ -1983,12 +2042,38 @@ def process_chunk(
                 _bump_chunk_cache_stat(
                     chunk_cache_stats, "step6_chunk_cache_final_hit_after_load_total",
                 )
+                _bump_chunk_cache_stat(chunk_cache_stats, "reused_partitions")
                 return chunk_path
             else:
-                miss_reasons = _chunk_cache_miss_reasons(stored_key, stored_comp, _cache_components)
+                _ch_stale_miss_reasons = _chunk_cache_miss_reasons(
+                    stored_key, stored_comp, _cache_components,
+                )
                 logger.info(
                     "Chunk %s–%s: cache stale (key mismatch, miss_reason=%s), recomputing",
-                    window_start.date(), window_end.date(), miss_reasons,
+                    window_start.date(), window_end.date(), _ch_stale_miss_reasons,
+                )
+        if _ch_stale_miss_reasons is not None:
+            from trainer.core import _config_training_domain as _tdom_gate_ch
+            from trainer.training.l2_impact_orchestrator import (
+                raise_if_impacted_only_chunk_miss_forbidden,
+            )
+
+            raise_if_impacted_only_chunk_miss_forbidden(
+                impact_orchestrator_mode=str(impact_orchestrator_mode),
+                orchestrator_execution_mode=str(orchestrator_execution_mode),
+                allow_chunk_full_fallback=bool(
+                    getattr(_tdom_gate_ch, "L2_IMPACT_ALLOW_CHUNK_FULL_FALLBACK", True),
+                ),
+                chunk_label=_chunk_lbl,
+                miss_reasons=_ch_stale_miss_reasons,
+            )
+            if (
+                str(impact_orchestrator_mode).lower() == "enforce"
+                and str(orchestrator_execution_mode).lower() == "impacted_only"
+            ):
+                _bump_chunk_cache_stat(
+                    chunk_cache_stats,
+                    "step6_orchestrator_impacted_only_stale_miss_full_recompute_total",
                 )
 
     # --- Post-Load Normalizer (PLAN § Post-Load Normalizer Phase 2) ---
@@ -2234,6 +2319,8 @@ def process_chunk(
     bets = compute_trip_layer_features(bets, fail_closed=_trip_fail_closed)
 
     # --- Labels (C1 extended pull) + optional label_intermediate disk cache (L2-aligned) ---
+    from trainer.core import _config_training_domain as _tdom_reuse
+
     _label_disk_components = build_label_disk_cache_components(
         window_start_iso=window_start.isoformat(),
         window_end_iso=window_end.isoformat(),
@@ -2251,7 +2338,45 @@ def process_chunk(
     _label_pq = label_intermediate_parquet_path(chunk, CHUNK_DIR)
     _label_key = label_intermediate_sidecar_path(chunk, CHUNK_DIR)
     labeled: Optional[pd.DataFrame] = None
-    if not label_asset_cache_disabled() and not force_recompute:
+    _label_cache_source = ""
+    _orch_mode_l = str(impact_orchestrator_mode or "off").strip().lower()
+    _impact_reasons = impact_plan.get("impact_reasons") if isinstance(impact_plan, dict) else None
+    _skip_cross_window_labels = (
+        _orch_mode_l == "enforce"
+        and isinstance(_impact_reasons, list)
+        and "DATA_SNAPSHOT_ID_CHANGED" in _impact_reasons
+    )
+    if _skip_cross_window_labels:
+        logger.info(
+            "Chunk %s–%s: label cross-window store skipped (enforce + DATA_SNAPSHOT_ID_CHANGED)",
+            window_start.date(),
+            window_end.date(),
+        )
+    if (
+        not label_asset_cache_disabled()
+        and not force_recompute
+    ):
+        if bool(getattr(_tdom_reuse, "L2_LABEL_ASSET_CROSS_WINDOW_STORE", False)) and not _skip_cross_window_labels:
+            from trainer.training.label_asset_cache import (
+                build_label_asset_store_lookup_components,
+                try_load_label_rows_from_asset_store,
+            )
+
+            _store_comp = build_label_asset_store_lookup_components(
+                identity_mapping_mode=str(identity_mapping_mode),
+                pit_identity_engine=str(_pit_engine),
+                source_snapshot_id=str(read_bridge_source_snapshot_id() or "unknown"),
+            )
+            labeled = try_load_label_rows_from_asset_store(bets=bets, components=_store_comp)
+            if labeled is not None:
+                logger.info(
+                    "Chunk %s–%s: label cross-window store hit",
+                    window_start.date(),
+                    window_end.date(),
+                )
+                _bump_chunk_cache_stat(chunk_cache_stats, "step6_label_crosswindow_store_hit_total")
+                _label_cache_source = "cross_window_store"
+    if labeled is None and not label_asset_cache_disabled() and not force_recompute:
         labeled = try_load_label_intermediate_cache(
             parquet_path=_label_pq,
             sidecar_path=_label_key,
@@ -2259,15 +2384,18 @@ def process_chunk(
             expected_components=_label_disk_components,
             expected_n_rows=len(bets),
         )
+        if labeled is not None:
+            _label_cache_source = "label_intermediate"
     if labeled is not None:
-        logger.info(
-            "Chunk %s–%s: label_intermediate cache hit (fp=%s)",
-            window_start.date(),
-            window_end.date(),
-            _label_disk_fp,
-        )
+        if _label_cache_source == "label_intermediate":
+            logger.info(
+                "Chunk %s–%s: label_intermediate cache hit (fp=%s)",
+                window_start.date(),
+                window_end.date(),
+                _label_disk_fp,
+            )
+            _bump_chunk_cache_stat(chunk_cache_stats, "step6_label_intermediate_cache_hit_total")
         _bump_chunk_cache_stat(chunk_cache_stats, "step6_label_asset_cache_hit_total")
-        _bump_chunk_cache_stat(chunk_cache_stats, "step6_label_intermediate_cache_hit_total")
     else:
         _bump_chunk_cache_stat(chunk_cache_stats, "step6_label_asset_cache_miss_total")
         labeled = compute_labels(
@@ -2282,6 +2410,21 @@ def process_chunk(
                 sidecar_path=_label_key,
                 components=_label_disk_components,
             )
+            if bool(getattr(_tdom_reuse, "L2_LABEL_ASSET_CROSS_WINDOW_STORE", False)):
+                from trainer.training.label_asset_cache import (
+                    build_label_asset_store_lookup_components,
+                    upsert_label_asset_store,
+                )
+
+                _store_comp_w = build_label_asset_store_lookup_components(
+                    identity_mapping_mode=str(identity_mapping_mode),
+                    pit_identity_engine=str(_pit_engine),
+                    source_snapshot_id=str(read_bridge_source_snapshot_id() or "unknown"),
+                )
+                try:
+                    upsert_label_asset_store(labeled, _store_comp_w)
+                except Exception as _up_exc:
+                    logger.warning("label asset store upsert skipped: %s", _up_exc)
     # H1: drop censored terminal bets + filter to training window in a single pass.
     # Combining the two filters into one mask avoids an intermediate ~32M-row .copy()
     # that was the direct OOM trigger (17 object cols × 32M rows ≈ 4 GiB allocation).
@@ -2348,11 +2491,29 @@ def process_chunk(
     )
 
     labeled.to_parquet(chunk_path, index=False)
+    _bump_chunk_cache_stat(chunk_cache_stats, "recomputed_partitions")
     # Persist structured cache sidecar (Task 7 R3); fingerprint matches legacy pipe format.
     key_path.write_text(
         _write_chunk_cache_sidecar(current_key, _cache_components, source_mode=_source_mode),
         encoding="utf-8",
     )
+    try:
+        from trainer.training import step6_partition_assets as _s6part
+
+        if "gaming_day" in labeled.columns and not labeled["gaming_day"].empty:
+            _gds = labeled["gaming_day"].astype(str)
+            _gmin, _gmax = str(_gds.min()), str(_gds.max())
+        else:
+            _gmin = window_start.date().isoformat()
+            _gmax = window_end.date().isoformat()
+        _s6part.record_prefeatures_partition_meta(
+            gaming_day_min=_gmin,
+            gaming_day_max=_gmax,
+            chunk_fingerprint=str(current_key)[:24],
+            source_snapshot_id=str(read_bridge_source_snapshot_id() or "unknown"),
+        )
+    except Exception as _s6_exc:
+        logger.debug("Step 6 partition meta skipped: %s", _s6_exc)
     try:
         from trainer.training.layer_asset_store import write_chunk_layer_asset_manifest
 
