@@ -92,10 +92,10 @@ class TestWave2PersonalizedBaselines(unittest.TestCase):
         df = pd.DataFrame(
             {
                 "minutes_since_run_start": [30.0],
-                "avg_session_duration_min_30d": [60.0],
+                "player_run_avg_duration_min_30d": [60.0],
                 "bets_in_run_so_far": [5],
-                "num_bets_sum_30d": [120.0],
-                "sessions_30d": [10.0],
+                "player_run_num_bets_sum_30d": [120.0],
+                "player_run_count_30d": [10.0],
             }
         )
         out = features_mod.add_wave2_personalized_baselines(df)

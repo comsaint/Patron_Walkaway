@@ -153,8 +153,8 @@ layered_framework:
         Resets each run; more local than lifetime session average.
 
 tracks_enabled:
-  # Unified pipeline: wave2 / bridge columns on bets + sessions; no legacy player_profile ETL.
-  player_snapshot_asset: false
+  # Unified pipeline: player_run_asset replaces legacy CSV player_snapshot/track_profile bundle.
+  player_run_asset: true
   bet_duckdb_window: true
   run_state_machine: true
   trip_asset_materialized: true
@@ -676,7 +676,7 @@ run_state_machine:
       dtype: "float"
       description: "當前 run 時長相對個人 30 天平均 session 時長"
       function_name: "compute_wave2_personalized_features"
-      input_columns: ["minutes_since_run_start", "avg_session_duration_min_30d", "bets_in_run_so_far", "num_bets_sum_30d", "sessions_30d"]
+      input_columns: ["minutes_since_run_start", "bets_in_run_so_far"]
       output_columns: ["run_duration_vs_personal_avg", "bets_in_run_vs_personal_avg", "pace_vs_personal_baseline"]
       screening_eligible: true
       reason_code_category: "BETTING_PACE_DROPPING"
@@ -687,7 +687,7 @@ run_state_machine:
       dtype: "float"
       description: "當前 run 下注筆數相對個人 30 天平均每次 session 筆數"
       function_name: "compute_wave2_personalized_features"
-      input_columns: ["minutes_since_run_start", "avg_session_duration_min_30d", "bets_in_run_so_far", "num_bets_sum_30d", "sessions_30d"]
+      input_columns: ["minutes_since_run_start", "bets_in_run_so_far"]
       output_columns: ["run_duration_vs_personal_avg", "bets_in_run_vs_personal_avg", "pace_vs_personal_baseline"]
       screening_eligible: true
       reason_code_category: "BETTING_PACE_DROPPING"
@@ -698,7 +698,7 @@ run_state_machine:
       dtype: "float"
       description: "當前 run 下注頻率（bets/min）相對個人 30 天基準頻率"
       function_name: "compute_wave2_personalized_features"
-      input_columns: ["minutes_since_run_start", "avg_session_duration_min_30d", "bets_in_run_so_far", "num_bets_sum_30d", "sessions_30d"]
+      input_columns: ["minutes_since_run_start", "bets_in_run_so_far"]
       output_columns: ["run_duration_vs_personal_avg", "bets_in_run_vs_personal_avg", "pace_vs_personal_baseline"]
       screening_eligible: true
       reason_code_category: "BETTING_PACE_DROPPING"
@@ -706,467 +706,180 @@ run_state_machine:
   active:
     feature_ids: []
 
-player_snapshot_asset:
-  name: "Track Profile"
-  enabled: false
+player_run_asset:
+  name: "Player run rollup (Section A, monthly snapshots)"
+  enabled: true
 
-  source_table: "player_profile"
-  join:
-    join_key: "canonical_id"
-    snapshot_time_column: "snapshot_dtm"
-    pit_rule: "asof_latest_snapshot_leq_event_time"
-    on_missing_profile:
-      strategy: "zero_fill"
-      emit_metric: "profile_missing_rate"
-
+  source_tables:
+    - run_fact
+    - run_bet_map
+    - t_bet
+    - t_session
+  pit_rule: "Monthly first-of-month snapshot_ts <= bet_time (as-of backward)."
   candidates:
-    - feature_id: "days_since_last_session"
+
+    - feature_id: "player_run_days_since_last_run"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
+      type: player_run_materialized
+      dtype: float
       screening_eligible: false
-      source_column: "days_since_last_session"
+      source_column: player_run_days_since_last_run
       min_lookback_days: 1
-      description: "距離上次造訪天數（Recency）"
+      description: "距離上一個結束 run 的天數（月快照 PIT）"
       postprocess:
-        fill: { strategy: "zero" }
+        fill: { strategy: zero }
         clip: { min: 0.0, max: 10000.0 }
-    - feature_id: "days_since_first_session"
+
+    - feature_id: "player_run_days_since_first_run"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "days_since_first_session"
+      type: player_run_materialized
+      dtype: float
+      source_column: player_run_days_since_first_run
       min_lookback_days: 1
-      description: "距離首次造訪天數"
+      description: "距離第一個開始 run 的天數（月快照 PIT）"
       postprocess:
-        fill: { strategy: "zero" }
+        fill: { strategy: zero }
         clip: { min: 0.0, max: 10000.0 }
-    - feature_id: "sessions_7d"
+
+    - feature_id: "player_run_count_7d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
+      type: player_run_materialized
+      dtype: float
       screening_eligible: false
-      source_column: "sessions_7d"
+      source_column: player_run_count_7d
       min_lookback_days: 7
-      description: "過去 7 天 session 次數"
+      description: "過去 7 日封閉 run 次數（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 10000.0 }
-    - feature_id: "sessions_30d"
+        fill: { strategy: zero }
+
+    - feature_id: "player_run_count_30d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "sessions_30d"
+      type: player_run_materialized
+      dtype: float
+      screening_eligible: false
+      source_column: player_run_count_30d
       min_lookback_days: 30
-      description: "過去 30 天 session 次數"
+      description: "過去 30 日封閉 run 次數（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 10000.0 }
-    - feature_id: "sessions_90d"
+        fill: { strategy: zero }
+
+    - feature_id: "player_run_count_90d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "sessions_90d"
+      type: player_run_materialized
+      dtype: float
+      screening_eligible: false
+      source_column: player_run_count_90d
       min_lookback_days: 90
-      description: "過去 90 天 session 次數"
+      description: "過去 90 日封閉 run 次數（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 10000.0 }
-    - feature_id: "sessions_180d"
+        fill: { strategy: zero }
+
+    - feature_id: "player_run_count_180d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "sessions_180d"
+      type: player_run_materialized
+      dtype: float
+      screening_eligible: false
+      source_column: player_run_count_180d
       min_lookback_days: 180
-      description: "過去 180 天 session 次數"
+      description: "過去 180 日封閉 run 次數（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 10000.0 }
-    - feature_id: "sessions_365d"
+        fill: { strategy: zero }
+
+    - feature_id: "player_run_count_365d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "sessions_365d"
+      type: player_run_materialized
+      dtype: float
+      screening_eligible: false
+      source_column: player_run_count_365d
       min_lookback_days: 365
-      description: "過去 365 天 session 次數"
+      description: "過去 365 日封閉 run 次數（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 10000.0 }
-    - feature_id: "active_days_30d"
+        fill: { strategy: zero }
+
+    - feature_id: "player_run_active_days_30d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "active_days_30d"
+      type: player_run_materialized
+      dtype: float
+      source_column: player_run_active_days_30d
       min_lookback_days: 30
-      description: "過去 30 天有活動天數"
+      description: "過去 30 日不重複下注日數（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 31.0 }
-    - feature_id: "active_days_90d"
+        fill: { strategy: zero }
+
+    - feature_id: "player_run_active_days_90d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "active_days_90d"
+      type: player_run_materialized
+      dtype: float
+      source_column: player_run_active_days_90d
       min_lookback_days: 90
-      description: "過去 90 天有活動天數"
+      description: "過去 90 日不重複下注日數（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 91.0 }
-    - feature_id: "active_days_365d"
+        fill: { strategy: zero }
+
+    - feature_id: "player_run_active_days_365d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "active_days_365d"
+      type: player_run_materialized
+      dtype: float
+      source_column: player_run_active_days_365d
       min_lookback_days: 365
-      description: "過去 365 天有活動天數"
+      description: "過去 365 日不重複下注日數（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 366.0 }
-    - feature_id: "turnover_sum_7d"
+        fill: { strategy: zero }
+
+    - feature_id: "player_run_wager_sum_7d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "turnover_sum_7d"
+      type: player_run_materialized
+      dtype: float
+      screening_eligible: false
+      source_column: player_run_wager_sum_7d
       min_lookback_days: 7
-      description: "過去 7 天 turnover 合計"
+      description: "過去 7 日 wager（投注額）合計（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000000000000.0 }
-    - feature_id: "turnover_sum_30d"
+        fill: { strategy: zero }
+
+    - feature_id: "player_run_wager_sum_30d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "turnover_sum_30d"
+      type: player_run_materialized
+      dtype: float
+      screening_eligible: false
+      source_column: player_run_wager_sum_30d
       min_lookback_days: 30
-      description: "過去 30 天 turnover 合計"
+      description: "過去 30 日 wager（投注額）合計（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000000000000.0 }
-    - feature_id: "turnover_sum_90d"
+        fill: { strategy: zero }
+
+    - feature_id: "player_run_wager_sum_90d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "turnover_sum_90d"
+      type: player_run_materialized
+      dtype: float
+      screening_eligible: false
+      source_column: player_run_wager_sum_90d
       min_lookback_days: 90
-      description: "過去 90 天 turnover 合計"
+      description: "過去 90 日 wager（投注額）合計（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000000000000.0 }
-    - feature_id: "turnover_sum_180d"
+        fill: { strategy: zero }
+
+    - feature_id: "player_run_wager_sum_180d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "turnover_sum_180d"
+      type: player_run_materialized
+      dtype: float
+      screening_eligible: false
+      source_column: player_run_wager_sum_180d
       min_lookback_days: 180
-      description: "過去 180 天 turnover 合計"
+      description: "過去 180 日 wager（投注額）合計（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000000000000.0 }
-    - feature_id: "turnover_sum_365d"
+        fill: { strategy: zero }
+
+    - feature_id: "player_run_wager_sum_365d"
       target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "turnover_sum_365d"
+      type: player_run_materialized
+      dtype: float
+      screening_eligible: false
+      source_column: player_run_wager_sum_365d
       min_lookback_days: 365
-      description: "過去 365 天 turnover 合計"
+      description: "過去 365 日 wager（投注額）合計（月快照）"
       postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000000000000.0 }
-    - feature_id: "player_win_sum_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "player_win_sum_30d"
-      min_lookback_days: 30
-      description: "過去 30 天玩家贏額合計"
-      postprocess:
-        fill: { strategy: "zero" }
-    - feature_id: "player_win_sum_90d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "player_win_sum_90d"
-      min_lookback_days: 90
-      description: "過去 90 天玩家贏額合計"
-      postprocess:
-        fill: { strategy: "zero" }
-    - feature_id: "player_win_sum_180d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "player_win_sum_180d"
-      min_lookback_days: 180
-      description: "過去 180 天玩家贏額合計"
-      postprocess:
-        fill: { strategy: "zero" }
-    - feature_id: "player_win_sum_365d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "player_win_sum_365d"
-      min_lookback_days: 365
-      description: "過去 365 天玩家贏額合計"
-      postprocess:
-        fill: { strategy: "zero" }
-    - feature_id: "theo_win_sum_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "theo_win_sum_30d"
-      min_lookback_days: 30
-      description: "過去 30 天理論贏額合計"
-      postprocess:
-        fill: { strategy: "zero" }
-    - feature_id: "theo_win_sum_180d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "theo_win_sum_180d"
-      min_lookback_days: 180
-      description: "過去 180 天理論贏額合計"
-      postprocess:
-        fill: { strategy: "zero" }
-    - feature_id: "num_bets_sum_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "num_bets_sum_30d"
-      min_lookback_days: 30
-      description: "過去 30 天下注筆數合計"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000000000.0 }
-    - feature_id: "num_bets_sum_180d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "num_bets_sum_180d"
-      min_lookback_days: 180
-      description: "過去 180 天下注筆數合計"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000000000.0 }
-    - feature_id: "num_games_with_wager_sum_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "num_games_with_wager_sum_30d"
-      min_lookback_days: 30
-      description: "過去 30 天有下注局數合計"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000000000.0 }
-    - feature_id: "num_games_with_wager_sum_180d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "num_games_with_wager_sum_180d"
-      min_lookback_days: 180
-      description: "過去 180 天有下注局數合計"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000000000.0 }
-    - feature_id: "turnover_per_bet_mean_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "turnover_per_bet_mean_30d"
-      min_lookback_days: 30
-      description: "過去 30 天平均每注 turnover"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000000000.0 }
-    - feature_id: "turnover_per_bet_mean_180d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "turnover_per_bet_mean_180d"
-      min_lookback_days: 180
-      description: "過去 180 天平均每注 turnover"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000000000.0 }
-    - feature_id: "win_session_rate_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "win_session_rate_30d"
-      min_lookback_days: 30
-      description: "過去 30 天贏錢 session 佔比"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1.0 }
-    - feature_id: "win_session_rate_180d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "win_session_rate_180d"
-      min_lookback_days: 180
-      description: "過去 180 天贏錢 session 佔比"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1.0 }
-    - feature_id: "actual_rtp_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "actual_rtp_30d"
-      min_lookback_days: 30
-      description: "過去 30 天實際 RTP"
-      postprocess:
-        fill: { strategy: "zero" }
-    - feature_id: "actual_rtp_180d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "actual_rtp_180d"
-      min_lookback_days: 180
-      description: "過去 180 天實際 RTP"
-      postprocess:
-        fill: { strategy: "zero" }
-    - feature_id: "actual_vs_theo_ratio_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "actual_vs_theo_ratio_30d"
-      min_lookback_days: 30
-      description: "過去 30 天實際贏錢與理論贏錢比率"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: -100.0, max: 100.0 }
-    - feature_id: "turnover_per_bet_30d_over_180d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "turnover_per_bet_30d_over_180d"
-      min_lookback_days: 180
-      description: "近期平均注額 vs 長期平均注額比（30d/180d）"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 100.0 }
-    - feature_id: "turnover_30d_over_180d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "turnover_30d_over_180d"
-      min_lookback_days: 180
-      description: "過去 30 天/180 天 turnover 比"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 100.0 }
-    - feature_id: "sessions_30d_over_180d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "sessions_30d_over_180d"
-      min_lookback_days: 180
-      description: "近期造訪頻率佔長期比例（30d/180d）"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 100.0 }
-    - feature_id: "sessions_7d_over_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "sessions_7d_over_30d"
-      min_lookback_days: 30
-      description: "最近一週造訪佔 30 天比例（7d/30d）"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 2.0 }
-    - feature_id: "active_days_per_session_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "active_days_per_session_30d"
-      min_lookback_days: 30
-      description: "過去 30 天有活動天數／session 數"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 31.0 }
-    - feature_id: "avg_session_duration_min_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "avg_session_duration_min_30d"
-      min_lookback_days: 30
-      description: "過去 30 天平均 Session 長度（分鐘）"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 10000.0 }
-    - feature_id: "avg_session_duration_min_180d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "avg_session_duration_min_180d"
-      min_lookback_days: 180
-      description: "過去 180 天平均 Session 長度（分鐘）"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 10000.0 }
-    - feature_id: "distinct_table_cnt_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      screening_eligible: false
-      source_column: "distinct_table_cnt_30d"
-      min_lookback_days: 30
-      description: "過去 30 天造訪過的不同桌台數"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000.0 }
-    - feature_id: "distinct_table_cnt_90d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "distinct_table_cnt_90d"
-      min_lookback_days: 90
-      description: "過去 90 天造訪過的不同桌台數"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000.0 }
-    - feature_id: "distinct_pit_cnt_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      screening_eligible: false
-      source_column: "distinct_pit_cnt_30d"
-      min_lookback_days: 30
-      description: "過去 30 天造訪 pit 數"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000.0 }
-    - feature_id: "distinct_gaming_area_cnt_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      screening_eligible: false
-      source_column: "distinct_gaming_area_cnt_30d"
-      min_lookback_days: 30
-      description: "過去 30 天造訪 gaming area 數"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1000.0 }
-    - feature_id: "top_table_share_30d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "top_table_share_30d"
-      min_lookback_days: 30
-      description: "過去 30 天最常桌台佔比"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1.0 }
-    - feature_id: "top_table_share_90d"
-      target_layer: player
-      type: "profile_column"
-      dtype: "float"
-      source_column: "top_table_share_90d"
-      min_lookback_days: 90
-      description: "過去 90 天最常桌台佔比"
-      postprocess:
-        fill: { strategy: "zero" }
-        clip: { min: 0.0, max: 1.0 }
+        fill: { strategy: zero }
 
   active:
     feature_ids: []

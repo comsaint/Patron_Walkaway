@@ -214,8 +214,8 @@ def get_profile_feature_cols(max_lookback_days: int = 365) -> List[str]:
     Examples
     --------
     >>> get_profile_feature_cols(30)   # ~30 days of data
-    ['days_since_last_session', 'days_since_first_session', 'sessions_7d',
-     'sessions_30d', 'active_days_30d', 'turnover_sum_7d', 'turnover_sum_30d', ...]
+    ['player_run_days_since_first_run', 'player_run_count_7d',
+     'player_run_wager_sum_7d', ...]
     >>> get_profile_feature_cols(365)  # full history
     PROFILE_FEATURE_COLS  # all columns
     """

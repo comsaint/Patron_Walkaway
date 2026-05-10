@@ -14,8 +14,9 @@ from typing import Literal
 # Default True: segmented train is required; failures raise (no silent fallback).
 HIGH_ROLLER_SEGMENT_ENABLE: bool = True
 
-# Profile / matrix column used as total theo proxy (must exist on rated train rows).
-HIGH_ROLLER_THEO_FEATURE: str = "player_run_theo_sum_180d"
+# Matrix column used as high/low segmentation proxy on rated rows (historic name: ``theo`` proxy).
+# Section A player-run trial uses wager tallies instead of stripped theo fields.
+HIGH_ROLLER_THEO_FEATURE: str = "player_run_wager_sum_180d"
 
 # Top (1 - q) fraction by theo is "high" (e.g. 0.90 → top ~10%).
 HIGH_ROLLER_QUANTILE: float = 0.90
