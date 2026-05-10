@@ -465,6 +465,24 @@ def execute_l2_training_bundle(
                     ),
                 }
             )
+            try:
+                from trainer.core.mlflow_utils import log_metrics_safe
+
+                _v3_obj = json.loads(_v3_metrics.read_text(encoding="utf-8"))
+                _ds = _v3_obj.get("datasets")
+                if isinstance(_ds, dict):
+                    _ml_m: dict[str, Any] = {}
+                    for _split in ("val", "test"):
+                        _blob = _ds.get(_split)
+                        if not isinstance(_blob, dict):
+                            continue
+                        for _k in ("ap", "precision", "recall", "f1"):
+                            if _k in _blob and _blob[_k] is not None:
+                                _ml_m[f"model/{_split}_{_k}"] = _blob[_k]
+                    if _ml_m:
+                        log_metrics_safe(_ml_m)
+            except Exception as _mm_exc:
+                logger.warning("MLflow raw model metrics (val/test) log skipped: %s", _mm_exc)
     except Exception as _art_exc:
         logger.warning("MLflow training_metrics v3/v2 artifact upload skipped: %s", _art_exc)
     try:
