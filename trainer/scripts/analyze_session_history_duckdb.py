@@ -101,19 +101,19 @@ def main() -> None:
             pct_days = (rated["history_span_days"] >= thr_days).mean() * 100
             print(f"  % with >= {thr_sess} sessions: {pct_sess:.1f}%  |  % with >= {thr_days} days history: {pct_days:.1f}%")
 
-    n_unrated = n_patrons - int(n_rated)
-    if n_unrated > 0:
-        unrated = agg[agg["is_rated"] == 0]
-        print("\n--- Unrated patrons only (sanity check) ---")
-        print(f"  Count: {len(unrated):,}")
-        print(f"  Sessions/patron — median: {unrated['session_count'].median():.0f}, mean: {unrated['session_count'].mean():.1f}")
-        print(f"  History span (days) — median: {unrated['history_span_days'].median():.1f}, mean: {unrated['history_span_days'].mean():.1f}")
+    n_non_rated_patrons = n_patrons - int(n_rated)
+    if n_non_rated_patrons > 0:
+        non_rated = agg[agg["is_rated"] == 0]
+        print("\n--- Non-rated patrons only (sanity check) ---")
+        print(f"  Count: {len(non_rated):,}")
+        print(f"  Sessions/patron — median: {non_rated['session_count'].median():.0f}, mean: {non_rated['session_count'].mean():.1f}")
+        print(f"  History span (days) — median: {non_rated['history_span_days'].median():.1f}, mean: {non_rated['history_span_days'].mean():.1f}")
         for thr_sess, thr_days in [(2, 1), (5, 7), (10, 30)]:
-            pct_sess = (unrated["session_count"] >= thr_sess).mean() * 100
-            pct_days = (unrated["history_span_days"] >= thr_days).mean() * 100
+            pct_sess = (non_rated["session_count"] >= thr_sess).mean() * 100
+            pct_days = (non_rated["history_span_days"] >= thr_days).mean() * 100
             print(f"  % with >= {thr_sess} sessions: {pct_sess:.1f}%  |  % with >= {thr_days} days history: {pct_days:.1f}%")
-        print(f"  % with 1 session only: {(unrated['session_count'] == 1).mean()*100:.1f}%")
-        print(f"  % with 0-day span (single day): {(unrated['history_span_days'] == 0).mean()*100:.1f}%")
+        print(f"  % with 1 session only: {(non_rated['session_count'] == 1).mean()*100:.1f}%")
+        print(f"  % with 0-day span (single day): {(non_rated['history_span_days'] == 0).mean()*100:.1f}%")
 
     print("\n--- Top 5 by history span (days) ---")
     top = agg.nlargest(5, "history_span_days")[

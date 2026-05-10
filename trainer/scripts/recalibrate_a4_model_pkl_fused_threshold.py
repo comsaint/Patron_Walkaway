@@ -38,6 +38,10 @@ import joblib
 import numpy as np
 
 from trainer.core import config as cfg
+from trainer.core.training_metrics_unified import (
+    SCHEMA_TRAINING_METRICS_UNIFIED,
+    primary_rated_metrics_row,
+)
 from trainer.training import trainer as trainer_mod
 from trainer.training.two_stage import (
     candidate_mask_from_scores,
@@ -50,6 +54,8 @@ def _read_training_metrics_rated(bundle_dir: Path) -> Dict[str, Any]:
     if not p.is_file():
         return {}
     root = json.loads(p.read_text(encoding="utf-8"))
+    if isinstance(root, dict) and str(root.get("schema_version") or "") == SCHEMA_TRAINING_METRICS_UNIFIED:
+        return primary_rated_metrics_row(root)
     r = root.get("rated")
     return dict(r) if isinstance(r, dict) else {}
 

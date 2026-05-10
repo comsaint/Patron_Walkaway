@@ -107,7 +107,7 @@ class TestR1104UnratedVolumeLogUsage(unittest.TestCase):
         self.assertIn(
             "UNRATED_VOLUME_LOG",
             src,
-            "scorer should consume UNRATED_VOLUME_LOG when emitting unrated volume telemetry.",
+            "scorer should consume UNRATED_VOLUME_LOG when emitting pre-slice identity-exclusion telemetry.",
         )
 
 

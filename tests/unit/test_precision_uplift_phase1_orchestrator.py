@@ -1897,16 +1897,41 @@ def test_extract_phase2_pat_from_flat_top_level() -> None:
 def test_validate_phase2_training_metrics_ok_when_pat_from_v2_merge(
     tmp_path: Path,
 ) -> None:
-    """v1 檔無 PAT 時，同目錄 ``training_metrics.v2.json`` 經 merge 後應可通過 Gate。"""
+    """junk-only top-level 時，embedded ``contract_v3`` 經 merge 後應可通過 Gate。"""
     d = tmp_path / "logs" / "track_a" / "a0"
     rel = d.relative_to(tmp_path).as_posix()
     d.mkdir(parents=True)
-    (d / "training_metrics.json").write_text(json.dumps({"junk": 1}), encoding="utf-8")
-    (d / "training_metrics.v2.json").write_text(
+    (d / "training_metrics.json").write_text(
         json.dumps(
             {
-                "schema_version": "training-metrics.v2",
-                "datasets": {"test": {"precision_at_recall_0.01": 0.66}},
+                "schema_version": "training-metrics.unified.v1",
+                "model_version": "m",
+                "junk": 1,
+                "contract_v3": {
+                    "schema_version": "training-metrics.v3",
+                    "model_version": "m",
+                    "selection_mode": "field_test",
+                    "neg_pos_ratio_overview": {
+                        "neg_pos_ratio_contract": "n_neg / n_pos",
+                        "primary_model": {
+                            "train": {"neg_pos_ratio": None, "source": "unavailable"},
+                            "val": {"neg_pos_ratio": None, "source": "unavailable"},
+                            "test": {"neg_pos_ratio": None, "source": "unavailable"},
+                        },
+                        "segments": [],
+                    },
+                    "objective_contract": {
+                        "selection_metric_id": "x",
+                        "threshold": {"selected": 0.4, "recall_floor": 0.01},
+                        "constraints": {},
+                        "gate": {},
+                        "observed_split_ratios": {},
+                    },
+                    "datasets": {"test": {"precision_at_recall_0.01": 0.66}},
+                    "segmentation": {"enabled": False},
+                    "selection": {},
+                    "execution": {},
+                },
             }
         ),
         encoding="utf-8",

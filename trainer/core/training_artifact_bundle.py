@@ -142,10 +142,8 @@ def save_artifact_bundle(
     models/feature_list.json       [{name, track}]
     models/reason_code_map.json   {feature_name: reason_code} for scorer SHAP lookup
     models/model_version          <version string>
-    models/training_metrics.json  legacy v1 per-model metrics (rated only)
-    models/training_metrics.v2.json  v2 metrics (datasets + selection; large blobs split out)
-    models/feature_importance.json  winner feature importance (gain list)
-    models/comparison_metrics.json  comparison families (e.g. gbm_bakeoff)
+    models/training_metrics.json  unified metrics (``training-metrics.unified.v1``;
+    embeds legacy flat keys + ``contract_v2`` / ``contract_v3`` / ``feature_importance`` / ``comparison_metrics``)
     models/feature_spec.yaml      frozen feature spec snapshot (DEC-024, R3501)
     models/model_metadata.json    train/valid/test time bounds + run params (schema v1)
     """
@@ -286,14 +284,6 @@ def save_artifact_bundle(
             json.dumps(baseline_training_alignment, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-    (_out / "training_metrics.json").write_text(
-        json.dumps(
-            _metrics_root,
-            indent=2,
-            default=str,
-        ),
-        encoding="utf-8",
-    )
     write_training_metrics_v2_sidecars(
         _out,
         model_version=model_version,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from trainer.core.training_metrics_unified import SCHEMA_TRAINING_METRICS_UNIFIED
 from trainer.core.training_metrics_v2_bundle_write import (
     SCHEMA_TRAINING_METRICS_V3,
     build_training_metrics_v2_payload,
@@ -35,7 +36,7 @@ def test_build_v2_field_test_blocks() -> None:
     assert abs(v2["datasets"]["test"]["field_test"]["precision"] - 0.75) < 1e-9
 
 
-def test_write_sidecars_writes_v3_v2_and_sidecars_and_metadata_paths(tmp_path: Path) -> None:
+def test_write_sidecars_writes_single_unified_json_and_metadata_path(tmp_path: Path) -> None:
     rated = {
         "val_precision": 0.5,
         "val_field_test_primary_score": 0.5,
@@ -67,24 +68,28 @@ def test_write_sidecars_writes_v3_v2_and_sidecars_and_metadata_paths(tmp_path: P
         metrics_root=root,
         model_metadata=meta,
     )
-    assert (tmp_path / "training_metrics.v3.json").is_file()
-    assert (tmp_path / "training_metrics.v2.json").is_file()
-    assert (tmp_path / "feature_importance.json").is_file()
-    assert (tmp_path / "comparison_metrics.json").is_file()
-    v3 = json.loads((tmp_path / "training_metrics.v3.json").read_text(encoding="utf-8"))
+    assert (tmp_path / "training_metrics.json").is_file()
+    assert not (tmp_path / "training_metrics.v3.json").is_file()
+    assert not (tmp_path / "training_metrics.v2.json").is_file()
+    assert not (tmp_path / "feature_importance.json").is_file()
+    assert not (tmp_path / "comparison_metrics.json").is_file()
+    unified = json.loads((tmp_path / "training_metrics.json").read_text(encoding="utf-8"))
+    assert unified.get("schema_version") == SCHEMA_TRAINING_METRICS_UNIFIED
+    v3 = unified["contract_v3"]
     assert v3.get("schema_version") == SCHEMA_TRAINING_METRICS_V3
     assert "objective_contract" in v3
     assert "segmentation" in v3
-    v2 = json.loads((tmp_path / "training_metrics.v2.json").read_text(encoding="utf-8"))
+    v2 = unified["contract_v2"]
     blob = json.dumps(v2)
     assert "feature_importance" not in blob
     assert "gbm_bakeoff" not in blob
-    cm = json.loads((tmp_path / "comparison_metrics.json").read_text(encoding="utf-8"))
+    cm = unified["comparison_metrics"]
     assert cm["families"]["gbm_bakeoff"]["winner_id"] == "xgboost"
-    assert "training_metrics_v3_path" in meta["artifacts"]
-    assert "training_metrics_v2_path" in meta["artifacts"]
-    assert "feature_importance_path" in meta["artifacts"]
-    assert "comparison_metrics_path" in meta["artifacts"]
+    assert "training_metrics_path" in meta["artifacts"]
+    assert "training_metrics_v3_path" not in meta["artifacts"]
+    assert "training_metrics_v2_path" not in meta["artifacts"]
+    assert "feature_importance_path" not in meta["artifacts"]
+    assert "comparison_metrics_path" not in meta["artifacts"]
 
 
 def test_comparison_metrics_preserves_backend_error_and_disposition(tmp_path: Path) -> None:
@@ -109,7 +114,8 @@ def test_comparison_metrics_preserves_backend_error_and_disposition(tmp_path: Pa
         metrics_root=root,
         model_metadata=None,
     )
-    cm = json.loads((tmp_path / "comparison_metrics.json").read_text(encoding="utf-8"))
+    unified = json.loads((tmp_path / "training_metrics.json").read_text(encoding="utf-8"))
+    cm = unified["comparison_metrics"]
     cat = cm["families"]["gbm_bakeoff"]["candidates"]["catboost"]
     assert cat["candidate_id"] == "catboost"
     assert cat["bakeoff_disposition"] == "reject"
@@ -168,9 +174,11 @@ def test_v3_neg_pos_ratio_overview_three_splits_and_segments() -> None:
     root = {
         "selection_mode": "field_test",
         "rated": rated,
-        "segment_high": seg_h,
-        "segment_low": seg_l,
+        "p10_model": seg_h,
+        "low_value_model": seg_l,
         "high_roller_segmentation": {
+            "high_roller_quantile": 0.90,
+            "tail_model_key": "p10_model",
             "high_roller_segment_train_rated_unique_canonical_high": 9,
             "high_roller_segment_valid_rated_unique_canonical_high": 4,
             "high_roller_segment_test_rated_unique_canonical_high": 2,
@@ -189,14 +197,14 @@ def test_v3_neg_pos_ratio_overview_three_splits_and_segments() -> None:
     assert pm["val"]["source"] == "rated.val_neg_pos_ratio"
     assert pm["test"]["neg_pos_ratio"] == 3.0
     assert len(ov["segments"]) == 2
-    hi = next(s for s in ov["segments"] if s["segment"] == "high")
+    hi = next(s for s in ov["segments"] if s["segment"] == "p10_model")
     assert hi["splits"]["train"]["neg_pos_ratio"] == 4.0
     assert hi["splits"]["val"]["neg_pos_ratio"] == 4.0
     assert abs(hi["splits"]["test"]["neg_pos_ratio"] - 3.0) < 1e-9
     assert hi["unique_canonical_rated"]["train"] == 9
     assert hi["unique_canonical_rated"]["val"] == 4
     assert hi["unique_canonical_rated"]["test"] == 2
-    lo = next(s for s in ov["segments"] if s["segment"] == "low")
+    lo = next(s for s in ov["segments"] if s["segment"] == "low_value_model")
     assert lo["splits"]["train"]["neg_pos_ratio"] == 1.0
     assert abs(lo["splits"]["val"]["neg_pos_ratio"] - 2.0) < 1e-9
     assert lo["unique_canonical_rated"]["train"] == 40
@@ -221,7 +229,10 @@ def test_v3_field_test_raw_only_and_segmentation() -> None:
         "selection_mode": "field_test",
         "production_neg_pos_ratio": 15.0,
         "rated": rated,
-        "high_roller_segmentation": {"primary_segment": "high"},
+        "high_roller_segmentation": {
+            "serving_root_segment": "p10_model",
+            "tail_model_key": "p10_model",
+        },
     }
     v3 = build_training_metrics_v3_payload(model_version="mv1", metrics_root=root)
     assert v3["schema_version"] == SCHEMA_TRAINING_METRICS_V3
@@ -236,7 +247,7 @@ def test_v3_field_test_raw_only_and_segmentation() -> None:
     assert "production_neg_pos_ratio" not in v3
     assert "ratio_assumption" not in v3["objective_contract"]
     assert v3["segmentation"]["enabled"] is True
-    assert v3["segmentation"]["high_roller_segmentation"]["primary_segment"] == "high"
+    assert v3["segmentation"]["high_roller_segmentation"]["serving_root_segment"] == "p10_model"
 
 
 def test_v2_datasets_include_alert_density_columns_under_train_val_test() -> None:

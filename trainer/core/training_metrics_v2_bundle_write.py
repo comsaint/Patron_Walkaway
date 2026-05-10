@@ -1,12 +1,9 @@
-"""Phase A dual-write for training_metrics v2 artifact split.
+"""Assemble v2/v3/feature-importance/comparison payloads and write one unified JSON.
 
-Writes alongside legacy ``training_metrics.json``:
-
-- ``training_metrics.v2.json`` — nested datasets + selection remainder (no long importance list, no gbm_bakeoff blob).
-- ``feature_importance.json`` — winner feature importance list + method.
-- ``comparison_metrics.json`` — ``families.gbm_bakeoff`` when A3 report exists.
-
-Legacy v1 payload is unchanged by these helpers; see ``doc/training_metrics_v2_artifact_split_implementation_plan.md``.
+:callable:`write_training_metrics_v2_sidecars` writes ``training_metrics.json`` only
+(``training-metrics.unified.v1``) with nested ``contract_v2``, ``contract_v3``,
+``feature_importance``, and ``comparison_metrics``; legacy sidecar filenames are
+removed when present. See ``doc/training_metrics_v2_artifact_split_implementation_plan.md``.
 """
 
 from __future__ import annotations
@@ -15,6 +12,12 @@ import json
 import math
 from pathlib import Path
 from typing import Any, Dict, Mapping, MutableMapping, Optional, Tuple
+
+from trainer.core.training_metrics_unified import primary_rated_metrics_row
+from trainer.training.high_roller_segmentation import (
+    LOW_VALUE_SEGMENT_MODEL_KEY,
+    tail_segment_model_key,
+)
 
 SCHEMA_TRAINING_METRICS_V2 = "training-metrics.v2"
 SCHEMA_TRAINING_METRICS_V3 = "training-metrics.v3"
@@ -106,9 +109,7 @@ def build_training_metrics_v2_payload(
     model_version: str,
     metrics_root: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    rated = metrics_root.get("rated")
-    if not isinstance(rated, dict):
-        rated = {}
+    rated = primary_rated_metrics_row(metrics_root)
 
     _datasets = build_datasets_section(rated)
     _stage1_ds = rated.get("stage1_datasets")
@@ -222,6 +223,20 @@ def _unique_canonical_rated_splits_from_hr(
     return out if any_set else None
 
 
+def _issue8_tail_model_key(hr: Mapping[str, Any]) -> Optional[str]:
+    """Resolve upper-tail segment metrics key (``p10_model``, …) from Issue #8 audit."""
+    tk = hr.get("tail_model_key")
+    if isinstance(tk, str) and tk.strip():
+        return tk.strip()
+    q_raw = hr.get("high_roller_quantile")
+    if q_raw is None:
+        return None
+    try:
+        return tail_segment_model_key(float(q_raw))
+    except (TypeError, ValueError):
+        return None
+
+
 def build_neg_pos_ratio_overview(
     metrics_root: Mapping[str, Any], rated: Mapping[str, Any]
 ) -> Dict[str, Any]:
@@ -229,30 +244,46 @@ def build_neg_pos_ratio_overview(
     hr_raw = metrics_root.get("high_roller_segmentation")
     hr: Dict[str, Any] = hr_raw if isinstance(hr_raw, dict) else {}
 
-    def _segment_entry(seg_label: str, splits_blob: Mapping[str, Any]) -> Dict[str, Any]:
+    def _segment_entry(
+        seg_label: str, splits_blob: Mapping[str, Any], audit_side: str
+    ) -> Dict[str, Any]:
         entry: Dict[str, Any] = {
             "segment": seg_label,
             "splits": _neg_pos_ratio_three_splits(splits_blob),
         }
-        uc = _unique_canonical_rated_splits_from_hr(hr, seg_label)
+        uc = _unique_canonical_rated_splits_from_hr(hr, audit_side)
         if uc is not None:
             entry["unique_canonical_rated"] = uc
         return entry
 
+    tail_k = _issue8_tail_model_key(hr)
     segments: list[Dict[str, Any]] = []
-    for seg_label, root_key in (("high", "segment_high"), ("low", "segment_low")):
+    specs: list[tuple[str, str, str]] = []
+    if tail_k:
+        specs.append((tail_k, tail_k, "high"))
+    specs.append((LOW_VALUE_SEGMENT_MODEL_KEY, LOW_VALUE_SEGMENT_MODEL_KEY, "low"))
+    for disp, root_key, audit_side in specs:
         blob = metrics_root.get(root_key)
         if isinstance(blob, dict) and blob:
-            segments.append(_segment_entry(seg_label, blob))
-    if not segments:
-        if hr:
-            for seg_label, mk in (
-                ("high", "high_segment_metrics"),
-                ("low", "low_segment_metrics"),
-            ):
-                blob = hr.get(mk)
-                if isinstance(blob, dict) and blob:
-                    segments.append(_segment_entry(seg_label, blob))
+            segments.append(_segment_entry(disp, blob, audit_side))
+    if not segments and hr:
+        legacy_tail_disp = tail_k or "p10_model"
+        for disp, root_key, audit_side in (
+            (legacy_tail_disp, "segment_high", "high"),
+            (LOW_VALUE_SEGMENT_MODEL_KEY, "segment_low", "low"),
+        ):
+            blob = metrics_root.get(root_key)
+            if isinstance(blob, dict) and blob:
+                segments.append(_segment_entry(disp, blob, audit_side))
+    if not segments and hr:
+        legacy_tail_disp = tail_k or "p10_model"
+        for disp, mk, audit_side in (
+            (legacy_tail_disp, "high_segment_metrics", "high"),
+            (LOW_VALUE_SEGMENT_MODEL_KEY, "low_segment_metrics", "low"),
+        ):
+            blob = hr.get(mk)
+            if isinstance(blob, dict) and blob:
+                segments.append(_segment_entry(disp, blob, audit_side))
     return {
         "neg_pos_ratio_contract": "n_neg / n_pos",
         "primary_model": _neg_pos_ratio_three_splits(rated),
@@ -350,15 +381,24 @@ def _objective_contract_block(
 
 def _segmentation_block(metrics_root: Mapping[str, Any]) -> Dict[str, Any]:
     """Issue #8 high-roller multi-tier outputs when present on ``metrics_root``."""
-    hr = metrics_root.get("high_roller_segmentation")
-    sh = metrics_root.get("segment_high")
-    sl = metrics_root.get("segment_low")
-    enabled = isinstance(hr, dict) and bool(hr)
+    hr_raw = metrics_root.get("high_roller_segmentation")
+    hr = hr_raw if isinstance(hr_raw, dict) else {}
+    tail_k = _issue8_tail_model_key(hr)
+    enabled = bool(hr)
     out: Dict[str, Any] = {"enabled": enabled}
     if enabled:
         out["high_roller_segmentation"] = hr
+    if tail_k:
+        shn = metrics_root.get(tail_k)
+        if isinstance(shn, dict) and shn:
+            out[tail_k] = shn
+    slv = metrics_root.get(LOW_VALUE_SEGMENT_MODEL_KEY)
+    if isinstance(slv, dict) and slv:
+        out[LOW_VALUE_SEGMENT_MODEL_KEY] = slv
+    sh = metrics_root.get("segment_high")
     if isinstance(sh, dict) and sh:
         out["segment_high"] = sh
+    sl = metrics_root.get("segment_low")
     if isinstance(sl, dict) and sl:
         out["segment_low"] = sl
     return out
@@ -385,9 +425,7 @@ def build_training_metrics_v3_payload(
     metrics_root: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """Contract-first training metrics (v3) aligned with current pipeline semantics."""
-    rated = metrics_root.get("rated")
-    if not isinstance(rated, dict):
-        rated = {}
+    rated = primary_rated_metrics_row(metrics_root)
 
     _datasets = build_datasets_section_v3(rated)
     _stage1_ds = rated.get("stage1_datasets")
@@ -398,8 +436,12 @@ def build_training_metrics_v3_payload(
         "model_version": model_version,
         "selection_mode": metrics_root.get("selection_mode"),
         "selection_mode_source": _SELECTION_MODE_SOURCE_V3,
-        "neg_pos_ratio_overview": build_neg_pos_ratio_overview(metrics_root, rated),
-        "objective_contract": _objective_contract_block(metrics_root, rated),
+        "neg_pos_ratio_overview": build_neg_pos_ratio_overview(
+            metrics_root, primary_rated_metrics_row(metrics_root)
+        ),
+        "objective_contract": _objective_contract_block(
+            metrics_root, primary_rated_metrics_row(metrics_root)
+        ),
         "datasets": _datasets,
         "segmentation": _segmentation_block(metrics_root),
         "selection": selection,
@@ -501,62 +543,38 @@ def write_training_metrics_v2_sidecars(
     metrics_root: Mapping[str, Any],
     model_metadata: Optional[MutableMapping[str, Any]] = None,
 ) -> Tuple[Path, Path, Path, Path]:
-    """Write v3/v2 metrics, feature importance, and comparison JSON; update optional metadata pointers.
+    """Write a single ``training_metrics.json`` (unified schema); remove legacy sidecars.
 
-    Returns written paths ``(v3, v2, feature_importance, comparison)`` (resolved).
+    Returns four times the same path for call-site compatibility with older tuple unpacks.
     """
+    from trainer.core.training_metrics_unified import write_unified_training_metrics_json
+
     root = Path(bundle_dir).resolve()
-    rated = metrics_root.get("rated")
-    if not isinstance(rated, dict):
-        rated = {}
-
-    v3_path = root / "training_metrics.v3.json"
-    v2_path = root / "training_metrics.v2.json"
-    fi_path = root / "feature_importance.json"
-    cm_path = root / "comparison_metrics.json"
-
-    v3_path.write_text(
-        _json_dump(
-            build_training_metrics_v3_payload(
-                model_version=model_version,
-                metrics_root=metrics_root,
-            )
-        ),
-        encoding="utf-8",
+    rated = primary_rated_metrics_row(metrics_root)
+    v3_payload = build_training_metrics_v3_payload(
+        model_version=model_version,
+        metrics_root=metrics_root,
     )
-    v2_path.write_text(
-        _json_dump(
-            build_training_metrics_v2_payload(
-                model_version=model_version,
-                metrics_root=metrics_root,
-            )
-        ),
-        encoding="utf-8",
+    v2_payload = build_training_metrics_v2_payload(
+        model_version=model_version,
+        metrics_root=metrics_root,
     )
-    fi_path.write_text(
-        _json_dump(
-            build_feature_importance_payload(
-                model_version=model_version,
-                rated=rated,
-            )
-        ),
-        encoding="utf-8",
+    fi_payload = build_feature_importance_payload(
+        model_version=model_version,
+        rated=rated,
     )
-    cm_path.write_text(
-        _json_dump(
-            build_comparison_metrics_payload(
-                model_version=model_version,
-                rated=rated,
-            )
-        ),
-        encoding="utf-8",
+    cm_payload = build_comparison_metrics_payload(
+        model_version=model_version,
+        rated=rated,
     )
-
-    if model_metadata is not None:
-        arts = model_metadata.setdefault("artifacts", {})
-        arts["training_metrics_v3_path"] = str(v3_path)
-        arts["training_metrics_v2_path"] = str(v2_path)
-        arts["feature_importance_path"] = str(fi_path)
-        arts["comparison_metrics_path"] = str(cm_path)
-
-    return v3_path, v2_path, fi_path, cm_path
+    out = write_unified_training_metrics_json(
+        root,
+        model_version=model_version,
+        metrics_root=metrics_root,
+        contract_v2=v2_payload,
+        contract_v3=v3_payload,
+        feature_importance=fi_payload,
+        comparison_metrics=cm_payload,
+        model_metadata=model_metadata,
+    )
+    return out, out, out, out

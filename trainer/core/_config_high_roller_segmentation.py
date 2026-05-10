@@ -28,5 +28,9 @@ HIGH_ROLLER_MIN_ROWS_LOW: int = 500
 # Legacy name only (min-rows / empty-artifact paths now raise instead of falling back).
 HIGH_ROLLER_FALLBACK_MODE: Literal["single_model"] = "single_model"
 
-# Primary segment keys written to model.pkl for backward-compatible scorer fields.
-HIGH_ROLLER_PRIMARY_SEGMENT_FOR_SERVING: Literal["low", "high"] = "low"
+# Which segment's booster is also written at the top-level ``rated_art`` keys
+# (``model`` / ``threshold`` / ``metrics``). The other segment lives only under
+# ``high_roller_segmentation`` with an ``artifact`` sub-tree.
+# - ``low_value_model``: complement of the upper-tail split (below cutoff).
+# - ``tail``: upper tail at ``HIGH_ROLLER_QUANTILE`` (key is ``p{N}_model``, e.g. ``p10_model`` when q=0.90).
+HIGH_ROLLER_ROOT_SEGMENT_FOR_SERVING: Literal["low_value_model", "tail"] = "low_value_model"

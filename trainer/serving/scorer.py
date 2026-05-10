@@ -2198,12 +2198,13 @@ def _score_df(
     rated_threshold: Optional[float] = None,
     feature_audit_context: Optional[Dict[str, object]] = None,
 ) -> pd.DataFrame:
-    """Score all observations with the rated model and compute margin.
+    """Score rows with the rated artifact model and compute margin.
 
-    Sets columns: score, is_rated_obs (int 0/1), margin.
-    All observations (rated and unrated) are scored with the rated artifact model
-    (v10 DEC-021).  Unrated observations are scored for volume telemetry only;
-    alerts are only generated for rated observations (is_rated_obs == 1).
+    Sets columns: ``score``, ``is_rated_obs`` (int 0/1), ``margin``.
+    Callers (e.g. ``score_once``) pass only rated rows after filtering by
+    ``canonical_id`` against the frozen rated mapping; this function therefore
+    scores the rated inference slice.  Alerts downstream use
+    ``is_rated_obs == 1`` (v10 DEC-021).
     """
     rated_art = artifacts.get("rated")
 
@@ -2724,15 +2725,15 @@ def score_once(
     _tel_is_rated = _telemetry_new_from_bets["canonical_id"].isin(rated_canonical_ids)
     _tel_is_rated = _tel_is_rated.fillna(False).astype(bool)
     n_rated_new_bets_pre_slice = int(_tel_is_rated.sum())
-    n_unrated_new_bets_pre_slice = int(len(_telemetry_new_from_bets) - n_rated_new_bets_pre_slice)
-    unrated_players_new_bets_pre_slice = (
+    n_excluded_new_bets_pre_slice = int(len(_telemetry_new_from_bets) - n_rated_new_bets_pre_slice)
+    excluded_players_new_bets_pre_slice = (
         int(
             _telemetry_new_from_bets.loc[~_tel_is_rated, "player_id"]
             .dropna()
             .astype(str)
             .nunique()
         )
-        if n_unrated_new_bets_pre_slice > 0
+        if n_excluded_new_bets_pre_slice > 0
         else 0
     )
 
@@ -2851,18 +2852,18 @@ def score_once(
         _emit_scorer_perf_summary(cycle_stage_seconds)
         return
 
-    # --- Exclude unrated before model (post rated-only slice this should be all True; keep filter for safety) ---
+    # --- Rated-only rows before model (defensive; post-slice should already be rated) ---
     is_rated_mask = features_df["is_rated"].fillna(False).astype(bool)
     features_df = features_df[is_rated_mask].copy()
     if features_df.empty:
         logger.debug("[scorer] No rated bets to score; sleeping")
         _emit_scorer_perf_summary(cycle_stage_seconds)
         return
-    if UNRATED_VOLUME_LOG and n_unrated_new_bets_pre_slice > 0:
+    if UNRATED_VOLUME_LOG and n_excluded_new_bets_pre_slice > 0:
         logger.debug(
-            "[scorer] Excluded %d unrated bets (%d players); scoring %d rated bets.",
-            n_unrated_new_bets_pre_slice,
-            unrated_players_new_bets_pre_slice,
+            "[scorer] Excluded %d bets outside rated identity (%d players); scoring %d rated bets.",
+            n_excluded_new_bets_pre_slice,
+            excluded_players_new_bets_pre_slice,
             n_rated_new_bets_pre_slice,
         )
 
@@ -2925,7 +2926,7 @@ def score_once(
         sqlite_seconds += time.perf_counter() - t_sqlite
 
     # ── Alert candidates: score >= threshold AND rated observations only ──
-    # UNRATED_VOLUME_LOG uses pre-slice new-bet counts; unrated rows are not scored (v10 DEC-021).
+    # UNRATED_VOLUME_LOG uses pre-slice new-bet counts; excluded rows never reach _score_df (v10 DEC-021).
     alert_candidates = features_df[
         (features_df["margin"] >= 0) & (features_df["is_rated_obs"] == 1)
     ].copy()

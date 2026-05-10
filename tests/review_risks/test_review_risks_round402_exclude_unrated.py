@@ -1,7 +1,7 @@
-"""Round 402 Code Review — 排除 unrated 變更之風險點轉成最小可重現測試（tests only，不改 production）。
+"""Round 402 Code Review — rated-only pipeline 變更之風險點轉成最小可重現測試（tests only，不改 production）。
 
 STATUS.md Round 402 Code Review 各項建議新增測試之實作。僅新增測試，不修改 trainer/scorer/backtester。
-Reference: PLAN §16「取得 bet 後排除 unrated 再送模型」、DECISION_LOG DEC-021。
+Reference: PLAN §16「取得 bet 後僅保留 rated 再送模型」、DECISION_LOG DEC-021。
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ class TestR402_1_CanonicalIdTypeStringRated(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# R402 Review #2 — Excluded 僅在 n_unrated > 0 時打 log（邊界／雜訊）
+# R402 Review #2 — Excluded 僅在有非 rated 列時打 log（邊界／雜訊）
 # ---------------------------------------------------------------------------
 class TestR402_2_ExcludedLogOnlyWhenUnratedPresent(unittest.TestCase):
     """Review #2: When all observations are rated, log should not contain 'Excluded' (avoid noise)."""
@@ -147,10 +147,10 @@ class TestR402_2_ExcludedLogOnlyWhenUnratedPresent(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# R402 Review #3 — Backtester 無 rated 時回傳 dict 應含 rated_obs / unrated_obs（契約）
+# R402 Review #3 — Backtester 無 rated 時回傳 dict 應含 rated_obs / non_rated_obs（契約）
 # ---------------------------------------------------------------------------
 class TestR402_3_NoRatedReturnContract(unittest.TestCase):
-    """Review #3: When no rated observations, return must include 'error'; contract: also rated_obs and unrated_obs for caller safety."""
+    """Review #3: When no rated observations, return must include 'error'; contract: also rated_obs and non_rated_obs for caller safety."""
 
     def test_no_rated_return_has_error_and_rated_obs_zero(self):
         """No rated → result has 'error' and result.get('rated_obs', 0) == 0 (passes with current or suggested return)."""
@@ -194,11 +194,14 @@ class TestR402_3_NoRatedReturnContract(unittest.TestCase):
                 run_optuna=False,
             )
         self.assertIn("error", result)
-        self.assertEqual(result.get("error"), "No rated observations in window")
+        self.assertIn(
+            result.get("error"),
+            ("No rated rows after early prune", "No rated observations in window"),
+        )
         self.assertEqual(result.get("rated_obs", 0), 0, "Caller can safely use get('rated_obs', 0).")
 
-    def test_no_rated_return_includes_unrated_obs_key(self):
-        """Contract: no-rated return should include 'unrated_obs' (and optionally 'observations') for consistent structure."""
+    def test_no_rated_return_includes_non_rated_obs_key(self):
+        """Contract: no-rated return should include 'non_rated_obs' (and optionally 'observations') for consistent structure."""
         bets = pd.DataFrame({
             "bet_id": [1],
             "session_id": [10],
@@ -233,17 +236,17 @@ class TestR402_3_NoRatedReturnContract(unittest.TestCase):
                 window_end=window_end,
                 run_optuna=False,
             )
-        self.assertIn("unrated_obs", result, "Error return should include unrated_obs for caller consistency.")
+        self.assertIn("non_rated_obs", result, "Error return should include non_rated_obs for caller consistency.")
 
 
 # ---------------------------------------------------------------------------
-# R402 Review #4 — Unrated 玩家數為 dropna 後計數（語意／可選）
+# R402 Review #4 — 非 rated 玩家數為 dropna 後計數（語意／可選）
 # ---------------------------------------------------------------------------
-class TestR402_4_UnratedPlayersCountSemantics(unittest.TestCase):
-    """Review #4: unrated_players counts only rows with non-NaN canonical_id (documented semantics)."""
+class TestR402_4_NonRatedPlayersCountSemantics(unittest.TestCase):
+    """Review #4: non_rated player counts use rows with non-NaN canonical_id (documented semantics)."""
 
     def test_no_rated_return_observations_consistent_when_keys_present(self):
-        """When production adds rated_obs/unrated_obs to error return, observations should equal rated_obs + unrated_obs. No-op when keys absent."""
+        """When error return includes rated_obs/non_rated_obs, observations should equal their sum. No-op when keys absent."""
         bets = pd.DataFrame({
             "bet_id": [1],
             "session_id": [10],
@@ -272,11 +275,11 @@ class TestR402_4_UnratedPlayersCountSemantics(unittest.TestCase):
                 window_end=dt.datetime(2026, 2, 13, 0, 0),
                 run_optuna=False,
             )
-        if "rated_obs" in result and "unrated_obs" in result and "observations" in result:
+        if "rated_obs" in result and "non_rated_obs" in result and "observations" in result:
             self.assertEqual(
                 result["observations"],
-                result["rated_obs"] + result["unrated_obs"],
-                "observations should equal rated_obs + unrated_obs when all keys present.",
+                result["rated_obs"] + result["non_rated_obs"],
+                "observations should equal rated_obs + non_rated_obs when all keys present.",
             )
         self.assertIn("error", result)
 

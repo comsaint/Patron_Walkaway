@@ -10,8 +10,14 @@ import pytest
 from trainer.training.high_roller_segmentation import (
     compute_high_roller_cutoff_from_train_parquet,
     count_distinct_canonical_rated_parquet,
+    tail_segment_model_key,
     validate_high_roller_theo_nonempty_on_rated_train,
 )
+
+
+def test_tail_segment_model_key_maps_quantile_to_percent_tail_name() -> None:
+    assert tail_segment_model_key(0.90) == "p10_model"
+    assert tail_segment_model_key(0.95) == "p5_model"
 
 
 def test_compute_high_roller_cutoff_from_train_parquet_duckdb_quantile_signature(

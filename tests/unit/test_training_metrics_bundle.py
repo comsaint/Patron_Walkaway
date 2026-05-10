@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from trainer.core.bundle_run_contract import read_bundle_run_contract_block
+from trainer.core.training_metrics_unified import SCHEMA_TRAINING_METRICS_UNIFIED
 from trainer.core.training_metrics_bundle import load_training_metrics_for_contract, load_training_metrics_merged
 
 
@@ -41,6 +42,48 @@ def test_load_training_metrics_merged_v2_only_flattens_datasets(tmp_path: Path) 
     assert flat["test_precision"] == 0.71
     assert flat["test_precision_prod_adjusted"] == 0.45
     assert flat["optuna_hpo_objective_mode"] == "field_test_dec026_val_precision_prod_adj"
+
+
+def test_load_training_metrics_merged_unified_v1_flattens_contract_v3(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "training_metrics.json",
+        {
+            "schema_version": SCHEMA_TRAINING_METRICS_UNIFIED,
+            "model_version": "u1",
+            "selection_mode": "field_test",
+            "rated": {"train_ap": 0.05},
+            "contract_v3": {
+                "schema_version": "training-metrics.v3",
+                "model_version": "u1",
+                "selection_mode": "field_test",
+                "neg_pos_ratio_overview": {
+                    "neg_pos_ratio_contract": "n_neg / n_pos",
+                    "primary_model": {
+                        "train": {"neg_pos_ratio": None, "source": "unavailable"},
+                        "val": {"neg_pos_ratio": None, "source": "unavailable"},
+                        "test": {"neg_pos_ratio": None, "source": "unavailable"},
+                    },
+                    "segments": [],
+                },
+                "objective_contract": {
+                    "selection_metric_id": "x",
+                    "threshold": {"selected": 0.4, "recall_floor": 0.01},
+                    "constraints": {},
+                    "gate": {},
+                    "observed_split_ratios": {},
+                },
+                "datasets": {"test": {"precision": 0.9, "recall": 0.15}},
+                "segmentation": {"enabled": False},
+                "selection": {},
+                "execution": {"optuna_hpo_objective_mode": "from_embedded_v3"},
+            },
+        },
+    )
+    src, flat = load_training_metrics_merged(tmp_path)
+    assert src == "training_metrics.json"
+    assert flat["test_precision"] == 0.9
+    assert flat["train_ap"] == 0.05
+    assert flat["optuna_hpo_objective_mode"] == "from_embedded_v3"
 
 
 def test_load_training_metrics_merged_v1_nested_rated(tmp_path: Path) -> None:
@@ -125,6 +168,44 @@ def test_load_training_metrics_for_contract_prefers_v2(tmp_path: Path) -> None:
     assert tm is not None
     assert tm["selection_mode"] == "field_test"
     assert label == "artifact_training_metrics.v2.json"
+
+
+def test_load_training_metrics_for_contract_unified_prefers_embedded_v3(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "training_metrics.json",
+        {
+            "schema_version": SCHEMA_TRAINING_METRICS_UNIFIED,
+            "selection_mode": "legacy_top",
+            "contract_v3": {
+                "schema_version": "training-metrics.v3",
+                "selection_mode": "field_test_embedded",
+                "neg_pos_ratio_overview": {
+                    "neg_pos_ratio_contract": "n_neg / n_pos",
+                    "primary_model": {
+                        "train": {"neg_pos_ratio": None, "source": "unavailable"},
+                        "val": {"neg_pos_ratio": None, "source": "unavailable"},
+                        "test": {"neg_pos_ratio": None, "source": "unavailable"},
+                    },
+                    "segments": [],
+                },
+                "objective_contract": {
+                    "selection_metric_id": "x",
+                    "threshold": {"selected": 0.4, "recall_floor": 0.01},
+                    "constraints": {},
+                    "gate": {},
+                    "observed_split_ratios": {},
+                },
+                "datasets": {},
+                "segmentation": {"enabled": False},
+                "selection": {},
+                "execution": {},
+            },
+        },
+    )
+    tm, label = load_training_metrics_for_contract(tmp_path)
+    assert tm is not None
+    assert tm["selection_mode"] == "field_test_embedded"
+    assert label == "artifact_training_metrics.json#contract_v3"
 
 
 def test_load_training_metrics_for_contract_prefers_v3(tmp_path: Path) -> None:

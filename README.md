@@ -42,10 +42,10 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 
 ### 最新本機模型快照
 
-- **版本**：`20260425-155443-d211e46`（`out/models/20260425-155443-d211e46/training_metrics.v2.json`）。
+- **版本**：`20260425-155443-d211e46`（`out/models/20260425-155443-d211e46/training_metrics.json`）。
 - **資料窗**：2026-01-01 至 2026-04-01；選模口徑為 `field_test_precision`。
 - **Test KPI**：AP 0.4521；field-test precision（prod-adjusted）0.4990；precision@recall 1% 為 0.7487（raw）/ 0.4906（prod-adjusted）。
-- **執行環境**：`TRAINER_DEVICE_MODE=auto`，本次有效後端為 GPU；完整指標以 bundle 內 `training_metrics.v2.json` 為準。
+- **執行環境**：`TRAINER_DEVICE_MODE=auto`，本次有效後端為 GPU；完整指標以 bundle 內 **`training_metrics.json`**（`training-metrics.unified.v1`，內嵌 `contract_v2` / `contract_v3` 等）為準。
 
 ### 環境設定
 
@@ -109,7 +109,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 **Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`（可加 `--skip-optuna` 跳過閾值搜尋、`--n-trials N` 指定 Optuna 試驗次數）
 
-**即時 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（單次執行加 `--once`；可加 `--model-dir` 指定模型目錄、`--log-level DEBUG|INFO|WARNING`）。Scorer 也會讀取 `data/canonical_mapping.parquet` 與 sidecar（條件同 trainer）；若需強制重建 mapping 可加 `--rebuild-canonical-mapping`。所有觀測用同一 rated 模型評分；**僅評級客（is_rated）會產生告警**，非評級客分數僅供 volume 統計（UNRATED_VOLUME_LOG）。
+**即時 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（單次執行加 `--once`；可加 `--model-dir` 指定模型目錄、`--log-level DEBUG|INFO|WARNING`）。Scorer 也會讀取 `data/canonical_mapping.parquet` 與 sidecar（條件同 trainer）；若需強制重建 mapping 可加 `--rebuild-canonical-mapping`。**僅落在凍結評級映射內的注單會進 rated 模型並產生告警**；映射外新注單不進模型；可選以 `UNRATED_VOLUME_LOG` 記錄映射外筆數（DEC-021）。
 
 **Validator**：`python -m trainer.validator --interval 60`（單次加 `--once`；手動強制結案 PENDING 加 `--force-finalize`）
 
@@ -170,9 +170,9 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 > **路徑**：預設寫入 **`MODEL_DIR`**＝專案根下 **`out/models/`**（`trainer/core/config.py` 之 **`DEFAULT_MODEL_DIR`**）；可設環境變數 **`MODEL_DIR`** 覆寫。下文 **`trainer/models/`** 表同一 bundle 目錄（慣用簡稱）。
 
-`trainer/models/` 下：`model.pkl`（v10 單一評級客模型；**DEC-040**：scorer／backtester **僅**從此檔載入模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 凍結特徵規格，訓練時寫入 bundle，scorer 優先從此載入）、`reason_code_map.json`、`model_version`、`training_metrics.json`（legacy v1）、**`training_metrics.v2.json`**（v2 主指標：datasets / selection / field-test precision）、**`feature_importance.json`**、**`comparison_metrics.json`**、**`pipeline_diagnostics.json`**（訓練成功後寫入：pipeline 總／步驟耗時、`step7_rss_*`、OOM 預檢與 `oom_precheck_step7_rss_error_ratio` 等資源診斷；與模型效能指標分檔）。訓練結束後若存在舊版 `nonrated_model.pkl`、`rated_model.pkl` 或 legacy `walkaway_model.pkl` 會自動刪除，避免目錄內殘留可誤解的檔案（載入端亦不再讀 rated／walkaway）。
+`trainer/models/` 下：`model.pkl`（v10 單一評級客模型；**DEC-040**：scorer／backtester **僅**從此檔載入模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 凍結特徵規格，訓練時寫入 bundle，scorer 優先從此載入）、`reason_code_map.json`、`model_version`、**`training_metrics.json`**（**`training-metrics.unified.v1`**：頂層保留與舊腳本相容的扁平鍵，並以巢狀 **`contract_v2`** / **`contract_v3`** / **`feature_importance`** / **`comparison_metrics`** 承載 datasets／selection／重要性與 A3 bakeoff 等；不再另寫 `training_metrics.v2.json` 等 sidecar）、**`pipeline_diagnostics.json`**（訓練成功後寫入：pipeline 總／步驟耗時、`step7_rss_*`、OOM 預檢與 `oom_precheck_step7_rss_error_ratio` 等資源診斷；與上述指標 JSON 分檔）。訓練結束後若存在舊版 `nonrated_model.pkl`、`rated_model.pkl` 或 legacy `walkaway_model.pkl` 會自動刪除，避免目錄內殘留可誤解的檔案（載入端亦不再讀 rated／walkaway）。
 
-- **部署／MLflow**：`python -m package.build_deploy_package` 會將 bundle 檔案拷貝到產物 `models/`，包含 `training_metrics.json`、`training_metrics.v2.json`、`feature_importance.json`、`comparison_metrics.json` 與 `pipeline_diagnostics.json`（缺檔時建包僅 warning）。若已設定 tracking 且該次訓練有 active run，上述小檔另可以 **`bundle/`** 前綴出現在該 run 的 **Artifacts**（best-effort）。詳見 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`、`doc/phase2_provenance_schema.md`。
+- **部署／MLflow**：`python -m package.build_deploy_package` 會將 bundle 檔案拷貝到產物 `models/`，其中指標與診斷含 **`training_metrics.json`**（unified）與 **`pipeline_diagnostics.json`**（缺檔時建包僅 warning）。若已設定 tracking 且該次訓練有 active run，上述小檔另可以 **`bundle/`** 前綴出現在該 run 的 **Artifacts**（best-effort）。詳見 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`、`doc/phase2_provenance_schema.md`。
 
 ### 注意事項
 
@@ -222,10 +222,10 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 
 ### 最新本机模型快照
 
-- **版本**：`20260425-155443-d211e46`（`out/models/20260425-155443-d211e46/training_metrics.v2.json`）。
+- **版本**：`20260425-155443-d211e46`（`out/models/20260425-155443-d211e46/training_metrics.json`）。
 - **数据窗**：2026-01-01 至 2026-04-01；选模口径为 `field_test_precision`。
 - **Test KPI**：AP 0.4521；field-test precision（prod-adjusted）0.4990；precision@recall 1% 为 0.7487（raw）/ 0.4906（prod-adjusted）。
-- **执行环境**：`TRAINER_DEVICE_MODE=auto`，本次有效后端为 GPU；完整指标以 bundle 内 `training_metrics.v2.json` 为准。
+- **执行环境**：`TRAINER_DEVICE_MODE=auto`，本次有效后端为 GPU；完整指标以 bundle 内 **`training_metrics.json`**（`training-metrics.unified.v1`，内嵌 `contract_v2` / `contract_v3` 等）为准。
 
 ### 环境设置
 
@@ -263,7 +263,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 **Backtester**：`python -m trainer.backtester --start "2025-01-01" --end "2025-01-31" --use-local-parquet`（可加 `--skip-optuna` 跳过阈值搜索、`--n-trials N` 指定 Optuna 试验次数）
 
-**实时 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（单次执行加 `--once`；可加 `--model-dir` 指定模型目录、`--log-level DEBUG|INFO|WARNING`）。Scorer 也会读取 `data/canonical_mapping.parquet` 与 sidecar（条件同 trainer）；若需强制重建 mapping 可加 `--rebuild-canonical-mapping`。所有观测用同一 rated 模型评分；**仅评级客（is_rated）会产生告警**，非评级客分数仅供 volume 统计（UNRATED_VOLUME_LOG）。
+**实时 scorer**：`python -m trainer.scorer --interval 45 --lookback-hours 8`（单次执行加 `--once`；可加 `--model-dir` 指定模型目录、`--log-level DEBUG|INFO|WARNING`）。Scorer 也会读取 `data/canonical_mapping.parquet` 与 sidecar（条件同 trainer）；若需强制重建 mapping 可加 `--rebuild-canonical-mapping`。**仅冻结评级映射内的注单进入 rated 模型并产生告警**；映射外新注单不进模型；可选以 `UNRATED_VOLUME_LOG` 记录映射外笔数（DEC-021）。
 
 **Validator**：`python -m trainer.validator --interval 60`（单次加 `--once`；手动强制结案 PENDING 加 `--force-finalize`）
 
@@ -324,9 +324,9 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 > **路径**：默认写入 **`MODEL_DIR`**＝项目根下 **`out/models/`**（`trainer/core/config.py` 之 **`DEFAULT_MODEL_DIR`**）；可设环境变量 **`MODEL_DIR`** 覆盖。下文 **`trainer/models/`** 表同一 bundle 目录（惯用简称）。
 
-`trainer/models/` 下：`model.pkl`（v10 单一评级客模型；**DEC-040**：scorer／backtester **仅**从此文件加载模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 冻结特征规格，训练时写入 bundle，scorer 优先从此载入）、`reason_code_map.json`、`model_version`、`training_metrics.json`（legacy v1）、**`training_metrics.v2.json`**（v2 主指标：datasets / selection / field-test precision）、**`feature_importance.json`**、**`comparison_metrics.json`**、**`pipeline_diagnostics.json`**（训练成功后写入：pipeline 总/步骤耗时、`step7_rss_*`、OOM 预检与 `oom_precheck_step7_rss_error_ratio` 等资源诊断；与模型效能指标分档）。训练结束后若存在旧版 `nonrated_model.pkl`、`rated_model.pkl` 或 legacy `walkaway_model.pkl` 会自动删除；加载端不再读取 rated／walkaway。
+`trainer/models/` 下：`model.pkl`（v10 单一评级客模型；**DEC-040**：scorer／backtester **仅**从此文件加载模型）、`feature_list.json`、`feature_spec.yaml`（DEC-024 冻结特征规格，训练时写入 bundle，scorer 优先从此载入）、`reason_code_map.json`、`model_version`、**`training_metrics.json`**（**`training-metrics.unified.v1`**：顶层保留与旧脚本兼容的扁平键，并以嵌套 **`contract_v2`** / **`contract_v3`** / **`feature_importance`** / **`comparison_metrics`** 承载 datasets／selection／重要性与 A3 bakeoff 等；不再另写 `training_metrics.v2.json` 等 sidecar）、**`pipeline_diagnostics.json`**（训练成功后写入：pipeline 总/步骤耗时、`step7_rss_*`、OOM 预检与 `oom_precheck_step7_rss_error_ratio` 等资源诊断；与上述指标 JSON 分档）。训练结束后若存在旧版 `nonrated_model.pkl`、`rated_model.pkl` 或 legacy `walkaway_model.pkl` 会自动删除；加载端不再读取 rated／walkaway。
 
-- **部署／MLflow**：`python -m package.build_deploy_package` 会将 bundle 档案拷贝到产物 `models/`，包含 `training_metrics.json`、`training_metrics.v2.json`、`feature_importance.json`、`comparison_metrics.json` 与 `pipeline_diagnostics.json`（缺档时建包仅 warning）。若已设定 tracking 且该次训练有 active run，上述小档另可以 **`bundle/`** 前缀出现在该 run 的 **Artifacts**（best-effort）。详见 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`、`doc/phase2_provenance_schema.md`。
+- **部署／MLflow**：`python -m package.build_deploy_package` 会将 bundle 档案拷贝到产物 `models/`，其中指标与诊断含 **`training_metrics.json`**（unified）与 **`pipeline_diagnostics.json`**（缺档时建包仅 warning）。若已设定 tracking 且该次训练有 active run，上述小档另可以 **`bundle/`** 前缀出现在该 run 的 **Artifacts**（best-effort）。详见 `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md`、`doc/phase2_provenance_schema.md`。
 
 ### 注意事项
 
@@ -376,10 +376,10 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 
 ### Latest Local Model Snapshot
 
-- **Version**: `20260425-155443-d211e46` (`out/models/20260425-155443-d211e46/training_metrics.v2.json`).
+- **Version**: `20260425-155443-d211e46` (`out/models/20260425-155443-d211e46/training_metrics.json`).
 - **Data window**: 2026-01-01 to 2026-04-01; selected by `field_test_precision`.
 - **Test KPI**: AP 0.4521; field-test precision (prod-adjusted) 0.4990; precision@recall 1% is 0.7487 raw / 0.4906 prod-adjusted.
-- **Runtime**: `TRAINER_DEVICE_MODE=auto`, effective backend GPU for this run. Treat the bundle `training_metrics.v2.json` as the source of truth for complete metrics.
+- **Runtime**: `TRAINER_DEVICE_MODE=auto`, effective backend GPU for this run. Treat the bundle **`training_metrics.json`** (`training-metrics.unified.v1`, with nested `contract_v2` / `contract_v3` / `feature_importance` / `comparison_metrics`) as the source of truth for complete metrics.
 
 ---
 
@@ -469,7 +469,7 @@ python -m trainer.scorer --interval 45 --lookback-hours 8
 # Single run: --once. Override model dir: --model-dir PATH. Log level: --log-level DEBUG|INFO|WARNING
 ```
 
-The scorer also loads `data/canonical_mapping.parquet` and sidecar (same conditions as trainer); use `--rebuild-canonical-mapping` to force a full rebuild. All observations are scored with the single rated model (v10). **Alerts are emitted only for rated patrons** (`is_rated`); unrated scores are used for volume telemetry only (UNRATED_VOLUME_LOG).
+The scorer also loads `data/canonical_mapping.parquet` and sidecar (same conditions as trainer); use `--rebuild-canonical-mapping` to force a full rebuild. **Only bets whose `canonical_id` is in the frozen rated mapping are scored** with the single rated model (v10) and can raise alerts. Bets outside that mapping are not scored; optional `UNRATED_VOLUME_LOG` records pre-slice counts for those rows (DEC-021).
 
 ### Validator (match/miss vs realized walkaways)
 
@@ -595,13 +595,10 @@ Under `trainer/models/`:
 - `feature_spec.yaml` — Frozen feature spec snapshot (DEC-024) written at training time; scorer loads this first for train–serve consistency
 - `reason_code_map.json` — Feature-to-reason-code mapping for SHAP
 - `model_version` — Version string (e.g. `20260228-153000-abc1234`)
-- `training_metrics.json` — Legacy v1 metrics for transitional consumers
-- `training_metrics.v2.json` — v2 primary metrics: datasets, selection summary, and field-test precision
-- `feature_importance.json` — Winner feature importance, split out of the v2 metrics file
-- `comparison_metrics.json` — GBM bakeoff / comparison-family details, split out of the v2 metrics file
-- `pipeline_diagnostics.json` — Written on successful training: pipeline/step timings, `step7_rss_*`, OOM precheck vs observed (`oom_precheck_step7_rss_error_ratio`), etc.; **separate** from model metrics files
+- `training_metrics.json` — **`training-metrics.unified.v1`**: flat keys for legacy scripts plus nested **`contract_v2`**, **`contract_v3`**, **`feature_importance`**, and **`comparison_metrics`** (datasets / selection / winner importance / A3 bakeoff families). New training runs do **not** emit separate `training_metrics.v2.json`, `feature_importance.json`, or `comparison_metrics.json` sidecars.
+- `pipeline_diagnostics.json` — Written on successful training: pipeline/step timings, `step7_rss_*`, OOM precheck vs observed (`oom_precheck_step7_rss_error_ratio`), etc.; **separate** from `training_metrics.json`
 
-**Deploy / MLflow**: `python -m package.build_deploy_package` copies bundle files into the package `models/`, including `training_metrics.json`, `training_metrics.v2.json`, `feature_importance.json`, `comparison_metrics.json`, and `pipeline_diagnostics.json` (missing files → warning only). With tracking enabled and an active run, small files may also appear under the run’s **Artifacts** with the **`bundle/`** prefix (best-effort). See `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` and `doc/phase2_provenance_schema.md`.
+**Deploy / MLflow**: `python -m package.build_deploy_package` copies bundle files into the package `models/`, including unified **`training_metrics.json`** and **`pipeline_diagnostics.json`** among the other bundle artifacts (missing optional files → warning only). With tracking enabled and an active run, small files may also appear under the run’s **Artifacts** with the **`bundle/`** prefix (best-effort). See `doc/plan_pipeline_diagnostics_and_mlflow_artifacts.md` and `doc/phase2_provenance_schema.md`.
 
 **DEC-040**: Serving and backtesting load **`model.pkl` only** (no `rated_model.pkl` or `walkaway_model.pkl` fallback). The trainer does not emit `walkaway_model.pkl`. After each successful run, stale `nonrated_model.pkl`, `rated_model.pkl`, and `walkaway_model.pkl` are removed from the bundle directory when present.
 
@@ -612,4 +609,4 @@ Under `trainer/models/`:
 - **Credentials**: Store ClickHouse credentials securely; avoid committing `.env`.
 - **Time zone**: Business logic uses `Asia/Hong_Kong` (see `config.HK_TZ`).
 - **Threshold selection**: Phase 1 uses validation-set **F-beta maximization** (default β=0.5, precision-weighted) for the single-model threshold (DEC-009, DEC-021); optional min recall / alerts-per-hour constraints; see `config.THRESHOLD_FBETA`.
-- **Alert scope**: The scorer and API `POST /score` return `alert=true` only for rated patrons (`is_rated=true`); unrated rows still receive a score but `alert` is always `false`.
+- **Alert scope**: The scorer and API `POST /score` return `alert=true` only for rated patrons (`is_rated=true`). Rows outside the rated identity slice are not scored in the live scorer path; `alert` is always `false` for them.

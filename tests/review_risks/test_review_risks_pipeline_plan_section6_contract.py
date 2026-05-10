@@ -43,14 +43,10 @@ class TestSection6BundleFiles(unittest.TestCase):
     def test_pipeline_diagnostics_in_bundle_files_after_training_metrics(self):
         self.assertIn("training_metrics.json", BUNDLE_FILES)
         for f in ("training_metrics.v2.json", "feature_importance.json", "comparison_metrics.json"):
-            self.assertIn(f, BUNDLE_FILES)
+            self.assertNotIn(f, BUNDLE_FILES)
         self.assertIn("pipeline_diagnostics.json", BUNDLE_FILES)
         self.assertLess(
             BUNDLE_FILES.index("training_metrics.json"),
-            BUNDLE_FILES.index("training_metrics.v2.json"),
-        )
-        self.assertLess(
-            BUNDLE_FILES.index("comparison_metrics.json"),
             BUNDLE_FILES.index("pipeline_diagnostics.json"),
         )
 

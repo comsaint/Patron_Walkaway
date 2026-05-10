@@ -70,7 +70,7 @@ def main() -> None:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # Canonical id: casino_player_id (rated) or player_id (unrated)
+    # Canonical id: casino_player_id when present, else player_id (non-rated fallback)
     df["casino_player_id_clean"] = clean_casino_player_id(
         df.get("casino_player_id", pd.Series(dtype=object))
     )

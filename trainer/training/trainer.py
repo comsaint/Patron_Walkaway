@@ -37,10 +37,8 @@ models/
                               (``bet_duckdb_window``, ``run_state_machine``, ``player_run_asset``);
                               legacy ``track_*`` strings remain readable for old bundles.
   model_version             YYYYMMDD-HHMMSS-<git7>  (plain text)
-  training_metrics.json     legacy v1: validation + test metrics, feature importance (gain), Optuna best params
-  training_metrics.v2.json  v2: nested datasets + selection summary (no long importance / no gbm_bakeoff blob)
-  feature_importance.json   winner gain importance list (split from v1 payload)
-  comparison_metrics.json   comparison families registry (e.g. A3 gbm_bakeoff)
+  training_metrics.json     unified ``training-metrics.unified.v1``: flat legacy keys plus
+                              nested ``contract_v2`` / ``contract_v3`` / ``feature_importance`` / ``comparison_metrics``
 
 Model bundle contract (DEC-040)
 -------------------------------
@@ -4724,13 +4722,20 @@ def train_issue8_high_roller_segmented_bundle(
     single-path ``train_single_rated_model``). When enabled, any prerequisite or
     segment train failure raises ``RuntimeError`` (no silent fallback).
     """
+    from trainer.core.training_metrics_unified import (
+        build_overall_model_issue8,
+        build_segment_models_issue8,
+        build_segmentation_spec_issue8,
+    )
     from trainer.training.high_roller_segmentation import (
+        LOW_VALUE_SEGMENT_MODEL_KEY,
         compute_high_roller_cutoff_from_train_parquet,
         count_distinct_canonical_rated_parquet,
         count_rated_rows_parquet,
         materialize_segment_parquet_splits,
         parquet_has_column,
         routed_test_metrics_payload,
+        tail_segment_model_key,
         validate_high_roller_theo_nonempty_on_rated_train,
     )
 
@@ -4739,13 +4744,19 @@ def train_issue8_high_roller_segmented_bundle(
 
     theo_col = str(getattr(_core_trainer_config, "HIGH_ROLLER_THEO_FEATURE", "theo_win_sum_30d"))
     q = float(getattr(_core_trainer_config, "HIGH_ROLLER_QUANTILE", 0.90))
+    tail_key = tail_segment_model_key(q)
     min_h = int(getattr(_core_trainer_config, "HIGH_ROLLER_MIN_ROWS_HIGH", 500))
     min_l = int(getattr(_core_trainer_config, "HIGH_ROLLER_MIN_ROWS_LOW", 500))
-    primary_seg = str(
-        getattr(_core_trainer_config, "HIGH_ROLLER_PRIMARY_SEGMENT_FOR_SERVING", "low")
-    ).strip().lower()
-    if primary_seg not in ("low", "high"):
-        primary_seg = "low"
+    _srv_raw = getattr(_core_trainer_config, "HIGH_ROLLER_ROOT_SEGMENT_FOR_SERVING", None)
+    if _srv_raw is None:
+        _srv_raw = getattr(_core_trainer_config, "HIGH_ROLLER_PRIMARY_SEGMENT_FOR_SERVING", None)
+    srv = str(_srv_raw if _srv_raw is not None else LOW_VALUE_SEGMENT_MODEL_KEY).strip().lower()
+    if srv in ("low", "low_value_model"):
+        serving_root = LOW_VALUE_SEGMENT_MODEL_KEY
+    elif srv in ("high", "tail") or srv == tail_key.lower():
+        serving_root = tail_key
+    else:
+        serving_root = LOW_VALUE_SEGMENT_MODEL_KEY
 
     if not parquet_has_column(step7_train_path, theo_col):
         raise RuntimeError(
@@ -4956,9 +4967,96 @@ def train_issue8_high_roller_segmented_bundle(
                 f"({step7_test_path}): {_rte}"
             ) from _rte
 
-    primary_art, secondary_art = (low_art, high_art) if primary_seg == "low" else (high_art, low_art)
+    primary_art = low_art if serving_root == LOW_VALUE_SEGMENT_MODEL_KEY else high_art
     primary_metrics = primary_art["metrics"]
-    secondary_metrics = secondary_art["metrics"]
+
+    # GitHub #8: metrics merged into ``save_artifact_bundle`` use ``overall_model`` as the
+    # primary rated row (see ``primary_rated_metrics_row``); ``segmentation_spec`` /
+    # ``segment_models`` hold the router contract—no top-level ``rated`` key on this path.
+    overall_uc: Dict[str, Any] = {
+        "train": count_distinct_canonical_rated_parquet(step7_train_path),
+        "val": count_distinct_canonical_rated_parquet(step7_valid_path),
+    }
+    if step7_test_path is not None and Path(step7_test_path).is_file():
+        overall_uc["test"] = count_distinct_canonical_rated_parquet(Path(step7_test_path))
+
+    uc_tail: Dict[str, Any] = {
+        "train": int(cut_meta.get("high_roller_segment_train_rated_unique_canonical_high") or 0),
+        "val": int(seg_audit.get("high_roller_segment_valid_rated_unique_canonical_high") or 0),
+    }
+    _tuh = seg_audit.get("high_roller_segment_test_rated_unique_canonical_high")
+    if _tuh is not None:
+        uc_tail["test"] = int(_tuh)
+
+    uc_low: Dict[str, Any] = {
+        "train": int(cut_meta.get("high_roller_segment_train_rated_unique_canonical_low") or 0),
+        "val": int(seg_audit.get("high_roller_segment_valid_rated_unique_canonical_low") or 0),
+    }
+    _tul = seg_audit.get("high_roller_segment_test_rated_unique_canonical_low")
+    if _tul is not None:
+        uc_low["test"] = int(_tul)
+
+    seg_spec = build_segmentation_spec_issue8(
+        theo_col=theo_col,
+        quantile=q,
+        cutoff=float(cutoff),
+        tail_key=tail_key,
+        low_key=LOW_VALUE_SEGMENT_MODEL_KEY,
+        serving_root=serving_root,
+    )
+    seg_models = build_segment_models_issue8(
+        tail_key=tail_key,
+        low_key=LOW_VALUE_SEGMENT_MODEL_KEY,
+        thr_tail=float(high_art["threshold"]),
+        thr_low=float(low_art["threshold"]),
+        m_tail=m_h,
+        m_low=m_l,
+        unique_canonical_tail=uc_tail,
+        unique_canonical_low=uc_low,
+    )
+    overall_model = build_overall_model_issue8(
+        primary_metrics=primary_metrics,
+        m_tail=m_h,
+        m_low=m_l,
+        tail_key=tail_key,
+        low_key=LOW_VALUE_SEGMENT_MODEL_KEY,
+        serving_root=serving_root,
+        serving_threshold=float(primary_art["threshold"]),
+        routed_test=routed,
+        unique_canonical_overall=overall_uc,
+    )
+
+    tail_payload: Dict[str, Any] = {
+        "threshold": float(high_art["threshold"]),
+        "metrics": m_h,
+    }
+    low_value_payload: Dict[str, Any] = {
+        "threshold": float(low_art["threshold"]),
+        "metrics": m_l,
+    }
+    if serving_root == LOW_VALUE_SEGMENT_MODEL_KEY:
+        tail_payload["artifact"] = {
+            "model": high_art["model"],
+            "threshold": float(high_art["threshold"]),
+            "features": high_art["features"],
+        }
+    else:
+        low_value_payload["artifact"] = {
+            "model": low_art["model"],
+            "threshold": float(low_art["threshold"]),
+            "features": low_art["features"],
+        }
+
+    hr_seg: Dict[str, Any] = {
+        "schema_version": "issue8_v2",
+        **seg_audit,
+        "tail_model_key": tail_key,
+        "complement_model_key": LOW_VALUE_SEGMENT_MODEL_KEY,
+        "serving_root_segment": serving_root,
+        "overall_weighted": routed,
+    }
+    hr_seg[tail_key] = tail_payload
+    hr_seg[LOW_VALUE_SEGMENT_MODEL_KEY] = low_value_payload
 
     rated_art = {
         "model": primary_art["model"],
@@ -4976,29 +5074,15 @@ def train_issue8_high_roller_segmented_bundle(
         ),
         "stage2_model": primary_art.get("stage2_model"),
         "stage2_features": list(primary_art.get("stage2_features") or primary_art.get("features") or []),
-        "high_roller_segmentation": {
-            "schema_version": "issue8_v1",
-            **seg_audit,
-            "primary_segment": primary_seg,
-            "secondary_segment": "high" if primary_seg == "low" else "low",
-            "high_model_threshold": float(high_art["threshold"]),
-            "low_model_threshold": float(low_art["threshold"]),
-            "high_segment_metrics": m_h,
-            "low_segment_metrics": m_l,
-            "secondary_artifact": {
-                "model": secondary_art["model"],
-                "threshold": secondary_art["threshold"],
-                "features": secondary_art["features"],
-                "metrics": secondary_metrics,
-            },
-            "overall_weighted": routed,
-        },
+        "high_roller_segmentation": hr_seg,
     }
 
     combined_metrics: Dict[str, Any] = {
-        "rated": primary_metrics,
-        "segment_high": m_h,
-        "segment_low": m_l,
+        "segmentation_spec": seg_spec,
+        "segment_models": seg_models,
+        "overall_model": overall_model,
+        tail_key: m_h,
+        LOW_VALUE_SEGMENT_MODEL_KEY: m_l,
         "high_roller_segmentation": rated_art["high_roller_segmentation"],
     }
     return rated_art, combined_metrics
@@ -6972,7 +7056,9 @@ def build_model_metadata_document(
         return str(x)
 
     _test_frac = max(0.0, 1.0 - float(TRAIN_SPLIT_FRAC) - float(VALID_SPLIT_FRAC))
-    _rated = (combined_metrics or {}).get("rated") if isinstance(combined_metrics, dict) else None
+    _rated = None
+    if isinstance(combined_metrics, dict):
+        _rated = combined_metrics.get("overall_model") or combined_metrics.get("rated")
     _rated_d = _rated if isinstance(_rated, dict) else {}
     _lineage: dict[str, Any] = {}
     if l2_snapshot_id:

@@ -1,11 +1,13 @@
 """Load training metrics from a model bundle with v3-first merge semantics.
 
-Phase B+: prefer ``training_metrics.v3.json`` when present and schema-valid,
-then merge with v2/v1 for legacy keys; expose a **flat** dict compatible with
-scripts that historically read top-level ``test_*`` / ``optuna_hpo_*`` keys.
+When ``training_metrics.json`` has ``schema_version`` ``training-metrics.unified.v1``,
+merge its legacy top-level keys (excluding embedded contract blobs) with the
+flattened ``contract_v3`` block. Otherwise prefer standalone ``training_metrics.v3.json``,
+then v2/v1; expose a **flat** dict compatible with scripts that historically read
+top-level ``test_*`` / ``optuna_hpo_*`` keys.
 
 ``read_bundle_run_contract_block`` uses :func:`load_training_metrics_for_contract`
-(v3 → v2 → v1) for ``selection_mode`` resolution; full merges are for reporting scripts.
+for ``selection_mode`` resolution; full merges are for reporting scripts.
 """
 
 from __future__ import annotations
@@ -13,6 +15,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Optional, Tuple
+
+from trainer.core.training_metrics_unified import SCHEMA_TRAINING_METRICS_UNIFIED
 
 V2_SCHEMA = "training-metrics.v2"
 V3_SCHEMA = "training-metrics.v3"
@@ -135,9 +139,10 @@ def load_training_metrics_merged(bundle_root: Path) -> Tuple[Optional[str], dict
     """Return ``(source_label, flat_metrics)`` for scripts / parity tooling.
 
     *source_label* is a short provenance hint:
-    - ``training_metrics.v3.json`` when v3 was loaded (merged with v2/v1 when present),
+    - ``training_metrics.json`` when unified v1 was merged from that file,
+    - ``training_metrics.v3.json`` when standalone v3 was loaded (merged with v2/v1 when present),
     - ``training_metrics.v2.json`` when only v2 (and v1) apply,
-    - ``training_metrics.json`` when only v1 exists,
+    - ``training_metrics.json`` when only legacy v1 exists,
     - ``None`` when no readable metrics files exist.
     """
     root = Path(bundle_root).resolve()
@@ -150,6 +155,24 @@ def load_training_metrics_merged(bundle_root: Path) -> Tuple[Optional[str], dict
 
     if not v1_raw and not v2_raw and not v3_raw:
         return None, {}
+
+    if v1_raw and str(v1_raw.get("schema_version") or "") == SCHEMA_TRAINING_METRICS_UNIFIED:
+        v3_embed = v1_raw.get("contract_v3")
+        v1_core = {
+            k: v
+            for k, v in v1_raw.items()
+            if k
+            not in (
+                "contract_v2",
+                "contract_v3",
+                "feature_importance",
+                "comparison_metrics",
+            )
+        }
+        v1_flat = _flatten_v1_training_metrics(v1_core)
+        v3_flat = _flatten_v3_training_metrics(v3_embed) if isinstance(v3_embed, dict) else {}
+        merged = {**v1_flat, **v3_flat}
+        return str(p_v1.name), merged
 
     v1_flat = _flatten_v1_training_metrics(v1_raw) if v1_raw else {}
 
@@ -198,6 +221,13 @@ def load_training_metrics_for_contract(bundle_root: Path) -> Tuple[Optional[dict
     def _nonempty_mode(blob: dict[str, Any]) -> bool:
         m = blob.get("selection_mode")
         return m is not None and str(m).strip() != ""
+
+    if isinstance(v1, dict) and str(v1.get("schema_version") or "") == SCHEMA_TRAINING_METRICS_UNIFIED:
+        v3e = v1.get("contract_v3")
+        if isinstance(v3e, dict) and _nonempty_mode(v3e):
+            return v3e, "artifact_training_metrics.json#contract_v3"
+        if _nonempty_mode(v1):
+            return v1, "artifact_training_metrics.json"
 
     if v3 is not None and _nonempty_mode(v3):
         return v3, "artifact_training_metrics.v3.json"

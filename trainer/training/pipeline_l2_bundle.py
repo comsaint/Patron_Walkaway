@@ -486,54 +486,58 @@ def execute_l2_training_bundle(
         from trainer.core.mlflow_utils import has_active_run, log_artifact_safe, log_params_safe
         from trainer.core.training_artifact_bundle import MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH
 
-        _v3_metrics = _bundle_dir / "training_metrics.v3.json"
-        if not _v3_metrics.is_file():
+        from trainer.core.training_metrics_unified import SCHEMA_TRAINING_METRICS_UNIFIED
+
+        _tm_main = _bundle_dir / "training_metrics.json"
+        if not _tm_main.is_file():
             logger.warning(
-                "training_metrics.v3.json missing after save_artifact_bundle (expected at %s); "
+                "training_metrics.json missing after save_artifact_bundle (expected at %s); "
                 "MLflow metrics artifact upload skipped.",
-                _v3_metrics,
+                _tm_main,
             )
         elif has_active_run():
             log_artifact_safe(
-                _v3_metrics,
+                _tm_main,
                 artifact_path=MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH,
             )
-            _v2_metrics = _bundle_dir / "training_metrics.v2.json"
-            if _v2_metrics.is_file():
-                log_artifact_safe(
-                    _v2_metrics,
-                    artifact_path=MLFLOW_FULL_MODEL_BUNDLE_ARTIFACT_PATH,
-                )
             log_params_safe(
                 {
-                    "training_metrics_v3_rel_path": (
-                        f"{_bundle_dir.name}/training_metrics.v3.json"
-                    ),
-                    "training_metrics_v2_rel_path": (
-                        f"{_bundle_dir.name}/training_metrics.v2.json"
-                    ),
+                    "training_metrics_rel_path": f"{_bundle_dir.name}/training_metrics.json",
                 }
             )
             try:
                 from trainer.core.mlflow_utils import log_metrics_safe
 
-                _v3_obj = json.loads(_v3_metrics.read_text(encoding="utf-8"))
-                _ds = _v3_obj.get("datasets")
-                if isinstance(_ds, dict):
-                    _ml_m: dict[str, Any] = {}
-                    for _split in ("val", "test"):
-                        _blob = _ds.get(_split)
-                        if not isinstance(_blob, dict):
-                            continue
-                        for _k in ("ap", "precision", "recall", "f1"):
-                            if _k in _blob and _blob[_k] is not None:
-                                _ml_m[f"model/{_split}_{_k}"] = _blob[_k]
-                    if _ml_m:
-                        log_metrics_safe(_ml_m)
+                _tm_obj = json.loads(_tm_main.read_text(encoding="utf-8"))
+                _v3_obj: dict[str, Any] | None = None
+                if (
+                    isinstance(_tm_obj, dict)
+                    and str(_tm_obj.get("schema_version") or "") == SCHEMA_TRAINING_METRICS_UNIFIED
+                ):
+                    _emb = _tm_obj.get("contract_v3")
+                    if isinstance(_emb, dict):
+                        _v3_obj = _emb
+                if _v3_obj is None:
+                    _legacy_v3 = _bundle_dir / "training_metrics.v3.json"
+                    if _legacy_v3.is_file():
+                        _v3_obj = json.loads(_legacy_v3.read_text(encoding="utf-8"))
+                if isinstance(_v3_obj, dict):
+                    _ds = _v3_obj.get("datasets")
+                    if isinstance(_ds, dict):
+                        _ml_m: dict[str, Any] = {}
+                        for _split in ("val", "test"):
+                            _blob = _ds.get(_split)
+                            if not isinstance(_blob, dict):
+                                continue
+                            for _k in ("ap", "precision", "recall", "f1"):
+                                if _k in _blob and _blob[_k] is not None:
+                                    _ml_m[f"model/{_split}_{_k}"] = _blob[_k]
+                        if _ml_m:
+                            log_metrics_safe(_ml_m)
             except Exception as _mm_exc:
                 logger.warning("MLflow raw model metrics (val/test) log skipped: %s", _mm_exc)
     except Exception as _art_exc:
-        logger.warning("MLflow training_metrics v3/v2 artifact upload skipped: %s", _art_exc)
+        logger.warning("MLflow training_metrics.json artifact upload skipped: %s", _art_exc)
     try:
         from trainer.core.mlflow_utils import has_active_run, log_params_safe
 

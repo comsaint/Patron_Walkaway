@@ -770,7 +770,7 @@ def _compute_section_metrics(
     """Compute rated observation-level metrics (v10 single threshold, DEC-021).
 
     Metrics are computed on rated observations only (``rated_sub``) so that
-    PRAUC and alert metrics are not skewed by unrated population scores.
+    PRAUC and alert metrics are not skewed by non-rated population scores.
     The ``labeled`` parameter is accepted for API compatibility but only
     ``rated_sub`` is used for metric computation.
 
@@ -1003,8 +1003,12 @@ def backtest(
             _adm.admitted_rows,
         )
     if bets.empty:
+        _n_after_prune = int(_adm.total_input_rows)
         return {
             "error": "No rated rows after early prune",
+            "rated_obs": 0,
+            "non_rated_obs": _n_after_prune,
+            "observations": _n_after_prune,
             "bet_duckdb_window_degraded": False,
             **_run_contract,
         }
@@ -1123,24 +1127,24 @@ def backtest(
     )
     labeled["is_rated"] = labeled["canonical_id"].astype(str).isin(rated_ids)
 
-    # --- Exclude unrated before model (PLAN: 取得 bet 後排除 unrated 再送模型) ---
+    # --- Rated-only before model (rows where canonical_id ∉ rated mapping) ---
     n_rated_orig = int(labeled["is_rated"].sum())
-    n_unrated_orig = int((~labeled["is_rated"]).sum())
-    unrated_players_orig = (
+    n_non_rated_orig = int((~labeled["is_rated"]).sum())
+    non_rated_players_orig = (
         int(
             labeled.loc[~labeled["is_rated"], "canonical_id"]
             .dropna()
             .astype(str)
             .nunique()
         )
-        if n_unrated_orig > 0
+        if n_non_rated_orig > 0
         else 0
     )
-    if UNRATED_VOLUME_LOG and n_unrated_orig > 0:
+    if UNRATED_VOLUME_LOG and n_non_rated_orig > 0:
         logger.info(
-            "[backtester] Excluded %d unrated observations (%d players); scoring %d rated.",
-            n_unrated_orig,
-            unrated_players_orig,
+            "[backtester] Excluded %d observations outside rated identity (%d players); scoring %d rated.",
+            n_non_rated_orig,
+            non_rated_players_orig,
             n_rated_orig,
         )
     labeled = labeled[labeled["is_rated"]].copy()
@@ -1148,8 +1152,8 @@ def backtest(
         return {
             "error": "No rated observations in window",
             "rated_obs": 0,
-            "unrated_obs": n_unrated_orig,
-            "observations": n_unrated_orig,
+            "non_rated_obs": n_non_rated_orig,
+            "observations": n_non_rated_orig,
             "bet_duckdb_window_degraded": _bet_duckdb_window_degraded,
             **_run_contract,
         }
@@ -1172,9 +1176,9 @@ def backtest(
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
         "window_hours": window_hours,
-        "observations": n_rated_orig + n_unrated_orig,
+        "observations": n_rated_orig + n_non_rated_orig,
         "rated_obs": n_rated_orig,
-        "unrated_obs": n_unrated_orig,
+        "non_rated_obs": n_non_rated_orig,
         "bet_duckdb_window_degraded": _bet_duckdb_window_degraded,
         "model_default": _compute_section_metrics(
             labeled, rated_sub,

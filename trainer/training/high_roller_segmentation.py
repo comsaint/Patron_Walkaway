@@ -15,7 +15,28 @@ from typing import Any, Dict, Literal, Optional, Tuple
 
 logger = logging.getLogger("trainer")
 
+# Rated rows below the train quantile cutoff (complement of the upper tail segment).
+LOW_VALUE_SEGMENT_MODEL_KEY = "low_value_model"
+
 _THEO_COL_SAFE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def tail_segment_model_key(quantile: float) -> str:
+    """Return JSON/dict key for the upper-tail segment (rated rows >= train quantile cutoff).
+
+    Examples: ``quantile=0.90`` → top ~10% → ``p10_model``; ``0.95`` → ``p5_model``.
+
+    Args:
+        quantile: Quantile ``q`` passed to ``quantile_cont(q)`` on the segmentation proxy.
+
+    Returns:
+        Key string ``p{tail_pct}_model`` with *tail_pct* in ``[1, 99]``.
+    """
+    qf = float(quantile)
+    if not math.isfinite(qf) or qf <= 0.0 or qf >= 1.0:
+        raise ValueError(f"quantile must be finite in (0, 1), got {quantile!r}")
+    tail_pct = max(1, min(99, int(round((1.0 - qf) * 100.0))))
+    return f"p{tail_pct}_model"
 
 
 def validate_theo_feature_name(theo_col: str) -> str:

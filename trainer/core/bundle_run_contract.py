@@ -4,14 +4,15 @@
 ``backtest_metrics.json`` and merged into scorer ``load_dual_artifacts`` output:
 ``selection_mode``, ``selection_mode_source``, ``production_neg_pos_ratio``.
 
-``selection_mode`` prefers a non-empty ``selection_mode`` in the bundle's
-``training_metrics.v3.json`` (when present and readable), then
-``training_metrics.v2.json``, then ``training_metrics.json``; otherwise
-:data:`trainer.core.config.SELECTION_MODE`.
+``selection_mode`` prefers a non-empty ``selection_mode`` in the bundle's embedded
+``training_metrics.json`` contract (``contract_v3`` when
+``schema_version`` is ``training-metrics.unified.v1``), then standalone
+``training_metrics.v3.json``, ``training_metrics.v2.json``, then top-level keys in
+``training_metrics.json``; otherwise :data:`trainer.core.config.SELECTION_MODE`.
 
 ``production_neg_pos_ratio`` defaults to :data:`trainer.core.config.PRODUCTION_NEG_POS_RATIO`
-(``training_metrics.v3.json`` does not repeat this config assumption; legacy
-``training_metrics.json`` / v2 may still carry it for audits).
+(unified / v3 contract blobs may omit this; legacy flat ``training_metrics.json`` may
+still carry it for audits).
 Callers that load config via a different module (e.g. backtester ``_cfg``) may pass
 ``production_neg_pos_ratio=...`` so the contract matches ``compute_micro_metrics``.
 """

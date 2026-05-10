@@ -159,6 +159,7 @@ THRESHOLD_MIN_ALERTS_PER_HOUR: Optional[float] = 1.0
 
 TABLE_HC_WINDOW_MIN = 30
 PLACEHOLDER_PLAYER_ID = -1
+# When True, scorer/backtester may log counts for new rows outside the rated canonical-id set (DEC-021).
 UNRATED_VOLUME_LOG = True
 
 # A4 two-stage (R4): default on; set A4_TWO_STAGE_ENABLE_TRAINING=0 / A4_TWO_STAGE_ENABLE_INFERENCE=0 to disable.
