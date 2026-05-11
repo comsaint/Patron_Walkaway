@@ -25,6 +25,8 @@ import threading
 from pathlib import Path
 from typing import Any, Sequence
 
+from trainer.core._config_training_memory import PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT
+
 # Bet-level run/trip LDA pass-through columns (must match trainer ``_REQUIRED_BET_PARQUET_COLS`` suffix
 # and dev ``feature_candidates.yaml`` passthrough ``feature_id`` values).
 LDA_RUN_TRIP_BET_COLUMNS: tuple[str, ...] = (
@@ -34,8 +36,6 @@ LDA_RUN_TRIP_BET_COLUMNS: tuple[str, ...] = (
     "lda_trip_is_closed",
     "lda_l1_run_duration_min",
 )
-
-_ENV_DUCKDB_MEM = "PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT"
 
 # Subdir under ``data/`` for bridge outputs only (L0 stays at repo ``data/gmwds_t_*.parquet``).
 MVP_TRAINER_BRIDGE_SUBDIR = "mvp_trainer_bridge"
@@ -296,7 +296,7 @@ def emit_trainer_local_parquet(
     data_dir: Path,
     enrich_bet_with_run_trip_lda: bool = False,
     skip_if_unchanged: bool | None = None,
-    duckdb_memory_limit: str | None = None,
+    duckdb_memory_limit: int | str | None = None,
 ) -> Path:
     """Materialize trainer-shaped bet/session Parquet under ``mvp_trainer_bridge/``.
 
@@ -313,9 +313,11 @@ def emit_trainer_local_parquet(
         Default False (skip bet-level run/trip LDA columns; manifest ``bet_includes_run_trip_lda_columns`` false).
     skip_if_unchanged : bool | None
         If None, use ``trainer.config.TRAINER_BRIDGE_SKIP_IF_UNCHANGED`` (default True).
-    duckdb_memory_limit : str | None
-        DuckDB ``SET memory_limit`` value, e.g. ``'4GB'``. Env
-        ``PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT`` when unset here.
+    duckdb_memory_limit : int | str | None
+        DuckDB ``PRAGMA memory_limit``: positive ``int`` = gigabytes (e.g. ``8`` → ``8GB``),
+        or a non-empty ``str`` passed through to DuckDB (e.g. ``'512MB'``). When ``None``,
+        uses ``PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT`` (int GB) from
+        ``trainer.core._config_training_memory``.
 
     Returns
     -------
@@ -328,7 +330,8 @@ def emit_trainer_local_parquet(
     FileNotFoundError
         If snapshot metadata or session source is missing.
     ValueError
-        If required bet columns are absent from resolved inputs.
+        If required bet columns are absent from resolved inputs, or if
+        ``duckdb_memory_limit`` / ``PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT`` is invalid.
     """
     import duckdb
 
@@ -340,7 +343,25 @@ def emit_trainer_local_parquet(
     if skip_if_unchanged is None:
         skip_if_unchanged = _default_skip_if_unchanged()
     if duckdb_memory_limit is None:
-        duckdb_memory_limit = os.environ.get(_ENV_DUCKDB_MEM, "").strip() or "4GB"
+        cfg_gb = PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT
+        if not isinstance(cfg_gb, int) or cfg_gb <= 0:
+            raise ValueError(
+                "PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT must be a positive int (GB); "
+                f"got {cfg_gb!r} (type={type(cfg_gb).__name__})."
+            )
+        duckdb_memory_pragma = f"{cfg_gb}GB"
+    elif isinstance(duckdb_memory_limit, int):
+        if duckdb_memory_limit <= 0:
+            raise ValueError(
+                "duckdb_memory_limit as int must be positive GB; "
+                f"got {duckdb_memory_limit!r}."
+            )
+        duckdb_memory_pragma = f"{duckdb_memory_limit}GB"
+    else:
+        raw = str(duckdb_memory_limit).strip()
+        if not raw:
+            raise ValueError("duckdb_memory_limit str must be non-empty after strip.")
+        duckdb_memory_pragma = raw
 
     try:
         _bridge_rel = str(bridge_dir.relative_to(data_dir))
@@ -353,7 +374,7 @@ def emit_trainer_local_parquet(
     )
     if os.environ.get("TRAINER_BRIDGE_VERBOSE", "").strip().lower() in ("1", "true", "yes"):
         _bridge_echo(
-            f"(verbose) DuckDB memory_limit={duckdb_memory_limit!r} skip_if_unchanged={skip_if_unchanged} "
+            f"(verbose) DuckDB memory_limit={duckdb_memory_pragma!r} skip_if_unchanged={skip_if_unchanged} "
             f"enrich_bet_with_run_trip_lda_requested={enrich_bet_with_run_trip_lda}"
         )
 
@@ -449,12 +470,15 @@ def emit_trainer_local_parquet(
     try:
         con = duckdb.connect(database=":memory:")
         try:
-            if duckdb_memory_limit:
+            if duckdb_memory_pragma:
                 # memory_limit is a pragma value, not a path — use as literal with simple guard
-                lim = str(duckdb_memory_limit).replace("'", "")
+                lim = str(duckdb_memory_pragma).replace("'", "")
                 con.execute(f"PRAGMA memory_limit='{lim}'")
                 _bridge_echo(
-                    f"DuckDB engine memory cap set to {lim!r} (raise via env {_ENV_DUCKDB_MEM} if you have RAM)."
+                    "DuckDB engine memory cap set to "
+                    f"{lim!r} (tune int GB ``PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT`` in "
+                    "``trainer/core/_config_training_memory.py``, or pass "
+                    "``duckdb_memory_limit`` to ``emit_trainer_local_parquet``)."
                 )
 
             cols_sql = ", ".join(f'"{c}"' for c in required)

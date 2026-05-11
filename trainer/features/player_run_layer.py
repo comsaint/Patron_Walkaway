@@ -29,6 +29,8 @@ Raises ``RuntimeError`` when local layered assets or required columns are missin
 from __future__ import annotations
 
 import logging
+import os
+import uuid
 from time import perf_counter
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Set, Tuple
@@ -49,7 +51,6 @@ logger = logging.getLogger(__name__)
 _PLAYER_RUN_WINDOWS_DAYS: Tuple[int, ...] = (7, 30, 90, 180, 365)
 _MAX_WINDOW_DAYS = max(_PLAYER_RUN_WINDOWS_DAYS)
 _JOIN_LOOKBACK_PAD_DAYS = 40
-_FETCH_VECTORS_PER_CHUNK = 64
 
 SECTION_A_PLAYER_RUN_FEATURE_IDS: Tuple[str, ...] = (
     "player_run_days_since_last_run",
@@ -161,8 +162,12 @@ def _merge_snapshot_features_onto_labeled(labeled_evt: pd.DataFrame, feats: pd.D
 
     merged = pd.concat(merged_parts, ignore_index=True)
     ok = merged["snapshot_ts"].notna() & merged["bet_t"].notna()
-    if ok.any() and ((merged.loc[ok, "snapshot_ts"] > merged.loc[ok, "bet_t"]).any()):
-        raise RuntimeError("monthly_snapshot PIT violation: snapshot_ts > bet_event_time")
+    if ok.any():
+        snap = merged["snapshot_ts"].to_numpy(copy=False)
+        bet_t = merged["bet_t"].to_numpy(copy=False)
+        ok_arr = ok.to_numpy(copy=False)
+        if np.logical_and(ok_arr, snap > bet_t).any():
+            raise RuntimeError("monthly_snapshot PIT violation: snapshot_ts > bet_event_time")
 
     return labeled_evt[["bet_id"]].merge(merged[["bet_id"] + feat_cols], on="bet_id", how="left")
 
@@ -234,6 +239,25 @@ def _materialized_column_set(wanted: Set[str]) -> Set[str]:
     """Return columns to fetch from DuckDB before pandas derived features."""
     all_known = _MAIN_AGG_OUTPUT_COLUMNS | _DAYS_OUTPUT_COLUMNS | _TOP_SHARE_OUTPUT_COLUMNS
     return (wanted & all_known) | (_derived_dependency_columns(wanted) & all_known)
+
+
+def _duckdb_copy_path_sql(path: Path) -> str:
+    """Return a single-quoted DuckDB path literal (forward slashes, escape quotes)."""
+    return path.resolve().as_posix().replace("'", "''")
+
+
+def _player_run_merge_column_order(merged_columns: Set[str], wanted_set: Set[str], materialized_cols: Set[str]) -> List[str]:
+    """Order columns for ``labeled.merge`` — ``bet_id`` plus required ``player_run_*`` only."""
+    deps = _derived_dependency_columns(wanted_set)
+    keep = {"bet_id"} | (merged_columns & (wanted_set | deps | materialized_cols))
+    if "bet_id" in merged_columns and "bet_id" not in keep:
+        keep.add("bet_id")
+    rest = sorted(c for c in merged_columns if c in keep and c != "bet_id")
+    out: List[str] = []
+    if "bet_id" in merged_columns:
+        out.append("bet_id")
+    out.extend(rest)
+    return out
 
 
 def _build_final_projection_sql(
@@ -868,6 +892,7 @@ def attach_player_run_features(
         manifest=manifest,
         manifest_path=mp,
     )
+    tmp_player_run_pq: Optional[Path] = None
 
     wanted_list = (
         list(feature_cols)
@@ -1003,26 +1028,42 @@ def attach_player_run_features(
         _run_sql_stage(con, "projection_sql", f"CREATE OR REPLACE TEMP TABLE player_run_all AS\n{final_sql};")
         progress.update(1)
 
-        progress.set_description("Step 6/11 player_run: fetch_chunked")
+        progress.set_description("Step 6/11 player_run: export_parquet")
         t_fetch = perf_counter()
-        con.execute("SELECT * FROM player_run_all")
-        chunks: List[pd.DataFrame] = []
-        fetched_rows = 0
-        while True:
-            chunk_df = con.fetch_df_chunk(vectors_per_chunk=_FETCH_VECTORS_PER_CHUNK)
-            if chunk_df.empty:
-                break
-            chunks.append(chunk_df)
-            fetched_rows += len(chunk_df)
-            logger.info("player_run: fetched chunk rows=%d total=%d", len(chunk_df), fetched_rows)
-        merged_df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=["bet_id"])
-        logger.info("player_run: %-22s done in %.1fs rows=%d", "fetch_chunked", perf_counter() - t_fetch, len(merged_df))
+        tmp_dir = Path(str(runtime_policy["temp_directory"]))
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_player_run_pq = tmp_dir / f"player_run_all_{os.getpid()}_{uuid.uuid4().hex}.parquet"
+        _copy_esc = _duckdb_copy_path_sql(tmp_player_run_pq)
+        con.execute(f"COPY player_run_all TO '{_copy_esc}' (FORMAT PARQUET)")
+        logger.info(
+            "player_run: %-22s done in %.1fs path=%s",
+            "export_parquet",
+            perf_counter() - t_fetch,
+            tmp_player_run_pq.name,
+        )
         progress.update(1)
     finally:
         progress.close()
         con.close()
 
+    try:
+        if tmp_player_run_pq is not None and tmp_player_run_pq.is_file():
+            merged_df = pd.read_parquet(tmp_player_run_pq)
+        else:
+            merged_df = pd.DataFrame(columns=["bet_id"])
+        logger.info("player_run: materialized join_frame rows=%d", len(merged_df))
+    finally:
+        if tmp_player_run_pq is not None:
+            try:
+                tmp_player_run_pq.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     merged_df.drop(columns=[c for c in merged_df.columns if str(c).startswith("_")], inplace=True, errors="ignore")
+    _proj_cols = _player_run_merge_column_order(set(merged_df.columns), wanted_set, materialized_cols)
+    _proj_cols = [c for c in _proj_cols if c in merged_df.columns]
+    if _proj_cols:
+        merged_df = merged_df[_proj_cols]
 
     join_frame = merged_df
     if monthly_snap and snap_grid is not None:

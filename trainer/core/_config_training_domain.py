@@ -33,7 +33,8 @@ L2_IMPACT_ORCHESTRATOR_MODE: Literal["off", "observe", "enforce"] = "enforce"
 # When False with enforce+impacted_only, a stale Step-6 chunk final-cache key raises (fail-closed B).
 L2_IMPACT_ALLOW_CHUNK_FULL_FALLBACK: bool = True
 # When True, Step 6 tries a snapshot/definition-keyed label store before window-bound label_intermediate.
-L2_LABEL_ASSET_CROSS_WINDOW_STORE: bool = True
+# Off by default: large-window runs avoid read/modify/write Parquet concat OOM on laptop class RAM.
+L2_LABEL_ASSET_CROSS_WINDOW_STORE: bool = False
 # Max Parquet size (bytes) for read-modify-write upsert on label store; avoids OOM on huge stores.
 L2_LABEL_ASSET_STORE_MAX_UPSERT_BYTES: int = 512 * 1024 * 1024
 

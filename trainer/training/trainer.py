@@ -2432,10 +2432,27 @@ def process_chunk(
         & (labeled["payout_complete_dtm"] >= window_start)
         & (labeled["payout_complete_dtm"] < window_end)
     )
-    labeled = labeled.loc[_keep_mask].reset_index(drop=True)
+    # Single slice only: reset_index(drop=True) forces a second full-frame copy and
+    # can OOM on 80M+ rows (float blocks). Non-RangeIndex is fine for downstream merges.
+    labeled = labeled.loc[_keep_mask]
     if labeled.empty:
         logger.warning("Chunk %s–%s: empty after label filtering", window_start.date(), window_end.date())
         return None
+
+    if bool(getattr(_cfg, "STEP6_CHUNK_HEALTH_LOG", False)):
+        try:
+            import psutil as _psutil_s6
+
+            _rss_mb = float(_psutil_s6.Process().memory_info().rss) / (1024**2)
+        except Exception:
+            _rss_mb = float("nan")
+        logger.info(
+            "Step 6/11 chunk health %s: rows=%d label_pos=%d rss_mb=%.1f",
+            _chunk_lbl,
+            len(labeled),
+            int(pd.to_numeric(labeled["label"], errors="coerce").fillna(0).astype(np.int64).sum()),
+            _rss_mb,
+        )
 
     # --- player_profile PIT join (PLAN Step 4 / DEC-011) ---
     # Attaches Rated-player profile features via as-of merge (snapshot_dtm <= bet_time).

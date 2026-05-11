@@ -20,7 +20,7 @@ Optional flags:
 
 Idempotency / RAM (bridge): skip unchanged rebuilds when
 ``trainer.config.TRAINER_BRIDGE_SKIP_IF_UNCHANGED`` is True (default); DuckDB cap via
-``PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT`` (e.g. ``4GB``).
+``trainer.core._config_training_memory.PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT`` (int GB, default ``4``).
 
 Defaults (first match wins for paths):
 

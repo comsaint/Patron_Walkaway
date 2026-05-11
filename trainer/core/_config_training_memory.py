@@ -21,14 +21,19 @@ from typing import Literal, Optional
 # - Peak RSS unchanged or lower on the same machine.
 # - Spot-check with RUN_BOUNDARY_PARITY_CHECK=True while len(bets) <= RUN_BOUNDARY_PARITY_MAX_ROWS.
 # Then set RUN_BOUNDARY_ENGINE = "duckdb".
-RUN_BOUNDARY_ENGINE: Literal["pandas", "duckdb"] = "pandas"
+# Default DuckDB: lower peak RAM / wall time on large windows (pandas fallback remains in feature_pipeline).
+RUN_BOUNDARY_ENGINE: Literal["pandas", "duckdb"] = "duckdb"
 # When True and engine is duckdb, diff against pandas if len(bets) <= RUN_BOUNDARY_PARITY_MAX_ROWS.
 RUN_BOUNDARY_PARITY_CHECK: bool = False
 RUN_BOUNDARY_PARITY_MAX_ROWS: int = 500_000
 
 # --- Step 6 diagnostics (process_chunk hot path) ---
 STEP6_PROFILE_ENABLED: bool = True
-
+# Log one compact health line after label window filter (rows / positives) for A/B parity checks.
+STEP6_CHUNK_HEALTH_LOG: bool = True
+# Manual Step 6 phase gates: compare the same training window after each change —
+# Step6 profile phases (load_raw, normalize_dq, identity_admission, run_state_machine, …),
+# ``chunk health`` log line (rows / label_pos / rss_mb), and final chunk Parquet row count.
 
 def _truthy_env(name: str, default: str) -> bool:
     """Return True for common truthy env strings (1/true/t/yes/y, case-insensitive)."""
@@ -58,9 +63,14 @@ NEG_SAMPLE_BYTES_PER_CHUNK_DEFAULT: int = 200 * 1024 * 1024
 # Test share is implicit: 1 - TRAIN_SPLIT_FRAC - VALID_SPLIT_FRAC (0.15 with 0.65/0.20).
 # For large N, 15% temporal holdout is a common default; adequacy of *row counts* for
 # metrics is warned in trainer Step 7 when valid or test falls below MIN_VALID_TEST_ROWS.
-TRAIN_SPLIT_FRAC = 0.65
-VALID_SPLIT_FRAC = 0.20
+TRAIN_SPLIT_FRAC = 0.70
+VALID_SPLIT_FRAC = 0.15
 MIN_VALID_TEST_ROWS = 50
+
+# --- parallel_lda_mvp → trainer bridge (DuckDB in-memory engine cap) ---
+# Gigabytes for DuckDB ``PRAGMA memory_limit`` in
+# ``parallel_lda_mvp.trainer_bridge_mvp.emit_trainer_local_parquet`` (emitted as ``"{n}GB"``).
+PARALLEL_LDA_BRIDGE_DUCKDB_MEMORY_LIMIT: int = 8
 
 # --- Profile ETL memory path ---
 PROFILE_USE_DUCKDB: bool = True

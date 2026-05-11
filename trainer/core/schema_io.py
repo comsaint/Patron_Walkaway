@@ -38,11 +38,14 @@ def normalize_bets_sessions(
     - Categorical columns (if present): astype("category") — NaN is preserved in category.
     - Key numeric columns (if present): pd.to_numeric(..., errors="coerce") — no fillna here.
 
+    Uses structural (shallow) copies so we do not eagerly duplicate all column buffers
+    before per-column coercion (OOM mitigation on 100M-row loads).
+
     Callers (trainer, scorer, backtester, ETL) must run this on loaded data before
     apply_dq or any business logic. See PLAN.md § Post-Load Normalizer.
     """
-    bets_out = bets.copy()
-    sessions_out = sessions.copy()
+    bets_out = bets.copy(deep=False)
+    sessions_out = sessions.copy(deep=False)
 
     for col in BET_CATEGORICAL_COLUMNS:
         if col in bets_out.columns:
