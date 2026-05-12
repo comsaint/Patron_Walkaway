@@ -5,9 +5,11 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from trainer_hightier.config import DuckDbRuntimeConfig
+
+T = TypeVar("T")
 
 
 def _path_posix(path: Path) -> str:
@@ -15,13 +17,17 @@ def _path_posix(path: Path) -> str:
 
 
 def apply_duckdb_runtime_pragmas(con: Any, cfg: DuckDbRuntimeConfig) -> None:
-    """Set ``memory_limit``, optional ``temp_directory`` and ``threads`` on a DuckDB connection."""
-    con.execute(f"PRAGMA memory_limit='{cfg.memory_limit}'")
+    """Apply ``DuckDbRuntimeConfig`` PRAGMAs / session variables on *con*."""
     if cfg.temp_directory is not None:
         td = _path_posix(Path(cfg.temp_directory))
         con.execute(f"PRAGMA temp_directory='{td}'")
+    if cfg.max_temp_directory_size is not None:
+        con.execute(f"PRAGMA max_temp_directory_size='{cfg.max_temp_directory_size}'")
+    con.execute(f"PRAGMA memory_limit='{cfg.memory_limit}'")
     if cfg.threads is not None:
         con.execute(f"PRAGMA threads={int(cfg.threads)}")
+    pio = "true" if cfg.preserve_insertion_order else "false"
+    con.execute(f"SET preserve_insertion_order={pio}")
 
 
 def _poll_duckdb_progress_bar(con: Any, stop: threading.Event, desc: str, t0: float) -> None:
@@ -57,8 +63,14 @@ def _poll_duckdb_progress_bar(con: Any, stop: threading.Event, desc: str, t0: fl
                 pbar.refresh()
 
 
-def execute_sql_with_progress(con: Any, sql: str, *, desc: str) -> None:
-    """Execute *sql*; tqdm reflects ``query_progress()`` while the query runs (same connection)."""
+def run_with_query_progress(
+    con: Any,
+    fn: Callable[[], T],
+    *,
+    desc: str,
+    join_timeout_s: float = 120.0,
+) -> T:
+    """Run *fn* while a tqdm bar polls ``con.query_progress()`` on a background thread."""
     try:
         con.execute("PRAGMA enable_progress_bar_print=false")
     except Exception:
@@ -72,7 +84,37 @@ def execute_sql_with_progress(con: Any, sql: str, *, desc: str) -> None:
     )
     th.start()
     try:
-        con.execute(sql)
+        return fn()
     finally:
         stop.set()
-        th.join(timeout=120.0)
+        th.join(timeout=float(join_timeout_s))
+
+
+def execute_sql_with_progress(
+    con: Any,
+    sql: str,
+    *,
+    desc: str,
+    join_timeout_s: float = 120.0,
+) -> None:
+    """Execute *sql*; tqdm reflects ``query_progress()`` while the query runs (same connection)."""
+
+    def _run() -> None:
+        con.execute(sql)
+
+    run_with_query_progress(con, _run, desc=desc, join_timeout_s=join_timeout_s)
+
+
+def execute_query_df_with_progress(
+    con: Any,
+    sql: str,
+    *,
+    desc: str,
+    join_timeout_s: float = 600.0,
+) -> Any:
+    """Execute *sql* and return ``pandas`` DataFrame with the same progress UX."""
+
+    def _run() -> Any:
+        return con.execute(sql).df()
+
+    return run_with_query_progress(con, _run, desc=desc, join_timeout_s=join_timeout_s)

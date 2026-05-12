@@ -11,11 +11,22 @@ import argparse
 import importlib
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import pyarrow.parquet as pq
 
-from trainer_hightier.config import DuckDbRuntimeConfig, HighTierObjectiveConfig, SessionPreprocessConfig
+from trainer_hightier.config import (
+    CanonicalMappingConfig,
+    DuckDbRuntimeConfig,
+    HighTierObjectiveConfig,
+    SessionPreprocessConfig,
+)
+from trainer_hightier.utils.canonical_mapping import (
+    build_canonical_mapping_from_cleaned_session_parquet,
+    default_canonical_mapping_parquet_path,
+)
+from trainer_hightier.utils.patron_session_metrics import compile_canonical_patron_session_metrics
 
 # Module names cannot start with a digit in ``import …`` syntax; load by full name.
 _ingest = importlib.import_module("trainer_hightier.01_data_ingest")
@@ -38,6 +49,7 @@ class HighTierTrainArgs:
     # DuckDB PRAGMA defaults for all high-tier DuckDB connections (not ``trainer.core``).
     duckdb_runtime: DuckDbRuntimeConfig = field(default_factory=DuckDbRuntimeConfig)
     session_preprocess: SessionPreprocessConfig = field(default_factory=SessionPreprocessConfig)
+    canonical_mapping: CanonicalMappingConfig = field(default_factory=CanonicalMappingConfig)
 
 
 def prepare_training_frame(args: HighTierTrainArgs) -> None:
@@ -55,30 +67,46 @@ def prepare_training_frame(args: HighTierTrainArgs) -> None:
             "[Step 2] session clean cache hit; skip preprocess (use --no-cache to force): %s",
             cleaned_path.resolve(),
         )
-        return
-    out_parquet = _hpre.preprocess_sessions_from_parquet_streaming(
-        pq_paths.session_parquet,
-        cleaned_path,
-        cfg=args.session_preprocess,
-        duckdb_runtime=args.duckdb_runtime,
-    )
-    _hpre.write_session_clean_cache_manifest(pq_paths.session_parquet, out_parquet)
-    n_clean = int(pq.ParquetFile(out_parquet).metadata.num_rows) if pq.ParquetFile(out_parquet).metadata else 0
-    logger.info(
-        "[Step 2] session preprocess OK (full table, no time window): cleaned rows=%d; written %s",
-        n_clean,
-        out_parquet,
-    )
+    else:
+        out_parquet = _hpre.preprocess_sessions_from_parquet_streaming(
+            pq_paths.session_parquet,
+            cleaned_path,
+            cfg=args.session_preprocess,
+            duckdb_runtime=args.duckdb_runtime,
+        )
+        _hpre.write_session_clean_cache_manifest(pq_paths.session_parquet, out_parquet)
+        n_clean = int(pq.ParquetFile(out_parquet).metadata.num_rows) if pq.ParquetFile(out_parquet).metadata else 0
+        logger.info(
+            "[Step 2] session preprocess OK (full table, no time window): cleaned rows=%d; written %s",
+            n_clean,
+            out_parquet,
+        )
+
+    if not cleaned_path.is_file():
+        raise FileNotFoundError(f"Cleaned session Parquet missing after preprocess: {cleaned_path}")
+
+    if args.canonical_mapping.enabled:
+        build_canonical_mapping_from_cleaned_session_parquet(
+            cleaned_path,
+            cfg=args.canonical_mapping,
+            duckdb_runtime=args.duckdb_runtime,
+        )
+        if args.canonical_mapping.compile_patron_session_metrics:
+            compile_canonical_patron_session_metrics(
+                cleaned_path,
+                default_canonical_mapping_parquet_path(),
+                duckdb_runtime=args.duckdb_runtime,
+            )
 
 
 def fit_model(args: HighTierTrainArgs) -> None:
     """Train a scorer on the high-tier slice (TODO)."""
-    logger.info("[Step 3] fit_model: not implemented (seed=%s)", args.random_seed)
+    logger.info("[Step 5] fit_model: not implemented (seed=%s)", args.random_seed)
 
 
 def write_artifacts(args: HighTierTrainArgs) -> None:
     """Persist model bundle + minimal metrics sidecars (TODO)."""
-    logger.info("[Step 4] write_artifacts: not implemented")
+    logger.info("[Step 6] write_artifacts: not implemented")
 
 
 def run_training(args: HighTierTrainArgs) -> None:
@@ -87,7 +115,7 @@ def run_training(args: HighTierTrainArgs) -> None:
     prepare_training_frame(args)
     fit_model(args)
     write_artifacts(args)
-    logger.info("[Step 5] run_training: skeleton finished")
+    logger.info("[Step 7] run_training: skeleton finished")
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -110,6 +138,30 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ignore session-clean cache and always recompute cleaned t_session (heavy on large L0).",
     )
+    p.add_argument(
+        "--canonical-cutoff",
+        type=str,
+        default=None,
+        help=(
+            "ISO-8601 cutoff for canonical mapping (training-window end). "
+            "Default: infer MAX(session_end_dtm) then MAX(lud_dtm) from cleaned Parquet."
+        ),
+    )
+    p.add_argument(
+        "--no-canonical-mapping",
+        action="store_true",
+        help="Skip player_id -> canonical_id artifact build.",
+    )
+    p.add_argument(
+        "--no-patron-session-metrics",
+        action="store_true",
+        help="Skip canonical_patron_session_metrics.parquet (ADT report) after canonical mapping.",
+    )
+    p.add_argument(
+        "--canonical-legacy-coalesce-cutoff",
+        action="store_true",
+        help="Use COALESCE(session_end_dtm, lud_dtm) <= cutoff (legacy parity); default is session_end_dtm only.",
+    )
     return p
 
 
@@ -123,11 +175,21 @@ def main() -> None:
     parser = _build_argparser()
     ns = parser.parse_args()
     data_dir = _ingest.default_data_dir() if ns.data_dir is None else Path(ns.data_dir)
+    cutoff_parsed: datetime | None = None
+    if ns.canonical_cutoff:
+        cutoff_parsed = datetime.fromisoformat(ns.canonical_cutoff.replace("Z", "+00:00"))
+    canonical_mapping = CanonicalMappingConfig(
+        enabled=not bool(ns.no_canonical_mapping),
+        cutoff_dtm=cutoff_parsed,
+        legacy_coalesce_cutoff=bool(ns.canonical_legacy_coalesce_cutoff),
+        compile_patron_session_metrics=not bool(ns.no_patron_session_metrics),
+    )
     args = HighTierTrainArgs(
         output_dir=ns.output_dir,
         data_dir=data_dir,
         random_seed=int(ns.random_seed),
         no_cache=bool(ns.no_cache),
+        canonical_mapping=canonical_mapping,
     )
     run_training(args)
 

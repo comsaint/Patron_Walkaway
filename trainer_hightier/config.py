@@ -12,6 +12,7 @@ Other packages may still *call* shared helpers; only **config** stays local here
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 
@@ -27,6 +28,12 @@ class DuckDbRuntimeConfig:
     memory_limit: str = "6GB"
     temp_directory: Path | None = None
     threads: int | None = None
+    # Cap DuckDB spill files under ``temp_directory`` (or OS default temp drive).
+    # Example: ``'200GiB'`` when the default inferred cap is too low for large windows.
+    max_temp_directory_size: str | None = None
+    # ``false`` reduces temp spill for heavy sorts/windows (DuckDB perf guide); rare
+    # FND-01 ties on all ORDER BY keys may pick a different survivor vs insertion order.
+    preserve_insertion_order: bool = False
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,22 @@ class SessionPreprocessConfig:
     engine: str = "duckdb"
     # Only for ``pandas_shards``: concatenate this many row groups per shard file.
     row_groups_per_shard: int = 8
+
+
+@dataclass(frozen=True)
+class CanonicalMappingConfig:
+    """``player_id`` → ``canonical_id`` built from cleaned session Parquet (trainer D2).
+
+    When ``cutoff_dtm`` is None, cutoff is inferred as
+    ``MAX(session_end_dtm)`` then ``MAX(lud_dtm)`` over the cleaned file (HK-naive
+    normalisation after inference).
+    """
+
+    enabled: bool = True
+    cutoff_dtm: datetime | None = None
+    legacy_coalesce_cutoff: bool = False
+    # After mapping Parquet is written: aggregate ``theo_win`` / ``gaming_day`` → ADT report.
+    compile_patron_session_metrics: bool = True
 
 
 @dataclass(frozen=True)
