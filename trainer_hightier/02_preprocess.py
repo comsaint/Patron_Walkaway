@@ -1,4 +1,4 @@
-"""Offline preprocessing: t_session (DuckDB-first + optional pandas shards) and t_bet (TBD).
+"""Offline preprocessing: ``t_session`` and ``t_bet`` cleaned Parquets (DuckDB-first).
 
 Step 2 in the high-tier pipeline. ``t_session`` ingests the full L0 Parquet (no
 training-window filter) without loading the whole table into pandas **by default**:
@@ -12,6 +12,14 @@ training-window filter) without loading the whole table into pandas **by default
 
 FND-02 (``is_manual``) is still **not** applied (manual rows kept). Downstream
 must enforce PIT separately.
+
+``t_bet`` (implemented): trainer-style DQ (rated rows, wager, keys), then
+``schema/preprocess_l0_data_contract_registry.yaml`` **BET-INGEST-FIX-004**
+residual ingest cap as ``__etl_insert_Dtm_synthetic`` plus ``ingestion_episode_id``
+tags for documented bulk-ingest calendar days (see ``tables.t_bet.bulk_*`` ),
+``ROW_NUMBER`` dedupe by ``bet_id`` (newest synthetic observed-at wins).
+
+Only ``BetPreprocessConfig.engine == "duckdb"`` is supported for bets.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ import hashlib
 import importlib
 import json
 import logging
+import re
 import tempfile
 from contextlib import nullcontext
 from datetime import datetime
@@ -31,8 +40,9 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import yaml
 from trainer.core.schema_io import normalize_bets_sessions
-from trainer_hightier.config import DuckDbRuntimeConfig, SessionPreprocessConfig
+from trainer_hightier.config import BetPreprocessConfig, DuckDbRuntimeConfig, SessionPreprocessConfig
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas, execute_sql_with_progress
 
 _01_ingest = importlib.import_module("trainer_hightier.01_data_ingest")
@@ -242,20 +252,335 @@ _SESSION_INGEST_DELAY_CAP_SEC = 636
 # Bump when cache record schema or semantics change (invalidates old sidecars).
 _SESSION_CLEAN_CACHE_MANIFEST_VERSION = 1
 
-__all__ = [
-    "load_sessions_via_duckdb_local_parquet_contract",
-    "preprocess_sessions_from_parquet",
-    "preprocess_sessions_from_parquet_streaming",
-    "apply_session_l0_registry_cleanup",
-    "apply_session_dq_keep_manual",
-    "build_session_clean_cache_record",
-    "default_cleaned_session_parquet_path",
-    "session_clean_cache_manifest_path",
-    "session_clean_cache_is_hit",
-    "write_session_clean_cache_manifest",
-    "write_cleaned_session_parquet",
-    "load_bets_sessions_from_parquet_skeleton",
-]
+_BET_CLEAN_CACHE_MANIFEST_VERSION = 1
+
+
+def default_preprocess_registry_yaml_path() -> Path:
+    """Repo ``schema/preprocess_l0_data_contract_registry.yaml``."""
+    return Path(__file__).resolve().parents[1] / "schema" / "preprocess_l0_data_contract_registry.yaml"
+
+
+def _placeholder_player_id_i64() -> int:
+    """Trainer sentinel ``player_id`` (default -1); used in bet DQ."""
+    try:
+        from trainer.core._config_training_domain import PLACEHOLDER_PLAYER_ID as ph
+
+        return int(ph)
+    except Exception:
+        return -1
+
+
+def _resolve_preprocess_registry(registry_yaml: Path | None) -> Path:
+    """Resolve ingest registry YAML path; default canonical repo schema file."""
+    path = registry_yaml if registry_yaml is not None else default_preprocess_registry_yaml_path()
+    p = Path(path).resolve()
+    if not p.is_file():
+        raise FileNotFoundError(f"Ingest registry YAML not found: {p}")
+    return p
+
+
+def _bet_cap_applied_rules(registry_yaml: Path) -> tuple[int, list[str]]:
+    """Load ``tables.t_bet`` and return ``BET-INGEST-FIX-004`` cap seconds plus manifest tags."""
+    try:
+        from pipelines.layered_data_assets.core.preprocess_bet_ingestion_fix_registry_v1 import (
+            load_preprocess_bet_ingestion_fix_registry,
+            resolve_bet_ingest_fix004_cap_binding,
+        )
+    except ModuleNotFoundError as exc:
+        raise ImportError(
+            "Bet preprocess requires ``pipelines.layered_data_assets.core.preprocess_bet_ingestion_fix_registry_v1``."
+        ) from exc
+    doc = load_preprocess_bet_ingestion_fix_registry(registry_yaml)
+    cap, _fid, _fver, applied = resolve_bet_ingest_fix004_cap_binding(doc)
+    return int(cap), list(applied)
+
+
+def bulk_bet_episode_calendar_tags(registry_yaml: Path) -> tuple[tuple[str, str], ...]:
+    """``(calendar day, episode_id)`` pairs from ``tables.t_bet`` bulk episodes."""
+    raw = yaml.safe_load(Path(registry_yaml).read_text(encoding="utf-8"))
+    tables = raw.get("tables") if isinstance(raw, dict) else None
+    if not isinstance(tables, dict):
+        raise ValueError("registry root must contain tables:")
+    tbet = tables.get("t_bet")
+    if not isinstance(tbet, dict):
+        raise ValueError("registry tables.t_bet missing")
+    bulk = tbet.get("bulk_historical_ingest_episodes")
+    if not isinstance(bulk, dict):
+        return ()
+    eps = bulk.get("episodes")
+    if not isinstance(eps, list):
+        return ()
+    out: list[tuple[str, str]] = []
+    for ep in eps:
+        if not isinstance(ep, dict):
+            continue
+        eid = ep.get("episode_id")
+        sql_frag = ep.get("match_rule_sql") or ""
+        if not isinstance(eid, str) or not isinstance(sql_frag, str):
+            continue
+        m = re.search(r"DATE\s+'(\d{4}-\d{2}-\d{2})'", sql_frag.replace("\n", " "))
+        if not m:
+            continue
+        out.append((m.group(1), eid.strip()))
+    return tuple(out)
+
+
+def _bet_episode_scalar_sql(tags: tuple[tuple[str, str], ...], *, obs_alias: str) -> str:
+    """DuckDB ``CASE`` expression mapping synthetic observed calendar day → episode id."""
+    if not tags:
+        return "CAST(NULL AS VARCHAR)"
+    parts: list[str] = []
+    for day, eid in tags:
+        esc = str(eid).replace("'", "''")
+        parts.append(
+            f"WHEN CAST(date_trunc('day', {obs_alias}.\"__etl_insert_Dtm_synthetic\") AS DATE) "
+            f"= DATE '{day}' THEN '{esc}'"
+        )
+    return "CASE " + " ".join(parts) + " ELSE CAST(NULL AS VARCHAR) END"
+
+
+def _bet_optional_flag_sql(names: frozenset[str]) -> list[str]:
+    """DQ fragments matching ``preprocess_bet_v1`` for optional cancelled/deleted/manual flags."""
+    parts: list[str] = []
+    if "is_deleted" in names:
+        parts.append(
+            '(TRY_CAST("is_deleted" AS INTEGER) IS NULL OR TRY_CAST("is_deleted" AS INTEGER) = 0)'
+        )
+    if "is_canceled" in names:
+        parts.append(
+            '(TRY_CAST("is_canceled" AS INTEGER) IS NULL OR TRY_CAST("is_canceled" AS INTEGER) = 0)'
+        )
+    if "is_manual" in names:
+        parts.append(
+            '(TRY_CAST("is_manual" AS INTEGER) IS NULL OR TRY_CAST("is_manual" AS INTEGER) = 0)'
+        )
+    return parts
+
+
+def _bet_dq_where_sql(names: frozenset[str]) -> str:
+    """Combined ``WHERE`` for rated bet rows (trainer ingress / preprocess_bet parity)."""
+    ph = _placeholder_player_id_i64()
+    frag = [
+        'TRY_CAST("bet_id" AS DOUBLE) IS NOT NULL',
+        f'TRY_CAST("player_id" AS BIGINT) IS NOT NULL '
+        f'AND TRY_CAST("player_id" AS BIGINT) <> {ph}',
+        'TRY_CAST("session_id" AS DOUBLE) IS NOT NULL',
+        'TRY_CAST("payout_complete_dtm" AS TIMESTAMP) IS NOT NULL',
+        'TRY_CAST("gaming_day" AS DATE) IS NOT NULL',
+        'COALESCE(TRY_CAST("wager" AS DOUBLE), 0.0) > 0',
+    ]
+    frag.extend(_bet_optional_flag_sql(names))
+    return " AND ".join(frag)
+
+
+def _duckdb_bet_clean_pipeline_select_sql(
+    *,
+    src_posix: str,
+    names: frozenset[str],
+    cap_sec: int,
+    tags: tuple[tuple[str, str], ...],
+) -> str:
+    """DuckSQL: DQ → capped ``__etl_insert_Dtm_synthetic`` → episode tag → ``bet_id`` dedup."""
+    l0_where = _bet_dq_where_sql(names)
+    cap = int(cap_sec)
+    lf_sel = "*"
+    if "__etl_insert_Dtm_synthetic" in names:
+        lf_sel = '* EXCLUDE ("__etl_insert_Dtm_synthetic")'
+    syn = f"""CASE
+    WHEN TRY_CAST(lf."__etl_insert_Dtm" AS TIMESTAMP) IS NULL
+      OR TRY_CAST(lf."payout_complete_dtm" AS TIMESTAMP) IS NULL
+    THEN NULL
+    ELSE LEAST(
+      TRY_CAST(lf."__etl_insert_Dtm" AS TIMESTAMP),
+      TRY_CAST(lf."payout_complete_dtm" AS TIMESTAMP) + INTERVAL {cap} SECOND
+    )
+  END"""
+    eps = _bet_episode_scalar_sql(tags, obs_alias="obs")
+    return f"""
+WITH lf AS (
+  SELECT {lf_sel} FROM read_parquet('{src_posix}')
+  WHERE {l0_where}
+),
+obs AS (
+  SELECT
+    lf.*,
+    {syn} AS "__etl_insert_Dtm_synthetic"
+  FROM lf AS lf
+),
+tagged AS (
+  SELECT
+    obs.*,
+    {eps} AS "ingestion_episode_id"
+  FROM obs AS obs
+),
+ranked AS (
+  SELECT
+    tagged.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY TRY_CAST(tagged."bet_id" AS DOUBLE)
+      ORDER BY
+        tagged."__etl_insert_Dtm_synthetic" DESC NULLS LAST,
+        TRY_CAST(tagged."payout_complete_dtm" AS TIMESTAMP) DESC NULLS LAST,
+        TRY_CAST(tagged."bet_id" AS DOUBLE) DESC NULLS LAST
+    ) AS _rn
+  FROM tagged
+),
+fin AS ( SELECT * EXCLUDE (_rn) FROM ranked WHERE _rn = 1 )
+SELECT *
+FROM fin
+ORDER BY
+  TRY_CAST("payout_complete_dtm" AS TIMESTAMP) ASC NULLS LAST,
+  TRY_CAST("bet_id" AS DOUBLE) ASC NULLS LAST
+""".strip()
+
+
+def _preprocess_bets_duckdb_single_copy(
+    bet_parquet: Path,
+    output_path: Path,
+    *,
+    registry_yaml: Path,
+    duckdb_cfg: DuckDbRuntimeConfig,
+) -> tuple[int, tuple[tuple[str, str], ...]]:
+    """Run single DuckDB ``COPY`` pipeline; returns ``cap_sec`` and episode tag tuples."""
+    src = Path(bet_parquet).resolve()
+    out = Path(output_path).resolve()
+    names = frozenset(pq.read_schema(src).names)
+    req = frozenset({"bet_id", "session_id", "player_id", "payout_complete_dtm", "gaming_day", "__etl_insert_Dtm", "wager"})
+    missing = sorted(req - names)
+    if missing:
+        raise ValueError(f"gmwds_t_bet Parquet missing columns required for preprocess: {missing}")
+    cap_sec, _applied = _bet_cap_applied_rules(registry_yaml)
+    tags = bulk_bet_episode_calendar_tags(registry_yaml)
+    src_esc = _path_posix(src).replace("'", "''")
+    inner = _duckdb_bet_clean_pipeline_select_sql(
+        src_posix=src_esc, names=names, cap_sec=cap_sec, tags=tags
+    )
+    out_esc = _path_posix(out).replace("'", "''")
+    sql = f"COPY ({inner}) TO '{out_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_cfg)
+        execute_sql_with_progress(con, sql, desc="[Step 2b] DuckDB bet COPY")
+    finally:
+        con.close()
+    return cap_sec, tags
+
+
+def preprocess_bets_from_parquet_streaming(
+    bet_parquet: Path,
+    output_path: Path,
+    *,
+    cfg: BetPreprocessConfig | None = None,
+    duckdb_runtime: DuckDbRuntimeConfig | None = None,
+) -> Path:
+    """Clean full L0 ``gmwds_t_bet`` Parquet (DQ + synthetic observed cap + episode tags + dedupe)."""
+    src = Path(bet_parquet).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(src)
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.is_file():
+        out.unlink()
+    _cfg = cfg if cfg is not None else BetPreprocessConfig()
+    if _cfg.engine != "duckdb":
+        raise ValueError(
+            f"t_bet preprocess engine {_cfg.engine!r} unsupported; use BetPreprocessConfig(engine='duckdb')."
+        )
+    reg = _resolve_preprocess_registry(_cfg.preprocess_registry_yaml)
+    _ddb = duckdb_runtime if duckdb_runtime is not None else DuckDbRuntimeConfig()
+    logger.info("[Step 2b] bet preprocess: DuckDB single-pass COPY registry=%s -> %s", reg, out)
+    cap_sec, tags = _preprocess_bets_duckdb_single_copy(src, out, registry_yaml=reg, duckdb_cfg=_ddb)
+    nrows = int(pq.ParquetFile(out).metadata.num_rows) if pq.ParquetFile(out).metadata else 0
+    logger.info(
+        "[Step 2b] bet preprocess done: rows=%d cap_sec=%s bulk_episode_days=%s written %s",
+        nrows,
+        cap_sec,
+        len(tags),
+        out,
+    )
+    return out
+
+
+def _registry_stat_dict(path: Path) -> dict[str, Any]:
+    """Small stat block for JSON cache fingerprints."""
+    p = Path(path).resolve()
+    st = p.stat()
+    return {"path": str(p), "mtime_ns": int(st.st_mtime_ns), "size_bytes": int(st.st_size)}
+
+
+def build_bet_clean_cache_record(
+    source_bet_parquet: Path,
+    *,
+    preprocess_registry_yaml: Path,
+) -> dict[str, Any]:
+    """Fingerprint for cleaned bet parquet cache (includes registry binding)."""
+    src = Path(source_bet_parquet).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(src)
+    st = src.stat()
+    meta = pq.ParquetFile(src).metadata
+    nrows = int(meta.num_rows) if meta is not None else -1
+    cap_sec, applied = _bet_cap_applied_rules(Path(preprocess_registry_yaml).resolve())
+    return {
+        "manifest_version": _BET_CLEAN_CACHE_MANIFEST_VERSION,
+        "preprocess_py_sha256": _preprocess_py_sha256(),
+        "bet_ingest_cap_sec": cap_sec,
+        "applied_registry_fix_rules": applied,
+        "preprocess_registry": _registry_stat_dict(preprocess_registry_yaml),
+        "source_bet": {
+            "path": str(src),
+            "mtime_ns": int(st.st_mtime_ns),
+            "size_bytes": int(st.st_size),
+            "num_rows": nrows,
+        },
+    }
+
+
+def default_cleaned_bet_parquet_path() -> Path:
+    """``trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet.parquet``."""
+    return Path(__file__).resolve().parent / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet.parquet"
+
+
+def bet_clean_cache_manifest_path(cleaned_parquet: Path) -> Path:
+    """Sidecar JSON next to cleaned bet parquet (``*.cache.json``)."""
+    return Path(cleaned_parquet).parent / f"{Path(cleaned_parquet).stem}.cache.json"
+
+
+def bet_clean_cache_is_hit(
+    source_bet_parquet: Path,
+    cleaned_parquet: Path,
+    *,
+    preprocess_registry_yaml: Path | None = None,
+) -> bool:
+    cleaned = Path(cleaned_parquet)
+    reg = _resolve_preprocess_registry(preprocess_registry_yaml)
+    man = bet_clean_cache_manifest_path(cleaned)
+    if not cleaned.is_file() or not man.is_file():
+        return False
+    try:
+        prev = json.loads(man.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    try:
+        cur = build_bet_clean_cache_record(source_bet_parquet, preprocess_registry_yaml=reg)
+    except (FileNotFoundError, OSError, ImportError, ValueError):
+        return False
+    return prev == cur
+
+
+def write_bet_clean_cache_manifest(
+    source_bet_parquet: Path,
+    cleaned_parquet: Path,
+    *,
+    preprocess_registry_yaml: Path | None = None,
+) -> Path:
+    reg = _resolve_preprocess_registry(preprocess_registry_yaml)
+    rec = build_bet_clean_cache_record(source_bet_parquet, preprocess_registry_yaml=reg)
+    mp = bet_clean_cache_manifest_path(Path(cleaned_parquet))
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    mp.write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
+    logger.info("[Step 2b] wrote bet clean cache manifest: %s", mp.resolve())
+    return mp
 
 
 def _filter_session_l0_deleted_canceled(chunk: pd.DataFrame) -> pd.DataFrame:
@@ -652,8 +977,36 @@ def load_bets_sessions_from_parquet_skeleton(
     window_start: datetime,
     extended_end: datetime,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """TODO: Predicate pushdown for ``gmwds_t_bet`` (see ``trainer.load_local_parquet``)."""
+    """TODO: Predicate pushdown for cleaned ``gmwds_t_bet`` (see ``trainer.load_local_parquet``).
+
+    Use :func:`preprocess_bets_from_parquet_streaming` with
+    :func:`default_cleaned_bet_parquet_path` for offline full-table cleans.
+    """
     raise NotImplementedError(
-        "load_bets_sessions_from_parquet_skeleton: pending t_bet path; "
-        "use preprocess_sessions_from_parquet(session_path alone) meanwhile."
+        "load_bets_sessions_from_parquet_skeleton: pending windowed t_bet load; "
+        "use preprocess_bets_from_parquet_streaming for full cleaned bet Parquet."
     )
+
+
+__all__ = [
+    "apply_session_dq_keep_manual",
+    "apply_session_l0_registry_cleanup",
+    "bet_clean_cache_is_hit",
+    "bet_clean_cache_manifest_path",
+    "build_bet_clean_cache_record",
+    "build_session_clean_cache_record",
+    "bulk_bet_episode_calendar_tags",
+    "default_cleaned_bet_parquet_path",
+    "default_cleaned_session_parquet_path",
+    "default_preprocess_registry_yaml_path",
+    "preprocess_sessions_from_parquet_streaming",
+    "preprocess_sessions_from_parquet",
+    "preprocess_bets_from_parquet_streaming",
+    "load_sessions_via_duckdb_local_parquet_contract",
+    "session_clean_cache_is_hit",
+    "session_clean_cache_manifest_path",
+    "write_session_clean_cache_manifest",
+    "write_bet_clean_cache_manifest",
+    "write_cleaned_session_parquet",
+    "load_bets_sessions_from_parquet_skeleton",
+]

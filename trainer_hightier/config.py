@@ -53,6 +53,18 @@ class SessionPreprocessConfig:
 
 
 @dataclass(frozen=True)
+class BetPreprocessConfig:
+    """L0 ``t_bet`` → cleaned Parquet (DQ + registry synthetic observed-at + bulk episode tags).
+
+    Only ``engine=\"duckdb\"`` is implemented (full-table single ``COPY``, like session default).
+    ``preprocess_registry_yaml`` defaults to ``<repo>/schema/preprocess_l0_data_contract_registry.yaml`` when omitted.
+    """
+
+    engine: str = "duckdb"
+    preprocess_registry_yaml: Path | None = None
+
+
+@dataclass(frozen=True)
 class CanonicalMappingConfig:
     """``player_id`` → ``canonical_id`` built from cleaned session Parquet (trainer D2).
 

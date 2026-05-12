@@ -17,6 +17,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 from trainer_hightier.config import (
+    BetPreprocessConfig,
     CanonicalMappingConfig,
     DuckDbRuntimeConfig,
     HighTierObjectiveConfig,
@@ -49,6 +50,8 @@ class HighTierTrainArgs:
     # DuckDB PRAGMA defaults for all high-tier DuckDB connections (not ``trainer.core``).
     duckdb_runtime: DuckDbRuntimeConfig = field(default_factory=DuckDbRuntimeConfig)
     session_preprocess: SessionPreprocessConfig = field(default_factory=SessionPreprocessConfig)
+    bet_preprocess: BetPreprocessConfig = field(default_factory=BetPreprocessConfig)
+    skip_bet_preprocess: bool = False
     canonical_mapping: CanonicalMappingConfig = field(default_factory=CanonicalMappingConfig)
 
 
@@ -84,6 +87,53 @@ def prepare_training_frame(args: HighTierTrainArgs) -> None:
 
     if not cleaned_path.is_file():
         raise FileNotFoundError(f"Cleaned session Parquet missing after preprocess: {cleaned_path}")
+
+    cleaned_bet_path = _hpre.default_cleaned_bet_parquet_path()
+    if not args.skip_bet_preprocess and pq_paths.bet_parquet.is_file():
+        _ingest.validate_bet_ingress_or_raise(pq_paths)
+        reg_yaml = (
+            Path(args.bet_preprocess.preprocess_registry_yaml)
+            if args.bet_preprocess.preprocess_registry_yaml is not None
+            else _hpre.default_preprocess_registry_yaml_path()
+        )
+        bet_cache_ok = (
+            use_cache
+            and _hpre.bet_clean_cache_is_hit(
+                pq_paths.bet_parquet,
+                cleaned_bet_path,
+                preprocess_registry_yaml=reg_yaml,
+            )
+        )
+        if bet_cache_ok:
+            logger.info(
+                "[Step 2b] bet clean cache hit; skip (use --no-cache to force): %s",
+                cleaned_bet_path.resolve(),
+            )
+        else:
+            out_b = _hpre.preprocess_bets_from_parquet_streaming(
+                pq_paths.bet_parquet,
+                cleaned_bet_path,
+                cfg=args.bet_preprocess,
+                duckdb_runtime=args.duckdb_runtime,
+            )
+            _hpre.write_bet_clean_cache_manifest(
+                pq_paths.bet_parquet,
+                out_b,
+                preprocess_registry_yaml=reg_yaml,
+            )
+            n_b = int(pq.ParquetFile(out_b).metadata.num_rows) if pq.ParquetFile(out_b).metadata else 0
+            logger.info(
+                "[Step 2b] bet preprocess OK: cleaned rows=%d; written %s",
+                n_b,
+                out_b,
+            )
+    elif pq_paths.bet_parquet.is_file() and args.skip_bet_preprocess:
+        logger.info("[Step 2b] bet preprocess skipped (--no-bet-preprocess); %s", pq_paths.bet_parquet)
+    else:
+        logger.info(
+            "[Step 2b] no %s; skip bet preprocess",
+            pq_paths.bet_parquet.name,
+        )
 
     if args.canonical_mapping.enabled:
         build_canonical_mapping_from_cleaned_session_parquet(
@@ -158,6 +208,11 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Skip canonical_patron_session_metrics.parquet (ADT report) after canonical mapping.",
     )
     p.add_argument(
+        "--no-bet-preprocess",
+        action="store_true",
+        help="Skip t_bet cleaning even when gmwds_t_bet.parquet exists under --data-dir.",
+    )
+    p.add_argument(
         "--canonical-legacy-coalesce-cutoff",
         action="store_true",
         help="Use COALESCE(session_end_dtm, lud_dtm) <= cutoff (legacy parity); default is session_end_dtm only.",
@@ -189,6 +244,7 @@ def main() -> None:
         data_dir=data_dir,
         random_seed=int(ns.random_seed),
         no_cache=bool(ns.no_cache),
+        skip_bet_preprocess=bool(ns.no_bet_preprocess),
         canonical_mapping=canonical_mapping,
     )
     run_training(args)

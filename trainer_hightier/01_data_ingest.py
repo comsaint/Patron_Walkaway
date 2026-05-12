@@ -127,6 +127,7 @@ _REQUIRED_BET_PARQUET_COLS: tuple[str, ...] = (
     "table_id",
     "payout_complete_dtm",
     "gaming_day",
+    "__etl_insert_Dtm",
     "wager",
     "status",
     "casino_win",
@@ -270,6 +271,20 @@ def validate_session_ingress_or_raise(paths: LocalParquetPaths) -> SessionIngres
             + ", ".join(report.missing_required_session_cols)
         )
     return report
+
+
+def validate_bet_ingress_or_raise(paths: LocalParquetPaths) -> ParquetInspectSummary:
+    """``gmwds_t_bet`` exists with required columns (schema + footer only)."""
+    if not paths.bet_parquet.is_file():
+        raise FileNotFoundError(f"Bet preprocess requires {paths.bet_parquet}")
+    bet_sum = parquet_inspect_summary(paths.bet_parquet)
+    mb = tuple(c for c in _REQUIRED_BET_PARQUET_COLS if c not in bet_sum.column_names)
+    if mb:
+        raise ValueError(
+            "Offline bet schema QC failed: gmwds_t_bet missing columns: "
+            + ", ".join(mb)
+        )
+    return bet_sum
 
 
 def run_offline_schema_quality_checks(paths: LocalParquetPaths) -> OfflineDataQualityReport:
