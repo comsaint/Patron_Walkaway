@@ -66,6 +66,7 @@ def read_parquet_row_groups_to_pandas(
     *,
     desc: str,
     chunk_filter: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
+    columns: list[str] | None = None,
 ) -> pd.DataFrame:
     """Decode Parquet into one pandas frame, showing a tqdm bar over row groups.
 
@@ -76,6 +77,7 @@ def read_parquet_row_groups_to_pandas(
         path: Parquet file path.
         desc: Progress label (e.g. ``\"[Step 2] t_session\"``).
         chunk_filter: Optional per-chunk transform (e.g. deleted/canceled gate) before concat.
+        columns: Optional column projection (Parquet / PyArrow read pushdown); must exist on file.
     """
     p = Path(path)
     if not p.is_file():
@@ -83,12 +85,12 @@ def read_parquet_row_groups_to_pandas(
     pf = pq.ParquetFile(p)
     nrg = int(pf.num_row_groups)
     if nrg <= 0:
-        df = pd.read_parquet(p)
+        df = pd.read_parquet(p, columns=columns)
         return chunk_filter(df) if chunk_filter is not None else df
 
     parts: list[pd.DataFrame] = []
     for i in _tqdm_range(range(nrg), desc=desc, unit="row_group"):
-        chunk = pf.read_row_group(i, use_threads=True).to_pandas()
+        chunk = pf.read_row_group(i, columns=columns, use_threads=True).to_pandas()
         if chunk_filter is not None:
             chunk = chunk_filter(chunk)
         if len(chunk) > 0:
@@ -119,23 +121,9 @@ def preflight_scan_parquet_row_groups(path: Path, *, desc: str) -> None:
 
 
 # Mirrors ``trainer.training.data_sources``: column pushdown / contract lists.
-_REQUIRED_BET_PARQUET_COLS: tuple[str, ...] = (
-    "bet_id",
-    "session_id",
-    "player_id",
-    "game_id",
-    "table_id",
-    "payout_complete_dtm",
-    "gaming_day",
-    "__etl_insert_Dtm",
-    "wager",
-    "status",
-    "casino_win",
-    "payout_odds",
-    "base_ha",
-    "is_back_bet",
-    "position_idx",
-)
+from trainer.training.data_sources import _BET_INGEST_READ_COLS_ORDERED
+
+_REQUIRED_BET_PARQUET_COLS: tuple[str, ...] = _BET_INGEST_READ_COLS_ORDERED
 
 _REQUIRED_SESSION_PARQUET_COLS: tuple[str, ...] = (
     "session_id",
@@ -149,6 +137,12 @@ _REQUIRED_SESSION_PARQUET_COLS: tuple[str, ...] = (
     "is_canceled",
     "num_games_with_wager",
     "turnover",
+    "player_win",
+    "cash_buyins",
+    "num_bets",
+    "__etl_insert_Dtm",
+    "theo_win",
+    "gaming_day",
 )
 
 

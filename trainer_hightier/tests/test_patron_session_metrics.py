@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from datetime import date
 
 import pandas as pd
@@ -9,7 +10,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from trainer_hightier.config import DuckDbRuntimeConfig
-from trainer_hightier.utils.patron_session_metrics import compile_canonical_patron_session_metrics
+from trainer_hightier.utils.patron_session_metrics import (
+    compile_canonical_patron_profile_csv,
+    compile_canonical_patron_session_metrics,
+)
 
 
 def _sess_row(pid: int, sid: int, theo: float, gd: date) -> dict:
@@ -28,6 +32,9 @@ def _sess_row(pid: int, sid: int, theo: float, gd: date) -> dict:
         "is_canceled": 0,
         "num_games_with_wager": 1,
         "turnover": 1.0,
+        "player_win": float(pid),
+        "cash_buyins": 10.0,
+        "num_bets": 2,
     }
 
 
@@ -88,3 +95,51 @@ def test_patron_session_metrics_requires_theo_and_gaming_day(tmp_path) -> None:
         raise AssertionError("expected ValueError")
     except ValueError as e:
         assert "missing columns" in str(e).lower()
+
+
+def test_patron_profile_csv_aggregates_by_canonical_id(tmp_path) -> None:
+    """Full patron profile CSV: sums, counts, gaming-day span, ADT."""
+    cleaned = tmp_path / "cleaned.parquet"
+    mp = tmp_path / "map.parquet"
+    out_csv = tmp_path / "profile.csv"
+
+    df_s = pd.DataFrame(
+        [
+            _sess_row(10, 1, 100.0, date(2024, 1, 1)),
+            _sess_row(10, 2, 50.0, date(2024, 1, 2)),
+            _sess_row(20, 3, 30.0, date(2024, 1, 1)),
+        ]
+    )
+    pq.write_table(pa.Table.from_pandas(df_s), cleaned)
+    pq.write_table(
+        pa.Table.from_pandas(
+            pd.DataFrame({"player_id": [10, 20], "canonical_id": ["HIGH_ADT", "LOW_ADT"]})
+        ),
+        mp,
+    )
+
+    compile_canonical_patron_profile_csv(
+        cleaned,
+        mp,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        output_csv=out_csv,
+        duckdb_join_timeout_s=120.0,
+    )
+
+    with out_csv.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    by_id = {r["canonical_id"]: r for r in rows}
+    h = by_id["HIGH_ADT"]
+    assert abs(float(h["total_theo_win"]) - 150.0) < 1e-9
+    assert abs(float(h["total_turnover"]) - 2.0) < 1e-9
+    assert abs(float(h["total_cash_buyins"]) - 20.0) < 1e-9
+    assert abs(float(h["total_player_win"]) - 20.0) < 1e-9
+    assert int(float(h["unique_gaming_days"])) == 2
+    assert int(float(h["total_num_bets"])) == 4
+    assert int(float(h["session_count"])) == 2
+    assert str(h["first_gaming_day"]) <= str(h["last_gaming_day"])
+    assert abs(float(h["adt"]) - 75.0) < 1e-9
+
+    ell = by_id["LOW_ADT"]
+    assert abs(float(ell["adt"]) - 30.0) < 1e-9
+    assert int(float(ell["session_count"])) == 1

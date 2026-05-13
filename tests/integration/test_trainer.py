@@ -416,6 +416,7 @@ class TestRefactorGuardrailsInputSources(unittest.TestCase):
             )
         # Column lists / SQL templates originate in data_sources too.
         for name in (
+            "_BET_INGEST_READ_COLS_ORDERED",
             "_BET_SELECT_COLS",
             "_SESSION_SELECT_COLS",
             "_REQUIRED_BET_PARQUET_COLS",
@@ -463,19 +464,17 @@ class TestRefactorGuardrailsInputSources(unittest.TestCase):
         ):
             self.assertIn(needed, cols, f"FND-02/04 column missing: {needed}")
 
-    def test_required_bet_parquet_cols_set(self):
-        """Column-pushdown list for the t_bet Parquet read must keep the
-        union needed by DQ + Track Human + Track LLM YAML."""
+    def test_required_bet_parquet_cols_match_bet_ingest_ssot(self):
+        """Bet Parquet ingest columns must equal ``data_sources._BET_INGEST_READ_COLS_ORDERED``."""
+
         if not _TRAINER_IMPORTED:
             self.skipTest("trainer module not importable in this env")
-        cols = set(_trainer_module._REQUIRED_BET_PARQUET_COLS)
-        for needed in (
-            "bet_id", "session_id", "player_id", "game_id", "table_id",
-            "payout_complete_dtm", "gaming_day",
-            "wager", "status", "casino_win",
-            "payout_odds", "base_ha", "is_back_bet", "position_idx",
-        ):
-            self.assertIn(needed, cols, f"missing required bet col: {needed}")
+
+        import trainer.training.data_sources as ds
+
+        cols = tuple(_trainer_module._REQUIRED_BET_PARQUET_COLS)  # pylint: disable=protected-access
+        ssot = ds._BET_INGEST_READ_COLS_ORDERED
+        self.assertEqual(cols, ssot)
 
     def test_optional_lda_run_trip_cols_present(self):
         """Run/trip LDA bridge columns are loaded when present."""

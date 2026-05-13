@@ -588,6 +588,7 @@ except ModuleNotFoundError:
 
 # Issue #33: paths + column lists + time helpers live in ``common_runtime``; identity DuckDB in ``identity_runtime``.
 from trainer.training.common_runtime import (  # noqa: E402
+    _BET_INGEST_READ_COLS_ORDERED,
     _BET_SELECT_COLS,
     _CANONICAL_MAP_SESSION_COLS,
     _OPTIONAL_BET_LDA_RUN_TRIP_COLS,

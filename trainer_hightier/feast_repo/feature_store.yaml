@@ -1,0 +1,21 @@
+# Feast feature repository (Feast 0.63.x).
+# CLI: from this directory run ``feast plan`` / ``feast apply``.
+#
+# Prerequisites: materialize cleaned bet Parquet (contains ``prediction_visible_ts_cf``), e.g.
+# ``trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet.parquet``.
+
+project: trainer_hightier_walkaway
+project_description: Local feature store for high-tier walkaway (cleaned t_bet Parquet).
+provider: local
+
+registry: data/registry.db
+
+online_store:
+  type: sqlite
+  path: data/online_store.db
+
+# DuckDB + Ibis offline path (Feast 0.63 ``DuckDBOfflineStore``). Requires ``ibis-framework``
+# (see root ``requirements.txt``). Optional staging dir for large ``get_historical_features`` runs.
+offline_store:
+  type: duckdb
+  staging_location: ../tmp/feast_duckdb_staging

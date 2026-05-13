@@ -100,49 +100,51 @@ _OPTIONAL_BET_LDA_RUN_TRIP_COLS: tuple[str, ...] = (
     "lda_l1_run_duration_min",
 )
 
-# Minimal bet columns needed by the full process_chunk pipeline.
-# Column pushdown: load_local_parquet reads only these from the ~60-column
-# t_bet Parquet, cutting RAM by ~2/3 and avoiding the 17-object-column
-# .copy() OOM. Includes DQ/identity, Track Human, Track LLM YAML and legacy
-# columns. If a future feature spec references additional source columns,
-# add them here.
-_REQUIRED_BET_PARQUET_COLS: list = [
-    # Keys & timestamps
+# L0 ``gmwds_t_bet`` ingest: fixed column projection (GDP contract + feature path).
+# Keep in sync with ``schema/GDP_GMWDS_Raw_Schema_Dictionary.md`` §4 Include list and
+# :func:`trainer_hightier.02_preprocess.preprocess_bets_from_parquet_streaming`.
+# Optional ``lda_*`` / bridge columns are appended at load time when present.
+_BET_INGEST_READ_COLS_ORDERED: tuple[str, ...] = (
     "bet_id",
     "session_id",
     "player_id",
     "game_id",
     "table_id",
-    "payout_complete_dtm",
     "gaming_day",
-    # DQ guard / Track Human state machines
+    "payout_complete_dtm",
+    "__etl_insert_Dtm",
     "wager",
+    "wager_nn",
     "status",
     "casino_win",
-    # Legacy / Track LLM features
     "payout_odds",
+    "payout_ha",
     "base_ha",
     "is_back_bet",
     "position_idx",
-]
+    "position_code",
+    "position_label",
+    "bet_type",
+    "type_of_bet",
+    "commission",
+    "max_wager",
+    "std_dev",
+    "theo_win",
+    "theo_win_cash",
+    "true_odds",
+    "adjusted_theo_win",
+    "is_settled",
+    "bet_payout_type",
+    "mixed_stack",
+    "auto_resolve_stack",
+    "__ts_ms",
+    "__op",
+    "__deleted",
+)
 
+_REQUIRED_BET_PARQUET_COLS: tuple[str, ...] = _BET_INGEST_READ_COLS_ORDERED
 
-_BET_SELECT_COLS = """
-    bet_id,
-    session_id,
-    player_id,
-    table_id,
-    payout_complete_dtm,
-    wager,
-    casino_win,
-    status,
-    gaming_day,
-    is_back_bet,
-    base_ha,
-    bet_type,
-    payout_odds,
-    position_idx
-""".strip()
+_BET_SELECT_COLS = ",\n    ".join(_BET_INGEST_READ_COLS_ORDERED)
 
 
 def assert_bets_gaming_day_contract(bets: pd.DataFrame, context: str) -> None:
@@ -559,12 +561,18 @@ def load_local_parquet(
             _sess_cols.append("__etl_insert_Dtm")
     else:
         # Use pyarrow pushdown filters to avoid loading the full table per chunk (R26).
-        # Column pushdown: only load _REQUIRED_BET_PARQUET_COLS to cut RAM by ~2/3 vs
-        # loading all ~60 t_bet columns (OOM fix — 17 object columns were the final straw).
+        # Column pushdown: only load the GDP ingest projection (``_REQUIRED_BET_PARQUET_COLS``)
+        # plus optional run/trip LDA columns when present.
         bets_lo = window_start - timedelta(days=HISTORY_BUFFER_DAYS)
         import pyarrow.parquet as _pq_bets
         _bet_schema_cols = set(_pq_bets.read_schema(bets_path).names)
-        _bet_cols = [c for c in _REQUIRED_BET_PARQUET_COLS if c in _bet_schema_cols]
+        _missing_bet = [c for c in _REQUIRED_BET_PARQUET_COLS if c not in _bet_schema_cols]
+        if _missing_bet:
+            raise ValueError(
+                "Local bet Parquet is missing GDP ingest columns required by trainer "
+                f"(trainer.training.data_sources._BET_INGEST_READ_COLS_ORDERED): {_missing_bet!r}"
+            )
+        _bet_cols = list(_REQUIRED_BET_PARQUET_COLS)
         for _c in _OPTIONAL_BET_LDA_RUN_TRIP_COLS:
             if _c in _bet_schema_cols and _c not in _bet_cols:
                 _bet_cols.append(_c)

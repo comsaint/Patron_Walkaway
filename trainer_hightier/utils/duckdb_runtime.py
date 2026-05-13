@@ -19,7 +19,9 @@ def _path_posix(path: Path) -> str:
 def apply_duckdb_runtime_pragmas(con: Any, cfg: DuckDbRuntimeConfig) -> None:
     """Apply ``DuckDbRuntimeConfig`` PRAGMAs / session variables on *con*."""
     if cfg.temp_directory is not None:
-        td = _path_posix(Path(cfg.temp_directory))
+        td_path = Path(cfg.temp_directory).resolve()
+        td_path.mkdir(parents=True, exist_ok=True)
+        td = _path_posix(td_path)
         con.execute(f"PRAGMA temp_directory='{td}'")
     if cfg.max_temp_directory_size is not None:
         con.execute(f"PRAGMA max_temp_directory_size='{cfg.max_temp_directory_size}'")

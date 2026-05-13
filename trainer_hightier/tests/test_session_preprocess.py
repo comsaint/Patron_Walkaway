@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from trainer_hightier.config import SessionPreprocessConfig
 
 _hpre = importlib.import_module("trainer_hightier.02_preprocess")
 
@@ -25,6 +27,7 @@ def test_preprocess_sessions_manual_ghost_dedup(tmp_path_factory) -> None:
     td = tmp_path_factory.mktemp("sess_pq")
 
     ws = datetime(2024, 1, 15, 0, 0, 0)
+    gd_ws = ws.date()
     rows = [
         dict(
             session_id=1,
@@ -39,6 +42,11 @@ def test_preprocess_sessions_manual_ghost_dedup(tmp_path_factory) -> None:
             is_canceled=0,
             num_games_with_wager=1,
             turnover=1.0,
+            player_win=0.0,
+            cash_buyins=0.0,
+            num_bets=0,
+            theo_win=0.0,
+            gaming_day=gd_ws,
             __etl_insert_Dtm=None,
         ),
         dict(
@@ -54,6 +62,11 @@ def test_preprocess_sessions_manual_ghost_dedup(tmp_path_factory) -> None:
             is_canceled=0,
             num_games_with_wager=1,
             turnover=10.0,
+            player_win=0.0,
+            cash_buyins=0.0,
+            num_bets=0,
+            theo_win=0.0,
+            gaming_day=date(2024, 1, 16),
             __etl_insert_Dtm=None,
         ),
         dict(
@@ -69,6 +82,11 @@ def test_preprocess_sessions_manual_ghost_dedup(tmp_path_factory) -> None:
             is_canceled=0,
             num_games_with_wager=1,
             turnover=5.0,
+            player_win=0.0,
+            cash_buyins=0.0,
+            num_bets=0,
+            theo_win=0.0,
+            gaming_day=gd_ws,
             __etl_insert_Dtm=None,
         ),
         dict(
@@ -84,6 +102,11 @@ def test_preprocess_sessions_manual_ghost_dedup(tmp_path_factory) -> None:
             is_canceled=0,
             num_games_with_wager=0,
             turnover=0.0,
+            player_win=0.0,
+            cash_buyins=0.0,
+            num_bets=0,
+            theo_win=0.0,
+            gaming_day=gd_ws,
             __etl_insert_Dtm=None,
         ),
     ]
@@ -120,6 +143,11 @@ def test_etl_insert_synthetic_caps_per_registry(tmp_path_factory) -> None:
             is_canceled=0,
             num_games_with_wager=1,
             turnover=1.0,
+            player_win=0.0,
+            cash_buyins=0.0,
+            num_bets=0,
+            theo_win=0.0,
+            gaming_day=t0.date(),
             __etl_insert_Dtm=etl,
         ),
     ]
@@ -152,6 +180,11 @@ def test_session_end_imputed_from_start_for_synthetic(tmp_path_factory) -> None:
             is_canceled=0,
             num_games_with_wager=1,
             turnover=10.0,
+            player_win=0.0,
+            cash_buyins=0.0,
+            num_bets=0,
+            theo_win=0.0,
+            gaming_day=t0.date(),
             __etl_insert_Dtm=etl,
         ),
     ]
@@ -184,6 +217,11 @@ def test_streaming_preprocess_fnd01_dedup_across_row_groups(tmp_path) -> None:
             is_canceled=0,
             num_games_with_wager=1,
             turnover=1.0,
+            player_win=0.0,
+            cash_buyins=0.0,
+            num_bets=0,
+            theo_win=0.0,
+            gaming_day=lud.date(),
             __etl_insert_Dtm=lud,
         )
 
@@ -196,3 +234,102 @@ def test_streaming_preprocess_fnd01_dedup_across_row_groups(tmp_path) -> None:
     out = pd.read_parquet(out_path)
     assert len(out) == 1
     assert pd.Timestamp(out["lud_dtm"].iloc[0]) == pd.Timestamp(t_new)
+
+
+def test_streaming_session_hash_buckets_matches_single_pass(tmp_path) -> None:
+    """Hash-bucketed FND-01 dedup must match single-pass (same survivor per session_id)."""
+    base = datetime(2024, 1, 1, 0, 0, 0)
+
+    def _row(session_id: int, lud: datetime) -> dict:
+        return dict(
+            session_id=session_id,
+            player_id=session_id,
+            casino_player_id=str(session_id),
+            lud_dtm=lud,
+            session_start_dtm=base,
+            session_end_dtm=base,
+            table_id=None,
+            is_manual=0,
+            is_deleted=0,
+            is_canceled=0,
+            num_games_with_wager=1,
+            turnover=1.0,
+            player_win=0.0,
+            cash_buyins=0.0,
+            num_bets=0,
+            theo_win=0.0,
+            gaming_day=lud.date(),
+            __etl_insert_Dtm=lud,
+        )
+
+    rows: list[dict] = []
+    for sid in range(1, 11):
+        rows.append(_row(sid, base + timedelta(hours=sid)))
+        rows.append(_row(sid, base + timedelta(hours=sid, minutes=30)))
+    dup_sid = 5
+    pay = base + timedelta(hours=dup_sid, minutes=30)
+    rows.append(
+        _row(
+            dup_sid,
+            pay,
+        )
+        | {"__etl_insert_Dtm": pay + timedelta(hours=3)}
+    )
+
+    df = pd.DataFrame(rows)
+    pq_path = tmp_path / "gmwds_t_session.parquet"
+    pq.write_table(pa.Table.from_pandas(df), pq_path)
+    out1 = tmp_path / "cleaned_b1.parquet"
+    out8 = tmp_path / "cleaned_b8.parquet"
+    _hpre.preprocess_sessions_from_parquet_streaming(
+        pq_path,
+        out1,
+        cfg=SessionPreprocessConfig(dedup_hash_buckets=1),
+    )
+    _hpre.preprocess_sessions_from_parquet_streaming(
+        pq_path,
+        out8,
+        cfg=SessionPreprocessConfig(dedup_hash_buckets=8),
+    )
+    g1 = pd.read_parquet(out1).sort_values(["session_id"]).reset_index(drop=True)
+    g8 = pd.read_parquet(out8).sort_values(["session_id"]).reset_index(drop=True)
+    pd.testing.assert_frame_equal(g1, g8)
+
+
+def test_session_preprocess_projection_drops_unlisted_wide_columns(tmp_path) -> None:
+    """Explicit L0 projection: extra source columns never reach cleaned parquet."""
+    t0 = datetime(2024, 7, 1, 15, 0, 0)
+    rows = [
+        dict(
+            session_id=77,
+            player_id=2,
+            casino_player_id="wide",
+            lud_dtm=t0,
+            session_start_dtm=t0,
+            session_end_dtm=t0,
+            is_manual=0,
+            is_deleted=0,
+            is_canceled=0,
+            num_games_with_wager=3,
+            turnover=12.0,
+            player_win=0.0,
+            cash_buyins=0.0,
+            num_bets=0,
+            theo_win=1.5,
+            gaming_day=t0.date(),
+            __etl_insert_Dtm=t0,
+            junk_metric_only_in_l0=999,
+            blob_like_col_should_not_ship="drop_me",
+        )
+    ]
+    pq_path = tmp_path / "gmwds_t_session.parquet"
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), pq_path, row_group_size=1)
+
+    out_path = tmp_path / "cleaned.parquet"
+    _hpre.preprocess_sessions_from_parquet_streaming(pq_path, out_path)
+
+    cols = pq.read_schema(out_path).names
+    assert "junk_metric_only_in_l0" not in cols
+    assert "blob_like_col_should_not_ship" not in cols
+    assert frozenset(cols).issuperset(frozenset(_hpre.SESSION_PREPROCESS_READ_COLS_ORDERED))
+    assert "__etl_insert_Dtm_synthetic" in cols

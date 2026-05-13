@@ -228,6 +228,8 @@ deploy_dist/
 deploy_dist.zip
 model_*/
 .tmp/
+# DuckDB spill from trainer_hightier DuckDbRuntimeConfig default temp_directory
+tmp/duckdb_spill/
 *.pkl
 
 # credential/ (PLAN: Credential folder consolidation). Ignore secrets; keep examples.

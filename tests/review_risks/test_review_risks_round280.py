@@ -115,7 +115,11 @@ class TestR280ResolvedRisks(unittest.TestCase):
         """Risk R-OOM-2 resolved: session-only fields removed from pushdown list."""
         req = set(trainer_mod._REQUIRED_BET_PARQUET_COLS)  # pylint: disable=protected-access
         self.assertNotIn("lud_dtm", req)
-        self.assertNotIn("__etl_insert_Dtm", req)
+
+    def test_required_bet_cols_should_include_bet_etl_insert_dtm_for_observed_at(self):
+        """Trainer bet Parquet ingest must expose ``__etl_insert_Dtm`` (not session-only)."""
+        req = set(trainer_mod._REQUIRED_BET_PARQUET_COLS)  # pylint: disable=protected-access
+        self.assertIn("__etl_insert_Dtm", req)
 
     def test_required_bet_cols_should_stay_in_sync_with_clickhouse_select(self):
         """Risk R-OOM-3 resolved: all pushdown cols are present in ClickHouse SELECT."""

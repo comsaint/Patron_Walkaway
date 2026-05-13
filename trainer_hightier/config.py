@@ -14,6 +14,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Final
+
+# Repo root (parent of ``trainer_hightier/``); used for default DuckDB spill path only.
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
@@ -25,8 +29,8 @@ class DuckDbRuntimeConfig:
     match DuckDB's PRAGMA surface (e.g. ``memory_limit='4GB'``).
     """
 
-    memory_limit: str = "6GB"
-    temp_directory: Path | None = None
+    memory_limit: str = "16GB"
+    temp_directory: Path | None = _PROJECT_ROOT / "tmp" / "duckdb_spill"
     threads: int | None = None
     # Cap DuckDB spill files under ``temp_directory`` (or OS default temp drive).
     # Example: ``'200GiB'`` when the default inferred cap is too low for large windows.
@@ -48,6 +52,9 @@ class SessionPreprocessConfig:
     # ``duckdb``: one ``COPY`` from raw Parquet (DuckDB pipelines).
     # ``pandas_shards``: row-group batches → temp shard Parquets → DuckDB merge.
     engine: str = "duckdb"
+    # ``dedup_hash_buckets`` (``engine=\"duckdb\"`` only): split FND-01 ``ROW_NUMBER`` dedup by
+    # ``mod(abs(hash(session_id)), N)`` to cap peak RAM on huge tables. ``1`` disables bucketing.
+    dedup_hash_buckets: int = 8
     # Only for ``pandas_shards``: concatenate this many row groups per shard file.
     row_groups_per_shard: int = 8
 
@@ -58,10 +65,25 @@ class BetPreprocessConfig:
 
     Only ``engine=\"duckdb\"`` is implemented (full-table single ``COPY``, like session default).
     ``preprocess_registry_yaml`` defaults to ``<repo>/schema/preprocess_l0_data_contract_registry.yaml`` when omitted.
+
+    ``dedup_hash_buckets``: split ``ROW_NUMBER`` dedup by ``mod(abs(hash(bet_id)), N)`` so each
+    bucket processes ~1/N of keys at a time (lower peak RAM on huge tables). ``1`` disables bucketing.
+
+    **ADT patron segment:** when ``adt_filter_quantile`` is set (e.g. ``0.99``), keep only bets whose
+    ``player_id`` appears in ``adt_allowed_players_parquet`` (one row per allowed ``player_id``, written
+    upstream from ``patron_profile_csv`` + ``canonical_mapping_parquet`` via ADT quantile threshold).
+    ``patron_profile_csv`` / ``canonical_mapping_parquet`` remain on the config for cache fingerprints
+    and trainer orchestration; bet DuckDB joins **only** the allowlist Parquet (early filter, lower RAM).
+    Paths are normally injected by :func:`trainer_hightier.trainer.prepare_training_frame`.
     """
 
     engine: str = "duckdb"
     preprocess_registry_yaml: Path | None = None
+    dedup_hash_buckets: int = 8
+    adt_filter_quantile: float | None = None
+    patron_profile_csv: Path | None = None
+    canonical_mapping_parquet: Path | None = None
+    adt_allowed_players_parquet: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -78,17 +100,116 @@ class CanonicalMappingConfig:
     legacy_coalesce_cutoff: bool = False
     # After mapping Parquet is written: aggregate ``theo_win`` / ``gaming_day`` → ADT report.
     compile_patron_session_metrics: bool = True
+    # Rich per-canonical profile CSV under ``trainer_hightier/artifacts/profile/``.
+    compile_patron_profile_csv: bool = True
 
 
 @dataclass(frozen=True)
 class HighTierObjectiveConfig:
     """Defaults for high-tier segment + precision-floor reporting."""
 
-    # Theo quantile in (0, 1): segment = rated rows with theo >= train quantile cutoff.
-    # Align naming with ``trainer.training.high_roller_segmentation`` when wiring data.
-    theo_train_quantile: float = 0.90
+    # Quantile in (0, 1) on patron **ADT** (from ``canonical_patron_profile.csv``): bet preprocess keeps
+    # only bets tied (via canonical mapping) to patrons at or above this ADT quantile (~top ``1 - q``).
+    # Align naming with ``trainer.training.high_roller_segmentation`` when wiring segment thresholds.
+    theo_train_quantile: float = 0.99
     # Require precision >= this value on the **segment** when choosing a score threshold.
     min_precision: float = 0.80
     # Placeholder paths for later steps (Parquet / DuckDB exports).
     segment_scores_parquet: Path | None = None
     labels_parquet: Path | None = None
+
+
+@dataclass(frozen=True)
+class HighTierRunProfile:
+    """One-place preset: DuckDB resource PRAGMAs + preprocess dedup bucket counts.
+
+    Adjust profiles when moving between machines; CLI flags may override individual fields.
+    """
+
+    memory_limit: str
+    temp_directory: Path | None
+    threads: int | None
+    max_temp_directory_size: str | None
+    preserve_insertion_order: bool
+    session_engine: str
+    session_dedup_hash_buckets: int
+    row_groups_per_shard: int
+    bet_dedup_hash_buckets: int
+
+
+def _default_paths_temp_dir() -> Path | None:
+    return _PROJECT_ROOT / "tmp" / "duckdb_spill"
+
+
+#: Presets keyed by ``--run-profile`` (see :func:`get_run_profile`).
+RUN_PROFILES: Final[dict[str, HighTierRunProfile]] = {
+    "default": HighTierRunProfile(
+        memory_limit="16GB",
+        temp_directory=_default_paths_temp_dir(),
+        threads=None,
+        max_temp_directory_size=None,
+        preserve_insertion_order=False,
+        session_engine="duckdb",
+        session_dedup_hash_buckets=8,
+        row_groups_per_shard=8,
+        bet_dedup_hash_buckets=8,
+    ),
+    "laptop_8g": HighTierRunProfile(
+        memory_limit="4GB",
+        temp_directory=_default_paths_temp_dir(),
+        threads=4,
+        max_temp_directory_size="20GiB",
+        preserve_insertion_order=False,
+        session_engine="duckdb",
+        session_dedup_hash_buckets=16,
+        row_groups_per_shard=8,
+        bet_dedup_hash_buckets=16,
+    ),
+    "workstation_64g": HighTierRunProfile(
+        memory_limit="48GB",
+        temp_directory=_default_paths_temp_dir(),
+        threads=8,
+        max_temp_directory_size=None,
+        preserve_insertion_order=False,
+        session_engine="duckdb",
+        session_dedup_hash_buckets=8,
+        row_groups_per_shard=8,
+        bet_dedup_hash_buckets=8,
+    ),
+}
+
+DEFAULT_RUN_PROFILE_NAME: Final[str] = "default"
+
+
+def list_run_profile_names() -> tuple[str, ...]:
+    """Sorted profile keys for argparse ``choices``."""
+    return tuple(sorted(RUN_PROFILES))
+
+
+def get_run_profile(name: str) -> HighTierRunProfile:
+    """Return the named :class:`HighTierRunProfile` or raise ``ValueError``."""
+    key = str(name).strip()
+    if key not in RUN_PROFILES:
+        names = ", ".join(list_run_profile_names())
+        raise ValueError(f"Unknown run profile {key!r}; expected one of: {names}")
+    return RUN_PROFILES[key]
+
+
+def configs_from_run_profile(
+    profile: HighTierRunProfile,
+) -> tuple[DuckDbRuntimeConfig, SessionPreprocessConfig, BetPreprocessConfig]:
+    """Expand a profile into configs used by :class:`~trainer_hightier.trainer.HighTierTrainArgs`."""
+    ddb = DuckDbRuntimeConfig(
+        memory_limit=profile.memory_limit,
+        temp_directory=profile.temp_directory,
+        threads=profile.threads,
+        max_temp_directory_size=profile.max_temp_directory_size,
+        preserve_insertion_order=profile.preserve_insertion_order,
+    )
+    sess = SessionPreprocessConfig(
+        engine=profile.session_engine,
+        dedup_hash_buckets=profile.session_dedup_hash_buckets,
+        row_groups_per_shard=profile.row_groups_per_shard,
+    )
+    bet = BetPreprocessConfig(dedup_hash_buckets=profile.bet_dedup_hash_buckets)
+    return ddb, sess, bet

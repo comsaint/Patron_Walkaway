@@ -21,6 +21,7 @@ except ModuleNotFoundError:
     import trainer.config as _cfg  # type: ignore[import]
 
 from trainer.training.data_sources import (  # noqa: E402
+    _BET_INGEST_READ_COLS_ORDERED,
     _BET_SELECT_COLS,
     _CANONICAL_MAP_SESSION_COLS,
     _OPTIONAL_BET_LDA_RUN_TRIP_COLS,
@@ -90,6 +91,7 @@ def get_model_version() -> str:
 
 
 __all__ = [
+    "_BET_INGEST_READ_COLS_ORDERED",
     "_BET_SELECT_COLS",
     "_CANONICAL_MAP_SESSION_COLS",
     "_OPTIONAL_BET_LDA_RUN_TRIP_COLS",
