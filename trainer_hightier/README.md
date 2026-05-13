@@ -33,10 +33,10 @@ trainer_hightier/
 2. 執行訓練骨架（會跑 Step 1–2，寫入預設清洗 Parquet）：
 
 ```bash
-python -m trainer_hightier.trainer --data-dir /path/to/data
+python -m trainer_hightier.trainer
 ```
 
-可選：`--output-dir`、`--no-cache`、`--random-seed`（見 `trainer.py` 的 argparse）。
+可選：`--ignore-caches`（等同 `--no-cache`）— 略過 session/bet 預處理磁碟快取並強制重算；其餘為程式預設（資料目錄為 `<repo>/data`、`config.DEFAULT_RUN_PROFILE_NAME` 等）。
 
 3. 執行評估 demo（與上面 **不同** 的入口）：
 
@@ -48,7 +48,7 @@ python -m trainer_hightier
 
 - **`DuckDbRuntimeConfig`**（`config.py`）：`memory_limit`、`temp_directory`、`threads`。透過 `trainer_hightier.utils.duckdb_runtime.apply_duckdb_runtime_pragmas` 套在連線上；**不**讀取 `trainer.core.config`。
 - **`SessionPreprocessConfig`**：`engine`（`duckdb` | `pandas_shards`）、`row_groups_per_shard`（僅 pandas 分片路徑）。
-- **`HighTierTrainArgs`**：程式化執行時可設定 `duckdb_runtime` 與 `session_preprocess`（CLI 目前未暴露每一欄，需改程式或擴充 argparse）。
+- **`HighTierTrainArgs`**：程式化執行時可覆寫各欄；CLI 僅暴露是否略過預處理快取（`--ignore-caches`）。
 
 預設清洗輸出路徑由 `02_preprocess.default_cleaned_session_parquet_path()` 決定（`trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_session.parquet`）。
 

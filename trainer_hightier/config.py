@@ -123,7 +123,7 @@ class HighTierObjectiveConfig:
 class HighTierRunProfile:
     """One-place preset: DuckDB resource PRAGMAs + preprocess dedup bucket counts.
 
-    Adjust profiles when moving between machines; CLI flags may override individual fields.
+    Select a profile in code (``DEFAULT_RUN_PROFILE_NAME`` / :func:`get_run_profile`) when wiring runs.
     """
 
     memory_limit: str
@@ -182,7 +182,7 @@ DEFAULT_RUN_PROFILE_NAME: Final[str] = "default"
 
 
 def list_run_profile_names() -> tuple[str, ...]:
-    """Sorted profile keys for argparse ``choices``."""
+    """Sorted :data:`RUN_PROFILES` keys (for validation UX)."""
     return tuple(sorted(RUN_PROFILES))
 
 

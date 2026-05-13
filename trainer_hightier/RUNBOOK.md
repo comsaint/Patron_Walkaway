@@ -17,17 +17,16 @@
 ## 2. 執行訓練骨架（session 清洗）
 
 ```bash
-python -m trainer_hightier.trainer --data-dir /path/to/data
+python -m trainer_hightier.trainer
 ```
 
 | 旗標 | 用途 |
 |------|------|
-| `--data-dir` | 覆寫資料目錄（省略則用 repo 下 `data/`） |
-| `--output-dir` | 執行輸出根目錄（預設 `.data/trainer_hightier/run`；目前骨架對 session 清洗路徑影響有限，仍以 `02_preprocess` 預設 cleaned 路徑為主） |
-| `--no-cache` | **強制**重算清洗結果，忽略 session clean cache |
-| `--random-seed` | 預留給未來訓練步驟 |
+| `--ignore-caches` / `--no-cache` | **強制**重跑 session / bet 預處理，略過兩者的 clean-cache manifest 命中（大 L0 時 I/O 與耗時明顯） |
 
-**注意：**`duckdb_runtime` 與 `session_preprocess` 的細項目前僅能透過 `HighTierTrainArgs` 在程式內設定；若要在 CLI 調 DuckDB，需擴充 `trainer._build_argparser()` 或包一層呼叫腳本。
+資料目錄固定為 `<repo>/data`（`01_data_ingest.default_data_dir()`）；其他行為請在程式中建立 `HighTierTrainArgs`（例如換 `run_profile`、調 `duckdb_runtime`）。
+
+**注意：**若要在 CLI 調 DuckDB／dedup 等，需自行包一層腳本或改 `trainer.main()` 內對 `configs_from_run_profile` 的用法。
 
 ## 3. Session 清洗引擎與記憶體
 
@@ -65,11 +64,11 @@ run_training(args)
 
 這些 PRAGMA **不會**套用主 `trainer` 管線的 `get_duckdb_memory_config`。
 
-## 4. Session clean cache
+## 4. Preprocess disk cache（session / bet）
 
-- **命中條件：**清洗目標 Parquet 已存在，且 sidecar JSON 與 `build_session_clean_cache_record()` 計出的指紋一致（含來源 `mtime`/`size`、列數 metadata、`02_preprocess.py` 原始碼 hash 等）。
-- **失效：**來源 `gmwds_t_session.parquet` 變更、或 preprocess 邏輯變更（模組 hash 變）通常會 miss；改 `DuckDbRuntimeConfig` **不一定**會讓指紋變——若語意相同但想強制重跑，請用 `--no-cache` 或刪除 cleaned + sidecar。
-- **強制重算：**`--no-cache`；大 L0 上可能耗時與 I/O 明顯。
+- **命中條件：**清洗目標 Parquet 已存在，且 sidecar JSON 與 `build_session_clean_cache_record()` 計出的指紋一致（含來源 `mtime`/`size`、列數 metadata、`02_preprocess.py` 原始碼 hash 等）。Bet 清洗則對應 `bet_l0_preprocess` 之 `build_bet_clean_cache_record()` 與側車。
+- **失效：**來源 Parquet 或 registry／前手 cleaned session 變更、或 preprocess 邏輯變更時通常會 miss；改 `DuckDbRuntimeConfig` **不一定**讓指紋變——若仍要強制重跑，請用 `--ignore-caches` 或手動刪除 cleaned 與對應 `.cache.json`。
+- **強制重算：**`--ignore-caches`（或 `--no-cache`）；大 L0 上可能耗時與 I/O 明顯；同一旗標同時作用於 session 與 bet preprocess cache。
 
 ## 5. 常見問題
 
@@ -77,7 +76,7 @@ run_training(args)
 |------|------|
 | DuckDB OOM 或程序被殺 | 降低 `memory_limit`、設定 `temp_directory` 到有足夠空間的磁碟、或改用較小批次 / `pandas_shards` + 較小 `row_groups_per_shard`（仍須注意 pandas 峰值） |
 | `pandas_shards` 很慢、暫存目錄爆量 | 正常：多顆 shard + merge；可改 `engine="duckdb"` 或調整 `row_groups_per_shard` |
-| 找不到 session 檔 | 確認 `--data-dir` 與 `gmwds_t_session.parquet` 檔名、路徑 |
+| 找不到 session 檔 | 確認預設資料目錄 `<repo>/data` 底下有 `gmwds_t_session.parquet`（或改程式指定 `HighTierTrainArgs.data_dir`） |
 | 與主 `trainer` DuckDB 行為不一致 | 預期內：本套件刻意**不**讀 `trainer.core` 的 DuckDB 設定；數值對齊需對照雙邊 SQL / 測試 |
 
 ## 6. 測試與除錯
