@@ -143,3 +143,78 @@ def test_patron_profile_csv_aggregates_by_canonical_id(tmp_path) -> None:
     ell = by_id["LOW_ADT"]
     assert abs(float(ell["adt"]) - 30.0) < 1e-9
     assert int(float(ell["session_count"])) == 1
+
+
+def test_slow_patron_180d_monthly_materialize_assigns_latest_anchor(tmp_path) -> None:
+    """Monthly MIN(gaming_day) anchor + lateral join picks correct snapshot per bet."""
+    from trainer_hightier.utils.slow_patron_180d_monthly import materialize_slow_patron_180d_monthly
+
+    gd1 = date(2024, 1, 5)
+    gd2 = date(2024, 1, 12)
+    gd3 = date(2024, 2, 2)
+    sess = pd.DataFrame(
+        [
+            _sess_row(100, 1, 100.0, gd1),
+            _sess_row(100, 2, 50.0, gd2),
+            _sess_row(100, 3, 200.0, gd3),
+        ]
+    )
+    mp = tmp_path / "map.parquet"
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame({"player_id": [100], "canonical_id": ["c1"]})),
+        mp,
+    )
+    spq = tmp_path / "sess.parquet"
+    pq.write_table(pa.Table.from_pandas(sess), spq)
+
+    pit = pd.Timestamp("2024-06-01 12:00:00+08:00")
+
+    def _bet(bid: float, pgd: date) -> dict:
+        pay = pd.Timestamp(pgd.year, pgd.month, pgd.day, 14, 0, 0, tz="Asia/Hong_Kong")
+        return {
+            "bet_id": bid,
+            "session_id": 1.0,
+            "player_id": 100,
+            "game_id": 1.0,
+            "table_id": 1.0,
+            "payout_complete_dtm": pay,
+            "__etl_insert_Dtm": pay,
+            "wager": 1.0,
+            "wager_nn": 0.0,
+            "status": "WIN",
+            "casino_win": 0.0,
+            "payout_odds": 1.0,
+            "payout_ha": 0.0,
+            "base_ha": 0.0,
+            "is_back_bet": 0,
+            "gaming_day": pgd,
+            "prediction_visible_ts_cf": pit,
+            "__etl_insert_Dtm_synthetic": pit,
+        }
+
+    bets = pd.DataFrame([_bet(1.0, date(2024, 1, 3)), _bet(2.0, date(2024, 1, 20)), _bet(3.0, date(2024, 2, 10))])
+    bpq = tmp_path / "bet.parquet"
+    pq.write_table(pa.Table.from_pandas(bets), bpq)
+    out = tmp_path / "slow180.parquet"
+
+    materialize_slow_patron_180d_monthly(
+        cleaned_session_parquet=spq,
+        canonical_mapping_parquet=mp,
+        cleaned_bet_parquet=bpq,
+        out_parquet=out,
+        lookback_days=180,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+    )
+    got = pd.read_parquet(out).sort_values("bet_id", kind="mergesort")
+
+    assert len(got) == 3
+    r0 = got.iloc[0]
+    assert pd.isna(r0["patron__theo_win_sum__w180d_m1snap"])
+    r1 = got.iloc[1]
+    assert float(r1["patron__theo_win_sum__w180d_m1snap"]) == 100.0
+    assert int(r1["patron__gaming_days_cnt__w180d_m1snap"]) == 1
+    assert float(r1["patron__adt__w180d_m1snap"]) == 100.0
+    r2 = got.iloc[2]
+    assert abs(float(r2["patron__theo_win_sum__w180d_m1snap"]) - 350.0) < 1e-6
+    assert int(r2["patron__gaming_days_cnt__w180d_m1snap"]) == 3
+    assert abs(float(r2["patron__adt__w180d_m1snap"]) - 350.0 / 3.0) < 1e-6

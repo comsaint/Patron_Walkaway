@@ -10,9 +10,12 @@
 Explicit ``schema``：避免 Feast 對 ``gaming_day`` 的 ``date32`` 做 schema inference
 時觸發不支援的型別對應（與本 repo 的 ``feast==0.63.0`` 行為一致）。
 
-未列入 ``schema`` 的 Parquet 欄位（含 ``gaming_day``）仍存在檔案中，但**不**透過
-本 FeatureView 註冊；若訓練需要 ``gaming_day``，請另開 view 或以字串欄在 preprocess
-中衍生後再註冊。
+Trial：需先執行 ``trainer_hightier.utils.trial_bet_behavior_1h.materialize_trial_bet_behavior_1h``
+產生 ``artifacts/feast/trial_bet_behavior_1h.parquet`` 後，``trial_bet_behavior_1h_features``
+與 ``walkaway_bet_trial_v1`` 才可通過來源檢核。
+
+Slow patron：需先執行 ``trainer_hightier.utils.slow_patron_180d_monthly.materialize_slow_patron_180d_monthly``
+產生 ``artifacts/feast/slow_patron_180d_monthly.parquet`` 後，``slow_patron_180d_monthly_features`` 方可通過檢核。
 """
 
 from __future__ import annotations
@@ -89,6 +92,74 @@ cleaned_bet_features = FeatureView(
         "semantics": "counterfactual_pit",
         "contract": "trainer_hightier/contracts/time_semantics_and_feast_mapping.md",
     },
+)
+
+_TRIAL_1H_PARQUET = (_REPO_ROOT.parent / "artifacts" / "feast" / "trial_bet_behavior_1h.parquet").resolve()
+_trial_1h_source_path = str(_TRIAL_1H_PARQUET)
+
+trial_bet_behavior_1h_source = FileSource(
+    name="trial_bet_behavior_1h_parquet",
+    path=_trial_1h_source_path,
+    timestamp_field="prediction_visible_ts_cf",
+    created_timestamp_column="__etl_insert_Dtm_synthetic",
+)
+
+trial_bet_behavior_1h_features = FeatureView(
+    name="trial_bet_behavior_1h_features",
+    entities=[bet],
+    ttl=timedelta(hours=2),
+    schema=[
+        Field(name="bet_id", dtype=Float64),
+        Field(name="bet__bets_cnt__w1h", dtype=Int64),
+        Field(name="bet__wager_sum__w1h", dtype=Float64),
+        Field(name="bet__back_bet_ratio__w1h", dtype=Float64),
+        Field(name="bet__payout_odds_avg__w1h", dtype=Float64),
+    ],
+    source=trial_bet_behavior_1h_source,
+    tags={
+        "owner": "trainer_hightier",
+        "semantics": "counterfactual_pit",
+        "trial": "1h_player_clock_lookback",
+        "contract": "trainer_hightier/contracts/trial_bet_behavior_1h_features.yaml",
+    },
+)
+
+_SLOW_180_PARQUET = (_REPO_ROOT.parent / "artifacts" / "feast" / "slow_patron_180d_monthly.parquet").resolve()
+_slow_180_source_path = str(_SLOW_180_PARQUET)
+
+slow_patron_180d_monthly_source = FileSource(
+    name="slow_patron_180d_monthly_parquet",
+    path=_slow_180_source_path,
+    timestamp_field="prediction_visible_ts_cf",
+    created_timestamp_column="__etl_insert_Dtm_synthetic",
+)
+
+slow_patron_180d_monthly_features = FeatureView(
+    name="slow_patron_180d_monthly_features",
+    entities=[bet],
+    ttl=timedelta(days=50),
+    schema=[
+        Field(name="bet_id", dtype=Float64),
+        Field(name="patron__theo_win_sum__w180d_m1snap", dtype=Float64),
+        Field(name="patron__gaming_days_cnt__w180d_m1snap", dtype=Int64),
+        Field(name="patron__adt__w180d_m1snap", dtype=Float64),
+    ],
+    source=slow_patron_180d_monthly_source,
+    tags={
+        "owner": "trainer_hightier",
+        "semantics": "counterfactual_pit",
+        "cadence": "monthly_first_gaming_day_snapshot",
+        "contract": "trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml",
+    },
+)
+
+walkaway_bet_trial_v1 = FeatureService(
+    name="walkaway_bet_trial_v1",
+    features=[
+        cleaned_bet_features,
+        trial_bet_behavior_1h_features,
+        slow_patron_180d_monthly_features,
+    ],
 )
 
 walkaway_bet_v1 = FeatureService(

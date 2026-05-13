@@ -1,0 +1,68 @@
+# Slow patron features: 180 calendar-day lookback, monthly snapshot (trainer_hightier)
+#
+# Grain: one row per cleaned bet_id; PIT timestamps match cleaned bet:
+#   prediction_visible_ts_cf, __etl_insert_Dtm_synthetic
+
+registry_id: slow_patron_180d_monthly_snapshot
+registry_version: v0.1
+
+semantics:
+  canonical_space: Sessions and metrics are aggregated in ``canonical_id`` (via player mapping).
+  monthly_anchor: >-
+    For each ``canonical_id`` and each calendar month present in that patron's session ``gaming_day``
+    values, ``anchor_gaming_day = MIN(gaming_day)`` in that month (first gaming day of the month for
+    that patron). Snapshots are computed only on those anchors (not every session day).
+  lookback_window: >-
+    Inclusive calendar dates: ``gaming_day`` in ``[anchor_gaming_day - (lookback_days - 1), anchor_gaming_day]``.
+    Default ``lookback_days`` is 180 (180 distinct calendar dates when the full prefix exists).
+  session_aggregates:
+    total_theo_win: SUM(theo_win) over sessions in the window (same session row may share gaming_day with others).
+    unique_gaming_days: COUNT(DISTINCT gaming_day) in the window.
+    adt: total_theo_win / unique_gaming_days when the latter > 0; else NULL.
+  bet_assignment: >-
+    Each bet receives the snapshot with the greatest ``anchor_gaming_day`` such that
+    ``anchor_gaming_day <= bet_gaming_day``, where
+    ``bet_gaming_day = COALESCE(bet.gaming_day, DATE(payout_complete_dtm AT TIME ZONE ...))``
+    (implementation: CAST payout TIMESTAMPTZ to DATE in HK/storage as per cleaned parquet). If no anchor
+    qualifies, feature columns are NULL.
+
+source_artifacts:
+  cleaned_session:
+    relative_to_repo: trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_session.parquet
+  canonical_mapping:
+    relative_to_repo: trainer_hightier/artifacts/mapping/canonical_player_mapping.parquet
+  cleaned_bet:
+    relative_to_repo: trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet.parquet
+
+materialized_artifact:
+  relative_to_repo: trainer_hightier/artifacts/feast/slow_patron_180d_monthly.parquet
+
+implementation:
+  module: trainer_hightier.utils.slow_patron_180d_monthly
+  entrypoint: materialize_slow_patron_180d_monthly
+  lookback_days_default: 180
+
+features:
+  - feature_id: patron__theo_win_sum__w180d_m1snap
+    type: float
+    description: >
+      Sum of session ``theo_win`` in the lookback window ending on that month's ``anchor_gaming_day``.
+  - feature_id: patron__gaming_days_cnt__w180d_m1snap
+    type: int
+    description: >
+      Count of distinct ``gaming_day`` values in that window (session grain).
+  - feature_id: patron__adt__w180d_m1snap
+    type: float
+    description: >
+      Average daily theo = total_theo / distinct gaming days when days > 0; else NULL.
+
+feast:
+  feature_view: slow_patron_180d_monthly_features
+  feature_service: walkaway_bet_trial_v1
+  entity: bet
+  timestamp_field: prediction_visible_ts_cf
+  created_timestamp_column: __etl_insert_Dtm_synthetic
+
+notes:
+  - Computationally heavy on large session history; run materialization explicitly (batch / workstation).
+  - Features change at most when crossing a new monthly ``anchor_gaming_day`` for that patron.

@@ -133,7 +133,26 @@ prediction_visible_ts_cf AS (
 
 ---
 
+## 6.1 慢變動 patron 特徵（180 日窗口 × 每月首日 `gaming_day` 快照）
+
+- **契約**：`trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml`。
+- **物化**：`trainer_hightier.utils.slow_patron_180d_monthly.materialize_slow_patron_180d_monthly` → `artifacts/feast/slow_patron_180d_monthly.parquet`（**請先跑物化再 `feast apply`**；僅用 DuckDB，不整表載入 pandas）。
+- **語意概要**：在 **canonical_id** 空間內，對每個日曆月中該 patron 實際出現的 **`gaming_day`** 取 **`MIN(gaming_day)`** 作為當月 **anchor**；在 anchor 上計算過去 `lookback_days`（預設 180）個**日曆日**內、以 session 為來源的 `SUM(theo_win)`、`COUNT(DISTINCT gaming_day)` 與 ADT。每筆 cleaned **bet** 透過 `COALESCE(bet.gaming_day, DATE(payout_complete_dtm))` 取得 `bet_gaming_day`，再套用 **不超過該日的最近一個 anchor** 之快照（LATERAL / 等價於「月級最多更新一次」的慢變動值）。
+- **時間欄**：與其他 bet-grain 視圖一致，使用 `prediction_visible_ts_cf` + `__etl_insert_Dtm_synthetic` 註冊 Feast（見該 YAML `feast` 段）。
+
+---
+
+## 6.2 訓練集匯出（Feast + labels）
+
+- **腳本**：`python -m trainer_hightier.03_build_training_data`（管線第 3 步，承接 `01_data_ingest` / `02_preprocess`；預設輸出 `trainer_hightier/artifacts/training_data/training_set.parquet`，並寫入同目錄 `training_set.manifest.json`）。
+- **輸入**：cleaned `t_bet`（含 `prediction_visible_ts_cf`）、`artifacts/labels/walkaway_labels.parquet`、已 **`feast apply`** 之 registry；衍生特徵 Parquet（trial 1h / slow 180d）須已存在，或使用 `--materialize-derived` 於腳本內先物化（**重**）。
+- **流程**：自清洗 bet 衍生 entity Parquet（`bet_id` + `event_timestamp`）→ `get_historical_features`（預設 feature service `walkaway_bet_trial_v1`）`persist` 為 staging Parquet → DuckDB 將 **labels** 以 `bet_id` 左連接（欄名 `walkaway_label`、`walkaway_censored`）。
+
+---
+
 ## 7. 變更紀錄
 
 - 2026-05-13：初版草案（trainer_hightier／Feast 對齊 scorer 輪詢與 `BET_AVAIL_DELAY_MIN`）。
 - 2026-05-13：離線 store 改為 `duckdb` + `ibis-framework[duckdb]`，並設定 `staging_location`。
+- 2026-05-13：§6.1 慢變動 patron 180d 月度快照特徵與物化路徑
+- 2026-05-13：§6.2 訓練集匯出腳本 `03_build_training_data.py`

@@ -19,11 +19,13 @@
 trainer_hightier/
   config.py              # DuckDbRuntimeConfig、SessionPreprocessConfig、HighTierObjectiveConfig
   01_data_ingest.py      # 路徑解析、session 進場 QC（metadata / schema）
-  02_preprocess.py       # session 清洗（DuckDB / pandas_shards）
+  02_preprocess.py       # session / bet 清洗 facade（DuckDB streaming）
+  03_build_training_data.py  # Step 3：Feast 離線特徵 + labels → training Parquet
   trainer.py             # HighTierTrainArgs、run_training（主流程骨架）
   eval.py                # precision floor 報告（demo 與單元測試會用到）
   utils/                 # 非步驟共用工具（例如 DuckDB PRAGMA 套用）
   artifacts/cleaned/     # 預設輸出：cleaned__gmwds_t_session.parquet（由程式建立）
+  artifacts/training_data/  # `03_build_training_data` 預設輸出：`training_set.parquet`
   tests/                 # pytest
 ```
 
@@ -36,9 +38,15 @@ trainer_hightier/
 python -m trainer_hightier.trainer
 ```
 
-可選：`--ignore-caches`（等同 `--no-cache`）— 略過 session/bet 預處理磁碟快取並強制重算；其餘為程式預設（資料目錄為 `<repo>/data`、`config.DEFAULT_RUN_PROFILE_NAME` 等）。
+可選：`--ignore-caches`（等同 `--no-cache`）— 略過 session/bet 預處理磁碟快取並強制重算；`--skip-training-dataset` — 不執行 Step 3（預設**會**跑 Feast + labels → `artifacts/training_data/training_set.parquet`）；`--skip-training-materialize-derived` — Step 3 內不重算 trial 1h / slow 180d 物化檔（若已存在且想省時間可加）。其餘為程式預設（資料目錄為 `<repo>/data`、`config.DEFAULT_RUN_PROFILE_NAME` 等）。
 
-3. 執行評估 demo（與上面 **不同** 的入口）：
+3. （可選）在 **已** `feast apply`、具 cleaned bet 與 `artifacts/labels/walkaway_labels.parquet` 後，匯出訓練表：
+
+```bash
+python -m trainer_hightier.03_build_training_data
+```
+
+4. 執行評估 demo（與上面 **不同** 的入口）：
 
 ```bash
 python -m trainer_hightier

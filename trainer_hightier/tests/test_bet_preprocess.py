@@ -373,3 +373,128 @@ def test_preprocess_bet_adt_segment_keeps_only_top_quantile_patrons(registry_pat
     got = pd.read_parquet(out)
     assert len(got) == 1
     assert int(got.iloc[0]["player_id"]) == 100
+
+
+def test_trial_bet_behavior_1h_window_counts(tmp_path: Path) -> None:
+    """1h RANGE window: prior rows with pcd in [current_pcd - 1h, current_pcd)."""
+    from trainer_hightier.utils.trial_bet_behavior_1h import materialize_trial_bet_behavior_1h
+
+    t0 = pd.Timestamp("2024-01-01 12:00:00", tz="UTC")
+    pit = t0 + pd.Timedelta(hours=3)
+    df = pd.DataFrame(
+        [
+            {
+                "bet_id": 1.0,
+                "player_id": 1,
+                "payout_complete_dtm": t0,
+                "wager": 10.0,
+                "is_back_bet": 1,
+                "payout_odds": 2.0,
+                "prediction_visible_ts_cf": pit,
+                "__etl_insert_Dtm_synthetic": pit,
+            },
+            {
+                "bet_id": 2.0,
+                "player_id": 1,
+                "payout_complete_dtm": t0 + pd.Timedelta(minutes=30),
+                "wager": 20.0,
+                "is_back_bet": 0,
+                "payout_odds": 3.0,
+                "prediction_visible_ts_cf": pit,
+                "__etl_insert_Dtm_synthetic": pit,
+            },
+            {
+                "bet_id": 3.0,
+                "player_id": 1,
+                "payout_complete_dtm": t0 + pd.Timedelta(minutes=45),
+                "wager": 99.0,
+                "is_back_bet": 0,
+                "payout_odds": 9.0,
+                "prediction_visible_ts_cf": pit,
+                "__etl_insert_Dtm_synthetic": pit,
+            },
+            {
+                "bet_id": 4.0,
+                "player_id": 1,
+                "payout_complete_dtm": t0 + pd.Timedelta(hours=2),
+                "wager": 1.0,
+                "is_back_bet": 1,
+                "payout_odds": 1.0,
+                "prediction_visible_ts_cf": pit,
+                "__etl_insert_Dtm_synthetic": pit,
+            },
+        ]
+    )
+    src = tmp_path / "cleaned_mini.parquet"
+    out = tmp_path / "trial_bet_behavior_1h.parquet"
+    pq.write_table(pa.Table.from_pandas(df), src)
+
+    materialize_trial_bet_behavior_1h(cleaned_bet_parquet=src, out_parquet=out)
+
+    got = pd.read_parquet(out).sort_values("bet_id", kind="mergesort")
+    assert len(got) == 4
+
+    r1 = got[got["bet_id"] == 1.0].iloc[0]
+    assert int(r1["bet__bets_cnt__w1h"]) == 0
+    assert float(r1["bet__wager_sum__w1h"]) == 0.0
+
+    r2 = got[got["bet_id"] == 2.0].iloc[0]
+    assert int(r2["bet__bets_cnt__w1h"]) == 1
+    assert float(r2["bet__wager_sum__w1h"]) == 10.0
+    assert abs(float(r2["bet__back_bet_ratio__w1h"]) - 1.0) < 1e-9
+    assert abs(float(r2["bet__payout_odds_avg__w1h"]) - 2.0) < 1e-9
+
+    r3 = got[got["bet_id"] == 3.0].iloc[0]
+    assert int(r3["bet__bets_cnt__w1h"]) == 2
+    assert float(r3["bet__wager_sum__w1h"]) == 30.0
+    assert abs(float(r3["bet__back_bet_ratio__w1h"]) - 0.5) < 1e-9
+    assert abs(float(r3["bet__payout_odds_avg__w1h"]) - 2.5) < 1e-9
+
+    r4 = got[got["bet_id"] == 4.0].iloc[0]
+    assert int(r4["bet__bets_cnt__w1h"]) == 0
+
+
+def test_materialize_walkaway_labels_matches_trainer_labels(tmp_path: Path) -> None:
+    """Join cleaned bet + mapping, then parity with ``trainer.labels.compute_labels``."""
+    from trainer.labels import compute_labels
+
+    from trainer_hightier.utils.walkaway_labels import materialize_walkaway_labels_from_cleaned_bet
+
+    t0 = pd.Timestamp("2024-06-01 12:00:00")
+    horizon = t0 + pd.Timedelta(hours=3)
+    df_b = pd.DataFrame(
+        [
+            {"bet_id": 1.0, "player_id": 100, "payout_complete_dtm": t0},
+            {"bet_id": 2.0, "player_id": 100, "payout_complete_dtm": t0 + pd.Timedelta(minutes=35)},
+        ]
+    )
+    df_m = pd.DataFrame([{"player_id": 100, "canonical_id": "c1"}])
+    b_path = tmp_path / "bet_clean.parquet"
+    m_path = tmp_path / "canonical_map.parquet"
+    out_path = tmp_path / "walkaway_labels.parquet"
+    pq.write_table(pa.Table.from_pandas(df_b), b_path)
+    pq.write_table(pa.Table.from_pandas(df_m), m_path)
+
+    materialize_walkaway_labels_from_cleaned_bet(
+        cleaned_bet_parquet=b_path,
+        canonical_mapping_parquet=m_path,
+        out_parquet=out_path,
+        window_end=horizon,
+        extended_end=horizon,
+    )
+    got = pd.read_parquet(out_path).sort_values("bet_id", kind="mergesort")
+
+    direct = compute_labels(
+        pd.DataFrame(
+            {
+                "canonical_id": ["c1", "c1"],
+                "bet_id": [1.0, 2.0],
+                "payout_complete_dtm": [t0, t0 + pd.Timedelta(minutes=35)],
+            }
+        ),
+        window_end=horizon,
+        extended_end=horizon,
+    ).sort_values("bet_id", kind="mergesort")
+
+    pd.testing.assert_series_equal(got["label"].reset_index(drop=True), direct["label"].reset_index(drop=True))
+    pd.testing.assert_series_equal(got["censored"].reset_index(drop=True), direct["censored"].reset_index(drop=True))

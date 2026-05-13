@@ -3,6 +3,10 @@
 Analogous role to ``trainer.training.trainer.run_pipeline`` / ``main``: orchestrate
 load → fit → artifact write for the reduced high-tier objective. Implementation
 is intentionally empty beyond logging and call order.
+
+Pipeline steps: ``01_data_ingest`` (inside ``prepare_training_frame``) →
+``02_preprocess`` → optional walkaway labels (2c) → ``03_build_training_data`` (default on;
+``--skip-training-dataset`` to skip) → ``fit_model`` / ``write_artifacts`` (TODO).
 """
 
 from __future__ import annotations
@@ -36,10 +40,15 @@ from trainer_hightier.utils.patron_session_metrics import (
     default_patron_profile_csv_path,
     materialize_adt_allowed_players_parquet,
 )
+from trainer_hightier.utils.walkaway_labels import (
+    default_walkaway_labels_parquet_path,
+    materialize_walkaway_labels_from_cleaned_bet,
+)
 
 # Module names cannot start with a digit in ``import …`` syntax; load by full name.
 _ingest = importlib.import_module("trainer_hightier.01_data_ingest")
 _hpre = importlib.import_module("trainer_hightier.02_preprocess")
+_b3 = importlib.import_module("trainer_hightier.03_build_training_data")
 
 
 logger = logging.getLogger("trainer_hightier")
@@ -63,6 +72,14 @@ class HighTierTrainArgs:
     canonical_mapping: CanonicalMappingConfig = field(default_factory=CanonicalMappingConfig)
     # When True with ``objective.theo_train_quantile`` in (0,1), bet preprocess keeps only ADT-top patrons.
     filter_bets_by_adt_quantile: bool = True
+    # After cleaned ``t_bet`` exists: join to mapping and write ``walkaway_labels.parquet`` (``trainer.labels`` parity).
+    materialize_walkaway_labels: bool = True
+    # Step 3: Feast historical features + labels → ``artifacts/training_data/training_set.parquet`` (default on).
+    build_training_dataset: bool = True
+    # When ``build_training_dataset``: materialize trial 1h + slow 180d Parquets before Feast (default on; very heavy).
+    training_materialize_derived: bool = True
+    # Feast feature service for Step 3 (default matches ``03_build_training_data``).
+    training_feature_service: str = "walkaway_bet_trial_v1"
 
 
 def prepare_training_frame(args: HighTierTrainArgs) -> None:
@@ -231,6 +248,67 @@ def prepare_training_frame(args: HighTierTrainArgs) -> None:
             pq_paths.bet_parquet.name,
         )
 
+    if (
+        args.materialize_walkaway_labels
+        and not args.skip_bet_preprocess
+        and pq_paths.bet_parquet.is_file()
+        and cleaned_bet_path.is_file()
+    ):
+        if not mapping_parquet_path.is_file():
+            logger.warning(
+                "[Step 2c] skip walkaway labels: canonical mapping missing at %s",
+                mapping_parquet_path,
+            )
+        else:
+            labels_out = args.objective.labels_parquet or default_walkaway_labels_parquet_path()
+            materialize_walkaway_labels_from_cleaned_bet(
+                cleaned_bet_parquet=cleaned_bet_path,
+                canonical_mapping_parquet=mapping_parquet_path,
+                out_parquet=labels_out,
+                duckdb_runtime=args.duckdb_runtime,
+            )
+            logger.info("[Step 2c] walkaway labels written %s", labels_out.resolve())
+
+
+def _maybe_build_training_dataset(args: HighTierTrainArgs) -> None:
+    """Step 3: Feast + labels training Parquet (see ``03_build_training_data``); default on."""
+    if not args.build_training_dataset:
+        return
+    cleaned_bet_path = _hpre.default_cleaned_bet_parquet_path()
+    if not cleaned_bet_path.is_file():
+        logger.warning(
+            "[Step 3] skip training dataset: cleaned bet missing at %s",
+            cleaned_bet_path.resolve(),
+        )
+        return
+    labels_path = args.objective.labels_parquet or default_walkaway_labels_parquet_path()
+    if not labels_path.is_file():
+        logger.warning(
+            "[Step 3] skip training dataset: labels missing at %s (enable walkaway labels or materialize separately)",
+            labels_path.resolve(),
+        )
+        return
+    feast_repo = Path(__file__).resolve().parent / "feast_repo"
+    registry = feast_repo / "data" / "registry.db"
+    if not registry.is_file():
+        logger.warning(
+            "[Step 3] skip training dataset: Feast registry missing at %s (run ``feast apply`` under feast_repo)",
+            registry.resolve(),
+        )
+        return
+    cfg = _b3.BuildTrainingDataArgs(
+        feast_repo=feast_repo.resolve(),
+        cleaned_bet_parquet=cleaned_bet_path.resolve(),
+        labels_parquet=labels_path.resolve(),
+        output_parquet=_b3.DEFAULT_OUTPUT.resolve(),
+        feature_service_name=args.training_feature_service,
+        materialize_derived_features=args.training_materialize_derived,
+        max_entity_rows=None,
+        duckdb_runtime=args.duckdb_runtime,
+    )
+    out = _b3.build_training_data(cfg)
+    logger.info("[Step 3] training dataset written %s", out)
+
 
 def fit_model(args: HighTierTrainArgs) -> None:
     """Train a scorer on the high-tier slice (TODO)."""
@@ -246,6 +324,7 @@ def run_training(args: HighTierTrainArgs) -> None:
     """Run the high-tier training pipeline in order."""
     args.output_dir.mkdir(parents=True, exist_ok=True)
     prepare_training_frame(args)
+    _maybe_build_training_dataset(args)
     fit_model(args)
     write_artifacts(args)
     logger.info("[Step 7] run_training: skeleton finished")
@@ -261,6 +340,30 @@ def _build_argparser() -> argparse.ArgumentParser:
         help=(
             "Bypass preprocess disk caches (session-clean + bet-clean manifests) and recompute those steps. "
             "Heavy IO on large L0; --no-cache is an alternate spelling."
+        ),
+    )
+    p.add_argument(
+        "--skip-walkaway-labels",
+        action="store_true",
+        dest="skip_walkaway_labels",
+        help="Do not materialize walkaway_labels.parquet after cleaned t_bet (large pandas pass).",
+    )
+    p.add_argument(
+        "--skip-training-dataset",
+        action="store_true",
+        dest="skip_training_dataset",
+        help=(
+            "Do not run Step 3 (Feast + labels → artifacts/training_data/training_set.parquet). "
+            "Default is to build the training set after preprocess."
+        ),
+    )
+    p.add_argument(
+        "--skip-training-materialize-derived",
+        action="store_true",
+        dest="skip_training_materialize_derived",
+        help=(
+            "With Step 3 enabled: do not re-materialize trial 1h + slow 180d Parquets before Feast "
+            "(faster when those files are already up to date)."
         ),
     )
     return p
@@ -279,6 +382,9 @@ def main() -> None:
         output_dir=Path(".data") / "trainer_hightier" / "run",
         data_dir=_ingest.default_data_dir(),
         ignore_caches=bool(ns.ignore_caches),
+        materialize_walkaway_labels=not bool(ns.skip_walkaway_labels),
+        build_training_dataset=not bool(ns.skip_training_dataset),
+        training_materialize_derived=not bool(ns.skip_training_materialize_derived),
         duckdb_runtime=duckdb_rt,
         session_preprocess=session_pre,
         bet_preprocess=bet_pre,
