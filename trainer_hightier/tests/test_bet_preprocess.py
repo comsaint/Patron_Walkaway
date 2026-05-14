@@ -375,6 +375,81 @@ def test_preprocess_bet_adt_segment_keeps_only_top_quantile_patrons(registry_pat
     assert int(got.iloc[0]["player_id"]) == 100
 
 
+def test_adt_allowlist_fingerprint_stable_reorder_dup_and_trunc(tmp_path: Path) -> None:
+    """Content hash matches DuckDB DISTINCT BIGINT semantics (order / duplicates / float vs int)."""
+    from trainer_hightier.utils.bet_l0_preprocess import _adt_allowlist_distinct_player_ids_fingerprint
+
+    p1 = tmp_path / "al1.parquet"
+    pd.DataFrame({"player_id": [3, 1, 3, 2]}).to_parquet(p1, index=False)
+    h1, n1 = _adt_allowlist_distinct_player_ids_fingerprint(p1)
+    p2 = tmp_path / "al2.parquet"
+    pd.DataFrame({"player_id": [2, 3, 1]}).to_parquet(p2, index=False)
+    h2, n2 = _adt_allowlist_distinct_player_ids_fingerprint(p2)
+    assert h1 == h2
+    assert n1 == n2 == 3
+
+    p3 = tmp_path / "al3.parquet"
+    pd.DataFrame({"player_id": [42.0, 42]}).to_parquet(p3, index=False)
+    h3, n3 = _adt_allowlist_distinct_player_ids_fingerprint(p3)
+    p_ref = tmp_path / "al_ref.parquet"
+    pd.DataFrame({"player_id": [42]}).to_parquet(p_ref, index=False)
+    href, nref = _adt_allowlist_distinct_player_ids_fingerprint(p_ref)
+    assert n3 == nref == 1
+    assert h3 == href
+
+
+def test_build_bet_clean_adt_record_matches_when_only_profile_csv_differs(
+    registry_path: Path, tmp_path: Path
+) -> None:
+    """ADT bet-cache key uses allowlist player_id set; profile CSV path/content may differ."""
+    profile_a = tmp_path / "profile_a.csv"
+    profile_b = tmp_path / "profile_b.csv"
+    pd.DataFrame([{"canonical_id": "x", "adt": 1.0}]).to_csv(profile_a, index=False)
+    pd.DataFrame([{"canonical_id": "y", "adt": 9.0}]).to_csv(profile_b, index=False)
+    allowed = tmp_path / "allowed.parquet"
+    pd.DataFrame({"player_id": [100, 200]}).to_parquet(allowed, index=False)
+    raw = tmp_path / "gmwds_t_bet.parquet"
+    t_pay = pd.Timestamp("2025-05-27 09:00:00")
+    pq.write_table(
+        pa.Table.from_pandas(
+            pd.DataFrame(
+                [
+                    _bet_row(
+                        bet_id=1,
+                        player_id=100,
+                        payout_complete_dtm=t_pay,
+                        gaming_day=t_pay.date(),
+                        __etl_insert_Dtm=t_pay,
+                    ),
+                ]
+            )
+        ),
+        raw,
+    )
+    rec_a = _hpre.build_bet_clean_cache_record(
+        raw,
+        preprocess_registry_yaml=registry_path,
+        dedup_hash_buckets=2,
+        cleaned_session_parquet=None,
+        adt_filter_quantile=0.99,
+        patron_profile_csv=profile_a,
+        canonical_mapping_parquet=None,
+        adt_allowed_players_parquet=allowed,
+    )
+    rec_b = _hpre.build_bet_clean_cache_record(
+        raw,
+        preprocess_registry_yaml=registry_path,
+        dedup_hash_buckets=2,
+        cleaned_session_parquet=None,
+        adt_filter_quantile=0.99,
+        patron_profile_csv=profile_b,
+        canonical_mapping_parquet=None,
+        adt_allowed_players_parquet=allowed,
+    )
+    assert rec_a == rec_b
+    assert rec_a["adt_segment"]["adt_allowlist_distinct_player_id_count"] == 2
+
+
 def test_trial_bet_behavior_1h_window_counts(tmp_path: Path) -> None:
     """1h RANGE window: prior rows with pcd in [current_pcd - 1h, current_pcd)."""
     from trainer_hightier.utils.trial_bet_behavior_1h import materialize_trial_bet_behavior_1h

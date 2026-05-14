@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import numpy as np
+import pandas as pd
 import pyarrow.parquet as pq
 import yaml
 from trainer.training.data_sources import _BET_INGEST_READ_COLS_ORDERED
@@ -22,7 +24,7 @@ from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas, 
 
 logger = logging.getLogger("trainer_hightier")
 
-_BET_CLEAN_CACHE_MANIFEST_VERSION = 5
+_BET_CLEAN_CACHE_MANIFEST_VERSION = 6
 
 
 def _duckdb_quote_ident(name: str) -> str:
@@ -30,14 +32,58 @@ def _duckdb_quote_ident(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
+def _adt_allowlist_distinct_player_ids_fingerprint(
+    allowlist_parquet: Path,
+) -> tuple[str, int]:
+    """SHA-256 over sorted distinct allowlist ``player_id`` values (DuckDB BIGINT semantics).
+
+    Mirrors the early-join CTE:
+    ``SELECT DISTINCT TRY_CAST(player_id AS BIGINT) ... WHERE ... IS NOT NULL``.
+
+    Parameters
+    ----------
+    allowlist_parquet
+        ADT allowlist Parquet path; must contain a ``player_id`` column.
+
+    Returns
+    -------
+    tuple[str, int]
+        ``(sha256_hex, distinct_player_id_count)``.
+    """
+    ap = Path(allowlist_parquet).resolve()
+    if not ap.is_file():
+        raise FileNotFoundError(ap)
+    names = frozenset(pq.read_schema(ap).names)
+    if "player_id" not in names:
+        raise ValueError(
+            "ADT allowlist Parquet missing player_id column "
+            f"(need early-join column set); got {sorted(names)}"
+        )
+    tbl = pq.read_table(ap, columns=["player_id"])
+    series = tbl.column(0).combine_chunks().to_pandas()
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    if numeric.empty:
+        uniq = np.array([], dtype=np.int64)
+    else:
+        as_float = numeric.to_numpy(dtype=np.float64, copy=False)
+        as_bigint = np.trunc(as_float).astype(np.int64, copy=False)
+        uniq = np.unique(as_bigint)
+    payload_gen = (str(int(x)).encode("ascii") for x in uniq.tolist())
+    payload = b"\n".join(payload_gen)
+    digest = hashlib.sha256(payload).hexdigest()
+    return digest, int(uniq.size)
+
+
 def _adt_segment_cache_block(
     *,
     quantile: float | None,
-    patron_profile_csv: Path | None,
-    canonical_mapping_parquet: Path | None,
     adt_allowed_players_parquet: Path | None,
 ) -> dict[str, Any] | None:
-    """Fingerprint fragment for ADT-based bet segmentation (optional)."""
+    """Fingerprint fragment for ADT-based bet segmentation (optional).
+
+    Uses **content** of the allowlist Parquet (distinct ``player_id`` set), not upstream CSV/Parquet mtimes,
+    so regenerating ``canonical_patron_profile.csv`` without changing the allowlist does not invalidate bet cache.
+    """
     if quantile is None:
         return None
     qf = float(quantile)
@@ -51,19 +97,12 @@ def _adt_segment_cache_block(
     ap_f = Path(adt_allowed_players_parquet).resolve()
     if not ap_f.is_file():
         raise FileNotFoundError(f"ADT allowlist Parquet missing for bet cache fingerprint: {ap_f}")
-    block: dict[str, Any] = {
+    digest, n_ids = _adt_allowlist_distinct_player_ids_fingerprint(ap_f)
+    return {
         "quantile": qf,
-        "adt_allowed_players_parquet": _registry_stat_dict(ap_f),
+        "adt_allowlist_player_ids_sha256_hex": digest,
+        "adt_allowlist_distinct_player_id_count": n_ids,
     }
-    if patron_profile_csv is not None:
-        pf = Path(patron_profile_csv).resolve()
-        if pf.is_file():
-            block["profile_csv"] = _registry_stat_dict(pf)
-    if canonical_mapping_parquet is not None:
-        mf = Path(canonical_mapping_parquet).resolve()
-        if mf.is_file():
-            block["canonical_mapping_parquet"] = _registry_stat_dict(mf)
-    return block
 
 
 def _resolve_adt_allowed_players_posix(cfg: BetPreprocessConfig) -> str | None:
@@ -527,7 +566,12 @@ def build_bet_clean_cache_record(
     canonical_mapping_parquet: Path | None = None,
     adt_allowed_players_parquet: Path | None = None,
 ) -> dict[str, Any]:
-    """Fingerprint for cleaned bet parquet cache (registry + optional cleaned session binding)."""
+    """Fingerprint for cleaned bet parquet cache (registry + optional cleaned session binding).
+
+    When ``adt_filter_quantile`` is set, the ADT fragment fingerprints **distinct ``player_id`` in the
+    allowlist Parquet** (content hash). ``patron_profile_csv`` / ``canonical_mapping_parquet`` are accepted
+    for API compatibility but **do not** affect the fingerprint.
+    """
     src = Path(source_bet_parquet).resolve()
     if not src.is_file():
         raise FileNotFoundError(src)
@@ -561,8 +605,6 @@ def build_bet_clean_cache_record(
         rec["cleaned_session_dependency"] = dep
     seg = _adt_segment_cache_block(
         quantile=adt_filter_quantile,
-        patron_profile_csv=patron_profile_csv,
-        canonical_mapping_parquet=canonical_mapping_parquet,
         adt_allowed_players_parquet=adt_allowed_players_parquet,
     )
     if seg is not None:
