@@ -146,6 +146,8 @@ class HighTierTrainArgs:
     training_materialize_derived: bool = True
     # Feast feature service for Step 3 (default matches ``03_build_training_data``).
     training_feature_service: str = "walkaway_bet_trial_v1"
+    # When False: skip month×group Feast disk cache in Step 3 (always full retrieval per month).
+    feast_retrieval_cache: bool = True
     # Partition snapshot folder (YYYYMM parquet shards): inventory manifest + recompute bookkeeping.
     # When ``None``, defaults to ``<repo>/data/partitions`` and must exist.
     partition_snapshot_dir: Path | None = None
@@ -548,6 +550,7 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs) -> None:
         duckdb_runtime=args.duckdb_runtime,
         feast_entity_batch_by_calendar_month=True,
         training_set_keep_last_n_versions=10,
+        feast_retrieval_cache_enabled=bool(args.feast_retrieval_cache) and not bool(args.ignore_caches),
     )
     out = _b3.build_training_data(cfg)
     logger.info("[Step 3] training dataset written %s", out)
@@ -631,6 +634,15 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--disable-feast-retrieval-cache",
+        action="store_true",
+        dest="disable_feast_retrieval_cache",
+        help=(
+            "With Step 3 + month-batch Feast: do not reuse per-month per-feature-group cached Parquets; "
+            "each month runs a single combined feature service retrieval (heavy). Ignored when --ignore-caches is set."
+        ),
+    )
+    p.add_argument(
         "--no-partition-snapshot",
         action="store_true",
         dest="no_partition_snapshot",
@@ -698,6 +710,7 @@ def main() -> None:
         materialize_walkaway_labels=not bool(ns.skip_walkaway_labels),
         build_training_dataset=not bool(ns.skip_training_dataset),
         training_materialize_derived=not bool(ns.skip_training_materialize_derived),
+        feast_retrieval_cache=not bool(ns.disable_feast_retrieval_cache),
         duckdb_runtime=duckdb_rt,
         session_preprocess=session_pre,
         bet_preprocess=bet_pre,

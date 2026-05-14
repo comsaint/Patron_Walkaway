@@ -173,3 +173,15 @@ walkaway_bet_v1 = FeatureService(
     name="walkaway_bet_v1",
     features=[cleaned_bet_features],
 )
+
+# Subset services for independent offline retrieval + disk cache keys (Step 3 decomposed path).
+# After editing this file, run ``feast apply`` from ``trainer_hightier/feast_repo``.
+walkaway_bet_trial_clock_v1 = FeatureService(
+    name="walkaway_bet_trial_clock_v1",
+    features=[trial_bet_behavior_1h_features],
+)
+
+walkaway_bet_slow_snap_v1 = FeatureService(
+    name="walkaway_bet_slow_snap_v1",
+    features=[slow_patron_180d_monthly_features],
+)
