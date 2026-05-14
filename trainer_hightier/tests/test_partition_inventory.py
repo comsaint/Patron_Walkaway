@@ -40,6 +40,19 @@ def test_scan_partition_snapshot_lists_sorted_months(tmp_path: Path) -> None:
     assert [x.yyyymm for x in sess] == ["202401"]
 
 
+def test_scan_partition_snapshot_supports_nested_export_subdirs(tmp_path: Path) -> None:
+    d = tmp_path / "snap"
+    nested = d / "20260512"
+    nested.mkdir(parents=True)
+    (nested / "t_bet__part_202401.parquet").write_bytes(_tiny_parquet_bytes())
+    (nested / "t_session__part_202401.parquet").write_bytes(_tiny_parquet_bytes())
+    bets, sess = scan_partition_snapshot_dir(d)
+    assert len(bets) == 1
+    assert len(sess) == 1
+    assert bets[0].yyyymm == "202401"
+    assert sess[0].yyyymm == "202401"
+
+
 def test_compute_recompute_first_run_all_months(tmp_path: Path) -> None:
     d = tmp_path / "snap"
     d.mkdir()

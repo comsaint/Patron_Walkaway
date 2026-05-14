@@ -178,7 +178,7 @@ def _duckdb_read_parquet_array_sql(paths: list[Path]) -> str:
     for p in paths:
         esc = _path_posix(Path(p).resolve()).replace("'", "''")
         parts.append(f"'{esc}'")
-    return "read_parquet([" + ", ".join(parts) + "]"
+    return "read_parquet([" + ", ".join(parts) + "])"
 
 
 def _duckdb_session_clean_pipeline_select_sql(

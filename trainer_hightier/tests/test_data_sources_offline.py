@@ -90,3 +90,22 @@ def test_validate_offline_reports_missing_required_column(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="missing columns"):
         validate_offline_inputs_or_raise(paths)
+
+
+def test_validate_partition_session_ingress_or_raise_ok(tmp_path) -> None:
+    shard = tmp_path / "t_session__part_202501.parquet"
+    sess_df = pd.DataFrame(
+        {c: pd.Series([], dtype="float64") for c in ds._REQUIRED_SESSION_PARQUET_COLS}
+    )
+    sess_df.to_parquet(shard, index=False)
+    rep = ds.validate_partition_session_ingress_or_raise((shard,))
+    assert rep.session.num_rows == 0
+    assert rep.missing_required_session_cols == ()
+
+
+def test_validate_partition_bet_ingress_or_raise_ok(tmp_path) -> None:
+    shard = tmp_path / "t_bet__part_202501.parquet"
+    bet_df = pd.DataFrame({c: pd.Series([], dtype="float64") for c in ds._REQUIRED_BET_PARQUET_COLS})
+    bet_df.to_parquet(shard, index=False)
+    rep = ds.validate_partition_bet_ingress_or_raise((shard,))
+    assert rep.num_rows == 0

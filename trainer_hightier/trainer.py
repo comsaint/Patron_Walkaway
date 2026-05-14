@@ -125,7 +125,6 @@ class HighTierTrainArgs:
     """Programmatic run configuration for :func:`run_training` (defaults + optional overrides)."""
 
     output_dir: Path
-    data_dir: Path = field(default_factory=_ingest.default_data_dir)
     random_seed: int = 42
     objective: HighTierObjectiveConfig = field(default_factory=HighTierObjectiveConfig)
     # When True: skip all preprocess disk-cache short-circuits (session-clean + bet-clean manifests).
@@ -147,10 +146,8 @@ class HighTierTrainArgs:
     # Feast feature service for Step 3 (default matches ``03_build_training_data``).
     training_feature_service: str = "walkaway_bet_trial_v1"
     # Partition snapshot folder (YYYYMM parquet shards): inventory manifest + recompute bookkeeping.
-    # When ``partition_snapshot_dir`` is ``None`` and ``partition_snapshot_disable_default_dir`` is False,
-    # :func:`prepare_training_frame` requires ``<repo>/data/partitions`` (raises if missing).
+    # When ``None``, defaults to ``<repo>/data/partitions`` and must exist.
     partition_snapshot_dir: Path | None = None
-    partition_snapshot_disable_default_dir: bool = False
     # Explicit baseline JSON for inventory diff; when ``None``, auto-pick same-snapshot manifest if present.
     partition_inventory_previous_manifest: Path | None = None
     partition_correction_months: tuple[str, ...] = ()
@@ -158,12 +155,17 @@ class HighTierTrainArgs:
 
 
 def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None) -> None:
-    """Ingest offline Parquet (presence + schema QC); full-session preprocess to cleaned table."""
-    pq_paths = _ingest.resolve_local_parquet_paths(args.data_dir)
-    sess_report = _ingest.validate_session_ingress_or_raise(pq_paths)
-    logger.info(
-        "[Step 1] t_session Parquet OK: %s rows (metadata); t_bet deferred until after session clean / downstream",
-        sess_report.session.num_rows,
+    """Ingest partition shards (schema QC) then build cleaned session/bet artifacts."""
+    from trainer_hightier.utils.partition_inventory import (
+        expect_default_partition_snapshot_dir,
+        expect_existing_partition_snapshot_dir,
+        resolve_partition_inventory_previous_for_run,
+    )
+
+    snap_dir: Path = (
+        expect_default_partition_snapshot_dir()
+        if args.partition_snapshot_dir is None
+        else expect_existing_partition_snapshot_dir(args.partition_snapshot_dir)
     )
 
     inv_fp: str | None = None
@@ -172,46 +174,40 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
     recompute_months: list[str] = []
     manifests_dir = Path(__file__).resolve().parent / "artifacts" / "manifests"
 
-    from trainer_hightier.utils.partition_inventory import (
-        expect_default_partition_snapshot_dir,
-        expect_existing_partition_snapshot_dir,
-        resolve_partition_inventory_previous_for_run,
+    baseline_used = resolve_partition_inventory_previous_for_run(
+        manifests_dir=manifests_dir,
+        snapshot_dir=snap_dir,
+        explicit_previous=args.partition_inventory_previous_manifest,
+    )
+    logger.info(
+        "[Step 1b] partition snapshot dir=%s inventory baseline=%s",
+        snap_dir.resolve(),
+        baseline_used.resolve() if baseline_used is not None else None,
+    )
+    inv_fp, bet_partition_paths, session_partition_paths, recompute_months = _materialize_partition_inventory(
+        manifests_dir=manifests_dir,
+        correction_months=args.partition_correction_months,
+        backfill_month_count=args.partition_backfill_month_count,
+        previous_manifest_path=baseline_used,
+        snapshot_dir=snap_dir,
     )
 
-    snap_dir = args.partition_snapshot_dir
-    if snap_dir is None and not args.partition_snapshot_disable_default_dir:
-        snap_dir = expect_default_partition_snapshot_dir()
-    elif snap_dir is not None:
-        snap_dir = expect_existing_partition_snapshot_dir(snap_dir)
-    baseline_used: Path | None = None
-    if snap_dir is not None:
-        baseline_used = resolve_partition_inventory_previous_for_run(
-            manifests_dir=manifests_dir,
-            snapshot_dir=snap_dir,
-            explicit_previous=args.partition_inventory_previous_manifest,
-        )
-        logger.info(
-            "[Step 1b] partition snapshot dir=%s inventory baseline=%s",
-            snap_dir.resolve(),
-            baseline_used.resolve() if baseline_used is not None else None,
-        )
-        inv_fp, bet_partition_paths, session_partition_paths, recompute_months = _materialize_partition_inventory(
-            manifests_dir=manifests_dir,
-            correction_months=args.partition_correction_months,
-            backfill_month_count=args.partition_backfill_month_count,
-            previous_manifest_path=baseline_used,
-            snapshot_dir=snap_dir,
-        )
+    sess_report = _ingest.validate_partition_session_ingress_or_raise(session_partition_paths)
+    logger.info(
+        "[Step 1] t_session partition shards OK: %d file(s), %s rows (metadata); "
+        "t_bet deferred until after session clean / downstream",
+        len(session_partition_paths),
+        sess_report.session.num_rows,
+    )
 
-    root_sess = Path(pq_paths.session_parquet).resolve()
-    session_extras = tuple(p for p in session_partition_paths if Path(p).resolve() != root_sess)
-    root_bet = Path(pq_paths.bet_parquet).resolve()
-    bet_extras = tuple(p for p in bet_partition_paths if Path(p).resolve() != root_bet)
+    ordered_sess = tuple(sorted((Path(p).resolve() for p in session_partition_paths), key=str))
+    session_primary = ordered_sess[0]
+    session_extras = ordered_sess[1:]
 
     cleaned_path = _hpre.default_cleaned_session_parquet_path()
     use_preprocess_caches = not args.ignore_caches
     ses_cache_ok = use_preprocess_caches and _hpre.session_clean_cache_is_hit(
-        pq_paths.session_parquet,
+        session_primary,
         cleaned_path,
         dedup_hash_buckets=args.session_preprocess.dedup_hash_buckets,
         extra_source_session_parquets=session_extras or None,
@@ -221,9 +217,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         metrics["session_clean_cache_hit"] = bool(ses_cache_ok)
         metrics["partition_inventory_fingerprint_sha256_hex"] = inv_fp
         metrics["partition_recompute_months"] = list(recompute_months)
-        metrics["partition_snapshot_dir_effective"] = (
-            str(snap_dir.resolve()) if snap_dir is not None else None
-        )
+        metrics["partition_snapshot_dir_effective"] = str(snap_dir.resolve())
         metrics["partition_inventory_baseline_path"] = (
             str(baseline_used.resolve()) if baseline_used is not None else None
         )
@@ -234,14 +228,14 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         )
     else:
         out_parquet = _hpre.preprocess_sessions_from_parquet_streaming(
-            pq_paths.session_parquet,
+            session_primary,
             cleaned_path,
             cfg=args.session_preprocess,
             duckdb_runtime=args.duckdb_runtime,
             extra_partition_sources=session_extras or None,
         )
         _hpre.write_session_clean_cache_manifest(
-            pq_paths.session_parquet,
+            session_primary,
             out_parquet,
             dedup_hash_buckets=args.session_preprocess.dedup_hash_buckets,
             extra_source_session_parquets=session_extras or None,
@@ -265,7 +259,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
     want_adt_bets = (
         args.filter_bets_by_adt_quantile
         and not args.skip_bet_preprocess
-        and pq_paths.bet_parquet.is_file()
+        and bool(bet_partition_paths)
         and 0.0 < q_thr < 1.0
     )
 
@@ -313,14 +307,22 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
             adt_allowed_players_parquet=allowed_players_pq,
         )
 
-    if not args.skip_bet_preprocess and pq_paths.bet_parquet.is_file():
-        _ingest.validate_bet_ingress_or_raise(pq_paths)
+    if not args.skip_bet_preprocess and bet_partition_paths:
+        bet_report = _ingest.validate_partition_bet_ingress_or_raise(bet_partition_paths)
+        logger.info(
+            "[Step 1] t_bet partition shards OK: %d file(s), %s rows (metadata)",
+            len(bet_partition_paths),
+            bet_report.num_rows,
+        )
+        ordered_bets = tuple(sorted((Path(p).resolve() for p in bet_partition_paths), key=str))
+        bet_primary = ordered_bets[0]
+        bet_extras = ordered_bets[1:]
         reg_yaml = (
             Path(args.bet_preprocess.preprocess_registry_yaml)
             if args.bet_preprocess.preprocess_registry_yaml is not None
             else _hpre.default_preprocess_registry_yaml_path()
         )
-        merged_bet_sources = _hbet.merge_bet_source_paths(pq_paths.bet_parquet, bet_extras or None)
+        merged_bet_sources = _hbet.merge_bet_source_paths(bet_primary, bet_extras or None)
         base_bet_cfg = replace(
             effective_bet_cfg,
             adt_filter_quantile=None,
@@ -340,7 +342,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 partition_inventory_fingerprint_sha256_hex=inv_fp,
             )
             seg_hit = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
-                pq_paths.bet_parquet,
+                bet_primary,
                 cleaned_bet_path,
                 preprocess_registry_yaml=reg_yaml,
                 dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
@@ -372,7 +374,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 )
                 if not base_hit:
                     _hpre.preprocess_bets_from_parquet_streaming(
-                        pq_paths.bet_parquet,
+                        bet_primary,
                         base_bet_path,
                         cfg=base_bet_cfg,
                         duckdb_runtime=args.duckdb_runtime,
@@ -393,7 +395,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     duckdb_runtime=args.duckdb_runtime,
                 )
                 _hbet.write_bet_clean_cache_manifest(
-                    pq_paths.bet_parquet,
+                    bet_primary,
                     cleaned_bet_path,
                     preprocess_registry_yaml=reg_yaml,
                     dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
@@ -416,7 +418,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 )
         else:
             bet_cache_ok = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
-                pq_paths.bet_parquet,
+                bet_primary,
                 cleaned_bet_path,
                 preprocess_registry_yaml=reg_yaml,
                 dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
@@ -437,14 +439,14 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 )
             else:
                 out_b = _hpre.preprocess_bets_from_parquet_streaming(
-                    pq_paths.bet_parquet,
+                    bet_primary,
                     cleaned_bet_path,
                     cfg=effective_bet_cfg,
                     duckdb_runtime=args.duckdb_runtime,
                     extra_partition_sources=bet_extras_arg,
                 )
                 _hbet.write_bet_clean_cache_manifest(
-                    pq_paths.bet_parquet,
+                    bet_primary,
                     out_b,
                     preprocess_registry_yaml=reg_yaml,
                     dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
@@ -462,18 +464,20 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     n_b,
                     out_b,
                 )
-    elif pq_paths.bet_parquet.is_file() and args.skip_bet_preprocess:
-        logger.info("[Step 2b] bet preprocess skipped (skip_bet_preprocess=True); %s", pq_paths.bet_parquet)
+    elif bet_partition_paths and args.skip_bet_preprocess:
+        logger.info(
+            "[Step 2b] bet preprocess skipped (skip_bet_preprocess=True); %d bet shard(s) available",
+            len(bet_partition_paths),
+        )
     else:
         logger.info(
-            "[Step 2b] no %s; skip bet preprocess",
-            pq_paths.bet_parquet.name,
+            "[Step 2b] no t_bet partition shards found under snapshot dir; skip bet preprocess",
         )
 
     if (
         args.materialize_walkaway_labels
         and not args.skip_bet_preprocess
-        and pq_paths.bet_parquet.is_file()
+        and bool(bet_partition_paths)
         and cleaned_bet_path.is_file()
     ):
         if not mapping_parquet_path.is_file():
@@ -605,8 +609,8 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         dest="no_partition_snapshot",
         help=(
-            "Do not merge monthly shard Parquets: do not use <repo>/data/partitions or "
-            "--partition-snapshot-dir. For monolith-only runs (gmwds_t_*.parquet only)."
+            "Deprecated in partition-only mode. This pipeline now requires partition shards; "
+            "do not set this flag."
         ),
     )
     p.add_argument(
@@ -615,7 +619,7 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Folder with t_bet__part_* / t_session__part_* monthly Parquets. "
-            "When omitted (and not --no-partition-snapshot), <repo>/data/partitions must exist or the run fails. "
+            "When omitted, <repo>/data/partitions must exist or the run fails. "
             "When set, this directory is used instead of the default path."
         ),
     )
@@ -655,11 +659,15 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
     ns = _build_argparser().parse_args()
+    if bool(ns.no_partition_snapshot):
+        raise ValueError(
+            "--no-partition-snapshot is no longer supported: trainer_hightier is now partition-only. "
+            "Provide --partition-snapshot-dir, or omit it to use <repo>/data/partitions."
+        )
     duckdb_rt, session_pre, bet_pre = configs_from_run_profile(get_run_profile(DEFAULT_RUN_PROFILE_NAME))
     corr = tuple(str(x).strip() for x in (ns.partition_correction_months or []) if str(x).strip())
     args = HighTierTrainArgs(
         output_dir=Path(".data") / "trainer_hightier" / "run",
-        data_dir=_ingest.default_data_dir(),
         ignore_caches=bool(ns.ignore_caches),
         materialize_walkaway_labels=not bool(ns.skip_walkaway_labels),
         build_training_dataset=not bool(ns.skip_training_dataset),
@@ -668,7 +676,6 @@ def main() -> None:
         session_preprocess=session_pre,
         bet_preprocess=bet_pre,
         partition_snapshot_dir=Path(ns.partition_snapshot_dir).resolve() if ns.partition_snapshot_dir else None,
-        partition_snapshot_disable_default_dir=bool(ns.no_partition_snapshot),
         partition_inventory_previous_manifest=(
             Path(ns.partition_inventory_previous).resolve() if ns.partition_inventory_previous else None
         ),

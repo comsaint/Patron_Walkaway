@@ -242,6 +242,71 @@ def parquet_inspect_summary(path: Path) -> ParquetInspectSummary:
     return ParquetInspectSummary(path=path.resolve(), num_rows=nrows, column_names=names)
 
 
+def _partition_ingress_summary(
+    paths: tuple[Path, ...],
+    *,
+    required_cols: tuple[str, ...],
+    role_name: str,
+) -> ParquetInspectSummary:
+    """Validate one partition shard set and return aggregated metadata summary."""
+    if not paths:
+        raise FileNotFoundError(
+            f"Partition ingress requires at least one {role_name} shard "
+            f"(expected {role_name}__part_YYYYMM.parquet)."
+        )
+    ordered = tuple(sorted((Path(p).resolve() for p in paths), key=str))
+    for p in ordered:
+        if not p.is_file():
+            raise FileNotFoundError(p)
+    s0 = parquet_inspect_summary(ordered[0])
+    missing = tuple(c for c in required_cols if c not in s0.column_names)
+    if missing:
+        raise ValueError(
+            f"Offline {role_name} schema QC failed: first shard missing columns: "
+            + ", ".join(missing)
+        )
+    cols0 = s0.column_names
+    total_rows = int(s0.num_rows) if s0.num_rows is not None else 0
+    for p in ordered[1:]:
+        sn = parquet_inspect_summary(p)
+        if sn.column_names != cols0:
+            raise ValueError(
+                f"Offline {role_name} partition schema mismatch vs first shard {ordered[0].name}: "
+                f"extra={sorted(sn.column_names - cols0)!r} "
+                f"missing={sorted(cols0 - sn.column_names)!r} in {p.name}"
+            )
+        if sn.num_rows is not None:
+            total_rows += int(sn.num_rows)
+    return ParquetInspectSummary(
+        path=ordered[0],
+        num_rows=total_rows if total_rows > 0 else s0.num_rows,
+        column_names=cols0,
+    )
+
+
+def validate_partition_session_ingress_or_raise(
+    partition_session_paths: tuple[Path, ...],
+) -> SessionIngressReport:
+    """Partition-first Step 1 QC for session shards only (no monolith lookup)."""
+    summary = _partition_ingress_summary(
+        partition_session_paths,
+        required_cols=_REQUIRED_SESSION_PARQUET_COLS,
+        role_name="t_session",
+    )
+    return SessionIngressReport(session=summary, missing_required_session_cols=())
+
+
+def validate_partition_bet_ingress_or_raise(
+    partition_bet_paths: tuple[Path, ...],
+) -> ParquetInspectSummary:
+    """Partition-first QC for bet shards only (schema + metadata, no row scan)."""
+    return _partition_ingress_summary(
+        partition_bet_paths,
+        required_cols=_REQUIRED_BET_PARQUET_COLS,
+        role_name="t_bet",
+    )
+
+
 def run_offline_schema_quality_checks_session_first(
     paths: LocalParquetPaths,
 ) -> SessionIngressReport:

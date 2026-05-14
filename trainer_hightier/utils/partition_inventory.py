@@ -55,21 +55,24 @@ def _stat_one_parquet(path: Path, role: str, month_extractor: re.Pattern[str]) -
 
 
 def scan_partition_snapshot_dir(snapshot_dir: Path) -> tuple[list[PartitionParquetStat], list[PartitionParquetStat]]:
-    """List bet and session partition parquets under a snapshot folder (sorted by month)."""
+    """List bet/session partition Parquets under a snapshot folder recursively.
+
+    Supports both flat exports and dated subfolders such as ``partitions/20260512/...``.
+    """
     root = Path(snapshot_dir).resolve()
     if not root.is_dir():
         raise NotADirectoryError(root)
     bet_stats: list[PartitionParquetStat] = []
     sess_stats: list[PartitionParquetStat] = []
-    for child in sorted(root.iterdir()):
-        if not child.is_file() or not child.suffix.lower() == ".parquet":
+    for child in sorted(root.rglob("*.parquet")):
+        if not child.is_file():
             continue
         if child.name.startswith("t_bet__part_"):
             bet_stats.append(_stat_one_parquet(child, "t_bet", _PART_MONTH_RE_BET))
         elif child.name.startswith("t_session__part_"):
             sess_stats.append(_stat_one_parquet(child, "t_session", _PART_MONTH_RE_SESSION))
-    bet_stats.sort(key=lambda x: x.yyyymm)
-    sess_stats.sort(key=lambda x: x.yyyymm)
+    bet_stats.sort(key=lambda x: (x.yyyymm, str(x.path)))
+    sess_stats.sort(key=lambda x: (x.yyyymm, str(x.path)))
     return bet_stats, sess_stats
 
 
