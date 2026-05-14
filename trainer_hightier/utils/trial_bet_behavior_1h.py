@@ -9,6 +9,11 @@ import pyarrow.parquet as pq
 
 from trainer_hightier.config import DuckDbRuntimeConfig
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
+from trainer_hightier.utils.bet_l0_preprocess import (
+    cleaned_bet_dataset_has_any_parquet,
+    first_parquet_under_for_schema,
+    resolved_cleaned_bet_read_parquet_sql,
+)
 
 
 def default_trial_bet_behavior_1h_parquet_path(*, repo_root: Path | None = None) -> Path:
@@ -21,7 +26,7 @@ def default_trial_bet_behavior_1h_parquet_path(*, repo_root: Path | None = None)
 def default_cleaned_bet_parquet_path(*, repo_root: Path | None = None) -> Path:
     """Default cleaned bet input (same default as Feast ``definitions.py``)."""
     base_repo = Path(__file__).resolve().parents[2] if repo_root is None else repo_root
-    return (base_repo / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet.parquet").resolve()
+    return (base_repo / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet").resolve()
 
 
 def _path_posix(path: Path) -> str:
@@ -52,7 +57,7 @@ def materialize_trial_bet_behavior_1h(
         ValueError: If required columns are missing (see error message).
     """
     src = Path(cleaned_bet_parquet or default_cleaned_bet_parquet_path()).resolve()
-    if not src.is_file():
+    if not (src.is_file() or cleaned_bet_dataset_has_any_parquet(src)):
         raise FileNotFoundError(f"cleaned bet parquet not found: {src}")
     dst = Path(out_parquet or default_trial_bet_behavior_1h_parquet_path()).resolve()
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -67,12 +72,12 @@ def materialize_trial_bet_behavior_1h(
         "prediction_visible_ts_cf",
         "__etl_insert_Dtm_synthetic",
     )
-    cols = set(pq.read_schema(src).names)
+    cols = set(pq.read_schema(first_parquet_under_for_schema(src)).names)
     missing = tuple(c for c in need if c not in cols)
     if missing:
         raise ValueError(f"cleaned bet missing columns {list(missing)}; got {sorted(cols)}")
 
-    src_esc = _path_posix(src).replace("'", "''")
+    bet_from = resolved_cleaned_bet_read_parquet_sql(src)
     dst_esc = _path_posix(dst).replace("'", "''")
     inner = f"""
 WITH src AS (
@@ -85,7 +90,7 @@ WITH src AS (
     TRY_CAST("payout_odds" AS DOUBLE) AS "payout_odds",
     CAST("prediction_visible_ts_cf" AS TIMESTAMPTZ) AS "prediction_visible_ts_cf",
     CAST("__etl_insert_Dtm_synthetic" AS TIMESTAMPTZ) AS "__etl_insert_Dtm_synthetic"
-  FROM read_parquet('{src_esc}')
+  FROM {bet_from} AS _bet_in
   WHERE TRY_CAST("player_id" AS BIGINT) IS NOT NULL
     AND TRY_CAST("bet_id" AS DOUBLE) IS NOT NULL
     AND "payout_complete_dtm" IS NOT NULL
