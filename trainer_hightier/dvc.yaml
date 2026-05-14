@@ -1,0 +1,29 @@
+---
+# Offline trainer_hightier stages (adapt paths to local data availability).
+vars:
+  - SKIP_DATASET_FLAG: "--skip-training-dataset"
+
+stages:
+  preprocess_skeleton:
+    cmd: python trainer.py ${SKIP_DATASET_FLAG}
+    deps:
+      - trainer.py
+      - 02_preprocess.py
+      - utils
+      - ../schema/preprocess_l0_data_contract_registry.yaml
+      - ../data/gmwds_t_session.parquet
+      - ../data/gmwds_t_bet.parquet
+    outs:
+      - artifacts/cleaned
+      - artifacts/manifests
+      - artifacts/mapping
+
+  training_dataset_build:
+    cmd: python 03_build_training_data.py --materialize-derived --feast-batch-by-month
+    deps:
+      - 03_build_training_data.py
+      - preprocess_skeleton
+      - feast_repo/data/registry.db
+    outs:
+      - artifacts/feast
+      - artifacts/training_data

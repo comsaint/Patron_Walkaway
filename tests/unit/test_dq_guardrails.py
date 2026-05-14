@@ -334,5 +334,29 @@ class TestR1205ConfigCommentFreshness(unittest.TestCase):
         )
 
 
+class TestTrainerHightierUncheckedGlobalRankingSQL(unittest.TestCase):
+    """Block cohort-global percentile / rank SQL idioms inside ``trainer_hightier/utils`` (light scan)."""
+
+    _FORBIDDEN = re.compile(
+        r"\b(?:percent_rank|cume_dist|ntile)(\s*\()",
+        re.IGNORECASE,
+    )
+
+    def test_utils_py_files_avoid_percent_rank_patterns(self):
+        root = pathlib.Path(__file__).resolve().parents[2] / "trainer_hightier" / "utils"
+        self.assertTrue(root.is_dir(), f"missing trainer_hightier/utils: {root}")
+        offenders: list[str] = []
+        for path in sorted(root.glob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            if self._FORBIDDEN.search(text):
+                offenders.append(path.name)
+        self.assertFalse(
+            offenders,
+            "Forbidden cohort-global window ranking primitives in trainer_hightier/utils/*.py "
+            "(add reviewer allowlist workflow before introducing percent_rank/cume_dist/ntile patterns): "
+            + ", ".join(offenders),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

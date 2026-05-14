@@ -34,11 +34,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
+import tempfile
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import duckdb
+import pyarrow.parquet as pq
 
 from trainer_hightier.config import DuckDbRuntimeConfig, configs_from_run_profile, get_run_profile
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
@@ -81,6 +85,8 @@ class BuildTrainingDataArgs:
     materialize_derived_features: bool
     max_entity_rows: int | None
     duckdb_runtime: DuckDbRuntimeConfig
+    feast_entity_batch_by_calendar_month: bool = False
+    training_set_keep_last_n_versions: int = 10
 
 
 def _validate_prereqs(
@@ -136,16 +142,62 @@ def _maybe_materialize_derived(cfg: BuildTrainingDataArgs) -> None:
     materialize_slow_patron_180d_monthly(duckdb_runtime=cfg.duckdb_runtime)
 
 
+def _add_one_month_calendar(d: date) -> date:
+    """First day of following calendar month (``d`` is expected month-start date)."""
+    y, m = d.year, d.month
+    if m == 12:
+        return date(y + 1, 1, 1)
+    return date(y, m + 1, 1)
+
+
+def _prediction_visible_month_starts(cleaned_bet: Path, *, duckdb_runtime: DuckDbRuntimeConfig) -> list[date]:
+    """Distinct calendar months (UTC TIMESTAMP cast) covering ``prediction_visible_ts_cf``."""
+    bet_esc = _path_posix(cleaned_bet).replace("'", "''")
+    sql = f"""
+SELECT CAST(DATE_TRUNC('month', CAST(prediction_visible_ts_cf AS TIMESTAMP)) AS DATE) AS m
+FROM read_parquet('{bet_esc}')
+WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+  AND prediction_visible_ts_cf IS NOT NULL
+GROUP BY 1 ORDER BY 1
+""".strip()
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        rows = con.execute(sql).fetchall()
+    finally:
+        con.close()
+    out: list[date] = []
+    for r in rows:
+        if not r or r[0] is None:
+            continue
+        raw = r[0]
+        if isinstance(raw, date):
+            out.append(raw)
+        else:
+            out.append(datetime.fromisoformat(str(raw)).date())
+    return out
+
+
 def _write_entity_parquet(
     cleaned_bet: Path,
     entity_out: Path,
     *,
     duckdb_runtime: DuckDbRuntimeConfig,
     max_rows: int | None,
-) -> None:
+    month_start: date | None = None,
+    month_end_exclusive: date | None = None,
+) -> int:
     bet_esc = _path_posix(cleaned_bet).replace("'", "''")
     ent_esc = _path_posix(entity_out).replace("'", "''")
     lim = f"LIMIT {int(max_rows)}" if max_rows is not None else ""
+    filt = ""
+    if month_start is not None and month_end_exclusive is not None:
+        ms = month_start.isoformat()
+        me = month_end_exclusive.isoformat()
+        filt = (
+            f"\n    AND CAST(prediction_visible_ts_cf AS TIMESTAMP) >= TIMESTAMP '{ms}' "
+            f"AND CAST(prediction_visible_ts_cf AS TIMESTAMP) < TIMESTAMP '{me}'"
+        )
     sql = f"""
 COPY (
   SELECT
@@ -154,15 +206,71 @@ COPY (
   FROM read_parquet('{bet_esc}')
   WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
     AND prediction_visible_ts_cf IS NOT NULL
+    {filt}
   {lim}
 ) TO '{ent_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
 """.strip()
+    Path(entity_out).parent.mkdir(parents=True, exist_ok=True)
+    if Path(entity_out).is_file():
+        Path(entity_out).unlink()
     con = duckdb.connect(database=":memory:")
     try:
         apply_duckdb_runtime_pragmas(con, duckdb_runtime)
         con.execute(sql)
     finally:
         con.close()
+    ent_path = Path(entity_out)
+    if not ent_path.is_file():
+        return 0
+    meta = pq.ParquetFile(ent_path).metadata
+    return int(meta.num_rows) if meta is not None else 0
+
+
+def _duckdb_union_parquet_into(
+    parquet_inputs: list[Path],
+    target: Path,
+    *,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> None:
+    """Concat multiple Parquets with identical schema into ``target`` (DuckDB ``read_parquet`` list)."""
+
+    if not parquet_inputs:
+        raise ValueError("duckdb_union: parquet_inputs must not be empty")
+    targ = Path(target).resolve()
+    targ.parent.mkdir(parents=True, exist_ok=True)
+    if targ.is_file():
+        targ.unlink()
+    if len(parquet_inputs) == 1:
+        shutil.copyfile(Path(parquet_inputs[0]).resolve(), targ)
+        return
+    esc = "[" + ",".join(f"'{_path_posix(p)}'" for p in parquet_inputs) + "]"
+    o_esc = _path_posix(targ).replace("'", "''")
+    sql = f"COPY (SELECT * FROM read_parquet({esc})) TO '{o_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        con.execute(sql)
+    finally:
+        con.close()
+
+
+def _prune_versioned_training_sets(versions_dir: Path, *, keep_last_n: int) -> None:
+    """Keep newest ``keep_last_n`` ``training_set_*.parquet`` under *versions_dir*."""
+    vd = Path(versions_dir).resolve()
+    keep = int(keep_last_n)
+    if keep < 1 or not vd.is_dir():
+        return
+    cand = sorted(
+        vd.glob("training_set_*.parquet"),
+        key=lambda p: p.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for stale in cand[keep:]:
+        try:
+            stale.unlink()
+            logger.info("Pruned old training set version %s", stale.name)
+        except OSError as exc:
+            logger.warning("Could not prune %s: %s", stale, exc)
 
 
 def _feast_features_to_parquet(
@@ -207,14 +315,18 @@ def _training_manifest(
     feature_service: str,
     row_count: int | None,
     labels_parquet: Path,
+    versioned_parquet: Path | None,
 ) -> dict[str, Any]:
-    return {
+    blob: dict[str, Any] = {
         "output_parquet": str(output_parquet.resolve()),
         "row_count": row_count,
         "feast_repo": str(feast_repo.resolve()),
         "feature_service": feature_service,
         "labels_parquet": str(labels_parquet.resolve()),
     }
+    if versioned_parquet is not None:
+        blob["versioned_output_parquet"] = str(Path(versioned_parquet).resolve())
+    return blob
 
 
 def _join_labels_to_features(
@@ -254,7 +366,7 @@ COPY (
 
 
 def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
-    """Produce ``cfg.output_parquet``; return its resolved path.
+    """Produce versioned artifact + symlink-style copy at ``cfg.output_parquet``.
 
     Raises:
         FileNotFoundError: Missing inputs or derived Parquets when not materializing.
@@ -271,29 +383,79 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
 
     out_dir = cfg.output_parquet.parent
     out_dir.mkdir(parents=True, exist_ok=True)
+    versions_dir = out_dir / "versions"
+    versions_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    versioned_out = versions_dir / f"training_set_{stamp}.parquet"
+
     entity_pq = out_dir / "_entity_bet_ts.parquet"
     staging_feat = out_dir / "_staging_feast_features.parquet"
-
+    batch_tmp = tempfile.mkdtemp(prefix="hightier_feast_mo_", dir=str(out_dir))
+    month_batch = cfg.feast_entity_batch_by_calendar_month and cfg.max_entity_rows is None
+    n_rows: int | None = None
     try:
-        _write_entity_parquet(
-            cfg.cleaned_bet_parquet,
-            entity_pq,
-            duckdb_runtime=cfg.duckdb_runtime,
-            max_rows=cfg.max_entity_rows,
-        )
-        _feast_features_to_parquet(
-            feast_repo=cfg.feast_repo,
-            entity_parquet=entity_pq,
-            feature_service_name=cfg.feature_service_name,
-            features_parquet=staging_feat,
-        )
+        if month_batch:
+            months = _prediction_visible_month_starts(
+                cfg.cleaned_bet_parquet,
+                duckdb_runtime=cfg.duckdb_runtime,
+            )
+            if not months:
+                raise ValueError("No prediction_visible_ts_cf months found for Feast batch retrieval.")
+            batch_feats: list[Path] = []
+            for mi, ms in enumerate(months):
+                me = _add_one_month_calendar(ms)
+                ent_fp = Path(batch_tmp) / f"entity_{mi:04d}.parquet"
+                nrow = _write_entity_parquet(
+                    cfg.cleaned_bet_parquet,
+                    ent_fp,
+                    duckdb_runtime=cfg.duckdb_runtime,
+                    max_rows=None,
+                    month_start=ms,
+                    month_end_exclusive=me,
+                )
+                if nrow <= 0:
+                    continue
+                f_fp = Path(batch_tmp) / f"feat_{mi:04d}.parquet"
+                _feast_features_to_parquet(
+                    feast_repo=cfg.feast_repo,
+                    entity_parquet=ent_fp,
+                    feature_service_name=cfg.feature_service_name,
+                    features_parquet=f_fp,
+                )
+                batch_feats.append(f_fp)
+            if not batch_feats:
+                raise ValueError("Feast month batches produced no non-empty slices.")
+            if staging_feat.is_file():
+                staging_feat.unlink()
+            _duckdb_union_parquet_into(batch_feats, staging_feat, duckdb_runtime=cfg.duckdb_runtime)
+            logger.info("Feast month batches merged %d slice(s) → %s", len(batch_feats), staging_feat.resolve())
+        else:
+            nrow = _write_entity_parquet(
+                cfg.cleaned_bet_parquet,
+                entity_pq,
+                duckdb_runtime=cfg.duckdb_runtime,
+                max_rows=cfg.max_entity_rows,
+            )
+            if nrow <= 0:
+                logger.warning("Entity parquet is empty (%s)", entity_pq)
+            _feast_features_to_parquet(
+                feast_repo=cfg.feast_repo,
+                entity_parquet=entity_pq,
+                feature_service_name=cfg.feature_service_name,
+                features_parquet=staging_feat,
+            )
+        if versioned_out.is_file():
+            versioned_out.unlink()
         n_rows = _join_labels_to_features(
             features_parquet=staging_feat,
             labels_parquet=cfg.labels_parquet,
-            output_parquet=cfg.output_parquet,
+            output_parquet=versioned_out,
             duckdb_runtime=cfg.duckdb_runtime,
         )
+        shutil.copy2(versioned_out, cfg.output_parquet)
+        _prune_versioned_training_sets(versions_dir, keep_last_n=cfg.training_set_keep_last_n_versions)
     finally:
+        shutil.rmtree(batch_tmp, ignore_errors=True)
         for p in (entity_pq, staging_feat):
             if p.is_file():
                 try:
@@ -310,12 +472,18 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
                 feature_service=cfg.feature_service_name,
                 row_count=n_rows,
                 labels_parquet=cfg.labels_parquet,
+                versioned_parquet=versioned_out,
             ),
             indent=2,
         ),
         encoding="utf-8",
     )
-    logger.info("Training set written %s (rows=%s)", cfg.output_parquet.resolve(), n_rows)
+    logger.info(
+        "Training set written %s (versioned=%s rows=%s)",
+        cfg.output_parquet.resolve(),
+        versioned_out.resolve(),
+        n_rows,
+    )
     return cfg.output_parquet.resolve()
 
 
@@ -360,7 +528,23 @@ def _parse_args() -> BuildTrainingDataArgs:
         "--max-entity-rows",
         type=int,
         default=None,
-        help="Limit entity rows for debugging (LIMIT in entity Parquet).",
+        help="Limit entity rows for debugging (LIMIT in entity Parquet). Disables Feast month slicing.",
+    )
+    p.add_argument(
+        "--feast-batch-by-month",
+        dest="feast_batch_by_month",
+        action="store_true",
+        help=(
+            "Run Feast retrieval in calendar-month batches (recommended for laptops; "
+            "ignored when combined with --max-entity-rows)."
+        ),
+    )
+    p.add_argument(
+        "--training-retention",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Keep newest N timestamped artifacts under training_data/versions/ (default: 10).",
     )
     p.add_argument(
         "--run-profile",
@@ -379,6 +563,8 @@ def _parse_args() -> BuildTrainingDataArgs:
         materialize_derived_features=bool(ns.materialize_derived),
         max_entity_rows=ns.max_entity_rows,
         duckdb_runtime=duckdb_rt,
+        feast_entity_batch_by_calendar_month=bool(ns.feast_batch_by_month),
+        training_set_keep_last_n_versions=int(ns.training_retention),
     )
 
 

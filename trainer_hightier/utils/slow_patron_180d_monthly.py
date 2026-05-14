@@ -16,6 +16,8 @@ All heavy work stays in DuckDB (no pandas full-frame load).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from pathlib import Path
 
@@ -27,6 +29,55 @@ from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_p
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 logger = logging.getLogger(__name__)
+
+_SLOW_CACHE_MANIFEST_VERSION = 1
+
+
+def _slow_patron_module_sha256() -> str:
+    path = Path(__file__).resolve()
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _parquet_input_stat(path: Path) -> dict[str, int | str]:
+    p = Path(path).resolve()
+    if not p.is_file():
+        raise FileNotFoundError(p)
+    st = p.stat()
+    meta = pq.ParquetFile(p).metadata
+    nrows = int(meta.num_rows) if meta is not None else -1
+    return {
+        "path": str(p),
+        "mtime_ns": int(st.st_mtime_ns),
+        "size_bytes": int(st.st_size),
+        "num_rows": nrows,
+    }
+
+
+def _slow_materialize_cache_expected_record(
+    *,
+    cleaned_session_parquet: Path,
+    canonical_mapping_parquet: Path,
+    cleaned_bet_parquet: Path,
+    out_parquet: Path,
+    lookback_days: int,
+) -> dict[str, object]:
+    dst = Path(out_parquet).resolve()
+    return {
+        "manifest_kind": "trainer_hightier_slow_patron_180d_monthly_v1",
+        "manifest_version": _SLOW_CACHE_MANIFEST_VERSION,
+        "lookback_days": int(lookback_days),
+        "slow_patron_180d_monthly_py_sha256": _slow_patron_module_sha256(),
+        "expect_output_path": str(dst),
+        "cleaned_session": _parquet_input_stat(cleaned_session_parquet),
+        "canonical_mapping": _parquet_input_stat(canonical_mapping_parquet),
+        "cleaned_bet": _parquet_input_stat(cleaned_bet_parquet),
+    }
+
+
+def slow_patron_materialization_cache_path(out_parquet: Path) -> Path:
+    """Sidecar JSON next to slow patron feature Parquet."""
+    p = Path(out_parquet).resolve()
+    return p.parent / f"{p.stem}.cache.json"
 
 
 def _path_posix(path: Path) -> str:
@@ -198,6 +249,27 @@ def materialize_slow_patron_180d_monthly(
         if not p.is_file():
             raise FileNotFoundError(f"{name} parquet not found: {p}")
 
+    expect = _slow_materialize_cache_expected_record(
+        cleaned_session_parquet=src_sess,
+        canonical_mapping_parquet=src_map,
+        cleaned_bet_parquet=src_bet,
+        out_parquet=dst,
+        lookback_days=lookback_days,
+    )
+    cache_path = slow_patron_materialization_cache_path(dst)
+    if dst.is_file() and cache_path.is_file():
+        try:
+            prev = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            prev = None
+        if prev == expect:
+            logger.info(
+                "slow_patron_180d_monthly: cache hit; skip materialize (delete %s to force): %s",
+                cache_path.name,
+                dst,
+            )
+            return dst
+
     sess_cols = set(pq.read_schema(src_sess).names)
     need_sess = frozenset({"player_id", "gaming_day", "theo_win"})
     miss_s = sorted(need_sess - sess_cols)
@@ -248,4 +320,5 @@ def materialize_slow_patron_180d_monthly(
         lookback_days,
         dst,
     )
+    cache_path.write_text(json.dumps(expect, indent=2, sort_keys=True), encoding="utf-8")
     return dst

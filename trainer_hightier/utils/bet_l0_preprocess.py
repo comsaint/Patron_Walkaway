@@ -11,7 +11,7 @@ import logging
 import re
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import duckdb
 import numpy as np
@@ -24,7 +24,7 @@ from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas, 
 
 logger = logging.getLogger("trainer_hightier")
 
-_BET_CLEAN_CACHE_MANIFEST_VERSION = 6
+_BET_CLEAN_CACHE_MANIFEST_VERSION = 7
 
 
 def _duckdb_quote_ident(name: str) -> str:
@@ -275,9 +275,21 @@ def _bet_feast_prediction_visible_alignment_params() -> tuple[int, int]:
         return 1, 45
 
 
+def _duckdb_read_parquet_sources_sql(paths: list[Path]) -> str:
+    """Build DuckDB ``read_parquet([...])`` or single-file variant."""
+    if not paths:
+        raise ValueError("bet paths empty")
+    if len(paths) == 1:
+        esc = _path_posix(paths[0].resolve()).replace("'", "''")
+        return f"read_parquet('{esc}')"
+    parts = [_path_posix(p.resolve()).replace("'", "''") for p in paths]
+    inner = ", ".join(f"'{p}'" for p in parts)
+    return "read_parquet([" + inner + "])"
+
+
 def _duckdb_bet_clean_pipeline_select_sql(
     *,
-    src_posix: str,
+    src_read_parquet_clause: str,
     read_cols_ordered: tuple[str, ...],
     cap_sec: int,
     tags: tuple[tuple[str, str], ...],
@@ -329,14 +341,14 @@ def _duckdb_bet_clean_pipeline_select_sql(
 lf AS (
   SELECT raw.*
   FROM (
-    SELECT {l0_projection} FROM read_parquet('{src_posix}')
+    SELECT {l0_projection} FROM {src_read_parquet_clause}
     WHERE {l0_where}{bucket_filter}
   ) AS raw
   INNER JOIN allowed AS ap ON TRY_CAST(raw.player_id AS BIGINT) = ap.player_id
 )"""
     else:
         with_lf = f"""WITH lf AS (
-  SELECT {l0_projection} FROM read_parquet('{src_posix}')
+  SELECT {l0_projection} FROM {src_read_parquet_clause}
   WHERE {l0_where}{bucket_filter}
 )"""
     syn = f"""CASE
@@ -406,7 +418,7 @@ ranked AS (
 
 
 def _preprocess_bets_duckdb_single_copy(
-    bet_parquet: Path,
+    source_parquets: list[Path],
     output_path: Path,
     *,
     registry_yaml: Path,
@@ -415,27 +427,28 @@ def _preprocess_bets_duckdb_single_copy(
 ) -> tuple[int, tuple[tuple[str, str], ...]]:
     """Run DuckDB ``COPY`` pipeline; multi-pass hash buckets then merge when *dedup_hash_buckets* > 1."""
 
-    src = Path(bet_parquet).resolve()
+    if not source_parquets:
+        raise ValueError("source_parquets must not be empty")
     out = Path(output_path).resolve()
     n = int(cfg.dedup_hash_buckets)
     if n < 1:
         raise ValueError(f"dedup_hash_buckets must be >= 1, got {n}")
-    schema_names = frozenset(pq.read_schema(src).names)
+    schema_names = frozenset(pq.read_schema(Path(source_parquets[0])).names)
     read_ordered = _bet_preprocess_read_columns_ordered(schema_names)
     cap_sec, _applied = _bet_cap_applied_rules(registry_yaml)
     tags = bulk_bet_episode_calendar_tags(registry_yaml)
-    src_esc = _path_posix(src).replace("'", "''")
+    src_clause = _duckdb_read_parquet_sources_sql(source_parquets)
     out_esc = _path_posix(out).replace("'", "''")
     adt_allowed_esc = _resolve_adt_allowed_players_posix(cfg)
     if adt_allowed_esc is not None:
         logger.info("[Step 2b] bet preprocess ADT segment: early join to allowlist Parquet")
 
-    con = duckdb.connect(database=":memory:")
-    try:
-        apply_duckdb_runtime_pragmas(con, duckdb_cfg)
-        if n == 1:
+    if n == 1:
+        con = duckdb.connect(database=":memory:")
+        try:
+            apply_duckdb_runtime_pragmas(con, duckdb_cfg)
             inner = _duckdb_bet_clean_pipeline_select_sql(
-                src_posix=src_esc,
+                src_read_parquet_clause=src_clause,
                 read_cols_ordered=read_ordered,
                 cap_sec=cap_sec,
                 tags=tags,
@@ -445,35 +458,47 @@ def _preprocess_bets_duckdb_single_copy(
             )
             sql = f"COPY ({inner}) TO '{out_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
             execute_sql_with_progress(con, sql, desc="[Step 2b] DuckDB bet COPY")
-        else:
-            with tempfile.TemporaryDirectory(prefix="hightier_bet_bkt_", dir=out.parent) as tdir:
-                parts_dir = Path(tdir)
-                for b in range(n):
-                    inner = _duckdb_bet_clean_pipeline_select_sql(
-                        src_posix=src_esc,
-                        read_cols_ordered=read_ordered,
-                        cap_sec=cap_sec,
-                        tags=tags,
-                        dedup_bucket_id=b,
-                        dedup_buckets=n,
-                        adt_allowed_players_posix=adt_allowed_esc,
-                    )
-                    part_p = parts_dir / f"part_{b:04d}.parquet"
-                    part_esc = _path_posix(part_p).replace("'", "''")
-                    bsql = f"COPY ({inner}) TO '{part_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+        finally:
+            con.close()
+    else:
+        # Fresh connection per bucket (and merge): one long-lived :memory: run can retain
+        # allocator peaks across buckets; t_bet dedup windows are heavier than session.
+        with tempfile.TemporaryDirectory(prefix="hightier_bet_bkt_", dir=out.parent) as tdir:
+            parts_dir = Path(tdir)
+            for b in range(n):
+                inner = _duckdb_bet_clean_pipeline_select_sql(
+                    src_read_parquet_clause=src_clause,
+                    read_cols_ordered=read_ordered,
+                    cap_sec=cap_sec,
+                    tags=tags,
+                    dedup_bucket_id=b,
+                    dedup_buckets=n,
+                    adt_allowed_players_posix=adt_allowed_esc,
+                )
+                part_p = parts_dir / f"part_{b:04d}.parquet"
+                part_esc = _path_posix(part_p).replace("'", "''")
+                bsql = f"COPY ({inner}) TO '{part_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+                con_b = duckdb.connect(database=":memory:")
+                try:
+                    apply_duckdb_runtime_pragmas(con_b, duckdb_cfg)
                     execute_sql_with_progress(
-                        con,
+                        con_b,
                         bsql,
                         desc=f"[Step 2b] DuckDB bet COPY bucket {b + 1}/{n}",
                     )
-                glob_pat = str(parts_dir / "part_*.parquet").replace("\\", "/").replace("'", "''")
-                merge_sql = (
-                    f"COPY (SELECT * FROM read_parquet('{glob_pat}')) "
-                    f"TO '{out_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
-                )
-                execute_sql_with_progress(con, merge_sql, desc="[Step 2b] DuckDB bet merge buckets")
-    finally:
-        con.close()
+                finally:
+                    con_b.close()
+            glob_pat = str(parts_dir / "part_*.parquet").replace("\\", "/").replace("'", "''")
+            merge_sql = (
+                f"COPY (SELECT * FROM read_parquet('{glob_pat}')) "
+                f"TO '{out_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+            )
+            con_m = duckdb.connect(database=":memory:")
+            try:
+                apply_duckdb_runtime_pragmas(con_m, duckdb_cfg)
+                execute_sql_with_progress(con_m, merge_sql, desc="[Step 2b] DuckDB bet merge buckets")
+            finally:
+                con_m.close()
     return cap_sec, tags
 
 
@@ -483,11 +508,21 @@ def preprocess_bets_from_parquet_streaming(
     *,
     cfg: BetPreprocessConfig | None = None,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
+    extra_partition_sources: tuple[Path, ...] | None = None,
 ) -> Path:
     """Clean full L0 ``gmwds_t_bet`` Parquet (DQ + synthetic observed cap + episode tags + dedupe)."""
     src = Path(bet_parquet).resolve()
     if not src.is_file():
         raise FileNotFoundError(src)
+    sources_list: list[Path] = [src]
+    if extra_partition_sources:
+        uniq = {str(src): src}
+        for pp in extra_partition_sources:
+            p = Path(pp).resolve()
+            if not p.is_file():
+                raise FileNotFoundError(p)
+            uniq[str(p)] = p
+        sources_list = sorted(uniq.values(), key=lambda x: str(x))
     out = Path(output_path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.is_file():
@@ -509,7 +544,7 @@ def preprocess_bets_from_parquet_streaming(
         out,
     )
     cap_sec, tags = _preprocess_bets_duckdb_single_copy(
-        src, out, registry_yaml=reg, duckdb_cfg=_ddb, cfg=_cfg
+        sources_list, out, registry_yaml=reg, duckdb_cfg=_ddb, cfg=_cfg
     )
     nrows = int(pq.ParquetFile(out).metadata.num_rows) if pq.ParquetFile(out).metadata else 0
     logger.info(
@@ -520,6 +555,215 @@ def preprocess_bets_from_parquet_streaming(
         out,
     )
     return out
+
+
+def default_cleaned_bet_base_parquet_path() -> Path:
+    """Intermediate all-players cleaned bet prior to optional ADT projection."""
+    return Path(__file__).resolve().parents[1] / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet_base.parquet"
+
+
+def segment_cleaned_bet_from_base_parquet(
+    base_cleaned_parquet: Path,
+    allowlist_parquet: Path,
+    output_parquet: Path,
+    *,
+    duckdb_runtime: DuckDbRuntimeConfig | None = None,
+) -> Path:
+    """Project cleaned all-players bets to ADT segment via semi-join allowlist."""
+
+    base = Path(base_cleaned_parquet).resolve()
+    allow = Path(allowlist_parquet).resolve()
+    out = Path(output_parquet).resolve()
+    if not base.is_file():
+        raise FileNotFoundError(base)
+    if not allow.is_file():
+        raise FileNotFoundError(allow)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.is_file():
+        out.unlink()
+    b_esc = _path_posix(base).replace("'", "''")
+    a_esc = _path_posix(allow).replace("'", "''")
+    o_esc = _path_posix(out).replace("'", "''")
+    sql = f"""
+COPY (
+  SELECT DISTINCT b.*
+  FROM read_parquet('{b_esc}') AS b
+  INNER JOIN (
+    SELECT TRY_CAST(player_id AS BIGINT) AS pid
+    FROM read_parquet('{a_esc}')
+    WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
+  ) AS a ON TRY_CAST(b.player_id AS BIGINT) = a.pid
+) TO '{o_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+""".strip()
+    con = duckdb.connect(database=":memory:")
+    try:
+        ddb = duckdb_runtime if duckdb_runtime is not None else DuckDbRuntimeConfig()
+        apply_duckdb_runtime_pragmas(con, ddb)
+        execute_sql_with_progress(con, sql, desc="[Step 2b] DuckDB segment bet from base")
+    finally:
+        con.close()
+    nrows = int(pq.ParquetFile(out).metadata.num_rows) if pq.ParquetFile(out).metadata else 0
+    logger.info(
+        "[Step 2b] segmented bet parquet from base rows=%d -> %s",
+        nrows,
+        out.resolve(),
+    )
+    return out
+
+
+def bet_base_clean_cache_manifest_path(base_cleaned_parquet: Path) -> Path:
+    """Sidecar manifest for intermediate base cleaned bet parquet."""
+    p = Path(base_cleaned_parquet).resolve()
+    return p.parent / f"{p.stem}.cache.json"
+
+
+def build_bet_base_clean_cache_record(
+    source_bet_parquets: Sequence[Path],
+    *,
+    preprocess_registry_yaml: Path,
+    dedup_hash_buckets: int | None = None,
+    cleaned_session_parquet: Path | None = None,
+    partition_inventory_fingerprint_sha256_hex: str | None = None,
+) -> dict[str, Any]:
+    """Fingerprint intermediate base bet (sources + cleaned session dependency; no ADT)."""
+
+    spaths = sorted({str(Path(x).resolve()) for x in source_bet_parquets})
+    paths = [Path(s) for s in spaths]
+    if not paths:
+        raise ValueError("source_bet_parquets must not be empty")
+    stats: list[dict[str, Any]] = []
+    for pth in paths:
+        p = pth.resolve()
+        if not p.is_file():
+            raise FileNotFoundError(p)
+        st = p.stat()
+        meta = pq.ParquetFile(p).metadata
+        nrows = int(meta.num_rows) if meta is not None else -1
+        stats.append(
+            {
+                "path": str(p),
+                "mtime_ns": int(st.st_mtime_ns),
+                "size_bytes": int(st.st_size),
+                "num_rows": nrows,
+            }
+        )
+    cap_sec, applied = _bet_cap_applied_rules(Path(preprocess_registry_yaml).resolve())
+    _buckets = (
+        int(dedup_hash_buckets)
+        if dedup_hash_buckets is not None
+        else BetPreprocessConfig().dedup_hash_buckets
+    )
+    if _buckets < 1:
+        raise ValueError(f"dedup_hash_buckets must be >= 1, got {_buckets}")
+    rec: dict[str, Any] = {
+        "manifest_kind": "bet_base_clean_only",
+        "manifest_version": _BET_CLEAN_CACHE_MANIFEST_VERSION,
+        "bet_l0_preprocess_py_sha256": _bet_l0_preprocess_py_sha256(),
+        "bet_dedup_hash_buckets": _buckets,
+        "bet_ingest_cap_sec": cap_sec,
+        "applied_registry_fix_rules": applied,
+        "preprocess_registry": _registry_stat_dict(preprocess_registry_yaml),
+        "source_bets": stats,
+    }
+    dep = _fingerprint_cleaned_session_dependency(cleaned_session_parquet)
+    if dep is not None:
+        rec["cleaned_session_dependency"] = dep
+    if partition_inventory_fingerprint_sha256_hex is not None:
+        rec["partition_inventory_fingerprint_sha256_hex"] = str(
+            partition_inventory_fingerprint_sha256_hex,
+        ).strip()
+    return rec
+
+
+def bet_base_clean_cache_is_hit(
+    source_bet_parquets: Sequence[Path],
+    base_cleaned_parquet: Path,
+    *,
+    preprocess_registry_yaml: Path | None = None,
+    dedup_hash_buckets: int | None = None,
+    cleaned_session_parquet: Path | None = None,
+    partition_inventory_fingerprint_sha256_hex: str | None = None,
+) -> bool:
+    """Return True if base cleaned bet exists and manifest matches."""
+
+    bp = Path(base_cleaned_parquet).resolve()
+    man = bet_base_clean_cache_manifest_path(bp)
+    if not bp.is_file() or not man.is_file():
+        return False
+    try:
+        prev = json.loads(man.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    try:
+        reg = _resolve_preprocess_registry(preprocess_registry_yaml)
+        cur = build_bet_base_clean_cache_record(
+            source_bet_parquets,
+            preprocess_registry_yaml=reg,
+            dedup_hash_buckets=dedup_hash_buckets,
+            cleaned_session_parquet=cleaned_session_parquet,
+            partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+        )
+    except (FileNotFoundError, OSError, ImportError, ValueError):
+        return False
+    return prev == cur
+
+
+def write_bet_base_clean_cache_manifest(
+    source_bet_parquets: Sequence[Path],
+    base_cleaned_parquet: Path,
+    *,
+    preprocess_registry_yaml: Path | None = None,
+    dedup_hash_buckets: int | None = None,
+    cleaned_session_parquet: Path | None = None,
+    partition_inventory_fingerprint_sha256_hex: str | None = None,
+) -> Path:
+    """Write manifest next to intermediate base cleaned parquet."""
+
+    reg = _resolve_preprocess_registry(preprocess_registry_yaml)
+    rec = build_bet_base_clean_cache_record(
+        source_bet_parquets,
+        preprocess_registry_yaml=reg,
+        dedup_hash_buckets=dedup_hash_buckets,
+        cleaned_session_parquet=cleaned_session_parquet,
+        partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+    )
+    mp = bet_base_clean_cache_manifest_path(Path(base_cleaned_parquet))
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    mp.write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
+    logger.info("[Step 2b] wrote bet base clean cache manifest: %s", mp.resolve())
+    return mp
+
+
+def merge_bet_source_paths(
+    primary: Path,
+    extra_partition_sources: tuple[Path, ...] | None,
+) -> tuple[Path, ...]:
+    """Return sorted union of resolved bet parquet paths (primary + extras, de-duplicated)."""
+
+    uniq: dict[str, Path] = {}
+    p0 = Path(primary).resolve()
+    uniq[str(p0)] = p0
+    if extra_partition_sources:
+        for raw in extra_partition_sources:
+            p = Path(raw).resolve()
+            uniq[str(p)] = p
+    return tuple(sorted(uniq.values(), key=lambda x: str(x)))
+
+
+def _cleaned_parquet_row_stat(path: Path) -> dict[str, Any]:
+    """mtime/size/path/num_rows fingerprint for one Parquet artifact."""
+    p = Path(path).resolve()
+    if not p.is_file():
+        raise FileNotFoundError(p)
+    st = p.stat()
+    meta = pq.ParquetFile(p).metadata
+    nrows = int(meta.num_rows) if meta is not None else -1
+    return {
+        "path": str(p),
+        "mtime_ns": int(st.st_mtime_ns),
+        "size_bytes": int(st.st_size),
+        "num_rows": nrows,
+    }
 
 
 def _registry_stat_dict(path: Path) -> dict[str, Any]:
@@ -565,19 +809,23 @@ def build_bet_clean_cache_record(
     patron_profile_csv: Path | None = None,
     canonical_mapping_parquet: Path | None = None,
     adt_allowed_players_parquet: Path | None = None,
+    extra_source_bet_parquets: tuple[Path, ...] | None = None,
+    bet_base_cleaned_parquet: Path | None = None,
+    partition_inventory_fingerprint_sha256_hex: str | None = None,
 ) -> dict[str, Any]:
     """Fingerprint for cleaned bet parquet cache (registry + optional cleaned session binding).
 
-    When ``adt_filter_quantile`` is set, the ADT fragment fingerprints **distinct ``player_id`` in the
-    allowlist Parquet** (content hash). ``patron_profile_csv`` / ``canonical_mapping_parquet`` are accepted
-    for API compatibility but **do not** affect the fingerprint.
+    When ``bet_base_cleaned_parquet`` is set, this targets the **segmented** parquet: fingerprint binds the
+    all-players base artifact plus allowlist-derived ``adt_segment`` (distinct ``player_id`` content hash).
+
+    When ``adt_filter_quantile`` is set without ``bet_base_cleaned_parquet``, the ADT fragment matches the
+    single-stage preprocess path.
+
+    ``patron_profile_csv`` / ``canonical_mapping_parquet`` are accepted for API compatibility but **do not**
+    affect the fingerprint.
     """
-    src = Path(source_bet_parquet).resolve()
-    if not src.is_file():
-        raise FileNotFoundError(src)
-    st = src.stat()
-    meta = pq.ParquetFile(src).metadata
-    nrows = int(meta.num_rows) if meta is not None else -1
+    merged_sources = merge_bet_source_paths(source_bet_parquet, extra_source_bet_parquets)
+    sources_stats = [_cleaned_parquet_row_stat(sp) for sp in merged_sources]
     cap_sec, applied = _bet_cap_applied_rules(Path(preprocess_registry_yaml).resolve())
     _buckets = (
         int(dedup_hash_buckets)
@@ -593,20 +841,41 @@ def build_bet_clean_cache_record(
         "bet_ingest_cap_sec": cap_sec,
         "applied_registry_fix_rules": applied,
         "preprocess_registry": _registry_stat_dict(preprocess_registry_yaml),
-        "source_bet": {
-            "path": str(src),
-            "mtime_ns": int(st.st_mtime_ns),
-            "size_bytes": int(st.st_size),
-            "num_rows": nrows,
-        },
     }
+    if partition_inventory_fingerprint_sha256_hex is not None:
+        rec["partition_inventory_fingerprint_sha256_hex"] = str(
+            partition_inventory_fingerprint_sha256_hex,
+        ).strip()
     dep = _fingerprint_cleaned_session_dependency(cleaned_session_parquet)
     if dep is not None:
         rec["cleaned_session_dependency"] = dep
+
     seg = _adt_segment_cache_block(
         quantile=adt_filter_quantile,
         adt_allowed_players_parquet=adt_allowed_players_parquet,
     )
+
+    base_p = Path(bet_base_cleaned_parquet).resolve() if bet_base_cleaned_parquet is not None else None
+    if base_p is not None:
+        if seg is None:
+            raise ValueError(
+                "bet_base_cleaned_parquet requires ADT segmentation inputs "
+                "(adt_filter_quantile + adt_allowed_players_parquet) for fingerprint."
+            )
+        rec.update(
+            {
+                "manifest_kind": "bet_clean_segment_projection_v1",
+                "source_bets": sources_stats,
+                "bet_base_cleaned": _cleaned_parquet_row_stat(base_p),
+                "adt_segment": seg,
+            }
+        )
+        return rec
+
+    if len(merged_sources) > 1:
+        rec.update({"manifest_kind": "bet_clean_direct_merge_v1", "source_bets": sources_stats})
+    else:
+        rec.update({"manifest_kind": "bet_clean_direct_v1", "source_bet": sources_stats[0]})
     if seg is not None:
         rec["adt_segment"] = seg
     return rec
@@ -633,6 +902,9 @@ def bet_clean_cache_is_hit(
     patron_profile_csv: Path | None = None,
     canonical_mapping_parquet: Path | None = None,
     adt_allowed_players_parquet: Path | None = None,
+    extra_source_bet_parquets: tuple[Path, ...] | None = None,
+    bet_base_cleaned_parquet: Path | None = None,
+    partition_inventory_fingerprint_sha256_hex: str | None = None,
 ) -> bool:
     cleaned = Path(cleaned_parquet)
     reg = _resolve_preprocess_registry(preprocess_registry_yaml)
@@ -653,6 +925,9 @@ def bet_clean_cache_is_hit(
             patron_profile_csv=patron_profile_csv,
             canonical_mapping_parquet=canonical_mapping_parquet,
             adt_allowed_players_parquet=adt_allowed_players_parquet,
+            extra_source_bet_parquets=extra_source_bet_parquets,
+            bet_base_cleaned_parquet=bet_base_cleaned_parquet,
+            partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
         )
     except (FileNotFoundError, OSError, ImportError, ValueError):
         return False
@@ -670,6 +945,9 @@ def write_bet_clean_cache_manifest(
     patron_profile_csv: Path | None = None,
     canonical_mapping_parquet: Path | None = None,
     adt_allowed_players_parquet: Path | None = None,
+    extra_source_bet_parquets: tuple[Path, ...] | None = None,
+    bet_base_cleaned_parquet: Path | None = None,
+    partition_inventory_fingerprint_sha256_hex: str | None = None,
 ) -> Path:
     reg = _resolve_preprocess_registry(preprocess_registry_yaml)
     rec = build_bet_clean_cache_record(
@@ -681,6 +959,9 @@ def write_bet_clean_cache_manifest(
         patron_profile_csv=patron_profile_csv,
         canonical_mapping_parquet=canonical_mapping_parquet,
         adt_allowed_players_parquet=adt_allowed_players_parquet,
+        extra_source_bet_parquets=extra_source_bet_parquets,
+        bet_base_cleaned_parquet=bet_base_cleaned_parquet,
+        partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
     )
     mp = bet_clean_cache_manifest_path(Path(cleaned_parquet))
     mp.parent.mkdir(parents=True, exist_ok=True)

@@ -529,6 +529,95 @@ def test_trial_bet_behavior_1h_window_counts(tmp_path: Path) -> None:
     assert int(r4["bet__bets_cnt__w1h"]) == 0
 
 
+def test_metamorphic_overlap_invariant_full_vs_player_subset(registry_path: Path, tmp_path: Path) -> None:
+    """All-players preprocess matches per-player preprocess on overlapping ``bet_id`` rows."""
+    t_pay = pd.Timestamp("2025-05-27 09:00:00")
+    df = pd.DataFrame(
+        [
+            _bet_row(
+                bet_id=1,
+                player_id=100,
+                payout_complete_dtm=t_pay,
+                gaming_day=t_pay.date(),
+                __etl_insert_Dtm=t_pay,
+            ),
+            _bet_row(
+                bet_id=2,
+                player_id=200,
+                payout_complete_dtm=t_pay,
+                gaming_day=t_pay.date(),
+                __etl_insert_Dtm=t_pay,
+            ),
+        ]
+    )
+    raw_full = tmp_path / "gmwds_t_bet_full.parquet"
+    pq.write_table(pa.Table.from_pandas(df), raw_full)
+    raw_sub = tmp_path / "gmwds_t_bet_sub.parquet"
+    pq.write_table(pa.Table.from_pandas(df[df["player_id"] == 100].copy()), raw_sub)
+
+    out_full = tmp_path / "clean_full.parquet"
+    out_sub = tmp_path / "clean_sub.parquet"
+    cfg = BetPreprocessConfig(preprocess_registry_yaml=registry_path)
+    _hpre.preprocess_bets_from_parquet_streaming(raw_full, out_full, cfg=cfg)
+    _hpre.preprocess_bets_from_parquet_streaming(raw_sub, out_sub, cfg=cfg)
+
+    full = pd.read_parquet(out_full).sort_values("bet_id", kind="mergesort")
+    sub = pd.read_parquet(out_sub).sort_values("bet_id", kind="mergesort")
+    assert len(sub) == 1
+    full_overlap = full[full["bet_id"].isin(sub["bet_id"])].reset_index(drop=True)
+    pd.testing.assert_frame_equal(full_overlap, sub.reset_index(drop=True))
+
+
+def test_metamorphic_threshold_expand_stable_bids_subset(registry_path: Path, tmp_path: Path) -> None:
+    """Wider ADT projection keeps prior segment rows identical (semi-join on larger allowlist)."""
+    import trainer_hightier.utils.bet_l0_preprocess as bl0
+
+    t_pay = pd.Timestamp("2025-05-27 09:00:00")
+    df = pd.DataFrame(
+        [
+            _bet_row(
+                bet_id=1,
+                player_id=100,
+                payout_complete_dtm=t_pay,
+                gaming_day=t_pay.date(),
+                __etl_insert_Dtm=t_pay,
+            ),
+            _bet_row(
+                bet_id=2,
+                player_id=200,
+                payout_complete_dtm=t_pay,
+                gaming_day=t_pay.date(),
+                __etl_insert_Dtm=t_pay,
+            ),
+        ]
+    )
+    raw = tmp_path / "gmwds_t_bet.parquet"
+    pq.write_table(pa.Table.from_pandas(df), raw)
+    base = tmp_path / "clean_base.parquet"
+    cfg = BetPreprocessConfig(preprocess_registry_yaml=registry_path)
+    _hpre.preprocess_bets_from_parquet_streaming(raw, base, cfg=cfg)
+
+    allowed_old = tmp_path / "allow_old.parquet"
+    allowed_new = tmp_path / "allow_new.parquet"
+    pd.DataFrame({"player_id": [100]}).to_parquet(allowed_old, index=False)
+    pd.DataFrame({"player_id": [100, 200]}).to_parquet(allowed_new, index=False)
+
+    out_old = tmp_path / "seg_old.parquet"
+    out_new = tmp_path / "seg_new.parquet"
+    bl0.segment_cleaned_bet_from_base_parquet(base, allowed_old, out_old)
+    bl0.segment_cleaned_bet_from_base_parquet(base, allowed_new, out_new)
+
+    old = pd.read_parquet(out_old).sort_values("bet_id", kind="mergesort").reset_index(drop=True)
+    new_full = pd.read_parquet(out_new).sort_values("bet_id", kind="mergesort").reset_index(drop=True)
+    new_stable = (
+        new_full[new_full["bet_id"].isin(old["bet_id"])]
+        .sort_values("bet_id", kind="mergesort")
+        .reset_index(drop=True)
+    )
+    pd.testing.assert_frame_equal(old, new_stable)
+    assert len(new_full) == 2
+
+
 def test_materialize_walkaway_labels_matches_trainer_labels(tmp_path: Path) -> None:
     """Join cleaned bet + mapping, then parity with ``trainer.labels.compute_labels``."""
     from trainer.labels import compute_labels
