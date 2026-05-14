@@ -170,14 +170,30 @@ def _build_s2_cte_sql(names: frozenset[str]) -> str:
 )"""
 
 
+def _duckdb_read_parquet_array_sql(paths: list[Path]) -> str:
+    """Build DuckDB ``read_parquet([...])`` source from explicit Parquet paths."""
+    if not paths:
+        raise ValueError("paths must be non-empty for read_parquet list")
+    parts: list[str] = []
+    for p in paths:
+        esc = _path_posix(Path(p).resolve()).replace("'", "''")
+        parts.append(f"'{esc}'")
+    return "read_parquet([" + ", ".join(parts) + "]"
+
+
 def _duckdb_session_clean_pipeline_select_sql(
-    src_posix: str,
+    src_clause: str,
     *,
     read_cols_ordered: tuple[str, ...],
     dedup_bucket_id: int | None = None,
     dedup_buckets: int = 1,
 ) -> str:
-    """Single-scan pipeline: L0 gate → impute → synthetic → FND-01 → FND-04."""
+    """Single-scan pipeline: L0 gate → impute → synthetic → FND-01 → FND-04.
+
+    Args:
+        src_clause: DuckDB source SQL, either ``read_parquet('single')``
+            or ``read_parquet([...])``.
+    """
 
     n = int(dedup_buckets)
     if n < 1:
@@ -202,7 +218,7 @@ def _duckdb_session_clean_pipeline_select_sql(
     l0_projection = ", ".join(_duckdb_quote_ident(c) for c in read_cols_ordered)
     return f"""
 WITH l0 AS (
-  SELECT {l0_projection} FROM read_parquet('{src_posix}')
+  SELECT {l0_projection} FROM {src_clause}
   WHERE {l0w}{bucket_filter}
 ),
 {s1b},
@@ -226,21 +242,26 @@ WHERE COALESCE(TRY_CAST("is_deleted" AS BIGINT), 0) = 0
 
 
 def _preprocess_sessions_duckdb_single_copy(
-    session_parquet: Path,
+    session_sources: list[Path],
     output_path: Path,
     duckdb_cfg: DuckDbRuntimeConfig,
     dedup_hash_buckets: int,
 ) -> None:
     """Run DuckDB ``COPY``; optional hash buckets + merge (matches bet preprocess pattern)."""
 
-    src = Path(session_parquet).resolve()
+    if not session_sources:
+        raise ValueError("session_sources must not be empty")
+    if len(session_sources) == 1:
+        sp = _path_posix(Path(session_sources[0]).resolve()).replace("'", "''")
+        src_clause = f"read_parquet('{sp}')"
+    else:
+        src_clause = _duckdb_read_parquet_array_sql([Path(x) for x in session_sources])
     out = Path(output_path).resolve()
     n = int(dedup_hash_buckets)
     if n < 1:
         raise ValueError(f"dedup_hash_buckets must be >= 1, got {n}")
-    schema_names = frozenset(pq.read_schema(src).names)
+    schema_names = frozenset(pq.read_schema(Path(session_sources[0])).names)
     read_ordered = _session_preprocess_read_columns_ordered(schema_names)
-    src_p = _path_posix(src).replace("'", "''")
     out_p = _path_posix(out).replace("'", "''")
 
     con = duckdb.connect(database=":memory:")
@@ -248,7 +269,7 @@ def _preprocess_sessions_duckdb_single_copy(
         apply_duckdb_runtime_pragmas(con, duckdb_cfg)
         if n == 1:
             inner = _duckdb_session_clean_pipeline_select_sql(
-                src_p,
+                src_clause,
                 read_cols_ordered=read_ordered,
                 dedup_bucket_id=None,
                 dedup_buckets=1,
@@ -260,7 +281,7 @@ def _preprocess_sessions_duckdb_single_copy(
                 parts_dir = Path(tdir)
                 for b in range(n):
                     inner = _duckdb_session_clean_pipeline_select_sql(
-                        src_p,
+                        src_clause,
                         read_cols_ordered=read_ordered,
                         dedup_bucket_id=b,
                         dedup_buckets=n,
@@ -352,7 +373,7 @@ def _preprocess_sessions_pandas_shard_batches(
 _SESSION_INGEST_DELAY_CAP_SEC = 636
 
 # Bump when cache record schema or semantics change (invalidates old sidecars).
-_SESSION_CLEAN_CACHE_MANIFEST_VERSION = 4
+_SESSION_CLEAN_CACHE_MANIFEST_VERSION = 5
 
 
 def _filter_session_l0_deleted_canceled(chunk: pd.DataFrame) -> pd.DataFrame:
@@ -604,6 +625,7 @@ def preprocess_sessions_from_parquet_streaming(
     *,
     cfg: SessionPreprocessConfig | None = None,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
+    extra_partition_sources: tuple[Path, ...] | None = None,
 ) -> Path:
     """Clean ``t_session`` L0 Parquet → single cleaned Parquet.
 
@@ -616,6 +638,8 @@ def preprocess_sessions_from_parquet_streaming(
         output_path: Final cleaned Parquet (parent dirs created).
         cfg: Session engine / shard batching; default :class:`SessionPreprocessConfig`.
         duckdb_runtime: Connection PRAGMAs for all DuckDB steps; default :class:`DuckDbRuntimeConfig`.
+        extra_partition_sources: Extra ``t_session`` Parquet shards (duckdb-only) merged via
+            multi-file ``read_parquet`` after ``session_parquet``.
 
     Returns:
         Resolved ``output_path``.
@@ -623,6 +647,16 @@ def preprocess_sessions_from_parquet_streaming(
     src = Path(session_parquet).resolve()
     if not src.is_file():
         raise FileNotFoundError(src)
+    sources_list: list[Path] = [src]
+    if extra_partition_sources:
+        uniq: dict[str, Path] = {str(src): src}
+        for pp in extra_partition_sources:
+            p = Path(pp).resolve()
+            if not p.is_file():
+                raise FileNotFoundError(p)
+            uniq[str(p)] = p
+        sources_list = sorted(uniq.values(), key=lambda x: str(x))
+    sources = sources_list
     out = Path(output_path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.is_file():
@@ -631,6 +665,8 @@ def preprocess_sessions_from_parquet_streaming(
     _cfg = cfg if cfg is not None else SessionPreprocessConfig()
     _ddb = duckdb_runtime if duckdb_runtime is not None else DuckDbRuntimeConfig()
     _nb = int(_cfg.dedup_hash_buckets)
+    if len(sources) > 1 and _cfg.engine != "duckdb":
+        raise ValueError("extra_partition_sources require SessionPreprocessConfig(engine='duckdb')")
     if _nb < 1:
         raise ValueError(f"SessionPreprocessConfig.dedup_hash_buckets must be >= 1, got {_nb}")
     if _cfg.engine == "duckdb":
@@ -639,7 +675,7 @@ def preprocess_sessions_from_parquet_streaming(
             _nb,
             out,
         )
-        _preprocess_sessions_duckdb_single_copy(src, out, _ddb, dedup_hash_buckets=_nb)
+        _preprocess_sessions_duckdb_single_copy(sources, out, _ddb, dedup_hash_buckets=_nb)
     elif _cfg.engine == "pandas_shards":
         _preprocess_sessions_pandas_shard_batches(src, out, _cfg, _ddb)
     else:
@@ -676,19 +712,48 @@ def _session_l0_preprocess_py_sha256() -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def merge_session_source_paths(
+    primary: Path,
+    extra_partition_sources: tuple[Path, ...] | None,
+) -> tuple[Path, ...]:
+    """Sorted union of resolved session parquet paths."""
+
+    uniq: dict[str, Path] = {}
+    p0 = Path(primary).resolve()
+    uniq[str(p0)] = p0
+    if extra_partition_sources:
+        for raw in extra_partition_sources:
+            p = Path(raw).resolve()
+            uniq[str(p)] = p
+    return tuple(sorted(uniq.values(), key=lambda x: str(x)))
+
+
 def build_session_clean_cache_record(
     source_session_parquet: Path,
     *,
     dedup_hash_buckets: int | None = None,
+    extra_source_session_parquets: tuple[Path, ...] | None = None,
+    partition_inventory_fingerprint_sha256_hex: str | None = None,
 ) -> dict[str, Any]:
     """Fingerprint: source L0 stats + row count + this module's source hash + dedup buckets."""
 
-    src = Path(source_session_parquet).resolve()
-    if not src.is_file():
-        raise FileNotFoundError(src)
-    st = src.stat()
-    meta = pq.ParquetFile(src).metadata
-    nrows = int(meta.num_rows) if meta is not None else -1
+    merged = merge_session_source_paths(source_session_parquet, extra_source_session_parquets)
+    stats: list[dict[str, Any]] = []
+    for sp in merged:
+        src = Path(sp).resolve()
+        if not src.is_file():
+            raise FileNotFoundError(src)
+        st = src.stat()
+        meta = pq.ParquetFile(src).metadata
+        nrows = int(meta.num_rows) if meta is not None else -1
+        stats.append(
+            {
+                "path": str(src),
+                "mtime_ns": int(st.st_mtime_ns),
+                "size_bytes": int(st.st_size),
+                "num_rows": nrows,
+            }
+        )
     _nb = (
         int(dedup_hash_buckets)
         if dedup_hash_buckets is not None
@@ -696,17 +761,21 @@ def build_session_clean_cache_record(
     )
     if _nb < 1:
         raise ValueError(f"dedup_hash_buckets must be >= 1, got {_nb}")
-    return {
+    body: dict[str, Any] = {
         "manifest_version": _SESSION_CLEAN_CACHE_MANIFEST_VERSION,
         "preprocess_py_sha256": _session_l0_preprocess_py_sha256(),
         "session_dedup_hash_buckets": _nb,
-        "source_session": {
-            "path": str(src),
-            "mtime_ns": int(st.st_mtime_ns),
-            "size_bytes": int(st.st_size),
-            "num_rows": nrows,
-        },
     }
+    if len(merged) == 1:
+        body["source_session"] = stats[0]
+    else:
+        body["manifest_kind"] = "session_clean_merge_v1"
+        body["source_sessions"] = stats
+    if partition_inventory_fingerprint_sha256_hex is not None:
+        body["partition_inventory_fingerprint_sha256_hex"] = str(
+            partition_inventory_fingerprint_sha256_hex,
+        ).strip()
+    return body
 
 
 def session_clean_cache_manifest_path(cleaned_parquet: Path) -> Path:
@@ -720,6 +789,8 @@ def session_clean_cache_is_hit(
     cleaned_parquet: Path,
     *,
     dedup_hash_buckets: int | None = None,
+    extra_source_session_parquets: tuple[Path, ...] | None = None,
+    partition_inventory_fingerprint_sha256_hex: str | None = None,
 ) -> bool:
     """Return True if cleaned parquet exists and manifest matches current fingerprint."""
 
@@ -735,6 +806,8 @@ def session_clean_cache_is_hit(
         cur = build_session_clean_cache_record(
             source_session_parquet,
             dedup_hash_buckets=dedup_hash_buckets,
+            extra_source_session_parquets=extra_source_session_parquets,
+            partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
         )
     except (FileNotFoundError, OSError):
         return False
@@ -746,12 +819,16 @@ def write_session_clean_cache_manifest(
     cleaned_parquet: Path,
     *,
     dedup_hash_buckets: int | None = None,
+    extra_source_session_parquets: tuple[Path, ...] | None = None,
+    partition_inventory_fingerprint_sha256_hex: str | None = None,
 ) -> Path:
     """Write cache sidecar after a successful cleaned parquet write."""
 
     rec = build_session_clean_cache_record(
         source_session_parquet,
         dedup_hash_buckets=dedup_hash_buckets,
+        extra_source_session_parquets=extra_source_session_parquets,
+        partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
     )
     mp = session_clean_cache_manifest_path(Path(cleaned_parquet))
     mp.parent.mkdir(parents=True, exist_ok=True)
