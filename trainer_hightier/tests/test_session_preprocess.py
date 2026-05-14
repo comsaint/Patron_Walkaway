@@ -230,7 +230,8 @@ def test_streaming_preprocess_fnd01_dedup_across_row_groups(tmp_path) -> None:
     pq.write_table(pa.Table.from_pandas(df), pq_path, row_group_size=1)
 
     out_path = tmp_path / "cleaned.parquet"
-    _hpre.preprocess_sessions_from_parquet_streaming(pq_path, out_path)
+    _, _buck = _hpre.preprocess_sessions_from_parquet_streaming(pq_path, out_path)
+    assert _buck >= 1
     out = pd.read_parquet(out_path)
     assert len(out) == 1
     assert pd.Timestamp(out["lud_dtm"].iloc[0]) == pd.Timestamp(t_new)
@@ -281,16 +282,17 @@ def test_streaming_session_hash_buckets_matches_single_pass(tmp_path) -> None:
     pq.write_table(pa.Table.from_pandas(df), pq_path)
     out1 = tmp_path / "cleaned_b1.parquet"
     out8 = tmp_path / "cleaned_b8.parquet"
-    _hpre.preprocess_sessions_from_parquet_streaming(
+    _, b1 = _hpre.preprocess_sessions_from_parquet_streaming(
         pq_path,
         out1,
         cfg=SessionPreprocessConfig(dedup_hash_buckets=1),
     )
-    _hpre.preprocess_sessions_from_parquet_streaming(
+    _, b8 = _hpre.preprocess_sessions_from_parquet_streaming(
         pq_path,
         out8,
         cfg=SessionPreprocessConfig(dedup_hash_buckets=8),
     )
+    assert b1 == 1 and b8 == 8
     g1 = pd.read_parquet(out1).sort_values(["session_id"]).reset_index(drop=True)
     g8 = pd.read_parquet(out8).sort_values(["session_id"]).reset_index(drop=True)
     pd.testing.assert_frame_equal(g1, g8)
@@ -326,10 +328,36 @@ def test_session_preprocess_projection_drops_unlisted_wide_columns(tmp_path) -> 
     pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), pq_path, row_group_size=1)
 
     out_path = tmp_path / "cleaned.parquet"
-    _hpre.preprocess_sessions_from_parquet_streaming(pq_path, out_path)
+    _, eff_sess = _hpre.preprocess_sessions_from_parquet_streaming(pq_path, out_path)
+    assert eff_sess == SessionPreprocessConfig().dedup_hash_buckets
 
     cols = pq.read_schema(out_path).names
     assert "junk_metric_only_in_l0" not in cols
     assert "blob_like_col_should_not_ship" not in cols
     assert frozenset(cols).issuperset(frozenset(_hpre.SESSION_PREPROCESS_READ_COLS_ORDERED))
     assert "__etl_insert_Dtm_synthetic" in cols
+
+
+def test_degraded_runtime_config_after_oom_from_none_threads() -> None:
+    """First degradation pins threads when DuckDB defaulted to unlimited."""
+    import trainer_hightier.utils.duckdb_runtime as _drunner
+    from trainer_hightier.config import DuckDbRuntimeConfig
+
+    nxt = _drunner.degraded_runtime_config_after_oom(DuckDbRuntimeConfig(threads=None))
+    assert nxt is not None
+    assert nxt.threads == 8
+
+
+def test_degraded_runtime_config_after_oom_halves_explicit_threads() -> None:
+    """OOM ladder halves explicit thread counts down to one."""
+    import trainer_hightier.utils.duckdb_runtime as _drunner
+    from trainer_hightier.config import DuckDbRuntimeConfig
+
+    c8 = DuckDbRuntimeConfig(threads=8)
+    c4 = _drunner.degraded_runtime_config_after_oom(c8)
+    assert c4 is not None and c4.threads == 4
+    c2 = _drunner.degraded_runtime_config_after_oom(c4)
+    assert c2 is not None and c2.threads == 2
+    c1 = _drunner.degraded_runtime_config_after_oom(c2)
+    assert c1 is not None and c1.threads == 1
+    assert _drunner.degraded_runtime_config_after_oom(c1) is None

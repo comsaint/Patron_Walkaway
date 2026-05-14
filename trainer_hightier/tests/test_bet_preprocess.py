@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 
 import duckdb
@@ -19,6 +20,18 @@ from trainer_hightier.utils.patron_session_metrics import materialize_adt_allowe
 _hpre = importlib.import_module("trainer_hightier.02_preprocess")
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_REGISTRY = _REPO_ROOT / "schema" / "preprocess_l0_data_contract_registry.yaml"
+
+
+def read_cleaned_bet_dataset(path: Path | str) -> pd.DataFrame:
+    """Load trainer bet preprocess output (Hive-partitioned dir or legacy single Parquet)."""
+
+    root = Path(path).resolve()
+    if root.is_file():
+        return pd.read_parquet(root)
+    shards = sorted(root.rglob("*.parquet"))
+    if not shards:
+        return pd.DataFrame()
+    return pd.concat([pd.read_parquet(p) for p in shards], ignore_index=True)
 
 
 def _bet_row(**kwargs: object) -> dict[str, object]:
@@ -97,13 +110,13 @@ def test_preprocess_bet_dedup_keeps_latest_synthetic(registry_path: Path, tmp_pa
     )
     raw = tmp_path / "gmwds_t_bet.parquet"
     pq.write_table(pa.Table.from_pandas(df), raw)
-    out = tmp_path / "cleaned.parquet"
-    _hpre.preprocess_bets_from_parquet_streaming(
+    out = tmp_path / "cleaned_ds"
+    _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
         cfg=BetPreprocessConfig(preprocess_registry_yaml=registry_path),
     )
-    got = pd.read_parquet(out)
+    got = read_cleaned_bet_dataset(out)
     assert len(got) == 1
     assert int(got.iloc[0]["bet_id"]) == 7
 
@@ -122,13 +135,13 @@ def test_preprocess_bet_synthetic_caps_after_event(registry_path: Path, cap_sec:
     )
     raw = tmp_path / "gmwds_t_bet.parquet"
     pq.write_table(pa.Table.from_pandas(df), raw)
-    out = tmp_path / "cleaned.parquet"
-    _hpre.preprocess_bets_from_parquet_streaming(
+    out = tmp_path / "cleaned_ds"
+    _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
         cfg=BetPreprocessConfig(preprocess_registry_yaml=registry_path),
     )
-    got = pd.read_parquet(out)
+    got = read_cleaned_bet_dataset(out)
     assert len(got) == 1
     expected = pd.Timestamp(t_pay) + pd.Timedelta(seconds=cap_sec)
     actual = pd.to_datetime(got.iloc[0]["__etl_insert_Dtm_synthetic"], utc=False)
@@ -147,8 +160,8 @@ def test_preprocess_bet_prediction_visible_ts_cf(registry_path: Path, tmp_path) 
     )
     raw = tmp_path / "gmwds_t_bet.parquet"
     pq.write_table(pa.Table.from_pandas(df), raw)
-    out = tmp_path / "cleaned.parquet"
-    _hpre.preprocess_bets_from_parquet_streaming(
+    out = tmp_path / "cleaned_ds"
+    _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
         cfg=BetPreprocessConfig(
@@ -156,7 +169,7 @@ def test_preprocess_bet_prediction_visible_ts_cf(registry_path: Path, tmp_path) 
             dedup_hash_buckets=1,
         ),
     )
-    got = pd.read_parquet(out)
+    got = read_cleaned_bet_dataset(out)
     assert len(got) == 1
     assert "prediction_visible_ts_cf" in got.columns
     pcd = got.iloc[0]["payout_complete_dtm"]
@@ -200,13 +213,13 @@ def test_preprocess_bet_drops_zero_wager(registry_path: Path, tmp_path) -> None:
     )
     raw = tmp_path / "gmwds_t_bet.parquet"
     pq.write_table(pa.Table.from_pandas(df), raw)
-    out = tmp_path / "cleaned.parquet"
-    _hpre.preprocess_bets_from_parquet_streaming(
+    out = tmp_path / "cleaned_ds"
+    _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
         cfg=BetPreprocessConfig(preprocess_registry_yaml=registry_path),
     )
-    got = pd.read_parquet(out)
+    got = read_cleaned_bet_dataset(out)
     assert len(got) == 0
 
 
@@ -217,13 +230,13 @@ def test_bulk_episode_day_tags(registry_path: Path, tmp_path) -> None:
     df = pd.DataFrame([_bet_row(payout_complete_dtm=pay, gaming_day=pay.date(), __etl_insert_Dtm=etl)])
     raw = tmp_path / "gmwds_t_bet.parquet"
     pq.write_table(pa.Table.from_pandas(df), raw)
-    out = tmp_path / "cleaned.parquet"
-    _hpre.preprocess_bets_from_parquet_streaming(
+    out = tmp_path / "cleaned_ds"
+    _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
         cfg=BetPreprocessConfig(preprocess_registry_yaml=registry_path),
     )
-    got = pd.read_parquet(out)
+    got = read_cleaned_bet_dataset(out)
     assert len(got) == 1
     assert got.iloc[0]["ingestion_episode_id"] == "BET-BULK-INGEST-2025-05-27"
 
@@ -254,9 +267,9 @@ def test_preprocess_bet_hash_buckets_matches_single_pass(registry_path: Path, tm
     df = pd.DataFrame(rows)
     raw = tmp_path / "gmwds_t_bet.parquet"
     pq.write_table(pa.Table.from_pandas(df), raw)
-    out1 = tmp_path / "cleaned_b1.parquet"
-    out8 = tmp_path / "cleaned_b8.parquet"
-    _hpre.preprocess_bets_from_parquet_streaming(
+    out1 = tmp_path / "cleaned_b1_ds"
+    out8 = tmp_path / "cleaned_b8_ds"
+    _, b1 = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out1,
         cfg=BetPreprocessConfig(
@@ -264,7 +277,7 @@ def test_preprocess_bet_hash_buckets_matches_single_pass(registry_path: Path, tm
             dedup_hash_buckets=1,
         ),
     )
-    _hpre.preprocess_bets_from_parquet_streaming(
+    _, b8 = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out8,
         cfg=BetPreprocessConfig(
@@ -272,8 +285,9 @@ def test_preprocess_bet_hash_buckets_matches_single_pass(registry_path: Path, tm
             dedup_hash_buckets=8,
         ),
     )
-    g1 = pd.read_parquet(out1).sort_values(["bet_id"]).reset_index(drop=True)
-    g8 = pd.read_parquet(out8).sort_values(["bet_id"]).reset_index(drop=True)
+    assert b1 == 1 and b8 == 8
+    g1 = read_cleaned_bet_dataset(out1).sort_values(["bet_id"]).reset_index(drop=True)
+    g8 = read_cleaned_bet_dataset(out8).sort_values(["bet_id"]).reset_index(drop=True)
     pd.testing.assert_frame_equal(g1, g8)
 
 
@@ -305,13 +319,13 @@ def test_preprocess_bet_dedup_prefers_newer_raw_etl_when_synthetic_tied(
     )
     raw = tmp_path / "gmwds_t_bet.parquet"
     pq.write_table(pa.Table.from_pandas(df), raw)
-    out = tmp_path / "cleaned.parquet"
-    _hpre.preprocess_bets_from_parquet_streaming(
+    out = tmp_path / "cleaned_ds"
+    _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
         cfg=BetPreprocessConfig(preprocess_registry_yaml=registry_path, dedup_hash_buckets=3),
     )
-    got = pd.read_parquet(out)
+    got = read_cleaned_bet_dataset(out)
     assert len(got) == 1
     assert pd.to_datetime(got.iloc[0]["__etl_insert_Dtm"], utc=False) == t_etl_late
 
@@ -358,8 +372,8 @@ def test_preprocess_bet_adt_segment_keeps_only_top_quantile_patrons(registry_pat
     )
     raw = tmp_path / "gmwds_t_bet.parquet"
     pq.write_table(pa.Table.from_pandas(df), raw)
-    out = tmp_path / "cleaned.parquet"
-    _hpre.preprocess_bets_from_parquet_streaming(
+    out = tmp_path / "cleaned_ds"
+    _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
         cfg=BetPreprocessConfig(
@@ -370,7 +384,7 @@ def test_preprocess_bet_adt_segment_keeps_only_top_quantile_patrons(registry_pat
             adt_allowed_players_parquet=allowed_pq,
         ),
     )
-    got = pd.read_parquet(out)
+    got = read_cleaned_bet_dataset(out)
     assert len(got) == 1
     assert int(got.iloc[0]["player_id"]) == 100
 
@@ -506,7 +520,7 @@ def test_trial_bet_behavior_1h_window_counts(tmp_path: Path) -> None:
 
     materialize_trial_bet_behavior_1h(cleaned_bet_parquet=src, out_parquet=out)
 
-    got = pd.read_parquet(out).sort_values("bet_id", kind="mergesort")
+    got = read_cleaned_bet_dataset(out).sort_values("bet_id", kind="mergesort")
     assert len(got) == 4
 
     r1 = got[got["bet_id"] == 1.0].iloc[0]
@@ -555,14 +569,14 @@ def test_metamorphic_overlap_invariant_full_vs_player_subset(registry_path: Path
     raw_sub = tmp_path / "gmwds_t_bet_sub.parquet"
     pq.write_table(pa.Table.from_pandas(df[df["player_id"] == 100].copy()), raw_sub)
 
-    out_full = tmp_path / "clean_full.parquet"
-    out_sub = tmp_path / "clean_sub.parquet"
+    out_full = tmp_path / "clean_full_ds"
+    out_sub = tmp_path / "clean_sub_ds"
     cfg = BetPreprocessConfig(preprocess_registry_yaml=registry_path)
-    _hpre.preprocess_bets_from_parquet_streaming(raw_full, out_full, cfg=cfg)
-    _hpre.preprocess_bets_from_parquet_streaming(raw_sub, out_sub, cfg=cfg)
+    _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(raw_full, out_full, cfg=cfg)
+    _, _bet_b2 = _hpre.preprocess_bets_from_parquet_streaming(raw_sub, out_sub, cfg=cfg)
 
-    full = pd.read_parquet(out_full).sort_values("bet_id", kind="mergesort")
-    sub = pd.read_parquet(out_sub).sort_values("bet_id", kind="mergesort")
+    full = read_cleaned_bet_dataset(out_full).sort_values("bet_id", kind="mergesort")
+    sub = read_cleaned_bet_dataset(out_sub).sort_values("bet_id", kind="mergesort")
     assert len(sub) == 1
     full_overlap = full[full["bet_id"].isin(sub["bet_id"])].reset_index(drop=True)
     pd.testing.assert_frame_equal(full_overlap, sub.reset_index(drop=True))
@@ -593,22 +607,22 @@ def test_metamorphic_threshold_expand_stable_bids_subset(registry_path: Path, tm
     )
     raw = tmp_path / "gmwds_t_bet.parquet"
     pq.write_table(pa.Table.from_pandas(df), raw)
-    base = tmp_path / "clean_base.parquet"
+    base = tmp_path / "clean_base_ds"
     cfg = BetPreprocessConfig(preprocess_registry_yaml=registry_path)
-    _hpre.preprocess_bets_from_parquet_streaming(raw, base, cfg=cfg)
+    _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(raw, base, cfg=cfg)
 
     allowed_old = tmp_path / "allow_old.parquet"
     allowed_new = tmp_path / "allow_new.parquet"
     pd.DataFrame({"player_id": [100]}).to_parquet(allowed_old, index=False)
     pd.DataFrame({"player_id": [100, 200]}).to_parquet(allowed_new, index=False)
 
-    out_old = tmp_path / "seg_old.parquet"
-    out_new = tmp_path / "seg_new.parquet"
+    out_old = tmp_path / "seg_old_ds"
+    out_new = tmp_path / "seg_new_ds"
     bl0.segment_cleaned_bet_from_base_parquet(base, allowed_old, out_old)
     bl0.segment_cleaned_bet_from_base_parquet(base, allowed_new, out_new)
 
-    old = pd.read_parquet(out_old).sort_values("bet_id", kind="mergesort").reset_index(drop=True)
-    new_full = pd.read_parquet(out_new).sort_values("bet_id", kind="mergesort").reset_index(drop=True)
+    old = read_cleaned_bet_dataset(out_old).sort_values("bet_id", kind="mergesort").reset_index(drop=True)
+    new_full = read_cleaned_bet_dataset(out_new).sort_values("bet_id", kind="mergesort").reset_index(drop=True)
     new_stable = (
         new_full[new_full["bet_id"].isin(old["bet_id"])]
         .sort_values("bet_id", kind="mergesort")
@@ -616,6 +630,36 @@ def test_metamorphic_threshold_expand_stable_bids_subset(registry_path: Path, tm
     )
     pd.testing.assert_frame_equal(old, new_stable)
     assert len(new_full) == 2
+
+
+def test_bet_base_clean_cache_hit_with_stored_higher_dedup_buckets(
+    registry_path: Path, tmp_path: Path
+) -> None:
+    """Lower nominal ``dedup_hash_buckets`` still hits when manifest stored OOM-escalated count."""
+
+    t_pay = pd.Timestamp("2025-05-27 09:00:00")
+    df = pd.DataFrame(
+        [_bet_row(payout_complete_dtm=t_pay, gaming_day=t_pay.date(), __etl_insert_Dtm=t_pay)]
+    )
+    raw = tmp_path / "gmwds_t_bet.parquet"
+    pq.write_table(pa.Table.from_pandas(df), raw)
+    base = tmp_path / "base.parquet"
+    df.iloc[0:0].to_parquet(base, index=False)
+
+    rec = _hpre.build_bet_base_clean_cache_record(
+        [raw],
+        preprocess_registry_yaml=registry_path,
+        dedup_hash_buckets=16,
+    )
+    mp = _hpre.bet_base_clean_cache_manifest_path(base)
+    mp.write_text(json.dumps(rec, sort_keys=True), encoding="utf-8")
+
+    assert _hpre.bet_base_clean_cache_is_hit(
+        [raw],
+        base,
+        preprocess_registry_yaml=registry_path,
+        dedup_hash_buckets=8,
+    )
 
 
 def test_materialize_walkaway_labels_matches_trainer_labels(tmp_path: Path) -> None:

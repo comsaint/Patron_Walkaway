@@ -11,8 +11,7 @@ stages:
       - 02_preprocess.py
       - utils
       - ../schema/preprocess_l0_data_contract_registry.yaml
-      - ../data/gmwds_t_session.parquet
-      - ../data/gmwds_t_bet.parquet
+      - ../data/partitions
     outs:
       - artifacts/cleaned
       - artifacts/manifests

@@ -5,12 +5,11 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import duckdb
 import pyarrow.parquet as pq
 
 from trainer_hightier.config import DuckDbRuntimeConfig
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_artifacts_dir
-from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas, execute_sql_with_progress
+from trainer_hightier.utils.duckdb_runtime import execute_sql_with_progress_oom_retry
 
 logger = logging.getLogger("trainer_hightier")
 
@@ -195,17 +194,12 @@ def compile_canonical_patron_session_metrics(
     inner = _adt_copy_sql(cleaned_posix=c_px, map_posix=m_px)
     sql = f"COPY ({inner}) TO '{out_px}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
 
-    con = duckdb.connect(database=":memory:")
-    try:
-        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
-        execute_sql_with_progress(
-            con,
-            sql,
-            desc="[Step 4] DuckDB patron ADT report",
-            join_timeout_s=float(duckdb_join_timeout_s),
-        )
-    finally:
-        con.close()
+    execute_sql_with_progress_oom_retry(
+        duckdb_runtime,
+        sql,
+        desc="[Step 4] DuckDB patron ADT report",
+        join_timeout_s=float(duckdb_join_timeout_s),
+    )
 
     meta = pq.ParquetFile(out).metadata
     nrows = int(meta.num_rows) if meta is not None else -1
@@ -257,17 +251,12 @@ def compile_canonical_patron_profile_csv(
     inner = _patron_profile_sql(cleaned_posix=c_px, map_posix=m_px)
     sql = f"COPY ({inner}) TO '{out_px}' (FORMAT CSV, HEADER true, DELIMITER ',')"
 
-    con = duckdb.connect(database=":memory:")
-    try:
-        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
-        execute_sql_with_progress(
-            con,
-            sql,
-            desc="[Step 4b] DuckDB patron profile CSV",
-            join_timeout_s=float(duckdb_join_timeout_s),
-        )
-    finally:
-        con.close()
+    execute_sql_with_progress_oom_retry(
+        duckdb_runtime,
+        sql,
+        desc="[Step 4b] DuckDB patron profile CSV",
+        join_timeout_s=float(duckdb_join_timeout_s),
+    )
 
     logger.info(
         "[Step 4b] patron profile CSV written %s",
@@ -348,17 +337,12 @@ def _copy_adt_allowlist_select_to_parquet(
     """Run ``COPY (<inner_select_sql>) TO`` Parquet via DuckDB."""
     out_px = _path_posix(output_parquet).replace("'", "''")
     sql = f"COPY ({inner_select_sql}) TO '{out_px}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
-    con = duckdb.connect(database=":memory:")
-    try:
-        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
-        execute_sql_with_progress(
-            con,
-            sql,
-            desc="[Step 4c] DuckDB ADT allowlist Parquet",
-            join_timeout_s=float(duckdb_join_timeout_s),
-        )
-    finally:
-        con.close()
+    execute_sql_with_progress_oom_retry(
+        duckdb_runtime,
+        sql,
+        desc="[Step 4c] DuckDB ADT allowlist Parquet",
+        join_timeout_s=float(duckdb_join_timeout_s),
+    )
 
 
 def materialize_adt_allowed_players_parquet(

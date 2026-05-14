@@ -31,6 +31,7 @@ from trainer_hightier.config import (
     SessionPreprocessConfig,
     configs_from_run_profile,
     get_run_profile,
+    list_run_profile_names,
 )
 from trainer_hightier.utils.canonical_mapping import (
     build_canonical_mapping_from_cleaned_session_parquet,
@@ -227,17 +228,19 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
             cleaned_path.resolve(),
         )
     else:
-        out_parquet = _hpre.preprocess_sessions_from_parquet_streaming(
+        out_parquet, session_dedup_effective = _hpre.preprocess_sessions_from_parquet_streaming(
             session_primary,
             cleaned_path,
             cfg=args.session_preprocess,
             duckdb_runtime=args.duckdb_runtime,
             extra_partition_sources=session_extras or None,
         )
+        if metrics is not None:
+            metrics["session_dedup_hash_buckets_effective"] = int(session_dedup_effective)
         _hpre.write_session_clean_cache_manifest(
             session_primary,
             out_parquet,
-            dedup_hash_buckets=args.session_preprocess.dedup_hash_buckets,
+            dedup_hash_buckets=int(session_dedup_effective),
             extra_source_session_parquets=session_extras or None,
             partition_inventory_fingerprint_sha256_hex=inv_fp,
         )
@@ -372,8 +375,12 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     duckdb_runtime=args.duckdb_runtime,
                     output_parquet=allowed_players_pq,
                 )
+                bet_dedup_eff = int(base_bet_cfg.dedup_hash_buckets)
+                mf_bkt = _hbet.bet_base_manifest_dedup_hash_buckets(base_bet_path)
+                if base_hit and mf_bkt is not None:
+                    bet_dedup_eff = int(mf_bkt)
                 if not base_hit:
-                    _hpre.preprocess_bets_from_parquet_streaming(
+                    _, bet_dedup_eff = _hpre.preprocess_bets_from_parquet_streaming(
                         bet_primary,
                         base_bet_path,
                         cfg=base_bet_cfg,
@@ -384,9 +391,15 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                         merged_bet_sources,
                         base_bet_path,
                         preprocess_registry_yaml=reg_yaml,
-                        dedup_hash_buckets=base_bet_cfg.dedup_hash_buckets,
+                        dedup_hash_buckets=int(bet_dedup_eff),
                         cleaned_session_parquet=cleaned_path,
                         partition_inventory_fingerprint_sha256_hex=inv_fp,
+                    )
+                elif not seg_hit and mf_bkt is None:
+                    logger.warning(
+                        "[Step 2b] bet base cache hit without readable manifest buckets; "
+                        "using nominal dedup_hash_buckets=%s for segment manifest fingerprint",
+                        bet_dedup_eff,
                     )
                 _hbet.segment_cleaned_bet_from_base_parquet(
                     base_bet_path,
@@ -398,7 +411,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     bet_primary,
                     cleaned_bet_path,
                     preprocess_registry_yaml=reg_yaml,
-                    dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
+                    dedup_hash_buckets=int(bet_dedup_eff),
                     cleaned_session_parquet=cleaned_path,
                     adt_filter_quantile=effective_bet_cfg.adt_filter_quantile,
                     patron_profile_csv=effective_bet_cfg.patron_profile_csv,
@@ -408,14 +421,14 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     bet_base_cleaned_parquet=base_bet_path,
                     partition_inventory_fingerprint_sha256_hex=inv_fp,
                 )
-                n_b = int(pq.ParquetFile(cleaned_bet_path).metadata.num_rows) if pq.ParquetFile(
-                    cleaned_bet_path
-                ).metadata else 0
+                n_b = _hbet.partitioned_cleaned_bet_total_rows(cleaned_bet_path)
                 logger.info(
                     "[Step 2b] bet preprocess OK (base+ADT segment): cleaned rows=%d; written %s",
                     n_b,
                     cleaned_bet_path,
                 )
+                if metrics is not None:
+                    metrics["bet_dedup_hash_buckets_effective"] = int(bet_dedup_eff)
         else:
             bet_cache_ok = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
                 bet_primary,
@@ -438,7 +451,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     cleaned_bet_path.resolve(),
                 )
             else:
-                out_b = _hpre.preprocess_bets_from_parquet_streaming(
+                out_b, bet_dedup_eff = _hpre.preprocess_bets_from_parquet_streaming(
                     bet_primary,
                     cleaned_bet_path,
                     cfg=effective_bet_cfg,
@@ -449,7 +462,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     bet_primary,
                     out_b,
                     preprocess_registry_yaml=reg_yaml,
-                    dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
+                    dedup_hash_buckets=int(bet_dedup_eff),
                     cleaned_session_parquet=cleaned_path,
                     adt_filter_quantile=effective_bet_cfg.adt_filter_quantile,
                     patron_profile_csv=effective_bet_cfg.patron_profile_csv,
@@ -458,12 +471,14 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     extra_source_bet_parquets=bet_extras_arg,
                     partition_inventory_fingerprint_sha256_hex=inv_fp,
                 )
-                n_b = int(pq.ParquetFile(out_b).metadata.num_rows) if pq.ParquetFile(out_b).metadata else 0
+                n_b = _hbet.partitioned_cleaned_bet_total_rows(out_b)
                 logger.info(
                     "[Step 2b] bet preprocess OK: cleaned rows=%d; written %s",
                     n_b,
                     out_b,
                 )
+                if metrics is not None:
+                    metrics["bet_dedup_hash_buckets_effective"] = int(bet_dedup_eff)
     elif bet_partition_paths and args.skip_bet_preprocess:
         logger.info(
             "[Step 2b] bet preprocess skipped (skip_bet_preprocess=True); %d bet shard(s) available",
@@ -478,7 +493,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         args.materialize_walkaway_labels
         and not args.skip_bet_preprocess
         and bool(bet_partition_paths)
-        and cleaned_bet_path.is_file()
+        and _hbet.cleaned_bet_dataset_has_any_parquet(cleaned_bet_path)
     ):
         if not mapping_parquet_path.is_file():
             logger.warning(
@@ -501,7 +516,7 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs) -> None:
     if not args.build_training_dataset:
         return
     cleaned_bet_path = _hpre.default_cleaned_bet_parquet_path()
-    if not cleaned_bet_path.is_file():
+    if not _hbet.cleaned_bet_dataset_has_any_parquet(cleaned_bet_path):
         logger.warning(
             "[Step 3] skip training dataset: cleaned bet missing at %s",
             cleaned_bet_path.resolve(),
@@ -578,6 +593,17 @@ def _build_argparser() -> argparse.ArgumentParser:
         help=(
             "Bypass preprocess disk caches (session-clean + bet-clean manifests) and recompute those steps. "
             "Heavy IO on large L0; --no-cache is an alternate spelling."
+        ),
+    )
+    p.add_argument(
+        "--run-profile",
+        type=str,
+        default=DEFAULT_RUN_PROFILE_NAME,
+        choices=list(list_run_profile_names()),
+        metavar="NAME",
+        help=(
+            "DuckDB PRAGMAs + session/bet dedup hash bucket counts (see trainer_hightier.config.RUN_PROFILES). "
+            "Use low_peak_memory or laptop_8g when Step 2b t_bet COPY hits DuckDB OOM."
         ),
     )
     p.add_argument(
@@ -664,7 +690,7 @@ def main() -> None:
             "--no-partition-snapshot is no longer supported: trainer_hightier is now partition-only. "
             "Provide --partition-snapshot-dir, or omit it to use <repo>/data/partitions."
         )
-    duckdb_rt, session_pre, bet_pre = configs_from_run_profile(get_run_profile(DEFAULT_RUN_PROFILE_NAME))
+    duckdb_rt, session_pre, bet_pre = configs_from_run_profile(get_run_profile(str(ns.run_profile)))
     corr = tuple(str(x).strip() for x in (ns.partition_correction_months or []) if str(x).strip())
     args = HighTierTrainArgs(
         output_dir=Path(".data") / "trainer_hightier" / "run",

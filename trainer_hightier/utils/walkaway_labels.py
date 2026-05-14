@@ -30,6 +30,11 @@ from trainer.labels import compute_labels
 
 from trainer_hightier.config import DuckDbRuntimeConfig
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
+from trainer_hightier.utils.bet_l0_preprocess import (
+    cleaned_bet_dataset_has_any_parquet,
+    first_parquet_under_for_schema,
+    resolved_cleaned_bet_read_parquet_sql,
+)
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 logger = logging.getLogger(__name__)
@@ -42,7 +47,7 @@ def _path_posix(path: Path) -> str:
 def default_cleaned_bet_parquet_path(*, repo_root: Path | None = None) -> Path:
     """Default cleaned bet input path (same default as Feast)."""
     base = Path(__file__).resolve().parents[2] if repo_root is None else repo_root
-    return (base / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet.parquet").resolve()
+    return (base / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet").resolve()
 
 
 def default_walkaway_labels_parquet_path(*, repo_root: Path | None = None) -> Path:
@@ -79,7 +84,7 @@ def materialize_walkaway_labels_from_cleaned_bet(
         ValueError: If required columns are absent from the cleaned bet schema.
     """
     src_bet = Path(cleaned_bet_parquet or default_cleaned_bet_parquet_path()).resolve()
-    if not src_bet.is_file():
+    if not (src_bet.is_file() or cleaned_bet_dataset_has_any_parquet(src_bet)):
         raise FileNotFoundError(f"cleaned bet parquet not found: {src_bet}")
     src_map = Path(canonical_mapping_parquet or default_canonical_mapping_parquet_path()).resolve()
     if not src_map.is_file():
@@ -88,12 +93,12 @@ def materialize_walkaway_labels_from_cleaned_bet(
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     need_bet = ("bet_id", "player_id", "payout_complete_dtm")
-    cols = set(pq.read_schema(src_bet).names)
+    cols = set(pq.read_schema(first_parquet_under_for_schema(src_bet)).names)
     missing = tuple(c for c in need_bet if c not in cols)
     if missing:
         raise ValueError(f"cleaned bet missing columns {list(missing)}; got {sorted(cols)}")
 
-    bet_esc = _path_posix(src_bet).replace("'", "''")
+    bet_from = resolved_cleaned_bet_read_parquet_sql(src_bet)
     map_esc = _path_posix(src_map).replace("'", "''")
     sql = f"""
 WITH cleaned AS (
@@ -101,7 +106,7 @@ WITH cleaned AS (
     TRY_CAST(bet_id AS DOUBLE) AS bet_id,
     TRY_CAST(player_id AS BIGINT) AS player_id,
     CAST(payout_complete_dtm AS TIMESTAMPTZ) AS payout_complete_dtm
-  FROM read_parquet('{bet_esc}')
+  FROM {bet_from} AS _cbet
 ),
 map_dedup AS (
   SELECT
@@ -135,7 +140,7 @@ SELECT bet_id, canonical_id, payout_complete_dtm FROM joined
         ).fetchone()[0]
         n_clean = con.execute(
             f"""
-            SELECT COUNT(*) FROM read_parquet('{bet_esc}')
+            SELECT COUNT(*) FROM {bet_from} AS _q
             WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
               AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
               AND payout_complete_dtm IS NOT NULL

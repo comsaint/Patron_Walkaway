@@ -33,10 +33,9 @@ from feast.types import Float64, Int64, String, UnixTimestamp
 from feast.value_type import ValueType
 
 _REPO_ROOT = Path(__file__).resolve().parent
-_CLEANED_BET_PARQUET = (_REPO_ROOT.parent / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet.parquet").resolve()
-
-# Absolute path so ``feast apply`` works from any CWD.
-_bet_source_path = str(_CLEANED_BET_PARQUET)
+_CLEANED_BET_DATASET = (_REPO_ROOT.parent / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet").resolve()
+# Glob all partition shards; hive-style directories use ``hive_partitioning=false`` in DuckDB reads.
+_bet_source_path = str((_CLEANED_BET_DATASET / "**" / "*.parquet").resolve()).replace("\\", "/")
 
 bet = Entity(
     name="bet",

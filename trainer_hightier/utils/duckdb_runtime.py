@@ -2,14 +2,86 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, TypeVar
+
+import duckdb
 
 from trainer_hightier.config import DuckDbRuntimeConfig
 
 T = TypeVar("T")
+
+_LOG = logging.getLogger("trainer_hightier")
+
+
+def degraded_runtime_config_after_oom(cfg: DuckDbRuntimeConfig) -> DuckDbRuntimeConfig | None:
+    """Return more conservative DuckDB threads after ``OutOfMemoryException``, or ``None`` if capped at 1."""
+
+    threads = cfg.threads
+    if threads is None:
+        return replace(cfg, threads=8, preserve_insertion_order=False)
+    if int(threads) <= 1:
+        return None
+    next_t = max(1, int(threads) // 2)
+    if next_t >= int(threads):
+        next_t = 1
+    return replace(cfg, threads=next_t, preserve_insertion_order=False)
+
+
+def run_with_fresh_duck_connections_oom_retry(
+    initial_cfg: DuckDbRuntimeConfig,
+    fn: Callable[[Any, int], T],
+    *,
+    max_attempts: int = 12,
+) -> tuple[T, DuckDbRuntimeConfig]:
+    """Run *fn(con, attempt_ix)* on fresh in-memory DuckDB connections; degrade threads on each OOM.
+
+    *fn* receives *con* after :func:`apply_duckdb_runtime_pragmas`. *attempt_ix* is the 0-based
+    loop index (``0`` on first try, ``1`` after one OOM, …) for progress labels only.
+    """
+
+    if max_attempts < 1:
+        raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
+    cfg = initial_cfg
+    last_oom: duckdb.OutOfMemoryException | None = None
+
+    for attempt_ix in range(int(max_attempts)):
+        con = duckdb.connect(database=":memory:")
+        try:
+            apply_duckdb_runtime_pragmas(con, cfg)
+            out = fn(con, attempt_ix)
+            return out, cfg
+        except duckdb.OutOfMemoryException as exc:
+            last_oom = exc
+            next_cfg = degraded_runtime_config_after_oom(cfg)
+            if next_cfg is None:
+                _LOG.warning(
+                    "trainer_hightier DuckDB OOM with threads<=1 (%s): %s; giving up.",
+                    getattr(cfg, "memory_limit", None),
+                    exc,
+                )
+                raise exc
+            _LOG.warning(
+                "trainer_hightier DuckDB OOM (attempt %d/%d): %s → retry threads %s→%s, memory_limit=%s",
+                attempt_ix + 1,
+                max_attempts,
+                exc,
+                cfg.threads,
+                next_cfg.threads,
+                next_cfg.memory_limit,
+            )
+            cfg = next_cfg
+        finally:
+            con.close()
+
+    if last_oom is not None:
+        raise last_oom
+    raise RuntimeError("duckdb oom retry: internal error")
+
 
 
 def _path_posix(path: Path) -> str:
@@ -105,6 +177,28 @@ def execute_sql_with_progress(
         con.execute(sql)
 
     run_with_query_progress(con, _run, desc=desc, join_timeout_s=join_timeout_s)
+
+
+def execute_sql_with_progress_oom_retry(
+    initial_cfg: DuckDbRuntimeConfig,
+    sql: str,
+    *,
+    desc: str,
+    join_timeout_s: float = 7200.0,
+    max_attempts: int = 12,
+) -> DuckDbRuntimeConfig:
+    """Like :func:`execute_sql_with_progress` but reopen DuckDB after each ``OutOfMemoryException``."""
+
+    def _fn(con: Any, attempt_ix: int) -> None:
+        dd = desc if attempt_ix == 0 else f"{desc} (OOM retry {attempt_ix})"
+        execute_sql_with_progress(con, sql, desc=dd, join_timeout_s=join_timeout_s)
+
+    _, cfg = run_with_fresh_duck_connections_oom_retry(
+        initial_cfg,
+        _fn,
+        max_attempts=max_attempts,
+    )
+    return cfg
 
 
 def execute_query_df_with_progress(

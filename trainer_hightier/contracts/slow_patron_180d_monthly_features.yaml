@@ -32,7 +32,7 @@ source_artifacts:
   canonical_mapping:
     relative_to_repo: trainer_hightier/artifacts/mapping/canonical_player_mapping.parquet
   cleaned_bet:
-    relative_to_repo: trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet.parquet
+    relative_to_repo: trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet
 
 materialized_artifact:
   relative_to_repo: trainer_hightier/artifacts/feast/slow_patron_180d_monthly.parquet

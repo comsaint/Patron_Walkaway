@@ -19,6 +19,9 @@ from typing import Final
 # Repo root (parent of ``trainer_hightier/``); used for default DuckDB spill path only.
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+# Upper bound when auto-doubling ``dedup_hash_buckets`` after DuckDB OOM (semantics-preserving).
+PREPROCESS_DEDUP_BUCKET_ESCALATION_CEILING: Final[int] = 256
+
 
 @dataclass(frozen=True)
 class DuckDbRuntimeConfig:
@@ -146,24 +149,37 @@ RUN_PROFILES: Final[dict[str, HighTierRunProfile]] = {
     "default": HighTierRunProfile(
         memory_limit="16GB",
         temp_directory=_default_paths_temp_dir(),
-        threads=None,
+        threads=2,
         max_temp_directory_size=None,
         preserve_insertion_order=False,
         session_engine="duckdb",
         session_dedup_hash_buckets=8,
         row_groups_per_shard=8,
-        bet_dedup_hash_buckets=8,
+        bet_dedup_hash_buckets=32,
     ),
     "laptop_8g": HighTierRunProfile(
         memory_limit="4GB",
         temp_directory=_default_paths_temp_dir(),
-        threads=4,
+        threads=1,
         max_temp_directory_size="20GiB",
         preserve_insertion_order=False,
         session_engine="duckdb",
         session_dedup_hash_buckets=16,
         row_groups_per_shard=8,
-        bet_dedup_hash_buckets=16,
+        bet_dedup_hash_buckets=32,
+    ),
+    # Large union of monthly t_bet shards: heavy ROW_NUMBER dedup; lower threads + more hash
+    # buckets reduce per-operator RAM vs ``default`` (see DuckDB perf guide).
+    "low_peak_memory": HighTierRunProfile(
+        memory_limit="10GB",
+        temp_directory=_default_paths_temp_dir(),
+        threads=1,
+        max_temp_directory_size="250GiB",
+        preserve_insertion_order=False,
+        session_engine="duckdb",
+        session_dedup_hash_buckets=16,
+        row_groups_per_shard=8,
+        bet_dedup_hash_buckets=32,
     ),
     "workstation_64g": HighTierRunProfile(
         memory_limit="48GB",

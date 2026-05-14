@@ -6,7 +6,7 @@
 
 | 區塊 | 說明 |
 |------|------|
-| **資料進場** | 本地 `gmwds_t_session.parquet`（必要）、`gmwds_t_bet.parquet`（後續步驟再驗證） |
+| **資料進場** | **僅** partition snapshot：`<repo>/data/partitions`（預設，**遞迴**掃描）或 `--partition-snapshot-dir` 下的 `t_session__part_YYYYMM.parquet` / `t_bet__part_YYYYMM.parquet`；**不再**讀 `<repo>/data/gmwds_t_*.parquet` 單檔 |
 | **Session 清洗** | L0 → 清洗後 Parquet（DuckDB 單段為預設；可選 pandas 分片後再 DuckDB merge） |
 | **訓練 / 特徵** | 多為 skeleton（`fit_model`、`write_artifacts` 等仍待實作） |
 | **評估 demo** | `python -m trainer_hightier` 為合成資料的 precision floor 示範，**不是**完整訓練 CLI |
@@ -31,14 +31,14 @@ trainer_hightier/
 
 ## 快速開始
 
-1. 在資料目錄放置 **`gmwds_t_session.parquet`**（預設路徑：`<repo>/data/`）。
+1. 在 **`<repo>/data/partitions`**（或自訂目錄）放置符合檔名的 shard；子目錄內的 parquet 也會掃到（例如 `data/partitions/20260512/...`）。至少需有 **session** shard；若要跑 bet 清洗與 Step 3，亦需 **bet** shard。
 2. 執行訓練骨架（會跑 Step 1–2，寫入預設清洗 Parquet）：
 
 ```bash
 python -m trainer_hightier.trainer
 ```
 
-可選：`--ignore-caches`（等同 `--no-cache`）— 略過 session/bet 預處理磁碟快取並強制重算；`--skip-training-dataset` — 不執行 Step 3（預設**會**跑 Feast + labels → `artifacts/training_data/training_set.parquet`）；`--skip-training-materialize-derived` — Step 3 內不重算 trial 1h / slow 180d 物化檔（若已存在且想省時間可加）。其餘為程式預設（資料目錄為 `<repo>/data`、`config.DEFAULT_RUN_PROFILE_NAME` 等）。
+可選：`--partition-snapshot-dir <已存在目錄>` — 不用預設的 `data/partitions`；`--ignore-caches`（等同 `--no-cache`）— 略過 session/bet 預處理磁碟快取並強制重算；`--skip-training-dataset` — 不執行 Step 3（預設**會**跑 Feast + labels → `artifacts/training_data/training_set.parquet`）；`--skip-training-materialize-derived` — Step 3 內不重算 trial 1h / slow 180d 物化檔（若已存在且想省時間可加）。**`--no-partition-snapshot` 已廢止**（會 `ValueError`）。其餘為程式預設（`config.DEFAULT_RUN_PROFILE_NAME` 等）。
 
 3. （可選）在 **已** `feast apply`、具 cleaned bet 與 `artifacts/labels/walkaway_labels.parquet` 後，匯出訓練表：
 
@@ -56,7 +56,7 @@ python -m trainer_hightier
 
 - **`DuckDbRuntimeConfig`**（`config.py`）：`memory_limit`、`temp_directory`、`threads`。透過 `trainer_hightier.utils.duckdb_runtime.apply_duckdb_runtime_pragmas` 套在連線上；**不**讀取 `trainer.core.config`。
 - **`SessionPreprocessConfig`**：`engine`（`duckdb` | `pandas_shards`）、`row_groups_per_shard`（僅 pandas 分片路徑）。
-- **`HighTierTrainArgs`**：程式化執行時可覆寫各欄；CLI 僅暴露是否略過預處理快取（`--ignore-caches`）。
+- **`HighTierTrainArgs`**：程式化執行時可覆寫各欄（含 **`partition_snapshot_dir`**，`None` 時等同 CLI 未指定、使用 `<repo>/data/partitions`）；CLI 另暴露 partition inventory、略過快取等旗標（見 [RUNBOOK.md](./RUNBOOK.md)）。
 
 預設清洗輸出路徑由 `02_preprocess.default_cleaned_session_parquet_path()` 決定（`trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_session.parquet`）。
 

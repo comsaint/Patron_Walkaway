@@ -11,9 +11,10 @@ import json
 import logging
 import tempfile
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 import duckdb
 import numpy as np
@@ -21,9 +22,13 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from trainer.core.schema_io import normalize_bets_sessions
-from trainer_hightier.config import DuckDbRuntimeConfig, SessionPreprocessConfig
+from trainer_hightier.config import (
+    PREPROCESS_DEDUP_BUCKET_ESCALATION_CEILING,
+    DuckDbRuntimeConfig,
+    SessionPreprocessConfig,
+)
 from trainer_hightier.utils.canonical_mapping import _CANONICAL_SESSION_COLS
-from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas, execute_sql_with_progress
+from trainer_hightier.utils.duckdb_runtime import execute_sql_with_progress_oom_retry
 
 _01_ingest = importlib.import_module("trainer_hightier.01_data_ingest")
 
@@ -264,44 +269,50 @@ def _preprocess_sessions_duckdb_single_copy(
     read_ordered = _session_preprocess_read_columns_ordered(schema_names)
     out_p = _path_posix(out).replace("'", "''")
 
-    con = duckdb.connect(database=":memory:")
-    try:
-        apply_duckdb_runtime_pragmas(con, duckdb_cfg)
-        if n == 1:
-            inner = _duckdb_session_clean_pipeline_select_sql(
-                src_clause,
-                read_cols_ordered=read_ordered,
-                dedup_bucket_id=None,
-                dedup_buckets=1,
-            )
-            sql = f"COPY ({inner}) TO '{out_p}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
-            execute_sql_with_progress(con, sql, desc="[Step 2] DuckDB session COPY")
-        else:
-            with tempfile.TemporaryDirectory(prefix="hightier_sess_bkt_", dir=out.parent) as tdir:
-                parts_dir = Path(tdir)
-                for b in range(n):
-                    inner = _duckdb_session_clean_pipeline_select_sql(
-                        src_clause,
-                        read_cols_ordered=read_ordered,
-                        dedup_bucket_id=b,
-                        dedup_buckets=n,
-                    )
-                    part_p = parts_dir / f"part_{b:04d}.parquet"
-                    part_esc = _path_posix(part_p).replace("'", "''")
-                    bsql = f"COPY ({inner}) TO '{part_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
-                    execute_sql_with_progress(
-                        con,
-                        bsql,
-                        desc=f"[Step 2] DuckDB session COPY bucket {b + 1}/{n}",
-                    )
-                glob_pat = str(parts_dir / "part_*.parquet").replace("\\", "/").replace("'", "''")
-                merge_sql = (
-                    f"COPY (SELECT * FROM read_parquet('{glob_pat}')) "
-                    f"TO '{out_p}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+    if n == 1:
+        inner = _duckdb_session_clean_pipeline_select_sql(
+            src_clause,
+            read_cols_ordered=read_ordered,
+            dedup_bucket_id=None,
+            dedup_buckets=1,
+        )
+        sql = f"COPY ({inner}) TO '{out_p}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+        execute_sql_with_progress_oom_retry(
+            duckdb_cfg,
+            sql,
+            desc="[Step 2] DuckDB session COPY",
+            join_timeout_s=7200.0,
+        )
+    else:
+        with tempfile.TemporaryDirectory(prefix="hightier_sess_bkt_", dir=out.parent) as tdir:
+            parts_dir = Path(tdir)
+            for b in range(n):
+                inner = _duckdb_session_clean_pipeline_select_sql(
+                    src_clause,
+                    read_cols_ordered=read_ordered,
+                    dedup_bucket_id=b,
+                    dedup_buckets=n,
                 )
-                execute_sql_with_progress(con, merge_sql, desc="[Step 2] DuckDB session merge buckets")
-    finally:
-        con.close()
+                part_p = parts_dir / f"part_{b:04d}.parquet"
+                part_esc = _path_posix(part_p).replace("'", "''")
+                bsql = f"COPY ({inner}) TO '{part_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+                execute_sql_with_progress_oom_retry(
+                    duckdb_cfg,
+                    bsql,
+                    desc=f"[Step 2] DuckDB session COPY bucket {b + 1}/{n}",
+                    join_timeout_s=7200.0,
+                )
+            glob_pat = str(parts_dir / "part_*.parquet").replace("\\", "/").replace("'", "''")
+            merge_sql = (
+                f"COPY (SELECT * FROM read_parquet('{glob_pat}')) "
+                f"TO '{out_p}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+            )
+            execute_sql_with_progress_oom_retry(
+                duckdb_cfg,
+                merge_sql,
+                desc="[Step 2] DuckDB session merge buckets",
+                join_timeout_s=7200.0,
+            )
 
 
 def _preprocess_sessions_pandas_shard_batches(
@@ -611,12 +622,12 @@ def _merge_session_shards_duckdb(
     ) TO '{output_path_posix}' (FORMAT PARQUET, COMPRESSION SNAPPY);
     """
     ddb = duckdb_runtime if duckdb_runtime is not None else DuckDbRuntimeConfig()
-    con = duckdb.connect(database=":memory:")
-    try:
-        apply_duckdb_runtime_pragmas(con, ddb)
-        execute_sql_with_progress(con, sql, desc="[Step 2] DuckDB merge shards")
-    finally:
-        con.close()
+    execute_sql_with_progress_oom_retry(
+        ddb,
+        sql,
+        desc="[Step 2] DuckDB merge shards",
+        join_timeout_s=7200.0,
+    )
 
 
 def preprocess_sessions_from_parquet_streaming(
@@ -626,7 +637,7 @@ def preprocess_sessions_from_parquet_streaming(
     cfg: SessionPreprocessConfig | None = None,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
     extra_partition_sources: tuple[Path, ...] | None = None,
-) -> Path:
+) -> tuple[Path, int]:
     """Clean ``t_session`` L0 Parquet → single cleaned Parquet.
 
     Default uses DuckDB end-to-end (no full pandas materialization). Optional
@@ -642,7 +653,7 @@ def preprocess_sessions_from_parquet_streaming(
             multi-file ``read_parquet`` after ``session_parquet``.
 
     Returns:
-        Resolved ``output_path``.
+        ``(resolved output_path, effective dedup_hash_buckets used)``.
     """
     src = Path(session_parquet).resolve()
     if not src.is_file():
@@ -669,13 +680,40 @@ def preprocess_sessions_from_parquet_streaming(
         raise ValueError("extra_partition_sources require SessionPreprocessConfig(engine='duckdb')")
     if _nb < 1:
         raise ValueError(f"SessionPreprocessConfig.dedup_hash_buckets must be >= 1, got {_nb}")
+    eff_buckets = int(_nb)
     if _cfg.engine == "duckdb":
-        logger.info(
-            "[Step 2] session preprocess: DuckDB COPY dedup_hash_buckets=%d → %s",
-            _nb,
-            out,
-        )
-        _preprocess_sessions_duckdb_single_copy(sources, out, _ddb, dedup_hash_buckets=_nb)
+        ceiling_eff = max(int(PREPROCESS_DEDUP_BUCKET_ESCALATION_CEILING), int(_nb))
+        b = int(_nb)
+        while True:
+            logger.info(
+                "[Step 2] session preprocess: DuckDB COPY dedup_hash_buckets=%d → %s",
+                b,
+                out,
+            )
+            try:
+                _preprocess_sessions_duckdb_single_copy(sources, out, _ddb, dedup_hash_buckets=b)
+            except duckdb.OutOfMemoryException as exc:
+                if b >= ceiling_eff:
+                    logger.warning(
+                        "[Step 2] DuckDB OOM at dedup_hash_buckets=%d (ceiling=%d); aborting escalate.",
+                        b,
+                        ceiling_eff,
+                    )
+                    raise exc
+                nb = min(ceiling_eff, b * 2)
+                if nb <= b:
+                    raise exc
+                logger.warning(
+                    "[Step 2] DuckDB OOM at dedup_hash_buckets=%s: %s — doubling buckets -> %s (ceiling=%s)",
+                    b,
+                    exc,
+                    nb,
+                    ceiling_eff,
+                )
+                b = nb
+                continue
+            eff_buckets = int(b)
+            break
     elif _cfg.engine == "pandas_shards":
         _preprocess_sessions_pandas_shard_batches(src, out, _cfg, _ddb)
     else:
@@ -685,11 +723,12 @@ def preprocess_sessions_from_parquet_streaming(
 
     nrows = int(pq.ParquetFile(out).metadata.num_rows) if pq.ParquetFile(out).metadata else 0
     logger.info(
-        "[Step 2] session preprocess done: %d rows written %s",
+        "[Step 2] session preprocess done: %d rows written dedup_hash_buckets_effective=%d %s",
         nrows,
+        eff_buckets,
         out,
     )
-    return out
+    return out, int(eff_buckets)
 
 
 def preprocess_sessions_from_parquet(session_parquet: Path) -> pd.DataFrame:
@@ -702,7 +741,7 @@ def preprocess_sessions_from_parquet(session_parquet: Path) -> pd.DataFrame:
     """
     with tempfile.TemporaryDirectory(prefix="hightier_sess_df_") as tmp:
         tpath = Path(tmp) / "cleaned.parquet"
-        preprocess_sessions_from_parquet_streaming(session_parquet, tpath)
+        preprocess_sessions_from_parquet_streaming(session_parquet, tpath)[0]
         return pd.read_parquet(tpath)
 
 
@@ -778,6 +817,27 @@ def build_session_clean_cache_record(
     return body
 
 
+def _session_manifest_matches_with_bucket_alias(
+    prev: dict[str, Any],
+    *,
+    nominal_buckets: int,
+    build_cur: Callable[[int], dict[str, Any]],
+) -> bool:
+    """True if *prev* equals current session fingerprint for nominal or persisted dedup buckets."""
+
+    nb = int(nominal_buckets)
+    if prev == build_cur(nb):
+        return True
+    raw = prev.get("session_dedup_hash_buckets")
+    try:
+        stored = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return False
+    if stored is None or stored == nb:
+        return False
+    return prev == build_cur(stored)
+
+
 def session_clean_cache_manifest_path(cleaned_parquet: Path) -> Path:
     """Sidecar JSON next to cleaned parquet: ``cleaned__gmwds_t_session.cache.json``."""
     cp = Path(cleaned_parquet)
@@ -803,15 +863,27 @@ def session_clean_cache_is_hit(
     except (OSError, json.JSONDecodeError, UnicodeError):
         return False
     try:
-        cur = build_session_clean_cache_record(
-            source_session_parquet,
-            dedup_hash_buckets=dedup_hash_buckets,
-            extra_source_session_parquets=extra_source_session_parquets,
-            partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+        nominal = (
+            int(dedup_hash_buckets)
+            if dedup_hash_buckets is not None
+            else SessionPreprocessConfig().dedup_hash_buckets
+        )
+
+        def _cur(nb: int) -> dict[str, Any]:
+            return build_session_clean_cache_record(
+                source_session_parquet,
+                dedup_hash_buckets=nb,
+                extra_source_session_parquets=extra_source_session_parquets,
+                partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+            )
+
+        return _session_manifest_matches_with_bucket_alias(
+            prev,
+            nominal_buckets=nominal,
+            build_cur=_cur,
         )
     except (FileNotFoundError, OSError):
         return False
-    return prev == cur
 
 
 def write_session_clean_cache_manifest(

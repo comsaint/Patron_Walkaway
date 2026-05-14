@@ -12,7 +12,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import duckdb
 import pandas as pd
 import pyarrow.parquet as pq
 
@@ -20,8 +19,8 @@ from trainer.identity import build_canonical_mapping_from_links
 
 from trainer_hightier.config import CanonicalMappingConfig, DuckDbRuntimeConfig
 from trainer_hightier.utils.duckdb_runtime import (
-    apply_duckdb_runtime_pragmas,
     execute_query_df_with_progress,
+    run_with_fresh_duck_connections_oom_retry,
 )
 
 logger = logging.getLogger("trainer_hightier")
@@ -177,10 +176,12 @@ def _duckdb_canonical_links_and_dummy(
     join_timeout_s: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame, datetime]:
     """Open DuckDB, compute cutoff, run links + dummy queries."""
-    con = duckdb.connect(database=":memory:")
-    try:
-        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
-        cutoff_raw = cfg.cutoff_dtm if cfg.cutoff_dtm is not None else _infer_cutoff_from_parquet(con, path_posix)
+    def _run(con: Any, attempt_ix: int) -> tuple[pd.DataFrame, pd.DataFrame, datetime]:
+        cutoff_raw = (
+            cfg.cutoff_dtm
+            if cfg.cutoff_dtm is not None
+            else _infer_cutoff_from_parquet(con, path_posix)
+        )
         cutoff_naive = _normalize_cutoff_naive_hk(cutoff_raw)
         cutoff_str = pd.Timestamp(cutoff_naive).strftime("%Y-%m-%d %H:%M:%S")
         links_sql, dummy_sql = _compose_links_dummy_sql(
@@ -190,21 +191,36 @@ def _duckdb_canonical_links_and_dummy(
             clean_sql=clean_sql,
             placeholder=placeholder,
         )
+        links_desc = (
+            "[Step 3] DuckDB canonical links"
+            if attempt_ix == 0
+            else f"[Step 3] DuckDB canonical links (OOM retry {attempt_ix})"
+        )
+        dummy_desc = (
+            "[Step 3] DuckDB canonical dummy (FND-12)"
+            if attempt_ix == 0
+            else f"[Step 3] DuckDB canonical dummy (FND-12) (OOM retry {attempt_ix})"
+        )
         links_df = execute_query_df_with_progress(
             con,
             links_sql,
-            desc="[Step 3] DuckDB canonical links",
+            desc=links_desc,
             join_timeout_s=join_timeout_s,
         )
         dummy_df = execute_query_df_with_progress(
             con,
             dummy_sql,
-            desc="[Step 3] DuckDB canonical dummy (FND-12)",
+            desc=dummy_desc,
             join_timeout_s=join_timeout_s,
         )
         return links_df, dummy_df, cutoff_naive
-    finally:
-        con.close()
+
+    (links_df, dummy_df, cutoff_naive), _ = run_with_fresh_duck_connections_oom_retry(
+        duckdb_runtime,
+        _run,
+        max_attempts=12,
+    )
+    return links_df, dummy_df, cutoff_naive
 
 
 def build_canonical_mapping_from_cleaned_session_parquet(

@@ -1,8 +1,9 @@
 # Feast feature repository (Feast 0.63.x).
 # CLI: from this directory run ``feast plan`` / ``feast apply``.
 #
-# Prerequisites: materialize cleaned bet Parquet (contains ``prediction_visible_ts_cf``), e.g.
-# ``trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet.parquet``.
+# Prerequisites: materialize cleaned bet Parquet shards under
+# ``trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet/`` (Hive ``gaming_month=gaming_day_key=`` tree;
+# each file still contains DATE ``gaming_day``).
 
 project: trainer_hightier_walkaway
 project_description: Local feature store for high-tier walkaway (cleaned t_bet Parquet).

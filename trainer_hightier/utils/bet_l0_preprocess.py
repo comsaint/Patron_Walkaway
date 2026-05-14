@@ -9,9 +9,11 @@ import hashlib
 import json
 import logging
 import re
+import shutil
 import tempfile
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import duckdb
 import numpy as np
@@ -19,12 +21,16 @@ import pandas as pd
 import pyarrow.parquet as pq
 import yaml
 from trainer.training.data_sources import _BET_INGEST_READ_COLS_ORDERED
-from trainer_hightier.config import BetPreprocessConfig, DuckDbRuntimeConfig
-from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas, execute_sql_with_progress
+from trainer_hightier.config import (
+    PREPROCESS_DEDUP_BUCKET_ESCALATION_CEILING,
+    BetPreprocessConfig,
+    DuckDbRuntimeConfig,
+)
+from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas, execute_sql_with_progress_oom_retry
 
 logger = logging.getLogger("trainer_hightier")
 
-_BET_CLEAN_CACHE_MANIFEST_VERSION = 7
+_BET_CLEAN_CACHE_MANIFEST_VERSION = 8
 
 
 def _duckdb_quote_ident(name: str) -> str:
@@ -275,6 +281,72 @@ def _bet_feast_prediction_visible_alignment_params() -> tuple[int, int]:
         return 1, 45
 
 
+def cleaned_bet_dataset_glob_posix(dataset_root: Path) -> str:
+    """POSIX glob matching all Parquet files under Hive-style cleaned-bet partitions."""
+
+    root = Path(dataset_root).resolve()
+    return str(root / "**" / "*.parquet").replace("\\", "/")
+
+
+def resolved_cleaned_bet_read_parquet_sql(path: Path) -> str:
+    """DuckDB ``read_parquet`` clause for cleaned bet artifacts (legacy file or partitioned dir).
+
+    Hive-style dirs (``gaming_month=*/gaming_day=*/``) disable automatic hive partitioning so DATE
+    ``gaming_day`` does not collide with partition folder keys.
+    """
+    p = Path(path).resolve()
+    if p.is_file():
+        esc = _path_posix(p).replace("'", "''")
+        return f"read_parquet('{esc}')"
+    if p.is_dir():
+        glo = cleaned_bet_dataset_glob_posix(p).replace("'", "''")
+        return f"read_parquet('{glo}', hive_partitioning=false)"
+    raise FileNotFoundError(f"cleaned bet artifact not found: {p}")
+
+
+def first_parquet_under_for_schema(dataset_root_or_file: Path) -> Path:
+    """Pick one readable Parquet (for ``pyarrow`` schema probing) under a rooted dataset."""
+
+    tgt = Path(dataset_root_or_file).resolve()
+    if tgt.is_file():
+        return tgt
+    if tgt.is_dir():
+        files = sorted(tgt.rglob("*.parquet"), key=lambda x: str(x))
+        if not files:
+            raise FileNotFoundError(f"No Parquet shards under partitioned cleaned bet dataset: {tgt}")
+        return files[0]
+    raise FileNotFoundError(tgt)
+
+
+def partitioned_cleaned_bet_total_rows(dataset_root_or_file: Path) -> int:
+    """Approximate ``SUM(num_rows)`` over Parquet footers (no full table scan)."""
+
+    p = Path(dataset_root_or_file).resolve()
+    if p.is_file():
+        meta = pq.ParquetFile(p).metadata
+        return int(meta.num_rows) if meta is not None else 0
+    if not p.is_dir():
+        return 0
+    total = 0
+    for f in sorted(p.rglob("*.parquet")):
+        meta = pq.ParquetFile(f).metadata
+        if meta is None:
+            continue
+        total += int(meta.num_rows)
+    return total
+
+
+def cleaned_bet_dataset_has_any_parquet(path: Path) -> bool:
+    """Return ``True`` if cleaned bet artifact exists as a parquet file or a non-empty parquet tree."""
+
+    p = Path(path).resolve()
+    if p.is_file():
+        return p.suffix.lower() == ".parquet"
+    if p.is_dir():
+        return any(p.rglob("*.parquet"))
+    return False
+
+
 def _duckdb_read_parquet_sources_sql(paths: list[Path]) -> str:
     """Build DuckDB ``read_parquet([...])`` or single-file variant."""
     if not paths:
@@ -417,6 +489,130 @@ ranked AS (
 """.strip()
 
 
+def _clear_partitioned_dataset_dir(dataset_root: Path) -> None:
+    """Remove an existing partitioned parquet tree before rewriting."""
+
+    r = Path(dataset_root).resolve()
+    if r.exists() and not r.is_dir():
+        raise ValueError(f"partitioned cleaned bet dataset path must be absent or directory: {r}")
+    if r.is_dir():
+        shutil.rmtree(r)
+    r.parent.mkdir(parents=True, exist_ok=True)
+    r.mkdir(parents=True, exist_ok=False)
+
+
+def _wrapped_bet_select_for_partitioned_copy(pipeline_sql: str) -> str:
+    """Hive-style COPY wrapper: emits ``gaming_month`` / ``gaming_day_key`` PARTITION_BY dirs."""
+
+    inner = pipeline_sql.strip()
+    return (
+        "SELECT\n"
+        "  p.*,\n"
+        "  strftime(TRY_CAST(p.gaming_day AS DATE), '%Y%m') AS gaming_month,\n"
+        "  strftime(TRY_CAST(p.gaming_day AS DATE), '%Y-%m-%d') AS gaming_day_key\n"
+        f"FROM ({inner}) AS p\n"
+    )
+
+
+def _consolidate_staged_bucket_partition_dirs(*, staged_root: Path, final_dataset_root: Path, n_buckets: int) -> None:
+    """Move per-bucket partition leaves into ``final_dataset_root`` with deterministic ``bucket_*.parquet`` names."""
+
+    for b in range(int(n_buckets)):
+        st = staged_root / f"b{b:04d}"
+        if not st.is_dir():
+            raise FileNotFoundError(f"missing staged bucket partition root: {st}")
+        bucket_label = f"bucket_{b:04d}.parquet"
+        for pq_src in sorted(st.rglob("*.parquet")):
+            rel_parent = pq_src.relative_to(st).parent  # hive dirs only
+            dest_dir = final_dataset_root / rel_parent
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / bucket_label
+            if dest.is_file():
+                dest.unlink()
+            shutil.move(str(pq_src), str(dest))
+
+
+def _partitioned_parquet_manifest_block(dataset_root: Path) -> dict[str, Any]:
+    """Fingerprint shard under a partitioned dataset root."""
+
+    root = Path(dataset_root).resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(f"partitioned artifact expected directory: {root}")
+    shards: list[dict[str, Any]] = []
+    total_rows = 0
+    root_s = root.as_posix()
+    for f in sorted(root.rglob("*.parquet")):
+        p = Path(f).resolve()
+        rel = str(p.relative_to(root)).replace("\\", "/")
+        st = p.stat()
+        meta = pq.ParquetFile(p).metadata
+        nrows = int(meta.num_rows) if meta is not None else -1
+        total_rows += max(nrows, 0)
+        shards.append(
+            {
+                "rel_path": rel,
+                "mtime_ns": int(st.st_mtime_ns),
+                "size_bytes": int(st.st_size),
+                "num_rows": int(nrows),
+            }
+        )
+    if not shards:
+        raise ValueError(f"partitioned dataset has no parquet files: {root}")
+    lines = ("\n".join(f"{x['rel_path']}:{x['mtime_ns']}:{x['size_bytes']}:{x['num_rows']}" for x in shards)).encode(
+        "utf-8",
+    )
+    digest = hashlib.sha256(lines).hexdigest()
+    return {
+        "kind": "gaming_day_partitioned_parquet_dataset_v1",
+        "dataset_root": root_s.replace("\\", "/"),
+        "shard_count": int(len(shards)),
+        "total_num_rows": int(total_rows),
+        "shard_list_sha256_hex": digest,
+        "shard_stats": shards,
+    }
+
+
+def _bet_artifact_manifest_block(path: Path) -> dict[str, Any]:
+    """Stat block supporting legacy single parquet or partitioned dataset."""
+
+    ap = Path(path).resolve()
+    if ap.is_file():
+        blk = _cleaned_parquet_row_stat(ap)
+        blk["manifest_storage_kind"] = "single_parquet_v1"
+        return blk
+    if ap.is_dir():
+        return _partitioned_parquet_manifest_block(ap)
+    raise FileNotFoundError(ap)
+
+
+def _enforce_no_null_gaming_day_partitioned(dataset_root: Path, *, duckdb_cfg: DuckDbRuntimeConfig) -> None:
+    root = Path(dataset_root).resolve()
+    if not any(root.rglob("*.parquet")):
+        return
+    glo = cleaned_bet_dataset_glob_posix(root).replace("'", "''")
+    sql = f"""
+SELECT COUNT(*) AS n_null
+FROM read_parquet('{glo}', hive_partitioning=false) AS _
+WHERE TRY_CAST(_.gaming_day AS DATE) IS NULL
+""".strip()
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_cfg)
+        n = int(con.execute(sql).fetchone()[0])
+    finally:
+        con.close()
+    if n > 0:
+        raise ValueError(
+            f"gaming_day null gate failed after partitioned bet preprocess: rows_with_null_date={n} root={dataset_root}"
+        )
+
+
+def cleaned_bet_artifact_fingerprint_block(path: Path) -> dict[str, Any]:
+    """JSON-serializable fingerprint for a cleaned bet file or partitioned dataset root."""
+
+    return _bet_artifact_manifest_block(path)
+
+
 def _preprocess_bets_duckdb_single_copy(
     source_parquets: list[Path],
     output_path: Path,
@@ -425,11 +621,15 @@ def _preprocess_bets_duckdb_single_copy(
     duckdb_cfg: DuckDbRuntimeConfig,
     cfg: BetPreprocessConfig,
 ) -> tuple[int, tuple[tuple[str, str], ...]]:
-    """Run DuckDB ``COPY`` pipeline; multi-pass hash buckets then merge when *dedup_hash_buckets* > 1."""
+    """Run DuckDB ``COPY`` into Hive-style ``gaming_month × gaming_day`` partition directories.
+
+    With multiple dedup buckets, writes staged partitioned trees then consolidates deterministic
+    ``bucket_*.parquet`` shards per leaf.
+    """
 
     if not source_parquets:
         raise ValueError("source_parquets must not be empty")
-    out = Path(output_path).resolve()
+    ds_root = Path(output_path).resolve()
     n = int(cfg.dedup_hash_buckets)
     if n < 1:
         raise ValueError(f"dedup_hash_buckets must be >= 1, got {n}")
@@ -438,35 +638,42 @@ def _preprocess_bets_duckdb_single_copy(
     cap_sec, _applied = _bet_cap_applied_rules(registry_yaml)
     tags = bulk_bet_episode_calendar_tags(registry_yaml)
     src_clause = _duckdb_read_parquet_sources_sql(source_parquets)
-    out_esc = _path_posix(out).replace("'", "''")
+    out_esc = _path_posix(ds_root).replace("'", "''")
     adt_allowed_esc = _resolve_adt_allowed_players_posix(cfg)
     if adt_allowed_esc is not None:
         logger.info("[Step 2b] bet preprocess ADT segment: early join to allowlist Parquet")
 
+    partition_opts = (
+        "FORMAT PARQUET, COMPRESSION SNAPPY, PARTITION_BY (gaming_month, gaming_day_key), OVERWRITE_OR_IGNORE TRUE"
+    )
+    _clear_partitioned_dataset_dir(ds_root)
+
     if n == 1:
-        con = duckdb.connect(database=":memory:")
-        try:
-            apply_duckdb_runtime_pragmas(con, duckdb_cfg)
-            inner = _duckdb_bet_clean_pipeline_select_sql(
-                src_read_parquet_clause=src_clause,
-                read_cols_ordered=read_ordered,
-                cap_sec=cap_sec,
-                tags=tags,
-                dedup_bucket_id=None,
-                dedup_buckets=1,
-                adt_allowed_players_posix=adt_allowed_esc,
-            )
-            sql = f"COPY ({inner}) TO '{out_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
-            execute_sql_with_progress(con, sql, desc="[Step 2b] DuckDB bet COPY")
-        finally:
-            con.close()
+        pipeline = _duckdb_bet_clean_pipeline_select_sql(
+            src_read_parquet_clause=src_clause,
+            read_cols_ordered=read_ordered,
+            cap_sec=cap_sec,
+            tags=tags,
+            dedup_bucket_id=None,
+            dedup_buckets=1,
+            adt_allowed_players_posix=adt_allowed_esc,
+        )
+        wrapped = _wrapped_bet_select_for_partitioned_copy(pipeline)
+        sql = f"COPY ({wrapped}) TO '{out_esc}' ({partition_opts})"
+        execute_sql_with_progress_oom_retry(
+            duckdb_cfg,
+            sql,
+            desc="[Step 2b] DuckDB bet partitioned COPY",
+            join_timeout_s=7200.0,
+        )
     else:
-        # Fresh connection per bucket (and merge): one long-lived :memory: run can retain
-        # allocator peaks across buckets; t_bet dedup windows are heavier than session.
-        with tempfile.TemporaryDirectory(prefix="hightier_bet_bkt_", dir=out.parent) as tdir:
-            parts_dir = Path(tdir)
+        with tempfile.TemporaryDirectory(prefix="hightier_bet_bkt_", dir=ds_root.parent) as tdir:
+            staged_parent = Path(tdir)
             for b in range(n):
-                inner = _duckdb_bet_clean_pipeline_select_sql(
+                staged_bucket = staged_parent / f"b{b:04d}"
+                staged_bucket.mkdir(parents=True, exist_ok=False)
+                st_esc = _path_posix(staged_bucket).replace("'", "''")
+                pipeline = _duckdb_bet_clean_pipeline_select_sql(
                     src_read_parquet_clause=src_clause,
                     read_cols_ordered=read_ordered,
                     cap_sec=cap_sec,
@@ -475,30 +682,20 @@ def _preprocess_bets_duckdb_single_copy(
                     dedup_buckets=n,
                     adt_allowed_players_posix=adt_allowed_esc,
                 )
-                part_p = parts_dir / f"part_{b:04d}.parquet"
-                part_esc = _path_posix(part_p).replace("'", "''")
-                bsql = f"COPY ({inner}) TO '{part_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
-                con_b = duckdb.connect(database=":memory:")
-                try:
-                    apply_duckdb_runtime_pragmas(con_b, duckdb_cfg)
-                    execute_sql_with_progress(
-                        con_b,
-                        bsql,
-                        desc=f"[Step 2b] DuckDB bet COPY bucket {b + 1}/{n}",
-                    )
-                finally:
-                    con_b.close()
-            glob_pat = str(parts_dir / "part_*.parquet").replace("\\", "/").replace("'", "''")
-            merge_sql = (
-                f"COPY (SELECT * FROM read_parquet('{glob_pat}')) "
-                f"TO '{out_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+                wrapped = _wrapped_bet_select_for_partitioned_copy(pipeline)
+                bsql = f"COPY ({wrapped}) TO '{st_esc}' ({partition_opts})"
+                execute_sql_with_progress_oom_retry(
+                    duckdb_cfg,
+                    bsql,
+                    desc=f"[Step 2b] DuckDB bet partitioned COPY bucket {b + 1}/{n}",
+                    join_timeout_s=7200.0,
+                )
+            _consolidate_staged_bucket_partition_dirs(
+                staged_root=staged_parent,
+                final_dataset_root=ds_root,
+                n_buckets=n,
             )
-            con_m = duckdb.connect(database=":memory:")
-            try:
-                apply_duckdb_runtime_pragmas(con_m, duckdb_cfg)
-                execute_sql_with_progress(con_m, merge_sql, desc="[Step 2b] DuckDB bet merge buckets")
-            finally:
-                con_m.close()
+    _enforce_no_null_gaming_day_partitioned(ds_root, duckdb_cfg=duckdb_cfg)
     return cap_sec, tags
 
 
@@ -509,8 +706,14 @@ def preprocess_bets_from_parquet_streaming(
     cfg: BetPreprocessConfig | None = None,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
     extra_partition_sources: tuple[Path, ...] | None = None,
-) -> Path:
-    """Clean full L0 ``gmwds_t_bet`` Parquet (DQ + synthetic observed cap + episode tags + dedupe)."""
+) -> tuple[Path, int]:
+    """Clean full L0 ``gmwds_t_bet`` Parquet (DQ + synthetic observed cap + episode tags + dedupe).
+
+    Returns
+    -------
+    tuple[Path, int]
+        ``(resolved output path, effective dedup_hash_buckets used)``.
+    """
     src = Path(bet_parquet).resolve()
     if not src.is_file():
         raise FileNotFoundError(src)
@@ -525,7 +728,9 @@ def preprocess_bets_from_parquet_streaming(
         sources_list = sorted(uniq.values(), key=lambda x: str(x))
     out = Path(output_path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
-    if out.is_file():
+    if out.exists() and out.is_dir():
+        shutil.rmtree(out)
+    elif out.exists() and out.is_file():
         out.unlink()
     _cfg = cfg if cfg is not None else BetPreprocessConfig()
     if _cfg.engine != "duckdb":
@@ -537,29 +742,62 @@ def preprocess_bets_from_parquet_streaming(
     _nb = int(_cfg.dedup_hash_buckets)
     if _nb < 1:
         raise ValueError(f"BetPreprocessConfig.dedup_hash_buckets must be >= 1, got {_nb}")
-    logger.info(
-        "[Step 2b] bet preprocess: DuckDB COPY registry=%s dedup_hash_buckets=%d -> %s",
-        reg,
-        _nb,
-        out,
-    )
-    cap_sec, tags = _preprocess_bets_duckdb_single_copy(
-        sources_list, out, registry_yaml=reg, duckdb_cfg=_ddb, cfg=_cfg
-    )
-    nrows = int(pq.ParquetFile(out).metadata.num_rows) if pq.ParquetFile(out).metadata else 0
-    logger.info(
-        "[Step 2b] bet preprocess done: rows=%d cap_sec=%s bulk_episode_days=%s written %s",
-        nrows,
-        cap_sec,
-        len(tags),
-        out,
-    )
-    return out
+    ceiling_eff = max(int(PREPROCESS_DEDUP_BUCKET_ESCALATION_CEILING), int(_nb))
+    b = int(_nb)
+    while True:
+        cfg_try = replace(_cfg, dedup_hash_buckets=b)
+        logger.info(
+            "[Step 2b] bet preprocess: DuckDB COPY registry=%s dedup_hash_buckets=%d -> %s",
+            reg,
+            b,
+            out,
+        )
+        try:
+            cap_sec, tags = _preprocess_bets_duckdb_single_copy(
+                sources_list,
+                out,
+                registry_yaml=reg,
+                duckdb_cfg=_ddb,
+                cfg=cfg_try,
+            )
+        except duckdb.OutOfMemoryException as exc:
+            if b >= ceiling_eff:
+                logger.warning(
+                    "[Step 2b] DuckDB OOM at dedup_hash_buckets=%d (ceiling=%d); aborting escalate.",
+                    b,
+                    ceiling_eff,
+                )
+                raise exc
+            nb = min(ceiling_eff, b * 2)
+            if nb <= b:
+                raise exc
+            logger.warning(
+                "[Step 2b] DuckDB OOM at dedup_hash_buckets=%s: %s — doubling buckets -> %s (ceiling=%s)",
+                b,
+                exc,
+                nb,
+                ceiling_eff,
+            )
+            b = nb
+            continue
+
+        nrows = partitioned_cleaned_bet_total_rows(out)
+        logger.info(
+            "[Step 2b] bet preprocess done: rows=%d cap_sec=%s bulk_episode_days=%s "
+            "dedup_hash_buckets_effective=%d written %s",
+            nrows,
+            cap_sec,
+            len(tags),
+            b,
+            out,
+        )
+        return out, int(b)
 
 
 def default_cleaned_bet_base_parquet_path() -> Path:
-    """Intermediate all-players cleaned bet prior to optional ADT projection."""
-    return Path(__file__).resolve().parents[1] / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet_base.parquet"
+    """Intermediate all-players cleaned bet partition root (prior to optional ADT projection)."""
+
+    return Path(__file__).resolve().parents[1] / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet_base"
 
 
 def segment_cleaned_bet_from_base_parquet(
@@ -569,42 +807,51 @@ def segment_cleaned_bet_from_base_parquet(
     *,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
 ) -> Path:
-    """Project cleaned all-players bets to ADT segment via semi-join allowlist."""
+    """Project partitioned all-player bets onto ADT allowlist rows; rewritten as Hive partitioned output."""
 
     base = Path(base_cleaned_parquet).resolve()
     allow = Path(allowlist_parquet).resolve()
     out = Path(output_parquet).resolve()
-    if not base.is_file():
+    legacy_base_ok = base.is_file() or cleaned_bet_dataset_has_any_parquet(base)
+    if not legacy_base_ok:
         raise FileNotFoundError(base)
     if not allow.is_file():
         raise FileNotFoundError(allow)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if out.is_file():
-        out.unlink()
-    b_esc = _path_posix(base).replace("'", "''")
+    b_from = resolved_cleaned_bet_read_parquet_sql(base)
     a_esc = _path_posix(allow).replace("'", "''")
     o_esc = _path_posix(out).replace("'", "''")
+    partition_opts = (
+        "FORMAT PARQUET, COMPRESSION SNAPPY, PARTITION_BY (gaming_month, gaming_day_key), OVERWRITE_OR_IGNORE TRUE"
+    )
     sql = f"""
 COPY (
-  SELECT DISTINCT b.*
-  FROM read_parquet('{b_esc}') AS b
-  INNER JOIN (
-    SELECT TRY_CAST(player_id AS BIGINT) AS pid
-    FROM read_parquet('{a_esc}')
-    WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
-  ) AS a ON TRY_CAST(b.player_id AS BIGINT) = a.pid
-) TO '{o_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+  SELECT
+    s.*,
+    strftime(TRY_CAST(s.gaming_day AS DATE), '%Y%m') AS gaming_month,
+    strftime(TRY_CAST(s.gaming_day AS DATE), '%Y-%m-%d') AS gaming_day_key
+  FROM (
+    SELECT DISTINCT b.*
+    FROM {b_from} AS b
+    INNER JOIN (
+      SELECT TRY_CAST(player_id AS BIGINT) AS pid
+      FROM read_parquet('{a_esc}')
+      WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
+    ) AS a ON TRY_CAST(b.player_id AS BIGINT) = a.pid
+  ) AS s
+) TO '{o_esc}' ({partition_opts})
 """.strip()
-    con = duckdb.connect(database=":memory:")
-    try:
-        ddb = duckdb_runtime if duckdb_runtime is not None else DuckDbRuntimeConfig()
-        apply_duckdb_runtime_pragmas(con, ddb)
-        execute_sql_with_progress(con, sql, desc="[Step 2b] DuckDB segment bet from base")
-    finally:
-        con.close()
-    nrows = int(pq.ParquetFile(out).metadata.num_rows) if pq.ParquetFile(out).metadata else 0
+    ddb = duckdb_runtime if duckdb_runtime is not None else DuckDbRuntimeConfig()
+    _clear_partitioned_dataset_dir(out)
+    execute_sql_with_progress_oom_retry(
+        ddb,
+        sql,
+        desc="[Step 2b] DuckDB segment bet from base",
+        join_timeout_s=7200.0,
+    )
+    _enforce_no_null_gaming_day_partitioned(out, duckdb_cfg=ddb)
+    nrows = partitioned_cleaned_bet_total_rows(out)
     logger.info(
-        "[Step 2b] segmented bet parquet from base rows=%d -> %s",
+        "[Step 2b] segmented bet dataset from base rows=%d -> %s",
         nrows,
         out.resolve(),
     )
@@ -612,9 +859,50 @@ COPY (
 
 
 def bet_base_clean_cache_manifest_path(base_cleaned_parquet: Path) -> Path:
-    """Sidecar manifest for intermediate base cleaned bet parquet."""
+    """Sidecar manifest for intermediate base cleaned bet artefact."""
+
     p = Path(base_cleaned_parquet).resolve()
-    return p.parent / f"{p.stem}.cache.json"
+    if p.is_file():
+        return p.parent / f"{p.stem}.cache.json"
+    return p.parent / f"{p.name}.cache.json"
+
+
+def bet_base_manifest_dedup_hash_buckets(base_cleaned_parquet: Path) -> int | None:
+    """Return ``bet_dedup_hash_buckets`` from existing base-clean cache manifest, or ``None``."""
+    bp = Path(base_cleaned_parquet).resolve()
+    man = bet_base_clean_cache_manifest_path(bp)
+    if not man.is_file():
+        return None
+    try:
+        prev = json.loads(man.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    raw = prev.get("bet_dedup_hash_buckets")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _bet_manifest_matches_with_bucket_alias(
+    prev: dict[str, Any],
+    *,
+    nominal_buckets: int,
+    build_cur: Callable[[int], dict[str, Any]],
+) -> bool:
+    """Cache hit if *prev* equals current fingerprint for nominal or persisted bucket count."""
+
+    nb = int(nominal_buckets)
+    if prev == build_cur(nb):
+        return True
+    raw = prev.get("bet_dedup_hash_buckets")
+    try:
+        stored = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return False
+    if stored is None or stored == nb:
+        return False
+    return prev == build_cur(stored)
 
 
 def build_bet_base_clean_cache_record(
@@ -688,7 +976,8 @@ def bet_base_clean_cache_is_hit(
 
     bp = Path(base_cleaned_parquet).resolve()
     man = bet_base_clean_cache_manifest_path(bp)
-    if not bp.is_file() or not man.is_file():
+    base_ready = bp.is_file() or (bp.is_dir() and cleaned_bet_dataset_has_any_parquet(bp))
+    if not base_ready or not man.is_file():
         return False
     try:
         prev = json.loads(man.read_text(encoding="utf-8"))
@@ -696,16 +985,29 @@ def bet_base_clean_cache_is_hit(
         return False
     try:
         reg = _resolve_preprocess_registry(preprocess_registry_yaml)
-        cur = build_bet_base_clean_cache_record(
-            source_bet_parquets,
-            preprocess_registry_yaml=reg,
-            dedup_hash_buckets=dedup_hash_buckets,
-            cleaned_session_parquet=cleaned_session_parquet,
-            partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+
+        nominal = (
+            int(dedup_hash_buckets)
+            if dedup_hash_buckets is not None
+            else BetPreprocessConfig().dedup_hash_buckets
+        )
+
+        def _cur(nb: int) -> dict[str, Any]:
+            return build_bet_base_clean_cache_record(
+                source_bet_parquets,
+                preprocess_registry_yaml=reg,
+                dedup_hash_buckets=nb,
+                cleaned_session_parquet=cleaned_session_parquet,
+                partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+            )
+
+        return _bet_manifest_matches_with_bucket_alias(
+            prev,
+            nominal_buckets=nominal,
+            build_cur=_cur,
         )
     except (FileNotFoundError, OSError, ImportError, ValueError):
         return False
-    return prev == cur
 
 
 def write_bet_base_clean_cache_manifest(
@@ -866,7 +1168,7 @@ def build_bet_clean_cache_record(
             {
                 "manifest_kind": "bet_clean_segment_projection_v1",
                 "source_bets": sources_stats,
-                "bet_base_cleaned": _cleaned_parquet_row_stat(base_p),
+                "bet_base_cleaned": _bet_artifact_manifest_block(base_p),
                 "adt_segment": seg,
             }
         )
@@ -882,13 +1184,18 @@ def build_bet_clean_cache_record(
 
 
 def default_cleaned_bet_parquet_path() -> Path:
-    """``trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet.parquet``."""
-    return Path(__file__).resolve().parents[1] / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet.parquet"
+    """Segmented cleaned bet Hive-partition dataset root."""
+
+    return Path(__file__).resolve().parents[1] / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet"
 
 
 def bet_clean_cache_manifest_path(cleaned_parquet: Path) -> Path:
-    """Sidecar JSON next to cleaned bet parquet (``*.cache.json``)."""
-    return Path(cleaned_parquet).parent / f"{Path(cleaned_parquet).stem}.cache.json"
+    """Sidecar JSON for cleaned bet cache (single Parquet legacy or partitioned dataset root)."""
+
+    p = Path(cleaned_parquet).resolve()
+    if p.is_file():
+        return p.parent / f"{p.stem}.cache.json"
+    return p.parent / f"{p.name}.cache.json"
 
 
 def bet_clean_cache_is_hit(
@@ -906,20 +1213,27 @@ def bet_clean_cache_is_hit(
     bet_base_cleaned_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
 ) -> bool:
-    cleaned = Path(cleaned_parquet)
+    cleaned = Path(cleaned_parquet).resolve()
     reg = _resolve_preprocess_registry(preprocess_registry_yaml)
     man = bet_clean_cache_manifest_path(cleaned)
-    if not cleaned.is_file() or not man.is_file():
+    ready = cleaned.is_file() or (cleaned.is_dir() and cleaned_bet_dataset_has_any_parquet(cleaned))
+    if not ready or not man.is_file():
         return False
     try:
         prev = json.loads(man.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeError):
         return False
-    try:
-        cur = build_bet_clean_cache_record(
+    nominal = (
+        int(dedup_hash_buckets)
+        if dedup_hash_buckets is not None
+        else BetPreprocessConfig().dedup_hash_buckets
+    )
+
+    def _cur(nb: int) -> dict[str, Any]:
+        return build_bet_clean_cache_record(
             source_bet_parquet,
             preprocess_registry_yaml=reg,
-            dedup_hash_buckets=dedup_hash_buckets,
+            dedup_hash_buckets=nb,
             cleaned_session_parquet=cleaned_session_parquet,
             adt_filter_quantile=adt_filter_quantile,
             patron_profile_csv=patron_profile_csv,
@@ -929,9 +1243,15 @@ def bet_clean_cache_is_hit(
             bet_base_cleaned_parquet=bet_base_cleaned_parquet,
             partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
         )
+
+    try:
+        return _bet_manifest_matches_with_bucket_alias(
+            prev,
+            nominal_buckets=nominal,
+            build_cur=_cur,
+        )
     except (FileNotFoundError, OSError, ImportError, ValueError):
         return False
-    return prev == cur
 
 
 def write_bet_clean_cache_manifest(

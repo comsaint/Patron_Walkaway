@@ -15,7 +15,7 @@ partition_keys:
 order_by: payout_complete_dtm ASC, bet_id ASC
 
 source_artifact:
-  relative_to_repo: trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet.parquet
+  relative_to_repo: trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet
 materialized_artifact:
   relative_to_repo: trainer_hightier/artifacts/feast/trial_bet_behavior_1h.parquet
 

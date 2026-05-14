@@ -26,6 +26,12 @@ import pyarrow.parquet as pq
 
 from trainer_hightier.config import DuckDbRuntimeConfig
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
+from trainer_hightier.utils.bet_l0_preprocess import (
+    cleaned_bet_artifact_fingerprint_block,
+    cleaned_bet_dataset_has_any_parquet,
+    first_parquet_under_for_schema,
+    resolved_cleaned_bet_read_parquet_sql,
+)
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 logger = logging.getLogger(__name__)
@@ -70,7 +76,7 @@ def _slow_materialize_cache_expected_record(
         "expect_output_path": str(dst),
         "cleaned_session": _parquet_input_stat(cleaned_session_parquet),
         "canonical_mapping": _parquet_input_stat(canonical_mapping_parquet),
-        "cleaned_bet": _parquet_input_stat(cleaned_bet_parquet),
+        "cleaned_bet": cleaned_bet_artifact_fingerprint_block(cleaned_bet_parquet),
     }
 
 
@@ -93,7 +99,7 @@ def default_cleaned_session_parquet_path(*, repo_root: Path | None = None) -> Pa
 def default_cleaned_bet_parquet_path(*, repo_root: Path | None = None) -> Path:
     """Default cleaned bet Parquet."""
     base = Path(__file__).resolve().parents[2] if repo_root is None else repo_root
-    return (base / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet.parquet").resolve()
+    return (base / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet").resolve()
 
 
 def default_slow_patron_180d_monthly_parquet_path(*, repo_root: Path | None = None) -> Path:
@@ -106,7 +112,7 @@ def _materialize_sql(
     *,
     sess_esc: str,
     map_esc: str,
-    bet_esc: str,
+    bet_from_sql: str,
     lookback_days: int,
 ) -> str:
     if lookback_days < 1:
@@ -176,7 +182,7 @@ bet_base AS (
       CAST(b.gaming_day AS DATE),
       CAST(CAST(b.payout_complete_dtm AS TIMESTAMPTZ) AS DATE)
     ) AS bet_gaming_day
-  FROM read_parquet('{bet_esc}') b
+  FROM {bet_from_sql} AS b
   INNER JOIN map_dedup m ON TRY_CAST(b.player_id AS BIGINT) = m.player_id
   WHERE TRY_CAST(b.bet_id AS DOUBLE) IS NOT NULL
     AND b.prediction_visible_ts_cf IS NOT NULL
@@ -244,10 +250,13 @@ def materialize_slow_patron_180d_monthly(
     for p, name in (
         (src_sess, "cleaned session"),
         (src_map, "canonical mapping"),
-        (src_bet, "cleaned bet"),
     ):
         if not p.is_file():
             raise FileNotFoundError(f"{name} parquet not found: {p}")
+
+    ok_bet = src_bet.is_file() or cleaned_bet_dataset_has_any_parquet(src_bet)
+    if not ok_bet:
+        raise FileNotFoundError(f"cleaned bet parquet not found: {src_bet}")
 
     expect = _slow_materialize_cache_expected_record(
         cleaned_session_parquet=src_sess,
@@ -276,7 +285,7 @@ def materialize_slow_patron_180d_monthly(
     if miss_s:
         raise ValueError(f"cleaned session missing columns {miss_s}; got {sorted(sess_cols)}")
 
-    bet_cols = set(pq.read_schema(src_bet).names)
+    bet_cols = set(pq.read_schema(first_parquet_under_for_schema(src_bet)).names)
     need_bet = frozenset(
         {"bet_id", "player_id", "payout_complete_dtm", "prediction_visible_ts_cf", "__etl_insert_Dtm_synthetic"}
     )
@@ -296,8 +305,10 @@ def materialize_slow_patron_180d_monthly(
 
     sess_esc = _path_posix(src_sess).replace("'", "''")
     map_esc = _path_posix(src_map).replace("'", "''")
-    bet_esc = _path_posix(src_bet).replace("'", "''")
-    inner = _materialize_sql(sess_esc=sess_esc, map_esc=map_esc, bet_esc=bet_esc, lookback_days=lookback_days)
+    bet_from_sql = resolved_cleaned_bet_read_parquet_sql(src_bet)
+    inner = _materialize_sql(
+        sess_esc=sess_esc, map_esc=map_esc, bet_from_sql=bet_from_sql, lookback_days=lookback_days
+    )
     dst_esc = _path_posix(dst).replace("'", "''")
 
     con = duckdb.connect(database=":memory:")

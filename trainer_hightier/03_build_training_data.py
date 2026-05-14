@@ -46,6 +46,10 @@ import pyarrow.parquet as pq
 
 from trainer_hightier.config import DuckDbRuntimeConfig, configs_from_run_profile, get_run_profile
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
+from trainer_hightier.utils.bet_l0_preprocess import (
+    cleaned_bet_dataset_has_any_parquet,
+    resolved_cleaned_bet_read_parquet_sql,
+)
 from trainer_hightier.utils.slow_patron_180d_monthly import (
     default_slow_patron_180d_monthly_parquet_path,
     materialize_slow_patron_180d_monthly,
@@ -62,7 +66,7 @@ _DEFAULT_RUN_PROFILE = "default"
 TRAINER_HIGHTIER_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = TRAINER_HIGHTIER_ROOT.parent
 DEFAULT_FEAST_REPO = TRAINER_HIGHTIER_ROOT / "feast_repo"
-DEFAULT_CLEANED_BET = TRAINER_HIGHTIER_ROOT / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet.parquet"
+DEFAULT_CLEANED_BET = TRAINER_HIGHTIER_ROOT / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet"
 DEFAULT_LABELS = TRAINER_HIGHTIER_ROOT / "artifacts" / "labels" / "walkaway_labels.parquet"
 DEFAULT_TRAINING_DIR = TRAINER_HIGHTIER_ROOT / "artifacts" / "training_data"
 DEFAULT_OUTPUT = DEFAULT_TRAINING_DIR / "training_set.parquet"
@@ -102,8 +106,9 @@ def _validate_prereqs(
         raise FileNotFoundError(
             f"Feast registry missing at {reg}; run `feast apply` from {feast_repo.resolve()}."
         )
-    if not cleaned_bet.is_file():
-        raise FileNotFoundError(f"Cleaned bet Parquet not found: {cleaned_bet}")
+    cb = Path(cleaned_bet).resolve()
+    if not (cb.is_file() or cleaned_bet_dataset_has_any_parquet(cb)):
+        raise FileNotFoundError(f"Cleaned bet artefact not found: {cb}")
     if not labels_parquet.is_file():
         raise FileNotFoundError(
             f"Labels Parquet not found: {labels_parquet} "
@@ -152,10 +157,10 @@ def _add_one_month_calendar(d: date) -> date:
 
 def _prediction_visible_month_starts(cleaned_bet: Path, *, duckdb_runtime: DuckDbRuntimeConfig) -> list[date]:
     """Distinct calendar months (UTC TIMESTAMP cast) covering ``prediction_visible_ts_cf``."""
-    bet_esc = _path_posix(cleaned_bet).replace("'", "''")
+    bet_from = resolved_cleaned_bet_read_parquet_sql(cleaned_bet)
     sql = f"""
 SELECT CAST(DATE_TRUNC('month', CAST(prediction_visible_ts_cf AS TIMESTAMP)) AS DATE) AS m
-FROM read_parquet('{bet_esc}')
+FROM {bet_from} AS _cb
 WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
   AND prediction_visible_ts_cf IS NOT NULL
 GROUP BY 1 ORDER BY 1
@@ -187,7 +192,7 @@ def _write_entity_parquet(
     month_start: date | None = None,
     month_end_exclusive: date | None = None,
 ) -> int:
-    bet_esc = _path_posix(cleaned_bet).replace("'", "''")
+    bet_from = resolved_cleaned_bet_read_parquet_sql(cleaned_bet)
     ent_esc = _path_posix(entity_out).replace("'", "''")
     lim = f"LIMIT {int(max_rows)}" if max_rows is not None else ""
     filt = ""
@@ -203,7 +208,7 @@ COPY (
   SELECT
     TRY_CAST(bet_id AS DOUBLE) AS bet_id,
     CAST(prediction_visible_ts_cf AS TIMESTAMPTZ) AS event_timestamp
-  FROM read_parquet('{bet_esc}')
+  FROM {bet_from} AS _cb
   WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
     AND prediction_visible_ts_cf IS NOT NULL
     {filt}
