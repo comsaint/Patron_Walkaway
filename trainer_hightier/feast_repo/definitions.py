@@ -7,6 +7,10 @@
 離線擷取：見 ``feature_store.yaml`` 的 ``offline_store.type: duckdb``（需
 ``ibis-framework``；見 repo 根目錄 ``requirements.txt``）。
 
+DuckDB 離線路徑：``FileSource`` 必須帶 ``file_format=ParquetFormat()``，否則
+Feast 0.63 的 ``_read_data_source`` 在 ``file_format is None`` 時會回傳 ``None``，
+``get_historical_features`` 觸發 ``'NoneType' object has no attribute 'mutate'``。
+
 Explicit ``schema``：避免 Feast 對 ``gaming_day`` 的 ``date32`` 做 schema inference
 時觸發不支援的型別對應（與本 repo 的 ``feast==0.63.0`` 行為一致）。
 
@@ -24,6 +28,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from feast import Entity, FeatureService, FeatureView, Field, FileSource
+from feast.data_format import ParquetFormat
 from feast.types import Float64, Int64, String, UnixTimestamp
 from feast.value_type import ValueType
 
@@ -43,6 +48,7 @@ bet = Entity(
 cleaned_bet_source = FileSource(
     name="cleaned_bet_parquet",
     path=_bet_source_path,
+    file_format=ParquetFormat(),
     timestamp_field="prediction_visible_ts_cf",
     created_timestamp_column="__etl_insert_Dtm_synthetic",
 )
@@ -100,6 +106,7 @@ _trial_1h_source_path = str(_TRIAL_1H_PARQUET)
 trial_bet_behavior_1h_source = FileSource(
     name="trial_bet_behavior_1h_parquet",
     path=_trial_1h_source_path,
+    file_format=ParquetFormat(),
     timestamp_field="prediction_visible_ts_cf",
     created_timestamp_column="__etl_insert_Dtm_synthetic",
 )
@@ -130,6 +137,7 @@ _slow_180_source_path = str(_SLOW_180_PARQUET)
 slow_patron_180d_monthly_source = FileSource(
     name="slow_patron_180d_monthly_parquet",
     path=_slow_180_source_path,
+    file_format=ParquetFormat(),
     timestamp_field="prediction_visible_ts_cf",
     created_timestamp_column="__etl_insert_Dtm_synthetic",
 )
