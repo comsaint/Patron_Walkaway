@@ -75,8 +75,8 @@ class BetPreprocessConfig:
     **ADT patron segment:** when ``adt_filter_quantile`` is set (e.g. ``0.99``), keep only bets whose
     ``player_id`` appears in ``adt_allowed_players_parquet`` (one row per allowed ``player_id``, written
     upstream from ``patron_profile_csv`` + ``canonical_mapping_parquet`` via ADT quantile threshold).
-    ``patron_profile_csv`` / ``canonical_mapping_parquet`` remain on the config for cache fingerprints
-    and trainer orchestration; bet DuckDB joins **only** the allowlist Parquet (early filter, lower RAM).
+    ``patron_profile_csv`` / ``canonical_mapping_parquet`` remain on the config for DuckDB joins and
+    trainer orchestration; the bet disk-cache fingerprint does **not** bind cleaned session stats.
     Paths are normally injected by :func:`trainer_hightier.trainer.prepare_training_frame`.
     """
 
@@ -195,6 +195,20 @@ RUN_PROFILES: Final[dict[str, HighTierRunProfile]] = {
 }
 
 DEFAULT_RUN_PROFILE_NAME: Final[str] = "default"
+
+
+@dataclass(frozen=True)
+class Step4SplitConfig:
+    """Deterministic train/val/test split on distinct ``gaming_day`` (calendar order).
+
+    Fractions apply to the **ordered distinct** gaming days, not row counts.
+    ``test`` receives the remainder after train and val.
+    """
+
+    train_day_fraction: float = 0.70
+    val_day_fraction: float = 0.15
+    #: When ``None``, defaults to ``trainer_hightier/artifacts/training_data/splits``.
+    splits_output_dir: Path | None = None
 
 
 def list_run_profile_names() -> tuple[str, ...]:

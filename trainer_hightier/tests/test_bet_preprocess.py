@@ -464,6 +464,176 @@ def test_build_bet_clean_adt_record_matches_when_only_profile_csv_differs(
     assert rec_a["adt_segment"]["adt_allowlist_distinct_player_id_count"] == 2
 
 
+def test_bet_clean_cache_hit_legacy_cleaned_session_dependency_ignored(
+    registry_path: Path, tmp_path: Path
+) -> None:
+    """Sidecars from older runs may include cleaned_session_dependency; compare ignores it.
+
+    Cache hit must not require cleaned_session.parquet on disk when semantic keys match.
+    """
+    import trainer_hightier.utils.bet_l0_preprocess as bl0
+
+    allowed = tmp_path / "allowed.parquet"
+    pd.DataFrame({"player_id": [100, 200]}).to_parquet(allowed, index=False)
+    raw = tmp_path / "gmwds_t_bet.parquet"
+    t_pay = pd.Timestamp("2025-05-27 09:00:00")
+    pq.write_table(
+        pa.Table.from_pandas(
+            pd.DataFrame(
+                [
+                    _bet_row(
+                        bet_id=1,
+                        player_id=100,
+                        payout_complete_dtm=t_pay,
+                        gaming_day=t_pay.date(),
+                        __etl_insert_Dtm=t_pay,
+                    ),
+                ]
+            )
+        ),
+        raw,
+    )
+    rec_cur = bl0.build_bet_clean_cache_record(
+        raw,
+        preprocess_registry_yaml=registry_path,
+        dedup_hash_buckets=2,
+        adt_filter_quantile=0.99,
+        adt_allowed_players_parquet=allowed,
+    )
+    legacy = dict(rec_cur)
+    legacy["manifest_version"] = 8
+    legacy["cleaned_session_dependency"] = {
+        "path": str(tmp_path / "ghost_session.parquet"),
+        "mtime_ns": 1,
+        "size_bytes": 2,
+        "num_rows": 3,
+    }
+
+    cleaned_root = tmp_path / "cleaned_seg"
+    cleaned_root.mkdir()
+    stub = cleaned_root / "shard.parquet"
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame([{"bet_id": 1.0}])), stub)
+    mp = bl0.bet_clean_cache_manifest_path(cleaned_root)
+    mp.write_text(json.dumps(legacy, sort_keys=True), encoding="utf-8")
+
+    missing_session = tmp_path / "no_such_cleaned_session.parquet"
+    assert not missing_session.is_file()
+    assert bl0.bet_clean_cache_is_hit(
+        raw,
+        cleaned_root,
+        preprocess_registry_yaml=registry_path,
+        dedup_hash_buckets=2,
+        cleaned_session_parquet=missing_session,
+        adt_filter_quantile=0.99,
+        adt_allowed_players_parquet=allowed,
+    )
+
+
+def test_bet_clean_cache_miss_when_allowlist_player_id_set_changes(
+    registry_path: Path, tmp_path: Path
+) -> None:
+    import trainer_hightier.utils.bet_l0_preprocess as bl0
+
+    allowed_a = tmp_path / "allowed_a.parquet"
+    allowed_b = tmp_path / "allowed_b.parquet"
+    pd.DataFrame({"player_id": [100]}).to_parquet(allowed_a, index=False)
+    pd.DataFrame({"player_id": [200]}).to_parquet(allowed_b, index=False)
+    raw = tmp_path / "gmwds_t_bet.parquet"
+    t_pay = pd.Timestamp("2025-05-27 09:00:00")
+    pq.write_table(
+        pa.Table.from_pandas(
+            pd.DataFrame(
+                [
+                    _bet_row(
+                        bet_id=1,
+                        player_id=100,
+                        payout_complete_dtm=t_pay,
+                        gaming_day=t_pay.date(),
+                        __etl_insert_Dtm=t_pay,
+                    ),
+                ]
+            )
+        ),
+        raw,
+    )
+    rec_a = bl0.build_bet_clean_cache_record(
+        raw,
+        preprocess_registry_yaml=registry_path,
+        dedup_hash_buckets=2,
+        adt_filter_quantile=0.99,
+        adt_allowed_players_parquet=allowed_a,
+    )
+    cleaned_root = tmp_path / "cleaned_seg"
+    cleaned_root.mkdir()
+    stub = cleaned_root / "shard.parquet"
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame([{"bet_id": 1.0}])), stub)
+    mp = bl0.bet_clean_cache_manifest_path(cleaned_root)
+    mp.write_text(json.dumps(rec_a, sort_keys=True), encoding="utf-8")
+
+    assert not bl0.bet_clean_cache_is_hit(
+        raw,
+        cleaned_root,
+        preprocess_registry_yaml=registry_path,
+        dedup_hash_buckets=2,
+        adt_filter_quantile=0.99,
+        adt_allowed_players_parquet=allowed_b,
+    )
+
+
+def test_bet_clean_cache_miss_when_source_bet_row_stat_differs(
+    registry_path: Path, tmp_path: Path
+) -> None:
+    import trainer_hightier.utils.bet_l0_preprocess as bl0
+
+    allowed = tmp_path / "allowed.parquet"
+    pd.DataFrame({"player_id": [100]}).to_parquet(allowed, index=False)
+    raw = tmp_path / "gmwds_t_bet.parquet"
+    t_pay = pd.Timestamp("2025-05-27 09:00:00")
+    pq.write_table(
+        pa.Table.from_pandas(
+            pd.DataFrame(
+                [
+                    _bet_row(
+                        bet_id=1,
+                        player_id=100,
+                        payout_complete_dtm=t_pay,
+                        gaming_day=t_pay.date(),
+                        __etl_insert_Dtm=t_pay,
+                    ),
+                ]
+            )
+        ),
+        raw,
+    )
+    rec_ok = bl0.build_bet_clean_cache_record(
+        raw,
+        preprocess_registry_yaml=registry_path,
+        dedup_hash_buckets=2,
+        adt_filter_quantile=0.99,
+        adt_allowed_players_parquet=allowed,
+    )
+    stale = dict(rec_ok)
+    stale_sb = dict(stale["source_bet"])
+    stale_sb["num_rows"] = int(stale_sb["num_rows"]) + 999_999
+    stale["source_bet"] = stale_sb
+
+    cleaned_root = tmp_path / "cleaned_seg"
+    cleaned_root.mkdir()
+    stub = cleaned_root / "shard.parquet"
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame([{"bet_id": 1.0}])), stub)
+    mp = bl0.bet_clean_cache_manifest_path(cleaned_root)
+    mp.write_text(json.dumps(stale, sort_keys=True), encoding="utf-8")
+
+    assert not bl0.bet_clean_cache_is_hit(
+        raw,
+        cleaned_root,
+        preprocess_registry_yaml=registry_path,
+        dedup_hash_buckets=2,
+        adt_filter_quantile=0.99,
+        adt_allowed_players_parquet=allowed,
+    )
+
+
 def test_trial_bet_behavior_1h_window_counts(tmp_path: Path) -> None:
     """1h RANGE window: prior rows with pcd in [current_pcd - 1h, current_pcd)."""
     from trainer_hightier.utils.trial_bet_behavior_1h import materialize_trial_bet_behavior_1h
@@ -630,6 +800,47 @@ def test_metamorphic_threshold_expand_stable_bids_subset(registry_path: Path, tm
     )
     pd.testing.assert_frame_equal(old, new_stable)
     assert len(new_full) == 2
+
+
+def test_bet_base_clean_cache_hit_legacy_cleaned_session_dependency_ignored(
+    registry_path: Path, tmp_path: Path
+) -> None:
+    import trainer_hightier.utils.bet_l0_preprocess as bl0
+
+    t_pay = pd.Timestamp("2025-05-27 09:00:00")
+    df = pd.DataFrame(
+        [_bet_row(payout_complete_dtm=t_pay, gaming_day=t_pay.date(), __etl_insert_Dtm=t_pay)]
+    )
+    raw = tmp_path / "gmwds_t_bet.parquet"
+    pq.write_table(pa.Table.from_pandas(df), raw)
+    base = tmp_path / "base.parquet"
+    df.iloc[0:0].to_parquet(base, index=False)
+
+    rec_cur = bl0.build_bet_base_clean_cache_record(
+        [raw],
+        preprocess_registry_yaml=registry_path,
+        dedup_hash_buckets=16,
+    )
+    legacy = dict(rec_cur)
+    legacy["manifest_version"] = 8
+    legacy["cleaned_session_dependency"] = {
+        "path": str(tmp_path / "ghost_session.parquet"),
+        "mtime_ns": 1,
+        "size_bytes": 2,
+        "num_rows": 3,
+    }
+    mp = bl0.bet_base_clean_cache_manifest_path(base)
+    mp.write_text(json.dumps(legacy, sort_keys=True), encoding="utf-8")
+
+    ghost = tmp_path / "no_such_cleaned_session.parquet"
+    assert not ghost.is_file()
+    assert bl0.bet_base_clean_cache_is_hit(
+        [raw],
+        base,
+        preprocess_registry_yaml=registry_path,
+        dedup_hash_buckets=8,
+        cleaned_session_parquet=ghost,
+    )
 
 
 def test_bet_base_clean_cache_hit_with_stored_higher_dedup_buckets(

@@ -16,7 +16,7 @@ Steps (see :func:`build_training_data`):
 1. Optional: materialize derived feature Parquets (1h trial + 180d monthly slow).
 2. Write entity Parquet (``bet_id``, ``event_timestamp``) from cleaned bet.
 3. ``get_historical_features`` + ``persist`` → staging feature Parquet (Ibis/DuckDB).
-4. DuckDB left-join labels on ``bet_id`` → ``artifacts/training_data/training_set.parquet``.
+4. DuckDB left-join labels on ``bet_id`` + ``gaming_day`` from cleaned bet → ``artifacts/training_data/training_set.parquet``.
 
 Prerequisites: ``feast apply`` has been run from ``feast_repo``; offline store
 paths in ``definitions.py`` resolve to existing materialized Parquets.
@@ -665,26 +665,45 @@ def _join_labels_to_features(
     *,
     features_parquet: Path,
     labels_parquet: Path,
+    cleaned_bet_parquet: Path,
     output_parquet: Path,
     duckdb_runtime: DuckDbRuntimeConfig,
 ) -> int | None:
+    """Merge Feast features with labels and split keys for downstream Step 4.
+
+    Adds ``canonical_id`` from ``walkaway_labels`` and ``gaming_day`` from cleaned
+    bet (VARCHAR ``YYYY-MM-DD``) via ``bet_id``; no change to Feast retrieval.
+    """
+
     f_esc = _path_posix(features_parquet).replace("'", "''")
     l_esc = _path_posix(labels_parquet).replace("'", "''")
     o_esc = _path_posix(output_parquet).replace("'", "''")
+    bet_from = resolved_cleaned_bet_read_parquet_sql(Path(cleaned_bet_parquet).resolve())
     sql = f"""
 COPY (
   SELECT
     h.*,
     y.label AS walkaway_label,
-    y.censored AS walkaway_censored
+    y.censored AS walkaway_censored,
+    y.canonical_id AS canonical_id,
+    b.gaming_day AS gaming_day
   FROM read_parquet('{f_esc}') h
   LEFT JOIN (
     SELECT
       TRY_CAST(bet_id AS DOUBLE) AS bet_id,
       CAST(label AS SMALLINT) AS label,
-      CAST(censored AS BOOLEAN) AS censored
+      CAST(censored AS BOOLEAN) AS censored,
+      TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id
     FROM read_parquet('{l_esc}')
   ) y ON TRY_CAST(h.bet_id AS DOUBLE) = y.bet_id
+  LEFT JOIN (
+    SELECT
+      TRY_CAST(bet_id AS DOUBLE) AS bet_id,
+      MIN(strftime(TRY_CAST(gaming_day AS DATE), '%Y-%m-%d')) AS gaming_day
+    FROM {bet_from} AS _cbd
+    WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+    GROUP BY 1
+  ) b ON TRY_CAST(h.bet_id AS DOUBLE) = b.bet_id
 ) TO '{o_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
 """.strip()
     con = duckdb.connect(database=":memory:")
@@ -906,6 +925,7 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
         n_rows = _join_labels_to_features(
             features_parquet=staging_feat,
             labels_parquet=cfg.labels_parquet,
+            cleaned_bet_parquet=cfg.cleaned_bet_parquet,
             output_parquet=versioned_out,
             duckdb_runtime=cfg.duckdb_runtime,
         )
@@ -964,7 +984,7 @@ def _parse_args() -> BuildTrainingDataArgs:
         "--labels",
         type=Path,
         default=DEFAULT_LABELS,
-        help="walkaway_labels.parquet (bet_id, label, censored).",
+        help="walkaway_labels.parquet (bet_id, canonical_id, label, censored, …).",
     )
     p.add_argument(
         "--output",

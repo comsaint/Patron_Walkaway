@@ -16,6 +16,7 @@
 - 本地增量資料處理、快取與 artifact 管理。
 - 特徵契約治理（Feast feature views/services）與離線 historical retrieval。
 - 訓練資料（training set）產製的版本化與可追溯性。
+- 訓練前資料整理與切分（Step 4）：欄位整理、型別標準化、train/val/test 時序切分。
 
 - 非範圍（Out of Scope）
 - 生產 ClickHouse schema/engine/operator 調整與上線流程。
@@ -34,6 +35,8 @@
 - 管線必須具 deterministic cache key，且 cache hit/miss 行為可解釋。
 - 特徵定義與取用必須與 Feast 契約一致，並遵守 point-in-time join 原則。
 - 產出的 training set 必須攜帶 manifest，記錄來源、版本、列數、特徵服務與關鍵參數。
+- training set 必須提供 Step 4 所需 split keys（`canonical_id`、`gaming_day`）以支援時序切分與可追溯檢核。
+- Step 4 必須只承擔 deterministic 前處理（欄位裁切、型別轉換、切分標記）；任何需從資料學習參數的轉換不得在 split 前執行。
 - 管線必須在一般筆電資源下可執行，不允許預設流程依賴超大記憶體一次載入全量資料。
 
 ## 5) 關鍵業務規則與領域定義
@@ -67,7 +70,9 @@
 - 清洗後分區資料（cleaned layer）。
 - 特徵分區資料（feature layer，例如 trial/slow）。
 - 訓練資料快照（training set parquet）。
+- Step 4 切分產物（`train` / `val` / `test` 或等價 `split_tag` 單檔）。
 - 對應 manifest（來源指紋、參數、列數、版本、產生時間、特徵服務名）。
+- 對應 split report（切分邊界、各 split 列數/label 比例、canonical 覆蓋與冷啟動占比）。
 
 ## 8) 非功能性需求（NFR）
 
@@ -106,6 +111,9 @@
 - 採用「分區驅動 + 增量重算」而非每次全量 materialization。
 - 採用「DuckDB + dbt-duckdb + DVC + Feast」的分層組合，而非單一工具承擔全部責任。
 - Feast 定位為特徵契約與取用層，不承擔中間資料工程快取管理。
+- Step 3 在最終輸出層補齊 Step 4 split keys（`canonical_id`、`gaming_day`），避免 Step 4 每次重做大表回接，同時維持 Feast retrieval cache 邏輯不變。
+- Step 4 為訓練前資料整理與切分專屬階段，目標為「同一批玩家的未來預測」（時間泛化優先）。
+- `trainer.py` 提供 `--start-from-features` 作為流程入口控制：允許跳過 Step 1-3，直接以既有 training parquet 啟動 Step 4。
 - 設定控制面以 YAML/Python 為主，不以環境變數作為主要行為切換機制。
 
 ## 12) 開放問題（Open Questions）
@@ -114,6 +122,7 @@
 - 分區層級 cache fingerprint 是否需要納入 row_count 與 schema hash（除了 size/mtime/path）。
 - training set 的批次化 historical retrieval 之標準 chunk 大小（效能與穩定性折衷）。
 - 各 stage 的最小監控指標集合（耗時、scan bytes、cache hit ratio）之最終清單。
+- Step 4 的預設時間切分邊界（例如 70/15/15 或固定最近 N 天）與回退規則應如何標準化。
 
 ## 13) 與其他文件的邊界
 

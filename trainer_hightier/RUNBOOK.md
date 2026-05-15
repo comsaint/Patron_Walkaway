@@ -85,6 +85,7 @@ python -m trainer_hightier.trainer --partition-snapshot-dir "D:/exports/my_snaps
 | 旗標 | 用途 |
 |------|------|
 | `--ignore-caches` / `--no-cache` | **強制**重跑 session / bet 預處理，略過 clean-cache manifest |
+| `--skip-bet-preprocess` | 略過 Step 2b（不重算 cleaned t_bet；需 `artifacts/cleaned` 已有產物） |
 | `--skip-training-dataset` | 不跑 Step 3（不產 training_set） |
 | `--skip-walkaway-labels` | 不物化 `walkaway_labels.parquet`（大表時可省時間；Step 3 需標籤則勿用或自行準備） |
 | ~~`--no-partition-snapshot`~~ | **已廢止**；若指定會 `ValueError` |
@@ -122,6 +123,7 @@ python -m trainer_hightier.trainer
 | 旗標 | 用途 |
 |------|------|
 | `--ignore-caches` / `--no-cache` | **強制**重跑 session / bet 預處理，略過兩者的 clean-cache manifest 命中（大 L0 時 I/O 與耗時明顯） |
+| `--skip-bet-preprocess` | 略過 Step 2b（不重算 cleaned t_bet；需預設 cleaned 路徑已有資料集） |
 
 主 CLI **不再**透過 `HighTierTrainArgs.data_dir` 讀 monolith；若要改 snapshot 根目錄請用 **`--partition-snapshot-dir`**，或於程式中設定 `HighTierTrainArgs.partition_snapshot_dir`。DuckDB、`run_profile` 等仍透過 `HighTierTrainArgs` / `configs_from_run_profile` 注入。
 
@@ -167,8 +169,9 @@ run_training(args)
 
 ## 5. Preprocess disk cache（session / bet）
 
-- **命中條件：**清洗目標 Parquet 已存在，且 sidecar JSON 與 `build_session_clean_cache_record()` 計出的指紋一致（含來源 `mtime`/`size`、列數 metadata、`session_l0_preprocess` 模組 hash、**合併後的 session shard 路徑清單** 與 **partition inventory fingerprint**）。Bet 清洗對應 `bet_l0_preprocess` 之 `build_bet_clean_cache_record()` / `build_bet_base_clean_cache_record()` 與側車（含 base vs segment、inventory fingerprint）。
-- **失效：**來源 Parquet 或 registry／前手 cleaned session 變更、或 preprocess 邏輯變更時通常會 miss；改 `DuckDbRuntimeConfig` **不一定**讓指紋變——若仍要強制重跑，請用 `--ignore-caches` 或手動刪除 cleaned 與對應 `.cache.json`。
+- **命中條件：**清洗目標 Parquet 已存在，且 sidecar JSON 與 `build_session_clean_cache_record()` 計出的指紋一致（含來源 `mtime`/`size`、列數 metadata、`session_l0_preprocess` 模組 hash、**合併後的 session shard 路徑清單** 與 **partition inventory fingerprint**）。Bet 清洗對應 `bet_l0_preprocess` 之 `build_bet_clean_cache_record()` / `build_bet_base_clean_cache_record()` 與側車（含 base vs segment、inventory fingerprint、**ADT allowlist 之 distinct `player_id` 集合 hash**，**不依** allowlist 檔案 mtime）。
+- **Bet 與 cleaned session：**bet 快取指紋**不**再綁定 `cleaned__gmwds_t_session.parquet` 的檔案統計。若磁碟上的舊 sidecar 仍含 `cleaned_session_dependency` 欄位，命中比對時會忽略該欄；`manifest_version` **8↔9** 在比對時會正規化為同一版本，以便升級後仍可回收舊 cache（其餘語義欄位須一致）。
+- **失效：**來源 Parquet 或 registry 變更、或 `bet_l0_preprocess` / `session_l0_preprocess` 模組內容變更（SHA-256）時通常會 miss；session 檔遺失**不應**單獨導致 bet cache miss。改 `DuckDbRuntimeConfig` **不一定**讓指紋變——若仍要強制重跑，請用 `--ignore-caches` 或手動刪除 cleaned 與對應 `.cache.json`。
 - **強制重算：**`--ignore-caches`（或 `--no-cache`）；大 L0 上可能耗時與 I/O 明顯；同一旗標同時作用於 session 與 bet preprocess cache。
 
 ## 6. 常見問題

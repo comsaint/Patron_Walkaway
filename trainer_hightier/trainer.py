@@ -6,7 +6,9 @@ is intentionally empty beyond logging and call order.
 
 Pipeline steps: ``01_data_ingest`` (inside ``prepare_training_frame``) →
 ``02_preprocess`` → optional walkaway labels (2c) → ``03_build_training_data`` (default on;
-``--skip-training-dataset`` to skip) → ``fit_model`` / ``write_artifacts`` (TODO).
+``--skip-training-dataset`` to skip) → ``04_split_dataset`` (default on; ``--skip-step4`` to skip)
+→ ``fit_model`` / ``write_artifacts`` (TODO). ``--skip-bet-preprocess`` skips Step 2b (reuse existing
+cleaned bet artifacts). Use ``--start-from-features`` to run only Step 4 on an existing training parquet.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from trainer_hightier.config import (
     DuckDbRuntimeConfig,
     HighTierObjectiveConfig,
     SessionPreprocessConfig,
+    Step4SplitConfig,
     configs_from_run_profile,
     get_run_profile,
     list_run_profile_names,
@@ -54,6 +57,7 @@ _ingest = importlib.import_module("trainer_hightier.01_data_ingest")
 _hpre = importlib.import_module("trainer_hightier.02_preprocess")
 _hbet = importlib.import_module("trainer_hightier.utils.bet_l0_preprocess")
 _b3 = importlib.import_module("trainer_hightier.03_build_training_data")
+_b4 = importlib.import_module("trainer_hightier.04_split_dataset")
 
 
 logger = logging.getLogger("trainer_hightier")
@@ -155,6 +159,12 @@ class HighTierTrainArgs:
     partition_inventory_previous_manifest: Path | None = None
     partition_correction_months: tuple[str, ...] = ()
     partition_backfill_month_count: int = 1
+    # Step 4: deterministic arrange + time split on ``gaming_day`` (after Step 3 or --start-from-features).
+    run_step4: bool = True
+    step4_split: Step4SplitConfig = field(default_factory=Step4SplitConfig)
+    # When True: skip Step 1-3; require an existing training features parquet and run Step 4 only.
+    start_from_features: bool = False
+    features_input_parquet: Path | None = None
 
 
 def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None) -> None:
@@ -513,6 +523,42 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
             logger.info("[Step 2c] walkaway labels written %s", labels_out.resolve())
 
 
+def _resolve_features_parquet(args: HighTierTrainArgs) -> Path:
+    """Return training features Parquet path (Step 3 default or explicit override)."""
+
+    if args.features_input_parquet is not None:
+        return Path(args.features_input_parquet).resolve()
+    return _b3.DEFAULT_OUTPUT.resolve()
+
+
+def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None) -> None:
+    """Step 4: project/cast columns and write train/val/test splits by ``gaming_day``."""
+
+    if not args.run_step4:
+        return
+    fp = _resolve_features_parquet(args)
+    if not fp.is_file():
+        if args.start_from_features:
+            raise FileNotFoundError(
+                f"--start-from-features requires features parquet at {fp}; "
+                "use --features-input or build Step 3 output first.",
+            )
+        logger.warning("[Step 4] skip: no features parquet at %s", fp.resolve())
+        return
+    t0 = time.perf_counter()
+    res = _b4.arrange_and_split_training_data(
+        features_parquet=fp,
+        duckdb_runtime=args.duckdb_runtime,
+        step4=args.step4_split,
+    )
+    elapsed = round(time.perf_counter() - t0, 3)
+    if metrics is not None:
+        metrics["step4_seconds"] = elapsed
+        metrics["step4_split_report"] = str(res.split_report_json.resolve())
+        metrics["step4_splits_dir"] = str(res.splits_dir.resolve())
+    logger.info("[Step 4] splits written %s (%.3fs)", res.splits_dir.resolve(), elapsed)
+
+
 def _maybe_build_training_dataset(args: HighTierTrainArgs) -> None:
     """Step 3: Feast + labels training Parquet (see ``03_build_training_data``); default on."""
     if not args.build_training_dataset:
@@ -572,12 +618,17 @@ def run_training(args: HighTierTrainArgs) -> None:
     metrics: dict[str, Any] = {
         "start_epoch_ms": int(time.time() * 1000),
     }
-    t_prep = time.perf_counter()
-    prepare_training_frame(args, metrics=metrics)
-    metrics["prepare_training_frame_seconds"] = round(time.perf_counter() - t_prep, 3)
-    t_step3 = time.perf_counter()
-    _maybe_build_training_dataset(args)
-    metrics["build_training_dataset_seconds"] = round(time.perf_counter() - t_step3, 3)
+    if args.start_from_features:
+        _maybe_run_step4(args, metrics=metrics)
+    else:
+        t_prep = time.perf_counter()
+        prepare_training_frame(args, metrics=metrics)
+        metrics["prepare_training_frame_seconds"] = round(time.perf_counter() - t_prep, 3)
+        t_step3 = time.perf_counter()
+        _maybe_build_training_dataset(args)
+        metrics["build_training_dataset_seconds"] = round(time.perf_counter() - t_step3, 3)
+        _maybe_run_step4(args, metrics=metrics)
+
     fit_model(args)
     write_artifacts(args)
     metrics["finish_epoch_ms"] = int(time.time() * 1000)
@@ -616,6 +667,15 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Do not materialize walkaway_labels.parquet after cleaned t_bet (large pandas pass).",
     )
     p.add_argument(
+        "--skip-bet-preprocess",
+        action="store_true",
+        dest="skip_bet_preprocess",
+        help=(
+            "Skip Step 2b (t_bet L0 to cleaned bet). Use when cleaned bet already exists under "
+            "artifacts/cleaned; downstream steps still read the default paths."
+        ),
+    )
+    p.add_argument(
         "--skip-training-dataset",
         action="store_true",
         dest="skip_training_dataset",
@@ -632,6 +692,28 @@ def _build_argparser() -> argparse.ArgumentParser:
             "With Step 3 enabled: do not re-materialize trial 1h + slow 180d Parquets before Feast "
             "(faster when those files are already up to date)."
         ),
+    )
+    p.add_argument(
+        "--start-from-features",
+        action="store_true",
+        dest="start_from_features",
+        help=(
+            "Skip Step 1-3 and run Step 4 only on an existing training parquet (default: "
+            "artifacts/training_data/training_set.parquet). Use --features-input to override."
+        ),
+    )
+    p.add_argument(
+        "--features-input",
+        type=Path,
+        default=None,
+        dest="features_input_parquet",
+        help="Training features parquet path for Step 4 (optional; default is Step 3 output).",
+    )
+    p.add_argument(
+        "--skip-step4",
+        action="store_true",
+        dest="skip_step4",
+        help="Do not run Step 4 (arrange + train/val/test split by gaming_day).",
     )
     p.add_argument(
         "--disable-feast-retrieval-cache",
@@ -707,6 +789,7 @@ def main() -> None:
     args = HighTierTrainArgs(
         output_dir=Path(".data") / "trainer_hightier" / "run",
         ignore_caches=bool(ns.ignore_caches),
+        skip_bet_preprocess=bool(ns.skip_bet_preprocess),
         materialize_walkaway_labels=not bool(ns.skip_walkaway_labels),
         build_training_dataset=not bool(ns.skip_training_dataset),
         training_materialize_derived=not bool(ns.skip_training_materialize_derived),
@@ -720,6 +803,12 @@ def main() -> None:
         ),
         partition_correction_months=corr,
         partition_backfill_month_count=int(ns.partition_backfill_count),
+        run_step4=not bool(ns.skip_step4),
+        start_from_features=bool(ns.start_from_features),
+        features_input_parquet=(
+            Path(ns.features_input_parquet).resolve() if ns.features_input_parquet else None
+        ),
+        step4_split=Step4SplitConfig(),
     )
     run_training(args)
 

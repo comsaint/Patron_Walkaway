@@ -1,6 +1,6 @@
 # trainer_hightier - Data Pipeline Implementation Plan
 
-本文件是 **Implementation plan 層**，對齊 [SSOT](./SSOT.md)，定義 realization strategy、工作流、里程碑、風險與驗證/落地方式；不展開 ticket 級任務清單。
+本文件是 **Implementation plan 層**，對齊 [SSOT](./Data%20pipeline%20-%20SSOT.md)，定義 realization strategy、工作流、里程碑、風險與驗證/落地方式；不展開 ticket 級任務清單。
 
 ## 非目標（明確排除）
 
@@ -10,7 +10,7 @@
 
 ## 對齊基準
 
-- SSOT: `trainer_hightier/SSOT.md`
+- SSOT: `trainer_hightier/doc/Data pipeline - SSOT.md`
 - 既有訓練入口: `trainer_hightier/trainer.py`
 - 既有資料集建置: `trainer_hightier/03_build_training_data.py`
 - Feast 定義: `trainer_hightier/feast_repo/definitions.py`
@@ -26,6 +26,9 @@
 - Feast retrieval：以 `gaming_day` 分片規劃，執行層可月桶批次化以控制成本。
 - 快取原子（cache atom）：`date_slice × feature_group × feature_group_signature × data_snapshot_signature`。
 - 訓練資料保留：最近 10 版。
+- Step 3 輸出契約補齊：在最終 training set 匯出時附帶 `canonical_id`、`gaming_day` 作為 Step 4 split keys（不改 Feast retrieval cache 邏輯）。
+- Step 4 新增為訓練前整理層：欄位裁切、明確 dtype cast、時間切分與 split 報表。
+- `trainer.py` 新增 `--start-from-features` 流程旗標：可跳過 Step 1-3，直接以既有 training parquet 啟動 Step 4。
 - 執行模式：snapshot-based 實驗批次（ad-hoc 下載節奏）。
 - 報表：每次 run 產出 run report。
 
@@ -42,8 +45,9 @@ flowchart LR
     featureLayer[FeatureLayerIncrementalByDateAndGroup]
     cachePlanner[DirtyDateAndFeatureGroupPlanner]
     feastRetrieval[FeastHistoricalRetrievalShardReuse]
-    trainingSet[VersionedTrainingSetAndManifest]
-    datasetPublish[DatasetPublishAndRunReport]
+    trainingSet[VersionedTrainingSetAndManifestWithSplitKeys]
+    step4Arrange[Step4DatasetArrangeAndSplit]
+    datasetPublish[DatasetPublishSplitArtifactsAndRunReport]
     dvcCtl[DVCStageAndArtifactControl]
 
     rawSnapshot --> inventory
@@ -58,7 +62,8 @@ flowchart LR
     featureLayer --> feastRetrieval
     cachePlanner --> feastRetrieval
     feastRetrieval --> trainingSet
-    trainingSet --> datasetPublish
+    trainingSet --> step4Arrange
+    step4Arrange --> datasetPublish
 
     dvcCtl --> inventory
     dvcCtl --> cleanSession
@@ -68,6 +73,7 @@ flowchart LR
     dvcCtl --> featureLayer
     dvcCtl --> feastRetrieval
     dvcCtl --> trainingSet
+    dvcCtl --> step4Arrange
     dvcCtl --> datasetPublish
 ```
 
@@ -106,9 +112,22 @@ flowchart LR
 - dirty 分片計算納入 lookback 擴張規則：來源日期分片變更時，依 feature group 的 lookback 影響後續 anchors。
 - 支援 threshold 擴大的 delta 行為：既有玩家重用既有結果，只計算新納入玩家與事件。
 - 實作 training set 版本命名規格與「最近 10 版」保留策略。
+- 在 Step 3 最終 join 匯出補齊 split keys：`canonical_id`（來自 labels join）與 `gaming_day`（由 cleaned bet 以 `bet_id` 回接），避免 Step 4 重做大表 join。
 - 每次建置輸出標準 manifest（來源日期分片、feature groups、row_count、關鍵參數、時間戳）。
 
-### Phase 4: DVC 治理與 Dataset Publish 報表
+### Phase 4: Dataset Arrange 與 Split（Step 4）
+
+- 新增 Step 4 模組，承接 Step 3 training parquet；不提供獨立 CLI，僅由 `trainer.py` orchestrate。
+- Step 4 僅做 deterministic 前處理：
+  - 欄位裁切（移除不必要訓練欄位）
+  - 明確 dtype cast（修正數值欄被儲存為字串/物件的情況）
+  - 依 `gaming_day` 進行 train/val/test 時間切分（目標 A：同一批玩家未來預測）
+- `canonical_id` 作為切分品質監控鍵，不做 hard holdout（避免偏離目標 A）。
+- 產出 split artifacts（單檔 `split_tag` 或三檔）與 split report（row 數、label rate、時間邊界、canonical 覆蓋/冷啟動占比）。
+- 實作 schema gate：缺少 `walkaway_label` / `canonical_id` / `gaming_day` 立即 fail-fast。
+- 支援 `--start-from-features`：可直接讀既有 training parquet 啟動 Step 4，以加速實驗迭代。
+
+### Phase 5: DVC 治理與 Dataset Publish 報表
 
 - 以 DVC 管理 stage 邊界（ingest / clean_session / clean_bet / features / training_set / dataset_publish）。
 - 每次 run 產出 run report（耗時、cache hit ratio、重算分區、輸出列數、失敗/警告摘要）。
@@ -118,8 +137,9 @@ flowchart LR
 
 - M1：`gaming_day` inventory + 指紋 + 重算集合規則可用，且能驅動既有流程。
 - M2：`step 2b` 改為「日鍵 + 月桶」分片輸出，並完成 `gaming_day` non-null gate。
-- M3：Feast `date_slice × feature_group` 快取可用，日期窗變更與 feature 清單變更皆可局部重算。
-- M4：DVC stage 治理與每次 run 報表上線，形成可審計閉環。
+- M3：Feast `date_slice × feature_group` 快取可用，日期窗變更與 feature 清單變更皆可局部重算，且 Step 3 輸出含 `canonical_id` / `gaming_day`。
+- M4：Step 4（dataset arrange + split）上線，可由 `--start-from-features` 直接啟動並產出 split artifacts + split report。
+- M5：DVC stage 治理與每次 run 報表上線，形成可審計閉環。
 
 ## 角色與責任（High-level Ownership）
 
@@ -137,6 +157,10 @@ flowchart LR
   - 緩解：納入 metamorphic tests 與 SQL/source guardrails，阻擋全域正規化模式未審核引入。
 - 風險：批次 retrieval 仍觸發記憶體壓力。
   - 緩解：日分片優先 + 月桶批次上限與 DuckDB spill 預設；對超大月份做自動切批。
+- 風險：Step 4 需額外回接大表取得 split keys，導致迭代速度慢與記憶體壓力升高。
+  - 緩解：在 Step 3 匯出時直接補齊 `canonical_id` / `gaming_day`，Step 4 僅做投影與切分。
+- 風險：`--start-from-features` 指向舊版 schema（缺 split key）造成流程不一致。
+  - 緩解：Step 4 schema gate + 明確錯誤訊息；split report 記錄來源 parquet 與欄位摘要。
 - 風險：日分片導致小檔案過多，拖慢 metadata 掃描。
   - 緩解：維持「日鍵 + 月桶」目錄並設定最小檔案大小與定期 compact 策略。
 - 風險：新增治理層影響研發速度。
@@ -168,6 +192,6 @@ flowchart LR
 ## 文件邊界
 
 - 本文件：Implementation plan（how at architecture/workstream level）。
-- `SSOT.md`：需求與原則（what/why）。
+- `Data pipeline - SSOT.md`：需求與原則（what/why）。
 - Working plan：後續拆成任務、依賴與順序，並回鏈本文件。
 

@@ -38,7 +38,7 @@ trainer_hightier/
 python -m trainer_hightier.trainer
 ```
 
-可選：`--partition-snapshot-dir <已存在目錄>` — 不用預設的 `data/partitions`；`--ignore-caches`（等同 `--no-cache`）— 略過 session/bet 預處理磁碟快取並強制重算；`--skip-training-dataset` — 不執行 Step 3（預設**會**跑 Feast + labels → `artifacts/training_data/training_set.parquet`）；`--skip-training-materialize-derived` — Step 3 內不重算 trial 1h / slow 180d 物化檔（若已存在且想省時間可加）。**`--no-partition-snapshot` 已廢止**（會 `ValueError`）。其餘為程式預設（`config.DEFAULT_RUN_PROFILE_NAME` 等）。
+可選：`--partition-snapshot-dir <已存在目錄>` — 不用預設的 `data/partitions`；`--ignore-caches`（等同 `--no-cache`）— 略過 session/bet 預處理磁碟快取並強制重算；`--skip-bet-preprocess` — 略過 Step 2b、t_bet 清洗（沿用既有 `artifacts/cleaned`）；`--skip-training-dataset` — 不執行 Step 3（預設**會**跑 Feast + labels → `artifacts/training_data/training_set.parquet`）；`--skip-training-materialize-derived` — Step 3 內不重算 trial 1h / slow 180d 物化檔（若已存在且想省時間可加）。**`--no-partition-snapshot` 已廢止**（會 `ValueError`）。其餘為程式預設（`config.DEFAULT_RUN_PROFILE_NAME` 等）。
 
 3. （可選）在 **已** `feast apply`、具 cleaned bet 與 `artifacts/labels/walkaway_labels.parquet` 後，匯出訓練表：
 

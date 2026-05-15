@@ -1,7 +1,9 @@
 """Bet L0 preprocess: ``t_bet`` → cleaned Parquet (DuckDB).
 
-Downstream training assumes session clean exists first; bet clean cache fingerprints
-optionally include the **cleaned session** Parquet stats so session rewrites invalidate bet cache.
+Bet clean cache keys bind **raw t_bet shards**, ingest registry, optional **ADT allowlist**
+(distinct ``player_id`` set hash), and partition inventory fingerprint — not cleaned session
+artifact mtime/rows. For hit checks, legacy manifests that still contain
+``cleaned_session_dependency`` are compared with that field ignored (backward compatible).
 """
 from __future__ import annotations
 
@@ -30,7 +32,7 @@ from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas, 
 
 logger = logging.getLogger("trainer_hightier")
 
-_BET_CLEAN_CACHE_MANIFEST_VERSION = 8
+_BET_CLEAN_CACHE_MANIFEST_VERSION = 9
 
 
 def _duckdb_quote_ident(name: str) -> str:
@@ -884,6 +886,34 @@ def bet_base_manifest_dedup_hash_buckets(base_cleaned_parquet: Path) -> int | No
         return None
 
 
+def _normalize_bet_cache_manifest_for_compare(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Drop legacy-only fields so old sidecars still match current fingerprints.
+
+    - Removes ``cleaned_session_dependency`` (no longer part of the cache key).
+    - Canonicalizes ``manifest_version`` for v8→v9 migration so on-disk v8 manifests
+      compare equal to newly written v9 when all semantic fields match.
+    """
+
+    out = dict(manifest)
+    out.pop("cleaned_session_dependency", None)
+    mv = out.get("manifest_version")
+    try:
+        mv_int = int(mv) if mv is not None else None
+    except (TypeError, ValueError):
+        mv_int = None
+    if mv_int in (8, 9):
+        out["manifest_version"] = _BET_CLEAN_CACHE_MANIFEST_VERSION
+    return out
+
+
+def _bet_cache_manifests_equal_for_compare(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Equality for hit checks after normalizing legacy session binding and manifest version."""
+
+    return _normalize_bet_cache_manifest_for_compare(a) == _normalize_bet_cache_manifest_for_compare(
+        b,
+    )
+
+
 def _bet_manifest_matches_with_bucket_alias(
     prev: dict[str, Any],
     *,
@@ -893,7 +923,7 @@ def _bet_manifest_matches_with_bucket_alias(
     """Cache hit if *prev* equals current fingerprint for nominal or persisted bucket count."""
 
     nb = int(nominal_buckets)
-    if prev == build_cur(nb):
+    if _bet_cache_manifests_equal_for_compare(prev, build_cur(nb)):
         return True
     raw = prev.get("bet_dedup_hash_buckets")
     try:
@@ -902,7 +932,7 @@ def _bet_manifest_matches_with_bucket_alias(
         return False
     if stored is None or stored == nb:
         return False
-    return prev == build_cur(stored)
+    return _bet_cache_manifests_equal_for_compare(prev, build_cur(stored))
 
 
 def build_bet_base_clean_cache_record(
@@ -913,7 +943,10 @@ def build_bet_base_clean_cache_record(
     cleaned_session_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
 ) -> dict[str, Any]:
-    """Fingerprint intermediate base bet (sources + cleaned session dependency; no ADT)."""
+    """Fingerprint intermediate base bet (raw sources + registry; no ADT).
+
+    ``cleaned_session_parquet`` is accepted for API compatibility but does not affect the fingerprint.
+    """
 
     spaths = sorted({str(Path(x).resolve()) for x in source_bet_parquets})
     paths = [Path(s) for s in spaths]
@@ -953,9 +986,6 @@ def build_bet_base_clean_cache_record(
         "preprocess_registry": _registry_stat_dict(preprocess_registry_yaml),
         "source_bets": stats,
     }
-    dep = _fingerprint_cleaned_session_dependency(cleaned_session_parquet)
-    if dep is not None:
-        rec["cleaned_session_dependency"] = dep
     if partition_inventory_fingerprint_sha256_hex is not None:
         rec["partition_inventory_fingerprint_sha256_hex"] = str(
             partition_inventory_fingerprint_sha256_hex,
@@ -997,7 +1027,7 @@ def bet_base_clean_cache_is_hit(
                 source_bet_parquets,
                 preprocess_registry_yaml=reg,
                 dedup_hash_buckets=nb,
-                cleaned_session_parquet=cleaned_session_parquet,
+                cleaned_session_parquet=None,
                 partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
             )
 
@@ -1081,26 +1111,6 @@ def _bet_l0_preprocess_py_sha256() -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _fingerprint_cleaned_session_dependency(
-    cleaned_session_parquet: Path | None,
-) -> dict[str, Any] | None:
-    """Stats for cleaned session artifact; ``None`` skips (bet-only / tests)."""
-    if cleaned_session_parquet is None:
-        return None
-    p = Path(cleaned_session_parquet).resolve()
-    if not p.is_file():
-        raise FileNotFoundError(f"cleaned session parquet expected for bet cache: {p}")
-    st = p.stat()
-    meta = pq.ParquetFile(p).metadata
-    nrows = int(meta.num_rows) if meta is not None else -1
-    return {
-        "path": str(p),
-        "mtime_ns": int(st.st_mtime_ns),
-        "size_bytes": int(st.st_size),
-        "num_rows": nrows,
-    }
-
-
 def build_bet_clean_cache_record(
     source_bet_parquet: Path,
     *,
@@ -1115,7 +1125,7 @@ def build_bet_clean_cache_record(
     bet_base_cleaned_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
 ) -> dict[str, Any]:
-    """Fingerprint for cleaned bet parquet cache (registry + optional cleaned session binding).
+    """Fingerprint for cleaned bet parquet cache (raw t_bet + registry + optional ADT allowlist).
 
     When ``bet_base_cleaned_parquet`` is set, this targets the **segmented** parquet: fingerprint binds the
     all-players base artifact plus allowlist-derived ``adt_segment`` (distinct ``player_id`` content hash).
@@ -1123,8 +1133,8 @@ def build_bet_clean_cache_record(
     When ``adt_filter_quantile`` is set without ``bet_base_cleaned_parquet``, the ADT fragment matches the
     single-stage preprocess path.
 
-    ``patron_profile_csv`` / ``canonical_mapping_parquet`` are accepted for API compatibility but **do not**
-    affect the fingerprint.
+    ``patron_profile_csv`` / ``canonical_mapping_parquet`` / ``cleaned_session_parquet`` are accepted for API
+    compatibility but **do not** affect the fingerprint.
     """
     merged_sources = merge_bet_source_paths(source_bet_parquet, extra_source_bet_parquets)
     sources_stats = [_cleaned_parquet_row_stat(sp) for sp in merged_sources]
@@ -1148,9 +1158,6 @@ def build_bet_clean_cache_record(
         rec["partition_inventory_fingerprint_sha256_hex"] = str(
             partition_inventory_fingerprint_sha256_hex,
         ).strip()
-    dep = _fingerprint_cleaned_session_dependency(cleaned_session_parquet)
-    if dep is not None:
-        rec["cleaned_session_dependency"] = dep
 
     seg = _adt_segment_cache_block(
         quantile=adt_filter_quantile,
@@ -1234,7 +1241,7 @@ def bet_clean_cache_is_hit(
             source_bet_parquet,
             preprocess_registry_yaml=reg,
             dedup_hash_buckets=nb,
-            cleaned_session_parquet=cleaned_session_parquet,
+            cleaned_session_parquet=None,
             adt_filter_quantile=adt_filter_quantile,
             patron_profile_csv=patron_profile_csv,
             canonical_mapping_parquet=canonical_mapping_parquet,
