@@ -1,14 +1,14 @@
-"""High-tier training entry (skeleton).
+"""High-tier training entry: partition ingest → preprocess → Feast training set → splits → LightGBM.
 
 Analogous role to ``trainer.training.trainer.run_pipeline`` / ``main``: orchestrate
-load → fit → artifact write for the reduced high-tier objective. Implementation
-is intentionally empty beyond logging and call order.
+load → fit → artifact write for the reduced high-tier objective.
 
 Pipeline steps: ``01_data_ingest`` (inside ``prepare_training_frame``) →
 ``02_preprocess`` → optional walkaway labels (2c) → ``03_build_training_data`` (default on;
 ``--skip-training-dataset`` to skip) → ``04_split_dataset`` (default on; ``--skip-step4`` to skip)
-→ ``fit_model`` / ``write_artifacts`` (TODO). ``--skip-bet-preprocess`` skips Step 2b (reuse existing
-cleaned bet artifacts). Use ``--start-from-features`` to run only Step 4 on an existing training parquet.
+→ Step 5 ``fit_model`` (LightGBM + optional Optuna; ``--skip-step5`` / ``--skip-optuna``).
+``--skip-bet-preprocess`` skips Step 2b (reuse existing cleaned bet artifacts).
+Use ``--start-from-features`` to run only Step 4 on an existing training parquet.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from trainer_hightier.config import (
     DEFAULT_RUN_PROFILE_NAME,
     DuckDbRuntimeConfig,
     HighTierObjectiveConfig,
+    Step5TrainConfig,
     SessionPreprocessConfig,
     Step4SplitConfig,
     configs_from_run_profile,
@@ -58,6 +59,7 @@ _hpre = importlib.import_module("trainer_hightier.02_preprocess")
 _hbet = importlib.import_module("trainer_hightier.utils.bet_l0_preprocess")
 _b3 = importlib.import_module("trainer_hightier.03_build_training_data")
 _b4 = importlib.import_module("trainer_hightier.04_split_dataset")
+_b5 = importlib.import_module("trainer_hightier.05_lgbm_train")
 
 
 logger = logging.getLogger("trainer_hightier")
@@ -165,6 +167,16 @@ class HighTierTrainArgs:
     # When True: skip Step 1-3; require an existing training features parquet and run Step 4 only.
     start_from_features: bool = False
     features_input_parquet: Path | None = None
+    # Step 5: LightGBM + optional Optuna on Step 4 split Parquets.
+    step5: Step5TrainConfig = field(default_factory=Step5TrainConfig)
+
+
+def _resolve_splits_dir(args: HighTierTrainArgs) -> Path:
+    """Directory with ``train.parquet`` / ``val.parquet`` / ``test.parquet`` (Step 4)."""
+
+    if args.step4_split.splits_output_dir is not None:
+        return Path(args.step4_split.splits_output_dir).resolve()
+    return _b4.default_splits_output_dir().resolve()
 
 
 def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None) -> None:
@@ -602,14 +614,36 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs) -> None:
     logger.info("[Step 3] training dataset written %s", out)
 
 
-def fit_model(args: HighTierTrainArgs) -> None:
-    """Train a scorer on the high-tier slice (TODO)."""
-    logger.info("[Step 5] fit_model: not implemented (seed=%s)", args.random_seed)
+def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None) -> _b5.Step5Result | None:
+    """Train Step 5 LightGBM on Step 4 splits; merge metrics into ``metrics`` when provided."""
+
+    if not args.step5.run_step5:
+        logger.info("[Step 5] skipped (step5.run_step5=False)")
+        return None
+    splits_dir = _resolve_splits_dir(args)
+    if not (splits_dir / "train.parquet").is_file():
+        logger.warning(
+            "[Step 5] skip: no train.parquet under %s (run Step 4 or set splits_output_dir)",
+            splits_dir,
+        )
+        return None
+    result = _b5.train_lgbm_from_splits(
+        splits_dir=splits_dir,
+        duckdb_runtime=args.duckdb_runtime,
+        objective_min_precision=float(args.objective.min_precision),
+        random_seed=int(args.random_seed),
+        step5=args.step5,
+        output_dir=args.output_dir,
+    )
+    if metrics is not None:
+        metrics.update(result.report)
+    return result
 
 
-def write_artifacts(args: HighTierTrainArgs) -> None:
-    """Persist model bundle + minimal metrics sidecars (TODO)."""
-    logger.info("[Step 6] write_artifacts: not implemented")
+def write_artifacts(args: HighTierTrainArgs, *, step5_result: _b5.Step5Result | None = None) -> None:
+    """Log persisted Step 5 artifacts (model written during ``fit_model``)."""
+    if step5_result is not None:
+        logger.info("[Step 6] Step 5 model at %s", step5_result.model_path.resolve())
 
 
 def run_training(args: HighTierTrainArgs) -> None:
@@ -629,8 +663,8 @@ def run_training(args: HighTierTrainArgs) -> None:
         metrics["build_training_dataset_seconds"] = round(time.perf_counter() - t_step3, 3)
         _maybe_run_step4(args, metrics=metrics)
 
-    fit_model(args)
-    write_artifacts(args)
+    step5_result = fit_model(args, metrics=metrics)
+    write_artifacts(args, step5_result=step5_result)
     metrics["finish_epoch_ms"] = int(time.time() * 1000)
     rp = Path(args.output_dir) / "run_report.json"
     rp.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -714,6 +748,26 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         dest="skip_step4",
         help="Do not run Step 4 (arrange + train/val/test split by gaming_day).",
+    )
+    p.add_argument(
+        "--skip-step5",
+        action="store_true",
+        dest="skip_step5",
+        help="Do not train Step 5 LightGBM on Step 4 split Parquets.",
+    )
+    p.add_argument(
+        "--skip-optuna",
+        action="store_true",
+        dest="skip_optuna",
+        help="Step 5: skip Optuna and use baseline LightGBM hyperparameters.",
+    )
+    p.add_argument(
+        "--optuna-timeout-sec",
+        type=float,
+        default=600.0,
+        metavar="SEC",
+        dest="optuna_timeout_sec",
+        help="Step 5 Optuna wall-clock budget in seconds (default 600). Ignored with --skip-optuna.",
     )
     p.add_argument(
         "--disable-feast-retrieval-cache",
@@ -809,6 +863,12 @@ def main() -> None:
             Path(ns.features_input_parquet).resolve() if ns.features_input_parquet else None
         ),
         step4_split=Step4SplitConfig(),
+        step5=replace(
+            Step5TrainConfig(),
+            run_step5=not bool(ns.skip_step5),
+            skip_optuna=bool(ns.skip_optuna),
+            optuna_timeout_sec=float(ns.optuna_timeout_sec),
+        ),
     )
     run_training(args)
 

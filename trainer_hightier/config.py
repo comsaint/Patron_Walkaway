@@ -116,7 +116,7 @@ class HighTierObjectiveConfig:
     # Align naming with ``trainer.training.high_roller_segmentation`` when wiring segment thresholds.
     theo_train_quantile: float = 0.99
     # Require precision >= this value on the **segment** when choosing a score threshold.
-    min_precision: float = 0.80
+    min_precision: float = 0.60
     # Placeholder paths for later steps (Parquet / DuckDB exports).
     segment_scores_parquet: Path | None = None
     labels_parquet: Path | None = None
@@ -209,6 +209,26 @@ class Step4SplitConfig:
     val_day_fraction: float = 0.15
     #: When ``None``, defaults to ``trainer_hightier/artifacts/training_data/splits``.
     splits_output_dir: Path | None = None
+
+
+@dataclass(frozen=True)
+class Step5TrainConfig:
+    """Step 5: one LightGBM on Step 4 Parquet splits; optional Optuna with time budget."""
+
+    run_step5: bool = True
+    #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
+    skip_optuna: bool = False
+    #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
+    optuna_timeout_sec: float = 600.0
+    early_stopping_rounds: int = 50
+    #: Upper bound on boosting rounds (early stopping usually stops sooner).
+    lgb_n_estimators_cap: int = 2000
+    baseline_learning_rate: float = 0.05
+    baseline_num_leaves: int = 31
+    baseline_min_child_samples: int = 20
+    baseline_subsample: float = 0.8
+    baseline_colsample_bytree: float = 0.8
+    baseline_reg_lambda: float = 0.0
 
 
 def list_run_profile_names() -> tuple[str, ...]:

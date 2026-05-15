@@ -1,0 +1,597 @@
+"""Step 5: train one LightGBM on Step 4 split Parquets with optional Optuna.
+
+No standalone CLI — invoked from :mod:`trainer_hightier.trainer`. Reads
+``train.parquet`` / ``val.parquet`` / ``test.parquet`` under the Step 4 splits
+directory; picks a validation threshold under ``HighTierObjectiveConfig.min_precision``;
+writes model + metrics under the run ``output_dir``.
+
+Numeric prefix matches steps 1–4; use :func:`importlib.import_module` if importing
+from code.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import pickle
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Final
+
+import duckdb
+import lightgbm as lgb
+import numpy as np
+import optuna
+import pandas as pd
+import pyarrow.parquet as pq
+from sklearn.metrics import average_precision_score
+
+from trainer_hightier.config import DuckDbRuntimeConfig, Step5TrainConfig
+from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
+
+logger = logging.getLogger(__name__)
+
+_PACKAGE_ROOT = Path(__file__).resolve().parent
+
+MODEL_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
+    "wager",
+    "wager_nn",
+    "casino_win",
+    "is_back_bet",
+    "bet_type",
+    "type_of_bet",
+    "bet__bets_cnt__w1h",
+    "bet__wager_sum__w1h",
+    "bet__back_bet_ratio__w1h",
+    "bet__payout_odds_avg__w1h",
+    "patron__theo_win_sum__w180d_m1snap",
+    "patron__gaming_days_cnt__w180d_m1snap",
+    "patron__adt__w180d_m1snap",
+)
+
+PAYOUT_TS_COLUMN: Final[str] = "payout_complete_dtm"
+LABEL_COLUMN: Final[str] = "walkaway_label"
+CAT_COLUMNS: Final[frozenset[str]] = frozenset({"bet_type", "type_of_bet"})
+
+DEFAULT_MODEL_FILENAME: Final[str] = "step5_lgbm_model.pkl"
+DEFAULT_METRICS_FILENAME: Final[str] = "step5_training_metrics.json"
+
+
+@dataclass(frozen=True)
+class ThresholdPickResult:
+    """Operating point from validation-score threshold search."""
+
+    threshold: float
+    feasible: bool
+    precision: float
+    recall: float
+    alert_count: int
+    n_samples: int
+
+
+@dataclass(frozen=True)
+class Step5Result:
+    """Paths and metrics produced by :func:`train_lgbm_from_splits`."""
+
+    model_path: Path
+    metrics_path: Path
+    report: dict[str, Any]
+    threshold: float
+
+
+def split_window_hours_from_parquet(
+    parquet_path: Path,
+    *,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> float | None:
+    """Hours between min/max ``payout_complete_dtm`` on a split (trainer parity).
+
+    Mirrors ``trainer.training.trainer._split_window_hours_from_parquet_payout``
+    semantics: invalid / insufficient timestamps return ``None``.
+    """
+
+    p = Path(parquet_path).resolve()
+    if not p.is_file():
+        return None
+    pe = str(p).replace("'", "''")
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        row = con.execute(
+            f"SELECT min({PAYOUT_TS_COLUMN}) AS mn, max({PAYOUT_TS_COLUMN}) AS mx "
+            f"FROM read_parquet('{pe}')",
+        ).fetchone()
+    except Exception:
+        return None
+    finally:
+        con.close()
+    if row is None or row[0] is None or row[1] is None:
+        return None
+    mn = pd.to_datetime(row[0], errors="coerce")
+    mx = pd.to_datetime(row[1], errors="coerce")
+    if pd.isna(mn) or pd.isna(mx):
+        return None
+    span_sec = float((mx - mn).total_seconds())
+    if not math.isfinite(span_sec) or span_sec <= 0.0:
+        return None
+    return span_sec / 3600.0
+
+
+def _validate_parquet_schema(parquet_path: Path, required: frozenset[str]) -> None:
+    """Raise if ``parquet_path`` is missing any ``required`` column names."""
+
+    names = frozenset(pq.ParquetFile(Path(parquet_path).resolve()).schema_arrow.names)
+    missing = sorted(required.difference(names))
+    if missing:
+        raise ValueError(
+            f"Step 5 schema gate failed: missing columns {missing}; "
+            f"expected at least {sorted(required)}. path={parquet_path!r}, got {sorted(names)!r}.",
+        )
+
+
+def _load_split_frame(parquet_path: Path) -> pd.DataFrame:
+    cols = list(MODEL_FEATURE_COLUMNS) + [LABEL_COLUMN, PAYOUT_TS_COLUMN]
+    _validate_parquet_schema(parquet_path, frozenset(cols))
+    return pd.read_parquet(Path(parquet_path).resolve(), columns=cols)
+
+
+def _prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray]:
+    """Return feature frame (with category dtypes) and binary labels ``0/1``."""
+
+    y_raw = pd.to_numeric(df[LABEL_COLUMN], errors="coerce")
+    if y_raw.isna().any():
+        bad = int(y_raw.isna().sum())
+        raise ValueError(f"Label column {LABEL_COLUMN!r} has {bad} non-numeric/null values.")
+    y = np.asarray(y_raw, dtype=np.int8)
+    uniq = np.unique(y)
+    if not np.isin(uniq, [0, 1]).all():
+        raise ValueError(f"Labels must be binary {{0,1}}; got unique {uniq.tolist()}")
+    X = df[list(MODEL_FEATURE_COLUMNS)].copy()
+    for c in MODEL_FEATURE_COLUMNS:
+        if c in CAT_COLUMNS:
+            X[c] = X[c].astype(str).replace({"nan": "__NA__"}).fillna("__NA__").astype("category")
+        else:
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+    return X, y
+
+
+def pick_threshold_precision_floor(
+    y_true: np.ndarray,
+    scores: np.ndarray,
+    *,
+    min_precision: float,
+) -> ThresholdPickResult:
+    """Pick threshold on validation scores under precision floor rules.
+
+    Alerts are ``scores >= threshold``. Candidates are prefixes after sorting
+    scores descending at boundaries between equal-score blocks.
+
+    When feasible (exists prefix with precision >= ``min_precision``): maximize
+    recall; ties — higher precision, then higher threshold.
+
+    When infeasible: maximize precision; ties — higher recall, then higher threshold.
+    """
+
+    y_arr = np.asarray(y_true, dtype=np.int8).reshape(-1)
+    s_arr = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if y_arr.shape[0] != s_arr.shape[0]:
+        raise ValueError(f"y_true length {y_arr.shape[0]} != scores length {s_arr.shape[0]}")
+    if y_arr.size == 0:
+        raise ValueError("y_true must be non-empty")
+    if not np.isfinite(s_arr).all():
+        raise ValueError("scores must be finite (no NaN/inf)")
+    mp = float(min_precision)
+    if not (0.0 < mp <= 1.0) or not math.isfinite(mp):
+        raise ValueError(f"min_precision must be finite in (0,1]; got {min_precision!r}")
+
+    pos = int(np.sum(y_arr == 1))
+    n = int(len(y_arr))
+    if pos == 0:
+        return ThresholdPickResult(
+            threshold=float("nan"),
+            feasible=False,
+            precision=0.0,
+            recall=0.0,
+            alert_count=0,
+            n_samples=n,
+        )
+
+    order = np.argsort(-s_arr, kind="mergesort")
+    ys = y_arr[order].astype(np.int64)
+    scs = s_arr[order]
+    cum_tp = np.cumsum(ys)
+
+    candidates: list[tuple[float, int, float, float]] = []
+    i = 0
+    while i < n:
+        thr = float(scs[i])
+        j = i
+        while j < n and float(scs[j]) == thr:
+            j += 1
+        k = j
+        tp = int(cum_tp[k - 1])
+        prec = tp / float(k)
+        rec = tp / float(pos)
+        candidates.append((thr, k, prec, rec))
+        i = j
+
+    feasible_pts = [(thr, k, prec, rec) for thr, k, prec, rec in candidates if prec >= mp - 1e-15]
+    if feasible_pts:
+        thr, k, prec, rec = max(feasible_pts, key=lambda t: (t[3], t[2], t[0]))
+        return ThresholdPickResult(
+            threshold=float(thr),
+            feasible=True,
+            precision=float(prec),
+            recall=float(rec),
+            alert_count=int(k),
+            n_samples=n,
+        )
+
+    thr, k, prec, rec = max(candidates, key=lambda t: (t[2], t[3], t[0]))
+    return ThresholdPickResult(
+        threshold=float(thr),
+        feasible=False,
+        precision=float(prec),
+        recall=float(rec),
+        alert_count=int(k),
+        n_samples=n,
+    )
+
+
+def _metrics_at_threshold(
+    y_true: np.ndarray,
+    scores: np.ndarray,
+    threshold: float,
+) -> tuple[float, float, float, int]:
+    """Return precision, recall, f1, alert_count for ``scores >= threshold``."""
+
+    y = np.asarray(y_true, dtype=np.int8).reshape(-1)
+    s = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if not math.isfinite(float(threshold)):
+        return 0.0, 0.0, 0.0, 0
+    pred = (s >= float(threshold)).astype(np.int8)
+    tp = int(np.sum((pred == 1) & (y == 1)))
+    fp = int(np.sum((pred == 1) & (y == 0)))
+    fn = int(np.sum((pred == 0) & (y == 1)))
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    alerts = int(np.sum(pred == 1))
+    return float(prec), float(rec), float(f1), alerts
+
+
+def _split_metrics_block(
+    split: str,
+    y_true: np.ndarray,
+    scores: np.ndarray,
+    threshold: float,
+    *,
+    window_hours: float | None,
+) -> dict[str, Any]:
+    """Build flat metrics keys aligned with main ``trainer`` density naming."""
+
+    y = np.asarray(y_true, dtype=np.int8).reshape(-1)
+    s = np.asarray(scores, dtype=np.float64).reshape(-1)
+    n = int(len(y))
+    n_pos = int(np.sum(y == 1))
+    n_neg = int(np.sum(y == 0))
+    has_both = n_pos >= 1 and n_neg >= 1 and np.isfinite(s).all()
+    ap = float(average_precision_score(y, s)) if has_both else 0.0
+    prec, rec, f1, alerts = _metrics_at_threshold(y, s, threshold)
+    out: dict[str, Any] = {
+        f"{split}_ap": ap,
+        f"{split}_precision": prec,
+        f"{split}_recall": rec,
+        f"{split}_f1": f1,
+        f"{split}_samples": n,
+        f"{split}_positives": n_pos,
+        f"{split}_alerts": alerts,
+        f"{split}_window_hours": float(window_hours) if window_hours is not None else None,
+        f"{split}_alerts_per_hour": None,
+        f"{split}_true_labels_per_hour": None,
+    }
+    if window_hours is not None and math.isfinite(float(window_hours)) and float(window_hours) > 0:
+        wh = float(window_hours)
+        out[f"{split}_alerts_per_hour"] = float(alerts) / wh
+        out[f"{split}_true_labels_per_hour"] = float(n_pos) / wh
+    return out
+
+
+def _baseline_lgb_params(cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
+    return {
+        "objective": "binary",
+        "metric": "binary_logloss",
+        "verbosity": -1,
+        "n_estimators": int(cfg.lgb_n_estimators_cap),
+        "learning_rate": float(cfg.baseline_learning_rate),
+        "num_leaves": int(cfg.baseline_num_leaves),
+        "min_child_samples": int(cfg.baseline_min_child_samples),
+        "subsample": float(cfg.baseline_subsample),
+        "colsample_bytree": float(cfg.baseline_colsample_bytree),
+        "reg_lambda": float(cfg.baseline_reg_lambda),
+        "random_state": int(seed),
+        "n_jobs": 1,
+    }
+
+
+def _rebuild_lgb_params_from_optuna_best(
+    best_params: dict[str, Any],
+    cfg: Step5TrainConfig,
+    seed: int,
+) -> dict[str, Any]:
+    """Rebuild full LightGBM kwargs from Optuna ``best_params``."""
+
+    hp = dict(best_params)
+    return {
+        "objective": "binary",
+        "metric": "binary_logloss",
+        "verbosity": -1,
+        "n_estimators": int(cfg.lgb_n_estimators_cap),
+        "learning_rate": float(hp["learning_rate"]),
+        "num_leaves": int(hp["num_leaves"]),
+        "min_child_samples": int(hp["min_child_samples"]),
+        "subsample": float(hp["subsample"]),
+        "colsample_bytree": float(hp["colsample_bytree"]),
+        "reg_lambda": float(hp["reg_lambda"]),
+        "random_state": int(seed),
+        "n_jobs": 1,
+    }
+
+
+def _suggest_lgb_params(trial: optuna.Trial, cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
+    return {
+        "objective": "binary",
+        "metric": "binary_logloss",
+        "verbosity": -1,
+        "n_estimators": int(cfg.lgb_n_estimators_cap),
+        "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.2, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 16, 96),
+        "min_child_samples": trial.suggest_int("min_child_samples", 10, 300),
+        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 5.0, log=True),
+        "random_state": int(seed),
+        "n_jobs": 1,
+    }
+
+
+def _optuna_trial_debug_log(study: optuna.study.Study, trial: optuna.trial.FrozenTrial) -> None:
+    """Log each finished Optuna trial at DEBUG only (objective value and sampled params)."""
+
+    logger.debug(
+        "Optuna trial %s state=%s value=%s params=%s",
+        trial.number,
+        trial.state,
+        trial.value,
+        trial.params,
+    )
+
+
+def _train_one_lgbm(
+    X_tr: pd.DataFrame,
+    y_tr: np.ndarray,
+    X_va: pd.DataFrame,
+    y_va: np.ndarray,
+    hp: dict[str, Any],
+    *,
+    early_stopping_rounds: int,
+) -> lgb.LGBMClassifier:
+    clf = lgb.LGBMClassifier(**hp)
+    callbacks = [
+        lgb.early_stopping(stopping_rounds=int(early_stopping_rounds), verbose=False),
+        lgb.log_evaluation(period=0),
+    ]
+    clf.fit(
+        X_tr,
+        y_tr,
+        eval_set=[(X_va, y_va)],
+        eval_metric="binary_logloss",
+        callbacks=callbacks,
+    )
+    return clf
+
+
+def train_lgbm_from_splits(
+    *,
+    splits_dir: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    objective_min_precision: float,
+    random_seed: int,
+    step5: Step5TrainConfig | None = None,
+    output_dir: Path,
+) -> Step5Result:
+    """Train LightGBM on Step 4 splits; optional Optuna; pick threshold on val; write artifacts."""
+
+    cfg = step5 or Step5TrainConfig()
+    sd = Path(splits_dir).resolve()
+    train_p = sd / "train.parquet"
+    val_p = sd / "val.parquet"
+    test_p = sd / "test.parquet"
+    for pth in (train_p, val_p, test_p):
+        if not pth.is_file():
+            raise FileNotFoundError(f"Step 5 requires split parquet at {pth}")
+
+    wh_train = split_window_hours_from_parquet(train_p, duckdb_runtime=duckdb_runtime)
+    wh_val = split_window_hours_from_parquet(val_p, duckdb_runtime=duckdb_runtime)
+    wh_test = split_window_hours_from_parquet(test_p, duckdb_runtime=duckdb_runtime)
+    if wh_train is None:
+        logger.warning(
+            "Step 5 train: cannot compute %s window_hours; train_alerts_per_hour omitted.",
+            PAYOUT_TS_COLUMN,
+        )
+    if wh_val is None:
+        logger.warning(
+            "Step 5 val: cannot compute %s window_hours; val_alerts_per_hour omitted.",
+            PAYOUT_TS_COLUMN,
+        )
+    if wh_test is None:
+        logger.warning(
+            "Step 5 test: cannot compute %s window_hours; test_alerts_per_hour omitted.",
+            PAYOUT_TS_COLUMN,
+        )
+
+    df_tr = _load_split_frame(train_p)
+    df_va = _load_split_frame(val_p)
+    df_te = _load_split_frame(test_p)
+    X_tr, y_tr = _prepare_xy(df_tr)
+    X_va, y_va = _prepare_xy(df_va)
+    X_te, y_te = _prepare_xy(df_te)
+
+    cat_cols = [c for c in MODEL_FEATURE_COLUMNS if c in CAT_COLUMNS]
+    union_cats: dict[str, pd.Index] = {}
+    for c in cat_cols:
+        combined = pd.concat(
+            [X_tr[c].astype(str), X_va[c].astype(str), X_te[c].astype(str)],
+            axis=0,
+            ignore_index=True,
+        )
+        union_cats[c] = pd.Index(pd.unique(combined))
+    for c in cat_cols:
+        X_tr[c] = pd.Categorical(X_tr[c], categories=union_cats[c])
+        X_va[c] = pd.Categorical(X_va[c], categories=union_cats[c])
+        X_te[c] = pd.Categorical(X_te[c], categories=union_cats[c])
+
+    val_pos = int(np.sum(y_va == 1))
+    if val_pos < 1 or int(np.sum(y_va == 0)) < 1:
+        raise ValueError(
+            f"Validation set must have at least one positive and one negative label; "
+            f"got positives={val_pos}, n={len(y_va)}.",
+        )
+
+    def _evaluate_hp(hp: dict[str, Any]) -> tuple[lgb.LGBMClassifier, ThresholdPickResult, float]:
+        model = _train_one_lgbm(
+            X_tr,
+            y_tr,
+            X_va,
+            y_va,
+            hp,
+            early_stopping_rounds=int(cfg.early_stopping_rounds),
+        )
+        val_scores = model.predict_proba(X_va)[:, 1]
+        pick = pick_threshold_precision_floor(
+            y_va,
+            val_scores,
+            min_precision=float(objective_min_precision),
+        )
+        objective_val: float
+        if pick.feasible:
+            objective_val = float(pick.recall)
+        else:
+            objective_val = float(pick.precision) - float(objective_min_precision) - 1.0
+        return model, pick, objective_val
+
+    t0 = time.perf_counter()
+    best_hp: dict[str, Any]
+    study_summary: dict[str, Any] | None = None
+
+    if cfg.skip_optuna:
+        best_hp = _baseline_lgb_params(cfg, random_seed)
+        model, val_pick, _obj = _evaluate_hp(best_hp)
+    else:
+        sampler = optuna.samplers.TPESampler(seed=int(random_seed))
+
+        def objective(trial: optuna.Trial) -> float:
+            hp = _suggest_lgb_params(trial, cfg, random_seed)
+            _, _, obj_inner = _evaluate_hp(hp)
+            return float(obj_inner)
+
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+        _prev_optuna_verbosity = optuna.logging.get_verbosity()
+        try:
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+            study.optimize(
+                objective,
+                timeout=float(cfg.optuna_timeout_sec),
+                show_progress_bar=True,
+                callbacks=[_optuna_trial_debug_log],
+            )
+        finally:
+            optuna.logging.set_verbosity(_prev_optuna_verbosity)
+        study_summary = {"optuna_n_trials": len(study.trials)}
+        try:
+            study_summary["optuna_best_value"] = float(study.best_value)
+            study_summary["optuna_best_params"] = dict(study.best_params)
+            best_hp = _rebuild_lgb_params_from_optuna_best(study.best_params, cfg, random_seed)
+        except RuntimeError:
+            logger.warning("Step 5: Optuna has no completed trials; using baseline hyperparameters.")
+            study_summary["optuna_best_value"] = None
+            study_summary["optuna_best_params"] = {}
+            best_hp = _baseline_lgb_params(cfg, random_seed)
+        model, val_pick, _ = _evaluate_hp(best_hp)
+
+    train_scores = model.predict_proba(X_tr)[:, 1]
+    val_scores = model.predict_proba(X_va)[:, 1]
+    test_scores = model.predict_proba(X_te)[:, 1]
+
+    if not val_pick.feasible:
+        logger.warning(
+            "Step 5: no threshold achieves min_precision=%.4f on validation; reporting best achievable "
+            "precision=%.4f recall=%.4f at threshold=%.6f.",
+            float(objective_min_precision),
+            val_pick.precision,
+            val_pick.recall,
+            val_pick.threshold,
+        )
+
+    thr = float(val_pick.threshold)
+    block_tr = _split_metrics_block("train", y_tr, train_scores, thr, window_hours=wh_train)
+    block_va = _split_metrics_block("val", y_va, val_scores, thr, window_hours=wh_val)
+    block_te = _split_metrics_block("test", y_te, test_scores, thr, window_hours=wh_test)
+
+    elapsed = round(time.perf_counter() - t0, 3)
+    report: dict[str, Any] = {
+        "step5_seconds": elapsed,
+        "step5_feature_columns": list(MODEL_FEATURE_COLUMNS),
+        "step5_threshold": thr,
+        "step5_val_pick_feasible": val_pick.feasible,
+        "step5_val_precision_at_pick": val_pick.precision,
+        "step5_val_recall_at_pick": val_pick.recall,
+        "step5_min_precision": float(objective_min_precision),
+        "step5_optuna_skipped": bool(cfg.skip_optuna),
+        **block_tr,
+        **block_va,
+        **block_te,
+    }
+    if study_summary is not None:
+        report.update(study_summary)
+
+    out_dir = Path(output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_path = (out_dir / DEFAULT_MODEL_FILENAME).resolve()
+    with open(model_path, "wb") as f:
+        pickle.dump(
+            {
+                "model": model,
+                "feature_columns": list(MODEL_FEATURE_COLUMNS),
+                "categorical_columns": list(CAT_COLUMNS),
+                "category_categories": {c: union_cats[c].tolist() for c in cat_cols},
+                "threshold": thr,
+                "min_precision": float(objective_min_precision),
+                "val_pick_feasible": val_pick.feasible,
+            },
+            f,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    report["step5_model_path"] = str(model_path)
+    metrics_path = (out_dir / DEFAULT_METRICS_FILENAME).resolve()
+    metrics_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    report["step5_training_metrics_path"] = str(metrics_path)
+
+    logger.info(
+        "Step 5 trained LightGBM in %.3fs; threshold=%.6f feasible=%s val recall=%.4f prec=%.4f → %s",
+        elapsed,
+        thr,
+        val_pick.feasible,
+        val_pick.recall,
+        val_pick.precision,
+        model_path,
+    )
+
+    return Step5Result(
+        model_path=model_path,
+        metrics_path=metrics_path,
+        report=report,
+        threshold=thr,
+    )

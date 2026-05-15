@@ -1,7 +1,10 @@
 ---
 name: trainer-hightier-working-plan
-overview: Execution-level working plan for implementing the trainer_hightier data pipeline architecture defined in the implementation plan, with task sequencing, dependencies, owners, and definition of done.
+overview: Execution-level working plan for trainer_hightier data pipeline plus Step 5 LightGBM training slice (feature contract, val threshold, metrics aligned with main trainer alert density).
 todos:
+  - id: w6-step5-lgbm-train-report
+    content: Step 5：LightGBM+Optuna、特徵契約、val 選 threshold、三 split 指標與主線對齊之 alerts_per_hour（payout_complete_dtm window）
+    status: pending
   - id: w1-inventory-recompute
     content: 完成 gaming_day 分片 inventory、fingerprint 與重算集合決策器（含 recent window/correction）
     status: pending
@@ -28,8 +31,8 @@ isProject: false
 
 ## 執行原則
 
-- 僅涵蓋資料管線、特徵物化、訓練資料產製與治理。
-- 不包含模型訓練策略、調參、FE 試驗方法學。
+- 以資料管線、特徵物化、訓練資料產製與治理為主。
+- **Step 5（`fit_model`）**：以下「Iteration 6」為獨立執行切片，描述單一 LightGBM、可選 Optuna、閾值與報表；不展開 FE 試驗矩陣或雙模型等主線完整範圍。
 - 每個階段必須完成 DoD 才能進下一階段。
 
 ## 時程分組（建議 5 個 iteration）
@@ -139,6 +142,65 @@ isProject: false
   - 依賴：W5.2
   - DoD：與基準流程結果差異在可接受範圍，並達成效能改善目標。
 
+### Iteration 6: Step 5 LightGBM 訓練、特徵契約與主線對齊之 alert 密度
+
+**輸入**：Step 4 產物 `trainer_hightier/artifacts/training_data/splits/{train,val,test}.parquet`（不做 CV）。
+
+**LightGBM 特徵欄（唯一允許進模型的欄名集合，共 13 欄）**
+
+| 來源 | 欄名 |
+|------|------|
+| cleaned bet（Feast `cleaned_bet_features`，僅此 6 欄） | `wager`, `wager_nn`, `casino_win`, `is_back_bet`, `bet_type`, `type_of_bet` |
+| trial 1h（`trial_bet_behavior_1h_features`） | `bet__bets_cnt__w1h`, `bet__wager_sum__w1h`, `bet__back_bet_ratio__w1h`, `bet__payout_odds_avg__w1h` |
+| slow 180d（`slow_patron_180d_monthly_features`） | `patron__theo_win_sum__w180d_m1snap`, `patron__gaming_days_cnt__w180d_m1snap`, `patron__adt__w180d_m1snap` |
+
+**明確排除（不得進 `X`）**
+
+- 識別 / 切分 / 標籤：`bet_id`, `session_id`, `player_id`, `game_id`, `table_id`, `walkaway_label`, `canonical_id`, `gaming_day`。
+- `cleaned_bet_features` 其餘所有欄位（例如 `payout_complete_dtm`, `status`, `position_*`, `theo_win`, …）—**一律不進模型**。
+- 其餘出現在 split Parquet 但不在上表者（例如 `event_timestamp`）：**預設不進 `X`**；若日後要時間衍生特徵，須另開任務與契約。
+
+**`payout_complete_dtm` 的用途（僅指標，非特徵）**
+
+- 為對齊主線「每小時 alert 密度」，採與 `trainer/training/trainer.py` 之 `_split_window_hours_from_payout_df` **相同語意**：在該 split 上取 `payout_complete_dtm` 可解析值之 **min/max 時間差（小時）** 作為 `window_hours`。
+- 若欄位缺失、有效時間戳 < 2、或跨度 ≤0：**不報** `alerts_per_hour`（或報 `null`）並 **warning**（與主線在無效 window 時不給有意義密度一致）。
+- 實作可優先使用 DuckDB 對 Parquet 的 `MIN`/`MAX`（對齊 `_split_window_hours_from_parquet_payout` 思路），避免整表載入 pandas。
+
+**主線對齊的報表鍵（建議與 `trainer/training/model_eval_runtime._split_alert_density_prefixed_dict` 同形）**
+
+- 對 `train` / `val` / `test` 各別輸出（在 **val 上選定之同一 `threshold`** 下計算 alerts）：
+  - `{split}_window_hours`
+  - `{split}_alerts`（`score >= threshold` 之列數）
+  - `{split}_alerts_per_hour` = `{split}_alerts / {split}_window_hours`（僅當 `window_hours` 為有限正數）
+- 另建議保留與主線可比之 scalar：`{split}_ap`（PR-AUC，無 threshold）、`{split}_precision`, `{split}_recall`, `{split}_f1`（於該 threshold）、`{split}_samples`, `{split}_positives`。
+
+**閾值與目標（實作契約，接續先前決策）**
+
+- Floor：`HighTierObjectiveConfig.min_precision`。
+- 在 **val** 分數上掃 threshold：在 `precision >= min_precision` 之可行集合內取 **recall 最大**；同 recall 則 **precision 較高**，再同分則 **threshold 較高**。
+- 若無任何 threshold 可達 floor：**warning**，並改報 **可達之最佳 precision** 及其 **recall**（與對應 threshold、三 split 之 alert 計數／密度一併寫入報表 JSON）。
+
+**訓練行為（摘要）**
+
+- Early stopping：`binary_logloss`；**不加** class weight。
+- Optuna：固定 seed + **時間預算**（timeout）；`--skip-optuna` 時走固定 baseline 超參數。
+
+- 任務 W6.1：在 `trainer_hightier` 內實作特徵投影（僅上表 13 欄 + 讀取 `payout_complete_dtm` 僅供 window）、缺失欄位於載入時 **fail fast** 並列出實際 schema。
+  - 主要落點：[C:/Users/longp/Patron_Walkaway/trainer_hightier/trainer.py](C:/Users/longp/Patron_Walkaway/trainer_hightier/trainer.py)（`fit_model`）或同套件小型模組（保持單一職責）。
+  - Owner：ML 工程
+  - 依賴：Step 4 產物存在且 `split_report.json` 與本契約一致。
+  - DoD：單元測試覆蓋「允許欄集合」與「排除欄不得出現在 `feature_name`」。
+- 任務 W6.2：實作 `window_hours` + 三 split `alerts_per_hour` 與主線鍵名對齊；寫入 `run_report.json` 或並列 `training_metrics.json` sidecar。
+  - 主要落點：同上。
+  - Owner：ML 工程
+  - 依賴：W6.1
+  - DoD：手動對照一筆小樣本：手算 `MIN/MAX(payout_complete_dtm)` 與程式輸出小時數一致；`alerts_per_hour` = `alerts / window_hours`。
+- 任務 W6.3：Optuna（時間預算 + seed）與 `--skip-optuna` baseline；artifact 寫出模型與選定 threshold、特徵清單版本。
+  - 主要落點：同上 + `trainer_hightier/config.py`（必要時僅擴充與訓練相關之常數/預設，避免與管線 SSOT 混淆）。
+  - Owner：ML 工程
+  - 依賴：W6.2
+  - DoD：同一 split 重跑（同 seed、skip Optuna）指標在浮點誤差內可重現。
+
 ## 依賴圖（高層）
 
 ```mermaid
@@ -159,6 +221,9 @@ flowchart LR
     W35 --> W51[W5.1DVCStages]
     W51 --> W52[W5.2RunReport]
     W52 --> W53[W5.3E2ERegression]
+    W35 --> W61[W6.1LgbmFeatureContract]
+    W61 --> W62[W6.2AlertDensityMetrics]
+    W62 --> W63[W6.3OptunaArtifacts]
 ```
 
 
@@ -169,6 +234,7 @@ flowchart LR
 - P1（核心效能）：W3.1, W3.2, W3.3, W3.4, W3.5。
 - P1（風險防線）：W4.1, W4.2, W4.3。
 - P2（治理固化）：W5.1, W5.2, W5.3。
+- P1（訓練最小切片，與 Step 4 銜接）：W6.1 → W6.2 → W6.3（可與 W5.* 並行開發，但上線驗收取決於 Step 4 穩定產物）。
 
 ## 阻塞條件與升級規則
 
@@ -185,4 +251,5 @@ flowchart LR
 - 建立 `date_slice × feature_group` 快取與 lookback dirty 擴張，支援「改日期窗 / 改 feature 組」局部重算。
 - 建立 metamorphic + guardrail 測試防線，保障特徵不依賴未審核 cohort-global normalization。
 - 建立每次 run 報表與可重現治理流程，並以對照驗證通過驗收。
+- Step 5：依「Iteration 6」特徵契約完成 LightGBM 訓練，並以 `payout_complete_dtm` 跨度計算各 split 之 `window_hours` 與主線語意一致之 `alerts_per_hour`。
 
