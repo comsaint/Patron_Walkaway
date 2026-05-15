@@ -16,6 +16,83 @@ from datetime import datetime
 from pathlib import Path
 from typing import Final
 
+# Baseline MODEL columns: softer FQG (high PSI → WARN; unique-constant under sample → WARN; WARN auto-allowlist).
+_FQG_BASELINE_MODEL_SOFT_COLUMNS: tuple[str, ...] = (
+    "wager",
+    "wager_nn",
+    "casino_win",
+    "is_back_bet",
+    "bet_type",
+    "type_of_bet",
+    "bet__bets_cnt__w1h",
+    "bet__wager_sum__w1h",
+    "bet__back_bet_ratio__w1h",
+    "bet__payout_odds_avg__w1h",
+    "patron__theo_win_sum__w180d_m1snap",
+    "patron__gaming_days_cnt__w180d_m1snap",
+    "patron__adt__w180d_m1snap",
+)
+
+
+@dataclass(frozen=True)
+class FeatureQualityGateConfig:
+    """Feature Quality Gate v0 thresholds (Working Plan §1.5).
+
+    Central SSOT for FQG; no environment variables — tune here or override in callers.
+    Baseline MODEL columns typically auto-approved on WARN entries (see ``warn_autoapprove_columns``).
+    """
+
+    fqg_version: str = "v0"
+    random_seed: int = 42
+    max_rows_per_split: int = 200_000
+    #: L1 — treat column as categorical if cardinality <= this threshold (excluding nulls).
+    low_cardinality_categorical_cutoff: int = 512
+    missing_rate_block: float = 0.98
+    missing_rate_warn_lo: float = 0.70
+    #: Absolute difference in missing rate fraction across splits (e.g. 0.20 = 20pp).
+    missing_rate_split_diff_warn: float = 0.20
+    near_constant_top1_warn: float = 0.995
+    categorical_unseen_frac_warn: float = 0.10
+    #: ``p99_abs / max(abs(p50), eps)``.
+    numeric_long_tail_warn: float = 1e4
+    numeric_long_tail_eps: float = 1e-12
+    #: Names containing any of these case-insensitive substrings fail PIT/leak heuristics (BLOCK).
+    leakage_column_substrings: tuple[str, ...] = tuple(
+        (
+            "__future__",
+            "_future_",
+            "future_win",
+            "label_future",
+            "walkaway_future",
+            "derived_from_label",
+            "posterior_target",
+            "oracle_",
+            "leaked_",
+        )
+    )
+    #: Gate 0 overlay (same sample as L1/L2): per-working-plan Gate 0.
+    gate0_missing_max_frac: float = 0.40
+    gate0_constant_top1_block: float = 0.995
+    gate0_illegal_max_frac: float = 0.005
+    psi_bin_count: int = 10
+    psi_eps: float = 1e-6
+    psi_pass_max: float = 0.10
+    psi_warn_max: float = 0.25
+    min_rows_month_slice: int = 500
+    #: Monthly missing-rate stability: WARN if STRICTLY MORE than ``floor(n_months_ok/2)`` months exceed this deviation ratio vs pooled estimate.
+    month_missing_rel_dev_warn: float = 2.0
+    uplift_flip_frac_warn: float = 0.40
+    #: ``|corr(is_nan,label)| >= this threshold in both splits but disagree in sign ⇒ WARN``.
+    mnar_corr_abs_floor: float = 0.10
+    #: Baseline MODEL columns: L2 PSI above ``psi_warn_max`` is **WARN** only (never BLOCK), so subsample drift does not abort the default pipeline.
+    l2_psi_block_downgrade_to_warn_columns: tuple[str, ...] = _FQG_BASELINE_MODEL_SOFT_COLUMNS
+    #: L1 ``nunique==1`` (across splits) becomes **WARN** for these columns (e.g. ``wager_nn`` degenerate under FQG sample).
+    #: Same set is used to soften **Gate0** ``top1`` constant BLOCK for baseline registry columns.
+    l1_constant_unique_block_downgrade_to_warn_columns: tuple[str, ...] = _FQG_BASELINE_MODEL_SOFT_COLUMNS
+    #: MODEL columns WARN without external approval file automatically stay trainable for baseline/compatibility.
+    warn_autoapprove_columns: tuple[str, ...] = _FQG_BASELINE_MODEL_SOFT_COLUMNS
+
+
 # Repo root (parent of ``trainer_hightier/``); used for default DuckDB spill path only.
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 

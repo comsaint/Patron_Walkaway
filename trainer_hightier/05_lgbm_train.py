@@ -131,13 +131,13 @@ def _validate_parquet_schema(parquet_path: Path, required: frozenset[str]) -> No
         )
 
 
-def _load_split_frame(parquet_path: Path) -> pd.DataFrame:
-    cols = list(MODEL_FEATURE_COLUMNS) + [LABEL_COLUMN, PAYOUT_TS_COLUMN]
+def _load_split_frame(parquet_path: Path, *, feature_columns: tuple[str, ...]) -> pd.DataFrame:
+    cols = list(feature_columns) + [LABEL_COLUMN, PAYOUT_TS_COLUMN]
     _validate_parquet_schema(parquet_path, frozenset(cols))
     return pd.read_parquet(Path(parquet_path).resolve(), columns=cols)
 
 
-def _prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray]:
+def _prepare_xy(df: pd.DataFrame, *, feature_columns: tuple[str, ...]) -> tuple[pd.DataFrame, np.ndarray]:
     """Return feature frame (with category dtypes) and binary labels ``0/1``."""
 
     y_raw = pd.to_numeric(df[LABEL_COLUMN], errors="coerce")
@@ -148,8 +148,8 @@ def _prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray]:
     uniq = np.unique(y)
     if not np.isin(uniq, [0, 1]).all():
         raise ValueError(f"Labels must be binary {{0,1}}; got unique {uniq.tolist()}")
-    X = df[list(MODEL_FEATURE_COLUMNS)].copy()
-    for c in MODEL_FEATURE_COLUMNS:
+    X = df[list(feature_columns)].copy()
+    for c in feature_columns:
         if c in CAT_COLUMNS:
             X[c] = X[c].astype(str).replace({"nan": "__NA__"}).fillna("__NA__").astype("category")
         else:
@@ -401,9 +401,16 @@ def train_lgbm_from_splits(
     random_seed: int,
     step5: Step5TrainConfig | None = None,
     output_dir: Path,
+    feature_columns: tuple[str, ...] | None = None,
 ) -> Step5Result:
-    """Train LightGBM on Step 4 splits; optional Optuna; pick threshold on val; write artifacts."""
+    """Train LightGBM on Step 4 splits; optional Optuna; pick threshold on val; write artifacts.
 
+    Args:
+        feature_columns: Columns used as model inputs (excluding label / payout_ts). Defaults to
+            :data:`MODEL_FEATURE_COLUMNS`.
+    """
+
+    feat_cols = feature_columns if feature_columns is not None else MODEL_FEATURE_COLUMNS
     cfg = step5 or Step5TrainConfig()
     sd = Path(splits_dir).resolve()
     train_p = sd / "train.parquet"
@@ -432,14 +439,14 @@ def train_lgbm_from_splits(
             PAYOUT_TS_COLUMN,
         )
 
-    df_tr = _load_split_frame(train_p)
-    df_va = _load_split_frame(val_p)
-    df_te = _load_split_frame(test_p)
-    X_tr, y_tr = _prepare_xy(df_tr)
-    X_va, y_va = _prepare_xy(df_va)
-    X_te, y_te = _prepare_xy(df_te)
+    df_tr = _load_split_frame(train_p, feature_columns=feat_cols)
+    df_va = _load_split_frame(val_p, feature_columns=feat_cols)
+    df_te = _load_split_frame(test_p, feature_columns=feat_cols)
+    X_tr, y_tr = _prepare_xy(df_tr, feature_columns=feat_cols)
+    X_va, y_va = _prepare_xy(df_va, feature_columns=feat_cols)
+    X_te, y_te = _prepare_xy(df_te, feature_columns=feat_cols)
 
-    cat_cols = [c for c in MODEL_FEATURE_COLUMNS if c in CAT_COLUMNS]
+    cat_cols = [c for c in feat_cols if c in CAT_COLUMNS]
     union_cats: dict[str, pd.Index] = {}
     for c in cat_cols:
         combined = pd.concat(
@@ -543,7 +550,7 @@ def train_lgbm_from_splits(
     elapsed = round(time.perf_counter() - t0, 3)
     report: dict[str, Any] = {
         "step5_seconds": elapsed,
-        "step5_feature_columns": list(MODEL_FEATURE_COLUMNS),
+        "step5_feature_columns": list(feat_cols),
         "step5_threshold": thr,
         "step5_val_pick_feasible": val_pick.feasible,
         "step5_val_precision_at_pick": val_pick.precision,
@@ -564,7 +571,7 @@ def train_lgbm_from_splits(
         pickle.dump(
             {
                 "model": model,
-                "feature_columns": list(MODEL_FEATURE_COLUMNS),
+                "feature_columns": list(feat_cols),
                 "categorical_columns": list(CAT_COLUMNS),
                 "category_categories": {c: union_cats[c].tolist() for c in cat_cols},
                 "threshold": thr,

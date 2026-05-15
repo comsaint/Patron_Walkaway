@@ -1,0 +1,19 @@
+training_sample_min_gaming_day: "2025-01-01"
+
+# Mirror :class:`~trainer_hightier.config.Step4SplitConfig` defaults used by main trainer.
+train_day_fraction: 0.70
+val_day_fraction: 0.15
+
+# Fixed-seed baseline vs candidate (no Optuna) per feature exploration agreement.
+random_seed: 42
+
+single_round_budget_sec: 3600
+
+# Val-split alerts/hour cap vs Step 5 ``val_alerts_per_hour`` (營運承接護欄).
+capacity_alerts_per_hour_cap: 120
+
+# Feast service for Step 3 (trial 1h + slow 180d + cleaned bet projections).
+feature_service_name: walkaway_bet_trial_v1
+
+# Trainer run profile (:data:`~trainer_hightier.config.RUN_PROFILES` key).
+run_profile: default
