@@ -1,0 +1,50 @@
+# FQG WARN approvals for the 2026-05-16 overnight 10-group expansion.
+#
+# Pass via ``--fqg-warn-approvals`` (CLI) or set
+# ``feature_quality_gate.warn_approvals_path`` in experiment_config.yaml.
+#
+# Purpose: allow newly-added experimental fe__* features that may trip PSI or
+# uplift_sign_flip WARNs to still enter the candidate / ablation arms during
+# the overnight evidence-collection run. Promotion to status=active later
+# requires a separate review of FQG metrics + Gate 1 outcomes.
+#
+# Scope: REVIEW-group fe__* from overnight run (registry v0.3); KEEP groups are now
+# status=active and typically pass FQG without approvals. Omit disabled columns.
+
+approved_warn_features:
+  # Group L: clock_context
+  - fe__clock__hour_of_day
+  - fe__clock__day_of_week
+  - fe__clock__is_weekend
+  - fe__clock__is_late_night
+
+  # Group M: outcome_state
+  - fe__outcome__casino_win_sum__w15m
+  - fe__outcome__casino_win_sum__w1h
+  - fe__outcome__loss_rate__w1h
+  - fe__outcome__net_pnl_to_wager_ratio__w1h
+  - fe__outcome__last_3_bets_loss_count
+
+  # Group N: stake_dynamics
+  - fe__stake__wager_z__w1h
+  - fe__stake__wager_to_recent_max_ratio__w1h
+  - fe__stake__wager_step_pct
+  - fe__stake__wager_cv__w1h
+
+  # Group O: table_switch
+  - fe__tableswitch__changed_table_vs_lag1
+  - fe__tableswitch__changed_table_vs_lag2
+  - fe__tableswitch__changes_in_last_5_bets
+
+  # Group E: session_position
+  - fe__session__bet_idx_in_session
+  - fe__session__elapsed_sec_since_first_bet_in_session
+  - fe__session__wager_sum_in_session_so_far
+
+  # Group F: rate_decay
+  - fe__rate__bets_cnt__w5m
+  - fe__rate__velocity__w5m_over_w15m
+  - fe__rate__velocity__w15m_over_w1h
+
+  # group_g_interarrival_dynamics and group_q_payout_odds_dynamics: promoted to active
+  # in registry v0.3 — no warn approvals needed for default FQG runs.

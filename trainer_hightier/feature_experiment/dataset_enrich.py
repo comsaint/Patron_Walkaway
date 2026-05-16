@@ -7,7 +7,7 @@ from pathlib import Path
 import duckdb
 
 from trainer_hightier.config import DuckDbRuntimeConfig
-from trainer_hightier.feature_experiment.feature_registry import EXPERIMENTAL_NUMERIC_COLUMNS
+import trainer_hightier.feature_experiment.feature_registry as _feature_registry
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 
@@ -29,7 +29,8 @@ def enrich_training_parquet(
     out = Path(out_parquet).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     oq = _esc(out)
-    fe_cols = ", ".join(f'd."{c}" AS "{c}"' for c in EXPERIMENTAL_NUMERIC_COLUMNS)
+    experimental_cols = list(_feature_registry.EXPERIMENTAL_NUMERIC_COLUMNS)
+    fe_cols = ", ".join(f'd."{c}" AS "{c}"' for c in experimental_cols)
     inner = f"""
 SELECT
   b.*,

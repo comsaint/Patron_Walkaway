@@ -25,7 +25,7 @@ def test_feature_columns_add_one_extends_baseline() -> None:
     gid = "group_d_personal_z"
     cols = feature_columns_add_one(gid)
     assert "wager" in cols
-    assert "fe__wager_z_prior_w30d" in cols
+    assert "fe__payout_odds_z_prior_w30d" in cols
 
 
 def test_leave_one_out_drops_group_columns() -> None:
@@ -33,7 +33,7 @@ def test_leave_one_out_drops_group_columns() -> None:
 
     gid = "group_d_personal_z"
     cols = feature_columns_leave_one_out_minus(gid)
-    assert "fe__wager_z_prior_w30d" not in cols
+    assert "fe__payout_odds_z_prior_w30d" not in cols
     assert "fe__wager_sum__w15m" in cols
 
 

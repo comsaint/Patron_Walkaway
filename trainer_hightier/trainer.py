@@ -17,6 +17,7 @@ import argparse
 import importlib
 import json
 import logging
+import subprocess
 import time
 from typing import Any
 from dataclasses import dataclass, field, replace
@@ -24,18 +25,41 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
+from trainer_hightier.feature_experiment.candidate_registry_loader import (
+    baseline_features_for_main_trainer,
+    default_registry_path,
+    load_candidate_registry,
+)
 from trainer_hightier.config import (
     BetPreprocessConfig,
     CanonicalMappingConfig,
+    DEFAULT_MODEL_DIR,
+    DEFAULT_RANDOM_SEED,
     DEFAULT_RUN_PROFILE_NAME,
+    DEFAULT_TRAINING_FEATURE_SERVICE,
     DuckDbRuntimeConfig,
     HighTierObjectiveConfig,
+    MLFLOW_EXPERIMENT_TRAIN_HIGHTIER,
+    MLFLOW_HIGHTIER_ARTIFACT_PREFIX,
+    PartitionIngressConfig,
     Step5TrainConfig,
     SessionPreprocessConfig,
     Step4SplitConfig,
     configs_from_run_profile,
     get_run_profile,
     list_run_profile_names,
+)
+from trainer.core.model_bundle_paths import (
+    safe_version_subdirectory,
+    write_latest_model_manifest,
+)
+from trainer.core.mlflow_utils import (
+    log_artifact_safe,
+    log_metrics_safe,
+    log_params_safe,
+    log_tags_safe,
+    safe_start_run,
+    warm_up_mlflow_run_safe,
 )
 from trainer_hightier.utils.canonical_mapping import (
     build_canonical_mapping_from_cleaned_session_parquet,
@@ -63,6 +87,9 @@ _b5 = importlib.import_module("trainer_hightier.05_lgbm_train")
 
 
 logger = logging.getLogger("trainer_hightier")
+
+_STEP5_CONFIG_DEFAULTS = Step5TrainConfig()
+_PARTITION_INGRESS_DEFAULTS = PartitionIngressConfig()
 
 
 def _materialize_partition_inventory(
@@ -131,8 +158,12 @@ def _materialize_partition_inventory(
 class HighTierTrainArgs:
     """Programmatic run configuration for :func:`run_training` (defaults + optional overrides)."""
 
+    #: Versioned bundle parent (default `<repo>/out/models_high_tier_mvp`).
+    #: ``run_training`` may set ``step5_bundle_dir`` to ``output_dir /<model_version>/``.
     output_dir: Path
-    random_seed: int = 42
+    #: When set (by :func:`run_training`), Step 5 writes ``model.pkl`` here; otherwise Step 5 uses ``output_dir`` flat (e.g. feature experiment scratch dirs).
+    step5_bundle_dir: Path | None = None
+    random_seed: int = DEFAULT_RANDOM_SEED
     objective: HighTierObjectiveConfig = field(default_factory=HighTierObjectiveConfig)
     # When True: skip all preprocess disk-cache short-circuits (session-clean + bet-clean manifests).
     ignore_caches: bool = False
@@ -151,16 +182,18 @@ class HighTierTrainArgs:
     # When ``build_training_dataset``: materialize trial 1h + slow 180d Parquets before Feast (default on; very heavy).
     training_materialize_derived: bool = True
     # Feast feature service for Step 3 (default matches ``03_build_training_data``).
-    training_feature_service: str = "walkaway_bet_trial_v1"
+    training_feature_service: str = DEFAULT_TRAINING_FEATURE_SERVICE
     # When False: skip month×group Feast disk cache in Step 3 (always full retrieval per month).
     feast_retrieval_cache: bool = True
+    # When Step 3: if feast_repo/registry.db missing, run `feast apply` in feast_repo first (default on).
+    auto_feast_apply: bool = True
     # Partition snapshot folder (YYYYMM parquet shards): inventory manifest + recompute bookkeeping.
     # When ``None``, defaults to ``<repo>/data/partitions`` and must exist.
     partition_snapshot_dir: Path | None = None
     # Explicit baseline JSON for inventory diff; when ``None``, auto-pick same-snapshot manifest if present.
     partition_inventory_previous_manifest: Path | None = None
     partition_correction_months: tuple[str, ...] = ()
-    partition_backfill_month_count: int = 1
+    partition_backfill_month_count: int = _PARTITION_INGRESS_DEFAULTS.backfill_month_count
     # Step 4: deterministic arrange + time split on ``gaming_day`` (after Step 3 or --start-from-features).
     run_step4: bool = True
     step4_split: Step4SplitConfig = field(default_factory=Step4SplitConfig)
@@ -169,6 +202,141 @@ class HighTierTrainArgs:
     features_input_parquet: Path | None = None
     # Step 5: LightGBM + optional Optuna on Step 4 split Parquets.
     step5: Step5TrainConfig = field(default_factory=Step5TrainConfig)
+    # Feature ledger for Step 5 baseline columns; ``None`` uses default contracts YAML path.
+    feature_candidate_registry: Path | None = None
+    #: ``--run-profile`` CLI name (MLflow param); programmatic callers default to :data:`DEFAULT_RUN_PROFILE_NAME`.
+    run_profile_name: str = DEFAULT_RUN_PROFILE_NAME
+
+
+def _repo_root() -> Path:
+    """Return repository root (parent of ``trainer_hightier`` package directory)."""
+
+    return Path(__file__).resolve().parents[1]
+
+
+def _git_short_head(repo_root: Path) -> str:
+    """Return ``git rev-parse --short HEAD`` or ``nogit``."""
+
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(repo_root),
+            stderr=subprocess.DEVNULL,
+        )
+        return out.decode().strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return "nogit"
+
+
+def _mlflow_hightier_run_name(*, repo_root: Path) -> str:
+    """Build MLflow ``run_name``: ``YYYYMMDD-HHMMSS-<git_short>``."""
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    return f"{ts}-{_git_short_head(repo_root)}"
+
+
+def _mlflow_initial_string_params(args: HighTierTrainArgs) -> dict[str, str]:
+    """Scalar string params logged at run start (bounded; details live in ``run_report.json``)."""
+
+    reg = args.feature_candidate_registry or default_registry_path()
+    return {
+        "pipeline": "trainer_hightier",
+        "run_profile": str(args.run_profile_name),
+        "random_seed": str(int(args.random_seed)),
+        "objective_min_precision": str(float(args.objective.min_precision)),
+        "step5_skip_optuna": str(bool(args.step5.skip_optuna)),
+        "step5_run_step5": str(bool(args.step5.run_step5)),
+        "run_step4": str(bool(args.run_step4)),
+        "start_from_features": str(bool(args.start_from_features)),
+        "feature_candidate_registry_path": str(Path(reg).resolve())[:500],
+        "git_commit": _git_short_head(_repo_root()),
+    }
+
+
+def _mlflow_post_run_string_params(metrics: dict[str, Any]) -> dict[str, str]:
+    """Append bounded lineage params after training (partition/registry echoes)."""
+
+    out: dict[str, str] = {}
+    cr = metrics.get("candidate_registry")
+    if isinstance(cr, dict):
+        rv = cr.get("registry_version")
+        if rv is not None:
+            out["candidate_registry_version"] = str(rv)[:200]
+        rp = cr.get("resolved_path")
+        if rp is not None:
+            out["candidate_registry_resolved_path"] = str(rp)[:500]
+        nb = cr.get("n_baseline_features")
+        if nb is not None:
+            out["candidate_registry_n_baseline_features"] = str(nb)
+    fp = metrics.get("partition_inventory_fingerprint_sha256_hex")
+    if fp is not None and str(fp).strip():
+        out["partition_inventory_fingerprint_sha256_hex"] = str(fp).strip()[:128]
+    snap = metrics.get("partition_snapshot_dir_effective")
+    if snap is not None:
+        out["partition_snapshot_dir_effective"] = str(snap)[:500]
+    mv_out = metrics.get("model_version")
+    if mv_out is not None and str(mv_out).strip():
+        out["model_version"] = str(mv_out).strip()[:128]
+    mbd = metrics.get("model_bundle_dir")
+    if mbd is not None and str(mbd).strip():
+        out["model_bundle_dir"] = str(mbd).strip()[:500]
+    return out
+
+
+def _mlflow_scalar_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Flatten top-level numeric metrics and Optuna best-params for ``log_metrics_safe``."""
+
+    skip = frozenset(
+        {
+            "candidate_registry",
+            "feast_auto_apply",
+            "partition_recompute_months",
+            "model_bundle_dir",
+            "model_version",
+        },
+    )
+    out: dict[str, Any] = {}
+    for k, v in metrics.items():
+        if k in skip or isinstance(v, (dict, list)):
+            continue
+        out[k] = v
+    obp = metrics.get("optuna_best_params")
+    if isinstance(obp, dict):
+        for pk, pv in obp.items():
+            key = f"optuna_best_{pk}"
+            try:
+                out[key] = float(pv)
+            except (TypeError, ValueError):
+                continue
+    rem = metrics.get("partition_recompute_months")
+    if isinstance(rem, list):
+        out["partition_recompute_months_count"] = float(len(rem))
+    return out
+
+
+def _log_mlflow_whitelist_artifacts(args: HighTierTrainArgs, metrics: dict[str, Any]) -> None:
+    """Log minimal training artifacts under :data:`MLFLOW_HIGHTIER_ARTIFACT_PREFIX`."""
+
+    prefix = MLFLOW_HIGHTIER_ARTIFACT_PREFIX
+    mbd = metrics.get("model_bundle_dir")
+    rp = Path(mbd).resolve() / "run_report.json" if mbd else Path(args.output_dir).resolve() / "run_report.json"
+    if rp.is_file():
+        log_artifact_safe(rp, artifact_path=prefix)
+    smp = metrics.get("training_metrics_path") or metrics.get("step5_training_metrics_path")
+    if smp:
+        p = Path(str(smp))
+        if p.is_file():
+            log_artifact_safe(p, artifact_path=prefix)
+    smp_model = metrics.get("model_path") or metrics.get("step5_model_path")
+    if smp_model:
+        pm = Path(str(smp_model))
+        if pm.is_file():
+            log_artifact_safe(pm, artifact_path=prefix)
+    sr = metrics.get("step4_split_report")
+    if sr:
+        sp = Path(str(sr))
+        if sp.is_file():
+            log_artifact_safe(sp, artifact_path=prefix)
 
 
 def _resolve_splits_dir(args: HighTierTrainArgs) -> Path:
@@ -177,6 +345,27 @@ def _resolve_splits_dir(args: HighTierTrainArgs) -> Path:
     if args.step4_split.splits_output_dir is not None:
         return Path(args.step4_split.splits_output_dir).resolve()
     return _b4.default_splits_output_dir().resolve()
+
+
+def _step5_splits_have_feature_columns(
+    splits_dir: Path,
+    feature_columns: tuple[str, ...],
+    *,
+    registry_path: Path,
+) -> None:
+    """Raise if ``train.parquet`` exists but lacks any baseline column from the registry."""
+
+    train_p = Path(splits_dir).resolve() / "train.parquet"
+    if not train_p.is_file():
+        return
+    names = frozenset(pq.ParquetFile(train_p).schema_arrow.names)
+    missing = sorted(set(feature_columns) - names)
+    if missing:
+        raise ValueError(
+            "Step 5 cannot load training split: Parquet is missing baseline columns "
+            f"{missing} selected from registry {registry_path}. "
+            "Regenerate Step 3/4 so these columns exist, or adjust the registry.",
+        )
 
 
 def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None) -> None:
@@ -543,6 +732,56 @@ def _resolve_features_parquet(args: HighTierTrainArgs) -> Path:
     return _b3.DEFAULT_OUTPUT.resolve()
 
 
+def _ensure_fe_enriched_training_parquet_for_step4(
+    args: HighTierTrainArgs,
+    base_training_parquet: Path,
+    *,
+    metrics: dict[str, Any] | None = None,
+) -> Path:
+    """When registry baseline includes ``fe__*``, materialize DuckDB features and join onto Step 3 output."""
+
+    reg_p = Path(args.feature_candidate_registry).resolve() if args.feature_candidate_registry else None
+    snap = load_candidate_registry(reg_p)
+    baseline = baseline_features_for_main_trainer(snap)
+    if not any(name.startswith("fe__") for name in baseline):
+        return base_training_parquet
+    cleaned = _hpre.default_cleaned_bet_parquet_path().resolve()
+    fe_mod = importlib.import_module("trainer_hightier.feature_experiment.materialize_fe_derived")
+    en_mod = importlib.import_module("trainer_hightier.feature_experiment.dataset_enrich")
+    freg = importlib.import_module("trainer_hightier.feature_experiment.feature_registry")
+    freg.set_candidate_registry_path(reg_p)
+    fe_out = base_training_parquet.parent / "_main_trainer_fe_derived.parquet"
+    enriched = base_training_parquet.parent / "training_set_fe_enriched.parquet"
+    t_m0 = time.perf_counter()
+    fe_mod.materialize_fe_derived_parquet(
+        cleaned_bet_parquet=cleaned,
+        training_parquet_for_bet_ids=base_training_parquet,
+        out_parquet=fe_out,
+        duckdb_runtime=args.duckdb_runtime,
+    )
+    mat_sec = round(time.perf_counter() - t_m0, 3)
+    t_e0 = time.perf_counter()
+    en_mod.enrich_training_parquet(
+        base_training_parquet=base_training_parquet,
+        fe_derived_parquet=fe_out,
+        out_parquet=enriched,
+        duckdb_runtime=args.duckdb_runtime,
+    )
+    enr_sec = round(time.perf_counter() - t_e0, 3)
+    if metrics is not None:
+        metrics["main_trainer_fe_materialize_sec"] = mat_sec
+        metrics["main_trainer_fe_enrich_sec"] = enr_sec
+        metrics["main_trainer_training_parquet_for_step4"] = str(enriched.resolve())
+    logger.info(
+        "[Step 3.5] baseline includes fe__*: materialized %s, enriched -> %s (%.3fs + %.3fs)",
+        fe_out.name,
+        enriched.name,
+        mat_sec,
+        enr_sec,
+    )
+    return enriched
+
+
 def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None) -> None:
     """Step 4: project/cast columns and write train/val/test splits by ``gaming_day``."""
 
@@ -557,9 +796,10 @@ def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None)
             )
         logger.warning("[Step 4] skip: no features parquet at %s", fp.resolve())
         return
+    fp_eff = _ensure_fe_enriched_training_parquet_for_step4(args, fp, metrics=metrics)
     t0 = time.perf_counter()
     res = _b4.arrange_and_split_training_data(
-        features_parquet=fp,
+        features_parquet=fp_eff,
         duckdb_runtime=args.duckdb_runtime,
         step4=args.step4_split,
     )
@@ -571,7 +811,7 @@ def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None)
     logger.info("[Step 4] splits written %s (%.3fs)", res.splits_dir.resolve(), elapsed)
 
 
-def _maybe_build_training_dataset(args: HighTierTrainArgs) -> None:
+def _maybe_build_training_dataset(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None) -> None:
     """Step 3: Feast + labels training Parquet (see ``03_build_training_data``); default on."""
     if not args.build_training_dataset:
         return
@@ -590,13 +830,9 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs) -> None:
         )
         return
     feast_repo = Path(__file__).resolve().parent / "feast_repo"
-    registry = feast_repo / "data" / "registry.db"
-    if not registry.is_file():
-        logger.warning(
-            "[Step 3] skip training dataset: Feast registry missing at %s (run ``feast apply`` under feast_repo)",
-            registry.resolve(),
-        )
-        return
+    ensure_res = _b3.ensure_feast_registry_ready(feast_repo.resolve(), auto_apply=args.auto_feast_apply)
+    if metrics is not None:
+        metrics["feast_auto_apply"] = _b3.feast_registry_ensure_result_to_metrics(ensure_res)
     cfg = _b3.BuildTrainingDataArgs(
         feast_repo=feast_repo.resolve(),
         cleaned_bet_parquet=cleaned_bet_path.resolve(),
@@ -609,6 +845,7 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs) -> None:
         feast_entity_batch_by_calendar_month=True,
         training_set_keep_last_n_versions=10,
         feast_retrieval_cache_enabled=bool(args.feast_retrieval_cache) and not bool(args.ignore_caches),
+        auto_feast_apply=bool(args.auto_feast_apply),
     )
     out = _b3.build_training_data(cfg)
     logger.info("[Step 3] training dataset written %s", out)
@@ -627,16 +864,48 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
             splits_dir,
         )
         return None
-    result = _b5.train_lgbm_from_splits(
-        splits_dir=splits_dir,
-        duckdb_runtime=args.duckdb_runtime,
-        objective_min_precision=float(args.objective.min_precision),
-        random_seed=int(args.random_seed),
-        step5=args.step5,
-        output_dir=args.output_dir,
+    registry_arg = Path(args.feature_candidate_registry).resolve() if args.feature_candidate_registry else None
+    try:
+        snap = load_candidate_registry(registry_arg)
+    except FileNotFoundError as exc:
+        attempted = registry_arg if registry_arg is not None else default_registry_path()
+        raise FileNotFoundError(
+            "Feature candidate registry file not found. "
+            f"Tried {attempted!s}; default is {default_registry_path()!s}. "
+            "Pass --feature-candidate-registry <path> or restore the YAML.",
+        ) from exc
+    feat_cols = baseline_features_for_main_trainer(snap)
+    _step5_splits_have_feature_columns(splits_dir, feat_cols, registry_path=snap.path)
+    logger.info(
+        "[Step 5] baseline features from registry %s (n=%s)",
+        snap.path,
+        len(feat_cols),
     )
+    reg_echo = {
+        "registry_version": snap.registry_version,
+        "updated_at": snap.updated_at,
+        "resolved_path": str(snap.path),
+        "n_baseline_features": len(feat_cols),
+    }
+    try:
+        step5_out_dir = Path(args.step5_bundle_dir).resolve() if args.step5_bundle_dir is not None else Path(args.output_dir).resolve()
+        result = _b5.train_lgbm_from_splits(
+            splits_dir=splits_dir,
+            duckdb_runtime=args.duckdb_runtime,
+            objective_min_precision=float(args.objective.min_precision),
+            random_seed=int(args.random_seed),
+            step5=args.step5,
+            output_dir=step5_out_dir,
+            feature_columns=feat_cols,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if "Step 5 schema gate failed" in msg or "requires split parquet" in msg:
+            raise ValueError(f"{msg} (feature_candidate_registry={snap.path})") from exc
+        raise
     if metrics is not None:
         metrics.update(result.report)
+        metrics["candidate_registry"] = reg_echo
     return result
 
 
@@ -646,12 +915,9 @@ def write_artifacts(args: HighTierTrainArgs, *, step5_result: _b5.Step5Result | 
         logger.info("[Step 6] Step 5 model at %s", step5_result.model_path.resolve())
 
 
-def run_training(args: HighTierTrainArgs) -> None:
-    """Run the high-tier training pipeline in order."""
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    metrics: dict[str, Any] = {
-        "start_epoch_ms": int(time.time() * 1000),
-    }
+def _run_training_execute_steps(args: HighTierTrainArgs, metrics: dict[str, Any]) -> _b5.Step5Result | None:
+    """Run preprocess → dataset → split → Step 5; mutate ``metrics``; return Step 5 result if any."""
+
     if args.start_from_features:
         _maybe_run_step4(args, metrics=metrics)
     else:
@@ -659,16 +925,74 @@ def run_training(args: HighTierTrainArgs) -> None:
         prepare_training_frame(args, metrics=metrics)
         metrics["prepare_training_frame_seconds"] = round(time.perf_counter() - t_prep, 3)
         t_step3 = time.perf_counter()
-        _maybe_build_training_dataset(args)
+        _maybe_build_training_dataset(args, metrics=metrics)
         metrics["build_training_dataset_seconds"] = round(time.perf_counter() - t_step3, 3)
         _maybe_run_step4(args, metrics=metrics)
 
     step5_result = fit_model(args, metrics=metrics)
     write_artifacts(args, step5_result=step5_result)
-    metrics["finish_epoch_ms"] = int(time.time() * 1000)
-    rp = Path(args.output_dir) / "run_report.json"
-    rp.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    logger.info("[Step 7] run_training skeleton finished (report %s)", rp.resolve())
+    return step5_result
+
+
+def run_training(args: HighTierTrainArgs) -> None:
+    """Run the high-tier training pipeline in order."""
+
+    t0 = time.perf_counter()
+    try:
+        repo_root = _repo_root()
+        versions_root = Path(args.output_dir).resolve()
+        versions_root.mkdir(parents=True, exist_ok=True)
+        model_version = _mlflow_hightier_run_name(repo_root=repo_root)
+        exec_args = args
+        if args.step5.run_step5:
+            bundle_dir = safe_version_subdirectory(versions_root, model_version)
+            if (bundle_dir / _b5.DEFAULT_MODEL_FILENAME).is_file():
+                raise FileExistsError(
+                    f"Refusing to overwrite existing high-tier Step 5 model bundle under {bundle_dir}. "
+                    "Remove the directory or wait for a new model_version timestamp."
+                )
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+            (bundle_dir / "model_version").write_text(model_version + "\n", encoding="utf-8")
+            exec_args = replace(args, step5_bundle_dir=bundle_dir)
+
+        run_name = model_version
+        with safe_start_run(
+            experiment_name=MLFLOW_EXPERIMENT_TRAIN_HIGHTIER,
+            run_name=run_name,
+            tags={"pipeline": "trainer_hightier", "component": "training"},
+        ):
+            warm_up_mlflow_run_safe()
+            log_tags_safe({"status": "RUNNING"})
+            log_params_safe(_mlflow_initial_string_params(exec_args))
+            metrics: dict[str, Any] = {"start_epoch_ms": int(time.time() * 1000)}
+            if exec_args.step5_bundle_dir is not None:
+                metrics["model_version"] = model_version
+                metrics["model_bundle_dir"] = str(exec_args.step5_bundle_dir.resolve())
+            try:
+                _run_training_execute_steps(exec_args, metrics)
+                metrics["finish_epoch_ms"] = int(time.time() * 1000)
+                metrics["run_training_total_seconds"] = round(time.perf_counter() - t0, 3)
+                rp_parent = exec_args.step5_bundle_dir.resolve() if exec_args.step5_bundle_dir else versions_root
+                rp = rp_parent / "run_report.json"
+                rp.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+                logger.info("[Step 7] run_training skeleton finished (report %s)", rp.resolve())
+                log_params_safe(_mlflow_post_run_string_params(metrics))
+                log_metrics_safe(_mlflow_scalar_metrics(metrics))
+                _log_mlflow_whitelist_artifacts(exec_args, metrics)
+                if (
+                    exec_args.step5_bundle_dir is not None
+                    and (exec_args.step5_bundle_dir.resolve() / _b5.DEFAULT_MODEL_FILENAME).is_file()
+                ):
+                    write_latest_model_manifest(versions_root, model_version, exec_args.step5_bundle_dir.resolve())
+                log_tags_safe({"status": "SUCCESS"})
+            except Exception as e:
+                log_tags_safe({"status": "FAILED", "error": str(e)[:500]})
+                raise
+    finally:
+        logger.info(
+            "[Done] trainer_hightier total elapsed %.3fs",
+            round(time.perf_counter() - t0, 3),
+        )
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -764,10 +1088,14 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--optuna-timeout-sec",
         type=float,
-        default=600.0,
+        default=_STEP5_CONFIG_DEFAULTS.optuna_timeout_sec,
         metavar="SEC",
         dest="optuna_timeout_sec",
-        help="Step 5 Optuna wall-clock budget in seconds (default 600). Ignored with --skip-optuna.",
+        help=(
+            f"Step 5 Optuna wall-clock budget in seconds "
+            f"(default {_STEP5_CONFIG_DEFAULTS.optuna_timeout_sec:g} from Step5TrainConfig). "
+            "Ignored with --skip-optuna."
+        ),
     )
     p.add_argument(
         "--disable-feast-retrieval-cache",
@@ -818,36 +1146,49 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--partition-backfill-count",
         type=int,
-        default=1,
+        default=_PARTITION_INGRESS_DEFAULTS.backfill_month_count,
         metavar="N",
-        help="Include N preceding calendar months for each touched month (default 1).",
+        help=(
+            f"Include N preceding calendar months for each touched month "
+            f"(default {_PARTITION_INGRESS_DEFAULTS.backfill_month_count} from PartitionIngressConfig)."
+        ),
+    )
+    p.add_argument(
+        "--feature-candidate-registry",
+        type=Path,
+        default=None,
+        dest="feature_candidate_registry",
+        help=(
+            "YAML baseline feature ledger for Step 5 (default: trainer_hightier/contracts/"
+            "feature_candidate_registry.yaml)."
+        ),
+    )
+    p.add_argument(
+        "--disable-auto-feast-apply",
+        action="store_true",
+        dest="disable_auto_feast_apply",
+        help=(
+            "When Step 3 runs: fail if Feast registry.db is missing instead of running `feast apply` under feast_repo. "
+            "Use in CI or read-only clones after a pre-published registry."
+        ),
     )
     return p
 
 
-def main() -> None:
-    """Parse cache flag and invoke :func:`run_training` with package defaults."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    ns = _build_argparser().parse_args()
-    if bool(ns.no_partition_snapshot):
-        raise ValueError(
-            "--no-partition-snapshot is no longer supported: trainer_hightier is now partition-only. "
-            "Provide --partition-snapshot-dir, or omit it to use <repo>/data/partitions."
-        )
+def _train_args_from_cli_namespace(ns: argparse.Namespace) -> HighTierTrainArgs:
+    """Build :class:`HighTierTrainArgs` from parsed CLI flags and config SSOT defaults."""
+
     duckdb_rt, session_pre, bet_pre = configs_from_run_profile(get_run_profile(str(ns.run_profile)))
     corr = tuple(str(x).strip() for x in (ns.partition_correction_months or []) if str(x).strip())
-    args = HighTierTrainArgs(
-        output_dir=Path(".data") / "trainer_hightier" / "run",
+    return HighTierTrainArgs(
+        output_dir=DEFAULT_MODEL_DIR,
         ignore_caches=bool(ns.ignore_caches),
         skip_bet_preprocess=bool(ns.skip_bet_preprocess),
         materialize_walkaway_labels=not bool(ns.skip_walkaway_labels),
         build_training_dataset=not bool(ns.skip_training_dataset),
         training_materialize_derived=not bool(ns.skip_training_materialize_derived),
         feast_retrieval_cache=not bool(ns.disable_feast_retrieval_cache),
+        auto_feast_apply=not bool(ns.disable_auto_feast_apply),
         duckdb_runtime=duckdb_rt,
         session_preprocess=session_pre,
         bet_preprocess=bet_pre,
@@ -864,13 +1205,32 @@ def main() -> None:
         ),
         step4_split=Step4SplitConfig(),
         step5=replace(
-            Step5TrainConfig(),
+            _STEP5_CONFIG_DEFAULTS,
             run_step5=not bool(ns.skip_step5),
             skip_optuna=bool(ns.skip_optuna),
             optuna_timeout_sec=float(ns.optuna_timeout_sec),
         ),
+        feature_candidate_registry=(
+            Path(ns.feature_candidate_registry).resolve() if ns.feature_candidate_registry else None
+        ),
+        run_profile_name=str(ns.run_profile),
     )
-    run_training(args)
+
+
+def main() -> None:
+    """Parse cache flag and invoke :func:`run_training` with package defaults."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    ns = _build_argparser().parse_args()
+    if bool(ns.no_partition_snapshot):
+        raise ValueError(
+            "--no-partition-snapshot is no longer supported: trainer_hightier is now partition-only. "
+            "Provide --partition-snapshot-dir, or omit it to use <repo>/data/partitions."
+        )
+    run_training(_train_args_from_cli_namespace(ns))
 
 
 if __name__ == "__main__":

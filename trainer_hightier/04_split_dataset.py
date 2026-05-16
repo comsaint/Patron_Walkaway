@@ -41,7 +41,6 @@ OPTIONAL_DROP_COLS: Final[frozenset[str]] = frozenset(
 _NUMERIC_TRY_DOUBLE_COLS: Final[frozenset[str]] = frozenset(
     {
         "wager",
-        "wager_nn",
         "casino_win",
         "payout_odds",
         "payout_ha",

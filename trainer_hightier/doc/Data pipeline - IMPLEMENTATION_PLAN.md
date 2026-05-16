@@ -133,6 +133,60 @@ flowchart LR
 - 每次 run 產出 run report（耗時、cache hit ratio、重算分區、輸出列數、失敗/警告摘要）。
 - 導入最小治理規則：可續跑條件、失敗恢復語義、artifact retention。
 
+### Phase 6: MLflow 訓練可觀測性整合（Training Result Logging）
+
+- 目標：讓 `trainer_hightier/trainer.py` 的一次完整訓練 run，能以單一 MLflow run 記錄核心參數、指標與關鍵 artifacts。
+- 採用策略：直接共用 `trainer/core/mlflow_utils.py` 的 safe helper（可用性檢查、retry、no-op 容錯），避免在 hightier 重複維護第二套 MLflow 邏輯。
+- run 生命週期：
+  - 入口建立單一 run（對齊主 `trainer` 的 pipeline-scope run 模式）。
+  - 流程中持續記錄重要參數/指標。
+  - 正常結束標記 `SUCCESS`；異常路徑標記 `FAILED` 並附截斷錯誤摘要後 re-raise。
+- 實作邊界：
+  - 僅接線訓練流程觀測，不改模型演算法、資料切分與 Step 5 評估規則。
+  - 不上傳大型中間資料目錄（避免筆電/網路環境耗時與失敗風險），僅上傳必要 artifacts。
+- 實驗命名與隔離：
+  - `trainer_hightier` 使用獨立 experiment namespace（例如 `patron/patron_walkaway/prod/train_hightier`），避免與主訓練 run 混流。
+
+## MLflow 整合工作流（Implementation Workstreams）
+
+### Workstream M1: Run Scope 與失敗語義
+
+- 在 `run_training()` 外層建立 pipeline-scope MLflow run，run_name 對齊當次訓練版本識別（建議時間戳 + git short hash）。
+- 失敗語義固定：
+  - 發生 exception 時寫入 `status=FAILED` 與 `error` tag（字串長度限制，避免超長 tag）。
+  - 以 `raise` 保持現有失敗行為，不吞錯。
+- 成功語義固定：
+  - 全流程完成後寫入 `status=SUCCESS`。
+
+### Workstream M2: 參數與指標契約
+
+- 參數（params）分層：
+  - run context：`pipeline=trainer_hightier`、`run_profile`、`feature_registry_path`。
+  - objective/config：`objective_min_precision`、`step5_skip_optuna`、`step5_feature_count`。
+  - data context：`partition_snapshot_dir_effective`、`partition_inventory_fingerprint_sha256_hex`。
+- 指標（metrics）策略：
+  - 以 `.data/trainer_hightier/run/run_report.json` 為主來源，擷取可數值化鍵寫入 MLflow（由 `log_metrics_safe` 處理型別清洗）。
+  - 保留 split 級核心品質指標（如 `val_precision`、`test_ap`、`step5_seconds`）於同一 run 內，便於跨次比較。
+
+### Workstream M3: Artifact Logging 與成本控制
+
+- 必要 artifacts（v1）：
+  - `run_report.json`
+  - `step5_training_metrics.json`
+  - `step5_lgbm_model.pkl`
+  - `split_report.json`（存在時）
+- 成本控制原則：
+  - 不整包上傳大型資料夾（如完整 `artifacts/`、大 parquet 中間層）。
+  - 僅上傳可支持「訓練重現與結果審計」的最小集合，降低網路傳輸與本機資源壓力。
+
+### Workstream M4: 文件與操作治理
+
+- 在 `trainer_hightier/RUNBOOK.md` 補充：
+  - MLflow 需要的最小環境設定（tracking URI、experiment 命名慣例）。
+  - 成功/失敗 run 的查核項目（status tag、核心 metrics、artifact 完整性）。
+- 在 `trainer_hightier/README.md` 補充：
+  - hightier 已支援 MLflow 訓練結果記錄（與主 `trainer` 共用 helper）。
+
 ## 里程碑與交付物（Milestones / Deliverables）
 
 - M1：`gaming_day` inventory + 指紋 + 重算集合規則可用，且能驅動既有流程。
@@ -140,6 +194,7 @@ flowchart LR
 - M3：Feast `date_slice × feature_group` 快取可用，日期窗變更與 feature 清單變更皆可局部重算，且 Step 3 輸出含 `canonical_id` / `gaming_day`。
 - M4：Step 4（dataset arrange + split）上線，可由 `--start-from-features` 直接啟動並產出 split artifacts + split report。
 - M5：DVC stage 治理與每次 run 報表上線，形成可審計閉環。
+- M6：`trainer_hightier` MLflow pipeline-scope run 上線，完成 params/metrics/artifacts 最小契約與失敗語義。
 
 ## 角色與責任（High-level Ownership）
 
@@ -165,6 +220,12 @@ flowchart LR
   - 緩解：維持「日鍵 + 月桶」目錄並設定最小檔案大小與定期 compact 策略。
 - 風險：新增治理層影響研發速度。
   - 緩解：先包裝現有流程，逐步替換重型路徑，不一次性重構。
+- 風險：MLflow 上傳過多 artifacts 導致 run 緩慢或失敗（尤其筆電網路環境）。
+  - 緩解：實施最小 artifact 白名單，禁止整包目錄上傳。
+- 風險：MLflow 不可達造成訓練中斷。
+  - 緩解：全程使用 safe helper，維持「記錄失敗不影響訓練成功/失敗判定」原則。
+- 風險：params/tag 放入過長字串或高基數欄位，降低可讀性並觸發限制。
+  - 緩解：限制欄位集合與字串長度，保留 summary 級資訊；細節放 artifact JSON。
 
 ## 驗證與上線策略
 
@@ -176,6 +237,9 @@ flowchart LR
 - 測試新增：guardrail tests（source/SQL）限制未審核的 cohort-global normalization 函數與模式。
 - 漸進 rollout：先在單一 snapshot 與有限特徵組合試行，再擴到完整資料路徑。
 - 治理門檻：未達最小 DQ gate 或 manifest 不完整，不允許提升為正式 training set 版本。
+- MLflow 驗證：
+  - 正常 run 必須具備 `status=SUCCESS`、核心 metrics（至少 `step5_seconds` 與一組 val/test 品質指標）與最小 artifact 集合。
+  - 失敗 run 必須具備 `status=FAILED` 與錯誤摘要 tag，且 pipeline 行為保持 fail-fast（不可被 logging 吞錯）。
 
 ## 測試策略補充（Metamorphic + Guardrail）
 

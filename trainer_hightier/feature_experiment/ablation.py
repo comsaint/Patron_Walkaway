@@ -4,27 +4,33 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from trainer_hightier.feature_experiment.feature_registry import FEATURE_GROUP_TAGS, FULL_CANDIDATE_FEATURE_COLUMNS, MODEL_FEATURE_COLUMNS
+from trainer_hightier.feature_experiment import feature_registry as _feature_registry
+from trainer_hightier.feature_experiment.candidate_registry_loader import candidate_features_for_group
+from trainer_hightier.feature_experiment.feature_registry import candidate_registry_snapshot
 
 
 def experimental_group_ids() -> tuple[str, ...]:
-    """Registry keys for DuckDB ``fe__*`` groups (``group_*`` only)."""
+    """Registry ``group_*`` keys that have at least one ablation-selectable ``fe__*`` column."""
 
-    return tuple(k for k in FEATURE_GROUP_TAGS if k.startswith("group_"))
+    return candidate_registry_snapshot().ablation_experimental_group_ids
 
 
 def feature_columns_add_one(group_id: str) -> tuple[str, ...]:
-    """Baseline columns plus experimental columns for a single ``group_id``."""
+    """Baseline columns plus ablation-selectable ``fe__*`` columns for a single ``group_id``."""
 
-    extra = FEATURE_GROUP_TAGS[group_id]
-    return tuple(dict.fromkeys(tuple(MODEL_FEATURE_COLUMNS) + tuple(extra)))
+    snap = candidate_registry_snapshot()
+    extra = candidate_features_for_group(snap, group_id, slot="ablation")
+    model_cols = tuple(_feature_registry.MODEL_FEATURE_COLUMNS)
+    return tuple(dict.fromkeys(model_cols + tuple(extra)))
 
 
 def feature_columns_leave_one_out_minus(group_id: str) -> tuple[str, ...]:
-    """Full candidate columns minus one group's ``fe__*`` columns."""
+    """Full candidate columns minus candidate-selectable ``fe__*`` in one group."""
 
-    drop = set(FEATURE_GROUP_TAGS[group_id])
-    return tuple(c for c in FULL_CANDIDATE_FEATURE_COLUMNS if c not in drop)
+    snap = candidate_registry_snapshot()
+    drop = frozenset(candidate_features_for_group(snap, group_id, slot="candidate"))
+    full_cols = tuple(_feature_registry.FULL_CANDIDATE_FEATURE_COLUMNS)
+    return tuple(c for c in full_cols if c not in drop)
 
 
 def compute_gate1_vs_baseline(
@@ -121,4 +127,3 @@ def synthesize_group_decision_v0(
     if harmless_remove:
         return "DROP", "removal_from_full_not_harmful_add_one_failed"
     return "REVIEW", "mixed_leave_one_out_signals"
-

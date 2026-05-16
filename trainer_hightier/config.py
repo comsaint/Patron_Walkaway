@@ -16,10 +16,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Final
 
+_REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
+# Versioned bundle root (parity with trainer ``DEFAULT_MODEL_DIR`` under ``out/``).
+DEFAULT_MODEL_DIR: Final[Path] = _REPO_ROOT / "out" / "models_high_tier_mvp"
+# Shared reproducibility seed (training, FQG subsampling, Optuna sampler).
+DEFAULT_RANDOM_SEED: Final[int] = 42
+# Step 3 Feast feature service wired by :mod:`trainer_hightier.trainer`.
+DEFAULT_TRAINING_FEATURE_SERVICE: Final[str] = "walkaway_bet_trial_v1"
+
 # Baseline MODEL columns: softer FQG (high PSI → WARN; unique-constant under sample → WARN; WARN auto-allowlist).
 _FQG_BASELINE_MODEL_SOFT_COLUMNS: tuple[str, ...] = (
     "wager",
-    "wager_nn",
     "casino_win",
     "is_back_bet",
     "bet_type",
@@ -43,7 +50,7 @@ class FeatureQualityGateConfig:
     """
 
     fqg_version: str = "v0"
-    random_seed: int = 42
+    random_seed: int = DEFAULT_RANDOM_SEED
     max_rows_per_split: int = 200_000
     #: L1 — treat column as categorical if cardinality <= this threshold (excluding nulls).
     low_cardinality_categorical_cutoff: int = 512
@@ -86,7 +93,7 @@ class FeatureQualityGateConfig:
     mnar_corr_abs_floor: float = 0.10
     #: Baseline MODEL columns: L2 PSI above ``psi_warn_max`` is **WARN** only (never BLOCK), so subsample drift does not abort the default pipeline.
     l2_psi_block_downgrade_to_warn_columns: tuple[str, ...] = _FQG_BASELINE_MODEL_SOFT_COLUMNS
-    #: L1 ``nunique==1`` (across splits) becomes **WARN** for these columns (e.g. ``wager_nn`` degenerate under FQG sample).
+    #: L1 ``nunique==1`` (across splits) becomes **WARN** for these columns (e.g. degenerate under FQG sample).
     #: Same set is used to soften **Gate0** ``top1`` constant BLOCK for baseline registry columns.
     l1_constant_unique_block_downgrade_to_warn_columns: tuple[str, ...] = _FQG_BASELINE_MODEL_SOFT_COLUMNS
     #: MODEL columns WARN without external approval file automatically stay trainable for baseline/compatibility.
@@ -273,6 +280,20 @@ RUN_PROFILES: Final[dict[str, HighTierRunProfile]] = {
 
 DEFAULT_RUN_PROFILE_NAME: Final[str] = "default"
 
+# MLflow (trainer_hightier): experiment namespace for training runs.
+# Tracking URI and optional overrides load via ``trainer.core.mlflow_utils`` (credential/mlflow.env).
+MLFLOW_EXPERIMENT_TRAIN_HIGHTIER: Final[str] = "patron/patron_walkaway/prod/train_hightier"
+# Artifact subfolder within each MLflow run (avoid colliding with main trainer ``model_bundle`` layout).
+MLFLOW_HIGHTIER_ARTIFACT_PREFIX: Final[str] = "hightier_run"
+
+
+@dataclass(frozen=True)
+class PartitionIngressConfig:
+    """Partition snapshot inventory diff / recompute defaults (Step 1b)."""
+
+    #: For each changed YYYYMM, also include this many prior calendar months in recompute set.
+    backfill_month_count: int = 1
+
 
 @dataclass(frozen=True)
 class Step4SplitConfig:
@@ -296,7 +317,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 600.0
+    optuna_timeout_sec: float = 60.0 * 60  # 1 hour = 60*60
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000

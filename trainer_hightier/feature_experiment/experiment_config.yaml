@@ -1,5 +1,9 @@
 training_sample_min_gaming_day: "2025-01-01"
 
+# Optional: override Feature Candidate Registry YAML (defaults to
+# trainer_hightier/contracts/feature_candidate_registry.yaml when omitted).
+# feature_candidate_registry: trainer_hightier/contracts/feature_candidate_registry.yaml
+
 # Mirror :class:`~trainer_hightier.config.Step4SplitConfig` defaults used by main trainer.
 train_day_fraction: 0.70
 val_day_fraction: 0.15
@@ -7,7 +11,7 @@ val_day_fraction: 0.15
 # Fixed-seed baseline vs candidate (no Optuna) per feature exploration agreement.
 random_seed: 42
 
-single_round_budget_sec: 3600
+single_round_budget_sec: 7200
 
 # Val-split alerts/hour cap vs Step 5 ``val_alerts_per_hour`` (營運承接護欄).
 capacity_alerts_per_hour_cap: 120

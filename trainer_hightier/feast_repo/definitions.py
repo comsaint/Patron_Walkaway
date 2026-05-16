@@ -65,7 +65,6 @@ cleaned_bet_features = FeatureView(
         Field(name="payout_complete_dtm", dtype=UnixTimestamp),
         Field(name="__etl_insert_Dtm", dtype=UnixTimestamp),
         Field(name="wager", dtype=Float64),
-        Field(name="wager_nn", dtype=Float64),
         Field(name="status", dtype=String),
         Field(name="casino_win", dtype=Float64),
         Field(name="payout_odds", dtype=Float64),

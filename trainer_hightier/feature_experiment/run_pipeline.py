@@ -49,11 +49,10 @@ from trainer_hightier.feature_experiment.ablation import (
     synthesize_group_decision_v0,
 )
 from trainer_hightier.feature_experiment.feature_registry import (
-    EXPERIMENTAL_NUMERIC_COLUMNS,
-    FEATURE_GROUP_TAGS,
-    FULL_CANDIDATE_FEATURE_COLUMNS,
-    MODEL_FEATURE_COLUMNS,
+    candidate_registry_snapshot,
+    set_candidate_registry_path,
 )
+import trainer_hightier.feature_experiment.feature_registry as _feat_registry
 from trainer_hightier.feature_experiment.materialize_fe_derived import materialize_fe_derived_parquet
 from trainer_hightier.feature_experiment.val_slices import (
     contiguous_val_day_masks,
@@ -181,6 +180,15 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="YAML with approved_warn_features: [feature_name, ...] for FQG WARN overrides.",
     )
+    p.add_argument(
+        "--disable-auto-feast-apply",
+        action="store_true",
+        dest="disable_auto_feast_apply",
+        help=(
+            "Before Step 3: fail when feast_repo/data/registry.db is missing instead of running `feast apply`. "
+            "Default is auto-apply when registry is absent."
+        ),
+    )
     return p.parse_args()
 
 
@@ -215,6 +223,7 @@ def _run_step3(
     cleaned_bet: Path,
     labels: Path,
     materialize_derived: bool,
+    auto_feast_apply: bool = True,
 ) -> None:
     feast_repo = (_TRAINER_HIGHTIER_ROOT / "feast_repo").resolve()
     bcfg = _b3.BuildTrainingDataArgs(
@@ -229,6 +238,7 @@ def _run_step3(
         feast_entity_batch_by_calendar_month=True,
         training_set_keep_last_n_versions=10,
         feast_retrieval_cache_enabled=True,
+        auto_feast_apply=bool(auto_feast_apply),
     )
     _b3.build_training_data(bcfg)
 
@@ -284,6 +294,8 @@ def _build_report(
     capacity_alerts_per_hour_cap: float,
     ablation_v0: dict[str, Any] | None = None,
     feature_quality: dict[str, Any] | None = None,
+    candidate_registry: dict[str, Any] | None = None,
+    feast_auto_apply: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     gate1_inner = compute_gate1_vs_baseline(
         baseline_report,
@@ -293,6 +305,12 @@ def _build_report(
     )
     gate1_pass = bool(gate1_inner.get("pass_v0_thresholds"))
     reason_codes = list(gate1_inner.get("reason_codes_if_fail") or [])
+
+    feat_group = _feat_registry.FEATURE_GROUP_TAGS
+    baseline_cols_registry = _feat_registry.MODEL_FEATURE_COLUMNS
+    cand_full_registry = _feat_registry.FULL_CANDIDATE_FEATURE_COLUMNS
+    experimental_num = _feat_registry.EXPERIMENTAL_NUMERIC_COLUMNS
+
     out: dict[str, Any] = {
         "experiment_paths": {k: str(v) if isinstance(v, Path) else v for k, v in paths.__dict__.items()},
         "config_echo": dict(cfg),
@@ -304,12 +322,16 @@ def _build_report(
             **gate1_inner,
             "reason_codes_if_fail": reason_codes if not gate1_pass else [],
         },
-        "feature_groups_fe": {k: list(v) for k, v in FEATURE_GROUP_TAGS.items()},
-        "experimental_numeric_columns": list(EXPERIMENTAL_NUMERIC_COLUMNS),
-        "candidate_feature_columns_registry_full": list(FULL_CANDIDATE_FEATURE_COLUMNS),
-        "baseline_feature_columns_registry": list(MODEL_FEATURE_COLUMNS),
+        "feature_groups_fe": {k: list(v) for k, v in feat_group.items()},
+        "experimental_numeric_columns": list(experimental_num),
+        "candidate_feature_columns_registry_full": list(cand_full_registry),
+        "baseline_feature_columns_registry": list(baseline_cols_registry),
         "val_slice_robustness_v0": val_slice_block,
     }
+    if candidate_registry is not None:
+        out["candidate_registry"] = candidate_registry
+    if feast_auto_apply is not None:
+        out["feast_auto_apply"] = dict(feast_auto_apply)
     if feature_quality is not None:
         out["feature_quality"] = feature_quality
     if ablation_v0 is not None:
@@ -532,6 +554,19 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     ns = _parse_args()
     cfg_yaml = _load_yaml_config(Path(ns.config))
+    reg_yaml = cfg_yaml.get("feature_candidate_registry")
+    set_candidate_registry_path(
+        Path(str(reg_yaml)).resolve() if reg_yaml not in (None, "") else None,
+    )
+    reg_snap = candidate_registry_snapshot()
+    registry_echo = {
+        "registry_version": reg_snap.registry_version,
+        "updated_at": reg_snap.updated_at,
+        "resolved_path": str(reg_snap.path),
+        "n_features_documented": len(reg_snap.rows),
+        "n_selectable_candidate_fe": len(reg_snap.experimental_numeric_columns),
+    }
+
     profile_name = str(cfg_yaml.get("run_profile", "default"))
     duck = _duckdb_from_profile(profile_name)
 
@@ -563,6 +598,16 @@ def main() -> None:
 
     timing: dict[str, float] = {}
 
+    feast_repo_fe = (_TRAINER_HIGHTIER_ROOT / "feast_repo").resolve()
+    if ns.skip_step3:
+        feast_apply_echo: dict[str, Any] = {"skipped": True, "reason": "skip_step3"}
+    else:
+        _er_fe = _b3.ensure_feast_registry_ready(
+            feast_repo_fe,
+            auto_apply=not bool(ns.disable_auto_feast_apply),
+        )
+        feast_apply_echo = dict(_b3.feast_registry_ensure_result_to_metrics(_er_fe))
+
     step3_in: Path
     if ns.skip_step3:
         step3_in = step3_dest
@@ -582,6 +627,7 @@ def main() -> None:
             cleaned_bet=cleaned,
             labels=labels_path,
             materialize_derived=True,
+            auto_feast_apply=not bool(ns.disable_auto_feast_apply),
         )
         timing["step3_sec"] = round(time.perf_counter() - t0, 3)
         step3_in = step3_dest
@@ -650,7 +696,7 @@ def main() -> None:
 
     if skip_fqg:
         logger.warning("[FE] FQG disabled (--skip-fqg or feature_quality_gate.skip); training uses full registry.")
-        allow_f = frozenset(FULL_CANDIDATE_FEATURE_COLUMNS)
+        allow_f = frozenset(_feat_registry.FULL_CANDIDATE_FEATURE_COLUMNS)
     else:
         t_fq = time.perf_counter()
         fqg_cfg = FeatureQualityGateConfig()
@@ -661,7 +707,7 @@ def main() -> None:
         qdir = paths.run_dir / "quality" / "fqg_v0"
         fqg_result = run_feature_quality_gate(
             splits_dir=paths.splits_dir,
-            candidate_feature_columns=FULL_CANDIDATE_FEATURE_COLUMNS,
+            candidate_feature_columns=_feat_registry.FULL_CANDIDATE_FEATURE_COLUMNS,
             cfg=fqg_cfg,
             duckdb_runtime=duck,
             approved_warn_features=appr_sets,
@@ -678,14 +724,14 @@ def main() -> None:
             )
         allow_f = frozenset(fqg_result.allowlist)
 
-    baseline_cols = _feature_columns_intersect_allowlist(MODEL_FEATURE_COLUMNS, allow_f)
-    if len(baseline_cols) != len(MODEL_FEATURE_COLUMNS):
-        missing_mx = sorted(set(MODEL_FEATURE_COLUMNS) - set(baseline_cols))
+    baseline_cols = _feature_columns_intersect_allowlist(_feat_registry.MODEL_FEATURE_COLUMNS, allow_f)
+    if len(baseline_cols) != len(_feat_registry.MODEL_FEATURE_COLUMNS):
+        missing_mx = sorted(set(_feat_registry.MODEL_FEATURE_COLUMNS) - set(baseline_cols))
         raise RuntimeError(
             "FQG allowlist dropped baseline columns "
             f"{missing_mx}; fix PIPE/data or pass WARN approvals / widen thresholds.",
         )
-    full_cols = _feature_columns_intersect_allowlist(FULL_CANDIDATE_FEATURE_COLUMNS, allow_f)
+    full_cols = _feature_columns_intersect_allowlist(_feat_registry.FULL_CANDIDATE_FEATURE_COLUMNS, allow_f)
     fq_quality_echo = {
         "fqg_version": FeatureQualityGateConfig().fqg_version,
         "fqg_status": ("skipped" if skip_fqg else (fqg_result.fqg_status if fqg_result is not None else "fail")),
@@ -820,6 +866,8 @@ def main() -> None:
         capacity_alerts_per_hour_cap=cap_alerts_hr,
         ablation_v0=ablation_v0,
         feature_quality=fq_quality_echo,
+        candidate_registry=registry_echo,
+        feast_auto_apply=feast_apply_echo,
     )
     if bool(blob["gate1"].get("capacity_alarm")):
         logger.warning(

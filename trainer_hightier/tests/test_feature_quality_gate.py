@@ -54,15 +54,15 @@ def test_fqg_baseline_unique_constant_soft_warn_allowlisted(tmp_path: Path) -> N
     splits = tmp_path / "splits_soft_const"
     n = 512
     const = np.ones(n, dtype=np.float64)
-    _write_minimal_splits(splits, col_values=(const, const.copy(), const.copy()), col_name="wager_nn")
+    _write_minimal_splits(splits, col_values=(const, const.copy(), const.copy()), col_name="is_back_bet")
     cfg = FeatureQualityGateConfig(random_seed=1, max_rows_per_split=min(4096, n))
     result = run_feature_quality_gate(
         splits_dir=splits,
-        candidate_feature_columns=("wager_nn",),
+        candidate_feature_columns=("is_back_bet",),
         cfg=cfg,
     )
     assert result.fqg_pass
-    assert "wager_nn" in result.allowlist
+    assert "is_back_bet" in result.allowlist
     assert result.blocklist == []
 
 

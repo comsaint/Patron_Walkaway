@@ -18,8 +18,10 @@ Steps (see :func:`build_training_data`):
 3. ``get_historical_features`` + ``persist`` → staging feature Parquet (Ibis/DuckDB).
 4. DuckDB left-join labels on ``bet_id`` + ``gaming_day`` from cleaned bet → ``artifacts/training_data/training_set.parquet``.
 
-Prerequisites: ``feast apply`` has been run from ``feast_repo``; offline store
-paths in ``definitions.py`` resolve to existing materialized Parquets.
+Prerequisites: ``feast_repo/data/registry.db`` must exist before Feast retrieval.
+By default Step 3 will run ``feast apply`` in ``feast_repo`` when registry is missing
+(pass ``--disable-auto-feast-apply`` to enforce a manual apply beforehand). Offline
+store paths in ``definitions.py`` must resolve to existing materialized Parquets.
 
 Memory / scale: Feast’s Ibis+DuckDB offline path loads the **full entity**
 ``DataFrame`` into memory (``bet_id`` + ``event_timestamp`` only — ~16 bytes/row
@@ -37,7 +39,9 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -63,6 +67,110 @@ from trainer_hightier.utils.trial_bet_behavior_1h import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FeastRegistryEnsureResult:
+    """Outcome of :func:`ensure_feast_registry_ready`."""
+
+    feast_repo: Path
+    registry_path: Path
+    feast_registry_ready: bool
+    feast_auto_apply_requested: bool
+    feast_auto_apply_attempted: bool
+    feast_auto_apply_succeeded: bool | None
+    feast_apply_wall_sec: float | None
+
+
+def feast_registry_ensure_result_to_metrics(result: FeastRegistryEnsureResult) -> dict[str, Any]:
+    """Serialize ensure result for ``run_report.json`` / experiment reports."""
+
+    return {
+        "feast_repo": str(result.feast_repo.resolve()),
+        "feast_registry_path": str(result.registry_path.resolve()),
+        "feast_registry_ready": bool(result.feast_registry_ready),
+        "feast_auto_apply_requested": bool(result.feast_auto_apply_requested),
+        "feast_auto_apply_attempted": bool(result.feast_auto_apply_attempted),
+        "feast_auto_apply_succeeded": result.feast_auto_apply_succeeded,
+        "feast_apply_wall_sec": result.feast_apply_wall_sec,
+    }
+
+
+def ensure_feast_registry_ready(feast_repo: Path | str, *, auto_apply: bool) -> FeastRegistryEnsureResult:
+    """Ensure ``feast_repo/data/registry.db`` exists, optionally via ``feast apply``.
+
+    When ``registry.db`` is missing and ``auto_apply`` is True, runs ``feast apply``
+    with ``cwd=feast_repo``. Any failure raises with stderr/stdout context (fail-fast).
+
+    Args:
+        feast_repo: Feast feature repo root (contains ``feature_store.yaml``).
+        auto_apply: If False and registry is missing, raise ``FileNotFoundError``.
+
+    Returns:
+        :class:`FeastRegistryEnsureResult` describing readiness and whether apply ran.
+
+    Raises:
+        FileNotFoundError: Registry missing and ``auto_apply`` is False.
+        RuntimeError: ``feast`` CLI missing, ``feast apply`` failed, or registry still missing after apply.
+    """
+
+    rp = Path(feast_repo).resolve()
+    reg = rp / "data" / "registry.db"
+    if reg.is_file():
+        return FeastRegistryEnsureResult(
+            feast_repo=rp,
+            registry_path=reg,
+            feast_registry_ready=True,
+            feast_auto_apply_requested=auto_apply,
+            feast_auto_apply_attempted=False,
+            feast_auto_apply_succeeded=None,
+            feast_apply_wall_sec=None,
+        )
+    if not auto_apply:
+        raise FileNotFoundError(
+            f"Feast registry missing at {reg}; run `feast apply` from {rp} "
+            "or omit --disable-auto-feast-apply to apply automatically.",
+        )
+    feast_bin = shutil.which("feast")
+    if feast_bin is None:
+        raise RuntimeError(
+            "Feast registry missing and `feast` CLI not found on PATH. "
+            f"Install Feast CLI or run manually: cd {rp} && feast apply. "
+            "Alternatively pass --disable-auto-feast-apply only after pre-applying.",
+        )
+    logger.info("[Feast] registry.db missing; running `feast apply` in %s", rp)
+    t0 = time.perf_counter()
+    proc = subprocess.run(
+        [feast_bin, "apply"],
+        cwd=str(rp),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    wall = round(time.perf_counter() - t0, 3)
+    if proc.returncode != 0:
+        err_tail = (proc.stderr or proc.stdout or "").strip()
+        if len(err_tail) > 4000:
+            err_tail = err_tail[:4000] + "...(truncated)"
+        raise RuntimeError(
+            f"`feast apply` failed in {rp} (exit={proc.returncode}, {wall}s). stderr/stdout tail:\n{err_tail}",
+        )
+    if not reg.is_file():
+        raise RuntimeError(
+            f"`feast apply` finished (exit=0) but registry still missing at {reg}. "
+            "Check Feast logs and feast_repo/feature_store.yaml.",
+        )
+    logger.info("[Feast] apply OK in %ss; registry at %s", wall, reg)
+    return FeastRegistryEnsureResult(
+        feast_repo=rp,
+        registry_path=reg,
+        feast_registry_ready=True,
+        feast_auto_apply_requested=True,
+        feast_auto_apply_attempted=True,
+        feast_auto_apply_succeeded=True,
+        feast_apply_wall_sec=wall,
+    )
+
 
 _DEFAULT_RUN_PROFILE = "default"
 
@@ -415,6 +523,7 @@ class BuildTrainingDataArgs:
     feast_entity_batch_by_calendar_month: bool = False
     training_set_keep_last_n_versions: int = 10
     feast_retrieval_cache_enabled: bool = True
+    auto_feast_apply: bool = True
 
 
 def _validate_prereqs(
@@ -727,6 +836,7 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
         FileNotFoundError: Missing inputs or derived Parquets when not materializing.
         ValueError: Feast feature service or join failure.
     """
+    ensure_feast_registry_ready(cfg.feast_repo, auto_apply=cfg.auto_feast_apply)
     _validate_prereqs(
         feast_repo=cfg.feast_repo,
         cleaned_bet=cfg.cleaned_bet_parquet,
@@ -999,6 +1109,12 @@ def _parse_args() -> BuildTrainingDataArgs:
         help="Feast feature service name (default: walkaway_bet_trial_v1).",
     )
     p.add_argument(
+        "--disable-auto-feast-apply",
+        action="store_true",
+        dest="disable_auto_feast_apply",
+        help="Do not run `feast apply` when feast_repo/data/registry.db is missing (fail instead).",
+    )
+    p.add_argument(
         "--materialize-derived",
         action="store_true",
         help="Run trial 1h + slow 180d materializers before Feast (heavy).",
@@ -1053,6 +1169,7 @@ def _parse_args() -> BuildTrainingDataArgs:
         feast_entity_batch_by_calendar_month=bool(ns.feast_batch_by_month),
         training_set_keep_last_n_versions=int(ns.training_retention),
         feast_retrieval_cache_enabled=not bool(ns.disable_feast_retrieval_cache),
+        auto_feast_apply=not bool(ns.disable_auto_feast_apply),
     )
 
 

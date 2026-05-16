@@ -685,10 +685,19 @@ def test_trial_bet_behavior_1h_window_counts(tmp_path: Path) -> None:
         ]
     )
     src = tmp_path / "cleaned_mini.parquet"
+    cmap = tmp_path / "canonical_player_mapping.parquet"
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame([{"player_id": 1, "canonical_id": "c_unit"}])),
+        cmap,
+    )
     out = tmp_path / "trial_bet_behavior_1h.parquet"
     pq.write_table(pa.Table.from_pandas(df), src)
 
-    materialize_trial_bet_behavior_1h(cleaned_bet_parquet=src, out_parquet=out)
+    materialize_trial_bet_behavior_1h(
+        cleaned_bet_parquet=src,
+        out_parquet=out,
+        canonical_mapping_parquet=cmap,
+    )
 
     got = read_cleaned_bet_dataset(out).sort_values("bet_id", kind="mergesort")
     assert len(got) == 4
@@ -711,6 +720,64 @@ def test_trial_bet_behavior_1h_window_counts(tmp_path: Path) -> None:
 
     r4 = got[got["bet_id"] == 4.0].iloc[0]
     assert int(r4["bet__bets_cnt__w1h"]) == 0
+
+
+def test_trial_bet_behavior_1h_cross_player_same_canonical(tmp_path: Path) -> None:
+    """1h window counts bets from another player_id under the same canonical_id."""
+    from trainer_hightier.utils.trial_bet_behavior_1h import materialize_trial_bet_behavior_1h
+
+    t0 = pd.Timestamp("2024-01-01 12:00:00", tz="UTC")
+    pit = t0 + pd.Timedelta(hours=1)
+    df = pd.DataFrame(
+        [
+            {
+                "bet_id": 1.0,
+                "player_id": 1,
+                "payout_complete_dtm": t0,
+                "wager": 10.0,
+                "is_back_bet": 0,
+                "payout_odds": 2.0,
+                "prediction_visible_ts_cf": pit,
+                "__etl_insert_Dtm_synthetic": pit,
+            },
+            {
+                "bet_id": 2.0,
+                "player_id": 2,
+                "payout_complete_dtm": t0 + pd.Timedelta(minutes=20),
+                "wager": 5.0,
+                "is_back_bet": 1,
+                "payout_odds": 3.0,
+                "prediction_visible_ts_cf": pit,
+                "__etl_insert_Dtm_synthetic": pit,
+            },
+        ]
+    )
+    cmap = tmp_path / "canonical_player_mapping.parquet"
+    pq.write_table(
+        pa.Table.from_pandas(
+            pd.DataFrame(
+                [
+                    {"player_id": 1, "canonical_id": "same_patron"},
+                    {"player_id": 2, "canonical_id": "same_patron"},
+                ]
+            )
+        ),
+        cmap,
+    )
+    src = tmp_path / "cleaned_mini.parquet"
+    out = tmp_path / "trial_cross.parquet"
+    pq.write_table(pa.Table.from_pandas(df), src)
+
+    materialize_trial_bet_behavior_1h(
+        cleaned_bet_parquet=src,
+        out_parquet=out,
+        canonical_mapping_parquet=cmap,
+    )
+
+    got = read_cleaned_bet_dataset(out).sort_values("bet_id", kind="mergesort")
+    r2 = got[got["bet_id"] == 2.0].iloc[0]
+    assert int(r2["bet__bets_cnt__w1h"]) == 1
+    assert float(r2["bet__wager_sum__w1h"]) == 10.0
 
 
 def test_metamorphic_overlap_invariant_full_vs_player_subset(registry_path: Path, tmp_path: Path) -> None:

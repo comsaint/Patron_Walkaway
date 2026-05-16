@@ -3,7 +3,7 @@
 No standalone CLI — invoked from :mod:`trainer_hightier.trainer`. Reads
 ``train.parquet`` / ``val.parquet`` / ``test.parquet`` under the Step 4 splits
 directory; picks a validation threshold under ``HighTierObjectiveConfig.min_precision``;
-writes model + metrics under the run ``output_dir``.
+writes ``model.pkl`` + ``training_metrics.json`` under the given ``output_dir`` (bundle dir when called from ``run_training``).
 
 Numeric prefix matches steps 1–4; use :func:`importlib.import_module` if importing
 from code.
@@ -35,28 +35,12 @@ logger = logging.getLogger(__name__)
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 
-MODEL_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
-    "wager",
-    "wager_nn",
-    "casino_win",
-    "is_back_bet",
-    "bet_type",
-    "type_of_bet",
-    "bet__bets_cnt__w1h",
-    "bet__wager_sum__w1h",
-    "bet__back_bet_ratio__w1h",
-    "bet__payout_odds_avg__w1h",
-    "patron__theo_win_sum__w180d_m1snap",
-    "patron__gaming_days_cnt__w180d_m1snap",
-    "patron__adt__w180d_m1snap",
-)
-
 PAYOUT_TS_COLUMN: Final[str] = "payout_complete_dtm"
 LABEL_COLUMN: Final[str] = "walkaway_label"
 CAT_COLUMNS: Final[frozenset[str]] = frozenset({"bet_type", "type_of_bet"})
 
-DEFAULT_MODEL_FILENAME: Final[str] = "step5_lgbm_model.pkl"
-DEFAULT_METRICS_FILENAME: Final[str] = "step5_training_metrics.json"
+DEFAULT_MODEL_FILENAME: Final[str] = "model.pkl"
+DEFAULT_METRICS_FILENAME: Final[str] = "training_metrics.json"
 
 
 @dataclass(frozen=True)
@@ -401,16 +385,22 @@ def train_lgbm_from_splits(
     random_seed: int,
     step5: Step5TrainConfig | None = None,
     output_dir: Path,
-    feature_columns: tuple[str, ...] | None = None,
+    feature_columns: tuple[str, ...],
 ) -> Step5Result:
     """Train LightGBM on Step 4 splits; optional Optuna; pick threshold on val; write artifacts.
 
     Args:
-        feature_columns: Columns used as model inputs (excluding label / payout_ts). Defaults to
-            :data:`MODEL_FEATURE_COLUMNS`.
+        feature_columns: Model input columns (excluding label / payout_ts). Required; use
+            :func:`~trainer_hightier.feature_experiment.candidate_registry_loader.baseline_features_for_main_trainer`
+            or full-candidate tuples from the candidate registry snapshot.
     """
 
-    feat_cols = feature_columns if feature_columns is not None else MODEL_FEATURE_COLUMNS
+    if not feature_columns:
+        raise ValueError(
+            "train_lgbm_from_splits requires non-empty feature_columns "
+            "(derive from trainer_hightier/contracts/feature_candidate_registry.yaml via load_candidate_registry).",
+        )
+    feat_cols = tuple(feature_columns)
     cfg = step5 or Step5TrainConfig()
     sd = Path(splits_dir).resolve()
     train_p = sd / "train.parquet"
@@ -581,10 +571,12 @@ def train_lgbm_from_splits(
             f,
             protocol=pickle.HIGHEST_PROTOCOL,
         )
+    report["model_path"] = str(model_path)
     report["step5_model_path"] = str(model_path)
     metrics_path = (out_dir / DEFAULT_METRICS_FILENAME).resolve()
-    metrics_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    report["training_metrics_path"] = str(metrics_path)
     report["step5_training_metrics_path"] = str(metrics_path)
+    metrics_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
 
     logger.info(
         "Step 5 trained LightGBM in %.3fs; threshold=%.6f feasible=%s val recall=%.4f prec=%.4f → %s",
