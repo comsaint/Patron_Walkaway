@@ -198,7 +198,7 @@ class HighTierObjectiveConfig:
     # Quantile in (0, 1) on patron **ADT** (from ``canonical_patron_profile.csv``): bet preprocess keeps
     # only bets tied (via canonical mapping) to patrons at or above this ADT quantile (~top ``1 - q``).
     # Align naming with ``trainer.training.high_roller_segmentation`` when wiring segment thresholds.
-    theo_train_quantile: float = 0.99
+    theo_train_quantile: float = 0.90
     # Require precision >= this value on the **segment** when choosing a score threshold.
     min_precision: float = 0.60
     # Placeholder paths for later steps (Parquet / DuckDB exports).
