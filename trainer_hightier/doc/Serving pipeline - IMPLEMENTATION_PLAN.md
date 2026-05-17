@@ -19,6 +19,7 @@
 - 部署形態：拆服務，先採 dedicated script per component。
 - validator 規則：沿用 `trainer/serving/validator.py` 判定邏輯，但部署時不可依賴 `trainer` package。
 - 特徵集合：serving 僅計算「模型訓練使用欄位」（目前 baseline 為主）。
+- 打分族群：預設啟用 `high_adt_only`，僅對「與訓練同源」的高 ADT allowlist 玩家打分（來源與訓練 `adt_allowed_players_parquet` 對齊）。
 - 快照更新 SLA：每日，由 orchestrator 觸發 `hightier_snapshot_updater.py`。
 - 缺口回補範圍：僅需補 `last_training_cutoff -> now`。
 - 狀態儲存：
@@ -63,11 +64,14 @@ flowchart LR
 
 - 責任：
   - 以 ingest watermark 從 ClickHouse 拉取新 bet（增量）。
+  - 套用高 ADT 玩家開關（`high_adt_only`）過濾打分母體。
   - 計算模型所需 baseline serving features。
   - 讀取 active snapshot 版本（來自 feature-state）並做 as-of 特徵拼接。
   - 產生告警並寫入共用 `state.db` 的 `alerts`。
 - 關鍵策略：
   - 不以固定 8h 當主邏輯；以增量 cursor + 特徵窗口需求控制查詢範圍。
+  - `high_adt_only=true` 時，僅保留 allowlist 內 `player_id`（與訓練同一份 allowed list SSOT）。
+  - `high_adt_only=false` 時才允許全量玩家模式（僅作除錯/回歸用途，預設關閉）。
   - 每輪檢查 feature-state version（manifest mtime/version），若更新則熱切換。
 
 ### 2) `hightier_validator.py`
@@ -116,6 +120,7 @@ flowchart LR
   - `feature_state_meta`：active 版本、training cutoff、coverage 區間。
   - `snapshot_watermark`：各快照族群最後補齊時間點。
   - `snapshot_job_log`：每日更新執行紀錄（成功/失敗、耗時、列數）。
+  - `adt_allowlist_meta`（建議新增）：allowlist 來源路徑/版本、生成時間、列數、hash（供 scorer 稽核與熱切換）。
 
 ### C. Parquet manifest
 
@@ -126,6 +131,8 @@ flowchart LR
   - `coverage_end_ts`
   - `generated_at`
   - `artifact_path`
+  - `adt_allowlist_path`
+  - `adt_allowlist_version`（或 hash）
 
 ## 工作流與階段（Workstreams / Phases）
 
@@ -138,6 +145,7 @@ flowchart LR
 ### Phase 1: Scorer 增量化與 baseline 特徵路徑
 
 - 實作 ClickHouse 增量抓取（ingest watermark）。
+- 實作 `high_adt_only` 開關與 allowlist 過濾（同訓練來源）。
 - 實作 baseline 特徵計算與模型欄位白名單校驗。
 - 實作 `alerts` 寫入與去重策略。
 
@@ -153,6 +161,7 @@ flowchart LR
 - 實作 `hightier_snapshot_updater.py`：
   - 讀 `training_cutoff`
   - 補 `cutoff -> now` 缺口
+  - 發布/刷新高 ADT allowlist artifact（路徑、版本、hash）
   - 更新 active version
 - scorer 加入快照版本輪詢與熱切換。
 
@@ -164,6 +173,7 @@ flowchart LR
 ## 里程碑與交付物
 
 - M1：`hightier_scorer.py` 可從 ClickHouse 增量出 alert，寫入 `state.db`。
+- M1.1：`high_adt_only` 啟用時，scorer 僅對 allowlist 玩家打分，且可觀測當前 allowlist 版本。
 - M2：`hightier_validator.py` 輸出與 trainer validator 判定一致（基準資料集）。
 - M3：`feature_state.db` + manifest + `hightier_snapshot_updater.py` 每日補齊可運行。
 - M4：scorer 可自動感知快照版本更新並在不中斷服務下生效。
@@ -173,6 +183,8 @@ flowchart LR
 
 - 風險：每日快照節奏下，日內特徵可能偏舊。
   - 緩解：明確標記 snapshot staleness 指標；支援手動補跑。
+- 風險：allowlist 版本漂移（訓練與 serving 使用不同名單）。
+  - 緩解：將 allowlist 版本/hash 納入 manifest 與執行日誌；scorer 啟動時強制記錄並告警版本不一致。
 - 風險：只補 `training_cutoff -> now` 無法反映 cutoff 前遲到修正。
   - 緩解：在文件層明示「不追溯」假設，避免誤判為 bug。
 - 風險：解耦後 validator 行為漂移。
@@ -184,6 +196,7 @@ flowchart LR
 
 - 正確性驗證：
   - scorer 輸出欄位契約符合 trainer API 相容要求。
+  - `high_adt_only=true` 時，alerts 的 `player_id` 應全數落在 allowlist；`false` 時可覆蓋全量模式。
   - validator 對照測試：hightier vs trainer 逐列判定一致。
 - 性能驗證：
   - 每輪查詢列數、耗時、記憶體峰值監控；確保可在筆電資源運行。
@@ -195,6 +208,7 @@ flowchart LR
 ## 假設與待確認
 
 - `training_cutoff` 可由當前 model bundle metadata 穩定取得。
+- 高 ADT allowlist 可由訓練流程穩定輸出，且 serving 可取得同版本 artifact。
 - orchestrator 可保證每日觸發 `hightier_snapshot_updater.py` 至少一次。
 - 共用 `state.db` 的併發寫入策略採 WAL（避免 scorer/validator lock 衝突）。
 
