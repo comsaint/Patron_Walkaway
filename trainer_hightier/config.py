@@ -11,7 +11,7 @@ Other packages may still *call* shared helpers; only **config** stays local here
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Final
@@ -327,6 +327,90 @@ class Step5TrainConfig:
     baseline_subsample: float = 0.8
     baseline_colsample_bytree: float = 0.8
     baseline_reg_lambda: float = 0.0
+
+
+@dataclass(frozen=True)
+class HightierServingConfig:
+    """ClickHouse + SQLite paths for ``trainer_hightier`` serving (no environment-variable SSOT).
+
+    Tune credentials and retention here for laptop/production deployments.
+    """
+
+    hk_tz: str = "Asia/Hong_Kong"
+    source_db: str = "GDP_GMWDS_Raw"
+    tbet: str = "t_bet"
+    tsession: str = "t_session"
+    casino_player_id_clean_sql: str = (
+        "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "
+        "THEN NULL ELSE trim(casino_player_id) END"
+    )
+    #: ClickHouse TCP/HTTP endpoint (``clickhouse_connect``).
+    ch_host: str = "gdpedw"
+    ch_port: int = 8123
+    ch_user: str = ""
+    ch_password: str = ""
+    ch_secure: bool = False
+    placeholder_player_id: int = -1
+    walkaway_gap_min: int = 30
+    alert_horizon_min: int = 15
+    #: ``trainer`` default is ``WALKAWAY_GAP_MIN + ALERT_HORIZON_MIN``.
+    label_lookahead_min: int = 45
+    validator_alert_retention_days: int = 30
+    validation_results_retention_days: int = 180
+    validator_cache_prune_interval_seconds: int = 300
+    validator_freshness_buffer_minutes: int = 2
+    validator_extended_wait_minutes: int = 15
+    validator_finality_hours: int = 1
+    validator_finalize_on_horizon: bool = True
+    validator_no_bet_bet_id_lookup_enabled: bool = True
+    validator_fetch_pre_context_minutes: int = 60
+    validator_fetch_max_lookback_minutes: int = 180
+    validator_fetch_max_lookback_minutes_cap: int = 24 * 60
+    validator_no_bet_retry_max_window_minutes: int = 240
+    validator_no_bet_bet_id_chunk_size: int = 500
+    validator_no_bet_retry_max_alerts: int = 50
+    scorer_state_retention_hours: int = 24
+    bet_avail_delay_min: int = 1
+    session_avail_delay_min: int = 15
+    scorer_poll_interval_seconds: float = 30.0
+    #: Upper bound on cold-start / backfill window for incremental fetches (hours).
+    scorer_dynamic_lookback_cap_hours: int = 168
+    hightier_scorer_max_bets_per_cycle: int = 2000
+    #: Hours of bet history loaded for 1h rolling features (per cycle, per player pool).
+    hot_feature_pool_lookback_hours: int = 6
+    state_db_path: Path = field(
+        default_factory=lambda: _REPO_ROOT / "trainer_hightier" / "local_state" / "state.db"
+    )
+    feature_state_db_path: Path = field(
+        default_factory=lambda: _REPO_ROOT / "trainer_hightier" / "local_state" / "feature_state.db"
+    )
+    snapshot_manifest_dir: Path = field(
+        default_factory=lambda: _REPO_ROOT
+        / "trainer_hightier"
+        / "artifacts"
+        / "serving_snapshots"
+    )
+    validator_out_dir: Path = field(
+        default_factory=lambda: _REPO_ROOT / "trainer_hightier" / "out_validator_hightier"
+    )
+    default_model_versions_root: Path = field(default_factory=lambda: DEFAULT_MODEL_DIR)
+    #: When True, only score bets whose ``player_id`` appears in the ADT allowlist Parquet.
+    high_adt_only: bool = True
+    #: Quantile slug for :func:`~trainer_hightier.utils.patron_session_metrics.default_adt_allowed_players_parquet_path`.
+    #: Must match training ``theo_train_quantile`` when using default allowlist path.
+    adt_allowlist_quantile: float = 0.90
+    #: Explicit allowlist path; when ``None``, scorer resolves via manifest → this field → default quantile path.
+    adt_allowed_players_parquet: Path | None = None
+    #: If True and ``training_metrics.json`` contains ``adt_allowlist_sha256``, scorer requires an exact match.
+    adt_allowlist_fail_on_training_hash_mismatch: bool = True
+
+
+_DEFAULT_HIGHTIER_SERVING: HightierServingConfig = HightierServingConfig()
+
+
+def default_hightier_serving_config() -> HightierServingConfig:
+    """Return the frozen default serving config (single-process SSOT)."""
+    return _DEFAULT_HIGHTIER_SERVING
 
 
 def list_run_profile_names() -> tuple[str, ...]:

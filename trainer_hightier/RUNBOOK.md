@@ -20,9 +20,34 @@
 
 **Step 1** 對 **session** shards 做 schema / metadata 檢查（`01_data_ingest.validate_partition_session_ingress_or_raise`）；bet 在進入 Step 2b 前同樣驗 shard。必要欄位見 `01_data_ingest._REQUIRED_SESSION_PARQUET_COLS` / `_REQUIRED_BET_PARQUET_COLS`。
 
-**其他模組**（例如 `validate_session_ingress_or_raise` + monolith 路徑）仍保留在 `01_data_ingest.py` 供測試或舊腳本；**主訓練 CLI 已不走該路徑**。
+## Serving（ClickHouse + SQLite，與 ``trainer`` ML API 相容）
 
-### 1.1 主 trainer Step 5 與 Feature Candidate Registry
+設定集中於 ``trainer_hightier.config.HightierServingConfig``（``default_hightier_serving_config()``），含 ClickHouse 連線與 ``state.db`` / ``feature_state.db`` 路徑。
+
+| 元件 | 啟動 |
+|------|------|
+| Scorer | ``python -m trainer_hightier.run_hightier_scorer``（``--once`` 單輪） |
+| Validator | ``python -m trainer_hightier.run_hightier_validator`` |
+| ML API | ``python -m trainer_hightier.run_hightier_api`` → ``/alerts``、``/validation``、``/health`` |
+| Snapshot（每日） | ``python -m trainer_hightier.run_hightier_snapshot_updater``（``--rematerialize-slow`` 需清洗後 Parquet 輸入） |
+
+**快照目錄**：預設 ``trainer_hightier/artifacts/serving_snapshots/active_manifest.json``；scorer 會讀其中 ``slow_patron_parquet`` 並在版本變更時寫入共用 ``state.db`` meta。
+
+**前置**：首次部署請先跑 snapshot updater（或 ``--slow-parquet`` 指定 slow patron Parquet），並確認 canonical mapping Parquet 存在（與訓練相同路徑）。
+
+### Serving：ADT allowlist（`high_adt_only`）
+
+| 項目 | 說明 |
+|------|------|
+| **預設** | `HightierServingConfig.high_adt_only=True`（`trainer_hightier/config.py`）。Scorer 只對訓練同源 **ADT allowlist** Parquet 內的 `player_id` 做 hot 特徵與打分。 |
+| **名單解析順序** | CLI `--adt-allowlist` → `active_manifest.json` 的 `adt_allowlist_parquet` → `adt_allowed_players_parquet` → `default_adt_allowed_players_parquet_path(adt_allowlist_quantile)`。 |
+| **Snapshot / manifest** | `run_hightier_snapshot_updater` 會複製 allowlist 至 `artifacts/serving_snapshots/adt_allowed_players_<run_id>.parquet`，並寫入 manifest 的 `adt_allowlist_parquet` 與 `adt_allowlist_version`（目前為 **整檔 SHA-256**）。`feature_state.db` 的 `adt_allowlist_meta` 單列與之一致。整段更新在 `try` 內：**例外時不會呼叫** `publish_manifest_atomic`，避免半套切換。 |
+| **訓練 hash 防線** | 若 bundle 內 `training_metrics.json` 有 `adt_allowlist_sha256`，且 `adt_allowlist_fail_on_training_hash_mismatch=True`（預設），載入名單時 **hash 不符即起動失敗**。若設為 `False`，會 **ERROR log**，`state.db` meta `adt_allowlist_health=degraded_hash_mismatch`，流程仍繼續（**不建議正式環境**）。 |
+| **除錯模式** | `python -m trainer_hightier.run_hightier_scorer --no-high-adt-only` 可對**全玩家**打分；**僅限**除錯／迴歸，**不可**當正式上線模式。 |
+| **可觀測** | 啟動一行 log：`high_adt_only`、`model_version`、`allowlist_path`、`allowlist_sha`、`manifest_adt_allowlist_version`；每輪過濾時 log `adt_allowlist filter rows …`。`state.db` meta：`active_adt_allowlist_sha256`、`active_adt_allowlist_version`、`adt_allowlist_health`（`ok` / `degraded_hash_mismatch` / `full_population_mode`）。 |
+| **排程契約（建議）** | **Snapshot updater**：缺檔、I/O、材化失敗 → **exit 非 0**，先修資料或路徑再重跑（不宜無限重試）。**Scorer**：ClickHouse 短暫錯誤可依 poll interval 重試；allowlist ／ manifest **結構性缺失**應 **fail-fast**（由程式抛錯退出）。 |
+| **回滾** | 自備份還原整份 `active_manifest.json` 及其指向的 `slow_patron_*.parquet` 與 `adt_allowed_players_*.parquet`（路徑須仍存在）；重啟 scorer。若僅要回到上一版名單，還原**整份** manifest + 兩個 parquet 指標檔，避免 slow 與 allowlist 版本錯配。 |
+
 
 - **`python -m trainer_hightier.trainer` 的 Step 5** 會讀 `trainer_hightier/contracts/feature_candidate_registry.yaml`（或 `--feature-candidate-registry`），以台帳中 **可選 baseline** 欄位（`status` 為 `active|experimental` 且 `enabled_for` 含 `baseline`）作為 `feature_columns`。
 - **單一真相**：baseline / candidate / ablation 選欄皆以 [`feature_candidate_registry.yaml`](trainer_hightier/contracts/feature_candidate_registry.yaml) 為準；baseline 列为 YAML 順序下 `enabled_for` 含 **`baseline`** 且 `status` 為 `active` 或 `experimental` 的列（**不可**對 `fe__*` 使用 baseline 槽）。主線 Step 5 與實驗皆由 `candidate_registry_loader` 載入。

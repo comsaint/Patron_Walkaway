@@ -97,6 +97,7 @@ flowchart LR
   - 每日補齊中長期快照（例如 slow/monthly）缺口。
   - 維護 `feature_state.db` watermark 與 active snapshot 版本。
   - 輸出/更新 Parquet manifest 供 scorer 快速感知版本。
+  - **已落地**：一併版本化並發佈訓練同源 **ADT allowlist**（複製至 `adt_allowed_players_<run_id>.parquet`），manifest 寫入 `adt_allowlist_parquet` / `adt_allowlist_version`（整檔 SHA-256），並寫入 `adt_allowlist_meta` 審計列；失敗時不呼叫 `publish_manifest_atomic`。
 - 觸發與節奏：
   - 由 orchestrator 每日觸發。
   - scorer 不負責計算快照，只負責「持續檢查並套用新快照版本」。
