@@ -24,6 +24,7 @@ import duckdb
 import lightgbm as lgb
 import numpy as np
 import optuna
+from optuna.trial import TrialState
 import pandas as pd
 import pyarrow.parquet as pq
 from sklearn.metrics import average_precision_score
@@ -353,6 +354,18 @@ def _optuna_trial_debug_log(study: optuna.study.Study, trial: optuna.trial.Froze
     )
 
 
+def _optuna_stopping_reason(*, wall_sec: float, timeout_sec: float, n_trials_total: int, n_completed: int) -> str:
+    """Classify why Optuna stopped (minimal enum for cross-run comparability)."""
+
+    if n_completed < 1:
+        return "no_completed_trials"
+    if wall_sec >= float(timeout_sec) * 0.995:
+        return "time_budget_exhausted"
+    if n_trials_total > 0 and n_completed == n_trials_total:
+        return "completed"
+    return "unknown"
+
+
 def _train_one_lgbm(
     X_tr: pd.DataFrame,
     y_tr: np.ndarray,
@@ -480,12 +493,21 @@ def train_lgbm_from_splits(
         return model, pick, objective_val
 
     t0 = time.perf_counter()
-    best_hp: dict[str, Any]
-    study_summary: dict[str, Any] | None = None
 
     if cfg.skip_optuna:
         best_hp = _baseline_lgb_params(cfg, random_seed)
         model, val_pick, _obj = _evaluate_hp(best_hp)
+        study_summary = {
+            "optuna_max_time_sec_configured": float(cfg.optuna_timeout_sec),
+            "optuna_max_trials_configured": None,
+            "optuna_wall_time_sec_actual": None,
+            "optuna_trials_completed": 0,
+            "optuna_trials_total": 0,
+            "optuna_stopping_reason": "optuna_skipped",
+            "optuna_n_trials": 0,
+            "optuna_best_value": None,
+            "optuna_best_params": {},
+        }
     else:
         sampler = optuna.samplers.TPESampler(seed=int(random_seed))
 
@@ -498,15 +520,33 @@ def train_lgbm_from_splits(
         _prev_optuna_verbosity = optuna.logging.get_verbosity()
         try:
             optuna.logging.set_verbosity(optuna.logging.WARNING)
+            t_opt0 = time.perf_counter()
             study.optimize(
                 objective,
                 timeout=float(cfg.optuna_timeout_sec),
                 show_progress_bar=True,
                 callbacks=[_optuna_trial_debug_log],
             )
+            opt_wall = round(time.perf_counter() - t_opt0, 3)
         finally:
             optuna.logging.set_verbosity(_prev_optuna_verbosity)
-        study_summary = {"optuna_n_trials": len(study.trials)}
+        n_trials_total = len(study.trials)
+        n_completed = int(sum(1 for tr in study.trials if tr.state == TrialState.COMPLETE))
+        stop_reason = _optuna_stopping_reason(
+            wall_sec=float(opt_wall),
+            timeout_sec=float(cfg.optuna_timeout_sec),
+            n_trials_total=n_trials_total,
+            n_completed=n_completed,
+        )
+        study_summary = {
+            "optuna_max_time_sec_configured": float(cfg.optuna_timeout_sec),
+            "optuna_max_trials_configured": None,
+            "optuna_wall_time_sec_actual": float(opt_wall),
+            "optuna_trials_completed": n_completed,
+            "optuna_trials_total": n_trials_total,
+            "optuna_stopping_reason": stop_reason,
+            "optuna_n_trials": n_trials_total,
+        }
         try:
             study_summary["optuna_best_value"] = float(study.best_value)
             study_summary["optuna_best_params"] = dict(study.best_params)
@@ -515,6 +555,7 @@ def train_lgbm_from_splits(
             logger.warning("Step 5: Optuna has no completed trials; using baseline hyperparameters.")
             study_summary["optuna_best_value"] = None
             study_summary["optuna_best_params"] = {}
+            study_summary["optuna_stopping_reason"] = "no_completed_trials"
             best_hp = _baseline_lgb_params(cfg, random_seed)
         model, val_pick, _ = _evaluate_hp(best_hp)
 
@@ -551,8 +592,7 @@ def train_lgbm_from_splits(
         **block_va,
         **block_te,
     }
-    if study_summary is not None:
-        report.update(study_summary)
+    report.update(study_summary)
 
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)

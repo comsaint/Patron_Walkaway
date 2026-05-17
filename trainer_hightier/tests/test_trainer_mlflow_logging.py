@@ -71,9 +71,14 @@ def test_run_training_mlflow_success_path_logs_success_tag_and_run_report_artifa
 
     rp = tmp_path / "out" / "run_report.json"
     assert rp.is_file()
+    assert (tmp_path / "out" / "run_summary.json").is_file()
+    assert (tmp_path / "out" / "metrics_detailed.json").is_file()
+    assert (tmp_path / "out" / "pipeline_debug.json").is_file()
 
     artifact_paths = [c.args[0] for c in art_m.call_args_list]
     assert any(Path(p).resolve() == rp.resolve() for p in artifact_paths)
+    rs_logged = tmp_path / "out" / "run_summary.json"
+    assert any(Path(p).resolve() == rs_logged.resolve() for p in artifact_paths)
 
     metrics_m.assert_called_once()
     logged_metrics = metrics_m.call_args[0][0]

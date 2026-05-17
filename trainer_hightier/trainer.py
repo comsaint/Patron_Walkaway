@@ -14,12 +14,14 @@ Use ``--start-from-features`` to run only Step 4 on an existing training parquet
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import logging
 import subprocess
 import time
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Final
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -87,6 +89,10 @@ _b5 = importlib.import_module("trainer_hightier.05_lgbm_train")
 
 
 logger = logging.getLogger("trainer_hightier")
+
+RUN_SUMMARY_FILENAME: Final[str] = "run_summary.json"
+METRICS_DETAILED_FILENAME: Final[str] = "metrics_detailed.json"
+PIPELINE_DEBUG_FILENAME: Final[str] = "pipeline_debug.json"
 
 _STEP5_CONFIG_DEFAULTS = Step5TrainConfig()
 _PARTITION_INGRESS_DEFAULTS = PartitionIngressConfig()
@@ -206,12 +212,247 @@ class HighTierTrainArgs:
     feature_candidate_registry: Path | None = None
     #: ``--run-profile`` CLI name (MLflow param); programmatic callers default to :data:`DEFAULT_RUN_PROFILE_NAME`.
     run_profile_name: str = DEFAULT_RUN_PROFILE_NAME
+    #: Explicit patron sampling ratio for logs (e.g. ``0.01`` vs ``0.10``). When ``None`` and ADT bet filter is on,
+    #: :func:`build_run_summary` derives approximate segment fraction as ``1 - objective.theo_train_quantile``.
+    patron_sampling_ratio: float | None = None
 
 
 def _repo_root() -> Path:
     """Return repository root (parent of ``trainer_hightier`` package directory)."""
 
     return Path(__file__).resolve().parents[1]
+
+
+def _epoch_ms_to_iso_z(epoch_ms: int | None) -> str | None:
+    """Render epoch milliseconds as UTC ISO-8601 ``…Z`` string."""
+
+    if epoch_ms is None:
+        return None
+    try:
+        ms = int(epoch_ms)
+    except (TypeError, ValueError):
+        return None
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _resolved_patron_sampling_ratio(args: HighTierTrainArgs) -> tuple[float | None, str]:
+    """Return ``(ratio, source)`` for run-summary ``data_scope`` (explicit vs ADT-derived)."""
+
+    if args.patron_sampling_ratio is not None:
+        return float(args.patron_sampling_ratio), "explicit"
+    if args.filter_bets_by_adt_quantile:
+        q = float(args.objective.theo_train_quantile)
+        if 0.0 < q < 1.0:
+            return round(1.0 - q, 8), "adt_quantile_derived"
+    return None, "unknown"
+
+
+def _feature_list_sha256_hex(columns: object) -> str | None:
+    """Stable SHA256 over sorted feature column names (hex digest, no prefix)."""
+
+    if not isinstance(columns, list):
+        return None
+    names = [str(x) for x in columns]
+    payload = json.dumps(sorted(names), separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _path_relative_to_repo(path_str: str | None, *, repo_root: Path) -> str | None:
+    """Best-effort repo-relative path string for logs."""
+
+    if path_str is None:
+        return None
+    raw = str(path_str).strip()
+    if not raw:
+        return None
+    try:
+        p = Path(raw).resolve()
+        rel = p.relative_to(repo_root.resolve())
+        return str(rel).replace("\\", "/")
+    except ValueError:
+        return raw.replace("\\", "/")
+
+
+def build_run_summary(metrics: dict[str, Any], args: HighTierTrainArgs) -> dict[str, Any]:
+    """Build compact ``run_summary.json`` payload (cross-run comparison)."""
+
+    repo_root = _repo_root()
+    run_id = str(metrics.get("model_version") or "").strip() or "unknown_run"
+    started = _epoch_ms_to_iso_z(metrics.get("start_epoch_ms")) if isinstance(metrics.get("start_epoch_ms"), int) else None
+    finished = _epoch_ms_to_iso_z(metrics.get("finish_epoch_ms")) if isinstance(metrics.get("finish_epoch_ms"), int) else None
+    duration_sec = metrics.get("run_training_total_seconds")
+    patron_ratio, patron_src = _resolved_patron_sampling_ratio(args)
+    warn_keys = ("val_ap", "val_precision", "test_ap", "test_precision")
+    for wk in warn_keys:
+        if wk not in metrics:
+            logger.warning("[run_summary] missing metrics[%r]; cross-run comparison degraded.", wk)
+    feat_cols = metrics.get("step5_feature_columns")
+    n_feat = len(feat_cols) if isinstance(feat_cols, list) else None
+    feat_hash = _feature_list_sha256_hex(feat_cols) if isinstance(feat_cols, list) else None
+    thr = metrics.get("step5_threshold")
+    if "step5_optuna_skipped" not in metrics:
+        opt_enabled = False
+    else:
+        opt_enabled = not bool(metrics.get("step5_optuna_skipped"))
+    summary = {
+        "run_id": run_id,
+        "started_at": started,
+        "finished_at": finished,
+        "duration_sec": float(duration_sec) if isinstance(duration_sec, (int, float)) else None,
+        "data_scope": {
+            "population_scope": "adt_filtered_bets_when_enabled",
+            "filter_bets_by_adt_quantile": bool(args.filter_bets_by_adt_quantile),
+            "theo_train_quantile": float(args.objective.theo_train_quantile),
+            "patron_sampling_ratio": patron_ratio,
+            "patron_sampling_ratio_source": patron_src,
+        },
+        "model": {"algorithm": "lightgbm", "n_features_used": n_feat, "feature_list_sha256_hex": feat_hash},
+        "thresholding": {
+            "policy": "min_precision",
+            "policy_param": {"min_precision": float(args.objective.min_precision)},
+            "selected_threshold": float(thr) if isinstance(thr, (int, float)) else None,
+        },
+        "metrics": {
+            "val": {
+                "ap": metrics.get("val_ap"),
+                "precision": metrics.get("val_precision"),
+                "recall": metrics.get("val_recall"),
+                "f1": metrics.get("val_f1"),
+                "samples": metrics.get("val_samples"),
+                "positives": metrics.get("val_positives"),
+                "alerts": metrics.get("val_alerts"),
+                "alerts_per_hour": metrics.get("val_alerts_per_hour"),
+            },
+            "test": {
+                "ap": metrics.get("test_ap"),
+                "precision": metrics.get("test_precision"),
+                "recall": metrics.get("test_recall"),
+                "f1": metrics.get("test_f1"),
+                "samples": metrics.get("test_samples"),
+                "positives": metrics.get("test_positives"),
+                "alerts": metrics.get("test_alerts"),
+                "alerts_per_hour": metrics.get("test_alerts_per_hour"),
+            },
+        },
+        "optimization": {
+            "enabled": opt_enabled,
+            "backend": "optuna",
+            "max_time_sec_configured": metrics.get("optuna_max_time_sec_configured"),
+            "max_trials_configured": metrics.get("optuna_max_trials_configured"),
+            "wall_time_sec_actual": metrics.get("optuna_wall_time_sec_actual"),
+            "trials_completed": metrics.get("optuna_trials_completed"),
+            "trials_total": metrics.get("optuna_trials_total"),
+            "stopping_reason": metrics.get("optuna_stopping_reason"),
+            "best_value": metrics.get("optuna_best_value"),
+        },
+        "git_commit_short": _git_short_head(repo_root),
+        "run_profile": str(args.run_profile_name),
+    }
+    if patron_ratio is None and patron_src == "unknown":
+        logger.warning(
+            "[run_summary] patron_sampling_ratio unknown; set HighTierTrainArgs.patron_sampling_ratio "
+            "or enable filter_bets_by_adt_quantile with theo_train_quantile in (0,1).",
+        )
+    return summary
+
+
+def build_metrics_detailed(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Build ``metrics_detailed.json`` (train/val/test blocks + feature list)."""
+
+    run_id = str(metrics.get("model_version") or "").strip() or "unknown_run"
+
+    def _split(prefix: str) -> dict[str, Any]:
+        keys = ("ap", "precision", "recall", "f1")
+        return {k: metrics.get(f"{prefix}_{k}") for k in keys}
+
+    return {
+        "run_id": run_id,
+        "split_metrics": {"train": _split("train"), "val": _split("val"), "test": _split("test")},
+        "threshold_analysis": {
+            "selection_policy": f"min_precision={metrics.get('step5_min_precision')}",
+            "selected_threshold": metrics.get("step5_threshold"),
+            "val_pick_feasible": metrics.get("step5_val_pick_feasible"),
+        },
+        "budget_points": {
+            "alerts_per_hour": {
+                "train": metrics.get("train_alerts_per_hour"),
+                "val": metrics.get("val_alerts_per_hour"),
+                "test": metrics.get("test_alerts_per_hour"),
+            }
+        },
+        "feature_columns": metrics.get("step5_feature_columns"),
+        "candidate_registry": metrics.get("candidate_registry"),
+    }
+
+
+def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Build ``pipeline_debug.json`` (timings, caches, lineage paths)."""
+
+    repo_root = _repo_root()
+    run_id = str(metrics.get("model_version") or "").strip() or "unknown_run"
+    return {
+        "run_id": run_id,
+        "cache": {
+            "session_clean_cache_hit": metrics.get("session_clean_cache_hit"),
+            "bet_base_clean_cache_hit": metrics.get("bet_base_clean_cache_hit"),
+            "bet_segment_clean_cache_hit": metrics.get("bet_segment_clean_cache_hit"),
+            "bet_clean_cache_hit": metrics.get("bet_clean_cache_hit"),
+        },
+        "partition": {
+            "inventory_fingerprint_sha256_hex": metrics.get("partition_inventory_fingerprint_sha256_hex"),
+            "recompute_months": metrics.get("partition_recompute_months"),
+            "snapshot_dir_effective": metrics.get("partition_snapshot_dir_effective"),
+            "inventory_baseline_path": metrics.get("partition_inventory_baseline_path"),
+        },
+        "timings_sec": {
+            "prepare_training_frame": metrics.get("prepare_training_frame_seconds"),
+            "build_training_dataset": metrics.get("build_training_dataset_seconds"),
+            "step4": metrics.get("step4_seconds"),
+            "step5": metrics.get("step5_seconds"),
+            "run_training_total": metrics.get("run_training_total_seconds"),
+            "main_trainer_fe_materialize": metrics.get("main_trainer_fe_materialize_sec"),
+            "main_trainer_fe_enrich": metrics.get("main_trainer_fe_enrich_sec"),
+        },
+        "feast_auto_apply": metrics.get("feast_auto_apply"),
+        "artifacts": {
+            "model_path": _path_relative_to_repo(
+                str(metrics.get("model_path") or metrics.get("step5_model_path") or ""),
+                repo_root=repo_root,
+            ),
+            "training_metrics_path": _path_relative_to_repo(
+                str(metrics.get("training_metrics_path") or metrics.get("step5_training_metrics_path") or ""),
+                repo_root=repo_root,
+            ),
+            "step4_split_report": _path_relative_to_repo(str(metrics.get("step4_split_report") or ""), repo_root=repo_root),
+            "step4_splits_dir": _path_relative_to_repo(str(metrics.get("step4_splits_dir") or ""), repo_root=repo_root),
+            "main_trainer_training_parquet_for_step4": _path_relative_to_repo(
+                str(metrics.get("main_trainer_training_parquet_for_step4") or ""),
+                repo_root=repo_root,
+            ),
+        },
+        "session_dedup_hash_buckets_effective": metrics.get("session_dedup_hash_buckets_effective"),
+        "bet_dedup_hash_buckets_effective": metrics.get("bet_dedup_hash_buckets_effective"),
+    }
+
+
+def write_hightier_training_logs(parent_dir: Path, metrics: dict[str, Any], args: HighTierTrainArgs) -> None:
+    """Write ``run_summary.json``, ``metrics_detailed.json``, ``pipeline_debug.json`` under ``parent_dir``."""
+
+    pd = Path(parent_dir).resolve()
+    pd.mkdir(parents=True, exist_ok=True)
+    rs = build_run_summary(metrics, args)
+    md = build_metrics_detailed(metrics)
+    dbg = build_pipeline_debug(metrics)
+    (pd / RUN_SUMMARY_FILENAME).write_text(json.dumps(rs, indent=2, default=str), encoding="utf-8")
+    (pd / METRICS_DETAILED_FILENAME).write_text(json.dumps(md, indent=2, default=str), encoding="utf-8")
+    (pd / PIPELINE_DEBUG_FILENAME).write_text(json.dumps(dbg, indent=2, default=str), encoding="utf-8")
+    logger.info(
+        "[Step 7b] wrote %s, %s, %s under %s",
+        RUN_SUMMARY_FILENAME,
+        METRICS_DETAILED_FILENAME,
+        PIPELINE_DEBUG_FILENAME,
+        pd,
+    )
 
 
 def _git_short_head(repo_root: Path) -> str:
@@ -239,7 +480,7 @@ def _mlflow_initial_string_params(args: HighTierTrainArgs) -> dict[str, str]:
     """Scalar string params logged at run start (bounded; details live in ``run_report.json``)."""
 
     reg = args.feature_candidate_registry or default_registry_path()
-    return {
+    out = {
         "pipeline": "trainer_hightier",
         "run_profile": str(args.run_profile_name),
         "random_seed": str(int(args.random_seed)),
@@ -250,7 +491,12 @@ def _mlflow_initial_string_params(args: HighTierTrainArgs) -> dict[str, str]:
         "start_from_features": str(bool(args.start_from_features)),
         "feature_candidate_registry_path": str(Path(reg).resolve())[:500],
         "git_commit": _git_short_head(_repo_root()),
+        "filter_bets_by_adt_quantile": str(bool(args.filter_bets_by_adt_quantile)),
+        "objective_theo_train_quantile": str(float(args.objective.theo_train_quantile)),
     }
+    if args.patron_sampling_ratio is not None:
+        out["patron_sampling_ratio"] = str(float(args.patron_sampling_ratio))[:64]
+    return out
 
 
 def _mlflow_post_run_string_params(metrics: dict[str, Any]) -> dict[str, str]:
@@ -337,6 +583,11 @@ def _log_mlflow_whitelist_artifacts(args: HighTierTrainArgs, metrics: dict[str, 
         sp = Path(str(sr))
         if sp.is_file():
             log_artifact_safe(sp, artifact_path=prefix)
+    bundle_root = rp.parent
+    for fname in (RUN_SUMMARY_FILENAME, METRICS_DETAILED_FILENAME, PIPELINE_DEBUG_FILENAME):
+        aux = bundle_root / fname
+        if aux.is_file():
+            log_artifact_safe(aux, artifact_path=prefix)
 
 
 def _resolve_splits_dir(args: HighTierTrainArgs) -> Path:
@@ -976,6 +1227,7 @@ def run_training(args: HighTierTrainArgs) -> None:
                 rp = rp_parent / "run_report.json"
                 rp.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
                 logger.info("[Step 7] run_training skeleton finished (report %s)", rp.resolve())
+                write_hightier_training_logs(rp_parent, metrics, exec_args)
                 log_params_safe(_mlflow_post_run_string_params(metrics))
                 log_metrics_safe(_mlflow_scalar_metrics(metrics))
                 _log_mlflow_whitelist_artifacts(exec_args, metrics)
@@ -1098,6 +1350,18 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--patron-sampling-ratio",
+        type=float,
+        default=None,
+        dest="patron_sampling_ratio",
+        metavar="FRACTION",
+        help=(
+            "Optional explicit patron sampling ratio recorded in run_summary.json "
+            "(e.g. 0.01 vs 0.10). When omitted, ratio may be derived from "
+            "HighTierObjectiveConfig.theo_train_quantile when ADT bet filtering is enabled."
+        ),
+    )
+    p.add_argument(
         "--disable-feast-retrieval-cache",
         action="store_true",
         dest="disable_feast_retrieval_cache",
@@ -1214,6 +1478,7 @@ def _train_args_from_cli_namespace(ns: argparse.Namespace) -> HighTierTrainArgs:
             Path(ns.feature_candidate_registry).resolve() if ns.feature_candidate_registry else None
         ),
         run_profile_name=str(ns.run_profile),
+        patron_sampling_ratio=float(ns.patron_sampling_ratio) if ns.patron_sampling_ratio is not None else None,
     )
 
 
