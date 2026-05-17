@@ -36,12 +36,21 @@ class ActiveSnapshotManifest:
     raw: dict[str, Any]
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> ActiveSnapshotManifest:
-        slow = Path(str(d.get("slow_patron_parquet", ""))).resolve()
-        trial_raw = d.get("trial_bet_behavior_parquet")
-        trial = Path(str(trial_raw)).resolve() if trial_raw else None
-        al_raw = d.get("adt_allowlist_parquet")
-        allow = Path(str(al_raw)).resolve() if al_raw else None
+    def from_dict(cls, d: dict[str, Any], *, manifest_dir: Path | None = None) -> ActiveSnapshotManifest:
+        def _resolve_path(raw: Any) -> Path | None:
+            if raw is None:
+                return None
+            s = str(raw).strip()
+            if not s:
+                return None
+            p = Path(s)
+            if manifest_dir is not None and not p.is_absolute():
+                return (Path(manifest_dir).resolve() / p).resolve()
+            return p.expanduser().resolve()
+
+        slow = _resolve_path(d.get("slow_patron_parquet")) or Path("")
+        trial = _resolve_path(d.get("trial_bet_behavior_parquet"))
+        allow = _resolve_path(d.get("adt_allowlist_parquet"))
         ver = d.get("adt_allowlist_version")
         return cls(
             version=str(d.get("version", "")),
@@ -137,7 +146,7 @@ def read_active_manifest() -> ActiveSnapshotManifest | None:
     if not isinstance(d, dict):
         return None
     try:
-        return ActiveSnapshotManifest.from_dict(d)
+        return ActiveSnapshotManifest.from_dict(d, manifest_dir=p.parent)
     except Exception as exc:
         logger.warning("[feature_state] invalid manifest payload %s: %s", p, exc)
         return None

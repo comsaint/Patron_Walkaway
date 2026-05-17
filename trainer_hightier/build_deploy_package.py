@@ -1,0 +1,361 @@
+"""Build a portable ``trainer_hightier`` deploy folder (or .zip).
+
+Layout (under ``--output-dir``):
+
+- ``models/`` — ``model.pkl``, ``training_metrics.json``, ``model_version``, …
+- ``snapshots/active_manifest.json`` — paths rewritten to bundle-relative
+- ``snapshots/artifacts/*.parquet`` — copied snapshot layers (slow / trial / allowlist)
+- ``mapping/`` — canonical mapping Parquet
+- ``local_state/`` — empty dir for ``state.db`` / ``feature_state.db`` at runtime
+- ``bundle_info.json``, ``deploy_bundle_paths.json``, ``README_DEPLOY.md``, ``requirements.txt``
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import shutil
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from trainer_hightier.serving.adt_allowlist import sha256_file
+
+logger = logging.getLogger(__name__)
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    pr = argparse.ArgumentParser(description="Build trainer_hightier deploy bundle.")
+    pr.add_argument(
+        "--model-source",
+        type=Path,
+        required=True,
+        help="Directory containing model.pkl (Step 5 bundle dir).",
+    )
+    pr.add_argument(
+        "--snapshot-manifest-source",
+        type=Path,
+        required=True,
+        help="Path to active_manifest.json or its parent directory.",
+    )
+    pr.add_argument(
+        "--mapping-source",
+        type=Path,
+        required=True,
+        help="Canonical mapping Parquet file.",
+    )
+    pr.add_argument("--output-dir", type=Path, required=True)
+    pr.add_argument("--archive", action="store_true", help="Also write <output-dir-name>.zip beside output-dir.")
+    pr.add_argument(
+        "--strict",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail when required artifacts are missing (default: strict).",
+    )
+    return pr.parse_args(argv)
+
+
+def _resolve_manifest_path(snapshot_src: Path) -> Path:
+    p = Path(snapshot_src).expanduser().resolve()
+    if p.is_file():
+        if p.name != "active_manifest.json":
+            raise ValueError(f"Expected active_manifest.json; got {p.name!r}")
+        return p
+    if p.is_dir():
+        cand = p / "active_manifest.json"
+        if not cand.is_file():
+            raise FileNotFoundError(f"active_manifest.json not under {p}")
+        return cand.resolve()
+    raise FileNotFoundError(f"snapshot source not found: {snapshot_src}")
+
+
+def _load_manifest_dict(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid manifest JSON {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"manifest root must be object; got {type(raw)}")
+    return raw
+
+
+def _rel_posix(root: Path, target: Path) -> str:
+    rel = target.resolve().relative_to(root.resolve())
+    return rel.as_posix()
+
+
+def _copy_parquet_map(
+    src: Path,
+    *,
+    dest_artifacts_dir: Path,
+    manifest_parent: Path,
+) -> str:
+    dest = dest_artifacts_dir / src.name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    return _rel_posix(manifest_parent, dest)
+
+
+def _maybe_copy_layer(
+    key: str,
+    raw_path: Any,
+    *,
+    dest_artifacts_dir: Path,
+    manifest_parent: Path,
+    strict: bool,
+) -> tuple[str | None, Path | None]:
+    if raw_path is None or raw_path == "":
+        return None, None
+    src = Path(str(raw_path)).expanduser().resolve()
+    if not src.is_file():
+        if key == "trial_bet_behavior_parquet" and not strict:
+            logger.warning("[pack] trial parquet missing (non-strict): %s", src)
+            return None, None
+        if key in ("slow_patron_parquet", "adt_allowlist_parquet"):
+            raise FileNotFoundError(f"manifest key {key!r} points to missing file: {src}")
+        if strict:
+            raise FileNotFoundError(f"manifest key {key!r} points to missing file: {src}")
+        logger.warning("[pack] skip missing optional %s=%s", key, src)
+        return None, None
+    rel = _copy_parquet_map(src, dest_artifacts_dir=dest_artifacts_dir, manifest_parent=manifest_parent)
+    return rel, src
+
+
+def _verify_allowlist_training_hash_or_raise(
+    training_metrics: dict[str, Any],
+    allowlist_pack_path: Path | None,
+) -> None:
+    exp = training_metrics.get("adt_allowlist_sha256")
+    if not exp or not str(exp).strip():
+        return
+    if allowlist_pack_path is None or not allowlist_pack_path.is_file():
+        raise ValueError(
+            "training_metrics has adt_allowlist_sha256 but packaged allowlist path missing "
+            f"(expected usable file; training expects {str(exp).strip()[:16]}…)"
+        )
+    act = sha256_file(allowlist_pack_path)
+    e = str(exp).strip().lower()
+    a = act.strip().lower()
+    if e == a:
+        return
+    raise ValueError(
+        f"adt_allowlist SHA256 mismatch: training_metrics expects {e[:16]}… "
+        f"but packaged allowlist at {allowlist_pack_path} has {a[:16]}…"
+    )
+
+
+def _write_bundle_info(
+    path: Path,
+    *,
+    model_version: str,
+    manifest_version: str,
+    allowlist_sha: str | None,
+    build_time_iso: str,
+) -> None:
+    payload = {
+        "model_version": model_version,
+        "manifest_version": manifest_version,
+        "allowlist_sha256": allowlist_sha,
+        "build_time": build_time_iso,
+        "high_adt_only_default": True,
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _write_deploy_paths(
+    path: Path,
+    *,
+    mapping_name: str,
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "model_bundle_dir": "models",
+        "snapshot_manifest_dir": "snapshots",
+        "canonical_mapping_parquet": f"mapping/{mapping_name}",
+        "local_state_dir": "local_state",
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _write_readme(path: Path) -> None:
+    body = """# trainer_hightier deploy bundle
+
+## Layout
+
+- `models/` — `model.pkl`, `training_metrics.json`, `model_version`
+- `snapshots/active_manifest.json` — layer paths are relative to the `snapshots/` directory
+- `snapshots/artifacts/` — Parquet layers referenced by the manifest
+- `mapping/` — canonical mapping Parquet
+- `local_state/` — runtime SQLite (`state.db`, `feature_state.db`)
+
+## Prerequisites
+
+Python env must be able to import `trainer` and `trainer_hightier` (same repo revision
+as the build machine, or compatible install). From repo root::
+
+  pip install -r requirements.txt
+
+## Run (unified)
+
+From **repository root** (so `trainer` resolves)::
+
+  python -m trainer_hightier.deploy.main --bundle-dir /path/to/this/folder
+
+Or use individual services after `deploy.main` documents path defaults.
+
+## Rollback
+
+Keep the previous bundle directory. Stop processes, swap symlink or folder,
+restart from the previous `README_DEPLOY` / `bundle_info.json` pair; verify
+`/health` and scorer boot logs (model_version / manifest / allowlist).
+"""
+    path.write_text(body, encoding="utf-8")
+
+
+def _copy_requirements(dest: Path) -> None:
+    src = _REPO_ROOT / "requirements.txt"
+    if src.is_file():
+        shutil.copy2(src, dest)
+    else:
+        dest.write_text(
+            "# Fallback: pip install from repo pyproject / trainer deps\npandas\npyarrow\nnumpy\nflask\n",
+            encoding="utf-8",
+        )
+
+
+def _ensure_model_bundle(model_src: Path, models_dest: Path, *, strict: bool) -> str:
+    if not model_src.is_dir():
+        raise NotADirectoryError(f"model source must be directory: {model_src}")
+    pkl = model_src / "model.pkl"
+    if not pkl.is_file():
+        raise FileNotFoundError(f"model.pkl missing under {model_src}")
+    models_dest.mkdir(parents=True, exist_ok=True)
+    for child in model_src.iterdir():
+        if child.is_file():
+            shutil.copy2(child, models_dest / child.name)
+    ver_path = models_dest / "model_version"
+    if not strict and not ver_path.is_file():
+        return "unknown"
+    if ver_path.is_file():
+        return ver_path.read_text(encoding="utf-8").strip() or "unknown"
+    return "unknown"
+
+
+def _read_training_metrics(models_dest: Path) -> dict[str, Any]:
+    p = models_dest / "training_metrics.json"
+    if not p.is_file():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+
+
+def build_deploy_package(argv: list[str] | None = None) -> Path:
+    """Build deploy tree at ``--output-dir``; return resolved output path."""
+    args = _parse_args(argv)
+    root = Path(args.output_dir).expanduser().resolve()
+    strict = bool(args.strict)
+    model_src = Path(args.model_source).expanduser().resolve()
+    map_src = Path(args.mapping_source).expanduser().resolve()
+    if not map_src.is_file():
+        raise FileNotFoundError(f"mapping parquet missing: {map_src}")
+
+    manifest_path = _resolve_manifest_path(Path(args.snapshot_manifest_source))
+    man = _load_manifest_dict(manifest_path)
+
+    if root.exists() and any(root.iterdir()):
+        raise FileExistsError(f"output dir must be empty or absent: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    models_dir = root / "models"
+    snap_dir = root / "snapshots"
+    art_dir = snap_dir / "artifacts"
+    map_dir = root / "mapping"
+    local_dir = root / "local_state"
+    for d in (art_dir, map_dir, local_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    mver = _ensure_model_bundle(model_src, models_dir, strict=strict)
+    metrics = _read_training_metrics(models_dir)
+
+    allow_pack_path: Path | None = None
+    new_man = dict(man)
+    for key in ("slow_patron_parquet", "trial_bet_behavior_parquet", "adt_allowlist_parquet"):
+        rel, _src = _maybe_copy_layer(
+            key,
+            man.get(key),
+            dest_artifacts_dir=art_dir,
+            manifest_parent=snap_dir,
+            strict=strict,
+        )
+        if rel is not None:
+            new_man[key] = rel
+        elif man.get(key):
+            new_man.pop(key, None)
+
+    slow_rel = new_man.get("slow_patron_parquet")
+    if strict and (not slow_rel or not (snap_dir / slow_rel).is_file()):
+        raise FileNotFoundError(
+            f"strict pack requires slow_patron_parquet present in bundle; got {slow_rel!r}"
+        )
+    if strict and not new_man.get("adt_allowlist_parquet"):
+        raise ValueError(
+            "strict pack requires manifest adt_allowlist_parquet (high_adt_only deploy); "
+            f"manifest keys={sorted(new_man.keys())}"
+        )
+    al_rel = new_man.get("adt_allowlist_parquet")
+    if isinstance(al_rel, str) and al_rel:
+        allow_pack_path = (snap_dir / al_rel).resolve()
+
+    map_name = map_src.name
+    shutil.copy2(map_src, map_dir / map_name)
+
+    out_manifest = snap_dir / "active_manifest.json"
+    out_manifest.write_text(json.dumps(new_man, indent=2), encoding="utf-8")
+
+    allow_sha = sha256_file(allow_pack_path) if allow_pack_path and allow_pack_path.is_file() else None
+    _verify_allowlist_training_hash_or_raise(metrics, allow_pack_path)
+
+    man_version = str(new_man.get("version", "") or man.get("version", "") or "unknown")
+    _write_bundle_info(
+        root / "bundle_info.json",
+        model_version=mver,
+        manifest_version=man_version,
+        allowlist_sha=allow_sha,
+        build_time_iso=datetime.now(timezone.utc).isoformat(),
+    )
+    _write_deploy_paths(root / "deploy_bundle_paths.json", mapping_name=map_name)
+    _write_readme(root / "README_DEPLOY.md")
+    _copy_requirements(root / "requirements.txt")
+
+    logger.info("[pack] wrote bundle %s", root)
+    if args.archive:
+        zip_path = root.parent / f"{root.name}.zip"
+        if zip_path.exists():
+            zip_path.unlink()
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in root.rglob("*"):
+                if f.is_file():
+                    arc = f.relative_to(root).as_posix()
+                    zf.write(f, arcname=arc)
+        logger.info("[pack] archive %s", zip_path)
+    return root
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try:
+        build_deploy_package(argv)
+    except Exception as exc:
+        logger.error("[pack] failed: %s", exc)
+        raise SystemExit(1) from exc
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -48,6 +48,16 @@
 | **排程契約（建議）** | **Snapshot updater**：缺檔、I/O、材化失敗 → **exit 非 0**，先修資料或路徑再重跑（不宜無限重試）。**Scorer**：ClickHouse 短暫錯誤可依 poll interval 重試；allowlist ／ manifest **結構性缺失**應 **fail-fast**（由程式抛錯退出）。 |
 | **回滾** | 自備份還原整份 `active_manifest.json` 及其指向的 `slow_patron_*.parquet` 與 `adt_allowed_players_*.parquet`（路徑須仍存在）；重啟 scorer。若僅要回到上一版名單，還原**整份** manifest + 兩個 parquet 指標檔，避免 slow 與 allowlist 版本錯配。 |
 
+### 打包搬機（`build_deploy_package`）
+
+| 項目 | 說明 |
+|------|------|
+| **建包** | 在儲存庫根執行：`python -m trainer_hightier.build_deploy_package --model-source <Step5 bundle 目錄> --snapshot-manifest-source <active_manifest.json 或其父目錄> --mapping-source <canonical_mapping.parquet> --output-dir <空資料夾> [--archive] [--strict/--no-strict]`。預設 **`--strict`**：缺 slow / allowlist / `model.pkl` / mapping 等即失敗。若 `training_metrics.json` 含 **`adt_allowlist_sha256`**，建置時**一律**比對打包後 allowlist 檔 SHA，不符即失敗。 |
+| **交付目錄** | `models/`、`snapshots/active_manifest.json`（內 Parquet 路徑相對 **`snapshots/`** 目錄）、`snapshots/artifacts/*.parquet`、`mapping/`、`local_state/`（空）、`bundle_info.json`、`deploy_bundle_paths.json`、`README_DEPLOY.md`、`requirements.txt`；`--archive` 另產 `<output-dir 名稱>.zip` 於其上一層。 |
+| **目標機啟動** | 執行環境須能 `import trainer` 與 `trainer_hightier`（建議自本儲存庫根安裝或設定 `PYTHONPATH`）。統一入口：`python -m trainer_hightier.deploy.main --bundle-dir <交付根目錄> --mode <all|api|scorer|validator> [--host … --port …]`；`mode=all` 為 API + validator 背景執行緒 + scorer 前景迴圈。 |
+| **驗收** | `GET /health`（須有 `local_state/state.db`，或由服務首次觸發建檔）；檢查 `deploy` 啟動 log 與 `bundle_info.json` 之版本／allowlist 摘要；正式環境勿關閉 `high_adt_only` 的除錯旗標。 |
+| **搬機回滾** | 保留上一版 bundle 目錄或 zip；停服後換回舊目錄並以相同命令啟動；確認 `bundle_info.json` 與 scorer 啟動 log 中 manifest／allowlist 資訊與預期一致。 |
+
 
 - **`python -m trainer_hightier.trainer` 的 Step 5** 會讀 `trainer_hightier/contracts/feature_candidate_registry.yaml`（或 `--feature-candidate-registry`），以台帳中 **可選 baseline** 欄位（`status` 為 `active|experimental` 且 `enabled_for` 含 `baseline`）作為 `feature_columns`。
 - **單一真相**：baseline / candidate / ablation 選欄皆以 [`feature_candidate_registry.yaml`](trainer_hightier/contracts/feature_candidate_registry.yaml) 為準；baseline 列为 YAML 順序下 `enabled_for` 含 **`baseline`** 且 `status` 為 `active` 或 `experimental` 的列（**不可**對 `fe__*` 使用 baseline 槽）。主線 Step 5 與實驗皆由 `candidate_registry_loader` 載入。

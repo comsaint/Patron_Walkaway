@@ -406,10 +406,24 @@ class HightierServingConfig:
 
 
 _DEFAULT_HIGHTIER_SERVING: HightierServingConfig = HightierServingConfig()
+# Optional one-shot override for portable deploy bundles (set before importing ``serving.runtime_config``).
+_DEPLOY_SERVING_OVERRIDE: HightierServingConfig | None = None
+
+
+def set_hightier_serving_deploy_override(cfg: HightierServingConfig | None) -> None:
+    """Replace serving defaults for this process (deploy bundle).
+
+    Must be called **before** the first import of :mod:`trainer_hightier.serving.runtime_config`
+    so module-level path snapshots match the bundle layout. Pass ``None`` to clear.
+    """
+    global _DEPLOY_SERVING_OVERRIDE
+    _DEPLOY_SERVING_OVERRIDE = cfg
 
 
 def default_hightier_serving_config() -> HightierServingConfig:
     """Return the frozen default serving config (single-process SSOT)."""
+    if _DEPLOY_SERVING_OVERRIDE is not None:
+        return _DEPLOY_SERVING_OVERRIDE
     return _DEFAULT_HIGHTIER_SERVING
 
 
