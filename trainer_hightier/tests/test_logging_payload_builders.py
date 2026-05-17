@@ -86,6 +86,48 @@ def test_build_run_summary_derives_patron_ratio_from_adt_quantile(tmp_path) -> N
     assert rs["optimization"]["enabled"] is False
 
 
+def test_build_run_summary_includes_split_periods(tmp_path) -> None:
+    """``step4_split_periods`` from metrics appears in run_summary and metrics_detailed."""
+
+    args = HighTierTrainArgs(
+        output_dir=tmp_path,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        step5=Step5TrainConfig(run_step5=False),
+    )
+    periods = {
+        "basis": "gaming_day",
+        "train_day_fraction": 0.7,
+        "val_day_fraction": 0.15,
+        "distinct_gaming_days": 100,
+        "by_split": {
+            "train": {"min_gaming_day": "2024-01-01", "max_gaming_day": "2024-08-01", "row_count": 1000},
+            "val": {"min_gaming_day": "2024-08-02", "max_gaming_day": "2024-09-01", "row_count": 200},
+            "test": {"min_gaming_day": "2024-09-02", "max_gaming_day": "2024-10-01", "row_count": 150},
+        },
+    }
+    metrics = {
+        "model_version": "mv-sp",
+        "step4_split_periods": periods,
+        "step5_optuna_skipped": True,
+        "step5_threshold": 0.5,
+        "optuna_max_time_sec_configured": 1.0,
+        "optuna_max_trials_configured": None,
+        "optuna_wall_time_sec_actual": None,
+        "optuna_trials_completed": 0,
+        "optuna_trials_total": 0,
+        "optuna_stopping_reason": "optuna_skipped",
+        "optuna_best_value": None,
+        "val_ap": 0.5,
+        "val_precision": 0.6,
+        "test_ap": 0.49,
+        "test_precision": 0.59,
+    }
+    rs = build_run_summary(metrics, args)
+    assert rs["split_periods"] == periods
+    md = build_metrics_detailed(metrics)
+    assert md["split_periods"] == periods
+
+
 def test_build_metrics_detailed_and_pipeline_debug_smoke() -> None:
     """Smoke nested payloads from flat Step 5 metrics."""
 
@@ -104,10 +146,13 @@ def test_build_metrics_detailed_and_pipeline_debug_smoke() -> None:
         "step5_seconds": 10.0,
         "run_training_total_seconds": 100.0,
         "model_path": "out/models_high_tier_mvp/run/model.pkl",
+        "step4_split_periods": {"basis": "gaming_day", "by_split": {"train": {"min_gaming_day": "2024-01-01"}}},
     }
     md = build_metrics_detailed(metrics)
     assert md["split_metrics"]["train"]["ap"] == 0.55
     assert md["feature_columns"] == ["x"]
+    assert md["split_periods"]["basis"] == "gaming_day"
     dbg = build_pipeline_debug(metrics)
     assert dbg["cache"]["session_clean_cache_hit"] is True
+    assert dbg["split_periods"]["basis"] == "gaming_day"
     assert dbg["timings_sec"]["prepare_training_frame"] == 1.0

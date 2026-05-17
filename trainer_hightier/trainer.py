@@ -273,6 +273,35 @@ def _path_relative_to_repo(path_str: str | None, *, repo_root: Path) -> str | No
         return raw.replace("\\", "/")
 
 
+def _step4_gaming_day_periods_from_report(report: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract train/val/test ``gaming_day`` date ranges from Step 4 report (``split_report.json`` body)."""
+
+    splits = report.get("splits")
+    if not isinstance(splits, list):
+        return None
+    by_split: dict[str, dict[str, Any]] = {}
+    for row in splits:
+        if not isinstance(row, dict):
+            continue
+        tag = str(row.get("split") or "").strip().lower()
+        if tag not in ("train", "val", "test"):
+            continue
+        by_split[tag] = {
+            "min_gaming_day": row.get("min_gaming_day"),
+            "max_gaming_day": row.get("max_gaming_day"),
+            "row_count": row.get("row_count"),
+        }
+    if not by_split:
+        return None
+    return {
+        "basis": "gaming_day",
+        "train_day_fraction": report.get("train_day_fraction"),
+        "val_day_fraction": report.get("val_day_fraction"),
+        "distinct_gaming_days": report.get("distinct_gaming_days"),
+        "by_split": by_split,
+    }
+
+
 def build_run_summary(metrics: dict[str, Any], args: HighTierTrainArgs) -> dict[str, Any]:
     """Build compact ``run_summary.json`` payload (cross-run comparison)."""
 
@@ -347,6 +376,7 @@ def build_run_summary(metrics: dict[str, Any], args: HighTierTrainArgs) -> dict[
         },
         "git_commit_short": _git_short_head(repo_root),
         "run_profile": str(args.run_profile_name),
+        "split_periods": metrics.get("step4_split_periods"),
     }
     if patron_ratio is None and patron_src == "unknown":
         logger.warning(
@@ -382,6 +412,7 @@ def build_metrics_detailed(metrics: dict[str, Any]) -> dict[str, Any]:
         },
         "feature_columns": metrics.get("step5_feature_columns"),
         "candidate_registry": metrics.get("candidate_registry"),
+        "split_periods": metrics.get("step4_split_periods"),
     }
 
 
@@ -414,6 +445,7 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
             "main_trainer_fe_enrich": metrics.get("main_trainer_fe_enrich_sec"),
         },
         "feast_auto_apply": metrics.get("feast_auto_apply"),
+        "split_periods": metrics.get("step4_split_periods"),
         "artifacts": {
             "model_path": _path_relative_to_repo(
                 str(metrics.get("model_path") or metrics.get("step5_model_path") or ""),
@@ -1059,6 +1091,9 @@ def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None)
         metrics["step4_seconds"] = elapsed
         metrics["step4_split_report"] = str(res.split_report_json.resolve())
         metrics["step4_splits_dir"] = str(res.splits_dir.resolve())
+        periods = _step4_gaming_day_periods_from_report(res.report)
+        if periods is not None:
+            metrics["step4_split_periods"] = periods
     logger.info("[Step 4] splits written %s (%.3fs)", res.splits_dir.resolve(), elapsed)
 
 
