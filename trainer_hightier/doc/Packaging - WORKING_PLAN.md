@@ -22,12 +22,19 @@
 ## CLI 速查
 
 ```bash
+# Frozen 預設：僅指定 model（需預設路徑上已有 active_manifest、canonical_mapping）
 python -m trainer_hightier.build_deploy_package \
-  --model-source <bundle_dir> \
-  --snapshot-manifest-source <active_manifest.json 或目錄> \
-  --mapping-source <canonical_mapping.parquet> \
-  --output-dir <空目錄> \
+  --model-version <YYYYMMDD-HHMMSS-<git7>> \
   [--archive] [--strict/--no-strict]
+
+# 完整覆寫路徑
+python -m trainer_hightier.build_deploy_package \
+  [--model-source <bundle_dir> | --model-version <id>] \
+  [--snapshot-manifest-source <active_manifest.json 或目錄>] \
+  [--mapping-source <canonical_mapping.parquet>] \
+  [--output-dir <空目錄>] \
+  [--archive] [--strict/--no-strict]
+# --output-dir 省略時：`out/deploy_hightier/<model_version>/`
 
 python -m trainer_hightier.deploy.main --bundle-dir <交付根> [--mode all|api|scorer|validator]
 ```

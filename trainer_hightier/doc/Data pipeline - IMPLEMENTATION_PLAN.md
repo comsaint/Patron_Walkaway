@@ -28,6 +28,7 @@
 - 訓練資料保留：最近 10 版。
 - Step 3 輸出契約補齊：在最終 training set 匯出時附帶 `canonical_id`、`gaming_day` 作為 Step 4 split keys（不改 Feast retrieval cache 邏輯）。
 - Step 4 新增為訓練前整理層：欄位裁切、明確 dtype cast、時間切分與 split 報表。
+- Step 5 最終模型策略：Optuna/驗證集選參完成後，預設以 `train+val` refit 產出部署模型；`test` 僅作最終 holdout 驗證，不參與訓練。
 - `trainer.py` 新增 `--start-from-features` 流程旗標：可跳過 Step 1-3，直接以既有 training parquet 啟動 Step 4。
 - 執行模式：snapshot-based 實驗批次（ad-hoc 下載節奏）。
 - 報表：每次 run 產出 run report。
@@ -132,6 +133,7 @@ flowchart LR
 - 以 DVC 管理 stage 邊界（ingest / clean_session / clean_bet / features / training_set / dataset_publish）。
 - 每次 run 產出 run report（耗時、cache hit ratio、重算分區、輸出列數、失敗/警告摘要）。
 - 導入最小治理規則：可續跑條件、失敗恢復語義、artifact retention。
+- Step 5 報表需明確記錄 refit 策略（是否 `train+val` refit、refit 使用樣本數），確保部署模型可審計。
 
 ### Phase 6: MLflow 訓練可觀測性整合（Training Result Logging）
 

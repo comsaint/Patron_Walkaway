@@ -7,6 +7,7 @@
 | 項目 | 預設 / 慣例 |
 |------|-------------|
 | **L0 來源（`python -m trainer_hightier.trainer`）** | **僅** partition snapshot：目錄內（**遞迴**）所有符合檔名的 `t_session__part_YYYYMM.parquet`、`t_bet__part_YYYYMM.parquet`。不再讀取 `<repo>/data/gmwds_t_session.parquet` 或 `gmwds_t_bet.parquet` 單檔。 |
+| Frozen deploy 輸出根 | **`<repo>/out/deploy_hightier`**（`trainer_hightier.config.DEFAULT_DEPLOY_OUTPUT_ROOT`）；未指定 `--output-dir` 時，建包目錄為 **`out/deploy_hightier/<model_version>/`**（`model_version` 來自 bundle 內同名檔）。 |
 | Snapshot 根目錄 | 預設 **`<repo>/data/partitions`**（須為已存在目錄）。可改 **`--partition-snapshot-dir <dir>`**（同樣須已存在）。子目錄內的 shard 會一併掃到（例如 `data/partitions/20260512/t_session__part_202501.parquet`）。 |
 | 清洗輸出 | `trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_session.parquet`（檔名沿用歷史慣例；內容來自**合併後**的 session shards） |
 | Bet base（ADT 路徑） | `trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet_base.parquet`（全玩家；segment 前） |
@@ -52,7 +53,12 @@
 
 | 項目 | 說明 |
 |------|------|
-| **建包** | 在儲存庫根執行：`python -m trainer_hightier.build_deploy_package --model-source <Step5 bundle 目錄> --snapshot-manifest-source <active_manifest.json 或其父目錄> --mapping-source <canonical_mapping.parquet> --output-dir <空資料夾> [--archive] [--strict/--no-strict]`。預設 **`--strict`**：缺 slow / allowlist / `model.pkl` / mapping 等即失敗。若 `training_metrics.json` 含 **`adt_allowlist_sha256`**，建置時**一律**比對打包後 allowlist 檔 SHA，不符即失敗。 |
+| **Frozen 語意（預設）** | 建包將 **封存** snapshot（slow patron、ADT allowlist）與 canonical mapping，與訓練所選 model bundle 對齊；不依賴之後異動的全域 `active_manifest`。`trial_bet_behavior_parquet`：manifest **未宣告**則不要求；manifest **宣告**且在 **`--strict`**（預設）下來源檔須存在。 |
+| **最短命令（建議）** | 在 repo 根執行：`python -m trainer_hightier.build_deploy_package --model-version <YYYYMMDD-HHMMSS-<git7>> [--archive]`。未給 `--output-dir` 時輸出到 **`out/deploy_hightier/<model_version>/`**。 |
+| **預設路徑** | 省略 `--snapshot-manifest-source` → `default_hightier_serving_config().snapshot_manifest_dir`（通常是 `trainer_hightier/artifacts/serving_snapshots`，須先有 `active_manifest.json`）；省略 `--mapping-source` → `default_canonical_mapping_parquet_path()`。省略三者僅 **`--model-version`**／**`--model-source`**／未指定時用 **`resolve_model_bundle_dir(DEFAULT_MODEL_DIR)`（latest manifest）**。 |
+| **建包（完整 CLI）** | `python -m trainer_hightier.build_deploy_package [--model-source … \| --model-version …] [--snapshot-manifest-source …] [--mapping-source …] [--output-dir …] [--archive] [--strict/--no-strict]`。**`--model-source` 與 `--model-version` 互斥**；優先順序：**顯式 `--model-source` > `--model-version` > latest**。預設 **`--strict`**：缺 slow / allowlist / `model.pkl` / mapping 即失敗。若 `training_metrics.json` 含 **`adt_allowlist_sha256`**，建置時**一律**比對打包後 allowlist 檔 SHA，不符即失敗。 |
+| **體積基準（約）** | 僅必要的 slow + allowlist + mapping + `model.pkl` 約數十 MB／版；若在 manifest 附上 `trial_bet_behavior` 層 parquet 會再增一檔個位數～數十 MB 級（視資料量）。磁碟請預留重複版本的空間。 |
+| **可追溯** | `bundle_info.json` 含 `frozen_fingerprint_sha256`（model_version + manifest_version + slow/allowlist/mapping SHA，不含 build_time）；同輸入重跑應維持相同 fingerprint。 |
 | **交付目錄** | `models/`、`snapshots/active_manifest.json`（內 Parquet 路徑相對 **`snapshots/`** 目錄）、`snapshots/artifacts/*.parquet`、`mapping/`、`local_state/`（空）、`bundle_info.json`、`deploy_bundle_paths.json`、`README_DEPLOY.md`、`requirements.txt`；`--archive` 另產 `<output-dir 名稱>.zip` 於其上一層。 |
 | **目標機啟動** | 執行環境須能 `import trainer` 與 `trainer_hightier`（建議自本儲存庫根安裝或設定 `PYTHONPATH`）。統一入口：`python -m trainer_hightier.deploy.main --bundle-dir <交付根目錄> --mode <all|api|scorer|validator> [--host … --port …]`；`mode=all` 為 API + validator 背景執行緒 + scorer 前景迴圈。 |
 | **驗收** | `GET /health`（須有 `local_state/state.db`，或由服務首次觸發建檔）；檢查 `deploy` 啟動 log 與 `bundle_info.json` 之版本／allowlist 摘要；正式環境勿關閉 `high_adt_only` 的除錯旗標。 |

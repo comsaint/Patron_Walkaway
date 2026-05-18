@@ -1,6 +1,6 @@
 """Build a portable ``trainer_hightier`` deploy folder (or .zip).
 
-Layout (under ``--output-dir``):
+Layout (resolved ``--output-dir``, default ``trainer_hightier.config.DEFAULT_DEPLOY_OUTPUT_ROOT`` / bundle ``model_version``):
 
 - ``models/`` — ``model.pkl``, ``training_metrics.json``, ``model_version``, …
 - ``snapshots/active_manifest.json`` — paths rewritten to bundle-relative
@@ -21,7 +21,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import hashlib
+
+from trainer.core.model_bundle_paths import resolve_model_bundle_dir
+
+from trainer_hightier import config as th_config
+from trainer_hightier.config import default_hightier_serving_config
 from trainer_hightier.serving.adt_allowlist import sha256_file
+from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 
 logger = logging.getLogger(__name__)
 
@@ -29,26 +36,47 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    pr = argparse.ArgumentParser(description="Build trainer_hightier deploy bundle.")
-    pr.add_argument(
+    pr = argparse.ArgumentParser(
+        description="Build trainer_hightier deploy bundle (Frozen artifact mode by default)."
+    )
+    mx = pr.add_mutually_exclusive_group(required=False)
+    mx.add_argument(
         "--model-source",
         type=Path,
-        required=True,
-        help="Directory containing model.pkl (Step 5 bundle dir).",
+        default=None,
+        help="Directory containing model.pkl (Step 5 bundle dir). Overrides --model-version.",
+    )
+    mx.add_argument(
+        "--model-version",
+        type=str,
+        default=None,
+        help="Single-segment bundle id under DEFAULT_MODEL_DIR (mutually exclusive with --model-source).",
     )
     pr.add_argument(
         "--snapshot-manifest-source",
         type=Path,
-        required=True,
-        help="Path to active_manifest.json or its parent directory.",
+        default=None,
+        help=(
+            "Path to active_manifest.json or its parent directory. "
+            "Default: default_hightier_serving_config().snapshot_manifest_dir."
+        ),
     )
     pr.add_argument(
         "--mapping-source",
         type=Path,
-        required=True,
-        help="Canonical mapping Parquet file.",
+        default=None,
+        help="Canonical mapping Parquet file. Default: default_canonical_mapping_parquet_path().",
     )
-    pr.add_argument("--output-dir", type=Path, required=True)
+    pr.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Deploy bundle output directory (must be absent or empty). "
+            "Default: trainer_hightier.config.DEFAULT_DEPLOY_OUTPUT_ROOT / <model_version> "
+            "(repo default: out/deploy_hightier/<run-id>/)."
+        ),
+    )
     pr.add_argument("--archive", action="store_true", help="Also write <output-dir-name>.zip beside output-dir.")
     pr.add_argument(
         "--strict",
@@ -57,6 +85,65 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Fail when required artifacts are missing (default: strict).",
     )
     return pr.parse_args(argv)
+
+
+def _resolved_model_bundle_dir(*, model_source: Path | None, model_version: str | None) -> Path:
+    """Resolve Step 5 bundle directory (--model-source > --model-version > latest manifest)."""
+
+    def _explicit_dir_errors(p: Path) -> None:
+        if not p.is_dir():
+            raise NotADirectoryError(f"model source must be directory: {p}")
+        if not (p / "model.pkl").is_file():
+            raise FileNotFoundError(f"No model.pkl under resolved bundle dir {p}")
+
+    if model_source is not None:
+        p = Path(model_source).expanduser().resolve()
+        _explicit_dir_errors(p)
+        return p
+    if model_version is not None:
+        mv = str(model_version).strip()
+        if not mv:
+            raise ValueError("--model-version must be non-empty when provided")
+        cand = resolve_model_bundle_dir(Path(th_config.DEFAULT_MODEL_DIR), model_version=mv)
+        _explicit_dir_errors(cand)
+        return cand
+    latest = resolve_model_bundle_dir(Path(th_config.DEFAULT_MODEL_DIR))
+    _explicit_dir_errors(latest)
+    return latest
+
+
+def _snapshot_manifest_origin(args: argparse.Namespace) -> Path:
+    if args.snapshot_manifest_source is not None:
+        return Path(args.snapshot_manifest_source).expanduser().resolve()
+    srv = Path(default_hightier_serving_config().snapshot_manifest_dir).expanduser().resolve()
+    if not srv.is_dir():
+        raise FileNotFoundError(
+            "default snapshot manifest dir missing (-directory); expected "
+            f"{srv} (--snapshot-manifest-source to override). Run snapshot updater or pass an explicit manifest path."
+        )
+    return srv
+
+
+def _canonical_mapping_origin(args: argparse.Namespace) -> Path:
+    if args.mapping_source is not None:
+        return Path(args.mapping_source).expanduser().resolve()
+    return Path(default_canonical_mapping_parquet_path()).expanduser().resolve()
+
+
+def _default_output_root_for_bundle(model_bundle: Path) -> Path:
+    vf = Path(model_bundle) / "model_version"
+    mv = vf.read_text(encoding="utf-8").strip() if vf.is_file() else ""
+    name = mv or Path(model_bundle).name.strip()
+    if not name:
+        raise ValueError(f"cannot derive default --output-dir: empty model bundle name ({model_bundle})")
+    root = Path(th_config.DEFAULT_DEPLOY_OUTPUT_ROOT) / name
+    return root.expanduser().resolve()
+
+
+def _resolve_output_dir(args: argparse.Namespace, *, model_bundle: Path) -> Path:
+    if args.output_dir is not None:
+        return Path(args.output_dir).expanduser().resolve()
+    return _default_output_root_for_bundle(model_bundle)
 
 
 def _resolve_manifest_path(snapshot_src: Path) -> Path:
@@ -148,18 +235,43 @@ def _verify_allowlist_training_hash_or_raise(
     )
 
 
+def _stable_fingerprint_payload(
+    *,
+    model_version: str,
+    manifest_version: str,
+    allowlist_sha: str | None,
+    slow_sha: str | None,
+    mapping_sha: str | None,
+) -> str:
+    stable = {
+        "model_version": model_version,
+        "manifest_version": manifest_version,
+        "adt_allowlist_sha256": allowlist_sha,
+        "slow_patron_sha256": slow_sha,
+        "canonical_mapping_sha256": mapping_sha,
+    }
+    blob = json.dumps(stable, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def _write_bundle_info(
     path: Path,
     *,
     model_version: str,
     manifest_version: str,
     allowlist_sha: str | None,
+    slow_patron_sha: str | None,
+    canonical_mapping_sha: str | None,
+    frozen_fingerprint_sha256: str,
     build_time_iso: str,
 ) -> None:
     payload = {
         "model_version": model_version,
         "manifest_version": manifest_version,
         "allowlist_sha256": allowlist_sha,
+        "slow_patron_sha256": slow_patron_sha,
+        "canonical_mapping_sha256": canonical_mapping_sha,
+        "frozen_fingerprint_sha256": frozen_fingerprint_sha256,
         "build_time": build_time_iso,
         "high_adt_only_default": True,
     }
@@ -257,17 +369,23 @@ def _read_training_metrics(models_dest: Path) -> dict[str, Any]:
 
 
 def build_deploy_package(argv: list[str] | None = None) -> Path:
-    """Build deploy tree at ``--output-dir``; return resolved output path."""
+    """Build deploy tree at resolved ``--output-dir`` (or default); return resolved output path."""
+
     args = _parse_args(argv)
-    root = Path(args.output_dir).expanduser().resolve()
     strict = bool(args.strict)
-    model_src = Path(args.model_source).expanduser().resolve()
-    map_src = Path(args.mapping_source).expanduser().resolve()
+    model_bundle = _resolved_model_bundle_dir(
+        model_source=args.model_source,
+        model_version=args.model_version,
+    )
+    map_src = _canonical_mapping_origin(args)
     if not map_src.is_file():
         raise FileNotFoundError(f"mapping parquet missing: {map_src}")
 
-    manifest_path = _resolve_manifest_path(Path(args.snapshot_manifest_source))
+    snap_origin = _snapshot_manifest_origin(args)
+    manifest_path = _resolve_manifest_path(snap_origin)
     man = _load_manifest_dict(manifest_path)
+
+    root = _resolve_output_dir(args, model_bundle=model_bundle)
 
     if root.exists() and any(root.iterdir()):
         raise FileExistsError(f"output dir must be empty or absent: {root}")
@@ -280,10 +398,11 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     for d in (art_dir, map_dir, local_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    mver = _ensure_model_bundle(model_src, models_dir, strict=strict)
+    mver = _ensure_model_bundle(model_bundle, models_dir, strict=strict)
     metrics = _read_training_metrics(models_dir)
 
     allow_pack_path: Path | None = None
+    slow_pack_path: Path | None = None
     new_man = dict(man)
     for key in ("slow_patron_parquet", "trial_bet_behavior_parquet", "adt_allowlist_parquet"):
         rel, _src = _maybe_copy_layer(
@@ -303,6 +422,15 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         raise FileNotFoundError(
             f"strict pack requires slow_patron_parquet present in bundle; got {slow_rel!r}"
         )
+    if isinstance(slow_rel, str) and slow_rel:
+        slow_pack_path = (snap_dir / slow_rel).resolve()
+
+    if strict and man.get("trial_bet_behavior_parquet") and not new_man.get("trial_bet_behavior_parquet"):
+        raise FileNotFoundError(
+            "strict pack requires copying trial_bet_behavior_parquet when declared in manifest; "
+            "source file missing or unreadable."
+        )
+
     if strict and not new_man.get("adt_allowlist_parquet"):
         raise ValueError(
             "strict pack requires manifest adt_allowlist_parquet (high_adt_only deploy); "
@@ -313,21 +441,35 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         allow_pack_path = (snap_dir / al_rel).resolve()
 
     map_name = map_src.name
-    shutil.copy2(map_src, map_dir / map_name)
+    map_dest_path = map_dir / map_name
+    shutil.copy2(map_src, map_dest_path)
 
     out_manifest = snap_dir / "active_manifest.json"
     out_manifest.write_text(json.dumps(new_man, indent=2), encoding="utf-8")
 
     allow_sha = sha256_file(allow_pack_path) if allow_pack_path and allow_pack_path.is_file() else None
+    slow_sha = sha256_file(slow_pack_path) if slow_pack_path and slow_pack_path.is_file() else None
+    map_sha = sha256_file(map_dest_path) if map_dest_path.is_file() else None
     _verify_allowlist_training_hash_or_raise(metrics, allow_pack_path)
 
     man_version = str(new_man.get("version", "") or man.get("version", "") or "unknown")
+    build_time_iso = datetime.now(timezone.utc).isoformat()
+    fingerprint = _stable_fingerprint_payload(
+        model_version=mver,
+        manifest_version=man_version,
+        allowlist_sha=allow_sha,
+        slow_sha=slow_sha,
+        mapping_sha=map_sha,
+    )
     _write_bundle_info(
         root / "bundle_info.json",
         model_version=mver,
         manifest_version=man_version,
         allowlist_sha=allow_sha,
-        build_time_iso=datetime.now(timezone.utc).isoformat(),
+        slow_patron_sha=slow_sha,
+        canonical_mapping_sha=map_sha,
+        frozen_fingerprint_sha256=fingerprint,
+        build_time_iso=build_time_iso,
     )
     _write_deploy_paths(root / "deploy_bundle_paths.json", mapping_name=map_name)
     _write_readme(root / "README_DEPLOY.md")

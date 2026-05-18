@@ -19,6 +19,8 @@ from typing import Final
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 # Versioned bundle root (parity with trainer ``DEFAULT_MODEL_DIR`` under ``out/``).
 DEFAULT_MODEL_DIR: Final[Path] = _REPO_ROOT / "out" / "models_high_tier_mvp"
+# Default root for Frozen deploy bundles emitted by ``build_deploy_package``.
+DEFAULT_DEPLOY_OUTPUT_ROOT: Final[Path] = _REPO_ROOT / "out" / "deploy_hightier"
 # Shared reproducibility seed (training, FQG subsampling, Optuna sampler).
 DEFAULT_RANDOM_SEED: Final[int] = 42
 # Step 3 Feast feature service wired by :mod:`trainer_hightier.trainer`.
@@ -198,7 +200,7 @@ class HighTierObjectiveConfig:
     # Quantile in (0, 1) on patron **ADT** (from ``canonical_patron_profile.csv``): bet preprocess keeps
     # only bets tied (via canonical mapping) to patrons at or above this ADT quantile (~top ``1 - q``).
     # Align naming with ``trainer.training.high_roller_segmentation`` when wiring segment thresholds.
-    theo_train_quantile: float = 0.90
+    theo_train_quantile: float = 0.99
     # Require precision >= this value on the **segment** when choosing a score threshold.
     min_precision: float = 0.60
     # Placeholder paths for later steps (Parquet / DuckDB exports).
@@ -317,7 +319,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60.0 * 60  # 1 hour = 60*60
+    optuna_timeout_sec: float = 60.0 * 30 * 1  # 1 hour = 60*60
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000
@@ -327,6 +329,8 @@ class Step5TrainConfig:
     baseline_subsample: float = 0.8
     baseline_colsample_bytree: float = 0.8
     baseline_reg_lambda: float = 0.0
+    #: When ``True``, final artifact model refits on train+val (test remains holdout-only).
+    refit_train_plus_val: bool = True
 
 
 @dataclass(frozen=True)

@@ -390,6 +390,29 @@ def _train_one_lgbm(
     return clf
 
 
+def _refit_final_lgbm_train_plus_val(
+    *,
+    base_model: lgb.LGBMClassifier,
+    best_hp: dict[str, Any],
+    X_tr: pd.DataFrame,
+    y_tr: np.ndarray,
+    X_va: pd.DataFrame,
+    y_va: np.ndarray,
+) -> tuple[lgb.LGBMClassifier, int | None]:
+    """Refit final model on train+val using best hyperparameters only."""
+
+    refit_hp = dict(best_hp)
+    best_iter_raw = getattr(base_model, "best_iteration_", None)
+    best_iter = int(best_iter_raw) if best_iter_raw is not None and int(best_iter_raw) > 0 else None
+    if best_iter is not None:
+        refit_hp["n_estimators"] = best_iter
+    X_refit = pd.concat([X_tr, X_va], axis=0, ignore_index=True)
+    y_refit = np.concatenate([y_tr, y_va], axis=0)
+    final_model = lgb.LGBMClassifier(**refit_hp)
+    final_model.fit(X_refit, y_refit)
+    return final_model, best_iter
+
+
 def train_lgbm_from_splits(
     *,
     splits_dir: Path,
@@ -559,9 +582,21 @@ def train_lgbm_from_splits(
             best_hp = _baseline_lgb_params(cfg, random_seed)
         model, val_pick, _ = _evaluate_hp(best_hp)
 
-    train_scores = model.predict_proba(X_tr)[:, 1]
-    val_scores = model.predict_proba(X_va)[:, 1]
-    test_scores = model.predict_proba(X_te)[:, 1]
+    final_model = model
+    refit_best_iteration: int | None = None
+    if bool(cfg.refit_train_plus_val):
+        final_model, refit_best_iteration = _refit_final_lgbm_train_plus_val(
+            base_model=model,
+            best_hp=best_hp,
+            X_tr=X_tr,
+            y_tr=y_tr,
+            X_va=X_va,
+            y_va=y_va,
+        )
+
+    train_scores = final_model.predict_proba(X_tr)[:, 1]
+    val_scores = final_model.predict_proba(X_va)[:, 1]
+    test_scores = final_model.predict_proba(X_te)[:, 1]
 
     if not val_pick.feasible:
         logger.warning(
@@ -588,6 +623,9 @@ def train_lgbm_from_splits(
         "step5_val_recall_at_pick": val_pick.recall,
         "step5_min_precision": float(objective_min_precision),
         "step5_optuna_skipped": bool(cfg.skip_optuna),
+        "step5_refit_train_plus_val": bool(cfg.refit_train_plus_val),
+        "step5_refit_rows": int(len(y_tr) + len(y_va)) if bool(cfg.refit_train_plus_val) else int(len(y_tr)),
+        "step5_refit_best_iteration": refit_best_iteration,
         **block_tr,
         **block_va,
         **block_te,
@@ -600,13 +638,15 @@ def train_lgbm_from_splits(
     with open(model_path, "wb") as f:
         pickle.dump(
             {
-                "model": model,
+                "model": final_model,
                 "feature_columns": list(feat_cols),
                 "categorical_columns": list(CAT_COLUMNS),
                 "category_categories": {c: union_cats[c].tolist() for c in cat_cols},
                 "threshold": thr,
                 "min_precision": float(objective_min_precision),
                 "val_pick_feasible": val_pick.feasible,
+                "refit_train_plus_val": bool(cfg.refit_train_plus_val),
+                "refit_best_iteration": refit_best_iteration,
             },
             f,
             protocol=pickle.HIGHEST_PROTOCOL,
@@ -619,12 +659,13 @@ def train_lgbm_from_splits(
     metrics_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
 
     logger.info(
-        "Step 5 trained LightGBM in %.3fs; threshold=%.6f feasible=%s val recall=%.4f prec=%.4f → %s",
+        "Step 5 trained LightGBM in %.3fs; threshold=%.6f feasible=%s val recall=%.4f prec=%.4f refit_train_plus_val=%s → %s",
         elapsed,
         thr,
         val_pick.feasible,
         val_pick.recall,
         val_pick.precision,
+        bool(cfg.refit_train_plus_val),
         model_path,
     )
 

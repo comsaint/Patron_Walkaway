@@ -245,3 +245,107 @@ def test_deploy_api_health_after_bundle_config(tmp_path: Path) -> None:
         set_hightier_serving_deploy_override(None)
         importlib.reload(rc)
         importlib.reload(api_mod)
+
+
+def test_strict_trial_declared_but_missing_raises(tmp_path: Path) -> None:
+    """Manifest declares trial_bet_behavior_parquet but source file absent -> strict fails."""
+
+    model_src = tmp_path / "model_in"
+    snap_src = tmp_path / "snap_in"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_parquet(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    missing_trial = (art / "nope.parquet").resolve()
+    man = {
+        "version": "mv",
+        "slow_patron_parquet": str(slow.resolve()),
+        "adt_allowlist_parquet": str(allow.resolve()),
+        "trial_bet_behavior_parquet": str(missing_trial),
+    }
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "maptrial.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "trialbad"
+    with pytest.raises(FileNotFoundError):
+        build_deploy_package(
+            [
+                "--model-source",
+                str(model_src),
+                "--snapshot-manifest-source",
+                str(snap_src),
+                "--mapping-source",
+                str(mapping),
+                "--output-dir",
+                str(out),
+            ]
+        )
+
+
+def test_model_version_defaults_and_fingerprint_repeatable(monkeypatch, tmp_path: Path) -> None:
+    """``--model-version`` with default snapshot/mapping/output roots (via monkeypatch)."""
+
+    from dataclasses import replace
+
+    import trainer_hightier.config as hcfg
+    from trainer_hightier.config import default_hightier_serving_config
+
+    vid = "test-run-mv-defaults"
+    versions_root = tmp_path / "models_mvp_root"
+    deploy_root = tmp_path / "deploy_root"
+    bundle_dir = versions_root / vid
+    bundle_dir.mkdir(parents=True)
+    _write_minimal_model_bundle(bundle_dir)
+    (bundle_dir / "model_version").write_text(vid + "\n", encoding="utf-8")
+    (bundle_dir / "training_metrics.json").write_text("{}", encoding="utf-8")
+
+    snap_dir = tmp_path / "serving_snapshots"
+    art = snap_dir / "staging"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_parquet(slow)
+    _write_parquet(allow)
+    man = {
+        "version": "mv-def",
+        "slow_patron_parquet": str(slow.resolve()),
+        "adt_allowlist_parquet": str(allow.resolve()),
+    }
+    (snap_dir / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+
+    map_pq = tmp_path / "artifacts" / "mapping" / "canonical_player_mapping.parquet"
+    map_pq.parent.mkdir(parents=True)
+    _write_parquet(map_pq)
+
+    monkeypatch.setattr(hcfg, "DEFAULT_MODEL_DIR", versions_root)
+    monkeypatch.setattr(hcfg, "DEFAULT_DEPLOY_OUTPUT_ROOT", deploy_root)
+
+    def _fake_serving_cfg():
+        return replace(default_hightier_serving_config(), snapshot_manifest_dir=snap_dir)
+
+    monkeypatch.setattr(
+        "trainer_hightier.build_deploy_package.default_hightier_serving_config",
+        _fake_serving_cfg,
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.build_deploy_package.default_canonical_mapping_parquet_path",
+        lambda: map_pq,
+    )
+
+    out1 = build_deploy_package(["--model-version", vid])
+    assert out1 == deploy_root / vid
+    bio1 = json.loads((out1 / "bundle_info.json").read_text(encoding="utf-8"))
+    fp1 = bio1.get("frozen_fingerprint_sha256")
+    assert isinstance(fp1, str) and len(fp1) == 64
+
+    out2_parent = deploy_root / f"{vid}-b2"
+    out2_parent.mkdir(parents=True)
+    out2 = out2_parent / "bundle2"
+    build_deploy_package(["--model-version", vid, "--output-dir", str(out2)])
+    bio2 = json.loads((out2 / "bundle_info.json").read_text(encoding="utf-8"))
+    assert bio2["frozen_fingerprint_sha256"] == fp1
+
