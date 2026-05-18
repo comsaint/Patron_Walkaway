@@ -263,3 +263,5 @@ parallel_lda_mvp/canonical_cache/
 *.db
 trainer_hightier/artifacts/**
 tmp/
+archive/*
+archive/trainer/**
