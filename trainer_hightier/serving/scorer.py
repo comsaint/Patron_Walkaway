@@ -14,12 +14,11 @@ import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
 
-from trainer.training.data_sources import assert_bets_gaming_day_contract
+from trainer_hightier.bet_contract import assert_bets_gaming_day_contract
 
 from trainer_hightier.config import HightierServingConfig, default_hightier_serving_config
 from trainer_hightier.serving.adt_allowlist import (
     check_training_allowlist_sha256,
-    filter_bets_by_adt_allowlist,
     load_adt_allowlist_ids,
     resolve_adt_allowlist_path,
     sha256_file,
@@ -41,6 +40,7 @@ from trainer_hightier.serving.feature_builder import (
 )
 from trainer_hightier.serving.feature_state_store import ActiveSnapshotManifest, read_active_manifest
 from trainer_hightier.serving.model_bundle import HightierModelBundle, load_hightier_model_bundle
+from trainer_hightier.serving.prediction_log import append_hightier_prediction_log, init_prediction_log_db
 from trainer_hightier.serving.runtime_config import HK_TZ
 from trainer_hightier.serving.state_db import (
     append_alerts,
@@ -131,15 +131,18 @@ def _effective_etl_cursor(bets: pd.DataFrame) -> pd.Series:
     return cur
 
 
-def fetch_bets_incremental(
+#: ``t_bet`` has no loyalty id; keep a nullable column for downstream schema / API parity.
+_TBET_CASINO_PLAYER_ID_SELECT = "CAST(NULL AS Nullable(String)) AS casino_player_id"
+
+
+def _incremental_params_and_etl_filter(
+    cfg: HightierServingConfig,
     last_etl: Optional[pd.Timestamp],
     *,
     lookback_hours: float,
     limit_rows: int,
-) -> pd.DataFrame:
-    """Fetch new settled bets ordered by arrival (__etl_insert_Dtm)."""
-    cfg = default_hightier_serving_config()
-    client = get_clickhouse_client()
+) -> tuple[dict[str, Any], str]:
+    """Shared ClickHouse parameter dict and ``last_etl`` SQL fragment for incremental paths."""
     now_hk = datetime.now(ZoneInfo(HK_TZ))
     end = now_hk
     bet_avail = end - timedelta(minutes=int(cfg.bet_avail_delay_min))
@@ -156,39 +159,35 @@ def fetch_bets_incremental(
         if le.tzinfo is None:
             le = le.tz_localize(UTC_TZ)
         params["last_etl"] = le.to_pydatetime()
-    cid_sql = cfg.casino_player_id_clean_sql
-    placeholder = int(cfg.placeholder_player_id)
-    q = f"""
-        SELECT
-            bet_id,
-            is_back_bet,
-            bet_type,
-            type_of_bet,
-            __etl_insert_Dtm,
-            payout_complete_dtm,
-            gaming_day,
-            session_id,
-            player_id,
-            table_id,
-            position_idx,
-            wager,
-            casino_win,
-            payout_odds,
-            status,
-            {cid_sql} AS casino_player_id
-        FROM {cfg.source_db}.{cfg.tbet} FINAL
-        WHERE payout_complete_dtm >= %(start)s
-          AND payout_complete_dtm <= %(bet_avail)s
-          AND payout_complete_dtm IS NOT NULL
-          AND gaming_day IS NOT NULL
-          AND wager > 0
-          AND player_id IS NOT NULL
-          AND player_id != {placeholder}
-          {etl_filter}
-        ORDER BY __etl_insert_Dtm ASC
-        LIMIT %(lim)s
-    """
-    bets = client.query_df(q, parameters=params)
+    return params, etl_filter
+
+
+def split_allowlist_player_id_chunks(ids: frozenset[int], chunk_size: int) -> list[list[int]]:
+    """Stable sorted chunks of ``player_id`` for bounded ``IN`` lists."""
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size!r}")
+    if not ids:
+        return []
+    sorted_ids = sorted(int(x) for x in ids)
+    return [sorted_ids[i : i + chunk_size] for i in range(0, len(sorted_ids), chunk_size)]
+
+
+def merge_incremental_chunk_frames(frames: list[pd.DataFrame], limit_rows: int) -> pd.DataFrame:
+    """Dedupe by ``bet_id``, globally sort by ETL cursor, take first ``limit_rows`` rows."""
+    nonempty = [f for f in frames if f is not None and not f.empty]
+    if not nonempty:
+        return pd.DataFrame()
+    merged = pd.concat(nonempty, ignore_index=True)
+    merged = merged.drop_duplicates(subset=["bet_id"], keep="first")
+    merged["_s_etl"] = pd.to_datetime(merged["__etl_insert_Dtm"], errors="coerce")
+    merged["_s_bid"] = pd.to_numeric(merged["bet_id"], errors="coerce").fillna(-1).astype("int64")
+    merged = merged.sort_values(by=["_s_etl", "_s_bid"], ascending=[True, True], na_position="last")
+    merged = merged.drop(columns=["_s_etl", "_s_bid"])
+    return merged.head(int(max(1, limit_rows))).reset_index(drop=True)
+
+
+def _postprocess_incremental_bets_timestamps(bets: pd.DataFrame) -> None:
+    """Normalize warehouse timestamps to HK (in-place)."""
     if not bets.empty and "payout_complete_dtm" in bets.columns:
         _pc = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce")
         if getattr(_pc.dt, "tz", None) is None:
@@ -199,6 +198,156 @@ def fetch_bets_incremental(
         if getattr(_etl.dt, "tz", None) is None:
             _etl = _etl.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
         bets["__etl_insert_Dtm"] = _etl.dt.tz_convert(ZoneInfo(HK_TZ))
+
+
+def fetch_bets_incremental_etl_probe(
+    last_etl: Optional[pd.Timestamp],
+    *,
+    lookback_hours: float,
+    limit_rows: int,
+) -> pd.DataFrame:
+    """Lightweight global top-``K`` probe (no ``player_id`` filter) for watermark parity with allowlist mode."""
+    cfg = default_hightier_serving_config()
+    client = get_clickhouse_client()
+    params, etl_filter = _incremental_params_and_etl_filter(
+        cfg, last_etl, lookback_hours=lookback_hours, limit_rows=limit_rows
+    )
+    placeholder = int(cfg.placeholder_player_id)
+    q = f"""
+        SELECT
+            bet_id,
+            __etl_insert_Dtm,
+            payout_complete_dtm
+        FROM {cfg.source_db}.{cfg.tbet} FINAL
+        WHERE payout_complete_dtm >= %(start)s
+          AND payout_complete_dtm <= %(bet_avail)s
+          AND payout_complete_dtm IS NOT NULL
+          AND gaming_day IS NOT NULL
+          AND wager > 0
+          AND player_id IS NOT NULL
+          AND player_id != {placeholder}
+          {etl_filter}
+        ORDER BY __etl_insert_Dtm ASC, bet_id ASC
+        LIMIT %(lim)s
+    """
+    probe = client.query_df(q, parameters=params)
+    _postprocess_incremental_bets_timestamps(probe)
+    return probe
+
+
+def fetch_bets_incremental(
+    last_etl: Optional[pd.Timestamp],
+    *,
+    lookback_hours: float,
+    limit_rows: int,
+    allowlist_player_ids: Optional[frozenset[int]] = None,
+) -> pd.DataFrame:
+    """Fetch new settled bets ordered by arrival (__etl_insert_Dtm).
+
+    When ``allowlist_player_ids`` is ``None``, use a single global query (debug / full population).
+    When it is empty, return an empty frame without hitting ClickHouse.
+    When non-empty, query per ``player_id`` chunk (short ``IN`` lists), merge, then take top ``limit_rows``.
+    """
+    cfg = default_hightier_serving_config()
+    if allowlist_player_ids is not None and not allowlist_player_ids:
+        return pd.DataFrame()
+
+    client = get_clickhouse_client()
+    params, etl_filter = _incremental_params_and_etl_filter(
+        cfg, last_etl, lookback_hours=lookback_hours, limit_rows=limit_rows
+    )
+    placeholder = int(cfg.placeholder_player_id)
+    lim = int(max(1, limit_rows))
+    cid_sel = _TBET_CASINO_PLAYER_ID_SELECT
+    cap = int(cfg.hightier_scorer_chunk_merge_row_cap)
+
+    if allowlist_player_ids is None:
+        q = f"""
+            SELECT
+                bet_id,
+                is_back_bet,
+                bet_type,
+                type_of_bet,
+                __etl_insert_Dtm,
+                payout_complete_dtm,
+                gaming_day,
+                session_id,
+                player_id,
+                table_id,
+                position_idx,
+                wager,
+                casino_win,
+                payout_odds,
+                status,
+                {cid_sel}
+            FROM {cfg.source_db}.{cfg.tbet} FINAL
+            WHERE payout_complete_dtm >= %(start)s
+              AND payout_complete_dtm <= %(bet_avail)s
+              AND payout_complete_dtm IS NOT NULL
+              AND gaming_day IS NOT NULL
+              AND wager > 0
+              AND player_id IS NOT NULL
+              AND player_id != {placeholder}
+              {etl_filter}
+            ORDER BY __etl_insert_Dtm ASC, bet_id ASC
+            LIMIT %(lim)s
+        """
+        bets = client.query_df(q, parameters=params)
+    else:
+        chunk_sz = int(cfg.hightier_scorer_player_id_chunk_size)
+        chunks = split_allowlist_player_id_chunks(allowlist_player_ids, chunk_sz)
+        frames: list[pd.DataFrame] = []
+        for i, chunk in enumerate(chunks):
+            in_list = ",".join(str(int(x)) for x in chunk)
+            q = f"""
+                SELECT
+                    bet_id,
+                    is_back_bet,
+                    bet_type,
+                    type_of_bet,
+                    __etl_insert_Dtm,
+                    payout_complete_dtm,
+                    gaming_day,
+                    session_id,
+                    player_id,
+                    table_id,
+                    position_idx,
+                    wager,
+                    casino_win,
+                    payout_odds,
+                    status,
+                    {cid_sel}
+                FROM {cfg.source_db}.{cfg.tbet} FINAL
+                WHERE payout_complete_dtm >= %(start)s
+                  AND payout_complete_dtm <= %(bet_avail)s
+                  AND payout_complete_dtm IS NOT NULL
+                  AND gaming_day IS NOT NULL
+                  AND wager > 0
+                  AND player_id IS NOT NULL
+                  AND player_id != {placeholder}
+                  AND player_id IN ({in_list})
+                  {etl_filter}
+                ORDER BY __etl_insert_Dtm ASC, bet_id ASC
+                LIMIT %(lim)s
+            """
+            frames.append(client.query_df(q, parameters=params))
+            if cap > 0:
+                total_so_far = sum(len(f) for f in frames)
+                if total_so_far > cap:
+                    raise RuntimeError(
+                        "incremental chunk merge exceeds hightier_scorer_chunk_merge_row_cap="
+                        f"{cap} ({total_so_far} rows after chunk {i + 1}/{len(chunks)})"
+                    )
+        bets = merge_incremental_chunk_frames(frames, lim)
+        logger.info(
+            "[hightier_scorer] fetch_bets_incremental allowlist_chunks=%d chunk_size=%d merged_rows=%d final_k=%d",
+            len(chunks),
+            chunk_sz,
+            len(bets),
+            lim,
+        )
+
+    _postprocess_incremental_bets_timestamps(bets)
     if not bets.empty:
         assert_bets_gaming_day_contract(bets, "hightier_fetch_bets_incremental")
     return bets
@@ -218,40 +367,62 @@ def fetch_bet_pool_window(
     bet_avail = datetime.now(ZoneInfo(HK_TZ)) - timedelta(minutes=int(cfg.bet_avail_delay_min))
     end = min(window_end, bet_avail)
     placeholder = int(cfg.placeholder_player_id)
-    cid_sql = cfg.casino_player_id_clean_sql
-    in_list = ",".join(str(int(x)) for x in sorted(set(player_ids)))
-    q = f"""
-        SELECT
-            bet_id,
-            is_back_bet,
-            bet_type,
-            type_of_bet,
-            __etl_insert_Dtm,
-            payout_complete_dtm,
-            gaming_day,
-            session_id,
-            player_id,
-            table_id,
-            position_idx,
-            wager,
-            casino_win,
-            payout_odds,
-            status,
-            {cid_sql} AS casino_player_id
-        FROM {cfg.source_db}.{cfg.tbet} FINAL
-        WHERE payout_complete_dtm >= %(ws)s
-          AND payout_complete_dtm <= %(we)s
-          AND payout_complete_dtm IS NOT NULL
-          AND gaming_day IS NOT NULL
-          AND wager > 0
-          AND player_id IS NOT NULL
-          AND player_id != {placeholder}
-          AND player_id IN ({in_list})
-        ORDER BY payout_complete_dtm ASC
-    """
-    bets = client.query_df(q, parameters={"ws": window_start, "we": end})
-    if bets.empty:
-        return bets
+    cid_sel = _TBET_CASINO_PLAYER_ID_SELECT
+    unique_ids = sorted({int(x) for x in player_ids})
+    chunk_sz = int(cfg.hightier_scorer_player_id_chunk_size)
+    cap = int(cfg.hightier_scorer_chunk_merge_row_cap)
+    frames: list[pd.DataFrame] = []
+    n_chunks = (len(unique_ids) + chunk_sz - 1) // chunk_sz if unique_ids else 0
+    for i in range(0, len(unique_ids), chunk_sz):
+        chunk = unique_ids[i : i + chunk_sz]
+        in_list = ",".join(str(x) for x in chunk)
+        q = f"""
+            SELECT
+                bet_id,
+                is_back_bet,
+                bet_type,
+                type_of_bet,
+                __etl_insert_Dtm,
+                payout_complete_dtm,
+                gaming_day,
+                session_id,
+                player_id,
+                table_id,
+                position_idx,
+                wager,
+                casino_win,
+                payout_odds,
+                status,
+                {cid_sel}
+            FROM {cfg.source_db}.{cfg.tbet} FINAL
+            WHERE payout_complete_dtm >= %(ws)s
+              AND payout_complete_dtm <= %(we)s
+              AND payout_complete_dtm IS NOT NULL
+              AND gaming_day IS NOT NULL
+              AND wager > 0
+              AND player_id IS NOT NULL
+              AND player_id != {placeholder}
+              AND player_id IN ({in_list})
+            ORDER BY payout_complete_dtm ASC, bet_id ASC
+        """
+        frames.append(client.query_df(q, parameters={"ws": window_start, "we": end}))
+        if cap > 0:
+            total_so_far = sum(len(f) for f in frames)
+            if total_so_far > cap:
+                raise RuntimeError(
+                    "pool chunk merge exceeds hightier_scorer_chunk_merge_row_cap="
+                    f"{cap} ({total_so_far} rows after chunk {i // chunk_sz + 1}/{n_chunks})"
+                )
+    nonempty = [f for f in frames if f is not None and not f.empty]
+    if not nonempty:
+        return pd.DataFrame()
+    bets = pd.concat(nonempty, ignore_index=True)
+    bets = bets.drop_duplicates(subset=["bet_id"], keep="first")
+    bets["_s_pc"] = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce")
+    bets["_s_bid"] = pd.to_numeric(bets["bet_id"], errors="coerce").fillna(-1).astype("int64")
+    bets = bets.sort_values(by=["_s_pc", "_s_bid"], ascending=[True, True], na_position="last")
+    bets = bets.drop(columns=["_s_pc", "_s_bid"]).reset_index(drop=True)
+
     _pc = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce")
     if getattr(_pc.dt, "tz", None) is None:
         _pc = _pc.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
@@ -260,6 +431,13 @@ def fetch_bet_pool_window(
     if getattr(_etl.dt, "tz", None) is None:
         _etl = _etl.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
     bets["__etl_insert_Dtm"] = _etl.dt.tz_convert(ZoneInfo(HK_TZ))
+    logger.info(
+        "[hightier_scorer] fetch_bet_pool_window chunks=%d chunk_size=%d unique_players=%d rows=%d",
+        n_chunks,
+        chunk_sz,
+        len(unique_ids),
+        len(bets),
+    )
     return bets
 
 
@@ -276,44 +454,66 @@ def score_once(
     cfg = default_hightier_serving_config()
     last = get_last_processed_etl_insert(conn)
     lookback = float(cfg.scorer_dynamic_lookback_cap_hours)
-    bets = fetch_bets_incremental(last, lookback_hours=lookback, limit_rows=cfg.hightier_scorer_max_bets_per_cycle)
-    if bets.empty:
-        return 0
+    lim = int(cfg.hightier_scorer_max_bets_per_cycle)
+
+    cursor_all: Optional[pd.Series] = None
+    if high_adt_only:
+        probe = fetch_bets_incremental_etl_probe(last, lookback_hours=lookback, limit_rows=lim)
+        if probe.empty:
+            return 0
+        cursor_pre_probe = _effective_etl_cursor(probe)
+        if last is not None:
+            probe = probe[cursor_pre_probe > last].copy()
+        if probe.empty:
+            return 0
+        cursor_all = _effective_etl_cursor(probe)
+        bets = fetch_bets_incremental(
+            last,
+            lookback_hours=lookback,
+            limit_rows=lim,
+            allowlist_player_ids=allowlist_ids,
+        )
+        if bets.empty:
+            max_c = cursor_all.max()
+            if pd.notna(max_c):
+                set_last_processed_etl_insert(conn, max_c.to_pydatetime())
+            conn.commit()
+            return 0
+    else:
+        bets = fetch_bets_incremental(
+            last,
+            lookback_hours=lookback,
+            limit_rows=lim,
+            allowlist_player_ids=None,
+        )
+        if bets.empty:
+            return 0
+
     cursor_pre = _effective_etl_cursor(bets)
     if last is not None:
         bets = bets[cursor_pre > last].copy()
     if bets.empty:
+        if high_adt_only and cursor_all is not None:
+            max_c = cursor_all.max()
+            if pd.notna(max_c):
+                set_last_processed_etl_insert(conn, max_c.to_pydatetime())
+            conn.commit()
         return 0
-    cursor_all = _effective_etl_cursor(bets)
-    n_rows_pre_al = len(bets)
-    n_pid_pre = int(bets["player_id"].nunique())
-    if high_adt_only:
-        bets = filter_bets_by_adt_allowlist(bets, allowlist_ids)
-        logger.info(
-            "[hightier_scorer] adt_allowlist filter rows %d -> %d; players %d -> %d",
-            n_rows_pre_al,
-            len(bets),
-            n_pid_pre,
-            int(bets["player_id"].nunique()) if not bets.empty else 0,
-        )
-    if bets.empty:
-        max_cursor = cursor_all.max()
-        if pd.notna(max_cursor):
-            set_last_processed_etl_insert(conn, max_cursor.to_pydatetime())
-        conn.commit()
-        return 0
+
     cursor = _effective_etl_cursor(bets)
     p_min = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").min()
     p_max = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").max()
     pool_start = (p_min - timedelta(hours=int(cfg.hot_feature_pool_lookback_hours))).to_pydatetime()
     pool_end = p_max.to_pydatetime()
     pids = sorted({int(x) for x in bets["player_id"].dropna().unique().tolist()})
-    if len(pids) > 5000:
+    fan_cap = int(cfg.hightier_scorer_pool_player_fanout_cap)
+    if len(pids) > fan_cap:
         logger.warning(
-            "[hightier_scorer] large player fanout (%d); truncating window pool to cap OOM risk",
+            "[hightier_scorer] large player fanout (%d); truncating window pool to cap OOM risk (%d)",
             len(pids),
+            fan_cap,
         )
-        pids = pids[:5000]
+        pids = pids[:fan_cap]
     pool = fetch_bet_pool_window(player_ids=pids, window_start=pool_start, window_end=pool_end)
     pool2 = attach_synthetic_etl_and_prediction_visible(pool)
     pool2 = attach_canonical_id(pool2, mapping_parquet=mapping_parquet)
@@ -329,6 +529,21 @@ def score_once(
     )
     prob = bundle.model.predict_proba(X)[:, 1]
     thr = float(bundle.threshold)
+    scored_at_iso = datetime.now(ZoneInfo(HK_TZ)).isoformat()
+    pl_path = cfg.prediction_log_db_path
+    if pl_path is not None and str(pl_path).strip():
+        try:
+            append_hightier_prediction_log(
+                pl_path,
+                scored_at=scored_at_iso,
+                model_version=str(bundle.model_version),
+                staged=staged,
+                prob=prob,
+                threshold=thr,
+            )
+        except Exception as exc:
+            logger.warning("[hightier_scorer] prediction_log write failed: %s", exc)
+
     m = prob >= thr
     n = int(m.sum())
     if n == 0:
@@ -339,7 +554,7 @@ def score_once(
         return 0
     out = staged.loc[m].copy()
     out["score"] = prob[m.to_numpy()]
-    now_iso = datetime.now(ZoneInfo(HK_TZ)).isoformat()
+    now_iso = scored_at_iso
     nom = out["casino_player_id"] if "casino_player_id" in out.columns else pd.Series("", index=out.index)
     rated = nom.notna() & (nom.astype(str).str.strip() != "")
     alerts = pd.DataFrame(
@@ -409,6 +624,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = pr.parse_args(argv)
     cfg = default_hightier_serving_config()
     init_state_db(Path(cfg.state_db_path))
+    init_prediction_log_db(cfg.prediction_log_db_path)
     bundle = load_hightier_model_bundle(bundle_dir=args.bundle_dir)
     slow_override = Path(args.slow_parquet).resolve() if args.slow_parquet else None
     map_path = Path(args.canonical_mapping).resolve() if args.canonical_mapping else None

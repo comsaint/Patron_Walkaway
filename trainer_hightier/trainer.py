@@ -52,11 +52,7 @@ from trainer_hightier.config import (
     get_run_profile,
     list_run_profile_names,
 )
-from trainer.core.model_bundle_paths import (
-    safe_version_subdirectory,
-    write_latest_model_manifest,
-)
-from trainer.core.mlflow_utils import (
+from trainer_hightier.core.mlflow_adapter import (
     log_artifact_safe,
     log_metrics_safe,
     log_params_safe,
@@ -64,6 +60,7 @@ from trainer.core.mlflow_utils import (
     safe_start_run,
     warm_up_mlflow_run_safe,
 )
+from trainer_hightier.core.model_bundle_paths import safe_version_subdirectory, write_latest_model_manifest
 from trainer_hightier.utils.canonical_mapping import (
     build_canonical_mapping_from_cleaned_session_parquet,
     default_canonical_mapping_parquet_path,

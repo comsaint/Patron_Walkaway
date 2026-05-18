@@ -24,12 +24,11 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 import pyarrow.parquet as pq
+from zoneinfo import ZoneInfo
 
-from trainer.config import HK_TZ
-from trainer.labels import compute_labels
-
-from trainer_hightier.config import DuckDbRuntimeConfig
+from trainer_hightier.config import DuckDbRuntimeConfig, HK_TZ as HK_TZ_STR
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
+from trainer_hightier.walkaway_compute_labels import compute_labels
 from trainer_hightier.utils.bet_l0_preprocess import (
     cleaned_bet_dataset_has_any_parquet,
     first_parquet_under_for_schema,
@@ -38,6 +37,8 @@ from trainer_hightier.utils.bet_l0_preprocess import (
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 logger = logging.getLogger(__name__)
+
+HK_TZ = ZoneInfo(HK_TZ_STR)
 
 
 def _path_posix(path: Path) -> str:
@@ -65,7 +66,7 @@ def materialize_walkaway_labels_from_cleaned_bet(
     extended_end: datetime | pd.Timestamp | None = None,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
 ) -> Path:
-    """Join cleaned bets to ``canonical_id``, then run :func:`trainer.labels.compute_labels`.
+    """Join cleaned bets to ``canonical_id``, then run :func:`~trainer_hightier.walkaway_compute_labels.compute_labels`.
 
     Args:
         cleaned_bet_parquet: Cleaned bet Parquet (must include ``bet_id``, ``player_id``,

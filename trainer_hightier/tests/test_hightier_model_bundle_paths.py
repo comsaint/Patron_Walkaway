@@ -1,4 +1,4 @@
-"""Versioned bundle + manifest parity with ``trainer.core.model_bundle_paths``."""
+"""Versioned bundle + manifest (``trainer_hightier.core.model_bundle_paths``)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from trainer.core.model_bundle_paths import (
+from trainer_hightier.core.model_bundle_paths import (
     LATEST_MODEL_MANIFEST_NAME,
     resolve_model_bundle_dir,
 )

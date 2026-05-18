@@ -28,6 +28,7 @@ except Exception:
                 "or ensure python-dateutil is installed"
             )
 
+from trainer_hightier.data_preflight import run_cross_entry_data_preflight
 from trainer_hightier.serving import runtime_config as config
 from trainer_hightier.serving.ch_adapter import get_clickhouse_client
 
@@ -901,9 +902,11 @@ def fetch_sessions_by_canonical_id(
 
 # ------------------ State helpers (SQLite) ------------------
 def get_db_conn() -> sqlite3.Connection:
+    from trainer_hightier.serving.prediction_log import init_prediction_log_db
     from trainer_hightier.serving.state_db import apply_sqlite_serving_pragmas, init_state_db
 
     init_state_db(STATE_DB_PATH)
+    init_prediction_log_db(config.PREDICTION_LOG_DB_PATH)
     conn = sqlite3.connect(STATE_DB_PATH)
     apply_sqlite_serving_pragmas(conn)
     return conn
@@ -1822,8 +1825,6 @@ def run_validator_loop(
     Uses STATE_DB_PATH from env if set.
     Runs ClickHouse data preflight once before the first poll (same contract as CLI ``main()``).
     """
-    from trainer.training.cross_entry_preflight import run_cross_entry_data_preflight
-
     run_cross_entry_data_preflight(
         entry="validator",
         use_local_parquet=False,
@@ -1863,8 +1864,6 @@ def main():
     args = parser.parse_args()
 
     try:
-        from trainer.training.cross_entry_preflight import run_cross_entry_data_preflight
-
         run_cross_entry_data_preflight(
             entry="validator",
             use_local_parquet=False,

@@ -1,200 +1,227 @@
 # trainer_hightier - Packaging Implementation Plan
 
-本文件屬於 **Implementation plan 層**，定義 `trainer_hightier` 可部署打包能力（對齊現有 `@package` 體驗）的 realization strategy、模組邊界、里程碑、風險與驗證策略；不展開 ticket 級 task checklist。
+本文件屬於 **Implementation plan 層**，定義 `trainer_hightier` 打包如何落地成「**Standalone production bundle**」：目標機器只有 Python interpreter 與交付包，也能啟動服務。本文描述 realization strategy、模組邊界、階段、里程碑、風險與驗證策略；不展開 ticket 級任務。
 
-## 目標與成功準則
+## 目標聲明（硬性）
 
-- 目標：
-  - 提供一個單一入口，產生可搬移到另一台機器的部署包（資料夾或 zip）。
-  - 讓部署操作在「**只指定 model version/bundle**」時即可解析並收斂 deploy 所需 artifact。
-  - 讓目標機器在具備相容程式碼環境時，能啟動 `scorer` / `validator` / `api`（與必要的 `snapshot_updater` 操作）。
-  - 保證 `high_adt_only` 模式所需 artifact（allowlist / manifest / slow snapshot）可追溯且可驗證。
-- 成功準則：
-  - 部署包在乾淨環境完成 `pip install -r requirements.txt` 後可啟動服務。
-  - 啟動前完整性檢查可阻擋缺失或版本不一致的核心 artifact。
-  - 在 `Frozen` 模式下，同一 `model_version` 重複建包輸出可重現（版本與 hash 一致）。
-  - 支援 single-folder 與 zip 兩種交付型態，並具備最小操作文件。
+`trainer_hightier` 正式交付目標為：
+
+- 目標機 **不需要 repo checkout**。
+- 目標機允許連線 **PyPI** 安裝第三方套件（不需要 repo checkout 與本機預裝專案依賴）。
+- 目標機僅需：
+  1. Python interpreter（版本符合支援矩陣）  
+  2. 一份 deploy bundle（folder 或 zip 解壓後）
+- 即可完成安裝與啟動。
+
+> 註：若目標平台缺少 Python 或缺少 OS 層必要動態函式庫，屬平台前置條件，不屬 repo/套件依賴。
+
+## 問題定義（現況差距）
+
+- 現況 `trainer_hightier` 偏 **Artifact Bundle**：打包主要覆蓋模型與 snapshots，runtime 啟動鏈仍非「bundle 內單一入口」模式。
+- 目標是 **Standalone Runtime Bundle**：交付包本身包含可啟動入口與所需 Python 安裝契約（允許 PyPI）。
+- 核心差距：從「可搬運 artifacts」提升為「可在乾淨主機獨立啟動」。
+- 觀測性差距：目前 runtime 僅寫入 `state.db`（alerts/validation），缺少 `archive/trainer` 既有的 `prediction_log.db`（全量 scored rows 稽核）。
+
+## 成功準則（Acceptance Criteria）
+
+- 乾淨目標機（僅 Python）可完成：
+  - 建立 venv（可選但建議）
+  - 依 `requirements.txt` 安裝依賴（允許從 PyPI 下載）
+  - 啟動 scorer/validator/api
+- 啟動時完成核心檢查並 fail-fast：
+  - `model.pkl`
+  - `active_manifest.json`
+  - required snapshots（slow + allowlist）
+  - mapping 檔案
+  - allowlist hash parity（若 training_metrics 提供 hash）
+- 同一 `model_version` 連續建包輸出可重現（manifest / allowlist / mapping / fingerprint 一致）。
+- folder 與 zip 兩種交付形式具一致啟動結果。
+- runtime 可持續寫入 `prediction_log.db`，至少覆蓋每輪全量 scored rows（不只 alert rows），以支援「全部預測」查詢與審計。
 
 ## 範圍與非範圍
 
 - 範圍：
-  - `trainer_hightier` 專用打包腳本、部署入口、artifact 收斂與驗證。
-  - 模型 bundle、active snapshot/allowlist、canonical mapping、必要設定與啟動文件打包。
-  - 打包時 manifest 路徑重寫與一致性驗證（搬機後可用）。
+  - 打包器（artifact 收斂 + runtime 安裝契約）。
+  - standalone runtime 入口（`main.py` 或等效），不依賴 repo module path。
+  - deploy 設定契約（`deploy_bundle_paths.json` + `.env.example`/等效 template）。
+  - README/RUNBOOK 生產操作文檔（離線安裝與啟動）。
+  - prediction audit store（`prediction_log.db`）落地策略與打包契約（路徑、初始化、寫入時機）。
 - 非範圍：
-  - 重新設計訓練流程與模型產生邏輯。
-  - 建置 CI/CD 平台細節（僅定義可被 CI 調用的 CLI 契約）。
-  - 前端 dashboard 靜態資源部署（本期以 API 與後端 runtime 為主）。
+  - 重設訓練流程與特徵工程邏輯（本文件僅保證 runtime 自包含）。
+  - CI/CD 平台實作細節（僅定義可被 CI 執行的輸出契約）。
+  - 前端 dashboard 靜態資源部署。
 
-## 已定約束（作為設計前提）
+## 設計前提與約束
 
-- `high_adt_only=true` 為預設安全模式；部署包不得默默降級成全量打分。
-- allowlist 需與訓練同源；若 `training_metrics.json` 提供 `adt_allowlist_sha256`，預設採 fail-fast。
-- `state.db` 與 trainer API 協定相容，避免下游 API 使用端破壞。
-- 打包流程需避免攜帶不必要大檔（raw ClickHouse mirror / 訓練中間 cache），降低搬運成本與目標機 OOM 風險。
-- 本期策略固定為 **Frozen artifact mode**：部署包鎖定訓練當下對應 artifact，不依賴「最新 serving snapshot」。
+- `high_adt_only=true` 為預設安全模式，不可默默降級全量打分。
+- `training_metrics.json` 若含 `adt_allowlist_sha256`，必須 fail-fast 比對。
+- 採 **Frozen artifact mode**：鎖定該次模型對應 snapshots，不依賴「執行當下最新 snapshot」。
+- 不打包 raw CH mirror / 訓練中間 cache，控制體積、降低目標機資源風險。
+- 秘密資訊（CH credentials）不可寫入 bundle；由目標機 `.env` 或同級秘密注入機制提供。
 
-## 決策紀錄（Decision Log）
+## Decision Log
 
-- D-001（已定）：採用 **Frozen** 模式作為預設與正式環境基準。
-  - 理由：可重現、可回滾、可稽核；同一 `model_version` 不受後續 snapshot 漂移影響。
-  - 影響：建包需收斂並封存 long/mid-term snapshot 與 mapping；不以 runtime 動態抓最新檔案為主流程。
-- D-002（已定）：`trial_bet_behavior_parquet` 目前列為 **optional**。
-  - 理由：現行 scorer 在 runtime 以 bet pool 即時計算 1h 行為特徵，非硬依賴該 parquet。
-  - 影響：strict 模式下可不要求此檔；若 manifest 宣告該欄位則需驗證可讀。
+- D-001（已定）：`trainer_hightier` 正式目標為 **Standalone Runtime Bundle**，Artifact Bundle 不可作為 production 完成態。
+  - 影響：所有驗收以「無 repo」可啟動為準。
+- D-002（已定）：依賴安裝允許 **PyPI online install**；離線 wheel 封裝為可選增強。
+  - 影響：`requirements.txt` 需可在標準 PyPI 路徑完成安裝。
+- D-003（已定）：Frozen mode 為正式預設。
+  - 影響：建包需保存 manifest/allowlist/mapping 版本與 hash。
+- D-004（已定）：`trial_bet_behavior_parquet` 保持 optional（除非 manifest 宣告）。
+- D-005（新增）：`prediction_log.db` 採獨立 SQLite（不混入 `state.db`），寫入點位於 scorer 每輪 `predict_proba` 後、alert 篩選前，對齊 `archive/trainer` 行為。
+  - 影響：可觀測到全量 predictions；不得僅依 alerts 反推。
 
-## 目前體積基線（2026-05-18 實測）
-
-- 目前單次 model bundle（`out/models_high_tier_mvp/<run_id>`）約 **1.65 MB**（主要為 `model.pkl`）。
-- `trainer_hightier/artifacts/mapping`：
-  - `canonical_player_mapping.parquet` 約 **4.29 MB**
-  - `adt_allowed_players_q0p99.parquet` 約 **69.92 KB**
-- `trainer_hightier/artifacts/feast`：
-  - `slow_patron_180d_monthly.parquet` 約 **39.51 MB**
-  - `trial_bet_behavior_1h.parquet` 約 **40.76 MB**
-- Frozen 最小必要集（不含 trial parquet）預估約 **45.5 MB / version**。
-
-## 架構實現藍圖
+## 目標架構（Standalone）
 
 ```mermaid
 flowchart LR
-    train[trainer_hightier trainer.py outputs]
-    pkg[build_hightier_deploy_package.py]
-    bundle[(deploy_hightier_dist/)]
-    target[Target machine]
-    runtime[hightier deploy main.py]
-    ch[(ClickHouse)]
-    state[(state.db)]
-    api[hightier API]
+    trainOut[training_outputs]
+    packer[build_deploy_package]
+    bundle[standalone_bundle]
+    target[target_machine_python_only]
+    setup[install_dependencies]
+    entry[main_entrypoint]
+    runtime[scorer_validator_api]
+    ch[clickhouse]
+    state[local_state_db]
 
-    train --> pkg
-    pkg --> bundle
+    trainOut --> packer
+    packer --> bundle
     bundle --> target
-    target --> runtime
-    ch --> runtime
+    target --> setup
+    setup --> entry
+    entry --> runtime
+    runtime --> ch
     runtime --> state
-    state --> api
 ```
 
 ## 元件邊界與責任
 
-### 1) `build_hightier_deploy_package.py`（打包編譯器）
+### 1) Packaging Compiler（`build_deploy_package.py`）
 
-- 責任：
-  - 收集並複製部署必要檔案到輸出目錄。
-  - 產出 `requirements.txt`、`README_DEPLOY.md`、可選 zip。
-  - 執行 strict preflight（模型、manifest、allowlist、mapping 完整性）。
-- 設計重點：
-  - 支援 `--strict`（預設建議開）與 `--archive`。
-  - 支援以 model bundle/version 為核心輸入，自動解析 snapshot/mapping 預設來源。
-  - 對 manifest 內路徑做「部署目錄相對化重寫」，避免跨機器絕對路徑失效。
+- 收斂並複製 runtime 必要模型與 serving artifacts。
+- 產出 bundle 內路徑契約檔（`deploy_bundle_paths.json`、`bundle_info.json`）。
+- 產出標準 `requirements.txt` 與安裝契約（預設走 PyPI）。
+- strict preflight（artifact 完整性 + hash parity + 路徑重寫檢查）。
 
-### 2) Deploy Runtime Entrypoint（例如 `deploy/main.py`）
+### 2) Standalone Entrypoint（`main.py` 或等效）
 
-- 責任：
-  - 載入部署設定（單一設定檔或 `.env`）。
-  - 啟動 scorer / validator / api（可同進程或分進程策略）。
-  - 啟動時做關鍵 artifact 驗證並輸出版本資訊（model / manifest / allowlist）。
-- 設計重點：
-  - 若 allowlist hash 與訓練標記不一致，預設 fail-fast。
-  - 清楚標示是否處於 `high_adt_only` 或除錯全量模式。
+- 可直接由 `python main.py` 啟動 scorer/api/validator，不依賴 repo import path。
+- 啟動前檢查關鍵 artifact，並輸出版本可觀測資訊。
+- 支援 mode 切換（all/api/scorer/validator）與 host/port。
 
-### 3) Artifact Resolver（模型與資料定位）
+### 3) Config Contract
 
-- 責任：
-  - 統一解析模型 bundle、snapshot manifest、allowlist、slow snapshot、mapping 路徑。
-  - 封裝部署包內固定目錄結構，避免 runtime 各模組自行拼路徑。
-- 設計重點：
-  - 提供可觀測 meta（active allowlist version/hash、manifest version）。
-  - 路徑解析失敗要有具體錯誤訊息（實際值 vs 期望值）。
+- `deploy_bundle_paths.json`：路徑 SSOT。
+- `.env.example`：運維必填與可選設定模板。
+- `.env` 僅承載秘密與操作參數；不得再引用 repo 本地路徑。
 
-### 4) Packaging Contract（輸出物協定）
+### 4) Artifact Resolver
 
-- 最小必要內容：
-  - `main.py`
-  - `requirements.txt`
-  - `models/`（`model.pkl`、`training_metrics.json`、`model_version`）
-  - `snapshots/active_manifest.json`（路徑重寫為相對 `snapshots/`）
-  - `snapshots/artifacts/slow_patron_*.parquet`（required）
-  - `snapshots/artifacts/adt_allowed_players_*.parquet`（required）
-  - `mapping/`（canonical mapping parquet）
-  - `local_state/`（可空）
-  - `README_DEPLOY.md`
-  - `bundle_info.json`（model/manifest/allowlist 版本與 hash）
-  - `deploy_bundle_paths.json`（runtime 路徑契約）
-- 可選內容：
-  - `snapshots/artifacts/trial_bet_behavior_*.parquet`（optional）
-  - `feature_state.db`（保留審計歷史）
+- 將 manifest 中路徑重寫為 bundle-relative。
+- 驗證 rewritten 路徑可讀。
+- 在缺失時提供可操作錯誤（實際值 + 預期值 + 修復方向）。
 
-## 工作流與階段（Workstreams / Phases）
+### 5) Prediction Audit Store（`prediction_log.db`）
 
-### Phase 0：契約定義與目錄佈局凍結
+- DB 與 `state.db` 分離，預設位於 `local_state/prediction_log.db`。
+- scorer 在每輪評分後、alert 篩選前 append 全量 scored rows（含 `score`、`margin`、`is_alert`、`is_rated_obs` 等最低必要欄位）。
+- 建議採 WAL + index（`scored_at`、`model_version`）以平衡寫入與查詢。
+- 寫入失敗時策略需明確：預設 **降級告警但不阻斷 scoring 主流程**（與 archive 行為一致），並在 runbook 標示風險。
 
-- 定義部署包目錄結構與必帶/可選檔案清單。
-- 定義 strict preflight 驗證規則與錯誤碼策略。
-- 凍結 Frozen 模式契約（required/optional artifact、hash parity、manifest 重寫規則）。
-- 凍結打包 CLI 參數協定（model 輸入優先、輸出位置、archive、strict）。
+## Packaging Contract（輸出物協定）
 
-### Phase 1：打包核心與 artifact 收斂
+必帶內容（production 完成態）：
 
-- 實作模型、snapshot、allowlist、mapping 的收斂與複製策略。
-- 實作 manifest 路徑重寫與重寫後驗證。
-- 實作由 model bundle/version 推導 snapshot/mapping 預設來源。
-- 產出 requirements 與 deploy README。
+- `main.py`（或等效 standalone entrypoint）
+- `requirements.txt`（於 **bundle 根目錄** 執行 `pip install -r`；首行為相對該目錄之 `wheels/trainer_hightier-*.whl`，其餘相依由 PyPI 解析）
+- `wheels/`（**預設**：内含 `trainer_hightier-*.whl`，由建包機 `pip wheel --no-deps` 產生；亦保留作離線備援擴充）
+- `.env.example`
+- `models/`（至少 `model.pkl`、`training_metrics.json`、`model_version`）
+- `snapshots/active_manifest.json`
+- `snapshots/artifacts/slow_patron_*.parquet`（required）
+- `snapshots/artifacts/adt_allowed_players_*.parquet`（required）
+- `mapping/`（canonical mapping parquet）
+- `local_state/`（可空）
+- `local_state/`（至少保留可建立 `state.db`、`prediction_log.db` 的路徑）
+- `README_DEPLOY.md`
+- `bundle_info.json`
+- `deploy_bundle_paths.json`
 
-### Phase 2：部署啟動入口與啟動前防線
+可選內容：
 
-- 實作 deploy entrypoint 與配置讀取流程。
-- 啟動前驗證 model/manifest/allowlist 一致性。
-- 輸出關鍵版本資訊與模式旗標 log。
+- `snapshots/artifacts/trial_bet_behavior_*.parquet`
+- `feature_state.db`（如需審計歷史）
+- `prediction_log.db`（若交付時預先建立；未預建亦須保證 runtime 可自動初始化）
 
-### Phase 3：驗證、壓測與交付
+## Workstreams / Phases
 
-- 在乾淨環境執行安裝 + 啟動 smoke test。
-- 驗證 `high_adt_only=true` 下行為與 allowlist 約束。
-- 驗證 zip 交付與解壓後啟動一致性。
+### Phase 0：契約凍結
 
-## 里程碑與交付物
+- 凍結 standalone 契約（輸出物、啟動方式、安裝規範）。
+- 明確禁止 production 依賴 repo import。
 
-- M1：打包 CLI 可產出最小部署資料夾。
-- M2：strict preflight 可攔截缺檔、壞路徑、hash 不一致。
-- M3：目標機可完成安裝並啟動 scorer/validator/api。
-- M4：`high_adt_only` 與 allowlist 版本資訊可於啟動與 runtime 觀測。
-- M5：Frozen 合約下同一 `model_version` 可重複建包且輸出一致。
-- M6：zip 交付流程與 runbook 指令完成。
+### Phase 1：打包核心與 runtime artifacts 收斂
 
-## 風險與緩解
+- 模型/snapshot/allowlist/mapping 收斂。
+- manifest 路徑重寫與校驗。
+- strict + hash parity。
 
-- 風險：搬機後 manifest 仍指向原機器絕對路徑。
-  - 緩解：打包時統一路徑重寫，並做重寫後存在性檢查。
-- 風險：打包遺漏 allowlist 或 mapping，導致 runtime fail 或隱性降級。
-  - 緩解：strict preflight 強制檢查；錯誤訊息列出缺失檔案。
-- 風險：打包包含大體積原始資料，部署慢且目標機記憶體/磁碟壓力高。
-  - 緩解：明確排除 raw mirrors 與訓練中間檔，只保留 serving 必要 artifact。
-- 風險：Frozen 每版重複攜帶 long/mid-term parquet，累積磁碟成本。
-  - 緩解：預設僅打包必要集（slow + allowlist + mapping）；trial parquet 保持 optional；後續可增量評估壓縮/去重策略。
-- 風險：模型與 allowlist 版本漂移造成行為不一致。
-  - 緩解：啟動時 hash parity 檢查，預設 fail-fast；必要時才允許 degraded-continue。
+### Phase 2：runtime 封裝與安裝契約
+
+- 產出 PyPI 可安裝的依賴清單與版本鎖定策略。
+- （可選）提供 wheels 目錄作為離線備援。
+- 生成 standalone runtime entrypoint 與 `.env.example`。
+- README 明確化為「python + bundle 即可」流程。
+
+### Phase 3：驗證與交付
+
+- 在無 repo 的乾淨環境 smoke test（含 PyPI 安裝）。
+- folder 與 zip 等價驗證。
+- 回滾流程驗證（上一版 bundle 快速切換）。
+
+### Phase 4：Prediction Log parity（對齊 archive/trainer）
+
+- 對齊 `archive/trainer/serving/scorer.py` 的核心契約：建立 prediction_log schema、append 全量 scored rows。
+- 定義最小欄位集合與索引策略，避免目標機長時運行磁碟無上限膨脹。
+- 在 deploy smoke 加入「全量 predictions 可查」驗收（非僅 alerts）。
+
+## 里程碑
+
+- M1：輸出符合 standalone contract 的 bundle 目錄。
+- M2：strict preflight 可攔截缺檔/壞路徑/hash mismatch。
+- M3：乾淨目標機（無 repo）可安裝並啟動服務。
+- M4：`high_adt_only` 與版本/hash 可於啟動與 runtime 觀測。
+- M5：同一 `model_version` 可重現建包。
+- M6：zip 交付與回滾 runbook 可操作。
+- M7：`prediction_log.db` 在 target 機可自動建立並可查詢全量 predictions。
+
+## 主要風險與緩解
+
+- 風險：PyPI 套件版本漂移或暫時不可用，導致安裝失敗或行為變動。
+  - 緩解：鎖定版本並維護可選內部鏡像/快取（必要時啟用 wheels 備援）。
+- 風險：`active_manifest.json` 缺失導致建包失敗。
+  - 緩解：明確前置檢查；指引使用 `--snapshot-manifest-source` 或先產生 manifest。
+- 風險：bundle 缺 `main.py`/`.env.example` 或入口與文件不一致，導致 target 機無法直接啟動 runtime。
+  - 緩解：將入口與設定模板納入必帶契約與 release gate。
+- 風險：bundle 體積過大，造成搬運或啟動資源壓力。
+  - 緩解：排除非必要大檔；trial parquet 保持 optional。
+- 風險：模型與 allowlist 版本漂移。
+  - 緩解：hash parity fail-fast + `bundle_info` 版本稽核。
+- 風險：prediction log 長時累積導致磁碟壓力或查詢退化。
+  - 緩解：建立 retention/summary 策略與必要索引；runbook 加入容量監控與清理步驟。
 
 ## 驗證與 rollout 策略
 
-- 功能驗證：
-  - 打包輸出內容符合協定。
-  - 乾淨環境可啟動服務並通過 `/health`。
-- 重現性驗證：
-  - 同一 `model_version` 連續建包，`bundle_info` / manifest / allowlist hash 一致。
-- 契約驗證：
-  - `high_adt_only=true` 時，alerts 僅來自 allowlist 玩家。
-  - state/meta 可查到 active allowlist version/hash。
-- 操作驗證：
-  - 資料夾與 zip 兩條交付路徑都可在目標機啟動。
-- rollout：
-  - 先 shadow 部署驗證資料與版本一致，再切正式告警流量。
+- 功能驗證：輸出內容符合 standalone contract，啟動流程無 repo 依賴。
+- 安裝驗證：可連 PyPI 的乾淨主機可完成 install + run；必要時再補離線備援驗證。
+- 契約驗證：`high_adt_only` 與 allowlist 約束生效。
+- 稽核驗證：`prediction_log.db` 可讀回全量 scored rows，且寫入不依賴 alerts 命中。
+- 操作驗證：folder/zip 兩路徑一致。
+- rollout：先 shadow，再切正式；保留上一版 bundle 可快速回滾。
 
 ## 假設與待確認
 
-- 目標機可連到 ClickHouse，且憑證由部署設定注入。
-- 模型 bundle 來源以最新或指定版本目錄可穩定解析。
-- 可提供與該模型同源的 slow snapshot、allowlist、mapping（或可由固定預設路徑解析）。
-- 運維流程允許以單一命令執行打包，並接受 strict fail-fast 行為。
-- 後續若需前端一體化部署，將另開文件擴充此計畫，不在本期範圍內。
+- 目標機可提供相容 Python 版本與必要 OS runtime。
+- ClickHouse 連線與權限由環境側提供。
+- 允許在需要時為特定平台提供對應 wheels 備援集合（非硬性）。

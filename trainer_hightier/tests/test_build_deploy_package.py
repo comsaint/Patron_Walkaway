@@ -77,6 +77,13 @@ def test_build_bundle_rewrites_manifest_relative_paths(tmp_path: Path) -> None:
     assert am.adt_allowlist_parquet is not None and am.adt_allowlist_parquet.is_file()
     assert (out / "bundle_info.json").is_file()
     assert (out / "deploy_bundle_paths.json").is_file()
+    assert (out / "main.py").is_file()
+    assert (out / ".env.example").is_file()
+    assert (out / "requirements.txt").is_file()
+    whls = list((out / "wheels").glob("trainer_hightier-*.whl"))
+    assert whls, "expected trainer_hightier wheel under bundle wheels/"
+    req_txt = (out / "requirements.txt").read_text(encoding="utf-8")
+    assert whls[0].name in req_txt
 
 
 def test_build_bundle_archive_zip(tmp_path: Path) -> None:
@@ -118,6 +125,11 @@ def test_build_bundle_archive_zip(tmp_path: Path) -> None:
         names = set(zf.namelist())
     assert "bundle_info.json" in names
     assert "snapshots/active_manifest.json" in names
+    assert "main.py" in names
+    assert "requirements.txt" in names
+    assert ".env.example" in names
+    wheel_members = [n for n in names if n.startswith("wheels/") and n.endswith(".whl")]
+    assert wheel_members
 
 
 def test_allowlist_hash_mismatch_fails(tmp_path: Path) -> None:
@@ -229,7 +241,6 @@ def test_deploy_api_health_after_bundle_config(tmp_path: Path) -> None:
     from trainer_hightier.deploy.main import _load_rel_paths, _serving_config_for_bundle
     from trainer_hightier.serving import api_server as api_mod
     from trainer_hightier.serving import runtime_config as rc
-    from trainer_hightier.serving.state_db import init_state_db
 
     rel = _load_rel_paths(bundle)
     cfg = _serving_config_for_bundle(bundle, rel)
@@ -237,7 +248,7 @@ def test_deploy_api_health_after_bundle_config(tmp_path: Path) -> None:
         set_hightier_serving_deploy_override(cfg)
         importlib.reload(rc)
         importlib.reload(api_mod)
-        init_state_db(api_mod.STATE_DB_PATH)
+        api_mod._init_state_and_prediction_log_dbs()
         client = api_mod.app.test_client()
         rv = client.get("/health")
         assert rv.status_code == 200
@@ -348,4 +359,151 @@ def test_model_version_defaults_and_fingerprint_repeatable(monkeypatch, tmp_path
     build_deploy_package(["--model-version", vid, "--output-dir", str(out2)])
     bio2 = json.loads((out2 / "bundle_info.json").read_text(encoding="utf-8"))
     assert bio2["frozen_fingerprint_sha256"] == fp1
+
+
+def test_archive_zip_file_list_matches_folder(tmp_path: Path) -> None:
+    """Folder and zip archive must list the same relative paths (standalone bundle)."""
+    model_src = tmp_path / "model_in"
+    snap_src = tmp_path / "snap_in"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_parquet(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    man = {
+        "version": "mv",
+        "slow_patron_parquet": str(slow),
+        "adt_allowlist_parquet": str(allow),
+    }
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map_zip_eq.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "fold_zip"
+    build_deploy_package(
+        [
+            "--model-source",
+            str(model_src),
+            "--snapshot-manifest-source",
+            str(snap_src),
+            "--mapping-source",
+            str(mapping),
+            "--output-dir",
+            str(out),
+            "--archive",
+        ]
+    )
+    zpath = tmp_path / "fold_zip.zip"
+    assert zpath.is_file()
+    folder_files = {p.relative_to(out).as_posix() for p in out.rglob("*") if p.is_file()}
+    with zipfile.ZipFile(zpath) as zf:
+        zip_files = set(zf.namelist())
+    assert folder_files == zip_files
+
+
+def test_phase_b_wheel_excludes_junk_and_includes_serving(tmp_path: Path) -> None:
+    """Phase B: wheel must not ship ``build/lib`` pollution or training-only subtrees."""
+    model_src = tmp_path / "model_in_pb"
+    snap_src = tmp_path / "snap_in_pb"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_parquet(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    man = {
+        "version": "mv",
+        "slow_patron_parquet": str(slow),
+        "adt_allowlist_parquet": str(allow),
+    }
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map_pb.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bundle_phase_b"
+    build_deploy_package(
+        [
+            "--model-source",
+            str(model_src),
+            "--snapshot-manifest-source",
+            str(snap_src),
+            "--mapping-source",
+            str(mapping),
+            "--output-dir",
+            str(out),
+        ]
+    )
+    whls = sorted((out / "wheels").glob("trainer_hightier-*.whl"))
+    assert len(whls) == 1, whls
+    with zipfile.ZipFile(whls[0]) as zf:
+        names = zf.namelist()
+    assert not any("/build/lib/" in n for n in names), names[:20]
+    assert not any(n.startswith("trainer_hightier/feature_experiment/") for n in names)
+    assert not any(n.startswith("trainer_hightier/tests/") for n in names)
+    assert not any(n.startswith("trainer_hightier/feast_repo/") for n in names)
+    assert any(n.endswith("trainer_hightier/utils/__init__.py") for n in names)
+    assert any(n.endswith("trainer_hightier/serving/scorer.py") for n in names)
+    assert any(n.endswith("trainer_hightier/deploy/main.py") for n in names)
+    assert any(n.endswith("trainer_hightier/config.py") for n in names)
+    assert any(n.endswith("trainer_hightier/contracts/feature_candidate_registry.yaml") for n in names)
+
+
+@pytest.mark.slow
+def test_no_repo_smoke_venv_pip_install_imports(tmp_path: Path) -> None:
+    """End-to-end: venv + pip install -r requirements.txt can import trainer_hightier (needs PyPI)."""
+    import subprocess
+    import sys
+
+    model_src = tmp_path / "model_in"
+    snap_src = tmp_path / "snap_in"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_parquet(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    man = {
+        "version": "mv",
+        "slow_patron_parquet": str(slow),
+        "adt_allowlist_parquet": str(allow),
+    }
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map_smoke.parquet"
+    _write_parquet(mapping)
+    bundle = tmp_path / "smokebundle"
+    build_deploy_package(
+        [
+            "--model-source",
+            str(model_src),
+            "--snapshot-manifest-source",
+            str(snap_src),
+            "--mapping-source",
+            str(mapping),
+            "--output-dir",
+            str(bundle),
+        ]
+    )
+
+    venv = tmp_path / "smoke_venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+    if sys.platform == "win32":
+        pip_exe = venv / "Scripts" / "pip.exe"
+        py_exe = venv / "Scripts" / "python.exe"
+    else:
+        pip_exe = venv / "bin" / "pip"
+        py_exe = venv / "bin" / "python"
+    subprocess.run([str(pip_exe), "install", "-r", "requirements.txt"], check=True, cwd=str(bundle))
+    subprocess.run(
+        [
+            str(py_exe),
+            "-c",
+            "import trainer_hightier.utils; import trainer_hightier.serving.scorer; import trainer_hightier.serving.prediction_log; import trainer_hightier.deploy.main",
+        ],
+        check=True,
+    )
 

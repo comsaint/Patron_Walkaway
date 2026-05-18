@@ -23,13 +23,13 @@
 
 ## Serving（ClickHouse + SQLite，與 ``trainer`` ML API 相容）
 
-設定集中於 ``trainer_hightier.config.HightierServingConfig``（``default_hightier_serving_config()``），含 ClickHouse 連線與 ``state.db`` / ``feature_state.db`` 路徑。
+設定集中於 ``trainer_hightier.config.HightierServingConfig``（``default_hightier_serving_config()``），含 ClickHouse 連線與 ``state.db`` / ``feature_state.db`` / ``prediction_log.db``（可透過 ``prediction_log_db_path`` 關閉）路徑。
 
 | 元件 | 啟動 |
 |------|------|
 | Scorer | ``python -m trainer_hightier.run_hightier_scorer``（``--once`` 單輪） |
 | Validator | ``python -m trainer_hightier.run_hightier_validator`` |
-| ML API | ``python -m trainer_hightier.run_hightier_api`` → ``/alerts``、``/validation``、``/health`` |
+| ML API | ``python -m trainer_hightier.run_hightier_api`` → ``/alerts``、``/validation``、``/health``、``/predictions`` |
 | Snapshot（每日） | ``python -m trainer_hightier.run_hightier_snapshot_updater``（``--rematerialize-slow`` 需清洗後 Parquet 輸入） |
 
 **快照目錄**：預設 ``trainer_hightier/artifacts/serving_snapshots/active_manifest.json``；scorer 會讀其中 ``slow_patron_parquet`` 並在版本變更時寫入共用 ``state.db`` meta。
@@ -45,7 +45,7 @@
 | **Snapshot / manifest** | `run_hightier_snapshot_updater` 會複製 allowlist 至 `artifacts/serving_snapshots/adt_allowed_players_<run_id>.parquet`，並寫入 manifest 的 `adt_allowlist_parquet` 與 `adt_allowlist_version`（目前為 **整檔 SHA-256**）。`feature_state.db` 的 `adt_allowlist_meta` 單列與之一致。整段更新在 `try` 內：**例外時不會呼叫** `publish_manifest_atomic`，避免半套切換。 |
 | **訓練 hash 防線** | 若 bundle 內 `training_metrics.json` 有 `adt_allowlist_sha256`，且 `adt_allowlist_fail_on_training_hash_mismatch=True`（預設），載入名單時 **hash 不符即起動失敗**。若設為 `False`，會 **ERROR log**，`state.db` meta `adt_allowlist_health=degraded_hash_mismatch`，流程仍繼續（**不建議正式環境**）。 |
 | **除錯模式** | `python -m trainer_hightier.run_hightier_scorer --no-high-adt-only` 可對**全玩家**打分；**僅限**除錯／迴歸，**不可**當正式上線模式。 |
-| **可觀測** | 啟動一行 log：`high_adt_only`、`model_version`、`allowlist_path`、`allowlist_sha`、`manifest_adt_allowlist_version`；每輪過濾時 log `adt_allowlist filter rows …`。`state.db` meta：`active_adt_allowlist_sha256`、`active_adt_allowlist_version`、`adt_allowlist_health`（`ok` / `degraded_hash_mismatch` / `full_population_mode`）。 |
+| **可觀測** | 啟動一行 log：`high_adt_only`、`model_version`、`allowlist_path`、`allowlist_sha`、`manifest_adt_allowlist_version`；allowlist 模式另有 **ETL probe**（維持 watermark）與 chunked 拉單 log `allowlist_chunks` / `fetch_bet_pool_window` chunk 列數。`state.db` meta：`active_adt_allowlist_sha256`、`active_adt_allowlist_version`、`adt_allowlist_health`（`ok` / `degraded_hash_mismatch` / `full_population_mode`）。 |
 | **排程契約（建議）** | **Snapshot updater**：缺檔、I/O、材化失敗 → **exit 非 0**，先修資料或路徑再重跑（不宜無限重試）。**Scorer**：ClickHouse 短暫錯誤可依 poll interval 重試；allowlist ／ manifest **結構性缺失**應 **fail-fast**（由程式抛錯退出）。 |
 | **回滾** | 自備份還原整份 `active_manifest.json` 及其指向的 `slow_patron_*.parquet` 與 `adt_allowed_players_*.parquet`（路徑須仍存在）；重啟 scorer。若僅要回到上一版名單，還原**整份** manifest + 兩個 parquet 指標檔，避免 slow 與 allowlist 版本錯配。 |
 
@@ -59,11 +59,16 @@
 | **建包（完整 CLI）** | `python -m trainer_hightier.build_deploy_package [--model-source … \| --model-version …] [--snapshot-manifest-source …] [--mapping-source …] [--output-dir …] [--archive] [--strict/--no-strict]`。**`--model-source` 與 `--model-version` 互斥**；優先順序：**顯式 `--model-source` > `--model-version` > latest**。預設 **`--strict`**：缺 slow / allowlist / `model.pkl` / mapping 即失敗。若 `training_metrics.json` 含 **`adt_allowlist_sha256`**，建置時**一律**比對打包後 allowlist 檔 SHA，不符即失敗。 |
 | **體積基準（約）** | 僅必要的 slow + allowlist + mapping + `model.pkl` 約數十 MB／版；若在 manifest 附上 `trial_bet_behavior` 層 parquet 會再增一檔個位數～數十 MB 級（視資料量）。磁碟請預留重複版本的空間。 |
 | **可追溯** | `bundle_info.json` 含 `frozen_fingerprint_sha256`（model_version + manifest_version + slow/allowlist/mapping SHA，不含 build_time）；同輸入重跑應維持相同 fingerprint。 |
-| **交付目錄** | `models/`、`snapshots/active_manifest.json`（內 Parquet 路徑相對 **`snapshots/`** 目錄）、`snapshots/artifacts/*.parquet`、`mapping/`、`local_state/`（空）、`bundle_info.json`、`deploy_bundle_paths.json`、`README_DEPLOY.md`、`requirements.txt`；`--archive` 另產 `<output-dir 名稱>.zip` 於其上一層。 |
-| **目標機啟動** | 執行環境須能 `import trainer` 與 `trainer_hightier`（建議自本儲存庫根安裝或設定 `PYTHONPATH`）。統一入口：`python -m trainer_hightier.deploy.main --bundle-dir <交付根目錄> --mode <all|api|scorer|validator> [--host … --port …]`；`mode=all` 為 API + validator 背景執行緒 + scorer 前景迴圈。 |
-| **驗收** | `GET /health`（須有 `local_state/state.db`，或由服務首次觸發建檔）；檢查 `deploy` 啟動 log 與 `bundle_info.json` 之版本／allowlist 摘要；正式環境勿關閉 `high_adt_only` 的除錯旗標。 |
+| **交付目錄** | `main.py`、`wheels/trainer_hightier-*.whl`、`requirements.txt`、`.env.example`、`models/`、`snapshots/active_manifest.json`（內 Parquet 路徑相對 **`snapshots/`** 目錄）、`snapshots/artifacts/*.parquet`、`mapping/`、`local_state/`（空）、`bundle_info.json`、`deploy_bundle_paths.json`、`README_DEPLOY.md`；`--archive` 另產 `<output-dir 名稱>.zip` 於其上一層。 |
+| **目標機啟動（Standalone）** | 在交付根目錄執行（相對路徑 wheel 依此目錄解析）：`python -m venv .venv` → `pip install -r requirements.txt` →（可選）自 `.env.example` 複製 `.env`。啟動：`python main.py --mode <all／api／scorer／validator>`。等效：`python -m trainer_hightier.deploy.main --bundle-dir <交付根> ...`。**不需** repo。 |
+| **驗收** | `GET /health`（須有 `local_state/state.db`；與 **同時** 建立的 `local_state/prediction_log.db`（若未停用 prediction log））；`GET /predictions` 在 scorer 寫入後應有列；檢查 `deploy` 啟動 log 與 `bundle_info.json` 之版本／allowlist 摘要；正式環境勿關閉 `high_adt_only` 的除錯旗標。 |
 | **搬機回滾** | 保留上一版 bundle 目錄或 zip；停服後換回舊目錄並以相同命令啟動；確認 `bundle_info.json` 與 scorer 啟動 log 中 manifest／allowlist 資訊與預期一致。 |
 
+**Phase B（serving wheel 瘦身，建包預設）**：`trainer-hightier` wheel 由 setuptools 自 `../trainer_hightier` 探索，但 **排除** `feature_experiment`、`tests`、`feast_repo`、`build` 等子樹；並設 **`include-package-data = false`**，只额外打包 `contracts/*.yaml`（避免把測試／實驗目錄當成發行資產打進 wheel）。建包前腳本會刪除 `trainer_hightier/build/`，避免 setuptools 暫存目錄造成 **pip wheel 快取命中舊的肥大 wheel** 或深層 `build/lib` 路徑。
+
+**Windows 目標機（無 Long Path 權限）**：將 bundle 與 venv 放在極短路徑（例如 `C:\\pwa\\b`、`C:\\pwa\\v`）；必要時以 `subst` 掛短磁碟代號；安裝後執行 `python -c "import trainer_hightier.utils; print(trainer_hightier.utils.__file__)"` 確認指向 `.venv\\Lib\\site-packages\\...`。
+
+**發版 gate（自動化）**：`trainer_hightier/tests/test_build_deploy_package.py` 內 `test_phase_b_wheel_excludes_junk_and_includes_serving` 檢查 wheel 不得含 `build/lib/`、`feature_experiment` 等；slow smoke 驗證 venv + `pip install -r requirements.txt` 後可 import `utils`／`serving.scorer`／`deploy.main`。
 
 - **`python -m trainer_hightier.trainer` 的 Step 5** 會讀 `trainer_hightier/contracts/feature_candidate_registry.yaml`（或 `--feature-candidate-registry`），以台帳中 **可選 baseline** 欄位（`status` 為 `active|experimental` 且 `enabled_for` 含 `baseline`）作為 `feature_columns`。
 - **單一真相**：baseline / candidate / ablation 選欄皆以 [`feature_candidate_registry.yaml`](trainer_hightier/contracts/feature_candidate_registry.yaml) 為準；baseline 列为 YAML 順序下 `enabled_for` 含 **`baseline`** 且 `status` 為 `active` 或 `experimental` 的列（**不可**對 `fe__*` 使用 baseline 槽）。主線 Step 5 與實驗皆由 `candidate_registry_loader` 載入。

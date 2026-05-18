@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from trainer_hightier.config import DEFAULT_MODEL_DIR
-from trainer.core.model_bundle_paths import resolve_model_bundle_dir
+from trainer_hightier.core.model_bundle_paths import resolve_model_bundle_dir
 
 
 @dataclass(frozen=True)

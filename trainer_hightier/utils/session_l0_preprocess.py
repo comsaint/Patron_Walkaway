@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from trainer.core.schema_io import normalize_bets_sessions
+from trainer_hightier.schema_normalize import normalize_bets_sessions
 from trainer_hightier.config import (
     PREPROCESS_DEDUP_BUCKET_ESCALATION_CEILING,
     DuckDbRuntimeConfig,

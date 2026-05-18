@@ -12,14 +12,18 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from trainer.training.data_sources import _BET_INGEST_READ_COLS_ORDERED
+from trainer_hightier.bet_contract import BET_INGEST_READ_COLS_ORDERED
 
 from trainer_hightier.config import BetPreprocessConfig, DuckDbRuntimeConfig
+from trainer_hightier.preprocess_bet_fix_registry import (
+    load_preprocess_bet_ingestion_fix_registry,
+    resolve_bet_ingest_fix004_cap_binding,
+)
+from trainer_hightier.utils.bet_l0_preprocess import default_preprocess_registry_yaml_path
 from trainer_hightier.utils.patron_session_metrics import materialize_adt_allowed_players_parquet
 
 _hpre = importlib.import_module("trainer_hightier.02_preprocess")
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_REGISTRY = _REPO_ROOT / "schema" / "preprocess_l0_data_contract_registry.yaml"
+_DEFAULT_REGISTRY = default_preprocess_registry_yaml_path()
 
 
 def read_cleaned_bet_dataset(path: Path | str) -> pd.DataFrame:
@@ -76,7 +80,7 @@ def _bet_row(**kwargs: object) -> dict[str, object]:
     merged.update(kwargs)
     if merged.get("gaming_day") is None:
         merged["gaming_day"] = pd.Timestamp(merged["payout_complete_dtm"]).date()
-    return {c: merged[c] for c in _BET_INGEST_READ_COLS_ORDERED}
+    return {c: merged[c] for c in BET_INGEST_READ_COLS_ORDERED}
 
 
 @pytest.fixture
@@ -88,11 +92,6 @@ def registry_path() -> Path:
 
 @pytest.fixture
 def cap_sec(registry_path: Path) -> int:
-    from pipelines.layered_data_assets.core.preprocess_bet_ingestion_fix_registry_v1 import (
-        load_preprocess_bet_ingestion_fix_registry,
-        resolve_bet_ingest_fix004_cap_binding,
-    )
-
     doc = load_preprocess_bet_ingestion_fix_registry(registry_path.resolve())
     cap, _, _, _ = resolve_bet_ingest_fix004_cap_binding(doc)
     return int(cap)
@@ -151,8 +150,7 @@ def test_preprocess_bet_synthetic_caps_after_event(registry_path: Path, cap_sec:
 
 def test_preprocess_bet_prediction_visible_ts_cf(registry_path: Path, tmp_path) -> None:
     """``prediction_visible_ts_cf`` matches DuckDB ceil-on-epoch formula in preprocess."""
-    from trainer.core._config_serving_runtime import SCORER_POLL_INTERVAL_SECONDS
-    from trainer.core._config_training_domain import BET_AVAIL_DELAY_MIN
+    from trainer_hightier.config import BET_AVAIL_DELAY_MIN, SCORER_POLL_INTERVAL_SECONDS
 
     t_pay = pd.Timestamp("2025-06-01 12:00:00")
     df = pd.DataFrame(
@@ -941,8 +939,9 @@ def test_bet_base_clean_cache_hit_with_stored_higher_dedup_buckets(
 
 
 def test_materialize_walkaway_labels_matches_trainer_labels(tmp_path: Path) -> None:
-    """Join cleaned bet + mapping, then parity with ``trainer.labels.compute_labels``."""
-    from trainer.labels import compute_labels
+    """Join cleaned bet + mapping, then parity with local :func:`~trainer_hightier.walkaway_compute_labels.compute_labels`."""
+
+    from trainer_hightier.walkaway_compute_labels import compute_labels
 
     from trainer_hightier.utils.walkaway_labels import materialize_walkaway_labels_from_cleaned_bet
 

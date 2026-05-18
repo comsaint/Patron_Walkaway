@@ -121,9 +121,7 @@ def preflight_scan_parquet_row_groups(path: Path, *, desc: str) -> None:
 
 
 # Mirrors ``trainer.training.data_sources``: column pushdown / contract lists.
-from trainer.training.data_sources import _BET_INGEST_READ_COLS_ORDERED
-
-_REQUIRED_BET_PARQUET_COLS: tuple[str, ...] = _BET_INGEST_READ_COLS_ORDERED
+from trainer_hightier.bet_contract import BET_INGEST_READ_COLS_ORDERED as _REQUIRED_BET_PARQUET_COLS
 
 _REQUIRED_SESSION_PARQUET_COLS: tuple[str, ...] = (
     "session_id",

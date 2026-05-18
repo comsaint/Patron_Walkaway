@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Final
 
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
+# Installed / editable package directory ``…/trainer_hightier/`` (contracts, modules).
+TRAINER_HIGHTIER_PACKAGE_DIR: Final[Path] = Path(__file__).resolve().parent
 # Versioned bundle root (parity with trainer ``DEFAULT_MODEL_DIR`` under ``out/``).
 DEFAULT_MODEL_DIR: Final[Path] = _REPO_ROOT / "out" / "models_high_tier_mvp"
 # Default root for Frozen deploy bundles emitted by ``build_deploy_package``.
@@ -25,6 +27,19 @@ DEFAULT_DEPLOY_OUTPUT_ROOT: Final[Path] = _REPO_ROOT / "out" / "deploy_hightier"
 DEFAULT_RANDOM_SEED: Final[int] = 42
 # Step 3 Feast feature service wired by :mod:`trainer_hightier.trainer`.
 DEFAULT_TRAINING_FEATURE_SERVICE: Final[str] = "walkaway_bet_trial_v1"
+
+# --- Shared domain constants (keep aligned with defaults in ``HightierServingConfig``) ---
+HK_TZ: Final[str] = "Asia/Hong_Kong"
+PLACEHOLDER_PLAYER_ID: Final[int] = -1
+CASINO_PLAYER_ID_CLEAN_SQL: Final[str] = (
+    "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "
+    "THEN NULL ELSE trim(casino_player_id) END"
+)
+WALKAWAY_GAP_MIN: Final[int] = 30
+ALERT_HORIZON_MIN: Final[int] = 15
+LABEL_LOOKAHEAD_MIN: Final[int] = 45
+BET_AVAIL_DELAY_MIN: Final[int] = 1
+SCORER_POLL_INTERVAL_SECONDS: Final[int] = 45
 
 # Baseline MODEL columns: softer FQG (high PSI → WARN; unique-constant under sample → WARN; WARN auto-allowlist).
 _FQG_BASELINE_MODEL_SOFT_COLUMNS: tuple[str, ...] = (
@@ -283,7 +298,7 @@ RUN_PROFILES: Final[dict[str, HighTierRunProfile]] = {
 DEFAULT_RUN_PROFILE_NAME: Final[str] = "default"
 
 # MLflow (trainer_hightier): experiment namespace for training runs.
-# Tracking URI and optional overrides load via ``trainer.core.mlflow_utils`` (credential/mlflow.env).
+# Tracking URI loads via ``trainer_hightier.core.mlflow_adapter`` (credential/mlflow.env pattern).
 MLFLOW_EXPERIMENT_TRAIN_HIGHTIER: Final[str] = "patron/patron_walkaway/prod/train_hightier"
 # Artifact subfolder within each MLflow run (avoid colliding with main trainer ``model_bundle`` layout).
 MLFLOW_HIGHTIER_ARTIFACT_PREFIX: Final[str] = "hightier_run"
@@ -319,7 +334,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60.0 * 30 * 1  # 1 hour = 60*60
+    optuna_timeout_sec: float = 60.0 * 1 * 1  # 1 hour = 60*60
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000
@@ -380,10 +395,20 @@ class HightierServingConfig:
     #: Upper bound on cold-start / backfill window for incremental fetches (hours).
     scorer_dynamic_lookback_cap_hours: int = 168
     hightier_scorer_max_bets_per_cycle: int = 2000
+    #: Split ADT allowlist ``player_id`` IN-lists into chunks of this size (ClickHouse query limits).
+    hightier_scorer_player_id_chunk_size: int = 500
+    #: Cap rows buffered while merging chunk query results (0 = disabled). Prevents OOM if mis-tuned.
+    hightier_scorer_chunk_merge_row_cap: int = 0
+    #: Max distinct ``player_id`` values passed to the hot bet-pool fetch per cycle (OOM guard).
+    hightier_scorer_pool_player_fanout_cap: int = 5000
     #: Hours of bet history loaded for 1h rolling features (per cycle, per player pool).
     hot_feature_pool_lookback_hours: int = 6
     state_db_path: Path = field(
         default_factory=lambda: _REPO_ROOT / "trainer_hightier" / "local_state" / "state.db"
+    )
+    #: All scored rows (pre-alert filter); ``None`` disables writes.
+    prediction_log_db_path: Path | None = field(
+        default_factory=lambda: _REPO_ROOT / "trainer_hightier" / "local_state" / "prediction_log.db"
     )
     feature_state_db_path: Path = field(
         default_factory=lambda: _REPO_ROOT / "trainer_hightier" / "local_state" / "feature_state.db"

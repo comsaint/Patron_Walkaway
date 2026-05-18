@@ -1,4 +1,4 @@
-"""Flask ML API compatible with trainer ``/alerts`` and ``/validation`` (SQLite state.db only)."""
+"""Flask ML API: ``/alerts``, ``/validation``, ``/health``, ``/predictions`` (SQLite)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ import pandas as pd
 from flask import Flask, jsonify, request
 from zoneinfo import ZoneInfo
 
-from trainer_hightier.serving.runtime_config import HK_TZ, STATE_DB_PATH
+from trainer_hightier.serving.prediction_log import init_prediction_log_db
+from trainer_hightier.serving.runtime_config import HK_TZ, PREDICTION_LOG_DB_PATH, STATE_DB_PATH
 from trainer_hightier.serving.state_db import apply_sqlite_serving_pragmas, init_state_db
 
 logger = logging.getLogger(__name__)
@@ -21,8 +22,13 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 
-def get_db_conn() -> sqlite3.Connection:
+def _init_state_and_prediction_log_dbs() -> None:
     init_state_db(STATE_DB_PATH)
+    init_prediction_log_db(PREDICTION_LOG_DB_PATH)
+
+
+def get_db_conn() -> sqlite3.Connection:
+    _init_state_and_prediction_log_dbs()
     conn = sqlite3.connect(STATE_DB_PATH)
     conn.row_factory = sqlite3.Row
     apply_sqlite_serving_pragmas(conn)
@@ -210,10 +216,57 @@ def _validation_to_protocol_records(df: pd.DataFrame) -> list[dict]:
     return out.to_dict(orient="records")
 
 
+def _predictions_24h_cutoff() -> datetime:
+    return datetime.now(ZoneInfo(HK_TZ)) - timedelta(hours=24)
+
+
+def _query_predictions_df(
+    ts_param: str | None = None,
+    limit_param: str | None = None,
+    *,
+    default_24h: bool = False,
+) -> pd.DataFrame:
+    if PREDICTION_LOG_DB_PATH is None:
+        return pd.DataFrame()
+    plp = Path(PREDICTION_LOG_DB_PATH)
+    if not plp.is_file():
+        return pd.DataFrame()
+    with sqlite3.connect(plp) as conn:
+        df = pd.read_sql_query("SELECT * FROM prediction_log", conn)
+    if df.empty:
+        return df
+    df["scored_dt"] = pd.to_datetime(df["scored_at"], errors="coerce")
+    df = df.dropna(subset=["scored_dt"]).sort_values("scored_dt")
+    if ts_param:
+        try:
+            ts_dt = pd.to_datetime(ts_param)
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.tz_localize(ZoneInfo(HK_TZ))
+            else:
+                ts_dt = ts_dt.tz_convert(ZoneInfo(HK_TZ))
+            df = df[df["scored_dt"] > ts_dt]
+        except Exception:
+            pass
+    elif default_24h:
+        df = df[df["scored_dt"] > _predictions_24h_cutoff()]
+    if limit_param is not None and not ts_param:
+        try:
+            lim = int(limit_param)
+            if lim > 0:
+                df = df.tail(lim)
+        except (TypeError, ValueError):
+            pass
+    return df
+
+
 @app.route("/health", methods=["GET"])
 def health():
     ok = Path(STATE_DB_PATH).is_file()
-    body = {"ok": bool(ok), "state_db": str(STATE_DB_PATH)}
+    body = {
+        "ok": bool(ok),
+        "state_db": str(STATE_DB_PATH),
+        "prediction_log_db": str(PREDICTION_LOG_DB_PATH) if PREDICTION_LOG_DB_PATH else None,
+    }
     code = 200 if ok else 503
     resp = jsonify(body)
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -248,6 +301,42 @@ def ml_validation():
     return resp
 
 
+@app.route("/predictions", methods=["GET"])
+def ml_predictions():
+    """Read-only recent rows from ``prediction_log`` (all scored bets, not only alerts)."""
+    if PREDICTION_LOG_DB_PATH is None:
+        resp = jsonify({"predictions": [], "enabled": False})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp
+    ts_param = request.args.get("ts")
+    limit_param = request.args.get("limit")
+    df = _query_predictions_df(ts_param=ts_param, limit_param=limit_param, default_24h=True)
+    if df.empty:
+        resp = jsonify({"predictions": [], "enabled": True})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp
+    cols = [
+        "prediction_id",
+        "scored_at",
+        "bet_id",
+        "player_id",
+        "canonical_id",
+        "model_version",
+        "score",
+        "margin",
+        "is_alert",
+        "is_rated_obs",
+    ]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    out = df[cols].replace({np.nan: None, np.inf: None, -np.inf: None})
+    records = out.to_dict(orient="records")
+    resp = jsonify({"predictions": records, "enabled": True})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     import argparse
 
@@ -256,7 +345,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     pr.add_argument("--host", default="127.0.0.1")
     pr.add_argument("--port", type=int, default=8001)
     args = pr.parse_args(argv)
-    init_state_db(STATE_DB_PATH)
+    _init_state_and_prediction_log_dbs()
     app.run(host=args.host, port=int(args.port), threaded=True)
     return 0
 

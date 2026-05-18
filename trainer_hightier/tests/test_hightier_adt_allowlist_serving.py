@@ -151,7 +151,9 @@ def test_score_once_allowlist_all_skipped_advances_watermark(monkeypatch: pytest
         set_last_processed_etl_insert(conn, (etl - pd.Timedelta(hours=1)).to_pydatetime())
         conn.commit()
 
-    monkeypatch.setattr(scorer_mod, "fetch_bets_incremental", lambda *a, **k: bets)
+    mini_probe = bets[["bet_id", "__etl_insert_Dtm", "payout_complete_dtm"]].copy()
+    monkeypatch.setattr(scorer_mod, "fetch_bets_incremental_etl_probe", lambda *a, **k: mini_probe)
+    monkeypatch.setattr(scorer_mod, "fetch_bets_incremental", lambda *a, **k: pd.DataFrame())
     monkeypatch.setattr(scorer_mod, "fetch_bet_pool_window", lambda *a, **k: pd.DataFrame())
 
     bundle = MagicMock(

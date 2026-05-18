@@ -22,11 +22,19 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import yaml
-from trainer.training.data_sources import _BET_INGEST_READ_COLS_ORDERED
+from trainer_hightier.bet_contract import BET_INGEST_READ_COLS_ORDERED
 from trainer_hightier.config import (
+    BET_AVAIL_DELAY_MIN,
+    DuckDbRuntimeConfig,
     PREPROCESS_DEDUP_BUCKET_ESCALATION_CEILING,
     BetPreprocessConfig,
-    DuckDbRuntimeConfig,
+    PLACEHOLDER_PLAYER_ID,
+    SCORER_POLL_INTERVAL_SECONDS,
+)
+from trainer_hightier.preprocess_bet_fix_registry import (
+    bundled_preprocess_registry_yaml_path,
+    load_preprocess_bet_ingestion_fix_registry,
+    resolve_bet_ingest_fix004_cap_binding,
 )
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas, execute_sql_with_progress_oom_retry
 
@@ -138,22 +146,18 @@ def _path_posix(path: Path) -> str:
 
 
 def default_preprocess_registry_yaml_path() -> Path:
-    """Repo ``schema/preprocess_l0_data_contract_registry.yaml``."""
-    return Path(__file__).resolve().parents[2] / "schema" / "preprocess_l0_data_contract_registry.yaml"
+    """Bundled ``trainer_hightier/contracts/preprocess_l0_data_contract_registry.yaml``."""
+    return bundled_preprocess_registry_yaml_path()
 
 
 def _placeholder_player_id_i64() -> int:
-    """Trainer sentinel ``player_id`` (default -1); used in bet DQ."""
-    try:
-        from trainer.core._config_training_domain import PLACEHOLDER_PLAYER_ID as ph
+    """Trainer sentinel ``player_id`` (`PLACEHOLDER_PLAYER_ID`); used in bet DQ."""
 
-        return int(ph)
-    except Exception:
-        return -1
+    return int(PLACEHOLDER_PLAYER_ID)
 
 
 def _resolve_preprocess_registry(registry_yaml: Path | None) -> Path:
-    """Resolve ingest registry YAML path; default canonical repo schema file."""
+    """Resolve ingest registry YAML path; default bundled contracts YAML."""
     path = registry_yaml if registry_yaml is not None else default_preprocess_registry_yaml_path()
     p = Path(path).resolve()
     if not p.is_file():
@@ -162,17 +166,9 @@ def _resolve_preprocess_registry(registry_yaml: Path | None) -> Path:
 
 
 def _bet_cap_applied_rules(registry_yaml: Path) -> tuple[int, list[str]]:
-    """Load ``tables.t_bet`` and return ``BET-INGEST-FIX-004`` cap seconds plus manifest tags."""
-    try:
-        from pipelines.layered_data_assets.core.preprocess_bet_ingestion_fix_registry_v1 import (
-            load_preprocess_bet_ingestion_fix_registry,
-            resolve_bet_ingest_fix004_cap_binding,
-        )
-    except ModuleNotFoundError as exc:
-        raise ImportError(
-            "Bet preprocess requires ``pipelines.layered_data_assets.core.preprocess_bet_ingestion_fix_registry_v1``."
-        ) from exc
-    doc = load_preprocess_bet_ingestion_fix_registry(registry_yaml)
+    """Load ``tables.t_bet`` FIX-004 cap from preprocess registry YAML (local parser)."""
+
+    doc = load_preprocess_bet_ingestion_fix_registry(Path(registry_yaml))
     cap, _fid, _fver, applied = resolve_bet_ingest_fix004_cap_binding(doc)
     return int(cap), list(applied)
 
@@ -224,13 +220,13 @@ def _bet_episode_scalar_sql(tags: tuple[tuple[str, str], ...], *, obs_alias: str
 def _bet_preprocess_read_columns_ordered(schema_names: frozenset[str]) -> tuple[str, ...]:
     """Verify ``gmwds_t_bet`` has full GDP ingest list; return fixed read order."""
 
-    missing = tuple(c for c in _BET_INGEST_READ_COLS_ORDERED if c not in schema_names)
+    missing = tuple(c for c in BET_INGEST_READ_COLS_ORDERED if c not in schema_names)
     if missing:
         raise ValueError(
             "gmwds_t_bet Parquet missing columns required for ingest/preprocess "
-            f"(trainer.training.data_sources._BET_INGEST_READ_COLS_ORDERED): {list(missing)}"
+            f"(trainer_hightier.bet_contract.BET_INGEST_READ_COLS_ORDERED): {list(missing)}"
         )
-    return _BET_INGEST_READ_COLS_ORDERED
+    return BET_INGEST_READ_COLS_ORDERED
 
 
 def _bet_optional_flag_sql(names: frozenset[str]) -> list[str]:
@@ -268,19 +264,9 @@ def _bet_dq_where_sql(names: frozenset[str]) -> str:
 
 
 def _bet_feast_prediction_visible_alignment_params() -> tuple[int, int]:
-    """Return ``(bet_avail_delay_min, poll_interval_sec)`` aligned with scorer defaults.
+    """Return ``(bet_avail_delay_min, poll_interval_sec)`` aligned with Feast / serving semantics."""
 
-    Matches :data:`trainer.core._config_training_domain.BET_AVAIL_DELAY_MIN` and
-    :data:`trainer.core._config_serving_runtime.SCORER_POLL_INTERVAL_SECONDS`
-    when ``trainer`` is importable.
-    """
-    try:
-        from trainer.core._config_serving_runtime import SCORER_POLL_INTERVAL_SECONDS
-        from trainer.core._config_training_domain import BET_AVAIL_DELAY_MIN
-
-        return int(BET_AVAIL_DELAY_MIN), int(SCORER_POLL_INTERVAL_SECONDS)
-    except ImportError:
-        return 1, 45
+    return int(BET_AVAIL_DELAY_MIN), int(SCORER_POLL_INTERVAL_SECONDS)
 
 
 def cleaned_bet_dataset_glob_posix(dataset_root: Path) -> str:
@@ -1295,3 +1281,171 @@ def write_bet_clean_cache_manifest(
     mp.write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
     logger.info("[Step 2b] wrote bet clean cache manifest: %s", mp.resolve())
     return mp
+
+
+def patch_bet_preprocess_cache_manifest_file(
+    manifest_path: Path,
+    *,
+    preprocess_registry_yaml: Path,
+    partition_inventory_fingerprint_sha256_hex: str | None = None,
+) -> dict[str, Any]:
+    """Rewrite fingerprint-only fields in an on-disk bet cache sidecar (no Parquet recompute).
+
+    Updates module hash, registry stat, FIX-004 cap binding, and optional partition inventory
+    fingerprint. Preserves ``bet_base_cleaned`` / ``shard_stats`` blocks for fast one-off repair.
+    """
+
+    mp = Path(manifest_path).resolve()
+    if not mp.is_file():
+        raise FileNotFoundError(f"bet cache manifest missing: {mp}")
+    reg = _resolve_preprocess_registry(preprocess_registry_yaml)
+    cap_sec, applied = _bet_cap_applied_rules(reg)
+    data = dict(json.loads(mp.read_text(encoding="utf-8")))
+    data["bet_l0_preprocess_py_sha256"] = _bet_l0_preprocess_py_sha256()
+    data["preprocess_registry"] = _registry_stat_dict(reg)
+    data["bet_ingest_cap_sec"] = int(cap_sec)
+    data["applied_registry_fix_rules"] = list(applied)
+    if partition_inventory_fingerprint_sha256_hex is not None:
+        data["partition_inventory_fingerprint_sha256_hex"] = str(
+            partition_inventory_fingerprint_sha256_hex,
+        ).strip()
+    mp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    logger.info("[bet cache] patched manifest metadata: %s", mp)
+    return data
+
+
+def refresh_bet_preprocess_cache_manifests(
+    *,
+    partition_snapshot_dir: Path | None = None,
+    base_cleaned_parquet: Path | None = None,
+    segment_cleaned_parquet: Path | None = None,
+    preprocess_registry_yaml: Path | None = None,
+    adt_filter_quantile: float | None = None,
+    adt_allowed_players_parquet: Path | None = None,
+    dedup_hash_buckets: int | None = None,
+) -> dict[str, bool]:
+    """One-shot repair: patch bet cache sidecars so ``*_cache_is_hit`` passes without DuckDB.
+
+    Reads ``bet_dedup_hash_buckets`` from the existing base sidecar when *dedup_hash_buckets*
+    is omitted. Verifies hits after patching; raises if segment/base still miss.
+    """
+
+    from trainer_hightier.utils.partition_inventory import (
+        infer_snapshot_id,
+        inventory_to_manifest_dict,
+        scan_partition_snapshot_dir,
+    )
+
+    snap = Path(partition_snapshot_dir or Path(__file__).resolve().parents[2] / "data" / "partitions").resolve()
+    reg = _resolve_preprocess_registry(
+        preprocess_registry_yaml or default_preprocess_registry_yaml_path(),
+    )
+    base_p = Path(base_cleaned_parquet or default_cleaned_bet_base_parquet_path()).resolve()
+    seg_p = Path(segment_cleaned_parquet or default_cleaned_bet_parquet_path()).resolve()
+    bet_rows, _ = scan_partition_snapshot_dir(snap)
+    if not bet_rows:
+        raise FileNotFoundError(f"no t_bet partition shards under {snap}")
+    inv_fp = inventory_to_manifest_dict(
+        infer_snapshot_id(snap),
+        snapshot_dir=snap,
+        bet_stats=bet_rows,
+        session_stats=[],
+    )["fingerprint_sha256_hex"]
+    inv_fp_s = str(inv_fp).strip()
+    merged_bets = tuple(sorted({r.path.resolve() for r in bet_rows}, key=str))
+    base_man = bet_base_clean_cache_manifest_path(base_p)
+    seg_man = bet_clean_cache_manifest_path(seg_p)
+    if not base_man.is_file():
+        raise FileNotFoundError(f"base bet cache sidecar missing: {base_man}")
+    stored_buckets = bet_base_manifest_dedup_hash_buckets(base_p)
+    buckets = int(dedup_hash_buckets if dedup_hash_buckets is not None else (stored_buckets or BetPreprocessConfig().dedup_hash_buckets))
+    patch_bet_preprocess_cache_manifest_file(
+        base_man,
+        preprocess_registry_yaml=reg,
+        partition_inventory_fingerprint_sha256_hex=inv_fp_s,
+    )
+    if seg_man.is_file():
+        patch_bet_preprocess_cache_manifest_file(
+            seg_man,
+            preprocess_registry_yaml=reg,
+            partition_inventory_fingerprint_sha256_hex=inv_fp_s,
+        )
+    q = adt_filter_quantile
+    allow_p = Path(adt_allowed_players_parquet).resolve() if adt_allowed_players_parquet is not None else None
+    if seg_man.is_file() and q is None:
+        prev_seg = json.loads(seg_man.read_text(encoding="utf-8"))
+        adt_blk = prev_seg.get("adt_segment")
+        if isinstance(adt_blk, dict) and adt_blk.get("quantile") is not None:
+            q = float(adt_blk["quantile"])
+    if allow_p is None and q is not None:
+        from trainer_hightier.utils.patron_session_metrics import default_adt_allowed_players_parquet_path
+
+        allow_p = default_adt_allowed_players_parquet_path(float(q)).resolve()
+    base_hit = bet_base_clean_cache_is_hit(
+        merged_bets,
+        base_p,
+        preprocess_registry_yaml=reg,
+        dedup_hash_buckets=buckets,
+        partition_inventory_fingerprint_sha256_hex=inv_fp_s,
+    )
+    seg_hit = False
+    if seg_man.is_file() and allow_p is not None and q is not None:
+        seg_hit = bet_clean_cache_is_hit(
+            merged_bets[0],
+            seg_p,
+            preprocess_registry_yaml=reg,
+            dedup_hash_buckets=buckets,
+            adt_filter_quantile=float(q),
+            adt_allowed_players_parquet=allow_p,
+            extra_source_bet_parquets=merged_bets[1:] or None,
+            bet_base_cleaned_parquet=base_p,
+            partition_inventory_fingerprint_sha256_hex=inv_fp_s,
+        )
+    out = {"bet_base_clean_cache_hit": bool(base_hit), "bet_segment_clean_cache_hit": bool(seg_hit)}
+    if not base_hit:
+        raise RuntimeError(
+            "bet base cache still misses after manifest patch; "
+            "source shard stats or dedup_hash_buckets may have drifted — inspect "
+            f"{base_man}"
+        )
+    if seg_man.is_file() and not seg_hit:
+        raise RuntimeError(
+            "bet segment cache still misses after manifest patch; "
+            "adt allowlist or bet_base_cleaned shard fingerprint may have drifted — inspect "
+            f"{seg_man}"
+        )
+    logger.info("[bet cache] refresh OK: %s", out)
+    return out
+
+
+def _cli_refresh_bet_cache_manifests(argv: list[str] | None = None) -> int:
+    """CLI: ``python -m trainer_hightier.utils.bet_l0_preprocess --refresh-cache-manifests``."""
+
+    import argparse
+
+    pr = argparse.ArgumentParser(description="Patch bet preprocess cache sidecars (no DuckDB recompute).")
+    pr.add_argument("--partition-snapshot-dir", type=Path, default=None)
+    pr.add_argument("--registry-yaml", type=Path, default=None)
+    pr.add_argument("--adt-quantile", type=float, default=None)
+    pr.add_argument("--adt-allowlist-parquet", type=Path, default=None)
+    pr.add_argument("--dedup-hash-buckets", type=int, default=None)
+    args = pr.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    refresh_bet_preprocess_cache_manifests(
+        partition_snapshot_dir=args.partition_snapshot_dir,
+        preprocess_registry_yaml=args.registry_yaml,
+        adt_filter_quantile=args.adt_quantile,
+        adt_allowed_players_parquet=args.adt_allowlist_parquet,
+        dedup_hash_buckets=args.dedup_hash_buckets,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--refresh-cache-manifests":
+        raise SystemExit(_cli_refresh_bet_cache_manifests(sys.argv[2:]))
+    raise SystemExit(
+        "Usage: python -m trainer_hightier.utils.bet_l0_preprocess --refresh-cache-manifests"
+    )

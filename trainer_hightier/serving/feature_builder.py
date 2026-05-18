@@ -37,7 +37,7 @@ def attach_synthetic_etl_and_prediction_visible(bets: pd.DataFrame) -> pd.DataFr
     etl = pd.to_datetime(bets["__etl_insert_Dtm"], errors="coerce")
     pcd = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce")
     cap_td = pd.Timedelta(minutes=adm)
-    syn = pd.Series(pd.NaT, index=bets.index)
+    syn = pd.Series(pd.NaT, index=bets.index, dtype=etl.dtype)
     ok = etl.notna() & pcd.notna()
     syn.loc[ok] = pd.concat(
         [etl.loc[ok], pcd.loc[ok] + cap_td],
@@ -49,17 +49,22 @@ def attach_synthetic_etl_and_prediction_visible(bets: pd.DataFrame) -> pd.DataFr
     poll_i = max(1, int(poll))
     base = pd.concat([syn, pcd + cap_td], axis=1).max(axis=1)
     bad = base.isna()
-    out["prediction_visible_ts_cf"] = pd.NaT
+    pv_col = pd.Series(pd.NaT, index=bets.index, dtype=pcd.dtype)
     if (~bad).any():
-        epoch_ns = base[~bad].astype("datetime64[ns]").astype("int64")
+        base_good = pd.to_datetime(base[~bad], errors="coerce")
+        if getattr(base_good.dt, "tz", None) is None:
+            base_good = base_good.dt.tz_localize("Asia/Hong_Kong", ambiguous="NaT", nonexistent="shift_forward")
+        base_good_utc = base_good.dt.tz_convert("UTC")
+        epoch_ns = base_good_utc.astype("int64")
         eceil = np.ceil(epoch_ns.astype("float64") / (float(poll_i) * 1e9)) * (float(poll_i) * 1e9)
         pv_good = pd.to_datetime(eceil.astype("int64"), unit="ns", utc=True)
         pcd_tz = bets["payout_complete_dtm"].dt.tz
         if pcd_tz is None:
-            pv_hk = pv_good.dt.tz_convert("Asia/Hong_Kong")
+            pv_out = pv_good.dt.tz_convert("Asia/Hong_Kong")
         else:
-            pv_hk = pv_good.dt.tz_convert(pcd_tz)
-        out.loc[~bad, "prediction_visible_ts_cf"] = pv_hk.to_numpy()
+            pv_out = pv_good.dt.tz_convert(pcd_tz)
+        pv_col.loc[~bad] = pv_out.to_numpy()
+    out["prediction_visible_ts_cf"] = pv_col
     return out
 
 

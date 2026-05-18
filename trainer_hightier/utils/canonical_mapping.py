@@ -15,9 +15,13 @@ from typing import Any
 import pandas as pd
 import pyarrow.parquet as pq
 
-from trainer.identity import build_canonical_mapping_from_links
-
-from trainer_hightier.config import CanonicalMappingConfig, DuckDbRuntimeConfig
+from trainer_hightier.canonical_from_links import build_canonical_mapping_from_links
+from trainer_hightier.config import (
+    CASINO_PLAYER_ID_CLEAN_SQL,
+    CanonicalMappingConfig,
+    DuckDbRuntimeConfig,
+    PLACEHOLDER_PLAYER_ID,
+)
 from trainer_hightier.utils.duckdb_runtime import (
     execute_query_df_with_progress,
     run_with_fresh_duck_connections_oom_retry,
@@ -88,18 +92,9 @@ def _dedup_cte(path_posix: str) -> str:
 
 
 def _resolve_clean_sql_and_placeholder() -> tuple[str, int]:
-    try:
-        from trainer.config import CASINO_PLAYER_ID_CLEAN_SQL as _sql  # type: ignore[import-untyped]
-        from trainer.config import PLACEHOLDER_PLAYER_ID as _ph  # type: ignore[import-untyped]
-    except ImportError:
-        _sql = (
-            "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "
-            "THEN NULL ELSE trim(casino_player_id) END"
-        )
-        _ph = -1
-    if ";" in (_sql or ""):
+    if ";" in (CASINO_PLAYER_ID_CLEAN_SQL or ""):
         raise ValueError("CASINO_PLAYER_ID_CLEAN_SQL must not contain ';'")
-    return str(_sql), int(_ph)
+    return str(CASINO_PLAYER_ID_CLEAN_SQL), int(PLACEHOLDER_PLAYER_ID)
 
 
 def _infer_cutoff_from_parquet(con: Any, path_posix: str) -> datetime:

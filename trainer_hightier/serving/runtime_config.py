@@ -47,6 +47,12 @@ SCORER_STATE_RETENTION_HOURS: int = _cfg.scorer_state_retention_hours
 
 # --- paths ---
 STATE_DB_PATH: Path = Path(_cfg.state_db_path).resolve()
+_raw_pl = getattr(_cfg, "prediction_log_db_path", None)
+PREDICTION_LOG_DB_PATH: Path | None = (
+    Path(_raw_pl).resolve()
+    if _raw_pl is not None and str(_raw_pl).strip()
+    else None
+)
 FEATURE_STATE_DB_PATH: Path = Path(_cfg.feature_state_db_path).resolve()
 SNAPSHOT_MANIFEST_DIR: Path = Path(_cfg.snapshot_manifest_dir).resolve()
 
