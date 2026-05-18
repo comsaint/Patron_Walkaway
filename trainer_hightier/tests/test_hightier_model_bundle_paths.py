@@ -45,6 +45,10 @@ def _minimal_success_execute(args: HighTierTrainArgs, metrics: dict) -> None:
     mp.write_bytes(b"h")
     metrics["training_metrics_path"] = str(tpm.resolve())
     metrics["model_path"] = str(mp.resolve())
+    split_src = bd.parent / "_step4_artifacts" / "split_report.json"
+    split_src.parent.mkdir(parents=True, exist_ok=True)
+    split_src.write_text('{"splits": [{"split": "train"}]}', encoding="utf-8")
+    metrics["step4_split_report"] = str(split_src.resolve())
 
 
 def test_run_training_success_writes_latest_manifest_resolve(
@@ -82,6 +86,9 @@ def test_run_training_success_writes_latest_manifest_resolve(
     assert (resolved / "run_summary.json").is_file()
     assert (resolved / "metrics_detailed.json").is_file()
     assert (resolved / "pipeline_debug.json").is_file()
+    assert (resolved / "split_report.json").is_file()
+    report = json.loads((resolved / "run_report.json").read_text(encoding="utf-8"))
+    assert report.get("step4_split_report_bundle") == str((resolved / "split_report.json").resolve())
 
 
 def test_run_training_raises_when_existing_model_under_version(

@@ -18,6 +18,7 @@ import hashlib
 import importlib
 import json
 import logging
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -93,6 +94,7 @@ logger = logging.getLogger("trainer_hightier")
 RUN_SUMMARY_FILENAME: Final[str] = "run_summary.json"
 METRICS_DETAILED_FILENAME: Final[str] = "metrics_detailed.json"
 PIPELINE_DEBUG_FILENAME: Final[str] = "pipeline_debug.json"
+SPLIT_REPORT_FILENAME: Final[str] = "split_report.json"
 
 _STEP5_CONFIG_DEFAULTS = Step5TrainConfig()
 _PARTITION_INGRESS_DEFAULTS = PartitionIngressConfig()
@@ -455,7 +457,10 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
                 str(metrics.get("training_metrics_path") or metrics.get("step5_training_metrics_path") or ""),
                 repo_root=repo_root,
             ),
-            "step4_split_report": _path_relative_to_repo(str(metrics.get("step4_split_report") or ""), repo_root=repo_root),
+            "step4_split_report": _path_relative_to_repo(
+                str(metrics.get("step4_split_report_bundle") or metrics.get("step4_split_report") or ""),
+                repo_root=repo_root,
+            ),
             "step4_splits_dir": _path_relative_to_repo(str(metrics.get("step4_splits_dir") or ""), repo_root=repo_root),
             "main_trainer_training_parquet_for_step4": _path_relative_to_repo(
                 str(metrics.get("main_trainer_training_parquet_for_step4") or ""),
@@ -465,6 +470,26 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
         "session_dedup_hash_buckets_effective": metrics.get("session_dedup_hash_buckets_effective"),
         "bet_dedup_hash_buckets_effective": metrics.get("bet_dedup_hash_buckets_effective"),
     }
+
+
+def _materialize_split_report_in_bundle(
+    bundle_dir: Path,
+    *,
+    source_report: str | Path | None,
+) -> Path | None:
+    """Copy Step 4 ``split_report.json`` into the model bundle directory."""
+
+    if source_report is None:
+        return None
+    src = Path(source_report).resolve()
+    if not src.is_file():
+        logger.warning("[Step 7] split report missing at %s; skip bundle copy.", src)
+        return None
+    dest = Path(bundle_dir).resolve() / SPLIT_REPORT_FILENAME
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    logger.info("[Step 7] copied split report to %s", dest.resolve())
+    return dest
 
 
 def write_hightier_training_logs(parent_dir: Path, metrics: dict[str, Any], args: HighTierTrainArgs) -> None:
@@ -610,7 +635,7 @@ def _log_mlflow_whitelist_artifacts(args: HighTierTrainArgs, metrics: dict[str, 
         pm = Path(str(smp_model))
         if pm.is_file():
             log_artifact_safe(pm, artifact_path=prefix)
-    sr = metrics.get("step4_split_report")
+    sr = metrics.get("step4_split_report_bundle") or metrics.get("step4_split_report")
     if sr:
         sp = Path(str(sr))
         if sp.is_file():
@@ -1258,6 +1283,13 @@ def run_training(args: HighTierTrainArgs) -> None:
                 _run_training_execute_steps(exec_args, metrics)
                 metrics["finish_epoch_ms"] = int(time.time() * 1000)
                 metrics["run_training_total_seconds"] = round(time.perf_counter() - t0, 3)
+                if exec_args.step5_bundle_dir is not None:
+                    bundle_sr = _materialize_split_report_in_bundle(
+                        exec_args.step5_bundle_dir.resolve(),
+                        source_report=metrics.get("step4_split_report"),
+                    )
+                    if bundle_sr is not None:
+                        metrics["step4_split_report_bundle"] = str(bundle_sr.resolve())
                 rp_parent = exec_args.step5_bundle_dir.resolve() if exec_args.step5_bundle_dir else versions_root
                 rp = rp_parent / "run_report.json"
                 rp.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
