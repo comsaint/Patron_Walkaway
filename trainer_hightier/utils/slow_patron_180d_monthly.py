@@ -1,8 +1,8 @@
 """Materialize slow-varying patron metrics (180d lookback, monthly snapshot) for Feast.
 
 Computes, per ``canonical_id``, monthly snapshot rows keyed by that patron's
-**first ``gaming_day`` in each calendar month** (HK local date from cleaned
-session). Each snapshot aggregates cleaned **sessions** in
+**last ``gaming_day`` in each calendar month** (month-end anchor; HK local date
+from cleaned session). Each snapshot aggregates cleaned **sessions** in
 ``[anchor - (lookback_days-1), anchor]`` (inclusive on both ends by calendar
 ``gaming_day``): ``SUM(theo_win)``, ``COUNT(DISTINCT gaming_day)``, and ADT =
 ``total_theo / distinct days`` (NULL if no distinct days).
@@ -141,7 +141,7 @@ monthly_anchors AS (
   SELECT
     canonical_id,
     DATE_TRUNC('month', gaming_day_d)::DATE AS cal_month,
-    MIN(gaming_day_d) AS anchor_gaming_day
+    MAX(gaming_day_d) AS anchor_gaming_day
   FROM sessions_mapped
   GROUP BY canonical_id, DATE_TRUNC('month', gaming_day_d)::DATE
 ),
@@ -213,6 +213,106 @@ LEFT JOIN LATERAL (
   LIMIT 1
 ) lst ON TRUE
 """.strip()
+
+
+def _canonical_asof_sql(*, sess_esc: str, map_esc: str, lookback_days: int) -> str:
+    """Canonical-grain monthly ASOF rows (production serving; no bet-grain expansion)."""
+
+    if lookback_days < 1:
+        raise ValueError(f"lookback_days must be >= 1, got {lookback_days!r}")
+    span = int(lookback_days) - 1
+    return f"""
+WITH sessions_mapped AS (
+  SELECT
+    TRIM(CAST(m.canonical_id AS VARCHAR)) AS canonical_id,
+    CAST(s.gaming_day AS DATE) AS gaming_day_d,
+    COALESCE(TRY_CAST(s.theo_win AS DOUBLE), 0.0) AS theo_win
+  FROM read_parquet('{sess_esc}') s
+  INNER JOIN (
+    SELECT
+      TRY_CAST(player_id AS BIGINT) AS player_id,
+      ANY_VALUE(TRIM(CAST(canonical_id AS VARCHAR))) AS canonical_id
+    FROM read_parquet('{map_esc}')
+    WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
+    GROUP BY player_id
+  ) m ON TRY_CAST(s.player_id AS BIGINT) = m.player_id
+  WHERE s.gaming_day IS NOT NULL
+    AND CAST(s.gaming_day AS DATE) IS NOT NULL
+    AND TRIM(CAST(m.canonical_id AS VARCHAR)) <> ''
+),
+monthly_anchors AS (
+  SELECT
+    canonical_id,
+    DATE_TRUNC('month', gaming_day_d)::DATE AS cal_month,
+    MAX(gaming_day_d) AS anchor_gaming_day
+  FROM sessions_mapped
+  GROUP BY canonical_id, DATE_TRUNC('month', gaming_day_d)::DATE
+),
+snapshots AS (
+  SELECT
+    ma.canonical_id,
+    ma.anchor_gaming_day,
+    COALESCE(SUM(s.theo_win), 0.0) AS patron__theo_win_sum__w180d_m1snap,
+    CAST(COUNT(DISTINCT s.gaming_day_d) AS BIGINT) AS patron__gaming_days_cnt__w180d_m1snap,
+    CASE
+      WHEN COUNT(DISTINCT s.gaming_day_d) > 0 THEN
+        CAST(COALESCE(SUM(s.theo_win), 0.0) AS DOUBLE)
+          / CAST(COUNT(DISTINCT s.gaming_day_d) AS DOUBLE)
+      ELSE CAST(NULL AS DOUBLE)
+    END AS patron__adt__w180d_m1snap
+  FROM monthly_anchors ma
+  INNER JOIN sessions_mapped s
+    ON s.canonical_id = ma.canonical_id
+   AND s.gaming_day_d <= ma.anchor_gaming_day
+   AND s.gaming_day_d >= ma.anchor_gaming_day - INTERVAL '{span}' DAY
+  GROUP BY ma.canonical_id, ma.anchor_gaming_day
+)
+SELECT
+  canonical_id,
+  anchor_gaming_day,
+  patron__theo_win_sum__w180d_m1snap,
+  patron__gaming_days_cnt__w180d_m1snap,
+  patron__adt__w180d_m1snap
+FROM snapshots
+""".strip()
+
+
+def materialize_slow_patron_180d_canonical_asof(
+    cleaned_session_parquet: Path | None = None,
+    canonical_mapping_parquet: Path | None = None,
+    out_parquet: Path | None = None,
+    *,
+    lookback_days: int = 180,
+    duckdb_runtime: DuckDbRuntimeConfig | None = None,
+) -> Path:
+    """Write canonical ASOF slow patron Parquet for production serving (no ``bet_id`` grain)."""
+
+    src_sess = Path(cleaned_session_parquet or default_cleaned_session_parquet_path()).resolve()
+    src_map = Path(canonical_mapping_parquet or default_canonical_mapping_parquet_path()).resolve()
+    dst = Path(out_parquet or (src_sess.parent / "slow_patron_180d_canonical_asof.parquet")).resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    for p, name in ((src_sess, "cleaned session"), (src_map, "canonical mapping")):
+        if not p.is_file():
+            raise FileNotFoundError(f"{name} parquet not found: {p}")
+    sess_cols = set(pq.read_schema(src_sess).names)
+    miss_s = sorted({"player_id", "gaming_day", "theo_win"} - sess_cols)
+    if miss_s:
+        raise ValueError(f"cleaned session missing columns {miss_s}")
+    inner = _canonical_asof_sql(
+        sess_esc=_path_posix(src_sess).replace("'", "''"),
+        map_esc=_path_posix(src_map).replace("'", "''"),
+        lookback_days=lookback_days,
+    )
+    dst_esc = _path_posix(dst).replace("'", "''")
+    con = duckdb.connect(database=":memory:")
+    try:
+        if duckdb_runtime is not None:
+            apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        con.execute(f"COPY ({inner}) TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)")
+    finally:
+        con.close()
+    logger.info("slow_patron_180d_canonical_asof: written %s lookback_days=%d", dst, lookback_days)
+    return dst
 
 
 def materialize_slow_patron_180d_monthly(

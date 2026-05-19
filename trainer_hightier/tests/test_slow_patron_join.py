@@ -60,6 +60,31 @@ def test_join_slow_patron_inference_gaming_day_column(tmp_path: Path) -> None:
     assert float(got.iloc[0]["patron__theo_win_sum__w180d_m1snap"]) == 20.0
 
 
+def test_join_slow_patron_canonical_asof_grain(tmp_path: Path) -> None:
+    """Production canonical ASOF parquet joins on canonical_id (not training bet_id)."""
+
+    slow = tmp_path / "slow_canon.parquet"
+    pd.DataFrame(
+        {
+            "canonical_id": ["c1", "c1"],
+            "anchor_gaming_day": pd.to_datetime(["2025-01-01", "2025-06-01"]),
+            "patron__theo_win_sum__w180d_m1snap": [10.0, 50.0],
+            "patron__gaming_days_cnt__w180d_m1snap": [1, 5],
+            "patron__adt__w180d_m1snap": [10.0, 10.0],
+        }
+    ).to_parquet(slow, index=False)
+
+    bets = pd.DataFrame(
+        {
+            "bet_id": [99.0],
+            "canonical_id": ["c1"],
+            "gaming_day": pd.to_datetime(["2025-06-15"]),
+        }
+    )
+    got = join_slow_patron_snapshot(bets, Path(slow), slow_grain="canonical_asof")
+    assert float(got.iloc[0]["patron__theo_win_sum__w180d_m1snap"]) == 50.0
+
+
 def test_join_slow_patron_prefers_anchor_gaming_day_when_present(tmp_path: Path) -> None:
     """When both anchors exist (should be rare), prefer ``anchor_gaming_day`` like training DSL."""
 

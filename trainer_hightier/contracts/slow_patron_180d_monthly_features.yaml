@@ -10,8 +10,9 @@ semantics:
   canonical_space: Sessions and metrics are aggregated in ``canonical_id`` (via player mapping).
   monthly_anchor: >-
     For each ``canonical_id`` and each calendar month present in that patron's session ``gaming_day``
-    values, ``anchor_gaming_day = MIN(gaming_day)`` in that month (first gaming day of the month for
-    that patron). Snapshots are computed only on those anchors (not every session day).
+    values, ``anchor_gaming_day = MAX(gaming_day)`` in that month (last gaming day of the month for
+    that patron; month-end anchor). Snapshots are computed only on those anchors (not every session day).
+    Monthly production refresh on the 1st uses data through the prior calendar month-end anchor.
   lookback_window: >-
     Inclusive calendar dates: ``gaming_day`` in ``[anchor_gaming_day - (lookback_days - 1), anchor_gaming_day]``.
     Default ``lookback_days`` is 180 (180 distinct calendar dates when the full prefix exists).
