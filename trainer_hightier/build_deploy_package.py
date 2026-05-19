@@ -375,6 +375,7 @@ def _static_parquet_minimum_contracts(
 ) -> None:
     """Structural gates independent of frozen registry (keys + slow anchor)."""
 
+    # Legacy bundles may omit ``casino_player_id``; serving falls back to ``canonical_id``.
     _ensure_parquet_columns(map_dest_path, role="canonical_mapping", required=("player_id", "canonical_id"))
     if allow_pack_path is not None and allow_pack_path.is_file():
         _ensure_parquet_columns(allow_pack_path, role="adt_allowlist", required=("player_id",))

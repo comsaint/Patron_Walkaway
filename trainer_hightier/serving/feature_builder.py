@@ -70,25 +70,42 @@ def attach_synthetic_etl_and_prediction_visible(bets: pd.DataFrame) -> pd.DataFr
 
 
 def _read_canonical_map(path: Path) -> pd.DataFrame:
+    """Load mapping parquet; supports legacy two-column files via ``casino_player_id`` fallback."""
     if not path.is_file():
         raise FileNotFoundError(f"canonical mapping parquet missing: {path}")
-    df = pd.read_parquet(path, columns=["player_id", "canonical_id"])
+    schema_names = set(pq.read_schema(path).names)
+    cols = ["player_id", "canonical_id"]
+    if "casino_player_id" in schema_names:
+        cols.append("casino_player_id")
+    df = pd.read_parquet(path, columns=cols)
     df = df.dropna(subset=["player_id"])
     df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce").astype("Int64")
     df["canonical_id"] = df["canonical_id"].astype(str)
+    if "casino_player_id" not in df.columns:
+        df["casino_player_id"] = df["canonical_id"].astype(str)
+    else:
+        df["casino_player_id"] = df["casino_player_id"].astype(str)
     return df.drop_duplicates(subset=["player_id"], keep="last")
 
 
 def attach_canonical_id(bets: pd.DataFrame, mapping_parquet: Path | None = None) -> pd.DataFrame:
-    """Left-join ``canonical_id``; fallback to string ``player_id`` when unmapped."""
+    """Left-join ``canonical_id`` and ``casino_player_id``; fallback canonical to ``player_id`` when unmapped.
+
+    Drops placeholder ``casino_player_id`` from ClickHouse (often all-null) before merge to avoid ``_x/_y``
+    suffix collisions.
+    """
     if bets.empty:
         return bets
     mp = Path(mapping_parquet or default_canonical_mapping_parquet_path()).resolve()
     cmap = _read_canonical_map(mp)
-    out = bets.merge(cmap, on="player_id", how="left")
+    work = bets.drop(columns=["casino_player_id"], errors="ignore")
+    out = work.merge(cmap, on="player_id", how="left")
     fallback = out["player_id"].astype(str)
     co = out["canonical_id"]
-    out["canonical_id"] = co.where(co.notna() & (co.astype(str).str.strip() != ""), fallback)
+    mapped = co.notna() & (co.astype(str).str.strip() != "")
+    out["canonical_id"] = co.where(mapped, fallback)
+    cp = out["casino_player_id"]
+    out["casino_player_id"] = cp.where(mapped, pd.NA)
     return out
 
 

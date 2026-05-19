@@ -324,8 +324,11 @@ def ml_predictions():
         "model_version",
         "score",
         "margin",
+        "threshold",
         "is_alert",
         "is_rated_obs",
+        "features_json",
+        "fe_features_missing",
     ]
     for c in cols:
         if c not in df.columns:

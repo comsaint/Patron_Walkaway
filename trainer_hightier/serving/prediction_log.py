@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -11,6 +12,12 @@ import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+_PREDICTION_LOG_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("threshold", "REAL"),
+    ("features_json", "TEXT"),
+    ("fe_features_missing", "INTEGER"),
+)
 
 
 def init_prediction_log_db(db_path: Path | str | None) -> Path | None:
@@ -36,6 +43,19 @@ def init_prediction_log_db(db_path: Path | str | None) -> Path | None:
     return p
 
 
+def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {str(r[1]) for r in rows}
+
+
+def _migrate_prediction_log_columns(conn: sqlite3.Connection) -> None:
+    """Add audit columns to existing DBs (idempotent)."""
+    have = _existing_columns(conn, "prediction_log")
+    for col_name, col_type in _PREDICTION_LOG_MIGRATION_COLUMNS:
+        if col_name not in have:
+            conn.execute(f"ALTER TABLE prediction_log ADD COLUMN {col_name} {col_type}")
+
+
 def ensure_prediction_log_table(conn: sqlite3.Connection) -> None:
     """Create ``prediction_log`` and indexes if missing."""
     conn.execute(
@@ -53,16 +73,64 @@ def ensure_prediction_log_table(conn: sqlite3.Connection) -> None:
             score REAL NOT NULL,
             margin REAL NOT NULL,
             is_alert INTEGER NOT NULL,
-            is_rated_obs INTEGER NOT NULL
+            is_rated_obs INTEGER NOT NULL,
+            threshold REAL,
+            features_json TEXT,
+            fe_features_missing INTEGER
         )
         """
     )
+    _migrate_prediction_log_columns(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_prediction_log_scored_at ON prediction_log(scored_at)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_prediction_log_model_version ON prediction_log(model_version)"
     )
+
+
+def _json_safe_scalar(v: Any) -> Any:
+    """Convert a single cell to a JSON-serializable value."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, (np.floating, float)):
+        fv = float(v)
+        return None if not np.isfinite(fv) else fv
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.bool_, bool)):
+        return bool(v)
+    if isinstance(v, (pd.Timestamp,)):
+        return v.isoformat()
+    if hasattr(v, "item"):
+        try:
+            return _json_safe_scalar(v.item())
+        except (TypeError, ValueError):
+            pass
+    if isinstance(v, (str, int, float, bool)):
+        return v
+    return str(v)
+
+
+def _feature_row_dict(row: pd.Series, feature_columns: tuple[str, ...]) -> dict[str, Any]:
+    """Build feature name → value map for one scored row (model input values)."""
+    return {str(c): _json_safe_scalar(row.get(c)) for c in feature_columns}
+
+
+def _count_fe_features_missing(feat: dict[str, Any]) -> int:
+    """Count ``fe__*`` keys with null/missing values."""
+    n = 0
+    for k, v in feat.items():
+        if not str(k).startswith("fe__"):
+            continue
+        if v is None:
+            n += 1
+    return n
 
 
 def _str_or_none(v: Any) -> str | None:
@@ -87,10 +155,16 @@ def append_hightier_prediction_log(
     staged: pd.DataFrame,
     prob: np.ndarray,
     threshold: float,
+    features: pd.DataFrame | None = None,
+    feature_columns: tuple[str, ...] | None = None,
 ) -> None:
     """Batch-insert one scoring cycle into ``prediction_log`` (no-op if path disabled or frame empty).
 
-    ``is_alert`` matches scorer alert rule: ``margin >= 0`` and ``is_rated_obs == 1``.
+    When ``features`` and ``feature_columns`` are provided, each row stores a JSON object of
+    model input values in ``features_json`` plus ``fe_features_missing`` (count of null ``fe__*``).
+
+    ``is_alert`` here means ``margin >= 0`` and ``is_rated_obs == 1`` (audit flag; scorer
+    ``state.db`` alerts use ``score >= threshold`` on all rows).
     """
     if db_path is None or not str(db_path).strip():
         return
@@ -102,6 +176,18 @@ def append_hightier_prediction_log(
         raise ValueError(
             f"prob length {len(prob)} != staged length {len(staged)}; cannot write prediction_log"
         )
+    feat_cols: tuple[str, ...] = ()
+    feat_frame: pd.DataFrame | None = None
+    if features is not None and feature_columns:
+        feat_cols = tuple(str(c) for c in feature_columns)
+        if len(features) != len(staged):
+            raise ValueError(
+                f"features length {len(features)} != staged length {len(staged)}; cannot write prediction_log"
+            )
+        miss = [c for c in feat_cols if c not in features.columns]
+        if miss:
+            raise ValueError(f"features frame missing model columns: {miss}")
+        feat_frame = features.reset_index(drop=True)
 
     nom = (
         staged["casino_player_id"]
@@ -110,12 +196,20 @@ def append_hightier_prediction_log(
     )
     is_rated_obs = (nom.notna() & (nom.astype(str).str.strip() != "")).astype(int)
     score = np.asarray(prob, dtype=np.float64)
-    margin = score - float(threshold)
+    thr = float(threshold)
+    margin = score - thr
     is_alert = ((margin >= 0.0) & (is_rated_obs.to_numpy() == 1)).astype(int)
 
+    staged_reset = staged.reset_index(drop=True)
     rows: list[tuple[Any, ...]] = []
-    for pos in range(len(staged)):
-        row = staged.iloc[pos]
+    for pos in range(len(staged_reset)):
+        row = staged_reset.iloc[pos]
+        feat_json: str | None = None
+        fe_miss: int | None = None
+        if feat_frame is not None and feat_cols:
+            feat_map = _feature_row_dict(feat_frame.iloc[pos], feat_cols)
+            feat_json = json.dumps(feat_map, separators=(",", ":"), ensure_ascii=False)
+            fe_miss = _count_fe_features_missing(feat_map)
         rows.append(
             (
                 scored_at,
@@ -130,6 +224,9 @@ def append_hightier_prediction_log(
                 float(margin[pos]),
                 int(is_alert[pos]),
                 int(is_rated_obs.iloc[pos]),
+                thr,
+                feat_json,
+                fe_miss,
             )
         )
 
@@ -143,8 +240,8 @@ def append_hightier_prediction_log(
             INSERT INTO prediction_log (
                 scored_at, bet_id, session_id, player_id, canonical_id,
                 casino_player_id, table_id, model_version, score, margin,
-                is_alert, is_rated_obs
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_alert, is_rated_obs, threshold, features_json, fe_features_missing
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

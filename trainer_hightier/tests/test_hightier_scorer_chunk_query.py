@@ -174,6 +174,7 @@ def test_fetch_bet_pool_window_chunks_merge(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_append_hightier_prediction_log_writes_rows(tmp_path) -> None:
+    import json
     import sqlite3
 
     from trainer_hightier.serving.prediction_log import append_hightier_prediction_log
@@ -189,6 +190,12 @@ def test_append_hightier_prediction_log_writes_rows(tmp_path) -> None:
             "table_id": [1, 2],
         }
     )
+    features = pd.DataFrame(
+        {
+            "wager": [100.0, 200.0],
+            "fe__bets_cnt__w15m": [3.0, None],
+        }
+    )
     prob = np.array([0.9, 0.6], dtype=np.float64)
     append_hightier_prediction_log(
         db,
@@ -197,16 +204,30 @@ def test_append_hightier_prediction_log_writes_rows(tmp_path) -> None:
         staged=staged,
         prob=prob,
         threshold=0.5,
+        features=features,
+        feature_columns=("wager", "fe__bets_cnt__w15m"),
     )
     with sqlite3.connect(db) as conn:
         rows = conn.execute(
-            "SELECT bet_id, is_alert, is_rated_obs, margin FROM prediction_log ORDER BY bet_id"
+            """
+            SELECT bet_id, is_alert, is_rated_obs, margin, threshold,
+                   features_json, fe_features_missing
+            FROM prediction_log ORDER BY bet_id
+            """
         ).fetchall()
     assert len(rows) == 2
     assert rows[0][:2] == ("1", 1)
     assert rows[0][2] == 1
     assert rows[1][:2] == ("2", 0)
     assert rows[1][2] == 0
+    assert rows[0][4] == 0.5
+    feat0 = json.loads(rows[0][5])
+    assert feat0["wager"] == 100.0
+    assert feat0["fe__bets_cnt__w15m"] == 3.0
+    assert rows[0][6] == 0
+    feat1 = json.loads(rows[1][5])
+    assert feat1["fe__bets_cnt__w15m"] is None
+    assert rows[1][6] == 1
 
 
 def test_append_hightier_prediction_log_disabled_no_file(tmp_path) -> None:
@@ -238,4 +259,77 @@ def test_init_prediction_log_db_idempotent(tmp_path) -> None:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(prediction_log)").fetchall()]
     assert n == 0
     assert "scored_at" in cols
+    assert "features_json" in cols
+    assert "fe_features_missing" in cols
     assert init_prediction_log_db(None) is None
+
+
+def test_attach_canonical_id_fills_casino_player_id(tmp_path) -> None:
+    """Rated rows get ``casino_player_id`` from three-column mapping parquet."""
+    from trainer_hightier.serving.feature_builder import attach_canonical_id
+
+    map_pq = tmp_path / "map.parquet"
+    pd.DataFrame(
+        {"player_id": [900], "canonical_id": ["card_new"], "casino_player_id": ["card_new"]}
+    ).to_parquet(map_pq, index=False)
+    bets = pd.DataFrame({"player_id": pd.Series([900], dtype="Int64"), "bet_id": [1]})
+    out = attach_canonical_id(bets, mapping_parquet=map_pq)
+    assert str(out["canonical_id"].iloc[0]) == "card_new"
+    assert str(out["casino_player_id"].iloc[0]) == "card_new"
+
+
+def test_attach_canonical_id_legacy_two_column_parquet(tmp_path) -> None:
+    """Serving fills ``casino_player_id`` from ``canonical_id`` when parquet lacks the column."""
+    from trainer_hightier.serving.feature_builder import attach_canonical_id
+
+    map_pq = tmp_path / "legacy.parquet"
+    pd.DataFrame({"player_id": [900], "canonical_id": ["legacy_card"]}).to_parquet(map_pq, index=False)
+    bets = pd.DataFrame({"player_id": pd.Series([900], dtype="Int64"), "bet_id": [1]})
+    out = attach_canonical_id(bets, mapping_parquet=map_pq)
+    assert str(out["casino_player_id"].iloc[0]) == "legacy_card"
+
+
+def test_attach_canonical_id_drops_placeholder_and_unmapped_null(tmp_path) -> None:
+    """Avoid merge suffix clash from ClickHouse NULL ``casino_player_id``; unmapped loyalty stays NA."""
+    from trainer_hightier.serving.feature_builder import attach_canonical_id
+
+    map_pq = tmp_path / "map.parquet"
+    pd.DataFrame({"player_id": [900], "canonical_id": ["z"], "casino_player_id": ["z"]}).to_parquet(
+        map_pq, index=False
+    )
+    bets = pd.DataFrame(
+        {
+            "player_id": pd.Series([900, 999], dtype="Int64"),
+            "bet_id": [1, 2],
+            "casino_player_id": [np.nan, np.nan],
+        }
+    )
+    out = attach_canonical_id(bets, mapping_parquet=map_pq)
+    assert str(out.loc[out["player_id"] == 900, "casino_player_id"].iloc[0]) == "z"
+    assert pd.isna(out.loc[out["player_id"] == 999, "casino_player_id"].iloc[0])
+    assert out.loc[out["player_id"] == 999, "canonical_id"].iloc[0] == "999"
+
+
+def test_alerts_protocol_preserves_casino_player_id() -> None:
+    """``_alerts_to_protocol_records`` exposes ML API ``casino_player_id`` when present in SQLite row."""
+    from trainer_hightier.serving.api_server import _alerts_to_protocol_records
+
+    hk = ZoneInfo("Asia/Hong_Kong")
+    df = pd.DataFrame(
+        {
+            "ts_dt": [pd.Timestamp("2025-06-01 12:00:00", tz=hk)],
+            "bet_id": ["1"],
+            "bet_ts": [None],
+            "player_id": [900],
+            "casino_player_id": ["CARD99"],
+            "table_id": [1],
+            "position_idx": [1.0],
+            "session_id": [10],
+            "visit_avg_bet": [100.0],
+            "is_rated_obs": [1],
+        }
+    )
+    rec = _alerts_to_protocol_records(df)
+    assert len(rec) == 1
+    assert rec[0]["casino_player_id"] == "CARD99"
+    assert rec[0]["is_known_player"] == 1

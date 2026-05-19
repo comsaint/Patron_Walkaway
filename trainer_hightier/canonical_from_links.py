@@ -29,7 +29,7 @@ def _apply_mn_resolution(
     """Resolve M:N player_id ↔ casino_player_id edges to final mapping."""
 
     if links_df.empty:
-        return pd.DataFrame(columns=["player_id", "canonical_id"])
+        return pd.DataFrame(columns=["player_id", "canonical_id", "casino_player_id"])
 
     df = links_df.copy()
     df["lud_dtm"] = pd.to_datetime(df["lud_dtm"], errors="coerce")
@@ -51,6 +51,8 @@ def _apply_mn_resolution(
         .rename(columns={"casino_player_id": "canonical_id"})
     )
     resolved["canonical_id"] = resolved["canonical_id"].astype(str)
+    #: ML API alerts use ``casino_player_id``; currently identical to ``canonical_id`` (cleaned loyalty id).
+    resolved["casino_player_id"] = resolved["canonical_id"]
     resolved = resolved[~resolved["player_id"].isin(dummy_player_ids)]
     return resolved.reset_index(drop=True)
 
@@ -59,14 +61,18 @@ def build_canonical_mapping_from_links(
     links_df: pd.DataFrame,
     dummy_pids: Set,
 ) -> pd.DataFrame:
-    """Return ``player_id`` / ``canonical_id`` from DuckDB links + dummy id set."""
+    """Return ``player_id``, ``canonical_id``, ``casino_player_id`` from DuckDB links + dummy id set.
+
+    ``canonical_id`` and ``casino_player_id`` are the same cleaned loyalty string today;
+    both columns are kept for explicit ML API / observability parity.
+    """
 
     required = {"player_id", "casino_player_id", "lud_dtm"}
     missing = required - set(links_df.columns)
     if missing:
         raise ValueError(f"links_df is missing required columns: {sorted(missing)}")
     if links_df.empty:
-        return pd.DataFrame(columns=["player_id", "canonical_id"])
+        return pd.DataFrame(columns=["player_id", "canonical_id", "casino_player_id"])
 
     rated = links_df.loc[
         links_df["casino_player_id"].notna(), ["player_id", "casino_player_id", "lud_dtm"]

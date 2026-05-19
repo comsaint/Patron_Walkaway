@@ -66,4 +66,6 @@ def test_canonical_mapping_card_swap_latest_wins_and_dummy_excluded(tmp_path) ->
     assert len(mp) == 1
     assert int(mp["player_id"].iloc[0]) == 900
     assert str(mp["canonical_id"].iloc[0]) == "card_new"
+    assert "casino_player_id" in mp.columns
+    assert str(mp["casino_player_id"].iloc[0]) == "card_new"
     assert out_js.is_file()

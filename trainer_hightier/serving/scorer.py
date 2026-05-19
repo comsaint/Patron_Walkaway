@@ -546,6 +546,8 @@ def score_once(
                 staged=staged,
                 prob=prob,
                 threshold=thr,
+                features=X,
+                feature_columns=bundle.feature_columns,
             )
         except Exception as exc:
             logger.warning("[hightier_scorer] prediction_log write failed: %s", exc)
