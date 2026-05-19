@@ -39,6 +39,10 @@ class FeatureRegistryEntryRow:
     note: str | None
     time_horizon: str
     max_lookback: str | None
+    cadence: str | None = None
+    anchor_rule: str | None = None
+    grain: str | None = None
+    allowed_training_supplier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +182,18 @@ def _row_from_raw(idx: int, raw: dict[str, Any]) -> FeatureRegistryEntryRow:
                 f"features[{idx}] {fid!r}: time_horizon={time_horizon!r} inconsistent with max_lookback="
                 f"{max_lookback_out!r} (expected time_horizon={expected_h!r})",
             )
+    cadence_raw = raw.get("cadence")
+    anchor_raw = raw.get("anchor_rule")
+    grain_raw = raw.get("grain")
+    supplier_raw = raw.get("allowed_training_supplier")
+    for key, val in (
+        ("cadence", cadence_raw),
+        ("anchor_rule", anchor_raw),
+        ("grain", grain_raw),
+        ("allowed_training_supplier", supplier_raw),
+    ):
+        if val is not None and (not isinstance(val, str) or not str(val).strip()):
+            raise TypeError(f"features[{idx}].{key} must be a non-empty string or null for {fid!r}")
     return FeatureRegistryEntryRow(
         feature_id=fid.strip(),
         group_id=gid.strip(),
@@ -191,6 +207,12 @@ def _row_from_raw(idx: int, raw: dict[str, Any]) -> FeatureRegistryEntryRow:
         note=str(note).strip() if isinstance(note, str) and note.strip() else None,
         time_horizon=time_horizon,
         max_lookback=max_lookback_out,
+        cadence=str(cadence_raw).strip() if isinstance(cadence_raw, str) and cadence_raw.strip() else None,
+        anchor_rule=str(anchor_raw).strip() if isinstance(anchor_raw, str) and anchor_raw.strip() else None,
+        grain=str(grain_raw).strip() if isinstance(grain_raw, str) and grain_raw.strip() else None,
+        allowed_training_supplier=(
+            str(supplier_raw).strip() if isinstance(supplier_raw, str) and supplier_raw.strip() else None
+        ),
     )
 
 
@@ -307,6 +329,26 @@ def candidate_features_for_group(snapshot: CandidateRegistrySnapshot, group_id: 
         if _is_selectable(slot, r):
             out.append(r.feature_id)
     return tuple(out)
+
+
+def load_registry_raw_feature_dicts(path: Path | None = None) -> list[dict[str, Any]]:
+    """Return raw ``features`` list from registry YAML (for cadence audit metadata)."""
+
+    p = Path(path).resolve() if path is not None else default_registry_path()
+    if not p.is_file():
+        raise FileNotFoundError(f"Candidate registry missing: {p}")
+    blob = yaml.safe_load(p.read_text(encoding="utf-8"))
+    if not isinstance(blob, dict):
+        raise ValueError(f"Registry root must be a mapping, got {type(blob)} from {p}")
+    feats_raw = blob.get("features")
+    if not isinstance(feats_raw, list) or not feats_raw:
+        raise ValueError(f"features must be a non-empty list in {p}")
+    out: list[dict[str, Any]] = []
+    for i, item in enumerate(feats_raw):
+        if not isinstance(item, dict):
+            raise TypeError(f"features[{i}] must be a mapping, got {type(item)}")
+        out.append(item)
+    return out
 
 
 def default_time_horizon_for_row(source: str, feature_id: str) -> tuple[str, str | None]:

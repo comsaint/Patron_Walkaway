@@ -29,6 +29,17 @@ from trainer_hightier.serving.contracts import (
     META_KEY_ACTIVE_ADT_ALLOWLIST_VERSION,
     META_KEY_ACTIVE_SNAPSHOT_VERSION,
     META_KEY_ADT_ALLOWLIST_HEALTH,
+    META_KEY_MID_TERM_ANCHOR_MAX,
+    META_KEY_MID_TERM_FRESHNESS_STATUS,
+    META_KEY_MID_TERM_STALENESS_DAYS,
+    META_KEY_SLOW_ANCHOR_MAX,
+    META_KEY_SLOW_FRESHNESS_STATUS,
+    META_KEY_SLOW_STALENESS_DAYS,
+    META_KEY_SNAPSHOT_SCORING_DEGRADED,
+)
+from trainer_hightier.feature_experiment.feature_cadence import (
+    classify_model_fe_features,
+    short_term_enrich_columns_with_dependencies,
 )
 from trainer_hightier.serving.feature_builder import (
     assert_features_ready,
@@ -37,7 +48,20 @@ from trainer_hightier.serving.feature_builder import (
     attach_trial_bet_behavior_1h,
     coerce_categoricals,
     join_fe_derived_snapshot,
+    join_production_fe_suppliers,
     join_slow_patron_snapshot,
+)
+from trainer_hightier.serving.feature_supply import load_frozen_registry_for_bundle
+from trainer_hightier.serving.snapshot_freshness import (
+    LayerFreshnessResult,
+    build_scoring_snapshot_gate,
+    evaluate_mid_term_freshness,
+    evaluate_slow_freshness,
+    post_join_feature_smoke,
+    read_mid_term_anchor_max,
+    read_slow_anchor_max,
+    validate_mid_term_artifact,
+    validate_slow_artifact,
 )
 from trainer_hightier.serving.feature_state_store import ActiveSnapshotManifest, read_active_manifest
 from trainer_hightier.serving.model_bundle import HightierModelBundle, load_hightier_model_bundle
@@ -451,6 +475,7 @@ def score_once(
     slow_parquet: Path,
     fe_parquet: Path | None = None,
     mapping_parquet: Path | None = None,
+    manifest: ActiveSnapshotManifest | None = None,
     high_adt_only: bool,
     allowlist_ids: frozenset[int],
 ) -> int:
@@ -524,9 +549,90 @@ def score_once(
     staged = attach_synthetic_etl_and_prediction_visible(bets)
     staged = attach_canonical_id(staged, mapping_parquet=mapping_parquet)
     staged = attach_trial_bet_behavior_1h(staged, pool2)
-    staged = join_slow_patron_snapshot(staged, slow_parquet)
-    if fe_parquet is not None and fe_parquet.is_file():
+    slow_grain = None
+    if manifest is not None and isinstance(manifest.raw, dict):
+        slow_grain = manifest.raw.get("slow_patron_grain")
+    staged = join_slow_patron_snapshot(staged, slow_parquet, slow_grain=slow_grain)
+
+    registry_snap = load_frozen_registry_for_bundle(Path(bundle.bundle_dir))
+    fe_split = classify_model_fe_features(registry_snap, bundle.feature_columns)
+    short_cols = short_term_enrich_columns_with_dependencies(
+        fe_split["short_term"],
+        fe_split["mid_term"],
+    )
+    mid_cols = fe_split["mid_term"]
+    mid_path = manifest.mid_term_snapshot_parquet if manifest is not None else None
+    fe_short_path = manifest.fe_short_term_parquet if manifest is not None else None
+    has_mid_supplier = mid_path is not None and Path(mid_path).is_file() and bool(mid_cols)
+    has_short_supplier = fe_short_path is not None and Path(fe_short_path).is_file() and bool(short_cols)
+    if has_mid_supplier or has_short_supplier:
+        staged = join_production_fe_suppliers(
+            staged,
+            fe_short_term_parquet=Path(fe_short_path) if has_short_supplier else None,
+            mid_term_snapshot_parquet=Path(mid_path) if has_mid_supplier else None,
+            short_term_columns=short_cols,
+            mid_term_columns=mid_cols,
+        )
+    elif fe_parquet is not None and fe_parquet.is_file():
         staged = join_fe_derived_snapshot(staged, fe_parquet)
+
+    mid_val = validate_mid_term_artifact(
+        Path(mid_path) if mid_path is not None else None,
+        manifest_grain=(manifest.raw.get("mid_term_grain") if manifest is not None else None),
+    ) if mid_cols else None
+    slow_val = validate_slow_artifact(
+        slow_parquet,
+        manifest_grain=slow_grain,
+    )
+    mid_anchor = read_mid_term_anchor_max(Path(mid_path) if mid_path else None, manifest.raw if manifest else None)
+    slow_anchor = read_slow_anchor_max(slow_parquet, manifest.raw if manifest else None)
+    mid_fresh = evaluate_mid_term_freshness(
+        anchor_max=mid_anchor,
+        hard_cap_days=int(cfg.mid_term_stale_hard_cap_days),
+        close_hour=int(cfg.gaming_day_close_hour),
+    ) if mid_cols else LayerFreshnessResult(layer="mid_term", status="fresh", staleness_days=0, anchor_max=None, message="mid_term not required")
+    slow_fresh = evaluate_slow_freshness(
+        anchor_max=slow_anchor,
+        monthly_grace_days=int(cfg.slow_monthly_grace_days),
+        hard_cap_days=int(cfg.slow_stale_hard_cap_days),
+        close_hour=int(cfg.gaming_day_close_hour),
+    )
+    gate = build_scoring_snapshot_gate(
+        mid_term=mid_fresh,
+        slow=slow_fresh,
+        mid_validation=mid_val,
+        slow_validation=slow_val,
+    )
+    if not gate.allow_scoring:
+        raise RuntimeError(
+            f"[hightier_scorer] snapshot gate blocked scoring: {gate.hard_failure_reason}"
+        )
+    if gate.degraded:
+        logger.warning(
+            "[hightier_scorer] degraded snapshot scoring mid=%s slow=%s mid_stale=%s slow_stale=%s",
+            mid_fresh.status,
+            slow_fresh.status,
+            mid_fresh.staleness_days,
+            slow_fresh.staleness_days,
+        )
+    smoke_failures = post_join_feature_smoke(staged, mid_term_columns=mid_cols)
+    if smoke_failures:
+        raise ValueError(
+            "[hightier_scorer] post-join feature smoke failed: " + "; ".join(smoke_failures)
+        )
+
+    meta_set(conn, META_KEY_MID_TERM_FRESHNESS_STATUS, mid_fresh.status)
+    meta_set(conn, META_KEY_SLOW_FRESHNESS_STATUS, slow_fresh.status)
+    meta_set(conn, META_KEY_SNAPSHOT_SCORING_DEGRADED, "1" if gate.degraded else "0")
+    if mid_anchor is not None:
+        meta_set(conn, META_KEY_MID_TERM_ANCHOR_MAX, mid_anchor.isoformat())
+    if slow_anchor is not None:
+        meta_set(conn, META_KEY_SLOW_ANCHOR_MAX, slow_anchor.isoformat())
+    if mid_fresh.staleness_days is not None:
+        meta_set(conn, META_KEY_MID_TERM_STALENESS_DAYS, str(mid_fresh.staleness_days))
+    if slow_fresh.staleness_days is not None:
+        meta_set(conn, META_KEY_SLOW_STALENESS_DAYS, str(slow_fresh.staleness_days))
+
     assert_features_ready(staged, bundle.feature_columns)
     X = coerce_categoricals(
         staged[list(bundle.feature_columns)].copy(),
@@ -548,6 +654,10 @@ def score_once(
                 threshold=thr,
                 features=X,
                 feature_columns=bundle.feature_columns,
+                snapshot_version=manifest.version if manifest is not None else None,
+                mid_term_freshness_status=mid_fresh.status,
+                slow_freshness_status=slow_fresh.status,
+                snapshot_scoring_degraded=gate.degraded,
             )
         except Exception as exc:
             logger.warning("[hightier_scorer] prediction_log write failed: %s", exc)
@@ -711,6 +821,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 slow_parquet=sp,
                 fe_parquet=fe_sp,
                 mapping_parquet=map_path,
+                manifest=man,
                 high_adt_only=high_adt_only,
                 allowlist_ids=allow_ids,
             )

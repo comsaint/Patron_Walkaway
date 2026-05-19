@@ -11,7 +11,12 @@ import pyarrow.parquet as pq
 import numpy as np
 import pandas as pd
 
-from trainer_hightier.config import DuckDbRuntimeConfig, default_hightier_serving_config
+from trainer_hightier.config import (
+    SLOW_PATRON_GRAIN_BET,
+    SLOW_PATRON_GRAIN_CANONICAL_ASOF,
+    DuckDbRuntimeConfig,
+    default_hightier_serving_config,
+)
 from trainer_hightier.utils.bet_l0_preprocess import _bet_feast_prediction_visible_alignment_params
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
@@ -235,35 +240,70 @@ def _infer_slow_patron_snap_date_column(schema_cols: Iterable[str]) -> str:
     )
 
 
-def _slow_parquet_join_mode(schema_cols: Iterable[str]) -> str:
-    """Return ``bet_merge`` or ``player_asof`` for slow patron parquet shape."""
+def _slow_parquet_join_mode(
+    schema_cols: Iterable[str],
+    *,
+    prefer_grain: str | None = None,
+) -> str:
+    """Return join mode: ``canonical_asof``, ``player_asof``, or ``bet_merge``."""
 
     by_lower = {str(c).lower(): str(c) for c in schema_cols}
     feast_bet = ("bet_id" in by_lower) and ("prediction_visible_ts_cf" in by_lower)
+    canonical_asof = ("canonical_id" in by_lower) and (
+        ("anchor_gaming_day" in by_lower) or ("gaming_day" in by_lower)
+    )
     legacy_player = ("player_id" in by_lower) and (
         ("anchor_gaming_day" in by_lower) or ("gaming_day" in by_lower)
     )
+    grain = str(prefer_grain or "").strip().lower()
+    if grain == SLOW_PATRON_GRAIN_CANONICAL_ASOF:
+        if not canonical_asof:
+            raise ValueError(
+                "[feature_builder] manifest requests canonical_asof slow grain but parquet schema "
+                f"lacks canonical_id + anchor_gaming_day; columns={sorted(by_lower.keys())[:40]}"
+            )
+        return "canonical_asof"
+    if grain == SLOW_PATRON_GRAIN_BET:
+        if not feast_bet:
+            raise ValueError(
+                "[feature_builder] manifest requests bet_grain slow join but parquet lacks "
+                "bet_id + prediction_visible_ts_cf"
+            )
+        return "bet_merge"
+    if grain in ("player_asof", "player"):
+        if not legacy_player:
+            raise ValueError("[feature_builder] manifest requests player_asof but parquet schema unsupported")
+        return "player_asof"
 
-    # Prefer Feast bet-grain materialization output (canonical for slow_patron_180d_monthly.parquet).
-    if feast_bet and not legacy_player:
+    # Production canonical ASOF artifact (no bet_id).
+    if canonical_asof and not feast_bet:
+        return "canonical_asof"
+
+    if feast_bet and not legacy_player and not canonical_asof:
         return "bet_merge"
 
-    # Legacy trainer-style monthly snapshots (player_id + anchor day).
     if legacy_player and not feast_bet:
         return "player_asof"
 
+    if canonical_asof and feast_bet:
+        logger.warning(
+            "[feature_builder] slow patron parquet has bet-grain and canonical ASOF columns; "
+            "defaulting to canonical_asof for production safety. columns=%s",
+            sorted(by_lower.keys())[:30],
+        )
+        return "canonical_asof"
+
     if feast_bet and legacy_player:
         logger.warning(
-            "[feature_builder] slow patron parquet exposes both player+anchor and Feast bet timestamps; "
-            "using Feast bet-merge path (ambiguous schema). columns=%s",
+            "[feature_builder] slow patron parquet exposes bet-grain and player anchor; "
+            "using bet-merge (legacy). columns=%s",
             sorted(by_lower.keys())[:30],
         )
         return "bet_merge"
 
     raise ValueError(
         "[feature_builder] slow patron parquet unsupported schema "
-        "(need Feast bet-grain: bet_id + prediction_visible_ts_cf, "
-        "or player snapshot with player_id + anchor_gaming_day|gaming_day); "
+        "(need canonical_id+anchor_gaming_day, player_id+anchor, or bet_id+prediction_visible_ts_cf); "
         f"columns sample={sorted(by_lower.keys())[:40]}"
     )
 
@@ -325,13 +365,210 @@ def join_fe_derived_snapshot(bets: pd.DataFrame, fe_parquet: Path) -> pd.DataFra
     return out.drop(columns=["_fe_bid_merge"], errors="ignore")
 
 
-def join_slow_patron_snapshot(
+def join_production_fe_suppliers(
+    bets: pd.DataFrame,
+    *,
+    fe_short_term_parquet: Path | None,
+    mid_term_snapshot_parquet: Path | None,
+    short_term_columns: tuple[str, ...],
+    mid_term_columns: tuple[str, ...],
+) -> pd.DataFrame:
+    """Join short-term bet-grain and mid-term canonical ASOF ``fe__*`` suppliers."""
+
+    if bets.empty:
+        return bets
+    if not short_term_columns and not mid_term_columns:
+        return bets
+    if "canonical_id" not in bets.columns:
+        raise ValueError("[feature_builder] bets missing canonical_id for production fe join")
+    if "gaming_day" not in bets.columns:
+        raise ValueError("[feature_builder] bets missing gaming_day for production fe join")
+    if mid_term_columns and mid_term_snapshot_parquet is None:
+        raise ValueError("[feature_builder] mid_term_columns require mid_term_snapshot_parquet")
+
+    from trainer_hightier.config import DuckDbRuntimeConfig
+    from trainer_hightier.feature_experiment.dataset_enrich import _MID_TERM_DERIVED_EXPRS
+
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, DuckDbRuntimeConfig())
+        con.register("bets_in", bets)
+        short_join = ""
+        short_select = ""
+        if short_term_columns and fe_short_term_parquet is not None:
+            sp = Path(fe_short_term_parquet).resolve()
+            if not sp.is_file():
+                raise FileNotFoundError(f"fe_short_term parquet missing: {sp}")
+            esc = str(sp).replace("'", "''")
+            short_select = ",\n  ".join(f's."{c}" AS "{c}"' for c in short_term_columns)
+            short_join = f"""
+LEFT JOIN read_parquet('{esc}') AS s
+  ON TRY_CAST(b.bet_id AS DOUBLE) = s.bet_id"""
+
+        mid_cte = ""
+        mid_select = ""
+        exclude_cols = ""
+        if mid_term_columns and mid_term_snapshot_parquet is not None:
+            mp = Path(mid_term_snapshot_parquet).resolve()
+            if not mp.is_file():
+                raise FileNotFoundError(f"mid_term snapshot parquet missing: {mp}")
+            mesc = str(mp).replace("'", "''")
+            mid_cte = f"""
+mid_snap AS (
+  SELECT * FROM read_parquet('{mesc}')
+),
+b_with_day AS (
+  SELECT
+    b.*,
+    TRIM(CAST(b.canonical_id AS VARCHAR)) AS _cid,
+    CAST(b.gaming_day AS DATE) AS _gday
+  FROM bets_in AS b
+),
+mid_asof AS (
+  SELECT
+    bw.*,
+    lst.fe__bets_cnt__w1d AS _snap_bets_cnt_w1d,
+    lst.fe__wager_sum__w1d AS _snap_wager_sum_w1d,
+    lst.fe__prior_odds_mean_w30d AS _snap_prior_odds_mean_w30d,
+    lst.fe__prior_odds_std_w30d AS _snap_prior_odds_std_w30d,
+    lst.fe__std_wager_w7d AS _snap_std_wager_w7d,
+    lst.fe__avg_abs_wager_w7d AS _snap_avg_abs_wager_w7d,
+    lst.fe__interarrival_avg_w7d AS _snap_interarrival_avg_w7d,
+    lst.fe__interarrival_std_w7d AS _snap_interarrival_std_w7d
+  FROM b_with_day AS bw
+  LEFT JOIN LATERAL (
+    SELECT *
+    FROM mid_snap AS s
+    WHERE TRIM(CAST(s.canonical_id AS VARCHAR)) = bw._cid
+      AND CAST(s.anchor_gaming_day AS DATE) < bw._gday
+    ORDER BY CAST(s.anchor_gaming_day AS DATE) DESC
+    LIMIT 1
+  ) AS lst ON TRUE
+)"""
+            mid_parts = []
+            for col in mid_term_columns:
+                expr = _MID_TERM_DERIVED_EXPRS.get(col, f'CAST(b."{col}" AS DOUBLE)')
+                mid_parts.append(f'{expr} AS "{col}"')
+            mid_select = ",\n  ".join(mid_parts)
+            exclude_cols = ", ".join(
+                (
+                    "_cid",
+                    "_gday",
+                    "_snap_bets_cnt_w1d",
+                    "_snap_wager_sum_w1d",
+                    "_snap_prior_odds_mean_w30d",
+                    "_snap_prior_odds_std_w30d",
+                    "_snap_std_wager_w7d",
+                    "_snap_avg_abs_wager_w7d",
+                    "_snap_interarrival_avg_w7d",
+                    "_snap_interarrival_std_w7d",
+                )
+            )
+
+        if mid_cte:
+            base_from = "FROM mid_asof AS b"
+            base_select = f"b.* EXCLUDE ({exclude_cols})" if exclude_cols else "b.*"
+        else:
+            base_from = "FROM bets_in AS b"
+            base_select = "b.*"
+
+        select_parts = [base_select]
+        if short_select:
+            select_parts.append(short_select)
+        if mid_select:
+            select_parts.append(mid_select)
+
+        if mid_cte:
+            sql = f"""
+WITH {mid_cte.strip()}
+SELECT
+  {", ".join(select_parts)}
+{base_from}
+{short_join}
+""".strip()
+        else:
+            sql = f"""
+SELECT
+  {", ".join(select_parts)}
+{base_from}
+{short_join}
+""".strip()
+        out = con.execute(sql).df()
+        logger.info(
+            "[feature_builder] joined production fe suppliers short=%d mid=%d",
+            len(short_term_columns),
+            len(mid_term_columns),
+        )
+        return out
+    finally:
+        con.close()
+
+
+def _join_slow_patron_canonical_asof_snapshot(
     bets: pd.DataFrame,
     slow_parquet: Path,
     *,
     key_days: str | None = None,
 ) -> pd.DataFrame:
-    """Attach slow patron 180d features from bundled Parquet (Feast bet-grain or legacy player ASOF snapshot)."""
+    """ASOF-join slow patron features on ``canonical_id`` × ``gaming_day``."""
+
+    if "canonical_id" not in bets.columns:
+        raise ValueError("bets must contain canonical_id for canonical ASOF slow join")
+    if "gaming_day" not in bets.columns:
+        raise ValueError("bets must contain gaming_day for canonical ASOF slow join")
+    schema_cols = list(pq.read_schema(slow_parquet).names)
+    by_lower = {str(c).lower(): str(c) for c in schema_cols}
+    exp = key_days.strip() if key_days is not None and str(key_days).strip() else ""
+    if exp:
+        anchor_sql_col = by_lower.get(exp.lower())
+        if anchor_sql_col is None:
+            raise ValueError(f"slow patron parquet lacks ASOF column {exp!r}")
+    else:
+        anchor_sql_col = _infer_slow_patron_snap_date_column(schema_cols)
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.register("bets_in", bets)
+        esc = str(slow_parquet).replace("'", "''")
+        q = f"""
+WITH slow AS (
+  SELECT * FROM read_parquet('{esc}')
+),
+b AS (
+  SELECT *, CAST(gaming_day AS DATE) AS bet_gday FROM bets_in
+)
+SELECT
+  b.*,
+  lst.patron__theo_win_sum__w180d_m1snap,
+  lst.patron__gaming_days_cnt__w180d_m1snap,
+  lst.patron__adt__w180d_m1snap
+FROM b
+ASOF JOIN (
+  SELECT
+    TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
+    CAST("{anchor_sql_col.replace('"', '""')}" AS DATE) AS anchor_gday,
+    patron__theo_win_sum__w180d_m1snap,
+    patron__gaming_days_cnt__w180d_m1snap,
+    patron__adt__w180d_m1snap
+  FROM slow
+) AS lst
+  ON b.canonical_id = lst.canonical_id
+ AND lst.anchor_gday <= b.bet_gday
+ORDER BY b.bet_id, lst.anchor_gday
+""".strip()
+        out = con.execute(q).df()
+        return out.drop(columns=["bet_gday"], errors="ignore")
+    finally:
+        con.close()
+
+
+def join_slow_patron_snapshot(
+    bets: pd.DataFrame,
+    slow_parquet: Path,
+    *,
+    key_days: str | None = None,
+    slow_grain: str | None = None,
+) -> pd.DataFrame:
+    """Attach slow patron 180d features (canonical ASOF, player ASOF, or legacy bet-grain)."""
 
     if bets.empty:
         return bets
@@ -339,10 +576,13 @@ def join_slow_patron_snapshot(
     if not sp.is_file():
         raise FileNotFoundError(f"slow patron snapshot parquet missing: {sp}")
     schema_cols = list(pq.read_schema(sp).names)
-    mode = _slow_parquet_join_mode(schema_cols)
+    mode = _slow_parquet_join_mode(schema_cols, prefer_grain=slow_grain)
     if mode == "bet_merge":
         logger.info("[feature_builder] joining slow patron via Feast bet-grain parquet %s", sp)
         return _join_slow_patron_bet_snapshot(bets, sp)
+    if mode == "canonical_asof":
+        logger.info("[feature_builder] joining slow patron via canonical ASOF parquet %s", sp)
+        return _join_slow_patron_canonical_asof_snapshot(bets, sp, key_days=key_days)
 
     by_lower = {str(c).lower(): str(c) for c in schema_cols}
     exp = (

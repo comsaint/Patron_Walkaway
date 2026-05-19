@@ -17,6 +17,10 @@ _PREDICTION_LOG_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("threshold", "REAL"),
     ("features_json", "TEXT"),
     ("fe_features_missing", "INTEGER"),
+    ("snapshot_version", "TEXT"),
+    ("mid_term_freshness_status", "TEXT"),
+    ("slow_freshness_status", "TEXT"),
+    ("snapshot_scoring_degraded", "INTEGER"),
 )
 
 
@@ -157,6 +161,10 @@ def append_hightier_prediction_log(
     threshold: float,
     features: pd.DataFrame | None = None,
     feature_columns: tuple[str, ...] | None = None,
+    snapshot_version: str | None = None,
+    mid_term_freshness_status: str | None = None,
+    slow_freshness_status: str | None = None,
+    snapshot_scoring_degraded: bool = False,
 ) -> None:
     """Batch-insert one scoring cycle into ``prediction_log`` (no-op if path disabled or frame empty).
 
@@ -227,6 +235,10 @@ def append_hightier_prediction_log(
                 thr,
                 feat_json,
                 fe_miss,
+                _str_or_none(snapshot_version),
+                _str_or_none(mid_term_freshness_status),
+                _str_or_none(slow_freshness_status),
+                1 if snapshot_scoring_degraded else 0,
             )
         )
 
@@ -240,8 +252,10 @@ def append_hightier_prediction_log(
             INSERT INTO prediction_log (
                 scored_at, bet_id, session_id, player_id, canonical_id,
                 casino_player_id, table_id, model_version, score, margin,
-                is_alert, is_rated_obs, threshold, features_json, fe_features_missing
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_alert, is_rated_obs, threshold, features_json, fe_features_missing,
+                snapshot_version, mid_term_freshness_status, slow_freshness_status,
+                snapshot_scoring_degraded
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
