@@ -131,7 +131,7 @@
 
 未達標時 fail-fast，錯誤須標 `[feature-supply]` 或 `[pack-schema]` 並列出過期欄位數與 manifest 時間戳。
 
-**實作備註**：`snapshot_updater` 目前只更新 slow/allowlist；fe 層 refresh 須由同等 job 寫入 `fe_derived_parquet` 並更新 manifest（與訓練後重打包流程一併落地）。
+**實作備註（已更新）**：`trainer_hightier.serving.snapshot_updater` 支援 `--production` 全層 publish、`--refresh-mid-term`、`--refresh-slow`；production 物化前會驗證 bundle 內 `source_mirror` 之 cleaned bet / session mirror。日常 cadence 預設由 **`trainer_hightier.deploy.main` 內建 refresh supervisor**（`all` / `scorer` 模式）驅動；外部 orchestrator 仍可作為備援或 `--no-refresh-supervisor` 時的唯一排程來源。
 
 ## Decision Log
 

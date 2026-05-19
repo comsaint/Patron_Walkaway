@@ -20,7 +20,7 @@
 - validator 規則：沿用 `trainer/serving/validator.py` 判定邏輯，但部署時不可依賴 `trainer` package。
 - 特徵集合：serving 僅計算「模型訓練使用欄位」（目前 baseline 為主）。
 - 打分族群：預設啟用 `high_adt_only`，僅對「與訓練同源」的高 ADT allowlist 玩家打分（來源與訓練 `adt_allowed_players_parquet` 對齊）。
-- 快照更新 SLA：每日，由 orchestrator 觸發 `hightier_snapshot_updater.py`。
+- 快照更新 SLA：每日；**預設**由 `trainer_hightier.deploy.main` 內建 **refresh supervisor**（輪詢 + 04:00 後 mid-term、每日 slow 檢查）維護 manifest，無需外部 orchestrator 亦可運行。另可選由 orchestrator 觸發 `python -m trainer_hightier.serving.snapshot_updater`（或關閉內建 supervisor 後改為唯一來源）。
 - 缺口回補範圍：僅需補 `last_training_cutoff -> now`。
 - 狀態儲存：
   - scorer / validator 共用單一 state DB（相容 trainer 既有模式）。
