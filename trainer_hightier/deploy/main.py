@@ -14,11 +14,22 @@ import logging
 import os
 import sys
 import threading
+import time
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from trainer_hightier.config import HightierServingConfig, set_hightier_serving_deploy_override
+from trainer_hightier.config import HK_TZ, HightierServingConfig, set_hightier_serving_deploy_override
+from trainer_hightier.serving.contracts import (
+    META_KEY_MID_TERM_REFRESH_LAST_ATTEMPT,
+    META_KEY_REFRESH_SUPERVISOR_LAST_CHECK,
+    META_KEY_SLOW_REFRESH_LAST_ATTEMPT,
+    META_KEY_SLOW_REFRESH_LAST_CHECK_DAY,
+    META_KEY_SOURCE_MIRROR_BET_STATUS,
+    META_KEY_SOURCE_MIRROR_SESSION_STATUS,
+)
 
 
 def _parse_deploy_args(argv: list[str] | None) -> argparse.Namespace:
@@ -31,6 +42,11 @@ def _parse_deploy_args(argv: list[str] | None) -> argparse.Namespace:
         choices=("all", "api", "scorer", "validator"),
         default="all",
         help="Which process to run (default: all = API+validator threads + scorer foreground).",
+    )
+    pr.add_argument(
+        "--no-refresh-supervisor",
+        action="store_true",
+        help="Disable deploy-managed snapshot refresh loop (debug / externally scheduled refresh only).",
     )
     return pr.parse_args(argv)
 
@@ -56,6 +72,8 @@ def _serving_config_for_bundle(bundle_root: Path, rel: dict[str, Any]) -> Highti
         feature_state_db_path=br / ls / "feature_state.db",
         snapshot_manifest_dir=br / rel.get("snapshot_manifest_dir", "snapshots"),
         validator_out_dir=br / ls / "validator_out",
+        production_cleaned_bet_mirror_dir=br / "source_mirror" / "cleaned_bet",
+        production_cleaned_session_mirror_parquet=br / "source_mirror" / "cleaned_session.parquet",
     )
 
 
@@ -125,6 +143,18 @@ def _preflight_frozen_artifacts(bundle_root: Path, rel: dict[str, Any]) -> None:
         if not fp.is_file():
             raise FileNotFoundError(
                 f"manifest {key}={rel_p!r} resolves to missing file {fp} (under {snap_root})"
+            )
+    from trainer_hightier.config import MANIFEST_KEY_MID_TERM_SNAPSHOT
+    from trainer_hightier.serving.snapshot_bootstrap import preflight_validate_shipped_snapshots
+
+    if man.get(MANIFEST_KEY_MID_TERM_SNAPSHOT):
+        try:
+            summary = preflight_validate_shipped_snapshots(man, manifest_dir=snap_root)
+            logging.info("[deploy] snapshot preflight ok: %s", summary)
+        except ValueError as exc:
+            logging.warning(
+                "[deploy] shipped snapshot preflight failed; refresh supervisor will attempt repair: %s",
+                exc,
             )
     trial = man.get("trial_bet_behavior_parquet")
     if trial:
@@ -225,6 +255,268 @@ def _validator_foreground() -> None:
         sys.argv = old
 
 
+def _refresh_lock_path(cfg: HightierServingConfig) -> Path:
+    """Return the bundle-local snapshot refresh lock path."""
+
+    p = Path(cfg.snapshot_manifest_dir).resolve() / ".snapshot_refresh_supervisor.lock"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _try_acquire_refresh_lock(cfg: HightierServingConfig) -> int | None:
+    """Acquire an inter-process refresh lock, removing clearly stale locks."""
+
+    lock = _refresh_lock_path(cfg)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    stale_after = timedelta(minutes=int(cfg.snapshot_refresh_lock_stale_minutes))
+    try:
+        fd = os.open(str(lock), flags)
+    except FileExistsError:
+        try:
+            mtime = datetime.fromtimestamp(lock.stat().st_mtime, tz=timezone.utc)
+            if datetime.now(timezone.utc) - mtime <= stale_after:
+                return None
+            lock.unlink(missing_ok=True)
+            fd = os.open(str(lock), flags)
+        except FileExistsError:
+            return None
+    os.write(fd, f"pid={os.getpid()} ts={datetime.now(timezone.utc).isoformat()}\n".encode("utf-8"))
+    return fd
+
+
+def _release_refresh_lock(cfg: HightierServingConfig, fd: int) -> None:
+    """Release the inter-process refresh lock."""
+
+    os.close(fd)
+    try:
+        _refresh_lock_path(cfg).unlink(missing_ok=True)
+    except OSError:
+        logging.warning("[deploy] failed to remove snapshot refresh lock", exc_info=True)
+
+
+def _record_supervisor_mirror_status(cfg: HightierServingConfig) -> None:
+    """Persist latest production source mirror validation summaries."""
+
+    from trainer_hightier.serving.feature_state_store import feature_state_meta_set
+    from trainer_hightier.serving.production_source_mirror import (
+        validate_production_bet_mirror,
+        validate_production_session_mirror,
+    )
+
+    bet = validate_production_bet_mirror()
+    sess = validate_production_session_mirror()
+    feature_state_meta_set(META_KEY_SOURCE_MIRROR_BET_STATUS, bet.message, path=cfg.feature_state_db_path)
+    feature_state_meta_set(
+        META_KEY_SOURCE_MIRROR_SESSION_STATUS,
+        sess.message,
+        path=cfg.feature_state_db_path,
+    )
+
+
+def _startup_snapshot_repair_or_raise(
+    model_bundle: Path,
+    mapping: Path,
+    cfg: HightierServingConfig,
+) -> None:
+    """Synchronously repair hard-failure snapshot states before scorer startup."""
+
+    from trainer_hightier.serving.feature_state_store import feature_state_meta_set
+    from trainer_hightier.serving.snapshot_freshness import build_deploy_startup_snapshot_plan
+    from trainer_hightier.serving.snapshot_updater import run_mid_term_refresh, run_slow_refresh
+
+    plan = build_deploy_startup_snapshot_plan(cfg)
+    logging.info(
+        "[deploy] startup snapshot plan mid_hard=%s slow_hard=%s mid_reason=%s slow_reason=%s",
+        plan.mid_hard_failure,
+        plan.slow_hard_failure,
+        plan.mid_reason,
+        plan.slow_reason,
+    )
+    if not plan.mid_startup_refresh and not plan.slow_startup_refresh:
+        _record_supervisor_mirror_status(cfg)
+        return
+    fd = _try_acquire_refresh_lock(cfg)
+    if fd is None:
+        raise RuntimeError(
+            "[deploy] startup snapshot repair blocked: refresh lock held by another process"
+        )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        if plan.mid_startup_refresh:
+            logging.warning("[deploy] startup repairing mid-term snapshot: %s", plan.mid_reason)
+            run_mid_term_refresh(bundle_dir=model_bundle, canonical_mapping=mapping, bootstrap=False)
+            feature_state_meta_set(
+                META_KEY_MID_TERM_REFRESH_LAST_ATTEMPT,
+                now_iso,
+                path=cfg.feature_state_db_path,
+            )
+        if plan.slow_startup_refresh:
+            logging.warning("[deploy] startup repairing slow snapshot: %s", plan.slow_reason)
+            run_slow_refresh(canonical_mapping=mapping)
+            feature_state_meta_set(
+                META_KEY_SLOW_REFRESH_LAST_ATTEMPT,
+                now_iso,
+                path=cfg.feature_state_db_path,
+            )
+    except Exception as exc:
+        raise RuntimeError(f"[deploy] startup snapshot repair failed: {exc}") from exc
+    finally:
+        _release_refresh_lock(cfg, fd)
+    after = build_deploy_startup_snapshot_plan(cfg)
+    if after.mid_hard_failure or after.slow_hard_failure:
+        raise RuntimeError(
+            "[deploy] startup snapshot repair incomplete: "
+            f"mid={after.mid_reason}; slow={after.slow_reason}"
+        )
+    _record_supervisor_mirror_status(cfg)
+
+
+def _mid_term_refresh_needed(cfg: HightierServingConfig) -> tuple[bool, str]:
+    """Return whether the mid-term snapshot should refresh now."""
+
+    from trainer_hightier.serving.feature_state_store import read_active_manifest
+    from trainer_hightier.serving.snapshot_freshness import (
+        evaluate_mid_term_freshness,
+        read_mid_term_anchor_max,
+    )
+
+    man = read_active_manifest()
+    if man is None:
+        return True, "active manifest missing"
+    anchor = read_mid_term_anchor_max(man.mid_term_snapshot_parquet, man.raw)
+    status = evaluate_mid_term_freshness(
+        anchor_max=anchor,
+        hard_cap_days=int(cfg.mid_term_stale_hard_cap_days),
+        close_hour=int(cfg.gaming_day_close_hour),
+    )
+    now_hk = datetime.now(ZoneInfo(HK_TZ))
+    after_refresh_target = int(now_hk.hour) >= int(cfg.mid_term_refresh_target_hour)
+    if status.status in ("missing", "hard_cap_breached"):
+        return True, status.message
+    if status.status == "stale_allowed" and after_refresh_target:
+        return True, status.message
+    return False, status.message
+
+
+def _slow_refresh_needed(cfg: HightierServingConfig) -> tuple[bool, str]:
+    """Return whether the monthly slow patron snapshot should refresh now."""
+
+    from trainer_hightier.serving.feature_state_store import (
+        feature_state_meta_get,
+        feature_state_meta_set,
+        read_active_manifest,
+    )
+    from trainer_hightier.serving.snapshot_freshness import evaluate_slow_freshness, read_slow_anchor_max
+
+    today = datetime.now(ZoneInfo(HK_TZ)).date().isoformat()
+    last_check = feature_state_meta_get(
+        META_KEY_SLOW_REFRESH_LAST_CHECK_DAY,
+        path=cfg.feature_state_db_path,
+    )
+    if last_check == today:
+        return False, "slow refresh already checked today"
+    feature_state_meta_set(
+        META_KEY_SLOW_REFRESH_LAST_CHECK_DAY,
+        today,
+        path=cfg.feature_state_db_path,
+    )
+
+    man = read_active_manifest()
+    if man is None:
+        return True, "active manifest missing"
+    anchor = read_slow_anchor_max(man.slow_patron_parquet, man.raw)
+    status = evaluate_slow_freshness(
+        anchor_max=anchor,
+        monthly_grace_days=int(cfg.slow_monthly_grace_days),
+        hard_cap_days=int(cfg.slow_stale_hard_cap_days),
+        close_hour=int(cfg.gaming_day_close_hour),
+    )
+    if status.status in ("missing", "stale_allowed", "hard_cap_breached"):
+        return True, status.message
+    return False, status.message
+
+
+def _refresh_supervisor_once(
+    model_bundle: Path,
+    mapping: Path,
+    cfg: HightierServingConfig,
+    *,
+    fail_on_error: bool = False,
+) -> None:
+    """Run one deploy-managed refresh check for mid-term and slow snapshots."""
+
+    from trainer_hightier.serving.feature_state_store import feature_state_meta_set
+
+    feature_state_meta_set(
+        META_KEY_REFRESH_SUPERVISOR_LAST_CHECK,
+        datetime.now(timezone.utc).isoformat(),
+        path=cfg.feature_state_db_path,
+    )
+    mid_needed, mid_reason = _mid_term_refresh_needed(cfg)
+    slow_needed, slow_reason = _slow_refresh_needed(cfg)
+    if not mid_needed and not slow_needed:
+        logging.info("[deploy] snapshot refresh not needed: mid=%s slow=%s", mid_reason, slow_reason)
+        _record_supervisor_mirror_status(cfg)
+        return
+    fd = _try_acquire_refresh_lock(cfg)
+    if fd is None:
+        logging.info("[deploy] snapshot refresh skipped; another deploy process holds the lock")
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        from trainer_hightier.serving.snapshot_updater import run_mid_term_refresh, run_slow_refresh
+
+        if mid_needed:
+            logging.warning("[deploy] refreshing mid-term snapshot: %s", mid_reason)
+            run_mid_term_refresh(bundle_dir=model_bundle, canonical_mapping=mapping, bootstrap=False)
+            feature_state_meta_set(
+                META_KEY_MID_TERM_REFRESH_LAST_ATTEMPT,
+                now_iso,
+                path=cfg.feature_state_db_path,
+            )
+        if slow_needed:
+            logging.warning("[deploy] refreshing slow patron snapshot: %s", slow_reason)
+            run_slow_refresh(canonical_mapping=mapping)
+            feature_state_meta_set(
+                META_KEY_SLOW_REFRESH_LAST_ATTEMPT,
+                now_iso,
+                path=cfg.feature_state_db_path,
+            )
+    except Exception:
+        if fail_on_error:
+            raise
+        logging.exception("[deploy] snapshot refresh attempt failed; last good manifest remains active")
+    finally:
+        _release_refresh_lock(cfg, fd)
+    _record_supervisor_mirror_status(cfg)
+
+
+def _refresh_supervisor_loop(model_bundle: Path, mapping: Path, cfg: HightierServingConfig) -> None:
+    """Continuously maintain production snapshots for this deploy process."""
+
+    interval = max(60, int(cfg.snapshot_refresh_supervisor_poll_seconds))
+    while True:
+        _refresh_supervisor_once(model_bundle, mapping, cfg)
+        time.sleep(interval)
+
+
+def _start_refresh_supervisor(model_bundle: Path, mapping: Path, cfg: HightierServingConfig) -> None:
+    """Run startup hard-failure repair, then launch the background refresh loop."""
+
+    _startup_snapshot_repair_or_raise(model_bundle, mapping, cfg)
+    th = threading.Thread(
+        target=_refresh_supervisor_loop,
+        args=(model_bundle, mapping, cfg),
+        name="hightier-refresh-supervisor",
+        daemon=True,
+    )
+    th.start()
+    logging.info(
+        "[deploy] refresh supervisor thread started poll_seconds=%d",
+        int(cfg.snapshot_refresh_supervisor_poll_seconds),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Configure paths from bundle, log versions, then run selected mode."""
     args = _parse_deploy_args(argv)
@@ -240,14 +532,16 @@ def main(argv: list[str] | None = None) -> int:
     set_hightier_serving_deploy_override(cfg)
     import trainer_hightier.serving.runtime_config  # noqa: F401  # establish paths
 
+    model_bundle = br / rel.get("model_bundle_dir", "models")
+    mapping = br / rel["canonical_mapping_parquet"]
+    mode = str(args.mode)
+
     _preflight_frozen_artifacts(br, rel)
+    if mode in ("all", "scorer") and not bool(args.no_refresh_supervisor):
+        _start_refresh_supervisor(model_bundle, mapping, cfg)
     _preflight_feature_supplyability(br, rel)
     _emit_deploy_boot_info(br, cfg, rel)
 
-    model_bundle = br / rel.get("model_bundle_dir", "models")
-    mapping = br / rel["canonical_mapping_parquet"]
-
-    mode = str(args.mode)
     if mode == "api":
         from trainer_hightier.serving import api_server
 
