@@ -36,6 +36,48 @@ FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME: Final[str] = "feature_candidate_re
 FE_DERIVED_DEPLOY_PARQUET_BASENAME: Final[str] = "fe_derived_features.parquet"
 # Mid-term snapshot freshness vs active_manifest.coverage_end_exclusive (ISO-8601 duration).
 MID_TERM_FRESHNESS_SLA_ISO8601: Final[str] = "PT36H"
+# Max gaming-day lookback when building mid-term daily snapshots (w30d + buffer).
+MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS: Final[int] = 32
+# Training audit columns written by mid-term ASOF enrich.
+MID_TERM_ANCHOR_AUDIT_COLUMN: Final[str] = "mid_term_anchor_gaming_day"
+MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN: Final[str] = "mid_term_snapshot_age_days"
+MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN: Final[str] = "mid_term_snapshot_missing_flag"
+# Manifest keys for Route B production feature suppliers.
+MANIFEST_KEY_FE_DERIVED_SOURCE_KIND: Final[str] = "fe_derived_source_kind"
+MANIFEST_KEY_SLOW_PATRON_GRAIN: Final[str] = "slow_patron_grain"
+MANIFEST_KEY_MID_TERM_SNAPSHOT: Final[str] = "mid_term_snapshot_parquet"
+MANIFEST_KEY_MID_TERM_GRAIN: Final[str] = "mid_term_grain"
+MANIFEST_KEY_MID_TERM_ANCHOR_MAX: Final[str] = "mid_term_anchor_gaming_day_max"
+MANIFEST_KEY_MID_TERM_COVERAGE_END: Final[str] = "mid_term_coverage_end_exclusive"
+MANIFEST_KEY_MID_TERM_GENERATED_AT: Final[str] = "mid_term_generated_at"
+MANIFEST_KEY_MID_TERM_STALE_HARD_CAP_DAYS: Final[str] = "mid_term_stale_hard_cap_days"
+MANIFEST_KEY_FE_SHORT_TERM: Final[str] = "fe_short_term_parquet"
+MANIFEST_KEY_SLOW_ANCHOR_MAX: Final[str] = "slow_anchor_gaming_day_max"
+MANIFEST_KEY_SLOW_GENERATED_AT: Final[str] = "slow_generated_at"
+MANIFEST_KEY_SLOW_MONTHLY_GRACE_DAYS: Final[str] = "slow_monthly_grace_days"
+MANIFEST_KEY_SLOW_STALE_HARD_CAP_DAYS: Final[str] = "slow_stale_hard_cap_days"
+MID_TERM_GRAIN_CANONICAL_DAILY_ASOF: Final[str] = "canonical_daily_asof"
+FE_DERIVED_SOURCE_KIND_PRODUCTION: Final[str] = "production_clickhouse"
+FE_DERIVED_SOURCE_KIND_SHIPPED: Final[str] = "shipped_training_bundle"
+SLOW_PATRON_GRAIN_CANONICAL_ASOF: Final[str] = "canonical_asof"
+SLOW_PATRON_GRAIN_BET: Final[str] = "bet_grain"
+MID_TERM_SNAPSHOT_DEPLOY_PARQUET_BASENAME: Final[str] = "mid_term_daily_snapshot.parquet"
+FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME: Final[str] = "fe_short_term_features.parquet"
+# Production snapshot lifecycle (HK wall-clock).
+GAMING_DAY_CLOSE_HOUR: Final[int] = 3
+MID_TERM_REFRESH_TARGET_HOUR: Final[int] = 4
+MID_TERM_STALE_HARD_CAP_DAYS: Final[int] = 3
+SLOW_MONTHLY_GRACE_DAYS: Final[int] = 1
+SLOW_STALE_HARD_CAP_DAYS: Final[int] = 3
+SNAPSHOT_REFRESH_SUPERVISOR_POLL_SECONDS: Final[int] = 300
+SNAPSHOT_REFRESH_LOCK_STALE_MINUTES: Final[int] = 360
+PRODUCTION_BET_MIRROR_RETENTION_DAYS: Final[int] = MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS + 5
+PRODUCTION_SESSION_MIRROR_RETENTION_DAYS: Final[int] = 187
+PRODUCTION_BET_MIRROR_REWRITE_DAYS: Final[int] = 3
+PRODUCTION_BET_MIRROR_DIRNAME: Final[str] = "cleaned_bet"
+PRODUCTION_SESSION_MIRROR_FILENAME: Final[str] = "cleaned_session.parquet"
+# Hours of live bets included in production fe_derived micro-batch (7d windows + buffer).
+PRODUCTION_FE_COVERAGE_HOURS: Final[int] = 192
 PLACEHOLDER_PLAYER_ID: Final[int] = -1
 CASINO_PLAYER_ID_CLEAN_SQL: Final[str] = (
     "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "
@@ -438,6 +480,22 @@ class HightierServingConfig:
     adt_allowed_players_parquet: Path | None = None
     #: If True and ``training_metrics.json`` contains ``adt_allowlist_sha256``, scorer requires an exact match.
     adt_allowlist_fail_on_training_hash_mismatch: bool = True
+    #: Hours of ``payout_complete_dtm`` coverage for production ``fe_derived`` materialization.
+    production_fe_coverage_hours: int = PRODUCTION_FE_COVERAGE_HOURS
+    #: Calendar-day lookback for production slow 180d canonical ASOF snapshots.
+    production_slow_lookback_days: int = 180
+    gaming_day_close_hour: int = GAMING_DAY_CLOSE_HOUR
+    mid_term_refresh_target_hour: int = MID_TERM_REFRESH_TARGET_HOUR
+    mid_term_stale_hard_cap_days: int = MID_TERM_STALE_HARD_CAP_DAYS
+    slow_monthly_grace_days: int = SLOW_MONTHLY_GRACE_DAYS
+    slow_stale_hard_cap_days: int = SLOW_STALE_HARD_CAP_DAYS
+    snapshot_refresh_supervisor_poll_seconds: int = SNAPSHOT_REFRESH_SUPERVISOR_POLL_SECONDS
+    snapshot_refresh_lock_stale_minutes: int = SNAPSHOT_REFRESH_LOCK_STALE_MINUTES
+    production_cleaned_bet_mirror_dir: Path | None = None
+    production_cleaned_session_mirror_parquet: Path | None = None
+    production_bet_mirror_retention_days: int = PRODUCTION_BET_MIRROR_RETENTION_DAYS
+    production_session_mirror_retention_days: int = PRODUCTION_SESSION_MIRROR_RETENTION_DAYS
+    production_bet_mirror_rewrite_days: int = PRODUCTION_BET_MIRROR_REWRITE_DAYS
 
 
 _DEFAULT_HIGHTIER_SERVING: HightierServingConfig = HightierServingConfig()
