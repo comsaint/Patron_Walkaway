@@ -52,7 +52,10 @@ features:
             slow_pack_path=None,
             trial_pack_path=None,
             fe_pack_path=fe_p,
-            manifest={"coverage_end_exclusive": stale_iso},
+            manifest={
+                "coverage_end_exclusive": stale_iso,
+                "fe_derived_source_kind": "production_clickhouse",
+            },
         )
 
 

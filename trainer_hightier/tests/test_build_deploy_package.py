@@ -120,6 +120,7 @@ def _manifest_abc_layers(*, slow: Path, allow: Path, fe: Path | None, version: s
     }
     if fe is not None:
         man["fe_derived_parquet"] = str(fe.resolve())
+        man["fe_derived_source_kind"] = "production_clickhouse"
     return man
 
 
@@ -947,6 +948,7 @@ def test_deploy_inputs_mid_term_manifest_freshness_passes(tmp_path: Path) -> Non
         "version": "frozen-di-fe",
         "slow_patron_parquet": slow_name,
         "fe_derived_parquet": fe_name,
+        "fe_derived_source_kind": "production_clickhouse",
         "adt_allowlist_parquet": allow_name,
         "adt_allowlist_version": "x",
         "coverage_end_exclusive": datetime.now(timezone.utc).isoformat(),
