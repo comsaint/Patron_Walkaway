@@ -9,6 +9,7 @@ from trainer_hightier.serving.candidate_registry_loader import (
     default_time_horizon_for_row,
     horizon_from_max_lookback_iso8601,
     load_candidate_registry,
+    load_registry_raw_feature_dicts,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "default_time_horizon_for_row",
     "horizon_from_max_lookback_iso8601",
     "load_candidate_registry",
+    "load_registry_raw_feature_dicts",
 ]

@@ -32,6 +32,7 @@ from trainer_hightier.feature_experiment.candidate_registry_loader import (
     baseline_features_for_main_trainer,
     default_registry_path,
     load_candidate_registry,
+    load_registry_raw_feature_dicts,
 )
 from trainer_hightier.config import (
     BetPreprocessConfig,
@@ -1050,46 +1051,92 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     *,
     metrics: dict[str, Any] | None = None,
 ) -> Path:
-    """When registry baseline includes ``fe__*``, materialize DuckDB features and join onto Step 3 output."""
+    """When registry baseline includes ``fe__*``, materialize cadence suppliers and join onto Step 3 output."""
 
     reg_p = Path(args.feature_candidate_registry).resolve() if args.feature_candidate_registry else None
     snap = load_candidate_registry(reg_p)
     baseline = baseline_features_for_main_trainer(snap)
-    if not any(name.startswith("fe__") for name in baseline):
+    fe_baseline = tuple(c for c in baseline if str(c).startswith("fe__"))
+    if not fe_baseline:
         return base_training_parquet
-    cleaned = _hpre.default_cleaned_bet_parquet_path().resolve()
+
+    raw_rows = load_registry_raw_feature_dicts(reg_p)
+    cadence_mod = importlib.import_module("trainer_hightier.feature_experiment.feature_cadence")
     fe_mod = importlib.import_module("trainer_hightier.feature_experiment.materialize_fe_derived")
+    mid_mod = importlib.import_module("trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot")
     en_mod = importlib.import_module("trainer_hightier.feature_experiment.dataset_enrich")
     freg = importlib.import_module("trainer_hightier.feature_experiment.feature_registry")
     freg.set_candidate_registry_path(reg_p)
-    fe_out = base_training_parquet.parent / "_main_trainer_fe_derived.parquet"
-    enriched = base_training_parquet.parent / "training_set_fe_enriched.parquet"
-    t_m0 = time.perf_counter()
-    fe_mod.materialize_fe_derived_parquet(
-        cleaned_bet_parquet=cleaned,
-        training_parquet_for_bet_ids=base_training_parquet,
-        out_parquet=fe_out,
-        duckdb_runtime=args.duckdb_runtime,
+
+    audit = cadence_mod.build_feature_cadence_audit(snap, baseline, raw_rows=raw_rows)
+    fe_split = cadence_mod.classify_model_fe_features(snap, fe_baseline, raw_rows=raw_rows)
+    short_cols = cadence_mod.short_term_enrich_columns_with_dependencies(
+        fe_split["short_term"],
+        fe_split["mid_term"],
     )
-    mat_sec = round(time.perf_counter() - t_m0, 3)
+    mid_cols = fe_split["mid_term"]
+
+    cleaned = _hpre.default_cleaned_bet_parquet_path().resolve()
+    out_dir = base_training_parquet.parent
+    audit_path = out_dir / "feature_cadence_audit.json"
+    audit_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+    fe_short_out = out_dir / "_main_trainer_fe_short_term.parquet"
+    mid_snap_out = out_dir / "_main_trainer_mid_term_daily_snapshot.parquet"
+    enriched = out_dir / "training_set_fe_enriched.parquet"
+
+    t_m0 = time.perf_counter()
+    if short_cols:
+        fe_mod.materialize_fe_derived_short_term_parquet(
+            cleaned_bet_parquet=cleaned,
+            training_parquet_for_bet_ids=base_training_parquet,
+            out_parquet=fe_short_out,
+            duckdb_runtime=args.duckdb_runtime,
+            short_term_columns=short_cols,
+        )
+    mat_short_sec = round(time.perf_counter() - t_m0, 3)
+
+    t_m1 = time.perf_counter()
+    mid_meta: dict[str, Any] = {}
+    if mid_cols:
+        _, mid_meta = mid_mod.materialize_mid_term_daily_snapshot(
+            cleaned_bet_parquet=cleaned,
+            out_parquet=mid_snap_out,
+            duckdb_runtime=args.duckdb_runtime,
+        )
+    mat_mid_sec = round(time.perf_counter() - t_m1, 3)
+
     t_e0 = time.perf_counter()
-    en_mod.enrich_training_parquet(
+    en_mod.enrich_training_parquet_with_cadence_suppliers(
         base_training_parquet=base_training_parquet,
-        fe_derived_parquet=fe_out,
+        fe_short_term_parquet=fe_short_out if short_cols else None,
+        mid_term_snapshot_parquet=mid_snap_out if mid_cols else None,
         out_parquet=enriched,
         duckdb_runtime=args.duckdb_runtime,
+        short_term_columns=short_cols,
+        mid_term_columns=mid_cols,
+        include_audit_columns=True,
     )
     enr_sec = round(time.perf_counter() - t_e0, 3)
+
     if metrics is not None:
-        metrics["main_trainer_fe_materialize_sec"] = mat_sec
+        metrics["main_trainer_fe_materialize_short_sec"] = mat_short_sec
+        metrics["main_trainer_fe_materialize_mid_sec"] = mat_mid_sec
         metrics["main_trainer_fe_enrich_sec"] = enr_sec
         metrics["main_trainer_training_parquet_for_step4"] = str(enriched.resolve())
-        metrics["main_trainer_fe_derived_parquet"] = str(fe_out.resolve())
+        metrics["main_trainer_fe_short_term_parquet"] = str(fe_short_out.resolve()) if short_cols else None
+        metrics["main_trainer_mid_term_snapshot_parquet"] = str(mid_snap_out.resolve()) if mid_cols else None
+        metrics["feature_cadence_audit"] = audit
+        metrics["feature_cadence_audit_path"] = str(audit_path.resolve())
+        if mid_meta:
+            metrics["main_trainer_mid_term_snapshot_meta"] = mid_meta
     logger.info(
-        "[Step 3.5] baseline includes fe__*: materialized %s, enriched -> %s (%.3fs + %.3fs)",
-        fe_out.name,
+        "[Step 3.5] cadence enrich: short=%d mid=%d -> %s (short %.3fs, mid %.3fs, enrich %.3fs)",
+        len(short_cols),
+        len(mid_cols),
         enriched.name,
-        mat_sec,
+        mat_short_sec,
+        mat_mid_sec,
         enr_sec,
     )
     return enriched
@@ -1344,7 +1391,26 @@ def _freeze_deploy_inputs(
     _deploy_inputs_copy_maybe(di, "slow_patron", slow_src)
     snap_frozen = bd / FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
     _deploy_inputs_copy_maybe(di, "feature_candidate_registry_snapshot", snap_frozen)
-    from trainer_hightier.config import FE_DERIVED_DEPLOY_PARQUET_BASENAME
+    from trainer_hightier.config import (
+        FE_DERIVED_DEPLOY_PARQUET_BASENAME,
+        FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME,
+        MANIFEST_KEY_FE_SHORT_TERM,
+        MANIFEST_KEY_MID_TERM_ANCHOR_MAX,
+        MANIFEST_KEY_MID_TERM_COVERAGE_END,
+        MANIFEST_KEY_MID_TERM_GENERATED_AT,
+        MANIFEST_KEY_MID_TERM_GRAIN,
+        MANIFEST_KEY_MID_TERM_SNAPSHOT,
+        MANIFEST_KEY_MID_TERM_STALE_HARD_CAP_DAYS,
+        MANIFEST_KEY_SLOW_MONTHLY_GRACE_DAYS,
+        MANIFEST_KEY_SLOW_STALE_HARD_CAP_DAYS,
+        MID_TERM_GRAIN_CANONICAL_DAILY_ASOF,
+        MID_TERM_SNAPSHOT_DEPLOY_PARQUET_BASENAME,
+        MID_TERM_STALE_HARD_CAP_DAYS,
+        SLOW_MONTHLY_GRACE_DAYS,
+        SLOW_PATRON_GRAIN_CANONICAL_ASOF,
+        SLOW_STALE_HARD_CAP_DAYS,
+        FE_DERIVED_SOURCE_KIND_SHIPPED,
+    )
 
     fe_src: Path | None = None
     fe_metric = metrics.get("main_trainer_fe_derived_parquet")
@@ -1355,10 +1421,38 @@ def _freeze_deploy_inputs(
         if alt.is_file():
             fe_src = alt
     fe_dest: Path | None = None
+    fe_short_dest: Path | None = None
+    mid_dest: Path | None = None
     if fe_src is not None and fe_src.is_file():
         fe_dest = di / FE_DERIVED_DEPLOY_PARQUET_BASENAME
         shutil.copy2(fe_src, fe_dest)
         logger.info("[deploy_inputs] copied fe_derived -> %s", fe_dest.name)
+
+    fe_short_metric = metrics.get("main_trainer_fe_short_term_parquet")
+    fe_short_src: Path | None = None
+    if isinstance(fe_short_metric, str) and fe_short_metric.strip():
+        fe_short_src = Path(fe_short_metric.strip()).expanduser().resolve()
+    if fe_short_src is None or not fe_short_src.is_file():
+        alt_short = bd / "_main_trainer_fe_short_term.parquet"
+        if alt_short.is_file():
+            fe_short_src = alt_short
+    if fe_short_src is not None and fe_short_src.is_file():
+        fe_short_dest = di / FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME
+        shutil.copy2(fe_short_src, fe_short_dest)
+        logger.info("[deploy_inputs] copied fe_short_term -> %s", fe_short_dest.name)
+
+    mid_metric = metrics.get("main_trainer_mid_term_snapshot_parquet")
+    mid_src: Path | None = None
+    if isinstance(mid_metric, str) and mid_metric.strip():
+        mid_src = Path(mid_metric.strip()).expanduser().resolve()
+    if mid_src is None or not mid_src.is_file():
+        alt_mid = bd / "_main_trainer_mid_term_daily_snapshot.parquet"
+        if alt_mid.is_file():
+            mid_src = alt_mid
+    if mid_src is not None and mid_src.is_file():
+        mid_dest = di / MID_TERM_SNAPSHOT_DEPLOY_PARQUET_BASENAME
+        shutil.copy2(mid_src, mid_dest)
+        logger.info("[deploy_inputs] copied mid_term_snapshot -> %s", mid_dest.name)
 
     al_sha: str | None = None
     if allow_dest is not None:
@@ -1378,8 +1472,27 @@ def _freeze_deploy_inputs(
     }
     if slow_src.is_file() and (di / slow_src.name).is_file():
         man["slow_patron_parquet"] = slow_src.name
+        man["slow_patron_grain"] = SLOW_PATRON_GRAIN_CANONICAL_ASOF
     if fe_dest is not None and fe_dest.is_file():
         man["fe_derived_parquet"] = fe_dest.name
+    if fe_short_dest is not None and fe_short_dest.is_file():
+        man[MANIFEST_KEY_FE_SHORT_TERM] = fe_short_dest.name
+    if mid_dest is not None and mid_dest.is_file():
+        man[MANIFEST_KEY_MID_TERM_SNAPSHOT] = mid_dest.name
+        man[MANIFEST_KEY_MID_TERM_GRAIN] = MID_TERM_GRAIN_CANONICAL_DAILY_ASOF
+        man[MANIFEST_KEY_MID_TERM_COVERAGE_END] = coverage_end
+        man[MANIFEST_KEY_MID_TERM_GENERATED_AT] = coverage_end
+        mid_meta = metrics.get("main_trainer_mid_term_snapshot_meta")
+        if isinstance(mid_meta, dict):
+            anchor_max = mid_meta.get("mid_term_anchor_gaming_day_max")
+            if anchor_max is None:
+                anchor_max = mid_meta.get("anchor_gaming_day_max")
+            if anchor_max is not None:
+                man[MANIFEST_KEY_MID_TERM_ANCHOR_MAX] = str(anchor_max)
+    man[MANIFEST_KEY_MID_TERM_STALE_HARD_CAP_DAYS] = MID_TERM_STALE_HARD_CAP_DAYS
+    man[MANIFEST_KEY_SLOW_MONTHLY_GRACE_DAYS] = SLOW_MONTHLY_GRACE_DAYS
+    man[MANIFEST_KEY_SLOW_STALE_HARD_CAP_DAYS] = SLOW_STALE_HARD_CAP_DAYS
+    man["fe_derived_source_kind"] = FE_DERIVED_SOURCE_KIND_SHIPPED
     if allow_dest is not None and allow_dest.is_file():
         man["adt_allowlist_parquet"] = allow_dest.name
         man["adt_allowlist_version"] = al_sha if al_sha else ""

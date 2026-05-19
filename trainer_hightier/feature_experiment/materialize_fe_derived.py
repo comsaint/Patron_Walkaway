@@ -462,3 +462,69 @@ WHERE bet_id IN (SELECT bet_id FROM tid)
     finally:
         con.close()
     return dst
+
+
+# Mid-term columns emitted by legacy per-bet rolling windows (non-production semantics).
+LEGACY_MID_TERM_FEATURE_COLUMNS: tuple[str, ...] = (
+    "fe__bets_cnt__w1d",
+    "fe__wager_sum__w1d",
+    "fe__wager_sum__w15m_over_w1d",
+    "fe__bets_cnt__w15m_over_w1d",
+    "fe__bets_cnt__w7d",
+    "fe__bets_cnt__w30d",
+    "fe__wager_sum__w7d",
+    "fe__wager_sum__w30d",
+    "fe__wager_sum__w7d_over_w30d",
+    "fe__bets_density_proxy_w30d",
+    "fe__interarrival_mean_sec_w7d",
+    "fe__wager_cv_w7d",
+    "fe__wager_z_prior_w30d",
+    "fe__payout_odds_z_prior_w30d",
+    "fe__interarrival__last_gap_z__w7d",
+)
+
+
+def materialize_fe_derived_short_term_parquet(
+    *,
+    cleaned_bet_parquet: Path,
+    training_parquet_for_bet_ids: Path,
+    out_parquet: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    canonical_mapping_parquet: Path | None = None,
+    short_term_columns: tuple[str, ...] | None = None,
+) -> Path:
+    """Materialize bet-grain short-term PIT ``fe__*`` columns only.
+
+    Mid-term model columns must be supplied by
+    :func:`~trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot.materialize_mid_term_daily_snapshot`
+    and joined via ASOF enrich. Legacy mid-term rolling values in
+    :func:`materialize_fe_derived_parquet` are intentionally excluded here.
+    """
+
+    dst = Path(out_parquet).resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.parent / f"{dst.stem}__legacy_full_tmp.parquet"
+    materialize_fe_derived_parquet(
+        cleaned_bet_parquet=cleaned_bet_parquet,
+        training_parquet_for_bet_ids=training_parquet_for_bet_ids,
+        out_parquet=tmp,
+        duckdb_runtime=duckdb_runtime,
+        canonical_mapping_parquet=canonical_mapping_parquet,
+    )
+    cols = tuple(dict.fromkeys(("bet_id", *(short_term_columns or ()))))
+    if len(cols) <= 1:
+        raise ValueError("short_term_columns must include at least one fe__ column")
+    col_sql = ", ".join(f'"{c}"' for c in cols)
+    dst_esc = _path_esc(dst)
+    tmp_esc = _path_esc(tmp)
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        con.execute(
+            f"COPY (SELECT {col_sql} FROM read_parquet('{tmp_esc}')) "
+            f"TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+        )
+    finally:
+        con.close()
+    tmp.unlink(missing_ok=True)
+    return dst
