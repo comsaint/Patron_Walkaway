@@ -46,6 +46,8 @@ from trainer_hightier.config import (
     HighTierObjectiveConfig,
     MLFLOW_EXPERIMENT_TRAIN_HIGHTIER,
     MLFLOW_HIGHTIER_ARTIFACT_PREFIX,
+    MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS,
+    MID_TERM_SNAPSHOT_SCOPE_TRAINING,
     PartitionIngressConfig,
     Step5TrainConfig,
     SessionPreprocessConfig,
@@ -1099,11 +1101,63 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     t_m1 = time.perf_counter()
     mid_meta: dict[str, Any] = {}
     if mid_cols:
-        _, mid_meta = mid_mod.materialize_mid_term_daily_snapshot(
-            cleaned_bet_parquet=cleaned,
-            out_parquet=mid_snap_out,
+        from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
+
+        cmap_path = default_canonical_mapping_parquet_path().resolve()
+        universe_pq = out_dir / "_main_trainer_mid_term_canonical_universe.parquet"
+        anchor_start, anchor_end, bets_start, bets_end = mid_mod.compute_training_mid_term_bounds(
+            base_training_parquet,
+            duckdb_runtime=args.duckdb_runtime,
+            lookback_days=MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS,
+        )
+        universe_rows = mid_mod.write_training_canonical_universe_parquet(
+            base_training_parquet,
+            universe_pq,
             duckdb_runtime=args.duckdb_runtime,
         )
+        lb = int(MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS)
+        cached = mid_mod.try_reuse_mid_term_snapshot_cache(
+            mid_snap_out,
+            snapshot_scope=MID_TERM_SNAPSHOT_SCOPE_TRAINING,
+            cleaned_bet_parquet=cleaned,
+            canonical_mapping_parquet=cmap_path,
+            canonical_universe_parquet=universe_pq,
+            lookback_days=lb,
+            anchor_gaming_day_start=anchor_start,
+            anchor_gaming_day_end=anchor_end,
+        )
+        if cached is not None:
+            _, mid_meta = cached
+            mid_meta["cache_hit"] = True
+            logger.info(
+                "[Step 3.5] mid-term snapshot cache hit scope=%s universe_rows=%d anchor_end=%s",
+                MID_TERM_SNAPSHOT_SCOPE_TRAINING,
+                universe_rows,
+                anchor_end,
+            )
+        else:
+            logger.info(
+                "[Step 3.5] materializing mid-term snapshot scope=%s universe_rows=%d "
+                "anchor_end=%s bets_gday=[%s,%s]",
+                MID_TERM_SNAPSHOT_SCOPE_TRAINING,
+                universe_rows,
+                anchor_end,
+                bets_start,
+                bets_end,
+            )
+            _, mid_meta = mid_mod.materialize_mid_term_daily_snapshot(
+                cleaned_bet_parquet=cleaned,
+                out_parquet=mid_snap_out,
+                duckdb_runtime=args.duckdb_runtime,
+                canonical_mapping_parquet=cmap_path,
+                canonical_universe_parquet=universe_pq,
+                lookback_days=lb,
+                anchor_gaming_day_start=anchor_start,
+                anchor_gaming_day_end=anchor_end,
+                bets_gaming_day_start=bets_start,
+                bets_gaming_day_end=bets_end,
+                snapshot_scope=MID_TERM_SNAPSHOT_SCOPE_TRAINING,
+            )
     mat_mid_sec = round(time.perf_counter() - t_m1, 3)
 
     t_e0 = time.perf_counter()
@@ -1428,6 +1482,7 @@ def _freeze_deploy_inputs(
         MANIFEST_KEY_SLOW_STALE_HARD_CAP_DAYS,
         MID_TERM_GRAIN_CANONICAL_DAILY_ASOF,
         MID_TERM_SNAPSHOT_DEPLOY_PARQUET_BASENAME,
+        MID_TERM_SNAPSHOT_SCOPE_PRODUCTION,
         MID_TERM_STALE_HARD_CAP_DAYS,
         SLOW_MONTHLY_GRACE_DAYS,
         SLOW_PATRON_GRAIN_CANONICAL_ASOF,
@@ -1473,9 +1528,22 @@ def _freeze_deploy_inputs(
         if alt_mid.is_file():
             mid_src = alt_mid
     if mid_src is not None and mid_src.is_file():
-        mid_dest = di / MID_TERM_SNAPSHOT_DEPLOY_PARQUET_BASENAME
-        shutil.copy2(mid_src, mid_dest)
-        logger.info("[deploy_inputs] copied mid_term_snapshot -> %s", mid_dest.name)
+        mid_meta = metrics.get("main_trainer_mid_term_snapshot_meta")
+        from trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot import (
+            mid_term_snapshot_production_safe,
+        )
+
+        if mid_term_snapshot_production_safe(mid_meta if isinstance(mid_meta, dict) else None):
+            mid_dest = di / MID_TERM_SNAPSHOT_DEPLOY_PARQUET_BASENAME
+            shutil.copy2(mid_src, mid_dest)
+            logger.info("[deploy_inputs] copied mid_term_snapshot -> %s", mid_dest.name)
+        else:
+            logger.warning(
+                "[deploy_inputs] skip mid_term_snapshot copy: scope=%s (training-scoped artifacts "
+                "must not ship to production deploy_inputs)",
+                (mid_meta or {}).get("snapshot_scope") if isinstance(mid_meta, dict) else None,
+            )
+            mid_src = None
 
     al_sha: str | None = None
     if allow_dest is not None:
@@ -1506,7 +1574,7 @@ def _freeze_deploy_inputs(
         man[MANIFEST_KEY_MID_TERM_COVERAGE_END] = coverage_end
         man[MANIFEST_KEY_MID_TERM_GENERATED_AT] = coverage_end
         mid_meta = metrics.get("main_trainer_mid_term_snapshot_meta")
-        if isinstance(mid_meta, dict):
+        if isinstance(mid_meta, dict) and str(mid_meta.get("snapshot_scope", "")).strip() == MID_TERM_SNAPSHOT_SCOPE_PRODUCTION:
             anchor_max = mid_meta.get("mid_term_anchor_gaming_day_max")
             if anchor_max is None:
                 anchor_max = mid_meta.get("anchor_gaming_day_max")

@@ -317,7 +317,11 @@ def materialize_production_mid_term_daily_snapshot(
 ) -> tuple[Path, dict[str, Any]]:
     """Materialize canonical mid-term daily snapshot for high-ADT production universe."""
 
-    from trainer_hightier.config import MID_TERM_GRAIN_CANONICAL_DAILY_ASOF, MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS
+    from trainer_hightier.config import (
+        MID_TERM_GRAIN_CANONICAL_DAILY_ASOF,
+        MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS,
+        MID_TERM_SNAPSHOT_SCOPE_PRODUCTION,
+    )
     from trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot import (
         materialize_mid_term_daily_snapshot,
     )
@@ -326,6 +330,7 @@ def materialize_production_mid_term_daily_snapshot(
     rt = duckdb_runtime or DuckDbRuntimeConfig()
     tmp = Path(out_parquet).resolve().parent / f"{Path(out_parquet).stem}__full_tmp.parquet"
     lb = int(lookback_days if lookback_days is not None else MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS)
+
     _, _ = materialize_mid_term_daily_snapshot(
         cleaned_bet_parquet=cleaned_bet_parquet,
         out_parquet=tmp,
@@ -334,6 +339,7 @@ def materialize_production_mid_term_daily_snapshot(
         lookback_days=lb,
         anchor_gaming_day_start=anchor_gaming_day_start,
         anchor_gaming_day_end=anchor_gaming_day_end,
+        snapshot_scope=MID_TERM_SNAPSHOT_SCOPE_PRODUCTION,
     )
     _filter_parquet_to_allowlist_canonical_ids(
         src_parquet=tmp,
@@ -360,6 +366,7 @@ def materialize_production_mid_term_daily_snapshot(
     meta: dict[str, Any] = {
         "artifact_kind": "mid_term_daily_gaming_day_snapshot",
         "mid_term_grain": MID_TERM_GRAIN_CANONICAL_DAILY_ASOF,
+        "snapshot_scope": MID_TERM_SNAPSHOT_SCOPE_PRODUCTION,
         "lookback_days": lb,
         "anchor_gaming_day_start": (
             anchor_gaming_day_start.isoformat() if anchor_gaming_day_start is not None else None
