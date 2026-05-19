@@ -361,6 +361,87 @@ def test_model_version_defaults_and_fingerprint_repeatable(monkeypatch, tmp_path
     assert bio2["frozen_fingerprint_sha256"] == fp1
 
 
+def test_deploy_inputs_autodiscovery_model_source_only(tmp_path: Path) -> None:
+    """Frozen ``deploy_inputs/`` beside bundle lets packager omit snapshot/mapping paths."""
+
+    model_src = tmp_path / "self_contained_bundle"
+    di = model_src / "deploy_inputs"
+    di.mkdir(parents=True)
+    slow_name = "slow_patron_180d_monthly.parquet"
+    allow_name = "adt_allowed_players_q0p99.parquet"
+    slow = di / slow_name
+    allow_f = di / allow_name
+    _write_parquet(slow)
+    _write_parquet(allow_f)
+    cmap = di / "canonical_player_mapping.parquet"
+    _write_parquet(cmap)
+    _write_minimal_model_bundle(model_src)
+    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    man = {
+        "version": "frozen-di",
+        "slow_patron_parquet": slow_name,
+        "adt_allowlist_parquet": allow_name,
+        "adt_allowlist_version": "x",
+    }
+    (di / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+
+    out = tmp_path / "from_deploy_inputs_only"
+    build_deploy_package(["--model-source", str(model_src), "--output-dir", str(out)])
+    mpath = out / "snapshots" / "active_manifest.json"
+    payload = json.loads(mpath.read_text(encoding="utf-8"))
+    am = ActiveSnapshotManifest.from_dict(payload, manifest_dir=mpath.parent)
+    assert am.slow_patron_parquet.is_file()
+    assert am.adt_allowlist_parquet is not None and am.adt_allowlist_parquet.is_file()
+    copied_map = out / "mapping" / cmap.name
+    assert copied_map.is_file()
+
+
+def test_deploy_inputs_fallback_when_absent(monkeypatch, tmp_path: Path) -> None:
+    """No ``deploy_inputs/`` → defaults to patched serving snapshot dir + canonical mapping."""
+
+    from dataclasses import replace
+
+    model_src = tmp_path / "no_di_bundle"
+    _write_minimal_model_bundle(model_src)
+    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+
+    snap_dir = tmp_path / "legacy_serv_snap"
+    art = snap_dir / "staging"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_parquet(slow)
+    _write_parquet(allow)
+    man = {
+        "version": "legacy",
+        "slow_patron_parquet": str(slow.resolve()),
+        "adt_allowlist_parquet": str(allow.resolve()),
+    }
+    (snap_dir / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+
+    map_pq = tmp_path / "legacy_map" / "canonical_player_mapping.parquet"
+    map_pq.parent.mkdir(parents=True)
+    _write_parquet(map_pq)
+
+    from trainer_hightier.config import default_hightier_serving_config
+
+    def _fake_serving_cfg():
+        return replace(default_hightier_serving_config(), snapshot_manifest_dir=snap_dir)
+
+    monkeypatch.setattr(
+        "trainer_hightier.build_deploy_package.default_hightier_serving_config",
+        _fake_serving_cfg,
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.build_deploy_package.default_canonical_mapping_parquet_path",
+        lambda: map_pq,
+    )
+
+    out = tmp_path / "legacy_fallback_out"
+    build_deploy_package(["--model-source", str(model_src), "--output-dir", str(out)])
+    assert (out / "bundle_info.json").is_file()
+
+
 def test_archive_zip_file_list_matches_folder(tmp_path: Path) -> None:
     """Folder and zip archive must list the same relative paths (standalone bundle)."""
     model_src = tmp_path / "model_in"

@@ -334,7 +334,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60.0 * 1 * 1  # 1 hour = 60*60
+    optuna_timeout_sec: float = 60.0 * 60 * 1  # 1 hour = 60*60
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000

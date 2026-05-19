@@ -72,10 +72,16 @@ from trainer_hightier.utils.patron_session_metrics import (
     default_patron_profile_csv_path,
     materialize_adt_allowed_players_parquet,
 )
+from trainer_hightier.utils.slow_patron_180d_monthly import (
+    default_slow_patron_180d_monthly_parquet_path,
+)
 from trainer_hightier.utils.walkaway_labels import (
     default_walkaway_labels_parquet_path,
     materialize_walkaway_labels_from_cleaned_bet,
 )
+
+# Subdirectory beside Step 5 bundle with Frozen snapshot + manifest for offline packaging.
+_DEPLOY_INPUTS_DIRNAME = "deploy_inputs"
 
 # Module names cannot start with a digit in ``import …`` syntax; load by full name.
 _ingest = importlib.import_module("trainer_hightier.01_data_ingest")
@@ -1223,6 +1229,91 @@ def write_artifacts(args: HighTierTrainArgs, *, step5_result: _b5.Step5Result | 
         logger.info("[Step 6] Step 5 model at %s", step5_result.model_path.resolve())
 
 
+def _deploy_inputs_copy_maybe(di: Path, label: str, src: Path) -> Path | None:
+    """Copy *src* into *deploy_inputs/* when the file exists; otherwise log WARN and return ``None``."""
+
+    if not src.is_file():
+        logger.warning("[deploy_inputs] missing %s source: %s", label, src)
+        return None
+    dest = di / src.name
+    shutil.copy2(src, dest)
+    logger.info("[deploy_inputs] copied %s -> %s", label, dest.name)
+    return dest
+
+
+def _persist_adt_allowlist_sha(
+    *,
+    metrics: dict[str, Any],
+    bundle_dir: Path,
+    allow_dest: Path,
+    training_metrics_rel: str,
+) -> str | None:
+    """SHA256-copy allowlist parquet; merge hash into metrics dict and optional ``training_metrics.json``."""
+
+    from trainer_hightier.serving.adt_allowlist import sha256_file
+
+    if allow_dest.is_file():
+        al_sha = sha256_file(allow_dest)
+        metrics["adt_allowlist_sha256"] = al_sha
+        tm_path = bundle_dir / training_metrics_rel
+        if tm_path.is_file():
+            try:
+                body = json.loads(tm_path.read_text(encoding="utf-8"))
+                if isinstance(body, dict):
+                    body["adt_allowlist_sha256"] = al_sha
+                    tm_path.write_text(json.dumps(body, indent=2), encoding="utf-8")
+                    logger.info("[deploy_inputs] merged adt_allowlist_sha256 into %s", tm_path.name)
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                logger.warning("[deploy_inputs] skip training_metrics merge: %s", exc)
+        return al_sha
+    return None
+
+
+def _freeze_deploy_inputs(
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any],
+    *,
+    bundle_dir: Path,
+    model_version: str,
+) -> None:
+    """Copy mapping/allowlist/slow beside bundle and write frozen manifest (relative filenames).
+
+    Best-effort: missing sources WARN only; merges allowlist SHA into metrics and disk JSON when copied."""
+
+    bd = Path(bundle_dir).resolve()
+    di = bd / _DEPLOY_INPUTS_DIRNAME
+    di.mkdir(parents=True, exist_ok=True)
+    map_src = default_canonical_mapping_parquet_path().resolve()
+    q_thr = float(args.objective.theo_train_quantile)
+    allow_src = default_adt_allowed_players_parquet_path(q_thr).resolve()
+    slow_src = default_slow_patron_180d_monthly_parquet_path().resolve()
+
+    _deploy_inputs_copy_maybe(di, "canonical_mapping", map_src)
+    allow_dest = _deploy_inputs_copy_maybe(di, "adt_allowlist", allow_src)
+    _deploy_inputs_copy_maybe(di, "slow_patron", slow_src)
+
+    al_sha: str | None = None
+    if allow_dest is not None:
+        al_sha = _persist_adt_allowlist_sha(
+            metrics=metrics,
+            bundle_dir=bd,
+            allow_dest=allow_dest,
+            training_metrics_rel=_b5.DEFAULT_METRICS_FILENAME,
+        )
+
+    man: dict[str, Any] = {"version": str(model_version)}
+    if slow_src.is_file() and (di / slow_src.name).is_file():
+        man["slow_patron_parquet"] = slow_src.name
+    if allow_dest is not None and allow_dest.is_file():
+        man["adt_allowlist_parquet"] = allow_dest.name
+        man["adt_allowlist_version"] = al_sha if al_sha else ""
+
+    mf = di / "active_manifest.json"
+    mf.write_text(json.dumps(man, indent=2), encoding="utf-8")
+    metrics["deploy_inputs_dir"] = str(di.resolve())
+    metrics["deploy_inputs_active_manifest"] = str(mf.resolve())
+
+
 def _run_training_execute_steps(args: HighTierTrainArgs, metrics: dict[str, Any]) -> _b5.Step5Result | None:
     """Run preprocess → dataset → split → Step 5; mutate ``metrics``; return Step 5 result if any."""
 
@@ -1287,6 +1378,16 @@ def run_training(args: HighTierTrainArgs) -> None:
                     )
                     if bundle_sr is not None:
                         metrics["step4_split_report_bundle"] = str(bundle_sr.resolve())
+                if (
+                    exec_args.step5_bundle_dir is not None
+                    and (exec_args.step5_bundle_dir.resolve() / _b5.DEFAULT_MODEL_FILENAME).is_file()
+                ):
+                    _freeze_deploy_inputs(
+                        exec_args,
+                        metrics,
+                        bundle_dir=exec_args.step5_bundle_dir.resolve(),
+                        model_version=model_version,
+                    )
                 rp_parent = exec_args.step5_bundle_dir.resolve() if exec_args.step5_bundle_dir else versions_root
                 rp = rp_parent / "run_report.json"
                 rp.write_text(json.dumps(metrics, indent=2), encoding="utf-8")

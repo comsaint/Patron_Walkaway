@@ -70,6 +70,7 @@
 - D-004（已定）：`trial_bet_behavior_parquet` 保持 optional（除非 manifest 宣告）。
 - D-005（新增）：`prediction_log.db` 採獨立 SQLite（不混入 `state.db`），寫入點位於 scorer 每輪 `predict_proba` 後、alert 篩選前，對齊 `archive/trainer` 行為。
   - 影響：可觀測到全量 predictions；不得僅依 alerts 反推。
+- D-006（新增）：Step 5 完成後自動產出 `<model-bundle>/deploy_inputs/`（frozen `active_manifest.json` + 對應 parquet 副本，`adt_allowlist_version`/`adt_allowlist_sha256` 與 allowlist 一致）；`build_deploy_package` **優先**自此目錄解析 manifest／canonical mapping。**僅需 `--model-version`** 即可建包——前提為訓練已寫完整 `deploy_inputs`；仍可透過 `--snapshot-manifest-source`／`--mapping-source` override。建包複製 parquet 時，manifest 若以**非絕對路徑**載明檔案，來源為 **`active_manifest.json` 之父目錄**。
 
 ## 目標架構（Standalone）
 
@@ -100,6 +101,7 @@ flowchart LR
 ### 1) Packaging Compiler（`build_deploy_package.py`）
 
 - 收斂並複製 runtime 必要模型與 serving artifacts。
+- **Bundle 側 `deploy_inputs/`**：若 `--model-bundle`/`--model-source`/`--model-version` 對應目錄下有 `deploy_inputs/active_manifest.json` 與 `canonical_player_mapping.parquet`，預設採為 Frozen 來源；否則退回全域 serving snapshot／repo mapping（CLI `--snapshot-manifest-source`/`--mapping-source` 仍可覆寫）。
 - 產出 bundle 內路徑契約檔（`deploy_bundle_paths.json`、`bundle_info.json`）。
 - 產出標準 `requirements.txt` 與安裝契約（預設走 PyPI）。
 - strict preflight（artifact 完整性 + hash parity + 路徑重寫檢查）。
@@ -118,7 +120,7 @@ flowchart LR
 
 ### 4) Artifact Resolver
 
-- 將 manifest 中路徑重寫為 bundle-relative。
+- 將 manifest 中路徑重寫為 bundle-relative（讀來源 parquet：絕對路徑直接用；若為相對檔名，則先相對 **`active_manifest.json` 所在目錄** 解析再複製）。
 - 驗證 rewritten 路徑可讀。
 - 在缺失時提供可操作錯誤（實際值 + 預期值 + 修復方向）。
 

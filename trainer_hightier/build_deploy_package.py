@@ -64,14 +64,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         help=(
             "Path to active_manifest.json or its parent directory. "
-            "Default: default_hightier_serving_config().snapshot_manifest_dir."
+            "Default: `<model-bundle>/deploy_inputs/` when present else "
+            "default_hightier_serving_config().snapshot_manifest_dir."
         ),
     )
     pr.add_argument(
         "--mapping-source",
         type=Path,
         default=None,
-        help="Canonical mapping Parquet file. Default: default_canonical_mapping_parquet_path().",
+        help=(
+            "Canonical mapping Parquet file. Default: `<model-bundle>/deploy_inputs/"
+            "canonical_player_mapping.parquet` when present else default_canonical_mapping_parquet_path()."
+        ),
     )
     pr.add_argument(
         "--output-dir",
@@ -118,9 +122,12 @@ def _resolved_model_bundle_dir(*, model_source: Path | None, model_version: str 
     return latest
 
 
-def _snapshot_manifest_origin(args: argparse.Namespace) -> Path:
+def _snapshot_manifest_origin(args: argparse.Namespace, *, model_bundle: Path) -> Path:
     if args.snapshot_manifest_source is not None:
         return Path(args.snapshot_manifest_source).expanduser().resolve()
+    bundled = Path(model_bundle).resolve() / "deploy_inputs"
+    if (bundled / "active_manifest.json").is_file():
+        return bundled.resolve()
     srv = Path(default_hightier_serving_config().snapshot_manifest_dir).expanduser().resolve()
     if not srv.is_dir():
         raise FileNotFoundError(
@@ -130,9 +137,12 @@ def _snapshot_manifest_origin(args: argparse.Namespace) -> Path:
     return srv
 
 
-def _canonical_mapping_origin(args: argparse.Namespace) -> Path:
+def _canonical_mapping_origin(args: argparse.Namespace, *, model_bundle: Path) -> Path:
     if args.mapping_source is not None:
         return Path(args.mapping_source).expanduser().resolve()
+    bundled = Path(model_bundle).resolve() / "deploy_inputs" / "canonical_player_mapping.parquet"
+    if bundled.is_file():
+        return bundled.resolve()
     return Path(default_canonical_mapping_parquet_path()).expanduser().resolve()
 
 
@@ -199,11 +209,16 @@ def _maybe_copy_layer(
     *,
     dest_artifacts_dir: Path,
     manifest_parent: Path,
+    manifest_basis_dir: Path,
     strict: bool,
 ) -> tuple[str | None, Path | None]:
     if raw_path is None or raw_path == "":
         return None, None
-    src = Path(str(raw_path)).expanduser().resolve()
+    p = Path(str(raw_path)).expanduser()
+    if p.is_absolute():
+        src = p.resolve()
+    else:
+        src = (Path(manifest_basis_dir).resolve() / p).resolve()
     if not src.is_file():
         if key == "trial_bet_behavior_parquet" and not strict:
             logger.warning("[pack] trial parquet missing (non-strict): %s", src)
@@ -496,11 +511,11 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         model_source=args.model_source,
         model_version=args.model_version,
     )
-    map_src = _canonical_mapping_origin(args)
+    map_src = _canonical_mapping_origin(args, model_bundle=model_bundle)
     if not map_src.is_file():
         raise FileNotFoundError(f"mapping parquet missing: {map_src}")
 
-    snap_origin = _snapshot_manifest_origin(args)
+    snap_origin = _snapshot_manifest_origin(args, model_bundle=model_bundle)
     manifest_path = _resolve_manifest_path(snap_origin)
     man = _load_manifest_dict(manifest_path)
 
@@ -534,6 +549,7 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
             man.get(key),
             dest_artifacts_dir=art_dir,
             manifest_parent=snap_dir,
+            manifest_basis_dir=manifest_path.parent,
             strict=strict,
         )
         if rel is not None:
