@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from trainer_hightier.config import default_hightier_serving_config
+from trainer_hightier.config import (
+    MANIFEST_KEY_FE_SHORT_TERM,
+    MANIFEST_KEY_MID_TERM_SNAPSHOT,
+    default_hightier_serving_config,
+)
 from trainer_hightier.serving.runtime_config import HK_TZ
 
 logger = logging.getLogger(__name__)
@@ -34,6 +38,8 @@ class ActiveSnapshotManifest:
     adt_allowlist_version: str | None
     coverage_end_exclusive: str | None
     training_cutoff_iso: str | None
+    mid_term_snapshot_parquet: Path | None
+    fe_short_term_parquet: Path | None
     raw: dict[str, Any]
 
     @classmethod
@@ -51,6 +57,8 @@ class ActiveSnapshotManifest:
 
         slow = _resolve_path(d.get("slow_patron_parquet")) or Path("")
         fe_derived = _resolve_path(d.get("fe_derived_parquet"))
+        mid_term = _resolve_path(d.get(MANIFEST_KEY_MID_TERM_SNAPSHOT))
+        fe_short = _resolve_path(d.get(MANIFEST_KEY_FE_SHORT_TERM)) or fe_derived
         trial = _resolve_path(d.get("trial_bet_behavior_parquet"))
         allow = _resolve_path(d.get("adt_allowlist_parquet"))
         ver = d.get("adt_allowlist_version")
@@ -65,6 +73,8 @@ class ActiveSnapshotManifest:
                 str(d["coverage_end_exclusive"]) if d.get("coverage_end_exclusive") else None
             ),
             training_cutoff_iso=(str(d["training_cutoff_iso"]) if d.get("training_cutoff_iso") else None),
+            mid_term_snapshot_parquet=mid_term,
+            fe_short_term_parquet=fe_short,
             raw=d,
         )
 
@@ -170,6 +180,41 @@ def publish_manifest_atomic(payload: dict[str, Any]) -> Path:
         raise
     logger.info("[feature_state] published manifest %s", final)
     return final
+
+
+def feature_state_meta_get(key: str, *, path: Optional[Path] = None) -> str | None:
+    """Read one key from ``feature_state_meta``."""
+
+    init_feature_state_db(path)
+    db_path = Path(path or default_hightier_serving_config().feature_state_db_path).resolve()
+    with sqlite3.connect(db_path) as conn:
+        apply_feature_state_pragmas(conn)
+        row = conn.execute(
+            "SELECT value FROM feature_state_meta WHERE key = ?",
+            (key,),
+        ).fetchone()
+    if row is None:
+        return None
+    val = row[0]
+    return str(val) if val is not None else None
+
+
+def feature_state_meta_set(key: str, value: str, *, path: Optional[Path] = None) -> None:
+    """Upsert one key in ``feature_state_meta``."""
+
+    init_feature_state_db(path)
+    db_path = Path(path or default_hightier_serving_config().feature_state_db_path).resolve()
+    with sqlite3.connect(db_path) as conn:
+        apply_feature_state_pragmas(conn)
+        conn.execute(
+            """
+            INSERT INTO feature_state_meta(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        conn.commit()
 
 
 def log_job_start(
