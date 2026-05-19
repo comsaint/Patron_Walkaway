@@ -116,6 +116,9 @@ def attach_trial_bet_behavior_1h(
     )
     work = pool[list(need_cols)].copy()
     work = work.drop_duplicates(subset=["bet_id"], keep="last")
+    for _fc in ("wager", "payout_odds"):
+        if _fc in work.columns:
+            work[_fc] = pd.to_numeric(work[_fc], errors="coerce").astype("float64")
     con = duckdb.connect(database=":memory:")
     try:
         if duckdb_runtime is not None:
