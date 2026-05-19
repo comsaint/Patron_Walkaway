@@ -1146,6 +1146,7 @@ def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None)
     """Step 4: project/cast columns and write train/val/test splits by ``gaming_day``."""
 
     if not args.run_step4:
+        logger.info("[Step 4] skipped (run_step4=False); using any existing splits for Step 5 if present.")
         return
     fp = _resolve_features_parquet(args)
     if not fp.is_file():
@@ -1156,7 +1157,13 @@ def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None)
             )
         logger.warning("[Step 4] skip: no features parquet at %s", fp.resolve())
         return
+    logger.info("[Step 4] starting from features parquet %s", fp.resolve())
     fp_eff = _ensure_fe_enriched_training_parquet_for_step4(args, fp, metrics=metrics)
+    logger.info(
+        "[Step 4] calling arrange_and_split_training_data (input %s → splits dir %s)",
+        fp_eff.resolve(),
+        _resolve_splits_dir(args).resolve(),
+    )
     t0 = time.perf_counter()
     res = _b4.arrange_and_split_training_data(
         features_parquet=fp_eff,
@@ -1212,6 +1219,10 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs, *, metrics: dict[str,
     )
     out = _b3.build_training_data(cfg)
     logger.info("[Step 3] training dataset written %s", out)
+    logger.info(
+        "[Pipeline] After Step 3: Step 4 will split by gaming_day (if run_step4), then Step 5 LightGBM (if run_step5). "
+        "If the console is quiet, heavy work is usually DuckDB split or model fit.",
+    )
 
 
 def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None) -> _b5.Step5Result | None:
@@ -1252,6 +1263,13 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
     }
     try:
         step5_out_dir = Path(args.step5_bundle_dir).resolve() if args.step5_bundle_dir is not None else Path(args.output_dir).resolve()
+        logger.info(
+            "[Step 5] training: train_lgbm_from_splits (splits_dir=%s, n_features=%d, skip_optuna=%s, out_dir=%s) …",
+            splits_dir.resolve(),
+            len(feat_cols),
+            bool(args.step5.skip_optuna),
+            step5_out_dir.resolve(),
+        )
         result = _b5.train_lgbm_from_splits(
             splits_dir=splits_dir,
             duckdb_runtime=args.duckdb_runtime,
@@ -1260,6 +1278,11 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
             step5=args.step5,
             output_dir=step5_out_dir,
             feature_columns=feat_cols,
+        )
+        logger.info(
+            "[Step 5] train_lgbm_from_splits finished (model=%s, threshold=%s).",
+            result.model_path.resolve(),
+            result.threshold,
         )
     except ValueError as exc:
         msg = str(exc)
@@ -1507,6 +1530,7 @@ def _run_training_execute_steps(args: HighTierTrainArgs, metrics: dict[str, Any]
     """Run preprocess → dataset → split → Step 5; mutate ``metrics``; return Step 5 result if any."""
 
     if args.start_from_features:
+        logger.info("[Pipeline] --start-from-features: skipping ingest and Step 3; Step 4 then Step 5.")
         _maybe_run_step4(args, metrics=metrics)
     else:
         t_prep = time.perf_counter()
@@ -1515,9 +1539,21 @@ def _run_training_execute_steps(args: HighTierTrainArgs, metrics: dict[str, Any]
         t_step3 = time.perf_counter()
         _maybe_build_training_dataset(args, metrics=metrics)
         metrics["build_training_dataset_seconds"] = round(time.perf_counter() - t_step3, 3)
+        logger.info(
+            "[Pipeline] prepare_training_frame %.3fs; build_training_dataset %.3fs — entering Step 4.",
+            float(metrics["prepare_training_frame_seconds"]),
+            float(metrics["build_training_dataset_seconds"]),
+        )
         _maybe_run_step4(args, metrics=metrics)
 
+    logger.info("[Pipeline] Step 4 finished or skipped; invoking Step 5 (fit_model) …")
     step5_result = fit_model(args, metrics=metrics)
+    if step5_result is not None:
+        logger.info("[Pipeline] Step 5 returned a model; continuing to write_artifacts / bundle steps.")
+    elif args.step5.run_step5:
+        logger.warning(
+            "[Pipeline] Step 5 was enabled but no model result (missing splits or early skip); see Step 4/5 logs above.",
+        )
     write_artifacts(args, step5_result=step5_result)
     return step5_result
 
